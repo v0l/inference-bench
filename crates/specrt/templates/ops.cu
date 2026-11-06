@@ -609,6 +609,118 @@ extern "C" __global__ void kv_norm_rope(float* qkv, const float* q_norm, const f
                    HEADS + blockIdx.x, blockIdx.y);
 }
 
+constexpr int ATTN_SPLITS = 64;
+constexpr int ATTN_TILE = 16;
+constexpr int ATTN_MIN_CHUNK = 16;
+constexpr int ATTN_BLOCK = 128;
+constexpr int ATTN_PART = HEAD_DIM + 2;
+
+__device__ __forceinline__ int attn_chunk(int len) {
+    return max(ATTN_MIN_CHUNK, (len + ATTN_SPLITS - 1) / ATTN_SPLITS);
+}
+
+extern "C" __global__ void attention_split(const float* qkv, const float* k_cache, const float* v_cache,
+                                     const int* block_table, const int* pos_ptr, int layer, float* part) {
+    __shared__ float q_s[HEAD_DIM];
+    __shared__ float p_s[ATTN_TILE];
+    int head = blockIdx.x;
+    int split = blockIdx.y;
+    int kv_head = head / GROUP;
+    int len = pos_ptr[0] + 1;
+    int chunk = attn_chunk(len);
+    int start = split * chunk;
+    if (start >= len) return;
+    int end = min(len, start + chunk);
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    const float* q = qkv + head * HEAD_DIM;
+    for (int d = threadIdx.x; d < HEAD_DIM; d += ATTN_BLOCK) q_s[d] = q[d];
+    __syncthreads();
+    float scale = rsqrtf((float)HEAD_DIM);
+    float m = NEG_INF;
+    float l = 0.0f;
+    float acc = 0.0f;
+    size_t base = ((size_t)layer * PAGES) * KV_HEADS + kv_head;
+    static_assert(HEAD_DIM <= ATTN_BLOCK, "head_dim exceeds attention block");
+    for (int t0 = start; t0 < end; t0 += ATTN_TILE) {
+        int n = min(ATTN_TILE, end - t0);
+        for (int i = warp; i < n; i += ATTN_BLOCK / 32) {
+            int t = t0 + i;
+            size_t slot = ((base + (size_t)block_table[t / PAGE] * KV_HEADS)) * PAGE + t % PAGE;
+            const float4* k = (const float4*)(k_cache + slot * HEAD_DIM);
+            float dot = 0.0f;
+            for (int d = lane; d < HEAD_DIM / 4; d += 32) {
+                float4 kv = k[d];
+                dot += q_s[4 * d] * kv.x + q_s[4 * d + 1] * kv.y + q_s[4 * d + 2] * kv.z + q_s[4 * d + 3] * kv.w;
+            }
+            dot = warp_sum(dot);
+            if (lane == 0) p_s[i] = dot * scale;
+        }
+        __syncthreads();
+        float tmax = NEG_INF;
+        for (int i = 0; i < n; i++) tmax = fmaxf(tmax, p_s[i]);
+        float m_new = fmaxf(m, tmax);
+        float corr = expf(m - m_new);
+        __syncthreads();
+        if (threadIdx.x < n) p_s[threadIdx.x] = expf(p_s[threadIdx.x] - m_new);
+        __syncthreads();
+        float psum = 0.0f;
+        float pv = 0.0f;
+        int d = threadIdx.x;
+#pragma unroll 8
+        for (int i = 0; i < n; i++) {
+            int t = t0 + i;
+            float p = p_s[i];
+            psum += p;
+            if (d < HEAD_DIM) {
+                size_t slot = (((size_t)layer * PAGES + block_table[t / PAGE]) * KV_HEADS + kv_head) * PAGE + t % PAGE;
+                pv += p * v_cache[slot * HEAD_DIM + d];
+            }
+        }
+        l = l * corr + psum;
+        acc = acc * corr + pv;
+        m = m_new;
+        __syncthreads();
+    }
+    float* dst = part + ((size_t)head * ATTN_SPLITS + split) * ATTN_PART;
+    if (threadIdx.x < HEAD_DIM) dst[threadIdx.x] = acc;
+    if (threadIdx.x == 0) {
+        dst[HEAD_DIM] = m;
+        dst[HEAD_DIM + 1] = l;
+    }
+}
+
+extern "C" __global__ void attention_reduce(const float* part, const int* pos_ptr, float* out) {
+    int head = blockIdx.x;
+    int len = pos_ptr[0] + 1;
+    int chunk = attn_chunk(len);
+    int active = (len + chunk - 1) / chunk;
+    const float* base = part + (size_t)head * ATTN_SPLITS * ATTN_PART;
+    __shared__ float w_s[ATTN_SPLITS];
+    int d = threadIdx.x;
+    float ms = d < active ? base[d * ATTN_PART + HEAD_DIM] : NEG_INF;
+    float ls = d < active ? base[d * ATTN_PART + HEAD_DIM + 1] : 0.0f;
+    float m = warp_max(ms);
+    if (ATTN_SPLITS > 32) {
+        __shared__ float wm[ATTN_SPLITS / 32 + 1];
+        if ((d & 31) == 0) wm[d >> 5] = m;
+        __syncthreads();
+        m = NEG_INF;
+        for (int i = 0; i <= (ATTN_SPLITS - 1) / 32; i++) m = fmaxf(m, wm[i]);
+    }
+    float w = d < active ? expf(ms - m) : 0.0f;
+    if (d < ATTN_SPLITS) w_s[d] = w;
+    __syncthreads();
+    float l = 0.0f;
+    for (int i = 0; i < active; i++) l += w_s[i] * base[i * ATTN_PART + HEAD_DIM + 1];
+    float total = 0.0f;
+    if (d < HEAD_DIM) {
+#pragma unroll 8
+        for (int i = 0; i < active; i++) total += w_s[i] * base[i * ATTN_PART + d];
+        out[head * HEAD_DIM + d] = total / l;
+    }
+}
+
 extern "C" __global__ void attention(const float* qkv, const float* k_cache, const float* v_cache,
                                      const int* block_table, const int* pos_ptr, int layer, float* out, float* scores_global,
                                      int seq_layers) {

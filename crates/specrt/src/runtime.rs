@@ -34,6 +34,7 @@ struct Buffers {
     xn: CudaSlice<f32>,
     qkv: CudaSlice<f32>,
     attn: CudaSlice<f32>,
+    attn_part: CudaSlice<f32>,
     gate_up: CudaSlice<f32>,
     act: CudaSlice<f32>,
     logits: CudaSlice<f32>,
@@ -128,6 +129,8 @@ const LINEAR_ROWS_PER_BLOCK: usize = 8;
 const PREFILL_CHUNK: usize = 1024;
 const SHARED_SCORES_MAX_CTX: usize = 4096;
 const SCORE_BUDGET_FLOATS: usize = 1 << 26;
+const ATTN_SPLITS: usize = 64;
+const ATTN_BLOCK: u32 = 128;
 const GEMM_TILE: usize = 64;
 
 impl Runtime {
@@ -197,6 +200,7 @@ impl Runtime {
             xn: stream.alloc_zeros(d.hidden)?,
             qkv: stream.alloc_zeros(spec.q_dim() + 2 * spec.kv_dim())?,
             attn: stream.alloc_zeros(spec.q_dim())?,
+            attn_part: stream.alloc_zeros(spec.attention.heads * ATTN_SPLITS * (spec.attention.head_dim + 2))?,
             gate_up: stream.alloc_zeros(2 * d.intermediate)?,
             act: stream.alloc_zeros(d.intermediate)?,
             logits: stream.alloc_zeros(d.vocab)?,
@@ -352,17 +356,24 @@ impl Runtime {
                 .arg(&layer)
                 .arg(&0i32);
             unsafe { b.launch(cfg((a.heads + 2 * a.kv_heads) as u32, a.head_dim.max(32) as u32)) }?;
-            let mut b = self.stream.launch_builder(self.kernel("attention"));
+            let mut b = self.stream.launch_builder(self.kernel("attention_split"));
             b.arg(&buf.qkv)
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
                 .arg(&layer)
-                .arg(&buf.attn)
-                .arg(&buf.scores)
-                .arg(&0i32);
-            unsafe { b.launch(cfg(a.heads as u32, 512)) }?;
+                .arg(&buf.attn_part);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: (a.heads as u32, ATTN_SPLITS as u32, 1),
+                    block_dim: (ATTN_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                })
+            }?;
+            let mut b = self.stream.launch_builder(self.kernel("attention_reduce"));
+            b.arg(&buf.attn_part).arg(&buf.pos).arg(&buf.attn);
+            unsafe { b.launch(cfg(a.heads as u32, a.head_dim.max(32) as u32)) }?;
             self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
             self.linear_norm(
                 "gate_up_act",

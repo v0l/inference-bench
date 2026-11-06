@@ -45,6 +45,8 @@ pub const KERNELS: &[&str] = &[
     "qkv_proj",
     "qk_norm_rope",
     "attention",
+    "attention_split",
+    "attention_reduce",
     "o_proj",
     "gate_up_proj",
     "swiglu",
