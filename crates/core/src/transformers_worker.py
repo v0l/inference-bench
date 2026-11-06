@@ -43,12 +43,25 @@ class Worker:
         if self.device == "cuda":
             self.torch.cuda.synchronize()
 
-    def generate(self, prompt, max_tokens):
+    def chat(self, msg):
+        messages = msg["messages"]
+        if msg.get("template", True) and getattr(self.tok, "chat_template", None):
+            prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        else:
+            prompt = "\n\n".join(m["content"] for m in messages)
+        temperature = msg.get("temperature", 0.0)
+        sampling = dict(do_sample=temperature > 0, temperature=temperature or 1.0, top_p=msg.get("top_p", 1.0))
+        self.generate(prompt, msg["max_tokens"], sampling, msg.get("seed"))
+
+    def generate(self, prompt, max_tokens, sampling=None, seed=None):
         from transformers import TextIteratorStreamer
 
         ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
         streamer = TextIteratorStreamer(self.tok, skip_prompt=True)
-        kwargs = dict(input_ids=ids, max_new_tokens=max_tokens, do_sample=False, streamer=streamer, min_new_tokens=1)
+        if seed:
+            self.torch.manual_seed(seed)
+        kwargs = dict(input_ids=ids, max_new_tokens=max_tokens, streamer=streamer, min_new_tokens=1)
+        kwargs.update(sampling or dict(do_sample=False))
         started = time.perf_counter()
         thread = threading.Thread(target=lambda: self.model.generate(**kwargs))
         thread.start()
@@ -102,6 +115,8 @@ def main():
                 emit(event="loaded")
             elif op == "generate":
                 worker.generate(msg["prompt"], msg["max_tokens"])
+            elif op == "chat":
+                worker.chat(msg)
             elif op == "logits":
                 worker.logits(msg["prompt"], msg["path"])
             elif op == "quit":

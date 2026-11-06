@@ -57,6 +57,19 @@ fn load(model: &str, max_ctx: Option<usize>) -> Result<Loaded> {
     Ok(Loaded { spec, tokenizer, chat, runtime, max_ctx })
 }
 
+fn encode_messages(l: &Loaded, messages: &[Value], template: bool) -> Result<Vec<u32>> {
+    let text = match (&l.chat, template) {
+        (Some(t), true) => t.render(messages)?,
+        _ => messages
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    };
+    let enc = l.tokenizer.encode(text.as_str(), false).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    Ok(enc.get_ids().to_vec())
+}
+
 fn encode(l: &Loaded, prompt: &str, chat: bool) -> Result<Vec<u32>> {
     let rendered;
     let prompt = match (&l.chat, chat) {
@@ -78,6 +91,15 @@ fn generate(
     sampling: Sampling,
 ) -> Result<Value> {
     let ids = encode(l, prompt, chat)?;
+    generate_ids(l, ids, max_tokens, sampling).map(|(_, done)| done)
+}
+
+fn generate_ids(
+    l: &mut Loaded,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    sampling: Sampling,
+) -> Result<(String, Value)> {
     if ids.len() + max_tokens > l.max_ctx {
         bail!(
             "prompt of {} tokens plus {max_tokens} new tokens exceeds the context of {}",
@@ -87,15 +109,25 @@ fn generate(
     }
     let g = l.runtime.generate(&ids, max_tokens, sampling)?;
     let text = l.tokenizer.decode(&g.tokens, true).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
-    Ok(json!({"event": "done", "generation": {
-        "text": text,
+    let done = json!({"event": "done", "generation": {
+        "text": text.clone(),
         "prompt_tokens": ids.len(),
         "completion_tokens": g.tokens.len(),
         "ttft_secs": g.prefill_secs,
         "prefill_secs": g.prefill_secs,
         "decode_secs": g.decode_secs,
         "peak_memory_bytes": g.peak_device_bytes,
-    }}))
+    }});
+    Ok((text, done))
+}
+
+fn chat(l: &mut Loaded, msg: &Value, out: &mut impl Write) -> Result<Value> {
+    let messages = msg["messages"].as_array().cloned().unwrap_or_default();
+    let ids = encode_messages(l, &messages, msg["template"].as_bool().unwrap_or(true))?;
+    let max_tokens = msg["max_tokens"].as_u64().unwrap_or(64) as usize;
+    let (text, done) = generate_ids(l, ids, max_tokens, sampling_from(msg))?;
+    writeln!(out, "{}", json!({"event": "text", "text": text}))?;
+    Ok(done)
 }
 
 fn logits(l: &mut Loaded, prompt: &str, path: &str) -> Result<Value> {
@@ -140,6 +172,7 @@ pub fn run(input: impl BufRead, mut out: impl Write) -> Result<()> {
                             let max_tokens = msg["max_tokens"].as_u64().unwrap_or(64) as usize;
                             generate(l, prompt, max_tokens, chat, sampling)
                         }
+                        "chat" => chat(l, &msg, &mut out),
                         "logits" => logits(l, prompt, msg["path"].as_str().unwrap_or("")),
                         other => Err(anyhow::anyhow!("unknown op {other}")),
                     };

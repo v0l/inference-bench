@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod chat;
 pub mod logitdiff;
 pub mod matrix;
 pub mod openai;
