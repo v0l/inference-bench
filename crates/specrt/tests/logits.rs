@@ -74,15 +74,33 @@ fn diff(ours: &[f32], reference: &Reference) -> Diff {
 }
 
 fn check_bf16(spec_file: &str) {
+    check(spec_file, 1e-3, true);
+}
+
+fn check(spec_file: &str, max_abs: f32, greedy_exact: bool) {
     let spec = Spec::load(&root().join("specs").join(spec_file)).unwrap();
+    check_spec(spec, max_abs, greedy_exact);
+}
+
+fn max_abs_with(spec_file: &str, edit: impl FnOnce(&mut Spec)) -> f32 {
+    let mut spec = Spec::load(&root().join("specs").join(spec_file)).unwrap();
+    let reference = reference(&spec.name);
+    edit(&mut spec);
+    let mut rt = Runtime::load(&spec, 256).unwrap();
+    diff(&rt.prompt_logits(&reference.tokens).unwrap(), &reference).max_abs
+}
+
+fn check_spec(spec: Spec, max_abs: f32, greedy_exact: bool) {
     let reference = reference(&spec.name);
     let mut rt = Runtime::load(&spec, 256).unwrap();
     let ours = rt.prompt_logits(&reference.tokens).unwrap();
     let d = diff(&ours, &reference);
-    assert!(d.max_abs <= 1e-3, "max abs diff {}", d.max_abs);
+    assert!(d.max_abs <= max_abs, "max abs diff {}", d.max_abs);
     assert_eq!(d.top1_agreement, 1.0);
     let greedy = rt.generate(&reference.tokens, reference.greedy.len(), specrt::runtime::Sampling::GREEDY).unwrap();
-    assert_eq!(greedy.tokens, reference.greedy);
+    if greedy_exact {
+        assert_eq!(greedy.tokens, reference.greedy);
+    }
 }
 
 #[test]
@@ -106,4 +124,40 @@ fn qwen3_q8_logits_stay_close_to_transformers() {
     let d = diff(&rt.prompt_logits(&reference.tokens).unwrap(), &reference);
     assert!(d.mean_abs <= 0.1, "mean abs diff {}", d.mean_abs);
     assert!(d.top1_agreement >= 0.95, "top1 agreement {}", d.top1_agreement);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the HF weights and scripts/reference.py output"]
+fn llama3_rope_scaling_logits_match_transformers() {
+    check("llama-3.2-1b.toml", 1e-3, true);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the HF weights and scripts/reference.py output"]
+fn linear_rope_scaling_logits_match_transformers() {
+    check("qwen2.5-0.5b-linear4.toml", 1e-3, true);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the HF weights and scripts/reference.py output"]
+fn gated_gelu_logits_match_transformers() {
+    check("qwen2.5-0.5b-geglu.toml", 1e-3, true);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the HF weights and scripts/reference.py output"]
+fn mistral_f16_checkpoint_logits_match_transformers() {
+    check("tinymistral-248m.toml", 0.05, false);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the HF weights and scripts/reference.py output"]
+fn wrong_rope_scaling_or_activation_is_caught_by_the_references() {
+    assert!(max_abs_with("llama-3.2-1b.toml", |s| s.rope.scaling = None) > 0.05);
+    assert!(max_abs_with("qwen2.5-0.5b-linear4.toml", |s| s.rope.scaling = None) > 0.05);
+    assert!(
+        max_abs_with("qwen2.5-0.5b-geglu.toml", |s| s.mlp.activation =
+            specrt::spec::Activation::Swiglu)
+            > 0.05
+    );
 }

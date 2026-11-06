@@ -114,3 +114,30 @@ fn rejects_unknown_activation_and_dtype() {
     let json = fixture_with("\"bfloat16\"", "\"int8\"");
     assert!(Spec::from_hf_config(&json).is_err());
 }
+
+fn matches_hf(spec_file: &str, fixture: &str) {
+    let spec = Spec::load(&root().join("specs").join(spec_file)).unwrap();
+    let mut from_hf = derived(fixture);
+    from_hf.name = spec.name.clone();
+    from_hf.repo = spec.repo.clone();
+    assert_eq!(spec, from_hf);
+}
+
+#[test]
+fn llama32_spec_matches_hf_config() {
+    matches_hf("llama-3.2-1b.toml", "llama-3.2-1b.config.json");
+}
+
+#[test]
+fn mistral_f16_spec_matches_hf_config() {
+    matches_hf("tinymistral-248m.toml", "tinymistral-248m.config.json");
+}
+
+#[test]
+fn gemma_and_phi3_stay_unsupported_with_the_model_type_in_the_error() {
+    for model_type in ["gemma2", "gemma3_text", "phi3"] {
+        let json = fixture_with("\"model_type\": \"qwen3\"", &format!("\"model_type\": \"{model_type}\""));
+        let e = Spec::from_hf_config(&json).unwrap_err().to_string();
+        assert_eq!(e, format!("model_type {model_type} is not supported"));
+    }
+}
