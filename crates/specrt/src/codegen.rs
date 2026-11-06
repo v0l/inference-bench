@@ -1,4 +1,4 @@
-use crate::spec::{Quant, Spec};
+use crate::spec::{Activation, Quant, RopeScalingKind, Spec};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
@@ -64,6 +64,19 @@ impl Module {
             Quant::Bf16 => "linear_bf16",
             Quant::Q8 => "linear_q8",
         };
+        let scaling = spec.rope.scaling.as_ref();
+        let rope_kind = match scaling.map(|s| s.kind) {
+            None => 0,
+            Some(RopeScalingKind::Linear) => 1,
+            Some(RopeScalingKind::Llama3) => 2,
+        };
+        let opt = |f: fn(&crate::spec::RopeScaling) -> Option<f64>| {
+            float_literal(scaling.and_then(f).unwrap_or(1.0))
+        };
+        let act = match spec.mlp.activation {
+            Activation::Swiglu => 0,
+            Activation::Geglu => 1,
+        };
         let vars: BTreeMap<&str, String> = [
             ("HIDDEN", d.hidden.to_string()),
             ("INTER", d.intermediate.to_string()),
@@ -76,6 +89,12 @@ impl Module {
             ("QKV_BIAS", a.qkv_bias.to_string()),
             ("EPS", float_literal(spec.norm.eps)),
             ("THETA", float_literal(spec.rope.theta)),
+            ("ROPE_KIND", rope_kind.to_string()),
+            ("ROPE_FACTOR", float_literal(scaling.map_or(1.0, |s| s.factor))),
+            ("ROPE_LOW_FREQ", opt(|s| s.low_freq_factor)),
+            ("ROPE_HIGH_FREQ", opt(|s| s.high_freq_factor)),
+            ("ROPE_ORIG_POS", opt(|s| s.original_max_positions)),
+            ("ACT_KIND", act.to_string()),
             ("MAX_CTX", max_ctx.to_string()),
             ("PAGE", PAGE.to_string()),
             ("Q8_GROUP", Q8_GROUP.to_string()),

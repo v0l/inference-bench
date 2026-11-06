@@ -13,6 +13,12 @@ constexpr int KV_DIM = KV_HEADS * HEAD_DIM;
 constexpr bool QK_NORM = {{QK_NORM}};
 constexpr float EPS = {{EPS}};
 constexpr float THETA = {{THETA}};
+constexpr int ROPE_KIND = {{ROPE_KIND}};
+constexpr float ROPE_FACTOR = {{ROPE_FACTOR}};
+constexpr float ROPE_LOW_FREQ = {{ROPE_LOW_FREQ}};
+constexpr float ROPE_HIGH_FREQ = {{ROPE_HIGH_FREQ}};
+constexpr float ROPE_ORIG_POS = {{ROPE_ORIG_POS}};
+constexpr int ACT_KIND = {{ACT_KIND}};
 constexpr int MAX_CTX = {{MAX_CTX}};
 constexpr int PAGE = {{PAGE}};
 constexpr int PAGES = (MAX_CTX + PAGE - 1) / PAGE;
@@ -214,6 +220,19 @@ extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const f
         int half = HEAD_DIM / 2;
         int i = d < half ? d : d - half;
         float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)HEAD_DIM);
+        if (ROPE_KIND == 1) {
+            inv_freq /= ROPE_FACTOR;
+        } else if (ROPE_KIND == 2) {
+            float wavelen = 6.283185307179586f / inv_freq;
+            float low_wavelen = ROPE_ORIG_POS / ROPE_LOW_FREQ;
+            float high_wavelen = ROPE_ORIG_POS / ROPE_HIGH_FREQ;
+            if (wavelen > low_wavelen) {
+                inv_freq /= ROPE_FACTOR;
+            } else if (wavelen >= high_wavelen) {
+                float smooth = (ROPE_ORIG_POS / wavelen - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ);
+                inv_freq = (1.0f - smooth) * inv_freq / ROPE_FACTOR + smooth * inv_freq;
+            }
+        }
         float angle = (float)pos * inv_freq;
         float c = cosf(angle);
         float s = sinf(angle);
@@ -278,7 +297,10 @@ extern "C" __global__ void swiglu(const float* gate_up, float* out) {
     out += (size_t)blockIdx.y * INTER;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < INTER; i += gridDim.x * blockDim.x) {
         float g = gate_up[i];
-        out[i] = g / (1.0f + expf(-g)) * gate_up[INTER + i];
+        float a = ACT_KIND == 1
+            ? 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)))
+            : g / (1.0f + expf(-g));
+        out[i] = a * gate_up[INTER + i];
     }
 }
 
