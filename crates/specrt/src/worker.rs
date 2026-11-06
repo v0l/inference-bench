@@ -1,4 +1,5 @@
-use crate::runtime::Runtime;
+use crate::chat::ChatTemplate;
+use crate::runtime::{Runtime, Sampling};
 use crate::spec::Spec;
 use crate::weights::find_in_snapshot;
 use anyhow::{Context, Result, bail};
@@ -8,7 +9,7 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 const DEFAULT_CTX: usize = 2048;
-const MAX_CTX: usize = 4096;
+const MAX_CTX: usize = 131072;
 
 pub fn resolve_spec(model: &str) -> Result<Spec> {
     if model.ends_with(".toml") {
@@ -25,6 +26,7 @@ pub fn resolve_spec(model: &str) -> Result<Spec> {
 struct Loaded {
     spec: Spec,
     tokenizer: Tokenizer,
+    chat: Option<ChatTemplate>,
     runtime: Runtime,
     max_ctx: usize,
 }
@@ -46,18 +48,36 @@ fn load(model: &str, max_ctx: Option<usize>) -> Result<Loaded> {
     let spec = resolve_spec(model)?;
     let tokenizer = Tokenizer::from_file(find_in_snapshot(&spec.repo, "tokenizer.json")?)
         .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let chat = match find_in_snapshot(&spec.repo, "tokenizer_config.json") {
+        Ok(path) => ChatTemplate::from_tokenizer_config(&std::fs::read_to_string(path)?)?,
+        Err(_) => None,
+    };
     let max_ctx = max_ctx.unwrap_or(DEFAULT_CTX).min(MAX_CTX);
     let runtime = Runtime::load(&spec, max_ctx)?;
-    Ok(Loaded { spec, tokenizer, runtime, max_ctx })
+    Ok(Loaded { spec, tokenizer, chat, runtime, max_ctx })
 }
 
-fn encode(l: &Loaded, prompt: &str) -> Result<Vec<u32>> {
+fn encode(l: &Loaded, prompt: &str, chat: bool) -> Result<Vec<u32>> {
+    let rendered;
+    let prompt = match (&l.chat, chat) {
+        (Some(template), true) => {
+            rendered = template.render_user(prompt)?;
+            rendered.as_str()
+        }
+        _ => prompt,
+    };
     let enc = l.tokenizer.encode(prompt, false).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     Ok(enc.get_ids().to_vec())
 }
 
-fn generate(l: &mut Loaded, prompt: &str, max_tokens: usize) -> Result<Value> {
-    let ids = encode(l, prompt)?;
+fn generate(
+    l: &mut Loaded,
+    prompt: &str,
+    max_tokens: usize,
+    chat: bool,
+    sampling: Sampling,
+) -> Result<Value> {
+    let ids = encode(l, prompt, chat)?;
     if ids.len() + max_tokens > l.max_ctx {
         bail!(
             "prompt of {} tokens plus {max_tokens} new tokens exceeds the context of {}",
@@ -65,7 +85,7 @@ fn generate(l: &mut Loaded, prompt: &str, max_tokens: usize) -> Result<Value> {
             l.max_ctx
         );
     }
-    let g = l.runtime.generate(&ids, max_tokens)?;
+    let g = l.runtime.generate(&ids, max_tokens, sampling)?;
     let text = l.tokenizer.decode(&g.tokens, true).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
     Ok(json!({"event": "done", "generation": {
         "text": text,
@@ -74,16 +94,23 @@ fn generate(l: &mut Loaded, prompt: &str, max_tokens: usize) -> Result<Value> {
         "ttft_secs": g.prefill_secs,
         "prefill_secs": g.prefill_secs,
         "decode_secs": g.decode_secs,
-        "peak_memory_bytes": l.runtime.device_bytes,
+        "peak_memory_bytes": g.peak_device_bytes,
     }}))
 }
 
 fn logits(l: &mut Loaded, prompt: &str, path: &str) -> Result<Value> {
-    let ids = encode(l, prompt)?;
+    let ids = encode(l, prompt, false)?;
     let values = l.runtime.prompt_logits(&ids)?;
     let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     std::fs::write(path, bytes)?;
     Ok(json!({"event": "logits", "tokens": ids, "vocab": l.spec.dims.vocab}))
+}
+
+fn sampling_from(msg: &Value) -> Sampling {
+    Sampling {
+        temperature: msg["temperature"].as_f64().unwrap_or(0.0).max(0.0) as f32,
+        seed: msg["seed"].as_u64().unwrap_or(0) as u32,
+    }
 }
 
 pub fn run(input: impl BufRead, mut out: impl Write) -> Result<()> {
@@ -108,7 +135,10 @@ pub fn run(input: impl BufRead, mut out: impl Write) -> Result<()> {
                     let prompt = msg["prompt"].as_str().unwrap_or("");
                     let r = match op {
                         "generate" => {
-                            generate(l, prompt, msg["max_tokens"].as_u64().unwrap_or(64) as usize)
+                            let sampling = sampling_from(&msg);
+                            let chat = msg["chat"].as_bool().unwrap_or(true);
+                            let max_tokens = msg["max_tokens"].as_u64().unwrap_or(64) as usize;
+                            generate(l, prompt, max_tokens, chat, sampling)
                         }
                         "logits" => logits(l, prompt, msg["path"].as_str().unwrap_or("")),
                         other => Err(anyhow::anyhow!("unknown op {other}")),
@@ -132,6 +162,13 @@ mod tests {
         let e = anyhow::anyhow!("model_type gemma3 is not supported");
         assert_eq!(error(&e)["kind"], "unsupported_architecture");
         assert_eq!(error(&e)["message"], "model_type gemma3 is not supported");
+    }
+
+    #[test]
+    fn sampling_defaults_to_greedy() {
+        assert_eq!(sampling_from(&json!({"op": "generate"})), Sampling::GREEDY);
+        let s = sampling_from(&json!({"temperature": 0.5, "seed": 7}));
+        assert_eq!((s.temperature, s.seed), (0.5, 7));
     }
 
     #[test]

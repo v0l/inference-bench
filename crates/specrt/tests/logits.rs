@@ -81,7 +81,7 @@ fn check_bf16(spec_file: &str) {
     let d = diff(&ours, &reference);
     assert!(d.max_abs <= 1e-3, "max abs diff {}", d.max_abs);
     assert_eq!(d.top1_agreement, 1.0);
-    let greedy = rt.generate(&reference.tokens, reference.greedy.len()).unwrap();
+    let greedy = rt.generate(&reference.tokens, reference.greedy.len(), specrt::runtime::Sampling::GREEDY).unwrap();
     assert_eq!(greedy.tokens, reference.greedy);
 }
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use specrt::runtime::Runtime;
+use specrt::runtime::{Runtime, Sampling};
 use specrt::spec::Spec;
 use std::path::PathBuf;
 
@@ -14,10 +14,10 @@ fn main() -> Result<()> {
     let mut rt = Runtime::load(&spec, prompt_len + new_tokens)?;
     let load_secs = started.elapsed().as_secs_f64();
     let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 1000 + i * 7).collect();
-    rt.generate(&prompt, 8.min(new_tokens))?;
+    rt.generate(&prompt, 8.min(new_tokens), Sampling::GREEDY)?;
     let mut runs = Vec::new();
     for _ in 0..5 {
-        runs.push(rt.generate(&prompt, new_tokens)?);
+        runs.push(rt.generate(&prompt, new_tokens, Sampling::GREEDY)?);
     }
     let median = |f: &dyn Fn(&specrt::runtime::Generation) -> f64| {
         let mut v: Vec<f64> = runs.iter().map(f).collect();

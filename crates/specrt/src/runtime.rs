@@ -44,12 +44,28 @@ struct Buffers {
     history: CudaSlice<i32>,
     count: CudaSlice<i32>,
     dummy: CudaSlice<f32>,
+    scores: CudaSlice<f32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Sampling {
+    pub temperature: f32,
+    pub seed: u32,
+}
+
+impl Sampling {
+    pub const GREEDY: Sampling = Sampling { temperature: 0.0, seed: 0 };
+
+    pub fn inverse_temperature(&self) -> f32 {
+        if self.temperature > 0.0 { 1.0 / self.temperature } else { 0.0 }
+    }
 }
 
 pub struct Generation {
     pub tokens: Vec<u32>,
     pub prefill_secs: f64,
     pub decode_secs: f64,
+    pub peak_device_bytes: u64,
 }
 
 pub struct Runtime {
@@ -66,6 +82,8 @@ pub struct Runtime {
     pub jit_key: String,
     pub arch: String,
     pub device_bytes: u64,
+    ctx: Arc<CudaContext>,
+    baseline_free: usize,
 }
 
 fn grid(n: usize, per_block: usize) -> u32 {
@@ -80,7 +98,6 @@ const LINEAR_ROWS_PER_BLOCK: usize = 8;
 
 impl Runtime {
     pub fn load(spec: &Spec, max_ctx: usize) -> Result<Self> {
-        ensure!(max_ctx <= 4096, "max_ctx above 4096 does not fit the attention scratch");
         let ctx = CudaContext::new(0).context("cuda init")?;
         let free_before = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         unsafe { ctx.disable_event_tracking() };
@@ -143,6 +160,7 @@ impl Runtime {
             history: stream.alloc_zeros(max_ctx)?,
             count: stream.alloc_zeros(1)?,
             dummy: stream.alloc_zeros(1)?,
+            scores: stream.alloc_zeros(spec.attention.heads * max_ctx)?,
         };
         let rt = Runtime {
             spec: spec.clone(),
@@ -158,6 +176,8 @@ impl Runtime {
             jit_key: loaded.key,
             arch: jit.arch().to_string(),
             device_bytes: 0,
+            ctx: ctx.clone(),
+            baseline_free: free_before,
         };
         rt.stream.synchronize()?;
         let free_after = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
@@ -225,7 +245,8 @@ impl Runtime {
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
                 .arg(&layer)
-                .arg(&buf.attn);
+                .arg(&buf.attn)
+                .arg(&buf.scores);
             unsafe { b.launch(cfg(a.heads as u32, 128)) }?;
             self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
             self.rmsnorm(&buf.x, &l.ln2, &buf.xn)?;
@@ -247,10 +268,12 @@ impl Runtime {
         Ok(())
     }
 
-    fn advance(&self) -> Result<()> {
+    fn advance(&self, sampling: Sampling) -> Result<()> {
         let buf = &self.buf;
         let mut b = self.stream.launch_builder(self.kernel("argmax_advance"));
         b.arg(&buf.logits).arg(&buf.token).arg(&buf.pos).arg(&buf.history).arg(&buf.count);
+        let inv_temp = sampling.inverse_temperature();
+        b.arg(&inv_temp).arg(&sampling.seed);
         unsafe { b.launch(cfg(1, 1024)) }?;
         Ok(())
     }
@@ -272,15 +295,20 @@ impl Runtime {
         Ok(out)
     }
 
-    fn capture(&self) -> Result<CudaGraph> {
+    fn capture(&self, sampling: Sampling) -> Result<CudaGraph> {
         self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-        let recorded = self.step().and_then(|_| self.advance());
+        let recorded = self.step().and_then(|_| self.advance(sampling));
         let graph = self.stream.end_capture(CUgraphInstantiate_flags(0))?;
         recorded?;
         graph.context("empty graph")
     }
 
-    pub fn generate(&mut self, prompt: &[u32], new_tokens: usize) -> Result<Generation> {
+    pub fn generate(
+        &mut self,
+        prompt: &[u32],
+        new_tokens: usize,
+        sampling: Sampling,
+    ) -> Result<Generation> {
         ensure!(!prompt.is_empty() && new_tokens > 0, "empty prompt or nothing to generate");
         ensure!(
             prompt.len() + new_tokens <= self.max_ctx,
@@ -292,10 +320,10 @@ impl Runtime {
             self.set(t, pos)?;
             self.step()?;
         }
-        self.advance()?;
+        self.advance(sampling)?;
         self.stream.synchronize()?;
         let prefill_secs = started.elapsed().as_secs_f64();
-        let graph = self.capture()?;
+        let graph = self.capture(sampling)?;
         graph.upload()?;
         self.stream.synchronize()?;
         let started = Instant::now();
@@ -305,10 +333,13 @@ impl Runtime {
         self.stream.synchronize()?;
         let decode_secs = started.elapsed().as_secs_f64();
         let history = self.stream.clone_dtoh(&self.buf.history)?;
+        let free_now = self.ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
+        let peak_device_bytes = (self.baseline_free.saturating_sub(free_now) as u64).max(self.device_bytes);
         Ok(Generation {
             tokens: history[..new_tokens].iter().map(|&t| t as u32).collect(),
             prefill_secs,
             decode_secs,
+            peak_device_bytes,
         })
     }
 }

@@ -156,10 +156,10 @@ extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const f
 }
 
 extern "C" __global__ void attention(const float* qkv, const float* k_cache, const float* v_cache,
-                                     const int* block_table, const int* pos_ptr, int layer, float* out) {
+                                     const int* block_table, const int* pos_ptr, int layer, float* out, float* scores_global) {
     __shared__ float scratch[32];
-    __shared__ float scores[MAX_CTX];
     int head = blockIdx.x;
+    float* scores = scores_global + (size_t)head * MAX_CTX;
     int kv_head = head / GROUP;
     int len = pos_ptr[0] + 1;
     int lane = threadIdx.x & 31;
@@ -203,13 +203,21 @@ extern "C" __global__ void swiglu(const float* gate_up, float* out) {
     }
 }
 
-extern "C" __global__ void argmax_advance(const float* logits, int* token, int* pos, int* history, int* count) {
+__device__ float gumbel(unsigned seed, unsigned step, unsigned i) {
+    unsigned x = seed * 747796405u + step * 2891336453u + i * 2246822519u + 1u;
+    x ^= x >> 16; x *= 2246822507u; x ^= x >> 13; x *= 3266489909u; x ^= x >> 16;
+    float u = ((float)(x >> 8) + 0.5f) / 16777216.0f;
+    return -logf(-logf(u));
+}
+
+extern "C" __global__ void argmax_advance(const float* logits, int* token, int* pos, int* history, int* count, float inv_temp, unsigned seed) {
     __shared__ float best_v[1024];
     __shared__ int best_i[1024];
     float bv = NEG_INF;
     int bi = 0;
     for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
         float v = logits[i];
+        if (inv_temp > 0.0f) v = v * inv_temp + gumbel(seed, (unsigned)count[0], (unsigned)i);
         if (v > bv) {
             bv = v;
             bi = i;
