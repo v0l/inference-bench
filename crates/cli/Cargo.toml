@@ -32,7 +32,7 @@ assets = [
 
 [dependencies]
 inference-bench-core.workspace = true
-inference-bench-server.workspace = true
+inference-bench-server = { path = "../server" }
 tracing.workspace = true
 anyhow.workspace = true
 clap.workspace = true

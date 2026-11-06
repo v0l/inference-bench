@@ -361,6 +361,9 @@ impl LogBuffer {
     }
 
     pub fn save(&self, path: &Path, max_level: Level, search: &str) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
+        }
         std::fs::write(path, self.text(max_level, search)).with_context(|| path.display().to_string())
     }
 }

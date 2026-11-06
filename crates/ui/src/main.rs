@@ -3,6 +3,7 @@ mod chart;
 mod chat;
 mod job;
 mod models;
+mod logs;
 mod server;
 mod settings;
 mod shell;
@@ -25,6 +26,7 @@ pub enum Tab {
     Models,
     Bench,
     Server,
+    Logs,
     Settings,
 }
 
@@ -45,6 +47,8 @@ pub struct App {
     pub models: models::ModelsState,
     pub bench: bench::BenchState,
     pub server: server::ServerState,
+    pub logs: inference_bench_core::logging::LogBuffer,
+    pub logs_ui: logs::LogsState,
     pub settings_ui: settings::SettingsState,
 }
 
@@ -71,6 +75,8 @@ impl App {
             models: models::ModelsState::default(),
             bench: bench::BenchState::load(&dir),
             server: server::ServerState::default(),
+            logs: inference_bench_core::logging::LogBuffer::new(5000),
+            logs_ui: logs::LogsState::default(),
             settings_ui: settings::SettingsState::default(),
             settings,
             wake,
@@ -168,6 +174,11 @@ fn wake_for(ctx: &egui::Context) -> Wake {
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = args.first().map(PathBuf::from).unwrap_or_else(store::data_dir);
+    let buffer = inference_bench_core::logging::LogBuffer::new(5000);
+    let mut log = inference_bench_core::logging::LogConfig::default();
+    log.buffer = Some(buffer.clone());
+    log.file = Some(inference_bench_core::logging::FileLog::in_dir(inference_bench_core::logging::default_log_dir()));
+    let _log_guard = inference_bench_core::logging::init(&log).ok();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
@@ -183,7 +194,9 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             egui_bench::install(&cc.egui_ctx);
-            Ok(Box::new(App::new(dir, wake_for(&cc.egui_ctx))))
+            let mut app = App::new(dir, wake_for(&cc.egui_ctx));
+            app.logs = buffer;
+            Ok(Box::new(app))
         }),
     )
 }

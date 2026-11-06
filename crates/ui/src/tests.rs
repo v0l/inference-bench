@@ -49,6 +49,7 @@ fn harness(name: &str, tab: Tab) -> Harness<'static, App> {
         egui_bench::install(&cc.egui_ctx);
         let mut app = App::bare(d, wake_for(&cc.egui_ctx));
         app.tab = tab;
+        app.logs = shared_logs();
         app.library = vec![model("Qwen3-0.6B", true, "dense decoder"), model("Weird-7B", false, "model_type weird is not supported")];
         app
     })
@@ -56,7 +57,7 @@ fn harness(name: &str, tab: Tab) -> Harness<'static, App> {
 
 #[test]
 fn every_tab_draws() {
-    for tab in [Tab::Chat, Tab::Models, Tab::Bench, Tab::Server, Tab::Settings] {
+    for tab in [Tab::Chat, Tab::Models, Tab::Bench, Tab::Server, Tab::Logs, Tab::Settings] {
         let mut h = harness(&format!("tab{tab:?}"), tab);
         h.run();
         assert_eq!(h.state().tab, tab);
@@ -218,8 +219,8 @@ fn the_server_tab_starts_and_serves_the_loaded_model() {
     h.run();
     {
         let app = h.state_mut();
-        let (handle, wake) = (app.engine.handle(), app.wake.clone());
-        app.server.start(handle, 0, "", false, wake);
+        let handle = app.engine.handle();
+        app.server.start(handle, 0, "", false);
     }
     h.run();
     let url = h.state().server.running.as_ref().expect("server running").url();
@@ -227,7 +228,54 @@ fn the_server_tab_starts_and_serves_the_loaded_model() {
     let v: serde_json::Value = resp.body_mut().read_json().unwrap();
     assert_eq!(v["data"][0]["id"], "Qwen3-0.6B");
     h.run();
-    assert_eq!(h.state().server.running.as_ref().unwrap().log.lock().unwrap().len(), 1);
+    let logged = h.state().logs.snapshot(tracing::Level::INFO, "request finished");
+    assert!(logged.iter().any(|e| e.field("path") == Some("/v1/models") && e.field("status") == Some("200")), "{logged:?}");
+    let mut resp = ureq::post(format!("{url}/v1/chat/completions"))
+        .send_json(serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":8}))
+        .unwrap();
+    let v: serde_json::Value = resp.body_mut().read_json().unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "Hello **world**!");
+    h.state_mut().server.stop();
+}
+
+fn shared_logs() -> inference_bench_core::logging::LogBuffer {
+    use tracing_subscriber::layer::SubscriberExt;
+    static BUF: std::sync::OnceLock<inference_bench_core::logging::LogBuffer> = std::sync::OnceLock::new();
+    BUF.get_or_init(|| {
+        let b = inference_bench_core::logging::LogBuffer::new(500);
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry().with(b.clone()));
+        b
+    })
+    .clone()
+}
+
+#[test]
+fn the_logs_tab_filters_searches_and_saves() {
+    let mut h = harness("logs", Tab::Logs);
+    {
+        let app = h.state_mut();
+        app.logs = inference_bench_core::logging::LogBuffer::new(50);
+        for (level, text) in [(tracing::Level::ERROR, "disk failed"), (tracing::Level::INFO, "model loaded"), (tracing::Level::DEBUG, "token step")] {
+            app.logs.push(inference_bench_core::logging::LogEntry {
+                time: chrono::Utc::now(),
+                level,
+                target: "t".into(),
+                message: text.into(),
+                fields: vec![],
+                spans: vec![],
+            });
+        }
+    }
+    h.run();
+    assert!(h.query_by_label_contains("model loaded").is_some());
+    assert!(h.query_by_label_contains("token step").is_none(), "debug hidden at info");
+    h.state_mut().logs_ui.search = "disk".into();
+    h.run();
+    assert!(h.query_by_label_contains("model loaded").is_none());
+    assert!(h.query_by_label_contains("disk failed").is_some());
+    let path = crate::logs::save_path(&h.state().dir);
+    h.state().logs.save(&path, tracing::Level::TRACE, "").unwrap();
+    assert!(std::fs::read_to_string(path).unwrap().contains("token step"));
 }
 
 #[test]
@@ -302,8 +350,8 @@ fn screenshots_with_real_data() {
 
     {
         let app = h.state_mut();
-        let (handle, wake) = (app.engine.handle(), app.wake.clone());
-        app.server.start(handle, 0, "", false, wake);
+        let handle = app.engine.handle();
+        app.server.start(handle, 0, "", false);
         let url = app.server.running.as_ref().unwrap().url();
         for _ in 0..2 {
             let _ = ureq::get(format!("{url}/v1/models")).call();

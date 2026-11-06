@@ -13,7 +13,6 @@ pub mod matrix;
 pub mod openai;
 pub mod report;
 pub mod result;
-pub mod server;
 pub mod store;
 pub mod subprocess;
 

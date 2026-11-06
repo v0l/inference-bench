@@ -14,15 +14,20 @@ path = "src/main.rs"
 
 [dependencies]
 inference-bench-core.workspace = true
+inference-bench-server = { workspace = true, default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tracing.workspace = true
 anyhow.workspace = true
 eframe = "0.37"
 egui = "0.37"
 egui_bench = { version = "0.9.4", features = ["markdown"] }
 serde_json.workspace = true
 chrono.workspace = true
+
 serde.workspace = true
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ureq.workspace = true

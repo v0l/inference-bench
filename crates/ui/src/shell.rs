@@ -6,11 +6,12 @@ use inference_bench_core::library::human_size;
 const RAIL_W: f32 = 92.0;
 const RAIL_ITEM_H: f32 = 64.0;
 
-const TABS: [(Tab, &str); 5] = [
+const TABS: [(Tab, &str); 6] = [
     (Tab::Chat, "chat"),
     (Tab::Models, "models"),
     (Tab::Bench, "bench"),
     (Tab::Server, "server"),
+    (Tab::Logs, "logs"),
     (Tab::Settings, "settings"),
 ];
 
@@ -67,6 +68,12 @@ fn glyph(p: &egui::Painter, tab: Tab, c: Pos2, tint: egui::Color32) {
             p.rect_stroke(Rect::from_center_size(c + Vec2::new(0.0, 6.0), Vec2::new(22.0, 8.0)), 1.0, s, egui::StrokeKind::Middle);
             p.circle_filled(c + Vec2::new(-7.0, -5.0), 1.5, tint);
             p.circle_filled(c + Vec2::new(-7.0, 6.0), 1.5, tint);
+        }
+        Tab::Logs => {
+            for (i, w) in [20.0, 14.0, 22.0, 10.0].iter().enumerate() {
+                let y = -9.0 + i as f32 * 6.0;
+                p.line_segment([c + Vec2::new(-11.0, y), c + Vec2::new(-11.0 + w, y)], Stroke::new(2.0, tint));
+            }
         }
         Tab::Settings => {
             for (i, x) in [-0.4f32, 0.5, -0.1].iter().enumerate() {
@@ -137,6 +144,7 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
             Tab::Models => crate::models::draw(app, ui),
             Tab::Bench => crate::bench::draw(app, ui),
             Tab::Server => crate::server::draw(app, ui),
+            Tab::Logs => crate::logs::draw(app, ui),
             Tab::Settings => crate::settings::draw(app, ui),
         }
     });

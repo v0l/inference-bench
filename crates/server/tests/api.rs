@@ -283,3 +283,29 @@ fn graceful_shutdown_drains_in_flight_requests() {
     assert!(out.contains("w3 ") && out.contains("[DONE]"), "{out}");
     rig.rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), handle.wait()).await.unwrap().unwrap() });
 }
+
+#[test]
+fn streaming_sends_several_chunks_spread_over_time_before_done() {
+    let shape = Shape { tokens: 8, first_delay_ms: 0, token_delay_ms: 60 };
+    let rig = start(config("[[models]]\nid='m'"), shape);
+    let body = json!({"model": "m", "messages": [{"role": "user", "content": "go"}], "max_tokens": 8, "stream": true});
+    let mut s = rig.raw_post("/v1/chat/completions", &body.to_string());
+    let started = std::time::Instant::now();
+    let mut first_content = None;
+    let mut seen = String::new();
+    while !seen.contains("[DONE]") {
+        let more = read_until(&mut s, "\n\n");
+        if more.is_empty() {
+            break;
+        }
+        seen.push_str(&more);
+        if first_content.is_none() && seen.contains("\"content\":\"w0 ") {
+            first_content = Some(started.elapsed());
+        }
+    }
+    let total = started.elapsed();
+    let chunks = seen.matches("\"content\":\"w").count();
+    assert!(chunks >= 6, "{chunks} content chunks in {seen}");
+    assert!(first_content.unwrap() < total / 2, "first {:?} total {total:?}", first_content);
+    rig.stop();
+}
