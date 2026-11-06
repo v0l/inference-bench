@@ -91,6 +91,7 @@ pub struct Runtime {
     buf: Buffers,
     pre: PrefillBuffers,
     chunk: usize,
+    use_mma: bool,
     pub cache_hit: bool,
     pub jit_key: String,
     pub arch: String,
@@ -108,7 +109,7 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 }
 
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
-const PREFILL_CHUNK: usize = 256;
+const PREFILL_CHUNK: usize = 512;
 const SHARED_SCORES_MAX_CTX: usize = 4096;
 const SCORE_BUDGET_FLOATS: usize = 1 << 26;
 const GEMM_TILE: usize = 64;
@@ -197,6 +198,8 @@ impl Runtime {
         let rt = Runtime {
             pre,
             chunk,
+            use_mma: ctx.compute_capability()?.0 >= 8
+                && std::env::var_os("SPECRT_GEMM_FP32").is_none(),
             spec: spec.clone(),
             max_ctx,
             embed: stream.clone_htod(&weights.embed)?,
@@ -322,7 +325,8 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel(name));
+        let name = if self.use_mma { name.replace("_gemm", "_mma") } else { name.to_string() };
+        let mut b = self.stream.launch_builder(self.kernel(&name));
         match w {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
             DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
@@ -331,7 +335,7 @@ impl Runtime {
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out).arg(&n);
         let config = LaunchConfig {
             grid_dim: (grid(rows, GEMM_TILE), grid(tokens, GEMM_TILE), 1),
-            block_dim: (256, 1, 1),
+            block_dim: (if self.use_mma { 128 } else { 256 }, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
@@ -402,7 +406,9 @@ impl Runtime {
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
-            let mut b = self.stream.launch_builder(self.kernel("attention"));
+            let attn_kernel = if self.use_mma { "flash_mma" } else { "flash_attention" };
+            let mut b = self.stream.launch_builder(self.kernel(attn_kernel));
+            let ntok = n as i32;
             b.arg(&pre.qkv)
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
@@ -410,10 +416,10 @@ impl Runtime {
                 .arg(&buf.pos)
                 .arg(&layer)
                 .arg(&pre.attn)
-                .arg(&buf.scores);
+                .arg(&ntok);
             let config = LaunchConfig {
-                grid_dim: (a.heads as u32, n as u32, 1),
-                block_dim: (512, 1, 1),
+                grid_dim: (grid(n, if self.use_mma { 64 } else { 16 }), a.heads as u32, 1),
+                block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
