@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod batch;
 pub mod logging;
 pub mod bench;
 pub mod chat;

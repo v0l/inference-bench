@@ -110,6 +110,23 @@ name = "m2"
 }
 
 #[test]
+fn batch_runs_each_size_concurrently_and_prints_json() {
+    let s = server(&["m"]);
+    let o = bin()
+        .args(["batch", "--backend", "openai", "--url", &s.url, "--label", "fake", "--model", "m"])
+        .args(["--prompt-len", "64", "--max-tokens", "3", "--sizes", "1,4", "--json"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let printed: Vec<inference_bench_core::batch::BatchResult> = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(printed.iter().map(|r| r.batch).collect::<Vec<_>>(), vec![1, 4]);
+    assert_eq!(printed[1].completion_tokens, 12);
+    assert!(printed.iter().all(|r| r.backend == "fake" && r.decode_tok_s > 0.0));
+    let sent = s.requests.lock().unwrap();
+    assert!(sent.iter().any(|r| r.contains("Summarise the following text")));
+}
+
+#[test]
 fn an_unreachable_openai_backend_is_a_failed_run_not_a_crash() {
     let out = tmp("dead");
     let o = bin()
