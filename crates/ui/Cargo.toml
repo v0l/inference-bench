@@ -17,6 +17,12 @@ inference-bench-core.workspace = true
 anyhow.workspace = true
 eframe = "0.37"
 egui = "0.37"
-egui_bench = "0.9.4"
+egui_bench = { version = "0.9.4", features = ["markdown"] }
 serde_json.workspace = true
 chrono.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["eframe", "wgpu"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+ureq.workspace = true

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub struct BenchModel {
     pub name: String,
     pub ids: Vec<(String, String)>,
+    pub skips: Vec<(String, String)>,
 }
 
 impl BenchModel {
@@ -89,12 +90,15 @@ pub fn run_plan(
                         r.model = tagged(&model.name, len);
                         r
                     }
-                    (Ok(_), None) => RunResult::failed(
-                        label,
-                        &tagged(&model.name, len),
-                        chrono::Utc::now(),
-                        crate::result::BackendError::unsupported(format!("{} has no way to load {}", label, model.name)),
-                    ),
+                    (Ok(_), None) => {
+                        let why = model
+                            .skips
+                            .iter()
+                            .find(|(b, _)| b == label)
+                            .map(|(_, r)| r.clone())
+                            .unwrap_or_else(|| format!("{label} has no way to load {}", model.name));
+                        RunResult::failed(label, &tagged(&model.name, len), chrono::Utc::now(), crate::result::BackendError::classify(why))
+                    }
                     (Err(e), _) => RunResult::failed(label, &tagged(&model.name, len), chrono::Utc::now(), e.clone()),
                 };
                 on_result(index, &cell, result);
@@ -224,8 +228,8 @@ mod tests {
     fn plan(a: &FakeServer, b: &FakeServer) -> BenchPlan {
         BenchPlan {
             models: vec![
-                BenchModel { name: "m1".into(), ids: vec![("a".into(), "m1".into()), ("b".into(), "m1".into())] },
-                BenchModel { name: "m2".into(), ids: vec![("a".into(), "m2".into()), ("b".into(), "m2".into())] },
+                BenchModel { name: "m1".into(), ids: vec![("a".into(), "m1".into()), ("b".into(), "m1".into())], skips: vec![] },
+                BenchModel { name: "m2".into(), ids: vec![("a".into(), "m2".into()), ("b".into(), "m2".into())], skips: vec![] },
             ],
             backends: vec![("a".into(), openai(&a.url)), ("b".into(), openai(&b.url))],
             prompt_lengths: vec![32, 128],
