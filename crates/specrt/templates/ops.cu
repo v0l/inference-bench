@@ -614,6 +614,106 @@ extern "C" __global__ void attention(const float* qkv, const float* k_cache, con
     }
 }
 
+constexpr int FA_BQ = 16;
+constexpr int FA_BK = 32;
+constexpr int FA_THREADS = 128;
+constexpr int FA_STRIDE = HEAD_DIM + 1;
+constexpr int FA_OUT = HEAD_DIM / 8;
+
+extern "C" __global__ void flash_attention(const float* qkv, const float* k_cache, const float* v_cache,
+                                           const int* block_table, const int* pos_ptr, int layer, float* out, int tokens) {
+    __shared__ float qs[FA_BQ][FA_STRIDE];
+    __shared__ float ks[FA_BK][FA_STRIDE];
+    __shared__ float vs[FA_BK][HEAD_DIM];
+    __shared__ float ps[FA_BQ][FA_BK + 1];
+    int head = blockIdx.y;
+    int kv_head = head / GROUP;
+    int q0 = blockIdx.x * FA_BQ;
+    int base = pos_ptr[0];
+    int tid = threadIdx.x;
+    int qr = tid >> 3;
+    int sub = tid & 7;
+    int qi = q0 + qr;
+    int pos = base + qi;
+    float scale = rsqrtf((float)HEAD_DIM);
+    for (int i = tid; i < FA_BQ * HEAD_DIM; i += FA_THREADS) {
+        int r = i / HEAD_DIM;
+        int d = i % HEAD_DIM;
+        int q = q0 + r;
+        qs[r][d] = q < tokens ? qkv[(size_t)q * (Q_DIM + 2 * KV_DIM) + head * HEAD_DIM + d] : 0.0f;
+    }
+    float o[FA_OUT];
+#pragma unroll
+    for (int i = 0; i < FA_OUT; i++) o[i] = 0.0f;
+    float m = NEG_INF;
+    float l = 0.0f;
+    int last = min(q0 + FA_BQ, tokens) - 1;
+    int key_end = base + last + 1;
+    for (int k0 = 0; k0 < key_end; k0 += FA_BK) {
+        __syncthreads();
+        for (int i = tid; i < FA_BK * HEAD_DIM; i += FA_THREADS) {
+            int r = i / HEAD_DIM;
+            int d = i % HEAD_DIM;
+            int t = k0 + r;
+            float kv = 0.0f, vv = 0.0f;
+            if (t < key_end) {
+                size_t slot = (((size_t)layer * PAGES + block_table[t / PAGE]) * KV_HEADS + kv_head) * PAGE + t % PAGE;
+                kv = k_cache[slot * HEAD_DIM + d];
+                vv = v_cache[slot * HEAD_DIM + d];
+            }
+            ks[r][d] = kv;
+            vs[r][d] = vv;
+        }
+        __syncthreads();
+        float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll 8
+        for (int d = 0; d < HEAD_DIM; d++) {
+            float qv = qs[qr][d];
+#pragma unroll
+            for (int j = 0; j < 4; j++) s[j] += qv * ks[sub * 4 + j][d];
+        }
+        float tile_max = NEG_INF;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int t = k0 + sub * 4 + j;
+            s[j] = (t <= pos && t < key_end) ? s[j] * scale : NEG_INF;
+            tile_max = fmaxf(tile_max, s[j]);
+        }
+        tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
+        tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
+        tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 4));
+        float m_new = fmaxf(m, tile_max);
+        float alpha = m == NEG_INF ? 0.0f : expf(m - m_new);
+        float row_sum = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float p = s[j] == NEG_INF ? 0.0f : expf(s[j] - m_new);
+            ps[qr][sub * 4 + j] = p;
+            row_sum += p;
+        }
+        row_sum += __shfl_xor_sync(0xffffffff, row_sum, 1);
+        row_sum += __shfl_xor_sync(0xffffffff, row_sum, 2);
+        row_sum += __shfl_xor_sync(0xffffffff, row_sum, 4);
+        l = l * alpha + row_sum;
+        m = m_new;
+#pragma unroll
+        for (int i = 0; i < FA_OUT; i++) o[i] *= alpha;
+        __syncwarp();
+#pragma unroll 8
+        for (int j = 0; j < FA_BK; j++) {
+            float p = ps[qr][j];
+#pragma unroll
+            for (int i = 0; i < FA_OUT; i++) o[i] += p * vs[j][sub + 8 * i];
+        }
+    }
+    if (qi < tokens) {
+        float inv = 1.0f / l;
+        float* dst = out + (size_t)qi * Q_DIM + head * HEAD_DIM;
+#pragma unroll
+        for (int i = 0; i < FA_OUT; i++) dst[sub + 8 * i] = o[i] * inv;
+    }
+}
+
 extern "C" __global__ void swiglu(const float* gate_up, float* out) {
     gate_up += (size_t)blockIdx.y * 2 * INTER;
     out += (size_t)blockIdx.y * INTER;

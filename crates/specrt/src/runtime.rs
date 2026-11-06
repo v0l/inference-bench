@@ -406,7 +406,8 @@ impl Runtime {
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
-            let mut b = self.stream.launch_builder(self.kernel("attention"));
+            let mut b = self.stream.launch_builder(self.kernel("flash_attention"));
+            let ntok = n as i32;
             b.arg(&pre.qkv)
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
@@ -414,10 +415,10 @@ impl Runtime {
                 .arg(&buf.pos)
                 .arg(&layer)
                 .arg(&pre.attn)
-                .arg(&buf.scores);
+                .arg(&ntok);
             let config = LaunchConfig {
-                grid_dim: (a.heads as u32, n as u32, 1),
-                block_dim: (512, 1, 1),
+                grid_dim: (grid(n, 16), a.heads as u32, 1),
+                block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
