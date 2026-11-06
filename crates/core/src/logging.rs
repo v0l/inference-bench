@@ -302,7 +302,7 @@ impl LogEntry {
             self.target,
             self.message
         );
-        for (k, v) in self.spans.iter().chain(self.fields.iter()) {
+        for (k, v) in self.spans.iter().filter(|(k, _)| !self.fields.iter().any(|(f, _)| f == k)).chain(self.fields.iter()) {
             let _ = write!(s, " {k}={v}");
         }
         s

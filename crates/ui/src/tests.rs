@@ -399,3 +399,47 @@ fn screenshots_with_real_data() {
     h.state_mut().models.pane = crate::models::Pane::Discover;
     shot(&mut h, "models-discover");
 }
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+fn screenshots_of_the_server_and_logs_tabs() {
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
+    std::fs::create_dir_all(&out).unwrap();
+    let fake = FakeServer::start(script());
+    let mut h = harness("shots-logs", Tab::Server);
+    {
+        let app = h.state_mut();
+        app.logs = shared_logs();
+        app.logs.clear();
+        app.settings.endpoints = vec![Endpoint { label: "fake".into(), backend: "vllm".into(), url: fake.url.clone(), api_key: String::new() }];
+        let m = app.library[0].clone();
+        app.load_model("fake", &m);
+    }
+    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
+    {
+        let handle = h.state().engine.handle();
+        let url = {
+            let app = h.state_mut();
+            app.server.start(handle, 0, "", false);
+            let url = app.server.running.as_ref().unwrap().url();
+            let _ = ureq::get(format!("{url}/v1/models")).call();
+            let _ = ureq::get(format!("{url}/health")).call();
+            let _ = ureq::post(format!("{url}/v1/chat/completions"))
+                .send_json(serde_json::json!({"messages":[{"role":"user","content":"Say hi"}],"max_tokens":24}));
+            let _ = ureq::get(format!("{url}/nothing")).call();
+            tracing::warn!(target: "specrt", "jit cache miss, compiling kernels");
+            std::thread::sleep(Duration::from_millis(200));
+            url
+        };
+        assert!(url.starts_with("http://"));
+    }
+    let shot = |h: &mut Harness<'static, App>, name: &str| {
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    };
+    shot(&mut h, "server");
+    h.state_mut().tab = Tab::Logs;
+    h.state_mut().logs_ui.level = tracing::Level::DEBUG;
+    shot(&mut h, "logs");
+    h.state_mut().server.stop();
+}
