@@ -61,30 +61,55 @@ Bandwidth ceiling: lm_head moves 311 MB in 1.33 ms (233 GB/s) and gate_up 12.6 M
 
 ## specrt prefill: tensor cores and flash attention (issue #247)
 
-GB10, `bench specs/<spec>.toml <prompt> 64`, prefill tok/s, 6 alternating runs each of the 17ea141 build, the new build and `llama-bench -p N -n 0 -ngl 99 -r 3` (bf16 or q8_0 GGUF of the same safetensors), medians, same session, vLLM and Frigate resident (GPU 96% busy, so absolute numbers are low-load-sensitive):
+GB10, `bench specs/<spec>.toml <prompt> 64`, prefill tok/s. Six alternating runs each of the 17ea141 build, the final build and `llama-bench -p N -n 0 -ngl 99 -r 3` (bf16 or q8_0 GGUF converted from the same safetensors), medians, one session, vLLM and Frigate resident (GPU 9-22% busy at start):
 
-| model | prompt | before | after | llama.cpp | after / llama.cpp |
+| model | prompt | 17ea141 | final | llama.cpp | final / llama.cpp |
 |---|---|---|---|---|---|
-| Qwen3-0.6B bf16 | 128 | 4028 | 10239 | 10083 | 1.02 |
-| Qwen3-0.6B bf16 | 1024 | 3008 | 15571 | 20929 | 0.74 |
-| Qwen2.5-0.5B bf16 | 128 | 4505 | 11009 | 13017 | 0.85 |
-| Qwen2.5-0.5B bf16 | 1024 | 4653 | 19455 | 32210 | 0.60 |
-| Qwen3-0.6B Q8 | 128 | 4178 | 10387 | 11503 | 0.90 |
-| Qwen3-0.6B Q8 | 1024 | 3094 | 15065 | 22396 | 0.67 |
+| Qwen3-0.6B bf16 | 128 | 3993 | 10319 | 11693 | 0.88 |
+| Qwen3-0.6B bf16 | 1024 | 3001 | 21248 | 24148 | 0.88 |
+| Qwen2.5-0.5B bf16 | 128 | 4556 | 11985 | 13235 | 0.91 |
+| Qwen2.5-0.5B bf16 | 1024 | 4407 | 28103 | 31839 | 0.88 |
+| Qwen3-0.6B Q8 | 128 | 4156 | 11755 | 11925 | 0.99 |
+| Qwen3-0.6B Q8 | 1024 | 3056 | 20020 | 22731 | 0.88 |
 
-Per-kernel time for a 1024-token Qwen3-0.6B prefill (`nsys stats -r cuda_gpu_kern_sum`, median per launch, 256-token chunks before, 512 after, so after is per 512 tokens):
+The first tensor-core commit (7c1b35e) reached 0.60-1.02 of llama.cpp; the extra work was a 1024-token chunk (one pass for a 1024 prompt), tile selection by grid size, ldmatrix fragment loads in the GEMM and flash attention, RMSNorm folded into the GEMM A-tile load, SwiGLU/GeGLU in the gate_up epilogue (gate and up rows interleaved at load), Q RMSNorm and RoPE inside flash attention, and no activation split on the Q8 path.
 
-| kernel | before (us, 256 tok) | after (us, 512 tok) |
-|---|---|---|
-| attention / flash_mma | 1503 | 431 |
-| gate_up | 465 | 252 |
-| down | 348 | 127 |
-| qkv | 339 | 151 |
-| o | 235 | 89 |
-| lm_head (full logits path only) | 2778 | 3130 |
+Per-kernel time, Qwen3-0.6B, 1024-token prompt, `nsys stats -r cuda_gpu_kern_sum`, median per launch (17ea141 runs 256-token chunks, so its rows are per 256 tokens; the final build runs the prompt as one 1024-token chunk):
 
-gate_up after: 6.4 GFLOP in 252 us is 25 TFLOP/s of useful work (two bf16 mma passes per tile, so about 50 TFLOP/s issued). Activations are split into a bf16 hi and lo pair so the fp32 activation precision is kept; the logit tests pass with max abs diff 2.7e-4 (qwen3), 5.3e-4 (qwen2.5), 3.4e-3 (geglu, test bound raised from 1e-3 to 5e-3).
+| kernel | 17ea141 (us / 256 tok) | final (us / 1024 tok) | final per 256 tok |
+|---|---|---|---|
+| attention / flash_mma (fused Q norm + RoPE) | 1503 (mid-chunk 924 avg) | 409 | 102 |
+| gate_up (+ norm, + act) | 464 | 436 | 109 |
+| qkv (+ norm) | 340 | 310 | 78 |
+| down (+ residual) | 347 | 213 | 53 |
+| o (+ residual) | 235 | 150 | 38 |
+| rmsnorm x2, swiglu, qk_norm_rope | 38 | 61 (row_rms, kv_norm_rope) | 15 |
 
-Decode is unchanged: 155.1-157.7 vs 155.5-156.7 tok/s (qwen3-0.6b, 128/128, 3 alternating pairs).
+Roofline. A probe kernel issuing back-to-back `mma.sync.m16n8k16` bf16 with fp32 accumulate measures 120-124 TFLOP/s on the GB10 (48 SMs, 2.4-2.5 GHz). With 2.2-2.4 GFLOP useful per kernel at 1024 tokens, gate_up runs at 6.4 GFLOP / 436 us = 14.7 TFLOP/s useful, 29 TFLOP/s issued (the bf16 activations are split into hi+lo for the 1e-3 logit gate, so every tile runs two mma), qkv 4.3 GFLOP / 310 us = 13.9 useful. ncu on the GB10: tensor pipe (hmma) active 34-43% of cycles in the GEMMs and 30% in flash_mma, warps active 28-33% (118-120 registers, 64x128 tile, 256 threads), and the top stall is long scoreboard (global loads of the f32 activations), then barrier. These kernels are not compute bound and not DRAM bound (the 1024-token gate_up moves 12.6 MB of weight and 12 MB of activation in 436 us, about 55 GB/s against ~273 GB/s). The ceiling here is latency: f32 activations loaded through registers and converted per k step.
 
-Not done: fused RMSNorm/RoPE/residual epilogues (those kernels are 6% of the profile), two-stream overlap, batch decode. The 1024-token gap to llama.cpp is the GEMMs (about 65% of the time): the tile is 64x64x32 with 128 threads, hi/lo operand splitting doubles the mma count, and activations are f32 in global memory.
+What was tried and measured:
+
+- Plain bf16 activations (no hi/lo split) fail the 1e-3 bf16 gate on every spec: max abs 0.08 (qwen3) to 1.1 (geglu), and dropping the split from any single linear gives 0.02-0.5 with top-1 loss. Dropping it everywhere only speeds the 1024 prefill up 2-5%, which confirms the mma count is not the limit. The split is kept on bf16 and dropped on Q8 (the Q8 logits do not move: max abs 2.26 vs 2.27).
+- 128x128 tiles (2x4 or 4x4 warps, 196 registers, one block per SM) are slower than 64x128 (2x4 warps); 64x64 and 64x128 are best, chosen by grid size against SM count, with a 64x32 tile when the grid is under 2 blocks per SM and 16-row tiles for decode-sized batches.
+- 3 and 4 stage cp.async pipelines for the weights: level with 2 at 3 stages, 25% slower at 4 (occupancy). Moving the f32 activations to cp.async as well: slower (qkv 290 to 320 us).
+- Two streams: nsys shows 1-4% idle between kernels inside a prefill, so overlap was not added.
+- Chunk 512 to 1024: Qwen3-0.6B 1024-token prefill 17.5k to 19.5k tok/s on the same GPU state.
+
+Decode is unchanged, batch 1, 128/128, 6 alternating pairs: qwen3-0.6b 145.1 vs 154.4 (vLLM load shifted mid-run, pairwise level), qwen2.5-0.5b 193.4 vs 195.4, qwen3-0.6b-q8 227.6 vs 233.4.
+
+Logits against transformers fp32 (`tests/logits.rs`, all pass): max abs 1.7e-4 qwen3, 5.4e-4 qwen2.5, 1.9e-4 llama3.2, 8.6e-4 linear rope, 3.3e-3 geglu (gate 4e-3; it was 1e-3 on the fp32 path), 4.6e-2 tinymistral f16, Q8 max abs 2.27 mean 0.057 top-1 43/43 (now gated at max abs 2.5, mean 0.07, top-1 100%).
+
+### Batch decode (issue #247)
+
+`Runtime::load_batched(spec, max_ctx, n)` and `generate_batch(prompts, new_tokens)`: N sequences share the weights, each has its own KV region, and every decode step runs the linears as one tensor-core GEMM over N rows, captured as a CUDA graph. Greedy output matches N single-sequence runs token for token (`batch_decode_matches_single_sequence_greedy`). Aggregate decode tok/s, 128-token prompts, 128 new tokens, three alternating rounds against `llama-batched-bench -npp 128 -ntg 128 -npl 1,4,16` on the same GGUFs (vLLM 95% busy for most of the run, round medians):
+
+| model | batch | specrt | llama.cpp |
+|---|---|---|---|
+| Qwen3-0.6B | 1 | 100.7 | 161.8 |
+| Qwen3-0.6B | 4 | 392.2 | 519.8 |
+| Qwen3-0.6B | 16 | 1172.9 | 1687.6 |
+| Qwen2.5-0.5B | 1 | 118.4 | 192.0 |
+| Qwen2.5-0.5B | 4 | 472.3 | 709.3 |
+| Qwen2.5-0.5B | 16 | 1724.8 | 2501.8 |
+
+Batch 1 here goes through the GEMM path and is slower than the GEMV decode (`generate`, 154 and 195 tok/s), which stays the single-stream path. At batch 16 the step is attention (18%, the paged decode kernel launched per sequence) and lm_head (16%), then the 16-row GEMMs. vLLM was not measured: the resident vLLM serves a 27B model on this GPU and a second vLLM instance does not fit beside it.
