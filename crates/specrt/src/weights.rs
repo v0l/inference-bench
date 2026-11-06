@@ -58,14 +58,57 @@ struct Reader<'a> {
 impl Reader<'_> {
     fn bf16(&self, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
         let t = self.st.tensor(name).with_context(|| name.to_string())?;
-        ensure!(t.dtype() == Dtype::BF16, "{name} is {:?}, expected bf16", t.dtype());
         ensure!(t.shape() == shape, "{name} has shape {:?}, expected {shape:?}", t.shape());
-        Ok(t.data().as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes([b[0], b[1]])).collect())
+        match t.dtype() {
+            Dtype::BF16 => Ok(t
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect()),
+            Dtype::F16 => Ok(t
+                .data()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| f32_to_bf16(f16_to_f32(u16::from_le_bytes([b[0], b[1]]))))
+                .collect()),
+            Dtype::F32 => Ok(t
+                .data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32_to_bf16(f32::from_le_bytes(*b)))
+                .collect()),
+            other => bail!("{name} is {other:?}, expected bf16, f16 or f32"),
+        }
     }
 
     fn f32(&self, name: &str, len: usize) -> Result<Vec<f32>> {
         Ok(self.bf16(name, &[len])?.into_iter().map(bf16_to_f32).collect())
     }
+}
+
+pub fn f16_to_f32(v: u16) -> f32 {
+    let sign = if v & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let exp = ((v >> 10) & 0x1f) as i32;
+    let frac = (v & 0x3ff) as f32;
+    match exp {
+        0 => sign * frac * 2f32.powi(-24),
+        31 if frac == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+pub fn f32_to_bf16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    if v.is_nan() {
+        return ((bits >> 16) | 0x40) as u16;
+    }
+    let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
 }
 
 pub fn bf16_to_f32(v: u16) -> f32 {
@@ -169,4 +212,18 @@ pub fn find_in_snapshot(repo: &str, file: &str) -> Result<PathBuf> {
         }
     }
     bail!("no {file} for {repo} under {}", snapshots.display())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_converts_to_bf16() {
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0xc000), -2.0);
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
+        assert_eq!(f32_to_bf16(1.0), 0x3f80);
+        assert_eq!(bf16_to_f32(f32_to_bf16(f16_to_f32(0x3555))), 0.333_984_38);
+    }
 }

@@ -55,6 +55,21 @@ Measured on spark (GB10, torch 2.9.1, transformers 4.57.3):
 | qwen2.5-0.5b (bf16) | 1.6e-4 | 1.1e-5 | 43/43 | identical |
 | qwen3-0.6b-q8 | 2.27 | 0.057 | 43/43 | not checked |
 
+Features added for issue #244, each checked against transformers (fp32, CPU) on the RTX PRO 6000:
+
+| spec | what it exercises | max abs diff | top-1 |
+|---|---|---|---|
+| llama-3.2-1b | Llama 3.x `rope_scaling` llama3 | 8e-5 | 43/43 |
+| qwen2.5-0.5b-linear4 | linear `rope_scaling` factor 4 (Qwen2.5 weights, scaling forced in both) | 2.4e-4 | all |
+| qwen2.5-0.5b-geglu | gelu_pytorch_tanh gated MLP (Qwen2.5 weights, activation forced in both) | 4.9e-4 | all |
+| tinymistral-248m | Mistral, float16 checkpoint (sliding window off in the reference) | 4.6e-2 | all |
+
+Dropping the scaling or switching the activation back to SwiGLU moves the logits by 0.2 to 19, so
+the tests fail if the kernel math is wrong. Still unsupported, reported as unsupported
+architecture: gemma2/gemma3 (embedding scale, `(1 + w)` RMSNorm, extra pre/post feedforward
+norms, logit softcapping), phi3 (fused qkv and gate_up weight names), smollm3 (NoPE layers), and
+yarn or longrope scaling.
+
 The bf16 tests assert max abs diff at most 1e-3 plus identical greedy output. The Q8 test asserts
 mean abs diff at most 0.1 and top-1 agreement of at least 95%.
 

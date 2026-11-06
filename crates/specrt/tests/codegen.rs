@@ -69,3 +69,23 @@ fn module_has_batched_gemm_for_every_linear() {
     }
     assert!(m.source.contains("gemm<1152, 896, true, false, false>"));
 }
+
+#[test]
+fn rope_scaling_and_activation_are_baked() {
+    let mut s = spec("qwen3-0.6b.toml");
+    let plain = Module::generate(&s, 256).unwrap();
+    assert!(plain.source.contains("constexpr int ROPE_KIND = 0;"));
+    assert!(plain.source.contains("constexpr int ACT_KIND = 0;"));
+    s.rope.scaling = Some(specrt::spec::RopeScaling {
+        kind: specrt::spec::RopeScalingKind::Linear,
+        factor: 4.0,
+        low_freq_factor: None,
+        high_freq_factor: None,
+        original_max_positions: None,
+    });
+    s.mlp.activation = specrt::spec::Activation::Geglu;
+    let m = Module::generate(&s, 256).unwrap();
+    assert!(m.source.contains("constexpr int ROPE_KIND = 1;"));
+    assert!(m.source.contains("constexpr int ACT_KIND = 1;"));
+    assert!(!m.source.contains("{{"));
+}

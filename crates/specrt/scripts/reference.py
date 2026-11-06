@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 PROMPT = (
     "The spec-driven runtime reads a TOML file describing the model, renders CUDA "
@@ -21,7 +21,19 @@ def main():
     spec = tomllib.loads(spec_path.read_text())
     torch.manual_seed(0)
     tok = AutoTokenizer.from_pretrained(spec["repo"])
-    model = AutoModelForCausalLM.from_pretrained(spec["repo"], torch_dtype=torch.float32)
+    config = AutoConfig.from_pretrained(spec["repo"])
+    config.sliding_window = None
+    scaling = spec["rope"].get("scaling")
+    if scaling:
+        config.rope_scaling = {
+            "rope_type": scaling["kind"],
+            "factor": scaling["factor"],
+            **{k: v for k, v in scaling.items() if k not in ("kind", "factor", "original_max_positions")},
+            **({"original_max_position_embeddings": int(scaling["original_max_positions"])} if "original_max_positions" in scaling else {}),
+        }
+    if spec["mlp"]["activation"] == "geglu":
+        config.hidden_act = "gelu_pytorch_tanh"
+    model = AutoModelForCausalLM.from_pretrained(spec["repo"], config=config, torch_dtype=torch.float32)
     model.eval()
     ids = tok(PROMPT, return_tensors="pt").input_ids
     with torch.inference_mode():

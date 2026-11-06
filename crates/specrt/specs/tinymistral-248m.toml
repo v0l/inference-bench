@@ -1,0 +1,32 @@
+name = "tinymistral-248m"
+repo = "Locutusque/TinyMistral-248M"
+quant = "bf16"
+
+[dims]
+hidden = 1024
+intermediate = 4096
+vocab = 32005
+tie_embeddings = false
+
+[layers]
+count = 12
+pattern = ["dense"]
+
+[norm]
+kind = "rmsnorm"
+eps = 1e-6
+
+[attention]
+kind = "gqa"
+heads = 32
+kv_heads = 8
+head_dim = 32
+qkv_bias = false
+qk_norm = false
+
+[rope]
+style = "neox"
+theta = 10000.0
+
+[mlp]
+activation = "swiglu"

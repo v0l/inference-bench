@@ -1,0 +1,39 @@
+name = "llama-3.2-1b"
+repo = "unsloth/Llama-3.2-1B"
+quant = "bf16"
+
+[dims]
+hidden = 2048
+intermediate = 8192
+vocab = 128256
+tie_embeddings = true
+
+[layers]
+count = 16
+pattern = ["dense"]
+
+[norm]
+kind = "rmsnorm"
+eps = 1e-5
+
+[attention]
+kind = "gqa"
+heads = 32
+kv_heads = 8
+head_dim = 64
+qkv_bias = false
+qk_norm = false
+
+[rope]
+style = "neox"
+theta = 500000.0
+
+[rope.scaling]
+kind = "llama3"
+factor = 32.0
+low_freq_factor = 1.0
+high_freq_factor = 4.0
+original_max_positions = 8192.0
+
+[mlp]
+activation = "swiglu"
