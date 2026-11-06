@@ -119,15 +119,15 @@ impl Settings {
 mod tests {
     use super::*;
 
-    fn temp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ib-settings-{}", std::process::id()));
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ib-settings-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
 
     #[test]
     fn settings_round_trip_and_keys_are_private() {
-        let dir = temp();
+        let dir = temp("a");
         let mut s = Settings::default();
         s.endpoints[0].api_key = "sk-secret".into();
         s.save(&dir).unwrap();
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn a_missing_or_broken_file_gives_defaults() {
-        let dir = temp();
+        let dir = temp("b");
         assert_eq!(Settings::load(&dir), Settings::default());
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(Settings::path(&dir), "{nope").unwrap();
