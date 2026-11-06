@@ -86,21 +86,49 @@ pub fn run_plan(
                         };
                         loaded = r.error.is_none();
                         r.text = r.text.chars().take(2000).collect();
+                        r.model = tagged(&model.name, len);
                         r
                     }
                     (Ok(_), None) => RunResult::failed(
                         label,
-                        &model.name,
+                        &tagged(&model.name, len),
                         chrono::Utc::now(),
                         crate::result::BackendError::unsupported(format!("{} has no way to load {}", label, model.name)),
                     ),
-                    (Err(e), _) => RunResult::failed(label, &model.name, chrono::Utc::now(), e.clone()),
+                    (Err(e), _) => RunResult::failed(label, &tagged(&model.name, len), chrono::Utc::now(), e.clone()),
                 };
                 on_result(index, &cell, result);
                 index += 1;
             }
         }
     }
+}
+
+pub fn tagged(model: &str, len: usize) -> String {
+    format!("{model} @{len}")
+}
+
+pub fn save_session(dir: &std::path::Path, results: &[RunResult]) -> std::io::Result<String> {
+    let folder = dir.join("sessions");
+    std::fs::create_dir_all(&folder)?;
+    let name = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let file = folder.join(format!("{}.json", name.replace([' ', ':'], "-")));
+    std::fs::write(file, serde_json::to_string_pretty(results)?)?;
+    Ok(name)
+}
+
+pub fn load_sessions(dir: &std::path::Path) -> Vec<(String, Vec<RunResult>)> {
+    let Ok(entries) = std::fs::read_dir(dir.join("sessions")) else { return Vec::new() };
+    let mut out: Vec<(String, Vec<RunResult>)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let stem = e.path().file_stem()?.to_string_lossy().into_owned();
+            let results = serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
+            Some((stem, results))
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 fn run_model_loaded(
@@ -223,6 +251,21 @@ mod tests {
         assert_eq!(miss.kind, crate::result::ErrorKind::ModelNotFound);
         let sent = a.requests.lock().unwrap().iter().filter(|r| r.starts_with("/v1/completions")).count();
         assert_eq!(sent, 6, "one warmup and two timed runs per model");
+    }
+
+    #[test]
+    fn results_carry_the_prompt_length_and_sessions_round_trip() {
+        let a = FakeServer::start(script(&["m1", "m2"]));
+        let b = FakeServer::start(script(&["m1"]));
+        let mut results = Vec::new();
+        run_plan(&plan(&a, &b), &AtomicBool::new(false), &mut |_, _| {}, &mut |_, _, r| results.push(r));
+        assert!(results.iter().any(|r| r.model == "m1 @32") && results.iter().any(|r| r.model == "m2 @128"));
+        let dir = std::env::temp_dir().join(format!("ib-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        save_session(&dir, &results).unwrap();
+        let back = load_sessions(&dir);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].1, results);
     }
 
     #[test]
