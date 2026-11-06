@@ -29,6 +29,41 @@ struct Loaded {
     chat: Option<ChatTemplate>,
     runtime: Runtime,
     max_ctx: usize,
+    stop: Vec<u32>,
+}
+
+const END_OF_TURN: [&str; 6] = ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "<|endoftext|>", "</s>"];
+
+pub fn stop_ids(
+    generation_config: Option<&str>,
+    tokenizer_config: Option<&str>,
+    lookup: &dyn Fn(&str) -> Option<u32>,
+) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    if let Some(v) = generation_config.and_then(|t| serde_json::from_str::<Value>(t).ok()) {
+        match &v["eos_token_id"] {
+            Value::Number(n) => out.extend(n.as_u64().map(|n| n as u32)),
+            Value::Array(a) => out.extend(a.iter().filter_map(|n| n.as_u64().map(|n| n as u32))),
+            _ => {}
+        }
+    }
+    if let Some(v) = tokenizer_config.and_then(|t| serde_json::from_str::<Value>(t).ok()) {
+        let eos = match &v["eos_token"] {
+            Value::String(s) => Some(s.clone()),
+            Value::Object(o) => o.get("content").and_then(Value::as_str).map(String::from),
+            _ => None,
+        };
+        out.extend(eos.as_deref().and_then(lookup));
+        let template = v["chat_template"].to_string();
+        for marker in END_OF_TURN {
+            if template.contains(marker) {
+                out.extend(lookup(marker));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn error(err: &anyhow::Error) -> Value {
@@ -52,9 +87,15 @@ fn load(model: &str, max_ctx: Option<usize>) -> Result<Loaded> {
         Ok(path) => ChatTemplate::from_tokenizer_config(&std::fs::read_to_string(path)?)?,
         Err(_) => None,
     };
+    let read = |f: &str| find_in_snapshot(&spec.repo, f).ok().and_then(|p| std::fs::read_to_string(p).ok());
+    let stop = stop_ids(
+        read("generation_config.json").as_deref(),
+        read("tokenizer_config.json").as_deref(),
+        &|t| tokenizer.token_to_id(t),
+    );
     let max_ctx = max_ctx.unwrap_or(DEFAULT_CTX).min(MAX_CTX);
     let runtime = Runtime::load(&spec, max_ctx)?;
-    Ok(Loaded { spec, tokenizer, chat, runtime, max_ctx })
+    Ok(Loaded { spec, tokenizer, chat, runtime, max_ctx, stop })
 }
 
 fn encode_messages(l: &Loaded, messages: &[Value], template: bool) -> Result<Vec<u32>> {
@@ -107,8 +148,43 @@ fn generate_ids(
             l.max_ctx
         );
     }
-    let g = l.runtime.generate(&ids, max_tokens, sampling)?;
+    generate_streaming(l, ids, max_tokens, sampling, false, &mut |_| {})
+}
+
+fn generate_streaming(
+    l: &mut Loaded,
+    ids: Vec<u32>,
+    max_tokens: usize,
+    sampling: Sampling,
+    stop_at_end_of_turn: bool,
+    on_text: &mut dyn FnMut(&str),
+) -> Result<(String, Value)> {
+    if ids.len() + max_tokens > l.max_ctx {
+        bail!(
+            "prompt of {} tokens plus {max_tokens} new tokens exceeds the context of {}",
+            ids.len(),
+            l.max_ctx
+        );
+    }
+    let mut so_far: Vec<u32> = Vec::new();
+    let mut sent = String::new();
+    let tokenizer = &l.tokenizer;
+    let stop: &[u32] = if stop_at_end_of_turn { &l.stop } else { &[] };
+    let g = l.runtime.generate_until(&ids, max_tokens, sampling, stop, &mut |fresh| {
+        so_far.extend_from_slice(fresh);
+        if let Ok(text) = tokenizer.decode(&so_far, true)
+            && text.len() > sent.len()
+            && text.starts_with(&sent)
+            && !text.ends_with('\u{fffd}')
+        {
+            on_text(&text[sent.len()..]);
+            sent = text;
+        }
+    })?;
     let text = l.tokenizer.decode(&g.tokens, true).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+    if text.len() > sent.len() && text.starts_with(&sent) {
+        on_text(&text[sent.len()..]);
+    }
     let done = json!({"event": "done", "generation": {
         "text": text.clone(),
         "prompt_tokens": ids.len(),
@@ -125,8 +201,15 @@ fn chat(l: &mut Loaded, msg: &Value, out: &mut impl Write) -> Result<Value> {
     let messages = msg["messages"].as_array().cloned().unwrap_or_default();
     let ids = encode_messages(l, &messages, msg["template"].as_bool().unwrap_or(true))?;
     let max_tokens = msg["max_tokens"].as_u64().unwrap_or(64) as usize;
-    let (text, done) = generate_ids(l, ids, max_tokens, sampling_from(msg))?;
-    writeln!(out, "{}", json!({"event": "text", "text": text}))?;
+    let mut failed = None;
+    let (_, done) = generate_streaming(l, ids, max_tokens, sampling_from(msg), true, &mut |t| {
+        if let Err(e) = writeln!(out, "{}", json!({"event": "text", "text": t})).and_then(|_| out.flush()) {
+            failed = Some(e);
+        }
+    })?;
+    if let Some(e) = failed {
+        return Err(e.into());
+    }
     Ok(done)
 }
 
@@ -195,6 +278,22 @@ mod tests {
         let e = anyhow::anyhow!("model_type gemma3 is not supported");
         assert_eq!(error(&e)["kind"], "unsupported_architecture");
         assert_eq!(error(&e)["message"], "model_type gemma3 is not supported");
+    }
+
+    #[test]
+    fn stop_ids_come_from_generation_config_eos_and_the_template_end_of_turn() {
+        let vocab = |t: &str| match t {
+            "<|im_end|>" => Some(151645),
+            "<|endoftext|>" => Some(151643),
+            "<|eot_id|>" => Some(9),
+            _ => None,
+        };
+        let gen_cfg = r#"{"eos_token_id": [151645, 151643]}"#;
+        let tok_cfg = r#"{"eos_token": "<|im_end|>", "chat_template": "{{ '<|im_start|>' }}{{ m }}<|im_end|>"}"#;
+        assert_eq!(stop_ids(Some(gen_cfg), Some(tok_cfg), &vocab), vec![151643, 151645]);
+        let only_tok = r#"{"eos_token": {"content": "<|endoftext|>"}, "chat_template": "<|eot_id|>"}"#;
+        assert_eq!(stop_ids(None, Some(only_tok), &vocab), vec![9, 151643]);
+        assert_eq!(stop_ids(Some(r#"{"eos_token_id": 2}"#), None, &vocab), vec![2]);
     }
 
     #[test]

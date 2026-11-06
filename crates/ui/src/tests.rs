@@ -284,7 +284,7 @@ fn screenshots_with_real_data() {
         app.tab = Tab::Chat;
     }
     pump_until(&mut h, 120, "load", |a| a.loaded().is_some());
-    for q in ["Explain what a KV cache is in two sentences.", "Now give me a tiny Rust example of a struct with a method, as markdown."] {
+    for q in ["Explain what a KV cache is in two sentences.", "Show a tiny Rust struct with one method."] {
         {
             let app = h.state_mut();
             app.chat.conv().sampling.max_tokens = 160;

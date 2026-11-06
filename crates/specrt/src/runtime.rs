@@ -516,6 +516,17 @@ impl Runtime {
         new_tokens: usize,
         sampling: Sampling,
     ) -> Result<Generation> {
+        self.generate_until(prompt, new_tokens, sampling, &[], &mut |_| {})
+    }
+
+    pub fn generate_until(
+        &mut self,
+        prompt: &[u32],
+        new_tokens: usize,
+        sampling: Sampling,
+        stop: &[u32],
+        on_tokens: &mut dyn FnMut(&[u32]),
+    ) -> Result<Generation> {
         ensure!(!prompt.is_empty() && new_tokens > 0, "empty prompt or nothing to generate");
         ensure!(
             prompt.len() + new_tokens <= self.max_ctx,
@@ -532,19 +543,58 @@ impl Runtime {
         graph.upload()?;
         self.stream.synchronize()?;
         let started = Instant::now();
-        for _ in 1..new_tokens {
-            graph.launch()?;
+        let mut made = 1;
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut shown = 0;
+        loop {
+            let seen = self.stream.clone_dtoh(&self.buf.history.slice(..made))?;
+            tokens = seen.iter().map(|&t| t as u32).collect();
+            let (kept, stopped) = cut_at_stop(&tokens, stop);
+            if kept > shown {
+                on_tokens(&tokens[shown..kept]);
+                shown = kept;
+            }
+            if stopped || made >= new_tokens {
+                tokens.truncate(kept);
+                break;
+            }
+            let step = if stop.is_empty() { new_tokens - made } else { DECODE_CHUNK.min(new_tokens - made) };
+            for _ in 0..step {
+                graph.launch()?;
+            }
+            made += step;
         }
         self.stream.synchronize()?;
         let decode_secs = started.elapsed().as_secs_f64();
-        let history = self.stream.clone_dtoh(&self.buf.history)?;
         let free_now = self.ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         let peak_device_bytes = (self.baseline_free.saturating_sub(free_now) as u64).max(self.device_bytes);
         Ok(Generation {
-            tokens: history[..new_tokens].iter().map(|&t| t as u32).collect(),
+            tokens,
             prefill_secs,
             decode_secs,
             peak_device_bytes,
         })
+    }
+}
+
+const DECODE_CHUNK: usize = 16;
+
+pub fn cut_at_stop(tokens: &[u32], stop: &[u32]) -> (usize, bool) {
+    match tokens.iter().position(|t| stop.contains(t)) {
+        Some(i) => (i, true),
+        None => (tokens.len(), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cut_at_stop;
+
+    #[test]
+    fn generation_is_cut_before_the_first_stop_token() {
+        assert_eq!(cut_at_stop(&[5, 6, 151645, 9, 9], &[151645, 151643]), (2, true));
+        assert_eq!(cut_at_stop(&[5, 6], &[151645]), (2, false));
+        assert_eq!(cut_at_stop(&[151643], &[151645, 151643]), (0, true));
+        assert_eq!(cut_at_stop(&[1, 2, 3], &[]), (3, false));
     }
 }

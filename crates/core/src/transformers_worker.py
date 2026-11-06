@@ -46,7 +46,9 @@ class Worker:
     def chat(self, msg):
         messages = msg["messages"]
         if msg.get("template", True) and getattr(self.tok, "chat_template", None):
-            prompt = self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            prompt = self.tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+            )
         else:
             prompt = "\n\n".join(m["content"] for m in messages)
         temperature = msg.get("temperature", 0.0)
@@ -57,7 +59,7 @@ class Worker:
         from transformers import TextIteratorStreamer
 
         ids = self.tok(prompt, return_tensors="pt").input_ids.to(self.device)
-        streamer = TextIteratorStreamer(self.tok, skip_prompt=True)
+        streamer = TextIteratorStreamer(self.tok, skip_prompt=True, skip_special_tokens=True)
         if seed:
             self.torch.manual_seed(seed)
         kwargs = dict(input_ids=ids, max_new_tokens=max_tokens, streamer=streamer, min_new_tokens=1)

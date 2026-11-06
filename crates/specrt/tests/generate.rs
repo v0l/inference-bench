@@ -39,3 +39,30 @@ fn contexts_above_4096_generate_and_match_the_short_context_path() {
     let b = short.generate(head, 16, Sampling::GREEDY).unwrap().tokens;
     assert_eq!(a, b);
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU and the HF weights"]
+fn a_chat_reply_stops_at_the_end_of_turn_and_streams_in_pieces() {
+    let input = concat!(
+        r#"{"op":"load","model":"Qwen/Qwen3-0.6B","max_ctx":2048}"#, "\n",
+        r#"{"op":"chat","messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":400}"#, "\n",
+        r#"{"op":"chat","messages":[{"role":"user","content":"Say hello in five words."},{"role":"assistant","content":"Hello there, how are you?"},{"role":"user","content":"Now say goodbye."}],"max_tokens":400}"#, "\n",
+        r#"{"op":"quit"}"#, "\n"
+    );
+    let mut out = Vec::new();
+    specrt::worker::run(input.as_bytes(), &mut out).unwrap();
+    let events: Vec<serde_json::Value> =
+        String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let dones: Vec<&serde_json::Value> = events.iter().filter(|e| e["event"] == "done").collect();
+    assert_eq!(dones.len(), 2, "{events:?}");
+    for d in dones {
+        let g = &d["generation"];
+        let text = g["text"].as_str().unwrap();
+        assert!(g["completion_tokens"].as_u64().unwrap() < 400, "never stopped: {text}");
+        for leak in ["Human:", "User:", "<|im_start|>", "<|im_end|>"] {
+            assert!(!text.contains(leak), "{leak} in {text}");
+        }
+    }
+    let pieces = events.iter().filter(|e| e["event"] == "text").count();
+    assert!(pieces > 2, "the reply arrived as {pieces} pieces");
+}
