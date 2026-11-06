@@ -19,6 +19,11 @@ impl Tile {
     pub const SMALL: Tile = Tile { bm: 64, bn: 64, wm: 2, wn: 2 };
     pub const NARROW: Tile = Tile { bm: 64, bn: 32, wm: 2, wn: 2 };
 
+    pub fn tiny() -> Tile {
+        let wn = std::env::var("SPECRT_TINY_WN").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        Tile { bm: 16, bn: 16 * wn, wm: 1, wn }
+    }
+
     pub fn threads(&self) -> u32 {
         (self.wm * self.wn * 32) as u32
     }
@@ -65,6 +70,11 @@ pub const KERNELS: &[&str] = &[
     "down_mma_big",
     "lm_head_mma_big",
     "row_rms",
+    "qkv_mma_tiny",
+    "o_mma_tiny",
+    "gate_up_mma_tiny",
+    "down_mma_tiny",
+    "lm_head_mma_tiny",
     "kv_norm_rope",
     "argmax_rows",
     "bump",
@@ -165,6 +175,8 @@ impl Module {
             ("SPLIT_DOWN", split("down")),
             ("SPLIT_LM_HEAD", split("lm_head")),
             ("GEMM_STAGES", std::env::var("SPECRT_STAGES").unwrap_or_else(|_| "2".into())),
+            ("TINY_BN", Tile::tiny().bn.to_string()),
+            ("TINY_WN", Tile::tiny().wn.to_string()),
             ("BIG_BM", big.bm.to_string()),
             ("BIG_BN", big.bn.to_string()),
             ("BIG_WM", big.wm.to_string()),

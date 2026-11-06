@@ -98,6 +98,26 @@ extern "C" __global__ void lm_head_mma_narrow(const void* w, const float* s, con
     gemm_tc<{{VOCAB}}, {{HIDDEN}}, 64, 32, 2, 2, EPI_STORE, false, {{Q8}}, true, {{SPLIT_LM_HEAD}}>(w, s, b, x, ri, nw, out, tokens);
 }
 
+extern "C" __global__ void qkv_mma_tiny(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{QKV_N}}, {{HIDDEN}}, 16, {{TINY_BN}}, 1, {{TINY_WN}}, EPI_STORE, {{QKV_BIAS}}, {{Q8}}, true, {{SPLIT_QKV}}>(w, s, b, x, ri, nw, out, tokens);
+}
+
+extern "C" __global__ void o_mma_tiny(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{HIDDEN}}, {{Q_DIM}}, 16, {{TINY_BN}}, 1, {{TINY_WN}}, EPI_RESIDUAL, false, {{Q8}}, false, {{SPLIT_O}}>(w, s, b, x, ri, nw, out, tokens);
+}
+
+extern "C" __global__ void gate_up_mma_tiny(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{GATE_UP_N}}, {{HIDDEN}}, 16, {{TINY_BN}}, 1, {{TINY_WN}}, EPI_ACT, false, {{Q8}}, true, {{SPLIT_GATE_UP}}>(w, s, b, x, ri, nw, out, tokens);
+}
+
+extern "C" __global__ void down_mma_tiny(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{HIDDEN}}, {{INTER}}, 16, {{TINY_BN}}, 1, {{TINY_WN}}, EPI_RESIDUAL, false, {{Q8}}, false, {{SPLIT_DOWN}}>(w, s, b, x, ri, nw, out, tokens);
+}
+
+extern "C" __global__ void lm_head_mma_tiny(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{VOCAB}}, {{HIDDEN}}, 16, {{TINY_BN}}, 1, {{TINY_WN}}, EPI_STORE, false, {{Q8}}, true, {{SPLIT_LM_HEAD}}>(w, s, b, x, ri, nw, out, tokens);
+}
+
 extern "C" __global__ void qkv_proj_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {
     linear_norm<{{Q8}}, {{QKV_N}}, {{QKV_BIAS}}>(w, s, b, x, nw, out);
 }

@@ -417,6 +417,7 @@ impl Runtime {
             Ok("small") => (Tile::SMALL, ""),
             Ok("big") => (big, "_big"),
             Ok("narrow") => (Tile::NARROW, "_narrow"),
+            _ if tokens <= 16 => (Tile::tiny(), "_tiny"),
             _ if blocks(big) >= 2 * self.sms => (big, "_big"),
             _ if blocks(Tile::SMALL) >= 2 * self.sms => (Tile::SMALL, ""),
             _ => (Tile::NARROW, "_narrow"),
