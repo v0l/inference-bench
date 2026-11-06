@@ -49,6 +49,13 @@ __device__ float block_reduce(float v, float* scratch) {
     return r;
 }
 
+__device__ __forceinline__ uint4 load_stream(const void* p) {
+    uint4 r;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+    return r;
+}
+
 template <int N, int K, bool BIAS, bool RESIDUAL>
 __device__ void linear_bf16(const void* w, const float* scales, const float* bias, const float* x, float* out) {
     int warp = threadIdx.x >> 5;
@@ -57,9 +64,9 @@ __device__ void linear_bf16(const void* w, const float* scales, const float* bia
     if (row >= N) return;
     const bf16_t* wr = (const bf16_t*)w + (size_t)row * K;
     float acc = 0.0f;
-#pragma unroll 4
+#pragma unroll 8
     for (int k = lane * 8; k < K; k += 256) {
-        uint4 packed = *(const uint4*)(wr + k);
+        uint4 packed = load_stream(wr + k);
         float4 xa = *(const float4*)(x + k);
         float4 xb = *(const float4*)(x + k + 4);
         acc += __uint_as_float(packed.x << 16) * xa.x + __uint_as_float(packed.x & 0xffff0000u) * xa.y;
