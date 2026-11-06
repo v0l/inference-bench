@@ -24,6 +24,9 @@ pub const KERNELS: &[&str] = &[
     "gate_up_gemm",
     "down_gemm",
     "lm_head_gemm",
+    "qkv_proj_norm",
+    "gate_up_act",
+    "lm_head_norm",
 ];
 
 #[derive(Clone, Debug, PartialEq)]

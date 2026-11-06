@@ -37,3 +37,15 @@ extern "C" __global__ void down_gemm(const void* w, const float* s, const float*
 extern "C" __global__ void lm_head_gemm(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
     gemm<{{VOCAB}}, {{HIDDEN}}, false, false, {{Q8}}>(w, s, b, x, out, tokens);
 }
+
+extern "C" __global__ void qkv_proj_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {
+    linear_norm<{{Q8}}, {{QKV_N}}, {{QKV_BIAS}}>(w, s, b, x, nw, out);
+}
+
+extern "C" __global__ void gate_up_act(const void* w, const float* s, const float* x, const float* nw, float* out) {
+    gate_up_act_norm<{{Q8}}>(w, s, x, nw, out);
+}
+
+extern "C" __global__ void lm_head_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {
+    linear_norm<{{Q8}}, {{VOCAB}}, false>(w, s, b, x, nw, out);
+}

@@ -243,6 +243,29 @@ impl Runtime {
         Ok(())
     }
 
+    fn linear_norm(
+        &self,
+        name: &str,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: &CudaSlice<f32>,
+        norm: &CudaSlice<f32>,
+        out: &CudaSlice<f32>,
+        rows: usize,
+    ) -> Result<()> {
+        let mut b = self.stream.launch_builder(self.kernel(name));
+        match w {
+            DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
+            DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
+        };
+        if name != "gate_up_act" {
+            b.arg(bias.unwrap_or(&self.buf.dummy));
+        }
+        b.arg(x).arg(norm).arg(out);
+        unsafe { b.launch(cfg(grid(rows, LINEAR_ROWS_PER_BLOCK), 256)) }?;
+        Ok(())
+    }
+
     fn rmsnorm(&self, x: &CudaSlice<f32>, w: &CudaSlice<f32>, out: &CudaSlice<f32>) -> Result<()> {
         let mut b = self.stream.launch_builder(self.kernel("rmsnorm"));
         b.arg(x).arg(w).arg(out);
@@ -260,8 +283,7 @@ impl Runtime {
         let qkv_rows = s.q_dim() + 2 * s.kv_dim();
         for (i, l) in self.layers.iter().enumerate() {
             let layer = i as i32;
-            self.rmsnorm(&buf.x, &l.ln1, &buf.xn)?;
-            self.linear("qkv_proj", &l.qkv, l.qkv_bias.as_ref(), &buf.xn, &buf.qkv, qkv_rows)?;
+            self.linear_norm("qkv_proj_norm", &l.qkv, l.qkv_bias.as_ref(), &buf.x, &l.ln1, &buf.qkv, qkv_rows)?;
             let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
             b.arg(&buf.qkv)
                 .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
@@ -283,22 +305,10 @@ impl Runtime {
                 .arg(&buf.scores);
             unsafe { b.launch(cfg(a.heads as u32, 512)) }?;
             self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
-            self.rmsnorm(&buf.x, &l.ln2, &buf.xn)?;
-            self.linear(
-                "gate_up_proj",
-                &l.gate_up,
-                None,
-                &buf.xn,
-                &buf.gate_up,
-                2 * s.dims.intermediate,
-            )?;
-            let mut b = self.stream.launch_builder(self.kernel("swiglu"));
-            b.arg(&buf.gate_up).arg(&buf.act);
-            unsafe { b.launch(cfg(grid(s.dims.intermediate, 256), 256)) }?;
+            self.linear_norm("gate_up_act", &l.gate_up, None, &buf.x, &l.ln2, &buf.act, s.dims.intermediate)?;
             self.linear("down_proj", &l.down, None, &buf.act, &buf.x, s.dims.hidden)?;
         }
-        self.rmsnorm(&buf.x, &self.norm, &buf.xn)?;
-        self.linear("lm_head", &self.lm_head, None, &buf.xn, &buf.logits, s.dims.vocab)?;
+        self.linear_norm("lm_head_norm", &self.lm_head, None, &buf.x, &self.norm, &buf.logits, s.dims.vocab)?;
         Ok(())
     }
 

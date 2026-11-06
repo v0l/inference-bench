@@ -115,6 +115,85 @@ __device__ void linear_q8(const void* w, const float* scales, const float* bias,
     }
 }
 
+template <bool IS_Q8, int K>
+__device__ __forceinline__ float row_dot(const void* w, const float* scales, int row, const float* x, int lane) {
+    float acc = 0.0f;
+    if constexpr (IS_Q8) {
+        const i8_t* wr = (const i8_t*)w + (size_t)row * K;
+        const float* sr = scales + (size_t)row * (K / Q8_GROUP);
+#pragma unroll 2
+        for (int k = lane * 16; k < K; k += 512) {
+            int4 packed = *(const int4*)(wr + k);
+            const i8_t* q = (const i8_t*)&packed;
+            float part = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; j += 4) {
+                float4 xv = *(const float4*)(x + k + j);
+                part += (float)q[j] * xv.x + (float)q[j + 1] * xv.y + (float)q[j + 2] * xv.z + (float)q[j + 3] * xv.w;
+            }
+            acc += part * sr[k / Q8_GROUP];
+        }
+    } else {
+        const bf16_t* wr = (const bf16_t*)w + (size_t)row * K;
+#pragma unroll 8
+        for (int k = lane * 8; k < K; k += 256) {
+            uint4 packed = load_stream(wr + k);
+            float4 xa = *(const float4*)(x + k);
+            float4 xb = *(const float4*)(x + k + 4);
+            acc += __uint_as_float(packed.x << 16) * xa.x + __uint_as_float(packed.x & 0xffff0000u) * xa.y;
+            acc += __uint_as_float(packed.y << 16) * xa.z + __uint_as_float(packed.y & 0xffff0000u) * xa.w;
+            acc += __uint_as_float(packed.z << 16) * xb.x + __uint_as_float(packed.z & 0xffff0000u) * xb.y;
+            acc += __uint_as_float(packed.w << 16) * xb.z + __uint_as_float(packed.w & 0xffff0000u) * xb.w;
+        }
+    }
+    return warp_sum(acc);
+}
+
+__device__ __forceinline__ void load_normed(const float* x, const float* nw, float* xs) {
+    __shared__ float scratch[32];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) {
+        float v = x[i];
+        xs[i] = v;
+        ss += v * v;
+    }
+    float inv = rsqrtf(block_reduce<false>(ss, scratch) / HIDDEN + EPS);
+    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) xs[i] = nw[i] * (xs[i] * inv);
+    __syncthreads();
+}
+
+template <bool IS_Q8, int N, bool BIAS>
+__device__ void linear_norm(const void* w, const float* scales, const float* bias, const float* x,
+                            const float* nw, float* out) {
+    __shared__ __align__(16) float xs[HIDDEN];
+    load_normed(x, nw, xs);
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * LINEAR_WARPS + warp;
+    if (row >= N) return;
+    float acc = row_dot<IS_Q8, HIDDEN>(w, scales, row, xs, lane);
+    if (lane == 0) out[row] = BIAS ? acc + bias[row] : acc;
+}
+
+__device__ __forceinline__ float activation(float g) {
+    return ACT_KIND == 1
+        ? 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)))
+        : g / (1.0f + expf(-g));
+}
+
+template <bool IS_Q8>
+__device__ void gate_up_act_norm(const void* w, const float* scales, const float* x, const float* nw, float* out) {
+    __shared__ __align__(16) float xs[HIDDEN];
+    load_normed(x, nw, xs);
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * LINEAR_WARPS + warp;
+    if (row >= INTER) return;
+    float g = row_dot<IS_Q8, HIDDEN>(w, scales, row, xs, lane);
+    float u = row_dot<IS_Q8, HIDDEN>(w, scales, INTER + row, xs, lane);
+    if (lane == 0) out[row] = activation(g) * u;
+}
+
 constexpr int GEMM_BM = 64;
 constexpr int GEMM_BN = 64;
 constexpr int GEMM_BK = 16;
