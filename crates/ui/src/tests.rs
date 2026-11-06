@@ -119,6 +119,7 @@ fn a_fake_streaming_backend_fills_a_chat_with_stats() {
     assert_eq!((stats.prompt_tokens, stats.completion_tokens), (9, 3));
     assert!(stats.ttft_secs >= 0.02);
     assert!(h.state().chat.last_stats.is_some());
+    h.get_by_label_contains("Hello");
 }
 
 #[test]
