@@ -1,0 +1,37 @@
+[package]
+name = "inference-bench-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description.workspace = true
+
+[[bin]]
+name = "inference-bench"
+path = "src/main.rs"
+
+[package.metadata.deb]
+name = "inference-bench"
+maintainer = "v0l <kieran@harkin.me>"
+copyright = "v0l"
+license-file = ["../../LICENSE", "0"]
+section = "science"
+priority = "optional"
+extended-description = """\
+Inference Bench runs the same prompt through several LLM inference backends \
+(llama.cpp, vLLM, Ollama, transformers and the spec-driven specrt runtime) and \
+compares prefill and decode speed, time to first token, memory and logit accuracy. \
+Ships the inference-bench command line tool and the inference-bench-ui desktop application."""
+assets = [
+    ["target/release/inference-bench", "usr/bin/", "755"],
+    ["target/release/inference-bench-ui", "usr/bin/", "755"],
+    ["../../packaging/linux/inference-bench.desktop", "usr/share/applications/", "644"],
+    ["../ui/assets/icon-256.png", "usr/share/icons/hicolor/256x256/apps/inference-bench.png", "644"],
+    ["../../README.md", "usr/share/doc/inference-bench/README.md", "644"],
+]
+
+[dependencies]
+inference-bench-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true

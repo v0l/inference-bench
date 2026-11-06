@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Inference Bench"
+      Manufacturer="v0l"
+      Version="$(var.Version)"
+      UpgradeCode="d4663dc4-d7af-4402-b65b-51b2958dfcf4"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Inference Bench is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="packaging\windows\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/v0l/inference-bench" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Inference Bench">
+        <Component Id="InferenceBenchCli" Guid="61d6efba-0fa1-4757-86c1-e722cfeeee94">
+          <File Id="InferenceBenchExe" Source="$(var.BinDir)\inference-bench.exe" KeyPath="yes" />
+          <Environment Id="InferenceBenchPath" Name="PATH" Value="[INSTALLFOLDER]" Action="set" Part="last" System="yes" Permanent="no" />
+        </Component>
+        <Component Id="InferenceBenchUi" Guid="c00743c5-d773-4d4f-b1cf-acdaa79d62e9">
+          <File Id="InferenceBenchUiExe" Source="$(var.BinDir)\inference-bench-ui.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="InferenceBenchDocs" Guid="cfba349c-0559-4065-b068-cbeb2c81f101">
+          <File Id="ReadmeMd" Source="README.md" KeyPath="yes" />
+          <File Id="LicenseTxt" Source="LICENSE" Name="LICENSE.txt" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="InferenceBenchShortcut" Guid="2f4ed0f4-fe00-40f6-b84a-c857c1c8a097">
+        <Shortcut Id="InferenceBenchUiShortcut" Icon="AppIcon" Name="Inference Bench" Target="[#InferenceBenchUiExe]" WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKLM" Key="Software\v0l\Inference Bench" Name="shortcut" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Inference Bench" Level="1">
+      <ComponentRef Id="InferenceBenchCli" />
+      <ComponentRef Id="InferenceBenchUi" />
+      <ComponentRef Id="InferenceBenchDocs" />
+      <ComponentRef Id="InferenceBenchShortcut" />
+    </Feature>
+  </Package>
+</Wix>

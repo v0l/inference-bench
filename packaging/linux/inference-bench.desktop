@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Inference Bench
+GenericName=LLM Inference Benchmark
+Comment=Compare LLM inference backends on speed, latency, memory and accuracy
+Exec=inference-bench-ui
+Icon=inference-bench
+Terminal=false
+Categories=Utility;Science;Development;
+Keywords=llm;inference;benchmark;vllm;llama.cpp;
