@@ -1,0 +1,20 @@
+prompt = "The spec-driven runtime reads a TOML file describing the model, renders CUDA templates for every operator, and compiles them at load time. A paged key value cache keeps the attention state between decode steps, so"
+max_tokens = 128
+
+[[backends]]
+label = "llama.cpp"
+kind = "openai"
+url = "http://127.0.0.1:18080"
+
+[[backends]]
+label = "specrt"
+kind = "specrt"
+worker = "/home/kieran/git/inference-bench/target/release/inference-bench-specrt"
+
+[[models]]
+name = "Qwen3-0.6B"
+ids = { "llama.cpp" = "Qwen3-0.6B-bf16", specrt = "Qwen/Qwen3-0.6B" }
+
+[[models]]
+name = "Qwen2.5-0.5B"
+ids = { "llama.cpp" = "Qwen2.5-0.5B-bf16", specrt = "Qwen/Qwen2.5-0.5B" }
