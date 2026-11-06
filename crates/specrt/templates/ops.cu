@@ -321,7 +321,7 @@ constexpr int EPI_STORE = 0;
 constexpr int EPI_RESIDUAL = 1;
 constexpr int EPI_ACT = 2;
 
-template <int N, int K, int BM, int BN, int WM, int WN, int EPI, bool BIAS, bool Q8, bool NORM>
+template <int N, int K, int BM, int BN, int WM, int WN, int EPI, bool BIAS, bool Q8, bool NORM, bool SPLIT>
 __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, const float* bias, const float* x,
                                         const float* row_inv, const float* nw, float* out, int tokens) {
     constexpr int THREADS = WM * WN * 32;
@@ -340,7 +340,7 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
     static_assert(A_ITERS * THREADS * 4 == BM * BK, "A tile split");
     static_assert(NJ % 2 == 0, "warp n tile");
     __shared__ __align__(16) bf16_t a_hi[BM * AS];
-    __shared__ __align__(16) bf16_t a_lo[BM * AS];
+    __shared__ __align__(16) bf16_t a_lo[SPLIT ? BM * AS : 8];
     __shared__ __align__(16) unsigned char ws[2][BN * WROW];
     int tid = threadIdx.x;
     int lane = tid & 31;
@@ -390,7 +390,7 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
             split_hi_lo(xr[i].z, h2, l2);
             split_hi_lo(xr[i].w, h3, l3);
             *(uint2*)&a_hi[r * AS + c] = make_uint2(h0 | (h1 << 16), h2 | (h3 << 16));
-            *(uint2*)&a_lo[r * AS + c] = make_uint2(l0 | (l1 << 16), l2 | (l3 << 16));
+            if (SPLIT) *(uint2*)&a_lo[r * AS + c] = make_uint2(l0 | (l1 << 16), l2 | (l3 << 16));
         }
     };
     auto load_w = [&](int buf, int kt) {
@@ -457,10 +457,10 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                 int row = wm * TM + i * 16 + (lane & 15);
                 int col = ks * 16 + (lane >> 4) * 8;
                 ldsm_x4(ah, &a_hi[row * AS + col]);
-                ldsm_x4(al, &a_lo[row * AS + col]);
+                if (SPLIT) ldsm_x4(al, &a_lo[row * AS + col]);
 #pragma unroll
                 for (int j = 0; j < NJ; j++) {
-                    mma_bf16(part[i][j], al[0], al[1], al[2], al[3], bw[j][0], bw[j][1]);
+                    if (SPLIT) mma_bf16(part[i][j], al[0], al[1], al[2], al[3], bw[j][0], bw[j][1]);
                     mma_bf16(part[i][j], ah[0], ah[1], ah[2], ah[3], bw[j][0], bw[j][1]);
                 }
             }

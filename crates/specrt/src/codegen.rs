@@ -17,6 +17,7 @@ pub struct Tile {
 
 impl Tile {
     pub const SMALL: Tile = Tile { bm: 64, bn: 64, wm: 2, wn: 2 };
+    pub const NARROW: Tile = Tile { bm: 64, bn: 32, wm: 2, wn: 2 };
 
     pub fn threads(&self) -> u32 {
         (self.wm * self.wn * 32) as u32
@@ -28,7 +29,7 @@ impl Tile {
             (p.len() == 4).then(|| Tile { bm: p[0], bn: p[1], wm: p[2], wn: p[3] })
         }) {
             Some(t) => t,
-            None => Tile { bm: 128, bn: 64, wm: 4, wn: 2 },
+            None => Tile { bm: 64, bn: 128, wm: 2, wn: 4 },
         }
     }
 }
@@ -64,6 +65,11 @@ pub const KERNELS: &[&str] = &[
     "down_mma_big",
     "lm_head_mma_big",
     "row_rms",
+    "qkv_mma_narrow",
+    "o_mma_narrow",
+    "gate_up_mma_narrow",
+    "down_mma_narrow",
+    "lm_head_mma_narrow",
     "flash_attention",
     "flash_mma",
 ];
@@ -116,6 +122,8 @@ impl Module {
             float_literal(scaling.and_then(f).unwrap_or(1.0))
         };
         let big = Tile::big();
+        let unsplit = std::env::var("SPECRT_UNSPLIT").unwrap_or_default();
+        let split = |name: &str| (!unsplit.split(',').any(|n| n == name)).to_string();
         let act = match spec.mlp.activation {
             Activation::Swiglu => 0,
             Activation::Geglu => 1,
@@ -146,6 +154,11 @@ impl Module {
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
             ("LINEAR", linear.to_string()),
             ("Q8", (spec.quant == Quant::Q8).to_string()),
+            ("SPLIT_QKV", split("qkv")),
+            ("SPLIT_O", split("o")),
+            ("SPLIT_GATE_UP", split("gate_up")),
+            ("SPLIT_DOWN", split("down")),
+            ("SPLIT_LM_HEAD", split("lm_head")),
             ("BIG_BM", big.bm.to_string()),
             ("BIG_BN", big.bn.to_string()),
             ("BIG_WM", big.wm.to_string()),

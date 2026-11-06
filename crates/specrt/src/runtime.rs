@@ -111,7 +111,7 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 }
 
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
-const PREFILL_CHUNK: usize = 512;
+const PREFILL_CHUNK: usize = 1024;
 const SHARED_SCORES_MAX_CTX: usize = 4096;
 const SCORE_BUDGET_FLOATS: usize = 1 << 26;
 const GEMM_TILE: usize = 64;
@@ -383,14 +383,18 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let big_tile = crate::codegen::Tile::big();
-        let big = match std::env::var("SPECRT_TILE").as_deref() {
-            Ok("small") => false,
-            Ok("big") => true,
-            _ => grid(rows, big_tile.bn) * grid(tokens, big_tile.bm) >= 2 * self.sms,
+        use crate::codegen::Tile;
+        let big = Tile::big();
+        let blocks = |t: Tile| grid(rows, t.bn) * grid(tokens, t.bm);
+        let (tile, suffix) = match std::env::var("SPECRT_TILE").as_deref() {
+            Ok("small") => (Tile::SMALL, ""),
+            Ok("big") => (big, "_big"),
+            Ok("narrow") => (Tile::NARROW, "_narrow"),
+            _ if blocks(big) >= 2 * self.sms => (big, "_big"),
+            _ if blocks(Tile::SMALL) >= 2 * self.sms => (Tile::SMALL, ""),
+            _ => (Tile::NARROW, "_narrow"),
         };
-        let tile = if big { big_tile } else { crate::codegen::Tile::SMALL };
-        let kernel = if big { format!("{name}_mma_big") } else { format!("{name}_mma") };
+        let kernel = format!("{name}_mma{suffix}");
         let mut b = self.stream.launch_builder(self.kernel(&kernel));
         match w {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
