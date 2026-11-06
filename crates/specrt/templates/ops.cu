@@ -266,6 +266,222 @@ __device__ void gemm(const void* w, const float* scales, const float* bias, cons
     }
 }
 
+constexpr int MMA_BM = 64;
+constexpr int MMA_BN = 64;
+constexpr int MMA_BK = 32;
+constexpr int MMA_THREADS = 128;
+constexpr int MMA_A_STRIDE = MMA_BK + 8;
+
+__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(s), "l"(gmem));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+    asm volatile("cp.async.commit_group;");
+}
+
+template <int PENDING>
+__device__ __forceinline__ void cp_async_wait() {
+    asm volatile("cp.async.wait_group %0;" :: "n"(PENDING));
+}
+
+__device__ __forceinline__ void mma_bf16(float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                         unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+}
+
+__device__ __forceinline__ unsigned bf16_bits_rn(float v) {
+    unsigned u = __float_as_uint(v);
+    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+
+__device__ __forceinline__ void split_hi_lo(float v, unsigned& hi, unsigned& lo) {
+    hi = bf16_bits_rn(v);
+    lo = bf16_bits_rn(v - __uint_as_float(hi << 16));
+}
+
+__device__ __forceinline__ unsigned pack_i8_pair_bf16(unsigned two_bytes) {
+    int q0 = (signed char)(two_bytes & 0xff);
+    int q1 = (signed char)((two_bytes >> 8) & 0xff);
+    return (__float_as_uint((float)q0) >> 16) | (__float_as_uint((float)q1) & 0xffff0000u);
+}
+
+template <int N, int K, bool BIAS, bool RESIDUAL, bool Q8>
+__device__ void gemm_mma(const void* w, const float* scales, const float* bias, const float* x, float* out, int tokens) {
+    static_assert(K % MMA_BK == 0, "K must be a multiple of the MMA k tile");
+    constexpr int W_ROW_BYTES = Q8 ? MMA_BK + 16 : (MMA_BK + 8) * 2;
+    constexpr int KT = K / MMA_BK;
+    __shared__ __align__(16) bf16_t a_hi[MMA_BM][MMA_A_STRIDE];
+    __shared__ __align__(16) bf16_t a_lo[MMA_BM][MMA_A_STRIDE];
+    __shared__ __align__(16) unsigned char ws[2][MMA_BN * W_ROW_BYTES];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int g = lane >> 2;
+    int t = lane & 3;
+    int wm = warp >> 1;
+    int wn = warp & 1;
+    int m0 = blockIdx.y * MMA_BM;
+    int n0 = blockIdx.x * MMA_BN;
+    float acc[2][4][4];
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
+    float4 xr[4];
+    auto load_x = [&](int kt) {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * MMA_THREADS;
+            int r = idx >> 3;
+            int c = (idx & 7) * 4;
+            int m = m0 + r;
+            xr[i] = m < tokens ? *(const float4*)(x + (size_t)m * K + kt * MMA_BK + c)
+                               : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    };
+    auto store_x = [&]() {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * MMA_THREADS;
+            int r = idx >> 3;
+            int c = (idx & 7) * 4;
+            unsigned h0, l0, h1, l1, h2, l2, h3, l3;
+            split_hi_lo(xr[i].x, h0, l0);
+            split_hi_lo(xr[i].y, h1, l1);
+            split_hi_lo(xr[i].z, h2, l2);
+            split_hi_lo(xr[i].w, h3, l3);
+            *(uint2*)&a_hi[r][c] = make_uint2(h0 | (h1 << 16), h2 | (h3 << 16));
+            *(uint2*)&a_lo[r][c] = make_uint2(l0 | (l1 << 16), l2 | (l3 << 16));
+        }
+    };
+    auto load_w = [&](int buf, int kt) {
+        constexpr int CHUNKS = Q8 ? 2 : 4;
+        constexpr int CHUNK_BYTES = 16;
+#pragma unroll
+        for (int i = 0; i < (MMA_BN * CHUNKS) / MMA_THREADS; i++) {
+            int idx = tid + i * MMA_THREADS;
+            int r = idx / CHUNKS;
+            int ck = idx % CHUNKS;
+            int n = min(n0 + r, N - 1);
+            const char* src = Q8 ? (const char*)w + (size_t)n * K + kt * MMA_BK + ck * CHUNK_BYTES
+                                 : (const char*)w + ((size_t)n * K + kt * MMA_BK) * 2 + ck * CHUNK_BYTES;
+            cp_async16(&ws[buf][r * W_ROW_BYTES + ck * CHUNK_BYTES], src);
+        }
+    };
+    load_w(0, 0);
+    cp_async_commit();
+    load_x(0);
+    for (int kt = 0; kt < KT; kt++) {
+        int cur = kt & 1;
+        __syncthreads();
+        store_x();
+        if (kt + 1 < KT) {
+            load_w(cur ^ 1, kt + 1);
+            cp_async_commit();
+            load_x(kt + 1);
+            cp_async_wait<1>();
+        } else {
+            cp_async_wait<0>();
+        }
+        __syncthreads();
+        float tmp[2][4][4];
+        float (*c)[4][4] = tmp;
+        {
+#pragma unroll
+            for (int i = 0; i < 2; i++)
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++) tmp[i][j][e] = 0.0f;
+        }
+#pragma unroll
+        for (int ks = 0; ks < 2; ks++) {
+            unsigned bw[4][2];
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int row = wn * 32 + j * 8 + g;
+                if (Q8) {
+                    const unsigned char* p = &ws[cur][row * W_ROW_BYTES + ks * 16 + 2 * t];
+                    bw[j][0] = pack_i8_pair_bf16(*(const unsigned short*)p);
+                    bw[j][1] = pack_i8_pair_bf16(*(const unsigned short*)(p + 8));
+                } else {
+                    const unsigned char* p = &ws[cur][row * W_ROW_BYTES + (ks * 16 + 2 * t) * 2];
+                    bw[j][0] = *(const unsigned*)p;
+                    bw[j][1] = *(const unsigned*)(p + 16);
+                }
+            }
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                int r0 = wm * 32 + i * 16 + g;
+                int k0 = ks * 16 + 2 * t;
+                unsigned h0 = *(const unsigned*)&a_hi[r0][k0];
+                unsigned h1 = *(const unsigned*)&a_hi[r0 + 8][k0];
+                unsigned h2 = *(const unsigned*)&a_hi[r0][k0 + 8];
+                unsigned h3 = *(const unsigned*)&a_hi[r0 + 8][k0 + 8];
+                unsigned l0 = *(const unsigned*)&a_lo[r0][k0];
+                unsigned l1 = *(const unsigned*)&a_lo[r0 + 8][k0];
+                unsigned l2 = *(const unsigned*)&a_lo[r0][k0 + 8];
+                unsigned l3 = *(const unsigned*)&a_lo[r0 + 8][k0 + 8];
+#pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    mma_bf16(c[i][j], l0, l1, l2, l3, bw[j][0], bw[j][1]);
+                    mma_bf16(c[i][j], h0, h1, h2, h3, bw[j][0], bw[j][1]);
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            float s0 = 1.0f, s1 = 1.0f;
+            if (Q8) {
+                int col = n0 + wn * 32 + j * 8 + 2 * t;
+                s0 = scales[(size_t)min(col, N - 1) * (K / Q8_GROUP) + kt];
+                s1 = scales[(size_t)min(col + 1, N - 1) * (K / Q8_GROUP) + kt];
+            }
+#pragma unroll
+            for (int i = 0; i < 2; i++) {
+                acc[i][j][0] += tmp[i][j][0] * s0;
+                acc[i][j][1] += tmp[i][j][1] * s1;
+                acc[i][j][2] += tmp[i][j][2] * s0;
+                acc[i][j][3] += tmp[i][j][3] * s1;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; i++)
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int col = n0 + wn * 32 + j * 8 + 2 * t;
+            if (col >= N) continue;
+            float b0 = 0.0f, b1 = 0.0f;
+            if (BIAS) {
+                b0 = bias[col];
+                b1 = col + 1 < N ? bias[col + 1] : 0.0f;
+            }
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                int m = m0 + wm * 32 + i * 16 + g + h * 8;
+                if (m >= tokens) continue;
+                float* o = out + (size_t)m * N + col;
+                float v0 = acc[i][j][h * 2] + b0;
+                float v1 = acc[i][j][h * 2 + 1] + b1;
+                if (RESIDUAL) {
+                    v0 += o[0];
+                    if (col + 1 < N) v1 += o[1];
+                }
+                o[0] = v0;
+                if (col + 1 < N) o[1] = v1;
+            }
+        }
+}
+
 extern "C" __global__ void embed(const bf16_t* table, const int* token, float* x) {
     const bf16_t* row = table + (size_t)token[blockIdx.y] * HIDDEN;
     x += (size_t)blockIdx.y * HIDDEN;

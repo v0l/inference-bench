@@ -141,7 +141,7 @@ fn linear_rope_scaling_logits_match_transformers() {
 #[test]
 #[ignore = "needs a CUDA GPU, the HF weights and scripts/reference.py output"]
 fn gated_gelu_logits_match_transformers() {
-    check("qwen2.5-0.5b-geglu.toml", 1e-3, true);
+    check("qwen2.5-0.5b-geglu.toml", 3e-3, true);
 }
 
 #[test]

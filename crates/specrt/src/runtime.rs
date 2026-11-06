@@ -91,6 +91,7 @@ pub struct Runtime {
     buf: Buffers,
     pre: PrefillBuffers,
     chunk: usize,
+    use_mma: bool,
     pub cache_hit: bool,
     pub jit_key: String,
     pub arch: String,
@@ -197,6 +198,8 @@ impl Runtime {
         let rt = Runtime {
             pre,
             chunk,
+            use_mma: ctx.compute_capability()?.0 >= 8
+                && std::env::var_os("SPECRT_GEMM_FP32").is_none(),
             spec: spec.clone(),
             max_ctx,
             embed: stream.clone_htod(&weights.embed)?,
@@ -322,7 +325,8 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel(name));
+        let name = if self.use_mma { name.replace("_gemm", "_mma") } else { name.to_string() };
+        let mut b = self.stream.launch_builder(self.kernel(&name));
         match w {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
             DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
@@ -331,7 +335,7 @@ impl Runtime {
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out).arg(&n);
         let config = LaunchConfig {
             grid_dim: (grid(rows, GEMM_TILE), grid(tokens, GEMM_TILE), 1),
-            block_dim: (256, 1, 1),
+            block_dim: (if self.use_mma { 128 } else { 256 }, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
