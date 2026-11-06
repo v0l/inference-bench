@@ -101,6 +101,7 @@ impl Backend for OpenAi {
             "prompt": request.prompt,
             "max_tokens": request.max_tokens,
             "temperature": 0,
+            "ignore_eos": true,
             "stream": true,
             "stream_options": {"include_usage": true},
         });
@@ -248,6 +249,17 @@ mod tests {
         let sent = server.requests.lock().unwrap().last().cloned().unwrap();
         let sent: String = sent.split_whitespace().collect();
         assert!(sent.contains("\"model\":\"qwen3\"") && sent.contains("\"stream\":true"), "{sent}");
+    }
+
+    #[test]
+    fn bench_completions_ignore_eos_so_every_engine_decodes_max_tokens() {
+        let server = FakeServer::start(script());
+        let mut b = OpenAi::new("fake".into(), &server.url, None);
+        b.load("qwen3").unwrap();
+        b.generate(&request(), &mut |_| {}).unwrap();
+        let sent = server.requests.lock().unwrap().last().cloned().unwrap();
+        let sent: String = sent.split_whitespace().collect();
+        assert!(sent.contains("\"ignore_eos\":true"), "{sent}");
     }
 
     #[test]
