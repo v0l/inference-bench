@@ -5,7 +5,8 @@ use crate::weights::{Matrix, Weights, find_safetensors};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, CudaView, LaunchConfig,
+    PushKernelArg,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,6 +62,16 @@ impl Sampling {
     }
 }
 
+struct PrefillBuffers {
+    tokens: CudaSlice<i32>,
+    x: CudaSlice<f32>,
+    xn: CudaSlice<f32>,
+    qkv: CudaSlice<f32>,
+    attn: CudaSlice<f32>,
+    gate_up: CudaSlice<f32>,
+    act: CudaSlice<f32>,
+}
+
 pub struct Generation {
     pub tokens: Vec<u32>,
     pub prefill_secs: f64,
@@ -78,6 +89,8 @@ pub struct Runtime {
     lm_head: DeviceMatrix,
     layers: Vec<DeviceLayer>,
     buf: Buffers,
+    pre: PrefillBuffers,
+    chunk: usize,
     pub cache_hit: bool,
     pub jit_key: String,
     pub arch: String,
@@ -95,6 +108,10 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 }
 
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
+const PREFILL_CHUNK: usize = 256;
+const SHARED_SCORES_MAX_CTX: usize = 4096;
+const SCORE_BUDGET_FLOATS: usize = 1 << 26;
+const GEMM_TILE: usize = 64;
 
 impl Runtime {
     pub fn load(spec: &Spec, max_ctx: usize) -> Result<Self> {
@@ -144,6 +161,8 @@ impl Runtime {
         let cache_len =
             spec.layers.count * pages * spec.attention.kv_heads * PAGE * spec.attention.head_dim;
         let table: Vec<i32> = (0..pages as i32).rev().collect();
+        let score_rows = (SCORE_BUDGET_FLOATS / (spec.attention.heads * max_ctx)).max(1);
+        let chunk = max_ctx.min(PREFILL_CHUNK).min(score_rows);
         let buf = Buffers {
             x: stream.alloc_zeros(d.hidden)?,
             xn: stream.alloc_zeros(d.hidden)?,
@@ -160,9 +179,24 @@ impl Runtime {
             history: stream.alloc_zeros(max_ctx)?,
             count: stream.alloc_zeros(1)?,
             dummy: stream.alloc_zeros(1)?,
-            scores: stream.alloc_zeros(spec.attention.heads * max_ctx)?,
+            scores: stream.alloc_zeros(if max_ctx > SHARED_SCORES_MAX_CTX {
+                spec.attention.heads * max_ctx * chunk
+            } else {
+                1
+            })?,
+        };
+        let pre = PrefillBuffers {
+            tokens: stream.alloc_zeros(chunk)?,
+            x: stream.alloc_zeros(chunk * d.hidden)?,
+            xn: stream.alloc_zeros(chunk * d.hidden)?,
+            qkv: stream.alloc_zeros(chunk * (spec.q_dim() + 2 * spec.kv_dim()))?,
+            attn: stream.alloc_zeros(chunk * spec.q_dim())?,
+            gate_up: stream.alloc_zeros(chunk * 2 * d.intermediate)?,
+            act: stream.alloc_zeros(chunk * d.intermediate)?,
         };
         let rt = Runtime {
+            pre,
+            chunk,
             spec: spec.clone(),
             max_ctx,
             embed: stream.clone_htod(&weights.embed)?,
@@ -268,6 +302,169 @@ impl Runtime {
         Ok(())
     }
 
+    fn gemm(
+        &self,
+        name: &str,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: &CudaView<f32>,
+        out: &CudaSlice<f32>,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let mut b = self.stream.launch_builder(self.kernel(name));
+        match w {
+            DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
+            DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
+        };
+        let n = tokens as i32;
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out).arg(&n);
+        let config = LaunchConfig {
+            grid_dim: (grid(rows, GEMM_TILE), grid(tokens, GEMM_TILE), 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn rmsnorm_rows(
+        &self,
+        x: &CudaSlice<f32>,
+        w: &CudaSlice<f32>,
+        out: &CudaSlice<f32>,
+        tokens: usize,
+    ) -> Result<()> {
+        let mut b = self.stream.launch_builder(self.kernel("rmsnorm"));
+        b.arg(x).arg(w).arg(out);
+        unsafe { b.launch(cfg(tokens as u32, 1024)) }?;
+        Ok(())
+    }
+
+    fn prefill_chunk(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+        all_logits: Option<&CudaSlice<f32>>,
+    ) -> Result<()> {
+        let n = tokens.len();
+        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        self.stream.memcpy_htod(&ids, &mut self.pre.tokens.slice_mut(..n))?;
+        self.stream.memcpy_htod(&[start as i32], &mut self.buf.pos)?;
+        let s = &self.spec;
+        let a = &s.attention;
+        let hidden = s.dims.hidden;
+        let qkv_rows = s.q_dim() + 2 * s.kv_dim();
+        let pre = &self.pre;
+        let buf = &self.buf;
+        let mut b = self.stream.launch_builder(self.kernel("embed"));
+        b.arg(&self.embed).arg(&pre.tokens).arg(&pre.x);
+        let config = LaunchConfig {
+            grid_dim: (grid(hidden, 256), n as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        for (i, l) in self.layers.iter().enumerate() {
+            let layer = i as i32;
+            self.rmsnorm_rows(&pre.x, &l.ln1, &pre.xn, n)?;
+            self.gemm(
+                "qkv_gemm",
+                &l.qkv,
+                l.qkv_bias.as_ref(),
+                &pre.xn.as_view(),
+                &pre.qkv,
+                qkv_rows,
+                n,
+            )?;
+            let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
+            b.arg(&pre.qkv)
+                .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
+                .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
+                .arg(&buf.k_cache)
+                .arg(&buf.v_cache)
+                .arg(&buf.block_table)
+                .arg(&buf.pos)
+                .arg(&layer);
+            let config = LaunchConfig {
+                grid_dim: ((a.heads + 2 * a.kv_heads) as u32, n as u32, 1),
+                block_dim: (a.head_dim.max(32) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { b.launch(config) }?;
+            let mut b = self.stream.launch_builder(self.kernel("attention"));
+            b.arg(&pre.qkv)
+                .arg(&buf.k_cache)
+                .arg(&buf.v_cache)
+                .arg(&buf.block_table)
+                .arg(&buf.pos)
+                .arg(&layer)
+                .arg(&pre.attn)
+                .arg(&buf.scores);
+            let config = LaunchConfig {
+                grid_dim: (a.heads as u32, n as u32, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { b.launch(config) }?;
+            self.gemm("o_gemm", &l.o, None, &pre.attn.as_view(), &pre.x, hidden, n)?;
+            self.rmsnorm_rows(&pre.x, &l.ln2, &pre.xn, n)?;
+            let inter = s.dims.intermediate;
+            self.gemm(
+                "gate_up_gemm",
+                &l.gate_up,
+                None,
+                &pre.xn.as_view(),
+                &pre.gate_up,
+                2 * inter,
+                n,
+            )?;
+            let mut b = self.stream.launch_builder(self.kernel("swiglu"));
+            b.arg(&pre.gate_up).arg(&pre.act);
+            let config = LaunchConfig {
+                grid_dim: (grid(inter, 256), n as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { b.launch(config) }?;
+            self.gemm("down_gemm", &l.down, None, &pre.act.as_view(), &pre.x, hidden, n)?;
+        }
+        self.rmsnorm_rows(&pre.x, &self.norm, &pre.xn, n)?;
+        match all_logits {
+            Some(out) => self.gemm(
+                "lm_head_gemm",
+                &self.lm_head,
+                None,
+                &pre.xn.as_view(),
+                out,
+                s.dims.vocab,
+                n,
+            )?,
+            None => {
+                let last = pre.xn.slice((n - 1) * hidden..n * hidden);
+                self.gemm("lm_head_gemm", &self.lm_head, None, &last, &buf.logits, s.dims.vocab, 1)?
+            }
+        }
+        Ok(())
+    }
+
+    fn prefill(&mut self, tokens: &[u32], all_logits: bool) -> Result<Vec<f32>> {
+        let vocab = self.spec.dims.vocab;
+        let scratch = if all_logits {
+            Some(self.stream.alloc_zeros::<f32>(self.chunk * vocab)?)
+        } else {
+            None
+        };
+        let mut out = Vec::new();
+        for (c, piece) in tokens.chunks(self.chunk).enumerate() {
+            self.prefill_chunk(piece, c * self.chunk, scratch.as_ref())?;
+            if let Some(scratch) = &scratch {
+                out.extend(self.stream.clone_dtoh(&scratch.slice(..piece.len() * vocab))?);
+            }
+        }
+        Ok(out)
+    }
+
     fn advance(&self, sampling: Sampling) -> Result<()> {
         let buf = &self.buf;
         let mut b = self.stream.launch_builder(self.kernel("argmax_advance"));
@@ -286,13 +483,7 @@ impl Runtime {
 
     pub fn prompt_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         ensure!(tokens.len() <= self.max_ctx, "prompt longer than max_ctx");
-        let mut out = Vec::with_capacity(tokens.len() * self.spec.dims.vocab);
-        for (pos, &t) in tokens.iter().enumerate() {
-            self.set(t, pos)?;
-            self.step()?;
-            out.extend(self.stream.clone_dtoh(&self.buf.logits)?);
-        }
-        Ok(out)
+        self.prefill(tokens, true)
     }
 
     fn capture(&self, sampling: Sampling) -> Result<CudaGraph> {
@@ -316,10 +507,8 @@ impl Runtime {
         );
         let started = Instant::now();
         self.stream.memcpy_htod(&[0i32], &mut self.buf.count)?;
-        for (pos, &t) in prompt.iter().enumerate() {
-            self.set(t, pos)?;
-            self.step()?;
-        }
+        self.prefill(prompt, false)?;
+        self.stream.memcpy_htod(&[prompt.len() as i32 - 1], &mut self.buf.pos)?;
         self.advance(sampling)?;
         self.stream.synchronize()?;
         let prefill_secs = started.elapsed().as_secs_f64();

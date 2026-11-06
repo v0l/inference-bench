@@ -59,3 +59,13 @@ fn generation_is_deterministic() {
         Module::generate(&s, 256).unwrap().source
     );
 }
+
+#[test]
+fn module_has_batched_gemm_for_every_linear() {
+    let m = Module::generate(&spec("qwen2.5-0.5b.toml"), 256).unwrap();
+    for name in ["qkv_gemm", "o_gemm", "gate_up_gemm", "down_gemm", "lm_head_gemm"] {
+        assert!(m.kernels.contains(&name), "{name}");
+        assert!(m.source.contains(&format!("void {name}(")), "{name}");
+    }
+    assert!(m.source.contains("gemm<1152, 896, true, false, false>"));
+}
