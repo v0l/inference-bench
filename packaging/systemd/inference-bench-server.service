@@ -1,0 +1,25 @@
+[Unit]
+Description=Inference Bench server (OpenAI-compatible API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=inference-bench
+Group=inference-bench
+StateDirectory=inference-bench
+LogsDirectory=inference-bench
+EnvironmentFile=-/etc/inference-bench/server.env
+ExecStart=/usr/bin/inference-bench-server --config /etc/inference-bench/server.toml --log-format json --log-dir /var/log/inference-bench
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=60
+KillSignal=SIGTERM
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/inference-bench /var/log/inference-bench
+
+[Install]
+WantedBy=multi-user.target
