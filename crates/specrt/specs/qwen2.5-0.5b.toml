@@ -1,0 +1,32 @@
+name = "qwen2.5-0.5b"
+repo = "Qwen/Qwen2.5-0.5B"
+quant = "bf16"
+
+[dims]
+hidden = 896
+intermediate = 4864
+vocab = 151936
+tie_embeddings = true
+
+[layers]
+count = 24
+pattern = ["dense"]
+
+[norm]
+kind = "rmsnorm"
+eps = 1e-6
+
+[attention]
+kind = "gqa"
+heads = 14
+kv_heads = 2
+head_dim = 64
+qkv_bias = true
+qk_norm = false
+
+[rope]
+style = "neox"
+theta = 1000000.0
+
+[mlp]
+activation = "swiglu"
