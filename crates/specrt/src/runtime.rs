@@ -70,6 +70,7 @@ struct PrefillBuffers {
     attn: CudaSlice<f32>,
     gate_up: CudaSlice<f32>,
     act: CudaSlice<f32>,
+    inv: CudaSlice<f32>,
 }
 
 pub struct Generation {
@@ -92,6 +93,7 @@ pub struct Runtime {
     pre: PrefillBuffers,
     chunk: usize,
     use_mma: bool,
+    sms: u32,
     pub cache_hit: bool,
     pub jit_key: String,
     pub arch: String,
@@ -194,10 +196,14 @@ impl Runtime {
             attn: stream.alloc_zeros(chunk * spec.q_dim())?,
             gate_up: stream.alloc_zeros(chunk * 2 * d.intermediate)?,
             act: stream.alloc_zeros(chunk * d.intermediate)?,
+            inv: stream.alloc_zeros(chunk)?,
         };
         let rt = Runtime {
             pre,
             chunk,
+            sms: ctx.attribute(
+                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+            )? as u32,
             use_mma: ctx.compute_capability()?.0 >= 8
                 && std::env::var_os("SPECRT_GEMM_FP32").is_none(),
             spec: spec.clone(),
@@ -286,7 +292,15 @@ impl Runtime {
         let qkv_rows = s.q_dim() + 2 * s.kv_dim();
         for (i, l) in self.layers.iter().enumerate() {
             let layer = i as i32;
-            self.linear_norm("qkv_proj_norm", &l.qkv, l.qkv_bias.as_ref(), &buf.x, &l.ln1, &buf.qkv, qkv_rows)?;
+            self.linear_norm(
+                "qkv_proj_norm",
+                &l.qkv,
+                l.qkv_bias.as_ref(),
+                &buf.x,
+                &l.ln1,
+                &buf.qkv,
+                qkv_rows,
+            )?;
             let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
             b.arg(&buf.qkv)
                 .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
@@ -308,10 +322,26 @@ impl Runtime {
                 .arg(&buf.scores);
             unsafe { b.launch(cfg(a.heads as u32, 512)) }?;
             self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
-            self.linear_norm("gate_up_act", &l.gate_up, None, &buf.x, &l.ln2, &buf.act, s.dims.intermediate)?;
+            self.linear_norm(
+                "gate_up_act",
+                &l.gate_up,
+                None,
+                &buf.x,
+                &l.ln2,
+                &buf.act,
+                s.dims.intermediate,
+            )?;
             self.linear("down_proj", &l.down, None, &buf.act, &buf.x, s.dims.hidden)?;
         }
-        self.linear_norm("lm_head_norm", &self.lm_head, None, &buf.x, &self.norm, &buf.logits, s.dims.vocab)?;
+        self.linear_norm(
+            "lm_head_norm",
+            &self.lm_head,
+            None,
+            &buf.x,
+            &self.norm,
+            &buf.logits,
+            s.dims.vocab,
+        )?;
         Ok(())
     }
 
@@ -325,8 +355,7 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let name = if self.use_mma { name.replace("_gemm", "_mma") } else { name.to_string() };
-        let mut b = self.stream.launch_builder(self.kernel(&name));
+        let mut b = self.stream.launch_builder(self.kernel(name));
         match w {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
             DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
@@ -335,10 +364,53 @@ impl Runtime {
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out).arg(&n);
         let config = LaunchConfig {
             grid_dim: (grid(rows, GEMM_TILE), grid(tokens, GEMM_TILE), 1),
-            block_dim: (if self.use_mma { 128 } else { 256 }, 1, 1),
+            block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tc(
+        &self,
+        name: &str,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: &CudaView<f32>,
+        norm: Option<(&CudaView<f32>, &CudaSlice<f32>)>,
+        out: &CudaSlice<f32>,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let big = grid(rows, 128) * grid(tokens, 128) >= 2 * self.sms;
+        let kernel = if big { format!("{name}_mma_big") } else { format!("{name}_mma") };
+        let tile = if big { 128 } else { 64 };
+        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        match w {
+            DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
+            DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
+        };
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x);
+        match norm {
+            Some((ri, nw)) => b.arg(ri).arg(nw),
+            None => b.arg(&self.buf.dummy).arg(&self.buf.dummy),
+        };
+        let n = tokens as i32;
+        b.arg(out).arg(&n);
+        let config = LaunchConfig {
+            grid_dim: (grid(rows, tile), grid(tokens, tile), 1),
+            block_dim: (if big { 256 } else { 128 }, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn row_rms(&self, x: &CudaSlice<f32>, tokens: usize) -> Result<()> {
+        let mut b = self.stream.launch_builder(self.kernel("row_rms"));
+        b.arg(x).arg(&self.pre.inv);
+        unsafe { b.launch(cfg(tokens as u32, 256)) }?;
         Ok(())
     }
 
@@ -381,16 +453,31 @@ impl Runtime {
         unsafe { b.launch(config) }?;
         for (i, l) in self.layers.iter().enumerate() {
             let layer = i as i32;
-            self.rmsnorm_rows(&pre.x, &l.ln1, &pre.xn, n)?;
-            self.gemm(
-                "qkv_gemm",
-                &l.qkv,
-                l.qkv_bias.as_ref(),
-                &pre.xn.as_view(),
-                &pre.qkv,
-                qkv_rows,
-                n,
-            )?;
+            if self.use_mma {
+                self.row_rms(&pre.x, n)?;
+                let inv = pre.inv.as_view();
+                self.tc(
+                    "qkv",
+                    &l.qkv,
+                    l.qkv_bias.as_ref(),
+                    &pre.x.as_view(),
+                    Some((&inv, &l.ln1)),
+                    &pre.qkv,
+                    qkv_rows,
+                    n,
+                )?;
+            } else {
+                self.rmsnorm_rows(&pre.x, &l.ln1, &pre.xn, n)?;
+                self.gemm(
+                    "qkv_gemm",
+                    &l.qkv,
+                    l.qkv_bias.as_ref(),
+                    &pre.xn.as_view(),
+                    &pre.qkv,
+                    qkv_rows,
+                    n,
+                )?;
+            }
             let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
             b.arg(&pre.qkv)
                 .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
@@ -423,9 +510,26 @@ impl Runtime {
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
+            let inter = s.dims.intermediate;
+            if self.use_mma {
+                self.tc("o", &l.o, None, &pre.attn.as_view(), None, &pre.x, hidden, n)?;
+                self.row_rms(&pre.x, n)?;
+                let inv = pre.inv.as_view();
+                self.tc(
+                    "gate_up",
+                    &l.gate_up,
+                    None,
+                    &pre.x.as_view(),
+                    Some((&inv, &l.ln2)),
+                    &pre.act,
+                    2 * inter,
+                    n,
+                )?;
+                self.tc("down", &l.down, None, &pre.act.as_view(), None, &pre.x, hidden, n)?;
+                continue;
+            }
             self.gemm("o_gemm", &l.o, None, &pre.attn.as_view(), &pre.x, hidden, n)?;
             self.rmsnorm_rows(&pre.x, &l.ln2, &pre.xn, n)?;
-            let inter = s.dims.intermediate;
             self.gemm(
                 "gate_up_gemm",
                 &l.gate_up,
@@ -444,6 +548,39 @@ impl Runtime {
             };
             unsafe { b.launch(config) }?;
             self.gemm("down_gemm", &l.down, None, &pre.act.as_view(), &pre.x, hidden, n)?;
+        }
+        if self.use_mma {
+            self.row_rms(&pre.x, n)?;
+            match all_logits {
+                Some(out) => {
+                    let inv = pre.inv.as_view();
+                    self.tc(
+                        "lm_head",
+                        &self.lm_head,
+                        None,
+                        &pre.x.as_view(),
+                        Some((&inv, &self.norm)),
+                        out,
+                        s.dims.vocab,
+                        n,
+                    )?
+                }
+                None => {
+                    let inv = pre.inv.slice(n - 1..n);
+                    let last = pre.x.slice((n - 1) * hidden..n * hidden);
+                    self.tc(
+                        "lm_head",
+                        &self.lm_head,
+                        None,
+                        &last,
+                        Some((&inv, &self.norm)),
+                        &buf.logits,
+                        s.dims.vocab,
+                        1,
+                    )?
+                }
+            }
+            return Ok(());
         }
         self.rmsnorm_rows(&pre.x, &self.norm, &pre.xn, n)?;
         match all_logits {
@@ -539,7 +676,8 @@ impl Runtime {
         let decode_secs = started.elapsed().as_secs_f64();
         let history = self.stream.clone_dtoh(&self.buf.history)?;
         let free_now = self.ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
-        let peak_device_bytes = (self.baseline_free.saturating_sub(free_now) as u64).max(self.device_bytes);
+        let peak_device_bytes =
+            (self.baseline_free.saturating_sub(free_now) as u64).max(self.device_bytes);
         Ok(Generation {
             tokens: history[..new_tokens].iter().map(|&t| t as u32).collect(),
             prefill_secs,

@@ -32,6 +32,12 @@ pub const KERNELS: &[&str] = &[
     "gate_up_mma",
     "down_mma",
     "lm_head_mma",
+    "qkv_mma_big",
+    "o_mma_big",
+    "gate_up_mma_big",
+    "down_mma_big",
+    "lm_head_mma_big",
+    "row_rms",
     "flash_attention",
     "flash_mma",
 ];

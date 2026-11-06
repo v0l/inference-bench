@@ -189,8 +189,8 @@ __device__ void gate_up_act_norm(const void* w, const float* scales, const float
     int lane = threadIdx.x & 31;
     int row = blockIdx.x * LINEAR_WARPS + warp;
     if (row >= INTER) return;
-    float g = row_dot<IS_Q8, HIDDEN>(w, scales, row, xs, lane);
-    float u = row_dot<IS_Q8, HIDDEN>(w, scales, INTER + row, xs, lane);
+    float g = row_dot<IS_Q8, HIDDEN>(w, scales, 2 * row, xs, lane);
+    float u = row_dot<IS_Q8, HIDDEN>(w, scales, 2 * row + 1, xs, lane);
     if (lane == 0) out[row] = activation(g) * u;
 }
 
@@ -266,12 +266,6 @@ __device__ void gemm(const void* w, const float* scales, const float* bias, cons
     }
 }
 
-constexpr int MMA_BM = 64;
-constexpr int MMA_BN = 64;
-constexpr int MMA_BK = 32;
-constexpr int MMA_THREADS = 128;
-constexpr int MMA_A_STRIDE = MMA_BK + 8;
-
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
     unsigned s = (unsigned)__cvta_generic_to_shared(smem);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(s), "l"(gmem));
@@ -305,75 +299,105 @@ __device__ __forceinline__ void split_hi_lo(float v, unsigned& hi, unsigned& lo)
     lo = bf16_bits_rn(v - __uint_as_float(hi << 16));
 }
 
-__device__ __forceinline__ unsigned pack_i8_pair_bf16(unsigned two_bytes) {
+__device__ __forceinline__ void ldsm_x4(unsigned* r, const void* p) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+
+__device__ __forceinline__ unsigned q8_pair_bf16(unsigned two_bytes) {
     int q0 = (signed char)(two_bytes & 0xff);
     int q1 = (signed char)((two_bytes >> 8) & 0xff);
     return (__float_as_uint((float)q0) >> 16) | (__float_as_uint((float)q1) & 0xffff0000u);
 }
 
-template <int N, int K, bool BIAS, bool RESIDUAL, bool Q8>
-__device__ void gemm_mma(const void* w, const float* scales, const float* bias, const float* x, float* out, int tokens) {
-    static_assert(K % MMA_BK == 0, "K must be a multiple of the MMA k tile");
-    constexpr int W_ROW_BYTES = Q8 ? MMA_BK + 16 : (MMA_BK + 8) * 2;
-    constexpr int KT = K / MMA_BK;
-    __shared__ __align__(16) bf16_t a_hi[MMA_BM][MMA_A_STRIDE];
-    __shared__ __align__(16) bf16_t a_lo[MMA_BM][MMA_A_STRIDE];
-    __shared__ __align__(16) unsigned char ws[2][MMA_BN * W_ROW_BYTES];
+constexpr int EPI_STORE = 0;
+constexpr int EPI_RESIDUAL = 1;
+constexpr int EPI_ACT = 2;
+
+template <int N, int K, int BM, int BN, int WM, int WN, int EPI, bool BIAS, bool Q8, bool NORM>
+__device__ __forceinline__ void gemm_tc(const void* w, const float* scales, const float* bias, const float* x,
+                                        const float* row_inv, const float* nw, float* out, int tokens) {
+    constexpr int THREADS = WM * WN * 32;
+    constexpr int TM = BM / WM;
+    constexpr int TN = BN / WN;
+    constexpr int MI = TM / 16;
+    constexpr int NJ = TN / 8;
+    constexpr int BK = 32;
+    constexpr int AS = BK + 8;
+    constexpr int WROW = Q8 ? BK + 16 : (BK + 8) * 2;
+    constexpr int KT = K / BK;
+    constexpr int A_ITERS = BM * BK / 4 / THREADS;
+    constexpr int W_CHUNKS = Q8 ? 2 : 4;
+    constexpr int W_ITERS = BN * W_CHUNKS / THREADS;
+    static_assert(K % BK == 0, "K must be a multiple of 32");
+    static_assert(A_ITERS * THREADS * 4 == BM * BK, "A tile split");
+    static_assert(W_ITERS * THREADS == BN * W_CHUNKS, "W tile split");
+    static_assert(NJ % 2 == 0, "warp n tile");
+    __shared__ __align__(16) bf16_t a_hi[BM * AS];
+    __shared__ __align__(16) bf16_t a_lo[BM * AS];
+    __shared__ __align__(16) unsigned char ws[2][BN * WROW];
     int tid = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
     int g = lane >> 2;
     int t = lane & 3;
-    int wm = warp >> 1;
-    int wn = warp & 1;
-    int m0 = blockIdx.y * MMA_BM;
-    int n0 = blockIdx.x * MMA_BN;
-    float acc[2][4][4];
+    int wm = warp / WN;
+    int wn = warp % WN;
+    int m0 = blockIdx.y * BM;
+    int n0 = blockIdx.x * BN;
+    float acc[MI][NJ][4];
 #pragma unroll
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < MI; i++)
 #pragma unroll
-        for (int j = 0; j < 4; j++)
+        for (int j = 0; j < NJ; j++)
 #pragma unroll
             for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
-    float4 xr[4];
+    float4 xr[A_ITERS];
     auto load_x = [&](int kt) {
 #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            int idx = tid + i * MMA_THREADS;
-            int r = idx >> 3;
-            int c = (idx & 7) * 4;
+        for (int i = 0; i < A_ITERS; i++) {
+            int idx = tid + i * THREADS;
+            int r = idx / (BK / 4);
+            int c = (idx % (BK / 4)) * 4;
             int m = m0 + r;
-            xr[i] = m < tokens ? *(const float4*)(x + (size_t)m * K + kt * MMA_BK + c)
-                               : make_float4(0.f, 0.f, 0.f, 0.f);
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (m < tokens) {
+                v = *(const float4*)(x + (size_t)m * K + kt * BK + c);
+                if (NORM) {
+                    float sc = row_inv[m];
+                    float4 nv = *(const float4*)(nw + kt * BK + c);
+                    v = make_float4(nv.x * (v.x * sc), nv.y * (v.y * sc), nv.z * (v.z * sc), nv.w * (v.w * sc));
+                }
+            }
+            xr[i] = v;
         }
     };
     auto store_x = [&]() {
 #pragma unroll
-        for (int i = 0; i < 4; i++) {
-            int idx = tid + i * MMA_THREADS;
-            int r = idx >> 3;
-            int c = (idx & 7) * 4;
+        for (int i = 0; i < A_ITERS; i++) {
+            int idx = tid + i * THREADS;
+            int r = idx / (BK / 4);
+            int c = (idx % (BK / 4)) * 4;
             unsigned h0, l0, h1, l1, h2, l2, h3, l3;
             split_hi_lo(xr[i].x, h0, l0);
             split_hi_lo(xr[i].y, h1, l1);
             split_hi_lo(xr[i].z, h2, l2);
             split_hi_lo(xr[i].w, h3, l3);
-            *(uint2*)&a_hi[r][c] = make_uint2(h0 | (h1 << 16), h2 | (h3 << 16));
-            *(uint2*)&a_lo[r][c] = make_uint2(l0 | (l1 << 16), l2 | (l3 << 16));
+            *(uint2*)&a_hi[r * AS + c] = make_uint2(h0 | (h1 << 16), h2 | (h3 << 16));
+            *(uint2*)&a_lo[r * AS + c] = make_uint2(l0 | (l1 << 16), l2 | (l3 << 16));
         }
     };
     auto load_w = [&](int buf, int kt) {
-        constexpr int CHUNKS = Q8 ? 2 : 4;
-        constexpr int CHUNK_BYTES = 16;
 #pragma unroll
-        for (int i = 0; i < (MMA_BN * CHUNKS) / MMA_THREADS; i++) {
-            int idx = tid + i * MMA_THREADS;
-            int r = idx / CHUNKS;
-            int ck = idx % CHUNKS;
+        for (int i = 0; i < W_ITERS; i++) {
+            int idx = tid + i * THREADS;
+            int r = idx / W_CHUNKS;
+            int ck = idx % W_CHUNKS;
             int n = min(n0 + r, N - 1);
-            const char* src = Q8 ? (const char*)w + (size_t)n * K + kt * MMA_BK + ck * CHUNK_BYTES
-                                 : (const char*)w + ((size_t)n * K + kt * MMA_BK) * 2 + ck * CHUNK_BYTES;
-            cp_async16(&ws[buf][r * W_ROW_BYTES + ck * CHUNK_BYTES], src);
+            const char* src = Q8 ? (const char*)w + (size_t)n * K + kt * BK + ck * 16
+                                 : (const char*)w + ((size_t)n * K + kt * BK) * 2 + ck * 16;
+            cp_async16(&ws[buf][r * WROW + ck * 16], src);
         }
     };
     load_w(0, 0);
@@ -392,73 +416,71 @@ __device__ void gemm_mma(const void* w, const float* scales, const float* bias, 
             cp_async_wait<0>();
         }
         __syncthreads();
-        float tmp[2][4][4];
-        float (*c)[4][4] = tmp;
-        {
+        float part[MI][NJ][4];
 #pragma unroll
-            for (int i = 0; i < 2; i++)
+        for (int i = 0; i < MI; i++)
 #pragma unroll
-                for (int j = 0; j < 4; j++)
+            for (int j = 0; j < NJ; j++)
 #pragma unroll
-                    for (int e = 0; e < 4; e++) tmp[i][j][e] = 0.0f;
-        }
+                for (int e = 0; e < 4; e++) part[i][j][e] = 0.0f;
 #pragma unroll
         for (int ks = 0; ks < 2; ks++) {
-            unsigned bw[4][2];
+            unsigned bw[NJ][2];
+            if (Q8) {
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                int row = wn * 32 + j * 8 + g;
-                if (Q8) {
-                    const unsigned char* p = &ws[cur][row * W_ROW_BYTES + ks * 16 + 2 * t];
-                    bw[j][0] = pack_i8_pair_bf16(*(const unsigned short*)p);
-                    bw[j][1] = pack_i8_pair_bf16(*(const unsigned short*)(p + 8));
-                } else {
-                    const unsigned char* p = &ws[cur][row * W_ROW_BYTES + (ks * 16 + 2 * t) * 2];
-                    bw[j][0] = *(const unsigned*)p;
-                    bw[j][1] = *(const unsigned*)(p + 16);
+                for (int j = 0; j < NJ; j++) {
+                    const unsigned char* p = &ws[cur][(wn * TN + j * 8 + g) * WROW + ks * 16 + 2 * t];
+                    bw[j][0] = q8_pair_bf16(*(const unsigned short*)p);
+                    bw[j][1] = q8_pair_bf16(*(const unsigned short*)(p + 8));
+                }
+            } else {
+#pragma unroll
+                for (int jp = 0; jp < NJ / 2; jp++) {
+                    unsigned r[4];
+                    int row = wn * TN + jp * 16 + (lane >> 4) * 8 + (lane & 7);
+                    ldsm_x4(r, &ws[cur][row * WROW + (ks * 16 + ((lane >> 3) & 1) * 8) * 2]);
+                    bw[2 * jp][0] = r[0];
+                    bw[2 * jp][1] = r[1];
+                    bw[2 * jp + 1][0] = r[2];
+                    bw[2 * jp + 1][1] = r[3];
                 }
             }
 #pragma unroll
-            for (int i = 0; i < 2; i++) {
-                int r0 = wm * 32 + i * 16 + g;
-                int k0 = ks * 16 + 2 * t;
-                unsigned h0 = *(const unsigned*)&a_hi[r0][k0];
-                unsigned h1 = *(const unsigned*)&a_hi[r0 + 8][k0];
-                unsigned h2 = *(const unsigned*)&a_hi[r0][k0 + 8];
-                unsigned h3 = *(const unsigned*)&a_hi[r0 + 8][k0 + 8];
-                unsigned l0 = *(const unsigned*)&a_lo[r0][k0];
-                unsigned l1 = *(const unsigned*)&a_lo[r0 + 8][k0];
-                unsigned l2 = *(const unsigned*)&a_lo[r0][k0 + 8];
-                unsigned l3 = *(const unsigned*)&a_lo[r0 + 8][k0 + 8];
+            for (int i = 0; i < MI; i++) {
+                unsigned ah[4], al[4];
+                int row = wm * TM + i * 16 + (lane & 15);
+                int col = ks * 16 + (lane >> 4) * 8;
+                ldsm_x4(ah, &a_hi[row * AS + col]);
+                ldsm_x4(al, &a_lo[row * AS + col]);
 #pragma unroll
-                for (int j = 0; j < 4; j++) {
-                    mma_bf16(c[i][j], l0, l1, l2, l3, bw[j][0], bw[j][1]);
-                    mma_bf16(c[i][j], h0, h1, h2, h3, bw[j][0], bw[j][1]);
+                for (int j = 0; j < NJ; j++) {
+                    mma_bf16(part[i][j], al[0], al[1], al[2], al[3], bw[j][0], bw[j][1]);
+                    mma_bf16(part[i][j], ah[0], ah[1], ah[2], ah[3], bw[j][0], bw[j][1]);
                 }
             }
         }
 #pragma unroll
-        for (int j = 0; j < 4; j++) {
+        for (int j = 0; j < NJ; j++) {
             float s0 = 1.0f, s1 = 1.0f;
             if (Q8) {
-                int col = n0 + wn * 32 + j * 8 + 2 * t;
+                int col = n0 + wn * TN + j * 8 + 2 * t;
                 s0 = scales[(size_t)min(col, N - 1) * (K / Q8_GROUP) + kt];
                 s1 = scales[(size_t)min(col + 1, N - 1) * (K / Q8_GROUP) + kt];
             }
 #pragma unroll
-            for (int i = 0; i < 2; i++) {
-                acc[i][j][0] += tmp[i][j][0] * s0;
-                acc[i][j][1] += tmp[i][j][1] * s1;
-                acc[i][j][2] += tmp[i][j][2] * s0;
-                acc[i][j][3] += tmp[i][j][3] * s1;
+            for (int i = 0; i < MI; i++) {
+                acc[i][j][0] += part[i][j][0] * s0;
+                acc[i][j][1] += part[i][j][1] * s1;
+                acc[i][j][2] += part[i][j][2] * s0;
+                acc[i][j][3] += part[i][j][3] * s1;
             }
         }
     }
 #pragma unroll
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < MI; i++)
 #pragma unroll
-        for (int j = 0; j < 4; j++) {
-            int col = n0 + wn * 32 + j * 8 + 2 * t;
+        for (int j = 0; j < NJ; j++) {
+            int col = n0 + wn * TN + j * 8 + 2 * t;
             if (col >= N) continue;
             float b0 = 0.0f, b1 = 0.0f;
             if (BIAS) {
@@ -467,19 +489,32 @@ __device__ void gemm_mma(const void* w, const float* scales, const float* bias, 
             }
 #pragma unroll
             for (int h = 0; h < 2; h++) {
-                int m = m0 + wm * 32 + i * 16 + g + h * 8;
+                int m = m0 + wm * TM + i * 16 + g + h * 8;
                 if (m >= tokens) continue;
-                float* o = out + (size_t)m * N + col;
                 float v0 = acc[i][j][h * 2] + b0;
                 float v1 = acc[i][j][h * 2 + 1] + b1;
-                if (RESIDUAL) {
-                    v0 += o[0];
-                    if (col + 1 < N) v1 += o[1];
+                if (EPI == EPI_ACT) {
+                    out[(size_t)m * (N / 2) + col / 2] = activation(v0) * v1;
+                } else {
+                    float* o = out + (size_t)m * N + col;
+                    if (EPI == EPI_RESIDUAL) {
+                        v0 += o[0];
+                        if (col + 1 < N) v1 += o[1];
+                    }
+                    o[0] = v0;
+                    if (col + 1 < N) o[1] = v1;
                 }
-                o[0] = v0;
-                if (col + 1 < N) o[1] = v1;
             }
         }
+}
+
+extern "C" __global__ void row_rms(const float* x, float* inv) {
+    __shared__ float scratch[32];
+    x += (size_t)blockIdx.x * HIDDEN;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) ss += x[i] * x[i];
+    float r = rsqrtf(block_reduce<false>(ss, scratch) / HIDDEN + EPS);
+    if (threadIdx.x == 0) inv[blockIdx.x] = r;
 }
 
 extern "C" __global__ void embed(const bf16_t* table, const int* token, float* x) {
@@ -906,11 +941,11 @@ extern "C" __global__ void swiglu(const float* gate_up, float* out) {
     gate_up += (size_t)blockIdx.y * 2 * INTER;
     out += (size_t)blockIdx.y * INTER;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < INTER; i += gridDim.x * blockDim.x) {
-        float g = gate_up[i];
+        float g = gate_up[2 * i];
         float a = ACT_KIND == 1
             ? 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)))
             : g / (1.0f + expf(-g));
-        out[i] = a * gate_up[INTER + i];
+        out[i] = a * gate_up[2 * i + 1];
     }
 }
 

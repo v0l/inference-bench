@@ -97,7 +97,9 @@ fn check_spec(spec: Spec, max_abs: f32, greedy_exact: bool) {
     let d = diff(&ours, &reference);
     assert!(d.max_abs <= max_abs, "max abs diff {}", d.max_abs);
     assert_eq!(d.top1_agreement, 1.0);
-    let greedy = rt.generate(&reference.tokens, reference.greedy.len(), specrt::runtime::Sampling::GREEDY).unwrap();
+    let greedy = rt
+        .generate(&reference.tokens, reference.greedy.len(), specrt::runtime::Sampling::GREEDY)
+        .unwrap();
     if greedy_exact {
         assert_eq!(greedy.tokens, reference.greedy);
     }

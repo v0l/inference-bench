@@ -38,24 +38,44 @@ extern "C" __global__ void lm_head_gemm(const void* w, const float* s, const flo
     gemm<{{VOCAB}}, {{HIDDEN}}, false, false, {{Q8}}>(w, s, b, x, out, tokens);
 }
 
-extern "C" __global__ void qkv_mma(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm_mma<{{QKV_N}}, {{HIDDEN}}, {{QKV_BIAS}}, false, {{Q8}}>(w, s, b, x, out, tokens);
+extern "C" __global__ void qkv_mma(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{QKV_N}}, {{HIDDEN}}, 64, 64, 2, 2, EPI_STORE, {{QKV_BIAS}}, {{Q8}}, true>(w, s, b, x, ri, nw, out, tokens);
 }
 
-extern "C" __global__ void o_mma(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm_mma<{{HIDDEN}}, {{Q_DIM}}, false, true, {{Q8}}>(w, s, b, x, out, tokens);
+extern "C" __global__ void qkv_mma_big(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{QKV_N}}, {{HIDDEN}}, 128, 128, 2, 4, EPI_STORE, {{QKV_BIAS}}, {{Q8}}, true>(w, s, b, x, ri, nw, out, tokens);
 }
 
-extern "C" __global__ void gate_up_mma(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm_mma<{{GATE_UP_N}}, {{HIDDEN}}, false, false, {{Q8}}>(w, s, b, x, out, tokens);
+extern "C" __global__ void o_mma(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{HIDDEN}}, {{Q_DIM}}, 64, 64, 2, 2, EPI_RESIDUAL, false, {{Q8}}, false>(w, s, b, x, ri, nw, out, tokens);
 }
 
-extern "C" __global__ void down_mma(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm_mma<{{HIDDEN}}, {{INTER}}, false, true, {{Q8}}>(w, s, b, x, out, tokens);
+extern "C" __global__ void o_mma_big(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{HIDDEN}}, {{Q_DIM}}, 128, 128, 2, 4, EPI_RESIDUAL, false, {{Q8}}, false>(w, s, b, x, ri, nw, out, tokens);
 }
 
-extern "C" __global__ void lm_head_mma(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm_mma<{{VOCAB}}, {{HIDDEN}}, false, false, {{Q8}}>(w, s, b, x, out, tokens);
+extern "C" __global__ void gate_up_mma(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{GATE_UP_N}}, {{HIDDEN}}, 64, 64, 2, 2, EPI_ACT, false, {{Q8}}, true>(w, s, b, x, ri, nw, out, tokens);
+}
+
+extern "C" __global__ void gate_up_mma_big(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{GATE_UP_N}}, {{HIDDEN}}, 128, 128, 2, 4, EPI_ACT, false, {{Q8}}, true>(w, s, b, x, ri, nw, out, tokens);
+}
+
+extern "C" __global__ void down_mma(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{HIDDEN}}, {{INTER}}, 64, 64, 2, 2, EPI_RESIDUAL, false, {{Q8}}, false>(w, s, b, x, ri, nw, out, tokens);
+}
+
+extern "C" __global__ void down_mma_big(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{HIDDEN}}, {{INTER}}, 128, 128, 2, 4, EPI_RESIDUAL, false, {{Q8}}, false>(w, s, b, x, ri, nw, out, tokens);
+}
+
+extern "C" __global__ void lm_head_mma(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{VOCAB}}, {{HIDDEN}}, 64, 64, 2, 2, EPI_STORE, false, {{Q8}}, true>(w, s, b, x, ri, nw, out, tokens);
+}
+
+extern "C" __global__ void lm_head_mma_big(const void* w, const float* s, const float* b, const float* x, const float* ri, const float* nw, float* out, int tokens) {
+    gemm_tc<{{VOCAB}}, {{HIDDEN}}, 128, 128, 2, 4, EPI_STORE, false, {{Q8}}, true>(w, s, b, x, ri, nw, out, tokens);
 }
 
 extern "C" __global__ void qkv_proj_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {

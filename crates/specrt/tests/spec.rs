@@ -69,8 +69,8 @@ fn rejects_non_dividing_gqa_groups() {
 }
 
 fn fixture_with(from: &str, to: &str) -> String {
-    let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3-0.6b.config.json"))
-        .unwrap();
+    let json =
+        std::fs::read_to_string(root().join("tests/fixtures/qwen3-0.6b.config.json")).unwrap();
     assert!(json.contains(from), "{from}");
     json.replace(from, to)
 }
@@ -136,7 +136,8 @@ fn mistral_f16_spec_matches_hf_config() {
 #[test]
 fn gemma_and_phi3_stay_unsupported_with_the_model_type_in_the_error() {
     for model_type in ["gemma2", "gemma3_text", "phi3"] {
-        let json = fixture_with("\"model_type\": \"qwen3\"", &format!("\"model_type\": \"{model_type}\""));
+        let json =
+            fixture_with("\"model_type\": \"qwen3\"", &format!("\"model_type\": \"{model_type}\""));
         let e = Spec::from_hf_config(&json).unwrap_err().to_string();
         assert_eq!(e, format!("model_type {model_type} is not supported"));
     }

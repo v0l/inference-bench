@@ -131,6 +131,15 @@ pub fn quantize_q8(w: &[u16], cols: usize) -> (Vec<i8>, Vec<f32>) {
     (values, scales)
 }
 
+pub fn interleave_rows<T: Copy>(a: &[T], b: &[T], cols: usize) -> Vec<T> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    for (ra, rb) in a.chunks_exact(cols).zip(b.chunks_exact(cols)) {
+        out.extend_from_slice(ra);
+        out.extend_from_slice(rb);
+    }
+    out
+}
+
 fn matrix(quant: Quant, w: Vec<u16>, cols: usize) -> Matrix {
     match quant {
         Quant::Bf16 => Matrix::Bf16(w),
@@ -175,8 +184,9 @@ impl Weights {
             } else {
                 (None, None)
             };
-            let mut gate_up = r.bf16(&format!("{p}.mlp.gate_proj.weight"), &[inter, h])?;
-            gate_up.extend(r.bf16(&format!("{p}.mlp.up_proj.weight"), &[inter, h])?);
+            let gate = r.bf16(&format!("{p}.mlp.gate_proj.weight"), &[inter, h])?;
+            let up = r.bf16(&format!("{p}.mlp.up_proj.weight"), &[inter, h])?;
+            let gate_up = interleave_rows(&gate, &up, h);
             layers.push(Layer {
                 ln1: r.f32(&format!("{p}.input_layernorm.weight"), h)?,
                 ln2: r.f32(&format!("{p}.post_attention_layernorm.weight"), h)?,

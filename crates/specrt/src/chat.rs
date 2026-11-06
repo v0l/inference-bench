@@ -70,7 +70,9 @@ mod tests {
     const CHATML: &str = "{% for m in messages %}<|im_start|>{{ m['role'] }}\\n{{ m['content'] }}<|im_end|>\\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\\n{% endif %}";
 
     fn config(template: &str) -> String {
-        format!(r#"{{"chat_template": "{template}", "bos_token": null, "eos_token": "<|im_end|>"}}"#)
+        format!(
+            r#"{{"chat_template": "{template}", "bos_token": null, "eos_token": "<|im_end|>"}}"#
+        )
     }
 
     #[test]
