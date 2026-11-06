@@ -19,3 +19,4 @@ eframe = "0.37"
 egui = "0.37"
 egui_bench = "0.9.4"
 serde_json.workspace = true
+chrono.workspace = true

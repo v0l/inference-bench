@@ -2903,6 +2903,7 @@ name = "inference-bench-ui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "eframe",
  "egui",
  "egui_bench",
