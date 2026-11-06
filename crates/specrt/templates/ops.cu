@@ -341,7 +341,8 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
     static_assert(NJ % 2 == 0, "warp n tile");
     __shared__ __align__(16) bf16_t a_hi[BM * AS];
     __shared__ __align__(16) bf16_t a_lo[SPLIT ? BM * AS : 8];
-    __shared__ __align__(16) unsigned char ws[2][BN * WROW];
+    constexpr int STAGES = {{GEMM_STAGES}};
+    __shared__ __align__(16) unsigned char ws[STAGES][BN * WROW];
     int tid = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
@@ -406,21 +407,21 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
             cp_async16(&ws[buf][r * WROW + ck * 16], src);
         }
     };
-    load_w(0, 0);
-    cp_async_commit();
+#pragma unroll
+    for (int st = 0; st < STAGES - 1; st++) {
+        if (st < KT) load_w(st, st);
+        cp_async_commit();
+    }
     load_x(0);
     for (int kt = 0; kt < KT; kt++) {
-        int cur = kt & 1;
+        int cur = kt % STAGES;
         __syncthreads();
         store_x();
-        if (kt + 1 < KT) {
-            load_w(cur ^ 1, kt + 1);
-            cp_async_commit();
-            load_x(kt + 1);
-            cp_async_wait<1>();
-        } else {
-            cp_async_wait<0>();
-        }
+        int next = kt + STAGES - 1;
+        if (next < KT) load_w(next % STAGES, next);
+        cp_async_commit();
+        if (kt + 1 < KT) load_x(kt + 1);
+        cp_async_wait<STAGES - 1>();
         __syncthreads();
         float part[MI][NJ][4];
 #pragma unroll

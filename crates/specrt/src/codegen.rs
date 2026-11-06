@@ -159,6 +159,7 @@ impl Module {
             ("SPLIT_GATE_UP", split("gate_up")),
             ("SPLIT_DOWN", split("down")),
             ("SPLIT_LM_HEAD", split("lm_head")),
+            ("GEMM_STAGES", std::env::var("SPECRT_STAGES").unwrap_or_else(|_| "2".into())),
             ("BIG_BM", big.bm.to_string()),
             ("BIG_BN", big.bn.to_string()),
             ("BIG_WM", big.wm.to_string()),
