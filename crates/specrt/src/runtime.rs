@@ -383,9 +383,14 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let big = grid(rows, 128) * grid(tokens, 128) >= 2 * self.sms;
+        let big_tile = crate::codegen::Tile::big();
+        let big = match std::env::var("SPECRT_TILE").as_deref() {
+            Ok("small") => false,
+            Ok("big") => true,
+            _ => grid(rows, big_tile.bn) * grid(tokens, big_tile.bm) >= 2 * self.sms,
+        };
+        let tile = if big { big_tile } else { crate::codegen::Tile::SMALL };
         let kernel = if big { format!("{name}_mma_big") } else { format!("{name}_mma") };
-        let tile = if big { 128 } else { 64 };
         let mut b = self.stream.launch_builder(self.kernel(&kernel));
         match w {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
@@ -399,8 +404,8 @@ impl Runtime {
         let n = tokens as i32;
         b.arg(out).arg(&n);
         let config = LaunchConfig {
-            grid_dim: (grid(rows, tile), grid(tokens, tile), 1),
-            block_dim: (if big { 256 } else { 128 }, 1, 1),
+            grid_dim: (grid(rows, tile.bn), grid(tokens, tile.bm), 1),
+            block_dim: (tile.threads(), 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;

@@ -305,6 +305,12 @@ __device__ __forceinline__ void ldsm_x4(unsigned* r, const void* p) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
 }
 
+__device__ __forceinline__ void ldsm_x4_t(unsigned* r, const void* p) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+
 __device__ __forceinline__ unsigned q8_pair_bf16(unsigned two_bytes) {
     int q0 = (signed char)(two_bytes & 0xff);
     int q1 = (signed char)((two_bytes >> 8) & 0xff);
@@ -329,10 +335,9 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
     constexpr int KT = K / BK;
     constexpr int A_ITERS = BM * BK / 4 / THREADS;
     constexpr int W_CHUNKS = Q8 ? 2 : 4;
-    constexpr int W_ITERS = BN * W_CHUNKS / THREADS;
+    constexpr int W_ITERS = (BN * W_CHUNKS + THREADS - 1) / THREADS;
     static_assert(K % BK == 0, "K must be a multiple of 32");
     static_assert(A_ITERS * THREADS * 4 == BM * BK, "A tile split");
-    static_assert(W_ITERS * THREADS == BN * W_CHUNKS, "W tile split");
     static_assert(NJ % 2 == 0, "warp n tile");
     __shared__ __align__(16) bf16_t a_hi[BM * AS];
     __shared__ __align__(16) bf16_t a_lo[BM * AS];
@@ -392,6 +397,7 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
 #pragma unroll
         for (int i = 0; i < W_ITERS; i++) {
             int idx = tid + i * THREADS;
+            if (W_ITERS * THREADS != BN * W_CHUNKS && idx >= BN * W_CHUNKS) break;
             int r = idx / W_CHUNKS;
             int ck = idx % W_CHUNKS;
             int n = min(n0 + r, N - 1);
@@ -752,7 +758,6 @@ extern "C" __global__ void flash_attention(const float* qkv, const float* k_cach
 constexpr int FM_BQ = 64;
 constexpr int FM_BK = 32;
 constexpr int FM_KS = HEAD_DIM + 8;
-constexpr int FM_VS = FM_BK + 8;
 constexpr int FM_KB = HEAD_DIM / 16;
 constexpr int FM_NB = HEAD_DIM / 8;
 
@@ -778,11 +783,11 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* k_cache, con
                                      const int* block_table, const int* pos_ptr, int layer, float* out, int tokens) {
     __shared__ __align__(16) bf16_t k_hi[FM_BK][FM_KS];
     __shared__ __align__(16) bf16_t k_lo[FM_BK][FM_KS];
-    __shared__ __align__(16) bf16_t v_hi[HEAD_DIM][FM_VS];
-    __shared__ __align__(16) bf16_t v_lo[HEAD_DIM][FM_VS];
+    __shared__ __align__(16) bf16_t v_hi[FM_BK][FM_KS];
+    __shared__ __align__(16) bf16_t v_lo[FM_BK][FM_KS];
     int head = blockIdx.y;
     int kv_head = head / GROUP;
-    int q0 = blockIdx.x * FM_BQ;
+    int q0 = (gridDim.x - 1 - blockIdx.x) * FM_BQ;
     int base = pos_ptr[0];
     int tid = threadIdx.x;
     int lane = tid & 31;
@@ -836,13 +841,8 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* k_cache, con
             }
             *(uint2*)&k_hi[r][d] = make_uint2(pack_hi(kv.x, kv.y), pack_hi(kv.z, kv.w));
             *(uint2*)&k_lo[r][d] = make_uint2(pack_lo(kv.x, kv.y), pack_lo(kv.z, kv.w));
-            float vf[4] = {vv.x, vv.y, vv.z, vv.w};
-#pragma unroll
-            for (int j = 0; j < 4; j++) {
-                unsigned hb = bf16_bits_rn(vf[j]);
-                v_hi[d + j][r] = (bf16_t)hb;
-                v_lo[d + j][r] = (bf16_t)bf16_bits_rn(vf[j] - __uint_as_float(hb << 16));
-            }
+            *(uint2*)&v_hi[r][d] = make_uint2(pack_hi(vv.x, vv.y), pack_hi(vv.z, vv.w));
+            *(uint2*)&v_lo[r][d] = make_uint2(pack_lo(vv.x, vv.y), pack_lo(vv.z, vv.w));
         }
         __syncthreads();
         float s[4][4];
@@ -851,14 +851,16 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* k_cache, con
 #pragma unroll
             for (int e = 0; e < 4; e++) s[nb][e] = 0.0f;
 #pragma unroll
-        for (int nb = 0; nb < 4; nb++)
+        for (int np = 0; np < 2; np++)
 #pragma unroll
             for (int kb = 0; kb < FM_KB; kb++) {
-                int kr = nb * 8 + g;
-                int d = kb * 16 + 2 * t;
-                mma3(s[nb], qh[kb], ql[kb],
-                     *(const unsigned*)&k_hi[kr][d], *(const unsigned*)&k_hi[kr][d + 8],
-                     *(const unsigned*)&k_lo[kr][d], *(const unsigned*)&k_lo[kr][d + 8]);
+                unsigned bh[4], bl[4];
+                int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
+                int d = kb * 16 + ((lane >> 3) & 1) * 8;
+                ldsm_x4(bh, &k_hi[kr][d]);
+                ldsm_x4(bl, &k_lo[kr][d]);
+                mma3(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
+                mma3(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
             }
         float mx0 = NEG_INF, mx1 = NEG_INF;
 #pragma unroll
@@ -904,6 +906,11 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* k_cache, con
             o[i][2] *= a1;
             o[i][3] *= a1;
         }
+        float pv[FM_NB][4];
+#pragma unroll
+        for (int i = 0; i < FM_NB; i++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) pv[i][e] = 0.0f;
 #pragma unroll
         for (int kb = 0; kb < 2; kb++) {
             unsigned ph[4], pl[4];
@@ -916,14 +923,20 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* k_cache, con
             pl[2] = pack_lo(s[2 * kb + 1][0], s[2 * kb + 1][1]);
             pl[3] = pack_lo(s[2 * kb + 1][2], s[2 * kb + 1][3]);
 #pragma unroll
-            for (int nb = 0; nb < FM_NB; nb++) {
-                int dr = nb * 8 + g;
-                int kc = kb * 16 + 2 * t;
-                mma3(o[nb], ph, pl,
-                     *(const unsigned*)&v_hi[dr][kc], *(const unsigned*)&v_hi[dr][kc + 8],
-                     *(const unsigned*)&v_lo[dr][kc], *(const unsigned*)&v_lo[dr][kc + 8]);
+            for (int np = 0; np < FM_NB / 2; np++) {
+                unsigned bh[4], bl[4];
+                int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+                int d = np * 16 + (lane >> 4) * 8;
+                ldsm_x4_t(bh, &v_hi[kr][d]);
+                ldsm_x4_t(bl, &v_lo[kr][d]);
+                mma3(pv[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
+                mma3(pv[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
             }
         }
+#pragma unroll
+        for (int i = 0; i < FM_NB; i++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) o[i][e] += pv[i][e];
     }
     float i0 = 1.0f / l0;
     float i1 = 1.0f / l1;

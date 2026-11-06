@@ -7,6 +7,32 @@ pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Tile {
+    pub bm: usize,
+    pub bn: usize,
+    pub wm: usize,
+    pub wn: usize,
+}
+
+impl Tile {
+    pub const SMALL: Tile = Tile { bm: 64, bn: 64, wm: 2, wn: 2 };
+
+    pub fn threads(&self) -> u32 {
+        (self.wm * self.wn * 32) as u32
+    }
+
+    pub fn big() -> Tile {
+        match std::env::var("SPECRT_BIG_TILE").ok().and_then(|v| {
+            let p: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+            (p.len() == 4).then(|| Tile { bm: p[0], bn: p[1], wm: p[2], wn: p[3] })
+        }) {
+            Some(t) => t,
+            None => Tile { bm: 128, bn: 64, wm: 4, wn: 2 },
+        }
+    }
+}
+
 pub const KERNELS: &[&str] = &[
     "embed",
     "rmsnorm",
@@ -89,6 +115,7 @@ impl Module {
         let opt = |f: fn(&crate::spec::RopeScaling) -> Option<f64>| {
             float_literal(scaling.and_then(f).unwrap_or(1.0))
         };
+        let big = Tile::big();
         let act = match spec.mlp.activation {
             Activation::Swiglu => 0,
             Activation::Geglu => 1,
@@ -119,6 +146,10 @@ impl Module {
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
             ("LINEAR", linear.to_string()),
             ("Q8", (spec.quant == Quant::Q8).to_string()),
+            ("BIG_BM", big.bm.to_string()),
+            ("BIG_BN", big.bn.to_string()),
+            ("BIG_WM", big.wm.to_string()),
+            ("BIG_WN", big.wn.to_string()),
         ]
         .into_iter()
         .collect();
