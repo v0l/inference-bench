@@ -281,7 +281,7 @@ impl Runtime {
                 .arg(&layer)
                 .arg(&buf.attn)
                 .arg(&buf.scores);
-            unsafe { b.launch(cfg(a.heads as u32, 128)) }?;
+            unsafe { b.launch(cfg(a.heads as u32, 512)) }?;
             self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
             self.rmsnorm(&buf.x, &l.ln2, &buf.xn)?;
             self.linear(
@@ -403,7 +403,7 @@ impl Runtime {
                 .arg(&buf.scores);
             let config = LaunchConfig {
                 grid_dim: (a.heads as u32, n as u32, 1),
-                block_dim: (128, 1, 1),
+                block_dim: (512, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
