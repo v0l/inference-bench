@@ -1,0 +1,13 @@
+{
+  "backend": "specrt",
+  "model": "Qwen3-0.6B",
+  "started": "2026-11-06T17:27:03.939997446Z",
+  "prompt_tokens": 43,
+  "completion_tokens": 128,
+  "prefill_tok_s": 151.25594051110895,
+  "decode_tok_s": 137.18380031932176,
+  "ttft_secs": 0.284286355,
+  "peak_memory_bytes": 3597807616,
+  "text": " that the model can be reloaded without recompiling. The model is then used to generate a new set of queries, and the system automatically updates the model with the new queries. This process is repeated until the model is fully trained. The model is then used to generate a new set of queries, and the system automatically updates the model with the new queries. This process is repeated until the model is fully trained. The model is then used to generate a new set of queries, and the system automatically updates the model with the new queries. This process is repeated until the model is fully trained.\n\nThe model is then used to generate a",
+  "error": null
+}

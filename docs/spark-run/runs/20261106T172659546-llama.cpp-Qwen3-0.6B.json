@@ -1,0 +1,13 @@
+{
+  "backend": "llama.cpp",
+  "model": "Qwen3-0.6B",
+  "started": "2026-11-06T17:26:59.546288956Z",
+  "prompt_tokens": 43,
+  "completion_tokens": 128,
+  "prefill_tok_s": 335.24170583953,
+  "decode_tok_s": 159.57575566549374,
+  "ttft_secs": 0.128265664,
+  "peak_memory_bytes": null,
+  "text": " that the model can be reloaded without recompiling. The model is then used to generate a new set of queries, and the system automatically updates the model with the new queries. This process is repeated until the model is fully trained. The model is then used to generate a new set of queries, and the system automatically updates the model with the new queries. This process is repeated until the model is fully trained. The model is then used to generate a new set of queries, and the system automatically updates the model with the new queries. This process is repeated until the model is fully trained.\n\nThe model is then used to generate a",
+  "error": null
+}

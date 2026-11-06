@@ -85,7 +85,7 @@ impl Backend for OpenAi {
             ));
         }
         self.model = model.to_string();
-        Ok(())
+        self.generate(&Request { prompt: "Hello".into(), max_tokens: 1 }, &mut |_| {}).map(|_| ())
     }
 
     fn generate(
@@ -193,9 +193,30 @@ mod tests {
         assert_eq!((g.prompt_tokens, g.completion_tokens), (40, 6));
         assert!(g.ttft_secs >= 0.15 && g.ttft_secs < 1.0, "ttft {}", g.ttft_secs);
         assert!(g.decode_secs >= 0.08, "decode {}", g.decode_secs);
-        let sent = server.requests.lock().unwrap().join("\n");
+        let sent = server.requests.lock().unwrap().last().cloned().unwrap();
         let sent: String = sent.split_whitespace().collect();
         assert!(sent.contains("\"model\":\"qwen3\"") && sent.contains("\"stream\":true"), "{sent}");
+    }
+
+    #[test]
+    fn load_warms_the_model_so_the_timed_run_excludes_loading() {
+        let server = FakeServer::start(script());
+        let mut b = OpenAi::new("fake".into(), &server.url, None);
+        b.load("qwen3").unwrap();
+        let seen = server.requests.lock().unwrap().clone();
+        assert_eq!(seen.iter().filter(|r| r.starts_with("/v1/completions")).count(), 1);
+        assert!(seen.last().unwrap().contains("\"max_tokens\": 1"));
+    }
+
+    #[test]
+    fn a_load_failure_from_the_server_surfaces_at_load() {
+        let server = FakeServer::start(Script {
+            models: vec!["qwen3".into()],
+            fail_status: Some((500, "model name=qwen3 failed to load".into())),
+            ..Default::default()
+        });
+        let mut b = OpenAi::new("fake".into(), &server.url, None);
+        assert!(b.load("qwen3").is_err());
     }
 
     #[test]

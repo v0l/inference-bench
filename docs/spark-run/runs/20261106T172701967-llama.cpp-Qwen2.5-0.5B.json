@@ -1,0 +1,13 @@
+{
+  "backend": "llama.cpp",
+  "model": "Qwen2.5-0.5B",
+  "started": "2026-11-06T17:27:01.967882242Z",
+  "prompt_tokens": 43,
+  "completion_tokens": 128,
+  "prefill_tok_s": 345.03220386158756,
+  "decode_tok_s": 186.00861096839466,
+  "ttft_secs": 0.124626048,
+  "peak_memory_bytes": null,
+  "text": " that the runtime can be used to decode a model in a single step. The runtime also supports a simple API for loading a model from a file, and a simple API for loading a model from a string. The runtime also supports a simple API for loading a model from a file, and a simple API for loading a model from a string. The runtime also supports a simple API for loading a model from a file, and a simple API for loading a model from a string. The runtime also supports a simple API for loading a model from a file, and a simple API for loading a model from a string. The runtime also supports a",
+  "error": null
+}

@@ -1,0 +1,13 @@
+{
+  "backend": "specrt",
+  "model": "Qwen2.5-0.5B",
+  "started": "2026-11-06T17:27:06.384726924Z",
+  "prompt_tokens": 43,
+  "completion_tokens": 128,
+  "prefill_tok_s": 180.060290131313,
+  "decode_tok_s": 175.4930279362943,
+  "ttft_secs": 0.238808901,
+  "peak_memory_bytes": 1731661824,
+  "text": " that the runtime can be used to decode a model in a single step. The runtime also supports a simple API for loading a model from a file, and a simple API for loading a model from a string. The runtime also supports a simple API for loading a model from a file, and a simple API for loading a model from a string. The runtime also supports a simple API for loading a model from a file, and a simple API for loading a model from a string. The runtime also supports a simple API for loading a model from a file, and a simple API for loading a model from a string. The runtime also supports a",
+  "error": null
+}
