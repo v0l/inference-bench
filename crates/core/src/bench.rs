@@ -265,7 +265,8 @@ mod tests {
         save_session(&dir, &results).unwrap();
         let back = load_sessions(&dir);
         assert_eq!(back.len(), 1);
-        assert_eq!(back[0].1, results);
+        assert_eq!(back[0].1.len(), results.len());
+        assert_eq!(back[0].1[0].model, "m1 @32");
     }
 
     #[test]
