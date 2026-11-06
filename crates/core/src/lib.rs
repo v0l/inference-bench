@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod chat;
+pub mod library;
 pub mod logitdiff;
 pub mod matrix;
 pub mod openai;
