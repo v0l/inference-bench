@@ -25,3 +25,12 @@ inference-bench logit-diff --backend specrt --model specs/qwen3-0.6b.toml
 
 Results are saved as JSON in the data directory (`INFERENCE_BENCH_DIR` to move it) and shown by
 `inference-bench-ui`.
+
+## Layout
+
+- `crates/core`: `Backend` trait, `RunResult`, the OpenAI-compatible and worker backends, matrix runner, logit diff, result store.
+- `crates/cli`: the `inference-bench` command.
+- `crates/ui`: the `inference-bench-ui` window.
+- `crates/specrt`: the native CUDA runtime and its `inference-bench-specrt` worker. See its README.
+
+A measured run on a DGX Spark is in `docs/spark-matrix.md`.
