@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use inference_bench_core::backend::{Backend, BackendConfig, Request};
+use inference_bench_core::logging::{self, LogArgs};
 use inference_bench_core::logitdiff::{self, FIXED_PROMPT, Tolerance};
 use inference_bench_core::matrix::{MatrixSpec, run_matrix, run_model};
 use inference_bench_core::result::RunResult;
@@ -13,6 +14,8 @@ use std::path::{Path, PathBuf};
 struct Cli {
     #[arg(long, global = true, help = "Where results are saved (INFERENCE_BENCH_DIR)")]
     out: Option<PathBuf>,
+    #[command(flatten)]
+    log: LogArgs,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -60,6 +63,8 @@ impl BackendArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
+    #[command(alias = "server", about = "Serve an OpenAI-compatible HTTP API")]
+    Serve(inference_bench_server::cli::ServeArgs),
     Run {
         #[command(flatten)]
         backend: BackendArgs,
@@ -142,7 +147,12 @@ fn print_results(results: &[RunResult], json: bool) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let data = dir(&cli);
+    let _log = logging::init(&cli.log.config())?;
+    if let Cmd::Serve(args) = &cli.cmd {
+        return args.run_initialised(&cli.log);
+    }
     match &cli.cmd {
+        Cmd::Serve(_) => unreachable!(),
         Cmd::Run { backend, model, prompt_file, prompt, max_tokens, json, no_save } => {
             let request = Request { prompt: read_prompt(prompt_file, prompt)?, max_tokens: *max_tokens };
             let mut b = backend.config()?.build().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -175,7 +185,7 @@ fn main() -> Result<()> {
             let mut all = Vec::new();
             run_matrix(&spec, &request, &mut |r| {
                 if let Err(e) = store::save(&data, &r) {
-                    eprintln!("could not save result: {e}");
+                    tracing::error!(error = %e, "could not save result");
                 }
                 if !*json {
                     println!("{}", describe(&r));
@@ -186,7 +196,7 @@ fn main() -> Result<()> {
                 print_results(&all, true)?;
             }
             let failed = all.iter().filter(|r| r.error.is_some()).count();
-            eprintln!("{} cells, {} failed, saved in {}", all.len(), failed, data.display());
+            tracing::info!(cells = all.len(), failed, dir = %data.display(), "matrix finished");
         }
         Cmd::LogitDiff { backend, model, reference_model, python, quantised, prompt_file } => {
             let prompt = match prompt_file {
@@ -207,7 +217,7 @@ fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&d)?);
             let tolerance = if *quantised { Tolerance::QUANTISED } else { Tolerance::BF16 };
             if !d.within(tolerance) {
-                eprintln!("logits are outside the tolerance");
+                tracing::error!("logits are outside the tolerance");
                 std::process::exit(2);
             }
         }

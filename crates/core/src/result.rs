@@ -8,6 +8,7 @@ pub enum ErrorKind {
     ModelNotFound,
     Unreachable,
     Failed,
+    Cancelled,
 }
 
 impl ErrorKind {
@@ -17,6 +18,7 @@ impl ErrorKind {
             Self::ModelNotFound => "model not found",
             Self::Unreachable => "backend unreachable",
             Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
         }
     }
 

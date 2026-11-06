@@ -115,13 +115,16 @@ const GEMM_TILE: usize = 64;
 
 impl Runtime {
     pub fn load(spec: &Spec, max_ctx: usize) -> Result<Self> {
+        let load_started = Instant::now();
         let ctx = CudaContext::new(0).context("cuda init")?;
         let free_before = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let jit = Jit::new(ctx.clone(), default_cache_dir())?;
         let module = Module::generate(spec, max_ctx)?;
+        let jit_started = Instant::now();
         let loaded = jit.load(&module)?;
+        let jit_secs = jit_started.elapsed().as_secs_f64();
         let mut kernels = HashMap::new();
         for &name in &module.kernels {
             kernels.insert(name, loaded.function(name)?);
@@ -217,6 +220,18 @@ impl Runtime {
         let free_after = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         let mut rt = rt;
         rt.device_bytes = free_before.saturating_sub(free_after) as u64;
+        tracing::info!(
+            spec = %rt.spec.name,
+            jit_key = %rt.jit_key,
+            jit_cache_hit = rt.cache_hit,
+            jit_secs = jit_secs,
+            arch = %rt.arch,
+            vram_before_bytes = free_before,
+            vram_after_bytes = free_after,
+            device_bytes = rt.device_bytes,
+            load_secs = load_started.elapsed().as_secs_f64(),
+            "runtime loaded"
+        );
         Ok(rt)
     }
 

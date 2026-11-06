@@ -53,6 +53,7 @@ fn load(model: &str, max_ctx: Option<usize>) -> Result<Loaded> {
         Err(_) => None,
     };
     let max_ctx = max_ctx.unwrap_or(DEFAULT_CTX).min(MAX_CTX);
+    tracing::info!(model, spec = %spec.name, max_ctx, "loading model");
     let runtime = Runtime::load(&spec, max_ctx)?;
     Ok(Loaded { spec, tokenizer, chat, runtime, max_ctx })
 }

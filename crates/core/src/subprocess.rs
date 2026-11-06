@@ -91,10 +91,12 @@ impl Subprocess {
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let stderr = Arc::new(Mutex::new(String::new()));
         let sink = stderr.clone();
+        let name = self.name.clone();
         let mut err = BufReader::new(child.stderr.take().unwrap());
         std::thread::spawn(move || {
             let mut line = String::new();
             while err.read_line(&mut line).unwrap_or(0) > 0 {
+                tracing::info!(worker = %name, "{}", line.trim_end());
                 let mut s = sink.lock().unwrap();
                 s.push_str(&line);
                 if s.len() > 16384 {
@@ -105,6 +107,7 @@ impl Subprocess {
                 line.clear();
             }
         });
+        tracing::info!(worker = %self.name, program = %self.program.display(), pid = child.id(), "worker started");
         self.child = Some(Running { child, stdin, stdout, stderr });
         Ok(())
     }
@@ -189,12 +192,20 @@ impl Backend for Subprocess {
         if self.child.is_none() {
             self.start()?;
         }
+        let started = std::time::Instant::now();
         self.send(json!({"op": "load", "model": model, "max_ctx": self.max_ctx}))?;
         loop {
             let event = self.next_event()?;
             match event["event"].as_str() {
-                Some("loaded") => return Ok(()),
-                Some("error") => return Err(Self::worker_error(&event)),
+                Some("loaded") => {
+                    tracing::info!(worker = %self.name, model, load_secs = started.elapsed().as_secs_f64(), "worker loaded model");
+                    return Ok(());
+                }
+                Some("error") => {
+                    let e = Self::worker_error(&event);
+                    tracing::error!(worker = %self.name, model, error = %e, "worker failed to load model");
+                    return Err(e);
+                }
                 _ => {}
             }
         }

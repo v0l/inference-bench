@@ -48,7 +48,9 @@ impl Logits {
     }
 }
 
-pub trait Backend {
+pub type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
+
+pub trait Backend: Send {
     fn name(&self) -> &str;
 
     fn capabilities(&self) -> Capabilities;
@@ -60,6 +62,8 @@ pub trait Backend {
         request: &Request,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError>;
+
+    fn set_cancel(&mut self, _flag: Option<CancelFlag>) {}
 
     fn logits(&mut self, _prompt: &str) -> Result<Logits, BackendError> {
         Err(BackendError::failed(format!("{} does not expose logits", self.name())))

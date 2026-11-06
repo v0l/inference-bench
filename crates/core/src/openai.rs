@@ -1,4 +1,4 @@
-use crate::backend::{Backend, Capabilities, Request};
+use crate::backend::{Backend, CancelFlag, Capabilities, Request};
 use crate::result::{BackendError, ErrorKind, Generation};
 use serde_json::{Value, json};
 use std::io::BufRead;
@@ -10,6 +10,7 @@ pub struct OpenAi {
     api_key: Option<String>,
     model: String,
     agent: ureq::Agent,
+    cancel: Option<CancelFlag>,
 }
 
 impl OpenAi {
@@ -23,7 +24,7 @@ impl OpenAi {
             .timeout_global(Some(std::time::Duration::from_secs(1800)))
             .build()
             .into();
-        Self { label, base, api_key, model: String::new(), agent }
+        Self { label, base, api_key, model: String::new(), agent, cancel: None }
     }
 
     fn authorised<B>(&self, mut req: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
@@ -35,6 +36,7 @@ impl OpenAi {
 
     fn http_error(&self, status: u16, mut body: ureq::Body) -> BackendError {
         let text = body.read_to_string().unwrap_or_default();
+        let text_for_log = text.clone();
         let message = serde_json::from_str::<Value>(&text)
             .ok()
             .and_then(|v| {
@@ -42,6 +44,7 @@ impl OpenAi {
             })
             .unwrap_or(text);
         let message = format!("HTTP {status}: {message}");
+        tracing::warn!(backend = %self.label, status, body = %crate::logging::preview(&text_for_log, 300), "upstream returned an error");
         match status {
             404 if message.to_lowercase().contains("model") => {
                 BackendError::new(ErrorKind::ModelNotFound, message)
@@ -58,6 +61,10 @@ impl Backend for OpenAi {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities { streaming: true, logits: false, memory: false }
+    }
+
+    fn set_cancel(&mut self, flag: Option<CancelFlag>) {
+        self.cancel = flag;
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
@@ -106,7 +113,10 @@ impl Backend for OpenAi {
         let resp = self
             .authorised(self.agent.post(&url))
             .send_json(&body)
-            .map_err(|e| BackendError::new(ErrorKind::Unreachable, format!("{url}: {e}")))?;
+            .map_err(|e| {
+                tracing::warn!(backend = %self.label, %url, error = %e, "upstream unreachable");
+                BackendError::new(ErrorKind::Unreachable, format!("{url}: {e}"))
+            })?;
         let status = resp.status().as_u16();
         if status >= 400 {
             return Err(self.http_error(status, resp.into_body()));
@@ -118,6 +128,10 @@ impl Backend for OpenAi {
         let mut usage: Option<(u64, u64)> = None;
         let mut line = String::new();
         loop {
+            if self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                tracing::debug!(backend = %self.label, "generation cancelled, closing upstream stream");
+                return Err(BackendError::new(ErrorKind::Cancelled, "cancelled"));
+            }
             line.clear();
             let n = reader
                 .read_line(&mut line)
