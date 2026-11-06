@@ -137,13 +137,16 @@ impl Runtime {
 
     pub fn load_batched(spec: &Spec, max_ctx: usize, batch: usize) -> Result<Self> {
         ensure!(batch >= 1, "batch must be at least 1");
+        let load_started = Instant::now();
         let ctx = CudaContext::new(0).context("cuda init")?;
         let free_before = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let jit = Jit::new(ctx.clone(), default_cache_dir())?;
         let module = Module::generate(spec, max_ctx)?;
+        let jit_started = Instant::now();
         let loaded = jit.load(&module)?;
+        let jit_secs = jit_started.elapsed().as_secs_f64();
         let mut kernels = HashMap::new();
         for &name in &module.kernels {
             kernels.insert(name, loaded.function(name)?);
@@ -251,6 +254,18 @@ impl Runtime {
         let free_after = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         let mut rt = rt;
         rt.device_bytes = free_before.saturating_sub(free_after) as u64;
+        tracing::info!(
+            spec = %rt.spec.name,
+            jit_key = %rt.jit_key,
+            jit_cache_hit = rt.cache_hit,
+            jit_secs = jit_secs,
+            arch = %rt.arch,
+            vram_before_bytes = free_before,
+            vram_after_bytes = free_after,
+            device_bytes = rt.device_bytes,
+            load_secs = load_started.elapsed().as_secs_f64(),
+            "runtime loaded"
+        );
         Ok(rt)
     }
 
@@ -698,6 +713,17 @@ impl Runtime {
         new_tokens: usize,
         sampling: Sampling,
     ) -> Result<Generation> {
+        self.generate_until(prompt, new_tokens, sampling, &[], &mut |_| {})
+    }
+
+    pub fn generate_until(
+        &mut self,
+        prompt: &[u32],
+        new_tokens: usize,
+        sampling: Sampling,
+        stop: &[u32],
+        on_tokens: &mut dyn FnMut(&[u32]),
+    ) -> Result<Generation> {
         ensure!(!prompt.is_empty() && new_tokens > 0, "empty prompt or nothing to generate");
         ensure!(
             prompt.len() + new_tokens <= self.max_ctx,
@@ -714,21 +740,37 @@ impl Runtime {
         graph.upload()?;
         self.stream.synchronize()?;
         let started = Instant::now();
-        for _ in 1..new_tokens {
-            graph.launch()?;
+        let mut made = 1;
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut shown = 0;
+        loop {
+            let seen = self.stream.clone_dtoh(&self.buf.history.slice(..made))?;
+            tokens = seen.iter().map(|&t| t as u32).collect();
+            let (kept, stopped) = cut_at_stop(&tokens, stop);
+            if kept > shown {
+                on_tokens(&tokens[shown..kept]);
+                shown = kept;
+            }
+            if stopped || made >= new_tokens {
+                tokens.truncate(kept);
+                break;
+            }
+            let step = if stop.is_empty() {
+                new_tokens - made
+            } else {
+                DECODE_CHUNK.min(new_tokens - made)
+            };
+            for _ in 0..step {
+                graph.launch()?;
+            }
+            made += step;
         }
         self.stream.synchronize()?;
         let decode_secs = started.elapsed().as_secs_f64();
-        let history = self.stream.clone_dtoh(&self.buf.history)?;
         let free_now = self.ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         let peak_device_bytes =
             (self.baseline_free.saturating_sub(free_now) as u64).max(self.device_bytes);
-        Ok(Generation {
-            tokens: history[..new_tokens].iter().map(|&t| t as u32).collect(),
-            prefill_secs,
-            decode_secs,
-            peak_device_bytes,
-        })
+        Ok(Generation { tokens, prefill_secs, decode_secs, peak_device_bytes })
     }
 
     fn first_token(&self, bb: &BatchBuffers, seq: usize) -> Result<()> {
@@ -890,5 +932,27 @@ impl Runtime {
             .map(|h| h[..new_tokens].iter().map(|&t| t as u32).collect())
             .collect();
         Ok(BatchGeneration { tokens, prefill_secs, decode_secs })
+    }
+}
+
+const DECODE_CHUNK: usize = 16;
+
+pub fn cut_at_stop(tokens: &[u32], stop: &[u32]) -> (usize, bool) {
+    match tokens.iter().position(|t| stop.contains(t)) {
+        Some(i) => (i, true),
+        None => (tokens.len(), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cut_at_stop;
+
+    #[test]
+    fn generation_is_cut_before_the_first_stop_token() {
+        assert_eq!(cut_at_stop(&[5, 6, 151645, 9, 9], &[151645, 151643]), (2, true));
+        assert_eq!(cut_at_stop(&[5, 6], &[151645]), (2, false));
+        assert_eq!(cut_at_stop(&[151643], &[151645, 151643]), (0, true));
+        assert_eq!(cut_at_stop(&[1, 2, 3], &[]), (3, false));
     }
 }

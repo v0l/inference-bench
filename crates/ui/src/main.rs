@@ -1,189 +1,188 @@
+mod bench;
 mod chart;
-mod views;
+mod chat;
+mod job;
+mod models;
+mod logs;
+mod server;
+mod settings;
+mod shell;
 
 use eframe::egui;
 use egui_bench::prelude::*;
-use inference_bench_core::backend::Request;
-use inference_bench_core::matrix::{MatrixSpec, run_matrix};
-use inference_bench_core::result::RunResult;
-use inference_bench_core::report::Metric;
+use inference_bench_core::engine::{Command, Engine, EngineEvent, Wake};
+use inference_bench_core::gpu::GpuStats;
+use inference_bench_core::library::{LocalModel, Sources};
+use inference_bench_core::settings::Settings;
 use inference_bench_core::store;
+use job::Pending;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, channel};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
-    Matrix,
-    History,
-    Charts,
+    Chat,
+    Models,
+    Bench,
+    Server,
+    Logs,
+    Settings,
 }
 
 pub struct App {
     pub dir: PathBuf,
-    pub runs: Vec<RunResult>,
     pub tab: Tab,
-    pub metric: Metric,
-    pub matrix_path: String,
-    pub shown_run: usize,
+    pub settings: Settings,
+    pub library: Vec<LocalModel>,
+    pub scan: Pending<Vec<LocalModel>>,
+    pub engine: Engine,
+    pub wake: Wake,
+    pub loading: Option<String>,
+    pub gpu: Vec<GpuStats>,
+    gpu_poll: Pending<Vec<GpuStats>>,
+    gpu_at: Option<Instant>,
     pub notice: Option<(bool, String)>,
-    running: Option<Receiver<Progress>>,
-    pub progress: Vec<RunResult>,
-}
-
-enum Progress {
-    Cell(RunResult),
-    Done,
-    Failed(String),
+    pub chat: chat::ChatState,
+    pub models: models::ModelsState,
+    pub bench: bench::BenchState,
+    pub server: server::ServerState,
+    pub logs: inference_bench_core::logging::LogBuffer,
+    pub logs_ui: logs::LogsState,
+    pub settings_ui: settings::SettingsState,
 }
 
 impl App {
-    pub fn new(dir: PathBuf, matrix_path: String) -> Self {
-        let runs = store::load_all(&dir);
+    pub fn new(dir: PathBuf, wake: Wake) -> Self {
+        let mut app = Self::bare(dir, wake);
+        app.rescan();
+        app
+    }
+
+    pub fn bare(dir: PathBuf, wake: Wake) -> Self {
+        let settings = Settings::load(&dir);
         Self {
-            dir,
-            shown_run: runs.len().saturating_sub(1),
-            runs,
-            tab: Tab::Matrix,
-            metric: Metric::DecodeTokS,
-            matrix_path,
+            tab: Tab::Chat,
+            library: Vec::new(),
+            scan: Pending::default(),
+            engine: Engine::spawn(wake.clone()),
+            loading: None,
+            gpu: Vec::new(),
+            gpu_poll: Pending::default(),
+            gpu_at: None,
             notice: None,
-            running: None,
-            progress: Vec::new(),
+            chat: chat::ChatState::load(&dir, &settings),
+            models: models::ModelsState::default(),
+            bench: bench::BenchState::load(&dir),
+            server: server::ServerState::default(),
+            logs: inference_bench_core::logging::LogBuffer::new(5000),
+            logs_ui: logs::LogsState::default(),
+            settings_ui: settings::SettingsState::default(),
+            settings,
+            wake,
+            dir,
         }
     }
 
-    pub fn reload(&mut self) {
-        self.runs = store::load_all(&self.dir);
-        self.shown_run = self.runs.len().saturating_sub(1);
+    pub fn rescan(&mut self) {
+        let sources = Sources::standard(&self.settings.model_folders);
+        self.scan.start(job::spawn(&self.wake, move || inference_bench_core::library::scan(&sources)));
     }
 
-    pub fn running(&self) -> bool {
-        self.running.is_some()
+    pub fn loaded(&self) -> Option<inference_bench_core::engine::Loaded> {
+        self.engine.loaded()
     }
 
-    pub fn start_matrix(&mut self) {
-        let path = PathBuf::from(self.matrix_path.trim());
-        let dir = self.dir.clone();
-        let (tx, rx) = channel();
-        let loaded = std::fs::read_to_string(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))
-            .and_then(|t| MatrixSpec::parse(&t))
-            .and_then(|spec| {
-                let base = path.parent().map(PathBuf::from).unwrap_or_default();
-                let prompt = spec.prompt_text(&base)?;
-                Ok((spec, prompt))
-            });
-        let (spec, prompt) = match loaded {
-            Ok(v) => v,
-            Err(e) => {
-                self.notice = Some((false, e));
-                return;
-            }
+    pub fn load_model(&mut self, backend: &str, model: &LocalModel) {
+        let Some(config) = self.settings.config_for(backend) else {
+            self.notice = Some((false, format!("no endpoint called {backend}")));
+            return;
         };
-        self.progress.clear();
-        self.notice = Some((true, format!("running {} cells", spec.backends.len() * spec.models.len())));
-        self.running = Some(rx);
-        std::thread::spawn(move || {
-            let request = Request { prompt, max_tokens: spec.max_tokens };
-            run_matrix(&spec, &request, &mut |r| {
-                if let Err(e) = store::save(&dir, &r) {
-                    let _ = tx.send(Progress::Failed(e.to_string()));
-                }
-                let _ = tx.send(Progress::Cell(r));
-            });
-            let _ = tx.send(Progress::Done);
+        let library_backend = self.settings.library_backend(backend);
+        self.engine.send(Command::Load {
+            backend: backend.to_string(),
+            config,
+            model_id: model.model_id(&library_backend),
+            display: model.name.clone(),
         });
     }
 
-    fn drain(&mut self) {
-        let Some(rx) = &self.running else { return };
-        let mut finished = false;
-        while let Ok(p) = rx.try_recv() {
-            match p {
-                Progress::Cell(r) => self.progress.push(r),
-                Progress::Failed(e) => self.notice = Some((false, e)),
-                Progress::Done => finished = true,
+    pub fn unload(&mut self) {
+        self.engine.send(Command::Unload);
+    }
+
+    fn pump(&mut self) {
+        if let Some(found) = self.scan.poll() {
+            self.library = found;
+        }
+        while let Ok(event) = self.engine.events.try_recv() {
+            match event {
+                EngineEvent::Loading(name) => self.loading = Some(name),
+                EngineEvent::Loaded(l) => {
+                    self.loading = None;
+                    self.notice = Some((true, format!("{} loaded in {:.1} s", l.display, l.load_secs)));
+                }
+                EngineEvent::LoadFailed(e) => {
+                    self.loading = None;
+                    self.notice = Some((false, e.to_string()));
+                }
+                EngineEvent::Unloaded => self.notice = Some((true, "model unloaded".into())),
             }
         }
-        if finished {
-            self.running = None;
-            self.reload();
-            let failed = self.progress.iter().filter(|r| r.error.is_some()).count();
-            self.notice = Some((failed == 0, format!("{} cells run, {failed} failed", self.progress.len())));
+        if let Some(g) = self.gpu_poll.poll() {
+            self.gpu = g;
         }
+        let due = self.gpu_at.is_none_or(|t| t.elapsed() > Duration::from_secs(2));
+        if due && !self.gpu_poll.busy() {
+            self.gpu_at = Some(Instant::now());
+            self.gpu_poll.start(job::spawn(&self.wake, inference_bench_core::gpu::sample));
+        }
+        self.chat.pump(&self.dir);
+        self.models.pump(&mut self.notice);
+        self.bench.pump(&self.dir, &mut self.notice);
+    }
+
+    pub fn save_settings(&mut self) {
+        self.notice = Some(match self.settings.save(&self.dir) {
+            Ok(()) => (true, "settings saved".into()),
+            Err(e) => (false, format!("settings: {e}")),
+        });
     }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, root: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.drain();
-        if self.running() {
-            root.ctx().request_repaint_after(Duration::from_millis(200));
+        self.pump();
+        if self.models.take_rescan() {
+            self.rescan();
         }
-        egui::Panel::top("header")
-            .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin {
-                left: 12,
-                right: 12,
-                top: 8,
-                bottom: 6,
-            }))
-            .show(root, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("INFERENCE BENCH")
-                            .font(legend_font(16.0))
-                            .extra_letter_spacing(2.0)
-                            .color(VALUE),
-                    );
-                    ui.add_space(16.0);
-                    tabs(
-                        ui,
-                        &mut self.tab,
-                        &[(Tab::Matrix, "matrix"), (Tab::History, "history"), (Tab::Charts, "charts")],
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add(Key::new("reload").outline(VALUE)).clicked() {
-                            self.reload();
-                        }
-                    });
-                });
-            });
-        egui::Panel::top("runner")
-            .frame(egui::Frame::NONE.fill(PANEL).inner_margin(egui::Margin::symmetric(12, 6)))
-            .show(root, |ui| views::runner(self, ui));
-        egui::Panel::bottom("notice")
-            .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin::symmetric(12, 4)))
-            .show(root, |ui| match &self.notice {
-                Some((ok, text)) => status(ui, *ok, text),
-                None => status(ui, true, &format!("{} runs in {}", self.runs.len(), self.dir.display())),
-            });
-        egui::CentralPanel::no_frame().show(root, |ui| {
-            let r = ui.max_rect();
-            ui.painter().rect_filled(r, 0.0, CHASSIS);
-            ui.painter().line_segment([r.left_top(), r.right_top()], egui::Stroke::new(1.0, ETCH));
-            egui::Frame::NONE.inner_margin(egui::Margin::same(10)).show(ui, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    match self.tab {
-                        Tab::Matrix => views::matrix(self, ui),
-                        Tab::History => views::history(self, ui),
-                        Tab::Charts => views::charts(self, ui),
-                    }
-                });
-            });
-        });
+        let animating = self.chat.streaming()
+            || self.loading.is_some()
+            || self.bench.running()
+            || self.models.downloading()
+            || self.scan.busy();
+        root.ctx().request_repaint_after(Duration::from_millis(if animating { 100 } else { 2000 }));
+        shell::draw(self, root);
     }
+}
+
+fn wake_for(ctx: &egui::Context) -> Wake {
+    let ctx = ctx.clone();
+    Arc::new(move || ctx.request_repaint())
 }
 
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = args.first().map(PathBuf::from).unwrap_or_else(store::data_dir);
-    let matrix = args.get(1).cloned().unwrap_or_default();
+    let buffer = inference_bench_core::logging::LogBuffer::new(5000);
+    let mut log = inference_bench_core::logging::LogConfig::default();
+    log.buffer = Some(buffer.clone());
+    log.file = Some(inference_bench_core::logging::FileLog::in_dir(inference_bench_core::logging::default_log_dir()));
+    let _log_guard = inference_bench_core::logging::init(&log).ok();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1000.0, 640.0])
-            .with_min_inner_size([760.0, 480.0])
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([900.0, 560.0])
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png"))
                     .unwrap_or_default(),
@@ -195,7 +194,9 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             egui_bench::install(&cc.egui_ctx);
-            Ok(Box::new(App::new(dir, matrix)))
+            let mut app = App::new(dir, wake_for(&cc.egui_ctx));
+            app.logs = buffer;
+            Ok(Box::new(app))
         }),
     )
 }

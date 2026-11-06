@@ -48,7 +48,7 @@ impl Logits {
     }
 }
 
-pub trait Backend {
+pub trait Backend: Send {
     fn name(&self) -> &str;
 
     fn capabilities(&self) -> Capabilities;
@@ -60,6 +60,15 @@ pub trait Backend {
         request: &Request,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError>;
+
+    fn chat(
+        &mut self,
+        request: &crate::chat::ChatRequest,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Generation, BackendError> {
+        let plain = Request { prompt: request.flatten(), max_tokens: request.sampling.max_tokens };
+        self.generate(&plain, on_text)
+    }
 
     fn logits(&mut self, _prompt: &str) -> Result<Logits, BackendError> {
         Err(BackendError::failed(format!("{} does not expose logits", self.name())))

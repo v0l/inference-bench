@@ -1,3 +1,4 @@
+use crate::chat::ChatRequest;
 use crate::backend::{Backend, Capabilities, Logits, Request};
 use crate::result::{BackendError, ErrorKind, Generation};
 use serde_json::{Value, json};
@@ -91,10 +92,12 @@ impl Subprocess {
         let stdout = BufReader::new(child.stdout.take().unwrap());
         let stderr = Arc::new(Mutex::new(String::new()));
         let sink = stderr.clone();
+        let name = self.name.clone();
         let mut err = BufReader::new(child.stderr.take().unwrap());
         std::thread::spawn(move || {
             let mut line = String::new();
             while err.read_line(&mut line).unwrap_or(0) > 0 {
+                tracing::info!(worker = %name, "{}", line.trim_end());
                 let mut s = sink.lock().unwrap();
                 s.push_str(&line);
                 if s.len() > 16384 {
@@ -105,6 +108,7 @@ impl Subprocess {
                 line.clear();
             }
         });
+        tracing::info!(worker = %self.name, program = %self.program.display(), pid = child.id(), "worker started");
         self.child = Some(Running { child, stdin, stdout, stderr });
         Ok(())
     }
@@ -189,12 +193,20 @@ impl Backend for Subprocess {
         if self.child.is_none() {
             self.start()?;
         }
+        let started = std::time::Instant::now();
         self.send(json!({"op": "load", "model": model, "max_ctx": self.max_ctx}))?;
         loop {
             let event = self.next_event()?;
             match event["event"].as_str() {
-                Some("loaded") => return Ok(()),
-                Some("error") => return Err(Self::worker_error(&event)),
+                Some("loaded") => {
+                    tracing::info!(worker = %self.name, model, load_secs = started.elapsed().as_secs_f64(), "worker loaded model");
+                    return Ok(());
+                }
+                Some("error") => {
+                    let e = Self::worker_error(&event);
+                    tracing::error!(worker = %self.name, model, error = %e, "worker failed to load model");
+                    return Err(e);
+                }
                 _ => {}
             }
         }
@@ -206,6 +218,34 @@ impl Backend for Subprocess {
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError> {
         self.send(json!({"op": "generate", "prompt": request.prompt, "max_tokens": request.max_tokens}))?;
+        self.collect(on_text)
+    }
+
+    fn chat(
+        &mut self,
+        request: &ChatRequest,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Generation, BackendError> {
+        let sampling = &request.sampling;
+        self.send(json!({
+            "op": "chat",
+            "messages": request.messages_json(),
+            "template": request.use_template,
+            "max_tokens": sampling.max_tokens,
+            "temperature": sampling.temperature,
+            "top_p": sampling.top_p,
+            "seed": sampling.seed.unwrap_or(0),
+        }))?;
+        self.collect(on_text)
+    }
+
+    fn logits(&mut self, prompt: &str) -> Result<Logits, BackendError> {
+        self.logits_of(prompt)
+    }
+}
+
+impl Subprocess {
+    fn collect(&mut self, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let mut text = String::new();
         loop {
             let event = self.next_event()?;
@@ -229,7 +269,7 @@ impl Backend for Subprocess {
         }
     }
 
-    fn logits(&mut self, prompt: &str) -> Result<Logits, BackendError> {
+    fn logits_of(&mut self, prompt: &str) -> Result<Logits, BackendError> {
         let path = std::env::temp_dir().join(format!(
             "inference-bench-logits-{}-{}.bin",
             std::process::id(),
@@ -276,6 +316,9 @@ for line in sys.stdin:
         for w in ["a ", "b "]:
             print(json.dumps({"event": "text", "text": w}), flush=True)
         print(json.dumps({"event": "done", "generation": {"text": "", "prompt_tokens": 4, "completion_tokens": 2, "ttft_secs": 0.1, "prefill_secs": 0.1, "decode_secs": 0.5, "peak_memory_bytes": 1024}}), flush=True)
+    elif m["op"] == "chat":
+        print(json.dumps({"event": "text", "text": m["messages"][-1]["content"] + "!"}), flush=True)
+        print(json.dumps({"event": "done", "generation": {"text": "", "prompt_tokens": 3, "completion_tokens": 2, "ttft_secs": 0.1, "prefill_secs": 0.1, "decode_secs": 0.5, "peak_memory_bytes": 1024}}), flush=True)
     elif m["op"] == "logits":
         open(m["path"], "wb").write(struct.pack("<6f", 1, 2, 3, 4, 5, 6))
         print(json.dumps({"event": "logits", "tokens": [7, 8], "vocab": 3}), flush=True)
@@ -310,6 +353,17 @@ for line in sys.stdin:
         let l = b.logits("p").unwrap();
         assert_eq!((l.tokens.clone(), l.vocab), (vec![7, 8], 3));
         assert_eq!(l.row(1), &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn chat_sends_the_messages_and_collects_the_reply() {
+        use crate::chat::{ChatRequest, Message, Role, Sampling};
+        let mut b = fake();
+        b.load("good").unwrap();
+        let request = ChatRequest::new(vec![Message::new(Role::User, "hey")], Sampling::default());
+        let g = b.chat(&request, &mut |_| {}).unwrap();
+        assert_eq!(g.text, "hey!");
+        assert_eq!(g.completion_tokens, 2);
     }
 
     #[test]

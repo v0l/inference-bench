@@ -42,13 +42,16 @@ impl ChatTemplate {
     }
 
     pub fn render_user(&self, prompt: &str) -> Result<String> {
+        self.render(&[serde_json::json!({"role": "user", "content": prompt})])
+    }
+
+    pub fn render(&self, messages: &[Value]) -> Result<String> {
         let mut env = Environment::new();
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
             Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
         });
         env.add_template("chat", &self.source).map_err(|e| anyhow!("chat template: {e}"))?;
-        let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
         env.get_template("chat")
             .and_then(|t| {
                 t.render(context! {

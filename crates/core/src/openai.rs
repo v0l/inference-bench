@@ -1,4 +1,5 @@
 use crate::backend::{Backend, Capabilities, Request};
+use crate::chat::ChatRequest;
 use crate::result::{BackendError, ErrorKind, Generation};
 use serde_json::{Value, json};
 use std::io::BufRead;
@@ -35,6 +36,7 @@ impl OpenAi {
 
     fn http_error(&self, status: u16, mut body: ureq::Body) -> BackendError {
         let text = body.read_to_string().unwrap_or_default();
+        let text_for_log = text.clone();
         let message = serde_json::from_str::<Value>(&text)
             .ok()
             .and_then(|v| {
@@ -42,6 +44,7 @@ impl OpenAi {
             })
             .unwrap_or(text);
         let message = format!("HTTP {status}: {message}");
+        tracing::warn!(backend = %self.label, status, body = %crate::logging::preview(&text_for_log, 300), "upstream returned an error");
         match status {
             404 if message.to_lowercase().contains("model") => {
                 BackendError::new(ErrorKind::ModelNotFound, message)
@@ -93,7 +96,6 @@ impl Backend for OpenAi {
         request: &Request,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError> {
-        let url = format!("{}/v1/completions", self.base);
         let body = json!({
             "model": self.model,
             "prompt": request.prompt,
@@ -102,11 +104,57 @@ impl Backend for OpenAi {
             "stream": true,
             "stream_options": {"include_usage": true},
         });
+        self.stream("completions", body, None, on_text)
+    }
+
+    fn chat(
+        &mut self,
+        request: &ChatRequest,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Generation, BackendError> {
+        let s = &request.sampling;
+        let mut body = json!({
+            "model": self.model,
+            "max_tokens": s.max_tokens,
+            "temperature": s.temperature,
+            "top_p": s.top_p,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        if let Some(seed) = s.seed {
+            body["seed"] = json!(seed);
+        }
+        let endpoint = match request.use_template {
+            true => {
+                body["messages"] = request.messages_json();
+                "chat/completions"
+            }
+            false => {
+                body["prompt"] = json!(request.flatten());
+                "completions"
+            }
+        };
+        self.stream(endpoint, body, Some(request), on_text)
+    }
+}
+
+impl OpenAi {
+    fn stream(
+        &mut self,
+        endpoint: &str,
+        body: Value,
+        request: Option<&ChatRequest>,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Generation, BackendError> {
+        let url = format!("{}/v1/{endpoint}", self.base);
         let started = Instant::now();
         let resp = self
             .authorised(self.agent.post(&url))
             .send_json(&body)
-            .map_err(|e| BackendError::new(ErrorKind::Unreachable, format!("{url}: {e}")))?;
+            .map_err(|e| {
+                tracing::warn!(backend = %self.label, %url, error = %e, "upstream unreachable");
+                BackendError::new(ErrorKind::Unreachable, format!("{url}: {e}"))
+            })?;
         let status = resp.status().as_u16();
         if status >= 400 {
             return Err(self.http_error(status, resp.into_body()));
@@ -122,7 +170,10 @@ impl Backend for OpenAi {
             let n = reader
                 .read_line(&mut line)
                 .map_err(|e| BackendError::failed(format!("stream broke: {e}")))?;
-            if n == 0 {
+            if n == 0 || request.is_some_and(|r| r.cancelled()) {
+                if n != 0 {
+                    tracing::debug!(backend = %self.label, "generation cancelled, closing upstream stream");
+                }
                 break;
             }
             let Some(data) = line.trim().strip_prefix("data:") else { continue };
@@ -141,7 +192,8 @@ impl Backend for OpenAi {
                     u["completion_tokens"].as_u64().unwrap_or(0),
                 ));
             }
-            let text = event["choices"][0]["text"].as_str().unwrap_or("");
+            let choice = &event["choices"][0];
+            let text = choice["text"].as_str().or_else(|| choice["delta"]["content"].as_str()).unwrap_or("");
             if !text.is_empty() {
                 first.get_or_insert_with(Instant::now);
                 chunks += 1;
@@ -217,6 +269,44 @@ mod tests {
         });
         let mut b = OpenAi::new("fake".into(), &server.url, None);
         assert!(b.load("qwen3").is_err());
+    }
+
+    #[test]
+    fn chat_posts_messages_and_sampling_to_the_chat_endpoint() {
+        use crate::chat::{ChatRequest, Message, Role, Sampling};
+        let server = FakeServer::start(script());
+        let mut b = OpenAi::new("fake".into(), &server.url, None);
+        b.load("qwen3").unwrap();
+        let sampling = Sampling { temperature: 0.3, top_p: 0.9, seed: Some(5), max_tokens: 6 };
+        let request = ChatRequest::new(vec![Message::new(Role::User, "hi")], sampling);
+        let mut streamed = String::new();
+        let g = b.chat(&request, &mut |t| streamed.push_str(t)).unwrap();
+        assert_eq!(g.completion_tokens, 6);
+        let sent = server.requests.lock().unwrap().last().cloned().unwrap();
+        assert!(sent.starts_with("/v1/chat/completions"), "{sent}");
+        let sent: String = sent.split_whitespace().collect();
+        assert!(sent.contains("\"seed\":5") && sent.contains("\"role\":\"user\""), "{sent}");
+    }
+
+    #[test]
+    fn a_cancelled_chat_stops_reading_the_stream() {
+        use crate::chat::{ChatRequest, Message, Role, Sampling};
+        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+        let server = FakeServer::start(script());
+        let mut b = OpenAi::new("fake".into(), &server.url, None);
+        b.load("qwen3").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut request = ChatRequest::new(vec![Message::new(Role::User, "hi")], Sampling::default());
+        request.cancel = Some(cancel.clone());
+        let mut seen = 0;
+        let g = b
+            .chat(&request, &mut |_| {
+                seen += 1;
+                cancel.store(true, Ordering::Relaxed);
+            })
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert!(g.completion_tokens <= 2, "{}", g.completion_tokens);
     }
 
     #[test]
