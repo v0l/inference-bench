@@ -102,14 +102,89 @@ __device__ void linear_q8(const void* w, const float* scales, const float* bias,
     }
 }
 
+constexpr int GEMM_BM = 64;
+constexpr int GEMM_BN = 64;
+constexpr int GEMM_BK = 16;
+constexpr int GEMM_TM = 4;
+constexpr int GEMM_TN = 4;
+
+template <int N, int K, bool BIAS, bool RESIDUAL, bool Q8>
+__device__ void gemm(const void* w, const float* scales, const float* bias, const float* x, float* out, int tokens) {
+    __shared__ float xs[GEMM_BK][GEMM_BM];
+    __shared__ float ws[GEMM_BK][GEMM_BN];
+    int tid = threadIdx.x;
+    int tx = tid % 16;
+    int ty = tid / 16;
+    int m0 = blockIdx.y * GEMM_BM;
+    int n0 = blockIdx.x * GEMM_BN;
+    float acc[GEMM_TM][GEMM_TN];
+#pragma unroll
+    for (int i = 0; i < GEMM_TM; i++)
+#pragma unroll
+        for (int j = 0; j < GEMM_TN; j++) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += GEMM_BK) {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int idx = tid + i * 256;
+            int r = idx / GEMM_BK;
+            int kk = idx % GEMM_BK;
+            int m = m0 + r;
+            xs[kk][r] = m < tokens ? x[(size_t)m * K + k0 + kk] : 0.0f;
+            int n = n0 + r;
+            float wv = 0.0f;
+            if (n < N) {
+                if (Q8) {
+                    wv = (float)((const i8_t*)w)[(size_t)n * K + k0 + kk] *
+                         scales[(size_t)n * (K / Q8_GROUP) + (k0 + kk) / Q8_GROUP];
+                } else {
+                    wv = bf16_to_f32(((const bf16_t*)w)[(size_t)n * K + k0 + kk]);
+                }
+            }
+            ws[kk][r] = wv;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < GEMM_BK; kk++) {
+            float a[GEMM_TM];
+            float b[GEMM_TN];
+#pragma unroll
+            for (int i = 0; i < GEMM_TM; i++) a[i] = xs[kk][ty * GEMM_TM + i];
+#pragma unroll
+            for (int j = 0; j < GEMM_TN; j++) b[j] = ws[kk][tx * GEMM_TN + j];
+#pragma unroll
+            for (int i = 0; i < GEMM_TM; i++)
+#pragma unroll
+                for (int j = 0; j < GEMM_TN; j++) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < GEMM_TM; i++) {
+        int m = m0 + ty * GEMM_TM + i;
+        if (m >= tokens) continue;
+#pragma unroll
+        for (int j = 0; j < GEMM_TN; j++) {
+            int n = n0 + tx * GEMM_TN + j;
+            if (n >= N) continue;
+            float v = acc[i][j];
+            if (BIAS) v += bias[n];
+            float* o = out + (size_t)m * N + n;
+            *o = RESIDUAL ? *o + v : v;
+        }
+    }
+}
+
 extern "C" __global__ void embed(const bf16_t* table, const int* token, float* x) {
-    const bf16_t* row = table + (size_t)token[0] * HIDDEN;
+    const bf16_t* row = table + (size_t)token[blockIdx.y] * HIDDEN;
+    x += (size_t)blockIdx.y * HIDDEN;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x)
         x[i] = bf16_to_f32(row[i]);
 }
 
 extern "C" __global__ void rmsnorm(const float* x, const float* weight, float* out) {
     __shared__ float scratch[32];
+    x += (size_t)blockIdx.x * HIDDEN;
+    out += (size_t)blockIdx.x * HIDDEN;
     float ss = 0.0f;
     for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) ss += x[i] * x[i];
     float inv = rsqrtf(block_reduce<false>(ss, scratch) / HIDDEN + EPS);
@@ -123,10 +198,10 @@ extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const f
     __shared__ float vec[HEAD_DIM];
     int head = blockIdx.x;
     int d = threadIdx.x;
-    int pos = pos_ptr[0];
+    int pos = pos_ptr[0] + blockIdx.y;
     bool is_q = head < HEADS;
     bool is_k = !is_q && head < HEADS + KV_HEADS;
-    float* src = qkv + head * HEAD_DIM;
+    float* src = qkv + (size_t)blockIdx.y * (Q_DIM + 2 * KV_DIM) + head * HEAD_DIM;
     float v = d < HEAD_DIM ? src[d] : 0.0f;
     if (QK_NORM && (is_q || is_k)) {
         float inv = rsqrtf(block_reduce<false>(v * v, scratch) / HEAD_DIM + EPS);
@@ -161,10 +236,11 @@ extern "C" __global__ void attention(const float* qkv, const float* k_cache, con
     __shared__ float scores[MAX_CTX];
     int head = blockIdx.x;
     int kv_head = head / GROUP;
-    int len = pos_ptr[0] + 1;
+    int len = pos_ptr[0] + blockIdx.y + 1;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
-    const float* q = qkv + head * HEAD_DIM;
+    const float* q = qkv + (size_t)blockIdx.y * (Q_DIM + 2 * KV_DIM) + head * HEAD_DIM;
+    out += (size_t)blockIdx.y * Q_DIM;
     float scale = rsqrtf((float)HEAD_DIM);
     for (int t = warp; t < len; t += ATTN_THREADS / 32) {
         size_t slot = (((size_t)layer * PAGES + block_table[t / PAGE]) * KV_HEADS + kv_head) * PAGE + t % PAGE;
@@ -197,6 +273,8 @@ extern "C" __global__ void attention(const float* qkv, const float* k_cache, con
 }
 
 extern "C" __global__ void swiglu(const float* gate_up, float* out) {
+    gate_up += (size_t)blockIdx.y * 2 * INTER;
+    out += (size_t)blockIdx.y * INTER;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < INTER; i += gridDim.x * blockDim.x) {
         float g = gate_up[i];
         out[i] = g / (1.0f + expf(-g)) * gate_up[INTER + i];

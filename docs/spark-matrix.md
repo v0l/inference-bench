@@ -13,7 +13,7 @@ Raw results are in `spark-run/runs`.
 | Qwen2.5-0.5B | specrt | 180 | 176 | 239 ms | 1651 MiB |
 
 Prefill for llama.cpp over HTTP is prompt tokens over time to first token, so it includes request
-overhead. specrt prefills one token at a time through its decode path.
+overhead. specrt prefills in batched chunks (see crates/specrt/README.md); the recorded runs predate that.
 
 Logit diff of specrt against `transformers` fp32 on the fixed 43-token prompt
 (`inference-bench logit-diff --backend specrt --model Qwen/Qwen3-0.6B`): max abs 1.0e-4,

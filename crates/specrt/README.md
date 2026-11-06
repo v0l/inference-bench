@@ -75,8 +75,12 @@ same safetensors. vLLM numbers are from `vllm bench latency --batch-size 1 --inp
 decode time taken as the output-len 128 latency minus the output-len 1 latency. While vLLM was
 serving requests (GPU 96% busy), every engine dropped to about half these numbers.
 
-specrt prefill runs one token at a time through the decode path (about 130-210 tokens/s). llama.cpp
-prefills at 9-12k tokens/s, so prefill is out of the spike's scope.
+specrt prefill is batched: prompts run in chunks of up to 256 tokens through tiled fp32 GEMM
+kernels (`*_gemm` in `templates/model.cu`), with the attention, RoPE and norm kernels taking a
+token per grid row. Only the last token goes through `lm_head`. On an RTX PRO 6000 this takes
+Qwen3-0.6B bf16 from about 150 to about 2000-2300 tokens/s (128 and 1024 token prompts). The
+GEMM is a plain shared-memory tile without tensor cores, so llama.cpp's 9-12k tokens/s is still
+ahead. The logits tests go through the batched path and still pass.
 
 An `nsys` profile of Qwen3-0.6B decode puts 24% in `lm_head`, 24% in `gate_up_proj`, 14% in
 `qkv_proj`, 13% in `down_proj` and 12% in `attention`. The GEMVs run at about 100-130 GB/s, against

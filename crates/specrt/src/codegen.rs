@@ -19,6 +19,11 @@ pub const KERNELS: &[&str] = &[
     "down_proj",
     "lm_head",
     "argmax_advance",
+    "qkv_gemm",
+    "o_gemm",
+    "gate_up_gemm",
+    "down_gemm",
+    "lm_head_gemm",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +83,7 @@ impl Module {
             ("QKV_N", (spec.q_dim() + 2 * spec.kv_dim()).to_string()),
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
             ("LINEAR", linear.to_string()),
+            ("Q8", (spec.quant == Quant::Q8).to_string()),
         ]
         .into_iter()
         .collect();
