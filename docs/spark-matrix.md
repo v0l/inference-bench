@@ -15,10 +15,18 @@ Raw results are in `spark-run/runs`.
 Prefill for llama.cpp over HTTP is prompt tokens over time to first token, so it includes request
 overhead. specrt prefills in batched chunks (see crates/specrt/README.md); the recorded runs predate that.
 
-After batched prefill, specrt Qwen3-0.6B bf16 prefills a 128-token prompt at about 1700-1900 tok/s
-and a 1024-token prompt at about 2300 tok/s (`bench`, median of 5). That was measured on an
-NVIDIA RTX PRO 6000 Blackwell Max-Q (compute_120), not on the Spark GB10, so the table above still
-needs a rerun on the Spark.
+After batched prefill, specrt bf16 prefill on the Spark (GB10, compute_121, `bench`, median of 5,
+vLLM and Frigate resident on the GPU) is:
+
+| model | 128-token prompt | 1024-token prompt |
+|---|---|---|
+| Qwen3-0.6B | 3965 tok/s | 2662 tok/s |
+| Qwen2.5-0.5B | 4585 tok/s | 3978 tok/s |
+
+The table above is the earlier run, before batching. On an NVIDIA RTX PRO 6000 Blackwell Max-Q
+(compute_120) Qwen3-0.6B measured 1717-1924 tok/s at 128 tokens and 2316 tok/s at 1024 tokens.
+The three logit tests also pass on the Spark (max abs 5e-5 qwen3 bf16, 1.1e-4 qwen2.5 bf16, 2.27
+qwen3 Q8, top-1 100%).
 
 Logit diff of specrt against `transformers` fp32 on the fixed 43-token prompt
 (`inference-bench logit-diff --backend specrt --model Qwen/Qwen3-0.6B`): max abs 1.0e-4,

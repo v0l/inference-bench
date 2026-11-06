@@ -77,10 +77,19 @@ serving requests (GPU 96% busy), every engine dropped to about half these number
 
 specrt prefill is batched: prompts run in chunks of up to 256 tokens through tiled fp32 GEMM
 kernels (`*_gemm` in `templates/model.cu`), with the attention, RoPE and norm kernels taking a
-token per grid row. Only the last token goes through `lm_head`. On an RTX PRO 6000 this takes
-Qwen3-0.6B bf16 from about 150 to about 2000-2300 tokens/s (128 and 1024 token prompts). The
-GEMM is a plain shared-memory tile without tensor cores, so llama.cpp's 9-12k tokens/s is still
-ahead. The logits tests go through the batched path and still pass.
+token per grid row. Only the last token goes through `lm_head`. Prefill tokens/s, bf16, median of
+5 (`bench specs/<spec>.toml <prompt> 64`):
+
+| spec | prompt | GB10 (spark) | RTX PRO 6000 |
+|---|---|---|---|
+| qwen3-0.6b | 128 | 3965 | 1717-1924 |
+| qwen3-0.6b | 1024 | 2662 | 2316 |
+| qwen2.5-0.5b | 128 | 4585 | not run |
+| qwen2.5-0.5b | 1024 | 3978 | not run |
+
+Before batching it was about 130-210 tokens/s. The Spark runs were taken with vLLM and Frigate
+resident on the GPU (8% busy at start), so they are not an idle-GPU best case. The GEMM is a plain
+shared-memory tile without tensor cores, so llama.cpp's 9-12k tokens/s is still ahead. The logits tests go through the batched path and still pass.
 
 An `nsys` profile of Qwen3-0.6B decode puts 24% in `lm_head`, 24% in `gate_up_proj`, 14% in
 `qkv_proj`, 13% in `down_proj` and 12% in `attention`. The GEMVs run at about 100-130 GB/s, against
