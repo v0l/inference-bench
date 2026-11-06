@@ -124,8 +124,9 @@ fn qwen3_q8_logits_stay_close_to_transformers() {
     let reference = reference("qwen3-0.6b");
     let mut rt = Runtime::load(&spec, 256).unwrap();
     let d = diff(&rt.prompt_logits(&reference.tokens).unwrap(), &reference);
-    assert!(d.mean_abs <= 0.1, "mean abs diff {}", d.mean_abs);
-    assert!(d.top1_agreement >= 0.95, "top1 agreement {}", d.top1_agreement);
+    assert!(d.mean_abs <= 0.07, "mean abs diff {}", d.mean_abs);
+    assert!(d.max_abs <= 2.5, "max abs diff {}", d.max_abs);
+    assert_eq!(d.top1_agreement, 1.0);
 }
 
 #[test]
@@ -143,7 +144,7 @@ fn linear_rope_scaling_logits_match_transformers() {
 #[test]
 #[ignore = "needs a CUDA GPU, the HF weights and scripts/reference.py output"]
 fn gated_gelu_logits_match_transformers() {
-    check("qwen2.5-0.5b-geglu.toml", 5e-3, true);
+    check("qwen2.5-0.5b-geglu.toml", 4e-3, true);
 }
 
 #[test]

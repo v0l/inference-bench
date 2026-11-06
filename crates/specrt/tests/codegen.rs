@@ -52,6 +52,17 @@ fn q8_spec_selects_q8_linears() {
 }
 
 #[test]
+fn bf16_prefill_splits_activations_and_q8_does_not() {
+    let bf16 = Module::generate(&spec("qwen3-0.6b.toml"), 256).unwrap();
+    assert!(bf16.source.contains("EPI_ACT, false, false, true, true>"));
+    let mut s = spec("qwen3-0.6b.toml");
+    s.quant = Quant::Q8;
+    let q8 = Module::generate(&s, 256).unwrap();
+    assert!(q8.source.contains("EPI_ACT, false, true, true, false>"));
+    assert!(!q8.source.contains(", true>(w, s, b, x, ri, nw"));
+}
+
+#[test]
 fn generation_is_deterministic() {
     let s = spec("qwen3-0.6b.toml");
     assert_eq!(

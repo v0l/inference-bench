@@ -123,7 +123,9 @@ impl Module {
         };
         let big = Tile::big();
         let unsplit = std::env::var("SPECRT_UNSPLIT").unwrap_or_default();
-        let split = |name: &str| (!unsplit.split(',').any(|n| n == name)).to_string();
+        let split_default = spec.quant == Quant::Bf16;
+        let split =
+            |name: &str| (split_default && !unsplit.split(',').any(|n| n == name)).to_string();
         let act = match spec.mlp.activation {
             Activation::Swiglu => 0,
             Activation::Geglu => 1,
