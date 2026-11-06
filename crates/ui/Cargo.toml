@@ -20,7 +20,7 @@ tracing.workspace = true
 anyhow.workspace = true
 eframe = "0.37"
 egui = "0.37"
-egui_bench = { git = "https://github.com/v0l/egui_bench", rev = "facef184eb18c909e9fb780a7ca1f7413a2c081a", features = ["markdown", "chat"] }
+egui_bench = { git = "https://github.com/v0l/egui_bench", rev = "21292b6cd92269898e017416db5644963bb90993", features = ["markdown", "chat"] }
 serde_json.workspace = true
 chrono.workspace = true
 

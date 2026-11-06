@@ -120,6 +120,26 @@ fn a_fake_streaming_backend_fills_a_chat_with_stats() {
     assert!(stats.ttft_secs >= 0.02);
     assert!(h.state().chat.last_stats.is_some());
     h.get_by_label_contains("Hello");
+
+    h.get_by_label("copy").click();
+    let mut copied = None;
+    for _ in 0..4 {
+        h.step();
+        for c in &h.output().platform_output.commands {
+            if let egui::OutputCommand::CopyText(t) = c {
+                copied = Some(t.clone());
+            }
+        }
+    }
+    assert_eq!(copied.as_deref(), Some("Hello **world**!"));
+
+    h.get_by_label("regenerate").click();
+    h.step();
+    h.step();
+    assert!(h.state().chat.streaming());
+    let turns = h.state_mut().chat.conv().turns.clone();
+    assert_eq!(turns.len(), 1);
+    assert_eq!(turns[0].message.content, "say hi");
 }
 
 #[test]
