@@ -23,7 +23,7 @@ INFERENCE_BENCH_API_KEYS=sk-local ./target/release/inference-bench-server \
 | `GET /metrics` | Prometheus text. Open unless `protect_metrics = true` |
 | `GET /admin/models`, `POST /admin/models/{id}/load`, `POST /admin/models/{id}/unload` | Model management (needs the API key when auth is on) |
 
-Chat requests go through the backend `chat` method, so specrt applies the model's chat template and stops at the end-of-turn token. The specrt worker does not stream, so its SSE responses arrive as one content chunk when generation ends; the `openai` upstream backend streams token by token.
+Chat requests go through the backend `chat` method, so specrt applies the model's chat template and stops at the end-of-turn token. Both specrt and `openai` upstream backends stream token by token (specrt in chunks of up to 16 decode steps), stopping at the end-of-turn ids from generation_config.
 
 Every response carries `x-request-id` (a client supplied one is kept). Errors use the OpenAI shape `{"error": {"message", "type", "param", "code"}}`.
 
@@ -73,7 +73,7 @@ For a `specrt` model `max_concurrent` above 1 queues requests on the single GPU 
 
 ## Metrics
 
-`inference_requests_total{endpoint,status}`, `inference_prompt_tokens_total{model}`, `inference_completion_tokens_total{model}`, `inference_ttft_seconds` (histogram), `inference_decode_tokens_per_second{window="last|mean"}`, `inference_queue_depth`, `inference_in_flight`, `inference_models_loaded`, `inference_model_vram_bytes{model}`, `inference_gpu_memory_used_bytes` (from `nvidia-smi`, absent where it reports nothing, such as unified memory boxes), `inference_requests_cancelled_total`, and model load, failure and unload counters.
+`inference_requests_total{endpoint,status}`, `inference_prompt_tokens_total{model}`, `inference_completion_tokens_total{model}`, `inference_ttft_seconds` (histogram), `inference_decode_tokens_per_second{window="last|mean"}`, `inference_queue_depth`, `inference_in_flight`, `inference_models_loaded`, `inference_model_vram_bytes{model}`, `inference_gpu_memory_used_bytes` (from `nvidia-smi`, falling back to the CUDA driver's free/total memory where nvidia-smi reports N/A, as on the GB10), `inference_requests_cancelled_total`, and model load, failure and unload counters.
 
 ## Logging
 
@@ -88,7 +88,7 @@ All crates use `tracing`. Flags (global on `inference-bench` and `inference-benc
 
 Each request runs in a `request` span carrying `request_id`, `method`, `path`, `model`, `backend`, `prompt_tokens`, `completion_tokens`, `ttft_ms`, `decode_tok_s`, `finish_reason` and `status`, so every line logged while serving it has the id. Model loads log the spec hash, JIT cache hit and compile time, and VRAM before and after. Upstream HTTP errors log the status and a body snippet. Panics are logged with a backtrace. API keys are only ever logged redacted (`sk...ey (19 chars)` form), never in full.
 
-GUI logs view: `inference_bench_core::logging::LogBuffer` is a `tracing` layer holding a bounded ring of entries with `snapshot(level, search)`, `text(...)` for copy and `save(path, ...)`. Add it through `LogConfig { buffer: Some(buffer), .. }`.
+The GUI Server tab runs this same library in-process over the loaded model, and its Logs tab reads the `LogBuffer`. `inference_bench_core::logging::LogBuffer` is a `tracing` layer holding a bounded ring of entries with `snapshot(level, search)`, `text(...)` for copy and `save(path, ...)`. Add it through `LogConfig { buffer: Some(buffer), .. }`.
 
 ## Packaging
 
@@ -97,4 +97,4 @@ GUI logs view: `inference_bench_core::logging::LogBuffer` is a `tracing` layer h
 
 ## Spark run (Qwen3-0.6B, specrt, GB10)
 
-16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 140.0 tokens/s aggregate, p50 3.8 s, p95 6.7 s (requests queue behind one GPU worker; latency is queue wait). First load 2.7 s including a cold NVRTC compile.
+16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 143.2 tokens/s aggregate, p50 3.5 s, p95 6.5 s (requests queue behind one GPU worker; latency is queue wait). A streamed reply arrives as 9 chunks, first at 0.03 s and last at 0.73 s. Loaded model VRAM reads 3.9 GB, device used 99 GB.
