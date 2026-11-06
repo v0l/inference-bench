@@ -541,17 +541,33 @@ extern "C" __global__ void rmsnorm(const float* x, const float* weight, float* o
     for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) out[i] = weight[i] * (x[i] * inv);
 }
 
-extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
-                                        float* k_cache, float* v_cache, const int* block_table,
-                                        const int* pos_ptr, int layer) {
+__device__ __forceinline__ float rope_inv_freq(int i) {
+    float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)HEAD_DIM);
+    if (ROPE_KIND == 1) {
+        inv_freq /= ROPE_FACTOR;
+    } else if (ROPE_KIND == 2) {
+        float wavelen = 6.283185307179586f / inv_freq;
+        float low_wavelen = ROPE_ORIG_POS / ROPE_LOW_FREQ;
+        float high_wavelen = ROPE_ORIG_POS / ROPE_HIGH_FREQ;
+        if (wavelen > low_wavelen) {
+            inv_freq /= ROPE_FACTOR;
+        } else if (wavelen >= high_wavelen) {
+            float smooth = (ROPE_ORIG_POS / wavelen - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ);
+            inv_freq = (1.0f - smooth) * inv_freq / ROPE_FACTOR + smooth * inv_freq;
+        }
+    }
+    return inv_freq;
+}
+
+__device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, const float* k_norm,
+                                               float* k_cache, float* v_cache, const int* block_table,
+                                               int pos, int layer, int head, int row) {
     __shared__ float scratch[32];
     __shared__ float vec[HEAD_DIM];
-    int head = blockIdx.x;
     int d = threadIdx.x;
-    int pos = pos_ptr[0] + blockIdx.y;
     bool is_q = head < HEADS;
     bool is_k = !is_q && head < HEADS + KV_HEADS;
-    float* src = qkv + (size_t)blockIdx.y * (Q_DIM + 2 * KV_DIM) + head * HEAD_DIM;
+    float* src = qkv + (size_t)row * (Q_DIM + 2 * KV_DIM) + head * HEAD_DIM;
     float v = d < HEAD_DIM ? src[d] : 0.0f;
     if (QK_NORM && (is_q || is_k)) {
         float inv = rsqrtf(block_reduce<false>(v * v, scratch) / HEAD_DIM + EPS);
@@ -562,22 +578,7 @@ extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const f
     __syncthreads();
     if ((is_q || is_k) && d < HEAD_DIM) {
         int half = HEAD_DIM / 2;
-        int i = d < half ? d : d - half;
-        float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)HEAD_DIM);
-        if (ROPE_KIND == 1) {
-            inv_freq /= ROPE_FACTOR;
-        } else if (ROPE_KIND == 2) {
-            float wavelen = 6.283185307179586f / inv_freq;
-            float low_wavelen = ROPE_ORIG_POS / ROPE_LOW_FREQ;
-            float high_wavelen = ROPE_ORIG_POS / ROPE_HIGH_FREQ;
-            if (wavelen > low_wavelen) {
-                inv_freq /= ROPE_FACTOR;
-            } else if (wavelen >= high_wavelen) {
-                float smooth = (ROPE_ORIG_POS / wavelen - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ);
-                inv_freq = (1.0f - smooth) * inv_freq / ROPE_FACTOR + smooth * inv_freq;
-            }
-        }
-        float angle = (float)pos * inv_freq;
+        float angle = (float)pos * rope_inv_freq(d < half ? d : d - half);
         float c = cosf(angle);
         float s = sinf(angle);
         v = d < half ? vec[d] * c - vec[d + half] * s : vec[d] * c + vec[d - half] * s;
@@ -591,6 +592,20 @@ extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const f
     int page = block_table[pos / PAGE];
     size_t slot = (((size_t)layer * PAGES + page) * KV_HEADS + kv_head) * PAGE + pos % PAGE;
     (is_k ? k_cache : v_cache)[slot * HEAD_DIM + d] = v;
+}
+
+extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
+                                        float* k_cache, float* v_cache, const int* block_table,
+                                        const int* pos_ptr, int layer) {
+    norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, block_table, pos_ptr[0] + blockIdx.y, layer,
+                   blockIdx.x, blockIdx.y);
+}
+
+extern "C" __global__ void kv_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
+                                        float* k_cache, float* v_cache, const int* block_table,
+                                        const int* pos_ptr, int layer) {
+    norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, block_table, pos_ptr[0] + blockIdx.y, layer,
+                   HEADS + blockIdx.x, blockIdx.y);
 }
 
 extern "C" __global__ void attention(const float* qkv, const float* k_cache, const float* v_cache,
@@ -780,12 +795,15 @@ __device__ __forceinline__ void mma3(float* c, const unsigned* ah, const unsigne
     mma_bf16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
 }
 
-extern "C" __global__ void flash_mma(const float* qkv, const float* k_cache, const float* v_cache,
+extern "C" __global__ void flash_mma(const float* qkv, const float* q_norm, const float* k_cache, const float* v_cache,
                                      const int* block_table, const int* pos_ptr, int layer, float* out, int tokens) {
-    __shared__ __align__(16) bf16_t k_hi[FM_BK][FM_KS];
-    __shared__ __align__(16) bf16_t k_lo[FM_BK][FM_KS];
-    __shared__ __align__(16) bf16_t v_hi[FM_BK][FM_KS];
-    __shared__ __align__(16) bf16_t v_lo[FM_BK][FM_KS];
+    static_assert(FM_BQ * HEAD_DIM * 4 <= 4 * FM_BK * FM_KS * 2, "Q staging fits the K/V tiles");
+    __shared__ __align__(16) unsigned char smem[4 * FM_BK * FM_KS * 2];
+    bf16_t (*k_hi)[FM_KS] = (bf16_t (*)[FM_KS])smem;
+    bf16_t (*k_lo)[FM_KS] = k_hi + FM_BK;
+    bf16_t (*v_hi)[FM_KS] = k_lo + FM_BK;
+    bf16_t (*v_lo)[FM_KS] = v_hi + FM_BK;
+    float* qs = (float*)smem;
     int head = blockIdx.y;
     int kv_head = head / GROUP;
     int q0 = (gridDim.x - 1 - blockIdx.x) * FM_BQ;
@@ -803,16 +821,59 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* k_cache, con
     unsigned qh[FM_KB][4];
     unsigned ql[FM_KB][4];
     constexpr int QKV_ROW = Q_DIM + 2 * KV_DIM;
+    constexpr int PER_LANE = (HEAD_DIM + 31) / 32;
+    constexpr int HALF = HEAD_DIM / 2;
+    float* wq = qs + warp * 16 * HEAD_DIM;
+    for (int r = 0; r < 16; r++) {
+        int row = q0 + warp * 16 + r;
+        float v[PER_LANE];
+        float ss = 0.0f;
+#pragma unroll
+        for (int i = 0; i < PER_LANE; i++) {
+            int d = lane + 32 * i;
+            v[i] = (d < HEAD_DIM && row < tokens) ? qkv[(size_t)row * QKV_ROW + head * HEAD_DIM + d] : 0.0f;
+            ss += v[i] * v[i];
+        }
+        if (QK_NORM) {
+            float inv = rsqrtf(warp_sum(ss) / HEAD_DIM + EPS);
+#pragma unroll
+            for (int i = 0; i < PER_LANE; i++) {
+                int d = lane + 32 * i;
+                if (d < HEAD_DIM) v[i] = q_norm[d] * (v[i] * inv);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < PER_LANE; i++) {
+            int d = lane + 32 * i;
+            if (d < HEAD_DIM) wq[r * HEAD_DIM + d] = v[i];
+        }
+        __syncwarp();
+#pragma unroll
+        for (int i = 0; i < PER_LANE; i++) {
+            int d = lane + 32 * i;
+            if (d < HEAD_DIM) {
+                float angle = (float)(base + row) * rope_inv_freq(d < HALF ? d : d - HALF);
+                float c = cosf(angle);
+                float sn = sinf(angle);
+                v[i] = d < HALF ? v[i] * c - wq[r * HEAD_DIM + d + HALF] * sn : v[i] * c + wq[r * HEAD_DIM + d - HALF] * sn;
+            }
+        }
+        __syncwarp();
+#pragma unroll
+        for (int i = 0; i < PER_LANE; i++) {
+            int d = lane + 32 * i;
+            if (d < HEAD_DIM) wq[r * HEAD_DIM + d] = v[i];
+        }
+        __syncwarp();
+    }
 #pragma unroll
     for (int kb = 0; kb < FM_KB; kb++) {
         int d = kb * 16 + 2 * t;
         float2 v[4];
-        const float* p0 = qkv + (size_t)row0 * QKV_ROW + head * HEAD_DIM + d;
-        const float* p1 = qkv + (size_t)row1 * QKV_ROW + head * HEAD_DIM + d;
-        v[0] = row0 < tokens ? *(const float2*)p0 : make_float2(0.f, 0.f);
-        v[1] = row1 < tokens ? *(const float2*)p1 : make_float2(0.f, 0.f);
-        v[2] = row0 < tokens ? *(const float2*)(p0 + 8) : make_float2(0.f, 0.f);
-        v[3] = row1 < tokens ? *(const float2*)(p1 + 8) : make_float2(0.f, 0.f);
+        v[0] = *(const float2*)&wq[g * HEAD_DIM + d];
+        v[1] = *(const float2*)&wq[(g + 8) * HEAD_DIM + d];
+        v[2] = *(const float2*)&wq[g * HEAD_DIM + d + 8];
+        v[3] = *(const float2*)&wq[(g + 8) * HEAD_DIM + d + 8];
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             qh[kb][i] = pack_hi(v[i].x, v[i].y);

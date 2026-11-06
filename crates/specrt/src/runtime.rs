@@ -487,7 +487,9 @@ impl Runtime {
                     n,
                 )?;
             }
-            let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
+            let rope_kernel = if self.use_mma { "kv_norm_rope" } else { "qk_norm_rope" };
+            let rope_heads = if self.use_mma { 2 * a.kv_heads } else { a.heads + 2 * a.kv_heads };
+            let mut b = self.stream.launch_builder(self.kernel(rope_kernel));
             b.arg(&pre.qkv)
                 .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
                 .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
@@ -497,7 +499,7 @@ impl Runtime {
                 .arg(&buf.pos)
                 .arg(&layer);
             let config = LaunchConfig {
-                grid_dim: ((a.heads + 2 * a.kv_heads) as u32, n as u32, 1),
+                grid_dim: (rope_heads as u32, n as u32, 1),
                 block_dim: (a.head_dim.max(32) as u32, 1, 1),
                 shared_mem_bytes: 0,
             };
@@ -505,8 +507,11 @@ impl Runtime {
             let attn_kernel = if self.use_mma { "flash_mma" } else { "flash_attention" };
             let mut b = self.stream.launch_builder(self.kernel(attn_kernel));
             let ntok = n as i32;
-            b.arg(&pre.qkv)
-                .arg(&buf.k_cache)
+            b.arg(&pre.qkv);
+            if self.use_mma {
+                b.arg(l.q_norm.as_ref().unwrap_or(&buf.dummy));
+            }
+            b.arg(&buf.k_cache)
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
