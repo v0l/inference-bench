@@ -34,22 +34,27 @@ mean abs 6.5e-6, top-1 agreement 43/43.
 
 ## specrt decode kernels (issue #243)
 
-nsys, Qwen3-0.6B bf16, spark GB10 (shared with vLLM), median kernel time per launch:
+Spark GB10, nsys median per launch, Qwen3-0.6B bf16:
 
-| kernel | before | after |
-|---|---|---|
-| attention | 38.7 us | 13.5 us |
-| gate_up_proj | 56 us | 56 us |
-| qkv_proj | 37.8 us | 37.7 us |
-| down_proj | 28.5 us | 28.6 us |
-| lm_head | 1.35 ms | 1.35 ms |
+| kernel | at start of #243 | attention fix | + fused norm / gate-up-act |
+|---|---|---|---|
+| attention | 38.7 us | 13.5-23 us | 23 us |
+| gate_up (+silu*mul) | 56 us (+1.1 us swiglu) | 56 us | 59 us |
+| qkv | 37.8 us | 37.6 us | 40 us |
+| down | 28.5 us | 28.6 us | 29 us |
+| o | 19.5 us | 19.5 us | 20 us |
+| lm_head | 1.35 ms | 1.33 ms | 1.37 ms |
 
-Attention now splits the V accumulation over timesteps across 16 warps (512 threads) instead of one thread per head dim looping over every timestep. Same-session A/B on spark, 6 alternating runs each, median decode tok/s (GPU shared, spread is large):
+Attention now splits the V accumulation over timesteps across 16 warps (512 threads). RMSNorm is fused into the qkv, gate_up and lm_head GEMVs (each block normalises x into shared memory), and gate_up computes gate and up for the same row and applies the activation in the epilogue, so the separate rmsnorm and swiglu launches are gone. The fusion removes about 3 launches per layer but did not change decode speed: inside a CUDA graph those launches cost little, and the extra per-block norm work offsets the saving.
 
-| spec | before | after |
-|---|---|---|
-| qwen3-0.6b bf16 | 77.9 | 130.9 |
-| qwen2.5-0.5b bf16 | 134.3 | 173.5 |
-| qwen3-0.6b-q8 | 107.3 | 157.9 |
+Alternating A/B on spark, 6 runs each, median decode tok/s, with llama.cpp (`llama-bench -n 128`, bf16 GGUF converted from the same safetensors) interleaved in the same session:
 
-Measured GEMV bandwidth from the table: lm_head moves 311 MB in 1.35 ms (230 GB/s) and gate_up moves 12.6 MB in 56 us (225 GB/s), about 83% of the ~273 GB/s roof, so the GEMVs have little left. The earlier 100-130 GB/s figure included the slow attention kernel and launch gaps.
+| spec | specrt before #243 | specrt now | llama.cpp |
+|---|---|---|---|
+| qwen3-0.6b bf16 | 77.9 (noisy, vLLM load) | 148.8 | 152.0 |
+| qwen2.5-0.5b bf16 | 134.3 | 192.3 | 188.6 |
+| qwen3-0.6b q8 | 107.3 | 203.1 | not comparable |
+
+The earlier 137 and 160 tok/s in the table above were measured under a different GPU load. Fused vs unfused builds are within noise (qwen3 150.2 vs 148.4, qwen2.5 194.1 vs 193.5, q8 202.5 vs 203.1).
+
+Bandwidth ceiling: lm_head moves 311 MB in 1.33 ms (233 GB/s) and gate_up 12.6 MB in 56 us (225 GB/s), about 83-85% of the ~273 GB/s roof. Streaming loads and unroll 8 gave about 2-3%. Attention reads under 1 MB of KV per layer at 128-256 tokens, so bf16 KV would not move decode speed at these lengths and was not done.
