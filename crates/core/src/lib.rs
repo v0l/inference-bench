@@ -1,10 +1,19 @@
 pub mod backend;
 pub mod logging;
+pub mod bench;
+pub mod chat;
+pub mod conversations;
+pub mod engine;
+pub mod gpu;
+pub mod hf;
+pub mod settings;
+pub mod library;
 pub mod logitdiff;
 pub mod matrix;
 pub mod openai;
 pub mod report;
 pub mod result;
+pub mod server;
 pub mod store;
 pub mod subprocess;
 

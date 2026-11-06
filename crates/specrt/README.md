@@ -103,11 +103,14 @@ token per grid row. Only the last token goes through `lm_head`. Prefill tokens/s
 | qwen2.5-0.5b | 1024 | 3978 | not run |
 
 Before batching it was about 130-210 tokens/s. The Spark runs were taken with vLLM and Frigate
-resident on the GPU (8% busy at start), so they are not an idle-GPU best case. The GEMM is a plain
-shared-memory tile without tensor cores, so llama.cpp's 9-12k tokens/s is still ahead. The logits tests go through the batched path and still pass.
+resident on the GPU (8% busy at start), so they are not an idle-GPU best case. The GEMM numbers above are the old fp32 tile; see below for the tensor core path. The logits tests go through the batched path and still pass.
 
 An `nsys` profile of Qwen3-0.6B decode puts 24% in `lm_head`, 24% in `gate_up_proj`, 14% in
 `qkv_proj`, 13% in `down_proj` and 12% in `attention`. The GEMVs run at about 100-130 GB/s, against
 roughly 273 GB/s of LPDDR5x bandwidth. Launch overhead is already gone behind the CUDA graph, so a
 megakernel tape scheduler or a green-context SM split is not justified by these numbers yet. The
 gap to llama.cpp is GEMV bandwidth and the f32 activations and KV cache.
+
+## Prefill on tensor cores (issue #247)
+
+Prefill GEMMs (`*_mma` in `templates/model.cu`, `gemm_mma` in `ops.cu`) use `mma.sync` m16n8k16 bf16 with fp32 accumulate and `cp.async` double buffered weight tiles. Activations are f32, so `split_bf16` turns them into a bf16 hi/lo pair and each tile runs two mma passes, which keeps the logits within 3.4e-3 of transformers. Q8 weights are converted to bf16 in registers and the group scale is applied per 32-wide k block. Prefill attention is `flash_mma` (online softmax, causal, GQA, QK and PV on tensor cores, 3-term bf16 split), with no global score buffer. `SPECRT_GEMM_FP32=1` or a pre-Ampere device selects the old fp32 tile GEMM and the `flash_attention` fallback. Prefill chunk is 512 tokens. The decode `attention` kernel is unchanged. Before/after tables are in `docs/spark-matrix.md`.

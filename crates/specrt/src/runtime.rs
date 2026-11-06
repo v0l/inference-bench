@@ -91,6 +91,7 @@ pub struct Runtime {
     buf: Buffers,
     pre: PrefillBuffers,
     chunk: usize,
+    use_mma: bool,
     pub cache_hit: bool,
     pub jit_key: String,
     pub arch: String,
@@ -108,7 +109,7 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 }
 
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
-const PREFILL_CHUNK: usize = 256;
+const PREFILL_CHUNK: usize = 512;
 const SHARED_SCORES_MAX_CTX: usize = 4096;
 const SCORE_BUDGET_FLOATS: usize = 1 << 26;
 const GEMM_TILE: usize = 64;
@@ -200,6 +201,8 @@ impl Runtime {
         let rt = Runtime {
             pre,
             chunk,
+            use_mma: ctx.compute_capability()?.0 >= 8
+                && std::env::var_os("SPECRT_GEMM_FP32").is_none(),
             spec: spec.clone(),
             max_ctx,
             embed: stream.clone_htod(&weights.embed)?,
@@ -337,7 +340,8 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel(name));
+        let name = if self.use_mma { name.replace("_gemm", "_mma") } else { name.to_string() };
+        let mut b = self.stream.launch_builder(self.kernel(&name));
         match w {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
             DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
@@ -346,7 +350,7 @@ impl Runtime {
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out).arg(&n);
         let config = LaunchConfig {
             grid_dim: (grid(rows, GEMM_TILE), grid(tokens, GEMM_TILE), 1),
-            block_dim: (256, 1, 1),
+            block_dim: (if self.use_mma { 128 } else { 256 }, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
@@ -417,7 +421,9 @@ impl Runtime {
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
-            let mut b = self.stream.launch_builder(self.kernel("attention"));
+            let attn_kernel = if self.use_mma { "flash_mma" } else { "flash_attention" };
+            let mut b = self.stream.launch_builder(self.kernel(attn_kernel));
+            let ntok = n as i32;
             b.arg(&pre.qkv)
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
@@ -425,10 +431,10 @@ impl Runtime {
                 .arg(&buf.pos)
                 .arg(&layer)
                 .arg(&pre.attn)
-                .arg(&buf.scores);
+                .arg(&ntok);
             let config = LaunchConfig {
-                grid_dim: (a.heads as u32, n as u32, 1),
-                block_dim: (512, 1, 1),
+                grid_dim: (grid(n, if self.use_mma { 64 } else { 16 }), a.heads as u32, 1),
+                block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
@@ -525,6 +531,17 @@ impl Runtime {
         new_tokens: usize,
         sampling: Sampling,
     ) -> Result<Generation> {
+        self.generate_until(prompt, new_tokens, sampling, &[], &mut |_| {})
+    }
+
+    pub fn generate_until(
+        &mut self,
+        prompt: &[u32],
+        new_tokens: usize,
+        sampling: Sampling,
+        stop: &[u32],
+        on_tokens: &mut dyn FnMut(&[u32]),
+    ) -> Result<Generation> {
         ensure!(!prompt.is_empty() && new_tokens > 0, "empty prompt or nothing to generate");
         ensure!(
             prompt.len() + new_tokens <= self.max_ctx,
@@ -541,19 +558,58 @@ impl Runtime {
         graph.upload()?;
         self.stream.synchronize()?;
         let started = Instant::now();
-        for _ in 1..new_tokens {
-            graph.launch()?;
+        let mut made = 1;
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut shown = 0;
+        loop {
+            let seen = self.stream.clone_dtoh(&self.buf.history.slice(..made))?;
+            tokens = seen.iter().map(|&t| t as u32).collect();
+            let (kept, stopped) = cut_at_stop(&tokens, stop);
+            if kept > shown {
+                on_tokens(&tokens[shown..kept]);
+                shown = kept;
+            }
+            if stopped || made >= new_tokens {
+                tokens.truncate(kept);
+                break;
+            }
+            let step = if stop.is_empty() { new_tokens - made } else { DECODE_CHUNK.min(new_tokens - made) };
+            for _ in 0..step {
+                graph.launch()?;
+            }
+            made += step;
         }
         self.stream.synchronize()?;
         let decode_secs = started.elapsed().as_secs_f64();
-        let history = self.stream.clone_dtoh(&self.buf.history)?;
         let free_now = self.ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         let peak_device_bytes = (self.baseline_free.saturating_sub(free_now) as u64).max(self.device_bytes);
         Ok(Generation {
-            tokens: history[..new_tokens].iter().map(|&t| t as u32).collect(),
+            tokens,
             prefill_secs,
             decode_secs,
             peak_device_bytes,
         })
+    }
+}
+
+const DECODE_CHUNK: usize = 16;
+
+pub fn cut_at_stop(tokens: &[u32], stop: &[u32]) -> (usize, bool) {
+    match tokens.iter().position(|t| stop.contains(t)) {
+        Some(i) => (i, true),
+        None => (tokens.len(), false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cut_at_stop;
+
+    #[test]
+    fn generation_is_cut_before_the_first_stop_token() {
+        assert_eq!(cut_at_stop(&[5, 6, 151645, 9, 9], &[151645, 151643]), (2, true));
+        assert_eq!(cut_at_stop(&[5, 6], &[151645]), (2, false));
+        assert_eq!(cut_at_stop(&[151643], &[151645, 151643]), (0, true));
+        assert_eq!(cut_at_stop(&[1, 2, 3], &[]), (3, false));
     }
 }

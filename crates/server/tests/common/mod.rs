@@ -1,4 +1,5 @@
-use inference_bench_core::backend::{Backend, BackendConfig, CancelFlag, Capabilities, Request};
+use inference_bench_core::backend::{Backend, BackendConfig, Capabilities, Request};
+use inference_bench_core::chat::ChatRequest;
 use inference_bench_core::result::{BackendError, ErrorKind, Generation};
 use inference_bench_server::{Server, ServerConfig, ServerHandle};
 use std::io::{Read, Write};
@@ -20,7 +21,6 @@ pub struct Fake {
     pub first_delay_ms: u64,
     pub token_delay_ms: u64,
     pub stats: Arc<Stats>,
-    cancel: Option<CancelFlag>,
 }
 
 impl Backend for Fake {
@@ -32,10 +32,6 @@ impl Backend for Fake {
         Capabilities::default()
     }
 
-    fn set_cancel(&mut self, flag: Option<CancelFlag>) {
-        self.cancel = flag;
-    }
-
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
         if model == "broken" {
             return Err(BackendError::new(ErrorKind::ModelNotFound, "no such checkpoint"));
@@ -45,27 +41,46 @@ impl Backend for Fake {
     }
 
     fn generate(&mut self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
-        self.stats.prompts.lock().unwrap().push(request.prompt.clone());
+        self.run(&request.prompt, request.max_tokens, None, on_text)
+    }
+
+    fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
+        self.run(&request.flatten(), request.sampling.max_tokens, Some(request), on_text)
+    }
+}
+
+impl Fake {
+    fn run(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        request: Option<&ChatRequest>,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Generation, BackendError> {
+        self.stats.prompts.lock().unwrap().push(prompt.to_string());
         let started = Instant::now();
         std::thread::sleep(Duration::from_millis(self.first_delay_ms));
         let ttft = started.elapsed().as_secs_f64();
-        let n = self.tokens.min(request.max_tokens);
+        let n = self.tokens.min(max_tokens);
         let mut text = String::new();
         for i in 0..n {
-            if self.cancel.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+            if request.is_some_and(|r| r.cancelled()) {
                 self.stats.cancelled.fetch_add(1, Ordering::SeqCst);
-                return Err(BackendError::new(ErrorKind::Cancelled, "cancelled"));
+                break;
             }
             std::thread::sleep(Duration::from_millis(self.token_delay_ms));
             let piece = format!("w{i} ");
             text.push_str(&piece);
             on_text(&piece);
         }
-        self.stats.generated.fetch_add(1, Ordering::SeqCst);
+        if !request.is_some_and(|r| r.cancelled()) {
+            self.stats.generated.fetch_add(1, Ordering::SeqCst);
+        }
+        let completion_tokens = text.split_whitespace().count() as u64;
         Ok(Generation {
             text,
-            prompt_tokens: request.prompt.split_whitespace().count() as u64,
-            completion_tokens: n as u64,
+            prompt_tokens: prompt.split_whitespace().count() as u64,
+            completion_tokens,
             ttft_secs: ttft,
             prefill_secs: ttft,
             decode_secs: started.elapsed().as_secs_f64() - ttft,
@@ -108,7 +123,6 @@ pub fn start(config: ServerConfig, shape: Shape) -> Rig {
             first_delay_ms: shape.first_delay_ms,
             token_delay_ms: shape.token_delay_ms,
             stats: s.clone(),
-            cancel: None,
         }))
     };
     let handle = rt

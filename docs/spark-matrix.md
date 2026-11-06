@@ -58,3 +58,33 @@ Alternating A/B on spark, 6 runs each, median decode tok/s, with llama.cpp (`lla
 The earlier 137 and 160 tok/s in the table above were measured under a different GPU load. Fused vs unfused builds are within noise (qwen3 150.2 vs 148.4, qwen2.5 194.1 vs 193.5, q8 202.5 vs 203.1).
 
 Bandwidth ceiling: lm_head moves 311 MB in 1.33 ms (233 GB/s) and gate_up 12.6 MB in 56 us (225 GB/s), about 83-85% of the ~273 GB/s roof. Streaming loads and unroll 8 gave about 2-3%. Attention reads under 1 MB of KV per layer at 128-256 tokens, so bf16 KV would not move decode speed at these lengths and was not done.
+
+## specrt prefill: tensor cores and flash attention (issue #247)
+
+GB10, `bench specs/<spec>.toml <prompt> 64`, prefill tok/s, 6 alternating runs each of the 17ea141 build, the new build and `llama-bench -p N -n 0 -ngl 99 -r 3` (bf16 or q8_0 GGUF of the same safetensors), medians, same session, vLLM and Frigate resident (GPU 96% busy, so absolute numbers are low-load-sensitive):
+
+| model | prompt | before | after | llama.cpp | after / llama.cpp |
+|---|---|---|---|---|---|
+| Qwen3-0.6B bf16 | 128 | 4028 | 10239 | 10083 | 1.02 |
+| Qwen3-0.6B bf16 | 1024 | 3008 | 15571 | 20929 | 0.74 |
+| Qwen2.5-0.5B bf16 | 128 | 4505 | 11009 | 13017 | 0.85 |
+| Qwen2.5-0.5B bf16 | 1024 | 4653 | 19455 | 32210 | 0.60 |
+| Qwen3-0.6B Q8 | 128 | 4178 | 10387 | 11503 | 0.90 |
+| Qwen3-0.6B Q8 | 1024 | 3094 | 15065 | 22396 | 0.67 |
+
+Per-kernel time for a 1024-token Qwen3-0.6B prefill (`nsys stats -r cuda_gpu_kern_sum`, median per launch, 256-token chunks before, 512 after, so after is per 512 tokens):
+
+| kernel | before (us, 256 tok) | after (us, 512 tok) |
+|---|---|---|
+| attention / flash_mma | 1503 | 431 |
+| gate_up | 465 | 252 |
+| down | 348 | 127 |
+| qkv | 339 | 151 |
+| o | 235 | 89 |
+| lm_head (full logits path only) | 2778 | 3130 |
+
+gate_up after: 6.4 GFLOP in 252 us is 25 TFLOP/s of useful work (two bf16 mma passes per tile, so about 50 TFLOP/s issued). Activations are split into a bf16 hi and lo pair so the fp32 activation precision is kept; the logit tests pass with max abs diff 2.7e-4 (qwen3), 5.3e-4 (qwen2.5), 3.4e-3 (geglu, test bound raised from 1e-3 to 5e-3).
+
+Decode is unchanged: 155.1-157.7 vs 155.5-156.7 tok/s (qwen3-0.6b, 128/128, 3 alternating pairs).
+
+Not done: fused RMSNorm/RoPE/residual epilogues (those kernels are 6% of the profile), two-stream overlap, batch decode. The 1024-token gap to llama.cpp is the GEMMs (about 65% of the time): the tile is 64x64x32 with 128 threads, hi/lo operand splitting doubles the mma count, and activations are f32 in global memory.

@@ -11,9 +11,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
-use inference_bench_core::backend::Request as GenRequest;
+use inference_bench_core::chat::{ChatRequest, Message, Role, Sampling};
 use inference_bench_core::logging::{preview, redact_key};
-use inference_bench_core::result::Generation;
+use inference_bench_core::result::{BackendError, ErrorKind, Generation};
 use serde_json::{Value, json};
 use std::convert::Infallible;
 use std::io::Write;
@@ -322,8 +322,9 @@ async fn embeddings() -> ApiError {
 
 struct Params {
     model: String,
-    prompt: String,
-    max_tokens: usize,
+    messages: Vec<Message>,
+    use_template: bool,
+    sampling: Sampling,
     stream: bool,
     include_usage: bool,
 }
@@ -333,7 +334,7 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         Some(m) if !m.is_empty() => m.to_string(),
         _ => state.manager.default_model().ok_or_else(|| ApiError::bad_request("model is required"))?,
     };
-    let prompt = if chat { chat_prompt(body)? } else { completion_prompt(body)? };
+    let messages = if chat { chat_messages(body)? } else { vec![Message::new(Role::User, completion_prompt(body)?)] };
     let max_tokens = body["max_completion_tokens"]
         .as_u64()
         .or_else(|| body["max_tokens"].as_u64())
@@ -342,10 +343,18 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
     if max_tokens == 0 {
         return Err(ApiError::bad_request("max_tokens must be at least 1"));
     }
+    let defaults = Sampling::default();
+    let sampling = Sampling {
+        temperature: body["temperature"].as_f64().map(|t| t as f32).unwrap_or(0.0),
+        top_p: body["top_p"].as_f64().map(|t| t as f32).unwrap_or(defaults.top_p),
+        seed: body["seed"].as_u64(),
+        max_tokens,
+    };
     Ok(Params {
         model,
-        prompt,
-        max_tokens,
+        messages,
+        use_template: chat,
+        sampling,
         stream: body["stream"].as_bool().unwrap_or(false),
         include_usage: body["stream_options"]["include_usage"].as_bool().unwrap_or(false),
     })
@@ -359,21 +368,15 @@ fn content_text(content: &Value) -> String {
     }
 }
 
-pub fn chat_prompt(body: &Value) -> Result<String, ApiError> {
+pub fn chat_messages(body: &Value) -> Result<Vec<Message>, ApiError> {
     let messages = body["messages"]
         .as_array()
         .filter(|m| !m.is_empty())
         .ok_or_else(|| ApiError::bad_request("messages must be a non-empty array"))?;
-    if messages.len() == 1 && messages[0]["role"].as_str().unwrap_or("user") == "user" {
-        return Ok(content_text(&messages[0]["content"]));
-    }
-    let mut out = String::new();
-    for m in messages {
-        let role = m["role"].as_str().unwrap_or("user");
-        out.push_str(&format!("{role}: {}\n", content_text(&m["content"])));
-    }
-    out.push_str("assistant:");
-    Ok(out)
+    Ok(messages
+        .iter()
+        .map(|m| Message::new(Role::from_name(m["role"].as_str().unwrap_or("user")), content_text(&m["content"])))
+        .collect())
 }
 
 fn completion_prompt(body: &Value) -> Result<String, ApiError> {
@@ -398,7 +401,9 @@ impl Drop for CancelOnDrop {
     }
 }
 
-fn log_prompt(state: &AppState, prompt: &str) {
+fn log_prompt(state: &AppState, request: &ChatRequest) {
+    let prompt = request.flatten();
+    let prompt = prompt.as_str();
     if state.config.log_prompts {
         tracing::info!(prompt = %preview(prompt, 2000), "prompt");
     } else {
@@ -409,9 +414,8 @@ fn log_prompt(state: &AppState, prompt: &str) {
 fn start_generation(
     state: &Arc<AppState>,
     model: String,
-    prompt: String,
+    request: ChatRequest,
     max_tokens: usize,
-    cancel: Arc<AtomicBool>,
 ) -> Result<mpsc::UnboundedReceiver<Gen>, ApiError> {
     let mut admission = state.admit()?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -440,20 +444,22 @@ fn start_generation(
             Span::current().record("backend", lease.model().backend_label.as_str());
             let queued_ms = started.elapsed().as_secs_f64() * 1000.0;
             tracing::debug!(queued_ms, "generation started");
-            let flag = cancel.clone();
+            let flag = request.cancel.clone().unwrap_or_default();
             let text_tx = tx.clone();
             let span = Span::current();
             let outcome = tokio::task::spawn_blocking(move || {
                 span.in_scope(|| {
-                    let backend = lease.backend();
-                    backend.set_cancel(Some(flag.clone()));
-                    let result = backend.generate(&GenRequest { prompt, max_tokens }, &mut |t| {
+                    let result = lease.backend().chat(&request, &mut |t| {
                         if text_tx.send(Gen::Text(t.to_string())).is_err() {
                             flag.store(true, Ordering::SeqCst);
                         }
                     });
-                    backend.set_cancel(None);
-                    result
+                    match result {
+                        Ok(_) if flag.load(Ordering::SeqCst) => {
+                            Err(BackendError::new(ErrorKind::Cancelled, "cancelled"))
+                        }
+                        other => other,
+                    }
                 })
             })
             .await;
@@ -556,18 +562,22 @@ async fn completions(State(state): State<Arc<AppState>>, Json(body): Json<Value>
 async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool) -> Result<Response, ApiError> {
     let p = parse_params(&state, &body, chat)?;
     state.manager.resolve(&p.model)?;
-    log_prompt(&state, &p.prompt);
+    let max_tokens = p.sampling.max_tokens;
     let cancel = Arc::new(AtomicBool::new(false));
     let guard = CancelOnDrop(cancel.clone());
-    let rx = start_generation(&state, p.model.clone(), p.prompt, p.max_tokens, cancel)?;
+    let mut request = ChatRequest::new(p.messages, p.sampling);
+    request.use_template = p.use_template;
+    request.cancel = Some(cancel);
+    log_prompt(&state, &request);
+    let rx = start_generation(&state, p.model.clone(), request, max_tokens)?;
     let id = format!("{}-{}", if chat { "chatcmpl" } else { "cmpl" }, &uuid::Uuid::new_v4().simple().to_string()[..24]);
     if p.stream {
-        let events = sse_events(rx, guard, id, p.model, p.max_tokens, chat, p.include_usage);
+        let events = sse_events(rx, guard, id, p.model, max_tokens, chat, p.include_usage);
         return Ok(Sse::new(events).keep_alive(KeepAlive::default()).into_response());
     }
     let g = collect(rx).await?;
     drop(guard);
-    let reason = finish_reason(&g, p.max_tokens);
+    let reason = finish_reason(&g, max_tokens);
     let created = now();
     let body = if chat {
         json!({
@@ -683,7 +693,11 @@ async fn bench(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> R
         for prompt in &prompts {
             let cancel = Arc::new(AtomicBool::new(false));
             let _guard = CancelOnDrop(cancel.clone());
-            let outcome = match start_generation(&state, model.clone(), prompt.clone(), max_tokens, cancel) {
+            let sampling = Sampling { temperature: 0.0, max_tokens, ..Sampling::default() };
+            let mut request = ChatRequest::new(vec![Message::new(Role::User, prompt.clone())], sampling);
+            request.use_template = false;
+            request.cancel = Some(cancel);
+            let outcome = match start_generation(&state, model.clone(), request, max_tokens) {
                 Ok(rx) => collect(rx).await,
                 Err(e) => Err(e),
             };

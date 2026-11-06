@@ -48,8 +48,6 @@ impl Logits {
     }
 }
 
-pub type CancelFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
-
 pub trait Backend: Send {
     fn name(&self) -> &str;
 
@@ -63,7 +61,14 @@ pub trait Backend: Send {
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError>;
 
-    fn set_cancel(&mut self, _flag: Option<CancelFlag>) {}
+    fn chat(
+        &mut self,
+        request: &crate::chat::ChatRequest,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<Generation, BackendError> {
+        let plain = Request { prompt: request.flatten(), max_tokens: request.sampling.max_tokens };
+        self.generate(&plain, on_text)
+    }
 
     fn logits(&mut self, _prompt: &str) -> Result<Logits, BackendError> {
         Err(BackendError::failed(format!("{} does not expose logits", self.name())))
