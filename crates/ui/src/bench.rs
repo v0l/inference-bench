@@ -261,7 +261,7 @@ fn cell_text(r: &RunResult, metric: Metric) -> (String, egui::Color32) {
 
 fn results(app: &mut App, ui: &mut egui::Ui) {
     let options: Vec<(Metric, &str, Option<usize>)> = Metric::ALL.iter().map(|m| (*m, m.label(), None)).collect();
-    segments(ui, &mut app.bench.metric, &options);
+    ui.push_id("metric", |ui| segments(ui, &mut app.bench.metric, &options));
     let metric = app.bench.metric;
     if app.bench.results.is_empty() {
         note(ui, "no results yet: set up a run", LEGEND);
@@ -361,7 +361,7 @@ fn compare(app: &mut App, ui: &mut egui::Ui) {
     });
     let metric = st.metric;
     let options: Vec<(Metric, &str, Option<usize>)> = Metric::ALL.iter().map(|m| (*m, m.label(), None)).collect();
-    segments(ui, &mut st.metric, &options);
+    ui.push_id("cmp-metric", |ui| segments(ui, &mut st.metric, &options));
     let (Some(l), Some(r)) = (st.sessions.get(st.left), st.sessions.get(st.right)) else { return };
     let deltas = bench::compare(&l.1, &r.1, |x| x.error.is_none().then(|| metric.value(x)).flatten());
     let cols: [(&str, f32); 5] = [("cell", 300.0), ("left", 110.0), ("right", 110.0), ("change", 100.0), ("backend", 120.0)];
@@ -383,7 +383,7 @@ fn compare(app: &mut App, ui: &mut egui::Ui) {
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     page(ui, "bench", |ui| {
         let mut view = app.bench.view;
-        segments(ui, &mut view, &[(View::Setup, "setup", None), (View::Results, "results", Some(app.bench.results.len())), (View::Compare, "compare", Some(app.bench.sessions.len()))]);
+        ui.push_id("view", |ui| segments(ui, &mut view, &[(View::Setup, "setup", None), (View::Results, "results", Some(app.bench.results.len())), (View::Compare, "compare", Some(app.bench.sessions.len()))]));
         app.bench.view = view;
         progress_card(app, ui);
         match view {

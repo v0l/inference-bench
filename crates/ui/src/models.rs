@@ -31,6 +31,7 @@ pub struct ModelsState {
     listing: Pending<Result<Vec<RepoFile>, String>>,
     pub downloads: Vec<Download>,
     pub confirm_delete: Option<usize>,
+    pub show_all: bool,
     pub hub_base: String,
     rescan: bool,
     pub message: Option<(bool, String)>,
@@ -48,6 +49,7 @@ impl Default for ModelsState {
             listing: Pending::default(),
             downloads: Vec::new(),
             confirm_delete: None,
+            show_all: false,
             hub_base: hf::HF_BASE.to_string(),
             rescan: false,
             message: None,
@@ -228,10 +230,23 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
         note(ui, "scanning the hub cache and model folders", LEGEND);
     }
     let n = app.library.len();
-    let usable = app.library.iter().filter(|m| m.support.iter().any(|s| s.supported)).count();
-    Line::new().legend("models").value(n.to_string()).gap(14.0).legend("usable").value(usable.to_string()).show(ui);
-    for i in 0..n {
-        model_card(app, ui, i);
+    let usable_at = |m: &LocalModel| m.support.iter().any(|s| s.supported);
+    let usable = app.library.iter().filter(|m| usable_at(m)).count();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| !usable_at(&app.library[i]));
+    ui.horizontal(|ui| {
+        Line::new().legend("models").value(n.to_string()).gap(14.0).legend("usable").value(usable.to_string()).show(ui);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut all = app.models.show_all;
+            if switch(ui, "show unusable", &mut all, "", "") {
+                app.models.show_all = all;
+            }
+        });
+    });
+    for i in order {
+        if app.models.show_all || usable_at(&app.library[i]) {
+            model_card(app, ui, i);
+        }
     }
     if n == 0 && !app.scan.busy() {
         note(ui, "no models found: download one from discover, or add a folder in settings", LEGEND);

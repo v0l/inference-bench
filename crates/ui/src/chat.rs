@@ -174,13 +174,13 @@ fn top_bar(app: &mut App, ui: &mut egui::Ui) {
         .collect();
     let loaded = app.loaded();
     ui.horizontal(|ui| {
-        ui.allocate_ui(egui::vec2(150.0, KEY_H), |ui| {
+        ui.allocate_ui(egui::vec2(130.0, KEY_H), |ui| {
             let mut b = backend.clone();
             if choice(ui, "chat-backend", &mut b, backends.iter().map(|x| (x.clone(), x.clone()))) {
                 app.chat.conv().backend = b;
             }
         });
-        ui.allocate_ui(egui::vec2(330.0, KEY_H), |ui| {
+        ui.allocate_ui(egui::vec2(260.0, KEY_H), |ui| {
             let mut m = model.clone();
             let mut options: Vec<(String, String)> = usable.iter().map(|x| (x.clone(), x.clone())).collect();
             if !model.is_empty() && !usable.contains(&model) {
@@ -194,12 +194,12 @@ fn top_bar(app: &mut App, ui: &mut egui::Ui) {
         if app.loading.is_some() {
             ui.add(Key::new("loading").outline(READOUT).enabled(false).min_width(110.0));
         } else if is_loaded {
-            if ui.add(Key::new("unload").outline(FAULT).min_width(110.0)).clicked() {
+            if ui.add(Key::new("unload").outline(FAULT).min_width(100.0)).clicked() {
                 app.unload();
             }
         } else {
             let found = app.library.iter().find(|m| m.name == model).cloned();
-            if ui.add(Key::new("load").solid(READOUT).enabled(found.is_some()).min_width(110.0)).clicked()
+            if ui.add(Key::new("load").solid(READOUT).enabled(found.is_some()).min_width(100.0)).clicked()
                 && let Some(m) = found
             {
                 app.load_model(&backend, &m);
@@ -207,11 +207,7 @@ fn top_bar(app: &mut App, ui: &mut egui::Ui) {
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some(g) = app.gpu.first() {
-                Line::new().legend("memory").measured(format!("{} / {}", human_size(g.used_bytes), human_size(g.total_bytes))).size(11.0).show(ui);
-            }
-            if let Some(l) = &loaded {
-                ui.add_space(12.0);
-                Line::new().legend("loaded in").measured(format!("{:.1} s", l.load_secs)).size(11.0).show(ui);
+                Line::new().legend("vram").measured(format!("{} / {}", human_size(g.used_bytes), human_size(g.total_bytes))).size(11.0).show(ui);
             }
         });
     });
@@ -309,14 +305,12 @@ fn bubble(ui: &mut egui::Ui, cache: &mut egui_bench::markdown::Cache, role: Role
         }
         if !user {
             ui.add_space(4.0);
+            if let Some(s) = stats {
+                stats_strip(ui, s);
+            }
             ui.horizontal(|ui| {
-                if let Some(s) = stats {
-                    stats_strip(ui, s);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    copy = ui.add(Key::new("copy").outline(VALUE).id_salt(("copy", salt))).clicked();
-                    regen = ui.add(Key::new("regenerate").outline(VALUE).id_salt(("regen", salt))).clicked();
-                });
+                copy = ui.add(Key::new("copy").outline(VALUE).min_width(80.0).id_salt(("copy", salt))).clicked();
+                regen = ui.add(Key::new("regenerate").outline(VALUE).min_width(130.0).id_salt(("regen", salt))).clicked();
             });
         }
     });
@@ -452,7 +446,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(8))
         .show_inside(ui, |ui| side_list(app, ui));
     egui::Panel::right("chat-settings")
-        .exact_size(290.0)
+        .exact_size(330.0)
         .resizable(false)
         .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(8))
         .show_inside(ui, |ui| {

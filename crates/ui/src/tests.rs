@@ -247,11 +247,107 @@ fn no_model_loaded_disables_sending() {
     assert!(!h.state().chat.streaming());
 }
 
+fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl Fn(&App) -> bool) {
+    let start = Instant::now();
+    while !done(h.state()) {
+        assert!(start.elapsed() < Duration::from_secs(secs), "{what}: {:?}", h.state().notice);
+        h.step();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
-fn zz_dump_bench() {
-    let mut h = harness("dump", Tab::Bench);
-    h.state_mut().bench.models.insert("Qwen3-0.6B".into());
-    h.run();
-    let img = h.render().unwrap();
-    img.save("/tmp/bench-dump.png").unwrap();
+#[ignore = "needs a GPU, the hub cache and a built specrt worker; run with SHOTS=docs/gui"]
+fn screenshots_with_real_data() {
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
+    std::fs::create_dir_all(&out).unwrap();
+    let d = dir("shots");
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::new(d, wake_for(&cc.egui_ctx));
+        app.settings.specrt_worker = std::env::var("SPECRT_WORKER").unwrap_or_default();
+        app
+    });
+    pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
+    let shot = |h: &mut Harness<'static, App>, name: &str| {
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    };
+    h.state_mut().tab = Tab::Models;
+    shot(&mut h, "models");
+
+    let qwen = h.state().library.iter().find(|m| m.name == "Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
+    {
+        let app = h.state_mut();
+        app.chat.pick("Qwen3-0.6B", "specrt");
+        app.load_model("specrt", &qwen);
+        app.tab = Tab::Chat;
+    }
+    pump_until(&mut h, 120, "load", |a| a.loaded().is_some());
+    for q in ["Explain what a KV cache is in two sentences.", "Now give me a tiny Rust example of a struct with a method, as markdown."] {
+        {
+            let app = h.state_mut();
+            app.chat.conv().sampling.max_tokens = 160;
+            app.chat.conv().sampling.temperature = 0.0;
+            app.chat.input = q.into();
+            let (handle, d) = (app.engine.handle(), app.dir.clone());
+            app.chat.send(handle, &d);
+        }
+        let n = h.state_mut().chat.conv().turns.len() + 1;
+        pump_until(&mut h, 120, "reply", move |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= n);
+    }
+    std::thread::sleep(Duration::from_millis(2500));
+    pump_until(&mut h, 20, "gpu", |a| !a.gpu.is_empty());
+    shot(&mut h, "chat");
+
+    {
+        let app = h.state_mut();
+        let (handle, wake) = (app.engine.handle(), app.wake.clone());
+        app.server.start(handle, 0, "", false, wake);
+        let url = app.server.running.as_ref().unwrap().url();
+        for _ in 0..2 {
+            let _ = ureq::get(format!("{url}/v1/models")).call();
+        }
+        let _ = ureq::post(format!("{url}/v1/chat/completions")).send_json(serde_json::json!({"messages":[{"role":"user","content":"Say hi"}],"max_tokens":24,"temperature":0}));
+        app.tab = Tab::Server;
+    }
+    shot(&mut h, "server");
+
+    {
+        let app = h.state_mut();
+        app.unload();
+        app.bench.models.insert("Qwen3-0.6B".into());
+        app.bench.models.insert("SmolLM2-135M".into());
+        app.bench.backends.insert("specrt".into());
+        app.bench.backends.insert("transformers".into());
+        app.bench.lengths = vec![(128, true), (512, true), (2048, false), (8192, false)];
+        app.bench.max_tokens = 64;
+        app.tab = Tab::Bench;
+    }
+    shot(&mut h, "bench-setup");
+    let plan = crate::bench::build_plan(h.state()).expect("plan");
+    let wake = h.state().wake.clone();
+    h.state_mut().bench.start(plan, wake);
+    pump_until(&mut h, 600, "bench", |a| !a.bench.running());
+    shot(&mut h, "bench-results");
+    {
+        let app = h.state_mut();
+        let first = app.bench.sessions[0].1.clone();
+        let mut second = first.clone();
+        for r in &mut second {
+            r.decode_tok_s = r.decode_tok_s.map(|v| v * 1.07);
+        }
+        app.bench.sessions.insert(0, ("previous run".into(), first));
+        app.bench.sessions[1].0 = "this run".into();
+        app.bench.sessions[1].1 = second;
+        app.bench.left = 0;
+        app.bench.right = 1;
+        app.bench.view = crate::bench::View::Compare;
+    }
+    shot(&mut h, "bench-compare");
+    h.state_mut().tab = Tab::Settings;
+    shot(&mut h, "settings");
+    h.state_mut().tab = Tab::Models;
+    h.state_mut().models.pane = crate::models::Pane::Discover;
+    shot(&mut h, "models-discover");
 }
