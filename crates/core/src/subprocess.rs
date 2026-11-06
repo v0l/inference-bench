@@ -217,7 +217,7 @@ impl Backend for Subprocess {
         request: &Request,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError> {
-        self.send(json!({"op": "generate", "prompt": request.prompt, "max_tokens": request.max_tokens}))?;
+        self.send(json!({"op": "generate", "prompt": request.prompt, "max_tokens": request.max_tokens, "chat": false}))?;
         self.collect(on_text)
     }
 
@@ -313,6 +313,8 @@ for line in sys.stdin:
             print("noise that is not json", flush=True)
             print(json.dumps({"event": "loaded"}), flush=True)
     elif m["op"] == "generate":
+        if m.get("chat", True):
+            print(json.dumps({"event": "text", "text": "<templated> "}), flush=True)
         for w in ["a ", "b "]:
             print(json.dumps({"event": "text", "text": w}), flush=True)
         print(json.dumps({"event": "done", "generation": {"text": "", "prompt_tokens": 4, "completion_tokens": 2, "ttft_secs": 0.1, "prefill_secs": 0.1, "decode_secs": 0.5, "peak_memory_bytes": 1024}}), flush=True)
@@ -353,6 +355,14 @@ for line in sys.stdin:
         let l = b.logits("p").unwrap();
         assert_eq!((l.tokens.clone(), l.vocab), (vec![7, 8], 3));
         assert_eq!(l.row(1), &[4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn generate_sends_the_raw_prompt_like_an_openai_completion() {
+        let mut b = fake();
+        b.load("good").unwrap();
+        let g = b.generate(&Request { prompt: "p".into(), max_tokens: 2 }, &mut |_| {}).unwrap();
+        assert!(!g.text.contains("<templated>"), "{}", g.text);
     }
 
     #[test]
