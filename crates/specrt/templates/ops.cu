@@ -714,6 +714,194 @@ extern "C" __global__ void flash_attention(const float* qkv, const float* k_cach
     }
 }
 
+constexpr int FM_BQ = 64;
+constexpr int FM_BK = 32;
+constexpr int FM_KS = HEAD_DIM + 8;
+constexpr int FM_VS = FM_BK + 8;
+constexpr int FM_KB = HEAD_DIM / 16;
+constexpr int FM_NB = HEAD_DIM / 8;
+
+__device__ __forceinline__ unsigned pack_hi(float a, float b) {
+    return bf16_bits_rn(a) | (bf16_bits_rn(b) << 16);
+}
+
+__device__ __forceinline__ unsigned pack_lo(float a, float b) {
+    float ha = __uint_as_float(bf16_bits_rn(a) << 16);
+    float hb = __uint_as_float(bf16_bits_rn(b) << 16);
+    return bf16_bits_rn(a - ha) | (bf16_bits_rn(b - hb) << 16);
+}
+
+__device__ __forceinline__ void mma3(float* c, const unsigned* ah, const unsigned* al,
+                                     unsigned bh0, unsigned bh1, unsigned bl0, unsigned bl1) {
+    mma_bf16(c, al[0], al[1], al[2], al[3], bl0, bl1);
+    mma_bf16(c, al[0], al[1], al[2], al[3], bh0, bh1);
+    mma_bf16(c, ah[0], ah[1], ah[2], ah[3], bl0, bl1);
+    mma_bf16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
+}
+
+extern "C" __global__ void flash_mma(const float* qkv, const float* k_cache, const float* v_cache,
+                                     const int* block_table, const int* pos_ptr, int layer, float* out, int tokens) {
+    __shared__ __align__(16) bf16_t k_hi[FM_BK][FM_KS];
+    __shared__ __align__(16) bf16_t k_lo[FM_BK][FM_KS];
+    __shared__ __align__(16) bf16_t v_hi[HEAD_DIM][FM_VS];
+    __shared__ __align__(16) bf16_t v_lo[HEAD_DIM][FM_VS];
+    int head = blockIdx.y;
+    int kv_head = head / GROUP;
+    int q0 = blockIdx.x * FM_BQ;
+    int base = pos_ptr[0];
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int g = lane >> 2;
+    int t = lane & 3;
+    int row0 = q0 + warp * 16 + g;
+    int row1 = row0 + 8;
+    int pos0 = base + row0;
+    int pos1 = base + row1;
+    float scale = rsqrtf((float)HEAD_DIM);
+    unsigned qh[FM_KB][4];
+    unsigned ql[FM_KB][4];
+    constexpr int QKV_ROW = Q_DIM + 2 * KV_DIM;
+#pragma unroll
+    for (int kb = 0; kb < FM_KB; kb++) {
+        int d = kb * 16 + 2 * t;
+        float2 v[4];
+        const float* p0 = qkv + (size_t)row0 * QKV_ROW + head * HEAD_DIM + d;
+        const float* p1 = qkv + (size_t)row1 * QKV_ROW + head * HEAD_DIM + d;
+        v[0] = row0 < tokens ? *(const float2*)p0 : make_float2(0.f, 0.f);
+        v[1] = row1 < tokens ? *(const float2*)p1 : make_float2(0.f, 0.f);
+        v[2] = row0 < tokens ? *(const float2*)(p0 + 8) : make_float2(0.f, 0.f);
+        v[3] = row1 < tokens ? *(const float2*)(p1 + 8) : make_float2(0.f, 0.f);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            qh[kb][i] = pack_hi(v[i].x, v[i].y);
+            ql[kb][i] = pack_lo(v[i].x, v[i].y);
+        }
+    }
+    float o[FM_NB][4];
+#pragma unroll
+    for (int i = 0; i < FM_NB; i++)
+#pragma unroll
+        for (int e = 0; e < 4; e++) o[i][e] = 0.0f;
+    float m0 = NEG_INF, m1 = NEG_INF, l0 = 0.0f, l1 = 0.0f;
+    int last = min(q0 + FM_BQ, tokens) - 1;
+    int key_end = base + last + 1;
+    for (int k0 = 0; k0 < key_end; k0 += FM_BK) {
+        __syncthreads();
+        for (int i = tid; i < FM_BK * HEAD_DIM / 4; i += 128) {
+            int r = i / (HEAD_DIM / 4);
+            int d = (i % (HEAD_DIM / 4)) * 4;
+            int tk = k0 + r;
+            float4 kv = make_float4(0.f, 0.f, 0.f, 0.f);
+            float4 vv = kv;
+            if (tk < key_end) {
+                size_t slot = (((size_t)layer * PAGES + block_table[tk / PAGE]) * KV_HEADS + kv_head) * PAGE + tk % PAGE;
+                kv = *(const float4*)(k_cache + slot * HEAD_DIM + d);
+                vv = *(const float4*)(v_cache + slot * HEAD_DIM + d);
+            }
+            *(uint2*)&k_hi[r][d] = make_uint2(pack_hi(kv.x, kv.y), pack_hi(kv.z, kv.w));
+            *(uint2*)&k_lo[r][d] = make_uint2(pack_lo(kv.x, kv.y), pack_lo(kv.z, kv.w));
+            float vf[4] = {vv.x, vv.y, vv.z, vv.w};
+#pragma unroll
+            for (int j = 0; j < 4; j++) {
+                unsigned hb = bf16_bits_rn(vf[j]);
+                v_hi[d + j][r] = (bf16_t)hb;
+                v_lo[d + j][r] = (bf16_t)bf16_bits_rn(vf[j] - __uint_as_float(hb << 16));
+            }
+        }
+        __syncthreads();
+        float s[4][4];
+#pragma unroll
+        for (int nb = 0; nb < 4; nb++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) s[nb][e] = 0.0f;
+#pragma unroll
+        for (int nb = 0; nb < 4; nb++)
+#pragma unroll
+            for (int kb = 0; kb < FM_KB; kb++) {
+                int kr = nb * 8 + g;
+                int d = kb * 16 + 2 * t;
+                mma3(s[nb], qh[kb], ql[kb],
+                     *(const unsigned*)&k_hi[kr][d], *(const unsigned*)&k_hi[kr][d + 8],
+                     *(const unsigned*)&k_lo[kr][d], *(const unsigned*)&k_lo[kr][d + 8]);
+            }
+        float mx0 = NEG_INF, mx1 = NEG_INF;
+#pragma unroll
+        for (int nb = 0; nb < 4; nb++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int key = k0 + nb * 8 + 2 * t + (e & 1);
+                int pos = e < 2 ? pos0 : pos1;
+                float v = (key <= pos && key < key_end) ? s[nb][e] * scale : NEG_INF;
+                s[nb][e] = v;
+                if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
+            }
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1));
+        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1));
+        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
+        float n0 = fmaxf(m0, mx0);
+        float n1 = fmaxf(m1, mx1);
+        float a0 = m0 == NEG_INF ? 0.0f : expf(m0 - n0);
+        float a1 = m1 == NEG_INF ? 0.0f : expf(m1 - n1);
+        float sum0 = 0.0f, sum1 = 0.0f;
+#pragma unroll
+        for (int nb = 0; nb < 4; nb++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                float nm = e < 2 ? n0 : n1;
+                float p = s[nb][e] == NEG_INF ? 0.0f : expf(s[nb][e] - nm);
+                s[nb][e] = p;
+                if (e < 2) sum0 += p; else sum1 += p;
+            }
+        sum0 += __shfl_xor_sync(0xffffffff, sum0, 1);
+        sum0 += __shfl_xor_sync(0xffffffff, sum0, 2);
+        sum1 += __shfl_xor_sync(0xffffffff, sum1, 1);
+        sum1 += __shfl_xor_sync(0xffffffff, sum1, 2);
+        l0 = l0 * a0 + sum0;
+        l1 = l1 * a1 + sum1;
+        m0 = n0;
+        m1 = n1;
+#pragma unroll
+        for (int i = 0; i < FM_NB; i++) {
+            o[i][0] *= a0;
+            o[i][1] *= a0;
+            o[i][2] *= a1;
+            o[i][3] *= a1;
+        }
+#pragma unroll
+        for (int kb = 0; kb < 2; kb++) {
+            unsigned ph[4], pl[4];
+            ph[0] = pack_hi(s[2 * kb][0], s[2 * kb][1]);
+            ph[1] = pack_hi(s[2 * kb][2], s[2 * kb][3]);
+            ph[2] = pack_hi(s[2 * kb + 1][0], s[2 * kb + 1][1]);
+            ph[3] = pack_hi(s[2 * kb + 1][2], s[2 * kb + 1][3]);
+            pl[0] = pack_lo(s[2 * kb][0], s[2 * kb][1]);
+            pl[1] = pack_lo(s[2 * kb][2], s[2 * kb][3]);
+            pl[2] = pack_lo(s[2 * kb + 1][0], s[2 * kb + 1][1]);
+            pl[3] = pack_lo(s[2 * kb + 1][2], s[2 * kb + 1][3]);
+#pragma unroll
+            for (int nb = 0; nb < FM_NB; nb++) {
+                int dr = nb * 8 + g;
+                int kc = kb * 16 + 2 * t;
+                mma3(o[nb], ph, pl,
+                     *(const unsigned*)&v_hi[dr][kc], *(const unsigned*)&v_hi[dr][kc + 8],
+                     *(const unsigned*)&v_lo[dr][kc], *(const unsigned*)&v_lo[dr][kc + 8]);
+            }
+        }
+    }
+    float i0 = 1.0f / l0;
+    float i1 = 1.0f / l1;
+#pragma unroll
+    for (int nb = 0; nb < FM_NB; nb++) {
+        int d = nb * 8 + 2 * t;
+        if (row0 < tokens)
+            *(float2*)(out + (size_t)row0 * Q_DIM + head * HEAD_DIM + d) = make_float2(o[nb][0] * i0, o[nb][1] * i0);
+        if (row1 < tokens)
+            *(float2*)(out + (size_t)row1 * Q_DIM + head * HEAD_DIM + d) = make_float2(o[nb][2] * i1, o[nb][3] * i1);
+    }
+}
+
 extern "C" __global__ void swiglu(const float* gate_up, float* out) {
     gate_up += (size_t)blockIdx.y * 2 * INTER;
     out += (size_t)blockIdx.y * INTER;

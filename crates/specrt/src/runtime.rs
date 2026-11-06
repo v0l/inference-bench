@@ -406,7 +406,8 @@ impl Runtime {
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
-            let mut b = self.stream.launch_builder(self.kernel("flash_attention"));
+            let attn_kernel = if self.use_mma { "flash_mma" } else { "flash_attention" };
+            let mut b = self.stream.launch_builder(self.kernel(attn_kernel));
             let ntok = n as i32;
             b.arg(&pre.qkv)
                 .arg(&buf.k_cache)
@@ -417,7 +418,7 @@ impl Runtime {
                 .arg(&pre.attn)
                 .arg(&ntok);
             let config = LaunchConfig {
-                grid_dim: (grid(n, 16), a.heads as u32, 1),
+                grid_dim: (grid(n, if self.use_mma { 64 } else { 16 }), a.heads as u32, 1),
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };

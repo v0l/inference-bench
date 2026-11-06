@@ -33,6 +33,7 @@ pub const KERNELS: &[&str] = &[
     "down_mma",
     "lm_head_mma",
     "flash_attention",
+    "flash_mma",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
