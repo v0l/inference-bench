@@ -23,7 +23,7 @@ INFERENCE_BENCH_API_KEYS=sk-local ./target/release/inference-bench-server \
 | `GET /metrics` | Prometheus text. Open unless `protect_metrics = true` |
 | `GET /admin/models`, `POST /admin/models/{id}/load`, `POST /admin/models/{id}/unload` | Model management (needs the API key when auth is on) |
 
-Chat messages are flattened to a prompt: a single user message is sent as is, longer conversations as `role: text` lines. The specrt backend applies the model's own chat template to a single user message. The specrt worker does not stream, so its SSE responses arrive as one content chunk when generation ends; the `openai` upstream backend streams token by token.
+Chat requests go through the backend `chat` method, so specrt applies the model's chat template and stops at the end-of-turn token. The specrt worker does not stream, so its SSE responses arrive as one content chunk when generation ends; the `openai` upstream backend streams token by token.
 
 Every response carries `x-request-id` (a client supplied one is kept). Errors use the OpenAI shape `{"error": {"message", "type", "param", "code"}}`.
 
@@ -97,4 +97,4 @@ GUI logs view: `inference_bench_core::logging::LogBuffer` is a `tracing` layer h
 
 ## Spark run (Qwen3-0.6B, specrt, GB10)
 
-16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 117.5 tokens/s aggregate, p50 4.9 s, p95 8.2 s (requests queue behind one GPU worker; latency is queue wait). First load 2.7 s including a cold NVRTC compile.
+16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 140.0 tokens/s aggregate, p50 3.8 s, p95 6.7 s (requests queue behind one GPU worker; latency is queue wait). First load 2.7 s including a cold NVRTC compile.
