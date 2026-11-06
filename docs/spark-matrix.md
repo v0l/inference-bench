@@ -18,3 +18,25 @@ overhead. specrt prefills one token at a time through its decode path.
 Logit diff of specrt against `transformers` fp32 on the fixed 43-token prompt
 (`inference-bench logit-diff --backend specrt --model Qwen/Qwen3-0.6B`): max abs 1.0e-4,
 mean abs 6.5e-6, top-1 agreement 43/43.
+
+## specrt decode kernels (issue #243)
+
+nsys, Qwen3-0.6B bf16, spark GB10 (shared with vLLM), median kernel time per launch:
+
+| kernel | before | after |
+|---|---|---|
+| attention | 38.7 us | 13.5 us |
+| gate_up_proj | 56 us | 56 us |
+| qkv_proj | 37.8 us | 37.7 us |
+| down_proj | 28.5 us | 28.6 us |
+| lm_head | 1.35 ms | 1.35 ms |
+
+Attention now splits the V accumulation over timesteps across 16 warps (512 threads) instead of one thread per head dim looping over every timestep. Same-session A/B on spark, 6 alternating runs each, median decode tok/s (GPU shared, spread is large):
+
+| spec | before | after |
+|---|---|---|
+| qwen3-0.6b bf16 | 77.9 | 130.9 |
+| qwen2.5-0.5b bf16 | 134.3 | 173.5 |
+| qwen3-0.6b-q8 | 107.3 | 157.9 |
+
+Measured GEMV bandwidth from the table: lm_head moves 311 MB in 1.35 ms (230 GB/s) and gate_up moves 12.6 MB in 56 us (225 GB/s), about 83% of the ~273 GB/s roof, so the GEMVs have little left. The earlier 100-130 GB/s figure included the slow attention kernel and launch gaps.

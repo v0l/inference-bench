@@ -226,7 +226,7 @@ impl Runtime {
                 .arg(&buf.pos)
                 .arg(&layer)
                 .arg(&buf.attn);
-            unsafe { b.launch(cfg(a.heads as u32, 128)) }?;
+            unsafe { b.launch(cfg(a.heads as u32, 512)) }?;
             self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
             self.rmsnorm(&buf.x, &l.ln2, &buf.xn)?;
             self.linear(
