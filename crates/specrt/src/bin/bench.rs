@@ -9,7 +9,11 @@ fn main() -> Result<()> {
         PathBuf::from(args.next().context("usage: bench <spec.toml> [prompt_len] [new_tokens]")?);
     let prompt_len: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(128);
     let new_tokens: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(128);
+    let batch: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(0);
     let spec = Spec::load(&spec_path)?;
+    if batch > 0 {
+        return bench_batch(&spec, prompt_len, new_tokens, batch);
+    }
     let started = std::time::Instant::now();
     let mut rt = Runtime::load(&spec, prompt_len + new_tokens)?;
     let load_secs = started.elapsed().as_secs_f64();
@@ -37,6 +41,31 @@ fn main() -> Result<()> {
         prefill,
         new_tokens,
         decode,
+    );
+    Ok(())
+}
+
+fn bench_batch(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize) -> Result<()> {
+    let mut rt = Runtime::load_batched(spec, prompt_len + new_tokens, batch)?;
+    let prompts: Vec<Vec<u32>> = (0..batch as u32)
+        .map(|s| (0..prompt_len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect())
+        .collect();
+    rt.generate_batch(&prompts, 8.min(new_tokens))?;
+    let mut rates: Vec<f64> = (0..5)
+        .map(|_| {
+            rt.generate_batch(&prompts, new_tokens)
+                .map(|g| (batch * (new_tokens - 1)) as f64 / g.decode_secs)
+        })
+        .collect::<Result<_>>()?;
+    rates.sort_by(f64::total_cmp);
+    println!(
+        "{} batch={} prompt={} new={} decode={:.1} tok/s aggregate, {:.1} per sequence (median of 5)",
+        spec.name,
+        batch,
+        prompt_len,
+        new_tokens,
+        rates[2],
+        rates[2] / batch as f64
     );
     Ok(())
 }

@@ -596,8 +596,9 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
 
 extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
                                         float* k_cache, float* v_cache, const int* block_table,
-                                        const int* pos_ptr, int layer) {
-    norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, block_table, pos_ptr[0] + blockIdx.y, layer,
+                                        const int* pos_ptr, int layer, int seq_layers) {
+    int pos = pos_ptr[0] + (seq_layers ? 0 : blockIdx.y);
+    norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, block_table, pos, layer + blockIdx.y * seq_layers,
                    blockIdx.x, blockIdx.y);
 }
 
@@ -609,13 +610,15 @@ extern "C" __global__ void kv_norm_rope(float* qkv, const float* q_norm, const f
 }
 
 extern "C" __global__ void attention(const float* qkv, const float* k_cache, const float* v_cache,
-                                     const int* block_table, const int* pos_ptr, int layer, float* out, float* scores_global) {
+                                     const int* block_table, const int* pos_ptr, int layer, float* out, float* scores_global,
+                                     int seq_layers) {
     __shared__ float scratch[32];
     __shared__ float scores_shared[MAX_CTX > 4096 ? 1 : MAX_CTX];
     int head = blockIdx.x;
     float* scores = MAX_CTX > 4096 ? scores_global + ((size_t)blockIdx.y * HEADS + head) * MAX_CTX : scores_shared;
     int kv_head = head / GROUP;
-    int len = pos_ptr[0] + blockIdx.y + 1;
+    int len = pos_ptr[0] + (seq_layers ? 0 : blockIdx.y) + 1;
+    layer += blockIdx.y * seq_layers;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     const float* q = qkv + (size_t)blockIdx.y * (Q_DIM + 2 * KV_DIM) + head * HEAD_DIM;
@@ -1064,4 +1067,42 @@ extern "C" __global__ void argmax_advance(const float* logits, int* token, int* 
         count[0] += 1;
         pos[0] += 1;
     }
+}
+
+extern "C" __global__ void argmax_rows(const float* logits, int* tokens, int* history, const int* count, int stride) {
+    __shared__ float best_v[1024];
+    __shared__ int best_i[1024];
+    logits += (size_t)blockIdx.x * VOCAB;
+    float bv = NEG_INF;
+    int bi = 0;
+    for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
+        float v = logits[i];
+        if (v > bv) {
+            bv = v;
+            bi = i;
+        }
+    }
+    best_v[threadIdx.x] = bv;
+    best_i[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            float ov = best_v[threadIdx.x + s];
+            int oi = best_i[threadIdx.x + s];
+            if (ov > best_v[threadIdx.x] || (ov == best_v[threadIdx.x] && oi < best_i[threadIdx.x])) {
+                best_v[threadIdx.x] = ov;
+                best_i[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        tokens[blockIdx.x] = best_i[0];
+        history[(size_t)blockIdx.x * stride + count[0]] = best_i[0];
+    }
+}
+
+extern "C" __global__ void bump(int* pos, int* count) {
+    pos[0] += 1;
+    count[0] += 1;
 }

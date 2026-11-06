@@ -28,6 +28,26 @@ fn seeded_sampling_reproduces_and_greedy_is_the_default() {
 
 #[test]
 #[ignore = "needs a CUDA GPU and the HF weights"]
+fn batch_decode_matches_single_sequence_greedy() {
+    for file in ["specs/qwen3-0.6b.toml", "specs/qwen2.5-0.5b.toml"] {
+        let spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+        let prompts: Vec<Vec<u32>> = (0..4u32)
+            .map(|s| (0..40u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect())
+            .collect();
+        let mut single = Runtime::load(&spec, 256).unwrap();
+        let expected: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| single.generate(p, 24, Sampling::GREEDY).unwrap().tokens)
+            .collect();
+        drop(single);
+        let mut batch = Runtime::load_batched(&spec, 256, 4).unwrap();
+        let got = batch.generate_batch(&prompts, 24).unwrap().tokens;
+        assert_eq!(got, expected, "{file}");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and the HF weights"]
 fn contexts_above_4096_generate_and_match_the_short_context_path() {
     let p = prompt(4500);
     let mut long = Runtime::load(&spec(), 4700).unwrap();

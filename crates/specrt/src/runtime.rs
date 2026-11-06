@@ -73,6 +73,18 @@ struct PrefillBuffers {
     inv: CudaSlice<f32>,
 }
 
+pub struct BatchGeneration {
+    pub tokens: Vec<Vec<u32>>,
+    pub prefill_secs: f64,
+    pub decode_secs: f64,
+}
+
+struct BatchBuffers {
+    tokens: CudaSlice<i32>,
+    logits: CudaSlice<f32>,
+    history: CudaSlice<i32>,
+}
+
 pub struct Generation {
     pub tokens: Vec<u32>,
     pub prefill_secs: f64,
@@ -94,6 +106,8 @@ pub struct Runtime {
     chunk: usize,
     use_mma: bool,
     sms: u32,
+    layer_base: i32,
+    batch: usize,
     pub cache_hit: bool,
     pub jit_key: String,
     pub arch: String,
@@ -118,6 +132,11 @@ const GEMM_TILE: usize = 64;
 
 impl Runtime {
     pub fn load(spec: &Spec, max_ctx: usize) -> Result<Self> {
+        Self::load_batched(spec, max_ctx, 1)
+    }
+
+    pub fn load_batched(spec: &Spec, max_ctx: usize, batch: usize) -> Result<Self> {
+        ensure!(batch >= 1, "batch must be at least 1");
         let ctx = CudaContext::new(0).context("cuda init")?;
         let free_before = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         unsafe { ctx.disable_event_tracking() };
@@ -161,11 +180,15 @@ impl Runtime {
         }
         let d = &spec.dims;
         let pages = max_ctx.div_ceil(PAGE);
-        let cache_len =
-            spec.layers.count * pages * spec.attention.kv_heads * PAGE * spec.attention.head_dim;
+        let cache_len = batch
+            * spec.layers.count
+            * pages
+            * spec.attention.kv_heads
+            * PAGE
+            * spec.attention.head_dim;
         let table: Vec<i32> = (0..pages as i32).rev().collect();
         let score_rows = (SCORE_BUDGET_FLOATS / (spec.attention.heads * max_ctx)).max(1);
-        let chunk = max_ctx.min(PREFILL_CHUNK).min(score_rows);
+        let chunk = max_ctx.min(PREFILL_CHUNK).min(score_rows).max(batch);
         let buf = Buffers {
             x: stream.alloc_zeros(d.hidden)?,
             xn: stream.alloc_zeros(d.hidden)?,
@@ -201,6 +224,8 @@ impl Runtime {
         let rt = Runtime {
             pre,
             chunk,
+            layer_base: 0,
+            batch,
             sms: ctx.attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
             )? as u32,
@@ -309,7 +334,8 @@ impl Runtime {
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
-                .arg(&layer);
+                .arg(&layer)
+                .arg(&0i32);
             unsafe { b.launch(cfg((a.heads + 2 * a.kv_heads) as u32, a.head_dim.max(32) as u32)) }?;
             let mut b = self.stream.launch_builder(self.kernel("attention"));
             b.arg(&buf.qkv)
@@ -319,7 +345,8 @@ impl Runtime {
                 .arg(&buf.pos)
                 .arg(&layer)
                 .arg(&buf.attn)
-                .arg(&buf.scores);
+                .arg(&buf.scores)
+                .arg(&0i32);
             unsafe { b.launch(cfg(a.heads as u32, 512)) }?;
             self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
             self.linear_norm(
@@ -461,7 +488,7 @@ impl Runtime {
         };
         unsafe { b.launch(config) }?;
         for (i, l) in self.layers.iter().enumerate() {
-            let layer = i as i32;
+            let layer = self.layer_base + i as i32;
             if self.use_mma {
                 self.row_rms(&pre.x, n)?;
                 let inv = pre.inv.as_view();
@@ -498,6 +525,9 @@ impl Runtime {
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
                 .arg(&layer);
+            if !self.use_mma {
+                b.arg(&0i32);
+            }
             let config = LaunchConfig {
                 grid_dim: (rope_heads as u32, n as u32, 1),
                 block_dim: (a.head_dim.max(32) as u32, 1, 1),
@@ -698,5 +728,166 @@ impl Runtime {
             decode_secs,
             peak_device_bytes,
         })
+    }
+
+    fn first_token(&self, bb: &BatchBuffers, seq: usize) -> Result<()> {
+        let stride = self.max_ctx as i32;
+        let mut b = self.stream.launch_builder(self.kernel("argmax_rows"));
+        let tokens = bb.tokens.slice(seq..seq + 1);
+        let history = bb.history.slice(seq * self.max_ctx..);
+        b.arg(&self.buf.logits).arg(&tokens).arg(&history).arg(&self.buf.count).arg(&stride);
+        unsafe { b.launch(cfg(1, 1024)) }?;
+        Ok(())
+    }
+
+    fn batch_step(&self, bb: &BatchBuffers) -> Result<()> {
+        let s = &self.spec;
+        let a = &s.attention;
+        let n = self.batch;
+        let hidden = s.dims.hidden;
+        let inter = s.dims.intermediate;
+        let pre = &self.pre;
+        let buf = &self.buf;
+        let seq_layers = s.layers.count as i32;
+        let mut b = self.stream.launch_builder(self.kernel("embed"));
+        b.arg(&self.embed).arg(&bb.tokens).arg(&pre.x);
+        let config = LaunchConfig {
+            grid_dim: (grid(hidden, 256), n as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        for (i, l) in self.layers.iter().enumerate() {
+            let layer = i as i32;
+            self.row_rms(&pre.x, n)?;
+            let inv = pre.inv.as_view();
+            let qkv_rows = s.q_dim() + 2 * s.kv_dim();
+            self.tc(
+                "qkv",
+                &l.qkv,
+                l.qkv_bias.as_ref(),
+                &pre.x.as_view(),
+                Some((&inv, &l.ln1)),
+                &pre.qkv,
+                qkv_rows,
+                n,
+            )?;
+            let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
+            b.arg(&pre.qkv)
+                .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
+                .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
+                .arg(&buf.k_cache)
+                .arg(&buf.v_cache)
+                .arg(&buf.block_table)
+                .arg(&buf.pos)
+                .arg(&layer)
+                .arg(&seq_layers);
+            let config = LaunchConfig {
+                grid_dim: ((a.heads + 2 * a.kv_heads) as u32, n as u32, 1),
+                block_dim: (a.head_dim.max(32) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { b.launch(config) }?;
+            let mut b = self.stream.launch_builder(self.kernel("attention"));
+            b.arg(&pre.qkv)
+                .arg(&buf.k_cache)
+                .arg(&buf.v_cache)
+                .arg(&buf.block_table)
+                .arg(&buf.pos)
+                .arg(&layer)
+                .arg(&pre.attn)
+                .arg(&buf.scores)
+                .arg(&seq_layers);
+            let config = LaunchConfig {
+                grid_dim: (a.heads as u32, n as u32, 1),
+                block_dim: (512, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { b.launch(config) }?;
+            self.tc("o", &l.o, None, &pre.attn.as_view(), None, &pre.x, hidden, n)?;
+            self.row_rms(&pre.x, n)?;
+            let inv = pre.inv.as_view();
+            self.tc(
+                "gate_up",
+                &l.gate_up,
+                None,
+                &pre.x.as_view(),
+                Some((&inv, &l.ln2)),
+                &pre.act,
+                2 * inter,
+                n,
+            )?;
+            self.tc("down", &l.down, None, &pre.act.as_view(), None, &pre.x, hidden, n)?;
+        }
+        self.row_rms(&pre.x, n)?;
+        let inv = pre.inv.as_view();
+        self.tc(
+            "lm_head",
+            &self.lm_head,
+            None,
+            &pre.x.as_view(),
+            Some((&inv, &self.norm)),
+            &bb.logits,
+            s.dims.vocab,
+            n,
+        )?;
+        let stride = self.max_ctx as i32;
+        let mut b = self.stream.launch_builder(self.kernel("argmax_rows"));
+        b.arg(&bb.logits).arg(&bb.tokens).arg(&bb.history).arg(&buf.count).arg(&stride);
+        unsafe { b.launch(cfg(n as u32, 1024)) }?;
+        let mut b = self.stream.launch_builder(self.kernel("bump"));
+        b.arg(&buf.pos).arg(&buf.count);
+        unsafe { b.launch(cfg(1, 1)) }?;
+        Ok(())
+    }
+
+    pub fn generate_batch(
+        &mut self,
+        prompts: &[Vec<u32>],
+        new_tokens: usize,
+    ) -> Result<BatchGeneration> {
+        ensure!(self.use_mma, "batch decode needs the tensor core path");
+        ensure!(prompts.len() == self.batch, "expected {} prompts", self.batch);
+        let len = prompts[0].len();
+        ensure!(len > 0 && new_tokens > 0, "empty prompt or nothing to generate");
+        ensure!(prompts.iter().all(|p| p.len() == len), "batch prompts must have the same length");
+        ensure!(len + new_tokens <= self.max_ctx, "prompt plus generation exceeds max_ctx");
+        let bb = BatchBuffers {
+            tokens: self.stream.alloc_zeros(self.batch)?,
+            logits: self.stream.alloc_zeros(self.batch * self.spec.dims.vocab)?,
+            history: self.stream.alloc_zeros(self.batch * self.max_ctx)?,
+        };
+        let started = Instant::now();
+        self.stream.memcpy_htod(&[0i32], &mut self.buf.count)?;
+        for (seq, p) in prompts.iter().enumerate() {
+            self.layer_base = (seq * self.spec.layers.count) as i32;
+            let prefilled = self.prefill(p, false);
+            self.layer_base = 0;
+            prefilled?;
+            self.first_token(&bb, seq)?;
+        }
+        self.stream.memcpy_htod(&[len as i32], &mut self.buf.pos)?;
+        self.stream.memcpy_htod(&[1i32], &mut self.buf.count)?;
+        self.stream.synchronize()?;
+        let prefill_secs = started.elapsed().as_secs_f64();
+        self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let recorded = self.batch_step(&bb);
+        let graph = self.stream.end_capture(CUgraphInstantiate_flags(0))?;
+        recorded?;
+        let graph = graph.context("empty graph")?;
+        graph.upload()?;
+        self.stream.synchronize()?;
+        let started = Instant::now();
+        for _ in 1..new_tokens {
+            graph.launch()?;
+        }
+        self.stream.synchronize()?;
+        let decode_secs = started.elapsed().as_secs_f64();
+        let history = self.stream.clone_dtoh(&bb.history)?;
+        let tokens = history
+            .chunks(self.max_ctx)
+            .map(|h| h[..new_tokens].iter().map(|&t| t as u32).collect())
+            .collect();
+        Ok(BatchGeneration { tokens, prefill_secs, decode_secs })
     }
 }

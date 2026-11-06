@@ -66,6 +66,8 @@ pub const KERNELS: &[&str] = &[
     "lm_head_mma_big",
     "row_rms",
     "kv_norm_rope",
+    "argmax_rows",
+    "bump",
     "qkv_mma_narrow",
     "o_mma_narrow",
     "gate_up_mma_narrow",
