@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "llama.cpp",
+    "model": "Qwen/Qwen3-0.6B",
+    "started": "2026-11-06T22:34:00.595674941Z",
+    "prompt_tokens": 129,
+    "completion_tokens": 128,
+    "prefill_tok_s": 9205.786143450698,
+    "decode_tok_s": 166.38547739340828,
+    "ttft_secs": 0.014012926,
+    "peak_memory_bytes": null,
+    "text": " quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain",
+    "error": null
+  }
+]

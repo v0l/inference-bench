@@ -1,0 +1,35 @@
+[
+  {
+    "backend": "llama.cpp",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "batch": 1,
+    "prompt_tokens": 129,
+    "completion_tokens": 128,
+    "wall_secs": 0.641364566,
+    "throughput_tok_s": 199.57448038998774,
+    "decode_tok_s": 201.28244749921396,
+    "median_ttft_secs": 0.010318153
+  },
+  {
+    "backend": "llama.cpp",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "batch": 4,
+    "prompt_tokens": 516,
+    "completion_tokens": 512,
+    "wall_secs": 0.795264882,
+    "throughput_tok_s": 643.8106492422735,
+    "decode_tok_s": 659.6007836145567,
+    "median_ttft_secs": 0.024667931
+  },
+  {
+    "backend": "llama.cpp",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "batch": 16,
+    "prompt_tokens": 2064,
+    "completion_tokens": 2048,
+    "wall_secs": 1.246731853,
+    "throughput_tok_s": 1642.6948546088042,
+    "decode_tok_s": 1743.8165368755747,
+    "median_ttft_secs": 0.073441962
+  }
+]

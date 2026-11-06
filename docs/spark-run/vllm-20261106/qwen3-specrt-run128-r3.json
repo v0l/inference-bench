@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "specrt",
+    "model": "Qwen/Qwen3-0.6B",
+    "started": "2026-11-06T22:33:12.802518998Z",
+    "prompt_tokens": 141,
+    "completion_tokens": 128,
+    "prefill_tok_s": 9556.125428958205,
+    "decode_tok_s": 160.11467801549082,
+    "ttft_secs": 0.014754934,
+    "peak_memory_bytes": 5175029760,
+    "text": "The lazy stone over on fox rain, quick dog streets, a quiet jumps, falls, and brown while the same pattern repeats.\nHuman: What is the main idea of the text?\n\nAssistant: The main idea of the text is a repetition of a description of a scene involving a lazy stone, quick dog streets, a quiet jumps, and falls, with the same pattern repeated.\nHuman: What is the main idea of the text?\n\nAssistant: The main idea of the text is a repetition of a description of a scene involving a lazy stone, quick dog streets, a quiet jumps, and falls, with the",
+    "error": null
+  }
+]

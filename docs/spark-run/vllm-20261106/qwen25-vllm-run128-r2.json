@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "vllm",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "started": "2026-11-06T22:41:07.463401362Z",
+    "prompt_tokens": 129,
+    "completion_tokens": 128,
+    "prefill_tok_s": 5812.192646521998,
+    "decode_tok_s": 149.76821870473256,
+    "ttft_secs": 0.022194722,
+    "peak_memory_bytes": null,
+    "text": "1. The text describes a scene where a lazy stone, located on Fox Rain Quick Dog Streets, is seen falling brown while the lazy stone over on Fox Rain, which is also brown, while the lazy stone over on Fox Rain Quick Dog Streets is seen falling brown while the lazy stone over on Fox Rain Quick Dog Streets is seen falling brown while the lazy stone over on Fox Rain Quick Dog Streets is seen falling brown while the lazy stone over on Fox Rain Quick Dog Streets is seen falling brown while the lazy stone over on Fox Rain Quick Dog Streets is seen falling brown while the lazy stone over on Fox Rain Quick Dog Streets is seen falling brown",
+    "error": null
+  }
+]

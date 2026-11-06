@@ -112,4 +112,64 @@ Logits against transformers fp32 (`tests/logits.rs`, all pass): max abs 1.7e-4 q
 | Qwen2.5-0.5B | 4 | 472.3 | 709.3 |
 | Qwen2.5-0.5B | 16 | 1724.8 | 2501.8 |
 
-Batch 1 here goes through the GEMM path and is slower than the GEMV decode (`generate`, 154 and 195 tok/s), which stays the single-stream path. At batch 16 the step is attention (18%, the paged decode kernel launched per sequence) and lm_head (16%), then the 16-row GEMMs. vLLM was not measured: the resident vLLM serves a 27B model on this GPU and a second vLLM instance does not fit beside it.
+Batch 1 here goes through the GEMM path and is slower than the GEMV decode (`generate`, 154 and 195 tok/s), which stays the single-stream path. At batch 16 the step is attention (18%, the paged decode kernel launched per sequence) and lm_head (16%), then the 16-row GEMMs. vLLM was measured later, see the next section.
+
+## vLLM, llama.cpp and specrt (issue #265)
+
+Spark GB10, 2026-11-06, one session, bf16 weights for all three. vLLM 0.32.0 ran as a second instance on port 18000 beside the resident 27B (`--dtype bfloat16 --max-model-len 4096 --gpu-memory-utilization 0.08 --max-num-seqs 16 --no-enable-prefix-caching`, CUDA graphs on). llama.cpp `7bd8282c3` ran as `llama-server -np 16 -c 24576 --no-cache-prompt` on port 18080 with the GGUFs converted from the same safetensors, plus `llama-bench` and `llama-batched-bench`. specrt ran through its worker and through `bench`. The 27B was not stopped. Also on the GPU for the whole run: the 27B vLLM (49.9 GB), ComfyUI (12.9 GB, idle), Frigate (detector and three ffmpeg decoders, about 1.5 GB). CUDA free memory was 18-22 GiB at the start of each round after `drop_caches`; without the cache drop the page cache ate it and CUDA context creation failed.
+
+Six rounds per model, the engine order rotated each round, medians. The 27B had a request running in 121 of the 994 sampled seconds, all inside llama.cpp and specrt rounds and never in a vLLM round; the worst were Qwen2.5 llama.cpp round 4 (87% of it, `llama-bench` decode fell to 38 tok/s) and specrt round 2 (50%). Medians of six keep those out. Every completion is 128 tokens (`ignore_eos`), prompts are the synthetic bench prompt (`--prompt-len`). Driver: `docs/spark-run/vllm-run.sh`, aggregation `docs/spark-run/summarise.py`, raw files and `summary.json` in `docs/spark-run/vllm-20261106/`.
+
+Over HTTP (`inference-bench run`, streaming; prefill is prompt tokens over TTFT, decode is the remaining 127 tokens over the time after the first):
+
+| model | prompt | engine | prefill tok/s | decode tok/s | TTFT |
+|---|---|---|---|---|---|
+| Qwen3-0.6B | 128 | vLLM | 7423 | 127.1 | 18.8 ms |
+| Qwen3-0.6B | 128 | llama.cpp | 8334 | 163.9 | 15.5 ms |
+| Qwen3-0.6B | 128 | specrt | 10485 | 156.1 | 13.4 ms |
+| Qwen3-0.6B | 1024 | vLLM | 32621 | 120.7 | 31.4 ms |
+| Qwen3-0.6B | 1024 | llama.cpp | 19913 | 150.6 | 51.5 ms |
+| Qwen3-0.6B | 1024 | specrt | 15587 | 101.3 | 66.5 ms |
+| Qwen2.5-0.5B | 128 | vLLM | 5787 | 149.6 | 22.3 ms |
+| Qwen2.5-0.5B | 128 | llama.cpp | 10500 | 195.1 | 12.3 ms |
+| Qwen2.5-0.5B | 128 | specrt | 12759 | 191.2 | 11.6 ms |
+| Qwen2.5-0.5B | 1024 | vLLM | 36159 | 139.4 | 28.4 ms |
+| Qwen2.5-0.5B | 1024 | llama.cpp | 22903 | 187.2 | 45.0 ms |
+| Qwen2.5-0.5B | 1024 | specrt | 20491 | 146.6 | 51.0 ms |
+
+In-process, no HTTP (`llama-bench -p 128,1024 -n 128 -r 1`, `bench specs/<spec>.toml <prompt> 128`):
+
+| model | metric | llama.cpp | specrt | specrt / llama.cpp |
+|---|---|---|---|---|
+| Qwen3-0.6B | prefill 128 | 8927 | 10801 | 1.21 |
+| Qwen3-0.6B | prefill 1024 | 24790 | 21104 | 0.85 |
+| Qwen3-0.6B | decode 128 | 151.6 | 156.4 | 1.03 |
+| Qwen2.5-0.5B | prefill 128 | 6286 | 11165 | 1.78 |
+| Qwen2.5-0.5B | prefill 1024 | 29213 | 28694 | 0.98 |
+| Qwen2.5-0.5B | decode 128 | 203.5 | 191.8 | 0.94 |
+
+llama-bench prefill at 128 tokens was noisy this session (Qwen2.5 1932-6615 over the six rounds), so the 128-token ratios above flatter specrt; the HTTP table is the steadier comparison there.
+
+Batch decode, 128-token prompts, 128 new tokens each, aggregate decode tok/s (sum over sequences of 127 tokens over each one's decode time). vLLM and llama-server get N concurrent streaming requests (`inference-bench batch --sizes 1,4,16`); the native columns are `llama-batched-bench -npp 128 -ntg 128 -npl 1,4,16` (`speed_tg`) and specrt `bench <spec> 128 128 <N>`:
+
+| model | batch | vLLM (HTTP) | llama-server (HTTP) | llama-batched-bench | specrt `bench` | specrt / vLLM | specrt / llama.cpp native |
+|---|---|---|---|---|---|---|---|
+| Qwen3-0.6B | 1 | 125.0 | 163.3 | 149.8 | 101.5 | 0.81 | 0.68 |
+| Qwen3-0.6B | 4 | 551.8 | 519.0 | 457.1 | 372.9 | 0.68 | 0.82 |
+| Qwen3-0.6B | 16 | 1883.1 | 1255.2 | 1682.1 | 1220.3 | 0.65 | 0.73 |
+| Qwen2.5-0.5B | 1 | 159.8 | 192.1 | 199.4 | 118.4 | 0.74 | 0.59 |
+| Qwen2.5-0.5B | 4 | 736.9 | 624.5 | 739.1 | 475.6 | 0.65 | 0.64 |
+| Qwen2.5-0.5B | 16 | 2852.9 | 1771.6 | 2722.1 | 1744.1 | 0.61 | 0.64 |
+
+Median TTFT under load at batch 16: vLLM 73.5 and 52.5 ms, llama-server 106.8 and 85.5 ms.
+
+Where specrt stands:
+
+- Single-stream decode on short context is level with llama.cpp (0.94-1.03 native, 0.95-0.98 over HTTP) and 1.2-1.3x vLLM.
+- Prefill is ahead at 128 tokens and 0.85-0.98 of llama.cpp at 1024 tokens. vLLM is the fastest prefill at 1024 tokens by a wide margin: 32.6k and 36.2k tok/s over HTTP, 1.8-2.1x specrt over HTTP and 1.3-1.5x specrt's in-process number.
+- Decode after a 1024-token prompt drops to 101 and 147 tok/s against llama.cpp's 151 and 187 (0.67 and 0.78). The decode attention kernel's cost grows with context much faster than llama.cpp's or vLLM's (vLLM loses 5-7% from 128 to 1024, specrt 23-35%).
+- Batch decode is 0.59-0.82 of llama-batched-bench and 0.61-0.81 of vLLM, and the gap widens with batch size against vLLM (0.65 and 0.61 at 16). Batch 1 through the GEMM path is 101 and 118 tok/s against 156 and 192 on the GEMV path.
+
+Follow-ups: batched paged decode attention (#272), decode at long context (#273), 1024-token prefill against vLLM and worker overhead (#274).
+
+Harness changes from this run: bench completions send `ignore_eos` so every engine decodes exactly `max_tokens`, `inference-bench run --prompt-len N` uses the synthetic prompt, `inference-bench batch` runs N concurrent requests per size against any backend, and the worker backends get the raw prompt on `generate` (they applied the chat template, which OpenAI completions do not). vLLM needs `--no-enable-prefix-caching` for repeated-prompt benches, or TTFT drops to the cache hit. The Bench tab already runs vLLM as an endpoint (Settings, backend endpoints: URL, API key; the model id is the HF repo).

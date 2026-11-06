@@ -1,0 +1,254 @@
+{
+  "Qwen3-0.6B": {
+    "http": {
+      "vLLM @128": {
+        "prefill_tok_s": 7422.5,
+        "decode_tok_s": 127.1,
+        "ttft_ms": 18.8,
+        "n": 6
+      },
+      "vLLM @1024": {
+        "prefill_tok_s": 32620.8,
+        "decode_tok_s": 120.7,
+        "ttft_ms": 31.4,
+        "n": 6
+      },
+      "llama.cpp @128": {
+        "prefill_tok_s": 8333.9,
+        "decode_tok_s": 163.9,
+        "ttft_ms": 15.5,
+        "n": 6
+      },
+      "llama.cpp @1024": {
+        "prefill_tok_s": 19913.3,
+        "decode_tok_s": 150.6,
+        "ttft_ms": 51.5,
+        "n": 6
+      },
+      "specrt @128": {
+        "prefill_tok_s": 10484.9,
+        "decode_tok_s": 156.1,
+        "ttft_ms": 13.4,
+        "n": 6
+      },
+      "specrt @1024": {
+        "prefill_tok_s": 15586.8,
+        "decode_tok_s": 101.3,
+        "ttft_ms": 66.5,
+        "n": 6
+      }
+    },
+    "native": {
+      "prefill @128": {
+        "llama.cpp": 8927.2,
+        "specrt": 10800.6
+      },
+      "prefill @1024": {
+        "llama.cpp": 24790.0,
+        "specrt": 21104.2
+      },
+      "decode 128": {
+        "llama.cpp": 151.6,
+        "specrt": 156.4
+      }
+    },
+    "batch_http": {
+      "vLLM x1": {
+        "decode_tok_s": 125.0,
+        "throughput_tok_s": 124.3,
+        "ttft_ms": 13.7
+      },
+      "vLLM x4": {
+        "decode_tok_s": 551.8,
+        "throughput_tok_s": 533.9,
+        "ttft_ms": 37.5
+      },
+      "vLLM x16": {
+        "decode_tok_s": 1883.1,
+        "throughput_tok_s": 1797.6,
+        "ttft_ms": 73.5
+      },
+      "llama.cpp x1": {
+        "decode_tok_s": 163.3,
+        "throughput_tok_s": 161.6,
+        "ttft_ms": 14.0
+      },
+      "llama.cpp x4": {
+        "decode_tok_s": 519.0,
+        "throughput_tok_s": 502.3,
+        "ttft_ms": 35.1
+      },
+      "llama.cpp x16": {
+        "decode_tok_s": 1255.2,
+        "throughput_tok_s": 1182.5,
+        "ttft_ms": 106.8
+      }
+    },
+    "batch_native": {
+      "x1": {
+        "llama.cpp": 149.8,
+        "specrt": 101.5
+      },
+      "x4": {
+        "llama.cpp": 457.1,
+        "specrt": 372.9
+      },
+      "x16": {
+        "llama.cpp": 1682.1,
+        "specrt": 1220.3
+      }
+    },
+    "busy_27b": {
+      "vLLM": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "llama.cpp": [
+        0.0,
+        0.0,
+        0.0,
+        0.29411764705882354,
+        0.13333333333333333,
+        0.0
+      ],
+      "specrt": [
+        0.45,
+        0.08333333333333333,
+        0.0,
+        0.0,
+        0.12,
+        0.02127659574468085
+      ]
+    }
+  },
+  "Qwen2.5-0.5B": {
+    "http": {
+      "vLLM @128": {
+        "prefill_tok_s": 5787.2,
+        "decode_tok_s": 149.6,
+        "ttft_ms": 22.3,
+        "n": 6
+      },
+      "vLLM @1024": {
+        "prefill_tok_s": 36158.9,
+        "decode_tok_s": 139.4,
+        "ttft_ms": 28.4,
+        "n": 6
+      },
+      "llama.cpp @128": {
+        "prefill_tok_s": 10499.8,
+        "decode_tok_s": 195.1,
+        "ttft_ms": 12.3,
+        "n": 6
+      },
+      "llama.cpp @1024": {
+        "prefill_tok_s": 22903.4,
+        "decode_tok_s": 187.2,
+        "ttft_ms": 45.0,
+        "n": 6
+      },
+      "specrt @128": {
+        "prefill_tok_s": 12758.9,
+        "decode_tok_s": 191.2,
+        "ttft_ms": 11.6,
+        "n": 6
+      },
+      "specrt @1024": {
+        "prefill_tok_s": 20491.3,
+        "decode_tok_s": 146.6,
+        "ttft_ms": 51.0,
+        "n": 6
+      }
+    },
+    "native": {
+      "prefill @128": {
+        "llama.cpp": 6285.8,
+        "specrt": 11164.5
+      },
+      "prefill @1024": {
+        "llama.cpp": 29213.2,
+        "specrt": 28693.9
+      },
+      "decode 128": {
+        "llama.cpp": 203.5,
+        "specrt": 191.8
+      }
+    },
+    "batch_http": {
+      "vLLM x1": {
+        "decode_tok_s": 159.8,
+        "throughput_tok_s": 158.5,
+        "ttft_ms": 13.1
+      },
+      "vLLM x4": {
+        "decode_tok_s": 736.9,
+        "throughput_tok_s": 716.9,
+        "ttft_ms": 22.6
+      },
+      "vLLM x16": {
+        "decode_tok_s": 2852.9,
+        "throughput_tok_s": 2661.6,
+        "ttft_ms": 52.5
+      },
+      "llama.cpp x1": {
+        "decode_tok_s": 192.1,
+        "throughput_tok_s": 190.7,
+        "ttft_ms": 10.6
+      },
+      "llama.cpp x4": {
+        "decode_tok_s": 624.5,
+        "throughput_tok_s": 608.2,
+        "ttft_ms": 28.9
+      },
+      "llama.cpp x16": {
+        "decode_tok_s": 1771.6,
+        "throughput_tok_s": 1642.9,
+        "ttft_ms": 85.5
+      }
+    },
+    "batch_native": {
+      "x1": {
+        "llama.cpp": 199.4,
+        "specrt": 118.4
+      },
+      "x4": {
+        "llama.cpp": 739.1,
+        "specrt": 475.6
+      },
+      "x16": {
+        "llama.cpp": 2722.1,
+        "specrt": 1744.1
+      }
+    },
+    "busy_27b": {
+      "vLLM": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "llama.cpp": [
+        0.0,
+        0.0,
+        0.0,
+        0.8709677419354839,
+        0.0,
+        0.0
+      ],
+      "specrt": [
+        0.0,
+        0.5,
+        0.17073170731707318,
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  }
+}

@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "vllm",
+    "model": "Qwen/Qwen3-0.6B",
+    "started": "2026-11-06T22:31:35.205036983Z",
+    "prompt_tokens": 1025,
+    "completion_tokens": 128,
+    "prefill_tok_s": 33440.24751394597,
+    "decode_tok_s": 118.17615838975944,
+    "ttft_secs": 0.030651687,
+    "peak_memory_bytes": null,
+    "text": ".\n\n\nThe text is about a series of descriptions of the same place, with the same time and the same location, but with different descriptions of the same place and time. The text is about a series of descriptions of the same place, with the same time and the same location, but with different descriptions of the same place and time. The text is about a series of descriptions of the same place, with the same time and the same location, but with different descriptions of the same place and time.\nThe text is about a series of descriptions of the same place, with the same time and the same location, but with different descriptions of the",
+    "error": null
+  }
+]

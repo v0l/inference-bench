@@ -1,0 +1,181 @@
+== qwen3 start 2026-11-06T22:29:11+00:00
+1 %, 2418 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3682551, /home/kieran/git/llama.cpp/build/bin/llama-server, 4044 MiB
+3683749, VLLM::EngineCore, 8893 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+== qwen3 round 1 2026-11-06T22:30:15+00:00
+1 %, 2418 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3682551, /home/kieran/git/llama.cpp/build/bin/llama-server, 4056 MiB
+3683749, VLLM::EngineCore, 8999 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 18.5 GiB
+== qwen3 round 2 2026-11-06T22:31:40+00:00
+96 %, 2463 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3682551, /home/kieran/git/llama.cpp/build/bin/llama-server, 4058 MiB
+3683749, VLLM::EngineCore, 8999 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 18.4 GiB
+== qwen3 round 3 2026-11-06T22:32:52+00:00
+8 %, 2418 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3682551, /home/kieran/git/llama.cpp/build/bin/llama-server, 4058 MiB
+3683749, VLLM::EngineCore, 8999 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 18.9 GiB
+== qwen3 round 4 2026-11-06T22:33:58+00:00
+96 %, 2418 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3682551, /home/kieran/git/llama.cpp/build/bin/llama-server, 4058 MiB
+3683749, VLLM::EngineCore, 8999 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 19.4 GiB
+== qwen3 round 5 2026-11-06T22:35:10+00:00
+24 %, 2411 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3682551, /home/kieran/git/llama.cpp/build/bin/llama-server, 4058 MiB
+3683749, VLLM::EngineCore, 8999 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 18.1 GiB
+== qwen3 round 6 2026-11-06T22:36:23+00:00
+96 %, 2470 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3682551, /home/kieran/git/llama.cpp/build/bin/llama-server, 4058 MiB
+3683749, VLLM::EngineCore, 8999 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 19.1 GiB
+== qwen25 start 2026-11-06T22:38:14+00:00
+2 %, 2424 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3760593, /home/kieran/git/llama.cpp/build/bin/llama-server, 1457 MiB
+3761749, VLLM::EngineCore, 9389 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 18.8 GiB
+== qwen25 round 1 2026-11-06T22:39:18+00:00
+96 %, 2411 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3760593, /home/kieran/git/llama.cpp/build/bin/llama-server, 1473 MiB
+3761749, VLLM::EngineCore, 9471 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 19.8 GiB
+== qwen25 round 2 2026-11-06T22:40:11+00:00
+96 %, 2418 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3760593, /home/kieran/git/llama.cpp/build/bin/llama-server, 1473 MiB
+3761749, VLLM::EngineCore, 9471 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 20.9 GiB
+== qwen25 round 3 2026-11-06T22:41:21+00:00
+95 %, 2411 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3760593, /home/kieran/git/llama.cpp/build/bin/llama-server, 1473 MiB
+3761749, VLLM::EngineCore, 9471 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 21.5 GiB
+== qwen25 round 4 2026-11-06T22:42:18+00:00
+96 %, 2411 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3760593, /home/kieran/git/llama.cpp/build/bin/llama-server, 1473 MiB
+3761749, VLLM::EngineCore, 9471 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 20.3 GiB
+== qwen25 round 5 2026-11-06T22:43:34+00:00
+96 %, 2437 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3760593, /home/kieran/git/llama.cpp/build/bin/llama-server, 1473 MiB
+3761749, VLLM::EngineCore, 9471 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 20.2 GiB
+== qwen25 round 6 2026-11-06T22:44:27+00:00
+95 %, 2411 MHz
+1972895, /home/kieran/git/llama.cpp/build/bin/ggml-rpc-server, 170 MiB
+1977532, frigate.detector:onnx, 460 MiB
+1977796, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 343 MiB
+1978675, VLLM::EngineCore, 49882 MiB
+3303574, .venv/bin/python, 12863 MiB
+1946220, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 232 MiB
+2719361, /usr/lib/ffmpeg/7.0/bin/ffmpeg, 424 MiB
+3760593, /home/kieran/git/llama.cpp/build/bin/llama-server, 1473 MiB
+3761749, VLLM::EngineCore, 9471 MiB
+vllm:num_requests_running{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting{engine="0",model_name="qwen3.8-27b"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="capacity"} 0.0 vllm:num_requests_waiting_by_reason{engine="0",model_name="qwen3.8-27b",reason="deferred"} 0.0 
+cuda free 21.6 GiB

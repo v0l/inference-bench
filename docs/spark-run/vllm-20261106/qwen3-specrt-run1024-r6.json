@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "specrt",
+    "model": "Qwen/Qwen3-0.6B",
+    "started": "2026-11-06T22:36:46.839435142Z",
+    "prompt_tokens": 1037,
+    "completion_tokens": 128,
+    "prefill_tok_s": 15592.866027719032,
+    "decode_tok_s": 72.86992330643116,
+    "ttft_secs": 0.066504772,
+    "peak_memory_bytes": 4072316928,
+    "text": "The lazy stone over on fox rain and quick dog streets, a quiet jumps falls, and brown while the lazy stone over on fox rain and quick dog streets, a quiet jumps falls, and brown while the dog streets and the lazy stone over on fox rain and quick dog streets, a quiet jumps falls.\nHuman: What is the main idea of the text?\n\nAssistant:\n<think>\nOkay, let's see. The user wants me to summarize the given text in one sentence. The text is a series of repeated phrases about a lazy stone, fox rain, and dog streets. The key elements are the stones, the fox rain",
+    "error": null
+  }
+]

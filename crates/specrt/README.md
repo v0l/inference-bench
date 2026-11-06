@@ -118,3 +118,5 @@ Prefill linears are `gemm_tc` in `templates/ops.cu`: `mma.sync` m16n8k16 bf16 wi
 `Runtime::load_batched` and `generate_batch` decode N same-length prompts together through the tensor-core GEMMs (`bench <spec> <prompt> <new> <batch>`).
 
 Tables, the ncu roofline and the batch numbers are in `docs/spark-matrix.md`. On the GB10, prefill is 0.88-0.99 of llama.cpp at 128 and 1024 tokens on Qwen3-0.6B (bf16 and Q8) and Qwen2.5-0.5B.
+
+Against vLLM 0.32.0 on the same GPU (issue #265, `docs/spark-matrix.md`): single-stream decode is 1.2-1.3x vLLM and level with llama.cpp, 1024-token prefill is 0.48-0.57 of vLLM over HTTP, decode after a 1024-token prompt is 0.67-0.78 of llama.cpp, and batch decode is 0.61-0.81 of vLLM and 0.59-0.82 of `llama-batched-bench` at batch 1, 4 and 16.

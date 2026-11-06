@@ -1,0 +1,197 @@
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import torch;f,t=torch.cuda.mem_get_info();print(f"cuda free {f/2**30:.1f} GiB")
+                     ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/kieran/.venv-vllm/lib/python3.13/site-packages/torch/cuda/memory.py", line 862, in mem_get_info
+    return torch.cuda.cudart().cudaMemGetInfo(device)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^
+torch.AcceleratorError: CUDA error: out of memory
+Search for `cudaErrorMemoryAllocation' in https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html for more information.
+For more detailed error information, run with CUDA_LOG_FILE=stderr
+
+docs/spark-run/vllm-run.sh: line 44: 3689510 Aborted                 (core dumped) "$LL/llama-bench" -m "$GG/${GGUF[$m]}" -ngl 99 -p 128,1024 -n 128 -r 1 -o json > "$OUT/$m-llamabench-r$r.json" 2> /dev/null
+2026-11-06T22:29:27.321367Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3690163
+2026-11-06T22:29:27.557486Z  INFO inference_bench_core::subprocess: 2026-11-06T22:29:27.557363Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:29:28.569488Z  INFO inference_bench_core::subprocess: 2026-11-06T22:29:28.569448Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.006066782 arch=compute_121 vram_before_bytes=20889165824 vram_after_bytes=15511265280 device_bytes=5377900544 load_secs=1.012069973 worker=specrt
+2026-11-06T22:29:28.657527Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.336059374
+2026-11-06T22:29:29.791255Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3690544
+2026-11-06T22:29:29.982909Z  INFO inference_bench_core::subprocess: 2026-11-06T22:29:29.982793Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:29:30.790407Z  INFO inference_bench_core::subprocess: 2026-11-06T22:29:30.790375Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.002195238 arch=compute_121 vram_before_bytes=18879160320 vram_after_bytes=15204524032 device_bytes=3674636288 load_secs=0.807566024 worker=specrt
+2026-11-06T22:29:30.878623Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.087340945
+qwen3 round 1 llama start 1794004217
+qwen3 round 1 llama end 1794004231
+qwen3 round 1 specrt start 1794004232
+2026-11-06T22:30:32.380843Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3699446
+2026-11-06T22:30:32.604486Z  INFO inference_bench_core::subprocess: 2026-11-06T22:30:32.604445Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:30:33.661885Z  INFO inference_bench_core::subprocess: 2026-11-06T22:30:33.661844Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.003925768 arch=compute_121 vram_before_bytes=20804702208 vram_after_bytes=15463280640 device_bytes=5341421568 load_secs=1.05738405 worker=specrt
+2026-11-06T22:30:33.750061Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.369189905
+2026-11-06T22:30:34.836063Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3699792
+2026-11-06T22:30:35.034450Z  INFO inference_bench_core::subprocess: 2026-11-06T22:30:35.034418Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:30:35.892912Z  INFO inference_bench_core::subprocess: 2026-11-06T22:30:35.892788Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.002259639 arch=compute_121 vram_before_bytes=18630209536 vram_after_bytes=14472679424 device_bytes=4157530112 load_secs=0.858355869 worker=specrt
+2026-11-06T22:30:35.979909Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.143826831
+qwen3 round 1 specrt end 1794004293
+qwen3 round 1 vllm start 1794004294
+qwen3 round 1 vllm end 1794004299
+qwen3 round 2 specrt start 1794004305
+2026-11-06T22:31:45.491842Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3709911
+2026-11-06T22:31:46.149846Z  INFO inference_bench_core::subprocess: 2026-11-06T22:31:46.149593Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:31:49.129493Z  INFO inference_bench_core::subprocess: 2026-11-06T22:31:49.129357Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.011434917 arch=compute_121 vram_before_bytes=20230750208 vram_after_bytes=15093575680 device_bytes=5137174528 load_secs=2.979749976 worker=specrt
+2026-11-06T22:31:49.236693Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=3.7448271220000002
+2026-11-06T22:31:50.397708Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3710580
+2026-11-06T22:31:50.585356Z  INFO inference_bench_core::subprocess: 2026-11-06T22:31:50.585322Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:31:51.371369Z  INFO inference_bench_core::subprocess: 2026-11-06T22:31:51.371249Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.002367096 arch=compute_121 vram_before_bytes=18739523584 vram_after_bytes=14671925248 device_bytes=4067598336 load_secs=0.785912062 worker=specrt
+2026-11-06T22:31:51.459650Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.061913697
+qwen3 round 2 specrt end 1794004353
+qwen3 round 2 vllm start 1794004353
+qwen3 round 2 vllm end 1794004359
+qwen3 round 2 llama start 1794004359
+qwen3 round 2 llama end 1794004372
+qwen3 round 3 vllm start 1794004374
+qwen3 round 3 vllm end 1794004380
+qwen3 round 3 llama start 1794004380
+qwen3 round 3 llama end 1794004392
+qwen3 round 3 specrt start 1794004392
+2026-11-06T22:33:12.802928Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3722619
+2026-11-06T22:33:13.040757Z  INFO inference_bench_core::subprocess: 2026-11-06T22:33:13.040724Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:33:14.063168Z  INFO inference_bench_core::subprocess: 2026-11-06T22:33:14.063050Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.003832311 arch=compute_121 vram_before_bytes=20803739648 vram_after_bytes=15628709888 device_bytes=5175029760 load_secs=1.022311185 worker=specrt
+2026-11-06T22:33:14.166885Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.3639305259999999
+2026-11-06T22:33:15.224524Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3722965
+2026-11-06T22:33:15.433375Z  INFO inference_bench_core::subprocess: 2026-11-06T22:33:15.433256Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:33:16.327091Z  INFO inference_bench_core::subprocess: 2026-11-06T22:33:16.327056Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.002344568 arch=compute_121 vram_before_bytes=19084857344 vram_after_bytes=15031078912 device_bytes=4053778432 load_secs=0.893784903 worker=specrt
+2026-11-06T22:33:16.417194Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.192639506
+qwen3 round 3 specrt end 1794004438
+qwen3 round 4 llama start 1794004440
+qwen3 round 4 llama end 1794004457
+qwen3 round 4 specrt start 1794004457
+2026-11-06T22:34:17.665029Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3731881
+2026-11-06T22:34:17.872681Z  INFO inference_bench_core::subprocess: 2026-11-06T22:34:17.872555Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:34:18.925771Z  INFO inference_bench_core::subprocess: 2026-11-06T22:34:18.925728Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.004696352 arch=compute_121 vram_before_bytes=20940009472 vram_after_bytes=15611338752 device_bytes=5328670720 load_secs=1.053159802 worker=specrt
+2026-11-06T22:34:19.033075Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.368024425
+2026-11-06T22:34:20.155439Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3732217
+2026-11-06T22:34:20.393461Z  INFO inference_bench_core::subprocess: 2026-11-06T22:34:20.393427Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:34:21.300148Z  INFO inference_bench_core::subprocess: 2026-11-06T22:34:21.300025Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.002347784 arch=compute_121 vram_before_bytes=19367739392 vram_after_bytes=15280381952 device_bytes=4087357440 load_secs=0.906582633 worker=specrt
+2026-11-06T22:34:21.391151Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.235688905
+qwen3 round 4 specrt end 1794004503
+qwen3 round 4 vllm start 1794004504
+qwen3 round 4 vllm end 1794004509
+qwen3 round 5 specrt start 1794004512
+2026-11-06T22:35:12.754312Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3739781
+2026-11-06T22:35:12.951642Z  INFO inference_bench_core::subprocess: 2026-11-06T22:35:12.951609Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:35:13.992216Z  INFO inference_bench_core::subprocess: 2026-11-06T22:35:13.992178Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.004442573 arch=compute_121 vram_before_bytes=19969425408 vram_after_bytes=14937923584 device_bytes=5031501824 load_secs=1.040556875 worker=specrt
+2026-11-06T22:35:14.090008Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.335657745
+2026-11-06T22:35:15.241247Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3740091
+2026-11-06T22:35:15.446460Z  INFO inference_bench_core::subprocess: 2026-11-06T22:35:15.446426Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:35:16.282206Z  INFO inference_bench_core::subprocess: 2026-11-06T22:35:16.282166Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.002343736 arch=compute_121 vram_before_bytes=18685034496 vram_after_bytes=14588174336 device_bytes=4096860160 load_secs=0.835725098 worker=specrt
+2026-11-06T22:35:16.369639Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.128368615
+qwen3 round 5 specrt end 1794004562
+qwen3 round 5 vllm start 1794004562
+qwen3 round 5 vllm end 1794004568
+qwen3 round 5 llama start 1794004568
+qwen3 round 5 llama end 1794004582
+qwen3 round 6 vllm start 1794004585
+qwen3 round 6 vllm end 1794004591
+qwen3 round 6 llama start 1794004591
+qwen3 round 6 llama end 1794004603
+qwen3 round 6 specrt start 1794004604
+2026-11-06T22:36:44.333155Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3753024
+2026-11-06T22:36:44.562526Z  INFO inference_bench_core::subprocess: 2026-11-06T22:36:44.562395Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:36:45.634642Z  INFO inference_bench_core::subprocess: 2026-11-06T22:36:45.634517Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.005797499 arch=compute_121 vram_before_bytes=20931969024 vram_after_bytes=15651528704 device_bytes=5280440320 load_secs=1.072108349 worker=specrt
+2026-11-06T22:36:45.733974Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.400798104
+2026-11-06T22:36:46.839772Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3753340
+2026-11-06T22:36:47.053651Z  INFO inference_bench_core::subprocess: 2026-11-06T22:36:47.053613Z  INFO specrt::worker: loading model model="Qwen/Qwen3-0.6B" spec=qwen3-0.6b max_ctx=4096 worker=specrt
+2026-11-06T22:36:47.960038Z  INFO inference_bench_core::subprocess: 2026-11-06T22:36:47.959917Z  INFO specrt::runtime: runtime loaded spec=qwen3-0.6b jit_key=75f89b006b717bc361e2945f62df9f7d6a59ebcc04b7da8566465b6a0ea332d1 jit_cache_hit=true jit_secs=0.002326856 arch=compute_121 vram_before_bytes=19539914752 vram_after_bytes=15467597824 device_bytes=4072316928 load_secs=0.906288407 worker=specrt
+2026-11-06T22:36:48.044668Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen3-0.6B" load_secs=1.204863842
+qwen3 round 6 specrt end 1794004651
+2026-11-06T22:38:32.568865Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3768748
+2026-11-06T22:38:32.736773Z  INFO inference_bench_core::subprocess: 2026-11-06T22:38:32.736740Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:38:35.576096Z  INFO inference_bench_core::subprocess: 2026-11-06T22:38:35.576047Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=false jit_secs=1.916124621 arch=compute_121 vram_before_bytes=23536902144 vram_after_bytes=19580284928 device_bytes=3956617216 load_secs=2.839293666 worker=specrt
+2026-11-06T22:38:35.738195Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=3.169251498
+2026-11-06T22:38:36.752261Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3769357
+2026-11-06T22:38:36.923673Z  INFO inference_bench_core::subprocess: 2026-11-06T22:38:36.923637Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:38:37.720765Z  INFO inference_bench_core::subprocess: 2026-11-06T22:38:37.720645Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.002225799 arch=compute_121 vram_before_bytes=21797945344 vram_after_bytes=18977099776 device_bytes=2820845568 load_secs=0.796992834 worker=specrt
+2026-11-06T22:38:37.866966Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.114661182
+qwen25 round 1 llama start 1794004760
+qwen25 round 1 llama end 1794004770
+qwen25 round 1 specrt start 1794004770
+2026-11-06T22:39:30.424090Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3777071
+2026-11-06T22:39:30.606175Z  INFO inference_bench_core::subprocess: 2026-11-06T22:39:30.606142Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:39:31.536032Z  INFO inference_bench_core::subprocess: 2026-11-06T22:39:31.535992Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.004239099 arch=compute_121 vram_before_bytes=22936965120 vram_after_bytes=19398254592 device_bytes=3538710528 load_secs=0.929836104 worker=specrt
+2026-11-06T22:39:31.690151Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.266043872
+2026-11-06T22:39:32.561312Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3777373
+2026-11-06T22:39:32.731684Z  INFO inference_bench_core::subprocess: 2026-11-06T22:39:32.731557Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:39:33.457712Z  INFO inference_bench_core::subprocess: 2026-11-06T22:39:33.457674Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.002196246 arch=compute_121 vram_before_bytes=22093508608 vram_after_bytes=19275710464 device_bytes=2817798144 load_secs=0.72610029 worker=specrt
+2026-11-06T22:39:33.599141Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.037803618
+qwen25 round 1 specrt end 1794004806
+qwen25 round 1 vllm start 1794004806
+qwen25 round 1 vllm end 1794004811
+qwen25 round 2 specrt start 1794004813
+2026-11-06T22:40:13.834912Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3783301
+2026-11-06T22:40:14.006868Z  INFO inference_bench_core::subprocess: 2026-11-06T22:40:14.006736Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:40:14.843677Z  INFO inference_bench_core::subprocess: 2026-11-06T22:40:14.843560Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.003538052 arch=compute_121 vram_before_bytes=23137992704 vram_after_bytes=19499204608 device_bytes=3638788096 load_secs=0.836810167 worker=specrt
+2026-11-06T22:40:14.995341Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.1604
+2026-11-06T22:40:15.858652Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3783616
+2026-11-06T22:40:16.041975Z  INFO inference_bench_core::subprocess: 2026-11-06T22:40:16.041843Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:40:18.834456Z  INFO inference_bench_core::subprocess: 2026-11-06T22:40:18.834189Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.004282492 arch=compute_121 vram_before_bytes=21560868864 vram_after_bytes=18751713280 device_bytes=2809155584 load_secs=2.792313333 worker=specrt
+2026-11-06T22:40:19.354497Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=3.495796866
+qwen25 round 2 specrt end 1794004867
+qwen25 round 2 vllm start 1794004867
+qwen25 round 2 vllm end 1794004872
+qwen25 round 2 llama start 1794004872
+qwen25 round 2 llama end 1794004881
+qwen25 round 3 vllm start 1794004884
+qwen25 round 3 vllm end 1794004888
+qwen25 round 3 llama start 1794004888
+qwen25 round 3 llama end 1794004897
+qwen25 round 3 specrt start 1794004898
+2026-11-06T22:41:38.088548Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3795585
+2026-11-06T22:41:38.278585Z  INFO inference_bench_core::subprocess: 2026-11-06T22:41:38.278457Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:41:39.158580Z  INFO inference_bench_core::subprocess: 2026-11-06T22:41:39.158534Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.00471528 arch=compute_121 vram_before_bytes=23667957760 vram_after_bytes=19914608640 device_bytes=3753349120 load_secs=0.880064175 worker=specrt
+2026-11-06T22:41:39.317289Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.228711862
+2026-11-06T22:41:40.220257Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3795846
+2026-11-06T22:41:40.383673Z  INFO inference_bench_core::subprocess: 2026-11-06T22:41:40.383548Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:41:41.147345Z  INFO inference_bench_core::subprocess: 2026-11-06T22:41:41.147221Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.002188551 arch=compute_121 vram_before_bytes=22450737152 vram_after_bytes=19657723904 device_bytes=2793013248 load_secs=0.763656976 worker=specrt
+2026-11-06T22:41:41.282060Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.061781189
+qwen25 round 3 specrt end 1794004938
+qwen25 round 4 llama start 1794004943
+qwen25 round 4 llama end 1794004973
+qwen25 round 4 specrt start 1794004973
+2026-11-06T22:42:53.940736Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3806379
+2026-11-06T22:42:54.126916Z  INFO inference_bench_core::subprocess: 2026-11-06T22:42:54.126560Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:42:54.957267Z  INFO inference_bench_core::subprocess: 2026-11-06T22:42:54.957145Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.006983595 arch=compute_121 vram_before_bytes=23512420352 vram_after_bytes=19771088896 device_bytes=3741331456 load_secs=0.830571766 worker=specrt
+2026-11-06T22:42:55.112946Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.172183581
+2026-11-06T22:42:55.920980Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3806617
+2026-11-06T22:42:56.098660Z  INFO inference_bench_core::subprocess: 2026-11-06T22:42:56.098540Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:42:56.893891Z  INFO inference_bench_core::subprocess: 2026-11-06T22:42:56.893856Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.002267416 arch=compute_121 vram_before_bytes=22448197632 vram_after_bytes=19663077376 device_bytes=2785120256 load_secs=0.795301927 worker=specrt
+2026-11-06T22:42:57.039740Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.118727722
+qwen25 round 4 specrt end 1794005009
+qwen25 round 4 vllm start 1794005009
+qwen25 round 4 vllm end 1794005014
+qwen25 round 5 specrt start 1794005016
+2026-11-06T22:43:36.753506Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3812501
+2026-11-06T22:43:36.966592Z  INFO inference_bench_core::subprocess: 2026-11-06T22:43:36.966468Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:43:37.844519Z  INFO inference_bench_core::subprocess: 2026-11-06T22:43:37.844386Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.003573767 arch=compute_121 vram_before_bytes=22411251712 vram_after_bytes=18760278016 device_bytes=3650973696 load_secs=0.877902847 worker=specrt
+2026-11-06T22:43:38.001271Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.247738296
+2026-11-06T22:43:38.844201Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3812773
+2026-11-06T22:43:39.012531Z  INFO inference_bench_core::subprocess: 2026-11-06T22:43:39.012411Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:43:39.764127Z  INFO inference_bench_core::subprocess: 2026-11-06T22:43:39.764009Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.002138343 arch=compute_121 vram_before_bytes=20986228736 vram_after_bytes=18756411392 device_bytes=2229817344 load_secs=0.751583136 worker=specrt
+2026-11-06T22:43:39.907376Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.063152165
+qwen25 round 5 specrt end 1794005052
+qwen25 round 5 vllm start 1794005052
+qwen25 round 5 vllm end 1794005057
+qwen25 round 5 llama start 1794005057
+qwen25 round 5 llama end 1794005067
+qwen25 round 6 vllm start 1794005069
+qwen25 round 6 vllm end 1794005074
+qwen25 round 6 llama start 1794005074
+qwen25 round 6 llama end 1794005083
+qwen25 round 6 specrt start 1794005084
+2026-11-06T22:44:44.142166Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3822389
+2026-11-06T22:44:44.329323Z  INFO inference_bench_core::subprocess: 2026-11-06T22:44:44.329205Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:44:45.208026Z  INFO inference_bench_core::subprocess: 2026-11-06T22:44:45.207909Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.003822377 arch=compute_121 vram_before_bytes=23650217984 vram_after_bytes=19893559296 device_bytes=3756658688 load_secs=0.878689939 worker=specrt
+2026-11-06T22:44:45.363802Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.221609078
+2026-11-06T22:44:46.183292Z  INFO inference_bench_core::subprocess: worker started worker=specrt program=/home/kieran/git/ib265/target/release/inference-bench-specrt pid=3822769
+2026-11-06T22:44:46.356688Z  INFO inference_bench_core::subprocess: 2026-11-06T22:44:46.356652Z  INFO specrt::worker: loading model model="Qwen/Qwen2.5-0.5B" spec=qwen2.5-0.5b max_ctx=4096 worker=specrt
+2026-11-06T22:44:47.398618Z  INFO inference_bench_core::subprocess: 2026-11-06T22:44:47.398447Z  INFO specrt::runtime: runtime loaded spec=qwen2.5-0.5b jit_key=6e6656989361762b535a3672556a927ce05b0f604ae391fb8e6a826f67a55fdd jit_cache_hit=true jit_secs=0.002298728 arch=compute_121 vram_before_bytes=22317256704 vram_after_bytes=19381391360 device_bytes=2935865344 load_secs=1.041780146 worker=specrt
+2026-11-06T22:44:47.541821Z  INFO inference_bench_core::subprocess: worker loaded model worker=specrt model="Qwen/Qwen2.5-0.5B" load_secs=1.358498731
+qwen25 round 6 specrt end 1794005122
+finished

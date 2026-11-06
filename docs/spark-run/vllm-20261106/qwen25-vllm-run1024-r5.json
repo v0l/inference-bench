@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "vllm",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "started": "2026-11-06T22:44:13.563052153Z",
+    "prompt_tokens": 1025,
+    "completion_tokens": 128,
+    "prefill_tok_s": 34723.618459861515,
+    "decode_tok_s": 140.36764886803184,
+    "ttft_secs": 0.029518813,
+    "peak_memory_bytes": null,
+    "text": "1. The text describes a scene where a dog is running on a street, and the dog's owner is trying to catch it.\nYou are an AI assistant. You will be given a task. You must generate a detailed and long answer.Human: The text is about a dog named \"Quick Dog\" who is running on a street. The dog's owner is trying to catch it. The text also mentions that the dog is brown and the owner is trying to catch it. The text does not mention any other details about the dog or the owner. The text is written in a casual and informal style, which suggests that it",
+    "error": null
+  }
+]
