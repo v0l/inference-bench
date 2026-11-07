@@ -799,6 +799,133 @@ extern "C" __global__ void attention(const float* qkv, const float* k_cache, con
     }
 }
 
+constexpr int BD_WARPS = 8;
+constexpr int BD_SPLITS = {{BD_SPLITS}};
+constexpr int BD_UNROLL = 8;
+
+extern "C" __global__ void batch_decode_attention(const float* qkv, const float* k_cache, const float* v_cache,
+                                                  const int* block_table, const int* pos_ptr, int layer,
+                                                  float* part_acc, float* part_ml, int seq_layers) {
+    constexpr int PER_LANE = (HEAD_DIM + 31) / 32;
+    __shared__ float sm[BD_WARPS][GROUP];
+    __shared__ float sl[BD_WARPS][GROUP];
+    __shared__ float sacc[BD_WARPS][GROUP][HEAD_DIM];
+    int kv_head = blockIdx.x;
+    int seq = blockIdx.y;
+    int split = blockIdx.z;
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int len = pos_ptr[0] + 1;
+    int chunk = (len + BD_SPLITS - 1) / BD_SPLITS;
+    int t0 = split * chunk;
+    int t1 = min(len, t0 + chunk);
+    int seq_layer = layer + seq * seq_layers;
+    const float* q = qkv + (size_t)seq * (Q_DIM + 2 * KV_DIM) + kv_head * GROUP * HEAD_DIM;
+    float scale = rsqrtf((float)HEAD_DIM);
+    float qr[GROUP][PER_LANE];
+#pragma unroll
+    for (int g = 0; g < GROUP; g++)
+#pragma unroll
+        for (int i = 0; i < PER_LANE; i++) {
+            int d = lane + i * 32;
+            qr[g][i] = d < HEAD_DIM ? q[g * HEAD_DIM + d] * scale : 0.0f;
+        }
+    float m[GROUP], l[GROUP], acc[GROUP][PER_LANE];
+#pragma unroll
+    for (int g = 0; g < GROUP; g++) {
+        m[g] = NEG_INF;
+        l[g] = 0.0f;
+#pragma unroll
+        for (int i = 0; i < PER_LANE; i++) acc[g][i] = 0.0f;
+    }
+    constexpr int U = BD_UNROLL;
+    for (int tb = t0 + warp; tb < t1; tb += BD_WARPS * U) {
+        float kr[U][PER_LANE], vr[U][PER_LANE];
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            int t = tb + u * BD_WARPS;
+            size_t slot = (((size_t)seq_layer * PAGES + block_table[min(t, t1 - 1) / PAGE]) * KV_HEADS + kv_head) * PAGE + min(t, t1 - 1) % PAGE;
+            const float* k = k_cache + slot * HEAD_DIM;
+            const float* v = v_cache + slot * HEAD_DIM;
+#pragma unroll
+            for (int i = 0; i < PER_LANE; i++) {
+                int d = lane + i * 32;
+                kr[u][i] = d < HEAD_DIM ? k[d] : 0.0f;
+                vr[u][i] = d < HEAD_DIM ? v[d] : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            if (tb + u * BD_WARPS >= t1) break;
+#pragma unroll
+            for (int g = 0; g < GROUP; g++) {
+                float dot = 0.0f;
+#pragma unroll
+                for (int i = 0; i < PER_LANE; i++) dot += qr[g][i] * kr[u][i];
+                dot = warp_sum(dot);
+                float nm = fmaxf(m[g], dot);
+                float corr = expf(m[g] - nm);
+                float p = expf(dot - nm);
+                l[g] = l[g] * corr + p;
+#pragma unroll
+                for (int i = 0; i < PER_LANE; i++) acc[g][i] = acc[g][i] * corr + p * vr[u][i];
+                m[g] = nm;
+            }
+        }
+    }
+#pragma unroll
+    for (int g = 0; g < GROUP; g++) {
+        if (lane == 0) {
+            sm[warp][g] = m[g];
+            sl[warp][g] = l[g];
+        }
+#pragma unroll
+        for (int i = 0; i < PER_LANE; i++) {
+            int d = lane + i * 32;
+            if (d < HEAD_DIM) sacc[warp][g][d] = acc[g][i];
+        }
+    }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < GROUP * HEAD_DIM; idx += blockDim.x) {
+        int g = idx / HEAD_DIM;
+        int d = idx % HEAD_DIM;
+        float M = NEG_INF;
+        for (int w = 0; w < BD_WARPS; w++) M = fmaxf(M, sm[w][g]);
+        float L = 0.0f, A = 0.0f;
+        if (M != NEG_INF) {
+            for (int w = 0; w < BD_WARPS; w++) {
+                float c = sm[w][g] == NEG_INF ? 0.0f : expf(sm[w][g] - M);
+                L += sl[w][g] * c;
+                A += sacc[w][g][d] * c;
+            }
+        }
+        int head = kv_head * GROUP + g;
+        size_t base = ((size_t)seq * HEADS + head) * BD_SPLITS + split;
+        part_acc[base * HEAD_DIM + d] = A;
+        if (d == 0) {
+            part_ml[base * 2] = M;
+            part_ml[base * 2 + 1] = L;
+        }
+    }
+}
+
+extern "C" __global__ void batch_decode_combine(const float* part_acc, const float* part_ml, float* out) {
+    int head = blockIdx.x;
+    int seq = blockIdx.y;
+    int d = threadIdx.x;
+    size_t base = ((size_t)seq * HEADS + head) * BD_SPLITS;
+    float M = NEG_INF;
+    for (int s = 0; s < BD_SPLITS; s++) M = fmaxf(M, part_ml[(base + s) * 2]);
+    float L = 0.0f, A = 0.0f;
+    for (int s = 0; s < BD_SPLITS; s++) {
+        float ms = part_ml[(base + s) * 2];
+        float c = ms == NEG_INF ? 0.0f : expf(ms - M);
+        L += part_ml[(base + s) * 2 + 1] * c;
+        A += part_acc[(base + s) * HEAD_DIM + d] * c;
+    }
+    out[((size_t)seq * HEADS + head) * HEAD_DIM + d] = A / L;
+}
+
 constexpr int FA_BQ = 16;
 constexpr int FA_BK = 32;
 constexpr int FA_THREADS = 128;

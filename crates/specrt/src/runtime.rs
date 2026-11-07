@@ -84,6 +84,8 @@ struct BatchBuffers {
     tokens: CudaSlice<i32>,
     logits: CudaSlice<f32>,
     history: CudaSlice<i32>,
+    part_acc: CudaSlice<f32>,
+    part_ml: CudaSlice<f32>,
 }
 
 pub struct Generation {
@@ -842,19 +844,27 @@ impl Runtime {
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
-            let mut b = self.stream.launch_builder(self.kernel("attention"));
+            let mut b = self.stream.launch_builder(self.kernel("batch_decode_attention"));
             b.arg(&pre.qkv)
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
                 .arg(&layer)
-                .arg(&pre.attn)
-                .arg(&buf.scores)
+                .arg(&bb.part_acc)
+                .arg(&bb.part_ml)
                 .arg(&seq_layers);
             let config = LaunchConfig {
+                grid_dim: (a.kv_heads as u32, n as u32, crate::codegen::BATCH_DECODE_SPLITS as u32),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe { b.launch(config) }?;
+            let mut b = self.stream.launch_builder(self.kernel("batch_decode_combine"));
+            b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.attn);
+            let config = LaunchConfig {
                 grid_dim: (a.heads as u32, n as u32, 1),
-                block_dim: (512, 1, 1),
+                block_dim: (a.head_dim as u32, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
@@ -906,10 +916,13 @@ impl Runtime {
         ensure!(len > 0 && new_tokens > 0, "empty prompt or nothing to generate");
         ensure!(prompts.iter().all(|p| p.len() == len), "batch prompts must have the same length");
         ensure!(len + new_tokens <= self.max_ctx, "prompt plus generation exceeds max_ctx");
+        let parts = self.batch * self.spec.attention.heads * crate::codegen::BATCH_DECODE_SPLITS;
         let bb = BatchBuffers {
             tokens: self.stream.alloc_zeros(self.batch)?,
             logits: self.stream.alloc_zeros(self.batch * self.spec.dims.vocab)?,
             history: self.stream.alloc_zeros(self.batch * self.max_ctx)?,
+            part_acc: self.stream.alloc_zeros(parts * self.spec.attention.head_dim)?,
+            part_ml: self.stream.alloc_zeros(parts * 2)?,
         };
         let started = Instant::now();
         self.stream.memcpy_htod(&[0i32], &mut self.buf.count)?;

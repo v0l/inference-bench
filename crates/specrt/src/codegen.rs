@@ -6,6 +6,7 @@ pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
 pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
+pub const BATCH_DECODE_SPLITS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tile {
@@ -87,6 +88,8 @@ pub const KERNELS: &[&str] = &[
     "lm_head_mma_narrow",
     "flash_attention",
     "flash_mma",
+    "batch_decode_attention",
+    "batch_decode_combine",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -166,6 +169,7 @@ impl Module {
             ("MAX_CTX", max_ctx.to_string()),
             ("PAGE", PAGE.to_string()),
             ("Q8_GROUP", Q8_GROUP.to_string()),
+            ("BD_SPLITS", BATCH_DECODE_SPLITS.to_string()),
             ("Q_DIM", spec.q_dim().to_string()),
             ("QKV_N", (spec.q_dim() + 2 * spec.kv_dim()).to_string()),
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
