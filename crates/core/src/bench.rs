@@ -218,6 +218,7 @@ mod tests {
             first_delay_ms: 8,
             usage: Some((50, 3)),
             fail_status: None,
+            files: Default::default(),
         }
     }
 

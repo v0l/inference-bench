@@ -23,6 +23,7 @@ fn server(models: &[&str]) -> FakeServer {
         first_delay_ms: 30,
         usage: Some((12, 3)),
         fail_status: None,
+        files: Default::default(),
     })
 }
 

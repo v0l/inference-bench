@@ -167,6 +167,7 @@ mod tests {
             first_delay_ms: 20,
             usage: Some((7, 3)),
             fail_status: None,
+            files: Default::default(),
         }
     }
 
