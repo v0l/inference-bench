@@ -274,3 +274,25 @@ vLLM 0.32.0 under `nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi`, `
 | total | | 49.3 | |
 
 The gap is the GEMMs and attention. vLLM's four GEMM families (cuBLAS cutlass and nvjet on bf16 activations) take 11.8 ms for the whole prefill against 33.7 ms for specrt's four fused mma GEMMs (qkv, o, gate_up, down; 2.9x), and its FlashAttention takes 2.7 ms against 12.2 ms for `flash_mma` (4.5x). The small kernels are not the problem: vLLM spends 5.2 ms on norm, RoPE, activation and cache write, specrt 1.7 ms because it fuses norm and activation into the GEMMs, and lm_head is 1.7 ms against 2.2 ms. So the remaining work is the GEMM main loop (f32 activations converted per tile, hi/lo split doubling mma count) and the attention kernel, not fusion. Note the specrt total under nsys is 49 ms (about 21k tok/s) on the Spark, against 22 ms of vLLM kernel time; vLLM's 31 ms TTFT adds about 9 ms of scheduling and sampling around its kernels.
+
+### Closing the prefill kernel gap (issue #296)
+
+Stage 1, GEMM main loop. The activations that feed a GEMM are now written once as two bf16 planes (hi and lo, the split that keeps the 1e-3 logit gate) by the producer instead of being loaded as f32 and split inside every GEMM tile: `rms_split` (RMSNorm, replaces `row_rms` plus the norm in the A-tile load), the gate_up epilogue (activation), `flash_mma` and `batch_decode_combine`. The GEMM loads A and W with `cp.async` into one dynamic shared-memory stage, the 16-byte chunks XOR-swizzled by row (no padding), and keeps a fresh fp32 partial per k step so the error stays at the old level. The mma wrappers are generated in `codegen.rs`, which also sets the shared-memory size per kernel.
+
+Per-kernel, Qwen3-0.6B bf16, 1024-token prefill, Spark GB10, `nsys` totals over six prefills divided by six, base (e8db06c) and stage 1 run back to back:
+
+| kernel | base ms | stage 1 ms |
+|---|---|---|
+| gate_up_mma_big | 12.59 | 10.17 |
+| flash_mma | 11.65 | 11.62 |
+| qkv_mma_big | 9.12 | 6.92 |
+| down_mma_big | 6.24 | 5.46 |
+| o_mma_big | 4.53 | 4.07 |
+| lm_head_mma_tiny | 1.76 | 1.42 |
+| kv_norm_rope | 1.40 | 1.40 |
+| row_rms / rms_split + embed + argmax | 0.29 | 0.91 |
+| total | 47.6 | 42.0 |
+
+The four GEMMs go from 32.5 to 26.6 ms. ncu on the GB10: tensor pipe (hmma subpipe) active 37 to 54% in gate_up, 32 to 47% in qkv; the swizzle is what moved it (the unswizzled cp.async version was slower than base, with barrier and long scoreboard stalls from bank conflicts on the padded rows). What did not help on the GB10: 3 or 4 stages (level or slower), BK 64, 128x128 / 128x256 / 128x64 tiles (level or slower), M-fastest block order. Without the hi/lo split the GEMMs would be another 25% faster but logits miss the gate by 30x to 1000x (qwen3 0.09, geglu 0.99), and rounding activations to f16 instead of the split fails too (qwen3 0.011, geglu 0.10).
+
+Logits on both GPUs (RTX PRO 6000 sm_120 and GB10 sm_121, `SPECRT_REF_DIR=/tmp/ref273`, all 8 pass): max abs 2.0e-4 qwen3, 6.0e-4 qwen2.5, 1.9e-4 llama3.2, 6.5e-4 linear rope, 3.4e-3 geglu, 4.6e-2 tinymistral, Q8 2.26 mean 0.058. Decode on the Spark, 6 alternating runs, medians: Qwen3-0.6B 128/128 batch 1 130.5 base, 134.1 stage 1 (the runs swing 114-167 with Frigate active); batch 16 aggregate 1459 base, 1637 stage 1.
