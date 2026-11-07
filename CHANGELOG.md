@@ -6,6 +6,11 @@ All notable changes to Inference Bench are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Spec files update themselves from GitHub: the app and `inference-bench-server` check at start and every 24 hours (ETag, size caps, parse check, atomic swap), keep the last 3 generations, and work offline from the cache or the snapshot built into every release. `inference-bench specs status|update|rollback`, a "check specs now" button, spec provenance on the Models page, spec update settings with a tag pin, `/admin/specs` and two metrics. See docs/specs-update.md.
+- `min_engine` in spec files: a spec for a newer engine is listed as needing a newer inference-bench instead of failing.
+- Models and the server accept a spec name such as `qwen3-0.6b` where a spec path was needed.
+
 ## [0.1.0] - 2026-11-07
 
 ### Changed

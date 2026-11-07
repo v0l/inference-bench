@@ -49,15 +49,23 @@ slow call (disk scan, Hugging Face, model load, generation, bench, GPU poll) run
   temperature, top-p, seed and max tokens, a context bar, chat template toggle, saved conversations,
   regenerate, stop and copy. TTFT, prefill and decode tok/s sit under each reply and in the status bar
   with VRAM and GPU load (`nvidia-smi`).
-- Models: everything found in the Hugging Face cache, GGUF folders and `crates/specrt/specs`, with
+- Models: everything found in the Hugging Face cache, GGUF folders and the spec files, with
   size, architecture, quant, context length and a supported or unsupported architecture badge for
-  the native engine and for the llama.cpp and vLLM bench targets. Search and download from Hugging Face with resume, reveal in folder, delete.
+  the native engine and for the llama.cpp and vLLM bench targets. Each spec says where it came from (your folder, updated from GitHub, or built in), and "check specs now" fetches new ones. Search and download from Hugging Face with resume, reveal in folder, delete.
 - Bench: pick models, targets (the native engine and the bench targets from settings) and prompt lengths, run with live progress, results table and charts,
   compare two runs, export JSON or CSV.
 - Server: an OpenAI-compatible server (`/v1/models`, `/v1/chat/completions`, `/v1/completions`) for
   the loaded model, with port, API key, LAN toggle and a request log.
 - Settings: native engine context length, bench target URLs and API keys (`settings.json`, mode
-  0600), model folders, Hugging Face token.
+  0600), model folders, Hugging Face token, spec updates (on or off, repository, branch, tag pin, interval, your own spec folders, roll back).
+
+## Spec updates
+
+Model specs (`crates/specrt/specs/*.toml`) update themselves from this repository on GitHub, so a
+model added here after you installed shows up and runs without reinstalling. Every build carries a
+snapshot of the specs, so a first run offline works too. `inference-bench specs status`, `specs
+update` and `specs rollback` manage them from the command line. How it works, the settings and what
+goes over the network: `docs/specs-update.md`.
 
 ![chat](docs/gui/chat.png)
 ![models](docs/gui/models.png)

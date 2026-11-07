@@ -22,6 +22,7 @@ INFERENCE_BENCH_API_KEYS=sk-local ./target/release/inference-bench-server \
 | `GET /health` | Always open |
 | `GET /metrics` | Prometheus text. Open unless `protect_metrics = true` |
 | `GET /admin/models`, `POST /admin/models/{id}/load`, `POST /admin/models/{id}/unload` | Model management (needs the API key when auth is on) |
+| `GET /admin/specs` | Spec sources, the last update check and where each spec came from. See `docs/specs-update.md` |
 
 Chat requests apply the model's chat template and stop at the end-of-turn ids from generation_config. Replies stream in chunks of up to 16 decode steps. The engine runs on its own thread: a CUDA error or out of memory fails that request, and a panic unloads the model and fails the request, so the server keeps running.
 
@@ -57,7 +58,17 @@ id = "qwen3-0.6b"
 model = "specs/qwen3-0.6b.toml"
 vram_bytes = 4000000000              # used for the budget until the measured value is known
 preload = true
+
+[specs]                              # spec updates from GitHub, see docs/specs-update.md
+auto_update = true
+repo = "v0l/inference-bench"
+branch = "master"
+tag = ""                             # pin to a tag, e.g. "v0.2.0"
+update_hours = 24                    # 0 checks only at start
+folders = ["/etc/inference-bench/specs"]   # your own specs, they win over downloaded ones
 ```
+
+A model's `model` can be a spec name such as `qwen3-0.6b`: it is looked up in `[specs].folders`, then the updated cache, then the specs built into the binary.
 
 Models load on first request. A model with requests in flight is never evicted; if nothing can be evicted the request gets 503. A client that disconnects cancels its generation (queued or running). A full queue answers 429 with `Retry-After`. SIGINT and SIGTERM stop accepting connections and drain in-flight requests for up to `shutdown_grace_secs`.
 
@@ -65,7 +76,7 @@ Each model runs one request at a time on the GPU; `max_concurrent` above 1 queue
 
 ## Metrics
 
-`inference_requests_total{endpoint,status}`, `inference_prompt_tokens_total{model}`, `inference_completion_tokens_total{model}`, `inference_ttft_seconds` (histogram), `inference_decode_tokens_per_second{window="last|mean"}`, `inference_queue_depth`, `inference_in_flight`, `inference_models_loaded`, `inference_model_vram_bytes{model}`, `inference_gpu_memory_used_bytes` (from `nvidia-smi`, falling back to the CUDA driver's free/total memory where nvidia-smi reports N/A, as on the GB10), `inference_requests_cancelled_total`, and model load, failure and unload counters.
+`inference_requests_total{endpoint,status}`, `inference_prompt_tokens_total{model}`, `inference_completion_tokens_total{model}`, `inference_ttft_seconds` (histogram), `inference_decode_tokens_per_second{window="last|mean"}`, `inference_queue_depth`, `inference_in_flight`, `inference_models_loaded`, `inference_model_vram_bytes{model}`, `inference_gpu_memory_used_bytes` (from `nvidia-smi`, falling back to the CUDA driver's free/total memory where nvidia-smi reports N/A, as on the GB10), `inference_requests_cancelled_total`, model load, failure and unload counters, `inference_specs_checks_total{result="updated|unchanged|failed"}` and `inference_specs_last_success_timestamp_seconds`.
 
 ## Logging
 

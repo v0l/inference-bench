@@ -587,6 +587,69 @@ fn chat_screenshots_with_a_real_model() {
 }
 
 #[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshot_of_spec_provenance_and_update_settings() {
+    use inference_bench_core::fake::{FakeFile, tarball};
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
+    std::fs::create_dir_all(&out).unwrap();
+    let specs_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs");
+    let read = |f: &str| std::fs::read_to_string(format!("{specs_dir}/{f}")).unwrap();
+    let newer = read("qwen3-0.6b.toml").replace("name = \"qwen3-0.6b\"", "name = \"qwen3-0.6b-new\"");
+    let future = format!("min_engine = 2\n{}", read("qwen2.5-0.5b.toml").replace("name = \"qwen2.5-0.5b\"", "name = \"qwen2.5-0.5b-moe\""));
+    let gh = Script::default();
+    let server = FakeServer::start(gh.clone());
+    gh.serve_file(FakeFile {
+        path: "/v0l/inference-bench/tar.gz/refs/heads/master".into(),
+        body: tarball(
+            "inference-bench-master",
+            &[
+                ("crates/specrt/specs/qwen3-0.6b.toml", read("qwen3-0.6b.toml").as_bytes()),
+                ("crates/specrt/specs/qwen3-0.6b-new.toml", newer.as_bytes()),
+                ("crates/specrt/specs/qwen2.5-0.5b-moe.toml", future.as_bytes()),
+            ],
+            Some("5f9d34982b950f61d8f0a238aff52c4676d8b9b1"),
+        ),
+        etag: Some("\"s\"".into()),
+        status: None,
+    });
+    let d = dir("spec-shot");
+    let mine = d.join("my-specs");
+    std::fs::create_dir_all(&mine).unwrap();
+    std::fs::write(mine.join("llama.toml"), read("llama-3.2-1b.toml")).unwrap();
+    let size = egui::vec2(1280.0, 1000.0);
+    let mut h = Harness::builder().with_size(size).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        app.tab = Tab::Models;
+        app.logs = shared_logs();
+        app.specs.base = Some(server.url.clone());
+        app.settings.spec_folders = vec![mine];
+        app.models.show_all = true;
+        app
+    });
+    h.run();
+    h.get_by_label("check specs now").click();
+    pump_until(&mut h, 30, "update", |a| !a.specs.busy() && a.specs.state.last_ok);
+    pump_until(&mut h, 30, "scan", |a| !a.scan.busy() && a.library.iter().any(|m| m.name == "qwen3-0.6b-new"));
+    h.state_mut().notice = None;
+    h.state_mut().library.retain(|m| m.format == inference_bench_core::library::Format::Spec);
+    h.run();
+    let models = h.render().unwrap();
+    h.state_mut().tab = Tab::Settings;
+    h.run();
+    let mut settings_shot = None;
+    for _ in 0..3 {
+        h.run();
+        settings_shot = Some(h.render().unwrap());
+    }
+    let settings = settings_shot.unwrap();
+    let mut both = image::RgbaImage::new(models.width() + settings.width(), models.height().max(settings.height()));
+    image::imageops::overlay(&mut both, &models, 0, 0);
+    image::imageops::overlay(&mut both, &settings, models.width() as i64, 0);
+    both.save(out.join("spec-updates.png")).unwrap();
+}
+
+#[test]
 #[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
 fn screenshots_of_the_server_and_logs_tabs() {
     let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));

@@ -63,6 +63,10 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Embedded specs match the tag
+        if: runner.os == 'Linux'
+        run: cargo test --locked -p inference-bench-specrt --test spec
+
       - name: Build
         run: cargo build --release --locked --workspace --target ${{ matrix.target }}
 

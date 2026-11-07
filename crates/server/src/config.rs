@@ -333,6 +333,13 @@ python = "python3"
     }
 
     #[test]
+    fn the_packaged_example_config_parses() {
+        let c = ServerConfig::parse(include_str!("../../../packaging/server.example.toml")).unwrap();
+        assert_eq!(c.specs.data(), PathBuf::from("/var/lib/inference-bench"));
+        assert_eq!(c.model("qwen3-0.6b").unwrap().upstream_name(), "qwen3-0.6b");
+    }
+
+    #[test]
     fn the_specs_section_has_defaults_and_can_pin_a_tag() {
         let c = ServerConfig::parse("").unwrap();
         assert!(c.specs.auto_update);

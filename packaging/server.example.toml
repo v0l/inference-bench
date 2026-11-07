@@ -12,5 +12,11 @@ max_ctx = 4096
 
 [[models]]
 id = "qwen3-0.6b"
-model = "/etc/inference-bench/specs/qwen3-0.6b.toml"
+model = "qwen3-0.6b"
 preload = true
+
+[specs]
+auto_update = true
+update_hours = 24
+data_dir = "/var/lib/inference-bench"
+folders = ["/etc/inference-bench/specs"]
