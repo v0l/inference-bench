@@ -485,6 +485,48 @@ fn screenshots_with_real_data() {
 }
 
 #[test]
+#[ignore = "needs a GPU, the hub cache and a built specrt worker; run with SHOTS=dir"]
+fn chat_screenshots_with_a_real_model() {
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
+    std::fs::create_dir_all(&out).unwrap();
+    let d = dir("chat-shots");
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::new(d, wake_for(&cc.egui_ctx));
+        app.settings.specrt_worker = std::env::var("SPECRT_WORKER").unwrap_or_default();
+        app
+    });
+    pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
+    let shot = |h: &mut Harness<'static, App>, name: &str| {
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    };
+    let qwen = h.state().library.iter().find(|m| m.name == "Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
+    h.state_mut().chat.pick("Qwen3-0.6B", "specrt");
+    shot(&mut h, "chat-empty");
+    h.state_mut().load_model("specrt", &qwen);
+    pump_until(&mut h, 120, "load", |a| a.loaded().is_some());
+    {
+        let app = h.state_mut();
+        app.chat.conv().sampling.max_tokens = 700;
+        app.chat.conv().sampling.temperature = 0.0;
+        app.chat.input = "Write a Rust struct for a ring buffer with push and pop methods, then explain each method in a short paragraph.".into();
+        let (handle, d) = (app.engine.handle(), app.dir.clone());
+        app.chat.send(handle, &d);
+    }
+    pump_until(&mut h, 60, "first tokens", |a| !a.chat.streaming() || a.chat.streaming.as_ref().is_some_and(|s| s.text.len() > 300));
+    assert!(h.state().chat.error.is_none(), "{:?}", h.state().chat.error);
+    h.step();
+    h.render().unwrap().save(out.join("chat-streaming.png")).unwrap();
+    pump_until(&mut h, 120, "reply", |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= 2);
+    std::thread::sleep(Duration::from_millis(2500));
+    pump_until(&mut h, 20, "gpu", |a| !a.gpu.is_empty());
+    shot(&mut h, "chat-reply");
+    let reply = h.state_mut().chat.conv().turns[1].message.content.clone();
+    assert!(reply.contains("struct"), "{reply}");
+}
+
+#[test]
 #[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
 fn screenshots_of_the_server_and_logs_tabs() {
     let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));

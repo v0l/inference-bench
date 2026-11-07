@@ -423,12 +423,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui) {
     let used = app.chat.conv().token_estimate();
     let limit = context_limit(app);
     chat_ui::context_bar(ui, used, limit);
-    let last = app.chat.last_stats;
-    let events = chat_ui::ask_box_with(ui, &mut app.chat.input, hint, streaming, ready, |ui| {
-        if let Some(s) = &last {
-            stats_line(s).show(ui);
-        }
-    });
+    let events = chat_ui::ask_box(ui, &mut app.chat.input, hint, streaming, ready);
     for event in events {
         match event {
             chat_ui::Event::Stop => app.chat.stop(),
