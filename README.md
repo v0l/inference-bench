@@ -20,6 +20,8 @@ error on that request instead of taking the app down.
 Other engines (llama.cpp, vLLM, LM Studio, any OpenAI-compatible server) are only benchmark targets,
 for comparing their speed with ours. They are never used for chat, the library or the server.
 
+The name `specrt` is kept on purpose, even though it is the only engine the app runs. It names the spec-driven design and appears in saved results, the `specrt_ctx` setting and docs/spark-matrix.md, so renaming would break result history and old settings for no visible gain. Revisit only if the engine stops being spec-driven; the plan then is crate `inference-bench-engine`, a serde alias for `specrt_ctx` and `specrt` accepted as an alias in stored results.
+
 ## Command line
 
 ```
