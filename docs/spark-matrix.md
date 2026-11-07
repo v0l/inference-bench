@@ -345,3 +345,7 @@ Prefill tok/s from `bench`, medians of 6 runs alternating base (e8db06c) and fin
 Decode, Qwen3-0.6B 128-token prompt, 128 new, 6 alternating runs, medians: batch 1 167.2 base, 166.8 final; batch 4 aggregate 482 base, 565 final; batch 16 aggregate 1456 base, 1637 final. At a 2048-token context batch 1 decode is 124.0 base, 124.3 final. On the RTX PRO 6000 (shared with a vLLM process) the 1024 prefill goes 22.9k to 31.1k tok/s and decode is level (417 vs 416).
 
 The 1024-token kernel time is 37.6 ms against the 26 ms target: not reached. The gap is the hi/lo split in the GEMMs (about 7 ms, needed for the gate) plus the remaining GEMM and attention kernel efficiency.
+
+#### Issue #305 follow-up
+
+Register double buffering of the GEMM fragments (ldmatrix for k step n+1 issued before the mma of step n, two fragment sets) was tried on the RTX PRO 6000 (nsys, same session, against the unmodified kernel): gate_up 6.9 vs 6.1 ms, qkv 4.55 vs 4.03, down 6.0 vs 6.4, o 2.83 vs 3.17 per six calls. Level or slower overall, so it is not kept; the compiler already hoists the fragment loads across the unrolled k steps. The remaining 11 ms to the 26 ms target needs either a looser logit gate (bf16 activations in the linears, about 7 ms; one-term attention, about 2 ms) or a different GEMM structure (persistent scheduler, larger warp tiles), neither of which fits the 1e-3 fp32 gate as it stands.
