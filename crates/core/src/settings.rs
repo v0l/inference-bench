@@ -42,6 +42,34 @@ pub struct Settings {
     pub specrt_ctx: usize,
     #[serde(default)]
     pub hf_token: String,
+    #[serde(default)]
+    pub spec_folders: Vec<PathBuf>,
+    #[serde(default = "yes")]
+    pub specs_auto_update: bool,
+    #[serde(default = "default_specs_repo")]
+    pub specs_repo: String,
+    #[serde(default = "default_specs_branch")]
+    pub specs_branch: String,
+    #[serde(default)]
+    pub specs_tag: String,
+    #[serde(default = "default_specs_hours")]
+    pub specs_update_hours: u64,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_specs_repo() -> String {
+    crate::specs::DEFAULT_REPO.into()
+}
+
+fn default_specs_branch() -> String {
+    crate::specs::DEFAULT_BRANCH.into()
+}
+
+fn default_specs_hours() -> u64 {
+    crate::specs::DEFAULT_HOURS
 }
 
 fn default_ctx() -> usize {
@@ -59,6 +87,12 @@ impl Default for Settings {
             server: ServerSettings::default(),
             specrt_ctx: default_ctx(),
             hf_token: String::new(),
+            spec_folders: Vec::new(),
+            specs_auto_update: true,
+            specs_repo: default_specs_repo(),
+            specs_branch: default_specs_branch(),
+            specs_tag: String::new(),
+            specs_update_hours: default_specs_hours(),
         }
     }
 }
@@ -104,6 +138,17 @@ impl Settings {
 
     pub fn native(&self) -> TargetConfig {
         TargetConfig::native(Some(self.specrt_ctx))
+    }
+
+    pub fn specs(&self) -> crate::specs::SpecsConfig {
+        crate::specs::SpecsConfig {
+            auto_update: self.specs_auto_update,
+            repo: self.specs_repo.clone(),
+            branch: self.specs_branch.clone(),
+            tag: self.specs_tag.clone(),
+            update_hours: self.specs_update_hours,
+            ..crate::specs::SpecsConfig::default()
+        }
     }
 
     pub fn bench_targets(&self) -> Vec<String> {
@@ -195,5 +240,19 @@ mod tests {
         assert_eq!((s.specrt_ctx, s.server.port, s.hf_token.as_str()), (4096, 9000, "hf_x"));
         assert_eq!(s.model_folders, vec![PathBuf::from("/models")]);
         assert_eq!(s.native(), TargetConfig::native(Some(4096)));
+        let specs = s.specs();
+        assert!(specs.auto_update);
+        assert_eq!((specs.repo.as_str(), specs.branch.as_str(), specs.update_hours), ("v0l/inference-bench", "master", 24));
+        assert!(s.spec_folders.is_empty());
+    }
+
+    #[test]
+    fn spec_update_settings_round_trip() {
+        let s = Settings::parse(r#"{"specs_auto_update": false, "specs_tag": "v0.2.0", "specs_update_hours": 0, "spec_folders": ["/mine"]}"#);
+        let c = s.specs();
+        assert!(!c.auto_update);
+        assert_eq!(c.source(), "v0l/inference-bench@v0.2.0");
+        assert_eq!(c.interval(), None);
+        assert_eq!(s.spec_folders, vec![PathBuf::from("/mine")]);
     }
 }

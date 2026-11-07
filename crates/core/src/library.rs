@@ -1,3 +1,4 @@
+use crate::specs::{self, SpecDir, SpecOrigin};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -54,6 +55,7 @@ pub struct LocalModel {
     pub context_length: Option<u64>,
     pub files: Vec<PathBuf>,
     pub support: Vec<Support>,
+    pub origin: Option<SpecOrigin>,
 }
 
 impl LocalModel {
@@ -390,6 +392,7 @@ fn gguf_models(dir: &Path, repo: &str, root: &Path, found: &mut Vec<LocalModel>)
             support: support_for_gguf(&h.architecture),
             architecture: h.architecture,
             files: shards,
+            origin: None,
         });
     }
 }
@@ -448,6 +451,7 @@ fn safetensors_model(dir: &Path, repo: &str, root: &Path) -> Option<LocalModel> 
         quant,
         context_length: cfg["max_position_embeddings"].as_u64(),
         files,
+        origin: None,
     })
 }
 
@@ -498,83 +502,69 @@ pub fn scan_folder(folder: &Path) -> Vec<LocalModel> {
     found
 }
 
-pub fn scan_specs(dir: &Path, hub: &Path) -> Vec<LocalModel> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
-    let mut paths: Vec<PathBuf> =
-        entries.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "toml")).collect();
-    paths.sort();
-    let mut found = Vec::new();
-    for path in paths {
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let Ok(spec) = toml::from_str::<toml::Value>(&text) else { continue };
-        let Some(name) = spec.get("name").and_then(|v| v.as_str()) else { continue };
-        let repo = spec.get("repo").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let quant = spec.get("quant").and_then(|v| v.as_str()).unwrap_or("bf16").to_uppercase();
-        let weights = hub.join(format!("models--{}", repo.replace('/', "--")));
-        let mut files = Vec::new();
-        for snap in newest_snapshot(&weights.join("snapshots")) {
-            collect(&snap, 0, &mut |p| p.extension().is_some_and(|e| e == "safetensors"), &mut files);
-            if !files.is_empty() {
-                break;
-            }
+fn spec_model(listed: &specs::Listed, hub: &Path) -> LocalModel {
+    let spec = &listed.table;
+    let repo = spec.get("repo").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let quant = spec.get("quant").and_then(|v| v.as_str()).unwrap_or("bf16").to_uppercase();
+    let weights = hub.join(format!("models--{}", repo.replace('/', "--")));
+    let mut files = Vec::new();
+    for snap in newest_snapshot(&weights.join("snapshots")) {
+        collect(&snap, 0, &mut |p| p.extension().is_some_and(|e| e == "safetensors"), &mut files);
+        if !files.is_empty() {
+            break;
         }
-        let present = !files.is_empty();
-        let layers = spec.get("layers").and_then(|l| l.get("count")).and_then(|c| c.as_integer());
-        found.push(LocalModel {
-            name: name.to_string(),
-            repo,
-            path: path.clone(),
-            root: dir.to_path_buf(),
-            format: Format::Spec,
-            size_bytes: dir_size(&files),
-            architecture: format!("spec, {} layers", layers.unwrap_or(0)),
-            quant,
-            context_length: None,
-            support: vec![
-                if present {
-                    Support::yes("specrt", "spec file, weights in the hub cache")
-                } else {
-                    Support::no("specrt", "weights are not in the hub cache")
-                },
-                Support::no("llama.cpp", "spec files are specrt only"),
-                Support::no("vllm", "spec files are specrt only"),
-            ],
-            files,
-        });
     }
-    found
+    let present = !files.is_empty();
+    let layers = spec.get("layers").and_then(|l| l.get("count")).and_then(|c| c.as_integer());
+    let specrt = match (&listed.problem, present) {
+        (Some(problem), _) => Support::no("specrt", problem.clone()),
+        (None, true) => Support::yes("specrt", "spec file, weights in the hub cache"),
+        (None, false) => Support::no("specrt", "weights are not in the hub cache"),
+    };
+    LocalModel {
+        name: listed.name.clone(),
+        repo,
+        path: listed.path.clone(),
+        root: listed.dir.clone(),
+        format: Format::Spec,
+        size_bytes: dir_size(&files),
+        architecture: format!("spec, {} layers", layers.unwrap_or(0)),
+        quant,
+        context_length: None,
+        support: vec![
+            specrt,
+            Support::no("llama.cpp", "spec files are specrt only"),
+            Support::no("vllm", "spec files are specrt only"),
+        ],
+        files,
+        origin: Some(listed.origin.clone()),
+    }
 }
 
-pub fn default_specs_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs"))];
-    if let Ok(exe) = std::env::current_exe() {
-        for ancestor in exe.ancestors().take(5) {
-            dirs.push(ancestor.join("crates/specrt/specs"));
-            dirs.push(ancestor.join("specs"));
-        }
-    }
-    dirs.push(PathBuf::from("crates/specrt/specs"));
-    dirs.into_iter().filter(|d| d.is_dir()).collect()
+pub fn spec_models(layers: &[SpecDir], hub: &Path) -> Vec<LocalModel> {
+    specs::list(layers).iter().map(|l| spec_model(l, hub)).collect()
+}
+
+pub fn scan_specs(dir: &Path, hub: &Path) -> Vec<LocalModel> {
+    spec_models(&[SpecDir { path: dir.to_path_buf(), origin: SpecOrigin::Folder }], hub)
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Sources {
     pub hub: PathBuf,
     pub folders: Vec<PathBuf>,
-    pub specs: Vec<PathBuf>,
+    pub specs: Vec<SpecDir>,
 }
 
 impl Sources {
-    pub fn standard(folders: &[PathBuf]) -> Self {
-        Self { hub: hub_dir(), folders: folders.to_vec(), specs: default_specs_dirs() }
+    pub fn standard(data: &Path, folders: &[PathBuf], spec_folders: &[PathBuf]) -> Self {
+        Self { hub: hub_dir(), folders: folders.to_vec(), specs: specs::standard_layers(data, spec_folders) }
     }
 }
 
 pub fn scan(sources: &Sources) -> Vec<LocalModel> {
     let mut all = scan_hub(&sources.hub);
-    for dir in &sources.specs {
-        all.extend(scan_specs(dir, &sources.hub));
-    }
+    all.extend(spec_models(&sources.specs, &sources.hub));
     for folder in &sources.folders {
         all.extend(scan_folder(folder));
     }
@@ -583,7 +573,14 @@ pub fn scan(sources: &Sources) -> Vec<LocalModel> {
     all
 }
 
+pub fn deletable(model: &LocalModel) -> bool {
+    model.format != Format::Spec || model.origin == Some(SpecOrigin::Folder)
+}
+
 pub fn delete(model: &LocalModel) -> std::io::Result<()> {
+    if !deletable(model) {
+        return Err(std::io::Error::other("this spec is managed by inference-bench: turn off spec updates or add your own folder instead"));
+    }
     match model.format {
         Format::Spec => std::fs::remove_file(&model.path),
         _ if model.root.join("snapshots").is_dir() || model.root.file_name().is_some_and(|n| n.to_string_lossy().starts_with("models--")) => {
@@ -743,14 +740,40 @@ mod tests {
         let hub = temp("spechub");
         hf_model(&hub, "Qwen/Qwen3-0.6B", r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#);
         let specs = temp("specs");
-        std::fs::write(specs.join("a.toml"), "name = \"qwen3-0.6b\"\nrepo = \"Qwen/Qwen3-0.6B\"\nquant = \"bf16\"\n[layers]\ncount = 28\n").unwrap();
-        std::fs::write(specs.join("b.toml"), "name = \"missing\"\nrepo = \"x/y\"\n").unwrap();
+        let real = specrt::spec::EMBEDDED.iter().find(|(n, _)| *n == "qwen3-0.6b.toml").unwrap().1;
+        std::fs::write(specs.join("a.toml"), real).unwrap();
+        std::fs::write(specs.join("b.toml"), real.replace("qwen3-0.6b", "missing").replace("Qwen/Qwen3-0.6B", "x/y")).unwrap();
+        std::fs::write(specs.join("c.toml"), "name = \"half\"\nrepo = \"Qwen/Qwen3-0.6B\"\n").unwrap();
         let found = scan_specs(&specs, &hub);
-        assert_eq!(found.len(), 2);
+        assert_eq!(found.len(), 3);
         assert!(found[0].support_for("specrt").unwrap().supported);
         assert!(!found[1].support_for("specrt").unwrap().supported);
+        assert!(found[2].support_for("specrt").unwrap().reason.starts_with("spec does not parse"));
         assert_eq!(found[0].architecture, "spec, 28 layers");
         assert_eq!(found[0].model_id("specrt"), specs.join("a.toml").display().to_string());
+        assert_eq!(found[0].origin, Some(SpecOrigin::Folder));
+    }
+
+    #[test]
+    fn a_spec_for_a_newer_engine_says_so_and_managed_specs_cannot_be_deleted() {
+        let hub = temp("newerhub");
+        hf_model(&hub, "Qwen/Qwen3-0.6B", r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3"}"#);
+        let data = temp("newerdata");
+        let mine = data.join("mine");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(mine.join("f.toml"), "min_engine = 50\nname = \"future-moe\"\nrepo = \"Qwen/Qwen3-0.6B\"\n[moe]\nexperts = 8\n").unwrap();
+        let sources = Sources { hub: hub.clone(), folders: vec![], specs: specs::layers(&specs::SpecStore::new(&data), &[mine], &[]) };
+        let all = scan(&sources);
+        let future = all.iter().find(|m| m.name == "future-moe").unwrap();
+        let s = future.support_for("specrt").unwrap();
+        assert!(!s.supported && s.reason.starts_with("needs a newer inference-bench"), "{}", s.reason);
+        assert!(deletable(future));
+        let embedded = all.iter().find(|m| m.name == "qwen3-0.6b").unwrap();
+        assert_eq!(embedded.origin, Some(SpecOrigin::Embedded));
+        assert!(embedded.support_for("specrt").unwrap().supported);
+        assert!(!deletable(embedded));
+        assert!(delete(embedded).is_err());
+        assert!(embedded.path.exists());
     }
 
     #[test]

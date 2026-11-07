@@ -29,6 +29,7 @@ fn model(name: &str, specrt: bool, reason: &str) -> LocalModel {
             Support { backend: "llama.cpp", supported: false, reason: "needs a GGUF conversion".into() },
             Support { backend: "vllm", supported: true, reason: "registered".into() },
         ],
+        origin: None,
     }
 }
 

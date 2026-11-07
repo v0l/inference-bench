@@ -347,6 +347,11 @@ fn stamp(now: DateTime<Utc>) -> String {
     now.format("%Y%m%dT%H%M%S%3f").to_string()
 }
 
+pub fn refresh_if_due(data: &Path, cfg: &SpecsConfig) -> Option<Result<Outcome>> {
+    let store = SpecStore::new(data);
+    store.due(cfg, Utc::now()).then(|| store.update(cfg))
+}
+
 pub struct SpecStore {
     root: PathBuf,
 }

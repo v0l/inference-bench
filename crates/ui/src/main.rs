@@ -85,7 +85,7 @@ impl App {
     }
 
     pub fn rescan(&mut self) {
-        let sources = Sources::standard(&self.settings.model_folders);
+        let sources = Sources::standard(&self.dir, &self.settings.model_folders, &self.settings.spec_folders);
         self.scan.start(job::spawn(&self.wake, move || inference_bench_core::library::scan(&sources)));
     }
 
