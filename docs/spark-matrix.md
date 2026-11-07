@@ -296,3 +296,18 @@ Per-kernel, Qwen3-0.6B bf16, 1024-token prefill, Spark GB10, `nsys` totals over 
 The four GEMMs go from 32.5 to 26.6 ms. ncu on the GB10: tensor pipe (hmma subpipe) active 37 to 54% in gate_up, 32 to 47% in qkv; the swizzle is what moved it (the unswizzled cp.async version was slower than base, with barrier and long scoreboard stalls from bank conflicts on the padded rows). What did not help on the GB10: 3 or 4 stages (level or slower), BK 64, 128x128 / 128x256 / 128x64 tiles (level or slower), M-fastest block order. Without the hi/lo split the GEMMs would be another 25% faster but logits miss the gate by 30x to 1000x (qwen3 0.09, geglu 0.99), and rounding activations to f16 instead of the split fails too (qwen3 0.011, geglu 0.10).
 
 Logits on both GPUs (RTX PRO 6000 sm_120 and GB10 sm_121, `SPECRT_REF_DIR=/tmp/ref273`, all 8 pass): max abs 2.0e-4 qwen3, 6.0e-4 qwen2.5, 1.9e-4 llama3.2, 6.5e-4 linear rope, 3.4e-3 geglu, 4.6e-2 tinymistral, Q8 2.26 mean 0.058. Decode on the Spark, 6 alternating runs, medians: Qwen3-0.6B 128/128 batch 1 130.5 base, 134.1 stage 1 (the runs swing 114-167 with Frigate active); batch 16 aggregate 1459 base, 1637 stage 1.
+
+Stage 2, attention. The KV cache now stores each row as an f16 hi plane and an f16 lo plane (same bytes as the f32 row it replaces), written once by `kv_norm_rope` / `qk_norm_rope`, so `flash_mma` loads K and V with swizzled `cp.async` (double buffered) instead of converting f32 per tile. Q and P are split into f16 hi/lo in registers, and each product runs three mma (hi x hi, hi x lo, lo x hi; lo x lo dropped). f16 hi/lo carries 22 mantissa bits against 16 for bf16 hi/lo, so the three-term f16 product is more precise than the old four-term bf16 one: geglu max abs 3.4e-3 to 1.3e-3. 128 query rows per block (8 warps) instead of 64, softmax in base 2 with `ex2.approx`, the Q RoPE once per pair with `sincosf`, and warps whose rows are all before a key tile skip it. The decode attention kernels read the same planes.
+
+What was measured on the way (Spark, min of 4 alternating nsys runs): bf16 planes with all four terms 12.3 ms; f16 four terms 11.0; f16 three terms 11.0 at 4 warps, 8.9 at 8 warps; plus `ex2` and the RoPE rewrite 7.4. Dropping more terms is faster (one term 5.3 ms) but fails the gate (bf16 one term: qwen3 0.12, geglu 3.5; f16 two terms: qwen3 0.008-0.012, geglu 0.1-0.5). 64-key tiles do not fit the shared memory at 128 rows, 16-key tiles are slower (8.0), a third cp.async stage is level.
+
+| kernel | base ms | stage 1 ms | stage 2 ms |
+|---|---|---|---|
+| flash_mma | 11.71 | 11.70 | 7.39 |
+| gate_up_mma_big | 12.94 | 10.08 | 10.36 |
+| qkv_mma_big | 9.23 | 7.20 | 7.19 |
+| down_mma_big | 6.30 | 5.41 | 5.42 |
+| o_mma_big | 4.49 | 4.11 | 4.02 |
+| total | 48.2 | 42.4 | 38.4 |
+
+(min of 4 alternating runs, Qwen3-0.6B 1024 tokens, Spark.) Logits after stage 2, both GPUs, all 8 pass: qwen3 1.9e-4, qwen2.5 6.1e-4, llama3.2 1.2e-4, linear rope 6.1e-4, geglu 1.3e-3, tinymistral 4.6e-2, Q8 2.27 mean 0.057.
