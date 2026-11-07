@@ -1,5 +1,7 @@
 # Spark matrix
 
+Historical record: llama.cpp and vLLM were measured with their own servers at the time, through the old `--backend` and `--worker` flags; today they are reached with `inference-bench bench --target openai:URL` and the scripts below need that change to rerun.
+
 Two backends on two models, run on the DGX Spark (GB10) with `inference-bench matrix`.
 128-token completions of the fixed prompt in `spark-run/matrix.toml`, greedy, bf16 weights.
 llama.cpp is `7bd8282c3` serving GGUFs converted from the same safetensors, specrt is `crates/specrt`.

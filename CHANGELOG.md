@@ -6,6 +6,9 @@ All notable changes to Inference Bench are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- Models run on the native engine in process, on a dedicated thread with cancel and panic containment; the `inference-bench-specrt` worker binary is gone. Other engines are benchmark targets only (`bench --target openai:URL`), and the transformers backend is removed. Old settings and server configs with backend entries still load.
+
 ### Added
 - `run`, `matrix`, `logit-diff` and `results` commands, with results saved as JSON.
 - OpenAI-compatible, `transformers` and specrt backends.

@@ -1,9 +1,9 @@
 # Server
 
-`inference-bench-server` is a headless OpenAI-compatible HTTP server. It has no egui or wgpu dependencies, so it builds on a GPU box without a display. The same library (`crates/server`) backs the `inference-bench serve` subcommand and the GUI Server tab.
+`inference-bench-server` is a headless OpenAI-compatible HTTP server for the native engine: every model it serves runs on `specrt` in the server process. It has no egui or wgpu dependencies, so it builds on a GPU box without a display. The same library (`crates/server`) backs the `inference-bench serve` subcommand and the GUI Server tab.
 
 ```sh
-cargo build --release -p inference-bench-server -p inference-bench-specrt
+cargo build --release -p inference-bench-server
 INFERENCE_BENCH_API_KEYS=sk-local ./target/release/inference-bench-server \
     --model crates/specrt/specs/qwen3-0.6b.toml --bind 127.0.0.1:8080
 ```
@@ -17,19 +17,19 @@ INFERENCE_BENCH_API_KEYS=sk-local ./target/release/inference-bench-server \
 | `GET /v1/models` | Configured models, with a `loaded` flag |
 | `POST /v1/chat/completions` | Stream (SSE, `stream_options.include_usage`) and non-stream |
 | `POST /v1/completions` | Stream and non-stream |
-| `POST /v1/embeddings` | 501: no configured backend supports embeddings |
+| `POST /v1/embeddings` | 501: the engine has no embeddings |
 | `POST /v1/bench` | `{"model", "prompts": [...], "max_tokens", "repeat"}` returns per-run and summary stats (tokens/s, TTFT and decode p50/p95) |
 | `GET /health` | Always open |
 | `GET /metrics` | Prometheus text. Open unless `protect_metrics = true` |
 | `GET /admin/models`, `POST /admin/models/{id}/load`, `POST /admin/models/{id}/unload` | Model management (needs the API key when auth is on) |
 
-Chat requests go through the backend `chat` method, so specrt applies the model's chat template and stops at the end-of-turn token. Both specrt and `openai` upstream backends stream token by token (specrt in chunks of up to 16 decode steps), stopping at the end-of-turn ids from generation_config.
+Chat requests apply the model's chat template and stop at the end-of-turn ids from generation_config. Replies stream in chunks of up to 16 decode steps. The engine runs on its own thread: a CUDA error or out of memory fails that request, and a panic unloads the model and fails the request, so the server keeps running.
 
 Every response carries `x-request-id` (a client supplied one is kept). Errors use the OpenAI shape `{"error": {"message", "type", "param", "code"}}`.
 
 ## Config
 
-Pass `--config server.toml` (see `packaging/server.example.toml`). Unknown keys are rejected.
+Pass `--config server.toml` (see `packaging/server.example.toml`). Unknown keys are rejected. Older configs with `[default_backend]` or `[models.backend]` tables still load: a `specrt` table gives its `max_ctx`, and a model on another engine is dropped with a warning in the log.
 
 ```toml
 bind = "127.0.0.1:8080"
@@ -50,26 +50,18 @@ default_max_tokens = 256
 shutdown_grace_secs = 30
 access_log = "/var/log/inference-bench/access.log"
 log_prompts = false
-
-[default_backend]                    # specrt, transformers or openai (llama.cpp, vLLM, Ollama proxy)
-kind = "specrt"
+max_ctx = 4096                       # context the engine allocates, per model with max_ctx
 
 [[models]]
 id = "qwen3-0.6b"
 model = "specs/qwen3-0.6b.toml"
 vram_bytes = 4000000000              # used for the budget until the measured value is known
 preload = true
-
-[[models]]
-id = "llama"
-[models.backend]
-kind = "openai"
-url = "http://127.0.0.1:8081"
 ```
 
 Models load on first request. A model with requests in flight is never evicted; if nothing can be evicted the request gets 503. A client that disconnects cancels its generation (queued or running). A full queue answers 429 with `Retry-After`. SIGINT and SIGTERM stop accepting connections and drain in-flight requests for up to `shutdown_grace_secs`.
 
-For a `specrt` model `max_concurrent` above 1 queues requests on the single GPU worker; for `openai` upstreams each slot gets its own connection.
+Each model runs one request at a time on the GPU; `max_concurrent` above 1 queues the rest.
 
 ## Metrics
 
@@ -97,4 +89,4 @@ The GUI Server tab runs this same library in-process over the loaded model, and 
 
 ## Spark run (Qwen3-0.6B, specrt, GB10)
 
-16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 143.2 tokens/s aggregate, p50 3.5 s, p95 6.5 s (requests queue behind one GPU worker; latency is queue wait). A streamed reply arrives as 9 chunks, first at 0.03 s and last at 0.73 s. Loaded model VRAM reads 3.9 GB, device used 99 GB.
+16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 143.2 tokens/s aggregate, p50 3.5 s, p95 6.5 s (requests queue behind the one engine; latency is queue wait). A streamed reply arrives as 9 chunks, first at 0.03 s and last at 0.73 s. Loaded model VRAM reads 3.9 GB, device used 99 GB.

@@ -8,17 +8,9 @@ max_loaded_models = 1
 default_model = "qwen3-0.6b"
 access_log = "/var/log/inference-bench/access.log"
 
-[default_backend]
-kind = "specrt"
 max_ctx = 4096
 
 [[models]]
 id = "qwen3-0.6b"
 model = "/etc/inference-bench/specs/qwen3-0.6b.toml"
 preload = true
-
-[[models]]
-id = "llama-upstream"
-[models.backend]
-kind = "openai"
-url = "http://127.0.0.1:8081"
