@@ -726,7 +726,7 @@ impl Runtime {
         new_tokens: usize,
         sampling: Sampling,
     ) -> Result<Generation> {
-        self.generate_until(prompt, new_tokens, sampling, &[], &mut |_| {})
+        self.generate_with(prompt, new_tokens, sampling, &[], false, &mut |_| true)
     }
 
     pub fn generate_until(
@@ -735,7 +735,19 @@ impl Runtime {
         new_tokens: usize,
         sampling: Sampling,
         stop: &[u32],
-        on_tokens: &mut dyn FnMut(&[u32]),
+        on_tokens: &mut dyn FnMut(&[u32]) -> bool,
+    ) -> Result<Generation> {
+        self.generate_with(prompt, new_tokens, sampling, stop, true, on_tokens)
+    }
+
+    pub fn generate_with(
+        &mut self,
+        prompt: &[u32],
+        new_tokens: usize,
+        sampling: Sampling,
+        stop: &[u32],
+        chunked: bool,
+        on_tokens: &mut dyn FnMut(&[u32]) -> bool,
     ) -> Result<Generation> {
         ensure!(!prompt.is_empty() && new_tokens > 0, "empty prompt or nothing to generate");
         ensure!(
@@ -760,19 +772,16 @@ impl Runtime {
             let seen = self.stream.clone_dtoh(&self.buf.history.slice(..made))?;
             tokens = seen.iter().map(|&t| t as u32).collect();
             let (kept, stopped) = cut_at_stop(&tokens, stop);
+            let mut wanted = true;
             if kept > shown {
-                on_tokens(&tokens[shown..kept]);
+                wanted = on_tokens(&tokens[shown..kept]);
                 shown = kept;
             }
-            if stopped || made >= new_tokens {
+            if stopped || !wanted || made >= new_tokens {
                 tokens.truncate(kept);
                 break;
             }
-            let step = if stop.is_empty() {
-                new_tokens - made
-            } else {
-                DECODE_CHUNK.min(new_tokens - made)
-            };
+            let step = if chunked { DECODE_CHUNK.min(new_tokens - made) } else { new_tokens - made };
             for _ in 0..step {
                 graph.launch()?;
             }

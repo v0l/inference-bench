@@ -1,5 +1,6 @@
 use specrt::runtime::{Runtime, Sampling};
 use specrt::spec::Spec;
+use serde_json::json;
 use std::path::Path;
 
 fn spec() -> Spec {
@@ -63,30 +64,51 @@ fn contexts_above_4096_generate_and_match_the_short_context_path() {
 #[test]
 #[ignore = "needs a CUDA GPU and the HF weights"]
 fn a_chat_reply_stops_at_the_end_of_turn_and_streams_in_pieces() {
-    let input = concat!(
-        r#"{"op":"load","model":"Qwen/Qwen3-0.6B","max_ctx":2048}"#,
-        "\n",
-        r#"{"op":"chat","messages":[{"role":"user","content":"Say hello in five words."}],"max_tokens":400}"#,
-        "\n",
-        r#"{"op":"chat","messages":[{"role":"user","content":"Say hello in five words."},{"role":"assistant","content":"Hello there, how are you?"},{"role":"user","content":"Now say goodbye."}],"max_tokens":400}"#,
-        "\n",
-        r#"{"op":"quit"}"#,
-        "\n"
-    );
-    let mut out = Vec::new();
-    specrt::worker::run(input.as_bytes(), &mut out).unwrap();
-    let events: Vec<serde_json::Value> =
-        String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    let dones: Vec<&serde_json::Value> = events.iter().filter(|e| e["event"] == "done").collect();
-    assert_eq!(dones.len(), 2, "{events:?}");
-    for d in dones {
-        let g = &d["generation"];
-        let text = g["text"].as_str().unwrap();
-        assert!(g["completion_tokens"].as_u64().unwrap() < 400, "never stopped: {text}");
+    let mut engine = specrt::Engine::load("Qwen/Qwen3-0.6B", Some(2048)).unwrap();
+    let turns = [
+        json!([{"role": "user", "content": "Say hello in five words."}]),
+        json!([
+            {"role": "user", "content": "Say hello in five words."},
+            {"role": "assistant", "content": "Hello there, how are you?"},
+            {"role": "user", "content": "Now say goodbye."}
+        ]),
+    ];
+    let mut pieces = 0;
+    for messages in turns {
+        let reply = engine
+            .chat(messages.as_array().unwrap(), true, 400, Sampling::GREEDY, &mut |_| {
+                pieces += 1;
+                true
+            })
+            .unwrap();
+        assert!(reply.completion_tokens < 400, "never stopped: {}", reply.text);
         for leak in ["Human:", "User:", "<|im_start|>", "<|im_end|>"] {
-            assert!(!text.contains(leak), "{leak} in {text}");
+            assert!(!reply.text.contains(leak), "{leak} in {}", reply.text);
         }
     }
-    let pieces = events.iter().filter(|e| e["event"] == "text").count();
-    assert!(pieces > 2, "the reply arrived as {pieces} pieces");
+    assert!(pieces > 2, "the replies arrived as {pieces} pieces");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and the HF weights"]
+fn a_callback_returning_false_stops_the_stream() {
+    let mut engine = specrt::Engine::load("Qwen/Qwen3-0.6B", Some(2048)).unwrap();
+    let messages = json!([{"role": "user", "content": "Count from one to two hundred in words."}]);
+    let mut pieces = 0;
+    let reply = engine
+        .chat(messages.as_array().unwrap(), true, 1000, Sampling::GREEDY, &mut |_| {
+            pieces += 1;
+            pieces < 3
+        })
+        .unwrap();
+    assert!(reply.completion_tokens < 100, "kept going for {} tokens", reply.completion_tokens);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and the HF weights"]
+fn a_context_too_large_for_the_device_is_an_error_not_an_abort() {
+    let oom = Runtime::load(&spec(), 1 << 23).err().expect("an 8M token KV cache cannot fit");
+    assert!(format!("{oom:#}").to_lowercase().contains("memory"), "{oom:#}");
+    let mut engine = specrt::Engine::load("Qwen/Qwen3-0.6B", Some(256)).unwrap();
+    assert!(engine.generate("hello", 8, Sampling::GREEDY).is_ok());
 }
