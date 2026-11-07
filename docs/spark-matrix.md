@@ -231,3 +231,11 @@ Same session, alternating order rotated per round, `drop_caches` before every ru
 | Qwen2.5-0.5B | 16 | 1044.2 | 651.7 | 816.3 | 1066.2 | 1.64 | 1.02 |
 
 specrt gained 18-31% over the per-sequence kernel and is ahead of llama.cpp at both batch sizes, at the vLLM level except Qwen3-0.6B at batch 16 (0.90). The llama.cpp numbers fall further than specrt's under the contended GPU, so its ratio here flatters specrt against the idle-GPU #265 figures (llama-batched-bench 1682 and 2722 at batch 16, which specrt's idle-GPU gain from 1220 and 1744 has not been re-measured against).
+
+## specrt worker overhead at 1024 tokens (issue #274)
+
+The HTTP number sat at 0.71-0.74 of `bench` because the HTTP prompt is the synthetic 1024 tokens plus the chat template, which lands just over 1024 tokens and split into a 1024-token chunk plus a tiny second chunk. Prefill cost per chunk is a full pass over the weights, so 1040 tokens ran at 19.1k tok/s against 27.3k for 1024 (RTX PRO 6000, Qwen3-0.6B, `bench`). `PREFILL_CHUNK` is now 2048 (still bounded by the score budget and `max_ctx`), so a prompt of up to 2048 tokens is one pass.
+
+Worker, through the JSON protocol with a 1044-token prompt (Qwen3-0.6B, RTX PRO 6000, medians of 7): worker prefill 59-62 ms before, 38 ms after; first streamed text 62-65 ms before, 41.5 ms after. Qwen2.5-0.5B after: 23-26 ms prefill, 27-30 ms first text. Tokenising and the first text decode add about 3.5 ms (under 10% of the prefill). The 1044 token prompt now runs at about 27k tok/s, matching `bench` at 1024.
+
+The vLLM per-kernel nsys comparison needs the Spark with vLLM installed; neither exists on this machine, so the kernel gap analysis from #247 stands.

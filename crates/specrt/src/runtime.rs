@@ -128,7 +128,7 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 }
 
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
-const PREFILL_CHUNK: usize = 1024;
+const PREFILL_CHUNK: usize = 2048;
 const SHARED_SCORES_MAX_CTX: usize = 4096;
 const SCORE_BUDGET_FLOATS: usize = 1 << 26;
 const ATTN_SPLITS: usize = 64;
