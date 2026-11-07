@@ -7,6 +7,9 @@ pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
 pub const BATCH_DECODE_SPLITS: usize = 8;
+pub const FLASH_ROWS: usize = 128;
+const FLASH_KEYS: usize = 32;
+const FLASH_STAGES: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tile {
@@ -236,6 +239,9 @@ impl Module {
         };
         let mut smem = BTreeMap::new();
         let mma = mma_kernels(spec, &mut smem);
+        let kv_bytes = FLASH_STAGES * 4 * FLASH_KEYS * a.head_dim * 2;
+        let q_bytes = FLASH_ROWS * a.head_dim * 4;
+        smem.insert("flash_mma", kv_bytes.max(q_bytes) as u32);
         let vars: BTreeMap<&str, String> = [
             ("HIDDEN", d.hidden.to_string()),
             ("INTER", d.intermediate.to_string()),
@@ -264,6 +270,10 @@ impl Module {
             ("LINEAR", linear.to_string()),
             ("Q8", (spec.quant == Quant::Q8).to_string()),
             ("MMA_KERNELS", mma),
+            ("FM_STAGES", FLASH_STAGES.to_string()),
+            ("FM_BK", FLASH_KEYS.to_string()),
+            ("FM_WARPS", (FLASH_ROWS / 16).to_string()),
+            ("FM_SMEM", kv_bytes.max(q_bytes).to_string()),
         ]
         .into_iter()
         .collect();

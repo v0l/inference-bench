@@ -600,8 +600,57 @@ __device__ __forceinline__ float rope_inv_freq(int i) {
     return inv_freq;
 }
 
+__device__ __forceinline__ unsigned f16_bits(float v) {
+    unsigned short h;
+    asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(v));
+    return h;
+}
+
+__device__ __forceinline__ float f16_to_f32(unsigned bits) {
+    float f;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"((unsigned short)bits));
+    return f;
+}
+
+__device__ __forceinline__ unsigned attn_bits(float v) {
+    return f16_bits(v);
+}
+
+__device__ __forceinline__ float attn_float(unsigned bits) {
+    return f16_to_f32(bits & 0xffffu);
+}
+
+__device__ __forceinline__ void attn_split(float v, unsigned& hi, unsigned& lo) {
+    hi = attn_bits(v);
+    lo = attn_bits(v - attn_float(hi));
+}
+
+__device__ __forceinline__ size_t kv_slot(const int* block_table, int layer, int kv_head, int pos) {
+    return (((size_t)layer * PAGES + block_table[pos / PAGE]) * KV_HEADS + kv_head) * PAGE + pos % PAGE;
+}
+
+__device__ __forceinline__ bf16_t* kv_row(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
+    return cache + kv_slot(block_table, layer, kv_head, pos) * 2 * HEAD_DIM;
+}
+
+__device__ __forceinline__ const bf16_t* kv_row(const bf16_t* cache, const int* block_table, int layer, int kv_head,
+                                                int pos) {
+    return cache + kv_slot(block_table, layer, kv_head, pos) * 2 * HEAD_DIM;
+}
+
+__device__ __forceinline__ float kv_at(const bf16_t* row, int d) {
+    return attn_float(row[d]) + attn_float(row[HEAD_DIM + d]);
+}
+
+__device__ __forceinline__ float4 kv_at4(const bf16_t* row, int d) {
+    uint2 h = *(const uint2*)(row + d);
+    uint2 l = *(const uint2*)(row + HEAD_DIM + d);
+    return make_float4(attn_float(h.x) + attn_float(l.x), attn_float(h.x >> 16) + attn_float(l.x >> 16),
+                       attn_float(h.y) + attn_float(l.y), attn_float(h.y >> 16) + attn_float(l.y >> 16));
+}
+
 __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, const float* k_norm,
-                                               float* k_cache, float* v_cache, const int* block_table,
+                                               bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
                                                int pos, int layer, int head, int row) {
     __shared__ float scratch[32];
     __shared__ float vec[HEAD_DIM];
@@ -630,13 +679,15 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
         return;
     }
     int kv_head = is_k ? head - HEADS : head - HEADS - KV_HEADS;
-    int page = block_table[pos / PAGE];
-    size_t slot = (((size_t)layer * PAGES + page) * KV_HEADS + kv_head) * PAGE + pos % PAGE;
-    (is_k ? k_cache : v_cache)[slot * HEAD_DIM + d] = v;
+    bf16_t* dst = kv_row(is_k ? k_cache : v_cache, block_table, layer, kv_head, pos);
+    unsigned hi, lo;
+    attn_split(v, hi, lo);
+    dst[d] = (bf16_t)hi;
+    dst[HEAD_DIM + d] = (bf16_t)lo;
 }
 
 extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
-                                        float* k_cache, float* v_cache, const int* block_table,
+                                        bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
                                         const int* pos_ptr, int layer, int seq_layers) {
     int pos = pos_ptr[0] + (seq_layers ? 0 : blockIdx.y);
     norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, block_table, pos, layer + blockIdx.y * seq_layers,
@@ -644,7 +695,7 @@ extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const f
 }
 
 extern "C" __global__ void kv_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
-                                        float* k_cache, float* v_cache, const int* block_table,
+                                        bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
                                         const int* pos_ptr, int layer) {
     norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, block_table, pos_ptr[0] + blockIdx.y, layer,
                    HEADS + blockIdx.x, blockIdx.y);
@@ -660,7 +711,7 @@ __device__ __forceinline__ int attn_chunk(int len) {
     return max(ATTN_MIN_CHUNK, (len + ATTN_SPLITS - 1) / ATTN_SPLITS);
 }
 
-extern "C" __global__ void attention_split(const float* qkv, const float* k_cache, const float* v_cache,
+extern "C" __global__ void attention_split(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
                                      const int* block_table, const int* pos_ptr, int layer, float* part) {
     __shared__ float q_s[HEAD_DIM];
     __shared__ float p_s[ATTN_TILE];
@@ -681,17 +732,15 @@ extern "C" __global__ void attention_split(const float* qkv, const float* k_cach
     float m = NEG_INF;
     float l = 0.0f;
     float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    size_t base = ((size_t)layer * PAGES) * KV_HEADS + kv_head;
     static_assert(HEAD_DIM <= ATTN_BLOCK && HEAD_DIM % 4 == 0 && HEAD_DIM <= 128, "unsupported head_dim");
     for (int t0 = start; t0 < end; t0 += ATTN_TILE) {
         int n = min(ATTN_TILE, end - t0);
         for (int i = warp; i < n; i += ATTN_BLOCK / 32) {
             int t = t0 + i;
-            size_t slot = ((base + (size_t)block_table[t / PAGE] * KV_HEADS)) * PAGE + t % PAGE;
-            const float4* k = (const float4*)(k_cache + slot * HEAD_DIM);
+            const bf16_t* k = kv_row(k_cache, block_table, layer, kv_head, t);
             float dot = 0.0f;
             for (int d = lane; d < HEAD_DIM / 4; d += 32) {
-                float4 kv = k[d];
+                float4 kv = kv_at4(k, 4 * d);
                 dot += q_s[4 * d] * kv.x + q_s[4 * d + 1] * kv.y + q_s[4 * d + 2] * kv.z + q_s[4 * d + 3] * kv.w;
             }
             dot = warp_sum(dot);
@@ -713,8 +762,7 @@ extern "C" __global__ void attention_split(const float* qkv, const float* k_cach
             for (int i = warp; i < n; i += ATTN_BLOCK / 32) {
                 int t = t0 + i;
                 float p = p_s[i];
-                size_t slot = (((size_t)layer * PAGES + block_table[t / PAGE]) * KV_HEADS + kv_head) * PAGE + t % PAGE;
-                float4 v = ((const float4*)(v_cache + slot * HEAD_DIM))[lane];
+                float4 v = kv_at4(kv_row(v_cache, block_table, layer, kv_head, t), 4 * lane);
                 pv.x += p * v.x;
                 pv.y += p * v.y;
                 pv.z += p * v.z;
@@ -775,7 +823,7 @@ extern "C" __global__ void attention_reduce(const float* part, const int* pos_pt
     }
 }
 
-extern "C" __global__ void attention(const float* qkv, const float* k_cache, const float* v_cache,
+extern "C" __global__ void attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
                                      const int* block_table, const int* pos_ptr, int layer, float* out, float* scores_global,
                                      int seq_layers) {
     __shared__ float scratch[32];
@@ -791,10 +839,9 @@ extern "C" __global__ void attention(const float* qkv, const float* k_cache, con
     out += (size_t)blockIdx.y * Q_DIM;
     float scale = rsqrtf((float)HEAD_DIM);
     for (int t = warp; t < len; t += ATTN_THREADS / 32) {
-        size_t slot = (((size_t)layer * PAGES + block_table[t / PAGE]) * KV_HEADS + kv_head) * PAGE + t % PAGE;
-        const float* k = k_cache + slot * HEAD_DIM;
+        const bf16_t* k = kv_row(k_cache, block_table, layer, kv_head, t);
         float dot = 0.0f;
-        for (int d = lane; d < HEAD_DIM; d += 32) dot += q[d] * k[d];
+        for (int d = lane; d < HEAD_DIM; d += 32) dot += q[d] * kv_at(k, d);
         dot = warp_sum(dot);
         if (lane == 0) scores[t] = dot * scale;
     }
@@ -818,13 +865,12 @@ extern "C" __global__ void attention(const float* qkv, const float* k_cache, con
     for (int i = 0; i < PER_LANE; i++) acc[i] = 0.0f;
 #pragma unroll 4
     for (int t = warp; t < len; t += WARPS) {
-        size_t slot = (((size_t)layer * PAGES + block_table[t / PAGE]) * KV_HEADS + kv_head) * PAGE + t % PAGE;
-        const float* v = v_cache + slot * HEAD_DIM;
+        const bf16_t* v = kv_row(v_cache, block_table, layer, kv_head, t);
         float p = scores[t];
 #pragma unroll
         for (int i = 0; i < PER_LANE; i++) {
             int d = lane + i * 32;
-            if (d < HEAD_DIM) acc[i] += p * v[d];
+            if (d < HEAD_DIM) acc[i] += p * kv_at(v, d);
         }
     }
 #pragma unroll
@@ -844,7 +890,7 @@ constexpr int BD_WARPS = 8;
 constexpr int BD_SPLITS = {{BD_SPLITS}};
 constexpr int BD_UNROLL = 8;
 
-extern "C" __global__ void batch_decode_attention(const float* qkv, const float* k_cache, const float* v_cache,
+extern "C" __global__ void batch_decode_attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
                                                   const int* block_table, const int* pos_ptr, int layer,
                                                   float* part_acc, float* part_ml, int seq_layers) {
     constexpr int PER_LANE = (HEAD_DIM + 31) / 32;
@@ -885,14 +931,13 @@ extern "C" __global__ void batch_decode_attention(const float* qkv, const float*
 #pragma unroll
         for (int u = 0; u < U; u++) {
             int t = tb + u * BD_WARPS;
-            size_t slot = (((size_t)seq_layer * PAGES + block_table[min(t, t1 - 1) / PAGE]) * KV_HEADS + kv_head) * PAGE + min(t, t1 - 1) % PAGE;
-            const float* k = k_cache + slot * HEAD_DIM;
-            const float* v = v_cache + slot * HEAD_DIM;
+            const bf16_t* k = kv_row(k_cache, block_table, seq_layer, kv_head, min(t, t1 - 1));
+            const bf16_t* v = kv_row(v_cache, block_table, seq_layer, kv_head, min(t, t1 - 1));
 #pragma unroll
             for (int i = 0; i < PER_LANE; i++) {
                 int d = lane + i * 32;
-                kr[u][i] = d < HEAD_DIM ? k[d] : 0.0f;
-                vr[u][i] = d < HEAD_DIM ? v[d] : 0.0f;
+                kr[u][i] = d < HEAD_DIM ? kv_at(k, d) : 0.0f;
+                vr[u][i] = d < HEAD_DIM ? kv_at(v, d) : 0.0f;
             }
         }
 #pragma unroll
@@ -974,7 +1019,7 @@ constexpr int FA_THREADS = 128;
 constexpr int FA_STRIDE = HEAD_DIM + 1;
 constexpr int FA_OUT = HEAD_DIM / 8;
 
-extern "C" __global__ void flash_attention(const float* qkv, const float* k_cache, const float* v_cache,
+extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
                                            const int* block_table, const int* pos_ptr, int layer, float* out, int tokens) {
     __shared__ float qs[FA_BQ][FA_STRIDE];
     __shared__ float ks[FA_BK][FA_STRIDE];
@@ -1011,9 +1056,8 @@ extern "C" __global__ void flash_attention(const float* qkv, const float* k_cach
             int t = k0 + r;
             float kv = 0.0f, vv = 0.0f;
             if (t < key_end) {
-                size_t slot = (((size_t)layer * PAGES + block_table[t / PAGE]) * KV_HEADS + kv_head) * PAGE + t % PAGE;
-                kv = k_cache[slot * HEAD_DIM + d];
-                vv = v_cache[slot * HEAD_DIM + d];
+                kv = kv_at(kv_row(k_cache, block_table, layer, kv_head, t), d);
+                vv = kv_at(kv_row(v_cache, block_table, layer, kv_head, t), d);
             }
             ks[r][d] = kv;
             vs[r][d] = vv;
@@ -1068,40 +1112,52 @@ extern "C" __global__ void flash_attention(const float* qkv, const float* k_cach
     }
 }
 
-constexpr int FM_BQ = 64;
-constexpr int FM_BK = 32;
-constexpr int FM_KS = HEAD_DIM + 8;
+constexpr int FM_WARPS = {{FM_WARPS}};
+constexpr int FM_BQ = 16 * FM_WARPS;
+constexpr int FM_BK = {{FM_BK}};
+constexpr int FM_STAGES = {{FM_STAGES}};
 constexpr int FM_KB = HEAD_DIM / 16;
 constexpr int FM_NB = HEAD_DIM / 8;
 
 __device__ __forceinline__ unsigned pack_hi(float a, float b) {
-    return bf16_bits_rn(a) | (bf16_bits_rn(b) << 16);
+    return attn_bits(a) | (attn_bits(b) << 16);
 }
 
 __device__ __forceinline__ unsigned pack_lo(float a, float b) {
-    float ha = __uint_as_float(bf16_bits_rn(a) << 16);
-    float hb = __uint_as_float(bf16_bits_rn(b) << 16);
-    return bf16_bits_rn(a - ha) | (bf16_bits_rn(b - hb) << 16);
+    return attn_bits(a - attn_float(attn_bits(a))) | (attn_bits(b - attn_float(attn_bits(b))) << 16);
 }
 
-__device__ __forceinline__ void mma3(float* c, const unsigned* ah, const unsigned* al,
-                                     unsigned bh0, unsigned bh1, unsigned bl0, unsigned bl1) {
-    mma_bf16(c, al[0], al[1], al[2], al[3], bl0, bl1);
-    mma_bf16(c, al[0], al[1], al[2], al[3], bh0, bh1);
-    mma_bf16(c, ah[0], ah[1], ah[2], ah[3], bl0, bl1);
-    mma_bf16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
+__device__ __forceinline__ void mma_f16(float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+                                        unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 800
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
 }
 
-extern "C" __global__ void flash_mma(const float* qkv, const float* q_norm, const float* k_cache, const float* v_cache,
-                                     const int* block_table, const int* pos_ptr, int layer, bf16_t* out_hi,
-                                     bf16_t* out_lo, int tokens) {
-    static_assert(FM_BQ * HEAD_DIM * 4 <= 4 * FM_BK * FM_KS * 2, "Q staging fits the K/V tiles");
-    __shared__ __align__(16) unsigned char smem[4 * FM_BK * FM_KS * 2];
-    bf16_t (*k_hi)[FM_KS] = (bf16_t (*)[FM_KS])smem;
-    bf16_t (*k_lo)[FM_KS] = k_hi + FM_BK;
-    bf16_t (*v_hi)[FM_KS] = k_lo + FM_BK;
-    bf16_t (*v_lo)[FM_KS] = v_hi + FM_BK;
-    float* qs = (float*)smem;
+__device__ __forceinline__ float fast_exp2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+__device__ __forceinline__ void mma_hi_lo(float* c, const unsigned* ah, const unsigned* al,
+                                          unsigned bh0, unsigned bh1, unsigned bl0, unsigned bl1) {
+    mma_f16(c, al[0], al[1], al[2], al[3], bh0, bh1);
+    mma_f16(c, ah[0], ah[1], ah[2], ah[3], bl0, bl1);
+    mma_f16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
+}
+
+extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
+                                     const bf16_t* v_cache, const int* block_table, const int* pos_ptr, int layer,
+                                     bf16_t* out_hi, bf16_t* out_lo, int tokens) {
+    constexpr int CPR = HEAD_DIM / 8;
+    constexpr int PLANE = FM_BK * HEAD_DIM;
+    static_assert(FM_BQ * HEAD_DIM * 4 <= {{FM_SMEM}}, "Q staging fits");
+    extern __shared__ __align__(16) unsigned char fm_smem[];
+    bf16_t* kvs = (bf16_t*)fm_smem;
+    float* qs = (float*)fm_smem;
     int head = blockIdx.y;
     int kv_head = head / GROUP;
     int q0 = (gridDim.x - 1 - blockIdx.x) * FM_BQ;
@@ -1115,55 +1171,47 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* q_norm, cons
     int row1 = row0 + 8;
     int pos0 = base + row0;
     int pos1 = base + row1;
-    float scale = rsqrtf((float)HEAD_DIM);
+    float scale_log2 = rsqrtf((float)HEAD_DIM) * 1.4426950408889634f;
     unsigned qh[FM_KB][4];
     unsigned ql[FM_KB][4];
     constexpr int QKV_ROW = Q_DIM + 2 * KV_DIM;
-    constexpr int PER_LANE = (HEAD_DIM + 31) / 32;
     constexpr int HALF = HEAD_DIM / 2;
+    constexpr int PAIRS = (HALF + 31) / 32;
     float* wq = qs + warp * 16 * HEAD_DIM;
+    float freq[PAIRS];
+#pragma unroll
+    for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, HALF - 1));
     for (int r = 0; r < 16; r++) {
         int row = q0 + warp * 16 + r;
-        float v[PER_LANE];
+        float a[PAIRS], b[PAIRS];
         float ss = 0.0f;
 #pragma unroll
-        for (int i = 0; i < PER_LANE; i++) {
+        for (int i = 0; i < PAIRS; i++) {
             int d = lane + 32 * i;
-            v[i] = (d < HEAD_DIM && row < tokens) ? qkv[(size_t)row * QKV_ROW + head * HEAD_DIM + d] : 0.0f;
-            ss += v[i] * v[i];
+            bool ok = d < HALF && row < tokens;
+            const float* src = qkv + (size_t)row * QKV_ROW + head * HEAD_DIM;
+            a[i] = ok ? src[d] : 0.0f;
+            b[i] = ok ? src[d + HALF] : 0.0f;
+            ss += a[i] * a[i] + b[i] * b[i];
         }
-        if (QK_NORM) {
-            float inv = rsqrtf(warp_sum(ss) / HEAD_DIM + EPS);
+        float inv = QK_NORM ? rsqrtf(warp_sum(ss) / HEAD_DIM + EPS) : 1.0f;
 #pragma unroll
-            for (int i = 0; i < PER_LANE; i++) {
-                int d = lane + 32 * i;
-                if (d < HEAD_DIM) v[i] = q_norm[d] * (v[i] * inv);
+        for (int i = 0; i < PAIRS; i++) {
+            int d = lane + 32 * i;
+            if (d < HALF) {
+                float x = a[i], y = b[i];
+                if (QK_NORM) {
+                    x = q_norm[d] * (x * inv);
+                    y = q_norm[d + HALF] * (y * inv);
+                }
+                float sn, c;
+                sincosf((float)(base + row) * freq[i], &sn, &c);
+                wq[r * HEAD_DIM + d] = x * c - y * sn;
+                wq[r * HEAD_DIM + d + HALF] = y * c + x * sn;
             }
         }
-#pragma unroll
-        for (int i = 0; i < PER_LANE; i++) {
-            int d = lane + 32 * i;
-            if (d < HEAD_DIM) wq[r * HEAD_DIM + d] = v[i];
-        }
-        __syncwarp();
-#pragma unroll
-        for (int i = 0; i < PER_LANE; i++) {
-            int d = lane + 32 * i;
-            if (d < HEAD_DIM) {
-                float angle = (float)(base + row) * rope_inv_freq(d < HALF ? d : d - HALF);
-                float c = cosf(angle);
-                float sn = sinf(angle);
-                v[i] = d < HALF ? v[i] * c - wq[r * HEAD_DIM + d + HALF] * sn : v[i] * c + wq[r * HEAD_DIM + d - HALF] * sn;
-            }
-        }
-        __syncwarp();
-#pragma unroll
-        for (int i = 0; i < PER_LANE; i++) {
-            int d = lane + 32 * i;
-            if (d < HEAD_DIM) wq[r * HEAD_DIM + d] = v[i];
-        }
-        __syncwarp();
     }
+    __syncwarp();
 #pragma unroll
     for (int kb = 0; kb < FM_KB; kb++) {
         int d = kb * 16 + 2 * t;
@@ -1186,50 +1234,67 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* q_norm, cons
     float m0 = NEG_INF, m1 = NEG_INF, l0 = 0.0f, l1 = 0.0f;
     int last = min(q0 + FM_BQ, tokens) - 1;
     int key_end = base + last + 1;
-    for (int k0 = 0; k0 < key_end; k0 += FM_BK) {
-        __syncthreads();
-        for (int i = tid; i < FM_BK * HEAD_DIM / 4; i += 128) {
-            int r = i / (HEAD_DIM / 4);
-            int d = (i % (HEAD_DIM / 4)) * 4;
-            int tk = k0 + r;
-            float4 kv = make_float4(0.f, 0.f, 0.f, 0.f);
-            float4 vv = kv;
-            if (tk < key_end) {
-                size_t slot = (((size_t)layer * PAGES + block_table[tk / PAGE]) * KV_HEADS + kv_head) * PAGE + tk % PAGE;
-                kv = *(const float4*)(k_cache + slot * HEAD_DIM + d);
-                vv = *(const float4*)(v_cache + slot * HEAD_DIM + d);
-            }
-            *(uint2*)&k_hi[r][d] = make_uint2(pack_hi(kv.x, kv.y), pack_hi(kv.z, kv.w));
-            *(uint2*)&k_lo[r][d] = make_uint2(pack_lo(kv.x, kv.y), pack_lo(kv.z, kv.w));
-            *(uint2*)&v_hi[r][d] = make_uint2(pack_hi(vv.x, vv.y), pack_hi(vv.z, vv.w));
-            *(uint2*)&v_lo[r][d] = make_uint2(pack_lo(vv.x, vv.y), pack_lo(vv.z, vv.w));
-        }
-        __syncthreads();
-        float s[4][4];
+    int warp_last = base + q0 + warp * 16 + 15;
+    int tiles = (key_end + FM_BK - 1) / FM_BK;
+    auto load_kv = [&](int buf, int k0) {
+        bf16_t* st = kvs + buf * 4 * PLANE;
+        constexpr int ROW_CHUNKS = 2 * CPR;
+        constexpr int TOTAL = 2 * FM_BK * ROW_CHUNKS;
 #pragma unroll
-        for (int nb = 0; nb < 4; nb++)
+        for (int i = tid; i < TOTAL; i += 32 * FM_WARPS) {
+            int which = i / (FM_BK * ROW_CHUNKS);
+            int rem = i % (FM_BK * ROW_CHUNKS);
+            int r = rem / ROW_CHUNKS;
+            int c = rem % ROW_CHUNKS;
+            int tk = k0 + r;
+            const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
+            bf16_t* dst = st + (which * 2 + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
+            cp_async16_zfill(dst, src + c * 8, tk < key_end);
+        }
+    };
+    __syncthreads();
+    load_kv(0, 0);
+    cp_async_commit();
+    for (int kt = 0; kt < tiles; kt++) {
+        int k0 = kt * FM_BK;
+        if (kt + 1 < tiles) load_kv((kt + 1) % FM_STAGES, k0 + FM_BK);
+        cp_async_commit();
+        cp_async_wait<1>();
+        __syncthreads();
+        const bf16_t* k_hi = kvs + (kt % FM_STAGES) * 4 * PLANE;
+        const bf16_t* k_lo = k_hi + PLANE;
+        const bf16_t* v_hi = k_lo + PLANE;
+        const bf16_t* v_lo = v_hi + PLANE;
+        if (k0 > warp_last) {
+            __syncthreads();
+            continue;
+        }
+        constexpr int SB = FM_BK / 8;
+        float s[SB][4];
+#pragma unroll
+        for (int nb = 0; nb < SB; nb++)
 #pragma unroll
             for (int e = 0; e < 4; e++) s[nb][e] = 0.0f;
 #pragma unroll
-        for (int np = 0; np < 2; np++)
+        for (int np = 0; np < SB / 2; np++)
 #pragma unroll
             for (int kb = 0; kb < FM_KB; kb++) {
                 unsigned bh[4], bl[4];
                 int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
-                int d = kb * 16 + ((lane >> 3) & 1) * 8;
-                ldsm_x4(bh, &k_hi[kr][d]);
-                ldsm_x4(bl, &k_lo[kr][d]);
-                mma3(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
-                mma3(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
+                int at = swz<CPR>(kr, kb * 2 + ((lane >> 3) & 1)) * 8;
+                ldsm_x4(bh, k_hi + at);
+                ldsm_x4(bl, k_lo + at);
+                mma_hi_lo(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
+                mma_hi_lo(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
             }
         float mx0 = NEG_INF, mx1 = NEG_INF;
 #pragma unroll
-        for (int nb = 0; nb < 4; nb++)
+        for (int nb = 0; nb < SB; nb++)
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nb * 8 + 2 * t + (e & 1);
                 int pos = e < 2 ? pos0 : pos1;
-                float v = (key <= pos && key < key_end) ? s[nb][e] * scale : NEG_INF;
+                float v = (key <= pos && key < key_end) ? s[nb][e] * scale_log2 : NEG_INF;
                 s[nb][e] = v;
                 if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
             }
@@ -1239,15 +1304,15 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* q_norm, cons
         mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
         float n0 = fmaxf(m0, mx0);
         float n1 = fmaxf(m1, mx1);
-        float a0 = m0 == NEG_INF ? 0.0f : expf(m0 - n0);
-        float a1 = m1 == NEG_INF ? 0.0f : expf(m1 - n1);
+        float a0 = m0 == NEG_INF ? 0.0f : fast_exp2(m0 - n0);
+        float a1 = m1 == NEG_INF ? 0.0f : fast_exp2(m1 - n1);
         float sum0 = 0.0f, sum1 = 0.0f;
 #pragma unroll
-        for (int nb = 0; nb < 4; nb++)
+        for (int nb = 0; nb < SB; nb++)
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 float nm = e < 2 ? n0 : n1;
-                float p = s[nb][e] == NEG_INF ? 0.0f : expf(s[nb][e] - nm);
+                float p = s[nb][e] == NEG_INF ? 0.0f : fast_exp2(s[nb][e] - nm);
                 s[nb][e] = p;
                 if (e < 2) sum0 += p; else sum1 += p;
             }
@@ -1266,13 +1331,8 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* q_norm, cons
             o[i][2] *= a1;
             o[i][3] *= a1;
         }
-        float pv[FM_NB][4];
 #pragma unroll
-        for (int i = 0; i < FM_NB; i++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) pv[i][e] = 0.0f;
-#pragma unroll
-        for (int kb = 0; kb < 2; kb++) {
+        for (int kb = 0; kb < SB / 2; kb++) {
             unsigned ph[4], pl[4];
             ph[0] = pack_hi(s[2 * kb][0], s[2 * kb][1]);
             ph[1] = pack_hi(s[2 * kb][2], s[2 * kb][3]);
@@ -1286,17 +1346,14 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* q_norm, cons
             for (int np = 0; np < FM_NB / 2; np++) {
                 unsigned bh[4], bl[4];
                 int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-                int d = np * 16 + (lane >> 4) * 8;
-                ldsm_x4_t(bh, &v_hi[kr][d]);
-                ldsm_x4_t(bl, &v_lo[kr][d]);
-                mma3(pv[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
-                mma3(pv[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
+                int at = swz<CPR>(kr, np * 2 + (lane >> 4)) * 8;
+                ldsm_x4_t(bh, v_hi + at);
+                ldsm_x4_t(bl, v_lo + at);
+                mma_hi_lo(o[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
+                mma_hi_lo(o[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
             }
         }
-#pragma unroll
-        for (int i = 0; i < FM_NB; i++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) o[i][e] += pv[i][e];
+        __syncthreads();
     }
     float i0 = 1.0f / l0;
     float i1 = 1.0f / l1;

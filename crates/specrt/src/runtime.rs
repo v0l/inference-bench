@@ -38,8 +38,8 @@ struct Buffers {
     gate_up: CudaSlice<f32>,
     act: CudaSlice<f32>,
     logits: CudaSlice<f32>,
-    k_cache: CudaSlice<f32>,
-    v_cache: CudaSlice<f32>,
+    k_cache: CudaSlice<u16>,
+    v_cache: CudaSlice<u16>,
     block_table: CudaSlice<i32>,
     token: CudaSlice<i32>,
     pos: CudaSlice<i32>,
@@ -245,8 +245,8 @@ impl Runtime {
             gate_up: stream.alloc_zeros(2 * d.intermediate)?,
             act: stream.alloc_zeros(d.intermediate)?,
             logits: stream.alloc_zeros(d.vocab)?,
-            k_cache: stream.alloc_zeros(cache_len)?,
-            v_cache: stream.alloc_zeros(cache_len)?,
+            k_cache: stream.alloc_zeros(2 * cache_len)?,
+            v_cache: stream.alloc_zeros(2 * cache_len)?,
             block_table: stream.clone_htod(&table)?,
             token: stream.alloc_zeros(1)?,
             pos: stream.alloc_zeros(1)?,
@@ -622,10 +622,11 @@ impl Runtime {
                 b.arg(&pre.attn);
             }
             b.arg(&ntok);
+            let rows = if self.use_mma { crate::codegen::FLASH_ROWS } else { 16 };
             let config = LaunchConfig {
-                grid_dim: (grid(n, if self.use_mma { 64 } else { 16 }), a.heads as u32, 1),
-                block_dim: (128, 1, 1),
-                shared_mem_bytes: 0,
+                grid_dim: (grid(n, rows), a.heads as u32, 1),
+                block_dim: (if self.use_mma { rows as u32 * 2 } else { 128 }, 1, 1),
+                shared_mem_bytes: if self.use_mma { self.smem["flash_mma"] } else { 0 },
             };
             unsafe { b.launch(config) }?;
             let inter = s.dims.intermediate;
