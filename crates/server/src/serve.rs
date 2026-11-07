@@ -2,6 +2,7 @@ use crate::app::{AppState, router};
 use crate::config::ServerConfig;
 use crate::manager::{EngineFactory, NativeFactory, GpuProbe, nvidia_smi_probe};
 use anyhow::{Context, Result};
+use inference_bench_core::specs::{Outcome, SpecStore, SpecsConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +69,7 @@ impl Server {
         let (tx, rx) = watch::channel(false);
         spawn_reaper(state.clone(), rx.clone());
         spawn_preload(state.clone());
+        spawn_spec_updates(state.clone(), rx.clone());
         let grace = Duration::from_secs(self.config.shutdown_grace_secs);
         tracing::info!(
             %addr,
@@ -155,6 +157,44 @@ fn spawn_reaper(state: Arc<AppState>, mut rx: watch::Receiver<bool>) {
                         tracing::info!(unloaded = n, idle_secs = secs, "idle timer unloaded models");
                     }
                 }
+                _ = rx.wait_for(|v| *v) => return,
+            }
+        }
+    });
+}
+
+fn check_specs(state: &Arc<AppState>, cfg: &SpecsConfig, data: &std::path::Path, force: bool) {
+    let store = SpecStore::new(data);
+    if !force && !store.due(cfg, chrono::Utc::now()) {
+        return;
+    }
+    let result = match store.update(cfg) {
+        Ok(Outcome::Updated(_)) => "updated",
+        Ok(_) => "unchanged",
+        Err(_) => "failed",
+    };
+    state.metrics.spec_check(result, store.state().last_success.map(|t| t.timestamp()));
+}
+
+fn spawn_spec_updates(state: Arc<AppState>, mut rx: watch::Receiver<bool>) {
+    let section = state.config.specs.clone();
+    let cfg = section.updater();
+    let data = section.data();
+    state.metrics.spec_last_success(SpecStore::new(&data).state().last_success.map(|t| t.timestamp()));
+    if !cfg.auto_update {
+        tracing::info!("spec updates are off");
+        return;
+    }
+    let tick = cfg.interval().map(|i| i.min(Duration::from_secs(300)));
+    tokio::spawn(async move {
+        let mut force = true;
+        loop {
+            let (s, c, d) = (state.clone(), cfg.clone(), data.clone());
+            let _ = tokio::task::spawn_blocking(move || check_specs(&s, &c, &d, force)).await;
+            force = false;
+            let Some(tick) = tick else { return };
+            tokio::select! {
+                _ = tokio::time::sleep(tick) => {}
                 _ = rx.wait_for(|v| *v) => return,
             }
         }

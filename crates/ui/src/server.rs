@@ -38,6 +38,7 @@ impl ServerState {
         let mut config = ServerConfig {
             bind: format!("{}:{port}", if lan { "0.0.0.0" } else { "127.0.0.1" }),
             shutdown_grace_secs: 2,
+            specs: inference_bench_server::config::SpecsSection { auto_update: false, ..Default::default() },
             ..ServerConfig::default()
         };
         if !key.trim().is_empty() {

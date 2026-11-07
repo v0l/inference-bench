@@ -216,8 +216,8 @@ impl Manager {
         self.make_room(cfg)?;
         let max_ctx = self.config.max_ctx_for(cfg);
         let instances = 1;
-        let name = cfg.upstream_name().to_string();
-        let spec_hash = cfg.spec_hash();
+        let name = self.config.specs.resolve(cfg.upstream_name());
+        let spec_hash = crate::config::spec_hash_of(&name);
         let vram_before = (self.probe)();
         let started = Instant::now();
         tracing::info!(model = %cfg.id, upstream = %name, ?max_ctx, %spec_hash, vram_before_bytes = ?vram_before, "loading model");

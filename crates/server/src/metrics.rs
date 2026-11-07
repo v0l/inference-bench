@@ -36,6 +36,8 @@ struct Inner {
     model_loads: BTreeMap<String, u64>,
     model_load_failures: u64,
     model_unloads: u64,
+    spec_checks: BTreeMap<String, u64>,
+    spec_last_success: Option<i64>,
 }
 
 #[derive(Default)]
@@ -86,6 +88,18 @@ impl Metrics {
         self.inner.lock().unwrap().model_unloads += 1;
     }
 
+    pub fn spec_check(&self, result: &str, success_at: Option<i64>) {
+        let mut m = self.inner.lock().unwrap();
+        *m.spec_checks.entry(result.to_string()).or_default() += 1;
+        if success_at.is_some() {
+            m.spec_last_success = success_at;
+        }
+    }
+
+    pub fn spec_last_success(&self, at: Option<i64>) {
+        self.inner.lock().unwrap().spec_last_success = at;
+    }
+
     pub fn render(&self, g: &Gauges) -> String {
         let m = self.inner.lock().unwrap();
         let mut o = String::new();
@@ -119,6 +133,15 @@ impl Metrics {
         }
         let _ = writeln!(o, "# TYPE inference_model_load_failures_total counter\ninference_model_load_failures_total {}", m.model_load_failures);
         let _ = writeln!(o, "# TYPE inference_model_unloads_total counter\ninference_model_unloads_total {}", m.model_unloads);
+        let _ = writeln!(o, "# HELP inference_specs_checks_total Spec update checks by result.\n# TYPE inference_specs_checks_total counter");
+        for (result, n) in &m.spec_checks {
+            let _ = writeln!(o, "inference_specs_checks_total{{result=\"{result}\"}} {n}");
+        }
+        let _ = writeln!(
+            o,
+            "# HELP inference_specs_last_success_timestamp_seconds Unix time of the last successful spec update check, 0 if none.\n# TYPE inference_specs_last_success_timestamp_seconds gauge\ninference_specs_last_success_timestamp_seconds {}",
+            m.spec_last_success.unwrap_or(0)
+        );
         let _ = writeln!(o, "# HELP inference_queue_depth Requests waiting for a slot.\n# TYPE inference_queue_depth gauge\ninference_queue_depth {}", g.queue_depth);
         let _ = writeln!(o, "# TYPE inference_in_flight gauge\ninference_in_flight {}", g.in_flight);
         let _ = writeln!(o, "# TYPE inference_models_loaded gauge\ninference_models_loaded {}", g.loaded_models.len());

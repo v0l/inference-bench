@@ -149,6 +149,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/models", get(admin_models))
         .route("/admin/models/{id}/load", post(admin_load))
         .route("/admin/models/{id}/unload", post(admin_unload))
+        .route("/admin/specs", get(admin_specs))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(middleware::from_fn_with_state(state.clone(), request_scope))
         .with_state(state.clone());
@@ -289,6 +290,29 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
         .map(|m| json!({"id": m.id, "object": "model", "created": 0, "owned_by": "inference-bench", "loaded": m.loaded}))
         .collect();
     Json(json!({"object": "list", "data": data}))
+}
+
+async fn admin_specs(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let section = state.config.specs.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        use inference_bench_core::specs;
+        let data = section.data();
+        let store = specs::SpecStore::new(&data);
+        let list: Vec<Value> = specs::list(&specs::standard_layers(&data, &section.folders))
+            .into_iter()
+            .map(|l| json!({"name": l.name, "path": l.path, "origin": l.origin.kind(), "source": l.origin.label(), "problem": l.problem}))
+            .collect();
+        json!({
+            "source": section.updater().source(),
+            "auto_update": section.auto_update,
+            "state": store.state(),
+            "generation": store.generation(),
+            "specs": list,
+        })
+    })
+    .await
+    .unwrap_or_default();
+    Json(body)
 }
 
 async fn admin_models(State(state): State<Arc<AppState>>) -> Json<Value> {

@@ -354,3 +354,54 @@ fn a_native_model_missing_on_disk_is_a_clean_error() {
     assert!(body.contains("no config.json"), "{body}");
     rig.stop();
 }
+
+#[test]
+fn the_server_checks_specs_at_start_reports_them_and_loads_a_new_spec_by_name() {
+    use inference_bench_core::fake::{FakeFile, FakeServer, Script, tarball};
+    let data = std::env::temp_dir().join(format!("ib-server-specs-update-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs/qwen3-0.6b.toml")).unwrap();
+    let fresh = base.replace("name = \"qwen3-0.6b\"", "name = \"brand-new\"");
+    let script = Script::default();
+    let github = FakeServer::start(script.clone());
+    script.serve_file(FakeFile {
+        path: "/v0l/inference-bench/tar.gz/refs/heads/master".into(),
+        body: tarball("inference-bench-master", &[("crates/specrt/specs/brand-new.toml", fresh.as_bytes())], Some("cafe123")),
+        etag: Some("\"e1\"".into()),
+        status: None,
+    });
+    let extra = format!(
+        "[[models]]\nid = 'new'\nmodel = 'brand-new'\n[specs]\nurl = {:?}\ndata_dir = {:?}\n",
+        github.url,
+        data.display().to_string()
+    );
+    let rig = start(config(&extra), Shape::default());
+    wait_for("spec check", || rig.metrics().contains("inference_specs_checks_total{result=\"updated\"} 1"));
+    let m = rig.metrics();
+    let at: i64 = m.lines().find_map(|l| l.strip_prefix("inference_specs_last_success_timestamp_seconds ")).unwrap().parse().unwrap();
+    assert!(at > 1_700_000_000, "{m}");
+    let (status, body, _) = rig.get("/admin/specs", None);
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["source"], "v0l/inference-bench@master");
+    assert_eq!(v["generation"]["commit"], "cafe123");
+    let new = v["specs"].as_array().unwrap().iter().find(|s| s["name"] == "brand-new").unwrap();
+    assert_eq!(new["origin"], "github");
+    assert!(v["specs"].as_array().unwrap().iter().any(|s| s["name"] == "llama-3.2-1b" && s["origin"] == "embedded"));
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("new", false)).0, 200);
+    let loaded = rig.stats.loaded_names.lock().unwrap().clone();
+    assert_eq!(loaded, vec![data.join("specs/current/brand-new.toml").display().to_string()]);
+    rig.stop();
+}
+
+#[test]
+fn the_server_makes_no_spec_request_when_updates_are_off() {
+    use inference_bench_core::fake::{FakeServer, Script};
+    let github = FakeServer::start(Script::default());
+    let extra = format!("[specs]\nauto_update = false\nurl = {:?}\ndata_dir = {:?}\n", github.url, std::env::temp_dir().join("ib-server-specs-off").display().to_string());
+    let rig = start(config(&extra), Shape::default());
+    assert!(rig.metrics().contains("inference_specs_last_success_timestamp_seconds 0"));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(github.requests.lock().unwrap().is_empty());
+    rig.stop();
+}

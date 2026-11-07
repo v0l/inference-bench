@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use inference_bench_core::specs::SpecsConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -34,13 +35,68 @@ impl ModelConfig {
     }
 
     pub fn spec_hash(&self) -> String {
-        let name = self.upstream_name();
-        let bytes = match name.ends_with(".toml") {
-            true => std::fs::read(name).unwrap_or_else(|_| name.as_bytes().to_vec()),
-            false => name.as_bytes().to_vec(),
-        };
-        let digest = Sha256::digest(&bytes);
-        digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+        spec_hash_of(self.upstream_name())
+    }
+}
+
+pub fn spec_hash_of(name: &str) -> String {
+    let bytes = match name.ends_with(".toml") {
+        true => std::fs::read(name).unwrap_or_else(|_| name.as_bytes().to_vec()),
+        false => name.as_bytes().to_vec(),
+    };
+    let digest = Sha256::digest(&bytes);
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpecsSection {
+    pub auto_update: bool,
+    pub repo: String,
+    pub branch: String,
+    pub tag: String,
+    pub update_hours: u64,
+    pub url: Option<String>,
+    pub data_dir: Option<PathBuf>,
+    pub folders: Vec<PathBuf>,
+}
+
+impl Default for SpecsSection {
+    fn default() -> Self {
+        let d = SpecsConfig::default();
+        Self {
+            auto_update: d.auto_update,
+            repo: d.repo,
+            branch: d.branch,
+            tag: d.tag,
+            update_hours: d.update_hours,
+            url: None,
+            data_dir: None,
+            folders: Vec::new(),
+        }
+    }
+}
+
+impl SpecsSection {
+    pub fn updater(&self) -> SpecsConfig {
+        let d = SpecsConfig::default();
+        SpecsConfig {
+            auto_update: self.auto_update,
+            repo: self.repo.clone(),
+            branch: self.branch.clone(),
+            tag: self.tag.clone(),
+            update_hours: self.update_hours,
+            base: self.url.clone().unwrap_or(d.base),
+            ..d
+        }
+    }
+
+    pub fn data(&self) -> PathBuf {
+        self.data_dir.clone().unwrap_or_else(inference_bench_core::store::data_dir)
+    }
+
+    pub fn resolve(&self, name: &str) -> String {
+        inference_bench_core::specs::resolve_model(&self.data(), &self.folders, name)
     }
 }
 
@@ -76,6 +132,7 @@ pub struct ServerConfig {
     pub shutdown_grace_secs: u64,
     pub access_log: Option<PathBuf>,
     pub log_prompts: bool,
+    pub specs: SpecsSection,
 }
 
 impl Default for ServerConfig {
@@ -102,6 +159,7 @@ impl Default for ServerConfig {
             shutdown_grace_secs: 30,
             access_log: None,
             log_prompts: false,
+            specs: SpecsSection::default(),
         }
     }
 }
@@ -272,6 +330,18 @@ python = "python3"
         assert_eq!(c.max_ctx_for(&c.models[0]), Some(4096));
         assert_eq!(c.max_ctx_for(&c.models[1]), Some(1024));
         assert_eq!(c.default_model, None);
+    }
+
+    #[test]
+    fn the_specs_section_has_defaults_and_can_pin_a_tag() {
+        let c = ServerConfig::parse("").unwrap();
+        assert!(c.specs.auto_update);
+        assert_eq!(c.specs.updater().source(), "v0l/inference-bench@master");
+        let c = ServerConfig::parse("[specs]\nauto_update = false\ntag = \"v0.2.0\"\nupdate_hours = 6\nurl = \"http://mirror\"").unwrap();
+        let u = c.specs.updater();
+        assert!(!u.auto_update);
+        assert_eq!(u.url(), "http://mirror/v0l/inference-bench/tar.gz/refs/tags/v0.2.0");
+        assert!(ServerConfig::parse("[specs]\nbogus = 1").is_err());
     }
 
     #[test]

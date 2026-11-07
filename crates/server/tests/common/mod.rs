@@ -14,6 +14,7 @@ pub struct Stats {
     pub cancelled: AtomicUsize,
     pub generated: AtomicUsize,
     pub prompts: Mutex<Vec<String>>,
+    pub loaded_names: Mutex<Vec<String>>,
 }
 
 pub struct Fake {
@@ -37,6 +38,7 @@ impl Target for Fake {
             return Err(BackendError::new(ErrorKind::ModelNotFound, "no such checkpoint"));
         }
         self.stats.loads.fetch_add(1, Ordering::SeqCst);
+        self.stats.loaded_names.lock().unwrap().push(model.to_string());
         Ok(())
     }
 
@@ -109,7 +111,12 @@ impl Default for Shape {
 }
 
 pub fn config(extra: &str) -> ServerConfig {
-    ServerConfig::parse(&format!("bind = \"127.0.0.1:0\"\n{extra}")).unwrap()
+    let data = std::env::temp_dir().join(format!("ib-server-specs-{}", std::process::id()));
+    let specs = match extra.contains("[specs]") {
+        true => String::new(),
+        false => format!("\n[specs]\nauto_update = false\ndata_dir = {:?}\n", data.display().to_string()),
+    };
+    ServerConfig::parse(&format!("bind = \"127.0.0.1:0\"\n{extra}{specs}")).unwrap()
 }
 
 pub fn start(config: ServerConfig, shape: Shape) -> Rig {
