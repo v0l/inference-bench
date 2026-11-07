@@ -382,6 +382,54 @@ fn chat_has_no_backend_picker_and_settings_list_bench_targets() {
     assert_eq!(kinds, [("llama.cpp", "openai"), ("specrt", "native")]);
 }
 
+#[test]
+fn the_model_list_refreshes_when_a_spec_update_lands() {
+    use inference_bench_core::fake::{FakeFile, tarball};
+    let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs/qwen3-0.6b.toml")).unwrap();
+    let fresh = base.replace("name = \"qwen3-0.6b\"", "name = \"landed-from-github\"");
+    let gh = Script::default();
+    let server = FakeServer::start(gh.clone());
+    gh.serve_file(FakeFile {
+        path: "/v0l/inference-bench/tar.gz/refs/heads/master".into(),
+        body: tarball("inference-bench-master", &[("crates/specrt/specs/landed.toml", fresh.as_bytes())], Some("feed42")),
+        etag: Some("\"x\"".into()),
+        status: None,
+    });
+    let mut h = harness("specs-landed", Tab::Models);
+    h.state_mut().specs.base = Some(server.url.clone());
+    h.state_mut().rescan();
+    pump_until(&mut h, 20, "first scan", |a| !a.scan.busy() && a.library.iter().any(|m| m.name == "llama-3.2-1b"));
+    assert!(!h.state().library.iter().any(|m| m.name == "landed-from-github"));
+    h.state_mut().models.show_all = true;
+    h.run();
+    h.get_by_label("check specs now").click();
+    pump_until(&mut h, 20, "update and rescan", |a| !a.specs.busy() && !a.scan.busy() && a.library.iter().any(|m| m.name == "landed-from-github"));
+    h.run();
+    let landed = h.state().library.iter().find(|m| m.name == "landed-from-github").unwrap().clone();
+    assert!(landed.origin.as_ref().unwrap().label().starts_with("updated from GitHub v0l/inference-bench@master (feed42) at "));
+    h.get_by_label("landed-from-github");
+    assert_eq!(h.state().notice.as_ref().unwrap().1, "specs updated: added landed-from-github");
+    assert!(h.state().specs.state.last_ok);
+}
+
+#[test]
+fn spec_updates_off_in_settings_makes_no_request() {
+    let gh = Script::default();
+    let server = FakeServer::start(gh);
+    let mut h = harness("specs-off", Tab::Settings);
+    {
+        let app = h.state_mut();
+        app.specs.base = Some(server.url.clone());
+        app.specs.auto = true;
+        app.settings.specs_auto_update = false;
+    }
+    for _ in 0..5 {
+        h.step();
+    }
+    assert!(!h.state().specs.busy());
+    assert!(server.requests.lock().unwrap().is_empty());
+}
+
 fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl Fn(&App) -> bool) {
     let start = Instant::now();
     while !done(h.state()) {

@@ -7,6 +7,7 @@ mod logs;
 mod server;
 mod settings;
 mod shell;
+mod specs;
 
 use eframe::egui;
 use egui_bench::prelude::*;
@@ -50,11 +51,13 @@ pub struct App {
     pub logs: inference_bench_core::logging::LogBuffer,
     pub logs_ui: logs::LogsState,
     pub settings_ui: settings::SettingsState,
+    pub specs: specs::SpecsUpdater,
 }
 
 impl App {
     pub fn new(dir: PathBuf, wake: Wake) -> Self {
         let mut app = Self::bare(dir, wake);
+        app.specs.auto = true;
         app.rescan();
         app
     }
@@ -78,6 +81,11 @@ impl App {
             logs: inference_bench_core::logging::LogBuffer::new(5000),
             logs_ui: logs::LogsState::default(),
             settings_ui: settings::SettingsState::default(),
+            specs: {
+                let mut s = specs::SpecsUpdater::default();
+                s.load_state(&dir);
+                s
+            },
             settings,
             wake,
             dir,
@@ -136,6 +144,9 @@ impl App {
         self.chat.pump(&self.dir);
         self.models.pump(&mut self.notice);
         self.bench.pump(&self.dir, &mut self.notice);
+        if self.specs.pump(&self.wake, &self.dir, &self.settings, &mut self.notice) {
+            self.rescan();
+        }
     }
 
     pub fn save_settings(&mut self) {
@@ -156,6 +167,7 @@ impl eframe::App for App {
             || self.loading.is_some()
             || self.bench.running()
             || self.models.downloading()
+            || self.specs.busy()
             || self.scan.busy();
         root.ctx().request_repaint_after(Duration::from_millis(if animating { 100 } else { 2000 }));
         shell::draw(self, root);

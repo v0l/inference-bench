@@ -204,6 +204,9 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
             if let Some(why) = m.support.iter().find(|s| !s.supported && s.backend == "specrt" && m.format != library::Format::Gguf) {
                 Line::new().note(format!("specrt: {}", why.reason)).size(10.5).elided(ui);
             }
+            if let Some(origin) = &m.origin {
+                Line::new().legend("spec from").value(origin.label()).size(10.5).elided(ui);
+            }
             ui.horizontal(|ui| {
                 if m.support_for("specrt").is_some_and(|s| s.supported) {
                     let label = if loaded { "reload" } else { "load" };
@@ -216,12 +219,41 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
                 if ui.add(Key::new("reveal").outline(VALUE).id_salt(("reveal", i))).clicked() {
                     reveal(&m);
                 }
-                if ui.add(Key::new("delete").outline(FAULT).id_salt(("del", i))).clicked() {
+                if library::deletable(&m) && ui.add(Key::new("delete").outline(FAULT).id_salt(("del", i))).clicked() {
                     app.models.confirm_delete = Some(i);
                 }
             });
         },
     );
+}
+
+fn specs_bar(app: &mut App, ui: &mut egui::Ui) {
+    let state = app.specs.state.clone();
+    ui.horizontal(|ui| {
+        let result = match (&app.specs.last, state.last_result.is_empty()) {
+            (Some((_, text)), _) => text.clone(),
+            (None, false) => state.last_result.clone(),
+            (None, true) => "not checked yet".into(),
+        };
+        Line::new()
+            .legend("specs")
+            .value(app.settings.specs().source())
+            .gap(14.0)
+            .legend("checked")
+            .value(crate::specs::when(state.checked_at))
+            .gap(14.0)
+            .legend("result")
+            .value(result)
+            .size(11.0)
+            .elided(ui);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let busy = app.specs.busy();
+            if ui.add(Key::new(if busy { "checking" } else { "check specs now" }).outline(READOUT).enabled(!busy)).clicked() {
+                let (wake, dir) = (app.wake.clone(), app.dir.clone());
+                app.specs.check_now(&wake, &dir, &app.settings);
+            }
+        });
+    });
 }
 
 fn library_pane(app: &mut App, ui: &mut egui::Ui) {
@@ -242,6 +274,7 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     });
+    specs_bar(app, ui);
     for i in order {
         if app.models.show_all || usable_at(&app.library[i]) {
             model_card(app, ui, i);
