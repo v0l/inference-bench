@@ -238,4 +238,37 @@ The HTTP number sat at 0.71-0.74 of `bench` because the HTTP prompt is the synth
 
 Worker, through the JSON protocol with a 1044-token prompt (Qwen3-0.6B, RTX PRO 6000, medians of 7): worker prefill 59-62 ms before, 38 ms after; first streamed text 62-65 ms before, 41.5 ms after. Qwen2.5-0.5B after: 23-26 ms prefill, 27-30 ms first text. Tokenising and the first text decode add about 3.5 ms (under 10% of the prefill). The 1044 token prompt now runs at about 27k tok/s, matching `bench` at 1024.
 
-The vLLM per-kernel nsys comparison needs the Spark with vLLM installed; neither exists on this machine, so the kernel gap analysis from #247 stands.
+The worker measurement above went through the old JSON worker (`inference-bench-specrt`), which issue #292 removes; the `PREFILL_CHUNK` change is in `runtime.rs` and does not depend on it. After the change the ignored GPU tests pass with `SPECRT_REF_DIR=/tmp/ref273` (logits 8/8, generate 4/4, jit 2/2, chat 3/3).
+
+### Per-kernel prefill, vLLM against specrt, 1024 tokens (Spark GB10, Qwen3-0.6B bf16)
+
+vLLM 0.32.0 under `nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi`, `--enforce-eager`, `--no-enable-prefix-caching`, one warm request set then one 1024-token completion (max_tokens 1) inside `/start_profile`..`/stop_profile`, `nsys stats --report cuda_gpu_kern_sum`. The request took 43 ms end to end. specrt is `bench specs/qwen3-0.6b.toml 1024 1` under nsys, six prefills, totals divided by six. GPU time only; the GPU was shared with Frigate and ffmpeg.
+
+| vLLM kernel | calls | total ms | share |
+|---|---|---|---|
+| cutlass_80 bf16 s16816 128x256 GEMM | 28 | 4.58 | 20.8% |
+| cutlass_80 bf16 s16816 256x128 GEMM | 28 | 3.31 | 15.0% |
+| flash_fwd_splitkv (FlashAttention 2) | 28 | 2.74 | 12.4% |
+| nvjet_sm121 128x192x64 GEMM | 28 | 2.39 | 10.9% |
+| gemvx (lm_head, one row) | 1 | 2.19 | 10.0% |
+| fused_add_rms_norm | 56 | 1.70 | 7.7% |
+| nvjet_sm121 32x96x64 GEMM | 28 | 1.50 | 6.8% |
+| act_and_mul (silu) | 28 | 1.10 | 5.0% |
+| rms_norm (qk norm) | 56 | 1.04 | 4.7% |
+| reshape_and_cache_flash | 28 | 0.75 | 3.4% |
+| rotary_embedding | 28 | 0.57 | 2.6% |
+| total | | 22.0 | |
+
+| specrt kernel | calls | total ms | share |
+|---|---|---|---|
+| gate_up_mma_big (norm + gate/up + silu*mul) | 28 | 13.25 | 26.9% |
+| flash_mma (Q norm, RoPE, attention) | 28 | 12.20 | 24.7% |
+| qkv_mma_big (norm + qkv) | 28 | 9.55 | 19.4% |
+| down_mma_big | 28 | 6.43 | 13.0% |
+| o_mma_big | 28 | 4.50 | 9.1% |
+| lm_head_mma_tiny | 1 | 1.73 | 3.5% |
+| kv_norm_rope | 28 | 1.39 | 2.8% |
+| row_rms + embed | 57 + 1 | 0.29 | 0.6% |
+| total | | 49.3 | |
+
+The gap is the GEMMs and attention. vLLM's four GEMM families (cuBLAS cutlass and nvjet on bf16 activations) take 11.8 ms for the whole prefill against 33.7 ms for specrt's four fused mma GEMMs (qkv, o, gate_up, down; 2.9x), and its FlashAttention takes 2.7 ms against 12.2 ms for `flash_mma` (4.5x). The small kernels are not the problem: vLLM spends 5.2 ms on norm, RoPE, activation and cache write, specrt 1.7 ms because it fuses norm and activation into the GEMMs, and lm_head is 1.7 ms against 2.2 ms. So the remaining work is the GEMM main loop (f32 activations converted per tile, hi/lo split doubling mma count) and the attention kernel, not fusion. Note the specrt total under nsys is 49 ms (about 21k tok/s) on the Spark, against 22 ms of vLLM kernel time; vLLM's 31 ms TTFT adds about 9 ms of scheduling and sampling around its kernels.
