@@ -349,3 +349,5 @@ The 1024-token kernel time is 37.6 ms against the 26 ms target: not reached. The
 #### Issue #305 follow-up
 
 Register double buffering of the GEMM fragments (ldmatrix for k step n+1 issued before the mma of step n, two fragment sets) was tried on the RTX PRO 6000 (nsys, same session, against the unmodified kernel): gate_up 6.9 vs 6.1 ms, qkv 4.55 vs 4.03, down 6.0 vs 6.4, o 2.83 vs 3.17 per six calls. Level or slower overall, so it is not kept; the compiler already hoists the fragment loads across the unrolled k steps. The remaining 11 ms to the 26 ms target needs either a looser logit gate (bf16 activations in the linears, about 7 ms; one-term attention, about 2 ms) or a different GEMM structure (persistent scheduler, larger warp tiles), neither of which fits the 1e-3 fp32 gate as it stands.
+
+Decision: the gate stays at 1e-3 against the fp32 reference, so the hi/lo split stays and prefill is good enough at 37.6 ms. The persistent tile scheduler, larger warp tiles and one-term attention are parked: they need that gate changed or a bigger GEMM restructure.
