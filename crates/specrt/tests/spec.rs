@@ -1,4 +1,4 @@
-use specrt::spec::{Quant, Spec};
+use specrt::spec::{Checked, EMBEDDED, Quant, SPEC_FORMAT, Spec, check};
 use std::path::Path;
 
 fn root() -> &'static Path {
@@ -141,4 +141,39 @@ fn gemma_and_phi3_stay_unsupported_with_the_model_type_in_the_error() {
         let e = Spec::from_hf_config(&json).unwrap_err().to_string();
         assert_eq!(e, format!("model_type {model_type} is not supported"));
     }
+}
+
+#[test]
+fn the_embedded_snapshot_equals_the_specs_folder() {
+    let mut on_disk: Vec<(String, String)> = std::fs::read_dir(root().join("specs"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".toml"))
+        .map(|n| (n.clone(), std::fs::read_to_string(root().join("specs").join(&n)).unwrap()))
+        .collect();
+    on_disk.sort();
+    let embedded: Vec<(String, String)> =
+        EMBEDDED.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect();
+    assert_eq!(embedded, on_disk);
+    assert!(embedded.len() >= 7);
+    for (name, text) in EMBEDDED {
+        assert!(Spec::parse(text).is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn min_engine_defaults_to_zero_and_a_newer_one_is_refused_by_name() {
+    let text = std::fs::read_to_string(root().join("specs/qwen3-0.6b.toml")).unwrap();
+    assert_eq!(Spec::parse(&text).unwrap().min_engine, 0);
+    let current = format!("min_engine = {SPEC_FORMAT}\n{text}");
+    assert_eq!(Spec::parse(&current).unwrap().min_engine, SPEC_FORMAT);
+    let newer = format!("min_engine = {}\n{}", SPEC_FORMAT + 1, text.replace("[mlp]", "[future]\nthing = 1\n[mlp]"));
+    assert_eq!(
+        check(&newer).unwrap(),
+        Checked::NeedsNewer { name: "qwen3-0.6b".into(), min_engine: SPEC_FORMAT + 1 }
+    );
+    let e = Spec::parse(&newer).unwrap_err().to_string();
+    assert!(e.contains("needs a newer inference-bench"), "{e}");
+    assert!(check("min_engine = -1\nname = \"x\"").is_err());
 }

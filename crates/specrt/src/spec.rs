@@ -2,6 +2,35 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub const SPEC_FORMAT: u32 = 1;
+
+pub const EMBEDDED: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/embedded_specs.rs"));
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Checked {
+    Ready(Box<Spec>),
+    NeedsNewer { name: String, min_engine: u32 },
+}
+
+pub fn needs_newer_note(min_engine: u32) -> String {
+    format!("needs a newer inference-bench (spec format {min_engine}, this build reads {SPEC_FORMAT})")
+}
+
+pub fn check(text: &str) -> Result<Checked> {
+    let value: toml::Table = toml::from_str(text)?;
+    let min_engine = match value.get("min_engine") {
+        None => 0,
+        Some(v) => v.as_integer().and_then(|n| u32::try_from(n).ok()).context("min_engine must be a whole number")?,
+    };
+    if min_engine > SPEC_FORMAT {
+        let name = value.get("name").and_then(|n| n.as_str()).context("spec has no name")?;
+        return Ok(Checked::NeedsNewer { name: name.to_string(), min_engine });
+    }
+    let spec: Spec = toml::from_str(text)?;
+    spec.validate()?;
+    Ok(Checked::Ready(Box::new(spec)))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Quant {
@@ -113,6 +142,8 @@ pub struct Mlp {
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     pub name: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub min_engine: u32,
     pub repo: String,
     pub quant: Quant,
     pub dims: Dims,
@@ -121,6 +152,10 @@ pub struct Spec {
     pub attention: Attention,
     pub rope: Rope,
     pub mlp: Mlp,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Deserialize)]
@@ -185,9 +220,10 @@ impl Spec {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let spec: Spec = toml::from_str(text)?;
-        spec.validate()?;
-        Ok(spec)
+        match check(text)? {
+            Checked::Ready(spec) => Ok(*spec),
+            Checked::NeedsNewer { name, min_engine } => bail!("spec {name} {}", needs_newer_note(min_engine)),
+        }
     }
 
     pub fn to_toml(&self) -> Result<String> {
@@ -215,6 +251,7 @@ impl Spec {
         };
         let spec = Spec {
             name: hf.model_type.clone(),
+            min_engine: 0,
             repo: String::new(),
             quant: Quant::Bf16,
             dims: Dims {
