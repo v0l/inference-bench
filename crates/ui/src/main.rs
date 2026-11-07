@@ -114,10 +114,12 @@ impl App {
                 EngineEvent::Loading(name) => self.loading = Some(name),
                 EngineEvent::Loaded(l) => {
                     self.loading = None;
+                    self.chat.load_error = None;
                     self.notice = Some((true, format!("{} loaded in {:.1} s", l.display, l.load_secs)));
                 }
                 EngineEvent::LoadFailed(e) => {
                     self.loading = None;
+                    self.chat.load_error = Some(e.to_string());
                     self.notice = Some((false, e.to_string()));
                 }
                 EngineEvent::Unloaded => self.notice = Some((true, "model unloaded".into())),

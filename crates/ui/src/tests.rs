@@ -1,6 +1,7 @@
 use super::*;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
+use inference_bench_core::conversations::Turn;
 use inference_bench_core::fake::{FakeServer, Script, ScriptedModel};
 use inference_bench_core::library::{Format, Support};
 use inference_bench_core::settings::Endpoint;
@@ -314,6 +315,45 @@ fn no_model_loaded_disables_sending() {
     h.run();
     assert!(h.state().loaded().is_none());
     assert!(!h.state().chat.streaming());
+    assert!(h.get_all_by_label_contains("Load a model to chat").count() >= 1);
+    h.get_by_label("load");
+}
+
+#[test]
+fn an_empty_library_sends_the_user_to_models() {
+    let mut h = harness("tomodels", Tab::Chat);
+    h.state_mut().library.clear();
+    h.run();
+    h.get_by_label("go to models").click();
+    h.run();
+    assert_eq!(h.state().tab, Tab::Models);
+}
+
+#[test]
+fn a_failed_load_shows_a_fault_on_the_chat_page() {
+    let mut h = harness("loadfail", Tab::Chat);
+    {
+        let app = h.state_mut();
+        scripted(app, Script { models: vec![], ..script() });
+        let m = app.library[0].clone();
+        app.chat.pick("Qwen3-0.6B");
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 20, "load failure", |a| a.chat.load_error.is_some());
+    h.run();
+    assert_eq!(h.get_all_by_label_contains("no config.json").count(), 2, "status bar and chat fault");
+}
+
+#[test]
+fn a_failed_reply_shows_a_fault_under_the_transcript() {
+    let mut h = harness("replyfail", Tab::Chat);
+    {
+        let app = h.state_mut();
+        app.chat.conv().turns.push(Turn { message: inference_bench_core::chat::Message::new(inference_bench_core::chat::Role::User, "hi"), stats: None });
+        app.chat.error = Some("the engine has stopped".into());
+    }
+    h.run();
+    h.get_by_label_contains("the engine has stopped");
 }
 
 #[test]

@@ -1,5 +1,4 @@
-use crate::shell::page;
-use crate::App;
+use crate::{App, Tab};
 use eframe::egui;
 use egui_bench::chat as chat_ui;
 use egui_bench::prelude::*;
@@ -14,6 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 
+const READY_HINT: &str = "Send a message. Enter sends, Shift+Enter adds a line.";
+const IDLE_HINT: &str = "Load a model to chat";
+
 pub struct Streaming {
     rx: Receiver<ChatEvent>,
     pub text: String,
@@ -27,6 +29,7 @@ pub struct ChatState {
     pub streaming: Option<Streaming>,
     pub last_stats: Option<Stats>,
     pub error: Option<String>,
+    pub load_error: Option<String>,
     pub markdown: egui_bench::markdown::Cache,
     pub show_settings: bool,
     pub seed_text: String,
@@ -46,8 +49,9 @@ impl ChatState {
             streaming: None,
             last_stats: None,
             error: None,
+            load_error: None,
             markdown: egui_bench::markdown::Cache::default(),
-            show_settings: true,
+            show_settings: false,
             seed_text: String::new(),
             max_tokens_text: String::new(),
         }
@@ -156,53 +160,104 @@ impl ChatState {
     }
 }
 
-fn top_bar(app: &mut App, ui: &mut egui::Ui) {
-    let model = app.chat.conv().model.clone();
-    let usable: Vec<String> = app
-        .library
+fn usable_models(app: &App) -> Vec<String> {
+    app.library
         .iter()
         .filter(|m| m.support_for(NATIVE).is_some_and(|s| s.supported))
         .map(|m| m.name.clone())
-        .collect();
-    let loaded = app.loaded();
-    ui.horizontal(|ui| {
-        ui.allocate_ui(egui::vec2(260.0, KEY_H), |ui| {
-            let mut m = model.clone();
-            let mut options: Vec<(String, String)> = usable.iter().map(|x| (x.clone(), x.clone())).collect();
-            if !model.is_empty() && !usable.contains(&model) {
-                options.insert(0, (model.clone(), model.clone()));
-            }
-            if choice(ui, "chat-model", &mut m, options) {
-                app.chat.conv().model = m;
-            }
-        });
-        let is_loaded = loaded.as_ref().is_some_and(|l| l.display == model);
-        if app.loading.is_some() {
-            ui.add(Key::new("loading").outline(READOUT).enabled(false).min_width(110.0));
-        } else if is_loaded {
-            if ui.add(Key::new("unload").outline(FAULT).min_width(100.0)).clicked() {
-                app.unload();
-            }
-        } else {
-            let found = app.library.iter().find(|m| m.name == model).cloned();
-            if ui.add(Key::new("load").solid(READOUT).enabled(found.is_some()).min_width(100.0)).clicked()
-                && let Some(m) = found
-            {
-                app.load_model(&m);
-            }
+        .collect()
+}
+
+enum Status {
+    None,
+    Loading(String),
+    Ready(String),
+    Failed(String),
+}
+
+impl Status {
+    fn of(app: &mut App) -> Self {
+        let model = app.chat.conv().model.clone();
+        match (&app.loading, app.loaded()) {
+            (Some(name), _) => Status::Loading(name.clone()),
+            (None, Some(l)) => Status::Ready(l.display),
+            _ if app.chat.load_error.is_some() && !model.is_empty() => Status::Failed(model),
+            _ => Status::None,
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some(g) = app.gpu.first() {
-                Line::new().legend("vram").measured(format!("{} / {}", human_size(g.used_bytes), human_size(g.total_bytes))).size(11.0).show(ui);
-            }
-        });
+    }
+
+    fn model(&self) -> chat_ui::Model<'_> {
+        match self {
+            Status::None => chat_ui::Model::None,
+            Status::Loading(s) => chat_ui::Model::Loading(s),
+            Status::Ready(s) => chat_ui::Model::Ready(s),
+            Status::Failed(s) => chat_ui::Model::Failed(s),
+        }
+    }
+}
+
+fn picker(app: &mut App, ui: &mut egui::Ui) {
+    let model = app.chat.conv().model.clone();
+    let usable = usable_models(app);
+    ui.allocate_ui(egui::vec2(260.0, KEY_H), |ui| {
+        let mut m = model.clone();
+        let mut options: Vec<(String, String)> = usable.iter().map(|x| (x.clone(), x.clone())).collect();
+        if !model.is_empty() && !usable.contains(&model) {
+            options.insert(0, (model.clone(), model.clone()));
+        }
+        if choice(ui, "chat-model", &mut m, options) {
+            app.chat.conv().model = m;
+        }
     });
 }
 
-fn context_bar(app: &mut App, ui: &mut egui::Ui) {
-    let ctx_len = app.settings.specrt_ctx;
-    let used = app.chat.conv().token_estimate();
-    chat_ui::context_bar(ui, used, ctx_len);
+fn load_key(app: &mut App, ui: &mut egui::Ui) {
+    let model = app.chat.conv().model.clone();
+    let loaded = app.loaded();
+    let is_loaded = loaded.as_ref().is_some_and(|l| l.display == model);
+    if app.loading.is_some() {
+        ui.add(Key::new("loading").outline(READOUT).enabled(false).min_width(100.0));
+    } else if is_loaded {
+        if ui.add(Key::new("unload").outline(FAULT).min_width(100.0)).clicked() {
+            app.unload();
+        }
+    } else {
+        let found = app.library.iter().find(|m| m.name == model).cloned();
+        if ui.add(Key::new("load").solid(READOUT).enabled(found.is_some()).min_width(100.0)).clicked()
+            && let Some(m) = found
+        {
+            app.chat.load_error = None;
+            app.load_model(&m);
+        }
+    }
+}
+
+fn header(app: &mut App, ui: &mut egui::Ui) {
+    let status = Status::of(app);
+    let busy = app.chat.streaming();
+    let mut toggle_settings = false;
+    chat_ui::header(ui, status.model(), busy, |ui| {
+        let label = if app.chat.show_settings { "hide settings" } else { "settings" };
+        toggle_settings = ui.add(Key::new(label).outline(VALUE).min_width(100.0).id_salt("chat-settings")).clicked();
+        if let Some(g) = app.gpu.first() {
+            Line::new()
+                .legend("vram")
+                .measured(format!("{} / {}", human_size(g.used_bytes), human_size(g.total_bytes)))
+                .size(11.0)
+                .show(ui);
+        }
+    });
+    if toggle_settings {
+        app.chat.show_settings = !app.chat.show_settings;
+    }
+    ui.horizontal(|ui| {
+        picker(app, ui);
+        load_key(app, ui);
+    });
+}
+
+fn context_limit(app: &App) -> usize {
+    app.settings.specrt_ctx
 }
 
 fn side_list(app: &mut App, ui: &mut egui::Ui) {
@@ -236,7 +291,7 @@ fn side_list(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-fn stats_strip(ui: &mut egui::Ui, s: &Stats) {
+pub fn stats_line(s: &Stats) -> Line {
     let mut line = Line::new().legend("ttft").measured(format!("{:.0} ms", s.ttft_secs * 1000.0));
     if let Some(v) = s.prefill_tok_s {
         line = line.gap(12.0).legend("prefill").measured(format!("{v:.0} tok/s"));
@@ -244,7 +299,7 @@ fn stats_strip(ui: &mut egui::Ui, s: &Stats) {
     if let Some(v) = s.decode_tok_s {
         line = line.gap(12.0).legend("decode").measured(format!("{v:.1} tok/s"));
     }
-    line.gap(12.0).legend("tokens").measured(format!("{} + {}", s.prompt_tokens, s.completion_tokens)).size(10.5).show(ui);
+    line.gap(12.0).legend("tokens").measured(format!("{} + {}", s.prompt_tokens, s.completion_tokens)).size(10.5)
 }
 
 fn ui_role(role: Role) -> chat_ui::Role {
@@ -275,10 +330,10 @@ fn sampling_panel(app: &mut App, ui: &mut egui::Ui) {
             if max_text.is_empty() {
                 *max_text = c.sampling.max_tokens.to_string();
             }
-            if field(ui, max_text, "512").changed() {
-                if let Ok(v) = max_text.trim().parse::<usize>() {
-                    c.sampling.max_tokens = v.clamp(1, 131072);
-                }
+            if field(ui, max_text, "512").changed()
+                && let Ok(v) = max_text.trim().parse::<usize>()
+            {
+                c.sampling.max_tokens = v.clamp(1, 131072);
             }
         });
         row(ui, "seed", |ui| {
@@ -295,26 +350,64 @@ fn sampling_panel(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
+fn empty_state(app: &mut App, ui: &mut egui::Ui) {
+    let ready = app.loaded().is_some();
+    if ready {
+        chat_ui::welcome(ui, "Start a conversation", "Type below. Replies stream in with their speed underneath.");
+        return;
+    }
+    if usable_models(app).is_empty() {
+        chat_ui::welcome(
+            ui,
+            IDLE_HINT,
+            "No model on disk runs here yet. Download one from the Models page.",
+        );
+        if ui.add(Key::new("go to models").solid(READOUT).min_width(140.0).id_salt("chat-to-models")).clicked() {
+            app.tab = Tab::Models;
+        }
+    } else {
+        chat_ui::welcome(ui, IDLE_HINT, "Pick a model above and load it. It stays loaded for every chat until you unload it.");
+    }
+}
+
 fn conversation_view(app: &mut App, ui: &mut egui::Ui) {
     let handle = app.engine.handle();
     let streaming_text = app.chat.streaming.as_ref().map(|s| s.text.clone());
     let last = app.chat.conversations.len() - 1;
     let cur = app.chat.current.min(last);
     let turns = app.chat.conversations[cur].turns.clone();
+    let error = app.chat.error.clone();
+    let load_error = app.chat.load_error.clone();
     if turns.is_empty() && streaming_text.is_none() {
-        chat_ui::welcome(ui, "START A CONVERSATION", "pick a model above, load it, and type below");
+        empty_state(app, ui);
+        if let Some(e) = &load_error {
+            chat_ui::fault(ui, "load failed", e);
+        }
+        return;
     }
-    let messages: Vec<chat_ui::Message> = turns.iter().map(|t| chat_ui::Message::new(ui_role(t.message.role), t.message.content.clone())).collect();
+    let messages: Vec<chat_ui::Message> =
+        turns.iter().map(|t| chat_ui::Message::new(ui_role(t.message.role), t.message.content.clone())).collect();
     let mut strip = |ui: &mut egui::Ui, i: usize| {
         if let Some(s) = turns.get(i).and_then(|t| t.stats.as_ref()) {
-            stats_strip(ui, s);
+            stats_line(s).show(ui);
         }
     };
-    let streaming = streaming_text.as_deref().map(|t| if t.is_empty() { "..." } else { t });
-    let events = chat_ui::transcript(ui, &mut app.chat.markdown, &messages, streaming, Some(&mut strip));
-    if let Some(e) = &app.chat.error {
-        note(ui, e.clone(), FAULT);
-    }
+    let below = |ui: &mut egui::Ui| {
+        if let Some(e) = &error {
+            chat_ui::fault(ui, "generation failed", e);
+        }
+        if let Some(e) = &load_error {
+            chat_ui::fault(ui, "load failed", e);
+        }
+    };
+    let events = chat_ui::transcript_with(
+        ui,
+        &mut app.chat.markdown,
+        &messages,
+        streaming_text.as_deref(),
+        Some(&mut strip),
+        below,
+    );
     for event in events {
         if let chat_ui::Event::Regenerate(_) = event {
             app.chat.regenerate(handle.clone());
@@ -326,8 +419,17 @@ fn composer(app: &mut App, ui: &mut egui::Ui) {
     let handle = app.engine.handle();
     let ready = app.loaded().is_some();
     let streaming = app.chat.streaming();
-    let hint = if ready { "Send a message. Enter sends, Shift+Enter adds a line." } else { "Load a model to chat" };
-    for event in chat_ui::ask_box(ui, &mut app.chat.input, hint, streaming, ready) {
+    let hint = if ready { READY_HINT } else { IDLE_HINT };
+    let used = app.chat.conv().token_estimate();
+    let limit = context_limit(app);
+    chat_ui::context_bar(ui, used, limit);
+    let last = app.chat.last_stats;
+    let events = chat_ui::ask_box_with(ui, &mut app.chat.input, hint, streaming, ready, |ui| {
+        if let Some(s) = &last {
+            stats_line(s).show(ui);
+        }
+    });
+    for event in events {
         match event {
             chat_ui::Event::Stop => app.chat.stop(),
             chat_ui::Event::Sent(text) => {
@@ -344,27 +446,27 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     egui::Panel::left("chats")
         .exact_size(230.0)
         .resizable(false)
-        .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(8))
+        .frame(egui::Frame::NONE.fill(WELL).inner_margin(8))
         .show_inside(ui, |ui| side_list(app, ui));
-    egui::Panel::right("chat-settings")
-        .exact_size(330.0)
-        .resizable(false)
-        .frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(8))
-        .show_inside(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 8.0;
-                sampling_panel(app, ui);
+    if app.chat.show_settings {
+        egui::Panel::right("chat-settings")
+            .exact_size(330.0)
+            .resizable(false)
+            .frame(egui::Frame::NONE.fill(WELL).inner_margin(8))
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    sampling_panel(app, ui);
+                });
             });
-        });
+    }
+    let frame = egui::Frame::NONE.inner_margin(egui::Margin::symmetric(16, 10));
+    egui::Panel::top("chat-header").frame(frame).show_inside(ui, |ui| header(app, ui));
+    egui::Panel::bottom("chat-composer").frame(frame).show_inside(ui, |ui| composer(app, ui));
     egui::CentralPanel::no_frame().show_inside(ui, |ui| {
-        page(ui, "chat", |ui| {
-            top_bar(app, ui);
-            ui.add_space(4.0);
-            context_bar(app, ui);
-            ui.add_space(6.0);
-            let h = ui.available_height() - 90.0;
-            ui.allocate_ui(egui::vec2(ui.available_width(), h.max(100.0)), |ui| conversation_view(app, ui));
-            composer(app, ui);
+        egui::Frame::NONE.inner_margin(egui::Margin::symmetric(16, 0)).show(ui, |ui| {
+            ui.set_max_width(ui.available_width().min(900.0));
+            conversation_view(app, ui);
         });
     });
 }

@@ -24,5 +24,8 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "ansi", "registry", "std", "smallvec", "tracing-log"] }
 ureq = { version = "3", features = ["json"] }
 
+[patch.crates-io]
+egui_bench = { path = "/home/kieran/git/.worktrees/egui_bench-chat-look" }
+
 [profile.dev.package.inference-bench-specrt]
 opt-level = 3
