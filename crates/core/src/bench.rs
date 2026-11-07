@@ -1,4 +1,4 @@
-use crate::backend::{BackendConfig, Request};
+use crate::target::{TargetConfig, Request};
 use crate::matrix::run_model;
 use crate::result::RunResult;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,7 @@ impl BenchModel {
 #[derive(Debug, Clone)]
 pub struct BenchPlan {
     pub models: Vec<BenchModel>,
-    pub backends: Vec<(String, BackendConfig)>,
+    pub backends: Vec<(String, TargetConfig)>,
     pub prompt_lengths: Vec<usize>,
     pub max_tokens: usize,
 }
@@ -78,19 +78,20 @@ pub fn run_plan(
                 }
                 on_start(index, &cell);
                 let request = Request { prompt: synthetic_prompt(len), max_tokens: plan.max_tokens };
-                let result = match (backend.as_mut(), model.id_for(label)) {
-                    (Ok(b), Some(id)) => {
+                let result = match model.id_for(label) {
+                    Some(id) => {
+                        let b = backend.as_mut();
                         let mut r = if loaded {
-                            run_model_loaded(b.as_mut(), label, &model.name, &request)
+                            run_model_loaded(b, label, &model.name, &request)
                         } else {
-                            run_model(b.as_mut(), label, &model.name, id, &request, &mut |_| {})
+                            run_model(b, label, &model.name, id, &request, &mut |_| {})
                         };
                         loaded = r.error.is_none();
                         r.text = r.text.chars().take(2000).collect();
                         r.model = tagged(&model.name, len);
                         r
                     }
-                    (Ok(_), None) => {
+                    None => {
                         let why = model
                             .skips
                             .iter()
@@ -99,7 +100,6 @@ pub fn run_plan(
                             .unwrap_or_else(|| format!("{label} has no way to load {}", model.name));
                         RunResult::failed(label, &tagged(&model.name, len), chrono::Utc::now(), crate::result::BackendError::classify(why))
                     }
-                    (Err(e), _) => RunResult::failed(label, &tagged(&model.name, len), chrono::Utc::now(), e.clone()),
                 };
                 on_result(index, &cell, result);
                 index += 1;
@@ -136,7 +136,7 @@ pub fn load_sessions(dir: &std::path::Path) -> Vec<(String, Vec<RunResult>)> {
 }
 
 fn run_model_loaded(
-    backend: &mut dyn crate::backend::Backend,
+    backend: &mut dyn crate::target::Target,
     label: &str,
     model: &str,
     request: &Request,
@@ -221,8 +221,8 @@ mod tests {
         }
     }
 
-    fn openai(url: &str) -> BackendConfig {
-        BackendConfig::Openai { url: url.into(), api_key: None, label: None }
+    fn openai(url: &str) -> TargetConfig {
+        TargetConfig::Openai { url: url.into(), api_key: None, label: None }
     }
 
     fn plan(a: &FakeServer, b: &FakeServer) -> BenchPlan {

@@ -139,7 +139,7 @@ pub fn build_plan(app: &App) -> Option<BenchPlan> {
     let backends: Vec<(String, _)> = st
         .backends
         .iter()
-        .filter_map(|b| app.settings.config_for(b).map(|c| (b.clone(), c)))
+        .filter_map(|b| app.settings.target_for(b).map(|c| (b.clone(), c)))
         .collect();
     let models: Vec<BenchModel> = app
         .library
@@ -192,9 +192,9 @@ fn setup(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     });
-    section(ui, "backends", "each one is loaded in turn", |ui| {
+    section(ui, "targets", "the native engine and other engines' servers, each loaded in turn", |ui| {
         ui.horizontal_wrapped(|ui| {
-            for b in app.settings.backend_names() {
+            for b in app.settings.bench_targets() {
                 toggle_set(ui, &mut app.bench.backends, &b, READOUT);
             }
         });

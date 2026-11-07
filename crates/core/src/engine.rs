@@ -1,5 +1,6 @@
-use crate::backend::{Backend, BackendConfig};
 use crate::chat::ChatRequest;
+use crate::native::{Factory, Native, specrt_factory};
+use crate::target::Target;
 use crate::result::{BackendError, Generation};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -7,14 +8,13 @@ use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Loaded {
-    pub backend: String,
     pub model_id: String,
     pub display: String,
     pub load_secs: f64,
 }
 
 pub enum Command {
-    Load { backend: String, config: BackendConfig, model_id: String, display: String },
+    Load { model_id: String, display: String, max_ctx: Option<usize> },
     Unload,
     Chat { request: ChatRequest, events: Sender<ChatEvent> },
     Shutdown,
@@ -65,11 +65,15 @@ impl Handle {
 
 impl Engine {
     pub fn spawn(wake: Wake) -> Self {
+        Self::with_factory(wake, specrt_factory())
+    }
+
+    pub fn with_factory(wake: Wake, factory: Factory) -> Self {
         let (commands, inbox) = channel();
         let (events_tx, events) = channel();
         let loaded = Arc::new(Mutex::new(None));
         let shared = loaded.clone();
-        std::thread::spawn(move || run(inbox, events_tx, shared, wake));
+        std::thread::spawn(move || run(inbox, events_tx, shared, wake, factory));
         Self { commands, events, loaded }
     }
 
@@ -97,8 +101,9 @@ fn run(
     events: Sender<EngineEvent>,
     shared: Arc<Mutex<Option<Loaded>>>,
     wake: Wake,
+    factory: Factory,
 ) {
-    let mut backend: Option<Box<dyn Backend>> = None;
+    let mut backend: Option<Native> = None;
     let emit = |e: EngineEvent| {
         let _ = events.send(e);
         wake();
@@ -111,16 +116,16 @@ fn run(
                 *shared.lock().unwrap() = None;
                 emit(EngineEvent::Unloaded);
             }
-            Command::Load { backend: label, config, model_id, display } => {
+            Command::Load { model_id, display, max_ctx } => {
                 backend = None;
                 *shared.lock().unwrap() = None;
                 emit(EngineEvent::Loading(display.clone()));
                 let started = Instant::now();
-                let outcome = config.build().and_then(|mut b| b.load(&model_id).map(|_| b));
-                match outcome {
-                    Ok(b) => {
-                        backend = Some(b);
-                        let info = Loaded { backend: label, model_id, display, load_secs: started.elapsed().as_secs_f64() };
+                let mut native = Native::with_factory(max_ctx, factory.clone());
+                match native.load(&model_id) {
+                    Ok(()) => {
+                        backend = Some(native);
+                        let info = Loaded { model_id, display, load_secs: started.elapsed().as_secs_f64() };
                         *shared.lock().unwrap() = Some(info.clone());
                         emit(EngineEvent::Loaded(info));
                     }
@@ -151,7 +156,7 @@ fn run(
 mod tests {
     use super::*;
     use crate::chat::{Message, Role, Sampling};
-    use crate::fake::{FakeServer, Script};
+    use crate::fake::{Script, ScriptedModel};
     use std::time::Duration;
 
     fn script() -> Script {
@@ -165,12 +170,12 @@ mod tests {
         }
     }
 
-    fn config(url: &str) -> BackendConfig {
-        BackendConfig::Openai { url: url.into(), api_key: None, label: Some("fake".into()) }
+    fn load(model: &str, display: &str) -> Command {
+        Command::Load { model_id: model.into(), display: display.into(), max_ctx: None }
     }
 
     fn engine() -> Engine {
-        Engine::spawn(Arc::new(|| {}))
+        Engine::with_factory(Arc::new(|| {}), ScriptedModel::factory(script()))
     }
 
     fn wait_event(e: &Engine) -> EngineEvent {
@@ -198,12 +203,11 @@ mod tests {
 
     #[test]
     fn a_loaded_model_streams_a_reply_with_stats() {
-        let server = FakeServer::start(script());
         let e = engine();
-        e.send(Command::Load { backend: "fake".into(), config: config(&server.url), model_id: "m".into(), display: "M".into() });
+        e.send(load("m", "M"));
         assert_eq!(wait_event(&e), EngineEvent::Loading("M".into()));
         assert!(matches!(wait_event(&e), EngineEvent::Loaded(l) if l.display == "M"));
-        assert_eq!(e.loaded().unwrap().backend, "fake");
+        assert_eq!(e.loaded().unwrap().model_id, "m");
         let (text, done, _) = ask(&e.handle(), "hi");
         assert_eq!(text, "Hello there");
         let g = done.unwrap();
@@ -213,11 +217,10 @@ mod tests {
 
     #[test]
     fn chat_without_a_model_fails_and_unload_clears_the_state() {
-        let server = FakeServer::start(script());
         let e = engine();
         let (_, _, failed) = ask(&e.handle(), "hi");
         assert!(failed.unwrap().message.contains("no model"));
-        e.send(Command::Load { backend: "fake".into(), config: config(&server.url), model_id: "m".into(), display: "M".into() });
+        e.send(load("m", "M"));
         wait_event(&e);
         wait_event(&e);
         e.send(Command::Unload);
@@ -226,10 +229,9 @@ mod tests {
     }
 
     #[test]
-    fn a_model_the_backend_lacks_is_a_load_failure() {
-        let server = FakeServer::start(script());
+    fn a_model_that_is_not_on_disk_is_a_load_failure() {
         let e = engine();
-        e.send(Command::Load { backend: "fake".into(), config: config(&server.url), model_id: "other".into(), display: "O".into() });
+        e.send(load("other", "O"));
         wait_event(&e);
         match wait_event(&e) {
             EngineEvent::LoadFailed(err) => assert_eq!(err.kind, crate::result::ErrorKind::ModelNotFound),

@@ -10,5 +10,5 @@ pub mod serve;
 
 pub use app::{AppState, REQUEST_ID_HEADER, router};
 pub use config::ServerConfig;
-pub use manager::{BackendFactory, DefaultFactory};
+pub use manager::{EngineFactory, NativeFactory};
 pub use serve::{Server, ServerHandle};

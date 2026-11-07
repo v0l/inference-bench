@@ -92,7 +92,7 @@ fn status_bar(app: &mut App, ui: &mut egui::Ui) {
                 lamp(ui, &format!("loading {name}"), true, false);
             }
             (None, Some(l)) => {
-                lamp(ui, &format!("{} on {}", l.display, l.backend), true, false);
+                lamp(ui, &l.display, true, false);
             }
             _ => {
                 lamp(ui, "no model loaded", false, false);

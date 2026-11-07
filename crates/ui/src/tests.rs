@@ -1,7 +1,7 @@
 use super::*;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use inference_bench_core::fake::{FakeServer, Script};
+use inference_bench_core::fake::{FakeServer, Script, ScriptedModel};
 use inference_bench_core::library::{Format, Support};
 use inference_bench_core::settings::Endpoint;
 
@@ -27,9 +27,12 @@ fn model(name: &str, specrt: bool, reason: &str) -> LocalModel {
             Support { backend: "specrt", supported: specrt, reason: reason.into() },
             Support { backend: "llama.cpp", supported: false, reason: "needs a GGUF conversion".into() },
             Support { backend: "vllm", supported: true, reason: "registered".into() },
-            Support { backend: "transformers", supported: true, reason: "config".into() },
         ],
     }
+}
+
+fn scripted(app: &mut App, script: Script) {
+    app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), ScriptedModel::factory(script));
 }
 
 fn script() -> Script {
@@ -83,15 +86,14 @@ fn the_model_list_shows_an_unsupported_architecture_badge() {
 }
 
 #[test]
-fn a_fake_streaming_backend_fills_a_chat_with_stats() {
-    let server = FakeServer::start(script());
+fn a_scripted_native_model_fills_a_chat_with_stats() {
     let mut h = harness("chat", Tab::Chat);
     {
         let app = h.state_mut();
-        app.settings.endpoints = vec![Endpoint { label: "fake".into(), backend: "vllm".into(), url: server.url.clone(), api_key: String::new() }];
+        scripted(app, script());
         let m = app.library[0].clone();
-        app.chat.pick("Qwen3-0.6B", "fake");
-        app.load_model("fake", &m);
+        app.chat.pick("Qwen3-0.6B");
+        app.load_model(&m);
     }
     let start = Instant::now();
     while h.state().loaded().is_none() {
@@ -144,14 +146,13 @@ fn a_fake_streaming_backend_fills_a_chat_with_stats() {
 
 #[test]
 fn stop_cancels_a_stream_and_regenerate_replaces_the_last_reply() {
-    let server = FakeServer::start(Script { chunks: (0..60).map(|i| format!("w{i} ")).collect(), chunk_delay_ms: 20, ..script() });
     let mut h = harness("regen", Tab::Chat);
     {
         let app = h.state_mut();
-        app.settings.endpoints = vec![Endpoint { label: "fake".into(), backend: "vllm".into(), url: server.url.clone(), api_key: String::new() }];
+        scripted(app, Script { chunks: (0..60).map(|i| format!("w{i} ")).collect(), chunk_delay_ms: 20, ..script() });
         let m = app.library[0].clone();
-        app.chat.pick("Qwen3-0.6B", "fake");
-        app.load_model("fake", &m);
+        app.chat.pick("Qwen3-0.6B");
+        app.load_model(&m);
     }
     while h.state().loaded().is_none() {
         h.step();
@@ -223,15 +224,14 @@ fn the_bench_grid_runs_from_the_ui_against_fake_http_backends() {
 
 #[test]
 fn the_server_tab_starts_and_serves_the_loaded_model() {
-    let fake = FakeServer::start(script());
     let mut h = harness("server", Tab::Server);
     {
         let app = h.state_mut();
-        app.settings.endpoints = vec![Endpoint { label: "fake".into(), backend: "vllm".into(), url: fake.url.clone(), api_key: String::new() }];
+        scripted(app, script());
         app.settings.server.port = 0;
         app.server.port_text = "0".into();
         let m = app.library[0].clone();
-        app.load_model("fake", &m);
+        app.load_model(&m);
     }
     while h.state().loaded().is_none() {
         h.step();
@@ -316,6 +316,30 @@ fn no_model_loaded_disables_sending() {
     assert!(!h.state().chat.streaming());
 }
 
+#[test]
+fn chat_has_no_backend_picker_and_settings_list_bench_targets() {
+    let mut h = harness("nopicker", Tab::Chat);
+    h.run();
+    for name in ["llama.cpp", "vllm", "transformers", "specrt"] {
+        assert!(h.query_by_label(name).is_none(), "chat offers {name}");
+    }
+    let tree = format!("{:?}", h.root());
+    assert!(!tree.contains("specrt") && !tree.contains("vllm"), "chat shows an engine choice: {tree}");
+    h.state_mut().tab = Tab::Settings;
+    h.run();
+    assert!(h.query_by_label("name for a new bench target").is_some());
+    assert!(h.query_by_label_contains("python3").is_none());
+    assert!(h.query_by_label_contains("inference-bench-specrt").is_none());
+    let app = h.state_mut();
+    app.bench.models.insert("Qwen3-0.6B".into());
+    app.bench.backends.insert("specrt".into());
+    app.bench.backends.insert("llama.cpp".into());
+    app.bench.backends.insert("transformers".into());
+    let plan = crate::bench::build_plan(h.state()).expect("a plan");
+    let kinds: Vec<(&str, &str)> = plan.backends.iter().map(|(l, c)| (l.as_str(), c.kind())).collect();
+    assert_eq!(kinds, [("llama.cpp", "openai"), ("specrt", "native")]);
+}
+
 fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl Fn(&App) -> bool) {
     let start = Instant::now();
     while !done(h.state()) {
@@ -326,7 +350,7 @@ fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl F
 }
 
 #[test]
-#[ignore = "needs a GPU, the hub cache and a built specrt worker; run with SHOTS=docs/gui"]
+#[ignore = "needs a GPU and the hub cache; run with SHOTS=docs/gui"]
 fn screenshots_with_real_data() {
     let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
     std::fs::create_dir_all(&out).unwrap();
@@ -334,7 +358,7 @@ fn screenshots_with_real_data() {
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
         let mut app = App::new(d, wake_for(&cc.egui_ctx));
-        app.settings.specrt_worker = std::env::var("SPECRT_WORKER").unwrap_or_default();
+        app.settings.specrt_ctx = 4096;
         app
     });
     pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
@@ -348,8 +372,8 @@ fn screenshots_with_real_data() {
     let qwen = h.state().library.iter().find(|m| m.name == "Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
     {
         let app = h.state_mut();
-        app.chat.pick("Qwen3-0.6B", "specrt");
-        app.load_model("specrt", &qwen);
+        app.chat.pick("Qwen3-0.6B");
+        app.load_model(&qwen);
         app.tab = Tab::Chat;
     }
     pump_until(&mut h, 120, "load", |a| a.loaded().is_some());
@@ -388,7 +412,6 @@ fn screenshots_with_real_data() {
         app.bench.models.insert("Qwen3-0.6B".into());
         app.bench.models.insert("SmolLM2-135M".into());
         app.bench.backends.insert("specrt".into());
-        app.bench.backends.insert("transformers".into());
         app.bench.lengths = vec![(128, true), (512, true), (2048, false), (8192, false)];
         app.bench.max_tokens = 64;
         app.tab = Tab::Bench;
@@ -426,15 +449,14 @@ fn screenshots_with_real_data() {
 fn screenshots_of_the_server_and_logs_tabs() {
     let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
     std::fs::create_dir_all(&out).unwrap();
-    let fake = FakeServer::start(script());
     let mut h = harness("shots-logs", Tab::Server);
     {
         let app = h.state_mut();
         app.logs = shared_logs();
         app.logs.clear();
-        app.settings.endpoints = vec![Endpoint { label: "fake".into(), backend: "vllm".into(), url: fake.url.clone(), api_key: String::new() }];
+        scripted(app, script());
         let m = app.library[0].clone();
-        app.load_model("fake", &m);
+        app.load_model(&m);
     }
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     {

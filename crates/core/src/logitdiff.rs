@@ -1,4 +1,4 @@
-use crate::backend::{Backend, Logits};
+use crate::target::{Target, Logits};
 use crate::result::BackendError;
 use serde::{Deserialize, Serialize};
 
@@ -73,12 +73,23 @@ pub fn diff(ours: &Logits, reference: &Logits) -> Result<LogitDiff, BackendError
     })
 }
 
-pub fn check(
-    backend: &mut dyn Backend,
-    reference: &mut dyn Backend,
-    prompt: &str,
-) -> Result<LogitDiff, BackendError> {
-    diff(&backend.logits(prompt)?, &reference.logits(prompt)?)
+pub fn check(target: &mut dyn Target, reference: &Logits, prompt: &str) -> Result<LogitDiff, BackendError> {
+    diff(&target.logits(prompt)?, reference)
+}
+
+pub fn read_reference(json: &std::path::Path) -> Result<Logits, BackendError> {
+    let text = std::fs::read_to_string(json)
+        .map_err(|e| BackendError::failed(format!("{}: {e}", json.display())))?;
+    let meta: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| BackendError::failed(format!("{}: {e}", json.display())))?;
+    let tokens: Vec<u32> = meta["tokens"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
+        .unwrap_or_default();
+    let vocab = meta["vocab"].as_u64().unwrap_or(0) as usize;
+    let name = json.to_string_lossy();
+    let bin = std::path::PathBuf::from(format!("{}.bin", name.strip_suffix(".json").unwrap_or(&name)));
+    Logits::read(&bin, tokens, vocab)
 }
 
 #[cfg(test)]
@@ -115,13 +126,13 @@ mod tests {
     }
 
     #[test]
-    fn check_asks_both_backends_for_the_same_prompt() {
+    fn check_asks_the_target_for_the_prompt_and_compares_with_the_reference() {
         struct Fixed(Logits);
-        impl Backend for Fixed {
+        impl Target for Fixed {
             fn name(&self) -> &str {
                 "fixed"
             }
-            fn capabilities(&self) -> crate::backend::Capabilities {
+            fn capabilities(&self) -> crate::target::Capabilities {
                 Default::default()
             }
             fn load(&mut self, _: &str) -> Result<(), BackendError> {
@@ -129,7 +140,7 @@ mod tests {
             }
             fn generate(
                 &mut self,
-                _: &crate::backend::Request,
+                _: &crate::target::Request,
                 _: &mut dyn FnMut(&str),
             ) -> Result<crate::result::Generation, BackendError> {
                 unreachable!()
@@ -140,7 +151,18 @@ mod tests {
             }
         }
         let l = logits(vec![1., 2., 3., 6., 5., 4.]);
-        let d = check(&mut Fixed(l.clone()), &mut Fixed(l), FIXED_PROMPT).unwrap();
+        let d = check(&mut Fixed(l.clone()), &l, FIXED_PROMPT).unwrap();
         assert_eq!(d.rows, 2);
+    }
+
+    #[test]
+    fn a_reference_pair_from_reference_py_reads_back() {
+        let dir = std::env::temp_dir().join(format!("ib-ref-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tiny.ref.json"), r#"{"tokens": [5, 6], "vocab": 2, "greedy": []}"#).unwrap();
+        let bytes: Vec<u8> = [1f32, 2., 3., 4.].iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join("tiny.ref.bin"), bytes).unwrap();
+        let l = read_reference(&dir.join("tiny.ref.json")).unwrap();
+        assert_eq!((l.tokens.clone(), l.row(1)), (vec![5, 6], &[3.0, 4.0][..]));
     }
 }

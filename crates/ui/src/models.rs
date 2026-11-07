@@ -205,13 +205,12 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
                 Line::new().note(format!("specrt: {}", why.reason)).size(10.5).elided(ui);
             }
             ui.horizontal(|ui| {
-                let first = BACKENDS.iter().find(|b| m.support_for(b).is_some_and(|s| s.supported));
-                if let Some(b) = first {
+                if m.support_for("specrt").is_some_and(|s| s.supported) {
                     let label = if loaded { "reload" } else { "load" };
                     if ui.add(Key::new(label).solid(READOUT).id_salt(("load", i))).clicked() {
-                        app.load_model(b, &m);
+                        app.load_model(&m);
                         app.tab = crate::Tab::Chat;
-                        app.chat.pick(&m.name, b);
+                        app.chat.pick(&m.name);
                     }
                 }
                 if ui.add(Key::new("reveal").outline(VALUE).id_salt(("reveal", i))).clicked() {

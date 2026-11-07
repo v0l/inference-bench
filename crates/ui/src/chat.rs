@@ -8,6 +8,7 @@ use inference_bench_core::conversations::{self, Conversation, Turn};
 use inference_bench_core::engine::ChatEvent;
 use inference_bench_core::library::human_size;
 use inference_bench_core::settings::Settings;
+use inference_bench_core::target::NATIVE;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,12 +34,10 @@ pub struct ChatState {
 }
 
 impl ChatState {
-    pub fn load(dir: &Path, settings: &Settings) -> Self {
+    pub fn load(dir: &Path, _settings: &Settings) -> Self {
         let mut conversations = conversations::load_all(dir);
         if conversations.is_empty() {
-            let mut c = Conversation::new();
-            c.backend = settings.backend_names().first().cloned().unwrap_or_default();
-            conversations.push(c);
+            conversations.push(Conversation::new());
         }
         Self {
             conversations,
@@ -63,16 +62,13 @@ impl ChatState {
         &mut self.conversations[self.current.min(last)]
     }
 
-    pub fn pick(&mut self, model: &str, backend: &str) {
-        let c = self.conv();
-        c.model = model.to_string();
-        c.backend = backend.to_string();
+    pub fn pick(&mut self, model: &str) {
+        self.conv().model = model.to_string();
     }
 
     pub fn new_conversation(&mut self) {
         let prev = self.conv().clone();
         let mut c = Conversation::new();
-        c.backend = prev.backend;
         c.model = prev.model;
         c.sampling = prev.sampling;
         c.system = prev.system;
@@ -161,26 +157,15 @@ impl ChatState {
 }
 
 fn top_bar(app: &mut App, ui: &mut egui::Ui) {
-    let backends = app.settings.backend_names();
-    let (backend, model) = {
-        let c = app.chat.conv();
-        (c.backend.clone(), c.model.clone())
-    };
-    let library_backend = app.settings.library_backend(&backend);
+    let model = app.chat.conv().model.clone();
     let usable: Vec<String> = app
         .library
         .iter()
-        .filter(|m| m.support_for(&library_backend).is_some_and(|s| s.supported))
+        .filter(|m| m.support_for(NATIVE).is_some_and(|s| s.supported))
         .map(|m| m.name.clone())
         .collect();
     let loaded = app.loaded();
     ui.horizontal(|ui| {
-        ui.allocate_ui(egui::vec2(130.0, KEY_H), |ui| {
-            let mut b = backend.clone();
-            if choice(ui, "chat-backend", &mut b, backends.iter().map(|x| (x.clone(), x.clone()))) {
-                app.chat.conv().backend = b;
-            }
-        });
         ui.allocate_ui(egui::vec2(260.0, KEY_H), |ui| {
             let mut m = model.clone();
             let mut options: Vec<(String, String)> = usable.iter().map(|x| (x.clone(), x.clone())).collect();
@@ -191,7 +176,7 @@ fn top_bar(app: &mut App, ui: &mut egui::Ui) {
                 app.chat.conv().model = m;
             }
         });
-        let is_loaded = loaded.as_ref().is_some_and(|l| l.display == model && l.backend == backend);
+        let is_loaded = loaded.as_ref().is_some_and(|l| l.display == model);
         if app.loading.is_some() {
             ui.add(Key::new("loading").outline(READOUT).enabled(false).min_width(110.0));
         } else if is_loaded {
@@ -203,7 +188,7 @@ fn top_bar(app: &mut App, ui: &mut egui::Ui) {
             if ui.add(Key::new("load").solid(READOUT).enabled(found.is_some()).min_width(100.0)).clicked()
                 && let Some(m) = found
             {
-                app.load_model(&backend, &m);
+                app.load_model(&m);
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -215,14 +200,7 @@ fn top_bar(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn context_bar(app: &mut App, ui: &mut egui::Ui) {
-    let ctx_len = {
-        let model = app.chat.conv().model.clone();
-        let from_lib = app.library.iter().find(|m| m.name == model).and_then(|m| m.context_length).map(|c| c as usize);
-        match app.chat.conv().backend.as_str() {
-            "specrt" => app.settings.specrt_ctx,
-            _ => from_lib.unwrap_or(8192),
-        }
-    };
+    let ctx_len = app.settings.specrt_ctx;
     let used = app.chat.conv().token_estimate();
     chat_ui::context_bar(ui, used, ctx_len);
 }

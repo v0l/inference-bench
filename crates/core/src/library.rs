@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const BACKENDS: [&str; 4] = ["specrt", "llama.cpp", "vllm", "transformers"];
+pub const BACKENDS: [&str; 3] = ["specrt", "llama.cpp", "vllm"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -64,7 +64,7 @@ impl LocalModel {
     pub fn model_id(&self, backend: &str) -> String {
         match (backend, self.format) {
             ("specrt", Format::Spec) => self.path.display().to_string(),
-            ("specrt" | "transformers" | "vllm", _) if !self.repo.is_empty() => self.repo.clone(),
+            ("specrt" | "vllm", _) if !self.repo.is_empty() => self.repo.clone(),
             ("llama.cpp", Format::Gguf) => self.path.display().to_string(),
             _ => self.name.clone(),
         }
@@ -170,11 +170,6 @@ fn support_for_safetensors(config: &Value, arch: &str) -> Vec<Support> {
         if text { specrt_support(config) } else { Support::no("specrt", none()) },
         Support::no("llama.cpp", "needs a GGUF conversion"),
         vllm,
-        if text {
-            Support::yes("transformers", "loads from config.json")
-        } else {
-            Support::no("transformers", none())
-        },
     ]
 }
 
@@ -198,7 +193,6 @@ fn support_for_gguf(arch: &str) -> Vec<Support> {
         } else {
             Support::no("vllm", format!("GGUF architecture '{arch}' is not supported"))
         },
-        Support::no("transformers", "needs safetensors weights"),
     ]
 }
 
@@ -544,7 +538,6 @@ pub fn scan_specs(dir: &Path, hub: &Path) -> Vec<LocalModel> {
                 },
                 Support::no("llama.cpp", "spec files are specrt only"),
                 Support::no("vllm", "spec files are specrt only"),
-                Support::no("transformers", "spec files are specrt only"),
             ],
             files,
         });
@@ -711,7 +704,7 @@ mod tests {
         );
         let m = &scan_hub(&hub)[0];
         assert!(m.support.iter().all(|s| !s.supported));
-        assert!(m.support_for("transformers").unwrap().reason.contains("not a text generation"));
+        assert!(m.support_for("vllm").unwrap().reason.contains("not a text generation"));
     }
 
     #[test]

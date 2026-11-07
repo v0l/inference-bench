@@ -31,13 +31,13 @@ fn stdout(o: &Output) -> String {
 }
 
 #[test]
-fn run_streams_prints_and_saves_one_result() {
+fn bench_streams_prints_and_saves_one_result() {
     let out = tmp("run");
     let prompt = out.join("p.txt");
     std::fs::write(&prompt, "hello there").unwrap();
     let s = server(&["qwen3"]);
     let o = bin()
-        .args(["--out", out.to_str().unwrap(), "run", "--backend", "openai", "--url", &s.url])
+        .args(["--out", out.to_str().unwrap(), "bench", "--target", &format!("openai:{}", s.url)])
         .args(["--label", "fake", "--model", "qwen3", "--prompt-file", prompt.to_str().unwrap()])
         .args(["--max-tokens", "3", "--json"])
         .output()
@@ -54,11 +54,11 @@ fn run_streams_prints_and_saves_one_result() {
 }
 
 #[test]
-fn run_against_a_missing_model_exits_nonzero_and_saves_the_error() {
+fn bench_against_a_missing_model_exits_nonzero_and_saves_the_error() {
     let out = tmp("missing");
     let s = server(&["qwen3"]);
     let o = bin()
-        .args(["--out", out.to_str().unwrap(), "run", "--backend", "openai", "--url", &s.url])
+        .args(["--out", out.to_str().unwrap(), "bench", "--target", &format!("openai:{}", s.url)])
         .args(["--model", "nope", "--prompt", "x"])
         .output()
         .unwrap();
@@ -113,7 +113,7 @@ name = "m2"
 fn batch_runs_each_size_concurrently_and_prints_json() {
     let s = server(&["m"]);
     let o = bin()
-        .args(["batch", "--backend", "openai", "--url", &s.url, "--label", "fake", "--model", "m"])
+        .args(["batch", "--target", &format!("openai:{}", s.url), "--label", "fake", "--model", "m"])
         .args(["--prompt-len", "64", "--max-tokens", "3", "--sizes", "1,4", "--json"])
         .output()
         .unwrap();
@@ -130,10 +130,48 @@ fn batch_runs_each_size_concurrently_and_prints_json() {
 fn an_unreachable_openai_backend_is_a_failed_run_not_a_crash() {
     let out = tmp("dead");
     let o = bin()
-        .args(["--out", out.to_str().unwrap(), "run", "--backend", "openai", "--url", "http://127.0.0.1:1"])
+        .args(["--out", out.to_str().unwrap(), "bench", "--target", "openai:http://127.0.0.1:1"])
         .args(["--model", "m", "--prompt", "x"])
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(1));
     assert_eq!(store::load_all(&out)[0].error.as_ref().unwrap().kind, ErrorKind::Unreachable);
+}
+
+#[test]
+fn run_without_a_backend_flag_runs_the_native_engine() {
+    let out = tmp("native");
+    let spec = out.join("missing.toml");
+    let o = bin()
+        .args(["--out", out.to_str().unwrap(), "run", "--model", spec.to_str().unwrap(), "--prompt", "x", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", String::from_utf8_lossy(&o.stderr));
+    let printed: Vec<RunResult> = serde_json::from_str(&stdout(&o)).unwrap();
+    assert_eq!(printed[0].backend, "specrt");
+    assert_eq!(printed[0].error.as_ref().unwrap().kind, ErrorKind::ModelNotFound);
+}
+
+#[test]
+fn the_removed_backend_flag_explains_where_other_engines_went() {
+    for args in [
+        vec!["run", "--backend", "openai", "--model", "m", "--prompt", "x"],
+        vec!["run", "--backend", "transformers", "--model", "m", "--prompt", "x"],
+        vec!["bench", "--backend", "openai", "--model", "m", "--prompt", "x"],
+    ] {
+        let o = bin().args(&args).output().unwrap();
+        assert!(!o.status.success());
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(err.contains("--backend was removed") && err.contains("--target openai:URL"), "{err}");
+    }
+}
+
+#[test]
+fn an_unknown_flag_or_target_is_a_clear_error() {
+    let o = bin().args(["run", "--url", "http://x", "--model", "m", "--prompt", "x"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("unexpected argument '--url'"));
+    let o = bin().args(["bench", "--target", "transformers", "--model", "m", "--prompt", "x"]).output().unwrap();
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("unknown target transformers"));
 }

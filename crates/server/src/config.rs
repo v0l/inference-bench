@@ -1,8 +1,16 @@
 use anyhow::{Context, Result};
-use inference_bench_core::backend::BackendConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+
+fn legacy_native_ctx(table: &toml::Table) -> Result<Option<usize>, String> {
+    match table.get("kind").and_then(|k| k.as_str()) {
+        Some("specrt" | "native") | None => {
+            Ok(table.get("max_ctx").and_then(|v| v.as_integer()).map(|n| n as usize))
+        }
+        Some(other) => Err(other.to_string()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -10,8 +18,10 @@ pub struct ModelConfig {
     pub id: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub backend: Option<toml::Table>,
     #[serde(default)]
-    pub backend: Option<BackendConfig>,
+    pub max_ctx: Option<usize>,
     #[serde(default)]
     pub vram_bytes: Option<u64>,
     #[serde(default)]
@@ -51,7 +61,9 @@ pub struct ServerConfig {
     pub cors_origins: Vec<String>,
     pub tls: Option<TlsConfig>,
     pub models_dir: Option<PathBuf>,
-    pub default_backend: BackendConfig,
+    pub max_ctx: Option<usize>,
+    #[serde(skip_serializing)]
+    pub default_backend: Option<toml::Table>,
     pub default_model: Option<String>,
     pub models: Vec<ModelConfig>,
     pub max_concurrent: usize,
@@ -76,7 +88,8 @@ impl Default for ServerConfig {
             cors_origins: Vec::new(),
             tls: None,
             models_dir: None,
-            default_backend: BackendConfig::Specrt { worker: None, max_ctx: None },
+            max_ctx: None,
+            default_backend: None,
             default_model: None,
             models: Vec::new(),
             max_concurrent: 1,
@@ -101,9 +114,35 @@ impl ServerConfig {
 
     pub fn parse(text: &str) -> Result<Self> {
         let mut config: Self = toml::from_str(text)?;
+        config.migrate();
         config.discover_models()?;
         config.validate()?;
         Ok(config)
+    }
+
+    fn migrate(&mut self) {
+        match self.default_backend.take().as_ref().map(legacy_native_ctx) {
+            Some(Ok(max_ctx)) => self.max_ctx = self.max_ctx.or(max_ctx),
+            Some(Err(kind)) => tracing::warn!(%kind, "default_backend is no longer used: the server runs models on the native engine"),
+            None => {}
+        }
+        let mut dropped = Vec::new();
+        self.models.retain_mut(|m| match m.backend.take().as_ref().map(legacy_native_ctx) {
+            Some(Ok(max_ctx)) => {
+                m.max_ctx = m.max_ctx.or(max_ctx);
+                true
+            }
+            Some(Err(kind)) => {
+                tracing::warn!(model = %m.id, %kind, "dropping a model served by another engine: the server runs models on the native engine");
+                dropped.push(m.id.clone());
+                false
+            }
+            None => true,
+        });
+        if self.default_model.as_ref().is_some_and(|d| dropped.contains(d)) {
+            tracing::warn!(model = ?self.default_model, "default_model was dropped with its backend");
+            self.default_model = None;
+        }
     }
 
     pub fn discover_models(&mut self) -> Result<()> {
@@ -147,8 +186,8 @@ impl ServerConfig {
         self.models.iter().find(|m| m.id == id)
     }
 
-    pub fn backend_for(&self, m: &ModelConfig) -> BackendConfig {
-        m.backend.clone().unwrap_or_else(|| self.default_backend.clone())
+    pub fn max_ctx_for(&self, m: &ModelConfig) -> Option<usize> {
+        m.max_ctx.or(self.max_ctx)
     }
 
     pub fn resolved_keys(&self) -> Vec<String> {
@@ -166,7 +205,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_models_backends_and_limits() {
+    fn parses_models_and_limits() {
         let c = ServerConfig::parse(
             r#"
 bind = "0.0.0.0:9000"
@@ -174,9 +213,6 @@ api_keys = ["k1"]
 max_concurrent = 4
 idle_unload_secs = 600
 default_model = "qwen"
-
-[default_backend]
-kind = "specrt"
 max_ctx = 4096
 
 [[models]]
@@ -185,18 +221,57 @@ model = "specs/qwen3-0.6b.toml"
 vram_bytes = 2000000000
 
 [[models]]
-id = "llama"
-[models.backend]
-kind = "openai"
-url = "http://127.0.0.1:8081"
+id = "long"
+max_ctx = 32768
 "#,
         )
         .unwrap();
         assert_eq!(c.bind, "0.0.0.0:9000");
         assert_eq!(c.models.len(), 2);
-        assert_eq!(c.backend_for(&c.models[0]).kind(), "specrt");
-        assert_eq!(c.backend_for(&c.models[1]).kind(), "openai");
+        assert_eq!(c.max_ctx_for(&c.models[0]), Some(4096));
+        assert_eq!(c.max_ctx_for(&c.models[1]), Some(32768));
         assert_eq!(c.idle_unload_secs, Some(600));
+    }
+
+    #[test]
+    fn an_old_config_with_other_backends_loads_and_keeps_the_native_models() {
+        let c = ServerConfig::parse(
+            r#"
+default_model = "llama"
+
+[default_backend]
+kind = "specrt"
+worker = "/opt/inference-bench-specrt"
+max_ctx = 4096
+
+[[models]]
+id = "qwen"
+
+[[models]]
+id = "llama"
+[models.backend]
+kind = "openai"
+url = "http://127.0.0.1:8081"
+
+[[models]]
+id = "hf"
+[models.backend]
+kind = "specrt"
+max_ctx = 1024
+
+[[models]]
+id = "torch"
+[models.backend]
+kind = "transformers"
+python = "python3"
+"#,
+        )
+        .unwrap();
+        let ids: Vec<&str> = c.models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["qwen", "hf"]);
+        assert_eq!(c.max_ctx_for(&c.models[0]), Some(4096));
+        assert_eq!(c.max_ctx_for(&c.models[1]), Some(1024));
+        assert_eq!(c.default_model, None);
     }
 
     #[test]

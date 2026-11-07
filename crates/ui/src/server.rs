@@ -47,8 +47,8 @@ impl ServerState {
             config.models = vec![ModelConfig { id: l.display.clone(), ..ModelConfig::default() }];
             config.default_model = Some(l.display);
         }
-        let factory = move |_: &inference_bench_core::backend::BackendConfig| {
-            Ok(Box::new(EngineBackend::new(engine.clone())) as Box<dyn inference_bench_core::backend::Backend>)
+        let factory = move |_: Option<usize>| {
+            Ok(Box::new(EngineBackend::new(engine.clone())) as Box<dyn inference_bench_core::target::Target>)
         };
         let started = self.runtime.block_on(Server::new(config).with_factory(factory).with_gpu_probe(std::sync::Arc::new(|| None)).start());
         match started {
@@ -113,7 +113,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     }
                 }
                 match &loaded {
-                    Some(l) => Line::new().legend("serving").value(format!("{} on {}", l.display, l.backend)).show(ui),
+                    Some(l) => Line::new().legend("serving").value(l.display.clone()).show(ui),
                     None => Line::new().legend("serving").note("nothing loaded: load a model in chat or models").show(ui),
                 };
                 ui.horizontal(|ui| {

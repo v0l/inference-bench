@@ -1,4 +1,4 @@
-use crate::backend::{Backend, BackendConfig, Request};
+use crate::target::{Target, TargetConfig, Request};
 use crate::result::RunResult;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 pub struct BackendEntry {
     pub label: String,
     #[serde(flatten)]
-    pub config: BackendConfig,
+    pub config: TargetConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,7 +60,7 @@ impl MatrixSpec {
 }
 
 pub fn run_model(
-    backend: &mut dyn Backend,
+    backend: &mut dyn Target,
     label: &str,
     display_model: &str,
     model_id: &str,
@@ -83,10 +83,7 @@ pub fn run_matrix(
     for entry in &spec.backends {
         let mut backend = entry.config.build();
         for model in &spec.models {
-            let result = match backend.as_mut() {
-                Ok(b) => run_model(b.as_mut(), &entry.label, &model.name, model.id_for(&entry.label), request, &mut |_| {}),
-                Err(e) => RunResult::failed(&entry.label, &model.name, Utc::now(), e.clone()),
-            };
+            let result = run_model(backend.as_mut(), &entry.label, &model.name, model.id_for(&entry.label), request, &mut |_| {});
             on_result(result);
         }
     }
@@ -129,7 +126,7 @@ ids = { specrt = "Qwen/Qwen3-0.6B" }
         assert_eq!(spec.max_tokens, 64);
         assert_eq!(spec.models[0].id_for("specrt"), "Qwen/Qwen3-0.6B");
         assert_eq!(spec.models[0].id_for("llama.cpp"), "Qwen3-0.6B");
-        assert_eq!(spec.backends[1].config.kind(), "specrt");
+        assert_eq!(spec.backends[1].config.kind(), "native");
     }
 
     #[test]
@@ -148,11 +145,11 @@ ids = { specrt = "Qwen/Qwen3-0.6B" }
             backends: vec![
                 BackendEntry {
                     label: "good".into(),
-                    config: BackendConfig::Openai { url: good.url.clone(), api_key: None, label: None },
+                    config: TargetConfig::Openai { url: good.url.clone(), api_key: None, label: None },
                 },
                 BackendEntry {
                     label: "partial".into(),
-                    config: BackendConfig::Openai { url: partial.url.clone(), api_key: None, label: None },
+                    config: TargetConfig::Openai { url: partial.url.clone(), api_key: None, label: None },
                 },
             ],
             models: vec![

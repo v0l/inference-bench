@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/v0l/inference-bench"
-description = "Compare LLM inference backends on the same prompts: speed, time to first token, memory and logit accuracy"
+description = "Run LLMs on a native CUDA engine, serve them, and benchmark them against other engines"
 
 [workspace.dependencies]
 inference-bench-core = { path = "crates/core" }

@@ -1,7 +1,7 @@
 use crate::config::{ModelConfig, ServerConfig};
 use crate::error::ApiError;
 use crate::metrics::Metrics;
-use inference_bench_core::backend::{Backend, BackendConfig};
+use inference_bench_core::target::Target;
 use inference_bench_core::result::BackendError;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,24 +10,24 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
-pub trait BackendFactory: Send + Sync + 'static {
-    fn build(&self, config: &BackendConfig) -> Result<Box<dyn Backend>, BackendError>;
+pub trait EngineFactory: Send + Sync + 'static {
+    fn build(&self, max_ctx: Option<usize>) -> Result<Box<dyn Target>, BackendError>;
 }
 
-pub struct DefaultFactory;
+pub struct NativeFactory;
 
-impl BackendFactory for DefaultFactory {
-    fn build(&self, config: &BackendConfig) -> Result<Box<dyn Backend>, BackendError> {
-        config.build()
+impl EngineFactory for NativeFactory {
+    fn build(&self, max_ctx: Option<usize>) -> Result<Box<dyn Target>, BackendError> {
+        Ok(Box::new(inference_bench_core::native::Native::new(max_ctx)))
     }
 }
 
-impl<F> BackendFactory for F
+impl<F> EngineFactory for F
 where
-    F: Fn(&BackendConfig) -> Result<Box<dyn Backend>, BackendError> + Send + Sync + 'static,
+    F: Fn(Option<usize>) -> Result<Box<dyn Target>, BackendError> + Send + Sync + 'static,
 {
-    fn build(&self, config: &BackendConfig) -> Result<Box<dyn Backend>, BackendError> {
-        self(config)
+    fn build(&self, max_ctx: Option<usize>) -> Result<Box<dyn Target>, BackendError> {
+        self(max_ctx)
     }
 }
 
@@ -44,7 +44,7 @@ pub struct LoadedModel {
     pub loaded_at: Instant,
     last_used: Mutex<Instant>,
     active: AtomicUsize,
-    pool: Mutex<Vec<Box<dyn Backend>>>,
+    pool: Mutex<Vec<Box<dyn Target>>>,
     sem: Arc<Semaphore>,
 }
 
@@ -61,11 +61,11 @@ impl LoadedModel {
 pub struct Lease {
     model: Arc<LoadedModel>,
     permit: Option<OwnedSemaphorePermit>,
-    backend: Option<Box<dyn Backend>>,
+    backend: Option<Box<dyn Target>>,
 }
 
 impl Lease {
-    pub fn backend(&mut self) -> &mut dyn Backend {
+    pub fn backend(&mut self) -> &mut dyn Target {
         self.backend.as_deref_mut().expect("lease holds a backend")
     }
 
@@ -97,7 +97,7 @@ pub struct ModelStatus {
 
 pub struct Manager {
     config: Arc<ServerConfig>,
-    factory: Arc<dyn BackendFactory>,
+    factory: Arc<dyn EngineFactory>,
     probe: GpuProbe,
     metrics: Arc<Metrics>,
     loaded: Mutex<HashMap<String, Arc<LoadedModel>>>,
@@ -107,7 +107,7 @@ pub struct Manager {
 impl Manager {
     pub fn new(
         config: Arc<ServerConfig>,
-        factory: Arc<dyn BackendFactory>,
+        factory: Arc<dyn EngineFactory>,
         probe: GpuProbe,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -158,7 +158,7 @@ impl Manager {
                 let l = loaded.get(&m.id);
                 ModelStatus {
                     id: m.id.clone(),
-                    backend: self.config.backend_for(m).label(),
+                    backend: inference_bench_core::target::NATIVE.to_string(),
                     loaded: l.is_some(),
                     vram_bytes: l.map(|l| l.vram).unwrap_or(0),
                     active_requests: l.map(|l| l.active()).unwrap_or(0),
@@ -214,24 +214,20 @@ impl Manager {
             return Ok(m);
         }
         self.make_room(cfg)?;
-        let backend_config = self.config.backend_for(cfg);
-        let instances = match backend_config {
-            BackendConfig::Openai { .. } => self.config.max_concurrent,
-            _ => 1,
-        };
+        let max_ctx = self.config.max_ctx_for(cfg);
+        let instances = 1;
         let name = cfg.upstream_name().to_string();
         let spec_hash = cfg.spec_hash();
         let vram_before = (self.probe)();
         let started = Instant::now();
-        tracing::info!(model = %cfg.id, backend = backend_config.kind(), upstream = %name, %spec_hash, instances, vram_before_bytes = ?vram_before, "loading model");
+        tracing::info!(model = %cfg.id, upstream = %name, ?max_ctx, %spec_hash, vram_before_bytes = ?vram_before, "loading model");
         let factory = self.factory.clone();
         let span = tracing::Span::current();
-        let bc = backend_config.clone();
         let built = tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
                 let mut backends = Vec::new();
                 for _ in 0..instances {
-                    let mut b = factory.build(&bc)?;
+                    let mut b = factory.build(max_ctx)?;
                     b.load(&name)?;
                     backends.push(b);
                 }
@@ -245,7 +241,7 @@ impl Manager {
             Ok(b) => b,
             Err(e) => {
                 self.metrics.model_load_failed();
-                tracing::error!(model = %cfg.id, backend = backend_config.kind(), error = %e, load_secs = started.elapsed().as_secs_f64(), "model load failed");
+                tracing::error!(model = %cfg.id, error = %e, load_secs = started.elapsed().as_secs_f64(), "model load failed");
                 return Err(e.into());
             }
         };

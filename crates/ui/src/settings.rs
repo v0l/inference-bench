@@ -14,7 +14,7 @@ pub struct SettingsState {
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     page(ui, "settings", |ui| {
         let mut save = false;
-        section(ui, "backend endpoints", "OpenAI-compatible servers the chat and bench tabs can talk to", |ui| {
+        section(ui, "bench targets", "other engines' OpenAI-compatible servers, used only by the bench tab", |ui| {
             let mut remove = None;
             for (i, e) in app.settings.endpoints.iter_mut().enumerate() {
                 ui.push_id(i, |ui| {
@@ -36,7 +36,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             let st = &mut app.settings_ui;
             let mut add = false;
             let ready = !st.new_endpoint.trim().is_empty();
-            field_then(ui, &mut st.new_endpoint, "name for a new endpoint", 96.0, |ui| {
+            field_then(ui, &mut st.new_endpoint, "name for a new bench target", 96.0, |ui| {
                 add = ui.add(Key::new("add").outline(VALUE).enabled(ready)).clicked();
             });
             if add {
@@ -50,15 +50,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             }
             hint(ui, "Keys are kept in settings.json in the data folder, readable only by you.");
         });
-        section(ui, "local runtimes", "specrt and transformers run as worker processes", |ui| {
-            row(ui, "specrt worker", |ui| {
-                field(ui, &mut app.settings.specrt_worker, "inference-bench-specrt next to this app");
-            });
-            row(ui, "specrt context", |ui| {
+        section(ui, "native engine", "runs every model in this app", |ui| {
+            row(ui, "context", |ui| {
                 ui.add(egui::DragValue::new(&mut app.settings.specrt_ctx).range(512..=131072).speed(64));
-            });
-            row(ui, "python", |ui| {
-                field(ui, &mut app.settings.python, "python3");
             });
         });
         section(ui, "model folders", "searched for GGUF and safetensors, on top of the Hugging Face cache", |ui| {

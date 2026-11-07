@@ -18,9 +18,9 @@ license-file = ["../../LICENSE", "0"]
 section = "science"
 priority = "optional"
 extended-description = """\
-Inference Bench runs the same prompt through several LLM inference backends \
-(llama.cpp, vLLM, Ollama, transformers and the spec-driven specrt runtime) and \
-compares prefill and decode speed, time to first token, memory and logit accuracy. \
+Inference Bench runs LLMs on its own spec-driven CUDA engine, serves them over an \
+OpenAI-compatible API, and benchmarks prefill and decode speed, time to first token \
+and memory against other engines such as llama.cpp and vLLM. \
 Ships the inference-bench command line tool and the inference-bench-ui desktop application."""
 assets = [
     ["target/release/inference-bench", "usr/bin/", "755"],

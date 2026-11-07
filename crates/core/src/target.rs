@@ -1,6 +1,5 @@
 use crate::result::{BackendError, Generation};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
@@ -48,7 +47,7 @@ impl Logits {
     }
 }
 
-pub trait Backend: Send {
+pub trait Target: Send {
     fn name(&self) -> &str;
 
     fn capabilities(&self) -> Capabilities;
@@ -75,9 +74,16 @@ pub trait Backend: Send {
     }
 }
 
+pub const NATIVE: &str = "specrt";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum BackendConfig {
+pub enum TargetConfig {
+    #[serde(alias = "specrt")]
+    Native {
+        #[serde(default)]
+        max_ctx: Option<usize>,
+    },
     Openai {
         url: String,
         #[serde(default)]
@@ -85,26 +91,17 @@ pub enum BackendConfig {
         #[serde(default)]
         label: Option<String>,
     },
-    Transformers {
-        #[serde(default)]
-        python: Option<String>,
-        #[serde(default)]
-        device: Option<String>,
-    },
-    Specrt {
-        #[serde(default)]
-        worker: Option<PathBuf>,
-        #[serde(default)]
-        max_ctx: Option<usize>,
-    },
 }
 
-impl BackendConfig {
+impl TargetConfig {
+    pub fn native(max_ctx: Option<usize>) -> Self {
+        Self::Native { max_ctx }
+    }
+
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::Native { .. } => "native",
             Self::Openai { .. } => "openai",
-            Self::Transformers { .. } => "transformers",
-            Self::Specrt { .. } => "specrt",
         }
     }
 
@@ -112,23 +109,49 @@ impl BackendConfig {
         match self {
             Self::Openai { label: Some(l), .. } => l.clone(),
             Self::Openai { url, .. } => format!("openai {url}"),
-            other => other.kind().to_string(),
+            Self::Native { .. } => NATIVE.to_string(),
         }
     }
 
-    pub fn build(&self) -> Result<Box<dyn Backend>, BackendError> {
+    pub fn build(&self) -> Box<dyn Target> {
         match self {
-            Self::Openai { url, api_key, label } => Ok(Box::new(crate::openai::OpenAi::new(
+            Self::Native { max_ctx } => Box::new(crate::native::Native::new(*max_ctx)),
+            Self::Openai { url, api_key, label } => Box::new(crate::openai::OpenAi::new(
                 label.clone().unwrap_or_else(|| "openai".into()),
                 url,
                 api_key.clone(),
-            ))),
-            Self::Transformers { python, device } => {
-                Ok(Box::new(crate::subprocess::Subprocess::transformers(python.clone(), device.clone())))
-            }
-            Self::Specrt { worker, max_ctx } => {
-                Ok(Box::new(crate::subprocess::Subprocess::specrt(worker.clone(), *max_ctx)))
-            }
+            )),
         }
+    }
+
+    pub fn parse_target(spec: &str) -> Result<Self, String> {
+        match spec.split_once(':') {
+            _ if spec == "native" || spec == NATIVE => Ok(Self::native(None)),
+            Some(("openai", url)) if !url.is_empty() => {
+                Ok(Self::Openai { url: url.to_string(), api_key: None, label: None })
+            }
+            _ => Err(format!("unknown target {spec}: use native or openai:URL")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn targets_parse_from_the_command_line() {
+        assert_eq!(TargetConfig::parse_target("native").unwrap(), TargetConfig::native(None));
+        assert_eq!(TargetConfig::parse_target("specrt").unwrap().kind(), "native");
+        let t = TargetConfig::parse_target("openai:http://127.0.0.1:8080").unwrap();
+        assert_eq!(t, TargetConfig::Openai { url: "http://127.0.0.1:8080".into(), api_key: None, label: None });
+        assert!(TargetConfig::parse_target("transformers").unwrap_err().contains("unknown target"));
+        assert!(TargetConfig::parse_target("openai:").is_err());
+    }
+
+    #[test]
+    fn the_old_specrt_kind_reads_as_native() {
+        let t: TargetConfig = toml::from_str("kind = \"specrt\"\nworker = \"/x\"\nmax_ctx = 4096").unwrap();
+        assert_eq!(t, TargetConfig::native(Some(4096)));
     }
 }

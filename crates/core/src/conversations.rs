@@ -15,7 +15,6 @@ pub struct Conversation {
     pub id: String,
     pub title: String,
     pub system: String,
-    pub backend: String,
     pub model: String,
     pub sampling: Sampling,
     pub use_template: bool,
@@ -30,7 +29,6 @@ impl Conversation {
             id: now.format("%Y%m%dT%H%M%S%3f").to_string(),
             title: "New chat".into(),
             system: String::new(),
-            backend: String::new(),
             model: String::new(),
             sampling: Sampling::default(),
             use_template: true,
@@ -118,6 +116,18 @@ mod tests {
         assert_eq!(all[1].title, "hello there");
         remove(&dir, "a");
         assert_eq!(load_all(&dir).len(), 1);
+    }
+
+    #[test]
+    fn a_conversation_saved_with_a_backend_still_loads() {
+        let dir = std::env::temp_dir().join(format!("ib-chats-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut c = serde_json::to_value(Conversation::new()).unwrap();
+        c["id"] = "old".into();
+        c["backend"] = "vllm".into();
+        std::fs::create_dir_all(dir_of(&dir)).unwrap();
+        std::fs::write(dir_of(&dir).join("old.json"), c.to_string()).unwrap();
+        assert_eq!(load_all(&dir)[0].id, "old");
     }
 
     #[test]

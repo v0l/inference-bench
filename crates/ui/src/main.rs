@@ -93,17 +93,11 @@ impl App {
         self.engine.loaded()
     }
 
-    pub fn load_model(&mut self, backend: &str, model: &LocalModel) {
-        let Some(config) = self.settings.config_for(backend) else {
-            self.notice = Some((false, format!("no endpoint called {backend}")));
-            return;
-        };
-        let library_backend = self.settings.library_backend(backend);
+    pub fn load_model(&mut self, model: &LocalModel) {
         self.engine.send(Command::Load {
-            backend: backend.to_string(),
-            config,
-            model_id: model.model_id(&library_backend),
+            model_id: model.model_id(inference_bench_core::target::NATIVE),
             display: model.name.clone(),
+            max_ctx: Some(self.settings.specrt_ctx),
         });
     }
 

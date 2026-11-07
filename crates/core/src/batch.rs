@@ -1,4 +1,4 @@
-use crate::backend::{BackendConfig, Request};
+use crate::target::{TargetConfig, Request};
 use crate::result::BackendError;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Barrier};
@@ -17,7 +17,7 @@ pub struct BatchResult {
 }
 
 pub fn run_concurrent(
-    config: &BackendConfig,
+    config: &TargetConfig,
     label: &str,
     model_id: &str,
     request: &Request,
@@ -25,7 +25,7 @@ pub fn run_concurrent(
 ) -> Result<BatchResult, BackendError> {
     let mut backends = Vec::with_capacity(batch);
     for _ in 0..batch.max(1) {
-        let mut b = config.build()?;
+        let mut b = config.build();
         b.load(model_id)?;
         backends.push(b);
     }
@@ -85,8 +85,8 @@ mod tests {
         }
     }
 
-    fn config(url: &str) -> BackendConfig {
-        BackendConfig::Openai { url: url.into(), api_key: None, label: Some("fake".into()) }
+    fn config(url: &str) -> TargetConfig {
+        TargetConfig::Openai { url: url.into(), api_key: None, label: Some("fake".into()) }
     }
 
     fn request() -> Request {

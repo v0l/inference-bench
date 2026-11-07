@@ -309,3 +309,48 @@ fn streaming_sends_several_chunks_spread_over_time_before_done() {
     assert!(first_content.unwrap() < total / 2, "first {:?} total {total:?}", first_content);
     rig.stop();
 }
+
+#[test]
+fn the_server_serves_a_model_through_the_in_process_native_engine() {
+    use inference_bench_core::fake::{Script, ScriptedModel};
+    use inference_bench_core::native::Native;
+    let script = Script {
+        models: vec!["Qwen/Qwen3-0.6B".into()],
+        chunks: vec!["Hel".into(), "lo".into()],
+        usage: Some((5, 2)),
+        ..Script::default()
+    };
+    let seen_ctx = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = seen_ctx.clone();
+    let factory = move |max_ctx: Option<usize>| -> Result<Box<dyn inference_bench_core::target::Target>, inference_bench_core::result::BackendError> {
+        *seen.lock().unwrap() = max_ctx;
+        Ok(Box::new(Native::with_factory(max_ctx, ScriptedModel::factory(script.clone()))))
+    };
+    let rig = start_with(
+        config("max_ctx = 4096\n[[models]]\nid='qwen'\nmodel='Qwen/Qwen3-0.6B'"),
+        factory,
+        Default::default(),
+    );
+    let (status, body, _) = rig.post("/v1/chat/completions", None, chat("qwen", false));
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(*seen_ctx.lock().unwrap(), Some(4096));
+    let (_, body, _) = rig.get("/admin/models", None);
+    assert!(body.contains("\"backend\":\"specrt\""), "{body}");
+    rig.stop();
+}
+
+#[test]
+fn a_native_model_missing_on_disk_is_a_clean_error() {
+    use inference_bench_core::fake::{Script, ScriptedModel};
+    use inference_bench_core::native::Native;
+    let factory = |max_ctx: Option<usize>| -> Result<Box<dyn inference_bench_core::target::Target>, inference_bench_core::result::BackendError> {
+        Ok(Box::new(Native::with_factory(max_ctx, ScriptedModel::factory(Script::default()))))
+    };
+    let rig = start_with(config("[[models]]\nid='gone'"), factory, Default::default());
+    let (status, body, _) = rig.post("/v1/chat/completions", None, chat("gone", false));
+    assert!(status >= 400, "{status} {body}");
+    assert!(body.contains("no config.json"), "{body}");
+    rig.stop();
+}

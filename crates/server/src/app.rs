@@ -1,6 +1,6 @@
 use crate::config::ServerConfig;
 use crate::error::ApiError;
-use crate::manager::{BackendFactory, GpuProbe, Manager};
+use crate::manager::{EngineFactory, GpuProbe, Manager};
 use crate::metrics::{Gauges, Metrics, percentile};
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -39,7 +39,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         config: Arc<ServerConfig>,
-        factory: Arc<dyn BackendFactory>,
+        factory: Arc<dyn EngineFactory>,
         probe: GpuProbe,
     ) -> anyhow::Result<Arc<Self>> {
         let metrics = Arc::new(Metrics::default());

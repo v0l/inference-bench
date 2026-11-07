@@ -1,4 +1,4 @@
-use inference_bench_core::backend::{Backend, Capabilities, Request};
+use inference_bench_core::target::{Target, Capabilities, Request};
 use inference_bench_core::chat::{ChatRequest, Message, Role, Sampling};
 use inference_bench_core::engine::{ChatEvent, Handle};
 use inference_bench_core::result::{BackendError, ErrorKind, Generation};
@@ -13,7 +13,7 @@ impl EngineBackend {
     }
 }
 
-impl Backend for EngineBackend {
+impl Target for EngineBackend {
     fn name(&self) -> &str {
         "engine"
     }

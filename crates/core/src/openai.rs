@@ -1,4 +1,4 @@
-use crate::backend::{Backend, Capabilities, Request};
+use crate::target::{Target, Capabilities, Request};
 use crate::chat::ChatRequest;
 use crate::result::{BackendError, ErrorKind, Generation};
 use serde_json::{Value, json};
@@ -54,7 +54,7 @@ impl OpenAi {
     }
 }
 
-impl Backend for OpenAi {
+impl Target for OpenAi {
     fn name(&self) -> &str {
         &self.label
     }

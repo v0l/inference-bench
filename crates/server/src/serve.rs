@@ -1,6 +1,6 @@
 use crate::app::{AppState, router};
 use crate::config::ServerConfig;
-use crate::manager::{BackendFactory, DefaultFactory, GpuProbe, nvidia_smi_probe};
+use crate::manager::{EngineFactory, NativeFactory, GpuProbe, nvidia_smi_probe};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -9,7 +9,7 @@ use tokio::sync::watch;
 
 pub struct Server {
     config: Arc<ServerConfig>,
-    factory: Arc<dyn BackendFactory>,
+    factory: Arc<dyn EngineFactory>,
     probe: GpuProbe,
 }
 
@@ -41,10 +41,10 @@ impl ServerHandle {
 
 impl Server {
     pub fn new(config: ServerConfig) -> Self {
-        Self { config: Arc::new(config), factory: Arc::new(DefaultFactory), probe: nvidia_smi_probe() }
+        Self { config: Arc::new(config), factory: Arc::new(NativeFactory), probe: nvidia_smi_probe() }
     }
 
-    pub fn with_factory(mut self, factory: impl BackendFactory) -> Self {
+    pub fn with_factory(mut self, factory: impl EngineFactory) -> Self {
         self.factory = Arc::new(factory);
         self
     }

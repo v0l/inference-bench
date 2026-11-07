@@ -3079,6 +3079,7 @@ dependencies = [
  "chrono",
  "clap",
  "dirs",
+ "inference-bench-specrt",
  "serde",
  "serde_json",
  "toml 0.9.12+spec-1.1.0",

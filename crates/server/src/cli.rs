@@ -1,8 +1,7 @@
 use crate::config::ServerConfig;
 use crate::serve::Server;
-use anyhow::{Context, Result};
+use anyhow::{Result, bail};
 use clap::Args;
-use inference_bench_core::backend::BackendConfig;
 use inference_bench_core::logging::{LogArgs, init};
 use std::path::PathBuf;
 
@@ -16,10 +15,12 @@ pub struct ServeArgs {
     pub model: Vec<String>,
     #[arg(long, help = "Directory of specrt spec files to serve")]
     pub models_dir: Option<PathBuf>,
-    #[arg(long, value_parser = ["openai", "transformers", "specrt"], help = "Default backend kind")]
+    #[arg(long, hide = true)]
     pub backend: Option<String>,
-    #[arg(long, help = "Upstream base URL for the openai backend")]
+    #[arg(long, hide = true)]
     pub upstream: Option<String>,
+    #[arg(long, help = "Context length the native engine allocates")]
+    pub max_ctx: Option<usize>,
     #[arg(long, help = "Concurrent generations")]
     pub max_concurrent: Option<usize>,
     #[arg(long, help = "Seconds before an idle model is unloaded")]
@@ -41,16 +42,11 @@ impl ServeArgs {
             config.models_dir = Some(d.clone());
             config.discover_models()?;
         }
-        match self.backend.as_deref() {
-            Some("openai") => {
-                let url = self.upstream.clone().context("--upstream is required with --backend openai")?;
-                config.default_backend = BackendConfig::Openai { url, api_key: None, label: None };
-            }
-            Some("transformers") => {
-                config.default_backend = BackendConfig::Transformers { python: None, device: None }
-            }
-            Some(_) => config.default_backend = BackendConfig::Specrt { worker: None, max_ctx: None },
-            None => {}
+        if self.backend.as_deref().is_some_and(|b| b != "specrt" && b != "native") || self.upstream.is_some() {
+            bail!("the server only runs models on the native engine; --backend and --upstream were removed");
+        }
+        if let Some(n) = self.max_ctx {
+            config.max_ctx = Some(n);
         }
         for m in &self.model {
             if config.model(m).is_none() {

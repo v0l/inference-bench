@@ -96,3 +96,69 @@ fn serve(mut stream: TcpStream, script: &Script, seen: &Mutex<Vec<String>>) {
     }
     let _ = write!(stream, "data: [DONE]\n\n");
 }
+
+pub struct ScriptedModel {
+    script: Script,
+}
+
+impl ScriptedModel {
+    pub fn factory(script: Script) -> crate::native::Factory {
+        Arc::new(move |model, _| {
+            if !script.models.iter().any(|m| m == model) {
+                anyhow::bail!("no config.json for {model} under the fake hub");
+            }
+            Ok(Box::new(ScriptedModel { script: script.clone() }) as Box<dyn crate::native::Model>)
+        })
+    }
+
+    fn reply(&self, text: String, pieces: usize, started: std::time::Instant, first: f64) -> specrt::engine::Reply {
+        let (prompt, completion) = self.script.usage.unwrap_or((0, pieces as u64));
+        specrt::engine::Reply {
+            text,
+            prompt_tokens: prompt as usize,
+            completion_tokens: completion.min(pieces as u64) as usize,
+            prefill_secs: first,
+            decode_secs: started.elapsed().as_secs_f64() - first,
+            peak_device_bytes: 0,
+        }
+    }
+
+    fn stream(&self, on_text: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<specrt::engine::Reply> {
+        if let Some((_, message)) = &self.script.fail_status {
+            anyhow::bail!("{message}");
+        }
+        let started = std::time::Instant::now();
+        thread::sleep(Duration::from_millis(self.script.first_delay_ms));
+        let first = started.elapsed().as_secs_f64();
+        let mut text = String::new();
+        for (i, chunk) in self.script.chunks.iter().enumerate() {
+            text.push_str(chunk);
+            if !on_text(chunk) {
+                return Ok(self.reply(text, i + 1, started, first));
+            }
+            thread::sleep(Duration::from_millis(self.script.chunk_delay_ms));
+        }
+        Ok(self.reply(text, self.script.chunks.len(), started, first))
+    }
+}
+
+impl crate::native::Model for ScriptedModel {
+    fn generate(&mut self, _: &str, _: usize, _: specrt::runtime::Sampling) -> anyhow::Result<specrt::engine::Reply> {
+        self.stream(&mut |_| true)
+    }
+
+    fn chat(
+        &mut self,
+        _: &[serde_json::Value],
+        _: bool,
+        _: usize,
+        _: specrt::runtime::Sampling,
+        on_text: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<specrt::engine::Reply> {
+        self.stream(on_text)
+    }
+
+    fn logits(&mut self, _: &str) -> anyhow::Result<specrt::engine::PromptLogits> {
+        Ok(specrt::engine::PromptLogits { tokens: vec![1, 2], vocab: 2, values: vec![0.0, 1.0, 2.0, 3.0] })
+    }
+}

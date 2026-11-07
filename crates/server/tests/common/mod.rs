@@ -1,4 +1,4 @@
-use inference_bench_core::backend::{Backend, BackendConfig, Capabilities, Request};
+use inference_bench_core::target::{Target, Capabilities, Request};
 use inference_bench_core::chat::ChatRequest;
 use inference_bench_core::result::{BackendError, ErrorKind, Generation};
 use inference_bench_server::{Server, ServerConfig, ServerHandle};
@@ -23,7 +23,7 @@ pub struct Fake {
     pub stats: Arc<Stats>,
 }
 
-impl Backend for Fake {
+impl Target for Fake {
     fn name(&self) -> &str {
         "fake"
     }
@@ -113,11 +113,9 @@ pub fn config(extra: &str) -> ServerConfig {
 }
 
 pub fn start(config: ServerConfig, shape: Shape) -> Rig {
-    init_logs();
-    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     let stats = Arc::new(Stats::default());
     let s = stats.clone();
-    let factory = move |_: &BackendConfig| -> Result<Box<dyn Backend>, BackendError> {
+    let factory = move |_: Option<usize>| -> Result<Box<dyn Target>, BackendError> {
         Ok(Box::new(Fake {
             tokens: shape.tokens,
             first_delay_ms: shape.first_delay_ms,
@@ -125,6 +123,12 @@ pub fn start(config: ServerConfig, shape: Shape) -> Rig {
             stats: s.clone(),
         }))
     };
+    start_with(config, factory, stats)
+}
+
+pub fn start_with(config: ServerConfig, factory: impl inference_bench_server::EngineFactory, stats: Arc<Stats>) -> Rig {
+    init_logs();
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
     let handle = rt
         .block_on(Server::new(config).with_factory(factory).with_gpu_probe(Arc::new(|| Some(1_000_000))).start())
         .unwrap();
