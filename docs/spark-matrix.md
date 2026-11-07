@@ -311,3 +311,37 @@ What was measured on the way (Spark, min of 4 alternating nsys runs): bf16 plane
 | total | 48.2 | 42.4 | 38.4 |
 
 (min of 4 alternating runs, Qwen3-0.6B 1024 tokens, Spark.) Logits after stage 2, both GPUs, all 8 pass: qwen3 1.9e-4, qwen2.5 6.1e-4, llama3.2 1.2e-4, linear rope 6.1e-4, geglu 1.3e-3, tinymistral 4.6e-2, Q8 2.27 mean 0.057.
+
+Stage 3, GEMM accumulation: the split GEMMs sum hi and lo products into a per-k-tile partial and add it to the accumulator once per tile (instead of once per mma pair), qkv 7.1 to 6.5 ms and o 4.0 to 3.7 ms. Logits: qwen3 2.5e-4, qwen2.5 5.6e-4, llama3.2 1.1e-4, linear rope 5.6e-4, geglu 1.6e-3, all 8 pass on both GPUs.
+
+Where the remaining GEMM time goes: dropping the hi/lo split from all linears takes the four GEMMs from 26.6 to 19.8 ms, but every single linear fails the gate on its own (max abs with only that linear unsplit, qwen3 / geglu: lm_head 0.037 / 0.070, o 0.030 / 0.21, down 0.073 / 0.31, qkv 0.063 / 0.48, gate_up 0.061 / 0.37). So against vLLM's 11.8 ms the GEMMs carry 2x the tensor work for the 1e-3 gate, and the unsplit kernel is still 1.7x off cuBLAS/CUTLASS. ncu on gate_up after stage 1: tensor pipe 52% active, 75 registers, 3 blocks per SM, stalls spread over math pipe throttle, long scoreboard and barrier.
+
+Final, Spark GB10, all with the GPU shared with Frigate, ffmpeg and an idle ComfyUI (`nvidia-smi --query-compute-apps`: ggml-rpc-server, frigate.detector:onnx, three ffmpeg, ComfyUI python 12.9 GB). Per-kernel, Qwen3-0.6B bf16 1024-token prefill, min of 4 alternating nsys runs:
+
+| kernel | base ms | final ms | vLLM ms |
+|---|---|---|---|
+| gate_up | 12.90 | 10.27 | |
+| qkv | 9.19 | 6.49 | |
+| down | 6.26 | 5.37 | |
+| o | 4.43 | 3.68 | |
+| four GEMMs | 32.8 | 25.8 | 11.8 |
+| attention | 11.47 | 7.51 | 2.74 |
+| total | 48.1 | 37.6 | 22.0 |
+
+Prefill tok/s from `bench`, medians of 6 runs alternating base (e8db06c) and final, page cache dropped before each run:
+
+| spec | prompt | base tok/s | final tok/s | ratio |
+|---|---|---|---|---|
+| qwen3-0.6b | 128 | 10707 | 11940 | 1.12 |
+| qwen3-0.6b | 512 | 20447 | 24527 | 1.20 |
+| qwen3-0.6b | 1024 | 20794 | 26803 | 1.29 |
+| qwen2.5-0.5b | 128 | 11784 | 13633 | 1.16 |
+| qwen2.5-0.5b | 512 | 25662 | 30976 | 1.21 |
+| qwen2.5-0.5b | 1024 | 28142 | 34639 | 1.23 |
+| qwen3-0.6b-q8 | 128 | 11542 | 12898 | 1.12 |
+| qwen3-0.6b-q8 | 512 | 20425 | 25514 | 1.25 |
+| qwen3-0.6b-q8 | 1024 | 20118 | 26532 | 1.32 |
+
+Decode, Qwen3-0.6B 128-token prompt, 128 new, 6 alternating runs, medians: batch 1 167.2 base, 166.8 final; batch 4 aggregate 482 base, 565 final; batch 16 aggregate 1456 base, 1637 final. At a 2048-token context batch 1 decode is 124.0 base, 124.3 final. On the RTX PRO 6000 (shared with a vLLM process) the 1024 prefill goes 22.9k to 31.1k tok/s and decode is level (417 vs 416).
+
+The 1024-token kernel time is 37.6 ms against the 26 ms target: not reached. The gap is the hi/lo split in the GEMMs (about 7 ms, needed for the gate) plus the remaining GEMM and attention kernel efficiency.
