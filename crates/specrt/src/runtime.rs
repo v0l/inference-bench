@@ -63,6 +63,30 @@ impl Sampling {
     }
 }
 
+struct Planes {
+    hi: CudaSlice<u16>,
+    lo: CudaSlice<u16>,
+}
+
+impl Planes {
+    fn new(stream: &Arc<CudaStream>, len: usize) -> Result<Self> {
+        Ok(Planes { hi: stream.alloc_zeros(len)?, lo: stream.alloc_zeros(len)? })
+    }
+
+    fn rows(&self, from: usize, to: usize, width: usize) -> (CudaView<'_, u16>, CudaView<'_, u16>) {
+        (self.hi.slice(from * width..to * width), self.lo.slice(from * width..to * width))
+    }
+
+    fn all(&self) -> (CudaView<'_, u16>, CudaView<'_, u16>) {
+        (self.hi.as_view(), self.lo.as_view())
+    }
+}
+
+enum GemmOut<'a> {
+    F32(&'a CudaSlice<f32>),
+    Planes(&'a Planes),
+}
+
 struct PrefillBuffers {
     tokens: CudaSlice<i32>,
     x: CudaSlice<f32>,
@@ -71,7 +95,10 @@ struct PrefillBuffers {
     attn: CudaSlice<f32>,
     gate_up: CudaSlice<f32>,
     act: CudaSlice<f32>,
-    inv: CudaSlice<f32>,
+    xn_planes: Planes,
+    attn_planes: Planes,
+    act_planes: Planes,
+    dummy_u16: CudaSlice<u16>,
 }
 
 pub struct BatchGeneration {
@@ -100,6 +127,7 @@ pub struct Runtime {
     max_ctx: usize,
     stream: Arc<CudaStream>,
     kernels: HashMap<&'static str, CudaFunction>,
+    smem: std::collections::BTreeMap<&'static str, u32>,
     embed: CudaSlice<u16>,
     norm: CudaSlice<f32>,
     lm_head: DeviceMatrix,
@@ -154,8 +182,19 @@ impl Runtime {
         let jit_secs = jit_started.elapsed().as_secs_f64();
         let mut kernels = HashMap::new();
         for &name in &module.kernels {
-            kernels.insert(name, loaded.function(name)?);
+            let f = loaded.function(name)?;
+            if let Some(&bytes) = module.smem.get(name) {
+                use cudarc::driver::sys::CUfunction_attribute as A;
+                f.set_attribute(A::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, 100)?;
+                f.set_attribute(
+                    A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    bytes as i32,
+                )
+                .with_context(|| format!("{name}: {bytes} bytes of shared memory"))?;
+            }
+            kernels.insert(name, f);
         }
+        let smem = module.smem.clone();
         let weights = Weights::load(spec, &find_safetensors(&spec.repo)?)?;
         let up_m = |m: &Matrix| -> Result<DeviceMatrix> {
             Ok(match m {
@@ -228,9 +267,13 @@ impl Runtime {
             attn: stream.alloc_zeros(chunk * spec.q_dim())?,
             gate_up: stream.alloc_zeros(chunk * 2 * d.intermediate)?,
             act: stream.alloc_zeros(chunk * d.intermediate)?,
-            inv: stream.alloc_zeros(chunk)?,
+            xn_planes: Planes::new(&stream, chunk * d.hidden)?,
+            attn_planes: Planes::new(&stream, chunk * spec.q_dim())?,
+            act_planes: Planes::new(&stream, chunk * d.intermediate)?,
+            dummy_u16: stream.alloc_zeros(8)?,
         };
         let rt = Runtime {
+            smem,
             pre,
             chunk,
             layer_base: 0,
@@ -432,49 +475,49 @@ impl Runtime {
         name: &str,
         w: &DeviceMatrix,
         bias: Option<&CudaSlice<f32>>,
-        x: &CudaView<f32>,
-        norm: Option<(&CudaView<f32>, &CudaSlice<f32>)>,
-        out: &CudaSlice<f32>,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
         use crate::codegen::Tile;
         let big = Tile::big();
         let blocks = |t: Tile| grid(rows, t.bn) * grid(tokens, t.bm);
-        let (tile, suffix) = match std::env::var("SPECRT_TILE").as_deref() {
-            Ok("small") => (Tile::SMALL, ""),
-            Ok("big") => (big, "_big"),
-            Ok("narrow") => (Tile::NARROW, "_narrow"),
-            _ if tokens <= 16 => (Tile::tiny(), "_tiny"),
-            _ if blocks(big) >= 2 * self.sms => (big, "_big"),
-            _ if blocks(Tile::SMALL) >= 2 * self.sms => (Tile::SMALL, ""),
-            _ => (Tile::NARROW, "_narrow"),
+        let suffix = match std::env::var("SPECRT_TILE").as_deref() {
+            Ok("small") => "",
+            Ok("big") => "_big",
+            Ok("narrow") => "_narrow",
+            _ if tokens <= 16 => "_tiny",
+            _ if blocks(big) >= 2 * self.sms => "_big",
+            _ if blocks(Tile::SMALL) >= 2 * self.sms => "",
+            _ => "_narrow",
         };
+        let tile = Tile::variant(suffix);
         let kernel = format!("{name}_mma{suffix}");
         let mut b = self.stream.launch_builder(self.kernel(&kernel));
         match w {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
             DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
         };
-        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x);
-        match norm {
-            Some((ri, nw)) => b.arg(ri).arg(nw),
-            None => b.arg(&self.buf.dummy).arg(&self.buf.dummy),
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
         };
         let n = tokens as i32;
-        b.arg(out).arg(&n);
+        b.arg(&n);
         let config = LaunchConfig {
             grid_dim: (grid(rows, tile.bn), grid(tokens, tile.bm), 1),
             block_dim: (tile.threads(), 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: self.smem[kernel.as_str()],
         };
         unsafe { b.launch(config) }?;
         Ok(())
     }
 
-    fn row_rms(&self, x: &CudaSlice<f32>, tokens: usize) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel("row_rms"));
-        b.arg(x).arg(&self.pre.inv);
+    fn rms_split(&self, x: &CudaView<f32>, w: &CudaSlice<f32>, out: &Planes, tokens: usize) -> Result<()> {
+        let mut b = self.stream.launch_builder(self.kernel("rms_split"));
+        b.arg(x).arg(w).arg(&out.hi).arg(&out.lo);
         unsafe { b.launch(cfg(tokens as u32, 256)) }?;
         Ok(())
     }
@@ -519,15 +562,13 @@ impl Runtime {
         for (i, l) in self.layers.iter().enumerate() {
             let layer = self.layer_base + i as i32;
             if self.use_mma {
-                self.row_rms(&pre.x, n)?;
-                let inv = pre.inv.as_view();
+                self.rms_split(&pre.x.as_view(), &l.ln1, &pre.xn_planes, n)?;
                 self.tc(
                     "qkv",
                     &l.qkv,
                     l.qkv_bias.as_ref(),
-                    &pre.x.as_view(),
-                    Some((&inv, &l.ln1)),
-                    &pre.qkv,
+                    pre.xn_planes.all(),
+                    GemmOut::F32(&pre.qkv),
                     qkv_rows,
                     n,
                 )?;
@@ -574,9 +615,13 @@ impl Runtime {
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
-                .arg(&layer)
-                .arg(&pre.attn)
-                .arg(&ntok);
+                .arg(&layer);
+            if self.use_mma {
+                b.arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
+            } else {
+                b.arg(&pre.attn);
+            }
+            b.arg(&ntok);
             let config = LaunchConfig {
                 grid_dim: (grid(n, if self.use_mma { 64 } else { 16 }), a.heads as u32, 1),
                 block_dim: (128, 1, 1),
@@ -585,20 +630,18 @@ impl Runtime {
             unsafe { b.launch(config) }?;
             let inter = s.dims.intermediate;
             if self.use_mma {
-                self.tc("o", &l.o, None, &pre.attn.as_view(), None, &pre.x, hidden, n)?;
-                self.row_rms(&pre.x, n)?;
-                let inv = pre.inv.as_view();
+                self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
+                self.rms_split(&pre.x.as_view(), &l.ln2, &pre.xn_planes, n)?;
                 self.tc(
                     "gate_up",
                     &l.gate_up,
                     None,
-                    &pre.x.as_view(),
-                    Some((&inv, &l.ln2)),
-                    &pre.act,
+                    pre.xn_planes.all(),
+                    GemmOut::Planes(&pre.act_planes),
                     2 * inter,
                     n,
                 )?;
-                self.tc("down", &l.down, None, &pre.act.as_view(), None, &pre.x, hidden, n)?;
+                self.tc("down", &l.down, None, pre.act_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
                 continue;
             }
             self.gemm("o_gemm", &l.o, None, &pre.attn.as_view(), &pre.x, hidden, n)?;
@@ -623,36 +666,21 @@ impl Runtime {
             self.gemm("down_gemm", &l.down, None, &pre.act.as_view(), &pre.x, hidden, n)?;
         }
         if self.use_mma {
-            self.row_rms(&pre.x, n)?;
-            match all_logits {
-                Some(out) => {
-                    let inv = pre.inv.as_view();
-                    self.tc(
-                        "lm_head",
-                        &self.lm_head,
-                        None,
-                        &pre.x.as_view(),
-                        Some((&inv, &self.norm)),
-                        out,
-                        s.dims.vocab,
-                        n,
-                    )?
-                }
-                None => {
-                    let inv = pre.inv.slice(n - 1..n);
-                    let last = pre.x.slice((n - 1) * hidden..n * hidden);
-                    self.tc(
-                        "lm_head",
-                        &self.lm_head,
-                        None,
-                        &last,
-                        Some((&inv, &self.norm)),
-                        &buf.logits,
-                        s.dims.vocab,
-                        1,
-                    )?
-                }
-            }
+            let (out, rows) = match all_logits {
+                Some(out) => (out, 0..n),
+                None => (&buf.logits, n - 1..n),
+            };
+            let x = pre.x.slice(rows.start * hidden..rows.end * hidden);
+            self.rms_split(&x, &self.norm, &pre.xn_planes, rows.len())?;
+            self.tc(
+                "lm_head",
+                &self.lm_head,
+                None,
+                pre.xn_planes.rows(0, rows.len(), hidden),
+                GemmOut::F32(out),
+                s.dims.vocab,
+                rows.len(),
+            )?;
             return Ok(());
         }
         self.rmsnorm_rows(&pre.x, &self.norm, &pre.xn, n)?;
@@ -824,16 +852,14 @@ impl Runtime {
         unsafe { b.launch(config) }?;
         for (i, l) in self.layers.iter().enumerate() {
             let layer = i as i32;
-            self.row_rms(&pre.x, n)?;
-            let inv = pre.inv.as_view();
+            self.rms_split(&pre.x.as_view(), &l.ln1, &pre.xn_planes, n)?;
             let qkv_rows = s.q_dim() + 2 * s.kv_dim();
             self.tc(
                 "qkv",
                 &l.qkv,
                 l.qkv_bias.as_ref(),
-                &pre.x.as_view(),
-                Some((&inv, &l.ln1)),
-                &pre.qkv,
+                pre.xn_planes.all(),
+                GemmOut::F32(&pre.qkv),
                 qkv_rows,
                 n,
             )?;
@@ -870,37 +896,33 @@ impl Runtime {
             };
             unsafe { b.launch(config) }?;
             let mut b = self.stream.launch_builder(self.kernel("batch_decode_combine"));
-            b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.attn);
+            b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
             let config = LaunchConfig {
                 grid_dim: (a.heads as u32, n as u32, 1),
-                block_dim: (a.head_dim as u32, 1, 1),
+                block_dim: (a.head_dim as u32 / 2, 1, 1),
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
-            self.tc("o", &l.o, None, &pre.attn.as_view(), None, &pre.x, hidden, n)?;
-            self.row_rms(&pre.x, n)?;
-            let inv = pre.inv.as_view();
+            self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
+            self.rms_split(&pre.x.as_view(), &l.ln2, &pre.xn_planes, n)?;
             self.tc(
                 "gate_up",
                 &l.gate_up,
                 None,
-                &pre.x.as_view(),
-                Some((&inv, &l.ln2)),
-                &pre.act,
+                pre.xn_planes.all(),
+                GemmOut::Planes(&pre.act_planes),
                 2 * inter,
                 n,
             )?;
-            self.tc("down", &l.down, None, &pre.act.as_view(), None, &pre.x, hidden, n)?;
+            self.tc("down", &l.down, None, pre.act_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
         }
-        self.row_rms(&pre.x, n)?;
-        let inv = pre.inv.as_view();
+        self.rms_split(&pre.x.as_view(), &self.norm, &pre.xn_planes, n)?;
         self.tc(
             "lm_head",
             &self.lm_head,
             None,
-            &pre.x.as_view(),
-            Some((&inv, &self.norm)),
-            &bb.logits,
+            pre.xn_planes.all(),
+            GemmOut::F32(&bb.logits),
             s.dims.vocab,
             n,
         )?;

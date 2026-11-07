@@ -16,12 +16,19 @@ pub struct Tile {
     pub wn: usize,
 }
 
+pub const MMA_LINEARS: [&str; 5] = ["qkv", "o", "gate_up", "down", "lm_head"];
+pub const MMA_VARIANTS: [&str; 4] = ["", "_big", "_narrow", "_tiny"];
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
 impl Tile {
     pub const SMALL: Tile = Tile { bm: 64, bn: 64, wm: 2, wn: 2 };
     pub const NARROW: Tile = Tile { bm: 64, bn: 32, wm: 2, wn: 2 };
 
     pub fn tiny() -> Tile {
-        let wn = std::env::var("SPECRT_TINY_WN").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let wn = env_usize("SPECRT_TINY_WN", 2);
         Tile { bm: 16, bn: 16 * wn, wm: 1, wn }
     }
 
@@ -37,6 +44,45 @@ impl Tile {
             Some(t) => t,
             None => Tile { bm: 64, bn: 128, wm: 2, wn: 4 },
         }
+    }
+
+    pub fn variant(suffix: &str) -> Tile {
+        match suffix {
+            "_big" => Tile::big(),
+            "_narrow" => Tile::NARROW,
+            "_tiny" => Tile::tiny(),
+            _ => Tile::SMALL,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MmaShape {
+    pub tile: Tile,
+    pub bk: usize,
+    pub stages: usize,
+    pub split: bool,
+    pub q8: bool,
+}
+
+impl MmaShape {
+    pub fn new(tile: Tile, k: usize, q8: bool, split: bool) -> MmaShape {
+        let bk = if q8 {
+            Q8_GROUP
+        } else if tile.bm == 16 && k % 128 == 0 {
+            128
+        } else {
+            env_usize("SPECRT_BK", 32)
+        };
+        let stages = if tile.bm == 16 { 2 } else { env_usize("SPECRT_STAGES", 2) };
+        MmaShape { tile, bk, stages, split, q8 }
+    }
+
+    pub fn smem_bytes(&self) -> u32 {
+        let planes = if self.split { 2 } else { 1 };
+        let a = self.tile.bm * self.bk * 2 * planes;
+        let wrow = if self.q8 { self.bk + 16 } else { self.bk * 2 };
+        ((a + self.tile.bn * wrow) * self.stages) as u32
     }
 }
 
@@ -72,7 +118,7 @@ pub const KERNELS: &[&str] = &[
     "gate_up_mma_big",
     "down_mma_big",
     "lm_head_mma_big",
-    "row_rms",
+    "rms_split",
     "qkv_mma_tiny",
     "o_mma_tiny",
     "gate_up_mma_tiny",
@@ -96,6 +142,7 @@ pub const KERNELS: &[&str] = &[
 pub struct Module {
     pub source: String,
     pub kernels: Vec<&'static str>,
+    pub smem: BTreeMap<&'static str, u32>,
 }
 
 pub fn render(template: &str, vars: &BTreeMap<&str, String>) -> Result<String> {
@@ -122,6 +169,50 @@ fn float_literal(v: f64) -> String {
     format!("{v:e}f")
 }
 
+fn mma_kernel_name(linear: &str, suffix: &str) -> &'static str {
+    let name = format!("{linear}_mma{suffix}");
+    KERNELS.iter().copied().find(|k| *k == name).expect("mma kernel listed in KERNELS")
+}
+
+fn linear_dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str, bool) {
+    let d = &spec.dims;
+    let qkv_n = spec.q_dim() + 2 * spec.kv_dim();
+    match linear {
+        "qkv" => (qkv_n, d.hidden, "EPI_STORE", spec.attention.qkv_bias),
+        "o" => (d.hidden, spec.q_dim(), "EPI_RESIDUAL", false),
+        "gate_up" => (2 * d.intermediate, d.hidden, "EPI_ACT", false),
+        "down" => (d.hidden, d.intermediate, "EPI_RESIDUAL", false),
+        _ => (d.vocab, d.hidden, "EPI_STORE", false),
+    }
+}
+
+fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
+    let q8 = spec.quant == Quant::Q8;
+    let unsplit = std::env::var("SPECRT_UNSPLIT").unwrap_or_default();
+    let mut out = String::new();
+    for linear in MMA_LINEARS {
+        let split = !q8 && !unsplit.split(',').any(|n| n == linear);
+        let (n, k, epi, bias) = linear_dims(spec, linear);
+        for suffix in MMA_VARIANTS {
+            let shape = MmaShape::new(Tile::variant(suffix), k, q8, split);
+            let t = shape.tile;
+            let name = mma_kernel_name(linear, suffix);
+            smem.insert(name, shape.smem_bytes());
+            out.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, {q8}, {split}>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+                threads = t.threads(),
+                bm = t.bm,
+                bn = t.bn,
+                wm = t.wm,
+                wn = t.wn,
+                bk = shape.bk,
+                stages = shape.stages,
+            ));
+        }
+    }
+    out
+}
+
 impl Module {
     pub fn generate(spec: &Spec, max_ctx: usize) -> Result<Self> {
         let a = &spec.attention;
@@ -139,15 +230,12 @@ impl Module {
         let opt = |f: fn(&crate::spec::RopeScaling) -> Option<f64>| {
             float_literal(scaling.and_then(f).unwrap_or(1.0))
         };
-        let big = Tile::big();
-        let unsplit = std::env::var("SPECRT_UNSPLIT").unwrap_or_default();
-        let split_default = spec.quant == Quant::Bf16;
-        let split =
-            |name: &str| (split_default && !unsplit.split(',').any(|n| n == name)).to_string();
         let act = match spec.mlp.activation {
             Activation::Swiglu => 0,
             Activation::Geglu => 1,
         };
+        let mut smem = BTreeMap::new();
+        let mma = mma_kernels(spec, &mut smem);
         let vars: BTreeMap<&str, String> = [
             ("HIDDEN", d.hidden.to_string()),
             ("INTER", d.intermediate.to_string()),
@@ -175,23 +263,12 @@ impl Module {
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
             ("LINEAR", linear.to_string()),
             ("Q8", (spec.quant == Quant::Q8).to_string()),
-            ("SPLIT_QKV", split("qkv")),
-            ("SPLIT_O", split("o")),
-            ("SPLIT_GATE_UP", split("gate_up")),
-            ("SPLIT_DOWN", split("down")),
-            ("SPLIT_LM_HEAD", split("lm_head")),
-            ("GEMM_STAGES", std::env::var("SPECRT_STAGES").unwrap_or_else(|_| "2".into())),
-            ("TINY_BN", Tile::tiny().bn.to_string()),
-            ("TINY_WN", Tile::tiny().wn.to_string()),
-            ("BIG_BM", big.bm.to_string()),
-            ("BIG_BN", big.bn.to_string()),
-            ("BIG_WM", big.wm.to_string()),
-            ("BIG_WN", big.wn.to_string()),
+            ("MMA_KERNELS", mma),
         ]
         .into_iter()
         .collect();
         let source =
             format!("{}\n{}", render(OPS_TEMPLATE, &vars)?, render(MODEL_TEMPLATE, &vars)?);
-        Ok(Module { source, kernels: KERNELS.to_vec() })
+        Ok(Module { source, kernels: KERNELS.to_vec(), smem })
     }
 }

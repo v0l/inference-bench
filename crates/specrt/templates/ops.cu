@@ -271,6 +271,12 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(s), "l"(gmem));
 }
 
+__device__ __forceinline__ void cp_async16_zfill(void* smem, const void* gmem, bool valid) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    int n = valid ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(s), "l"(gmem), "r"(n));
+}
+
 __device__ __forceinline__ void cp_async_commit() {
     asm volatile("cp.async.commit_group;");
 }
@@ -283,7 +289,7 @@ __device__ __forceinline__ void cp_async_wait() {
 __device__ __forceinline__ void mma_bf16(float* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                          unsigned b0, unsigned b1) {
 #if __CUDA_ARCH__ >= 800
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 #endif
@@ -321,29 +327,48 @@ constexpr int EPI_STORE = 0;
 constexpr int EPI_RESIDUAL = 1;
 constexpr int EPI_ACT = 2;
 
-template <int N, int K, int BM, int BN, int WM, int WN, int EPI, bool BIAS, bool Q8, bool NORM, bool SPLIT>
-__device__ __forceinline__ void gemm_tc(const void* w, const float* scales, const float* bias, const float* x,
-                                        const float* row_inv, const float* nw, float* out, int tokens) {
+__device__ __forceinline__ void split_store2(bf16_t* hi, bf16_t* lo, size_t at, float a, float b) {
+    unsigned ha, la, hb, lb;
+    split_hi_lo(a, ha, la);
+    split_hi_lo(b, hb, lb);
+    *(unsigned*)(hi + at) = ha | (hb << 16);
+    *(unsigned*)(lo + at) = la | (lb << 16);
+}
+
+template <int CPR>
+__device__ __forceinline__ int swz(int r, int c) {
+    static_assert(CPR >= 4, "rows of at least 64 bytes");
+    constexpr int GROUP_ROWS = CPR >= 8 ? 1 : 8 / CPR;
+    constexpr int MASK = CPR >= 8 ? 7 : CPR - 1;
+    return r * CPR + (c ^ ((r / GROUP_ROWS) & MASK));
+}
+
+template <int N, int K, int BM, int BN, int WM, int WN, int BK, int STAGES, int EPI, bool BIAS, bool Q8, bool SPLIT>
+__device__ __forceinline__ void gemm_tc(const void* w, const float* scales, const float* bias, const bf16_t* x_hi,
+                                        const bf16_t* x_lo, float* out, bf16_t* out_hi, bf16_t* out_lo, int tokens) {
     constexpr int THREADS = WM * WN * 32;
     constexpr int TM = BM / WM;
     constexpr int TN = BN / WN;
     constexpr int MI = TM / 16;
     constexpr int NJ = TN / 8;
-    constexpr int BK = (!Q8 && BM == 16 && K % 128 == 0) ? 128 : 32;
     constexpr int KS = BK / 16;
-    constexpr int AS = BK + 8;
-    constexpr int WROW = Q8 ? BK + 16 : (BK + 8) * 2;
+    constexpr int CPR = BK / 8;
+    constexpr int PLANES = SPLIT ? 2 : 1;
+    constexpr int A_TILE = BM * BK;
+    constexpr int A_BYTES = A_TILE * 2 * PLANES;
+    constexpr int WROW = Q8 ? BK + 16 : BK * 2;
+    constexpr int STAGE_BYTES = A_BYTES + BN * WROW;
     constexpr int KT = K / BK;
-    constexpr int A_ITERS = BM * BK / 4 / THREADS;
-    constexpr int W_CHUNKS = Q8 ? 2 : BK / 8;
+    constexpr int A_CHUNKS = BK / 8;
+    constexpr int A_TOTAL = BM * A_CHUNKS * PLANES;
+    constexpr int A_ITERS = (A_TOTAL + THREADS - 1) / THREADS;
+    constexpr int W_CHUNKS = Q8 ? BK / 16 : BK / 8;
     constexpr int W_ITERS = (BN * W_CHUNKS + THREADS - 1) / THREADS;
-    static_assert(K % BK == 0, "K must be a multiple of 32");
-    static_assert(A_ITERS * THREADS * 4 == BM * BK, "A tile split");
+    static_assert(K % BK == 0, "K must be a multiple of BK");
+    static_assert(!Q8 || BK == Q8_GROUP, "Q8 tiles cover one scale group");
     static_assert(NJ % 2 == 0, "warp n tile");
-    __shared__ __align__(16) bf16_t a_hi[BM * AS];
-    __shared__ __align__(16) bf16_t a_lo[SPLIT ? BM * AS : 8];
-    constexpr int STAGES = {{GEMM_STAGES}};
-    __shared__ __align__(16) unsigned char ws[STAGES][BN * WROW];
+    static_assert(STAGES >= 2, "pipeline depth");
+    extern __shared__ __align__(16) unsigned char gemm_smem[];
     int tid = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
@@ -360,42 +385,22 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
         for (int j = 0; j < NJ; j++)
 #pragma unroll
             for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
-    float4 xr[A_ITERS];
-    auto load_x = [&](int kt) {
+    int last_row = max(tokens - 1, 0);
+    auto load_stage = [&](int buf, int kt) {
+        unsigned char* base = gemm_smem + buf * STAGE_BYTES;
 #pragma unroll
         for (int i = 0; i < A_ITERS; i++) {
             int idx = tid + i * THREADS;
-            int r = idx / (BK / 4);
-            int c = (idx % (BK / 4)) * 4;
+            if (A_ITERS * THREADS != A_TOTAL && idx >= A_TOTAL) break;
+            int p = idx / (BM * A_CHUNKS);
+            int rem = idx % (BM * A_CHUNKS);
+            int r = rem / A_CHUNKS;
+            int c = rem % A_CHUNKS;
             int m = m0 + r;
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (m < tokens) {
-                v = *(const float4*)(x + (size_t)m * K + kt * BK + c);
-                if (NORM) {
-                    float sc = row_inv[m];
-                    float4 nv = *(const float4*)(nw + kt * BK + c);
-                    v = make_float4(nv.x * (v.x * sc), nv.y * (v.y * sc), nv.z * (v.z * sc), nv.w * (v.w * sc));
-                }
-            }
-            xr[i] = v;
+            const bf16_t* src = (p ? x_lo : x_hi) + (size_t)min(m, last_row) * K + kt * BK + c * 8;
+            cp_async16_zfill(base + p * A_TILE * 2 + swz<CPR>(r, c) * 16, src, m < tokens);
         }
-    };
-    auto store_x = [&]() {
-#pragma unroll
-        for (int i = 0; i < A_ITERS; i++) {
-            int idx = tid + i * THREADS;
-            int r = idx / (BK / 4);
-            int c = (idx % (BK / 4)) * 4;
-            unsigned h0, l0, h1, l1, h2, l2, h3, l3;
-            split_hi_lo(xr[i].x, h0, l0);
-            split_hi_lo(xr[i].y, h1, l1);
-            split_hi_lo(xr[i].z, h2, l2);
-            split_hi_lo(xr[i].w, h3, l3);
-            *(uint2*)&a_hi[r * AS + c] = make_uint2(h0 | (h1 << 16), h2 | (h3 << 16));
-            if (SPLIT) *(uint2*)&a_lo[r * AS + c] = make_uint2(l0 | (l1 << 16), l2 | (l3 << 16));
-        }
-    };
-    auto load_w = [&](int buf, int kt) {
+        unsigned char* ws = base + A_BYTES;
 #pragma unroll
         for (int i = 0; i < W_ITERS; i++) {
             int idx = tid + i * THREADS;
@@ -405,39 +410,42 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
             int n = min(n0 + r, N - 1);
             const char* src = Q8 ? (const char*)w + (size_t)n * K + kt * BK + ck * 16
                                  : (const char*)w + ((size_t)n * K + kt * BK) * 2 + ck * 16;
-            cp_async16(&ws[buf][r * WROW + ck * 16], src);
+            cp_async16(ws + (Q8 ? r * WROW + ck * 16 : swz<CPR>(r, ck) * 16), src);
         }
     };
 #pragma unroll
     for (int st = 0; st < STAGES - 1; st++) {
-        if (st < KT) load_w(st, st);
+        if (st < KT) load_stage(st, st);
         cp_async_commit();
     }
-    load_x(0);
     for (int kt = 0; kt < KT; kt++) {
-        int cur = kt % STAGES;
+        cp_async_wait<STAGES - 2>();
         __syncthreads();
-        store_x();
         int next = kt + STAGES - 1;
-        if (next < KT) load_w(next % STAGES, next);
+        if (next < KT) load_stage(next % STAGES, next);
         cp_async_commit();
-        if (kt + 1 < KT) load_x(kt + 1);
-        cp_async_wait<STAGES - 1>();
-        __syncthreads();
-        float part[MI][NJ][4];
+        const unsigned char* base = gemm_smem + (kt % STAGES) * STAGE_BYTES;
+        const bf16_t* a_hi = (const bf16_t*)base;
+        const bf16_t* a_lo = a_hi + A_TILE;
+        const unsigned char* ws = base + A_BYTES;
+        float s0[NJ], s1[NJ];
 #pragma unroll
-        for (int i = 0; i < MI; i++)
-#pragma unroll
-            for (int j = 0; j < NJ; j++)
-#pragma unroll
-                for (int e = 0; e < 4; e++) part[i][j][e] = 0.0f;
+        for (int j = 0; j < NJ; j++) {
+            s0[j] = 1.0f;
+            s1[j] = 1.0f;
+            if (Q8) {
+                int col = n0 + wn * TN + j * 8 + 2 * t;
+                s0[j] = scales[(size_t)min(col, N - 1) * (K / Q8_GROUP) + kt];
+                s1[j] = scales[(size_t)min(col + 1, N - 1) * (K / Q8_GROUP) + kt];
+            }
+        }
 #pragma unroll
         for (int ks = 0; ks < KS; ks++) {
             unsigned bw[NJ][2];
             if (Q8) {
 #pragma unroll
                 for (int j = 0; j < NJ; j++) {
-                    const unsigned char* p = &ws[cur][(wn * TN + j * 8 + g) * WROW + ks * 16 + 2 * t];
+                    const unsigned char* p = ws + (wn * TN + j * 8 + g) * WROW + ks * 16 + 2 * t;
                     bw[j][0] = q8_pair_bf16(*(const unsigned short*)p);
                     bw[j][1] = q8_pair_bf16(*(const unsigned short*)(p + 8));
                 }
@@ -446,43 +454,67 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                 for (int jp = 0; jp < NJ / 2; jp++) {
                     unsigned r[4];
                     int row = wn * TN + jp * 16 + (lane >> 4) * 8 + (lane & 7);
-                    ldsm_x4(r, &ws[cur][row * WROW + (ks * 16 + ((lane >> 3) & 1) * 8) * 2]);
+                    ldsm_x4(r, ws + swz<CPR>(row, ks * 2 + ((lane >> 3) & 1)) * 16);
                     bw[2 * jp][0] = r[0];
                     bw[2 * jp][1] = r[1];
                     bw[2 * jp + 1][0] = r[2];
                     bw[2 * jp + 1][1] = r[3];
                 }
             }
+            unsigned ah[MI][4], al[MI][4];
 #pragma unroll
             for (int i = 0; i < MI; i++) {
-                unsigned ah[4], al[4];
                 int row = wm * TM + i * 16 + (lane & 15);
-                int col = ks * 16 + (lane >> 4) * 8;
-                ldsm_x4(ah, &a_hi[row * AS + col]);
-                if (SPLIT) ldsm_x4(al, &a_lo[row * AS + col]);
+                int at = swz<CPR>(row, ks * 2 + (lane >> 4)) * 8;
+                ldsm_x4(ah[i], &a_hi[at]);
+                if (SPLIT) ldsm_x4(al[i], &a_lo[at]);
+            }
+            if (SPLIT) {
 #pragma unroll
-                for (int j = 0; j < NJ; j++) {
-                    if (SPLIT) mma_bf16(part[i][j], al[0], al[1], al[2], al[3], bw[j][0], bw[j][1]);
-                    mma_bf16(part[i][j], ah[0], ah[1], ah[2], ah[3], bw[j][0], bw[j][1]);
+                for (int i = 0; i < MI; i++)
+#pragma unroll
+                    for (int j = 0; j < NJ; j++) {
+                        float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        mma_bf16(c, al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
+                        mma_bf16(c, ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
+                        acc[i][j][0] += c[0];
+                        acc[i][j][1] += c[1];
+                        acc[i][j][2] += c[2];
+                        acc[i][j][3] += c[3];
+                    }
+            } else {
+#pragma unroll
+                for (int i = 0; i < MI; i++)
+#pragma unroll
+                    for (int j = 0; j < NJ; j++) {
+                        float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        mma_bf16(c, ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
+                        acc[i][j][0] += c[0] * s0[j];
+                        acc[i][j][1] += c[1] * s1[j];
+                        acc[i][j][2] += c[2] * s0[j];
+                        acc[i][j][3] += c[3] * s1[j];
+                    }
+            }
+        }
+    }
+    cp_async_wait<0>();
+    if (EPI == EPI_ACT) {
+        static_assert(EPI != EPI_ACT || N % 4 == 0, "gate/up pairs");
+#pragma unroll
+        for (int i = 0; i < MI; i++)
+#pragma unroll
+            for (int j = 0; j < NJ; j++) {
+                int col = n0 + wn * TN + j * 8 + 2 * t;
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    int m = m0 + wm * TM + i * 16 + g + h * 8;
+                    float a = activation(acc[i][j][h * 2]) * acc[i][j][h * 2 + 1];
+                    float b = __shfl_xor_sync(0xffffffff, a, 1);
+                    if ((t & 1) == 0 && col < N && m < tokens)
+                        split_store2(out_hi, out_lo, (size_t)m * (N / 2) + col / 2, a, b);
                 }
             }
-        }
-#pragma unroll
-        for (int j = 0; j < NJ; j++) {
-            float s0 = 1.0f, s1 = 1.0f;
-            if (Q8) {
-                int col = n0 + wn * TN + j * 8 + 2 * t;
-                s0 = scales[(size_t)min(col, N - 1) * (K / Q8_GROUP) + kt];
-                s1 = scales[(size_t)min(col + 1, N - 1) * (K / Q8_GROUP) + kt];
-            }
-#pragma unroll
-            for (int i = 0; i < MI; i++) {
-                acc[i][j][0] += part[i][j][0] * s0;
-                acc[i][j][1] += part[i][j][1] * s1;
-                acc[i][j][2] += part[i][j][2] * s0;
-                acc[i][j][3] += part[i][j][3] * s1;
-            }
-        }
+        return;
     }
 #pragma unroll
     for (int i = 0; i < MI; i++)
@@ -501,9 +533,7 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                 if (m >= tokens) continue;
                 float v0 = acc[i][j][h * 2] + b0;
                 float v1 = acc[i][j][h * 2 + 1] + b1;
-                if (EPI == EPI_ACT) {
-                    out[(size_t)m * (N / 2) + col / 2] = activation(v0) * v1;
-                } else {
+                {
                     float* o = out + (size_t)m * N + col;
                     if (EPI == EPI_RESIDUAL) {
                         v0 += o[0];
@@ -516,13 +546,23 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
         }
 }
 
-extern "C" __global__ void row_rms(const float* x, float* inv) {
+extern "C" __global__ void rms_split(const float* x, const float* weight, bf16_t* hi, bf16_t* lo) {
     __shared__ float scratch[32];
-    x += (size_t)blockIdx.x * HIDDEN;
+    static_assert(HIDDEN % 4 == 0, "hidden size");
+    size_t row = (size_t)blockIdx.x * HIDDEN;
+    const float4* xv = (const float4*)(x + row);
     float ss = 0.0f;
-    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) ss += x[i] * x[i];
-    float r = rsqrtf(block_reduce<false>(ss, scratch) / HIDDEN + EPS);
-    if (threadIdx.x == 0) inv[blockIdx.x] = r;
+    for (int i = threadIdx.x; i < HIDDEN / 4; i += blockDim.x) {
+        float4 v = xv[i];
+        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    float inv = rsqrtf(block_reduce<false>(ss, scratch) / HIDDEN + EPS);
+    for (int i = threadIdx.x; i < HIDDEN / 4; i += blockDim.x) {
+        float4 v = xv[i];
+        float4 nv = ((const float4*)weight)[i];
+        split_store2(hi, lo, row + 4 * i, nv.x * (v.x * inv), nv.y * (v.y * inv));
+        split_store2(hi, lo, row + 4 * i + 2, nv.z * (v.z * inv), nv.w * (v.w * inv));
+    }
 }
 
 extern "C" __global__ void embed(const bf16_t* table, const int* token, float* x) {
@@ -910,21 +950,22 @@ extern "C" __global__ void batch_decode_attention(const float* qkv, const float*
     }
 }
 
-extern "C" __global__ void batch_decode_combine(const float* part_acc, const float* part_ml, float* out) {
+extern "C" __global__ void batch_decode_combine(const float* part_acc, const float* part_ml, bf16_t* out_hi, bf16_t* out_lo) {
     int head = blockIdx.x;
     int seq = blockIdx.y;
-    int d = threadIdx.x;
+    int d = 2 * threadIdx.x;
     size_t base = ((size_t)seq * HEADS + head) * BD_SPLITS;
     float M = NEG_INF;
     for (int s = 0; s < BD_SPLITS; s++) M = fmaxf(M, part_ml[(base + s) * 2]);
-    float L = 0.0f, A = 0.0f;
+    float L = 0.0f, A0 = 0.0f, A1 = 0.0f;
     for (int s = 0; s < BD_SPLITS; s++) {
         float ms = part_ml[(base + s) * 2];
         float c = ms == NEG_INF ? 0.0f : expf(ms - M);
         L += part_ml[(base + s) * 2 + 1] * c;
-        A += part_acc[(base + s) * HEAD_DIM + d] * c;
+        A0 += part_acc[(base + s) * HEAD_DIM + d] * c;
+        A1 += part_acc[(base + s) * HEAD_DIM + d + 1] * c;
     }
-    out[((size_t)seq * HEADS + head) * HEAD_DIM + d] = A / L;
+    split_store2(out_hi, out_lo, ((size_t)seq * HEADS + head) * HEAD_DIM + d, A0 / L, A1 / L);
 }
 
 constexpr int FA_BQ = 16;
@@ -1052,7 +1093,8 @@ __device__ __forceinline__ void mma3(float* c, const unsigned* ah, const unsigne
 }
 
 extern "C" __global__ void flash_mma(const float* qkv, const float* q_norm, const float* k_cache, const float* v_cache,
-                                     const int* block_table, const int* pos_ptr, int layer, float* out, int tokens) {
+                                     const int* block_table, const int* pos_ptr, int layer, bf16_t* out_hi,
+                                     bf16_t* out_lo, int tokens) {
     static_assert(FM_BQ * HEAD_DIM * 4 <= 4 * FM_BK * FM_KS * 2, "Q staging fits the K/V tiles");
     __shared__ __align__(16) unsigned char smem[4 * FM_BK * FM_KS * 2];
     bf16_t (*k_hi)[FM_KS] = (bf16_t (*)[FM_KS])smem;
@@ -1262,9 +1304,9 @@ extern "C" __global__ void flash_mma(const float* qkv, const float* q_norm, cons
     for (int nb = 0; nb < FM_NB; nb++) {
         int d = nb * 8 + 2 * t;
         if (row0 < tokens)
-            *(float2*)(out + (size_t)row0 * Q_DIM + head * HEAD_DIM + d) = make_float2(o[nb][0] * i0, o[nb][1] * i0);
+            split_store2(out_hi, out_lo, (size_t)row0 * Q_DIM + head * HEAD_DIM + d, o[nb][0] * i0, o[nb][1] * i0);
         if (row1 < tokens)
-            *(float2*)(out + (size_t)row1 * Q_DIM + head * HEAD_DIM + d) = make_float2(o[nb][2] * i1, o[nb][3] * i1);
+            split_store2(out_hi, out_lo, (size_t)row1 * Q_DIM + head * HEAD_DIM + d, o[nb][2] * i1, o[nb][3] * i1);
     }
 }
 
