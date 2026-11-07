@@ -428,6 +428,15 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
         const bf16_t* a_hi = (const bf16_t*)base;
         const bf16_t* a_lo = a_hi + A_TILE;
         const unsigned char* ws = base + A_BYTES;
+        float part[SPLIT ? MI : 1][SPLIT ? NJ : 1][4];
+        if (SPLIT) {
+#pragma unroll
+            for (int i = 0; i < MI; i++)
+#pragma unroll
+                for (int j = 0; j < NJ; j++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++) part[i][j][e] = 0.0f;
+        }
         float s0[NJ], s1[NJ];
 #pragma unroll
         for (int j = 0; j < NJ; j++) {
@@ -474,13 +483,8 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                 for (int i = 0; i < MI; i++)
 #pragma unroll
                     for (int j = 0; j < NJ; j++) {
-                        float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        mma_bf16(c, al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
-                        mma_bf16(c, ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-                        acc[i][j][0] += c[0];
-                        acc[i][j][1] += c[1];
-                        acc[i][j][2] += c[2];
-                        acc[i][j][3] += c[3];
+                        mma_bf16(part[i][j], al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
+                        mma_bf16(part[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
                     }
             } else {
 #pragma unroll
@@ -495,6 +499,14 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                         acc[i][j][3] += c[3] * s1[j];
                     }
             }
+        }
+        if (SPLIT) {
+#pragma unroll
+            for (int i = 0; i < MI; i++)
+#pragma unroll
+                for (int j = 0; j < NJ; j++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++) acc[i][j][e] += part[i][j][e];
         }
     }
     cp_async_wait<0>();
