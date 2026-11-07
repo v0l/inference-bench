@@ -212,3 +212,22 @@ Tried and dropped, all measured locally at 1024 context:
 - Chunk size: 8 timesteps with 64 splits was level with 16; 32 gave 310 and 64 gave 253 tok/s on Qwen3. 128 splits of 8 gave no gain (365).
 - f16 KV cache (rounding on write): max abs logit error 0.012 on Qwen3 and 0.020 on Qwen2.5 against the 1e-3 bound, so rejected. bf16 was 0.064 and 0.13 earlier.
 - Fusing `attention_reduce` into the o_proj input load: attention_reduce is 6.7% of decode and its launch is hidden by the graph, so there is little to fuse; not done.
+
+Batch 1 here goes through the GEMM path and is slower than the GEMV decode (`generate`, 154 and 195 tok/s), which stays the single-stream path. At batch 16 the step is attention (18%, the paged decode kernel launched per sequence) and lm_head (16%), then the 16-row GEMMs. vLLM was not measured: the resident vLLM serves a 27B model on this GPU and a second vLLM instance does not fit beside it.
+
+## Batched paged decode attention (issue #272)
+
+The batch decode step used the single-sequence `attention` kernel, one launch per sequence. `batch_decode_attention` now covers every sequence in one launch (grid kv head x sequence x 8 timestep splits, 8 warps per block, 8 keys in flight per warp, online softmax per warp) and `batch_decode_combine` merges the splits. The 16-row GEMM tile (`gemm_tc`, BM 16, bf16) loads 128 k values per stage instead of 32 when K divides by 128, which cuts the barrier count in lm_head and the decode GEMMs. Both are gated by `batch_decode_matches_single_sequence_greedy` and the qwen3, qwen2.5 and q8 logit tests.
+
+Profile at batch 16 (nsys, graph nodes): attention was 24% of the step at 117 us per launch before the kernel change; lm_head 16% at 1.89 ms (bandwidth bound, 311 MB). The GEMM BK change gave 3-5% in paired runs; stage count 3 and a smaller key unroll were not better.
+
+Same session, alternating order rotated per round, `drop_caches` before every run, 6 rounds, medians of aggregate decode tok/s, 128-token prompts and 128 new tokens. The 27B vLLM was serving at 94-96% GPU utilisation for the whole session (it was not idle in the #265 run), so every absolute number is roughly 2.5x below the #265 table and only the ratios within this table are meaningful. vLLM is the HTTP number (`inference-bench batch`), llama.cpp `llama-batched-bench` `speed_tg`, specrt `bench <spec> 128 128 N`. Raw files, driver and summary script in `docs/spark-run/ib272-20261107/`.
+
+| model | batch | vLLM | llama-batched-bench | specrt before | specrt now | now / llama.cpp | now / vLLM |
+|---|---|---|---|---|---|---|---|
+| Qwen3-0.6B | 4 | 210.0 | 131.3 | 182.6 | 225.8 | 1.72 | 1.08 |
+| Qwen3-0.6B | 16 | 739.8 | 489.0 | 567.0 | 669.2 | 1.37 | 0.90 |
+| Qwen2.5-0.5B | 4 | 265.5 | 150.6 | 225.8 | 293.8 | 1.95 | 1.11 |
+| Qwen2.5-0.5B | 16 | 1044.2 | 651.7 | 816.3 | 1066.2 | 1.64 | 1.02 |
+
+specrt gained 18-31% over the per-sequence kernel and is ahead of llama.cpp at both batch sizes, at the vLLM level except Qwen3-0.6B at batch 16 (0.90). The llama.cpp numbers fall further than specrt's under the contended GPU, so its ratio here flatters specrt against the idle-GPU #265 figures (llama-batched-bench 1682 and 2722 at batch 16, which specrt's idle-GPU gain from 1220 and 1744 has not been re-measured against).

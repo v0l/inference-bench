@@ -1,0 +1,2 @@
+qwen3-0.6b batch=4 prompt=128 new=128 decode=176.9 tok/s aggregate, 44.2 per sequence (median of 5)
+qwen3-0.6b batch=16 prompt=128 new=128 decode=562.0 tok/s aggregate, 35.1 per sequence (median of 5)

@@ -329,12 +329,13 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
     constexpr int TN = BN / WN;
     constexpr int MI = TM / 16;
     constexpr int NJ = TN / 8;
-    constexpr int BK = 32;
+    constexpr int BK = (!Q8 && BM == 16 && K % 128 == 0) ? 128 : 32;
+    constexpr int KS = BK / 16;
     constexpr int AS = BK + 8;
     constexpr int WROW = Q8 ? BK + 16 : (BK + 8) * 2;
     constexpr int KT = K / BK;
     constexpr int A_ITERS = BM * BK / 4 / THREADS;
-    constexpr int W_CHUNKS = Q8 ? 2 : 4;
+    constexpr int W_CHUNKS = Q8 ? 2 : BK / 8;
     constexpr int W_ITERS = (BN * W_CHUNKS + THREADS - 1) / THREADS;
     static_assert(K % BK == 0, "K must be a multiple of 32");
     static_assert(A_ITERS * THREADS * 4 == BM * BK, "A tile split");
@@ -431,7 +432,7 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
 #pragma unroll
                 for (int e = 0; e < 4; e++) part[i][j][e] = 0.0f;
 #pragma unroll
-        for (int ks = 0; ks < 2; ks++) {
+        for (int ks = 0; ks < KS; ks++) {
             unsigned bw[NJ][2];
             if (Q8) {
 #pragma unroll

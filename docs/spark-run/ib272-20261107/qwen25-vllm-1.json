@@ -1,0 +1,24 @@
+[
+  {
+    "backend": "vllm",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "batch": 4,
+    "prompt_tokens": 516,
+    "completion_tokens": 512,
+    "wall_secs": 2.004512038,
+    "throughput_tok_s": 255.42375914631447,
+    "decode_tok_s": 261.7356301828504,
+    "median_ttft_secs": 0.064618074
+  },
+  {
+    "backend": "vllm",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "batch": 16,
+    "prompt_tokens": 2064,
+    "completion_tokens": 2048,
+    "wall_secs": 2.079848111,
+    "throughput_tok_s": 984.6872899845137,
+    "decode_tok_s": 1041.3160924177548,
+    "median_ttft_secs": 0.131865262
+  }
+]
