@@ -1,0 +1,44 @@
+name = "qwen3.8-27b"
+min_engine = 2
+repo = "Qwen/Qwen3.8-27B-FP8"
+quant = "bf16"
+
+[dims]
+hidden = 5120
+intermediate = 17408
+vocab = 248320
+tie_embeddings = false
+
+[layers]
+count = 64
+pattern = ["linear", "linear", "linear", "full"]
+
+[norm]
+kind = "rmsnorm"
+eps = 1e-6
+unit_offset = true
+
+[attention]
+kind = "gqa"
+heads = 24
+kv_heads = 4
+head_dim = 256
+qkv_bias = false
+qk_norm = true
+output_gate = true
+rotary_dim = 64
+
+[rope]
+style = "neox"
+theta = 10000000.0
+
+[mlp]
+activation = "swiglu"
+
+[linear_attention]
+kind = "gated_delta_net"
+key_heads = 16
+value_heads = 48
+key_head_dim = 128
+value_head_dim = 128
+conv_kernel = 4

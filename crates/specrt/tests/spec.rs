@@ -1,4 +1,4 @@
-use specrt::spec::{Checked, EMBEDDED, Quant, SPEC_FORMAT, Spec, check};
+use specrt::spec::{Block, Checked, EMBEDDED, LinearKind, Quant, SPEC_FORMAT, Spec, check};
 use std::path::Path;
 
 fn root() -> &'static Path {
@@ -159,6 +159,77 @@ fn the_embedded_snapshot_equals_the_specs_folder() {
     assert!(embedded.len() >= 7);
     for (name, text) in EMBEDDED {
         assert!(Spec::parse(text).is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn qwen38_27b_config_parses_into_a_hybrid_spec_and_round_trips() {
+    let mut spec = derived("qwen3.8-27b.config.json");
+    assert_eq!(spec.layers.pattern, [Block::Linear, Block::Linear, Block::Linear, Block::Full]);
+    assert_eq!(spec.layers.count, 64);
+    assert_eq!(spec.linear_layers(), 48);
+    assert_eq!(spec.attention_layers(), 16);
+    let la = spec.linear_attention.clone().unwrap();
+    assert_eq!(la.kind, LinearKind::GatedDeltaNet);
+    assert_eq!((la.key_heads, la.value_heads, la.key_head_dim, la.value_head_dim), (16, 48, 128, 128));
+    assert_eq!(la.conv_kernel, 4);
+    assert_eq!(la.conv_dim(), 10240);
+    assert_eq!(spec.rotary_dim(), 64);
+    assert!(spec.attention.output_gate && spec.attention.qk_norm && spec.norm.unit_offset);
+    assert_eq!(spec.qkv_rows(), 2 * 6144 + 2 * 1024);
+    assert_eq!(Spec::parse(&spec.to_toml().unwrap()).unwrap(), spec);
+    let file = Spec::load(&root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
+    spec.name = file.name.clone();
+    spec.repo = file.repo.clone();
+    spec.min_engine = file.min_engine;
+    assert_eq!(file, spec);
+    assert_eq!(file.min_engine, SPEC_FORMAT);
+}
+
+fn hybrid_text() -> String {
+    std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap()
+}
+
+#[test]
+fn hybrid_spec_validation_rejects_inconsistent_linear_attention() {
+    let text = hybrid_text();
+    assert!(Spec::parse(&text).is_ok());
+    let bad = [
+        ("value_heads = 48", "value_heads = 40"),
+        ("value_head_dim = 128", "value_head_dim = 64"),
+        ("conv_kernel = 4", "conv_kernel = 1"),
+        ("count = 64", "count = 66"),
+        ("rotary_dim = 64", "rotary_dim = 300"),
+        ("pattern = [\"linear\", \"linear\", \"linear\", \"full\"]", "pattern = [\"linear\", \"dense\"]"),
+        ("pattern = [\"linear\", \"linear\", \"linear\", \"full\"]", "pattern = [\"full\"]"),
+        ("kind = \"gated_delta_net\"", "kind = \"mamba2\""),
+    ];
+    for (from, to) in bad {
+        assert!(text.contains(from), "{from}");
+        assert!(Spec::parse(&text.replace(from, to)).is_err(), "{to}");
+    }
+    let cut = text.split("[linear_attention]").next().unwrap();
+    assert!(Spec::parse(cut).is_err(), "a linear layer needs [linear_attention]");
+}
+
+#[test]
+fn layer_types_reduce_to_their_shortest_period() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b.config.json")).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let text = &mut v["text_config"];
+    text["num_hidden_layers"] = 3.into();
+    text["layer_types"] = serde_json::json!(["linear_attention", "linear_attention", "full_attention"]);
+    let spec = Spec::from_hf_config(&v.to_string()).unwrap();
+    assert_eq!(spec.layers.pattern, [Block::Linear, Block::Linear, Block::Full]);
+    v["text_config"]["layer_types"] = serde_json::json!(["linear_attention", "sliding_attention", "full_attention"]);
+    assert!(Spec::from_hf_config(&v.to_string()).is_err());
+}
+
+#[test]
+fn dense_specs_serialize_without_the_hybrid_fields() {
+    let text = derived("qwen3-0.6b.config.json").to_toml().unwrap();
+    for field in ["unit_offset", "output_gate", "rotary_dim", "linear_attention"] {
+        assert!(!text.contains(field), "{field} in {text}");
     }
 }
 

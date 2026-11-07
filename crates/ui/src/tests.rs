@@ -595,7 +595,7 @@ fn screenshot_of_spec_provenance_and_update_settings() {
     let specs_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs");
     let read = |f: &str| std::fs::read_to_string(format!("{specs_dir}/{f}")).unwrap();
     let newer = read("qwen3-0.6b.toml").replace("name = \"qwen3-0.6b\"", "name = \"qwen3-0.6b-new\"");
-    let future = format!("min_engine = 2\n{}", read("qwen2.5-0.5b.toml").replace("name = \"qwen2.5-0.5b\"", "name = \"qwen2.5-0.5b-moe\""));
+    let future = format!("min_engine = 3\n{}", read("qwen2.5-0.5b.toml").replace("name = \"qwen2.5-0.5b\"", "name = \"qwen2.5-0.5b-moe\""));
     let gh = Script::default();
     let server = FakeServer::start(gh.clone());
     gh.serve_file(FakeFile {
