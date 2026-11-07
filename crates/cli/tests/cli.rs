@@ -1,4 +1,4 @@
-use inference_bench_core::fake::{FakeServer, Script};
+use inference_bench_core::fake::{FakeFile, FakeServer, Script, tarball};
 use inference_bench_core::result::{ErrorKind, RunResult};
 use inference_bench_core::store;
 use std::path::PathBuf;
@@ -175,4 +175,76 @@ fn an_unknown_flag_or_target_is_a_clear_error() {
     let o = bin().args(["bench", "--target", "transformers", "--model", "m", "--prompt", "x"]).output().unwrap();
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("unknown target transformers"));
+}
+
+fn spec_body(name: &str, layers: u32) -> String {
+    let base = specrt_spec("qwen3-0.6b.toml");
+    base.replace("name = \"qwen3-0.6b\"", &format!("name = \"{name}\"")).replace("count = 28", &format!("count = {layers}"))
+}
+
+fn specrt_spec(file: &str) -> String {
+    std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../specrt/specs").join(file)).unwrap()
+}
+
+fn publish(script: &Script, entries: &[(&str, String)], etag: &str, commit: &str) {
+    let files: Vec<(String, Vec<u8>)> =
+        entries.iter().map(|(n, t)| (format!("crates/specrt/specs/{n}"), t.as_bytes().to_vec())).collect();
+    let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+    script.serve_file(FakeFile {
+        path: "/v0l/inference-bench/tar.gz/refs/heads/master".into(),
+        body: tarball("inference-bench-master", &refs, Some(commit)),
+        etag: Some(format!("\"{etag}\"")),
+        status: None,
+    });
+}
+
+fn specs_cmd(out: &PathBuf, url: &str, args: &[&str]) -> Output {
+    bin().env("INFERENCE_BENCH_SPECS_URL", url).args(["--out", out.to_str().unwrap(), "specs"]).args(args).output().unwrap()
+}
+
+#[test]
+fn specs_update_status_and_rollback() {
+    let out = tmp("specs");
+    let script = Script::default();
+    let s = FakeServer::start(script.clone());
+    let o = specs_cmd(&out, &s.url, &["status"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let text = stdout(&o);
+    assert!(text.contains("source       v0l/inference-bench@master"), "{text}");
+    assert!(text.contains("last check   never"), "{text}");
+    assert!(text.contains("cache        empty, using the embedded snapshot"), "{text}");
+    assert!(text.lines().any(|l| l.starts_with("llama-3.2-1b") && l.contains("embedded")), "{text}");
+
+    publish(&script, &[("qwen3-0.6b.toml", spec_body("qwen3-0.6b", 2)), ("new-model.toml", spec_body("new-model", 3))], "v1", "aaaaaaa1111");
+    let o = specs_cmd(&out, &s.url, &["update"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(stdout(&o).trim(), "specs updated: added new-model, qwen3-0.6b");
+    publish(&script, &[("qwen3-0.6b.toml", spec_body("qwen3-0.6b", 4)), ("new-model.toml", spec_body("new-model", 3))], "v2", "bbbbbbb2222");
+    assert_eq!(stdout(&specs_cmd(&out, &s.url, &["update"])).trim(), "specs updated: updated qwen3-0.6b");
+    assert_eq!(stdout(&specs_cmd(&out, &s.url, &["update"])).trim(), "specs are up to date");
+
+    let text = stdout(&specs_cmd(&out, &s.url, &["status"]));
+    assert!(text.contains("cache        bbbbbbb"), "{text}");
+    assert!(text.contains("history      1 earlier generation(s)"), "{text}");
+    assert!(text.contains("last result  specs are up to date"), "{text}");
+    let new = text.lines().find(|l| l.starts_with("new-model")).unwrap();
+    assert!(new.contains("github") && new.contains("updated from GitHub v0l/inference-bench@master (bbbbbbb) at "), "{new}");
+    assert!(text.lines().any(|l| l.starts_with("llama-3.2-1b") && l.contains("embedded")), "{text}");
+
+    let o = specs_cmd(&out, &s.url, &["rollback"]);
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(stdout(&o).starts_with("rolled back to aaaaaaa"), "{}", stdout(&o));
+    let o = specs_cmd(&out, &s.url, &["rollback"]);
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("no earlier spec generation"));
+}
+
+#[test]
+fn a_failed_specs_update_exits_nonzero_and_status_shows_it() {
+    let out = tmp("specs-fail");
+    let o = specs_cmd(&out, "http://127.0.0.1:9", &["update"]);
+    assert!(!o.status.success());
+    let text = stdout(&specs_cmd(&out, "http://127.0.0.1:9", &["status"]));
+    assert!(text.contains("last result  failed: fetching http://127.0.0.1:9/"), "{text}");
+    assert!(text.contains("last success never"), "{text}");
 }

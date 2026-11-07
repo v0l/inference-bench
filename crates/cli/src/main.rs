@@ -5,6 +5,7 @@ use inference_bench_core::logging::{self, LogArgs};
 use inference_bench_core::logitdiff::{self, FIXED_PROMPT, Tolerance};
 use inference_bench_core::matrix::{MatrixSpec, run_matrix, run_model};
 use inference_bench_core::result::RunResult;
+use inference_bench_core::specs;
 use inference_bench_core::store;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -149,6 +150,49 @@ enum Cmd {
         #[arg(long, help = "Print the results as JSON")]
         json: bool,
     },
+    #[command(about = "Spec files: where each comes from, and updates from GitHub")]
+    Specs {
+        #[command(subcommand)]
+        cmd: SpecsCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum SpecsCmd {
+    #[command(about = "Fetch the specs from GitHub now, even when automatic updates are off")]
+    Update,
+    #[command(about = "Show the source of each spec and the last check")]
+    Status,
+    #[command(about = "Go back to the previous downloaded generation")]
+    Rollback,
+}
+
+fn specs_command(data: &Path, cmd: &SpecsCmd) -> Result<()> {
+    let settings = inference_bench_core::settings::Settings::load(data);
+    let cfg = settings.specs();
+    let store = specs::SpecStore::new(data);
+    match cmd {
+        SpecsCmd::Update => {
+            let outcome = store.update(&cfg)?;
+            println!("{}", outcome.describe());
+            if let specs::Outcome::Updated(c) = &outcome {
+                for (file, why) in &c.skipped {
+                    println!("skipped {file}: {why}");
+                }
+            }
+        }
+        SpecsCmd::Status => print!("{}", specs::status_report(data, &settings.spec_folders, &cfg)),
+        SpecsCmd::Rollback => {
+            let g = store.rollback()?;
+            println!("rolled back to {} fetched {}", g.short_commit(), g.fetched_at.format("%Y-%m-%d %H:%M UTC"));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_spec_names(data: &Path, model: &str) -> String {
+    let settings = inference_bench_core::settings::Settings::load(data);
+    specs::resolve_model(data, &settings.spec_folders, model)
 }
 
 fn read_prompt(file: &Option<PathBuf>, inline: &Option<String>, len: Option<usize>) -> Result<String> {
@@ -224,7 +268,11 @@ fn main() -> Result<()> {
     }
     match &cli.cmd {
         Cmd::Serve(_) => unreachable!(),
-        Cmd::Run { engine, prompt } => run_one(&data, engine.native()?, NATIVE.to_string(), prompt)?,
+        Cmd::Run { engine, prompt } => {
+            let mut prompt = prompt.clone();
+            prompt.model = resolve_spec_names(&data, &prompt.model);
+            run_one(&data, engine.native()?, NATIVE.to_string(), &prompt)?
+        }
         Cmd::Bench { target, prompt } => run_one(&data, target.config()?, target.label()?, prompt)?,
         Cmd::Batch { target, model, prompt_len, max_tokens, sizes, json } => {
             let config = target.config()?;
@@ -295,6 +343,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Results { json } => print_results(&store::load_all(&data), *json)?,
+        Cmd::Specs { cmd } => specs_command(&data, cmd)?,
     }
     Ok(())
 }

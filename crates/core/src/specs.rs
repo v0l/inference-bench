@@ -347,6 +347,50 @@ fn stamp(now: DateTime<Utc>) -> String {
     now.format("%Y%m%dT%H%M%S%3f").to_string()
 }
 
+pub fn resolve_model(data: &Path, folders: &[PathBuf], model: &str) -> String {
+    if model.ends_with(".toml") || model.contains('/') || model.contains('\\') {
+        return model.to_string();
+    }
+    match find(model, &standard_layers(data, folders)) {
+        Some(path) => path.display().to_string(),
+        None => model.to_string(),
+    }
+}
+
+pub fn status_report(data: &Path, folders: &[PathBuf], cfg: &SpecsConfig) -> String {
+    let store = SpecStore::new(data);
+    let state = store.state();
+    let mut out = String::new();
+    let when = |t: Option<DateTime<Utc>>| t.map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_else(|| "never".into());
+    out.push_str(&format!("source       {}\n", cfg.source()));
+    out.push_str(&format!(
+        "auto update  {}\n",
+        match cfg.interval() {
+            Some(_) => format!("on, every {} h", cfg.update_hours),
+            None if cfg.auto_update => "on at start only".into(),
+            None => "off".into(),
+        }
+    ));
+    out.push_str(&format!("last check   {}\n", when(state.checked_at)));
+    out.push_str(&format!("last success {}\n", when(state.last_success)));
+    if !state.last_result.is_empty() {
+        out.push_str(&format!("last result  {}{}\n", if state.last_ok { "" } else { "failed: " }, state.last_result));
+    }
+    match store.generation() {
+        Some(g) => out.push_str(&format!("cache        {} ({})\n", g.short_commit(), store.current().display())),
+        None => out.push_str("cache        empty, using the embedded snapshot\n"),
+    }
+    out.push_str(&format!("history      {} earlier generation(s)\n\n", store.history().len()));
+    for l in list(&layers(&store, folders, &checkout_dirs())) {
+        out.push_str(&format!("{:<24} {:<9} {}", l.name, l.origin.kind(), l.origin.label()));
+        if let Some(p) = &l.problem {
+            out.push_str(&format!("  [{p}]"));
+        }
+        out.push('\n');
+    }
+    out
+}
+
 pub fn refresh_if_due(data: &Path, cfg: &SpecsConfig) -> Option<Result<Outcome>> {
     let store = SpecStore::new(data);
     store.due(cfg, Utc::now()).then(|| store.update(cfg))
