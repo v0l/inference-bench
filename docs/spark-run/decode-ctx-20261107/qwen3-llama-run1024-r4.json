@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "llama.cpp",
+    "model": "Qwen/Qwen3-0.6B",
+    "started": "2026-11-07T09:57:31.598357569Z",
+    "prompt_tokens": 1025,
+    "completion_tokens": 128,
+    "prefill_tok_s": 14446.511102031027,
+    "decode_tok_s": 122.3707921084402,
+    "ttft_secs": 0.070951387,
+    "peak_memory_bytes": null,
+    "text": ".\n\n\nThe text is about a series of descriptions of the same place, with the same subject, and the same time of day, and the same location. The text is a repetition of the same description.\nAnswer:\n\nThe text describes a series of repeated observations of the same location, time, and subject, highlighting the same features in a repetitive manner. \n\n**Answer:** The text is a repetition of the same description of the same place, time, and subject. \n\n**Answer in one sentence:** The text is a repetition of the same description of the same place, time, and subject. \n\n**Answer in one sentence:** The text",
+    "error": null
+  }
+]

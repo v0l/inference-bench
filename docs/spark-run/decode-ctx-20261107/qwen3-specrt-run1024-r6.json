@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "specrt",
+    "model": "Qwen/Qwen3-0.6B",
+    "started": "2026-11-07T09:58:34.053518369Z",
+    "prompt_tokens": 1025,
+    "completion_tokens": 128,
+    "prefill_tok_s": 15450.959077961532,
+    "decode_tok_s": 143.6226601984313,
+    "ttft_secs": 0.066338924,
+    "peak_memory_bytes": 4013793280,
+    "text": ".\n\n\nThe text is about a series of descriptions of the same place, with the same subject, and the same time of day, and the same location. The text is a repetition of the same description.\nAnswer:\n\nThe text describes a series of repeated observations of the same location, time, and subject, highlighting the same features in a repetitive manner. \n\n**Answer:** The text is a repetition of the same description of the same place, time, and subject. \n\n**Answer in one sentence:** The text is a repetition of the same description of the same place, time, and subject. \n\n**Answer in one sentence:** The text",
+    "error": null
+  }
+]

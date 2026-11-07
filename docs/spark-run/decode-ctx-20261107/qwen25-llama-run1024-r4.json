@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "llama.cpp",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "started": "2026-11-07T10:02:47.085717901Z",
+    "prompt_tokens": 1025,
+    "completion_tokens": 128,
+    "prefill_tok_s": 4159.9739956575795,
+    "decode_tok_s": 38.57973351566103,
+    "ttft_secs": 0.246395771,
+    "peak_memory_bytes": null,
+    "text": " The text describes a scene where a dog is running on a street, and the text mentions that the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the",
+    "error": null
+  }
+]

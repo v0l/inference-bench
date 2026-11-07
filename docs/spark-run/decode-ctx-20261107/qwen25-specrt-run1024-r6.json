@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "specrt",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "started": "2026-11-07T10:03:41.113283158Z",
+    "prompt_tokens": 1025,
+    "completion_tokens": 128,
+    "prefill_tok_s": 9262.267027778813,
+    "decode_tok_s": 86.38835043816096,
+    "ttft_secs": 0.110664052,
+    "peak_memory_bytes": 2763071488,
+    "text": " The text describes a scene where a dog is running on a street, and the text mentions that the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the dog is running on a street, and the",
+    "error": null
+  }
+]

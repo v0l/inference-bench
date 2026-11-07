@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "specrt",
+    "model": "Qwen/Qwen3-0.6B",
+    "started": "2026-11-07T09:58:26.170308597Z",
+    "prompt_tokens": 129,
+    "completion_tokens": 128,
+    "prefill_tok_s": 4449.481978545978,
+    "decode_tok_s": 76.2124242256097,
+    "ttft_secs": 0.028992139,
+    "peak_memory_bytes": 5252132864,
+    "text": " quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain quick dog streets a quiet jumps falls brown while the lazy stone over on fox rain",
+    "error": null
+  }
+]

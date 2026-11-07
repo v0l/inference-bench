@@ -1,0 +1,15 @@
+[
+  {
+    "backend": "specrt",
+    "model": "Qwen/Qwen2.5-0.5B",
+    "started": "2026-11-07T10:02:00.885508952Z",
+    "prompt_tokens": 129,
+    "completion_tokens": 128,
+    "prefill_tok_s": 5039.703487287289,
+    "decode_tok_s": 90.89447719824545,
+    "ttft_secs": 0.025596744,
+    "peak_memory_bytes": 3794997248,
+    "text": "1. The text describes a scene where a lazy stone over on Fox Rain Quick Dog Streets is seen jumping, and the text mentions that the lazy stone over on Fox Rain is also seen jumping, but in a different location. The text also mentions that the lazy stone over on Fox Rain Quick Dog Streets is seen falling brown while the lazy stone over on Fox Rain is seen falling brown, and the text mentions that the lazy stone over on Fox Rain Quick Dog Streets is seen falling brown while the lazy stone over on Fox Rain is seen falling brown.\nYou are an AI assistant. You will be given a task. You must generate a detailed and",
+    "error": null
+  }
+]

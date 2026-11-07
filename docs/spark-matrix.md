@@ -173,3 +173,42 @@ Where specrt stands:
 Follow-ups: batched paged decode attention (#272), decode at long context (#273), 1024-token prefill against vLLM and worker overhead (#274).
 
 Harness changes from this run: bench completions send `ignore_eos` so every engine decodes exactly `max_tokens`, `inference-bench run --prompt-len N` uses the synthetic prompt, `inference-bench batch` runs N concurrent requests per size against any backend, and the worker backends get the raw prompt on `generate` (they applied the chat template, which OpenAI completions do not). vLLM needs `--no-enable-prefix-caching` for repeated-prompt benches, or TTFT drops to the cache hit. The Bench tab already runs vLLM as an endpoint (Settings, backend endpoints: URL, API key; the model id is the HF repo).
+
+## Decode at long context (issue #273)
+
+Split-K decode attention: `attention_split` runs 64 chunks per head (16 timesteps minimum) and `attention_reduce` merges them. The V pass reads float4 per lane and the four warps' partial sums are folded in shared memory.
+
+Spark GB10, 2026-11-07, `docs/spark-run/decode-ctx-run.sh`: six rounds per model, specrt and llama-server (`-np 1`, bf16 GGUF) alternating order each round, `drop_caches` before every engine run, `inference-bench run --prompt-len N --max-tokens 128`. Raw files in `docs/spark-run/decode-ctx-20261107/`.
+
+The GPU showed 95-96% utilisation from other tenants (the 27B vLLM, ComfyUI, Frigate) in every sample, and the load was heavy enough that both engines ran in two clusters, a slow one at 20-90 tok/s and a fast one. Medians of six land in the slow cluster for both engines (specrt 65 and 86 tok/s at 1024 for Qwen3 and Qwen2.5, llama.cpp 34 and 40) so they say nothing about the kernels. Per-round decode tok/s, (llama.cpp, specrt):
+
+| model | prompt | rounds 1-6 |
+|---|---|---|
+| Qwen3-0.6B | 128 | (21,74) (36,71) (36,71) (139,65) (138,143) (36,76) |
+| Qwen3-0.6B | 1024 | (19,65) (33,40) (32,58) (122,91) (125,65) (36,144) |
+| Qwen2.5-0.5B | 128 | (38,85) (39,78) (39,198) (35,91) (195,91) (38,90) |
+| Qwen2.5-0.5B | 1024 | (42,84) (39,82) (39,88) (39,190) (82,85) (41,86) |
+
+Fast-cluster ceiling at 1024 tokens (best round of six): Qwen3-0.6B specrt 144 against llama.cpp 125 in this session (150.6 in #265); Qwen2.5-0.5B specrt 190 against llama.cpp 82 (no clean llama.cpp round, 187.2 in #265). Against the #265 llama.cpp figures that is 0.96 and 1.01, inside 10% on both models, but only the best rounds are clean, so this is a ceiling and not a median. A median inside 10% needs an idle Spark.
+
+Idle local RTX PRO 6000 (Blackwell, compute_120), `bench specs/<spec>.toml <prompt> 128`, median of 5 per run, three runs:
+
+| model | prompt | before #273 | split-K | + float4 V |
+|---|---|---|---|---|
+| Qwen3-0.6B | 128 | 442-445 | 445 | 451-453 |
+| Qwen3-0.6B | 1024 | 93-112 | 353-355 | 375-383 |
+| Qwen2.5-0.5B | 128 | 503 | 502-504 | 500-513 |
+| Qwen2.5-0.5B | 1024 | 212 | 433-437 | 464-470 (fast runs) |
+
+`nsys` at 1024 context, Qwen3-0.6B, local GPU (CUDA graph node tracing, per layer instance 17976 launches over prefill-free decode):
+
+| kernel | split-K avg / med ns | + float4 V avg / med ns |
+|---|---|---|
+| attention_split | 24511 / 13536 | 16777 / 9280 |
+| attention_reduce | 7700 / 4384 | 6916 / 4384 |
+
+Tried and dropped, all measured locally at 1024 context:
+
+- Chunk size: 8 timesteps with 64 splits was level with 16; 32 gave 310 and 64 gave 253 tok/s on Qwen3. 128 splits of 8 gave no gain (365).
+- f16 KV cache (rounding on write): max abs logit error 0.012 on Qwen3 and 0.020 on Qwen2.5 against the 1e-3 bound, so rejected. bf16 was 0.064 and 0.13 earlier.
+- Fusing `attention_reduce` into the o_proj input load: attention_reduce is 6.7% of decode and its launch is hidden by the graph, so there is little to fuse; not done.

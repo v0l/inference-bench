@@ -1,0 +1,2 @@
+qwen3-0.6b quant=Bf16 arch=compute_121 jit_cache_hit=true load=4.85s prompt=128 prefill=3000.8 tok/s decode=128 tokens 48.6 tok/s (median of 5)
+qwen3-0.6b quant=Bf16 arch=compute_121 jit_cache_hit=true load=3.00s prompt=1024 prefill=5628.4 tok/s decode=128 tokens 40.3 tok/s (median of 5)
