@@ -25,7 +25,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 ureq = { version = "3", features = ["json"] }
 
 [patch.crates-io]
-egui_bench = { path = "/home/kieran/git/.worktrees/egui_bench-chat-look" }
+egui_bench = { git = "https://github.com/v0l/egui_bench", rev = "dae434d" }
 
 [profile.dev.package.inference-bench-specrt]
 opt-level = 3
