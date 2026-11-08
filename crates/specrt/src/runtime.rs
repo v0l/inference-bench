@@ -497,7 +497,7 @@ impl Runtime {
             .chain(spec.linear_attention.as_ref().map(|l| l.value_dim()))
             .max()
             .unwrap_or(d.hidden);
-        let fp8_act = if spec.quant == crate::spec::Quant::Fp8Block128 && std::env::var_os("SPECRT_FP8_ACT").is_some() {
+        let fp8_act = if spec.quant.is_fp8() && std::env::var_os("SPECRT_FP8_ACT").is_some() {
             Some(Fp8Act {
                 q: stream.alloc_zeros(chunk * widest)?,
                 scale: stream.alloc_zeros(chunk * widest / crate::codegen::FP8_BLOCK)?,

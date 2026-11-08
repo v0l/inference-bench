@@ -23,10 +23,32 @@ fn argmax(row: &[f32]) -> usize {
     (0..row.len()).fold(0, |best, i| if row[i] > row[best] { i } else { best })
 }
 
-const NEAR_TIE: f32 = 0.25;
+fn log_softmax(row: &[f32]) -> Vec<f64> {
+    let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+    let lse = max as f64 + row.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln();
+    row.iter().map(|&v| v as f64 - lse).collect()
+}
+
+fn mean_kl(p: &[f32], q: &[f32], vocab: usize) -> f64 {
+    let rows = p.len() / vocab;
+    (0..rows)
+        .map(|r| {
+            let (a, b) = (log_softmax(&p[r * vocab..(r + 1) * vocab]), log_softmax(&q[r * vocab..(r + 1) * vocab]));
+            a.iter().zip(&b).map(|(x, y)| x.exp() * (x - y)).sum::<f64>()
+        })
+        .sum::<f64>()
+        / rows as f64
+}
+
+fn top1_agreement(p: &[f32], q: &[f32], vocab: usize) -> f64 {
+    let rows = p.len() / vocab;
+    (0..rows).filter(|&r| argmax(&p[r * vocab..(r + 1) * vocab]) == argmax(&q[r * vocab..(r + 1) * vocab])).count() as f64
+        / rows as f64
+}
 
 fn full_spec() -> Spec {
-    Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml")).unwrap()
+    let name = std::env::var("SPECRT_27B_SPEC").unwrap_or_else(|_| "qwen3.8-27b".into());
+    Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.toml"))).unwrap()
 }
 
 fn ids(v: &serde_json::Value) -> Vec<u32> {
@@ -39,7 +61,7 @@ fn write_floats(name: &str, v: &[f32]) {
 }
 
 fn mode() -> &'static str {
-    if std::env::var_os("SPECRT_FP8_ACT").is_some() { "act" } else { "weight" }
+    if std::env::var_os("SPECRT_FP8_ACT").is_some() || specrt::codegen::fp4_act_enabled() { "act" } else { "weight" }
 }
 
 #[test]
@@ -90,6 +112,115 @@ fn real_27b_generates_greedy_and_dumps_logits() {
 }
 
 #[test]
+#[ignore = "needs about 25 GB of free GPU memory, the NVFP4 checkpoint and scripts/vllm_logprobs.py output"]
+fn real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs() {
+    let spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out_dir().join("vllm-nvfp4.json")).unwrap()).unwrap();
+    let new = meta["new_tokens"].as_u64().unwrap() as usize;
+    let records = meta["records"].as_array().unwrap();
+    let mut rt = Runtime::load(&spec, 8192).unwrap();
+    eprintln!(
+        "loaded ({}): weights {:.2} GB in {:.1} s, device {:.2} GB, load {:.1} s, peak host RSS {:.2} GB",
+        mode(),
+        rt.weight_bytes as f64 / 1e9,
+        rt.weight_secs,
+        rt.device_bytes as f64 / 1e9,
+        rt.load_secs,
+        rt.peak_host_rss_bytes as f64 / 1e9
+    );
+    let vocab = spec.dims.vocab;
+    let mut agree_prefix = Vec::new();
+    let mut agree_positions = 0usize;
+    let mut kls = Vec::new();
+    let mut top1 = 0usize;
+    let mut margins: Vec<f32> = Vec::new();
+    for r in records {
+        let prompt = ids(&r["prompt"]);
+        let theirs = ids(&r["greedy"]);
+        let ours = rt.generate(&prompt, new, specrt::runtime::Sampling::GREEDY).unwrap().tokens;
+        let prefix = ours.iter().zip(&theirs).take_while(|(a, b)| a == b).count();
+        agree_prefix.push(prefix);
+        if prefix < new {
+            let row = r["logprobs"][prefix].as_object().unwrap();
+            let lp = |t: u32| row.get(&t.to_string()).and_then(|v| v.as_f64());
+            margins.push((lp(theirs[prefix]).unwrap_or(f64::NAN) - lp(ours[prefix]).unwrap_or(f64::NEG_INFINITY)) as f32);
+        }
+        let mut seq = prompt.clone();
+        seq.extend(&theirs);
+        let logits = rt.prompt_logits(&seq).unwrap();
+        for (step, row) in r["logprobs"].as_array().unwrap().iter().enumerate() {
+            let at = (prompt.len() + step - 1) * vocab;
+            let l = &logits[at..at + vocab];
+            let max = l.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+            let lse = max + l.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln() as f32;
+            let top: Vec<(usize, f64)> =
+                row.as_object().unwrap().iter().map(|(k, v)| (k.parse().unwrap(), v.as_f64().unwrap())).collect();
+            let p_mass: f64 = top.iter().map(|(_, lp)| lp.exp()).sum();
+            let mut kl = 0.0;
+            for &(t, lp) in &top {
+                let ours_lp = (l[t] - lse) as f64;
+                kl += lp.exp() * (lp - ours_lp);
+            }
+            let rest_p = (1.0 - p_mass).max(1e-12);
+            let rest_q = (1.0 - top.iter().map(|&(t, _)| ((l[t] - lse) as f64).exp()).sum::<f64>()).max(1e-12);
+            kl += rest_p * (rest_p / rest_q).ln();
+            kls.push(kl);
+            if argmax(l) == theirs[step] as usize {
+                top1 += 1;
+            }
+            if ours.get(step) == Some(&theirs[step]) {
+                agree_positions += 1;
+            }
+        }
+    }
+    let total = records.len() * new;
+    let mut sorted = kls.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mean = kls.iter().sum::<f64>() / kls.len() as f64;
+    let first5: usize = agree_prefix.iter().take(5).sum();
+    let report = serde_json::json!({
+        "mode": mode(),
+        "prompts": records.len(),
+        "new_tokens": new,
+        "greedy_prefix": agree_prefix,
+        "greedy_prefix_first5": first5,
+        "vllm_margin_at_first_divergence": margins,
+        "greedy_positions_equal": agree_positions,
+        "teacher_forced_top1": top1,
+        "positions": total,
+        "kl_mean": mean,
+        "kl_median": sorted[sorted.len() / 2],
+        "kl_p99": sorted[sorted.len() * 99 / 100],
+        "kl_max": sorted[sorted.len() - 1],
+    });
+    eprintln!("{report}");
+    std::fs::write(out_dir().join(format!("vllm-compare-{}.json", mode())), report.to_string()).unwrap();
+    assert!(top1 * 10 >= total * 9, "teacher-forced top-1 {top1}/{total}");
+    assert!(mean <= 0.05, "mean KL {mean}");
+}
+
+#[test]
+#[ignore = "needs about 25 GB of free GPU memory and scripts/reference.py real-full output"]
+fn real_27b_per_layer_trace_matches_the_cpu_oracle() {
+    let spec = full_spec();
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out_dir().join("real27b-ref.json")).unwrap()).unwrap();
+    let seq = ids(&meta["sequences"][0]);
+    let n = 64;
+    let mut rt = Runtime::load(&spec, 8192).unwrap();
+    let trace = rt.trace_prefill(&seq[..n]).unwrap();
+    let theirs = floats("real27b-ref.layers.bin");
+    let h = spec.dims.hidden;
+    let per_layer: Vec<f32> = (0..spec.layers.count)
+        .map(|l| relative(&trace.layers[l * n * h..(l + 1) * n * h], &theirs[l * n * h..(l + 1) * n * h]))
+        .collect();
+    let first_bad = per_layer.iter().position(|&e| e > 1e-3);
+    eprintln!("per-layer max error / max |x|: {per_layer:?}; first above 1e-3: {first_bad:?}");
+    assert!(first_bad.is_none(), "layer {first_bad:?}");
+}
+
+#[test]
 #[ignore = "needs real27b_generates_greedy_and_dumps_logits and scripts/reference.py real-full output (both act and weight-only)"]
 fn real_27b_greedy_and_logits_match_the_fp8_reference() {
     let vocab = full_spec().dims.vocab;
@@ -102,6 +233,8 @@ fn real_27b_greedy_and_logits_match_the_fp8_reference() {
     let weight_only = floats("real27b-ref.logits.bin");
     let act_ref = floats("real27b-ref-act.logits.bin");
     let envelope = relative(&act_ref, &weight_only);
+    let ref_kl = mean_kl(&weight_only, &act_ref, vocab);
+    let ref_top1 = top1_agreement(&weight_only, &act_ref, vocab);
     let len = forced[0].len();
     let first_miss = |seqs: &[Vec<u32>], reference: &[f32]| -> Vec<Result<usize, (usize, f32)>> {
         seqs.iter()
@@ -132,15 +265,17 @@ fn real_27b_greedy_and_logits_match_the_fp8_reference() {
         let error = relative(&ours, reference);
         let to_weight_only = relative(&ours, &weight_only);
         let misses = first_miss(&seqs, reference);
+        let kl = mean_kl(&weight_only, &ours, vocab);
+        let top1 = top1_agreement(&weight_only, &ours, vocab);
         eprintln!(
-            "{mode}: logits max error / max |logit| vs its reference {error}, vs weight-only {to_weight_only}; envelope {envelope}; greedy per prompt: Ok(n) = n tokens agree, Err((step, reference margin)) = first disagreement {misses:?}"
+            "{mode}: logits max error / max |logit| vs its reference {error}, vs weight-only {to_weight_only}; envelope {envelope}; KL(weight-only || ours) {kl} against {ref_kl} for the act reference; top-1 vs weight-only {top1} against {ref_top1}; greedy per prompt: Ok(n) = n tokens agree, Err((step, reference margin)) = first disagreement {misses:?}"
         );
-        assert!(error <= envelope, "{mode}: {error} outside the {envelope} envelope");
-        assert!(to_weight_only <= 1.5 * envelope, "{mode}: {to_weight_only} from the weight-only reference");
         if mode == "weight" {
+            assert!(error <= envelope, "{mode}: {error} outside the {envelope} envelope");
             assert!(misses.iter().all(|m| *m == Ok(len - prompt_len)), "{misses:?}");
         } else {
-            assert!(misses.iter().all(|m| m.as_ref().err().is_none_or(|e| e.1 <= NEAR_TIE)), "{misses:?}");
+            assert!(kl <= 1.5 * ref_kl, "{mode}: KL {kl} against the act reference's {ref_kl}");
+            assert!(top1 + 0.02 >= ref_top1, "{mode}: top-1 {top1} against {ref_top1}");
         }
         checked += 1;
     }

@@ -166,6 +166,18 @@ def quantize_activation_fp8(x):
     return (q * scale).reshape(shape).to(x.dtype)
 
 
+def quantize_activation_fp8_token(x):
+    amax = x.float().abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax > 0, amax / FP8_MAX, torch.ones_like(amax))
+    return ((x.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float() * scale).to(x.dtype)
+
+
+def quantize_token_inputs(model, skip):
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear) and name.split(".")[-1] in FP8_PROJECTIONS and name not in skip:
+            module.register_forward_pre_hook(lambda _m, args: (quantize_activation_fp8_token(args[0]),))
+
+
 def quantize_projection_inputs(model):
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear) and name.split(".")[-1] in FP8_PROJECTIONS:
@@ -575,6 +587,7 @@ def real_full(repo, out_dir, seq_file, act_quant):
     config = Qwen3_5TextConfig(**{k: v for k, v in text.items() if k != "model_type"})
     config._attn_implementation = "sdpa"
     seqs = json.loads(seq_file.read_text())["sequences"]
+    compressed = json.loads((src / "config.json").read_text())["quantization_config"]["quant_method"] == "compressed-tensors"
     handles = {}
 
     def tensor(name):
@@ -585,11 +598,14 @@ def real_full(repo, out_dir, seq_file, act_quant):
 
     def weights(prefix):
         names = [n for n in index if n.startswith(prefix) and not n.endswith("_scale_inv")]
+        if compressed:
+            state, input_scales = dequantize_compressed({n: tensor(n) for n in names})
+            return {k[len(prefix):]: v for k, v in state.items()}, {k[len(prefix):]: v for k, v in input_scales.items()}
         out = {}
         for n in names:
             w = tensor(n)
             out[n[len(prefix):]] = dequantize_fp8_block(w, tensor(n + "_scale_inv")) if w.dtype == torch.float8_e4m3fn else w.float()
-        return out
+        return out, {}
 
     root = "model.language_model."
     started = time.time()
@@ -601,8 +617,12 @@ def real_full(repo, out_dir, seq_file, act_quant):
     with torch.inference_mode():
         for i in range(config.num_hidden_layers):
             layer = Qwen3_5DecoderLayer(config, i).float().eval()
-            layer.load_state_dict(weights(f"{root}layers.{i}."), strict=True)
-            if act_quant:
+            state, input_scales = weights(f"{root}layers.{i}.")
+            layer.load_state_dict(state, strict=True)
+            if act_quant and compressed:
+                quantize_nvfp4_inputs(layer, input_scales, prefix="")
+                quantize_token_inputs(layer, skip=input_scales)
+            elif act_quant:
                 quantize_projection_inputs(layer)
             for p, h in enumerate(hidden):
                 pos = torch.arange(h.shape[1])[None]
@@ -615,7 +635,7 @@ def real_full(repo, out_dir, seq_file, act_quant):
         norm.load_state_dict({"weight": tensor(root + "norm.weight").float()})
         head = tensor("lm_head.weight").float()
         logits = torch.stack([norm(h[0]) @ head.T for h in hidden])
-    name = "real27b-ref-act" if act_quant else "real27b-ref"
+    name = ("real27b-ref-act" if act_quant else "real27b-ref") + os.environ.get("REF_SUFFIX", "")
     versions = {"torch": torch.__version__, "transformers": __import__("transformers").__version__}
     save(out_dir, name, {"logits": logits, "layers": torch.stack(trace)},
          {"sequences": seqs, "argmax": logits.argmax(-1).tolist(), "act_quant": act_quant, "secs": time.time() - started, **versions})
