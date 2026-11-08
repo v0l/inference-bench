@@ -1422,9 +1422,12 @@ impl Runtime {
 
     pub fn linear_states(&self) -> Result<LinearStates> {
         let gb = self.gdn.as_ref().context("no linear layers")?;
+        let layers = self.spec.linear_layers();
+        let conv = self.slots * layers * gb.la.conv_dim() * (gb.la.conv_kernel - 1);
+        let ssm = self.slots * layers * gb.la.value_heads * gb.la.key_head_dim * gb.la.key_head_dim;
         Ok(LinearStates {
-            conv: self.stream.clone_dtoh(&gb.conv_state)?,
-            state: self.stream.clone_dtoh(&gb.ssm_state)?,
+            conv: self.stream.clone_dtoh(&gb.conv_state.slice(..conv))?,
+            state: self.stream.clone_dtoh(&gb.ssm_state.slice(..ssm))?,
         })
     }
 
