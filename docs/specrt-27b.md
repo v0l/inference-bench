@@ -77,7 +77,7 @@ From the checkpoint headers and the allocation code in `runtime.rs`:
 | norms, conv, `in_proj_a/b`, A, dt | 0.05 GB | |
 | **weights on the device** | **29.5 GB** | MTP (0.48 GB) and vision (0.92 GB) are not loaded |
 | linear-attention state per sequence | 151 MB + 5.9 MB conv | 48 layers x 48 heads x 128 x 128 x f32; independent of context |
-| KV per token, specrt today (f16 hi/lo pair) | 128 KiB | 16 layers x 4 heads x 256 x (K, V) x 2 planes x 2 bytes |
+| KV per token, specrt today (f16 hi/lo pair) | 128 KiB | 16 layers x 4 heads x 256 x (K, V) x 2 planes x 2 bytes; the serving layout (#335, `docs/specrt-scheduler.md`) stores one f16 plane, 64 KiB |
 | KV per token in bf16 / fp8 | 64 KiB / 32 KiB | what vLLM's `--kv-cache-dtype fp8` stores |
 | decode scratch | 3 MB | |
 | prefill scratch | 0.24 / 0.06 / 0.02 GB at 8k / 32k / 128k | the chunk shrinks as context grows (`SCORE_BUDGET_FLOATS`) |

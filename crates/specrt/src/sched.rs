@@ -192,7 +192,6 @@ pub struct Scheduler<E: Executor> {
     next_id: SeqId,
     admissions: u64,
     preemptions: u64,
-    decode_ewma: f64,
     prefill_rate: f64,
 }
 
@@ -214,7 +213,6 @@ impl<E: Executor> Scheduler<E> {
             next_id: 1,
             admissions: 0,
             preemptions: 0,
-            decode_ewma: 0.0,
             prefill_rate: 0.0,
         }
     }
@@ -378,8 +376,7 @@ impl<E: Executor> Scheduler<E> {
         if self.prefill_rate <= 0.0 {
             return align.min(full.max(1));
         }
-        let room = (self.cfg.itl_target.as_secs_f64() - self.decode_ewma).max(0.0);
-        let fit = (room * self.prefill_rate) as usize;
+        let fit = (self.cfg.itl_target.as_secs_f64() * self.prefill_rate) as usize;
         let fit = if fit > align { fit / align * align } else { align };
         fit.min(full.max(align))
     }
@@ -412,7 +409,6 @@ impl<E: Executor> Scheduler<E> {
             let plain: Vec<DecodeRow> = rows.iter().map(|r| r.1).collect();
             let next = self.exec.decode(&plain)?;
             report.decode_secs = started.elapsed().as_secs_f64();
-            self.decode_ewma = ewma(self.decode_ewma, report.decode_secs);
             report.decode_rows = rows.len();
             for ((i, _), t) in rows.iter().zip(next) {
                 let s = &mut self.running[*i];
@@ -762,6 +758,35 @@ mod tests {
             let took = started.elapsed();
             assert!(took < Duration::from_millis(75), "a step of {took:?} with {} prefill tokens", r.prefill_tokens);
         }
+    }
+
+    #[test]
+    fn a_first_token_mid_step_caps_the_rest_of_that_steps_prefill() {
+        let mut fake = Fake::new(65536, 8, 8000, 2048);
+        fake.token_cost = Duration::from_micros(100);
+        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(50), ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        s.submit(request(500, 400, 1)).unwrap();
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        s.step(&mut events).unwrap();
+        s.cancel(1, &mut events);
+        let a = s.submit(request(300, 400, 2)).unwrap();
+        s.submit(request(20_000, 4, 3)).unwrap();
+        let mut last: Option<Instant> = None;
+        let mut worst = Duration::ZERO;
+        for _ in 0..40 {
+            let mut ev = Vec::new();
+            s.step(&mut ev).unwrap();
+            if ev.iter().any(|e| matches!(e, Event::Token { id, .. } if *id == a)) {
+                let now = Instant::now();
+                if let Some(p) = last {
+                    worst = worst.max(now - p);
+                }
+                last = Some(now);
+            }
+        }
+        assert!(worst < Duration::from_millis(90), "a {worst:?} gap after the first token");
     }
 
     #[test]
