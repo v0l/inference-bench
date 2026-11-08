@@ -292,6 +292,57 @@ fn fp8_batch_decode_matches_single_sequence_greedy() {
     assert_eq!(batch.generate_batch(&prompts, 24).unwrap().tokens, expected);
 }
 
+const NVFP4: &str = "tiny-qwen3.5-nvfp4";
+
+#[test]
+fn nvfp4_fixture_has_nvfp4_mlps_then_fp8_channel_and_the_spec_says_so() {
+    let s = spec_for(NVFP4);
+    assert_eq!(s.quant, specrt::spec::Quant::Fp8Channel);
+    assert_eq!((s.mlp.quant, s.mlp.quant_until), (Some(specrt::spec::Quant::Nvfp4G16), Some(2)));
+    let ck = specrt::weights::Checkpoint::open(&fixture_dir(NVFP4)).unwrap();
+    let packed = ck.view("model.language_model.layers.0.mlp.down_proj.weight_packed").unwrap();
+    assert_eq!((packed.dtype, packed.shape.as_slice()), (safetensors::Dtype::U8, &[256usize, 256][..]));
+    for i in 0..2 {
+        let layer = ck.layer(&s, i).unwrap();
+        assert!(matches!(layer.gate_up, specrt::weights::Matrix::Fp4(_)));
+        assert!(matches!(layer.down, specrt::weights::Matrix::Fp4(_)));
+    }
+    let last = ck.layer(&s, 2).unwrap();
+    assert!(matches!(last.gate_up, specrt::weights::Matrix::Fp8 { .. }));
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-nvfp4 output"]
+fn nvfp4_decode_matches_the_dequantised_reference_per_layer() {
+    decode_matches_reference(NVFP4, "tinynvfp4");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-nvfp4 output"]
+fn nvfp4_prefill_matches_the_dequantised_reference_per_layer() {
+    prefill_matches_reference(NVFP4, "tinynvfp4");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-nvfp4 output"]
+fn nvfp4_logits_and_greedy_match_transformers() {
+    logits_and_greedy_match_reference(NVFP4, "tinynvfp4");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn nvfp4_batch_decode_matches_single_sequence_greedy() {
+    let s = spec_for(NVFP4);
+    let prompts: Vec<Vec<u32>> =
+        (0..4u32).map(|q| (0..40u32).map(|i| (i * 7 + q * 131) % 1024).collect()).collect();
+    let mut single = Runtime::load(&s, 256).unwrap();
+    let expected: Vec<Vec<u32>> =
+        prompts.iter().map(|p| single.generate(p, 24, Sampling::GREEDY).unwrap().tokens).collect();
+    drop(single);
+    let mut batch = Runtime::load_batched(&s, 256, 4).unwrap();
+    assert_eq!(batch.generate_batch(&prompts, 24).unwrap().tokens, expected);
+}
+
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn head_dim_256_batch_decode_matches_single_sequence_greedy() {

@@ -5,6 +5,48 @@ use std::collections::BTreeMap;
 pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
 pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
+pub const FP4_TEMPLATE: &str = include_str!("../templates/fp4.cu");
+pub const FP4_KERNELS: &[&str] = &[
+    "gate_up_act_f4",
+    "down_proj_f4",
+    "gate_up_f4w",
+    "gate_up_f4w_big",
+    "gate_up_f4w_narrow",
+    "gate_up_f4w_tiny",
+    "down_f4w",
+    "down_f4w_big",
+    "down_f4w_narrow",
+    "down_f4w_tiny",
+];
+const FP4_STAGES: usize = 3;
+const F4W_BK: usize = 64;
+const F4W_ROW: usize = 48;
+
+pub fn f4w_smem(tile: Tile) -> u32 {
+    (FP4_STAGES * (tile.bm * F4W_BK * 4 + tile.bn * F4W_ROW)) as u32
+}
+
+fn fp4_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
+    let mut out = String::new();
+    for linear in ["gate_up", "down"] {
+        let (n, k, epi, _) = linear_dims(spec, linear);
+        for suffix in MMA_VARIANTS {
+            let t = Tile::variant(suffix);
+            let name = format!("{linear}_f4w{suffix}");
+            let name = FP4_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_KERNELS");
+            smem.insert(name, f4w_smem(t));
+            out.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_f4w<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP4_STAGES}, {epi}>(w, s, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+                threads = t.threads(),
+                bm = t.bm,
+                bn = t.bn,
+                wm = t.wm,
+                wn = t.wn,
+            ));
+        }
+    }
+    out
+}
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
 pub const FP8_BLOCK: usize = 128;
@@ -106,7 +148,6 @@ pub enum WeightFormat {
     Bf16,
     Q8,
     Fp8,
-    Fp4,
 }
 
 impl WeightFormat {
@@ -115,7 +156,7 @@ impl WeightFormat {
             Quant::Bf16 => WeightFormat::Bf16,
             Quant::Q8 => WeightFormat::Q8,
             Quant::Fp8Block128 | Quant::Fp8Channel => WeightFormat::Fp8,
-            Quant::Nvfp4G16 => WeightFormat::Fp4,
+            Quant::Nvfp4G16 => unreachable!("nvfp4 is an MLP format with its own kernels"),
         }
     }
 
@@ -131,7 +172,6 @@ impl WeightFormat {
             WeightFormat::Bf16 => 0,
             WeightFormat::Q8 => 1,
             WeightFormat::Fp8 => 2,
-            WeightFormat::Fp4 => 3,
         }
     }
 
@@ -144,7 +184,6 @@ impl WeightFormat {
             WeightFormat::Bf16 => "linear_bf16",
             WeightFormat::Q8 => "linear_q8",
             WeightFormat::Fp8 => "linear_fp8",
-            WeightFormat::Fp4 => "linear_fp4",
         }
     }
 }
@@ -164,7 +203,6 @@ impl MmaShape {
             WeightFormat::Q8 => Q8_GROUP,
             WeightFormat::Fp8 if tile.bm == 16 => 128,
             WeightFormat::Fp8 => env_usize("SPECRT_FP8_BK", 64),
-            WeightFormat::Fp4 => 64,
             WeightFormat::Bf16 if tile.bm == 16 && k % 128 == 0 => 128,
             WeightFormat::Bf16 => env_usize("SPECRT_BK", 32),
         };
@@ -475,6 +513,13 @@ impl Module {
             source.push_str(&fp8_act_kernels(spec, &mut smem));
             kernels.push("quant_rows_fp8");
             kernels.extend(smem.keys().filter(|k| k.contains("_f8")).copied().collect::<Vec<_>>());
+        }
+        if spec.mlp.quant == Some(Quant::Nvfp4G16) {
+            let mut fp4_vars = BTreeMap::new();
+            fp4_vars.insert("F4W_KERNELS", fp4_kernels(spec, &mut smem));
+            source.push('\n');
+            source.push_str(&render(FP4_TEMPLATE, &fp4_vars)?);
+            kernels.extend_from_slice(FP4_KERNELS);
         }
         Ok(Module { source, kernels, smem })
     }

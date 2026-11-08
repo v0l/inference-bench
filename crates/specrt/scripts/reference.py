@@ -186,6 +186,177 @@ def tiny_fp8_model(fixture, act_quant=False):
     return model
 
 
+NVFP4_MAX = 6.0
+E2M1_GRID = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+TINY_NVFP4_UNTIL = 2
+
+
+def round_e2m1(x):
+    a = x.abs()
+    bounds = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
+    idx = torch.bucketize(a, bounds, right=False)
+    upper_tie = torch.isin(a, torch.tensor([0.75, 1.75, 3.5]))
+    idx = torch.where(upper_tie, idx + 1, idx)
+    return E2M1_GRID[idx] * torch.sign(x)
+
+
+def nvfp4_qdq(x, global_scale):
+    shape = x.shape
+    g = x.float().reshape(*shape[:-1], shape[-1] // 16, 16)
+    amax = g.abs().amax(dim=-1, keepdim=True)
+    scale = (amax / NVFP4_MAX * global_scale).clamp(max=FP8_MAX).to(torch.float8_e4m3fn).float()
+    step = scale / global_scale
+    q = round_e2m1(torch.where(step > 0, g / torch.where(step > 0, step, 1.0), torch.zeros_like(g)).clamp(-6, 6))
+    return (q * step).reshape(shape)
+
+
+def quantize_nvfp4(w, global_scale):
+    from compressed_tensors.compressors.nvfp4.helpers import pack_fp4_to_uint8
+
+    rows, cols = w.shape
+    g = w.float().reshape(rows, cols // 16, 16)
+    amax = g.abs().amax(dim=-1, keepdim=True)
+    scale = (amax / NVFP4_MAX * global_scale).clamp(max=FP8_MAX).to(torch.float8_e4m3fn)
+    step = scale.float() / global_scale
+    q = round_e2m1(torch.where(step > 0, g / torch.where(step > 0, step, 1.0), torch.zeros_like(g)).clamp(-6, 6))
+    return pack_fp4_to_uint8(q.reshape(rows, cols)), scale.reshape(rows, cols // 16)
+
+
+def dequantize_nvfp4(packed, scale, global_scale):
+    from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
+
+    rows, half = packed.shape
+    q = unpack_fp4_from_uint8(packed, rows, half * 2, dtype=torch.float32)
+    return (q.reshape(rows, -1, 16) * (scale.float() / global_scale)[..., None]).reshape(rows, half * 2)
+
+
+def quantize_fp8_channel(w):
+    amax = w.float().abs().amax(dim=1, keepdim=True).clamp(min=1e-12)
+    scale = (amax / FP8_MAX).to(torch.bfloat16)
+    q = (w.float() / scale.float()).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return q, scale
+
+
+def nvfp4_global(amax):
+    return torch.tensor([FP8_MAX * NVFP4_MAX / max(float(amax), 1e-12)], dtype=torch.float32)
+
+
+def calibrate_mlp_inputs(src):
+    model = tiny_model(src, 256)
+    amax = {}
+
+    def hook(name):
+        def f(_m, args):
+            amax[name] = max(amax.get(name, 0.0), float(args[0].abs().max()))
+        return f
+
+    for name, module in model.named_modules():
+        if name.endswith(("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")):
+            module.register_forward_pre_hook(hook(name))
+    with torch.inference_mode():
+        model(tiny_tokens(TINY_PREFILL, 1)[None])
+    return amax
+
+
+def write_nvfp4_shards(src, dst):
+    from safetensors.torch import load_file, save_file
+
+    amax = calibrate_mlp_inputs(src)
+    dst.mkdir(parents=True, exist_ok=True)
+    weights = load_file(src / "model.safetensors")
+    shards, targets = {}, {"group_0": [], "group_1": []}
+    for name, w in sorted(weights.items()):
+        parts = name.split(".")
+        shard = f"layers-{parts[2]}.safetensors" if parts[1] == "layers" else "outside.safetensors"
+        group = shards.setdefault(shard, {})
+        module = name[: -len(".weight")]
+        nvfp4 = module.split(".")[-1] in ("gate_proj", "up_proj", "down_proj") and int(parts[2]) < TINY_NVFP4_UNTIL
+        target = "model.language_model." + module[len("model."):]
+        if is_fp8_projection(name) and nvfp4:
+            mlp = module.rsplit(".", 1)[0]
+            peers = [module] if module.endswith("down_proj") else [mlp + ".gate_proj", mlp + ".up_proj"]
+            wgs = nvfp4_global(max(float(weights[p + ".weight"].float().abs().max()) for p in peers))
+            igs = nvfp4_global(amax[peers[0]])
+            packed, scale = quantize_nvfp4(w, wgs)
+            group[module + ".weight_packed"] = packed
+            group[module + ".weight_scale"] = scale
+            group[module + ".weight_global_scale"] = wgs
+            group[module + ".input_global_scale"] = igs
+            targets["group_1"].append(target)
+        elif is_fp8_projection(name):
+            group[name], group[module + ".weight_scale"] = quantize_fp8_channel(w)
+            targets["group_0"].append(target)
+        else:
+            group[name] = w
+    weight_map = {}
+    for shard, tensors in shards.items():
+        renamed = {("model.language_model." + k[len("model."):] if k.startswith("model.") else k): v.contiguous() for k, v in tensors.items()}
+        save_file(renamed, dst / shard)
+        weight_map.update({k: shard for k in renamed})
+    (dst / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}, indent=1))
+    fp8_args = {"num_bits": 8, "type": "float", "symmetric": True, "dynamic": False, "strategy": "channel", "group_size": None}
+    fp4_args = {"num_bits": 4, "type": "float", "symmetric": True, "dynamic": False, "strategy": "tensor_group", "group_size": 16, "scale_dtype": "torch.float8_e4m3fn"}
+    config = json.loads((src / "config.json").read_text())
+    config["quantization_config"] = {
+        "quant_method": "compressed-tensors",
+        "format": "mixed-precision",
+        "config_groups": {
+            "group_0": {"format": "float-quantized", "weights": fp8_args, "input_activations": {**fp8_args, "dynamic": True, "strategy": "token"}, "targets": targets["group_0"]},
+            "group_1": {"format": "nvfp4-pack-quantized", "weights": fp4_args, "input_activations": {**fp4_args, "dynamic": "local"}, "targets": targets["group_1"]},
+        },
+    }
+    (dst / "config.json").write_text(json.dumps(config, indent=2))
+
+
+def nvfp4_state(fixture):
+    from safetensors.torch import load_file
+
+    index = json.loads((fixture / "model.safetensors.index.json").read_text())
+    raw = {}
+    for shard in sorted(set(index["weight_map"].values())):
+        raw.update(load_file(fixture / shard))
+    return dequantize_compressed(raw)
+
+
+def dequantize_compressed(raw):
+    state, input_scales = {}, {}
+    for name, w in raw.items():
+        if name.endswith(".weight_packed"):
+            m = name[: -len(".weight_packed")]
+            state[m + ".weight"] = dequantize_nvfp4(w, raw[m + ".weight_scale"], raw[m + ".weight_global_scale"])
+            input_scales[m] = raw[m + ".input_global_scale"]
+        elif name.endswith((".weight_scale", "_global_scale")):
+            continue
+        elif w.dtype == torch.float8_e4m3fn:
+            state[name] = w.float() * raw[name[: -len(".weight")] + ".weight_scale"].float()
+        else:
+            state[name] = w.float()
+    return state, input_scales
+
+
+def quantize_nvfp4_inputs(model, input_scales, prefix="model.language_model."):
+    for name, module in model.named_modules():
+        key = prefix + name[len("model."):] if name.startswith("model.") else name
+        if key in input_scales:
+            gs = input_scales[key]
+            module.register_forward_pre_hook(lambda _m, args, gs=gs: (nvfp4_qdq(args[0], gs).to(args[0].dtype),))
+
+
+def tiny_nvfp4_model(fixture, act_quant=False):
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+    src = fixture.parent / "tiny-qwen3.5-hd256"
+    if not (fixture / "model.safetensors.index.json").exists():
+        write_nvfp4_shards(src, fixture)
+    torch.manual_seed(TINY_SEED)
+    model = Qwen3_5ForCausalLM(tiny_config(256)).float().eval()
+    state, input_scales = nvfp4_state(fixture)
+    model.load_state_dict({k.replace("model.language_model.", "model."): v for k, v in state.items()}, strict=True)
+    if act_quant:
+        quantize_nvfp4_inputs(model, input_scales)
+    return model
+
+
 def tiny_tokens(n, salt):
     g = torch.Generator().manual_seed(TINY_SEED + salt)
     return torch.randint(0, 1024, (n,), generator=g)
@@ -216,12 +387,16 @@ def save(out_dir, name, arrays, meta):
     (out_dir / f"{name}.json").write_text(json.dumps(meta))
 
 
-def tiny(fixture, out_dir, head_dim=128, fp8=False, act_quant=False):
+def tiny(fixture, out_dir, head_dim=128, fp8=False, act_quant=False, nvfp4=False):
     from transformers import DynamicCache
 
     torch.set_num_threads(4)
-    model = tiny_fp8_model(fixture, act_quant) if fp8 else tiny_model(fixture, head_dim)
-    prefix = ("tinyfp8act" if act_quant else "tinyfp8") if fp8 else "tiny" if head_dim == 128 else f"tiny{head_dim}"
+    if nvfp4:
+        model = tiny_nvfp4_model(fixture, act_quant)
+        prefix = "tinynvfp4act" if act_quant else "tinynvfp4"
+    else:
+        model = tiny_fp8_model(fixture, act_quant) if fp8 else tiny_model(fixture, head_dim)
+        prefix = ("tinyfp8act" if act_quant else "tinyfp8") if fp8 else "tiny" if head_dim == 128 else f"tiny{head_dim}"
     out_dir.mkdir(parents=True, exist_ok=True)
     versions = {"torch": torch.__version__, "transformers": __import__("transformers").__version__}
     with torch.inference_mode():
@@ -498,6 +673,10 @@ def main():
         return
     if sys.argv[1] == "tiny":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4]) if len(sys.argv) > 4 else 128)
+        return
+    if sys.argv[1] == "tiny-nvfp4":
+        tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, nvfp4=True)
+        tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, nvfp4=True, act_quant=True)
         return
     if sys.argv[1] == "tiny-fp8":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, fp8=True)

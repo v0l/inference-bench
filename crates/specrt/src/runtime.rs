@@ -637,7 +637,7 @@ impl Runtime {
     ) -> Result<()> {
         let mut b = self.stream.launch_builder(self.kernel(name));
         w.args(&mut b, &self.buf.dummy);
-        if name != "gate_up_act" {
+        if !name.starts_with("gate_up_act") {
             b.arg(bias.unwrap_or(&self.buf.dummy));
         }
         b.arg(x).arg(norm).arg(out);
@@ -659,8 +659,10 @@ impl Runtime {
     fn mlp_decode(&self, l: &DeviceLayer) -> Result<()> {
         let s = &self.spec;
         let buf = &self.buf;
-        self.linear_norm("gate_up_act", &l.gate_up, None, &buf.x, &l.ln2, &buf.act, s.dims.intermediate)?;
-        self.linear("down_proj", &l.down, None, &buf.act, &buf.x, s.dims.hidden)
+        let fp4 = matches!(l.gate_up, DeviceMatrix::Fp4 { .. });
+        let (act, down) = if fp4 { ("gate_up_act_f4", "down_proj_f4") } else { ("gate_up_act", "down_proj") };
+        self.linear_norm(act, &l.gate_up, None, &buf.x, &l.ln2, &buf.act, s.dims.intermediate)?;
+        self.linear(down, &l.down, None, &buf.act, &buf.x, s.dims.hidden)
     }
 
     fn trace_layer(&self, trace: Option<&CudaSlice<f32>>, layer: usize, tokens: usize) -> Result<()> {
@@ -829,7 +831,10 @@ impl Runtime {
         if let (Some(fa), DeviceMatrix::Fp8 { .. }, false) = (&self.fp8_act, w, suffix == "_tiny") {
             return self.tc_fp8(fa, name, w, bias, x, out, rows, tokens, suffix, tile);
         }
-        let kernel = format!("{name}_mma{suffix}");
+        let kernel = match w {
+            DeviceMatrix::Fp4 { .. } => format!("{name}_f4w{suffix}"),
+            _ => format!("{name}_mma{suffix}"),
+        };
         let mut b = self.stream.launch_builder(self.kernel(&kernel));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
