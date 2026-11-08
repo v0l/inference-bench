@@ -67,6 +67,26 @@ to allocate and free, and a table entry is the same for all layers. The kernels 
   (`slots`) whose block table names a spare KV block (`kv_blocks`), so they never touch live state.
   `SPECRT_NO_GRAPH=1` falls back to eager launches. Test:
   `rows_padded_to_a_captured_graph_size_match_single_sequence_greedy`.
+- **Fused decode and prefill step.** When decoders run and a prefill chunk is due, the scheduler
+  calls `Executor::fused`, which `Runtime::fused_step` runs as one batch: the embed, every norm, QKV,
+  O, gate/up, down, the delta-net projections and the lm_head see `decode rows + chunk tokens` rows, so
+  each weight matrix is read once per step. Attention (`batch_decode_attention` for the decode rows,
+  `flash_mma` for the chunk) and the delta-net step (`gdn_step` against `gdn_chunk_*`) stay separate
+  launches per kind of row. The lm_head runs on the decode rows plus the last chunk row only when it
+  samples. The fused step is not graph-captured (the chunk length varies); `SPECRT_NO_FUSE=1` goes back
+  to decode then prefill. Tests (`tests/fused.rs`): 3 decode rows plus a 200 token chunk give the same
+  logits as the separate launches, within 1e-5 on the fixtures when both use one GEMM tile
+  (`SPECRT_TILE=big`) and 1e-4 across tile choices; the 64 sequence preemption test runs through the
+  fused path.
+- **Recurrent state on demand.** The conv and delta-net state of a slot (157 MB on the 27B, 156,893,184
+  bytes) is a virtual range reserved for all slots at load; physical memory is mapped when the
+  scheduler admits a sequence (`StatePool`, CUDA virtual memory) and unmapped when it finishes, is
+  cancelled or is preempted. `max_num_seqs` 32 costs 5 GB only if 32 sequences run. Admission stops,
+  and the request waits, when `acquire_state` fails or free device memory is under the state size plus
+  256 MB. The serving layout keeps room for 8 resident slots in its KV headroom. Tests:
+  `tests/statepool.rs` (1000 random acquire/release cycles end with nothing mapped and the free memory
+  back), `admission_stops_cleanly_when_no_recurrent_state_can_be_allocated` and
+  `recurrent_states_are_freed_by_finish_cancel_and_preemption_with_no_growth` in `sched.rs`.
 - **Cancel.** The serving thread checks every live job's cancel flag before each step. A dropped
   SSE stream sets it (the send fails), so its blocks are back in the pool within one step.
   Server test: `a_dropped_stream_frees_its_kv_blocks_within_a_step`.
@@ -170,3 +190,13 @@ cargo test --release -p inference-bench-server --test serving -- --include-ignor
 SPECRT_BENCH_SERVE=1 cargo run --release --bin bench -- specs/qwen3-0.6b.toml 128 128 8
 flock /tmp/gpu27.lock ./scripts/serve27b.sh              # KV_GB, SEQS, MAX_LEN, ONLY=stall
 ```
+
+## #360 measurements
+
+Not measured on the real 27B: another process held 24 GB of the GPU next to vLLM's 51 GB (free
+memory 14 GB against the 36 GB `serve27b.sh` needs) for the whole window, and the one run that fit
+failed its model loads with CUDA out of memory, so its numbers are not recorded. Still to run, under
+`flock /tmp/gpu27.lock`, shared GPU with vLLM serving, 7 alternating runs and medians:
+single stream tok/s with graphs against `SPECRT_NO_GRAPH=1` (57 ms against 45 ms per token),
+`SPECRT_NO_FUSE=1` against fused for 8 decoders beside a 29k prefill (aggregate tok/s and decoder
+stall max), and the vLLM comparison of the same `loadtest` mix (#307).
