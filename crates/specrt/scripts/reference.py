@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import tomllib
 from pathlib import Path
@@ -242,7 +243,97 @@ def tiny(fixture, out_dir, head_dim=128, fp8=False):
     print("tiny", fixture, "->", out_dir)
 
 
+def snapshot_dir(repo):
+    hub = Path(os.environ.get("HF_HUB_CACHE", Path.home() / ".cache/huggingface/hub"))
+    snaps = hub / f"models--{repo.replace('/', '--')}" / "snapshots"
+    return next(d for d in sorted(snaps.iterdir()) if (d / "model.safetensors.index.json").exists())
+
+
+def real_prompt_ids(tok):
+    return tok(PROMPT + " " + PROMPT).input_ids[:64]
+
+
+def slice_rows(src, vocab):
+    tok = AutoTokenizer.from_pretrained(src)
+    used = sorted(set(real_prompt_ids(tok)))
+    rest = [i for i in range(vocab) if i not in set(used)][: vocab - len(used)]
+    return sorted(used + rest)
+
+
+def real_slice(repo, dst, layers, vocab):
+    from safetensors import safe_open
+    from safetensors.torch import save_file
+
+    src = snapshot_dir(repo)
+    rows = torch.tensor(slice_rows(src, vocab))
+    index = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
+    dst.mkdir(parents=True, exist_ok=True)
+    keep = {}
+    for name, shard in index.items():
+        parts = name.split(".")
+        if name.startswith("model.language_model.layers.") and int(parts[3]) < layers:
+            keep.setdefault(f"layers-{parts[3]}.safetensors", []).append((name, shard))
+        elif name in ("model.language_model.embed_tokens.weight", "lm_head.weight", "model.language_model.norm.weight"):
+            keep.setdefault("outside.safetensors", []).append((name, shard))
+    weight_map = {}
+    for out, names in sorted(keep.items()):
+        tensors = {}
+        for name, shard in names:
+            with safe_open(src / shard, "pt") as f:
+                t = f.get_tensor(name)
+            if name.endswith("embed_tokens.weight") or name == "lm_head.weight":
+                t = t[rows]
+            tensors[name] = t.contiguous()
+            weight_map[name] = out
+        save_file(tensors, dst / out)
+    (dst / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}, indent=1))
+    config = json.loads((src / "config.json").read_text())
+    text = config["text_config"]
+    text["num_hidden_layers"] = layers
+    text["layer_types"] = text["layer_types"][:layers]
+    text["vocab_size"] = vocab
+    q = config["quantization_config"]
+    config["quantization_config"] = {k: q[k] for k in ("activation_scheme", "fmt", "quant_method", "weight_block_size")}
+    (dst / "config.json").write_text(json.dumps(config, indent=2))
+    for f in ("tokenizer.json", "tokenizer_config.json"):
+        (dst / f).write_bytes((src / f).read_bytes())
+    (dst / "vocab_rows.json").write_text(json.dumps(rows.tolist()))
+
+
+def real_slice_reference(repo, fixture, out_dir, layers, vocab):
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+    if not (fixture / "model.safetensors.index.json").exists():
+        real_slice(repo, fixture, layers, vocab)
+    torch.set_num_threads(16)
+    text = json.loads((fixture / "config.json").read_text())["text_config"]
+    config = Qwen3_5TextConfig(**{k: v for k, v in text.items() if k != "model_type"})
+    with torch.device("meta"):
+        model = Qwen3_5ForCausalLM(config)
+    state = {k.replace("model.language_model.", "model."): v for k, v in dequantized_state(fixture).items()}
+    model.load_state_dict(state, strict=True, assign=True)
+    model = model.float().eval()
+    model.model.rotary_emb.__init__(config)
+    tok = AutoTokenizer.from_pretrained(fixture)
+    rows = {r: i for i, r in enumerate(json.loads((fixture / "vocab_rows.json").read_text()))}
+    ids = torch.tensor([rows[t] for t in real_prompt_ids(tok)])
+    versions = {"torch": torch.__version__, "transformers": __import__("transformers").__version__}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with torch.inference_mode():
+        seen, hooks = layer_outputs(model)
+        logits = model(ids[None]).logits[0]
+        for h in hooks:
+            h.remove()
+    save(out_dir, "real27b-slice", {"layers": torch.stack([s[0] for s in seen]), "logits": logits},
+         {"tokens": ids.tolist(), "layers": layers, "vocab": vocab, **versions})
+    print("real slice", fixture, len(ids), "tokens ->", out_dir)
+
+
 def main():
+    if sys.argv[1] == "real-slice":
+        real_slice_reference(sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]))
+        return
     if sys.argv[1] == "tiny":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4]) if len(sys.argv) > 4 else 128)
         return
