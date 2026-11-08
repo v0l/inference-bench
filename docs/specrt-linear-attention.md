@@ -206,6 +206,9 @@ The per-spec call needs the HF weights for each spec's `repo`; the `tiny` calls 
 fixtures and write `tiny-*` (128) and `tiny256-*` (256) files. Run the suite with
 `--test-threads=1` because the GPU is shared and `contexts_above_4096` needs most of the free memory.
 
+`scripts/reference.py` writes `rope_parameters` (with `rope_theta` from the model's own config) for
+rope-scaled specs, so it needs transformers 5. On this machine use `PY=~/.venv-vllm/bin/python`.
+
 ## What the next issue needs (FP8 and NVFP4 weights for the real 27B)
 
 The 27B in bf16 is 54 GB of weights and does not fit beside vLLM; the FP8 checkpoint
