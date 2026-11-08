@@ -41,6 +41,10 @@ impl Runtime {
         self.chunk
     }
 
+    pub fn synchronize(&self) -> Result<()> {
+        Ok(self.stream.synchronize()?)
+    }
+
     pub fn prefill_slot(
         &mut self,
         st: &mut Stepper,

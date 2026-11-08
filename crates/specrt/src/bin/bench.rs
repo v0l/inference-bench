@@ -37,6 +37,9 @@ fn main() -> Result<()> {
     let batch: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(0);
     let spec = load_spec(&spec_path)?;
     let longest = *prompts.iter().max().context(usage)?;
+    if std::env::var_os("SPECRT_BENCH_SERVE").is_some() {
+        return bench_serve(&spec, longest, new_tokens, batch.max(1));
+    }
     if batch > 0 {
         return bench_batch(&spec, longest, new_tokens, batch);
     }
@@ -68,6 +71,40 @@ fn main() -> Result<()> {
             runs.len(),
             all(&|g| prompt_len as f64 / g.prefill_secs),
             all(&|g| (new_tokens - 1) as f64 / g.decode_secs),
+        );
+    }
+    Ok(())
+}
+
+fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize) -> Result<()> {
+    use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
+    let max_ctx = prompt_len + new_tokens + 16;
+    let layout = specrt::runtime::Layout::serving(spec, max_ctx, batch, None);
+    let rt = Runtime::load_layout(spec, layout)?;
+    let mut sched = Scheduler::new(GpuExecutor::new(rt)?, Config { max_num_seqs: batch, ..Config::default() });
+    for round in 0..runs() {
+        for s in 0..batch as u32 {
+            let prompt = (0..prompt_len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect();
+            sched.submit(Request { prompt, max_tokens: new_tokens, sampling: Sampling::GREEDY, stop: vec![] })?;
+        }
+        let (mut decode_secs, mut decode_tokens, mut prefill_secs, mut steps) = (0.0, 0, 0.0, 0);
+        let started = std::time::Instant::now();
+        while !sched.idle() {
+            let mut events = Vec::new();
+            let r = sched.step(&mut events)?;
+            decode_secs += r.decode_secs;
+            decode_tokens += r.decode_rows;
+            prefill_secs += r.prefill_secs;
+            steps += 1;
+            let _ = events.iter().filter(|e| matches!(e, Event::Token { .. })).count();
+        }
+        println!(
+            "{} serve round={round} batch={batch} prompt={prompt_len} new={new_tokens} steps={steps} decode={:.1} tok/s aggregate (decode step {:.2} ms) prefill {:.2} s wall {:.2} s",
+            spec.name,
+            decode_tokens as f64 / decode_secs,
+            decode_secs * 1e3 / (steps as f64),
+            prefill_secs,
+            started.elapsed().as_secs_f64(),
         );
     }
     Ok(())

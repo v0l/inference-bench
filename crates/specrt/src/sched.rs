@@ -52,6 +52,9 @@ pub trait Executor {
     fn set_table(&mut self, slot: usize, blocks: &[u32]) -> Result<()>;
     fn prefill(&mut self, slot: usize, tokens: &[u32], start: usize, sample: Option<(Sampling, u32)>) -> Result<Option<u32>>;
     fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>>;
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct GpuExecutor {
@@ -93,6 +96,10 @@ impl Executor for GpuExecutor {
 
     fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
         self.rt.decode(&mut self.st, rows)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.rt.synchronize()
     }
 }
 
@@ -457,6 +464,7 @@ impl<E: Executor> Scheduler<E> {
             }
         }
         if report.prefill_tokens > 0 {
+            self.exec.flush()?;
             report.prefill_secs = started.elapsed().as_secs_f64();
             if report.prefill_tokens >= self.cfg.min_prefill_chunk {
                 self.prefill_rate = ewma(self.prefill_rate, report.prefill_tokens as f64 / report.prefill_secs.max(1e-6));
