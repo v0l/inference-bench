@@ -27,6 +27,8 @@ constexpr int ACT_KIND = {{ACT_KIND}};
 constexpr int MAX_CTX = {{MAX_CTX}};
 constexpr int PAGE = {{PAGE}};
 constexpr int PAGES = (MAX_CTX + PAGE - 1) / PAGE;
+constexpr int ATTN_LAYERS = {{ATTN_LAYERS}};
+constexpr int KV_PLANES = {{KV_PLANES}};
 constexpr int Q8_GROUP = {{Q8_GROUP}};
 constexpr int WF_BF16 = 0;
 constexpr int WF_Q8 = 1;
@@ -909,27 +911,38 @@ __device__ __forceinline__ void attn_split(float v, unsigned& hi, unsigned& lo) 
 }
 
 __device__ __forceinline__ size_t kv_slot(const int* block_table, int layer, int kv_head, int pos) {
-    return (((size_t)layer * PAGES + block_table[pos / PAGE]) * KV_HEADS + kv_head) * PAGE + pos % PAGE;
+    return (((size_t)block_table[pos / PAGE] * ATTN_LAYERS + layer) * KV_HEADS + kv_head) * PAGE + pos % PAGE;
 }
 
 __device__ __forceinline__ bf16_t* kv_row(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
-    return cache + kv_slot(block_table, layer, kv_head, pos) * 2 * HEAD_DIM;
+    return cache + kv_slot(block_table, layer, kv_head, pos) * KV_PLANES * HEAD_DIM;
 }
 
 __device__ __forceinline__ const bf16_t* kv_row(const bf16_t* cache, const int* block_table, int layer, int kv_head,
                                                 int pos) {
-    return cache + kv_slot(block_table, layer, kv_head, pos) * 2 * HEAD_DIM;
+    return cache + kv_slot(block_table, layer, kv_head, pos) * KV_PLANES * HEAD_DIM;
+}
+
+__device__ __forceinline__ const int* seq_table(const int* block_table, const int* slots, int row) {
+    return block_table + (size_t)slots[row] * PAGES;
 }
 
 __device__ __forceinline__ float kv_at(const bf16_t* row, int d) {
-    return attn_float(row[d]) + attn_float(row[HEAD_DIM + d]);
+    float v = attn_float(row[d]);
+    return KV_PLANES == 2 ? v + attn_float(row[HEAD_DIM + d]) : v;
 }
 
 __device__ __forceinline__ float4 kv_at4(const bf16_t* row, int d) {
     uint2 h = *(const uint2*)(row + d);
-    uint2 l = *(const uint2*)(row + HEAD_DIM + d);
-    return make_float4(attn_float(h.x) + attn_float(l.x), attn_float(h.x >> 16) + attn_float(l.x >> 16),
-                       attn_float(h.y) + attn_float(l.y), attn_float(h.y >> 16) + attn_float(l.y >> 16));
+    float4 v = make_float4(attn_float(h.x), attn_float(h.x >> 16), attn_float(h.y), attn_float(h.y >> 16));
+    if (KV_PLANES == 2) {
+        uint2 l = *(const uint2*)(row + HEAD_DIM + d);
+        v.x += attn_float(l.x);
+        v.y += attn_float(l.x >> 16);
+        v.z += attn_float(l.y);
+        v.w += attn_float(l.y >> 16);
+    }
+    return v;
 }
 
 __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, const float* k_norm,
@@ -965,15 +978,16 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     unsigned hi, lo;
     attn_split(v, hi, lo);
     dst[d] = (bf16_t)hi;
-    dst[HEAD_DIM + d] = (bf16_t)lo;
+    if (KV_PLANES == 2) dst[HEAD_DIM + d] = (bf16_t)lo;
 }
 
 extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
                                         bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
-                                        const int* pos_ptr, int layer, int seq_layers) {
-    int pos = pos_ptr[0] + (seq_layers ? 0 : blockIdx.y);
-    norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, block_table, pos, layer + blockIdx.y * seq_layers,
-                   blockIdx.x, blockIdx.y);
+                                        const int* pos, const int* slots, int layer, int per_row) {
+    int row = blockIdx.y;
+    const int* table = per_row ? seq_table(block_table, slots, row) : block_table;
+    int p = per_row ? pos[row] : pos[0] + row;
+    norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, table, p, layer, blockIdx.x, row);
 }
 
 extern "C" __global__ void kv_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
@@ -1112,76 +1126,13 @@ extern "C" __global__ void attention_reduce(const float* part, const int* pos_pt
     }
 }
 
-extern "C" __global__ void attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
-                                     const int* block_table, const int* pos_ptr, int layer, float* out, float* scores_global,
-                                     int seq_layers) {
-    __shared__ float scratch[32];
-    __shared__ float scores_shared[MAX_CTX > 4096 ? 1 : MAX_CTX];
-    int head = blockIdx.x;
-    float* scores = MAX_CTX > 4096 ? scores_global + ((size_t)blockIdx.y * HEADS + head) * MAX_CTX : scores_shared;
-    int kv_head = head / GROUP;
-    int len = pos_ptr[0] + (seq_layers ? 0 : blockIdx.y) + 1;
-    layer += blockIdx.y * seq_layers;
-    int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    const float* q = qkv + (size_t)blockIdx.y * QKV_ROW + head * HEAD_DIM;
-    out += (size_t)blockIdx.y * Q_DIM;
-    float scale = rsqrtf((float)HEAD_DIM);
-    for (int t = warp; t < len; t += ATTN_THREADS / 32) {
-        const bf16_t* k = kv_row(k_cache, block_table, layer, kv_head, t);
-        float dot = 0.0f;
-        for (int d = lane; d < HEAD_DIM; d += 32) dot += q[d] * kv_at(k, d);
-        dot = warp_sum(dot);
-        if (lane == 0) scores[t] = dot * scale;
-    }
-    __syncthreads();
-    float m = NEG_INF;
-    for (int t = threadIdx.x; t < len; t += blockDim.x) m = fmaxf(m, scores[t]);
-    m = block_reduce<true>(m, scratch);
-    float sum = 0.0f;
-    for (int t = threadIdx.x; t < len; t += blockDim.x) {
-        float e = expf(scores[t] - m);
-        scores[t] = e;
-        sum += e;
-    }
-    sum = block_reduce<false>(sum, scratch);
-    __syncthreads();
-    constexpr int PER_LANE = (HEAD_DIM + 31) / 32;
-    constexpr int WARPS = ATTN_THREADS / 32;
-    __shared__ float partial[WARPS][HEAD_DIM];
-    float acc[PER_LANE];
-#pragma unroll
-    for (int i = 0; i < PER_LANE; i++) acc[i] = 0.0f;
-#pragma unroll 4
-    for (int t = warp; t < len; t += WARPS) {
-        const bf16_t* v = kv_row(v_cache, block_table, layer, kv_head, t);
-        float p = scores[t];
-#pragma unroll
-        for (int i = 0; i < PER_LANE; i++) {
-            int d = lane + i * 32;
-            if (d < HEAD_DIM) acc[i] += p * kv_at(v, d);
-        }
-    }
-#pragma unroll
-    for (int i = 0; i < PER_LANE; i++) {
-        int d = lane + i * 32;
-        if (d < HEAD_DIM) partial[warp][d] = acc[i];
-    }
-    __syncthreads();
-    for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x) {
-        float total = 0.0f;
-        for (int w = 0; w < WARPS; w++) total += partial[w][d];
-        out[head * HEAD_DIM + d] = total / sum * out_gate(qkv, blockIdx.y, head * HEAD_DIM + d);
-    }
-}
-
 constexpr int BD_WARPS = 8;
 constexpr int BD_SPLITS = {{BD_SPLITS}};
 constexpr int BD_UNROLL = 8;
 
 extern "C" __global__ void batch_decode_attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
-                                                  const int* block_table, const int* pos_ptr, int layer,
-                                                  float* part_acc, float* part_ml, int seq_layers) {
+                                                  const int* block_table, const int* pos, const int* slots,
+                                                  int layer, float* part_acc, float* part_ml) {
     constexpr int PER_LANE = (HEAD_DIM + 31) / 32;
     __shared__ float sm[BD_WARPS][GROUP];
     __shared__ float sl[BD_WARPS][GROUP];
@@ -1191,11 +1142,11 @@ extern "C" __global__ void batch_decode_attention(const float* qkv, const bf16_t
     int split = blockIdx.z;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
-    int len = pos_ptr[0] + 1;
+    int len = pos[seq] + 1;
     int chunk = (len + BD_SPLITS - 1) / BD_SPLITS;
     int t0 = split * chunk;
     int t1 = min(len, t0 + chunk);
-    int seq_layer = layer + seq * seq_layers;
+    const int* table = seq_table(block_table, slots, seq);
     const float* q = qkv + (size_t)seq * QKV_ROW + kv_head * GROUP * HEAD_DIM;
     float scale = rsqrtf((float)HEAD_DIM);
     float qr[GROUP][PER_LANE];
@@ -1220,8 +1171,8 @@ extern "C" __global__ void batch_decode_attention(const float* qkv, const bf16_t
 #pragma unroll
         for (int u = 0; u < U; u++) {
             int t = tb + u * BD_WARPS;
-            const bf16_t* k = kv_row(k_cache, block_table, seq_layer, kv_head, min(t, t1 - 1));
-            const bf16_t* v = kv_row(v_cache, block_table, seq_layer, kv_head, min(t, t1 - 1));
+            const bf16_t* k = kv_row(k_cache, table, layer, kv_head, min(t, t1 - 1));
+            const bf16_t* v = kv_row(v_cache, table, layer, kv_head, min(t, t1 - 1));
 #pragma unroll
             for (int i = 0; i < PER_LANE; i++) {
                 int d = lane + i * 32;
@@ -1439,6 +1390,16 @@ __device__ __forceinline__ void mma_hi_lo(float* c, const unsigned* ah, const un
     mma_f16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
 }
 
+__device__ __forceinline__ void mma_kv(float* c, const unsigned* ah, const unsigned* al,
+                                       unsigned bh0, unsigned bh1, unsigned bl0, unsigned bl1) {
+    if (KV_PLANES == 2) {
+        mma_hi_lo(c, ah, al, bh0, bh1, bl0, bl1);
+        return;
+    }
+    mma_f16(c, al[0], al[1], al[2], al[3], bh0, bh1);
+    mma_f16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
+}
+
 extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
                                      const bf16_t* v_cache, const int* block_table, const int* pos_ptr, int layer,
                                      bf16_t* out_hi, bf16_t* out_lo, int tokens) {
@@ -1524,7 +1485,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     int tiles = (key_end + FM_BK - 1) / FM_BK;
     auto load_kv = [&](int buf, int k0) {
         bf16_t* st = kvs + buf * 4 * PLANE;
-        constexpr int ROW_CHUNKS = 2 * CPR;
+        constexpr int ROW_CHUNKS = KV_PLANES * CPR;
         constexpr int TOTAL = 2 * FM_BK * ROW_CHUNKS;
 #pragma unroll
         for (int i = tid; i < TOTAL; i += 32 * FM_WARPS) {
@@ -1565,13 +1526,13 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         for (int np = 0; np < SB / 2; np++)
 #pragma unroll
             for (int kb = 0; kb < FM_KB; kb++) {
-                unsigned bh[4], bl[4];
+                unsigned bh[4], bl[4] = {0, 0, 0, 0};
                 int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
                 int at = swz<CPR>(kr, kb * 2 + ((lane >> 3) & 1)) * 8;
                 ldsm_x4(bh, k_hi + at);
-                ldsm_x4(bl, k_lo + at);
-                mma_hi_lo(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
-                mma_hi_lo(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
+                if (KV_PLANES == 2) ldsm_x4(bl, k_lo + at);
+                mma_kv(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
+                mma_kv(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
             }
         float mx0 = NEG_INF, mx1 = NEG_INF;
 #pragma unroll
@@ -1630,13 +1591,13 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             pl[3] = pack_lo(s[2 * kb + 1][2], s[2 * kb + 1][3]);
 #pragma unroll
             for (int np = 0; np < FM_NB / 2; np++) {
-                unsigned bh[4], bl[4];
+                unsigned bh[4], bl[4] = {0, 0, 0, 0};
                 int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
                 int at = swz<CPR>(kr, np * 2 + (lane >> 4)) * 8;
                 ldsm_x4_t(bh, v_hi + at);
-                ldsm_x4_t(bl, v_lo + at);
-                mma_hi_lo(o[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
-                mma_hi_lo(o[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
+                if (KV_PLANES == 2) ldsm_x4_t(bl, v_lo + at);
+                mma_kv(o[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
+                mma_kv(o[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
             }
         }
         __syncthreads();
@@ -1744,8 +1705,8 @@ extern "C" __global__ void argmax_rows(const float* logits, int* tokens, int* hi
 }
 
 extern "C" __global__ void bump(int* pos, int* count) {
-    pos[0] += 1;
-    count[0] += 1;
+    pos[threadIdx.x] += 1;
+    if (threadIdx.x == 0) count[0] += 1;
 }
 
 extern "C" __global__ void copy_rows(const float* src, float* dst, int n) {

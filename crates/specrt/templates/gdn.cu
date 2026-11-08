@@ -55,13 +55,14 @@ __device__ __forceinline__ float* conv_state_row(float* state, int slot, int c) 
     return state + ((size_t)slot * LA_CONV_DIM + c) * (LA_K - 1);
 }
 
-extern "C" __global__ void gdn_conv_step(const float* lin, const float* w, float* state, float* mix, int slot, int seq_slots) {
+extern "C" __global__ void gdn_conv_step(const float* lin, const float* w, float* state, float* mix, int slot, int seq_slots,
+                                         const int* slots) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     int seq = blockIdx.y;
     if (c >= LA_CONV_DIM) return;
     lin += (size_t)seq * LA_IN_ROWS;
     mix += (size_t)seq * LA_CONV_DIM;
-    float* s = conv_state_row(state, slot + seq * seq_slots, c);
+    float* s = conv_state_row(state, slot + slots[seq] * seq_slots, c);
     float window[LA_K];
 #pragma unroll
     for (int j = 0; j < LA_K - 1; j++) window[j] = s[j];
@@ -103,7 +104,8 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const fl
                                                                         const float* ba,
                                                                         const float* neg_a, const float* dt_bias,
                                                                         const float* norm_w, float* state,
-                                                                        float* out, int slot, int seq_slots) {
+                                                                        float* out, int slot, int seq_slots,
+                                                                        const int* slots) {
     constexpr int KS = LA_D / LA_KSPLIT;
     __shared__ float scratch[32];
     __shared__ float q_s[LA_D];
@@ -116,7 +118,7 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const fl
     lin += (size_t)seq * LA_IN_ROWS;
     ba += (size_t)seq * LA_BA_ROWS;
     out += (size_t)seq * LA_VALUE_DIM;
-    slot += seq * seq_slots;
+    slot += slots[seq] * seq_slots;
     int kh = h / LA_RATIO;
     int tid = threadIdx.x;
     int v = tid % LA_D;

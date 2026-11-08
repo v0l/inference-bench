@@ -149,12 +149,12 @@ struct Buffers {
     k_cache: CudaSlice<u16>,
     v_cache: CudaSlice<u16>,
     block_table: CudaSlice<i32>,
+    zero_slots: CudaSlice<i32>,
     token: CudaSlice<i32>,
     pos: CudaSlice<i32>,
     history: CudaSlice<i32>,
     count: CudaSlice<i32>,
     dummy: CudaSlice<f32>,
-    scores: CudaSlice<f32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -226,6 +226,8 @@ struct BatchBuffers {
     history: CudaSlice<i32>,
     part_acc: CudaSlice<f32>,
     part_ml: CudaSlice<f32>,
+    pos: CudaSlice<i32>,
+    slots: CudaSlice<i32>,
 }
 
 pub struct Generation {
@@ -254,6 +256,10 @@ pub struct Runtime {
     sms: u32,
     seq: i32,
     batch: usize,
+    slots: usize,
+    pages: usize,
+    kv_blocks: usize,
+    tables: Vec<i32>,
     pub cache_hit: bool,
     pub jit_key: String,
     pub arch: String,
@@ -276,11 +282,48 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
 const PREFILL_CHUNK: usize = 2048;
-const SHARED_SCORES_MAX_CTX: usize = 4096;
-const SCORE_BUDGET_FLOATS: usize = 1 << 26;
 const ATTN_SPLITS: usize = 64;
 const ATTN_BLOCK: u32 = 128;
 const GEMM_TILE: usize = 64;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layout {
+    pub max_ctx: usize,
+    pub slots: usize,
+    pub kv_blocks: usize,
+    pub prefill_chunk: usize,
+    pub kv_planes: usize,
+}
+
+impl Layout {
+    pub fn contiguous(max_ctx: usize, slots: usize) -> Layout {
+        Layout {
+            max_ctx,
+            slots,
+            kv_blocks: slots * max_ctx.div_ceil(PAGE),
+            prefill_chunk: PREFILL_CHUNK,
+            kv_planes: 2,
+        }
+    }
+
+    pub fn serving(spec: &Spec, max_ctx: usize, slots: usize, kv_bytes: usize) -> Layout {
+        Layout {
+            max_ctx,
+            slots,
+            kv_blocks: (kv_bytes / kv_block_bytes(spec, 1)).max(1),
+            prefill_chunk: PREFILL_CHUNK,
+            kv_planes: 1,
+        }
+    }
+
+    pub fn pages(&self) -> usize {
+        self.max_ctx.div_ceil(PAGE)
+    }
+}
+
+pub fn kv_block_bytes(spec: &Spec, planes: usize) -> usize {
+    2 * spec.attention_layers() * spec.attention.kv_heads * PAGE * spec.attention.head_dim * planes * 2
+}
 
 impl Runtime {
     pub fn load(spec: &Spec, max_ctx: usize) -> Result<Self> {
@@ -289,13 +332,27 @@ impl Runtime {
 
     pub fn load_batched(spec: &Spec, max_ctx: usize, batch: usize) -> Result<Self> {
         ensure!(batch >= 1, "batch must be at least 1");
+        let mut rt = Self::load_layout(spec, Layout::contiguous(max_ctx, batch))?;
+        rt.batch = batch;
+        let pages = rt.pages;
+        for slot in 0..batch {
+            let blocks: Vec<u32> = (0..pages as u32).rev().map(|p| (slot * pages) as u32 + p).collect();
+            rt.set_block_table(slot, &blocks)?;
+        }
+        Ok(rt)
+    }
+
+    pub fn load_layout(spec: &Spec, layout: Layout) -> Result<Self> {
+        ensure!(layout.slots >= 1 && layout.kv_blocks >= 1, "need at least one slot and one KV block");
+        let max_ctx = layout.max_ctx;
+        let batch = 1;
         let load_started = Instant::now();
         let ctx = CudaContext::new(0).context("cuda init")?;
         let free_before = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let jit = Jit::new(ctx.clone(), default_cache_dir())?;
-        let module = Module::generate(spec, max_ctx)?;
+        let module = Module::generate_kv(spec, max_ctx, layout.kv_planes)?;
         let jit_started = Instant::now();
         let loaded = jit.load(&module)?;
         let jit_secs = jit_started.elapsed().as_secs_f64();
@@ -374,16 +431,13 @@ impl Runtime {
         let weight_secs = weights_started.elapsed().as_secs_f64();
         let weight_bytes = free_before.saturating_sub(ctx.mem_get_info().map(|(f, _)| f).unwrap_or(0)) as u64;
         let d = &spec.dims;
-        let pages = max_ctx.div_ceil(PAGE);
-        let cache_len = batch
-            * spec.attention_layers()
-            * pages
-            * spec.attention.kv_heads
-            * PAGE
-            * spec.attention.head_dim;
-        let table: Vec<i32> = (0..pages as i32).rev().collect();
-        let score_rows = (SCORE_BUDGET_FLOATS / (spec.attention.heads * max_ctx)).max(1);
-        let chunk = max_ctx.min(PREFILL_CHUNK).min(score_rows).max(batch);
+        let pages = layout.pages();
+        let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
+        let cache_len = layout.kv_blocks * block_elems;
+        let chunk = max_ctx.min(layout.prefill_chunk).max(layout.slots);
+        let use_mma =
+            ctx.compute_capability()?.0 >= 8 && std::env::var_os("SPECRT_GEMM_FP32").is_none();
+        let mma_only = |n: usize| if use_mma { 1 } else { n };
         let buf = Buffers {
             x: stream.alloc_zeros(d.hidden)?,
             xn: stream.alloc_zeros(d.hidden)?,
@@ -393,39 +447,33 @@ impl Runtime {
             gate_up: stream.alloc_zeros(2 * d.intermediate)?,
             act: stream.alloc_zeros(d.intermediate)?,
             logits: stream.alloc_zeros(d.vocab)?,
-            k_cache: stream.alloc_zeros(2 * cache_len)?,
-            v_cache: stream.alloc_zeros(2 * cache_len)?,
-            block_table: stream.clone_htod(&table)?,
+            k_cache: stream.alloc_zeros(cache_len.max(1)).context("KV cache")?,
+            v_cache: stream.alloc_zeros(cache_len.max(1)).context("KV cache")?,
+            block_table: stream.alloc_zeros(layout.slots * pages)?,
+            zero_slots: stream.alloc_zeros(chunk)?,
             token: stream.alloc_zeros(1)?,
             pos: stream.alloc_zeros(1)?,
             history: stream.alloc_zeros(max_ctx)?,
             count: stream.alloc_zeros(1)?,
             dummy: stream.alloc_zeros(1)?,
-            scores: stream.alloc_zeros(if max_ctx > SHARED_SCORES_MAX_CTX {
-                spec.attention.heads * max_ctx * chunk
-            } else {
-                1
-            })?,
         };
         let pre = PrefillBuffers {
             tokens: stream.alloc_zeros(chunk)?,
             x: stream.alloc_zeros(chunk * d.hidden)?,
-            xn: stream.alloc_zeros(chunk * d.hidden)?,
+            xn: stream.alloc_zeros(mma_only(chunk * d.hidden))?,
             qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
-            attn: stream.alloc_zeros(chunk * spec.q_dim())?,
-            gate_up: stream.alloc_zeros(chunk * 2 * d.intermediate)?,
-            act: stream.alloc_zeros(chunk * d.intermediate)?,
+            attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim()))?,
+            gate_up: stream.alloc_zeros(mma_only(chunk * 2 * d.intermediate))?,
+            act: stream.alloc_zeros(mma_only(chunk * d.intermediate))?,
             xn_planes: Planes::new(&stream, chunk * d.hidden)?,
             attn_planes: Planes::new(&stream, chunk * spec.q_dim())?,
             act_planes: Planes::new(&stream, chunk * d.intermediate)?,
             dummy_u16: stream.alloc_zeros(8)?,
         };
         let gdn = match &spec.linear_attention {
-            Some(la) => Some(GdnBuffers::new(&stream, la, batch * spec.linear_layers(), chunk)?),
+            Some(la) => Some(GdnBuffers::new(&stream, la, layout.slots * spec.linear_layers(), chunk)?),
             None => None,
         };
-        let use_mma =
-            ctx.compute_capability()?.0 >= 8 && std::env::var_os("SPECRT_GEMM_FP32").is_none();
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
         let widest = [d.hidden, d.intermediate, spec.q_dim()]
             .into_iter()
@@ -448,6 +496,10 @@ impl Runtime {
             chunk,
             seq: 0,
             batch,
+            slots: layout.slots,
+            pages,
+            kv_blocks: layout.kv_blocks,
+            tables: vec![0; layout.slots * pages],
             sms: ctx.attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
             )? as u32,
@@ -499,6 +551,39 @@ impl Runtime {
 
     fn kernel(&self, name: &str) -> &CudaFunction {
         &self.kernels[name]
+    }
+
+    fn slot_table(&self, slot: usize) -> CudaView<'_, i32> {
+        self.buf.block_table.slice(slot * self.pages..(slot + 1) * self.pages)
+    }
+
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+
+    pub fn kv_blocks(&self) -> usize {
+        self.kv_blocks
+    }
+
+    pub fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
+    pub fn set_block_table(&mut self, slot: usize, blocks: &[u32]) -> Result<()> {
+        ensure!(slot < self.slots, "slot {slot} out of {}", self.slots);
+        ensure!(blocks.len() <= self.pages, "{} blocks for a table of {}", blocks.len(), self.pages);
+        ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "block outside the pool");
+        let row = &mut self.tables[slot * self.pages..(slot + 1) * self.pages];
+        let old = row[..blocks.len()].to_vec();
+        for (dst, &b) in row.iter_mut().zip(blocks) {
+            *dst = b as i32;
+        }
+        let changed = old.iter().zip(blocks).position(|(&o, &b)| o != b as i32);
+        let Some(from) = changed else { return Ok(()) };
+        let at = slot * self.pages + from;
+        let host = self.tables[at..slot * self.pages + blocks.len()].to_vec();
+        self.stream.memcpy_htod(&host, &mut self.buf.block_table.slice_mut(at..at + host.len()))?;
+        Ok(())
     }
 
     fn linear(
@@ -578,7 +663,7 @@ impl Runtime {
         self.linear_norm("lin_ba_norm", &g.ba, None, x, ln1, &gb.ba, la.ba_rows())?;
         let zero = 0i32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
-        b.arg(&gb.lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.mix).arg(&g.slot).arg(&zero);
+        b.arg(&gb.lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.mix).arg(&g.slot).arg(&zero).arg(&self.buf.zero_slots);
         unsafe { b.launch(cfg(grid(la.conv_dim(), 256), 256)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_step"));
         b.arg(&gb.mix)
@@ -590,7 +675,8 @@ impl Runtime {
             .arg(&gb.ssm_state)
             .arg(&gb.out)
             .arg(&g.slot)
-            .arg(&zero);
+            .arg(&zero)
+            .arg(&self.buf.zero_slots);
         unsafe { b.launch(cfg(la.value_heads as u32, (la.value_head_dim * LA_KSPLIT) as u32)) }?;
         self.linear("lin_out_proj", &g.out, None, &gb.out, x, self.spec.dims.hidden)
     }
@@ -614,6 +700,7 @@ impl Runtime {
                 DeviceMixer::Attention(l) => l,
             };
             let kv_layer = l.kv;
+            let table = self.slot_table(self.seq as usize);
             self.linear_norm(
                 "qkv_proj_norm",
                 &l.qkv,
@@ -629,8 +716,9 @@ impl Runtime {
                 .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
-                .arg(&buf.block_table)
+                .arg(&table)
                 .arg(&buf.pos)
+                .arg(&buf.zero_slots)
                 .arg(&kv_layer)
                 .arg(&0i32);
             unsafe { b.launch(cfg((a.heads + 2 * a.kv_heads) as u32, a.head_dim.max(32) as u32)) }?;
@@ -638,7 +726,7 @@ impl Runtime {
             b.arg(&buf.qkv)
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
-                .arg(&buf.block_table)
+                .arg(&table)
                 .arg(&buf.pos)
                 .arg(&kv_layer)
                 .arg(&buf.attn_part);
@@ -914,7 +1002,8 @@ impl Runtime {
                 }
                 DeviceMixer::Attention(l) => l,
             };
-            let kv_layer = self.seq * s.attention_layers() as i32 + l.kv;
+            let kv_layer = l.kv;
+            let table = self.slot_table(self.seq as usize);
             if self.use_mma {
                 self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
                 self.tc(
@@ -946,11 +1035,12 @@ impl Runtime {
                 .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
-                .arg(&buf.block_table)
-                .arg(&buf.pos)
-                .arg(&kv_layer);
+                .arg(&table)
+                .arg(&buf.pos);
             if !self.use_mma {
-                b.arg(&0i32);
+                b.arg(&buf.zero_slots).arg(&kv_layer).arg(&0i32);
+            } else {
+                b.arg(&kv_layer);
             }
             let config = LaunchConfig {
                 grid_dim: (rope_heads as u32, n as u32, 1),
@@ -967,7 +1057,7 @@ impl Runtime {
             }
             b.arg(&buf.k_cache)
                 .arg(&buf.v_cache)
-                .arg(&buf.block_table)
+                .arg(&table)
                 .arg(&buf.pos)
                 .arg(&kv_layer);
             if self.use_mma {
@@ -1182,15 +1272,15 @@ impl Runtime {
         Ok(())
     }
 
-    fn gdn_batch(&self, g: &DeviceGdn, seq_slots: i32) -> Result<()> {
+    fn gdn_batch(&self, g: &DeviceGdn, slots: &CudaSlice<i32>, n: usize) -> Result<()> {
         let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
         let la = &gb.la;
-        let n = self.batch;
+        let seq_slots = self.spec.linear_layers() as i32;
         let pre = &self.pre;
         self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
         self.tc("lin_ba", &g.ba, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_ba), la.ba_rows(), n)?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
-        b.arg(&gb.pre_lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.pre_mix).arg(&g.slot).arg(&seq_slots);
+        b.arg(&gb.pre_lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.pre_mix).arg(&g.slot).arg(&seq_slots).arg(slots);
         let config = LaunchConfig {
             grid_dim: (grid(la.conv_dim(), 256), n as u32, 1),
             block_dim: (256, 1, 1),
@@ -1207,7 +1297,8 @@ impl Runtime {
             .arg(&gb.ssm_state)
             .arg(&gb.o)
             .arg(&g.slot)
-            .arg(&seq_slots);
+            .arg(&seq_slots)
+            .arg(slots);
         let config = LaunchConfig {
             grid_dim: (la.value_heads as u32, n as u32, 1),
             block_dim: ((la.value_head_dim * LA_KSPLIT) as u32, 1, 1),
@@ -1279,15 +1370,24 @@ impl Runtime {
         Ok(logits)
     }
 
-    fn batch_step(&self, bb: &BatchBuffers) -> Result<()> {
+    fn batch_step(&self, bb: &BatchBuffers, n: usize) -> Result<()> {
+        self.decode_rows(bb, n)?;
+        let stride = self.max_ctx as i32;
+        let mut b = self.stream.launch_builder(self.kernel("argmax_rows"));
+        b.arg(&bb.logits).arg(&bb.tokens).arg(&bb.history).arg(&self.buf.count).arg(&stride);
+        unsafe { b.launch(cfg(n as u32, 1024)) }?;
+        let mut b = self.stream.launch_builder(self.kernel("bump"));
+        b.arg(&bb.pos).arg(&self.buf.count);
+        unsafe { b.launch(cfg(1, n as u32)) }?;
+        Ok(())
+    }
+
+    fn decode_rows(&self, bb: &BatchBuffers, n: usize) -> Result<()> {
         let s = &self.spec;
         let a = &s.attention;
-        let n = self.batch;
         let hidden = s.dims.hidden;
         let pre = &self.pre;
         let buf = &self.buf;
-        let seq_layers = s.attention_layers() as i32;
-        let seq_slots = s.linear_layers() as i32;
         let mut b = self.stream.launch_builder(self.kernel("embed"));
         b.arg(&self.embed).arg(&bb.tokens).arg(&pre.x);
         let config = LaunchConfig {
@@ -1300,7 +1400,7 @@ impl Runtime {
             self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
             let l = match &layer.mixer {
                 DeviceMixer::Linear(g) => {
-                    self.gdn_batch(g, seq_slots)?;
+                    self.gdn_batch(g, &bb.slots, n)?;
                     self.mlp_prefill(layer, n)?;
                     continue;
                 }
@@ -1324,9 +1424,10 @@ impl Runtime {
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
-                .arg(&buf.pos)
+                .arg(&bb.pos)
+                .arg(&bb.slots)
                 .arg(&kv_layer)
-                .arg(&seq_layers);
+                .arg(&1i32);
             let config = LaunchConfig {
                 grid_dim: ((a.heads + 2 * a.kv_heads) as u32, n as u32, 1),
                 block_dim: (a.head_dim.max(32) as u32, 1, 1),
@@ -1338,11 +1439,11 @@ impl Runtime {
                 .arg(&buf.k_cache)
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
-                .arg(&buf.pos)
+                .arg(&bb.pos)
+                .arg(&bb.slots)
                 .arg(&kv_layer)
                 .arg(&bb.part_acc)
-                .arg(&bb.part_ml)
-                .arg(&seq_layers);
+                .arg(&bb.part_ml);
             let config = LaunchConfig {
                 grid_dim: (a.kv_heads as u32, n as u32, crate::codegen::BATCH_DECODE_SPLITS as u32),
                 block_dim: (256, 1, 1),
@@ -1370,14 +1471,20 @@ impl Runtime {
             s.dims.vocab,
             n,
         )?;
-        let stride = self.max_ctx as i32;
-        let mut b = self.stream.launch_builder(self.kernel("argmax_rows"));
-        b.arg(&bb.logits).arg(&bb.tokens).arg(&bb.history).arg(&buf.count).arg(&stride);
-        unsafe { b.launch(cfg(n as u32, 1024)) }?;
-        let mut b = self.stream.launch_builder(self.kernel("bump"));
-        b.arg(&buf.pos).arg(&buf.count);
-        unsafe { b.launch(cfg(1, 1)) }?;
         Ok(())
+    }
+
+    fn batch_buffers(&self, rows: usize) -> Result<BatchBuffers> {
+        let parts = rows * self.spec.attention.heads * crate::codegen::BATCH_DECODE_SPLITS;
+        Ok(BatchBuffers {
+            tokens: self.stream.alloc_zeros(rows)?,
+            logits: self.stream.alloc_zeros(rows * self.spec.dims.vocab)?,
+            history: self.stream.alloc_zeros(rows * self.max_ctx)?,
+            part_acc: self.stream.alloc_zeros(parts * self.spec.attention.head_dim)?,
+            part_ml: self.stream.alloc_zeros(parts * 2)?,
+            pos: self.stream.alloc_zeros(rows)?,
+            slots: self.stream.alloc_zeros(rows)?,
+        })
     }
 
     pub fn generate_batch(
@@ -1391,14 +1498,7 @@ impl Runtime {
         ensure!(len > 0 && new_tokens > 0, "empty prompt or nothing to generate");
         ensure!(prompts.iter().all(|p| p.len() == len), "batch prompts must have the same length");
         ensure!(len + new_tokens <= self.max_ctx, "prompt plus generation exceeds max_ctx");
-        let parts = self.batch * self.spec.attention.heads * crate::codegen::BATCH_DECODE_SPLITS;
-        let bb = BatchBuffers {
-            tokens: self.stream.alloc_zeros(self.batch)?,
-            logits: self.stream.alloc_zeros(self.batch * self.spec.dims.vocab)?,
-            history: self.stream.alloc_zeros(self.batch * self.max_ctx)?,
-            part_acc: self.stream.alloc_zeros(parts * self.spec.attention.head_dim)?,
-            part_ml: self.stream.alloc_zeros(parts * 2)?,
-        };
+        let mut bb = self.batch_buffers(self.batch)?;
         let started = Instant::now();
         self.stream.memcpy_htod(&[0i32], &mut self.buf.count)?;
         for (seq, p) in prompts.iter().enumerate() {
@@ -1408,12 +1508,14 @@ impl Runtime {
             prefilled?;
             self.first_token(&bb, seq)?;
         }
-        self.stream.memcpy_htod(&[len as i32], &mut self.buf.pos)?;
+        let slots: Vec<i32> = (0..self.batch as i32).collect();
+        self.stream.memcpy_htod(&slots, &mut bb.slots)?;
+        self.stream.memcpy_htod(&vec![len as i32; self.batch], &mut bb.pos)?;
         self.stream.memcpy_htod(&[1i32], &mut self.buf.count)?;
         self.stream.synchronize()?;
         let prefill_secs = started.elapsed().as_secs_f64();
         self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-        let recorded = self.batch_step(&bb);
+        let recorded = self.batch_step(&bb, self.batch);
         let graph = self.stream.end_capture(CUgraphInstantiate_flags(0))?;
         recorded?;
         let graph = graph.context("empty graph")?;

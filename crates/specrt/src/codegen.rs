@@ -180,7 +180,6 @@ pub const KERNELS: &[&str] = &[
     "rmsnorm",
     "qkv_proj",
     "qk_norm_rope",
-    "attention",
     "attention_split",
     "attention_reduce",
     "o_proj",
@@ -370,6 +369,11 @@ fn fp8_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Strin
 
 impl Module {
     pub fn generate(spec: &Spec, max_ctx: usize) -> Result<Self> {
+        Self::generate_kv(spec, max_ctx, 2)
+    }
+
+    pub fn generate_kv(spec: &Spec, max_ctx: usize, kv_planes: usize) -> Result<Self> {
+        anyhow::ensure!(kv_planes == 1 || kv_planes == 2, "kv planes must be 1 or 2");
         let a = &spec.attention;
         let d = &spec.dims;
         let wf = WeightFormat::of(spec.quant);
@@ -422,6 +426,8 @@ impl Module {
             ("ACT_KIND", act.to_string()),
             ("MAX_CTX", max_ctx.to_string()),
             ("PAGE", PAGE.to_string()),
+            ("ATTN_LAYERS", spec.attention_layers().max(1).to_string()),
+            ("KV_PLANES", kv_planes.to_string()),
             ("Q8_GROUP", Q8_GROUP.to_string()),
             ("FP8_BLOCK", FP8_BLOCK.to_string()),
             ("BD_SPLITS", BATCH_DECODE_SPLITS.to_string()),
