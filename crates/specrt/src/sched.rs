@@ -364,12 +364,15 @@ impl<E: Executor> Scheduler<E> {
 
     fn prefill_budget(&self, decodes: usize) -> usize {
         let full = self.cfg.max_batched_tokens.saturating_sub(decodes);
-        if decodes == 0 || self.prefill_rate <= 0.0 {
-            return full.max(self.cfg.min_prefill_chunk);
+        let align = self.cfg.min_prefill_chunk.max(1);
+        if decodes == 0 {
+            return full.max(align);
+        }
+        if self.prefill_rate <= 0.0 {
+            return align.min(full.max(1));
         }
         let room = (self.cfg.itl_target.as_secs_f64() - self.decode_ewma).max(0.0);
         let fit = (room * self.prefill_rate) as usize;
-        let align = self.cfg.min_prefill_chunk.max(1);
         let fit = if fit > align { fit / align * align } else { align };
         fit.min(full.max(align))
     }
@@ -514,6 +517,7 @@ mod tests {
         tables: Vec<Vec<u32>>,
         state: Vec<(u64, usize)>,
         chunk: usize,
+        pub token_cost: Duration,
         pub decode_calls: Vec<usize>,
         pub prefill_calls: Vec<usize>,
     }
@@ -527,6 +531,7 @@ mod tests {
                 tables: vec![Vec::new(); slots],
                 state: vec![(0, 0); slots],
                 chunk,
+                token_cost: Duration::ZERO,
                 decode_calls: Vec::new(),
                 prefill_calls: Vec::new(),
             }
@@ -572,6 +577,7 @@ mod tests {
                 self.state[slot] = (0, 0);
             }
             self.prefill_calls.push(tokens.len());
+            std::thread::sleep(self.token_cost * tokens.len() as u32);
             let mut h = 0;
             for (i, &t) in tokens.iter().enumerate() {
                 h = self.write(slot, start + i, t);
@@ -727,6 +733,27 @@ mod tests {
         assert_eq!((s.running(), s.waiting()), (1, 1));
         let (_, _, _) = drain(&mut s);
         assert_eq!(s.blocks_used(), 0);
+    }
+
+    #[test]
+    fn prefill_beside_decoders_stays_inside_the_inter_token_target_from_the_first_step() {
+        let mut fake = Fake::new(65536, 8, 8000, 2048);
+        fake.token_cost = Duration::from_micros(100);
+        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(50), ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        s.submit(request(50, 400, 1)).unwrap();
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            s.step(&mut events).unwrap();
+        }
+        s.submit(request(20_000, 4, 2)).unwrap();
+        for _ in 0..30 {
+            let started = Instant::now();
+            let r = s.step(&mut events).unwrap();
+            assert_eq!(r.decode_rows, 1);
+            let took = started.elapsed();
+            assert!(took < Duration::from_millis(75), "a step of {took:?} with {} prefill tokens", r.prefill_tokens);
+        }
     }
 
     #[test]
