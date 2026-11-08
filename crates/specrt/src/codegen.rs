@@ -11,6 +11,7 @@ pub const BATCH_DECODE_SPLITS: usize = 8;
 pub const FLASH_ROWS: usize = 128;
 pub const LA_CHUNK: usize = 64;
 pub const LA_KSPLIT: usize = 4;
+pub const LA_COLS: usize = 16;
 const FLASH_KEYS: usize = 32;
 const FLASH_STAGES: usize = 2;
 
@@ -317,6 +318,7 @@ impl Module {
             ("LA_CONV_K", la_dim(|l| l.conv_kernel)),
             ("LA_CHUNK", LA_CHUNK.to_string()),
             ("LA_KSPLIT", LA_KSPLIT.to_string()),
+            ("LA_COLS", LA_COLS.to_string()),
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
             ("LINEAR", linear.to_string()),
             ("Q8", (spec.quant == Quant::Q8).to_string()),

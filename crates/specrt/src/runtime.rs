@@ -1,4 +1,4 @@
-use crate::codegen::{LA_CHUNK, LA_KSPLIT, Module, PAGE};
+use crate::codegen::{LA_CHUNK, LA_COLS, LA_KSPLIT, Module, PAGE};
 use crate::jit::{Jit, default_cache_dir};
 use crate::spec::{LinearAttention, Spec};
 use crate::weights::{Matrix, Mixer, Weights, find_safetensors};
@@ -754,7 +754,7 @@ impl Runtime {
             .arg(&gb.o)
             .arg(&slot)
             .arg(&ntok);
-        unsafe { b.launch(launch("", (la.value_heads as u32, (d / 32) as u32, 1), 256, 0)) }?;
+        unsafe { b.launch(launch("", (la.value_heads as u32, (d / LA_COLS) as u32, 1), 256, 0)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_gated_norm"));
         b.arg(&gb.o).arg(&gb.pre_lin).arg(&g.norm).arg(&gb.planes.hi).arg(&gb.planes.lo);
         unsafe { b.launch(launch("", (la.value_heads as u32, n as u32, 1), (d / 2) as u32, 0)) }?;

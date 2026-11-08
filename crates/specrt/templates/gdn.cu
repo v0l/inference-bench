@@ -16,7 +16,7 @@ constexpr int LA_CHUNK = {{LA_CHUNK}};
 constexpr int LA_KSPLIT = {{LA_KSPLIT}};
 constexpr int LA_KS = LA_D + 1;
 constexpr int LA_AS = LA_CHUNK + 1;
-constexpr int LA_COLS = 32;
+constexpr int LA_COLS = {{LA_COLS}};
 constexpr float LA_L2_EPS = 1e-6f;
 static_assert(LA_D % LA_COLS == 0 && LA_D <= 128, "linear head dim");
 static_assert(LA_VH % LA_KH == 0, "linear head groups");
@@ -192,6 +192,39 @@ extern "C" __global__ void gdn_gates(const float* lin, const float* neg_a, const
     }
 }
 
+template <int KSTEPS, typename FA, typename FB>
+__device__ __forceinline__ void mma_split_tile(float* c, int m0, int n0, int lane, FA a_at, FB b_at) {
+    int g = lane >> 2;
+    int t = lane & 3;
+#pragma unroll 2
+    for (int kk = 0; kk < KSTEPS; kk++) {
+        int k = kk * 16 + 2 * t;
+        float av[8] = {a_at(m0 + g, k),     a_at(m0 + g, k + 1),     a_at(m0 + g + 8, k),     a_at(m0 + g + 8, k + 1),
+                       a_at(m0 + g, k + 8), a_at(m0 + g, k + 9), a_at(m0 + g + 8, k + 8), a_at(m0 + g + 8, k + 9)};
+        float bv[4] = {b_at(k, n0 + g), b_at(k + 1, n0 + g), b_at(k + 8, n0 + g), b_at(k + 9, n0 + g)};
+        unsigned ah[4], al[4], bh[2], bl[2];
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            unsigned h0, l0, h1, l1;
+            split_hi_lo(av[2 * i], h0, l0);
+            split_hi_lo(av[2 * i + 1], h1, l1);
+            ah[i] = h0 | (h1 << 16);
+            al[i] = l0 | (l1 << 16);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            unsigned h0, l0, h1, l1;
+            split_hi_lo(bv[2 * i], h0, l0);
+            split_hi_lo(bv[2 * i + 1], h1, l1);
+            bh[i] = h0 | (h1 << 16);
+            bl[i] = l0 | (l1 << 16);
+        }
+        mma_bf16(c, al[0], al[1], al[2], al[3], bh[0], bh[1]);
+        mma_bf16(c, ah[0], ah[1], ah[2], ah[3], bl[0], bl[1]);
+        mma_bf16(c, ah[0], ah[1], ah[2], ah[3], bh[0], bh[1]);
+    }
+}
+
 extern "C" __global__ void __launch_bounds__(256) gdn_chunk_prep(const float* qn, const float* kn, const float* mix,
                                                                  const float* g, const float* beta, float* w,
                                                                  float* u, float* aqk, float* gc, int tokens) {
@@ -221,16 +254,42 @@ extern "C" __global__ void __launch_bounds__(256) gdn_chunk_prep(const float* qn
     if (tid == 0)
         for (int i = 1; i < C; i++) gs[i] += gs[i - 1];
     __syncthreads();
-    for (int e = tid; e < C * C; e += blockDim.x) {
-        int i = e / C;
-        int j = e % C;
-        float v = 0.0f;
-        if (j < i) {
-            float dot = 0.0f;
-            for (int d = 0; d < LA_D; d++) dot += ks[i * LA_KS + d] * ks[j * LA_KS + d];
-            v = -(bs[i] * dot) * expf(gs[i] - gs[j]);
+    constexpr int WARPS = 8;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int g8 = lane >> 2;
+    int t4 = lane & 3;
+    auto k_row = [&](int m, int k) { return ks[m * LA_KS + k]; };
+    auto k_col = [&](int k, int n) { return ks[n * LA_KS + k]; };
+    for (int tile = warp; tile < (C / 16) * (C / 8); tile += WARPS) {
+        int m0 = (tile / (C / 8)) * 16;
+        int n0 = (tile % (C / 8)) * 8;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (n0 <= m0 + 15) mma_split_tile<LA_D / 16>(acc, m0, n0, lane, k_row, k_col);
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            int i = m0 + g8 + (e >> 1) * 8;
+            int j = n0 + 2 * t4 + (e & 1);
+            A[i * LA_AS + j] = j < i ? -(bs[i] * acc[e]) * expf(gs[i] - gs[j]) : 0.0f;
         }
-        A[i * LA_AS + j] = v;
+    }
+    const float* qc = qn + ((size_t)t0 * LA_KH + kh) * LA_D;
+    float* ac = aqk + (size_t)(c * LA_VH + h) * C * C;
+    int live = min(C, tokens - t0);
+    for (int tile = warp; tile < (C / 16) * (C / 8); tile += WARPS) {
+        int m0 = (tile / (C / 8)) * 16;
+        int n0 = (tile % (C / 8)) * 8;
+        float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (n0 <= m0 + 15)
+            mma_split_tile<LA_D / 16>(
+                acc, m0, n0, lane, [&](int m, int k) { return m < live ? qc[(size_t)m * LA_KH * LA_D + k] : 0.0f; },
+                k_col);
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            int i = m0 + g8 + (e >> 1) * 8;
+            int j = n0 + 2 * t4 + (e & 1);
+            ac[i * C + j] = j <= i && i < live ? acc[e] * expf(gs[i] - gs[j]) : 0.0f;
+        }
     }
     __syncthreads();
     for (int i = 1; i < C; i++) {
@@ -244,93 +303,121 @@ extern "C" __global__ void __launch_bounds__(256) gdn_chunk_prep(const float* qn
         if (j < i) A[i * LA_AS + j] = next;
         __syncthreads();
     }
-    for (int e = tid; e < C * LA_D; e += blockDim.x) {
-        int i = e / LA_D;
-        int d = e % LA_D;
-        float uu = 0.0f, ww = 0.0f;
-        for (int j = 0; j <= i; j++) {
-            float tij = j == i ? 1.0f : A[i * LA_AS + j];
-            int tj = t0 + j;
-            float vj = tj < tokens ? mix[(size_t)tj * LA_CONV_DIM + LA_V_OFF + h * LA_D + d] : 0.0f;
-            uu += tij * (vj * bs[j]);
-            ww += tij * (ks[j * LA_KS + d] * bs[j] * expf(gs[j]));
+    if (tid < C) A[tid * LA_AS + tid] = 1.0f;
+    __syncthreads();
+    const float* vc = mix + (size_t)t0 * LA_CONV_DIM + LA_V_OFF + h * LA_D;
+    auto t_at = [&](int m, int k) { return k <= m ? A[m * LA_AS + k] : 0.0f; };
+    for (int tile = warp; tile < (C / 16) * (LA_D / 8); tile += WARPS) {
+        int m0 = (tile / (LA_D / 8)) * 16;
+        int n0 = (tile % (LA_D / 8)) * 8;
+        float uu[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float ww[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        mma_split_tile<C / 16>(uu, m0, n0, lane, t_at,
+                               [&](int k, int n) { return k < live ? vc[(size_t)k * LA_CONV_DIM + n] * bs[k] : 0.0f; });
+        mma_split_tile<C / 16>(ww, m0, n0, lane, t_at,
+                               [&](int k, int n) { return ks[k * LA_KS + n] * bs[k] * expf(gs[k]); });
+#pragma unroll
+        for (int e = 0; e < 4; e++) {
+            int i = m0 + g8 + (e >> 1) * 8;
+            int d = n0 + 2 * t4 + (e & 1);
+            size_t at = ((size_t)(t0 + i) * LA_VH + h) * LA_D + d;
+            u[at] = uu[e];
+            w[at] = ww[e];
         }
-        size_t at = ((size_t)(t0 + i) * LA_VH + h) * LA_D + d;
-        u[at] = uu;
-        w[at] = ww;
-    }
-    for (int e = tid; e < C * C; e += blockDim.x) {
-        int i = e / C;
-        int j = e % C;
-        int t = t0 + i;
-        float v = 0.0f;
-        if (j <= i && t < tokens) {
-            const float* q = qn + ((size_t)t * LA_KH + kh) * LA_D;
-            float dot = 0.0f;
-            for (int d = 0; d < LA_D; d++) dot += q[d] * ks[j * LA_KS + d];
-            v = dot * expf(gs[i] - gs[j]);
-        }
-        aqk[((size_t)(c * LA_VH + h) * C + i) * C + j] = v;
     }
     if (tid < C) gc[(size_t)(c * LA_VH + h) * C + tid] = gs[tid];
 }
+
 
 extern "C" __global__ void __launch_bounds__(256) gdn_chunk_scan(const float* qn, const float* kn, const float* w,
                                                                  const float* u, const float* aqk, const float* gc,
                                                                  float* state, float* o, int slot, int tokens) {
     constexpr int C = LA_CHUNK;
     constexpr int WARPS = 8;
-    __shared__ float S[LA_D][LA_COLS];
-    __shared__ float vn[C][LA_COLS];
+    constexpr int NT = LA_COLS / 8;
+    constexpr int CT = (C / 16) * NT;
+    constexpr int ST = (LA_D / 16) * NT;
+    static_assert(CT % WARPS == 0 && ST % WARPS == 0, "warp tiling");
+    __shared__ float S[LA_D][LA_COLS + 1];
+    __shared__ float vn[C][LA_COLS + 1];
     __shared__ float gsh[C];
+    __shared__ float eg[C];
     __shared__ float tail[C];
     int h = blockIdx.x;
     int kh = h / LA_RATIO;
     int c0 = blockIdx.y * LA_COLS;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
+    int g = lane >> 2;
+    int t4 = lane & 3;
     float* st = state + ((size_t)slot * LA_VH + h) * LA_STATE;
-    for (int k = warp; k < LA_D; k += WARPS) S[k][lane] = st[k * LA_D + c0 + lane];
+    for (int i = threadIdx.x; i < LA_D * LA_COLS; i += blockDim.x)
+        S[i / LA_COLS][i % LA_COLS] = st[(i / LA_COLS) * LA_D + c0 + i % LA_COLS];
     int chunks = (tokens + C - 1) / C;
+    auto s_at = [&](int k, int n) { return S[k][n]; };
+    auto vn_at = [&](int k, int n) { return vn[k][n]; };
     for (int c = 0; c < chunks; c++) {
+        int t0 = c * C;
         __syncthreads();
         if (threadIdx.x < C) gsh[threadIdx.x] = gc[(size_t)(c * LA_VH + h) * C + threadIdx.x];
         __syncthreads();
         float glast = gsh[C - 1];
-        if (threadIdx.x < C) tail[threadIdx.x] = expf(glast - gsh[threadIdx.x]);
-        for (int i = warp; i < C; i += WARPS) {
-            size_t row = ((size_t)(c * C + i) * LA_VH + h) * LA_D;
-            float acc = 0.0f;
-            for (int k = 0; k < LA_D; k++) acc += w[row + k] * S[k][lane];
-            vn[i][lane] = u[row + c0 + lane] - acc;
+        if (threadIdx.x < C) {
+            int i = threadIdx.x;
+            bool live = t0 + i < tokens;
+            tail[i] = live ? expf(glast - gsh[i]) : 0.0f;
+            eg[i] = live ? expf(gsh[i]) : 0.0f;
+        }
+        const float* wc = w + ((size_t)t0 * LA_VH + h) * LA_D;
+        const float* uc = u + ((size_t)t0 * LA_VH + h) * LA_D + c0;
+        for (int tile = warp; tile < CT; tile += WARPS) {
+            int m0 = (tile / NT) * 16;
+            int n0 = (tile % NT) * 8;
+            float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            mma_split_tile<LA_D / 16>(acc, m0, n0, lane,
+                                      [&](int m, int k) { return wc[(size_t)m * LA_VH * LA_D + k]; }, s_at);
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int m = m0 + g + (e >> 1) * 8;
+                int n = n0 + 2 * t4 + (e & 1);
+                vn[m][n] = uc[(size_t)m * LA_VH * LA_D + n] - acc[e];
+            }
         }
         __syncthreads();
-        for (int i = warp; i < C; i += WARPS) {
-            int t = c * C + i;
-            if (t >= tokens) break;
-            const float* q = qn + ((size_t)t * LA_KH + kh) * LA_D;
-            float eg = expf(gsh[i]);
-            float inter = 0.0f;
-            for (int k = 0; k < LA_D; k++) inter += (q[k] * eg) * S[k][lane];
-            const float* a = aqk + ((size_t)(c * LA_VH + h) * C + i) * C;
-            float intra = 0.0f;
-            for (int j = 0; j <= i; j++) intra += a[j] * vn[j][lane];
-            o[((size_t)t * LA_VH + h) * LA_D + c0 + lane] = inter + intra;
+        const float* qc = qn + ((size_t)t0 * LA_KH + kh) * LA_D;
+        const float* ac = aqk + (size_t)(c * LA_VH + h) * C * C;
+        for (int tile = warp; tile < CT; tile += WARPS) {
+            int m0 = (tile / NT) * 16;
+            int n0 = (tile % NT) * 8;
+            float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            mma_split_tile<LA_D / 16>(acc, m0, n0, lane,
+                                      [&](int m, int k) { return qc[(size_t)m * LA_KH * LA_D + k] * eg[m]; }, s_at);
+            mma_split_tile<C / 16>(acc, m0, n0, lane, [&](int m, int k) { return ac[m * C + k]; }, vn_at);
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                int m = m0 + g + (e >> 1) * 8;
+                int n = n0 + 2 * t4 + (e & 1);
+                if (t0 + m < tokens) o[((size_t)(t0 + m) * LA_VH + h) * LA_D + c0 + n] = acc[e];
+            }
         }
         __syncthreads();
         float decay = expf(glast);
-        for (int k = warp; k < LA_D; k += WARPS) {
-            float acc = S[k][lane] * decay;
-            for (int i = 0; i < C; i++) {
-                int t = c * C + i;
-                float kd = t < tokens ? kn[((size_t)t * LA_KH + kh) * LA_D + k] * tail[i] : 0.0f;
-                acc += kd * vn[i][lane];
-            }
-            S[k][lane] = acc;
+        const float* kc = kn + ((size_t)t0 * LA_KH + kh) * LA_D;
+        for (int tile = warp; tile < ST; tile += WARPS) {
+            int m0 = (tile / NT) * 16;
+            int n0 = (tile % NT) * 8;
+            float acc[4];
+#pragma unroll
+            for (int e = 0; e < 4; e++) acc[e] = S[m0 + g + (e >> 1) * 8][n0 + 2 * t4 + (e & 1)] * decay;
+            mma_split_tile<C / 16>(acc, m0, n0, lane,
+                                   [&](int m, int k) { return kc[(size_t)k * LA_KH * LA_D + m] * tail[k]; }, vn_at);
+#pragma unroll
+            for (int e = 0; e < 4; e++) S[m0 + g + (e >> 1) * 8][n0 + 2 * t4 + (e & 1)] = acc[e];
         }
     }
     __syncthreads();
-    for (int k = warp; k < LA_D; k += WARPS) st[k * LA_D + c0 + lane] = S[k][lane];
+    for (int i = threadIdx.x; i < LA_D * LA_COLS; i += blockDim.x)
+        st[(i / LA_COLS) * LA_D + c0 + i % LA_COLS] = S[i / LA_COLS][i % LA_COLS];
 }
 
 extern "C" __global__ void gdn_gated_norm(const float* o, const float* lin, const float* norm_w, bf16_t* hi, bf16_t* lo) {
