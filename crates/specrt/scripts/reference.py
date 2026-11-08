@@ -175,12 +175,17 @@ def main():
     config.sliding_window = None
     scaling = spec["rope"].get("scaling")
     if scaling:
-        config.rope_scaling = {
+        original = getattr(config, "rope_parameters", None) or {}
+        theta = original.get("rope_theta", getattr(config, "rope_theta", None))
+        params = {
+            "rope_theta": theta,
             "rope_type": scaling["kind"],
             "factor": scaling["factor"],
             **{k: v for k, v in scaling.items() if k not in ("kind", "factor", "original_max_positions")},
             **({"original_max_position_embeddings": int(scaling["original_max_positions"])} if "original_max_positions" in scaling else {}),
         }
+        config.rope_parameters = params
+        config.rope_scaling = params
     if spec["mlp"]["activation"] == "geglu":
         config.hidden_act = "gelu_pytorch_tanh"
     model = AutoModelForCausalLM.from_pretrained(spec["repo"], config=config, torch_dtype=torch.float32)
