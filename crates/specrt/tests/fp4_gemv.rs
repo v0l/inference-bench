@@ -85,9 +85,9 @@ fn big_spec() -> Spec {
     Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap()
 }
 
-fn compare(spec: &Spec, case: &Case) -> bool {
+fn compare(label: &str, spec: &Spec, case: &Case) -> bool {
     let Ok(ctx) = CudaContext::new(0) else { return false };
-    let dir = std::env::temp_dir().join(format!("specrt-fp4gemv-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("specrt-fp4gemv-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut module = Module::generate(spec, 256).unwrap();
     module.source.push_str(include_str!("fixtures/fp4_gemv_reference.cu"));
@@ -141,7 +141,7 @@ fn compare(spec: &Spec, case: &Case) -> bool {
 #[test]
 fn tuned_fp4_gemvs_equal_the_reference_kernels_bit_for_bit_on_the_tiny_fixture() {
     let spec = tiny_spec();
-    if !compare(&spec, &fixture_case(&spec)) {
+    if !compare("tiny", &spec, &fixture_case(&spec)) {
         eprintln!("no CUDA device, skipped");
     }
 }
@@ -150,7 +150,7 @@ fn tuned_fp4_gemvs_equal_the_reference_kernels_bit_for_bit_on_the_tiny_fixture()
 fn tuned_fp4_gemvs_equal_the_reference_kernels_bit_for_bit_on_a_random_5120_by_17408_matrix() {
     let spec = big_spec();
     assert_eq!((spec.dims.hidden, spec.dims.intermediate), (5120, 17408));
-    if !compare(&spec, &random_case(5120, 17408)) {
+    if !compare("random", &spec, &random_case(5120, 17408)) {
         eprintln!("no CUDA device, skipped");
     }
 }
