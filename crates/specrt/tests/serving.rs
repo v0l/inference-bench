@@ -1,4 +1,4 @@
-use specrt::runtime::{Layout, Runtime, Sampling};
+use specrt::runtime::{DecodeRow, Layout, Runtime, Sampling};
 use specrt::spec::Spec;
 use std::path::{Path, PathBuf};
 
@@ -63,6 +63,86 @@ fn tiny_shuffled_kv_blocks_match_the_contiguous_layout() {
 fn head_dim_256_shuffled_kv_blocks_match_the_contiguous_layout() {
     shuffled_blocks_match_contiguous("tiny-qwen3.5-hd256", 1);
     shuffled_blocks_match_contiguous("tiny-qwen3.5-hd256", 2);
+}
+
+fn single_greedy(s: &Spec, prompts: &[Vec<u32>], new: usize) -> Vec<Vec<u32>> {
+    let mut rt = Runtime::load(s, 512).unwrap();
+    prompts.iter().map(|p| rt.generate(p, new, Sampling::GREEDY).unwrap().tokens).collect()
+}
+
+fn stepped_greedy(s: &Spec, prompts: &[Vec<u32>], new: usize, chunk: usize) -> Vec<Vec<u32>> {
+    let slots = prompts.len() + 1;
+    let pages = 512usize.div_ceil(specrt::codegen::PAGE);
+    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 128, kv_planes: 1 };
+    let mut rt = Runtime::load_layout(s, layout).unwrap();
+    let pool = shuffled((slots * pages) as u32, 3);
+    let mut st = rt.stepper().unwrap();
+    let mut out: Vec<Vec<u32>> = vec![Vec::new(); prompts.len()];
+    for (i, p) in prompts.iter().enumerate() {
+        let slot = slots - 1 - i;
+        rt.set_block_table(slot, &pool[i * pages..(i + 1) * pages]).unwrap();
+        let mut start = 0;
+        while start < p.len() {
+            let end = (start + chunk).min(p.len());
+            let last = end == p.len();
+            let t = rt.prefill_slot(&mut st, slot, &p[start..end], start, last.then_some((Sampling::GREEDY, 0))).unwrap();
+            if let Some(t) = t {
+                out[i].push(t);
+            }
+            start = end;
+        }
+    }
+    for _ in 1..new {
+        let rows: Vec<DecodeRow> = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| DecodeRow {
+                slot: slots - 1 - i,
+                token: *out[i].last().unwrap(),
+                pos: p.len() + out[i].len() - 1,
+                sampling: Sampling::GREEDY,
+                step: out[i].len() as u32,
+            })
+            .collect();
+        for (i, t) in rt.decode(&mut st, &rows).unwrap().into_iter().enumerate() {
+            out[i].push(t);
+        }
+    }
+    out
+}
+
+fn mixed_prompts() -> Vec<Vec<u32>> {
+    [5usize, 40, 129, 300]
+        .iter()
+        .enumerate()
+        .map(|(q, &n)| (0..n as u32).map(|i| (i * 7 + q as u32 * 131 + 3) % 1024).collect())
+        .collect()
+}
+
+fn stepped_matches_single(dir: &str) {
+    let s = spec_for(dir);
+    let prompts = mixed_prompts();
+    let expected = single_greedy(&s, &prompts, 24);
+    assert_eq!(stepped_greedy(&s, &prompts, 24, 37), expected);
+    assert_eq!(stepped_greedy(&s, &prompts, 24, 128), expected);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn tiny_mixed_length_step_decode_matches_single_sequence_greedy() {
+    stepped_matches_single("tiny-qwen3.5");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn head_dim_256_mixed_length_step_decode_matches_single_sequence_greedy() {
+    stepped_matches_single("tiny-qwen3.5-hd256");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn fp8_mixed_length_step_decode_matches_single_sequence_greedy() {
+    stepped_matches_single("tiny-qwen3.5-fp8");
 }
 
 #[test]

@@ -1704,6 +1704,41 @@ extern "C" __global__ void argmax_rows(const float* logits, int* tokens, int* hi
     }
 }
 
+extern "C" __global__ void sample_rows(const float* logits, int* tokens, const int* params) {
+    __shared__ float best_v[1024];
+    __shared__ int best_i[1024];
+    logits += (size_t)blockIdx.x * VOCAB;
+    const int* p = params + 3 * blockIdx.x;
+    float inv_temp = __int_as_float(p[0]);
+    unsigned seed = (unsigned)p[1];
+    unsigned step = (unsigned)p[2];
+    float bv = NEG_INF;
+    int bi = 0;
+    for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
+        float v = logits[i];
+        if (inv_temp > 0.0f) v = v * inv_temp + gumbel(seed, step, (unsigned)i);
+        if (v > bv) {
+            bv = v;
+            bi = i;
+        }
+    }
+    best_v[threadIdx.x] = bv;
+    best_i[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            float ov = best_v[threadIdx.x + s];
+            int oi = best_i[threadIdx.x + s];
+            if (ov > best_v[threadIdx.x] || (ov == best_v[threadIdx.x] && oi < best_i[threadIdx.x])) {
+                best_v[threadIdx.x] = ov;
+                best_i[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) tokens[blockIdx.x] = best_i[0];
+}
+
 extern "C" __global__ void bump(int* pos, int* count) {
     pos[threadIdx.x] += 1;
     if (threadIdx.x == 0) count[0] += 1;

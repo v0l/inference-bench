@@ -12,6 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod step;
+pub use step::{DecodeRow, Stepper};
+
 enum DeviceMatrix {
     Bf16(CudaSlice<u16>),
     Q8 { values: CudaSlice<i8>, scales: CudaSlice<f32> },
@@ -1313,7 +1316,11 @@ impl Runtime {
     }
 
     fn reset_linear_state(&mut self) -> Result<()> {
-        let seq = self.seq as usize;
+        self.reset_slot(self.seq as usize)
+    }
+
+    pub fn reset_slot(&mut self, seq: usize) -> Result<()> {
+        ensure!(seq < self.slots, "slot {seq} out of {}", self.slots);
         let slots = self.spec.linear_layers();
         let Some(gb) = self.gdn.as_mut() else { return Ok(()) };
         let conv = slots * gb.la.conv_dim() * (gb.la.conv_kernel - 1);
