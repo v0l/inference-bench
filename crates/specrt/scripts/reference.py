@@ -13,9 +13,158 @@ PROMPT = (
     "cache keeps the attention state between decode steps, so"
 )
 GREEDY = 32
+TINY_SEED = 0
+TINY_PREFILL = 1024
+TINY_DECODE = 32
+TINY_PROMPT = 48
+TINY_GREEDY = 64
+
+
+def tiny_config():
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    return Qwen3_5TextConfig(
+        vocab_size=1024,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=3,
+        layer_types=["linear_attention", "linear_attention", "full_attention"],
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,
+        linear_num_key_heads=2,
+        linear_num_value_heads=6,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.25},
+        attn_output_gate=True,
+        tie_word_embeddings=False,
+        max_position_embeddings=4096,
+        eos_token_id=None,
+        bos_token_id=None,
+        pad_token_id=None,
+    )
+
+
+def tiny_weights(model):
+    g = torch.Generator().manual_seed(TINY_SEED)
+    out = {}
+    for name, p in sorted(model.state_dict().items()):
+        if name.endswith("A_log"):
+            v = torch.empty(p.shape).uniform_(-5.5, -1.0, generator=g)
+        elif name.endswith("dt_bias"):
+            v = 2.8 + 4.0 * torch.randn(p.shape, generator=g)
+        elif name.endswith("linear_attn.norm.weight"):
+            v = torch.empty(p.shape).uniform_(0.8, 1.0, generator=g)
+        elif p.dim() == 1:
+            v = 0.1 * torch.randn(p.shape, generator=g)
+        elif "conv1d" in name:
+            v = 0.3 * torch.randn(p.shape, generator=g)
+        elif "embed_tokens" in name:
+            v = torch.randn(p.shape, generator=g)
+        else:
+            v = torch.randn(p.shape, generator=g) / p.shape[1] ** 0.5
+        out[name] = v.to(torch.bfloat16).contiguous()
+    return out
+
+
+def tiny_model(fixture):
+    from safetensors.torch import load_file, save_file
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+    torch.manual_seed(TINY_SEED)
+    config = tiny_config()
+    model = Qwen3_5ForCausalLM(config).float().eval()
+    weights = fixture / "model.safetensors"
+    if not weights.exists():
+        fixture.mkdir(parents=True, exist_ok=True)
+        save_file(tiny_weights(model), weights)
+        config.to_json_file(fixture / "config.json")
+    state = {k: v.float() for k, v in load_file(weights).items()}
+    model.load_state_dict(state, strict=True)
+    return model
+
+
+def tiny_tokens(n, salt):
+    g = torch.Generator().manual_seed(TINY_SEED + salt)
+    return torch.randint(0, 1024, (n,), generator=g)
+
+
+def layer_outputs(model):
+    seen = []
+    hooks = [
+        layer.register_forward_hook(lambda _m, _i, out: seen.append(out[0] if isinstance(out, tuple) else out))
+        for layer in model.model.layers
+    ]
+    return seen, hooks
+
+
+def linear_states(cache, model):
+    conv, rec = [], []
+    for i, kind in enumerate(model.config.layer_types):
+        if kind == "linear_attention":
+            layer = cache.layers[i]
+            conv.append(layer.conv_states[0][0])
+            rec.append(layer.recurrent_states[0][0])
+    return torch.stack(conv), torch.stack(rec)
+
+
+def save(out_dir, name, arrays, meta):
+    for key, value in arrays.items():
+        value.detach().float().numpy().astype(np.float32).tofile(out_dir / f"{name}.{key}.bin")
+    (out_dir / f"{name}.json").write_text(json.dumps(meta))
+
+
+def tiny(fixture, out_dir):
+    from transformers import DynamicCache
+
+    torch.set_num_threads(4)
+    model = tiny_model(fixture)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    versions = {"torch": torch.__version__, "transformers": __import__("transformers").__version__}
+    with torch.inference_mode():
+        ids = tiny_tokens(TINY_PREFILL, 1)
+        seen, hooks = layer_outputs(model)
+        cache = DynamicCache(config=model.config)
+        logits = model(ids[None], past_key_values=cache, use_cache=True).logits[0]
+        for h in hooks:
+            h.remove()
+        conv, rec = linear_states(cache, model)
+        save(
+            out_dir,
+            "tiny-prefill",
+            {"layers": torch.stack([s[0] for s in seen]), "logits": logits, "conv": conv, "state": rec},
+            {"tokens": ids.tolist(), **versions},
+        )
+        ids = tiny_tokens(TINY_DECODE, 2)
+        seen, hooks = layer_outputs(model)
+        cache = DynamicCache(config=model.config)
+        steps = []
+        for t in ids:
+            steps.append(model(t.view(1, 1), past_key_values=cache, use_cache=True).logits[0, -1])
+        for h in hooks:
+            h.remove()
+        conv, rec = linear_states(cache, model)
+        per_step = torch.stack([s[0, -1] for s in seen]).view(TINY_DECODE, -1, model.config.hidden_size)
+        save(
+            out_dir,
+            "tiny-decode",
+            {"layers": per_step, "logits": torch.stack(steps), "conv": conv, "state": rec},
+            {"tokens": ids.tolist(), **versions},
+        )
+        ids = tiny_tokens(TINY_PROMPT, 3)
+        logits = model(ids[None]).logits[0]
+        greedy = model.generate(ids[None], max_new_tokens=TINY_GREEDY, do_sample=False)[0, TINY_PROMPT:]
+        save(out_dir, "tiny-greedy", {"logits": logits}, {"tokens": ids.tolist(), "greedy": greedy.tolist(), **versions})
+    print("tiny", fixture, "->", out_dir)
 
 
 def main():
+    if sys.argv[1] == "tiny":
+        tiny(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
     spec_path = Path(sys.argv[1])
     out_dir = Path(sys.argv[2])
     spec = tomllib.loads(spec_path.read_text())
