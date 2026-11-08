@@ -3,7 +3,9 @@ use specrt::runtime::{Generation, Runtime, Sampling};
 use specrt::spec::Spec;
 use std::path::{Path, PathBuf};
 
-const RUNS: usize = 6;
+fn runs() -> usize {
+    std::env::var("SPECRT_BENCH_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(6)
+}
 
 fn load_spec(path: &Path) -> Result<Spec> {
     if path.is_dir() {
@@ -55,13 +57,17 @@ fn main() -> Result<()> {
         let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 1000 + i * 7 % 5000).collect();
         rt.generate(&prompt, 8.min(new_tokens), Sampling::GREEDY)?;
         let runs: Vec<Generation> =
-            (0..RUNS).map(|_| rt.generate(&prompt, new_tokens, Sampling::GREEDY)).collect::<Result<_>>()?;
+            (0..runs()).map(|_| rt.generate(&prompt, new_tokens, Sampling::GREEDY)).collect::<Result<_>>()?;
         let prefill = median(runs.iter().map(|g| prompt_len as f64 / g.prefill_secs).collect());
         let decode = median(runs.iter().map(|g| (new_tokens - 1) as f64 / g.decode_secs).collect());
         let peak = runs.iter().map(|g| g.peak_device_bytes).max().unwrap_or(0);
+        let all = |f: &dyn Fn(&Generation) -> f64| runs.iter().map(|g| format!("{:.1}", f(g))).collect::<Vec<_>>().join(",");
         println!(
-            "  prompt={prompt_len} prefill={prefill:.1} tok/s decode={new_tokens} tokens {decode:.1} tok/s peak_device={:.2} GB (median of {RUNS})",
-            peak as f64 / 1e9
+            "  prompt={prompt_len} prefill={prefill:.1} tok/s decode={new_tokens} tokens {decode:.1} tok/s peak_device={:.2} GB (median of {}) prefill_runs=[{}] decode_runs=[{}]",
+            peak as f64 / 1e9,
+            runs.len(),
+            all(&|g| prompt_len as f64 / g.prefill_secs),
+            all(&|g| (new_tokens - 1) as f64 / g.decode_secs),
         );
     }
     Ok(())
@@ -73,7 +79,7 @@ fn bench_batch(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize) 
         .map(|s| (0..prompt_len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect())
         .collect();
     rt.generate_batch(&prompts, 8.min(new_tokens))?;
-    let rates: Vec<f64> = (0..RUNS)
+    let rates: Vec<f64> = (0..runs())
         .map(|_| {
             rt.generate_batch(&prompts, new_tokens)
                 .map(|g| (batch * (new_tokens - 1)) as f64 / g.decode_secs)
@@ -81,13 +87,14 @@ fn bench_batch(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize) 
         .collect::<Result<_>>()?;
     let rate = median(rates);
     println!(
-        "{} batch={} prompt={} new={} decode={:.1} tok/s aggregate, {:.1} per sequence (median of {RUNS})",
+        "{} batch={} prompt={} new={} decode={:.1} tok/s aggregate, {:.1} per sequence (median of {})",
         spec.name,
         batch,
         prompt_len,
         new_tokens,
         rate,
-        rate / batch as f64
+        rate / batch as f64,
+        runs()
     );
     Ok(())
 }

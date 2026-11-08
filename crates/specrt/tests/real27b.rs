@@ -23,6 +23,8 @@ fn argmax(row: &[f32]) -> usize {
     (0..row.len()).fold(0, |best, i| if row[i] > row[best] { i } else { best })
 }
 
+const NEAR_TIE: f32 = 0.25;
+
 fn full_spec() -> Spec {
     Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml")).unwrap()
 }
@@ -36,16 +38,21 @@ fn write_floats(name: &str, v: &[f32]) {
     std::fs::write(out_dir().join(name), bytes).unwrap();
 }
 
+fn mode() -> &'static str {
+    if std::env::var_os("SPECRT_FP8_ACT").is_some() { "act" } else { "weight" }
+}
+
 #[test]
-#[ignore = "needs the whole GPU (about 31 GB) with local-llm stopped, and scripts/reference.py real-prompts output"]
+#[ignore = "needs about 31 GB of free GPU memory and scripts/reference.py real-prompts output"]
 fn real_27b_generates_greedy_and_dumps_logits() {
     let spec = full_spec();
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out_dir().join("real27b-prompts.json")).unwrap()).unwrap();
     let new = meta["new_tokens"].as_u64().unwrap() as usize;
-    let mut rt = Runtime::load(&spec, 256).unwrap();
+    let mut rt = Runtime::load(&spec, 8192).unwrap();
     eprintln!(
-        "loaded: weights {:.2} GB in {:.1} s, device {:.2} GB, total load {:.1} s, peak host RSS {:.2} GB",
+        "loaded ({}): weights {:.2} GB in {:.1} s, device {:.2} GB, total load {:.1} s, peak host RSS {:.2} GB",
+        mode(),
         rt.weight_bytes as f64 / 1e9,
         rt.weight_secs,
         rt.device_bytes as f64 / 1e9,
@@ -60,10 +67,16 @@ fn real_27b_generates_greedy_and_dumps_logits() {
         assert_eq!(g.tokens.len(), new);
         let mut seq = prompt.clone();
         seq.extend(&g.tokens);
-        logits.extend(rt.prompt_logits(&seq).unwrap());
         sequences.push(seq);
     }
-    write_floats("real27b-specrt.logits.bin", &logits);
+    let forced = std::fs::read_to_string(out_dir().join("real27b-specrt-weight.json"))
+        .ok()
+        .map(|t| serde_json::from_str::<serde_json::Value>(&t).unwrap())
+        .map(|v| v["sequences"].as_array().unwrap().iter().map(ids).collect::<Vec<_>>());
+    for seq in forced.as_ref().filter(|_| mode() == "act").unwrap_or(&sequences) {
+        logits.extend(rt.prompt_logits(seq).unwrap());
+    }
+    write_floats(&format!("real27b-specrt-{}.logits.bin", mode()), &logits);
     let out = serde_json::json!({
         "sequences": sequences,
         "prompt_len": ids(&meta["prompts"][0]).len(),
@@ -73,36 +86,65 @@ fn real_27b_generates_greedy_and_dumps_logits() {
         "device_bytes": rt.device_bytes,
         "peak_host_rss_bytes": rt.peak_host_rss_bytes,
     });
-    std::fs::write(out_dir().join("real27b-specrt.json"), out.to_string()).unwrap();
+    std::fs::write(out_dir().join(format!("real27b-specrt-{}.json", mode())), out.to_string()).unwrap();
 }
 
 #[test]
 #[ignore = "needs real27b_generates_greedy_and_dumps_logits and scripts/reference.py real-full output (both act and weight-only)"]
 fn real_27b_greedy_and_logits_match_the_fp8_reference() {
     let vocab = full_spec().dims.vocab;
-    let ours_meta: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(out_dir().join("real27b-specrt.json")).unwrap()).unwrap();
-    let prompt_len = ours_meta["prompt_len"].as_u64().unwrap() as usize;
-    let seqs: Vec<Vec<u32>> = ours_meta["sequences"].as_array().unwrap().iter().map(ids).collect();
-    let ours = floats("real27b-specrt.logits.bin");
+    let read = |name: &str| -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(out_dir().join(name)).unwrap()).unwrap()
+    };
+    let weight_meta = read("real27b-specrt-weight.json");
+    let prompt_len = weight_meta["prompt_len"].as_u64().unwrap() as usize;
+    let forced: Vec<Vec<u32>> = weight_meta["sequences"].as_array().unwrap().iter().map(ids).collect();
     let weight_only = floats("real27b-ref.logits.bin");
-    let act = floats("real27b-ref-act.logits.bin");
-    let envelope = relative(&act, &weight_only);
-    let error = relative(&ours, &weight_only);
-    let len = seqs[0].len();
-    let mut first_miss = Vec::new();
-    for (s, seq) in seqs.iter().enumerate() {
-        let miss = (prompt_len..len).find(|&p| {
-            let at = (s * len + p - 1) * vocab;
-            argmax(&weight_only[at..at + vocab]) != seq[p] as usize
-        });
-        first_miss.push(miss);
+    let act_ref = floats("real27b-ref-act.logits.bin");
+    let envelope = relative(&act_ref, &weight_only);
+    let len = forced[0].len();
+    let first_miss = |seqs: &[Vec<u32>], reference: &[f32]| -> Vec<Result<usize, (usize, f32)>> {
+        seqs.iter()
+            .zip(&forced)
+            .enumerate()
+            .map(|(s, (seq, f))| {
+                for p in prompt_len..len {
+                    let at = (s * len + p - 1) * vocab;
+                    let row = &reference[at..at + vocab];
+                    let best = argmax(row);
+                    if best != seq[p] as usize {
+                        return Err((p - prompt_len, row[best] - row[seq[p] as usize]));
+                    }
+                    if seq[p] != f[p] {
+                        return Ok(p + 1 - prompt_len);
+                    }
+                }
+                Ok(len - prompt_len)
+            })
+            .collect()
+    };
+    let mut checked = 0;
+    for (mode, reference) in [("weight", &weight_only), ("act", &act_ref)] {
+        let Ok(text) = std::fs::read_to_string(out_dir().join(format!("real27b-specrt-{mode}.json"))) else { continue };
+        let meta: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let seqs: Vec<Vec<u32>> = meta["sequences"].as_array().unwrap().iter().map(ids).collect();
+        let ours = floats(&format!("real27b-specrt-{mode}.logits.bin"));
+        let error = relative(&ours, reference);
+        let to_weight_only = relative(&ours, &weight_only);
+        let misses = first_miss(&seqs, reference);
+        eprintln!(
+            "{mode}: logits max error / max |logit| vs its reference {error}, vs weight-only {to_weight_only}; envelope {envelope}; greedy per prompt: Ok(n) = n tokens agree, Err((step, reference margin)) = first disagreement {misses:?}"
+        );
+        assert!(error <= envelope, "{mode}: {error} outside the {envelope} envelope");
+        assert!(to_weight_only <= 1.5 * envelope, "{mode}: {to_weight_only} from the weight-only reference");
+        if mode == "weight" {
+            assert!(misses.iter().all(|m| *m == Ok(len - prompt_len)), "{misses:?}");
+        } else {
+            assert!(misses.iter().all(|m| m.as_ref().err().is_none_or(|e| e.1 <= NEAR_TIE)), "{misses:?}");
+        }
+        checked += 1;
     }
-    eprintln!(
-        "logits max error / max |logit|: specrt {error}, envelope (act-quantised vs weight-only reference) {envelope}; first greedy mismatch per prompt {first_miss:?}"
-    );
-    assert!(error <= envelope, "{error} outside the {envelope} envelope");
-    assert!(first_miss.iter().all(Option::is_none), "{first_miss:?}");
+    assert!(checked > 0, "no specrt dumps");
 }
 
 #[test]

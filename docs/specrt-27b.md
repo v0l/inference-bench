@@ -48,6 +48,8 @@ Issue #320. The checkpoint is `Qwen/Qwen3.8-27B-FP8` from the HF cache (68 shard
 A mutation check: doubling the e4m3 exponent bias in the kernel fails all three FP8 reference
 tests.
 
+The whole-model results are under "Real-model run" below.
+
 The full-model oracle is `reference.py real-full`. It runs the whole 27B on the CPU one layer at a
 time from the FP8 shards, dequantised to f32, for all five prompts at once. It takes 108 s on 24
 threads. Peak anonymous RSS is 3.7 GB; VmHWM shows 33 GB, but that is page cache from the shard
@@ -86,10 +88,10 @@ From the checkpoint headers and the allocation code in `runtime.rs`:
 | 32,768 | 4.29 GB | 2.15 GB | 1.07 GB | about 35.5 GB |
 | 131,072 | 17.18 GB | 8.59 GB | 4.29 GB | about 48.4 GB |
 
-Beside the live vLLM (which holds about 58 GB of the card today, `nvidia-smi`), about 38 GB are
-free: enough for the 30 GB of weights at 8k context, but not with headroom. The full-model runs
-below therefore need `local-llm.service` stopped. Everything above was checked on the 4-layer
-real slice (3.0 GB on the device) while vLLM was running.
+Beside the live vLLM (58.2 GB used after its KV was trimmed to 14 GB) 38.9 GB are free. That is
+enough for the 30.2 GB of weights plus 8k of context, and that is how the real-model run below
+was done, with max context capped at 8,192. Longer contexts beside vLLM would need fp8 KV
+(#334 also frees 0.76 GB).
 
 ## Prefill GEMM: dequant-to-bf16 against native FP8 mma
 
@@ -116,18 +118,107 @@ under the same load (the card sits at its 300 W limit with vLLM running).
 
 ## Real-model run
 
-Needs `local-llm.service` stopped (see the memory budget). Commands, in order:
+Run on 8 Nov 2026 next to the live vLLM (`local-llm.service` serving agents, about 100% busy,
+KV trimmed to 14 GB so 38.9 GB of the card was free). Max context was capped at 8,192 for
+every specrt run. The service was not touched; its journal logged no errors during the runs,
+and free memory went back to 38,953 MiB after each process exited.
+
+### Load
+
+| | |
+|---|---|
+| weights on the device | 30.24 GB, uploaded in 5.6 s from the page cache |
+| device memory, 8k context | 31.7 GB (`bench`), 32.0 GB in the greedy test |
+| whole load (JIT cache warm) | 5.8 s; 11.6 s on the first run |
+| peak host RSS | 5.3 to 5.5 GB |
+
+The peak host RSS is VmHWM, so it includes the mapped shard pages of the layer being uploaded
+and the 2.5 GB `lm_head`, which the fused bf16 head copies once. Nothing close to the 25 GB
+limit.
+
+### Correctness, whole model
+
+`tests/real27b.rs`, 5 prompts of 64 tokens (prose, Python, science, a letter, a word problem),
+32 greedy tokens each, then the logits of all 96 positions against the CPU oracle:
+
+| path | logits max error / max abs logit vs its own reference | vs weight-only reference | greedy, 32 tokens x 5 |
+|---|---|---|---|
+| default (dequant to bf16 tiles, fp32 activations) | 2.0e-4 | 2.0e-4 | identical on all 5 |
+| `SPECRT_FP8_ACT=1` (native e4m3 mma, dynamic per-token activations) | 0.087 against the activation-quantised reference | 0.32 | 3 of 5 identical; the other two flip at a near tie (0.10 and 0.17 logit margin in the reference) |
+
+The envelope is the gap between the activation-quantised and weight-only references: 0.33 of
+the largest logit. Both paths are inside it. The default path is 1600 times inside it and is the
+one that meets "greedy identical for 32 tokens on 5 prompts". The native path's own error
+against a reference that quantises activations the same way is 0.087. Its greedy test passes
+only where the reference itself is within 0.25 logits of a tie (`NEAR_TIE`). The 0.087 is not
+explained further here: on the tiny fixture the same kernel lands inside the envelope too, and a
+per-layer trace of prompt 0 (`real27b-ref-act.layers.bin`) is there to dig into it.
+
+Sample continuations (default path): "...the cost of a book fell" continues " the cost of paper
+fell, the number of books printed in Europe rose from a few million..."; the Python prompt
+continues with the correct `out.append(b[j])` and `out.extend(a[i:])`; the word problem
+continues "...The first train has a head start of 1.5".
+
+### Speed: shared GPU, vLLM serving, indicative only
+
+`scripts/bench27b.sh`: 3 rounds alternating the two paths, 2 runs per round, so 6 runs per
+mode, single stream, 128 new tokens. All of these tok/s figures are from a shared GPU with vLLM
+serving and are indicative only. The clean comparison is #307's window.
+
+| prompt | prefill, default | prefill, native FP8 | decode, default | decode, native FP8 |
+|---|---|---|---|---|
+| 128 | 553 tok/s (489 to 584) | 1,062 (1,014 to 1,112) | 21.6 (20.6 to 24.4) | 23.8 (22.5 to 24.7) |
+| 1,024 | 611 (542 to 652) | 1,308 (1,105 to 1,333) | 23.4 (20.4 to 24.2) | 22.1 (20.3 to 23.7) |
+| 4,096 | 558 (527 to 615) | 1,081 (1,069 to 1,269) | 22.3 (19.8 to 22.9) | 21.4 (19.8 to 23.1) |
+
+Kernel times per call from `nsys` (1,024-token prompt, 64 new tokens). These per-call times are
+more robust than wall clock under sharing:
+
+| kernel | default | native FP8 | rate |
+|---|---|---|---|
+| `gate_up` prefill GEMM, 1024 x 34816 x 5120 | 11.0 ms | 5.0 ms | 33 vs 72 TFLOP/s |
+| `down` prefill GEMM, 1024 x 5120 x 17408 | 5.2 ms | 2.0 ms | 35 vs 90 TFLOP/s |
+| `lin_in` prefill GEMM, 1024 x 16384 x 5120 | 4.3 ms | 1.5 ms | 40 vs 111 TFLOP/s |
+| `gate_up_act` decode GEMV (178 MB FP8) | 265 us | same | 672 GB/s |
+| `down_proj` decode GEMV (89 MB) | 126 us | same | 709 GB/s |
+| `lin_in_norm` decode GEMV (84 MB) | 145 us | same | 581 GB/s |
+| `lm_head_norm` decode GEMV (2.5 GB bf16) | 3.4 ms | same | 744 GB/s |
+
+Decode reads 26.9 GB per token. At the 825 GB/s this card reaches for a plain read under the
+same load, the ceiling is 30.6 tok/s. specrt runs at 21 to 24 tok/s, about 75% of it. The bf16
+`lm_head` is 2.5 GB of the 26.9 GB, about 10% of decode time.
+
+### Against vLLM
+
+vLLM serves the NVFP4 build of this model (MLPs in 4-bit, so about 17 GB of weights read per
+token, against specrt's 27 GB) with MTP speculative decoding at 2.8 tokens per step. Its
+single-stream median is 162.5 tok/s (`docs/qwen3.8-27b-vllm-baseline.md`). specrt's 22 tok/s
+under sharing is about 7x lower. The gap has three parts, roughly multiplicative:
+
+- MTP: about 2.8x, the measured acceptance length. specrt has no MTP yet.
+- Bytes per token: NVFP4 MLPs read about 1.6x fewer bytes than FP8. The NVFP4 issue covers it.
+- Sharing: these numbers ran beside vLLM at 100% load and the 300 W cap, so the clean number
+  will be higher. #307 measures it.
+
+Without MTP the same vLLM deployment would be about 162.5 / 2.8 = 58 tok/s; with NVFP4's
+byte count, specrt's 75%-of-bandwidth decode would land at about 35 to 40 tok/s on a free GPU.
+This is an estimate, not a measurement.
+
+Prefill: vLLM's logged median is 1,782 tok/s on mixed short prompts. specrt's native FP8 path
+reaches 1,062 to 1,308 tok/s here under sharing, and the default path about half of that.
+
+### Commands
 
 ```
 cd crates/specrt
 python scripts/reference.py real-prompts Qwen/Qwen3.8-27B-FP8 out
 cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored --nocapture
-python scripts/reference.py real-full Qwen/Qwen3.8-27B-FP8 out out/real27b-specrt.json
-python scripts/reference.py real-full Qwen/Qwen3.8-27B-FP8 out out/real27b-specrt.json act
+SPECRT_FP8_ACT=1 cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored --nocapture
+python scripts/reference.py real-full Qwen/Qwen3.8-27B-FP8 out out/real27b-specrt-weight.json
+python scripts/reference.py real-full Qwen/Qwen3.8-27B-FP8 out out/real27b-specrt-weight.json act
 cargo test --release --test real27b real_27b_greedy_and_logits_match -- --ignored --nocapture
-bench tests/fixtures/qwen3.8-27b.toml 128,1024,4096 128
-SPECRT_FP8_ACT=1 bench tests/fixtures/qwen3.8-27b.toml 128,1024,4096 128
+./scripts/bench27b.sh
 ```
 
-Only the first GPU test and the two `bench` runs need the GPU. The CPU reference can run with vLLM
-up. Results: pending the GPU window.
+The GPU steps need about 32 GB free (the bench script stops below 36 GB, and if vLLM logs an
+error). The CPU references take about 95 s each on 24 threads, with 3.7 GB of anonymous RSS.
