@@ -143,13 +143,17 @@ __device__ void linear_q8(const void* w, const float* scales, const float* bias,
     }
 }
 
+__device__ __forceinline__ const float* fp8_row_scales(const float* scales, int row) {
+    return scales + __float_as_uint(__ldg(scales + row));
+}
+
 template <int WF, int K>
 __device__ __forceinline__ float row_dot(const void* w, const float* scales, int row, const float* x, int lane) {
     float acc = 0.0f;
     if constexpr (WF == WF_FP8) {
         static_assert(K % 16 == 0, "fp8 rows load 16 bytes per lane");
         const unsigned char* wr = (const unsigned char*)w + (size_t)row * K;
-        const float* sr = scales + (size_t)row * (K / FP8_BLOCK);
+        const float* sr = fp8_row_scales(scales, row);
 #pragma unroll 2
         for (int k = lane * 16; k < K; k += 512) {
             uint4 packed = load_stream(wr + k);
@@ -282,7 +286,7 @@ __device__ void gemm(const void* w, const float* scales, const float* bias, cons
                          scales[(size_t)n * (K / Q8_GROUP) + (k0 + kk) / Q8_GROUP];
                 } else if (WF == WF_FP8) {
                     wv = e4m3_to_f32(((const unsigned char*)w)[(size_t)n * K + k0 + kk]) *
-                         scales[(size_t)n * (K / FP8_BLOCK) + (k0 + kk) / FP8_BLOCK];
+                         fp8_row_scales(scales, n)[(k0 + kk) / FP8_BLOCK];
                 } else {
                     wv = bf16_to_f32(((const bf16_t*)w)[(size_t)n * K + k0 + kk]);
                 }
@@ -506,8 +510,13 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
             if (BYTES) {
                 int col = n0 + wn * TN + j * 8 + 2 * t;
                 int group = kt * BK / GROUP_K;
-                s0[j] = scales[(size_t)min(col, N - 1) * (K / GROUP_K) + group];
-                s1[j] = scales[(size_t)min(col + 1, N - 1) * (K / GROUP_K) + group];
+                if (WF == WF_FP8) {
+                    s0[j] = fp8_row_scales(scales, min(col, N - 1))[group];
+                    s1[j] = fp8_row_scales(scales, min(col + 1, N - 1))[group];
+                } else {
+                    s0[j] = scales[(size_t)min(col, N - 1) * (K / GROUP_K) + group];
+                    s1[j] = scales[(size_t)min(col + 1, N - 1) * (K / GROUP_K) + group];
+                }
             }
         }
 #pragma unroll
@@ -757,8 +766,8 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
 #pragma unroll
         for (int j = 0; j < NJ; j++) {
             int col = n0 + wn * TN + j * 8 + 2 * t;
-            sw0[j] = wscale[(size_t)min(col, N - 1) * KT + kt];
-            sw1[j] = wscale[(size_t)min(col + 1, N - 1) * KT + kt];
+            sw0[j] = fp8_row_scales(wscale, min(col, N - 1))[kt];
+            sw1[j] = fp8_row_scales(wscale, min(col + 1, N - 1))[kt];
         }
 #pragma unroll
         for (int i = 0; i < MI; i++)

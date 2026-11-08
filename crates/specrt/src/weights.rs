@@ -207,9 +207,9 @@ impl Checkpoint {
         }
         ensure!(v.shape == [rows, cols], "{weight} has shape {:?}, expected {:?}", v.shape, [rows, cols]);
         let kb = cols.div_ceil(FP8_BLOCK);
-        let blocks = self.floats(&format!("{weight}_scale_inv"), &[rows.div_ceil(FP8_BLOCK), kb])?;
-        let scales = (0..rows).flat_map(|r| blocks[r / FP8_BLOCK * kb..(r / FP8_BLOCK + 1) * kb].to_vec()).collect();
-        Ok(Raw::Fp8 { w: Cow::Borrowed(v.data), scales, cols })
+        let grid = self.floats(&format!("{weight}_scale_inv"), &[rows.div_ceil(FP8_BLOCK), kb])?;
+        let map = (0..rows).map(|r| (r / FP8_BLOCK * kb) as u32).collect();
+        Ok(Raw::Fp8 { w: Cow::Borrowed(v.data), grid, map, cols })
     }
 }
 
@@ -222,7 +222,12 @@ pub fn peak_rss_bytes() -> Option<u64> {
 
 enum Raw<'a> {
     Bf16 { w: Cow<'a, [u16]>, cols: usize },
-    Fp8 { w: Cow<'a, [u8]>, scales: Vec<f32>, cols: usize },
+    Fp8 { w: Cow<'a, [u8]>, grid: Vec<f32>, map: Vec<u32>, cols: usize },
+}
+
+pub fn fp8_scales(grid: &[f32], map: &[u32]) -> Vec<f32> {
+    let rows = map.len() as u32;
+    map.iter().map(|&m| f32::from_bits(rows + m)).chain(grid.iter().copied()).collect()
 }
 
 impl<'a> Raw<'a> {
@@ -242,11 +247,15 @@ impl<'a> Raw<'a> {
     fn slice_rows(&self, from: usize, to: usize) -> Raw<'a> {
         match self {
             Raw::Bf16 { w, cols } => Raw::Bf16 { w: Cow::Owned(w[from * cols..to * cols].to_vec()), cols: *cols },
-            Raw::Fp8 { w, scales, cols } => {
-                let kb = cols.div_ceil(FP8_BLOCK);
+            Raw::Fp8 { w, grid, map, cols } => {
+                let kb = cols.div_ceil(FP8_BLOCK) as u32;
+                let map = &map[from..to];
+                let lo = map.iter().min().map_or(0, |m| m / kb * kb);
+                let hi = map.iter().max().map_or(0, |m| m / kb * kb + kb);
                 Raw::Fp8 {
                     w: Cow::Owned(w[from * cols..to * cols].to_vec()),
-                    scales: scales[from * kb..to * kb].to_vec(),
+                    grid: grid[lo as usize..hi as usize].to_vec(),
+                    map: map.iter().map(|m| m - lo).collect(),
                     cols: *cols,
                 }
             }
@@ -260,9 +269,11 @@ impl<'a> Raw<'a> {
             ensure!(p.cols() == out.cols(), "fused rows have different widths");
             match (&mut out, p) {
                 (Raw::Bf16 { w, .. }, Raw::Bf16 { w: more, .. }) => w.to_mut().extend_from_slice(&more),
-                (Raw::Fp8 { w, scales, .. }, Raw::Fp8 { w: more, scales: s, .. }) => {
+                (Raw::Fp8 { w, grid, map, .. }, Raw::Fp8 { w: more, grid: g, map: m, .. }) => {
                     w.to_mut().extend_from_slice(&more);
-                    scales.extend(s);
+                    let base = grid.len() as u32;
+                    map.extend(m.iter().map(|r| r + base));
+                    grid.extend(g);
                 }
                 _ => bail!("fused projections mix FP8 and bf16"),
             }
@@ -276,11 +287,13 @@ impl<'a> Raw<'a> {
             (Raw::Bf16 { w: a, cols }, Raw::Bf16 { w: b, .. }) => {
                 Raw::Bf16 { w: Cow::Owned(interleave_rows(&a, &b, cols)), cols }
             }
-            (Raw::Fp8 { w: a, scales: sa, cols }, Raw::Fp8 { w: b, scales: sb, .. }) => {
-                let kb = cols.div_ceil(FP8_BLOCK);
+            (Raw::Fp8 { w: a, grid: ga, map: ma, cols }, Raw::Fp8 { w: b, grid: gb, map: mb, .. }) => {
+                let base = ga.len() as u32;
+                let mb: Vec<u32> = mb.iter().map(|r| r + base).collect();
                 Raw::Fp8 {
                     w: Cow::Owned(interleave_rows(&a, &b, cols)),
-                    scales: interleave_rows(&sa, &sb, kb),
+                    grid: [ga, gb].concat(),
+                    map: interleave_rows(&ma, &mb, 1),
                     cols,
                 }
             }
@@ -295,7 +308,9 @@ impl<'a> Raw<'a> {
                 let (values, scales) = quantize_q8(&w, cols);
                 Matrix::Q8 { values, scales }
             }
-            (Raw::Fp8 { w, scales, .. }, Quant::Fp8Block128) => Matrix::Fp8 { values: w, scales },
+            (Raw::Fp8 { w, grid, map, .. }, Quant::Fp8Block128) => {
+                Matrix::Fp8 { values: w, scales: fp8_scales(&grid, &map) }
+            }
             (Raw::Bf16 { .. }, Quant::Fp8Block128) => bail!("{what} is not FP8 but the spec says fp8_block128"),
             (Raw::Fp8 { .. }, _) => bail!("{what} is FP8; use quant = \"fp8_block128\""),
         })
@@ -491,6 +506,40 @@ mod tests {
         assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
         assert_eq!(f32_to_bf16(1.0), 0x3f80);
         assert_eq!(bf16_to_f32(f32_to_bf16(f16_to_f32(0x3555))), 0.333_984_38);
+    }
+
+    #[test]
+    fn fp8_scale_map_follows_rows_through_split_concat_and_interleave() {
+        let (rows, cols, kb) = (384usize, 256usize, 2usize);
+        let source = |tag: f32| {
+            let grid: Vec<f32> = (0..rows / FP8_BLOCK * kb).map(|i| tag + i as f32).collect();
+            let map = (0..rows).map(|r| (r / FP8_BLOCK * kb) as u32).collect();
+            Raw::Fp8 { w: Cow::Owned(vec![0; rows * cols]), grid, map, cols }
+        };
+        let expect = |tag: f32, r: usize, b: usize| tag + (r / FP8_BLOCK * kb + b) as f32;
+        let lookup = |raw: &Raw, r: usize, b: usize| {
+            let Raw::Fp8 { grid, map, .. } = raw else { unreachable!() };
+            let scales = fp8_scales(grid, map);
+            scales[scales[r].to_bits() as usize + b]
+        };
+        let a = source(1000.0);
+        let fused = Raw::concat(vec![a.slice_rows(200, 300), source(2000.0), a.slice_rows(10, 140)]).unwrap();
+        assert_eq!(fused.rows(), 100 + rows + 130);
+        let Raw::Fp8 { grid, .. } = &fused else { unreachable!() };
+        assert_eq!(grid.len(), 2 * kb + rows / FP8_BLOCK * kb + 2 * kb);
+        for b in 0..kb {
+            assert_eq!(lookup(&fused, 0, b), expect(1000.0, 200, b));
+            assert_eq!(lookup(&fused, 99, b), expect(1000.0, 299, b));
+            assert_eq!(lookup(&fused, 100 + 130, b), expect(2000.0, 130, b));
+            assert_eq!(lookup(&fused, 100 + rows + 120, b), expect(1000.0, 130, b));
+        }
+        let both = Raw::interleave(source(1000.0), source(2000.0)).unwrap();
+        for r in [0, 127, 128, 383] {
+            for b in 0..kb {
+                assert_eq!(lookup(&both, 2 * r, b), expect(1000.0, r, b));
+                assert_eq!(lookup(&both, 2 * r + 1, b), expect(2000.0, r, b));
+            }
+        }
     }
 
     #[test]
