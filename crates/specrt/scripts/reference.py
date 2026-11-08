@@ -325,7 +325,7 @@ def dequantize_compressed(raw):
             m = name[: -len(".weight_packed")]
             state[m + ".weight"] = dequantize_nvfp4(w, raw[m + ".weight_scale"], raw[m + ".weight_global_scale"])
             input_scales[m] = raw[m + ".input_global_scale"]
-        elif name.endswith((".weight_scale", "_global_scale")):
+        elif name.endswith((".weight_scale", "_global_scale", ".k_scale", ".v_scale")):
             continue
         elif w.dtype == torch.float8_e4m3fn:
             state[name] = w.float() * raw[name[: -len(".weight")] + ".weight_scale"].float()
@@ -486,7 +486,13 @@ def real_slice(repo, dst, layers, vocab):
     text["layer_types"] = text["layer_types"][:layers]
     text["vocab_size"] = vocab
     q = config["quantization_config"]
-    config["quantization_config"] = {k: q[k] for k in ("activation_scheme", "fmt", "quant_method", "weight_block_size")}
+    if q.get("quant_method") == "compressed-tensors":
+        prefix = "model.language_model.layers."
+        for g in q["config_groups"].values():
+            g["targets"] = [t for t in g["targets"] if t.startswith(prefix) and int(t[len(prefix):].split(".")[0]) < layers]
+        config["quantization_config"] = {k: q[k] for k in ("quant_method", "format", "config_groups")}
+    else:
+        config["quantization_config"] = {k: q[k] for k in ("activation_scheme", "fmt", "quant_method", "weight_block_size")}
     (dst / "config.json").write_text(json.dumps(config, indent=2))
     for f in ("tokenizer.json", "tokenizer_config.json"):
         (dst / f).write_bytes((src / f).read_bytes())
@@ -504,7 +510,18 @@ def real_slice_reference(repo, fixture, out_dir, layers, vocab):
     config = Qwen3_5TextConfig(**{k: v for k, v in text.items() if k != "model_type"})
     with torch.device("meta"):
         model = Qwen3_5ForCausalLM(config)
-    state = {k.replace("model.language_model.", "model."): v for k, v in dequantized_state(fixture).items()}
+    compressed = json.loads((fixture / "config.json").read_text())["quantization_config"]["quant_method"] == "compressed-tensors"
+    if compressed:
+        from safetensors.torch import load_file
+
+        index = json.loads((fixture / "model.safetensors.index.json").read_text())
+        raw = {}
+        for shard in sorted(set(index["weight_map"].values())):
+            raw.update(load_file(fixture / shard))
+        dequantised = dequantize_compressed(raw)[0]
+    else:
+        dequantised = dequantized_state(fixture)
+    state = {k.replace("model.language_model.", "model."): v for k, v in dequantised.items()}
     model.load_state_dict(state, strict=True, assign=True)
     model = model.float().eval()
     model.model.rotary_emb.__init__(config)
@@ -518,7 +535,7 @@ def real_slice_reference(repo, fixture, out_dir, layers, vocab):
         logits = model(ids[None]).logits[0]
         for h in hooks:
             h.remove()
-    save(out_dir, "real27b-slice", {"layers": torch.stack([s[0] for s in seen]), "logits": logits},
+    save(out_dir, "real27b-slice" + ("-nvfp4" if compressed else ""), {"layers": torch.stack([s[0] for s in seen]), "logits": logits},
          {"tokens": ids.tolist(), "layers": layers, "vocab": vocab, **versions})
     print("real slice", fixture, len(ids), "tokens ->", out_dir)
 

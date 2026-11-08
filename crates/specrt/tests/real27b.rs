@@ -150,12 +150,22 @@ fn real_27b_greedy_and_logits_match_the_fp8_reference() {
 #[test]
 #[ignore = "needs a CUDA GPU, the Qwen3.8 27B FP8 checkpoint and scripts/reference.py real-slice output"]
 fn real_27b_fp8_first_layers_match_transformers() {
-    let dir = out_dir().join("qwen3.8-27b-slice");
+    first_layers_match("qwen3.8-27b-slice", "real27b-slice", Quant::Fp8Block128);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the NVFP4 27B checkpoint and scripts/reference.py real-slice output for it"]
+fn real_27b_nvfp4_first_layers_match_the_dequantised_checkpoint() {
+    first_layers_match("qwen3.8-27b-nvfp4-slice", "real27b-slice-nvfp4", Quant::Fp8Channel);
+}
+
+fn first_layers_match(fixture: &str, reference: &str, quant: Quant) {
+    let dir = out_dir().join(fixture);
     let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     spec.repo = dir.display().to_string();
-    assert_eq!(spec.quant, Quant::Fp8Block128);
+    assert_eq!(spec.quant, quant);
     let meta: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(out_dir().join("real27b-slice.json")).unwrap()).unwrap();
+        serde_json::from_str(&std::fs::read_to_string(out_dir().join(format!("{reference}.json"))).unwrap()).unwrap();
     let tokens: Vec<u32> = meta["tokens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
     let mut rt = Runtime::load(&spec, 256).unwrap();
     eprintln!(
@@ -169,11 +179,11 @@ fn real_27b_fp8_first_layers_match_transformers() {
     assert!(rt.device_bytes < 3_000_000_000, "{} bytes on the device", rt.device_bytes);
     let trace = rt.trace_prefill(&tokens).unwrap();
     let (n, hidden, vocab) = (tokens.len(), spec.dims.hidden, spec.dims.vocab);
-    let theirs = floats("real27b-slice.layers.bin");
+    let theirs = floats(&format!("{reference}.layers.bin"));
     let per_layer: Vec<f32> = (0..spec.layers.count)
         .map(|l| relative(&trace.layers[l * n * hidden..(l + 1) * n * hidden], &theirs[l * n * hidden..(l + 1) * n * hidden]))
         .collect();
-    let logits_ref = floats("real27b-slice.logits.bin");
+    let logits_ref = floats(&format!("{reference}.logits.bin"));
     let logits = relative(&trace.logits, &logits_ref);
     let top1 = (0..n)
         .filter(|&i| argmax(&trace.logits[i * vocab..(i + 1) * vocab]) == argmax(&logits_ref[i * vocab..(i + 1) * vocab]))
