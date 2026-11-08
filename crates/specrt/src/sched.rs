@@ -1,7 +1,7 @@
 use crate::codegen::PAGE;
 use crate::runtime::{DecodeRow, Runtime, Sampling, Stepper};
 use anyhow::{Result, bail};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 pub type SeqId = u64;
@@ -495,6 +495,7 @@ fn accept(s: &mut Seq, t: u32, max_ctx: usize, events: &mut Vec<Event>) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     const VOCAB: u32 = 1000;
 

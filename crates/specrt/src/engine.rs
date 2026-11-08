@@ -95,17 +95,15 @@ pub struct PromptLogits {
     pub values: Vec<f32>,
 }
 
-pub struct Engine {
-    spec: Spec,
-    tokenizer: Tokenizer,
-    chat: Option<ChatTemplate>,
-    runtime: Runtime,
-    max_ctx: usize,
-    stop: Vec<u32>,
+pub(crate) struct Assets {
+    pub spec: Spec,
+    pub tokenizer: Tokenizer,
+    pub chat: Option<ChatTemplate>,
+    pub stop: Vec<u32>,
 }
 
-impl Engine {
-    pub fn load(model: &str, max_ctx: Option<usize>) -> Result<Self> {
+impl Assets {
+    pub fn load(model: &str) -> Result<Self> {
         let spec = resolve_spec(model)?;
         let tokenizer = Tokenizer::from_file(find_in_snapshot(&spec.repo, "tokenizer.json")?)
             .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
@@ -121,6 +119,39 @@ impl Engine {
             read("tokenizer_config.json").as_deref(),
             &|t| tokenizer.token_to_id(t),
         );
+        Ok(Assets { spec, tokenizer, chat, stop })
+    }
+
+    pub fn tokens(&self, text: &str) -> Result<Vec<u32>> {
+        let enc = self.tokenizer.encode(text, false).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+        Ok(enc.get_ids().to_vec())
+    }
+
+    pub fn encode_messages(&self, messages: &[Value], template: bool) -> Result<Vec<u32>> {
+        let text = match (&self.chat, template) {
+            (Some(t), true) => t.render(messages)?,
+            _ => messages
+                .iter()
+                .filter_map(|m| m["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        };
+        self.tokens(&text)
+    }
+}
+
+pub struct Engine {
+    spec: Spec,
+    tokenizer: Tokenizer,
+    chat: Option<ChatTemplate>,
+    runtime: Runtime,
+    max_ctx: usize,
+    stop: Vec<u32>,
+}
+
+impl Engine {
+    pub fn load(model: &str, max_ctx: Option<usize>) -> Result<Self> {
+        let Assets { spec, tokenizer, chat, stop } = Assets::load(model)?;
         let max_ctx = max_ctx.unwrap_or(DEFAULT_CTX).min(MAX_CTX);
         tracing::info!(model, spec = %spec.name, max_ctx, "loading model");
         let runtime = Runtime::load(&spec, max_ctx)?;

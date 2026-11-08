@@ -42,7 +42,7 @@ fn shuffled_blocks_match_contiguous(dir: &str, kv_planes: usize) {
     let logits = plain.prompt_logits(&prompt).unwrap();
     let greedy = plain.generate(&prompt, 40, Sampling::GREEDY).unwrap().tokens;
     drop(plain);
-    let layout = Layout { max_ctx, slots: 3, kv_blocks: 3 * pages as usize, prefill_chunk: 128, kv_planes };
+    let layout = Layout { max_ctx, slots: 3, kv_blocks: 3 * pages as usize, prefill_chunk: 128, kv_planes, kv_headroom: 0 };
     let mut paged = Runtime::load_layout(&s, layout).unwrap();
     let pool = shuffled(3 * pages, 7);
     paged.set_block_table(0, &pool[pages as usize..2 * pages as usize]).unwrap();
@@ -73,7 +73,7 @@ fn single_greedy(s: &Spec, prompts: &[Vec<u32>], new: usize) -> Vec<Vec<u32>> {
 fn stepped_greedy(s: &Spec, prompts: &[Vec<u32>], new: usize, chunk: usize) -> Vec<Vec<u32>> {
     let slots = prompts.len() + 1;
     let pages = 512usize.div_ceil(specrt::codegen::PAGE);
-    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 128, kv_planes: 1 };
+    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0 };
     let mut rt = Runtime::load_layout(s, layout).unwrap();
     let pool = shuffled((slots * pages) as u32, 3);
     let mut st = rt.stepper().unwrap();
@@ -157,7 +157,7 @@ fn scheduled_matches_single(dir: &str) {
     let want: Vec<Vec<u32>> =
         prompts.iter().zip(&new).map(|(p, &n)| single.generate(p, n, Sampling::GREEDY).unwrap().tokens).collect();
     drop(single);
-    let layout = Layout { max_ctx: 512, slots: 16, kv_blocks: 120, prefill_chunk: 256, kv_planes: 1 };
+    let layout = Layout { max_ctx: 512, slots: 16, kv_blocks: 120, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0 };
     let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
     let cfg = Config { max_num_seqs: 16, max_batched_tokens: 300, reserve_blocks: Some(1), ..Config::default() };
     let mut sched = Scheduler::new(exec, cfg);
@@ -198,12 +198,77 @@ fn head_dim_256_sixty_four_scheduled_sequences_match_single_sequence_greedy_with
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_serving_core_streams_concurrent_jobs_and_cancels_within_a_step() {
+    use specrt::sched::{Finish, Request};
+    use specrt::serve::{Core, Job, SeqEvent, ServeOptions};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let s = spec_for("tiny-qwen3.5");
+    let prompts = mixed_prompts();
+    let want = single_greedy(&s, &prompts, 30);
+    let opts = ServeOptions { max_model_len: 512, max_num_seqs: 8, kv_cache_bytes: Some(4 << 20), ..ServeOptions::default() };
+    let core = Core::start(&s, opts).unwrap();
+    let mut rxs = Vec::new();
+    for p in &prompts {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request = Request { prompt: p.clone(), max_tokens: 30, sampling: Sampling::GREEDY, stop: vec![] };
+        core.submit(Job { request, events: tx, cancel: Arc::new(AtomicBool::new(false)) }).unwrap();
+        rxs.push(rx);
+    }
+    let (tx, long_rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let request = Request { prompt: prompts[0].clone(), max_tokens: 500, sampling: Sampling::GREEDY, stop: vec![] };
+    core.submit(Job { request, events: tx, cancel: cancel.clone() }).unwrap();
+    let mut seen = 0;
+    let generated = loop {
+        match long_rx.recv().unwrap() {
+            SeqEvent::Token(_) => {
+                seen += 1;
+                if seen == 5 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            SeqEvent::Finished { finish, completion_tokens, .. } => {
+                assert_eq!(finish, Finish::Cancelled);
+                break completion_tokens;
+            }
+            _ => {}
+        }
+    };
+    assert!(generated < 100, "{generated} of 500 tokens were generated before the cancel took");
+    for (rx, want) in rxs.iter().zip(&want) {
+        let mut got = Vec::new();
+        loop {
+            match rx.recv().unwrap() {
+                SeqEvent::Token(t) => got.push(t),
+                SeqEvent::Finished { finish, completion_tokens, .. } => {
+                    assert_eq!((finish, completion_tokens), (Finish::Length, 30));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(&got, want);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while core.stats().kv_blocks_used > 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let st = core.stats();
+    assert_eq!((st.kv_blocks_used, st.running, st.waiting), (0, 0, 0));
+    assert_eq!(st.kv_blocks_total, (4 << 20) / specrt::runtime::kv_block_bytes(&s, 1));
+    assert!(st.inter_token_secs.total > 100 && st.decode_batch.total > 0);
+}
+
+#[test]
 fn serving_kv_is_one_f16_copy_per_token() {
     let s = spec_for("tiny-qwen3.5-hd256");
     let per_token = specrt::runtime::kv_block_bytes(&s, 1) / specrt::codegen::PAGE;
     assert_eq!(per_token, s.attention_layers() * s.attention.kv_heads * s.attention.head_dim * 2 * 2);
     let real = Spec::load(&fixture_dir("qwen3.8-27b.toml")).unwrap();
     assert_eq!(specrt::runtime::kv_block_bytes(&real, 1) / specrt::codegen::PAGE, 64 * 1024);
-    let layout = Layout::serving(&real, 131072, 32, 7 << 30);
+    let layout = Layout::serving(&real, 131072, 32, Some(7 << 30));
     assert_eq!((layout.kv_planes, layout.kv_blocks), (1, (7 << 30) / (64 * 1024 * 16)));
+    assert_eq!(Layout::serving(&real, 131072, 32, None).kv_blocks, 0, "0 sizes the pool from free memory");
 }

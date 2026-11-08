@@ -302,6 +302,7 @@ pub struct Layout {
     pub kv_blocks: usize,
     pub prefill_chunk: usize,
     pub kv_planes: usize,
+    pub kv_headroom: usize,
 }
 
 impl Layout {
@@ -312,16 +313,18 @@ impl Layout {
             kv_blocks: slots * max_ctx.div_ceil(PAGE),
             prefill_chunk: PREFILL_CHUNK,
             kv_planes: 2,
+            kv_headroom: 0,
         }
     }
 
-    pub fn serving(spec: &Spec, max_ctx: usize, slots: usize, kv_bytes: usize) -> Layout {
+    pub fn serving(spec: &Spec, max_ctx: usize, slots: usize, kv_bytes: Option<usize>) -> Layout {
         Layout {
             max_ctx,
             slots,
-            kv_blocks: (kv_bytes / kv_block_bytes(spec, 1)).max(1),
+            kv_blocks: kv_bytes.map_or(0, |b| (b / kv_block_bytes(spec, 1)).max(1)),
             prefill_chunk: PREFILL_CHUNK,
             kv_planes: 1,
+            kv_headroom: 1 << 30,
         }
     }
 
@@ -352,7 +355,7 @@ impl Runtime {
     }
 
     pub fn load_layout(spec: &Spec, layout: Layout) -> Result<Self> {
-        ensure!(layout.slots >= 1 && layout.kv_blocks >= 1, "need at least one slot and one KV block");
+        ensure!(layout.slots >= 1, "need at least one slot");
         let max_ctx = layout.max_ctx;
         let batch = 1;
         let load_started = Instant::now();
@@ -442,7 +445,6 @@ impl Runtime {
         let d = &spec.dims;
         let pages = layout.pages();
         let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
-        let cache_len = layout.kv_blocks * block_elems;
         let chunk = max_ctx.min(layout.prefill_chunk).max(layout.slots);
         let use_mma =
             ctx.compute_capability()?.0 >= 8 && std::env::var_os("SPECRT_GEMM_FP32").is_none();
@@ -456,8 +458,8 @@ impl Runtime {
             gate_up: stream.alloc_zeros(2 * d.intermediate)?,
             act: stream.alloc_zeros(d.intermediate)?,
             logits: stream.alloc_zeros(d.vocab)?,
-            k_cache: stream.alloc_zeros(cache_len.max(1)).context("KV cache")?,
-            v_cache: stream.alloc_zeros(cache_len.max(1)).context("KV cache")?,
+            k_cache: stream.alloc_zeros(1)?,
+            v_cache: stream.alloc_zeros(1)?,
             block_table: stream.alloc_zeros(layout.slots * pages)?,
             zero_slots: stream.alloc_zeros(chunk)?,
             token: stream.alloc_zeros(1)?,
@@ -497,7 +499,7 @@ impl Runtime {
         } else {
             None
         };
-        let rt = Runtime {
+        let mut rt = Runtime {
             smem,
             pre,
             gdn,
@@ -534,8 +536,20 @@ impl Runtime {
             baseline_free: free_before,
         };
         rt.stream.synchronize()?;
+        let kv_blocks = match layout.kv_blocks {
+            0 => {
+                let free = ctx.mem_get_info().map(|(f, _)| f).unwrap_or(0);
+                let spare = free.saturating_sub(layout.kv_headroom);
+                ensure!(spare >= 2 * block_elems * 4, "no device memory left for the KV cache ({free} bytes free)");
+                spare / (block_elems * 4)
+            }
+            n => n,
+        };
+        rt.buf.k_cache = rt.stream.alloc_zeros(kv_blocks * block_elems).context("KV cache")?;
+        rt.buf.v_cache = rt.stream.alloc_zeros(kv_blocks * block_elems).context("KV cache")?;
+        rt.kv_blocks = kv_blocks;
+        rt.stream.synchronize()?;
         let free_after = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
-        let mut rt = rt;
         rt.device_bytes = free_before.saturating_sub(free_after) as u64;
         rt.load_secs = load_started.elapsed().as_secs_f64();
         rt.peak_host_rss_bytes = peak_rss_bytes().unwrap_or(0);

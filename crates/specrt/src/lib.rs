@@ -5,6 +5,7 @@ pub mod jit;
 pub mod nvfp4;
 pub mod runtime;
 pub mod sched;
+pub mod serve;
 pub mod spec;
 pub mod weights;
 
