@@ -108,3 +108,24 @@ shard holds `mtp.*` (bf16).
 
 Decode reads every projection plus `lm_head` once per token: 20.3 GB, against 26.9 GB for the
 FP8 checkpoint. The NVFP4 MLPs are 8.4 GB of it; at FP8 they would be 15.0 GB.
+
+## Spec and loader
+
+`tests/fixtures/qwen3.8-27b-nvfp4.toml` (`min_engine = 4`): `quant = "fp8_channel"` for the
+projections, `[mlp] quant = "nvfp4_g16"` and `quant_until = 56`, so `Spec::mlp_quant(layer)` is
+NVFP4 below 56 and FP8 from there. `Spec::from_hf_config` derives exactly this from the
+compressed-tensors `config_groups` (it reads each group's format, type, bits, strategy and group
+size and maps every target to a layer and module), and refuses anything else.
+
+`src/nvfp4.rs` holds the format: e2m1 decode and round to nearest, `Fp4` (borrowed packed bytes
+and e4m3 group scales, the weight and input global scales), gate/up interleave and the CPU
+dequant. FP8 per-channel weights go through the existing FP8 path with the per-row scale
+repeated per 128 columns. On the device the scale buffer of an `Fp4` matrix is a 16-byte header
+(`1 / weight_global_scale`, `input_global_scale` as f32) followed by the raw e4m3 group scales.
+
+Dequant oracle: `reference.py nvfp4-dequant out` dequantises 14 tensors' rows (NVFP4 gate, up and
+down of layers 0, 30 and 55; FP8 MLPs of 56 and 63; FP8 `in_proj_qkv`, `in_proj_z`, `o_proj`)
+with compressed-tensors' own `unpack_fp4_from_uint8` and `dequantize`, in f32.
+`tests/nvfp4.rs` loads the same layers through `Checkpoint::layer` (so through the gate/up
+interleave and the qkv/z fusion) and matches all 304,128 values bit for bit. Swapping the
+nibble order fails it (4,804 of the first 5,120 values differ).

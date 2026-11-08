@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const SPEC_FORMAT: u32 = 3;
+pub const SPEC_FORMAT: u32 = 4;
 
 pub const EMBEDDED: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/embedded_specs.rs"));
 
@@ -38,6 +38,20 @@ pub enum Quant {
     Q8,
     #[serde(rename = "fp8_block128")]
     Fp8Block128,
+    #[serde(rename = "fp8_channel")]
+    Fp8Channel,
+    #[serde(rename = "nvfp4_g16")]
+    Nvfp4G16,
+}
+
+impl Quant {
+    pub fn is_fp8(self) -> bool {
+        matches!(self, Quant::Fp8Block128 | Quant::Fp8Channel)
+    }
+
+    pub fn quantised_checkpoint(self) -> bool {
+        matches!(self, Quant::Fp8Block128 | Quant::Fp8Channel | Quant::Nvfp4G16)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +201,10 @@ pub struct Rope {
 #[serde(deny_unknown_fields)]
 pub struct Mlp {
     pub activation: Activation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quant: Option<Quant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quant_until: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -262,19 +280,91 @@ fn layer_pattern(types: &[String]) -> Result<Vec<Block>> {
     Ok(blocks[..period].to_vec())
 }
 
-fn parse_quantization(value: Option<&serde_json::Value>) -> Result<Quant> {
+#[derive(Debug, PartialEq)]
+pub struct Quantization {
+    pub quant: Quant,
+    pub mlp: Option<(Quant, Option<usize>)>,
+}
+
+fn compressed_group(name: &str, g: &serde_json::Value) -> Result<Quant> {
+    let w = &g["weights"];
+    let field = |v: &serde_json::Value, k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
+    let text = |v: &serde_json::Value, k: &str| field(v, k).as_str().map(str::to_string);
+    let int = |v: &serde_json::Value, k: &str| field(v, k).as_u64();
+    let symmetric = field(w, "symmetric").as_bool() == Some(true);
+    match (text(g, "format").as_deref(), text(w, "type").as_deref(), int(w, "num_bits"), text(w, "strategy").as_deref()) {
+        (Some("float-quantized"), Some("float"), Some(8), Some("channel")) if symmetric => Ok(Quant::Fp8Channel),
+        (Some("nvfp4-pack-quantized"), Some("float"), Some(4), Some("tensor_group"))
+            if symmetric && int(w, "group_size") == Some(16) =>
+        {
+            Ok(Quant::Nvfp4G16)
+        }
+        _ => bail!("compressed-tensors group {name} is not supported (fp8 per-channel and nvfp4 group 16 are)"),
+    }
+}
+
+fn target_slot(target: &str) -> Result<(usize, bool)> {
+    let rest = target
+        .split_once("layers.")
+        .map(|(_, r)| r)
+        .with_context(|| format!("compressed-tensors target {target} is not a layer projection"))?;
+    let (layer, module) = rest.split_once('.').context("layer target without a module")?;
+    let layer: usize = layer.parse().with_context(|| format!("target {target}"))?;
+    Ok((layer, module.starts_with("mlp.")))
+}
+
+fn parse_compressed(q: &serde_json::Value, layers: usize) -> Result<Quantization> {
+    let groups = q["config_groups"].as_object().context("compressed-tensors config has no config_groups")?;
+    let mut projection: Option<Quant> = None;
+    let mut mlp: Vec<Option<Quant>> = vec![None; layers];
+    for (name, g) in groups {
+        let quant = compressed_group(name, g)?;
+        for t in g["targets"].as_array().context("group without targets")? {
+            let t = t.as_str().context("target is not a string")?;
+            let (layer, is_mlp) = target_slot(t)?;
+            ensure!(layer < layers, "target {t} is past the last layer");
+            if is_mlp {
+                ensure!(mlp[layer].is_none_or(|m| m == quant), "{t} is in two groups");
+                mlp[layer] = Some(quant);
+            } else {
+                ensure!(projection.is_none_or(|p| p == quant), "attention projections mix {projection:?} and {quant:?}");
+                projection = Some(quant);
+            }
+        }
+    }
+    let quant = projection.context("compressed-tensors config quantises no attention projection")?;
+    ensure!(quant == Quant::Fp8Channel, "attention projections in {quant:?} are not supported");
+    let mlp: Vec<Quant> = mlp
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| m.with_context(|| format!("the MLP of layer {i} is not quantised")))
+        .collect::<Result<_>>()?;
+    let first = mlp[0];
+    let until = mlp.iter().position(|&m| m != first).unwrap_or(layers);
+    ensure!(
+        mlp[until..].iter().all(|&m| m == quant),
+        "MLP quantisation must be one kind for the first layers and the projection kind after them"
+    );
+    let mlp = (first != quant).then_some((first, (until < layers).then_some(until)));
+    Ok(Quantization { quant, mlp })
+}
+
+fn parse_quantization(value: Option<&serde_json::Value>, layers: usize) -> Result<Quantization> {
     let Some(q) = value.filter(|v| !v.is_null()) else {
-        return Ok(Quant::Bf16);
+        return Ok(Quantization { quant: Quant::Bf16, mlp: None });
     };
     let method = q.get("quant_method").and_then(|m| m.as_str()).unwrap_or("");
+    if method == "compressed-tensors" {
+        return parse_compressed(q, layers);
+    }
     let fmt = q.get("fmt").and_then(|f| f.as_str()).unwrap_or("e4m3");
     let block: Option<Vec<u64>> = q
         .get("weight_block_size")
         .and_then(|b| b.as_array())
         .map(|b| b.iter().filter_map(|x| x.as_u64()).collect());
     match (method, fmt, block.as_deref()) {
-        ("fp8", "e4m3", Some([128, 128])) => Ok(Quant::Fp8Block128),
-        _ => bail!("quantization {q} is not supported (fp8 e4m3 with 128x128 blocks is)"),
+        ("fp8", "e4m3", Some([128, 128])) => Ok(Quantization { quant: Quant::Fp8Block128, mlp: None }),
+        _ => bail!("quantization {q} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are)"),
     }
 }
 
@@ -334,7 +424,7 @@ impl Spec {
 
     pub fn from_hf_config(json: &str) -> Result<Self> {
         let mut value: serde_json::Value = serde_json::from_str(json)?;
-        let quant = parse_quantization(value.get("quantization_config"))?;
+        let quant_config = value.get("quantization_config").cloned();
         let outer_type = value.get("model_type").cloned();
         if let Some(text) = value.get_mut("text_config").map(serde_json::Value::take) {
             value = text;
@@ -343,6 +433,7 @@ impl Spec {
             }
         }
         let hf: HfConfig = serde_json::from_value(value)?;
+        let Quantization { quant, mlp: mlp_quant } = parse_quantization(quant_config.as_ref(), hf.num_hidden_layers)?;
         let params = hf.rope_parameters.as_ref();
         let param = |key: &str| params.and_then(|p| p.get(key)).and_then(|v| v.as_f64());
         let scaling = parse_rope_scaling(hf.rope_scaling.as_ref().or(params))?;
@@ -411,7 +502,7 @@ impl Spec {
                 rotary_dim,
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling },
-            mlp: Mlp { activation },
+            mlp: Mlp { activation, quant: mlp_quant.map(|m| m.0), quant_until: mlp_quant.and_then(|m| m.1) },
             linear_attention,
         };
         spec.validate()?;
@@ -437,7 +528,20 @@ impl Spec {
             "layer count must be a multiple of the pattern length"
         );
         let rot = self.rotary_dim();
-        if self.quant == Quant::Fp8Block128 {
+        ensure!(self.quant != Quant::Nvfp4G16, "nvfp4_g16 is supported for [mlp] quant only");
+        match (self.mlp.quant, self.mlp.quant_until) {
+            (None, Some(_)) => bail!("[mlp] quant_until needs [mlp] quant"),
+            (Some(m), until) => {
+                ensure!(m == Quant::Nvfp4G16 && self.quant == Quant::Fp8Channel, "[mlp] quant {m:?} beside {:?} is not supported (nvfp4_g16 beside fp8_channel is)", self.quant);
+                ensure!(until.is_none_or(|u| u > 0 && u < self.layers.count), "[mlp] quant_until must be inside the layer count");
+                ensure!(
+                    self.dims.hidden.is_multiple_of(256) && self.dims.intermediate.is_multiple_of(256),
+                    "nvfp4_g16 needs hidden and intermediate to be multiples of 256"
+                );
+            }
+            (None, None) => {}
+        }
+        if self.quant.is_fp8() {
             let block = 128;
             let la_ok = self.linear_attention.as_ref().is_none_or(|l| l.value_dim().is_multiple_of(block) && l.conv_dim().is_multiple_of(block));
             ensure!(
@@ -446,7 +550,7 @@ impl Spec {
                     && self.attention.head_dim.is_multiple_of(block)
                     && self.q_dim().is_multiple_of(block)
                     && la_ok,
-                "fp8_block128 needs hidden, intermediate, head_dim and the linear value dim to be multiples of 128"
+                "fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of 128"
             );
         }
         ensure!(rot > 0 && rot.is_multiple_of(2) && rot <= a.head_dim, "rotary_dim must be even and at most head_dim");
@@ -471,6 +575,13 @@ impl Spec {
             }
         }
         Ok(())
+    }
+
+    pub fn mlp_quant(&self, layer: usize) -> Quant {
+        match self.mlp.quant {
+            Some(q) if self.mlp.quant_until.is_none_or(|u| layer < u) => q,
+            _ => self.quant,
+        }
     }
 
     pub fn block(&self, layer: usize) -> Block {

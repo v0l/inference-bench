@@ -201,7 +201,57 @@ fn qwen38_27b_config_parses_into_a_hybrid_spec_and_round_trips() {
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;
     assert_eq!(file, spec);
+    assert_eq!(file.min_engine, 3);
+}
+
+#[test]
+fn compressed_tensors_nvfp4_checkpoint_derives_fp8_channel_with_nvfp4_mlps_until_56() {
+    let mut spec = derived("qwen3.8-27b-nvfp4.config.json");
+    assert_eq!(spec.quant, Quant::Fp8Channel);
+    assert_eq!((spec.mlp.quant, spec.mlp.quant_until), (Some(Quant::Nvfp4G16), Some(56)));
+    assert_eq!(spec.mlp_quant(0), Quant::Nvfp4G16);
+    assert_eq!(spec.mlp_quant(55), Quant::Nvfp4G16);
+    assert_eq!(spec.mlp_quant(56), Quant::Fp8Channel);
+    assert_eq!(spec.mlp_quant(63), Quant::Fp8Channel);
+    assert_eq!(Spec::parse(&spec.to_toml().unwrap()).unwrap(), spec);
+    let file = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    spec.name = file.name.clone();
+    spec.repo = file.repo.clone();
+    spec.min_engine = file.min_engine;
+    assert_eq!(file, spec);
     assert_eq!(file.min_engine, SPEC_FORMAT);
+}
+
+fn nvfp4_config() -> serde_json::Value {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4.config.json")).unwrap();
+    serde_json::from_str(&json).unwrap()
+}
+
+#[test]
+fn compressed_tensors_groups_that_are_not_fp8_channel_or_nvfp4_g16_are_refused() {
+    let mut v = nvfp4_config();
+    v["quantization_config"]["config_groups"]["group_1"]["weights"]["group_size"] = serde_json::json!(32);
+    assert!(Spec::from_hf_config(&v.to_string()).unwrap_err().to_string().contains("group_1"));
+    let mut v = nvfp4_config();
+    v["quantization_config"]["config_groups"]["group_0"]["weights"]["strategy"] = serde_json::json!("tensor");
+    assert!(Spec::from_hf_config(&v.to_string()).is_err());
+    let mut v = nvfp4_config();
+    let targets = v["quantization_config"]["config_groups"]["group_1"]["targets"].as_array_mut().unwrap();
+    targets.retain(|t| t.as_str().unwrap() != "model.language_model.layers.7.mlp.down_proj");
+    targets.push(serde_json::json!("model.language_model.layers.7.self_attn.q_proj"));
+    assert!(Spec::from_hf_config(&v.to_string()).is_err(), "an nvfp4 attention projection");
+}
+
+#[test]
+fn mlp_quant_needs_fp8_channel_projections_and_a_layer_inside_the_count() {
+    let text = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    assert!(Spec::parse(&text).is_ok());
+    assert!(Spec::parse(&text.replace("quant = \"fp8_channel\"", "quant = \"fp8_block128\"")).is_err());
+    assert!(Spec::parse(&text.replace("quant = \"fp8_channel\"", "quant = \"nvfp4_g16\"")).is_err());
+    assert!(Spec::parse(&text.replace("quant_until = 56", "quant_until = 64")).is_err());
+    assert!(Spec::parse(&text.replace("quant = \"nvfp4_g16\"\n", "")).is_err(), "quant_until alone");
+    let all = Spec::parse(&text.replace("quant_until = 56\n", "")).unwrap();
+    assert_eq!(all.mlp_quant(63), Quant::Nvfp4G16);
 }
 
 fn hybrid_text() -> String {

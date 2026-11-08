@@ -12,6 +12,7 @@ pub enum Matrix<'a> {
     Bf16(Cow<'a, [u16]>),
     Q8 { values: Vec<i8>, scales: Vec<f32> },
     Fp8 { values: Cow<'a, [u8]>, scales: Vec<f32> },
+    Fp4(crate::nvfp4::Fp4<'a>),
 }
 
 pub struct Attn<'a> {
@@ -207,6 +208,13 @@ impl Checkpoint {
         }
         ensure!(v.shape == [rows, cols], "{weight} has shape {:?}, expected {:?}", v.shape, [rows, cols]);
         let kb = cols.div_ceil(FP8_BLOCK);
+        let channel = format!("{weight}_scale");
+        if !self.has(&format!("{weight}_scale_inv")) && self.has(&channel) {
+            let per_row = self.floats(&channel, &[rows, 1])?;
+            let grid = per_row.iter().flat_map(|&s| std::iter::repeat_n(s, kb)).collect();
+            let map = (0..rows).map(|r| (r * kb) as u32).collect();
+            return Ok(Raw::Fp8 { w: Cow::Borrowed(v.data), grid, map, cols });
+        }
         let grid = self.floats(&format!("{weight}_scale_inv"), &[rows.div_ceil(FP8_BLOCK), kb])?;
         let map = (0..rows).map(|r| (r / FP8_BLOCK * kb) as u32).collect();
         Ok(Raw::Fp8 { w: Cow::Borrowed(v.data), grid, map, cols })
@@ -308,11 +316,11 @@ impl<'a> Raw<'a> {
                 let (values, scales) = quantize_q8(&w, cols);
                 Matrix::Q8 { values, scales }
             }
-            (Raw::Fp8 { w, grid, map, .. }, Quant::Fp8Block128) => {
+            (Raw::Fp8 { w, grid, map, .. }, q) if q.is_fp8() => {
                 Matrix::Fp8 { values: w, scales: fp8_scales(&grid, &map) }
             }
-            (Raw::Bf16 { .. }, Quant::Fp8Block128) => bail!("{what} is not FP8 but the spec says fp8_block128"),
-            (Raw::Fp8 { .. }, _) => bail!("{what} is FP8; use quant = \"fp8_block128\""),
+            (Raw::Bf16 { .. }, q) => bail!("{what} is bf16 but the spec says {q:?}"),
+            (Raw::Fp8 { .. }, _) => bail!("{what} is FP8; use quant = \"fp8_block128\" or \"fp8_channel\""),
         })
     }
 }
@@ -348,6 +356,19 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
     let man = (mag & 7) as f32;
     let v = if exp == 0 { man * 2f32.powi(-9) } else { (1.0 + man / 8.0) * 2f32.powi(exp - 7) };
     if b & 0x80 != 0 { -v } else { v }
+}
+
+pub fn f32_to_e4m3(v: f32) -> u8 {
+    let sign = if v.is_sign_negative() { 0x80 } else { 0 };
+    let a = v.abs().min(448.0);
+    let mut best = 0u8;
+    for code in 1..=0x7eu8 {
+        let (d, b) = ((e4m3_to_f32(code) - a).abs(), (e4m3_to_f32(best) - a).abs());
+        if d < b || (d == b && code & 1 == 0) {
+            best = code;
+        }
+    }
+    best | sign
 }
 
 pub fn quantize_q8(w: &[u16], cols: usize) -> (Vec<i8>, Vec<f32>) {
@@ -453,23 +474,46 @@ impl Checkpoint {
         } else {
             Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"))?)
         };
-        let gate = self.raw(&format!("{p}.mlp.gate_proj.weight"), inter, h)?;
-        let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?;
-        let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
+        let mlp = spec.mlp_quant(i);
+        let (gate_up, down) = if mlp == Quant::Nvfp4G16 {
+            let gate = self.fp4(&format!("{p}.mlp.gate_proj"), inter, h)?;
+            let up = self.fp4(&format!("{p}.mlp.up_proj"), inter, h)?;
+            (Matrix::Fp4(crate::nvfp4::Fp4::interleave(gate, up)?), Matrix::Fp4(self.fp4(&format!("{p}.mlp.down_proj"), h, inter)?))
+        } else {
+            let gate = self.raw(&format!("{p}.mlp.gate_proj.weight"), inter, h)?;
+            let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?;
+            let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
+            (
+                Raw::interleave(gate, up)?.into_matrix(mlp, &format!("{p}.mlp.gate_up"))?,
+                down.into_matrix(mlp, &format!("{p}.mlp.down_proj"))?,
+            )
+        };
         Ok(Layer {
             ln1: self.norm(spec, &format!("{p}.input_layernorm.weight"), h)?,
             ln2: self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
             mixer,
-            gate_up: Raw::interleave(gate, up)?.into_matrix(spec.quant, &format!("{p}.mlp.gate_up"))?,
-            down: down.into_matrix(spec.quant, &format!("{p}.mlp.down_proj"))?,
+            gate_up,
+            down,
         })
+    }
+
+    pub fn fp4(&self, module: &str, rows: usize, cols: usize) -> Result<crate::nvfp4::Fp4<'_>> {
+        use crate::nvfp4::GROUP;
+        let packed = self.shaped(&format!("{module}.weight_packed"), &[rows, cols / 2])?;
+        ensure!(packed.dtype == Dtype::U8, "{module}.weight_packed is {:?}, expected U8", packed.dtype);
+        let scales = self.shaped(&format!("{module}.weight_scale"), &[rows, cols / GROUP])?;
+        ensure!(scales.dtype == Dtype::F8_E4M3, "{module}.weight_scale is {:?}, expected F8_E4M3", scales.dtype);
+        let global = self.floats(&format!("{module}.weight_global_scale"), &[1])?[0];
+        let mut m = crate::nvfp4::Fp4::new(Cow::Borrowed(packed.data), Cow::Borrowed(scales.data), global, rows, cols)?;
+        m.input_global = self.floats(&format!("{module}.input_global_scale"), &[1])?[0];
+        Ok(m)
     }
 
     pub fn outside(&self, spec: &Spec) -> Result<Outside<'_>> {
         let d = &spec.dims;
         let root = self.root();
         let embed = self.bf16(&format!("{root}.embed_tokens.weight"), &[d.vocab, d.hidden])?;
-        let head_quant = if spec.quant == Quant::Fp8Block128 { Quant::Bf16 } else { spec.quant };
+        let head_quant = if spec.quant.quantised_checkpoint() { Quant::Bf16 } else { spec.quant };
         let lm_head = if d.tie_embeddings {
             Raw::Bf16 { w: embed.clone(), cols: d.hidden }
         } else {
@@ -540,6 +584,16 @@ mod tests {
                 assert_eq!(lookup(&both, 2 * r + 1, b), expect(2000.0, r, b));
             }
         }
+    }
+
+    #[test]
+    fn e4m3_encode_inverts_decode_and_saturates() {
+        for code in 0..=0x7eu8 {
+            assert_eq!(f32_to_e4m3(e4m3_to_f32(code)), code, "{code:#x}");
+            assert_eq!(f32_to_e4m3(-e4m3_to_f32(code)) & 0x7f, code);
+        }
+        assert_eq!(f32_to_e4m3(1e6), 0x7e);
+        assert_eq!(f32_to_e4m3(1.0625), 0x38);
     }
 
     #[test]

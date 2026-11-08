@@ -19,6 +19,7 @@ enum DeviceMatrix {
     Bf16(CudaSlice<u16>),
     Q8 { values: CudaSlice<i8>, scales: CudaSlice<f32> },
     Fp8 { values: CudaSlice<u8>, scales: CudaSlice<f32> },
+    Fp4 { packed: CudaSlice<u8>, scales: CudaSlice<u8> },
 }
 
 impl DeviceMatrix {
@@ -31,6 +32,10 @@ impl DeviceMatrix {
             Matrix::Fp8 { values, scales } => {
                 DeviceMatrix::Fp8 { values: stream.clone_htod(values.as_ref())?, scales: stream.clone_htod(scales)? }
             }
+            Matrix::Fp4(m) => DeviceMatrix::Fp4 {
+                packed: stream.clone_htod(m.packed.as_ref())?,
+                scales: stream.clone_htod(&m.device_scales())?,
+            },
         })
     }
 
@@ -39,6 +44,7 @@ impl DeviceMatrix {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(dummy),
             DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
             DeviceMatrix::Fp8 { values, scales } => b.arg(values).arg(scales),
+            DeviceMatrix::Fp4 { packed, scales } => b.arg(packed).arg(scales),
         };
     }
 }

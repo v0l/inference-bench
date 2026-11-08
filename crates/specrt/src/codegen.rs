@@ -106,6 +106,7 @@ pub enum WeightFormat {
     Bf16,
     Q8,
     Fp8,
+    Fp4,
 }
 
 impl WeightFormat {
@@ -113,13 +114,14 @@ impl WeightFormat {
         match quant {
             Quant::Bf16 => WeightFormat::Bf16,
             Quant::Q8 => WeightFormat::Q8,
-            Quant::Fp8Block128 => WeightFormat::Fp8,
+            Quant::Fp8Block128 | Quant::Fp8Channel => WeightFormat::Fp8,
+            Quant::Nvfp4G16 => WeightFormat::Fp4,
         }
     }
 
     pub fn head(quant: Quant) -> WeightFormat {
         match quant {
-            Quant::Fp8Block128 => WeightFormat::Bf16,
+            q if q.quantised_checkpoint() => WeightFormat::Bf16,
             q => WeightFormat::of(q),
         }
     }
@@ -129,6 +131,7 @@ impl WeightFormat {
             WeightFormat::Bf16 => 0,
             WeightFormat::Q8 => 1,
             WeightFormat::Fp8 => 2,
+            WeightFormat::Fp4 => 3,
         }
     }
 
@@ -141,6 +144,7 @@ impl WeightFormat {
             WeightFormat::Bf16 => "linear_bf16",
             WeightFormat::Q8 => "linear_q8",
             WeightFormat::Fp8 => "linear_fp8",
+            WeightFormat::Fp4 => "linear_fp4",
         }
     }
 }
@@ -160,6 +164,7 @@ impl MmaShape {
             WeightFormat::Q8 => Q8_GROUP,
             WeightFormat::Fp8 if tile.bm == 16 => 128,
             WeightFormat::Fp8 => env_usize("SPECRT_FP8_BK", 64),
+            WeightFormat::Fp4 => 64,
             WeightFormat::Bf16 if tile.bm == 16 && k % 128 == 0 => 128,
             WeightFormat::Bf16 => env_usize("SPECRT_BK", 32),
         };
@@ -394,7 +399,7 @@ impl Module {
         };
         let mut smem = BTreeMap::new();
         let mma = mma_kernels(spec, &mut smem);
-        let fp8 = spec.quant == Quant::Fp8Block128;
+        let fp8 = spec.quant.is_fp8();
         let (flash_rows, flash_keys) = (flash_rows(a.head_dim), flash_keys(a.head_dim));
         let kv_bytes = FLASH_STAGES * 4 * flash_keys * a.head_dim * 2;
         let q_bytes = flash_rows * a.head_dim * 4;

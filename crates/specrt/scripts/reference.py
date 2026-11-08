@@ -430,7 +430,63 @@ def real_full(repo, out_dir, seq_file, act_quant):
     print(name, "done in", f"{time.time() - started:.0f}s")
 
 
+NVFP4_REPO = "orcarouter/Qwen3.8-27B-Uncensored-NVFP4"
+NVFP4_ROWS = {"gate_proj": [0, 1, 4095, 17407], "up_proj": [0, 9000], "down_proj": [0, 2561, 5119]}
+NVFP4_LAYERS = [0, 30, 55]
+FP8_CHANNEL_ROWS = [
+    (56, "mlp.gate_proj", [0, 17407]),
+    (63, "mlp.down_proj", [5119]),
+    (0, "linear_attn.in_proj_qkv", [0, 10239]),
+    (0, "linear_attn.in_proj_z", [6143]),
+    (3, "self_attn.o_proj", [0, 4000]),
+]
+
+
+def nvfp4_dequant(out_dir):
+    from compressed_tensors.compressors.nvfp4.base import NVFP4PackedCompressor
+    from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
+    from compressed_tensors.quantization.lifecycle.forward import dequantize
+    from safetensors import safe_open
+
+    src = snapshot_dir(NVFP4_REPO)
+    index = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
+
+    def tensor(name):
+        with safe_open(src / index[name], "pt") as f:
+            return f.get_tensor(name)
+
+    rows_f32, rows_bf16, entries = [], [], []
+    for layer in NVFP4_LAYERS:
+        for proj, rows in NVFP4_ROWS.items():
+            p = f"model.language_model.layers.{layer}.mlp.{proj}"
+            sd = {k: tensor(f"{p}.{k}") for k in ("weight_packed", "weight_scale", "weight_global_scale")}
+            sel = {"weight_packed": sd["weight_packed"][rows], "weight_scale": sd["weight_scale"][rows], "weight_global_scale": sd["weight_global_scale"]}
+            m, n = sel["weight_packed"].shape
+            q = unpack_fp4_from_uint8(sel["weight_packed"], m, n * 2, dtype=torch.float32)
+            w32 = dequantize(x_q=q, scale=sel["weight_scale"].to(torch.float32), global_scale=sel["weight_global_scale"], dtype=torch.float32)
+            w16 = NVFP4PackedCompressor.decompress(dict(sel), scheme=None)["weight"]
+            rows_f32.append(w32)
+            rows_bf16.append(w16.float())
+            entries.append({"kind": "nvfp4", "layer": layer, "proj": proj, "rows": rows, "cols": n * 2})
+    for layer, proj, rows in FP8_CHANNEL_ROWS:
+        p = f"model.language_model.layers.{layer}.{proj}"
+        w, s = tensor(f"{p}.weight")[rows], tensor(f"{p}.weight_scale")[rows]
+        w32 = dequantize(x_q=w, scale=s.to(torch.float32), dtype=torch.float32)
+        rows_f32.append(w32)
+        rows_bf16.append(w32.to(torch.bfloat16).float())
+        entries.append({"kind": "fp8_channel", "layer": layer, "proj": proj, "rows": rows, "cols": w.shape[1]})
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.cat([r.flatten() for r in rows_f32]).numpy().astype(np.float32).tofile(out_dir / "nvfp4-dequant.f32.bin")
+    torch.cat([r.flatten() for r in rows_bf16]).numpy().astype(np.float32).tofile(out_dir / "nvfp4-dequant.bf16.bin")
+    versions = {"torch": torch.__version__, "compressed_tensors": __import__("compressed_tensors").__version__}
+    (out_dir / "nvfp4-dequant.json").write_text(json.dumps({"entries": entries, **versions}))
+    print("nvfp4 dequant", len(entries), "tensors ->", out_dir)
+
+
 def main():
+    if sys.argv[1] == "nvfp4-dequant":
+        nvfp4_dequant(Path(sys.argv[2]))
+        return
     if sys.argv[1] == "real-prompts":
         real_prompts(sys.argv[2], Path(sys.argv[3]))
         return
