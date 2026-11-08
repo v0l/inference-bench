@@ -50,6 +50,24 @@ fn quant_override_parses() {
 }
 
 #[test]
+fn fp8_block_checkpoints_derive_the_fp8_quant_and_others_are_refused() {
+    let spec = derived("qwen3.8-27b.config.json");
+    assert_eq!(spec.quant, Quant::Fp8Block128);
+    assert!(spec.to_toml().unwrap().contains("quant = \"fp8_block128\""));
+    let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b.config.json")).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    v["quantization_config"]["weight_block_size"] = serde_json::json!([1, 128]);
+    assert!(Spec::from_hf_config(&v.to_string()).is_err());
+    v["quantization_config"] = serde_json::json!({"quant_method": "compressed-tensors"});
+    assert!(Spec::from_hf_config(&v.to_string()).is_err());
+    let text = std::fs::read_to_string(root().join("specs/qwen3-0.6b.toml"))
+        .unwrap()
+        .replace("quant = \"bf16\"", "quant = \"fp8_block128\"")
+        .replace("intermediate = 3072", "intermediate = 3000");
+    assert!(Spec::parse(&text).is_err(), "fp8 blocks need dims that are multiples of 128");
+}
+
+#[test]
 fn rejects_unsupported_rope_scaling() {
     let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3-0.6b.config.json"))
         .unwrap()

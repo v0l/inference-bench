@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const SPEC_FORMAT: u32 = 2;
+pub const SPEC_FORMAT: u32 = 3;
 
 pub const EMBEDDED: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/embedded_specs.rs"));
 
@@ -32,10 +32,12 @@ pub fn check(text: &str) -> Result<Checked> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Quant {
     Bf16,
     Q8,
+    #[serde(rename = "fp8_block128")]
+    Fp8Block128,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,7 +81,11 @@ impl LinearAttention {
     }
 
     pub fn in_proj_rows(&self) -> usize {
-        self.conv_dim() + self.value_dim() + 2 * self.value_heads
+        self.conv_dim() + self.value_dim()
+    }
+
+    pub fn ba_rows(&self) -> usize {
+        2 * self.value_heads
     }
 }
 
@@ -256,6 +262,22 @@ fn layer_pattern(types: &[String]) -> Result<Vec<Block>> {
     Ok(blocks[..period].to_vec())
 }
 
+fn parse_quantization(value: Option<&serde_json::Value>) -> Result<Quant> {
+    let Some(q) = value.filter(|v| !v.is_null()) else {
+        return Ok(Quant::Bf16);
+    };
+    let method = q.get("quant_method").and_then(|m| m.as_str()).unwrap_or("");
+    let fmt = q.get("fmt").and_then(|f| f.as_str()).unwrap_or("e4m3");
+    let block: Option<Vec<u64>> = q
+        .get("weight_block_size")
+        .and_then(|b| b.as_array())
+        .map(|b| b.iter().filter_map(|x| x.as_u64()).collect());
+    match (method, fmt, block.as_deref()) {
+        ("fp8", "e4m3", Some([128, 128])) => Ok(Quant::Fp8Block128),
+        _ => bail!("quantization {q} is not supported (fp8 e4m3 with 128x128 blocks is)"),
+    }
+}
+
 fn parse_rope_scaling(value: Option<&serde_json::Value>) -> Result<Option<RopeScaling>> {
     let Some(v) = value.filter(|v| !v.is_null()) else {
         return Ok(None);
@@ -312,6 +334,7 @@ impl Spec {
 
     pub fn from_hf_config(json: &str) -> Result<Self> {
         let mut value: serde_json::Value = serde_json::from_str(json)?;
+        let quant = parse_quantization(value.get("quantization_config"))?;
         let outer_type = value.get("model_type").cloned();
         if let Some(text) = value.get_mut("text_config").map(serde_json::Value::take) {
             value = text;
@@ -368,7 +391,7 @@ impl Spec {
             name: hf.model_type.clone(),
             min_engine: 0,
             repo: String::new(),
-            quant: Quant::Bf16,
+            quant,
             dims: Dims {
                 hidden: hf.hidden_size,
                 intermediate: hf.intermediate_size,
@@ -414,6 +437,18 @@ impl Spec {
             "layer count must be a multiple of the pattern length"
         );
         let rot = self.rotary_dim();
+        if self.quant == Quant::Fp8Block128 {
+            let block = 128;
+            let la_ok = self.linear_attention.as_ref().is_none_or(|l| l.value_dim().is_multiple_of(block) && l.conv_dim().is_multiple_of(block));
+            ensure!(
+                self.dims.hidden.is_multiple_of(block)
+                    && self.dims.intermediate.is_multiple_of(block)
+                    && self.attention.head_dim.is_multiple_of(block)
+                    && self.q_dim().is_multiple_of(block)
+                    && la_ok,
+                "fp8_block128 needs hidden, intermediate, head_dim and the linear value dim to be multiples of 128"
+            );
+        }
         ensure!(rot > 0 && rot.is_multiple_of(2) && rot <= a.head_dim, "rotary_dim must be even and at most head_dim");
         let has_linear = self.layers.pattern.iter().any(|b| b.is_linear());
         match (&self.linear_attention, has_linear) {

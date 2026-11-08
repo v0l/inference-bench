@@ -238,6 +238,60 @@ fn head_dim_256_logits_and_greedy_match_transformers() {
     logits_and_greedy_match_reference(WIDE, "tiny256");
 }
 
+const FP8: &str = "tiny-qwen3.5-fp8";
+
+#[test]
+fn fp8_fixture_is_sharded_with_block_scales_and_the_spec_says_so() {
+    let s = spec_for(FP8);
+    assert_eq!(s.quant, specrt::spec::Quant::Fp8Block128);
+    let ck = specrt::weights::Checkpoint::open(&fixture_dir(FP8)).unwrap();
+    assert_eq!(ck.files.len(), 4);
+    let w = ck.view("model.layers.2.mlp.down_proj.weight").unwrap();
+    assert_eq!(w.dtype, safetensors::Dtype::F8_E4M3);
+    assert_eq!(w.shape, [256, 512]);
+    let scale = ck.view("model.layers.2.mlp.down_proj.weight_scale_inv").unwrap();
+    assert_eq!(scale.shape, [2, 4]);
+    assert_eq!(ck.view("model.layers.0.linear_attn.in_proj_b.weight").unwrap().dtype, safetensors::Dtype::BF16);
+    let layer = ck.layer(&s, 0).unwrap();
+    assert!(matches!(layer.gate_up, specrt::weights::Matrix::Fp8 { .. }));
+    let mut bf16 = s.clone();
+    bf16.quant = specrt::spec::Quant::Bf16;
+    assert!(ck.layer(&bf16, 0).is_err(), "an FP8 checkpoint under a bf16 spec is refused");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-fp8 output"]
+fn fp8_decode_matches_the_dequantised_reference_per_layer() {
+    decode_matches_reference(FP8, "tinyfp8");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-fp8 output"]
+fn fp8_prefill_matches_the_dequantised_reference_per_layer() {
+    prefill_matches_reference(FP8, "tinyfp8");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-fp8 output"]
+fn fp8_logits_and_greedy_match_transformers() {
+    logits_and_greedy_match_reference(FP8, "tinyfp8");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn fp8_batch_decode_matches_single_sequence_greedy() {
+    let s = spec_for(FP8);
+    let prompts: Vec<Vec<u32>> =
+        (0..4u32).map(|q| (0..40u32).map(|i| (i * 7 + q * 131) % 1024).collect()).collect();
+    let mut single = Runtime::load(&s, 256).unwrap();
+    assert!(single.peak_host_rss_bytes > 0 && single.weight_bytes > 0);
+    let expected: Vec<Vec<u32>> =
+        prompts.iter().map(|p| single.generate(p, 24, Sampling::GREEDY).unwrap().tokens).collect();
+    drop(single);
+    let mut batch = Runtime::load_batched(&s, 256, 4).unwrap();
+    assert_eq!(batch.generate_batch(&prompts, 24).unwrap().tokens, expected);
+}
+
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn head_dim_256_batch_decode_matches_single_sequence_greedy() {

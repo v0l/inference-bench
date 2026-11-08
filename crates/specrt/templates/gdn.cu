@@ -5,12 +5,13 @@ constexpr int LA_K = {{LA_CONV_K}};
 constexpr int LA_KEY_DIM = LA_KH * LA_D;
 constexpr int LA_VALUE_DIM = LA_VH * LA_D;
 constexpr int LA_CONV_DIM = 2 * LA_KEY_DIM + LA_VALUE_DIM;
-constexpr int LA_IN_ROWS = LA_CONV_DIM + LA_VALUE_DIM + 2 * LA_VH;
+constexpr int LA_IN_ROWS = LA_CONV_DIM + LA_VALUE_DIM;
+constexpr int LA_BA_ROWS = 2 * LA_VH;
 constexpr int LA_RATIO = LA_VH / LA_KH;
 constexpr int LA_V_OFF = 2 * LA_KEY_DIM;
 constexpr int LA_Z_OFF = LA_CONV_DIM;
-constexpr int LA_B_OFF = LA_CONV_DIM + LA_VALUE_DIM;
-constexpr int LA_A_OFF = LA_B_OFF + LA_VH;
+constexpr int LA_B_OFF = 0;
+constexpr int LA_A_OFF = LA_VH;
 constexpr int LA_STATE = LA_D * LA_D;
 constexpr int LA_CHUNK = {{LA_CHUNK}};
 constexpr int LA_KSPLIT = {{LA_KSPLIT}};
@@ -29,10 +30,10 @@ __device__ __forceinline__ float softplus(float x) {
     return x > 20.0f ? x : log1pf(expf(x));
 }
 
-__device__ __forceinline__ void gdn_gate(const float* lin_row, const float* neg_a, const float* dt_bias, int h,
+__device__ __forceinline__ void gdn_gate(const float* ba_row, const float* neg_a, const float* dt_bias, int h,
                                          float& g, float& beta) {
-    g = neg_a[h] * softplus(lin_row[LA_A_OFF + h] + dt_bias[h]);
-    beta = 1.0f / (1.0f + expf(-lin_row[LA_B_OFF + h]));
+    g = neg_a[h] * softplus(ba_row[LA_A_OFF + h] + dt_bias[h]);
+    beta = 1.0f / (1.0f + expf(-ba_row[LA_B_OFF + h]));
 }
 
 __device__ __forceinline__ float conv_tap(const float* w, const float* window) {
@@ -99,6 +100,7 @@ extern "C" __global__ void gdn_conv_keep(const float* lin, float* state, int slo
 }
 
 extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const float* mix, const float* lin,
+                                                                        const float* ba,
                                                                         const float* neg_a, const float* dt_bias,
                                                                         const float* norm_w, float* state,
                                                                         float* out, int slot, int seq_slots) {
@@ -112,6 +114,7 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const fl
     int seq = blockIdx.y;
     mix += (size_t)seq * LA_CONV_DIM;
     lin += (size_t)seq * LA_IN_ROWS;
+    ba += (size_t)seq * LA_BA_ROWS;
     out += (size_t)seq * LA_VALUE_DIM;
     slot += seq * seq_slots;
     int kh = h / LA_RATIO;
@@ -127,7 +130,7 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const fl
         k_s[tid] = l2_k(kv, kss);
     }
     float g, beta;
-    gdn_gate(lin, neg_a, dt_bias, h, g, beta);
+    gdn_gate(ba, neg_a, dt_bias, h, g, beta);
     float decay = expf(g);
     __syncthreads();
     float* S = state + ((size_t)slot * LA_VH + h) * LA_STATE;
@@ -184,11 +187,11 @@ extern "C" __global__ void gdn_qk_prep(const float* mix, float* qn, float* kn) {
     kn[at] = l2_k(k, kss);
 }
 
-extern "C" __global__ void gdn_gates(const float* lin, const float* neg_a, const float* dt_bias, float* g, float* beta) {
+extern "C" __global__ void gdn_gates(const float* ba, const float* neg_a, const float* dt_bias, float* g, float* beta) {
     int t = blockIdx.x;
     for (int h = threadIdx.x; h < LA_VH; h += blockDim.x) {
         size_t at = (size_t)t * LA_VH + h;
-        gdn_gate(lin + (size_t)t * LA_IN_ROWS, neg_a, dt_bias, h, g[at], beta[at]);
+        gdn_gate(ba + (size_t)t * LA_BA_ROWS, neg_a, dt_bias, h, g[at], beta[at]);
     }
 }
 
@@ -435,7 +438,11 @@ extern "C" __global__ void gdn_gated_norm(const float* o, const float* lin, cons
 }
 
 extern "C" __global__ void lin_in_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {
-    linear_norm<{{Q8}}, LA_IN_ROWS, false>(w, s, b, x, nw, out);
+    linear_norm<{{WF}}, LA_IN_ROWS, false>(w, s, b, x, nw, out);
+}
+
+extern "C" __global__ void lin_ba_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {
+    linear_norm<WF_BF16, LA_BA_ROWS, false>(w, s, b, x, nw, out);
 }
 
 extern "C" __global__ void lin_out_proj(const void* w, const float* s, const float* b, const float* x, float* out) {

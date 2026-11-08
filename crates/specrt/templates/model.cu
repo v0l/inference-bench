@@ -15,38 +15,38 @@ extern "C" __global__ void down_proj(const void* w, const float* s, const float*
 }
 
 extern "C" __global__ void lm_head(const void* w, const float* s, const float* b, const float* x, float* out) {
-    {{LINEAR}}<{{VOCAB}}, {{HIDDEN}}, false, false>(w, s, b, x, out);
+    {{HEAD_LINEAR}}<{{VOCAB}}, {{HIDDEN}}, false, false>(w, s, b, x, out);
 }
 
 extern "C" __global__ void qkv_gemm(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm<{{QKV_N}}, {{HIDDEN}}, {{QKV_BIAS}}, false, {{Q8}}>(w, s, b, x, out, tokens);
+    gemm<{{QKV_N}}, {{HIDDEN}}, {{QKV_BIAS}}, false, {{WF}}>(w, s, b, x, out, tokens);
 }
 
 extern "C" __global__ void o_gemm(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm<{{HIDDEN}}, {{Q_DIM}}, false, true, {{Q8}}>(w, s, b, x, out, tokens);
+    gemm<{{HIDDEN}}, {{Q_DIM}}, false, true, {{WF}}>(w, s, b, x, out, tokens);
 }
 
 extern "C" __global__ void gate_up_gemm(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm<{{GATE_UP_N}}, {{HIDDEN}}, false, false, {{Q8}}>(w, s, b, x, out, tokens);
+    gemm<{{GATE_UP_N}}, {{HIDDEN}}, false, false, {{WF}}>(w, s, b, x, out, tokens);
 }
 
 extern "C" __global__ void down_gemm(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm<{{HIDDEN}}, {{INTER}}, false, true, {{Q8}}>(w, s, b, x, out, tokens);
+    gemm<{{HIDDEN}}, {{INTER}}, false, true, {{WF}}>(w, s, b, x, out, tokens);
 }
 
 extern "C" __global__ void lm_head_gemm(const void* w, const float* s, const float* b, const float* x, float* out, int tokens) {
-    gemm<{{VOCAB}}, {{HIDDEN}}, false, false, {{Q8}}>(w, s, b, x, out, tokens);
+    gemm<{{VOCAB}}, {{HIDDEN}}, false, false, {{HEAD_WF}}>(w, s, b, x, out, tokens);
 }
 
 {{MMA_KERNELS}}
 extern "C" __global__ void qkv_proj_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {
-    linear_norm<{{Q8}}, {{QKV_N}}, {{QKV_BIAS}}>(w, s, b, x, nw, out);
+    linear_norm<{{WF}}, {{QKV_N}}, {{QKV_BIAS}}>(w, s, b, x, nw, out);
 }
 
 extern "C" __global__ void gate_up_act(const void* w, const float* s, const float* x, const float* nw, float* out) {
-    gate_up_act_norm<{{Q8}}>(w, s, x, nw, out);
+    gate_up_act_norm<{{WF}}>(w, s, x, nw, out);
 }
 
 extern "C" __global__ void lm_head_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {
-    linear_norm<{{Q8}}, {{VOCAB}}, false>(w, s, b, x, nw, out);
+    linear_norm<{{HEAD_WF}}, {{VOCAB}}, false>(w, s, b, x, nw, out);
 }

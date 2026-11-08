@@ -1,7 +1,7 @@
 use crate::codegen::{LA_CHUNK, LA_COLS, LA_KSPLIT, Module, PAGE};
 use crate::jit::{Jit, default_cache_dir};
 use crate::spec::{LinearAttention, Spec};
-use crate::weights::{Matrix, Mixer, Weights, find_safetensors};
+use crate::weights::{Checkpoint, Matrix, Mixer, peak_rss_bytes};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::{
@@ -15,6 +15,29 @@ use std::time::Instant;
 enum DeviceMatrix {
     Bf16(CudaSlice<u16>),
     Q8 { values: CudaSlice<i8>, scales: CudaSlice<f32> },
+    Fp8 { values: CudaSlice<u8>, scales: CudaSlice<f32> },
+}
+
+impl DeviceMatrix {
+    fn upload(stream: &Arc<CudaStream>, m: &Matrix) -> Result<Self> {
+        Ok(match m {
+            Matrix::Bf16(w) => DeviceMatrix::Bf16(stream.clone_htod(w.as_ref())?),
+            Matrix::Q8 { values, scales } => {
+                DeviceMatrix::Q8 { values: stream.clone_htod(values)?, scales: stream.clone_htod(scales)? }
+            }
+            Matrix::Fp8 { values, scales } => {
+                DeviceMatrix::Fp8 { values: stream.clone_htod(values.as_ref())?, scales: stream.clone_htod(scales)? }
+            }
+        })
+    }
+
+    fn args<'a>(&'a self, b: &mut cudarc::driver::LaunchArgs<'a>, dummy: &'a CudaSlice<f32>) {
+        match self {
+            DeviceMatrix::Bf16(w) => b.arg(w).arg(dummy),
+            DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
+            DeviceMatrix::Fp8 { values, scales } => b.arg(values).arg(scales),
+        };
+    }
 }
 
 struct DeviceAttn {
@@ -28,6 +51,7 @@ struct DeviceAttn {
 
 struct DeviceGdn {
     in_proj: DeviceMatrix,
+    ba: DeviceMatrix,
     conv: CudaSlice<f32>,
     neg_a: CudaSlice<f32>,
     dt_bias: CudaSlice<f32>,
@@ -54,9 +78,11 @@ struct GdnBuffers {
     conv_state: CudaSlice<f32>,
     ssm_state: CudaSlice<f32>,
     lin: CudaSlice<f32>,
+    ba: CudaSlice<f32>,
     mix: CudaSlice<f32>,
     out: CudaSlice<f32>,
     pre_lin: CudaSlice<f32>,
+    pre_ba: CudaSlice<f32>,
     pre_mix: CudaSlice<f32>,
     qn: CudaSlice<f32>,
     kn: CudaSlice<f32>,
@@ -81,9 +107,11 @@ impl GdnBuffers {
             conv_state: zeros(slots * la.conv_dim() * (la.conv_kernel - 1))?,
             ssm_state: zeros(slots * la.value_heads * d * d)?,
             lin: zeros(la.in_proj_rows())?,
+            ba: zeros(la.ba_rows())?,
             mix: zeros(la.conv_dim())?,
             out: zeros(la.value_dim())?,
             pre_lin: zeros(chunk * la.in_proj_rows())?,
+            pre_ba: zeros(chunk * la.ba_rows())?,
             pre_mix: zeros(chunk * la.conv_dim())?,
             qn: zeros(chunk * la.key_heads * d)?,
             kn: zeros(chunk * la.key_heads * d)?,
@@ -224,6 +252,10 @@ pub struct Runtime {
     pub jit_key: String,
     pub arch: String,
     pub device_bytes: u64,
+    pub weight_bytes: u64,
+    pub weight_secs: f64,
+    pub load_secs: f64,
+    pub peak_host_rss_bytes: u64,
     ctx: Arc<CudaContext>,
     baseline_free: usize,
 }
@@ -276,25 +308,19 @@ impl Runtime {
             kernels.insert(name, f);
         }
         let smem = module.smem.clone();
-        let weights = Weights::load(spec, &find_safetensors(&spec.repo)?)?;
-        let up_m = |m: &Matrix| -> Result<DeviceMatrix> {
-            Ok(match m {
-                Matrix::Bf16(w) => DeviceMatrix::Bf16(stream.clone_htod(w)?),
-                Matrix::Q8 { values, scales } => DeviceMatrix::Q8 {
-                    values: stream.clone_htod(values)?,
-                    scales: stream.clone_htod(scales)?,
-                },
-            })
-        };
+        let checkpoint = Checkpoint::for_repo(&spec.repo)?;
+        let weights_started = Instant::now();
+        let up_m = |m: &Matrix| DeviceMatrix::upload(&stream, m);
         let up_opt = |v: &Option<Vec<f32>>| -> Result<Option<CudaSlice<f32>>> {
             Ok(match v {
                 Some(v) => Some(stream.clone_htod(v)?),
                 None => None,
             })
         };
-        let mut layers = Vec::with_capacity(weights.layers.len());
+        let mut layers = Vec::with_capacity(spec.layers.count);
         let (mut kv, mut slot) = (0i32, 0i32);
-        for l in &weights.layers {
+        for i in 0..spec.layers.count {
+            let l = checkpoint.layer(spec, i).with_context(|| format!("layer {i}"))?;
             let mixer = match &l.mixer {
                 Mixer::Attention(a) => {
                     kv += 1;
@@ -311,6 +337,7 @@ impl Runtime {
                     slot += 1;
                     DeviceMixer::Linear(DeviceGdn {
                         in_proj: up_m(&g.in_proj)?,
+                        ba: up_m(&g.ba)?,
                         conv: stream.clone_htod(&g.conv)?,
                         neg_a: stream.clone_htod(&g.neg_a)?,
                         dt_bias: stream.clone_htod(&g.dt_bias)?,
@@ -327,7 +354,19 @@ impl Runtime {
                 gate_up: up_m(&l.gate_up)?,
                 down: up_m(&l.down)?,
             });
+            stream.synchronize()?;
+            drop(l);
+            checkpoint.release();
         }
+        let outside = checkpoint.outside(spec)?;
+        let embed = stream.clone_htod(outside.embed.as_ref())?;
+        let norm = stream.clone_htod(&outside.norm)?;
+        let lm_head = up_m(&outside.lm_head)?;
+        stream.synchronize()?;
+        drop(outside);
+        checkpoint.release();
+        let weight_secs = weights_started.elapsed().as_secs_f64();
+        let weight_bytes = free_before.saturating_sub(ctx.mem_get_info().map(|(f, _)| f).unwrap_or(0)) as u64;
         let d = &spec.dims;
         let pages = max_ctx.div_ceil(PAGE);
         let cache_len = batch
@@ -395,9 +434,9 @@ impl Runtime {
             use_mma,
             spec: spec.clone(),
             max_ctx,
-            embed: stream.clone_htod(&weights.embed)?,
-            norm: stream.clone_htod(&weights.norm)?,
-            lm_head: up_m(&weights.lm_head)?,
+            embed,
+            norm,
+            lm_head,
             layers,
             buf,
             kernels,
@@ -406,6 +445,10 @@ impl Runtime {
             jit_key: loaded.key,
             arch: jit.arch().to_string(),
             device_bytes: 0,
+            weight_bytes,
+            weight_secs,
+            load_secs: 0.0,
+            peak_host_rss_bytes: 0,
             ctx: ctx.clone(),
             baseline_free: free_before,
         };
@@ -413,16 +456,22 @@ impl Runtime {
         let free_after = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         let mut rt = rt;
         rt.device_bytes = free_before.saturating_sub(free_after) as u64;
+        rt.load_secs = load_started.elapsed().as_secs_f64();
+        rt.peak_host_rss_bytes = peak_rss_bytes().unwrap_or(0);
         tracing::info!(
             spec = %rt.spec.name,
             jit_key = %rt.jit_key,
             jit_cache_hit = rt.cache_hit,
             jit_secs = jit_secs,
             arch = %rt.arch,
+            shards = checkpoint.files.len(),
+            weight_bytes = rt.weight_bytes,
+            weight_secs = rt.weight_secs,
+            peak_host_rss_bytes = rt.peak_host_rss_bytes,
             vram_before_bytes = free_before,
             vram_after_bytes = free_after,
             device_bytes = rt.device_bytes,
-            load_secs = load_started.elapsed().as_secs_f64(),
+            load_secs = rt.load_secs,
             "runtime loaded"
         );
         Ok(rt)
@@ -442,10 +491,7 @@ impl Runtime {
         rows: usize,
     ) -> Result<()> {
         let mut b = self.stream.launch_builder(self.kernel(name));
-        match w {
-            DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
-            DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
-        };
+        w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out);
         unsafe { b.launch(cfg(grid(rows, LINEAR_ROWS_PER_BLOCK), 256)) }?;
         Ok(())
@@ -462,10 +508,7 @@ impl Runtime {
         rows: usize,
     ) -> Result<()> {
         let mut b = self.stream.launch_builder(self.kernel(name));
-        match w {
-            DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
-            DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
-        };
+        w.args(&mut b, &self.buf.dummy);
         if name != "gate_up_act" {
             b.arg(bias.unwrap_or(&self.buf.dummy));
         }
@@ -512,6 +555,7 @@ impl Runtime {
         let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
         let la = &gb.la;
         self.linear_norm("lin_in_norm", &g.in_proj, None, x, ln1, &gb.lin, la.in_proj_rows())?;
+        self.linear_norm("lin_ba_norm", &g.ba, None, x, ln1, &gb.ba, la.ba_rows())?;
         let zero = 0i32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
         b.arg(&gb.lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.mix).arg(&g.slot).arg(&zero);
@@ -519,6 +563,7 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel("gdn_step"));
         b.arg(&gb.mix)
             .arg(&gb.lin)
+            .arg(&gb.ba)
             .arg(&g.neg_a)
             .arg(&g.dt_bias)
             .arg(&g.norm)
@@ -614,10 +659,7 @@ impl Runtime {
         tokens: usize,
     ) -> Result<()> {
         let mut b = self.stream.launch_builder(self.kernel(name));
-        match w {
-            DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
-            DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
-        };
+        w.args(&mut b, &self.buf.dummy);
         let n = tokens as i32;
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out).arg(&n);
         let config = LaunchConfig {
@@ -655,10 +697,7 @@ impl Runtime {
         let tile = Tile::variant(suffix);
         let kernel = format!("{name}_mma{suffix}");
         let mut b = self.stream.launch_builder(self.kernel(&kernel));
-        match w {
-            DeviceMatrix::Bf16(w) => b.arg(w).arg(&self.buf.dummy),
-            DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
-        };
+        w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
@@ -711,6 +750,7 @@ impl Runtime {
         let slot = g.slot + self.seq * self.spec.linear_layers() as i32;
         let d = la.key_head_dim;
         self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
+        self.tc("lin_ba", &g.ba, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_ba), la.ba_rows(), n)?;
         let launch = |name: &str, grid_dim: (u32, u32, u32), block: u32, smem: u32| LaunchConfig {
             grid_dim,
             block_dim: (block, 1, 1),
@@ -727,7 +767,7 @@ impl Runtime {
         b.arg(&gb.pre_mix).arg(&gb.qn).arg(&gb.kn);
         unsafe { b.launch(launch("", (la.key_heads as u32, n as u32, 1), d as u32, 0)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_gates"));
-        b.arg(&gb.pre_lin).arg(&g.neg_a).arg(&g.dt_bias).arg(&gb.g).arg(&gb.beta);
+        b.arg(&gb.pre_ba).arg(&g.neg_a).arg(&g.dt_bias).arg(&gb.g).arg(&gb.beta);
         unsafe { b.launch(cfg(n as u32, 64)) }?;
         let chunks = n.div_ceil(LA_CHUNK) as u32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_chunk_prep"));
@@ -1079,6 +1119,7 @@ impl Runtime {
         let n = self.batch;
         let pre = &self.pre;
         self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
+        self.tc("lin_ba", &g.ba, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_ba), la.ba_rows(), n)?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
         b.arg(&gb.pre_lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.pre_mix).arg(&g.slot).arg(&seq_slots);
         let config = LaunchConfig {
@@ -1090,6 +1131,7 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel("gdn_step"));
         b.arg(&gb.pre_mix)
             .arg(&gb.pre_lin)
+            .arg(&gb.pre_ba)
             .arg(&g.neg_a)
             .arg(&g.dt_bias)
             .arg(&g.norm)

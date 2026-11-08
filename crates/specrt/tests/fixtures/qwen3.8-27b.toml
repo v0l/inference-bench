@@ -1,7 +1,7 @@
 name = "qwen3.8-27b"
-min_engine = 2
+min_engine = 3
 repo = "Qwen/Qwen3.8-27B-FP8"
-quant = "bf16"
+quant = "fp8_block128"
 
 [dims]
 hidden = 5120

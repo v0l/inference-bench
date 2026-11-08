@@ -87,6 +87,86 @@ def tiny_model(fixture, head_dim=128):
     return model
 
 
+FP8_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj", "gate_proj", "up_proj", "down_proj")
+FP8_BLOCK = 128
+FP8_MAX = 448.0
+
+
+def quantize_fp8_block(w):
+    rows, cols = w.shape
+    blocks = w.float().reshape(rows // FP8_BLOCK, FP8_BLOCK, cols // FP8_BLOCK, FP8_BLOCK)
+    amax = blocks.abs().amax(dim=(1, 3)).clamp(min=1e-12)
+    scale = (amax / FP8_MAX).to(torch.bfloat16)
+    s = scale.float()[:, None, :, None]
+    q = (blocks / s).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return q.reshape(rows, cols), scale
+
+
+def dequantize_fp8_block(q, scale):
+    rows, cols = q.shape
+    s = scale.float().repeat_interleave(FP8_BLOCK, 0).repeat_interleave(FP8_BLOCK, 1)
+    return q.float() * s[:rows, :cols]
+
+
+def is_fp8_projection(name):
+    return name.endswith(".weight") and name.split(".")[-2] in FP8_PROJECTIONS
+
+
+def write_fp8_shards(src, dst):
+    from safetensors.torch import load_file, save_file
+
+    dst.mkdir(parents=True, exist_ok=True)
+    shards = {}
+    for name, w in sorted(load_file(src / "model.safetensors").items()):
+        parts = name.split(".")
+        shard = f"layers-{parts[2]}.safetensors" if parts[1] == "layers" else "outside.safetensors"
+        group = shards.setdefault(shard, {})
+        if is_fp8_projection(name):
+            group[name], group[name + "_scale_inv"] = quantize_fp8_block(w)
+        else:
+            group[name] = w
+    weight_map = {}
+    for shard, tensors in shards.items():
+        save_file({k: v.contiguous() for k, v in tensors.items()}, dst / shard)
+        weight_map.update({k: shard for k in tensors})
+    (dst / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}, indent=1))
+    config = json.loads((src / "config.json").read_text())
+    config["quantization_config"] = {
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "quant_method": "fp8",
+        "weight_block_size": [FP8_BLOCK, FP8_BLOCK],
+    }
+    (dst / "config.json").write_text(json.dumps(config, indent=2))
+
+
+def dequantized_state(fixture):
+    from safetensors.torch import load_file
+
+    index = json.loads((fixture / "model.safetensors.index.json").read_text())
+    raw = {}
+    for shard in sorted(set(index["weight_map"].values())):
+        raw.update(load_file(fixture / shard))
+    state = {}
+    for name, w in raw.items():
+        if name.endswith("_scale_inv"):
+            continue
+        state[name] = dequantize_fp8_block(w, raw[name + "_scale_inv"]) if w.dtype == torch.float8_e4m3fn else w.float()
+    return state
+
+
+def tiny_fp8_model(fixture):
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
+
+    src = fixture.parent / "tiny-qwen3.5-hd256"
+    if not (fixture / "model.safetensors.index.json").exists():
+        write_fp8_shards(src, fixture)
+    torch.manual_seed(TINY_SEED)
+    model = Qwen3_5ForCausalLM(tiny_config(256)).float().eval()
+    model.load_state_dict(dequantized_state(fixture), strict=True)
+    return model
+
+
 def tiny_tokens(n, salt):
     g = torch.Generator().manual_seed(TINY_SEED + salt)
     return torch.randint(0, 1024, (n,), generator=g)
@@ -117,12 +197,12 @@ def save(out_dir, name, arrays, meta):
     (out_dir / f"{name}.json").write_text(json.dumps(meta))
 
 
-def tiny(fixture, out_dir, head_dim=128):
+def tiny(fixture, out_dir, head_dim=128, fp8=False):
     from transformers import DynamicCache
 
     torch.set_num_threads(4)
-    model = tiny_model(fixture, head_dim)
-    prefix = "tiny" if head_dim == 128 else f"tiny{head_dim}"
+    model = tiny_fp8_model(fixture) if fp8 else tiny_model(fixture, head_dim)
+    prefix = "tinyfp8" if fp8 else "tiny" if head_dim == 128 else f"tiny{head_dim}"
     out_dir.mkdir(parents=True, exist_ok=True)
     versions = {"torch": torch.__version__, "transformers": __import__("transformers").__version__}
     with torch.inference_mode():
@@ -165,6 +245,9 @@ def tiny(fixture, out_dir, head_dim=128):
 def main():
     if sys.argv[1] == "tiny":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4]) if len(sys.argv) > 4 else 128)
+        return
+    if sys.argv[1] == "tiny-fp8":
+        tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, fp8=True)
         return
     spec_path = Path(sys.argv[1])
     out_dir = Path(sys.argv[2])

@@ -7,6 +7,7 @@ pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
+pub const FP8_BLOCK: usize = 128;
 pub const BATCH_DECODE_SPLITS: usize = 8;
 const FLASH_SMEM_LIMIT: usize = 99 * 1024;
 
@@ -32,7 +33,7 @@ pub struct Tile {
 }
 
 pub const MMA_LINEARS: [&str; 5] = ["qkv", "o", "gate_up", "down", "lm_head"];
-pub const GDN_LINEARS: [&str; 2] = ["lin_in", "lin_out"];
+pub const GDN_LINEARS: [&str; 3] = ["lin_in", "lin_out", "lin_ba"];
 pub const MMA_VARIANTS: [&str; 4] = ["", "_big", "_narrow", "_tiny"];
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -72,32 +73,76 @@ impl Tile {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightFormat {
+    Bf16,
+    Q8,
+    Fp8,
+}
+
+impl WeightFormat {
+    pub fn of(quant: Quant) -> WeightFormat {
+        match quant {
+            Quant::Bf16 => WeightFormat::Bf16,
+            Quant::Q8 => WeightFormat::Q8,
+            Quant::Fp8Block128 => WeightFormat::Fp8,
+        }
+    }
+
+    pub fn head(quant: Quant) -> WeightFormat {
+        match quant {
+            Quant::Fp8Block128 => WeightFormat::Bf16,
+            q => WeightFormat::of(q),
+        }
+    }
+
+    pub fn code(self) -> u32 {
+        match self {
+            WeightFormat::Bf16 => 0,
+            WeightFormat::Q8 => 1,
+            WeightFormat::Fp8 => 2,
+        }
+    }
+
+    pub fn bytes(self) -> bool {
+        self != WeightFormat::Bf16
+    }
+
+    fn gemv(self) -> &'static str {
+        match self {
+            WeightFormat::Bf16 => "linear_bf16",
+            WeightFormat::Q8 => "linear_q8",
+            WeightFormat::Fp8 => "linear_fp8",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MmaShape {
     pub tile: Tile,
     pub bk: usize,
     pub stages: usize,
     pub split: bool,
-    pub q8: bool,
+    pub wf: WeightFormat,
 }
 
 impl MmaShape {
-    pub fn new(tile: Tile, k: usize, q8: bool, split: bool) -> MmaShape {
-        let bk = if q8 {
-            Q8_GROUP
-        } else if tile.bm == 16 && k % 128 == 0 {
-            128
-        } else {
-            env_usize("SPECRT_BK", 32)
+    pub fn new(tile: Tile, k: usize, wf: WeightFormat, split: bool) -> MmaShape {
+        let bk = match wf {
+            WeightFormat::Q8 => Q8_GROUP,
+            WeightFormat::Fp8 if tile.bm == 16 => 128,
+            WeightFormat::Fp8 => env_usize("SPECRT_FP8_BK", 64),
+            WeightFormat::Bf16 if tile.bm == 16 && k % 128 == 0 => 128,
+            WeightFormat::Bf16 => env_usize("SPECRT_BK", 32),
         };
         let stages = if tile.bm == 16 { 2 } else { env_usize("SPECRT_STAGES", 2) };
-        MmaShape { tile, bk, stages, split, q8 }
+        MmaShape { tile, bk, stages, split, wf }
     }
 
     pub fn smem_bytes(&self) -> u32 {
         let planes = if self.split { 2 } else { 1 };
         let a = self.tile.bm * self.bk * 2 * planes;
-        let wrow = if self.q8 { self.bk + 16 } else { self.bk * 2 };
+        let wrow = if self.wf.bytes() { self.bk + 16 } else { self.bk * 2 };
         ((a + self.tile.bn * wrow) * self.stages) as u32
     }
 }
@@ -167,6 +212,7 @@ pub const GDN_KERNELS: &[&str] = &[
     "gdn_chunk_scan",
     "gdn_gated_norm",
     "lin_in_norm",
+    "lin_ba_norm",
     "lin_out_proj",
     "lin_in_mma",
     "lin_out_mma",
@@ -176,6 +222,10 @@ pub const GDN_KERNELS: &[&str] = &[
     "lin_out_mma_narrow",
     "lin_in_mma_tiny",
     "lin_out_mma_tiny",
+    "lin_ba_mma",
+    "lin_ba_mma_big",
+    "lin_ba_mma_narrow",
+    "lin_ba_mma_tiny",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -228,26 +278,31 @@ fn linear_dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str, bool) 
         "gate_up" => (2 * d.intermediate, d.hidden, "EPI_ACT", false),
         "down" => (d.hidden, d.intermediate, "EPI_RESIDUAL", false),
         "lin_in" => (la.map_or(0, |l| l.in_proj_rows()), d.hidden, "EPI_STORE", false),
+        "lin_ba" => (la.map_or(0, |l| l.ba_rows()), d.hidden, "EPI_STORE", false),
         "lin_out" => (d.hidden, la.map_or(0, |l| l.value_dim()), "EPI_RESIDUAL", false),
         _ => (d.vocab, d.hidden, "EPI_STORE", false),
     }
 }
 
 fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
-    let q8 = spec.quant == Quant::Q8;
     let unsplit = std::env::var("SPECRT_UNSPLIT").unwrap_or_default();
     let mut out = String::new();
     let gdn: &[&str] = if spec.linear_attention.is_some() { &GDN_LINEARS } else { &[] };
     for &linear in MMA_LINEARS.iter().chain(gdn) {
-        let split = !q8 && !unsplit.split(',').any(|n| n == linear);
+        let wf = match linear {
+            "lm_head" => WeightFormat::head(spec.quant),
+            "lin_ba" => WeightFormat::Bf16,
+            _ => WeightFormat::of(spec.quant),
+        };
+        let split = wf != WeightFormat::Q8 && !unsplit.split(',').any(|n| n == linear);
         let (n, k, epi, bias) = linear_dims(spec, linear);
         for suffix in MMA_VARIANTS {
-            let shape = MmaShape::new(Tile::variant(suffix), k, q8, split);
+            let shape = MmaShape::new(Tile::variant(suffix), k, wf, split);
             let t = shape.tile;
             let name = mma_kernel_name(linear, suffix);
             smem.insert(name, shape.smem_bytes());
             out.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, {q8}, {split}>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, {wf}, {split}>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
                 threads = t.threads(),
                 bm = t.bm,
                 bn = t.bn,
@@ -255,6 +310,7 @@ fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
                 wn = t.wn,
                 bk = shape.bk,
                 stages = shape.stages,
+                wf = wf.code(),
             ));
         }
     }
@@ -265,10 +321,8 @@ impl Module {
     pub fn generate(spec: &Spec, max_ctx: usize) -> Result<Self> {
         let a = &spec.attention;
         let d = &spec.dims;
-        let linear = match spec.quant {
-            Quant::Bf16 => "linear_bf16",
-            Quant::Q8 => "linear_q8",
-        };
+        let wf = WeightFormat::of(spec.quant);
+        let head_wf = WeightFormat::head(spec.quant);
         let scaling = spec.rope.scaling.as_ref();
         let rope_kind = match scaling.map(|s| s.kind) {
             None => 0,
@@ -317,6 +371,7 @@ impl Module {
             ("MAX_CTX", max_ctx.to_string()),
             ("PAGE", PAGE.to_string()),
             ("Q8_GROUP", Q8_GROUP.to_string()),
+            ("FP8_BLOCK", FP8_BLOCK.to_string()),
             ("BD_SPLITS", BATCH_DECODE_SPLITS.to_string()),
             ("Q_DIM", spec.q_dim().to_string()),
             ("QKV_N", spec.qkv_rows().to_string()),
@@ -331,8 +386,10 @@ impl Module {
             ("LA_KSPLIT", LA_KSPLIT.to_string()),
             ("LA_COLS", LA_COLS.to_string()),
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
-            ("LINEAR", linear.to_string()),
-            ("Q8", (spec.quant == Quant::Q8).to_string()),
+            ("LINEAR", wf.gemv().to_string()),
+            ("HEAD_LINEAR", head_wf.gemv().to_string()),
+            ("WF", wf.code().to_string()),
+            ("HEAD_WF", head_wf.code().to_string()),
             ("MMA_KERNELS", mma),
             ("FM_STAGES", FLASH_STAGES.to_string()),
             ("FM_BK", flash_keys.to_string()),

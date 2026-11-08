@@ -54,12 +54,31 @@ fn q8_spec_selects_q8_linears() {
 #[test]
 fn bf16_prefill_splits_activations_and_q8_does_not() {
     let bf16 = Module::generate(&spec("qwen3-0.6b.toml"), 256).unwrap();
-    assert!(bf16.source.contains("EPI_ACT, false, false, true>"));
+    assert!(bf16.source.contains("EPI_ACT, false, 0, true>"));
     let mut s = spec("qwen3-0.6b.toml");
     s.quant = Quant::Q8;
     let q8 = Module::generate(&s, 256).unwrap();
-    assert!(q8.source.contains("EPI_ACT, false, true, false>"));
+    assert!(q8.source.contains("EPI_ACT, false, 1, false>"));
     assert!(!q8.source.contains(", true>(w, s, b, xh"));
+}
+
+#[test]
+fn fp8_spec_uses_fp8_projections_and_keeps_lm_head_and_gates_bf16() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml");
+    let s = Spec::load(&path).unwrap();
+    let m = Module::generate(&s, 4096).unwrap();
+    assert!(!m.source.contains("{{"));
+    assert!(m.source.contains("linear_fp8<5120, 6144, false, true>"));
+    assert!(m.source.contains("linear_bf16<248320, 5120, false, false>"));
+    assert!(m.source.contains("linear_norm<2, LA_IN_ROWS, false>"));
+    assert!(m.source.contains("constexpr int LA_IN_ROWS = LA_CONV_DIM + LA_VALUE_DIM;"));
+    assert!(m.source.contains("linear_norm<WF_BF16, LA_BA_ROWS, false>"));
+    let tc: Vec<&str> = m.source.lines().filter(|l| l.contains("gemm_tc<")).collect();
+    let has = |s: &str| tc.iter().any(|l| l.contains(s));
+    assert!(has("gemm_tc<34816, 5120, 64, 128, 2, 4, 64, 2, EPI_ACT, false, 2, true>"), "{tc:#?}");
+    assert!(has("gemm_tc<248320, 5120, 64, 128, 2, 4, 32, 2, EPI_STORE, false, 0, true>"));
+    assert!(has("gemm_tc<96, 5120, 64, 64, 2, 2, 32, 2, EPI_STORE, false, 0, true>"));
+    assert!(m.kernels.contains(&"lin_ba_mma"));
 }
 
 #[test]
@@ -78,7 +97,7 @@ fn module_has_batched_gemm_for_every_linear() {
         assert!(m.kernels.contains(&name), "{name}");
         assert!(m.source.contains(&format!("void {name}(")), "{name}");
     }
-    assert!(m.source.contains("gemm<1152, 896, true, false, false>"));
+    assert!(m.source.contains("gemm<1152, 896, true, false, 0>"));
 }
 
 #[test]

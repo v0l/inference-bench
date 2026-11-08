@@ -28,12 +28,30 @@ constexpr int MAX_CTX = {{MAX_CTX}};
 constexpr int PAGE = {{PAGE}};
 constexpr int PAGES = (MAX_CTX + PAGE - 1) / PAGE;
 constexpr int Q8_GROUP = {{Q8_GROUP}};
+constexpr int WF_BF16 = 0;
+constexpr int WF_Q8 = 1;
+constexpr int WF_FP8 = 2;
+constexpr int FP8_BLOCK = {{FP8_BLOCK}};
 constexpr int LINEAR_WARPS = 8;
 constexpr int ATTN_THREADS = 512;
 #define NEG_INF __int_as_float(0xff800000)
 
 __device__ __forceinline__ float bf16_to_f32(bf16_t v) {
     return __uint_as_float(((unsigned)v) << 16);
+}
+
+__device__ __forceinline__ float e4m3_to_f32(unsigned b) {
+    return __uint_as_float(((b & 0x80u) << 24) | ((b & 0x7fu) << 20)) * __uint_as_float(0x7b800000u);
+}
+
+__device__ __forceinline__ unsigned e4m3_pair_bf16(unsigned two_bytes) {
+    return (__float_as_uint(e4m3_to_f32(two_bytes & 0xffu)) >> 16) |
+           (__float_as_uint(e4m3_to_f32((two_bytes >> 8) & 0xffu)) & 0xffff0000u);
+}
+
+__device__ __forceinline__ float e4m3_dot4(unsigned word, float4 x) {
+    return e4m3_to_f32(word & 0xffu) * x.x + e4m3_to_f32((word >> 8) & 0xffu) * x.y +
+           e4m3_to_f32((word >> 16) & 0xffu) * x.z + e4m3_to_f32(word >> 24) * x.w;
 }
 
 __device__ __forceinline__ float out_gate(const float* qkv, size_t row, int at) {
@@ -125,10 +143,21 @@ __device__ void linear_q8(const void* w, const float* scales, const float* bias,
     }
 }
 
-template <bool IS_Q8, int K>
+template <int WF, int K>
 __device__ __forceinline__ float row_dot(const void* w, const float* scales, int row, const float* x, int lane) {
     float acc = 0.0f;
-    if constexpr (IS_Q8) {
+    if constexpr (WF == WF_FP8) {
+        static_assert(K % 16 == 0, "fp8 rows load 16 bytes per lane");
+        const unsigned char* wr = (const unsigned char*)w + (size_t)row * K;
+        const float* sr = scales + (size_t)row * (K / FP8_BLOCK);
+#pragma unroll 2
+        for (int k = lane * 16; k < K; k += 512) {
+            uint4 packed = load_stream(wr + k);
+            float part = e4m3_dot4(packed.x, *(const float4*)(x + k)) + e4m3_dot4(packed.y, *(const float4*)(x + k + 4)) +
+                         e4m3_dot4(packed.z, *(const float4*)(x + k + 8)) + e4m3_dot4(packed.w, *(const float4*)(x + k + 12));
+            acc += part * sr[k / FP8_BLOCK];
+        }
+    } else if constexpr (WF == WF_Q8) {
         const i8_t* wr = (const i8_t*)w + (size_t)row * K;
         const float* sr = scales + (size_t)row * (K / Q8_GROUP);
 #pragma unroll 2
@@ -159,6 +188,19 @@ __device__ __forceinline__ float row_dot(const void* w, const float* scales, int
     return warp_sum(acc);
 }
 
+template <int N, int K, bool BIAS, bool RESIDUAL>
+__device__ void linear_fp8(const void* w, const float* scales, const float* bias, const float* x, float* out) {
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * LINEAR_WARPS + warp;
+    if (row >= N) return;
+    float acc = row_dot<WF_FP8, K>(w, scales, row, x, lane);
+    if (lane == 0) {
+        if (BIAS) acc += bias[row];
+        out[row] = RESIDUAL ? out[row] + acc : acc;
+    }
+}
+
 __device__ __forceinline__ void load_normed(const float* x, const float* nw, float* xs) {
     __shared__ float scratch[32];
     float ss = 0.0f;
@@ -172,7 +214,7 @@ __device__ __forceinline__ void load_normed(const float* x, const float* nw, flo
     __syncthreads();
 }
 
-template <bool IS_Q8, int N, bool BIAS>
+template <int WF, int N, bool BIAS>
 __device__ void linear_norm(const void* w, const float* scales, const float* bias, const float* x,
                             const float* nw, float* out) {
     __shared__ __align__(16) float xs[HIDDEN];
@@ -181,7 +223,7 @@ __device__ void linear_norm(const void* w, const float* scales, const float* bia
     int lane = threadIdx.x & 31;
     int row = blockIdx.x * LINEAR_WARPS + warp;
     if (row >= N) return;
-    float acc = row_dot<IS_Q8, HIDDEN>(w, scales, row, xs, lane);
+    float acc = row_dot<WF, HIDDEN>(w, scales, row, xs, lane);
     if (lane == 0) out[row] = BIAS ? acc + bias[row] : acc;
 }
 
@@ -191,7 +233,7 @@ __device__ __forceinline__ float activation(float g) {
         : g / (1.0f + expf(-g));
 }
 
-template <bool IS_Q8>
+template <int WF>
 __device__ void gate_up_act_norm(const void* w, const float* scales, const float* x, const float* nw, float* out) {
     __shared__ __align__(16) float xs[HIDDEN];
     load_normed(x, nw, xs);
@@ -199,8 +241,8 @@ __device__ void gate_up_act_norm(const void* w, const float* scales, const float
     int lane = threadIdx.x & 31;
     int row = blockIdx.x * LINEAR_WARPS + warp;
     if (row >= INTER) return;
-    float g = row_dot<IS_Q8, HIDDEN>(w, scales, 2 * row, xs, lane);
-    float u = row_dot<IS_Q8, HIDDEN>(w, scales, 2 * row + 1, xs, lane);
+    float g = row_dot<WF, HIDDEN>(w, scales, 2 * row, xs, lane);
+    float u = row_dot<WF, HIDDEN>(w, scales, 2 * row + 1, xs, lane);
     if (lane == 0) out[row] = activation(g) * u;
 }
 
@@ -210,7 +252,7 @@ constexpr int GEMM_BK = 16;
 constexpr int GEMM_TM = 4;
 constexpr int GEMM_TN = 4;
 
-template <int N, int K, bool BIAS, bool RESIDUAL, bool Q8>
+template <int N, int K, bool BIAS, bool RESIDUAL, int WF>
 __device__ void gemm(const void* w, const float* scales, const float* bias, const float* x, float* out, int tokens) {
     __shared__ float xs[GEMM_BK][GEMM_BM];
     __shared__ float ws[GEMM_BK][GEMM_BN];
@@ -235,9 +277,12 @@ __device__ void gemm(const void* w, const float* scales, const float* bias, cons
             int n = n0 + r;
             float wv = 0.0f;
             if (n < N) {
-                if (Q8) {
+                if (WF == WF_Q8) {
                     wv = (float)((const i8_t*)w)[(size_t)n * K + k0 + kk] *
                          scales[(size_t)n * (K / Q8_GROUP) + (k0 + kk) / Q8_GROUP];
+                } else if (WF == WF_FP8) {
+                    wv = e4m3_to_f32(((const unsigned char*)w)[(size_t)n * K + k0 + kk]) *
+                         scales[(size_t)n * (K / FP8_BLOCK) + (k0 + kk) / FP8_BLOCK];
                 } else {
                     wv = bf16_to_f32(((const bf16_t*)w)[(size_t)n * K + k0 + kk]);
                 }
@@ -353,9 +398,11 @@ __device__ __forceinline__ int swz(int r, int c) {
     return r * CPR + (c ^ ((r / GROUP_ROWS) & MASK));
 }
 
-template <int N, int K, int BM, int BN, int WM, int WN, int BK, int STAGES, int EPI, bool BIAS, bool Q8, bool SPLIT>
+template <int N, int K, int BM, int BN, int WM, int WN, int BK, int STAGES, int EPI, bool BIAS, int WF, bool SPLIT>
 __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, const float* bias, const bf16_t* x_hi,
                                         const bf16_t* x_lo, float* out, bf16_t* out_hi, bf16_t* out_lo, int tokens) {
+    constexpr bool BYTES = WF != WF_BF16;
+    constexpr int GROUP_K = WF == WF_FP8 ? FP8_BLOCK : Q8_GROUP;
     constexpr int THREADS = WM * WN * 32;
     constexpr int TM = BM / WM;
     constexpr int TN = BN / WN;
@@ -366,16 +413,16 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
     constexpr int PLANES = SPLIT ? 2 : 1;
     constexpr int A_TILE = BM * BK;
     constexpr int A_BYTES = A_TILE * 2 * PLANES;
-    constexpr int WROW = Q8 ? BK + 16 : BK * 2;
+    constexpr int WROW = BYTES ? BK + 16 : BK * 2;
     constexpr int STAGE_BYTES = A_BYTES + BN * WROW;
     constexpr int KT = K / BK;
     constexpr int A_CHUNKS = BK / 8;
     constexpr int A_TOTAL = BM * A_CHUNKS * PLANES;
     constexpr int A_ITERS = (A_TOTAL + THREADS - 1) / THREADS;
-    constexpr int W_CHUNKS = Q8 ? BK / 16 : BK / 8;
+    constexpr int W_CHUNKS = BYTES ? BK / 16 : BK / 8;
     constexpr int W_ITERS = (BN * W_CHUNKS + THREADS - 1) / THREADS;
     static_assert(K % BK == 0, "K must be a multiple of BK");
-    static_assert(!Q8 || BK == Q8_GROUP, "Q8 tiles cover one scale group");
+    static_assert(!BYTES || GROUP_K % BK == 0, "byte weight tiles stay inside one scale group");
     static_assert(NJ % 2 == 0, "warp n tile");
     static_assert(STAGES >= 2, "pipeline depth");
     extern __shared__ __align__(16) unsigned char gemm_smem[];
@@ -418,9 +465,9 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
             int r = idx / W_CHUNKS;
             int ck = idx % W_CHUNKS;
             int n = min(n0 + r, N - 1);
-            const char* src = Q8 ? (const char*)w + (size_t)n * K + kt * BK + ck * 16
-                                 : (const char*)w + ((size_t)n * K + kt * BK) * 2 + ck * 16;
-            cp_async16(ws + (Q8 ? r * WROW + ck * 16 : swz<CPR>(r, ck) * 16), src);
+            const char* src = BYTES ? (const char*)w + (size_t)n * K + kt * BK + ck * 16
+                                    : (const char*)w + ((size_t)n * K + kt * BK) * 2 + ck * 16;
+            cp_async16(ws + (BYTES ? r * WROW + ck * 16 : swz<CPR>(r, ck) * 16), src);
         }
     };
 #pragma unroll
@@ -452,21 +499,24 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
         for (int j = 0; j < NJ; j++) {
             s0[j] = 1.0f;
             s1[j] = 1.0f;
-            if (Q8) {
+            if (BYTES) {
                 int col = n0 + wn * TN + j * 8 + 2 * t;
-                s0[j] = scales[(size_t)min(col, N - 1) * (K / Q8_GROUP) + kt];
-                s1[j] = scales[(size_t)min(col + 1, N - 1) * (K / Q8_GROUP) + kt];
+                int group = kt * BK / GROUP_K;
+                s0[j] = scales[(size_t)min(col, N - 1) * (K / GROUP_K) + group];
+                s1[j] = scales[(size_t)min(col + 1, N - 1) * (K / GROUP_K) + group];
             }
         }
 #pragma unroll
         for (int ks = 0; ks < KS; ks++) {
             unsigned bw[NJ][2];
-            if (Q8) {
+            if (BYTES) {
 #pragma unroll
                 for (int j = 0; j < NJ; j++) {
                     const unsigned char* p = ws + (wn * TN + j * 8 + g) * WROW + ks * 16 + 2 * t;
-                    bw[j][0] = q8_pair_bf16(*(const unsigned short*)p);
-                    bw[j][1] = q8_pair_bf16(*(const unsigned short*)(p + 8));
+                    unsigned lo = *(const unsigned short*)p;
+                    unsigned hi = *(const unsigned short*)(p + 8);
+                    bw[j][0] = WF == WF_FP8 ? e4m3_pair_bf16(lo) : q8_pair_bf16(lo);
+                    bw[j][1] = WF == WF_FP8 ? e4m3_pair_bf16(hi) : q8_pair_bf16(hi);
                 }
             } else {
 #pragma unroll
@@ -488,7 +538,20 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                 ldsm_x4(ah[i], &a_hi[at]);
                 if (SPLIT) ldsm_x4(al[i], &a_lo[at]);
             }
-            if (SPLIT) {
+            if (SPLIT && BYTES) {
+#pragma unroll
+                for (int i = 0; i < MI; i++)
+#pragma unroll
+                    for (int j = 0; j < NJ; j++) {
+                        float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                        mma_bf16(c, al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
+                        mma_bf16(c, ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
+                        acc[i][j][0] += c[0] * s0[j];
+                        acc[i][j][1] += c[1] * s1[j];
+                        acc[i][j][2] += c[2] * s0[j];
+                        acc[i][j][3] += c[3] * s1[j];
+                    }
+            } else if (SPLIT) {
 #pragma unroll
                 for (int i = 0; i < MI; i++)
 #pragma unroll
@@ -510,7 +573,7 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                     }
             }
         }
-        if (SPLIT) {
+        if (SPLIT && !BYTES) {
 #pragma unroll
             for (int i = 0; i < MI; i++)
 #pragma unroll
