@@ -153,6 +153,59 @@ sequence); the 27B has 48 value heads, so 384 CTAs, and fills the card.
 Decode, per token per linear layer: `gdn_step` 5.2 us, `gdn_conv_step` 1.2 us, `lin_in_norm` 2.5 us,
 `lin_out_proj` 1.7 us (medians).
 
+## head_dim 256
+
+The 27B's full-attention layers use `head_dim = 256`. `attention_split` keeps one float4 column per
+lane and loops over `ceil(head_dim / 128)` columns, so 256 needs no extra block size.
+`flash_mma` stages Q as 128 rows x head_dim x 4 B, which is 128 KB at 256 and over the 99 KB
+per-block limit, so above 128 it runs 64 query rows and 16-key tiles (64 KB). `Module::generate`
+fails with the byte count if a shape would exceed 99 KB.
+
+The second oracle is the same tiny model with `head_dim = 256`
+(`tests/fixtures/tiny-qwen3.5-hd256/`, 8 MB, references named `tiny256-*`). Decode, prefill, logits
+and batched decode all match to the same 1e-3 as the 128 fixture (logits max abs 4.9e-5 at 1024
+tokens, 4.0e-5 over the 48-token prompt). `qwen38_27b_module_compiles_through_nvrtc` in `tests/jit.rs`
+compiles the real 27B spec.
+
+Prefill cost of the smaller tiles, nsys time of one `flash_mma` call over the same 1024-token tiny
+prefill (4 heads, one full layer): 137 us at head_dim 128, 284 us at 256. That is 2.1x for 2x the
+head dim, so per-FLOP the 64-row tiling costs close to nothing; the 27B's 16 full layers will pay
+the 2x of the wider heads, not an extra tiling penalty.
+
+Dense models are unchanged. Qwen3-0.6B (head_dim 128), before/after this change, 6 alternating
+`bench` runs, medians, GPU shared with the live vLLM:
+
+| run | prefill tok/s before | after | decode tok/s before | after |
+| --- | --- | --- | --- | --- |
+| 128 prompt / 128 new | 12629 | 12708 | 450.5 | 448.6 |
+| 1024 prompt / 128 new | 31752 | 34889 | 380.3 | 380.8 |
+
+nsys, same runs, median per call (us, before -> after): at 128 tokens `attention_split` 5.09 ->
+5.02, `attention_reduce` 2.24 -> 2.24, `flash_mma` 36.3 -> 36.4; at 1024 `attention_split` 9.92 ->
+9.73, `attention_reduce` 4.45 -> 4.38, `flash_mma` 164.1 -> 161.4. Means differ because of
+warm-up outliers on the shared card.
+
+## Regenerating every reference
+
+The tests read one folder, `SPECRT_REF_DIR` (default `crates/specrt/out`). Everything below writes
+into it. `/tmp` is deleted on reboot, so rerun this after one.
+
+```sh
+uv venv ~/.venvs/specrt-ref
+uv pip install -p ~/.venvs/specrt-ref "transformers>=5.1" torch numpy safetensors
+export SPECRT_REF_DIR=/tmp/ref273
+cd crates/specrt
+PY=~/.venvs/specrt-ref/bin/python
+for s in specs/*.toml; do $PY scripts/reference.py $s $SPECRT_REF_DIR; done
+$PY scripts/reference.py tiny tests/fixtures/tiny-qwen3.5 $SPECRT_REF_DIR
+$PY scripts/reference.py tiny tests/fixtures/tiny-qwen3.5-hd256 $SPECRT_REF_DIR 256
+cargo test --release -- --include-ignored --test-threads=1
+```
+
+The per-spec call needs the HF weights for each spec's `repo`; the `tiny` calls need only the
+fixtures and write `tiny-*` (128) and `tiny256-*` (256) files. Run the suite with
+`--test-threads=1` because the GPU is shared and `contexts_above_4096` needs most of the free memory.
+
 ## What the next issue needs (FP8 and NVFP4 weights for the real 27B)
 
 The 27B in bf16 is 54 GB of weights and does not fit beside vLLM; the FP8 checkpoint
