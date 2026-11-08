@@ -20,7 +20,7 @@ TINY_PROMPT = 48
 TINY_GREEDY = 64
 
 
-def tiny_config():
+def tiny_config(head_dim=128):
     from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 
     return Qwen3_5TextConfig(
@@ -31,7 +31,7 @@ def tiny_config():
         layer_types=["linear_attention", "linear_attention", "full_attention"],
         num_attention_heads=4,
         num_key_value_heads=2,
-        head_dim=128,
+        head_dim=head_dim,
         linear_num_key_heads=2,
         linear_num_value_heads=6,
         linear_key_head_dim=128,
@@ -70,12 +70,12 @@ def tiny_weights(model):
     return out
 
 
-def tiny_model(fixture):
+def tiny_model(fixture, head_dim=128):
     from safetensors.torch import load_file, save_file
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
     torch.manual_seed(TINY_SEED)
-    config = tiny_config()
+    config = tiny_config(head_dim)
     model = Qwen3_5ForCausalLM(config).float().eval()
     weights = fixture / "model.safetensors"
     if not weights.exists():
@@ -117,11 +117,12 @@ def save(out_dir, name, arrays, meta):
     (out_dir / f"{name}.json").write_text(json.dumps(meta))
 
 
-def tiny(fixture, out_dir):
+def tiny(fixture, out_dir, head_dim=128):
     from transformers import DynamicCache
 
     torch.set_num_threads(4)
-    model = tiny_model(fixture)
+    model = tiny_model(fixture, head_dim)
+    prefix = "tiny" if head_dim == 128 else f"tiny{head_dim}"
     out_dir.mkdir(parents=True, exist_ok=True)
     versions = {"torch": torch.__version__, "transformers": __import__("transformers").__version__}
     with torch.inference_mode():
@@ -134,7 +135,7 @@ def tiny(fixture, out_dir):
         conv, rec = linear_states(cache, model)
         save(
             out_dir,
-            "tiny-prefill",
+            f"{prefix}-prefill",
             {"layers": torch.stack([s[0] for s in seen]), "logits": logits, "conv": conv, "state": rec},
             {"tokens": ids.tolist(), **versions},
         )
@@ -150,20 +151,20 @@ def tiny(fixture, out_dir):
         per_step = torch.stack([s[0, -1] for s in seen]).view(TINY_DECODE, -1, model.config.hidden_size)
         save(
             out_dir,
-            "tiny-decode",
+            f"{prefix}-decode",
             {"layers": per_step, "logits": torch.stack(steps), "conv": conv, "state": rec},
             {"tokens": ids.tolist(), **versions},
         )
         ids = tiny_tokens(TINY_PROMPT, 3)
         logits = model(ids[None]).logits[0]
         greedy = model.generate(ids[None], max_new_tokens=TINY_GREEDY, do_sample=False)[0, TINY_PROMPT:]
-        save(out_dir, "tiny-greedy", {"logits": logits}, {"tokens": ids.tolist(), "greedy": greedy.tolist(), **versions})
+        save(out_dir, f"{prefix}-greedy", {"logits": logits}, {"tokens": ids.tolist(), "greedy": greedy.tolist(), **versions})
     print("tiny", fixture, "->", out_dir)
 
 
 def main():
     if sys.argv[1] == "tiny":
-        tiny(Path(sys.argv[2]), Path(sys.argv[3]))
+        tiny(Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4]) if len(sys.argv) > 4 else 128)
         return
     spec_path = Path(sys.argv[1])
     out_dir = Path(sys.argv[2])

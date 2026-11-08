@@ -8,11 +8,19 @@ pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
 pub const BATCH_DECODE_SPLITS: usize = 8;
-pub const FLASH_ROWS: usize = 128;
+const FLASH_SMEM_LIMIT: usize = 99 * 1024;
+
+pub fn flash_rows(head_dim: usize) -> usize {
+    if head_dim > 128 { 64 } else { 128 }
+}
+
+pub fn flash_keys(head_dim: usize) -> usize {
+    if head_dim > 128 { 16 } else { 32 }
+}
+
 pub const LA_CHUNK: usize = 64;
 pub const LA_KSPLIT: usize = 4;
 pub const LA_COLS: usize = 16;
-const FLASH_KEYS: usize = 32;
 const FLASH_STAGES: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -276,9 +284,12 @@ impl Module {
         };
         let mut smem = BTreeMap::new();
         let mma = mma_kernels(spec, &mut smem);
-        let kv_bytes = FLASH_STAGES * 4 * FLASH_KEYS * a.head_dim * 2;
-        let q_bytes = FLASH_ROWS * a.head_dim * 4;
-        smem.insert("flash_mma", kv_bytes.max(q_bytes) as u32);
+        let (flash_rows, flash_keys) = (flash_rows(a.head_dim), flash_keys(a.head_dim));
+        let kv_bytes = FLASH_STAGES * 4 * flash_keys * a.head_dim * 2;
+        let q_bytes = flash_rows * a.head_dim * 4;
+        let flash_smem = kv_bytes.max(q_bytes);
+        anyhow::ensure!(flash_smem <= FLASH_SMEM_LIMIT, "flash_mma needs {flash_smem} bytes of shared memory");
+        smem.insert("flash_mma", flash_smem as u32);
         let la = spec.linear_attention.as_ref();
         let la_dim = |f: fn(&crate::spec::LinearAttention) -> usize| la.map_or("0".into(), |l| f(l).to_string());
         if let Some(l) = la {
@@ -324,8 +335,8 @@ impl Module {
             ("Q8", (spec.quant == Quant::Q8).to_string()),
             ("MMA_KERNELS", mma),
             ("FM_STAGES", FLASH_STAGES.to_string()),
-            ("FM_BK", FLASH_KEYS.to_string()),
-            ("FM_WARPS", (FLASH_ROWS / 16).to_string()),
+            ("FM_BK", flash_keys.to_string()),
+            ("FM_WARPS", (flash_rows / 16).to_string()),
             ("FM_SMEM", kv_bytes.max(q_bytes).to_string()),
         ]
         .into_iter()

@@ -867,7 +867,7 @@ impl Runtime {
                 b.arg(&pre.attn);
             }
             b.arg(&ntok);
-            let rows = if self.use_mma { crate::codegen::FLASH_ROWS } else { 16 };
+            let rows = if self.use_mma { crate::codegen::flash_rows(a.head_dim) } else { 16 };
             let config = LaunchConfig {
                 grid_dim: (grid(n, rows), a.heads as u32, 1),
                 block_dim: (if self.use_mma { rows as u32 * 2 } else { 128 }, 1, 1),

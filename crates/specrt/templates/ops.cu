@@ -726,6 +726,7 @@ constexpr int ATTN_SPLITS = 64;
 constexpr int ATTN_TILE = 16;
 constexpr int ATTN_MIN_CHUNK = 16;
 constexpr int ATTN_BLOCK = 128;
+constexpr int ATTN_V4 = (HEAD_DIM / 4 + 31) / 32;
 constexpr int ATTN_PART = HEAD_DIM + 2;
 
 __device__ __forceinline__ int attn_chunk(int len) {
@@ -752,8 +753,9 @@ extern "C" __global__ void attention_split(const float* qkv, const bf16_t* k_cac
     float scale = rsqrtf((float)HEAD_DIM);
     float m = NEG_INF;
     float l = 0.0f;
-    float4 acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    static_assert(HEAD_DIM <= ATTN_BLOCK && HEAD_DIM % 4 == 0 && HEAD_DIM <= 128, "unsupported head_dim");
+    float4 acc[ATTN_V4];
+    for (int j = 0; j < ATTN_V4; j++) acc[j] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    static_assert(HEAD_DIM % 4 == 0 && HEAD_DIM <= 256, "unsupported head_dim");
     for (int t0 = start; t0 < end; t0 += ATTN_TILE) {
         int n = min(ATTN_TILE, end - t0);
         for (int i = warp; i < n; i += ATTN_BLOCK / 32) {
@@ -777,35 +779,40 @@ extern "C" __global__ void attention_split(const float* qkv, const bf16_t* k_cac
         __syncthreads();
         float psum = 0.0f;
         for (int i = 0; i < n; i++) psum += p_s[i];
-        float4 pv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-        if (lane < HEAD_DIM / 4) {
-#pragma unroll 4
-            for (int i = warp; i < n; i += ATTN_BLOCK / 32) {
-                int t = t0 + i;
-                float p = p_s[i];
-                float4 v = kv_at4(kv_row(v_cache, block_table, layer, kv_head, t), 4 * lane);
-                pv.x += p * v.x;
-                pv.y += p * v.y;
-                pv.z += p * v.z;
-                pv.w += p * v.w;
-            }
-        }
         l = l * corr + psum;
-        acc.x = acc.x * corr + pv.x;
-        acc.y = acc.y * corr + pv.y;
-        acc.z = acc.z * corr + pv.z;
-        acc.w = acc.w * corr + pv.w;
+#pragma unroll
+        for (int j = 0; j < ATTN_V4; j++) {
+            int c = lane + 32 * j;
+            float4 pv = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (c < HEAD_DIM / 4) {
+#pragma unroll 4
+                for (int i = warp; i < n; i += ATTN_BLOCK / 32) {
+                    int t = t0 + i;
+                    float p = p_s[i];
+                    float4 v = kv_at4(kv_row(v_cache, block_table, layer, kv_head, t), 4 * c);
+                    pv.x += p * v.x;
+                    pv.y += p * v.y;
+                    pv.z += p * v.z;
+                    pv.w += p * v.w;
+                }
+            }
+            acc[j].x = acc[j].x * corr + pv.x;
+            acc[j].y = acc[j].y * corr + pv.y;
+            acc[j].z = acc[j].z * corr + pv.z;
+            acc[j].w = acc[j].w * corr + pv.w;
+        }
         m = m_new;
         __syncthreads();
     }
     float* dst = part + ((size_t)head * ATTN_SPLITS + split) * ATTN_PART;
     __shared__ float4 acc_s[ATTN_BLOCK / 32][HEAD_DIM / 4];
-    if (lane < HEAD_DIM / 4) acc_s[warp][lane] = acc;
+    for (int j = 0; j < ATTN_V4; j++)
+        if (lane + 32 * j < HEAD_DIM / 4) acc_s[warp][lane + 32 * j] = acc[j];
     __syncthreads();
-    if (threadIdx.x < HEAD_DIM) {
+    for (int d = threadIdx.x; d < HEAD_DIM; d += ATTN_BLOCK) {
         float sum = 0.0f;
-        for (int w = 0; w < ATTN_BLOCK / 32; w++) sum += ((const float*)acc_s[w])[threadIdx.x];
-        dst[threadIdx.x] = sum;
+        for (int w = 0; w < ATTN_BLOCK / 32; w++) sum += ((const float*)acc_s[w])[d];
+        dst[d] = sum;
     }
     if (threadIdx.x == 0) {
         dst[HEAD_DIM] = m;
@@ -826,7 +833,7 @@ extern "C" __global__ void attention_reduce(const float* part, const int* pos_pt
     float m = warp_max(ms);
     if (ATTN_SPLITS > 32) {
         __shared__ float wm[ATTN_SPLITS / 32 + 1];
-        if ((d & 31) == 0) wm[d >> 5] = m;
+        if ((d & 31) == 0 && d < ATTN_SPLITS) wm[d >> 5] = m;
         __syncthreads();
         m = NEG_INF;
         for (int i = 0; i <= (ATTN_SPLITS - 1) / 32; i++) m = fmaxf(m, wm[i]);

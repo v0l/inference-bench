@@ -38,3 +38,19 @@ fn compiles_and_caches_both_models() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU with NVRTC"]
+fn qwen38_27b_module_compiles_through_nvrtc() {
+    let dir = std::env::temp_dir().join(format!("specrt-jit27-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let ctx = cudarc::driver::CudaContext::new(0).unwrap();
+    let jit = Jit::new(ctx, dir.clone()).unwrap();
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml");
+    let module = Module::generate(&Spec::load(&path).unwrap(), 4096).unwrap();
+    let loaded = jit.load(&module).unwrap();
+    for name in &module.kernels {
+        loaded.function(name).unwrap();
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

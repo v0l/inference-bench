@@ -8,16 +8,20 @@ fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn fixture() -> PathBuf {
-    root().join("tests/fixtures/tiny-qwen3.5")
+fn fixture_dir(dir: &str) -> PathBuf {
+    root().join("tests/fixtures").join(dir)
+}
+
+fn spec_for(dir: &str) -> Spec {
+    let json = std::fs::read_to_string(fixture_dir(dir).join("config.json")).unwrap();
+    let mut spec = Spec::from_hf_config(&json).unwrap();
+    spec.name = dir.into();
+    spec.repo = fixture_dir(dir).display().to_string();
+    spec
 }
 
 fn spec() -> Spec {
-    let json = std::fs::read_to_string(fixture().join("config.json")).unwrap();
-    let mut spec = Spec::from_hf_config(&json).unwrap();
-    spec.name = "tiny-qwen3.5".into();
-    spec.repo = fixture().display().to_string();
-    spec
+    spec_for("tiny-qwen3.5")
 }
 
 fn ref_dir() -> PathBuf {
@@ -89,20 +93,18 @@ fn tiny_fixture_spec_is_hybrid() {
     assert!(s.attention.output_gate);
 }
 
-#[test]
-#[ignore = "needs a CUDA GPU and scripts/reference.py tiny output"]
-fn tiny_decode_matches_the_recurrent_reference_per_layer() {
-    let s = spec();
-    let r = reference("tiny-decode");
+fn decode_matches_reference(dir: &str, prefix: &str) {
+    let s = spec_for(dir);
+    let r = reference(&format!("{prefix}-decode"));
     let mut rt = Runtime::load(&s, 256).unwrap();
     let trace = rt.trace_decode(&r.tokens).unwrap();
     let steps = r.tokens.len();
-    let layers = per_layer(&trace.layers, &floats("tiny-decode", "layers"), 3, steps, 256, true);
-    let logits = max_abs(&trace.logits, &floats("tiny-decode", "logits"));
+    let layers = per_layer(&trace.layers, &floats(&format!("{prefix}-decode"), "layers"), 3, steps, 256, true);
+    let logits = max_abs(&trace.logits, &floats(&format!("{prefix}-decode"), "logits"));
     let states = rt.linear_states().unwrap();
-    let state = max_abs(&states.state, &floats("tiny-decode", "state"));
+    let state = max_abs(&states.state, &floats(&format!("{prefix}-decode"), "state"));
     let la = s.linear_attention.as_ref().unwrap();
-    let conv = max_abs(&states.conv, &last_taps(&floats("tiny-decode", "conv"), la.conv_kernel));
+    let conv = max_abs(&states.conv, &last_taps(&floats(&format!("{prefix}-decode"), "conv"), la.conv_kernel));
     eprintln!("decode {steps} tokens: layers {layers:?} logits {logits} state {state} conv {conv}");
     assert!(layers.iter().all(|&d| d <= 1e-3), "{layers:?}");
     assert!(logits <= 1e-3, "{logits}");
@@ -110,20 +112,18 @@ fn tiny_decode_matches_the_recurrent_reference_per_layer() {
     assert!(conv <= 1e-4, "{conv}");
 }
 
-#[test]
-#[ignore = "needs a CUDA GPU and scripts/reference.py tiny output"]
-fn tiny_prefill_matches_the_chunked_reference_per_layer() {
-    let s = spec();
-    let r = reference("tiny-prefill");
+fn prefill_matches_reference(dir: &str, prefix: &str) {
+    let s = spec_for(dir);
+    let r = reference(&format!("{prefix}-prefill"));
     assert_eq!(r.tokens.len(), PREFILL);
     let mut rt = Runtime::load(&s, 2048).unwrap();
     let trace = rt.trace_prefill(&r.tokens).unwrap();
-    let layers = per_layer(&trace.layers, &floats("tiny-prefill", "layers"), 3, PREFILL, 256, false);
-    let logits = max_abs(&trace.logits, &floats("tiny-prefill", "logits"));
+    let layers = per_layer(&trace.layers, &floats(&format!("{prefix}-prefill"), "layers"), 3, PREFILL, 256, false);
+    let logits = max_abs(&trace.logits, &floats(&format!("{prefix}-prefill"), "logits"));
     let states = rt.linear_states().unwrap();
-    let state = max_abs(&states.state, &floats("tiny-prefill", "state"));
+    let state = max_abs(&states.state, &floats(&format!("{prefix}-prefill"), "state"));
     let la = s.linear_attention.as_ref().unwrap();
-    let conv = max_abs(&states.conv, &last_taps(&floats("tiny-prefill", "conv"), la.conv_kernel));
+    let conv = max_abs(&states.conv, &last_taps(&floats(&format!("{prefix}-prefill"), "conv"), la.conv_kernel));
     eprintln!("prefill {PREFILL} tokens: layers {layers:?} logits {logits} state {state} conv {conv}");
     assert!(layers.iter().all(|&d| d <= 1e-3), "{layers:?}");
     assert!(logits <= 1e-3, "{logits}");
@@ -159,15 +159,13 @@ fn chunked_prefill_hands_off_the_same_state_as_recurrent_decode() {
     assert!(d <= 1e-3, "{d}");
 }
 
-#[test]
-#[ignore = "needs a CUDA GPU and scripts/reference.py tiny output"]
-fn tiny_model_logits_and_greedy_match_transformers() {
-    let s = spec();
-    let r = reference("tiny-greedy");
+fn logits_and_greedy_match_reference(dir: &str, prefix: &str) {
+    let s = spec_for(dir);
+    let r = reference(&format!("{prefix}-greedy"));
     assert_eq!(r.greedy.len(), 64, "{}", r.meta);
     let mut rt = Runtime::load(&s, 256).unwrap();
     let ours = rt.prompt_logits(&r.tokens).unwrap();
-    let theirs = floats("tiny-greedy", "logits");
+    let theirs = floats(&format!("{prefix}-greedy"), "logits");
     let d = max_abs(&ours, &theirs);
     let rows = r.tokens.len();
     let vocab = s.dims.vocab;
@@ -185,6 +183,65 @@ fn tiny_model_logits_and_greedy_match_transformers() {
 #[ignore = "needs a CUDA GPU"]
 fn tiny_batch_decode_matches_single_sequence_greedy() {
     let s = spec();
+    let prompts: Vec<Vec<u32>> =
+        (0..4u32).map(|q| (0..40u32).map(|i| (i * 7 + q * 131) % 1024).collect()).collect();
+    let mut single = Runtime::load(&s, 256).unwrap();
+    let expected: Vec<Vec<u32>> =
+        prompts.iter().map(|p| single.generate(p, 24, Sampling::GREEDY).unwrap().tokens).collect();
+    drop(single);
+    let mut batch = Runtime::load_batched(&s, 256, 4).unwrap();
+    assert_eq!(batch.generate_batch(&prompts, 24).unwrap().tokens, expected);
+}
+
+const WIDE: &str = "tiny-qwen3.5-hd256";
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny output"]
+fn tiny_decode_matches_the_recurrent_reference_per_layer() {
+    decode_matches_reference("tiny-qwen3.5", "tiny");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny output"]
+fn tiny_prefill_matches_the_chunked_reference_per_layer() {
+    prefill_matches_reference("tiny-qwen3.5", "tiny");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny output"]
+fn tiny_model_logits_and_greedy_match_transformers() {
+    logits_and_greedy_match_reference("tiny-qwen3.5", "tiny");
+}
+
+#[test]
+fn head_dim_256_fixture_spec_is_hybrid() {
+    let s = spec_for(WIDE);
+    assert_eq!(s.attention.head_dim, 256);
+    assert_eq!(s.linear_layers(), 2);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny output"]
+fn head_dim_256_decode_matches_the_reference_per_layer() {
+    decode_matches_reference(WIDE, "tiny256");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny output"]
+fn head_dim_256_prefill_matches_the_reference_per_layer() {
+    prefill_matches_reference(WIDE, "tiny256");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny output"]
+fn head_dim_256_logits_and_greedy_match_transformers() {
+    logits_and_greedy_match_reference(WIDE, "tiny256");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn head_dim_256_batch_decode_matches_single_sequence_greedy() {
+    let s = spec_for(WIDE);
     let prompts: Vec<Vec<u32>> =
         (0..4u32).map(|q| (0..40u32).map(|i| (i * 7 + q * 131) % 1024).collect()).collect();
     let mut single = Runtime::load(&s, 256).unwrap();
