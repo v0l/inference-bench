@@ -145,6 +145,58 @@ fn fp8_mixed_length_step_decode_matches_single_sequence_greedy() {
     stepped_matches_single("tiny-qwen3.5-fp8");
 }
 
+fn scheduled_matches_single(dir: &str) {
+    use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
+    let s = spec_for(dir);
+    let lens = [3usize, 17, 64, 65, 130, 250, 400];
+    let prompts: Vec<Vec<u32>> = (0..64u32)
+        .map(|q| (0..lens[q as usize % lens.len()] as u32).map(|i| (i * 13 + q * 97 + 1) % 1024).collect())
+        .collect();
+    let new: Vec<usize> = (0..64).map(|q| 8 + (q * 7) % 40).collect();
+    let mut single = Runtime::load(&s, 512).unwrap();
+    let want: Vec<Vec<u32>> =
+        prompts.iter().zip(&new).map(|(p, &n)| single.generate(p, n, Sampling::GREEDY).unwrap().tokens).collect();
+    drop(single);
+    let layout = Layout { max_ctx: 512, slots: 16, kv_blocks: 120, prefill_chunk: 256, kv_planes: 1 };
+    let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
+    let cfg = Config { max_num_seqs: 16, max_batched_tokens: 300, reserve_blocks: Some(1), ..Config::default() };
+    let mut sched = Scheduler::new(exec, cfg);
+    let mut ids = Vec::new();
+    for (p, &n) in prompts.iter().zip(&new) {
+        ids.push(sched.submit(Request { prompt: p.clone(), max_tokens: n, sampling: Sampling::GREEDY, stop: vec![] }).unwrap());
+    }
+    let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+    let mut most = 0;
+    while !sched.idle() {
+        let mut events = Vec::new();
+        let r = sched.step(&mut events).unwrap();
+        most = most.max(r.decode_rows);
+        for e in events {
+            if let Event::Token { id, token } = e {
+                got.entry(id).or_default().push(token);
+            }
+        }
+    }
+    assert!(sched.preemptions() > 0, "the pool of 120 blocks was meant to run out");
+    assert!(most > 8, "decode batches stayed at {most} rows");
+    assert_eq!(sched.blocks_used(), 0);
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(got[id], want[i], "sequence {i}");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn tiny_sixty_four_scheduled_sequences_match_single_sequence_greedy_with_preemption() {
+    scheduled_matches_single("tiny-qwen3.5");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn head_dim_256_sixty_four_scheduled_sequences_match_single_sequence_greedy_with_preemption() {
+    scheduled_matches_single("tiny-qwen3.5-hd256");
+}
+
 #[test]
 fn serving_kv_is_one_f16_copy_per_token() {
     let s = spec_for("tiny-qwen3.5-hd256");
