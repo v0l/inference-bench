@@ -54,7 +54,7 @@ update lands.
 ## Specs for a newer engine
 
 A spec may set `min_engine`, a whole number that defaults to 0. The engine reads specs up to
-`SPEC_FORMAT` (`crates/specrt/src/spec.rs`, currently 1). A spec with a higher `min_engine` is
+`SPEC_FORMAT` (`crates/specrt/src/spec.rs`, currently 3: 2 added hybrid linear attention, 3 added `quant = "fp8_block128"`). A spec with a higher `min_engine` is
 listed with "needs a newer inference-bench" and cannot be loaded; the app never tries to parse the
 parts it does not know. When a spec needs an engine change, raise `SPEC_FORMAT` in the same commit
 and set `min_engine` in the spec to the new value, so older apps skip it instead of failing.

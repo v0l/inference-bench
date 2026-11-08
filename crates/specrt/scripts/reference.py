@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -347,7 +348,95 @@ def real_slice_reference(repo, fixture, out_dir, layers, vocab):
     print("real slice", fixture, len(ids), "tokens ->", out_dir)
 
 
+REAL_PROMPTS = [
+    "The history of the printing press begins in the fifteenth century, when Johannes Gutenberg combined movable metal type, oil based ink and a screw press adapted from wine making. Within fifty years presses had spread to more than two hundred cities across Europe, and printers in Venice alone had issued several thousand editions. As paper mills multiplied and type founders sold standard fonts, the cost of a book fell",
+    "def merge_sorted(a, b):\n    \"\"\"Merge two sorted lists into one sorted list in linear time.\"\"\"\n    out = []\n    i = j = 0\n    while i < len(a) and j < len(b):\n        if a[i] <= b[j]:\n            out.append(a[i])\n            i += 1\n        else:\n            out.append(b[j])\n            j += 1\n    out.extend(a[i:])\n",
+    "Photosynthesis converts light energy into chemical energy. In the light dependent reactions, water is split and oxygen is released, while ATP and NADPH are produced. The Calvin cycle then uses that ATP and NADPH to fix carbon dioxide into three carbon sugars, regenerating the acceptor molecule ribulose bisphosphate on each turn. Measured against the sunlight that falls on a leaf, the overall efficiency of the process is",
+    "Dear hiring committee, I am writing to apply for the position of senior network engineer. Over the past eight years I have designed and operated BGP edge routing for a regional provider, migrated two data centres to an EVPN fabric, and led the on call rotation for a team of six engineers across three time zones. In my current role",
+    "Question: A train leaves the station at 9:00 travelling at 80 km/h. A second train leaves the same station at 10:30 on the same track travelling at 120 km/h. At what time does the second train catch the first? Answer: Let t be the time in hours after 10:30. The first train has a head start of",
+]
+REAL_PROMPT_LEN = 64
+REAL_NEW = 32
+
+
+def real_prompts(repo, out_dir):
+    tok = AutoTokenizer.from_pretrained(snapshot_dir(repo))
+    prompts = []
+    for text in REAL_PROMPTS:
+        ids = tok(text).input_ids
+        assert len(ids) >= REAL_PROMPT_LEN, f"prompt has only {len(ids)} tokens"
+        prompts.append(ids[:REAL_PROMPT_LEN])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "real27b-prompts.json").write_text(json.dumps({"prompts": prompts, "new_tokens": REAL_NEW}))
+    print("wrote", len(prompts), "prompts of", REAL_PROMPT_LEN, "tokens")
+
+
+def real_full(repo, out_dir, seq_file, act_quant):
+    from safetensors import safe_open
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm, Qwen3_5TextRotaryEmbedding
+
+    torch.set_num_threads(int(os.environ.get("REF_THREADS", "24")))
+    src = snapshot_dir(repo)
+    index = json.loads((src / "model.safetensors.index.json").read_text())["weight_map"]
+    text = json.loads((src / "config.json").read_text())["text_config"]
+    config = Qwen3_5TextConfig(**{k: v for k, v in text.items() if k != "model_type"})
+    config._attn_implementation = "sdpa"
+    seqs = json.loads(seq_file.read_text())["sequences"]
+    handles = {}
+
+    def tensor(name):
+        shard = index[name]
+        if shard not in handles:
+            handles[shard] = safe_open(src / shard, "pt")
+        return handles[shard].get_tensor(name)
+
+    def weights(prefix):
+        names = [n for n in index if n.startswith(prefix) and not n.endswith("_scale_inv")]
+        out = {}
+        for n in names:
+            w = tensor(n)
+            out[n[len(prefix):]] = dequantize_fp8_block(w, tensor(n + "_scale_inv")) if w.dtype == torch.float8_e4m3fn else w.float()
+        return out
+
+    root = "model.language_model."
+    started = time.time()
+    embed = tensor(root + "embed_tokens.weight")
+    hidden = [embed[torch.tensor(s)].float()[None] for s in seqs]
+    del embed
+    rotary = Qwen3_5TextRotaryEmbedding(config)
+    trace = []
+    with torch.inference_mode():
+        for i in range(config.num_hidden_layers):
+            layer = Qwen3_5DecoderLayer(config, i).float().eval()
+            layer.load_state_dict(weights(f"{root}layers.{i}."), strict=True)
+            if act_quant:
+                quantize_projection_inputs(layer)
+            for p, h in enumerate(hidden):
+                pos = torch.arange(h.shape[1])[None]
+                emb = rotary(h, pos)
+                hidden[p] = layer(h, position_embeddings=emb, attention_mask=None, position_ids=pos)
+            trace.append(hidden[0][0, :REAL_PROMPT_LEN].clone())
+            del layer
+            print(f"layer {i} {time.time() - started:.0f}s", flush=True)
+        norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        norm.load_state_dict({"weight": tensor(root + "norm.weight").float()})
+        head = tensor("lm_head.weight").float()
+        logits = torch.stack([norm(h[0]) @ head.T for h in hidden])
+    name = "real27b-ref-act" if act_quant else "real27b-ref"
+    versions = {"torch": torch.__version__, "transformers": __import__("transformers").__version__}
+    save(out_dir, name, {"logits": logits, "layers": torch.stack(trace)},
+         {"sequences": seqs, "argmax": logits.argmax(-1).tolist(), "act_quant": act_quant, "secs": time.time() - started, **versions})
+    print(name, "done in", f"{time.time() - started:.0f}s")
+
+
 def main():
+    if sys.argv[1] == "real-prompts":
+        real_prompts(sys.argv[2], Path(sys.argv[3]))
+        return
+    if sys.argv[1] == "real-full":
+        real_full(sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), len(sys.argv) > 5 and sys.argv[5] == "act")
+        return
     if sys.argv[1] == "real-slice":
         real_slice_reference(sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]))
         return

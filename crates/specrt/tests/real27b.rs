@@ -23,6 +23,88 @@ fn argmax(row: &[f32]) -> usize {
     (0..row.len()).fold(0, |best, i| if row[i] > row[best] { i } else { best })
 }
 
+fn full_spec() -> Spec {
+    Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml")).unwrap()
+}
+
+fn ids(v: &serde_json::Value) -> Vec<u32> {
+    v.as_array().unwrap().iter().map(|t| t.as_u64().unwrap() as u32).collect()
+}
+
+fn write_floats(name: &str, v: &[f32]) {
+    let bytes: Vec<u8> = v.iter().flat_map(|f| f.to_le_bytes()).collect();
+    std::fs::write(out_dir().join(name), bytes).unwrap();
+}
+
+#[test]
+#[ignore = "needs the whole GPU (about 31 GB) with local-llm stopped, and scripts/reference.py real-prompts output"]
+fn real_27b_generates_greedy_and_dumps_logits() {
+    let spec = full_spec();
+    let meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out_dir().join("real27b-prompts.json")).unwrap()).unwrap();
+    let new = meta["new_tokens"].as_u64().unwrap() as usize;
+    let mut rt = Runtime::load(&spec, 256).unwrap();
+    eprintln!(
+        "loaded: weights {:.2} GB in {:.1} s, device {:.2} GB, total load {:.1} s, peak host RSS {:.2} GB",
+        rt.weight_bytes as f64 / 1e9,
+        rt.weight_secs,
+        rt.device_bytes as f64 / 1e9,
+        rt.load_secs,
+        rt.peak_host_rss_bytes as f64 / 1e9
+    );
+    let mut sequences = Vec::new();
+    let mut logits = Vec::new();
+    for p in meta["prompts"].as_array().unwrap() {
+        let prompt = ids(p);
+        let g = rt.generate(&prompt, new, specrt::runtime::Sampling::GREEDY).unwrap();
+        assert_eq!(g.tokens.len(), new);
+        let mut seq = prompt.clone();
+        seq.extend(&g.tokens);
+        logits.extend(rt.prompt_logits(&seq).unwrap());
+        sequences.push(seq);
+    }
+    write_floats("real27b-specrt.logits.bin", &logits);
+    let out = serde_json::json!({
+        "sequences": sequences,
+        "prompt_len": ids(&meta["prompts"][0]).len(),
+        "load_secs": rt.load_secs,
+        "weight_secs": rt.weight_secs,
+        "weight_bytes": rt.weight_bytes,
+        "device_bytes": rt.device_bytes,
+        "peak_host_rss_bytes": rt.peak_host_rss_bytes,
+    });
+    std::fs::write(out_dir().join("real27b-specrt.json"), out.to_string()).unwrap();
+}
+
+#[test]
+#[ignore = "needs real27b_generates_greedy_and_dumps_logits and scripts/reference.py real-full output (both act and weight-only)"]
+fn real_27b_greedy_and_logits_match_the_fp8_reference() {
+    let vocab = full_spec().dims.vocab;
+    let ours_meta: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out_dir().join("real27b-specrt.json")).unwrap()).unwrap();
+    let prompt_len = ours_meta["prompt_len"].as_u64().unwrap() as usize;
+    let seqs: Vec<Vec<u32>> = ours_meta["sequences"].as_array().unwrap().iter().map(ids).collect();
+    let ours = floats("real27b-specrt.logits.bin");
+    let weight_only = floats("real27b-ref.logits.bin");
+    let act = floats("real27b-ref-act.logits.bin");
+    let envelope = relative(&act, &weight_only);
+    let error = relative(&ours, &weight_only);
+    let len = seqs[0].len();
+    let mut first_miss = Vec::new();
+    for (s, seq) in seqs.iter().enumerate() {
+        let miss = (prompt_len..len).find(|&p| {
+            let at = (s * len + p - 1) * vocab;
+            argmax(&weight_only[at..at + vocab]) != seq[p] as usize
+        });
+        first_miss.push(miss);
+    }
+    eprintln!(
+        "logits max error / max |logit|: specrt {error}, envelope (act-quantised vs weight-only reference) {envelope}; first greedy mismatch per prompt {first_miss:?}"
+    );
+    assert!(error <= envelope, "{error} outside the {envelope} envelope");
+    assert!(first_miss.iter().all(Option::is_none), "{first_miss:?}");
+}
+
 #[test]
 #[ignore = "needs a CUDA GPU, the Qwen3.8 27B FP8 checkpoint and scripts/reference.py real-slice output"]
 fn real_27b_fp8_first_layers_match_transformers() {
