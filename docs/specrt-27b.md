@@ -17,9 +17,11 @@ Issue #320. The checkpoint is `Qwen/Qwen3.8-27B-FP8` from the HF cache (68 shard
   `q/k/v/o_proj`, `in_proj_qkv`, `in_proj_z`, `out_proj`, `gate/up/down_proj`. These stay bf16:
   `in_proj_a`, `in_proj_b` (48 rows each), the conv, norms, `embed_tokens` and `lm_head`. The
   96 gate rows are now their own bf16 linear (`lin_ba`) for every quant, so the FP8 `in_proj` is
-  a clean 16384-row matrix. Scales are expanded at load to one f32 per row per 128 columns, so
-  head splitting, gate/up interleaving and qkv fusion stay plain row operations. That costs
-  0.76 GB on the 27B (#334 tracks shrinking it).
+  a clean 16384-row matrix. Scales stay as the checkpoint's 128 x 128 grid (f32 on the device).
+  Each FP8 matrix's scale buffer starts with one u32 per fused row, the offset of that row's grid
+  row, so head splitting, gate/up interleaving and qkv fusion only remap rows (#334). On the 27B
+  that is 15.6 MB of map plus 5.9 MB of grid, 21.5 MB in all, down from 0.76 GB of per-row
+  expanded scales.
 - **Decode GEMV** (`row_dot<WF_FP8>`, `linear_fp8`). Each lane streams 16 bytes of weight
   (`ld.global.nc.L1::no_allocate`), decodes e4m3 in registers with two integer ops and one
   multiply, and applies the block scale once per 128 columns.
@@ -70,10 +72,10 @@ From the checkpoint headers and the allocation code in `runtime.rs`:
 | item | size | notes |
 |---|---|---|
 | FP8 projection weights | 24.33 GB | 64 layers |
-| per-row f32 block scales | 0.76 GB | the checkpoint grid is 6 MB; #334 |
+| FP8 block scales: grid plus row map | 0.02 GB | 5.9 MB grid, 15.6 MB map; was 0.76 GB per-row before #334 |
 | `embed_tokens` + `lm_head` bf16 | 5.09 GB | 248,320 x 5120 each |
 | norms, conv, `in_proj_a/b`, A, dt | 0.05 GB | |
-| **weights on the device** | **30.2 GB** | MTP (0.48 GB) and vision (0.92 GB) are not loaded |
+| **weights on the device** | **29.5 GB** | MTP (0.48 GB) and vision (0.92 GB) are not loaded |
 | linear-attention state per sequence | 151 MB + 5.9 MB conv | 48 layers x 48 heads x 128 x 128 x f32; independent of context |
 | KV per token, specrt today (f16 hi/lo pair) | 128 KiB | 16 layers x 4 heads x 256 x (K, V) x 2 planes x 2 bytes |
 | KV per token in bf16 / fp8 | 64 KiB / 32 KiB | what vLLM's `--kv-cache-dtype fp8` stores |
@@ -84,14 +86,37 @@ From the checkpoint headers and the allocation code in `runtime.rs`:
 
 | context | KV specrt (hi/lo) | KV if bf16 | KV if fp8 | total specrt, one sequence |
 |---|---|---|---|---|
-| 8,192 | 1.07 GB | 0.54 GB | 0.27 GB | about 32.5 GB |
-| 32,768 | 4.29 GB | 2.15 GB | 1.07 GB | about 35.5 GB |
-| 131,072 | 17.18 GB | 8.59 GB | 4.29 GB | about 48.4 GB |
+| 8,192 | 1.07 GB | 0.54 GB | 0.27 GB | about 31.8 GB |
+| 32,768 | 4.29 GB | 2.15 GB | 1.07 GB | about 34.8 GB |
+| 131,072 | 17.18 GB | 8.59 GB | 4.29 GB | about 47.7 GB |
 
 Beside the live vLLM (58.2 GB used after its KV was trimmed to 14 GB) 38.9 GB are free. That is
-enough for the 30.2 GB of weights plus 8k of context, and that is how the real-model run below
-was done, with max context capped at 8,192. Longer contexts beside vLLM would need fp8 KV
-(#334 also frees 0.76 GB).
+enough for the 29.5 GB of weights plus 8k of context, and that is how the real-model run below
+was done, with max context capped at 8,192. Longer contexts beside vLLM would need fp8 KV.
+
+### Scale grid and row map (#334)
+
+The kernels read a row's scales as `scales[map[row] + k / 128]`. `gemm_tc` and `gemm_fp8` load
+the map entry once per column before the k loop; `row_dot` loads it once per row. Kernel
+medians from `nsys` on the full 27B, 1,024-token prompt, old and new binaries alternated, min of
+3 runs each (vLLM serving beside it):
+
+| kernel | per-row scales | grid + map | ratio |
+|---|---|---|---|
+| `gate_up_act` decode GEMV | 137 us | 138 us | 1.009 |
+| `lin_in_norm` decode GEMV | 76 us | 77 us | 1.009 |
+| `qkv_proj_norm` decode GEMV | 69.8 us | 69.8 us | 0.999 |
+| `down_proj` decode GEMV | 66.5 us | 62.5 us | 0.94 |
+| `o_proj` decode GEMV | 25.2 us | 23.7 us | 0.94 |
+| `lin_out_proj` decode GEMV | 25.5 us | 24.5 us | 0.96 |
+| `gate_up` prefill GEMM | 10.9 ms | 10.8 ms | 0.99 |
+| `down` prefill GEMM | 5.33 ms | 5.19 ms | 0.97 |
+| `lin_in` prefill GEMM | 4.70 ms | 4.62 ms | 0.98 |
+
+The real 27B check still passes on the default path: logits 1.98e-4 of the largest logit and
+greedy identical for 32 tokens on all 5 prompts. The greedy tokens are the same as before the
+change. The tiny FP8 tests give the same errors as before on both paths (default logits 4.3e-5,
+`SPECRT_FP8_ACT=1` 0.299).
 
 ## Prefill GEMM: dequant-to-bf16 against native FP8 mma
 
