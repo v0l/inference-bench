@@ -1,7 +1,7 @@
-use crate::codegen::{Module, PAGE};
+use crate::codegen::{LA_CHUNK, LA_KSPLIT, Module, PAGE};
 use crate::jit::{Jit, default_cache_dir};
-use crate::spec::Spec;
-use crate::weights::{Matrix, Weights, find_safetensors};
+use crate::spec::{LinearAttention, Spec};
+use crate::weights::{Matrix, Mixer, Weights, find_safetensors};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::{
@@ -17,16 +17,96 @@ enum DeviceMatrix {
     Q8 { values: CudaSlice<i8>, scales: CudaSlice<f32> },
 }
 
-struct DeviceLayer {
-    ln1: CudaSlice<f32>,
-    ln2: CudaSlice<f32>,
+struct DeviceAttn {
     qkv: DeviceMatrix,
     qkv_bias: Option<CudaSlice<f32>>,
     q_norm: Option<CudaSlice<f32>>,
     k_norm: Option<CudaSlice<f32>>,
     o: DeviceMatrix,
+    kv: i32,
+}
+
+struct DeviceGdn {
+    in_proj: DeviceMatrix,
+    conv: CudaSlice<f32>,
+    neg_a: CudaSlice<f32>,
+    dt_bias: CudaSlice<f32>,
+    norm: CudaSlice<f32>,
+    out: DeviceMatrix,
+    slot: i32,
+}
+
+enum DeviceMixer {
+    Attention(DeviceAttn),
+    Linear(DeviceGdn),
+}
+
+struct DeviceLayer {
+    ln1: CudaSlice<f32>,
+    ln2: CudaSlice<f32>,
+    mixer: DeviceMixer,
     gate_up: DeviceMatrix,
     down: DeviceMatrix,
+}
+
+struct GdnBuffers {
+    la: LinearAttention,
+    conv_state: CudaSlice<f32>,
+    ssm_state: CudaSlice<f32>,
+    lin: CudaSlice<f32>,
+    mix: CudaSlice<f32>,
+    out: CudaSlice<f32>,
+    pre_lin: CudaSlice<f32>,
+    pre_mix: CudaSlice<f32>,
+    qn: CudaSlice<f32>,
+    kn: CudaSlice<f32>,
+    g: CudaSlice<f32>,
+    beta: CudaSlice<f32>,
+    w: CudaSlice<f32>,
+    u: CudaSlice<f32>,
+    aqk: CudaSlice<f32>,
+    gc: CudaSlice<f32>,
+    o: CudaSlice<f32>,
+    planes: Planes,
+}
+
+impl GdnBuffers {
+    fn new(stream: &Arc<CudaStream>, la: &LinearAttention, slots: usize, chunk: usize) -> Result<Self> {
+        let d = la.key_head_dim;
+        let chunks = chunk.div_ceil(LA_CHUNK);
+        let padded = chunks * LA_CHUNK;
+        let zeros = |n: usize| stream.alloc_zeros::<f32>(n);
+        Ok(GdnBuffers {
+            la: la.clone(),
+            conv_state: zeros(slots * la.conv_dim() * (la.conv_kernel - 1))?,
+            ssm_state: zeros(slots * la.value_heads * d * d)?,
+            lin: zeros(la.in_proj_rows())?,
+            mix: zeros(la.conv_dim())?,
+            out: zeros(la.value_dim())?,
+            pre_lin: zeros(chunk * la.in_proj_rows())?,
+            pre_mix: zeros(chunk * la.conv_dim())?,
+            qn: zeros(chunk * la.key_heads * d)?,
+            kn: zeros(chunk * la.key_heads * d)?,
+            g: zeros(chunk * la.value_heads)?,
+            beta: zeros(chunk * la.value_heads)?,
+            w: zeros(padded * la.value_heads * d)?,
+            u: zeros(padded * la.value_heads * d)?,
+            aqk: zeros(chunks * la.value_heads * LA_CHUNK * LA_CHUNK)?,
+            gc: zeros(chunks * la.value_heads * LA_CHUNK)?,
+            o: zeros(chunk * la.value_dim())?,
+            planes: Planes::new(stream, chunk * la.value_dim())?,
+        })
+    }
+}
+
+pub struct Trace {
+    pub layers: Vec<f32>,
+    pub logits: Vec<f32>,
+}
+
+pub struct LinearStates {
+    pub conv: Vec<f32>,
+    pub state: Vec<f32>,
 }
 
 struct Buffers {
@@ -134,10 +214,11 @@ pub struct Runtime {
     layers: Vec<DeviceLayer>,
     buf: Buffers,
     pre: PrefillBuffers,
+    gdn: Option<GdnBuffers>,
     chunk: usize,
     use_mma: bool,
     sms: u32,
-    layer_base: i32,
+    seq: i32,
     batch: usize,
     pub cache_hit: bool,
     pub jit_key: String,
@@ -212,15 +293,37 @@ impl Runtime {
             })
         };
         let mut layers = Vec::with_capacity(weights.layers.len());
+        let (mut kv, mut slot) = (0i32, 0i32);
         for l in &weights.layers {
+            let mixer = match &l.mixer {
+                Mixer::Attention(a) => {
+                    kv += 1;
+                    DeviceMixer::Attention(DeviceAttn {
+                        qkv: up_m(&a.qkv)?,
+                        qkv_bias: up_opt(&a.qkv_bias)?,
+                        q_norm: up_opt(&a.q_norm)?,
+                        k_norm: up_opt(&a.k_norm)?,
+                        o: up_m(&a.o)?,
+                        kv: kv - 1,
+                    })
+                }
+                Mixer::Linear(g) => {
+                    slot += 1;
+                    DeviceMixer::Linear(DeviceGdn {
+                        in_proj: up_m(&g.in_proj)?,
+                        conv: stream.clone_htod(&g.conv)?,
+                        neg_a: stream.clone_htod(&g.neg_a)?,
+                        dt_bias: stream.clone_htod(&g.dt_bias)?,
+                        norm: stream.clone_htod(&g.norm)?,
+                        out: up_m(&g.out)?,
+                        slot: slot - 1,
+                    })
+                }
+            };
             layers.push(DeviceLayer {
                 ln1: stream.clone_htod(&l.ln1)?,
                 ln2: stream.clone_htod(&l.ln2)?,
-                qkv: up_m(&l.qkv)?,
-                qkv_bias: up_opt(&l.qkv_bias)?,
-                q_norm: up_opt(&l.q_norm)?,
-                k_norm: up_opt(&l.k_norm)?,
-                o: up_m(&l.o)?,
+                mixer,
                 gate_up: up_m(&l.gate_up)?,
                 down: up_m(&l.down)?,
             });
@@ -228,7 +331,7 @@ impl Runtime {
         let d = &spec.dims;
         let pages = max_ctx.div_ceil(PAGE);
         let cache_len = batch
-            * spec.layers.count
+            * spec.attention_layers()
             * pages
             * spec.attention.kv_heads
             * PAGE
@@ -239,7 +342,7 @@ impl Runtime {
         let buf = Buffers {
             x: stream.alloc_zeros(d.hidden)?,
             xn: stream.alloc_zeros(d.hidden)?,
-            qkv: stream.alloc_zeros(spec.q_dim() + 2 * spec.kv_dim())?,
+            qkv: stream.alloc_zeros(spec.qkv_rows())?,
             attn: stream.alloc_zeros(spec.q_dim())?,
             attn_part: stream.alloc_zeros(spec.attention.heads * ATTN_SPLITS * (spec.attention.head_dim + 2))?,
             gate_up: stream.alloc_zeros(2 * d.intermediate)?,
@@ -263,7 +366,7 @@ impl Runtime {
             tokens: stream.alloc_zeros(chunk)?,
             x: stream.alloc_zeros(chunk * d.hidden)?,
             xn: stream.alloc_zeros(chunk * d.hidden)?,
-            qkv: stream.alloc_zeros(chunk * (spec.q_dim() + 2 * spec.kv_dim()))?,
+            qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
             attn: stream.alloc_zeros(chunk * spec.q_dim())?,
             gate_up: stream.alloc_zeros(chunk * 2 * d.intermediate)?,
             act: stream.alloc_zeros(chunk * d.intermediate)?,
@@ -272,17 +375,24 @@ impl Runtime {
             act_planes: Planes::new(&stream, chunk * d.intermediate)?,
             dummy_u16: stream.alloc_zeros(8)?,
         };
+        let gdn = match &spec.linear_attention {
+            Some(la) => Some(GdnBuffers::new(&stream, la, batch * spec.linear_layers(), chunk)?),
+            None => None,
+        };
+        let use_mma =
+            ctx.compute_capability()?.0 >= 8 && std::env::var_os("SPECRT_GEMM_FP32").is_none();
+        ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
         let rt = Runtime {
             smem,
             pre,
+            gdn,
             chunk,
-            layer_base: 0,
+            seq: 0,
             batch,
             sms: ctx.attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
             )? as u32,
-            use_mma: ctx.compute_capability()?.0 >= 8
-                && std::env::var_os("SPECRT_GEMM_FP32").is_none(),
+            use_mma,
             spec: spec.clone(),
             max_ctx,
             embed: stream.clone_htod(&weights.embed)?,
@@ -372,21 +482,79 @@ impl Runtime {
     }
 
     fn step(&self) -> Result<()> {
+        self.step_traced(None)
+    }
+
+    fn mlp_decode(&self, l: &DeviceLayer) -> Result<()> {
+        let s = &self.spec;
+        let buf = &self.buf;
+        self.linear_norm("gate_up_act", &l.gate_up, None, &buf.x, &l.ln2, &buf.act, s.dims.intermediate)?;
+        self.linear("down_proj", &l.down, None, &buf.act, &buf.x, s.dims.hidden)
+    }
+
+    fn trace_layer(&self, trace: Option<&CudaSlice<f32>>, layer: usize, tokens: usize) -> Result<()> {
+        let Some(trace) = trace else { return Ok(()) };
+        let n = tokens * self.spec.dims.hidden;
+        let src = if tokens == 1 { self.buf.x.slice(..n) } else { self.pre.x.slice(..n) };
+        let dst = trace.slice(layer * n..(layer + 1) * n);
+        self.copy_rows(&src, &dst, n)
+    }
+
+    fn copy_rows(&self, src: &CudaView<f32>, dst: &CudaView<f32>, n: usize) -> Result<()> {
+        let mut b = self.stream.launch_builder(self.kernel("copy_rows"));
+        let count = n as i32;
+        b.arg(src).arg(dst).arg(&count);
+        unsafe { b.launch(cfg(grid(n, 256).min(1024), 256)) }?;
+        Ok(())
+    }
+
+    fn gdn_decode(&self, g: &DeviceGdn, ln1: &CudaSlice<f32>, x: &CudaSlice<f32>) -> Result<()> {
+        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
+        let la = &gb.la;
+        self.linear_norm("lin_in_norm", &g.in_proj, None, x, ln1, &gb.lin, la.in_proj_rows())?;
+        let zero = 0i32;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
+        b.arg(&gb.lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.mix).arg(&g.slot).arg(&zero);
+        unsafe { b.launch(cfg(grid(la.conv_dim(), 256), 256)) }?;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_step"));
+        b.arg(&gb.mix)
+            .arg(&gb.lin)
+            .arg(&g.neg_a)
+            .arg(&g.dt_bias)
+            .arg(&g.norm)
+            .arg(&gb.ssm_state)
+            .arg(&gb.out)
+            .arg(&g.slot)
+            .arg(&zero);
+        unsafe { b.launch(cfg(la.value_heads as u32, (la.value_head_dim * LA_KSPLIT) as u32)) }?;
+        self.linear("lin_out_proj", &g.out, None, &gb.out, x, self.spec.dims.hidden)
+    }
+
+    fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
         let s = &self.spec;
         let a = &s.attention;
         let buf = &self.buf;
         let mut b = self.stream.launch_builder(self.kernel("embed"));
         b.arg(&self.embed).arg(&buf.token).arg(&buf.x);
         unsafe { b.launch(cfg(grid(s.dims.hidden, 256), 256)) }?;
-        let qkv_rows = s.q_dim() + 2 * s.kv_dim();
-        for (i, l) in self.layers.iter().enumerate() {
-            let layer = i as i32;
+        let qkv_rows = s.qkv_rows();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let l = match &layer.mixer {
+                DeviceMixer::Linear(g) => {
+                    self.gdn_decode(g, &layer.ln1, &buf.x)?;
+                    self.mlp_decode(layer)?;
+                    self.trace_layer(trace, i, 1)?;
+                    continue;
+                }
+                DeviceMixer::Attention(l) => l,
+            };
+            let kv_layer = l.kv;
             self.linear_norm(
                 "qkv_proj_norm",
                 &l.qkv,
                 l.qkv_bias.as_ref(),
                 &buf.x,
-                &l.ln1,
+                &layer.ln1,
                 &buf.qkv,
                 qkv_rows,
             )?;
@@ -398,7 +566,7 @@ impl Runtime {
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
-                .arg(&layer)
+                .arg(&kv_layer)
                 .arg(&0i32);
             unsafe { b.launch(cfg((a.heads + 2 * a.kv_heads) as u32, a.head_dim.max(32) as u32)) }?;
             let mut b = self.stream.launch_builder(self.kernel("attention_split"));
@@ -407,7 +575,7 @@ impl Runtime {
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
-                .arg(&layer)
+                .arg(&kv_layer)
                 .arg(&buf.attn_part);
             unsafe {
                 b.launch(LaunchConfig {
@@ -417,19 +585,11 @@ impl Runtime {
                 })
             }?;
             let mut b = self.stream.launch_builder(self.kernel("attention_reduce"));
-            b.arg(&buf.attn_part).arg(&buf.pos).arg(&buf.attn);
+            b.arg(&buf.attn_part).arg(&buf.pos).arg(&buf.qkv).arg(&buf.attn);
             unsafe { b.launch(cfg(a.heads as u32, a.head_dim.max(32) as u32)) }?;
             self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
-            self.linear_norm(
-                "gate_up_act",
-                &l.gate_up,
-                None,
-                &buf.x,
-                &l.ln2,
-                &buf.act,
-                s.dims.intermediate,
-            )?;
-            self.linear("down_proj", &l.down, None, &buf.act, &buf.x, s.dims.hidden)?;
+            self.mlp_decode(layer)?;
+            self.trace_layer(trace, i, 1)?;
         }
         self.linear_norm(
             "lm_head_norm",
@@ -541,6 +701,81 @@ impl Runtime {
         start: usize,
         all_logits: Option<&CudaSlice<f32>>,
     ) -> Result<()> {
+        self.prefill_chunk_traced(tokens, start, all_logits, None)
+    }
+
+    fn gdn_prefill(&self, g: &DeviceGdn, n: usize) -> Result<()> {
+        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
+        let la = &gb.la;
+        let pre = &self.pre;
+        let slot = g.slot + self.seq * self.spec.linear_layers() as i32;
+        let d = la.key_head_dim;
+        self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
+        let launch = |name: &str, grid_dim: (u32, u32, u32), block: u32, smem: u32| LaunchConfig {
+            grid_dim,
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: if name.is_empty() { 0 } else { smem },
+        };
+        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_prefill"));
+        b.arg(&gb.pre_lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.pre_mix).arg(&slot);
+        unsafe { b.launch(launch("", (grid(la.conv_dim(), 256), n as u32, 1), 256, 0)) }?;
+        let ntok = n as i32;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_keep"));
+        b.arg(&gb.pre_lin).arg(&gb.conv_state).arg(&slot).arg(&ntok);
+        unsafe { b.launch(cfg(grid(la.conv_dim(), 256), 256)) }?;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_qk_prep"));
+        b.arg(&gb.pre_mix).arg(&gb.qn).arg(&gb.kn);
+        unsafe { b.launch(launch("", (la.key_heads as u32, n as u32, 1), d as u32, 0)) }?;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_gates"));
+        b.arg(&gb.pre_lin).arg(&g.neg_a).arg(&g.dt_bias).arg(&gb.g).arg(&gb.beta);
+        unsafe { b.launch(cfg(n as u32, 64)) }?;
+        let chunks = n.div_ceil(LA_CHUNK) as u32;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_chunk_prep"));
+        b.arg(&gb.qn)
+            .arg(&gb.kn)
+            .arg(&gb.pre_mix)
+            .arg(&gb.g)
+            .arg(&gb.beta)
+            .arg(&gb.w)
+            .arg(&gb.u)
+            .arg(&gb.aqk)
+            .arg(&gb.gc)
+            .arg(&ntok);
+        let smem = self.smem["gdn_chunk_prep"];
+        unsafe { b.launch(launch("prep", (la.value_heads as u32, chunks, 1), 256, smem)) }?;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_chunk_scan"));
+        b.arg(&gb.qn)
+            .arg(&gb.kn)
+            .arg(&gb.w)
+            .arg(&gb.u)
+            .arg(&gb.aqk)
+            .arg(&gb.gc)
+            .arg(&gb.ssm_state)
+            .arg(&gb.o)
+            .arg(&slot)
+            .arg(&ntok);
+        unsafe { b.launch(launch("", (la.value_heads as u32, (d / 32) as u32, 1), 256, 0)) }?;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_gated_norm"));
+        b.arg(&gb.o).arg(&gb.pre_lin).arg(&g.norm).arg(&gb.planes.hi).arg(&gb.planes.lo);
+        unsafe { b.launch(launch("", (la.value_heads as u32, n as u32, 1), (d / 2) as u32, 0)) }?;
+        self.tc("lin_out", &g.out, None, gb.planes.all(), GemmOut::F32(&pre.x), self.spec.dims.hidden, n)
+    }
+
+    fn mlp_prefill(&self, l: &DeviceLayer, n: usize) -> Result<()> {
+        let pre = &self.pre;
+        let (hidden, inter) = (self.spec.dims.hidden, self.spec.dims.intermediate);
+        self.rms_split(&pre.x.as_view(), &l.ln2, &pre.xn_planes, n)?;
+        self.tc("gate_up", &l.gate_up, None, pre.xn_planes.all(), GemmOut::Planes(&pre.act_planes), 2 * inter, n)?;
+        self.tc("down", &l.down, None, pre.act_planes.all(), GemmOut::F32(&pre.x), hidden, n)
+    }
+
+    fn prefill_chunk_traced(
+        &mut self,
+        tokens: &[u32],
+        start: usize,
+        all_logits: Option<&CudaSlice<f32>>,
+        trace: Option<&CudaSlice<f32>>,
+    ) -> Result<()> {
         let n = tokens.len();
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         self.stream.memcpy_htod(&ids, &mut self.pre.tokens.slice_mut(..n))?;
@@ -548,7 +783,7 @@ impl Runtime {
         let s = &self.spec;
         let a = &s.attention;
         let hidden = s.dims.hidden;
-        let qkv_rows = s.q_dim() + 2 * s.kv_dim();
+        let qkv_rows = s.qkv_rows();
         let pre = &self.pre;
         let buf = &self.buf;
         let mut b = self.stream.launch_builder(self.kernel("embed"));
@@ -559,10 +794,20 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        for (i, l) in self.layers.iter().enumerate() {
-            let layer = self.layer_base + i as i32;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let l = match &layer.mixer {
+                DeviceMixer::Linear(g) => {
+                    self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
+                    self.gdn_prefill(g, n)?;
+                    self.mlp_prefill(layer, n)?;
+                    self.trace_layer(trace, i, n)?;
+                    continue;
+                }
+                DeviceMixer::Attention(l) => l,
+            };
+            let kv_layer = self.seq * s.attention_layers() as i32 + l.kv;
             if self.use_mma {
-                self.rms_split(&pre.x.as_view(), &l.ln1, &pre.xn_planes, n)?;
+                self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
                 self.tc(
                     "qkv",
                     &l.qkv,
@@ -573,7 +818,7 @@ impl Runtime {
                     n,
                 )?;
             } else {
-                self.rmsnorm_rows(&pre.x, &l.ln1, &pre.xn, n)?;
+                self.rmsnorm_rows(&pre.x, &layer.ln1, &pre.xn, n)?;
                 self.gemm(
                     "qkv_gemm",
                     &l.qkv,
@@ -594,7 +839,7 @@ impl Runtime {
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
-                .arg(&layer);
+                .arg(&kv_layer);
             if !self.use_mma {
                 b.arg(&0i32);
             }
@@ -615,7 +860,7 @@ impl Runtime {
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
-                .arg(&layer);
+                .arg(&kv_layer);
             if self.use_mma {
                 b.arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
             } else {
@@ -632,24 +877,15 @@ impl Runtime {
             let inter = s.dims.intermediate;
             if self.use_mma {
                 self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
-                self.rms_split(&pre.x.as_view(), &l.ln2, &pre.xn_planes, n)?;
-                self.tc(
-                    "gate_up",
-                    &l.gate_up,
-                    None,
-                    pre.xn_planes.all(),
-                    GemmOut::Planes(&pre.act_planes),
-                    2 * inter,
-                    n,
-                )?;
-                self.tc("down", &l.down, None, pre.act_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
+                self.mlp_prefill(layer, n)?;
+                self.trace_layer(trace, i, n)?;
                 continue;
             }
             self.gemm("o_gemm", &l.o, None, &pre.attn.as_view(), &pre.x, hidden, n)?;
-            self.rmsnorm_rows(&pre.x, &l.ln2, &pre.xn, n)?;
+            self.rmsnorm_rows(&pre.x, &layer.ln2, &pre.xn, n)?;
             self.gemm(
                 "gate_up_gemm",
-                &l.gate_up,
+                &layer.gate_up,
                 None,
                 &pre.xn.as_view(),
                 &pre.gate_up,
@@ -664,7 +900,8 @@ impl Runtime {
                 shared_mem_bytes: 0,
             };
             unsafe { b.launch(config) }?;
-            self.gemm("down_gemm", &l.down, None, &pre.act.as_view(), &pre.x, hidden, n)?;
+            self.gemm("down_gemm", &layer.down, None, &pre.act.as_view(), &pre.x, hidden, n)?;
+            self.trace_layer(trace, i, n)?;
         }
         if self.use_mma {
             let (out, rows) = match all_logits {
@@ -738,6 +975,7 @@ impl Runtime {
 
     pub fn prompt_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         ensure!(tokens.len() <= self.max_ctx, "prompt longer than max_ctx");
+        self.reset_linear_state()?;
         self.prefill(tokens, true)
     }
 
@@ -785,6 +1023,7 @@ impl Runtime {
         );
         let started = Instant::now();
         self.stream.memcpy_htod(&[0i32], &mut self.buf.count)?;
+        self.reset_linear_state()?;
         self.prefill(prompt, false)?;
         self.stream.memcpy_htod(&[prompt.len() as i32 - 1], &mut self.buf.pos)?;
         self.advance(sampling)?;
@@ -834,15 +1073,110 @@ impl Runtime {
         Ok(())
     }
 
+    fn gdn_batch(&self, g: &DeviceGdn, seq_slots: i32) -> Result<()> {
+        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
+        let la = &gb.la;
+        let n = self.batch;
+        let pre = &self.pre;
+        self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
+        b.arg(&gb.pre_lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.pre_mix).arg(&g.slot).arg(&seq_slots);
+        let config = LaunchConfig {
+            grid_dim: (grid(la.conv_dim(), 256), n as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        let mut b = self.stream.launch_builder(self.kernel("gdn_step"));
+        b.arg(&gb.pre_mix)
+            .arg(&gb.pre_lin)
+            .arg(&g.neg_a)
+            .arg(&g.dt_bias)
+            .arg(&g.norm)
+            .arg(&gb.ssm_state)
+            .arg(&gb.o)
+            .arg(&g.slot)
+            .arg(&seq_slots);
+        let config = LaunchConfig {
+            grid_dim: (la.value_heads as u32, n as u32, 1),
+            block_dim: ((la.value_head_dim * LA_KSPLIT) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        let mut b = self.stream.launch_builder(self.kernel("split_rows"));
+        let count = (n * la.value_dim()) as i32;
+        b.arg(&gb.o).arg(&gb.planes.hi).arg(&gb.planes.lo).arg(&count);
+        unsafe { b.launch(cfg(grid(n * la.value_dim(), 512), 256)) }?;
+        self.tc("lin_out", &g.out, None, gb.planes.all(), GemmOut::F32(&pre.x), self.spec.dims.hidden, n)
+    }
+
+    fn reset_linear_state(&mut self) -> Result<()> {
+        let seq = self.seq as usize;
+        let slots = self.spec.linear_layers();
+        let Some(gb) = self.gdn.as_mut() else { return Ok(()) };
+        let conv = slots * gb.la.conv_dim() * (gb.la.conv_kernel - 1);
+        let ssm = slots * gb.la.value_heads * gb.la.key_head_dim * gb.la.key_head_dim;
+        self.stream.memset_zeros(&mut gb.conv_state.slice_mut(seq * conv..(seq + 1) * conv))?;
+        self.stream.memset_zeros(&mut gb.ssm_state.slice_mut(seq * ssm..(seq + 1) * ssm))?;
+        Ok(())
+    }
+
+    pub fn linear_states(&self) -> Result<LinearStates> {
+        let gb = self.gdn.as_ref().context("no linear layers")?;
+        Ok(LinearStates {
+            conv: self.stream.clone_dtoh(&gb.conv_state)?,
+            state: self.stream.clone_dtoh(&gb.ssm_state)?,
+        })
+    }
+
+    pub fn trace_prefill(&mut self, tokens: &[u32]) -> Result<Trace> {
+        ensure!(tokens.len() <= self.chunk, "trace prefill fits one chunk");
+        let s = &self.spec;
+        let n = tokens.len();
+        let layers = self.stream.alloc_zeros::<f32>(s.layers.count * n * s.dims.hidden)?;
+        let logits = self.stream.alloc_zeros::<f32>(n * s.dims.vocab)?;
+        self.reset_linear_state()?;
+        self.prefill_chunk_traced(tokens, 0, Some(&logits), Some(&layers))?;
+        Ok(Trace { layers: self.stream.clone_dtoh(&layers)?, logits: self.stream.clone_dtoh(&logits)? })
+    }
+
+    pub fn trace_decode(&mut self, tokens: &[u32]) -> Result<Trace> {
+        let s = self.spec.clone();
+        let per_step = s.layers.count * s.dims.hidden;
+        let layers = self.stream.alloc_zeros::<f32>(per_step)?;
+        self.reset_linear_state()?;
+        let mut trace = Trace { layers: Vec::new(), logits: Vec::new() };
+        for (pos, &t) in tokens.iter().enumerate() {
+            self.set(t, pos)?;
+            self.step_traced(Some(&layers))?;
+            trace.layers.extend(self.stream.clone_dtoh(&layers)?);
+            trace.logits.extend(self.stream.clone_dtoh(&self.buf.logits)?);
+        }
+        Ok(trace)
+    }
+
+    pub fn prefill_then_decode(&mut self, prompt: &[u32], decode: &[u32]) -> Result<Vec<f32>> {
+        ensure!(prompt.len() + decode.len() <= self.max_ctx, "longer than max_ctx");
+        self.reset_linear_state()?;
+        self.prefill(prompt, false)?;
+        let mut logits = self.stream.clone_dtoh(&self.buf.logits)?;
+        for (i, &t) in decode.iter().enumerate() {
+            self.set(t, prompt.len() + i)?;
+            self.step()?;
+            logits.extend(self.stream.clone_dtoh(&self.buf.logits)?);
+        }
+        Ok(logits)
+    }
+
     fn batch_step(&self, bb: &BatchBuffers) -> Result<()> {
         let s = &self.spec;
         let a = &s.attention;
         let n = self.batch;
         let hidden = s.dims.hidden;
-        let inter = s.dims.intermediate;
         let pre = &self.pre;
         let buf = &self.buf;
-        let seq_layers = s.layers.count as i32;
+        let seq_layers = s.attention_layers() as i32;
+        let seq_slots = s.linear_layers() as i32;
         let mut b = self.stream.launch_builder(self.kernel("embed"));
         b.arg(&self.embed).arg(&bb.tokens).arg(&pre.x);
         let config = LaunchConfig {
@@ -851,10 +1185,18 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        for (i, l) in self.layers.iter().enumerate() {
-            let layer = i as i32;
-            self.rms_split(&pre.x.as_view(), &l.ln1, &pre.xn_planes, n)?;
-            let qkv_rows = s.q_dim() + 2 * s.kv_dim();
+        for layer in &self.layers {
+            self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
+            let l = match &layer.mixer {
+                DeviceMixer::Linear(g) => {
+                    self.gdn_batch(g, seq_slots)?;
+                    self.mlp_prefill(layer, n)?;
+                    continue;
+                }
+                DeviceMixer::Attention(l) => l,
+            };
+            let kv_layer = l.kv;
+            let qkv_rows = s.qkv_rows();
             self.tc(
                 "qkv",
                 &l.qkv,
@@ -872,7 +1214,7 @@ impl Runtime {
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
-                .arg(&layer)
+                .arg(&kv_layer)
                 .arg(&seq_layers);
             let config = LaunchConfig {
                 grid_dim: ((a.heads + 2 * a.kv_heads) as u32, n as u32, 1),
@@ -886,7 +1228,7 @@ impl Runtime {
                 .arg(&buf.v_cache)
                 .arg(&buf.block_table)
                 .arg(&buf.pos)
-                .arg(&layer)
+                .arg(&kv_layer)
                 .arg(&bb.part_acc)
                 .arg(&bb.part_ml)
                 .arg(&seq_layers);
@@ -897,7 +1239,7 @@ impl Runtime {
             };
             unsafe { b.launch(config) }?;
             let mut b = self.stream.launch_builder(self.kernel("batch_decode_combine"));
-            b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
+            b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.qkv).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
             let config = LaunchConfig {
                 grid_dim: (a.heads as u32, n as u32, 1),
                 block_dim: (a.head_dim as u32 / 2, 1, 1),
@@ -905,17 +1247,7 @@ impl Runtime {
             };
             unsafe { b.launch(config) }?;
             self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
-            self.rms_split(&pre.x.as_view(), &l.ln2, &pre.xn_planes, n)?;
-            self.tc(
-                "gate_up",
-                &l.gate_up,
-                None,
-                pre.xn_planes.all(),
-                GemmOut::Planes(&pre.act_planes),
-                2 * inter,
-                n,
-            )?;
-            self.tc("down", &l.down, None, pre.act_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
+            self.mlp_prefill(layer, n)?;
         }
         self.rms_split(&pre.x.as_view(), &self.norm, &pre.xn_planes, n)?;
         self.tc(
@@ -959,9 +1291,9 @@ impl Runtime {
         let started = Instant::now();
         self.stream.memcpy_htod(&[0i32], &mut self.buf.count)?;
         for (seq, p) in prompts.iter().enumerate() {
-            self.layer_base = (seq * self.spec.layers.count) as i32;
-            let prefilled = self.prefill(p, false);
-            self.layer_base = 0;
+            self.seq = seq as i32;
+            let prefilled = self.reset_linear_state().and_then(|_| self.prefill(p, false));
+            self.seq = 0;
             prefilled?;
             self.first_token(&bb, seq)?;
         }

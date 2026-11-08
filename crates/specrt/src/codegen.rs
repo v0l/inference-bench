@@ -4,10 +4,13 @@ use std::collections::BTreeMap;
 
 pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
 pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
+pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
 pub const BATCH_DECODE_SPLITS: usize = 8;
 pub const FLASH_ROWS: usize = 128;
+pub const LA_CHUNK: usize = 64;
+pub const LA_KSPLIT: usize = 4;
 const FLASH_KEYS: usize = 32;
 const FLASH_STAGES: usize = 2;
 
@@ -20,6 +23,7 @@ pub struct Tile {
 }
 
 pub const MMA_LINEARS: [&str; 5] = ["qkv", "o", "gate_up", "down", "lm_head"];
+pub const GDN_LINEARS: [&str; 2] = ["lin_in", "lin_out"];
 pub const MMA_VARIANTS: [&str; 4] = ["", "_big", "_narrow", "_tiny"];
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -139,6 +143,30 @@ pub const KERNELS: &[&str] = &[
     "flash_mma",
     "batch_decode_attention",
     "batch_decode_combine",
+    "copy_rows",
+    "split_rows",
+];
+
+pub const GDN_KERNELS: &[&str] = &[
+    "gdn_conv_step",
+    "gdn_conv_prefill",
+    "gdn_conv_keep",
+    "gdn_step",
+    "gdn_qk_prep",
+    "gdn_gates",
+    "gdn_chunk_prep",
+    "gdn_chunk_scan",
+    "gdn_gated_norm",
+    "lin_in_norm",
+    "lin_out_proj",
+    "lin_in_mma",
+    "lin_out_mma",
+    "lin_in_mma_big",
+    "lin_out_mma_big",
+    "lin_in_mma_narrow",
+    "lin_out_mma_narrow",
+    "lin_in_mma_tiny",
+    "lin_out_mma_tiny",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,17 +202,24 @@ fn float_literal(v: f64) -> String {
 
 fn mma_kernel_name(linear: &str, suffix: &str) -> &'static str {
     let name = format!("{linear}_mma{suffix}");
-    KERNELS.iter().copied().find(|k| *k == name).expect("mma kernel listed in KERNELS")
+    KERNELS
+        .iter()
+        .chain(GDN_KERNELS)
+        .copied()
+        .find(|k| *k == name)
+        .expect("mma kernel listed in KERNELS")
 }
 
 fn linear_dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str, bool) {
     let d = &spec.dims;
-    let qkv_n = spec.q_dim() + 2 * spec.kv_dim();
+    let la = spec.linear_attention.as_ref();
     match linear {
-        "qkv" => (qkv_n, d.hidden, "EPI_STORE", spec.attention.qkv_bias),
+        "qkv" => (spec.qkv_rows(), d.hidden, "EPI_STORE", spec.attention.qkv_bias),
         "o" => (d.hidden, spec.q_dim(), "EPI_RESIDUAL", false),
         "gate_up" => (2 * d.intermediate, d.hidden, "EPI_ACT", false),
         "down" => (d.hidden, d.intermediate, "EPI_RESIDUAL", false),
+        "lin_in" => (la.map_or(0, |l| l.in_proj_rows()), d.hidden, "EPI_STORE", false),
+        "lin_out" => (d.hidden, la.map_or(0, |l| l.value_dim()), "EPI_RESIDUAL", false),
         _ => (d.vocab, d.hidden, "EPI_STORE", false),
     }
 }
@@ -193,7 +228,8 @@ fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
     let q8 = spec.quant == Quant::Q8;
     let unsplit = std::env::var("SPECRT_UNSPLIT").unwrap_or_default();
     let mut out = String::new();
-    for linear in MMA_LINEARS {
+    let gdn: &[&str] = if spec.linear_attention.is_some() { &GDN_LINEARS } else { &[] };
+    for &linear in MMA_LINEARS.iter().chain(gdn) {
         let split = !q8 && !unsplit.split(',').any(|n| n == linear);
         let (n, k, epi, bias) = linear_dims(spec, linear);
         for suffix in MMA_VARIANTS {
@@ -242,6 +278,12 @@ impl Module {
         let kv_bytes = FLASH_STAGES * 4 * FLASH_KEYS * a.head_dim * 2;
         let q_bytes = FLASH_ROWS * a.head_dim * 4;
         smem.insert("flash_mma", kv_bytes.max(q_bytes) as u32);
+        let la = spec.linear_attention.as_ref();
+        let la_dim = |f: fn(&crate::spec::LinearAttention) -> usize| la.map_or("0".into(), |l| f(l).to_string());
+        if let Some(l) = la {
+            let floats = LA_CHUNK * (l.key_head_dim + 1) + LA_CHUNK * (LA_CHUNK + 1) + 2 * LA_CHUNK;
+            smem.insert("gdn_chunk_prep", (floats * 4) as u32);
+        }
         let vars: BTreeMap<&str, String> = [
             ("HIDDEN", d.hidden.to_string()),
             ("INTER", d.intermediate.to_string()),
@@ -265,7 +307,16 @@ impl Module {
             ("Q8_GROUP", Q8_GROUP.to_string()),
             ("BD_SPLITS", BATCH_DECODE_SPLITS.to_string()),
             ("Q_DIM", spec.q_dim().to_string()),
-            ("QKV_N", (spec.q_dim() + 2 * spec.kv_dim()).to_string()),
+            ("QKV_N", spec.qkv_rows().to_string()),
+            ("QKV_ROW", spec.qkv_rows().to_string()),
+            ("OUT_GATE", a.output_gate.to_string()),
+            ("ROT", spec.rotary_dim().to_string()),
+            ("LA_KH", la_dim(|l| l.key_heads)),
+            ("LA_VH", la_dim(|l| l.value_heads)),
+            ("LA_D", la_dim(|l| l.key_head_dim)),
+            ("LA_CONV_K", la_dim(|l| l.conv_kernel)),
+            ("LA_CHUNK", LA_CHUNK.to_string()),
+            ("LA_KSPLIT", LA_KSPLIT.to_string()),
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
             ("LINEAR", linear.to_string()),
             ("Q8", (spec.quant == Quant::Q8).to_string()),
@@ -277,8 +328,14 @@ impl Module {
         ]
         .into_iter()
         .collect();
-        let source =
+        let mut source =
             format!("{}\n{}", render(OPS_TEMPLATE, &vars)?, render(MODEL_TEMPLATE, &vars)?);
-        Ok(Module { source, kernels: KERNELS.to_vec(), smem })
+        let mut kernels = KERNELS.to_vec();
+        if la.is_some() {
+            source.push('\n');
+            source.push_str(&render(GDN_TEMPLATE, &vars)?);
+            kernels.extend_from_slice(GDN_KERNELS);
+        }
+        Ok(Module { source, kernels, smem })
     }
 }

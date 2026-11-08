@@ -10,6 +10,11 @@ constexpr int HEAD_DIM = {{HEAD_DIM}};
 constexpr int GROUP = {{GROUP}};
 constexpr int Q_DIM = HEADS * HEAD_DIM;
 constexpr int KV_DIM = KV_HEADS * HEAD_DIM;
+constexpr int QKV_ROW = {{QKV_ROW}};
+constexpr int GATE_OFF = Q_DIM + 2 * KV_DIM;
+constexpr bool OUT_GATE = {{OUT_GATE}};
+constexpr int ROT = {{ROT}};
+constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = {{QK_NORM}};
 constexpr float EPS = {{EPS}};
 constexpr float THETA = {{THETA}};
@@ -29,6 +34,11 @@ constexpr int ATTN_THREADS = 512;
 
 __device__ __forceinline__ float bf16_to_f32(bf16_t v) {
     return __uint_as_float(((unsigned)v) << 16);
+}
+
+__device__ __forceinline__ float out_gate(const float* qkv, size_t row, int at) {
+    if (!OUT_GATE) return 1.0f;
+    return 1.0f / (1.0f + expf(-qkv[row * QKV_ROW + GATE_OFF + at]));
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -595,7 +605,7 @@ extern "C" __global__ void rmsnorm(const float* x, const float* weight, float* o
 }
 
 __device__ __forceinline__ float rope_inv_freq(int i) {
-    float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)HEAD_DIM);
+    float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)ROT);
     if (ROPE_KIND == 1) {
         inv_freq /= ROPE_FACTOR;
     } else if (ROPE_KIND == 2) {
@@ -669,7 +679,7 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     int d = threadIdx.x;
     bool is_q = head < HEADS;
     bool is_k = !is_q && head < HEADS + KV_HEADS;
-    float* src = qkv + (size_t)row * (Q_DIM + 2 * KV_DIM) + head * HEAD_DIM;
+    float* src = qkv + (size_t)row * QKV_ROW + head * HEAD_DIM;
     float v = d < HEAD_DIM ? src[d] : 0.0f;
     if (QK_NORM && (is_q || is_k)) {
         float inv = rsqrtf(block_reduce<false>(v * v, scratch) / HEAD_DIM + EPS);
@@ -678,12 +688,11 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     }
     if (d < HEAD_DIM) vec[d] = v;
     __syncthreads();
-    if ((is_q || is_k) && d < HEAD_DIM) {
-        int half = HEAD_DIM / 2;
-        float angle = (float)pos * rope_inv_freq(d < half ? d : d - half);
+    if ((is_q || is_k) && d < ROT) {
+        float angle = (float)pos * rope_inv_freq(d < ROT_HALF ? d : d - ROT_HALF);
         float c = cosf(angle);
         float s = sinf(angle);
-        v = d < half ? vec[d] * c - vec[d + half] * s : vec[d] * c + vec[d - half] * s;
+        v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
     }
     if (d >= HEAD_DIM) return;
     if (is_q) {
@@ -804,7 +813,7 @@ extern "C" __global__ void attention_split(const float* qkv, const bf16_t* k_cac
     }
 }
 
-extern "C" __global__ void attention_reduce(const float* part, const int* pos_ptr, float* out) {
+extern "C" __global__ void attention_reduce(const float* part, const int* pos_ptr, const float* qkv, float* out) {
     int head = blockIdx.x;
     int len = pos_ptr[0] + 1;
     int chunk = attn_chunk(len);
@@ -831,7 +840,7 @@ extern "C" __global__ void attention_reduce(const float* part, const int* pos_pt
     if (d < HEAD_DIM) {
 #pragma unroll 8
         for (int i = 0; i < active; i++) total += w_s[i] * base[i * ATTN_PART + d];
-        out[head * HEAD_DIM + d] = total / l;
+        out[head * HEAD_DIM + d] = total / l * out_gate(qkv, 0, head * HEAD_DIM + d);
     }
 }
 
@@ -847,7 +856,7 @@ extern "C" __global__ void attention(const float* qkv, const bf16_t* k_cache, co
     layer += blockIdx.y * seq_layers;
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
-    const float* q = qkv + (size_t)blockIdx.y * (Q_DIM + 2 * KV_DIM) + head * HEAD_DIM;
+    const float* q = qkv + (size_t)blockIdx.y * QKV_ROW + head * HEAD_DIM;
     out += (size_t)blockIdx.y * Q_DIM;
     float scale = rsqrtf((float)HEAD_DIM);
     for (int t = warp; t < len; t += ATTN_THREADS / 32) {
@@ -894,7 +903,7 @@ extern "C" __global__ void attention(const float* qkv, const bf16_t* k_cache, co
     for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x) {
         float total = 0.0f;
         for (int w = 0; w < WARPS; w++) total += partial[w][d];
-        out[head * HEAD_DIM + d] = total / sum;
+        out[head * HEAD_DIM + d] = total / sum * out_gate(qkv, blockIdx.y, head * HEAD_DIM + d);
     }
 }
 
@@ -919,7 +928,7 @@ extern "C" __global__ void batch_decode_attention(const float* qkv, const bf16_t
     int t0 = split * chunk;
     int t1 = min(len, t0 + chunk);
     int seq_layer = layer + seq * seq_layers;
-    const float* q = qkv + (size_t)seq * (Q_DIM + 2 * KV_DIM) + kv_head * GROUP * HEAD_DIM;
+    const float* q = qkv + (size_t)seq * QKV_ROW + kv_head * GROUP * HEAD_DIM;
     float scale = rsqrtf((float)HEAD_DIM);
     float qr[GROUP][PER_LANE];
 #pragma unroll
@@ -1007,7 +1016,7 @@ extern "C" __global__ void batch_decode_attention(const float* qkv, const bf16_t
     }
 }
 
-extern "C" __global__ void batch_decode_combine(const float* part_acc, const float* part_ml, bf16_t* out_hi, bf16_t* out_lo) {
+extern "C" __global__ void batch_decode_combine(const float* part_acc, const float* part_ml, const float* qkv, bf16_t* out_hi, bf16_t* out_lo) {
     int head = blockIdx.x;
     int seq = blockIdx.y;
     int d = 2 * threadIdx.x;
@@ -1022,7 +1031,8 @@ extern "C" __global__ void batch_decode_combine(const float* part_acc, const flo
         A0 += part_acc[(base + s) * HEAD_DIM + d] * c;
         A1 += part_acc[(base + s) * HEAD_DIM + d + 1] * c;
     }
-    split_store2(out_hi, out_lo, ((size_t)seq * HEADS + head) * HEAD_DIM + d, A0 / L, A1 / L);
+    int at = head * HEAD_DIM + d;
+    split_store2(out_hi, out_lo, (size_t)seq * Q_DIM + at, A0 / L * out_gate(qkv, seq, at), A1 / L * out_gate(qkv, seq, at + 1));
 }
 
 constexpr int FA_BQ = 16;
@@ -1051,7 +1061,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
         int r = i / HEAD_DIM;
         int d = i % HEAD_DIM;
         int q = q0 + r;
-        qs[r][d] = q < tokens ? qkv[(size_t)q * (Q_DIM + 2 * KV_DIM) + head * HEAD_DIM + d] : 0.0f;
+        qs[r][d] = q < tokens ? qkv[(size_t)q * QKV_ROW + head * HEAD_DIM + d] : 0.0f;
     }
     float o[FA_OUT];
 #pragma unroll
@@ -1120,7 +1130,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
         float inv = 1.0f / l;
         float* dst = out + (size_t)qi * Q_DIM + head * HEAD_DIM;
 #pragma unroll
-        for (int i = 0; i < FA_OUT; i++) dst[sub + 8 * i] = o[i] * inv;
+        for (int i = 0; i < FA_OUT; i++) dst[sub + 8 * i] = o[i] * inv * out_gate(qkv, qi, head * HEAD_DIM + sub + 8 * i);
     }
 }
 
@@ -1186,42 +1196,38 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     float scale_log2 = rsqrtf((float)HEAD_DIM) * 1.4426950408889634f;
     unsigned qh[FM_KB][4];
     unsigned ql[FM_KB][4];
-    constexpr int QKV_ROW = Q_DIM + 2 * KV_DIM;
-    constexpr int HALF = HEAD_DIM / 2;
-    constexpr int PAIRS = (HALF + 31) / 32;
+    constexpr int PAIRS = (ROT_HALF + 31) / 32;
     float* wq = qs + warp * 16 * HEAD_DIM;
     float freq[PAIRS];
 #pragma unroll
-    for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, HALF - 1));
+    for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, ROT_HALF - 1));
     for (int r = 0; r < 16; r++) {
         int row = q0 + warp * 16 + r;
-        float a[PAIRS], b[PAIRS];
+        const float* src = qkv + (size_t)row * QKV_ROW + head * HEAD_DIM;
+        float* dst = wq + r * HEAD_DIM;
         float ss = 0.0f;
-#pragma unroll
-        for (int i = 0; i < PAIRS; i++) {
-            int d = lane + 32 * i;
-            bool ok = d < HALF && row < tokens;
-            const float* src = qkv + (size_t)row * QKV_ROW + head * HEAD_DIM;
-            a[i] = ok ? src[d] : 0.0f;
-            b[i] = ok ? src[d + HALF] : 0.0f;
-            ss += a[i] * a[i] + b[i] * b[i];
+        for (int d = lane; d < HEAD_DIM; d += 32) {
+            float v = row < tokens ? src[d] : 0.0f;
+            dst[d] = v;
+            ss += v * v;
         }
         float inv = QK_NORM ? rsqrtf(warp_sum(ss) / HEAD_DIM + EPS) : 1.0f;
+        __syncwarp();
+        if (QK_NORM)
+            for (int d = lane; d < HEAD_DIM; d += 32) dst[d] = q_norm[d] * (dst[d] * inv);
+        __syncwarp();
 #pragma unroll
         for (int i = 0; i < PAIRS; i++) {
             int d = lane + 32 * i;
-            if (d < HALF) {
-                float x = a[i], y = b[i];
-                if (QK_NORM) {
-                    x = q_norm[d] * (x * inv);
-                    y = q_norm[d + HALF] * (y * inv);
-                }
+            if (d < ROT_HALF) {
+                float x = dst[d], y = dst[d + ROT_HALF];
                 float sn, c;
                 sincosf((float)(base + row) * freq[i], &sn, &c);
-                wq[r * HEAD_DIM + d] = x * c - y * sn;
-                wq[r * HEAD_DIM + d + HALF] = y * c + x * sn;
+                dst[d] = x * c - y * sn;
+                dst[d + ROT_HALF] = y * c + x * sn;
             }
         }
+        __syncwarp();
     }
     __syncwarp();
 #pragma unroll
@@ -1372,10 +1378,13 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
 #pragma unroll
     for (int nb = 0; nb < FM_NB; nb++) {
         int d = nb * 8 + 2 * t;
+        int at = head * HEAD_DIM + d;
         if (row0 < tokens)
-            split_store2(out_hi, out_lo, (size_t)row0 * Q_DIM + head * HEAD_DIM + d, o[nb][0] * i0, o[nb][1] * i0);
+            split_store2(out_hi, out_lo, (size_t)row0 * Q_DIM + at, o[nb][0] * i0 * out_gate(qkv, row0, at),
+                         o[nb][1] * i0 * out_gate(qkv, row0, at + 1));
         if (row1 < tokens)
-            split_store2(out_hi, out_lo, (size_t)row1 * Q_DIM + head * HEAD_DIM + d, o[nb][2] * i1, o[nb][3] * i1);
+            split_store2(out_hi, out_lo, (size_t)row1 * Q_DIM + at, o[nb][2] * i1 * out_gate(qkv, row1, at),
+                         o[nb][3] * i1 * out_gate(qkv, row1, at + 1));
     }
 }
 
@@ -1469,4 +1478,13 @@ extern "C" __global__ void argmax_rows(const float* logits, int* tokens, int* hi
 extern "C" __global__ void bump(int* pos, int* count) {
     pos[0] += 1;
     count[0] += 1;
+}
+
+extern "C" __global__ void copy_rows(const float* src, float* dst, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = src[i];
+}
+
+extern "C" __global__ void split_rows(const float* src, bf16_t* hi, bf16_t* lo, int n) {
+    for (int i = 2 * (blockIdx.x * blockDim.x + threadIdx.x); i < n; i += 2 * gridDim.x * blockDim.x)
+        split_store2(hi, lo, i, src[i], src[i + 1]);
 }

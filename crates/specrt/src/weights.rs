@@ -10,14 +10,32 @@ pub enum Matrix {
     Q8 { values: Vec<i8>, scales: Vec<f32> },
 }
 
-pub struct Layer {
-    pub ln1: Vec<f32>,
-    pub ln2: Vec<f32>,
+pub struct Attn {
     pub qkv: Matrix,
     pub qkv_bias: Option<Vec<f32>>,
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
     pub o: Matrix,
+}
+
+pub struct Gdn {
+    pub in_proj: Matrix,
+    pub conv: Vec<f32>,
+    pub neg_a: Vec<f32>,
+    pub dt_bias: Vec<f32>,
+    pub norm: Vec<f32>,
+    pub out: Matrix,
+}
+
+pub enum Mixer {
+    Attention(Attn),
+    Linear(Gdn),
+}
+
+pub struct Layer {
+    pub ln1: Vec<f32>,
+    pub ln2: Vec<f32>,
+    pub mixer: Mixer,
     pub gate_up: Matrix,
     pub down: Matrix,
 }
@@ -40,6 +58,12 @@ pub fn hub_dir() -> PathBuf {
 }
 
 pub fn find_safetensors(repo: &str) -> Result<PathBuf> {
+    let local = Path::new(repo);
+    if local.is_dir() {
+        let file = local.join("model.safetensors");
+        ensure!(file.exists(), "no model.safetensors in {repo}");
+        return Ok(file);
+    }
     let snapshots =
         hub_dir().join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
     for entry in std::fs::read_dir(&snapshots).with_context(|| snapshots.display().to_string())? {
@@ -87,6 +111,14 @@ impl Reader<'_> {
 
     fn f32(&self, name: &str, len: usize) -> Result<Vec<f32>> {
         Ok(self.bf16(name, &[len])?.into_iter().map(bf16_to_f32).collect())
+    }
+
+    fn f32_shaped(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        Ok(self.bf16(name, shape)?.into_iter().map(bf16_to_f32).collect())
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.st.tensor(name).is_ok()
     }
 }
 
@@ -150,51 +182,93 @@ fn matrix(quant: Quant, w: Vec<u16>, cols: usize) -> Matrix {
     }
 }
 
+fn attention(spec: &Spec, r: &Reader, attn: &str, norm: &dyn Fn(&str, usize) -> Result<Vec<f32>>) -> Result<Attn> {
+    let a = &spec.attention;
+    let (h, q, kv) = (spec.dims.hidden, spec.q_dim(), spec.kv_dim());
+    let mut qkv = Vec::with_capacity(spec.qkv_rows() * h);
+    let mut gate = Vec::new();
+    if a.output_gate {
+        let both = r.bf16(&format!("{attn}.q_proj.weight"), &[2 * q, h])?;
+        for head in both.chunks_exact(2 * a.head_dim * h) {
+            let (query, g) = head.split_at(a.head_dim * h);
+            qkv.extend_from_slice(query);
+            gate.extend_from_slice(g);
+        }
+    } else {
+        qkv.extend(r.bf16(&format!("{attn}.q_proj.weight"), &[q, h])?);
+    }
+    qkv.extend(r.bf16(&format!("{attn}.k_proj.weight"), &[kv, h])?);
+    qkv.extend(r.bf16(&format!("{attn}.v_proj.weight"), &[kv, h])?);
+    qkv.extend(gate);
+    let qkv_bias = if a.qkv_bias {
+        ensure!(!a.output_gate, "qkv bias with an output gate is not supported");
+        let mut b = r.f32(&format!("{attn}.q_proj.bias"), q)?;
+        b.extend(r.f32(&format!("{attn}.k_proj.bias"), kv)?);
+        b.extend(r.f32(&format!("{attn}.v_proj.bias"), kv)?);
+        Some(b)
+    } else {
+        None
+    };
+    let (q_norm, k_norm) = if a.qk_norm {
+        (
+            Some(norm(&format!("{attn}.q_norm.weight"), a.head_dim)?),
+            Some(norm(&format!("{attn}.k_norm.weight"), a.head_dim)?),
+        )
+    } else {
+        (None, None)
+    };
+    let o = matrix(spec.quant, r.bf16(&format!("{attn}.o_proj.weight"), &[h, q])?, q);
+    Ok(Attn { qkv: matrix(spec.quant, qkv, h), qkv_bias, q_norm, k_norm, o })
+}
+
+fn gated_delta_net(spec: &Spec, r: &Reader, p: &str) -> Result<Gdn> {
+    let la = spec.linear_attention.as_ref().context("no [linear_attention]")?;
+    let h = spec.dims.hidden;
+    let (conv_dim, value_dim, heads) = (la.conv_dim(), la.value_dim(), la.value_heads);
+    let mut in_proj = r.bf16(&format!("{p}.in_proj_qkv.weight"), &[conv_dim, h])?;
+    in_proj.extend(r.bf16(&format!("{p}.in_proj_z.weight"), &[value_dim, h])?);
+    in_proj.extend(r.bf16(&format!("{p}.in_proj_b.weight"), &[heads, h])?);
+    in_proj.extend(r.bf16(&format!("{p}.in_proj_a.weight"), &[heads, h])?);
+    Ok(Gdn {
+        in_proj: matrix(spec.quant, in_proj, h),
+        conv: r.f32_shaped(&format!("{p}.conv1d.weight"), &[conv_dim, 1, la.conv_kernel])?,
+        neg_a: r.f32(&format!("{p}.A_log"), heads)?.into_iter().map(|a| -a.exp()).collect(),
+        dt_bias: r.f32(&format!("{p}.dt_bias"), heads)?,
+        norm: r.f32(&format!("{p}.norm.weight"), la.value_head_dim)?,
+        out: matrix(spec.quant, r.bf16(&format!("{p}.out_proj.weight"), &[h, value_dim])?, value_dim),
+    })
+}
+
 impl Weights {
     pub fn load(spec: &Spec, path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
         let map = unsafe { Mmap::map(&file)? };
         let r = Reader { st: SafeTensors::deserialize(&map)? };
         let d = &spec.dims;
-        let a = &spec.attention;
-        let (h, q, kv, inter) = (d.hidden, spec.q_dim(), spec.kv_dim(), d.intermediate);
-        let embed = r.bf16("model.embed_tokens.weight", &[d.vocab, h])?;
+        let (h, inter) = (d.hidden, d.intermediate);
+        let root = if r.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" };
+        let offset = if spec.norm.unit_offset { 1.0 } else { 0.0 };
+        let norm = |name: &str, len: usize| -> Result<Vec<f32>> {
+            Ok(r.f32(name, len)?.into_iter().map(|w| w + offset).collect())
+        };
+        let embed = r.bf16(&format!("{root}.embed_tokens.weight"), &[d.vocab, h])?;
         let lm_head =
             if d.tie_embeddings { embed.clone() } else { r.bf16("lm_head.weight", &[d.vocab, h])? };
         let mut layers = Vec::with_capacity(spec.layers.count);
         for i in 0..spec.layers.count {
-            let p = format!("model.layers.{i}");
-            let attn = format!("{p}.self_attn");
-            let mut qkv = r.bf16(&format!("{attn}.q_proj.weight"), &[q, h])?;
-            qkv.extend(r.bf16(&format!("{attn}.k_proj.weight"), &[kv, h])?);
-            qkv.extend(r.bf16(&format!("{attn}.v_proj.weight"), &[kv, h])?);
-            let qkv_bias = if a.qkv_bias {
-                let mut b = r.f32(&format!("{attn}.q_proj.bias"), q)?;
-                b.extend(r.f32(&format!("{attn}.k_proj.bias"), kv)?);
-                b.extend(r.f32(&format!("{attn}.v_proj.bias"), kv)?);
-                Some(b)
+            let p = format!("{root}.layers.{i}");
+            let mixer = if spec.block(i).is_linear() {
+                Mixer::Linear(gated_delta_net(spec, &r, &format!("{p}.linear_attn"))?)
             } else {
-                None
-            };
-            let (q_norm, k_norm) = if a.qk_norm {
-                (
-                    Some(r.f32(&format!("{attn}.q_norm.weight"), a.head_dim)?),
-                    Some(r.f32(&format!("{attn}.k_norm.weight"), a.head_dim)?),
-                )
-            } else {
-                (None, None)
+                Mixer::Attention(attention(spec, &r, &format!("{p}.self_attn"), &norm)?)
             };
             let gate = r.bf16(&format!("{p}.mlp.gate_proj.weight"), &[inter, h])?;
             let up = r.bf16(&format!("{p}.mlp.up_proj.weight"), &[inter, h])?;
             let gate_up = interleave_rows(&gate, &up, h);
             layers.push(Layer {
-                ln1: r.f32(&format!("{p}.input_layernorm.weight"), h)?,
-                ln2: r.f32(&format!("{p}.post_attention_layernorm.weight"), h)?,
-                qkv: matrix(spec.quant, qkv, h),
-                qkv_bias,
-                q_norm,
-                k_norm,
-                o: matrix(spec.quant, r.bf16(&format!("{attn}.o_proj.weight"), &[h, q])?, q),
+                ln1: norm(&format!("{p}.input_layernorm.weight"), h)?,
+                ln2: norm(&format!("{p}.post_attention_layernorm.weight"), h)?,
+                mixer,
                 gate_up: matrix(spec.quant, gate_up, h),
                 down: matrix(
                     spec.quant,
@@ -205,7 +279,7 @@ impl Weights {
         }
         Ok(Weights {
             embed,
-            norm: r.f32("model.norm.weight", h)?,
+            norm: norm(&format!("{root}.norm.weight"), h)?,
             lm_head: matrix(spec.quant, lm_head, h),
             layers,
         })
