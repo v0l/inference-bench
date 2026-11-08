@@ -10,6 +10,14 @@ pub fn pad_rows(rows: usize) -> usize {
     GRAPH_SIZES.iter().copied().find(|&s| s >= rows).unwrap_or(rows)
 }
 
+pub fn round8(rows: usize) -> usize {
+    rows.div_ceil(8) * 8
+}
+
+pub fn row_capacity(slots: usize) -> usize {
+    pad_rows(slots).max(round8(slots))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecodeRow {
     pub slot: usize,
@@ -20,8 +28,8 @@ pub struct DecodeRow {
 }
 
 pub struct Stepper {
-    bb: BatchBuffers,
-    params: CudaSlice<i32>,
+    pub(super) bb: BatchBuffers,
+    pub(super) params: CudaSlice<i32>,
     graphs: HashMap<usize, CudaGraph>,
     use_graphs: bool,
 }
@@ -38,13 +46,13 @@ impl Stepper {
     }
 }
 
-fn params(sampling: Sampling, step: u32) -> [i32; 3] {
+pub(super) fn params(sampling: Sampling, step: u32) -> [i32; 3] {
     [sampling.inverse_temperature().to_bits() as i32, sampling.seed as i32, step as i32]
 }
 
 impl Runtime {
     pub fn stepper(&self) -> Result<Stepper> {
-        let rows = pad_rows(self.slots);
+        let rows = row_capacity(self.slots) + 1;
         let parts = rows * self.spec.attention.heads * crate::codegen::BATCH_DECODE_SPLITS;
         let bb = BatchBuffers {
             tokens: self.stream.alloc_zeros(rows)?,
@@ -64,7 +72,7 @@ impl Runtime {
     }
 
     pub fn prefill_chunk_limit(&self) -> usize {
-        self.chunk
+        self.prefill_limit
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -81,7 +89,7 @@ impl Runtime {
     ) -> Result<Option<u32>> {
         ensure!(self.use_mma, "serving needs the tensor core path");
         ensure!(slot < self.slots, "slot {slot} out of {}", self.slots);
-        ensure!(!tokens.is_empty() && tokens.len() <= self.chunk, "prefill chunk of {} tokens", tokens.len());
+        ensure!(!tokens.is_empty() && tokens.len() <= self.prefill_limit, "prefill chunk of {} tokens", tokens.len());
         ensure!(start + tokens.len() <= self.max_ctx, "prefill past max_ctx");
         if start == 0 {
             self.reset_slot(slot)?;

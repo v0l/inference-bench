@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod fused;
 mod step;
+pub use fused::PrefillPart;
 pub use step::{DecodeRow, GRAPH_SIZES, Stepper, pad_rows};
 
 enum DeviceMatrix {
@@ -267,6 +269,7 @@ pub struct Runtime {
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
     chunk: usize,
+    prefill_limit: usize,
     use_mma: bool,
     sms: u32,
     seq: i32,
@@ -451,7 +454,8 @@ impl Runtime {
         let d = &spec.dims;
         let pages = layout.pages();
         let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
-        let chunk = max_ctx.min(layout.prefill_chunk).max(crate::runtime::step::pad_rows(layout.slots));
+        let prefill_limit = max_ctx.min(layout.prefill_chunk).max(layout.slots);
+        let chunk = prefill_limit + crate::runtime::step::row_capacity(layout.slots);
         let use_mma =
             ctx.compute_capability()?.0 >= 8 && std::env::var_os("SPECRT_GEMM_FP32").is_none();
         let mma_only = |n: usize| if use_mma { 1 } else { n };
@@ -521,6 +525,7 @@ impl Runtime {
             fp8_act,
             fp4_act,
             chunk,
+            prefill_limit,
             seq: 0,
             batch,
             slots: layout.slots,
@@ -965,8 +970,19 @@ impl Runtime {
     }
 
     fn rms_split(&self, x: &CudaView<f32>, w: &CudaSlice<f32>, out: &Planes, tokens: usize) -> Result<()> {
+        self.rms_split_into(x, w, &out.hi.as_view(), &out.lo.as_view(), tokens)
+    }
+
+    fn rms_split_into(
+        &self,
+        x: &CudaView<f32>,
+        w: &CudaSlice<f32>,
+        hi: &CudaView<u16>,
+        lo: &CudaView<u16>,
+        tokens: usize,
+    ) -> Result<()> {
         let mut b = self.stream.launch_builder(self.kernel("rms_split"));
-        b.arg(x).arg(w).arg(&out.hi).arg(&out.lo);
+        b.arg(x).arg(w).arg(hi).arg(lo);
         unsafe { b.launch(cfg(tokens as u32, 256)) }?;
         Ok(())
     }
@@ -997,33 +1013,46 @@ impl Runtime {
         let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
         let la = &gb.la;
         let pre = &self.pre;
-        let slot = g.slot + self.seq * self.spec.linear_layers() as i32;
-        let d = la.key_head_dim;
         self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
         self.tc("lin_ba", &g.ba, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_ba), la.ba_rows(), n)?;
+        self.gdn_prefill_rows(g, n, 0)?;
+        self.tc("lin_out", &g.out, None, gb.planes.all(), GemmOut::F32(&pre.x), self.spec.dims.hidden, n)
+    }
+
+    fn gdn_prefill_rows(&self, g: &DeviceGdn, n: usize, at: usize) -> Result<()> {
+        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
+        let la = &gb.la;
+        let slot = g.slot + self.seq * self.spec.linear_layers() as i32;
+        let d = la.key_head_dim;
+        let lin = gb.pre_lin.slice(at * la.in_proj_rows()..);
+        let ba = gb.pre_ba.slice(at * la.ba_rows()..);
+        let mix = gb.pre_mix.slice(at * la.conv_dim()..);
+        let o = gb.o.slice(at * la.value_dim()..);
+        let hi = gb.planes.hi.slice(at * la.value_dim()..);
+        let lo = gb.planes.lo.slice(at * la.value_dim()..);
         let launch = |name: &str, grid_dim: (u32, u32, u32), block: u32, smem: u32| LaunchConfig {
             grid_dim,
             block_dim: (block, 1, 1),
             shared_mem_bytes: if name.is_empty() { 0 } else { smem },
         };
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_prefill"));
-        b.arg(&gb.pre_lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.pre_mix).arg(&slot);
+        b.arg(&lin).arg(&g.conv).arg(&gb.conv_state).arg(&mix).arg(&slot);
         unsafe { b.launch(launch("", (grid(la.conv_dim(), 256), n as u32, 1), 256, 0)) }?;
         let ntok = n as i32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_keep"));
-        b.arg(&gb.pre_lin).arg(&gb.conv_state).arg(&slot).arg(&ntok);
+        b.arg(&lin).arg(&gb.conv_state).arg(&slot).arg(&ntok);
         unsafe { b.launch(cfg(grid(la.conv_dim(), 256), 256)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_qk_prep"));
-        b.arg(&gb.pre_mix).arg(&gb.qn).arg(&gb.kn);
+        b.arg(&mix).arg(&gb.qn).arg(&gb.kn);
         unsafe { b.launch(launch("", (la.key_heads as u32, n as u32, 1), d as u32, 0)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_gates"));
-        b.arg(&gb.pre_ba).arg(&g.neg_a).arg(&g.dt_bias).arg(&gb.g).arg(&gb.beta);
+        b.arg(&ba).arg(&g.neg_a).arg(&g.dt_bias).arg(&gb.g).arg(&gb.beta);
         unsafe { b.launch(cfg(n as u32, 64)) }?;
         let chunks = n.div_ceil(LA_CHUNK) as u32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_chunk_prep"));
         b.arg(&gb.qn)
             .arg(&gb.kn)
-            .arg(&gb.pre_mix)
+            .arg(&mix)
             .arg(&gb.g)
             .arg(&gb.beta)
             .arg(&gb.w)
@@ -1041,14 +1070,59 @@ impl Runtime {
             .arg(&gb.aqk)
             .arg(&gb.gc)
             .arg(&gb.ssm_state)
-            .arg(&gb.o)
+            .arg(&o)
             .arg(&slot)
             .arg(&ntok);
         unsafe { b.launch(launch("", (la.value_heads as u32, (d / LA_COLS) as u32, 1), 256, 0)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_gated_norm"));
-        b.arg(&gb.o).arg(&gb.pre_lin).arg(&g.norm).arg(&gb.planes.hi).arg(&gb.planes.lo);
+        b.arg(&o).arg(&lin).arg(&g.norm).arg(&hi).arg(&lo);
         unsafe { b.launch(launch("", (la.value_heads as u32, n as u32, 1), (d / 2) as u32, 0)) }?;
-        self.tc("lin_out", &g.out, None, gb.planes.all(), GemmOut::F32(&pre.x), self.spec.dims.hidden, n)
+        Ok(())
+    }
+
+    fn attn_prefill_rows(&self, l: &DeviceAttn, n: usize, at: usize) -> Result<()> {
+        let a = &self.spec.attention;
+        let pre = &self.pre;
+        let buf = &self.buf;
+        let table = self.slot_table(self.seq as usize);
+        let qkv = pre.qkv.slice(at * self.spec.qkv_rows()..);
+        let hi = pre.attn_planes.hi.slice(at * self.spec.q_dim()..);
+        let lo = pre.attn_planes.lo.slice(at * self.spec.q_dim()..);
+        let mut b = self.stream.launch_builder(self.kernel("kv_norm_rope"));
+        b.arg(&qkv)
+            .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
+            .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
+            .arg(&buf.k_cache)
+            .arg(&buf.v_cache)
+            .arg(&table)
+            .arg(&buf.pos)
+            .arg(&l.kv);
+        let config = LaunchConfig {
+            grid_dim: ((2 * a.kv_heads) as u32, n as u32, 1),
+            block_dim: (a.head_dim.max(32) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        let mut b = self.stream.launch_builder(self.kernel("flash_mma"));
+        let ntok = n as i32;
+        b.arg(&qkv)
+            .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
+            .arg(&buf.k_cache)
+            .arg(&buf.v_cache)
+            .arg(&table)
+            .arg(&buf.pos)
+            .arg(&l.kv)
+            .arg(&hi)
+            .arg(&lo)
+            .arg(&ntok);
+        let rows = crate::codegen::flash_rows(a.head_dim);
+        let config = LaunchConfig {
+            grid_dim: (grid(n, rows), a.heads as u32, 1),
+            block_dim: (rows as u32 * 2, 1, 1),
+            shared_mem_bytes: self.smem["flash_mma"],
+        };
+        unsafe { b.launch(config) }?;
+        Ok(())
     }
 
     fn mlp_prefill(&self, l: &DeviceLayer, n: usize) -> Result<()> {
@@ -1235,13 +1309,13 @@ impl Runtime {
     fn prefill(&mut self, tokens: &[u32], all_logits: bool) -> Result<Vec<f32>> {
         let vocab = self.spec.dims.vocab;
         let scratch = if all_logits {
-            Some(self.stream.alloc_zeros::<f32>(self.chunk * vocab)?)
+            Some(self.stream.alloc_zeros::<f32>(self.prefill_limit * vocab)?)
         } else {
             None
         };
         let mut out = Vec::new();
-        for (c, piece) in tokens.chunks(self.chunk).enumerate() {
-            self.prefill_chunk(piece, c * self.chunk, scratch.as_ref())?;
+        for (c, piece) in tokens.chunks(self.prefill_limit).enumerate() {
+            self.prefill_chunk(piece, c * self.prefill_limit, scratch.as_ref())?;
             if let Some(scratch) = &scratch {
                 out.extend(self.stream.clone_dtoh(&scratch.slice(..piece.len() * vocab))?);
             }
@@ -1368,10 +1442,17 @@ impl Runtime {
     fn gdn_batch(&self, g: &DeviceGdn, slots: &CudaSlice<i32>, n: usize) -> Result<()> {
         let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
         let la = &gb.la;
-        let seq_slots = self.spec.linear_layers() as i32;
         let pre = &self.pre;
         self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
         self.tc("lin_ba", &g.ba, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_ba), la.ba_rows(), n)?;
+        self.gdn_decode_rows(g, slots, n)?;
+        self.tc("lin_out", &g.out, None, gb.planes.all(), GemmOut::F32(&pre.x), self.spec.dims.hidden, n)
+    }
+
+    fn gdn_decode_rows(&self, g: &DeviceGdn, slots: &CudaSlice<i32>, n: usize) -> Result<()> {
+        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
+        let la = &gb.la;
+        let seq_slots = self.spec.linear_layers() as i32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
         b.arg(&gb.pre_lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.pre_mix).arg(&g.slot).arg(&seq_slots).arg(slots);
         let config = LaunchConfig {
@@ -1402,7 +1483,7 @@ impl Runtime {
         let count = (n * la.value_dim()) as i32;
         b.arg(&gb.o).arg(&gb.planes.hi).arg(&gb.planes.lo).arg(&count);
         unsafe { b.launch(cfg(grid(n * la.value_dim(), 512), 256)) }?;
-        self.tc("lin_out", &g.out, None, gb.planes.all(), GemmOut::F32(&pre.x), self.spec.dims.hidden, n)
+        Ok(())
     }
 
     fn reset_linear_state(&mut self) -> Result<()> {
@@ -1432,7 +1513,7 @@ impl Runtime {
     }
 
     pub fn trace_prefill(&mut self, tokens: &[u32]) -> Result<Trace> {
-        ensure!(tokens.len() <= self.chunk, "trace prefill fits one chunk");
+        ensure!(tokens.len() <= self.prefill_limit, "trace prefill fits one chunk");
         let s = &self.spec;
         let n = tokens.len();
         let layers = self.stream.alloc_zeros::<f32>(s.layers.count * n * s.dims.hidden)?;
@@ -1482,12 +1563,58 @@ impl Runtime {
         Ok(())
     }
 
-    fn decode_rows(&self, bb: &BatchBuffers, n: usize) -> Result<()> {
-        let s = &self.spec;
-        let a = &s.attention;
-        let hidden = s.dims.hidden;
+    fn attn_decode_rows(&self, l: &DeviceAttn, bb: &BatchBuffers, n: usize) -> Result<()> {
+        let a = &self.spec.attention;
         let pre = &self.pre;
         let buf = &self.buf;
+        let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
+        b.arg(&pre.qkv)
+            .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
+            .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
+            .arg(&buf.k_cache)
+            .arg(&buf.v_cache)
+            .arg(&buf.block_table)
+            .arg(&bb.pos)
+            .arg(&bb.slots)
+            .arg(&l.kv)
+            .arg(&1i32);
+        let config = LaunchConfig {
+            grid_dim: ((a.heads + 2 * a.kv_heads) as u32, n as u32, 1),
+            block_dim: (a.head_dim.max(32) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        let mut b = self.stream.launch_builder(self.kernel("batch_decode_attention"));
+        b.arg(&pre.qkv)
+            .arg(&buf.k_cache)
+            .arg(&buf.v_cache)
+            .arg(&buf.block_table)
+            .arg(&bb.pos)
+            .arg(&bb.slots)
+            .arg(&l.kv)
+            .arg(&bb.part_acc)
+            .arg(&bb.part_ml);
+        let config = LaunchConfig {
+            grid_dim: (a.kv_heads as u32, n as u32, crate::codegen::BATCH_DECODE_SPLITS as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        let mut b = self.stream.launch_builder(self.kernel("batch_decode_combine"));
+        b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.qkv).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
+        let config = LaunchConfig {
+            grid_dim: (a.heads as u32, n as u32, 1),
+            block_dim: (a.head_dim as u32 / 2, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn decode_rows(&self, bb: &BatchBuffers, n: usize) -> Result<()> {
+        let s = &self.spec;
+        let hidden = s.dims.hidden;
+        let pre = &self.pre;
         let mut b = self.stream.launch_builder(self.kernel("embed"));
         b.arg(&self.embed).arg(&bb.tokens).arg(&pre.x);
         let config = LaunchConfig {
@@ -1506,7 +1633,6 @@ impl Runtime {
                 }
                 DeviceMixer::Attention(l) => l,
             };
-            let kv_layer = l.kv;
             let qkv_rows = s.qkv_rows();
             self.tc(
                 "qkv",
@@ -1517,47 +1643,7 @@ impl Runtime {
                 qkv_rows,
                 n,
             )?;
-            let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
-            b.arg(&pre.qkv)
-                .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
-                .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
-                .arg(&buf.k_cache)
-                .arg(&buf.v_cache)
-                .arg(&buf.block_table)
-                .arg(&bb.pos)
-                .arg(&bb.slots)
-                .arg(&kv_layer)
-                .arg(&1i32);
-            let config = LaunchConfig {
-                grid_dim: ((a.heads + 2 * a.kv_heads) as u32, n as u32, 1),
-                block_dim: (a.head_dim.max(32) as u32, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe { b.launch(config) }?;
-            let mut b = self.stream.launch_builder(self.kernel("batch_decode_attention"));
-            b.arg(&pre.qkv)
-                .arg(&buf.k_cache)
-                .arg(&buf.v_cache)
-                .arg(&buf.block_table)
-                .arg(&bb.pos)
-                .arg(&bb.slots)
-                .arg(&kv_layer)
-                .arg(&bb.part_acc)
-                .arg(&bb.part_ml);
-            let config = LaunchConfig {
-                grid_dim: (a.kv_heads as u32, n as u32, crate::codegen::BATCH_DECODE_SPLITS as u32),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe { b.launch(config) }?;
-            let mut b = self.stream.launch_builder(self.kernel("batch_decode_combine"));
-            b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.qkv).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
-            let config = LaunchConfig {
-                grid_dim: (a.heads as u32, n as u32, 1),
-                block_dim: (a.head_dim as u32 / 2, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe { b.launch(config) }?;
+            self.attn_decode_rows(l, bb, n)?;
             self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
             self.mlp_prefill(layer, n)?;
         }

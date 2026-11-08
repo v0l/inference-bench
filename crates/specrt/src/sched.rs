@@ -1,5 +1,5 @@
 use crate::codegen::PAGE;
-use crate::runtime::{DecodeRow, Runtime, Sampling, Stepper};
+use crate::runtime::{DecodeRow, Runtime, Sampling, Stepper, PrefillPart};
 use anyhow::{Result, bail};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -52,6 +52,18 @@ pub trait Executor {
     fn set_table(&mut self, slot: usize, blocks: &[u32]) -> Result<()>;
     fn prefill(&mut self, slot: usize, tokens: &[u32], start: usize, sample: Option<(Sampling, u32)>) -> Result<Option<u32>>;
     fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>>;
+    fn fused(
+        &mut self,
+        rows: &[DecodeRow],
+        slot: usize,
+        tokens: &[u32],
+        start: usize,
+        sample: Option<(Sampling, u32)>,
+    ) -> Result<(Vec<u32>, Option<u32>)> {
+        let next = self.decode(rows)?;
+        let first = self.prefill(slot, tokens, start, sample)?;
+        Ok((next, first))
+    }
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
@@ -60,12 +72,13 @@ pub trait Executor {
 pub struct GpuExecutor {
     pub rt: Runtime,
     st: Stepper,
+    fuse: bool,
 }
 
 impl GpuExecutor {
     pub fn new(rt: Runtime) -> Result<Self> {
         let st = rt.stepper()?;
-        Ok(GpuExecutor { rt, st })
+        Ok(GpuExecutor { rt, st, fuse: std::env::var_os("SPECRT_NO_FUSE").is_none() })
     }
 }
 
@@ -96,6 +109,22 @@ impl Executor for GpuExecutor {
 
     fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
         self.rt.decode(&mut self.st, rows)
+    }
+
+    fn fused(
+        &mut self,
+        rows: &[DecodeRow],
+        slot: usize,
+        tokens: &[u32],
+        start: usize,
+        sample: Option<(Sampling, u32)>,
+    ) -> Result<(Vec<u32>, Option<u32>)> {
+        if !self.fuse {
+            let next = self.rt.decode(&mut self.st, rows)?;
+            let first = self.rt.prefill_slot(&mut self.st, slot, tokens, start, sample)?;
+            return Ok((next, first));
+        }
+        self.rt.fused_step(&mut self.st, rows, PrefillPart { slot, tokens, start, sample })
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -367,6 +396,16 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
+    fn apply_decode(&mut self, rows: &[(usize, DecodeRow)], next: Vec<u32>, done: &mut Vec<usize>, events: &mut Vec<Event>) {
+        for ((i, _), t) in rows.iter().zip(next) {
+            let s = &mut self.running[*i];
+            s.computed += 1;
+            if accept(s, t, self.exec.max_ctx(), events) {
+                done.push(*i);
+            }
+        }
+    }
+
     fn prefill_budget(&self, decodes: usize) -> usize {
         let full = self.cfg.max_batched_tokens.saturating_sub(decodes);
         let align = self.cfg.min_prefill_chunk.max(1);
@@ -404,20 +443,8 @@ impl<E: Executor> Scheduler<E> {
             })
             .collect();
         let mut done: Vec<usize> = Vec::new();
-        if !rows.is_empty() {
-            let started = Instant::now();
-            let plain: Vec<DecodeRow> = rows.iter().map(|r| r.1).collect();
-            let next = self.exec.decode(&plain)?;
-            report.decode_secs = started.elapsed().as_secs_f64();
-            report.decode_rows = rows.len();
-            for ((i, _), t) in rows.iter().zip(next) {
-                let s = &mut self.running[*i];
-                s.computed += 1;
-                if accept(s, t, self.exec.max_ctx(), events) {
-                    done.push(*i);
-                }
-            }
-        }
+        let plain: Vec<DecodeRow> = rows.iter().map(|r| r.1).collect();
+        let mut pending = !rows.is_empty();
         let mut left = budget;
         let started = Instant::now();
         let limit = self.exec.chunk_limit();
@@ -447,7 +474,15 @@ impl<E: Executor> Scheduler<E> {
                 let slot = s.slot.expect("running has a slot");
                 let chunk = s.tokens[s.computed..s.computed + n].to_vec();
                 let start = s.computed;
-                let t = self.exec.prefill(slot, &chunk, start, sample)?;
+                let t = if pending {
+                    pending = false;
+                    let (next, t) = self.exec.fused(&plain, slot, &chunk, start, sample)?;
+                    report.decode_rows = rows.len();
+                    self.apply_decode(&rows, next, &mut done, events);
+                    t
+                } else {
+                    self.exec.prefill(slot, &chunk, start, sample)?
+                };
                 let s = &mut self.running[i];
                 s.computed += n;
                 left -= n;
@@ -458,6 +493,13 @@ impl<E: Executor> Scheduler<E> {
                     done.push(i);
                 }
             }
+        }
+        if pending {
+            let started = Instant::now();
+            let next = self.exec.decode(&plain)?;
+            report.decode_secs = started.elapsed().as_secs_f64();
+            report.decode_rows = rows.len();
+            self.apply_decode(&rows, next, &mut done, events);
         }
         if report.prefill_tokens > 0 {
             self.exec.flush()?;
