@@ -72,6 +72,7 @@ impl AppState {
             in_flight: running,
             loaded_models: self.manager.loaded_snapshot(),
             gpu_used_bytes: self.manager.gpu_used(),
+            engine: self.manager.engine_metrics(),
         }
     }
 
@@ -84,7 +85,7 @@ impl AppState {
     }
 
     fn admit(self: &Arc<Self>) -> Result<Admission, ApiError> {
-        let limit = self.config.max_concurrent + self.config.queue_depth;
+        let limit = self.config.concurrency() + self.config.queue_depth;
         let mut current = self.admitted.load(Ordering::SeqCst);
         loop {
             if current >= limit {

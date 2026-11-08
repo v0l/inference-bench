@@ -10,8 +10,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
+use inference_bench_core::specrt_serve::ServeOptions;
+
 pub trait EngineFactory: Send + Sync + 'static {
     fn build(&self, max_ctx: Option<usize>) -> Result<Box<dyn Target>, BackendError>;
+
+    fn build_serving(&self, max_ctx: Option<usize>, opts: ServeOptions) -> Result<Box<dyn Target>, BackendError> {
+        let _ = opts;
+        self.build(max_ctx)
+    }
 }
 
 pub struct NativeFactory;
@@ -19,6 +26,10 @@ pub struct NativeFactory;
 impl EngineFactory for NativeFactory {
     fn build(&self, max_ctx: Option<usize>) -> Result<Box<dyn Target>, BackendError> {
         Ok(Box::new(inference_bench_core::native::Native::new(max_ctx)))
+    }
+
+    fn build_serving(&self, _max_ctx: Option<usize>, opts: ServeOptions) -> Result<Box<dyn Target>, BackendError> {
+        Ok(Box::new(inference_bench_core::serving::ServingTarget::new(opts)))
     }
 }
 
@@ -46,6 +57,7 @@ pub struct LoadedModel {
     active: AtomicUsize,
     pool: Mutex<Vec<Box<dyn Target>>>,
     sem: Arc<Semaphore>,
+    stats: Mutex<Option<Box<dyn Target>>>,
 }
 
 impl LoadedModel {
@@ -148,6 +160,12 @@ impl Manager {
         v
     }
 
+    pub fn engine_metrics(&self) -> String {
+        let mut models: Vec<Arc<LoadedModel>> = self.loaded.lock().unwrap().values().cloned().collect();
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models.iter().filter_map(|m| m.stats.lock().unwrap().as_ref().and_then(|t| t.metrics())).collect()
+    }
+
     pub fn status(&self) -> Vec<ModelStatus> {
         let loaded = self.loaded.lock().unwrap();
         let mut out: Vec<ModelStatus> = self
@@ -215,22 +233,31 @@ impl Manager {
         }
         self.make_room(cfg)?;
         let max_ctx = self.config.max_ctx_for(cfg);
-        let instances = 1;
+        let serving = self.config.serve_options(cfg);
         let name = self.config.specs.resolve(cfg.upstream_name());
         let spec_hash = crate::config::spec_hash_of(&name);
         let vram_before = (self.probe)();
         let started = Instant::now();
-        tracing::info!(model = %cfg.id, upstream = %name, ?max_ctx, %spec_hash, vram_before_bytes = ?vram_before, "loading model");
+        tracing::info!(model = %cfg.id, upstream = %name, ?max_ctx, ?serving, %spec_hash, vram_before_bytes = ?vram_before, "loading model");
         let factory = self.factory.clone();
         let span = tracing::Span::current();
         let built = tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
+                let mut b = match serving {
+                    Some(opts) => factory.build_serving(max_ctx, opts)?,
+                    None => factory.build(max_ctx)?,
+                };
+                b.load(&name)?;
                 let mut backends = Vec::new();
-                for _ in 0..instances {
-                    let mut b = factory.build(max_ctx)?;
-                    b.load(&name)?;
-                    backends.push(b);
+                if let Some(opts) = serving {
+                    for _ in 1..opts.max_num_seqs {
+                        match b.share() {
+                            Some(more) => backends.push(more),
+                            None => break,
+                        }
+                    }
                 }
+                backends.push(b);
                 Ok::<_, BackendError>(backends)
             })
         })
@@ -252,6 +279,7 @@ impl Manager {
         };
         let vram = if measured > 0 { measured } else { cfg.vram_bytes.unwrap_or(0) };
         let backend_label = backends.first().map(|b| b.name().to_string()).unwrap_or_default();
+        let stats = backends.first().and_then(|b| b.share()).filter(|_| serving.is_some());
         tracing::info!(
             model = %cfg.id,
             backend = %backend_label,
@@ -272,6 +300,7 @@ impl Manager {
             active: AtomicUsize::new(1),
             sem: Arc::new(Semaphore::new(backends.len())),
             pool: Mutex::new(backends),
+            stats: Mutex::new(stats),
         });
         self.loaded.lock().unwrap().insert(cfg.id.clone(), model.clone());
         Ok(model)

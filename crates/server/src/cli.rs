@@ -23,6 +23,14 @@ pub struct ServeArgs {
     pub max_ctx: Option<usize>,
     #[arg(long, help = "Concurrent generations")]
     pub max_concurrent: Option<usize>,
+    #[arg(long, help = "Serve with continuous batching: most sequences decoded together")]
+    pub max_num_seqs: Option<usize>,
+    #[arg(long, help = "Longest prompt plus reply with continuous batching (default 131072, up to 262144)")]
+    pub max_model_len: Option<usize>,
+    #[arg(long, help = "KV cache size in GB with continuous batching (default: free memory after the weights)")]
+    pub kv_cache_gb: Option<f64>,
+    #[arg(long, help = "Token budget per scheduler step (default 8192)")]
+    pub max_batched_tokens: Option<usize>,
     #[arg(long, help = "Seconds before an idle model is unloaded")]
     pub idle_unload_secs: Option<u64>,
     #[arg(long, help = "Write an access log (JSON lines) here")]
@@ -61,6 +69,10 @@ impl ServeArgs {
         if let Some(n) = self.max_concurrent {
             config.max_concurrent = n;
         }
+        config.max_num_seqs = self.max_num_seqs.or(config.max_num_seqs);
+        config.max_model_len = self.max_model_len.or(config.max_model_len);
+        config.kv_cache_gb = self.kv_cache_gb.or(config.kv_cache_gb);
+        config.max_batched_tokens = self.max_batched_tokens.or(config.max_batched_tokens);
         if let Some(n) = self.idle_unload_secs {
             config.idle_unload_secs = Some(n);
         }

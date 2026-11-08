@@ -51,6 +51,7 @@ pub struct Gauges {
     pub in_flight: usize,
     pub loaded_models: Vec<(String, u64)>,
     pub gpu_used_bytes: Option<u64>,
+    pub engine: String,
 }
 
 impl Metrics {
@@ -152,6 +153,7 @@ impl Metrics {
         if let Some(used) = g.gpu_used_bytes {
             let _ = writeln!(o, "# HELP inference_gpu_memory_used_bytes GPU memory in use on device 0.\n# TYPE inference_gpu_memory_used_bytes gauge\ninference_gpu_memory_used_bytes {used}");
         }
+        o.push_str(&g.engine);
         o
     }
 }

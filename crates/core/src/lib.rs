@@ -14,6 +14,8 @@ pub mod native;
 pub mod openai;
 pub mod report;
 pub mod result;
+pub mod serving;
+pub use specrt::serve as specrt_serve;
 pub mod specs;
 pub mod store;
 pub mod target;

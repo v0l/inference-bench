@@ -72,6 +72,14 @@ pub trait Target: Send {
     fn logits(&mut self, _prompt: &str) -> Result<Logits, BackendError> {
         Err(BackendError::failed(format!("{} does not expose logits", self.name())))
     }
+
+    fn share(&self) -> Option<Box<dyn Target>> {
+        None
+    }
+
+    fn metrics(&self) -> Option<String> {
+        None
+    }
 }
 
 pub const NATIVE: &str = "specrt";

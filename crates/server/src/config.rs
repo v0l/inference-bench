@@ -133,6 +133,11 @@ pub struct ServerConfig {
     pub access_log: Option<PathBuf>,
     pub log_prompts: bool,
     pub specs: SpecsSection,
+    pub max_num_seqs: Option<usize>,
+    pub max_model_len: Option<usize>,
+    pub kv_cache_gb: Option<f64>,
+    pub max_batched_tokens: Option<usize>,
+    pub itl_target_ms: Option<u64>,
 }
 
 impl Default for ServerConfig {
@@ -160,6 +165,11 @@ impl Default for ServerConfig {
             access_log: None,
             log_prompts: false,
             specs: SpecsSection::default(),
+            max_num_seqs: None,
+            max_model_len: None,
+            kv_cache_gb: None,
+            max_batched_tokens: None,
+            itl_target_ms: None,
         }
     }
 }
@@ -228,6 +238,15 @@ impl ServerConfig {
 
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.max_concurrent >= 1, "max_concurrent must be at least 1");
+        anyhow::ensure!(self.max_num_seqs != Some(0), "max_num_seqs must be at least 1");
+        if let Some(n) = self.max_model_len {
+            anyhow::ensure!(
+                (16..=inference_bench_core::specrt_serve::MAX_MODEL_LEN).contains(&n),
+                "max_model_len must be between 16 and {}",
+                inference_bench_core::specrt_serve::MAX_MODEL_LEN
+            );
+        }
+        anyhow::ensure!(self.kv_cache_gb.is_none_or(|g| g > 0.0), "kv_cache_gb must be positive");
         anyhow::ensure!(self.max_loaded_models >= 1, "max_loaded_models must be at least 1");
         let mut seen = std::collections::HashSet::new();
         for m in &self.models {
@@ -246,6 +265,22 @@ impl ServerConfig {
 
     pub fn max_ctx_for(&self, m: &ModelConfig) -> Option<usize> {
         m.max_ctx.or(self.max_ctx)
+    }
+
+    pub fn serve_options(&self, m: &ModelConfig) -> Option<inference_bench_core::specrt_serve::ServeOptions> {
+        let seqs = self.max_num_seqs?;
+        let d = inference_bench_core::specrt_serve::ServeOptions::default();
+        Some(inference_bench_core::specrt_serve::ServeOptions {
+            max_model_len: self.max_model_len.or(self.max_ctx_for(m)).unwrap_or(d.max_model_len),
+            max_num_seqs: seqs,
+            kv_cache_bytes: self.kv_cache_gb.map(|g| (g * (1u64 << 30) as f64) as u64),
+            max_batched_tokens: self.max_batched_tokens.unwrap_or(d.max_batched_tokens),
+            itl_target: self.itl_target_ms.map(std::time::Duration::from_millis).unwrap_or(d.itl_target),
+        })
+    }
+
+    pub fn concurrency(&self) -> usize {
+        self.max_concurrent.max(self.max_num_seqs.unwrap_or(0))
     }
 
     pub fn resolved_keys(&self) -> Vec<String> {
@@ -349,6 +384,26 @@ python = "python3"
         assert!(!u.auto_update);
         assert_eq!(u.url(), "http://mirror/v0l/inference-bench/tar.gz/refs/tags/v0.2.0");
         assert!(ServerConfig::parse("[specs]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn serving_options_come_from_the_config_and_raise_concurrency() {
+        let c = ServerConfig::parse(
+            "max_num_seqs = 32\nmax_model_len = 262144\nkv_cache_gb = 7\nmax_batched_tokens = 16384\nitl_target_ms = 80\n[[models]]\nid='m'",
+        )
+        .unwrap();
+        let o = c.serve_options(&c.models[0]).unwrap();
+        assert_eq!((o.max_num_seqs, o.max_model_len, o.max_batched_tokens), (32, 262144, 16384));
+        assert_eq!(o.kv_cache_bytes, Some(7 << 30));
+        assert_eq!(o.itl_target, std::time::Duration::from_millis(80));
+        assert_eq!(c.concurrency(), 32);
+        let plain = ServerConfig::parse("max_ctx = 4096\n[[models]]\nid='m'").unwrap();
+        assert!(plain.serve_options(&plain.models[0]).is_none());
+        assert_eq!(plain.concurrency(), 1);
+        let c = ServerConfig::parse("max_num_seqs = 4\nmax_ctx = 8192\n[[models]]\nid='m'").unwrap();
+        assert_eq!(c.serve_options(&c.models[0]).unwrap().max_model_len, 8192);
+        assert!(ServerConfig::parse("max_model_len = 300000").is_err());
+        assert!(ServerConfig::parse("max_num_seqs = 0").is_err());
     }
 
     #[test]

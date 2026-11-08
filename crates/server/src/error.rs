@@ -51,6 +51,9 @@ impl From<BackendError> for ApiError {
             ErrorKind::Unreachable => (StatusCode::BAD_GATEWAY, "upstream_error"),
             ErrorKind::UnsupportedArchitecture => (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request_error"),
             ErrorKind::Cancelled => (StatusCode::from_u16(499).unwrap(), "cancelled"),
+            ErrorKind::Failed if e.message.contains("exceeds the context") || e.message.contains("can never fit") => {
+                (StatusCode::BAD_REQUEST, "invalid_request_error")
+            }
             ErrorKind::Failed => (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
         };
         Self::new(status, kind, e.message)
