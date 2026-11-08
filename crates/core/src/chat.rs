@@ -59,6 +59,7 @@ pub struct ChatRequest {
     pub sampling: Sampling,
     pub use_template: bool,
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    pub ignore_eos: bool,
 }
 
 impl ChatRequest {
@@ -69,7 +70,7 @@ impl ChatRequest {
 
 impl ChatRequest {
     pub fn new(messages: Vec<Message>, sampling: Sampling) -> Self {
-        Self { messages, sampling, use_template: true, cancel: None }
+        Self { messages, sampling, use_template: true, cancel: None, ignore_eos: false }
     }
 
     pub fn flatten(&self) -> String {
@@ -110,7 +111,13 @@ impl ChatRequest {
             return (!messages.is_empty()).then(|| Self::new(messages, sampling));
         }
         let prompt = body["prompt"].as_str()?;
-        Some(Self { messages: vec![Message::new(Role::User, prompt)], sampling, use_template: false, cancel: None })
+        Some(Self {
+            messages: vec![Message::new(Role::User, prompt)],
+            sampling,
+            use_template: false,
+            cancel: None,
+            ignore_eos: false,
+        })
     }
 }
 

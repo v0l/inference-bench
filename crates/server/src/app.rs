@@ -352,6 +352,7 @@ struct Params {
     sampling: Sampling,
     stream: bool,
     include_usage: bool,
+    ignore_eos: bool,
 }
 
 fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, ApiError> {
@@ -382,6 +383,7 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         sampling,
         stream: body["stream"].as_bool().unwrap_or(false),
         include_usage: body["stream_options"]["include_usage"].as_bool().unwrap_or(false),
+        ignore_eos: body["ignore_eos"].as_bool().unwrap_or(false),
     })
 }
 
@@ -592,6 +594,7 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool) -> Res
     let guard = CancelOnDrop(cancel.clone());
     let mut request = ChatRequest::new(p.messages, p.sampling);
     request.use_template = p.use_template;
+    request.ignore_eos = p.ignore_eos;
     request.cancel = Some(cancel);
     log_prompt(&state, &request);
     let rx = start_generation(&state, p.model.clone(), request, max_tokens)?;

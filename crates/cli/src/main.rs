@@ -150,6 +150,31 @@ enum Cmd {
         #[arg(long, help = "Print the results as JSON")]
         json: bool,
     },
+    #[command(about = "Open-loop load test of an OpenAI-compatible server (specrt or vLLM)")]
+    Loadtest {
+        #[arg(long, help = "Base URL of the server, such as http://127.0.0.1:8080")]
+        url: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long, env = "INFERENCE_BENCH_API_KEY")]
+        api_key: Option<String>,
+        #[arg(long, default_value_t = 64)]
+        requests: usize,
+        #[arg(long, default_value_t = 1.0, help = "Arrivals per second (Poisson); 0 sends them all at once")]
+        rate: f64,
+        #[arg(long, default_value_t = 32, help = "Most requests in flight from this client")]
+        clients: usize,
+        #[arg(long, default_value = "0.6:1k-8k,0.3:8k-32k,0.1:32k-128k", help = "Prompt words as weight:min-max buckets")]
+        mix: String,
+        #[arg(long, help = "Drop or clip prompt buckets above this many words")]
+        max_prompt: Option<usize>,
+        #[arg(long, default_value = "128-1024", help = "Output tokens as min-max")]
+        output: String,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, help = "Print the report as JSON")]
+        json: bool,
+    },
     #[command(about = "Spec files: where each comes from, and updates from GitHub")]
     Specs {
         #[command(subcommand)]
@@ -343,6 +368,48 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Results { json } => print_results(&store::load_all(&data), *json)?,
+        Cmd::Loadtest { url, model, api_key, requests, rate, clients, mix, max_prompt, output, seed, json } => {
+            use inference_bench_core::loadtest::{LengthMix, LoadConfig, run};
+            let mut mix = LengthMix::parse(mix).map_err(anyhow::Error::msg)?;
+            if let Some(m) = max_prompt {
+                mix = mix.capped(*m);
+                anyhow::ensure!(!mix.buckets.is_empty(), "no prompt bucket fits under --max-prompt {m}");
+            }
+            let (lo, hi) = output.split_once('-').context("--output wants min-max")?;
+            let output = (lo.trim().parse()?, hi.trim().parse()?);
+            anyhow::ensure!(output.0 >= 1 && output.1 >= output.0, "--output wants 1 <= min <= max");
+            let cfg = LoadConfig {
+                url: url.clone(),
+                model: model.clone(),
+                api_key: api_key.clone(),
+                requests: *requests,
+                rate: *rate,
+                clients: *clients,
+                mix,
+                output,
+                seed: *seed,
+                sample_every: std::time::Duration::from_secs(1),
+            };
+            let quiet = *json;
+            let report = run(&cfg, &mut |i, o| {
+                if !quiet {
+                    match &o.error {
+                        Some(e) => eprintln!("#{i} failed: {e}"),
+                        None => eprintln!(
+                            "#{i} prompt {} completion {} ttft {:.0} ms total {:.1} s",
+                            o.prompt_tokens,
+                            o.completion_tokens,
+                            o.ttft_secs * 1e3,
+                            o.total_secs
+                        ),
+                    }
+                }
+            });
+            match json {
+                true => println!("{}", serde_json::to_string_pretty(&report)?),
+                false => println!("{}", report.describe()),
+            }
+        }
         Cmd::Specs { cmd } => specs_command(&data, cmd)?,
     }
     Ok(())
