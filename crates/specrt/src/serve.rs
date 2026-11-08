@@ -208,7 +208,9 @@ fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
         kv_blocks = rt.kv_blocks(),
         kv_bytes = rt.kv_blocks() as u64 * block,
         kv_tokens = rt.kv_blocks() * crate::codegen::PAGE,
-        linear_state_bytes = slot_state_bytes(spec) * layout.slots as u64,
+        linear_state_bytes_per_slot = slot_state_bytes(spec),
+        linear_state_mapped_bytes = rt.state_mapped_bytes() as u64,
+        state_on_demand = layout.state_on_demand,
         device_bytes = rt.device_bytes,
         "serving layout"
     );

@@ -1,6 +1,7 @@
 use crate::codegen::{LA_CHUNK, LA_COLS, LA_KSPLIT, Module, PAGE};
 use crate::jit::{Jit, default_cache_dir};
 use crate::spec::{LinearAttention, Spec};
+use crate::statepool::StatePool;
 use crate::weights::{Checkpoint, Matrix, Mixer, peak_rss_bytes};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
@@ -9,6 +10,7 @@ use cudarc::driver::{
     PushKernelArg,
 };
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -86,8 +88,10 @@ struct DeviceLayer {
 
 struct GdnBuffers {
     la: LinearAttention,
-    conv_state: CudaSlice<f32>,
-    ssm_state: CudaSlice<f32>,
+    conv_pool: StatePool,
+    ssm_pool: StatePool,
+    conv_state: ManuallyDrop<CudaSlice<f32>>,
+    ssm_state: ManuallyDrop<CudaSlice<f32>>,
     lin: CudaSlice<f32>,
     ba: CudaSlice<f32>,
     mix: CudaSlice<f32>,
@@ -108,15 +112,28 @@ struct GdnBuffers {
 }
 
 impl GdnBuffers {
-    fn new(stream: &Arc<CudaStream>, la: &LinearAttention, slots: usize, chunk: usize) -> Result<Self> {
+    fn new(
+        ctx: &Arc<CudaContext>,
+        stream: &Arc<CudaStream>,
+        la: &LinearAttention,
+        layers: usize,
+        slots: usize,
+        chunk: usize,
+    ) -> Result<Self> {
         let d = la.key_head_dim;
+        let conv_pool = StatePool::new(ctx, layers * la.conv_dim() * (la.conv_kernel - 1) * 4, slots)?;
+        let ssm_pool = StatePool::new(ctx, layers * la.value_heads * d * d * 4, slots)?;
+        let conv_state = ManuallyDrop::new(conv_pool.slice(stream));
+        let ssm_state = ManuallyDrop::new(ssm_pool.slice(stream));
         let chunks = chunk.div_ceil(LA_CHUNK);
         let padded = chunks * LA_CHUNK;
         let zeros = |n: usize| stream.alloc_zeros::<f32>(n);
         Ok(GdnBuffers {
             la: la.clone(),
-            conv_state: zeros(slots * la.conv_dim() * (la.conv_kernel - 1))?,
-            ssm_state: zeros(slots * la.value_heads * d * d)?,
+            conv_pool,
+            ssm_pool,
+            conv_state,
+            ssm_state,
             lin: zeros(la.in_proj_rows())?,
             ba: zeros(la.ba_rows())?,
             mix: zeros(la.conv_dim())?,
@@ -135,6 +152,15 @@ impl GdnBuffers {
             o: zeros(chunk * la.value_dim())?,
             planes: Planes::new(stream, chunk * la.value_dim())?,
         })
+    }
+}
+
+impl Drop for GdnBuffers {
+    fn drop(&mut self) {
+        let conv = unsafe { ManuallyDrop::take(&mut self.conv_state) };
+        let ssm = unsafe { ManuallyDrop::take(&mut self.ssm_state) };
+        conv.leak();
+        ssm.leak();
     }
 }
 
@@ -300,6 +326,8 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
 const PREFILL_CHUNK: usize = 2048;
+const SERVING_RESIDENT_SLOTS: usize = 8;
+const STATE_FREE_MARGIN: usize = 256 << 20;
 const ATTN_SPLITS: usize = 64;
 const ATTN_BLOCK: u32 = 128;
 const GEMM_TILE: usize = 64;
@@ -312,6 +340,7 @@ pub struct Layout {
     pub prefill_chunk: usize,
     pub kv_planes: usize,
     pub kv_headroom: usize,
+    pub state_on_demand: bool,
 }
 
 impl Layout {
@@ -323,6 +352,7 @@ impl Layout {
             prefill_chunk: PREFILL_CHUNK,
             kv_planes: 2,
             kv_headroom: 0,
+            state_on_demand: false,
         }
     }
 
@@ -333,7 +363,8 @@ impl Layout {
             kv_blocks: kv_bytes.map_or(0, |b| (b / kv_block_bytes(spec, 1)).max(1)),
             prefill_chunk: PREFILL_CHUNK,
             kv_planes: 1,
-            kv_headroom: 1 << 30,
+            kv_headroom: (1 << 30) + slots.min(SERVING_RESIDENT_SLOTS) * crate::serve::slot_state_bytes(spec) as usize,
+            state_on_demand: true,
         }
     }
 
@@ -492,7 +523,7 @@ impl Runtime {
             dummy_u16: stream.alloc_zeros(8)?,
         };
         let gdn = match &spec.linear_attention {
-            Some(la) => Some(GdnBuffers::new(&stream, la, (layout.slots + 1) * spec.linear_layers(), chunk)?),
+            Some(la) => Some(GdnBuffers::new(&ctx, &stream, la, spec.linear_layers(), layout.slots + 1, chunk)?),
             None => None,
         };
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
@@ -572,6 +603,12 @@ impl Runtime {
         let pad_row = layout.slots * pages;
         rt.tables[pad_row] = kv_blocks as i32;
         rt.stream.memcpy_htod(&[kv_blocks as i32], &mut rt.buf.block_table.slice_mut(pad_row..pad_row + 1))?;
+        rt.acquire_state(layout.slots)?;
+        if !layout.state_on_demand {
+            for slot in 0..layout.slots {
+                rt.acquire_state(slot)?;
+            }
+        }
         rt.stream.synchronize()?;
         let free_after = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         rt.device_bytes = free_before.saturating_sub(free_after) as u64;
@@ -712,7 +749,7 @@ impl Runtime {
         self.linear_norm("lin_ba_norm", &g.ba, None, x, ln1, &gb.ba, la.ba_rows())?;
         let zero = 0i32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
-        b.arg(&gb.lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.mix).arg(&g.slot).arg(&zero).arg(&self.buf.zero_slots);
+        b.arg(&gb.lin).arg(&g.conv).arg(&*gb.conv_state).arg(&gb.mix).arg(&g.slot).arg(&zero).arg(&self.buf.zero_slots);
         unsafe { b.launch(cfg(grid(la.conv_dim(), 256), 256)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_step"));
         b.arg(&gb.mix)
@@ -721,7 +758,7 @@ impl Runtime {
             .arg(&g.neg_a)
             .arg(&g.dt_bias)
             .arg(&g.norm)
-            .arg(&gb.ssm_state)
+            .arg(&*gb.ssm_state)
             .arg(&gb.out)
             .arg(&g.slot)
             .arg(&zero)
@@ -1036,11 +1073,11 @@ impl Runtime {
             shared_mem_bytes: if name.is_empty() { 0 } else { smem },
         };
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_prefill"));
-        b.arg(&lin).arg(&g.conv).arg(&gb.conv_state).arg(&mix).arg(&slot);
+        b.arg(&lin).arg(&g.conv).arg(&*gb.conv_state).arg(&mix).arg(&slot);
         unsafe { b.launch(launch("", (grid(la.conv_dim(), 256), n as u32, 1), 256, 0)) }?;
         let ntok = n as i32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_keep"));
-        b.arg(&lin).arg(&gb.conv_state).arg(&slot).arg(&ntok);
+        b.arg(&lin).arg(&*gb.conv_state).arg(&slot).arg(&ntok);
         unsafe { b.launch(cfg(grid(la.conv_dim(), 256), 256)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_qk_prep"));
         b.arg(&mix).arg(&gb.qn).arg(&gb.kn);
@@ -1069,7 +1106,7 @@ impl Runtime {
             .arg(&gb.u)
             .arg(&gb.aqk)
             .arg(&gb.gc)
-            .arg(&gb.ssm_state)
+            .arg(&*gb.ssm_state)
             .arg(&o)
             .arg(&slot)
             .arg(&ntok);
@@ -1454,7 +1491,7 @@ impl Runtime {
         let la = &gb.la;
         let seq_slots = self.spec.linear_layers() as i32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
-        b.arg(&gb.pre_lin).arg(&g.conv).arg(&gb.conv_state).arg(&gb.pre_mix).arg(&g.slot).arg(&seq_slots).arg(slots);
+        b.arg(&gb.pre_lin).arg(&g.conv).arg(&*gb.conv_state).arg(&gb.pre_mix).arg(&g.slot).arg(&seq_slots).arg(slots);
         let config = LaunchConfig {
             grid_dim: (grid(la.conv_dim(), 256), n as u32, 1),
             block_dim: (256, 1, 1),
@@ -1468,7 +1505,7 @@ impl Runtime {
             .arg(&g.neg_a)
             .arg(&g.dt_bias)
             .arg(&g.norm)
-            .arg(&gb.ssm_state)
+            .arg(&*gb.ssm_state)
             .arg(&gb.o)
             .arg(&g.slot)
             .arg(&seq_slots)
@@ -1490,8 +1527,58 @@ impl Runtime {
         self.reset_slot(self.seq as usize)
     }
 
+    pub fn state_slot_bytes(&self) -> usize {
+        self.gdn.as_ref().map_or(0, |gb| gb.conv_pool.stride_bytes() + gb.ssm_pool.stride_bytes())
+    }
+
+    pub fn state_mapped_bytes(&self) -> usize {
+        self.gdn.as_ref().map_or(0, |gb| gb.conv_pool.mapped_bytes() + gb.ssm_pool.mapped_bytes())
+    }
+
+    pub fn state_live_slots(&self) -> usize {
+        self.gdn.as_ref().map_or(0, |gb| gb.ssm_pool.live_slots())
+    }
+
+    pub fn acquire_state(&mut self, slot: usize) -> Result<()> {
+        ensure!(slot <= self.slots, "slot {slot} out of {}", self.slots);
+        let need = self.state_slot_bytes();
+        let free = self.ctx.mem_get_info().map(|(f, _)| f).unwrap_or(usize::MAX);
+        let Some(gb) = self.gdn.as_mut() else { return Ok(()) };
+        if gb.ssm_pool.is_live(slot) {
+            return Ok(());
+        }
+        ensure!(
+            free >= need + STATE_FREE_MARGIN,
+            "{free} bytes of device memory free, a recurrent state slot needs {need} plus a margin"
+        );
+        gb.conv_pool.acquire(slot)?;
+        if let Err(e) = gb.ssm_pool.acquire(slot) {
+            gb.conv_pool.release(slot);
+            return Err(e);
+        }
+        let conv = gb.conv_pool.stride_bytes() / 4;
+        let ssm = gb.ssm_pool.stride_bytes() / 4;
+        self.stream.memset_zeros(&mut gb.conv_state.slice_mut(slot * conv..(slot + 1) * conv))?;
+        self.stream.memset_zeros(&mut gb.ssm_state.slice_mut(slot * ssm..(slot + 1) * ssm))?;
+        Ok(())
+    }
+
+    pub fn release_state(&mut self, slot: usize) {
+        if slot >= self.slots {
+            return;
+        }
+        let _ = self.stream.synchronize();
+        if let Some(gb) = self.gdn.as_mut() {
+            gb.ssm_pool.release(slot);
+            gb.conv_pool.release(slot);
+        }
+    }
+
     pub fn reset_slot(&mut self, seq: usize) -> Result<()> {
         ensure!(seq < self.slots, "slot {seq} out of {}", self.slots);
+        if let Some(gb) = self.gdn.as_ref() {
+            ensure!(gb.ssm_pool.is_live(seq), "recurrent state of slot {seq} is not allocated");
+        }
         let slots = self.spec.linear_layers();
         let Some(gb) = self.gdn.as_mut() else { return Ok(()) };
         let conv = slots * gb.la.conv_dim() * (gb.la.conv_kernel - 1);

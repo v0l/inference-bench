@@ -50,6 +50,10 @@ pub trait Executor {
     fn kv_blocks(&self) -> usize;
     fn chunk_limit(&self) -> usize;
     fn set_table(&mut self, slot: usize, blocks: &[u32]) -> Result<()>;
+    fn acquire_state(&mut self, _slot: usize) -> Result<()> {
+        Ok(())
+    }
+    fn release_state(&mut self, _slot: usize) {}
     fn prefill(&mut self, slot: usize, tokens: &[u32], start: usize, sample: Option<(Sampling, u32)>) -> Result<Option<u32>>;
     fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>>;
     fn fused(
@@ -101,6 +105,14 @@ impl Executor for GpuExecutor {
 
     fn set_table(&mut self, slot: usize, blocks: &[u32]) -> Result<()> {
         self.rt.set_block_table(slot, blocks)
+    }
+
+    fn acquire_state(&mut self, slot: usize) -> Result<()> {
+        self.rt.acquire_state(slot)
+    }
+
+    fn release_state(&mut self, slot: usize) {
+        self.rt.release_state(slot)
     }
 
     fn prefill(&mut self, slot: usize, tokens: &[u32], start: usize, sample: Option<(Sampling, u32)>) -> Result<Option<u32>> {
@@ -221,6 +233,7 @@ pub struct Scheduler<E: Executor> {
     next_id: SeqId,
     admissions: u64,
     preemptions: u64,
+    state_refusals: u64,
     prefill_rate: f64,
 }
 
@@ -242,6 +255,7 @@ impl<E: Executor> Scheduler<E> {
             next_id: 1,
             admissions: 0,
             preemptions: 0,
+            state_refusals: 0,
             prefill_rate: 0.0,
         }
     }
@@ -264,6 +278,10 @@ impl<E: Executor> Scheduler<E> {
 
     pub fn blocks_total(&self) -> usize {
         self.pool.total()
+    }
+
+    pub fn state_refusals(&self) -> u64 {
+        self.state_refusals
     }
 
     pub fn preemptions(&self) -> u64 {
@@ -327,6 +345,7 @@ impl<E: Executor> Scheduler<E> {
     fn release(&mut self, s: &mut Seq) {
         self.pool.release(&mut s.blocks);
         if let Some(slot) = s.slot.take() {
+            self.exec.release_state(slot);
             self.free_slots.push(slot);
         }
     }
@@ -381,8 +400,13 @@ impl<E: Executor> Scheduler<E> {
             if self.pool.free_count() < need + reserve {
                 break;
             }
+            let slot = *self.free_slots.last().expect("a free slot");
+            if self.exec.acquire_state(slot).is_err() {
+                self.state_refusals += 1;
+                break;
+            }
+            self.free_slots.pop();
             let mut s = self.waiting.pop_front().expect("front exists");
-            let slot = self.free_slots.pop().expect("a free slot");
             for _ in 0..blocks_for(s.prefill_target()) {
                 s.blocks.push(self.pool.alloc().expect("checked free blocks"));
             }
@@ -566,6 +590,8 @@ mod tests {
         pub token_cost: Duration,
         pub decode_calls: Vec<usize>,
         pub prefill_calls: Vec<usize>,
+        pub state_budget: usize,
+        pub states_live: std::collections::HashSet<usize>,
     }
 
     impl Fake {
@@ -580,6 +606,8 @@ mod tests {
                 token_cost: Duration::ZERO,
                 decode_calls: Vec::new(),
                 prefill_calls: Vec::new(),
+                state_budget: usize::MAX,
+                states_live: Default::default(),
             }
         }
 
@@ -616,6 +644,16 @@ mod tests {
         fn set_table(&mut self, slot: usize, blocks: &[u32]) -> Result<()> {
             self.tables[slot] = blocks.to_vec();
             Ok(())
+        }
+        fn acquire_state(&mut self, slot: usize) -> Result<()> {
+            if self.states_live.len() >= self.state_budget {
+                bail!("no device memory for a recurrent state");
+            }
+            assert!(self.states_live.insert(slot), "slot {slot} acquired twice");
+            Ok(())
+        }
+        fn release_state(&mut self, slot: usize) {
+            assert!(self.states_live.remove(&slot), "slot {slot} released without state");
         }
         fn prefill(&mut self, slot: usize, tokens: &[u32], start: usize, sample: Option<(Sampling, u32)>) -> Result<Option<u32>> {
             assert!(tokens.len() <= self.chunk);
@@ -778,6 +816,45 @@ mod tests {
         s.step(&mut events).unwrap();
         assert_eq!((s.running(), s.waiting()), (1, 1));
         let (_, _, _) = drain(&mut s);
+        assert_eq!(s.blocks_used(), 0);
+    }
+
+    #[test]
+    fn admission_stops_cleanly_when_no_recurrent_state_can_be_allocated() {
+        let mut fake = Fake::new(1024, 8, 400, 512);
+        fake.state_budget = 2;
+        let mut s = Scheduler::new(fake, Config::default());
+        for q in 0..5 {
+            s.submit(request(20, 30, q)).unwrap();
+        }
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        assert_eq!((s.running(), s.waiting()), (2, 3));
+        assert!(s.state_refusals() > 0);
+        assert_eq!(s.exec.states_live.len(), 2);
+        let (_, _, _) = drain(&mut s);
+        assert!(s.exec.states_live.is_empty());
+        assert_eq!(s.blocks_used(), 0);
+    }
+
+    #[test]
+    fn recurrent_states_are_freed_by_finish_cancel_and_preemption_with_no_growth() {
+        let mut fake = Fake::new(512, 6, 60, 256);
+        fake.state_budget = 4;
+        let mut s = Scheduler::new(fake, Config { max_num_seqs: 6, reserve_blocks: Some(1), ..Config::default() });
+        let mut x = 12345u64;
+        let mut events = Vec::new();
+        for round in 0..1000u32 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            if (x >> 40) % 3 != 0 && s.waiting() < 8 {
+                s.submit(request(1 + ((x >> 20) % 200) as usize, 1 + ((x >> 8) % 12) as usize, round)).unwrap();
+            }
+            s.step(&mut events).unwrap();
+            assert!(s.exec.states_live.len() <= 4);
+            assert_eq!(s.exec.states_live.len(), s.running());
+        }
+        let (_, _, _) = drain(&mut s);
+        assert!(s.exec.states_live.is_empty());
         assert_eq!(s.blocks_used(), 0);
     }
 

@@ -49,7 +49,7 @@ fn fused_pair(dir: &str, tile: Option<&str>, bound: f32) {
     let s = spec_for(dir);
     let pages = 512usize.div_ceil(specrt::codegen::PAGE);
     let slots = 4;
-    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0 };
+    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
     let prompts = mixed_prompts();
     let long: Vec<u32> = (0..200u32).map(|i| (i * 13 + 5) % 1024).collect();
     let setup = |rt: &mut Runtime, st: &mut specrt::runtime::Stepper| -> Vec<DecodeRow> {

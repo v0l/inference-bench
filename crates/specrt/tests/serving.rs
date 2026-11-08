@@ -42,7 +42,7 @@ fn shuffled_blocks_match_contiguous(dir: &str, kv_planes: usize) {
     let logits = plain.prompt_logits(&prompt).unwrap();
     let greedy = plain.generate(&prompt, 40, Sampling::GREEDY).unwrap().tokens;
     drop(plain);
-    let layout = Layout { max_ctx, slots: 3, kv_blocks: 3 * pages as usize, prefill_chunk: 128, kv_planes, kv_headroom: 0 };
+    let layout = Layout { max_ctx, slots: 3, kv_blocks: 3 * pages as usize, prefill_chunk: 128, kv_planes, kv_headroom: 0, state_on_demand: false };
     let mut paged = Runtime::load_layout(&s, layout).unwrap();
     let pool = shuffled(3 * pages, 7);
     paged.set_block_table(0, &pool[pages as usize..2 * pages as usize]).unwrap();
@@ -73,7 +73,7 @@ fn single_greedy(s: &Spec, prompts: &[Vec<u32>], new: usize) -> Vec<Vec<u32>> {
 fn stepped_greedy(s: &Spec, prompts: &[Vec<u32>], new: usize, chunk: usize) -> Vec<Vec<u32>> {
     let slots = prompts.len() + 1;
     let pages = 512usize.div_ceil(specrt::codegen::PAGE);
-    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0 };
+    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
     let mut rt = Runtime::load_layout(s, layout).unwrap();
     let pool = shuffled((slots * pages) as u32, 3);
     let mut st = rt.stepper().unwrap();
@@ -172,7 +172,7 @@ fn scheduled_matches_single(dir: &str) {
     let want: Vec<Vec<u32>> =
         prompts.iter().zip(&new).map(|(p, &n)| single.generate(p, n, Sampling::GREEDY).unwrap().tokens).collect();
     drop(single);
-    let layout = Layout { max_ctx: 512, slots: 16, kv_blocks: 120, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0 };
+    let layout = Layout { max_ctx: 512, slots: 16, kv_blocks: 120, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
     let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
     let cfg = Config { max_num_seqs: 16, max_batched_tokens: 300, reserve_blocks: Some(1), ..Config::default() };
     let mut sched = Scheduler::new(exec, cfg);
@@ -195,6 +195,8 @@ fn scheduled_matches_single(dir: &str) {
     assert!(sched.preemptions() > 0, "the pool of 120 blocks was meant to run out");
     assert!(most > 8, "decode batches stayed at {most} rows");
     assert_eq!(sched.blocks_used(), 0);
+    assert_eq!(sched.exec.rt.state_live_slots(), 1);
+    assert_eq!(sched.exec.rt.state_mapped_bytes() > 0, true);
     for (i, id) in ids.iter().enumerate() {
         assert_eq!(got[id], want[i], "sequence {i}");
     }
