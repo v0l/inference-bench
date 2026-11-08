@@ -195,6 +195,11 @@ enum GemmOut<'a> {
     Planes(&'a Planes),
 }
 
+struct Fp8Act {
+    q: CudaSlice<u8>,
+    scale: CudaSlice<f32>,
+}
+
 struct PrefillBuffers {
     tokens: CudaSlice<i32>,
     x: CudaSlice<f32>,
@@ -243,6 +248,7 @@ pub struct Runtime {
     buf: Buffers,
     pre: PrefillBuffers,
     gdn: Option<GdnBuffers>,
+    fp8_act: Option<Fp8Act>,
     chunk: usize,
     use_mma: bool,
     sms: u32,
@@ -421,10 +427,24 @@ impl Runtime {
         let use_mma =
             ctx.compute_capability()?.0 >= 8 && std::env::var_os("SPECRT_GEMM_FP32").is_none();
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
+        let widest = [d.hidden, d.intermediate, spec.q_dim()]
+            .into_iter()
+            .chain(spec.linear_attention.as_ref().map(|l| l.value_dim()))
+            .max()
+            .unwrap_or(d.hidden);
+        let fp8_act = if spec.quant == crate::spec::Quant::Fp8Block128 && std::env::var_os("SPECRT_FP8_ACT").is_some() {
+            Some(Fp8Act {
+                q: stream.alloc_zeros(chunk * widest)?,
+                scale: stream.alloc_zeros(chunk * widest / crate::codegen::FP8_BLOCK)?,
+            })
+        } else {
+            None
+        };
         let rt = Runtime {
             smem,
             pre,
             gdn,
+            fp8_act,
             chunk,
             seq: 0,
             batch,
@@ -695,10 +715,59 @@ impl Runtime {
             _ => "_narrow",
         };
         let tile = Tile::variant(suffix);
+        if let (Some(fa), DeviceMatrix::Fp8 { .. }, false) = (&self.fp8_act, w, suffix == "_tiny") {
+            return self.tc_fp8(fa, name, w, bias, x, out, rows, tokens, suffix, tile);
+        }
         let kernel = format!("{name}_mma{suffix}");
         let mut b = self.stream.launch_builder(self.kernel(&kernel));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        let n = tokens as i32;
+        b.arg(&n);
+        let config = LaunchConfig {
+            grid_dim: (grid(rows, tile.bn), grid(tokens, tile.bm), 1),
+            block_dim: (tile.threads(), 1, 1),
+            shared_mem_bytes: self.smem[kernel.as_str()],
+        };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tc_fp8(
+        &self,
+        fa: &Fp8Act,
+        name: &str,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+        suffix: &str,
+        tile: crate::codegen::Tile,
+    ) -> Result<()> {
+        let width = match w {
+            DeviceMatrix::Fp8 { values, .. } => values.len() / rows,
+            _ => unreachable!("tc_fp8 takes FP8 weights"),
+        };
+        let width_i = width as i32;
+        let mut b = self.stream.launch_builder(self.kernel("quant_rows_fp8"));
+        b.arg(&x.0).arg(&x.1).arg(&fa.q).arg(&fa.scale).arg(&width_i);
+        let config = LaunchConfig {
+            grid_dim: ((width / crate::codegen::FP8_BLOCK) as u32, tokens as u32, 1),
+            block_dim: ((crate::codegen::FP8_BLOCK / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        let kernel = format!("{name}_f8{suffix}");
+        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        w.args(&mut b, &self.buf.dummy);
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&fa.q).arg(&fa.scale);
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
             GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),

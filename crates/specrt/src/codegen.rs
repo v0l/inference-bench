@@ -35,6 +35,34 @@ pub struct Tile {
 pub const MMA_LINEARS: [&str; 5] = ["qkv", "o", "gate_up", "down", "lm_head"];
 pub const GDN_LINEARS: [&str; 3] = ["lin_in", "lin_out", "lin_ba"];
 pub const MMA_VARIANTS: [&str; 4] = ["", "_big", "_narrow", "_tiny"];
+pub const FP8_ACT_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
+pub const FP8_ACT_VARIANTS: [&str; 3] = ["", "_big", "_narrow"];
+pub const FP8_ACT_KERNELS: &[&str] = &[
+    "quant_rows_fp8",
+    "qkv_f8",
+    "qkv_f8_big",
+    "qkv_f8_narrow",
+    "o_f8",
+    "o_f8_big",
+    "o_f8_narrow",
+    "gate_up_f8",
+    "gate_up_f8_big",
+    "gate_up_f8_narrow",
+    "down_f8",
+    "down_f8_big",
+    "down_f8_narrow",
+    "lin_in_f8",
+    "lin_in_f8_big",
+    "lin_in_f8_narrow",
+    "lin_out_f8",
+    "lin_out_f8_big",
+    "lin_out_f8_narrow",
+];
+const FP8_ACT_STAGES: usize = 2;
+
+pub fn fp8_act_smem(tile: Tile) -> u32 {
+    (FP8_ACT_STAGES * (tile.bm + tile.bn) * (FP8_BLOCK + 16)) as u32
+}
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -317,6 +345,29 @@ fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
     out
 }
 
+fn fp8_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
+    let mut out = String::new();
+    let la = spec.linear_attention.is_some();
+    for &linear in FP8_ACT_LINEARS.iter().filter(|l| la || !l.starts_with("lin_")) {
+        let (n, k, epi, bias) = linear_dims(spec, linear);
+        for suffix in FP8_ACT_VARIANTS {
+            let t = Tile::variant(suffix);
+            let name = format!("{linear}_f8{suffix}");
+            let name = FP8_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP8_ACT_KERNELS");
+            smem.insert(name, fp8_act_smem(t));
+            out.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const unsigned char* xq, const float* xs, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_fp8<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP8_ACT_STAGES}, {epi}, {bias}>(w, s, b, xq, xs, out, oh, ol, tokens);\n}}\n\n",
+                threads = t.threads(),
+                bm = t.bm,
+                bn = t.bn,
+                wm = t.wm,
+                wn = t.wn,
+            ));
+        }
+    }
+    out
+}
+
 impl Module {
     pub fn generate(spec: &Spec, max_ctx: usize) -> Result<Self> {
         let a = &spec.attention;
@@ -338,6 +389,7 @@ impl Module {
         };
         let mut smem = BTreeMap::new();
         let mma = mma_kernels(spec, &mut smem);
+        let fp8 = spec.quant == Quant::Fp8Block128;
         let (flash_rows, flash_keys) = (flash_rows(a.head_dim), flash_keys(a.head_dim));
         let kv_bytes = FLASH_STAGES * 4 * flash_keys * a.head_dim * 2;
         let q_bytes = flash_rows * a.head_dim * 4;
@@ -405,6 +457,12 @@ impl Module {
             source.push('\n');
             source.push_str(&render(GDN_TEMPLATE, &vars)?);
             kernels.extend_from_slice(GDN_KERNELS);
+        }
+        if fp8 {
+            source.push('\n');
+            source.push_str(&fp8_act_kernels(spec, &mut smem));
+            kernels.push("quant_rows_fp8");
+            kernels.extend(smem.keys().filter(|k| k.contains("_f8")).copied().collect::<Vec<_>>());
         }
         Ok(Module { source, kernels, smem })
     }

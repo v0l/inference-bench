@@ -156,7 +156,22 @@ def dequantized_state(fixture):
     return state
 
 
-def tiny_fp8_model(fixture):
+def quantize_activation_fp8(x):
+    shape = x.shape
+    blocks = x.float().reshape(*shape[:-1], shape[-1] // FP8_BLOCK, FP8_BLOCK)
+    amax = blocks.abs().amax(dim=-1, keepdim=True)
+    scale = torch.where(amax > 0, amax / FP8_MAX, torch.ones_like(amax))
+    q = (blocks / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float()
+    return (q * scale).reshape(shape).to(x.dtype)
+
+
+def quantize_projection_inputs(model):
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear) and name.split(".")[-1] in FP8_PROJECTIONS:
+            module.register_forward_pre_hook(lambda _m, args: (quantize_activation_fp8(args[0]),))
+
+
+def tiny_fp8_model(fixture, act_quant=False):
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
     src = fixture.parent / "tiny-qwen3.5-hd256"
@@ -165,6 +180,8 @@ def tiny_fp8_model(fixture):
     torch.manual_seed(TINY_SEED)
     model = Qwen3_5ForCausalLM(tiny_config(256)).float().eval()
     model.load_state_dict(dequantized_state(fixture), strict=True)
+    if act_quant:
+        quantize_projection_inputs(model)
     return model
 
 
@@ -198,12 +215,12 @@ def save(out_dir, name, arrays, meta):
     (out_dir / f"{name}.json").write_text(json.dumps(meta))
 
 
-def tiny(fixture, out_dir, head_dim=128, fp8=False):
+def tiny(fixture, out_dir, head_dim=128, fp8=False, act_quant=False):
     from transformers import DynamicCache
 
     torch.set_num_threads(4)
-    model = tiny_fp8_model(fixture) if fp8 else tiny_model(fixture, head_dim)
-    prefix = "tinyfp8" if fp8 else "tiny" if head_dim == 128 else f"tiny{head_dim}"
+    model = tiny_fp8_model(fixture, act_quant) if fp8 else tiny_model(fixture, head_dim)
+    prefix = ("tinyfp8act" if act_quant else "tinyfp8") if fp8 else "tiny" if head_dim == 128 else f"tiny{head_dim}"
     out_dir.mkdir(parents=True, exist_ok=True)
     versions = {"torch": torch.__version__, "transformers": __import__("transformers").__version__}
     with torch.inference_mode():
@@ -339,6 +356,7 @@ def main():
         return
     if sys.argv[1] == "tiny-fp8":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, fp8=True)
+        tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, fp8=True, act_quant=True)
         return
     spec_path = Path(sys.argv[1])
     out_dir = Path(sys.argv[2])
