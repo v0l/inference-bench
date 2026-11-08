@@ -6,6 +6,47 @@ pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
 pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
 pub const FP4_TEMPLATE: &str = include_str!("../templates/fp4.cu");
+pub const FP4_ACT_TEMPLATE: &str = include_str!("../templates/fp4_act.cu");
+pub const FP4_ACT_KERNELS: &[&str] = &[
+    "quant_rows_fp4",
+    "gate_up_f4a",
+    "gate_up_f4a_big",
+    "gate_up_f4a_narrow",
+    "down_f4a",
+    "down_f4a_big",
+    "down_f4a_narrow",
+];
+const F4A_ROW: usize = 80;
+
+pub fn fp4_act_enabled() -> bool {
+    std::env::var_os("SPECRT_FP4_ACT").is_some_and(|v| v != "0")
+}
+
+pub fn f4a_smem(tile: Tile) -> u32 {
+    (FP4_STAGES * (tile.bm + tile.bn) * F4A_ROW) as u32
+}
+
+fn fp4_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
+    let mut out = String::from(FP4_ACT_TEMPLATE);
+    for linear in ["gate_up", "down"] {
+        let (n, k, epi, _) = linear_dims(spec, linear);
+        for suffix in FP8_ACT_VARIANTS {
+            let t = Tile::variant(suffix);
+            let name = format!("{linear}_f4a{suffix}");
+            let name = FP4_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_ACT_KERNELS");
+            smem.insert(name, f4a_smem(t));
+            out.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const unsigned char* xq, const unsigned char* xs, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_f4a<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP4_STAGES}, {epi}>(w, s, xq, xs, out, oh, ol, tokens);\n}}\n\n",
+                threads = t.threads(),
+                bm = t.bm,
+                bn = t.bn,
+                wm = t.wm,
+                wn = t.wn,
+            ));
+        }
+    }
+    out
+}
 pub const FP4_KERNELS: &[&str] = &[
     "gate_up_act_f4",
     "down_proj_f4",
@@ -304,6 +345,7 @@ pub struct Module {
     pub source: String,
     pub kernels: Vec<&'static str>,
     pub smem: BTreeMap<&'static str, u32>,
+    pub arch_features: bool,
 }
 
 pub fn render(template: &str, vars: &BTreeMap<&str, String>) -> Result<String> {
@@ -503,6 +545,7 @@ impl Module {
         let mut source =
             format!("{}\n{}", render(OPS_TEMPLATE, &vars)?, render(MODEL_TEMPLATE, &vars)?);
         let mut kernels = KERNELS.to_vec();
+        let mut arch_features = false;
         if la.is_some() {
             source.push('\n');
             source.push_str(&render(GDN_TEMPLATE, &vars)?);
@@ -517,10 +560,16 @@ impl Module {
         if spec.mlp.quant == Some(Quant::Nvfp4G16) {
             let mut fp4_vars = BTreeMap::new();
             fp4_vars.insert("F4W_KERNELS", fp4_kernels(spec, &mut smem));
+            let act = fp4_act_enabled();
+            fp4_vars.insert("F4A_SOURCE", if act { fp4_act_kernels(spec, &mut smem) } else { String::new() });
             source.push('\n');
             source.push_str(&render(FP4_TEMPLATE, &fp4_vars)?);
             kernels.extend_from_slice(FP4_KERNELS);
+            if act {
+                kernels.extend_from_slice(FP4_ACT_KERNELS);
+                arch_features = true;
+            }
         }
-        Ok(Module { source, kernels, smem })
+        Ok(Module { source, kernels, smem, arch_features })
     }
 }

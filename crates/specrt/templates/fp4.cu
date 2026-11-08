@@ -211,3 +211,4 @@ __device__ __forceinline__ void gemm_f4w(const void* w, const unsigned char* sca
 }
 
 {{F4W_KERNELS}}
+{{F4A_SOURCE}}

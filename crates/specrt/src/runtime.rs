@@ -209,6 +209,11 @@ struct Fp8Act {
     scale: CudaSlice<f32>,
 }
 
+struct Fp4Act {
+    q: CudaSlice<u8>,
+    scales: CudaSlice<u8>,
+}
+
 struct PrefillBuffers {
     tokens: CudaSlice<i32>,
     x: CudaSlice<f32>,
@@ -260,6 +265,7 @@ pub struct Runtime {
     pre: PrefillBuffers,
     gdn: Option<GdnBuffers>,
     fp8_act: Option<Fp8Act>,
+    fp4_act: Option<Fp4Act>,
     chunk: usize,
     use_mma: bool,
     sms: u32,
@@ -499,11 +505,21 @@ impl Runtime {
         } else {
             None
         };
+        let fp4_act = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) && crate::codegen::fp4_act_enabled() {
+            let widest = d.hidden.max(d.intermediate);
+            Some(Fp4Act {
+                q: stream.alloc_zeros(chunk * widest / 2)?,
+                scales: stream.alloc_zeros(chunk * widest / crate::nvfp4::GROUP)?,
+            })
+        } else {
+            None
+        };
         let mut rt = Runtime {
             smem,
             pre,
             gdn,
             fp8_act,
+            fp4_act,
             chunk,
             seq: 0,
             batch,
@@ -831,6 +847,9 @@ impl Runtime {
         if let (Some(fa), DeviceMatrix::Fp8 { .. }, false) = (&self.fp8_act, w, suffix == "_tiny") {
             return self.tc_fp8(fa, name, w, bias, x, out, rows, tokens, suffix, tile);
         }
+        if let (Some(fa), DeviceMatrix::Fp4 { .. }, false) = (&self.fp4_act, w, suffix == "_tiny") {
+            return self.tc_fp4(fa, name, w, x, out, rows, tokens, suffix, tile);
+        }
         let kernel = match w {
             DeviceMatrix::Fp4 { .. } => format!("{name}_f4w{suffix}"),
             _ => format!("{name}_mma{suffix}"),
@@ -838,6 +857,49 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel(&kernel));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        let n = tokens as i32;
+        b.arg(&n);
+        let config = LaunchConfig {
+            grid_dim: (grid(rows, tile.bn), grid(tokens, tile.bm), 1),
+            block_dim: (tile.threads(), 1, 1),
+            shared_mem_bytes: self.smem[kernel.as_str()],
+        };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tc_fp4(
+        &self,
+        fa: &Fp4Act,
+        name: &str,
+        w: &DeviceMatrix,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+        suffix: &str,
+        tile: crate::codegen::Tile,
+    ) -> Result<()> {
+        let DeviceMatrix::Fp4 { packed, scales } = w else { unreachable!("tc_fp4 takes NVFP4 weights") };
+        let width = packed.len() * 2 / rows;
+        let width_i = width as i32;
+        let groups = width / crate::nvfp4::GROUP;
+        let mut b = self.stream.launch_builder(self.kernel("quant_rows_fp4"));
+        b.arg(&x.0).arg(&x.1).arg(scales).arg(&fa.q).arg(&fa.scales).arg(&width_i);
+        let config = LaunchConfig {
+            grid_dim: (grid(groups, 128), tokens as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        let kernel = format!("{name}_f4a{suffix}");
+        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        b.arg(packed).arg(scales).arg(&fa.q).arg(&fa.scales);
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
             GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),

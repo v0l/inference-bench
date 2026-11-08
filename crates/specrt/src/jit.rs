@@ -55,14 +55,19 @@ impl Jit {
         self.arch
     }
 
+    pub fn arch_for(&self, module: &Module) -> &'static str {
+        if module.arch_features && self.arch == "compute_120" { "compute_120a" } else { self.arch }
+    }
+
     pub fn load(&self, module: &Module) -> Result<Loaded> {
-        let key = cache_key(&module.source, self.arch, &self.options);
+        let arch = self.arch_for(module);
+        let key = cache_key(&module.source, arch, &self.options);
         let path = self.dir.join(format!("{key}.ptx"));
         let (ptx, cache_hit) = match std::fs::read_to_string(&path) {
             Ok(text) => (text, true),
             Err(_) => {
                 let opts = CompileOptions {
-                    arch: Some(self.arch),
+                    arch: Some(arch),
                     options: self.options.clone(),
                     ..Default::default()
                 };
