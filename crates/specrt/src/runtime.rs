@@ -325,6 +325,15 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 }
 
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
+const FP4_GEMV_THREADS: u32 = 512;
+
+fn gemv_cfg(name: &str, rows: usize) -> LaunchConfig {
+    if name.ends_with("_f4") {
+        cfg(grid(rows, FP4_GEMV_THREADS as usize / 32), FP4_GEMV_THREADS)
+    } else {
+        cfg(grid(rows, LINEAR_ROWS_PER_BLOCK), 256)
+    }
+}
 const PREFILL_CHUNK: usize = 2048;
 const SERVING_RESIDENT_SLOTS: usize = 8;
 const STATE_FREE_MARGIN: usize = 256 << 20;
@@ -682,7 +691,7 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel(name));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out);
-        unsafe { b.launch(cfg(grid(rows, LINEAR_ROWS_PER_BLOCK), 256)) }?;
+        unsafe { b.launch(gemv_cfg(name, rows)) }?;
         Ok(())
     }
 
@@ -702,7 +711,7 @@ impl Runtime {
             b.arg(bias.unwrap_or(&self.buf.dummy));
         }
         b.arg(x).arg(norm).arg(out);
-        unsafe { b.launch(cfg(grid(rows, LINEAR_ROWS_PER_BLOCK), 256)) }?;
+        unsafe { b.launch(gemv_cfg(name, rows)) }?;
         Ok(())
     }
 

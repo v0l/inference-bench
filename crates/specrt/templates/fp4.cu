@@ -1,5 +1,6 @@
 constexpr int FP4_GROUP = 16;
 constexpr int FP4_HEADER = 16;
+constexpr int FP4_GEMV_THREADS = 512;
 
 __device__ __forceinline__ float fp4_inv_global(const unsigned char* scales) {
     return __ldg((const float*)scales);
@@ -19,26 +20,54 @@ __device__ __forceinline__ int fp4_t(int k, int kg) {
     return (k & (FP4_GROUP - 1)) * kg + (k >> 4);
 }
 
-template <int K>
-__device__ __forceinline__ float fp4_row_dot(const void* w, const unsigned char* scales, int row, const float* xt, int lane) {
+template <int K, int ROWS, int U>
+__device__ __forceinline__ void fp4_rows_dot(const void* w, const unsigned char* scales, int row0, int stride, const float* xt, int lane, float* result) {
     constexpr int KG = K / FP4_GROUP;
-    const uint2* wr = (const uint2*)((const unsigned char*)w + (size_t)row * (K / 2));
-    const unsigned char* sr = scales + FP4_HEADER + (size_t)row * KG;
-    float acc = 0.0f;
-#pragma unroll 4
-    for (int g = lane; g < KG; g += 32) {
-        uint2 q = load_stream8(wr + g);
-        float s = e4m3_to_f32(__ldg(sr + g));
-        float part = 0.0f;
+    const unsigned char* wb = (const unsigned char*)w;
+    const unsigned char* sb = scales + FP4_HEADER;
+    float acc[ROWS];
 #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            unsigned byte = ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xffu;
-            part += e2m1_to_f32(byte & 15u) * xt[(2 * i) * KG + g];
-            part += e2m1_to_f32(byte >> 4) * xt[(2 * i + 1) * KG + g];
+    for (int r = 0; r < ROWS; r++) acc[r] = 0.0f;
+    for (int g0 = 0; g0 < KG; g0 += 32 * U) {
+        uint2 q[ROWS][U];
+        unsigned char sc[ROWS][U];
+#pragma unroll
+        for (int r = 0; r < ROWS; r++)
+#pragma unroll
+            for (int u = 0; u < U; u++) {
+                int g = g0 + u * 32 + lane;
+                if (g < KG) {
+                    size_t row = (size_t)(row0 + r * stride);
+                    q[r][u] = load_stream8(wb + row * (K / 2) + (size_t)g * 8);
+                    sc[r][u] = __ldg(sb + row * KG + g);
+                } else {
+                    q[r][u] = make_uint2(0, 0);
+                    sc[r][u] = 0;
+                }
+            }
+#pragma unroll
+        for (int u = 0; u < U; u++) {
+            int g = g0 + u * 32 + lane;
+            if (g >= KG) break;
+            float xv[16];
+#pragma unroll
+            for (int i = 0; i < 16; i++) xv[i] = xt[i * KG + g];
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) {
+                float part = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    unsigned byte = ((i < 4 ? q[r][u].x : q[r][u].y) >> (8 * (i & 3))) & 0xffu;
+                    part += e2m1_to_f32(byte & 15u) * xv[2 * i];
+                    part += e2m1_to_f32(byte >> 4) * xv[2 * i + 1];
+                }
+                acc[r] += part * e4m3_to_f32(sc[r][u]);
+            }
         }
-        acc += part * s;
     }
-    return warp_sum(acc) * fp4_inv_global(scales);
+    float inv = fp4_inv_global(scales);
+#pragma unroll
+    for (int r = 0; r < ROWS; r++) result[r] = warp_sum(acc[r]) * inv;
 }
 
 __device__ __forceinline__ void load_normed_t(const float* x, const float* nw, float* xt) {
@@ -53,24 +82,25 @@ __device__ __forceinline__ void load_normed_t(const float* x, const float* nw, f
     __syncthreads();
 }
 
-extern "C" __global__ void gate_up_act_f4(const void* w, const unsigned char* s, const float* x, const float* nw, float* out) {
+extern "C" __global__ void __launch_bounds__(FP4_GEMV_THREADS) gate_up_act_f4(const void* w, const unsigned char* s, const float* x, const float* nw, float* out) {
     __shared__ __align__(16) float xt[HIDDEN];
     load_normed_t(x, nw, xt);
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int row = blockIdx.x * LINEAR_WARPS + warp;
+    int row = blockIdx.x * (FP4_GEMV_THREADS / 32) + warp;
     if (row >= INTER) return;
-    float g = fp4_row_dot<HIDDEN>(w, s, 2 * row, xt, lane);
-    float u = fp4_row_dot<HIDDEN>(w, s, 2 * row + 1, xt, lane);
-    if (lane == 0) out[fp4_t(row, INTER / FP4_GROUP)] = activation(g) * u;
+    float gu[2];
+    fp4_rows_dot<HIDDEN, 2, 2>(w, s, 2 * row, 1, xt, lane, gu);
+    if (lane == 0) out[fp4_t(row, INTER / FP4_GROUP)] = activation(gu[0]) * gu[1];
 }
 
-extern "C" __global__ void down_proj_f4(const void* w, const unsigned char* s, const float* b, const float* xt, float* out) {
+extern "C" __global__ void __launch_bounds__(FP4_GEMV_THREADS) down_proj_f4(const void* w, const unsigned char* s, const float* b, const float* xt, float* out) {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int row = blockIdx.x * LINEAR_WARPS + warp;
+    int row = blockIdx.x * (FP4_GEMV_THREADS / 32) + warp;
     if (row >= HIDDEN) return;
-    float acc = fp4_row_dot<INTER>(w, s, row, xt, lane);
+    float acc;
+    fp4_rows_dot<INTER, 1, 4>(w, s, row, 0, xt, lane, &acc);
     if (lane == 0) out[row] += acc;
 }
 

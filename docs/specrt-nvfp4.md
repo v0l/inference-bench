@@ -302,6 +302,41 @@ At 1,081 GB/s, 21.3 GB per token is a 19.7 ms floor, about 50 tok/s; specrt meas
 The rest is per-token overhead outside the GEMVs (48 `gdn_step` launches, small norms, the
 attention layers) and the sharing: each kernel here ran beside vLLM's own.
 
+### Decode GEMV tuning (#362)
+
+The GPU was never free (vLLM at 94% utilisation, 300 W cap), so every number is beside vLLM;
+medians swing with its load (the bf16 `lm_head` median moved from 2.7 ms to 4.3 ms between two
+runs of the same kernel) while minimums stay put. Standalone microbenchmarks
+(`scripts/fp4_gemv_bench.cu`, 16 layers of buffers so nothing is L2 resident, streaming read
+ceiling 1,652 GB/s from `scripts/bandwidth.cu`):
+
+| variant | gate/up GB/s | down GB/s |
+|---|---|---|
+| before (1 row per warp, 256 threads, unroll 4) | 1,292 | 1,461 |
+| 2 rows per warp (gate and up), 2 groups per lane in flight, 512 threads | 1,366 | 1,461 |
+| 1,024 threads | 1,380 | |
+| 4 rows per warp | 1,252 | 1,415 |
+| several row pairs per block, prefetching the next tile | no gain | |
+
+`down_proj_f4` was already at 1,461 GB/s (88% of the ceiling) with the full-grid launch, so split-k
+is not needed. Kept: `gate_up_act_f4` loads gate and up rows together with two groups per lane
+in flight, 512-thread blocks for both `_f4` kernels (`FP4_GEMV_THREADS`).
+
+`lm_head_norm` standalone reaches 1,640 to 1,646 GB/s for any unroll or block size
+(5,120 x 248,320 bf16, 1.55 ms), so its 929 GB/s in the table below is vLLM contention, not the
+kernel. An FP8 or NVFP4 head changes logits and needs its own accuracy gate; not done.
+
+In the graph, under the same sharing (`nsys --cuda-graph-trace=node`, 128-token prompt):
+
+| kernel | before median | after median | after min |
+|---|---|---|---|
+| `gate_up_act_f4` | 1,107 GB/s | 1,278 | 1,470 |
+| `down_proj_f4` | 1,161 | 1,172 | 1,476 |
+| other GEMVs | unchanged | | |
+
+`gate_up_act_f4` median 90.6 us to 78.5 us. Per-layer minimums of the NVFP4 GEMVs are 89% of the
+ceiling; medians stay near 78% because of the sharing.
+
 ### Batched decode (native prefill, 128-token prompts, `bench ... 128 128 N`)
 
 | batch | aggregate | per sequence | vLLM at that many running (with MTP) |
