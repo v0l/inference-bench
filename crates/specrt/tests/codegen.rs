@@ -82,6 +82,30 @@ fn module_has_batched_gemm_for_every_linear() {
 }
 
 #[test]
+fn hybrid_spec_adds_the_delta_net_kernels_and_dense_specs_do_not() {
+    let json = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-qwen3.5/config.json"),
+    )
+    .unwrap();
+    let hybrid = Module::generate(&Spec::from_hf_config(&json).unwrap(), 256).unwrap();
+    assert!(!hybrid.source.contains("{{"));
+    for name in specrt::codegen::GDN_KERNELS {
+        assert!(hybrid.kernels.contains(name), "{name}");
+        assert!(hybrid.source.contains(&format!("void {name}(")) || hybrid.source.contains(&format!(") {name}(")), "{name}");
+    }
+    assert!(hybrid.source.contains("constexpr int QKV_ROW = 1536;"));
+    assert!(hybrid.source.contains("constexpr int ROT = 32;"));
+    assert!(hybrid.source.contains("constexpr bool OUT_GATE = true;"));
+    assert!(hybrid.source.contains("constexpr int LA_VH = 6;"));
+    assert!(hybrid.smem.contains_key("gdn_chunk_prep"));
+    let dense = Module::generate(&spec("qwen3-0.6b.toml"), 256).unwrap();
+    assert!(!dense.source.contains("gdn_step"));
+    assert!(dense.kernels.iter().all(|k| !k.starts_with("gdn_") && !k.starts_with("lin_")));
+    assert!(dense.source.contains("constexpr int ROT = 128;"));
+    assert!(dense.source.contains("constexpr bool OUT_GATE = false;"));
+}
+
+#[test]
 fn rope_scaling_and_activation_are_baked() {
     let mut s = spec("qwen3-0.6b.toml");
     let plain = Module::generate(&s, 256).unwrap();
