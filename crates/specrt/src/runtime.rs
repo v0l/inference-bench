@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod step;
-pub use step::{DecodeRow, Stepper};
+pub use step::{DecodeRow, GRAPH_SIZES, Stepper, pad_rows};
 
 enum DeviceMatrix {
     Bf16(CudaSlice<u16>),
@@ -451,7 +451,7 @@ impl Runtime {
         let d = &spec.dims;
         let pages = layout.pages();
         let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
-        let chunk = max_ctx.min(layout.prefill_chunk).max(layout.slots);
+        let chunk = max_ctx.min(layout.prefill_chunk).max(crate::runtime::step::pad_rows(layout.slots));
         let use_mma =
             ctx.compute_capability()?.0 >= 8 && std::env::var_os("SPECRT_GEMM_FP32").is_none();
         let mma_only = |n: usize| if use_mma { 1 } else { n };
@@ -466,7 +466,7 @@ impl Runtime {
             logits: stream.alloc_zeros(d.vocab)?,
             k_cache: stream.alloc_zeros(1)?,
             v_cache: stream.alloc_zeros(1)?,
-            block_table: stream.alloc_zeros(layout.slots * pages)?,
+            block_table: stream.alloc_zeros((layout.slots + 1) * pages)?,
             zero_slots: stream.alloc_zeros(chunk)?,
             token: stream.alloc_zeros(1)?,
             pos: stream.alloc_zeros(1)?,
@@ -488,7 +488,7 @@ impl Runtime {
             dummy_u16: stream.alloc_zeros(8)?,
         };
         let gdn = match &spec.linear_attention {
-            Some(la) => Some(GdnBuffers::new(&stream, la, layout.slots * spec.linear_layers(), chunk)?),
+            Some(la) => Some(GdnBuffers::new(&stream, la, (layout.slots + 1) * spec.linear_layers(), chunk)?),
             None => None,
         };
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
@@ -526,7 +526,7 @@ impl Runtime {
             slots: layout.slots,
             pages,
             kv_blocks: layout.kv_blocks,
-            tables: vec![0; layout.slots * pages],
+            tables: vec![0; (layout.slots + 1) * pages],
             sms: ctx.attribute(
                 cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
             )? as u32,
@@ -561,9 +561,12 @@ impl Runtime {
             }
             n => n,
         };
-        rt.buf.k_cache = rt.stream.alloc_zeros(kv_blocks * block_elems).context("KV cache")?;
-        rt.buf.v_cache = rt.stream.alloc_zeros(kv_blocks * block_elems).context("KV cache")?;
+        rt.buf.k_cache = rt.stream.alloc_zeros((kv_blocks + 1) * block_elems).context("KV cache")?;
+        rt.buf.v_cache = rt.stream.alloc_zeros((kv_blocks + 1) * block_elems).context("KV cache")?;
         rt.kv_blocks = kv_blocks;
+        let pad_row = layout.slots * pages;
+        rt.tables[pad_row] = kv_blocks as i32;
+        rt.stream.memcpy_htod(&[kv_blocks as i32], &mut rt.buf.block_table.slice_mut(pad_row..pad_row + 1))?;
         rt.stream.synchronize()?;
         let free_after = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         rt.device_bytes = free_before.saturating_sub(free_after) as u64;

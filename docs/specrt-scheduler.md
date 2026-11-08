@@ -61,6 +61,12 @@ to allocate and free, and a table entry is the same for all layers. The kernels 
 - **Prefill and decode in one step.** The batched decode and the per-sequence chunked prefill are
   separate launches on one stream, decode first. They are not fused into one batch: the delta-net
   chunked prefill and the per-token recurrent step are different kernels.
+- **Graph-captured decode.** `Runtime::decode` pads the rows to the next of 1, 2, 4, 8, 16, 32
+  (`GRAPH_SIZES`) and replays one CUDA graph per size, captured on first use, with tokens, positions,
+  slots and sampling params in the `Stepper`'s fixed device buffers. Pad rows point at a spare slot
+  (`slots`) whose block table names a spare KV block (`kv_blocks`), so they never touch live state.
+  `SPECRT_NO_GRAPH=1` falls back to eager launches. Test:
+  `rows_padded_to_a_captured_graph_size_match_single_sequence_greedy`.
 - **Cancel.** The serving thread checks every live job's cancel flag before each step. A dropped
   SSE stream sets it (the send fails), so its blocks are back in the pool within one step.
   Server test: `a_dropped_stream_frees_its_kv_blocks_within_a_step`.

@@ -1,6 +1,14 @@
 use super::{BatchBuffers, Runtime, Sampling, cfg};
-use anyhow::{Result, ensure};
-use cudarc::driver::{CudaSlice, PushKernelArg};
+use anyhow::{Context, Result, ensure};
+use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+use cudarc::driver::{CudaGraph, CudaSlice, PushKernelArg};
+use std::collections::HashMap;
+
+pub const GRAPH_SIZES: [usize; 6] = [1, 2, 4, 8, 16, 32];
+
+pub fn pad_rows(rows: usize) -> usize {
+    GRAPH_SIZES.iter().copied().find(|&s| s >= rows).unwrap_or(rows)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DecodeRow {
@@ -14,7 +22,20 @@ pub struct DecodeRow {
 pub struct Stepper {
     bb: BatchBuffers,
     params: CudaSlice<i32>,
-    rows: usize,
+    graphs: HashMap<usize, CudaGraph>,
+    use_graphs: bool,
+}
+
+impl Stepper {
+    pub fn set_graphs(&mut self, on: bool) {
+        self.use_graphs = on;
+    }
+
+    pub fn captured_sizes(&self) -> Vec<usize> {
+        let mut sizes: Vec<usize> = self.graphs.keys().copied().collect();
+        sizes.sort();
+        sizes
+    }
 }
 
 fn params(sampling: Sampling, step: u32) -> [i32; 3] {
@@ -23,7 +44,7 @@ fn params(sampling: Sampling, step: u32) -> [i32; 3] {
 
 impl Runtime {
     pub fn stepper(&self) -> Result<Stepper> {
-        let rows = self.slots;
+        let rows = pad_rows(self.slots);
         let parts = rows * self.spec.attention.heads * crate::codegen::BATCH_DECODE_SPLITS;
         let bb = BatchBuffers {
             tokens: self.stream.alloc_zeros(rows)?,
@@ -34,7 +55,12 @@ impl Runtime {
             pos: self.stream.alloc_zeros(rows)?,
             slots: self.stream.alloc_zeros(rows)?,
         };
-        Ok(Stepper { bb, params: self.stream.alloc_zeros(3 * rows)?, rows })
+        Ok(Stepper {
+            bb,
+            params: self.stream.alloc_zeros(3 * rows)?,
+            graphs: HashMap::new(),
+            use_graphs: std::env::var_os("SPECRT_NO_GRAPH").is_none(),
+        })
     }
 
     pub fn prefill_chunk_limit(&self) -> usize {
@@ -73,24 +99,49 @@ impl Runtime {
         Ok(Some(token[0] as u32))
     }
 
-    pub fn decode(&mut self, st: &mut Stepper, rows: &[DecodeRow]) -> Result<Vec<u32>> {
-        ensure!(self.use_mma, "serving needs the tensor core path");
-        let n = rows.len();
-        ensure!(n >= 1 && n <= st.rows, "{n} decode rows for {} slots", st.rows);
-        ensure!(rows.iter().all(|r| r.slot < self.slots && r.pos < self.max_ctx), "decode row out of range");
-        let tokens: Vec<i32> = rows.iter().map(|r| r.token as i32).collect();
-        let pos: Vec<i32> = rows.iter().map(|r| r.pos as i32).collect();
-        let slots: Vec<i32> = rows.iter().map(|r| r.slot as i32).collect();
-        let p: Vec<i32> = rows.iter().flat_map(|r| params(r.sampling, r.step)).collect();
-        self.stream.memcpy_htod(&tokens, &mut st.bb.tokens.slice_mut(..n))?;
-        self.stream.memcpy_htod(&pos, &mut st.bb.pos.slice_mut(..n))?;
-        self.stream.memcpy_htod(&slots, &mut st.bb.slots.slice_mut(..n))?;
-        self.stream.memcpy_htod(&p, &mut st.params.slice_mut(..3 * n))?;
+    fn decode_and_sample(&self, st: &Stepper, n: usize) -> Result<()> {
         self.decode_rows(&st.bb, n)?;
         let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
         b.arg(&st.bb.logits).arg(&st.bb.tokens).arg(&st.params);
         unsafe { b.launch(cfg(n as u32, 1024)) }?;
-        let out = self.stream.clone_dtoh(&st.bb.tokens.slice(..n))?;
+        Ok(())
+    }
+
+    fn capture_decode(&self, st: &Stepper, n: usize) -> Result<CudaGraph> {
+        self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let recorded = self.decode_and_sample(st, n);
+        let graph = self.stream.end_capture(CUgraphInstantiate_flags(0))?;
+        recorded?;
+        graph.context("empty decode graph")
+    }
+
+    pub fn decode(&mut self, st: &mut Stepper, rows: &[DecodeRow]) -> Result<Vec<u32>> {
+        ensure!(self.use_mma, "serving needs the tensor core path");
+        let live = rows.len();
+        ensure!(live >= 1 && live <= self.slots, "{live} decode rows for {} slots", self.slots);
+        ensure!(rows.iter().all(|r| r.slot < self.slots && r.pos < self.max_ctx), "decode row out of range");
+        let n = if st.use_graphs { pad_rows(live) } else { live };
+        let pad = DecodeRow { slot: self.slots, token: 0, pos: 0, sampling: Sampling::GREEDY, step: 0 };
+        let padded: Vec<DecodeRow> = rows.iter().copied().chain(std::iter::repeat(pad)).take(n).collect();
+        let tokens: Vec<i32> = padded.iter().map(|r| r.token as i32).collect();
+        let pos: Vec<i32> = padded.iter().map(|r| r.pos as i32).collect();
+        let slots: Vec<i32> = padded.iter().map(|r| r.slot as i32).collect();
+        let p: Vec<i32> = padded.iter().flat_map(|r| params(r.sampling, r.step)).collect();
+        self.stream.memcpy_htod(&tokens, &mut st.bb.tokens.slice_mut(..n))?;
+        self.stream.memcpy_htod(&pos, &mut st.bb.pos.slice_mut(..n))?;
+        self.stream.memcpy_htod(&slots, &mut st.bb.slots.slice_mut(..n))?;
+        self.stream.memcpy_htod(&p, &mut st.params.slice_mut(..3 * n))?;
+        if st.use_graphs {
+            if !st.graphs.contains_key(&n) {
+                let graph = self.capture_decode(st, n)?;
+                graph.upload()?;
+                st.graphs.insert(n, graph);
+            }
+            st.graphs[&n].launch()?;
+        } else {
+            self.decode_and_sample(st, n)?;
+        }
+        let out = self.stream.clone_dtoh(&st.bb.tokens.slice(..live))?;
         Ok(out.into_iter().map(|t| t as u32).collect())
     }
 }

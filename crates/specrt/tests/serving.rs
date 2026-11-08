@@ -135,6 +135,21 @@ fn tiny_mixed_length_step_decode_matches_single_sequence_greedy() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn rows_padded_to_a_captured_graph_size_match_single_sequence_greedy() {
+    let s = spec_for("tiny-qwen3.5-hd256");
+    let prompts: Vec<Vec<u32>> = mixed_prompts().into_iter().take(3).collect();
+    let expected = single_greedy(&s, &prompts, 12);
+    assert_eq!(stepped_greedy(&s, &prompts, 12, 64), expected);
+}
+
+#[test]
+fn decode_batches_pad_to_the_next_graph_size() {
+    let padded: Vec<usize> = [1, 2, 3, 5, 8, 9, 17, 32].iter().map(|&n| specrt::runtime::pad_rows(n)).collect();
+    assert_eq!(padded, [1, 2, 4, 8, 8, 16, 32, 32]);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn head_dim_256_mixed_length_step_decode_matches_single_sequence_greedy() {
     stepped_matches_single("tiny-qwen3.5-hd256");
 }
