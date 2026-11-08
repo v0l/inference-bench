@@ -129,3 +129,215 @@ with compressed-tensors' own `unpack_fp4_from_uint8` and `dequantize`, in f32.
 `tests/nvfp4.rs` loads the same layers through `Checkpoint::layer` (so through the gate/up
 interleave and the qkv/z fusion) and matches all 304,128 values bit for bit. Swapping the
 nibble order fails it (4,804 of the first 5,120 values differ).
+
+## Kernels
+
+`templates/fp4.cu`, rendered only when `[mlp] quant = "nvfp4_g16"`:
+
+- **Decode GEMV** (`gate_up_act_f4`, `down_proj_f4`). One warp per output row; each lane
+  streams one 16-column group (8 bytes, `ld.global.nc.L1::no_allocate`) and its e4m3 scale per
+  step, decodes e2m1 with two integer ops and a multiply, and applies `1 / weight_global_scale`
+  once per row. The normalised input sits in shared memory transposed by group
+  (`xt[c % 16][c / 16]`), so the 32 lanes of a warp read 32 consecutive floats for each nibble
+  position and the shared loads are conflict free. The gate/up kernel writes the SwiGLU output in
+  the same transposed order, which is what `down_proj_f4` reads.
+- **Prefill GEMM, two paths.**
+  - Default: `gemm_f4w`, the bf16 tensor-core GEMM with NVFP4 weight tiles. A 64-wide k tile of
+    a weight row is 32 packed bytes plus its 4 group scales (one 48-byte smem row). Each
+    fragment is decoded straight to bf16 (`e2m1 * e4m3` is exact in bf16) and run through
+    `mma.m16n8k16.bf16` against the hi/lo split activations, so the result is exact to the
+    dequantised weights. The global scale is applied in the epilogue.
+  - `SPECRT_FP4_ACT=1`: `gemm_f4a`, native
+    `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64...e2m1.e2m1.f32.ue4m3`.
+    `quant_rows_fp4` quantises each activation row per 16-column group the way vLLM's
+    `scaled_fp4_quant` does (`sx = e4m3(input_global_scale * amax / 6)`, `cvt.rn.satfinite.e2m1x2`),
+    and the GEMM multiplies by `alpha = 1 / (weight_global_scale * input_global_scale)` at the
+    end. Scales sit in smem next to their row (a 128-wide k tile is 64 packed bytes plus 8 scale
+    bytes per row); each thread hands the mma its row's four scale bytes as one 32-bit operand.
+    This is the same per-row, per-16 scale layout CUTLASS uses before vLLM's
+    `swizzle_blockscale` reorders it into 128 x 4 tiles for TMA; with plain `ld.shared` there is
+    no need for the swizzle.
+- The block-scaled mma is refused by ptxas for `sm_120` and accepted for `sm_120a` and
+  `sm_120f`. NVRTC 13.2 compiles it for `compute_120a`, so `Jit` switches a module to
+  `compute_120a` when it has the native kernels (`Module::arch_features`) and otherwise keeps
+  `compute_120`. A one-warp probe of the fragment layout (random e2m1 and e4m3 inputs against a
+  CPU dot product) matched exactly.
+
+## Correctness
+
+| check | fixture | result |
+|---|---|---|
+| tiny NVFP4 (`tiny-qwen3.5-nvfp4`, `reference.py tiny-nvfp4`: layers 0 and 1 NVFP4 MLPs, layer 2 FP8 channel, everything else FP8 channel or bf16, the real checkpoint's mix in small) | decode 32 tokens, per layer | max abs 4e-6 against transformers on the dequantised weights |
+| same | chunked prefill 1,024 tokens | layers 7e-5, logits 5e-5, state 1.2e-5, every tile shape (`SPECRT_TILE=big/small/narrow`) |
+| same | logits and 64 greedy tokens | 3.8e-5, greedy identical |
+| same | batch 4 decode against single | identical |
+| same, native fp4 (`SPECRT_FP4_ACT=1`) | 1,024-token prefill against a reference that quantises MLP inputs like vLLM | layer 0 rms 0.0028 against the 0.097 the activation quantisation itself costs; logits rms 0.019 against 0.127 |
+| real 27B, first 4 layers (`reference.py real-slice`) | 64-token prefill and 64 decode steps | per-layer max error / max abs at most 2.5e-5, logits 1e-5, decode 8e-7, top-1 64/64 |
+| real 27B, all 64 layers (`real_27b_per_layer_trace_matches_the_cpu_oracle`) | 64-token prefill, per layer | at most 6.7e-5 relative on every layer |
+
+Mutation checks: flipping the e2m1 sign bit in the GPU decode fails the tiny decode, prefill
+and logits tests; scaling `alpha` by 1.1 fails the native test (layer 0 rms 0.22).
+
+### Whole model against the CPU oracle
+
+`reference.py real-full orcarouter/Qwen3.8-27B-Uncensored-NVFP4` now reads compressed-tensors
+checkpoints: it dequantises with the same formulas as compressed-tensors (bit for bit, above)
+and, with `act`, quantises every MLP input to NVFP4 with the checkpoint's `input_global_scale`
+and every FP8 projection input per token, which is what vLLM does on this checkpoint. Same 5
+prompts of 64 tokens and 32 greedy tokens as the FP8 run (`tests/real27b.rs`,
+`SPECRT_27B_SPEC=qwen3.8-27b-nvfp4`). 131 s per reference on 16 threads.
+
+| path | logits max error / max abs vs its own reference | KL(weight-only reference \|\| ours) | top-1 vs weight-only | greedy, 32 x 5 |
+|---|---|---|---|---|
+| default (NVFP4 weights dequantised in the GEMM, f32 activations) | 1.8e-3 | 1.2e-9 | 100% | identical on all 5 |
+| `SPECRT_FP4_ACT=1 SPECRT_FP8_ACT=1` (native fp4 MLPs, native FP8 projections, dynamic activations) | 0.44 against the act reference | 0.0093 | 97.1% | 4 of 5; the fifth flips at step 6 |
+| the act reference itself, for scale | 0.22 from weight-only | 0.0105 | 97.3% | |
+
+The envelope here is what quantising the activations costs, measured on the real checkpoint:
+KL 0.0105 and 97.3% top-1 between the weight-only and activation-quantised oracles. The native
+path sits inside it (KL 0.0093, top-1 97.1%) and the test requires KL within 1.5x and top-1
+within 2 points. Its max error against the act oracle (0.44) is larger than the gap between the
+oracles because the two quantise the same values from slightly different inputs (bf16 hi/lo
+planes against f32), and a group whose amax lands on an e4m3 or e2m1 rounding boundary flips a
+whole step; that grows through 64 layers, so the max is a poor gate and KL and top-1 are used.
+One known difference: `SPECRT_FP8_ACT` quantises FP8 projection inputs per 128 columns (the
+scheme of the block-128 checkpoint), while this checkpoint and the oracle use one scale per
+token. Per 128 is the finer of the two, so it is not a source of extra error.
+
+### Against vLLM
+
+`scripts/vllm_logprobs.py out` sends 20 prompts (the 5 above plus 15 short ones: code, SQL,
+maths, prose, translation) to the live vLLM (`local-llm.service`, this checkpoint, MTP on) and
+records 64 greedy tokens and the top-20 logprobs at each of them. `real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs`
+runs specrt on the same prompts, then teacher-forces vLLM's tokens and computes KL(vLLM ||
+specrt) on vLLM's top-20 plus one bucket for the rest.
+
+| | specrt default | specrt native fp4 + fp8 | vLLM against itself, two runs |
+|---|---|---|---|
+| teacher-forced top-1 = vLLM's token | 1,236 / 1,280 (96.6%) | 1,220 / 1,280 (95.3%) | |
+| KL mean / median / p99 | 0.0097 / 0.0025 / 0.087 | 0.0137 / 0.0034 / 0.107 | |
+| greedy tokens equal to vLLM's, 20 x 64 | 494 / 1,280 | 582 / 1,280 | 913 / 1,280 |
+| greedy agreement, first 5 prompts | 138 / 320 tokens before the first divergence | 138 / 320 | 110 / 320 |
+| vLLM's own logprob margin at the first divergence | 0 to 0.63, median 0.125 | 0 to 0.375 | |
+
+The issue's "90% of tokens for 64 tokens on 5 prompts" cannot hold against vLLM here: vLLM
+does not agree with itself at that level (110 of 320 on a second run, 913 of 1,280 overall),
+because it serves this model with MTP speculation and batch-dependent kernels, so greedy
+decoding is not reproducible. Every specrt divergence is at a near tie in vLLM's own
+distribution (margin at most 0.63 nats, median 0.125). The gate in the test is therefore
+teacher-forced: top-1 at least 90% (96.6%) and mean KL at most 0.05 (0.0097). Against the CPU
+oracle, where the reference is deterministic, greedy is identical on all 5 prompts.
+
+The first attempt read `prompt_logprobs` from vLLM. On this deployment those are wrong (the
+prompt tokens sit at ranks in the tens of thousands with logprob -11 to -15, and the top-20
+mass is 1 to 5%): MTP or prefix caching corrupts prompt-side logprobs. The script reads the
+generation-side `logprobs` instead, whose top-20 hold 66 to 99% of the mass.
+
+## Memory
+
+| item | size |
+|---|---|
+| weights on the device | 23.2 GB: 22.9 GB as stored in the checkpoint (MTP and vision not loaded) plus 0.3 GB of FP8 channel scales |
+| device memory, 8k context, one sequence | 24.3 to 25.4 GB |
+| load | 5.0 to 5.5 s to upload, 14 s with a cold JIT |
+| peak host RSS | 5.3 to 5.5 GB |
+
+The FP8 per-channel scales use #334's row map with each row's single scale repeated 40 times
+in its own grid row (0.3 GB), so the existing FP8 kernels read them unchanged.
+
+## Speed
+
+All on the shared GPU: vLLM serving at 92 to 100% utilisation and the card at its 300 W cap
+the whole time, max context 8,192, 128 new tokens, medians of 3, two rounds
+(`scripts/bench27b-nvfp4.sh`). Indicative, as the FP8 numbers in `specrt-27b.md` were.
+
+Memory bandwidth on this card (`scripts/bandwidth.cu`, 2 GiB, best of 10): a streaming read
+reaches 1,640 to 1,660 GB/s even beside vLLM, a copy 800 to 1,360 GB/s (read plus write).
+
+### Single stream
+
+| prompt | prefill, default | prefill, native fp4 + fp8 | decode, default | decode, native |
+|---|---|---|---|---|
+| 128 | 493 to 588 tok/s | 1,242 to 1,420 | 24.3 to 25.6 tok/s | 23.9 to 28.9 |
+| 1,024 | 663 to 757 | 1,875 to 1,926 | 26.6 to 27.5 | 27.7 to 28.5 |
+| 4,096 | 728 to 783 | 1,643 to 1,830 | 25.1 | 23.3 to 25.4 |
+
+Against the FP8 checkpoint under the same sharing (`specrt-27b.md`): decode goes from 21 to 24
+tok/s to 24 to 29, prefill on the native path from 1,062 to 1,308 tok/s to 1,240 to 1,930.
+vLLM's logged single-request prefill median is 1,782 tok/s; specrt's native path is at or above
+that at 1k tokens.
+
+### Prefill GEMM, per call (`nsys`, 1,024-token prompt)
+
+| kernel | default (dequant to bf16) | native | rate |
+|---|---|---|---|
+| NVFP4 `gate_up`, 1024 x 34816 x 5120 | 8.4 ms | 1.16 ms | 44 vs 315 TFLOP/s |
+| NVFP4 `down`, 1024 x 5120 x 17408 | 4.7 ms | 0.61 ms | 39 vs 299 TFLOP/s |
+| FP8 `gate_up` (layers 56 to 63) | 10.1 ms | 4.9 ms | 36 vs 74 |
+| FP8 `lin_in` | 4.6 ms | 0.95 ms | |
+
+The native fp4 mma is 7x the dequant path. With it the MLPs are 32% of prefill time and the FP8
+projections (`lin_in`, `lin_out`, `o`, `qkv`) another 37%.
+
+### Decode GEMV bandwidth (`nsys` with graph node tracing, 128-token prompt)
+
+| kernel | bytes | median | GB/s |
+|---|---|---|---|
+| `gate_up_act_f4` (NVFP4) | 100 MB | 91 us | 1,104 |
+| `down_proj_f4` (NVFP4) | 50 MB | 43 us | 1,161 |
+| `gate_up_act` (FP8, layers 56 to 63) | 178 MB | 135 us | 1,325 |
+| `down_proj` (FP8) | 89 MB | 65 us | 1,373 |
+| `lin_in_norm` (FP8) | 84 MB | 78 us | 1,081 |
+| `qkv_proj_norm` (FP8) | 73 MB | 71 us | 1,029 |
+| `lin_out_proj`, `o_proj` (FP8) | 31 MB | 26 us | 1,220 |
+| `lm_head_norm` (bf16) | 2.54 GB | 2.7 ms | 929 |
+
+Decode reads 21.3 GB per token. The GEMVs take 19.7 ms of it, 1,081 GB/s on average: 66% of
+the 1,640 GB/s read ceiling measured beside vLLM, against the issue's target of 80%. GEMVs are
+88% of decode kernel time. The NVFP4 GEMVs (about 67% of the ceiling) lag the FP8 ones (80% to
+84%) and the bf16 `lm_head` is the slowest per byte (57%). A 16-byte-per-lane variant of the
+fp4 GEMV (two groups per load) measured worse (107 us for gate/up) and was not kept.
+
+At 1,081 GB/s, 21.3 GB per token is a 19.7 ms floor, about 50 tok/s; specrt measures 24 to 29.
+The rest is per-token overhead outside the GEMVs (48 `gdn_step` launches, small norms, the
+attention layers) and the sharing: each kernel here ran beside vLLM's own.
+
+### Batched decode (native prefill, 128-token prompts, `bench ... 128 128 N`)
+
+| batch | aggregate | per sequence | vLLM at that many running (with MTP) |
+|---|---|---|---|
+| 4 | 52.3 tok/s | 13.1 | 362 |
+| 8 | 98.7 to 104.3 | 12.3 to 13.0 | 512 |
+| 16 | 172.6 | 10.8 | 796 |
+
+Batched decode goes through the prefill GEMMs with the tiny tile (`gate_up_f4w_tiny` 251 us,
+`down_f4w_tiny` 224 us per call at batch 8). Those read the weights once per 16 rows but
+achieve only about 400 GB/s, so batch 8 is 4x single stream, not 8x. A batched GEMV that
+shares one weight read across the rows, or the native fp4 mma at m = 16, is the next step for
+aggregate throughput; it is #361. The bandwidth gap is #362.
+
+## Commands
+
+```
+cd crates/specrt
+PY=~/.venv-vllm/bin/python
+$PY scripts/reference.py nvfp4-dequant out
+cargo test --release --test nvfp4 -- --ignored
+$PY scripts/reference.py tiny-nvfp4 tests/fixtures/tiny-qwen3.5-nvfp4 out
+cargo test --release --test linear nvfp4 -- --include-ignored
+cargo test --release --test fp4_act -- --ignored
+$PY scripts/reference.py real-slice orcarouter/Qwen3.8-27B-Uncensored-NVFP4 out/qwen3.8-27b-nvfp4-slice out 4 32768
+cargo test --release --test real27b real_27b_nvfp4_first_layers -- --ignored
+# whole model, GPU steps under flock /tmp/gpu27.lock with 36 GB free
+export SPECRT_27B_SPEC=qwen3.8-27b-nvfp4
+$PY scripts/reference.py real-prompts orcarouter/Qwen3.8-27B-Uncensored-NVFP4 out
+cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored
+SPECRT_FP4_ACT=1 SPECRT_FP8_ACT=1 cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored
+$PY scripts/reference.py real-full orcarouter/Qwen3.8-27B-Uncensored-NVFP4 out out/real27b-specrt-weight.json
+$PY scripts/reference.py real-full orcarouter/Qwen3.8-27B-Uncensored-NVFP4 out out/real27b-specrt-weight.json act
+cargo test --release --test real27b real_27b_greedy_and_logits_match -- --ignored
+cargo test --release --test real27b real_27b_per_layer_trace -- --ignored
+$PY scripts/vllm_logprobs.py out
+cargo test --release --test real27b real_27b_nvfp4_agrees_with_vllm -- --ignored
+./scripts/bench27b-nvfp4.sh
+```
