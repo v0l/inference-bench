@@ -451,6 +451,17 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
 #pragma unroll
             for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
     int last_row = max(tokens - 1, 0);
+    unsigned srow0[BYTES ? NJ : 1], srow1[BYTES ? NJ : 1];
+    if (BYTES) {
+#pragma unroll
+        for (int j = 0; j < NJ; j++) {
+            int col = n0 + wn * TN + j * 8 + 2 * t;
+            int c0 = min(col, N - 1);
+            int c1 = min(col + 1, N - 1);
+            srow0[j] = WF == WF_FP8 ? __float_as_uint(__ldg(scales + c0)) : (unsigned)c0 * (K / GROUP_K);
+            srow1[j] = WF == WF_FP8 ? __float_as_uint(__ldg(scales + c1)) : (unsigned)c1 * (K / GROUP_K);
+        }
+    }
     auto load_stage = [&](int buf, int kt) {
         unsigned char* base = gemm_smem + buf * STAGE_BYTES;
 #pragma unroll
@@ -508,15 +519,9 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
             s0[j] = 1.0f;
             s1[j] = 1.0f;
             if (BYTES) {
-                int col = n0 + wn * TN + j * 8 + 2 * t;
                 int group = kt * BK / GROUP_K;
-                if (WF == WF_FP8) {
-                    s0[j] = fp8_row_scales(scales, min(col, N - 1))[group];
-                    s1[j] = fp8_row_scales(scales, min(col + 1, N - 1))[group];
-                } else {
-                    s0[j] = scales[(size_t)min(col, N - 1) * (K / GROUP_K) + group];
-                    s1[j] = scales[(size_t)min(col + 1, N - 1) * (K / GROUP_K) + group];
-                }
+                s0[j] = scales[srow0[j] + group];
+                s1[j] = scales[srow1[j] + group];
             }
         }
 #pragma unroll
@@ -727,6 +732,13 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
 #pragma unroll
             for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
     int last_row = max(tokens - 1, 0);
+    unsigned srow0[NJ], srow1[NJ];
+#pragma unroll
+    for (int j = 0; j < NJ; j++) {
+        int col = n0 + wn * TN + j * 8 + 2 * t;
+        srow0[j] = __float_as_uint(__ldg(wscale + min(col, N - 1)));
+        srow1[j] = __float_as_uint(__ldg(wscale + min(col + 1, N - 1)));
+    }
     auto load_stage = [&](int buf, int kt) {
         unsigned char* as = gemm_smem + buf * STAGE_BYTES;
         unsigned char* ws = as + BM * ROW;
@@ -765,9 +777,8 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
         float sw0[NJ], sw1[NJ], sa[MI][2];
 #pragma unroll
         for (int j = 0; j < NJ; j++) {
-            int col = n0 + wn * TN + j * 8 + 2 * t;
-            sw0[j] = fp8_row_scales(wscale, min(col, N - 1))[kt];
-            sw1[j] = fp8_row_scales(wscale, min(col + 1, N - 1))[kt];
+            sw0[j] = wscale[srow0[j] + kt];
+            sw1[j] = wscale[srow1[j] + kt];
         }
 #pragma unroll
         for (int i = 0; i < MI; i++)
