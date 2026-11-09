@@ -16,7 +16,7 @@ both engines (FlashInfer builds `Arch = Sm120` for both).
 Every specrt number below was taken beside the live vLLM at 92 to 100 percent utilisation and
 the 300 W cap. vLLM's numbers are its own 10 s journal averages over real traffic. Neither is a
 clean benchmark, so per-kernel `nsys` times are the only fair comparison, and vLLM has none yet
-(see "Missing measurements").
+(see "Measured").
 
 ## What vLLM runs for this model
 
@@ -210,13 +210,132 @@ writes a TMA GEMV.
   quantises activations.
 - Start-up: 5 to 14 s against vLLM's 153 to 185 s (`docs/vllm-jit-warmup-review.md`).
 
-## Missing measurements
+## Measured
 
-There is no per-kernel profile of vLLM on this model, and every specrt number is taken beside a
-vLLM at 100 percent. The single-stream wall clock (43 ms per plain token) is twice the kernel sum
-(21.8 ms), and no number says how much of that is time-slicing with vLLM. A per-kernel `nsys` of
-an isolated vLLM on the same card, beside the served one, under the same sharing as specrt's
-profiles, is the first item: it turns most of the guesses above into numbers.
+#413, 2026-11-09 15:05 to 16:10. Both engines ran in one window beside the served vLLM (92 to 100
+percent utilisation, 42 GB free, 0 errors in `journalctl -u local-llm.service` for the window).
+The isolated vLLM 0.27.1 ran one after the other with specrt (not interleaved) under
+`systemd-run -p MemoryMax=24G -p MemorySwapMax=0`, `nsys profile --cuda-graph-trace=node`, and
+was stopped after each run. It differs from the served command in `--max-model-len 8192`,
+`--max-num-seqs 8`, `--kv-cache-memory-bytes 3G`, `--gpu-memory-utilization 0.38` (0.75 does not
+fit beside the served one), `--skip-mm-profiling --mm-processor-cache-gb 0
+--safetensors-load-strategy lazy` (without them the 24 GB cgroup OOM-killed it), and no parsers,
+middleware or prompt-detail flags. Requests were greedy, 128-token prompts, 64 new tokens.
+specrt is `qwen3.8-27b-nvfp4-act.toml` (`act`) and `qwen3.8-27b-nvfp4.toml` (`default`),
+three runs per `bench`.
+
+```
+flock /tmp/gpu27.lock env MTP=on  crates/specrt/scripts/vllm27b-nsys.sh vllm
+flock /tmp/gpu27.lock env MTP=off crates/specrt/scripts/vllm27b-nsys.sh vllm
+flock /tmp/gpu27.lock crates/specrt/scripts/vllm27b-nsys.sh specrt
+python3 crates/specrt/scripts/nsys_steps.py crates/specrt/out/nsys413/<run>.sqlite <steps>
+python3 crates/specrt/scripts/nsys_grid.py  crates/specrt/out/nsys413/<run>.sqlite
+```
+
+vLLM's FlashInfer GEMMs all show as `device_kernel`, so they are told apart by grid and by the
+e2m1 or e4m3 element type in the demangled name. Times are medians over all calls, with the 10th
+percentile beside it: both engines share the GPU, so some calls run at half speed while the
+served vLLM holds a time slice, and the p10 is the unshared time. Bytes and the specrt names are
+from `docs/specrt-nvfp4.md`.
+
+### Decode kernels, batch 1, plain (MTP off), per call
+
+| kernel | bytes | calls per token | vLLM med / p10 | specrt med / p10 | GB/s at p10, vLLM / specrt |
+|---|---|---|---|---|---|
+| NVFP4 `gate_up` (vLLM grid 1x188, `gate_up_act_f4`) | 100 MB | 56 | 67.1 / 66.2 us | 80.8 / 71.5 us | 1,510 / 1,399 |
+| NVFP4 `down` (1x40, `down_proj_f4`) | 50 MB | 56 | 40.7 / 39.6 | 43.7 / 38.9 | 1,263 / 1,285 |
+| FP8 `lin_in` (1x256, `lin_in_norm`) | 84 MB | 48 | 57.2 / 56.5 | 78.9 / 70.5 | 1,487 / 1,191 |
+| FP8 `qkv` (1x224, `qkv_proj_norm`) | 73 MB | 16 | 51.7 / 51.2 | 72.2 / 64.7 | 1,426 / 1,128 |
+| FP8 `lin_out`, `o` (1x80, `lin_out_proj`) | 31 MB | 64 | 24.1 / 23.6 | 25.7 / 24.1 | 1,314 / 1,286 |
+| FP8 `gate_up` layers 56 to 63 (1x544, `gate_up_act`) | 178 MB | 8 | 117.5 / 116.0 | 138.0 / 128.4 | 1,534 / 1,386 |
+| FP8 `down` layers 56 to 63 (`down_proj`) | 89 MB | 8 | 61.8 / 60.6 | 66.6 / 62.0 | 1,469 / 1,435 |
+| bf16 `lm_head` (`cutlass_80_wmma` 8x1940, `lm_head_norm`) | 2.54 GB | 1 | 4,130 / 1,990 | 4,185 / 1,763 | 1,276 / 1,441 |
+| delta-net step (`fused_recurrent_..._packed_decode`, `gdn_step`) | 6.3 MB state read and write | 48 | 7.3 / 6.9 | 9.0 / 8.0 | 911 / 786 |
+| conv1d update (`_causal_conv1d_update`, `gdn_conv_step`) | small | 48 | 2.3 | 2.6 | |
+| decode attention (`BatchPrefillWithPagedKV`, `attention_split`) | small | 16 | 10.9 | 11.6 | |
+
+The `lm_head` median is bimodal in both engines (about 2.0 and 4.1 ms): the slow half is the
+time slice. `gdn_step` against its floor: 6.3 MB per layer at 1,640 GB/s is 3.8 us, so 0.18 ms
+per token over 48 layers. specrt is at 0.43 ms (2.3x, p10 2.0x), vLLM at 0.35 ms (1.8x). At
+batch 8 specrt's step is 27.5 us against vLLM's 24.0 and a nominal floor of 30.7 us (vLLM is under
+it, so part of the state is served from L2).
+
+Batched rows (vLLM runs the same CUTLASS kernel for 1 to 24 rows; specrt's batched kernels,
+medians): `gate_up` at 4 or 8 rows 67.6 us against specrt `gate_up_f4b8` 102.8 and 103.6 us (1.5x);
+`down` 48.8 (p10 40.4) against 51.8 and 52.8; `lin_in` 58.7 against 72.1 and 74.4. At the 12 and
+24 verify rows of MTP at batch 4 and 8, vLLM's `gate_up` stays at 67.6 us and specrt's
+`gate_up_f4b8` is 104 us.
+
+### Per token, plain decode, batch 1, wall clock against kernel sum
+
+| | vLLM | specrt |
+|---|---|---|
+| wall per token (no nsys) | 36.4 ms (27.5 tok/s) | 34.0 ms (29.4 tok/s) |
+| kernels per token | 1,247 | 467 |
+| kernel sum, median x calls | 19.4 ms (p10 16.9) | 21.1 ms (p10 17.0) |
+| kernel sum, mean x calls | 31.0 ms | 34.2 ms |
+| gaps between kernels, 20 us and over | 4.9 ms | 0.5 ms |
+| gaps under 20 us | 0.4 ms | 0.1 ms |
+| kernels under 20 us | 988 calls, 2.9 ms | 206 calls, 1.4 ms |
+
+The 43 ms against 21.8 ms of #363 is time slicing: the mean kernel sum is 11.6 ms (vLLM) and 13.1
+ms (specrt) above the median one, and the launch gaps are 0.6 ms for specrt. vLLM's graph has
+2.7x the nodes and 10x the large gaps. Beside the served vLLM both engines decode a plain token
+in 34 to 36 ms, and their unshared kernel sums are level (16.9 against 17.0 ms).
+
+### Speculative decode (MTP, k = 2)
+
+| | vLLM | specrt `act` |
+|---|---|---|
+| tokens per second, batch 1, MTP off / on | 27.5 / 37.6 to 47.0 (1.4x to 1.7x, four runs) | 22.5 to 23.3 / 27.8 to 28.0 (1.2x) |
+| batch 4 aggregate, off / on | 96.1 / 144.8 (1.51x) | 83.6 / 98.3 (1.18x) |
+| batch 8 aggregate, off / on | 157.6 to 186.8 / 123.8 to 152.2 (0.8x) | 129.1 / 148.6 (1.15x) |
+| mean acceptance length | 2.65 (632 drafts, 1,040 accepted of 1,264) | 2.37 to 2.38 |
+| round at batch 1: wall | 52 ms | 84 ms |
+| round: kernel median sum / mean sum | 28.6 / 42.7 ms | 29.7 / 51.6 ms |
+| round: idle gaps of 20 us and over | 8.2 ms | 34.4 ms |
+| kernels per round | 1,559 | 918 |
+
+specrt's round is 41 percent idle (host synchronisation after each upload and the accept
+readback, #401). vLLM's own MTP loses at batch 8 (0.81x), the same as specrt's `default` spec
+(125.2 against 141.5). A round spends 3.1 `lm_head` calls (1.74 ms each, p10 1.67) and
+`spec_accept` 0.7 to 1.0 ms.
+
+### Prefill, 1,024 tokens, per call (p10)
+
+| GEMM | FLOP | vLLM | specrt | vLLM / specrt TFLOP/s |
+|---|---|---|---|---|
+| NVFP4 `gate_up` | 365 G | 504 us (med 576) | 1,184 us (med 1,496) | 724 / 308 |
+| NVFP4 `down` | 182 G | 187 (211) | 598 (617) | 976 / 305 |
+| FP8 `lin_in` | 172 G | 408 (489) | 939 (974) | 421 / 183 |
+| FP8 `lin_out` | 64 G | 142 (152) | 409 (427) | 454 / 157 |
+| FP8 `qkv` | 150 G | 343 (412) | 840 (869) | 438 / 179 |
+| FP8 `gate_up` | 365 G | 891 (1,017) | 2,949 (5,090) | 410 / 124 |
+
+Per request, kernel time as median x calls, including the one decode step of the 2-token
+request: 1,024 tokens vLLM 166 ms (linears and head 140, delta-net 11, attention 3) against specrt
+`act` 360 ms (291, 47, 11); 4,096 tokens vLLM 518 ms (412, 42, 29) against 2,058 ms (1,638, 213,
+161). Request wall for vLLM: 293 ms and 988 ms (MTP off), 328 and 1,041 ms (MTP on), about 4,000
+and 4,300 tok/s once one decode step is taken off. specrt `bench` prefill: `act` 1,864 and 1,808
+tok/s, `default` 649 and 750 tok/s. The FLA delta-net kernels (`chunk_scaled_dot_kkt`,
+`merge_16x16_to_64x64_inverse`, `recompute_w_u`, `chunk_fwd_kernel_h`, `chunk_fwd_kernel_o`) take
+10.7 and 41.6 ms against specrt's `gdn_chunk_prep` and `gdn_chunk_scan` family at 46.6 and 212.9.
+Attention at 4,096 tokens: vLLM `BatchPrefillWithPagedKV` 29 ms, specrt `flash_mma` 161 ms.
+
+### What it decides
+
+- Decode GEMVs: vLLM's best reach 1,510 GB/s (92 percent of the 1,640 ceiling). specrt is level
+  on `down` and `lm_head` and 7 to 21 percent behind on `gate_up`, `lin_in` and `qkv`. Matching
+  vLLM on those is about 1.2 ms per token (6 percent), less the separate norm kernel vLLM still
+  runs (5.3 us x 57).
+- Launch gaps in plain decode are 0.6 ms per token for specrt: PDL (#417) cannot reach 3 percent
+  at batch 1.
+- The speculative round is where the wall clock goes: 34 ms of 84 ms is idle. A round at the
+  kernel mean sum plus a little is 52 to 55 ms, which is vLLM's round (#401).
+- The delta-net decode grid (#418) is worth 0.08 ms per token at batch 1 and 0.17 ms at batch
+  8 (0.5 percent). The prefill half is 4x to 5x.
+- NVFP4 and FP8 prefill GEMMs are 2x to 3x slower per call than vLLM's CUTLASS at 1,024 tokens;
+  the NVFP4 ones are not covered by #416.
 
 ## Ranked ports
 
