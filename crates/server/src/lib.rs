@@ -7,6 +7,7 @@ pub mod gpu;
 pub mod manager;
 pub mod metrics;
 pub mod serve;
+pub mod tools;
 
 pub use app::{AppState, REQUEST_ID_HEADER, router};
 pub use config::ServerConfig;
