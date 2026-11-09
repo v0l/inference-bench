@@ -79,6 +79,8 @@ impl std::error::Error for BackendError {}
 pub struct Generation {
     pub text: String,
     pub prompt_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
     pub completion_tokens: u64,
     pub ttft_secs: f64,
     pub prefill_secs: f64,

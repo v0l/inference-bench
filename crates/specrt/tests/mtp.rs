@@ -205,7 +205,7 @@ fn scheduled_speculation_matches_single_sequence_greedy_and_counts_drafts() {
         let mut sched = Scheduler::new(GpuExecutor::new(rt).unwrap(), Config { max_num_seqs: 6, max_batched_tokens: 128, ..Config::default() });
         let ids: Vec<u64> = ps
             .iter()
-            .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: NEW, sampling: Sampling::GREEDY, stop: vec![] }).unwrap())
+            .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: NEW, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() }).unwrap())
             .collect();
         let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
         let (mut drafted, mut accepted) = (0, 0);

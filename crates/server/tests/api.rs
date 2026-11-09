@@ -40,6 +40,49 @@ fn non_streaming_chat_matches_the_openai_schema() {
 }
 
 #[test]
+fn usage_reports_cached_prompt_tokens_in_the_vllm_shape() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    let (_, body, _) = rig.post("/v1/chat/completions", None, chat("m", false));
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+    let mut streamed = chat("m", true);
+    streamed["stream_options"] = json!({"include_usage": true});
+    let (_, body, _) = rig.post("/v1/chat/completions", None, streamed);
+    assert!(body.contains("\"prompt_tokens_details\":{\"cached_tokens\":0}"), "{body}");
+    rig.stop();
+}
+
+#[test]
+fn the_cache_salt_is_the_body_salt_without_keys_and_per_key_with_keys() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    let mut body = chat("m", false);
+    body["cache_salt"] = json!("tenant");
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body.clone());
+    assert_eq!(status, 200, "{text}");
+    rig.post("/v1/chat/completions", None, chat("m", false));
+    let salts: Vec<_> = rig.stats.requests.lock().unwrap().iter().map(|r| r.cache_salt.clone().unwrap()).collect();
+    assert_eq!(salts, ["tenant", ""]);
+    rig.stop();
+
+    let rig = start(config("api_keys = [\"k1\", \"k2\"]\n[[models]]\nid='m'"), Shape::default());
+    rig.post("/v1/chat/completions", Some("k1"), chat("m", false));
+    rig.post("/v1/chat/completions", Some("k2"), chat("m", false));
+    rig.post("/v1/chat/completions", Some("k1"), body.clone());
+    let salts: Vec<_> = rig.stats.requests.lock().unwrap().iter().map(|r| r.cache_salt.clone().unwrap()).collect();
+    assert_ne!(salts[0], salts[1], "two keys never share a cache");
+    assert_ne!(salts[0], salts[2], "a body salt narrows a key further");
+    assert!(salts[2].ends_with("|tenant") && !salts[2].contains("k1"));
+    rig.stop();
+
+    let rig = start(config("api_keys = [\"k1\", \"k2\"]\nprefix_cache_share_across_keys = true\n[[models]]\nid='m'"), Shape::default());
+    rig.post("/v1/chat/completions", Some("k1"), chat("m", false));
+    rig.post("/v1/chat/completions", Some("k2"), chat("m", false));
+    let salts: Vec<_> = rig.stats.requests.lock().unwrap().iter().map(|r| r.cache_salt.clone().unwrap()).collect();
+    assert_eq!(salts[0], salts[1]);
+    rig.stop();
+}
+
+#[test]
 fn streaming_chat_emits_openai_chunks_then_done() {
     let rig = start(config("[[models]]\nid='m'"), Shape::default());
     let mut body = chat("m", true);

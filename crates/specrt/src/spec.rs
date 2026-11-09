@@ -99,7 +99,7 @@ pub struct RuntimeOptions {
     pub prefix_cache: PrefixCacheOptions,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PrefixCacheOptions {
     pub enabled: bool,
@@ -119,7 +119,7 @@ impl PrefixCacheOptions {
         *self == PrefixCacheOptions::default()
     }
 
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         let page = crate::codegen::PAGE;
         ensure!(
             self.snapshot_interval > 0 && self.snapshot_interval.is_multiple_of(page),

@@ -1,7 +1,10 @@
 use crate::codegen::PAGE;
+use crate::prefix::{self, Hash, PrefixCache, StateSnapshot};
 use crate::runtime::{DecodeRow, PrefillPart, Runtime, Sampling, SpecRow, Stepper};
+use crate::spec::PrefixCacheOptions;
 use anyhow::{Result, bail};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub type SeqId = u64;
@@ -97,6 +100,21 @@ pub trait Executor {
     fn speculate(&mut self, _rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
         bail!("this executor does not speculate")
     }
+    fn supports_prefix_cache(&self) -> bool {
+        false
+    }
+    fn hybrid(&self) -> bool {
+        false
+    }
+    fn prefix_root(&self, salt: &str) -> Hash {
+        prefix::bare_namespace(salt)
+    }
+    fn snapshot(&mut self, _slot: usize) -> Result<StateSnapshot> {
+        bail!("this executor cannot snapshot recurrent state")
+    }
+    fn restore(&mut self, _slot: usize, _state: &StateSnapshot) -> Result<()> {
+        bail!("this executor cannot restore recurrent state")
+    }
 }
 
 pub struct GpuExecutor {
@@ -181,6 +199,26 @@ impl Executor for GpuExecutor {
     fn speculate(&mut self, rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
         self.rt.speculate(rows)
     }
+
+    fn supports_prefix_cache(&self) -> bool {
+        self.rt.draft_tokens().is_none()
+    }
+
+    fn hybrid(&self) -> bool {
+        self.rt.spec().linear_layers() > 0
+    }
+
+    fn prefix_root(&self, salt: &str) -> Hash {
+        prefix::namespace(self.rt.spec(), self.rt.kv_planes(), salt)
+    }
+
+    fn snapshot(&mut self, slot: usize) -> Result<StateSnapshot> {
+        self.rt.snapshot_state(slot)
+    }
+
+    fn restore(&mut self, slot: usize, state: &StateSnapshot) -> Result<()> {
+        self.rt.restore_state(slot, state)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -190,6 +228,7 @@ pub struct Config {
     pub itl_target: Duration,
     pub reserve_blocks: Option<usize>,
     pub min_prefill_chunk: usize,
+    pub prefix_cache: PrefixCacheOptions,
 }
 
 impl Default for Config {
@@ -200,6 +239,7 @@ impl Default for Config {
             itl_target: Duration::from_millis(100),
             reserve_blocks: None,
             min_prefill_chunk: 64,
+            prefix_cache: PrefixCacheOptions::default(),
         }
     }
 }
@@ -210,6 +250,7 @@ pub struct Request {
     pub max_tokens: usize,
     pub sampling: Sampling,
     pub stop: Vec<u32>,
+    pub salt: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +265,7 @@ pub enum Event {
     Started { id: SeqId, queued: Duration },
     Token { id: SeqId, token: u32 },
     Preempted { id: SeqId },
-    Finished { id: SeqId, finish: Finish, prompt_tokens: usize, completion_tokens: usize },
+    Finished { id: SeqId, finish: Finish, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -248,6 +289,8 @@ struct Seq {
     arrived: Instant,
     admitted: u64,
     started: bool,
+    root: Hash,
+    cached: usize,
 }
 
 impl Seq {
@@ -276,6 +319,18 @@ pub struct Scheduler<E: Executor> {
     preemptions: u64,
     state_refusals: u64,
     prefill_rate: f64,
+    cache: Option<PrefixCache>,
+    prefix_queries: u64,
+    prefix_hits: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PrefixStats {
+    pub queries: u64,
+    pub hits: u64,
+    pub blocks: usize,
+    pub snapshots: usize,
+    pub snapshot_bytes: usize,
 }
 
 fn ewma(old: f64, new: f64) -> f64 {
@@ -286,6 +341,7 @@ impl<E: Executor> Scheduler<E> {
     pub fn new(exec: E, cfg: Config) -> Self {
         let pool = BlockPool::new(exec.kv_blocks());
         let free_slots = (0..exec.slots()).rev().collect();
+        let cache = (cfg.prefix_cache.enabled && exec.supports_prefix_cache()).then(|| PrefixCache::new(&cfg.prefix_cache, exec.hybrid()));
         Scheduler {
             exec,
             cfg,
@@ -298,6 +354,32 @@ impl<E: Executor> Scheduler<E> {
             preemptions: 0,
             state_refusals: 0,
             prefill_rate: 0.0,
+            cache,
+            prefix_queries: 0,
+            prefix_hits: 0,
+        }
+    }
+
+    pub fn prefix_stats(&self) -> PrefixStats {
+        let c = self.cache.as_ref();
+        PrefixStats {
+            queries: self.prefix_queries,
+            hits: self.prefix_hits,
+            blocks: c.map_or(0, |c| c.blocks()),
+            snapshots: c.map_or(0, |c| c.snapshots()),
+            snapshot_bytes: c.map_or(0, |c| c.snapshot_bytes()),
+        }
+    }
+
+    fn alloc_block(&mut self) -> Option<u32> {
+        loop {
+            if let Some(b) = self.pool.alloc() {
+                return Some(b);
+            }
+            let cache = self.cache.as_mut()?;
+            if !cache.evict_one(&mut self.pool) {
+                return None;
+            }
         }
     }
 
@@ -357,6 +439,7 @@ impl<E: Executor> Scheduler<E> {
         let id = self.next_id;
         self.next_id += 1;
         let tokens = req.prompt.clone();
+        let root = self.exec.prefix_root(&req.salt);
         self.waiting.push_back(Seq {
             id,
             req,
@@ -367,6 +450,8 @@ impl<E: Executor> Scheduler<E> {
             arrived: Instant::now(),
             admitted: 0,
             started: false,
+            root,
+            cached: 0,
         });
         Ok(id)
     }
@@ -412,7 +497,7 @@ impl<E: Executor> Scheduler<E> {
                 i += 1;
                 continue;
             }
-            match self.pool.alloc() {
+            match self.alloc_block() {
                 Some(b) => {
                     let s = &mut self.running[i];
                     s.blocks.push(b);
@@ -437,29 +522,101 @@ impl<E: Executor> Scheduler<E> {
             if self.running.len() >= cap || self.free_slots.is_empty() || planned >= budget {
                 break;
             }
-            let need = blocks_for(s.prefill_target() + 1);
+            let target = s.prefill_target();
+            let need = blocks_for(target + 1);
             let reserve = if self.running.is_empty() { 0 } else { self.reserve() };
-            if self.pool.free_count() < need + reserve {
+            let hit = match self.cache.as_mut() {
+                Some(cache) => {
+                    let hashes = prefix::block_hashes(&s.root, &s.tokens[..target]);
+                    let limit = if s.generated() == 0 { target - 1 } else { target };
+                    cache.lookup(&hashes, limit, &mut self.pool)
+                }
+                None => prefix::Hit::default(),
+            };
+            let fresh = need - hit.blocks.len();
+            while self.pool.free_count() < fresh + reserve {
+                let evicted = self.cache.as_mut().is_some_and(|c| c.evict_one(&mut self.pool));
+                if !evicted {
+                    break;
+                }
+            }
+            if self.pool.free_count() < fresh + reserve {
+                let mut held = hit.blocks;
+                self.pool.release(&mut held);
                 break;
             }
             let slot = *self.free_slots.last().expect("a free slot");
             if self.exec.acquire_state(slot).is_err() {
                 self.state_refusals += 1;
+                let mut held = hit.blocks;
+                self.pool.release(&mut held);
                 break;
             }
-            self.free_slots.pop();
             let mut s = self.waiting.pop_front().expect("front exists");
-            for _ in 0..blocks_for(s.prefill_target()) {
+            if let Some(state) = &hit.snapshot {
+                if let Err(e) = self.exec.restore(slot, state) {
+                    self.exec.release_state(slot);
+                    let mut held = hit.blocks;
+                    self.pool.release(&mut held);
+                    self.waiting.push_front(s);
+                    return Err(e);
+                }
+            }
+            self.free_slots.pop();
+            if s.generated() == 0 && self.cache.is_some() {
+                self.prefix_queries += s.req.prompt.len() as u64;
+                self.prefix_hits += hit.tokens as u64;
+            }
+            if s.generated() == 0 {
+                s.cached = hit.tokens;
+            }
+            s.computed = hit.tokens;
+            s.blocks = hit.blocks;
+            for _ in s.blocks.len()..blocks_for(target) {
                 s.blocks.push(self.pool.alloc().expect("checked free blocks"));
             }
             self.exec.set_table(slot, &s.blocks)?;
             s.slot = Some(slot);
             self.admissions += 1;
             s.admitted = self.admissions;
-            planned += s.prefill_target();
+            planned += target - s.computed;
             self.running.push(s);
         }
         Ok(())
+    }
+
+    fn cache_progress(&mut self, i: usize, final_state: bool) -> Result<()> {
+        let hybrid = self.exec.hybrid();
+        let s = &self.running[i];
+        let upto = s.computed / PAGE;
+        if self.cache.is_none() || upto == 0 {
+            return Ok(());
+        }
+        let aligned = s.computed.is_multiple_of(PAGE);
+        let at_point = if final_state {
+            aligned
+        } else {
+            self.snapshot_points(i).contains(&s.computed)
+        };
+        let hashes = prefix::block_hashes(&s.root, &s.tokens[..upto * PAGE]);
+        let blocks = s.blocks[..upto].to_vec();
+        let slot = s.slot.expect("running has a slot");
+        let cached = self.cache.as_ref().is_some_and(|c| c.has_snapshot(&hashes[upto - 1]));
+        let take = hybrid && at_point && !cached;
+        let state = if take { Some(Arc::new(self.exec.snapshot(slot)?)) } else { None };
+        let cache = self.cache.as_mut().expect("checked above");
+        if !hybrid || take {
+            cache.register(&hashes, &blocks, &mut self.pool);
+        }
+        if let Some(state) = state {
+            cache.store_snapshot(hashes[upto - 1], state);
+        }
+        Ok(())
+    }
+
+    fn snapshot_points(&self, i: usize) -> Vec<usize> {
+        let s = &self.running[i];
+        prefix::snapshot_points(s.cached, s.prefill_target(), self.cfg.prefix_cache.snapshot_interval)
     }
 
     fn apply_decode(&mut self, rows: &[(usize, DecodeRow)], next: Vec<u32>, done: &mut Vec<usize>, events: &mut Vec<Event>) {
@@ -563,7 +720,13 @@ impl<E: Executor> Scheduler<E> {
                 if s.computed >= target {
                     break;
                 }
-                let n = (target - s.computed).min(limit).min(left);
+                let mut n = (target - s.computed).min(limit).min(left);
+                if self.cache.is_some() && self.exec.hybrid() {
+                    if let Some(p) = self.snapshot_points(i).into_iter().find(|&p| p > self.running[i].computed) {
+                        n = n.min(p - self.running[i].computed);
+                    }
+                }
+                let s = &self.running[i];
                 let last = s.computed + n == target;
                 let sample = (last && s.generated() == 0).then_some((s.req.sampling, 0));
                 let slot = s.slot.expect("running has a slot");
@@ -587,6 +750,7 @@ impl<E: Executor> Scheduler<E> {
                 {
                     done.push(i);
                 }
+                self.cache_progress(i, false)?;
             }
         }
         if pending {
@@ -606,6 +770,7 @@ impl<E: Executor> Scheduler<E> {
         done.sort_unstable();
         done.dedup();
         for &i in done.iter().rev() {
+            self.cache_progress(i, true)?;
             let mut s = self.running.remove(i);
             self.release(&mut s);
             let finish = finish_of(&s);
@@ -624,7 +789,7 @@ fn finish_of(s: &Seq) -> Finish {
 
 fn finished(s: &Seq, finish: Finish) -> Event {
     let completion = s.generated() - usize::from(finish == Finish::Stop);
-    Event::Finished { id: s.id, finish, prompt_tokens: s.req.prompt.len(), completion_tokens: completion }
+    Event::Finished { id: s.id, finish, prompt_tokens: s.req.prompt.len(), completion_tokens: completion, cached_tokens: s.cached }
 }
 
 fn accept(s: &mut Seq, t: u32, max_ctx: usize, events: &mut Vec<Event>) -> bool {
@@ -663,6 +828,9 @@ mod tests {
         pub prefill_calls: Vec<usize>,
         pub state_budget: usize,
         pub states_live: std::collections::HashSet<usize>,
+        pub hybrid: bool,
+        pub prefix_enabled: bool,
+        pub restores: usize,
         pub spec_k: usize,
         pub spec_cap: usize,
         pub spec_calls: Vec<usize>,
@@ -683,6 +851,9 @@ mod tests {
                 prefill_calls: Vec::new(),
                 state_budget: usize::MAX,
                 states_live: Default::default(),
+                hybrid: true,
+                prefix_enabled: true,
+                restores: 0,
                 spec_k: 0,
                 spec_cap: 0,
                 spec_calls: Vec::new(),
@@ -694,16 +865,20 @@ mod tests {
             let block = self.tables[slot][pos / PAGE] as usize;
             self.kv[block * PAGE + pos % PAGE] = Some(t);
             let (h, n) = self.state[slot];
-            assert_eq!(n, pos, "recurrent state of slot {slot} is at {n}, write at {pos}");
-            let h = mix(h, t);
+            if self.hybrid {
+                assert_eq!(n, pos, "recurrent state of slot {slot} is at {n}, write at {pos}");
+            }
+            let h = if self.hybrid { mix(h, t) } else { 0 };
             self.state[slot] = (h, pos + 1);
             let mut check = 0u64;
             for p in 0..=pos {
                 let b = self.tables[slot][p / PAGE] as usize;
                 check = mix(check, self.kv[b * PAGE + p % PAGE].expect("written KV"));
             }
-            assert_eq!(check, h, "KV through the block table disagrees with the recurrent state");
-            h
+            if self.hybrid {
+                assert_eq!(check, h, "KV through the block table disagrees with the recurrent state");
+            }
+            check
         }
     }
 
@@ -752,6 +927,22 @@ mod tests {
             assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
             self.decode_calls.push(rows.len());
             Ok(rows.iter().map(|r| next_token(self.write(r.slot, r.pos, r.token))).collect())
+        }
+        fn supports_prefix_cache(&self) -> bool {
+            self.prefix_enabled
+        }
+        fn hybrid(&self) -> bool {
+            self.hybrid
+        }
+        fn snapshot(&mut self, slot: usize) -> Result<StateSnapshot> {
+            let (h, n) = self.state[slot];
+            Ok(StateSnapshot { conv: Vec::new(), ssm: vec![f32::from_bits(h as u32), f32::from_bits((h >> 32) as u32), f32::from_bits(n as u32)] })
+        }
+        fn restore(&mut self, slot: usize, state: &StateSnapshot) -> Result<()> {
+            let h = state.ssm[0].to_bits() as u64 | (state.ssm[1].to_bits() as u64) << 32;
+            self.state[slot] = (h, state.ssm[2].to_bits() as usize);
+            self.restores += 1;
+            Ok(())
         }
         fn draft_tokens(&self) -> usize {
             self.spec_k
@@ -810,6 +1001,7 @@ mod tests {
             max_tokens,
             sampling: Sampling::GREEDY,
             stop: Vec::new(),
+            salt: String::new(),
         }
     }
 
@@ -927,6 +1119,152 @@ mod tests {
         assert!(prefill_steps >= 40, "40k tokens in {prefill_steps} steps of at most 1020");
     }
 
+    fn cached_config(interval: usize, snapshots: usize) -> Config {
+        Config {
+            prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: interval, max_snapshots: snapshots, max_blocks: 0 },
+            ..Config::default()
+        }
+    }
+
+    fn run_one(s: &mut Scheduler<Fake>, r: Request) -> (Vec<u32>, usize, usize) {
+        let before: usize = s.exec.prefill_calls.iter().sum();
+        let id = s.submit(r).unwrap();
+        let (got, events, _) = drain(s);
+        let cached = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Finished { id: i, cached_tokens, .. } if *i == id => Some(*cached_tokens),
+                _ => None,
+            })
+            .unwrap();
+        (got.get(&id).cloned().unwrap_or_default(), cached, s.exec.prefill_calls.iter().sum::<usize>() - before)
+    }
+
+    #[test]
+    fn a_second_request_with_a_shared_prefix_prefills_only_the_remainder_and_matches() {
+        for hybrid in [false, true] {
+            let mut fake = Fake::new(2048, 4, 200, 256);
+            fake.hybrid = hybrid;
+            let mut s = Scheduler::new(fake, cached_config(64, 4));
+            let base = request(300, 12, 1);
+            let (first, cached, prefilled) = run_one(&mut s, base.clone());
+            assert_eq!((cached, prefilled), (0, 300), "hybrid = {hybrid}");
+            assert_eq!(first, expected(&base.prompt, 12, &[]));
+            let mut longer = base.clone();
+            longer.prompt.extend((0..70u32).map(|i| (i * 13 + 5) % VOCAB));
+            let (second, cached, prefilled) = run_one(&mut s, longer.clone());
+            assert_eq!(second, expected(&longer.prompt, 12, &[]), "hybrid = {hybrid}");
+            assert_eq!(cached, 288, "hybrid = {hybrid}: the last full block of the first prompt");
+            assert_eq!(prefilled, 370 - 288, "hybrid = {hybrid}");
+            let stats = s.prefix_stats();
+            assert_eq!((stats.queries, stats.hits), (300 + 370, 288));
+            let (again, cached, _) = run_one(&mut s, longer.clone());
+            assert_eq!(again, second);
+            assert_eq!(cached, 368, "an identical prompt hits all but its last token's block");
+            assert_eq!(s.blocks_used(), s.prefix_stats().blocks, "only the cache holds blocks when idle");
+        }
+    }
+
+    #[test]
+    fn the_next_chat_turn_hits_the_previous_request_to_the_last_block_that_has_state() {
+        for (hybrid, want) in [(false, 176), (true, 144)] {
+            let mut fake = Fake::new(2048, 4, 200, 256);
+            fake.hybrid = hybrid;
+            let mut s = Scheduler::new(fake, cached_config(512, 4));
+            let first = request(150, 40, 3);
+            let (out, _, _) = run_one(&mut s, first.clone());
+            let mut turn2 = first.clone();
+            turn2.prompt.extend(&out);
+            turn2.prompt.extend((0..30u32).map(|i| (i * 7 + 1) % VOCAB));
+            let (got, cached, prefilled) = run_one(&mut s, turn2.clone());
+            assert_eq!(got, expected(&turn2.prompt, 40, &[]), "hybrid = {hybrid}");
+            assert_eq!(cached, want, "hybrid = {hybrid}: plain models reach the generated tokens, hybrids the last prefill block");
+            assert_eq!(prefilled, turn2.prompt.len() - want);
+        }
+    }
+
+    #[test]
+    fn a_hybrid_hit_restores_the_snapshot_and_a_plain_model_needs_none() {
+        let mut s = Scheduler::new(Fake::new(2048, 4, 200, 256), cached_config(128, 4));
+        run_one(&mut s, request(300, 4, 2));
+        assert!(s.prefix_stats().snapshots >= 2, "interval points and the end of the request");
+        let before = s.exec.restores;
+        let (_, cached, _) = run_one(&mut s, request(300, 4, 2));
+        assert!(cached > 0);
+        assert_eq!(s.exec.restores, before + 1);
+        let mut plain = Fake::new(2048, 4, 200, 256);
+        plain.hybrid = false;
+        let mut s = Scheduler::new(plain, cached_config(128, 4));
+        run_one(&mut s, request(300, 4, 2));
+        assert_eq!(s.prefix_stats().snapshots, 0);
+        let (_, cached, _) = run_one(&mut s, request(300, 4, 2));
+        assert!(cached > 0);
+        assert_eq!(s.exec.restores, 0);
+    }
+
+    #[test]
+    fn prefill_stops_at_the_snapshot_interval_and_the_cache_is_off_by_default() {
+        let mut s = Scheduler::new(Fake::new(2048, 4, 200, 1024), cached_config(128, 8));
+        run_one(&mut s, request(400, 2, 5));
+        assert_eq!(&s.exec.prefill_calls[..4], &[128, 128, 128, 16]);
+        let mut off = Scheduler::new(Fake::new(2048, 4, 200, 1024), Config::default());
+        run_one(&mut off, request(400, 2, 5));
+        let (_, cached, prefilled) = run_one(&mut off, request(400, 2, 5));
+        assert_eq!((cached, prefilled), (0, 400));
+        assert_eq!(off.prefix_stats(), PrefixStats::default());
+        assert_eq!(off.blocks_used(), 0);
+    }
+
+    #[test]
+    fn different_salts_never_share_a_prefix() {
+        let mut s = Scheduler::new(Fake::new(2048, 4, 200, 256), cached_config(64, 4));
+        let a = Request { salt: "key-a".into(), ..request(200, 3, 4) };
+        run_one(&mut s, a.clone());
+        let (_, cached, _) = run_one(&mut s, Request { salt: "key-b".into(), ..a.clone() });
+        assert_eq!(cached, 0);
+        let (_, cached, _) = run_one(&mut s, a);
+        assert!(cached > 0);
+    }
+
+    #[test]
+    fn cached_blocks_are_evicted_when_new_requests_need_the_pool_and_output_stays_exact() {
+        for hybrid in [false, true] {
+            let mut fake = Fake::new(1024, 2, 40, 256);
+            fake.hybrid = hybrid;
+            let mut s = Scheduler::new(fake, cached_config(64, 4));
+            for q in 0..12u32 {
+                let r = request(200, 20, q);
+                let (got, _, _) = run_one(&mut s, r.clone());
+                assert_eq!(got, expected(&r.prompt, 20, &[]), "request {q}, hybrid = {hybrid}");
+                assert!(s.prefix_stats().blocks <= 40);
+            }
+            assert!(s.prefix_stats().blocks > 0);
+            let (_, cached, _) = run_one(&mut s, request(200, 20, 11));
+            assert!(cached > 0, "the most recent prompt survived");
+            let (_, cached, _) = run_one(&mut s, request(200, 20, 0));
+            assert_eq!(cached, 0, "the oldest was evicted");
+        }
+    }
+
+    #[test]
+    fn concurrent_requests_with_one_shared_prefix_stay_exact_under_preemption() {
+        let mut fake = Fake::new(2048, 8, 90, 256);
+        fake.hybrid = true;
+        let cfg = Config { max_num_seqs: 8, max_batched_tokens: 512, reserve_blocks: Some(1), ..cached_config(64, 6) };
+        let mut s = Scheduler::new(fake, cfg);
+        let shared: Vec<u32> = (0..200u32).map(|i| (i * 17 + 3) % VOCAB).collect();
+        let mut want = HashMap::new();
+        for q in 0..40u32 {
+            let mut r = request(10 + (q as usize * 7) % 90, 30 + (q as usize * 11) % 100, q);
+            r.prompt = [shared.clone(), r.prompt].concat();
+            want.insert(s.submit(r.clone()).unwrap(), expected(&r.prompt, r.max_tokens, &[]));
+        }
+        let (got, _, _) = drain(&mut s);
+        assert_eq!(got, want);
+        assert!(s.prefix_stats().hits > 0);
+        assert_eq!(s.blocks_used(), s.prefix_stats().blocks);
+    }
+
     #[test]
     fn a_stop_token_ends_the_sequence_and_is_not_streamed() {
         let mut s = Scheduler::new(Fake::new(512, 2, 64, 128), Config::default());
@@ -940,7 +1278,8 @@ mod tests {
             id,
             finish: Finish::Stop,
             prompt_tokens: 10,
-            completion_tokens: got[&id].len()
+            completion_tokens: got[&id].len(),
+            cached_tokens: 0
         }));
     }
 

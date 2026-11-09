@@ -47,6 +47,13 @@ pub fn block_hashes(root: &Hash, tokens: &[u32]) -> Vec<Hash> {
         .collect()
 }
 
+pub fn bare_namespace(salt: &str) -> Hash {
+    let mut h = Sha256::new();
+    h.update((salt.len() as u64).to_le_bytes());
+    h.update(salt.as_bytes());
+    h.finalize().into()
+}
+
 pub fn snapshot_points(start: usize, prompt_len: usize, interval: usize) -> Vec<usize> {
     let last = prompt_len / PAGE * PAGE;
     let mut points: Vec<usize> = if interval == 0 { Vec::new() } else { (1..).map(|i| i * interval).take_while(|&p| p <= last).filter(|&p| p > start).collect() };
@@ -138,6 +145,10 @@ impl PrefixCache {
         }
         self.states.insert(hash, Stored { state, tick });
         true
+    }
+
+    pub fn has_block(&self, hash: &Hash) -> bool {
+        self.entries.contains_key(hash)
     }
 
     pub fn has_snapshot(&self, hash: &Hash) -> bool {

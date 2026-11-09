@@ -365,6 +365,7 @@ pub struct Runtime {
     slots: usize,
     pages: usize,
     kv_blocks: usize,
+    kv_planes: usize,
     tables: Vec<i32>,
     pub cache_hit: bool,
     pub jit_key: String,
@@ -676,6 +677,7 @@ impl Runtime {
             slots: layout.slots,
             pages,
             kv_blocks: layout.kv_blocks,
+            kv_planes: layout.kv_planes,
             tables: vec![0; (layout.slots + 1) * pages],
             sms,
             use_mma,
@@ -767,6 +769,10 @@ impl Runtime {
 
     pub fn kv_blocks(&self) -> usize {
         self.kv_blocks
+    }
+
+    pub fn kv_planes(&self) -> usize {
+        self.kv_planes
     }
 
     pub fn max_ctx(&self) -> usize {

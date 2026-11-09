@@ -395,7 +395,7 @@ fn stop_strings(body: &Value) -> Result<Vec<String>, ApiError> {
 
 const HANDLED_FIELDS: &[&str] = &[
     "model", "messages", "prompt", "prompts", "repeat", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "seed", "stop", "stream",
-    "stream_options", "ignore_eos", "tools", "tool_choice", "chat_template_kwargs", "reasoning_effort",
+    "stream_options", "ignore_eos", "tools", "tool_choice", "chat_template_kwargs", "reasoning_effort", "cache_salt",
 ];
 
 const NEUTRAL_FIELDS: &[&str] = &["user", "parallel_tool_calls", "store", "metadata"];
@@ -704,6 +704,7 @@ fn usage(g: &Generation) -> Value {
         "prompt_tokens": g.prompt_tokens,
         "completion_tokens": g.completion_tokens,
         "total_tokens": g.prompt_tokens + g.completion_tokens,
+        "prompt_tokens_details": {"cached_tokens": g.cached_tokens},
     })
 }
 
@@ -724,15 +725,36 @@ async fn collect(mut rx: mpsc::UnboundedReceiver<Gen>) -> Result<(Generation, bo
     Err(ApiError::internal("generation ended without a result"))
 }
 
-async fn chat_completions(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Result<Response, ApiError> {
-    generate_endpoint(state, body, true).await
+async fn chat_completions(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<Value>) -> Result<Response, ApiError> {
+    let salt = cache_salt(&headers, &body_salt(&body), state_shares_keys(&state));
+    generate_endpoint(state, body, true, salt).await
 }
 
-async fn completions(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Result<Response, ApiError> {
-    generate_endpoint(state, body, false).await
+async fn completions(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<Value>) -> Result<Response, ApiError> {
+    let salt = cache_salt(&headers, &body_salt(&body), state_shares_keys(&state));
+    generate_endpoint(state, body, false, salt).await
 }
 
-async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool) -> Result<Response, ApiError> {
+fn state_shares_keys(state: &AppState) -> bool {
+    state.config.prefix_cache_share_across_keys || !state.auth_required()
+}
+
+fn body_salt(body: &Value) -> String {
+    body["cache_salt"].as_str().unwrap_or_default().to_string()
+}
+
+pub fn cache_salt(headers: &HeaderMap, body_salt: &str, shared: bool) -> String {
+    use sha2::{Digest, Sha256};
+    if shared {
+        return body_salt.to_string();
+    }
+    let key = bearer(headers).unwrap_or_default();
+    let digest: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+    let tag: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("key:{tag}|{body_salt}")
+}
+
+async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: String) -> Result<Response, ApiError> {
     let p = parse_params(&state, &body, chat)?;
     state.manager.resolve(&p.model)?;
     let max_tokens = p.sampling.max_tokens;
@@ -743,6 +765,7 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool) -> Res
     request.ignore_eos = p.ignore_eos;
     request.cancel = Some(cancel);
     request.openai_messages = p.openai_messages;
+    request.cache_salt = Some(salt);
     if p.use_template {
         request.template_vars = p.template_vars;
     }

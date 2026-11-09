@@ -127,6 +127,7 @@ pub struct ServerConfig {
     pub retry_after_secs: u64,
     pub idle_unload_secs: Option<u64>,
     pub max_loaded_models: usize,
+    pub prefix_cache_share_across_keys: bool,
     pub vram_budget_bytes: Option<u64>,
     pub default_max_tokens: usize,
     pub top_k: Option<u32>,
@@ -167,6 +168,7 @@ impl Default for ServerConfig {
             retry_after_secs: 1,
             idle_unload_secs: None,
             max_loaded_models: 1,
+            prefix_cache_share_across_keys: false,
             vram_budget_bytes: None,
             default_max_tokens: 256,
             top_k: None,
@@ -274,6 +276,9 @@ impl ServerConfig {
         for m in &self.models {
             anyhow::ensure!(!m.id.is_empty(), "a model has an empty id");
             anyhow::ensure!(seen.insert(&m.id), "model {} is listed twice", m.id);
+        }
+        if let Some(r) = &self.runtime {
+            r.prefix_cache.validate()?;
         }
         if let Some(d) = &self.default_model {
             anyhow::ensure!(self.model(d).is_some(), "default_model {d} is not a configured model");
@@ -455,6 +460,18 @@ python = "python3"
         let e = ServerConfig::parse("[runtime]\ntile = \"huge\"").unwrap_err();
         assert!(format!("{e:#}").contains("huge"), "{e:#}");
         assert!(ServerConfig::parse("[runtime]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn the_prefix_cache_table_reaches_the_serving_options() {
+        let c = ServerConfig::parse("max_num_seqs = 4\n[runtime.prefix_cache]\nenabled = true\nsnapshot_interval = 1024\nmax_snapshots = 9\n[[models]]\nid='m'").unwrap();
+        let p = c.serve_options(&c.models[0]).unwrap().runtime.unwrap().prefix_cache;
+        assert!(p.enabled);
+        assert_eq!((p.snapshot_interval, p.max_snapshots, p.max_blocks), (1024, 9, 0));
+        assert!(!c.prefix_cache_share_across_keys);
+        let shared = ServerConfig::parse("prefix_cache_share_across_keys = true").unwrap();
+        assert!(shared.prefix_cache_share_across_keys);
+        assert!(ServerConfig::parse("[runtime.prefix_cache]\nsnapshot_interval = 100").is_err());
     }
 
     #[test]

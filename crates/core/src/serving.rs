@@ -28,13 +28,14 @@ impl ServingTarget {
         max_tokens: usize,
         sampling: Sampling,
         streaming: bool,
+        salt: String,
         cancel: Option<Arc<AtomicBool>>,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError> {
         let engine = self.engine()?;
         let cancel = cancel.unwrap_or_default();
         let c = engine
-            .complete(prompt, max_tokens, sampling, streaming, cancel, &mut |t| {
+            .complete(prompt, max_tokens, sampling, streaming, salt, cancel, &mut |t| {
                 on_text(t);
                 true
             })
@@ -42,6 +43,7 @@ impl ServingTarget {
         Ok(Generation {
             text: c.text,
             prompt_tokens: c.prompt_tokens as u64,
+            cached_tokens: c.cached_tokens as u64,
             completion_tokens: c.completion_tokens as u64,
             ttft_secs: c.ttft_secs,
             prefill_secs: c.ttft_secs,
@@ -77,14 +79,14 @@ impl Target for ServingTarget {
 
     fn generate(&mut self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let ids = self.engine()?.tokens(&request.prompt).map_err(|e| engine_error(&e))?;
-        self.run(ids, request.max_tokens, Sampling::GREEDY, false, None, on_text)
+        self.run(ids, request.max_tokens, Sampling::GREEDY, false, String::new(), None, on_text)
     }
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let list = request.messages_json().as_array().cloned().unwrap_or_default();
         let ids = self.engine()?.encode_messages(&list, request.template()).map_err(|e| engine_error(&e))?;
         let s = request.sampling;
-        self.run(ids, s.max_tokens, sampling(&s, self.engine()?.sampling_defaults()), !request.ignore_eos, request.cancel.clone(), on_text)
+        self.run(ids, s.max_tokens, sampling(&s, self.engine()?.sampling_defaults()), !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), on_text)
     }
 
     fn share(&self) -> Option<Box<dyn Target>> {
@@ -123,6 +125,21 @@ pub fn render(s: &Stats) -> String {
     let _ = writeln!(o, "# TYPE inference_steps_total counter\ninference_steps_total {}", s.steps);
     let _ = writeln!(
         o,
+        "# HELP inference_prefix_cache_queries_total Prompt tokens looked up in the prefix cache.\n# TYPE inference_prefix_cache_queries_total counter\ninference_prefix_cache_queries_total {}",
+        s.prefix_queries
+    );
+    let _ = writeln!(
+        o,
+        "# HELP inference_prefix_cache_hit_tokens_total Prompt tokens served from the prefix cache.\n# TYPE inference_prefix_cache_hit_tokens_total counter\ninference_prefix_cache_hit_tokens_total {}",
+        s.prefix_hits
+    );
+    let rate = if s.prefix_queries > 0 { s.prefix_hits as f64 / s.prefix_queries as f64 } else { 0.0 };
+    gauge(&mut o, "inference_prefix_cache_hit_rate", "Share of looked up prompt tokens that hit the prefix cache.", rate);
+    gauge(&mut o, "inference_prefix_cache_blocks", "KV blocks held by the prefix cache.", s.prefix_blocks as f64);
+    gauge(&mut o, "inference_prefix_cache_snapshots", "Recurrent state snapshots held by the prefix cache.", s.prefix_snapshots as f64);
+    gauge(&mut o, "inference_prefix_cache_snapshot_bytes", "Host bytes of the recurrent state snapshots.", s.prefix_snapshot_bytes as f64);
+    let _ = writeln!(
+        o,
         "# HELP inference_spec_drafted_tokens_total MTP draft tokens proposed for verification.\n# TYPE inference_spec_drafted_tokens_total counter\ninference_spec_drafted_tokens_total {}",
         s.spec_drafted
     );
@@ -145,7 +162,7 @@ mod tests {
 
     #[test]
     fn serving_stats_render_as_prometheus_text() {
-        let mut s = Stats { running: 3, waiting: 2, kv_blocks_used: 40, kv_blocks_total: 100, preemptions: 1, spec_drafted: 10, spec_accepted: 7, ..Stats::default() };
+        let mut s = Stats { running: 3, waiting: 2, kv_blocks_used: 40, kv_blocks_total: 100, preemptions: 1, spec_drafted: 10, spec_accepted: 7, prefix_queries: 200, prefix_hits: 50, ..Stats::default() };
         s.inter_token_secs.observe(0.03);
         s.inter_token_secs.observe(0.3);
         let t = render(&s);
@@ -155,6 +172,9 @@ mod tests {
             "inference_kv_blocks_used 40",
             "inference_preemptions_total 1",
             "inference_spec_drafted_tokens_total 10",
+            "inference_prefix_cache_queries_total 200",
+            "inference_prefix_cache_hit_tokens_total 50",
+            "inference_prefix_cache_hit_rate 0.25",
             "inference_spec_accepted_tokens_total 7",
             "inference_inter_token_seconds_bucket{le=\"0.035\"} 1",
             "inference_inter_token_seconds_bucket{le=\"+Inf\"} 2",

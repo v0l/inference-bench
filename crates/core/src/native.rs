@@ -153,6 +153,7 @@ fn generation(r: Reply) -> Generation {
     Generation {
         text: r.text,
         prompt_tokens: r.prompt_tokens as u64,
+        cached_tokens: 0,
         completion_tokens: r.completion_tokens as u64,
         ttft_secs: r.prefill_secs,
         prefill_secs: r.prefill_secs,

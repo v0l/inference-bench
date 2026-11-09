@@ -67,6 +67,7 @@ pub struct ChatRequest {
     pub ignore_eos: bool,
     pub openai_messages: Option<Vec<Value>>,
     pub template_vars: Value,
+    pub cache_salt: Option<String>,
 }
 
 impl ChatRequest {
@@ -85,6 +86,7 @@ impl ChatRequest {
             ignore_eos: false,
             openai_messages: None,
             template_vars: json!({"enable_thinking": false}),
+            cache_salt: None,
         }
     }
 

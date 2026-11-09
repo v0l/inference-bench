@@ -114,6 +114,11 @@ pub struct Stats {
     pub spec_drafted: u64,
     pub spec_accepted: u64,
     pub steps: u64,
+    pub prefix_queries: u64,
+    pub prefix_hits: u64,
+    pub prefix_blocks: usize,
+    pub prefix_snapshots: usize,
+    pub prefix_snapshot_bytes: usize,
     pub queue_secs: Histogram,
     pub inter_token_secs: Histogram,
     pub decode_batch: Histogram,
@@ -133,6 +138,11 @@ impl Default for Stats {
             spec_drafted: 0,
             spec_accepted: 0,
             steps: 0,
+            prefix_queries: 0,
+            prefix_hits: 0,
+            prefix_blocks: 0,
+            prefix_snapshots: 0,
+            prefix_snapshot_bytes: 0,
             queue_secs: Histogram::new(&LATENCY_BUCKETS),
             inter_token_secs: Histogram::new(&LATENCY_BUCKETS),
             decode_batch: Histogram::new(&COUNT_BUCKETS),
@@ -147,7 +157,7 @@ pub enum SeqEvent {
     Started { queued: Duration },
     Token(u32),
     Preempted,
-    Finished { finish: Finish, prompt_tokens: usize, completion_tokens: usize },
+    Finished { finish: Finish, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize },
     Failed(String),
 }
 
@@ -261,6 +271,7 @@ fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
         max_num_seqs: opts.max_num_seqs,
         max_batched_tokens: opts.max_batched_tokens,
         itl_target: opts.itl_target,
+        prefix_cache: spec.runtime.prefix_cache,
         ..Config::default()
     };
     Ok(Scheduler::new(GpuExecutor::new(rt)?, cfg))
@@ -373,8 +384,8 @@ fn run(sched: &mut Scheduler<GpuExecutor>, inbox: Receiver<Job>, stats: Arc<Mute
                     (id, SeqEvent::Token(token))
                 }
                 Event::Preempted { id } => (id, SeqEvent::Preempted),
-                Event::Finished { id, finish, prompt_tokens, completion_tokens } => {
-                    (id, SeqEvent::Finished { finish, prompt_tokens, completion_tokens })
+                Event::Finished { id, finish, prompt_tokens, completion_tokens, cached_tokens } => {
+                    (id, SeqEvent::Finished { finish, prompt_tokens, completion_tokens, cached_tokens })
                 }
             };
             let terminal = matches!(ev, SeqEvent::Finished { .. });
@@ -389,6 +400,12 @@ fn run(sched: &mut Scheduler<GpuExecutor>, inbox: Receiver<Job>, stats: Arc<Mute
         s.waiting = sched.waiting();
         s.kv_blocks_used = sched.blocks_used();
         s.preemptions = sched.preemptions();
+        let p = sched.prefix_stats();
+        s.prefix_queries = p.queries;
+        s.prefix_hits = p.hits;
+        s.prefix_blocks = p.blocks;
+        s.prefix_snapshots = p.snapshots;
+        s.prefix_snapshot_bytes = p.snapshot_bytes;
     }
 }
 
@@ -396,6 +413,7 @@ fn run(sched: &mut Scheduler<GpuExecutor>, inbox: Receiver<Job>, stats: Arc<Mute
 pub struct Completion {
     pub text: String,
     pub prompt_tokens: usize,
+    pub cached_tokens: usize,
     pub completion_tokens: usize,
     pub finish: Option<Finish>,
     pub queue_secs: f64,
@@ -453,13 +471,14 @@ impl Serving {
         max_tokens: usize,
         sampling: Sampling,
         use_stop: bool,
+        salt: String,
         cancel: Arc<AtomicBool>,
         on_text: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion> {
         let started = Instant::now();
         let (tx, rx) = channel();
         let stop = if use_stop { self.assets.stop.clone() } else { Vec::new() };
-        let request = sched::Request { prompt, max_tokens, sampling, stop };
+        let request = sched::Request { prompt, max_tokens, sampling, stop, salt };
         self.core.submit(Job { request, events: tx, cancel: cancel.clone() })?;
         let tokenizer = &self.assets.tokenizer;
         let mut out = Completion::default();
@@ -488,7 +507,8 @@ impl Serving {
                         sent = text;
                     }
                 }
-                SeqEvent::Finished { finish, prompt_tokens, completion_tokens } => {
+                SeqEvent::Finished { finish, prompt_tokens, completion_tokens, cached_tokens } => {
+                    out.cached_tokens = cached_tokens;
                     out.finish = Some(finish);
                     out.prompt_tokens = prompt_tokens;
                     out.completion_tokens = completion_tokens.min(ids.len());
