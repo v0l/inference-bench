@@ -1,5 +1,5 @@
 use crate::App;
-use crate::{block, strip};
+use crate::{block, breakdown, strip, table};
 use eframe::egui;
 use egui_bench::prelude::*;
 use inference_bench_core::library::{Format, LocalModel, human_size};
@@ -141,12 +141,20 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let Some(mut detail) = app.models.detail.take() else { return };
     let back = header(app, &mut detail, ui);
     if !back {
-        body(&mut detail, ui);
+        let free = app.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes));
+        body(&mut detail, ui, free, app.settings.gpu_bandwidth_gbs);
         app.models.detail = Some(detail);
     }
 }
 
-fn body(detail: &mut Detail, ui: &mut egui::Ui) {
+fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth: Option<u64>) {
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 8.0;
+        content(detail, ui, free, bandwidth);
+    });
+}
+
+fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth: Option<u64>) {
     let Detail { view, other, kind, layer, .. } = detail;
     let view = match view {
         Ok(v) => v,
@@ -177,6 +185,35 @@ fn body(detail: &mut Detail, ui: &mut egui::Ui) {
     let layer_for_block = layer.unwrap_or_else(|| view.anatomy.layers.iter().find(|l| l.kind == *kind).map_or(0, |l| l.index));
     section(ui, "block diagram", &block::title(*kind, *layer, &view.spec), |ui| {
         block::draw(ui, &view.spec, *kind, layer_for_block);
+    });
+    let anatomies: Vec<&specrt::anatomy::ModelAnatomy> = views.iter().map(|v| &v.anatomy).collect();
+    let totals = breakdown::max_totals(anatomies.iter().copied());
+    section(ui, "parameters and memory", "bars share one scale", |ui| {
+        for (n, v) in views.iter().enumerate() {
+            if views.len() > 1 {
+                Line::new().legend(&v.name).show(ui);
+            }
+            breakdown::bars(ui, &v.anatomy, &v.spec, totals, &format!("{n}"));
+            ui.add_space(6.0);
+        }
+    });
+    let y_max = breakdown::memory_scale(&anatomies, free);
+    section(ui, "memory against context", "weights, recurrent state and kv cache from 1k tokens to the context limit", |ui| {
+        for v in &views {
+            if views.len() > 1 {
+                Line::new().legend(&v.name).show(ui);
+            }
+            breakdown::memory_summary(ui, &v.anatomy);
+            breakdown::memory_chart(ui, &v.anatomy, y_max, free);
+        }
+    });
+    section(ui, "numbers", "every spec field and where it came from", |ui| {
+        for v in &views {
+            if views.len() > 1 {
+                Line::new().legend(&v.name).show(ui);
+            }
+            table::draw(ui, v, bandwidth);
+        }
     });
 }
 

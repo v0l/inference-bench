@@ -41,6 +41,8 @@ pub struct Settings {
     #[serde(default = "default_ctx")]
     pub specrt_ctx: usize,
     #[serde(default)]
+    pub gpu_bandwidth_gbs: Option<u64>,
+    #[serde(default)]
     pub hf_token: String,
     #[serde(default)]
     pub spec_folders: Vec<PathBuf>,
@@ -86,6 +88,7 @@ impl Default for Settings {
             model_folders: Vec::new(),
             server: ServerSettings::default(),
             specrt_ctx: default_ctx(),
+            gpu_bandwidth_gbs: None,
             hf_token: String::new(),
             spec_folders: Vec::new(),
             specs_auto_update: true,

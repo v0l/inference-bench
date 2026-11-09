@@ -126,6 +126,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             row(ui, "context", |ui| {
                 ui.add(egui::DragValue::new(&mut app.settings.specrt_ctx).range(512..=131072).speed(64));
             });
+            row(ui, "gpu bandwidth", |ui| {
+                let mut gbs = app.settings.gpu_bandwidth_gbs.unwrap_or(0);
+                if ui.add(egui::DragValue::new(&mut gbs).range(0..=10000).suffix(" GB/s")).changed() {
+                    app.settings.gpu_bandwidth_gbs = Some(gbs).filter(|g| *g > 0);
+                }
+            });
         });
         section(ui, "model folders", "searched for GGUF and safetensors, on top of the Hugging Face cache", |ui| {
             let mut remove = None;
