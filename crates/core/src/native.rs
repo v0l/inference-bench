@@ -16,7 +16,7 @@ pub trait Model {
     fn chat(
         &mut self,
         messages: &[Value],
-        template: bool,
+        template: Option<&Value>,
         max_tokens: usize,
         sampling: Sampling,
         on_text: &mut dyn FnMut(&str) -> bool,
@@ -33,7 +33,7 @@ impl Model for specrt::Engine {
     fn chat(
         &mut self,
         messages: &[Value],
-        template: bool,
+        template: Option<&Value>,
         max_tokens: usize,
         sampling: Sampling,
         on_text: &mut dyn FnMut(&str) -> bool,
@@ -244,7 +244,7 @@ impl Target for Native {
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let messages = request.messages_json();
-        let (template, s, cancel) = (request.use_template, request.sampling, request.cancel.clone());
+        let (template, s, cancel) = (request.template().cloned(), request.sampling, request.cancel.clone());
         let (tx, rx) = channel();
         let job: Job = Box::new(move |m: &mut dyn Model| {
             let list = messages.as_array().cloned().unwrap_or_default();
@@ -253,7 +253,7 @@ impl Target for Native {
                 let _ = text.send(Streamed::Text(t.to_string()));
                 !cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             };
-            let out = m.chat(&list, template, s.max_tokens, sampling(s.temperature, s.seed), &mut send);
+            let out = m.chat(&list, template.as_ref(), s.max_tokens, sampling(s.temperature, s.seed), &mut send);
             let _ = tx.send(Streamed::Done(out.map(generation).map_err(|e| engine_error(&e))));
         });
         self.send(job)?;
@@ -311,7 +311,7 @@ mod tests {
         fn chat(
             &mut self,
             _: &[Value],
-            _: bool,
+            _: Option<&Value>,
             max_tokens: usize,
             _: Sampling,
             on_text: &mut dyn FnMut(&str) -> bool,

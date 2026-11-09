@@ -434,7 +434,7 @@ impl Serving {
         self.core.max_model_len()
     }
 
-    pub fn encode_messages(&self, messages: &[Value], template: bool) -> Result<Vec<u32>> {
+    pub fn encode_messages(&self, messages: &[Value], template: Option<&Value>) -> Result<Vec<u32>> {
         self.assets.encode_messages(messages, template)
     }
 

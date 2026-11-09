@@ -82,7 +82,7 @@ impl Target for ServingTarget {
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let list = request.messages_json().as_array().cloned().unwrap_or_default();
-        let ids = self.engine()?.encode_messages(&list, request.use_template).map_err(|e| engine_error(&e))?;
+        let ids = self.engine()?.encode_messages(&list, request.template()).map_err(|e| engine_error(&e))?;
         let s = request.sampling;
         self.run(ids, s.max_tokens, sampling(s.temperature, s.seed), !request.ignore_eos, request.cancel.clone(), on_text)
     }

@@ -214,7 +214,7 @@ impl crate::native::Model for ScriptedModel {
     fn chat(
         &mut self,
         _: &[serde_json::Value],
-        _: bool,
+        _: Option<&serde_json::Value>,
         _: usize,
         _: specrt::runtime::Sampling,
         on_text: &mut dyn FnMut(&str) -> bool,

@@ -60,6 +60,8 @@ pub struct ChatRequest {
     pub use_template: bool,
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     pub ignore_eos: bool,
+    pub openai_messages: Option<Vec<Value>>,
+    pub template_vars: Value,
 }
 
 impl ChatRequest {
@@ -70,7 +72,19 @@ impl ChatRequest {
 
 impl ChatRequest {
     pub fn new(messages: Vec<Message>, sampling: Sampling) -> Self {
-        Self { messages, sampling, use_template: true, cancel: None, ignore_eos: false }
+        Self {
+            messages,
+            sampling,
+            use_template: true,
+            cancel: None,
+            ignore_eos: false,
+            openai_messages: None,
+            template_vars: json!({"enable_thinking": false}),
+        }
+    }
+
+    pub fn template(&self) -> Option<&Value> {
+        self.use_template.then_some(&self.template_vars)
     }
 
     pub fn flatten(&self) -> String {
@@ -88,6 +102,9 @@ impl ChatRequest {
     }
 
     pub fn messages_json(&self) -> Value {
+        if let Some(list) = &self.openai_messages {
+            return Value::Array(list.clone());
+        }
         Value::Array(
             self.messages.iter().map(|m| json!({"role": m.role.name(), "content": m.content})).collect(),
         )
@@ -111,13 +128,9 @@ impl ChatRequest {
             return (!messages.is_empty()).then(|| Self::new(messages, sampling));
         }
         let prompt = body["prompt"].as_str()?;
-        Some(Self {
-            messages: vec![Message::new(Role::User, prompt)],
-            sampling,
-            use_template: false,
-            cancel: None,
-            ignore_eos: false,
-        })
+        let mut r = Self::new(vec![Message::new(Role::User, prompt)], sampling);
+        r.use_template = false;
+        Some(r)
     }
 }
 

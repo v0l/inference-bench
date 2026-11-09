@@ -7,6 +7,35 @@ fn template(file: &str) -> ChatTemplate {
 }
 
 #[test]
+fn the_recorded_agent_request_renders_to_the_vllm_token_ids() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let read = |f: &str| std::fs::read_to_string(fixtures.join(f)).unwrap();
+    let t = ChatTemplate::from_files(&read("qwen3.8-27b.tokenizer_config.json"), Some(&read("qwen3.8-27b.chat_template.jinja")))
+        .unwrap()
+        .unwrap();
+    let req: serde_json::Value = serde_json::from_str(&read("agent-request.json")).unwrap();
+    let want: serde_json::Value = serde_json::from_str(&read("agent-request.vllm.json")).unwrap();
+    let tokenizer = specrt::weights::find_in_snapshot("orcarouter/Qwen3.8-27B-Uncensored-NVFP4", "tokenizer.json")
+        .ok()
+        .and_then(|p| tokenizers::Tokenizer::from_file(p).ok());
+    let cases = [
+        ("medium", serde_json::json!({"reasoning_effort": "medium"})),
+        ("no_thinking", serde_json::json!({"enable_thinking": false})),
+        ("low", serde_json::json!({"reasoning_effort": "low"})),
+    ];
+    for (name, mut vars) in cases {
+        vars["tools"] = req["tools"].clone();
+        let text = t.render_with(req["messages"].as_array().unwrap(), &vars).unwrap();
+        assert_eq!(text, want[name]["text"].as_str().unwrap(), "{name}");
+        if let Some(tok) = &tokenizer {
+            let ids: Vec<u64> = tok.encode(text.as_str(), false).unwrap().get_ids().iter().map(|&i| i as u64).collect();
+            let expected: Vec<u64> = want[name]["tokens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
+            assert_eq!(ids, expected, "{name}");
+        }
+    }
+}
+
+#[test]
 fn qwen3_wraps_a_user_turn_and_closes_the_thinking_block() {
     assert_eq!(
         template("Qwen3-0.6B.tokenizer_config.json").render_user("hi").unwrap(),

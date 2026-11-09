@@ -76,7 +76,7 @@ fn a_chat_reply_stops_at_the_end_of_turn_and_streams_in_pieces() {
     let mut pieces = 0;
     for messages in turns {
         let reply = engine
-            .chat(messages.as_array().unwrap(), true, 400, Sampling::GREEDY, &mut |_| {
+            .chat(messages.as_array().unwrap(), Some(&json!({"enable_thinking": false})), 400, Sampling::GREEDY, &mut |_| {
                 pieces += 1;
                 true
             })
@@ -96,7 +96,7 @@ fn a_callback_returning_false_stops_the_stream() {
     let messages = json!([{"role": "user", "content": "Count from one to two hundred in words."}]);
     let mut pieces = 0;
     let reply = engine
-        .chat(messages.as_array().unwrap(), true, 1000, Sampling::GREEDY, &mut |_| {
+        .chat(messages.as_array().unwrap(), Some(&json!({"enable_thinking": false})), 1000, Sampling::GREEDY, &mut |_| {
             pieces += 1;
             pieces < 3
         })

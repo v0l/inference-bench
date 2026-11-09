@@ -1,0 +1,23 @@
+{
+  "model": "qwen3.8-27b",
+  "messages": [
+    {"role": "system", "content": "You are a coding agent. Use the tools to answer."},
+    {"role": "user", "content": [{"type": "text", "text": "What is the weather in Dallas?"}, {"type": "text", "text": "Then list the files in src."}]},
+    {"role": "assistant", "content": "I will check the weather first.", "reasoning": "The user wants weather and files.", "tool_calls": [
+      {"id": "call_1", "type": "function", "function": {"name": "get_current_weather", "arguments": "{\"city\": \"Dallas\", \"state\": \"TX\", \"unit\": \"fahrenheit\"}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_1", "content": "{\"temp\": 91, \"sky\": \"clear\"}"},
+    {"role": "assistant", "content": "", "tool_calls": [
+      {"id": "call_2", "type": "function", "function": {"name": "list_files", "arguments": "{\"path\": \"src\", \"depth\": 2, \"hidden\": false}"}},
+      {"id": "call_3", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"src/main.rs\", \"lines\": [1, 40]}"}}
+    ]},
+    {"role": "tool", "tool_call_id": "call_2", "content": "src/main.rs\nsrc/lib.rs"},
+    {"role": "tool", "tool_call_id": "call_3", "content": [{"type": "text", "text": "fn main() {"}, {"type": "text", "text": "}"}]},
+    {"role": "user", "content": "Summarise in one line, ünïcode ok."}
+  ],
+  "tools": [
+    {"type": "function", "function": {"name": "get_current_weather", "description": "Get the current weather", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "The city name"}, "state": {"type": "string"}, "unit": {"type": "string", "enum": ["fahrenheit", "celsius"]}}, "required": ["city", "state"]}}},
+    {"type": "function", "function": {"name": "list_files", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "depth": {"type": "integer"}, "hidden": {"type": "boolean"}}}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read a file <with> \"quotes\" & ünïcode", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "lines": {"type": "array", "items": {"type": "integer"}}}, "required": ["path"]}}}
+  ]
+}

@@ -108,7 +108,10 @@ impl Assets {
         let tokenizer = Tokenizer::from_file(find_in_snapshot(&spec.repo, "tokenizer.json")?)
             .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
         let chat = match find_in_snapshot(&spec.repo, "tokenizer_config.json") {
-            Ok(path) => ChatTemplate::from_tokenizer_config(&std::fs::read_to_string(path)?)?,
+            Ok(path) => {
+                let jinja = find_in_snapshot(&spec.repo, "chat_template.jinja").ok().and_then(|p| std::fs::read_to_string(p).ok());
+                ChatTemplate::from_files(&std::fs::read_to_string(path)?, jinja.as_deref())?
+            }
             Err(_) => None,
         };
         let read = |f: &str| {
@@ -127,16 +130,16 @@ impl Assets {
         Ok(enc.get_ids().to_vec())
     }
 
-    pub fn encode_messages(&self, messages: &[Value], template: bool) -> Result<Vec<u32>> {
-        let text = match (&self.chat, template) {
-            (Some(t), true) => t.render(messages)?,
-            _ => messages
-                .iter()
-                .filter_map(|m| m["content"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        };
+    pub fn encode_messages(&self, messages: &[Value], template: Option<&Value>) -> Result<Vec<u32>> {
+        let text = render_prompt(self.chat.as_ref(), messages, template)?;
         self.tokens(&text)
+    }
+}
+
+pub fn render_prompt(chat: Option<&ChatTemplate>, messages: &[Value], template: Option<&Value>) -> Result<String> {
+    match (chat, template) {
+        (Some(t), Some(vars)) => t.render_with(messages, vars),
+        _ => Ok(messages.iter().filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n\n")),
     }
 }
 
@@ -179,15 +182,8 @@ impl Engine {
         Ok(enc.get_ids().to_vec())
     }
 
-    pub fn encode_messages(&self, messages: &[Value], template: bool) -> Result<Vec<u32>> {
-        let text = match (&self.chat, template) {
-            (Some(t), true) => t.render(messages)?,
-            _ => messages
-                .iter()
-                .filter_map(|m| m["content"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-        };
+    pub fn encode_messages(&self, messages: &[Value], template: Option<&Value>) -> Result<Vec<u32>> {
+        let text = render_prompt(self.chat.as_ref(), messages, template)?;
         self.tokens(&text)
     }
 
@@ -214,7 +210,7 @@ impl Engine {
     pub fn chat(
         &mut self,
         messages: &[Value],
-        template: bool,
+        template: Option<&Value>,
         max_tokens: usize,
         sampling: Sampling,
         on_text: &mut dyn FnMut(&str) -> bool,
