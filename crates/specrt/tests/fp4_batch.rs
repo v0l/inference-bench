@@ -1,5 +1,7 @@
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use specrt::codegen::{F4B_REDUCE_BLOCK, F4B_ROWS, F4B_WARPS, Module, Tile, f4b_smem, f4b_splits, f4b_tokens, f4w_smem};
+use specrt::codegen::{
+    F4B_REDUCE_BLOCK, F4B_VARIANTS, Module, Tile, f4b_part_len, f4b_shape, f4b_tokens, f4w_smem,
+};
 use specrt::jit::Jit;
 use specrt::nvfp4::{SCALE_HEADER, e2m1_to_f32};
 use specrt::spec::Spec;
@@ -73,7 +75,7 @@ fn cpu(m: &Matrix, x: &[f32], tokens: usize) -> Vec<f64> {
 struct Gpu {
     stream: Arc<CudaStream>,
     tiny: CudaFunction,
-    batch: [CudaFunction; 2],
+    batch: Vec<CudaFunction>,
     reduce: CudaFunction,
     tiny_smem: u32,
     sms: usize,
@@ -88,11 +90,11 @@ fn gpu(linear: &str) -> Gpu {
     let f = |name: &str| loaded.function(name).unwrap();
     let tiny_smem = f4w_smem(Tile::tiny());
     let tiny = f(&format!("{linear}_f4w_tiny"));
-    let batch = [8, 16].map(|t| f(&format!("{linear}_f4b{t}")));
+    let batch: Vec<_> = F4B_VARIANTS.iter().map(|t| f(&format!("{linear}_f4b{t}"))).collect();
     use cudarc::driver::sys::CUfunction_attribute as A;
     tiny.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, tiny_smem as i32).unwrap();
-    for (b, t) in batch.iter().zip([8, 16]) {
-        b.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f4b_smem(t) as i32).unwrap();
+    for (b, &t) in batch.iter().zip(F4B_VARIANTS) {
+        b.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f4b_shape(t).smem() as i32).unwrap();
     }
     let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).unwrap();
     Gpu { stream: ctx.default_stream(), tiny, batch, reduce: f(&format!("{linear}_f4b_reduce")), tiny_smem, sms: sms as usize }
@@ -101,6 +103,7 @@ fn gpu(linear: &str) -> Gpu {
 struct Run {
     out: Vec<f32>,
     micros: f64,
+    splits: usize,
 }
 
 struct Device {
@@ -161,16 +164,17 @@ fn run_tiny(g: &Gpu, d: &mut Device, rows: usize, tokens: usize, act: bool) -> R
         unsafe { b.launch(config) }.unwrap();
     });
     let len = if act { tokens * rows / 2 } else { tokens * rows };
-    Run { out: read(g, d, act, len), micros }
+    Run { out: read(g, d, act, len), micros, splits: 1 }
 }
 
 fn run_batch(g: &Gpu, d: &mut Device, rows: usize, cols: usize, tokens: usize, act: bool) -> Run {
-    let splits = f4b_splits(rows, cols, g.sms);
+    let shape = f4b_shape(tokens);
+    let splits = shape.splits(rows, cols, g.sms);
     let (n, s) = (tokens as i32, splits as i32);
     let config = LaunchConfig {
-        grid_dim: (rows.div_ceil(F4B_ROWS) as u32, splits as u32, 1),
-        block_dim: ((F4B_WARPS * 32) as u32, 1, 1),
-        shared_mem_bytes: f4b_smem(tokens),
+        grid_dim: (rows.div_ceil(shape.rows()) as u32, splits as u32, 1),
+        block_dim: (shape.threads(), 1, 1),
+        shared_mem_bytes: shape.smem(),
     };
     let outs = if act { tokens * rows / 2 } else { tokens * rows };
     let reduce = LaunchConfig {
@@ -178,7 +182,7 @@ fn run_batch(g: &Gpu, d: &mut Device, rows: usize, cols: usize, tokens: usize, a
         block_dim: (F4B_REDUCE_BLOCK as u32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let kernel = &g.batch[usize::from(f4b_tokens(tokens) == 16)];
+    let kernel = &g.batch[F4B_VARIANTS.iter().position(|&v| v == f4b_tokens(tokens)).unwrap()];
     let micros = time(g, d, |d| {
         let mut b = g.stream.launch_builder(kernel);
         b.arg(&d.w).arg(&d.s).arg(&d.hi).arg(&d.lo).arg(&d.out).arg(&d.oh).arg(&d.ol).arg(&d.part).arg(&n).arg(&s);
@@ -190,7 +194,7 @@ fn run_batch(g: &Gpu, d: &mut Device, rows: usize, cols: usize, tokens: usize, a
         }
     });
     let len = if act { tokens * rows / 2 } else { tokens * rows };
-    Run { out: read(g, d, act, len), micros }
+    Run { out: read(g, d, act, len), micros, splits }
 }
 
 fn swiglu(v: &[f64], tokens: usize, rows: usize) -> Vec<f64> {
@@ -216,7 +220,7 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
     let exact = cpu(&m, &x, most);
     let g = gpu(linear);
     let act = linear == "gate_up";
-    let splits = f4b_splits(rows, cols, g.sms);
+    let part = f4b_part_len(rows, cols, g.sms);
     let mut d = Device {
         w: g.stream.clone_htod(&m.packed).unwrap(),
         s: g.stream.clone_htod(&m.device_scales()).unwrap(),
@@ -225,7 +229,7 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
         out: g.stream.alloc_zeros(most * rows).unwrap(),
         oh: g.stream.alloc_zeros(most * rows / 2).unwrap(),
         ol: g.stream.alloc_zeros(most * rows / 2).unwrap(),
-        part: g.stream.alloc_zeros(splits * most * rows).unwrap(),
+        part: g.stream.alloc_zeros(part).unwrap(),
         dummy: g.stream.alloc_zeros(1).unwrap(),
     };
     let bytes = (m.packed.len() + m.scales.len()) as f64;
@@ -238,11 +242,12 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
         let (new_err, _) = max_err(&new.out, &exact);
         let between = old.out.iter().zip(&new.out).fold(0f32, |a, (x, y)| a.max((x - y).abs()));
         eprintln!(
-            "{linear} {rows}x{cols} batch {tokens}: tile {:.1} us ({:.0} GB/s, max err {old_err:.2e}), batched {:.1} us ({:.0} GB/s, max err {new_err:.2e}, splits {splits}), |new - old| {between:.2e}, max abs {scale:.1}",
+            "{linear} {rows}x{cols} batch {tokens}: tile {:.1} us ({:.0} GB/s, max err {old_err:.2e}), batched {:.1} us ({:.0} GB/s, max err {new_err:.2e}, splits {}), |new - old| {between:.2e}, max abs {scale:.1}",
             old.micros,
             bytes / old.micros / 1e3,
             new.micros,
             bytes / new.micros / 1e3,
+            new.splits,
         );
         assert!(old_err <= ERROR_BOUND * scale, "tile path {old_err} of {scale}");
         assert!(new_err <= ERROR_BOUND * scale, "batched path {new_err} of {scale}");
@@ -253,11 +258,11 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
 #[test]
 #[ignore = "needs an sm_120 GPU"]
 fn batched_fp4_down_matches_the_tile_path_on_a_random_27b_matrix() {
-    compare("down", 5120, 17408, &[1, 2, 3, 4, 8, 13, 16]);
+    compare("down", 5120, 17408, &[1, 2, 3, 4, 8, 13, 16, 17, 24, 32]);
 }
 
 #[test]
 #[ignore = "needs an sm_120 GPU"]
 fn batched_fp4_gate_up_matches_the_tile_path_on_a_random_27b_matrix() {
-    compare("gate_up", 34816, 5120, &[2, 4, 8, 16]);
+    compare("gate_up", 34816, 5120, &[2, 4, 8, 16, 17, 24, 32]);
 }

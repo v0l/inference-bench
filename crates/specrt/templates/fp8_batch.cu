@@ -1,8 +1,4 @@
-constexpr int F8B_WARPS = {{F8B_WARPS}};
-constexpr int F8B_MJ = {{F8B_MJ}};
-constexpr int F8B_ROWS = F8B_WARPS * F8B_MJ * 16;
 constexpr int F8B_KC = {{F8B_KC}};
-constexpr int F8B_STAGES = {{F8B_STAGES}};
 
 __device__ __forceinline__ void f8b_cp_async8(void* smem, const void* gmem, bool valid) {
     unsigned s = (unsigned)__cvta_generic_to_shared(smem);
@@ -37,7 +33,7 @@ __device__ __forceinline__ void f8b_store(int m, int r, float v, float u, float*
     }
 }
 
-template <int N, int K, int EPI, bool BIAS, int NT>
+template <int N, int K, int EPI, bool BIAS, int NT, int WARPS, int STAGES, int MJ>
 __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, const float* bias, const bf16_t* x_hi,
                                          const bf16_t* x_lo, float* out, bf16_t* out_hi, bf16_t* out_lo, float* part,
                                          int tokens, int splits) {
@@ -60,13 +56,13 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
     int split = blockIdx.y;
     int c_begin = split * CHUNKS / splits;
     int nc = (split + 1) * CHUNKS / splits - c_begin;
-    int row0 = blockIdx.x * F8B_ROWS + warp * (F8B_MJ * 16);
+    int row0 = blockIdx.x * (WARPS * MJ * 16) + warp * (MJ * 16);
     int last = max(tokens - 1, 0);
     const unsigned char* wb = (const unsigned char*)w;
-    const unsigned char* wrow[F8B_MJ][2];
-    const float* srow[F8B_MJ][2];
+    const unsigned char* wrow[MJ][2];
+    const float* srow[MJ][2];
 #pragma unroll
-    for (int i = 0; i < F8B_MJ; i++)
+    for (int i = 0; i < MJ; i++)
 #pragma unroll
         for (int h = 0; h < 2; h++) {
             int r = min(row0 + i * 16 + g + 8 * h, N - 1);
@@ -75,7 +71,7 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
         }
     auto stage = [&](int buf, int c) {
         bf16_t* base = xs + buf * STAGE;
-        for (int i = tid; i < LOADS; i += F8B_WARPS * 32) {
+        for (int i = tid; i < LOADS; i += WARPS * 32) {
             int p = i / (M * PIECES);
             int m = (i / PIECES) % M;
             int piece = i % PIECES;
@@ -83,9 +79,9 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
             f8b_cp_async8(base + p * PLANE + (((piece & 7) * M + m) * 4 + (piece >> 3)) * 4, src, m < tokens);
         }
     };
-    auto load_w = [&](int c, uint4 (&q)[F8B_MJ][2][2], float (&s)[F8B_MJ][2]) {
+    auto load_w = [&](int c, uint4 (&q)[MJ][2][2], float (&s)[MJ][2]) {
 #pragma unroll
-        for (int i = 0; i < F8B_MJ; i++)
+        for (int i = 0; i < MJ; i++)
 #pragma unroll
             for (int h = 0; h < 2; h++) {
                 q[i][h][0] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC);
@@ -93,34 +89,34 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
                 s[i][h] = __ldg(srow[i][h] + c);
             }
     };
-    float acc[F8B_MJ][NT][4];
+    float acc[MJ][NT][4];
 #pragma unroll
-    for (int i = 0; i < F8B_MJ; i++)
+    for (int i = 0; i < MJ; i++)
 #pragma unroll
         for (int n = 0; n < NT; n++)
 #pragma unroll
             for (int e = 0; e < 4; e++) acc[i][n][e] = 0.0f;
 #pragma unroll
-    for (int st = 0; st < F8B_STAGES - 1; st++) {
+    for (int st = 0; st < STAGES - 1; st++) {
         if (st < nc) stage(st, c_begin + st);
         cp_async_commit();
     }
-    uint4 q[F8B_MJ][2][2];
-    float s[F8B_MJ][2];
+    uint4 q[MJ][2][2];
+    float s[MJ][2];
     if (nc > 0) load_w(c_begin, q, s);
     for (int it = 0; it < nc; it++) {
-        cp_async_wait<F8B_STAGES - 2>();
+        cp_async_wait<STAGES - 2>();
         __syncthreads();
-        if (it + F8B_STAGES - 1 < nc) stage((it + F8B_STAGES - 1) % F8B_STAGES, c_begin + it + F8B_STAGES - 1);
+        if (it + STAGES - 1 < nc) stage((it + STAGES - 1) % STAGES, c_begin + it + STAGES - 1);
         cp_async_commit();
-        uint4 nq[F8B_MJ][2][2];
-        float ns[F8B_MJ][2];
+        uint4 nq[MJ][2][2];
+        float ns[MJ][2];
         if (it + 1 < nc) load_w(c_begin + it + 1, nq, ns);
-        const bf16_t* xh = xs + (it % F8B_STAGES) * STAGE;
+        const bf16_t* xh = xs + (it % STAGES) * STAGE;
         const bf16_t* xl = xh + PLANE;
-        float c[F8B_MJ][NT][4];
+        float c[MJ][NT][4];
 #pragma unroll
-        for (int i = 0; i < F8B_MJ; i++)
+        for (int i = 0; i < MJ; i++)
 #pragma unroll
             for (int n = 0; n < NT; n++)
 #pragma unroll
@@ -134,7 +130,7 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
                 bl[n] = *(const uint2*)(xl + ((k * M + n * 8 + g) * 4 + t) * 4);
             }
 #pragma unroll
-            for (int i = 0; i < F8B_MJ; i++) {
+            for (int i = 0; i < MJ; i++) {
                 unsigned w0 = f8b_word(q[i][0][0], q[i][0][1], k);
                 unsigned w1 = f8b_word(q[i][1][0], q[i][1][1], k);
                 unsigned a0 = e4m3_pair_bf16(w0 & 0xffffu);
@@ -149,14 +145,14 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
             }
         }
 #pragma unroll
-        for (int i = 0; i < F8B_MJ; i++)
+        for (int i = 0; i < MJ; i++)
 #pragma unroll
             for (int n = 0; n < NT; n++)
 #pragma unroll
                 for (int e = 0; e < 4; e++) acc[i][n][e] += c[i][n][e] * s[i][e >> 1];
         if (it + 1 < nc) {
 #pragma unroll
-            for (int i = 0; i < F8B_MJ; i++)
+            for (int i = 0; i < MJ; i++)
 #pragma unroll
                 for (int h = 0; h < 2; h++) {
                     q[i][h][0] = nq[i][h][0];
@@ -167,7 +163,7 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
     }
     cp_async_wait<0>();
 #pragma unroll
-    for (int i = 0; i < F8B_MJ; i++)
+    for (int i = 0; i < MJ; i++)
 #pragma unroll
         for (int n = 0; n < NT; n++)
 #pragma unroll

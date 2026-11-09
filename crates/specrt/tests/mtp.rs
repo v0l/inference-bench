@@ -400,7 +400,7 @@ fn batched_speculation_with_different_accept_counts_matches_plain_greedy() {
     let s = spec(2);
     let ps = prompts();
     let want = plain_greedy(&s, &ps);
-    for batch in [4, 5] {
+    for batch in [4, 5, 8] {
         let (got, mean) = speculative_greedy(&s, &ps, &want, Drafts::Mtp, batch);
         eprintln!("batch {batch}: mean acceptance length {mean:.3}");
         check(&format!("batch {batch}"), &got, &want);

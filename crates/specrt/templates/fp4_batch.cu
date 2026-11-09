@@ -1,8 +1,4 @@
-constexpr int F4B_WARPS = {{F4B_WARPS}};
-constexpr int F4B_MJ = {{F4B_MJ}};
-constexpr int F4B_ROWS = F4B_WARPS * F4B_MJ * 16;
 constexpr int F4B_KC = {{F4B_KC}};
-constexpr int F4B_STAGES = {{F4B_STAGES}};
 
 __device__ __forceinline__ void f4b_cp_async8(void* smem, const void* gmem, bool valid) {
     unsigned s = (unsigned)__cvta_generic_to_shared(smem);
@@ -36,7 +32,7 @@ __device__ __forceinline__ void f4b_store(int m, int r, float v, float u, float*
     }
 }
 
-template <int N, int K, int EPI, int NT>
+template <int N, int K, int EPI, int NT, int WARPS, int STAGES, int MJ>
 __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* scales, const bf16_t* x_hi, const bf16_t* x_lo,
                                          float* out, bf16_t* out_hi, bf16_t* out_lo, float* part, int tokens, int splits) {
     constexpr int M = NT * 8;
@@ -59,14 +55,14 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
     int split = blockIdx.y;
     int c_begin = split * CHUNKS / splits;
     int nc = (split + 1) * CHUNKS / splits - c_begin;
-    int row0 = blockIdx.x * F4B_ROWS + warp * (F4B_MJ * 16);
+    int row0 = blockIdx.x * (WARPS * MJ * 16) + warp * (MJ * 16);
     int last = max(tokens - 1, 0);
     const unsigned char* wb = (const unsigned char*)w;
     const unsigned char* sb = scales + FP4_HEADER;
-    const unsigned char* wrow[F4B_MJ][2];
-    const unsigned char* srow[F4B_MJ][2];
+    const unsigned char* wrow[MJ][2];
+    const unsigned char* srow[MJ][2];
 #pragma unroll
-    for (int i = 0; i < F4B_MJ; i++)
+    for (int i = 0; i < MJ; i++)
 #pragma unroll
         for (int h = 0; h < 2; h++) {
             int r = min(row0 + i * 16 + g + 8 * h, N - 1);
@@ -75,7 +71,7 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
         }
     auto stage = [&](int buf, int c) {
         bf16_t* base = xs + buf * STAGE;
-        for (int i = tid; i < LOADS; i += F4B_WARPS * 32) {
+        for (int i = tid; i < LOADS; i += WARPS * 32) {
             int p = i / (M * PIECES);
             int m = (i / PIECES) % M;
             int piece = i % PIECES;
@@ -83,43 +79,43 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
             f4b_cp_async8(base + p * PLANE + (((piece & 7) * M + m) * 4 + (piece >> 3)) * 4, src, m < tokens);
         }
     };
-    auto load_w = [&](int c, uint4 (&q)[F4B_MJ][2], unsigned (&s)[F4B_MJ][2]) {
+    auto load_w = [&](int c, uint4 (&q)[MJ][2], unsigned (&s)[MJ][2]) {
 #pragma unroll
-        for (int i = 0; i < F4B_MJ; i++)
+        for (int i = 0; i < MJ; i++)
 #pragma unroll
             for (int h = 0; h < 2; h++) {
                 q[i][h] = f4b_load16(wrow[i][h] + (size_t)c * (F4B_KC / 2));
                 s[i][h] = __ldg((const unsigned short*)(srow[i][h] + c * (F4B_KC / FP4_GROUP)));
             }
     };
-    float acc[F4B_MJ][NT][4];
+    float acc[MJ][NT][4];
 #pragma unroll
-    for (int i = 0; i < F4B_MJ; i++)
+    for (int i = 0; i < MJ; i++)
 #pragma unroll
         for (int n = 0; n < NT; n++)
 #pragma unroll
             for (int e = 0; e < 4; e++) acc[i][n][e] = 0.0f;
 #pragma unroll
-    for (int st = 0; st < F4B_STAGES - 1; st++) {
+    for (int st = 0; st < STAGES - 1; st++) {
         if (st < nc) stage(st, c_begin + st);
         cp_async_commit();
     }
-    uint4 q[F4B_MJ][2];
-    unsigned s[F4B_MJ][2];
+    uint4 q[MJ][2];
+    unsigned s[MJ][2];
     if (nc > 0) load_w(c_begin, q, s);
     for (int it = 0; it < nc; it++) {
-        cp_async_wait<F4B_STAGES - 2>();
+        cp_async_wait<STAGES - 2>();
         __syncthreads();
-        if (it + F4B_STAGES - 1 < nc) stage((it + F4B_STAGES - 1) % F4B_STAGES, c_begin + it + F4B_STAGES - 1);
+        if (it + STAGES - 1 < nc) stage((it + STAGES - 1) % STAGES, c_begin + it + STAGES - 1);
         cp_async_commit();
-        uint4 nq[F4B_MJ][2];
-        unsigned ns[F4B_MJ][2];
+        uint4 nq[MJ][2];
+        unsigned ns[MJ][2];
         if (it + 1 < nc) load_w(c_begin + it + 1, nq, ns);
-        const bf16_t* xh = xs + (it % F4B_STAGES) * STAGE;
+        const bf16_t* xh = xs + (it % STAGES) * STAGE;
         const bf16_t* xl = xh + PLANE;
-        float sc[F4B_MJ][2][2];
+        float sc[MJ][2][2];
 #pragma unroll
-        for (int i = 0; i < F4B_MJ; i++)
+        for (int i = 0; i < MJ; i++)
 #pragma unroll
             for (int h = 0; h < 2; h++) {
                 sc[i][h][0] = e4m3_to_f32(s[i][h] & 0xffu);
@@ -134,7 +130,7 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
                 bl[n] = *(const uint2*)(xl + ((k * M + n * 8 + g) * 4 + t) * 4);
             }
 #pragma unroll
-            for (int i = 0; i < F4B_MJ; i++) {
+            for (int i = 0; i < MJ; i++) {
                 float s0 = sc[i][0][k >> 2];
                 float s1 = sc[i][1][k >> 2];
                 unsigned a0 = fp4_pair_bf16(f4b_byte(q[i][0], 2 * k), s0);
@@ -150,7 +146,7 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
         }
         if (it + 1 < nc) {
 #pragma unroll
-            for (int i = 0; i < F4B_MJ; i++)
+            for (int i = 0; i < MJ; i++)
 #pragma unroll
                 for (int h = 0; h < 2; h++) {
                     q[i][h] = nq[i][h];
@@ -161,7 +157,7 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
     cp_async_wait<0>();
     float inv = fp4_inv_global(scales);
 #pragma unroll
-    for (int i = 0; i < F4B_MJ; i++)
+    for (int i = 0; i < MJ; i++)
 #pragma unroll
         for (int n = 0; n < NT; n++)
 #pragma unroll

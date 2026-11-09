@@ -1,5 +1,7 @@
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
-use specrt::codegen::{F8B_REDUCE_BLOCK, F8B_ROWS, F8B_WARPS, FP8_BLOCK, Module, Tile, f8b_smem, f8b_splits, f8b_tokens};
+use specrt::codegen::{
+    F8B_REDUCE_BLOCK, F8B_VARIANTS, FP8_BLOCK, Module, Tile, f8b_part_len, f8b_shape, f8b_tokens,
+};
 use specrt::jit::Jit;
 use specrt::spec::Spec;
 use specrt::weights::{bf16_to_f32, e4m3_to_f32, f32_to_bf16, fp8_scales};
@@ -69,7 +71,7 @@ fn cpu(m: &Matrix, x: &[f32], tokens: usize) -> Vec<f64> {
 struct Gpu {
     stream: Arc<CudaStream>,
     tiny: CudaFunction,
-    batch: [CudaFunction; 2],
+    batch: Vec<CudaFunction>,
     reduce: CudaFunction,
     tiny_smem: u32,
     sms: usize,
@@ -85,11 +87,11 @@ fn gpu(linear: &str) -> Gpu {
     let tiny_name = format!("{linear}_mma_tiny");
     let tiny_smem = module.smem[tiny_name.as_str()];
     let tiny = f(&tiny_name);
-    let batch = [8, 16].map(|t| f(&format!("{linear}_f8b{t}")));
+    let batch: Vec<_> = F8B_VARIANTS.iter().map(|t| f(&format!("{linear}_f8b{t}"))).collect();
     use cudarc::driver::sys::CUfunction_attribute as A;
     tiny.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, tiny_smem as i32).unwrap();
-    for (b, t) in batch.iter().zip([8, 16]) {
-        b.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f8b_smem(t) as i32).unwrap();
+    for (b, &t) in batch.iter().zip(F8B_VARIANTS) {
+        b.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f8b_shape(t).smem() as i32).unwrap();
     }
     let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).unwrap();
     Gpu { stream: ctx.default_stream(), tiny, batch, reduce: f(&format!("{linear}_f8b_reduce")), tiny_smem, sms: sms as usize }
@@ -98,6 +100,7 @@ fn gpu(linear: &str) -> Gpu {
 struct Run {
     out: Vec<f32>,
     micros: f64,
+    splits: usize,
 }
 
 struct Device {
@@ -158,16 +161,17 @@ fn run_tiny(g: &Gpu, d: &mut Device, rows: usize, tokens: usize, act: bool) -> R
         unsafe { b.launch(config) }.unwrap();
     });
     let len = if act { tokens * rows / 2 } else { tokens * rows };
-    Run { out: read(g, d, act, len), micros }
+    Run { out: read(g, d, act, len), micros, splits: 1 }
 }
 
 fn run_batch(g: &Gpu, d: &mut Device, rows: usize, cols: usize, tokens: usize, act: bool) -> Run {
-    let splits = f8b_splits(rows, cols, g.sms);
+    let shape = f8b_shape(tokens);
+    let splits = shape.splits(rows, cols, g.sms);
     let (n, s) = (tokens as i32, splits as i32);
     let config = LaunchConfig {
-        grid_dim: (rows.div_ceil(F8B_ROWS) as u32, splits as u32, 1),
-        block_dim: ((F8B_WARPS * 32) as u32, 1, 1),
-        shared_mem_bytes: f8b_smem(tokens),
+        grid_dim: (rows.div_ceil(shape.rows()) as u32, splits as u32, 1),
+        block_dim: (shape.threads(), 1, 1),
+        shared_mem_bytes: shape.smem(),
     };
     let outs = if act { tokens * rows / 2 } else { tokens * rows };
     let reduce = LaunchConfig {
@@ -175,7 +179,7 @@ fn run_batch(g: &Gpu, d: &mut Device, rows: usize, cols: usize, tokens: usize, a
         block_dim: (F8B_REDUCE_BLOCK as u32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let kernel = &g.batch[usize::from(f8b_tokens(tokens) == 16)];
+    let kernel = &g.batch[F8B_VARIANTS.iter().position(|&v| v == f8b_tokens(tokens)).unwrap()];
     let micros = time(g, d, |d| {
         let mut b = g.stream.launch_builder(kernel);
         b.arg(&d.w).arg(&d.s).arg(&d.dummy).arg(&d.hi).arg(&d.lo).arg(&d.out).arg(&d.oh).arg(&d.ol).arg(&d.part).arg(&n).arg(&s);
@@ -187,7 +191,7 @@ fn run_batch(g: &Gpu, d: &mut Device, rows: usize, cols: usize, tokens: usize, a
         }
     });
     let len = if act { tokens * rows / 2 } else { tokens * rows };
-    Run { out: read(g, d, act, len), micros }
+    Run { out: read(g, d, act, len), micros, splits }
 }
 
 fn swiglu(v: &[f64], tokens: usize, rows: usize) -> Vec<f64> {
@@ -213,7 +217,7 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
     let exact = cpu(&m, &x, most);
     let g = gpu(linear);
     let act = linear == "gate_up";
-    let splits = f8b_splits(rows, cols, g.sms);
+    let part = f8b_part_len(rows, cols, g.sms);
     let mut d = Device {
         w: g.stream.clone_htod(&m.values).unwrap(),
         s: g.stream.clone_htod(&m.device_scales()).unwrap(),
@@ -222,7 +226,7 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
         out: g.stream.alloc_zeros(most * rows).unwrap(),
         oh: g.stream.alloc_zeros(most * rows / 2).unwrap(),
         ol: g.stream.alloc_zeros(most * rows / 2).unwrap(),
-        part: g.stream.alloc_zeros(splits * most * rows).unwrap(),
+        part: g.stream.alloc_zeros(part).unwrap(),
         dummy: g.stream.alloc_zeros(1).unwrap(),
     };
     let bytes = (m.values.len() + rows * 4) as f64;
@@ -234,18 +238,19 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
         let (old_err, scale) = max_err(&old.out, &exact);
         let (new_err, _) = max_err(&new.out, &exact);
         eprintln!(
-            "{linear} {rows}x{cols} batch {tokens}: tile {:.1} us ({:.0} GB/s, max err {old_err:.2e}), batched {:.1} us ({:.0} GB/s, max err {new_err:.2e}, splits {splits}), max abs {scale:.1}",
+            "{linear} {rows}x{cols} batch {tokens}: tile {:.1} us ({:.0} GB/s, max err {old_err:.2e}), batched {:.1} us ({:.0} GB/s, max err {new_err:.2e}, splits {}), max abs {scale:.1}",
             old.micros,
             bytes / old.micros / 1e3,
             new.micros,
             bytes / new.micros / 1e3,
+            new.splits,
         );
         assert!(old_err <= ERROR_BOUND * scale, "tile path {old_err} of {scale}");
         assert!(new_err <= ERROR_BOUND * scale, "batched path {new_err} of {scale}");
     }
 }
 
-const BATCHES: [usize; 7] = [1, 2, 3, 4, 8, 13, 16];
+const BATCHES: [usize; 10] = [1, 2, 3, 4, 8, 13, 16, 17, 24, 32];
 
 #[test]
 #[ignore = "needs an sm_120 GPU"]

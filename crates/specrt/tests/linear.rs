@@ -278,7 +278,7 @@ fn fp8_batch_decode_matches_single_sequence_greedy() {
     let single = Runtime::load(&s, 256).unwrap();
     assert!(single.peak_host_rss_bytes > 0 && single.weight_bytes > 0);
     drop(single);
-    for batch in [2, 4, 8, 16] {
+    for batch in [2, 4, 8, 16, 17, 24, 32] {
         batch_decode_matches_single_sequence_greedy(FP8, batch);
     }
 }
@@ -341,7 +341,7 @@ fn nvfp4_batch_decode_matches_single_sequence_greedy() {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn nvfp4_batch_2_8_16_decode_matches_single_sequence_greedy() {
-    for batch in [2, 8, 16] {
+    for batch in [2, 8, 16, 17, 24, 32] {
         batch_decode_matches_single_sequence_greedy(NVFP4, batch);
     }
 }

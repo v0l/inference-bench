@@ -625,15 +625,15 @@ impl Runtime {
         };
         let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
         let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) {
-            use crate::codegen::{F4B_MAX_TOKENS, f4b_splits};
+            use crate::codegen::{F4B_MAX_TOKENS, f4b_part_len};
             let (h, i) = (d.hidden, 2 * d.intermediate);
-            let most = (f4b_splits(i, h, sms as usize) * i).max(f4b_splits(h, d.intermediate, sms as usize) * h);
-            stream.alloc_zeros(most * F4B_MAX_TOKENS)?
+            let most = f4b_part_len(i, h, sms as usize).max(f4b_part_len(h, d.intermediate, sms as usize));
+            stream.alloc_zeros(most.max(F4B_MAX_TOKENS))?
         } else {
             stream.alloc_zeros(1)?
         };
         let f8b_part = if spec.quant.is_fp8() {
-            use crate::codegen::{F8B_MAX_TOKENS, f8b_splits};
+            use crate::codegen::{F8B_MAX_TOKENS, f8b_part_len};
             let sms = sms as usize;
             let mut shapes = vec![
                 (spec.qkv_rows(), d.hidden),
@@ -645,8 +645,8 @@ impl Runtime {
                 shapes.push((la.in_proj_rows(), d.hidden));
                 shapes.push((d.hidden, la.value_dim()));
             }
-            let most = shapes.into_iter().map(|(n, k)| f8b_splits(n, k, sms) * n).max().unwrap_or(1);
-            stream.alloc_zeros(most * F8B_MAX_TOKENS)?
+            let most = shapes.into_iter().map(|(n, k)| f8b_part_len(n, k, sms)).max().unwrap_or(1);
+            stream.alloc_zeros(most.max(F8B_MAX_TOKENS))?
         } else {
             stream.alloc_zeros(1)?
         };
@@ -1025,10 +1025,11 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        use crate::codegen::{F8B_REDUCE_BLOCK, F8B_ROWS, F8B_WARPS, f8b_smem, f8b_splits};
+        use crate::codegen::{F8B_REDUCE_BLOCK, f8b_shape};
         let DeviceMatrix::Fp8 { values, .. } = w else { unreachable!("tc_f8b takes FP8 weights") };
         let width = values.len() / rows;
-        let splits = f8b_splits(rows, width, self.sms as usize);
+        let shape = f8b_shape(tokens);
+        let splits = shape.splits(rows, width, self.sms as usize);
         let (n, s) = (tokens as i32, splits as i32);
         let mut b = self.stream.launch_builder(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
@@ -1039,9 +1040,9 @@ impl Runtime {
         };
         b.arg(&self.f8b_part).arg(&n).arg(&s);
         let config = LaunchConfig {
-            grid_dim: (grid(rows, F8B_ROWS), splits as u32, 1),
-            block_dim: ((F8B_WARPS * 32) as u32, 1, 1),
-            shared_mem_bytes: f8b_smem(tokens),
+            grid_dim: (grid(rows, shape.rows()), splits as u32, 1),
+            block_dim: (shape.threads(), 1, 1),
+            shared_mem_bytes: shape.smem(),
         };
         unsafe { b.launch(config) }?;
         if splits == 1 {
@@ -1072,10 +1073,11 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        use crate::codegen::{F4B_REDUCE_BLOCK, F4B_ROWS, f4b_smem, f4b_splits};
+        use crate::codegen::{F4B_REDUCE_BLOCK, f4b_shape};
         let DeviceMatrix::Fp4 { packed, .. } = w else { unreachable!("tc_f4b takes NVFP4 weights") };
         let width = packed.len() * 2 / rows;
-        let splits = f4b_splits(rows, width, self.sms as usize);
+        let shape = f4b_shape(tokens);
+        let splits = shape.splits(rows, width, self.sms as usize);
         let (n, s) = (tokens as i32, splits as i32);
         let mut b = self.stream.launch_builder(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
@@ -1086,9 +1088,9 @@ impl Runtime {
         };
         b.arg(&self.f4b_part).arg(&n).arg(&s);
         let config = LaunchConfig {
-            grid_dim: (grid(rows, F4B_ROWS), splits as u32, 1),
-            block_dim: ((crate::codegen::F4B_WARPS * 32) as u32, 1, 1),
-            shared_mem_bytes: f4b_smem(tokens),
+            grid_dim: (grid(rows, shape.rows()), splits as u32, 1),
+            block_dim: (shape.threads(), 1, 1),
+            shared_mem_bytes: shape.smem(),
         };
         unsafe { b.launch(config) }?;
         if splits == 1 {
