@@ -454,8 +454,58 @@ checked against an f64 CPU product: the batched kernel's max error is 7.7e-5 to 
 once more. Both must stay within 1e-4 of the largest output.
 
 The FP8 projections in batched decode (`lin_in_mma_tiny` 69 to 81 us, `lin_out_mma_tiny` 43
-to 49 us, `qkv_mma_tiny` 64 us) still go through the tile GEMM; they are the next largest
-share of the step.
+to 49 us, `qkv_mma_tiny` 64 us) went through the tile GEMM until #375.
+
+#### FP8 projections on the batched GEMV (#375)
+
+`templates/fp8_batch.cu` (`gemv_f8b`) is `gemv_f4b` for e4m3 per-channel weights: the same
+warp layout, activation ring and split-K, with a lane streaming 32 bytes of one row per
+128-column chunk and the row's scale for that chunk applied to the chunk's partial sums, so
+the block-128 checkpoint runs through it too. It covers `qkv`, `o`, `lin_in`, `lin_out` and the
+FP8 MLPs of layers 56 to 63 (`*_f8b8`, `*_f8b16`, `*_f8b_reduce`); splits come from
+`f8b_splits` (10 for `qkv` and `lin_in`, 12 for `o` and `lin_out`, 5 for `gate_up`, 32 for
+`down` on 188 SMs). `lin_ba` and `lm_head` are bf16 and keep the tile GEMM.
+
+Per call, `nsys --cuda-graph-trace=node`, 128-token prompt, 64 new, `qwen3.8-27b-nvfp4-act.toml`,
+vLLM at 93 to 100% beside it. Medians of 3,360 calls for the 48 linear-attention layers, 1,120
+for the 16 attention layers and 560 for the 8 FP8 MLPs; the batched figure adds the reduce
+median (2 to 5 us).
+
+| kernel | batch 4 tile | batch 4 batched | batch 8 tile | batch 8 batched | batch 16 tile | batch 16 batched |
+|---|---|---|---|---|---|---|
+| `lin_in` 16384 x 5120 | 79.1 us | 74.6 us | 86.4 | 76.1 | 99.1 | 102.4 |
+| `lin_out` 5120 x 6144 | 46.9 | 32.5 | 50.8 | 34.6 | 54.2 | 45.8 |
+| `qkv` 14336 x 5120 | 72.8 | 68.1 | 78.9 | 69.8 | 90.8 | 94.0 |
+| `o` 5120 x 6144 | 47.9 | 33.4 | 50.6 | 32.2 | 53.1 | 37.4 |
+| `gate_up` 34816 x 5120 | 147.0 | 146.8 | 157.2 | 148.7 | 184.0 | 186.4 |
+| `down` 5120 x 17408 | 135.5 | 81.1 | 143.4 | 82.7 | 149.2 | 116.0 |
+
+Summed over a decode step that is 11.1 ms of FP8 projections on the tile path against 8.8 ms
+batched at batch 8 (minus 20%), 10.2 ms against 8.6 ms at batch 4 (minus 16%) and 12.3 ms
+against 11.6 ms at batch 16 (minus 6%). The narrow-K shapes
+(`o`, `lin_out`, `down`) gain most, from the split-K filling the card; `lin_in`, `qkv` and
+`gate_up` were already near the memory roofline on the tile path (1.0 to 1.2 TB/s) and stay
+there. At batch 16 the 16-token variant runs twice the mmas per weight byte, the dequant is no
+longer hidden, and `lin_in`, `qkv` and `gate_up` come out 1 to 4% behind the tile path while
+the other three stay ahead.
+
+Whole-step tok/s (`bench ... 128 128 N`, median of 3, same binary with the batched FP8 path
+switched off for the tile column, run interleaved, vLLM at 93 to 100%):
+
+| batch | tile path | batched FP8 |
+|---|---|---|
+| 4 | 89.1 tok/s | 90.5 |
+| 8 | 140.6 | 177.7 |
+| 16 | 285.5 | 254.1 |
+
+These swing by 20 to 30% between runs with vLLM busy beside it (the #361 numbers above were
+taken at 95 to 100% vLLM load too, and a `scripts/bench27b-nvfp4.sh` run during this work gave
+75.1, 137.0 and 220.6 on the batched path), so the per-kernel table is the measure.
+
+On random matrices of every projection shape (`tests/fp8_batch.rs`, batch 1, 2, 3, 4, 8, 13,
+16) the batched kernel's max error against an f64 CPU product is 1.1e-5 to 1.5e-5 on `qkv`,
+`o`, `lin_in` and `lin_out` (max abs 30 to 40), 2.4e-5 to 2.6e-5 on `down` (max abs 57 to 66)
+and 1.1e-3 to 3.2e-3 on `gate_up` (max abs 400 to 560), never worse than the tile path.
 
 ## Commands
 
@@ -468,6 +518,7 @@ $PY scripts/reference.py tiny-nvfp4 tests/fixtures/tiny-qwen3.5-nvfp4 out
 cargo test --release --test linear nvfp4 -- --include-ignored
 cargo test --release --test fp4_act -- --ignored
 cargo test --release --test fp4_batch -- --ignored --nocapture
+cargo test --release --test fp8_batch -- --ignored --nocapture
 $PY scripts/reference.py real-slice orcarouter/Qwen3.8-27B-Uncensored-NVFP4 out/qwen3.8-27b-nvfp4-slice out 4 32768
 cargo test --release --test real27b real_27b_nvfp4_first_layers -- --ignored
 # whole model, GPU steps under flock /tmp/gpu27.lock with 36 GB free
