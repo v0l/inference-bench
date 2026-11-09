@@ -258,11 +258,11 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
 #[test]
 #[ignore = "needs an sm_120 GPU"]
 fn batched_fp4_down_matches_the_tile_path_on_a_random_27b_matrix() {
-    compare("down", 5120, 17408, &[1, 2, 3, 4, 8, 13, 16, 17, 24, 32]);
+    compare("down", 5120, 17408, &[1, 2, 3, 4, 8, 13, 16, 17, 24, 32, 33, 48, 64]);
 }
 
 #[test]
 #[ignore = "needs an sm_120 GPU"]
 fn batched_fp4_gate_up_matches_the_tile_path_on_a_random_27b_matrix() {
-    compare("gate_up", 34816, 5120, &[2, 4, 8, 16, 17, 24, 32]);
+    compare("gate_up", 34816, 5120, &[2, 4, 8, 16, 17, 24, 32, 33, 48, 64]);
 }

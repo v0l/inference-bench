@@ -250,7 +250,7 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
     }
 }
 
-const BATCHES: [usize; 10] = [1, 2, 3, 4, 8, 13, 16, 17, 24, 32];
+const BATCHES: [usize; 13] = [1, 2, 3, 4, 8, 13, 16, 17, 24, 32, 33, 48, 64];
 
 #[test]
 #[ignore = "needs an sm_120 GPU"]

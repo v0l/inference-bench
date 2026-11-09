@@ -66,16 +66,18 @@ pub const FP4_KERNELS: &[&str] = &[
     "gate_up_f4b8",
     "gate_up_f4b16",
     "gate_up_f4b32",
+    "gate_up_f4b64",
     "gate_up_f4b_reduce",
     "down_f4b8",
     "down_f4b16",
     "down_f4b32",
+    "down_f4b64",
     "down_f4b_reduce",
 ];
 const FP4_STAGES: usize = 3;
 pub const FP4_BATCH_TEMPLATE: &str = include_str!("../templates/fp4_batch.cu");
-pub const F4B_VARIANTS: &[usize] = &[8, 16, 32];
-pub const F4B_MAX_TOKENS: usize = 32;
+pub const F4B_VARIANTS: &[usize] = &[8, 16, 32, 64];
+pub const F4B_MAX_TOKENS: usize = 64;
 pub const F4B_KC: usize = 128;
 pub const F4B_REDUCE_BLOCK: usize = 256;
 const SMEM_PER_SM: usize = 100 * 1024;
@@ -94,7 +96,8 @@ impl BatchShape {
     pub fn for_tokens(tokens: usize) -> BatchShape {
         match tokens {
             0..=16 => BatchShape { tokens, warps: 4, stages: 3, mj: 2 },
-            _ => BatchShape { tokens, warps: 8, stages: 3, mj: 1 },
+            17..=32 => BatchShape { tokens, warps: 8, stages: 3, mj: 1 },
+            _ => BatchShape { tokens, warps: 8, stages: 2, mj: 1 },
         }
     }
 
@@ -172,30 +175,36 @@ pub const F8B_KERNELS: &[&str] = &[
     "qkv_f8b8",
     "qkv_f8b16",
     "qkv_f8b32",
+    "qkv_f8b64",
     "qkv_f8b_reduce",
     "o_f8b8",
     "o_f8b16",
     "o_f8b32",
+    "o_f8b64",
     "o_f8b_reduce",
     "gate_up_f8b8",
     "gate_up_f8b16",
     "gate_up_f8b32",
+    "gate_up_f8b64",
     "gate_up_f8b_reduce",
     "down_f8b8",
     "down_f8b16",
     "down_f8b32",
+    "down_f8b64",
     "down_f8b_reduce",
     "lin_in_f8b8",
     "lin_in_f8b16",
     "lin_in_f8b32",
+    "lin_in_f8b64",
     "lin_in_f8b_reduce",
     "lin_out_f8b8",
     "lin_out_f8b16",
     "lin_out_f8b32",
+    "lin_out_f8b64",
     "lin_out_f8b_reduce",
 ];
-pub const F8B_VARIANTS: &[usize] = &[8, 16, 32];
-pub const F8B_MAX_TOKENS: usize = 32;
+pub const F8B_VARIANTS: &[usize] = &[8, 16, 32, 64];
+pub const F8B_MAX_TOKENS: usize = 64;
 pub const F8B_REDUCE_BLOCK: usize = 256;
 
 pub fn f8b_tokens(tokens: usize) -> usize {
