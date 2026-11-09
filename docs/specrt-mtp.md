@@ -307,10 +307,11 @@ The runs swing 3x with vLLM's load, so compare within a row. Batch 4 is unchange
 already on the 16-token GEMV). `[mtp] max_batch = 8` is the setting for this card now; above 32
 verify rows (batch 11 at k = 2) the GEMMs take over again.
 
-The single-stream speedup (1.36x for 2.43 tokens per step) is below the acceptance length because
-each speculative step pays the 3-row verify, the MTP pass over the accepted rows and two chained
-MTP steps, each with its own lm_head over 248k rows, and the round used to synchronise the stream on every host-to-device index upload. The issue's target of 162 tok/s single stream
-is about the weight kernels (#361, #362); plain decode here is 23 tok/s.
+The 31.4 against 23.1 tok/s of this table is stale: it was taken on a card where vLLM's load
+slowed both columns, before the batched GEMV work (#399, 32-row GEMV) and the deferred commit
+settled. The paired runs in "Device-side round (#401)" below are current: 85 tok/s speculative
+against 40 plain at batch 1 (2.1x for 2.43 tokens per round), and a round of 28.8 ms against a plain
+step of 24.4 ms (1.18x the plain step, not 1.8x).
 
 ## Commands
 
@@ -338,14 +339,59 @@ the k chained drafts, and reads back accept counts and emitted tokens once. The 
 synchronised once per round (test `a_speculative_round_synchronises_the_stream_at_most_once`).
 `[mtp] graph = true` captures that round per padded batch size (1, 2, 4, 8, ...) as `decode` does.
 
-`scripts/spec27b.sh`, batch 1 and 4, k = 2, acceptance 2.43, alternating runs on the 27B NVFP4
-beside the served vLLM (decode tok/s, speculative rows only):
+### Paired measurement
 
-| build | batch 1 | batch 4 |
-|---|---|---|
-| before (origin/master) | 84.6, 31.1 | 283.8, 106.6 |
-| device round, eager | 83.9, 86.1 | 291.8, 275.0 |
-| device round, graph | 76.8, 79.8, 81.4, 87.6 | 292.2, 261.3, 282.1, 288.1 |
+`scripts/spec27b.sh`, batch 1 and 4, k = 2, acceptance 2.43, 128 greedy tokens over 20 prompts,
+`flock /tmp/gpu27.lock`, at least 37 GB free before each run. Arms alternated base, eager, graph
+for 5 rounds (the sixth was stopped). base is origin/master at 6031fd3 built in a temp worktree;
+eager and graph are this change with `[mtp] graph` off and on. Speculative decode tok/s, median
+(min to max). The served vLLM was 100 percent busy throughout: `nvidia-smi` utilisation sampled
+every 2 s during each run averaged 68 to 100 percent per run (about 85 percent over the 15 runs) and
+dipped to 1 percent only in the gaps between benchmark phases, so every run shared the card.
 
-The device round plus graph does not clear the issue's 15% bar on this box (the 31.1 and 106.6
-base runs coincide with vLLM load). The graph path stays off by default.
+| arm | batch 1 | batch 4 | plain batch 1 | plain batch 4 |
+|---|---|---|---|---|
+| base (before) | 85.5 (70.8 to 87.1) | 246.7 (196.5 to 287.0) | 39.9 (34.4 to 43.9) | 161.0 (101.6 to 171.3) |
+| device round, eager | 82.1 (42.8 to 86.5) | 283.3 (152.8 to 283.9) | 41.3 (22.9 to 44.2) | 168.2 (87.4 to 169.7) |
+| device round, graph | 82.9 (44.6 to 88.7) | 227.7 (153.0 to 281.7) | 38.4 (23.5 to 40.6) | 167.0 (82.4 to 169.7) |
+
+The spread comes from vLLM taking time slices: the slowest runs of every arm (the 42.8, 44.6 and
+the 150s) are the ones where plain decode dropped to the 20s and 80s too. Medians of the three
+arms are within that spread at batch 1 (85.5, 82.1, 82.9) and the eager arm leads at batch 4.
+Graph gains nothing at batch 1 (-3 percent against base) and nothing reliable at batch 4. Neither
+reaches the 15 percent bar, so the graph stays off and the eager device round stays on (the round
+is not slower: nsys wall 29.22 ms against 29.38 ms, and the idle gaps fell from 0.74 to 0.10 ms).
+
+### Where a round goes now
+
+`nsys profile --cuda-graph-trace=node`, `bench --speculative` on the same spec, rounds delimited
+by `spec_accept` (204 rounds at batch 1, 63 at batch 4), plain steps by `embed` with spec off (471
+and 126 steps). Median per round, beside the same busy vLLM:
+
+| | plain step b1 | spec round b1 | plain step b4 | spec round b4 |
+|---|---|---|---|---|
+| wall | 24.4 ms | 28.8 ms | 25.0 ms | 34.3 ms |
+| kernel sum | 23.3 ms | 27.9 ms | 23.9 ms | 32.6 ms |
+| idle gaps of 20 us and over | 1.03 ms | 0.60 ms | 0.84 ms | 0.80 ms |
+| kernels | 884 | 918 | 884 | 918 |
+
+Spec round at batch 1, by kernel group: weight GEMVs of the 3-row verify (`gate_up_f4b8`
+6.1 ms, `lin_in_f8b8` 3.4 ms, `down_f4b8` 3.1 ms, `lin_ba` 1.6 ms, `lin_out` 1.3 ms, qkv, o and the
+fp8 MLP: 17.8 ms in all), `lm_head` three times (verify rows plus two draft heads: 5.0 ms, 1.75 ms
+each, the plain step pays it once), attention 1.8 ms, MTP layer GEMVs 1.3 ms, delta-net verify and
+commit 0.9 ms, norm and embed 0.7 ms, `spec_accept` 0.28 ms, `mtp_draft` 0.04 ms. At batch 4 the
+verify GEMVs grow to 20.7 ms (`b16` kernels) and delta-net verify and commit to 2.0 ms. The
+round is 1.18x the plain step at batch 1 for 2.43 tokens, so the cost is the weights, not the
+host: gaps are 2 percent of the round (0.6 ms), which is all a graph could remove, and the idle
+that remains in a 24 ms step is launch gaps of the same size.
+
+Against #413's 84 ms round (52 ms for vLLM): the kernel sum is the same (28.4 ms here, 29.7 ms
+there), the wall is not. #413's 34.4 ms of idle gaps was not host synchronisation: the pre-change
+build run alone here has 0.74 ms of gaps in a 29.4 ms round, with every upload still
+synchronising. It is time slicing against the busy vLLM (the same run's mean kernel sum was
+51.6 ms against a 29.7 ms median, and plain decode in that run was 22.5 tok/s against 40 now).
+The 84 ms is therefore most likely contention, not the old build (an inference: #413 has no isolated specrt round to check it against).
+An isolated vLLM round of 52 ms against specrt's 29 ms is not a like-for-like pair.
+
+What would still cut the round: the two extra `lm_head` passes (3.3 ms, #415 quantises the draft
+head) and the verify GEMV bandwidth (17.8 ms, #361, #362); the host side is done.
