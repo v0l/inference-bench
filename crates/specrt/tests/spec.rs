@@ -201,7 +201,9 @@ fn qwen38_27b_config_parses_into_a_hybrid_spec_and_round_trips() {
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;
     assert_eq!(file, spec);
-    assert_eq!(file.min_engine, 3);
+    assert_eq!(file.min_engine, 6);
+    assert_eq!(file.mtp, Some(specrt::spec::Mtp::new(1)));
+    assert_eq!(file.kv_layers(), 17);
 }
 
 #[test]
@@ -219,7 +221,8 @@ fn compressed_tensors_nvfp4_checkpoint_derives_fp8_channel_with_nvfp4_mlps_until
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;
     assert_eq!(file, spec);
-    assert_eq!(file.min_engine, 4);
+    assert_eq!(file.min_engine, 6);
+    assert_eq!(file.mtp, Some(specrt::spec::Mtp::new(1)));
 }
 
 fn nvfp4_config() -> serde_json::Value {
@@ -429,7 +432,7 @@ fn layer_types_reduce_to_their_shortest_period() {
 #[test]
 fn dense_specs_serialize_without_the_hybrid_fields() {
     let text = derived("qwen3-0.6b.config.json").to_toml().unwrap();
-    for field in ["unit_offset", "output_gate", "rotary_dim", "linear_attention"] {
+    for field in ["unit_offset", "output_gate", "rotary_dim", "linear_attention", "mtp"] {
         assert!(!text.contains(field), "{field} in {text}");
     }
 }
@@ -448,4 +451,30 @@ fn min_engine_defaults_to_zero_and_a_newer_one_is_refused_by_name() {
     let e = Spec::parse(&newer).unwrap_err().to_string();
     assert!(e.contains("needs a newer inference-bench"), "{e}");
     assert!(check("min_engine = -1\nname = \"x\"").is_err());
+}
+
+fn nvfp4_with_mtp(block: &str) -> anyhow::Result<Spec> {
+    let text = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    let (head, _) = text.split_once("[mtp]").unwrap();
+    Spec::parse(&format!("{head}[mtp]\n{block}"))
+}
+
+#[test]
+fn mtp_block_defaults_to_two_draft_tokens_and_rejects_what_cannot_run() {
+    let s = nvfp4_with_mtp("layers = 1\n").unwrap();
+    let m = s.mtp.clone().unwrap();
+    assert_eq!((m.draft_tokens, m.speculate, m.max_batch), (2, true, None));
+    assert_eq!(Spec::parse(&s.to_toml().unwrap()).unwrap(), s);
+    let s = nvfp4_with_mtp("layers = 1\ndraft_tokens = 3\nmax_batch = 4\n").unwrap();
+    assert_eq!(s.speculative().map(|m| (m.draft_tokens, m.max_batch)), Some((3, Some(4))));
+    let off = nvfp4_with_mtp("layers = 1\nspeculate = false\n").unwrap();
+    assert!(off.speculative().is_none());
+    assert_eq!(off.kv_layers(), 16);
+    for bad in ["layers = 2\n", "layers = 1\ndraft_tokens = 0\n", "layers = 1\ndraft_tokens = 4\n", "layers = 1\nmax_batch = 0\n", "layers = 1\nbogus = 1\n"] {
+        assert!(nvfp4_with_mtp(bad).is_err(), "{bad}");
+    }
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4.config.json")).unwrap()).unwrap();
+    v["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(0);
+    assert_eq!(Spec::from_hf_config(&v.to_string()).unwrap().mtp, None);
 }

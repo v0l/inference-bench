@@ -297,8 +297,38 @@ pub struct Spec {
     pub mlp: Mlp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_attention: Option<LinearAttention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "RuntimeOptions::is_default")]
     pub runtime: RuntimeOptions,
+}
+
+pub const MAX_DRAFT_TOKENS: usize = 3;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mtp {
+    pub layers: usize,
+    #[serde(default = "default_draft_tokens")]
+    pub draft_tokens: usize,
+    #[serde(default = "default_true")]
+    pub speculate: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_batch: Option<usize>,
+}
+
+fn default_draft_tokens() -> usize {
+    2
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Mtp {
+    pub fn new(layers: usize) -> Mtp {
+        Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None }
+    }
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -338,6 +368,8 @@ struct HfConfig {
     linear_key_head_dim: Option<usize>,
     linear_value_head_dim: Option<usize>,
     linear_conv_kernel_dim: Option<usize>,
+    #[serde(default)]
+    mtp_num_hidden_layers: usize,
 }
 
 fn layer_pattern(types: &[String]) -> Result<Vec<Block>> {
@@ -586,6 +618,7 @@ impl Spec {
                 quant_until: mlp_quant.and_then(|m| m.1),
                 act_quant: ActQuant::None,
             },
+            mtp: (hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
             linear_attention,
             runtime: RuntimeOptions::default(),
         };
@@ -604,6 +637,17 @@ impl Spec {
                 ensure!(self.dims.hidden.is_multiple_of(64), "head_quant = \"nvfp4_g16\" needs hidden to be a multiple of 64")
             }
             Some(h) => bail!("head_quant {h:?} is not supported (bf16, fp8_channel and nvfp4_g16 are)"),
+        }
+        if let Some(m) = &self.mtp {
+            ensure!(m.layers == 1, "[mtp] layers = {} is not supported (one MTP layer is)", m.layers);
+            ensure!(
+                (1..=MAX_DRAFT_TOKENS).contains(&m.draft_tokens),
+                "[mtp] draft_tokens must be 1 to {MAX_DRAFT_TOKENS}, not {}",
+                m.draft_tokens
+            );
+            ensure!(m.max_batch != Some(0), "[mtp] max_batch must be at least 1");
+            ensure!(self.linear_attention.is_some(), "[mtp] needs a hybrid spec with [linear_attention]");
+            ensure!(self.attention.output_gate && self.attention.qk_norm, "[mtp] needs the Qwen3.5 attention (output_gate and qk_norm)");
         }
         match self.act_quant {
             ActQuant::None => {}
@@ -769,6 +813,14 @@ impl Spec {
 
     pub fn attention_layers(&self) -> usize {
         self.layers.count - self.linear_layers()
+    }
+
+    pub fn speculative(&self) -> Option<&Mtp> {
+        self.mtp.as_ref().filter(|m| m.speculate)
+    }
+
+    pub fn kv_layers(&self) -> usize {
+        self.attention_layers() + self.speculative().map_or(0, |m| m.layers)
     }
 
     pub fn rotary_dim(&self) -> usize {

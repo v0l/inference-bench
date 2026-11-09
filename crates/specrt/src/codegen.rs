@@ -683,7 +683,7 @@ impl Module {
             ("ACT_KIND", act.to_string()),
             ("MAX_CTX", max_ctx.to_string()),
             ("PAGE", PAGE.to_string()),
-            ("ATTN_LAYERS", spec.attention_layers().max(1).to_string()),
+            ("ATTN_LAYERS", spec.kv_layers().max(1).to_string()),
             ("KV_PLANES", kv_planes.to_string()),
             ("Q8_GROUP", Q8_GROUP.to_string()),
             ("FP8_BLOCK", FP8_BLOCK.to_string()),

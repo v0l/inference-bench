@@ -425,7 +425,7 @@ impl Layout {
 }
 
 pub fn kv_block_bytes(spec: &Spec, planes: usize) -> usize {
-    2 * spec.attention_layers() * spec.attention.kv_heads * PAGE * spec.attention.head_dim * planes * 2
+    2 * spec.kv_layers() * spec.attention.kv_heads * PAGE * spec.attention.head_dim * planes * 2
 }
 
 impl Runtime {

@@ -1,5 +1,5 @@
 name = "qwen3.8-27b"
-min_engine = 3
+min_engine = 6
 repo = "Qwen/Qwen3.8-27B-FP8"
 quant = "fp8_block128"
 
@@ -42,3 +42,8 @@ value_heads = 48
 key_head_dim = 128
 value_head_dim = 128
 conv_kernel = 4
+
+[mtp]
+layers = 1
+draft_tokens = 2
+speculate = true

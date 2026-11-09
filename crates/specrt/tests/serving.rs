@@ -306,10 +306,13 @@ fn the_serving_core_streams_concurrent_jobs_and_cancels_within_a_step() {
 fn serving_kv_is_one_f16_copy_per_token() {
     let s = spec_for("tiny-qwen3.5-hd256");
     let per_token = specrt::runtime::kv_block_bytes(&s, 1) / specrt::codegen::PAGE;
-    assert_eq!(per_token, s.attention_layers() * s.attention.kv_heads * s.attention.head_dim * 2 * 2);
+    assert_eq!(per_token, s.kv_layers() * s.attention.kv_heads * s.attention.head_dim * 2 * 2);
     let real = Spec::load(&fixture_dir("qwen3.8-27b.toml")).unwrap();
-    assert_eq!(specrt::runtime::kv_block_bytes(&real, 1) / specrt::codegen::PAGE, 64 * 1024);
+    assert_eq!(specrt::runtime::kv_block_bytes(&real, 1) / specrt::codegen::PAGE, 68 * 1024);
+    let mut plain = real.clone();
+    plain.mtp.as_mut().unwrap().speculate = false;
+    assert_eq!(specrt::runtime::kv_block_bytes(&plain, 1) / specrt::codegen::PAGE, 64 * 1024);
     let layout = Layout::serving(&real, 131072, 32, Some(7 << 30));
-    assert_eq!((layout.kv_planes, layout.kv_blocks), (1, (7 << 30) / (64 * 1024 * 16)));
+    assert_eq!((layout.kv_planes, layout.kv_blocks), (1, (7 << 30) / (68 * 1024 * 16)));
     assert_eq!(Layout::serving(&real, 131072, 32, None).kv_blocks, 0, "0 sizes the pool from free memory");
 }
