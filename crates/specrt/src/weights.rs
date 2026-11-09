@@ -1,4 +1,5 @@
 use crate::codegen::{FP8_BLOCK, Q8_GROUP};
+use crate::gguf::{GgmlType, Gguf};
 use crate::spec::{Quant, Spec};
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::{Mmap, UncheckedAdvice};
@@ -98,6 +99,7 @@ struct Shard {
 }
 
 pub struct Checkpoint {
+    gguf: Option<Gguf>,
     shards: Vec<Shard>,
     names: HashMap<String, usize>,
     pub files: Vec<PathBuf>,
@@ -126,6 +128,9 @@ fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
 
 impl Checkpoint {
     pub fn open(dir: &Path) -> Result<Self> {
+        if dir.extension().is_some_and(|e| e == "gguf") {
+            return Ok(Checkpoint { gguf: Some(Gguf::open(dir)?), shards: Vec::new(), names: HashMap::new(), files: vec![dir.to_path_buf()] });
+        }
         let files = shard_files(dir)?;
         let mut shards = Vec::with_capacity(files.len());
         let mut names = HashMap::new();
@@ -141,15 +146,21 @@ impl Checkpoint {
             }
             shards.push(Shard { map, data_start: 8 + header, meta });
         }
-        Ok(Checkpoint { shards, names, files })
+        Ok(Checkpoint { gguf: None, shards, names, files })
     }
 
     pub fn for_repo(repo: &str) -> Result<Self> {
+        if repo.ends_with(".gguf") {
+            return Self::open(Path::new(repo));
+        }
         Self::open(&find_checkpoint(repo)?)
     }
 
     pub fn has(&self, name: &str) -> bool {
-        self.names.contains_key(name)
+        match &self.gguf {
+            Some(g) => gguf_name(name).is_some_and(|n| g.tensors.contains_key(&n)),
+            None => self.names.contains_key(name),
+        }
     }
 
     pub fn view(&self, name: &str) -> Result<View<'_>> {
@@ -165,13 +176,18 @@ impl Checkpoint {
     }
 
     pub fn release(&self) {
+        if let Some(g) = &self.gguf {
+            g.release();
+        }
         for s in &self.shards {
             let _ = unsafe { s.map.unchecked_advise(UncheckedAdvice::DontNeed) };
         }
     }
 
     pub fn root(&self) -> &'static str {
-        if self.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" }
+        if self.gguf.is_some() {
+            "model"
+        } else if self.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" }
     }
 
     fn shaped(&self, name: &str, shape: &[usize]) -> Result<View<'_>> {
@@ -181,6 +197,9 @@ impl Checkpoint {
     }
 
     fn bf16(&self, name: &str, shape: &[usize]) -> Result<Cow<'_, [u16]>> {
+        if let Some(g) = &self.gguf {
+            return Ok(Cow::Owned(self.gguf_f32(g, name, shape)?.into_iter().map(f32_to_bf16).collect()));
+        }
         let v = self.shaped(name, shape)?;
         let pairs = || v.data.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes([b[0], b[1]]));
         Ok(match v.dtype {
@@ -198,6 +217,9 @@ impl Checkpoint {
     }
 
     fn floats(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        if let Some(g) = &self.gguf {
+            return self.gguf_f32(g, name, shape);
+        }
         let v = self.shaped(name, shape)?;
         match v.dtype {
             Dtype::F32 => Ok(v.data.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()),
@@ -210,6 +232,9 @@ impl Checkpoint {
     }
 
     fn raw(&self, weight: &str, rows: usize, cols: usize) -> Result<Raw<'_>> {
+        if let Some(g) = &self.gguf {
+            return self.gguf_raw(g, weight, rows, cols);
+        }
         let v = self.view(weight)?;
         if v.dtype != Dtype::F8_E4M3 {
             return Ok(Raw::Bf16 { w: self.bf16(weight, &[rows, cols])?, cols });
@@ -229,6 +254,88 @@ impl Checkpoint {
     }
 }
 
+fn gguf_name(hf: &str) -> Option<String> {
+    match hf {
+        "model.embed_tokens.weight" => return Some("token_embd.weight".into()),
+        "model.norm.weight" => return Some("output_norm.weight".into()),
+        "lm_head.weight" => return Some("output.weight".into()),
+        _ => {}
+    }
+    let rest = hf.strip_prefix("model.layers.")?;
+    let (layer, tail) = rest.split_once('.')?;
+    let tail = match tail {
+        "self_attn.q_proj.weight" => "attn_q.weight",
+        "self_attn.k_proj.weight" => "attn_k.weight",
+        "self_attn.v_proj.weight" => "attn_v.weight",
+        "self_attn.q_proj.bias" => "attn_q.bias",
+        "self_attn.k_proj.bias" => "attn_k.bias",
+        "self_attn.v_proj.bias" => "attn_v.bias",
+        "self_attn.o_proj.weight" => "attn_output.weight",
+        "self_attn.q_norm.weight" => "attn_q_norm.weight",
+        "self_attn.k_norm.weight" => "attn_k_norm.weight",
+        "input_layernorm.weight" => "attn_norm.weight",
+        "post_attention_layernorm.weight" => "ffn_norm.weight",
+        "mlp.gate_proj.weight" => "ffn_gate.weight",
+        "mlp.up_proj.weight" => "ffn_up.weight",
+        "mlp.down_proj.weight" => "ffn_down.weight",
+        _ => return None,
+    };
+    Some(format!("blk.{layer}.{tail}"))
+}
+
+fn unpermute_rows(data: &[u8], heads: usize, rows: usize) -> Vec<u8> {
+    let row_bytes = data.len() / rows;
+    let head_dim = rows / heads;
+    let half = head_dim / 2;
+    let mut out = Vec::with_capacity(data.len());
+    for h in 0..heads {
+        for t in 0..2 {
+            for j in 0..half {
+                let src = h * head_dim + j * 2 + t;
+                out.extend_from_slice(&data[src * row_bytes..(src + 1) * row_bytes]);
+            }
+        }
+    }
+    out
+}
+
+impl Checkpoint {
+    fn gguf_tensor<'g>(&self, g: &'g Gguf, name: &str, shape: &[usize]) -> Result<(&'g crate::gguf::TensorInfo, Cow<'g, [u8]>)> {
+        let mapped = gguf_name(name).with_context(|| format!("{name} has no GGUF tensor name"))?;
+        let info = g.tensor(&mapped).with_context(|| format!("{mapped} is not in the GGUF file"))?;
+        ensure!(info.shape == shape, "{mapped} has shape {:?}, expected {shape:?}", info.shape);
+        let data = g.data(info);
+        let arch = g.architecture()?;
+        let heads = match mapped.rsplit_once('.') {
+            Some((m, "weight")) if m.ends_with(".attn_q") => g.count(&format!("{arch}.attention.head_count")),
+            Some((m, "weight")) if m.ends_with(".attn_k") => g.count(&format!("{arch}.attention.head_count_kv")).or(g.count(&format!("{arch}.attention.head_count"))),
+            _ => None,
+        };
+        Ok(match heads {
+            Some(h) if arch == "llama" => (info, Cow::Owned(unpermute_rows(data, h, info.rows()))),
+            _ => (info, Cow::Borrowed(data)),
+        })
+    }
+
+    fn gguf_f32(&self, g: &Gguf, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        let (info, data) = self.gguf_tensor(g, name, shape)?;
+        let mut out = vec![0f32; shape.iter().product()];
+        crate::gguf::dequantize(info.kind, &data, &mut out).with_context(|| name.to_string())?;
+        Ok(out)
+    }
+
+    fn gguf_raw(&self, g: &Gguf, weight: &str, rows: usize, cols: usize) -> Result<Raw<'_>> {
+        let (info, data) = self.gguf_tensor(g, weight, &[rows, cols])?;
+        if info.kind == GgmlType::Q8_0 {
+            let (values, scales) = crate::gguf::q8_0_split(&data);
+            return Ok(Raw::Q8 { values, scales, cols });
+        }
+        let mut out = vec![0f32; rows * cols];
+        crate::gguf::dequantize(info.kind, &data, &mut out).with_context(|| weight.to_string())?;
+        Ok(Raw::Bf16 { w: Cow::Owned(out.into_iter().map(f32_to_bf16).collect()), cols })
+    }
+}
+
 pub fn peak_rss_bytes() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
@@ -238,6 +345,7 @@ pub fn peak_rss_bytes() -> Option<u64> {
 
 enum Raw<'a> {
     Bf16 { w: Cow<'a, [u16]>, cols: usize },
+    Q8 { values: Vec<i8>, scales: Vec<f32>, cols: usize },
     Fp8 { w: Cow<'a, [u8]>, grid: Vec<f32>, map: Vec<u32>, cols: usize },
 }
 
@@ -249,13 +357,14 @@ pub fn fp8_scales(grid: &[f32], map: &[u32]) -> Vec<f32> {
 impl<'a> Raw<'a> {
     fn cols(&self) -> usize {
         match self {
-            Raw::Bf16 { cols, .. } | Raw::Fp8 { cols, .. } => *cols,
+            Raw::Bf16 { cols, .. } | Raw::Q8 { cols, .. } | Raw::Fp8 { cols, .. } => *cols,
         }
     }
 
     fn rows(&self) -> usize {
         match self {
             Raw::Bf16 { w, cols } => w.len() / cols,
+            Raw::Q8 { values, cols, .. } => values.len() / cols,
             Raw::Fp8 { w, cols, .. } => w.len() / cols,
         }
     }
@@ -263,6 +372,10 @@ impl<'a> Raw<'a> {
     fn slice_rows(&self, from: usize, to: usize) -> Raw<'a> {
         match self {
             Raw::Bf16 { w, cols } => Raw::Bf16 { w: Cow::Owned(w[from * cols..to * cols].to_vec()), cols: *cols },
+            Raw::Q8 { values, scales, cols } => {
+                let groups = cols / Q8_GROUP;
+                Raw::Q8 { values: values[from * cols..to * cols].to_vec(), scales: scales[from * groups..to * groups].to_vec(), cols: *cols }
+            }
             Raw::Fp8 { w, grid, map, cols } => {
                 let kb = cols.div_ceil(FP8_BLOCK) as u32;
                 let map = &map[from..to];
@@ -292,16 +405,32 @@ impl<'a> Raw<'a> {
                     .collect();
                 Raw::Bf16 { w: Cow::Owned(out), cols }
             }
+            Raw::Q8 { values, scales, cols } => {
+                let out = values
+                    .chunks(Q8_GROUP)
+                    .zip(&scales)
+                    .flat_map(|(g, &s)| g.iter().map(move |&q| f32_to_bf16(q as f32 * s)))
+                    .collect();
+                Raw::Bf16 { w: Cow::Owned(out), cols }
+            }
             bf16 => bf16,
         }
     }
 
     fn concat(parts: Vec<Raw<'a>>) -> Result<Raw<'a>> {
+        let mut parts = parts;
+        if parts.iter().any(|p| matches!(p, Raw::Q8 { .. })) && !parts.iter().all(|p| matches!(p, Raw::Q8 { .. })) {
+            parts = parts.into_iter().map(Raw::dequantized).collect();
+        }
         let mut parts = parts.into_iter();
         let mut out = parts.next().context("nothing to concatenate")?;
         for p in parts {
             ensure!(p.cols() == out.cols(), "fused rows have different widths");
             match (&mut out, p) {
+                (Raw::Q8 { values, scales, .. }, Raw::Q8 { values: v, scales: s, .. }) => {
+                    values.extend(v);
+                    scales.extend(s);
+                }
                 (Raw::Bf16 { w, .. }, Raw::Bf16 { w: more, .. }) => w.to_mut().extend_from_slice(&more),
                 (Raw::Fp8 { w, grid, map, .. }, Raw::Fp8 { w: more, grid: g, map: m, .. }) => {
                     w.to_mut().extend_from_slice(&more);
@@ -318,6 +447,12 @@ impl<'a> Raw<'a> {
     fn interleave(a: Raw<'a>, b: Raw<'a>) -> Result<Raw<'a>> {
         ensure!(a.rows() == b.rows() && a.cols() == b.cols(), "gate and up differ in shape");
         Ok(match (a, b) {
+            (Raw::Q8 { values: va, scales: sa, cols }, Raw::Q8 { values: vb, scales: sb, .. }) => Raw::Q8 {
+                values: interleave_rows(&va, &vb, cols),
+                scales: interleave_rows(&sa, &sb, cols / Q8_GROUP),
+                cols,
+            },
+            (a @ Raw::Q8 { .. }, b) | (a, b @ Raw::Q8 { .. }) => return Raw::interleave(a.dequantized(), b.dequantized()),
             (Raw::Bf16 { w: a, cols }, Raw::Bf16 { w: b, .. }) => {
                 Raw::Bf16 { w: Cow::Owned(interleave_rows(&a, &b, cols)), cols }
             }
@@ -336,7 +471,11 @@ impl<'a> Raw<'a> {
     }
 
     fn into_matrix(self, quant: Quant, what: &str) -> Result<Matrix<'a>> {
+        if matches!(self, Raw::Q8 { .. }) && quant != Quant::Q8 {
+            return self.dequantized().into_matrix(quant, what);
+        }
         Ok(match (self, quant) {
+            (Raw::Q8 { values, scales, .. }, _) => Matrix::Q8 { values, scales },
             (Raw::Bf16 { w, .. }, Quant::Bf16) => Matrix::Bf16(w),
             (Raw::Bf16 { w, cols }, Quant::Q8) => {
                 let (values, scales) = quantize_q8(&w, cols);

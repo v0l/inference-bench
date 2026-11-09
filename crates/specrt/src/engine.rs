@@ -14,6 +14,11 @@ pub fn resolve_spec(model: &str) -> Result<Spec> {
     if model.ends_with(".toml") {
         return Spec::load(Path::new(model));
     }
+    if model.ends_with(".gguf") {
+        let mut spec = crate::gguf::Gguf::open(Path::new(model))?.spec().with_context(|| model.to_string())?;
+        spec.repo = model.to_string();
+        return Ok(spec);
+    }
     let config = find_in_snapshot(model, "config.json")?;
     let mut spec = Spec::from_hf_config(&std::fs::read_to_string(&config)?)
         .with_context(|| model.to_string())?;
@@ -122,8 +127,24 @@ pub(crate) struct Assets {
 }
 
 impl Assets {
+    fn from_gguf(spec: Spec) -> Result<Self> {
+        let g = crate::gguf::Gguf::open(Path::new(&spec.repo))?;
+        let tokenizer: Tokenizer = std::str::FromStr::from_str(&g.tokenizer_json()?).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let tok_cfg = g.tokenizer_config_json();
+        let chat = match &tok_cfg {
+            Some(c) => ChatTemplate::from_files(c, None)?,
+            None => None,
+        };
+        let gen_cfg = g.generation_config_json();
+        let stop = stop_ids(Some(&gen_cfg), tok_cfg.as_deref(), &|t| tokenizer.token_to_id(t));
+        Ok(Assets { spec, tokenizer, chat, stop, sampling: SamplingDefaults::default() })
+    }
+
     pub fn load(model: &str) -> Result<Self> {
         let spec = resolve_spec(model)?;
+        if model.ends_with(".gguf") {
+            return Self::from_gguf(spec);
+        }
         let tokenizer = Tokenizer::from_file(find_in_snapshot(&spec.repo, "tokenizer.json")?)
             .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
         let chat = match find_in_snapshot(&spec.repo, "tokenizer_config.json") {

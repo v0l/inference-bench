@@ -656,6 +656,12 @@ impl Spec {
         Ok(toml::to_string(self)?)
     }
 
+    pub fn from_gguf_file(path: &Path) -> Result<Self> {
+        let mut spec = crate::gguf::Gguf::open(path)?.spec()?;
+        spec.repo = path.display().to_string();
+        Ok(spec)
+    }
+
     pub fn from_hf_config(json: &str) -> Result<Self> {
         let spec = Self::hf_config(json, true)?;
         spec.validate()?;

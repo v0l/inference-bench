@@ -525,13 +525,6 @@ impl Gguf {
         ids.dedup();
         json!({"eos_token_id": ids}).to_string()
     }
-
-    pub fn adds_bos(&self) -> Option<u32> {
-        match self.metadata.get("tokenizer.ggml.add_bos_token") {
-            Some(Value::Bool(true)) => self.count("tokenizer.ggml.bos_token_id").map(|b| b as u32),
-            _ => None,
-        }
-    }
 }
 
 const QWEN2_PRE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
