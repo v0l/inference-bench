@@ -121,7 +121,7 @@ blocks, then prefill B there. Greedy decode afterwards matches too.
 ## Scheduler integration
 
 `sched::Scheduler` owns the `PrefixCache` when `[runtime.prefix_cache] enabled = true` and the
-executor allows it (`Executor::supports_prefix_cache`, false while MTP speculation is on).
+executor allows it (`Executor::supports_prefix_cache`).
 
 - `submit` computes the namespace root from the request salt.
 - `admit` hashes the prompt, calls `lookup` (never the last prompt token), evicts unreferenced
@@ -206,18 +206,67 @@ memory, not in the KV pool, so they do not reduce KV blocks. Eviction under pres
 `tiny_prefix_cached_scheduling_matches_single_sequence_greedy` (90 blocks, 6 slots, 24 requests with
 a shared prefix, exact greedy output).
 
-The 27B rows need `[mtp] speculate = false`. While MTP speculation is on the cache is off
-(`supports_prefix_cache`), because the draft layer keeps its own KV that a hit would skip. The
-first 27B run with the stock spec confirmed it: hit rate 0.000, same TTFT as off. Making the cache
-work with MTP is the follow-up.
+The 27B rows above ran with `[mtp] speculate = false`. The cache now also works with MTP speculation
+on, which is the stock serving config. A snapshot carries three parts: the conv state, the ssm state
+and the MTP pending hidden row of the slot (the input of the next draft round). The draft layer's KV
+needs no extra copy because it lives in the same paged blocks as the target layers (`kv_layers`
+includes the MTP layer), so a shared block already holds both. Restoring clears the slot's draft
+flag, so the first speculative step after a hit re-primes the drafts from the restored hidden.
+
+Qwen3.8 27B nvfp4 with `speculate = true`, `draft_tokens = 2` (the stock spec), same 20 turn transcript:
+
+| cache | turn 1 | turn 2 | turn 10 | turn 20 | median | hit rate | snapshots |
+|---|---|---|---|---|---|---|---|
+| off | 1328 | 1994 | 7741 | 15047 | 8577 | 0 | 0 |
+| on | 738 | 410 | 473 | 533 | 487 | 0.913 | 8 (1255 MB) |
+
+Tests: `a_prefix_cache_hit_with_speculation_on_gives_the_output_of_a_run_without_the_cache` and
+`the_cached_state_includes_the_draft_layer_kv_and_pending_hidden` (tests/mtp.rs, tiny MTP fixture,
+4 chat turns, greedy output identical with the cache on and off, every later turn hits).
+
+### Request ends that are not block aligned
+
+When a request finishes, the full blocks are registered and the partial last block is registered as
+a tail: its parent hash, its tokens, its block, and for hybrid models a state snapshot taken at that
+exact position. A lookup that finds the tail's parent and a prompt that continues the tail's tokens
+gets `tokens = full blocks + tail length`. Admission copies the tail block into a fresh block on the
+device (`copy_kv_block`, a block is never shared while a sequence still writes into it) and starts
+prefill at the exact end of the previous request. Tails are evicted before their parents, die with
+them, count against `max_blocks`, and hybrid tail states count against `max_snapshots`.
+`the_next_chat_turn_hits_the_end_of_the_previous_request_even_when_it_is_not_block_aligned`
+checks 189 of 190 tokens for plain and hybrid models (the previous prompt plus its generated
+tokens, minus the last token that is always recomputed).
+
+### Snapshot copy off the serving thread
+
+`async_snapshots = true` (default) in `[runtime.prefix_cache]`: the state is copied device to device
+into a staging buffer on the compute stream, then a side stream copies it to a pinned host buffer
+and records an event. The serving thread does not wait; the snapshot reads synchronise on that
+event only when a hit restores it. Pinned buffers are recycled through a pool when snapshots are
+evicted. `async_snapshots = false` falls back to a blocking copy.
+
+Decode inter-token gaps of one steady decoder (ms) while six 3072 token prompts arrive one by one,
+snapshot interval 512 (so each long prompt takes several snapshots), 27B nvfp4 with MTP on:
+
+| mode | p50 | p99 | max |
+|---|---|---|---|
+| cache off | 99.4 | 756 | 940 |
+| cache on, async copy | 99.5 | 105 | 136 |
+| cache on, blocking copy | 98.5 | 213 | 231 |
+
+The async copy halves the worst gap against the blocking copy. The cache off row has larger gaps
+than both cache rows, and that is probably not the copy: with the cache on, hybrid prefill is cut
+at every snapshot point (512 tokens here), so each step runs a shorter prefill chunk beside the
+decoder. That explanation is untested (no run with the cache on and the interval above the prompt
+length). The comparison this table supports is async against blocking copy, both with the same
+chunking: p99 105 against 213 ms.
 
 ## Status
 
 Done: refcounted blocks, hash chain, LRU cache, snapshot store, snapshot and restore on the runtime,
 the config table, scheduler integration, server usage, metrics and salts, the template test, the
-benchmarks above, bit identical A+B equals A, snapshot, B test.
+benchmarks above, bit identical A+B equals A, snapshot, B test, the cache with MTP on, tail
+snapshots at non block aligned request ends, asynchronous snapshot copies.
 
-Left: the cache with MTP speculation on (the draft layer's own KV and pending hidden state need
-the same treatment as the target state), snapshots at chat template message boundaries,
-persisting `StateSnapshot` and cached blocks for the idle session disk snapshot issue, and a
-hybrid snapshot at the exact end of a request that is not block aligned.
+Left (issue #326): snapshots at chat template message boundaries, and persisting `StateSnapshot`
+and cached blocks to disk. `StateSnapshot` is already one flat f32 buffer plus the three lengths.
