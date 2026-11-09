@@ -1,5 +1,5 @@
 use crate::App;
-use crate::strip;
+use crate::{block, strip};
 use eframe::egui;
 use egui_bench::prelude::*;
 use inference_bench_core::library::{Format, LocalModel, human_size};
@@ -173,6 +173,10 @@ fn body(detail: &mut Detail, ui: &mut egui::Ui) {
             strip::draw(ui, n, &v.anatomy, scale, kind, layer);
         }
         strip::legend(ui);
+    });
+    let layer_for_block = layer.unwrap_or_else(|| view.anatomy.layers.iter().find(|l| l.kind == *kind).map_or(0, |l| l.index));
+    section(ui, "block diagram", &block::title(*kind, *layer, &view.spec), |ui| {
+        block::draw(ui, &view.spec, *kind, layer_for_block);
     });
 }
 
