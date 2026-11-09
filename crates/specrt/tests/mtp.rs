@@ -34,6 +34,7 @@ fn spec(k: usize) -> Spec {
     s.name = "tiny-qwen3.5-mtp".into();
     s.repo = dir.display().to_string();
     s.mtp.as_mut().unwrap().draft_tokens = k;
+    s.mtp.as_mut().unwrap().graph = true;
     s
 }
 

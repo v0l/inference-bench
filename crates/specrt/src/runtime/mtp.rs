@@ -176,7 +176,7 @@ impl MtpState {
             clog: z(layers * rows * la.conv_dim())?,
             has_drafts: vec![false; rt.slots + 1],
             graphs: HashMap::new(),
-            use_graphs: s.runtime.graphs,
+            use_graphs: s.runtime.graphs && m.graph,
             syncs: Cell::new(0),
             stats: SpecStats::default(),
         })

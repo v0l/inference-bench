@@ -21,6 +21,7 @@ quant = "bf16"        # weight format of the MTP decoder layer; fc and norms are
 draft_tokens = 2      # k, 1 to 3
 speculate = true
 max_batch = 8         # optional: plain decode when more sequences decode at once
+graph = false         # optional: capture the whole speculative round in a CUDA graph (needs [runtime] graphs)
 ```
 
 ```toml
@@ -308,8 +309,7 @@ verify rows (batch 11 at k = 2) the GEMMs take over again.
 
 The single-stream speedup (1.36x for 2.43 tokens per step) is below the acceptance length because
 each speculative step pays the 3-row verify, the MTP pass over the accepted rows and two chained
-MTP steps, each with its own lm_head over 248k rows, and the step is not graph-captured: every
-host-to-device index upload synchronises the stream. The issue's target of 162 tok/s single stream
+MTP steps, each with its own lm_head over 248k rows, and the round used to synchronise the stream on every host-to-device index upload. The issue's target of 162 tok/s single stream
 is about the weight kernels (#361, #362); plain decode here is 23 tok/s.
 
 ## Commands
@@ -327,3 +327,25 @@ flock /tmp/gpu27.lock ./scripts/spec27b.sh          # BATCHES, NEW, SPEC
 flock /tmp/gpu27.lock cargo test --release --test real27b real_27b_mtp_ -- --ignored --nocapture
 $PY scripts/reference.py real-mtp orcarouter/Qwen3.8-27B-Uncensored-NVFP4 $SPECRT_REF_DIR
 ```
+
+## Device-side round (#401)
+
+The next round's row indices, positions, slots and copy indices are built on the device from
+`spec_accept`'s `accepted` output (`mtp_round_in`, `mtp_chain_rows`, `mtp_pick_rows`). Drafts live
+in a device buffer per slot. A round uploads one packed buffer (`rin`: tokens, positions, slots,
+accept caps, sampling params), runs verify, accept, commit, the MTP pass over the emitted rows and
+the k chained drafts, and reads back accept counts and emitted tokens once. The stream is
+synchronised once per round (test `a_speculative_round_synchronises_the_stream_at_most_once`).
+`[mtp] graph = true` captures that round per padded batch size (1, 2, 4, 8, ...) as `decode` does.
+
+`scripts/spec27b.sh`, batch 1 and 4, k = 2, acceptance 2.43, alternating runs on the 27B NVFP4
+beside the served vLLM (decode tok/s, speculative rows only):
+
+| build | batch 1 | batch 4 |
+|---|---|---|
+| before (origin/master) | 84.6, 31.1 | 283.8, 106.6 |
+| device round, eager | 83.9, 86.1 | 291.8, 275.0 |
+| device round, graph | 76.8, 79.8, 81.4, 87.6 | 292.2, 261.3, 282.1, 288.1 |
+
+The device round plus graph does not clear the issue's 15% bar on this box (the 31.1 and 106.6
+base runs coincide with vLLM load). The graph path stays off by default.

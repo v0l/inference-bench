@@ -387,6 +387,8 @@ pub struct Mtp {
     pub speculate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub graph: bool,
 }
 
 fn default_draft_tokens() -> usize {
@@ -399,7 +401,7 @@ fn default_true() -> bool {
 
 impl Mtp {
     pub fn new(layers: usize) -> Mtp {
-        Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None }
+        Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None, graph: false }
     }
 }
 
