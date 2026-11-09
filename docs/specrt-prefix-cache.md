@@ -164,12 +164,60 @@ prefix of turn 2. With it off (the template drops the old reasoning) the chain f
 changed block, so the cache only shares the part that really is equal. Equal ids from different
 request shapes (string or content parts) share keys, and thinking on and off never share a tail.
 
-## Slice 1 status and what is left
+## Measurements
 
-Done in slice 1: refcounted blocks, hash chain, LRU cache, snapshot store, snapshot and restore on
-the runtime, the config table, the equality test.
+`prefixbench` (`crates/specrt/src/bin/prefixbench.rs`): `prefixbench <spec> <turns|clients> <on|off> [snapshot_interval] [kv_gb]`.
+Greedy, synthetic token ids, one warm-up request. The GPU was shared with other workers' jobs and the
+live vLLM during these runs (the lock serialises our runs, not theirs), so absolute times are noisy;
+the 27B off runs vary from 8.5 s to 14.8 s at turn 20 between runs.
 
-Left for slice 2: scheduler integration (lookup before admission, chunk prefill at snapshot points,
-register on finish, eviction under allocation pressure), `usage.prompt_tokens_details.cached_tokens`,
-the `inference_prefix_cache_*` metrics, `cache_salt` per API key and the timing side channel note,
-the 20 turn transcript and 16 client shared system prompt benchmarks.
+20 turn agent transcript: 1000 token system prompt, each turn appends 32 generated and 500 new tokens,
+TTFT of each request (ms), snapshot interval 2048.
+
+| model | cache | turn 1 | turn 2 | turn 10 | turn 20 | median | hit rate |
+|---|---|---|---|---|---|---|---|
+| Qwen3-0.6B | off | 14.2 | 18.8 | 207 | 543 | 256 | 0 |
+| Qwen3-0.6B | on | 13.6 | 10.1 | 18.8 | 31.1 | 20.8 | 0.912 |
+| Qwen3.8 27B nvfp4, MTP off | off | 1339 | 1039 | 7479 | 14833 | 7479 | 0 |
+| Qwen3.8 27B nvfp4, MTP off | on | 779 | 496 | 528 | 592 | 561 | 0.907 |
+
+With the cache the TTFT is flat in the context length (the remainder of a turn is about 530 new
+tokens) while without it TTFT grows linearly with the transcript. The 27B hit is 992 tokens at turn 2:
+the hybrid hit stops at the last block boundary of the previous prefill.
+
+16 clients sharing a 2000 token system prompt, 200 unique tokens each, 16 new tokens (Qwen3-0.6B, a
+second wave of 16 new clients with the same system prompt follows the first):
+
+| cache | wave | TTFT mean (ms) | TTFT p95 (ms) | wall (s) | hit rate |
+|---|---|---|---|---|---|
+| off | first | 803 | 1373 | 1.56 | 0 |
+| off | second | 798 | 1377 | 1.56 | 0 |
+| on | first | 434 | 565 | 0.67 | 0.682 |
+| on | second | 318 | 318 | 0.43 | 0.909 |
+
+Within the first wave the first admitted request prefills the whole prompt and registers its blocks
+as each chunk completes, so requests admitted in later steps already hit (hit rate 0.682 of all
+prompt tokens before any wave finished).
+
+Snapshot memory on the 27B: 8 snapshots held 1255 MB of host memory, 157 MB each (conv plus ssm
+state, f32). `max_snapshots` is the budget: the default of 4 is 0.63 GB. Snapshots live in host
+memory, not in the KV pool, so they do not reduce KV blocks. Eviction under pressure is covered by
+`cached_blocks_are_evicted_when_new_requests_need_the_pool_and_output_stays_exact` and the GPU test
+`tiny_prefix_cached_scheduling_matches_single_sequence_greedy` (90 blocks, 6 slots, 24 requests with
+a shared prefix, exact greedy output).
+
+The 27B rows need `[mtp] speculate = false`. While MTP speculation is on the cache is off
+(`supports_prefix_cache`), because the draft layer keeps its own KV that a hit would skip. The
+first 27B run with the stock spec confirmed it: hit rate 0.000, same TTFT as off. Making the cache
+work with MTP is the follow-up.
+
+## Status
+
+Done: refcounted blocks, hash chain, LRU cache, snapshot store, snapshot and restore on the runtime,
+the config table, scheduler integration, server usage, metrics and salts, the template test, the
+benchmarks above, bit identical A+B equals A, snapshot, B test.
+
+Left: the cache with MTP speculation on (the draft layer's own KV and pending hidden state need
+the same treatment as the target state), snapshots at chat template message boundaries,
+persisting `StateSnapshot` and cached blocks for the idle session disk snapshot issue, and a
+hybrid snapshot at the exact end of a request that is not block aligned.
