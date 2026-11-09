@@ -69,6 +69,7 @@ struct Slot {
 pub struct OutputParser {
     tools: Vec<Value>,
     tool_parsing: bool,
+    json_calls: bool,
     state: State,
     buffer: String,
     slots: Vec<Slot>,
@@ -88,6 +89,7 @@ impl OutputParser {
         Self {
             tools: tools.to_vec(),
             tool_parsing,
+            json_calls: false,
             state: if reasoning { State::Reasoning } else { State::Content },
             buffer: String::new(),
             slots: Vec::new(),
@@ -96,6 +98,11 @@ impl OutputParser {
             content: String::new(),
             reasoning: String::new(),
         }
+    }
+
+    pub fn hermes(mut self) -> Self {
+        self.json_calls = true;
+        self
     }
 
     pub fn feed(&mut self, text: &str) -> Vec<Delta> {
@@ -202,6 +209,7 @@ impl OutputParser {
             }
             State::Name => self.slots.last_mut().unwrap().name.push_str(&text),
             State::Args => self.slots.last_mut().unwrap().args.push_str(&text),
+            State::Preamble if self.json_calls => self.slots.last_mut().unwrap().args.push_str(&text),
             State::Preamble | State::Between => {}
         }
     }
@@ -259,6 +267,23 @@ impl OutputParser {
         }
     }
 
+    fn end_json_call(&mut self, index: usize, out: &mut Vec<Delta>) {
+        let slot = &mut self.slots[index];
+        slot.ended = true;
+        let Ok(body) = serde_json::from_str::<Value>(slot.args.trim()) else { return };
+        let Some(name) = body["name"].as_str().filter(|n| !n.is_empty()) else { return };
+        let args = match body.get("arguments").or_else(|| body.get("parameters")) {
+            Some(Value::String(s)) => s.clone(),
+            Some(v) => crate::tools::py_dumps(v),
+            None => "{}".to_string(),
+        };
+        slot.name = name.to_string();
+        self.send_name(out);
+        let slot = &mut self.slots[index];
+        slot.arguments = Some(args.clone());
+        out.push(Delta::Args { index, arguments: args });
+    }
+
     fn send_name(&mut self, out: &mut Vec<Delta>) {
         let index = self.slots.len() - 1;
         let slot = &mut self.slots[index];
@@ -276,6 +301,9 @@ impl OutputParser {
         let Some(index) = self.slots.len().checked_sub(1) else { return };
         if self.slots[index].ended {
             return;
+        }
+        if self.json_calls && self.state == State::Preamble {
+            return self.end_json_call(index, out);
         }
         self.send_name(out);
         let slot = &mut self.slots[index];
@@ -470,6 +498,10 @@ fn py_float(v: f64) -> String {
         true => format!("{v:.1}"),
         false => format!("{v}"),
     }
+}
+
+fn py_dumps(v: &Value) -> String {
+    py_json(&v.to_string()).unwrap_or_else(|| v.to_string())
 }
 
 fn py_json(text: &str) -> Option<String> {

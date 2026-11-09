@@ -366,11 +366,17 @@ struct OutputMode {
     tools: Vec<Value>,
     tool_parsing: bool,
     reasoning: bool,
+    hermes: bool,
 }
 
 impl OutputMode {
     fn parses(&self) -> bool {
         self.tool_parsing || self.reasoning
+    }
+
+    fn parser(&self) -> OutputParser {
+        let p = OutputParser::new(&self.tools, self.tool_parsing, self.reasoning);
+        if self.hermes { p.hermes() } else { p }
     }
 }
 
@@ -425,6 +431,7 @@ fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), Api
     let output = OutputMode {
         tool_parsing: state.config.tool_parser.is_some() && !tools.is_empty() && choice == "auto",
         reasoning: state.config.reasoning_parser.is_some() && vars["enable_thinking"] != json!(false),
+        hermes: state.config.tool_parser.as_deref() == Some("hermes"),
         tools,
     };
     Ok((vars, output))
@@ -736,7 +743,10 @@ fn chat_message(text: &str, output: &OutputMode, reason: &'static str) -> (Value
     if !output.parses() {
         return (json!({"role": "assistant", "content": text}), reason);
     }
-    let parsed = OutputParser::parse(&output.tools, output.tool_parsing, output.reasoning, text);
+    let mut parser = output.parser();
+    parser.feed(text);
+    parser.finish();
+    let parsed = parser.result();
     let mut message = json!({"role": "assistant", "content": parsed.content});
     if let Some(r) = &parsed.reasoning {
         message["reasoning"] = json!(r);
@@ -816,7 +826,7 @@ fn sse_events(
         })
     });
     let mut streamed = false;
-    let mut parser = output.parses().then(|| OutputParser::new(&output.tools, output.tool_parsing, output.reasoning));
+    let mut parser = output.parses().then(|| output.parser());
     let tail = body.flat_map(move |ev| {
         let _keep = &guard;
         let deltas = |_: &mut OutputParser, deltas: Vec<Delta>| -> Vec<Result<Event, Infallible>> {

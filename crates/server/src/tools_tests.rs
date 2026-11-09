@@ -301,6 +301,22 @@ fn with_tool_parsing_off_tags_are_content() {
 }
 
 #[test]
+fn hermes_json_calls_parse_with_python_spacing() {
+    let text = "<think>\nhmm\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\":\"Paris\",\"n\":[1,2]}}\n</tool_call>";
+    for chunks in [vec![text], by_char(text)] {
+        let mut p = OutputParser::new(&weather_tools(), true, true).hermes();
+        for c in &chunks {
+            p.feed(c);
+        }
+        p.finish();
+        let r = p.result();
+        assert_eq!(calls(&r), [("get_weather", r#"{"city": "Paris", "n": [1, 2]}"#)]);
+        assert_eq!(r.reasoning.as_deref(), Some("\nhmm\n"));
+        assert_eq!(r.content, None);
+    }
+}
+
+#[test]
 fn a_partial_tag_at_a_chunk_edge_is_held_back() {
     let mut p = OutputParser::new(&weather_tools(), true, false);
     assert_eq!(p.feed("Hello <tool"), vec![Delta::Content("Hello ".into())]);

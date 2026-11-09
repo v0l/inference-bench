@@ -259,7 +259,7 @@ impl ServerConfig {
         anyhow::ensure!(self.kv_cache_gb.is_none_or(|g| g > 0.0), "kv_cache_gb must be positive");
         anyhow::ensure!(self.max_loaded_models >= 1, "max_loaded_models must be at least 1");
         if let Some(p) = &self.tool_parser {
-            anyhow::ensure!(matches!(p.as_str(), "qwen3_coder" | "qwen3_xml"), "tool_parser {p} is not supported: use qwen3_coder");
+            anyhow::ensure!(matches!(p.as_str(), "qwen3_coder" | "qwen3_xml" | "hermes"), "tool_parser {p} is not supported: use qwen3_coder or hermes");
         }
         if let Some(p) = &self.reasoning_parser {
             anyhow::ensure!(p == "qwen3", "reasoning_parser {p} is not supported: use qwen3");

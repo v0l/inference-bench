@@ -72,6 +72,37 @@ fn concurrent_requests_are_batched_and_match_their_solo_output() {
 
 #[test]
 #[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
+fn qwen3_0_6b_answers_a_tool_turn_with_a_parsed_call() {
+    let rig = serving_rig("tool_parser = 'hermes'\nreasoning_parser = 'qwen3'\n[chat_template_kwargs]\nenable_thinking = true\n");
+    let tools = json!([{"type": "function", "function": {"name": "get_weather", "description": "Get the weather for a city",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]);
+    let body = json!({"model": "q", "temperature": 0, "max_tokens": 400, "tools": tools,
+        "messages": [{"role": "user", "content": "What is the weather in Paris? Use the tool."}]});
+    let (s, text, _) = rig.post("/v1/chat/completions", None, body.clone());
+    assert_eq!(s, 200, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let choice = &v["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
+    let call = &choice["message"]["tool_calls"][0]["function"];
+    assert_eq!(call["name"], "get_weather");
+    let args: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
+    assert!(args["city"].as_str().unwrap().contains("Paris"), "{args}");
+    assert!(choice["message"]["reasoning_content"].is_string(), "{text}");
+    let mut stream = body;
+    stream["stream"] = json!(true);
+    let (_, sse, _) = rig.post("/v1/chat/completions", None, stream);
+    let args: String = sse
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|e| e["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str().map(String::from))
+        .collect();
+    assert_eq!(args, call["arguments"].as_str().unwrap());
+    rig.stop();
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
 fn a_dropped_stream_frees_its_kv_blocks_within_a_step() {
     let rig = serving_rig("");
     let body = completion("Write a very long story about a dragon.", 1500, true).to_string();
