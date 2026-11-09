@@ -349,7 +349,7 @@ fn prefix_cached_scheduler_matches_single(dir: &str) {
     drop(single);
     let layout = Layout { max_ctx: 512, slots: 6, kv_blocks: 90, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
     let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
-    let prefix_cache = PrefixCacheOptions { enabled: true, snapshot_interval: 64, max_snapshots: 4, max_blocks: 0 };
+    let prefix_cache = PrefixCacheOptions { enabled: true, snapshot_interval: 64, max_snapshots: 4, max_blocks: 0, async_snapshots: true };
     let cfg = Config { max_num_seqs: 6, max_batched_tokens: 300, reserve_blocks: Some(1), prefix_cache, ..Config::default() };
     let mut sched = Scheduler::new(exec, cfg);
     let ids: Vec<u64> = prompts

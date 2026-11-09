@@ -21,6 +21,8 @@ fn tokens(n: usize, salt: u32) -> Vec<u32> {
     (0..n as u32).map(|i| 1000 + (i * 7 + salt * 131) % 5000).collect()
 }
 
+static ASYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 struct Bench {
     sched: Scheduler<GpuExecutor>,
 }
@@ -35,7 +37,7 @@ struct Reply {
 impl Bench {
     fn new(spec: &Spec, cache: bool, interval: usize, max_ctx: usize, slots: usize, kv_gb: f64) -> Result<Self> {
         let mut spec = spec.clone();
-        spec.runtime.prefix_cache = PrefixCacheOptions { enabled: cache, snapshot_interval: interval, max_snapshots: 8, max_blocks: 0 };
+        spec.runtime.prefix_cache = PrefixCacheOptions { enabled: cache, snapshot_interval: interval, max_snapshots: 8, max_blocks: 0, async_snapshots: ASYNC.load(std::sync::atomic::Ordering::Relaxed) };
         let layout = Layout::serving(&spec, max_ctx, slots, Some((kv_gb * (1u64 << 30) as f64) as usize));
         let rt = Runtime::load_layout(&spec, layout)?;
         let cfg = Config { max_num_seqs: slots, prefix_cache: spec.runtime.prefix_cache, ..Config::default() };
@@ -138,15 +140,60 @@ fn clients(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> 
     Ok(())
 }
 
+fn itl(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> {
+    let (long, newcomers, new) = (3072usize, 6usize, 400usize);
+    let max_ctx = long + new + 64;
+    let mut b = Bench::new(spec, cache, interval, max_ctx, newcomers + 1, kv_gb)?;
+    b.run(vec![tokens(64, 99)], 4)?;
+    let steady = b.sched.submit(Request { prompt: tokens(64, 5), max_tokens: new, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() })?;
+    let mut waiting: Vec<Vec<u32>> = (0..newcomers as u32).map(|c| tokens(long, 40 + c)).collect();
+    let mut last: Option<Instant> = None;
+    let mut gaps: Vec<f64> = Vec::new();
+    let mut step = 0usize;
+    while !b.sched.idle() {
+        if step % 40 == 20 && !waiting.is_empty() {
+            let prompt = waiting.remove(0);
+            b.sched.submit(Request { prompt, max_tokens: 4, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() })?;
+        }
+        let mut events = Vec::new();
+        b.sched.step(&mut events)?;
+        let now = Instant::now();
+        let got = events.iter().filter(|e| matches!(e, Event::Token { id, .. } if *id == steady)).count();
+        if got > 0 {
+            if let Some(prev) = last {
+                gaps.push(now.duration_since(prev).as_secs_f64() * 1e3);
+            }
+            last = Some(now);
+        }
+        step += 1;
+    }
+    gaps.sort_by(f64::total_cmp);
+    let p = b.sched.prefix_stats();
+    println!(
+        "SUMMARY itl cache={cache} async={} model={} gaps={} p50_ms={:.1} p99_ms={:.1} max_ms={:.1} snapshots={} snapshot_mb={:.0}",
+        ASYNC.load(std::sync::atomic::Ordering::Relaxed),
+        spec.name,
+        gaps.len(),
+        gaps[gaps.len() / 2],
+        gaps[(gaps.len() - 1) * 99 / 100],
+        gaps[gaps.len() - 1],
+        p.snapshots,
+        p.snapshot_bytes as f64 / 1e6
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: prefixbench <spec.toml | checkpoint dir> <turns|clients> <on|off> [snapshot_interval] [kv_gb]";
+    let usage = "usage: prefixbench <spec.toml | checkpoint dir> <turns|clients|itl> <on|off> [snapshot_interval] [kv_gb] [sync]";
     let spec = load_spec(&PathBuf::from(args.first().context(usage)?))?;
     let mode = args.get(1).context(usage)?.as_str();
     let cache = args.get(2).context(usage)? == "on";
     let interval: usize = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(2048);
     let kv_gb: f64 = args.get(4).map(|s| s.parse()).transpose()?.unwrap_or(4.0);
+    ASYNC.store(args.get(5).is_none_or(|s| s != "sync"), std::sync::atomic::Ordering::Relaxed);
     match mode {
+        "itl" => itl(&spec, cache, interval, kv_gb),
         "turns" => turns(&spec, cache, interval, kv_gb),
         "clients" => clients(&spec, cache, interval, kv_gb),
         _ => anyhow::bail!(usage),

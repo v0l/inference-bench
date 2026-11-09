@@ -115,6 +115,9 @@ pub trait Executor {
     fn restore(&mut self, _slot: usize, _state: &StateSnapshot) -> Result<()> {
         bail!("this executor cannot restore recurrent state")
     }
+    fn copy_block(&mut self, _src: u32, _dst: u32) -> Result<()> {
+        bail!("this executor cannot copy KV blocks")
+    }
 }
 
 pub struct GpuExecutor {
@@ -201,7 +204,7 @@ impl Executor for GpuExecutor {
     }
 
     fn supports_prefix_cache(&self) -> bool {
-        self.rt.draft_tokens().is_none()
+        true
     }
 
     fn hybrid(&self) -> bool {
@@ -218,6 +221,10 @@ impl Executor for GpuExecutor {
 
     fn restore(&mut self, slot: usize, state: &StateSnapshot) -> Result<()> {
         self.rt.restore_state(slot, state)
+    }
+
+    fn copy_block(&mut self, src: u32, dst: u32) -> Result<()> {
+        self.rt.copy_kv_block(src, dst)
     }
 }
 
@@ -529,7 +536,7 @@ impl<E: Executor> Scheduler<E> {
                 Some(cache) => {
                     let hashes = prefix::block_hashes(&s.root, &s.tokens[..target]);
                     let limit = if s.generated() == 0 { target - 1 } else { target };
-                    cache.lookup(&hashes, limit, &mut self.pool)
+                    cache.lookup_with_tail(&s.root, &s.tokens[..target], &hashes, limit, &mut self.pool)
                 }
                 None => prefix::Hit::default(),
             };
@@ -541,23 +548,20 @@ impl<E: Executor> Scheduler<E> {
                 }
             }
             if self.pool.free_count() < fresh + reserve {
-                let mut held = hit.blocks;
-                self.pool.release(&mut held);
+                self.give_back(hit);
                 break;
             }
             let slot = *self.free_slots.last().expect("a free slot");
             if self.exec.acquire_state(slot).is_err() {
                 self.state_refusals += 1;
-                let mut held = hit.blocks;
-                self.pool.release(&mut held);
+                self.give_back(hit);
                 break;
             }
             let mut s = self.waiting.pop_front().expect("front exists");
             if let Some(state) = &hit.snapshot {
                 if let Err(e) = self.exec.restore(slot, state) {
                     self.exec.release_state(slot);
-                    let mut held = hit.blocks;
-                    self.pool.release(&mut held);
+                    self.give_back(hit);
                     self.waiting.push_front(s);
                     return Err(e);
                 }
@@ -572,6 +576,12 @@ impl<E: Executor> Scheduler<E> {
             }
             s.computed = hit.tokens;
             s.blocks = hit.blocks;
+            if let Some(src) = hit.tail {
+                let dst = self.pool.alloc().expect("checked free blocks");
+                self.exec.copy_block(src, dst)?;
+                s.blocks.push(dst);
+                self.pool.release(&mut vec![src]);
+            }
             for _ in s.blocks.len()..blocks_for(target) {
                 s.blocks.push(self.pool.alloc().expect("checked free blocks"));
             }
@@ -585,31 +595,44 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
+    fn give_back(&mut self, hit: prefix::Hit) {
+        let mut held = hit.blocks;
+        held.extend(hit.tail);
+        self.pool.release(&mut held);
+    }
+
     fn cache_progress(&mut self, i: usize, final_state: bool) -> Result<()> {
         let hybrid = self.exec.hybrid();
         let s = &self.running[i];
         let upto = s.computed / PAGE;
-        if self.cache.is_none() || upto == 0 {
+        let rem = s.computed % PAGE;
+        if self.cache.is_none() || s.computed == 0 {
             return Ok(());
         }
-        let aligned = s.computed.is_multiple_of(PAGE);
-        let at_point = if final_state {
-            aligned
-        } else {
-            self.snapshot_points(i).contains(&s.computed)
-        };
+        let at_point = if final_state { true } else { rem == 0 && self.snapshot_points(i).contains(&s.computed) };
+        if !final_state && upto == 0 {
+            return Ok(());
+        }
         let hashes = prefix::block_hashes(&s.root, &s.tokens[..upto * PAGE]);
         let blocks = s.blocks[..upto].to_vec();
         let slot = s.slot.expect("running has a slot");
-        let cached = self.cache.as_ref().is_some_and(|c| c.has_snapshot(&hashes[upto - 1]));
-        let take = hybrid && at_point && !cached;
+        let parent = if upto == 0 { s.root } else { hashes[upto - 1] };
+        let tail_tokens = s.tokens[upto * PAGE..s.computed].to_vec();
+        let tail_block = (rem > 0).then(|| s.blocks[upto]);
+        let have_state = upto > 0 && rem == 0 && self.cache.as_ref().is_some_and(|c| c.has_snapshot(&parent));
+        let have_tail = rem > 0 && self.cache.as_ref().is_some_and(|c| c.has_tail(&parent, &tail_tokens));
+        let take = hybrid && at_point && !have_state && !have_tail;
         let state = if take { Some(Arc::new(self.exec.snapshot(slot)?)) } else { None };
         let cache = self.cache.as_mut().expect("checked above");
-        if !hybrid || take {
+        if !hybrid || final_state || take {
             cache.register(&hashes, &blocks, &mut self.pool);
         }
-        if let Some(state) = state {
-            cache.store_snapshot(hashes[upto - 1], state);
+        if final_state && rem > 0 {
+            if let Some(block) = tail_block {
+                cache.register_tail(parent, upto == 0, &tail_tokens, block, state, &mut self.pool);
+            }
+        } else if let (Some(state), true) = (state, upto > 0) {
+            cache.store_snapshot(parent, state, &mut self.pool);
         }
         Ok(())
     }
@@ -831,6 +854,7 @@ mod tests {
         pub hybrid: bool,
         pub prefix_enabled: bool,
         pub restores: usize,
+        pub block_copies: usize,
         pub spec_k: usize,
         pub spec_cap: usize,
         pub spec_calls: Vec<usize>,
@@ -854,6 +878,7 @@ mod tests {
                 hybrid: true,
                 prefix_enabled: true,
                 restores: 0,
+                block_copies: 0,
                 spec_k: 0,
                 spec_cap: 0,
                 spec_calls: Vec::new(),
@@ -936,12 +961,20 @@ mod tests {
         }
         fn snapshot(&mut self, slot: usize) -> Result<StateSnapshot> {
             let (h, n) = self.state[slot];
-            Ok(StateSnapshot { conv: Vec::new(), ssm: vec![f32::from_bits(h as u32), f32::from_bits((h >> 32) as u32), f32::from_bits(n as u32)] })
+            Ok(StateSnapshot::new(Vec::new(), vec![f32::from_bits(h as u32), f32::from_bits((h >> 32) as u32), f32::from_bits(n as u32)], Vec::new()))
         }
         fn restore(&mut self, slot: usize, state: &StateSnapshot) -> Result<()> {
-            let h = state.ssm[0].to_bits() as u64 | (state.ssm[1].to_bits() as u64) << 32;
-            self.state[slot] = (h, state.ssm[2].to_bits() as usize);
+            let s = state.ssm();
+            let h = s[0].to_bits() as u64 | (s[1].to_bits() as u64) << 32;
+            self.state[slot] = (h, s[2].to_bits() as usize);
             self.restores += 1;
+            Ok(())
+        }
+        fn copy_block(&mut self, src: u32, dst: u32) -> Result<()> {
+            for i in 0..PAGE {
+                self.kv[dst as usize * PAGE + i] = self.kv[src as usize * PAGE + i];
+            }
+            self.block_copies += 1;
             Ok(())
         }
         fn draft_tokens(&self) -> usize {
@@ -1121,7 +1154,7 @@ mod tests {
 
     fn cached_config(interval: usize, snapshots: usize) -> Config {
         Config {
-            prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: interval, max_snapshots: snapshots, max_blocks: 0 },
+            prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: interval, max_snapshots: snapshots, max_blocks: 0, async_snapshots: true },
             ..Config::default()
         }
     }
@@ -1166,8 +1199,8 @@ mod tests {
     }
 
     #[test]
-    fn the_next_chat_turn_hits_the_previous_request_to_the_last_block_that_has_state() {
-        for (hybrid, want) in [(false, 176), (true, 144)] {
+    fn the_next_chat_turn_hits_the_end_of_the_previous_request_even_when_it_is_not_block_aligned() {
+        for (hybrid, want) in [(false, 189), (true, 189)] {
             let mut fake = Fake::new(2048, 4, 200, 256);
             fake.hybrid = hybrid;
             let mut s = Scheduler::new(fake, cached_config(512, 4));
@@ -1178,7 +1211,7 @@ mod tests {
             turn2.prompt.extend((0..30u32).map(|i| (i * 7 + 1) % VOCAB));
             let (got, cached, prefilled) = run_one(&mut s, turn2.clone());
             assert_eq!(got, expected(&turn2.prompt, 40, &[]), "hybrid = {hybrid}");
-            assert_eq!(cached, want, "hybrid = {hybrid}: plain models reach the generated tokens, hybrids the last prefill block");
+            assert_eq!(cached, want, "hybrid = {hybrid}: the whole previous request, tail block included");
             assert_eq!(prefilled, turn2.prompt.len() - want);
         }
     }
@@ -1217,7 +1250,7 @@ mod tests {
 
     #[test]
     fn different_salts_never_share_a_prefix() {
-        let mut s = Scheduler::new(Fake::new(2048, 4, 200, 256), cached_config(64, 4));
+        let mut s = Scheduler::new(Fake::new(2048, 4, 200, 256), cached_config(64, 16));
         let a = Request { salt: "key-a".into(), ..request(200, 3, 4) };
         run_one(&mut s, a.clone());
         let (_, cached, _) = run_one(&mut s, Request { salt: "key-b".into(), ..a.clone() });

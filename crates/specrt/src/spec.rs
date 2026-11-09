@@ -110,11 +110,12 @@ pub struct PrefixCacheOptions {
     pub snapshot_interval: usize,
     pub max_snapshots: usize,
     pub max_blocks: usize,
+    pub async_snapshots: bool,
 }
 
 impl Default for PrefixCacheOptions {
     fn default() -> Self {
-        PrefixCacheOptions { enabled: false, snapshot_interval: 2048, max_snapshots: 4, max_blocks: 0 }
+        PrefixCacheOptions { enabled: false, snapshot_interval: 2048, max_snapshots: 4, max_blocks: 0, async_snapshots: true }
     }
 }
 

@@ -237,6 +237,27 @@ impl Runtime {
         }
     }
 
+    pub(super) fn mtp_pending_host(&self, slot: usize) -> Result<Vec<f32>> {
+        let h = self.spec.dims.hidden;
+        Ok(self.stream.clone_dtoh(&self.mtp().pending.slice(slot * h..(slot + 1) * h))?)
+    }
+
+    pub(super) fn mtp_pending_to(&self, slot: usize, dst: &mut cudarc::driver::CudaViewMut<f32>) -> Result<()> {
+        let h = self.spec.dims.hidden;
+        self.stream.memcpy_dtod(&self.mtp().pending.slice(slot * h..(slot + 1) * h), dst)?;
+        Ok(())
+    }
+
+    pub(super) fn mtp_pending_from(&mut self, slot: usize, host: &[f32]) -> Result<()> {
+        let h = self.spec.dims.hidden;
+        ensure!(host.len() == h, "pending hidden of {} values for a hidden size of {h}", host.len());
+        let stream = self.stream.clone();
+        let m = self.mtp.as_mut().context("no MTP layer")?;
+        stream.memcpy_htod(host, &mut m.pending.slice_mut(slot * h..(slot + 1) * h))?;
+        m.has_drafts[slot] = false;
+        Ok(())
+    }
+
     fn up_i32(&self, host: &[i32], dst: &impl cudarc::driver::DevicePtr<i32>) -> Result<()> {
         ensure!(host.len() <= dst.len(), "{} values for a device buffer of {}", host.len(), dst.len());
         if host.is_empty() {

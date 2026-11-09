@@ -273,6 +273,61 @@ fn plain_greedy(s: &Spec, prompts: &[Vec<u32>]) -> Vec<Vec<u32>> {
         .collect()
 }
 
+fn cached_turns(s: &Spec, cache: bool) -> (Vec<Vec<u32>>, Vec<usize>, usize) {
+    use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
+    use specrt::spec::PrefixCacheOptions;
+    let lay = Layout { max_ctx: 512, slots: 3, kv_blocks: 3 * 32, prefill_chunk: 64, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
+    let rt = Runtime::load_layout(s, lay).unwrap();
+    let prefix_cache = PrefixCacheOptions { enabled: cache, snapshot_interval: 32, max_snapshots: 8, max_blocks: 0, async_snapshots: true };
+    let mut sched = Scheduler::new(GpuExecutor::new(rt).unwrap(), Config { max_num_seqs: 3, max_batched_tokens: 128, prefix_cache, ..Config::default() });
+    let mut prompt = prompt(5);
+    let (mut outs, mut cached) = (Vec::new(), Vec::new());
+    for turn in 0..4u32 {
+        let id = sched.submit(Request { prompt: prompt.clone(), max_tokens: 24, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() }).unwrap();
+        let mut got = Vec::new();
+        while !sched.idle() {
+            let mut events = Vec::new();
+            sched.step(&mut events).unwrap();
+            for e in events {
+                match e {
+                    Event::Token { id: i, token } if i == id => got.push(token),
+                    Event::Finished { id: i, cached_tokens, .. } if i == id => cached.push(cached_tokens),
+                    _ => {}
+                }
+            }
+        }
+        prompt.extend(&got);
+        prompt.extend((0..17u32).map(|j| (j * 53 + turn * 31 + 9) % 1024));
+        outs.push(got);
+    }
+    (outs, cached, sched.exec.rt.spec_stats().steps as usize)
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_prefix_cache_hit_with_speculation_on_gives_the_output_of_a_run_without_the_cache() {
+    let s = spec(2);
+    let (off, off_cached, off_steps) = cached_turns(&s, false);
+    let (on, on_cached, on_steps) = cached_turns(&s, true);
+    assert!(off_steps > 0 && on_steps > 0, "speculation ran");
+    assert_eq!(off_cached, vec![0, 0, 0, 0]);
+    assert_eq!(on, off, "greedy output with the cache equals the run without it");
+    assert_eq!(on_cached[0], 0);
+    assert!(on_cached[1..].iter().all(|&c| c > 0), "every next turn hit the previous one: {on_cached:?}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_cached_state_includes_the_draft_layer_kv_and_pending_hidden() {
+    let s = spec(2);
+    let (off, _, _) = cached_turns(&s, false);
+    let mut sync = s.clone();
+    sync.runtime.prefix_cache.async_snapshots = false;
+    let (on_sync, cached, _) = cached_turns(&sync, true);
+    assert_eq!(on_sync, off);
+    assert!(cached[1..].iter().all(|&c| c > 0));
+}
+
 enum Drafts {
     Mtp,
     Oracle(usize),

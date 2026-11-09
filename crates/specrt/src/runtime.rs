@@ -17,6 +17,7 @@ use std::time::Instant;
 mod exec;
 mod fused;
 mod mtp;
+mod snapshot;
 mod step;
 pub use fused::PrefillPart;
 use exec::Plans;
@@ -382,6 +383,7 @@ pub struct Runtime {
     ctx: Arc<CudaContext>,
     baseline_free: usize,
     mtp: Option<mtp::MtpState>,
+    snap: snapshot::SnapshotPool,
 }
 
 fn grid(n: usize, per_block: usize) -> u32 {
@@ -707,6 +709,7 @@ impl Runtime {
             ctx: ctx.clone(),
             baseline_free: free_before,
             mtp: None,
+            snap: Default::default(),
         };
         if let Some(w) = mtp_weights {
             rt.mtp = Some(mtp::MtpState::new(&rt, w)?);
@@ -1657,36 +1660,6 @@ impl Runtime {
 
     pub fn last_logits(&self) -> Result<Vec<f32>> {
         Ok(self.stream.clone_dtoh(&self.buf.logits)?)
-    }
-
-    fn state_lens(&self) -> Result<(usize, usize)> {
-        let gb = self.gdn.as_ref().context("no linear layers")?;
-        let layers = self.spec.linear_layers();
-        Ok((layers * gb.la.conv_dim() * (gb.la.conv_kernel - 1), layers * gb.la.value_heads * gb.la.key_head_dim * gb.la.key_head_dim))
-    }
-
-    pub fn snapshot_state(&self, slot: usize) -> Result<crate::prefix::StateSnapshot> {
-        ensure!(slot < self.slots, "slot {slot} out of {}", self.slots);
-        let (conv, ssm) = self.state_lens()?;
-        let gb = self.gdn.as_ref().context("no linear layers")?;
-        ensure!(gb.ssm_pool.is_live(slot), "recurrent state of slot {slot} is not allocated");
-        self.stream.synchronize()?;
-        Ok(crate::prefix::StateSnapshot {
-            conv: self.stream.clone_dtoh(&gb.conv_state.slice(slot * conv..(slot + 1) * conv))?,
-            ssm: self.stream.clone_dtoh(&gb.ssm_state.slice(slot * ssm..(slot + 1) * ssm))?,
-        })
-    }
-
-    pub fn restore_state(&mut self, slot: usize, snap: &crate::prefix::StateSnapshot) -> Result<()> {
-        ensure!(slot < self.slots, "slot {slot} out of {}", self.slots);
-        let (conv, ssm) = self.state_lens()?;
-        ensure!(snap.conv.len() == conv && snap.ssm.len() == ssm, "snapshot does not match this model's recurrent state");
-        self.acquire_state(slot)?;
-        let gb = self.gdn.as_mut().context("no linear layers")?;
-        self.stream.memcpy_htod(&snap.conv, &mut gb.conv_state.slice_mut(slot * conv..(slot + 1) * conv))?;
-        self.stream.memcpy_htod(&snap.ssm, &mut gb.ssm_state.slice_mut(slot * ssm..(slot + 1) * ssm))?;
-        self.stream.synchronize()?;
-        Ok(())
     }
 
     pub fn linear_states(&self) -> Result<LinearStates> {

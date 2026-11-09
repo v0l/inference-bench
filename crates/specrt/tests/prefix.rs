@@ -19,7 +19,7 @@ fn spec_for(dir: &str) -> Spec {
 }
 
 fn options(max_blocks: usize, max_snapshots: usize) -> PrefixCacheOptions {
-    PrefixCacheOptions { enabled: true, snapshot_interval: 2048, max_snapshots, max_blocks }
+    PrefixCacheOptions { enabled: true, snapshot_interval: 2048, max_snapshots, max_blocks, async_snapshots: true }
 }
 
 fn tokens(n: usize, salt: u32) -> Vec<u32> {
@@ -27,7 +27,7 @@ fn tokens(n: usize, salt: u32) -> Vec<u32> {
 }
 
 fn snapshot(tag: f32) -> Arc<StateSnapshot> {
-    Arc::new(StateSnapshot { conv: vec![tag; 4], ssm: vec![tag; 8] })
+    Arc::new(StateSnapshot::new(vec![tag; 4], vec![tag; 8], vec![tag; 2]))
 }
 
 fn root(salt: &str) -> specrt::prefix::Hash {
@@ -130,15 +130,15 @@ fn a_hybrid_hit_stops_at_the_deepest_block_that_has_a_state_snapshot() {
     let (hashes, _) = register_chain(&mut cache, &mut pool, &r, &t);
     let miss = cache.lookup(&hashes, 6 * PAGE - 1, &mut pool);
     assert_eq!((miss.tokens, miss.blocks.len()), (0, 0), "KV without a state is not a hit");
-    cache.store_snapshot(hashes[1], snapshot(1.0));
-    cache.store_snapshot(hashes[3], snapshot(3.0));
+    cache.store_snapshot(hashes[1], snapshot(1.0), &mut pool);
+    cache.store_snapshot(hashes[3], snapshot(3.0), &mut pool);
     let hit = cache.lookup(&hashes, 6 * PAGE - 1, &mut pool);
     assert_eq!(hit.tokens, 4 * PAGE);
     assert_eq!(hit.blocks.len(), 4);
-    assert_eq!(hit.snapshot.unwrap().conv[0], 3.0);
+    assert_eq!(hit.snapshot.unwrap().conv()[0], 3.0);
     let shorter = cache.lookup(&hashes, 3 * PAGE + 2, &mut pool);
     assert_eq!(shorter.tokens, 2 * PAGE);
-    assert_eq!(shorter.snapshot.unwrap().conv[0], 1.0);
+    assert_eq!(shorter.snapshot.unwrap().conv()[0], 1.0);
 }
 
 #[test]
@@ -147,9 +147,9 @@ fn a_snapshot_for_an_uncached_block_is_refused() {
     let mut cache = PrefixCache::new(&options(0, 4), true);
     let r = root("");
     let hashes = block_hashes(&r, &tokens(2 * PAGE, 0));
-    assert!(!cache.store_snapshot(hashes[0], snapshot(1.0)));
+    assert!(!cache.store_snapshot(hashes[0], snapshot(1.0), &mut pool));
     let (hashes, _) = register_chain(&mut cache, &mut pool, &r, &tokens(2 * PAGE, 0));
-    assert!(cache.store_snapshot(hashes[1], snapshot(1.0)));
+    assert!(cache.store_snapshot(hashes[1], snapshot(1.0), &mut pool));
     assert_eq!(cache.snapshots(), 1);
 }
 
@@ -220,7 +220,7 @@ fn evicting_a_block_drops_its_snapshot() {
     let mut cache = PrefixCache::new(&options(0, 4), true);
     let r = root("");
     let (hashes, mut blocks) = register_chain(&mut cache, &mut pool, &r, &tokens(2 * PAGE, 0));
-    cache.store_snapshot(hashes[1], snapshot(1.0));
+    cache.store_snapshot(hashes[1], snapshot(1.0), &mut pool);
     pool.release(&mut blocks);
     assert!(cache.evict_one(&mut pool));
     assert_eq!(cache.snapshots(), 0);
@@ -233,18 +233,18 @@ fn the_snapshot_budget_drops_the_least_recently_used_state() {
     let r = root("");
     let (hashes, mut blocks) = register_chain(&mut cache, &mut pool, &r, &tokens(6 * PAGE, 0));
     pool.release(&mut blocks);
-    cache.store_snapshot(hashes[1], snapshot(1.0));
-    cache.store_snapshot(hashes[3], snapshot(3.0));
+    cache.store_snapshot(hashes[1], snapshot(1.0), &mut pool);
+    cache.store_snapshot(hashes[3], snapshot(3.0), &mut pool);
     let hit = cache.lookup(&hashes[..2], 2 * PAGE, &mut pool);
     assert_eq!(hit.tokens, 2 * PAGE);
     let mut held = hit.blocks.clone();
     pool.release(&mut held);
-    cache.store_snapshot(hashes[5], snapshot(5.0));
+    cache.store_snapshot(hashes[5], snapshot(5.0), &mut pool);
     assert_eq!(cache.snapshots(), 2);
     let deep = cache.lookup(&hashes, 6 * PAGE, &mut pool);
-    assert_eq!(deep.snapshot.unwrap().conv[0], 5.0);
+    assert_eq!(deep.snapshot.unwrap().conv()[0], 5.0);
     let mid = cache.lookup(&hashes, 4 * PAGE, &mut pool);
-    assert_eq!(mid.snapshot.unwrap().conv[0], 1.0, "the state touched by the earlier hit survived, the untouched one went");
+    assert_eq!(mid.snapshot.unwrap().conv()[0], 1.0, "the state touched by the earlier hit survived, the untouched one went");
 }
 
 #[test]
@@ -264,9 +264,127 @@ fn the_prefix_cache_table_parses_and_defaults_to_off() {
     let toml = s.to_toml().unwrap();
     let with = format!("{toml}\n[runtime.prefix_cache]\nenabled = true\nsnapshot_interval = 512\nmax_snapshots = 7\nmax_blocks = 100\n");
     let p = Spec::parse(&with).unwrap().runtime.prefix_cache;
-    assert_eq!(p, PrefixCacheOptions { enabled: true, snapshot_interval: 512, max_snapshots: 7, max_blocks: 100 });
+    assert_eq!(p, PrefixCacheOptions { enabled: true, snapshot_interval: 512, max_snapshots: 7, max_blocks: 100, async_snapshots: true });
     let bad = format!("{toml}\n[runtime.prefix_cache]\nsnapshot_interval = 100\n");
     assert!(format!("{:#}", Spec::parse(&bad).unwrap_err()).contains("snapshot_interval"));
+}
+
+fn tail_setup(hybrid: bool, snapshots: usize) -> (BlockPool, PrefixCache, specrt::prefix::Hash, Vec<u32>, Vec<specrt::prefix::Hash>) {
+    let mut pool = BlockPool::new(32);
+    let mut cache = PrefixCache::new(&options(0, snapshots), hybrid);
+    let r = root("");
+    let t = tokens(2 * PAGE + 5, 0);
+    let (hashes, _) = register_chain(&mut cache, &mut pool, &r, &t[..2 * PAGE]);
+    (pool, cache, r, t, hashes)
+}
+
+#[test]
+fn a_partial_tail_block_hits_only_prompts_that_continue_its_tokens() {
+    let (mut pool, mut cache, r, t, hashes) = tail_setup(false, 4);
+    let tail_block = pool.alloc().unwrap();
+    assert!(cache.register_tail(hashes[1], false, &t[2 * PAGE..], tail_block, None, &mut pool));
+    assert_eq!(pool.refs(tail_block), 2);
+    let longer = [t.clone(), tokens(40, 3)].concat();
+    let hit = cache.lookup_with_tail(&r, &longer, &block_hashes(&r, &longer), longer.len() - 1, &mut pool);
+    assert_eq!((hit.tokens, hit.blocks.len(), hit.tail), (2 * PAGE + 5, 2, Some(tail_block)));
+    assert_eq!(pool.refs(tail_block), 3, "the hit holds the tail source until it is copied");
+    let mut forked = longer.clone();
+    forked[2 * PAGE + 2] ^= 1;
+    let hit = cache.lookup_with_tail(&r, &forked, &block_hashes(&r, &forked), forked.len() - 1, &mut pool);
+    assert_eq!((hit.tokens, hit.tail), (2 * PAGE, None), "a prompt that diverges inside the tail only gets the full blocks");
+    let short = &t[..2 * PAGE + 4];
+    let hit = cache.lookup_with_tail(&r, short, &block_hashes(&r, short), short.len() - 1, &mut pool);
+    assert_eq!((hit.tokens, hit.tail), (2 * PAGE, None), "the last prompt token is never served");
+    let exact = &t[..];
+    let hit = cache.lookup_with_tail(&r, exact, &block_hashes(&r, exact), exact.len() - 1, &mut pool);
+    assert_eq!(hit.tail, None);
+}
+
+#[test]
+fn a_tail_under_the_root_serves_prompts_shorter_than_a_block() {
+    let mut pool = BlockPool::new(8);
+    let mut cache = PrefixCache::new(&options(0, 4), false);
+    let r = root("");
+    let t = tokens(9, 1);
+    let block = pool.alloc().unwrap();
+    assert!(cache.register_tail(r, true, &t, block, None, &mut pool));
+    let longer = [t.clone(), tokens(30, 2)].concat();
+    let hit = cache.lookup_with_tail(&r, &longer, &block_hashes(&r, &longer), longer.len() - 1, &mut pool);
+    assert_eq!((hit.tokens, hit.blocks.len(), hit.tail), (9, 0, Some(block)));
+}
+
+#[test]
+fn a_hybrid_tail_needs_a_state_and_returns_it_with_the_hit() {
+    let (mut pool, mut cache, r, t, hashes) = tail_setup(true, 4);
+    let block = pool.alloc().unwrap();
+    assert!(!cache.register_tail(hashes[1], false, &t[2 * PAGE..], block, None, &mut pool), "no state, no hybrid tail");
+    assert!(cache.register_tail(hashes[1], false, &t[2 * PAGE..], block, Some(snapshot(7.0)), &mut pool));
+    cache.store_snapshot(hashes[0], snapshot(1.0), &mut pool);
+    let longer = [t.clone(), tokens(40, 3)].concat();
+    let hit = cache.lookup_with_tail(&r, &longer, &block_hashes(&r, &longer), longer.len() - 1, &mut pool);
+    assert_eq!((hit.tokens, hit.tail), (2 * PAGE + 5, Some(block)));
+    assert_eq!(hit.snapshot.unwrap().conv()[0], 7.0);
+    let aligned_only = cache.lookup(&block_hashes(&r, &longer), longer.len() - 1, &mut pool);
+    assert_eq!((aligned_only.tokens, aligned_only.tail), (PAGE, None));
+}
+
+#[test]
+fn tails_are_evicted_before_their_parents_and_die_with_them() {
+    let (mut pool, mut cache, _, t, hashes) = tail_setup(false, 4);
+    let block = pool.alloc().unwrap();
+    cache.register_tail(hashes[1], false, &t[2 * PAGE..], block, None, &mut pool);
+    pool.release(&mut vec![block]);
+    for b in 0..32 {
+        while pool.refs(b) > 1 {
+            pool.release(&mut vec![b]);
+        }
+    }
+    assert_eq!(cache.tails(), 1);
+    assert!(cache.evict_one(&mut pool));
+    assert_eq!(cache.tails(), 0, "the tail went first");
+    assert!(cache.has_block(&hashes[1]));
+    assert!(cache.evict_one(&mut pool));
+    assert!(cache.evict_one(&mut pool));
+    assert_eq!(cache.blocks(), 0);
+}
+
+#[test]
+fn evicting_a_parent_drops_the_tails_under_it() {
+    let (mut pool, mut cache, _, t, hashes) = tail_setup(false, 4);
+    let block = pool.alloc().unwrap();
+    cache.register_tail(hashes[1], false, &t[2 * PAGE..], block, None, &mut pool);
+    pool.release(&mut vec![block]);
+    for b in 0..32 {
+        while pool.refs(b) > 1 {
+            pool.release(&mut vec![b]);
+        }
+    }
+    let mut budget = PrefixCache::new(&options(0, 4), false);
+    assert_eq!(budget.tails(), 0);
+    assert!(cache.evict_one(&mut pool));
+    assert!(cache.evict_one(&mut pool));
+    assert!(cache.evict_one(&mut pool));
+    assert_eq!((cache.blocks(), cache.tails()), (0, 0));
+    assert_eq!(pool.free_count(), 32);
+}
+
+#[test]
+fn hybrid_tail_states_count_against_the_snapshot_budget() {
+    let (mut pool, mut cache, _, t, hashes) = tail_setup(true, 2);
+    cache.store_snapshot(hashes[0], snapshot(1.0), &mut pool);
+    let block = pool.alloc().unwrap();
+    cache.register_tail(hashes[1], false, &t[2 * PAGE..], block, Some(snapshot(2.0)), &mut pool);
+    assert_eq!(cache.snapshots(), 2);
+    cache.store_snapshot(hashes[1], snapshot(3.0), &mut pool);
+    assert_eq!(cache.snapshots(), 2, "the oldest state made room");
+}
+
+#[test]
+fn the_state_snapshot_keeps_conv_ssm_and_pending_apart() {
+    let s = StateSnapshot::new(vec![1.0, 2.0], vec![3.0, 4.0, 5.0], vec![6.0]);
+    assert_eq!((s.conv(), s.ssm(), s.pending()), (&[1.0, 2.0][..], &[3.0, 4.0, 5.0][..], &[6.0][..]));
+    assert_eq!(s.bytes(), 24);
+    assert_eq!(s, s.clone());
 }
 
 fn max_ctx() -> usize {
@@ -300,7 +418,7 @@ fn prefill_a_then_b_equals_prefill_a_snapshot_then_b_from_the_snapshot() {
     rt.prefill_slot(&mut st, 1, &a, 0, None).unwrap();
     let hashes = block_hashes(&root, &a);
     cache.register(&hashes, &table1[..hashes.len()], &mut pool);
-    assert!(cache.store_snapshot(*hashes.last().unwrap(), Arc::new(rt.snapshot_state(1).unwrap())));
+    assert!(cache.store_snapshot(*hashes.last().unwrap(), Arc::new(rt.snapshot_state(1).unwrap()), &mut pool));
     let mut released = table1.clone();
     pool.release(&mut released);
 
