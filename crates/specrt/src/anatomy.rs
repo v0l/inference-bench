@@ -196,7 +196,7 @@ impl ModelAnatomy {
         let decode_params = layer_params + hidden + matrix;
         let decode_bytes = layer_bytes + 2 * hidden + quant_bytes(matrix, head_quant);
 
-        let kv_bytes_per_token = (2 * spec.attention_layers() * spec.attention.kv_heads * spec.attention.head_dim * 2) as u64;
+        let kv_bytes_per_token = (2 * spec.kv_layers() * spec.attention.kv_heads * spec.attention.head_dim * 2) as u64;
         let state_bytes_per_seq = match &spec.linear_attention {
             Some(la) => {
                 let ssm = la.value_heads * la.key_head_dim * la.key_head_dim;
