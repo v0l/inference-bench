@@ -52,6 +52,14 @@ pub struct Outside<'a> {
     pub lm_head: Matrix<'a>,
 }
 
+pub struct MtpWeights<'a> {
+    pub fc: Matrix<'a>,
+    pub norm_embed: Vec<f32>,
+    pub norm_hidden: Vec<f32>,
+    pub layer: Layer<'a>,
+    pub norm: Vec<f32>,
+}
+
 pub fn hub_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("HF_HUB_CACHE") {
         return PathBuf::from(dir);
@@ -270,6 +278,24 @@ impl<'a> Raw<'a> {
         }
     }
 
+    fn dequantized(self) -> Raw<'a> {
+        match self {
+            Raw::Fp8 { w, grid, map, cols } => {
+                let kb = cols.div_ceil(FP8_BLOCK);
+                let out = w
+                    .chunks(cols)
+                    .zip(&map)
+                    .flat_map(|(row, &m)| {
+                        let scales = &grid[m as usize..m as usize + kb];
+                        row.iter().enumerate().map(move |(c, &b)| f32_to_bf16(e4m3_to_f32(b) * scales[c / FP8_BLOCK]))
+                    })
+                    .collect();
+                Raw::Bf16 { w: Cow::Owned(out), cols }
+            }
+            bf16 => bf16,
+        }
+    }
+
     fn concat(parts: Vec<Raw<'a>>) -> Result<Raw<'a>> {
         let mut parts = parts.into_iter();
         let mut out = parts.next().context("nothing to concatenate")?;
@@ -472,9 +498,16 @@ impl Checkpoint {
     }
 
     fn attention(&self, spec: &Spec, attn: &str) -> Result<Attn<'_>> {
+        self.attention_as(spec, attn, false)
+    }
+
+    fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool) -> Result<Attn<'_>> {
         let a = &spec.attention;
+        let quant = if bf16 { Quant::Bf16 } else { spec.quant };
         let (h, q, kv) = (spec.dims.hidden, spec.q_dim(), spec.kv_dim());
-        let w = |p: &str, rows: usize, cols: usize| self.raw(&format!("{attn}.{p}.weight"), rows, cols);
+        let w = |p: &str, rows: usize, cols: usize| {
+            self.raw(&format!("{attn}.{p}.weight"), rows, cols).map(|r| if bf16 { r.dequantized() } else { r })
+        };
         let mut parts = Vec::new();
         let mut gates = Vec::new();
         if a.output_gate {
@@ -508,11 +541,11 @@ impl Checkpoint {
             (None, None)
         };
         Ok(Attn {
-            qkv: Raw::concat(parts)?.into_matrix(spec.quant, &format!("{attn}.qkv"))?,
+            qkv: Raw::concat(parts)?.into_matrix(quant, &format!("{attn}.qkv"))?,
             qkv_bias,
             q_norm,
             k_norm,
-            o: w("o_proj", h, q)?.into_matrix(spec.quant, &format!("{attn}.o_proj"))?,
+            o: w("o_proj", h, q)?.into_matrix(quant, &format!("{attn}.o_proj"))?,
         })
     }
 
@@ -576,6 +609,30 @@ impl Checkpoint {
         let mut m = crate::nvfp4::Fp4::new(Cow::Borrowed(packed.data), Cow::Borrowed(scales.data), global, rows, cols)?;
         m.input_global = self.floats(&format!("{module}.input_global_scale"), &[1])?[0];
         Ok(m)
+    }
+
+    pub fn mtp<'a>(&'a self, spec: &Spec) -> Result<MtpWeights<'a>> {
+        let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
+        ensure!(self.has("mtp.fc.weight"), "the checkpoint has no mtp.* tensors");
+        let bf16 = |r: Raw<'a>, what: &str| -> Result<Matrix<'a>> { r.dequantized().into_matrix(Quant::Bf16, what) };
+        let p = "mtp.layers.0";
+        let attn = self.attention_as(spec, &format!("{p}.self_attn"), true)?;
+        let gate = self.raw(&format!("{p}.mlp.gate_proj.weight"), inter, h)?.dequantized();
+        let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?.dequantized();
+        let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
+        Ok(MtpWeights {
+            fc: bf16(self.raw("mtp.fc.weight", h, 2 * h)?, "mtp.fc")?,
+            norm_embed: self.norm(spec, "mtp.pre_fc_norm_embedding.weight", h)?,
+            norm_hidden: self.norm(spec, "mtp.pre_fc_norm_hidden.weight", h)?,
+            layer: Layer {
+                ln1: self.norm(spec, &format!("{p}.input_layernorm.weight"), h)?,
+                ln2: self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
+                mixer: Mixer::Attention(attn),
+                gate_up: Raw::interleave(gate, up)?.into_matrix(Quant::Bf16, "mtp gate_up")?,
+                down: bf16(down, "mtp down_proj")?,
+            },
+            norm: self.norm(spec, "mtp.norm.weight", h)?,
+        })
     }
 
     pub fn outside(&self, spec: &Spec) -> Result<Outside<'_>> {
