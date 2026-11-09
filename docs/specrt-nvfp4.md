@@ -591,3 +591,19 @@ SPECRT_REF_DIR=out TESTBIN=<real27b test binary> ./scripts/head27b-gates.sh
 SPECRT_REF_DIR=out TESTBIN=<real27b test binary> ./scripts/head27b-vllm.sh
 cargo test --release --test head_quant -- --include-ignored
 ```
+
+## Prefill tile for the native fp4 GEMM (#432)
+
+`gemm_f4a` (`[mlp] act_quant = "fp4"`) now defaults its `_big` tile to 128x256 with 4x4 warps,
+settable with `[runtime] fp4_tile = [bm, bn, wm, wn]`. Per-call nsys on the 27B, gate_up:
+
+| tile | 1,024 tokens | 4,096 tokens | prefill tok/s at 1,024 / 4,096 |
+|---|---|---|---|
+| 64x128, 2x4 (old) | 1.14 ms | 2.31 ms | 3,996 / 3,832 |
+| 128x128, 4x2 | 0.80 ms | 1.60 ms | 4,164 / 4,003 |
+| 128x256, 4x4 (default) | 0.72 ms | 1.48 ms | 4,223 / 4,051 |
+
+gate_up goes from about 160 to 250 TFLOP/s at 1,024 tokens, a 37% cut in GEMM time. Below 512
+tokens the larger tile loses (256 tokens: 2,898 against 2,756 tok/s is the new default, still ahead;
+see the bench run). ncu needs GPU counter permission (ERR_NVGPUCTRPERM), so stall reasons and bank
+conflicts were not collected; the deeper pipeline, TMA and warp specialisation ports are not done.

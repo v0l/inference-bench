@@ -90,6 +90,8 @@ pub struct RuntimeOptions {
     pub tile: TileChoice,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub big_tile: Option<[usize; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp4_tile: Option<[usize; 4]>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unsplit: Vec<String>,
     pub gemm_fp32: bool,
@@ -132,7 +134,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default() }
+        RuntimeOptions { graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default() }
     }
 }
 
@@ -143,11 +145,13 @@ impl RuntimeOptions {
 
     fn validate(&self) -> Result<()> {
         self.prefix_cache.validate()?;
-        if let Some([bm, bn, wm, wn]) = self.big_tile {
-            ensure!(
-                wm > 0 && wn > 0 && bm.is_multiple_of(16 * wm) && bn.is_multiple_of(8 * wn),
-                "[runtime] big_tile [{bm}, {bn}, {wm}, {wn}] needs bm a multiple of 16 * wm and bn a multiple of 8 * wn"
-            );
+        for (key, tile) in [("big_tile", self.big_tile), ("fp4_tile", self.fp4_tile)] {
+            if let Some([bm, bn, wm, wn]) = tile {
+                ensure!(
+                    wm > 0 && wn > 0 && bm.is_multiple_of(16 * wm) && bn.is_multiple_of(8 * wn),
+                    "[runtime] {key} [{bm}, {bn}, {wm}, {wn}] needs bm a multiple of 16 * wm and bn a multiple of 8 * wn"
+                );
+            }
         }
         for name in &self.unsplit {
             ensure!(

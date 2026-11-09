@@ -36,7 +36,7 @@ fn fp4_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Strin
     for linear in ["gate_up", "down"] {
         let (n, k, epi, _) = linear_dims(spec, linear);
         for suffix in FP8_ACT_VARIANTS {
-            let t = Tile::variant(suffix, &spec.runtime);
+            let t = Tile::fp4_variant(suffix, &spec.runtime);
             let name = format!("{linear}_f4a{suffix}");
             let name = FP4_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_ACT_KERNELS");
             smem.insert(name, f4a_smem(t));
@@ -375,6 +375,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 
 impl Tile {
     pub const SMALL: Tile = Tile { bm: 64, bn: 64, wm: 2, wn: 2 };
+    pub const FP4_BIG: Tile = Tile { bm: 128, bn: 256, wm: 4, wn: 4 };
     pub const NARROW: Tile = Tile { bm: 64, bn: 32, wm: 2, wn: 2 };
 
     pub fn tiny() -> Tile {
@@ -390,6 +391,14 @@ impl Tile {
         match opts.big_tile {
             Some([bm, bn, wm, wn]) => Tile { bm, bn, wm, wn },
             None => Tile { bm: 64, bn: 128, wm: 2, wn: 4 },
+        }
+    }
+
+    pub fn fp4_variant(suffix: &str, opts: &RuntimeOptions) -> Tile {
+        match (suffix, opts.fp4_tile) {
+            ("_big", Some([bm, bn, wm, wn])) => Tile { bm, bn, wm, wn },
+            ("_big", None) => Tile::FP4_BIG,
+            _ => Tile::variant(suffix, opts),
         }
     }
 
@@ -498,7 +507,10 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
     let fp4_act = spec.mlp.quant == Some(Quant::Nvfp4G16) && fp4_act_enabled(spec);
     match weight {
         WeightKind::Fp8 if act_quant && fp8_act => choice(format!("{linear}_f8{suffix}"), GemmPath::F8a, Some("quant_rows_fp8")),
-        WeightKind::Fp4 if act_quant && fp4_act => choice(format!("{linear}_f4a{suffix}"), GemmPath::F4a, Some("quant_rows_fp4")),
+        WeightKind::Fp4 if act_quant && fp4_act => KernelChoice {
+            tile: Tile::fp4_variant(suffix, opts),
+            ..choice(format!("{linear}_f4a{suffix}"), GemmPath::F4a, Some("quant_rows_fp4"))
+        },
         WeightKind::Fp8 if f8b => KernelChoice {
             reduce: Some(format!("{linear}_f8b_reduce")),
             ..choice(format!("{linear}_f8b{}", f8b_tokens(tokens)), GemmPath::F8b, None)
