@@ -167,3 +167,31 @@ fn malformed_tool_fields_are_rejected() {
     }
     rig.stop();
 }
+
+#[test]
+fn unsupported_fields_are_rejected_naming_the_field() {
+    let rig = start(config(AGENT), Shape::default());
+    let cases = [
+        ("response_format", json!({"type": "json_object"})),
+        ("n", json!(2)),
+        ("logprobs", json!(true)),
+        ("tool_choice", json!({"type": "function", "function": {"name": "get_weather"}})),
+        ("mystery_field", json!(1)),
+    ];
+    for (field, value) in cases {
+        let mut body = agent_body(false);
+        body[field] = value;
+        let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+        assert_eq!(status, 400, "{field}: {text}");
+        if field != "tool_choice" {
+            assert!(text.contains(field), "{field}: {text}");
+        }
+    }
+    let mut body = agent_body(false);
+    body["n"] = json!(1);
+    body["response_format"] = json!({"type": "text"});
+    body["logprobs"] = json!(false);
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 200, "{text}");
+    rig.stop();
+}

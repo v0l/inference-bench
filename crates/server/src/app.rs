@@ -393,6 +393,38 @@ fn stop_strings(body: &Value) -> Result<Vec<String>, ApiError> {
     }
 }
 
+const HANDLED_FIELDS: &[&str] = &[
+    "model", "messages", "prompt", "prompts", "repeat", "max_tokens", "max_completion_tokens", "temperature", "top_p", "seed", "stop", "stream",
+    "stream_options", "ignore_eos", "tools", "tool_choice", "chat_template_kwargs", "reasoning_effort",
+];
+
+const NEUTRAL_FIELDS: &[&str] = &["user", "parallel_tool_calls", "store", "metadata"];
+
+fn reject_unsupported_fields(body: &Value) -> Result<(), ApiError> {
+    let Some(obj) = body.as_object() else { return Ok(()) };
+    for (key, value) in obj {
+        let key = key.as_str();
+        let known = HANDLED_FIELDS.contains(&key) || NEUTRAL_FIELDS.contains(&key);
+        let ok = known
+            || match key {
+                "n" => value.is_null() || value.as_u64() == Some(1),
+                "logprobs" => value.is_null() || value == &json!(false),
+                "top_logprobs" => value.is_null() || value.as_u64() == Some(0),
+                "response_format" => value.is_null() || value["type"] == "text",
+                "frequency_penalty" | "presence_penalty" => value.is_null() || value.as_f64() == Some(0.0),
+                _ => false,
+            };
+        if !ok {
+            let why = match key {
+                "n" | "logprobs" | "top_logprobs" | "response_format" | "frequency_penalty" | "presence_penalty" => "value is not supported",
+                _ => "field is not supported",
+            };
+            return Err(ApiError::bad_request(format!("{key}: {why}")));
+        }
+    }
+    Ok(())
+}
+
 fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), ApiError> {
     let mut vars = toml_json(&state.config.chat_template_kwargs);
     let user = match &body["chat_template_kwargs"] {
@@ -438,6 +470,7 @@ fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), Api
 }
 
 fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, ApiError> {
+    reject_unsupported_fields(body)?;
     let model = match body["model"].as_str() {
         Some(m) if !m.is_empty() => m.to_string(),
         _ => state.manager.default_model().ok_or_else(|| ApiError::bad_request("model is required"))?,
