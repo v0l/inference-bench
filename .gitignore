@@ -1,3 +1,4 @@
 /target
 /out
 /crates/specrt/out
+__pycache__/
