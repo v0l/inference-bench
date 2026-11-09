@@ -3148,6 +3148,7 @@ dependencies = [
  "image",
  "inference-bench-core",
  "inference-bench-server",
+ "inference-bench-specrt",
  "serde",
  "serde_json",
  "tokio",

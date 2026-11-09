@@ -35,6 +35,7 @@ pub struct ModelsState {
     pub hub_base: String,
     rescan: bool,
     pub message: Option<(bool, String)>,
+    pub detail: Option<crate::detail::Detail>,
 }
 
 impl Default for ModelsState {
@@ -53,6 +54,7 @@ impl Default for ModelsState {
             hub_base: hf::HF_BASE.to_string(),
             rescan: false,
             message: None,
+            detail: None,
         }
     }
 }
@@ -215,6 +217,9 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
                         app.tab = crate::Tab::Chat;
                         app.chat.pick(&m.name);
                     }
+                }
+                if ui.add(Key::new("details").outline(READOUT).id_salt(("details", i))).clicked() {
+                    app.models.detail = Some(crate::detail::Detail::open(&m));
                 }
                 if ui.add(Key::new("reveal").outline(VALUE).id_salt(("reveal", i))).clicked() {
                     reveal(&m);
@@ -385,6 +390,10 @@ fn downloads_section(app: &mut App, ui: &mut egui::Ui) {
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     page(ui, "models", |ui| {
+        if app.models.detail.is_some() {
+            crate::detail::draw(app, ui);
+            return;
+        }
         let mut pane = app.models.pane;
         segments(ui, &mut pane, &[(Pane::Library, "my models", Some(app.library.len())), (Pane::Discover, "discover", None)]);
         app.models.pane = pane;

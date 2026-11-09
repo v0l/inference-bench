@@ -1,6 +1,8 @@
 mod bench;
 mod chart;
 mod chat;
+mod detail;
+mod strip;
 mod job;
 mod models;
 mod logs;
