@@ -163,6 +163,25 @@ fn rows_padded_to_a_captured_graph_size_match_single_sequence_greedy() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
+fn plan_driven_decode_captures_a_graph_per_padded_size() {
+    let s = spec_for("tiny-qwen3.5");
+    let layout = Layout { max_ctx: 512, slots: 4, kv_blocks: 4 * 512usize.div_ceil(specrt::codegen::PAGE), prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let mut rt = Runtime::load_layout(&s, layout).unwrap();
+    let pages = 512usize.div_ceil(specrt::codegen::PAGE);
+    let mut st = rt.stepper().unwrap();
+    st.set_graphs(true);
+    for slot in 0..3 {
+        rt.set_block_table(slot, &((slot * pages) as u32..((slot + 1) * pages) as u32).collect::<Vec<_>>()).unwrap();
+        rt.prefill_slot(&mut st, slot, &[5, 6, 7, 8], 0, None).unwrap();
+    }
+    let row = |slot: usize| DecodeRow { slot, token: 9, pos: 4, sampling: Sampling::GREEDY, step: 0 };
+    rt.decode(&mut st, &[row(0)]).unwrap();
+    rt.decode(&mut st, &[row(0), row(1), row(2)]).unwrap();
+    assert_eq!(st.captured_sizes(), vec![1, 4]);
+}
+
+#[test]
 fn decode_batches_pad_to_the_next_graph_size() {
     let padded: Vec<usize> = [1, 2, 3, 5, 8, 9, 17, 32].iter().map(|&n| specrt::runtime::pad_rows(n)).collect();
     assert_eq!(padded, [1, 2, 4, 8, 8, 16, 32, 32]);
