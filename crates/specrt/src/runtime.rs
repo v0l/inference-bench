@@ -928,7 +928,8 @@ impl Runtime {
         if let (Some(fa), DeviceMatrix::Fp4 { .. }, true) = (&self.fp4_act, w, act_quant) {
             return self.tc_fp4(fa, name, w, x, out, rows, tokens, suffix, tile);
         }
-        if let (DeviceMatrix::Fp4 { .. }, true) = (w, suffix == "_tiny" && tokens <= crate::codegen::F4B_MAX_TOKENS) {
+        let batched_f4 = name != "lm_head" && suffix == "_tiny" && tokens <= crate::codegen::F4B_MAX_TOKENS;
+        if let (DeviceMatrix::Fp4 { .. }, true) = (w, batched_f4) {
             return self.tc_f4b(name, w, x, out, rows, tokens);
         }
         let kernel = match w {
