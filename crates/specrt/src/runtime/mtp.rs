@@ -572,6 +572,11 @@ impl Runtime {
     }
 
     pub fn mtp_prompt_logits(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<u32>)> {
+        let (logits, drafts, _) = self.mtp_prompt_trace(tokens)?;
+        Ok((logits, drafts))
+    }
+
+    pub fn mtp_prompt_trace(&mut self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<u32>, Vec<f32>)> {
         ensure!(self.mtp.is_some(), "no MTP layer");
         ensure!(!tokens.is_empty() && tokens.len() + 2 * self.mtp().k < self.max_ctx, "prompt too long");
         self.reset_slot(0)?;
@@ -582,6 +587,8 @@ impl Runtime {
         self.prime(&[row])?;
         let vocab = self.spec.dims.vocab;
         let logits = self.stream.clone_dtoh(&self.mtp().logits.slice(..vocab))?;
-        Ok((logits, self.mtp().host_drafts[0].clone()))
+        let n = tokens.len() * self.spec.dims.hidden;
+        let hidden = self.stream.clone_dtoh(&self.mtp().vx.slice(..n))?;
+        Ok((logits, self.mtp().host_drafts[0].clone(), hidden))
     }
 }

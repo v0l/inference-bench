@@ -254,6 +254,56 @@ fn real_27b_mtp_weights_load_from_both_checkpoints_with_fp8_dequantised_to_bf16(
 }
 
 #[test]
+#[ignore = "needs about 26 GB of free GPU memory, the NVFP4 27B checkpoint and vllm-spec-greedy.json; then scripts/reference.py real-mtp"]
+fn real_27b_mtp_dumps_hiddens_and_draft_logits_for_the_cpu_oracle() {
+    let spec = named_spec("qwen3.8-27b-nvfp4");
+    let recs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out_dir().join("vllm-spec-greedy.json")).unwrap()).unwrap();
+    let mut rt = Runtime::load(&spec, 1024).unwrap();
+    let mut records = Vec::new();
+    for (i, r) in recs.as_array().unwrap().iter().take(5).enumerate() {
+        let ids: Vec<u32> = ids(&r["prompt"]).into_iter().chain(ids(&r["vllm"])).collect();
+        let (logits, drafts, hidden) = rt.mtp_prompt_trace(&ids).unwrap();
+        let name = format!("real27b-mtp-{i}");
+        let bytes = |v: &[f32]| v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>();
+        std::fs::write(out_dir().join(format!("{name}.hidden.bin")), bytes(&hidden)).unwrap();
+        std::fs::write(out_dir().join(format!("{name}.chain.bin")), bytes(&logits)).unwrap();
+        records.push(serde_json::json!({"name": name, "tokens": ids, "prompt": r["prompt"].as_array().unwrap().len(), "drafts": drafts}));
+    }
+    std::fs::write(out_dir().join("real27b-mtp.json"), serde_json::to_string(&records).unwrap()).unwrap();
+}
+
+#[test]
+#[ignore = "needs about 26 GB of free GPU memory, the NVFP4 27B checkpoint and vllm-spec-greedy.json"]
+fn real_27b_mtp_acceptance_on_vllms_own_greedy_tokens() {
+    let spec = named_spec("qwen3.8-27b-nvfp4");
+    let k = spec.mtp.as_ref().unwrap().draft_tokens;
+    let recs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out_dir().join("vllm-spec-greedy.json")).unwrap()).unwrap();
+    let mut rt = Runtime::load(&spec, 1024).unwrap();
+    let (mut steps, mut accepted, mut first, mut second) = (0u64, 0u64, 0u64, 0u64);
+    for r in recs.as_array().unwrap() {
+        let prompt = ids(&r["prompt"]);
+        let vgen = ids(&r["vllm"]);
+        let mut at = 0;
+        while at + k < vgen.len() {
+            let prefix: Vec<u32> = prompt.iter().chain(&vgen[..at]).copied().collect();
+            let (_, drafts) = rt.mtp_prompt_logits(&prefix).unwrap();
+            let a = drafts.iter().zip(&vgen[at + 1..]).take_while(|(d, g)| d == g).count();
+            steps += 1;
+            accepted += a as u64;
+            first += u64::from(a >= 1);
+            second += u64::from(a >= 2);
+            at += a + 1;
+        }
+    }
+    eprintln!(
+        "teacher-forced on vLLM greedy: {steps} steps, mean acceptance length {:.3}, position 0 {:.3}, position 1 {:.3}",
+        1.0 + accepted as f64 / steps as f64,
+        first as f64 / steps as f64,
+        second as f64 / steps as f64,
+    );
+}
+
+#[test]
 #[ignore = "needs about 25 GB of free GPU memory and scripts/reference.py real-full output"]
 fn real_27b_per_layer_trace_matches_the_cpu_oracle() {
     let spec = full_spec();
