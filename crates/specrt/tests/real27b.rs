@@ -47,8 +47,12 @@ fn top1_agreement(p: &[f32], q: &[f32], vocab: usize) -> f64 {
 }
 
 fn full_spec() -> Spec {
-    let name = std::env::var("SPECRT_27B_SPEC").unwrap_or_else(|_| "qwen3.8-27b".into());
-    Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.toml"))).unwrap()
+    named_spec("qwen3.8-27b")
+}
+
+fn named_spec(default: &str) -> Spec {
+    let name = std::env::var("SPECRT_27B_SPEC").unwrap_or_else(|_| default.into());
+    Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.toml"))).unwrap().with_env_overrides()
 }
 
 fn ids(v: &serde_json::Value) -> Vec<u32> {
@@ -60,8 +64,9 @@ fn write_floats(name: &str, v: &[f32]) {
     std::fs::write(out_dir().join(name), bytes).unwrap();
 }
 
-fn mode() -> &'static str {
-    if std::env::var_os("SPECRT_FP8_ACT").is_some() || specrt::codegen::fp4_act_enabled() { "act" } else { "weight" }
+fn mode(spec: &Spec) -> &'static str {
+    use specrt::spec::ActQuant;
+    if spec.act_quant != ActQuant::None || spec.mlp.act_quant != ActQuant::None { "act" } else { "weight" }
 }
 
 #[test]
@@ -74,7 +79,7 @@ fn real_27b_generates_greedy_and_dumps_logits() {
     let mut rt = Runtime::load(&spec, 8192).unwrap();
     eprintln!(
         "loaded ({}): weights {:.2} GB in {:.1} s, device {:.2} GB, total load {:.1} s, peak host RSS {:.2} GB",
-        mode(),
+        mode(&spec),
         rt.weight_bytes as f64 / 1e9,
         rt.weight_secs,
         rt.device_bytes as f64 / 1e9,
@@ -95,10 +100,10 @@ fn real_27b_generates_greedy_and_dumps_logits() {
         .ok()
         .map(|t| serde_json::from_str::<serde_json::Value>(&t).unwrap())
         .map(|v| v["sequences"].as_array().unwrap().iter().map(ids).collect::<Vec<_>>());
-    for seq in forced.as_ref().filter(|_| mode() == "act").unwrap_or(&sequences) {
+    for seq in forced.as_ref().filter(|_| mode(&spec) == "act").unwrap_or(&sequences) {
         logits.extend(rt.prompt_logits(seq).unwrap());
     }
-    write_floats(&format!("real27b-specrt-{}.logits.bin", mode()), &logits);
+    write_floats(&format!("real27b-specrt-{}.logits.bin", mode(&spec)), &logits);
     let out = serde_json::json!({
         "sequences": sequences,
         "prompt_len": ids(&meta["prompts"][0]).len(),
@@ -108,13 +113,14 @@ fn real_27b_generates_greedy_and_dumps_logits() {
         "device_bytes": rt.device_bytes,
         "peak_host_rss_bytes": rt.peak_host_rss_bytes,
     });
-    std::fs::write(out_dir().join(format!("real27b-specrt-{}.json", mode())), out.to_string()).unwrap();
+    std::fs::write(out_dir().join(format!("real27b-specrt-{}.json", mode(&spec))), out.to_string()).unwrap();
 }
 
 #[test]
 #[ignore = "needs about 25 GB of free GPU memory, the NVFP4 checkpoint and scripts/vllm_logprobs.py output"]
 fn real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs() {
-    let spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    let spec = named_spec("qwen3.8-27b-nvfp4");
+    assert_eq!(spec.mlp.quant, Some(Quant::Nvfp4G16), "SPECRT_27B_SPEC must name an NVFP4 spec for the vLLM comparison");
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out_dir().join("vllm-nvfp4.json")).unwrap()).unwrap();
     let new = meta["new_tokens"].as_u64().unwrap() as usize;
@@ -122,7 +128,7 @@ fn real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs() {
     let mut rt = Runtime::load(&spec, 8192).unwrap();
     eprintln!(
         "loaded ({}): weights {:.2} GB in {:.1} s, device {:.2} GB, load {:.1} s, peak host RSS {:.2} GB",
-        mode(),
+        mode(&spec),
         rt.weight_bytes as f64 / 1e9,
         rt.weight_secs,
         rt.device_bytes as f64 / 1e9,
@@ -180,7 +186,7 @@ fn real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs() {
     let mean = kls.iter().sum::<f64>() / kls.len() as f64;
     let first5: usize = agree_prefix.iter().take(5).sum();
     let report = serde_json::json!({
-        "mode": mode(),
+        "mode": mode(&spec),
         "prompts": records.len(),
         "new_tokens": new,
         "greedy_prefix": agree_prefix,
@@ -195,7 +201,7 @@ fn real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs() {
         "kl_max": sorted[sorted.len() - 1],
     });
     eprintln!("{report}");
-    std::fs::write(out_dir().join(format!("vllm-compare-{}.json", mode())), report.to_string()).unwrap();
+    std::fs::write(out_dir().join(format!("vllm-compare-{}.json", mode(&spec))), report.to_string()).unwrap();
     assert!(top1 * 10 >= total * 9, "teacher-forced top-1 {top1}/{total}");
     assert!(mean <= 0.05, "mean KL {mean}");
 }

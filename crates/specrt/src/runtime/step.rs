@@ -67,7 +67,7 @@ impl Runtime {
             bb,
             params: self.stream.alloc_zeros(3 * rows)?,
             graphs: HashMap::new(),
-            use_graphs: std::env::var_os("SPECRT_NO_GRAPH").is_none(),
+            use_graphs: self.spec.runtime.graphs,
         })
     }
 

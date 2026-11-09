@@ -219,7 +219,7 @@ fn compressed_tensors_nvfp4_checkpoint_derives_fp8_channel_with_nvfp4_mlps_until
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;
     assert_eq!(file, spec);
-    assert_eq!(file.min_engine, SPEC_FORMAT);
+    assert_eq!(file.min_engine, 4);
 }
 
 fn nvfp4_config() -> serde_json::Value {
@@ -254,8 +254,111 @@ fn mlp_quant_needs_fp8_channel_projections_and_a_layer_inside_the_count() {
     assert_eq!(all.mlp_quant(63), Quant::Nvfp4G16);
 }
 
+#[test]
+fn deprecated_env_overrides_still_switch_the_resolved_spec() {
+    use specrt::spec::{ActQuant, TileChoice};
+    let plain = Spec::parse(&nvfp4_text()).unwrap();
+    assert_eq!(plain.with_env_overrides(), plain);
+    unsafe {
+        std::env::set_var("SPECRT_FP4_ACT", "1");
+        std::env::set_var("SPECRT_FP8_ACT", "1");
+        std::env::set_var("SPECRT_NO_GRAPH", "1");
+        std::env::set_var("SPECRT_TILE", "narrow");
+    }
+    let r = plain.with_env_overrides();
+    unsafe {
+        for v in ["SPECRT_FP4_ACT", "SPECRT_FP8_ACT", "SPECRT_NO_GRAPH", "SPECRT_TILE"] {
+            std::env::remove_var(v);
+        }
+    }
+    assert_eq!((r.act_quant, r.mlp.act_quant), (ActQuant::Fp8, ActQuant::Fp4));
+    assert!(!r.runtime.graphs);
+    assert_eq!(r.runtime.tile, TileChoice::Narrow);
+    assert!(r.runtime.fuse);
+    r.validate().unwrap();
+}
+
 fn hybrid_text() -> String {
     std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap()
+}
+
+fn nvfp4_text() -> String {
+    std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap()
+}
+
+#[test]
+fn act_quant_fields_default_to_none_round_trip_and_match_the_act_fixtures() {
+    use specrt::spec::ActQuant;
+    let plain = Spec::parse(&nvfp4_text()).unwrap();
+    assert_eq!((plain.act_quant, plain.mlp.act_quant), (ActQuant::None, ActQuant::None));
+    let text = plain.to_toml().unwrap();
+    assert!(!text.contains("act_quant") && !text.contains("[runtime]"), "{text}");
+    assert_eq!(Spec::parse(&text).unwrap(), plain);
+    let act = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4-act.toml")).unwrap();
+    assert_eq!((act.act_quant, act.mlp.act_quant), (ActQuant::Fp8, ActQuant::Fp4));
+    assert_eq!(Spec::parse(&act.to_toml().unwrap()).unwrap(), act);
+    let mut same = act.clone();
+    same.name = plain.name.clone();
+    same.min_engine = plain.min_engine;
+    same.act_quant = ActQuant::None;
+    same.mlp.act_quant = ActQuant::None;
+    assert_eq!(same, plain);
+    let fp8 = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-act.toml")).unwrap();
+    assert_eq!((fp8.act_quant, fp8.mlp.act_quant), (ActQuant::Fp8, ActQuant::None));
+}
+
+#[test]
+fn act_quant_rejects_unknown_values_and_formats_the_weights_cannot_take() {
+    let text = nvfp4_text();
+    let top = |v: &str| text.replace("quant = \"fp8_channel\"\n", &format!("quant = \"fp8_channel\"\nact_quant = {v:?}\n"));
+    let mlp = |v: &str| text.replace("quant_until = 56\n", &format!("quant_until = 56\nact_quant = {v:?}\n"));
+    let e = format!("{:#}", Spec::parse(&top("int8")).unwrap_err());
+    assert!(e.contains("int8") && e.contains("act_quant"), "{e}");
+    let e = format!("{:#}", Spec::parse(&mlp("fp6")).unwrap_err());
+    assert!(e.contains("fp6"), "{e}");
+    assert!(Spec::parse(&top("fp8")).is_ok());
+    assert!(Spec::parse(&mlp("fp4")).is_ok());
+    assert!(Spec::parse(&top("none")).is_ok());
+    let e = format!("{:#}", Spec::parse(&top("fp4")).unwrap_err());
+    assert!(e.contains("[mlp] only"), "{e}");
+    let e = format!("{:#}", Spec::parse(&mlp("fp8")).unwrap_err());
+    assert!(e.contains("[mlp] act_quant"), "{e}");
+    let bf16 = std::fs::read_to_string(root().join("specs/qwen3-0.6b.toml")).unwrap();
+    let e = format!("{:#}", Spec::parse(&bf16.replace("[dims]", "act_quant = \"fp8\"\n\n[dims]")).unwrap_err());
+    assert!(e.contains("needs fp8 weights"), "{e}");
+    let e = format!("{:#}", Spec::parse(&hybrid_text().replace("activation = \"swiglu\"", "activation = \"swiglu\"\nact_quant = \"fp4\"")).unwrap_err());
+    assert!(e.contains("nvfp4_g16"), "{e}");
+}
+
+#[test]
+fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
+    use specrt::spec::{RuntimeOptions, TileChoice};
+    let base = std::fs::read_to_string(root().join("specs/qwen3-0.6b.toml")).unwrap();
+    assert_eq!(Spec::parse(&base).unwrap().runtime, RuntimeOptions::default());
+    let d = RuntimeOptions::default();
+    assert!(d.graphs && d.fuse && !d.gemm_fp32 && d.tile == TileChoice::Auto && d.cache_dir.is_none());
+    let with = format!("{base}\n[runtime]\ngraphs = false\nfuse = false\ntile = \"big\"\nbig_tile = [64, 128, 2, 4]\nunsplit = [\"lm_head\"]\ngemm_fp32 = true\ncache_dir = \"/tmp/x\"\n");
+    let s = Spec::parse(&with).unwrap();
+    assert_eq!(
+        s.runtime,
+        RuntimeOptions {
+            graphs: false,
+            fuse: false,
+            tile: TileChoice::Big,
+            big_tile: Some([64, 128, 2, 4]),
+            unsplit: vec!["lm_head".into()],
+            gemm_fp32: true,
+            cache_dir: Some("/tmp/x".into()),
+        }
+    );
+    assert_eq!(Spec::parse(&s.to_toml().unwrap()).unwrap(), s);
+    let partial = Spec::parse(&format!("{base}\n[runtime]\nfuse = false\n")).unwrap();
+    assert_eq!(partial.runtime, RuntimeOptions { fuse: false, ..RuntimeOptions::default() });
+    let bad = |extra: &str| format!("{:#}", Spec::parse(&format!("{base}\n[runtime]\n{extra}\n")).unwrap_err());
+    assert!(bad("tile = \"huge\"").contains("huge"));
+    assert!(bad("bogus = 1").contains("bogus"));
+    assert!(bad("unsplit = [\"nope\"]").contains("nope"));
+    assert!(bad("big_tile = [60, 128, 2, 4]").contains("big_tile"));
 }
 
 #[test]

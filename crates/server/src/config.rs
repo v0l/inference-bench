@@ -138,6 +138,7 @@ pub struct ServerConfig {
     pub kv_cache_gb: Option<f64>,
     pub max_batched_tokens: Option<usize>,
     pub itl_target_ms: Option<u64>,
+    pub runtime: Option<inference_bench_core::specrt_serve::RuntimeOptions>,
 }
 
 impl Default for ServerConfig {
@@ -170,6 +171,7 @@ impl Default for ServerConfig {
             kv_cache_gb: None,
             max_batched_tokens: None,
             itl_target_ms: None,
+            runtime: None,
         }
     }
 }
@@ -276,6 +278,7 @@ impl ServerConfig {
             kv_cache_bytes: self.kv_cache_gb.map(|g| (g * (1u64 << 30) as f64) as u64),
             max_batched_tokens: self.max_batched_tokens.unwrap_or(d.max_batched_tokens),
             itl_target: self.itl_target_ms.map(std::time::Duration::from_millis).unwrap_or(d.itl_target),
+            runtime: self.runtime.clone(),
         })
     }
 
@@ -404,6 +407,20 @@ python = "python3"
         assert_eq!(c.serve_options(&c.models[0]).unwrap().max_model_len, 8192);
         assert!(ServerConfig::parse("max_model_len = 300000").is_err());
         assert!(ServerConfig::parse("max_num_seqs = 0").is_err());
+    }
+
+    #[test]
+    fn the_runtime_table_reaches_the_serving_options_with_defaults_for_missing_keys() {
+        use inference_bench_core::specrt_serve::{RuntimeOptions, TileChoice};
+        let c = ServerConfig::parse("max_num_seqs = 4\n[runtime]\ngraphs = false\ntile = \"narrow\"\ncache_dir = \"/tmp/ptx\"\n[[models]]\nid='m'").unwrap();
+        let r = c.serve_options(&c.models[0]).unwrap().runtime.unwrap();
+        assert_eq!(r, RuntimeOptions { graphs: false, tile: TileChoice::Narrow, cache_dir: Some("/tmp/ptx".into()), ..RuntimeOptions::default() });
+        assert!(r.fuse && !r.gemm_fp32);
+        let plain = ServerConfig::parse("max_num_seqs = 4\n[[models]]\nid='m'").unwrap();
+        assert_eq!(plain.serve_options(&plain.models[0]).unwrap().runtime, None);
+        let e = ServerConfig::parse("[runtime]\ntile = \"huge\"").unwrap_err();
+        assert!(format!("{e:#}").contains("huge"), "{e:#}");
+        assert!(ServerConfig::parse("[runtime]\nbogus = 1").is_err());
     }
 
     #[test]

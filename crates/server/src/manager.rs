@@ -10,10 +10,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument;
 
-use inference_bench_core::specrt_serve::ServeOptions;
+use inference_bench_core::specrt_serve::{RuntimeOptions, ServeOptions};
 
 pub trait EngineFactory: Send + Sync + 'static {
     fn build(&self, max_ctx: Option<usize>) -> Result<Box<dyn Target>, BackendError>;
+
+    fn build_with(&self, max_ctx: Option<usize>, runtime: Option<RuntimeOptions>) -> Result<Box<dyn Target>, BackendError> {
+        let _ = runtime;
+        self.build(max_ctx)
+    }
 
     fn build_serving(&self, max_ctx: Option<usize>, opts: ServeOptions) -> Result<Box<dyn Target>, BackendError> {
         let _ = opts;
@@ -26,6 +31,10 @@ pub struct NativeFactory;
 impl EngineFactory for NativeFactory {
     fn build(&self, max_ctx: Option<usize>) -> Result<Box<dyn Target>, BackendError> {
         Ok(Box::new(inference_bench_core::native::Native::new(max_ctx)))
+    }
+
+    fn build_with(&self, max_ctx: Option<usize>, runtime: Option<RuntimeOptions>) -> Result<Box<dyn Target>, BackendError> {
+        Ok(Box::new(inference_bench_core::native::Native::with_runtime(max_ctx, runtime)))
     }
 
     fn build_serving(&self, _max_ctx: Option<usize>, opts: ServeOptions) -> Result<Box<dyn Target>, BackendError> {
@@ -234,22 +243,24 @@ impl Manager {
         self.make_room(cfg)?;
         let max_ctx = self.config.max_ctx_for(cfg);
         let serving = self.config.serve_options(cfg);
+        let runtime = self.config.runtime.clone();
         let name = self.config.specs.resolve(cfg.upstream_name());
         let spec_hash = crate::config::spec_hash_of(&name);
         let vram_before = (self.probe)();
         let started = Instant::now();
         tracing::info!(model = %cfg.id, upstream = %name, ?max_ctx, ?serving, %spec_hash, vram_before_bytes = ?vram_before, "loading model");
         let factory = self.factory.clone();
+        let serving_in = serving.clone();
         let span = tracing::Span::current();
         let built = tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
-                let mut b = match serving {
+                let mut b = match serving_in.clone() {
                     Some(opts) => factory.build_serving(max_ctx, opts)?,
-                    None => factory.build(max_ctx)?,
+                    None => factory.build_with(max_ctx, runtime)?,
                 };
                 b.load(&name)?;
                 let mut backends = Vec::new();
-                if let Some(opts) = serving {
+                if let Some(opts) = &serving_in {
                     for _ in 1..opts.max_num_seqs {
                         match b.share() {
                             Some(more) => backends.push(more),

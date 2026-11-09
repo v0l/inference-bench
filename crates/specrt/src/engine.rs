@@ -151,7 +151,14 @@ pub struct Engine {
 
 impl Engine {
     pub fn load(model: &str, max_ctx: Option<usize>) -> Result<Self> {
-        let Assets { spec, tokenizer, chat, stop } = Assets::load(model)?;
+        Self::load_with(model, max_ctx, None)
+    }
+
+    pub fn load_with(model: &str, max_ctx: Option<usize>, runtime: Option<&crate::spec::RuntimeOptions>) -> Result<Self> {
+        let Assets { mut spec, tokenizer, chat, stop } = Assets::load(model)?;
+        if let Some(r) = runtime {
+            spec.runtime = r.clone();
+        }
         let max_ctx = max_ctx.unwrap_or(DEFAULT_CTX).min(MAX_CTX);
         tracing::info!(model, spec = %spec.name, max_ctx, "loading model");
         let runtime = Runtime::load(&spec, max_ctx)?;

@@ -2,6 +2,7 @@ use crate::engine::Assets;
 use crate::runtime::{Layout, Runtime, Sampling, kv_block_bytes};
 use crate::sched::{self, Config, Event, Finish, GpuExecutor, Scheduler, SeqId};
 use crate::spec::Spec;
+pub use crate::spec::{RuntimeOptions, TileChoice};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -13,13 +14,14 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_MAX_MODEL_LEN: usize = 131072;
 pub const MAX_MODEL_LEN: usize = 262144;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServeOptions {
     pub max_model_len: usize,
     pub max_num_seqs: usize,
     pub kv_cache_bytes: Option<u64>,
     pub max_batched_tokens: usize,
     pub itl_target: Duration,
+    pub runtime: Option<RuntimeOptions>,
 }
 
 impl Default for ServeOptions {
@@ -30,6 +32,7 @@ impl Default for ServeOptions {
             kv_cache_bytes: None,
             max_batched_tokens: 8192,
             itl_target: Duration::from_millis(100),
+            runtime: None,
         }
     }
 }
@@ -143,6 +146,7 @@ impl Core {
         let stats = Arc::new(Mutex::new(Stats::default()));
         let shared = stats.clone();
         let spec = spec.clone();
+        let max_model_len = opts.max_model_len;
         let thread = std::thread::Builder::new()
             .name("specrt-serve".into())
             .spawn(move || {
@@ -165,7 +169,7 @@ impl Core {
             jobs: Mutex::new(Some(jobs)),
             stats,
             thread: Mutex::new(Some(thread)),
-            max_model_len: opts.max_model_len,
+            max_model_len,
         }))
     }
 
@@ -198,6 +202,11 @@ impl Drop for Core {
 }
 
 fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
+    let mut spec = spec.clone();
+    if let Some(r) = &opts.runtime {
+        spec.runtime = r.clone();
+    }
+    let spec = &spec;
     let layout = opts.layout(spec);
     let rt = Runtime::load_layout(spec, layout)?;
     let block = kv_block_bytes(spec, 1) as u64;

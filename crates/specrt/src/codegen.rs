@@ -1,4 +1,4 @@
-use crate::spec::{Activation, Quant, RopeScalingKind, Spec};
+use crate::spec::{Activation, ActQuant, Quant, RopeScalingKind, RuntimeOptions, Spec};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
@@ -18,8 +18,12 @@ pub const FP4_ACT_KERNELS: &[&str] = &[
 ];
 const F4A_ROW: usize = 80;
 
-pub fn fp4_act_enabled() -> bool {
-    std::env::var_os("SPECRT_FP4_ACT").is_some_and(|v| v != "0")
+pub fn fp4_act_enabled(spec: &Spec) -> bool {
+    spec.mlp.act_quant == ActQuant::Fp4
+}
+
+pub fn fp8_act_enabled(spec: &Spec) -> bool {
+    spec.act_quant == ActQuant::Fp8
 }
 
 pub fn f4a_smem(tile: Tile) -> u32 {
@@ -31,7 +35,7 @@ fn fp4_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Strin
     for linear in ["gate_up", "down"] {
         let (n, k, epi, _) = linear_dims(spec, linear);
         for suffix in FP8_ACT_VARIANTS {
-            let t = Tile::variant(suffix);
+            let t = Tile::variant(suffix, &spec.runtime);
             let name = format!("{linear}_f4a{suffix}");
             let name = FP4_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_ACT_KERNELS");
             smem.insert(name, f4a_smem(t));
@@ -72,7 +76,7 @@ fn fp4_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
     for linear in ["gate_up", "down"] {
         let (n, k, epi, _) = linear_dims(spec, linear);
         for suffix in MMA_VARIANTS {
-            let t = Tile::variant(suffix);
+            let t = Tile::variant(suffix, &spec.runtime);
             let name = format!("{linear}_f4w{suffix}");
             let name = FP4_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_KERNELS");
             smem.insert(name, f4w_smem(t));
@@ -164,19 +168,16 @@ impl Tile {
         (self.wm * self.wn * 32) as u32
     }
 
-    pub fn big() -> Tile {
-        match std::env::var("SPECRT_BIG_TILE").ok().and_then(|v| {
-            let p: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
-            (p.len() == 4).then(|| Tile { bm: p[0], bn: p[1], wm: p[2], wn: p[3] })
-        }) {
-            Some(t) => t,
+    pub fn big(opts: &RuntimeOptions) -> Tile {
+        match opts.big_tile {
+            Some([bm, bn, wm, wn]) => Tile { bm, bn, wm, wn },
             None => Tile { bm: 64, bn: 128, wm: 2, wn: 4 },
         }
     }
 
-    pub fn variant(suffix: &str) -> Tile {
+    pub fn variant(suffix: &str, opts: &RuntimeOptions) -> Tile {
         match suffix {
-            "_big" => Tile::big(),
+            "_big" => Tile::big(opts),
             "_narrow" => Tile::NARROW,
             "_tiny" => Tile::tiny(),
             _ => Tile::SMALL,
@@ -398,7 +399,7 @@ fn linear_dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str, bool) 
 }
 
 fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
-    let unsplit = std::env::var("SPECRT_UNSPLIT").unwrap_or_default();
+    let unsplit = &spec.runtime.unsplit;
     let mut out = String::new();
     let gdn: &[&str] = if spec.linear_attention.is_some() { &GDN_LINEARS } else { &[] };
     for &linear in MMA_LINEARS.iter().chain(gdn) {
@@ -407,10 +408,10 @@ fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
             "lin_ba" => WeightFormat::Bf16,
             _ => WeightFormat::of(spec.quant),
         };
-        let split = wf != WeightFormat::Q8 && !unsplit.split(',').any(|n| n == linear);
+        let split = wf != WeightFormat::Q8 && !unsplit.iter().any(|n| n == linear);
         let (n, k, epi, bias) = linear_dims(spec, linear);
         for suffix in MMA_VARIANTS {
-            let shape = MmaShape::new(Tile::variant(suffix), k, wf, split);
+            let shape = MmaShape::new(Tile::variant(suffix, &spec.runtime), k, wf, split);
             let t = shape.tile;
             let name = mma_kernel_name(linear, suffix);
             smem.insert(name, shape.smem_bytes());
@@ -436,7 +437,7 @@ fn fp8_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Strin
     for &linear in FP8_ACT_LINEARS.iter().filter(|l| la || !l.starts_with("lin_")) {
         let (n, k, epi, bias) = linear_dims(spec, linear);
         for suffix in FP8_ACT_VARIANTS {
-            let t = Tile::variant(suffix);
+            let t = Tile::variant(suffix, &spec.runtime);
             let name = format!("{linear}_f8{suffix}");
             let name = FP8_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP8_ACT_KERNELS");
             smem.insert(name, fp8_act_smem(t));
@@ -560,7 +561,7 @@ impl Module {
         if spec.mlp.quant == Some(Quant::Nvfp4G16) {
             let mut fp4_vars = BTreeMap::new();
             fp4_vars.insert("F4W_KERNELS", fp4_kernels(spec, &mut smem));
-            let act = fp4_act_enabled();
+            let act = fp4_act_enabled(spec);
             fp4_vars.insert("F4A_SOURCE", if act { fp4_act_kernels(spec, &mut smem) } else { String::new() });
             source.push('\n');
             source.push_str(&render(FP4_TEMPLATE, &fp4_vars)?);

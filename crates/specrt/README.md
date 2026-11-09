@@ -19,7 +19,15 @@ untouched. cudarc uses `dynamic-loading`, so building needs no CUDA toolkit. Run
   instantiates the five linears for the spec. `codegen::Module::generate` fills the `{{SLOTS}}`
   from the spec, so every shape is a compile-time constant.
 - `jit::Jit` compiles the source with NVRTC for the device's `compute_XY` and caches the PTX in
-  `~/.cache/specrt/<sha256(source, arch, options)>.ptx` (`SPECRT_CACHE` to move it).
+  `~/.cache/specrt/<sha256(source, arch, options)>.ptx` (`[runtime] cache_dir` to move it).
+- Behaviour switches live in the spec, not the environment: `act_quant = "fp8"` (native FP8
+  activations for the FP8 projections), `[mlp] act_quant = "fp4"` (native NVFP4 activations), and a
+  `[runtime]` table with `graphs = true`, `fuse = true`, `tile = "auto"` (`small`, `big`, `narrow`),
+  `big_tile = [bm, bn, wm, wn]`, `unsplit = [linear, ...]`, `gemm_fp32 = false` and `cache_dir`.
+  The server config takes the same `[runtime]` table and hands it to every model it loads. The old
+  `SPECRT_FP8_ACT`, `SPECRT_FP4_ACT`, `SPECRT_NO_GRAPH`, `SPECRT_NO_FUSE`, `SPECRT_TILE`,
+  `SPECRT_BIG_TILE`, `SPECRT_UNSPLIT`, `SPECRT_GEMM_FP32` and `SPECRT_CACHE` variables still
+  override them for development and log a deprecation warning when they change anything.
 - `runtime::Runtime` loads `model.safetensors` from the HF hub cache, fuses q/k/v and gate/up,
   quantises to Q8 (per 32-weight group, f32 scale) when the spec asks, and runs single-stream
   decode. The KV cache is paged (16-token pages through a block table). Each decode step, argmax
@@ -113,7 +121,7 @@ gap to llama.cpp is GEMV bandwidth and the f32 activations and KV cache.
 
 ## Prefill on tensor cores (issue #247)
 
-Prefill linears are `gemm_tc` in `templates/ops.cu`: `mma.sync` m16n8k16 bf16 with fp32 accumulate, `ldmatrix` fragment loads, `cp.async` double-buffered weight tiles, fp32 accumulation across 32-wide k blocks. Codegen emits four tile shapes per linear (`*_mma_big` 64x128, `*_mma` 64x64, `*_mma_narrow` 64x32, `*_mma_tiny` 16 rows), and the runtime picks one by grid size against the SM count. The epilogues fuse the work around each GEMM: the A-tile load applies RMSNorm (`row_rms` writes one inverse RMS per row), gate_up applies SwiGLU or GeGLU (gate and up rows are interleaved when the weights load), o and down add the residual, and qkv adds the bias. f32 activations are split into a bf16 hi and lo pair on bf16 specs, which keeps the logits within 1e-3 of transformers. Q8 dequantises in registers and skips the split. Prefill attention is `flash_mma`: online softmax, causal, GQA, QK and PV on tensor cores with a 3-term bf16 split, Q RMSNorm and RoPE applied in the kernel, no score buffer. `kv_norm_rope` writes K and V to the paged cache. A prompt of up to 1024 tokens runs as one chunk. `SPECRT_GEMM_FP32=1` or a pre-Ampere device selects the old fp32 tile GEMM and `flash_attention`. Decode (`generate`) is still the GEMV and CUDA graph path.
+Prefill linears are `gemm_tc` in `templates/ops.cu`: `mma.sync` m16n8k16 bf16 with fp32 accumulate, `ldmatrix` fragment loads, `cp.async` double-buffered weight tiles, fp32 accumulation across 32-wide k blocks. Codegen emits four tile shapes per linear (`*_mma_big` 64x128, `*_mma` 64x64, `*_mma_narrow` 64x32, `*_mma_tiny` 16 rows), and the runtime picks one by grid size against the SM count. The epilogues fuse the work around each GEMM: the A-tile load applies RMSNorm (`row_rms` writes one inverse RMS per row), gate_up applies SwiGLU or GeGLU (gate and up rows are interleaved when the weights load), o and down add the residual, and qkv adds the bias. f32 activations are split into a bf16 hi and lo pair on bf16 specs, which keeps the logits within 1e-3 of transformers. Q8 dequantises in registers and skips the split. Prefill attention is `flash_mma`: online softmax, causal, GQA, QK and PV on tensor cores with a 3-term bf16 split, Q RMSNorm and RoPE applied in the kernel, no score buffer. `kv_norm_rope` writes K and V to the paged cache. A prompt of up to 1024 tokens runs as one chunk. `[runtime] gemm_fp32 = true` or a pre-Ampere device selects the old fp32 tile GEMM and `flash_attention`. Decode (`generate`) is still the GEMV and CUDA graph path.
 
 `Runtime::load_batched` and `generate_batch` decode N same-length prompts together through the tensor-core GEMMs (`bench <spec> <prompt> <new> <batch>`).
 

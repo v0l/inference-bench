@@ -49,7 +49,11 @@ impl Model for specrt::Engine {
 pub type Factory = Arc<dyn Fn(&str, Option<usize>) -> anyhow::Result<Box<dyn Model>> + Send + Sync>;
 
 pub fn specrt_factory() -> Factory {
-    Arc::new(|model, max_ctx| Ok(Box::new(specrt::Engine::load(model, max_ctx)?) as Box<dyn Model>))
+    specrt_factory_with(None)
+}
+
+pub fn specrt_factory_with(runtime: Option<specrt::spec::RuntimeOptions>) -> Factory {
+    Arc::new(move |model, max_ctx| Ok(Box::new(specrt::Engine::load_with(model, max_ctx, runtime.as_ref())?) as Box<dyn Model>))
 }
 
 type Job = Box<dyn FnOnce(&mut dyn Model) + Send>;
@@ -78,6 +82,10 @@ pub struct Native {
 impl Native {
     pub fn new(max_ctx: Option<usize>) -> Self {
         Self::with_factory(max_ctx, specrt_factory())
+    }
+
+    pub fn with_runtime(max_ctx: Option<usize>, runtime: Option<specrt::spec::RuntimeOptions>) -> Self {
+        Self::with_factory(max_ctx, specrt_factory_with(runtime))
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {

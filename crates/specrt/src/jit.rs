@@ -38,9 +38,7 @@ pub fn cache_key(source: &str, arch: &str, options: &[String]) -> String {
 }
 
 pub fn default_cache_dir() -> PathBuf {
-    std::env::var_os("SPECRT_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("specrt"))
+    dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("specrt")
 }
 
 impl Jit {

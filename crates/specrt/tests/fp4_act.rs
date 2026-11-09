@@ -33,10 +33,11 @@ fn tokens(name: &str) -> Vec<u32> {
 #[test]
 #[ignore = "needs an sm_120 GPU and scripts/reference.py tiny-nvfp4 output"]
 fn native_fp4_prefill_matches_the_activation_quantised_reference() {
-    unsafe { std::env::set_var("SPECRT_FP4_ACT", "1") };
     let dir = root().join("tests/fixtures/tiny-qwen3.5-nvfp4");
     let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     spec.repo = dir.display().to_string();
+    spec.mlp.act_quant = specrt::spec::ActQuant::Fp4;
+    spec.validate().unwrap();
     let ids = tokens("tinynvfp4act-prefill.json");
     let mut rt = Runtime::load(&spec, 2048).unwrap();
     assert_eq!(rt.arch, "compute_120");

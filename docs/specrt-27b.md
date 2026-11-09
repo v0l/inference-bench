@@ -30,7 +30,7 @@ Issue #320. The checkpoint is `Qwen/Qwen3.8-27B-FP8` from the HF cache (68 shard
     run through `mma.m16n8k16.bf16` against the hi/lo split activations. The block scale is
     applied per 64-wide k tile. Activations stay effectively fp32, so this is exact to the
     dequantised weights.
-  - `SPECRT_FP8_ACT=1`: `gemm_fp8`, a native `mma.sync.m16n8k32.e4m3.e4m3.f32` kernel. A
+  - `act_quant = "fp8"`: `gemm_fp8`, a native `mma.sync.m16n8k32.e4m3.e4m3.f32` kernel. A
     `quant_rows_fp8` pass quantises each activation row per 128-column block (dynamic, the
     checkpoint's own `activation_scheme`), and the kernel applies activation scale x weight
     scale per 128-wide k block. NVRTC compiles it for `compute_120`.
@@ -45,7 +45,7 @@ Issue #320. The checkpoint is `Qwen/Qwen3.8-27B-FP8` from the HF cache (68 shard
 | same | batch 4 decode vs single | identical |
 | real 27B, first 4 layers (`reference.py real-slice`, real FP8 shards, vocab cut to 32768 rows that hold the prompt) | 64-token prefill, per layer | max error / max abs 3e-6, logits 5e-6, top-1 64/64 |
 | same | 64 recurrent decode steps | logits 6e-7 relative |
-| native FP8 mma (`SPECRT_FP8_ACT=1`), tiny FP8 | prefill logits vs weight-only reference | 0.30, against a 0.29 gap between the weight-only and activation-quantised references, so it stays inside the envelope that FP8 activations cost |
+| native FP8 mma (`act_quant = "fp8"`), tiny FP8 | prefill logits vs weight-only reference | 0.30, against a 0.29 gap between the weight-only and activation-quantised references, so it stays inside the envelope that FP8 activations cost |
 
 A mutation check: doubling the e4m3 exponent bias in the kernel fails all three FP8 reference
 tests.
@@ -116,14 +116,14 @@ medians from `nsys` on the full 27B, 1,024-token prompt, old and new binaries al
 The real 27B check still passes on the default path: logits 1.98e-4 of the largest logit and
 greedy identical for 32 tokens on all 5 prompts. The greedy tokens are the same as before the
 change. The tiny FP8 tests give the same errors as before on both paths (default logits 4.3e-5,
-`SPECRT_FP8_ACT=1` 0.299).
+`act_quant = "fp8"` 0.299).
 
 ## Prefill GEMM: dequant-to-bf16 against native FP8 mma
 
 Measured on the real 4-layer slice (`bench out/qwen3.8-27b-slice`, vLLM running beside it at
 97% GPU use, so absolute numbers are low and noisy). These are medians of 6, two rounds each:
 
-| prompt | dequant to bf16 (default) | native e4m3 mma (`SPECRT_FP8_ACT=1`) |
+| prompt | dequant to bf16 (default) | native e4m3 mma (`act_quant = "fp8"`) |
 |---|---|---|
 | 128 | 8,700 to 11,000 tok/s | 11,100 to 17,300 tok/s |
 | 1,024 | 10,400 to 10,500 | 17,400 to 20,400 |
@@ -133,7 +133,7 @@ On this slice the GEMMs are 87% of prefill time (`nsys`: `gate_up` 42%, `down` 2
 13%, `lin_out` 6%). The native path roughly doubles prefill at 1k and 4k tokens. It is opt-in
 because it adds the activation-quantisation error, which is as large as the whole FP8
 envelope. The weight-only default is exact to the dequantised checkpoint. Running the default
-path without the hi/lo activation split (`SPECRT_UNSPLIT=...`) reaches about 13,600 tok/s but
+path without the hi/lo activation split (`[runtime] unsplit = [...]`) reaches about 13,600 tok/s but
 fails the 1e-3 reference bound.
 
 Decode is the same on both paths (single-token GEMVs): about 360 tok/s for 4 layers, which
@@ -169,7 +169,7 @@ limit.
 | path | logits max error / max abs logit vs its own reference | vs weight-only reference | greedy, 32 tokens x 5 |
 |---|---|---|---|
 | default (dequant to bf16 tiles, fp32 activations) | 2.0e-4 | 2.0e-4 | identical on all 5 |
-| `SPECRT_FP8_ACT=1` (native e4m3 mma, dynamic per-token activations) | 0.087 against the activation-quantised reference | 0.32 | 3 of 5 identical; the other two flip at a near tie (0.10 and 0.17 logit margin in the reference) |
+| `act_quant = "fp8"` (native e4m3 mma, dynamic per-token activations) | 0.087 against the activation-quantised reference | 0.32 | 3 of 5 identical; the other two flip at a near tie (0.10 and 0.17 logit margin in the reference) |
 
 The envelope is the gap between the activation-quantised and weight-only references: 0.33 of
 the largest logit. Both paths are inside it. The default path is 1600 times inside it and is the
@@ -238,7 +238,7 @@ reaches 1,062 to 1,308 tok/s here under sharing, and the default path about half
 cd crates/specrt
 python scripts/reference.py real-prompts Qwen/Qwen3.8-27B-FP8 out
 cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored --nocapture
-SPECRT_FP8_ACT=1 cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored --nocapture
+SPECRT_27B_SPEC=qwen3.8-27b-act cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored --nocapture
 python scripts/reference.py real-full Qwen/Qwen3.8-27B-FP8 out out/real27b-specrt-weight.json
 python scripts/reference.py real-full Qwen/Qwen3.8-27B-FP8 out out/real27b-specrt-weight.json act
 cargo test --release --test real27b real_27b_greedy_and_logits_match -- --ignored --nocapture

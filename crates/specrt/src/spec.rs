@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub const SPEC_FORMAT: u32 = 4;
+pub const SPEC_FORMAT: u32 = 5;
 
 pub const EMBEDDED: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/embedded_specs.rs"));
 
@@ -51,6 +51,74 @@ impl Quant {
 
     pub fn quantised_checkpoint(self) -> bool {
         matches!(self, Quant::Fp8Block128 | Quant::Fp8Channel | Quant::Nvfp4G16)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActQuant {
+    #[default]
+    None,
+    Fp8,
+    Fp4,
+}
+
+impl ActQuant {
+    fn is_none(&self) -> bool {
+        *self == ActQuant::None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TileChoice {
+    #[default]
+    Auto,
+    Small,
+    Big,
+    Narrow,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeOptions {
+    pub graphs: bool,
+    pub fuse: bool,
+    pub tile: TileChoice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub big_tile: Option<[usize; 4]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unsplit: Vec<String>,
+    pub gemm_fp32: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<PathBuf>,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        RuntimeOptions { graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None }
+    }
+}
+
+impl RuntimeOptions {
+    pub fn is_default(&self) -> bool {
+        *self == RuntimeOptions::default()
+    }
+
+    fn validate(&self) -> Result<()> {
+        if let Some([bm, bn, wm, wn]) = self.big_tile {
+            ensure!(
+                wm > 0 && wn > 0 && bm.is_multiple_of(16 * wm) && bn.is_multiple_of(8 * wn),
+                "[runtime] big_tile [{bm}, {bn}, {wm}, {wn}] needs bm a multiple of 16 * wm and bn a multiple of 8 * wn"
+            );
+        }
+        for name in &self.unsplit {
+            ensure!(
+                crate::codegen::MMA_LINEARS.iter().chain(&crate::codegen::GDN_LINEARS).any(|l| l == name),
+                "[runtime] unsplit names {name}, which is not a linear"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -205,6 +273,8 @@ pub struct Mlp {
     pub quant: Option<Quant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quant_until: Option<usize>,
+    #[serde(default, skip_serializing_if = "ActQuant::is_none")]
+    pub act_quant: ActQuant,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -215,6 +285,8 @@ pub struct Spec {
     pub min_engine: u32,
     pub repo: String,
     pub quant: Quant,
+    #[serde(default, skip_serializing_if = "ActQuant::is_none")]
+    pub act_quant: ActQuant,
     pub dims: Dims,
     pub layers: Layers,
     pub norm: Norm,
@@ -223,6 +295,8 @@ pub struct Spec {
     pub mlp: Mlp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_attention: Option<LinearAttention>,
+    #[serde(default, skip_serializing_if = "RuntimeOptions::is_default")]
+    pub runtime: RuntimeOptions,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -483,6 +557,7 @@ impl Spec {
             min_engine: 0,
             repo: String::new(),
             quant,
+            act_quant: ActQuant::None,
             dims: Dims {
                 hidden: hf.hidden_size,
                 intermediate: hf.intermediate_size,
@@ -502,14 +577,31 @@ impl Spec {
                 rotary_dim,
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling },
-            mlp: Mlp { activation, quant: mlp_quant.map(|m| m.0), quant_until: mlp_quant.and_then(|m| m.1) },
+            mlp: Mlp {
+                activation,
+                quant: mlp_quant.map(|m| m.0),
+                quant_until: mlp_quant.and_then(|m| m.1),
+                act_quant: ActQuant::None,
+            },
             linear_attention,
+            runtime: RuntimeOptions::default(),
         };
         spec.validate()?;
         Ok(spec)
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.runtime.validate()?;
+        match self.act_quant {
+            ActQuant::None => {}
+            ActQuant::Fp8 => ensure!(self.quant.is_fp8(), "act_quant = \"fp8\" needs fp8 weights (quant = \"fp8_block128\" or \"fp8_channel\")"),
+            ActQuant::Fp4 => bail!("act_quant = \"fp4\" is for [mlp] only (act_quant at the top is \"none\" or \"fp8\")"),
+        }
+        match self.mlp.act_quant {
+            ActQuant::None => {}
+            ActQuant::Fp4 => ensure!(self.mlp.quant == Some(Quant::Nvfp4G16), "[mlp] act_quant = \"fp4\" needs [mlp] quant = \"nvfp4_g16\""),
+            ActQuant::Fp8 => bail!("[mlp] act_quant is \"none\" or \"fp4\"; FP8 MLP inputs follow the top-level act_quant"),
+        }
         let a = &self.attention;
         ensure!(
             a.kv_heads > 0 && a.heads.is_multiple_of(a.kv_heads),
@@ -575,6 +667,68 @@ impl Spec {
             }
         }
         Ok(())
+    }
+
+    pub fn with_env_overrides(&self) -> Spec {
+        let mut s = self.clone();
+        let env = |name: &str| std::env::var(name).ok();
+        let on = |name: &str| env(name).is_some_and(|v| v != "0");
+        let mut changed = Vec::new();
+        if on("SPECRT_FP8_ACT") && s.quant.is_fp8() && s.act_quant != ActQuant::Fp8 {
+            s.act_quant = ActQuant::Fp8;
+            changed.push("SPECRT_FP8_ACT");
+        }
+        if on("SPECRT_FP4_ACT") && s.mlp.quant == Some(Quant::Nvfp4G16) && s.mlp.act_quant != ActQuant::Fp4 {
+            s.mlp.act_quant = ActQuant::Fp4;
+            changed.push("SPECRT_FP4_ACT");
+        }
+        if env("SPECRT_NO_GRAPH").is_some() && s.runtime.graphs {
+            s.runtime.graphs = false;
+            changed.push("SPECRT_NO_GRAPH");
+        }
+        if env("SPECRT_NO_FUSE").is_some() && s.runtime.fuse {
+            s.runtime.fuse = false;
+            changed.push("SPECRT_NO_FUSE");
+        }
+        if env("SPECRT_GEMM_FP32").is_some() && !s.runtime.gemm_fp32 {
+            s.runtime.gemm_fp32 = true;
+            changed.push("SPECRT_GEMM_FP32");
+        }
+        let tile = match env("SPECRT_TILE").as_deref() {
+            Some("small") => Some(TileChoice::Small),
+            Some("big") => Some(TileChoice::Big),
+            Some("narrow") => Some(TileChoice::Narrow),
+            _ => None,
+        };
+        if let Some(t) = tile.filter(|t| *t != s.runtime.tile) {
+            s.runtime.tile = t;
+            changed.push("SPECRT_TILE");
+        }
+        let big = env("SPECRT_BIG_TILE").and_then(|v| {
+            let p: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+            <[usize; 4]>::try_from(p).ok()
+        });
+        if let Some(b) = big.filter(|b| s.runtime.big_tile != Some(*b)) {
+            s.runtime.big_tile = Some(b);
+            changed.push("SPECRT_BIG_TILE");
+        }
+        if let Some(u) = env("SPECRT_UNSPLIT") {
+            let names: Vec<String> = u.split(',').filter(|n| !n.is_empty()).map(String::from).collect();
+            if !names.is_empty() && names != s.runtime.unsplit {
+                s.runtime.unsplit = names;
+                changed.push("SPECRT_UNSPLIT");
+            }
+        }
+        if let Some(dir) = std::env::var_os("SPECRT_CACHE").map(PathBuf::from)
+            && s.runtime.cache_dir.as_ref() != Some(&dir)
+        {
+            s.runtime.cache_dir = Some(dir);
+            changed.push("SPECRT_CACHE");
+        }
+        for var in changed {
+            tracing::warn!(spec = %s.name, var, "{var} is a development override and is deprecated; set it in the spec (act_quant, [mlp] act_quant or [runtime]) or the server config");
+        }
+        s
     }
 
     pub fn mlp_quant(&self, layer: usize) -> Quant {

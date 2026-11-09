@@ -1,9 +1,8 @@
 use specrt::runtime::{DecodeRow, Layout, PrefillPart, Runtime, Sampling};
 use specrt::spec::Spec;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
-static TILE: Mutex<()> = Mutex::new(());
+const BIG: Option<specrt::spec::TileChoice> = Some(specrt::spec::TileChoice::Big);
 
 fn fixture_dir(dir: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(dir)
@@ -40,13 +39,9 @@ fn mixed_prompts() -> Vec<Vec<u32>> {
         .collect()
 }
 
-fn fused_pair(dir: &str, tile: Option<&str>, bound: f32) {
-    let _guard = TILE.lock().unwrap_or_else(|e| e.into_inner());
-    match tile {
-        Some(t) => unsafe { std::env::set_var("SPECRT_TILE", t) },
-        None => unsafe { std::env::remove_var("SPECRT_TILE") },
-    }
-    let s = spec_for(dir);
+fn fused_pair(dir: &str, tile: Option<specrt::spec::TileChoice>, bound: f32) {
+    let mut s = spec_for(dir);
+    s.runtime.tile = tile.unwrap_or_default();
     let pages = 512usize.div_ceil(specrt::codegen::PAGE);
     let slots = 4;
     let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
@@ -91,7 +86,7 @@ fn fused_pair(dir: &str, tile: Option<&str>, bound: f32) {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn tiny_fused_step_of_three_decode_rows_and_a_200_token_chunk_matches_separate_launches_at_one_tile() {
-    fused_pair("tiny-qwen3.5", Some("big"), 1e-5);
+    fused_pair("tiny-qwen3.5", BIG, 1e-5);
 }
 
 #[test]
@@ -103,7 +98,7 @@ fn tiny_fused_step_matches_separate_launches_within_tile_rounding() {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn head_dim_256_fused_step_of_three_decode_rows_and_a_200_token_chunk_matches_separate_launches_at_one_tile() {
-    fused_pair("tiny-qwen3.5-hd256", Some("big"), 1e-5);
+    fused_pair("tiny-qwen3.5-hd256", BIG, 1e-5);
 }
 
 #[test]
@@ -115,7 +110,7 @@ fn head_dim_256_fused_step_matches_separate_launches_within_tile_rounding() {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn fp8_fused_step_of_three_decode_rows_and_a_200_token_chunk_matches_separate_launches_at_one_tile() {
-    fused_pair("tiny-qwen3.5-fp8", Some("big"), 1e-5);
+    fused_pair("tiny-qwen3.5-fp8", BIG, 1e-5);
 }
 
 #[test]

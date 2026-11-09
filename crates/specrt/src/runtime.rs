@@ -1,6 +1,6 @@
 use crate::codegen::{LA_CHUNK, LA_COLS, LA_KSPLIT, Module, PAGE};
 use crate::jit::{Jit, default_cache_dir};
-use crate::spec::{LinearAttention, Spec};
+use crate::spec::{LinearAttention, Spec, TileChoice};
 use crate::statepool::StatePool;
 use crate::weights::{Checkpoint, Matrix, Mixer, peak_rss_bytes};
 use anyhow::{Context, Result, ensure};
@@ -404,6 +404,8 @@ impl Runtime {
     }
 
     pub fn load_layout(spec: &Spec, layout: Layout) -> Result<Self> {
+        let resolved = spec.with_env_overrides();
+        let spec = &resolved;
         ensure!(layout.slots >= 1, "need at least one slot");
         let max_ctx = layout.max_ctx;
         let batch = 1;
@@ -412,7 +414,7 @@ impl Runtime {
         let free_before = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
-        let jit = Jit::new(ctx.clone(), default_cache_dir())?;
+        let jit = Jit::new(ctx.clone(), spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir))?;
         let module = Module::generate_kv(spec, max_ctx, layout.kv_planes)?;
         let jit_started = Instant::now();
         let loaded = jit.load(&module)?;
@@ -496,8 +498,7 @@ impl Runtime {
         let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
         let prefill_limit = max_ctx.min(layout.prefill_chunk).max(layout.slots);
         let chunk = prefill_limit + crate::runtime::step::row_capacity(layout.slots);
-        let use_mma =
-            ctx.compute_capability()?.0 >= 8 && std::env::var_os("SPECRT_GEMM_FP32").is_none();
+        let use_mma = ctx.compute_capability()?.0 >= 8 && !spec.runtime.gemm_fp32;
         let mma_only = |n: usize| if use_mma { 1 } else { n };
         let buf = Buffers {
             x: stream.alloc_zeros(d.hidden)?,
@@ -541,7 +542,7 @@ impl Runtime {
             .chain(spec.linear_attention.as_ref().map(|l| l.value_dim()))
             .max()
             .unwrap_or(d.hidden);
-        let fp8_act = if spec.quant.is_fp8() && std::env::var_os("SPECRT_FP8_ACT").is_some() {
+        let fp8_act = if spec.quant.is_fp8() && crate::codegen::fp8_act_enabled(spec) {
             Some(Fp8Act {
                 q: stream.alloc_zeros(chunk * widest)?,
                 scale: stream.alloc_zeros(chunk * widest / crate::codegen::FP8_BLOCK)?,
@@ -549,7 +550,7 @@ impl Runtime {
         } else {
             None
         };
-        let fp4_act = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) && crate::codegen::fp4_act_enabled() {
+        let fp4_act = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) && crate::codegen::fp4_act_enabled(spec) {
             let widest = d.hidden.max(d.intermediate);
             Some(Fp4Act {
                 q: stream.alloc_zeros(chunk * widest / 2)?,
@@ -652,6 +653,10 @@ impl Runtime {
 
     pub fn slots(&self) -> usize {
         self.slots
+    }
+
+    pub fn spec(&self) -> &Spec {
+        &self.spec
     }
 
     pub fn kv_blocks(&self) -> usize {
@@ -886,18 +891,19 @@ impl Runtime {
         tokens: usize,
     ) -> Result<()> {
         use crate::codegen::Tile;
-        let big = Tile::big();
+        let opts = &self.spec.runtime;
+        let big = Tile::big(opts);
         let blocks = |t: Tile| grid(rows, t.bn) * grid(tokens, t.bm);
-        let suffix = match std::env::var("SPECRT_TILE").as_deref() {
-            Ok("small") => "",
-            Ok("big") => "_big",
-            Ok("narrow") => "_narrow",
+        let suffix = match opts.tile {
+            TileChoice::Small => "",
+            TileChoice::Big => "_big",
+            TileChoice::Narrow => "_narrow",
             _ if tokens <= 16 => "_tiny",
             _ if blocks(big) >= 2 * self.sms => "_big",
             _ if blocks(Tile::SMALL) >= 2 * self.sms => "",
             _ => "_narrow",
         };
-        let tile = Tile::variant(suffix);
+        let tile = Tile::variant(suffix, opts);
         if let (Some(fa), DeviceMatrix::Fp8 { .. }, false) = (&self.fp8_act, w, suffix == "_tiny") {
             return self.tc_fp8(fa, name, w, bias, x, out, rows, tokens, suffix, tile);
         }

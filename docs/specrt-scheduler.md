@@ -65,7 +65,7 @@ to allocate and free, and a table entry is the same for all layers. The kernels 
   (`GRAPH_SIZES`) and replays one CUDA graph per size, captured on first use, with tokens, positions,
   slots and sampling params in the `Stepper`'s fixed device buffers. Pad rows point at a spare slot
   (`slots`) whose block table names a spare KV block (`kv_blocks`), so they never touch live state.
-  `SPECRT_NO_GRAPH=1` falls back to eager launches. Test:
+  `[runtime] graphs = false` falls back to eager launches. Test:
   `rows_padded_to_a_captured_graph_size_match_single_sequence_greedy`.
 - **Fused decode and prefill step.** When decoders run and a prefill chunk is due, the scheduler
   calls `Executor::fused`, which `Runtime::fused_step` runs as one batch: the embed, every norm, QKV,
@@ -73,10 +73,10 @@ to allocate and free, and a table entry is the same for all layers. The kernels 
   each weight matrix is read once per step. Attention (`batch_decode_attention` for the decode rows,
   `flash_mma` for the chunk) and the delta-net step (`gdn_step` against `gdn_chunk_*`) stay separate
   launches per kind of row. The lm_head runs on the decode rows plus the last chunk row only when it
-  samples. The fused step is not graph-captured (the chunk length varies); `SPECRT_NO_FUSE=1` goes back
+  samples. The fused step is not graph-captured (the chunk length varies); `[runtime] fuse = false` goes back
   to decode then prefill. Tests (`tests/fused.rs`): 3 decode rows plus a 200 token chunk give the same
   logits as the separate launches, within 1e-5 on the fixtures when both use one GEMM tile
-  (`SPECRT_TILE=big`) and 1e-4 across tile choices; the 64 sequence preemption test runs through the
+  (`[runtime] tile = "big"`) and 1e-4 across tile choices; the 64 sequence preemption test runs through the
   fused path.
 - **Recurrent state on demand.** The conv and delta-net state of a slot (157 MB on the 27B, 156,893,184
   bytes) is a virtual range reserved for all slots at load; physical memory is mapped when the
@@ -197,6 +197,6 @@ Not measured on the real 27B: another process held 24 GB of the GPU next to vLLM
 memory 14 GB against the 36 GB `serve27b.sh` needs) for the whole window, and the one run that fit
 failed its model loads with CUDA out of memory, so its numbers are not recorded. Still to run, under
 `flock /tmp/gpu27.lock`, shared GPU with vLLM serving, 7 alternating runs and medians:
-single stream tok/s with graphs against `SPECRT_NO_GRAPH=1` (57 ms against 45 ms per token),
-`SPECRT_NO_FUSE=1` against fused for 8 decoders beside a 29k prefill (aggregate tok/s and decoder
+single stream tok/s with graphs against `[runtime] graphs = false` (57 ms against 45 ms per token),
+`[runtime] fuse = false` against fused for 8 decoders beside a 29k prefill (aggregate tok/s and decoder
 stall max), and the vLLM comparison of the same `loadtest` mix (#307).

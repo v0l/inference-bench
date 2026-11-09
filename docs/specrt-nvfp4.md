@@ -147,7 +147,7 @@ nibble order fails it (4,804 of the first 5,120 values differ).
     fragment is decoded straight to bf16 (`e2m1 * e4m3` is exact in bf16) and run through
     `mma.m16n8k16.bf16` against the hi/lo split activations, so the result is exact to the
     dequantised weights. The global scale is applied in the epilogue.
-  - `SPECRT_FP4_ACT=1`: `gemm_f4a`, native
+  - `[mlp] act_quant = "fp4"`: `gemm_f4a`, native
     `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64...e2m1.e2m1.f32.ue4m3`.
     `quant_rows_fp4` quantises each activation row per 16-column group the way vLLM's
     `scaled_fp4_quant` does (`sx = e4m3(input_global_scale * amax / 6)`, `cvt.rn.satfinite.e2m1x2`),
@@ -168,10 +168,10 @@ nibble order fails it (4,804 of the first 5,120 values differ).
 | check | fixture | result |
 |---|---|---|
 | tiny NVFP4 (`tiny-qwen3.5-nvfp4`, `reference.py tiny-nvfp4`: layers 0 and 1 NVFP4 MLPs, layer 2 FP8 channel, everything else FP8 channel or bf16, the real checkpoint's mix in small) | decode 32 tokens, per layer | max abs 4e-6 against transformers on the dequantised weights |
-| same | chunked prefill 1,024 tokens | layers 7e-5, logits 5e-5, state 1.2e-5, every tile shape (`SPECRT_TILE=big/small/narrow`) |
+| same | chunked prefill 1,024 tokens | layers 7e-5, logits 5e-5, state 1.2e-5, every tile shape (`[runtime] tile = "big"`, `"small"`, `"narrow"`) |
 | same | logits and 64 greedy tokens | 3.8e-5, greedy identical |
 | same | batch 4 decode against single | identical |
-| same, native fp4 (`SPECRT_FP4_ACT=1`) | 1,024-token prefill against a reference that quantises MLP inputs like vLLM | layer 0 rms 0.0028 against the 0.097 the activation quantisation itself costs; logits rms 0.019 against 0.127 |
+| same, native fp4 (`[mlp] act_quant = "fp4"`) | 1,024-token prefill against a reference that quantises MLP inputs like vLLM | layer 0 rms 0.0028 against the 0.097 the activation quantisation itself costs; logits rms 0.019 against 0.127 |
 | real 27B, first 4 layers (`reference.py real-slice`) | 64-token prefill and 64 decode steps | per-layer max error / max abs at most 2.5e-5, logits 1e-5, decode 8e-7, top-1 64/64 |
 | real 27B, all 64 layers (`real_27b_per_layer_trace_matches_the_cpu_oracle`) | 64-token prefill, per layer | at most 6.7e-5 relative on every layer |
 
@@ -190,7 +190,7 @@ prompts of 64 tokens and 32 greedy tokens as the FP8 run (`tests/real27b.rs`,
 | path | logits max error / max abs vs its own reference | KL(weight-only reference \|\| ours) | top-1 vs weight-only | greedy, 32 x 5 |
 |---|---|---|---|---|
 | default (NVFP4 weights dequantised in the GEMM, f32 activations) | 1.8e-3 | 1.2e-9 | 100% | identical on all 5 |
-| `SPECRT_FP4_ACT=1 SPECRT_FP8_ACT=1` (native fp4 MLPs, native FP8 projections, dynamic activations) | 0.44 against the act reference | 0.0093 | 97.1% | 4 of 5; the fifth flips at step 6 |
+| `act_quant = "fp8"`, `[mlp] act_quant = "fp4"` (native fp4 MLPs, native FP8 projections, dynamic activations) | 0.44 against the act reference | 0.0093 | 97.1% | 4 of 5; the fifth flips at step 6 |
 | the act reference itself, for scale | 0.22 from weight-only | 0.0105 | 97.3% | |
 
 The envelope here is what quantising the activations costs, measured on the real checkpoint:
@@ -200,7 +200,7 @@ within 2 points. Its max error against the act oracle (0.44) is larger than the 
 oracles because the two quantise the same values from slightly different inputs (bf16 hi/lo
 planes against f32), and a group whose amax lands on an e4m3 or e2m1 rounding boundary flips a
 whole step; that grows through 64 layers, so the max is a poor gate and KL and top-1 are used.
-One known difference: `SPECRT_FP8_ACT` quantises FP8 projection inputs per 128 columns (the
+One known difference: `act_quant = "fp8"` quantises FP8 projection inputs per 128 columns (the
 scheme of the block-128 checkpoint), while this checkpoint and the oracle use one scale per
 token. Per 128 is the finer of the two, so it is not a source of extra error.
 
@@ -367,7 +367,7 @@ cargo test --release --test real27b real_27b_nvfp4_first_layers -- --ignored
 export SPECRT_27B_SPEC=qwen3.8-27b-nvfp4
 $PY scripts/reference.py real-prompts orcarouter/Qwen3.8-27B-Uncensored-NVFP4 out
 cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored
-SPECRT_FP4_ACT=1 SPECRT_FP8_ACT=1 cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored
+SPECRT_27B_SPEC=qwen3.8-27b-nvfp4-act cargo test --release --test real27b real_27b_generates_greedy_and_dumps_logits -- --ignored
 $PY scripts/reference.py real-full orcarouter/Qwen3.8-27B-Uncensored-NVFP4 out out/real27b-specrt-weight.json
 $PY scripts/reference.py real-full orcarouter/Qwen3.8-27B-Uncensored-NVFP4 out out/real27b-specrt-weight.json act
 cargo test --release --test real27b real_27b_greedy_and_logits_match -- --ignored

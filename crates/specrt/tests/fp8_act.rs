@@ -33,10 +33,11 @@ fn tokens(name: &str) -> Vec<u32> {
 #[test]
 #[ignore = "needs a CUDA GPU with FP8 mma and scripts/reference.py tiny-fp8 output"]
 fn native_fp8_prefill_stays_inside_the_activation_quantisation_envelope() {
-    unsafe { std::env::set_var("SPECRT_FP8_ACT", "1") };
     let dir = root().join("tests/fixtures/tiny-qwen3.5-fp8");
     let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     spec.repo = dir.display().to_string();
+    spec.act_quant = specrt::spec::ActQuant::Fp8;
+    spec.validate().unwrap();
     let ids = tokens("tinyfp8-greedy.json");
     let mut rt = Runtime::load(&spec, 2048).unwrap();
     let ours = rt.prompt_logits(&ids).unwrap();

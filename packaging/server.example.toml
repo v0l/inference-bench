@@ -20,3 +20,9 @@ auto_update = true
 update_hours = 24
 data_dir = "/var/lib/inference-bench"
 folders = ["/etc/inference-bench/specs"]
+
+[runtime]
+graphs = true
+fuse = true
+tile = "auto"
+gemm_fp32 = false

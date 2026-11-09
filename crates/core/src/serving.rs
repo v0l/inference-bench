@@ -70,7 +70,7 @@ impl Target for ServingTarget {
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
         self.serving = None;
-        let s = Serving::load(model, self.opts).map_err(|e| engine_error(&e))?;
+        let s = Serving::load(model, self.opts.clone()).map_err(|e| engine_error(&e))?;
         self.serving = Some(s);
         Ok(())
     }
@@ -89,7 +89,7 @@ impl Target for ServingTarget {
 
     fn share(&self) -> Option<Box<dyn Target>> {
         let serving = self.serving.clone()?;
-        Some(Box::new(ServingTarget { opts: self.opts, serving: Some(serving) }))
+        Some(Box::new(ServingTarget { opts: self.opts.clone(), serving: Some(serving) }))
     }
 
     fn metrics(&self) -> Option<String> {

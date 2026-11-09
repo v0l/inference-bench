@@ -82,7 +82,8 @@ pub struct GpuExecutor {
 impl GpuExecutor {
     pub fn new(rt: Runtime) -> Result<Self> {
         let st = rt.stepper()?;
-        Ok(GpuExecutor { rt, st, fuse: std::env::var_os("SPECRT_NO_FUSE").is_none() })
+        let fuse = rt.spec().runtime.fuse;
+        Ok(GpuExecutor { rt, st, fuse })
     }
 }
 
