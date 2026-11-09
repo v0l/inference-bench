@@ -412,6 +412,7 @@ fn real_27b_nvfp4_first_layers_match_the_dequantised_checkpoint() {
 fn first_layers_match(fixture: &str, reference: &str, quant: Quant) {
     let dir = out_dir().join(fixture);
     let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    spec.mtp = None;
     spec.repo = dir.display().to_string();
     assert_eq!(spec.quant, quant);
     let meta: serde_json::Value =
