@@ -6,7 +6,7 @@ const PROMPT: [u32; 18] = [785, 6722, 315, 9625, 374, 12095, 13, 9645, 264, 2805
 const VOCAB: usize = 151936;
 
 fn dir() -> PathBuf {
-    std::env::var_os("SPECRT_GGUF_DIR").map(PathBuf::from).unwrap_or_else(|| dirs::home_dir().unwrap().join(".cache/specrt-gguf"))
+    std::env::var_os("SPECRT_GGUF_DIR").filter(|d| !d.is_empty()).map(PathBuf::from).unwrap_or_else(|| dirs::home_dir().unwrap().join(".cache/specrt-gguf"))
 }
 
 fn log_softmax(row: &[f32]) -> Vec<f64> {

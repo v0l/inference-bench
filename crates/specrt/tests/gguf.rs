@@ -34,6 +34,52 @@ fn assert_bits(label: &str, got: &[f32], want: &[u32]) {
     assert!(bad.is_empty(), "{label} differs from ggml at {} of {} values, first {:?}", bad.len(), got.len(), bad.first().map(|&i| (i, got[i], f32::from_bits(want[i]))));
 }
 
+fn gguf_dir() -> std::path::PathBuf {
+    std::env::var_os("SPECRT_GGUF_DIR").filter(|d| !d.is_empty()).map(Into::into).unwrap_or_else(|| dirs::home_dir().unwrap().join(".cache/specrt-gguf"))
+}
+
+fn assets(file: &str) -> (specrt::spec::Spec, tokenizers::Tokenizer, specrt::gguf::Gguf) {
+    let path = gguf_dir().join(file);
+    let g = specrt::gguf::Gguf::open(&path).unwrap();
+    let tok: tokenizers::Tokenizer = g.tokenizer_json().unwrap().parse().unwrap();
+    (specrt::spec::Spec::from_gguf_file(&path).unwrap(), tok, g)
+}
+
+const TOKENIZE: &str = "Hello world! 12345 <|im_start|>user\n  naïve café, isn't it?";
+
+fn ids(tok: &tokenizers::Tokenizer, text: &str) -> Vec<u32> {
+    tok.encode(text, false).unwrap().get_ids().to_vec()
+}
+
+#[test]
+#[ignore = "needs the unsloth Qwen3-0.6B Q8_0 GGUF in ~/.cache/specrt-gguf"]
+fn the_qwen3_gguf_spec_and_tokenizer_match_the_hf_spec_and_llama_cpp() {
+    let (spec, tok, g) = assets("Qwen3-0.6B-Q8_0.gguf");
+    let mut hf = specrt::spec::Spec::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/qwen3-0.6b.toml")).unwrap();
+    (hf.name, hf.repo, hf.quant) = (spec.name.clone(), spec.repo.clone(), specrt::spec::Quant::Q8);
+    hf.norm.eps = spec.norm.eps;
+    assert_eq!(spec, hf);
+    assert_eq!(ids(&tok, TOKENIZE), [9707, 1879, 0, 220, 16, 17, 18, 19, 20, 220, 151644, 872, 198, 220, 94880, 586, 51950, 11, 4436, 944, 432, 30]);
+    let chat = specrt::chat::ChatTemplate::from_tokenizer_config(&g.tokenizer_config_json().unwrap()).unwrap().unwrap();
+    assert!(chat.render_user("hi").unwrap().contains("<|im_start|>user\nhi<|im_end|>"));
+    let stop = specrt::engine::stop_ids(Some(&g.generation_config_json()), g.tokenizer_config_json().as_deref(), &|t| tok.token_to_id(t));
+    assert!(stop.contains(&151645), "{stop:?}");
+    let q4 = specrt::spec::Spec::from_gguf_file(&gguf_dir().join("Qwen3-0.6B-Q4_K_M.gguf")).unwrap();
+    assert_eq!(q4.quant, specrt::spec::Quant::Gguf);
+}
+
+#[test]
+#[ignore = "needs the bartowski Llama-3.2-1B-Instruct Q4_K_M GGUF in ~/.cache/specrt-gguf"]
+fn the_llama_gguf_spec_recovers_llama3_rope_scaling_and_tokenizes_like_llama_cpp() {
+    let (spec, tok, _) = assets("Llama-3.2-1B-Instruct-Q4_K_M.gguf");
+    let mut hf = specrt::spec::Spec::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/llama-3.2-1b.toml")).unwrap();
+    (hf.name, hf.repo, hf.quant) = (spec.name.clone(), spec.repo.clone(), specrt::spec::Quant::Gguf);
+    hf.norm.eps = spec.norm.eps;
+    hf.rope.theta = spec.rope.theta;
+    assert_eq!(spec, hf);
+    assert_eq!(ids(&tok, TOKENIZE), [9906, 1917, 0, 220, 4513, 1774, 83739, 318, 5011, 91, 29, 882, 198, 220, 95980, 588, 53050, 11, 4536, 956, 433, 30]);
+}
+
 #[test]
 fn every_quant_type_dequantises_bit_exact_against_ggml() {
     let all = golden();

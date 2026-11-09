@@ -22,7 +22,7 @@ fn cache_key_covers_source_arch_and_options() {
 fn the_gguf_module_renders_the_ggml_kernels() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3-0.6b-gguf.toml");
     let module = Module::generate(&Spec::load(&path).unwrap(), 256).unwrap();
-    if let Some(out) = std::env::var_os("SPECRT_DUMP_SOURCE") {
+    if let Some(out) = std::env::var_os("SPECRT_DUMP_SOURCE").filter(|o| !o.is_empty()) {
         std::fs::write(out, &module.source).unwrap();
     }
     assert!(module.source.contains("linear_ggml<"));

@@ -8,6 +8,9 @@ fn runs() -> usize {
 }
 
 fn load_spec(path: &Path) -> Result<Spec> {
+    if path.extension().is_some_and(|e| e == "gguf") {
+        return Spec::from_gguf_file(path);
+    }
     if path.is_dir() {
         let config = std::fs::read_to_string(path.join("config.json")).with_context(|| path.display().to_string())?;
         let mut spec = Spec::from_hf_config(&config)?;
@@ -34,7 +37,7 @@ fn main() -> Result<()> {
         args.remove(0);
     }
     let mut args = args.into_iter();
-    let usage = "usage: bench [--speculative] [--sampled] <spec.toml | checkpoint dir> [prompt_len[,prompt_len..]] [new_tokens] [batch]";
+    let usage = "usage: bench [--speculative] [--sampled] <spec.toml | checkpoint dir | model.gguf> [prompt_len[,prompt_len..]] [new_tokens] [batch]";
     let spec_path = PathBuf::from(args.next().context(usage)?);
     let prompts: Vec<usize> = args
         .next()
