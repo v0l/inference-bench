@@ -359,3 +359,64 @@ fn head_dim_256_batch_decode_matches_single_sequence_greedy() {
     let mut batch = Runtime::load_batched(&s, 256, 4).unwrap();
     assert_eq!(batch.generate_batch(&prompts, 24).unwrap().tokens, expected);
 }
+
+fn expected_fp8_weight_bytes() -> u64 {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(fixture_dir(FP8)).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "safetensors") {
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let st = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+        for (name, view) in st.tensors() {
+            let elems = view.shape().iter().product::<usize>() as u64;
+            total += match view.dtype() {
+                safetensors::Dtype::F8_E4M3 => elems + 4 * view.shape()[0] as u64,
+                _ if name.ends_with("in_proj_a.weight")
+                    || name.ends_with("in_proj_b.weight")
+                    || name == "lm_head.weight"
+                    || name == "model.embed_tokens.weight" =>
+                {
+                    elems * 2
+                }
+                _ => elems * 4,
+            };
+        }
+    }
+    total
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn weight_bytes_is_the_sum_of_the_uploaded_buffers() {
+    let rt = Runtime::load(&spec_for(FP8), 256).unwrap();
+    assert_eq!(rt.weight_bytes, expected_fp8_weight_bytes());
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn weight_bytes_ignore_device_memory_freed_by_another_thread() {
+    use cudarc::driver::CudaContext;
+    let expected = expected_fp8_weight_bytes();
+    let churn = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let worker = {
+        let churn = churn.clone();
+        std::thread::spawn(move || {
+            let ctx = CudaContext::new(0).unwrap();
+            let stream = ctx.new_stream().unwrap();
+            while churn.load(std::sync::atomic::Ordering::Relaxed) {
+                let big = stream.alloc_zeros::<u8>(512 << 20).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(3));
+                drop(big);
+                std::thread::sleep(std::time::Duration::from_millis(3));
+            }
+        })
+    };
+    let s = spec_for(FP8);
+    for _ in 0..5 {
+        assert_eq!(Runtime::load(&s, 256).unwrap().weight_bytes, expected);
+    }
+    churn.store(false, std::sync::atomic::Ordering::Relaxed);
+    worker.join().unwrap();
+}
