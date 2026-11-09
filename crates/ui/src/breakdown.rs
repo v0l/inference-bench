@@ -13,6 +13,9 @@ pub fn component_tint(name: &str) -> Color32 {
         "attention" => READOUT,
         "delta-net" => TRACE,
         "mlp" => VALUE,
+        "experts" => VALUE,
+        "shared expert" => VALUE.gamma_multiply(0.6),
+        "router" => WARN.gamma_multiply(0.7),
         "norms" => WARN,
         "lm_head" => LEGEND.gamma_multiply(0.6),
         _ => OK,
@@ -54,6 +57,17 @@ fn stacked(ui: &mut egui::Ui, a: &ModelAnatomy, scale: u64, bytes: bool, label: 
 
 fn effects(a: &ModelAnatomy, spec: &specrt::spec::Spec) -> Vec<String> {
     let mut out = Vec::new();
+    if let Some(m) = &a.moe {
+        let top = m.active.map_or("unknown".to_string(), |k| k.to_string());
+        out.push(format!(
+            "moe: {} experts per layer, top {top} routed plus {} shared, {} of {} layers",
+            m.experts,
+            if m.shared_intermediate > 0 { "1" } else { "no" },
+            m.moe_layers,
+            a.layers.len()
+        ));
+        out.push(format!("experts hold {} of {}, {} per token", human_size(m.routed_bytes), human_size(a.total_bytes), human_size(a.decode_bytes)));
+    }
     out.push(format!("head_quant {}", specrt::anatomy::quant_tag(a.head_quant)));
     if a.head_tied {
         out.push("lm_head tied to the embedding".into());

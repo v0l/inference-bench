@@ -16,6 +16,8 @@ pub fn needs_newer_note(min_engine: u32) -> String {
     format!("needs a newer inference-bench (spec format {min_engine}, this build reads {SPEC_FORMAT})")
 }
 
+const MOE_UNSUPPORTED: &str = "mixture-of-experts models are not supported by the specrt engine";
+
 pub fn check(text: &str) -> Result<Checked> {
     let value: toml::Table = toml::from_str(text)?;
     let min_engine = match value.get("min_engine") {
@@ -28,6 +30,7 @@ pub fn check(text: &str) -> Result<Checked> {
     }
     let spec: Spec = toml::from_str(text)?;
     spec.validate()?;
+    ensure!(spec.moe.is_none(), "{MOE_UNSUPPORTED}");
     Ok(Checked::Ready(Box::new(spec)))
 }
 
@@ -259,6 +262,39 @@ pub struct Dims {
     pub tie_embeddings: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Moe {
+    pub experts: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<usize>,
+    pub expert_intermediate: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub shared_intermediate: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dense_layers: Vec<usize>,
+    #[serde(default = "default_sparse_step", skip_serializing_if = "is_one")]
+    pub sparse_step: usize,
+}
+
+fn default_sparse_step() -> usize {
+    1
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
+fn is_one(n: &usize) -> bool {
+    *n == 1
+}
+
+impl Moe {
+    pub fn is_sparse(&self, layer: usize) -> bool {
+        !self.dense_layers.contains(&layer) && (layer + 1).is_multiple_of(self.sparse_step.max(1))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Layers {
@@ -330,6 +366,8 @@ pub struct Spec {
     pub rope: Rope,
     pub mlp: Mlp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moe: Option<Moe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_attention: Option<LinearAttention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
@@ -377,7 +415,14 @@ fn is_false(b: &bool) -> bool {
 struct HfConfig {
     model_type: String,
     hidden_size: usize,
-    intermediate_size: usize,
+    intermediate_size: Option<usize>,
+    moe_intermediate_size: Option<usize>,
+    shared_expert_intermediate_size: Option<usize>,
+    num_experts: Option<usize>,
+    num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    mlp_only_layers: Vec<usize>,
+    decoder_sparse_step: Option<usize>,
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: Option<usize>,
@@ -397,6 +442,7 @@ struct HfConfig {
     attn_output_gate: bool,
     partial_rotary_factor: Option<f64>,
     layer_types: Option<Vec<String>>,
+    full_attention_interval: Option<usize>,
     linear_num_key_heads: Option<usize>,
     linear_num_value_heads: Option<usize>,
     linear_key_head_dim: Option<usize>,
@@ -459,6 +505,12 @@ fn parse_compressed(q: &serde_json::Value, layers: usize) -> Result<Quantization
     let groups = q["config_groups"].as_object().context("compressed-tensors config has no config_groups")?;
     let mut projection: Option<Quant> = None;
     let mut mlp: Vec<Option<Quant>> = vec![None; layers];
+    if groups.len() == 1 {
+        let (name, g) = groups.iter().next().unwrap();
+        if g["targets"].as_array().is_some_and(|t| t.len() == 1 && t[0].as_str() == Some("Linear")) {
+            return Ok(Quantization { quant: compressed_group(name, g)?, mlp: None });
+        }
+    }
     for (name, g) in groups {
         let quant = compressed_group(name, g)?;
         for t in g["targets"].as_array().context("group without targets")? {
@@ -565,6 +617,14 @@ impl Spec {
     }
 
     pub fn from_hf_config(json: &str) -> Result<Self> {
+        let spec = Self::describe_hf_config(json)?;
+        spec.validate()?;
+        ensure!(spec.moe.is_none(), "{MOE_UNSUPPORTED}");
+        ensure!(spec.dims.intermediate > 0, "config has no intermediate_size");
+        Ok(spec)
+    }
+
+    pub fn describe_hf_config(json: &str) -> Result<Self> {
         let mut value: serde_json::Value = serde_json::from_str(json)?;
         let quant_config = value.get("quantization_config").cloned();
         let outer_type = value.get("model_type").cloned();
@@ -574,7 +634,21 @@ impl Spec {
                 value["model_type"] = t;
             }
         }
-        let hf: HfConfig = serde_json::from_value(value)?;
+        let model_type = value.get("model_type").and_then(|t| t.as_str()).unwrap_or("");
+        ensure!(
+            matches!(
+                model_type,
+                "qwen2" | "qwen3" | "qwen3_moe" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next" | "llama" | "mistral"
+            ),
+            "model_type {model_type} is not supported"
+        );
+        let hf: HfConfig = serde_json::from_value(value).map_err(|e| {
+            let text = e.to_string();
+            match text.strip_prefix("missing field `").and_then(|r| r.split_once('`')) {
+                Some((field, _)) => anyhow::anyhow!("config.json has no {field}"),
+                None => anyhow::Error::from(e),
+            }
+        })?;
         let Quantization { quant, mlp: mlp_quant } = parse_quantization(quant_config.as_ref(), hf.num_hidden_layers)?;
         let params = hf.rope_parameters.as_ref();
         let param = |key: &str| params.and_then(|p| p.get(key)).and_then(|v| v.as_f64());
@@ -590,10 +664,12 @@ impl Spec {
         {
             bail!("torch_dtype {dtype} is not supported");
         }
-        let hybrid = matches!(hf.model_type.as_str(), "qwen3_5" | "qwen3_5_text");
+        let hybrid = matches!(hf.model_type.as_str(), "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next");
         let (qkv_bias, qk_norm) = match hf.model_type.as_str() {
             "qwen2" => (true, false),
-            "qwen3" | "qwen3_5" | "qwen3_5_text" => (hf.attention_bias.unwrap_or(false), true),
+            "qwen3" | "qwen3_moe" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next" => {
+                (hf.attention_bias.unwrap_or(false), true)
+            }
             "llama" | "mistral" => (hf.attention_bias.unwrap_or(false), false),
             other => bail!("model_type {other} is not supported"),
         };
@@ -605,6 +681,12 @@ impl Spec {
             .map(|f| (head_dim as f64 * f).round() as usize);
         let pattern = match &hf.layer_types {
             Some(types) if hybrid => layer_pattern(types)?,
+            None if hybrid && hf.full_attention_interval.is_some_and(|n| n > 1) => {
+                let n = hf.full_attention_interval.unwrap_or(4);
+                let mut p = vec![Block::Linear; n - 1];
+                p.push(Block::Full);
+                p
+            }
             _ => vec![Block::Dense],
         };
         let linear_attention = if pattern.iter().any(|b| b.is_linear()) {
@@ -620,6 +702,17 @@ impl Spec {
         } else {
             None
         };
+        let moe = match (hf.num_experts, hf.moe_intermediate_size) {
+            (Some(experts), Some(expert_intermediate)) if experts > 0 => Some(Moe {
+                experts,
+                active: hf.num_experts_per_tok,
+                expert_intermediate,
+                shared_intermediate: hf.shared_expert_intermediate_size.unwrap_or(0),
+                dense_layers: hf.mlp_only_layers.clone(),
+                sparse_step: hf.decoder_sparse_step.unwrap_or(1),
+            }),
+            _ => None,
+        };
         let spec = Spec {
             name: hf.model_type.clone(),
             min_engine: 0,
@@ -629,7 +722,7 @@ impl Spec {
             act_quant: ActQuant::None,
             dims: Dims {
                 hidden: hf.hidden_size,
-                intermediate: hf.intermediate_size,
+                intermediate: hf.intermediate_size.unwrap_or(0),
                 vocab: hf.vocab_size,
                 tie_embeddings: hf.tie_word_embeddings,
             },
@@ -642,7 +735,7 @@ impl Spec {
                 head_dim,
                 qkv_bias,
                 qk_norm,
-                output_gate: hf.attn_output_gate,
+                output_gate: hf.attn_output_gate || hf.model_type == "qwen3_next",
                 rotary_dim,
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling },
@@ -652,11 +745,11 @@ impl Spec {
                 quant_until: mlp_quant.and_then(|m| m.1),
                 act_quant: ActQuant::None,
             },
+            moe,
             mtp: (hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
             linear_attention,
             runtime: RuntimeOptions::default(),
         };
-        spec.validate()?;
         Ok(spec)
     }
 

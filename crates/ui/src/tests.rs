@@ -772,7 +772,12 @@ fn compare_draws_a_second_strip_on_the_same_scale() {
 fn screenshots_of_the_model_detail_view() {
     let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("/tmp/shots".into()));
     std::fs::create_dir_all(&out).unwrap();
-    let cases: [(&str, detail::View, Option<detail::View>); 4] = [
+    let cases: [(&str, detail::View, Option<detail::View>); 5] = [
+        ("moe-35b", {
+            let json = std::fs::read_to_string(fixtures().join("qwen3.6-35b-a3b-fp8.config.json")).unwrap();
+            let spec = specrt::spec::Spec::describe_hf_config(&json).unwrap();
+            detail::View::new("Qwen3.6-35B-A3B-FP8", spec, detail::Source::HfConfig, 1, Some(262144))
+        }, None),
         ("27b-nvfp4", detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml")), None),
         ("27b-fp8", detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), None),
         ("qwen3-0.6b", {

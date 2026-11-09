@@ -48,7 +48,7 @@ impl View {
             Format::Safetensors => {
                 let path = m.path.join("config.json");
                 let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-                let mut spec = Spec::from_hf_config(&text).map_err(|e| format!("{e:#}"))?;
+                let mut spec = Spec::describe_hf_config(&text).map_err(|e| format!("{e:#}"))?;
                 spec.name = m.name.clone();
                 let (mtp, ctx) = config_extras(&path);
                 Ok(View::new(&m.name, spec, Source::HfConfig, mtp, ctx.or(m.context_length.map(|c| c as usize))))
@@ -231,5 +231,96 @@ fn layers_note(a: &ModelAnatomy) -> String {
     match delta {
         0 => format!("{attention} attention layers"),
         _ => format!("{attention} attention, {delta} delta-net"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use inference_bench_core::library::{hub_dir, scan_hub};
+    use std::path::PathBuf;
+
+    fn fixtures() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures")
+    }
+
+    fn local(name: &str, dir: &Path) -> LocalModel {
+        LocalModel {
+            name: name.into(),
+            repo: String::new(),
+            path: dir.to_path_buf(),
+            root: dir.to_path_buf(),
+            format: Format::Safetensors,
+            size_bytes: 0,
+            architecture: String::new(),
+            quant: String::new(),
+            context_length: None,
+            files: vec![],
+            support: vec![],
+            origin: None,
+        }
+    }
+
+    fn fixture_models() -> Vec<LocalModel> {
+        let scratch = std::env::temp_dir().join(format!("ib-detail-open-{}", std::process::id()));
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(fixtures()).unwrap().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(stem) = name.strip_suffix(".config.json") {
+                let dir = scratch.join(stem);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::copy(&path, dir.join("config.json")).unwrap();
+                out.push(local(stem, &dir));
+            } else if path.join("config.json").is_file() {
+                out.push(local(&name, &path));
+            }
+        }
+        out
+    }
+
+    fn hub_models() -> Vec<LocalModel> {
+        let mut hubs = vec![hub_dir()];
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            hubs.push(home.join("spark/huggingface/hub"));
+        }
+        hubs.iter().flat_map(|h| scan_hub(h)).filter(|m| m.format == Format::Safetensors).collect()
+    }
+
+    #[test]
+    fn the_35b_a3b_moe_config_opens_with_its_experts() {
+        let models = fixture_models();
+        let m = models.iter().find(|m| m.name == "qwen3.6-35b-a3b-fp8").unwrap();
+        let detail = Detail::open(m);
+        let view = detail.view.unwrap_or_else(|e| panic!("{e}"));
+        let moe = view.anatomy.moe.as_ref().unwrap();
+        assert_eq!((moe.experts, moe.active, moe.moe_layers), (256, Some(8), 40));
+        assert!(view.anatomy.decode_params * 8 < view.anatomy.total_params);
+    }
+
+    #[test]
+    fn every_fixture_and_local_model_opens_or_says_why_it_cannot_be_drawn() {
+        let mut models = fixture_models();
+        models.extend(hub_models());
+        assert!(models.len() >= 8);
+        for m in &models {
+            if let Err(e) = Detail::open(m).view {
+                assert!(!e.contains("missing field"), "{}: {e}", m.name);
+                assert!(e.contains("not supported") || e.contains("no config.json") || e.contains("config.json has no"), "{}: {e}", m.name);
+            }
+        }
+    }
+
+    #[test]
+    fn a_config_without_an_intermediate_size_shows_unknown_not_an_error() {
+        let json = std::fs::read_to_string(fixtures().join("qwen3-0.6b.config.json")).unwrap();
+        let mut v: Value = serde_json::from_str(&json).unwrap();
+        v.as_object_mut().unwrap().remove("intermediate_size");
+        let dir = std::env::temp_dir().join(format!("ib-detail-nointer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), v.to_string()).unwrap();
+        let view = Detail::open(&local("no-inter", &dir)).view.unwrap_or_else(|e| panic!("{e}"));
+        let entries = crate::table::entries(&view, None);
+        assert!(entries.iter().any(|e| e.field == "intermediate" && e.value == "unknown"));
     }
 }

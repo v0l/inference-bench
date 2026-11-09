@@ -27,7 +27,8 @@ pub fn entries(view: &View, bandwidth_gbs: Option<u64>) -> Vec<Entry> {
         out.push(Entry { group, field, value, source });
     };
     add("dims", "hidden", s.dims.hidden.to_string(), src);
-    add("dims", "intermediate", s.dims.intermediate.to_string(), src);
+    let known = |n: usize| if n == 0 { "unknown".to_string() } else { n.to_string() };
+    add("dims", "intermediate", known(s.dims.intermediate), src);
     add("dims", "vocab", s.dims.vocab.to_string(), src);
     add("dims", "tie_embeddings", yes(s.dims.tie_embeddings), src);
     add("dims", "layers", s.layers.count.to_string(), src);
@@ -52,7 +53,21 @@ pub fn entries(view: &View, bandwidth_gbs: Option<u64>) -> Vec<Entry> {
         Activation::Geglu => "geglu",
     };
     add("mlp", "activation", act.into(), src);
-    add("mlp", "experts", "dense, none".into(), "derived");
+    match &s.moe {
+        None => add("mlp", "experts", "dense, none".into(), "derived"),
+        Some(m) => {
+            let count = |n: Option<usize>| n.map_or("unknown".to_string(), |n| n.to_string());
+            add("mlp", "experts", m.experts.to_string(), src);
+            add("mlp", "active experts per token", count(m.active), src);
+            add("mlp", "expert intermediate", m.expert_intermediate.to_string(), src);
+            add("mlp", "shared expert intermediate", if m.shared_intermediate == 0 { "none".into() } else { m.shared_intermediate.to_string() }, src);
+            if let Some(summary) = &a.moe {
+                add("mlp", "moe layers", format!("{} of {}", summary.moe_layers, s.layers.count), "derived");
+                add("mlp", "expert parameters", params_text(summary.routed_params), "derived");
+                add("mlp", "expert bytes", human_size(summary.routed_bytes), "derived");
+            }
+        }
+    }
     add("norm", "kind", "rmsnorm".into(), src);
     add("norm", "eps", format!("{:e}", s.norm.eps), src);
     add("norm", "unit_offset", yes(s.norm.unit_offset), src);
@@ -80,7 +95,7 @@ pub fn entries(view: &View, bandwidth_gbs: Option<u64>) -> Vec<Entry> {
     add("mtp and runtime", "tile", tile.into(), src);
     add("mtp and runtime", "gemm_fp32", yes(r.gemm_fp32), src);
     add("derived", "total parameters", params_text(a.total_params), "derived");
-    add("derived", "active parameters", params_text(a.decode_params), "derived");
+    add("derived", "active parameters per token", params_text(a.decode_params), "derived");
     add("derived", "weights", human_size(a.total_bytes), "derived");
     add("derived", "read per decoded token", human_size(a.decode_bytes), "derived");
     add("derived", "kv per 1k tokens", human_size(a.kv_bytes_per_token * 1024), "derived");

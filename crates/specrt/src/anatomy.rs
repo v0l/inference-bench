@@ -25,9 +25,54 @@ pub struct LayerInfo {
     pub mlp_quant: Quant,
     pub mixer_params: u64,
     pub mlp_params: u64,
+    pub moe: bool,
+    pub router_params: u64,
+    pub routed_params: u64,
+    pub shared_params: u64,
+    pub active_params: u64,
+    pub active_bytes: u64,
     pub norm_params: u64,
     pub params: u64,
     pub bytes: u64,
+}
+
+impl LayerInfo {
+    pub fn dense_params(&self) -> u64 {
+        self.mlp_params - self.router_params - self.routed_params - self.shared_params
+    }
+
+    pub fn routed_bytes(&self) -> u64 {
+        quant_bytes(self.routed_params, self.mlp_quant)
+    }
+
+    pub fn shared_bytes(&self) -> u64 {
+        quant_bytes(self.shared_params, self.mlp_quant)
+    }
+
+    pub fn dense_bytes(&self) -> u64 {
+        quant_bytes(self.dense_params(), self.mlp_quant)
+    }
+
+    pub fn router_bytes(&self) -> u64 {
+        2 * self.router_params
+    }
+
+    pub fn mlp_bytes(&self) -> u64 {
+        self.dense_bytes() + self.routed_bytes() + self.shared_bytes() + self.router_bytes()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MoeSummary {
+    pub experts: usize,
+    pub active: Option<usize>,
+    pub expert_intermediate: usize,
+    pub shared_intermediate: usize,
+    pub moe_layers: usize,
+    pub routed_params: u64,
+    pub routed_bytes: u64,
+    pub shared_params: u64,
+    pub router_params: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -49,6 +94,7 @@ pub struct ModelAnatomy {
     pub mtp_layers: usize,
     pub mtp_params: u64,
     pub mtp_bytes: u64,
+    pub moe: Option<MoeSummary>,
     pub total_params: u64,
     pub total_bytes: u64,
     pub decode_params: u64,
@@ -103,8 +149,48 @@ fn delta_counts(spec: &Spec) -> Counts {
     }
 }
 
-fn mlp_params(spec: &Spec) -> u64 {
-    3 * spec.dims.hidden as u64 * spec.dims.intermediate as u64
+struct MlpParts {
+    dense: u64,
+    routed: u64,
+    shared: u64,
+    router: u64,
+    active_routed: u64,
+}
+
+impl MlpParts {
+    fn total(&self) -> u64 {
+        self.dense + self.routed + self.shared + self.router
+    }
+
+    fn bytes(&self, q: Quant) -> u64 {
+        quant_bytes(self.dense, q) + quant_bytes(self.routed, q) + quant_bytes(self.shared, q) + 2 * self.router
+    }
+
+    fn active(&self) -> u64 {
+        self.dense + self.active_routed + self.shared + self.router
+    }
+
+    fn active_bytes(&self, q: Quant) -> u64 {
+        quant_bytes(self.dense, q) + quant_bytes(self.active_routed, q) + quant_bytes(self.shared, q) + 2 * self.router
+    }
+}
+
+fn mlp_parts(spec: &Spec, index: usize, force_moe: bool) -> MlpParts {
+    let h = spec.dims.hidden as u64;
+    match &spec.moe {
+        Some(m) if force_moe || m.is_sparse(index) => {
+            let routed = 3 * h * m.expert_intermediate as u64 * m.experts as u64;
+            let per_token = m.active.unwrap_or(m.experts).min(m.experts) as u64;
+            MlpParts {
+                dense: 0,
+                routed,
+                shared: 3 * h * m.shared_intermediate as u64,
+                router: h * m.experts as u64 + if m.shared_intermediate > 0 { h } else { 0 },
+                active_routed: routed / m.experts.max(1) as u64 * per_token,
+            }
+        }
+        _ => MlpParts { dense: 3 * h * spec.dims.intermediate as u64, routed: 0, shared: 0, router: 0, active_routed: 0 },
+    }
 }
 
 fn layer(spec: &Spec, index: usize) -> LayerInfo {
@@ -115,10 +201,11 @@ fn layer(spec: &Spec, index: usize) -> LayerInfo {
     };
     let mixer_quant = spec.quant;
     let mlp_quant = spec.mlp_quant(index);
-    let mlp = mlp_params(spec);
+    let parts = mlp_parts(spec, index, false);
+    let mlp = parts.total();
     let norm_params = 2 * spec.dims.hidden as u64;
     let mixer_params = mixer.quantised + mixer.plain;
-    let bytes = quant_bytes(mixer.quantised, mixer_quant) + 2 * mixer.plain + quant_bytes(mlp, mlp_quant) + 2 * norm_params;
+    let fixed = quant_bytes(mixer.quantised, mixer_quant) + 2 * mixer.plain + 2 * norm_params;
     LayerInfo {
         index,
         kind,
@@ -126,9 +213,15 @@ fn layer(spec: &Spec, index: usize) -> LayerInfo {
         mlp_quant,
         mixer_params,
         mlp_params: mlp,
+        moe: parts.routed > 0,
+        router_params: parts.router,
+        routed_params: parts.routed,
+        shared_params: parts.shared,
+        active_params: mixer_params + parts.active() + norm_params,
+        active_bytes: fixed + parts.active_bytes(mlp_quant),
         norm_params,
         params: mixer_params + mlp + norm_params,
-        bytes,
+        bytes: fixed + parts.bytes(mlp_quant),
     }
 }
 
@@ -138,11 +231,12 @@ fn mtp_counts(spec: &Spec, count: usize) -> (u64, u64) {
     }
     let h = spec.dims.hidden as u64;
     let attn = attention_counts(spec);
-    let mlp = mlp_params(spec);
+    let parts = mlp_parts(spec, 0, true);
+    let mlp = parts.total();
     let norms = 5 * h;
     let fc = 2 * h * h;
     let params = attn.quantised + attn.plain + mlp + norms + fc;
-    let bytes = quant_bytes(attn.quantised, spec.quant) + 2 * attn.plain + quant_bytes(mlp, spec.quant) + 2 * norms + 2 * fc;
+    let bytes = quant_bytes(attn.quantised, spec.quant) + 2 * attn.plain + parts.bytes(spec.quant) + 2 * norms + 2 * fc;
     (params * count as u64, bytes * count as u64)
 }
 
@@ -162,7 +256,10 @@ impl ModelAnatomy {
         let sum = |kind: LayerKind, f: fn(&LayerInfo) -> u64| layers.iter().filter(|l| l.kind == kind).map(f).sum::<u64>();
         let attn_params = sum(LayerKind::Attention, |l| l.mixer_params);
         let delta_params = sum(LayerKind::DeltaNet, |l| l.mixer_params);
-        let mlp_total: u64 = layers.iter().map(|l| l.mlp_params).sum();
+        let dense_total: u64 = layers.iter().map(|l| l.dense_params()).sum();
+        let routed_total: u64 = layers.iter().map(|l| l.routed_params).sum();
+        let shared_total: u64 = layers.iter().map(|l| l.shared_params).sum();
+        let router_total: u64 = layers.iter().map(|l| l.router_params).sum();
         let norm_total: u64 = layers.iter().map(|l| l.norm_params).sum::<u64>() + hidden;
         let mixer_bytes = |kind: LayerKind| -> u64 {
             layers
@@ -174,7 +271,10 @@ impl ModelAnatomy {
                 })
                 .sum()
         };
-        let mlp_bytes: u64 = layers.iter().map(|l| quant_bytes(l.mlp_params, l.mlp_quant)).sum();
+        let dense_bytes: u64 = layers.iter().map(|l| l.dense_bytes()).sum();
+        let routed_bytes: u64 = layers.iter().map(|l| l.routed_bytes()).sum();
+        let shared_bytes: u64 = layers.iter().map(|l| l.shared_bytes()).sum();
+        let router_bytes: u64 = layers.iter().map(|l| l.router_bytes()).sum();
         let norm_bytes = 2 * norm_total;
 
         let mut components = vec![Component { name: "embedding", params: embedding_params, bytes: embedding_bytes }];
@@ -182,7 +282,14 @@ impl ModelAnatomy {
         if delta_params > 0 {
             components.push(Component { name: "delta-net", params: delta_params, bytes: mixer_bytes(LayerKind::DeltaNet) });
         }
-        components.push(Component { name: "mlp", params: mlp_total, bytes: mlp_bytes });
+        if dense_total > 0 || routed_total == 0 {
+            components.push(Component { name: "mlp", params: dense_total, bytes: dense_bytes });
+        }
+        if routed_total > 0 {
+            components.push(Component { name: "experts", params: routed_total, bytes: routed_bytes });
+            components.push(Component { name: "shared expert", params: shared_total, bytes: shared_bytes });
+            components.push(Component { name: "router", params: router_total, bytes: router_bytes });
+        }
         components.push(Component { name: "norms", params: norm_total, bytes: norm_bytes });
         components.push(Component { name: "lm_head", params: head_params, bytes: head_bytes });
         if mtp_params > 0 {
@@ -191,10 +298,21 @@ impl ModelAnatomy {
 
         let total_params = components.iter().map(|c| c.params).sum();
         let total_bytes = components.iter().map(|c| c.bytes).sum();
-        let layer_params: u64 = layers.iter().map(|l| l.params).sum();
-        let layer_bytes: u64 = layers.iter().map(|l| l.bytes).sum();
+        let layer_params: u64 = layers.iter().map(|l| l.active_params).sum();
+        let layer_bytes: u64 = layers.iter().map(|l| l.active_bytes).sum();
         let decode_params = layer_params + hidden + matrix;
         let decode_bytes = layer_bytes + 2 * hidden + quant_bytes(matrix, head_quant);
+        let moe = spec.moe.as_ref().map(|m| MoeSummary {
+            experts: m.experts,
+            active: m.active,
+            expert_intermediate: m.expert_intermediate,
+            shared_intermediate: m.shared_intermediate,
+            moe_layers: layers.iter().filter(|l| l.moe).count(),
+            routed_params: routed_total,
+            routed_bytes,
+            shared_params: shared_total,
+            router_params: router_total,
+        });
 
         let kv_bytes_per_token = (2 * spec.kv_layers() * spec.attention.kv_heads * spec.attention.head_dim * 2) as u64;
         let state_bytes_per_seq = match &spec.linear_attention {
@@ -217,6 +335,7 @@ impl ModelAnatomy {
             mtp_layers,
             mtp_params,
             mtp_bytes,
+            moe,
             total_params,
             total_bytes,
             decode_params,
@@ -247,7 +366,10 @@ impl ModelAnatomy {
         };
         for l in &self.layers {
             add(l.mixer_quant, quant_bytes(l.mixer_params, l.mixer_quant));
-            add(l.mlp_quant, quant_bytes(l.mlp_params, l.mlp_quant));
+            add(l.mlp_quant, l.mlp_bytes() - l.router_bytes());
+            if l.router_bytes() > 0 {
+                add(Quant::Bf16, l.router_bytes());
+            }
         }
         mix.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
         mix
@@ -271,6 +393,11 @@ mod tests {
 
     fn qwen3() -> Spec {
         Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/qwen3-0.6b.toml")).unwrap()
+    }
+
+    fn moe_35b() -> Spec {
+        let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.6-35b-a3b-fp8.config.json")).unwrap();
+        Spec::describe_hf_config(&json).unwrap()
     }
 
     fn component(a: &ModelAnatomy, name: &str) -> u64 {
@@ -361,6 +488,51 @@ mod tests {
         assert_eq!(mixed.iter().map(|m| m.0).collect::<Vec<_>>(), vec![Quant::Fp8Channel, Quant::Nvfp4G16]);
         let plain = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 0, None).quant_mix();
         assert_eq!(plain.len(), 1);
+    }
+
+    #[test]
+    fn qwen3_6_35b_a3b_reads_as_a_moe_with_the_experts_of_its_config() {
+        let spec = moe_35b();
+        let m = spec.moe.as_ref().unwrap();
+        assert_eq!((m.experts, m.active, m.expert_intermediate, m.shared_intermediate), (256, Some(8), 512, 512));
+        assert_eq!(spec.dims.hidden, 2048);
+        assert_eq!(spec.layers.count, 40);
+        assert_eq!(spec.attention_layers(), 10);
+        assert_eq!(spec.quant, Quant::Fp8Block128);
+    }
+
+    #[test]
+    fn qwen3_6_35b_a3b_total_and_active_parameters_match_the_safetensors_headers() {
+        let a = ModelAnatomy::new(&moe_35b(), 1, None);
+        let layers: u64 = a.layers.iter().map(|l| l.params).sum();
+        assert_eq!(layers, 33_643_489_920);
+        assert_eq!(component(&a, "embedding"), 508_559_360);
+        assert_eq!(component(&a, "lm_head"), 508_559_360);
+        assert_eq!(component(&a, "experts"), 32_212_254_720);
+        assert_eq!(component(&a, "mtp"), 844_640_768);
+        assert_eq!(a.total_params, 34_660_610_688 + 844_640_768);
+        let moe = a.moe.as_ref().unwrap();
+        assert_eq!(moe.moe_layers, 40);
+        assert_eq!(moe.routed_params, 32_212_254_720);
+        let routed_active = 32_212_254_720 / 256 * 8;
+        assert_eq!(a.decode_params, 34_660_610_688 - 508_559_360 - 32_212_254_720 + routed_active);
+        assert!(a.decode_params.abs_diff(3_000_000_000) < 600_000_000, "{}", a.decode_params);
+    }
+
+    #[test]
+    fn qwen3_6_35b_a3b_bytes_match_the_checkpoint_and_decode_reads_only_active_experts() {
+        let a = ModelAnatomy::new(&moe_35b(), 0, None);
+        let header_bytes: u64 = 35_707_978_496;
+        assert!(a.total_bytes.abs_diff(header_bytes) * 1000 < header_bytes, "{} vs {header_bytes}", a.total_bytes);
+        assert_eq!(a.moe.as_ref().unwrap().routed_bytes, 32_216_186_880);
+        assert!(a.decode_bytes * 8 < a.total_bytes, "{} of {}", a.decode_bytes, a.total_bytes);
+    }
+
+    #[test]
+    fn dense_models_have_no_moe_summary_and_decode_all_their_weights() {
+        let a = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 0, None);
+        assert!(a.moe.is_none());
+        assert!(a.layers.iter().all(|l| !l.moe && l.active_params == l.params));
     }
 
     #[test]

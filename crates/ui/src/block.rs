@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use egui_bench::prelude::*;
 use specrt::anatomy::{LayerKind, quant_tag};
-use specrt::spec::{Activation, ActQuant, Quant, RopeScalingKind, Spec};
+use specrt::spec::{Activation, ActQuant, Moe, Quant, RopeScalingKind, Spec};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Node {
@@ -30,7 +30,30 @@ fn norm_node(spec: &Spec) -> Node {
     node("rmsnorm", format!("{}{offset}", spec.dims.hidden))
 }
 
+fn moe_rows(spec: &Spec, layer: usize, moe: &Moe) -> Vec<Row> {
+    let h = spec.dims.hidden;
+    let i = moe.expert_intermediate;
+    let q = spec.mlp_quant(layer);
+    let top = moe.active.map_or("unknown".to_string(), |k| k.to_string());
+    let mut experts = vec![linear(
+        &format!("{} experts, top {top}", moe.experts),
+        format!("each {h} → {i} → {h}, gate and up, swiglu, down"),
+        q,
+    )];
+    if moe.shared_intermediate > 0 {
+        experts.push(linear("shared expert", format!("{h} → {} → {h}, sigmoid gate", moe.shared_intermediate), q));
+    }
+    vec![
+        Row::Boxes(vec![linear("router", format!("{h} → {} logits, softmax, top {top}", moe.experts), Quant::Bf16)]),
+        Row::Boxes(experts),
+        Row::Boxes(vec![node("weighted sum", format!("{top} routed outputs by router weight, plus shared"))]),
+    ]
+}
+
 fn mlp_rows(spec: &Spec, layer: usize) -> Vec<Row> {
+    if let Some(m) = spec.moe.as_ref().filter(|m| m.is_sparse(layer)) {
+        return moe_rows(spec, layer, m);
+    }
     let (h, i) = (spec.dims.hidden, spec.dims.intermediate);
     let q = spec.mlp_quant(layer);
     let act = match spec.mlp.activation {
@@ -277,6 +300,19 @@ mod tests {
         assert!(t.iter().any(|s| s.starts_with("rope neox") && s.contains("64 of 256")));
         assert!(t.contains(&"q norm 256".to_string()));
         assert_eq!(rows.iter().filter(|r| **r == Row::Add).count(), 2);
+    }
+
+    #[test]
+    fn a_moe_layer_shows_the_router_the_experts_with_top_k_and_the_shared_expert() {
+        let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/qwen3.6-35b-a3b-fp8.config.json")).unwrap();
+        let spec = Spec::describe_hf_config(&json).unwrap();
+        for kind in [LayerKind::Attention, LayerKind::DeltaNet] {
+            let t = texts(&rows_for(&spec, kind, 3));
+            assert!(t.contains(&"router 2048 → 256 logits, softmax, top 8".to_string()), "{t:?}");
+            assert!(t.iter().any(|s| s.starts_with("256 experts, top 8 each 2048 → 512 → 2048")), "{t:?}");
+            assert!(t.iter().any(|s| s.starts_with("shared expert 2048 → 512 → 2048")), "{t:?}");
+            assert!(!t.iter().any(|s| s.starts_with("gate ") || s.starts_with("up ")), "{t:?}");
+        }
     }
 
     #[test]

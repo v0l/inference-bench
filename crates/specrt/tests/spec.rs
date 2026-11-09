@@ -479,3 +479,23 @@ fn mtp_block_defaults_to_two_draft_tokens_and_rejects_what_cannot_run() {
     v["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(0);
     assert_eq!(Spec::from_hf_config(&v.to_string()).unwrap().mtp, None);
 }
+
+#[test]
+fn moe_configs_without_an_intermediate_size_are_described_but_refused_for_serving() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3.6-35b-a3b-fp8.config.json")).unwrap();
+    let e = Spec::from_hf_config(&json).unwrap_err().to_string();
+    assert!(e.contains("mixture-of-experts"), "{e}");
+    let spec = Spec::describe_hf_config(&json).unwrap();
+    assert_eq!(spec.dims.intermediate, 0);
+    let moe = spec.moe.unwrap();
+    assert_eq!((moe.experts, moe.active, moe.expert_intermediate, moe.shared_intermediate), (256, Some(8), 512, 512));
+}
+
+#[test]
+fn a_dense_config_without_an_intermediate_size_names_the_missing_field() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3-0.6b.config.json")).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    v.as_object_mut().unwrap().remove("intermediate_size");
+    let e = Spec::from_hf_config(&v.to_string()).unwrap_err().to_string();
+    assert!(e.contains("no intermediate_size") && !e.contains("missing field"), "{e}");
+}

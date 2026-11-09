@@ -32,7 +32,7 @@ pub fn layer_tip(l: &LayerInfo) -> String {
     } else {
         format!("{} mixer, {} mlp", quant_tag(l.mixer_quant), quant_tag(l.mlp_quant))
     };
-    format!(
+    let mut tip = format!(
         "layer {}: {}\n{} parameters ({} mixer, {} mlp, {} norm)\n{} at {}",
         l.index,
         l.kind.label(),
@@ -42,7 +42,19 @@ pub fn layer_tip(l: &LayerInfo) -> String {
         params_text(l.norm_params),
         human_size(l.bytes),
         quants
-    )
+    );
+    if l.moe {
+        tip.push_str(&format!(
+            "\nmoe mlp: {} in experts ({}), {} shared expert, {} router\n{} active per token ({})",
+            params_text(l.routed_params),
+            human_size(l.routed_bytes()),
+            params_text(l.shared_params),
+            params_text(l.router_params),
+            params_text(l.active_params),
+            human_size(l.active_bytes)
+        ));
+    }
+    tip
 }
 
 fn cap_tip(c: &Component, quant: &str) -> String {
@@ -144,6 +156,9 @@ pub fn legend(ui: &mut egui::Ui, a: &specrt::anatomy::ModelAnatomy) {
             ui.painter().rect_filled(r, 1.0, kind_tint(kind));
             Line::new().note(kind.label()).size(11.0).show(ui);
             ui.add_space(8.0);
+        }
+        if a.moe.is_some() {
+            Line::new().note("mlp is the experts, the router and the shared expert").size(10.5).show(ui);
         }
         Line::new().note("darker base is the mlp share, height is parameters, click a layer for its block diagram").size(10.5).show(ui);
     });

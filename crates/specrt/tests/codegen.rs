@@ -178,6 +178,9 @@ fn dispatch_specs() -> Vec<(String, Spec)> {
             out.push((name, Spec::load(&path).unwrap()));
         } else if name.ends_with("config.json") && !name.contains("tokenizer") && path.exists() {
             let json = std::fs::read_to_string(&path).unwrap();
+            if json.contains("\"num_experts\"") {
+                continue;
+            }
             out.push((name, Spec::from_hf_config(&json).unwrap()));
         }
     }
