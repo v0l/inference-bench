@@ -337,6 +337,29 @@ In the graph, under the same sharing (`nsys --cuda-graph-trace=node`, 128-token 
 `gate_up_act_f4` median 90.6 us to 78.5 us. Per-layer minimums of the NVFP4 GEMVs are 89% of the
 ceiling; medians stay near 78% because of the sharing.
 
+### Quantised lm_head for MTP drafts (#415)
+
+`[mtp] head_quant = "bf16" | "fp8_channel" | "nvfp4_g16"` (default `bf16`) gives the MTP draft
+passes (`mtp_heads`) their own head, quantised at load from the target head; the target and the
+verify rows keep `head_quant`. Costs one extra copy (0.72 GB nvfp4, 1.31 GB fp8). Emitted tokens
+stay identical to plain greedy (`tests/mtp.rs`, greedy and chi-square tests per draft head, and
+`the_draft_head_never_touches_the_target_logits`); only acceptance can move.
+
+27B nvfp4, k = 2, 20 prompts x 128 tokens, `bench --speculative`, three alternating runs per head
+beside the served vLLM (first run of each batch size is cold and noisy):
+
+| batch | draft head | tok/s (3 runs) | mean acceptance length |
+|---|---|---|---|
+| 1 | bf16 | 44.1, 82.2, 74.3 | 2.428 |
+| 1 | fp8_channel | 46.5, 78.3, 88.5 | 2.421 |
+| 1 | nvfp4_g16 | 84.2, 86.8, 85.6 | 2.414 |
+| 4 | bf16 | 272.2, 279.7, 281.5 | 2.428 |
+| 4 | fp8_channel | 284.3, 294.0, 288.4 | 2.426 |
+| 4 | nvfp4_g16 | 283.6, 284.5, 283.5 | 2.417 |
+
+nvfp4_g16 loses 0.014 tokens per step and gains about 10 percent at batch 1 on the warm runs
+(86.2 against 78.2) and 2 percent at batch 4. The option stays; the default stays `bf16`.
+
 ### Quantised lm_head (#363)
 
 `head_quant` in the spec picks the output head format: `bf16` (the default, what the checkpoint
