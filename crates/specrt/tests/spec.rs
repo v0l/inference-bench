@@ -545,3 +545,20 @@ fn layer_types_in_any_config_give_sliding_and_full_layers_with_the_window() {
     assert_eq!((a.count(LayerKind::SlidingAttention), a.count(LayerKind::Attention), a.count(LayerKind::DeltaNet)), (50, 10, 0));
     assert!(a.pattern().starts_with("SSSSSA"));
 }
+
+#[test]
+fn mtp_head_quant_defaults_to_the_target_head_and_validates() {
+    let hf = std::fs::read_to_string(format!("{}/tests/fixtures/tiny-qwen3.5-mtp/config.json", env!("CARGO_MANIFEST_DIR"))).unwrap();
+    let s = Spec::from_hf_config(&hf).unwrap();
+    assert_eq!(s.mtp.as_ref().unwrap().head_quant, None);
+    assert_eq!(s.draft_head_quant(), None);
+    let mut q = s.clone();
+    q.mtp.as_mut().unwrap().head_quant = Some(Quant::Nvfp4G16);
+    q.validate().unwrap();
+    assert_eq!(q.draft_head_quant(), Some(Quant::Nvfp4G16));
+    let again = Spec::parse(&q.to_toml().unwrap()).unwrap();
+    assert_eq!(again.mtp.unwrap().head_quant, Some(Quant::Nvfp4G16));
+    let mut bad = s;
+    bad.mtp.as_mut().unwrap().head_quant = Some(Quant::Q8);
+    assert!(bad.validate().unwrap_err().to_string().contains("[mtp] head_quant"));
+}

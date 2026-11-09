@@ -401,6 +401,8 @@ pub struct Mtp {
     pub max_batch: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub graph: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_quant: Option<Quant>,
 }
 
 fn default_draft_tokens() -> usize {
@@ -413,7 +415,7 @@ fn default_true() -> bool {
 
 impl Mtp {
     pub fn new(layers: usize) -> Mtp {
-        Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None, graph: false }
+        Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None, graph: false, head_quant: None }
     }
 }
 
@@ -875,6 +877,16 @@ impl Spec {
                 m.draft_tokens
             );
             ensure!(m.max_batch != Some(0), "[mtp] max_batch must be at least 1");
+            match m.head_quant {
+                None | Some(Quant::Bf16) => {}
+                Some(Quant::Fp8Channel) => {
+                    ensure!(self.dims.hidden.is_multiple_of(128), "[mtp] head_quant = \"fp8_channel\" needs hidden to be a multiple of 128")
+                }
+                Some(Quant::Nvfp4G16) => {
+                    ensure!(self.dims.hidden.is_multiple_of(64), "[mtp] head_quant = \"nvfp4_g16\" needs hidden to be a multiple of 64")
+                }
+                Some(h) => bail!("[mtp] head_quant {h:?} is not supported (bf16, fp8_channel and nvfp4_g16 are)"),
+            }
             ensure!(self.linear_attention.is_some(), "[mtp] needs a hybrid spec with [linear_attention]");
             ensure!(self.attention.output_gate && self.attention.qk_norm, "[mtp] needs the Qwen3.5 attention (output_gate and qk_norm)");
         }
@@ -1031,6 +1043,11 @@ impl Spec {
             None if self.quant.quantised_checkpoint() => Quant::Bf16,
             None => self.quant,
         }
+    }
+
+    pub fn draft_head_quant(&self) -> Option<Quant> {
+        let q = self.speculative()?.head_quant.unwrap_or(Quant::Bf16);
+        (q != self.lm_head_quant()).then_some(q)
     }
 
     pub fn mlp_quant(&self, layer: usize) -> Quant {

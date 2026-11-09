@@ -584,7 +584,7 @@ impl Runtime {
         let chunk = prefill_limit + crate::runtime::step::row_capacity(layout.slots);
         let use_mma = ctx.compute_capability()?.0 >= 8 && !spec.runtime.gemm_fp32;
         ensure!(
-            use_mma || spec.lm_head_quant() != crate::spec::Quant::Nvfp4G16,
+            use_mma || (spec.lm_head_quant() != crate::spec::Quant::Nvfp4G16 && spec.draft_head_quant() != Some(crate::spec::Quant::Nvfp4G16)),
             "head_quant = \"nvfp4_g16\" needs the tensor-core prefill path (an Ampere or newer GPU and [runtime] gemm_fp32 = false)"
         );
         let mma_only = |n: usize| if use_mma { 1 } else { n };

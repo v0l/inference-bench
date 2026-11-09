@@ -1,5 +1,5 @@
 use specrt::runtime::{DecodeRow, Layout, Runtime, Sampling, SpecRow};
-use specrt::spec::Spec;
+use specrt::spec::{Quant, Spec};
 use std::path::{Path, PathBuf};
 
 fn root() -> &'static Path {
@@ -35,6 +35,14 @@ fn spec(k: usize) -> Spec {
     s.repo = dir.display().to_string();
     s.mtp.as_mut().unwrap().draft_tokens = k;
     s.mtp.as_mut().unwrap().graph = true;
+    s
+}
+
+const DRAFT_HEADS: [Quant; 2] = [Quant::Fp8Channel, Quant::Nvfp4G16];
+
+fn spec_with_head(k: usize, head: Quant) -> Spec {
+    let mut s = spec(k);
+    s.mtp.as_mut().unwrap().head_quant = Some(head);
     s
 }
 
@@ -147,7 +155,18 @@ fn check_distribution(name: &str, counts: &[u64], target: &[f64], draft: u32, ac
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn rejection_sampling_follows_the_target_distribution_at_both_draft_positions() {
-    let s = spec(2);
+    rejection_sampling_follows_the_target(spec(2));
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn rejection_sampling_follows_the_target_distribution_with_each_quantised_draft_head() {
+    for head in DRAFT_HEADS {
+        rejection_sampling_follows_the_target(spec_with_head(2, head));
+    }
+}
+
+fn rejection_sampling_follows_the_target(s: Spec) {
     let t = 0.3f32;
     let p: Vec<u32> = prompt(3);
     let mut plain = s.clone();
@@ -452,6 +471,42 @@ fn speculative_greedy_is_identical_to_plain_greedy_for_128_tokens_over_20_prompt
         let (got, mean) = speculative_greedy(&s, &ps, &want, Drafts::Random(k as u64 * 77 + 1), 1);
         assert!(mean < 1.1, "random drafts are almost always rejected: {mean}");
         check(&format!("random drafts, k = {k}"), &got, &want);
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn speculative_greedy_is_identical_to_plain_greedy_with_each_quantised_draft_head() {
+    let ps = prompts();
+    for head in DRAFT_HEADS {
+        for k in 1..=3 {
+            let s = spec_with_head(k, head);
+            let want = plain_greedy(&s, &ps);
+            for batch in [1, 4] {
+                let (got, mean) = speculative_greedy(&s, &ps, &want, Drafts::Mtp, batch);
+                eprintln!("{head:?} draft head, k = {k}, batch {batch}: mean acceptance length {mean:.3}");
+                check(&format!("{head:?} draft head, k = {k}, batch {batch}"), &got, &want);
+            }
+            let (got, _) = speculative_greedy(&s, &ps, &want, Drafts::Wrong(0), 1);
+            check(&format!("{head:?} draft head, rejection position rotating, k = {k}"), &got, &want);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_draft_head_never_touches_the_target_logits() {
+    let base = spec(2);
+    let p = prompt(5);
+    let want = Runtime::load(&base, 512).unwrap().prompt_logits(&p).unwrap();
+    for head in DRAFT_HEADS {
+        let s = spec_with_head(2, head);
+        let mut rt = Runtime::load(&s, 512).unwrap();
+        let got = rt.prompt_logits(&p).unwrap();
+        assert!(want.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()), "{head:?} draft head changed the target logits");
+        let (draft_logits, _) = rt.mtp_prompt_logits(&p).unwrap();
+        let (base_logits, _) = Runtime::load(&base, 512).unwrap().mtp_prompt_logits(&p).unwrap();
+        assert!(draft_logits.iter().zip(&base_logits).any(|(a, b)| a.to_bits() != b.to_bits()), "{head:?} draft head is not used for draft logits");
     }
 }
 

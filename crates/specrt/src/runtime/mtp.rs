@@ -17,6 +17,7 @@ pub(super) struct DeviceMtp {
     norm_hidden: CudaSlice<f32>,
     norm: CudaSlice<f32>,
     layer: DeviceLayer,
+    head: Option<DeviceMatrix>,
 }
 
 impl DeviceMtp {
@@ -52,6 +53,10 @@ impl DeviceMtp {
             norm_hidden: stream.clone_htod(&w.norm_hidden)?,
             norm: stream.clone_htod(&w.norm)?,
             layer,
+            head: match spec.draft_head_quant() {
+                Some(q) => Some(DeviceMatrix::upload(stream, &checkpoint.draft_head(spec, q)?)?),
+                None => None,
+            },
         };
         stream.synchronize()?;
         Ok(Some(m))
@@ -59,6 +64,7 @@ impl DeviceMtp {
 
     pub(super) fn bytes(&self) -> u64 {
         self.fc.bytes()
+            + self.head.as_ref().map_or(0, DeviceMatrix::bytes)
             + self.layer.bytes()
             + (self.norm_embed.num_bytes() + self.norm_hidden.num_bytes() + self.norm.num_bytes()) as u64
     }
@@ -323,7 +329,11 @@ impl Runtime {
         let m = self.mtp();
         self.copy_rows_by_index(&self.pre.x, src, &m.cg, &m.iota.as_view(), n)?;
         self.rms_split(&m.cg.as_view(), &m.w.norm, &self.pre.xn_planes, n)?;
-        self.tc("lm_head", &self.lm_head, None, self.pre.xn_planes.all(), GemmOut::F32(&m.logits), self.spec.dims.vocab, n)?;
+        let (head_name, head) = match &m.w.head {
+            Some(h) => ("mtp_head", h),
+            None => ("lm_head", &self.lm_head),
+        };
+        self.tc(head_name, head, None, self.pre.xn_planes.all(), GemmOut::F32(&m.logits), self.spec.dims.vocab, n)?;
         let (col, k) = (col as i32, m.k as i32);
         let mut b = self.stream.launch_builder(self.kernel("mtp_draft"));
         b.arg(&m.logits).arg(&m.drafts).arg(&col).arg(&k).arg(&m.ctok).arg(slots);

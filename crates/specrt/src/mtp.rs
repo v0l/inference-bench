@@ -1,5 +1,5 @@
-use crate::codegen::{MMA_VARIANTS, MmaShape, Tile, WeightFormat};
-use crate::spec::Spec;
+use crate::codegen::{FP4_STAGES, MMA_VARIANTS, MmaShape, Tile, WeightFormat, f4w_smem};
+use crate::spec::{Quant, Spec};
 use std::collections::BTreeMap;
 
 pub const MTP_TEMPLATE: &str = include_str!("../templates/mtp.cu");
@@ -53,6 +53,56 @@ pub fn dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str) {
         "mtp_gate_up" => (2 * d.intermediate, d.hidden, "EPI_ACT"),
         _ => (d.hidden, d.intermediate, "EPI_RESIDUAL"),
     }
+}
+
+pub const MTP_HEAD_MMA_KERNELS: &[&str] = &["mtp_head_mma", "mtp_head_mma_big", "mtp_head_mma_narrow", "mtp_head_mma_tiny"];
+pub const MTP_HEAD_F4_KERNELS: &[&str] = &["mtp_head_f4w", "mtp_head_f4w_big", "mtp_head_f4w_narrow", "mtp_head_f4w_tiny"];
+
+pub fn head_kernels(spec: &Spec) -> &'static [&'static str] {
+    match spec.draft_head_quant() {
+        None => &[],
+        Some(Quant::Nvfp4G16) => MTP_HEAD_F4_KERNELS,
+        Some(_) => MTP_HEAD_MMA_KERNELS,
+    }
+}
+
+pub fn head_source(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
+    let Some(quant) = spec.draft_head_quant() else { return String::new() };
+    let (n, k) = (spec.dims.vocab, spec.dims.hidden);
+    let mut out = String::new();
+    for (i, suffix) in MMA_VARIANTS.iter().enumerate() {
+        let t = Tile::variant(suffix, &spec.runtime);
+        if quant == Quant::Nvfp4G16 {
+            let name = MTP_HEAD_F4_KERNELS[i];
+            smem.insert(name, f4w_smem(t));
+            out.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_f4w<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {stages}, EPI_STORE>(w, s, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+                threads = t.threads(),
+                bm = t.bm,
+                bn = t.bn,
+                wm = t.wm,
+                wn = t.wn,
+                stages = FP4_STAGES,
+            ));
+        } else {
+            let wf = WeightFormat::of(quant);
+            let shape = MmaShape::new(t, k, wf, true);
+            let name = MTP_HEAD_MMA_KERNELS[i];
+            smem.insert(name, shape.smem_bytes());
+            out.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, EPI_STORE, false, {wf}, true>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+                threads = t.threads(),
+                bm = t.bm,
+                bn = t.bn,
+                wm = t.wm,
+                wn = t.wn,
+                bk = shape.bk,
+                stages = shape.stages,
+                wf = wf.code(),
+            ));
+        }
+    }
+    out
 }
 
 pub fn mtp_source(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {

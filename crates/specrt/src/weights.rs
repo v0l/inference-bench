@@ -824,18 +824,27 @@ impl Checkpoint {
         let root = self.root();
         let embed = self.bf16(&format!("{root}.embed_tokens.weight"), &[d.vocab, d.hidden])?;
         let head_quant = spec.lm_head_quant();
-        let lm_head = if d.tie_embeddings && self.gguf.is_some() {
-            self.raw(&format!("{root}.embed_tokens.weight"), d.vocab, d.hidden)?
-        } else if d.tie_embeddings {
-            Raw::Bf16 { w: embed.clone(), cols: d.hidden }
-        } else {
-            self.raw("lm_head.weight", d.vocab, d.hidden)?
-        };
         Ok(Outside {
             norm: self.norm(spec, &format!("{root}.norm.weight"), d.hidden)?,
-            lm_head: lm_head.into_matrix(head_quant, "lm_head")?,
+            lm_head: self.head_raw(spec, &embed)?.into_matrix(head_quant, "lm_head")?,
             embed,
         })
+    }
+
+    fn head_raw<'s>(&'s self, spec: &Spec, embed: &Cow<'s, [u16]>) -> Result<Raw<'s>> {
+        let d = &spec.dims;
+        if d.tie_embeddings && self.gguf.is_some() {
+            self.raw(&format!("{}.embed_tokens.weight", self.root()), d.vocab, d.hidden)
+        } else if d.tie_embeddings {
+            Ok(Raw::Bf16 { w: embed.clone(), cols: d.hidden })
+        } else {
+            self.raw("lm_head.weight", d.vocab, d.hidden)
+        }
+    }
+
+    pub fn draft_head(&self, spec: &Spec, quant: Quant) -> Result<Matrix<'_>> {
+        let embed = self.bf16(&format!("{}.embed_tokens.weight", self.root()), &[spec.dims.vocab, spec.dims.hidden])?;
+        self.head_raw(spec, &embed)?.into_matrix(quant, "mtp lm_head")
     }
 }
 

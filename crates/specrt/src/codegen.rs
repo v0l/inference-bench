@@ -82,7 +82,7 @@ pub const FP4_KERNELS: &[&str] = &[
     "down_f4b64",
     "down_f4b_reduce",
 ];
-const FP4_STAGES: usize = 3;
+pub const FP4_STAGES: usize = 3;
 pub const FP4_BATCH_TEMPLATE: &str = include_str!("../templates/fp4_batch.cu");
 pub const F4B_VARIANTS: &[usize] = &[8, 16, 32, 64];
 pub const F4B_MAX_TOKENS: usize = 64;
@@ -527,8 +527,8 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
     let choice = |name: String, path: GemmPath, quant: Option<&'static str>| KernelChoice { name, quant, reduce: None, tile, path };
     let auto = opts.tile == TileChoice::Auto;
     let f8b = auto && tokens <= F8B_MAX_TOKENS && F8B_LINEARS.contains(&linear);
-    let f4b = auto && tokens <= F4B_MAX_TOKENS && linear != "lm_head";
-    let act_quant = linear != "lm_head" && suffix != "_tiny";
+    let f4b = auto && tokens <= F4B_MAX_TOKENS && !linear.ends_with("head");
+    let act_quant = !linear.ends_with("head") && suffix != "_tiny";
     let fp8_act = spec.quant.is_fp8() && fp8_act_enabled(spec);
     let fp4_act = spec.mlp.quant == Some(Quant::Nvfp4G16) && fp4_act_enabled(spec);
     match weight {
@@ -947,7 +947,8 @@ impl Module {
         }
         let fp4_mlp = spec.mlp.quant == Some(Quant::Nvfp4G16);
         let fp4_head = spec.lm_head_quant() == Quant::Nvfp4G16;
-        if fp4_mlp || fp4_head {
+        let fp4_draft = spec.draft_head_quant() == Some(Quant::Nvfp4G16);
+        if fp4_mlp || fp4_head || fp4_draft {
             let mut fp4_vars = BTreeMap::new();
             fp4_vars.insert("F4W_KERNELS", if fp4_mlp { fp4_kernels(spec, &mut smem) } else { String::new() });
             let act = fp4_mlp && fp4_act_enabled(spec);
@@ -968,6 +969,11 @@ impl Module {
             source.push('\n');
             source.push_str(&fp4_head_source(spec, &mut smem)?);
             kernels.extend_from_slice(FP4_HEAD_KERNELS);
+        }
+        if la.is_some() && spec.speculative().is_some() {
+            source.push('\n');
+            source.push_str(&crate::mtp::head_source(spec, &mut smem));
+            kernels.extend_from_slice(crate::mtp::head_kernels(spec));
         }
         Ok(Module { source, kernels, smem, arch_features })
     }
