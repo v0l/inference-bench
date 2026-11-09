@@ -6,6 +6,7 @@ use inference_bench_core::library::{Format, LocalModel, human_size};
 use serde_json::Value;
 use specrt::anatomy::{LayerKind, ModelAnatomy};
 use specrt::spec::Spec;
+use specrt::structure::Structure;
 use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,12 +29,20 @@ pub struct View {
     pub spec: Spec,
     pub anatomy: ModelAnatomy,
     pub source: Source,
+    pub structure: Option<Structure>,
 }
 
 impl View {
     pub fn new(name: &str, spec: Spec, source: Source, mtp_layers: usize, max_ctx: Option<usize>) -> Self {
         let anatomy = ModelAnatomy::new(&spec, mtp_layers, max_ctx);
-        View { name: name.to_string(), spec, anatomy, source }
+        View { name: name.to_string(), spec, anatomy, source, structure: None }
+    }
+
+    pub fn with_structure(mut self, structure: Structure) -> Self {
+        self.spec.apply_structure(&structure);
+        self.anatomy = ModelAnatomy::new(&self.spec, self.anatomy.mtp_layers, Some(self.anatomy.max_context));
+        self.structure = Some(structure);
+        self
     }
 
     pub fn load(m: &LocalModel) -> Result<View, String> {
@@ -43,7 +52,8 @@ impl View {
                 let spec = Spec::load(&m.path).map_err(|e| format!("{e:#}"))?;
                 let cfg = m.files.first().and_then(|f| f.parent()).map(|d| d.join("config.json"));
                 let (mtp, ctx) = cfg.as_deref().map(config_extras).unwrap_or((0, None));
-                Ok(View::new(&m.name, spec, Source::SpecToml, mtp, ctx.or(m.context_length.map(|c| c as usize))))
+                let view = View::new(&m.name, spec, Source::SpecToml, mtp, ctx.or(m.context_length.map(|c| c as usize)));
+                Ok(with_header(view, m))
             }
             Format::Safetensors => {
                 let path = m.path.join("config.json");
@@ -51,9 +61,17 @@ impl View {
                 let mut spec = Spec::describe_hf_config(&text).map_err(|e| format!("{e:#}"))?;
                 spec.name = m.name.clone();
                 let (mtp, ctx) = config_extras(&path);
-                Ok(View::new(&m.name, spec, Source::HfConfig, mtp, ctx.or(m.context_length.map(|c| c as usize))))
+                let view = View::new(&m.name, spec, Source::HfConfig, mtp, ctx.or(m.context_length.map(|c| c as usize)));
+                Ok(with_header(view, m))
             }
         }
+    }
+}
+
+fn with_header(view: View, m: &LocalModel) -> View {
+    match Structure::read(&m.files) {
+        Ok(structure) => view.with_structure(structure),
+        Err(_) => view,
     }
 }
 
@@ -191,9 +209,14 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
         strip::legend(ui, &view.anatomy);
     });
     let layer_for_block = layer.unwrap_or_else(|| view.anatomy.layers.iter().find(|l| l.kind == *kind).map_or(0, |l| l.index));
-    section(ui, "block diagram", &block::title(*kind, *layer, &view.spec), |ui| {
-        block::draw(ui, &view.spec, *kind, layer_for_block);
-    });
+    match view.structure.as_ref().and_then(|s| block::layer_for(s, layer_for_block)) {
+        Some(l) => section(ui, "block diagram", &block::title(*layer, &view.spec, l), |ui| {
+            block::draw(ui, &block::rows_for(l, &view.spec));
+        }),
+        None => section(ui, "block diagram", "no checkpoint headers", |ui| {
+            Line::new().note("the safetensors headers are not on disk, so there are no tensors to draw").size(11.0).show(ui);
+        }),
+    };
     let anatomies: Vec<&specrt::anatomy::ModelAnatomy> = views.iter().map(|v| &v.anatomy).collect();
     let totals = breakdown::max_totals(anatomies.iter().copied());
     section(ui, "parameters and memory", "bars share one scale", |ui| {

@@ -703,11 +703,16 @@ fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures")
 }
 
+fn header_structure(name: &str) -> specrt::structure::Structure {
+    let text = std::fs::read_to_string(fixtures().join("headers").join(format!("{name}.json"))).unwrap();
+    specrt::structure::Structure::from_json(&text).unwrap()
+}
+
 fn detail_view(name: &str, toml: Option<&str>) -> detail::View {
     match toml {
         Some(t) => {
             let spec = specrt::spec::Spec::load(&fixtures().join(t)).unwrap();
-            detail::View::new(name, spec, detail::Source::SpecToml, 1, Some(131072))
+            detail::View::new(name, spec, detail::Source::SpecToml, 1, Some(131072)).with_structure(header_structure("qwen3.8-27b-fp8"))
         }
         None => {
             let json = std::fs::read_to_string(fixtures().join("tiny-qwen3.5/config.json")).unwrap();
@@ -779,17 +784,27 @@ fn compare_draws_a_second_strip_on_the_same_scale() {
 fn screenshots_of_the_model_detail_view() {
     let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("/tmp/shots".into()));
     std::fs::create_dir_all(&out).unwrap();
-    let cases: [(&str, detail::View, Option<detail::View>); 5] = [
+    let cases: [(&str, detail::View, Option<detail::View>); 7] = [
         ("moe-35b", {
             let json = std::fs::read_to_string(fixtures().join("qwen3.6-35b-a3b-fp8.config.json")).unwrap();
             let spec = specrt::spec::Spec::describe_hf_config(&json).unwrap();
-            detail::View::new("Qwen3.6-35B-A3B-FP8", spec, detail::Source::HfConfig, 1, Some(262144))
+            detail::View::new("Qwen3.6-35B-A3B-FP8", spec, detail::Source::HfConfig, 1, Some(262144)).with_structure(header_structure("qwen3.6-35b-a3b-fp8"))
         }, None),
         ("27b-nvfp4", detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml")), None),
         ("27b-fp8", detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), None),
         ("qwen3-0.6b", {
             let spec = specrt::spec::Spec::load(&fixtures().join("../../specs/qwen3-0.6b.toml")).unwrap();
-            detail::View::new("Qwen3-0.6B", spec, detail::Source::SpecToml, 0, Some(40960))
+            detail::View::new("Qwen3-0.6B", spec, detail::Source::SpecToml, 0, Some(40960)).with_structure(header_structure("qwen3-0.6b"))
+        }, None),
+        ("llama", {
+            let json = std::fs::read_to_string(fixtures().join("llama-3.2-1b.config.json")).unwrap();
+            let spec = specrt::spec::Spec::describe_hf_config(&json).unwrap();
+            detail::View::new("Llama-3.2-1B", spec, detail::Source::HfConfig, 0, None).with_structure(header_structure("llama-3.2-1b"))
+        }, None),
+        ("gemma4", {
+            let json = std::fs::read_to_string(fixtures().join("gemma4-31b.config.json")).unwrap();
+            let spec = specrt::spec::Spec::describe_hf_config(&json).unwrap();
+            detail::View::new("gemma-4-31B-it", spec, detail::Source::HfConfig, 0, None).with_structure(header_structure("gemma4-31b"))
         }, None),
         ("compare", detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), Some(detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml")))),
     ];
@@ -805,5 +820,9 @@ fn screenshots_of_the_model_detail_view() {
 }
 
 fn view_clone(v: &detail::View) -> detail::View {
-    detail::View::new(&v.name, v.spec.clone(), v.source, v.anatomy.mtp_layers, Some(v.anatomy.max_context))
+    {
+        let mut c = detail::View::new(&v.name, v.spec.clone(), v.source, v.anatomy.mtp_layers, Some(v.anatomy.max_context));
+        c.structure = v.structure.clone();
+        c
+    }
 }

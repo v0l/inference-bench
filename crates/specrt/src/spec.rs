@@ -420,6 +420,15 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+pub const HF_CONFIG_KEYS: &[&str] = &[
+    "model_type", "hidden_size", "intermediate_size", "moe_intermediate_size", "shared_expert_intermediate_size", "num_experts",
+    "num_experts_per_tok", "mlp_only_layers", "decoder_sparse_step", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+    "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
+    "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
+    "full_attention_interval", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
+    "linear_conv_kernel_dim", "mtp_num_hidden_layers",
+];
+
 #[derive(Deserialize)]
 struct HfConfig {
     model_type: String,

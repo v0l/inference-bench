@@ -38,13 +38,11 @@ impl Group {
     }
 
     pub fn weight(&self) -> Option<&TensorInfo> {
-        self.tensor("weight").or_else(|| self.tensors.first())
+        self.tensor("weight").or_else(|| self.tensor("weight_packed")).or_else(|| self.tensors.first())
     }
 
     pub fn is_norm(&self) -> bool {
-        self.name().contains("norm") && !self.path.contains('.')
-            || self.name().ends_with("_norm")
-            || self.name().ends_with("layernorm")
+        self.name().contains("norm")
     }
 
     pub fn is_matrix(&self) -> bool {

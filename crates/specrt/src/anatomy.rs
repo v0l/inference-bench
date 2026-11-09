@@ -397,7 +397,10 @@ mod tests {
 
     fn moe_35b() -> Spec {
         let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.6-35b-a3b-fp8.config.json")).unwrap();
-        Spec::describe_hf_config(&json).unwrap()
+        let mut spec = Spec::describe_hf_config(&json).unwrap();
+        let rows = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/headers/qwen3.6-35b-a3b-fp8.json")).unwrap();
+        spec.apply_structure(&crate::structure::Structure::from_json(&rows).unwrap());
+        spec
     }
 
     fn component(a: &ModelAnatomy, name: &str) -> u64 {
