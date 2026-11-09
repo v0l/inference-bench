@@ -605,4 +605,42 @@ settable with `[runtime] fp4_tile = [bm, bn, wm, wn]`. Per-call nsys on the 27B,
 
 gate_up goes from about 160 to 250 TFLOP/s at 1,024 tokens, a 37% cut in GEMM time. At 256 and 512
 tokens the new tile is still ahead (2,898 and 3,600 against 2,756 and 3,322 tok/s). ncu needs GPU counter permission (ERR_NVGPUCTRPERM), so stall reasons and bank
-conflicts were not collected; the deeper pipeline, TMA and warp specialisation ports are not done.
+conflicts were not collected.
+
+### FlashInfer's choices on this box
+
+The autotune cache (`~/.cache/vllm/flashinfer_autotune_cache/0.6.16.post3/120f`) stores only a tactic
+index per (M, N, K), not the tile. The tactic list comes from `CutlassFp4GemmRunner::getConfigs()` in
+`fp4_gemm_cutlass_template_sm120.h`: 8 CTA shapes (128x32x64, 128x32x128, 128x64x64, 128x64x128,
+128x128x64, 128x128x128, 256x128x64, 128x256x64), always a 1x1x1 cluster, mainloop and epilogue
+schedule AUTO, stage count `StageCountAutoCarveout` (derived from smem), each with swap_ab on or off
+and the data-parallel or StreamK scheduler: tactic = 4 * tile + 2 * (stream_k) + (not swap_ab) after
+the leading fallback, so 0 to 3 is 128x32x64 and 24 to 27 is 128x256x64.
+
+The tactics chosen at 1,024 tokens: gate_up (N 34816, K 5120) 24, 26 or 27; down (N 5120, K 17408)
+26. At 4,096: gate_up 10 or 25, down 21, 25 or 26. Tactics 24 to 27 are the 128x256x64 tile, so
+FlashInfer's winner at prefill sizes is the same 128x256 tile adopted here, with an auto-sized
+pipeline and the cooperative CUTLASS warp-specialised mainloop. qkv is not NVFP4 in this checkpoint
+(FP8 channel projections), so it has no fp4 entry.
+
+### Pipeline depth
+
+`[runtime] fp4_stages` (default 3, clamped to what fits in 99 KB) sets the cp.async depth.
+128x256 holds 3 stages in 99 KB (2 would fit more tiles per SM but measured slower: gate_up 0.77 ms
+at 1,024, against 0.72 ms for 3). 128x128 with 4 stages measured no better than 3 (the runs were
+contended by other GPU jobs, so treat those as inconclusive). Neither reached the 10% bar, so the
+default stays 3.
+
+### Other NVFP4 GEMMs (per call, 1,024 / 4,096 tokens, min over launches)
+
+| call | before | after |
+|---|---|---|
+| gate_up | 1.01 / 2.20 ms | 0.66 / 1.45 ms |
+| down | 0.51 / 1.04 ms | 0.33 / 0.74 ms |
+
+Only gate_up and down are NVFP4 in the 27B checkpoint; qkv, o and lin_in/lin_out are FP8 (#416) and
+use the `[runtime] big_tile` path, which this change does not touch.
+
+Swizzled smem and producer/consumer warp specialisation were not ported: without ncu there is no
+bank-conflict or stall signal to justify them, and the GPU was shared with other jobs during
+measurement.

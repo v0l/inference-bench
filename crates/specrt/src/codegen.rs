@@ -27,8 +27,15 @@ pub fn fp8_act_enabled(spec: &Spec) -> bool {
     spec.act_quant == ActQuant::Fp8
 }
 
-pub fn f4a_smem(tile: Tile) -> u32 {
-    (FP4_STAGES * (tile.bm + tile.bn) * F4A_ROW) as u32
+const F4A_SMEM_LIMIT: usize = 101376;
+
+pub fn f4a_stages(tile: Tile, opts: &RuntimeOptions) -> usize {
+    let fit = F4A_SMEM_LIMIT / ((tile.bm + tile.bn) * F4A_ROW);
+    opts.fp4_stages.unwrap_or(FP4_STAGES).min(fit).max(2)
+}
+
+pub fn f4a_smem(tile: Tile, opts: &RuntimeOptions) -> u32 {
+    (f4a_stages(tile, opts) * (tile.bm + tile.bn) * F4A_ROW) as u32
 }
 
 fn fp4_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
@@ -39,14 +46,15 @@ fn fp4_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Strin
             let t = Tile::fp4_variant(suffix, &spec.runtime);
             let name = format!("{linear}_f4a{suffix}");
             let name = FP4_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_ACT_KERNELS");
-            smem.insert(name, f4a_smem(t));
+            smem.insert(name, f4a_smem(t, &spec.runtime));
             out.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const unsigned char* xq, const unsigned char* xs, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_f4a<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP4_STAGES}, {epi}>(w, s, xq, xs, out, oh, ol, tokens);\n}}\n\n",
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const unsigned char* xq, const unsigned char* xs, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_f4a<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {stages}, {epi}>(w, s, xq, xs, out, oh, ol, tokens);\n}}\n\n",
                 threads = t.threads(),
                 bm = t.bm,
                 bn = t.bn,
                 wm = t.wm,
                 wn = t.wn,
+                stages = f4a_stages(t, &spec.runtime),
             ));
         }
     }
