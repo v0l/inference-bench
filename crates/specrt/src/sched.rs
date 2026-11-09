@@ -1,5 +1,5 @@
 use crate::codegen::PAGE;
-use crate::runtime::{DecodeRow, Runtime, Sampling, Stepper, PrefillPart};
+use crate::runtime::{DecodeRow, PrefillPart, Runtime, Sampling, SpecRow, Stepper};
 use anyhow::{Result, bail};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -70,6 +70,15 @@ pub trait Executor {
     }
     fn flush(&mut self) -> Result<()> {
         Ok(())
+    }
+    fn draft_tokens(&self) -> usize {
+        0
+    }
+    fn speculation_cap(&self) -> usize {
+        0
+    }
+    fn speculate(&mut self, _rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
+        bail!("this executor does not speculate")
     }
 }
 
@@ -143,6 +152,18 @@ impl Executor for GpuExecutor {
     fn flush(&mut self) -> Result<()> {
         self.rt.synchronize()
     }
+
+    fn draft_tokens(&self) -> usize {
+        self.rt.draft_tokens().unwrap_or(0)
+    }
+
+    fn speculation_cap(&self) -> usize {
+        self.rt.speculation_cap()
+    }
+
+    fn speculate(&mut self, rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
+        self.rt.speculate(rows)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -196,6 +217,8 @@ pub struct StepReport {
     pub preemptions: usize,
     pub decode_secs: f64,
     pub prefill_secs: f64,
+    pub drafted: usize,
+    pub accepted: usize,
 }
 
 struct Seq {
@@ -302,14 +325,15 @@ impl<E: Executor> Scheduler<E> {
         if req.prompt.is_empty() || req.max_tokens == 0 {
             bail!("empty prompt or nothing to generate");
         }
-        if req.prompt.len() + req.max_tokens > max_ctx {
+        if req.prompt.len() + req.max_tokens + self.exec.draft_tokens() > max_ctx {
             bail!(
-                "prompt of {} tokens plus {} new tokens exceeds the context of {max_ctx}",
+                "prompt of {} tokens plus {} new tokens (and {} draft positions) exceeds the context of {max_ctx}",
                 req.prompt.len(),
-                req.max_tokens
+                req.max_tokens,
+                self.exec.draft_tokens()
             );
         }
-        let need = blocks_for(req.prompt.len() + req.max_tokens);
+        let need = blocks_for(req.prompt.len() + req.max_tokens + self.exec.draft_tokens());
         if need > self.pool.total() {
             bail!("a request of {need} KV blocks can never fit the pool of {}", self.pool.total());
         }
@@ -367,7 +391,7 @@ impl<E: Executor> Scheduler<E> {
         let mut i = 0;
         while i < self.running.len() {
             let s = &self.running[i];
-            if !s.decoding() || blocks_for(s.tokens.len()) <= s.blocks.len() {
+            if !s.decoding() || blocks_for(s.tokens.len() + self.exec.draft_tokens()) <= s.blocks.len() {
                 i += 1;
                 continue;
             }
@@ -470,6 +494,35 @@ impl<E: Executor> Scheduler<E> {
         let mut done: Vec<usize> = Vec::new();
         let plain: Vec<DecodeRow> = rows.iter().map(|r| r.1).collect();
         let mut pending = !rows.is_empty();
+        let cap = self.exec.speculation_cap();
+        if pending && rows.len() <= cap {
+            pending = false;
+            let started = Instant::now();
+            let spec: Vec<SpecRow> = rows
+                .iter()
+                .map(|(i, r)| {
+                    let s = &self.running[*i];
+                    let room = self.exec.max_ctx() - s.tokens.len();
+                    let left = (s.req.max_tokens - s.generated()).min(room);
+                    SpecRow { slot: r.slot, token: r.token, pos: r.pos, sampling: r.sampling, step: r.step, max_accept: left.saturating_sub(1) }
+                })
+                .collect();
+            let out = self.exec.speculate(&spec)?;
+            report.decode_secs = started.elapsed().as_secs_f64();
+            report.decode_rows = rows.len();
+            report.drafted = rows.len() * self.exec.draft_tokens();
+            for ((i, _), emitted) in rows.iter().zip(out) {
+                report.accepted += emitted.len() - 1;
+                for t in emitted {
+                    let s = &mut self.running[*i];
+                    s.computed += 1;
+                    if accept(s, t, self.exec.max_ctx(), events) {
+                        done.push(*i);
+                        break;
+                    }
+                }
+            }
+        }
         let mut left = budget;
         let started = Instant::now();
         let limit = self.exec.chunk_limit();
@@ -593,6 +646,10 @@ mod tests {
         pub prefill_calls: Vec<usize>,
         pub state_budget: usize,
         pub states_live: std::collections::HashSet<usize>,
+        pub spec_k: usize,
+        pub spec_cap: usize,
+        pub spec_calls: Vec<usize>,
+        pub accept_counts: Vec<usize>,
     }
 
     impl Fake {
@@ -609,6 +666,10 @@ mod tests {
                 prefill_calls: Vec::new(),
                 state_budget: usize::MAX,
                 states_live: Default::default(),
+                spec_k: 0,
+                spec_cap: 0,
+                spec_calls: Vec::new(),
+                accept_counts: Vec::new(),
             }
         }
 
@@ -674,6 +735,35 @@ mod tests {
             assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
             self.decode_calls.push(rows.len());
             Ok(rows.iter().map(|r| next_token(self.write(r.slot, r.pos, r.token))).collect())
+        }
+        fn draft_tokens(&self) -> usize {
+            self.spec_k
+        }
+        fn speculation_cap(&self) -> usize {
+            self.spec_cap
+        }
+        fn speculate(&mut self, rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
+            let mut seen = std::collections::HashSet::new();
+            assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
+            assert!(rows.len() <= self.spec_cap);
+            self.spec_calls.push(rows.len());
+            let mut out = Vec::new();
+            for r in rows {
+                let pages = self.tables[r.slot].len() * PAGE;
+                assert!(r.pos + self.spec_k < pages, "verify rows past the block table: pos {} k {} pages {pages}", r.pos, self.spec_k);
+                let wanted = ((r.pos as u64 * 2654435761 + r.slot as u64) % (self.spec_k as u64 + 1)) as usize;
+                let a = wanted.min(r.max_accept);
+                self.accept_counts.push(a);
+                let mut emitted = Vec::new();
+                let mut t = r.token;
+                for j in 0..=a {
+                    let h = self.write(r.slot, r.pos + j, t);
+                    t = next_token(h);
+                    emitted.push(t);
+                }
+                out.push(emitted);
+            }
+            Ok(out)
         }
     }
 
@@ -743,6 +833,58 @@ mod tests {
         assert_eq!(got, want);
         let finished = events.iter().filter(|e| matches!(e, Event::Finished { finish: Finish::Length, .. })).count();
         assert_eq!(finished, 64);
+    }
+
+    #[test]
+    fn speculative_steps_with_different_accept_counts_match_single_sequence_output_under_preemption() {
+        for (k, cap) in [(1, 16), (2, 16), (3, 16), (2, 4)] {
+            let mut fake = Fake::new(2048, 16, 120, 256);
+            fake.spec_k = k;
+            fake.spec_cap = cap;
+            let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), ..Config::default() };
+            let mut s = Scheduler::new(fake, cfg);
+            let mut want = HashMap::new();
+            for q in 0..64u32 {
+                let mut r = request([3, 17, 90, 400, 1100][q as usize % 5], 20 + (q as usize * 13) % 200, q);
+                if q % 7 == 3 {
+                    let full = expected(&r.prompt, r.max_tokens, &[]);
+                    r.stop = vec![full[full.len() / 2]];
+                }
+                want.insert(s.submit(r.clone()).unwrap(), expected(&r.prompt, r.max_tokens, &r.stop));
+            }
+            let (got, events, reports) = drain(&mut s);
+            assert!(s.preemptions() > 0, "the pool was meant to run out");
+            assert_eq!(s.blocks_used(), 0);
+            assert_eq!(got, want, "k = {k}, cap = {cap}");
+            let finished = events.iter().filter(|e| matches!(e, Event::Finished { .. })).count();
+            assert_eq!(finished, 64);
+            let counts = &s.exec.accept_counts;
+            for a in 0..=k {
+                assert!(counts.contains(&a), "k = {k}: no step accepted {a}");
+            }
+            assert!(s.exec.spec_calls.iter().any(|&n| n > 1), "speculation ran batched");
+            if cap < 16 {
+                assert!(!s.exec.decode_calls.is_empty() && s.exec.decode_calls.iter().all(|&n| n > cap));
+            }
+            let drafted: usize = reports.iter().map(|r| r.drafted).sum();
+            let accepted: usize = reports.iter().map(|r| r.accepted).sum();
+            assert_eq!(drafted, s.exec.spec_calls.iter().sum::<usize>() * k);
+            assert!(accepted <= drafted && accepted >= counts.iter().sum::<usize>() / 2);
+        }
+    }
+
+    #[test]
+    fn speculation_reserves_k_positions_of_context_and_blocks() {
+        let mut fake = Fake::new(64, 2, 8, 64);
+        fake.spec_k = 3;
+        fake.spec_cap = 2;
+        let mut s = Scheduler::new(fake, Config::default());
+        assert!(s.submit(request(40, 22, 1)).is_err(), "40 + 22 + 3 drafts > 64");
+        let r = request(40, 21, 1);
+        let want = expected(&r.prompt, r.max_tokens, &[]);
+        let id = s.submit(r).unwrap();
+        let (got, _, _) = drain(&mut s);
+        assert_eq!(got[&id], want);
     }
 
     #[test]
