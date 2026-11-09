@@ -28,7 +28,7 @@ extern "C" __global__ void mtp_fc_in(const bf16_t* table, const int* tokens, con
     }
 }
 
-extern "C" __global__ void mtp_draft(const float* logits, int* drafts, int col, int k, int* ctok) {
+extern "C" __global__ void mtp_draft(const float* logits, int* drafts, int col, int k, int* ctok, const int* dslots) {
     __shared__ float best_v[1024];
     __shared__ int best_i[1024];
     int s = blockIdx.x;
@@ -56,7 +56,7 @@ extern "C" __global__ void mtp_draft(const float* logits, int* drafts, int col, 
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        drafts[s * k + col] = best_i[0];
+        drafts[dslots[s] * k + col] = best_i[0];
         ctok[s] = best_i[0];
     }
 }
@@ -150,6 +150,25 @@ extern "C" __global__ void mtp_fill(const int* drafts, int* vtok, int k) {
     int s = blockIdx.x;
     int j = threadIdx.x;
     if (j < k) vtok[s * (k + 1) + 1 + j] = drafts[s * k + j];
+}
+
+extern "C" __global__ void mtp_round_in(const int* rin, const int* drafts, int n, int k, int* vtok, int* vpos,
+                                        int* vslots) {
+    int s = blockIdx.x;
+    int j = threadIdx.x;
+    int slot = rin[2 * n + s];
+    vtok[s * (k + 1) + j] = j == 0 ? rin[s] : drafts[slot * k + j - 1];
+    vpos[s * (k + 1) + j] = rin[n + s] + j;
+    vslots[s * (k + 1) + j] = slot;
+}
+
+extern "C" __global__ void mtp_chain_rows(const int* rin, int n, const int* accepted, int step, int* vpos,
+                                          int* vslots) {
+    int s = threadIdx.x;
+    if (s < n) {
+        vpos[s] = rin[n + s] + accepted[s] + step;
+        vslots[s] = rin[2 * n + s];
+    }
 }
 
 extern "C" __global__ void mtp_pick_rows(const int* accepted, int k, int* sidx) {

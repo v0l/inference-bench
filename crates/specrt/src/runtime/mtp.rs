@@ -5,7 +5,10 @@ use crate::codegen::LA_KSPLIT;
 use crate::spec::Spec;
 use crate::weights::{Checkpoint, Mixer};
 use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
+use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
+use cudarc::driver::{CudaGraph, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(super) struct DeviceMtp {
@@ -65,6 +68,7 @@ pub(super) struct MtpState {
     w: DeviceMtp,
     k: usize,
     cap: usize,
+    pcap: usize,
     rows: usize,
     vb: BatchBuffers,
     fc_planes: Planes,
@@ -75,17 +79,20 @@ pub(super) struct MtpState {
     drafts: CudaSlice<i32>,
     ctok: CudaSlice<i32>,
     hidx: CudaSlice<i32>,
+    iota: CudaSlice<i32>,
+    zeros: CudaSlice<i32>,
     sidx: CudaSlice<i32>,
     didx: CudaSlice<i32>,
-    vout: CudaSlice<i32>,
-    accepted: CudaSlice<i32>,
-    max_accept: CudaSlice<i32>,
-    params: CudaSlice<i32>,
+    rin: CudaSlice<i32>,
+    res: CudaSlice<i32>,
     klog: CudaSlice<f32>,
     dlog: CudaSlice<f32>,
     glog: CudaSlice<f32>,
     clog: CudaSlice<f32>,
-    host_drafts: Vec<Vec<u32>>,
+    has_drafts: Vec<bool>,
+    graphs: HashMap<usize, CudaGraph>,
+    use_graphs: bool,
+    syncs: Cell<u64>,
     stats: SpecStats,
 }
 
@@ -119,7 +126,10 @@ impl MtpState {
         let m = s.speculative().context("speculation is off")?;
         let k = m.draft_tokens;
         let cap = m.max_batch.unwrap_or(rt.slots).min(rt.slots);
-        let rows = cap * (k + 1);
+        let k1 = k + 1;
+        let padded = super::step::pad_rows(cap);
+        let acap = if padded * k1 <= rt.chunk { padded } else { cap };
+        let rows = acap * k1;
         ensure!(rows <= rt.chunk, "{rows} verify rows do not fit a step of {}", rt.chunk);
         let la = s.linear_attention.as_ref().context("MTP needs linear attention")?;
         let stream = &rt.stream;
@@ -135,6 +145,7 @@ impl MtpState {
             w,
             k,
             cap,
+            pcap: acap,
             rows,
             vb: BatchBuffers {
                 tokens: zi(vb_rows)?,
@@ -148,22 +159,25 @@ impl MtpState {
             fc_planes: Planes::new(stream, wide * 2 * h)?,
             vx: z(wide * h)?,
             pending: z((rt.slots + 1) * h)?,
-            cg: z(cap * h)?,
-            logits: z(cap * s.dims.vocab)?,
-            drafts: zi(cap * k)?,
-            ctok: zi(cap)?,
+            cg: z(acap * h)?,
+            logits: z(acap * s.dims.vocab)?,
+            drafts: zi((rt.slots + 1) * k)?,
+            ctok: zi(acap)?,
             hidx: zi(wide)?,
+            iota: stream.clone_htod(&(0..wide as i32).collect::<Vec<i32>>())?,
+            zeros: zi(acap)?,
             sidx: zi(vb_rows)?,
             didx: zi(vb_rows)?,
-            vout: zi(rows)?,
-            accepted: zi(cap)?,
-            max_accept: zi(cap)?,
-            params: zi(6 * cap)?,
+            rin: zi(10 * acap)?,
+            res: zi(rows + acap)?,
             klog: z(layers * rows * vd)?,
             dlog: z(layers * rows * vd)?,
             glog: z(layers * rows * la.value_heads)?,
             clog: z(layers * rows * la.conv_dim())?,
-            host_drafts: vec![Vec::new(); rt.slots + 1],
+            has_drafts: vec![false; rt.slots + 1],
+            graphs: HashMap::new(),
+            use_graphs: s.runtime.graphs,
+            syncs: Cell::new(0),
             stats: SpecStats::default(),
         })
     }
@@ -187,31 +201,49 @@ impl Runtime {
     }
 
     pub fn drafts(&self, slot: usize) -> Vec<u32> {
-        self.mtp.as_ref().map(|m| m.host_drafts[slot].clone()).unwrap_or_default()
+        let Some(m) = self.mtp.as_ref().filter(|m| m.has_drafts[slot]) else { return Vec::new() };
+        let d = self.stream.clone_dtoh(&m.drafts.slice(slot * m.k..(slot + 1) * m.k)).expect("read drafts");
+        d.into_iter().map(|t| t as u32).collect()
     }
 
     pub fn set_drafts(&mut self, slot: usize, drafts: &[u32]) -> Result<()> {
-        let m = self.mtp.as_mut().context("no MTP layer")?;
+        let m = self.mtp.as_ref().context("no MTP layer")?;
         ensure!(drafts.len() == m.k, "{} drafts for k = {}", drafts.len(), m.k);
-        m.host_drafts[slot] = drafts.to_vec();
+        let host: Vec<i32> = drafts.iter().map(|&t| t as i32).collect();
+        self.up_i32(&host, &m.drafts.slice(slot * m.k..(slot + 1) * m.k))?;
+        self.mtp.as_mut().expect("an MTP spec").has_drafts[slot] = true;
         Ok(())
+    }
+
+    pub fn set_speculative_graphs(&mut self, on: bool) {
+        if let Some(m) = self.mtp.as_mut() {
+            m.use_graphs = on;
+        }
+    }
+
+    pub fn captured_speculation_sizes(&self) -> Vec<usize> {
+        let mut sizes: Vec<usize> = self.mtp.as_ref().map(|m| m.graphs.keys().copied().collect()).unwrap_or_default();
+        sizes.sort();
+        sizes
+    }
+
+    pub fn stream_syncs(&self) -> u64 {
+        self.mtp.as_ref().map_or(0, |m| m.syncs.get())
     }
 
     pub(super) fn mtp_forget(&mut self, slot: usize) {
         if let Some(m) = self.mtp.as_mut() {
-            m.host_drafts[slot].clear();
+            m.has_drafts[slot] = false;
         }
     }
 
-    fn up_i32(&self, host: &[i32], dst: &CudaSlice<i32>) -> Result<()> {
-        use cudarc::driver::DevicePtr;
+    fn up_i32(&self, host: &[i32], dst: &impl cudarc::driver::DevicePtr<i32>) -> Result<()> {
         ensure!(host.len() <= dst.len(), "{} values for a device buffer of {}", host.len(), dst.len());
         if host.is_empty() {
             return Ok(());
         }
         let (ptr, _sync) = dst.device_ptr(&self.stream);
         unsafe { cudarc::driver::result::memcpy_htod_async(ptr, host, self.stream.cu_stream()) }?;
-        self.stream.synchronize()?;
         Ok(())
     }
 
@@ -233,7 +265,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn mtp_layer(&self, tokens: &CudaView<i32>, xsrc: &CudaSlice<f32>, pre: &CudaSlice<f32>, n: usize, attn: Attn) -> Result<()> {
+    fn mtp_layer(&self, tokens: &CudaView<i32>, hidx: &CudaView<i32>, xsrc: &CudaSlice<f32>, pre: &CudaSlice<f32>, n: usize, attn: Attn) -> Result<()> {
         let m = self.mtp();
         let s = &self.spec;
         let h = s.dims.hidden;
@@ -243,7 +275,7 @@ impl Runtime {
             .arg(tokens)
             .arg(xsrc)
             .arg(&m.pending)
-            .arg(&m.hidx)
+            .arg(hidx)
             .arg(pre)
             .arg(&m.w.norm_embed)
             .arg(&m.w.norm_hidden)
@@ -266,17 +298,27 @@ impl Runtime {
         self.tc("mtp_down", &layer.down, None, p.act_planes.all(), GemmOut::F32(&p.x), h, n)
     }
 
-    fn mtp_heads(&self, sidx: &[i32], col: usize) -> Result<()> {
+    fn mtp_heads(&self, src: &CudaView<i32>, n: usize, col: usize, slots: &CudaView<i32>) -> Result<()> {
         let m = self.mtp();
-        let n = sidx.len();
-        let ident: Vec<i32> = (0..n as i32).collect();
-        self.copy_hidden(&self.pre.x, sidx, &m.cg, &ident)?;
+        self.copy_rows_by_index(&self.pre.x, src, &m.cg, &m.iota.as_view(), n)?;
         self.rms_split(&m.cg.as_view(), &m.w.norm, &self.pre.xn_planes, n)?;
         self.tc("lm_head", &self.lm_head, None, self.pre.xn_planes.all(), GemmOut::F32(&m.logits), self.spec.dims.vocab, n)?;
         let (col, k) = (col as i32, m.k as i32);
         let mut b = self.stream.launch_builder(self.kernel("mtp_draft"));
-        b.arg(&m.logits).arg(&m.drafts).arg(&col).arg(&k).arg(&m.ctok);
+        b.arg(&m.logits).arg(&m.drafts).arg(&col).arg(&k).arg(&m.ctok).arg(slots);
         unsafe { b.launch(cfg(n as u32, 1024)) }?;
+        Ok(())
+    }
+
+    fn copy_rows_by_index(&self, src: &CudaSlice<f32>, sidx: &CudaView<i32>, dst: &CudaSlice<f32>, didx: &CudaView<i32>, n: usize) -> Result<()> {
+        let mut b = self.stream.launch_builder(self.kernel("mtp_copy"));
+        b.arg(src).arg(sidx).arg(dst).arg(didx);
+        let config = LaunchConfig {
+            grid_dim: (grid(self.spec.dims.hidden, 256), n as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
         Ok(())
     }
 
@@ -289,24 +331,23 @@ impl Runtime {
         self.up_i32(hidx, &m.hidx)?;
         self.up_i32(pos, &m.vb.pos)?;
         self.up_i32(slots, &m.vb.slots)?;
-        self.mtp_layer(&m.vb.tokens.as_view(), &m.vx, pre, tokens.len(), Attn::Rows)
+        self.mtp_layer(&m.vb.tokens.as_view(), &m.hidx.as_view(), &m.vx, pre, tokens.len(), Attn::Rows)
     }
 
-    fn mtp_chain(&self, heads: &[i32], q0: &[usize], slots: &[i32]) -> Result<Vec<Vec<u32>>> {
+    fn mtp_chain(&self, n: usize, first: &CudaView<i32>, rin: &CudaView<i32>, accepted: &CudaView<i32>) -> Result<()> {
         let m = self.mtp();
-        let n = heads.len();
-        self.mtp_heads(heads, 0)?;
-        let ident: Vec<i32> = (0..n as i32).collect();
+        let slots = rin.slice(2 * n..3 * n);
+        self.mtp_heads(first, n, 0, &slots)?;
+        let n_i = n as i32;
         for i in 1..m.k {
-            let pos: Vec<i32> = q0.iter().map(|&q| (q + i) as i32).collect();
-            self.up_i32(&ident, &m.hidx)?;
-            self.up_i32(&pos, &m.vb.pos)?;
-            self.up_i32(slots, &m.vb.slots)?;
-            self.mtp_layer(&m.ctok.slice(..n), &m.cg, &m.w.norm, n, Attn::Rows)?;
-            self.mtp_heads(&ident, i)?;
+            let step = i as i32;
+            let mut b = self.stream.launch_builder(self.kernel("mtp_chain_rows"));
+            b.arg(rin).arg(&n_i).arg(accepted).arg(&step).arg(&m.vb.pos).arg(&m.vb.slots);
+            unsafe { b.launch(cfg(1, n as u32)) }?;
+            self.mtp_layer(&m.ctok.slice(..n), &m.iota.slice(..n), &m.cg, &m.w.norm, n, Attn::Rows)?;
+            self.mtp_heads(&m.iota.slice(..n), n, i, &slots)?;
         }
-        let d = self.stream.clone_dtoh(&m.drafts.slice(..n * m.k))?;
-        Ok(d.chunks(m.k).map(|c| c.iter().map(|&t| t as u32).collect()).collect())
+        Ok(())
     }
 
     pub(super) fn mtp_after_prefill(&mut self, slot: usize, tokens: &[u32], start: usize) -> Result<()> {
@@ -324,7 +365,7 @@ impl Runtime {
             self.up_i32(&hidx, &m.hidx)?;
             self.stream.memcpy_htod(&[(start + from - 1) as i32], &mut self.buf.pos)?;
             self.seq = slot as i32;
-            let ran = self.mtp_layer(&self.pre.tokens.slice(from..from + rows), &self.mtp().vx, &self.norm, rows, Attn::Contiguous);
+            let ran = self.mtp_layer(&self.pre.tokens.slice(from..from + rows), &self.mtp().hidx.as_view(), &self.mtp().vx, &self.norm, rows, Attn::Contiguous);
             self.seq = 0;
             ran?;
         }
@@ -359,22 +400,24 @@ impl Runtime {
     }
 
     fn prime(&mut self, rows: &[SpecRow]) -> Result<()> {
-        let need: Vec<&SpecRow> = rows.iter().filter(|r| self.mtp().host_drafts[r.slot].is_empty()).collect();
+        let need: Vec<&SpecRow> = rows.iter().filter(|r| !self.mtp().has_drafts[r.slot]).collect();
         if need.is_empty() {
             return Ok(());
         }
         ensure!(need.iter().all(|r| r.pos >= 1), "a speculative row needs a computed token before it");
+        let n = need.len();
         let tokens: Vec<i32> = need.iter().map(|r| r.token as i32).collect();
         let hidx: Vec<i32> = need.iter().map(|r| -1 - r.slot as i32).collect();
         let pos: Vec<i32> = need.iter().map(|r| r.pos as i32 - 1).collect();
         let slots: Vec<i32> = need.iter().map(|r| r.slot as i32).collect();
         self.mtp_rows(&tokens, &hidx, &pos, &slots, &self.norm)?;
-        let heads: Vec<i32> = (0..need.len() as i32).collect();
-        let q0: Vec<usize> = need.iter().map(|r| r.pos - 1).collect();
-        let drafts = self.mtp_chain(&heads, &q0, &slots)?;
+        let m = self.mtp();
+        let rin: Vec<i32> = tokens.iter().map(|_| 0).chain(pos.iter().copied()).chain(slots.iter().copied()).collect();
+        self.up_i32(&rin, &m.rin)?;
+        self.mtp_chain(n, &m.iota.slice(..n), &m.rin.slice(..), &m.zeros.slice(..n))?;
         let m = self.mtp.as_mut().expect("an MTP spec");
-        for (r, d) in need.iter().zip(drafts) {
-            m.host_drafts[r.slot] = d;
+        for r in need {
+            m.has_drafts[r.slot] = true;
         }
         Ok(())
     }
@@ -463,12 +506,13 @@ impl Runtime {
 
     fn commit(&self, nseq: usize) -> Result<()> {
         let m = self.mtp();
+        let accepted = m.res.slice(..nseq);
         let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
         let la = &gb.la;
         let layers = self.spec.linear_layers() as u32;
         let (seq_slots, k1, log_rows) = (layers as i32, (m.k + 1) as i32, m.rows as i32);
         let mut b = self.stream.launch_builder(self.kernel("gdn_conv_commit"));
-        b.arg(&*gb.conv_state).arg(&m.clog).arg(&seq_slots).arg(&m.vb.slots).arg(&k1).arg(&m.accepted).arg(&log_rows);
+        b.arg(&*gb.conv_state).arg(&m.clog).arg(&seq_slots).arg(&m.vb.slots).arg(&k1).arg(&accepted).arg(&log_rows);
         let config = LaunchConfig {
             grid_dim: (grid(la.conv_dim(), 256), nseq as u32, layers),
             block_dim: (256, 1, 1),
@@ -483,7 +527,7 @@ impl Runtime {
             .arg(&seq_slots)
             .arg(&m.vb.slots)
             .arg(&k1)
-            .arg(&m.accepted)
+            .arg(&accepted)
             .arg(&log_rows);
         let config = LaunchConfig {
             grid_dim: (la.value_heads as u32, nseq as u32, layers),
@@ -494,12 +538,48 @@ impl Runtime {
         Ok(())
     }
 
+    fn round_body(&self, n: usize) -> Result<()> {
+        let m = self.mtp();
+        let (k, k1) = (m.k, m.k + 1);
+        let h = self.spec.dims.hidden;
+        let (n_i, k_i) = (n as i32, k as i32);
+        let rin = m.rin.slice(..);
+        let accepted = m.res.slice(..n);
+        let vout = m.res.slice(m.pcap..m.pcap + n * k1);
+        let mut b = self.stream.launch_builder(self.kernel("mtp_round_in"));
+        b.arg(&rin).arg(&m.drafts).arg(&n_i).arg(&k_i).arg(&m.vb.tokens).arg(&m.vb.pos).arg(&m.vb.slots);
+        unsafe { b.launch(cfg(n as u32, k1 as u32)) }?;
+        self.verify_rows(n)?;
+        self.copy_rows(&self.pre.x.slice(..n * k1 * h), &m.vx.slice(..n * k1 * h), n * k1 * h)?;
+        let maxa = rin.slice(3 * n..4 * n);
+        let params = rin.slice(4 * n..10 * n);
+        let mut b = self.stream.launch_builder(self.kernel("spec_accept"));
+        b.arg(&m.vb.logits).arg(&m.vb.tokens).arg(&params).arg(&maxa).arg(&k_i).arg(&vout).arg(&accepted);
+        unsafe { b.launch(cfg(n as u32, 1024)) }?;
+        self.commit(n)?;
+        let mut b = self.stream.launch_builder(self.kernel("mtp_pick_rows"));
+        b.arg(&accepted).arg(&k_i).arg(&m.sidx);
+        unsafe { b.launch(cfg(1, n as u32)) }?;
+        self.mtp_layer(&vout, &m.iota.slice(..n * k1), &m.vx, &self.norm, n * k1, Attn::Rows)?;
+        let heads = m.sidx.slice(..n);
+        self.mtp_chain(n, &heads, &rin, &accepted)?;
+        self.copy_rows_by_index(&m.vx, &heads, &m.pending, &rin.slice(2 * n..3 * n), n)
+    }
+
+    fn capture_round(&self, n: usize) -> Result<CudaGraph> {
+        self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
+        let recorded = self.round_body(n);
+        let graph = self.stream.end_capture(CUgraphInstantiate_flags(0))?;
+        recorded?;
+        graph.context("empty speculative graph")
+    }
+
     pub fn speculate(&mut self, rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
         ensure!(self.mtp.is_some(), "speculation needs an [mtp] spec with speculate = true");
         ensure!(self.use_mma, "speculation needs the tensor core path");
-        let (k, cap) = (self.mtp().k, self.mtp().cap);
-        let n = rows.len();
-        ensure!(n >= 1 && n <= cap, "{n} speculative rows for a cap of {cap}");
+        let (k, cap, pcap) = (self.mtp().k, self.mtp().cap, self.mtp().pcap);
+        let live = rows.len();
+        ensure!(live >= 1 && live <= cap, "{live} speculative rows for a cap of {cap}");
         ensure!(
             rows.iter().all(|r| r.slot < self.slots && r.pos + 2 * k < self.max_ctx),
             "speculative row out of range"
@@ -508,68 +588,45 @@ impl Runtime {
         ensure!(rows.iter().all(|r| !std::mem::replace(&mut seen[r.slot], true)), "a slot twice in one step");
         self.prime(rows)?;
         let k1 = k + 1;
+        let graphs = self.mtp().use_graphs && super::step::pad_rows(live) <= pcap;
+        let n = if graphs { super::step::pad_rows(live) } else { live };
+        let pad = SpecRow { slot: self.slots, token: 0, pos: 0, sampling: Sampling::GREEDY, step: 0, max_accept: 0 };
+        let padded: Vec<SpecRow> = rows.iter().copied().chain(std::iter::repeat(pad)).take(n).collect();
+        let mut rin: Vec<i32> = Vec::with_capacity(10 * n);
+        rin.extend(padded.iter().map(|r| r.token as i32));
+        rin.extend(padded.iter().map(|r| r.pos as i32));
+        rin.extend(padded.iter().map(|r| r.slot as i32));
+        rin.extend(padded.iter().map(|r| r.max_accept.min(k) as i32));
+        rin.extend(padded.iter().flat_map(|r| super::step::params(r.sampling, r.step)));
         let m = self.mtp();
-        let mut vtok = Vec::with_capacity(n * k1);
-        let mut pos = Vec::with_capacity(n * k1);
-        let mut slots = Vec::with_capacity(n * k1);
-        for r in rows {
-            vtok.push(r.token as i32);
-            vtok.extend(m.host_drafts[r.slot].iter().map(|&t| t as i32));
-            pos.extend((0..k1).map(|j| (r.pos + j) as i32));
-            slots.extend(std::iter::repeat_n(r.slot as i32, k1));
-        }
-        self.up_i32(&vtok, &m.vb.tokens)?;
-        self.up_i32(&pos, &m.vb.pos)?;
-        self.up_i32(&slots, &m.vb.slots)?;
-        let p: Vec<i32> = rows.iter().flat_map(|r| super::step::params(r.sampling, r.step)).collect();
-        self.up_i32(&p, &m.params)?;
-        let caps: Vec<i32> = rows.iter().map(|r| r.max_accept.min(k) as i32).collect();
-        self.up_i32(&caps, &m.max_accept)?;
-        self.verify_rows(n)?;
-        let h = self.spec.dims.hidden;
-        self.copy_rows(&self.pre.x.slice(..n * k1 * h), &m.vx.slice(..n * k1 * h), n * k1 * h)?;
-        let k_i = k as i32;
-        let mut b = self.stream.launch_builder(self.kernel("spec_accept"));
-        b.arg(&m.vb.logits).arg(&m.vb.tokens).arg(&m.params).arg(&m.max_accept).arg(&k_i).arg(&m.vout).arg(&m.accepted);
-        unsafe { b.launch(cfg(n as u32, 1024)) }?;
-        self.commit(n)?;
-        let out = self.stream.clone_dtoh(&m.vout.slice(..n * k1))?;
-        let accepted = self.stream.clone_dtoh(&m.accepted.slice(..n))?;
-        let mut tokens = Vec::new();
-        let mut hidx = Vec::new();
-        let mut mpos = Vec::new();
-        let mut mslots = Vec::new();
-        let mut heads = Vec::new();
-        let mut q0 = Vec::new();
-        let mut emitted = Vec::with_capacity(n);
-        for (s, r) in rows.iter().enumerate() {
-            let a = accepted[s] as usize;
-            let row = &out[s * k1..s * k1 + a + 1];
-            emitted.push(row.iter().map(|&t| t as u32).collect::<Vec<u32>>());
-            for (j, &t) in row.iter().enumerate() {
-                tokens.push(t);
-                hidx.push((s * k1 + j) as i32);
-                mpos.push((r.pos + j) as i32);
-                mslots.push(r.slot as i32);
+        self.up_i32(&rin, &m.rin)?;
+        if graphs {
+            if !m.graphs.contains_key(&n) {
+                let graph = self.capture_round(n)?;
+                graph.upload()?;
+                self.mtp.as_mut().expect("an MTP spec").graphs.insert(n, graph);
             }
-            heads.push(tokens.len() as i32 - 1);
-            q0.push(r.pos + a);
+            self.mtp().graphs[&n].launch()?;
+        } else {
+            self.round_body(n)?;
         }
-        self.mtp_rows(&tokens, &hidx, &mpos, &mslots, &self.norm)?;
-        let chain_slots: Vec<i32> = rows.iter().map(|r| r.slot as i32).collect();
-        let drafts = self.mtp_chain(&heads, &q0, &chain_slots)?;
-        let src: Vec<i32> = accepted.iter().enumerate().map(|(s, &a)| (s * k1) as i32 + a).collect();
         let m = self.mtp();
-        self.copy_hidden(&m.vx, &src, &m.pending, &chain_slots)?;
+        m.syncs.set(m.syncs.get() + 1);
+        let res = self.stream.clone_dtoh(&m.res.slice(..m.pcap + n * k1))?;
+        let accepted = &res[..live];
+        let out = &res[m.pcap..];
+        let emitted: Vec<Vec<u32>> = (0..live)
+            .map(|s| out[s * k1..s * k1 + accepted[s] as usize + 1].iter().map(|&t| t as u32).collect())
+            .collect();
         let m = self.mtp.as_mut().expect("an MTP spec");
-        for (r, d) in rows.iter().zip(drafts) {
-            m.host_drafts[r.slot] = d;
+        for r in rows {
+            m.has_drafts[r.slot] = true;
         }
         m.stats.steps += 1;
-        m.stats.rows += n as u64;
-        m.stats.drafted += (n * k) as u64;
+        m.stats.rows += live as u64;
+        m.stats.drafted += (live * k) as u64;
         m.stats.accepted += accepted.iter().map(|&a| a as u64).sum::<u64>();
-        for &a in &accepted {
+        for &a in accepted {
             for j in 0..(a as usize).min(4) {
                 m.stats.position_accepted[j] += 1;
             }
@@ -595,6 +652,6 @@ impl Runtime {
         let logits = self.stream.clone_dtoh(&self.mtp().logits.slice(..vocab))?;
         let n = tokens.len() * self.spec.dims.hidden;
         let hidden = self.stream.clone_dtoh(&self.mtp().vx.slice(..n))?;
-        Ok((logits, self.mtp().host_drafts[0].clone(), hidden))
+        Ok((logits, self.drafts(0), hidden))
     }
 }

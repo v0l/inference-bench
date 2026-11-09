@@ -285,8 +285,13 @@ fn speculative_greedy(s: &Spec, prompts: &[Vec<u32>], want: &[Vec<u32>], drafts:
 }
 
 fn speculative_run(s: &Spec, prompts: &[Vec<u32>], want: &[Vec<u32>], drafts: Drafts, batch: usize) -> (Vec<Vec<u32>>, f64, specrt::runtime::SpecStats) {
+    speculative_run_mode(s, prompts, want, drafts, batch, true)
+}
+
+fn speculative_run_mode(s: &Spec, prompts: &[Vec<u32>], want: &[Vec<u32>], drafts: Drafts, batch: usize, graphs: bool) -> (Vec<Vec<u32>>, f64, specrt::runtime::SpecStats) {
     let k = s.mtp.as_ref().unwrap().draft_tokens;
     let mut rt = Runtime::load_layout(s, layout(batch)).unwrap();
+    rt.set_speculative_graphs(graphs);
     tables(&mut rt, batch);
     let mut st = rt.stepper().unwrap();
     let mut outs = Vec::new();
@@ -426,4 +431,48 @@ fn per_position_acceptance_counts_follow_the_forced_wrong_draft_position() {
     assert_eq!(second_wrong.position_accepted[1], 0);
     let (_, _, first_wrong) = speculative_run(&s, &ps, &want, Drafts::Oracle(0), 1);
     assert_eq!(first_wrong.position_accepted, [0; 4]);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn eager_speculation_matches_plain_greedy_alone_and_in_a_batch() {
+    let s = spec(2);
+    let ps = prompts();
+    let want = plain_greedy(&s, &ps);
+    for batch in [1, 3] {
+        let (got, _, _) = speculative_run_mode(&s, &ps, &want, Drafts::Mtp, batch, false);
+        check(&format!("eager, batch {batch}"), &got, &want);
+        let (got, _, _) = speculative_run_mode(&s, &ps, &want, Drafts::Wrong(0), batch, false);
+        check(&format!("eager, batch {batch}, staggered rejections"), &got, &want);
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_speculative_round_synchronises_the_stream_at_most_once() {
+    let s = spec(2);
+    let ps = prompts();
+    for graphs in [true, false] {
+        let mut rt = Runtime::load_layout(&s, layout(3)).unwrap();
+        tables(&mut rt, 3);
+        rt.set_speculative_graphs(graphs);
+        let mut st = rt.stepper().unwrap();
+        let mut out: Vec<Vec<u32>> = (0..3)
+            .map(|i| vec![rt.prefill_slot(&mut st, i, &ps[i], 0, Some((Sampling::GREEDY, 0))).unwrap().unwrap()])
+            .collect();
+        for round in 0..8 {
+            let rows: Vec<SpecRow> = (0..3)
+                .map(|i| SpecRow { slot: i, token: *out[i].last().unwrap(), pos: ps[i].len() + out[i].len() - 1, sampling: Sampling::GREEDY, step: out[i].len() as u32, max_accept: 2 })
+                .collect();
+            let before = rt.stream_syncs();
+            let emitted = rt.speculate(&rows).unwrap();
+            let used = rt.stream_syncs() - before;
+            assert!(used <= 1, "graphs {graphs}, round {round}: {used} synchronisations");
+            for (i, e) in emitted.into_iter().enumerate() {
+                out[i].extend(e);
+            }
+        }
+        let sizes = rt.captured_speculation_sizes();
+        assert_eq!(sizes, if graphs { vec![4] } else { Vec::new() });
+    }
 }

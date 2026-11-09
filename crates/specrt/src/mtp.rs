@@ -10,6 +10,8 @@ pub const MTP_KERNELS: &[&str] = &[
     "mtp_fill",
     "mtp_copy",
     "mtp_pick_rows",
+    "mtp_round_in",
+    "mtp_chain_rows",
     "spec_accept",
     "gdn_conv_verify",
     "gdn_conv_commit",
