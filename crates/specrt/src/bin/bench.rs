@@ -143,6 +143,23 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
             1.0 + (after.accepted - before.accepted) as f64 / rows,
             accepted as f64 / drafted.max(1) as f64,
         );
+        let k = spec.mtp.as_ref().map_or(0, |m| m.draft_tokens);
+        let per_position: Vec<f64> = (0..k.min(4)).map(|j| (after.position_accepted[j] - before.position_accepted[j]) as f64 / rows).collect();
+        println!(
+            "  per_position_accepted={:?} per_position_proposed={rows} per_position_rate={per_position:.3?}",
+            &after.position_accepted[..k.min(4)].iter().zip(&before.position_accepted).map(|(a, b)| a - b).collect::<Vec<_>>(),
+        );
+        println!(
+            "{}",
+            serde_json::json!({
+                "speculate": speculate, "k": k, "prompts": prompts.len(), "new_tokens": new_tokens,
+                "steps": after.steps - before.steps, "rows": rows as u64,
+                "mean_acceptance_length": 1.0 + (after.accepted - before.accepted) as f64 / rows,
+                "per_position_accepted": (0..k.min(4)).map(|j| after.position_accepted[j] - before.position_accepted[j]).collect::<Vec<_>>(),
+                "per_position_proposed": rows as u64,
+                "per_position_rate": per_position,
+            })
+        );
         let first: Vec<u32> = outs[&ids[0]].iter().take(24).copied().collect();
         println!("  first prompt tokens {first:?}");
     }
