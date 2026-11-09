@@ -295,6 +295,7 @@ pub struct Runtime {
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
     f4b_part: CudaSlice<f32>,
+    f8b_part: CudaSlice<f32>,
     chunk: usize,
     prefill_limit: usize,
     use_mma: bool,
@@ -576,6 +577,24 @@ impl Runtime {
         } else {
             stream.alloc_zeros(1)?
         };
+        let f8b_part = if spec.quant.is_fp8() {
+            use crate::codegen::{F8B_MAX_TOKENS, f8b_splits};
+            let sms = sms as usize;
+            let mut shapes = vec![
+                (spec.qkv_rows(), d.hidden),
+                (d.hidden, spec.q_dim()),
+                (2 * d.intermediate, d.hidden),
+                (d.hidden, d.intermediate),
+            ];
+            if let Some(la) = &spec.linear_attention {
+                shapes.push((la.in_proj_rows(), d.hidden));
+                shapes.push((d.hidden, la.value_dim()));
+            }
+            let most = shapes.into_iter().map(|(n, k)| f8b_splits(n, k, sms) * n).max().unwrap_or(1);
+            stream.alloc_zeros(most * F8B_MAX_TOKENS)?
+        } else {
+            stream.alloc_zeros(1)?
+        };
         let mut rt = Runtime {
             smem,
             pre,
@@ -583,6 +602,7 @@ impl Runtime {
             fp8_act,
             fp4_act,
             f4b_part,
+            f8b_part,
             chunk,
             prefill_limit,
             seq: 0,
@@ -928,6 +948,10 @@ impl Runtime {
         if let (Some(fa), DeviceMatrix::Fp4 { .. }, true) = (&self.fp4_act, w, act_quant) {
             return self.tc_fp4(fa, name, w, x, out, rows, tokens, suffix, tile);
         }
+        let f8b = suffix == "_tiny" && tokens <= crate::codegen::F8B_MAX_TOKENS && crate::codegen::F8B_LINEARS.contains(&name);
+        if let (DeviceMatrix::Fp8 { .. }, true) = (w, f8b) {
+            return self.tc_f8b(name, w, bias, x, out, rows, tokens);
+        }
         let batched_f4 = name != "lm_head" && suffix == "_tiny" && tokens <= crate::codegen::F4B_MAX_TOKENS;
         if let (DeviceMatrix::Fp4 { .. }, true) = (w, batched_f4) {
             return self.tc_f4b(name, w, x, out, rows, tokens);
@@ -951,6 +975,56 @@ impl Runtime {
             shared_mem_bytes: self.smem[kernel.as_str()],
         };
         unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tc_f8b(
+        &self,
+        name: &str,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        use crate::codegen::{F8B_REDUCE_BLOCK, F8B_ROWS, F8B_WARPS, f8b_smem, f8b_splits, f8b_tokens};
+        let DeviceMatrix::Fp8 { values, .. } = w else { unreachable!("tc_f8b takes FP8 weights") };
+        let width = values.len() / rows;
+        let splits = f8b_splits(rows, width, self.sms as usize);
+        let (n, s) = (tokens as i32, splits as i32);
+        let kernel = format!("{name}_f8b{}", f8b_tokens(tokens));
+        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        w.args(&mut b, &self.buf.dummy);
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        b.arg(&self.f8b_part).arg(&n).arg(&s);
+        let config = LaunchConfig {
+            grid_dim: (grid(rows, F8B_ROWS), splits as u32, 1),
+            block_dim: ((F8B_WARPS * 32) as u32, 1, 1),
+            shared_mem_bytes: f8b_smem(tokens),
+        };
+        unsafe { b.launch(config) }?;
+        if splits == 1 {
+            return Ok(());
+        }
+        let reduce = format!("{name}_f8b_reduce");
+        let mut b = self.stream.launch_builder(self.kernel(&reduce));
+        b.arg(&self.f8b_part).arg(bias.unwrap_or(&self.buf.dummy));
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        let outs = match out {
+            GemmOut::Planes(_) => tokens * rows / 2,
+            GemmOut::F32(_) => tokens * rows,
+        };
+        b.arg(&n).arg(&s);
+        unsafe { b.launch(cfg(grid(outs, F8B_REDUCE_BLOCK), F8B_REDUCE_BLOCK as u32)) }?;
         Ok(())
     }
 

@@ -182,15 +182,9 @@ fn logits_and_greedy_match_reference(dir: &str, prefix: &str) {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn tiny_batch_decode_matches_single_sequence_greedy() {
-    let s = spec();
-    let prompts: Vec<Vec<u32>> =
-        (0..4u32).map(|q| (0..40u32).map(|i| (i * 7 + q * 131) % 1024).collect()).collect();
-    let mut single = Runtime::load(&s, 256).unwrap();
-    let expected: Vec<Vec<u32>> =
-        prompts.iter().map(|p| single.generate(p, 24, Sampling::GREEDY).unwrap().tokens).collect();
-    drop(single);
-    let mut batch = Runtime::load_batched(&s, 256, 4).unwrap();
-    assert_eq!(batch.generate_batch(&prompts, 24).unwrap().tokens, expected);
+    for batch in [2, 4, 8, 16] {
+        batch_decode_matches_single_sequence_greedy("tiny-qwen3.5", batch);
+    }
 }
 
 const WIDE: &str = "tiny-qwen3.5-hd256";
@@ -281,15 +275,12 @@ fn fp8_logits_and_greedy_match_transformers() {
 #[ignore = "needs a CUDA GPU"]
 fn fp8_batch_decode_matches_single_sequence_greedy() {
     let s = spec_for(FP8);
-    let prompts: Vec<Vec<u32>> =
-        (0..4u32).map(|q| (0..40u32).map(|i| (i * 7 + q * 131) % 1024).collect()).collect();
-    let mut single = Runtime::load(&s, 256).unwrap();
+    let single = Runtime::load(&s, 256).unwrap();
     assert!(single.peak_host_rss_bytes > 0 && single.weight_bytes > 0);
-    let expected: Vec<Vec<u32>> =
-        prompts.iter().map(|p| single.generate(p, 24, Sampling::GREEDY).unwrap().tokens).collect();
     drop(single);
-    let mut batch = Runtime::load_batched(&s, 256, 4).unwrap();
-    assert_eq!(batch.generate_batch(&prompts, 24).unwrap().tokens, expected);
+    for batch in [2, 4, 8, 16] {
+        batch_decode_matches_single_sequence_greedy(FP8, batch);
+    }
 }
 
 const NVFP4: &str = "tiny-qwen3.5-nvfp4";

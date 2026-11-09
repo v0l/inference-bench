@@ -6,6 +6,7 @@ pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
 pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
 pub const FP4_TEMPLATE: &str = include_str!("../templates/fp4.cu");
+pub const FP8_BATCH_TEMPLATE: &str = include_str!("../templates/fp8_batch.cu");
 pub const FP4_ACT_TEMPLATE: &str = include_str!("../templates/fp4_act.cu");
 pub const FP4_ACT_KERNELS: &[&str] = &[
     "quant_rows_fp4",
@@ -125,6 +126,83 @@ fn fp4_batch_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Res
     .into_iter()
     .collect();
     render(FP4_BATCH_TEMPLATE, &vars)
+}
+pub const F8B_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
+pub const F8B_KERNELS: &[&str] = &[
+    "qkv_f8b8",
+    "qkv_f8b16",
+    "qkv_f8b_reduce",
+    "o_f8b8",
+    "o_f8b16",
+    "o_f8b_reduce",
+    "gate_up_f8b8",
+    "gate_up_f8b16",
+    "gate_up_f8b_reduce",
+    "down_f8b8",
+    "down_f8b16",
+    "down_f8b_reduce",
+    "lin_in_f8b8",
+    "lin_in_f8b16",
+    "lin_in_f8b_reduce",
+    "lin_out_f8b8",
+    "lin_out_f8b16",
+    "lin_out_f8b_reduce",
+];
+pub const F8B_MAX_TOKENS: usize = 16;
+pub const F8B_WARPS: usize = 4;
+pub const F8B_MJ: usize = 2;
+pub const F8B_ROWS: usize = F8B_WARPS * F8B_MJ * 16;
+pub const F8B_KC: usize = 128;
+const F8B_STAGES: usize = 3;
+pub const F8B_REDUCE_BLOCK: usize = 256;
+pub const F8B_BLOCKS_PER_SM: usize = 4;
+
+pub fn f8b_tokens(tokens: usize) -> usize {
+    if tokens <= 8 { 8 } else { 16 }
+}
+
+pub fn f8b_smem(tokens: usize) -> u32 {
+    (F8B_STAGES * f8b_tokens(tokens) * F8B_KC * 2 * 2) as u32
+}
+
+pub fn f8b_splits(n: usize, k: usize, sms: usize) -> usize {
+    let blocks = n.div_ceil(F8B_ROWS);
+    let most = (k / F8B_KC / 4).max(1);
+    let wave = F8B_BLOCKS_PER_SM * sms;
+    let fill = |s: usize| (blocks * s) as f64 / ((blocks * s).div_ceil(wave) * wave) as f64;
+    (1..=most).find(|&s| blocks * s >= wave && fill(s) >= 0.85).unwrap_or(most)
+}
+
+fn fp8_batch_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Result<String> {
+    let mut kernels = String::new();
+    let la = spec.linear_attention.is_some();
+    for &linear in F8B_LINEARS.iter().filter(|l| la || !l.starts_with("lin_")) {
+        let (n, k, epi, bias) = linear_dims(spec, linear);
+        let find = |name: String| F8B_KERNELS.iter().copied().find(|x| *x == name).expect("listed in F8B_KERNELS");
+        for tokens in [8, 16] {
+            let name = find(format!("{linear}_f8b{tokens}"));
+            smem.insert(name, f8b_smem(tokens));
+            kernels.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}, {F8B_BLOCKS_PER_SM}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, float* part, int tokens, int splits) {{\n    gemv_f8b<{n}, {k}, {epi}, {bias}, {nt}>(w, s, b, xh, xl, out, oh, ol, part, tokens, splits);\n}}\n\n",
+                threads = F8B_WARPS * 32,
+                nt = tokens / 8,
+            ));
+        }
+        let reduce = find(format!("{linear}_f8b_reduce"));
+        kernels.push_str(&format!(
+            "extern \"C\" __global__ void {reduce}(const float* part, const float* b, float* out, bf16_t* oh, bf16_t* ol, int tokens, int splits) {{\n    f8b_reduce<{n}, {epi}, {bias}>(part, b, out, oh, ol, tokens, splits);\n}}\n\n"
+        ));
+    }
+    let vars: BTreeMap<&str, String> = [
+        ("F8B_WARPS", F8B_WARPS.to_string()),
+        ("F8B_MJ", F8B_MJ.to_string()),
+        ("F8B_KC", F8B_KC.to_string()),
+        ("F8B_STAGES", F8B_STAGES.to_string()),
+        ("F8B_KERNELS", kernels),
+    ]
+    .into_iter()
+    .collect();
+    render(FP8_BATCH_TEMPLATE, &vars)
 }
 const F4W_BK: usize = 64;
 const F4W_ROW: usize = 48;
@@ -648,7 +726,10 @@ impl Module {
             source.push('\n');
             source.push_str(&fp8_act_kernels(spec, &mut smem));
             kernels.push("quant_rows_fp8");
-            kernels.extend(smem.keys().filter(|k| k.contains("_f8")).copied().collect::<Vec<_>>());
+            source.push('\n');
+            source.push_str(&fp8_batch_kernels(spec, &mut smem)?);
+            kernels.extend(F8B_KERNELS.iter().filter(|k| la.is_some() || !k.starts_with("lin_")));
+            kernels.extend(smem.keys().filter(|k| k.contains("_f8") && !k.contains("_f8b")).copied().collect::<Vec<_>>());
         }
         let fp4_mlp = spec.mlp.quant == Some(Quant::Nvfp4G16);
         let fp4_head = spec.lm_head_quant() == Quant::Nvfp4G16;
