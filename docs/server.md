@@ -101,3 +101,19 @@ The GUI Server tab runs this same library in-process over the loaded model, and 
 ## Spark run (Qwen3-0.6B, specrt, GB10)
 
 16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 143.2 tokens/s aggregate, p50 3.5 s, p95 6.5 s (requests queue behind the one engine; latency is queue wait). A streamed reply arrives as 9 chunks, first at 0.03 s and last at 0.73 s. Loaded model VRAM reads 3.9 GB, device used 99 GB.
+
+## Unsupported request fields
+
+A field the server does not handle returns 400 naming it: `n` other than 1, `logprobs`, `top_logprobs`, `response_format` other than `text`, non-zero `frequency_penalty` or `presence_penalty`, named or `required` `tool_choice`, and any unknown top-level key. `user`, `parallel_tool_calls`, `store` and `metadata` are accepted and ignored.
+
+## Tool loop parity with vLLM (Qwen3.8-27B)
+
+`crates/server/scripts/tool_parity.py URL MODEL OUT` sends 20 temperature 0 turns (one prior tool exchange, then a user turn, with `get_weather` and `add`) through the `openai` client, plus a 3 turn loop with canned tool results. specrt ran with `tool_parser = "qwen3_coder"`, `reasoning_parser = "qwen3"`, `reasoning_effort = "medium"`; the reference was the vLLM server on port 8001.
+
+| Check | Result |
+|---|---|
+| 20 single turns, tool name, arguments and finish reason | 20 identical |
+| 3 turn loop (two calls in one reply, then a final answer) | identical |
+| `n=2` through the client | 400 `n: value is not supported` |
+
+Qwen3-0.6B with the hermes parser ran the same client loop (call, tool result, answer) correctly.
