@@ -754,7 +754,7 @@ fn ggb_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
             let name = GGB_KERNELS.iter().copied().find(|g| *g == name).expect("listed in GGB_KERNELS");
             smem.insert(name, shape.smem_bytes());
             out.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, 0, {split}>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, 0, {split}, true>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
                 threads = t.threads(),
                 bm = t.bm,
                 bn = t.bn,

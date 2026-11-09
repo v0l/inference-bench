@@ -407,6 +407,7 @@ impl Gguf {
             mtp: None,
             runtime: RuntimeOptions {
                 unsplit: if quant == Quant::Gguf { crate::codegen::GGB_LINEARS.iter().map(|l| l.to_string()).collect() } else { Vec::new() },
+                big_tile: if quant == Quant::Gguf { Some([256, 128, 4, 2]) } else { None },
                 ..RuntimeOptions::default()
             },
         };

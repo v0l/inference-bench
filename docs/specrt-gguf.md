@@ -32,6 +32,7 @@ For `gguf`, every matrix carries a row table: each row has its own byte offset a
 
 - Decode: `linear_ggml` and `row_dot<WF_GGML>` read the blocks and dequantise in registers. Q4_K and Q6_K have their own dot products (8 lanes per 256-value superblock); the other types use the shared 8-value dequantiser.
 - Prefill: `kernel_for` picks the `GemmPath::Ggb` path for more than 32 tokens. Each matrix is dequantised to a bf16 scratch (`gg_dequant_bf16`) and the existing bf16 tensor-core GEMM runs on it. Short batches use the MMA GEMM with an in-kernel dequant.
+- The GGUF GEMM grid runs the token tiles fastest, so the CTAs that share a weight tile run together and read it from L2. With the derived `[runtime] big_tile = [256, 128, 4, 2]` this took Qwen2.5-7B Q4_K_M prefill from 7.1k to 9.5k tok/s (llama.cpp 11.0k). Llama-3.2-1B went from 26k to 61k at 1024 tokens when the tile was set; Qwen3-0.6B is unchanged.
 - The spec derived from a K-quant file sets `[runtime] unsplit` for the four dense linears. The weights are already 4 to 6 bit, so the split-activation GEMM costs time without changing accuracy: unsplit prefill on Qwen2.5-7B Q4_K_M runs at 7.3k tok/s against 4.9k split.
 
 The bf16 dequantisation on the GPU is bit exact against ggml's `to_float`, and the native kernels give the same logits as loading the same file dequantised to bf16 (KL 0 on Qwen3-0.6B Q4_K_M).
@@ -82,6 +83,8 @@ RTX PRO 6000 Blackwell Max-Q, beside the resident vLLM (about 38 GB free). llama
 | Llama-3.2-1B-Instruct Q4_K_M | llama.cpp | 54,336 | 49,841 | 865 | 793 |
 | | specrt | 59,098 | 54,389 | 729 | 572 |
 | Qwen2.5-7B-Instruct Q4_K_M | llama.cpp | 11,024 | 10,341 | 222 | 209 |
-| | specrt | 7,092 | 7,071 | 168 | 150 |
+| | specrt | 9,500 | 9,600 | 166 | 150 |
 
 All in tokens per second. specrt is ahead on prefill for the small models and on short-context decode for Qwen3-0.6B. It is behind on the 7B (prefill pays for dequantising each weight to bf16 per chunk, and decode reads the blocks at about 73% of llama.cpp's rate) and on decode at 4096, where its attention is the slower part.
+
+Still behind on the 7B after #462: prefill 9.5k against 11.0k (the bf16 dequantisation pass is still there; an in-tile dequant GEMM or a Q8_1 MMQ path is the remaining step), decode 166 to 176 against 222, and decode at 4096 context on the small models.

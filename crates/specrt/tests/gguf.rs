@@ -77,6 +77,7 @@ fn the_llama_gguf_spec_recovers_llama3_rope_scaling_and_tokenizes_like_llama_cpp
     hf.norm.eps = spec.norm.eps;
     hf.rope.theta = spec.rope.theta;
     hf.runtime.unsplit = ["qkv", "o", "gate_up", "down"].map(String::from).to_vec();
+    hf.runtime.big_tile = Some([256, 128, 4, 2]);
     assert_eq!(spec, hf);
     assert_eq!(ids(&tok, TOKENIZE), [9906, 1917, 0, 220, 4513, 1774, 83739, 318, 5011, 91, 29, 882, 198, 220, 95980, 588, 53050, 11, 4536, 956, 433, 30]);
 }

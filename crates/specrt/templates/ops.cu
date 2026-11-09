@@ -284,7 +284,7 @@ __device__ __forceinline__ float gg_q4k_dot(const unsigned char* base, const flo
     int j = (lane & 7) >> 1;
     int l0 = (lane & 1) * 16;
     float acc = 0.0f;
-#pragma unroll 2
+#pragma unroll 4
     for (int s0 = 0; s0 < K / GG_SB; s0 += 4) {
         int s = s0 + (lane >> 3);
         if (s >= K / GG_SB) break;
@@ -320,7 +320,7 @@ __device__ __forceinline__ float gg_q6k_dot(const unsigned char* base, const flo
     int h = (lane & 7) >> 2;
     int l0 = (lane & 3) * 8;
     float acc = 0.0f;
-#pragma unroll 2
+#pragma unroll 4
     for (int s0 = 0; s0 < K / GG_SB; s0 += 4) {
         int s = s0 + (lane >> 3);
         if (s >= K / GG_SB) break;
@@ -360,7 +360,7 @@ __device__ __forceinline__ float gg_row_dot(const void* w, const unsigned* table
     int bytes = gg_bytes(type);
     float acc = 0.0f;
     int c0 = (lane & 7) * 4;
-#pragma unroll 2
+#pragma unroll 4
     for (int s0 = 0; s0 < K / GG_SB; s0 += 4) {
         int s = s0 + (lane >> 3);
         if (s >= K / GG_SB) break;
@@ -676,11 +676,11 @@ __device__ __forceinline__ int swz(int r, int c) {
     return r * CPR + (c ^ ((r / GROUP_ROWS) & MASK));
 }
 
-template <int N, int BM, int BN, int WM, int WN, int EPI, bool BIAS>
+template <int N, int BM, int BN, int WM, int WN, int EPI, bool BIAS, bool MFAST = false>
 __device__ __forceinline__ void gemm_epilogue(float (&acc)[BM / WM / 16][BN / WN / 8][4], const float* bias, float* out,
                                               bf16_t* out_hi, bf16_t* out_lo, int tokens);
 
-template <int N, int K, int BM, int BN, int WM, int WN, int BK, int STAGES, int EPI, bool BIAS, int WF, bool SPLIT>
+template <int N, int K, int BM, int BN, int WM, int WN, int BK, int STAGES, int EPI, bool BIAS, int WF, bool SPLIT, bool MFAST = false>
 __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, const float* bias, const bf16_t* x_hi,
                                         const bf16_t* x_lo, float* out, bf16_t* out_hi, bf16_t* out_lo, int tokens) {
     constexpr bool BYTES = WF == WF_Q8 || WF == WF_FP8;
@@ -715,8 +715,8 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
     int t = lane & 3;
     int wm = warp / WN;
     int wn = warp % WN;
-    int m0 = blockIdx.y * BM;
-    int n0 = blockIdx.x * BN;
+    int m0 = (MFAST ? blockIdx.x : blockIdx.y) * BM;
+    int n0 = (MFAST ? blockIdx.y : blockIdx.x) * BN;
     float acc[MI][NJ][4];
 #pragma unroll
     for (int i = 0; i < MI; i++)
@@ -883,10 +883,10 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
         }
     }
     cp_async_wait<0>();
-    gemm_epilogue<N, BM, BN, WM, WN, EPI, BIAS>(acc, bias, out, out_hi, out_lo, tokens);
+    gemm_epilogue<N, BM, BN, WM, WN, EPI, BIAS, MFAST>(acc, bias, out, out_hi, out_lo, tokens);
 }
 
-template <int N, int BM, int BN, int WM, int WN, int EPI, bool BIAS>
+template <int N, int BM, int BN, int WM, int WN, int EPI, bool BIAS, bool MFAST>
 __device__ __forceinline__ void gemm_epilogue(float (&acc)[BM / WM / 16][BN / WN / 8][4], const float* bias, float* out,
                                               bf16_t* out_hi, bf16_t* out_lo, int tokens) {
     constexpr int TM = BM / WM;
@@ -899,8 +899,8 @@ __device__ __forceinline__ void gemm_epilogue(float (&acc)[BM / WM / 16][BN / WN
     int t = lane & 3;
     int wm = warp / WN;
     int wn = warp % WN;
-    int m0 = blockIdx.y * BM;
-    int n0 = blockIdx.x * BN;
+    int m0 = (MFAST ? blockIdx.x : blockIdx.y) * BM;
+    int n0 = (MFAST ? blockIdx.y : blockIdx.x) * BN;
     if (EPI == EPI_ACT) {
         static_assert(EPI != EPI_ACT || N % 4 == 0, "gate/up pairs");
 #pragma unroll

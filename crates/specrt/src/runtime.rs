@@ -1078,7 +1078,7 @@ impl Runtime {
         let n = tokens as i32;
         b.arg(&n);
         let config = LaunchConfig {
-            grid_dim: (grid(rows, tile.bn), grid(tokens, tile.bm), 1),
+            grid_dim: (grid(tokens, tile.bm), grid(rows, tile.bn), 1),
             block_dim: (tile.threads(), 1, 1),
             shared_mem_bytes: self.smem[kernel],
         };
