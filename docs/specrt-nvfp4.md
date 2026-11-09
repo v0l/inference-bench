@@ -507,6 +507,40 @@ On random matrices of every projection shape (`tests/fp8_batch.rs`, batch 1, 2, 
 `o`, `lin_in` and `lin_out` (max abs 30 to 40), 2.4e-5 to 2.6e-5 on `down` (max abs 57 to 66)
 and 1.1e-3 to 3.2e-3 on `gate_up` (max abs 400 to 560), never worse than the tile path.
 
+#### 17 to 32 rows on the batched GEMV (#414)
+
+`gemv_f4b` and `gemv_f8b` take the warp count, ring depth and rows per warp as template
+parameters (`BatchShape` in `codegen.rs`). The 32-token variants (`*_f4b32`, `*_f8b32`) run 8
+warps of one 16-row mma tile each, so a block still covers 128 weight rows and each warp keeps
+four 8-wide N tiles of accumulators: with two row tiles per warp the FP8 kernel spilled 464 bytes
+at 128 registers, with one it does not spill. The ring is 3 stages of 32 x 128 hi/lo columns (48
+KB), so 2 blocks fit an SM; `BatchShape::blocks_per_sm` derives that from the shared memory and
+the splits follow from it (`gate_up` 4, `down` 16, `qkv` 6, `lin_in` 5, `o` and `lin_out` 12 on
+188 SMs). Every weight byte is still read once for 17 to 32 rows. Dispatch: `kernel_for` takes
+the batched GEMV for every FP8/NVFP4 projection up to 32 rows on `tile = "auto"`, before the
+activation-quantised GEMMs; above 32 the GEMMs keep it.
+
+Errors at 17, 24 and 32 rows (`tests/fp4_batch.rs`, `tests/fp8_batch.rs`) are the 16-row ones:
+8.6e-5 on fp4 `down`, 5.4e-3 on fp4 `gate_up`, 1.2e-5 to 2.8e-5 on the FP8 shapes, 3.5e-3 on FP8
+`gate_up`.
+
+Per call on the real 27B (`nsys --cuda-graph-trace=node`, 128-token prompt, 64 new,
+`qwen3.8-27b-nvfp4.toml`, base `f5b1ef0` against #414, vLLM 93 to 100% busy):
+
+| kernel | batch 24 base | batch 24 #414 | batch 32 base | batch 32 #414 |
+|---|---|---|---|---|
+| NVFP4 `gate_up` (`f4w` 34816 x 5120) | 341.0 us | 160.5 | 343.7 | 168.6 |
+| NVFP4 `down` (`f4w_narrow` 5120 x 17408) | 547.5 | 101.4 | 590.0 | 110.9 |
+| FP8 `lin_in` 16384 x 5120 | 175.5 | 115.0 | 178.4 | 121.3 |
+| FP8 `qkv` 14336 x 5120 | 172.6 | 100.2 | 175.2 | 106.4 |
+| FP8 `lin_out` 5120 x 6144 | 95.1 | 47.1 | 104.0 | 48.3 |
+| FP8 `gate_up` 34816 x 5120 | 325.2 | 201.1 | 331.0 | 209.8 |
+
+Total kernel time under nsys falls from 23.6 to 17.3 s at batch 24 and 25.6 to 22.6 s at batch
+32, and the whole-step decode rate in the same runs goes from 153.3 to
+276.0 tok/s at batch 24 and 221.3 to 349.3 at batch 32 (plus 58%). On the `[mlp] act_quant =
+"fp4"` spec plain batch 32 is unchanged (450.2 against 450.8 under nsys): its native fp4 and fp8
+GEMMs already beat the bf16 dequant GEMV there, so the dispatch keeps them.
 Real-27B tests on master f03f786 (with #375 and #379), references regenerated for this run
 into one dir (`real-prompts`, both `real-slice`s, `real-full` weight-only and `act`, and
 `vllm_logprobs.py` against the live vLLM), `cargo test --release --test real27b -- --ignored

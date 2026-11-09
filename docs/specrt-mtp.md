@@ -288,11 +288,23 @@ target hidden state (specrt's FP8 and NVFP4 kernels against vLLM's), not in the 
 not show in `bench` (0.827), where specrt's drafter sees specrt's own hiddens on its own text.
 The earlier 0.917 and 0.816 for the served vLLM do not reproduce in isolation.
 
-Crossover: speculation still wins at batch 4 (12 verify rows) and loses at batch 8 (24 rows). Past
-16 rows the verify GEMMs leave the batched fp4/fp8 GEMV path for the `_tiny` mma tile, which reads
-the weights at about 400 GB/s (see `specrt-nvfp4.md`), so a verify step costs much more than a
-decode step. Set `[mtp] max_batch = 4` (or `[speculative] max_batch` in the server config) on this
-card until the batched GEMVs cover more rows.
+Crossover: speculation still wins at batch 4 (12 verify rows). Until #414 it lost at batch 8 (24
+rows): past 16 rows the verify GEMMs left the batched fp4/fp8 GEMV path for the `_tiny` mma tile,
+which reads the weights at about 400 GB/s (see `specrt-nvfp4.md`). With the 32-token GEMVs
+(`*_f4b32`, `*_f8b32`) a 24-row verify reads every weight once, and batch 8 speculation is level
+with plain decode. `scripts/spec27b.sh`-style runs, the same prompts, base (`f5b1ef0`) and #414
+binaries interleaved, three rounds, vLLM 93 to 100 percent busy beside it:
+
+| batch | binary | speculative tok/s (3 runs) | plain tok/s (3 runs) | median ratio |
+|---|---|---|---|---|
+| 4 | base | 297.3, 98.0, 96.3 | 172.9, 88.4, 84.2 | 1.11x |
+| 4 | #414 | 276.7, 92.8, 93.0 | 172.8, 86.8, 88.0 | 1.06x |
+| 8 | base | 262.8, 106.0, 90.6 | 278.0, 130.0, 141.0 | 0.75x |
+| 8 | #414 | 387.7, 147.3, 137.1 | 140.3, 141.3, 137.8 | 1.05x |
+
+The runs swing 3x with vLLM's load, so compare within a row. Batch 4 is unchanged (12 rows were
+already on the 16-token GEMV). `[mtp] max_batch = 8` is the setting for this card now; above 32
+verify rows (batch 11 at k = 2) the GEMMs take over again.
 
 The single-stream speedup (1.36x for 2.43 tokens per step) is below the acceptance length because
 each speculative step pays the 3-row verify, the MTP pass over the accepted rows and two chained

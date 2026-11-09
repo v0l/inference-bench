@@ -488,6 +488,8 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
     let fp8_act = spec.quant.is_fp8() && fp8_act_enabled(spec);
     let fp4_act = spec.mlp.quant == Some(Quant::Nvfp4G16) && fp4_act_enabled(spec);
     match weight {
+        WeightKind::Fp8 if act_quant && fp8_act => choice(format!("{linear}_f8{suffix}"), GemmPath::F8a, Some("quant_rows_fp8")),
+        WeightKind::Fp4 if act_quant && fp4_act => choice(format!("{linear}_f4a{suffix}"), GemmPath::F4a, Some("quant_rows_fp4")),
         WeightKind::Fp8 if f8b => KernelChoice {
             reduce: Some(format!("{linear}_f8b_reduce")),
             ..choice(format!("{linear}_f8b{}", f8b_tokens(tokens)), GemmPath::F8b, None)
@@ -496,8 +498,6 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
             reduce: Some(format!("{linear}_f4b_reduce")),
             ..choice(format!("{linear}_f4b{}", f4b_tokens(tokens)), GemmPath::F4b, None)
         },
-        WeightKind::Fp8 if act_quant && fp8_act => choice(format!("{linear}_f8{suffix}"), GemmPath::F8a, Some("quant_rows_fp8")),
-        WeightKind::Fp4 if act_quant && fp4_act => choice(format!("{linear}_f4a{suffix}"), GemmPath::F4a, Some("quant_rows_fp4")),
         WeightKind::Fp4 => choice(format!("{linear}_f4w{suffix}"), GemmPath::F4w, None),
         _ => choice(format!("{linear}_mma{suffix}"), GemmPath::Mma, None),
     }
