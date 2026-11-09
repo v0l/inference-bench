@@ -43,6 +43,15 @@ impl DeviceMatrix {
         })
     }
 
+    fn bytes(&self) -> u64 {
+        (match self {
+            DeviceMatrix::Bf16(w) => w.num_bytes(),
+            DeviceMatrix::Q8 { values, scales } => values.num_bytes() + scales.num_bytes(),
+            DeviceMatrix::Fp8 { values, scales } => values.num_bytes() + scales.num_bytes(),
+            DeviceMatrix::Fp4 { packed, scales } => packed.num_bytes() + scales.num_bytes(),
+        }) as u64
+    }
+
     fn args<'a>(&'a self, b: &mut cudarc::driver::LaunchArgs<'a>, dummy: &'a CudaSlice<f32>) {
         match self {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(dummy),
@@ -84,6 +93,34 @@ struct DeviceLayer {
     mixer: DeviceMixer,
     gate_up: DeviceMatrix,
     down: DeviceMatrix,
+}
+
+fn opt_bytes(v: &Option<CudaSlice<f32>>) -> u64 {
+    v.as_ref().map_or(0, |s| s.num_bytes() as u64)
+}
+
+impl DeviceLayer {
+    fn bytes(&self) -> u64 {
+        let mixer = match &self.mixer {
+            DeviceMixer::Attention(a) => {
+                a.qkv.bytes()
+                    + a.o.bytes()
+                    + opt_bytes(&a.qkv_bias)
+                    + opt_bytes(&a.q_norm)
+                    + opt_bytes(&a.k_norm)
+            }
+            DeviceMixer::Linear(g) => {
+                g.in_proj.bytes()
+                    + g.ba.bytes()
+                    + g.out.bytes()
+                    + (g.conv.num_bytes() + g.neg_a.num_bytes() + g.dt_bias.num_bytes() + g.norm.num_bytes()) as u64
+            }
+        };
+        mixer
+            + self.gate_up.bytes()
+            + self.down.bytes()
+            + (self.ln1.num_bytes() + self.ln2.num_bytes()) as u64
+    }
 }
 
 struct GdnBuffers {
@@ -497,7 +534,9 @@ impl Runtime {
         drop(outside);
         checkpoint.release();
         let weight_secs = weights_started.elapsed().as_secs_f64();
-        let weight_bytes = free_before.saturating_sub(ctx.mem_get_info().map(|(f, _)| f).unwrap_or(0)) as u64;
+        let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
+            + (embed.num_bytes() + norm.num_bytes()) as u64
+            + lm_head.bytes();
         let d = &spec.dims;
         let pages = layout.pages();
         let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
