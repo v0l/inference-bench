@@ -1,9 +1,11 @@
-extern "C" __global__ void mtp_fc_in(const bf16_t* table, const int* tokens, const float* hsrc, const int* hidx,
-                                     const float* pre, const float* ne, const float* nh, bf16_t* hi, bf16_t* lo) {
+extern "C" __global__ void mtp_fc_in(const bf16_t* table, const int* tokens, const float* xsrc, const float* psrc,
+                                     const int* hidx, const float* pre, const float* ne, const float* nh, bf16_t* hi,
+                                     bf16_t* lo) {
     __shared__ float scratch[32];
     int r = blockIdx.x;
     const bf16_t* e = table + (size_t)tokens[r] * HIDDEN;
-    const float* h = hsrc + (size_t)hidx[r] * HIDDEN;
+    int at = hidx[r];
+    const float* h = at >= 0 ? xsrc + (size_t)at * HIDDEN : psrc + (size_t)(-1 - at) * HIDDEN;
     float se = 0.0f, sx = 0.0f;
     for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) {
         float a = bf16_to_f32(e[i]);
@@ -128,7 +130,10 @@ extern "C" __global__ void spec_accept(const float* logits, const int* vtok, con
         if (!take) break;
         a++;
     }
-    if (threadIdx.x == 0) accepted[s] = a;
+    if (threadIdx.x == 0) {
+        accepted[s] = a;
+        for (int j = a + 1; j <= k; j++) out[s * (k + 1) + j] = 0;
+    }
 }
 
 extern "C" __global__ void mtp_fill(const int* drafts, int* vtok, int k) {
@@ -137,10 +142,15 @@ extern "C" __global__ void mtp_fill(const int* drafts, int* vtok, int k) {
     if (j < k) vtok[s * (k + 1) + 1 + j] = drafts[s * k + j];
 }
 
-extern "C" __global__ void mtp_gather(const float* src, const int* sidx, float* dst, const int* didx) {
-    int r = blockIdx.y;
-    const float* a = src + (size_t)sidx[r] * HIDDEN;
-    float* b = dst + (size_t)didx[r] * HIDDEN;
+extern "C" __global__ void mtp_pick_rows(const int* accepted, int k, int* sidx) {
+    int s = threadIdx.x;
+    sidx[s] = s * (k + 1) + accepted[s];
+}
+
+extern "C" __global__ void mtp_copy(const float* src, const int* sidx, float* dst, const int* didx) {
+    int s = blockIdx.y;
+    const float* a = src + (size_t)sidx[s] * HIDDEN;
+    float* b = dst + (size_t)didx[s] * HIDDEN;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x) b[i] = a[i];
 }
 

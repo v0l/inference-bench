@@ -15,8 +15,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 mod fused;
+mod mtp;
 mod step;
 pub use fused::PrefillPart;
+pub use mtp::{SpecRow, SpecStats};
 pub use step::{DecodeRow, GRAPH_SIZES, Stepper, pad_rows};
 
 enum DeviceMatrix {
@@ -353,6 +355,7 @@ pub struct Runtime {
     pub peak_host_rss_bytes: u64,
     ctx: Arc<CudaContext>,
     baseline_free: usize,
+    mtp: Option<mtp::MtpState>,
 }
 
 fn grid(n: usize, per_block: usize) -> u32 {
@@ -533,10 +536,13 @@ impl Runtime {
         stream.synchronize()?;
         drop(outside);
         checkpoint.release();
+        let mtp_weights = mtp::DeviceMtp::load(&stream, &checkpoint, spec)?;
+        checkpoint.release();
         let weight_secs = weights_started.elapsed().as_secs_f64();
         let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
             + (embed.num_bytes() + norm.num_bytes()) as u64
-            + lm_head.bytes();
+            + lm_head.bytes()
+            + mtp_weights.as_ref().map_or(0, mtp::DeviceMtp::bytes);
         let d = &spec.dims;
         let pages = layout.pages();
         let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
@@ -671,7 +677,11 @@ impl Runtime {
             peak_host_rss_bytes: 0,
             ctx: ctx.clone(),
             baseline_free: free_before,
+            mtp: None,
         };
+        if let Some(w) = mtp_weights {
+            rt.mtp = Some(mtp::MtpState::new(&rt, w)?);
+        }
         rt.stream.synchronize()?;
         let kv_blocks = match layout.kv_blocks {
             0 => {
@@ -1774,6 +1784,7 @@ impl Runtime {
 
     pub fn reset_slot(&mut self, seq: usize) -> Result<()> {
         ensure!(seq < self.slots, "slot {seq} out of {}", self.slots);
+        self.mtp_forget(seq);
         if let Some(gb) = self.gdn.as_ref() {
             ensure!(gb.ssm_pool.is_live(seq), "recurrent state of slot {seq} is not allocated");
         }
@@ -2008,6 +2019,10 @@ impl Runtime {
 }
 
 const DECODE_CHUNK: usize = 16;
+
+fn argmax_host(row: &[f32]) -> u32 {
+    (0..row.len()).fold(0, |best, i| if row[i] > row[best] { i } else { best }) as u32
+}
 
 pub fn cut_at_stop(tokens: &[u32], stop: &[u32]) -> (usize, bool) {
     match tokens.iter().position(|t| stop.contains(t)) {

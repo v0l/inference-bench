@@ -452,12 +452,18 @@ def tiny_mtp(fixture, out_dir):
         out = model.model(ids[None])
         hidden = out.last_hidden_state
         target = model.lm_head(hidden)[0]
-        logits, mtp_hidden = mtp(model, ids[None, 1:], hidden[:, :-1], torch.arange(TINY_MTP_PROMPT - 1))
+        t = int(target[-1].argmax())
+        nxt = torch.cat([ids[1:], torch.tensor([t])])
+        logits, mtp_hidden = mtp(model, nxt[None], hidden, torch.arange(TINY_MTP_PROMPT))
+        d1 = int(logits[-1].argmax())
+        chain_tokens = torch.cat([nxt, torch.tensor([d1])])
+        chain_hidden = torch.cat([hidden, mtp_hidden[None, -1:]], dim=1)
+        chain, _ = mtp(model, chain_tokens[None], chain_hidden, torch.arange(TINY_MTP_PROMPT + 1))
     save(
         out_dir,
         "tinymtp-prompt",
-        {"hidden": hidden[0], "target": target, "logits": logits, "mtp_hidden": mtp_hidden},
-        {"tokens": ids.tolist(), **versions},
+        {"hidden": hidden[0], "target": target, "logits": logits, "chain": chain[-1]},
+        {"tokens": ids.tolist(), "first": t, "draft": d1, "chain_draft": int(chain[-1].argmax()), **versions},
     )
     print("tiny mtp", fixture, "->", out_dir)
 

@@ -98,6 +98,7 @@ impl Runtime {
         let ran = self.prefill_chunk(tokens, start, None);
         self.seq = 0;
         ran?;
+        self.mtp_after_prefill(slot, tokens, start)?;
         let Some((sampling, step)) = sample else { return Ok(None) };
         self.stream.memcpy_htod(&params(sampling, step), &mut st.params.slice_mut(..3))?;
         let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
@@ -150,6 +151,7 @@ impl Runtime {
             self.decode_and_sample(st, n)?;
         }
         let out = self.stream.clone_dtoh(&st.bb.tokens.slice(..live))?;
+        self.mtp_after_decode(rows)?;
         Ok(out.into_iter().map(|t| t as u32).collect())
     }
 }

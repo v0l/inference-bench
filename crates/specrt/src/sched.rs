@@ -82,7 +82,7 @@ pub struct GpuExecutor {
 impl GpuExecutor {
     pub fn new(rt: Runtime) -> Result<Self> {
         let st = rt.stepper()?;
-        let fuse = rt.spec().runtime.fuse;
+        let fuse = rt.spec().runtime.fuse && rt.draft_tokens().is_none();
         Ok(GpuExecutor { rt, st, fuse })
     }
 }
