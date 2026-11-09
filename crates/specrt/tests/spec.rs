@@ -298,6 +298,14 @@ fn head_quant_defaults_to_the_checkpoint_head_round_trips_and_rejects_other_form
     assert!(e.contains("head_quant"), "{e}");
     let e = format!("{:#}", Spec::parse(&with("fp4")).unwrap_err());
     assert!(e.contains("fp4"), "{e}");
+    for (file, q) in [("qwen3.8-27b-nvfp4-head-fp8", Quant::Fp8Channel), ("qwen3.8-27b-nvfp4-head-nvfp4", Quant::Nvfp4G16)] {
+        let mut f = Spec::load(&root().join(format!("tests/fixtures/{file}.toml"))).unwrap();
+        assert_eq!(f.head_quant, Some(q));
+        f.name = plain.name.clone();
+        f.min_engine = plain.min_engine;
+        f.head_quant = None;
+        assert_eq!(f, plain, "{file} differs from the base spec only in head_quant");
+    }
 }
 
 fn hybrid_text() -> String {

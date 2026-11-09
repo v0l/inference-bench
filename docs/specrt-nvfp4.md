@@ -324,7 +324,7 @@ in flight, 512-thread blocks for both `_f4` kernels (`FP4_GEMV_THREADS`).
 
 `lm_head_norm` standalone reaches 1,640 to 1,646 GB/s for any unroll or block size
 (5,120 x 248,320 bf16, 1.55 ms), so its 929 GB/s in the table below is vLLM contention, not the
-kernel. An FP8 or NVFP4 head changes logits and needs its own accuracy gate; not done.
+kernel. An FP8 or NVFP4 head changes logits and needs its own accuracy gate; see the next section.
 
 In the graph, under the same sharing (`nsys --cuda-graph-trace=node`, 128-token prompt):
 
@@ -336,6 +336,63 @@ In the graph, under the same sharing (`nsys --cuda-graph-trace=node`, 128-token 
 
 `gate_up_act_f4` median 90.6 us to 78.5 us. Per-layer minimums of the NVFP4 GEMVs are 89% of the
 ceiling; medians stay near 78% because of the sharing.
+
+### Quantised lm_head (#363)
+
+`head_quant` in the spec picks the output head format: `bf16` (the default, what the checkpoint
+ships and what vLLM uses), `fp8_channel` or `nvfp4_g16`. The loader quantises the bf16 head at load
+time, so the checkpoint is unchanged: `fp8_channel` takes one scale per row (`absmax / 448`,
+round to nearest even e4m3) and reuses the FP8 GEMV and `gemm_tc` kernels; `nvfp4_g16` takes a
+global scale of `448 * 6 / absmax` over the whole head and e4m3 scales per 16 columns, exactly
+the checkpoint's own NVFP4 scheme, and runs `lm_head_norm_f4` (the `fp4_rows_dot` GEMV, two rows
+per warp) and `lm_head_f4w*` (`gemm_f4w`) from `templates/fp4_head.cu`. A tied head quantises only
+its output copy; the embedding lookup stays bf16. The head never goes through the native FP8 or
+FP4 activation paths. `nvfp4_g16` needs the tensor-core path (it is refused with `[runtime]
+gemm_fp32 = true`).
+
+Tiny fixtures (`tests/head_quant.rs`): decode GEMV and prefill GEMM logits match a CPU f64 matmul of
+the dequantised head to at most 3.1e-6 relative on all four fixtures and both formats (bound
+1e-4); every layer stays bit identical; the default and an explicit `bf16` are bit identical to
+master (logits and greedy, compared byte for byte against `9b2e9d2` on qwen3-0.6b and three tiny
+fixtures); batch decode, the stepped decode and the 64-sequence scheduler with preemption
+(`tests/serving.rs`) equal single-sequence greedy with either head.
+
+| 20 prompts, 1,500 positions | fp8_channel top-1 / KL(bf16 \|\| quantised) | nvfp4_g16 top-1 / KL |
+|---|---|---|
+| tiny-qwen3.5 (random weights, flat logits) | 94.9% / 3.5e-4 | 83.9% / 4.7e-3 |
+| tiny hd256, tiny fp8, tiny nvfp4 | 94.8 to 95.9% / 3.5e-4 | 82.2 to 83.5% / 4.6e-3 |
+| Qwen3-0.6B (tied head) | 95.5% / 2.4e-3 | 85.2% / 2.8e-2 |
+
+Real NVFP4 27B, beside vLLM, one binary for all three heads (`scripts/head27b.sh`, `nsys
+--cuda-graph-trace=node`, 128-token prompt, 64 decode steps, max context 192):
+
+| head | bytes | `lm_head` GEMV median / min | GB/s at median / min | decode kernel time per token (sum of medians) |
+|---|---|---|---|---|
+| bf16 | 2.54 GB | 1,821 / 1,709 us | 1,396 / 1,488 | 21.80 ms |
+| fp8_channel | 1.31 GB | 1,313 / 1,012 us | 999 / 1,297 | 21.46 ms |
+| nvfp4_g16 | 0.72 GB | 656 / 529 us | 1,090 / 1,352 | 20.97 ms |
+
+The NVFP4 head saves 1.17 ms of the 1.82 ms GEMV, 3.8% of decode kernel time; FP8 saves 0.5 ms
+(2.3%). End-to-end decode tok/s swung from 28 to 55 between runs of the same binary as vLLM's load
+moved, so it is not a usable before/after; the kernel times are.
+
+Accuracy, whole model against the CPU oracle (`real_27b_greedy_and_logits_match_the_fp8_reference`,
+weight-only reference, 5 prompts x 96 positions) and teacher-forced against vLLM
+(`real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs`, 20 x 64):
+
+| head | KL(oracle \|\| ours) | top-1 vs oracle | greedy vs oracle, 32 x 5 | vLLM teacher-forced top-1 | KL(vLLM \|\| ours) mean / median / p99 |
+|---|---|---|---|---|---|
+| bf16 | 1.2e-9 | 100% | identical on all 5 | 1,241 / 1,280 (97.0%) | 0.0091 / 0.0025 / 0.087 |
+| fp8_channel | 6.5e-4 | 97.3% | 1 of 5; flips at steps 9 to 19, margins 0.007 to 0.09 | 1,237 (96.6%) | 0.0095 / 0.0028 / 0.082 |
+| nvfp4_g16 | 6.2e-3 | 95.8% | 2 of 5; flips at steps 0 to 29, margins 0.06 to 0.39 | 1,226 (95.8%) | 0.0136 / 0.0044 / 0.107 |
+| envelope: the act reference against weight-only | 0.0105 | 97.3% | | gate: no worse than 96.6% / 0.0097 | |
+
+Both heads pass the test's envelope (KL within 1.5x of 0.0105, top-1 within 2 points of 97.3%).
+Against the issue's vLLM gate (no worse than 96.6% top-1 and 0.0097 KL), `fp8_channel` passes
+(96.6%, 0.0095) and `nvfp4_g16` fails (95.8%, 0.0136). The FP8 head buys 2.3% of decode kernel
+time and costs 0.4 points of vLLM top-1 at the edge of the gate. That is not worth a change to the
+default, which stays `bf16`; `fp8_channel` is there for anyone who wants the speed and accepts the
+drift. `nvfp4_g16` is outside the gate.
 
 ### Batched decode (native prefill, 128-token prompts, `bench ... 128 128 N`)
 
@@ -425,4 +482,9 @@ cargo test --release --test real27b real_27b_per_layer_trace -- --ignored
 $PY scripts/vllm_logprobs.py out
 cargo test --release --test real27b real_27b_nvfp4_agrees_with_vllm -- --ignored
 ./scripts/bench27b-nvfp4.sh
+# quantised head: run head27b.sh under flock /tmp/gpu27.lock; the other two take the lock per GPU step; all need 36 GB free
+flock /tmp/gpu27.lock env BENCH=<bench> OUT=out/nsys363 ./scripts/head27b.sh
+SPECRT_REF_DIR=out TESTBIN=<real27b test binary> ./scripts/head27b-gates.sh
+SPECRT_REF_DIR=out TESTBIN=<real27b test binary> ./scripts/head27b-vllm.sh
+cargo test --release --test head_quant -- --include-ignored
 ```

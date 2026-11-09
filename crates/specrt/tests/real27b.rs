@@ -64,9 +64,21 @@ fn write_floats(name: &str, v: &[f32]) {
     std::fs::write(out_dir().join(name), bytes).unwrap();
 }
 
-fn mode(spec: &Spec) -> &'static str {
+fn mode(spec: &Spec) -> String {
     use specrt::spec::ActQuant;
-    if spec.act_quant != ActQuant::None || spec.mlp.act_quant != ActQuant::None { "act" } else { "weight" }
+    let base = if spec.act_quant != ActQuant::None || spec.mlp.act_quant != ActQuant::None { "act" } else { "weight" };
+    match spec.head_quant {
+        Some(h) if h != Quant::Bf16 => format!("{base}-head-{}", head_name(h)),
+        _ => base.into(),
+    }
+}
+
+fn head_name(q: Quant) -> &'static str {
+    match q {
+        Quant::Fp8Channel => "fp8_channel",
+        Quant::Nvfp4G16 => "nvfp4_g16",
+        _ => "bf16",
+    }
 }
 
 #[test]
@@ -100,7 +112,7 @@ fn real_27b_generates_greedy_and_dumps_logits() {
         .ok()
         .map(|t| serde_json::from_str::<serde_json::Value>(&t).unwrap())
         .map(|v| v["sequences"].as_array().unwrap().iter().map(ids).collect::<Vec<_>>());
-    for seq in forced.as_ref().filter(|_| mode(&spec) == "act").unwrap_or(&sequences) {
+    for seq in forced.as_ref().filter(|_| mode(&spec) != "weight").unwrap_or(&sequences) {
         logits.extend(rt.prompt_logits(seq).unwrap());
     }
     write_floats(&format!("real27b-specrt-{}.logits.bin", mode(&spec)), &logits);
@@ -263,7 +275,9 @@ fn real_27b_greedy_and_logits_match_the_fp8_reference() {
             .collect()
     };
     let mut checked = 0;
-    for (mode, reference) in [("weight", &weight_only), ("act", &act_ref)] {
+    let heads = [Quant::Fp8Channel, Quant::Nvfp4G16].map(|h| format!("weight-head-{}", head_name(h)));
+    let modes = [("weight".to_string(), &weight_only), ("act".to_string(), &act_ref)].into_iter().chain(heads.into_iter().map(|m| (m, &weight_only)));
+    for (mode, reference) in modes {
         let Ok(text) = std::fs::read_to_string(out_dir().join(format!("real27b-specrt-{mode}.json"))) else { continue };
         let meta: serde_json::Value = serde_json::from_str(&text).unwrap();
         let seqs: Vec<Vec<u32>> = meta["sequences"].as_array().unwrap().iter().map(ids).collect();
