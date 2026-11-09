@@ -2,3 +2,4 @@
 /out
 /crates/specrt/out
 __pycache__/
+/crates/ui/docs/

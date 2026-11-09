@@ -442,7 +442,7 @@ fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl F
 #[test]
 #[ignore = "needs a GPU and the hub cache; run with SHOTS=docs/gui"]
 fn screenshots_with_real_data() {
-    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/gui").into()));
     std::fs::create_dir_all(&out).unwrap();
     let d = dir("shots");
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
@@ -537,7 +537,7 @@ fn screenshots_with_real_data() {
 #[test]
 #[ignore = "needs a GPU and Qwen3-0.6B in the hub cache; run with SHOTS=dir"]
 fn chat_screenshots_with_a_real_model() {
-    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/gui").into()));
     std::fs::create_dir_all(&out).unwrap();
     let d = dir("chat-shots");
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
@@ -590,7 +590,7 @@ fn chat_screenshots_with_a_real_model() {
 #[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshot_of_spec_provenance_and_update_settings() {
     use inference_bench_core::fake::{FakeFile, tarball};
-    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/gui").into()));
     std::fs::create_dir_all(&out).unwrap();
     let specs_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs");
     let read = |f: &str| std::fs::read_to_string(format!("{specs_dir}/{f}")).unwrap();
@@ -652,7 +652,7 @@ fn screenshot_of_spec_provenance_and_update_settings() {
 #[test]
 #[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
 fn screenshots_of_the_server_and_logs_tabs() {
-    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("docs/gui".into()));
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/gui").into()));
     std::fs::create_dir_all(&out).unwrap();
     let mut h = harness("shots-logs", Tab::Server);
     {
