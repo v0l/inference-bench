@@ -1,0 +1,80 @@
+use crate::codegen::{MMA_VARIANTS, MmaShape, Tile, WeightFormat};
+use crate::spec::Spec;
+use std::collections::BTreeMap;
+
+pub const MTP_TEMPLATE: &str = include_str!("../templates/mtp.cu");
+
+pub const MTP_KERNELS: &[&str] = &[
+    "mtp_fc_in",
+    "mtp_draft",
+    "mtp_fill",
+    "mtp_gather",
+    "spec_accept",
+    "gdn_conv_verify",
+    "gdn_conv_commit",
+    "gdn_verify",
+    "gdn_commit",
+];
+
+pub const MTP_LINEARS: [&str; 5] = ["mtp_fc", "mtp_qkv", "mtp_o", "mtp_gate_up", "mtp_down"];
+
+pub const MTP_MMA_KERNELS: &[&str] = &[
+    "mtp_fc_mma",
+    "mtp_fc_mma_big",
+    "mtp_fc_mma_narrow",
+    "mtp_fc_mma_tiny",
+    "mtp_qkv_mma",
+    "mtp_qkv_mma_big",
+    "mtp_qkv_mma_narrow",
+    "mtp_qkv_mma_tiny",
+    "mtp_o_mma",
+    "mtp_o_mma_big",
+    "mtp_o_mma_narrow",
+    "mtp_o_mma_tiny",
+    "mtp_gate_up_mma",
+    "mtp_gate_up_mma_big",
+    "mtp_gate_up_mma_narrow",
+    "mtp_gate_up_mma_tiny",
+    "mtp_down_mma",
+    "mtp_down_mma_big",
+    "mtp_down_mma_narrow",
+    "mtp_down_mma_tiny",
+];
+
+fn dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str) {
+    let d = &spec.dims;
+    match linear {
+        "mtp_fc" => (d.hidden, 2 * d.hidden, "EPI_STORE"),
+        "mtp_qkv" => (spec.qkv_rows(), d.hidden, "EPI_STORE"),
+        "mtp_o" => (d.hidden, spec.q_dim(), "EPI_RESIDUAL"),
+        "mtp_gate_up" => (2 * d.intermediate, d.hidden, "EPI_ACT"),
+        _ => (d.hidden, d.intermediate, "EPI_RESIDUAL"),
+    }
+}
+
+pub fn mtp_source(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
+    let mut out = String::from(MTP_TEMPLATE);
+    let wf = WeightFormat::Bf16;
+    for linear in MTP_LINEARS {
+        let (n, k, epi) = dims(spec, linear);
+        for suffix in MMA_VARIANTS {
+            let shape = MmaShape::new(Tile::variant(suffix, &spec.runtime), k, wf, true);
+            let t = shape.tile;
+            let name = format!("{linear}_mma{suffix}");
+            let name = MTP_MMA_KERNELS.iter().copied().find(|k| *k == name).expect("listed in MTP_MMA_KERNELS");
+            smem.insert(name, shape.smem_bytes());
+            out.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, false, {wf}, true>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+                threads = t.threads(),
+                bm = t.bm,
+                bn = t.bn,
+                wm = t.wm,
+                wn = t.wn,
+                bk = shape.bk,
+                stages = shape.stages,
+                wf = wf.code(),
+            ));
+        }
+    }
+    out
+}

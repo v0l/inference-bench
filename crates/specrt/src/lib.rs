@@ -2,6 +2,7 @@ pub mod chat;
 pub mod codegen;
 pub mod engine;
 pub mod jit;
+pub mod mtp;
 pub mod nvfp4;
 pub mod runtime;
 pub mod sched;

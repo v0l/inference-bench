@@ -141,8 +141,8 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const fl
 #pragma unroll
     for (int i = 0; i < KS; i++) {
         int k = ks * KS + i;
-        s[i] = S[k * LA_D + v] * decay;
-        acc += s[i] * k_s[k];
+        s[i] = __fmul_rn(S[k * LA_D + v], decay);
+        acc = __fmaf_rn(s[i], k_s[k], acc);
     }
     part[ks][v] = acc;
     __syncthreads();
@@ -158,9 +158,9 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const fl
 #pragma unroll
     for (int i = 0; i < KS; i++) {
         int k = ks * KS + i;
-        s[i] += k_s[k] * d;
+        s[i] = __fmaf_rn(k_s[k], d, s[i]);
         S[k * LA_D + v] = s[i];
-        acc += s[i] * q_s[k];
+        acc = __fmaf_rn(s[i], q_s[k], acc);
     }
     __syncthreads();
     part[ks][v] = acc;

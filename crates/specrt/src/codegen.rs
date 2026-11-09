@@ -722,6 +722,12 @@ impl Module {
             source.push_str(&render(GDN_TEMPLATE, &vars)?);
             kernels.extend_from_slice(GDN_KERNELS);
         }
+        if la.is_some() && spec.speculative().is_some() {
+            source.push('\n');
+            source.push_str(&crate::mtp::mtp_source(spec, &mut smem));
+            kernels.extend_from_slice(crate::mtp::MTP_KERNELS);
+            kernels.extend_from_slice(crate::mtp::MTP_MMA_KERNELS);
+        }
         if fp8 {
             source.push('\n');
             source.push_str(&fp8_act_kernels(spec, &mut smem));
