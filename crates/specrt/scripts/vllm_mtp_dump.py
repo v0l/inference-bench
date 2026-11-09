@@ -64,7 +64,7 @@ def main():
         ids = records[i]["prompt"]
         res = llm.generate([{"prompt_token_ids": ids}], params)
         gen = list(res[0].outputs[0].token_ids)
-        keep = calls if i < 2 else [{k: v for k, v in c.items() if k not in ("hidden", "out")} for c in calls]
+        keep = list(calls)
         torch.save({"prompt": ids, "gen": gen, "calls": keep}, out / f"vllm-mtp-{i}.pt")
         print("prompt", i, "calls", len(calls), flush=True)
     for m in llm.get_metrics():
