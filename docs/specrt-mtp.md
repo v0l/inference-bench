@@ -108,21 +108,24 @@ acceptance length = `1 + accepted / (drafted / k)`.
 
 ### State
 
-Per slot, besides KV and recurrent state: a *pending* list of up to `k + 1` normed target hiddens
-at positions `q .. q + m - 1`, whose MTP rows have not run yet because their next token was not
-known. The newest token always sits at position `q + m`.
+Per slot, besides KV and recurrent state: one *pending* target hidden (the residual before the
+final norm) for the newest computed position, and the `k` drafts made from it. `mtp_fc_in` applies
+the target's final norm (or, for chained rows, the MTP's own `mtp.norm`) and then the pre-fc norm,
+so the pending buffer holds raw residuals for both.
 
-- Prefill chunk `[s, s + n)`: after the target, the MTP runs as a prefill over positions
-  `s - 1 .. s + n - 2` (the pending row from the previous chunk, then the chunk) with tokens
-  `s .. s + n - 1`, writing its KV with `flash_mma`. The hidden at `s + n - 1` becomes pending.
-- Speculative step: MTP pass 1 over the pending rows (ragged across sequences, one batched launch
-  per kernel) gives `d_1` from each sequence's last row, then `k - 1` single-row MTP steps; the
-  target verifies `k + 1` rows per sequence; the accept kernel decides on the device; the commit
-  kernels advance the recurrent state by the accepted rows; the hiddens of the accepted rows become
-  pending.
-- Plain decode on an MTP spec (above `max_batch`): after the decode, the MTP pass 1 runs over the
-  pending rows without logits (KV only) and the decode row's hidden becomes pending, so a
-  sequence can move between plain and speculative steps.
+- Prefill chunk `[s, s + n)` (`mtp_after_prefill`): after the target, the MTP runs as a prefill over
+  positions `s - 1 .. s + n - 2` (the pending row from the previous chunk, then the chunk) with
+  tokens `s .. s + n - 1`, writing its KV with `flash_mma`. The hidden at `s + n - 1` becomes
+  pending; the drafts are dropped.
+- Speculative step (`Runtime::speculate`): if a row has no drafts yet, one MTP row (pending hidden,
+  newest token) and the chain make them. The target verifies `k + 1` rows per sequence
+  (`verify_rows`), `spec_accept` decides on the device, the commit kernels advance the recurrent
+  state by the accepted rows, then the MTP runs over the `a + 1` accepted rows (writing its KV) and
+  chains `k` new drafts from the last one.
+- Plain decode on an MTP spec (`mtp_after_decode`, above `max_batch`): after the decode the MTP
+  writes its KV for the row before and the decode row's hidden becomes pending, so a sequence can
+  move between plain and speculative steps.
+- `set_drafts` replaces a slot's drafts; the tests use it to force rejections.
 
 ### Delta-net rollback: deferred commit
 
@@ -143,9 +146,14 @@ The extra cost is one more read of the state per step (151 MB, about 0.1 ms on t
 log of 1.9 MB per sequence and row on the 27B. Rejected rows cost nothing to undo. KV needs no
 rollback: rejected positions are overwritten before they are read.
 
-Because the verify row computes exactly what `gdn_step` computes and the GEMMs give each row the
-same result whatever the other rows hold, greedy speculative output equals greedy plain output
-token for token.
+Because the verify row computes exactly what `gdn_step` computes, greedy speculative output equals
+greedy plain output token for token as long as the GEMMs pick the same tile for the verify batch as
+for plain decode (`tc` uses the `_tiny` tile, and the batched fp4/fp8 GEMVs, up to 16 rows, so up
+to 5 sequences at k = 2). Past 16 verify rows the GEMMs switch tile and K step, which sums in a
+different order: the result is still correct to the float tolerance but a near-tie can flip a
+greedy token. The tests cover 1 to 5 sequences (4 to 15 rows).
+The delta-rule multiplies and adds are written as `__fmul_rn` and `__fmaf_rn` in `gdn_step`,
+`gdn_verify` and `gdn_commit` so the compiler cannot contract them differently in the three kernels.
 
 ### KV
 
@@ -158,5 +166,51 @@ sequence's table. A request must fit `prompt + max_tokens + k` in `max_model_len
 
 Every speculating sequence drafts `k` and verifies `k + 1` rows, so the verify batch is dense
 (`rows = sequences x (k + 1)`); sequences accept different counts and only the host bookkeeping
-differs. Prefill chunks run beside speculative steps unfused (`prefill_slot` then the MTP
-catch-up).
+differs. The scheduler speculates when the decoding sequences fit `[mtp] max_batch` (default: every
+slot) and decodes plainly otherwise; prefill chunks then run in the same step through
+`prefill_slot`, unfused, because the fused step has no MTP catch-up. A row's `max_accept` caps the
+accepted drafts at what is left of `max_tokens`, so a sequence never emits past its limit; a stop
+token in the middle of an accepted run ends the sequence there and the rest is dropped.
+
+## Tests
+
+The oracle for the MTP layer is a small torch module written for this (`TinyMtp` in
+`scripts/reference.py`): transformers 5.15 has no Qwen3.5 MTP, it drops `mtp.*` on load. It is built from transformers'
+`Qwen3_5DecoderLayer` (layer type `full_attention`), `Qwen3_5RMSNorm` and the target's own
+`embed_tokens`, `rotary_emb` and `lm_head`, wired as vLLM's `Qwen3_5MultiTokenPredictor.forward`.
+The fixture `tests/fixtures/tiny-qwen3.5-mtp` is `tiny-qwen3.5-nvfp4` (NVFP4 MLPs, FP8 channel
+projections) plus `mtp.safetensors` with random bf16 weights (seed 7) and `mtp_num_hidden_layers =
+1` in its config. `reference.py tiny-mtp tests/fixtures/tiny-qwen3.5-mtp <out>` writes it the first
+time and dumps `tinymtp-prompt.*`: the target hiddens and logits for a 96-token prompt, the MTP's
+first-pass logits over all 96 positions, and the logits of the chained second draft.
+
+| test (`tests/mtp.rs` unless noted) | what it proves |
+|---|---|
+| `tiny_mtp_draft_logits_match_the_torch_reference` | first pass over the prompt plus one chained step: logits max abs 2.8e-5 (scale 3.7), both drafts equal the torch argmax |
+| `drafts_after_speculative_steps_equal_drafts_from_a_fresh_prefill_of_the_same_prefix` | after speculative steps with forced rejections the MTP KV and pending hidden are what a fresh prefill of the accepted prefix gives (k = 3) |
+| `speculative_greedy_is_identical_to_plain_greedy_for_128_tokens_over_20_prompts` | for k = 1, 2, 3: MTP drafts, oracle drafts (everything accepted), a wrong draft at each position 0..k, a rotating wrong position, random drafts; 20 prompts of 5 to 124 tokens, 128 tokens each, byte-identical to plain greedy |
+| `batched_speculation_with_different_accept_counts_matches_plain_greedy` | 4 and 5 sequences per verify batch, rotating rejection position per sequence so rows accept 0..k in the same step |
+| `rejection_sampling_follows_the_target_distribution_at_both_draft_positions` | temperature 0.3, 4,000 seeds per case: emitted token at draft position 0 against the target softmax, chi-square 30.2 on 26 dof (z 0.58), accept rate 0.352 for p(draft) 0.346; position 1 after accepting position 0, chi-square 27.1 on 24 dof, accept 0.161 for 0.166; a low-probability draft, chi-square 19.9 on 26 dof |
+| `scheduled_speculation_matches_single_sequence_greedy_and_counts_drafts` | 12 requests through the `Scheduler` on 6 slots with chunked prefill beside speculation, with and without `max_batch = 3`; output equals plain greedy, every block is returned, drafted counts match the runtime's |
+| `sched.rs` `speculative_steps_with_different_accept_counts_match_single_sequence_output_under_preemption` | fake executor that checks every KV write goes through the block table and the recurrent state position: 64 sequences, k = 1..3, every accept count 0..k seen, stop tokens inside accepted runs, preemption, `max_batch` switch to plain decode |
+| `real27b.rs` `real_27b_mtp_weights_load_from_both_checkpoints_with_fp8_dequantised_to_bf16` | the MTP layer loads from the NVFP4 and the FP8 27B checkpoints; the FP8 one is dequantised bit for bit |
+
+Mutation checks: doubling the accept probability in `spec_accept` fails the sampling test (z 314,
+accept 0.706 for 0.346); committing one row too many in `gdn_commit` fails the fresh-prefill test.
+
+The random-weight MTP of the tiny fixture predicts nothing, so its own drafts are almost never
+accepted (mean acceptance length 1.000); the oracle and forced-wrong drafts are what exercise
+acceptance and rollback on it.
+
+## Commands
+
+```
+cd crates/specrt
+PY=~/.venv-vllm/bin/python
+export SPECRT_REF_DIR=~/.cache/specrt-ref-322
+$PY scripts/reference.py tiny-mtp tests/fixtures/tiny-qwen3.5-mtp $SPECRT_REF_DIR
+cargo test --release --test mtp -- --include-ignored --test-threads=1
+cargo test --release --lib sched
+cargo test --release --test real27b real_27b_mtp_weights -- --ignored
+flock /tmp/gpu27.lock ./scripts/spec27b.sh          # BATCHES, NEW
+```

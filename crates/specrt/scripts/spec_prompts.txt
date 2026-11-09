@@ -1,0 +1,61 @@
+The history of the printing press begins in the fifteenth century, when Johannes Gutenberg combined movable metal type, oil based ink and a screw press adapted from wine making. Within fifty years presses had spread to more than two hundred cities across Europe, and printers in Venice alone had issued several thousand editions. As paper mills multiplied and type founders sold standard fonts, the cost of a book fell
+---
+def merge_sorted(a, b):
+    """Merge two sorted lists into one sorted list in linear time."""
+    out = []
+    i = j = 0
+    while i < len(a) and j < len(b):
+        if a[i] <= b[j]:
+            out.append(a[i])
+            i += 1
+        else:
+            out.append(b[j])
+            j += 1
+    out.extend(a[i:])
+
+---
+Photosynthesis converts light energy into chemical energy. In the light dependent reactions, water is split and oxygen is released, while ATP and NADPH are produced. The Calvin cycle then uses that ATP and NADPH to fix carbon dioxide into three carbon sugars, regenerating the acceptor molecule ribulose bisphosphate on each turn. Measured against the sunlight that falls on a leaf, the overall efficiency of the process is
+---
+Dear hiring committee, I am writing to apply for the position of senior network engineer. Over the past eight years I have designed and operated BGP edge routing for a regional provider, migrated two data centres to an EVPN fabric, and led the on call rotation for a team of six engineers across three time zones. In my current role
+---
+Question: A train leaves the station at 9:00 travelling at 80 km/h. A second train leaves the same station at 10:30 on the same track travelling at 120 km/h. At what time does the second train catch the first? Answer: Let t be the time in hours after 10:30. The first train has a head start of
+---
+The Treaty of Westphalia in 1648 ended the Thirty Years' War and is often described as the origin of the modern state system, because
+---
+To configure a WireGuard tunnel between two Linux hosts, first generate a key pair on each machine with
+---
+fn parse_header(input: &[u8]) -> Result<Header, Error> {
+    if input.len() < 8 {
+
+---
+In a hash table with open addressing, deletion is harder than insertion because
+---
+The recipe calls for 250 grams of flour, two eggs and a pinch of salt. First, sift the flour into a large bowl, then
+---
+SELECT customer_id, COUNT(*) AS orders
+FROM orders
+WHERE created_at >= '2024-01-01'
+
+---
+A capacitor charged to 12 volts through a 10 kilohm resistor reaches 63 percent of its final voltage after one time constant, which for a 100 microfarad capacitor is
+---
+Once upon a time, in a village at the edge of a great forest, there lived an old clockmaker who
+---
+The main difference between TCP and UDP is that
+---
+Bitcoin's proof of work adjusts its difficulty every 2016 blocks so that
+---
+import numpy as np
+
+def softmax(x):
+    """Numerically stable softmax over the last axis."""
+
+---
+The mitochondria produce most of the cell's ATP through oxidative phosphorylation, a process in which
+---
+Dear Sir or Madam, I am writing to complain about the delivery of my order number 48213, which
+---
+Translate to French: The weather is beautiful today and we are going to the beach.
+French:
+---
+The proof that there are infinitely many primes goes back to Euclid. Suppose there were only finitely many primes p1, p2, ..., pn. Then
