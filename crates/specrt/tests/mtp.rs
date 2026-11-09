@@ -262,7 +262,7 @@ fn speculative_greedy(s: &Spec, prompts: &[Vec<u32>], want: &[Vec<u32>], drafts:
                     Drafts::Mtp => None,
                     Drafts::Oracle(wrong_at) | Drafts::Wrong(wrong_at) => {
                         let mut d: Vec<u32> = (0..k).map(|j| ws[i].get(have + j).copied().unwrap_or(0)).collect();
-                        let at = if let Drafts::Wrong(_) = drafts { (have + i) % k } else { wrong_at };
+                        let at = if let Drafts::Wrong(_) = drafts { (have + i) % (k + 1) } else { wrong_at };
                         if at < k {
                             d[at] = (d[at] + 1) % 1024;
                         }
@@ -357,5 +357,8 @@ fn batched_speculation_with_different_accept_counts_matches_plain_greedy() {
         check(&format!("batch {batch}"), &got, &want);
         let (got, _) = speculative_greedy(&s, &ps, &want, Drafts::Wrong(0), batch);
         check(&format!("batch {batch}, staggered rejections"), &got, &want);
+        let (got, mean) = speculative_greedy(&s, &ps, &want, Drafts::Oracle(2), batch);
+        assert!(mean > 2.8, "oracle drafts in a batch: {mean}");
+        check(&format!("batch {batch}, oracle drafts"), &got, &want);
     }
 }
