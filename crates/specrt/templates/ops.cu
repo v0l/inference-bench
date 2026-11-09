@@ -1714,7 +1714,8 @@ __device__ __forceinline__ float order_value(unsigned k) {
 }
 
 __device__ float sample_threshold(const float* row, float inv_temp, int top_k, float top_p, float min_p, float* row_max) {
-    __shared__ unsigned hist[256];
+    __shared__ unsigned hist[2048];
+    __shared__ unsigned chunk[64];
     __shared__ float scratch[32];
     __shared__ unsigned sh_prefix;
     __shared__ int sh_need;
@@ -1728,18 +1729,31 @@ __device__ float sample_threshold(const float* row, float inv_temp, int top_k, f
     if (use_k) {
         unsigned prefix = 0, mask = 0;
         int need = top_k;
-        for (int shift = 24; shift >= 0; shift -= 8) {
-            if (threadIdx.x < 256) hist[threadIdx.x] = 0;
+        for (int pass = 0; pass < 3; pass++) {
+            int shift = pass == 0 ? 21 : (pass == 1 ? 10 : 0);
+            unsigned width_mask = pass == 2 ? 1023u : 2047u;
+            for (int i = threadIdx.x; i < 2048; i += blockDim.x) hist[i] = 0;
             __syncthreads();
             for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
                 unsigned key = order_key(row[i] * inv_temp);
-                if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1u);
+                if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & width_mask], 1u);
+            }
+            __syncthreads();
+            if (threadIdx.x < 64) {
+                unsigned c = 0;
+                for (int j = 0; j < 32; j++) c += hist[threadIdx.x * 32 + j];
+                chunk[threadIdx.x] = c;
             }
             __syncthreads();
             if (threadIdx.x == 0) {
                 int c = need;
-                int b = 255;
-                for (; b > 0; b--) {
+                int ch = 63;
+                for (; ch > 0; ch--) {
+                    if ((int)chunk[ch] >= c) break;
+                    c -= (int)chunk[ch];
+                }
+                int b = ch * 32 + 31;
+                for (; b > ch * 32; b--) {
                     if ((int)hist[b] >= c) break;
                     c -= (int)hist[b];
                 }
@@ -1749,7 +1763,7 @@ __device__ float sample_threshold(const float* row, float inv_temp, int top_k, f
             __syncthreads();
             need = sh_need;
             prefix = sh_prefix;
-            mask |= 0xffu << shift;
+            mask |= width_mask << shift;
         }
         thr = order_value(prefix);
     }

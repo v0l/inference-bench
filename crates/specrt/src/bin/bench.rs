@@ -29,8 +29,12 @@ fn main() -> Result<()> {
     if speculative {
         args.remove(0);
     }
+    let sampled = args.first().is_some_and(|a| a == "--sampled");
+    if sampled {
+        args.remove(0);
+    }
     let mut args = args.into_iter();
-    let usage = "usage: bench [--speculative] <spec.toml | checkpoint dir> [prompt_len[,prompt_len..]] [new_tokens] [batch]";
+    let usage = "usage: bench [--speculative] [--sampled] <spec.toml | checkpoint dir> [prompt_len[,prompt_len..]] [new_tokens] [batch]";
     let spec_path = PathBuf::from(args.next().context(usage)?);
     let prompts: Vec<usize> = args
         .next()
@@ -46,7 +50,7 @@ fn main() -> Result<()> {
         return bench_spec(&spec, new_tokens, batch.max(1), longest);
     }
     if std::env::var_os("SPECRT_BENCH_SERVE").is_some() {
-        return bench_serve(&spec, longest, new_tokens, batch.max(1));
+        return bench_serve(&spec, longest, new_tokens, batch.max(1), sampled);
     }
     if batch > 0 {
         return bench_batch(&spec, longest, new_tokens, batch);
@@ -166,7 +170,7 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
     Ok(())
 }
 
-fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize) -> Result<()> {
+fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize, sampled: bool) -> Result<()> {
     use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
     let max_ctx = prompt_len + new_tokens + 16;
     let layout = specrt::runtime::Layout::serving(spec, max_ctx, batch, None);
@@ -175,7 +179,8 @@ fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize) 
     for round in 0..runs() {
         for s in 0..batch as u32 {
             let prompt = (0..prompt_len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect();
-            sched.submit(Request { prompt, max_tokens: new_tokens, sampling: Sampling::GREEDY, stop: vec![] })?;
+            let sampling = if sampled { Sampling::new(1.0, 100 + s).truncated(20, 0.95, 0.0) } else { Sampling::GREEDY };
+            sched.submit(Request { prompt, max_tokens: new_tokens, sampling, stop: vec![] })?;
         }
         let (mut decode_secs, mut decode_tokens, mut prefill_secs, mut steps) = (0.0, 0, 0.0, 0);
         let started = std::time::Instant::now();
