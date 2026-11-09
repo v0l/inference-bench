@@ -121,6 +121,16 @@ pub fn render(s: &Stats) -> String {
         s.preemptions
     );
     let _ = writeln!(o, "# TYPE inference_steps_total counter\ninference_steps_total {}", s.steps);
+    let _ = writeln!(
+        o,
+        "# HELP inference_spec_drafted_tokens_total MTP draft tokens proposed for verification.\n# TYPE inference_spec_drafted_tokens_total counter\ninference_spec_drafted_tokens_total {}",
+        s.spec_drafted
+    );
+    let _ = writeln!(
+        o,
+        "# HELP inference_spec_accepted_tokens_total MTP draft tokens the target accepted.\n# TYPE inference_spec_accepted_tokens_total counter\ninference_spec_accepted_tokens_total {}",
+        s.spec_accepted
+    );
     histogram(&mut o, "inference_queue_seconds", "Time from arrival to the first scheduled step.", &s.queue_secs);
     histogram(&mut o, "inference_inter_token_seconds", "Time between streamed tokens of one sequence.", &s.inter_token_secs);
     histogram(&mut o, "inference_batch_size", "Decode rows per step.", &s.decode_batch);
@@ -135,7 +145,7 @@ mod tests {
 
     #[test]
     fn serving_stats_render_as_prometheus_text() {
-        let mut s = Stats { running: 3, waiting: 2, kv_blocks_used: 40, kv_blocks_total: 100, preemptions: 1, ..Stats::default() };
+        let mut s = Stats { running: 3, waiting: 2, kv_blocks_used: 40, kv_blocks_total: 100, preemptions: 1, spec_drafted: 10, spec_accepted: 7, ..Stats::default() };
         s.inter_token_secs.observe(0.03);
         s.inter_token_secs.observe(0.3);
         let t = render(&s);
@@ -144,6 +154,8 @@ mod tests {
             "inference_waiting_seqs 2",
             "inference_kv_blocks_used 40",
             "inference_preemptions_total 1",
+            "inference_spec_drafted_tokens_total 10",
+            "inference_spec_accepted_tokens_total 7",
             "inference_inter_token_seconds_bucket{le=\"0.035\"} 1",
             "inference_inter_token_seconds_bucket{le=\"+Inf\"} 2",
             "inference_prefill_tokens_per_step_count 0",

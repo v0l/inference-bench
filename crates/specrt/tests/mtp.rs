@@ -188,6 +188,46 @@ fn rejection_sampling_follows_the_target_distribution_at_both_draft_positions() 
     }
 }
 
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn scheduled_speculation_matches_single_sequence_greedy_and_counts_drafts() {
+    use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
+    let s = spec(2);
+    let ps: Vec<Vec<u32>> = (0..12).map(|i| prompt(i * 3 + 1)).collect();
+    let want = plain_greedy(&s, &ps);
+    for cap in [None, Some(3)] {
+        let mut sp = s.clone();
+        sp.mtp.as_mut().unwrap().max_batch = cap;
+        let pages = 512usize.div_ceil(specrt::codegen::PAGE);
+        let lay = Layout { max_ctx: 512, slots: 6, kv_blocks: 6 * pages, prefill_chunk: 64, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
+        let rt = Runtime::load_layout(&sp, lay).unwrap();
+        let mut sched = Scheduler::new(GpuExecutor::new(rt).unwrap(), Config { max_num_seqs: 6, max_batched_tokens: 128, ..Config::default() });
+        let ids: Vec<u64> = ps
+            .iter()
+            .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: NEW, sampling: Sampling::GREEDY, stop: vec![] }).unwrap())
+            .collect();
+        let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+        let (mut drafted, mut accepted) = (0, 0);
+        while !sched.idle() {
+            let mut events = Vec::new();
+            let r = sched.step(&mut events).unwrap();
+            drafted += r.drafted;
+            accepted += r.accepted;
+            for e in events {
+                if let Event::Token { id, token } = e {
+                    got.entry(id).or_default().push(token);
+                }
+            }
+        }
+        let stats = sched.exec.rt.spec_stats();
+        eprintln!("cap {cap:?}: {} speculative steps, drafted {drafted}, accepted {accepted}", stats.steps);
+        assert!(stats.steps > 0 && drafted as u64 == stats.drafted);
+        let ordered: Vec<Vec<u32>> = ids.iter().map(|id| got[id].clone()).collect();
+        check(&format!("scheduled, cap {cap:?}"), &ordered, &want);
+        assert_eq!(sched.blocks_used(), 0);
+    }
+}
+
 const PROMPTS: usize = 20;
 const NEW: usize = 128;
 

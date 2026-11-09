@@ -3,6 +3,33 @@ use crate::runtime::{Layout, Runtime, Sampling, kv_block_bytes};
 use crate::sched::{self, Config, Event, Finish, GpuExecutor, Scheduler, SeqId};
 use crate::spec::Spec;
 pub use crate::spec::{RuntimeOptions, TileChoice};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpeculativeOptions {
+    pub enabled: Option<bool>,
+    pub draft_tokens: Option<usize>,
+    pub max_batch: Option<usize>,
+}
+
+impl SpeculativeOptions {
+    pub fn apply(&self, spec: &mut Spec) -> Result<()> {
+        let Some(m) = spec.mtp.as_mut() else {
+            anyhow::ensure!(self.enabled != Some(true), "[speculative] enabled = true but {} has no [mtp] layer", spec.name);
+            return Ok(());
+        };
+        if let Some(on) = self.enabled {
+            m.speculate = on;
+        }
+        if let Some(k) = self.draft_tokens {
+            m.draft_tokens = k;
+        }
+        if self.max_batch.is_some() {
+            m.max_batch = self.max_batch;
+        }
+        spec.validate().context("[speculative]")
+    }
+}
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -22,6 +49,7 @@ pub struct ServeOptions {
     pub max_batched_tokens: usize,
     pub itl_target: Duration,
     pub runtime: Option<RuntimeOptions>,
+    pub speculative: SpeculativeOptions,
 }
 
 impl Default for ServeOptions {
@@ -33,6 +61,7 @@ impl Default for ServeOptions {
             max_batched_tokens: 8192,
             itl_target: Duration::from_millis(100),
             runtime: None,
+            speculative: SpeculativeOptions::default(),
         }
     }
 }
@@ -82,6 +111,8 @@ pub struct Stats {
     pub kv_blocks_total: usize,
     pub kv_block_tokens: usize,
     pub preemptions: u64,
+    pub spec_drafted: u64,
+    pub spec_accepted: u64,
     pub steps: u64,
     pub queue_secs: Histogram,
     pub inter_token_secs: Histogram,
@@ -99,6 +130,8 @@ impl Default for Stats {
             kv_blocks_total: 0,
             kv_block_tokens: crate::codegen::PAGE,
             preemptions: 0,
+            spec_drafted: 0,
+            spec_accepted: 0,
             steps: 0,
             queue_secs: Histogram::new(&LATENCY_BUCKETS),
             inter_token_secs: Histogram::new(&LATENCY_BUCKETS),
@@ -206,6 +239,7 @@ fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
     if let Some(r) = &opts.runtime {
         spec.runtime = r.clone();
     }
+    opts.speculative.apply(&mut spec)?;
     let spec = &spec;
     let layout = opts.layout(spec);
     let rt = Runtime::load_layout(spec, layout)?;
@@ -313,6 +347,8 @@ fn run(sched: &mut Scheduler<GpuExecutor>, inbox: Receiver<Job>, stats: Arc<Mute
         let mut s = stats.lock().unwrap();
         if let Some(r) = report {
             s.steps += 1;
+            s.spec_drafted += r.drafted as u64;
+            s.spec_accepted += r.accepted as u64;
             s.step_secs.observe(started.elapsed().as_secs_f64());
             if r.decode_rows > 0 {
                 s.decode_batch.observe(r.decode_rows as f64);

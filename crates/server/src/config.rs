@@ -139,6 +139,7 @@ pub struct ServerConfig {
     pub max_batched_tokens: Option<usize>,
     pub itl_target_ms: Option<u64>,
     pub runtime: Option<inference_bench_core::specrt_serve::RuntimeOptions>,
+    pub speculative: inference_bench_core::specrt_serve::SpeculativeOptions,
 }
 
 impl Default for ServerConfig {
@@ -172,6 +173,7 @@ impl Default for ServerConfig {
             max_batched_tokens: None,
             itl_target_ms: None,
             runtime: None,
+            speculative: Default::default(),
         }
     }
 }
@@ -279,6 +281,7 @@ impl ServerConfig {
             max_batched_tokens: self.max_batched_tokens.unwrap_or(d.max_batched_tokens),
             itl_target: self.itl_target_ms.map(std::time::Duration::from_millis).unwrap_or(d.itl_target),
             runtime: self.runtime.clone(),
+            speculative: self.speculative,
         })
     }
 
@@ -407,6 +410,19 @@ python = "python3"
         assert_eq!(c.serve_options(&c.models[0]).unwrap().max_model_len, 8192);
         assert!(ServerConfig::parse("max_model_len = 300000").is_err());
         assert!(ServerConfig::parse("max_num_seqs = 0").is_err());
+    }
+
+    #[test]
+    fn the_speculative_table_reaches_the_serving_options() {
+        use inference_bench_core::specrt_serve::SpeculativeOptions;
+        let c = ServerConfig::parse("max_num_seqs = 4\n[speculative]\ndraft_tokens = 3\nmax_batch = 2\n[[models]]\nid='m'").unwrap();
+        let o = c.serve_options(&c.models[0]).unwrap();
+        assert_eq!(o.speculative, SpeculativeOptions { enabled: None, draft_tokens: Some(3), max_batch: Some(2) });
+        let off = ServerConfig::parse("max_num_seqs = 4\n[speculative]\nenabled = false\n[[models]]\nid='m'").unwrap();
+        assert_eq!(off.serve_options(&off.models[0]).unwrap().speculative.enabled, Some(false));
+        let plain = ServerConfig::parse("max_num_seqs = 4\n[[models]]\nid='m'").unwrap();
+        assert_eq!(plain.serve_options(&plain.models[0]).unwrap().speculative, SpeculativeOptions::default());
+        assert!(ServerConfig::parse("[speculative]\nk = 2").is_err());
     }
 
     #[test]
