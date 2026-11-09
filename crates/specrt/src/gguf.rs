@@ -383,7 +383,7 @@ impl Gguf {
             head_quant: None,
             act_quant: ActQuant::None,
             dims: Dims { hidden, intermediate, vocab: embd.rows(), tie_embeddings: tied },
-            layers: Layers { count: layers, pattern: vec![Block::Dense] },
+            layers: Layers { count: layers, pattern: vec![Block::Dense], window: None },
             norm: Norm { kind: NormKind::Rmsnorm, eps, unit_offset: false },
             attention: Attention {
                 kind: AttentionKind::Gqa,
