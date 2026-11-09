@@ -329,18 +329,30 @@ fn nvfp4_logits_and_greedy_match_transformers() {
     logits_and_greedy_match_reference(NVFP4, "tinynvfp4");
 }
 
-#[test]
-#[ignore = "needs a CUDA GPU"]
-fn nvfp4_batch_decode_matches_single_sequence_greedy() {
-    let s = spec_for(NVFP4);
+fn batch_decode_matches_single_sequence_greedy(dir: &str, batch: u32) {
+    let s = spec_for(dir);
     let prompts: Vec<Vec<u32>> =
-        (0..4u32).map(|q| (0..40u32).map(|i| (i * 7 + q * 131) % 1024).collect()).collect();
+        (0..batch).map(|q| (0..40u32).map(|i| (i * 7 + q * 131) % 1024).collect()).collect();
     let mut single = Runtime::load(&s, 256).unwrap();
     let expected: Vec<Vec<u32>> =
         prompts.iter().map(|p| single.generate(p, 24, Sampling::GREEDY).unwrap().tokens).collect();
     drop(single);
-    let mut batch = Runtime::load_batched(&s, 256, 4).unwrap();
-    assert_eq!(batch.generate_batch(&prompts, 24).unwrap().tokens, expected);
+    let mut batched = Runtime::load_batched(&s, 256, batch as usize).unwrap();
+    assert_eq!(batched.generate_batch(&prompts, 24).unwrap().tokens, expected, "batch {batch}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn nvfp4_batch_decode_matches_single_sequence_greedy() {
+    batch_decode_matches_single_sequence_greedy(NVFP4, 4);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn nvfp4_batch_2_8_16_decode_matches_single_sequence_greedy() {
+    for batch in [2, 8, 16] {
+        batch_decode_matches_single_sequence_greedy(NVFP4, batch);
+    }
 }
 
 #[test]

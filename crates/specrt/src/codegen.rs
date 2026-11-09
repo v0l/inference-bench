@@ -62,8 +62,70 @@ pub const FP4_KERNELS: &[&str] = &[
     "down_f4w_big",
     "down_f4w_narrow",
     "down_f4w_tiny",
+    "gate_up_f4b8",
+    "gate_up_f4b16",
+    "gate_up_f4b_reduce",
+    "down_f4b8",
+    "down_f4b16",
+    "down_f4b_reduce",
 ];
 const FP4_STAGES: usize = 3;
+pub const FP4_BATCH_TEMPLATE: &str = include_str!("../templates/fp4_batch.cu");
+pub const F4B_MAX_TOKENS: usize = 16;
+pub const F4B_WARPS: usize = 4;
+pub const F4B_MJ: usize = 2;
+pub const F4B_ROWS: usize = F4B_WARPS * F4B_MJ * 16;
+pub const F4B_KC: usize = 128;
+const F4B_STAGES: usize = 3;
+pub const F4B_REDUCE_BLOCK: usize = 256;
+pub const F4B_BLOCKS_PER_SM: usize = 4;
+
+pub fn f4b_tokens(tokens: usize) -> usize {
+    if tokens <= 8 { 8 } else { 16 }
+}
+
+pub fn f4b_smem(tokens: usize) -> u32 {
+    (F4B_STAGES * f4b_tokens(tokens) * F4B_KC * 2 * 2) as u32
+}
+
+pub fn f4b_splits(n: usize, k: usize, sms: usize) -> usize {
+    let blocks = n.div_ceil(F4B_ROWS);
+    let most = (k / F4B_KC / 4).max(1);
+    let wave = F4B_BLOCKS_PER_SM * sms;
+    let fill = |s: usize| (blocks * s) as f64 / ((blocks * s).div_ceil(wave) * wave) as f64;
+    (1..=most).find(|&s| blocks * s >= wave && fill(s) >= 0.85).unwrap_or(most)
+}
+
+fn fp4_batch_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Result<String> {
+    let mut kernels = String::new();
+    for linear in ["gate_up", "down"] {
+        let (n, k, epi, _) = linear_dims(spec, linear);
+        let find = |name: String| FP4_KERNELS.iter().copied().find(|x| *x == name).expect("listed in FP4_KERNELS");
+        for tokens in [8, 16] {
+            let name = find(format!("{linear}_f4b{tokens}"));
+            smem.insert(name, f4b_smem(tokens));
+            kernels.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}, {F4B_BLOCKS_PER_SM}) {name}(const void* w, const unsigned char* s, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, float* part, int tokens, int splits) {{\n    gemv_f4b<{n}, {k}, {epi}, {nt}>(w, s, xh, xl, out, oh, ol, part, tokens, splits);\n}}\n\n",
+                threads = F4B_WARPS * 32,
+                nt = tokens / 8,
+            ));
+        }
+        let reduce = find(format!("{linear}_f4b_reduce"));
+        kernels.push_str(&format!(
+            "extern \"C\" __global__ void {reduce}(const float* part, float* out, bf16_t* oh, bf16_t* ol, int tokens, int splits) {{\n    f4b_reduce<{n}, {epi}>(part, out, oh, ol, tokens, splits);\n}}\n\n"
+        ));
+    }
+    let vars: BTreeMap<&str, String> = [
+        ("F4B_WARPS", F4B_WARPS.to_string()),
+        ("F4B_MJ", F4B_MJ.to_string()),
+        ("F4B_KC", F4B_KC.to_string()),
+        ("F4B_STAGES", F4B_STAGES.to_string()),
+        ("F4B_KERNELS", kernels),
+    ]
+    .into_iter()
+    .collect();
+    render(FP4_BATCH_TEMPLATE, &vars)
+}
 const F4W_BK: usize = 64;
 const F4W_ROW: usize = 48;
 
@@ -565,6 +627,8 @@ impl Module {
             fp4_vars.insert("F4A_SOURCE", if act { fp4_act_kernels(spec, &mut smem) } else { String::new() });
             source.push('\n');
             source.push_str(&render(FP4_TEMPLATE, &fp4_vars)?);
+            source.push('\n');
+            source.push_str(&fp4_batch_kernels(spec, &mut smem)?);
             kernels.extend_from_slice(FP4_KERNELS);
             if act {
                 kernels.extend_from_slice(FP4_ACT_KERNELS);

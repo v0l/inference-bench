@@ -294,6 +294,7 @@ pub struct Runtime {
     gdn: Option<GdnBuffers>,
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
+    f4b_part: CudaSlice<f32>,
     chunk: usize,
     prefill_limit: usize,
     use_mma: bool,
@@ -559,12 +560,22 @@ impl Runtime {
         } else {
             None
         };
+        let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
+        let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) {
+            use crate::codegen::{F4B_MAX_TOKENS, f4b_splits};
+            let (h, i) = (d.hidden, 2 * d.intermediate);
+            let most = (f4b_splits(i, h, sms as usize) * i).max(f4b_splits(h, d.intermediate, sms as usize) * h);
+            stream.alloc_zeros(most * F4B_MAX_TOKENS)?
+        } else {
+            stream.alloc_zeros(1)?
+        };
         let mut rt = Runtime {
             smem,
             pre,
             gdn,
             fp8_act,
             fp4_act,
+            f4b_part,
             chunk,
             prefill_limit,
             seq: 0,
@@ -573,9 +584,7 @@ impl Runtime {
             pages,
             kv_blocks: layout.kv_blocks,
             tables: vec![0; (layout.slots + 1) * pages],
-            sms: ctx.attribute(
-                cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-            )? as u32,
+            sms,
             use_mma,
             spec: spec.clone(),
             max_ctx,
@@ -910,6 +919,9 @@ impl Runtime {
         if let (Some(fa), DeviceMatrix::Fp4 { .. }, false) = (&self.fp4_act, w, suffix == "_tiny") {
             return self.tc_fp4(fa, name, w, x, out, rows, tokens, suffix, tile);
         }
+        if let (DeviceMatrix::Fp4 { .. }, true) = (w, suffix == "_tiny" && tokens <= crate::codegen::F4B_MAX_TOKENS) {
+            return self.tc_f4b(name, w, x, out, rows, tokens);
+        }
         let kernel = match w {
             DeviceMatrix::Fp4 { .. } => format!("{name}_f4w{suffix}"),
             _ => format!("{name}_mma{suffix}"),
@@ -929,6 +941,54 @@ impl Runtime {
             shared_mem_bytes: self.smem[kernel.as_str()],
         };
         unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn tc_f4b(
+        &self,
+        name: &str,
+        w: &DeviceMatrix,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        use crate::codegen::{F4B_REDUCE_BLOCK, F4B_ROWS, f4b_smem, f4b_splits, f4b_tokens};
+        let DeviceMatrix::Fp4 { packed, .. } = w else { unreachable!("tc_f4b takes NVFP4 weights") };
+        let width = packed.len() * 2 / rows;
+        let splits = f4b_splits(rows, width, self.sms as usize);
+        let (n, s) = (tokens as i32, splits as i32);
+        let kernel = format!("{name}_f4b{}", f4b_tokens(tokens));
+        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        w.args(&mut b, &self.buf.dummy);
+        b.arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        b.arg(&self.f4b_part).arg(&n).arg(&s);
+        let config = LaunchConfig {
+            grid_dim: (grid(rows, F4B_ROWS), splits as u32, 1),
+            block_dim: ((crate::codegen::F4B_WARPS * 32) as u32, 1, 1),
+            shared_mem_bytes: f4b_smem(tokens),
+        };
+        unsafe { b.launch(config) }?;
+        if splits == 1 {
+            return Ok(());
+        }
+        let reduce = format!("{name}_f4b_reduce");
+        let mut b = self.stream.launch_builder(self.kernel(&reduce));
+        b.arg(&self.f4b_part);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        let outs = match out {
+            GemmOut::Planes(_) => tokens * rows / 2,
+            GemmOut::F32(_) => tokens * rows,
+        };
+        b.arg(&n).arg(&s);
+        unsafe { b.launch(cfg(grid(outs, F4B_REDUCE_BLOCK), F4B_REDUCE_BLOCK as u32)) }?;
         Ok(())
     }
 
