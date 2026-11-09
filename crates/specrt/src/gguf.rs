@@ -374,6 +374,11 @@ impl Gguf {
         let embd = self.tensor("token_embd.weight").context("the GGUF file has no token_embd.weight")?;
         ensure!(embd.shape == [embd.rows(), hidden], "token_embd.weight has shape {:?}, expected [vocab, {hidden}]", embd.shape);
         let tied = !self.tensors.contains_key("output.weight");
+        let mut unsupported: Vec<String> = self.tensors.values().filter(|t| t.kind.block().is_none()).map(|t| format!("{} ({})", t.name, t.kind.name())).collect();
+        unsupported.sort();
+        if let Some(first) = unsupported.first() {
+            bail!("GGUF tensor type is not supported: {first} and {} more (F32, F16, BF16, Q8_0, Q4_K, Q5_K and Q6_K are)", unsupported.len() - 1);
+        }
         let quant = self.weight_quant();
         let spec = Spec {
             name: self.string("general.name").unwrap_or(arch).to_lowercase().replace(' ', "-"),
@@ -776,9 +781,8 @@ pub fn q8_0_split(data: &[u8]) -> (Vec<i8>, Vec<f32>) {
     (values, scales)
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
+pub mod writer {
+    use super::DEFAULT_ALIGNMENT;
 
     pub enum Kv<'a> {
         U8(u8),
@@ -868,6 +872,12 @@ pub(crate) mod tests {
         }
         out
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::writer::*;
+    use super::*;
 
     #[test]
     fn every_metadata_type_and_array_round_trips() {

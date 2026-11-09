@@ -203,7 +203,7 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
                     backend_chip(ui, &m, b);
                 }
             });
-            if let Some(why) = m.support.iter().find(|s| !s.supported && s.backend == "specrt" && m.format != library::Format::Gguf) {
+            if let Some(why) = m.support.iter().find(|s| !s.supported && s.backend == "specrt") {
                 Line::new().note(format!("specrt: {}", why.reason)).size(10.5).elided(ui);
             }
             if let Some(origin) = &m.origin {

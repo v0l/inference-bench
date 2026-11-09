@@ -66,8 +66,8 @@ impl LocalModel {
     pub fn model_id(&self, backend: &str) -> String {
         match (backend, self.format) {
             ("specrt", Format::Spec) => self.path.display().to_string(),
+            ("specrt" | "llama.cpp", Format::Gguf) => self.path.display().to_string(),
             ("specrt" | "vllm", _) if !self.repo.is_empty() => self.repo.clone(),
-            ("llama.cpp", Format::Gguf) => self.path.display().to_string(),
             _ => self.name.clone(),
         }
     }
@@ -181,10 +181,10 @@ const LLAMA_CPP_ARCHS: [&str; 22] = [
     "mixtral", "starcoder2", "command-r",
 ];
 
-fn support_for_gguf(arch: &str) -> Vec<Support> {
+fn support_for_gguf(arch: &str, files: &[PathBuf]) -> Vec<Support> {
     let known = LLAMA_CPP_ARCHS.contains(&arch);
     vec![
-        Support::no("specrt", "specrt reads safetensors, not GGUF"),
+        specrt_gguf_support(files),
         if known {
             Support::yes("llama.cpp", "architecture is registered")
         } else {
@@ -196,6 +196,17 @@ fn support_for_gguf(arch: &str) -> Vec<Support> {
             Support::no("vllm", format!("GGUF architecture '{arch}' is not supported"))
         },
     ]
+}
+
+fn specrt_gguf_support(files: &[PathBuf]) -> Support {
+    let [file] = files else { return Support::no("specrt", "split GGUF files are not read by specrt") };
+    match specrt::gguf::Gguf::open(file).and_then(|g| g.spec().map(|_| g.weight_type_bytes())) {
+        Ok(types) => {
+            let names: Vec<String> = types.iter().map(|(k, _)| k.name()).collect();
+            Support { backend: "specrt", supported: true, reason: format!("GGUF {}", names.join(" + ")) }
+        }
+        Err(e) => Support::no("specrt", e.root_cause().to_string()),
+    }
 }
 
 fn dir_size(files: &[PathBuf]) -> u64 {
@@ -389,7 +400,7 @@ fn gguf_models(dir: &Path, repo: &str, root: &Path, found: &mut Vec<LocalModel>)
             size_bytes: dir_size(&shards),
             quant: gguf_quant(h.file_type, &stem),
             context_length: h.context_length,
-            support: support_for_gguf(&h.architecture),
+            support: support_for_gguf(&h.architecture, &shards),
             architecture: h.architecture,
             files: shards,
             origin: None,
@@ -715,6 +726,42 @@ mod tests {
         let m = &scan_hub(&hub)[0];
         assert_eq!(m.quant, "FP8");
         assert!(m.support_for("specrt").unwrap().reason.contains("fp8"));
+    }
+
+    #[test]
+    fn specrt_supports_a_dense_qwen3_gguf_and_names_an_unsupported_type() {
+        use specrt::gguf::writer::{Kv, build};
+        let hub = temp("specrt-gguf");
+        let snap = hub.join("models--unsloth--Tiny-GGUF/snapshots/abc");
+        std::fs::create_dir_all(&snap).unwrap();
+        let file = |weight_type: u32, weight: &[u8]| {
+            let embd = vec![0u8; 2 * 256 * 4];
+            build(
+                3,
+                &[
+                    ("general.architecture", Kv::Str("qwen3")),
+                    ("qwen3.block_count", Kv::U32(1)),
+                    ("qwen3.embedding_length", Kv::U32(256)),
+                    ("qwen3.feed_forward_length", Kv::U32(256)),
+                    ("qwen3.attention.head_count", Kv::U32(2)),
+                    ("qwen3.attention.head_count_kv", Kv::U32(1)),
+                    ("qwen3.attention.key_length", Kv::U32(128)),
+                    ("qwen3.attention.layer_norm_rms_epsilon", Kv::F32(1e-6)),
+                    ("general.file_type", Kv::U32(15)),
+                ],
+                &[("token_embd.weight", &[256, 4], 1, &embd[..]), ("blk.0.ffn_down.weight", &[256, 256], weight_type, weight)],
+            )
+        };
+        std::fs::write(snap.join("Tiny-Q4_K_M.gguf"), file(12, &vec![0u8; 256 * 144])).unwrap();
+        std::fs::write(snap.join("Tiny-Q4_0.gguf"), file(2, &vec![0u8; 256 * 8 * 18])).unwrap();
+        let models = scan_hub(&hub);
+        let find = |q: &str| models.iter().find(|m| m.path.to_string_lossy().contains(q)).unwrap();
+        let good = find("Q4_K_M");
+        let s = good.support_for("specrt").unwrap();
+        assert!(s.supported && s.reason.contains("Q4_K"), "{}", s.reason);
+        assert_eq!(good.model_id("specrt"), good.path.display().to_string());
+        let bad = find("Q4_0").support_for("specrt").unwrap();
+        assert!(!bad.supported && bad.reason.contains("Q4_0") && bad.reason.contains("not supported"), "{}", bad.reason);
     }
 
     #[test]

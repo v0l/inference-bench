@@ -13,6 +13,7 @@ use std::path::Path;
 pub enum Source {
     SpecToml,
     HfConfig,
+    GgufMetadata,
 }
 
 impl Source {
@@ -20,6 +21,7 @@ impl Source {
         match self {
             Source::SpecToml => "spec TOML",
             Source::HfConfig => "config.json",
+            Source::GgufMetadata => "GGUF metadata",
         }
     }
 }
@@ -48,7 +50,12 @@ impl View {
 
     pub fn load(m: &LocalModel) -> Result<View, String> {
         match m.format {
-            Format::Gguf => Err("GGUF files carry no layer spec, so there is nothing to draw".into()),
+            Format::Gguf => {
+                let g = specrt::gguf::Gguf::open(&m.path).map_err(|e| format!("{e:#}"))?;
+                let mut spec = g.spec().map_err(|e| format!("{e:#}"))?;
+                spec.name = m.name.clone();
+                Ok(View::new(&m.name, spec, Source::GgufMetadata, 0, m.context_length.map(|c| c as usize)))
+            }
             Format::Spec => {
                 let spec = Spec::load(&m.path).map_err(|e| format!("{e:#}"))?;
                 let cfg = m.files.first().and_then(|f| f.parent()).map(|d| d.join("config.json"));
@@ -139,7 +146,7 @@ fn pick_compare(app: &App, detail: &mut Detail, ui: &mut egui::Ui) {
     let mut chosen = detail.compare.clone().unwrap_or_default();
     let mut options = vec![(String::new(), "no comparison".to_string())];
     for m in &app.library {
-        if m.format != Format::Gguf && m.name != detail.model {
+        if m.name != detail.model {
             options.push((m.name.clone(), m.name.clone()));
         }
     }

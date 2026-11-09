@@ -752,6 +752,35 @@ fn the_detail_view_draws_the_tiny_fixture_and_hovering_a_cell_shows_its_tooltip(
 }
 
 #[test]
+fn a_gguf_model_opens_a_detail_view_from_its_metadata() {
+    use specrt::gguf::writer::{Kv, build};
+    let d = dir("detail-gguf");
+    std::fs::create_dir_all(&d).unwrap();
+    let path = d.join("Tiny-Q8_0.gguf");
+    let embd = vec![0u8; 2 * 256 * 4];
+    let bytes = build(
+        3,
+        &[
+            ("general.architecture", Kv::Str("llama")),
+            ("llama.block_count", Kv::U32(3)),
+            ("llama.embedding_length", Kv::U32(256)),
+            ("llama.feed_forward_length", Kv::U32(512)),
+            ("llama.attention.head_count", Kv::U32(4)),
+            ("llama.attention.head_count_kv", Kv::U32(2)),
+            ("llama.attention.layer_norm_rms_epsilon", Kv::F32(1e-5)),
+        ],
+        &[("token_embd.weight", &[256, 4], 1, &embd[..])],
+    );
+    std::fs::write(&path, bytes).unwrap();
+    let mut m = model("Tiny Q8_0", true, "GGUF Q8_0");
+    (m.format, m.path, m.files) = (Format::Gguf, path.clone(), vec![path]);
+    let view = detail::View::load(&m).unwrap();
+    assert_eq!(view.source, detail::Source::GgufMetadata);
+    assert_eq!((view.spec.layers.count, view.spec.dims.hidden, view.spec.attention.kv_heads), (3, 256, 2));
+    assert_eq!(view.anatomy.layers.len(), 3);
+}
+
+#[test]
 fn the_detail_view_draws_the_27b_with_its_delta_net_rhythm_and_opens_a_block_diagram() {
     let mut h = detail_harness("detail-27b", egui::vec2(1280.0, 900.0), detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), None);
     h.run();
