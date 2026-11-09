@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const SPEC_FORMAT: u32 = 5;
+pub const SPEC_FORMAT: u32 = 6;
 
 pub const EMBEDDED: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/embedded_specs.rs"));
 
@@ -285,6 +285,8 @@ pub struct Spec {
     pub min_engine: u32,
     pub repo: String,
     pub quant: Quant,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_quant: Option<Quant>,
     #[serde(default, skip_serializing_if = "ActQuant::is_none")]
     pub act_quant: ActQuant,
     pub dims: Dims,
@@ -557,6 +559,7 @@ impl Spec {
             min_engine: 0,
             repo: String::new(),
             quant,
+            head_quant: None,
             act_quant: ActQuant::None,
             dims: Dims {
                 hidden: hf.hidden_size,
@@ -592,6 +595,16 @@ impl Spec {
 
     pub fn validate(&self) -> Result<()> {
         self.runtime.validate()?;
+        match self.head_quant {
+            None | Some(Quant::Bf16) => {}
+            Some(Quant::Fp8Channel) => {
+                ensure!(self.dims.hidden.is_multiple_of(128), "head_quant = \"fp8_channel\" needs hidden to be a multiple of 128")
+            }
+            Some(Quant::Nvfp4G16) => {
+                ensure!(self.dims.hidden.is_multiple_of(64), "head_quant = \"nvfp4_g16\" needs hidden to be a multiple of 64")
+            }
+            Some(h) => bail!("head_quant {h:?} is not supported (bf16, fp8_channel and nvfp4_g16 are)"),
+        }
         match self.act_quant {
             ActQuant::None => {}
             ActQuant::Fp8 => ensure!(self.quant.is_fp8(), "act_quant = \"fp8\" needs fp8 weights (quant = \"fp8_block128\" or \"fp8_channel\")"),
@@ -729,6 +742,14 @@ impl Spec {
             tracing::warn!(spec = %s.name, var, "{var} is a development override and is deprecated; set it in the spec (act_quant, [mlp] act_quant or [runtime]) or the server config");
         }
         s
+    }
+
+    pub fn lm_head_quant(&self) -> Quant {
+        match self.head_quant {
+            Some(q) => q,
+            None if self.quant.quantised_checkpoint() => Quant::Bf16,
+            None => self.quant,
+        }
     }
 
     pub fn mlp_quant(&self, layer: usize) -> Quant {

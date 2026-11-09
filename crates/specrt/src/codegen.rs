@@ -154,6 +154,36 @@ fn fp4_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
     }
     out
 }
+pub const FP4_HEAD_TEMPLATE: &str = include_str!("../templates/fp4_head.cu");
+pub const FP4_HEAD_KERNELS: &[&str] =
+    &["lm_head_norm_f4", "lm_head_f4w", "lm_head_f4w_big", "lm_head_f4w_narrow", "lm_head_f4w_tiny"];
+
+pub fn fp4_head_rows(vocab: usize) -> usize {
+    if vocab.is_multiple_of(2) { 2 } else { 1 }
+}
+
+fn fp4_head_source(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Result<String> {
+    let (n, k) = (spec.dims.vocab, spec.dims.hidden);
+    let mut gemms = String::new();
+    for suffix in MMA_VARIANTS {
+        let t = Tile::variant(suffix, &spec.runtime);
+        let name = format!("lm_head_f4w{suffix}");
+        let name = FP4_HEAD_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_HEAD_KERNELS");
+        smem.insert(name, f4w_smem(t));
+        gemms.push_str(&format!(
+            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_f4w<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP4_STAGES}, EPI_STORE>(w, s, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+            threads = t.threads(),
+            bm = t.bm,
+            bn = t.bn,
+            wm = t.wm,
+            wn = t.wn,
+        ));
+    }
+    let vars: BTreeMap<&str, String> =
+        [("HEAD_F4_ROWS", fp4_head_rows(n).to_string()), ("HEAD_F4W_KERNELS", gemms)].into_iter().collect();
+    render(FP4_HEAD_TEMPLATE, &vars)
+}
+
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
 pub const FP8_BLOCK: usize = 128;
@@ -264,9 +294,9 @@ impl WeightFormat {
         }
     }
 
-    pub fn head(quant: Quant) -> WeightFormat {
-        match quant {
-            q if q.quantised_checkpoint() => WeightFormat::Bf16,
+    pub fn head(spec: &Spec) -> WeightFormat {
+        match spec.lm_head_quant() {
+            Quant::Nvfp4G16 => WeightFormat::Bf16,
             q => WeightFormat::of(q),
         }
     }
@@ -466,7 +496,7 @@ fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
     let gdn: &[&str] = if spec.linear_attention.is_some() { &GDN_LINEARS } else { &[] };
     for &linear in MMA_LINEARS.iter().chain(gdn) {
         let wf = match linear {
-            "lm_head" => WeightFormat::head(spec.quant),
+            "lm_head" => WeightFormat::head(spec),
             "lin_ba" => WeightFormat::Bf16,
             _ => WeightFormat::of(spec.quant),
         };
@@ -526,7 +556,7 @@ impl Module {
         let a = &spec.attention;
         let d = &spec.dims;
         let wf = WeightFormat::of(spec.quant);
-        let head_wf = WeightFormat::head(spec.quant);
+        let head_wf = WeightFormat::head(spec);
         let scaling = spec.rope.scaling.as_ref();
         let rope_kind = match scaling.map(|s| s.kind) {
             None => 0,
@@ -620,20 +650,29 @@ impl Module {
             kernels.push("quant_rows_fp8");
             kernels.extend(smem.keys().filter(|k| k.contains("_f8")).copied().collect::<Vec<_>>());
         }
-        if spec.mlp.quant == Some(Quant::Nvfp4G16) {
+        let fp4_mlp = spec.mlp.quant == Some(Quant::Nvfp4G16);
+        let fp4_head = spec.lm_head_quant() == Quant::Nvfp4G16;
+        if fp4_mlp || fp4_head {
             let mut fp4_vars = BTreeMap::new();
-            fp4_vars.insert("F4W_KERNELS", fp4_kernels(spec, &mut smem));
-            let act = fp4_act_enabled(spec);
+            fp4_vars.insert("F4W_KERNELS", if fp4_mlp { fp4_kernels(spec, &mut smem) } else { String::new() });
+            let act = fp4_mlp && fp4_act_enabled(spec);
             fp4_vars.insert("F4A_SOURCE", if act { fp4_act_kernels(spec, &mut smem) } else { String::new() });
             source.push('\n');
             source.push_str(&render(FP4_TEMPLATE, &fp4_vars)?);
-            source.push('\n');
-            source.push_str(&fp4_batch_kernels(spec, &mut smem)?);
-            kernels.extend_from_slice(FP4_KERNELS);
+            if fp4_mlp {
+                source.push('\n');
+                source.push_str(&fp4_batch_kernels(spec, &mut smem)?);
+                kernels.extend_from_slice(FP4_KERNELS);
+            }
             if act {
                 kernels.extend_from_slice(FP4_ACT_KERNELS);
                 arch_features = true;
             }
+        }
+        if fp4_head {
+            source.push('\n');
+            source.push_str(&fp4_head_source(spec, &mut smem)?);
+            kernels.extend_from_slice(FP4_HEAD_KERNELS);
         }
         Ok(Module { source, kernels, smem, arch_features })
     }

@@ -278,6 +278,28 @@ fn deprecated_env_overrides_still_switch_the_resolved_spec() {
     r.validate().unwrap();
 }
 
+#[test]
+fn head_quant_defaults_to_the_checkpoint_head_round_trips_and_rejects_other_formats() {
+    let text = nvfp4_text();
+    let plain = Spec::parse(&text).unwrap();
+    assert_eq!((plain.head_quant, plain.lm_head_quant()), (None, Quant::Bf16));
+    assert_eq!(Spec::parse(&std::fs::read_to_string(root().join("specs/qwen3-0.6b-q8.toml")).unwrap()).unwrap().lm_head_quant(), Quant::Q8);
+    let with = |v: &str| text.replace("quant = \"fp8_channel\"\n", &format!("quant = \"fp8_channel\"\nhead_quant = {v:?}\n"));
+    for (v, q) in [("bf16", Quant::Bf16), ("fp8_channel", Quant::Fp8Channel), ("nvfp4_g16", Quant::Nvfp4G16)] {
+        let s = Spec::parse(&with(v)).unwrap();
+        assert_eq!((s.head_quant, s.lm_head_quant()), (Some(q), q));
+        assert!(s.to_toml().unwrap().contains(&format!("head_quant = \"{v}\"")));
+        assert_eq!(Spec::parse(&s.to_toml().unwrap()).unwrap(), s);
+    }
+    assert!(!plain.to_toml().unwrap().contains("head_quant"));
+    let e = format!("{:#}", Spec::parse(&with("fp8_block128")).unwrap_err());
+    assert!(e.contains("head_quant") && e.contains("not supported"), "{e}");
+    let e = format!("{:#}", Spec::parse(&with("q8")).unwrap_err());
+    assert!(e.contains("head_quant"), "{e}");
+    let e = format!("{:#}", Spec::parse(&with("fp4")).unwrap_err());
+    assert!(e.contains("fp4"), "{e}");
+}
+
 fn hybrid_text() -> String {
     std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap()
 }

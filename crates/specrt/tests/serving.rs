@@ -120,11 +120,31 @@ fn mixed_prompts() -> Vec<Vec<u32>> {
 }
 
 fn stepped_matches_single(dir: &str) {
-    let s = spec_for(dir);
+    stepped_spec_matches_single(&spec_for(dir));
+}
+
+fn stepped_spec_matches_single(s: &Spec) {
     let prompts = mixed_prompts();
-    let expected = single_greedy(&s, &prompts, 24);
-    assert_eq!(stepped_greedy(&s, &prompts, 24, 37), expected);
-    assert_eq!(stepped_greedy(&s, &prompts, 24, 128), expected);
+    let expected = single_greedy(s, &prompts, 24);
+    assert_eq!(stepped_greedy(s, &prompts, 24, 37), expected);
+    assert_eq!(stepped_greedy(s, &prompts, 24, 128), expected);
+}
+
+fn head_quant_spec(dir: &str, head: specrt::spec::Quant) -> Spec {
+    let mut s = spec_for(dir);
+    s.head_quant = Some(head);
+    s
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn quantised_head_step_decode_and_scheduler_match_single_sequence_greedy() {
+    use specrt::spec::Quant;
+    for (dir, head) in [("tiny-qwen3.5", Quant::Fp8Channel), ("tiny-qwen3.5", Quant::Nvfp4G16), ("tiny-qwen3.5-nvfp4", Quant::Nvfp4G16)] {
+        let s = head_quant_spec(dir, head);
+        stepped_spec_matches_single(&s);
+        scheduled_spec_matches_single(&s);
+    }
 }
 
 #[test]
@@ -161,8 +181,12 @@ fn fp8_mixed_length_step_decode_matches_single_sequence_greedy() {
 }
 
 fn scheduled_matches_single(dir: &str) {
+    scheduled_spec_matches_single(&spec_for(dir));
+}
+
+fn scheduled_spec_matches_single(s: &Spec) {
     use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
-    let s = spec_for(dir);
+    let s = s.clone();
     let lens = [3usize, 17, 64, 65, 130, 250, 400];
     let prompts: Vec<Vec<u32>> = (0..64u32)
         .map(|q| (0..lens[q as usize % lens.len()] as u32).map(|i| (i * 13 + q * 97 + 1) % 1024).collect())

@@ -316,6 +316,11 @@ impl<'a> Raw<'a> {
                 let (values, scales) = quantize_q8(&w, cols);
                 Matrix::Q8 { values, scales }
             }
+            (Raw::Bf16 { w, cols }, Quant::Fp8Channel) => {
+                let (values, scales) = quantize_fp8_channel(&w, cols);
+                Matrix::Fp8 { values: Cow::Owned(values), scales }
+            }
+            (Raw::Bf16 { w, cols }, Quant::Nvfp4G16) => Matrix::Fp4(quantize_nvfp4(&w, cols)),
             (Raw::Fp8 { w, grid, map, .. }, q) if q.is_fp8() => {
                 Matrix::Fp8 { values: w, scales: fp8_scales(&grid, &map) }
             }
@@ -359,16 +364,80 @@ pub fn e4m3_to_f32(b: u8) -> f32 {
 }
 
 pub fn f32_to_e4m3(v: f32) -> u8 {
-    let sign = if v.is_sign_negative() { 0x80 } else { 0 };
-    let a = v.abs().min(448.0);
-    let mut best = 0u8;
-    for code in 1..=0x7eu8 {
-        let (d, b) = ((e4m3_to_f32(code) - a).abs(), (e4m3_to_f32(best) - a).abs());
-        if d < b || (d == b && code & 1 == 0) {
-            best = code;
+    let a = v.abs();
+    let code = if a < 0.015625 {
+        (a * 512.0).round_ties_even() as u32
+    } else {
+        let bits = a.to_bits().min(0x43f0_0000);
+        let bits = bits + 0x7ffff + ((bits >> 20) & 1);
+        ((((bits >> 23) as i32 - 120) as u32) << 3) | ((bits >> 20) & 7)
+    };
+    code.min(0x7e) as u8 | if v.is_sign_negative() { 0x80 } else { 0 }
+}
+
+fn par_rows<A: Send, B: Send>(
+    w: &[u16],
+    cols: usize,
+    (a, a_cols): (&mut [A], usize),
+    (b, b_cols): (&mut [B], usize),
+    f: impl Fn(&[u16], &mut [A], &mut [B]) + Sync,
+) {
+    let rows = w.len() / cols;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = rows.div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for ((src, da), db) in w.chunks(per * cols).zip(a.chunks_mut(per * a_cols)).zip(b.chunks_mut(per * b_cols)) {
+            let f = &f;
+            s.spawn(move || {
+                for ((row, ra), rb) in src.chunks_exact(cols).zip(da.chunks_exact_mut(a_cols)).zip(db.chunks_exact_mut(b_cols)) {
+                    f(row, ra, rb);
+                }
+            });
         }
-    }
-    best | sign
+    });
+}
+
+pub fn quantize_fp8_channel(w: &[u16], cols: usize) -> (Vec<u8>, Vec<f32>) {
+    let rows = w.len() / cols;
+    let kb = cols.div_ceil(FP8_BLOCK);
+    let mut values = vec![0u8; w.len()];
+    let mut row_scales = vec![0f32; rows];
+    par_rows(w, cols, (&mut values, cols), (&mut row_scales, 1), |row, out, scale| {
+        let max = row.iter().map(|&v| bf16_to_f32(v).abs()).fold(0f32, f32::max);
+        scale[0] = if max == 0.0 { 1.0 } else { max / 448.0 };
+        for (o, &v) in out.iter_mut().zip(row) {
+            *o = f32_to_e4m3(bf16_to_f32(v) / scale[0]);
+        }
+    });
+    let grid = row_scales.iter().flat_map(|&s| std::iter::repeat_n(s, kb)).collect::<Vec<_>>();
+    let map = (0..rows).map(|r| (r * kb) as u32).collect::<Vec<_>>();
+    (values, fp8_scales(&grid, &map))
+}
+
+pub fn nvfp4_global_scale(w: &[u16]) -> f32 {
+    let amax = w.iter().map(|&v| bf16_to_f32(v).abs()).fold(0f32, f32::max);
+    if amax == 0.0 { 1.0 } else { 448.0 * 6.0 / amax }
+}
+
+pub fn quantize_nvfp4(w: &[u16], cols: usize) -> crate::nvfp4::Fp4<'static> {
+    use crate::nvfp4::{Fp4, GROUP, f32_to_e2m1};
+    let global = nvfp4_global_scale(w);
+    let mut packed = vec![0u8; w.len() / 2];
+    let mut scales = vec![0u8; w.len() / GROUP];
+    par_rows(w, cols, (&mut packed, cols / 2), (&mut scales, cols / GROUP), |row, out, row_scales| {
+        for ((g, group), code) in row.chunks_exact(GROUP).enumerate().zip(row_scales.iter_mut()) {
+            let amax = group.iter().map(|&v| bf16_to_f32(v).abs()).fold(0f32, f32::max);
+            *code = f32_to_e4m3((amax / 6.0 * global).min(448.0));
+            let s = e4m3_to_f32(*code) / global;
+            for (i, &v) in group.iter().enumerate() {
+                let q = if s > 0.0 { f32_to_e2m1(bf16_to_f32(v) / s) } else { 0 };
+                let at = g * GROUP + i;
+                out[at / 2] |= if at % 2 == 0 { q } else { q << 4 };
+            }
+        }
+    });
+    let rows = w.len() / cols;
+    Fp4::new(Cow::Owned(packed), Cow::Owned(scales), global, rows, cols).expect("nvfp4 head shape")
 }
 
 pub fn quantize_q8(w: &[u16], cols: usize) -> (Vec<i8>, Vec<f32>) {
@@ -513,7 +582,7 @@ impl Checkpoint {
         let d = &spec.dims;
         let root = self.root();
         let embed = self.bf16(&format!("{root}.embed_tokens.weight"), &[d.vocab, d.hidden])?;
-        let head_quant = if spec.quant.quantised_checkpoint() { Quant::Bf16 } else { spec.quant };
+        let head_quant = spec.lm_head_quant();
         let lm_head = if d.tie_embeddings {
             Raw::Bf16 { w: embed.clone(), cols: d.hidden }
         } else {
@@ -584,6 +653,83 @@ mod tests {
                 assert_eq!(lookup(&both, 2 * r + 1, b), expect(2000.0, r, b));
             }
         }
+    }
+
+    fn exhaustive_e4m3(v: f32) -> u8 {
+        let sign = if v.is_sign_negative() { 0x80 } else { 0 };
+        let a = v.abs().min(448.0);
+        let mut best = 0u8;
+        for code in 1..=0x7eu8 {
+            let (d, b) = ((e4m3_to_f32(code) - a).abs(), (e4m3_to_f32(best) - a).abs());
+            if d < b || (d == b && code & 1 == 0) {
+                best = code;
+            }
+        }
+        best | sign
+    }
+
+    #[test]
+    fn e4m3_encode_matches_the_nearest_even_search_on_every_bf16_and_random_f32() {
+        for bits in 0..=u16::MAX {
+            let v = bf16_to_f32(bits);
+            if v.is_finite() {
+                assert_eq!(f32_to_e4m3(v), exhaustive_e4m3(v), "{v} ({bits:#06x})");
+            }
+        }
+        let mut x = 0x2545f491u32;
+        for i in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let v = (x as f32 / u32::MAX as f32 - 0.5) * if i % 2 == 0 { 1000.0 } else { 0.05 };
+            assert_eq!(f32_to_e4m3(v), exhaustive_e4m3(v), "{v}");
+        }
+        assert_eq!(f32_to_e4m3(f32::MAX), 0x7e);
+        assert_eq!(f32_to_e4m3(-0.0), 0x80);
+    }
+
+    fn head_rows(rows: usize, cols: usize) -> Vec<u16> {
+        (0..rows * cols)
+            .map(|i| {
+                let r = i / cols;
+                let scale = [0.001, 0.7, 3.0, 0.0][r % 4];
+                f32_to_bf16(((i * 37 % 101) as f32 - 50.0) * scale * if i % 29 == 0 { 9.0 } else { 1.0 })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fp8_channel_head_scales_each_row_by_its_absmax_and_rounds_to_nearest() {
+        let (rows, cols) = (5, 256);
+        let w = head_rows(rows, cols);
+        let (values, scales) = quantize_fp8_channel(&w, cols);
+        for r in 0..rows {
+            let row = &w[r * cols..(r + 1) * cols];
+            let amax = row.iter().map(|&v| bf16_to_f32(v).abs()).fold(0f32, f32::max);
+            let s = scales[scales[r].to_bits() as usize];
+            assert_eq!(s, if amax == 0.0 { 1.0 } else { amax / 448.0 });
+            for b in 0..cols / FP8_BLOCK {
+                assert_eq!(scales[scales[r].to_bits() as usize + b], s);
+            }
+            for c in 0..cols {
+                assert_eq!(values[r * cols + c], exhaustive_e4m3(bf16_to_f32(row[c]) / s), "{r} {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn nvfp4_head_matches_the_reference_quantiser_with_a_global_scale_from_the_absmax() {
+        let (rows, cols) = (6, 64);
+        let w = head_rows(rows, cols);
+        let m = quantize_nvfp4(&w, cols);
+        let f: Vec<f32> = w.iter().map(|&v| bf16_to_f32(v)).collect();
+        let amax = f.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert_eq!(m.global, 448.0 * 6.0 / amax);
+        let (packed, scales) = crate::nvfp4::quantize(&f, cols, m.global);
+        assert_eq!(m.packed.as_ref(), packed.as_slice());
+        assert_eq!(m.scales.as_ref(), scales.as_slice());
+        assert_eq!(m.rows(), rows);
+        assert!(m.scales.iter().any(|&s| s == 0x7e), "the largest group uses the top e4m3 scale");
     }
 
     #[test]

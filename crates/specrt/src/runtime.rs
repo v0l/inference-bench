@@ -329,7 +329,10 @@ const LINEAR_ROWS_PER_BLOCK: usize = 8;
 const FP4_GEMV_THREADS: u32 = 512;
 
 fn gemv_cfg(name: &str, rows: usize) -> LaunchConfig {
-    if name.ends_with("_f4") {
+    if name == "lm_head_norm_f4" {
+        let per_block = FP4_GEMV_THREADS as usize / 32 * crate::codegen::fp4_head_rows(rows);
+        cfg(grid(rows, per_block), FP4_GEMV_THREADS)
+    } else if name.ends_with("_f4") {
         cfg(grid(rows, FP4_GEMV_THREADS as usize / 32), FP4_GEMV_THREADS)
     } else {
         cfg(grid(rows, LINEAR_ROWS_PER_BLOCK), 256)
@@ -500,6 +503,10 @@ impl Runtime {
         let prefill_limit = max_ctx.min(layout.prefill_chunk).max(layout.slots);
         let chunk = prefill_limit + crate::runtime::step::row_capacity(layout.slots);
         let use_mma = ctx.compute_capability()?.0 >= 8 && !spec.runtime.gemm_fp32;
+        ensure!(
+            use_mma || spec.lm_head_quant() != crate::spec::Quant::Nvfp4G16,
+            "head_quant = \"nvfp4_g16\" needs the tensor-core prefill path (an Ampere or newer GPU and [runtime] gemm_fp32 = false)"
+        );
         let mma_only = |n: usize| if use_mma { 1 } else { n };
         let buf = Buffers {
             x: stream.alloc_zeros(d.hidden)?,
@@ -853,8 +860,9 @@ impl Runtime {
             self.mlp_decode(layer)?;
             self.trace_layer(trace, i, 1)?;
         }
+        let head_kernel = if matches!(self.lm_head, DeviceMatrix::Fp4 { .. }) { "lm_head_norm_f4" } else { "lm_head_norm" };
         self.linear_norm(
-            "lm_head_norm",
+            head_kernel,
             &self.lm_head,
             None,
             &buf.x,
@@ -913,10 +921,11 @@ impl Runtime {
             _ => "_narrow",
         };
         let tile = Tile::variant(suffix, opts);
-        if let (Some(fa), DeviceMatrix::Fp8 { .. }, false) = (&self.fp8_act, w, suffix == "_tiny") {
+        let act_quant = name != "lm_head" && suffix != "_tiny";
+        if let (Some(fa), DeviceMatrix::Fp8 { .. }, true) = (&self.fp8_act, w, act_quant) {
             return self.tc_fp8(fa, name, w, bias, x, out, rows, tokens, suffix, tile);
         }
-        if let (Some(fa), DeviceMatrix::Fp4 { .. }, false) = (&self.fp4_act, w, suffix == "_tiny") {
+        if let (Some(fa), DeviceMatrix::Fp4 { .. }, true) = (&self.fp4_act, w, act_quant) {
             return self.tc_fp4(fa, name, w, x, out, rows, tokens, suffix, tile);
         }
         if let (DeviceMatrix::Fp4 { .. }, true) = (w, suffix == "_tiny" && tokens <= crate::codegen::F4B_MAX_TOKENS) {
