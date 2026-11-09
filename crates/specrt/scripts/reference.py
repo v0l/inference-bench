@@ -753,6 +753,65 @@ FP8_CHANNEL_ROWS = [
 ]
 
 
+def real_mtp(repo, out_dir):
+    from safetensors import safe_open
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+
+    torch.set_num_threads(16)
+    snap = snapshot_dir(repo)
+    cfg = json.loads((snap / "config.json").read_text())["text_config"]
+    cfg = {k: v for k, v in cfg.items() if k not in ("quantization_config",)}
+    config = Qwen3_5TextConfig(**cfg)
+    config._attn_implementation = "eager"
+    index = json.loads((snap / "model.safetensors.index.json").read_text())["weight_map"]
+
+    def tensor(name):
+        with safe_open(snap / index[name], "pt") as f:
+            return f.get_tensor(name)
+
+    state = {k: tensor(k) for k in index if k.startswith("mtp.")}
+    mtp = TinyMtp(config, state).eval()
+    embed = torch.nn.Embedding.from_pretrained(tensor("model.language_model.embed_tokens.weight").float())
+    head = torch.nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+    head.weight.data = tensor("lm_head.weight").float()
+    norm_w = tensor("model.language_model.norm.weight").float()
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
+
+    class Shell:
+        pass
+
+    model = Shell()
+    model.config = config
+    model.model = Shell()
+    model.model.embed_tokens = embed
+    model.model.rotary_emb = Qwen3_5TextRotaryEmbedding(config=config)
+    model.lm_head = head
+    records = json.loads((out_dir / "real27b-mtp.json").read_text())
+    report = []
+    with torch.inference_mode():
+        for r in records:
+            ids = torch.tensor(r["tokens"])
+            n = len(ids)
+            x = torch.from_numpy(np.fromfile(out_dir / f"{r['name']}.hidden.bin", dtype=np.float32)).view(1, n, -1)
+            var = x.pow(2).mean(-1, keepdim=True)
+            hidden = x * torch.rsqrt(var + config.rms_norm_eps) * (1.0 + norm_w)
+            first = int(head(hidden[0, -1]).argmax())
+            nxt = torch.cat([ids[1:], torch.tensor([first])])
+            logits, g = mtp(model, nxt[None], hidden, torch.arange(n))
+            d1 = int(logits[-1].argmax())
+            chain, _ = mtp(model, torch.cat([nxt, torch.tensor([d1])])[None], torch.cat([hidden, g[None, -1:]], dim=1), torch.arange(n + 1))
+            ours = torch.from_numpy(np.fromfile(out_dir / f"{r['name']}.chain.bin", dtype=np.float32))
+            p = torch.log_softmax(chain[-1], -1)
+            q = torch.log_softmax(ours, -1)
+            kl = float((p.exp() * (p - q)).sum())
+            rel = float((ours - chain[-1]).abs().max() / chain[-1].abs().max())
+            gen = slice(r["prompt"], n - 1)
+            hits = (logits[:-1].argmax(-1) == nxt[1:])[gen]
+            report.append({"name": r["name"], "drafts": [d1, int(chain[-1].argmax())], "specrt": r["drafts"], "kl": kl, "rel": rel, "generated_next_next": float(hits.float().mean())})
+            print(report[-1], flush=True)
+    (out_dir / "real27b-mtp-oracle.json").write_text(json.dumps(report))
+
+
 def nvfp4_dequant(out_dir):
     from compressed_tensors.compressors.nvfp4.base import NVFP4PackedCompressor
     from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
@@ -816,6 +875,9 @@ def main():
         return
     if sys.argv[1] == "tiny-mtp":
         tiny_mtp(Path(sys.argv[2]), Path(sys.argv[3]))
+        return
+    if sys.argv[1] == "real-mtp":
+        real_mtp(sys.argv[2], Path(sys.argv[3]))
         return
     if sys.argv[1] == "tiny-fp8":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, fp8=True)

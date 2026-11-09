@@ -202,6 +202,63 @@ The random-weight MTP of the tiny fixture predicts nothing, so its own drafts ar
 accepted (mean acceptance length 1.000); the oracle and forced-wrong drafts are what exercise
 acceptance and rollback on it.
 
+## Real 27B NVFP4
+
+`scripts/spec27b.sh` under `flock /tmp/gpu27.lock`, 9 Nov 2026, beside the live vLLM
+(`local-llm.service`, 51.7 GB, 97 to 100 percent busy): 43.3 GB free before each run and back to
+43.3 GB after. Context 8,192, 1 GB of KV, the 20 prompts of `scripts/vllm_logprobs.py` (the 5
+real-prompts plus 15 short ones: code, SQL, maths, prose, translation) in
+`scripts/spec_prompts.txt`, 128 greedy tokens each, `bench --speculative`. Decode tok/s counts
+only steps with no prefill in them. One run each, on a shared card, so read the speeds as
+indicative.
+
+| k | batch | mean acceptance length | draft acceptance | decode tok/s, speculative | plain | speedup |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1.830 | 83.0% | 27.2 | 23.1 | 1.18x |
+| 2 | 1 | 2.428 | 71.4% | 31.4 | 23.1 | 1.36x |
+| 3 | 1 | 2.807 | 60.2% | 31.6 | 23.1 | 1.37x |
+| 2 | 1, native fp4 + fp8 activations (`qwen3.8-27b-nvfp4-act`) | 2.417 | 70.8% | 30.1 | 23.8 | 1.26x |
+| 2 | 4 | 2.428 | 71.4% | 110.1 aggregate | 94.3 | 1.17x |
+| 2 | 8 | 2.428 | 71.4% | 115.9 aggregate | 143.7 | 0.81x |
+
+Greedy output with and without speculation agrees on the 27B too (the bench prints the first 24
+tokens of prompt 0 for both). The acceptance numbers are the same at every batch size, as they
+must be for greedy.
+
+vLLM on the same checkpoint, from its own `/metrics` over its whole uptime of real traffic:
+12,123,426 accepted of 13,617,794 drafted in 6,808,897 steps, so mean acceptance length 2.78, draft
+acceptance 89.0%, per position 0.933 and 0.847. On the same 20 prompts and 128 greedy tokens
+(counter deltas around two runs sent to `local-llm.service`): mean acceptance length 2.66 and 2.65,
+draft acceptance 82.8%, position 0 0.917 and 0.918, position 1 0.816 and 0.811. specrt on the
+same prompts: 2.43, 71.4%.
+
+Where the gap is not: `real_27b_mtp_dumps_hiddens_and_draft_logits_for_the_cpu_oracle` runs specrt
+on 5 of vLLM's own prompt plus greedy sequences and dumps the target hiddens and the chained draft
+logits; `reference.py real-mtp` recomputes the MTP in f32 torch from the checkpoint tensors (the
+`TinyMtp` module above, independent of specrt's loader). Both drafts are identical on all 5,
+logits relative error 2e-6 to 3e-6, KL 1e-7. Teacher-forced on vLLM's greedy tokens
+(`real_27b_mtp_acceptance_on_vllms_own_greedy_tokens`), specrt's drafts reach mean length 2.34,
+position 0 0.760 and position 1 0.576, and the CPU oracle predicts the token after next on the
+generated part at 0.773. So specrt computes the MTP as `qwen3_5_mtp.py` describes it to float
+accuracy; the 16-point gap to vLLM's position 0 is shared by specrt and the oracle and is not yet
+explained. Variations tried on the oracle, none of which close it: swapping the `fc` input halves
+(0.5%), the residual instead of the normed hidden (0.746), positions shifted by one (0.773), no unit
+offset on `mtp.norm` (0.767). Candidates left: vLLM's target hidden comes from its own NVFP4 kernels
+with activation quantisation, and its draft attention runs with a KV cache over the whole sequence
+including positions computed in earlier steps. Tracked in #387.
+
+Crossover: speculation still wins at batch 4 (12 verify rows) and loses at batch 8 (24 rows). Past
+16 rows the verify GEMMs leave the batched fp4/fp8 GEMV path for the `_tiny` mma tile, which reads
+the weights at about 400 GB/s (see `specrt-nvfp4.md`), so a verify step costs much more than a
+decode step. Set `[mtp] max_batch = 4` (or `[speculative] max_batch` in the server config) on this
+card until the batched GEMVs cover more rows.
+
+The single-stream speedup (1.36x for 2.43 tokens per step) is below the acceptance length because
+each speculative step pays the 3-row verify, the MTP pass over the accepted rows and two chained
+MTP steps, each with its own lm_head over 248k rows, and the step is not graph-captured: every
+host-to-device index upload synchronises the stream. The issue's target of 162 tok/s single stream
+is about the weight kernels (#361, #362); plain decode here is 23 tok/s.
+
 ## Commands
 
 ```
@@ -212,5 +269,8 @@ $PY scripts/reference.py tiny-mtp tests/fixtures/tiny-qwen3.5-mtp $SPECRT_REF_DI
 cargo test --release --test mtp -- --include-ignored --test-threads=1
 cargo test --release --lib sched
 cargo test --release --test real27b real_27b_mtp_weights -- --ignored
-flock /tmp/gpu27.lock ./scripts/spec27b.sh          # BATCHES, NEW
+flock /tmp/gpu27.lock ./scripts/spec27b.sh          # BATCHES, NEW, SPEC
+# vllm-spec-greedy.json: the 20 prompts' greedy tokens from local-llm.service (logprobs 1)
+flock /tmp/gpu27.lock cargo test --release --test real27b real_27b_mtp_ -- --ignored --nocapture
+$PY scripts/reference.py real-mtp orcarouter/Qwen3.8-27B-Uncensored-NVFP4 $SPECRT_REF_DIR
 ```

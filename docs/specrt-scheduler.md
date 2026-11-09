@@ -107,10 +107,12 @@ to allocate and free, and a table entry is the same for all layers. The kernels 
 Server config keys (or the same flags on `inference-bench serve`): `max_num_seqs` turns the
 serving core on (without it the old single-stream engine serves); `max_model_len` (default
 131072, at most 262144, falls back to `max_ctx`); `kv_cache_gb`; `max_batched_tokens` (default
-8192); `itl_target_ms` (default 100). Requests accept `ignore_eos` like vLLM.
+8192); `itl_target_ms` (default 100); `[speculative]` with `enabled`, `draft_tokens` (1 to 3) and
+`max_batch` over the spec's `[mtp]` block (see `specrt-mtp.md`). Requests accept `ignore_eos` like vLLM.
 
 `/metrics` adds `inference_running_seqs`, `inference_waiting_seqs`, `inference_kv_blocks_used`,
-`inference_kv_blocks_total`, `inference_preemptions_total`, `inference_steps_total`, and the
+`inference_kv_blocks_total`, `inference_preemptions_total`, `inference_steps_total`,
+`inference_spec_drafted_tokens_total`, `inference_spec_accepted_tokens_total`, and the
 histograms `inference_queue_seconds`, `inference_inter_token_seconds`, `inference_batch_size`
 (decode rows per step), `inference_prefill_tokens_per_step` and `inference_step_seconds`.
 
