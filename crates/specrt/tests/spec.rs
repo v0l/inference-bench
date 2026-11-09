@@ -533,3 +533,15 @@ fn tensors_decide_qk_norm_and_the_output_gate_not_the_family() {
     let gemma = describe("gemma4-31b.config.json", "gemma4-31b.json");
     assert!(gemma.attention.qk_norm);
 }
+
+#[test]
+fn layer_types_in_any_config_give_sliding_and_full_layers_with_the_window() {
+    use specrt::anatomy::{LayerKind, ModelAnatomy};
+    let json = std::fs::read_to_string(root().join("tests/fixtures/gemma4-31b.config.json")).unwrap();
+    let spec = Spec::describe_hf_config(&json).unwrap();
+    assert_eq!(spec.layers.window, Some(1024));
+    assert_eq!(spec.layers.pattern, vec![Block::Sliding, Block::Sliding, Block::Sliding, Block::Sliding, Block::Sliding, Block::Full]);
+    let a = ModelAnatomy::new(&spec, 0, None);
+    assert_eq!((a.count(LayerKind::SlidingAttention), a.count(LayerKind::Attention), a.count(LayerKind::DeltaNet)), (50, 10, 0));
+    assert!(a.pattern().starts_with("SSSSSA"));
+}

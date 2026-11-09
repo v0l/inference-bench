@@ -9,6 +9,7 @@ const CAP_W: f32 = 38.0;
 pub fn kind_tint(kind: LayerKind) -> Color32 {
     match kind {
         LayerKind::Attention => READOUT,
+        LayerKind::SlidingAttention => OK,
         LayerKind::DeltaNet => TRACE,
     }
 }
@@ -151,7 +152,7 @@ fn layer_cell(ui: &mut egui::Ui, id: egui::Id, rect: Rect, l: &LayerInfo, scale:
 
 pub fn legend(ui: &mut egui::Ui, a: &specrt::anatomy::ModelAnatomy) {
     ui.horizontal(|ui| {
-        for kind in [LayerKind::Attention, LayerKind::DeltaNet].into_iter().filter(|k| a.count(*k) > 0) {
+        for kind in [LayerKind::Attention, LayerKind::SlidingAttention, LayerKind::DeltaNet].into_iter().filter(|k| a.count(*k) > 0) {
             let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
             ui.painter().rect_filled(r, 1.0, kind_tint(kind));
             Line::new().note(kind.label()).size(11.0).show(ui);

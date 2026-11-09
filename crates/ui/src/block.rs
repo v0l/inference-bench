@@ -1,6 +1,6 @@
 use eframe::egui::{self, Color32, Rect, Sense, Stroke, StrokeKind, pos2, vec2};
 use egui_bench::prelude::*;
-use specrt::spec::{Activation, RopeScalingKind, Spec};
+use specrt::spec::{Activation, Block, RopeScalingKind, Spec};
 use specrt::structure::{Group, Layer, Structure};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,12 +99,14 @@ fn mixer_rows(layer: &Layer, module: &str, spec: &Spec) -> Vec<Row> {
         rows.push(Row::Boxes(vec![computed("rope", rope_text(spec, a.head_dim))]));
     }
     if has("q_proj") {
-        let group = a.heads / a.kv_heads.max(1);
+        let rows_of = |name: &str| groups.iter().find(|g| g.name() == name).and_then(|g| g.weight()).and_then(|w| w.shape.first().copied());
+        let head_dim = groups.iter().find(|g| g.name() == "q_norm").and_then(|g| g.weight()).and_then(|w| w.shape.first().copied()).unwrap_or(a.head_dim);
+        let per = if a.output_gate { 2 * head_dim } else { head_dim };
+        let heads = rows_of("q_proj").map_or(a.heads, |r| r / per.max(1));
+        let kv = rows_of("k_proj").map_or(a.kv_heads, |r| r / head_dim.max(1));
+        let group = heads / kv.max(1);
         let gating = if a.output_gate { ", sigmoid output gate" } else { "" };
-        rows.push(Row::Boxes(vec![computed(
-            "attention",
-            format!("{} heads, {} kv, {group} per group{gating}", a.heads, a.kv_heads),
-        )]));
+        rows.push(Row::Boxes(vec![computed("attention", format!("{heads} heads, {kv} kv, {group} per group{gating}"))]));
     } else if let Some(la) = spec.linear_attention.as_ref().filter(|_| has("conv1d")) {
         rows.push(Row::Boxes(vec![computed(
             "gated delta rule",
@@ -327,9 +329,18 @@ pub fn draw(ui: &mut egui::Ui, rows: &[Row]) {
 }
 
 pub fn title(layer: Option<usize>, spec: &Spec, structure: &Layer) -> String {
+    let index = layer.unwrap_or(structure.index);
+    let kind = match spec.block(index) {
+        Block::Sliding => match spec.layers.window {
+            Some(w) => format!(", sliding attention, window {w}"),
+            None => ", sliding attention".to_string(),
+        },
+        Block::Full if spec.layers.pattern.contains(&Block::Sliding) => ", full attention".to_string(),
+        _ => String::new(),
+    };
     match layer {
-        Some(i) => format!("layer {i}"),
-        None => format!("layer {} ({})", structure.index, spec.name),
+        Some(i) => format!("layer {i}{kind}"),
+        None => format!("layer {index}{kind} ({})", spec.name),
     }
 }
 
@@ -406,6 +417,14 @@ mod tests {
     }
 
     #[test]
+    fn head_counts_follow_the_tensor_shapes_of_each_layer() {
+        let full = drawn("gemma4-31b.config.json", "gemma4-31b.json", 5);
+        assert!(full.iter().any(|s| s.starts_with("attention 32 heads, 4 kv, 8 per group")), "{full:?}");
+        let sliding = drawn("gemma4-31b.config.json", "gemma4-31b.json", 0);
+        assert!(sliding.iter().any(|s| s.starts_with("attention 32 heads, 16 kv, 2 per group")), "{sliding:?}");
+    }
+
+    #[test]
     fn the_rope_label_has_no_strikethrough_and_a_compact_theta() {
         assert_eq!(theta_text(10_000_000.0), "10M");
         let job = shape_job("theta 10M, 64 of 256 dims", 300.0);
@@ -414,5 +433,20 @@ mod tests {
             assert_eq!(s.format.strikethrough, Stroke::NONE);
             assert_eq!(s.format.underline, Stroke::NONE);
         }
+    }
+}
+
+#[cfg(test)]
+mod title_tests {
+    use super::*;
+
+    #[test]
+    fn a_gemma_layer_title_says_sliding_with_its_window_or_full() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures");
+        let spec = Spec::describe_hf_config(&std::fs::read_to_string(dir.join("gemma4-31b.config.json")).unwrap()).unwrap();
+        let s = Structure::from_json(&std::fs::read_to_string(dir.join("headers/gemma4-31b.json")).unwrap()).unwrap();
+        let l = layer_for(&s, 0).unwrap();
+        assert_eq!(title(Some(0), &spec, l), "layer 0, sliding attention, window 1024");
+        assert_eq!(title(Some(5), &spec, layer_for(&s, 5).unwrap()), "layer 5, full attention");
     }
 }

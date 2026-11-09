@@ -30,12 +30,13 @@ pub struct View {
     pub anatomy: ModelAnatomy,
     pub source: Source,
     pub structure: Option<Structure>,
+    pub unread: Vec<(String, String)>,
 }
 
 impl View {
     pub fn new(name: &str, spec: Spec, source: Source, mtp_layers: usize, max_ctx: Option<usize>) -> Self {
         let anatomy = ModelAnatomy::new(&spec, mtp_layers, max_ctx);
-        View { name: name.to_string(), spec, anatomy, source, structure: None }
+        View { name: name.to_string(), spec, anatomy, source, structure: None, unread: Vec::new() }
     }
 
     pub fn with_structure(mut self, structure: Structure) -> Self {
@@ -61,7 +62,8 @@ impl View {
                 let mut spec = Spec::describe_hf_config(&text).map_err(|e| format!("{e:#}"))?;
                 spec.name = m.name.clone();
                 let (mtp, ctx) = config_extras(&path);
-                let view = View::new(&m.name, spec, Source::HfConfig, mtp, ctx.or(m.context_length.map(|c| c as usize)));
+                let mut view = View::new(&m.name, spec, Source::HfConfig, mtp, ctx.or(m.context_length.map(|c| c as usize)));
+                view.unread = specrt::spec::unread_hf_keys(&text);
                 Ok(with_header(view, m))
             }
         }
@@ -199,7 +201,7 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
     };
     let views: Vec<&View> = std::iter::once(&*view).chain(other).collect();
     let scale = strip::shared_scale(views.iter().map(|v| &v.anatomy));
-    section(ui, "layers", &layers_note(&view.anatomy), |ui| {
+    section(ui, "layers", &layers_note(&view.anatomy, view.spec.layers.window), |ui| {
         for (n, v) in views.iter().enumerate() {
             if views.len() > 1 {
                 Line::new().legend(&v.name).gap(10.0).value(human_size(v.anatomy.total_bytes)).size(11.0).show(ui);
@@ -248,13 +250,25 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
     });
 }
 
-fn layers_note(a: &ModelAnatomy) -> String {
+fn layers_note(a: &ModelAnatomy, window: Option<usize>) -> String {
     let attention = a.count(LayerKind::Attention);
+    let sliding = a.count(LayerKind::SlidingAttention);
     let delta = a.count(LayerKind::DeltaNet);
-    match delta {
-        0 => format!("{attention} attention layers"),
-        _ => format!("{attention} attention, {delta} delta-net"),
+    let mut parts = Vec::new();
+    match (sliding, delta) {
+        (0, 0) => return format!("{attention} attention layers"),
+        _ => parts.push(format!("{attention} attention")),
     }
+    if sliding > 0 {
+        parts.push(match window {
+            Some(w) => format!("{sliding} sliding attention (window {w})"),
+            None => format!("{sliding} sliding attention"),
+        });
+    }
+    if delta > 0 {
+        parts.push(format!("{delta} delta-net"));
+    }
+    parts.join(", ")
 }
 
 #[cfg(test)]
@@ -345,5 +359,18 @@ mod tests {
         let view = Detail::open(&local("no-inter", &dir)).view.unwrap_or_else(|e| panic!("{e}"));
         let entries = crate::table::entries(&view, None);
         assert!(entries.iter().any(|e| e.field == "intermediate" && e.value == "unknown"));
+    }
+}
+
+#[cfg(test)]
+mod note_tests {
+    use super::*;
+
+    #[test]
+    fn the_layer_note_counts_sliding_layers_with_the_window() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures");
+        let spec = Spec::describe_hf_config(&std::fs::read_to_string(dir.join("gemma4-31b.config.json")).unwrap()).unwrap();
+        let a = ModelAnatomy::new(&spec, 0, None);
+        assert_eq!(layers_note(&a, spec.layers.window), "10 attention, 50 sliding attention (window 1024)");
     }
 }

@@ -5,6 +5,7 @@ pub const DEFAULT_MAX_CONTEXT: usize = 262_144;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayerKind {
     Attention,
+    SlidingAttention,
     DeltaNet,
 }
 
@@ -12,6 +13,7 @@ impl LayerKind {
     pub fn label(self) -> &'static str {
         match self {
             LayerKind::Attention => "full attention",
+            LayerKind::SlidingAttention => "sliding attention",
             LayerKind::DeltaNet => "gated delta-net",
         }
     }
@@ -194,9 +196,13 @@ fn mlp_parts(spec: &Spec, index: usize, force_moe: bool) -> MlpParts {
 }
 
 fn layer(spec: &Spec, index: usize) -> LayerInfo {
-    let kind = if spec.block(index) == Block::Linear { LayerKind::DeltaNet } else { LayerKind::Attention };
+    let kind = match spec.block(index) {
+        Block::Linear => LayerKind::DeltaNet,
+        Block::Sliding => LayerKind::SlidingAttention,
+        _ => LayerKind::Attention,
+    };
     let mixer = match kind {
-        LayerKind::Attention => attention_counts(spec),
+        LayerKind::Attention | LayerKind::SlidingAttention => attention_counts(spec),
         LayerKind::DeltaNet => delta_counts(spec),
     };
     let mixer_quant = spec.quant;
@@ -254,19 +260,19 @@ impl ModelAnatomy {
         let (mtp_params, mtp_bytes) = mtp_counts(spec, mtp_layers);
 
         let sum = |kind: LayerKind, f: fn(&LayerInfo) -> u64| layers.iter().filter(|l| l.kind == kind).map(f).sum::<u64>();
-        let attn_params = sum(LayerKind::Attention, |l| l.mixer_params);
+        let attn_params = layers.iter().filter(|l| l.kind != LayerKind::DeltaNet).map(|l| l.mixer_params).sum::<u64>();
         let delta_params = sum(LayerKind::DeltaNet, |l| l.mixer_params);
         let dense_total: u64 = layers.iter().map(|l| l.dense_params()).sum();
         let routed_total: u64 = layers.iter().map(|l| l.routed_params).sum();
         let shared_total: u64 = layers.iter().map(|l| l.shared_params).sum();
         let router_total: u64 = layers.iter().map(|l| l.router_params).sum();
         let norm_total: u64 = layers.iter().map(|l| l.norm_params).sum::<u64>() + hidden;
-        let mixer_bytes = |kind: LayerKind| -> u64 {
+        let mixer_bytes = |delta: bool| -> u64 {
             layers
                 .iter()
-                .filter(|l| l.kind == kind)
+                .filter(|l| (l.kind == LayerKind::DeltaNet) == delta)
                 .map(|l| {
-                    let c = if kind == LayerKind::Attention { attention_counts(spec) } else { delta_counts(spec) };
+                    let c = if delta { delta_counts(spec) } else { attention_counts(spec) };
                     quant_bytes(c.quantised, l.mixer_quant) + 2 * c.plain
                 })
                 .sum()
@@ -278,9 +284,9 @@ impl ModelAnatomy {
         let norm_bytes = 2 * norm_total;
 
         let mut components = vec![Component { name: "embedding", params: embedding_params, bytes: embedding_bytes }];
-        components.push(Component { name: "attention", params: attn_params, bytes: mixer_bytes(LayerKind::Attention) });
+        components.push(Component { name: "attention", params: attn_params, bytes: mixer_bytes(false) });
         if delta_params > 0 {
-            components.push(Component { name: "delta-net", params: delta_params, bytes: mixer_bytes(LayerKind::DeltaNet) });
+            components.push(Component { name: "delta-net", params: delta_params, bytes: mixer_bytes(true) });
         }
         if dense_total > 0 || routed_total == 0 {
             components.push(Component { name: "mlp", params: dense_total, bytes: dense_bytes });
@@ -376,7 +382,14 @@ impl ModelAnatomy {
     }
 
     pub fn pattern(&self) -> String {
-        self.layers.iter().map(|l| if l.kind == LayerKind::Attention { 'A' } else { 'D' }).collect()
+        self.layers
+            .iter()
+            .map(|l| match l.kind {
+                LayerKind::Attention => 'A',
+                LayerKind::SlidingAttention => 'S',
+                LayerKind::DeltaNet => 'D',
+            })
+            .collect()
     }
 }
 

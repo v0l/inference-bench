@@ -171,6 +171,7 @@ impl RuntimeOptions {
 pub enum Block {
     Dense,
     Full,
+    Sliding,
     Linear,
 }
 
@@ -307,6 +308,8 @@ impl Moe {
 pub struct Layers {
     pub count: usize,
     pub pattern: Vec<Block>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -425,9 +428,23 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "num_experts_per_tok", "mlp_only_layers", "decoder_sparse_step", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
     "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
-    "full_attention_interval", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
-    "linear_conv_kernel_dim", "mtp_num_hidden_layers",
+    "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
+    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "text_config", "quantization_config",
 ];
+
+pub fn unread_hf_keys(json: &str) -> Vec<(String, String)> {
+    let Ok(serde_json::Value::Object(top)) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
+    let mut out = Vec::new();
+    let nested = top.get("text_config").and_then(|t| t.as_object());
+    for map in std::iter::once(&top).chain(nested) {
+        for (k, v) in map {
+            if !HF_CONFIG_KEYS.contains(&k.as_str()) && !out.iter().any(|(o, _): &(String, String)| o == k) {
+                out.push((k.clone(), v.to_string()));
+            }
+        }
+    }
+    out
+}
 
 #[derive(Deserialize)]
 struct HfConfig {
@@ -462,6 +479,7 @@ struct HfConfig {
     partial_rotary_factor: Option<f64>,
     layer_types: Option<Vec<String>>,
     full_attention_interval: Option<usize>,
+    sliding_window: Option<usize>,
     linear_num_key_heads: Option<usize>,
     linear_num_value_heads: Option<usize>,
     linear_key_head_dim: Option<usize>,
@@ -477,6 +495,7 @@ fn layer_pattern(types: &[String], strict: bool) -> Result<Vec<Block>> {
         .map(|t| match t.as_str() {
             "linear_attention" => Ok(Block::Linear),
             "full_attention" => Ok(Block::Full),
+            "sliding_attention" if !strict => Ok(Block::Sliding),
             _ if !strict => Ok(Block::Full),
             other => bail!("layer type {other} is not supported"),
         })
@@ -747,7 +766,7 @@ impl Spec {
             .filter(|f| *f != 1.0)
             .map(|f| (head_dim as f64 * f).round() as usize);
         let pattern = match &hf.layer_types {
-            Some(types) if hybrid => layer_pattern(types, strict)?,
+            Some(types) if hybrid || !strict => layer_pattern(types, strict)?,
             None if hybrid && hf.full_attention_interval.is_some_and(|n| n > 1) => {
                 let n = hf.full_attention_interval.unwrap_or(4);
                 let mut p = vec![Block::Linear; n - 1];
@@ -793,7 +812,7 @@ impl Spec {
                 vocab: hf.vocab_size,
                 tie_embeddings: hf.tie_word_embeddings,
             },
-            layers: Layers { count: hf.num_hidden_layers, pattern },
+            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.contains(&Block::Sliding)), pattern },
             norm: Norm { kind: NormKind::Rmsnorm, eps: hf.rms_norm_eps, unit_offset: hybrid },
             attention: Attention {
                 kind: AttentionKind::Gqa,
@@ -822,6 +841,7 @@ impl Spec {
 
     pub fn validate(&self) -> Result<()> {
         self.runtime.validate()?;
+        ensure!(!self.layers.pattern.contains(&Block::Sliding), "sliding window attention layers are not supported");
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
             Some(Quant::Fp8Channel) => {
