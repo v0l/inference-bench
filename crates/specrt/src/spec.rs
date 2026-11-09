@@ -1046,7 +1046,8 @@ impl Spec {
     }
 
     pub fn draft_head_quant(&self) -> Option<Quant> {
-        let q = self.speculative()?.head_quant.unwrap_or(Quant::Bf16);
+        let fallback = if self.runtime.gemm_fp32 { Quant::Bf16 } else { Quant::Nvfp4G16 };
+        let q = self.speculative()?.head_quant.unwrap_or(fallback);
         (q != self.lm_head_quant()).then_some(q)
     }
 

@@ -35,6 +35,7 @@ fn spec(k: usize) -> Spec {
     s.repo = dir.display().to_string();
     s.mtp.as_mut().unwrap().draft_tokens = k;
     s.mtp.as_mut().unwrap().graph = true;
+    s.mtp.as_mut().unwrap().head_quant = Some(Quant::Bf16);
     s
 }
 

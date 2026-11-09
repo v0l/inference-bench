@@ -339,7 +339,8 @@ ceiling; medians stay near 78% because of the sharing.
 
 ### Quantised lm_head for MTP drafts (#415)
 
-`[mtp] head_quant = "bf16" | "fp8_channel" | "nvfp4_g16"` (default `bf16`) gives the MTP draft
+`[mtp] head_quant = "bf16" | "fp8_channel" | "nvfp4_g16"` (default `nvfp4_g16`, `bf16` when
+`[runtime] gemm_fp32 = true`; `bf16` means no extra copy) gives the MTP draft
 passes (`mtp_heads`) their own head, quantised at load from the target head; the target and the
 verify rows keep `head_quant`. Costs one extra copy (0.72 GB nvfp4, 1.31 GB fp8). Emitted tokens
 stay identical to plain greedy (`tests/mtp.rs`, greedy and chi-square tests per draft head, and
@@ -357,8 +358,13 @@ beside the served vLLM (first run of each batch size is cold and noisy):
 | 4 | fp8_channel | 284.3, 294.0, 288.4 | 2.426 |
 | 4 | nvfp4_g16 | 283.6, 284.5, 283.5 | 2.417 |
 
-nvfp4_g16 loses 0.014 tokens per step and gains about 10 percent at batch 1 on the warm runs
-(86.2 against 78.2) and 2 percent at batch 4. The option stays; the default stays `bf16`.
+nvfp4_g16 loses 0.014 tokens per step and gains 2 percent at batch 4. Settled batch 1 re-run
+(one discarded warm-up per arm, then 5 alternating runs, beside the served vLLM, so the spread is
+wide): bf16 81.3, 81.3, 69.4, 74.0, 77.2 (median 77.2); nvfp4_g16 84.1, 75.4, 83.8, 61.5, 88.6
+(median 83.8). That is +8.5 percent at the median, over the 5 percent bar, with acceptance
+2.414 against 2.428 (under the 0.05 bar), so `nvfp4_g16` is the default. It costs one extra
+0.72 GB head copy on the GPU for every MTP spec; set `head_quant = "bf16"` to share the target
+head and skip it.
 
 ### Quantised lm_head (#363)
 
