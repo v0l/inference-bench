@@ -339,17 +339,66 @@ ceiling; medians stay near 78% because of the sharing.
 
 ### Batched decode (native prefill, 128-token prompts, `bench ... 128 128 N`)
 
+Before #361 (MLPs through the prefill GEMM's tiny tile):
+
 | batch | aggregate | per sequence | vLLM at that many running (with MTP) |
 |---|---|---|---|
 | 4 | 52.3 tok/s | 13.1 | 362 |
 | 8 | 98.7 to 104.3 | 12.3 to 13.0 | 512 |
 | 16 | 172.6 | 10.8 | 796 |
 
-Batched decode goes through the prefill GEMMs with the tiny tile (`gate_up_f4w_tiny` 251 us,
-`down_f4w_tiny` 224 us per call at batch 8). Those read the weights once per 16 rows but
-achieve only about 400 GB/s, so batch 8 is 4x single stream, not 8x. A batched GEMV that
-shares one weight read across the rows, or the native fp4 mma at m = 16, is the next step for
-aggregate throughput; it is #361. The bandwidth gap is #362.
+With the batched fp4 GEMV (#361), same command (the `qwen3.8-27b-nvfp4-act.toml` spec), vLLM at
+95 to 100% beside it:
+
+| batch | aggregate | per sequence |
+|---|---|---|
+| 4 | 88.3 tok/s | 22.1 |
+| 8 | 194.7 | 24.3 |
+| 16 | 325.8 | 20.4 |
+
+That is 1.7x, 1.9x and 1.9x the old numbers at batch 4, 8 and 16; per sequence, batch 8 now
+runs at the single-stream rate (24 to 29 tok/s). vLLM, with MTP, is still 2.4 to 4x ahead.
+
+#### NVFP4 MLP kernels per call (`nsys --cuda-graph-trace=node`, 128-token prompt, 64 new)
+
+`gate_up` reads 100.3 MB (packed weights plus group scales), `down` 50.1 MB. Medians of
+3,920 calls; the batched rows include the split-K reduce launch (2 to 5 us).
+
+| batch | `gate_up` tile | `gate_up` batched | `down` tile | `down` batched |
+|---|---|---|---|---|
+| 4 | 251 us, 400 GB/s | 105 us, 960 GB/s | 239 us, 210 GB/s | 53 us, 955 GB/s |
+| 8 | 257 us, 391 GB/s | 106 us, 945 GB/s | 243 us, 206 GB/s | 54 us, 922 GB/s |
+| 16 | 261 us, 384 GB/s | 124 us, 807 GB/s | 248 us, 202 GB/s | 81 us, 622 GB/s |
+| 1 (single-row GEMV after #362, for scale) | `gate_up_act_f4` 78.5 us | | `down_proj_f4` 43 us | |
+
+At batch 8 the MLP pair takes 160 us against 134 us for the single-row GEMVs before #362
+(1.19x) and 121.5 us after it (1.32x), so it sits at the issue's 1.3x target, just above it
+against the tuned GEMV. At batch 16 it is 205 us (1.7x): the 16-token variant runs twice the
+mmas per weight byte and the dequant is no longer hidden.
+
+`templates/fp4_batch.cu` (`gemv_f4b`): each warp owns 32 weight rows and puts them on the
+M side of `mma.m16n8k16.bf16`, so the tokens are the N side, 8 per tile (`gate_up_f4b8` for 1
+to 8 rows, `gate_up_f4b16` for 9 to 16). A lane streams 16 bytes of one row per 128-column
+chunk (`ld.global.nc.L1::no_allocate`, prefetched one chunk ahead) and decodes them straight
+to mma A fragments, so every weight byte is read once whatever the batch. The activations sit
+in shared memory as hi/lo bf16 planes in a 3-stage `cp.async` ring, laid out so each B
+fragment is one conflict-free 8-byte load. K is split across `blockIdx.y` to fill the card
+(`f4b_splits`: the fewest splits that give at least one full wave of 4 blocks per SM at 85%
+occupancy of the last wave, 5 for `gate_up` and 32 for `down` on 188 SMs), and
+`*_f4b_reduce` sums the partial rows and applies the epilogue (SwiGLU into the hi/lo planes,
+or the residual add). Everything is derived from the spec dims and the SM count; there is no
+switch. It serves the default and the `[mlp] act_quant = "fp4"` paths alike; more than 16 rows
+(prefill chunks) keep the GEMMs.
+
+On a random 5120 x 17408 and 34816 x 5120 matrix (`tests/fp4_batch.rs`) both paths are
+checked against an f64 CPU product: the batched kernel's max error is 7.7e-5 to 8.6e-5 on
+`down` (max abs 60 to 72) and 4.4e-3 to 5.4e-3 on `gate_up` (max abs 600 to 880), against
+2.2e-3 to 2.9e-3 and 1.4e-2 to 1.8e-2 for the tile path, whose bf16 epilogue planes round
+once more. Both must stay within 1e-4 of the largest output.
+
+The FP8 projections in batched decode (`lin_in_mma_tiny` 69 to 81 us, `lin_out_mma_tiny` 43
+to 49 us, `qkv_mma_tiny` 64 us) still go through the tile GEMM; they are the next largest
+share of the step.
 
 ## Commands
 
@@ -361,6 +410,7 @@ cargo test --release --test nvfp4 -- --ignored
 $PY scripts/reference.py tiny-nvfp4 tests/fixtures/tiny-qwen3.5-nvfp4 out
 cargo test --release --test linear nvfp4 -- --include-ignored
 cargo test --release --test fp4_act -- --ignored
+cargo test --release --test fp4_batch -- --ignored --nocapture
 $PY scripts/reference.py real-slice orcarouter/Qwen3.8-27B-Uncensored-NVFP4 out/qwen3.8-27b-nvfp4-slice out 4 32768
 cargo test --release --test real27b real_27b_nvfp4_first_layers -- --ignored
 # whole model, GPU steps under flock /tmp/gpu27.lock with 36 GB free
