@@ -62,6 +62,132 @@ fn tiny_mtp_draft_logits_match_the_torch_reference() {
     assert_eq!(drafts[1] as u64, m["chain_draft"].as_u64().unwrap());
 }
 
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn drafts_after_speculative_steps_equal_drafts_from_a_fresh_prefill_of_the_same_prefix() {
+    let s = spec(3);
+    let ps = prompts();
+    let want = plain_greedy(&s, &ps[..4]);
+    let mut rt = Runtime::load_layout(&s, layout(1)).unwrap();
+    tables(&mut rt, 1);
+    let mut st = rt.stepper().unwrap();
+    let mut fresh = Runtime::load_layout(&s, layout(1)).unwrap();
+    tables(&mut fresh, 1);
+    for (p, w) in ps.iter().zip(&want) {
+        let mut out = vec![rt.prefill_slot(&mut st, 0, p, 0, Some((Sampling::GREEDY, 0))).unwrap().unwrap()];
+        for step in 0..6 {
+            if step % 2 == 1 {
+                let k = 3;
+                let have = out.len();
+                let mut d: Vec<u32> = (0..k).map(|j| w[have + j]).collect();
+                d[step % k] = (d[step % k] + 1) % 1024;
+                rt.set_drafts(0, &d).unwrap();
+            }
+            let row = SpecRow { slot: 0, token: *out.last().unwrap(), pos: p.len() + out.len() - 1, sampling: Sampling::GREEDY, step: out.len() as u32, max_accept: 3 };
+            out.extend(rt.speculate(&[row]).unwrap().remove(0));
+            let prefix: Vec<u32> = p.iter().chain(&out[..out.len() - 1]).copied().collect();
+            let (_, again) = fresh.mtp_prompt_logits(&prefix).unwrap();
+            assert_eq!(rt.drafts(0), again, "drafts after step {step} with {} tokens", out.len());
+        }
+    }
+}
+
+fn chi_square_of(counts: &[u64], probs: &[f64], total: u64) -> (f64, usize) {
+    let mut chi = 0.0;
+    let mut bins = 0usize;
+    let (mut rest_obs, mut rest_exp) = (0.0, 0.0);
+    for (c, p) in counts.iter().zip(probs) {
+        let e = p * total as f64;
+        if e >= 5.0 {
+            chi += (*c as f64 - e).powi(2) / e;
+            bins += 1;
+        } else {
+            rest_obs += *c as f64;
+            rest_exp += e;
+        }
+    }
+    if rest_exp > 0.0 {
+        chi += (rest_obs - rest_exp).powi(2) / rest_exp.max(1e-9);
+        bins += 1;
+    }
+    (chi, bins.saturating_sub(1))
+}
+
+fn softmax(row: &[f32], t: f32) -> Vec<f64> {
+    let m = row.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+    let e: Vec<f64> = row.iter().map(|&v| (((v - m) / t) as f64).exp()).collect();
+    let s: f64 = e.iter().sum();
+    e.into_iter().map(|v| v / s).collect()
+}
+
+fn argmax_row(row: &[f64]) -> u32 {
+    (0..row.len()).fold(0, |b, i| if row[i] > row[b] { i } else { b }) as u32
+}
+
+fn target_after(plain: &Spec, prefix: &[u32], t: f32) -> Vec<f64> {
+    let mut rt = Runtime::load(plain, 512).unwrap();
+    let l = rt.prompt_logits(prefix).unwrap();
+    let vocab = plain.dims.vocab;
+    softmax(&l[(prefix.len() - 1) * vocab..prefix.len() * vocab], t)
+}
+
+fn check_distribution(name: &str, counts: &[u64], target: &[f64], draft: u32, accepted: u64) {
+    let total: u64 = counts.iter().sum();
+    let (chi, dof) = chi_square_of(counts, target, total);
+    let z = (chi - dof as f64) / (2.0 * dof.max(1) as f64).sqrt();
+    let rate = accepted as f64 / total as f64;
+    let p = target[draft as usize];
+    eprintln!("{name}: {total} samples, chi-square {chi:.1} on {dof} dof (z {z:.2}), accept rate {rate:.3} for p(draft) {p:.3}");
+    assert!(dof >= 3, "{name}: too few bins to test");
+    assert!(z < 4.0, "{name}: the emitted token does not follow the target distribution");
+    assert!((rate - p).abs() < 4.0 * (p * (1.0 - p) / total as f64).sqrt() + 1e-3, "{name}: accept rate {rate}, want {p}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn rejection_sampling_follows_the_target_distribution_at_both_draft_positions() {
+    let s = spec(2);
+    let t = 0.3f32;
+    let p: Vec<u32> = prompt(3);
+    let mut plain = s.clone();
+    plain.mtp.as_mut().unwrap().speculate = false;
+    let first = argmax_row(&target_after(&plain, &p, 1.0));
+    let ext: Vec<u32> = p.iter().copied().chain([first]).collect();
+    let target0 = target_after(&plain, &ext, t);
+    let mode0 = argmax_row(&target0);
+    let ext2: Vec<u32> = ext.iter().copied().chain([mode0]).collect();
+    let target1 = target_after(&plain, &ext2, t);
+    let mode1 = argmax_row(&target1);
+    let runs = 4000u64;
+    let vocab = s.dims.vocab;
+    let mut rt = Runtime::load_layout(&s, layout(1)).unwrap();
+    tables(&mut rt, 1);
+    let mut st = rt.stepper().unwrap();
+    let low = (mode0 + 1) % vocab as u32;
+    for (d0, name) in [(mode0, "position 0, the mode drafted"), (low, "position 0, another token drafted")] {
+        let mut c0 = vec![0u64; vocab];
+        let mut c1 = vec![0u64; vocab];
+        let (mut a0, mut a1) = (0u64, 0u64);
+        for seed in 0..runs {
+            rt.prefill_slot(&mut st, 0, &p, 0, None).unwrap();
+            rt.set_drafts(0, &[d0, mode1]).unwrap();
+            let sampling = Sampling { temperature: t, seed: (seed as u32).wrapping_mul(2654435761).wrapping_add(17) };
+            let row = SpecRow { slot: 0, token: first, pos: p.len(), sampling, step: 1, max_accept: 2 };
+            let out = rt.speculate(&[row]).unwrap().remove(0);
+            c0[out[0] as usize] += 1;
+            a0 += u64::from(out.len() >= 2);
+            if d0 == mode0 && out.len() >= 2 {
+                c1[out[1] as usize] += 1;
+                a1 += u64::from(out.len() == 3);
+            }
+        }
+        check_distribution(name, &c0, &target0, d0, a0);
+        if d0 == mode0 {
+            check_distribution("position 1 after accepting position 0", &c1, &target1, mode1, a1);
+        }
+    }
+}
+
 const PROMPTS: usize = 20;
 const NEW: usize = 128;
 
