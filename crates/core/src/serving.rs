@@ -51,8 +51,12 @@ impl ServingTarget {
     }
 }
 
-fn sampling(temperature: f32, seed: Option<u64>) -> Sampling {
-    Sampling { temperature: temperature.max(0.0), seed: seed.unwrap_or(0) as u32 }
+fn sampling(s: &crate::chat::Sampling, defaults: specrt::engine::SamplingDefaults) -> Sampling {
+    Sampling::new(s.temperature.max(0.0), s.seed.unwrap_or(0) as u32).truncated(
+        s.top_k.or(defaults.top_k).unwrap_or(0),
+        s.top_p.or(defaults.top_p).unwrap_or(1.0),
+        s.min_p.or(defaults.min_p).unwrap_or(0.0),
+    )
 }
 
 impl Target for ServingTarget {
@@ -80,7 +84,7 @@ impl Target for ServingTarget {
         let list = request.messages_json().as_array().cloned().unwrap_or_default();
         let ids = self.engine()?.encode_messages(&list, request.template()).map_err(|e| engine_error(&e))?;
         let s = request.sampling;
-        self.run(ids, s.max_tokens, sampling(s.temperature, s.seed), !request.ignore_eos, request.cancel.clone(), on_text)
+        self.run(ids, s.max_tokens, sampling(&s, self.engine()?.sampling_defaults()), !request.ignore_eos, request.cancel.clone(), on_text)
     }
 
     fn share(&self) -> Option<Box<dyn Target>> {

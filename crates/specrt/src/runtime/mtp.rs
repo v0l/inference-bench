@@ -158,7 +158,7 @@ impl MtpState {
             vout: zi(rows)?,
             accepted: zi(cap)?,
             max_accept: zi(cap)?,
-            params: zi(3 * cap)?,
+            params: zi(6 * cap)?,
             klog: z(layers * rows * vd)?,
             dlog: z(layers * rows * vd)?,
             glog: z(layers * rows * la.value_heads)?,

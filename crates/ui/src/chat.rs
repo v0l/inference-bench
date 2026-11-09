@@ -324,7 +324,10 @@ fn sampling_panel(app: &mut App, ui: &mut egui::Ui) {
             ui.add(egui::Slider::new(&mut c.sampling.temperature, 0.0..=2.0));
         });
         row(ui, "top p", |ui| {
-            ui.add(egui::Slider::new(&mut c.sampling.top_p, 0.0..=1.0));
+            let mut p = c.sampling.top_p.unwrap_or(1.0);
+            if ui.add(egui::Slider::new(&mut p, 0.0..=1.0)).changed() {
+                c.sampling.top_p = Some(p);
+            }
         });
         row(ui, "max tokens", |ui| {
             if max_text.is_empty() {

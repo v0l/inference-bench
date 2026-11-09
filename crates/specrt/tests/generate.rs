@@ -16,7 +16,7 @@ fn prompt(n: usize) -> Vec<u32> {
 fn seeded_sampling_reproduces_and_greedy_is_the_default() {
     let mut rt = Runtime::load(&spec(), 256).unwrap();
     let p = prompt(32);
-    let hot = |seed| Sampling { temperature: 1.5, seed };
+    let hot = |seed| Sampling::new(1.5, seed);
     let a = rt.generate(&p, 24, hot(1)).unwrap().tokens;
     let b = rt.generate(&p, 24, hot(1)).unwrap().tokens;
     let c = rt.generate(&p, 24, hot(2)).unwrap().tokens;

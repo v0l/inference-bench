@@ -25,6 +25,24 @@ pub fn resolve_spec(model: &str) -> Result<Spec> {
 const END_OF_TURN: [&str; 6] =
     ["<|im_end|>", "<|eot_id|>", "<|end_of_text|>", "<end_of_turn>", "<|endoftext|>", "</s>"];
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SamplingDefaults {
+    pub top_k: Option<u32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+}
+
+impl SamplingDefaults {
+    pub fn from_generation_config(text: Option<&str>) -> Self {
+        let Some(v) = text.and_then(|t| serde_json::from_str::<Value>(t).ok()) else { return Self::default() };
+        SamplingDefaults {
+            top_k: v["top_k"].as_u64().map(|n| n as u32),
+            top_p: v["top_p"].as_f64().map(|n| n as f32),
+            min_p: v["min_p"].as_f64().map(|n| n as f32),
+        }
+    }
+}
+
 pub fn stop_ids(
     generation_config: Option<&str>,
     tokenizer_config: Option<&str>,
@@ -100,6 +118,7 @@ pub(crate) struct Assets {
     pub tokenizer: Tokenizer,
     pub chat: Option<ChatTemplate>,
     pub stop: Vec<u32>,
+    pub sampling: SamplingDefaults,
 }
 
 impl Assets {
@@ -117,12 +136,13 @@ impl Assets {
         let read = |f: &str| {
             find_in_snapshot(&spec.repo, f).ok().and_then(|p| std::fs::read_to_string(p).ok())
         };
+        let sampling = SamplingDefaults::from_generation_config(read("generation_config.json").as_deref());
         let stop = stop_ids(
             read("generation_config.json").as_deref(),
             read("tokenizer_config.json").as_deref(),
             &|t| tokenizer.token_to_id(t),
         );
-        Ok(Assets { spec, tokenizer, chat, stop })
+        Ok(Assets { spec, tokenizer, chat, stop, sampling })
     }
 
     pub fn tokens(&self, text: &str) -> Result<Vec<u32>> {
@@ -158,7 +178,7 @@ impl Engine {
     }
 
     pub fn load_with(model: &str, max_ctx: Option<usize>, runtime: Option<&crate::spec::RuntimeOptions>) -> Result<Self> {
-        let Assets { mut spec, tokenizer, chat, stop } = Assets::load(model)?;
+        let Assets { mut spec, tokenizer, chat, stop, .. } = Assets::load(model)?;
         if let Some(r) = runtime {
             spec.runtime = r.clone();
         }
@@ -277,6 +297,13 @@ mod tests {
     fn unsupported_model_types_are_reported_as_unsupported_architecture() {
         let e = anyhow::anyhow!("model_type gemma3 is not supported");
         assert_eq!(failure_kind(&e), FailureKind::UnsupportedArchitecture);
+    }
+
+    #[test]
+    fn sampling_defaults_come_from_generation_config() {
+        let d = SamplingDefaults::from_generation_config(Some(r#"{"top_k": 20, "top_p": 0.95, "temperature": 1.0}"#));
+        assert_eq!(d, SamplingDefaults { top_k: Some(20), top_p: Some(0.95), min_p: None });
+        assert_eq!(SamplingDefaults::from_generation_config(None), SamplingDefaults::default());
     }
 
     #[test]

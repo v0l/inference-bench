@@ -46,8 +46,15 @@ impl Stepper {
     }
 }
 
-pub(super) fn params(sampling: Sampling, step: u32) -> [i32; 3] {
-    [sampling.inverse_temperature().to_bits() as i32, sampling.seed as i32, step as i32]
+pub(super) fn params(sampling: Sampling, step: u32) -> [i32; 6] {
+    [
+        sampling.inverse_temperature().to_bits() as i32,
+        sampling.seed as i32,
+        step as i32,
+        sampling.top_k as i32,
+        sampling.top_p.to_bits() as i32,
+        sampling.min_p.to_bits() as i32,
+    ]
 }
 
 impl Runtime {
@@ -65,7 +72,7 @@ impl Runtime {
         };
         Ok(Stepper {
             bb,
-            params: self.stream.alloc_zeros(3 * rows)?,
+            params: self.stream.alloc_zeros(6 * rows)?,
             graphs: HashMap::new(),
             use_graphs: self.spec.runtime.graphs,
         })
@@ -100,7 +107,7 @@ impl Runtime {
         ran?;
         self.mtp_after_prefill(slot, tokens, start)?;
         let Some((sampling, step)) = sample else { return Ok(None) };
-        self.stream.memcpy_htod(&params(sampling, step), &mut st.params.slice_mut(..3))?;
+        self.stream.memcpy_htod(&params(sampling, step), &mut st.params.slice_mut(..6))?;
         let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
         b.arg(&self.buf.logits).arg(&st.bb.tokens).arg(&st.params);
         unsafe { b.launch(cfg(1, 1024)) }?;
@@ -139,7 +146,7 @@ impl Runtime {
         self.stream.memcpy_htod(&tokens, &mut st.bb.tokens.slice_mut(..n))?;
         self.stream.memcpy_htod(&pos, &mut st.bb.pos.slice_mut(..n))?;
         self.stream.memcpy_htod(&slots, &mut st.bb.slots.slice_mut(..n))?;
-        self.stream.memcpy_htod(&p, &mut st.params.slice_mut(..3 * n))?;
+        self.stream.memcpy_htod(&p, &mut st.params.slice_mut(..6 * n))?;
         if st.use_graphs {
             if !st.graphs.contains_key(&n) {
                 let graph = self.capture_decode(st, n)?;

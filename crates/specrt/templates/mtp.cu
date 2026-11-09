@@ -73,7 +73,7 @@ extern "C" __global__ void spec_accept(const float* logits, const int* vtok, con
     __shared__ int best_i[1024];
     __shared__ float scratch[32];
     int s = blockIdx.x;
-    const int* p = params + 3 * s;
+    const int* p = params + 6 * s;
     float inv_temp = __int_as_float(p[0]);
     unsigned seed = (unsigned)p[1];
     unsigned step = (unsigned)p[2];
@@ -84,14 +84,20 @@ extern "C" __global__ void spec_accept(const float* logits, const int* vtok, con
         bool may = j < k && j < max_accept[s];
         bool sampled = inv_temp > 0.0f;
         bool take = false;
-        if (sampled && may) {
-            float m = NEG_INF;
-            for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) m = fmaxf(m, row[i]);
-            m = block_reduce<true>(m, scratch);
-            float sum = 0.0f;
-            for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) sum += expf((row[i] - m) * inv_temp);
-            sum = block_reduce<false>(sum, scratch);
-            take = spec_uniform(seed, step + j) < expf((row[d] - m) * inv_temp) / sum;
+        float thr = NEG_INF;
+        if (sampled) {
+            float m;
+            thr = sample_threshold(row, inv_temp, p[3], __int_as_float(p[4]), __int_as_float(p[5]), &m);
+            if (may) {
+                float sum = 0.0f;
+                for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
+                    float v = row[i] * inv_temp;
+                    if (v >= thr) sum += expf(v - m);
+                }
+                sum = block_reduce<false>(sum, scratch);
+                float vd = row[d] * inv_temp;
+                take = vd >= thr && spec_uniform(seed, step + j) < expf(vd - m) / sum;
+            }
         }
         int tok = d;
         if (!take) {
@@ -101,7 +107,11 @@ extern "C" __global__ void spec_accept(const float* logits, const int* vtok, con
             for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
                 if (i == excl) continue;
                 float v = row[i];
-                if (sampled) v = v * inv_temp + gumbel(seed, step + j, (unsigned)i);
+                if (sampled) {
+                    v *= inv_temp;
+                    if (v < thr) continue;
+                    v += gumbel(seed, step + j, (unsigned)i);
+                }
                 if (v > bv) {
                     bv = v;
                     bi = i;

@@ -146,7 +146,7 @@ pub fn engine_error(err: &anyhow::Error) -> BackendError {
 }
 
 fn sampling(temperature: f32, seed: Option<u64>) -> Sampling {
-    Sampling { temperature: temperature.max(0.0), seed: seed.unwrap_or(0) as u32 }
+    Sampling::new(temperature.max(0.0), seed.unwrap_or(0) as u32)
 }
 
 fn generation(r: Reply) -> Generation {

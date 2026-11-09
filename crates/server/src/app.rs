@@ -394,7 +394,7 @@ fn stop_strings(body: &Value) -> Result<Vec<String>, ApiError> {
 }
 
 const HANDLED_FIELDS: &[&str] = &[
-    "model", "messages", "prompt", "prompts", "repeat", "max_tokens", "max_completion_tokens", "temperature", "top_p", "seed", "stop", "stream",
+    "model", "messages", "prompt", "prompts", "repeat", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "seed", "stop", "stream",
     "stream_options", "ignore_eos", "tools", "tool_choice", "chat_template_kwargs", "reasoning_effort",
 ];
 
@@ -487,7 +487,9 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
     let defaults = Sampling::default();
     let sampling = Sampling {
         temperature: body["temperature"].as_f64().map(|t| t as f32).unwrap_or(0.0),
-        top_p: body["top_p"].as_f64().map(|t| t as f32).unwrap_or(defaults.top_p),
+        top_p: body["top_p"].as_f64().map(|t| t as f32).or(state.config.top_p).or(defaults.top_p),
+        top_k: body["top_k"].as_u64().map(|t| t as u32).or(state.config.top_k).or(defaults.top_k),
+        min_p: body["min_p"].as_f64().map(|t| t as f32).or(state.config.min_p).or(defaults.min_p),
         seed: body["seed"].as_u64(),
         max_tokens,
     };

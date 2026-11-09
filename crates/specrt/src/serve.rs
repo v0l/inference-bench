@@ -416,6 +416,10 @@ impl Clone for Serving {
 }
 
 impl Serving {
+    pub fn sampling_defaults(&self) -> crate::engine::SamplingDefaults {
+        self.assets.sampling
+    }
+
     pub fn load(model: &str, opts: ServeOptions) -> Result<Self> {
         let assets = Assets::load(model)?;
         let core = Core::start(&assets.spec, opts)?;

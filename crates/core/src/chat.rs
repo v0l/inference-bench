@@ -42,14 +42,19 @@ impl Message {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Sampling {
     pub temperature: f32,
-    pub top_p: f32,
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f32>,
     pub seed: Option<u64>,
     pub max_tokens: usize,
 }
 
 impl Default for Sampling {
     fn default() -> Self {
-        Self { temperature: 0.7, top_p: 0.95, seed: None, max_tokens: 512 }
+        Self { temperature: 0.7, top_p: None, top_k: None, min_p: None, seed: None, max_tokens: 512 }
     }
 }
 
@@ -114,7 +119,9 @@ impl ChatRequest {
         let defaults = Sampling::default();
         let sampling = Sampling {
             temperature: body["temperature"].as_f64().map(|v| v as f32).unwrap_or(defaults.temperature),
-            top_p: body["top_p"].as_f64().map(|v| v as f32).unwrap_or(defaults.top_p),
+            top_p: body["top_p"].as_f64().map(|v| v as f32).or(defaults.top_p),
+            top_k: body["top_k"].as_u64().map(|v| v as u32).or(defaults.top_k),
+            min_p: body["min_p"].as_f64().map(|v| v as f32).or(defaults.min_p),
             seed: body["seed"].as_u64(),
             max_tokens: body["max_tokens"].as_u64().map(|v| v as usize).unwrap_or(defaults.max_tokens),
         };

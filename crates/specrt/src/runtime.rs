@@ -247,10 +247,21 @@ struct Buffers {
 pub struct Sampling {
     pub temperature: f32,
     pub seed: u32,
+    pub top_k: u32,
+    pub top_p: f32,
+    pub min_p: f32,
 }
 
 impl Sampling {
-    pub const GREEDY: Sampling = Sampling { temperature: 0.0, seed: 0 };
+    pub const GREEDY: Sampling = Sampling { temperature: 0.0, seed: 0, top_k: 0, top_p: 1.0, min_p: 0.0 };
+
+    pub fn new(temperature: f32, seed: u32) -> Sampling {
+        Sampling { temperature, seed, ..Sampling::GREEDY }
+    }
+
+    pub fn truncated(self, top_k: u32, top_p: f32, min_p: f32) -> Sampling {
+        Sampling { top_k, top_p, min_p, ..self }
+    }
 
     pub fn inverse_temperature(&self) -> f32 {
         if self.temperature > 0.0 { 1.0 / self.temperature } else { 0.0 }

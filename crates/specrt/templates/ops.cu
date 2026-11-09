@@ -1704,19 +1704,137 @@ extern "C" __global__ void argmax_rows(const float* logits, int* tokens, int* hi
     }
 }
 
+__device__ __forceinline__ unsigned order_key(float v) {
+    unsigned b = __float_as_uint(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+__device__ __forceinline__ float order_value(unsigned k) {
+    return __uint_as_float((k & 0x80000000u) ? (k & 0x7fffffffu) : ~k);
+}
+
+__device__ float sample_threshold(const float* row, float inv_temp, int top_k, float top_p, float min_p, float* row_max) {
+    __shared__ unsigned hist[256];
+    __shared__ float scratch[32];
+    __shared__ unsigned sh_prefix;
+    __shared__ int sh_need;
+    float m = NEG_INF;
+    for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) m = fmaxf(m, row[i] * inv_temp);
+    m = block_reduce<true>(m, scratch);
+    *row_max = m;
+    bool use_k = top_k > 0 && top_k < VOCAB;
+    bool use_p = top_p < 1.0f;
+    float thr = NEG_INF;
+    if (use_k) {
+        unsigned prefix = 0, mask = 0;
+        int need = top_k;
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            if (threadIdx.x < 256) hist[threadIdx.x] = 0;
+            __syncthreads();
+            for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
+                unsigned key = order_key(row[i] * inv_temp);
+                if ((key & mask) == prefix) atomicAdd(&hist[(key >> shift) & 255u], 1u);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                int c = need;
+                int b = 255;
+                for (; b > 0; b--) {
+                    if ((int)hist[b] >= c) break;
+                    c -= (int)hist[b];
+                }
+                sh_need = c;
+                sh_prefix = prefix | ((unsigned)b << shift);
+            }
+            __syncthreads();
+            need = sh_need;
+            prefix = sh_prefix;
+            mask |= 0xffu << shift;
+        }
+        thr = order_value(prefix);
+    }
+    if (use_p) {
+        __shared__ float cand[1024];
+        __shared__ int ncand;
+        if (threadIdx.x == 0) ncand = 0;
+        __syncthreads();
+        if (use_k) {
+            for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
+                float v = row[i] * inv_temp;
+                if (v >= thr) {
+                    int at = atomicAdd(&ncand, 1);
+                    if (at < 1024) cand[at] = v;
+                }
+            }
+            __syncthreads();
+        }
+        bool cached = use_k && ncand <= 1024;
+        int count = cached ? ncand : 0;
+        float z = 0.0f;
+        if (cached) {
+            for (int i = threadIdx.x; i < count; i += blockDim.x) z += expf(cand[i] - m);
+        } else {
+            for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
+                float v = row[i] * inv_temp;
+                if (v >= thr) z += expf(v - m);
+            }
+        }
+        z = block_reduce<false>(z, scratch);
+        float target = fmaxf(top_p, 1e-9f) * z;
+        float lo = use_k ? thr : m - 88.0f;
+        float hi = nextafterf(m, -NEG_INF);
+        for (int it = 0; it < 48; it++) {
+            float mid = 0.5f * (lo + hi);
+            if (mid <= lo || mid >= hi) break;
+            float mass = 0.0f;
+            if (cached) {
+                for (int i = threadIdx.x; i < count; i += blockDim.x) if (cand[i] >= mid) mass += expf(cand[i] - m);
+            } else {
+                for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
+                    float v = row[i] * inv_temp;
+                    if (v >= mid) mass += expf(v - m);
+                }
+            }
+            mass = block_reduce<false>(mass, scratch);
+            if (mass >= target) lo = mid; else hi = mid;
+        }
+        float low = NEG_INF;
+        if (cached) {
+            for (int i = threadIdx.x; i < count; i += blockDim.x) if (cand[i] >= lo) low = fmaxf(low, -cand[i]);
+        } else {
+            for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
+                float v = row[i] * inv_temp;
+                if (v >= lo) low = fmaxf(low, -v);
+            }
+        }
+        thr = fmaxf(thr, -block_reduce<true>(low, scratch));
+    }
+    if (min_p > 0.0f) thr = fmaxf(thr, m + logf(min_p));
+    return thr;
+}
+
 extern "C" __global__ void sample_rows(const float* logits, int* tokens, const int* params) {
     __shared__ float best_v[1024];
     __shared__ int best_i[1024];
     logits += (size_t)blockIdx.x * VOCAB;
-    const int* p = params + 3 * blockIdx.x;
+    const int* p = params + 6 * blockIdx.x;
     float inv_temp = __int_as_float(p[0]);
     unsigned seed = (unsigned)p[1];
     unsigned step = (unsigned)p[2];
+    float thr = NEG_INF;
+    if (inv_temp > 0.0f) {
+        float m;
+        thr = sample_threshold(logits, inv_temp, p[3], __int_as_float(p[4]), __int_as_float(p[5]), &m);
+    }
     float bv = NEG_INF;
     int bi = 0;
     for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
         float v = logits[i];
-        if (inv_temp > 0.0f) v = v * inv_temp + gumbel(seed, step, (unsigned)i);
+        if (inv_temp > 0.0f) {
+            v *= inv_temp;
+            if (v < thr) continue;
+            v += gumbel(seed, step, (unsigned)i);
+        }
         if (v > bv) {
             bv = v;
             bi = i;

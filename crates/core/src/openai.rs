@@ -119,6 +119,8 @@ impl Target for OpenAi {
             "max_tokens": s.max_tokens,
             "temperature": s.temperature,
             "top_p": s.top_p,
+            "top_k": s.top_k,
+            "min_p": s.min_p,
             "stream": true,
             "stream_options": {"include_usage": true},
         });
@@ -290,7 +292,7 @@ mod tests {
         let server = FakeServer::start(script());
         let mut b = OpenAi::new("fake".into(), &server.url, None);
         b.load("qwen3").unwrap();
-        let sampling = Sampling { temperature: 0.3, top_p: 0.9, seed: Some(5), max_tokens: 6 };
+        let sampling = Sampling { temperature: 0.3, top_p: Some(0.9), top_k: None, min_p: None, seed: Some(5), max_tokens: 6 };
         let request = ChatRequest::new(vec![Message::new(Role::User, "hi")], sampling);
         let mut streamed = String::new();
         let g = b.chat(&request, &mut |t| streamed.push_str(t)).unwrap();

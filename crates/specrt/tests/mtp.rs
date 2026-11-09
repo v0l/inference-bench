@@ -171,7 +171,7 @@ fn rejection_sampling_follows_the_target_distribution_at_both_draft_positions() 
         for seed in 0..runs {
             rt.prefill_slot(&mut st, 0, &p, 0, None).unwrap();
             rt.set_drafts(0, &[d0, mode1]).unwrap();
-            let sampling = Sampling { temperature: t, seed: (seed as u32).wrapping_mul(2654435761).wrapping_add(17) };
+            let sampling = Sampling::new(t, (seed as u32).wrapping_mul(2654435761).wrapping_add(17));
             let row = SpecRow { slot: 0, token: first, pos: p.len(), sampling, step: 1, max_accept: 2 };
             let out = rt.speculate(&[row]).unwrap().remove(0);
             c0[out[0] as usize] += 1;
