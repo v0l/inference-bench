@@ -439,7 +439,8 @@ struct HfConfig {
     vocab_size: usize,
     rms_norm_eps: f64,
     rope_theta: Option<f64>,
-    hidden_act: String,
+    #[serde(alias = "hidden_activation")]
+    hidden_act: Option<String>,
     #[serde(default)]
     tie_word_embeddings: bool,
     attention_bias: Option<bool>,
@@ -461,12 +462,13 @@ struct HfConfig {
     mtp_num_hidden_layers: usize,
 }
 
-fn layer_pattern(types: &[String]) -> Result<Vec<Block>> {
+fn layer_pattern(types: &[String], strict: bool) -> Result<Vec<Block>> {
     let blocks = types
         .iter()
         .map(|t| match t.as_str() {
             "linear_attention" => Ok(Block::Linear),
             "full_attention" => Ok(Block::Full),
+            _ if !strict => Ok(Block::Full),
             other => bail!("layer type {other} is not supported"),
         })
         .collect::<Result<Vec<_>>>()?;
@@ -626,7 +628,7 @@ impl Spec {
     }
 
     pub fn from_hf_config(json: &str) -> Result<Self> {
-        let spec = Self::describe_hf_config(json)?;
+        let spec = Self::hf_config(json, true)?;
         spec.validate()?;
         ensure!(spec.moe.is_none(), "{MOE_UNSUPPORTED}");
         ensure!(spec.dims.intermediate > 0, "config has no intermediate_size");
@@ -634,6 +636,25 @@ impl Spec {
     }
 
     pub fn describe_hf_config(json: &str) -> Result<Self> {
+        Self::hf_config(json, false)
+    }
+
+    pub fn apply_structure(&mut self, structure: &crate::structure::Structure) {
+        let Some(stack) = structure.main() else { return };
+        let any = |group: &str, leaf: &str| structure.any_leaf(group, leaf);
+        self.attention.qk_norm = any("q_norm", "weight") || any("k_norm", "weight");
+        self.attention.qkv_bias = any("q_proj", "bias") || any("k_proj", "bias") || any("v_proj", "bias");
+        let gated = stack.layers.iter().find_map(|l| {
+            let q = l.group("self_attn.q_proj")?.weight()?;
+            let rows = *q.shape.first()?;
+            Some(rows == 2 * self.attention.heads * self.attention.head_dim)
+        });
+        if let Some(gated) = gated {
+            self.attention.output_gate = gated;
+        }
+    }
+
+    fn hf_config(json: &str, strict: bool) -> Result<Self> {
         let mut value: serde_json::Value = serde_json::from_str(json)?;
         let quant_config = value.get("quantization_config").cloned();
         let outer_type = value.get("model_type").cloned();
@@ -643,14 +664,16 @@ impl Spec {
                 value["model_type"] = t;
             }
         }
-        let model_type = value.get("model_type").and_then(|t| t.as_str()).unwrap_or("");
-        ensure!(
-            matches!(
-                model_type,
-                "qwen2" | "qwen3" | "qwen3_moe" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next" | "llama" | "mistral"
-            ),
-            "model_type {model_type} is not supported"
-        );
+        if strict {
+            let model_type = value.get("model_type").and_then(|t| t.as_str()).unwrap_or("");
+            ensure!(
+                matches!(
+                    model_type,
+                    "qwen2" | "qwen3" | "qwen3_moe" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next" | "llama" | "mistral"
+                ),
+                "model_type {model_type} is not supported"
+            );
+        }
         let hf: HfConfig = serde_json::from_value(value).map_err(|e| {
             let text = e.to_string();
             match text.strip_prefix("missing field `").and_then(|r| r.split_once('`')) {
@@ -658,29 +681,55 @@ impl Spec {
                 None => anyhow::Error::from(e),
             }
         })?;
-        let Quantization { quant, mlp: mlp_quant } = parse_quantization(quant_config.as_ref(), hf.num_hidden_layers)?;
-        let params = hf.rope_parameters.as_ref();
-        let param = |key: &str| params.and_then(|p| p.get(key)).and_then(|v| v.as_f64());
-        let scaling = parse_rope_scaling(hf.rope_scaling.as_ref().or(params))?;
-        let theta = hf.rope_theta.or(param("rope_theta")).context("no rope_theta")?;
-        let activation = match hf.hidden_act.as_str() {
-            "silu" => Activation::Swiglu,
-            "gelu_pytorch_tanh" | "gelu_new" | "gelu_fast" => Activation::Geglu,
-            other => bail!("hidden_act {other} is not supported"),
+        let quantization = parse_quantization(quant_config.as_ref(), hf.num_hidden_layers);
+        let Quantization { quant, mlp: mlp_quant } = match (quantization, strict) {
+            (Ok(q), _) => q,
+            (Err(e), true) => return Err(e),
+            (Err(_), false) => Quantization { quant: Quant::Bf16, mlp: None },
         };
-        if let Some(dtype) = hf.torch_dtype.as_deref().or(hf.dtype.as_deref())
+        let nested = hf
+            .rope_parameters
+            .as_ref()
+            .and_then(|p| p.as_object())
+            .filter(|_| !strict)
+            .and_then(|o| o.values().find(|v| v.get("rope_theta").is_some()));
+        let params = hf.rope_parameters.as_ref();
+        let param = |key: &str| params.and_then(|p| p.get(key)).or(nested.and_then(|n| n.get(key))).and_then(|v| v.as_f64());
+        let scaling = match parse_rope_scaling(hf.rope_scaling.as_ref().or(params)) {
+            Ok(s) => s,
+            Err(e) if strict => return Err(e),
+            Err(_) => None,
+        };
+        let theta = hf.rope_theta.or(param("rope_theta")).context("no rope_theta")?;
+        let activation = match (hf.hidden_act.as_deref(), strict) {
+            (Some("silu"), _) => Activation::Swiglu,
+            (Some("gelu_pytorch_tanh" | "gelu_new" | "gelu_fast"), _) => Activation::Geglu,
+            (_, false) => Activation::Swiglu,
+            (Some(other), true) => bail!("hidden_act {other} is not supported"),
+            (None, true) => bail!("config.json has no hidden_act"),
+        };
+        if strict
+            && let Some(dtype) = hf.torch_dtype.as_deref().or(hf.dtype.as_deref())
             && !matches!(dtype, "bfloat16" | "float16" | "float32")
         {
             bail!("torch_dtype {dtype} is not supported");
         }
-        let hybrid = matches!(hf.model_type.as_str(), "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next");
-        let (qkv_bias, qk_norm) = match hf.model_type.as_str() {
-            "qwen2" => (true, false),
-            "qwen3" | "qwen3_moe" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next" => {
-                (hf.attention_bias.unwrap_or(false), true)
+        let family_hybrid = matches!(hf.model_type.as_str(), "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next");
+        let config_hybrid = hf.layer_types.as_ref().is_some_and(|t| t.iter().any(|x| x == "linear_attention"))
+            || hf.full_attention_interval.is_some_and(|n| n > 1)
+            || hf.linear_num_key_heads.is_some();
+        let hybrid = if strict { family_hybrid } else { config_hybrid };
+        let (qkv_bias, qk_norm) = if strict {
+            match hf.model_type.as_str() {
+                "qwen2" => (true, false),
+                "qwen3" | "qwen3_moe" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_next" => {
+                    (hf.attention_bias.unwrap_or(false), true)
+                }
+                "llama" | "mistral" => (hf.attention_bias.unwrap_or(false), false),
+                other => bail!("model_type {other} is not supported"),
             }
-            "llama" | "mistral" => (hf.attention_bias.unwrap_or(false), false),
-            other => bail!("model_type {other} is not supported"),
+        } else {
+            (hf.attention_bias.unwrap_or(false), false)
         };
         let head_dim = hf.head_dim.unwrap_or(hf.hidden_size / hf.num_attention_heads);
         let rotary_dim = hf
@@ -689,7 +738,7 @@ impl Spec {
             .filter(|f| *f != 1.0)
             .map(|f| (head_dim as f64 * f).round() as usize);
         let pattern = match &hf.layer_types {
-            Some(types) if hybrid => layer_pattern(types)?,
+            Some(types) if hybrid => layer_pattern(types, strict)?,
             None if hybrid && hf.full_attention_interval.is_some_and(|n| n > 1) => {
                 let n = hf.full_attention_interval.unwrap_or(4);
                 let mut p = vec![Block::Linear; n - 1];
@@ -744,7 +793,7 @@ impl Spec {
                 head_dim,
                 qkv_bias,
                 qk_norm,
-                output_gate: hf.attn_output_gate || hf.model_type == "qwen3_next",
+                output_gate: hf.attn_output_gate || (strict && hf.model_type == "qwen3_next"),
                 rotary_dim,
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling },

@@ -1,4 +1,4 @@
-use specrt::spec::{Block, Checked, EMBEDDED, LinearKind, Quant, SPEC_FORMAT, Spec, check};
+use specrt::spec::{Activation, Block, Checked, EMBEDDED, LinearKind, Quant, SPEC_FORMAT, Spec, check};
 use std::path::Path;
 
 fn root() -> &'static Path {
@@ -502,4 +502,34 @@ fn a_dense_config_without_an_intermediate_size_names_the_missing_field() {
     v.as_object_mut().unwrap().remove("intermediate_size");
     let e = Spec::from_hf_config(&v.to_string()).unwrap_err().to_string();
     assert!(e.contains("no intermediate_size") && !e.contains("missing field"), "{e}");
+}
+
+#[test]
+fn a_config_of_a_family_the_engine_has_not_seen_is_still_described() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/gemma4-31b.config.json")).unwrap();
+    let spec = Spec::describe_hf_config(&json).unwrap();
+    assert_eq!((spec.dims.hidden, spec.layers.count, spec.attention.heads, spec.attention.head_dim), (5376, 60, 32, 256));
+    assert_eq!(spec.mlp.activation, Activation::Geglu);
+    assert!(Spec::from_hf_config(&json).is_err());
+}
+
+#[test]
+fn tensors_decide_qk_norm_and_the_output_gate_not_the_family() {
+    use specrt::structure::Structure;
+    let fixtures = root().join("tests/fixtures");
+    let describe = |config: &str, header: &str| {
+        let json = std::fs::read_to_string(fixtures.join(config)).unwrap();
+        let mut spec = Spec::describe_hf_config(&json).unwrap();
+        let rows = std::fs::read_to_string(fixtures.join("headers").join(header)).unwrap();
+        spec.apply_structure(&Structure::from_json(&rows).unwrap());
+        spec
+    };
+    let llama = describe("llama-3.2-1b.config.json", "llama-3.2-1b.json");
+    assert!(!llama.attention.qk_norm && !llama.attention.qkv_bias && !llama.attention.output_gate);
+    let qwen3 = describe("qwen3-0.6b.config.json", "qwen3-0.6b.json");
+    assert!(qwen3.attention.qk_norm && !qwen3.attention.output_gate);
+    let big = describe("qwen3.8-27b.config.json", "qwen3.8-27b-fp8.json");
+    assert!(big.attention.qk_norm && big.attention.output_gate);
+    let gemma = describe("gemma4-31b.config.json", "gemma4-31b.json");
+    assert!(gemma.attention.qk_norm);
 }
