@@ -691,3 +691,107 @@ fn screenshots_of_the_server_and_logs_tabs() {
     shot(&mut h, "logs");
     h.state_mut().server.stop();
 }
+
+fn fixtures() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures")
+}
+
+fn detail_view(name: &str, toml: Option<&str>) -> detail::View {
+    match toml {
+        Some(t) => {
+            let spec = specrt::spec::Spec::load(&fixtures().join(t)).unwrap();
+            detail::View::new(name, spec, detail::Source::SpecToml, 1, Some(131072))
+        }
+        None => {
+            let json = std::fs::read_to_string(fixtures().join("tiny-qwen3.5/config.json")).unwrap();
+            let spec = specrt::spec::Spec::from_hf_config(&json).unwrap();
+            detail::View::new(name, spec, detail::Source::HfConfig, 0, None)
+        }
+    }
+}
+
+fn detail_harness(name: &str, size: egui::Vec2, view: detail::View, other: Option<detail::View>) -> Harness<'static, App> {
+    let d = dir(name);
+    Harness::builder().with_size(size).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        app.tab = Tab::Models;
+        app.settings.gpu_bandwidth_gbs = Some(800);
+        let mut detail = detail::Detail::from_view(view);
+        if let Some(o) = other {
+            detail.compare_with(o);
+        }
+        app.models.detail = Some(detail);
+        app
+    })
+}
+
+#[test]
+fn the_detail_view_draws_the_tiny_fixture_and_hovering_a_cell_shows_its_tooltip() {
+    let mut h = detail_harness("detail-tiny", egui::vec2(1280.0, 900.0), detail_view("tiny", None), None);
+    h.run();
+    let count = h.state().models.detail.as_ref().unwrap().view.as_ref().unwrap().anatomy.layers.len();
+    assert!(count >= 2);
+    h.get_by_label_contains("layer 0 ").hover();
+    h.run();
+    assert!(h.query_by_label_contains("layer 0: ").is_some());
+    assert!(h.query_by_label_contains("parameters").is_some());
+    assert!(h.query_by_label("memory against context").is_some());
+}
+
+#[test]
+fn the_detail_view_draws_the_27b_with_its_delta_net_rhythm_and_opens_a_block_diagram() {
+    let mut h = detail_harness("detail-27b", egui::vec2(1280.0, 900.0), detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), None);
+    h.run();
+    h.get_by_label("layer 3 full attention").hover();
+    h.run();
+    assert!(h.query_by_label_contains("layer 3: full attention").is_some());
+    h.get_by_label("layer 3 full attention").click();
+    h.run();
+    let d = h.state().models.detail.as_ref().unwrap();
+    assert_eq!((d.layer, d.kind), (Some(3), specrt::anatomy::LayerKind::Attention));
+    h.get_by_label("layer 2 gated delta-net").click();
+    h.run();
+    assert_eq!(h.state().models.detail.as_ref().unwrap().kind, specrt::anatomy::LayerKind::DeltaNet);
+}
+
+#[test]
+fn compare_draws_a_second_strip_on_the_same_scale() {
+    let mut h = detail_harness(
+        "detail-compare",
+        egui::vec2(1280.0, 900.0),
+        detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")),
+        Some(detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml"))),
+    );
+    h.run();
+    assert_eq!(h.query_all_by_label("layer 3 full attention").count(), 2);
+}
+
+#[test]
+#[ignore = "renders pictures; run with SHOTS=/tmp/shots"]
+fn screenshots_of_the_model_detail_view() {
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("/tmp/shots".into()));
+    std::fs::create_dir_all(&out).unwrap();
+    let cases: [(&str, detail::View, Option<detail::View>); 4] = [
+        ("27b-nvfp4", detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml")), None),
+        ("27b-fp8", detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), None),
+        ("qwen3-0.6b", {
+            let spec = specrt::spec::Spec::load(&fixtures().join("../../specs/qwen3-0.6b.toml")).unwrap();
+            detail::View::new("Qwen3-0.6B", spec, detail::Source::SpecToml, 0, Some(40960))
+        }, None),
+        ("compare", detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), Some(detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml")))),
+    ];
+    for (name, view, other) in cases {
+        for (w, h_px) in [(1400.0, 900.0), (1024.0, 700.0)] {
+            let mut h = detail_harness(&format!("shot-{name}"), egui::vec2(w, h_px), view_clone(&view), other.as_ref().map(view_clone));
+            h.run();
+            h.query_all_by_label_contains("layer 3 ").next().unwrap().click();
+            h.run();
+            h.render().unwrap().save(out.join(format!("detail-{name}-{w}.png"))).unwrap();
+        }
+    }
+}
+
+fn view_clone(v: &detail::View) -> detail::View {
+    detail::View::new(&v.name, v.spec.clone(), v.source, v.anatomy.mtp_layers, Some(v.anatomy.max_context))
+}

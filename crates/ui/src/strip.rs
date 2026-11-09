@@ -53,6 +53,7 @@ fn height_for(params: u64, scale: u64) -> f32 {
     (params as f32 / scale as f32 * STRIP_H * 0.78).clamp(3.0, STRIP_H)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cap(ui: &mut egui::Ui, id: egui::Id, rect: Rect, label: &str, params: u64, scale: u64, tint: Color32, tip: String) {
     let h = height_for(params, scale);
     let bar = Rect::from_min_max(pos2(rect.left(), rect.bottom() - h), rect.right_bottom());
@@ -123,7 +124,7 @@ fn layer_cell(ui: &mut egui::Ui, id: egui::Id, rect: Rect, l: &LayerInfo, scale:
     } else if l.kind == *kind {
         p.rect_stroke(bar, 1.0, Stroke::new(1.0, VALUE.gamma_multiply(0.35)), StrokeKind::Inside);
     }
-    if l.index % 8 == 0 && rect.width() >= 6.0 {
+    if l.index.is_multiple_of(8) && rect.width() >= 6.0 {
         let g = p.layout_no_wrap(l.index.to_string(), figure(8.5), LEGEND);
         p.galley(pos2(rect.left(), rect.bottom() + 3.0), g, LEGEND);
     }

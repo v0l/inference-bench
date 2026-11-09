@@ -71,7 +71,7 @@ fn attention_rows(spec: &Spec) -> Vec<Row> {
     };
     rows.push(Row::Boxes(vec![node(
         "rope neox",
-        format!("θ {}, {} of {d} dims{scaling}", spec.rope.theta, spec.rotary_dim()),
+        format!("theta {}, {} of {d} dims{scaling}", spec.rope.theta, spec.rotary_dim()),
     )]));
     let group = a.heads / a.kv_heads;
     let gating = if a.output_gate { ", sigmoid output gate" } else { "" };
