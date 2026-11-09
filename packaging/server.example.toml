@@ -9,6 +9,11 @@ default_model = "qwen3-0.6b"
 access_log = "/var/log/inference-bench/access.log"
 
 max_ctx = 4096
+tool_parser = "qwen3_coder"
+reasoning_parser = "qwen3"
+
+[chat_template_kwargs]
+reasoning_effort = "medium"
 
 [[models]]
 id = "qwen3-0.6b"

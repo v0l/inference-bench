@@ -2,6 +2,8 @@ use crate::config::ServerConfig;
 use crate::error::ApiError;
 use crate::manager::{EngineFactory, GpuProbe, Manager};
 use crate::metrics::{Gauges, Metrics, percentile};
+use crate::stop::StopFilter;
+use crate::tools::{Delta, OutputParser};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header};
@@ -348,11 +350,84 @@ async fn embeddings() -> ApiError {
 struct Params {
     model: String,
     messages: Vec<Message>,
+    openai_messages: Option<Vec<Value>>,
+    template_vars: Value,
+    output: OutputMode,
+    stop: Vec<String>,
     use_template: bool,
     sampling: Sampling,
     stream: bool,
     include_usage: bool,
     ignore_eos: bool,
+}
+
+#[derive(Clone, Default)]
+struct OutputMode {
+    tools: Vec<Value>,
+    tool_parsing: bool,
+    reasoning: bool,
+}
+
+impl OutputMode {
+    fn parses(&self) -> bool {
+        self.tool_parsing || self.reasoning
+    }
+}
+
+fn toml_json(t: &toml::Table) -> Value {
+    serde_json::to_value(t).unwrap_or_else(|_| json!({}))
+}
+
+fn stop_strings(body: &Value) -> Result<Vec<String>, ApiError> {
+    match &body["stop"] {
+        Value::Null => Ok(Vec::new()),
+        Value::String(s) => Ok(vec![s.clone()]),
+        Value::Array(a) if a.iter().all(Value::is_string) => Ok(a.iter().filter_map(|s| s.as_str().map(String::from)).collect()),
+        _ => Err(ApiError::bad_request("stop must be a string or an array of strings")),
+    }
+}
+
+fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), ApiError> {
+    let mut vars = toml_json(&state.config.chat_template_kwargs);
+    let user = match &body["chat_template_kwargs"] {
+        Value::Object(o) => o.clone(),
+        Value::Null => Default::default(),
+        _ => return Err(ApiError::bad_request("chat_template_kwargs must be an object")),
+    };
+    if let Some(effort) = body["reasoning_effort"].as_str() {
+        vars["reasoning_effort"] = json!(effort);
+        if !user.contains_key("enable_thinking") {
+            vars["enable_thinking"] = json!(effort != "none");
+        }
+    }
+    for (k, v) in user {
+        vars[k] = v;
+    }
+    if state.config.reasoning_parser.is_none() && vars.get("enable_thinking").is_none() {
+        vars["enable_thinking"] = json!(false);
+    }
+    let tools = match &body["tools"] {
+        Value::Array(t) => t.clone(),
+        Value::Null => Vec::new(),
+        _ => return Err(ApiError::bad_request("tools must be an array")),
+    };
+    if tools.iter().any(|t| t["type"] != "function" || !t["function"]["name"].is_string()) {
+        return Err(ApiError::bad_request("tools must be function tools with a name"));
+    }
+    let choice = match &body["tool_choice"] {
+        Value::Null => "auto",
+        Value::String(s) if s == "auto" || s == "none" => s.as_str(),
+        _ => return Err(ApiError::bad_request("tool_choice must be auto or none: required and named tool choice are not supported")),
+    };
+    if !tools.is_empty() {
+        vars["tools"] = Value::Array(tools.clone());
+    }
+    let output = OutputMode {
+        tool_parsing: state.config.tool_parser.is_some() && !tools.is_empty() && choice == "auto",
+        reasoning: state.config.reasoning_parser.is_some() && vars["enable_thinking"] != json!(false),
+        tools,
+    };
+    Ok((vars, output))
 }
 
 fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, ApiError> {
@@ -376,9 +451,17 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         seed: body["seed"].as_u64(),
         max_tokens,
     };
+    let (template_vars, output) = match chat {
+        true => chat_setup(state, body)?,
+        false => (Value::Null, OutputMode::default()),
+    };
     Ok(Params {
         model,
         messages,
+        openai_messages: chat.then(|| body["messages"].as_array().cloned().unwrap_or_default()),
+        template_vars,
+        output,
+        stop: stop_strings(body)?,
         use_template: chat,
         sampling,
         stream: body["stream"].as_bool().unwrap_or(false),
@@ -417,7 +500,7 @@ fn completion_prompt(body: &Value) -> Result<String, ApiError> {
 
 enum Gen {
     Text(String),
-    Done(Result<Generation, ApiError>),
+    Done(Result<Generation, ApiError>, bool),
 }
 
 struct CancelOnDrop(Arc<AtomicBool>);
@@ -443,6 +526,7 @@ fn start_generation(
     model: String,
     request: ChatRequest,
     max_tokens: usize,
+    stop: Vec<String>,
 ) -> Result<mpsc::UnboundedReceiver<Gen>, ApiError> {
     let mut admission = state.admit()?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -463,7 +547,7 @@ fn start_generation(
             let mut lease = match lease {
                 Ok(l) => l,
                 Err(e) => {
-                    let _ = tx.send(Gen::Done(Err(e)));
+                    let _ = tx.send(Gen::Done(Err(e), false));
                     return;
                 }
             };
@@ -476,41 +560,61 @@ fn start_generation(
             let span = Span::current();
             let outcome = tokio::task::spawn_blocking(move || {
                 span.in_scope(|| {
+                    let mut filter = StopFilter::new(stop);
+                    let mut send = |t: &str| {
+                        if !t.is_empty() && text_tx.send(Gen::Text(t.to_string())).is_err() {
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                    };
                     let result = lease.backend().chat(&request, &mut |t| {
-                        if text_tx.send(Gen::Text(t.to_string())).is_err() {
+                        let out = filter.feed(t);
+                        send(&out);
+                        if filter.hit {
                             flag.store(true, Ordering::SeqCst);
                         }
                     });
-                    match result {
+                    let tail = filter.finish();
+                    send(&tail);
+                    let hit = filter.hit;
+                    let result = match result {
+                        Ok(mut g) if hit => {
+                            g.text = filter.text;
+                            Ok(g)
+                        }
                         Ok(_) if flag.load(Ordering::SeqCst) => {
                             Err(BackendError::new(ErrorKind::Cancelled, "cancelled"))
                         }
+                        Ok(mut g) => {
+                            g.text = filter.text;
+                            Ok(g)
+                        }
                         other => other,
-                    }
+                    };
+                    (result, hit)
                 })
             })
             .await;
-            let result = match outcome {
-                Ok(r) => r.map_err(ApiError::from),
-                Err(e) => Err(ApiError::internal(format!("generation task failed: {e}"))),
+            let (result, stopped) = match outcome {
+                Ok((r, hit)) => (r.map_err(ApiError::from), hit),
+                Err(e) => (Err(ApiError::internal(format!("generation task failed: {e}"))), false),
             };
             match &result {
-                Ok(g) => record_generation(&state, &model, g, max_tokens),
+                Ok(g) => record_generation(&state, &model, g, max_tokens, stopped),
                 Err(e) if e.kind == "cancelled" => {
                     state.metrics.cancelled();
                     tracing::info!("generation cancelled by client disconnect");
                 }
                 Err(e) => tracing::error!(status = e.status.as_u16(), error = %e.message, "generation failed"),
             }
-            let _ = tx.send(Gen::Done(result));
+            let _ = tx.send(Gen::Done(result, stopped));
         }
         .instrument(span),
     );
     Ok(rx)
 }
 
-fn finish_reason(g: &Generation, max_tokens: usize) -> &'static str {
-    match g.completion_tokens as usize >= max_tokens {
+fn finish_reason(g: &Generation, max_tokens: usize, stopped: bool) -> &'static str {
+    match !stopped && g.completion_tokens as usize >= max_tokens {
         true => "length",
         false => "stop",
     }
@@ -523,9 +627,9 @@ fn decode_rate(g: &Generation) -> f64 {
     }
 }
 
-fn record_generation(state: &AppState, model: &str, g: &Generation, max_tokens: usize) {
+fn record_generation(state: &AppState, model: &str, g: &Generation, max_tokens: usize, stopped: bool) {
     let span = Span::current();
-    let reason = finish_reason(g, max_tokens);
+    let reason = finish_reason(g, max_tokens, stopped);
     span.record("prompt_tokens", g.prompt_tokens);
     span.record("completion_tokens", g.completion_tokens);
     span.record("ttft_ms", g.ttft_secs * 1000.0);
@@ -561,18 +665,18 @@ fn usage(g: &Generation) -> Value {
     })
 }
 
-async fn collect(mut rx: mpsc::UnboundedReceiver<Gen>) -> Result<Generation, ApiError> {
+async fn collect(mut rx: mpsc::UnboundedReceiver<Gen>) -> Result<(Generation, bool), ApiError> {
     let mut text = String::new();
     while let Some(ev) = rx.recv().await {
         match ev {
             Gen::Text(t) => text.push_str(&t),
-            Gen::Done(Ok(mut g)) => {
+            Gen::Done(Ok(mut g), stopped) => {
                 if g.text.is_empty() {
                     g.text = text;
                 }
-                return Ok(g);
+                return Ok((g, stopped));
             }
-            Gen::Done(Err(e)) => return Err(e),
+            Gen::Done(Err(e), _) => return Err(e),
         }
     }
     Err(ApiError::internal("generation ended without a result"))
@@ -596,21 +700,26 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool) -> Res
     request.use_template = p.use_template;
     request.ignore_eos = p.ignore_eos;
     request.cancel = Some(cancel);
+    request.openai_messages = p.openai_messages;
+    if p.use_template {
+        request.template_vars = p.template_vars;
+    }
     log_prompt(&state, &request);
-    let rx = start_generation(&state, p.model.clone(), request, max_tokens)?;
+    let rx = start_generation(&state, p.model.clone(), request, max_tokens, p.stop)?;
     let id = format!("{}-{}", if chat { "chatcmpl" } else { "cmpl" }, &uuid::Uuid::new_v4().simple().to_string()[..24]);
     if p.stream {
-        let events = sse_events(rx, guard, id, p.model, max_tokens, chat, p.include_usage);
+        let events = sse_events(rx, guard, id, p.model, max_tokens, chat, p.include_usage, p.output);
         return Ok(Sse::new(events).keep_alive(KeepAlive::default()).into_response());
     }
-    let g = collect(rx).await?;
+    let (g, stopped) = collect(rx).await?;
     drop(guard);
-    let reason = finish_reason(&g, max_tokens);
+    let reason = finish_reason(&g, max_tokens, stopped);
     let created = now();
     let body = if chat {
+        let (message, reason) = chat_message(&g.text, &p.output, reason);
         json!({
             "id": id, "object": "chat.completion", "created": created, "model": p.model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": g.text}, "finish_reason": reason}],
+            "choices": [{"index": 0, "message": message, "finish_reason": reason}],
             "usage": usage(&g),
         })
     } else {
@@ -621,6 +730,44 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool) -> Res
         })
     };
     Ok(Json(body).into_response())
+}
+
+fn chat_message(text: &str, output: &OutputMode, reason: &'static str) -> (Value, &'static str) {
+    if !output.parses() {
+        return (json!({"role": "assistant", "content": text}), reason);
+    }
+    let parsed = OutputParser::parse(&output.tools, output.tool_parsing, output.reasoning, text);
+    let mut message = json!({"role": "assistant", "content": parsed.content});
+    if let Some(r) = &parsed.reasoning {
+        message["reasoning"] = json!(r);
+        message["reasoning_content"] = json!(r);
+    }
+    if parsed.tool_calls.is_empty() {
+        return (message, reason);
+    }
+    message["tool_calls"] = parsed
+        .tool_calls
+        .iter()
+        .map(|c| json!({"id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments}}))
+        .collect();
+    (message, "tool_calls")
+}
+
+fn delta_json(d: &Delta) -> Value {
+    match d {
+        Delta::Content(t) => json!({"content": t}),
+        Delta::Reasoning(t) => json!({"reasoning": t, "reasoning_content": t}),
+        Delta::Call { index, id, name } => {
+            json!({"tool_calls": [{"index": index, "id": id, "type": "function", "function": {"name": name, "arguments": ""}}]})
+        }
+        Delta::Args { index, arguments } => json!({"tool_calls": [{"index": index, "function": {"arguments": arguments}}]}),
+    }
+}
+
+fn delta_chunk(id: &str, model: &str, delta: Value) -> Value {
+    let mut c = chunk(id, model, true, None, None);
+    c["choices"][0]["delta"] = delta;
+    c
 }
 
 fn chunk(id: &str, model: &str, chat: bool, delta: Option<(&str, &str)>, reason: Option<&str>) -> Value {
@@ -652,6 +799,7 @@ fn sse_events(
     max_tokens: usize,
     chat: bool,
     include_usage: bool,
+    output: OutputMode,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let data = |v: Value| Ok(Event::default().data(v.to_string()));
     let opening = match chat {
@@ -663,24 +811,49 @@ fn sse_events(
             return None;
         }
         rx.recv().await.map(|ev| {
-            let finished = matches!(ev, Gen::Done(_));
+            let finished = matches!(ev, Gen::Done(..));
             (ev, (rx, finished))
         })
     });
     let mut streamed = false;
+    let mut parser = output.parses().then(|| OutputParser::new(&output.tools, output.tool_parsing, output.reasoning));
     let tail = body.flat_map(move |ev| {
         let _keep = &guard;
+        let deltas = |_: &mut OutputParser, deltas: Vec<Delta>| -> Vec<Result<Event, Infallible>> {
+            deltas.iter().map(|d| data(delta_chunk(&id, &model, delta_json(d)))).collect()
+        };
         let items: Vec<Result<Event, Infallible>> = match ev {
             Gen::Text(t) => {
                 streamed = true;
-                vec![data(chunk(&id, &model, chat, Some(("", &t)), None))]
-            }
-            Gen::Done(Ok(g)) => {
-                let mut out = Vec::new();
-                if !streamed && !g.text.is_empty() {
-                    out.push(data(chunk(&id, &model, chat, Some(("", &g.text)), None)));
+                match parser.as_mut() {
+                    Some(p) => {
+                        let d = p.feed(&t);
+                        deltas(p, d)
+                    }
+                    None => vec![data(chunk(&id, &model, chat, Some(("", &t)), None))],
                 }
-                out.push(data(chunk(&id, &model, chat, None, Some(finish_reason(&g, max_tokens)))));
+            }
+            Gen::Done(Ok(g), stopped) => {
+                let mut out = Vec::new();
+                let mut reason = finish_reason(&g, max_tokens, stopped);
+                match parser.as_mut() {
+                    Some(p) => {
+                        let mut d = match streamed {
+                            true => Vec::new(),
+                            false => p.feed(&g.text),
+                        };
+                        d.extend(p.finish());
+                        out.extend(deltas(p, d));
+                        if p.called() {
+                            reason = "tool_calls";
+                        }
+                    }
+                    None if !streamed && !g.text.is_empty() => {
+                        out.push(data(chunk(&id, &model, chat, Some(("", &g.text)), None)))
+                    }
+                    None => {}
+                }
+                out.push(data(chunk(&id, &model, chat, None, Some(reason))));
                 if include_usage {
                     let mut u = chunk(&id, &model, chat, None, None);
                     u["choices"] = json!([]);
@@ -690,7 +863,7 @@ fn sse_events(
                 out.push(Ok(Event::default().data("[DONE]")));
                 out
             }
-            Gen::Done(Err(e)) => vec![
+            Gen::Done(Err(e), _) => vec![
                 data(json!({"error": {"message": e.message, "type": e.kind, "code": e.status.as_u16().to_string()}})),
                 Ok(Event::default().data("[DONE]")),
             ],
@@ -725,8 +898,8 @@ async fn bench(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> R
             let mut request = ChatRequest::new(vec![Message::new(Role::User, prompt.clone())], sampling);
             request.use_template = false;
             request.cancel = Some(cancel);
-            let outcome = match start_generation(&state, model.clone(), request, max_tokens) {
-                Ok(rx) => collect(rx).await,
+            let outcome = match start_generation(&state, model.clone(), request, max_tokens, Vec::new()) {
+                Ok(rx) => collect(rx).await.map(|(g, _)| g),
                 Err(e) => Err(e),
             };
             match outcome {

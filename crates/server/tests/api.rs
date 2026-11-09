@@ -120,7 +120,7 @@ fn keys_from_the_environment_are_accepted() {
 
 #[test]
 fn full_queue_returns_429_with_retry_after() {
-    let shape = Shape { tokens: 3, first_delay_ms: 600, token_delay_ms: 1 };
+    let shape = Shape { tokens: 3, first_delay_ms: 600, token_delay_ms: 1, ..Shape::default() };
     let rig = start(config("max_concurrent = 1\nqueue_depth = 1\nretry_after_secs = 7\n[[models]]\nid='m'"), shape);
     let mut held = Vec::new();
     for _ in 0..2 {
@@ -141,7 +141,7 @@ fn full_queue_returns_429_with_retry_after() {
 
 #[test]
 fn client_disconnect_cancels_generation() {
-    let shape = Shape { tokens: 500, first_delay_ms: 0, token_delay_ms: 20 };
+    let shape = Shape { tokens: 500, first_delay_ms: 0, token_delay_ms: 20, ..Shape::default() };
     let rig = start(config("[[models]]\nid='m'"), shape);
     let body = json!({"model": "m", "messages": [{"role": "user", "content": "go"}], "max_tokens": 500, "stream": true});
     let mut s = rig.raw_post("/v1/chat/completions", &body.to_string());
@@ -246,7 +246,7 @@ fn metrics_counters_move() {
 
 #[test]
 fn bench_runs_a_prompt_set_and_returns_stats() {
-    let rig = start(config("[[models]]\nid='m'"), Shape { tokens: 5, first_delay_ms: 5, token_delay_ms: 2 });
+    let rig = start(config("[[models]]\nid='m'"), Shape { tokens: 5, first_delay_ms: 5, token_delay_ms: 2, ..Shape::default() });
     let (status, body, _) =
         rig.post("/v1/bench", None, json!({"model": "m", "prompts": ["one two", "three"], "max_tokens": 5, "repeat": 2}));
     assert_eq!(status, 200, "{body}");
@@ -273,7 +273,7 @@ fn cors_headers_are_sent_for_allowed_origins() {
 
 #[test]
 fn graceful_shutdown_drains_in_flight_requests() {
-    let shape = Shape { tokens: 5, first_delay_ms: 300, token_delay_ms: 20 };
+    let shape = Shape { tokens: 5, first_delay_ms: 300, token_delay_ms: 20, ..Shape::default() };
     let mut rig = start(config("[[models]]\nid='m'"), shape);
     let mut s = rig.raw_post("/v1/chat/completions", &chat("m", true).to_string());
     wait_for("in flight", || rig.metrics().contains("inference_in_flight 1"));
@@ -286,7 +286,7 @@ fn graceful_shutdown_drains_in_flight_requests() {
 
 #[test]
 fn streaming_sends_several_chunks_spread_over_time_before_done() {
-    let shape = Shape { tokens: 8, first_delay_ms: 0, token_delay_ms: 60 };
+    let shape = Shape { tokens: 8, first_delay_ms: 0, token_delay_ms: 60, ..Shape::default() };
     let rig = start(config("[[models]]\nid='m'"), shape);
     let body = json!({"model": "m", "messages": [{"role": "user", "content": "go"}], "max_tokens": 8, "stream": true});
     let mut s = rig.raw_post("/v1/chat/completions", &body.to_string());

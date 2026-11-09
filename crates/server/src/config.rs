@@ -140,6 +140,9 @@ pub struct ServerConfig {
     pub itl_target_ms: Option<u64>,
     pub runtime: Option<inference_bench_core::specrt_serve::RuntimeOptions>,
     pub speculative: inference_bench_core::specrt_serve::SpeculativeOptions,
+    pub tool_parser: Option<String>,
+    pub reasoning_parser: Option<String>,
+    pub chat_template_kwargs: toml::Table,
 }
 
 impl Default for ServerConfig {
@@ -174,6 +177,9 @@ impl Default for ServerConfig {
             itl_target_ms: None,
             runtime: None,
             speculative: Default::default(),
+            tool_parser: None,
+            reasoning_parser: None,
+            chat_template_kwargs: toml::Table::new(),
         }
     }
 }
@@ -252,6 +258,12 @@ impl ServerConfig {
         }
         anyhow::ensure!(self.kv_cache_gb.is_none_or(|g| g > 0.0), "kv_cache_gb must be positive");
         anyhow::ensure!(self.max_loaded_models >= 1, "max_loaded_models must be at least 1");
+        if let Some(p) = &self.tool_parser {
+            anyhow::ensure!(matches!(p.as_str(), "qwen3_coder" | "qwen3_xml"), "tool_parser {p} is not supported: use qwen3_coder");
+        }
+        if let Some(p) = &self.reasoning_parser {
+            anyhow::ensure!(p == "qwen3", "reasoning_parser {p} is not supported: use qwen3");
+        }
         let mut seen = std::collections::HashSet::new();
         for m in &self.models {
             anyhow::ensure!(!m.id.is_empty(), "a model has an empty id");

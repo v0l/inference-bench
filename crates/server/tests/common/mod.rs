@@ -14,6 +14,7 @@ pub struct Stats {
     pub cancelled: AtomicUsize,
     pub generated: AtomicUsize,
     pub prompts: Mutex<Vec<String>>,
+    pub requests: Mutex<Vec<ChatRequest>>,
     pub loaded_names: Mutex<Vec<String>>,
 }
 
@@ -21,6 +22,7 @@ pub struct Fake {
     pub tokens: usize,
     pub first_delay_ms: u64,
     pub token_delay_ms: u64,
+    pub pieces: Vec<String>,
     pub stats: Arc<Stats>,
 }
 
@@ -47,6 +49,7 @@ impl Target for Fake {
     }
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
+        self.stats.requests.lock().unwrap().push(request.clone());
         self.run(&request.flatten(), request.sampling.max_tokens, Some(request), on_text)
     }
 }
@@ -63,7 +66,10 @@ impl Fake {
         let started = Instant::now();
         std::thread::sleep(Duration::from_millis(self.first_delay_ms));
         let ttft = started.elapsed().as_secs_f64();
-        let n = self.tokens.min(max_tokens);
+        let n = match self.pieces.is_empty() {
+            true => self.tokens.min(max_tokens),
+            false => self.pieces.len().min(max_tokens),
+        };
         let mut text = String::new();
         for i in 0..n {
             if request.is_some_and(|r| r.cancelled()) {
@@ -71,14 +77,20 @@ impl Fake {
                 break;
             }
             std::thread::sleep(Duration::from_millis(self.token_delay_ms));
-            let piece = format!("w{i} ");
+            let piece = match self.pieces.get(i) {
+                Some(p) => p.clone(),
+                None => format!("w{i} "),
+            };
             text.push_str(&piece);
             on_text(&piece);
         }
         if !request.is_some_and(|r| r.cancelled()) {
             self.stats.generated.fetch_add(1, Ordering::SeqCst);
         }
-        let completion_tokens = text.split_whitespace().count() as u64;
+        let completion_tokens = match self.pieces.is_empty() {
+            true => text.split_whitespace().count() as u64,
+            false => n as u64,
+        };
         Ok(Generation {
             text,
             prompt_tokens: prompt.split_whitespace().count() as u64,
@@ -102,11 +114,12 @@ pub struct Shape {
     pub tokens: usize,
     pub first_delay_ms: u64,
     pub token_delay_ms: u64,
+    pub pieces: Vec<String>,
 }
 
 impl Default for Shape {
     fn default() -> Self {
-        Self { tokens: 4, first_delay_ms: 0, token_delay_ms: 1 }
+        Self { tokens: 4, first_delay_ms: 0, token_delay_ms: 1, pieces: Vec::new() }
     }
 }
 
@@ -127,6 +140,7 @@ pub fn start(config: ServerConfig, shape: Shape) -> Rig {
             tokens: shape.tokens,
             first_delay_ms: shape.first_delay_ms,
             token_delay_ms: shape.token_delay_ms,
+            pieces: shape.pieces.clone(),
             stats: s.clone(),
         }))
     };

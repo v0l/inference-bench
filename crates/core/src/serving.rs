@@ -3,7 +3,6 @@ use crate::native::engine_error;
 use crate::result::{BackendError, Generation};
 use crate::target::{Capabilities, Request, Target};
 use specrt::runtime::Sampling;
-use specrt::sched::Finish;
 use specrt::serve::{Histogram, ServeOptions, Serving, Stats};
 use std::fmt::Write;
 use std::sync::Arc;
@@ -40,9 +39,6 @@ impl ServingTarget {
                 true
             })
             .map_err(|e| engine_error(&e))?;
-        if c.finish == Some(Finish::Cancelled) {
-            return Err(BackendError::new(crate::result::ErrorKind::Cancelled, "cancelled"));
-        }
         Ok(Generation {
             text: c.text,
             prompt_tokens: c.prompt_tokens as u64,
