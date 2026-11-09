@@ -95,6 +95,7 @@ pub struct SpecStats {
     pub rows: u64,
     pub drafted: u64,
     pub accepted: u64,
+    pub position_accepted: [u64; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -568,6 +569,11 @@ impl Runtime {
         m.stats.rows += n as u64;
         m.stats.drafted += (n * k) as u64;
         m.stats.accepted += accepted.iter().map(|&a| a as u64).sum::<u64>();
+        for &a in &accepted {
+            for j in 0..(a as usize).min(4) {
+                m.stats.position_accepted[j] += 1;
+            }
+        }
         Ok(emitted)
     }
 

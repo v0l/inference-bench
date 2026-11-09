@@ -222,6 +222,10 @@ fn scheduled_speculation_matches_single_sequence_greedy_and_counts_drafts() {
         let stats = sched.exec.rt.spec_stats();
         eprintln!("cap {cap:?}: {} speculative steps, drafted {drafted}, accepted {accepted}", stats.steps);
         assert!(stats.steps > 0 && drafted as u64 == stats.drafted);
+        let pos = stats.position_accepted;
+        assert_eq!(pos.iter().sum::<u64>(), stats.accepted);
+        assert_eq!(pos.iter().sum::<u64>(), accepted as u64);
+        assert!(pos[0] <= stats.rows && pos[1] <= pos[0] && pos[2] == 0 && pos[3] == 0, "{pos:?} of {} rows", stats.rows);
         let ordered: Vec<Vec<u32>> = ids.iter().map(|id| got[id].clone()).collect();
         check(&format!("scheduled, cap {cap:?}"), &ordered, &want);
         assert_eq!(sched.blocks_used(), 0);
@@ -276,6 +280,11 @@ enum Drafts {
 }
 
 fn speculative_greedy(s: &Spec, prompts: &[Vec<u32>], want: &[Vec<u32>], drafts: Drafts, batch: usize) -> (Vec<Vec<u32>>, f64) {
+    let (outs, mean, _) = speculative_run(s, prompts, want, drafts, batch);
+    (outs, mean)
+}
+
+fn speculative_run(s: &Spec, prompts: &[Vec<u32>], want: &[Vec<u32>], drafts: Drafts, batch: usize) -> (Vec<Vec<u32>>, f64, specrt::runtime::SpecStats) {
     let k = s.mtp.as_ref().unwrap().draft_tokens;
     let mut rt = Runtime::load_layout(s, layout(batch)).unwrap();
     tables(&mut rt, batch);
@@ -346,7 +355,7 @@ fn speculative_greedy(s: &Spec, prompts: &[Vec<u32>], want: &[Vec<u32>], drafts:
     }
     let st = rt.spec_stats();
     let mean = 1.0 + st.accepted as f64 / st.rows.max(1) as f64;
-    (outs, if st.drafted == 0 { 0.0 } else { mean })
+    (outs, if st.drafted == 0 { 0.0 } else { mean }, st)
 }
 
 fn check(name: &str, got: &[Vec<u32>], want: &[Vec<u32>]) {
@@ -401,4 +410,20 @@ fn batched_speculation_with_different_accept_counts_matches_plain_greedy() {
         assert!(mean > 2.8, "oracle drafts in a batch: {mean}");
         check(&format!("batch {batch}, oracle drafts"), &got, &want);
     }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn per_position_acceptance_counts_follow_the_forced_wrong_draft_position() {
+    let s = spec(2);
+    let ps: Vec<Vec<u32>> = prompts().into_iter().take(4).collect();
+    let want = plain_greedy(&s, &ps);
+    let (_, _, all) = speculative_run(&s, &ps, &want, Drafts::Oracle(2), 1);
+    let capped = 2 * ps.len() as u64;
+    assert!(all.position_accepted[0] + capped >= all.rows && all.position_accepted[1] + capped >= all.rows, "{all:?}");
+    let (_, _, second_wrong) = speculative_run(&s, &ps, &want, Drafts::Oracle(1), 1);
+    assert!(second_wrong.position_accepted[0] + capped >= second_wrong.rows, "{second_wrong:?}");
+    assert_eq!(second_wrong.position_accepted[1], 0);
+    let (_, _, first_wrong) = speculative_run(&s, &ps, &want, Drafts::Oracle(0), 1);
+    assert_eq!(first_wrong.position_accepted, [0; 4]);
 }
