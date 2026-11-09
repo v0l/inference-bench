@@ -1,5 +1,5 @@
 use crate::codegen::{FP8_BLOCK, Q8_GROUP};
-use crate::gguf::{GgmlType, Gguf};
+use crate::gguf::{DeviceRows, GgmlType, Gguf};
 use crate::spec::{Quant, Spec};
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::{Mmap, UncheckedAdvice};
@@ -14,6 +14,7 @@ pub enum Matrix<'a> {
     Q8 { values: Vec<i8>, scales: Vec<f32> },
     Fp8 { values: Cow<'a, [u8]>, scales: Vec<f32> },
     Fp4(crate::nvfp4::Fp4<'a>),
+    Ggml(DeviceRows),
 }
 
 pub struct Attn<'a> {
@@ -326,6 +327,9 @@ impl Checkpoint {
 
     fn gguf_raw(&self, g: &Gguf, weight: &str, rows: usize, cols: usize) -> Result<Raw<'_>> {
         let (info, data) = self.gguf_tensor(g, weight, &[rows, cols])?;
+        if g.weight_quant() == Quant::Gguf {
+            return Ok(Raw::Ggml(DeviceRows::pack(info.kind, &data, rows, cols).with_context(|| weight.to_string())?));
+        }
         if info.kind == GgmlType::Q8_0 {
             let (values, scales) = crate::gguf::q8_0_split(&data);
             return Ok(Raw::Q8 { values, scales, cols });
@@ -346,6 +350,7 @@ pub fn peak_rss_bytes() -> Option<u64> {
 enum Raw<'a> {
     Bf16 { w: Cow<'a, [u16]>, cols: usize },
     Q8 { values: Vec<i8>, scales: Vec<f32>, cols: usize },
+    Ggml(DeviceRows),
     Fp8 { w: Cow<'a, [u8]>, grid: Vec<f32>, map: Vec<u32>, cols: usize },
 }
 
@@ -358,6 +363,7 @@ impl<'a> Raw<'a> {
     fn cols(&self) -> usize {
         match self {
             Raw::Bf16 { cols, .. } | Raw::Q8 { cols, .. } | Raw::Fp8 { cols, .. } => *cols,
+            Raw::Ggml(d) => d.cols,
         }
     }
 
@@ -365,6 +371,7 @@ impl<'a> Raw<'a> {
         match self {
             Raw::Bf16 { w, cols } => w.len() / cols,
             Raw::Q8 { values, cols, .. } => values.len() / cols,
+            Raw::Ggml(d) => d.rows.len(),
             Raw::Fp8 { w, cols, .. } => w.len() / cols,
         }
     }
@@ -376,6 +383,7 @@ impl<'a> Raw<'a> {
                 let groups = cols / Q8_GROUP;
                 Raw::Q8 { values: values[from * cols..to * cols].to_vec(), scales: scales[from * groups..to * groups].to_vec(), cols: *cols }
             }
+            Raw::Ggml(d) => Raw::Ggml(DeviceRows { data: d.data.clone(), rows: d.rows[from..to].to_vec(), cols: d.cols }),
             Raw::Fp8 { w, grid, map, cols } => {
                 let kb = cols.div_ceil(FP8_BLOCK) as u32;
                 let map = &map[from..to];
@@ -413,12 +421,35 @@ impl<'a> Raw<'a> {
                     .collect();
                 Raw::Bf16 { w: Cow::Owned(out), cols }
             }
+            Raw::Ggml(d) => {
+                let out = (0..d.rows.len()).flat_map(|r| d.row_f32(r)).map(f32_to_bf16).collect();
+                Raw::Bf16 { w: Cow::Owned(out), cols: d.cols }
+            }
             bf16 => bf16,
+        }
+    }
+
+    fn into_ggml(self) -> Result<DeviceRows> {
+        match self {
+            Raw::Ggml(d) => Ok(d),
+            Raw::Bf16 { w, cols } => DeviceRows::from_bf16(&w, cols),
+            other => other.dequantized().into_ggml(),
         }
     }
 
     fn concat(parts: Vec<Raw<'a>>) -> Result<Raw<'a>> {
         let mut parts = parts;
+        if parts.iter().any(|p| matches!(p, Raw::Ggml(_))) {
+            let mut rows = parts.into_iter().map(Raw::into_ggml);
+            let mut out = rows.next().context("nothing to concatenate")??;
+            for more in rows {
+                let more = more?;
+                ensure!(more.cols == out.cols, "fused rows have different widths");
+                let table = out.append(more);
+                out.rows.extend(table);
+            }
+            return Ok(Raw::Ggml(out));
+        }
         if parts.iter().any(|p| matches!(p, Raw::Q8 { .. })) && !parts.iter().all(|p| matches!(p, Raw::Q8 { .. })) {
             parts = parts.into_iter().map(Raw::dequantized).collect();
         }
@@ -446,6 +477,13 @@ impl<'a> Raw<'a> {
 
     fn interleave(a: Raw<'a>, b: Raw<'a>) -> Result<Raw<'a>> {
         ensure!(a.rows() == b.rows() && a.cols() == b.cols(), "gate and up differ in shape");
+        if matches!(a, Raw::Ggml(_)) || matches!(b, Raw::Ggml(_)) {
+            let mut out = a.into_ggml()?;
+            let gate = std::mem::take(&mut out.rows);
+            let up = out.append(b.into_ggml()?);
+            out.rows = interleave_rows(&gate, &up, 1);
+            return Ok(Raw::Ggml(out));
+        }
         Ok(match (a, b) {
             (Raw::Q8 { values: va, scales: sa, cols }, Raw::Q8 { values: vb, scales: sb, .. }) => Raw::Q8 {
                 values: interleave_rows(&va, &vb, cols),
@@ -471,7 +509,13 @@ impl<'a> Raw<'a> {
     }
 
     fn into_matrix(self, quant: Quant, what: &str) -> Result<Matrix<'a>> {
-        if matches!(self, Raw::Q8 { .. }) && quant != Quant::Q8 {
+        if matches!(self, Raw::Q8 { .. } | Raw::Ggml(_)) && !matches!(quant, Quant::Q8 | Quant::Gguf) {
+            return self.dequantized().into_matrix(quant, what);
+        }
+        if quant == Quant::Gguf {
+            return Ok(Matrix::Ggml(self.into_ggml()?));
+        }
+        if matches!(self, Raw::Ggml(_)) {
             return self.dequantized().into_matrix(quant, what);
         }
         Ok(match (self, quant) {
@@ -490,6 +534,7 @@ impl<'a> Raw<'a> {
                 Matrix::Fp8 { values: w, scales: fp8_scales(&grid, &map) }
             }
             (Raw::Bf16 { .. }, q) => bail!("{what} is bf16 but the spec says {q:?}"),
+            (Raw::Ggml(_), _) => unreachable!("ggml rows are handled above"),
             (Raw::Fp8 { .. }, _) => bail!("{what} is FP8; use quant = \"fp8_block128\" or \"fp8_channel\""),
         })
     }
@@ -779,7 +824,9 @@ impl Checkpoint {
         let root = self.root();
         let embed = self.bf16(&format!("{root}.embed_tokens.weight"), &[d.vocab, d.hidden])?;
         let head_quant = spec.lm_head_quant();
-        let lm_head = if d.tie_embeddings {
+        let lm_head = if d.tie_embeddings && self.gguf.is_some() {
+            self.raw(&format!("{root}.embed_tokens.weight"), d.vocab, d.hidden)?
+        } else if d.tie_embeddings {
             Raw::Bf16 { w: embed.clone(), cols: d.hidden }
         } else {
             self.raw("lm_head.weight", d.vocab, d.hidden)?

@@ -113,6 +113,7 @@ pub fn quant_tag(q: Quant) -> &'static str {
         Quant::Fp8Block128 => "fp8 block-128",
         Quant::Fp8Channel => "fp8 channel",
         Quant::Nvfp4G16 => "nvfp4 g16",
+        Quant::Gguf => "gguf",
     }
 }
 
@@ -121,7 +122,7 @@ pub fn quant_bytes(params: u64, q: Quant) -> u64 {
         Quant::Bf16 => (2, 1),
         Quant::Q8 | Quant::Fp8Channel => (1, 1),
         Quant::Fp8Block128 => (16386, 16384),
-        Quant::Nvfp4G16 => (9, 16),
+        Quant::Nvfp4G16 | Quant::Gguf => (9, 16),
     };
     (params * num).div_ceil(den)
 }

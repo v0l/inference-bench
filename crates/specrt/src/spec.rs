@@ -45,6 +45,7 @@ pub enum Quant {
     Fp8Channel,
     #[serde(rename = "nvfp4_g16")]
     Nvfp4G16,
+    Gguf,
 }
 
 impl Quant {
@@ -906,6 +907,13 @@ impl Spec {
         );
         let rot = self.rotary_dim();
         ensure!(self.quant != Quant::Nvfp4G16, "nvfp4_g16 is supported for [mlp] quant only");
+        if self.quant == Quant::Gguf {
+            ensure!(
+                [self.dims.hidden, self.dims.intermediate, self.q_dim()].iter().all(|d| d.is_multiple_of(crate::gguf::DEVICE_SUPERBLOCK)),
+                "quant = \"gguf\" needs hidden, intermediate and heads * head_dim to be multiples of 256"
+            );
+            ensure!(self.linear_attention.is_none(), "quant = \"gguf\" is for dense attention models");
+        }
         match (self.mlp.quant, self.mlp.quant_until) {
             (None, Some(_)) => bail!("[mlp] quant_until needs [mlp] quant"),
             (Some(m), until) => {
@@ -1019,6 +1027,7 @@ impl Spec {
     pub fn lm_head_quant(&self) -> Quant {
         match self.head_quant {
             Some(q) => q,
+            None if self.quant == Quant::Gguf => Quant::Gguf,
             None if self.quant.quantised_checkpoint() => Quant::Bf16,
             None => self.quant,
         }

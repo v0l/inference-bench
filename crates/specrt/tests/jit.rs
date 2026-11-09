@@ -19,6 +19,18 @@ fn cache_key_covers_source_arch_and_options() {
 }
 
 #[test]
+fn the_gguf_module_renders_the_ggml_kernels() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3-0.6b-gguf.toml");
+    let module = Module::generate(&Spec::load(&path).unwrap(), 256).unwrap();
+    if let Some(out) = std::env::var_os("SPECRT_DUMP_SOURCE") {
+        std::fs::write(out, &module.source).unwrap();
+    }
+    assert!(module.source.contains("linear_ggml<"));
+    assert!(module.source.contains("gate_up_act_norm<3>"));
+    assert!(module.kernels.contains(&"gg_dequant_rows"));
+}
+
+#[test]
 #[ignore = "needs a CUDA GPU with NVRTC"]
 fn compiles_and_caches_both_models() {
     let dir = std::env::temp_dir().join(format!("specrt-jit-{}", std::process::id()));

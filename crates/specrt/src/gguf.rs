@@ -406,9 +406,15 @@ impl Gguf {
         Ok(spec)
     }
 
-    fn weight_quant(&self) -> Quant {
-        let q8 = self.tensor("blk.0.ffn_down.weight").is_some_and(|t| t.kind == GgmlType::Q8_0);
-        if q8 { Quant::Q8 } else { Quant::Bf16 }
+    pub fn weight_quant(&self) -> Quant {
+        let kinds: Vec<GgmlType> = self.tensors.values().filter(|t| t.name.starts_with("blk.") && t.shape.len() == 2).map(|t| t.kind).collect();
+        if kinds.iter().any(|k| matches!(k, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)) {
+            Quant::Gguf
+        } else if kinds.contains(&GgmlType::Q8_0) {
+            Quant::Q8
+        } else {
+            Quant::Bf16
+        }
     }
 
     fn rope_scaling(&self, head_dim: usize) -> Result<Option<RopeScaling>> {
@@ -647,6 +653,116 @@ pub fn dequantize(kind: GgmlType, data: &[u8], out: &mut [f32]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub const DEVICE_SUPERBLOCK: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceRow {
+    Q4K = 0,
+    Q5K = 1,
+    Q6K = 2,
+    Q8 = 3,
+    Bf16 = 4,
+    F16 = 5,
+}
+
+impl DeviceRow {
+    pub fn of(kind: GgmlType) -> Result<DeviceRow> {
+        Ok(match kind {
+            GgmlType::Q4K => DeviceRow::Q4K,
+            GgmlType::Q5K => DeviceRow::Q5K,
+            GgmlType::Q6K => DeviceRow::Q6K,
+            GgmlType::Q8_0 => DeviceRow::Q8,
+            GgmlType::Bf16 | GgmlType::F32 => DeviceRow::Bf16,
+            GgmlType::F16 => DeviceRow::F16,
+            GgmlType::Other(_) => bail!("GGUF tensor type {} is not supported", kind.name()),
+        })
+    }
+
+    fn from_code(code: u32) -> DeviceRow {
+        match code {
+            0 => DeviceRow::Q4K,
+            1 => DeviceRow::Q5K,
+            2 => DeviceRow::Q6K,
+            3 => DeviceRow::Q8,
+            4 => DeviceRow::Bf16,
+            _ => DeviceRow::F16,
+        }
+    }
+
+    pub fn bytes(self) -> usize {
+        match self {
+            DeviceRow::Q4K => 144,
+            DeviceRow::Q5K => 176,
+            DeviceRow::Q6K => 224,
+            DeviceRow::Q8 => 272,
+            DeviceRow::Bf16 | DeviceRow::F16 => 512,
+        }
+    }
+}
+
+pub struct DeviceRows {
+    pub data: Vec<u8>,
+    pub rows: Vec<u32>,
+    pub cols: usize,
+}
+
+impl DeviceRows {
+    pub fn pack(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Result<DeviceRows> {
+        let row = DeviceRow::of(kind)?;
+        ensure!(cols.is_multiple_of(DEVICE_SUPERBLOCK), "a {} row of {cols} is not a whole number of 256-element blocks", kind.name());
+        let src_row = kind.row_bytes(cols)?;
+        ensure!(data.len() == src_row * rows, "{} data of {} bytes is not {rows} rows of {cols}", kind.name(), data.len());
+        let per_row = cols / DEVICE_SUPERBLOCK * row.bytes();
+        let mut out = Vec::with_capacity(per_row * rows);
+        for src in data.chunks_exact(src_row) {
+            match kind {
+                GgmlType::Q6K => {
+                    for b in src.chunks_exact(210) {
+                        out.extend_from_slice(b);
+                        out.extend_from_slice(&[0u8; 14]);
+                    }
+                }
+                GgmlType::F32 => out.extend(src.chunks_exact(4).flat_map(|b| crate::weights::f32_to_bf16(f32::from_le_bytes(b.try_into().expect("4 bytes"))).to_le_bytes())),
+                _ => out.extend_from_slice(src),
+            }
+        }
+        let table = (0..rows).map(|r| ((r * per_row / 16) as u32) << 3 | row as u32).collect();
+        ensure!(out.len() / 16 < 1 << 29, "a GGUF matrix of {} bytes is too large for the row table", out.len());
+        Ok(DeviceRows { data: out, rows: table, cols })
+    }
+
+    pub fn from_bf16(w: &[u16], cols: usize) -> Result<DeviceRows> {
+        let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+        DeviceRows::pack(GgmlType::Bf16, &bytes, w.len() / cols, cols)
+    }
+
+    pub fn append(&mut self, other: DeviceRows) -> Vec<u32> {
+        let base = (self.data.len() / 16) as u32;
+        self.data.extend(other.data);
+        other.rows.into_iter().map(|e| e + (base << 3)).collect()
+    }
+
+    pub fn row_f32(&self, r: usize) -> Vec<f32> {
+        let entry = self.rows[r];
+        let row = DeviceRow::from_code(entry & 7);
+        let start = (entry >> 3) as usize * 16;
+        let blocks = self.cols / DEVICE_SUPERBLOCK;
+        let mut out = vec![0f32; self.cols];
+        for (b, y) in out.chunks_exact_mut(DEVICE_SUPERBLOCK).enumerate().take(blocks) {
+            let sb = &self.data[start + b * row.bytes()..start + (b + 1) * row.bytes()];
+            match row {
+                DeviceRow::Q4K => dequantize_q4_k(sb, y),
+                DeviceRow::Q5K => dequantize_q5_k(sb, y),
+                DeviceRow::Q6K => dequantize_q6_k(&sb[..210], y),
+                DeviceRow::Q8 => sb.chunks_exact(34).zip(y.chunks_exact_mut(32)).for_each(|(q, o)| dequantize_q8_0(q, o)),
+                DeviceRow::Bf16 => y.iter_mut().zip(sb.chunks_exact(2)).for_each(|(o, h)| *o = crate::weights::bf16_to_f32(u16::from_le_bytes([h[0], h[1]]))),
+                DeviceRow::F16 => y.iter_mut().zip(sb.chunks_exact(2)).for_each(|(o, h)| *o = f16(h)),
+            }
+        }
+        out
+    }
 }
 
 pub fn q8_0_split(data: &[u8]) -> (Vec<i8>, Vec<f32>) {

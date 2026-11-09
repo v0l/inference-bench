@@ -436,6 +436,7 @@ pub enum WeightFormat {
     Bf16,
     Q8,
     Fp8,
+    Ggml,
 }
 
 impl WeightFormat {
@@ -444,6 +445,7 @@ impl WeightFormat {
             Quant::Bf16 => WeightFormat::Bf16,
             Quant::Q8 => WeightFormat::Q8,
             Quant::Fp8Block128 | Quant::Fp8Channel => WeightFormat::Fp8,
+            Quant::Gguf => WeightFormat::Ggml,
             Quant::Nvfp4G16 => unreachable!("nvfp4 is an MLP format with its own kernels"),
         }
     }
@@ -460,11 +462,12 @@ impl WeightFormat {
             WeightFormat::Bf16 => 0,
             WeightFormat::Q8 => 1,
             WeightFormat::Fp8 => 2,
+            WeightFormat::Ggml => 3,
         }
     }
 
     pub fn bytes(self) -> bool {
-        self != WeightFormat::Bf16
+        matches!(self, WeightFormat::Q8 | WeightFormat::Fp8)
     }
 
     fn gemv(self) -> &'static str {
@@ -472,6 +475,7 @@ impl WeightFormat {
             WeightFormat::Bf16 => "linear_bf16",
             WeightFormat::Q8 => "linear_q8",
             WeightFormat::Fp8 => "linear_fp8",
+            WeightFormat::Ggml => "linear_ggml",
         }
     }
 }
@@ -482,6 +486,7 @@ pub enum WeightKind {
     Q8,
     Fp8,
     Fp4,
+    Ggml,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -566,8 +571,8 @@ impl MmaShape {
             WeightFormat::Q8 => Q8_GROUP,
             WeightFormat::Fp8 if tile.bm == 16 => 128,
             WeightFormat::Fp8 => env_usize("SPECRT_FP8_BK", 64),
-            WeightFormat::Bf16 if tile.bm == 16 && k % 128 == 0 => 128,
-            WeightFormat::Bf16 => env_usize("SPECRT_BK", 32),
+            WeightFormat::Bf16 | WeightFormat::Ggml if tile.bm == 16 && k % 128 == 0 => 128,
+            WeightFormat::Bf16 | WeightFormat::Ggml => env_usize("SPECRT_BK", 32),
         };
         let stages = if tile.bm == 16 { 2 } else { env_usize("SPECRT_STAGES", 2) };
         MmaShape { tile, bk, stages, split, wf }
@@ -633,6 +638,7 @@ pub const KERNELS: &[&str] = &[
     "batch_decode_combine",
     "copy_rows",
     "split_rows",
+    "gg_dequant_rows",
 ];
 
 pub const GDN_KERNELS: &[&str] = &[

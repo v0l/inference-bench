@@ -29,6 +29,7 @@ enum DeviceMatrix {
     Q8 { values: CudaSlice<i8>, scales: CudaSlice<f32> },
     Fp8 { values: CudaSlice<u8>, scales: CudaSlice<f32> },
     Fp4 { packed: CudaSlice<u8>, scales: CudaSlice<u8> },
+    Ggml { data: CudaSlice<u8>, table: CudaSlice<u32> },
 }
 
 impl DeviceMatrix {
@@ -41,6 +42,7 @@ impl DeviceMatrix {
             Matrix::Fp8 { values, scales } => {
                 DeviceMatrix::Fp8 { values: stream.clone_htod(values.as_ref())?, scales: stream.clone_htod(scales)? }
             }
+            Matrix::Ggml(m) => DeviceMatrix::Ggml { data: stream.clone_htod(&m.data)?, table: stream.clone_htod(&m.rows)? },
             Matrix::Fp4(m) => DeviceMatrix::Fp4 {
                 packed: stream.clone_htod(m.packed.as_ref())?,
                 scales: stream.clone_htod(&m.device_scales())?,
@@ -54,6 +56,7 @@ impl DeviceMatrix {
             DeviceMatrix::Q8 { values, scales } => values.num_bytes() + scales.num_bytes(),
             DeviceMatrix::Fp8 { values, scales } => values.num_bytes() + scales.num_bytes(),
             DeviceMatrix::Fp4 { packed, scales } => packed.num_bytes() + scales.num_bytes(),
+            DeviceMatrix::Ggml { data, table } => data.num_bytes() + table.num_bytes(),
         }) as u64
     }
 
@@ -64,6 +67,7 @@ impl DeviceMatrix {
             DeviceMatrix::Q8 { .. } => WeightKind::Q8,
             DeviceMatrix::Fp8 { .. } => WeightKind::Fp8,
             DeviceMatrix::Fp4 { .. } => WeightKind::Fp4,
+            DeviceMatrix::Ggml { .. } => WeightKind::Ggml,
         }
     }
 
@@ -73,6 +77,7 @@ impl DeviceMatrix {
             DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
             DeviceMatrix::Fp8 { values, scales } => b.arg(values).arg(scales),
             DeviceMatrix::Fp4 { packed, scales } => b.arg(packed).arg(scales),
+            DeviceMatrix::Ggml { data, table } => b.arg(data).arg(table),
         };
     }
 }

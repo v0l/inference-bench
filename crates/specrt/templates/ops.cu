@@ -33,6 +33,7 @@ constexpr int Q8_GROUP = {{Q8_GROUP}};
 constexpr int WF_BF16 = 0;
 constexpr int WF_Q8 = 1;
 constexpr int WF_FP8 = 2;
+constexpr int WF_GGML = 3;
 constexpr int FP8_BLOCK = {{FP8_BLOCK}};
 constexpr int LINEAR_WARPS = 8;
 constexpr int ATTN_THREADS = 512;
@@ -149,10 +150,170 @@ __device__ __forceinline__ const float* fp8_row_scales(const float* scales, int 
     return scales + __float_as_uint(__ldg(scales + row));
 }
 
+constexpr int GG_Q4K = 0;
+constexpr int GG_Q5K = 1;
+constexpr int GG_Q6K = 2;
+constexpr int GG_Q8 = 3;
+constexpr int GG_BF16 = 4;
+constexpr int GG_SB = 256;
+
+__device__ __forceinline__ float gg_f16(unsigned short h) {
+    float r;
+    asm("cvt.f32.f16 %0, %1;" : "=f"(r) : "h"(h));
+    return r;
+}
+
+__device__ __forceinline__ unsigned gg_u16(const unsigned char* p) {
+    return __ldg((const unsigned short*)p);
+}
+
+__device__ __forceinline__ unsigned gg_u32(const unsigned char* p) {
+    return __ldg((const unsigned*)p);
+}
+
+__device__ __forceinline__ int gg_bytes(int type) {
+    switch (type) {
+        case GG_Q4K: return 144;
+        case GG_Q5K: return 176;
+        case GG_Q6K: return 224;
+        case GG_Q8: return 272;
+        default: return 512;
+    }
+}
+
+__device__ __forceinline__ unsigned gg_byte(const unsigned* s, int i) {
+    return (s[i >> 2] >> (8 * (i & 3))) & 0xffu;
+}
+
+__device__ __forceinline__ void gg_scale_min(const unsigned* s, int j, float& sc, float& m) {
+    unsigned a, b;
+    if (j < 4) {
+        a = gg_byte(s, j) & 63u;
+        b = gg_byte(s, j + 4) & 63u;
+    } else {
+        a = (gg_byte(s, j + 4) & 0xfu) | ((gg_byte(s, j - 4) >> 6) << 4);
+        b = (gg_byte(s, j + 4) >> 4) | ((gg_byte(s, j) >> 6) << 4);
+    }
+    sc = (float)a;
+    m = (float)b;
+}
+
+__device__ __forceinline__ void gg_dequant8(const unsigned char* sb, int type, int c, float* w) {
+    if (type == GG_Q4K || type == GG_Q5K) {
+        float d = gg_f16(gg_u16(sb));
+        float dmin = gg_f16(gg_u16(sb + 2));
+        unsigned s[3] = {gg_u32(sb + 4), gg_u32(sb + 8), gg_u32(sb + 12)};
+        int j = c >> 3;
+        int half = (c >> 2) & 1;
+        int l = (c & 3) * 8;
+        float sc, m;
+        gg_scale_min(s, 2 * j + half, sc, m);
+        float dl = __fmul_rn(d, sc), ml = __fmul_rn(dmin, m);
+        const unsigned char* qp = sb + (type == GG_Q4K ? 16 : 48) + 32 * j + l;
+        unsigned q[2] = {gg_u32(qp), gg_u32(qp + 4)};
+        unsigned qh[2] = {0u, 0u};
+        if (type == GG_Q5K) {
+            qh[0] = gg_u32(sb + 16 + l);
+            qh[1] = gg_u32(sb + 20 + l);
+        }
+        int bit = 2 * j + half;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            unsigned byte = (q[i >> 2] >> (8 * (i & 3))) & 0xffu;
+            unsigned nib = half ? byte >> 4 : byte & 15u;
+            unsigned hb = ((qh[i >> 2] >> (8 * (i & 3))) >> bit) & 1u;
+            w[i] = __fsub_rn(__fmul_rn(dl, (float)(nib + 16u * hb)), ml);
+        }
+    } else if (type == GG_Q6K) {
+        int h = c >> 4;
+        int k = (c >> 2) & 3;
+        int l = (c & 3) * 8;
+        float d = gg_f16(gg_u16(sb + 208));
+        float ds = __fmul_rn(d, (float)(signed char)__ldg(sb + 192 + 8 * h + l / 16 + 2 * k));
+        const unsigned char* qlp = sb + 64 * h + (k & 1) * 32 + l;
+        const unsigned char* qhp = sb + 128 + 32 * h + l;
+        unsigned ql[2] = {gg_u32(qlp), gg_u32(qlp + 4)};
+        unsigned qh[2] = {gg_u32(qhp), gg_u32(qhp + 4)};
+        int ls = (k >> 1) * 4;
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            unsigned lo = ((ql[i >> 2] >> (8 * (i & 3) + ls)) & 15u);
+            unsigned hi = ((qh[i >> 2] >> (8 * (i & 3) + 2 * k)) & 3u);
+            w[i] = __fmul_rn(ds, (float)((int)(lo | (hi << 4)) - 32));
+        }
+    } else if (type == GG_Q8) {
+        const unsigned char* bp = sb + 34 * (c >> 2);
+        float d = gg_f16(gg_u16(bp));
+        int e = (c & 3) * 8;
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            unsigned two = gg_u16(bp + 2 + e + 2 * k);
+            w[2 * k] = __fmul_rn((float)(signed char)(two & 0xffu), d);
+            w[2 * k + 1] = __fmul_rn((float)(signed char)(two >> 8), d);
+        }
+    } else {
+        uint4 v = __ldg((const uint4*)(sb + 16 * c));
+        unsigned words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            if (type == GG_BF16) {
+                w[2 * k] = __uint_as_float(words[k] << 16);
+                w[2 * k + 1] = __uint_as_float(words[k] & 0xffff0000u);
+            } else {
+                w[2 * k] = gg_f16((unsigned short)(words[k] & 0xffffu));
+                w[2 * k + 1] = gg_f16((unsigned short)(words[k] >> 16));
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ const unsigned char* gg_row(const void* w, const unsigned* table, int row, int& type) {
+    unsigned e = __ldg(table + row);
+    type = (int)(e & 7u);
+    return (const unsigned char*)w + (size_t)(e >> 3) * 16;
+}
+
+__device__ __forceinline__ void gg_load8(const void* w, const unsigned* table, int row, int k, float* out) {
+    int type;
+    const unsigned char* base = gg_row(w, table, row, type);
+    gg_dequant8(base + (size_t)(k / GG_SB) * gg_bytes(type), type, (k % GG_SB) / 8, out);
+}
+
+template <int K>
+__device__ __forceinline__ float gg_row_dot(const void* w, const unsigned* table, int row, const float* x, int lane) {
+    int type;
+    const unsigned char* base = gg_row(w, table, row, type);
+    int bytes = gg_bytes(type);
+    float acc = 0.0f;
+#pragma unroll 2
+    for (int s = 0; s < K / GG_SB; s++) {
+        float wv[8];
+        gg_dequant8(base + (size_t)s * bytes, type, lane, wv);
+        float4 xa = *(const float4*)(x + s * GG_SB + 8 * lane);
+        float4 xb = *(const float4*)(x + s * GG_SB + 8 * lane + 4);
+        acc += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w + wv[4] * xb.x + wv[5] * xb.y + wv[6] * xb.z + wv[7] * xb.w;
+    }
+    return acc;
+}
+
+extern "C" __global__ void gg_dequant_rows(const void* w, const unsigned* table, float* out, int rows, int cols) {
+    int chunk = blockIdx.x * blockDim.x + threadIdx.x;
+    int per_row = cols / 8;
+    if (chunk >= rows * per_row) return;
+    int row = chunk / per_row;
+    int k = (chunk % per_row) * 8;
+    float v[8];
+    gg_load8(w, table, row, k, v);
+#pragma unroll
+    for (int i = 0; i < 8; i++) out[(size_t)row * cols + k + i] = v[i];
+}
+
 template <int WF, int K>
 __device__ __forceinline__ float row_dot(const void* w, const float* scales, int row, const float* x, int lane) {
     float acc = 0.0f;
-    if constexpr (WF == WF_FP8) {
+    if constexpr (WF == WF_GGML) {
+        acc = gg_row_dot<K>(w, (const unsigned*)scales, row, x, lane);
+    } else if constexpr (WF == WF_FP8) {
         static_assert(K % 16 == 0, "fp8 rows load 16 bytes per lane");
         const unsigned char* wr = (const unsigned char*)w + (size_t)row * K;
         const float* sr = fp8_row_scales(scales, row);
@@ -201,6 +362,19 @@ __device__ void linear_fp8(const void* w, const float* scales, const float* bias
     int row = blockIdx.x * LINEAR_WARPS + warp;
     if (row >= N) return;
     float acc = row_dot<WF_FP8, K>(w, scales, row, x, lane);
+    if (lane == 0) {
+        if (BIAS) acc += bias[row];
+        out[row] = RESIDUAL ? out[row] + acc : acc;
+    }
+}
+
+template <int N, int K, bool BIAS, bool RESIDUAL>
+__device__ void linear_ggml(const void* w, const float* scales, const float* bias, const float* x, float* out) {
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * LINEAR_WARPS + warp;
+    if (row >= N) return;
+    float acc = row_dot<WF_GGML, K>(w, scales, row, x, lane);
     if (lane == 0) {
         if (BIAS) acc += bias[row];
         out[row] = RESIDUAL ? out[row] + acc : acc;
@@ -283,7 +457,12 @@ __device__ void gemm(const void* w, const float* scales, const float* bias, cons
             int n = n0 + r;
             float wv = 0.0f;
             if (n < N) {
-                if (WF == WF_Q8) {
+                if (WF == WF_GGML) {
+                    float v[8];
+                    int kk8 = (k0 + kk) & ~7;
+                    gg_load8(w, (const unsigned*)scales, n, kk8, v);
+                    wv = v[(k0 + kk) & 7];
+                } else if (WF == WF_Q8) {
                     wv = (float)((const i8_t*)w)[(size_t)n * K + k0 + kk] *
                          scales[(size_t)n * (K / Q8_GROUP) + (k0 + kk) / Q8_GROUP];
                 } else if (WF == WF_FP8) {
@@ -411,7 +590,7 @@ __device__ __forceinline__ void gemm_epilogue(float (&acc)[BM / WM / 16][BN / WN
 template <int N, int K, int BM, int BN, int WM, int WN, int BK, int STAGES, int EPI, bool BIAS, int WF, bool SPLIT>
 __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, const float* bias, const bf16_t* x_hi,
                                         const bf16_t* x_lo, float* out, bf16_t* out_hi, bf16_t* out_lo, int tokens) {
-    constexpr bool BYTES = WF != WF_BF16;
+    constexpr bool BYTES = WF == WF_Q8 || WF == WF_FP8;
     constexpr int GROUP_K = WF == WF_FP8 ? FP8_BLOCK : Q8_GROUP;
     constexpr int THREADS = WM * WN * 32;
     constexpr int TM = BM / WM;
@@ -486,6 +665,14 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
             int r = idx / W_CHUNKS;
             int ck = idx % W_CHUNKS;
             int n = min(n0 + r, N - 1);
+            if constexpr (WF == WF_GGML) {
+                float v[8];
+                gg_load8(w, (const unsigned*)scales, n, kt * BK + ck * 8, v);
+                uint4 packed = make_uint4(bf16_bits_rn(v[0]) | (bf16_bits_rn(v[1]) << 16), bf16_bits_rn(v[2]) | (bf16_bits_rn(v[3]) << 16),
+                                          bf16_bits_rn(v[4]) | (bf16_bits_rn(v[5]) << 16), bf16_bits_rn(v[6]) | (bf16_bits_rn(v[7]) << 16));
+                *(uint4*)(ws + swz<CPR>(r, ck) * 16) = packed;
+                continue;
+            }
             const char* src = BYTES ? (const char*)w + (size_t)n * K + kt * BK + ck * 16
                                     : (const char*)w + ((size_t)n * K + kt * BK) * 2 + ck * 16;
             cp_async16(ws + (BYTES ? r * WROW + ck * 16 : swz<CPR>(r, ck) * 16), src);

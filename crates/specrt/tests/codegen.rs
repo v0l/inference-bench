@@ -217,6 +217,7 @@ fn weight_kinds(spec: &Spec, linear: &str) -> Vec<WeightKind> {
         Quant::Q8 => WeightKind::Q8,
         Quant::Fp8Block128 | Quant::Fp8Channel => WeightKind::Fp8,
         Quant::Nvfp4G16 => WeightKind::Fp4,
+        Quant::Gguf => WeightKind::Ggml,
     };
     let mut out: Vec<WeightKind> = match linear {
         "lm_head" => vec![kind(spec.lm_head_quant())],

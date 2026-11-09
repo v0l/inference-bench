@@ -52,6 +52,7 @@ fn dequant_head(spec: &Spec) -> Vec<f32> {
             })
             .collect(),
         Matrix::Fp4(m) => (0..vocab).flat_map(|r| m.dequant_row(r)).collect(),
+        Matrix::Ggml(m) => (0..vocab).flat_map(|r| m.row_f32(r)).collect(),
         Matrix::Q8 { .. } => unreachable!("no q8 head here"),
     }
 }
