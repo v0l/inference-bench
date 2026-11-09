@@ -13,12 +13,22 @@ pub fn blocks_for(tokens: usize) -> usize {
 #[derive(Debug, Clone)]
 pub struct BlockPool {
     free: Vec<u32>,
+    refs: Vec<u32>,
     total: usize,
 }
 
 impl BlockPool {
     pub fn new(total: usize) -> Self {
-        BlockPool { free: (0..total as u32).rev().collect(), total }
+        BlockPool { free: (0..total as u32).rev().collect(), refs: vec![0; total], total }
+    }
+
+    pub fn refs(&self, block: u32) -> u32 {
+        self.refs[block as usize]
+    }
+
+    pub fn retain(&mut self, block: u32) {
+        debug_assert!(self.refs[block as usize] > 0);
+        self.refs[block as usize] += 1;
     }
 
     pub fn total(&self) -> usize {
@@ -34,12 +44,19 @@ impl BlockPool {
     }
 
     pub fn alloc(&mut self) -> Option<u32> {
-        self.free.pop()
+        let block = self.free.pop()?;
+        self.refs[block as usize] = 1;
+        Some(block)
     }
 
     pub fn release(&mut self, blocks: &mut Vec<u32>) {
-        debug_assert!(blocks.iter().all(|b| (*b as usize) < self.total));
-        self.free.append(blocks);
+        for b in blocks.drain(..) {
+            debug_assert!((b as usize) < self.total && self.refs[b as usize] > 0);
+            self.refs[b as usize] -= 1;
+            if self.refs[b as usize] == 0 {
+                self.free.push(b);
+            }
+        }
         debug_assert!(self.free.len() <= self.total);
     }
 }

@@ -382,6 +382,7 @@ fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
             unsplit: vec!["lm_head".into()],
             gemm_fp32: true,
             cache_dir: Some("/tmp/x".into()),
+            ..RuntimeOptions::default()
         }
     );
     assert_eq!(Spec::parse(&s.to_toml().unwrap()).unwrap(), s);

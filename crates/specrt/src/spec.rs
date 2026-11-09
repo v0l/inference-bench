@@ -92,11 +92,44 @@ pub struct RuntimeOptions {
     pub gemm_fp32: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "PrefixCacheOptions::is_default")]
+    pub prefix_cache: PrefixCacheOptions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrefixCacheOptions {
+    pub enabled: bool,
+    pub snapshot_interval: usize,
+    pub max_snapshots: usize,
+    pub max_blocks: usize,
+}
+
+impl Default for PrefixCacheOptions {
+    fn default() -> Self {
+        PrefixCacheOptions { enabled: false, snapshot_interval: 2048, max_snapshots: 4, max_blocks: 0 }
+    }
+}
+
+impl PrefixCacheOptions {
+    pub fn is_default(&self) -> bool {
+        *self == PrefixCacheOptions::default()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let page = crate::codegen::PAGE;
+        ensure!(
+            self.snapshot_interval > 0 && self.snapshot_interval.is_multiple_of(page),
+            "[runtime.prefix_cache] snapshot_interval {} must be a positive multiple of the {page} token block",
+            self.snapshot_interval
+        );
+        Ok(())
+    }
 }
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None }
+        RuntimeOptions { graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default() }
     }
 }
 
@@ -106,6 +139,7 @@ impl RuntimeOptions {
     }
 
     fn validate(&self) -> Result<()> {
+        self.prefix_cache.validate()?;
         if let Some([bm, bn, wm, wn]) = self.big_tile {
             ensure!(
                 wm > 0 && wn > 0 && bm.is_multiple_of(16 * wm) && bn.is_multiple_of(8 * wn),
