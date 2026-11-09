@@ -4,20 +4,21 @@
 #include "llama.h"
 
 int main(int argc, char** argv) {
-    if (argc < 5) {
-        fprintf(stderr, "usage: gguf_reference model.gguf out_prefix n_gen tok0 tok1 ...\n");
+    if (argc < 6) {
+        fprintf(stderr, "usage: gguf_reference model.gguf out_prefix n_gpu_layers n_gen tok0 tok1 ...\n");
         return 2;
     }
     const char* model_path = argv[1];
     const char* prefix = argv[2];
-    int n_gen = atoi(argv[3]);
-    int n_prompt = argc - 4;
+    int n_gpu = atoi(argv[3]);
+    int n_gen = atoi(argv[4]);
+    int n_prompt = argc - 5;
     llama_token* prompt = malloc(sizeof(llama_token) * n_prompt);
-    for (int i = 0; i < n_prompt; i++) prompt[i] = atoi(argv[4 + i]);
+    for (int i = 0; i < n_prompt; i++) prompt[i] = atoi(argv[5 + i]);
 
     llama_backend_init();
     struct llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    mp.n_gpu_layers = n_gpu;
     struct llama_model* model = llama_model_load_from_file(model_path, mp);
     if (!model) return 1;
     const struct llama_vocab* vocab = llama_model_get_vocab(model);
