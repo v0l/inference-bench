@@ -14,10 +14,12 @@ use std::mem::ManuallyDrop;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod exec;
 mod fused;
 mod mtp;
 mod step;
 pub use fused::PrefillPart;
+use exec::Plans;
 pub use mtp::{SpecRow, SpecStats};
 pub use step::{DecodeRow, GRAPH_SIZES, Stepper, pad_rows};
 
@@ -360,6 +362,7 @@ pub struct Runtime {
     chunk: usize,
     prefill_limit: usize,
     use_mma: bool,
+    plans: Plans,
     sms: u32,
     seq: i32,
     batch: usize,
@@ -683,6 +686,7 @@ impl Runtime {
             tables: vec![0; (layout.slots + 1) * pages],
             sms,
             use_mma,
+            plans: Plans::build(spec, use_mma),
             spec: spec.clone(),
             max_ctx,
             embed,
@@ -1260,16 +1264,6 @@ impl Runtime {
         self.prefill_chunk_traced(tokens, start, all_logits, None)
     }
 
-    fn gdn_prefill(&self, g: &DeviceGdn, n: usize) -> Result<()> {
-        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
-        let la = &gb.la;
-        let pre = &self.pre;
-        self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
-        self.tc("lin_ba", &g.ba, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_ba), la.ba_rows(), n)?;
-        self.gdn_prefill_rows(g, n, 0)?;
-        self.tc("lin_out", &g.out, None, gb.planes.all(), GemmOut::F32(&pre.x), self.spec.dims.hidden, n)
-    }
-
     fn gdn_prefill_rows(&self, g: &DeviceGdn, n: usize, at: usize) -> Result<()> {
         let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
         let la = &gb.la;
@@ -1332,13 +1326,16 @@ impl Runtime {
     }
 
     fn attn_prefill_rows(&self, l: &DeviceAttn, n: usize, at: usize) -> Result<()> {
+        self.attn_rope_rows(l, n, at)?;
+        self.attn_flash_rows(l, n, at)
+    }
+
+    fn attn_rope_rows(&self, l: &DeviceAttn, n: usize, at: usize) -> Result<()> {
         let a = &self.spec.attention;
         let pre = &self.pre;
         let buf = &self.buf;
         let table = self.slot_table(self.seq as usize);
         let qkv = pre.qkv.slice(at * self.spec.qkv_rows()..);
-        let hi = pre.attn_planes.hi.slice(at * self.spec.q_dim()..);
-        let lo = pre.attn_planes.lo.slice(at * self.spec.q_dim()..);
         let mut b = self.stream.launch_builder(self.kernel("kv_norm_rope"));
         b.arg(&qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
@@ -1354,6 +1351,17 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn attn_flash_rows(&self, l: &DeviceAttn, n: usize, at: usize) -> Result<()> {
+        let a = &self.spec.attention;
+        let pre = &self.pre;
+        let buf = &self.buf;
+        let table = self.slot_table(self.seq as usize);
+        let qkv = pre.qkv.slice(at * self.spec.qkv_rows()..);
+        let hi = pre.attn_planes.hi.slice(at * self.spec.q_dim()..);
+        let lo = pre.attn_planes.lo.slice(at * self.spec.q_dim()..);
         let mut b = self.stream.launch_builder(self.kernel("flash_mma"));
         let ntok = n as i32;
         b.arg(&qkv)
@@ -1395,166 +1403,20 @@ impl Runtime {
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         self.stream.memcpy_htod(&ids, &mut self.pre.tokens.slice_mut(..n))?;
         self.stream.memcpy_htod(&[start as i32], &mut self.buf.pos)?;
-        let s = &self.spec;
-        let a = &s.attention;
-        let hidden = s.dims.hidden;
-        let qkv_rows = s.qkv_rows();
-        let pre = &self.pre;
-        let buf = &self.buf;
-        let mut b = self.stream.launch_builder(self.kernel("embed"));
-        b.arg(&self.embed).arg(&pre.tokens).arg(&pre.x);
-        let config = LaunchConfig {
-            grid_dim: (grid(hidden, 256), n as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { b.launch(config) }?;
+        let plan = &self.plans.prefill;
+        let out = all_logits.unwrap_or(&self.buf.logits);
+        let rows = if all_logits.is_some() { 0..n } else { n - 1..n };
+        let run = exec::Run { n, tokens: &self.pre.tokens, logits: out, rows, bb: None };
+        self.run_ops(&plan.head, None, &run)?;
         for (i, layer) in self.layers.iter().enumerate() {
-            let l = match &layer.mixer {
-                DeviceMixer::Linear(g) => {
-                    self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
-                    self.gdn_prefill(g, n)?;
-                    self.mlp_prefill(layer, n)?;
-                    self.trace_layer(trace, i, n)?;
-                    continue;
-                }
-                DeviceMixer::Attention(l) => l,
+            let ops = match &layer.mixer {
+                DeviceMixer::Linear(_) => &plan.linear,
+                DeviceMixer::Attention(_) => &plan.attention,
             };
-            let kv_layer = l.kv;
-            let table = self.slot_table(self.seq as usize);
-            if self.use_mma {
-                self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
-                self.tc(
-                    "qkv",
-                    &l.qkv,
-                    l.qkv_bias.as_ref(),
-                    pre.xn_planes.all(),
-                    GemmOut::F32(&pre.qkv),
-                    qkv_rows,
-                    n,
-                )?;
-            } else {
-                self.rmsnorm_rows(&pre.x, &layer.ln1, &pre.xn, n)?;
-                self.gemm(
-                    "qkv_gemm",
-                    &l.qkv,
-                    l.qkv_bias.as_ref(),
-                    &pre.xn.as_view(),
-                    &pre.qkv,
-                    qkv_rows,
-                    n,
-                )?;
-            }
-            let rope_kernel = if self.use_mma { "kv_norm_rope" } else { "qk_norm_rope" };
-            let rope_heads = if self.use_mma { 2 * a.kv_heads } else { a.heads + 2 * a.kv_heads };
-            let mut b = self.stream.launch_builder(self.kernel(rope_kernel));
-            b.arg(&pre.qkv)
-                .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
-                .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
-                .arg(&buf.k_cache)
-                .arg(&buf.v_cache)
-                .arg(&table)
-                .arg(&buf.pos);
-            if !self.use_mma {
-                b.arg(&buf.zero_slots).arg(&kv_layer).arg(&0i32);
-            } else {
-                b.arg(&kv_layer);
-            }
-            let config = LaunchConfig {
-                grid_dim: (rope_heads as u32, n as u32, 1),
-                block_dim: (a.head_dim.max(32) as u32, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe { b.launch(config) }?;
-            let attn_kernel = if self.use_mma { "flash_mma" } else { "flash_attention" };
-            let mut b = self.stream.launch_builder(self.kernel(attn_kernel));
-            let ntok = n as i32;
-            b.arg(&pre.qkv);
-            if self.use_mma {
-                b.arg(l.q_norm.as_ref().unwrap_or(&buf.dummy));
-            }
-            b.arg(&buf.k_cache)
-                .arg(&buf.v_cache)
-                .arg(&table)
-                .arg(&buf.pos)
-                .arg(&kv_layer);
-            if self.use_mma {
-                b.arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
-            } else {
-                b.arg(&pre.attn);
-            }
-            b.arg(&ntok);
-            let rows = if self.use_mma { crate::codegen::flash_rows(a.head_dim) } else { 16 };
-            let config = LaunchConfig {
-                grid_dim: (grid(n, rows), a.heads as u32, 1),
-                block_dim: (if self.use_mma { rows as u32 * 2 } else { 128 }, 1, 1),
-                shared_mem_bytes: if self.use_mma { self.smem["flash_mma"] } else { 0 },
-            };
-            unsafe { b.launch(config) }?;
-            let inter = s.dims.intermediate;
-            if self.use_mma {
-                self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
-                self.mlp_prefill(layer, n)?;
-                self.trace_layer(trace, i, n)?;
-                continue;
-            }
-            self.gemm("o_gemm", &l.o, None, &pre.attn.as_view(), &pre.x, hidden, n)?;
-            self.rmsnorm_rows(&pre.x, &layer.ln2, &pre.xn, n)?;
-            self.gemm(
-                "gate_up_gemm",
-                &layer.gate_up,
-                None,
-                &pre.xn.as_view(),
-                &pre.gate_up,
-                2 * inter,
-                n,
-            )?;
-            let mut b = self.stream.launch_builder(self.kernel("swiglu"));
-            b.arg(&pre.gate_up).arg(&pre.act);
-            let config = LaunchConfig {
-                grid_dim: (grid(inter, 256), n as u32, 1),
-                block_dim: (256, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe { b.launch(config) }?;
-            self.gemm("down_gemm", &layer.down, None, &pre.act.as_view(), &pre.x, hidden, n)?;
+            self.run_ops(ops, Some(layer), &run)?;
             self.trace_layer(trace, i, n)?;
         }
-        if self.use_mma {
-            let (out, rows) = match all_logits {
-                Some(out) => (out, 0..n),
-                None => (&buf.logits, n - 1..n),
-            };
-            let x = pre.x.slice(rows.start * hidden..rows.end * hidden);
-            self.rms_split(&x, &self.norm, &pre.xn_planes, rows.len())?;
-            self.tc(
-                "lm_head",
-                &self.lm_head,
-                None,
-                pre.xn_planes.rows(0, rows.len(), hidden),
-                GemmOut::F32(out),
-                s.dims.vocab,
-                rows.len(),
-            )?;
-            return Ok(());
-        }
-        self.rmsnorm_rows(&pre.x, &self.norm, &pre.xn, n)?;
-        match all_logits {
-            Some(out) => self.gemm(
-                "lm_head_gemm",
-                &self.lm_head,
-                None,
-                &pre.xn.as_view(),
-                out,
-                s.dims.vocab,
-                n,
-            )?,
-            None => {
-                let last = pre.xn.slice((n - 1) * hidden..n * hidden);
-                self.gemm("lm_head_gemm", &self.lm_head, None, &last, &buf.logits, s.dims.vocab, 1)?
-            }
-        }
-        Ok(())
+        self.run_ops(&plan.tail, None, &run)
     }
 
     fn prefill(&mut self, tokens: &[u32], all_logits: bool) -> Result<Vec<f32>> {
@@ -1688,16 +1550,6 @@ impl Runtime {
         b.arg(&self.buf.logits).arg(&tokens).arg(&history).arg(&self.buf.count).arg(&stride);
         unsafe { b.launch(cfg(1, 1024)) }?;
         Ok(())
-    }
-
-    fn gdn_batch(&self, g: &DeviceGdn, slots: &CudaSlice<i32>, n: usize) -> Result<()> {
-        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
-        let la = &gb.la;
-        let pre = &self.pre;
-        self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
-        self.tc("lin_ba", &g.ba, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_ba), la.ba_rows(), n)?;
-        self.gdn_decode_rows(g, slots, n)?;
-        self.tc("lin_out", &g.out, None, gb.planes.all(), GemmOut::F32(&pre.x), self.spec.dims.hidden, n)
     }
 
     fn gdn_decode_rows(&self, g: &DeviceGdn, slots: &CudaSlice<i32>, n: usize) -> Result<()> {
@@ -1948,52 +1800,17 @@ impl Runtime {
     }
 
     fn decode_rows(&self, bb: &BatchBuffers, n: usize) -> Result<()> {
-        let s = &self.spec;
-        let hidden = s.dims.hidden;
-        let pre = &self.pre;
-        let mut b = self.stream.launch_builder(self.kernel("embed"));
-        b.arg(&self.embed).arg(&bb.tokens).arg(&pre.x);
-        let config = LaunchConfig {
-            grid_dim: (grid(hidden, 256), n as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe { b.launch(config) }?;
+        let plan = &self.plans.decode;
+        let run = exec::Run { n, tokens: &bb.tokens, logits: &bb.logits, rows: 0..n, bb: Some(bb) };
+        self.run_ops(&plan.head, None, &run)?;
         for layer in &self.layers {
-            self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
-            let l = match &layer.mixer {
-                DeviceMixer::Linear(g) => {
-                    self.gdn_batch(g, &bb.slots, n)?;
-                    self.mlp_prefill(layer, n)?;
-                    continue;
-                }
-                DeviceMixer::Attention(l) => l,
+            let ops = match &layer.mixer {
+                DeviceMixer::Linear(_) => &plan.linear,
+                DeviceMixer::Attention(_) => &plan.attention,
             };
-            let qkv_rows = s.qkv_rows();
-            self.tc(
-                "qkv",
-                &l.qkv,
-                l.qkv_bias.as_ref(),
-                pre.xn_planes.all(),
-                GemmOut::F32(&pre.qkv),
-                qkv_rows,
-                n,
-            )?;
-            self.attn_decode_rows(l, bb, n)?;
-            self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
-            self.mlp_prefill(layer, n)?;
+            self.run_ops(ops, Some(layer), &run)?;
         }
-        self.rms_split(&pre.x.as_view(), &self.norm, &pre.xn_planes, n)?;
-        self.tc(
-            "lm_head",
-            &self.lm_head,
-            None,
-            pre.xn_planes.all(),
-            GemmOut::F32(&bb.logits),
-            s.dims.vocab,
-            n,
-        )?;
-        Ok(())
+        self.run_ops(&plan.tail, None, &run)
     }
 
     fn batch_buffers(&self, rows: usize) -> Result<BatchBuffers> {

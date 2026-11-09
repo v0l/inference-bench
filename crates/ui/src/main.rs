@@ -5,6 +5,7 @@ mod breakdown;
 mod table;
 mod block;
 mod detail;
+mod engine;
 mod strip;
 mod job;
 mod models;

@@ -49,6 +49,20 @@ impl Group {
         self.weight().is_some_and(|w| w.shape.len() == 2 && w.shape.iter().all(|d| *d > 1))
     }
 
+    pub fn holds(&self, name: &str) -> bool {
+        let Some((module, leaf)) = name.rsplit_once('.') else { return false };
+        if module != self.path {
+            return false;
+        }
+        self.tensor(leaf).is_some() || (leaf == "weight" && self.tensor("weight_packed").is_some())
+    }
+
+    pub fn holds_suffix(&self, name: &str) -> bool {
+        let Some((module, leaf)) = name.rsplit_once('.') else { return false };
+        let at_end = self.path == module || self.path.ends_with(&format!(".{module}"));
+        at_end && (self.tensor(leaf).is_some() || (leaf == "weight" && self.tensor("weight_packed").is_some()))
+    }
+
     pub fn tensor_names(&self) -> Vec<String> {
         self.tensors.iter().map(|t| format!("{}.{}", self.path, t.leaf)).collect()
     }
@@ -212,6 +226,30 @@ impl Structure {
 
     pub fn any_leaf(&self, group_name: &str, leaf: &str) -> bool {
         self.main().is_some_and(|s| s.layers.iter().any(|l| l.groups.iter().any(|g| g.name() == group_name && g.tensor(leaf).is_some())))
+    }
+
+    pub fn layer_has_tensor(&self, index: usize, name: &str) -> bool {
+        self.layer(index).is_some_and(|l| l.groups.iter().any(|g| g.holds(name)))
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        for stack in &self.stacks {
+            let Some(rest) = name.strip_prefix(stack.prefix.as_str()).and_then(|r| r.strip_prefix('.')) else { continue };
+            let Some((index, tail)) = rest.split_once('.') else { continue };
+            let Ok(index) = index.parse::<usize>() else { continue };
+            if stack.layers.iter().any(|l| l.index == index && l.groups.iter().any(|g| g.holds(tail))) {
+                return true;
+            }
+        }
+        self.outside.iter().any(|g| g.holds(name))
+    }
+
+    pub fn root(&self) -> Option<&str> {
+        self.main()?.prefix.strip_suffix(".layers")
+    }
+
+    pub fn has_outside_tensor(&self, name: &str) -> bool {
+        self.outside.iter().any(|g| g.holds_suffix(name))
     }
 
     pub fn layer_has_module(&self, index: usize, module: &str) -> bool {

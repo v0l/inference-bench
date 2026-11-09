@@ -663,6 +663,13 @@ impl Spec {
         Ok(spec)
     }
 
+    pub fn runnable(&self) -> Result<()> {
+        self.validate()?;
+        ensure!(self.moe.is_none(), "{MOE_UNSUPPORTED}");
+        ensure!(self.dims.intermediate > 0, "the config has no intermediate_size");
+        Ok(())
+    }
+
     pub fn describe_hf_config(json: &str) -> Result<Self> {
         Self::hf_config(json, false)
     }

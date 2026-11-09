@@ -7,6 +7,7 @@ pub mod gguf;
 pub mod jit;
 pub mod mtp;
 pub mod nvfp4;
+pub mod plan;
 pub mod prefix;
 pub mod runtime;
 pub mod sched;

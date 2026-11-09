@@ -1,5 +1,5 @@
 use crate::App;
-use crate::{block, breakdown, strip, table};
+use crate::{block, breakdown, engine, strip, table};
 use eframe::egui;
 use egui_bench::prelude::*;
 use inference_bench_core::library::{Format, LocalModel, human_size};
@@ -93,6 +93,25 @@ pub struct Detail {
     pub layer: Option<usize>,
     pub compare: Option<String>,
     pub other: Option<Result<View, String>>,
+    pub diagram: Diagram,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Diagram {
+    #[default]
+    Checkpoint,
+    EnginePrefill,
+    EngineDecode,
+}
+
+impl Diagram {
+    fn phase(self) -> Option<specrt::plan::Phase> {
+        match self {
+            Diagram::Checkpoint => None,
+            Diagram::EnginePrefill => Some(specrt::plan::Phase::Prefill),
+            Diagram::EngineDecode => Some(specrt::plan::Phase::Decode),
+        }
+    }
 }
 
 impl Detail {
@@ -102,12 +121,12 @@ impl Detail {
             Ok(v) if v.anatomy.count(LayerKind::DeltaNet) > 0 => LayerKind::DeltaNet,
             _ => LayerKind::Attention,
         };
-        Detail { model: m.name.clone(), view, kind, layer: None, compare: None, other: None }
+        Detail { model: m.name.clone(), view, kind, layer: None, compare: None, other: None, diagram: Diagram::default() }
     }
 
     pub fn from_view(view: View) -> Self {
         let kind = if view.anatomy.count(LayerKind::DeltaNet) > 0 { LayerKind::DeltaNet } else { LayerKind::Attention };
-        Detail { model: view.name.clone(), view: Ok(view), kind, layer: None, compare: None, other: None }
+        Detail { model: view.name.clone(), view: Ok(view), kind, layer: None, compare: None, other: None, diagram: Diagram::default() }
     }
 
     pub fn compare_with(&mut self, view: View) {
@@ -183,7 +202,7 @@ fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth: Op
 }
 
 fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth: Option<u64>) {
-    let Detail { view, other, kind, layer, .. } = detail;
+    let Detail { view, other, kind, layer, diagram, .. } = detail;
     let view = match view {
         Ok(v) => v,
         Err(e) => {
@@ -211,14 +230,7 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
         strip::legend(ui, &view.anatomy);
     });
     let layer_for_block = layer.unwrap_or_else(|| view.anatomy.layers.iter().find(|l| l.kind == *kind).map_or(0, |l| l.index));
-    match view.structure.as_ref().and_then(|s| block::layer_for(s, layer_for_block)) {
-        Some(l) => section(ui, "block diagram", &block::title(*layer, &view.spec, l), |ui| {
-            block::draw(ui, &block::rows_for(l, &view.spec));
-        }),
-        None => section(ui, "block diagram", "no checkpoint headers", |ui| {
-            Line::new().note("the safetensors headers are not on disk, so there are no tensors to draw").size(11.0).show(ui);
-        }),
-    };
+    block_section(ui, view, *kind, *layer, layer_for_block, diagram);
     let anatomies: Vec<&specrt::anatomy::ModelAnatomy> = views.iter().map(|v| &v.anatomy).collect();
     let totals = breakdown::max_totals(anatomies.iter().copied());
     section(ui, "parameters and memory", "bars share one scale", |ui| {
@@ -360,6 +372,37 @@ mod tests {
         let entries = crate::table::entries(&view, None);
         assert!(entries.iter().any(|e| e.field == "intermediate" && e.value == "unknown"));
     }
+}
+
+fn block_section(ui: &mut egui::Ui, view: &View, _kind: LayerKind, layer: Option<usize>, layer_for_block: usize, diagram: &mut Diagram) {
+    let Some(structure) = view.structure.as_ref() else {
+        section(ui, "block diagram", "no checkpoint headers", |ui| {
+            Line::new().note("the safetensors headers are not on disk, so there are no tensors to draw").size(11.0).show(ui);
+        });
+        return;
+    };
+    let Some(l) = block::layer_for(structure, layer_for_block) else { return };
+    let title = match diagram.phase() {
+        None => block::title(layer, &view.spec, l),
+        Some(phase) => engine::title(&view.spec, l.index, phase),
+    };
+    section(ui, "block diagram", &title, |ui| {
+        let options = [
+            (Diagram::Checkpoint, "checkpoint".to_string()),
+            (Diagram::EnginePrefill, "engine, prefill".to_string()),
+            (Diagram::EngineDecode, "engine, decode".to_string()),
+        ];
+        ui.allocate_ui(egui::vec2(240.0, KEY_H), |ui| {
+            choice(ui, "diagram-view", diagram, options);
+        });
+        match diagram.phase() {
+            None => block::draw(ui, &block::rows_for(l, &view.spec)),
+            Some(phase) => match engine::rows_for(&view.spec, structure, l.index, phase) {
+                Ok(rows) => block::draw(ui, &rows),
+                Err(reason) => status(ui, false, &reason),
+            },
+        }
+    });
 }
 
 #[cfg(test)]
