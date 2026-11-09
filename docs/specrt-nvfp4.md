@@ -644,3 +644,27 @@ use the `[runtime] big_tile` path, which this change does not touch.
 Swizzled smem and producer/consumer warp specialisation were not ported: without ncu there is no
 bank-conflict or stall signal to justify them, and the GPU was shared with other jobs during
 measurement.
+
+### FP8 prefill GEMM (#416)
+
+For `quant = "fp8_channel"` with `act_quant = "fp8"` the activation is quantised with one scale per token
+(`quant_rows_fp8_token`) and both scales are applied once in the `gemm_fp8` epilogue, so the k loop is pure
+mma; the block-128 checkpoint keeps the per-128 scale. A and B fragments come through `ldmatrix` from rows
+with an XOR swizzle on the 16-byte chunk (no 144-byte padding). Above 256 tokens the `_big` call runs an
+FP8-only 128 x 128 tile with 8 warps (`_huge`, `Tile::FP8_HUGE`), separate from the NVFP4 `big_tile`.
+`qwen3.8-27b-nvfp4-act.toml`, three runs, `flock /tmp/gpu27.lock`; per-call nsys average in us at 1,024 tokens:
+
+| step | prefill 1,024 | prefill 4,096 | `gate_up` | `lin_in` | `qkv` | `down` | kept |
+|---|---|---|---|---|---|---|---|
+| before | 3,597 tok/s | 3,484 tok/s | 916 | 395 | 355 (avg 612 after step 1) | 805 | |
+| 1 per-token scale | 4,089 tok/s | 3,942 tok/s | 2,094 per layer pair (see nsys) | | | | yes, -23% |
+| 2 stages from shared memory | 4,036 tok/s | 3,903 tok/s | 659 | 279 | | | no, under 10% more |
+| 3 ldmatrix, swizzled rows | 4,498 tok/s | 3,882 to 4,296 tok/s (noisy) | | | | | yes, -20% to -32% |
+| 4 `_huge` 128 x 128 tile | 4,448 tok/s | 4,298 tok/s | | | | | yes, -9% at 1,024, -11% at 4,096 |
+
+Per-call averages from nsys (us), 1,024 / 4,096 tokens: after step 1, `lin_in` 687 / 1,469, `gate_up` 2,094 /
+4,660, `qkv` 613 / 1,275, `down` 853 / 1,627; after step 3, 466 / 983, 1,678 / 3,643, 394 / 860, 585 / 1,195;
+after step 4, 450 / 880, 1,258 / 2,800, 366 / 801, 504 / 1,086. (The averages mix NVFP4 and FP8 layers'
+launches per kernel name, so they are the same ones across steps, not the p10 per-layer numbers of #413.)
+Tests: `tests/fp8_gemm.rs` (1, 64, 1,024 rows, every tile, per-token and block-128 scales against an f64
+product of the quantised inputs, error at most 1e-5 of the max), `tests/fp8_act.rs`.

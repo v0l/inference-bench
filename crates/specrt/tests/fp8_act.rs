@@ -59,3 +59,29 @@ fn native_fp8_prefill_stays_inside_the_activation_quantisation_envelope() {
     assert!(error <= 1.5 * envelope, "{error} outside the {envelope} envelope");
     assert!(top1 + 2 >= ref_top1, "{top1} against {ref_top1}");
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU with FP8 mma"]
+fn per_token_activation_scale_prefill_tracks_the_weight_only_channel_model() {
+    let dir = root().join("tests/fixtures/tiny-qwen3.5-hd256");
+    let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    spec.repo = dir.display().to_string();
+    spec.quant = specrt::spec::Quant::Fp8Channel;
+    spec.validate().unwrap();
+    let ids: Vec<u32> = (0..300).map(|i| (i * 7 + 3) % 200).collect();
+    let weight_only = Runtime::load(&spec, 2048).unwrap().prompt_logits(&ids).unwrap();
+    spec.act_quant = specrt::spec::ActQuant::Fp8;
+    spec.validate().unwrap();
+    let mut rt = Runtime::load(&spec, 2048).unwrap();
+    let ours = rt.prompt_logits(&ids).unwrap();
+    let scale = weight_only.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let error = max_abs(&ours, &weight_only);
+    let vocab = spec.dims.vocab;
+    let rows = ids.len();
+    let top1 = (0..rows)
+        .filter(|&i| argmax(&ours[i * vocab..(i + 1) * vocab]) == argmax(&weight_only[i * vocab..(i + 1) * vocab]))
+        .count();
+    eprintln!("per-token act vs weight-only: {error} of {scale}, top1 {top1}/{rows}");
+    assert!(error <= 0.1 * scale, "{error} against {scale}");
+    assert!(top1 * 10 >= rows * 8, "{top1}/{rows}");
+}

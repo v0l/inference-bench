@@ -295,6 +295,7 @@ enum GemmOut<'a> {
 struct Fp8Act {
     q: CudaSlice<u8>,
     scale: CudaSlice<f32>,
+    per_token: bool,
 }
 
 struct Fp4Act {
@@ -622,6 +623,7 @@ impl Runtime {
             Some(Fp8Act {
                 q: stream.alloc_zeros(chunk * widest)?,
                 scale: stream.alloc_zeros(chunk * widest / crate::codegen::FP8_BLOCK)?,
+                per_token: spec.quant == crate::spec::Quant::Fp8Channel,
             })
         } else {
             None
@@ -1189,10 +1191,14 @@ impl Runtime {
         let width_i = width as i32;
         let mut b = self.stream.launch_builder(self.kernel(choice.quant.expect("f8 quantises its input")));
         b.arg(&x.0).arg(&x.1).arg(&fa.q).arg(&fa.scale).arg(&width_i);
-        let config = LaunchConfig {
-            grid_dim: ((width / crate::codegen::FP8_BLOCK) as u32, tokens as u32, 1),
-            block_dim: ((crate::codegen::FP8_BLOCK / 2) as u32, 1, 1),
-            shared_mem_bytes: 0,
+        let config = if fa.per_token {
+            LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }
+        } else {
+            LaunchConfig {
+                grid_dim: ((width / crate::codegen::FP8_BLOCK) as u32, tokens as u32, 1),
+                block_dim: ((crate::codegen::FP8_BLOCK / 2) as u32, 1, 1),
+                shared_mem_bytes: 0,
+            }
         };
         unsafe { b.launch(config) }?;
         let (kernel, tile) = (choice.name.as_str(), choice.tile);

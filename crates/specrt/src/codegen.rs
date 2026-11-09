@@ -42,7 +42,7 @@ fn fp4_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Strin
     let mut out = String::from(FP4_ACT_TEMPLATE);
     for linear in ["gate_up", "down"] {
         let (n, k, epi, _) = linear_dims(spec, linear);
-        for suffix in FP8_ACT_VARIANTS {
+        for suffix in FP4_ACT_VARIANTS {
             let t = Tile::fp4_variant(suffix, &spec.runtime);
             let name = format!("{linear}_f4a{suffix}");
             let name = FP4_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_ACT_KERNELS");
@@ -349,32 +349,41 @@ pub const MMA_LINEARS: [&str; 5] = ["qkv", "o", "gate_up", "down", "lm_head"];
 pub const GDN_LINEARS: [&str; 3] = ["lin_in", "lin_out", "lin_ba"];
 pub const MMA_VARIANTS: [&str; 4] = ["", "_big", "_narrow", "_tiny"];
 pub const FP8_ACT_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
-pub const FP8_ACT_VARIANTS: [&str; 3] = ["", "_big", "_narrow"];
+pub const FP4_ACT_VARIANTS: [&str; 3] = ["", "_big", "_narrow"];
+pub const FP8_ACT_VARIANTS: [&str; 4] = ["", "_big", "_narrow", "_huge"];
+pub const FP8_HUGE_MIN_TOKENS: usize = 256;
 pub const FP8_ACT_KERNELS: &[&str] = &[
     "quant_rows_fp8",
+    "quant_rows_fp8_token",
     "qkv_f8",
     "qkv_f8_big",
     "qkv_f8_narrow",
+    "qkv_f8_huge",
     "o_f8",
     "o_f8_big",
     "o_f8_narrow",
+    "o_f8_huge",
     "gate_up_f8",
     "gate_up_f8_big",
     "gate_up_f8_narrow",
+    "gate_up_f8_huge",
     "down_f8",
     "down_f8_big",
     "down_f8_narrow",
+    "down_f8_huge",
     "lin_in_f8",
     "lin_in_f8_big",
     "lin_in_f8_narrow",
+    "lin_in_f8_huge",
     "lin_out_f8",
     "lin_out_f8_big",
     "lin_out_f8_narrow",
+    "lin_out_f8_huge",
 ];
 const FP8_ACT_STAGES: usize = 2;
 
 pub fn fp8_act_smem(tile: Tile) -> u32 {
-    (FP8_ACT_STAGES * (tile.bm + tile.bn) * (FP8_BLOCK + 16)) as u32
+    (FP8_ACT_STAGES * (tile.bm + tile.bn) * FP8_BLOCK) as u32
 }
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -384,6 +393,7 @@ fn env_usize(name: &str, default: usize) -> usize {
 impl Tile {
     pub const SMALL: Tile = Tile { bm: 64, bn: 64, wm: 2, wn: 2 };
     pub const FP4_BIG: Tile = Tile { bm: 128, bn: 256, wm: 4, wn: 4 };
+    pub const FP8_HUGE: Tile = Tile { bm: 128, bn: 128, wm: 2, wn: 4 };
     pub const NARROW: Tile = Tile { bm: 64, bn: 32, wm: 2, wn: 2 };
 
     pub fn tiny() -> Tile {
@@ -414,6 +424,7 @@ impl Tile {
         match suffix {
             "_big" => Tile::big(opts),
             "_narrow" => Tile::NARROW,
+            "_huge" => Tile::FP8_HUGE,
             "_tiny" => Tile::tiny(),
             _ => Tile::SMALL,
         }
@@ -505,6 +516,7 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
         _ if blocks(Tile::SMALL) >= 2 * sms => "",
         _ => "_narrow",
     };
+    let huge = spec.quant.is_fp8() && weight == WeightKind::Fp8 && opts.tile == TileChoice::Auto && suffix == "_big" && tokens > FP8_HUGE_MIN_TOKENS;
     let tile = Tile::variant(suffix, opts);
     let choice = |name: String, path: GemmPath, quant: Option<&'static str>| KernelChoice { name, quant, reduce: None, tile, path };
     let auto = opts.tile == TileChoice::Auto;
@@ -514,7 +526,14 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
     let fp8_act = spec.quant.is_fp8() && fp8_act_enabled(spec);
     let fp4_act = spec.mlp.quant == Some(Quant::Nvfp4G16) && fp4_act_enabled(spec);
     match weight {
-        WeightKind::Fp8 if act_quant && fp8_act => choice(format!("{linear}_f8{suffix}"), GemmPath::F8a, Some("quant_rows_fp8")),
+        WeightKind::Fp8 if act_quant && fp8_act => KernelChoice {
+            tile: if huge { Tile::FP8_HUGE } else { tile },
+            ..choice(
+                format!("{linear}_f8{}", if huge { "_huge" } else { suffix }),
+                GemmPath::F8a,
+                Some(if spec.quant == Quant::Fp8Channel { "quant_rows_fp8_token" } else { "quant_rows_fp8" }),
+            )
+        },
         WeightKind::Fp4 if act_quant && fp4_act => KernelChoice {
             tile: Tile::fp4_variant(suffix, opts),
             ..choice(format!("{linear}_f4a{suffix}"), GemmPath::F4a, Some("quant_rows_fp4"))
@@ -744,12 +763,13 @@ fn fp8_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Strin
             let name = FP8_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP8_ACT_KERNELS");
             smem.insert(name, fp8_act_smem(t));
             out.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const unsigned char* xq, const float* xs, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_fp8<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP8_ACT_STAGES}, {epi}, {bias}>(w, s, b, xq, xs, out, oh, ol, tokens);\n}}\n\n",
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const unsigned char* xq, const float* xs, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_fp8<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP8_ACT_STAGES}, {epi}, {bias}, {per_token}>(w, s, b, xq, xs, out, oh, ol, tokens);\n}}\n\n",
                 threads = t.threads(),
                 bm = t.bm,
                 bn = t.bn,
                 wm = t.wm,
                 wn = t.wn,
+                per_token = spec.quant == Quant::Fp8Channel,
             ));
         }
     }
@@ -864,6 +884,7 @@ impl Module {
             source.push('\n');
             source.push_str(&fp8_act_kernels(spec, &mut smem));
             kernels.push("quant_rows_fp8");
+            kernels.push("quant_rows_fp8_token");
             source.push('\n');
             source.push_str(&fp8_batch_kernels(spec, &mut smem)?);
             kernels.extend(F8B_KERNELS.iter().filter(|k| la.is_some() || !k.starts_with("lin_")));
