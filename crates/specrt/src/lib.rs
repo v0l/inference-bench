@@ -1,3 +1,4 @@
+pub mod anatomy;
 pub mod chat;
 pub mod codegen;
 pub mod engine;
