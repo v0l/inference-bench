@@ -250,15 +250,43 @@ length 2.40, position 0 0.805 (861 of 1,069), position 1 0.592. specrt `bench --
 same prompts: 2.43. Its greedy tokens equal vLLM's on 1 of 20 prompts only because of the
 target's different kernels, so the drafts are compared on vLLM's own tokens.
 
-The forward hook in that script records the drafter's `input_ids`, `positions`, target
-`hidden_states` and argmax at every call. The call pattern matches the algorithm above (first pass
-over the prompt shifted by one, then `a + 1` rows per step, then a one-row chain with the MTP's own
-output). `scripts/mtp_diff.py` runs the f32 torch oracle on vLLM's recorded inputs: the oracle's
-outputs differ from vLLM's by 3.5% on the prompt pass (bf16 and NVFP4 kernel noise, argmax equal
-on 72 of 76 rows). Counting vLLM's own first drafts against its own tokens, position 0 is 0.796
-(1,034 steps); specrt teacher-forced on the same tokens is 0.760, 3.6 points lower, and the
-bench's mean length is 2.43 against 2.40. No wiring difference was found, so nothing in the MTP
-path needs changing.
+`bench --speculative` now prints and emits as JSON the per-position accepted counts and the
+rows proposed (`per_position_accepted`, `per_position_proposed`, `per_position_rate`); the
+`per_position_acceptance_counts_follow_the_forced_wrong_draft_position` test in `tests/mtp.rs`
+checks them on the tiny MTP fixture. On the 20 prompts, 128 greedy tokens, k = 2, batch 1:
+
+| | steps | mean length | position 0 | position 1 |
+|---|---|---|---|---|
+| isolated vLLM 0.27.1, graphs | 1,069 | 2.40 | 0.805 | 0.592 |
+| specrt `bench --speculative` | 1,046 | 2.428 | 0.827 (865) | 0.601 (629) |
+| specrt teacher-forced on isolated vLLM's tokens | 1,080 | 2.346 | 0.772 | 0.574 |
+
+On its own trajectories specrt's position 0 is 2.2 points above vLLM's, position 1 0.9 above. The
+two systems do not generate the same text (greedy near-ties), and about 1,050 steps give a
+standard error of 1.2 points per rate, so the two are equal within measurement noise.
+
+The forward hook in `scripts/vllm_mtp_dump.py` records the drafter's `input_ids`, `positions`,
+target `hidden_states` and argmax at every call; the pattern matches the algorithm above.
+`scripts/mtp_variants.py` replays vLLM's own recorded target hiddens through the f32 torch oracle
+(prompt-wide, the same positions vLLM drafted at) and scores the next-next token against vLLM's
+tokens, 1,056 steps:
+
+| MTP precision on vLLM's hiddens | position 0 |
+|---|---|
+| vLLM's own drafts | 0.7955 |
+| f32 | 0.7926 |
+| bf16 weights and activations | 0.7917 |
+| f32, fp8 (e4m3) rounded K and V in the MTP attention | 0.7926 |
+| bf16 plus fp8 K and V | 0.7917 |
+
+The checkpoint's `mtp.*` tensors are unquantised bf16 (`ignore: re:mtp\..*`), so there is no
+quantised MTP linear to mimic. MTP precision moves position 0 by less than 0.1 point, and the
+oracle fed vLLM's hiddens reproduces vLLM's position 0 to 0.3 points. So a precision option for
+the MTP would measure no different and was not added. The remaining difference between specrt
+teacher-forced (0.772) and the oracle on vLLM's hiddens (0.793) is about 2 points and sits in the
+target hidden state (specrt's FP8 and NVFP4 kernels against vLLM's), not in the MTP path; it does
+not show in `bench` (0.827), where specrt's drafter sees specrt's own hiddens on its own text.
+The earlier 0.917 and 0.816 for the served vLLM do not reproduce in isolation.
 
 Crossover: speculation still wins at batch 4 (12 verify rows) and loses at batch 8 (24 rows). Past
 16 rows the verify GEMMs leave the batched fp4/fp8 GEMV path for the `_tiny` mma tile, which reads

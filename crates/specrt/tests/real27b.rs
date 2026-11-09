@@ -275,9 +275,19 @@ fn real_27b_mtp_dumps_hiddens_and_draft_logits_for_the_cpu_oracle() {
 #[test]
 #[ignore = "needs about 26 GB of free GPU memory, the NVFP4 27B checkpoint and vllm-spec-greedy.json"]
 fn real_27b_mtp_acceptance_on_vllms_own_greedy_tokens() {
+    teacher_forced("vllm-spec-greedy.json");
+}
+
+#[test]
+#[ignore = "needs about 26 GB of free GPU memory, the NVFP4 27B checkpoint and vllm-isolated-greedy.json from scripts/vllm_mtp_dump.py"]
+fn real_27b_mtp_acceptance_on_an_isolated_vllms_greedy_tokens() {
+    teacher_forced("vllm-isolated-greedy.json");
+}
+
+fn teacher_forced(file: &str) {
     let spec = named_spec("qwen3.8-27b-nvfp4");
     let k = spec.mtp.as_ref().unwrap().draft_tokens;
-    let recs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out_dir().join("vllm-spec-greedy.json")).unwrap()).unwrap();
+    let recs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out_dir().join(file)).unwrap()).unwrap();
     let mut rt = Runtime::load(&spec, 1024).unwrap();
     let (mut steps, mut accepted, mut first, mut second) = (0u64, 0u64, 0u64, 0u64);
     for r in recs.as_array().unwrap() {
@@ -296,7 +306,7 @@ fn real_27b_mtp_acceptance_on_vllms_own_greedy_tokens() {
         }
     }
     eprintln!(
-        "teacher-forced on vLLM greedy: {steps} steps, mean acceptance length {:.3}, position 0 {:.3}, position 1 {:.3}",
+        "teacher-forced on {file}: {steps} steps, mean acceptance length {:.3}, position 0 {:.3}, position 1 {:.3}",
         1.0 + accepted as f64 / steps as f64,
         first as f64 / steps as f64,
         second as f64 / steps as f64,
