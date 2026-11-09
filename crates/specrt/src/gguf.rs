@@ -405,7 +405,10 @@ impl Gguf {
             moe: None,
             linear_attention: None,
             mtp: None,
-            runtime: RuntimeOptions::default(),
+            runtime: RuntimeOptions {
+                unsplit: if quant == Quant::Gguf { crate::codegen::GGB_LINEARS.iter().map(|l| l.to_string()).collect() } else { Vec::new() },
+                ..RuntimeOptions::default()
+            },
         };
         spec.validate()?;
         Ok(spec)

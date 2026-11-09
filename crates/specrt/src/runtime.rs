@@ -365,6 +365,7 @@ pub struct Runtime {
     fp4_act: Option<Fp4Act>,
     f4b_part: CudaSlice<f32>,
     f8b_part: CudaSlice<f32>,
+    ggb_scratch: CudaSlice<u16>,
     chunk: usize,
     prefill_limit: usize,
     use_mma: bool,
@@ -682,6 +683,7 @@ impl Runtime {
             fp4_act,
             f4b_part,
             f8b_part,
+            ggb_scratch: stream.alloc_zeros(if spec.quant == crate::spec::Quant::Gguf { crate::codegen::ggb_scratch_len(spec) } else { 8 })?,
             chunk,
             prefill_limit,
             seq: 0,
@@ -1024,6 +1026,7 @@ impl Runtime {
             (GemmPath::F4a, _, Some(fa)) => return self.tc_fp4(fa, &choice, w, x, out, rows, tokens),
             (GemmPath::F8b, _, _) => return self.tc_f8b(&choice, w, bias, x, out, rows, tokens),
             (GemmPath::F4b, _, _) => return self.tc_f4b(&choice, w, x, out, rows, tokens),
+            (GemmPath::Ggb, _, _) => return self.tc_ggb(&choice, w, bias, x, out, rows, tokens),
             _ => {}
         }
         let (kernel, tile) = (choice.name.as_str(), choice.tile);
@@ -1043,6 +1046,49 @@ impl Runtime {
         };
         unsafe { b.launch(config) }?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tc_ggb(
+        &self,
+        choice: &crate::codegen::KernelChoice,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let DeviceMatrix::Ggml { data, table } = w else { unreachable!("tc_ggb takes GGUF weights") };
+        let cols = self.ggb_cols(choice.name.as_str());
+        let chunks = rows * cols / 8;
+        let (r, c) = (rows as i32, cols as i32);
+        let mut b = self.stream.launch_builder(self.kernel("gg_dequant_bf16"));
+        b.arg(data).arg(table).arg(&self.ggb_scratch).arg(&r).arg(&c);
+        unsafe { b.launch(cfg(grid(chunks, 256), 256)) }?;
+        let tile = choice.tile;
+        let kernel = choice.name.as_str();
+        let mut b = self.stream.launch_builder(self.kernel(kernel));
+        b.arg(&self.ggb_scratch).arg(&self.buf.dummy);
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        let n = tokens as i32;
+        b.arg(&n);
+        let config = LaunchConfig {
+            grid_dim: (grid(rows, tile.bn), grid(tokens, tile.bm), 1),
+            block_dim: (tile.threads(), 1, 1),
+            shared_mem_bytes: self.smem[kernel],
+        };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn ggb_cols(&self, kernel: &str) -> usize {
+        let linear = crate::codegen::GGB_LINEARS.iter().find(|l| kernel.starts_with(&format!("{l}_ggb"))).expect("a ggb kernel");
+        crate::codegen::linear_dims(&self.spec, linear).1
     }
 
     #[allow(clippy::too_many_arguments)]

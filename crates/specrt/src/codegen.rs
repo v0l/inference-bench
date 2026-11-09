@@ -492,6 +492,7 @@ pub enum WeightKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GemmPath {
     Mma,
+    Ggb,
     F4w,
     F4a,
     F8a,
@@ -552,6 +553,9 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
             ..choice(format!("{linear}_f4b{}", f4b_tokens(tokens)), GemmPath::F4b, None)
         },
         WeightKind::Fp4 => choice(format!("{linear}_f4w{suffix}"), GemmPath::F4w, None),
+        WeightKind::Ggml if tokens > GGB_MIN_TOKENS && GGB_LINEARS.contains(&linear) => {
+            KernelChoice { quant: Some("gg_dequant_bf16"), ..choice(format!("{linear}_ggb{suffix}"), GemmPath::Ggb, None) }
+        }
         _ => choice(format!("{linear}_mma{suffix}"), GemmPath::Mma, None),
     }
 }
@@ -725,6 +729,45 @@ pub fn linear_dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str, bo
     }
 }
 
+pub const GGB_MIN_TOKENS: usize = 32;
+pub const GGB_LINEARS: [&str; 4] = ["qkv", "o", "gate_up", "down"];
+pub const GGB_KERNELS: &[&str] = &[
+    "qkv_ggb", "qkv_ggb_big", "qkv_ggb_narrow", "qkv_ggb_tiny",
+    "o_ggb", "o_ggb_big", "o_ggb_narrow", "o_ggb_tiny",
+    "gate_up_ggb", "gate_up_ggb_big", "gate_up_ggb_narrow", "gate_up_ggb_tiny",
+    "down_ggb", "down_ggb_big", "down_ggb_narrow", "down_ggb_tiny",
+];
+
+pub fn ggb_scratch_len(spec: &Spec) -> usize {
+    GGB_LINEARS.iter().map(|l| { let (n, k, _, _) = linear_dims(spec, l); n * k }).max().unwrap_or(0)
+}
+
+fn ggb_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
+    let mut out = String::new();
+    for linear in GGB_LINEARS {
+        let (n, k, epi, bias) = linear_dims(spec, linear);
+        let split = !spec.runtime.unsplit.iter().any(|u| u == linear);
+        for suffix in MMA_VARIANTS {
+            let shape = MmaShape::new(Tile::variant(suffix, &spec.runtime), k, WeightFormat::Bf16, split);
+            let t = shape.tile;
+            let name = format!("{linear}_ggb{suffix}");
+            let name = GGB_KERNELS.iter().copied().find(|g| *g == name).expect("listed in GGB_KERNELS");
+            smem.insert(name, shape.smem_bytes());
+            out.push_str(&format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, 0, {split}>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+                threads = t.threads(),
+                bm = t.bm,
+                bn = t.bn,
+                wm = t.wm,
+                wn = t.wn,
+                bk = shape.bk,
+                stages = shape.stages,
+            ));
+        }
+    }
+    out
+}
+
 fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
     let unsplit = &spec.runtime.unsplit;
     let mut out = String::new();
@@ -875,6 +918,12 @@ impl Module {
             format!("{}\n{}", render(OPS_TEMPLATE, &vars)?, render(MODEL_TEMPLATE, &vars)?);
         let mut kernels = KERNELS.to_vec();
         let mut arch_features = false;
+        if spec.quant == Quant::Gguf {
+            source.push('\n');
+            source.push_str(&ggb_kernels(spec, &mut smem));
+            kernels.extend_from_slice(GGB_KERNELS);
+            kernels.push("gg_dequant_bf16");
+        }
         if la.is_some() {
             source.push('\n');
             source.push_str(&render(GDN_TEMPLATE, &vars)?);

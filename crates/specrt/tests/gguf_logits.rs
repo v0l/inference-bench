@@ -75,6 +75,23 @@ fn native_against_bf16(file: &str) -> (f64, f64, usize) {
     (mean, max, same)
 }
 
+#[test]
+#[ignore = "needs a CUDA GPU and the unsloth Qwen3-0.6B Q4_K_M GGUF in ~/.cache/specrt-gguf"]
+fn the_engine_chats_with_a_gguf_file_using_its_own_tokenizer_and_template() {
+    let path = dir().join("Qwen3-0.6B-Q4_K_M.gguf");
+    let mut engine = specrt::Engine::load(path.to_str().unwrap(), Some(512)).unwrap();
+    let messages = [serde_json::json!({"role": "user", "content": "What is the capital of France? Answer in one word."})];
+    let vars = serde_json::json!({"enable_thinking": false});
+    let mut text = String::new();
+    let reply = engine.chat(&messages, Some(&vars), 32, Sampling::GREEDY, &mut |t| {
+        text.push_str(t);
+        true
+    }).unwrap();
+    eprintln!("reply {:?} prompt {} completion {}", reply.text, reply.prompt_tokens, reply.completion_tokens);
+    assert!(reply.text.contains("Paris"), "{}", reply.text);
+    assert!(reply.completion_tokens < 32, "stops at the template end of turn");
+}
+
 const ENGINE_KL_MEAN: f64 = 5e-2;
 const ENGINE_KL_MAX: f64 = 0.5;
 const ENGINE_TOP1: usize = 16;

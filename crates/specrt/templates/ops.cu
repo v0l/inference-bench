@@ -280,18 +280,99 @@ __device__ __forceinline__ void gg_load8(const void* w, const unsigned* table, i
 }
 
 template <int K>
+__device__ __forceinline__ float gg_q4k_dot(const unsigned char* base, const float* x, int lane) {
+    int j = (lane & 7) >> 1;
+    int l0 = (lane & 1) * 16;
+    float acc = 0.0f;
+#pragma unroll 2
+    for (int s0 = 0; s0 < K / GG_SB; s0 += 4) {
+        int s = s0 + (lane >> 3);
+        if (s >= K / GG_SB) break;
+        const unsigned char* sb = base + (size_t)s * 144;
+        uint4 head = __ldg((const uint4*)sb);
+        uint4 q = __ldg((const uint4*)(sb + 16 + 32 * j + l0));
+        float d = gg_f16((unsigned short)(head.x & 0xffffu));
+        float dmin = gg_f16((unsigned short)(head.x >> 16));
+        unsigned scales[3] = {head.y, head.z, head.w};
+        float sc1, m1, sc2, m2;
+        gg_scale_min(scales, 2 * j, sc1, m1);
+        gg_scale_min(scales, 2 * j + 1, sc2, m2);
+        const float* xs = x + s * GG_SB + 64 * j + l0;
+        unsigned words[4] = {q.x, q.y, q.z, q.w};
+        float lo = 0.0f, hi = 0.0f, slo = 0.0f, shi = 0.0f;
+#pragma unroll
+        for (int w4 = 0; w4 < 4; w4++) {
+            float4 a = *(const float4*)(xs + 4 * w4);
+            float4 b = *(const float4*)(xs + 32 + 4 * w4);
+            unsigned v = words[w4];
+            lo += (float)(v & 15u) * a.x + (float)((v >> 8) & 15u) * a.y + (float)((v >> 16) & 15u) * a.z + (float)((v >> 24) & 15u) * a.w;
+            hi += (float)((v >> 4) & 15u) * b.x + (float)((v >> 12) & 15u) * b.y + (float)((v >> 20) & 15u) * b.z + (float)(v >> 28) * b.w;
+            slo += a.x + a.y + a.z + a.w;
+            shi += b.x + b.y + b.z + b.w;
+        }
+        acc += d * (sc1 * lo + sc2 * hi) - dmin * (m1 * slo + m2 * shi);
+    }
+    return acc;
+}
+
+template <int K>
+__device__ __forceinline__ float gg_q6k_dot(const unsigned char* base, const float* x, int lane) {
+    int h = (lane & 7) >> 2;
+    int l0 = (lane & 3) * 8;
+    float acc = 0.0f;
+#pragma unroll 2
+    for (int s0 = 0; s0 < K / GG_SB; s0 += 4) {
+        int s = s0 + (lane >> 3);
+        if (s >= K / GG_SB) break;
+        const unsigned char* sb = base + (size_t)s * 224;
+        uint2 qa = __ldg((const uint2*)(sb + 64 * h + l0));
+        uint2 qb = __ldg((const uint2*)(sb + 64 * h + 32 + l0));
+        uint2 qc = __ldg((const uint2*)(sb + 128 + 32 * h + l0));
+        float d = gg_f16(gg_u16(sb + 208));
+        const unsigned char* sc = sb + 192 + 8 * h + l0 / 16;
+        const float* xs = x + s * GG_SB + 128 * h + l0;
+        unsigned a[2] = {qa.x, qa.y}, b[2] = {qb.x, qb.y}, c[2] = {qc.x, qc.y};
+        float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            unsigned av = (a[i >> 2] >> (8 * (i & 3))) & 0xffu;
+            unsigned bv = (b[i >> 2] >> (8 * (i & 3))) & 0xffu;
+            unsigned cv = (c[i >> 2] >> (8 * (i & 3))) & 0xffu;
+            part[0] += (float)((int)((av & 15u) | ((cv & 3u) << 4)) - 32) * xs[i];
+            part[1] += (float)((int)((bv & 15u) | (((cv >> 2) & 3u) << 4)) - 32) * xs[i + 32];
+            part[2] += (float)((int)((av >> 4) | (((cv >> 4) & 3u) << 4)) - 32) * xs[i + 64];
+            part[3] += (float)((int)((bv >> 4) | (((cv >> 6) & 3u) << 4)) - 32) * xs[i + 96];
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; k++) sum += (float)(signed char)__ldg(sc + 2 * k) * part[k];
+        acc += d * sum;
+    }
+    return acc;
+}
+
+template <int K>
 __device__ __forceinline__ float gg_row_dot(const void* w, const unsigned* table, int row, const float* x, int lane) {
     int type;
     const unsigned char* base = gg_row(w, table, row, type);
+    if (type == GG_Q4K) return gg_q4k_dot<K>(base, x, lane);
+    if (type == GG_Q6K) return gg_q6k_dot<K>(base, x, lane);
     int bytes = gg_bytes(type);
     float acc = 0.0f;
+    int c0 = (lane & 7) * 4;
 #pragma unroll 2
-    for (int s = 0; s < K / GG_SB; s++) {
-        float wv[8];
-        gg_dequant8(base + (size_t)s * bytes, type, lane, wv);
-        float4 xa = *(const float4*)(x + s * GG_SB + 8 * lane);
-        float4 xb = *(const float4*)(x + s * GG_SB + 8 * lane + 4);
-        acc += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w + wv[4] * xb.x + wv[5] * xb.y + wv[6] * xb.z + wv[7] * xb.w;
+    for (int s0 = 0; s0 < K / GG_SB; s0 += 4) {
+        int s = s0 + (lane >> 3);
+        if (s >= K / GG_SB) break;
+        const unsigned char* sb = base + (size_t)s * bytes;
+#pragma unroll
+        for (int c = c0; c < c0 + 4; c++) {
+            float wv[8];
+            gg_dequant8(sb, type, c, wv);
+            float4 xa = *(const float4*)(x + s * GG_SB + 8 * c);
+            float4 xb = *(const float4*)(x + s * GG_SB + 8 * c + 4);
+            acc += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w + wv[4] * xb.x + wv[5] * xb.y + wv[6] * xb.z + wv[7] * xb.w;
+        }
     }
     return acc;
 }
@@ -538,6 +619,18 @@ __device__ __forceinline__ void mma_bf16(float* c, unsigned a0, unsigned a1, uns
 __device__ __forceinline__ unsigned bf16_bits_rn(float v) {
     unsigned u = __float_as_uint(v);
     return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+}
+
+extern "C" __global__ void gg_dequant_bf16(const void* w, const unsigned* table, bf16_t* out, int rows, int cols) {
+    int chunk = blockIdx.x * blockDim.x + threadIdx.x;
+    int per_row = cols / 8;
+    if (chunk >= rows * per_row) return;
+    int row = chunk / per_row;
+    int k = (chunk % per_row) * 8;
+    float v[8];
+    gg_load8(w, table, row, k, v);
+    *(uint4*)(out + (size_t)row * cols + k) = make_uint4(bf16_bits_rn(v[0]) | (bf16_bits_rn(v[1]) << 16), bf16_bits_rn(v[2]) | (bf16_bits_rn(v[3]) << 16),
+                                                     bf16_bits_rn(v[4]) | (bf16_bits_rn(v[5]) << 16), bf16_bits_rn(v[6]) | (bf16_bits_rn(v[7]) << 16));
 }
 
 __device__ __forceinline__ void split_hi_lo(float v, unsigned& hi, unsigned& lo) {
