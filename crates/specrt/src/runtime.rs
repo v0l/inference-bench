@@ -1,6 +1,6 @@
 use crate::codegen::{LA_CHUNK, LA_COLS, LA_KSPLIT, Module, PAGE};
 use crate::jit::{Jit, default_cache_dir};
-use crate::spec::{LinearAttention, Spec, TileChoice};
+use crate::spec::{LinearAttention, Spec};
 use crate::statepool::StatePool;
 use crate::weights::{Checkpoint, Matrix, Mixer, peak_rss_bytes};
 use anyhow::{Context, Result, ensure};
@@ -52,6 +52,16 @@ impl DeviceMatrix {
             DeviceMatrix::Fp8 { values, scales } => values.num_bytes() + scales.num_bytes(),
             DeviceMatrix::Fp4 { packed, scales } => packed.num_bytes() + scales.num_bytes(),
         }) as u64
+    }
+
+    fn kind(&self) -> crate::codegen::WeightKind {
+        use crate::codegen::WeightKind;
+        match self {
+            DeviceMatrix::Bf16(_) => WeightKind::Bf16,
+            DeviceMatrix::Q8 { .. } => WeightKind::Q8,
+            DeviceMatrix::Fp8 { .. } => WeightKind::Fp8,
+            DeviceMatrix::Fp4 { .. } => WeightKind::Fp4,
+        }
     }
 
     fn args<'a>(&'a self, b: &mut cudarc::driver::LaunchArgs<'a>, dummy: &'a CudaSlice<f32>) {
@@ -976,40 +986,17 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        use crate::codegen::Tile;
-        let opts = &self.spec.runtime;
-        let big = Tile::big(opts);
-        let blocks = |t: Tile| grid(rows, t.bn) * grid(tokens, t.bm);
-        let suffix = match opts.tile {
-            TileChoice::Small => "",
-            TileChoice::Big => "_big",
-            TileChoice::Narrow => "_narrow",
-            _ if tokens <= 16 => "_tiny",
-            _ if blocks(big) >= 2 * self.sms => "_big",
-            _ if blocks(Tile::SMALL) >= 2 * self.sms => "",
-            _ => "_narrow",
-        };
-        let tile = Tile::variant(suffix, opts);
-        let act_quant = name != "lm_head" && suffix != "_tiny";
-        if let (Some(fa), DeviceMatrix::Fp8 { .. }, true) = (&self.fp8_act, w, act_quant) {
-            return self.tc_fp8(fa, name, w, bias, x, out, rows, tokens, suffix, tile);
+        use crate::codegen::{GemmPath, kernel_for};
+        let choice = kernel_for(&self.spec, name, rows, tokens, self.sms as usize, w.kind());
+        match (choice.path, &self.fp8_act, &self.fp4_act) {
+            (GemmPath::F8a, Some(fa), _) => return self.tc_fp8(fa, &choice, w, bias, x, out, rows, tokens),
+            (GemmPath::F4a, _, Some(fa)) => return self.tc_fp4(fa, &choice, w, x, out, rows, tokens),
+            (GemmPath::F8b, _, _) => return self.tc_f8b(&choice, w, bias, x, out, rows, tokens),
+            (GemmPath::F4b, _, _) => return self.tc_f4b(&choice, w, x, out, rows, tokens),
+            _ => {}
         }
-        if let (Some(fa), DeviceMatrix::Fp4 { .. }, true) = (&self.fp4_act, w, act_quant) {
-            return self.tc_fp4(fa, name, w, x, out, rows, tokens, suffix, tile);
-        }
-        let f8b = suffix == "_tiny" && tokens <= crate::codegen::F8B_MAX_TOKENS && crate::codegen::F8B_LINEARS.contains(&name);
-        if let (DeviceMatrix::Fp8 { .. }, true) = (w, f8b) {
-            return self.tc_f8b(name, w, bias, x, out, rows, tokens);
-        }
-        let batched_f4 = name != "lm_head" && suffix == "_tiny" && tokens <= crate::codegen::F4B_MAX_TOKENS;
-        if let (DeviceMatrix::Fp4 { .. }, true) = (w, batched_f4) {
-            return self.tc_f4b(name, w, x, out, rows, tokens);
-        }
-        let kernel = match w {
-            DeviceMatrix::Fp4 { .. } => format!("{name}_f4w{suffix}"),
-            _ => format!("{name}_mma{suffix}"),
-        };
-        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        let (kernel, tile) = (choice.name.as_str(), choice.tile);
+        let mut b = self.stream.launch_builder(self.kernel(kernel));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
         match out {
@@ -1021,7 +1008,7 @@ impl Runtime {
         let config = LaunchConfig {
             grid_dim: (grid(rows, tile.bn), grid(tokens, tile.bm), 1),
             block_dim: (tile.threads(), 1, 1),
-            shared_mem_bytes: self.smem[kernel.as_str()],
+            shared_mem_bytes: self.smem[kernel],
         };
         unsafe { b.launch(config) }?;
         Ok(())
@@ -1030,7 +1017,7 @@ impl Runtime {
     #[allow(clippy::too_many_arguments)]
     fn tc_f8b(
         &self,
-        name: &str,
+        choice: &crate::codegen::KernelChoice,
         w: &DeviceMatrix,
         bias: Option<&CudaSlice<f32>>,
         x: (CudaView<u16>, CudaView<u16>),
@@ -1038,13 +1025,12 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        use crate::codegen::{F8B_REDUCE_BLOCK, F8B_ROWS, F8B_WARPS, f8b_smem, f8b_splits, f8b_tokens};
+        use crate::codegen::{F8B_REDUCE_BLOCK, F8B_ROWS, F8B_WARPS, f8b_smem, f8b_splits};
         let DeviceMatrix::Fp8 { values, .. } = w else { unreachable!("tc_f8b takes FP8 weights") };
         let width = values.len() / rows;
         let splits = f8b_splits(rows, width, self.sms as usize);
         let (n, s) = (tokens as i32, splits as i32);
-        let kernel = format!("{name}_f8b{}", f8b_tokens(tokens));
-        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        let mut b = self.stream.launch_builder(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
         match out {
@@ -1061,8 +1047,8 @@ impl Runtime {
         if splits == 1 {
             return Ok(());
         }
-        let reduce = format!("{name}_f8b_reduce");
-        let mut b = self.stream.launch_builder(self.kernel(&reduce));
+        let reduce = choice.reduce.as_deref().expect("f8b has a reduce kernel");
+        let mut b = self.stream.launch_builder(self.kernel(reduce));
         b.arg(&self.f8b_part).arg(bias.unwrap_or(&self.buf.dummy));
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
@@ -1079,20 +1065,19 @@ impl Runtime {
 
     fn tc_f4b(
         &self,
-        name: &str,
+        choice: &crate::codegen::KernelChoice,
         w: &DeviceMatrix,
         x: (CudaView<u16>, CudaView<u16>),
         out: GemmOut,
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        use crate::codegen::{F4B_REDUCE_BLOCK, F4B_ROWS, f4b_smem, f4b_splits, f4b_tokens};
+        use crate::codegen::{F4B_REDUCE_BLOCK, F4B_ROWS, f4b_smem, f4b_splits};
         let DeviceMatrix::Fp4 { packed, .. } = w else { unreachable!("tc_f4b takes NVFP4 weights") };
         let width = packed.len() * 2 / rows;
         let splits = f4b_splits(rows, width, self.sms as usize);
         let (n, s) = (tokens as i32, splits as i32);
-        let kernel = format!("{name}_f4b{}", f4b_tokens(tokens));
-        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        let mut b = self.stream.launch_builder(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
         b.arg(&x.0).arg(&x.1);
         match out {
@@ -1109,8 +1094,8 @@ impl Runtime {
         if splits == 1 {
             return Ok(());
         }
-        let reduce = format!("{name}_f4b_reduce");
-        let mut b = self.stream.launch_builder(self.kernel(&reduce));
+        let reduce = choice.reduce.as_deref().expect("f4b has a reduce kernel");
+        let mut b = self.stream.launch_builder(self.kernel(reduce));
         b.arg(&self.f4b_part);
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
@@ -1129,20 +1114,18 @@ impl Runtime {
     fn tc_fp4(
         &self,
         fa: &Fp4Act,
-        name: &str,
+        choice: &crate::codegen::KernelChoice,
         w: &DeviceMatrix,
         x: (CudaView<u16>, CudaView<u16>),
         out: GemmOut,
         rows: usize,
         tokens: usize,
-        suffix: &str,
-        tile: crate::codegen::Tile,
     ) -> Result<()> {
         let DeviceMatrix::Fp4 { packed, scales } = w else { unreachable!("tc_fp4 takes NVFP4 weights") };
         let width = packed.len() * 2 / rows;
         let width_i = width as i32;
         let groups = width / crate::nvfp4::GROUP;
-        let mut b = self.stream.launch_builder(self.kernel("quant_rows_fp4"));
+        let mut b = self.stream.launch_builder(self.kernel(choice.quant.expect("f4a quantises its input")));
         b.arg(&x.0).arg(&x.1).arg(scales).arg(&fa.q).arg(&fa.scales).arg(&width_i);
         let config = LaunchConfig {
             grid_dim: (grid(groups, 128), tokens as u32, 1),
@@ -1150,8 +1133,8 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        let kernel = format!("{name}_f4a{suffix}");
-        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        let (kernel, tile) = (choice.name.as_str(), choice.tile);
+        let mut b = self.stream.launch_builder(self.kernel(kernel));
         b.arg(packed).arg(scales).arg(&fa.q).arg(&fa.scales);
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
@@ -1162,7 +1145,7 @@ impl Runtime {
         let config = LaunchConfig {
             grid_dim: (grid(rows, tile.bn), grid(tokens, tile.bm), 1),
             block_dim: (tile.threads(), 1, 1),
-            shared_mem_bytes: self.smem[kernel.as_str()],
+            shared_mem_bytes: self.smem[kernel],
         };
         unsafe { b.launch(config) }?;
         Ok(())
@@ -1172,22 +1155,20 @@ impl Runtime {
     fn tc_fp8(
         &self,
         fa: &Fp8Act,
-        name: &str,
+        choice: &crate::codegen::KernelChoice,
         w: &DeviceMatrix,
         bias: Option<&CudaSlice<f32>>,
         x: (CudaView<u16>, CudaView<u16>),
         out: GemmOut,
         rows: usize,
         tokens: usize,
-        suffix: &str,
-        tile: crate::codegen::Tile,
     ) -> Result<()> {
         let width = match w {
             DeviceMatrix::Fp8 { values, .. } => values.len() / rows,
             _ => unreachable!("tc_fp8 takes FP8 weights"),
         };
         let width_i = width as i32;
-        let mut b = self.stream.launch_builder(self.kernel("quant_rows_fp8"));
+        let mut b = self.stream.launch_builder(self.kernel(choice.quant.expect("f8 quantises its input")));
         b.arg(&x.0).arg(&x.1).arg(&fa.q).arg(&fa.scale).arg(&width_i);
         let config = LaunchConfig {
             grid_dim: ((width / crate::codegen::FP8_BLOCK) as u32, tokens as u32, 1),
@@ -1195,8 +1176,8 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        let kernel = format!("{name}_f8{suffix}");
-        let mut b = self.stream.launch_builder(self.kernel(&kernel));
+        let (kernel, tile) = (choice.name.as_str(), choice.tile);
+        let mut b = self.stream.launch_builder(self.kernel(kernel));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&fa.q).arg(&fa.scale);
         match out {
@@ -1208,7 +1189,7 @@ impl Runtime {
         let config = LaunchConfig {
             grid_dim: (grid(rows, tile.bn), grid(tokens, tile.bm), 1),
             block_dim: (tile.threads(), 1, 1),
-            shared_mem_bytes: self.smem[kernel.as_str()],
+            shared_mem_bytes: self.smem[kernel],
         };
         unsafe { b.launch(config) }?;
         Ok(())

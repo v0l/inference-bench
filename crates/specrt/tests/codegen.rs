@@ -1,5 +1,6 @@
-use specrt::codegen::{Module, render};
-use specrt::spec::{Quant, Spec};
+use specrt::codegen::{GDN_LINEARS, MMA_LINEARS, Module, WeightKind, kernel_for, linear_dims, render};
+use specrt::mtp::MTP_LINEARS;
+use specrt::spec::{Quant, Spec, TileChoice};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -158,6 +159,114 @@ fn hybrid_spec_adds_the_delta_net_kernels_and_dense_specs_do_not() {
     assert!(dense.kernels.iter().all(|k| !k.starts_with("gdn_") && !k.starts_with("lin_")));
     assert!(dense.source.contains("constexpr int ROT = 128;"));
     assert!(dense.source.contains("constexpr bool OUT_GATE = false;"));
+}
+
+fn dispatch_specs() -> Vec<(String, Spec)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = Vec::new();
+    let mut files = Vec::new();
+    for dir in [root.join("specs"), root.join("tests/fixtures")] {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            files.push(if path.is_dir() { path.join("config.json") } else { path });
+        }
+    }
+    files.sort();
+    for path in files {
+        let name = path.strip_prefix(root).unwrap().display().to_string();
+        if name.ends_with(".toml") {
+            out.push((name, Spec::load(&path).unwrap()));
+        } else if name.ends_with("config.json") && !name.contains("tokenizer") && path.exists() {
+            let json = std::fs::read_to_string(&path).unwrap();
+            out.push((name, Spec::from_hf_config(&json).unwrap()));
+        }
+    }
+    out
+}
+
+fn dispatch_variants(base: &Spec) -> Vec<Spec> {
+    use specrt::spec::ActQuant;
+    let heads = [None, Some(Quant::Bf16), Some(Quant::Fp8Channel), Some(Quant::Nvfp4G16)];
+    let mut out = Vec::new();
+    for head in heads {
+        for act in [ActQuant::None, ActQuant::Fp8] {
+            for mlp_act in [ActQuant::None, ActQuant::Fp4] {
+                for tile in [TileChoice::Auto, TileChoice::Small, TileChoice::Big, TileChoice::Narrow] {
+                    let mut s = base.clone();
+                    s.head_quant = head;
+                    s.act_quant = act;
+                    s.mlp.act_quant = mlp_act;
+                    s.runtime.tile = tile;
+                    s.runtime.gemm_fp32 = false;
+                    if s.validate().is_ok() {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn weight_kinds(spec: &Spec, linear: &str) -> Vec<WeightKind> {
+    let kind = |q: Quant| match q {
+        Quant::Bf16 => WeightKind::Bf16,
+        Quant::Q8 => WeightKind::Q8,
+        Quant::Fp8Block128 | Quant::Fp8Channel => WeightKind::Fp8,
+        Quant::Nvfp4G16 => WeightKind::Fp4,
+    };
+    let mut out: Vec<WeightKind> = match linear {
+        "lm_head" => vec![kind(spec.lm_head_quant())],
+        "lin_ba" => vec![WeightKind::Bf16],
+        l if l.starts_with("mtp_") => vec![WeightKind::Bf16],
+        "gate_up" | "down" => (0..spec.layers.count).map(|l| kind(spec.mlp_quant(l))).collect(),
+        _ => vec![kind(spec.quant)],
+    };
+    out.dedup();
+    out
+}
+
+#[test]
+fn every_dispatched_kernel_is_generated() {
+    let tokens = [1, 8, 9, 16, 17, 32, 64, 128, 256, 512, 1024, 2048];
+    let mut checked = 0;
+    let mut mtp_specs = 0;
+    let mut missing = std::collections::BTreeSet::new();
+    for (file, base) in dispatch_specs() {
+        for spec in dispatch_variants(&base) {
+            let m = Module::generate(&spec, 256).unwrap();
+            let gdn: &[&str] = if spec.linear_attention.is_some() { &GDN_LINEARS } else { &[] };
+            let mtp: &[&str] = if spec.linear_attention.is_some() && spec.speculative().is_some() { &MTP_LINEARS } else { &[] };
+            if !mtp.is_empty() {
+                mtp_specs += 1;
+            }
+            for &linear in MMA_LINEARS.iter().chain(gdn).chain(mtp) {
+                let rows = if linear.starts_with("mtp_") { specrt::mtp::dims(&spec, linear).0 } else { linear_dims(&spec, linear).0 };
+                for weight in weight_kinds(&spec, linear) {
+                    for &n in &tokens {
+                        for sms in [48, 84, 188] {
+                            let c = kernel_for(&spec, linear, rows, n, sms, weight);
+                            let mut need = vec![c.name.clone()];
+                            need.extend(c.quant.map(str::to_string));
+                            need.extend(c.reduce.clone());
+                            for k in &need {
+                                if !m.kernels.contains(&k.as_str()) {
+                                    missing.insert(format!("{file} {:?} {k} not generated", spec.runtime.tile));
+                                }
+                            }
+                            if !m.smem.contains_key(c.name.as_str()) {
+                                missing.insert(format!("{file} {} has no smem entry", c.name));
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 10_000, "{checked}");
+    assert!(mtp_specs > 0);
+    assert!(missing.is_empty(), "{missing:#?}");
 }
 
 #[test]

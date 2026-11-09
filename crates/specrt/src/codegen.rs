@@ -1,4 +1,4 @@
-use crate::spec::{Activation, ActQuant, Quant, RopeScalingKind, RuntimeOptions, Spec};
+use crate::spec::{Activation, ActQuant, Quant, RopeScalingKind, RuntimeOptions, Spec, TileChoice};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
@@ -400,6 +400,67 @@ impl WeightFormat {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightKind {
+    Bf16,
+    Q8,
+    Fp8,
+    Fp4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GemmPath {
+    Mma,
+    F4w,
+    F4a,
+    F8a,
+    F8b,
+    F4b,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct KernelChoice {
+    pub name: String,
+    pub quant: Option<&'static str>,
+    pub reduce: Option<String>,
+    pub tile: Tile,
+    pub path: GemmPath,
+}
+
+pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: usize, weight: WeightKind) -> KernelChoice {
+    let opts = &spec.runtime;
+    let big = Tile::big(opts);
+    let blocks = |t: Tile| rows.div_ceil(t.bn) * tokens.div_ceil(t.bm);
+    let suffix = match opts.tile {
+        TileChoice::Small => "",
+        TileChoice::Big => "_big",
+        TileChoice::Narrow => "_narrow",
+        _ if tokens <= 16 => "_tiny",
+        _ if blocks(big) >= 2 * sms => "_big",
+        _ if blocks(Tile::SMALL) >= 2 * sms => "",
+        _ => "_narrow",
+    };
+    let tile = Tile::variant(suffix, opts);
+    let choice = |name: String, path: GemmPath, quant: Option<&'static str>| KernelChoice { name, quant, reduce: None, tile, path };
+    let act_quant = linear != "lm_head" && suffix != "_tiny";
+    let fp8_act = spec.quant.is_fp8() && fp8_act_enabled(spec);
+    let fp4_act = spec.mlp.quant == Some(Quant::Nvfp4G16) && fp4_act_enabled(spec);
+    match weight {
+        WeightKind::Fp8 if act_quant && fp8_act => choice(format!("{linear}_f8{suffix}"), GemmPath::F8a, Some("quant_rows_fp8")),
+        WeightKind::Fp4 if act_quant && fp4_act => choice(format!("{linear}_f4a{suffix}"), GemmPath::F4a, Some("quant_rows_fp4")),
+        WeightKind::Fp8 if suffix == "_tiny" && tokens <= F8B_MAX_TOKENS && F8B_LINEARS.contains(&linear) => KernelChoice {
+            reduce: Some(format!("{linear}_f8b_reduce")),
+            ..choice(format!("{linear}_f8b{}", f8b_tokens(tokens)), GemmPath::F8b, None)
+        },
+        WeightKind::Fp4 if linear != "lm_head" && suffix == "_tiny" && tokens <= F4B_MAX_TOKENS => KernelChoice {
+            reduce: Some(format!("{linear}_f4b_reduce")),
+            ..choice(format!("{linear}_f4b{}", f4b_tokens(tokens)), GemmPath::F4b, None)
+        },
+        WeightKind::Fp4 => choice(format!("{linear}_f4w{suffix}"), GemmPath::F4w, None),
+        _ => choice(format!("{linear}_mma{suffix}"), GemmPath::Mma, None),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MmaShape {
     pub tile: Tile,
@@ -553,7 +614,7 @@ fn mma_kernel_name(linear: &str, suffix: &str) -> &'static str {
         .expect("mma kernel listed in KERNELS")
 }
 
-fn linear_dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str, bool) {
+pub fn linear_dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str, bool) {
     let d = &spec.dims;
     let la = spec.linear_attention.as_ref();
     match linear {

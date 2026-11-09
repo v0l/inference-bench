@@ -42,7 +42,7 @@ pub const MTP_MMA_KERNELS: &[&str] = &[
     "mtp_down_mma_tiny",
 ];
 
-fn dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str) {
+pub fn dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str) {
     let d = &spec.dims;
     match linear {
         "mtp_fc" => (d.hidden, 2 * d.hidden, "EPI_STORE"),
