@@ -239,6 +239,20 @@ impl ModelAnatomy {
         bandwidth_bytes_per_second / self.decode_bytes as f64
     }
 
+    pub fn quant_mix(&self) -> Vec<(Quant, u64)> {
+        let mut mix: Vec<(Quant, u64)> = Vec::new();
+        let mut add = |q: Quant, bytes: u64| match mix.iter_mut().find(|(k, _)| *k == q) {
+            Some(e) => e.1 += bytes,
+            None => mix.push((q, bytes)),
+        };
+        for l in &self.layers {
+            add(l.mixer_quant, quant_bytes(l.mixer_params, l.mixer_quant));
+            add(l.mlp_quant, quant_bytes(l.mlp_params, l.mlp_quant));
+        }
+        mix.sort_by_key(|(_, b)| std::cmp::Reverse(*b));
+        mix
+    }
+
     pub fn pattern(&self) -> String {
         self.layers.iter().map(|l| if l.kind == LayerKind::Attention { 'A' } else { 'D' }).collect()
     }
@@ -339,6 +353,14 @@ mod tests {
         assert!(fp8.decode_bytes <= fp8.total_bytes);
         assert_eq!(quant_bytes(32, Quant::Nvfp4G16), 18);
         assert_eq!(quant_bytes(10, Quant::Bf16), 20);
+    }
+
+    #[test]
+    fn the_quant_mix_lists_every_format_by_weight_bytes() {
+        let mixed = ModelAnatomy::new(&fixture("qwen3.8-27b-nvfp4.toml"), 0, None).quant_mix();
+        assert_eq!(mixed.iter().map(|m| m.0).collect::<Vec<_>>(), vec![Quant::Fp8Channel, Quant::Nvfp4G16]);
+        let plain = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 0, None).quant_mix();
+        assert_eq!(plain.len(), 1);
     }
 
     #[test]

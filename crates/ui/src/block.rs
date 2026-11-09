@@ -71,7 +71,7 @@ fn attention_rows(spec: &Spec) -> Vec<Row> {
     };
     rows.push(Row::Boxes(vec![node(
         "rope neox",
-        format!("theta {}, {} of {d} dims{scaling}", spec.rope.theta, spec.rotary_dim()),
+        format!("theta {}, {} of {d} dims{scaling}", theta_text(spec.rope.theta), spec.rotary_dim()),
     )]));
     let group = a.heads / a.kv_heads;
     let gating = if a.output_gate { ", sigmoid output gate" } else { "" };
@@ -142,13 +142,30 @@ fn quant_tint(q: Quant) -> Color32 {
     }
 }
 
+pub fn theta_text(theta: f64) -> String {
+    match theta {
+        t if t >= 1e6 && (t / 1e6).fract() == 0.0 => format!("{}M", t / 1e6),
+        t if t >= 1e3 && (t / 1e3).fract() == 0.0 => format!("{}k", t / 1e3),
+        t => format!("{t}"),
+    }
+}
+
+pub fn shape_job(text: &str, width: f32) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::simple(text.to_string(), figure(10.0), VALUE, width);
+    for s in &mut job.sections {
+        s.format.strikethrough = Stroke::NONE;
+        s.format.underline = Stroke::NONE;
+    }
+    job
+}
+
 fn paint_node(ui: &egui::Ui, rect: Rect, n: &Node, tint: Color32) {
     let p = ui.painter();
     p.rect_filled(rect, 2.0, PANEL);
     p.rect_stroke(rect, 2.0, Stroke::new(1.0, tint.gamma_multiply(0.7)), StrokeKind::Inside);
     let title = p.layout_no_wrap(n.title.to_uppercase(), legend_font(10.5), tint);
     p.galley(pos2(rect.left() + 6.0, rect.top() + 4.0), title, tint);
-    let shape = p.layout(n.shape.clone(), figure(10.0), VALUE, (rect.width() - 12.0).max(10.0));
+    let shape = p.layout_job(shape_job(&n.shape, (rect.width() - 12.0).max(10.0)));
     p.galley(pos2(rect.left() + 6.0, rect.top() + 19.0), shape, VALUE);
     if let Some(q) = n.quant {
         let t = quant_tag(q).to_uppercase();
@@ -268,6 +285,25 @@ mod tests {
         assert!(t.iter().any(|s| s.starts_with("causal conv 10240 channels, width 4")), "{t:?}");
         assert!(t.iter().any(|s| s.contains("16 key, 48 value heads")));
         assert!(t.contains(&"out 48 × 128 → 5120".to_string()));
+    }
+
+    #[test]
+    fn the_rope_label_has_no_strikethrough_and_a_compact_theta() {
+        let rows = rows_for(&spec("qwen3.8-27b.toml"), LayerKind::Attention, 3);
+        let rope = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Boxes(ns) => ns.iter().find(|n| n.title == "rope neox").cloned(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(rope.shape, "theta 10M, 64 of 256 dims");
+        let job = shape_job(&rope.shape, 300.0);
+        assert!(!job.sections.is_empty());
+        for s in &job.sections {
+            assert_eq!(s.format.strikethrough, Stroke::NONE);
+            assert_eq!(s.format.underline, Stroke::NONE);
+        }
     }
 
     #[test]

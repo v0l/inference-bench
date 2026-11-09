@@ -782,12 +782,12 @@ fn screenshots_of_the_model_detail_view() {
         ("compare", detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), Some(detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml")))),
     ];
     for (name, view, other) in cases {
-        for (w, h_px) in [(1400.0, 900.0), (1024.0, 700.0)] {
+        for (w, h_px) in [(1400.0, 900.0), (1024.0, 700.0), (1400.0, 3000.0)] {
             let mut h = detail_harness(&format!("shot-{name}"), egui::vec2(w, h_px), view_clone(&view), other.as_ref().map(view_clone));
             h.run();
             h.query_all_by_label_contains("layer 3 ").next().unwrap().click();
             h.run();
-            h.render().unwrap().save(out.join(format!("detail-{name}-{w}.png"))).unwrap();
+            h.render().unwrap().save(out.join(format!("detail-{name}-{w}x{h_px}.png"))).unwrap();
         }
     }
 }

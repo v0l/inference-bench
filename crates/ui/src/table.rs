@@ -56,7 +56,7 @@ pub fn entries(view: &View, bandwidth_gbs: Option<u64>) -> Vec<Entry> {
     add("norm", "kind", "rmsnorm".into(), src);
     add("norm", "eps", format!("{:e}", s.norm.eps), src);
     add("norm", "unit_offset", yes(s.norm.unit_offset), src);
-    add("rope and scaling", "theta", format!("{}", s.rope.theta), src);
+    add("rope and scaling", "theta", crate::block::theta_text(s.rope.theta), src);
     add("rope and scaling", "style", "neox".into(), src);
     let scaling = s.rope.scaling.as_ref().map_or("none".to_string(), |r| format!("{:?} x {}", r.kind, r.factor).to_lowercase());
     add("rope and scaling", "scaling", scaling, src);

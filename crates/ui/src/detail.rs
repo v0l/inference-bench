@@ -127,7 +127,15 @@ fn header(app: &App, detail: &mut Detail, ui: &mut egui::Ui) -> bool {
         ui.label(egui::RichText::new(&detail.model).font(legend_font(14.0)).color(VALUE));
         if let Ok(v) = &detail.view {
             chip(ui, v.source.label(), LEGEND, false);
-            chip(ui, specrt::anatomy::quant_tag(v.spec.quant), READOUT, true);
+            let mix = v.anatomy.quant_mix();
+            let total: u64 = mix.iter().map(|m| m.1).sum::<u64>().max(1);
+            for (q, bytes) in &mix {
+                let text = match mix.len() {
+                    1 => specrt::anatomy::quant_tag(*q).to_string(),
+                    _ => format!("{} {:.0}%", specrt::anatomy::quant_tag(*q), *bytes as f64 / total as f64 * 100.0),
+                };
+                chip(ui, &text, READOUT, true);
+            }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             pick_compare(app, detail, ui);
@@ -180,7 +188,7 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
             }
             strip::draw(ui, n, &v.anatomy, scale, kind, layer);
         }
-        strip::legend(ui);
+        strip::legend(ui, &view.anatomy);
     });
     let layer_for_block = layer.unwrap_or_else(|| view.anatomy.layers.iter().find(|l| l.kind == *kind).map_or(0, |l| l.index));
     section(ui, "block diagram", &block::title(*kind, *layer, &view.spec), |ui| {
