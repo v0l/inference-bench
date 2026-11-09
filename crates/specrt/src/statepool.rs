@@ -14,6 +14,7 @@ pub struct StatePool {
     refs: Vec<u32>,
     handles: HashMap<usize, sys::CUmemGenericAllocationHandle>,
     live: Vec<bool>,
+    outstanding: usize,
 }
 
 fn check(r: sys::CUresult, what: &str) -> Result<()> {
@@ -49,6 +50,7 @@ impl StatePool {
             refs: vec![0; pages],
             handles: HashMap::new(),
             live: vec![false; slots],
+            outstanding: 0,
         })
     }
 
@@ -76,6 +78,10 @@ impl StatePool {
         self.handles.len() * self.granularity
     }
 
+    pub fn outstanding_allocations(&self) -> usize {
+        self.outstanding
+    }
+
     pub fn live_slots(&self) -> usize {
         self.live.iter().filter(|&&l| l).count()
     }
@@ -90,10 +96,12 @@ impl StatePool {
         let prop = Self::prop(&self.ctx);
         let mut handle: sys::CUmemGenericAllocationHandle = 0;
         check(unsafe { sys::cuMemCreate(&mut handle, self.granularity, &prop, 0) }, "allocate state page")?;
+        self.outstanding += 1;
         let at = self.base + (page * self.granularity) as u64;
         let mapped = check(unsafe { sys::cuMemMap(at, self.granularity, 0, handle, 0) }, "map state page");
         if let Err(e) = mapped {
             unsafe { sys::cuMemRelease(handle) };
+            self.outstanding -= 1;
             return Err(e);
         }
         let mut access: sys::CUmemAccessDesc = unsafe { std::mem::zeroed() };
@@ -105,6 +113,7 @@ impl StatePool {
                 sys::cuMemUnmap(at, self.granularity);
                 sys::cuMemRelease(handle);
             }
+            self.outstanding -= 1;
             return Err(e);
         }
         self.handles.insert(page, handle);
@@ -117,6 +126,7 @@ impl StatePool {
                 sys::cuMemUnmap(self.base + (page * self.granularity) as u64, self.granularity);
                 sys::cuMemRelease(handle);
             }
+            self.outstanding -= 1;
         }
     }
 

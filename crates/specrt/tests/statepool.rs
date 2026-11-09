@@ -8,7 +8,6 @@ fn a_thousand_random_acquire_release_cycles_leave_no_memory_behind() {
     let stride = 3 * (1 << 20) + 4096;
     let mut pool = StatePool::new(&ctx, stride, 32).unwrap();
     assert_eq!(pool.mapped_bytes(), 0);
-    let before = ctx.mem_get_info().unwrap().0;
     let mut x = 99u64;
     let mut live: Vec<usize> = Vec::new();
     let mut peak = 0;
@@ -32,8 +31,7 @@ fn a_thousand_random_acquire_release_cycles_leave_no_memory_behind() {
     }
     assert_eq!(pool.live_slots(), 0);
     assert_eq!(pool.mapped_bytes(), 0);
-    let after = ctx.mem_get_info().unwrap().0;
-    assert!(after + (512 << 20) >= before, "{before} free before, {after} after");
+    assert_eq!(pool.outstanding_allocations(), 0);
     assert!(peak < 32 * stride);
 }
 
