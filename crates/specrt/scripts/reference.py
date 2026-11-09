@@ -363,10 +363,103 @@ def tiny_nvfp4_model(fixture, act_quant=False):
     torch.manual_seed(TINY_SEED)
     model = Qwen3_5ForCausalLM(tiny_config(256)).float().eval()
     state, input_scales = nvfp4_state(fixture)
-    model.load_state_dict({k.replace("model.language_model.", "model."): v for k, v in state.items()}, strict=True)
+    model.load_state_dict({k.replace("model.language_model.", "model."): v for k, v in state.items() if not k.startswith("mtp.")}, strict=True)
     if act_quant:
         quantize_nvfp4_inputs(model, input_scales)
     return model
+
+
+TINY_MTP_PROMPT = 96
+
+
+def tiny_mtp_weights(config):
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer
+
+    g = torch.Generator().manual_seed(TINY_SEED + 7)
+    h = config.hidden_size
+    full = config.layer_types.index("full_attention")
+    layer = Qwen3_5DecoderLayer(config, full)
+    out = {}
+    for name, p in sorted(layer.state_dict().items()):
+        v = 0.1 * torch.randn(p.shape, generator=g) if p.dim() == 1 else torch.randn(p.shape, generator=g) / p.shape[1] ** 0.5
+        out[f"mtp.layers.0.{name}"] = v
+    out["mtp.fc.weight"] = torch.randn((h, 2 * h), generator=g) / (2 * h) ** 0.5
+    for n in ("norm", "pre_fc_norm_embedding", "pre_fc_norm_hidden"):
+        out[f"mtp.{n}.weight"] = 0.1 * torch.randn((h,), generator=g)
+    return {k: v.to(torch.bfloat16).contiguous() for k, v in out.items()}
+
+
+def write_mtp_fixture(src, dst):
+    import shutil
+    from safetensors.torch import save_file
+
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in src.iterdir():
+        if f.suffix == ".safetensors":
+            shutil.copy(f, dst / f.name)
+    config = json.loads((src / "config.json").read_text())
+    config["mtp_num_hidden_layers"] = 1
+    config["mtp_use_dedicated_embeddings"] = False
+    (dst / "config.json").write_text(json.dumps(config, indent=2))
+    torch.manual_seed(TINY_SEED)
+    weights = tiny_mtp_weights(tiny_config(256))
+    save_file(weights, dst / "mtp.safetensors")
+    index = json.loads((src / "model.safetensors.index.json").read_text())
+    index["weight_map"].update({k: "mtp.safetensors" for k in weights})
+    (dst / "model.safetensors.index.json").write_text(json.dumps(index, indent=1))
+
+
+class TinyMtp(torch.nn.Module):
+    def __init__(self, config, state):
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5RMSNorm
+
+        super().__init__()
+        h = config.hidden_size
+        self.full = config.layer_types.index("full_attention")
+        self.layer = Qwen3_5DecoderLayer(config, self.full)
+        self.fc = torch.nn.Linear(2 * h, h, bias=False)
+        self.norm = Qwen3_5RMSNorm(h, eps=config.rms_norm_eps)
+        self.pre_fc_norm_embedding = Qwen3_5RMSNorm(h, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3_5RMSNorm(h, eps=config.rms_norm_eps)
+        own = {k[len("mtp."):].replace("layers.0.", "layer."): v.float() for k, v in state.items() if k.startswith("mtp.")}
+        self.load_state_dict(own, strict=True)
+
+    def forward(self, model, tokens, hidden, positions):
+        from transformers.masking_utils import create_causal_mask
+
+        e = self.pre_fc_norm_embedding(model.model.embed_tokens(tokens))
+        x = self.fc(torch.cat([e, self.pre_fc_norm_hidden(hidden)], dim=-1))
+        pos = positions[None]
+        rope = model.model.rotary_emb(x, pos[None].expand(3, 1, -1))
+        mask = create_causal_mask(config=model.config, inputs_embeds=x, attention_mask=None, past_key_values=None, position_ids=pos)
+        x = self.layer(x, position_embeddings=rope, attention_mask=mask, position_ids=pos)
+        g = self.norm(x)
+        return model.lm_head(g)[0], g[0]
+
+
+def tiny_mtp(fixture, out_dir):
+    from safetensors.torch import load_file
+
+    torch.set_num_threads(4)
+    if not (fixture / "mtp.safetensors").exists():
+        write_mtp_fixture(fixture.parent / "tiny-qwen3.5-nvfp4", fixture)
+    model = tiny_nvfp4_model(fixture)
+    mtp = TinyMtp(model.config, load_file(fixture / "mtp.safetensors")).eval()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    versions = {"torch": torch.__version__, "transformers": __import__("transformers").__version__}
+    with torch.inference_mode():
+        ids = tiny_tokens(TINY_MTP_PROMPT, 5)
+        out = model.model(ids[None])
+        hidden = out.last_hidden_state
+        target = model.lm_head(hidden)[0]
+        logits, mtp_hidden = mtp(model, ids[None, 1:], hidden[:, :-1], torch.arange(TINY_MTP_PROMPT - 1))
+    save(
+        out_dir,
+        "tinymtp-prompt",
+        {"hidden": hidden[0], "target": target, "logits": logits, "mtp_hidden": mtp_hidden},
+        {"tokens": ids.tolist(), **versions},
+    )
+    print("tiny mtp", fixture, "->", out_dir)
 
 
 def tiny_tokens(n, salt):
@@ -714,6 +807,9 @@ def main():
     if sys.argv[1] == "tiny-nvfp4":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, nvfp4=True)
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, nvfp4=True, act_quant=True)
+        return
+    if sys.argv[1] == "tiny-mtp":
+        tiny_mtp(Path(sys.argv[2]), Path(sys.argv[3]))
         return
     if sys.argv[1] == "tiny-fp8":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, fp8=True)
