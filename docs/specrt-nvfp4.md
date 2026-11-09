@@ -603,7 +603,6 @@ settable with `[runtime] fp4_tile = [bm, bn, wm, wn]`. Per-call nsys on the 27B,
 | 128x128, 4x2 | 0.80 ms | 1.60 ms | 4,164 / 4,003 |
 | 128x256, 4x4 (default) | 0.72 ms | 1.48 ms | 4,223 / 4,051 |
 
-gate_up goes from about 160 to 250 TFLOP/s at 1,024 tokens, a 37% cut in GEMM time. Below 512
-tokens the larger tile loses (256 tokens: 2,898 against 2,756 tok/s is the new default, still ahead;
-see the bench run). ncu needs GPU counter permission (ERR_NVGPUCTRPERM), so stall reasons and bank
+gate_up goes from about 160 to 250 TFLOP/s at 1,024 tokens, a 37% cut in GEMM time. At 256 and 512
+tokens the new tile is still ahead (2,898 and 3,600 against 2,756 and 3,322 tok/s). ncu needs GPU counter permission (ERR_NVGPUCTRPERM), so stall reasons and bank
 conflicts were not collected; the deeper pipeline, TMA and warp specialisation ports are not done.
