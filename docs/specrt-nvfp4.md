@@ -507,6 +507,24 @@ On random matrices of every projection shape (`tests/fp8_batch.rs`, batch 1, 2, 
 `o`, `lin_in` and `lin_out` (max abs 30 to 40), 2.4e-5 to 2.6e-5 on `down` (max abs 57 to 66)
 and 1.1e-3 to 3.2e-3 on `gate_up` (max abs 400 to 560), never worse than the tile path.
 
+Real-27B tests on master f03f786 (with #375 and #379), references regenerated for this run
+into one dir (`real-prompts`, both `real-slice`s, `real-full` weight-only and `act`, and
+`vllm_logprobs.py` against the live vLLM), `cargo test --release --test real27b -- --ignored
+--test-threads=1`: 6 passed, 0 failed.
+
+| test | result |
+|---|---|
+| `real_27b_fp8_first_layers_match_transformers` | per-layer 6.9e-7 to 3.1e-6, logits 4.7e-6, top-1 64/64, decode 6.3e-7 |
+| `real_27b_nvfp4_first_layers_match_the_dequantised_checkpoint` | per-layer 1.3e-5 to 2.5e-5, logits 9.9e-6, top-1 64/64, decode 8.4e-7 |
+| `real_27b_per_layer_trace_matches_the_cpu_oracle` | all 64 layers 7.6e-7 to 1.4e-5, none above 1e-3 |
+| `real_27b_generates_greedy_and_dumps_logits` | weight and act dumps written |
+| `real_27b_greedy_and_logits_match_the_fp8_reference` | weight: logits 2.0e-4 of max, greedy 32/32 on all 5; act: KL 0.00108 against 0.00086 for the act reference, top-1 98.3% against 99.0% |
+| `real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs` | teacher-forced top-1 1,217 / 1,280 (95.1%), KL mean / median / p99 0.0096 / 0.0029 / 0.080, greedy 504 / 1,280 |
+
+These run single sequences and prefill chunks over 16 tokens, so they check that #375 left the
+other paths alone; the batched kernel itself is covered by the batch greedy tests and
+`tests/fp8_batch.rs`.
+
 ## Commands
 
 ```
