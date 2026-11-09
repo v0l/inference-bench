@@ -118,6 +118,52 @@ pressure. No env knobs.
 bit, as prefill A in a second slot, snapshot, restore into a third slot whose block table shares A's
 blocks, then prefill B there. Greedy decode afterwards matches too.
 
+## Scheduler integration
+
+`sched::Scheduler` owns the `PrefixCache` when `[runtime.prefix_cache] enabled = true` and the
+executor allows it (`Executor::supports_prefix_cache`, false while MTP speculation is on).
+
+- `submit` computes the namespace root from the request salt.
+- `admit` hashes the prompt, calls `lookup` (never the last prompt token), evicts unreferenced
+  cached blocks until the remainder fits, restores the hit's snapshot into the new slot and starts
+  prefill at the hit length. `Finished` carries `cached_tokens`.
+- Hybrid prefill is cut at `snapshot_points`, and `cache_progress` registers the blocks and takes a
+  snapshot at each. A non-hybrid model registers its blocks after every chunk.
+- On finish, every full block (prompt and generated tokens) is registered. A hybrid model also
+  takes a snapshot there if the end is block aligned, otherwise its next hit reaches the last
+  snapshot point of the prefill. So a chat turn hits the previous prompt to its last full block.
+- Block allocation (`alloc_block`) evicts LRU cached blocks before preempting anyone.
+
+## Server
+
+- `usage.prompt_tokens_details.cached_tokens` is in every response and in the streamed usage chunk.
+- `/metrics`: `inference_prefix_cache_queries_total` (prompt tokens looked up),
+  `inference_prefix_cache_hit_tokens_total`, `inference_prefix_cache_hit_rate` (gauge), and gauges
+  for cached blocks, snapshots and snapshot host bytes.
+- `[runtime.prefix_cache]` in the server config maps onto the spec table, validated at load.
+- `cache_salt` in the request body narrows the namespace. With API keys configured the key is
+  hashed into the namespace too, so keys never share cache entries unless the operator sets
+  `prefix_cache_share_across_keys = true`. Without keys the body salt alone is used.
+
+### Timing side channel
+
+A hit makes the first token faster, so a client that can send prompts can tell whether another
+client recently sent the same prefix: send a guess, compare TTFT with a cold prompt. This is the
+same side channel as any shared prefix cache (vLLM documents it for `cache_salt`). Mitigations here:
+per key isolation by default when keys exist, `cache_salt` for finer tenancy, and no sharing
+across models or specs because the namespace includes them. An operator who needs no leakage at all
+turns the cache off. Hits are only visible to the caller that earned them: `cached_tokens` is in the
+response for that request only and the metrics are aggregates.
+
+## Chat templates
+
+The key is computed on the final templated token ids, after the template has dropped the reasoning
+of earlier turns. `tests/prefix.rs::the_cache_key_follows_the_final_templated_ids_across_thinking_turns`
+renders a Qwen thinking transcript for two turns. With `preserve_thinking` the turn 1 prompt is a
+prefix of turn 2. With it off (the template drops the old reasoning) the chain forks at the first
+changed block, so the cache only shares the part that really is equal. Equal ids from different
+request shapes (string or content parts) share keys, and thinking on and off never share a tail.
+
 ## Slice 1 status and what is left
 
 Done in slice 1: refcounted blocks, hash chain, LRU cache, snapshot store, snapshot and restore on
