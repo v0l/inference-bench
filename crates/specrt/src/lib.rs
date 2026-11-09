@@ -3,6 +3,7 @@ pub mod structure;
 pub mod chat;
 pub mod codegen;
 pub mod engine;
+pub mod gguf;
 pub mod jit;
 pub mod mtp;
 pub mod nvfp4;
