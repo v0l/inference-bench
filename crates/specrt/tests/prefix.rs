@@ -344,3 +344,72 @@ fn a_restored_snapshot_is_independent_of_the_slot_it_came_from() {
     rt.restore_state(1, &snap).unwrap();
     assert_eq!(rt.snapshot_state(1).unwrap(), snap);
 }
+
+fn thinking_template() -> specrt::chat::ChatTemplate {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).unwrap();
+    specrt::chat::ChatTemplate::from_files(&read("qwen3.8-27b.tokenizer_config.json"), Some(&read("qwen3.8-27b.chat_template.jinja")))
+        .unwrap()
+        .unwrap()
+}
+
+fn qwen_tokenizer() -> Option<tokenizers::Tokenizer> {
+    ["Qwen/Qwen3-0.6B", "orcarouter/Qwen3.8-27B-Uncensored-NVFP4"]
+        .iter()
+        .find_map(|repo| specrt::weights::find_in_snapshot(repo, "tokenizer.json").ok())
+        .and_then(|p| tokenizers::Tokenizer::from_file(p).ok())
+}
+
+fn ids(t: &specrt::chat::ChatTemplate, tok: &tokenizers::Tokenizer, messages: &[serde_json::Value], vars: &serde_json::Value) -> Vec<u32> {
+    let text = t.render_with(messages, vars).unwrap();
+    tok.encode(text.as_str(), false).unwrap().get_ids().to_vec()
+}
+
+fn common_prefix(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+fn shared_blocks(r: &specrt::prefix::Hash, a: &[u32], b: &[u32]) -> usize {
+    block_hashes(r, a).iter().zip(block_hashes(r, b)).take_while(|(x, y)| *x == y).count()
+}
+
+#[test]
+fn the_cache_key_follows_the_final_templated_ids_across_thinking_turns() {
+    use serde_json::json;
+    let Some(tok) = qwen_tokenizer() else { return };
+    let t = thinking_template();
+    let r = root("");
+    let system = json!({"role": "system", "content": "You are a coding agent. Use the tools to answer. ".repeat(6)});
+    let user1 = json!({"role": "user", "content": "List the files in src and explain what each one does in detail please."});
+    let user2 = json!({"role": "user", "content": "Now read main.rs and summarise it."});
+    let reasoning = "The user wants a listing, so I should call the tool and then describe each file carefully.";
+    let answer = "src has main.rs and lib.rs. main.rs is the entry point and lib.rs holds the library code.";
+    let assistant = json!({"role": "assistant", "content": answer, "reasoning_content": reasoning});
+
+    for vars in [json!({"enable_thinking": true}), json!({"enable_thinking": true, "preserve_thinking": true})] {
+        let turn1 = ids(&t, &tok, &[system.clone(), user1.clone()], &vars);
+        let turn2 = ids(&t, &tok, &[system.clone(), user1.clone(), assistant.clone(), user2.clone()], &vars);
+        let divergence = common_prefix(&turn1, &turn2);
+        assert!(divergence >= turn1.len() - 1, "the generation prompt of turn 1 is a prefix of turn 2 when the reasoning is kept");
+        assert_eq!(shared_blocks(&r, &turn1, &turn2), turn1.len().min(divergence) / PAGE);
+    }
+
+    let vars = json!({"enable_thinking": true, "preserve_thinking": false});
+    let turn1 = ids(&t, &tok, &[system.clone(), user1.clone()], &vars);
+    let turn2 = ids(&t, &tok, &[system.clone(), user1.clone(), assistant.clone(), user2.clone()], &vars);
+    let divergence = common_prefix(&turn1, &turn2);
+    assert!(divergence < turn1.len(), "stripping the reasoning changes the tail of the turn 1 prompt");
+    assert_eq!(shared_blocks(&r, &turn1, &turn2), divergence / PAGE, "the chain forks at the first changed token block");
+
+    let as_text = ids(&t, &tok, &[system.clone(), user1.clone()], &vars);
+    let as_parts = ids(
+        &t,
+        &tok,
+        &[system.clone(), json!({"role": "user", "content": [{"type": "text", "text": user1["content"].as_str().unwrap()}]})],
+        &vars,
+    );
+    assert_eq!(block_hashes(&r, &as_text), block_hashes(&r, &as_parts), "equal templated ids give equal keys whatever the request shape");
+
+    let off = ids(&t, &tok, &[system, user1], &json!({"enable_thinking": false}));
+    assert_ne!(block_hashes(&r, &off).last(), block_hashes(&r, &as_text).last(), "thinking on and off are different prompts and never share a tail");
+}

@@ -316,3 +316,49 @@ fn serving_kv_is_one_f16_copy_per_token() {
     assert_eq!((layout.kv_planes, layout.kv_blocks), (1, (7 << 30) / (68 * 1024 * 16)));
     assert_eq!(Layout::serving(&real, 131072, 32, None).kv_blocks, 0, "0 sizes the pool from free memory");
 }
+
+fn prefix_cached_scheduler_matches_single(dir: &str) {
+    use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
+    use specrt::spec::PrefixCacheOptions;
+    let s = spec_for(dir);
+    let shared: Vec<u32> = (0..160u32).map(|i| (i * 29 + 7) % 1024).collect();
+    let prompts: Vec<Vec<u32>> = (0..24u32)
+        .map(|q| [shared.clone(), (0..(5 + q * 11 % 90)).map(|i| (i * 13 + q * 97 + 1) % 1024).collect::<Vec<u32>>()].concat())
+        .collect();
+    let mut single = Runtime::load(&s, 512).unwrap();
+    let want: Vec<Vec<u32>> = prompts.iter().map(|p| single.generate(p, 20, Sampling::GREEDY).unwrap().tokens).collect();
+    drop(single);
+    let layout = Layout { max_ctx: 512, slots: 6, kv_blocks: 90, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
+    let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
+    let prefix_cache = PrefixCacheOptions { enabled: true, snapshot_interval: 64, max_snapshots: 4, max_blocks: 0 };
+    let cfg = Config { max_num_seqs: 6, max_batched_tokens: 300, reserve_blocks: Some(1), prefix_cache, ..Config::default() };
+    let mut sched = Scheduler::new(exec, cfg);
+    let ids: Vec<u64> = prompts
+        .iter()
+        .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: 20, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() }).unwrap())
+        .collect();
+    let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+    let mut cached = 0;
+    while !sched.idle() {
+        let mut events = Vec::new();
+        sched.step(&mut events).unwrap();
+        for e in events {
+            match e {
+                Event::Token { id, token } => got.entry(id).or_default().push(token),
+                Event::Finished { cached_tokens, .. } => cached += cached_tokens,
+                _ => {}
+            }
+        }
+    }
+    assert!(cached > 0 && sched.prefix_stats().hits > 0, "the shared prefix was never hit");
+    assert_eq!(sched.blocks_used(), sched.prefix_stats().blocks);
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(got[id], want[i], "sequence {i}");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn tiny_prefix_cached_scheduling_matches_single_sequence_greedy() {
+    prefix_cached_scheduler_matches_single("tiny-qwen3.5");
+}
