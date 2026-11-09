@@ -240,12 +240,25 @@ logits relative error 2e-6 to 3e-6, KL 1e-7. Teacher-forced on vLLM's greedy tok
 (`real_27b_mtp_acceptance_on_vllms_own_greedy_tokens`), specrt's drafts reach mean length 2.34,
 position 0 0.760 and position 1 0.576, and the CPU oracle predicts the token after next on the
 generated part at 0.773. So specrt computes the MTP as `qwen3_5_mtp.py` describes it to float
-accuracy; the 16-point gap to vLLM's position 0 is shared by specrt and the oracle and is not yet
-explained. Variations tried on the oracle, none of which close it: swapping the `fc` input halves
-(0.5%), the residual instead of the normed hidden (0.746), positions shifted by one (0.773), no unit
-offset on `mtp.norm` (0.767). Candidates left: vLLM's target hidden comes from its own NVFP4 kernels
-with activation quantisation, and its draft attention runs with a KV cache over the whole sequence
-including positions computed in earlier steps. Tracked in #387.
+accuracy. The 16-point gap to the served vLLM was a measurement artifact: `local-llm.service` is
+97 to 100 percent busy with real traffic (acceptance 0.93 and 0.85 over its uptime), so counter deltas
+around two runs include other requests' drafts. An isolated vLLM 0.27.1 instance
+(`scripts/vllm_mtp_dump.py`, offline `LLM`, same checkpoint, fp8 KV, k = 2, one request at a time,
+the 20 prompts as token ids, 128 greedy tokens) accepts 1,494 of 2,138 drafts over 1,069 steps with
+CUDA graphs and torch.compile (1,496 of 2,128 over 1,064 steps in eager mode): mean acceptance
+length 2.40, position 0 0.805 (861 of 1,069), position 1 0.592. specrt `bench --speculative` on the
+same prompts: 2.43. Its greedy tokens equal vLLM's on 1 of 20 prompts only because of the
+target's different kernels, so the drafts are compared on vLLM's own tokens.
+
+The forward hook in that script records the drafter's `input_ids`, `positions`, target
+`hidden_states` and argmax at every call. The call pattern matches the algorithm above (first pass
+over the prompt shifted by one, then `a + 1` rows per step, then a one-row chain with the MTP's own
+output). `scripts/mtp_diff.py` runs the f32 torch oracle on vLLM's recorded inputs: the oracle's
+outputs differ from vLLM's by 3.5% on the prompt pass (bf16 and NVFP4 kernel noise, argmax equal
+on 72 of 76 rows). Counting vLLM's own first drafts against its own tokens, position 0 is 0.796
+(1,034 steps); specrt teacher-forced on the same tokens is 0.760, 3.6 points lower, and the
+bench's mean length is 2.43 against 2.40. No wiring difference was found, so nothing in the MTP
+path needs changing.
 
 Crossover: speculation still wins at batch 4 (12 verify rows) and loses at batch 8 (24 rows). Past
 16 rows the verify GEMMs leave the batched fp4/fp8 GEMV path for the `_tiny` mma tile, which reads
