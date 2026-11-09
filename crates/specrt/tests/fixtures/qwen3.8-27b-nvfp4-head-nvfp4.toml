@@ -1,5 +1,5 @@
 name = "qwen3.8-27b-nvfp4-head-nvfp4"
-min_engine = 6
+min_engine = 7
 repo = "orcarouter/Qwen3.8-27B-Uncensored-NVFP4"
 quant = "fp8_channel"
 head_quant = "nvfp4_g16"
@@ -45,3 +45,8 @@ value_heads = 48
 key_head_dim = 128
 value_head_dim = 128
 conv_kernel = 4
+
+[mtp]
+layers = 1
+draft_tokens = 2
+speculate = true

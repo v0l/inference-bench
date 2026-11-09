@@ -201,7 +201,7 @@ fn qwen38_27b_config_parses_into_a_hybrid_spec_and_round_trips() {
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;
     assert_eq!(file, spec);
-    assert_eq!(file.min_engine, 6);
+    assert_eq!(file.min_engine, 7);
     assert_eq!(file.mtp, Some(specrt::spec::Mtp::new(1)));
     assert_eq!(file.kv_layers(), 17);
 }
@@ -221,7 +221,7 @@ fn compressed_tensors_nvfp4_checkpoint_derives_fp8_channel_with_nvfp4_mlps_until
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;
     assert_eq!(file, spec);
-    assert_eq!(file.min_engine, 6);
+    assert_eq!(file.min_engine, 7);
     assert_eq!(file.mtp, Some(specrt::spec::Mtp::new(1)));
 }
 

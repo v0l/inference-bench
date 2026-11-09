@@ -1,5 +1,5 @@
 name = "qwen3.8-27b-act"
-min_engine = 6
+min_engine = 7
 repo = "Qwen/Qwen3.8-27B-FP8"
 quant = "fp8_block128"
 act_quant = "fp8"
