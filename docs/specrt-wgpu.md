@@ -18,11 +18,14 @@ backend = "auto"   # "cuda" | "wgpu" | "auto"
 | Plan (ops, buffers, weights) | `plan.rs` | yes |
 | Backend trait (`alloc`, `upload`, `download`, `compile`, `dispatch`, `flush`) | `backends/mod.rs` | yes |
 | WGSL generation from the spec | `wgsl.rs`, `templates/wgsl/*.wgsl` | yes (plain strings) |
-| Dense executor walking the plan | `backends/dense.rs` | yes, generic over `Backend` |
+| Plan executor (`run_plan`, trait `PlanBackend`) | `executor.rs` | yes |
+| Dense plan runner on `Backend` | `backends/dense.rs` | yes, generic over `Backend` |
 | wgpu device, pipelines, buffers | `backends/wgpu.rs` | feature `wgpu` |
 | CUDA runtime | `runtime.rs`, `jit.rs` | CUDA only |
 
-The CUDA runtime is not yet behind the `Backend` trait. It is 1,900 lines of cudarc launches, graphs, batching, MTP and delta-net, and #462 is rewriting its GEMM templates. Moving it behind the trait changes nothing a wgpu user sees, so it is the follow-up issue "Move runtime.rs behind Backend" and must be gated by the logits, greedy and real27b tests (27B NVFP4 within 2%). Until then CUDA behaviour and speed are untouched.
+Both backends run the same `Plan` (`plan::Plan::build`) through `executor::run_plan`: `Runtime` (CUDA, `runtime/exec.rs`) and the wgpu `Dense` runner each implement `PlanBackend::run_op`. The wgpu side maps each `Op` to WGSL kernels in `wgsl::kernels_for`; there is no hand-written layer loop. CUDA launches stay in `runtime/`, behaviour and speed unchanged (27B NVFP4 prefill 1,024 1,514 vs 1,544 tok/s, 4,096 1,507 vs 1,532, decode batch 1 56.5 vs 57.5, batch 8 333 vs 338 tok/s aggregate, base against this branch, within 2%; real27b 10/10; the non-27B suite passes with `SPECRT_REF_DIR=/tmp/ref387`).
+
+What is not moved: the CUDA buffers, graphs, batching, MTP and delta-net still use cudarc directly rather than the byte-level `Backend` trait. The `wgpu` kernel choice also does not go through `kernel_for` yet, because `kernel_for` picks CUDA GEMM tiles and tensor-core paths; the wgpu plan is `Plan::build(spec, phase, false)` and its two linear kernels are chosen by token count.
 
 ## Weights and the decoder interface
 
@@ -48,7 +51,7 @@ Each is its own issue. A spec that needs one fails the wgpu check with `<feature
 - CUDA-graph equivalents beyond reusing one command buffer per step.
 - Prefix cache snapshots and the batched scheduler (`sched.rs`, `serve.rs`): wgpu runs through `Engine`, one sequence.
 - Subgroup-accelerated reductions and a tiled GEMM.
-- Moving the CUDA runtime behind the `Backend` trait (#483 follow-up).
+- Moving the CUDA buffers and launches under the byte-level `Backend` trait.
 
 ## Tests
 
@@ -72,7 +75,7 @@ Speed, Qwen3-0.6B bf16, release build, no tuning (row-per-workgroup GEMV, scalar
 
 | Adapter | Prefill 1,024 tokens | Decode batch 1 |
 |---|---|---|
-| RTX PRO 6000 Blackwell (Vulkan) | 1.45 s (705 tok/s) | 19.8 tok/s |
+| RTX PRO 6000 Blackwell (Vulkan) | 0.65 s (1,582 tok/s) | 41.3 tok/s |
 | Apple M1 Pro (Metal) | 14.9 s (69 tok/s) | 18.8 tok/s |
 
 Decode is dominated by dispatch count and the scalar kernels, not bandwidth. Speed work (subgroups, tiled GEMM, fused ops, command buffer reuse) is the follow-up. Metal lost the device when eight decode steps were recorded into one command buffer, so decode submits four steps at a time (`DECODE_STEPS_PER_SUBMIT`).
