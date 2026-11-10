@@ -200,3 +200,25 @@ in the media path, so the gap on inputs with unusual or repetitive hidden states
 vision. Images keep the text gate (mean KL 0.05, top-1 90%); videos are gated at KL 0.09 and top-1 85%,
 a bound set from this measurement and not the text bound. #496 stays open for a run against a vLLM
 with an unquantised KV cache, which needs the user to start one.
+
+## Running the tests
+
+Non-27B suite (the 27B tests are all named `real_27b_*`, including every test in `tests/vision_lm.rs`):
+
+```
+SPECRT_REF_DIR=/tmp/ref387 cargo test --release --workspace -- --include-ignored --skip real_27b
+```
+
+The 27B vision tests need a GPU with about 36 GB free, one at a time under `flock /tmp/gpu27.lock`,
+the vLLM server on port 8001 and its reference output:
+
+```
+~/.venv-vllm/bin/python crates/specrt/scripts/vllm_vision.py /tmp/vis484
+SPECRT_VISION_REF_DIR=/tmp/vis484 flock /tmp/gpu27.lock cargo test --release -p inference-bench-specrt \
+  --test vision_lm --test vision_encoder -- --include-ignored --nocapture --test-threads=1 \
+  --skip control --skip bisect --skip positions_equal --skip noise --skip prompt_position
+```
+
+Without `SPECRT_VISION_REF_DIR` the `vision_lm` tests print `skipped` and pass. The fixtures behind
+`vision.rs` come from `scripts/vision_reference.py` and `scripts/vision_encoder_reference.py`
+(`~/.venv-vllm/bin/python`, CPU only).
