@@ -208,6 +208,10 @@ impl Assets {
     }
 }
 
+fn ensure_media(ok: bool) -> Result<()> {
+    if ok { Ok(()) } else { bail!("the model does not accept image or video input: its config has no vision_config") }
+}
+
 pub fn strip_media_urls(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
@@ -294,6 +298,30 @@ impl Device {
         }
     }
 
+    fn has_vision(&self) -> bool {
+        match self {
+            Device::Cuda(r) => r.has_vision(),
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(_) => false,
+        }
+    }
+
+    fn set_media(&mut self, plan: Option<&crate::vision::MediaPlan>) -> Result<()> {
+        match self {
+            Device::Cuda(r) => r.set_media(0, plan),
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(_) => bail!("the wgpu backend has no vision encoder"),
+        }
+    }
+
+    fn plan_media(&mut self, prompt: &[u32], media: &[crate::sched::MediaInput]) -> Result<std::sync::Arc<crate::vision::MediaPlan>> {
+        match self {
+            Device::Cuda(r) => r.plan_media(prompt, media),
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(_) => bail!("the wgpu backend has no vision encoder"),
+        }
+    }
+
     fn prompt_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         match self {
             Device::Cuda(r) => r.prompt_logits(tokens),
@@ -310,6 +338,7 @@ pub struct Engine {
     runtime: Device,
     max_ctx: usize,
     stop: Vec<u32>,
+    media: Option<crate::vision::MediaAssets>,
 }
 
 impl Engine {
@@ -318,14 +347,14 @@ impl Engine {
     }
 
     pub fn load_with(model: &str, max_ctx: Option<usize>, runtime: Option<&crate::spec::RuntimeOptions>) -> Result<Self> {
-        let Assets { mut spec, tokenizer, chat, stop, .. } = Assets::load(model)?;
+        let Assets { mut spec, tokenizer, chat, stop, media, .. } = Assets::load(model)?;
         if let Some(r) = runtime {
             spec.runtime = r.clone();
         }
         let max_ctx = max_ctx.unwrap_or(DEFAULT_CTX).min(MAX_CTX);
         tracing::info!(model, spec = %spec.name, max_ctx, "loading model");
         let runtime = Device::load(&spec, max_ctx)?;
-        Ok(Self { spec, tokenizer, chat, runtime, max_ctx, stop })
+        Ok(Self { spec, tokenizer, chat, runtime, max_ctx, stop, media })
     }
 
     pub fn spec(&self) -> &Spec {
@@ -420,6 +449,35 @@ impl Engine {
             decode_secs: g.decode_secs,
             peak_device_bytes: g.peak_device_bytes,
         })
+    }
+
+    pub fn accepts_media(&self) -> bool {
+        self.media.is_some() && self.runtime.has_vision()
+    }
+
+    pub fn chat_media(
+        &mut self,
+        messages: &[Value],
+        template: Option<&Value>,
+        items: &[crate::vision::MediaItem],
+        budget: crate::vision::MediaBudget,
+        max_tokens: usize,
+        sampling: Sampling,
+        on_text: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<(Reply, usize)> {
+        ensure_media(self.accepts_media())?;
+        let media = self.media.as_ref().context("the model has no vision_config")?;
+        let processed = media.process(items, budget)?;
+        let text = render_prompt(self.chat.as_ref(), &strip_media_urls(messages), template)?;
+        let ids = self.tokens(&media.expand(&text, &processed)?)?;
+        let vision_tokens = ids.iter().filter(|&&t| t == media.ids.image || t == media.ids.video).count();
+        let inputs: Vec<crate::sched::MediaInput> =
+            processed.into_iter().zip(items).map(|(processed, item)| crate::sched::MediaInput { processed, hash: item.hash }).collect();
+        let plan = self.runtime.plan_media(&ids, &inputs)?;
+        self.runtime.set_media(Some(&plan))?;
+        let reply = self.run(ids, max_tokens, sampling, true, on_text);
+        self.runtime.set_media(None)?;
+        Ok((reply?, vision_tokens))
     }
 
     pub fn logits(&mut self, prompt: &str) -> Result<PromptLogits> {

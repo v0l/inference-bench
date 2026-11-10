@@ -705,11 +705,15 @@ fn now() -> i64 {
 }
 
 fn usage(g: &Generation) -> Value {
+    let mut details = json!({"cached_tokens": g.cached_tokens});
+    if g.vision_tokens > 0 {
+        details["vision_tokens"] = json!(g.vision_tokens);
+    }
     json!({
         "prompt_tokens": g.prompt_tokens,
         "completion_tokens": g.completion_tokens,
         "total_tokens": g.prompt_tokens + g.completion_tokens,
-        "prompt_tokens_details": {"cached_tokens": g.cached_tokens, "vision_tokens": g.vision_tokens},
+        "prompt_tokens_details": details,
     })
 }
 

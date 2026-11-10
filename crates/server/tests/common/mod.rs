@@ -96,7 +96,7 @@ impl Fake {
             text,
             prompt_tokens: prompt.split_whitespace().count() as u64,
             cached_tokens: 0,
-            vision_tokens: 0,
+            vision_tokens: request.map_or(0, |r| 100 * r.media.len() as u64),
             completion_tokens,
             ttft_secs: ttft,
             prefill_secs: ttft,

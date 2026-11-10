@@ -23,6 +23,23 @@ pub trait Model {
     ) -> anyhow::Result<Reply>;
 
     fn logits(&mut self, prompt: &str) -> anyhow::Result<PromptLogits>;
+
+    fn accepts_media(&self) -> bool {
+        false
+    }
+
+    fn chat_media(
+        &mut self,
+        _messages: &[Value],
+        _template: Option<&Value>,
+        _items: &[specrt::vision::MediaItem],
+        _budget: specrt::vision::MediaBudget,
+        _max_tokens: usize,
+        _sampling: Sampling,
+        _on_text: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<(Reply, usize)> {
+        anyhow::bail!("the model does not accept image or video input")
+    }
 }
 
 impl Model for specrt::Engine {
@@ -43,6 +60,23 @@ impl Model for specrt::Engine {
 
     fn logits(&mut self, prompt: &str) -> anyhow::Result<PromptLogits> {
         specrt::Engine::logits(self, prompt)
+    }
+
+    fn accepts_media(&self) -> bool {
+        specrt::Engine::accepts_media(self)
+    }
+
+    fn chat_media(
+        &mut self,
+        messages: &[Value],
+        template: Option<&Value>,
+        items: &[specrt::vision::MediaItem],
+        budget: specrt::vision::MediaBudget,
+        max_tokens: usize,
+        sampling: Sampling,
+        on_text: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<(Reply, usize)> {
+        specrt::Engine::chat_media(self, messages, template, items, budget, max_tokens, sampling, on_text)
     }
 }
 
@@ -77,6 +111,7 @@ pub struct Native {
     max_ctx: Option<usize>,
     factory: Factory,
     worker: Option<Worker>,
+    vision: bool,
 }
 
 impl Native {
@@ -89,7 +124,7 @@ impl Native {
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {
-        Self { max_ctx, factory, worker: None }
+        Self { max_ctx, factory, worker: None, vision: false }
     }
 
     fn send(&mut self, job: Job) -> Result<(), BackendError> {
@@ -167,7 +202,7 @@ fn run_engine(
     model: String,
     max_ctx: Option<usize>,
     factory: Factory,
-    loaded: Sender<Result<(), BackendError>>,
+    loaded: Sender<Result<bool, BackendError>>,
     jobs: std::sync::mpsc::Receiver<Job>,
     panic: Arc<Mutex<Option<String>>>,
 ) {
@@ -184,7 +219,7 @@ fn run_engine(
             return;
         }
     };
-    let _ = loaded.send(Ok(()));
+    let _ = loaded.send(Ok(engine.accepts_media()));
     while let Ok(job) = jobs.recv() {
         if let Err(p) = catch_unwind(AssertUnwindSafe(|| job(engine.as_mut()))) {
             let why = panic_text(p.as_ref());
@@ -207,7 +242,7 @@ impl Target for Native {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: true, memory: true, vision: false }
+        Capabilities { streaming: true, logits: true, memory: true, vision: self.vision }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
@@ -224,8 +259,9 @@ impl Target for Native {
         let worker = Worker { jobs: Some(jobs), thread: Some(thread), panic };
         let outcome = loaded_rx.recv().unwrap_or_else(|_| Err(BackendError::failed("the native engine stopped while loading")));
         match outcome {
-            Ok(()) => {
+            Ok(vision) => {
                 self.worker = Some(worker);
+                self.vision = vision;
                 Ok(())
             }
             Err(e) => {
@@ -246,6 +282,8 @@ impl Target for Native {
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let messages = request.messages_json();
+        let media = request.media.clone();
+        let budget = specrt::vision::MediaBudget { max_pixels: request.media_max_pixels, max_video_secs: request.media_max_video_secs };
         let (template, s, cancel) = (request.template().cloned(), request.sampling, request.cancel.clone());
         let (tx, rx) = channel();
         let job: Job = Box::new(move |m: &mut dyn Model| {
@@ -255,8 +293,13 @@ impl Target for Native {
                 let _ = text.send(Streamed::Text(t.to_string()));
                 !cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             };
-            let out = m.chat(&list, template.as_ref(), s.max_tokens, sampling(s.temperature, s.seed), &mut send);
-            let _ = tx.send(Streamed::Done(out.map(generation).map_err(|e| engine_error(&e))));
+            let out = if media.is_empty() {
+                m.chat(&list, template.as_ref(), s.max_tokens, sampling(s.temperature, s.seed), &mut send).map(generation)
+            } else {
+                m.chat_media(&list, template.as_ref(), &media, budget, s.max_tokens, sampling(s.temperature, s.seed), &mut send)
+                    .map(|(reply, vision_tokens)| Generation { vision_tokens: vision_tokens as u64, ..generation(reply) })
+            };
+            let _ = tx.send(Streamed::Done(out.map_err(|e| engine_error(&e))));
         });
         self.send(job)?;
         loop {

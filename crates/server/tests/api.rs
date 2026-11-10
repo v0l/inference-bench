@@ -492,3 +492,16 @@ fn url_fetching_is_off_by_default_and_the_limits_come_from_config() {
     assert!(body.contains("at most 0 images"), "{body}");
     rig.stop();
 }
+
+#[test]
+fn usage_counts_the_vision_tokens_of_media_and_text_requests_stay_unchanged() {
+    let rig = start(config("[[models]]\nid='m'"), Shape { vision: true, ..Shape::default() });
+    let (status, body, _) = rig.post("/v1/chat/completions", None, image_chat(PIXEL));
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["usage"]["prompt_tokens_details"]["vision_tokens"], 100);
+    let (_, body, _) = rig.post("/v1/chat/completions", None, chat("m", false));
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert!(v["usage"]["prompt_tokens_details"].get("vision_tokens").is_none());
+    rig.stop();
+}
