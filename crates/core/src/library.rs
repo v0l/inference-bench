@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const BACKENDS: [&str; 3] = ["specrt", "llama.cpp", "vllm"];
+pub const BACKENDS: [&str; 4] = ["specrt", "specrt (wgpu)", "llama.cpp", "vllm"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -168,8 +168,11 @@ fn support_for_safetensors(config: &Value, arch: &str) -> Vec<Support> {
         (true, true) => Support::yes("vllm", "architecture is registered"),
         (true, false) => Support::no("vllm", format!("Model architectures ['{arch}'] are not supported")),
     };
+    let specrt = if text { specrt_support(config) } else { Support::no("specrt", none()) };
+    let wgpu = Support { backend: "specrt (wgpu)", ..specrt.clone() };
     vec![
-        if text { specrt_support(config) } else { Support::no("specrt", none()) },
+        specrt,
+        wgpu,
         Support::no("llama.cpp", "needs a GGUF conversion"),
         vllm,
     ]
@@ -185,6 +188,7 @@ fn support_for_gguf(arch: &str, files: &[PathBuf]) -> Vec<Support> {
     let known = LLAMA_CPP_ARCHS.contains(&arch);
     vec![
         specrt_gguf_support(files),
+        specrt_wgpu_gguf_support(files),
         if known {
             Support::yes("llama.cpp", "architecture is registered")
         } else {
@@ -206,6 +210,17 @@ fn specrt_gguf_support(files: &[PathBuf]) -> Support {
             Support { backend: "specrt", supported: true, reason: format!("GGUF {}", names.join(" + ")) }
         }
         Err(e) => Support::no("specrt", e.root_cause().to_string()),
+    }
+}
+
+fn specrt_wgpu_gguf_support(files: &[PathBuf]) -> Support {
+    let [file] = files else { return Support::no("specrt (wgpu)", "split GGUF files are not read by specrt") };
+    match specrt::gguf::Gguf::open(file).and_then(|g| g.spec()) {
+        Ok(spec) => match specrt::wgsl::unsupported(&spec) {
+            None => Support { backend: "specrt (wgpu)", supported: true, reason: "dense decoder on Vulkan, Metal or DX12".into() },
+            Some(why) => Support::no("specrt (wgpu)", why),
+        },
+        Err(e) => Support::no("specrt (wgpu)", e.root_cause().to_string()),
     }
 }
 
@@ -693,6 +708,7 @@ mod tests {
         let qwen = models.iter().find(|m| m.name == "Qwen3-0.6B").unwrap();
         assert_eq!((qwen.quant.as_str(), qwen.context_length, qwen.size_bytes), ("BF16", Some(40960), 2048));
         assert!(qwen.support_for("specrt").unwrap().supported);
+        assert!(qwen.support_for("specrt (wgpu)").unwrap().supported);
         assert!(qwen.support_for("vllm").unwrap().supported);
         assert!(!qwen.support_for("llama.cpp").unwrap().supported);
         let weird = models.iter().find(|m| m.name == "Weird-7B").unwrap();
