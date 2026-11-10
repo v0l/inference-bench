@@ -544,7 +544,9 @@ template <typename D, int N, int K, bool BIAS, bool RESIDUAL, int ROWS = gemv_ro
 __device__ void linear_w(const void* w, const void* s, const float* bias, const float* x, float* out) {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    for (int row = (blockIdx.x * D::WARPS + warp) * ROWS; row < N; row += gridDim.x * D::WARPS * ROWS) {
+    int row = (blockIdx.x * D::WARPS + warp) * ROWS;
+    do {
+        if (row >= N) return;
         float acc[ROWS];
         D::template rows<K, ROWS>(w, s, row, 1, x, lane, acc);
         if (lane == 0) {
@@ -555,7 +557,8 @@ __device__ void linear_w(const void* w, const void* s, const float* bias, const 
                 out[row + r] = RESIDUAL ? out[row + r] + v : v;
             }
         }
-    }
+        row += gridDim.x * D::WARPS * ROWS;
+    } while (D::STRIDE);
 }
 
 template <typename D, int N, bool BIAS, int ROWS = gemv_rows<D, N>()>
@@ -564,14 +567,17 @@ __device__ void linear_norm(const void* w, const void* s, const float* bias, con
     load_normed<D>(x, nw, xs);
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    for (int row = (blockIdx.x * D::WARPS + warp) * ROWS; row < N; row += gridDim.x * D::WARPS * ROWS) {
+    int row = (blockIdx.x * D::WARPS + warp) * ROWS;
+    do {
+        if (row >= N) return;
         float acc[ROWS];
         D::template rows<HIDDEN, ROWS>(w, s, row, 1, xs, lane, acc);
         if (lane == 0) {
 #pragma unroll
             for (int r = 0; r < ROWS; r++) out[row + r] = BIAS ? acc[r] + bias[row + r] : acc[r];
         }
-    }
+        row += gridDim.x * D::WARPS * ROWS;
+    } while (D::STRIDE);
 }
 
 template <typename D>
@@ -580,11 +586,14 @@ __device__ void gate_up_act_norm(const void* w, const void* s, const float* x, c
     load_normed<D>(x, nw, xs);
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    for (int row = blockIdx.x * D::WARPS + warp; row < INTER; row += gridDim.x * D::WARPS) {
+    int row = blockIdx.x * D::WARPS + warp;
+    do {
+        if (row >= INTER) return;
         float gu[2];
         D::template rows<HIDDEN, 2>(w, s, 2 * row, 1, xs, lane, gu);
         if (lane == 0) out[D::template x_at<INTER>(row)] = activation(gu[0]) * gu[1];
-    }
+        row += gridDim.x * D::WARPS;
+    } while (D::STRIDE);
 }
 
 constexpr int GEMM_BM = 64;
@@ -751,6 +760,7 @@ struct DecBase {
     static constexpr bool LDSM = true;
     static constexpr int WARPS = LINEAR_WARPS;
     static constexpr int PAIR = 1;
+    static constexpr bool STRIDE = false;
     template <int BK> static constexpr int wrow = BK * 2;
     template <int BK> static constexpr int w_chunks = BK / 8;
     template <int K, int ROWS>
@@ -823,6 +833,7 @@ struct DecFp8 : DecBytes<DecFp8, FP8_BLOCK> {
 
 struct DecGgml : DecBase<DecGgml> {
     static constexpr int PAIR = 2;
+    static constexpr bool STRIDE = true;
     template <int K, int BK, int CPR, int WROW>
     static __device__ __forceinline__ void load(unsigned char* ws, const void* w, const void* s, int r, int n, int kt, int ck) {
         float v[8];
