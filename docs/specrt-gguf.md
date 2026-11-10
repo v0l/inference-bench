@@ -30,10 +30,22 @@ specrt loads a llama.cpp GGUF file directly. `model` is the path of the `.gguf` 
 
 For `gguf`, every matrix carries a row table: each row has its own byte offset and type (Q4_K, Q5_K, Q6_K, Q8_0, BF16), so a fused matrix (qkv, gate and up interleaved) can mix types the way Q4_K_M does (`attn_v` and some `ffn_down` are Q6_K). Q6_K blocks are padded from 210 to 224 bytes so every row starts 16-byte aligned.
 
-- Decode: `linear_ggml` and `row_dot<WF_GGML>` read the blocks and dequantise in registers. Q4_K and Q6_K have their own dot products (8 lanes per 256-value superblock); the other types use the shared 8-value dequantiser.
-- Prefill: `kernel_for` picks the `GemmPath::Ggb` path for more than 32 tokens. Each matrix is dequantised to a bf16 scratch (`gg_dequant_bf16`) and the existing bf16 tensor-core GEMM runs on it. Short batches use the MMA GEMM with an in-kernel dequant.
-- The GGUF GEMM grid runs the token tiles fastest, so the CTAs that share a weight tile run together and read it from L2. With the derived `[runtime] big_tile = [256, 128, 4, 2]` this took Qwen2.5-7B Q4_K_M prefill from 7.1k to 9.5k tok/s (llama.cpp 11.0k). Llama-3.2-1B went from 26k to 61k at 1024 tokens when the tile was set; Qwen3-0.6B is unchanged.
+Every linear goes through one GEMM template (`gemm_tc`) and one GEMV template (`linear_w`, `linear_norm`, `gate_up_act_norm`) with a weight decoder as a template parameter. A decoder says how its weights reach shared memory and how they become bf16 MMA fragments (prefill), and how a row block becomes a dot product (decode); the multiply, pipeline and epilogue are shared. Decoders: `DecBf16`, `DecQ8`, `DecFp8`, `DecFp4` and `DecGgml`, chosen per tensor by `kernel_for`. The engine tab shows the decoder of each linear in brackets.
+
+- Decode: `DecGgml::rows` reads Q4_K and Q6_K blocks with 16-byte streaming loads and dequantises in registers (8 lanes per 256-value superblock). When the rows a warp handles share a type it runs them together, so both rows' loads are in flight before any math: gate and up rows always pair, and the single-output GEMVs take two rows per warp. The grid is capped at 2 blocks per SM with a grid-stride loop, so each block normalises the input once and keeps its x in shared memory for many rows. Mixed-type row pairs fall back to the per-row dot. Results are bit identical to the one-row kernel.
+- Prefill: `kernel_for` picks `GemmPath::Ggb` for more than 32 tokens. Each matrix is dequantised to a bf16 scratch (`gg_dequant_bf16`) and `gemm_tc<DecBf16>` runs on it. Short batches use `gemm_tc<DecGgml>` with an in-kernel dequant.
+- The GGUF GEMM grid runs the token tiles fastest, so the CTAs that share a weight tile run together and read it from L2. With the derived `[runtime] big_tile = [256, 128, 4, 2]` this took Qwen2.5-7B Q4_K_M prefill from 7.1k to 9.5k tok/s.
 - The spec derived from a K-quant file sets `[runtime] unsplit` for the four dense linears. The weights are already 4 to 6 bit, so the split-activation GEMM costs time without changing accuracy: unsplit prefill on Qwen2.5-7B Q4_K_M runs at 7.3k tok/s against 4.9k split.
+
+Tried and dropped (#462), on Qwen2.5-7B Q4_K_M at 1,024 tokens:
+
+| Change | prefill | why dropped |
+| --- | ---: | --- |
+| Q4_K tile decoder: raw blocks to shared memory by `cp.async` (48 bytes per row per 64 values), decoded per fragment | 6.1k | the decode runs once per warp per fragment, 4x redundant |
+| the same, decoded once per stage into a bf16 tile, then `ldmatrix` | 9.7k against 10.1k scratch | bit identical, but the extra sync and decode cost more than the scratch pass (`gg_dequant_bf16` is about 4% of prefill) |
+| bk 64, 3 or 4 stages, 128x128 or 128x256 tiles for the scratch GEMM | 9.0k to 9.9k | the 256x128 tile with bk 32 and 2 stages stays best |
+
+The scratch GEMM itself is the limit: `gate_up` at 1,024 x 37,888 x 3,584 takes 1.48 ms (188 TFLOP/s) where torch's bf16 GEMM takes 1.03 ms and its int8 GEMM 0.59 ms on the same card. llama.cpp's MMQ multiplies Q4_K weights with Q8_1 activations on int8 tensor cores, which is how it reaches 11.9k.
 
 The bf16 dequantisation on the GPU is bit exact against ggml's `to_float`, and the native kernels give the same logits as loading the same file dequantised to bf16 (KL 0 on Qwen3-0.6B Q4_K_M).
 
@@ -72,19 +84,21 @@ On BF16 the two engines agree to 5e-5, the same as llama.cpp against transformer
 
 ## Bench
 
-RTX PRO 6000 Blackwell Max-Q, beside the resident vLLM (about 38 GB free). llama.cpp `7bd8282c3` (build 10267), CUDA, `-ngl 99 -fa 1`, 5 runs. specrt `bench <file.gguf> 1024,4096 128` (median of 5; `SPECRT_BENCH_RUNS=5`). Decode is batch 1, 128 tokens after the prompt; llama.cpp decode uses `-d 1024` and `-d 4096` so both engines decode at the same depth.
+RTX PRO 6000 Blackwell Max-Q, beside the resident vLLM (about 38 GB free), master after #462 (`48e2e54`). llama.cpp `7bd8282c3` (build 10267), CUDA, `-ngl 99 -fa 1`, 3 runs per point; llama.cpp decode uses `-d 1024` and `-d 4096` so both engines decode 128 tokens at the same depth. specrt `bench <file.gguf> 1024,4096 128`, median of 3. Both engines ran in the same window, alternating, each step started only below 10% GPU utilisation: `flock /tmp/gpu27.lock crates/specrt/scripts/vsllama.sh <file.gguf> <bench> 2`. The table is the mean of the two rounds.
 
 | Model | Engine | prefill 1024 | prefill 4096 | decode at 1024 | decode at 4096 |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Qwen3-0.6B Q8_0 | llama.cpp | 50,680 | 46,914 | 739 | 612 |
-| | specrt | 74,202 | 54,373 | 821 | 557 |
-| Qwen3-0.6B Q4_K_M | llama.cpp | 48,816 | 46,379 | 779 | 636 |
-| | specrt | 85,818 | 62,311 | 864 | 571 |
-| Llama-3.2-1B-Instruct Q4_K_M | llama.cpp | 54,336 | 49,841 | 865 | 793 |
-| | specrt | 59,098 | 54,389 | 729 | 572 |
-| Qwen2.5-7B-Instruct Q4_K_M | llama.cpp | 11,024 | 10,341 | 222 | 209 |
-| | specrt | 9,500 | 9,600 | 166 | 150 |
+| Qwen3-0.6B Q8_0 | llama.cpp | 55,630 | 51,410 | 782 | 640 |
+| | specrt | 78,560 | 56,960 | 810 | 565 |
+| Qwen3-0.6B Q4_K_M | llama.cpp | 53,110 | 50,140 | 806 | 658 |
+| | specrt | 86,230 | 63,470 | 880 | 603 |
+| Llama-3.2-1B-Instruct Q4_K_M | llama.cpp | 58,750 | 54,710 | 909 | 834 |
+| | specrt | 62,600 | 52,600 | 875 | 674 |
+| Qwen2.5-7B-Instruct Q4_K_M | llama.cpp | 12,130 | 11,240 | 241 | 225 |
+| | specrt | 9,760 | 9,940 | 213 | 187 |
 
-All in tokens per second. specrt is ahead on prefill for the small models and on short-context decode for Qwen3-0.6B. It is behind on the 7B (prefill pays for dequantising each weight to bf16 per chunk, and decode reads the blocks at about 73% of llama.cpp's rate) and on decode at 4096, where its attention is the slower part.
+All in tokens per second. Before #462 the 7B ran at 7,092 prefill and 168 decode (llama.cpp then measured 11,024 and 222 in a busier window).
 
-Still behind on the 7B after #462: prefill 9.5k against 11.0k (the bf16 dequantisation pass is still there; an in-tile dequant GEMM or a Q8_1 MMQ path is the remaining step), decode 166 to 176 against 222, and decode at 4096 context on the small models.
+specrt is ahead on prefill for the small models and on short-context decode for Qwen3-0.6B. On the 7B it reaches 80% of llama.cpp's prefill and 88% of its decode at 1,024 context; the prefill gap is the bf16 GEMM against llama.cpp's int8 MMQ (#499). Decode at 4,096 context trails on every model; there the attention is the slower part.
+
+The GEMV numbers in #462 were measured with paired runs of two builds (`crates/specrt/scripts/ab7b.sh`), checked bit identical with `crates/specrt/scripts/dumpall.sh` (logit hashes of 9 models across bf16, q8, fp8, nvfp4 and GGUF), and the 27B NVFP4 speed gate is `crates/specrt/scripts/gate27b.sh`.
