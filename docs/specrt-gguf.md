@@ -138,3 +138,12 @@ Next lever: the K-quant GEMV reads gate/up at about 75% and down at about 50% of
 Fusing the attention reduce into `attention_split` (last block per KV head reduces its 4 query heads, atomic ticket) was slower, 195 against 216 tok/s at 1,024 and 187 against 202 at 4,096, because one block then serialises four reductions after the split; it is not in the tree. The prompt logits and greedy tokens were unchanged. The qkv GEMV already fuses the RMSNorm (`qkv_proj_norm`), so nothing is left to fuse there.
 
 Remaining per-step gap on the 7B (llama.cpp 239 and 222 tok/s, specrt 216 and 202): about 0.45 ms per step at 1,024 and 0.5 ms at 4,096. The gate/up GEMV at 61.6 us per layer against a 46 us read floor accounts for 0.4 ms of it.
+
+### Tried and dropped (#502)
+
+| Attempt | Result |
+| --- | --- |
+| Gate/up GEMV with 4 rows per warp (two gate/up pairs, 8 16-byte loads in flight), bit identical | 210.6 against 210.5 tok/s at 1,024 and 197.2 against 197.4 at 4,096, 3 alternating pairs: no change, the loads were already in flight |
+| Attention reduce fused into `attention_split` | 195 against 216 tok/s at 1,024 |
+| int8 `dp4a` K-quant dot on quantised activations | 201 against 217 tok/s at 1,024 |
+| GEMV block size 32 to 512, grid cap 1 to 8 blocks per SM | within noise of the shipped 256 threads and 2 blocks per SM |
