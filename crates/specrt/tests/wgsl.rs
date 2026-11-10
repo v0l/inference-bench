@@ -444,15 +444,31 @@ fn gguf_dir() -> std::path::PathBuf {
     dirs::home_dir().unwrap().join(".cache/specrt-gguf")
 }
 
+fn cuda_reference(spec: &Spec, greedy: usize) -> (Vec<f32>, Vec<u32>) {
+    let dir = dirs::home_dir().unwrap().join(".cache/specrt-wgpu-ref");
+    let id = Path::new(&spec.repo).file_name().map_or(spec.name.clone(), |f| f.to_string_lossy().replace('/', "_"));
+    let logits_path = dir.join(format!("{id}.{}.logits.bin", spec.name));
+    let tokens_path = dir.join(format!("{id}.{}.tokens.txt", spec.name));
+    if let (Ok(l), Ok(t)) = (std::fs::read(&logits_path), std::fs::read_to_string(&tokens_path)) {
+        let logits = l.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let tokens: Vec<u32> = t.lines().map(|x| x.parse().unwrap()).collect();
+        if tokens.len() >= greedy {
+            return (logits, tokens);
+        }
+    }
+    let mut rt = specrt::runtime::Runtime::load(spec, 256).expect("a CUDA GPU, or a reference in ~/.cache/specrt-wgpu-ref copied from a CUDA machine");
+    let l = rt.prompt_logits(&PROMPT).unwrap();
+    let g = rt.generate(&PROMPT, 64, specrt::runtime::Sampling::GREEDY).unwrap().tokens;
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&logits_path, l.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+    std::fs::write(&tokens_path, g.iter().map(|t| format!("{t}\n")).collect::<String>()).unwrap();
+    (l, g)
+}
+
 fn compare_with_cuda(spec: &Spec, mean_bound: f64, max_bound: f64, greedy: usize, require_equal: bool) {
     let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let vocab = spec.dims.vocab;
-    let (cuda_logits, cuda_tokens) = {
-        let mut rt = specrt::runtime::Runtime::load(spec, 256).unwrap();
-        let l = rt.prompt_logits(&PROMPT).unwrap();
-        let g = rt.generate(&PROMPT, greedy, specrt::runtime::Sampling::GREEDY).unwrap().tokens;
-        (l, g)
-    };
+    let (cuda_logits, cuda_tokens) = cuda_reference(spec, greedy);
     let be = device();
     let mut dense = specrt::backends::dense::Dense::load(be, spec, 256).unwrap();
     let ours = dense.prompt_logits(&PROMPT).unwrap();
@@ -488,4 +504,22 @@ fn qwen3_q4_k_m_gguf_logits_match_cuda_within_the_kl_bound() {
 fn llama_3_2_1b_q4_k_m_gguf_logits_match_cuda_within_the_kl_bound() {
     let s = Spec::from_gguf_file(&gguf_dir().join("Llama-3.2-1B-Instruct-Q4_K_M.gguf")).unwrap();
     compare_with_cuda(&s, 1e-3, 1e-2, 32, false);
+}
+
+#[test]
+#[ignore = "needs a GPU adapter and Qwen3-0.6B in the HF cache; prints tokens per second"]
+fn qwen3_bf16_speed_on_wgpu() {
+    let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let s = spec();
+    let be = device();
+    let name = specrt::backends::Backend::description(&be);
+    let mut dense = specrt::backends::dense::Dense::load(be, &s, 1200).unwrap();
+    let prompt: Vec<u32> = (0..1024).map(|i| 1000 + (i * 7919) % 50000).collect();
+    let warm = dense.generate(&prompt[..64], 4, specrt::runtime::Sampling::GREEDY).unwrap();
+    let _ = warm;
+    let out = dense.generate(&prompt, 33, specrt::runtime::Sampling::GREEDY).unwrap();
+    let decode = 32.0 / out.decode_secs;
+    let prefill = 1024.0 / out.prefill_secs;
+    eprintln!("SPEED {name}: prefill 1024 tokens {:.2}s ({prefill:.0} tok/s), decode {decode:.1} tok/s", out.prefill_secs);
+    assert!(decode > 0.0 && prefill > 0.0);
 }
