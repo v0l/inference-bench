@@ -48,7 +48,7 @@ Each is its own issue. A spec that needs one fails the wgpu check with `<feature
 - CUDA-graph equivalents beyond reusing one command buffer per step.
 - Prefix cache snapshots and the batched scheduler (`sched.rs`, `serve.rs`): wgpu runs through `Engine`, one sequence.
 - Subgroup-accelerated reductions and a tiled GEMM.
-- Moving the CUDA runtime behind the `Backend` trait.
+- Moving the CUDA runtime behind the `Backend` trait (#483 follow-up).
 
 ## Tests
 
@@ -56,4 +56,23 @@ Each is its own issue. A spec that needs one fails the wgpu check with `<feature
 
 ## Results
 
-Filled in below from the runs on the RTX (Vulkan) and the MacBook (Metal).
+All 18 tests in `tests/wgsl.rs` pass on both machines (`cargo test --release --features wgpu --test wgsl -- --include-ignored --test-threads=1`). Q8_0, Q4_K, Q5_K, Q6_K, bf16 and f16 decode are bit-exact with the CPU dequant.
+
+Logits against the CUDA backend on an 18 token prompt (KL bound: mean 1e-4 and max 1e-3 for bf16, mean 1e-3 and max 1e-2 for GGUF; top-1 must match on every position):
+
+| Model | Mean KL | Max KL | Greedy |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 1.1e-10 | 4.4e-10 | 64/64 equal |
+| Qwen3-0.6B Q4_K_M | 7.3e-5 | 2.5e-4 | 32/32 equal |
+| Llama-3.2-1B Q4_K_M | 1.1e-4 | 4.0e-4 | 32/32 equal |
+
+Identical on Vulkan and Metal to the printed digits for the quantised models.
+
+Speed, Qwen3-0.6B bf16, release build, no tuning (row-per-workgroup GEMV, scalar attention):
+
+| Adapter | Prefill 1,024 tokens | Decode batch 1 |
+|---|---|---|
+| RTX PRO 6000 Blackwell (Vulkan) | 1.45 s (705 tok/s) | 19.8 tok/s |
+| Apple M1 Pro (Metal) | 14.9 s (69 tok/s) | 18.8 tok/s |
+
+Decode is dominated by dispatch count and the scalar kernels, not bandwidth. Speed work (subgroups, tiled GEMM, fused ops, command buffer reuse) is the follow-up. Metal lost the device when eight decode steps were recorded into one command buffer, so decode submits four steps at a time (`DECODE_STEPS_PER_SUBMIT`).

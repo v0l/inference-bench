@@ -74,6 +74,8 @@ impl Wgpu {
             ..Default::default()
         }))
         .with_context(|| format!("wgpu device on {}", info.name))?;
+        device.set_device_lost_callback(|r, m| tracing::warn!("wgpu device lost {r:?}: {m}"));
+        device.on_uncaptured_error(std::sync::Arc::new(|e| tracing::error!("wgpu: {e}")));
         let limits = DeviceLimits {
             max_buffer_bytes: required.max_buffer_size,
             max_binding_bytes: required.max_storage_buffer_binding_size as u64,
@@ -168,7 +170,8 @@ impl Backend for Wgpu {
     }
 
     fn download(&self, buffer: &Buffer, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let padded = len.next_multiple_of(4);
+        let padded = len.next_multiple_of(4).max(16);
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: padded,
@@ -176,8 +179,11 @@ impl Backend for Wgpu {
             mapped_at_creation: false,
         });
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.copy_buffer_to_buffer(&buffer.raw, offset, &staging, 0, padded);
+        encoder.copy_buffer_to_buffer(&buffer.raw, offset, &staging, 0, padded.min(buffer.bytes - offset));
         self.queue.submit([encoder.finish()]);
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            bail!("reading back {padded} bytes on {} failed: {e} (max_buffer_size {})", self.info.name, self.limits.max_buffer_bytes);
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
@@ -289,10 +295,14 @@ impl Backend for Wgpu {
     }
 
     fn submit(&mut self) -> Result<()> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         if let Some(e) = self.encoder.take() {
             self.queue.submit([e.finish()]);
         }
         self.slot = 0;
+        if let Some(e) = pollster::block_on(scope.pop()) {
+            bail!("submitting work on {} failed: {e}", self.info.name);
+        }
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| anyhow!("wgpu poll: {e:?}"))?;
         Ok(())
     }

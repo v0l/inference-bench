@@ -8,7 +8,7 @@ use anyhow::{Context, Result, bail, ensure};
 use std::time::Instant;
 
 const PREFILL_CHUNK: usize = 64;
-const DECODE_STEPS_PER_SUBMIT: usize = 8;
+const DECODE_STEPS_PER_SUBMIT: usize = 4;
 
 pub struct WMat<B: Backend> {
     data: B::Buffer,
