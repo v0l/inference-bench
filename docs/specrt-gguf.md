@@ -102,3 +102,18 @@ All in tokens per second. Before #462 the 7B ran at 7,092 prefill and 168 decode
 specrt is ahead on prefill for the small models and on short-context decode for Qwen3-0.6B. On the 7B it reaches 80% of llama.cpp's prefill and 88% of its decode at 1,024 context; the prefill gap is the bf16 GEMM against llama.cpp's int8 MMQ (#499). Decode at 4,096 context trails on every model; there the attention is the slower part.
 
 The GEMV numbers in #462 were measured with paired runs of two builds (`crates/specrt/scripts/ab7b.sh`), checked bit identical with `crates/specrt/scripts/dumpall.sh` (logit hashes of 9 models across bf16, q8, fp8, nvfp4 and GGUF), and the 27B NVFP4 speed gate is `crates/specrt/scripts/gate27b.sh`.
+
+## Decode profile (#502)
+
+Qwen2.5-7B-Instruct Q4_K_M, one decode step, nsys with `--cuda-graph-trace=node`, median kernel time per call. The GPU was shared with other jobs, so llama.cpp's 4,096 rows are noisy.
+
+| Kernel (per layer unless noted) | specrt 1024 | specrt 4096 | llama.cpp 1024 | llama.cpp 4096 |
+| --- | ---: | ---: | ---: | ---: |
+| gate and up (76 MB, floor 46 us) | 61.6 us | 63.7 us | | |
+| down (38 MB, floor 23 us; llama.cpp `mul_mat_vec_q` K=18944) | 46.6 us | 47.3 us | 54.1 us | 54.7 us |
+| qkv, o (llama.cpp K=3584 and N=512 calls) | 15.9 + 11.1 us | 16.3 + 11.9 us | 14.9 + 4.5 us | 19.1 + 4.6 us |
+| decode attention (split plus reduce) | 11.3 + 5.2 us | 31.2 + 4.6 us | 7.5 + 8.5 us | 16.0 + 19.2 us |
+| lm_head (Q6_K) | 353 us | 363 us | 2,829 us at 152064 rows in one launch, 326 us at 4,096 | |
+| llama.cpp extra launches (`quantize_q8_1`, `rms_norm_f32`, rope, set_rows) | | | about 1.5 ms per step | about 2.5 ms per step |
+
+Decode with the K-quant GEMV launch shape swept (block size 32 to 512, grid cap 1 to 8 blocks per SM, gate/up and down separately): no setting beats the shipped 256 threads and 2 blocks per SM by more than noise, and 64 threads on gate/up loses 12%. The shipped shape stays. A faster GEMV needs a different dot (int8 on Q8_1 activations), which changes the logits and is not done yet.
