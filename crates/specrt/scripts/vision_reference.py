@@ -81,8 +81,10 @@ def video_case(out, name, w, h, seconds, fps, size, existing=False):
     res = proc(videos=[frames], video_metadata=[meta], return_tensors="pt", return_metadata=True)
     md = res["video_metadata"][0] if "video_metadata" in res else meta
     indices = [int(i) for i in (md.frames_indices if md.frames_indices is not None else [])]
+    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
+    stamps = Qwen3VLProcessor._calculate_timestamps(None, list(indices), vfps, 2)
     save(out, name, res["pixel_values_videos"], res["video_grid_thw"][0],
-         {"frames": total, "fps": vfps, "indices": indices})
+         {"frames": total, "fps": vfps, "indices": indices, "timestamps": [f"{t:.1f}" for t in stamps]})
 
 
 def main():
@@ -94,6 +96,9 @@ def main():
     video_case(out, "video_exact", 64, 64, 2, 8, SMALL_SIZE)
     video_case(out, "video_resize", 90, 70, 3, 10, SMALL_SIZE)
     video_case(out, "clip", 320, 240, 3, 8, {"shortest_edge": 4096, "longest_edge": 25165824}, existing=True)
+    video_case(out, "clip2f", 320, 240, 1, 2, {"shortest_edge": 4096, "longest_edge": 25165824}, existing=True)
+    video_case(out, "clip4f", 320, 240, 2, 2, {"shortest_edge": 4096, "longest_edge": 25165824}, existing=True)
+    video_case(out, "clip10", 320, 240, 10, 10, {"shortest_edge": 4096, "longest_edge": 25165824}, existing=True)
 
 
 main()

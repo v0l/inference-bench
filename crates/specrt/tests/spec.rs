@@ -196,7 +196,11 @@ fn qwen38_27b_config_parses_into_a_hybrid_spec_and_round_trips() {
     assert!(spec.attention.output_gate && spec.attention.qk_norm && spec.norm.unit_offset);
     assert_eq!(spec.qkv_rows(), 2 * 6144 + 2 * 1024);
     assert_eq!(Spec::parse(&spec.to_toml().unwrap()).unwrap(), spec);
+    assert_eq!(spec.rope.mrope, Some(specrt::spec::Mrope { section: [11, 11, 10], interleaved: true }));
     let file = Spec::load(&root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
+    assert!(file.rope.mrope.is_none() && file.vision.is_none(), "toml specs are completed from the snapshot config at load, not stored");
+    spec.rope.mrope = None;
+    spec.vision = None;
     spec.name = file.name.clone();
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;
@@ -216,7 +220,10 @@ fn compressed_tensors_nvfp4_checkpoint_derives_fp8_channel_with_nvfp4_mlps_until
     assert_eq!(spec.mlp_quant(56), Quant::Fp8Channel);
     assert_eq!(spec.mlp_quant(63), Quant::Fp8Channel);
     assert_eq!(Spec::parse(&spec.to_toml().unwrap()).unwrap(), spec);
+    assert_eq!(spec.rope.mrope, Some(specrt::spec::Mrope { section: [11, 11, 10], interleaved: true }));
     let file = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    spec.rope.mrope = None;
+    spec.vision = None;
     spec.name = file.name.clone();
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;

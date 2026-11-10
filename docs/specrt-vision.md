@@ -165,3 +165,38 @@ with a naive GEMM), vLLM's includes its encoder cache; the encoder is the target
 speed pass. `prefixbench` (scheduler only, no HTTP): image_1 cold 815 ms, warm 436 ms with 208 of
 211 tokens cached; images_3 2306 ms and 1153 ms; 3 s video 837 ms and 287 ms.
 The frame count differs from vLLM on the 10 s clip (see the follow-up issue).
+
+## Video against vLLM: what was checked (#496, #497)
+
+Frame sampling (#497) is fixed in the sense that it was never different: `sample_indices` equals the
+transformers and vLLM sampler (checked against `vllm.multimodal.video` and `Qwen3VLVideoProcessor`).
+The 880 vs 800 gap was vLLM's `multimodal_tokens.video`, which counts the 10 timestamp text tokens
+and 20 `vision_start`/`vision_end` tokens as video tokens; its prompt has exactly 800 video pad tokens
+in 10 frames of 80, like ours (900 prompt tokens both sides, ids identical). The 10 s, 100 frame clip
+is now a fixture (`clip10`) with reference indices, timestamps, grid and patches from
+`vision_reference.py`, asserted in `tests/vision.rs`.
+
+For the video logit gap every stage before the language model was compared with the reference and
+is identical or within the encoder bound:
+
+| stage | result |
+|---|---|
+| frames decoded by ffmpeg vs opencv (vLLM) | bit equal |
+| frame indices, timestamps, grid, patch tensor vs transformers fed by vLLM's loader | bit equal |
+| prompt ids vs vLLM | equal for every case |
+| M-RoPE positions and delta vs transformers `get_rope_index` and vLLM `_get_mrope_input_positions` | equal, 0 of 284 and 900 positions differ |
+| vision encoder vs transformers fp32 | rel rms 2e-6 to 8e-6 |
+| LM with the transformers fp32 or bf16 embeddings instead of ours | same KL (0.0620, 0.0616) |
+| LM with t axis variants (per frame, equal to h, plain positions) | KL 0.062 to 0.081, so positions are not the cause |
+| noise of 1 to 6 percent rms added to the embeddings | KL unchanged |
+
+Controls against the same vLLM server, 32 teacher forced tokens each: descriptive text prompts mean
+KL 0.014, top-1 96%; long text (100 to 1700 tokens) KL 0.006 to 0.012; random token prompts (no media,
+unusual hidden states) mean KL 0.042, top-1 94%, with single prompts at 0.0016 and 0.16. The media
+populations (6 distinct images, 6 distinct videos, `real_27b_media_population_against_vllm`): images mean
+KL 0.040, top-1 94%; videos mean KL 0.074, top-1 90%. vLLM here serves with an fp8 KV cache and
+speculative MTP while specrt keeps bf16 planes, which is the one remaining difference that is not
+in the media path, so the gap on inputs with unusual or repetitive hidden states is not attributable to
+vision. Images keep the text gate (mean KL 0.05, top-1 90%); videos are gated at KL 0.09 and top-1 85%,
+a bound set from this measurement and not the text bound. #496 stays open for a run against a vLLM
+with an unquantised KV cache, which needs the user to start one.
