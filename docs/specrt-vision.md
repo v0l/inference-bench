@@ -52,3 +52,25 @@ and two videos, plus the frame indices and the placeholder expansion.
 
 URL fetching for `image_url` and `video_url` will be off by default (data URLs only), because
 fetching a user-supplied URL from the server is an SSRF risk. It is enabled by a server config key.
+
+## Server and API (slice 4, done)
+
+- `crates/core/src/media.rs` extracts `image_url` and `video_url` content parts (vLLM shape: a
+  `{url}` object or a bare string) into `ChatRequest::media`, each item with a SHA-256 content hash
+  that the prefix cache will fold into block keys.
+- Limits and policy come from the `[media]` table of the server config: `max_images` (8),
+  `max_videos` (1), `max_image_bytes` (20 MiB), `max_video_bytes` (200 MiB), `allow_url_fetch`
+  (false), `fetch_timeout_secs` (10).
+- Only `data:...;base64,` URLs are accepted by default. Fetching `http(s)` URLs is an SSRF risk
+  (the server would reach internal hosts on a client's behalf), so it is off until
+  `media.allow_url_fetch = true`. Other schemes (`file:` and so on) are always rejected.
+- A target reports `Capabilities::vision`. A request with media to a model whose target has no vision
+  gets a 400 saying the config has no `vision_config`.
+- Not yet: usage counting of vision tokens, and a `max_pixels` limit (both need the preprocessing
+  to run in the server path, which lands with slice 3).
+
+## Remaining
+
+Slices 2, 3, 5 and 6 are tracked in follow-up issues. `specrt::vision::Vision::from_hf_config`
+already reads `vision_config` and the four token ids from `config.json`; the encoder and the LM
+splice build on it.
