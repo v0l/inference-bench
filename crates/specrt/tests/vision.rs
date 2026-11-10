@@ -38,23 +38,23 @@ fn check_image(name: &str, file: &str, cfg: &Preprocessor) {
 
 #[test]
 fn image_without_resize_is_bit_identical_to_transformers() {
-    check_image("image_exact", "image_exact.png", &config("qwen3.8-27b.preprocessor_config.json"));
+    check_image("image_exact", "image_exact.png", &config("qwen3.8-27b.image-preprocessor.json"));
 }
 
 #[test]
 fn resized_image_is_bit_identical_to_transformers() {
-    check_image("image_resize", "image_resize.png", &config("qwen3.8-27b.preprocessor_config.json"));
+    check_image("image_resize", "image_resize.png", &config("qwen3.8-27b.image-preprocessor.json"));
 }
 
 #[test]
 fn large_image_with_config_bounds_is_bit_identical_to_transformers() {
-    let cfg = Preprocessor::from_json(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.preprocessor_config.json")).unwrap()).unwrap();
+    let cfg = Preprocessor::from_json(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.image-preprocessor.json")).unwrap()).unwrap();
     check_image("image_big", "image_big.png", &cfg);
 }
 
 fn check_video(name: &str) {
     let (meta, want) = reference(name);
-    let cfg = config("qwen3.8-27b.video_preprocessor_config.json");
+    let cfg = config("qwen3.8-27b.video-preprocessor.json");
     let got = preprocess_video_file(&cfg, &dir().join(format!("{name}.mp4"))).unwrap();
     assert_eq!(got.patches.grid, grid(&meta), "{name} grid");
     let (bad, max) = worst(&got.patches.data, &want);
@@ -74,7 +74,7 @@ fn resized_video_is_bit_identical_to_transformers() {
 #[test]
 fn frame_sampling_matches_transformers_indices() {
     let (meta, _) = reference("video_resize");
-    let cfg = config("qwen3.8-27b.video_preprocessor_config.json");
+    let cfg = config("qwen3.8-27b.video-preprocessor.json");
     let want: Vec<usize> = meta["indices"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
     assert_eq!(sample_indices(&cfg, meta["frames"].as_u64().unwrap() as usize, meta["fps"].as_f64().unwrap()), want);
 }
@@ -96,7 +96,7 @@ fn placeholders_expand_to_the_merged_token_count() {
 
 #[test]
 fn the_27b_config_declares_a_vision_tower() {
-    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.multimodal.config.json")).unwrap();
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.multimodal.json")).unwrap();
     let v = Vision::from_hf_config(&json).unwrap().unwrap();
     assert_eq!((v.config.depth, v.config.hidden_size, v.config.num_heads, v.config.out_hidden_size), (27, 1152, 16, 5120));
     assert_eq!((v.tokens.image, v.tokens.video, v.tokens.start, v.tokens.end), (248056, 248057, 248053, 248054));

@@ -74,3 +74,22 @@ fetching a user-supplied URL from the server is an SSRF risk. It is enabled by a
 Slices 2, 3, 5 and 6 are tracked in follow-up issues. `specrt::vision::Vision::from_hf_config`
 already reads `vision_config` and the four token ids from `config.json`; the encoder and the LM
 splice build on it.
+
+## Vision encoder (slice 2, done)
+
+`crates/specrt/src/vision_encoder.rs` and `templates/vision.cu`, built from `vision_config` of the
+checkpoint and JIT compiled like the other kernels. `vision_encoder::plan(cfg)` lists the ops
+(patch embed with interpolated position embeddings, per block norm, qkv, 2D rope, per frame
+attention, proj, norm, mlp up and down, then the merger and a deepstack merger after each block
+named in `deepstack_visual_indexes`), so the engine tab can draw the tower from the same list.
+
+- Weights are the checkpoint's `visual.*` tensors in bf16, kept bf16 on the device. Activations are
+  f32. The patch embed Conv3d is a GEMM over the flattened patch, the bilinear position table
+  interpolation (align_corners) and the rope tables are built on the host.
+- Attention is limited to one frame (`h * w` patches), which is how transformers builds `cu_seqlens`
+  for images and videos. Images in one request are encoded one at a time, so no cross image mask is
+  needed.
+- Bound: `tests/vision_encoder.rs` (ignored, needs the 27B FP8 snapshot and a GPU) compares the merged
+  embeddings of three fixtures with `transformers` run by `scripts/vision_encoder_reference.py`.
+  Measured relative rms 2e-6 to 8e-6 and max abs error at most 2.2e-3 on values up to 94. The test
+  asserts rms below 1e-4 and max below 5e-5 of the largest value.

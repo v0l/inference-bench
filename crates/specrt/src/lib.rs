@@ -18,6 +18,7 @@ pub mod serve;
 pub mod spec;
 pub mod statepool;
 pub mod vision;
+pub mod vision_encoder;
 pub mod weights;
 
 pub use engine::Engine;

@@ -197,7 +197,7 @@ impl Checkpoint {
         Ok(v)
     }
 
-    fn bf16(&self, name: &str, shape: &[usize]) -> Result<Cow<'_, [u16]>> {
+    pub fn bf16(&self, name: &str, shape: &[usize]) -> Result<Cow<'_, [u16]>> {
         if let Some(g) = &self.gguf {
             return Ok(Cow::Owned(self.gguf_f32(g, name, shape)?.into_iter().map(f32_to_bf16).collect()));
         }
