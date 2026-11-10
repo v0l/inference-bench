@@ -23,6 +23,7 @@ pub struct Fake {
     pub first_delay_ms: u64,
     pub token_delay_ms: u64,
     pub pieces: Vec<String>,
+    pub vision: bool,
     pub stats: Arc<Stats>,
 }
 
@@ -32,7 +33,7 @@ impl Target for Fake {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities::default()
+        Capabilities { vision: self.vision, ..Capabilities::default() }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
@@ -116,11 +117,12 @@ pub struct Shape {
     pub first_delay_ms: u64,
     pub token_delay_ms: u64,
     pub pieces: Vec<String>,
+    pub vision: bool,
 }
 
 impl Default for Shape {
     fn default() -> Self {
-        Self { tokens: 4, first_delay_ms: 0, token_delay_ms: 1, pieces: Vec::new() }
+        Self { tokens: 4, first_delay_ms: 0, token_delay_ms: 1, pieces: Vec::new(), vision: false }
     }
 }
 
@@ -142,6 +144,7 @@ pub fn start(config: ServerConfig, shape: Shape) -> Rig {
             first_delay_ms: shape.first_delay_ms,
             token_delay_ms: shape.token_delay_ms,
             pieces: shape.pieces.clone(),
+            vision: shape.vision,
             stats: s.clone(),
         }))
     };

@@ -67,7 +67,7 @@ impl Target for ServingTarget {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: false, memory: false }
+        Capabilities { streaming: true, logits: false, memory: false, vision: false }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {

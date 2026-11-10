@@ -3112,6 +3112,7 @@ name = "inference-bench-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "dirs",
@@ -3119,6 +3120,7 @@ dependencies = [
  "inference-bench-specrt",
  "serde",
  "serde_json",
+ "sha2",
  "tar",
  "toml 0.9.12+spec-1.1.0",
  "tracing",

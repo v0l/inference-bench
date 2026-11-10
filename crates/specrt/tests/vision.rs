@@ -93,3 +93,18 @@ fn placeholders_expand_to_the_merged_token_count() {
     assert_eq!(out, format!("<0.2 seconds><|vision_start|>{pad}<|vision_end|><1.5 seconds><|vision_start|>{pad}<|vision_end|>"));
     assert!(expand_placeholders("no slot", &tokens, 2, &[Media::Image(&image)]).is_err());
 }
+
+#[test]
+fn the_27b_config_declares_a_vision_tower() {
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.multimodal.config.json")).unwrap();
+    let v = Vision::from_hf_config(&json).unwrap().unwrap();
+    assert_eq!((v.config.depth, v.config.hidden_size, v.config.num_heads, v.config.out_hidden_size), (27, 1152, 16, 5120));
+    assert_eq!((v.tokens.image, v.tokens.video, v.tokens.start, v.tokens.end), (248056, 248057, 248053, 248054));
+    assert!(v.config.deepstack_visual_indexes.is_empty());
+}
+
+#[test]
+fn text_only_configs_have_no_vision() {
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3-0.6b.config.json")).unwrap();
+    assert!(Vision::from_hf_config(&json).unwrap().is_none());
+}

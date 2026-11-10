@@ -68,6 +68,7 @@ pub struct ChatRequest {
     pub openai_messages: Option<Vec<Value>>,
     pub template_vars: Value,
     pub cache_salt: Option<String>,
+    pub media: Vec<crate::media::MediaItem>,
 }
 
 impl ChatRequest {
@@ -87,6 +88,7 @@ impl ChatRequest {
             openai_messages: None,
             template_vars: json!({"enable_thinking": false}),
             cache_salt: None,
+            media: Vec::new(),
         }
     }
 

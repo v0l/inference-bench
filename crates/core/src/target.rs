@@ -6,6 +6,8 @@ pub struct Capabilities {
     pub streaming: bool,
     pub logits: bool,
     pub memory: bool,
+    #[serde(default)]
+    pub vision: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

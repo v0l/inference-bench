@@ -147,6 +147,7 @@ pub struct ServerConfig {
     pub tool_parser: Option<String>,
     pub reasoning_parser: Option<String>,
     pub chat_template_kwargs: toml::Table,
+    pub media: inference_bench_core::media::MediaLimits,
 }
 
 impl Default for ServerConfig {
@@ -188,6 +189,7 @@ impl Default for ServerConfig {
             tool_parser: None,
             reasoning_parser: None,
             chat_template_kwargs: toml::Table::new(),
+            media: Default::default(),
         }
     }
 }
@@ -255,6 +257,7 @@ impl ServerConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(self.media.max_image_bytes > 0 && self.media.max_video_bytes > 0, "media byte limits must be positive");
         anyhow::ensure!(self.max_concurrent >= 1, "max_concurrent must be at least 1");
         anyhow::ensure!(self.max_num_seqs != Some(0), "max_num_seqs must be at least 1");
         if let Some(n) = self.max_model_len {

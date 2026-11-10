@@ -396,3 +396,55 @@ pub fn expand_placeholders(prompt: &str, tokens: &MediaTokens, merge_size: usize
     out.push_str(rest);
     Ok(out)
 }
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct VisionConfig {
+    pub depth: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_heads: usize,
+    pub patch_size: usize,
+    pub spatial_merge_size: usize,
+    pub temporal_patch_size: usize,
+    pub out_hidden_size: usize,
+    pub num_position_embeddings: usize,
+    #[serde(default)]
+    pub in_channels: Option<usize>,
+    #[serde(default)]
+    pub hidden_act: Option<String>,
+    #[serde(default)]
+    pub deepstack_visual_indexes: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VisionTokens {
+    pub image: u32,
+    pub video: u32,
+    pub start: u32,
+    pub end: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Vision {
+    pub config: VisionConfig,
+    pub tokens: VisionTokens,
+}
+
+impl Vision {
+    pub fn from_hf_config(json: &str) -> Result<Option<Self>> {
+        let top: serde_json::Value = serde_json::from_str(json).context("config.json")?;
+        let Some(vc) = top.get("vision_config").filter(|v| v.is_object()) else { return Ok(None) };
+        if top.get("language_model_only").and_then(|v| v.as_bool()) == Some(true) {
+            return Ok(None);
+        }
+        let config: VisionConfig = serde_json::from_value(vc.clone()).context("vision_config")?;
+        let id = |k: &str| top.get(k).and_then(|v| v.as_u64()).map(|v| v as u32).with_context(|| format!("config.json has no {k}"));
+        let tokens = VisionTokens {
+            image: id("image_token_id")?,
+            video: id("video_token_id")?,
+            start: id("vision_start_token_id")?,
+            end: id("vision_end_token_id")?,
+        };
+        Ok(Some(Vision { config, tokens }))
+    }
+}

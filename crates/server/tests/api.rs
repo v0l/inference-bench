@@ -448,3 +448,47 @@ fn the_server_makes_no_spec_request_when_updates_are_off() {
     assert!(github.requests.lock().unwrap().is_empty());
     rig.stop();
 }
+
+fn image_chat(url: &str) -> Value {
+    json!({"model": "m", "max_tokens": 2, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is this"},
+        {"type": "image_url", "image_url": {"url": url}},
+    ]}]})
+}
+
+const PIXEL: &str = "data:image/png;base64,iVBORw0KGgo=";
+
+#[test]
+fn image_input_to_a_model_without_vision_is_a_400() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    let (status, body, _) = rig.post("/v1/chat/completions", None, image_chat(PIXEL));
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("vision_config"), "{body}");
+    rig.stop();
+}
+
+#[test]
+fn image_input_reaches_a_vision_model_as_media() {
+    let rig = start(config("[[models]]\nid='m'"), Shape { vision: true, ..Shape::default() });
+    let (status, body, _) = rig.post("/v1/chat/completions", None, image_chat(PIXEL));
+    assert_eq!(status, 200, "{body}");
+    let seen = rig.stats.requests.lock().unwrap();
+    assert_eq!(seen[0].media.len(), 1);
+    assert_eq!(seen[0].media[0].bytes.as_slice(), &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    drop(seen);
+    rig.stop();
+}
+
+#[test]
+fn url_fetching_is_off_by_default_and_the_limits_come_from_config() {
+    let rig = start(config("[[models]]\nid='m'"), Shape { vision: true, ..Shape::default() });
+    let (status, body, _) = rig.post("/v1/chat/completions", None, image_chat("http://127.0.0.1:1/a.png"));
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("disabled"), "{body}");
+    rig.stop();
+    let rig = start(config("[[models]]\nid='m'\n[media]\nmax_images = 0"), Shape { vision: true, ..Shape::default() });
+    let (status, body, _) = rig.post("/v1/chat/completions", None, image_chat(PIXEL));
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("at most 0 images"), "{body}");
+    rig.stop();
+}

@@ -19,7 +19,7 @@ impl Target for EngineBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: false, memory: false }
+        Capabilities { streaming: true, logits: false, memory: false, vision: false }
     }
 
     fn load(&mut self, _model: &str) -> Result<(), BackendError> {

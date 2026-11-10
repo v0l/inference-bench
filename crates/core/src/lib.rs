@@ -9,6 +9,7 @@ pub mod hf;
 pub mod settings;
 pub mod library;
 pub mod logitdiff;
+pub mod media;
 pub mod loadtest;
 pub mod matrix;
 pub mod metrics_text;

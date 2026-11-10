@@ -594,6 +594,11 @@ fn start_generation(
                 }
             };
             admission.start();
+            if !request.media.is_empty() && !lease.backend().capabilities().vision {
+                let msg = format!("model {model} does not accept image or video input: its config has no vision_config");
+                let _ = tx.send(Gen::Done(Err(ApiError::bad_request(msg)), false));
+                return;
+            }
             Span::current().record("backend", lease.model().backend_label.as_str());
             let queued_ms = started.elapsed().as_secs_f64() * 1000.0;
             tracing::debug!(queued_ms, "generation started");
@@ -766,6 +771,16 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
     request.cancel = Some(cancel);
     request.openai_messages = p.openai_messages;
     request.cache_salt = Some(salt);
+    if let Some(list) = &request.openai_messages
+        && inference_bench_core::media::has_media(list)
+    {
+        let list = list.clone();
+        let limits = state.config.media.clone();
+        request.media = tokio::task::spawn_blocking(move || inference_bench_core::media::extract(&list, &limits))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .map_err(|e| ApiError::bad_request(e.0))?;
+    }
     if p.use_template {
         request.template_vars = p.template_vars;
     }
