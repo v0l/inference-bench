@@ -23,7 +23,16 @@ backend = "auto"   # "cuda" | "wgpu" | "auto"
 | wgpu device, pipelines, buffers | `backends/wgpu.rs` | feature `wgpu` |
 | CUDA runtime | `runtime.rs`, `jit.rs` | CUDA only |
 
-Both backends run the same `Plan` (`plan::Plan::build`) through `executor::run_plan`: `Runtime` (CUDA, `runtime/exec.rs`) and the wgpu `Dense` runner each implement `PlanBackend::run_op`. The wgpu side maps each `Op` to WGSL kernels in `wgsl::kernels_for`; there is no hand-written layer loop. CUDA launches stay in `runtime/`, behaviour and speed unchanged (27B NVFP4 prefill 1,024 1,514 vs 1,544 tok/s, 4,096 1,507 vs 1,532, decode batch 1 56.5 vs 57.5, batch 8 333 vs 338 tok/s aggregate, base against this branch, within 2%; real27b 10/10; the non-27B suite passes with `SPECRT_REF_DIR=/tmp/ref387`).
+Both backends run the same `Plan` (`plan::Plan::build`) through `executor::run_plan`: `Runtime` (CUDA, `runtime/exec.rs`) and the wgpu `Dense` runner each implement `PlanBackend::run_op`. The wgpu side maps each `Op` to WGSL kernels in `wgsl::kernels_for`; there is no hand-written layer loop. CUDA launches stay in `runtime/`, behaviour and speed unchanged. Speed gate, 27B NVFP4 on the RTX PRO 6000, base `9b27e03` against `bc75dc6`, interleaved base, new three times each under `flock /tmp/gpu27.lock` (each run is the median of 3 inside `bench`; the table is the median of the three):
+
+| Case | Base | New | Delta |
+|---|---|---|---|
+| Prefill 1,024 (tok/s) | 1490.2 | 1492.6 | +0.16% |
+| Prefill 4,096 (tok/s) | 1490.0 | 1494.5 | +0.30% |
+| Decode batch 1 (tok/s) | 55.4 | 55.5 | +0.18% |
+| Decode batch 8 (tok/s aggregate) | 332.3 | 332.4 | +0.03% |
+
+All within 2%. real27b 10/10; the non-27B suite passes with `SPECRT_REF_DIR=/tmp/ref387`.
 
 What is not moved: the CUDA buffers, graphs, batching, MTP and delta-net still use cudarc directly rather than the byte-level `Backend` trait. The `wgpu` kernel choice also does not go through `kernel_for` yet, because `kernel_for` picks CUDA GEMM tiles and tensor-core paths; the wgpu plan is `Plan::build(spec, phase, false)` and its two linear kernels are chosen by token count.
 
