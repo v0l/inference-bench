@@ -19,6 +19,64 @@ Source: the `local-llm.service` journal on the RTX PRO 6000 box (26 Oct to 7 Nov
 
 64 layers, hidden 5120, FFN 17408, vocab 248,320, 262,144 positions. **48 linear-attention layers and 16 full-attention layers** (one full layer every fourth). Full attention: 24 query heads, 4 KV heads, head dim 256. Linear attention: 48 value heads, 16 key heads, key and value head dim 128, conv kernel 4 (a gated delta-net style recurrent layer). One MTP layer. Quantisation: FP8 weights and activations for the attention projections, **NVFP4 (4-bit float, group size 16) for every MLP**. The vision tower is ignored (text-only).
 
+## Clean baseline (10 Nov 2026, #307)
+
+vLLM 0.27.1 started by hand with the service's exact flags (`docs/qwen27-run/launch.sh`, port 8011) while `local-llm.service` was stopped. Only desktop apps and agentbench-server (4.4 GB) were on the GPU (RTX PRO 6000 Blackwell Max-Q, driver 595.112.07). No request other than the harness reached the benchmark server (checked in the vLLM logs). Harness: `crates/specrt/scripts/vllm_baseline.py`, streaming chat, `ignore_eos`, thinking off, unique prompt per request so the prefix cache only hits where a suite asks for it. Raw JSON and logs are in `docs/qwen27-run/`. MTP on and MTP off are two sequential launches, not alternating runs. The 200 request replay set was skipped: no recorded request bodies exist on this machine. A first MTP attempt on port 8001 was discarded because routed YALR traffic reached it (`contaminated-8001/`).
+
+KV capacity from the startup log: **400,663 tokens with MTP, 439,919 without** (14 GB fp8 cache), which is 1.53x and 1.68x of one 262,144 token request.
+
+### Single stream, 128 output tokens
+
+| prompt tokens | runs | TTFT s (MTP / off) | prefill tok/s (MTP / off) | decode tok/s (MTP / off) |
+|---|---|---|---|---|
+| 128 | 6 | 0.055 / 0.046 | 2,195 / 2,633 | 112.0 / 59.9 |
+| 1,024 | 6 | 0.128 / 0.113 | 7,912 / 8,986 | 105.6 / 59.4 |
+| 4,096 | 6 | 0.466 / 0.456 | 8,781 / 8,968 | 118.2 / 58.7 |
+| 16,384 | 6 | 2.04 / 2.05 | 8,016 / 8,001 | 111.8 / 57.2 |
+
+### Concurrency, 128 token prompts, aggregate decode tok/s
+
+| streams | MTP | off |
+|---|---|---|
+| 1 | 112.5 | 59.3 |
+| 4 | 431.5 | 215.2 |
+| 8 | 818.6 | 434.5 |
+| 16 | 1,368 | 806.1 |
+| 32 | 2,319 | 1,386 |
+
+## Long context (up to 260k)
+
+Single stream, 128 output tokens, 6 runs up to 65k and 3 runs from 131k (medians). The specrt column is the 27B NVFP4 spec (`qwen3.8-27b.toml`) through `prefixbench long` (scheduler, no HTTP, bf16 KV, 24 GB KV pool, prefix cache on), a single cold run per point.
+
+| prompt tokens | vLLM MTP TTFT s | vLLM off TTFT s | vLLM MTP prefill tok/s | vLLM off prefill tok/s | vLLM MTP decode | vLLM off decode | specrt TTFT s | specrt prefill tok/s | specrt decode |
+|---|---|---|---|---|---|---|---|---|---|
+| 32,768 | 4.78 | 4.67 | 6,849 | 7,023 | 106.0 | 56.0 | 28.6 | 1,145 | 78.3 |
+| 65,536 | 12.29 | 11.75 | 5,332 | 5,578 | 105.1 | 54.2 | 68.4 | 959 | 63.8 |
+| 131,072 | 34.82 | 33.13 | 3,764 | 3,956 | 98.7 | 50.5 | 172.8 | 758 | 47.1 |
+| 196,608 | 67.56 | 64.39 | 2,910 | 3,053 | 83.4 | 47.3 | 314.6 | 625 | 37.3 |
+| 260,000 | 109.1 | 103.9 | 2,383 | 2,501 | 85.1 | 44.3 | 488.3 | 532 | 31.0 |
+
+specrt ran every length to 260k without an out of memory error at KV 24 GB. Its long prefill is 4x to 5x slower than vLLM and falls with length (1,374 tok/s at 4k to 532 at 260k), so prefill attention at long context is the gap to close.
+
+Decode of 512 tokens after a held prefix (median tok/s):
+
+| held prefix | MTP | off |
+|---|---|---|
+| 131,064 | 96.8 | 50.2 |
+| 259,992 | 89.3 | 43.8 |
+
+Prefix cache at long context: the same prompt resent with a new 1k suffix.
+
+| prompt | vLLM MTP cold / warm TTFT s | vLLM off cold / warm TTFT s | specrt cold / warm TTFT s |
+|---|---|---|---|
+| 8,192 | 0.98 / 0.34 | 0.94 / 0.14 | 2.98 (4k) / 0.81 (4k) |
+| 131,072 | 34.85 / 1.86 | 33.22 / 0.83 | 172.8 / 2.12 |
+| 260,000 | n/a | n/a | 488.3 / 3.44 |
+
+vLLM warm hits cached 128,000 of 131,064 tokens with MTP and 130,144 without; the shorter match with MTP is a block size effect, not measured further.
+
+4 concurrent requests at 65,536 tokens (all four fit in the KV pool): aggregate decode 108.8 tok/s with MTP and 63.3 without, median TTFT 36.2 s and 33.5 s. specrt was not run with 4 concurrent 64k requests.
+
 ## Measured performance
 
 Decode, aggregate generation tokens per second in 10 s windows with N requests running:

@@ -1,0 +1,81 @@
+# /etc/systemd/system/local-llm.service
+[Unit]
+Description=Local LLM (vLLM Qwen3.8 27B on RTX PRO 6000)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kieran
+WorkingDirectory=/home/kieran
+Environment=HOME=/home/kieran
+# uvx lives in ~/.local/bin; without it the model/mmproj download path fails
+Environment=PATH=/home/kieran/.local/bin:/usr/local/cuda/bin:/usr/local/bin:/usr/bin:/bin
+# Symlink: repoint it at another launcher script to switch models,
+# then `systemctl restart local-llm`.
+ExecStart=/home/kieran/local-llm
+Restart=on-failure
+RestartSec=30
+# Model load and graph capture take a few minutes
+TimeoutStartSec=900
+TimeoutStopSec=60
+KillMode=mixed
+# Killed by the global OOM killer at a 46.9G peak on 2026-09-02; reclaim
+# pressure here beats taking the desktop down with it. Box has 62G.
+MemoryHigh=54G
+
+[Install]
+WantedBy=multi-user.target
+---
+/home/kieran/qwen3.8-27B-NVFP4.sh
+---
+#!/bin/bash
+VENV=.venv-vllm
+VLLM_MAIN_CUDA_VERSION=cu130
+#MODEL="nvidia/Qwen3.8-27B-NVFP4"
+MODEL="orcarouter/Qwen3.8-27B-Uncensored-NVFP4"
+
+export HF_HOME=$HOME/.cache/huggingface
+
+if [ ! -d "$VENV" ]; then
+  uv venv $VENV
+  source $VENV/bin/activate
+  #uv pip install -U vllm --torch-backend=auto --extra-index-url https://wheels.vllm.ai/nightly/$VLLM_MAIN_CUDA_VERSION
+  #uv pip install flashinfer-python flashinfer-cubin flashinfer-jit-cache --index-url https://flashinfer.ai/whl/$VLLM_MAIN_CUDA_VERSION
+  uv pip install -U vllm --torch-backend auto
+  uv pip install instanttensor
+  uv pip install -U "transformers>=5.8.0"
+  deactivate
+fi
+source $VENV/bin/activate
+
+getsnapshotdir() { 
+    cache=$(hf env | awk -F': ' '/HF_HUB_CACHE/ {print $2}'); 
+    repo="$cache/models--${1//\//--}"; 
+    commit=$(cat "$repo/refs/main" 2>/dev/null); 
+    echo "$repo/snapshots/$commit"; 
+}
+
+export MAX_JOBS=20
+export NVCC_THREADS=20
+export PYTHONPATH=$HOME/vllm-middleware${PYTHONPATH:+:$PYTHONPATH}
+vllm serve $MODEL \
+  --served-model-name "qwen3.8-27b" \
+  --max-num-batched-tokens 16384 \
+  --max-num-seqs 32 \
+  --max-model-len 262144 \
+  --override-generation-config '{"temperature":1.0,"top_p":0.95,"top_k":20,"min_p":0.0,"presence_penalty":0.0,"repetition_penalty":1.0}' \
+  --default-chat-template-kwargs '{"reasoning_effort":"medium"}' \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --gpu-memory-utilization 0.75 \
+  --kv-cache-memory-bytes 14G \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser qwen3 \
+  --enable-prefix-caching \
+  --kv-cache-dtype fp8 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+  --enable-prompt-tokens-details \
+  --mm-encoder-tp-mode data \
+  --middleware null_detail.StripNullImageDetail

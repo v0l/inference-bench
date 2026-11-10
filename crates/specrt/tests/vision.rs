@@ -56,7 +56,7 @@ fn large_image_with_config_bounds_is_bit_identical_to_transformers() {
 fn check_video(name: &str) {
     let (meta, want) = reference(name);
     let mut cfg = config("qwen3.8-27b.video-preprocessor.json");
-    if name == "clip" {
+    if name == "clip" || name == "clip10" {
         cfg.size.longest_edge = 25165824;
     }
     let got = preprocess_video_file(&cfg, &dir().join(format!("{name}.mp4"))).unwrap();
@@ -222,4 +222,20 @@ fn the_op_plan_has_a_merger_and_a_deepstack_merger_per_configured_block() {
     let deep: Vec<_> = ops.iter().filter(|o| matches!(o, VisionOp::DeepstackMerger { .. })).collect();
     assert_eq!(deep.len(), 2);
     assert_eq!(ops[ops.iter().position(|o| *o == VisionOp::DeepstackMerger { index: 0, after_block: 5 }).unwrap() - 1], VisionOp::MlpDown { block: 5 });
+}
+
+#[test]
+fn the_ten_second_clip_has_the_reference_frames_grid_patches_and_timestamps() {
+    check_video("clip10");
+    let (meta, _) = reference("clip10");
+    let mut cfg = config("qwen3.8-27b.video-preprocessor.json");
+    cfg.size.longest_edge = 25165824;
+    let want: Vec<usize> = meta["indices"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
+    let fps = meta["fps"].as_f64().unwrap();
+    assert_eq!(sample_indices(&cfg, meta["frames"].as_u64().unwrap() as usize, fps), want);
+    let got = preprocess_video_file(&cfg, &dir().join("clip10.mp4")).unwrap();
+    let stamps: Vec<String> = got.timestamps.iter().map(|t| format!("{t:.1}")).collect();
+    let want_stamps: Vec<String> = meta["timestamps"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    assert_eq!(stamps, want_stamps);
+    assert_eq!(got.patches.tokens(2), 800);
 }

@@ -165,3 +165,70 @@ with a naive GEMM), vLLM's includes its encoder cache; the encoder is the target
 speed pass. `prefixbench` (scheduler only, no HTTP): image_1 cold 815 ms, warm 436 ms with 208 of
 211 tokens cached; images_3 2306 ms and 1153 ms; 3 s video 837 ms and 287 ms.
 The frame count differs from vLLM on the 10 s clip (see the follow-up issue).
+
+## Video against vLLM: what was checked (#496, #497)
+
+Frame sampling (#497) is fixed in the sense that it was never different: `sample_indices` equals the
+transformers and vLLM sampler (checked against `vllm.multimodal.video` and `Qwen3VLVideoProcessor`).
+The 880 vs 800 gap was vLLM's `multimodal_tokens.video`, which counts the 10 timestamp text tokens
+and 20 `vision_start`/`vision_end` tokens as video tokens; its prompt has exactly 800 video pad tokens
+in 10 frames of 80, like ours (900 prompt tokens both sides, ids identical). The 10 s, 100 frame clip
+is now a fixture (`clip10`) with reference indices, timestamps, grid and patches from
+`vision_reference.py`, asserted in `tests/vision.rs`.
+
+For the video logit gap every stage before the language model was compared with the reference and
+is identical or within the encoder bound:
+
+| stage | result |
+|---|---|
+| frames decoded by ffmpeg vs opencv (vLLM) | bit equal |
+| frame indices, timestamps, grid, patch tensor vs transformers fed by vLLM's loader | bit equal |
+| prompt ids vs vLLM | equal for every case |
+| M-RoPE positions and delta vs transformers `get_rope_index` and vLLM `_get_mrope_input_positions` | equal, 0 of 284 and 900 positions differ |
+| vision encoder vs transformers fp32 | rel rms 2e-6 to 8e-6 |
+| LM with the transformers fp32 or bf16 embeddings instead of ours | same KL (0.0620, 0.0616) |
+| LM with t axis variants (per frame, equal to h, plain positions) | KL 0.062 to 0.081, so positions are not the cause |
+| noise of 1 to 6 percent rms added to the embeddings | KL unchanged |
+
+Controls against the same vLLM server, 32 teacher forced tokens each: descriptive text prompts mean
+KL 0.014, top-1 96%; long text (100 to 1700 tokens) KL 0.006 to 0.012; random token prompts (no media,
+unusual hidden states) mean KL 0.042, top-1 94%, with single prompts at 0.0016 and 0.16. The media
+populations (6 distinct images, 6 distinct videos, `real_27b_media_population_against_vllm`): images mean
+KL 0.040, top-1 94%; videos mean KL 0.074, top-1 90%. vLLM here serves with an fp8 KV cache and
+speculative MTP while specrt keeps bf16 planes, which is the one remaining difference that is not
+in the media path, so the gap on inputs with unusual or repetitive hidden states is not attributable to
+vision. Images keep the text gate (mean KL 0.05, top-1 90%); videos are gated at KL 0.09 and top-1 85%,
+a bound set from this measurement and not the text bound.
+
+Run against a vLLM with an unquantised KV cache and no MTP (`--kv-cache-dtype auto`, bf16 planes like
+specrt, `docs/qwen27-run/launch.sh kvauto`, log in `docs/qwen27-run/vision-lm-kvauto.log`): the
+image population falls to mean KL 0.033, top-1 93% (178/192) and the video population to mean KL
+0.060, top-1 94% (181/192), from 0.074 and 90%. Single clips: 3 s video 0.108, 10 s video 0.048, 2
+frames 0.057, 4 frames 0.066, 3 images 0.109. So the fp8 KV cache and MTP explain about a fifth of
+the video gap, and the rest stays: video KL is still above the 0.05 text bound while the image
+population is inside it. The video gate therefore stays at KL 0.09 and top-1 85%, and #496 stays
+open for the remaining 0.01 to 0.06 on video. The text-only controls were not rerun because
+`vllm_vision.py` does not write their reference files (`vllm-textctrl.json`, `vllm-longtext.json`,
+`vllm-randtext.json`, `vllm-pos.json`, `plp-*.json`); those five tests need `/tmp/vis484`.
+
+## Running the tests
+
+Non-27B suite (the 27B tests are all named `real_27b_*`, including every test in `tests/vision_lm.rs`):
+
+```
+SPECRT_REF_DIR=/tmp/ref387 cargo test --release --workspace -- --include-ignored --skip real_27b
+```
+
+The 27B vision tests need a GPU with about 36 GB free, one at a time under `flock /tmp/gpu27.lock`,
+the vLLM server on port 8001 and its reference output:
+
+```
+~/.venv-vllm/bin/python crates/specrt/scripts/vllm_vision.py /tmp/vis484
+SPECRT_VISION_REF_DIR=/tmp/vis484 flock /tmp/gpu27.lock cargo test --release -p inference-bench-specrt \
+  --test vision_lm --test vision_encoder -- --include-ignored --nocapture --test-threads=1 \
+  --skip control --skip bisect --skip positions_equal --skip noise --skip prompt_position
+```
+
+Without `SPECRT_VISION_REF_DIR` the `vision_lm` tests print `skipped` and pass. The fixtures behind
+`vision.rs` come from `scripts/vision_reference.py` and `scripts/vision_encoder_reference.py`
+(`~/.venv-vllm/bin/python`, CPU only).

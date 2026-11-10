@@ -1,0 +1,12 @@
+SUMMARY long cache=true model=qwen3.8-27b prompt=4096 phase=cold ttft_s=2.980 prefill_tok_s=1374 decode_tok_s=74.7 cached=0
+SUMMARY long cache=true model=qwen3.8-27b prompt=4096 phase=warm_suffix1k ttft_s=0.811 cached=4096
+SUMMARY long cache=true model=qwen3.8-27b prompt=32768 phase=cold ttft_s=28.607 prefill_tok_s=1145 decode_tok_s=78.3 cached=0
+SUMMARY long cache=true model=qwen3.8-27b prompt=32768 phase=warm_suffix1k ttft_s=1.112 cached=32768
+SUMMARY long cache=true model=qwen3.8-27b prompt=65536 phase=cold ttft_s=68.364 prefill_tok_s=959 decode_tok_s=63.8 cached=0
+SUMMARY long cache=true model=qwen3.8-27b prompt=65536 phase=warm_suffix1k ttft_s=1.449 cached=65536
+SUMMARY long cache=true model=qwen3.8-27b prompt=131072 phase=cold ttft_s=172.812 prefill_tok_s=758 decode_tok_s=47.1 cached=0
+SUMMARY long cache=true model=qwen3.8-27b prompt=131072 phase=warm_suffix1k ttft_s=2.119 cached=131072
+SUMMARY long cache=true model=qwen3.8-27b prompt=196608 phase=cold ttft_s=314.642 prefill_tok_s=625 decode_tok_s=37.3 cached=0
+SUMMARY long cache=true model=qwen3.8-27b prompt=196608 phase=warm_suffix1k ttft_s=2.792 cached=196608
+SUMMARY long cache=true model=qwen3.8-27b prompt=260000 phase=cold ttft_s=488.337 prefill_tok_s=532 decode_tok_s=31.0 cached=0
+SUMMARY long cache=true model=qwen3.8-27b prompt=260000 phase=warm_suffix1k ttft_s=3.443 cached=260000

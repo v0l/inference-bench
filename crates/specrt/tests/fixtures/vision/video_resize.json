@@ -1,1 +1,1 @@
-{"grid": [3, 4, 6], "patch_dim": 1536, "frames": 30, "fps": 10.0, "indices": [0, 6, 12, 17, 23, 29]}
+{"grid": [3, 4, 6], "patch_dim": 1536, "frames": 30, "fps": 10.0, "indices": [0, 6, 12, 17, 23, 29], "timestamps": ["0.3", "1.4", "2.6"]}

@@ -1,0 +1,51 @@
+waiting for gpu lock 2026-11-10T15:25:18+00:00
+waiting for gpu lock 2026-11-10T15:25:38+00:00
+waiting for gpu lock 2026-11-10T15:25:58+00:00
+waiting for gpu lock 2026-11-10T15:26:18+00:00
+Running as unit: vllm-bench.service; invocation ID: a421688e16ef41959c64ebdc8a6c9cb0
+(EngineCore pid=1076341) INFO 11-10 15:27:13 [kv_cache_utils.py:2235] GPU KV cache size: 439,919 tokens
+(EngineCore pid=1076341) INFO 11-10 15:27:13 [kv_cache_utils.py:2236] Maximum concurrency for 262,144 tokens per request: 1.68x
+image This is a simple, flat-style digital illustration of a rural scene. The image is composed of basic geometric shapes and solid colors, giving it a clean, minimalist {'prompt_tokens': 160, 'total_tokens': 192, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'image': 140}}} prompt ids
+video The video depicts a simple, stylized animation of a barn in a rural setting. Here's a detailed breakdown:
+
+**Scene Elements:**
+
+1.  {'prompt_tokens': 284, 'total_tokens': 316, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 264}}} prompt ids
+images3 Here is a detailed description of each image, presented in the requested order.
+
+---
+
+### Image 1: A Simple Farmhouse Scene
+
+This image is {'prompt_tokens': 502, 'total_tokens': 534, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'image': 476}}} prompt ids
+video10 This video is a vibrant, abstract animation that combines elements of retro test patterns with dynamic, colorful motion graphics. Here's a detailed breakdown:
+
+**Overall Composition {'prompt_tokens': 900, 'total_tokens': 932, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 880}}} prompt ids
+video2f This is a simple, 2D animated video with a flat design aesthetic. The scene depicts a rural landscape under a clear sky.
+
+**Scene Elements:** {'prompt_tokens': 108, 'total_tokens': 140, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 88}}} prompt ids
+video4f This is a simple, stylized 2D animation or illustration depicting a rural scene. The video appears to be static, with no visible motion between the two {'prompt_tokens': 196, 'total_tokens': 228, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 176}}} prompt ids
+set_img0 This is a vibrant, abstract digital illustration composed of simple geometric shapes set against a solid, bright magenta background. The overall aesthetic is flat and graphic, reminiscent {'prompt_tokens': 240, 'total_tokens': 272, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'image': 220}}} prompt ids
+set_vid0 The video features a vibrant and abstract composition set against a solid magenta background. The scene is populated with several geometric shapes, each distinct in color and form, {'prompt_tokens': 196, 'total_tokens': 228, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 176}}} prompt ids
+set_img1 This is a digital graphic featuring several simple geometric shapes arranged on a solid dark green background. The composition is flat and abstract, with no gradients, shadows, or {'prompt_tokens': 212, 'total_tokens': 244, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'image': 192}}} prompt ids
+set_vid1 This is a short, abstract animation featuring simple geometric shapes on a solid green background. The video is approximately 2 seconds long and consists of a single, slow {'prompt_tokens': 196, 'total_tokens': 228, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 176}}} prompt ids
+set_img2 This is a minimalist, abstract digital image composed of simple geometric shapes set against a solid background. The overall aesthetic is flat and graphic, with no gradients, textures {'prompt_tokens': 160, 'total_tokens': 192, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'image': 140}}} prompt ids
+set_vid2 Based on the provided images, here is a detailed description of the video:
+
+**Overall Description:**
+The video displays a simple, abstract composition of geometric shapes {'prompt_tokens': 284, 'total_tokens': 316, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 264}}} prompt ids
+set_img3 This is a digital abstract composition featuring several geometric shapes set against a solid, bright cyan-blue background. The style is flat and minimalist, with no gradients, textures {'prompt_tokens': 212, 'total_tokens': 244, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'image': 192}}} prompt ids
+set_vid3 This video features a simple, abstract animation composed of geometric shapes against a solid light blue background. The scene is static in terms of camera movement but dynamic due to {'prompt_tokens': 284, 'total_tokens': 316, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 264}}} prompt ids
+set_img4 This is a digital abstract composition featuring several geometric shapes layered on a solid purple background. The overall aesthetic is flat, modern, and reminiscent of mid-century modern or {'prompt_tokens': 212, 'total_tokens': 244, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'image': 192}}} prompt ids
+set_vid4 The video features a dynamic and colorful abstract composition set against a vibrant purple background. Here's a detailed description of the elements and their movements:
+
+1. ** {'prompt_tokens': 372, 'total_tokens': 404, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 352}}} prompt ids
+set_img5 This is a minimalist, abstract digital illustration composed of simple geometric shapes against a solid background.
+
+**Background:**
+- The entire canvas has a vibrant, solid {'prompt_tokens': 164, 'total_tokens': 196, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'image': 144}}} prompt ids
+set_vid5 The video features a dynamic and abstract composition set against a vibrant purple background. The scene is dominated by geometric shapes that move and interact in a visually engaging manner. {'prompt_tokens': 372, 'total_tokens': 404, 'completion_tokens': 32, 'prompt_tokens_details': {'cached_tokens': 0, 'created_cache_tokens': 0, 'multimodal_tokens': {'video': 352}}} prompt ids
+tests exit 101
+specrt long exit 0
+window496 done 2026-11-10T15:48:47+00:00
+restarting service 2026-11-10T15:48:47+00:00
