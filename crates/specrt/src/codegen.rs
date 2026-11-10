@@ -398,7 +398,7 @@ impl Tile {
     pub fn big(opts: &RuntimeOptions) -> Tile {
         match opts.big_tile {
             Some([bm, bn, wm, wn]) => Tile { bm, bn, wm, wn },
-            None => Tile { bm: 64, bn: 128, wm: 2, wn: 4 },
+            None => Tile { bm: 128, bn: 128, wm: 2, wn: 4 },
         }
     }
 
@@ -617,7 +617,10 @@ impl MmaShape {
             WeightFormat::Bf16 | WeightFormat::Ggml => env_usize("SPECRT_BK", 32),
         };
         let stages = match wf {
-            WeightFormat::Fp4 => FP4_STAGES,
+            WeightFormat::Fp4 => {
+                let per_stage = tile.bm * bk * 2 * if split { 2 } else { 1 } + tile.bn * wf.wrow(bk);
+                (FLASH_SMEM_LIMIT / per_stage).clamp(2, FP4_STAGES)
+            }
             _ if tile.bm == 16 => 2,
             _ => env_usize("SPECRT_STAGES", 2),
         };

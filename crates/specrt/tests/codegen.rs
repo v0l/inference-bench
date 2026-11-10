@@ -76,8 +76,8 @@ fn fp8_spec_uses_fp8_projections_and_keeps_lm_head_and_gates_bf16() {
     assert!(m.source.contains("linear_norm<DecBf16, LA_BA_ROWS, false>"));
     let tc: Vec<&str> = m.source.lines().filter(|l| l.contains("gemm_tc<")).collect();
     let has = |s: &str| tc.iter().any(|l| l.contains(s));
-    assert!(has("gemm_tc<34816, 5120, 64, 128, 2, 4, 64, 2, EPI_ACT, false, DecFp8, true, false>"), "{tc:#?}");
-    assert!(has("gemm_tc<248320, 5120, 64, 128, 2, 4, 32, 2, EPI_STORE, false, DecBf16, true, false>"));
+    assert!(has("gemm_tc<34816, 5120, 128, 128, 2, 4, 64, 2, EPI_ACT, false, DecFp8, true, false>"), "{tc:#?}");
+    assert!(has("gemm_tc<248320, 5120, 128, 128, 2, 4, 32, 2, EPI_STORE, false, DecBf16, true, false>"));
     assert!(has("gemm_tc<96, 5120, 64, 64, 2, 2, 32, 2, EPI_STORE, false, DecBf16, true, false>"));
     assert!(m.kernels.contains(&"lin_ba_mma"));
 }
@@ -96,7 +96,7 @@ fn head_quant_picks_the_head_kernels_and_bf16_stays_the_master_source() {
     fp8.head_quant = Some(Quant::Fp8Channel);
     let m = Module::generate(&fp8, 4096).unwrap();
     assert!(m.source.contains("linear_norm<DecFp8, 248320, false>"));
-    assert!(m.source.contains("gemm_tc<248320, 5120, 64, 128, 2, 4, 64, 2, EPI_STORE, false, DecFp8, true, false>"));
+    assert!(m.source.contains("gemm_tc<248320, 5120, 128, 128, 2, 4, 64, 2, EPI_STORE, false, DecFp8, true, false>"));
     let mut fp4 = plain.clone();
     fp4.head_quant = Some(Quant::Nvfp4G16);
     let m = Module::generate(&fp4, 4096).unwrap();
@@ -108,7 +108,7 @@ fn head_quant_picks_the_head_kernels_and_bf16_stays_the_master_source() {
             assert!(m.smem.contains_key(k), "{k}");
         }
     }
-    assert!(m.source.contains("gemm_tc<248320, 5120, 64, 128, 2, 4, 64, 3, EPI_STORE, false, DecFp4, true, false>"));
+    assert!(m.source.contains("gemm_tc<248320, 5120, 128, 128, 2, 4, 64, 2, EPI_STORE, false, DecFp4, true, false>"));
     assert!(m.source.contains("constexpr int HEAD_F4_ROWS = 2;"));
     let dense = spec("qwen3-0.6b.toml");
     let mut dense_fp4 = dense.clone();
