@@ -18,6 +18,14 @@ pub struct MediaLimits {
     pub max_video_secs: Option<f64>,
 }
 
+impl MediaLimits {
+    pub fn request_body_limit(&self) -> usize {
+        let images = self.max_images * self.max_image_bytes;
+        let videos = self.max_videos * self.max_video_bytes;
+        ((images + videos) / 3 * 4 + (1 << 20)).max(2 << 20)
+    }
+}
+
 impl Default for MediaLimits {
     fn default() -> Self {
         Self {
@@ -279,6 +287,13 @@ mod tests {
         assert_eq!(items[0].bytes.as_slice(), png);
         assert_eq!(a.bytes(), png);
         assert_eq!(content_with_attachments("hi", &[]), Value::String("hi".into()));
+    }
+
+    #[test]
+    fn the_body_limit_fits_the_configured_media_as_base64() {
+        let l = MediaLimits { max_images: 2, max_image_bytes: 3 << 20, max_videos: 0, ..Default::default() };
+        assert!(l.request_body_limit() >= 8 << 20);
+        assert!(MediaLimits::default().request_body_limit() > 200 << 20);
     }
 
     #[test]

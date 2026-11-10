@@ -57,8 +57,11 @@ impl View {
                 Ok(View::new(&m.name, spec, Source::GgufMetadata, 0, m.context_length.map(|c| c as usize)))
             }
             Format::Spec => {
-                let spec = Spec::load(&m.path).map_err(|e| format!("{e:#}"))?;
+                let mut spec = Spec::load(&m.path).map_err(|e| format!("{e:#}"))?;
                 let cfg = m.files.first().and_then(|f| f.parent()).map(|d| d.join("config.json"));
+                if let Some(text) = cfg.as_deref().and_then(|p| std::fs::read_to_string(p).ok()) {
+                    let _ = spec.complete_from_checkpoint_config(&text);
+                }
                 let (mtp, ctx) = cfg.as_deref().map(config_extras).unwrap_or((0, None));
                 let view = View::new(&m.name, spec, Source::SpecToml, mtp, ctx.or(m.context_length.map(|c| c as usize)));
                 Ok(with_header(view, m))
@@ -68,6 +71,7 @@ impl View {
                 let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
                 let mut spec = Spec::describe_hf_config(&text).map_err(|e| format!("{e:#}"))?;
                 spec.name = m.name.clone();
+                spec.vision = specrt::vision::Vision::from_hf_config(&text).ok().flatten();
                 let (mtp, ctx) = config_extras(&path);
                 let mut view = View::new(&m.name, spec, Source::HfConfig, mtp, ctx.or(m.context_length.map(|c| c as usize)));
                 view.unread = specrt::spec::unread_hf_keys(&text);
@@ -238,6 +242,16 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
     });
     let layer_for_block = layer.unwrap_or_else(|| view.anatomy.layers.iter().find(|l| l.kind == *kind).map_or(0, |l| l.index));
     block_section(ui, view, *kind, *layer, layer_for_block, diagram);
+    for v in &views {
+        if let Some(vision) = &v.spec.vision {
+            section(ui, "vision tower", &tower_note(&vision.config), |ui| {
+                if views.len() > 1 {
+                    Line::new().legend(&v.name).show(ui);
+                }
+                tower(ui, &vision.config);
+            });
+        }
+    }
     let anatomies: Vec<&specrt::anatomy::ModelAnatomy> = views.iter().map(|v| &v.anatomy).collect();
     let totals = breakdown::max_totals(anatomies.iter().copied());
     section(ui, "parameters and memory", "bars share one scale", |ui| {
@@ -267,6 +281,43 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
             table::draw(ui, v, bandwidth);
         }
     });
+}
+
+fn tower_note(c: &specrt::vision::VisionConfig) -> String {
+    format!(
+        "{} blocks, hidden {}, {} heads, patch {} merged {}x{} to {}, {} params",
+        c.depth,
+        c.hidden_size,
+        c.num_heads,
+        c.patch_size,
+        c.spatial_merge_size,
+        c.spatial_merge_size,
+        c.out_hidden_size,
+        human_count(specrt::vision_encoder::tower_params(c))
+    )
+}
+
+fn human_count(n: u64) -> String {
+    match n {
+        1_000_000_000.. => format!("{:.2} B", n as f64 / 1e9),
+        1_000_000.. => format!("{:.1} M", n as f64 / 1e6),
+        1_000.. => format!("{:.1} K", n as f64 / 1e3),
+        _ => n.to_string(),
+    }
+}
+
+fn tower(ui: &mut egui::Ui, c: &specrt::vision::VisionConfig) {
+    let parts = specrt::vision_encoder::tower_parts(c);
+    for p in &parts {
+        let times = if p.count > 1 { format!("{} x ", p.count) } else { String::new() };
+        Line::new().legend(&p.name).gap(10.0).value(format!("{times}{}", human_count(p.params))).show(ui);
+    }
+    let ops = specrt::vision_encoder::plan(c);
+    let labels: Vec<String> = ops.iter().take(9).map(|o| o.label()).collect();
+    Line::new().legend("op plan").value(format!("{} ops: {} ...", ops.len(), labels.join(", "))).size(10.5).elided(ui);
+    if !c.deepstack_visual_indexes.is_empty() {
+        Line::new().legend("deepstack after blocks").value(format!("{:?}", c.deepstack_visual_indexes)).show(ui);
+    }
 }
 
 fn layers_note(a: &ModelAnatomy, window: Option<usize>) -> String {
@@ -314,6 +365,7 @@ mod tests {
             files: vec![],
             support: vec![],
             origin: None,
+            vision: false,
         }
     }
 
@@ -341,6 +393,21 @@ mod tests {
             hubs.push(home.join("spark/huggingface/hub"));
         }
         hubs.iter().flat_map(|h| scan_hub(h)).filter(|m| m.format == Format::Safetensors).collect()
+    }
+
+    #[test]
+    fn a_vision_checkpoint_shows_its_tower_and_a_text_model_does_not() {
+        let dir = std::env::temp_dir().join(format!("ib-detail-vision-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(fixtures().join("qwen3.8-27b.multimodal.json"), dir.join("config.json")).unwrap();
+        let view = View::load(&local("qwen3.8-27b", &dir)).unwrap();
+        let vision = view.spec.vision.as_ref().expect("vision_config is read");
+        assert_eq!(vision.config.depth, 27);
+        assert!(tower_note(&vision.config).contains("27 blocks"));
+        let text = std::env::temp_dir().join(format!("ib-detail-text-{}", std::process::id()));
+        std::fs::create_dir_all(&text).unwrap();
+        std::fs::copy(fixtures().join("qwen3-0.6b.config.json"), text.join("config.json")).unwrap();
+        assert!(View::load(&local("qwen3-0.6b", &text)).unwrap().spec.vision.is_none());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use specrt::vision::*;
+use specrt::vision_encoder::{plan, tower_params, tower_parts, VisionOp};
 use std::path::{Path, PathBuf};
 
 fn dir() -> PathBuf {
@@ -185,4 +186,40 @@ fn video_frames_each_advance_the_text_position_by_their_grid_side() {
     assert_eq!(plan.positions[10][..3], [8, 8, 8]);
     assert_eq!(plan.positions[14][..3], [10, 10, 10]);
         assert_eq!(plan.delta, plan.positions.last().unwrap()[0] + 1 - ids.len() as i32);
+}
+
+#[test]
+fn the_tower_parameter_count_matches_the_checkpoint_tensors() {
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.multimodal.json")).unwrap();
+    let v = Vision::from_hf_config(&json).unwrap().unwrap();
+    let repo = "Qwen/Qwen3.8-27B-FP8";
+    if let Ok(dir) = specrt::weights::find_checkpoint(repo) {
+        let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("model.safetensors.index.json")).unwrap()).unwrap();
+        let file = dir.join("outside.safetensors");
+        let bytes = std::fs::read(&file).unwrap();
+        let n = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&bytes[8..8 + n]).unwrap();
+        let mut total = 0u64;
+        for (name, info) in header.as_object().unwrap() {
+            if name.starts_with("model.visual.") && index["weight_map"].get(name).is_some() {
+                total += info["shape"].as_array().unwrap().iter().map(|d| d.as_u64().unwrap()).product::<u64>();
+            }
+        }
+        assert_eq!(tower_params(&v.config), total);
+    }
+    assert_eq!(tower_parts(&v.config).iter().find(|p| p.name == "attention (qkv, proj)").unwrap().count, 27);
+}
+
+#[test]
+fn the_op_plan_has_a_merger_and_a_deepstack_merger_per_configured_block() {
+    let mut cfg = Vision::from_hf_config(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.multimodal.json")).unwrap()).unwrap().unwrap().config;
+    let ops = plan(&cfg);
+    assert_eq!(ops.first(), Some(&VisionOp::PatchEmbed));
+    assert_eq!(ops.last(), Some(&VisionOp::Merger));
+    assert_eq!(ops.len(), 2 + 8 * 27);
+    cfg.deepstack_visual_indexes = vec![5, 11];
+    let ops = plan(&cfg);
+    let deep: Vec<_> = ops.iter().filter(|o| matches!(o, VisionOp::DeepstackMerger { .. })).collect();
+    assert_eq!(deep.len(), 2);
+    assert_eq!(ops[ops.iter().position(|o| *o == VisionOp::DeepstackMerger { index: 0, after_block: 5 }).unwrap() - 1], VisionOp::MlpDown { block: 5 });
 }

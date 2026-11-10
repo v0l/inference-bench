@@ -396,3 +396,35 @@ impl VisionEncoder {
         Ok(VisionOutput { embeds, deepstack, tokens: tokens / (merge * merge) })
     }
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TowerPart {
+    pub name: String,
+    pub count: usize,
+    pub params: u64,
+}
+
+pub fn tower_parts(cfg: &VisionConfig) -> Vec<TowerPart> {
+    let h = cfg.hidden_size as u64;
+    let i = cfg.intermediate_size as u64;
+    let merged = h * (cfg.spatial_merge_size * cfg.spatial_merge_size) as u64;
+    let channels = cfg.in_channels.unwrap_or(3) as u64;
+    let patch = channels * (cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size) as u64;
+    let merger = merged * merged + merged + merged * cfg.out_hidden_size as u64 + cfg.out_hidden_size as u64 + 2 * h;
+    let mut parts = vec![
+        TowerPart { name: "patch embed".into(), count: 1, params: h * patch + h },
+        TowerPart { name: "position embeddings".into(), count: 1, params: cfg.num_position_embeddings as u64 * h },
+        TowerPart { name: "attention (qkv, proj)".into(), count: cfg.depth, params: 3 * h * h + 3 * h + h * h + h },
+        TowerPart { name: "mlp (up, down)".into(), count: cfg.depth, params: 2 * h * i + i + h },
+        TowerPart { name: "layernorms".into(), count: cfg.depth, params: 4 * h },
+        TowerPart { name: "patch merger".into(), count: 1, params: merger },
+    ];
+    if !cfg.deepstack_visual_indexes.is_empty() {
+        parts.push(TowerPart { name: "deepstack mergers".into(), count: cfg.deepstack_visual_indexes.len(), params: merger - 2 * h + 2 * merged });
+    }
+    parts
+}
+
+pub fn tower_params(cfg: &VisionConfig) -> u64 {
+    tower_parts(cfg).iter().map(|p| p.params * p.count as u64).sum()
+}

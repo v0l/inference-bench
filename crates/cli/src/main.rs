@@ -172,6 +172,8 @@ enum Cmd {
         output: String,
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        #[arg(long, help = "Send chat requests with media instead of text prompts: images:N or video:FILE")]
+        media: Option<String>,
         #[arg(long, help = "Print the report as JSON")]
         json: bool,
     },
@@ -368,8 +370,9 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Results { json } => print_results(&store::load_all(&data), *json)?,
-        Cmd::Loadtest { url, model, api_key, requests, rate, clients, mix, max_prompt, output, seed, json } => {
-            use inference_bench_core::loadtest::{LengthMix, LoadConfig, run};
+        Cmd::Loadtest { url, model, api_key, requests, rate, clients, mix, max_prompt, output, seed, media, json } => {
+            use inference_bench_core::loadtest::{LengthMix, LoadConfig, MediaLoad, run};
+            let media = media.as_deref().map(MediaLoad::parse).transpose().map_err(anyhow::Error::msg)?;
             let mut mix = LengthMix::parse(mix).map_err(anyhow::Error::msg)?;
             if let Some(m) = max_prompt {
                 mix = mix.capped(*m);
@@ -389,6 +392,7 @@ fn main() -> Result<()> {
                 output,
                 seed: *seed,
                 sample_every: std::time::Duration::from_secs(1),
+                media,
             };
             let quiet = *json;
             let report = run(&cfg, &mut |i, o| {

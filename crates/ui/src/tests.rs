@@ -37,6 +37,7 @@ fn model(name: &str, specrt: bool, reason: &str) -> LocalModel {
             Support { backend: "vllm", supported: true, reason: "registered".into() },
         ],
         origin: None,
+        vision: false,
     }
 }
 
@@ -963,4 +964,27 @@ fn screenshot_chat_attachment_thumbnail() {
     h.state_mut().chat.attach_bytes("gradient.png", &png);
     h.run();
     h.render().unwrap().save(out.join("chat-attachment.png")).unwrap();
+}
+
+#[test]
+fn the_models_page_says_vision_yes_only_for_models_with_a_vision_config() {
+    let mut h = harness("vision-chip", Tab::Models);
+    h.state_mut().library[0].vision = true;
+    h.run();
+    h.get_by_label("vision: yes");
+    assert_eq!(h.query_all_by_label("vision: no").count(), 1);
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshot_vision_tower_in_the_model_detail() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let json = std::fs::read_to_string(fixtures().join("qwen3.8-27b.multimodal.json")).unwrap();
+    let mut spec = specrt::spec::Spec::from_hf_config(&json).unwrap();
+    spec.name = "qwen3.8-27b".into();
+    let view = detail::View::new("qwen3.8-27b", spec, detail::Source::HfConfig, 1, None);
+    let mut h = detail_harness("shot-vision", egui::vec2(1400.0, 3200.0), view, None);
+    h.run();
+    h.render().unwrap().save(out.join("detail-vision-tower.png")).unwrap();
 }

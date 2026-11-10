@@ -98,6 +98,23 @@ pub struct LoadConfig {
     pub output: (usize, usize),
     pub seed: u64,
     pub sample_every: Duration,
+    pub media: Option<MediaLoad>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MediaLoad {
+    Images(usize),
+    Video(std::path::PathBuf),
+}
+
+impl MediaLoad {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.split_once(':') {
+            Some(("images" | "image", n)) => n.parse().ok().filter(|&n| n >= 1).map(MediaLoad::Images).ok_or_else(|| "images:N wants N >= 1".to_string()),
+            Some(("video", path)) if !path.is_empty() => Ok(MediaLoad::Video(path.into())),
+            _ => Err("--media wants images:N or video:FILE".into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +161,7 @@ pub fn prompt(words: usize, salt: u64) -> String {
 pub struct Outcome {
     pub planned_prompt: usize,
     pub prompt_tokens: u64,
+    pub vision_tokens: u64,
     pub completion_tokens: u64,
     pub queued_secs: f64,
     pub ttft_secs: f64,
@@ -152,9 +170,47 @@ pub struct Outcome {
     pub error: Option<String>,
 }
 
+pub fn noise_png(salt: u64, side: u32) -> Vec<u8> {
+    let mut rng = Rng::new(salt.wrapping_add(7));
+    let mut img = image::RgbImage::new(side, side);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let n = (rng.unit() * 40.0) as u8;
+        *p = image::Rgb([((x * 255 / side) as u8).saturating_add(n), ((y * 255 / side) as u8).saturating_add(n), 128u8.saturating_add(n)]);
+    }
+    let mut out = Vec::new();
+    let _ = image::DynamicImage::ImageRgb8(img).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png);
+    out
+}
+
+fn media_body(cfg: &LoadConfig, load: &MediaLoad, p: &Planned, salt: u64) -> Value {
+    use base64::Engine;
+    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
+    let mut parts: Vec<Value> = match load {
+        MediaLoad::Images(n) => (0..*n)
+            .map(|i| json!({"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{}", b64(&noise_png(salt.wrapping_mul(31).wrapping_add(i as u64), 448)))}}))
+            .collect(),
+        MediaLoad::Video(path) => {
+            let bytes = std::fs::read(path).unwrap_or_default();
+            vec![json!({"type": "video_url", "video_url": {"url": format!("data:video/mp4;base64,{}", b64(&bytes))}})]
+        }
+    };
+    parts.push(json!({"type": "text", "text": "Describe this in detail."}));
+    json!({
+        "model": cfg.model,
+        "messages": [{"role": "user", "content": parts}],
+        "max_tokens": p.max_tokens,
+        "temperature": 0,
+        "stream": true,
+        "ignore_eos": true,
+        "stream_options": {"include_usage": true},
+        "chat_template_kwargs": {"enable_thinking": false},
+    })
+}
+
 fn one(agent: &ureq::Agent, cfg: &LoadConfig, p: &Planned, salt: u64) -> Outcome {
     let mut out = Outcome { planned_prompt: p.prompt_words, ..Outcome::default() };
-    let body = json!({
+    let chat = cfg.media.is_some();
+    let body = if let Some(load) = &cfg.media { media_body(cfg, load, p, salt) } else { json!({
         "model": cfg.model,
         "prompt": prompt(p.prompt_words, salt),
         "max_tokens": p.max_tokens,
@@ -162,9 +218,10 @@ fn one(agent: &ureq::Agent, cfg: &LoadConfig, p: &Planned, salt: u64) -> Outcome
         "stream": true,
         "ignore_eos": true,
         "stream_options": {"include_usage": true},
-    });
+    }) };
     let started = Instant::now();
-    let mut req = agent.post(format!("{}/v1/completions", cfg.url.trim_end_matches('/')));
+    let path = if chat { "chat/completions" } else { "completions" };
+    let mut req = agent.post(format!("{}/v1/{path}", cfg.url.trim_end_matches('/')));
     if let Some(k) = &cfg.api_key {
         req = req.header("Authorization", &format!("Bearer {k}"));
     }
@@ -207,7 +264,13 @@ fn one(agent: &ureq::Agent, cfg: &LoadConfig, p: &Planned, salt: u64) -> Outcome
             out.prompt_tokens = u["prompt_tokens"].as_u64().unwrap_or(0);
             out.completion_tokens = u["completion_tokens"].as_u64().unwrap_or(0);
         }
-        let text = event["choices"][0]["text"].as_str().unwrap_or("");
+        if let Some(v) = event["usage"]["prompt_tokens_details"]["vision_tokens"].as_u64().or_else(|| {
+            let m = &event["usage"]["prompt_tokens_details"]["multimodal_tokens"];
+            m.as_object().map(|o| o.values().filter_map(Value::as_u64).sum())
+        }) {
+            out.vision_tokens = v;
+        }
+        let text = event["choices"][0]["text"].as_str().or_else(|| event["choices"][0]["delta"]["content"].as_str()).unwrap_or("");
         if text.is_empty() {
             continue;
         }
@@ -228,6 +291,7 @@ pub struct Report {
     pub failed: usize,
     pub wall_secs: f64,
     pub prompt_tokens: u64,
+    pub vision_tokens: u64,
     pub completion_tokens: u64,
     pub decode_tok_s: f64,
     pub prefill_tok_s: f64,
@@ -273,6 +337,7 @@ pub fn summarise(outcomes: &[Outcome], wall: f64, samples: Vec<Sample>) -> Repor
         failed: outcomes.len() - ok.len(),
         wall_secs: wall,
         prompt_tokens: prompt,
+        vision_tokens: ok.iter().map(|o| o.vision_tokens).sum(),
         completion_tokens: completion,
         decode_tok_s: if wall > 0.0 { completion as f64 / wall } else { 0.0 },
         prefill_tok_s: if wall > 0.0 { prompt as f64 / wall } else { 0.0 },
@@ -434,6 +499,33 @@ mod tests {
     }
 
     #[test]
+    fn media_workloads_parse_and_build_chat_bodies_with_the_right_parts() {
+        assert_eq!(MediaLoad::parse("images:3").unwrap(), MediaLoad::Images(3));
+        assert_eq!(MediaLoad::parse("video:/tmp/a.mp4").unwrap(), MediaLoad::Video("/tmp/a.mp4".into()));
+        assert!(MediaLoad::parse("images:0").is_err() && MediaLoad::parse("gif").is_err());
+        let cfg = LoadConfig {
+            url: String::new(),
+            model: "m".into(),
+            api_key: None,
+            requests: 1,
+            rate: 0.0,
+            clients: 1,
+            mix: LengthMix::journal(),
+            output: (8, 8),
+            seed: 1,
+            sample_every: Duration::from_secs(1),
+            media: Some(MediaLoad::Images(2)),
+        };
+        let p = Planned { at: Duration::ZERO, prompt_words: 0, max_tokens: 8 };
+        let a = media_body(&cfg, cfg.media.as_ref().unwrap(), &p, 1);
+        let parts = a["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(parts.iter().filter(|p| p["type"] == "image_url").count(), 2);
+        assert_eq!(parts.last().unwrap()["type"], "text");
+        let b = media_body(&cfg, cfg.media.as_ref().unwrap(), &p, 2);
+        assert_ne!(a["messages"][0]["content"][0], b["messages"][0]["content"][0]);
+    }
+
+    #[test]
     fn open_loop_arrivals_follow_the_rate() {
         let cfg = LoadConfig {
             url: String::new(),
@@ -446,6 +538,7 @@ mod tests {
             output: (128, 1024),
             seed: 1,
             sample_every: Duration::from_secs(1),
+            media: None,
         };
         let p = plan(&cfg);
         let span = p.last().unwrap().at.as_secs_f64();

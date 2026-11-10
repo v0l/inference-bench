@@ -56,6 +56,11 @@ pub struct LocalModel {
     pub files: Vec<PathBuf>,
     pub support: Vec<Support>,
     pub origin: Option<SpecOrigin>,
+    pub vision: bool,
+}
+
+pub fn config_has_vision(config: &Value) -> bool {
+    config.get("vision_config").is_some_and(Value::is_object) && config.get("language_model_only").and_then(Value::as_bool) != Some(true)
 }
 
 impl LocalModel {
@@ -419,6 +424,7 @@ fn gguf_models(dir: &Path, repo: &str, root: &Path, found: &mut Vec<LocalModel>)
             architecture: h.architecture,
             files: shards,
             origin: None,
+            vision: false,
         });
     }
 }
@@ -478,6 +484,7 @@ fn safetensors_model(dir: &Path, repo: &str, root: &Path) -> Option<LocalModel> 
         context_length: cfg["max_position_embeddings"].as_u64(),
         files,
         origin: None,
+        vision: config_has_vision(&config),
     })
 }
 
@@ -562,6 +569,7 @@ fn spec_model(listed: &specs::Listed, hub: &Path) -> LocalModel {
             Support::no("llama.cpp", "spec files are specrt only"),
             Support::no("vllm", "spec files are specrt only"),
         ],
+        vision: files.first().and_then(|f| f.parent()).and_then(|d| std::fs::read_to_string(d.join("config.json")).ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|c| config_has_vision(&c)),
         files,
         origin: Some(listed.origin.clone()),
     }

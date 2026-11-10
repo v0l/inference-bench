@@ -153,6 +153,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/admin/models/{id}/load", post(admin_load))
         .route("/admin/models/{id}/unload", post(admin_unload))
         .route("/admin/specs", get(admin_specs))
+        .layer(axum::extract::DefaultBodyLimit::max(state.config.media.request_body_limit()))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(middleware::from_fn_with_state(state.clone(), request_scope))
         .with_state(state.clone());

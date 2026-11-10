@@ -202,6 +202,10 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
                 for b in BACKENDS {
                     backend_chip(ui, &m, b);
                 }
+                let tint = if m.vision { OK } else { LEGEND };
+                let chip_text = if m.vision { "vision: yes" } else { "vision: no" };
+                let r = chip(ui, chip_text, tint, m.vision);
+                r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, chip_text));
             });
             if let Some(why) = m.support.iter().find(|s| !s.supported && s.backend == "specrt") {
                 Line::new().note(format!("specrt: {}", why.reason)).size(10.5).elided(ui);

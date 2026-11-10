@@ -128,3 +128,40 @@ Tests (`tests/vision_lm.rs`, ignored, need the 27B and the vLLM output of
   open, see the follow-up issue.
 - Greedy "what is in this image" on a drawn house with the FP8 spec: "a house in a field with a
   sun in the sky".
+
+## App (slice 5, done)
+
+- Chat: attach with the `attach` key (a file dialog through `rfd`), drag and drop onto the window,
+  or paste an image from the clipboard. Pending attachments show a thumbnail (videos show their
+  name) with a remove key; the key is disabled with a note on models without vision
+  (`Loaded.vision`, from the engine's `Capabilities::vision`). Turns keep their attachments as
+  base64 in the saved conversation and are sent as OpenAI `image_url` / `video_url` parts through
+  the same path the server uses (`Engine::chat_media`). Screenshot: `docs/gui/chat-attachment.png`.
+- Models page: a "vision: yes / no" chip from `vision_config` in the checkpoint config.
+- Model detail: a "vision tower" section (blocks, hidden, heads, merge, parameters per part, and the
+  op plan from `vision_encoder::plan`). The parameter count is asserted equal to the sum of the
+  checkpoint's `visual.*` tensors. Screenshot: `docs/gui/detail-vision-tower.png`.
+
+## Bench (slice 6, done)
+
+`inference-bench loadtest --media images:N|video:FILE` sends streaming chat requests with data URL
+media (noise images of 448x448 so every request is distinct, or the given video) to any
+OpenAI-compatible server, and reports TTFT, inter token gaps and vision tokens
+(`prompt_tokens_details.vision_tokens` from specrt, `multimodal_tokens` from vLLM).
+`prefixbench <spec> media on 64 2 [video.mp4]` runs the scheduler directly: cold and warm passes
+per case, so the warm pass shows the prefix-cache hit on the same media.
+
+Measured on the 27B NVFP4 spec, 3 requests per case, one client, 64 output tokens, one at a time,
+vLLM on port 8001 (read only) against specrt behind `inference-bench serve`:
+
+| workload | vision tokens/req | vLLM TTFT p50 | specrt TTFT p50 |
+|---|---|---|---|
+| 1 image 448x448 | 196 | 0.106 s | 0.469 s |
+| 3 images | 588 | 0.156 s | 1.046 s |
+| 10 s video, 10 fps 320x240 | 800 (specrt) / 880 (vLLM) | 0.165 s | 1.221 s |
+
+specrt TTFT includes the preprocessing and the vision encoder (a first, unoptimised f32 kernel set
+with a naive GEMM), vLLM's includes its encoder cache; the encoder is the target for a later
+speed pass. `prefixbench` (scheduler only, no HTTP): image_1 cold 815 ms, warm 436 ms with 208 of
+211 tokens cached; images_3 2306 ms and 1153 ms; 3 s video 837 ms and 287 ms.
+The frame count differs from vLLM on the 10 s clip (see the follow-up issue).

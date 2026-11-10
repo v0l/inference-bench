@@ -505,3 +505,16 @@ fn usage_counts_the_vision_tokens_of_media_and_text_requests_stay_unchanged() {
     assert!(v["usage"]["prompt_tokens_details"].get("vision_tokens").is_none());
     rig.stop();
 }
+
+#[test]
+fn a_request_body_above_the_old_two_megabyte_default_is_accepted_when_media_limits_allow_it() {
+    let rig = start(config("[[models]]\nid='m'"), Shape { vision: true, ..Shape::default() });
+    let big = format!("data:image/png;base64,{}", "A".repeat(3 << 20));
+    let (status, body, _) = rig.post("/v1/chat/completions", None, image_chat(&big));
+    assert_ne!(status, 413, "{body}");
+    rig.stop();
+    let rig = start(config("[[models]]\nid='m'\n[media]\nmax_images = 1\nmax_videos = 0\nmax_image_bytes = 1000"), Shape { vision: true, ..Shape::default() });
+    let (status, _, _) = rig.post("/v1/chat/completions", None, image_chat(&big));
+    assert_eq!(status, 413);
+    rig.stop();
+}

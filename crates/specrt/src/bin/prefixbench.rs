@@ -45,10 +45,14 @@ impl Bench {
     }
 
     fn run(&mut self, prompts: Vec<Vec<u32>>, new: usize) -> Result<Vec<Reply>> {
+        self.run_media(prompts.into_iter().map(|p| (p, Vec::new())).collect(), new)
+    }
+
+    fn run_media(&mut self, prompts: Vec<(Vec<u32>, Vec<specrt::sched::MediaInput>)>, new: usize) -> Result<Vec<Reply>> {
         let started = Instant::now();
         let ids: Vec<u64> = prompts
             .into_iter()
-            .map(|prompt| self.sched.submit(Request { prompt, max_tokens: new, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() }))
+            .map(|(prompt, media)| self.sched.submit(Request { prompt, max_tokens: new, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media }))
             .collect::<Result<_>>()?;
         let mut replies: HashMap<u64, Reply> = ids.iter().map(|&id| (id, Reply { ttft: 0.0, total: 0.0, cached: 0, out: Vec::new() })).collect();
         while !self.sched.idle() {
@@ -140,6 +144,57 @@ fn clients(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> 
     Ok(())
 }
 
+fn noise_png(salt: u32, side: u32) -> Vec<u8> {
+    let mut img = image::RgbImage::new(side, side);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let n = ((x * 7 + y * 13 + salt * 31) % 40) as u8;
+        *p = image::Rgb([((x * 255 / side) as u8).saturating_add(n), ((y * 255 / side) as u8).saturating_add(n), 128u8.saturating_add(n)]);
+    }
+    let mut out = Vec::new();
+    let _ = image::DynamicImage::ImageRgb8(img).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png);
+    out
+}
+
+fn media(spec: &Spec, cache: bool, interval: usize, kv_gb: f64, video: Option<&Path>) -> Result<()> {
+    use specrt::vision::{MediaItem, MediaKind};
+    let new = 32usize;
+    let mut spec = spec.clone();
+    specrt::engine::complete_spec(&mut spec)?;
+    let mut b = Bench::new(&spec, cache, interval, 16384, 2, kv_gb)?;
+    let assets = specrt::engine::media_prompt_assets(&spec)?;
+    b.run(vec![tokens(64, 99)], 4)?;
+    let mut cases: Vec<(String, Vec<MediaItem>)> = vec![
+        ("image_1".into(), vec![MediaItem::new(MediaKind::Image, noise_png(1, 448))]),
+        ("images_3".into(), (0..3).map(|i| MediaItem::new(MediaKind::Image, noise_png(10 + i, 448))).collect()),
+    ];
+    if let Some(v) = video {
+        cases.push(("video".into(), vec![MediaItem::new(MediaKind::Video, std::fs::read(v)?)]));
+    }
+    for (name, items) in cases {
+        let build = || -> Result<(Vec<u32>, Vec<specrt::sched::MediaInput>, usize)> {
+            let part = |k: MediaKind| if k == MediaKind::Image { "<|vision_start|><|image_pad|><|vision_end|>" } else { "<|vision_start|><|video_pad|><|vision_end|>" };
+            let slots: String = items.iter().map(|i| part(i.kind)).collect();
+            assets.encode(&format!("<|im_start|>user\n{slots}Describe this in detail.<|im_end|>\n<|im_start|>assistant\n"), &items)
+        };
+        for pass in ["cold", "warm"] {
+            let (ids, media, vision) = build()?;
+            let encode_started = Instant::now();
+            let r = b.run_media(vec![(ids.clone(), media)], new)?.remove(0);
+            println!(
+                "SUMMARY media cache={cache} model={} case={name} pass={pass} prompt={} vision={vision} cached={} ttft_ms={:.1} total_ms={:.1} decode_tok_s={:.1} wall_ms={:.1}",
+                spec.name,
+                ids.len(),
+                r.cached,
+                r.ttft * 1e3,
+                r.total * 1e3,
+                (r.out.len().saturating_sub(1)) as f64 / (r.total - r.ttft).max(1e-9),
+                encode_started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+    Ok(())
+}
+
 fn itl(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> {
     let (long, newcomers, new) = (3072usize, 6usize, 400usize);
     let max_ctx = long + new + 64;
@@ -185,7 +240,7 @@ fn itl(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: prefixbench <spec.toml | checkpoint dir> <turns|clients|itl> <on|off> [snapshot_interval] [kv_gb] [sync]";
+    let usage = "usage: prefixbench <spec.toml | checkpoint dir> <turns|clients|itl|media> <on|off> [snapshot_interval] [kv_gb] [sync|video.mp4]";
     let spec = load_spec(&PathBuf::from(args.first().context(usage)?))?;
     let mode = args.get(1).context(usage)?.as_str();
     let cache = args.get(2).context(usage)? == "on";
@@ -195,6 +250,7 @@ fn main() -> Result<()> {
     match mode {
         "itl" => itl(&spec, cache, interval, kv_gb),
         "turns" => turns(&spec, cache, interval, kv_gb),
+        "media" => media(&spec, cache, interval, kv_gb, args.get(5).map(PathBuf::from).as_deref()),
         "clients" => clients(&spec, cache, interval, kv_gb),
         _ => anyhow::bail!(usage),
     }

@@ -3119,6 +3119,7 @@ dependencies = [
  "clap",
  "dirs",
  "flate2",
+ "image",
  "inference-bench-specrt",
  "serde",
  "serde_json",
