@@ -1,4 +1,5 @@
 use crate::codegen::render;
+use crate::plan::{Op, Phase, Plan, Weight};
 use crate::spec::{ActQuant, Quant, RopeScalingKind, Spec};
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -27,6 +28,28 @@ const DECODE: &str = include_str!("../templates/wgsl/decode.wgsl");
 
 fn float(v: f64) -> String {
     format!("{v:e}")
+}
+
+pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static str>> {
+    Ok(match op {
+        Op::Embed => vec!["embed"],
+        Op::Norm { .. } => vec!["rmsnorm"],
+        Op::Linear { weight, .. } => {
+            let mut k = vec![if tokens == 1 { "linear" } else { "linear_t8" }];
+            if *weight == Weight::Qkv && spec.attention.qkv_bias {
+                k.push("bias");
+            }
+            k
+        }
+        Op::KvRope | Op::QkRope => vec!["rope"],
+        Op::Flash | Op::FlashLegacy | Op::DecodeAttention => vec!["attention"],
+        Op::Swiglu => vec!["swiglu"],
+        Op::GdnPrefill | Op::GdnDecode => anyhow::bail!("delta-net is not yet on wgpu"),
+    })
+}
+
+pub fn plan(spec: &Spec, phase: Phase) -> Plan {
+    Plan::build(spec, phase, false)
 }
 
 pub fn unsupported(spec: &Spec) -> Option<String> {

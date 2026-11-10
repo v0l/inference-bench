@@ -1,6 +1,7 @@
 use super::{BatchBuffers, DeviceAttn, DeviceLayer, DeviceMatrix, DeviceMixer, GemmOut, Planes, Runtime, grid};
+use crate::executor::PlanBackend;
 use crate::plan::{Buf, NormKind, Op, Phase, Plan, Weight};
-use crate::spec::Spec;
+use crate::spec::{Block, Spec};
 use anyhow::Result;
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use std::ops::Range;
@@ -27,15 +28,22 @@ pub(super) struct Run<'a> {
     pub bb: Option<&'a BatchBuffers>,
 }
 
-impl Runtime {
-    pub(super) fn run_ops(&self, ops: &[Op], layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
-        for op in ops {
-            self.run_op(op, layer, run)?;
-        }
-        Ok(())
+impl PlanBackend<Run<'_>> for Runtime {
+    fn layers(&self) -> usize {
+        self.layers.len()
     }
 
-    fn run_op(&self, op: &Op, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+    fn block(&self, layer: usize) -> Block {
+        self.spec.block(layer)
+    }
+
+    fn run_op(&self, op: &Op, layer: Option<usize>, run: &Run<'_>) -> Result<()> {
+        self.run_one(op, layer.map(|i| &self.layers[i]), run)
+    }
+}
+
+impl Runtime {
+    fn run_one(&self, op: &Op, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
         let n = run.n;
         match *op {
             Op::Embed => self.embed_rows(run),

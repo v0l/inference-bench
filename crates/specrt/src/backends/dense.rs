@@ -1,10 +1,14 @@
 use super::Backend;
 use crate::gguf::DeviceRows;
 use crate::runtime::{Generation, Sampling};
-use crate::spec::Spec;
+use crate::executor::PlanBackend;
+use crate::plan::{Buf, NormKind, Op, Phase, Plan, Weight};
+use crate::spec::{Block, Spec};
 use crate::weights::{Checkpoint, Matrix, Mixer};
 use crate::wgsl::{self, LINEAR_TOKENS, ROW_SPAN};
 use anyhow::{Context, Result, bail, ensure};
+use std::cell::RefCell;
+use std::ops::Range;
 use std::time::Instant;
 
 const PREFILL_CHUNK: usize = 64;
@@ -52,6 +56,8 @@ struct Model<B: Backend> {
     head: WMat<B>,
     scratch: Scratch<B>,
     weight_bytes: u64,
+    prefill: Plan,
+    decode: Plan,
 }
 
 pub struct Dense<B: Backend> {
@@ -93,6 +99,104 @@ fn upload_floats<B: Backend>(be: &B, v: &[f32]) -> Result<B::Buffer> {
     let b = be.alloc(v.len() as u64 * 4)?;
     be.upload(&b, 0, &floats(v));
     Ok(b)
+}
+
+struct Step {
+    pos0: usize,
+    rows: usize,
+    head: Range<usize>,
+}
+
+struct Exec<'a, B: Backend> {
+    be: RefCell<&'a mut B>,
+    m: &'a Model<B>,
+}
+
+impl<B: Backend> Exec<'_, B> {
+    fn buf(&self, b: Buf) -> &B::Buffer {
+        let s = &self.m.scratch;
+        match b {
+            Buf::X => &s.x,
+            Buf::Xn => &s.xn,
+            Buf::Qkv => &s.qkv,
+            Buf::Attn => &s.attn,
+            Buf::GateUp => &s.gate_up,
+            Buf::Act => &s.act,
+            Buf::Logits => &s.logits,
+            other => unreachable!("{} is not on wgpu", other.label()),
+        }
+    }
+
+    fn weight<'a>(&'a self, w: Weight, l: Option<&'a LayerBuffers<B>>) -> &'a WMat<B> {
+        let l = || l.expect("layer weights need a layer");
+        match w {
+            Weight::Qkv => &l().qkv,
+            Weight::O => &l().o,
+            Weight::GateUp => &l().gate_up,
+            Weight::Down => &l().down,
+            Weight::LmHead => &self.m.head,
+            other => unreachable!("{} is not on wgpu", other.name()),
+        }
+    }
+}
+
+impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
+    fn layers(&self) -> usize {
+        self.m.layers.len()
+    }
+
+    fn block(&self, layer: usize) -> Block {
+        self.m.spec.block(layer)
+    }
+
+    fn run_op(&self, op: &Op, layer: Option<usize>, run: &Step) -> Result<()> {
+        let m = self.m;
+        let spec = &m.spec;
+        let l = layer.map(|i| &m.layers[i]);
+        let mut be = self.be.borrow_mut();
+        let be = &mut **be;
+        let head = op_is_head(op);
+        let (rows, row0) = if head { (run.head.len(), run.head.start) } else { (run.rows, 0) };
+        let kernels = wgsl::kernels_for(op, spec, rows)?;
+        let r = rows as u32;
+        match *op {
+            Op::Embed => be.dispatch(kernels[0], &[&m.scratch.tokens, &m.embed.data, &m.embed.rows, &m.scratch.x], [0, run.pos0 as u32, 0, 0, 0, 0, 0, 0], [r, 1, 1]),
+            Op::Norm { which, into } => {
+                let w = match which {
+                    NormKind::Input => &l.expect("layer norm needs a layer").ln1,
+                    NormKind::PostAttention => &l.expect("layer norm needs a layer").ln2,
+                    NormKind::Final => &m.final_norm,
+                };
+                be.dispatch(kernels[0], &[&m.scratch.x, w, self.buf(into)], [row0 as u32, 0, 0, 0, 0, 0, 0, 0], [r, 1, 1])
+            }
+            Op::Linear { weight, input, output } => {
+                let w = self.weight(weight, l);
+                let grid = [w.nrows.min(ROW_SPAN), w.nrows.div_ceil(ROW_SPAN), rows.div_ceil(if rows == 1 { 1 } else { LINEAR_TOKENS }) as u32];
+                let accumulate = output == Buf::X;
+                be.dispatch(kernels[0], &[self.buf(input), self.buf(output), &w.data, &w.rows], [w.nrows, w.cols, r, 0, 0, accumulate as u32, 0, 0], grid)?;
+                if let (Weight::Qkv, Some(b)) = (weight, l.and_then(|l| l.bias.as_ref())) {
+                    let width = spec.qkv_rows();
+                    be.dispatch(kernels[1], &[self.buf(output), b], [r, width as u32, 0, 0, 0, 0, 0, 0], grid_1d(rows * width))?;
+                }
+                Ok(())
+            }
+            Op::KvRope | Op::QkRope => {
+                let l = l.expect("rope needs a layer");
+                let a = &spec.attention;
+                be.dispatch(kernels[0], &[&m.scratch.qkv, &l.q_norm, &l.k_norm, &l.k_cache, &l.v_cache], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [(a.heads + 2 * a.kv_heads) as u32, r, 1])
+            }
+            Op::Flash | Op::FlashLegacy | Op::DecodeAttention => {
+                let l = l.expect("attention needs a layer");
+                be.dispatch(kernels[0], &[&m.scratch.qkv, &l.k_cache, &l.v_cache, &m.scratch.attn], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r, 1])
+            }
+            Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),
+            Op::GdnPrefill | Op::GdnDecode => bail!("delta-net is not yet on wgpu"),
+        }
+    }
+}
+
+fn op_is_head(op: &Op) -> bool {
+    matches!(op, Op::Norm { which: NormKind::Final, .. } | Op::Linear { weight: Weight::LmHead, .. })
 }
 
 fn grid_1d(items: usize) -> [u32; 3] {
@@ -153,7 +257,7 @@ impl<B: Backend> Dense<B> {
             logits: be.alloc((rows * d.vocab * 4) as u64).context("logits buffer")?,
             tokens: be.alloc(((max_ctx + 2) * 4) as u64)?,
         };
-        Ok(Dense { be, m: Model { spec: spec.clone(), max_ctx, embed, layers, final_norm, head, scratch, weight_bytes } })
+        Ok(Dense { be, m: Model { spec: spec.clone(), max_ctx, embed, layers, final_norm, head, scratch, weight_bytes, prefill: wgsl::plan(spec, Phase::Prefill), decode: wgsl::plan(spec, Phase::Decode) } })
     }
 
     pub fn description(&self) -> String {
@@ -172,46 +276,14 @@ impl<B: Backend> Dense<B> {
         self.m.weight_bytes
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn linear(be: &mut B, w: &WMat<B>, x: &B::Buffer, y: &B::Buffer, tokens: usize, x_row0: usize, y_row0: usize, accumulate: bool) -> Result<()> {
-        let (name, tt) = if tokens == 1 { ("linear", 1) } else { ("linear_t8", LINEAR_TOKENS) };
-        let nrows = w.nrows;
-        let grid = [nrows.min(ROW_SPAN), nrows.div_ceil(ROW_SPAN), tokens.div_ceil(tt) as u32];
-        be.dispatch(name, &[x, y, &w.data, &w.rows], [nrows, w.cols, tokens as u32, x_row0 as u32, y_row0 as u32, accumulate as u32, 0, 0], grid)
-    }
-
-    fn norm(be: &mut B, w: &B::Buffer, x: &B::Buffer, out: &B::Buffer, src_row0: usize, dst_row0: usize, rows: usize) -> Result<()> {
-        be.dispatch("rmsnorm", &[x, w, out], [src_row0 as u32, dst_row0 as u32, 0, 0, 0, 0, 0, 0], [rows as u32, 1, 1])
-    }
-
-    fn forward_layers(be: &mut B, m: &Model<B>, pos0: usize, rows: usize) -> Result<()> {
-        let s = &m.scratch;
-        let spec = &m.spec;
-        let heads = (spec.attention.heads + 2 * spec.attention.kv_heads) as u32;
-        for l in &m.layers {
-            Self::norm(be, &l.ln1, &s.x, &s.xn, 0, 0, rows)?;
-            Self::linear(be, &l.qkv, &s.xn, &s.qkv, rows, 0, 0, false)?;
-            if let Some(b) = &l.bias {
-                be.dispatch("bias", &[&s.qkv, b], [rows as u32, spec.qkv_rows() as u32, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.qkv_rows()))?;
-            }
-            be.dispatch("rope", &[&s.qkv, &l.q_norm, &l.k_norm, &l.k_cache, &l.v_cache], [pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [heads, rows as u32, 1])?;
-            be.dispatch("attention", &[&s.qkv, &l.k_cache, &l.v_cache, &s.attn], [pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, rows as u32, 1])?;
-            Self::linear(be, &l.o, &s.attn, &s.x, rows, 0, 0, true)?;
-            Self::norm(be, &l.ln2, &s.x, &s.xn, 0, 0, rows)?;
-            Self::linear(be, &l.gate_up, &s.xn, &s.gate_up, rows, 0, 0, false)?;
-            be.dispatch("swiglu", &[&s.gate_up, &s.act], [rows as u32, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate))?;
-            Self::linear(be, &l.down, &s.act, &s.x, rows, 0, 0, true)?;
-        }
-        Ok(())
-    }
-
     fn argmax(be: &mut B, m: &Model<B>, sampling: Sampling, step: usize, slot: usize) -> Result<()> {
         let inv = sampling.inverse_temperature().to_bits();
         be.dispatch("argmax", &[&m.scratch.logits, &m.scratch.tokens], [0, inv, sampling.seed, step as u32, slot as u32, 0, 0, 0], [1, 1, 1])
     }
 
-    fn embed(be: &mut B, m: &Model<B>, token0: usize, rows: usize) -> Result<()> {
-        be.dispatch("embed", &[&m.scratch.tokens, &m.embed.data, &m.embed.rows, &m.scratch.x], [0, token0 as u32, 0, 0, 0, 0, 0, 0], [rows as u32, 1, 1])
+    fn run(be: &mut B, m: &Model<B>, plan: &Plan, pos0: usize, rows: usize, head: Range<usize>) -> Result<()> {
+        let exec = Exec { be: RefCell::new(be), m };
+        crate::executor::run_plan(&exec, plan, &Step { pos0, rows, head }, &mut |_| Ok(()))
     }
 
     fn prefill(&mut self, prompt: &[u32], all_logits: bool, sampling: Sampling) -> Result<Vec<f32>> {
@@ -223,21 +295,17 @@ impl<B: Backend> Dense<B> {
         let mut c0 = 0;
         while c0 < n {
             let rows = PREFILL_CHUNK.min(n - c0);
-            Self::embed(be, m, c0, rows)?;
-            Self::forward_layers(be, m, c0, rows)?;
             let last = c0 + rows == n;
+            let head = if all_logits { 0..rows } else if last { rows - 1..rows } else { 0..0 };
+            Self::run(be, m, &m.prefill, c0, rows, head)?;
             if all_logits {
-                Self::norm(be, &m.final_norm, &m.scratch.x, &m.scratch.xn, 0, 0, rows)?;
-                Self::linear(be, &m.head, &m.scratch.xn, &m.scratch.logits, rows, 0, 0, false)?;
                 be.submit()?;
                 let bytes = be.download(&m.scratch.logits, 0, (rows * vocab * 4) as u64)?;
                 logits.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes"))));
-            } else if last {
-                Self::norm(be, &m.final_norm, &m.scratch.x, &m.scratch.xn, rows - 1, 0, 1)?;
-                Self::linear(be, &m.head, &m.scratch.xn, &m.scratch.logits, 1, 0, 0, false)?;
-                Self::argmax(be, m, sampling, 0, n)?;
-                be.submit()?;
             } else {
+                if last {
+                    Self::argmax(be, m, sampling, 0, n)?;
+                }
                 be.submit()?;
             }
             c0 += rows;
@@ -246,10 +314,7 @@ impl<B: Backend> Dense<B> {
     }
 
     fn decode_step(be: &mut B, m: &Model<B>, pos: usize, sampling: Sampling) -> Result<()> {
-        Self::embed(be, m, pos, 1)?;
-        Self::forward_layers(be, m, pos, 1)?;
-        Self::norm(be, &m.final_norm, &m.scratch.x, &m.scratch.xn, 0, 0, 1)?;
-        Self::linear(be, &m.head, &m.scratch.xn, &m.scratch.logits, 1, 0, 0, false)?;
+        Self::run(be, m, &m.decode, pos, 1, 0..1)?;
         Self::argmax(be, m, sampling, pos, pos + 1)
     }
 

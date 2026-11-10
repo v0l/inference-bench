@@ -1461,16 +1461,7 @@ impl Runtime {
         let out = all_logits.unwrap_or(&self.buf.logits);
         let rows = if all_logits.is_some() { 0..n } else { n - 1..n };
         let run = exec::Run { n, tokens: &self.pre.tokens, logits: out, rows, bb: None };
-        self.run_ops(&plan.head, None, &run)?;
-        for (i, layer) in self.layers.iter().enumerate() {
-            let ops = match &layer.mixer {
-                DeviceMixer::Linear(_) => &plan.linear,
-                DeviceMixer::Attention(_) => &plan.attention,
-            };
-            self.run_ops(ops, Some(layer), &run)?;
-            self.trace_layer(trace, i, n)?;
-        }
-        self.run_ops(&plan.tail, None, &run)
+        crate::executor::run_plan(self, plan, &run, &mut |i| self.trace_layer(trace, i, n))
     }
 
     fn prefill(&mut self, tokens: &[u32], all_logits: bool) -> Result<Vec<f32>> {
@@ -1826,15 +1817,7 @@ impl Runtime {
     fn decode_rows(&self, bb: &BatchBuffers, n: usize) -> Result<()> {
         let plan = &self.plans.decode;
         let run = exec::Run { n, tokens: &bb.tokens, logits: &bb.logits, rows: 0..n, bb: Some(bb) };
-        self.run_ops(&plan.head, None, &run)?;
-        for layer in &self.layers {
-            let ops = match &layer.mixer {
-                DeviceMixer::Linear(_) => &plan.linear,
-                DeviceMixer::Attention(_) => &plan.attention,
-            };
-            self.run_ops(ops, Some(layer), &run)?;
-        }
-        self.run_ops(&plan.tail, None, &run)
+        crate::executor::run_plan(self, plan, &run, &mut |_| Ok(()))
     }
 
     fn batch_buffers(&self, rows: usize) -> Result<BatchBuffers> {
