@@ -93,12 +93,8 @@ __device__ __forceinline__ uint4 load_stream(const void* p) {
     return r;
 }
 
-template <int N, int K, bool BIAS, bool RESIDUAL>
-__device__ void linear_bf16(const void* w, const float* scales, const float* bias, const float* x, float* out) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * LINEAR_WARPS + warp;
-    if (row >= N) return;
+template <int K>
+__device__ __forceinline__ float dot_bf16(const void* w, int row, const float* x, int lane) {
     const bf16_t* wr = (const bf16_t*)w + (size_t)row * K;
     float acc = 0.0f;
 #pragma unroll 8
@@ -111,19 +107,11 @@ __device__ void linear_bf16(const void* w, const float* scales, const float* bia
         acc += __uint_as_float(packed.z << 16) * xb.x + __uint_as_float(packed.z & 0xffff0000u) * xb.y;
         acc += __uint_as_float(packed.w << 16) * xb.z + __uint_as_float(packed.w & 0xffff0000u) * xb.w;
     }
-    acc = warp_sum(acc);
-    if (lane == 0) {
-        if (BIAS) acc += bias[row];
-        out[row] = RESIDUAL ? out[row] + acc : acc;
-    }
+    return acc;
 }
 
-template <int N, int K, bool BIAS, bool RESIDUAL>
-__device__ void linear_q8(const void* w, const float* scales, const float* bias, const float* x, float* out) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * LINEAR_WARPS + warp;
-    if (row >= N) return;
+template <int K>
+__device__ __forceinline__ float dot_q8(const void* w, const float* scales, int row, const float* x, int lane) {
     const i8_t* wr = (const i8_t*)w + (size_t)row * K;
     const float* sr = scales + (size_t)row * (K / Q8_GROUP);
     float acc = 0.0f;
@@ -139,11 +127,7 @@ __device__ void linear_q8(const void* w, const float* scales, const float* bias,
         }
         acc += part * sr[k / Q8_GROUP];
     }
-    acc = warp_sum(acc);
-    if (lane == 0) {
-        if (BIAS) acc += bias[row];
-        out[row] = RESIDUAL ? out[row] + acc : acc;
-    }
+    return acc;
 }
 
 __device__ __forceinline__ const float* fp8_row_scales(const float* scales, int row) {
@@ -389,103 +373,20 @@ extern "C" __global__ void gg_dequant_rows(const void* w, const unsigned* table,
     for (int i = 0; i < 8; i++) out[(size_t)row * cols + k + i] = v[i];
 }
 
-template <int WF, int K>
-__device__ __forceinline__ float row_dot(const void* w, const float* scales, int row, const float* x, int lane) {
+template <int K>
+__device__ __forceinline__ float dot_fp8(const void* w, const float* scales, int row, const float* x, int lane) {
+    static_assert(K % 16 == 0, "fp8 rows load 16 bytes per lane");
+    const unsigned char* wr = (const unsigned char*)w + (size_t)row * K;
+    const float* sr = fp8_row_scales(scales, row);
     float acc = 0.0f;
-    if constexpr (WF == WF_GGML) {
-        acc = gg_row_dot<K>(w, (const unsigned*)scales, row, x, lane);
-    } else if constexpr (WF == WF_FP8) {
-        static_assert(K % 16 == 0, "fp8 rows load 16 bytes per lane");
-        const unsigned char* wr = (const unsigned char*)w + (size_t)row * K;
-        const float* sr = fp8_row_scales(scales, row);
 #pragma unroll 2
-        for (int k = lane * 16; k < K; k += 512) {
-            uint4 packed = load_stream(wr + k);
-            float part = e4m3_dot4(packed.x, *(const float4*)(x + k)) + e4m3_dot4(packed.y, *(const float4*)(x + k + 4)) +
-                         e4m3_dot4(packed.z, *(const float4*)(x + k + 8)) + e4m3_dot4(packed.w, *(const float4*)(x + k + 12));
-            acc += part * sr[k / FP8_BLOCK];
-        }
-    } else if constexpr (WF == WF_Q8) {
-        const i8_t* wr = (const i8_t*)w + (size_t)row * K;
-        const float* sr = scales + (size_t)row * (K / Q8_GROUP);
-#pragma unroll 2
-        for (int k = lane * 16; k < K; k += 512) {
-            int4 packed = *(const int4*)(wr + k);
-            const i8_t* q = (const i8_t*)&packed;
-            float part = 0.0f;
-#pragma unroll
-            for (int j = 0; j < 16; j += 4) {
-                float4 xv = *(const float4*)(x + k + j);
-                part += (float)q[j] * xv.x + (float)q[j + 1] * xv.y + (float)q[j + 2] * xv.z + (float)q[j + 3] * xv.w;
-            }
-            acc += part * sr[k / Q8_GROUP];
-        }
-    } else {
-        const bf16_t* wr = (const bf16_t*)w + (size_t)row * K;
-#pragma unroll 8
-        for (int k = lane * 8; k < K; k += 256) {
-            uint4 packed = load_stream(wr + k);
-            float4 xa = *(const float4*)(x + k);
-            float4 xb = *(const float4*)(x + k + 4);
-            acc += __uint_as_float(packed.x << 16) * xa.x + __uint_as_float(packed.x & 0xffff0000u) * xa.y;
-            acc += __uint_as_float(packed.y << 16) * xa.z + __uint_as_float(packed.y & 0xffff0000u) * xa.w;
-            acc += __uint_as_float(packed.z << 16) * xb.x + __uint_as_float(packed.z & 0xffff0000u) * xb.y;
-            acc += __uint_as_float(packed.w << 16) * xb.z + __uint_as_float(packed.w & 0xffff0000u) * xb.w;
-        }
+    for (int k = lane * 16; k < K; k += 512) {
+        uint4 packed = load_stream(wr + k);
+        float part = e4m3_dot4(packed.x, *(const float4*)(x + k)) + e4m3_dot4(packed.y, *(const float4*)(x + k + 4)) +
+                     e4m3_dot4(packed.z, *(const float4*)(x + k + 8)) + e4m3_dot4(packed.w, *(const float4*)(x + k + 12));
+        acc += part * sr[k / FP8_BLOCK];
     }
-    return warp_sum(acc);
-}
-
-template <int N, int K, bool BIAS, bool RESIDUAL>
-__device__ void linear_fp8(const void* w, const float* scales, const float* bias, const float* x, float* out) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * LINEAR_WARPS + warp;
-    if (row >= N) return;
-    float acc = row_dot<WF_FP8, K>(w, scales, row, x, lane);
-    if (lane == 0) {
-        if (BIAS) acc += bias[row];
-        out[row] = RESIDUAL ? out[row] + acc : acc;
-    }
-}
-
-template <int N, int K, bool BIAS, bool RESIDUAL>
-__device__ void linear_ggml(const void* w, const float* scales, const float* bias, const float* x, float* out) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * LINEAR_WARPS + warp;
-    if (row >= N) return;
-    float acc = row_dot<WF_GGML, K>(w, scales, row, x, lane);
-    if (lane == 0) {
-        if (BIAS) acc += bias[row];
-        out[row] = RESIDUAL ? out[row] + acc : acc;
-    }
-}
-
-__device__ __forceinline__ void load_normed(const float* x, const float* nw, float* xs) {
-    __shared__ float scratch[32];
-    float ss = 0.0f;
-    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) {
-        float v = x[i];
-        xs[i] = v;
-        ss += v * v;
-    }
-    float inv = rsqrtf(block_reduce<false>(ss, scratch) / HIDDEN + EPS);
-    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) xs[i] = nw[i] * (xs[i] * inv);
-    __syncthreads();
-}
-
-template <int WF, int N, bool BIAS>
-__device__ void linear_norm(const void* w, const float* scales, const float* bias, const float* x,
-                            const float* nw, float* out) {
-    __shared__ __align__(16) float xs[HIDDEN];
-    load_normed(x, nw, xs);
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * LINEAR_WARPS + warp;
-    if (row >= N) return;
-    float acc = row_dot<WF, HIDDEN>(w, scales, row, xs, lane);
-    if (lane == 0) out[row] = BIAS ? acc + bias[row] : acc;
+    return acc;
 }
 
 __device__ __forceinline__ float activation(float g) {
@@ -494,17 +395,64 @@ __device__ __forceinline__ float activation(float g) {
         : g / (1.0f + expf(-g));
 }
 
-template <int WF>
-__device__ void gate_up_act_norm(const void* w, const float* scales, const float* x, const float* nw, float* out) {
-    __shared__ __align__(16) float xs[HIDDEN];
-    load_normed(x, nw, xs);
+template <typename D>
+__device__ __forceinline__ void load_normed(const float* x, const float* nw, float* xs) {
+    __shared__ float scratch[32];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) {
+        float v = x[i];
+        ss += v * v;
+    }
+    float inv = rsqrtf(block_reduce<false>(ss, scratch) / HIDDEN + EPS);
+    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) xs[D::template x_at<HIDDEN>(i)] = nw[i] * (x[i] * inv);
+    __syncthreads();
+}
+
+template <typename D, int N, int K, bool BIAS, bool RESIDUAL, int ROWS = 1>
+__device__ void linear_w(const void* w, const void* s, const float* bias, const float* x, float* out) {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int row = blockIdx.x * LINEAR_WARPS + warp;
+    int row = (blockIdx.x * D::WARPS + warp) * ROWS;
+    if (row >= N) return;
+    float acc[ROWS];
+    D::template rows<K, ROWS>(w, s, row, 1, x, lane, acc);
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            float v = acc[r];
+            if (BIAS) v += bias[row + r];
+            out[row + r] = RESIDUAL ? out[row + r] + v : v;
+        }
+    }
+}
+
+template <typename D, int N, bool BIAS, int ROWS = 1>
+__device__ void linear_norm(const void* w, const void* s, const float* bias, const float* x, const float* nw, float* out) {
+    __shared__ __align__(16) float xs[HIDDEN];
+    load_normed<D>(x, nw, xs);
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = (blockIdx.x * D::WARPS + warp) * ROWS;
+    if (row >= N) return;
+    float acc[ROWS];
+    D::template rows<HIDDEN, ROWS>(w, s, row, 1, xs, lane, acc);
+    if (lane == 0) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) out[row + r] = BIAS ? acc[r] + bias[row + r] : acc[r];
+    }
+}
+
+template <typename D>
+__device__ void gate_up_act_norm(const void* w, const void* s, const float* x, const float* nw, float* out) {
+    __shared__ __align__(16) float xs[HIDDEN];
+    load_normed<D>(x, nw, xs);
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * D::WARPS + warp;
     if (row >= INTER) return;
-    float g = row_dot<WF, HIDDEN>(w, scales, 2 * row, xs, lane);
-    float u = row_dot<WF, HIDDEN>(w, scales, 2 * row + 1, xs, lane);
-    if (lane == 0) out[row] = activation(g) * u;
+    float gu[2];
+    D::template rows<HIDDEN, 2>(w, s, 2 * row, 1, xs, lane, gu);
+    if (lane == 0) out[D::template x_at<INTER>(row)] = activation(gu[0]) * gu[1];
 }
 
 constexpr int GEMM_BM = 64;
@@ -513,8 +461,8 @@ constexpr int GEMM_BK = 16;
 constexpr int GEMM_TM = 4;
 constexpr int GEMM_TN = 4;
 
-template <int N, int K, bool BIAS, bool RESIDUAL, int WF>
-__device__ void gemm(const void* w, const float* scales, const float* bias, const float* x, float* out, int tokens) {
+template <int N, int K, bool BIAS, bool RESIDUAL, typename D>
+__device__ void gemm(const void* w, const void* scales, const float* bias, const float* x, float* out, int tokens) {
     __shared__ float xs[GEMM_BK][GEMM_BM];
     __shared__ float ws[GEMM_BK][GEMM_BN];
     int tid = threadIdx.x;
@@ -537,22 +485,7 @@ __device__ void gemm(const void* w, const float* scales, const float* bias, cons
             xs[kk][r] = m < tokens ? x[(size_t)m * K + k0 + kk] : 0.0f;
             int n = n0 + r;
             float wv = 0.0f;
-            if (n < N) {
-                if (WF == WF_GGML) {
-                    float v[8];
-                    int kk8 = (k0 + kk) & ~7;
-                    gg_load8(w, (const unsigned*)scales, n, kk8, v);
-                    wv = v[(k0 + kk) & 7];
-                } else if (WF == WF_Q8) {
-                    wv = (float)((const i8_t*)w)[(size_t)n * K + k0 + kk] *
-                         scales[(size_t)n * (K / Q8_GROUP) + (k0 + kk) / Q8_GROUP];
-                } else if (WF == WF_FP8) {
-                    wv = e4m3_to_f32(((const unsigned char*)w)[(size_t)n * K + k0 + kk]) *
-                         fp8_row_scales(scales, n)[(k0 + kk) / FP8_BLOCK];
-                } else {
-                    wv = bf16_to_f32(((const bf16_t*)w)[(size_t)n * K + k0 + kk]);
-                }
-            }
+            if (n < N) wv = D::template at<K>(w, scales, n, k0 + kk);
             ws[kk][r] = wv;
         }
         __syncthreads();
@@ -676,15 +609,113 @@ __device__ __forceinline__ int swz(int r, int c) {
     return r * CPR + (c ^ ((r / GROUP_ROWS) & MASK));
 }
 
+constexpr int ACC_PLAIN = 0;
+constexpr int ACC_SCALED = 1;
+constexpr int ACC_DIRECT = 2;
+
+template <typename Self>
+struct DecBase {
+    static constexpr int ACC = ACC_PLAIN;
+    static constexpr bool LDSM = true;
+    static constexpr int WARPS = LINEAR_WARPS;
+    template <int BK> static constexpr int wrow = BK * 2;
+    template <int BK> static constexpr int w_chunks = BK / 8;
+    template <int K, int ROWS>
+    static __device__ __forceinline__ void rows(const void* w, const void* s, int row0, int stride, const float* x, int lane, float* out) {
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) out[r] = warp_sum(Self::template dot<K>(w, s, row0 + r * stride, x, lane));
+    }
+    template <int W> static __device__ __forceinline__ int x_at(int i) { return i; }
+    template <int K> static __device__ __forceinline__ unsigned col(const void*, int) { return 0; }
+    template <int K, int BK> static __device__ __forceinline__ float scale(const void*, unsigned, int) { return 1.0f; }
+    static __device__ __forceinline__ void frag(unsigned*, const unsigned char*, int, int) {}
+    template <int MI, int NJ> static __device__ __forceinline__ void finish(float (&)[MI][NJ][4], const void*) {}
+};
+
+struct DecBf16 : DecBase<DecBf16> {
+    template <int K, int BK, int CPR, int WROW>
+    static __device__ __forceinline__ void load(unsigned char* ws, const void* w, const void*, int r, int n, int kt, int ck) {
+        cp_async16(ws + swz<CPR>(r, ck) * 16, (const char*)w + ((size_t)n * K + kt * BK) * 2 + ck * 16);
+    }
+    template <int K> static __device__ __forceinline__ float dot(const void* w, const void*, int row, const float* x, int lane) {
+        return dot_bf16<K>(w, row, x, lane);
+    }
+    template <int K> static __device__ __forceinline__ float at(const void* w, const void*, int n, int k) {
+        return bf16_to_f32(((const bf16_t*)w)[(size_t)n * K + k]);
+    }
+};
+
+template <typename Self, int GROUP_K>
+struct DecBytes : DecBase<Self> {
+    static constexpr int ACC = ACC_SCALED;
+    static constexpr bool LDSM = false;
+    template <int BK> static constexpr int wrow = BK + 16;
+    template <int BK> static constexpr int w_chunks = BK / 16;
+    template <int K, int BK, int CPR, int WROW>
+    static __device__ __forceinline__ void load(unsigned char* ws, const void* w, const void*, int r, int n, int kt, int ck) {
+        static_assert(GROUP_K % BK == 0, "byte weight tiles stay inside one scale group");
+        cp_async16(ws + r * WROW + ck * 16, (const char*)w + (size_t)n * K + kt * BK + ck * 16);
+    }
+    static __device__ __forceinline__ void frag(unsigned* bw, const unsigned char* row, int ks, int t) {
+        const unsigned char* p = row + ks * 16 + 2 * t;
+        bw[0] = Self::pair(*(const unsigned short*)p);
+        bw[1] = Self::pair(*(const unsigned short*)(p + 8));
+    }
+    template <int K, int BK> static __device__ __forceinline__ float scale(const void* s, unsigned col, int kt) {
+        return ((const float*)s)[col + kt * BK / GROUP_K];
+    }
+};
+
+struct DecQ8 : DecBytes<DecQ8, Q8_GROUP> {
+    static __device__ __forceinline__ unsigned pair(unsigned two) { return q8_pair_bf16(two); }
+    template <int K> static __device__ __forceinline__ unsigned col(const void*, int c) { return (unsigned)c * (K / Q8_GROUP); }
+    template <int K> static __device__ __forceinline__ float dot(const void* w, const void* s, int row, const float* x, int lane) {
+        return dot_q8<K>(w, (const float*)s, row, x, lane);
+    }
+    template <int K> static __device__ __forceinline__ float at(const void* w, const void* s, int n, int k) {
+        return (float)((const i8_t*)w)[(size_t)n * K + k] * ((const float*)s)[(size_t)n * (K / Q8_GROUP) + k / Q8_GROUP];
+    }
+};
+
+struct DecFp8 : DecBytes<DecFp8, FP8_BLOCK> {
+    static __device__ __forceinline__ unsigned pair(unsigned two) { return e4m3_pair_bf16(two); }
+    template <int K> static __device__ __forceinline__ unsigned col(const void* s, int c) { return __float_as_uint(__ldg((const float*)s + c)); }
+    template <int K> static __device__ __forceinline__ float dot(const void* w, const void* s, int row, const float* x, int lane) {
+        return dot_fp8<K>(w, (const float*)s, row, x, lane);
+    }
+    template <int K> static __device__ __forceinline__ float at(const void* w, const void* s, int n, int k) {
+        return e4m3_to_f32(((const unsigned char*)w)[(size_t)n * K + k]) * fp8_row_scales((const float*)s, n)[k / FP8_BLOCK];
+    }
+};
+
+struct DecGgml : DecBase<DecGgml> {
+    template <int K, int BK, int CPR, int WROW>
+    static __device__ __forceinline__ void load(unsigned char* ws, const void* w, const void* s, int r, int n, int kt, int ck) {
+        float v[8];
+        gg_load8(w, (const unsigned*)s, n, kt * BK + ck * 8, v);
+        uint4 packed = make_uint4(bf16_bits_rn(v[0]) | (bf16_bits_rn(v[1]) << 16), bf16_bits_rn(v[2]) | (bf16_bits_rn(v[3]) << 16),
+                                  bf16_bits_rn(v[4]) | (bf16_bits_rn(v[5]) << 16), bf16_bits_rn(v[6]) | (bf16_bits_rn(v[7]) << 16));
+        *(uint4*)(ws + swz<CPR>(r, ck) * 16) = packed;
+    }
+    template <int K> static __device__ __forceinline__ float dot(const void* w, const void* s, int row, const float* x, int lane) {
+        return gg_row_dot<K>(w, (const unsigned*)s, row, x, lane);
+    }
+    template <int K> static __device__ __forceinline__ float at(const void* w, const void* s, int n, int k) {
+        float v[8];
+        gg_load8(w, (const unsigned*)s, n, k & ~7, v);
+        return v[k & 7];
+    }
+};
+
 template <int N, int BM, int BN, int WM, int WN, int EPI, bool BIAS, bool MFAST = false>
 __device__ __forceinline__ void gemm_epilogue(float (&acc)[BM / WM / 16][BN / WN / 8][4], const float* bias, float* out,
                                               bf16_t* out_hi, bf16_t* out_lo, int tokens);
 
-template <int N, int K, int BM, int BN, int WM, int WN, int BK, int STAGES, int EPI, bool BIAS, int WF, bool SPLIT, bool MFAST = false>
-__device__ __forceinline__ void gemm_tc(const void* w, const float* scales, const float* bias, const bf16_t* x_hi,
+template <int N, int K, int BM, int BN, int WM, int WN, int BK, int STAGES, int EPI, bool BIAS, typename D, bool SPLIT, bool MFAST = false>
+__device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const float* bias, const bf16_t* x_hi,
                                         const bf16_t* x_lo, float* out, bf16_t* out_hi, bf16_t* out_lo, int tokens) {
-    constexpr bool BYTES = WF == WF_Q8 || WF == WF_FP8;
-    constexpr int GROUP_K = WF == WF_FP8 ? FP8_BLOCK : Q8_GROUP;
+    constexpr bool SCALED = D::ACC == ACC_SCALED;
+    constexpr bool DIRECT = D::ACC == ACC_DIRECT;
     constexpr int THREADS = WM * WN * 32;
     constexpr int TM = BM / WM;
     constexpr int TN = BN / WN;
@@ -695,16 +726,15 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
     constexpr int PLANES = SPLIT ? 2 : 1;
     constexpr int A_TILE = BM * BK;
     constexpr int A_BYTES = A_TILE * 2 * PLANES;
-    constexpr int WROW = BYTES ? BK + 16 : BK * 2;
+    constexpr int WROW = D::template wrow<BK>;
     constexpr int STAGE_BYTES = A_BYTES + BN * WROW;
     constexpr int KT = K / BK;
     constexpr int A_CHUNKS = BK / 8;
     constexpr int A_TOTAL = BM * A_CHUNKS * PLANES;
     constexpr int A_ITERS = (A_TOTAL + THREADS - 1) / THREADS;
-    constexpr int W_CHUNKS = BYTES ? BK / 16 : BK / 8;
+    constexpr int W_CHUNKS = D::template w_chunks<BK>;
     constexpr int W_ITERS = (BN * W_CHUNKS + THREADS - 1) / THREADS;
     static_assert(K % BK == 0, "K must be a multiple of BK");
-    static_assert(!BYTES || GROUP_K % BK == 0, "byte weight tiles stay inside one scale group");
     static_assert(NJ % 2 == 0, "warp n tile");
     static_assert(STAGES >= 2, "pipeline depth");
     extern __shared__ __align__(16) unsigned char gemm_smem[];
@@ -725,15 +755,13 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
 #pragma unroll
             for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
     int last_row = max(tokens - 1, 0);
-    unsigned srow0[BYTES ? NJ : 1], srow1[BYTES ? NJ : 1];
-    if (BYTES) {
+    unsigned srow0[SCALED ? NJ : 1], srow1[SCALED ? NJ : 1];
+    if (SCALED) {
 #pragma unroll
         for (int j = 0; j < NJ; j++) {
             int col = n0 + wn * TN + j * 8 + 2 * t;
-            int c0 = min(col, N - 1);
-            int c1 = min(col + 1, N - 1);
-            srow0[j] = WF == WF_FP8 ? __float_as_uint(__ldg(scales + c0)) : (unsigned)c0 * (K / GROUP_K);
-            srow1[j] = WF == WF_FP8 ? __float_as_uint(__ldg(scales + c1)) : (unsigned)c1 * (K / GROUP_K);
+            srow0[j] = D::template col<K>(scales, min(col, N - 1));
+            srow1[j] = D::template col<K>(scales, min(col + 1, N - 1));
         }
     }
     auto load_stage = [&](int buf, int kt) {
@@ -758,17 +786,7 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
             int r = idx / W_CHUNKS;
             int ck = idx % W_CHUNKS;
             int n = min(n0 + r, N - 1);
-            if constexpr (WF == WF_GGML) {
-                float v[8];
-                gg_load8(w, (const unsigned*)scales, n, kt * BK + ck * 8, v);
-                uint4 packed = make_uint4(bf16_bits_rn(v[0]) | (bf16_bits_rn(v[1]) << 16), bf16_bits_rn(v[2]) | (bf16_bits_rn(v[3]) << 16),
-                                          bf16_bits_rn(v[4]) | (bf16_bits_rn(v[5]) << 16), bf16_bits_rn(v[6]) | (bf16_bits_rn(v[7]) << 16));
-                *(uint4*)(ws + swz<CPR>(r, ck) * 16) = packed;
-                continue;
-            }
-            const char* src = BYTES ? (const char*)w + (size_t)n * K + kt * BK + ck * 16
-                                    : (const char*)w + ((size_t)n * K + kt * BK) * 2 + ck * 16;
-            cp_async16(ws + (BYTES ? r * WROW + ck * 16 : swz<CPR>(r, ck) * 16), src);
+            D::template load<K, BK, CPR, WROW>(ws, w, scales, r, n, kt, ck);
         }
     };
 #pragma unroll
@@ -800,25 +818,15 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
         for (int j = 0; j < NJ; j++) {
             s0[j] = 1.0f;
             s1[j] = 1.0f;
-            if (BYTES) {
-                int group = kt * BK / GROUP_K;
-                s0[j] = scales[srow0[j] + group];
-                s1[j] = scales[srow1[j] + group];
+            if (SCALED) {
+                s0[j] = D::template scale<K, BK>(scales, srow0[j], kt);
+                s1[j] = D::template scale<K, BK>(scales, srow1[j], kt);
             }
         }
 #pragma unroll
         for (int ks = 0; ks < KS; ks++) {
             unsigned bw[NJ][2];
-            if (BYTES) {
-#pragma unroll
-                for (int j = 0; j < NJ; j++) {
-                    const unsigned char* p = ws + (wn * TN + j * 8 + g) * WROW + ks * 16 + 2 * t;
-                    unsigned lo = *(const unsigned short*)p;
-                    unsigned hi = *(const unsigned short*)(p + 8);
-                    bw[j][0] = WF == WF_FP8 ? e4m3_pair_bf16(lo) : q8_pair_bf16(lo);
-                    bw[j][1] = WF == WF_FP8 ? e4m3_pair_bf16(hi) : q8_pair_bf16(hi);
-                }
-            } else {
+            if constexpr (D::LDSM) {
 #pragma unroll
                 for (int jp = 0; jp < NJ / 2; jp++) {
                     unsigned r[4];
@@ -829,6 +837,9 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                     bw[2 * jp + 1][0] = r[2];
                     bw[2 * jp + 1][1] = r[3];
                 }
+            } else {
+#pragma unroll
+                for (int j = 0; j < NJ; j++) D::frag(bw[j], ws + (wn * TN + j * 8 + g) * WROW, ks, t);
             }
             unsigned ah[MI][4], al[MI][4];
 #pragma unroll
@@ -838,7 +849,15 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                 ldsm_x4(ah[i], &a_hi[at]);
                 if (SPLIT) ldsm_x4(al[i], &a_lo[at]);
             }
-            if (SPLIT && BYTES) {
+            if (DIRECT) {
+#pragma unroll
+                for (int i = 0; i < MI; i++)
+#pragma unroll
+                    for (int j = 0; j < NJ; j++) {
+                        if (SPLIT) mma_bf16(acc[i][j], al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
+                        mma_bf16(acc[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
+                    }
+            } else if (SPLIT && SCALED) {
 #pragma unroll
                 for (int i = 0; i < MI; i++)
 #pragma unroll
@@ -873,7 +892,7 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
                     }
             }
         }
-        if (SPLIT && !BYTES) {
+        if (SPLIT && !SCALED && !DIRECT) {
 #pragma unroll
             for (int i = 0; i < MI; i++)
 #pragma unroll
@@ -883,6 +902,7 @@ __device__ __forceinline__ void gemm_tc(const void* w, const float* scales, cons
         }
     }
     cp_async_wait<0>();
+    D::finish(acc, scales);
     gemm_epilogue<N, BM, BN, WM, WN, EPI, BIAS, MFAST>(acc, bias, out, out_hi, out_lo, tokens);
 }
 

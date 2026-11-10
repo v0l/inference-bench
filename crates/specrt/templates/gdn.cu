@@ -444,9 +444,9 @@ extern "C" __global__ void lin_in_norm(const void* w, const float* s, const floa
 }
 
 extern "C" __global__ void lin_ba_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {
-    linear_norm<WF_BF16, LA_BA_ROWS, false>(w, s, b, x, nw, out);
+    linear_norm<DecBf16, LA_BA_ROWS, false>(w, s, b, x, nw, out);
 }
 
 extern "C" __global__ void lin_out_proj(const void* w, const float* s, const float* b, const float* x, float* out) {
-    {{LINEAR}}<HIDDEN, LA_VALUE_DIM, false, true>(w, s, b, x, out);
+    linear_w<{{WF}}, HIDDEN, LA_VALUE_DIM, false, true>(w, s, b, x, out);
 }

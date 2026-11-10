@@ -14,9 +14,10 @@ fn node(op: &Op, spec: &Spec, layer: usize, phase: Phase, root: &str, index: Opt
         Phase::Decode => DECODE_ROWS,
     };
     let kernels = op.kernels(spec, layer, tokens, SMS).join(", ");
+    let decoder = op.decoder(spec, layer, tokens, SMS).map(|d| format!(" [{d}]")).unwrap_or_default();
     Node {
         title: op.label(),
-        shape: format!("{}: {kernels}", op.flow()),
+        shape: format!("{}: {kernels}{decoder}", op.flow()),
         dtype: op.quant(spec, layer).map(|q| quant_tag(q).to_string()),
         tensors: op.checkpoint_tensors(spec, root, index),
     }

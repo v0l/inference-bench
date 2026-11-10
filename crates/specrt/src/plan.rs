@@ -217,6 +217,16 @@ impl Op {
         }
     }
 
+    pub fn decoder(&self, spec: &Spec, layer: usize, tokens: usize, sms: usize) -> Option<&'static str> {
+        match self {
+            Op::Linear { weight, .. } => {
+                let kind = weight_kind(weight.quant(spec, layer));
+                Some(kernel_for(spec, weight.name(), weight.rows(spec), tokens, sms, kind).decoder)
+            }
+            _ => None,
+        }
+    }
+
     pub fn kernels(&self, spec: &Spec, layer: usize, tokens: usize, sms: usize) -> Vec<String> {
         let names = |k: &[&str]| k.iter().map(|s| s.to_string()).collect();
         match self {
@@ -432,5 +442,7 @@ mod tests {
         let op = Op::Linear { weight: Weight::Qkv, input: Buf::XnPlanes, output: Buf::Qkv };
         let direct = kernel_for(&spec, "qkv", spec.qkv_rows(), 512, 84, WeightKind::Bf16);
         assert_eq!(op.kernels(&spec, 0, 512, 84), vec![direct.name]);
+        assert_eq!(op.decoder(&spec, 0, 512, 84), Some("DecBf16"));
+        assert_eq!(Op::Embed.decoder(&spec, 0, 512, 84), None);
     }
 }

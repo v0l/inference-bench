@@ -8,7 +8,7 @@ extern "C" __global__ void __launch_bounds__(FP4_GEMV_THREADS) lm_head_norm_f4(c
     int row = (blockIdx.x * (FP4_GEMV_THREADS / 32) + warp) * HEAD_F4_ROWS;
     if (row >= VOCAB) return;
     float acc[HEAD_F4_ROWS];
-    fp4_rows_dot<HIDDEN, HEAD_F4_ROWS, 4 / HEAD_F4_ROWS>(w, s, row, 1, xt, lane, acc);
+    DecFp4::rows<HIDDEN, HEAD_F4_ROWS>(w, s, row, 1, xt, lane, acc);
     if (lane == 0) {
 #pragma unroll
         for (int r = 0; r < HEAD_F4_ROWS; r++) out[row + r] = acc[r];

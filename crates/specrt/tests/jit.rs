@@ -25,8 +25,8 @@ fn the_gguf_module_renders_the_ggml_kernels() {
     if let Some(out) = std::env::var_os("SPECRT_DUMP_SOURCE").filter(|o| !o.is_empty()) {
         std::fs::write(out, &module.source).unwrap();
     }
-    assert!(module.source.contains("linear_ggml<"));
-    assert!(module.source.contains("gate_up_act_norm<3>"));
+    assert!(module.source.contains("linear_w<DecGgml,"));
+    assert!(module.source.contains("gate_up_act_norm<DecGgml>"));
     assert!(module.kernels.contains(&"gg_dequant_rows"));
 }
 

@@ -263,8 +263,12 @@ fn fp8_batch_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Res
 const F4W_BK: usize = 64;
 const F4W_ROW: usize = 48;
 
+pub fn f4w_shape(tile: Tile, k: usize) -> MmaShape {
+    MmaShape::new(tile, k, WeightFormat::Fp4, true)
+}
+
 pub fn f4w_smem(tile: Tile) -> u32 {
-    (FP4_STAGES * (tile.bm * F4W_BK * 4 + tile.bn * F4W_ROW)) as u32
+    f4w_shape(tile, F4W_BK).smem_bytes()
 }
 
 fn fp4_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
@@ -272,18 +276,11 @@ fn fp4_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
     for linear in ["gate_up", "down"] {
         let (n, k, epi, _) = linear_dims(spec, linear);
         for suffix in MMA_VARIANTS {
-            let t = Tile::variant(suffix, &spec.runtime);
+            let shape = f4w_shape(Tile::variant(suffix, &spec.runtime), k);
             let name = format!("{linear}_f4w{suffix}");
             let name = FP4_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_KERNELS");
-            smem.insert(name, f4w_smem(t));
-            out.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_f4w<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP4_STAGES}, {epi}>(w, s, xh, xl, out, oh, ol, tokens);\n}}\n\n",
-                threads = t.threads(),
-                bm = t.bm,
-                bn = t.bn,
-                wm = t.wm,
-                wn = t.wn,
-            ));
+            smem.insert(name, shape.smem_bytes());
+            out.push_str(&shape.kernel(name, n, k, epi, false, false));
         }
     }
     out
@@ -300,18 +297,11 @@ fn fp4_head_source(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Resul
     let (n, k) = (spec.dims.vocab, spec.dims.hidden);
     let mut gemms = String::new();
     for suffix in MMA_VARIANTS {
-        let t = Tile::variant(suffix, &spec.runtime);
+        let shape = f4w_shape(Tile::variant(suffix, &spec.runtime), k);
         let name = format!("lm_head_f4w{suffix}");
         let name = FP4_HEAD_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_HEAD_KERNELS");
-        smem.insert(name, f4w_smem(t));
-        gemms.push_str(&format!(
-            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_f4w<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP4_STAGES}, EPI_STORE>(w, s, xh, xl, out, oh, ol, tokens);\n}}\n\n",
-            threads = t.threads(),
-            bm = t.bm,
-            bn = t.bn,
-            wm = t.wm,
-            wn = t.wn,
-        ));
+        smem.insert(name, shape.smem_bytes());
+        gemms.push_str(&shape.kernel(name, n, k, "EPI_STORE", false, false));
     }
     let vars: BTreeMap<&str, String> =
         [("HEAD_F4_ROWS", fp4_head_rows(n).to_string()), ("HEAD_F4W_KERNELS", gemms)].into_iter().collect();
@@ -437,6 +427,7 @@ pub enum WeightFormat {
     Q8,
     Fp8,
     Ggml,
+    Fp4,
 }
 
 impl WeightFormat {
@@ -446,7 +437,17 @@ impl WeightFormat {
             Quant::Q8 => WeightFormat::Q8,
             Quant::Fp8Block128 | Quant::Fp8Channel => WeightFormat::Fp8,
             Quant::Gguf => WeightFormat::Ggml,
-            Quant::Nvfp4G16 => unreachable!("nvfp4 is an MLP format with its own kernels"),
+            Quant::Nvfp4G16 => WeightFormat::Fp4,
+        }
+    }
+
+    pub fn of_kind(kind: WeightKind) -> WeightFormat {
+        match kind {
+            WeightKind::Bf16 => WeightFormat::Bf16,
+            WeightKind::Q8 => WeightFormat::Q8,
+            WeightKind::Fp8 => WeightFormat::Fp8,
+            WeightKind::Fp4 => WeightFormat::Fp4,
+            WeightKind::Ggml => WeightFormat::Ggml,
         }
     }
 
@@ -457,12 +458,23 @@ impl WeightFormat {
         }
     }
 
-    pub fn code(self) -> u32 {
+    pub fn decoder(self) -> &'static str {
         match self {
-            WeightFormat::Bf16 => 0,
-            WeightFormat::Q8 => 1,
-            WeightFormat::Fp8 => 2,
-            WeightFormat::Ggml => 3,
+            WeightFormat::Bf16 => "DecBf16",
+            WeightFormat::Q8 => "DecQ8",
+            WeightFormat::Fp8 => "DecFp8",
+            WeightFormat::Ggml => "DecGgml",
+            WeightFormat::Fp4 => "DecFp4",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WeightFormat::Bf16 => "bf16",
+            WeightFormat::Q8 => "q8",
+            WeightFormat::Fp8 => "fp8",
+            WeightFormat::Ggml => "ggml",
+            WeightFormat::Fp4 => "nvfp4",
         }
     }
 
@@ -470,12 +482,11 @@ impl WeightFormat {
         matches!(self, WeightFormat::Q8 | WeightFormat::Fp8)
     }
 
-    fn gemv(self) -> &'static str {
+    fn wrow(self, bk: usize) -> usize {
         match self {
-            WeightFormat::Bf16 => "linear_bf16",
-            WeightFormat::Q8 => "linear_q8",
-            WeightFormat::Fp8 => "linear_fp8",
-            WeightFormat::Ggml => "linear_ggml",
+            WeightFormat::Q8 | WeightFormat::Fp8 => bk + 16,
+            WeightFormat::Fp4 => F4W_ROW,
+            WeightFormat::Bf16 | WeightFormat::Ggml => bk * 2,
         }
     }
 }
@@ -507,6 +518,18 @@ pub struct KernelChoice {
     pub reduce: Option<String>,
     pub tile: Tile,
     pub path: GemmPath,
+    pub decoder: &'static str,
+}
+
+fn decoder_for(path: GemmPath, weight: WeightKind) -> &'static str {
+    match path {
+        GemmPath::F8a => "fp8 x fp8 act",
+        GemmPath::F4a => "nvfp4 x nvfp4 act",
+        GemmPath::F8b => "fp8 batch rows",
+        GemmPath::F4b => "nvfp4 batch rows",
+        GemmPath::Ggb => "ggml to bf16 scratch",
+        GemmPath::Mma | GemmPath::F4w => WeightFormat::of_kind(weight).decoder(),
+    }
 }
 
 pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: usize, weight: WeightKind) -> KernelChoice {
@@ -524,7 +547,14 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
     };
     let huge = spec.quant.is_fp8() && weight == WeightKind::Fp8 && opts.tile == TileChoice::Auto && suffix == "_big" && tokens > FP8_HUGE_MIN_TOKENS;
     let tile = Tile::variant(suffix, opts);
-    let choice = |name: String, path: GemmPath, quant: Option<&'static str>| KernelChoice { name, quant, reduce: None, tile, path };
+    let choice = |name: String, path: GemmPath, quant: Option<&'static str>| KernelChoice {
+        name,
+        quant,
+        reduce: None,
+        tile,
+        path,
+        decoder: decoder_for(path, weight),
+    };
     let auto = opts.tile == TileChoice::Auto;
     let f8b = auto && tokens <= F8B_MAX_TOKENS && F8B_LINEARS.contains(&linear);
     let f4b = auto && tokens <= F4B_MAX_TOKENS && !linear.ends_with("head");
@@ -573,20 +603,41 @@ impl MmaShape {
     pub fn new(tile: Tile, k: usize, wf: WeightFormat, split: bool) -> MmaShape {
         let bk = match wf {
             WeightFormat::Q8 => Q8_GROUP,
+            WeightFormat::Fp4 => F4W_BK,
             WeightFormat::Fp8 if tile.bm == 16 => 128,
             WeightFormat::Fp8 => env_usize("SPECRT_FP8_BK", 64),
             WeightFormat::Bf16 | WeightFormat::Ggml if tile.bm == 16 && k % 128 == 0 => 128,
             WeightFormat::Bf16 | WeightFormat::Ggml => env_usize("SPECRT_BK", 32),
         };
-        let stages = if tile.bm == 16 { 2 } else { env_usize("SPECRT_STAGES", 2) };
+        let stages = match wf {
+            WeightFormat::Fp4 => FP4_STAGES,
+            _ if tile.bm == 16 => 2,
+            _ => env_usize("SPECRT_STAGES", 2),
+        };
         MmaShape { tile, bk, stages, split, wf }
     }
 
     pub fn smem_bytes(&self) -> u32 {
         let planes = if self.split { 2 } else { 1 };
         let a = self.tile.bm * self.bk * 2 * planes;
-        let wrow = if self.wf.bytes() { self.bk + 16 } else { self.bk * 2 };
-        ((a + self.tile.bn * wrow) * self.stages) as u32
+        ((a + self.tile.bn * self.wf.wrow(self.bk)) * self.stages) as u32
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn kernel(&self, name: &str, n: usize, k: usize, epi: &str, bias: bool, token_major: bool) -> String {
+        let t = self.tile;
+        format!(
+            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const void* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, {dec}, {split}, {token_major}>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
+            threads = t.threads(),
+            bm = t.bm,
+            bn = t.bn,
+            wm = t.wm,
+            wn = t.wn,
+            bk = self.bk,
+            stages = self.stages,
+            dec = self.wf.decoder(),
+            split = self.split,
+        )
     }
 }
 
@@ -749,20 +800,10 @@ fn ggb_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
         let split = !spec.runtime.unsplit.iter().any(|u| u == linear);
         for suffix in MMA_VARIANTS {
             let shape = MmaShape::new(Tile::variant(suffix, &spec.runtime), k, WeightFormat::Bf16, split);
-            let t = shape.tile;
             let name = format!("{linear}_ggb{suffix}");
             let name = GGB_KERNELS.iter().copied().find(|g| *g == name).expect("listed in GGB_KERNELS");
             smem.insert(name, shape.smem_bytes());
-            out.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, 0, {split}, true>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
-                threads = t.threads(),
-                bm = t.bm,
-                bn = t.bn,
-                wm = t.wm,
-                wn = t.wn,
-                bk = shape.bk,
-                stages = shape.stages,
-            ));
+            out.push_str(&shape.kernel(name, n, k, epi, bias, true));
         }
     }
     out
@@ -782,20 +823,9 @@ fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
         let (n, k, epi, bias) = linear_dims(spec, linear);
         for suffix in MMA_VARIANTS {
             let shape = MmaShape::new(Tile::variant(suffix, &spec.runtime), k, wf, split);
-            let t = shape.tile;
             let name = mma_kernel_name(linear, suffix);
             smem.insert(name, shape.smem_bytes());
-            out.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, {wf}, {split}>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
-                threads = t.threads(),
-                bm = t.bm,
-                bn = t.bn,
-                wm = t.wm,
-                wn = t.wn,
-                bk = shape.bk,
-                stages = shape.stages,
-                wf = wf.code(),
-            ));
+            out.push_str(&shape.kernel(name, n, k, epi, bias, false));
         }
     }
     out
@@ -902,10 +932,8 @@ impl Module {
             ("LA_KSPLIT", LA_KSPLIT.to_string()),
             ("LA_COLS", LA_COLS.to_string()),
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
-            ("LINEAR", wf.gemv().to_string()),
-            ("HEAD_LINEAR", head_wf.gemv().to_string()),
-            ("WF", wf.code().to_string()),
-            ("HEAD_WF", head_wf.code().to_string()),
+            ("WF", wf.decoder().to_string()),
+            ("HEAD_WF", head_wf.decoder().to_string()),
             ("MMA_KERNELS", mma),
             ("FM_STAGES", FLASH_STAGES.to_string()),
             ("FM_BK", flash_keys.to_string()),
