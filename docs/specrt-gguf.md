@@ -117,3 +117,20 @@ Qwen2.5-7B-Instruct Q4_K_M, one decode step, nsys with `--cuda-graph-trace=node`
 | llama.cpp extra launches (`quantize_q8_1`, `rms_norm_f32`, rope, set_rows) | | | about 1.5 ms per step | about 2.5 ms per step |
 
 Decode with the K-quant GEMV launch shape swept (block size 32 to 512, grid cap 1 to 8 blocks per SM, gate/up and down separately): no setting beats the shipped 256 threads and 2 blocks per SM by more than noise, and 64 threads on gate/up loses 12%. The shipped shape stays. A faster GEMV needs a different dot (int8 on Q8_1 activations), which changes the logits and is not done yet.
+
+### Results of #502
+
+Decode attention now runs one block per KV head (all GQA query heads share each K and V load, 4 keys in flight per warp). `dumpall.sh` shows prompt logits and greedy tokens unchanged on all 9 models; the decode-step logit hashes change because the softmax sums in a different order (greedy tokens still match). On the 7B the A/B at 4,096 context is 189 to 203 tok/s (`ab7b.sh`, 2 rounds).
+
+Tried and dropped: an int8 `dp4a` K-quant dot on activations quantised to 8 bits per 32 values. It was slower, 201 against 217 tok/s at 1,024 and 189 against 203 at 4,096, and changes the logits, so it is not in the tree. The GEMV is limited by weight reads and load issue, not by the multiply.
+
+Final alternating run (`vsllama.sh`, 2 rounds; llama.cpp round 2 at 1,024 was disturbed by another job, 154 tok/s):
+
+| Context | llama.cpp | specrt |
+| --- | ---: | ---: |
+| decode at 1,024 | 240 | 216 and 213 |
+| decode at 4,096 | 224.5 and 222.2 | 202.3 and 199.6 |
+
+specrt is at 90% of llama.cpp on the 7B at both depths. 27B NVFP4 (`gate27b.sh`, 5 runs): decode 56.9 and 55.4 tok/s at 1,024, 54.6 and 54.0 at 4,096, against 56.3 and 55.2, 53.2 and 52.8 before; logits and greedy tokens identical.
+
+Next lever: the K-quant GEMV reads gate/up at about 75% and down at about 50% of the wall. llama.cpp's Q4_K `mul_mat_vec_q` takes 54 us for the down matrix against 47 us here, so the remaining gap is spread over the smaller launches (qkv, o) and the attention reduce, not one kernel. Fusing the per-layer launches (attention reduce into the o projection, qkv into the norm) is the next step.
