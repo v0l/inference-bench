@@ -25,8 +25,8 @@ fn hash_u32(v: &[u32]) -> u64 {
     v.iter().fold(0xcbf29ce484222325u64, |h, t| (h ^ *t as u64).wrapping_mul(0x100000001b3))
 }
 
-fn prompt(len: usize, seed: u32) -> Vec<u32> {
-    (0..len as u32).map(|i| 1000 + (i * 7 + seed * 131) % 5000).collect()
+fn prompt(len: usize, seed: u32, vocab: u32) -> Vec<u32> {
+    (0..len as u32).map(|i| (1000 + (i * 7 + seed * 131) % 5000) % vocab).collect()
 }
 
 fn main() -> Result<()> {
@@ -36,12 +36,13 @@ fn main() -> Result<()> {
     let lens: Vec<usize> = args.next().unwrap_or_else(|| "17,300,1100".into()).split(',').map(|s| s.parse().context(usage)).collect::<Result<_>>()?;
     let batch: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(4);
     let spec = load_spec(&path)?.with_env_overrides();
+    let vocab = spec.dims.vocab as u32;
     let longest = *lens.iter().max().context(usage)?;
     let mut rt = Runtime::load(&spec, longest + 32)?;
     for &len in &lens {
-        let p = prompt(len, 0);
+        let p = prompt(len, 0, vocab);
         let all = rt.prompt_logits(&p)?;
-        let decode: Vec<u32> = prompt(8, 1);
+        let decode: Vec<u32> = prompt(8, 1, vocab);
         let stepped = rt.prefill_then_decode(&p, &decode)?;
         let greedy = rt.generate(&p, 16, Sampling::GREEDY)?.tokens;
         println!("{} len={len} prompt={:016x} decode={:016x} greedy={:016x}", spec.name, hash(&all), hash(&stepped), hash_u32(&greedy));
@@ -49,7 +50,7 @@ fn main() -> Result<()> {
     drop(rt);
     if batch > 1 {
         let mut rt = Runtime::load_batched(&spec, 64 + 16, batch)?;
-        let prompts: Vec<Vec<u32>> = (0..batch as u32).map(|s| prompt(64, s)).collect();
+        let prompts: Vec<Vec<u32>> = (0..batch as u32).map(|s| prompt(64, s, vocab)).collect();
         let g = rt.generate_batch(&prompts, 16)?;
         println!("{} batch={batch} greedy={:016x}", spec.name, hash_u32(&g.tokens.concat()));
     }

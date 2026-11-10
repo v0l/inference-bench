@@ -240,3 +240,15 @@ fn a_tied_head_quantises_only_the_output_copy() {
         assert!(matches!(f.lm_head, Matrix::Fp8 { .. }) && f.embed == bf16.embed);
     }
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn token_ids_outside_the_vocabulary_are_rejected() {
+    let spec = spec_for("tiny-qwen3.5", None);
+    let mut rt = Runtime::load(&spec, 64).unwrap();
+    let vocab = spec.dims.vocab as u32;
+    let err = rt.prompt_logits(&[1, 2, vocab]).err().expect("out of range id");
+    assert!(format!("{err:#}").contains("vocabulary"), "{err:#}");
+    let again = rt.prompt_logits(&[1, 2, vocab - 1]).unwrap();
+    assert_eq!(again, rt.prompt_logits(&[1, 2, vocab - 1]).unwrap());
+}

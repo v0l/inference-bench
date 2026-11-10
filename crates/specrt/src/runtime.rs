@@ -1484,6 +1484,7 @@ impl Runtime {
         trace: Option<&CudaSlice<f32>>,
     ) -> Result<()> {
         let n = tokens.len();
+        self.check_tokens(tokens)?;
         let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         self.stream.memcpy_htod(&ids, &mut self.pre.tokens.slice_mut(..n))?;
         self.stream.memcpy_htod(&[start as i32], &mut self.buf.pos)?;
@@ -1521,7 +1522,16 @@ impl Runtime {
         Ok(())
     }
 
+    fn check_tokens(&self, tokens: &[u32]) -> Result<()> {
+        let vocab = self.spec.dims.vocab;
+        if let Some(t) = tokens.iter().find(|&&t| t as usize >= vocab) {
+            anyhow::bail!("token id {t} outside the vocabulary of {vocab}");
+        }
+        Ok(())
+    }
+
     fn set(&mut self, token: u32, pos: usize) -> Result<()> {
+        self.check_tokens(&[token])?;
         self.stream.memcpy_htod(&[token as i32], &mut self.buf.token)?;
         self.stream.memcpy_htod(&[pos as i32], &mut self.buf.pos)?;
         Ok(())
