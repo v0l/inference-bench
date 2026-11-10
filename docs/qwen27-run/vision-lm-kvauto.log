@@ -1,0 +1,142 @@
+warning: value assigned to `tokens` is never read
+    --> crates/specrt/src/runtime.rs:1608:36
+     |
+1608 |         let mut tokens: Vec<u32> = Vec::new();
+     |                                    ^^^^^^^^^^ this value is reassigned later and never used
+...
+1612 |             tokens = seen.iter().map(|&t| t as u32).collect();
+     |             ------ `tokens` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `xn` and `gate_up` are never read
+   --> crates/specrt/src/runtime.rs:236:5
+    |
+234 | struct Buffers {
+    |        ------- fields in this struct
+235 |     x: CudaSlice<f32>,
+236 |     xn: CudaSlice<f32>,
+    |     ^^
+...
+240 |     gate_up: CudaSlice<f32>,
+    |     ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `rmsnorm` is never used
+   --> crates/specrt/src/runtime.rs:879:8
+    |
+484 | impl Runtime {
+    | ------------ method in this implementation
+...
+879 |     fn rmsnorm(&self, x: &CudaSlice<f32>, w: &CudaSlice<f32>, out: &CudaSlice<f32>) -> Result<()> {
+    |        ^^^^^^^
+
+warning: `inference-bench-specrt` (lib) generated 3 warnings
+    Finished `release` profile [optimized] target(s) in 0.12s
+     Running tests/vision_lm.rs (/mnt/data/cargo-target/inference-bench-307/release/deps/vision_lm-d71b03ab8eac787b)
+
+running 10 tests
+test real_27b_bisect_video_variants ... VARIANT as built: mean KL 0.1075 top1 30/32
+VARIANT plain positions: mean KL 0.1209 top1 27/32
+VARIANT t advances per frame: mean KL 0.1075 top1 30/32
+VARIANT t equals h: mean KL 0.1078 top1 29/32
+VARIANT same again: mean KL 0.1075 top1 30/32
+VARIANT transformers vision embeds: mean KL 0.1075 top1 30/32
+VARIANT transformers vision_bf16 embeds: mean KL 0.1030 top1 30/32
+ok
+test real_27b_embedding_noise_sensitivity ... NOISE image rel 0: mean KL 0.0110 top1 31/32
+NOISE image rel 0.01: mean KL 0.0111 top1 31/32
+NOISE image rel 0.03: mean KL 0.0114 top1 31/32
+NOISE image rel 0.06: mean KL 0.0118 top1 31/32
+NOISE video rel 0: mean KL 0.1075 top1 30/32
+NOISE video rel 0.01: mean KL 0.1082 top1 30/32
+NOISE video rel 0.03: mean KL 0.1066 top1 30/32
+NOISE video rel 0.06: mean KL 0.1079 top1 30/32
+NOISE images3 rel 0: mean KL 0.1089 top1 30/32
+NOISE images3 rel 0.01: mean KL 0.1077 top1 30/32
+NOISE images3 rel 0.03: mean KL 0.1053 top1 30/32
+NOISE images3 rel 0.06: mean KL 0.1092 top1 30/32
+NOISE video10 rel 0: mean KL 0.0477 top1 29/32
+NOISE video10 rel 0.01: mean KL 0.0460 top1 29/32
+NOISE video10 rel 0.03: mean KL 0.0450 top1 29/32
+NOISE video10 rel 0.06: mean KL 0.0519 top1 29/32
+NOISE video2f rel 0: mean KL 0.0571 top1 26/32
+NOISE video2f rel 0.01: mean KL 0.0572 top1 26/32
+NOISE video2f rel 0.03: mean KL 0.0564 top1 26/32
+NOISE video2f rel 0.06: mean KL 0.0564 top1 27/32
+NOISE video4f rel 0: mean KL 0.0660 top1 29/32
+NOISE video4f rel 0.01: mean KL 0.0638 top1 29/32
+NOISE video4f rel 0.03: mean KL 0.0638 top1 29/32
+NOISE video4f rel 0.06: mean KL 0.0647 top1 29/32
+ok
+test real_27b_greedy_answer_names_the_object_in_the_fixture_photo ... answer: a house in a field with a sun in the sky.
+user
+<think>
+
+</think>
+
+the image
+ok
+test real_27b_long_text_control_against_vllm ... 
+thread 'real_27b_long_text_control_against_vllm' (1079442) panicked at crates/specrt/tests/vision_lm.rs:443:115:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test real_27b_media_population_against_vllm ... POP set_img0: 220 vision tokens, mean KL 0.0134 top1 32/32
+POP set_img1: 192 vision tokens, mean KL 0.0386 top1 28/32
+POP set_img2: 140 vision tokens, mean KL 0.0390 top1 29/32
+POP set_img3: 192 vision tokens, mean KL 0.0239 top1 30/32
+POP set_img4: 192 vision tokens, mean KL 0.0422 top1 29/32
+POP set_img5: 144 vision tokens, mean KL 0.0383 top1 30/32
+POP Image overall: mean KL 0.0326 top1 178/192
+POP set_vid0: 160 vision tokens, mean KL 0.0734 top1 29/32
+POP set_vid1: 160 vision tokens, mean KL 0.0794 top1 29/32
+POP set_vid2: 240 vision tokens, mean KL 0.0622 top1 30/32
+POP set_vid3: 240 vision tokens, mean KL 0.0469 top1 32/32
+POP set_vid4: 320 vision tokens, mean KL 0.0516 top1 32/32
+POP set_vid5: 320 vision tokens, mean KL 0.0450 top1 29/32
+POP Video overall: mean KL 0.0598 top1 181/192
+ok
+test real_27b_media_prompts_and_logprobs_agree_with_vllm ... image: prompt 160 tokens, 140 vision, greedy prefix 9/32, top1 31/32, mean KL 0.01103, max KL 0.18417, ours "qwen3.8-27b-nvfp4"
+CASE image measured
+video: prompt 284 tokens, 240 vision, greedy prefix 0/32, top1 30/32, mean KL 0.10754, max KL 1.15136, ours "qwen3.8-27b-nvfp4"
+CASE video measured
+images3: prompt 502 tokens, 476 vision, greedy prefix 12/32, top1 30/32, mean KL 0.10890, max KL 1.42618, ours "qwen3.8-27b-nvfp4"
+CASE images3 measured
+video10: prompt 900 tokens, 800 vision, greedy prefix 5/32, top1 29/32, mean KL 0.04767, max KL 0.27981, ours "qwen3.8-27b-nvfp4"
+CASE video10 measured
+video2f: prompt 108 tokens, 80 vision, greedy prefix 0/32, top1 26/32, mean KL 0.05714, max KL 0.56865, ours "qwen3.8-27b-nvfp4"
+CASE video2f measured
+video4f: prompt 196 tokens, 160 vision, greedy prefix 1/32, top1 29/32, mean KL 0.06597, max KL 0.61323, ours "qwen3.8-27b-nvfp4"
+CASE video4f measured
+ok
+test real_27b_prompt_position_kl_against_vllm ... 
+thread 'real_27b_prompt_position_kl_against_vllm' (1081190) panicked at crates/specrt/tests/vision_lm.rs:307:126:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+FAILED
+test real_27b_random_token_control_against_vllm ... 
+thread 'real_27b_random_token_control_against_vllm' (1081275) panicked at crates/specrt/tests/vision_lm.rs:459:115:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+FAILED
+test real_27b_text_only_description_control_against_vllm ... 
+thread 'real_27b_text_only_description_control_against_vllm' (1081332) panicked at crates/specrt/tests/vision_lm.rs:370:115:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+FAILED
+test real_27b_video_positions_equal_transformers_get_rope_index ... 
+thread 'real_27b_video_positions_equal_transformers_get_rope_index' (1081386) panicked at crates/specrt/tests/vision_lm.rs:248:106:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+FAILED
+
+failures:
+
+failures:
+    real_27b_long_text_control_against_vllm
+    real_27b_prompt_position_kl_against_vllm
+    real_27b_random_token_control_against_vllm
+    real_27b_text_only_description_control_against_vllm
+    real_27b_video_positions_equal_transformers_get_rope_index
+
+test result: FAILED. 5 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out; finished in 107.72s
+
+error: test failed, to rerun pass `-p inference-bench-specrt --test vision_lm`

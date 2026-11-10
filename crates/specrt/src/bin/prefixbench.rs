@@ -118,6 +118,35 @@ fn turns(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> {
     Ok(())
 }
 
+fn long(spec: &Spec, cache: bool, interval: usize, kv_gb: f64, lengths: &[usize]) -> Result<()> {
+    let out = 128usize;
+    let max_ctx = lengths.iter().max().copied().unwrap_or(1024) + 2048 + out;
+    let mut b = Bench::new(spec, cache, interval, max_ctx, 4, kv_gb)?;
+    b.run(vec![tokens(64, 99)], 4)?;
+    for (i, &n) in lengths.iter().enumerate() {
+        let salt = 10 + i as u32;
+        let cold = b.run(vec![tokens(n, salt)], out)?.remove(0);
+        let decode_secs = cold.total - cold.ttft;
+        println!(
+            "SUMMARY long cache={cache} model={} prompt={n} phase=cold ttft_s={:.3} prefill_tok_s={:.0} decode_tok_s={:.1} cached={}",
+            spec.name,
+            cold.ttft,
+            n as f64 / cold.ttft,
+            (cold.out.len().saturating_sub(1)) as f64 / decode_secs,
+            cold.cached
+        );
+        if cache {
+            let warm_prompt = [tokens(n, salt), tokens(1024, salt + 500)].concat();
+            let warm = b.run(vec![warm_prompt], 16)?.remove(0);
+            println!(
+                "SUMMARY long cache={cache} model={} prompt={n} phase=warm_suffix1k ttft_s={:.3} cached={}",
+                spec.name, warm.ttft, warm.cached
+            );
+        }
+    }
+    Ok(())
+}
+
 fn clients(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> {
     let (system, unique, new, clients) = (2000usize, 200usize, 16usize, 16usize);
     let max_ctx = system + unique + new + 64;
@@ -240,7 +269,7 @@ fn itl(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> {
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: prefixbench <spec.toml | checkpoint dir> <turns|clients|itl|media> <on|off> [snapshot_interval] [kv_gb] [sync|video.mp4]";
+    let usage = "usage: prefixbench <spec.toml | checkpoint dir> <turns|clients|itl|media|long> <on|off> [snapshot_interval] [kv_gb] [sync|video.mp4|lengths]";
     let spec = load_spec(&PathBuf::from(args.first().context(usage)?))?;
     let mode = args.get(1).context(usage)?.as_str();
     let cache = args.get(2).context(usage)? == "on";
@@ -252,6 +281,10 @@ fn main() -> Result<()> {
         "turns" => turns(&spec, cache, interval, kv_gb),
         "media" => media(&spec, cache, interval, kv_gb, args.get(5).map(PathBuf::from).as_deref()),
         "clients" => clients(&spec, cache, interval, kv_gb),
+        "long" => {
+            let lengths: Vec<usize> = args.get(5).context(usage)?.split(',').map(|s| s.parse()).collect::<Result<_, _>>()?;
+            long(&spec, cache, interval, kv_gb, &lengths)
+        }
         _ => anyhow::bail!(usage),
     }
 }

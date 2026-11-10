@@ -1,10 +1,11 @@
 import base64
 import json
+import os
 import sys
 import urllib.request
 from pathlib import Path
 
-URL = "http://127.0.0.1:8001/v1/chat/completions"
+URL = os.environ.get("VLLM_URL", "http://127.0.0.1:8001") + "/v1/chat/completions"
 MODEL = "qwen3.8-27b"
 NEW = 32
 TOP = 20

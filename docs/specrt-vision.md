@@ -198,8 +198,18 @@ KL 0.040, top-1 94%; videos mean KL 0.074, top-1 90%. vLLM here serves with an f
 speculative MTP while specrt keeps bf16 planes, which is the one remaining difference that is not
 in the media path, so the gap on inputs with unusual or repetitive hidden states is not attributable to
 vision. Images keep the text gate (mean KL 0.05, top-1 90%); videos are gated at KL 0.09 and top-1 85%,
-a bound set from this measurement and not the text bound. #496 stays open for a run against a vLLM
-with an unquantised KV cache, which needs the user to start one.
+a bound set from this measurement and not the text bound.
+
+Run against a vLLM with an unquantised KV cache and no MTP (`--kv-cache-dtype auto`, bf16 planes like
+specrt, `docs/qwen27-run/launch.sh kvauto`, log in `docs/qwen27-run/vision-lm-kvauto.log`): the
+image population falls to mean KL 0.033, top-1 93% (178/192) and the video population to mean KL
+0.060, top-1 94% (181/192), from 0.074 and 90%. Single clips: 3 s video 0.108, 10 s video 0.048, 2
+frames 0.057, 4 frames 0.066, 3 images 0.109. So the fp8 KV cache and MTP explain about a fifth of
+the video gap, and the rest stays: video KL is still above the 0.05 text bound while the image
+population is inside it. The video gate therefore stays at KL 0.09 and top-1 85%, and #496 stays
+open for the remaining 0.01 to 0.06 on video. The text-only controls were not rerun because
+`vllm_vision.py` does not write their reference files (`vllm-textctrl.json`, `vllm-longtext.json`,
+`vllm-randtext.json`, `vllm-pos.json`, `plp-*.json`); those five tests need `/tmp/vis484`.
 
 ## Running the tests
 

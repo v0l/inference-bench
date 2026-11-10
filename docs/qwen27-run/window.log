@@ -1,0 +1,90 @@
+12712, /opt/Signal/signal-desktop --type=gpu-process --ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --enable-crash-reporter=a78bfd35-ac88-4540-b22a-3e633f4f48b0?no_channel --user-data-dir=/home/kieran/.config/Signal --gpu-preferences=YAAAAAAAAAAgAQAEAAAAAAAAAAAAAGAASAAAAAAAAAABAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAMAAAAAQAAAAAAAAAAAAAACAAAAAAAAAAIAAAAAAAAAA== --shared-files --field-trial-handle=3?i?15002312820283709970?5733527124334263496?262144 --enable-features=PdfUseShowSaveFilePicker --disable-features=DropInputEventsWhilePaintHolding?HardwareMediaKeyHandling?LocalNetworkAccessChecks?ScreenAIOCREnabled?SpareRendererForSitePerProcess?TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=7?i?16701851763220248298?3665411680311238866?4 --trace-process-track-uuid=3190708988185955192, 198 MiB
+669498, /opt/Lens/lens-desktop --type=gpu-process --ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --enable-crash-reporter=1130bb1d-ff46-4f8b-9b8e-1a347230410d?no_channel --user-data-dir=/home/kieran/.config/Lens --gpu-preferences=YAAAAAAAAAAgAQAEAAAAAAAAAAAAAGAASAAAAAAAAAABAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAMAAAAAAAAAAwAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAMAAAAAQAAAAAAAAAAAAAACAAAAAAAAAAIAAAAAAAAAA== --shared-files --field-trial-handle=3?i?15629971205026947809?6768549605764124673?262144 --enable-features=PdfUseShowSaveFilePicker --disable-features=DropInputEventsWhilePaintHolding?LocalNetworkAccessChecks?ScreenAIOCREnabled?SpareRendererForSitePerProcess?TraceSiteInstanceGetProcessCreation --variations-seed-version --pseudonymization-salt-handle=7?i?13467978169861601244?4784726363135292675?4 --trace-process-track-uuid=3190708988185955192, 61 MiB
+3796745, /opt/helium/helium --type=gpu-process --ozone-platform=wayland --render-node-override=/dev/dri/renderD128 --crashpad-handler-pid=3796707 --enable-crash-reporter=?deb --change-stack-guard-on-fork=enable --gpu-preferences=UAAAAAAAAAAgAQAEAAAAAAAAAAAAAGAAAQAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAAYAAAAAAAAABgAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAgAAAAAAAAA --shared-files --metrics-shmem-handle=4?i?6872969233150279615?6374604335345156631?262144 --field-trial-handle=3?i?4803850455889038114?11606610949824251006?262144 --disable-features=EyeDropper --variations-seed-version --pseudonymization-salt-handle=7?i?5671500559093477545?6521028340526915770?4 --trace-process-track-uuid=3190708988185955192, 178 MiB
+447142, agentbench, 261 MiB
+== window start 2026-11-10T14:30:13+00:00
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 2253 MiB, 97887 MiB, 180 MHz, 0 %
+12712, /opt/Signal/signal-desktop --type=gpu-process --ozone-platform=wayland --
+669498, /opt/Lens/lens-desktop --type=gpu-process --ozone-platform=wayland --ren
+3796745, /opt/helium/helium --type=gpu-process --ozone-platform=wayland --render
+447142, agentbench, 261 MiB
+Running as unit: vllm-bench.service; invocation ID: c89a7d6a650a4bcd918b197d584a27bc
+== mtp up 2026-11-10T14:31:23+00:00
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 43248 MiB, 97887 MiB, 180 MHz, 0 %
+12712, /opt/Signal/signal-desktop --type=gpu-process --ozone-platform=wayland --
+669498, /opt/Lens/lens-desktop --type=gpu-process --ozone-platform=wayland --ren
+3796745, /opt/helium/helium --type=gpu-process --ozone-platform=wayland --render
+447142, agentbench, 261 MiB
+1031160, VLLM::EngineCore, 40990 MiB
+(APIServer pid=1030430) INFO 11-10 14:30:17 [api_utils.py:345]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.27.1
+(APIServer pid=1030430) [transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(EngineCore pid=1031160) INFO 11-10 14:30:34 [core.py:121] Initializing a V1 LLM engine (v0.27.1) with config: model='orcarouter/Qwen3.8-27B-Uncensored-NVFP4', speculative_config=SpeculativeConfig(method='mtp', model='orcarouter/Qwen3.8-27B-Uncensored-NVFP4', num_spec_tokens=2), tokenizer='orcarouter/Qwen3.8-27B-Uncensored-NVFP4', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=262144, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=compressed-tensors, quantization_config=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=fp8, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='qwen3', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=qwen3.8-27b, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'ir_enable_torch_wrap': True, 'splitting_ops': ['vllm::unified_attention_with_output', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::qwen_gdn_attention_core', 'vllm::gdn_attention_core_xpu', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::deepseek_v4_attention', 'vllm::hpc_rope_norm_forward', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [16384], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 192, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=1031160) [transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(EngineCore pid=1031160) INFO 11-10 14:30:59 [kv_cache_utils.py:2235] GPU KV cache size: 400,663 tokens
+vllm-mtp 128 0.054679293010849506 2194.619650696858 112.00913666810553
+vllm-mtp 1024 0.1284499094763305 7911.620154564506 105.59222600364814
+vllm-mtp 4096 0.4655695484834723 8780.643575517428 118.21956665572384
+vllm-mtp 16384 2.0428676760056987 8016.22087140347 111.78114936600022
+vllm-mtp 32768 4.783440578030422 6848.754390360427 106.04472913545538
+vllm-mtp 65536 12.289451142016333 5332.053925007247 105.0630668111235
+vllm-mtp 131072 34.81937507900875 3764.1112082741943 98.70519143816426
+vllm-mtp 196608 67.56184650101932 2909.9263886612966 83.35873138330716
+vllm-mtp 260000 109.10398499300936 2382.9743708871724 85.12193897404853
+vllm-mtp conc 1 112.51758615431677
+vllm-mtp conc 4 431.4578596054764
+vllm-mtp conc 8 818.5994830171786
+vllm-mtp conc 16 1367.963815569089
+vllm-mtp conc 32 2318.626357913896
+vllm-mtp conc 4 108.82906674617097
+vllm-mtp prefix 8192 0.9823172580217943 0.3371313359821215
+vllm-mtp prefix 131072 34.85131291899597 1.8601887039840221
+vllm-mtp held 131072 96.78496632387792
+vllm-mtp held 260000 89.27326089079139
+== mtp done 2026-11-10T14:54:23+00:00
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 51502 MiB, 97887 MiB, 1867 MHz, 98 %
+12712, /opt/Signal/signal-desktop --type=gpu-process --ozone-platform=wayland --
+669498, /opt/Lens/lens-desktop --type=gpu-process --ozone-platform=wayland --ren
+3796745, /opt/helium/helium --type=gpu-process --ozone-platform=wayland --render
+447142, agentbench, 261 MiB
+1031160, VLLM::EngineCore, 49244 MiB
+Running as unit: vllm-bench.service; invocation ID: 508bfd635aee417a86323a5a7b44fa44
+== nomtp up 2026-11-10T14:57:34+00:00
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 43462 MiB, 97887 MiB, 180 MHz, 0 %
+12712, /opt/Signal/signal-desktop --type=gpu-process --ozone-platform=wayland --
+669498, /opt/Lens/lens-desktop --type=gpu-process --ozone-platform=wayland --ren
+3796745, /opt/helium/helium --type=gpu-process --ozone-platform=wayland --render
+447142, agentbench, 261 MiB
+1053773, VLLM::EngineCore, 41204 MiB
+(APIServer pid=1053412) INFO 11-10 14:54:43 [api_utils.py:345]  ▄▄ ▄█ █     █     █ ▀▄▀ █  version 0.27.1
+(APIServer pid=1053412) [transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(EngineCore pid=1053773) INFO 11-10 14:54:59 [core.py:121] Initializing a V1 LLM engine (v0.27.1) with config: model='orcarouter/Qwen3.8-27B-Uncensored-NVFP4', speculative_config=None, tokenizer='orcarouter/Qwen3.8-27B-Uncensored-NVFP4', skip_tokenizer_init=False, tokenizer_mode=auto, revision=None, tokenizer_revision=None, trust_remote_code=False, dtype=torch.bfloat16, max_seq_len=262144, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=False, quantization=compressed-tensors, quantization_config=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=fp8, device_config=cuda, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='qwen3', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=qwen3.8-27b, enable_prefix_caching=True, enable_chunked_prefill=True, pooler_config=None, compilation_config={'mode': <CompilationMode.VLLM_COMPILE: 3>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['none'], 'ir_enable_torch_wrap': True, 'splitting_ops': ['vllm::unified_attention_with_output', 'vllm::unified_mla_attention_with_output', 'vllm::mamba_mixer2', 'vllm::mamba_mixer', 'vllm::short_conv', 'vllm::linear_attention', 'vllm::qwen_gdn_attention_core', 'vllm::gdn_attention_core_xpu', 'vllm::olmo_hybrid_gdn_full_forward', 'vllm::sparse_attn_indexer', 'vllm::rocm_aiter_sparse_attn_indexer', 'vllm::deepseek_v4_attention', 'vllm::hpc_rope_norm_forward', 'vllm::unified_kv_cache_update', 'vllm::unified_mla_kv_cache_update'], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [], 'compile_ranges_endpoints': [16384], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.FULL_AND_PIECEWISE: (2, 1)>, 'cudagraph_num_of_warmups': 1, 'cudagraph_capture_sizes': [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': False, 'fuse_act_quant': False, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': 64, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=1053773) [transformers] The `use_fast` parameter is deprecated and will be removed in a future version. Use `backend="torchvision"` instead of `use_fast=True`, or `backend="pil"` instead of `use_fast=False`.
+(EngineCore pid=1053773) INFO 11-10 14:56:53 [kv_cache_utils.py:2235] GPU KV cache size: 439,919 tokens
+vllm-nomtp 128 0.04558319199713878 2632.5740434341756 59.939551202112874
+vllm-nomtp 1024 0.11312172550242394 8985.897356631356 59.41940801163124
+vllm-nomtp 4096 0.4558236770099029 8968.3840514627 58.741548347311934
+vllm-nomtp 16384 2.046826277015498 8000.926126849646 57.187158629783234
+vllm-nomtp 32768 4.664970062498469 7022.670861033026 56.03512998865822
+vllm-nomtp 65536 11.747263329976704 5578.1929269917555 54.187933724833
+vllm-nomtp 131072 33.131219007016625 3955.936543483132 50.49503985290696
+vllm-nomtp 196608 64.39361555501819 3053.097707054888 47.325937027874495
+vllm-nomtp 260000 103.94795282499399 2501.174798869975 44.26923726034468
+vllm-nomtp conc 1 59.28149272570657
+vllm-nomtp conc 4 215.19675761405765
+vllm-nomtp conc 8 434.4882471436962
+vllm-nomtp conc 16 806.1126294907339
+vllm-nomtp conc 32 1386.3461784759918
+vllm-nomtp conc 4 63.27289460440642
+vllm-nomtp prefix 8192 0.9371371819870546 0.13467859296360984
+vllm-nomtp prefix 131072 33.21896722295787 0.8323668090160936
+vllm-nomtp held 131072 50.18467482562522
+vllm-nomtp held 260000 43.844555506297915
+== nomtp done 2026-11-10T15:20:58+00:00
+NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition, 47478 MiB, 97887 MiB, 1830 MHz, 100 %
+12712, /opt/Signal/signal-desktop --type=gpu-process --ozone-platform=wayland --
+669498, /opt/Lens/lens-desktop --type=gpu-process --ozone-platform=wayland --ren
+3796745, /opt/helium/helium --type=gpu-process --ozone-platform=wayland --render
+447142, agentbench, 261 MiB
+1053773, VLLM::EngineCore, 45220 MiB
+window done 2026-11-10T15:21:14+00:00
+restarting service 2026-11-10T15:21:14+00:00

@@ -1,0 +1,41 @@
+{
+ "label": "vllm-mtp",
+ "suite": "held",
+ "tokens_per_word": 1.0,
+ "points": [
+  {
+   "prompt_len": 131072,
+   "decode_tokens": 512,
+   "runs": [
+    {
+     "prompt_tokens": 131063,
+     "completion_tokens": 512,
+     "cached_tokens": 0,
+     "ttft_s": 36.32100498699583,
+     "prefill_tok_s": 3608.4629279097608,
+     "decode_tok_s": 89.57733483990522,
+     "total_s": 42.02557301096385
+    },
+    {
+     "prompt_tokens": 131063,
+     "completion_tokens": 512,
+     "cached_tokens": 0,
+     "ttft_s": 36.401784332992975,
+     "prefill_tok_s": 3600.455373315595,
+     "decode_tok_s": 85.94675336285148,
+     "total_s": 42.34732596203685
+    },
+    {
+     "prompt_tokens": 131064,
+     "completion_tokens": 512,
+     "cached_tokens": 0,
+     "ttft_s": 36.51488977804547,
+     "prefill_tok_s": 3589.3302922908465,
+     "decode_tok_s": 92.9956868195166,
+     "total_s": 42.00976827699924
+    }
+   ],
+   "median_decode_tok_s": 89.57733483990522
+  }
+ ]
+}
