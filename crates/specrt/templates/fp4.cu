@@ -10,12 +10,6 @@ __device__ __forceinline__ float e2m1_to_f32(unsigned n) {
     return __uint_as_float(((n & 8u) << 28) | ((n & 7u) << 22)) * __uint_as_float(0x7e800000u);
 }
 
-__device__ __forceinline__ uint2 load_stream8(const void* p) {
-    uint2 r;
-    asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
-    return r;
-}
-
 __device__ __forceinline__ int fp4_t(int k, int kg) {
     return (k & (FP4_GROUP - 1)) * kg + (k >> 4);
 }

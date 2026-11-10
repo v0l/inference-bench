@@ -468,6 +468,13 @@ impl WeightFormat {
         }
     }
 
+    pub fn gemv_rows(self) -> usize {
+        match self {
+            WeightFormat::Ggml => 2,
+            _ => 1,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             WeightFormat::Bf16 => "bf16",

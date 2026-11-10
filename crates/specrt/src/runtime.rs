@@ -412,16 +412,23 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
 const FP4_GEMV_THREADS: u32 = 512;
 
-fn gemv_cfg(name: &str, rows: usize) -> LaunchConfig {
+fn gemv_cfg(name: &str, rows: usize, w: &DeviceMatrix, sms: u32) -> LaunchConfig {
     if name == "lm_head_norm_f4" {
         let per_block = FP4_GEMV_THREADS as usize / 32 * crate::codegen::fp4_head_rows(rows);
         cfg(grid(rows, per_block), FP4_GEMV_THREADS)
     } else if name.ends_with("_f4") {
         cfg(grid(rows, FP4_GEMV_THREADS as usize / 32), FP4_GEMV_THREADS)
     } else {
-        cfg(grid(rows, LINEAR_ROWS_PER_BLOCK), 256)
+        let format = crate::codegen::WeightFormat::of_kind(w.kind());
+        let pair = format.gemv_rows();
+        let per_warp = if name.starts_with("gate_up_act") || !rows.is_multiple_of(pair) { 1 } else { pair };
+        let blocks = grid(rows, LINEAR_ROWS_PER_BLOCK * per_warp);
+        let cap = if format == crate::codegen::WeightFormat::Ggml { sms * GEMV_BLOCKS_PER_SM } else { u32::MAX };
+        cfg(blocks.min(cap), 256)
     }
 }
+
+const GEMV_BLOCKS_PER_SM: u32 = 2;
 const PREFILL_CHUNK: usize = 2048;
 const SERVING_RESIDENT_SLOTS: usize = 8;
 const STATE_FREE_MARGIN: usize = 256 << 20;
@@ -845,7 +852,7 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel(name));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out);
-        unsafe { b.launch(gemv_cfg(name, rows)) }?;
+        unsafe { b.launch(gemv_cfg(name, rows, w, self.sms)) }?;
         Ok(())
     }
 
@@ -865,7 +872,7 @@ impl Runtime {
             b.arg(bias.unwrap_or(&self.buf.dummy));
         }
         b.arg(x).arg(norm).arg(out);
-        unsafe { b.launch(gemv_cfg(name, rows)) }?;
+        unsafe { b.launch(gemv_cfg(name, rows, w, self.sms)) }?;
         Ok(())
     }
 

@@ -35,10 +35,6 @@ constexpr int PAGES = (MAX_CTX + PAGE - 1) / PAGE;
 constexpr int ATTN_LAYERS = {{ATTN_LAYERS}};
 constexpr int KV_PLANES = {{KV_PLANES}};
 constexpr int Q8_GROUP = {{Q8_GROUP}};
-constexpr int WF_BF16 = 0;
-constexpr int WF_Q8 = 1;
-constexpr int WF_FP8 = 2;
-constexpr int WF_GGML = 3;
 constexpr int FP8_BLOCK = {{FP8_BLOCK}};
 constexpr int LINEAR_WARPS = 8;
 constexpr int ATTN_THREADS = 512;
@@ -95,6 +91,12 @@ __device__ __forceinline__ uint4 load_stream(const void* p) {
     uint4 r;
     asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
                  : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+    return r;
+}
+
+__device__ __forceinline__ uint2 load_stream8(const void* p) {
+    uint2 r;
+    asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(r.x), "=r"(r.y) : "l"(p));
     return r;
 }
 
@@ -268,6 +270,126 @@ __device__ __forceinline__ void gg_load8(const void* w, const unsigned* table, i
     gg_dequant8(base + (size_t)(k / GG_SB) * gg_bytes(type), type, (k % GG_SB) / 8, out);
 }
 
+template <int K, int R>
+__device__ __forceinline__ void gg_q4k_rows(const unsigned char* const* base, const float* x, int lane, float* out) {
+    constexpr int NSB = K / GG_SB;
+    int j = (lane & 7) >> 1;
+    int l0 = (lane & 1) * 16;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+#pragma unroll 2
+    for (int s0 = 0; s0 < NSB; s0 += 4) {
+        int s = s0 + (lane >> 3);
+        bool valid = s < NSB;
+        int sl = valid ? s : NSB - 1;
+        uint4 head[R], q[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const unsigned char* sb = base[r] + (size_t)sl * 144;
+            head[r] = load_stream(sb);
+            q[r] = load_stream(sb + 16 + 32 * j + l0);
+        }
+        const float* xs = x + sl * GG_SB + 64 * j + l0;
+        float4 a[4], b[4];
+        float slo = 0.0f, shi = 0.0f;
+#pragma unroll
+        for (int w4 = 0; w4 < 4; w4++) {
+            a[w4] = *(const float4*)(xs + 4 * w4);
+            b[w4] = *(const float4*)(xs + 32 + 4 * w4);
+            slo += a[w4].x + a[w4].y + a[w4].z + a[w4].w;
+            shi += b[w4].x + b[w4].y + b[w4].z + b[w4].w;
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            float d = gg_f16((unsigned short)(head[r].x & 0xffffu));
+            float dmin = gg_f16((unsigned short)(head[r].x >> 16));
+            unsigned scales[3] = {head[r].y, head[r].z, head[r].w};
+            float sc1, m1, sc2, m2;
+            gg_scale_min(scales, 2 * j, sc1, m1);
+            gg_scale_min(scales, 2 * j + 1, sc2, m2);
+            unsigned words[4] = {q[r].x, q[r].y, q[r].z, q[r].w};
+            float lo = 0.0f, hi = 0.0f;
+#pragma unroll
+            for (int w4 = 0; w4 < 4; w4++) {
+                unsigned v = words[w4];
+                lo += (float)(v & 15u) * a[w4].x + (float)((v >> 8) & 15u) * a[w4].y + (float)((v >> 16) & 15u) * a[w4].z + (float)((v >> 24) & 15u) * a[w4].w;
+                hi += (float)((v >> 4) & 15u) * b[w4].x + (float)((v >> 12) & 15u) * b[w4].y + (float)((v >> 20) & 15u) * b[w4].z + (float)(v >> 28) * b[w4].w;
+            }
+            float part = d * (sc1 * lo + sc2 * hi) - dmin * (m1 * slo + m2 * shi);
+            acc[r] += valid ? part : 0.0f;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++) out[r] = acc[r];
+}
+
+template <int K, int R>
+__device__ __forceinline__ void gg_q6k_rows(const unsigned char* const* base, const float* x, int lane, float* out) {
+    constexpr int NSB = K / GG_SB;
+    int h = (lane & 7) >> 2;
+    int l0 = (lane & 3) * 8;
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; r++) acc[r] = 0.0f;
+#pragma unroll 2
+    for (int s0 = 0; s0 < NSB; s0 += 4) {
+        int s = s0 + (lane >> 3);
+        bool valid = s < NSB;
+        int sl = valid ? s : NSB - 1;
+        uint2 qa[R], qb[R], qc[R];
+        unsigned sc[R][2];
+        unsigned short dh[R];
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            const unsigned char* sb = base[r] + (size_t)sl * 224;
+            qa[r] = load_stream8(sb + 64 * h + l0);
+            qb[r] = load_stream8(sb + 64 * h + 32 + l0);
+            qc[r] = load_stream8(sb + 128 + 32 * h + l0);
+            unsigned w = __ldg((const unsigned*)(sb + 192 + 8 * h));
+            unsigned w2 = __ldg((const unsigned*)(sb + 196 + 8 * h));
+            sc[r][0] = w;
+            sc[r][1] = w2;
+            dh[r] = __ldg((const unsigned short*)(sb + 208));
+        }
+        const float* xs = x + sl * GG_SB + 128 * h + l0;
+        float xv[4][8];
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float4 u = *(const float4*)(xs + 32 * k);
+            float4 v = *(const float4*)(xs + 32 * k + 4);
+            xv[k][0] = u.x; xv[k][1] = u.y; xv[k][2] = u.z; xv[k][3] = u.w;
+            xv[k][4] = v.x; xv[k][5] = v.y; xv[k][6] = v.z; xv[k][7] = v.w;
+        }
+#pragma unroll
+        for (int r = 0; r < R; r++) {
+            unsigned a[2] = {qa[r].x, qa[r].y}, b[2] = {qb[r].x, qb[r].y}, c[2] = {qc[r].x, qc[r].y};
+            float part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+                unsigned av = (a[i >> 2] >> (8 * (i & 3))) & 0xffu;
+                unsigned bv = (b[i >> 2] >> (8 * (i & 3))) & 0xffu;
+                unsigned cv = (c[i >> 2] >> (8 * (i & 3))) & 0xffu;
+                part[0] += (float)((int)((av & 15u) | ((cv & 3u) << 4)) - 32) * xv[0][i];
+                part[1] += (float)((int)((bv & 15u) | (((cv >> 2) & 3u) << 4)) - 32) * xv[1][i];
+                part[2] += (float)((int)((av >> 4) | (((cv >> 4) & 3u) << 4)) - 32) * xv[2][i];
+                part[3] += (float)((int)((bv >> 4) | (((cv >> 6) & 3u) << 4)) - 32) * xv[3][i];
+            }
+            int sh = 8 * (l0 / 16);
+            float sum = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 4; k++) {
+                unsigned word = sc[r][k >> 1];
+                sum += (float)(signed char)((word >> (16 * (k & 1) + sh)) & 0xffu) * part[k];
+            }
+            float d = gg_f16(dh[r]);
+            acc[r] += valid ? d * sum : 0.0f;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; r++) out[r] = acc[r];
+}
+
 template <int K>
 __device__ __forceinline__ float gg_q4k_dot(const unsigned char* base, const float* x, int lane) {
     int j = (lane & 7) >> 1;
@@ -413,37 +535,42 @@ __device__ __forceinline__ void load_normed(const float* x, const float* nw, flo
     __syncthreads();
 }
 
-template <typename D, int N, int K, bool BIAS, bool RESIDUAL, int ROWS = 1>
+template <typename D, int N>
+__host__ __device__ constexpr int gemv_rows() {
+    return N % D::PAIR == 0 ? D::PAIR : 1;
+}
+
+template <typename D, int N, int K, bool BIAS, bool RESIDUAL, int ROWS = gemv_rows<D, N>()>
 __device__ void linear_w(const void* w, const void* s, const float* bias, const float* x, float* out) {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int row = (blockIdx.x * D::WARPS + warp) * ROWS;
-    if (row >= N) return;
-    float acc[ROWS];
-    D::template rows<K, ROWS>(w, s, row, 1, x, lane, acc);
-    if (lane == 0) {
+    for (int row = (blockIdx.x * D::WARPS + warp) * ROWS; row < N; row += gridDim.x * D::WARPS * ROWS) {
+        float acc[ROWS];
+        D::template rows<K, ROWS>(w, s, row, 1, x, lane, acc);
+        if (lane == 0) {
 #pragma unroll
-        for (int r = 0; r < ROWS; r++) {
-            float v = acc[r];
-            if (BIAS) v += bias[row + r];
-            out[row + r] = RESIDUAL ? out[row + r] + v : v;
+            for (int r = 0; r < ROWS; r++) {
+                float v = acc[r];
+                if (BIAS) v += bias[row + r];
+                out[row + r] = RESIDUAL ? out[row + r] + v : v;
+            }
         }
     }
 }
 
-template <typename D, int N, bool BIAS, int ROWS = 1>
+template <typename D, int N, bool BIAS, int ROWS = gemv_rows<D, N>()>
 __device__ void linear_norm(const void* w, const void* s, const float* bias, const float* x, const float* nw, float* out) {
     __shared__ __align__(16) float xs[HIDDEN];
     load_normed<D>(x, nw, xs);
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int row = (blockIdx.x * D::WARPS + warp) * ROWS;
-    if (row >= N) return;
-    float acc[ROWS];
-    D::template rows<HIDDEN, ROWS>(w, s, row, 1, xs, lane, acc);
-    if (lane == 0) {
+    for (int row = (blockIdx.x * D::WARPS + warp) * ROWS; row < N; row += gridDim.x * D::WARPS * ROWS) {
+        float acc[ROWS];
+        D::template rows<HIDDEN, ROWS>(w, s, row, 1, xs, lane, acc);
+        if (lane == 0) {
 #pragma unroll
-        for (int r = 0; r < ROWS; r++) out[row + r] = BIAS ? acc[r] + bias[row + r] : acc[r];
+            for (int r = 0; r < ROWS; r++) out[row + r] = BIAS ? acc[r] + bias[row + r] : acc[r];
+        }
     }
 }
 
@@ -453,11 +580,11 @@ __device__ void gate_up_act_norm(const void* w, const void* s, const float* x, c
     load_normed<D>(x, nw, xs);
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
-    int row = blockIdx.x * D::WARPS + warp;
-    if (row >= INTER) return;
-    float gu[2];
-    D::template rows<HIDDEN, 2>(w, s, 2 * row, 1, xs, lane, gu);
-    if (lane == 0) out[D::template x_at<INTER>(row)] = activation(gu[0]) * gu[1];
+    for (int row = blockIdx.x * D::WARPS + warp; row < INTER; row += gridDim.x * D::WARPS) {
+        float gu[2];
+        D::template rows<HIDDEN, 2>(w, s, 2 * row, 1, xs, lane, gu);
+        if (lane == 0) out[D::template x_at<INTER>(row)] = activation(gu[0]) * gu[1];
+    }
 }
 
 constexpr int GEMM_BM = 64;
@@ -623,6 +750,7 @@ struct DecBase {
     static constexpr int ACC = ACC_PLAIN;
     static constexpr bool LDSM = true;
     static constexpr int WARPS = LINEAR_WARPS;
+    static constexpr int PAIR = 1;
     template <int BK> static constexpr int wrow = BK * 2;
     template <int BK> static constexpr int w_chunks = BK / 8;
     template <int K, int ROWS>
@@ -694,6 +822,7 @@ struct DecFp8 : DecBytes<DecFp8, FP8_BLOCK> {
 };
 
 struct DecGgml : DecBase<DecGgml> {
+    static constexpr int PAIR = 2;
     template <int K, int BK, int CPR, int WROW>
     static __device__ __forceinline__ void load(unsigned char* ws, const void* w, const void* s, int r, int n, int kt, int ck) {
         float v[8];
@@ -704,6 +833,26 @@ struct DecGgml : DecBase<DecGgml> {
     }
     template <int K> static __device__ __forceinline__ float dot(const void* w, const void* s, int row, const float* x, int lane) {
         return gg_row_dot<K>(w, (const unsigned*)s, row, x, lane);
+    }
+    template <int K, int ROWS>
+    static __device__ __forceinline__ void rows(const void* w, const void* s, int row0, int stride, const float* x, int lane, float* out) {
+        const unsigned char* base[ROWS];
+        int type[ROWS];
+        bool same = true;
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) {
+            base[r] = gg_row(w, (const unsigned*)s, row0 + r * stride, type[r]);            same = same && type[r] == type[0];
+        }
+        if (same && type[0] == GG_Q4K) {
+            gg_q4k_rows<K, ROWS>(base, x, lane, out);
+        } else if (same && type[0] == GG_Q6K) {
+            gg_q6k_rows<K, ROWS>(base, x, lane, out);
+        } else {
+#pragma unroll
+            for (int r = 0; r < ROWS; r++) out[r] = dot<K>(w, s, row0 + r * stride, x, lane);
+        }
+#pragma unroll
+        for (int r = 0; r < ROWS; r++) out[r] = warp_sum(out[r]);
     }
     template <int K> static __device__ __forceinline__ float at(const void* w, const void* s, int n, int k) {
         float v[8];

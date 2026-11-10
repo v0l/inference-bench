@@ -2,7 +2,7 @@
 set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$here/..
-bin=${CARGO_TARGET_DIR:-/mnt/data/cargo-target/inference-bench}/release/logitdump
+bin=${1:?usage: dumpall.sh <logitdump binary>}
 g=$HOME/.cache/specrt-gguf
 for m in "$root/specs/qwen3-0.6b.toml" "$root/specs/qwen3-0.6b-q8.toml" "$root/specs/llama-3.2-1b.toml" \
     "$g/Qwen3-0.6B-Q4_K_M.gguf" "$g/Qwen3-0.6B-Q8_0.gguf" "$g/Llama-3.2-1B-Instruct-Q4_K_M.gguf"; do
