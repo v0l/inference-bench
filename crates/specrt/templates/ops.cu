@@ -1956,7 +1956,6 @@ __device__ __forceinline__ void mma_kv(float* c, const unsigned* ah, const unsig
         mma_hi_lo(c, ah, al, bh0, bh1, bl0, bl1);
         return;
     }
-    mma_f16(c, al[0], al[1], al[2], al[3], bh0, bh1);
     mma_f16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
 }
 
@@ -2031,7 +2030,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             qh[kb][i] = pack_hi(v[i].x, v[i].y);
-            ql[kb][i] = pack_lo(v[i].x, v[i].y);
+            if (KV_PLANES == 2) ql[kb][i] = pack_lo(v[i].x, v[i].y);
         }
     }
     float o[FM_NB][4];
@@ -2146,10 +2145,12 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             ph[1] = pack_hi(s[2 * kb][2], s[2 * kb][3]);
             ph[2] = pack_hi(s[2 * kb + 1][0], s[2 * kb + 1][1]);
             ph[3] = pack_hi(s[2 * kb + 1][2], s[2 * kb + 1][3]);
-            pl[0] = pack_lo(s[2 * kb][0], s[2 * kb][1]);
-            pl[1] = pack_lo(s[2 * kb][2], s[2 * kb][3]);
-            pl[2] = pack_lo(s[2 * kb + 1][0], s[2 * kb + 1][1]);
-            pl[3] = pack_lo(s[2 * kb + 1][2], s[2 * kb + 1][3]);
+            if (KV_PLANES == 2) {
+                pl[0] = pack_lo(s[2 * kb][0], s[2 * kb][1]);
+                pl[1] = pack_lo(s[2 * kb][2], s[2 * kb][3]);
+                pl[2] = pack_lo(s[2 * kb + 1][0], s[2 * kb + 1][1]);
+                pl[3] = pack_lo(s[2 * kb + 1][2], s[2 * kb + 1][3]);
+            }
 #pragma unroll
             for (int np = 0; np < FM_NB / 2; np++) {
                 unsigned bh[4], bl[4] = {0, 0, 0, 0};

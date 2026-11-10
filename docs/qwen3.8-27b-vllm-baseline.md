@@ -58,6 +58,18 @@ Single stream, 128 output tokens, 6 runs up to 65k and 3 runs from 131k (medians
 
 specrt ran every length to 260k without an out of memory error at KV 24 GB. Its long prefill is 4x to 5x slower than vLLM and falls with length (1,374 tok/s at 4k to 532 at 260k), so prefill attention at long context is the gap to close.
 
+#505 profile (nsys, 16k prompt, `qwen3.8-27b.toml`): prefill is GEMM bound, not attention bound. gate_up 37%, down 16%, lin_in 11%, flash_mma 8% at 16k and 28% at 64k (it grows with length). With 1-plane (serving) KV the flash kernel now skips the unused lo plane: half the shared memory per stage, 32 keys per tile instead of 16 for head_dim 256, one fewer MMA per tile. flash_mma median per call at 16k: 8.6 ms before, 7.7 ms after (GPU shared with other jobs, so noisy). The 27B gate (10 real27b tests) and the non-27B suite pass.
+
+Bigger lever, config only: `qwen3.8-27b-nvfp4-act.toml` (native FP8 projections and FP4 MLPs) through `prefixbench long`, bf16 KV, cold single run:
+
+| prompt | `qwen3.8-27b.toml` before | `qwen3.8-27b-nvfp4-act.toml` before the flash change | `qwen3.8-27b-nvfp4-act.toml` after |
+|---|---|---|---|
+| 4,096 | 1,356 tok/s | 2,484 | 2,640 |
+| 32,768 | 1,101 | 1,599 | 2,062 |
+| 65,536 | n/a | n/a | 1,669 |
+
+Still 3x below vLLM at 32k (6,849 tok/s). The remaining gap is the GEMM kernels and flash_mma at long KV.
+
 Decode of 512 tokens after a held prefix (median tok/s):
 
 | held prefix | MTP | off |
