@@ -207,9 +207,8 @@ image population falls to mean KL 0.033, top-1 93% (178/192) and the video popul
 frames 0.057, 4 frames 0.066, 3 images 0.109. So the fp8 KV cache and MTP explain about a fifth of
 the video gap, and the rest stays: video KL is still above the 0.05 text bound while the image
 population is inside it. The video gate therefore stays at KL 0.09 and top-1 85%, and #496 stays
-open for the remaining 0.01 to 0.06 on video. The text-only controls were not rerun because
-`vllm_vision.py` does not write their reference files (`vllm-textctrl.json`, `vllm-longtext.json`,
-`vllm-randtext.json`, `vllm-pos.json`, `plp-*.json`); those five tests need `/tmp/vis484`.
+open for the remaining 0.01 to 0.06 on video. The text-only controls, the prompt logprob files and the position references are written by
+`vllm_vision.py` and `vision_positions.py` (see below).
 
 ## Running the tests
 
@@ -224,10 +223,15 @@ the vLLM server on port 8001 and its reference output:
 
 ```
 ~/.venv-vllm/bin/python crates/specrt/scripts/vllm_vision.py /tmp/vis484
+CUDA_VISIBLE_DEVICES= ~/.venv-vllm/bin/python crates/specrt/scripts/vision_positions.py /tmp/vis484
 SPECRT_VISION_REF_DIR=/tmp/vis484 flock /tmp/gpu27.lock cargo test --release -p inference-bench-specrt \
   --test vision_lm --test vision_encoder -- --include-ignored --nocapture --test-threads=1 \
-  --skip control --skip bisect --skip positions_equal --skip noise --skip prompt_position
+  --skip bisect --skip noise
 ```
+
+`vllm_vision.py` also writes `vllm-textctrl/longtext/randtext.json` and `plp-*.json` (prompt logprobs);
+`vision_positions.py` (needs the transformers and vLLM packages, no server) writes `vllm-pos.json` and
+`hf-pos-video.json` from the prompt ids.
 
 Without `SPECRT_VISION_REF_DIR` the `vision_lm` tests print `skipped` and pass. The fixtures behind
 `vision.rs` come from `scripts/vision_reference.py` and `scripts/vision_encoder_reference.py`
