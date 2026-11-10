@@ -991,7 +991,7 @@ impl Runtime {
                 .arg(&buf.attn_part);
             unsafe {
                 b.launch(LaunchConfig {
-                    grid_dim: (a.heads as u32, ATTN_SPLITS as u32, 1),
+                    grid_dim: (a.kv_heads as u32, ATTN_SPLITS as u32, 1),
                     block_dim: (ATTN_BLOCK, 1, 1),
                     shared_mem_bytes: 0,
                 })
