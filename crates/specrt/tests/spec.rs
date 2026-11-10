@@ -370,11 +370,12 @@ fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
     assert_eq!(Spec::parse(&base).unwrap().runtime, RuntimeOptions::default());
     let d = RuntimeOptions::default();
     assert!(d.graphs && d.fuse && !d.gemm_fp32 && d.tile == TileChoice::Auto && d.cache_dir.is_none());
-    let with = format!("{base}\n[runtime]\ngraphs = false\nfuse = false\ntile = \"big\"\nbig_tile = [64, 128, 2, 4]\nfp4_tile = [64, 256, 2, 4]\nfp4_stages = 4\nunsplit = [\"lm_head\"]\ngemm_fp32 = true\ncache_dir = \"/tmp/x\"\n");
+    let with = format!("{base}\n[runtime]\nbackend = \"wgpu\"\ngraphs = false\nfuse = false\ntile = \"big\"\nbig_tile = [64, 128, 2, 4]\nfp4_tile = [64, 256, 2, 4]\nfp4_stages = 4\nunsplit = [\"lm_head\"]\ngemm_fp32 = true\ncache_dir = \"/tmp/x\"\n");
     let s = Spec::parse(&with).unwrap();
     assert_eq!(
         s.runtime,
         RuntimeOptions {
+            backend: specrt::spec::BackendChoice::Wgpu,
             graphs: false,
             fuse: false,
             tile: TileChoice::Big,
@@ -393,6 +394,7 @@ fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
     let bad = |extra: &str| format!("{:#}", Spec::parse(&format!("{base}\n[runtime]\n{extra}\n")).unwrap_err());
     assert!(bad("tile = \"huge\"").contains("huge"));
     assert!(bad("bogus = 1").contains("bogus"));
+    assert!(bad("backend = \"metal\"").contains("metal"));
     assert!(bad("unsplit = [\"nope\"]").contains("nope"));
     assert!(bad("big_tile = [60, 128, 2, 4]").contains("big_tile"));
     assert!(bad("fp4_tile = [60, 128, 2, 4]").contains("fp4_tile"));

@@ -3125,6 +3125,7 @@ dependencies = [
  "memmap2",
  "minijinja",
  "minijinja-contrib",
+ "pollster",
  "safetensors",
  "serde",
  "serde_json",
@@ -3133,6 +3134,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
+ "wgpu",
 ]
 
 [[package]]

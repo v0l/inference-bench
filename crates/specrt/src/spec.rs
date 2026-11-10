@@ -83,9 +83,19 @@ pub enum TileChoice {
     Narrow,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendChoice {
+    #[default]
+    Auto,
+    Cuda,
+    Wgpu,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RuntimeOptions {
+    pub backend: BackendChoice,
     pub graphs: bool,
     pub fuse: bool,
     pub tile: TileChoice,
@@ -138,7 +148,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default() }
     }
 }
 

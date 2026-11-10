@@ -1,6 +1,6 @@
 use crate::chat::ChatTemplate;
 use crate::runtime::{Runtime, Sampling};
-use crate::spec::Spec;
+use crate::spec::{BackendChoice, Spec};
 use crate::weights::find_in_snapshot;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -184,11 +184,65 @@ pub fn render_prompt(chat: Option<&ChatTemplate>, messages: &[Value], template: 
     }
 }
 
+enum Device {
+    Cuda(Runtime),
+    #[cfg(feature = "wgpu")]
+    Wgpu(crate::backends::dense::Dense<crate::backends::wgpu::Wgpu>),
+}
+
+impl Device {
+    fn load(spec: &Spec, max_ctx: usize) -> Result<Self> {
+        match spec.runtime.backend {
+            BackendChoice::Cuda => Ok(Device::Cuda(Runtime::load(spec, max_ctx)?)),
+            BackendChoice::Wgpu => Self::wgpu(spec, max_ctx),
+            BackendChoice::Auto => match Runtime::load(spec, max_ctx) {
+                Ok(rt) => Ok(Device::Cuda(rt)),
+                Err(cuda) => Self::wgpu(spec, max_ctx).map_err(|wgpu| cuda.context(format!("wgpu fallback failed too: {wgpu:#}"))),
+            },
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu(spec: &Spec, max_ctx: usize) -> Result<Self> {
+        let be = crate::backends::wgpu::Wgpu::new(spec.runtime.cache_dir.clone().or_else(|| Some(crate::jit::default_cache_dir())))?;
+        Ok(Device::Wgpu(crate::backends::dense::Dense::load(be, spec, max_ctx)?))
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    fn wgpu(_: &Spec, _: usize) -> Result<Self> {
+        bail!("backend wgpu was requested but this build has no wgpu support (build with --features wgpu)")
+    }
+
+    fn generate_with(
+        &mut self,
+        prompt: &[u32],
+        new_tokens: usize,
+        sampling: Sampling,
+        stop: &[u32],
+        chunked: bool,
+        on_tokens: &mut dyn FnMut(&[u32]) -> bool,
+    ) -> Result<crate::runtime::Generation> {
+        match self {
+            Device::Cuda(r) => r.generate_with(prompt, new_tokens, sampling, stop, chunked, on_tokens),
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(d) => d.generate_with(prompt, new_tokens, sampling, stop, chunked, on_tokens),
+        }
+    }
+
+    fn prompt_logits(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        match self {
+            Device::Cuda(r) => r.prompt_logits(tokens),
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(d) => d.prompt_logits(tokens),
+        }
+    }
+}
+
 pub struct Engine {
     spec: Spec,
     tokenizer: Tokenizer,
     chat: Option<ChatTemplate>,
-    runtime: Runtime,
+    runtime: Device,
     max_ctx: usize,
     stop: Vec<u32>,
 }
@@ -205,7 +259,7 @@ impl Engine {
         }
         let max_ctx = max_ctx.unwrap_or(DEFAULT_CTX).min(MAX_CTX);
         tracing::info!(model, spec = %spec.name, max_ctx, "loading model");
-        let runtime = Runtime::load(&spec, max_ctx)?;
+        let runtime = Device::load(&spec, max_ctx)?;
         Ok(Self { spec, tokenizer, chat, runtime, max_ctx, stop })
     }
 

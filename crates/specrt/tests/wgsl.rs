@@ -422,3 +422,70 @@ fn generated_wgsl_has_no_unfilled_slots() {
         assert!(!k.source.contains("{{"), "{} has an unfilled slot", k.name);
     }
 }
+
+const PROMPT: [u32; 18] = [785, 6722, 315, 9625, 374, 12095, 13, 9645, 264, 2805, 32794, 911, 279, 9396, 323, 279, 9759, 13];
+
+fn log_softmax(row: &[f32]) -> Vec<f64> {
+    let max = row.iter().copied().fold(f32::MIN, f32::max) as f64;
+    let sum: f64 = row.iter().map(|&v| (v as f64 - max).exp()).sum();
+    row.iter().map(|&v| v as f64 - max - sum.ln()).collect()
+}
+
+fn kl(reference: &[f32], ours: &[f32]) -> f64 {
+    let (p, q) = (log_softmax(reference), log_softmax(ours));
+    p.iter().zip(&q).map(|(lp, lq)| lp.exp() * (lp - lq)).sum()
+}
+
+fn argmax(row: &[f32]) -> usize {
+    (0..row.len()).fold(0, |b, i| if row[i] > row[b] { i } else { b })
+}
+
+fn gguf_dir() -> std::path::PathBuf {
+    dirs::home_dir().unwrap().join(".cache/specrt-gguf")
+}
+
+fn compare_with_cuda(spec: &Spec, mean_bound: f64, max_bound: f64, greedy: usize, require_equal: bool) {
+    let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let vocab = spec.dims.vocab;
+    let (cuda_logits, cuda_tokens) = {
+        let mut rt = specrt::runtime::Runtime::load(spec, 256).unwrap();
+        let l = rt.prompt_logits(&PROMPT).unwrap();
+        let g = rt.generate(&PROMPT, greedy, specrt::runtime::Sampling::GREEDY).unwrap().tokens;
+        (l, g)
+    };
+    let be = device();
+    let mut dense = specrt::backends::dense::Dense::load(be, spec, 256).unwrap();
+    let ours = dense.prompt_logits(&PROMPT).unwrap();
+    let rows = PROMPT.len();
+    let kls: Vec<f64> = (0..rows).map(|r| kl(&cuda_logits[r * vocab..(r + 1) * vocab], &ours[r * vocab..(r + 1) * vocab])).collect();
+    let top1 = (0..rows).filter(|&r| argmax(&cuda_logits[r * vocab..(r + 1) * vocab]) == argmax(&ours[r * vocab..(r + 1) * vocab])).count();
+    let (mean, max) = (kls.iter().sum::<f64>() / rows as f64, kls.iter().copied().fold(0.0, f64::max));
+    let out = dense.generate(&PROMPT, greedy, specrt::runtime::Sampling::GREEDY).unwrap();
+    let same = out.tokens.iter().zip(&cuda_tokens).take_while(|(a, b)| a == b).count();
+    eprintln!("{}: mean KL {mean:.3e} max KL {max:.3e} top1 {top1}/{rows} greedy prefix {same}/{greedy} prefill {:.3}s decode {:.3}s", spec.name, out.prefill_secs, out.decode_secs);
+    assert!(mean <= mean_bound && max <= max_bound, "mean KL {mean} max KL {max}");
+    assert_eq!(top1, rows);
+    if require_equal {
+        assert_eq!(same, greedy, "greedy tokens differ from CUDA after {same}");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter, the CUDA backend and Qwen3-0.6B in the HF cache"]
+fn qwen3_bf16_logits_match_cuda_and_greedy_64_tokens_are_equal() {
+    compare_with_cuda(&spec(), 1e-4, 1e-3, 64, true);
+}
+
+#[test]
+#[ignore = "needs a GPU adapter, the CUDA backend and the Qwen3-0.6B Q4_K_M GGUF in ~/.cache/specrt-gguf"]
+fn qwen3_q4_k_m_gguf_logits_match_cuda_within_the_kl_bound() {
+    let s = Spec::from_gguf_file(&gguf_dir().join("Qwen3-0.6B-Q4_K_M.gguf")).unwrap();
+    compare_with_cuda(&s, 1e-3, 1e-2, 32, false);
+}
+
+#[test]
+#[ignore = "needs a GPU adapter, the CUDA backend and the Llama-3.2-1B Q4_K_M GGUF in ~/.cache/specrt-gguf"]
+fn llama_3_2_1b_q4_k_m_gguf_logits_match_cuda_within_the_kl_bound() {
+    let s = Spec::from_gguf_file(&gguf_dir().join("Llama-3.2-1B-Instruct-Q4_K_M.gguf")).unwrap();
+    compare_with_cuda(&s, 1e-3, 1e-2, 32, false);
+}
