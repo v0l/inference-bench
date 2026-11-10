@@ -1,5 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::path::Path;
 use std::process::Command;
 
@@ -326,6 +328,7 @@ pub fn decode_frames(path: &Path, info: &VideoInfo, indices: &[usize]) -> Result
     Ok(ordered)
 }
 
+#[derive(Clone, Debug, PartialEq)]
 pub struct VideoPatches {
     pub patches: Patches,
     pub timestamps: Vec<f64>,
@@ -385,7 +388,7 @@ pub fn expand_placeholders(prompt: &str, tokens: &MediaTokens, merge_size: usize
                 for ts in v.timestamps.iter().take(t) {
                     s.push_str(&format!("<{ts:.1} seconds>{}{}{}", tokens.start, tokens.video.repeat(per_frame), tokens.end));
                 }
-                (&video_slot, s)
+                (&video_slot, format!("{}{s}{}", tokens.start, tokens.end))
             }
         };
         let at = rest.find(slot.as_str()).context("prompt has fewer media placeholders than media items")?;
@@ -397,7 +400,7 @@ pub fn expand_placeholders(prompt: &str, tokens: &MediaTokens, merge_size: usize
     Ok(out)
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionConfig {
     pub depth: usize,
     pub hidden_size: usize,
@@ -408,15 +411,15 @@ pub struct VisionConfig {
     pub temporal_patch_size: usize,
     pub out_hidden_size: usize,
     pub num_position_embeddings: usize,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_channels: Option<usize>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden_act: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deepstack_visual_indexes: Vec<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionTokens {
     pub image: u32,
     pub video: u32,
@@ -424,7 +427,7 @@ pub struct VisionTokens {
     pub end: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Vision {
     pub config: VisionConfig,
     pub tokens: VisionTokens,
@@ -447,4 +450,182 @@ impl Vision {
         };
         Ok(Some(Vision { config, tokens }))
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKind {
+    Image,
+    Video,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaItem {
+    pub kind: MediaKind,
+    pub bytes: Arc<Vec<u8>>,
+    pub hash: [u8; 32],
+}
+
+impl MediaItem {
+    pub fn new(kind: MediaKind, bytes: Vec<u8>) -> Self {
+        let mut h = Sha256::new();
+        h.update([kind as u8]);
+        h.update(&bytes);
+        Self { kind, hash: h.finalize().into(), bytes: Arc::new(bytes) }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Processed {
+    Image(Patches),
+    Video(VideoPatches),
+}
+
+impl Processed {
+    pub fn patches(&self) -> &Patches {
+        match self {
+            Processed::Image(p) => p,
+            Processed::Video(v) => &v.patches,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaAssets {
+    pub image: Preprocessor,
+    pub video: Preprocessor,
+    pub tokens: MediaTokens,
+    pub ids: VisionTokens,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MediaBudget {
+    pub max_pixels: Option<usize>,
+    pub max_video_secs: Option<f64>,
+}
+
+impl MediaAssets {
+    pub fn merge(&self) -> usize {
+        self.image.merge_size
+    }
+
+    pub fn process(&self, items: &[MediaItem], budget: MediaBudget) -> Result<Vec<Processed>> {
+        items
+            .iter()
+            .map(|item| match item.kind {
+                MediaKind::Image => {
+                    let mut cfg = self.image.clone();
+                    if let Some(px) = budget.max_pixels {
+                        cfg.size.longest_edge = cfg.size.longest_edge.min(px);
+                        cfg.size.shortest_edge = cfg.size.shortest_edge.min(cfg.size.longest_edge);
+                    }
+                    preprocess_image(&cfg, &item.bytes).map(Processed::Image)
+                }
+                MediaKind::Video => {
+                    let mut cfg = self.video.clone();
+                    if let Some(px) = budget.max_pixels {
+                        cfg.size.longest_edge = cfg.size.longest_edge.min(px);
+                        cfg.size.shortest_edge = cfg.size.shortest_edge.min(cfg.size.longest_edge);
+                    }
+                    preprocess_video_limited(&cfg, &item.bytes, budget.max_video_secs).map(Processed::Video)
+                }
+            })
+            .collect()
+    }
+
+    pub fn expand(&self, prompt: &str, processed: &[Processed]) -> Result<String> {
+        let media: Vec<Media> = processed
+            .iter()
+            .map(|p| match p {
+                Processed::Image(i) => Media::Image(i),
+                Processed::Video(v) => Media::Video(v),
+            })
+            .collect();
+        expand_placeholders(prompt, &self.tokens, self.merge(), &media)
+    }
+}
+
+pub fn preprocess_video_limited(cfg: &Preprocessor, bytes: &[u8], max_secs: Option<f64>) -> Result<VideoPatches> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+    let path = std::env::temp_dir().join(format!("specrt-video-{}-{nanos}.bin", std::process::id()));
+    std::fs::write(&path, bytes)?;
+    let out = (|| {
+        let info = probe_video(&path)?;
+        if let Some(limit) = max_secs {
+            let secs = info.frames as f64 / info.fps;
+            ensure!(secs <= limit, "video is {secs:.1} s long, the limit is {limit} s");
+        }
+        preprocess_video_file(cfg, &path)
+    })();
+    let _ = std::fs::remove_file(&path);
+    out
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MediaPlan {
+    pub positions: Vec<[i32; 4]>,
+    pub delta: i32,
+    pub tags: Vec<u32>,
+    pub embeds: Arc<Vec<f32>>,
+}
+
+fn tag(hash: &[u8; 32], row: usize) -> u32 {
+    let mut h = Sha256::new();
+    h.update(hash);
+    h.update((row as u64).to_le_bytes());
+    let d = h.finalize();
+    u32::from_le_bytes([d[0], d[1], d[2], d[3]]) | 0x8000_0000
+}
+
+pub fn plan_media(ids: &[u32], vis: &VisionTokens, merge: usize, processed: &[Processed], hashes: &[[u8; 32]]) -> Result<MediaPlan> {
+    ensure!(processed.len() == hashes.len(), "one hash per media item");
+    let modality = |t: u32| if t == vis.image { 1 } else if t == vis.video { 2 } else { 0 };
+    let mut positions = vec![[0i32; 4]; ids.len()];
+    let mut tags = vec![0u32; ids.len()];
+    let mut cur = 0i32;
+    let mut next_item = 0usize;
+    let mut frame = 0usize;
+    let mut embed_row = 0i32;
+    let mut item_row = 0usize;
+    let mut i = 0;
+    while i < ids.len() {
+        let m = modality(ids[i]);
+        let mut j = i;
+        while j < ids.len() && modality(ids[j]) == m {
+            j += 1;
+        }
+        if m == 0 {
+            for (k, p) in positions[i..j].iter_mut().enumerate() {
+                let v = cur + k as i32;
+                *p = [v, v, v, -1];
+            }
+            cur += (j - i) as i32;
+        } else {
+            let item = processed.get(next_item).context("more media placeholders than media items")?;
+            let [t, h, w] = item.patches().grid;
+            let (lh, lw) = (h / merge, w / merge);
+            match (m, item) {
+                (1, Processed::Image(_)) | (2, Processed::Video(_)) => {}
+                _ => bail!("media placeholder kind does not match media item {next_item}"),
+            }
+            ensure!(j - i == lh * lw, "media run of {} tokens, the grid needs {}", j - i, lh * lw);
+            for (k, p) in positions[i..j].iter_mut().enumerate() {
+                let (hi, wi) = ((k / lw) as i32, (k % lw) as i32);
+                *p = [cur, cur + hi, cur + wi, embed_row];
+                tags[i + k] = tag(&hashes[next_item], item_row);
+                embed_row += 1;
+                item_row += 1;
+            }
+            cur += lh.max(lw) as i32;
+            frame += 1;
+            if m == 1 || frame == t {
+                next_item += 1;
+                frame = 0;
+                item_row = 0;
+            }
+        }
+        i = j;
+    }
+    ensure!(next_item == processed.len(), "fewer media placeholders than media items");
+    Ok(MediaPlan { positions, delta: cur - ids.len() as i32, tags, embeds: Arc::new(Vec::new()) })
 }

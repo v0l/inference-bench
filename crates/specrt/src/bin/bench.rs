@@ -112,7 +112,7 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
         let rt = Runtime::load_layout(&s, layout)?;
         let mut sched = Scheduler::new(GpuExecutor::new(rt)?, Config { max_num_seqs: batch, ..Config::default() });
         let mut warm = Vec::new();
-        sched.submit(Request { prompt: prompts[0].clone(), max_tokens: 16, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() })?;
+        sched.submit(Request { prompt: prompts[0].clone(), max_tokens: 16, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() })?;
         while !sched.idle() {
             sched.step(&mut warm)?;
         }
@@ -121,7 +121,7 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
         let mut outs: std::collections::HashMap<u64, Vec<u32>> = Default::default();
         let mut ids = Vec::new();
         for p in &prompts {
-            ids.push(sched.submit(Request { prompt: p.clone(), max_tokens: new_tokens, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() })?);
+            ids.push(sched.submit(Request { prompt: p.clone(), max_tokens: new_tokens, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() })?);
         }
         while !sched.idle() {
             let mut events = Vec::new();
@@ -183,7 +183,7 @@ fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize, 
         for s in 0..batch as u32 {
             let prompt = (0..prompt_len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect();
             let sampling = if sampled { Sampling::new(1.0, 100 + s).truncated(20, 0.95, 0.0) } else { Sampling::GREEDY };
-            sched.submit(Request { prompt, max_tokens: new_tokens, sampling, stop: vec![], salt: String::new() })?;
+            sched.submit(Request { prompt, max_tokens: new_tokens, sampling, stop: vec![], salt: String::new(), media: Vec::new() })?;
         }
         let (mut decode_secs, mut decode_tokens, mut prefill_secs, mut steps) = (0.0, 0, 0.0, 0);
         let started = std::time::Instant::now();

@@ -36,7 +36,7 @@ Everything comes from `preprocessor_config.json` (images) and `video_preprocesso
 - Prompt expansion: the template emits one `<|vision_start|><|image_pad|><|vision_end|>` per image
   and the same with `<|video_pad|>` per video. `expand_placeholders` replaces image slots by
   `grid_t * grid_h * grid_w / merge_size^2` pads, and a video slot by one
-  `<T seconds><|vision_start|>pads<|vision_end|>` group per temporal patch, with T the mean
+  `<T seconds><|vision_start|>pads<|vision_end|>` group per temporal patch, inside the template's own `<|vision_start|>` and `<|vision_end|>` (only the pad token is replaced, as in transformers and vLLM), with T the mean
   timestamp of the frames in the patch (transformers' Qwen3-VL prompt layout).
 
 ## Reference and tests
@@ -93,3 +93,38 @@ named in `deepstack_visual_indexes`), so the engine tab can draw the tower from 
   embeddings of three fixtures with `transformers` run by `scripts/vision_encoder_reference.py`.
   Measured relative rms 2e-6 to 8e-6 and max abs error at most 2.2e-3 on values up to 94. The test
   asserts rms below 1e-4 and max below 5e-5 of the largest value.
+
+## LM integration (slice 3, done)
+
+- `Spec.rope.mrope` (`section`, `interleaved`) is read from `rope_parameters` of the checkpoint
+  config, and `Spec.vision` from `vision_config` plus the four token ids. Specs written as TOML
+  (like `qwen3.8-27b.toml`) are completed from the snapshot's `config.json` at load
+  (`engine::complete_spec`), so no spec file needs a vision section. A text model has neither and
+  runs the old rope path (the kernel constants `MROPE*` compile it out).
+- Position ids: `vision::plan_media` walks the templated ids. Text advances all three axes
+  together; each run of image or video pad tokens gets `(t, h, w)` from its grid, offset by the
+  text position before it, and the position after a frame advances by `max(h, w) / merge`, as in
+  transformers' `get_rope_index`. Positions are a per slot device table. Tokens past the prompt
+  (decode) use `index + delta`, with `delta = next_position - prompt_len`.
+- Rope kernels (`qk_norm_rope`, `kv_norm_rope`, `flash_mma`) pick the axis for every frequency pair
+  from `mrope_section` and `mrope_interleaved`.
+- Splice: `Runtime::plan_media` encodes each item with the vision encoder; the `embed` op is followed
+  by a `splice_rows` kernel that overwrites the placeholder rows of the chunk being prefilled, so
+  mixed text and vision chunks work with chunked prefill and fused steps.
+- Prefix cache: each placeholder token is keyed by a tag derived from the SHA-256 of the media
+  bytes and the row inside the item (`Seq.keys`), so the same image hits the cache and a different
+  image with the same size does not.
+- Usage: `prompt_tokens_details.vision_tokens` counts the placeholder tokens. `[media] max_pixels`
+  and `max_video_secs` limit the preprocessing; over-limit and undecodable media are 400s.
+
+Tests (`tests/vision_lm.rs`, ignored, need the 27B and the vLLM output of
+`scripts/vllm_vision.py` made through port 8001):
+
+- Image: prompt ids equal vLLM's, greedy prefix 32/32, teacher forced top-1 32/32, mean KL 0.0058
+  against vLLM's logprobs (NVFP4 spec, the checkpoint vLLM serves). Bound: top-1 at least 90%, KL
+  at most 0.05, as for text.
+- Video (3 s, 8 fps, 6 sampled frames, 240 vision tokens): prompt ids equal vLLM's, top-1 28/32,
+  mean KL 0.062. Looser bound (top-1 80%, KL 0.1); the cause of the gap to the image case is
+  open, see the follow-up issue.
+- Greedy "what is in this image" on a drawn house with the FP8 spec: "a house in a field with a
+  sun in the sky".

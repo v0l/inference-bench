@@ -225,7 +225,7 @@ fn scheduled_speculation_matches_single_sequence_greedy_and_counts_drafts() {
         let mut sched = Scheduler::new(GpuExecutor::new(rt).unwrap(), Config { max_num_seqs: 6, max_batched_tokens: 128, ..Config::default() });
         let ids: Vec<u64> = ps
             .iter()
-            .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: NEW, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() }).unwrap())
+            .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: NEW, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() }).unwrap())
             .collect();
         let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
         let (mut drafted, mut accepted) = (0, 0);
@@ -303,7 +303,7 @@ fn cached_turns(s: &Spec, cache: bool) -> (Vec<Vec<u32>>, Vec<usize>, usize) {
     let mut prompt = prompt(5);
     let (mut outs, mut cached) = (Vec::new(), Vec::new());
     for turn in 0..4u32 {
-        let id = sched.submit(Request { prompt: prompt.clone(), max_tokens: 24, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() }).unwrap();
+        let id = sched.submit(Request { prompt: prompt.clone(), max_tokens: 24, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() }).unwrap();
         let mut got = Vec::new();
         while !sched.idle() {
             let mut events = Vec::new();

@@ -9,6 +9,7 @@ pub enum ErrorKind {
     Unreachable,
     Failed,
     Cancelled,
+    InvalidRequest,
 }
 
 impl ErrorKind {
@@ -19,6 +20,7 @@ impl ErrorKind {
             Self::Unreachable => "backend unreachable",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::InvalidRequest => "invalid request",
         }
     }
 
@@ -81,6 +83,8 @@ pub struct Generation {
     pub prompt_tokens: u64,
     #[serde(default)]
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub vision_tokens: u64,
     pub completion_tokens: u64,
     pub ttft_secs: f64,
     pub prefill_secs: f64,

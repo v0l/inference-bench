@@ -45,7 +45,7 @@ impl Runtime {
         self.stream.memcpy_htod(&[part.start as i32], &mut self.buf.pos)?;
         self.stream.memcpy_htod(&p, &mut st.params.slice_mut(..p.len()))?;
         self.seq = part.slot as i32;
-        let ran = self.fused_layers(st, nd, np, sampled);
+        let ran = self.fused_layers(st, nd, np, sampled, part.start);
         self.seq = 0;
         ran?;
         let out_rows = nd + usize::from(sampled);
@@ -57,7 +57,7 @@ impl Runtime {
         Ok((decoded, sampled.then(|| out[nd] as u32)))
     }
 
-    fn fused_layers(&self, st: &Stepper, nd: usize, np: usize, sampled: bool) -> Result<()> {
+    fn fused_layers(&self, st: &Stepper, nd: usize, np: usize, sampled: bool, start: usize) -> Result<()> {
         let s = &self.spec;
         let hidden = s.dims.hidden;
         let n = nd + np;
@@ -71,6 +71,7 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
+        self.splice_media(self.seq as usize, start, np, nd)?;
         for layer in &self.layers {
             self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
             match &layer.mixer {

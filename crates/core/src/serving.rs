@@ -30,12 +30,14 @@ impl ServingTarget {
         streaming: bool,
         salt: String,
         cancel: Option<Arc<AtomicBool>>,
+        media: Vec<specrt::sched::MediaInput>,
+        vision_tokens: usize,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError> {
         let engine = self.engine()?;
         let cancel = cancel.unwrap_or_default();
         let c = engine
-            .complete(prompt, max_tokens, sampling, streaming, salt, cancel, &mut |t| {
+            .complete_media(prompt, media, max_tokens, sampling, streaming, salt, cancel, &mut |t| {
                 on_text(t);
                 true
             })
@@ -43,6 +45,7 @@ impl ServingTarget {
         Ok(Generation {
             text: c.text,
             prompt_tokens: c.prompt_tokens as u64,
+            vision_tokens: vision_tokens as u64,
             cached_tokens: c.cached_tokens as u64,
             completion_tokens: c.completion_tokens as u64,
             ttft_secs: c.ttft_secs,
@@ -67,7 +70,7 @@ impl Target for ServingTarget {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: false, memory: false, vision: false }
+        Capabilities { streaming: true, logits: false, memory: false, vision: self.serving.as_ref().is_some_and(|s| s.accepts_media()) }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
@@ -79,14 +82,21 @@ impl Target for ServingTarget {
 
     fn generate(&mut self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let ids = self.engine()?.tokens(&request.prompt).map_err(|e| engine_error(&e))?;
-        self.run(ids, request.max_tokens, Sampling::GREEDY, false, String::new(), None, on_text)
+        self.run(ids, request.max_tokens, Sampling::GREEDY, false, String::new(), None, Vec::new(), 0, on_text)
     }
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let list = request.messages_json().as_array().cloned().unwrap_or_default();
-        let ids = self.engine()?.encode_messages(&list, request.template()).map_err(|e| engine_error(&e))?;
+        let (ids, media, vision_tokens) = if request.media.is_empty() {
+            (self.engine()?.encode_messages(&list, request.template()).map_err(|e| engine_error(&e))?, Vec::new(), 0)
+        } else {
+            let budget = specrt::vision::MediaBudget { max_pixels: request.media_max_pixels, max_video_secs: request.media_max_video_secs };
+            self.engine()?
+                .encode_media_messages(&list, request.template(), &request.media, budget)
+                .map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("{e:#}")))?
+        };
         let s = request.sampling;
-        self.run(ids, s.max_tokens, sampling(&s, self.engine()?.sampling_defaults()), !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), on_text)
+        self.run(ids, s.max_tokens, sampling(&s, self.engine()?.sampling_defaults()), !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), media, vision_tokens, on_text)
     }
 
     fn share(&self) -> Option<Box<dyn Target>> {

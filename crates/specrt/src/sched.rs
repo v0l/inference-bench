@@ -103,6 +103,12 @@ pub trait Executor {
     fn supports_prefix_cache(&self) -> bool {
         false
     }
+    fn plan_media(&mut self, _prompt: &[u32], _media: &[MediaInput]) -> Result<Arc<crate::vision::MediaPlan>> {
+        bail!("this executor has no vision encoder")
+    }
+    fn set_media(&mut self, _slot: usize, _plan: Option<&crate::vision::MediaPlan>) -> Result<()> {
+        Ok(())
+    }
     fn hybrid(&self) -> bool {
         false
     }
@@ -207,6 +213,14 @@ impl Executor for GpuExecutor {
         true
     }
 
+    fn plan_media(&mut self, prompt: &[u32], media: &[MediaInput]) -> Result<Arc<crate::vision::MediaPlan>> {
+        self.rt.plan_media(prompt, media)
+    }
+
+    fn set_media(&mut self, slot: usize, plan: Option<&crate::vision::MediaPlan>) -> Result<()> {
+        self.rt.set_media(slot, plan)
+    }
+
     fn hybrid(&self) -> bool {
         self.rt.spec().linear_layers() > 0
     }
@@ -258,6 +272,13 @@ pub struct Request {
     pub sampling: Sampling,
     pub stop: Vec<u32>,
     pub salt: String,
+    pub media: Vec<MediaInput>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MediaInput {
+    pub processed: crate::vision::Processed,
+    pub hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,6 +319,8 @@ struct Seq {
     started: bool,
     root: Hash,
     cached: usize,
+    keys: Vec<u32>,
+    media: Option<Arc<crate::vision::MediaPlan>>,
 }
 
 impl Seq {
@@ -447,6 +470,13 @@ impl<E: Executor> Scheduler<E> {
         self.next_id += 1;
         let tokens = req.prompt.clone();
         let root = self.exec.prefix_root(&req.salt);
+        let (media, keys) = if req.media.is_empty() {
+            (None, tokens.clone())
+        } else {
+            let plan = self.exec.plan_media(&req.prompt, &req.media)?;
+            let keys = tokens.iter().zip(&plan.tags).map(|(&t, &tag)| if tag != 0 { tag } else { t }).collect();
+            (Some(plan), keys)
+        };
         self.waiting.push_back(Seq {
             id,
             req,
@@ -459,6 +489,8 @@ impl<E: Executor> Scheduler<E> {
             started: false,
             root,
             cached: 0,
+            keys,
+            media,
         });
         Ok(id)
     }
@@ -534,9 +566,9 @@ impl<E: Executor> Scheduler<E> {
             let reserve = if self.running.is_empty() { 0 } else { self.reserve() };
             let hit = match self.cache.as_mut() {
                 Some(cache) => {
-                    let hashes = prefix::block_hashes(&s.root, &s.tokens[..target]);
+                    let hashes = prefix::block_hashes(&s.root, &s.keys[..target]);
                     let limit = if s.generated() == 0 { target - 1 } else { target };
-                    cache.lookup_with_tail(&s.root, &s.tokens[..target], &hashes, limit, &mut self.pool)
+                    cache.lookup_with_tail(&s.root, &s.keys[..target], &hashes, limit, &mut self.pool)
                 }
                 None => prefix::Hit::default(),
             };
@@ -586,6 +618,7 @@ impl<E: Executor> Scheduler<E> {
                 s.blocks.push(self.pool.alloc().expect("checked free blocks"));
             }
             self.exec.set_table(slot, &s.blocks)?;
+            self.exec.set_media(slot, s.media.as_deref())?;
             s.slot = Some(slot);
             self.admissions += 1;
             s.admitted = self.admissions;
@@ -613,11 +646,11 @@ impl<E: Executor> Scheduler<E> {
         if !final_state && upto == 0 {
             return Ok(());
         }
-        let hashes = prefix::block_hashes(&s.root, &s.tokens[..upto * PAGE]);
+        let hashes = prefix::block_hashes(&s.root, &s.keys[..upto * PAGE]);
         let blocks = s.blocks[..upto].to_vec();
         let slot = s.slot.expect("running has a slot");
         let parent = if upto == 0 { s.root } else { hashes[upto - 1] };
-        let tail_tokens = s.tokens[upto * PAGE..s.computed].to_vec();
+        let tail_tokens = s.keys[upto * PAGE..s.computed].to_vec();
         let tail_block = (rem > 0).then(|| s.blocks[upto]);
         let have_state = upto > 0 && rem == 0 && self.cache.as_ref().is_some_and(|c| c.has_snapshot(&parent));
         let have_tail = rem > 0 && self.cache.as_ref().is_some_and(|c| c.has_tail(&parent, &tail_tokens));
@@ -817,6 +850,7 @@ fn finished(s: &Seq, finish: Finish) -> Event {
 
 fn accept(s: &mut Seq, t: u32, max_ctx: usize, events: &mut Vec<Event>) -> bool {
     s.tokens.push(t);
+    s.keys.push(t);
     let stop = s.req.stop.contains(&t);
     if !stop {
         events.push(Event::Token { id: s.id, token: t });
@@ -1035,6 +1069,7 @@ mod tests {
             sampling: Sampling::GREEDY,
             stop: Vec::new(),
             salt: String::new(),
+            media: Vec::new(),
         }
     }
 

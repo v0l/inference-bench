@@ -709,7 +709,7 @@ fn usage(g: &Generation) -> Value {
         "prompt_tokens": g.prompt_tokens,
         "completion_tokens": g.completion_tokens,
         "total_tokens": g.prompt_tokens + g.completion_tokens,
-        "prompt_tokens_details": {"cached_tokens": g.cached_tokens},
+        "prompt_tokens_details": {"cached_tokens": g.cached_tokens, "vision_tokens": g.vision_tokens},
     })
 }
 
@@ -776,6 +776,8 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
     {
         let list = list.clone();
         let limits = state.config.media.clone();
+        request.media_max_pixels = limits.max_pixels;
+        request.media_max_video_secs = limits.max_video_secs;
         request.media = tokio::task::spawn_blocking(move || inference_bench_core::media::extract(&list, &limits))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?

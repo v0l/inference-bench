@@ -26,6 +26,7 @@ pub(super) struct Run<'a> {
     pub logits: &'a CudaSlice<f32>,
     pub rows: Range<usize>,
     pub bb: Option<&'a BatchBuffers>,
+    pub start: Option<usize>,
 }
 
 impl PlanBackend<Run<'_>> for Runtime {
@@ -46,7 +47,13 @@ impl Runtime {
     fn run_one(&self, op: &Op, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
         let n = run.n;
         match *op {
-            Op::Embed => self.embed_rows(run),
+            Op::Embed => {
+                self.embed_rows(run)?;
+                match run.start {
+                    Some(start) => self.splice_media(self.seq as usize, start, run.n, 0),
+                    None => Ok(()),
+                }
+            }
             Op::Norm { which, into } => self.norm_op(which, into, layer, run),
             Op::Linear { weight, input, output } => self.linear_op(weight, input, output, layer, run),
             Op::KvRope => self.attn_rope_rows(self.attn_of(layer), n, 0),
@@ -192,7 +199,10 @@ impl Runtime {
             .arg(&buf.pos)
             .arg(&buf.zero_slots)
             .arg(&l.kv)
-            .arg(&0i32);
+            .arg(&0i32)
+            .arg(&self.mm_meta)
+            .arg(&self.mm_table)
+            .arg(&self.seq);
         let config = LaunchConfig {
             grid_dim: ((a.heads + 2 * a.kv_heads) as u32, n as u32, 1),
             block_dim: (a.head_dim.max(32) as u32, 1, 1),

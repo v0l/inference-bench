@@ -96,6 +96,7 @@ impl Fake {
             text,
             prompt_tokens: prompt.split_whitespace().count() as u64,
             cached_tokens: 0,
+            vision_tokens: 0,
             completion_tokens,
             ttft_secs: ttft,
             prefill_secs: ttft,

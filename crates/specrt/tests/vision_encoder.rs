@@ -40,7 +40,7 @@ fn encoder_matches_transformers_within_the_documented_bound() {
     let stream = ctx.new_stream().unwrap();
     let jit = Jit::new(ctx.clone(), default_cache_dir()).unwrap();
     let enc = VisionEncoder::load(&ctx, &stream, &jit, &ck, &vision.config).unwrap();
-    for name in ["image_resize", "image_big", "video_resize"] {
+    for name in ["image_resize", "image_big", "video_resize", "clip"] {
         let (max_rel, rms_rel) = case(name, &enc);
         assert!(rms_rel < 1e-4, "{name}: relative rms {rms_rel}");
         assert!(max_rel < 5e-5, "{name}: max relative {max_rel}");

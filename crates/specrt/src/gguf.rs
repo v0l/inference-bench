@@ -400,11 +400,12 @@ impl Gguf {
                 output_gate: false,
                 rotary_dim: rotary,
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(head_dim)? },
+            rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(head_dim)?, mrope: None },
             mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None },
             moe: None,
             linear_attention: None,
             mtp: None,
+            vision: None,
             runtime: RuntimeOptions {
                 unsplit: if quant == Quant::Gguf { crate::codegen::GGB_LINEARS.iter().map(|l| l.to_string()).collect() } else { Vec::new() },
                 big_tile: if quant == Quant::Gguf { Some([256, 128, 4, 2]) } else { None },

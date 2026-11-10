@@ -12,7 +12,9 @@ pub const MAX_CTX: usize = 131072;
 
 pub fn resolve_spec(model: &str) -> Result<Spec> {
     if model.ends_with(".toml") {
-        return Spec::load(Path::new(model));
+        let mut spec = Spec::load(Path::new(model))?;
+        complete_spec(&mut spec)?;
+        return Ok(spec);
     }
     if model.ends_with(".gguf") {
         let mut spec = crate::gguf::Gguf::open(Path::new(model))?.spec().with_context(|| model.to_string())?;
@@ -25,6 +27,16 @@ pub fn resolve_spec(model: &str) -> Result<Spec> {
     spec.repo = model.to_string();
     spec.name = model.rsplit('/').next().unwrap_or(model).to_lowercase();
     Ok(spec)
+}
+
+pub fn complete_spec(spec: &mut Spec) -> Result<()> {
+    if spec.repo.ends_with(".gguf") || spec.vision.is_some() {
+        return Ok(());
+    }
+    if let Ok(path) = find_in_snapshot(&spec.repo, "config.json") {
+        spec.complete_from_checkpoint_config(&std::fs::read_to_string(path)?)?;
+    }
+    Ok(())
 }
 
 const END_OF_TURN: [&str; 6] =
@@ -124,6 +136,7 @@ pub(crate) struct Assets {
     pub chat: Option<ChatTemplate>,
     pub stop: Vec<u32>,
     pub sampling: SamplingDefaults,
+    pub media: Option<crate::vision::MediaAssets>,
 }
 
 impl Assets {
@@ -137,7 +150,7 @@ impl Assets {
         };
         let gen_cfg = g.generation_config_json();
         let stop = stop_ids(Some(&gen_cfg), tok_cfg.as_deref(), &|t| tokenizer.token_to_id(t));
-        Ok(Assets { spec, tokenizer, chat, stop, sampling: SamplingDefaults::default() })
+        Ok(Assets { spec, tokenizer, chat, stop, sampling: SamplingDefaults::default(), media: None })
     }
 
     pub fn load(model: &str) -> Result<Self> {
@@ -163,7 +176,8 @@ impl Assets {
             read("tokenizer_config.json").as_deref(),
             &|t| tokenizer.token_to_id(t),
         );
-        Ok(Assets { spec, tokenizer, chat, stop, sampling })
+        let media = media_assets(&spec, &tokenizer)?;
+        Ok(Assets { spec, tokenizer, chat, stop, sampling, media })
     }
 
     pub fn tokens(&self, text: &str) -> Result<Vec<u32>> {
@@ -175,6 +189,57 @@ impl Assets {
         let text = render_prompt(self.chat.as_ref(), messages, template)?;
         self.tokens(&text)
     }
+
+    pub fn encode_media_messages(
+        &self,
+        messages: &[Value],
+        template: Option<&Value>,
+        items: &[crate::vision::MediaItem],
+        budget: crate::vision::MediaBudget,
+    ) -> Result<(Vec<u32>, Vec<crate::sched::MediaInput>, usize)> {
+        let media = self.media.as_ref().context("the model has no vision_config")?;
+        let processed = media.process(items, budget)?;
+        let text = render_prompt(self.chat.as_ref(), &strip_media_urls(messages), template)?;
+        let expanded = media.expand(&text, &processed)?;
+        let ids = self.tokens(&expanded)?;
+        let vision_tokens = ids.iter().filter(|&&t| t == media.ids.image || t == media.ids.video).count();
+        let inputs = processed.into_iter().zip(items).map(|(processed, item)| crate::sched::MediaInput { processed, hash: item.hash }).collect();
+        Ok((ids, inputs, vision_tokens))
+    }
+}
+
+pub fn strip_media_urls(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            if let Some(parts) = m.get_mut("content").and_then(Value::as_array_mut) {
+                for p in parts.iter_mut() {
+                    match p["type"].as_str() {
+                        Some("image_url") => *p = serde_json::json!({"type": "image"}),
+                        Some("video_url") => *p = serde_json::json!({"type": "video"}),
+                        _ => {}
+                    }
+                }
+            }
+            m
+        })
+        .collect()
+}
+
+fn media_assets(spec: &Spec, tokenizer: &Tokenizer) -> Result<Option<crate::vision::MediaAssets>> {
+    use crate::vision::{MediaAssets, MediaTokens, Preprocessor};
+    let Some(vision) = &spec.vision else { return Ok(None) };
+    let read = |f: &str| find_in_snapshot(&spec.repo, f).ok().and_then(|p| std::fs::read_to_string(p).ok());
+    let (Some(image), Some(video)) = (read("preprocessor_config.json"), read("video_preprocessor_config.json")) else { return Ok(None) };
+    let text = |id: u32| tokenizer.id_to_token(id).with_context(|| format!("no token {id}"));
+    let tokens = MediaTokens {
+        image: text(vision.tokens.image)?,
+        video: text(vision.tokens.video)?,
+        start: text(vision.tokens.start)?,
+        end: text(vision.tokens.end)?,
+    };
+    Ok(Some(MediaAssets { image: Preprocessor::from_json(&image)?, video: Preprocessor::from_json(&video)?, tokens, ids: vision.tokens.clone() }))
 }
 
 pub fn render_prompt(chat: Option<&ChatTemplate>, messages: &[Value], template: Option<&Value>) -> Result<String> {
@@ -415,4 +480,16 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/specs/qwen3-0.6b.toml");
         assert_eq!(resolve_spec(path).unwrap().repo, "Qwen/Qwen3-0.6B");
     }
+}
+
+pub struct MediaPrompt {
+    pub ids: Vec<u32>,
+    pub media: Vec<crate::sched::MediaInput>,
+    pub vision_tokens: usize,
+}
+
+pub fn encode_media_prompt(model: &str, messages: &[Value], template: Option<&Value>, items: &[crate::vision::MediaItem]) -> Result<MediaPrompt> {
+    let assets = Assets::load(model)?;
+    let (ids, media, vision_tokens) = assets.encode_media_messages(messages, template, items, Default::default())?;
+    Ok(MediaPrompt { ids, media, vision_tokens })
 }

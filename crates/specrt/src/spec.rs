@@ -355,6 +355,25 @@ pub struct Rope {
     pub theta: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling: Option<RopeScaling>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrope: Option<Mrope>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Mrope {
+    pub section: [usize; 3],
+    #[serde(default)]
+    pub interleaved: bool,
+}
+
+fn parse_mrope(params: Option<&serde_json::Value>) -> Option<Mrope> {
+    let p = params?;
+    let section = p.get("mrope_section")?.as_array()?;
+    let mut it = section.iter().filter_map(|v| v.as_u64().map(|v| v as usize));
+    let section = [it.next()?, it.next()?, it.next()?];
+    let interleaved = p.get("mrope_interleaved").and_then(|v| v.as_bool()).unwrap_or(false);
+    Some(Mrope { section, interleaved })
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -393,6 +412,8 @@ pub struct Spec {
     pub linear_attention: Option<LinearAttention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<crate::vision::Vision>,
     #[serde(default, skip_serializing_if = "RuntimeOptions::is_default")]
     pub runtime: RuntimeOptions,
 }
@@ -690,6 +711,19 @@ impl Spec {
         Ok(())
     }
 
+    pub fn complete_from_checkpoint_config(&mut self, json: &str) -> Result<()> {
+        if self.vision.is_none() {
+            self.vision = crate::vision::Vision::from_hf_config(json)?;
+        }
+        if self.rope.mrope.is_none() && self.vision.is_some() {
+            let value: serde_json::Value = serde_json::from_str(json)?;
+            let text = value.get("text_config").unwrap_or(&value);
+            self.rope.mrope = parse_mrope(text.get("rope_parameters").or(text.get("rope_scaling")));
+            self.validate()?;
+        }
+        Ok(())
+    }
+
     pub fn describe_hf_config(json: &str) -> Result<Self> {
         Self::hf_config(json, false)
     }
@@ -851,7 +885,7 @@ impl Spec {
                 output_gate: hf.attn_output_gate || (strict && hf.model_type == "qwen3_next"),
                 rotary_dim,
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling },
+            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params) },
             mlp: Mlp {
                 activation,
                 quant: mlp_quant.map(|m| m.0),
@@ -861,6 +895,7 @@ impl Spec {
             moe,
             mtp: (hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
             linear_attention,
+            vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             runtime: RuntimeOptions::default(),
         };
         Ok(spec)
@@ -909,6 +944,14 @@ impl Spec {
             ActQuant::None => {}
             ActQuant::Fp4 => ensure!(self.mlp.quant == Some(Quant::Nvfp4G16), "[mlp] act_quant = \"fp4\" needs [mlp] quant = \"nvfp4_g16\""),
             ActQuant::Fp8 => bail!("[mlp] act_quant is \"none\" or \"fp4\"; FP8 MLP inputs follow the top-level act_quant"),
+        }
+        if let Some(m) = &self.rope.mrope {
+            ensure!(
+                m.section.iter().sum::<usize>() == self.rotary_dim() / 2,
+                "mrope_section {:?} must add up to half the rotary dims ({})",
+                m.section,
+                self.rotary_dim() / 2
+            );
         }
         let a = &self.attention;
         ensure!(

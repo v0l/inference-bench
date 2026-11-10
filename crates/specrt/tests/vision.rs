@@ -54,7 +54,10 @@ fn large_image_with_config_bounds_is_bit_identical_to_transformers() {
 
 fn check_video(name: &str) {
     let (meta, want) = reference(name);
-    let cfg = config("qwen3.8-27b.video-preprocessor.json");
+    let mut cfg = config("qwen3.8-27b.video-preprocessor.json");
+    if name == "clip" {
+        cfg.size.longest_edge = 25165824;
+    }
     let got = preprocess_video_file(&cfg, &dir().join(format!("{name}.mp4"))).unwrap();
     assert_eq!(got.patches.grid, grid(&meta), "{name} grid");
     let (bad, max) = worst(&got.patches.data, &want);
@@ -90,7 +93,7 @@ fn placeholders_expand_to_the_merged_token_count() {
     let prompt = "<|vision_start|><|video_pad|><|vision_end|>";
     let out = expand_placeholders(prompt, &tokens, 2, &[Media::Video(&video)]).unwrap();
     let pad = "<|video_pad|>".repeat(4);
-    assert_eq!(out, format!("<0.2 seconds><|vision_start|>{pad}<|vision_end|><1.5 seconds><|vision_start|>{pad}<|vision_end|>"));
+    assert_eq!(out, format!("<|vision_start|><0.2 seconds><|vision_start|>{pad}<|vision_end|><1.5 seconds><|vision_start|>{pad}<|vision_end|><|vision_end|>"));
     assert!(expand_placeholders("no slot", &tokens, 2, &[Media::Image(&image)]).is_err());
 }
 
@@ -107,4 +110,9 @@ fn the_27b_config_declares_a_vision_tower() {
 fn text_only_configs_have_no_vision() {
     let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3-0.6b.config.json")).unwrap();
     assert!(Vision::from_hf_config(&json).unwrap().is_none());
+}
+
+#[test]
+fn clip_with_the_config_bounds_is_bit_identical_to_transformers() {
+    check_video("clip");
 }

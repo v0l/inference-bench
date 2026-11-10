@@ -1,34 +1,11 @@
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use std::io::Read;
-use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MediaKind {
-    Image,
-    Video,
-}
+pub use specrt::vision::{MediaItem, MediaKind};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MediaItem {
-    pub kind: MediaKind,
-    pub bytes: Arc<Vec<u8>>,
-    pub hash: [u8; 32],
-}
-
-impl MediaItem {
-    pub fn new(kind: MediaKind, bytes: Vec<u8>) -> Self {
-        let mut h = Sha256::new();
-        h.update([kind as u8]);
-        h.update(&bytes);
-        Self { kind, hash: h.finalize().into(), bytes: Arc::new(bytes) }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MediaLimits {
     pub max_images: usize,
@@ -37,6 +14,8 @@ pub struct MediaLimits {
     pub max_video_bytes: usize,
     pub allow_url_fetch: bool,
     pub fetch_timeout_secs: u64,
+    pub max_pixels: Option<usize>,
+    pub max_video_secs: Option<f64>,
 }
 
 impl Default for MediaLimits {
@@ -48,6 +27,8 @@ impl Default for MediaLimits {
             max_video_bytes: 200 << 20,
             allow_url_fetch: false,
             fetch_timeout_secs: 10,
+            max_pixels: None,
+            max_video_secs: None,
         }
     }
 }

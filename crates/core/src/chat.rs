@@ -69,6 +69,8 @@ pub struct ChatRequest {
     pub template_vars: Value,
     pub cache_salt: Option<String>,
     pub media: Vec<crate::media::MediaItem>,
+    pub media_max_pixels: Option<usize>,
+    pub media_max_video_secs: Option<f64>,
 }
 
 impl ChatRequest {
@@ -89,6 +91,8 @@ impl ChatRequest {
             template_vars: json!({"enable_thinking": false}),
             cache_salt: None,
             media: Vec::new(),
+            media_max_pixels: None,
+            media_max_video_secs: None,
         }
     }
 

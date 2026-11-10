@@ -70,9 +70,10 @@ def image_case(out, name, h, w, seed, size):
     save(out, name, res["pixel_values"], res["image_grid_thw"][0])
 
 
-def video_case(out, name, w, h, seconds, fps, size):
+def video_case(out, name, w, h, seconds, fps, size, existing=False):
     path = out / f"{name}.mp4"
-    make_video(path, w, h, seconds, fps)
+    if not existing:
+        make_video(path, w, h, seconds, fps)
     vw, vh, vfps, total = probe(path)
     frames = torch.from_numpy(decode_all(path, vw, vh)).permute(0, 3, 1, 2)
     proc = Qwen3VLVideoProcessor(size=size, **COMMON)
@@ -92,6 +93,7 @@ def main():
     image_case(out, "image_big", 200, 150, 3, {"shortest_edge": 65536, "longest_edge": 16777216})
     video_case(out, "video_exact", 64, 64, 2, 8, SMALL_SIZE)
     video_case(out, "video_resize", 90, 70, 3, 10, SMALL_SIZE)
+    video_case(out, "clip", 320, 240, 3, 8, {"shortest_edge": 4096, "longest_edge": 25165824}, existing=True)
 
 
 main()

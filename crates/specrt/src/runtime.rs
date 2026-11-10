@@ -390,6 +390,15 @@ pub struct Runtime {
     baseline_free: usize,
     mtp: Option<mtp::MtpState>,
     snap: snapshot::SnapshotPool,
+    mm_meta: CudaSlice<i32>,
+    mm_table: CudaSlice<i32>,
+    media: Vec<Option<MediaDevice>>,
+    vision: Option<crate::vision_encoder::VisionEncoder>,
+}
+
+struct MediaDevice {
+    embeds: CudaSlice<f32>,
+    rows: Vec<i32>,
 }
 
 fn grid(n: usize, per_block: usize) -> u32 {
@@ -675,6 +684,8 @@ impl Runtime {
         } else {
             stream.alloc_zeros(1)?
         };
+        let mm_meta = stream.alloc_zeros(2 * (layout.slots + 1))?;
+        let mm_table = stream.alloc_zeros(if spec.rope.mrope.is_some() { (layout.slots + 1) * max_ctx * 3 } else { 1 })?;
         let mut rt = Runtime {
             smem,
             pre,
@@ -717,9 +728,19 @@ impl Runtime {
             baseline_free: free_before,
             mtp: None,
             snap: Default::default(),
+            mm_meta,
+            mm_table,
+            media: (0..=layout.slots).map(|_| None).collect(),
+            vision: None,
         };
         if let Some(w) = mtp_weights {
             rt.mtp = Some(mtp::MtpState::new(&rt, w)?);
+        }
+        if let Some(v) = &spec.vision {
+            if spec.rope.mrope.is_some() && checkpoint.has("model.visual.patch_embed.proj.weight") {
+                rt.vision = Some(crate::vision_encoder::VisionEncoder::load(&rt.ctx, &rt.stream, &jit, &checkpoint, &v.config)?);
+                checkpoint.release();
+            }
         }
         rt.stream.synchronize()?;
         let kv_blocks = match layout.kv_blocks {
@@ -948,7 +969,10 @@ impl Runtime {
                 .arg(&buf.pos)
                 .arg(&buf.zero_slots)
                 .arg(&kv_layer)
-                .arg(&0i32);
+                .arg(&0i32)
+                .arg(&self.mm_meta)
+                .arg(&self.mm_table)
+                .arg(&self.seq);
             unsafe { b.launch(cfg((a.heads + 2 * a.kv_heads) as u32, a.head_dim.max(32) as u32)) }?;
             let mut b = self.stream.launch_builder(self.kernel("attention_split"));
             b.arg(&buf.qkv)
@@ -1398,7 +1422,10 @@ impl Runtime {
             .arg(&buf.v_cache)
             .arg(&table)
             .arg(&buf.pos)
-            .arg(&l.kv);
+            .arg(&l.kv)
+            .arg(&self.mm_meta)
+            .arg(&self.mm_table)
+            .arg(&self.seq);
         let config = LaunchConfig {
             grid_dim: ((2 * a.kv_heads) as u32, n as u32, 1),
             block_dim: (a.head_dim.max(32) as u32, 1, 1),
@@ -1427,7 +1454,10 @@ impl Runtime {
             .arg(&l.kv)
             .arg(&hi)
             .arg(&lo)
-            .arg(&ntok);
+            .arg(&ntok)
+            .arg(&self.mm_meta)
+            .arg(&self.mm_table)
+            .arg(&self.seq);
         let rows = crate::codegen::flash_rows(a.head_dim);
         let config = LaunchConfig {
             grid_dim: (grid(n, rows), a.heads as u32, 1),
@@ -1460,7 +1490,7 @@ impl Runtime {
         let plan = &self.plans.prefill;
         let out = all_logits.unwrap_or(&self.buf.logits);
         let rows = if all_logits.is_some() { 0..n } else { n - 1..n };
-        let run = exec::Run { n, tokens: &self.pre.tokens, logits: out, rows, bb: None };
+        let run = exec::Run { n, tokens: &self.pre.tokens, logits: out, rows, bb: None, start: Some(start) };
         crate::executor::run_plan(self, plan, &run, &mut |i| self.trace_layer(trace, i, n))
     }
 
@@ -1700,6 +1730,62 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    pub fn plan_media(&mut self, prompt: &[u32], media: &[crate::sched::MediaInput]) -> Result<Arc<crate::vision::MediaPlan>> {
+        let enc = self.vision.as_ref().context("this model was loaded without a vision encoder")?;
+        let vis = self.spec.vision.as_ref().context("the spec has no vision config")?;
+        let merge = vis.config.spatial_merge_size;
+        let processed: Vec<crate::vision::Processed> = media.iter().map(|m| m.processed.clone()).collect();
+        let hashes: Vec<[u8; 32]> = media.iter().map(|m| m.hash).collect();
+        let mut plan = crate::vision::plan_media(prompt, &vis.tokens, merge, &processed, &hashes)?;
+        let mut embeds = Vec::new();
+        for p in &processed {
+            embeds.extend(enc.encode(p.patches())?.embeds);
+        }
+        plan.embeds = Arc::new(embeds);
+        Ok(Arc::new(plan))
+    }
+
+    pub fn set_media(&mut self, slot: usize, plan: Option<&crate::vision::MediaPlan>) -> Result<()> {
+        ensure!(slot < self.slots, "slot {slot} out of {}", self.slots);
+        let Some(plan) = plan else {
+            self.media[slot] = None;
+            self.stream.memcpy_htod(&[0i32, 0], &mut self.mm_meta.slice_mut(2 * slot..2 * slot + 2))?;
+            return Ok(());
+        };
+        ensure!(self.spec.rope.mrope.is_some(), "the model has no mrope section in its spec");
+        let n = plan.positions.len();
+        ensure!(n <= self.max_ctx, "media prompt longer than max_ctx");
+        let hidden = self.spec.dims.hidden;
+        ensure!(plan.embeds.len() % hidden == 0, "media embeddings are not rows of {hidden}");
+        let table: Vec<i32> = plan.positions.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
+        let base = slot * self.max_ctx * 3;
+        self.stream.memcpy_htod(&table, &mut self.mm_table.slice_mut(base..base + table.len()))?;
+        self.stream.memcpy_htod(&[n as i32, plan.delta], &mut self.mm_meta.slice_mut(2 * slot..2 * slot + 2))?;
+        let rows: Vec<i32> = plan.positions.iter().map(|p| p[3]).collect();
+        let embeds = self.stream.clone_htod(plan.embeds.as_slice())?;
+        self.media[slot] = Some(MediaDevice { embeds, rows });
+        Ok(())
+    }
+
+    pub(super) fn splice_media(&self, slot: usize, start: usize, n: usize, row_offset: usize) -> Result<()> {
+        let Some(m) = self.media.get(slot).and_then(|m| m.as_ref()) else { return Ok(()) };
+        let rows: Vec<i32> = (0..n).map(|i| m.rows.get(start + i).copied().unwrap_or(-1)).collect();
+        if rows.iter().all(|&r| r < 0) {
+            return Ok(());
+        }
+        let hidden = self.spec.dims.hidden;
+        let rows_dev = self.stream.clone_htod(&rows)?;
+        let x = self.pre.x.slice(row_offset * hidden..);
+        let mut b = self.stream.launch_builder(self.kernel("splice_rows"));
+        b.arg(&x).arg(&rows_dev).arg(&m.embeds);
+        unsafe { b.launch(LaunchConfig { grid_dim: (grid(hidden, 256), n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+        Ok(())
+    }
+
     pub fn last_logits(&self) -> Result<Vec<f32>> {
         Ok(self.stream.clone_dtoh(&self.buf.logits)?)
     }
@@ -1780,7 +1866,10 @@ impl Runtime {
             .arg(&bb.pos)
             .arg(&bb.slots)
             .arg(&l.kv)
-            .arg(&1i32);
+            .arg(&1i32)
+            .arg(&self.mm_meta)
+            .arg(&self.mm_table)
+            .arg(&0i32);
         let config = LaunchConfig {
             grid_dim: ((a.heads + 2 * a.kv_heads) as u32, n as u32, 1),
             block_dim: (a.head_dim.max(32) as u32, 1, 1),
@@ -1816,7 +1905,7 @@ impl Runtime {
 
     fn decode_rows(&self, bb: &BatchBuffers, n: usize) -> Result<()> {
         let plan = &self.plans.decode;
-        let run = exec::Run { n, tokens: &bb.tokens, logits: &bb.logits, rows: 0..n, bb: Some(bb) };
+        let run = exec::Run { n, tokens: &bb.tokens, logits: &bb.logits, rows: 0..n, bb: Some(bb), start: None };
         crate::executor::run_plan(self, plan, &run, &mut |_| Ok(()))
     }
 

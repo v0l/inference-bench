@@ -8,7 +8,7 @@ from safetensors import safe_open
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
 
-CASES = ["image_resize", "image_big", "video_resize"]
+CASES = ["image_resize", "image_big", "video_resize", "clip"]
 
 
 def load_model(snapshot: Path):

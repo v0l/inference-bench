@@ -643,6 +643,7 @@ impl MmaShape {
 
 pub const KERNELS: &[&str] = &[
     "embed",
+    "splice_rows",
     "rmsnorm",
     "qkv_proj",
     "qk_norm_rope",
@@ -907,6 +908,11 @@ impl Module {
             ("EPS", float_literal(spec.norm.eps)),
             ("THETA", float_literal(spec.rope.theta)),
             ("ROPE_KIND", rope_kind.to_string()),
+            ("MROPE", spec.rope.mrope.is_some().to_string()),
+            ("MROPE_INTERLEAVED", spec.rope.mrope.as_ref().is_some_and(|m| m.interleaved).to_string()),
+            ("MROPE_S0", spec.rope.mrope.as_ref().map_or(0, |m| m.section[0]).to_string()),
+            ("MROPE_S1", spec.rope.mrope.as_ref().map_or(0, |m| m.section[1]).to_string()),
+            ("MROPE_S2", spec.rope.mrope.as_ref().map_or(0, |m| m.section[2]).to_string()),
             ("ROPE_FACTOR", float_literal(scaling.map_or(1.0, |s| s.factor))),
             ("ROPE_LOW_FREQ", opt(|s| s.low_freq_factor)),
             ("ROPE_HIGH_FREQ", opt(|s| s.high_freq_factor)),

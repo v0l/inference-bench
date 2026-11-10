@@ -178,6 +178,7 @@ pub struct Core {
     stats: Arc<Mutex<Stats>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     max_model_len: usize,
+    vision: bool,
 }
 
 impl Core {
@@ -185,7 +186,7 @@ impl Core {
         anyhow::ensure!(opts.max_model_len <= MAX_MODEL_LEN, "max_model_len above {MAX_MODEL_LEN}");
         anyhow::ensure!(opts.max_num_seqs >= 1, "max_num_seqs must be at least 1");
         let (jobs, inbox) = channel::<Job>();
-        let (ready_tx, ready) = channel::<Result<()>>();
+        let (ready_tx, ready) = channel::<Result<bool>>();
         let stats = Arc::new(Mutex::new(Stats::default()));
         let shared = stats.clone();
         let spec = spec.clone();
@@ -196,7 +197,7 @@ impl Core {
                 let built = build(&spec, opts);
                 let mut sched = match built {
                     Ok(s) => {
-                        let _ = ready_tx.send(Ok(()));
+                        let _ = ready_tx.send(Ok(s.exec.rt.has_vision()));
                         s
                     }
                     Err(e) => {
@@ -207,8 +208,9 @@ impl Core {
                 run(&mut sched, inbox, shared);
             })
             .context("serving thread")?;
-        ready.recv().context("the serving thread stopped while loading")??;
+        let vision = ready.recv().context("the serving thread stopped while loading")??;
         Ok(Arc::new(Core {
+            vision,
             jobs: Mutex::new(Some(jobs)),
             stats,
             thread: Mutex::new(Some(thread)),
@@ -218,6 +220,10 @@ impl Core {
 
     pub fn max_model_len(&self) -> usize {
         self.max_model_len
+    }
+
+    pub fn vision(&self) -> bool {
+        self.vision
     }
 
     pub fn stats(&self) -> Stats {
@@ -464,6 +470,20 @@ impl Serving {
         self.assets.tokens(text)
     }
 
+    pub fn accepts_media(&self) -> bool {
+        self.assets.media.is_some() && self.core.vision()
+    }
+
+    pub fn encode_media_messages(
+        &self,
+        messages: &[Value],
+        template: Option<&Value>,
+        items: &[crate::vision::MediaItem],
+        budget: crate::vision::MediaBudget,
+    ) -> Result<(Vec<u32>, Vec<sched::MediaInput>, usize)> {
+        self.assets.encode_media_messages(messages, template, items, budget)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn complete(
         &self,
@@ -475,10 +495,25 @@ impl Serving {
         cancel: Arc<AtomicBool>,
         on_text: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion> {
+        self.complete_media(prompt, Vec::new(), max_tokens, sampling, use_stop, salt, cancel, on_text)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_media(
+        &self,
+        prompt: Vec<u32>,
+        media: Vec<sched::MediaInput>,
+        max_tokens: usize,
+        sampling: Sampling,
+        use_stop: bool,
+        salt: String,
+        cancel: Arc<AtomicBool>,
+        on_text: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<Completion> {
         let started = Instant::now();
         let (tx, rx) = channel();
         let stop = if use_stop { self.assets.stop.clone() } else { Vec::new() };
-        let request = sched::Request { prompt, max_tokens, sampling, stop, salt };
+        let request = sched::Request { prompt, max_tokens, sampling, stop, salt, media };
         self.core.submit(Job { request, events: tx, cancel: cancel.clone() })?;
         let tokenizer = &self.assets.tokenizer;
         let mut out = Completion::default();

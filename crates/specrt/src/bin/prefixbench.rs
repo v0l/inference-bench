@@ -48,7 +48,7 @@ impl Bench {
         let started = Instant::now();
         let ids: Vec<u64> = prompts
             .into_iter()
-            .map(|prompt| self.sched.submit(Request { prompt, max_tokens: new, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() }))
+            .map(|prompt| self.sched.submit(Request { prompt, max_tokens: new, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() }))
             .collect::<Result<_>>()?;
         let mut replies: HashMap<u64, Reply> = ids.iter().map(|&id| (id, Reply { ttft: 0.0, total: 0.0, cached: 0, out: Vec::new() })).collect();
         while !self.sched.idle() {
@@ -145,7 +145,7 @@ fn itl(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> {
     let max_ctx = long + new + 64;
     let mut b = Bench::new(spec, cache, interval, max_ctx, newcomers + 1, kv_gb)?;
     b.run(vec![tokens(64, 99)], 4)?;
-    let steady = b.sched.submit(Request { prompt: tokens(64, 5), max_tokens: new, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() })?;
+    let steady = b.sched.submit(Request { prompt: tokens(64, 5), max_tokens: new, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() })?;
     let mut waiting: Vec<Vec<u32>> = (0..newcomers as u32).map(|c| tokens(long, 40 + c)).collect();
     let mut last: Option<Instant> = None;
     let mut gaps: Vec<f64> = Vec::new();
@@ -153,7 +153,7 @@ fn itl(spec: &Spec, cache: bool, interval: usize, kv_gb: f64) -> Result<()> {
     while !b.sched.idle() {
         if step % 40 == 20 && !waiting.is_empty() {
             let prompt = waiting.remove(0);
-            b.sched.submit(Request { prompt, max_tokens: 4, sampling: Sampling::GREEDY, stop: vec![], salt: String::new() })?;
+            b.sched.submit(Request { prompt, max_tokens: 4, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() })?;
         }
         let mut events = Vec::new();
         b.sched.step(&mut events)?;

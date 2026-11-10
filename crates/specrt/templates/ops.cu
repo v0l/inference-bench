@@ -19,6 +19,11 @@ constexpr bool QK_NORM = {{QK_NORM}};
 constexpr float EPS = {{EPS}};
 constexpr float THETA = {{THETA}};
 constexpr int ROPE_KIND = {{ROPE_KIND}};
+constexpr bool MROPE = {{MROPE}};
+constexpr bool MROPE_INTERLEAVED = {{MROPE_INTERLEAVED}};
+constexpr int MROPE_S0 = {{MROPE_S0}};
+constexpr int MROPE_S1 = {{MROPE_S1}};
+constexpr int MROPE_S2 = {{MROPE_S2}};
 constexpr float ROPE_FACTOR = {{ROPE_FACTOR}};
 constexpr float ROPE_LOW_FREQ = {{ROPE_LOW_FREQ}};
 constexpr float ROPE_HIGH_FREQ = {{ROPE_HIGH_FREQ}};
@@ -1201,6 +1206,14 @@ extern "C" __global__ void embed(const bf16_t* table, const int* token, float* x
         x[i] = bf16_to_f32(row[i]);
 }
 
+extern "C" __global__ void splice_rows(float* x, const int* rows, const float* embeds) {
+    int row = rows[blockIdx.y];
+    if (row < 0) return;
+    float* dst = x + (size_t)blockIdx.y * HIDDEN;
+    const float* src = embeds + (size_t)row * HIDDEN;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x) dst[i] = src[i];
+}
+
 extern "C" __global__ void rmsnorm(const float* x, const float* weight, float* out) {
     __shared__ float scratch[32];
     x += (size_t)blockIdx.x * HIDDEN;
@@ -1289,9 +1302,27 @@ __device__ __forceinline__ float4 kv_at4(const bf16_t* row, int d) {
     return v;
 }
 
+__device__ __forceinline__ int mrope_axis(int i) {
+    if (MROPE_INTERLEAVED) {
+        if (i % 3 == 1 && i < 3 * MROPE_S1) return 1;
+        if (i % 3 == 2 && i < 3 * MROPE_S2) return 2;
+        return 0;
+    }
+    if (i < MROPE_S0) return 0;
+    if (i < MROPE_S0 + MROPE_S1) return 1;
+    return 2;
+}
+
+__device__ __forceinline__ float rope_position(const int* mm_meta, const int* mm_table, int slot, int idx, int i) {
+    if (!MROPE) return (float)idx;
+    if (idx < mm_meta[2 * slot]) return (float)mm_table[((size_t)slot * MAX_CTX + idx) * 3 + mrope_axis(i)];
+    return (float)(idx + mm_meta[2 * slot + 1]);
+}
+
 __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, const float* k_norm,
                                                bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
-                                               int pos, int layer, int head, int row) {
+                                               int pos, int layer, int head, int row,
+                                               const int* mm_meta, const int* mm_table, int slot) {
     __shared__ float scratch[32];
     __shared__ float vec[HEAD_DIM];
     int d = threadIdx.x;
@@ -1307,7 +1338,8 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     if (d < HEAD_DIM) vec[d] = v;
     __syncthreads();
     if ((is_q || is_k) && d < ROT) {
-        float angle = (float)pos * rope_inv_freq(d < ROT_HALF ? d : d - ROT_HALF);
+        int fi = d < ROT_HALF ? d : d - ROT_HALF;
+        float angle = rope_position(mm_meta, mm_table, slot, pos, fi) * rope_inv_freq(fi);
         float c = cosf(angle);
         float s = sinf(angle);
         v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
@@ -1327,18 +1359,21 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
 
 extern "C" __global__ void qk_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
                                         bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
-                                        const int* pos, const int* slots, int layer, int per_row) {
+                                        const int* pos, const int* slots, int layer, int per_row,
+                                        const int* mm_meta, const int* mm_table, int slot_base) {
     int row = blockIdx.y;
     const int* table = per_row ? seq_table(block_table, slots, row) : block_table;
     int p = per_row ? pos[row] : pos[0] + row;
-    norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, table, p, layer, blockIdx.x, row);
+    norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, table, p, layer, blockIdx.x, row, mm_meta, mm_table,
+                   per_row ? slots[row] : slot_base);
 }
 
 extern "C" __global__ void kv_norm_rope(float* qkv, const float* q_norm, const float* k_norm,
                                         bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
-                                        const int* pos_ptr, int layer) {
+                                        const int* pos_ptr, int layer,
+                                        const int* mm_meta, const int* mm_table, int slot) {
     norm_rope_head(qkv, q_norm, k_norm, k_cache, v_cache, block_table, pos_ptr[0] + blockIdx.y, layer,
-                   HEADS + blockIdx.x, blockIdx.y);
+                   HEADS + blockIdx.x, blockIdx.y, mm_meta, mm_table, slot);
 }
 
 constexpr int ATTN_SPLITS = 64;
@@ -1746,7 +1781,8 @@ __device__ __forceinline__ void mma_kv(float* c, const unsigned* ah, const unsig
 
 extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
                                      const bf16_t* v_cache, const int* block_table, const int* pos_ptr, int layer,
-                                     bf16_t* out_hi, bf16_t* out_lo, int tokens) {
+                                     bf16_t* out_hi, bf16_t* out_lo, int tokens,
+                                     const int* mm_meta, const int* mm_table, int mm_slot) {
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = FM_BK * HEAD_DIM;
     static_assert(FM_BQ * HEAD_DIM * 4 <= {{FM_SMEM}}, "Q staging fits");
@@ -1795,7 +1831,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             if (d < ROT_HALF) {
                 float x = dst[d], y = dst[d + ROT_HALF];
                 float sn, c;
-                sincosf((float)(base + row) * freq[i], &sn, &c);
+                sincosf(rope_position(mm_meta, mm_table, mm_slot, base + row, d) * freq[i], &sn, &c);
                 dst[d] = x * c - y * sn;
                 dst[d + ROT_HALF] = y * c + x * sn;
             }
