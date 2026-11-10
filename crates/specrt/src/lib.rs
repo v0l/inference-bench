@@ -1,4 +1,6 @@
 pub mod anatomy;
+pub mod backends;
+pub mod wgsl;
 pub mod structure;
 pub mod chat;
 pub mod codegen;

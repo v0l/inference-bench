@@ -9,7 +9,13 @@ description = "Spec-driven CUDA runtime for dense decoder models: a new model is
 [lib]
 name = "specrt"
 
+[features]
+default = []
+wgpu = ["dep:wgpu", "dep:pollster"]
+
 [dependencies]
+wgpu = { version = "30", optional = true, default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
+pollster = { version = "1", optional = true }
 anyhow.workspace = true
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
 dirs.workspace = true
