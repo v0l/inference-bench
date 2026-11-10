@@ -134,3 +134,7 @@ Final alternating run (`vsllama.sh`, 2 rounds; llama.cpp round 2 at 1,024 was di
 specrt is at 90% of llama.cpp on the 7B at both depths. 27B NVFP4 (`gate27b.sh`, 5 runs): decode 56.9 and 55.4 tok/s at 1,024, 54.6 and 54.0 at 4,096, against 56.3 and 55.2, 53.2 and 52.8 before; logits and greedy tokens identical.
 
 Next lever: the K-quant GEMV reads gate/up at about 75% and down at about 50% of the wall. llama.cpp's Q4_K `mul_mat_vec_q` takes 54 us for the down matrix against 47 us here, so the remaining gap is spread over the smaller launches (qkv, o) and the attention reduce, not one kernel. Fusing the per-layer launches (attention reduce into the o projection, qkv into the norm) is the next step.
+
+Fusing the attention reduce into `attention_split` (last block per KV head reduces its 4 query heads, atomic ticket) was slower, 195 against 216 tok/s at 1,024 and 187 against 202 at 4,096, because one block then serialises four reductions after the split; it is not in the tree. The prompt logits and greedy tokens were unchanged. The qkv GEMV already fuses the RMSNorm (`qkv_proj_norm`), so nothing is left to fuse there.
+
+Remaining per-step gap on the 7B (llama.cpp 239 and 222 tok/s, specrt 216 and 202): about 0.45 ms per step at 1,024 and 0.5 ms at 4,096. The gate/up GEMV at 61.6 us per layer against a 46 us read floor accounts for 0.4 ms of it.
