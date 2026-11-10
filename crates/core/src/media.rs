@@ -137,6 +137,71 @@ pub fn extract(messages: &[Value], limits: &MediaLimits) -> Result<Vec<MediaItem
     Ok(out)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub kind: MediaKind,
+    pub mime: String,
+    pub name: String,
+    pub data: String,
+}
+
+impl Attachment {
+    pub fn from_bytes(name: &str, bytes: &[u8]) -> Option<Self> {
+        let (kind, mime) = sniff(name, bytes)?;
+        Some(Self { kind, mime: mime.into(), name: name.into(), data: base64::engine::general_purpose::STANDARD.encode(bytes) })
+    }
+
+    pub fn from_path(path: &std::path::Path) -> Result<Self, MediaError> {
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let bytes = std::fs::read(path).map_err(|e| MediaError(format!("{}: {e}", path.display())))?;
+        Self::from_bytes(&name, &bytes).ok_or_else(|| MediaError(format!("{name} is not an image or a video the app can send")))
+    }
+
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, self.data)
+    }
+
+    pub fn bytes(&self) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD.decode(&self.data).unwrap_or_default()
+    }
+
+    pub fn part(&self) -> Value {
+        match self.kind {
+            MediaKind::Image => serde_json::json!({"type": "image_url", "image_url": {"url": self.data_url()}}),
+            MediaKind::Video => serde_json::json!({"type": "video_url", "video_url": {"url": self.data_url()}}),
+        }
+    }
+}
+
+fn sniff(name: &str, bytes: &[u8]) -> Option<(MediaKind, &'static str)> {
+    let image = |m| Some((MediaKind::Image, m));
+    let video = |m| Some((MediaKind::Video, m));
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => return image("image/png"),
+        [0xff, 0xd8, 0xff, ..] => return image("image/jpeg"),
+        [b'G', b'I', b'F', b'8', ..] => return image("image/gif"),
+        [b'B', b'M', ..] => return image("image/bmp"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => return image("image/webp"),
+        [0x1a, 0x45, 0xdf, 0xa3, ..] => return video("video/webm"),
+        [_, _, _, _, b'f', b't', b'y', b'p', ..] => return video("video/mp4"),
+        _ => {}
+    }
+    match name.rsplit('.').next().map(str::to_lowercase).as_deref() {
+        Some("mov") => video("video/quicktime"),
+        Some("mkv") => video("video/x-matroska"),
+        _ => None,
+    }
+}
+
+pub fn content_with_attachments(text: &str, attachments: &[Attachment]) -> Value {
+    if attachments.is_empty() {
+        return Value::String(text.to_string());
+    }
+    let mut parts: Vec<Value> = attachments.iter().map(Attachment::part).collect();
+    parts.push(serde_json::json!({"type": "text", "text": text}));
+    Value::Array(parts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +263,22 @@ mod tests {
             let m = msg(json!([{"type": "image_url", "image_url": {"url": url}}]));
             assert!(extract(&m, &MediaLimits::default()).is_err(), "{url}");
         }
+    }
+
+    #[test]
+    fn attachments_sniff_their_kind_and_round_trip_into_content_parts() {
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let a = Attachment::from_bytes("cat.png", &png).unwrap();
+        assert_eq!((a.kind, a.mime.as_str()), (MediaKind::Image, "image/png"));
+        let mp4 = [0, 0, 0, 0x18, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2'];
+        assert_eq!(Attachment::from_bytes("clip.mp4", &mp4).unwrap().kind, MediaKind::Video);
+        assert!(Attachment::from_bytes("notes.txt", b"hello").is_none());
+        let content = content_with_attachments("what is it", &[a.clone()]);
+        let items = extract(&[serde_json::json!({"role": "user", "content": content})], &MediaLimits::default()).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].bytes.as_slice(), png);
+        assert_eq!(a.bytes(), png);
+        assert_eq!(content_with_attachments("hi", &[]), Value::String("hi".into()));
     }
 
     #[test]

@@ -164,6 +164,8 @@ pub struct Stats {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub ttft_secs: f64,
+    #[serde(default)]
+    pub vision_tokens: u64,
     pub prefill_tok_s: Option<f64>,
     pub decode_tok_s: Option<f64>,
 }
@@ -174,6 +176,7 @@ impl Stats {
         Self {
             prompt_tokens: g.prompt_tokens,
             completion_tokens: g.completion_tokens,
+            vision_tokens: g.vision_tokens,
             ttft_secs: g.ttft_secs,
             prefill_tok_s: r.prefill_tok_s,
             decode_tok_s: r.decode_tok_s,

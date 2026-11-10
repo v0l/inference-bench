@@ -12,6 +12,7 @@ pub struct Script {
     pub first_delay_ms: u64,
     pub usage: Option<(u64, u64)>,
     pub fail_status: Option<(u16, String)>,
+    pub vision: bool,
     pub files: Arc<Mutex<Vec<FakeFile>>>,
 }
 
@@ -163,6 +164,7 @@ fn serve(mut stream: TcpStream, script: &Script, seen: &Mutex<Vec<String>>) {
 
 pub struct ScriptedModel {
     script: Script,
+    pub vision: bool,
 }
 
 impl ScriptedModel {
@@ -171,7 +173,7 @@ impl ScriptedModel {
             if !script.models.iter().any(|m| m == model) {
                 anyhow::bail!("no config.json for {model} under the fake hub");
             }
-            Ok(Box::new(ScriptedModel { script: script.clone() }) as Box<dyn crate::native::Model>)
+            Ok(Box::new(ScriptedModel { script: script.clone(), vision: script.vision }) as Box<dyn crate::native::Model>)
         })
     }
 
@@ -224,5 +226,23 @@ impl crate::native::Model for ScriptedModel {
 
     fn logits(&mut self, _: &str) -> anyhow::Result<specrt::engine::PromptLogits> {
         Ok(specrt::engine::PromptLogits { tokens: vec![1, 2], vocab: 2, values: vec![0.0, 1.0, 2.0, 3.0] })
+    }
+
+    fn accepts_media(&self) -> bool {
+        self.vision
+    }
+
+    fn chat_media(
+        &mut self,
+        _: &[serde_json::Value],
+        _: Option<&serde_json::Value>,
+        items: &[specrt::vision::MediaItem],
+        _: specrt::vision::MediaBudget,
+        _: usize,
+        _: specrt::runtime::Sampling,
+        on_text: &mut dyn FnMut(&str) -> bool,
+    ) -> anyhow::Result<(specrt::engine::Reply, usize)> {
+        let reply = self.stream(on_text)?;
+        Ok((reply, 100 * items.len()))
     }
 }

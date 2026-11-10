@@ -8,6 +8,8 @@ pub struct Turn {
     pub message: Message,
     #[serde(default)]
     pub stats: Option<Stats>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::media::Attachment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -45,6 +47,23 @@ impl Conversation {
                 self.title = title;
             }
         }
+    }
+
+    pub fn openai_messages(&self) -> Option<Vec<serde_json::Value>> {
+        if self.turns.iter().all(|t| t.attachments.is_empty()) {
+            return None;
+        }
+        let mut out = Vec::new();
+        if !self.system.trim().is_empty() {
+            out.push(serde_json::json!({"role": "system", "content": self.system.trim()}));
+        }
+        for t in &self.turns {
+            out.push(serde_json::json!({
+                "role": t.message.role.name(),
+                "content": crate::media::content_with_attachments(&t.message.content, &t.attachments),
+            }));
+        }
+        Some(out)
     }
 
     pub fn messages(&self) -> Vec<Message> {
@@ -103,7 +122,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut a = Conversation::new();
         a.id = "a".into();
-        a.turns.push(Turn { message: Message::new(Role::User, "hello there"), stats: Some(Stats { completion_tokens: 3, ..Default::default() }) });
+        a.turns.push(Turn { message: Message::new(Role::User, "hello there"), stats: Some(Stats { completion_tokens: 3, ..Default::default() }), attachments: Vec::new() });
         a.retitle();
         let mut b = Conversation::new();
         b.id = "b".into();
@@ -131,10 +150,27 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_with_an_attachment_becomes_openai_content_parts_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("ib-chats-att-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let png = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let mut c = Conversation::new();
+        c.id = "att".into();
+        assert!(c.openai_messages().is_none());
+        let att = crate::media::Attachment::from_bytes("a.png", &png).unwrap();
+        c.turns.push(Turn { message: Message::new(Role::User, "what is this"), stats: None, attachments: vec![att.clone()] });
+        let list = c.openai_messages().unwrap();
+        assert_eq!(list[0]["content"][0]["type"], "image_url");
+        assert_eq!(list[0]["content"][1]["text"], "what is this");
+        save(&dir, &c).unwrap();
+        assert_eq!(load_all(&dir)[0].turns[0].attachments, vec![att]);
+    }
+
+    #[test]
     fn the_system_prompt_leads_the_messages() {
         let mut c = Conversation::new();
         c.system = " be brief ".into();
-        c.turns.push(Turn { message: Message::new(Role::User, "hi"), stats: None });
+        c.turns.push(Turn { message: Message::new(Role::User, "hi"), stats: None, attachments: Vec::new() });
         let m = c.messages();
         assert_eq!((m[0].role, m[0].content.as_str()), (Role::System, "be brief"));
         assert_eq!(m.len(), 2);

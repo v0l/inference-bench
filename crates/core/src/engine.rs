@@ -11,6 +11,7 @@ pub struct Loaded {
     pub model_id: String,
     pub display: String,
     pub load_secs: f64,
+    pub vision: bool,
 }
 
 pub enum Command {
@@ -88,6 +89,10 @@ impl Engine {
     pub fn loaded(&self) -> Option<Loaded> {
         self.loaded.lock().unwrap().clone()
     }
+
+    pub fn vision(&self) -> bool {
+        self.loaded().is_some_and(|l| l.vision)
+    }
 }
 
 impl Drop for Engine {
@@ -124,8 +129,9 @@ fn run(
                 let mut native = Native::with_factory(max_ctx, factory.clone());
                 match native.load(&model_id) {
                     Ok(()) => {
+                        let vision = native.capabilities().vision;
                         backend = Some(native);
-                        let info = Loaded { model_id, display, load_secs: started.elapsed().as_secs_f64() };
+                        let info = Loaded { model_id, display, load_secs: started.elapsed().as_secs_f64(), vision };
                         *shared.lock().unwrap() = Some(info.clone());
                         emit(EngineEvent::Loaded(info));
                     }
@@ -167,6 +173,7 @@ mod tests {
             first_delay_ms: 20,
             usage: Some((7, 3)),
             fail_status: None,
+            vision: false,
             files: Default::default(),
         }
     }

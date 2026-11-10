@@ -6,12 +6,13 @@ use inference_bench_core::chat::{ChatRequest, Message, Role, Stats};
 use inference_bench_core::conversations::{self, Conversation, Turn};
 use inference_bench_core::engine::ChatEvent;
 use inference_bench_core::library::human_size;
+use inference_bench_core::media::{Attachment, MediaKind};
 use inference_bench_core::settings::Settings;
 use inference_bench_core::target::NATIVE;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, channel};
 
 const READY_HINT: &str = "Send a message. Enter sends, Shift+Enter adds a line.";
 const IDLE_HINT: &str = "Load a model to chat";
@@ -34,6 +35,10 @@ pub struct ChatState {
     pub show_settings: bool,
     pub seed_text: String,
     pub max_tokens_text: String,
+    pub pending: Vec<Attachment>,
+    pub attach_error: Option<String>,
+    pub picking: Option<Receiver<Vec<std::path::PathBuf>>>,
+    pub thumbs: std::collections::HashMap<String, egui::TextureHandle>,
 }
 
 impl ChatState {
@@ -54,6 +59,10 @@ impl ChatState {
             show_settings: false,
             seed_text: String::new(),
             max_tokens_text: String::new(),
+            pending: Vec::new(),
+            attach_error: None,
+            picking: None,
+            thumbs: Default::default(),
         }
     }
 
@@ -101,14 +110,14 @@ impl ChatState {
                 let reply = if g.text.is_empty() { text } else { g.text };
                 self.last_stats = Some(stats);
                 let c = self.conv();
-                c.turns.push(Turn { message: Message::new(Role::Assistant, reply), stats: Some(stats) });
+                c.turns.push(Turn { message: Message::new(Role::Assistant, reply), stats: Some(stats), attachments: Vec::new() });
                 c.updated = chrono::Utc::now();
                 let _ = conversations::save(dir, c);
             }
             Err(e) => {
                 let c = self.conv();
                 if !text.is_empty() {
-                    c.turns.push(Turn { message: Message::new(Role::Assistant, text), stats: None });
+                    c.turns.push(Turn { message: Message::new(Role::Assistant, text), stats: None, attachments: Vec::new() });
                 }
                 let _ = conversations::save(dir, c);
                 self.error = Some(e.to_string());
@@ -116,14 +125,61 @@ impl ChatState {
         }
     }
 
+    pub fn attach_bytes(&mut self, name: &str, bytes: &[u8]) {
+        match Attachment::from_bytes(name, bytes) {
+            Some(a) => {
+                self.attach_error = None;
+                self.pending.push(a);
+            }
+            None => self.attach_error = Some(format!("{name} is not an image or a video the app can send")),
+        }
+    }
+
+    pub fn attach_path(&mut self, path: &Path) {
+        match Attachment::from_path(path) {
+            Ok(a) => {
+                self.attach_error = None;
+                self.pending.push(a);
+            }
+            Err(e) => self.attach_error = Some(e.to_string()),
+        }
+    }
+
+    pub fn pick_files(&mut self) {
+        if self.picking.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let files = rfd::FileDialog::new()
+                .set_title("Attach images or video")
+                .add_filter("images and video", &["png", "jpg", "jpeg", "webp", "gif", "bmp", "mp4", "mov", "webm", "mkv"])
+                .pick_files()
+                .unwrap_or_default();
+            let _ = tx.send(files);
+        });
+        self.picking = Some(rx);
+    }
+
+    pub fn poll_picker(&mut self) {
+        let Some(rx) = &self.picking else { return };
+        if let Ok(files) = rx.try_recv() {
+            self.picking = None;
+            for f in files {
+                self.attach_path(&f);
+            }
+        }
+    }
+
     pub fn send(&mut self, handle: inference_bench_core::engine::Handle, dir: &Path) {
         let text = self.input.trim().to_string();
-        if text.is_empty() || self.streaming.is_some() {
+        if (text.is_empty() && self.pending.is_empty()) || self.streaming.is_some() {
             return;
         }
         self.input.clear();
+        let attachments = std::mem::take(&mut self.pending);
         let c = self.conv();
-        c.turns.push(Turn { message: Message::new(Role::User, text), stats: None });
+        c.turns.push(Turn { message: Message::new(Role::User, text), stats: None, attachments });
         c.retitle();
         let _ = conversations::save(dir, c);
         self.generate(handle);
@@ -134,6 +190,10 @@ impl ChatState {
         let c = self.conv();
         let mut request = ChatRequest::new(c.messages(), c.sampling);
         request.use_template = c.use_template;
+        request.openai_messages = c.openai_messages();
+        if let Some(list) = &request.openai_messages {
+            request.media = inference_bench_core::media::extract(list, &Default::default()).unwrap_or_default();
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         request.cancel = Some(cancel.clone());
         let rx = handle.chat(request);
@@ -418,15 +478,107 @@ fn conversation_view(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+fn thumbnail(ui: &mut egui::Ui, thumbs: &mut std::collections::HashMap<String, egui::TextureHandle>, a: &Attachment) {
+    let key = format!("{}:{}", a.name, a.data.len());
+    if a.kind == MediaKind::Image && !thumbs.contains_key(&key) {
+        if let Ok(img) = image::load_from_memory(&a.bytes()) {
+            let small = img.thumbnail(160, 160).to_rgba8();
+            let size = [small.width() as usize, small.height() as usize];
+            let color = egui::ColorImage::from_rgba_unmultiplied(size, small.as_raw());
+            thumbs.insert(key.clone(), ui.ctx().load_texture(format!("thumb-{key}"), color, Default::default()));
+        }
+    }
+    match thumbs.get(&key) {
+        Some(t) => {
+            let r = ui.add(egui::Image::new(t).max_height(72.0).corner_radius(4));
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, format!("attachment {}", a.name)));
+        }
+        None => {
+            let label = if a.kind == MediaKind::Video { format!("video {}", a.name) } else { a.name.clone() };
+            ui.add(egui::Label::new(egui::RichText::new(label).color(LEGEND)));
+        }
+    }
+}
+
+fn attachment_row(app: &mut App, ui: &mut egui::Ui) {
+    let mut remove = None;
+    if let Some(e) = &app.chat.attach_error {
+        chat_ui::fault(ui, "attachment", e);
+    }
+    if app.chat.pending.is_empty() {
+        return;
+    }
+    let pending = app.chat.pending.clone();
+    ui.horizontal_wrapped(|ui| {
+        for (i, a) in pending.iter().enumerate() {
+            ui.vertical(|ui| {
+                thumbnail(ui, &mut app.chat.thumbs, a);
+                if ui.add(Key::new("remove").outline(LEGEND).id_salt(("remove-attachment", i))).clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+    });
+    if let Some(i) = remove {
+        app.chat.pending.remove(i);
+    }
+}
+
+fn collect_input(app: &mut App, ui: &egui::Ui) {
+    let (dropped, pasted) = ui.input(|i| {
+        let dropped: Vec<_> = i.raw.dropped_files.clone();
+        let pasted: Vec<_> = i
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::PasteImage(img) => Some(img.clone()),
+                _ => None,
+            })
+            .collect();
+        (dropped, pasted)
+    });
+    for f in dropped {
+        match f.bytes() {
+            Ok(bytes) => {
+                let name = f.path().file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                app.chat.attach_bytes(&name, &bytes);
+            }
+            Err(e) => app.chat.attach_error = Some(e),
+        }
+    }
+    for img in pasted {
+        let mut png = Vec::new();
+        let rgba: Vec<u8> = img.pixels.iter().flat_map(|p| p.to_array()).collect();
+        if let Some(buf) = image::RgbaImage::from_raw(img.size[0] as u32, img.size[1] as u32, rgba) {
+            let _ = image::DynamicImage::ImageRgba8(buf).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png);
+            app.chat.attach_bytes("pasted.png", &png);
+        }
+    }
+}
+
 fn composer(app: &mut App, ui: &mut egui::Ui) {
     let handle = app.engine.handle();
     let ready = app.loaded().is_some();
+    app.chat.poll_picker();
+    collect_input(app, ui);
+    attachment_row(app, ui);
+    let vision = app.engine.vision();
+    ui.horizontal(|ui| {
+        let attach = ui.add_enabled(ready && vision, Key::new("attach").outline(VALUE).min_width(90.0).id_salt("attach"));
+        if attach.clicked() {
+            app.chat.pick_files();
+        }
+        if ready && !vision {
+            ui.label(egui::RichText::new("this model takes text only").size(10.5).color(LEGEND));
+        }
+    });
     let streaming = app.chat.streaming();
     let hint = if ready { READY_HINT } else { IDLE_HINT };
     let used = app.chat.conv().token_estimate();
     let limit = context_limit(app);
     chat_ui::context_bar(ui, used, limit);
     let events = chat_ui::ask_box(ui, &mut app.chat.input, hint, streaming, ready);
+    let _ = &events;
     for event in events {
         match event {
             chat_ui::Event::Stop => app.chat.stop(),

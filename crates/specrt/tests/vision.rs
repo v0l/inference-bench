@@ -116,3 +116,73 @@ fn text_only_configs_have_no_vision() {
 fn clip_with_the_config_bounds_is_bit_identical_to_transformers() {
     check_video("clip");
 }
+
+fn tokens() -> VisionTokens {
+    VisionTokens { image: 9, video: 8, start: 7, end: 6 }
+}
+
+fn image(h: usize, w: usize) -> Processed {
+    Processed::Image(Patches { grid: [1, h, w], data: vec![] })
+}
+
+#[test]
+fn text_positions_advance_all_axes_and_vision_gets_a_grid() {
+    let vis = tokens();
+    let mut ids = vec![1, 2, 7];
+    ids.extend([9; 6]);
+    ids.extend([6, 3]);
+    let plan = plan_media(&ids, &vis, 2, &[image(4, 6)], &[[1; 32]]).unwrap();
+    let p = |i: usize| (plan.positions[i][0], plan.positions[i][1], plan.positions[i][2]);
+    assert_eq!([p(0), p(1), p(2)], [(0, 0, 0), (1, 1, 1), (2, 2, 2)]);
+    assert_eq!([p(3), p(4), p(5)], [(3, 3, 3), (3, 3, 4), (3, 3, 5)]);
+    assert_eq!([p(6), p(7), p(8)], [(3, 4, 3), (3, 4, 4), (3, 4, 5)]);
+    assert_eq!(p(9), (6, 6, 6));
+    assert_eq!(p(10), (7, 7, 7));
+    assert_eq!(plan.delta, 8 - 11);
+    assert_eq!(plan.positions[3][3], 0);
+    assert_eq!(plan.positions[8][3], 5);
+    assert_eq!(plan.positions[0][3], -1);
+}
+
+#[test]
+fn the_same_image_gives_the_same_prefix_tags_and_another_image_does_not() {
+    let vis = tokens();
+    let mut ids = vec![7];
+    ids.extend([9; 4]);
+    ids.push(6);
+    let a = plan_media(&ids, &vis, 2, &[image(4, 4)], &[[1; 32]]).unwrap();
+    let b = plan_media(&ids, &vis, 2, &[image(4, 4)], &[[1; 32]]).unwrap();
+    let c = plan_media(&ids, &vis, 2, &[image(4, 4)], &[[2; 32]]).unwrap();
+    assert_eq!(a.tags, b.tags);
+    assert_ne!(a.tags[1..5], c.tags[1..5]);
+    assert_eq!(a.tags[0], 0);
+    assert!(a.tags[1..5].iter().all(|&t| t != 0));
+    let distinct: std::collections::HashSet<_> = a.tags[1..5].iter().collect();
+    assert_eq!(distinct.len(), 4);
+}
+
+#[test]
+fn a_run_that_does_not_match_the_grid_or_the_media_count_is_an_error() {
+    let vis = tokens();
+    let ids = [7, 9, 9, 6];
+    assert!(plan_media(&ids, &vis, 2, &[image(4, 4)], &[[1; 32]]).is_err());
+    assert!(plan_media(&[1, 2], &vis, 2, &[image(2, 2)], &[[1; 32]]).is_err());
+    assert!(plan_media(&[9], &vis, 2, &[], &[]).is_err());
+}
+
+#[test]
+fn video_frames_each_advance_the_text_position_by_their_grid_side() {
+    let vis = tokens();
+    let video = Processed::Video(VideoPatches { patches: Patches { grid: [2, 4, 4], data: vec![] }, timestamps: vec![0.0, 1.0] });
+    let mut ids = vec![7, 5, 7];
+    ids.extend([8; 4]);
+    ids.extend([6, 5, 7]);
+    ids.extend([8; 4]);
+    ids.extend([6, 6]);
+    let plan = plan_media(&ids, &vis, 2, &[video], &[[3; 32]]).unwrap();
+    assert_eq!(plan.positions[3][..3], [3, 3, 3]);
+    assert_eq!(plan.positions[6][..3], [3, 4, 4]);
+    assert_eq!(plan.positions[10][..3], [8, 8, 8]);
+    assert_eq!(plan.positions[14][..3], [10, 10, 10]);
+        assert_eq!(plan.delta, plan.positions.last().unwrap()[0] + 1 - ids.len() as i32);
+}

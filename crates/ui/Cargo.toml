@@ -24,11 +24,12 @@ egui = "0.37"
 egui_bench = { version = "0.9.6", features = ["markdown", "chat"] }
 serde_json.workspace = true
 chrono.workspace = true
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 serde.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
 ureq.workspace = true

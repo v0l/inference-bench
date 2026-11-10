@@ -52,6 +52,7 @@ fn script() -> Script {
         first_delay_ms: 20,
         usage: Some((9, 3)),
         fail_status: None,
+        vision: false,
         files: Default::default(),
     }
 }
@@ -358,7 +359,7 @@ fn a_failed_reply_shows_a_fault_under_the_transcript() {
     let mut h = harness("replyfail", Tab::Chat);
     {
         let app = h.state_mut();
-        app.chat.conv().turns.push(Turn { message: inference_bench_core::chat::Message::new(inference_bench_core::chat::Role::User, "hi"), stats: None });
+        app.chat.conv().turns.push(Turn { message: inference_bench_core::chat::Message::new(inference_bench_core::chat::Role::User, "hi"), stats: None, attachments: Vec::new() });
         app.chat.error = Some("the engine has stopped".into());
     }
     h.run();
@@ -854,4 +855,112 @@ fn view_clone(v: &detail::View) -> detail::View {
         c.structure = v.structure.clone();
         c
     }
+}
+
+fn red_png() -> Vec<u8> {
+    let mut out = Vec::new();
+    let img = image::RgbaImage::from_pixel(64, 48, image::Rgba([200, 30, 30, 255]));
+    image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
+    out
+}
+
+fn load_vision(h: &mut Harness<'static, App>, vision: bool) {
+    {
+        let app = h.state_mut();
+        scripted(app, Script { vision, ..script() });
+        let m = app.library[0].clone();
+        app.chat.pick("Qwen3-0.6B");
+        app.load_model(&m);
+    }
+    pump_until(h, 10, "model never loaded", |a| a.loaded().is_some());
+}
+
+#[test]
+fn a_pasted_image_shows_a_thumbnail_and_goes_out_as_an_attachment() {
+    let mut h = harness("attach", Tab::Chat);
+    load_vision(&mut h, true);
+    assert!(h.state().engine.vision());
+    let rgba = vec![egui::Color32::from_rgb(200, 30, 30); 64 * 48];
+    let img = egui::ColorImage { size: [64, 48], source_size: egui::vec2(64.0, 48.0), pixels: rgba };
+    h.event(egui::Event::PasteImage(std::sync::Arc::new(img)));
+    h.run();
+    assert_eq!(h.state().chat.pending.len(), 1);
+    assert_eq!(h.state().chat.pending[0].mime, "image/png");
+    h.get_by_label_contains("attachment pasted.png");
+    h.get_by_label("remove");
+    {
+        let app = h.state_mut();
+        app.chat.input = "what is this".into();
+        let handle = app.engine.handle();
+        let d = app.dir.clone();
+        app.chat.send(handle, &d);
+    }
+    assert!(h.state().chat.pending.is_empty());
+    let turn = h.state_mut().chat.conv().turns[0].clone();
+    assert_eq!(turn.attachments.len(), 1);
+    pump_until(&mut h, 10, "reply never finished", |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= 2);
+    let stats = h.state_mut().chat.conv().turns[1].stats.unwrap();
+    assert_eq!(stats.vision_tokens, 100);
+    let saved = inference_bench_core::conversations::load_all(&h.state().dir);
+    assert_eq!(saved[0].turns[0].attachments.len(), 1);
+}
+
+#[test]
+fn a_text_only_model_cannot_attach_and_a_dropped_text_file_is_refused() {
+    let mut h = harness("attach-no", Tab::Chat);
+    load_vision(&mut h, false);
+    h.run();
+    assert!(!h.state().engine.vision());
+    h.get_by_label_contains("this model takes text only");
+    h.state_mut().chat.attach_bytes("notes.txt", b"hello");
+    assert!(h.state().chat.pending.is_empty());
+    assert!(h.state().chat.attach_error.as_deref().unwrap().contains("notes.txt"));
+    h.state_mut().chat.attach_bytes("red.png", &red_png());
+    assert_eq!(h.state().chat.pending.len(), 1);
+}
+
+#[test]
+fn a_dropped_image_file_becomes_a_pending_attachment() {
+    #[derive(Debug)]
+    struct File(std::path::PathBuf, Vec<u8>);
+    impl egui::DroppedFile for File {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            Ok(self.1.clone())
+        }
+    }
+    let mut h = harness("drop", Tab::Chat);
+    load_vision(&mut h, true);
+    h.input_mut().dropped_files.push(std::sync::Arc::new(File("/tmp/red.png".into(), red_png())));
+    h.run();
+    assert_eq!(h.state().chat.pending.len(), 1);
+    assert_eq!(h.state().chat.pending[0].name, "red.png");
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshot_chat_attachment_thumbnail() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let d = dir("shot-attach");
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        app.tab = Tab::Chat;
+        app.logs = shared_logs();
+        app.library = vec![model("Qwen3-0.6B", true, "dense decoder")];
+        app
+    });
+    load_vision(&mut h, true);
+    let mut img = image::RgbaImage::new(160, 120);
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        *p = image::Rgba([(x * 255 / 160) as u8, (y * 255 / 120) as u8, 120, 255]);
+    }
+    let mut png = Vec::new();
+    image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    h.state_mut().chat.attach_bytes("gradient.png", &png);
+    h.run();
+    h.render().unwrap().save(out.join("chat-attachment.png")).unwrap();
 }
