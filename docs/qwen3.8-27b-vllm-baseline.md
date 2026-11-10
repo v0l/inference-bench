@@ -58,17 +58,30 @@ Single stream, 128 output tokens, 6 runs up to 65k and 3 runs from 131k (medians
 
 specrt ran every length to 260k without an out of memory error at KV 24 GB. Its long prefill is 4x to 5x slower than vLLM and falls with length (1,374 tok/s at 4k to 532 at 260k), so prefill attention at long context is the gap to close.
 
-#505 profile (nsys, 16k prompt, `qwen3.8-27b.toml`): prefill is GEMM bound, not attention bound. gate_up 37%, down 16%, lin_in 11%, flash_mma 8% at 16k and 28% at 64k (it grows with length). With 1-plane (serving) KV the flash kernel now skips the unused lo plane: half the shared memory per stage, 32 keys per tile instead of 16 for head_dim 256, one fewer MMA per tile. flash_mma median per call at 16k: 8.6 ms before, 7.7 ms after (GPU shared with other jobs, so noisy). The 27B gate (10 real27b tests) and the non-27B suite pass.
+#505, specrt prefill on `qwen3.8-27b.toml`, `prefixbench long`, bf16 KV, cache on, cold. The GPU was never idle: the served vLLM (local-llm, port 8001) had live requests the whole time, so every wall-clock number below is under load and is only comparable inside one interleaved A/B (master, branch, master, branch, 3 rounds each, medians, all three values shown). The 1,101 tok/s at 32k in the table above was taken on a quieter GPU and cannot be compared with these.
 
-Bigger lever, config only: `qwen3.8-27b-nvfp4-act.toml` (native FP8 projections and FP4 MLPs) through `prefixbench long`, bf16 KV, cold single run:
-
-| prompt | `qwen3.8-27b.toml` before | `qwen3.8-27b-nvfp4-act.toml` before the flash change | `qwen3.8-27b-nvfp4-act.toml` after |
+| prompt | master tok/s (3 runs) | branch tok/s (3 runs) | median gain |
 |---|---|---|---|
-| 4,096 | 1,356 tok/s | 2,484 | 2,640 |
-| 32,768 | 1,101 | 1,599 | 2,062 |
-| 65,536 | n/a | n/a | 1,669 |
+| 4,096 | 689 (689, 1259, 664) | 1,474 (817, 1474, 1542) | too noisy |
+| 32,768 | 579 (573, 587, 579) | 916 (916, 739, 930) | 1.6x |
+| 65,536 | 549 (501, 549, 828) | 746 (738, 746, 1015) | 1.4x |
 
-Still 3x below vLLM at 32k (6,849 tok/s). The remaining gap is the GEMM kernels and flash_mma at long KV.
+So the earlier 596 vs 1,101 was contention, not a regression: master measured 579 in the same window.
+
+Profile (nsys, 8k to 16k prompt): prefill is GEMM bound. gate_up 37%, down 16%, lin_in 11%, flash_mma 8% at 16k and 28% at 64k. Per-kernel medians (kernel time does not depend on the load much, but they overlap vLLM too):
+
+| kernel | master 64x128 tile | 128x128 tile (branch) |
+|---|---|---|
+| gate_up_mma_big (FP8) | 23.5 ms | 19.3 ms |
+| down_mma_big | 9.7 ms | 9.6 ms |
+| lin_in_mma_big | 9.3 ms | 8.6 ms |
+| gate_up_f4w_big (NVFP4 spec) | 18.7 ms | 17.2 ms |
+
+At 2048 tokens gate_up is 2 x 2048 x 34816 x 5120 = 0.73 TFLOP, so 19.3 ms is 38 TFLOP/s. cuBLAS on the same shape in this venv: bf16 about 240 to 250 TFLOP/s, FP8 `_scaled_mm` about 500 TFLOP/s (down and lin_in shapes measured; gate_up in the same range). The kernels here run the `mma.sync` bf16 path with weights dequantised in the main loop and the activation split in hi and lo planes (two MMAs per tile), so they sit at roughly 15% of cuBLAS bf16 and 8% of FP8. Closing that needs a different design (tcgen05 or native FP8/FP4 MMA with block scales on the weight side, no hi/lo split), not tuning. The `[runtime] big_tile` sweep (nvfp4 and fp8 specs, tiles 64x128, 128x128 with 2x4 and 4x2 warps, 64x256, 128x256) found 128x128 with 2x4 warps best; 64x256 is slightly worse, 128x128 with 4x2 warps is worse. 128x256 and 3-stage FP8 do not fit in shared memory.
+
+Changes: flash_mma skips the unused lo KV plane with 1-plane KV (flash_mma 8.6 ms to 7.7 ms median at 16k, 32 keys per tile for head_dim 256); the default big tile is 128x128 (was 64x128); NVFP4 weight GEMM stage count now fits the shared memory limit so larger tiles load. The `qwen3.8-27b-nvfp4-act.toml` spec (native FP4 MLP, FP8 projections) is about 2x faster at prefill but changes numerics; the serving default stays `qwen3.8-27b.toml`.
+
+Still about 5x below vLLM at 32k (6,849 tok/s, quiet GPU) on specrt-under-load numbers; on a quiet GPU the branch would be higher.
 
 Decode of 512 tokens after a held prefix (median tok/s):
 
