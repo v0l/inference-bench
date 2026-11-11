@@ -121,6 +121,7 @@ pub struct PlacementConfig {
     pub micro_batch: Option<usize>,
     pub discovery: Discovery,
     pub mdns_port: u16,
+    pub mdns_interface: Option<String>,
     pub remote: Option<RemoteConfig>,
 }
 
@@ -138,7 +139,7 @@ impl PlacementConfig {
 
 impl Default for PlacementConfig {
     fn default() -> Self {
-        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: None, discovery: Discovery::Static, mdns_port: 5353, remote: None }
+        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: None, discovery: Discovery::Static, mdns_port: 5353, mdns_interface: None, remote: None }
     }
 }
 

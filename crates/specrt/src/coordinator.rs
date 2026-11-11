@@ -25,7 +25,7 @@ pub struct Coordinator {
 impl Coordinator {
     pub fn new(spec: &Spec, base: PlacementConfig, key: Vec<u8>, timeout: Duration, member_ttl: Duration) -> Result<Coordinator> {
         let browser = match base.discovery {
-            crate::placement::Discovery::Mdns => Some(Browser::start(base.mdns_port)?),
+            crate::placement::Discovery::Mdns => Some(Browser::start_on(base.mdns_port, base.mdns_interface.as_deref())?),
             crate::placement::Discovery::Static => None,
         };
         let members = Membership::from_static(&base.devices, member_ttl.as_millis() as u64);

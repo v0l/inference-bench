@@ -264,7 +264,8 @@ pub fn serve(config: &StageConfig, placement: Option<&PlacementConfig>) -> Resul
     let announcer = match (placement.map(|p| p.discovery), &config.device) {
         (Some(Discovery::Mdns), Some(device)) => {
             let port = placement.map_or(5353, |p| p.mdns_port);
-            Some(crate::discovery::Announcer::start(device, server.addr(), port)?)
+            let interface = placement.and_then(|p| p.mdns_interface.as_deref());
+            Some(crate::discovery::Announcer::start_on(device, server.addr(), port, interface)?)
         }
         (Some(Discovery::Mdns), None) => anyhow::bail!("[placement] discovery = \"mdns\" needs a [stage.device] table to announce"),
         _ => None,

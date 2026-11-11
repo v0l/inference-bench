@@ -303,3 +303,36 @@ fn killing_and_restarting_a_stage_process_fails_the_request_then_serves_identica
     drop(tail_again);
     drop(head);
 }
+
+#[test]
+fn mdns_can_be_bound_to_one_named_interface_and_still_finds_the_stage() {
+    let port = 15470;
+    if !multicast_works(port) {
+        eprintln!("multicast is not available here, skipping");
+        return;
+    }
+    let browser = Browser::start_on(port + 1, Some("lo")).unwrap();
+    let _announce = Announcer::start_on(&device("bound-a", None), "127.0.0.1:7788".parse().unwrap(), port + 1, Some("lo")).unwrap();
+    let joined = until("the join on lo", || match browser.events().recv_timeout(Duration::from_millis(200)) {
+        Ok(Event::Join { device, address, .. }) if device.name == "bound-a" => Some(address),
+        _ => None,
+    });
+    assert_eq!(joined, "127.0.0.1:7788");
+}
+
+#[test]
+fn mdns_bound_to_a_missing_interface_never_sees_a_stage_on_another_one() {
+    let port = 15480;
+    if !multicast_works(port) {
+        eprintln!("multicast is not available here, skipping");
+        return;
+    }
+    let browser = Browser::start_on(port + 1, Some("nosuchif0")).unwrap();
+    let _announce = Announcer::start_on(&device("bound-b", None), "127.0.0.1:7789".parse().unwrap(), port + 1, Some("lo")).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        if let Ok(Event::Join { device, .. }) = browser.events().recv_timeout(Duration::from_millis(200)) {
+            assert_ne!(device.name, "bound-b", "a browser bound to another interface saw the stage");
+        }
+    }
+}

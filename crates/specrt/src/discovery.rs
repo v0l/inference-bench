@@ -1,10 +1,23 @@
 use crate::cluster::{Event, SERVICE_NAME, decode_announcement, encode_announcement};
 use crate::placement::DeviceConfig;
 use anyhow::{Context, Result};
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{IfKind, ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::net::SocketAddr;
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
+
+fn daemon_on(port: u16, interface: Option<&str>) -> Result<ServiceDaemon> {
+    let daemon = ServiceDaemon::new_with_port(port).context("mdns daemon")?;
+    if let Some(name) = interface {
+        daemon.disable_interface(IfKind::All).context("mdns interfaces")?;
+        let kind = match name.parse::<std::net::IpAddr>() {
+            Ok(ip) => IfKind::Addr(ip),
+            Err(_) => IfKind::Name(name.to_string()),
+        };
+        daemon.enable_interface(kind).with_context(|| format!("mdns interface {name}"))?;
+    }
+    Ok(daemon)
+}
 
 pub struct Announcer {
     daemon: ServiceDaemon,
@@ -13,7 +26,11 @@ pub struct Announcer {
 
 impl Announcer {
     pub fn start(device: &DeviceConfig, addr: SocketAddr, port: u16) -> Result<Announcer> {
-        let daemon = ServiceDaemon::new_with_port(port).context("mdns daemon")?;
+        Self::start_on(device, addr, port, None)
+    }
+
+    pub fn start_on(device: &DeviceConfig, addr: SocketAddr, port: u16, interface: Option<&str>) -> Result<Announcer> {
+        let daemon = daemon_on(port, interface)?;
         let txt: Vec<(String, String)> = encode_announcement(device, &addr.to_string())
             .into_iter()
             .filter_map(|e| e.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())))
@@ -56,7 +73,11 @@ fn instance_name(fullname: &str) -> String {
 
 impl Browser {
     pub fn start(port: u16) -> Result<Browser> {
-        let daemon = ServiceDaemon::new_with_port(port).context("mdns daemon")?;
+        Self::start_on(port, None)
+    }
+
+    pub fn start_on(port: u16, interface: Option<&str>) -> Result<Browser> {
+        let daemon = daemon_on(port, interface)?;
         let found = daemon.browse(SERVICE_NAME).context("mdns browse")?;
         let (tx, events) = channel();
         let epoch = Instant::now();
