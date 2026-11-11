@@ -3,7 +3,7 @@ use crate::spec::Spec;
 use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
 
-pub const SERVICE_NAME: &str = "_specrt-stage._tcp.local";
+pub const SERVICE_NAME: &str = "_specrt-stage._tcp.local.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -69,6 +69,8 @@ pub fn decode_announcement(txt: &[String]) -> Result<(DeviceConfig, String)> {
         memory_gib: number("mem")?,
         bandwidth_gbs: number("bw")?,
         tflops: number("tflops")?,
+        ordinal: None,
+        address: None,
         reserve_gib: if fields.contains_key("reserve") { Some(number("reserve")?) } else { None },
         link,
         offload: None,
@@ -86,7 +88,7 @@ impl Membership {
     pub fn from_static(devices: &[DeviceConfig], ttl_ms: u64) -> Membership {
         let members = devices
             .iter()
-            .map(|d| Member { device: d.clone(), address: None, source: Source::Static, last_seen_ms: 0 })
+            .map(|d| Member { device: d.clone(), address: d.address.clone(), source: Source::Static, last_seen_ms: 0 })
             .collect();
         Membership { members, ttl_ms }
     }
@@ -146,8 +148,16 @@ impl Membership {
 
     pub fn replan(&self, spec: &Spec, base: &PlacementConfig) -> Result<Placement> {
         let mut config = base.clone();
-        config.devices = self.devices();
-        config.stages.retain(|s| config.devices.iter().any(|d| d.name == s.device));
+        let mut devices = self.devices();
+        config.stages.retain(|s| devices.iter().any(|d| d.name == s.device));
+        let mut ordered = Vec::new();
+        for s in &config.stages {
+            if let Some(i) = devices.iter().position(|d| d.name == s.device) {
+                ordered.push(devices.remove(i));
+            }
+        }
+        ordered.extend(devices);
+        config.devices = ordered;
         config.place(spec)
     }
 }
@@ -182,6 +192,8 @@ mod tests {
             memory_gib: gib,
             bandwidth_gbs: 1800.0,
             tflops: 1000.0,
+            ordinal: None,
+            address: None,
             reserve_gib: Some(0.0),
             link: LinkConfig::default(),
             offload: None,
@@ -194,6 +206,21 @@ mod tests {
 
     fn base() -> PlacementConfig {
         PlacementConfig { context: 8192, slots: 8, ..PlacementConfig::default() }
+    }
+
+    #[test]
+    fn pinned_stages_keep_their_order_whatever_order_nodes_joined_in() {
+        let spec = spec();
+        let mut m = Membership::from_static(&[], 5000);
+        m.apply(Event::Join { device: dev("tail", 96.0), address: "h:2".into(), now_ms: 0 });
+        m.apply(Event::Join { device: dev("head", 96.0), address: "h:1".into(), now_ms: 0 });
+        let mut cfg = base();
+        cfg.stages = vec![
+            crate::placement::StageConfig { device: "head".into(), layers: [0, 40] },
+            crate::placement::StageConfig { device: "tail".into(), layers: [40, 64] },
+        ];
+        let p = m.replan(&spec, &cfg).unwrap();
+        assert_eq!(p.stages.iter().map(|s| s.device_name.as_str()).collect::<Vec<_>>(), ["head", "tail"]);
     }
 
     #[test]

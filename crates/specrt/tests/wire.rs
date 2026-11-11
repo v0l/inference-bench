@@ -58,6 +58,7 @@ fn every_message_round_trips_through_the_codec() {
         Message::Cancel { slot: 0 },
         Message::Ack,
         Message::Error { message: "no".into() },
+        Message::Assign { layer_start: 8, layer_end: 16 },
     ];
     for m in messages {
         let mut buf = Vec::new();

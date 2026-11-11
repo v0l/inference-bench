@@ -1,3 +1,4 @@
+use crate::placement::{DeviceConfig, Discovery, PlacementConfig};
 use crate::runtime::{DecodeRow, Layout, Runtime, Sampling, StageRange, Stepper};
 use crate::spec::Spec;
 use crate::wire::{Chain, ChainTimes, Input, Message, StageHandler, StageServer};
@@ -11,7 +12,10 @@ use std::time::{Duration, Instant};
 #[serde(deny_unknown_fields)]
 pub struct StageConfig {
     pub spec: PathBuf,
-    pub layers: [usize; 2],
+    #[serde(default)]
+    pub layers: Option<[usize; 2]>,
+    #[serde(default)]
+    pub device: Option<DeviceConfig>,
     pub bind: String,
     pub key: Option<String>,
     pub key_file: Option<PathBuf>,
@@ -24,6 +28,7 @@ pub struct StageConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineConfig {
+    #[serde(default)]
     pub stages: Vec<String>,
     pub key: Option<String>,
     pub key_file: Option<PathBuf>,
@@ -36,6 +41,7 @@ pub struct PipelineConfig {
 pub struct Config {
     pub stage: Option<StageConfig>,
     pub pipeline: Option<PipelineConfig>,
+    pub placement: Option<PlacementConfig>,
 }
 
 fn default_ctx() -> usize {
@@ -93,46 +99,64 @@ pub fn bytes_f32(b: &[u8]) -> Result<Vec<f32>> {
     Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
 }
 
-struct Inner {
+struct Loaded {
     rt: Runtime,
     st: Stepper,
-}
-
-unsafe impl Send for Inner {}
-
-pub struct RuntimeStage {
-    inner: Mutex<Inner>,
     start: u32,
     end: u32,
-    hidden: u32,
-    slots: u32,
+}
+
+unsafe impl Send for Loaded {}
+
+pub struct RuntimeStage {
+    spec: Spec,
+    max_ctx: usize,
+    slots: usize,
+    inner: Mutex<Option<Loaded>>,
+}
+
+fn load_range(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize) -> Result<Loaded> {
+    let pages = max_ctx.div_ceil(crate::codegen::PAGE);
+    let layout = Layout { kv_planes: 1, ..Layout::contiguous(max_ctx, slots) };
+    let range = StageRange { device: 0, start: layers[0], end: layers[1] };
+    let mut rt = Runtime::load_stage(spec, layout, range)?;
+    for slot in 0..slots {
+        let blocks: Vec<u32> = (0..pages as u32).map(|p| (slot * pages) as u32 + p).collect();
+        rt.set_block_table(slot, &blocks)?;
+    }
+    let st = rt.stepper()?;
+    Ok(Loaded { rt, st, start: layers[0] as u32, end: layers[1] as u32 })
 }
 
 impl RuntimeStage {
     pub fn load(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize) -> Result<RuntimeStage> {
-        let pages = max_ctx.div_ceil(crate::codegen::PAGE);
-        let layout = Layout { kv_planes: 1, ..Layout::contiguous(max_ctx, slots) };
-        let range = StageRange { device: 0, start: layers[0], end: layers[1] };
-        let mut rt = Runtime::load_stage(spec, layout, range)?;
-        for slot in 0..slots {
-            let blocks: Vec<u32> = (0..pages as u32).map(|p| (slot * pages) as u32 + p).collect();
-            rt.set_block_table(slot, &blocks)?;
+        let loaded = load_range(spec, layers, max_ctx, slots)?;
+        Ok(RuntimeStage { spec: spec.clone(), max_ctx, slots, inner: Mutex::new(Some(loaded)) })
+    }
+
+    pub fn unloaded(spec: &Spec, max_ctx: usize, slots: usize) -> RuntimeStage {
+        RuntimeStage { spec: spec.clone(), max_ctx, slots, inner: Mutex::new(None) }
+    }
+
+    pub fn assign(&self, layers: [usize; 2]) -> Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        if guard.as_ref().is_some_and(|l| [l.start as usize, l.end as usize] == layers) {
+            return Ok(());
         }
-        let st = rt.stepper()?;
-        Ok(RuntimeStage {
-            inner: Mutex::new(Inner { rt, st }),
-            start: layers[0] as u32,
-            end: layers[1] as u32,
-            hidden: spec.dims.hidden as u32,
-            slots: slots as u32,
-        })
+        *guard = None;
+        *guard = Some(load_range(&self.spec, layers, self.max_ctx, self.slots)?);
+        Ok(())
+    }
+
+    pub fn layers(&self) -> Option<[usize; 2]> {
+        self.inner.lock().unwrap().as_ref().map(|l| [l.start as usize, l.end as usize])
     }
 
     fn forward(&self, slot: u32, position: u32, input: Input, decode: bool) -> Result<Message> {
-        ensure!(slot < self.slots, "slot {slot} out of {}", self.slots);
+        ensure!((slot as usize) < self.slots, "slot {slot} out of {}", self.slots);
         let started = Instant::now();
         let mut guard = self.inner.lock().unwrap();
-        let Inner { rt, st } = &mut *guard;
+        let Loaded { rt, st, .. } = guard.as_mut().context("this stage has no layers loaded")?;
         let role = rt.role();
         let (tokens, rows) = match input {
             Input::Tokens(t) => {
@@ -165,7 +189,8 @@ impl RuntimeStage {
 
 impl StageHandler for RuntimeStage {
     fn ready(&self) -> Message {
-        Message::Ready { layer_start: self.start, layer_end: self.end, hidden: self.hidden }
+        let (layer_start, layer_end) = self.layers().map_or((0, 0), |[a, b]| (a as u32, b as u32));
+        Message::Ready { layer_start, layer_end, hidden: self.spec.dims.hidden as u32 }
     }
 
     fn handle(&self, message: Message) -> Message {
@@ -174,16 +199,38 @@ impl StageHandler for RuntimeStage {
                 Ok(reply) => reply,
                 Err(e) => Message::Error { message: format!("{e:#}") },
             },
+            Message::Assign { layer_start, layer_end } => match self.assign([layer_start as usize, layer_end as usize]) {
+                Ok(()) => self.ready(),
+                Err(e) => Message::Error { message: format!("{e:#}") },
+            },
             Message::Free { .. } | Message::Cancel { .. } => Message::Ack,
             other => Message::Error { message: format!("unexpected {other:?}") },
         }
     }
 }
 
-pub fn serve(config: &StageConfig) -> Result<StageServer> {
+pub struct ServedStage {
+    pub server: StageServer,
+    pub stage: Arc<RuntimeStage>,
+    pub announcer: Option<crate::discovery::Announcer>,
+}
+
+pub fn serve(config: &StageConfig, placement: Option<&PlacementConfig>) -> Result<ServedStage> {
     let spec = Spec::load(&config.spec)?;
-    let stage = Arc::new(RuntimeStage::load(&spec, config.layers, config.max_ctx, config.slots)?);
-    StageServer::start(&config.bind, &config.key()?, stage)
+    let stage = Arc::new(match config.layers {
+        Some(layers) => RuntimeStage::load(&spec, layers, config.max_ctx, config.slots)?,
+        None => RuntimeStage::unloaded(&spec, config.max_ctx, config.slots),
+    });
+    let server = StageServer::start(&config.bind, &config.key()?, stage.clone())?;
+    let announcer = match (placement.map(|p| p.discovery), &config.device) {
+        (Some(Discovery::Mdns), Some(device)) => {
+            let port = placement.map_or(5353, |p| p.mdns_port);
+            Some(crate::discovery::Announcer::start(device, server.addr(), port)?)
+        }
+        (Some(Discovery::Mdns), None) => anyhow::bail!("[placement] discovery = \"mdns\" needs a [stage.device] table to announce"),
+        _ => None,
+    };
+    Ok(ServedStage { server, stage, announcer })
 }
 
 pub struct Generated {

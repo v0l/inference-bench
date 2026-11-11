@@ -27,6 +27,7 @@ pub enum Message {
     Cancel { slot: u32 },
     Ack,
     Error { message: String },
+    Assign { layer_start: u32, layer_end: u32 },
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -129,6 +130,11 @@ impl Message {
                 out.push(9);
                 put_bytes(&mut out, message.as_bytes());
             }
+            Message::Assign { layer_start, layer_end } => {
+                out.push(10);
+                put_u32(&mut out, *layer_start);
+                put_u32(&mut out, *layer_end);
+            }
         }
         out
     }
@@ -171,6 +177,7 @@ impl Message {
             7 => Message::Cancel { slot: c.u32()? },
             8 => Message::Ack,
             9 => Message::Error { message: String::from_utf8(c.bytes()?).context("error text")? },
+            10 => Message::Assign { layer_start: c.u32()?, layer_end: c.u32()? },
             other => bail!("unknown message tag {other}"),
         };
         c.done()?;
@@ -371,11 +378,28 @@ impl StageClient {
         Ok(StageClient { stream, ready, addr: addr.to_string() })
     }
 
+    pub fn hidden(&self) -> u32 {
+        match self.ready {
+            Message::Ready { hidden, .. } => hidden,
+            _ => 0,
+        }
+    }
+
     pub fn call(&mut self, message: &Message) -> Result<Message> {
         write_frame(&mut self.stream, message)?;
         match read_frame(&mut self.stream)? {
             Message::Error { message } => bail!("stage {} error: {message}", self.addr),
             reply => Ok(reply),
+        }
+    }
+
+    pub fn assign(&mut self, layer_start: u32, layer_end: u32) -> Result<()> {
+        match self.call(&Message::Assign { layer_start, layer_end })? {
+            ready @ Message::Ready { .. } => {
+                self.ready = ready;
+                Ok(())
+            }
+            other => bail!("stage {} answered an assignment with {other:?}", self.addr),
         }
     }
 
@@ -399,6 +423,24 @@ impl Chain {
             stages.push(StageClient::connect(addr, key, timeout).with_context(|| format!("stage {addr} is not ready, downstream first"))?);
         }
         stages.reverse();
+        Chain::assemble(stages)
+    }
+
+    pub fn connect_assigned(addrs: &[String], ranges: &[(usize, usize)], key: &[u8], timeout: Duration) -> Result<Chain> {
+        ensure!(!addrs.is_empty() && addrs.len() == ranges.len(), "a chain needs one layer range per stage");
+        let mut stages: Vec<StageClient> = Vec::new();
+        for (addr, &(start, end)) in addrs.iter().zip(ranges).rev() {
+            let mut client = StageClient::connect(addr, key, timeout).with_context(|| format!("stage {addr} is not ready, downstream first"))?;
+            if client.ready != (Message::Ready { layer_start: start as u32, layer_end: end as u32, hidden: client.hidden() }) {
+                client.assign(start as u32, end as u32).with_context(|| format!("stage {addr} could not load layers {start}..{end}"))?;
+            }
+            stages.push(client);
+        }
+        stages.reverse();
+        Chain::assemble(stages)
+    }
+
+    fn assemble(stages: Vec<StageClient>) -> Result<Chain> {
         let mut expected = 0;
         let mut hidden = None;
         for (i, stage) in stages.iter().enumerate() {
@@ -433,7 +475,7 @@ impl Chain {
         let mut input = Input::Tokens(tokens);
         for (i, stage) in self.stages.iter_mut().enumerate() {
             let started = Instant::now();
-            let reply = stage.call(&Message::Forward { slot, position, input, decode })?;
+            let reply = stage.call(&Message::Forward { slot, position, input, decode }).with_context(|| format!("stage {i} at {} was lost", stage.addr))?;
             times.stage.push(started.elapsed());
             match reply {
                 Message::Output { rows, data, compute_us } if i < last => {

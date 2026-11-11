@@ -38,8 +38,8 @@ fn main() -> Result<()> {
     match command.as_str() {
         "serve" => {
             let stage = config.stage.context("the config has no [stage] table")?;
-            let server = serve(&stage)?;
-            tracing::info!(addr = %server.addr(), layers = ?stage.layers, "stage ready");
+            let served = serve(&stage, config.placement.as_ref())?;
+            tracing::info!(addr = %served.server.addr(), layers = ?stage.layers, mdns = served.announcer.is_some(), "stage ready");
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }

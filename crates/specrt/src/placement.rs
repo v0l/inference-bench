@@ -47,6 +47,8 @@ pub struct DeviceConfig {
     #[serde(default)]
     pub ordinal: Option<usize>,
     #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
     pub reserve_gib: Option<f64>,
     #[serde(default)]
     pub link: LinkConfig,
@@ -60,6 +62,14 @@ pub enum Objective {
     #[default]
     Latency,
     Throughput,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Discovery {
+    #[default]
+    Static,
+    Mdns,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -78,11 +88,13 @@ pub struct PlacementConfig {
     pub devices: Vec<DeviceConfig>,
     pub stages: Vec<StageConfig>,
     pub micro_batch: usize,
+    pub discovery: Discovery,
+    pub mdns_port: u16,
 }
 
 impl Default for PlacementConfig {
     fn default() -> Self {
-        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: 0 }
+        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: 0, discovery: Discovery::Static, mdns_port: 5353 }
     }
 }
 
@@ -570,6 +582,7 @@ mod tests {
             bandwidth_gbs: gbs,
             tflops: 1000.0,
             ordinal: None,
+            address: None,
             reserve_gib: Some(0.0),
             link: LinkConfig { latency_ms: 0.01, bandwidth_gbs: 25.0 },
             offload: None,

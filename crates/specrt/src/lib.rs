@@ -4,6 +4,8 @@ pub mod wgsl;
 pub mod structure;
 pub mod chat;
 pub mod cluster;
+pub mod coordinator;
+pub mod discovery;
 pub mod codegen;
 pub mod engine;
 pub mod executor;

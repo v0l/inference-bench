@@ -87,7 +87,17 @@ A stage server process runs a layer range. The coordinator opens a stream to eac
 
 A static device list first (the config above), then mDNS. Nostr and relays are out of scope.
 
-`crates/specrt/src/cluster.rs` holds the transport-free part: `Membership` starts from the static `[[placement.devices]]`, applies `Join` and `Leave` events and expires discovered nodes that stop announcing (static ones never leave), and `replan` reruns the planner over the current members, dropping pinned stages whose device is gone. `diff` reports which stages moved. A node announces itself as `_specrt-stage._tcp.local` TXT records (`encode_announcement` / `decode_announcement`). The mDNS socket and the stage server hookup need the slice 3 stage protocol.
+Config: `[placement] discovery = "static"` (default) or `"mdns"`, `mdns_port` (default 5353). `[[placement.devices]]` takes an optional `address` for static members. With `mdns`, a `stage serve` config needs a `[stage.device]` table (same fields as a placement device) and may omit `layers`: the stage starts empty and loads whatever range the coordinator assigns.
+
+Crate: `mdns-sd` 0.21 (pure Rust, no async runtime, maintained). Each stage registers `_specrt-stage._tcp.local.` with TXT keys from `encode_announcement` and its TCP address; `discovery::Browser` turns resolved and removed services into `cluster::Event`s.
+
+- `cluster.rs` (transport-free): `Membership` starts from the static list, applies `Join` and `Leave`, expires discovered nodes that stop announcing (static ones never leave), `replan` reruns the planner over the members (pinned stages whose device is gone are dropped, device order follows the pins), `diff` reports moved stages.
+- `coordinator.rs`: `Coordinator` owns membership and the chain. `poll` feeds mDNS events and expiries into `Membership`; every change drops the chain and replans. `generate` waits for a chain (downstream first, `Chain::connect_assigned` sends `Assign` to any stage whose loaded range differs, so a stage whose layers moved reloads them) and runs the request. A lost stage fails the in-flight request with the stage address ("stage N at ADDR was lost") and drops the chain; the next request waits for the replanned chain.
+- Wire: new `Assign { layer_start, layer_end }` frame, answered with `Ready`.
+
+Tests: `tests/discovery.rs` (announce and browse on loopback, join then leave replans, kill and rejoin of a stage, and a GPU test that kills a stage process mid-request and gets bit-identical tokens after it returns). The multicast tests skip when the host has no multicast.
+
+Not done: the HTTP server (`serve.rs`, `PipelineExecutor`) still pipelines local runtimes only. A scheduler executor over remote stages, and a live replan of the served model, are tracked as a follow-up.
 
 ## Tensor parallel
 
