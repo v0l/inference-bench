@@ -14,7 +14,7 @@ fn floats(name: &str) -> Vec<f32> {
 }
 
 fn spec() -> Spec {
-    Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap()
+    Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap()
 }
 
 fn row(m: &Matrix, r: usize, cols: usize) -> Vec<f32> {

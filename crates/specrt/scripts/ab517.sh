@@ -3,8 +3,8 @@ set -uo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 base=${BASE:?BASE=<baseline prefixbench>}
 branch=${BRANCH:?BRANCH=<branch prefixbench>}
-base_spec=${BASE_SPEC:-$here/../tests/fixtures/qwen3.8-27b.toml}
-branch_spec=${BRANCH_SPEC:-$here/../tests/fixtures/qwen3.8-27b-act.toml}
+base_spec=${BASE_SPEC:-$here/../tests/fixtures/qwen3.8-27b-exact.toml}
+branch_spec=${BRANCH_SPEC:-$here/../tests/fixtures/qwen3.8-27b.toml}
 lengths=${LENGTHS:-4096,32768,65536}
 rounds=${ROUNDS:-3}
 kv_gb=${KV_GB:-6}

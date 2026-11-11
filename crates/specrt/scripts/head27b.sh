@@ -7,7 +7,7 @@ out=${OUT:-out/nsys363}
 mkdir -p "$out"
 for head in bf16 fp8 nvfp4; do
     case $head in
-        bf16) spec=tests/fixtures/qwen3.8-27b-nvfp4.toml ;;
+        bf16) spec=tests/fixtures/qwen3.8-27b-nvfp4-exact.toml ;;
         fp8) spec=tests/fixtures/qwen3.8-27b-nvfp4-head-fp8.toml ;;
         nvfp4) spec=tests/fixtures/qwen3.8-27b-nvfp4-head-nvfp4.toml ;;
     esac

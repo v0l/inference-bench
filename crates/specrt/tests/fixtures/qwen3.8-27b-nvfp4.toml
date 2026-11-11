@@ -2,6 +2,7 @@ name = "qwen3.8-27b-nvfp4"
 min_engine = 7
 repo = "orcarouter/Qwen3.8-27B-Uncensored-NVFP4"
 quant = "fp8_channel"
+act_quant = "fp8"
 
 [dims]
 hidden = 5120
@@ -36,6 +37,7 @@ theta = 10000000.0
 activation = "swiglu"
 quant = "nvfp4_g16"
 quant_until = 56
+act_quant = "fp4"
 
 [linear_attention]
 kind = "gated_delta_net"

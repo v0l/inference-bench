@@ -2,7 +2,7 @@
 set -u
 cd "$(dirname "$0")/.."
 B=${BENCH:-${CARGO_TARGET_DIR:-../../target}/release/bench}
-spec=${SPEC:-tests/fixtures/qwen3.8-27b-nvfp4.toml}
+spec=${SPEC:-tests/fixtures/qwen3.8-27b-nvfp4-exact.toml}
 log=${LOG:-out/spec27b.log}
 mkdir -p "$(dirname "$log")"
 : > "$log"

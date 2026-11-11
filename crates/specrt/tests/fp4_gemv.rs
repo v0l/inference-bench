@@ -82,7 +82,7 @@ fn tiny_spec() -> Spec {
 }
 
 fn big_spec() -> Spec {
-    Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap()
+    Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap()
 }
 
 fn compare(label: &str, spec: &Spec, case: &Case) -> bool {

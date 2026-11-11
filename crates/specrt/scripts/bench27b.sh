@@ -14,9 +14,9 @@ for round in 1 2 3; do
         fi
         echo "== $mode round $round free ${free} MiB $(date +%T)" >> "$log"
         if [ "$mode" = act ]; then
-            SPECRT_BENCH_RUNS=2 nice -n 15 "$B" tests/fixtures/qwen3.8-27b-act.toml 128,1024,4096 128 >> "$log" 2>&1
-        else
             SPECRT_BENCH_RUNS=2 nice -n 15 "$B" tests/fixtures/qwen3.8-27b.toml 128,1024,4096 128 >> "$log" 2>&1
+        else
+            SPECRT_BENCH_RUNS=2 nice -n 15 "$B" tests/fixtures/qwen3.8-27b-exact.toml 128,1024,4096 128 >> "$log" 2>&1
         fi
         errors=$(journalctl -u local-llm.service --since "$start" --no-pager -q | grep -ciE " error|oom|out of memory")
         if [ "$errors" -gt 0 ]; then

@@ -649,7 +649,7 @@ mod tests {
     }
 
     fn qwen27() -> Spec {
-        fixture("qwen3.8-27b.toml")
+        fixture("qwen3.8-27b-exact.toml")
     }
 
     fn qwen3() -> Spec {

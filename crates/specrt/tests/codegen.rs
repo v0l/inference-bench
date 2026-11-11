@@ -65,7 +65,7 @@ fn bf16_prefill_splits_activations_and_q8_does_not() {
 
 #[test]
 fn fp8_spec_uses_fp8_projections_and_keeps_lm_head_and_gates_bf16() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-exact.toml");
     let s = Spec::load(&path).unwrap();
     let m = Module::generate(&s, 4096).unwrap();
     assert!(!m.source.contains("{{"));
@@ -84,7 +84,7 @@ fn fp8_spec_uses_fp8_projections_and_keeps_lm_head_and_gates_bf16() {
 
 #[test]
 fn head_quant_picks_the_head_kernels_and_bf16_stays_the_master_source() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml");
     let plain = Spec::load(&path).unwrap();
     let base = Module::generate(&plain, 4096).unwrap();
     let mut bf16 = plain.clone();

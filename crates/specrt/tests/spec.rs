@@ -197,7 +197,7 @@ fn qwen38_27b_config_parses_into_a_hybrid_spec_and_round_trips() {
     assert_eq!(spec.qkv_rows(), 2 * 6144 + 2 * 1024);
     assert_eq!(Spec::parse(&spec.to_toml().unwrap()).unwrap(), spec);
     assert_eq!(spec.rope.mrope, Some(specrt::spec::Mrope { section: [11, 11, 10], interleaved: true }));
-    let file = Spec::load(&root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
+    let file = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-exact.toml")).unwrap();
     assert!(file.rope.mrope.is_none() && file.vision.is_none(), "toml specs are completed from the snapshot config at load, not stored");
     spec.rope.mrope = None;
     spec.vision = None;
@@ -221,7 +221,7 @@ fn compressed_tensors_nvfp4_checkpoint_derives_fp8_channel_with_nvfp4_mlps_until
     assert_eq!(spec.mlp_quant(63), Quant::Fp8Channel);
     assert_eq!(Spec::parse(&spec.to_toml().unwrap()).unwrap(), spec);
     assert_eq!(spec.rope.mrope, Some(specrt::spec::Mrope { section: [11, 11, 10], interleaved: true }));
-    let file = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    let file = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap();
     spec.rope.mrope = None;
     spec.vision = None;
     spec.name = file.name.clone();
@@ -254,7 +254,7 @@ fn compressed_tensors_groups_that_are_not_fp8_channel_or_nvfp4_g16_are_refused()
 
 #[test]
 fn mlp_quant_needs_fp8_channel_projections_and_a_layer_inside_the_count() {
-    let text = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    let text = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap();
     assert!(Spec::parse(&text).is_ok());
     assert!(Spec::parse(&text.replace("quant = \"fp8_channel\"", "quant = \"fp8_block128\"")).is_err());
     assert!(Spec::parse(&text.replace("quant = \"fp8_channel\"", "quant = \"nvfp4_g16\"")).is_err());
@@ -319,11 +319,11 @@ fn head_quant_defaults_to_the_checkpoint_head_round_trips_and_rejects_other_form
 }
 
 fn hybrid_text() -> String {
-    std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap()
+    std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-exact.toml")).unwrap()
 }
 
 fn nvfp4_text() -> String {
-    std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap()
+    std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap()
 }
 
 #[test]
@@ -334,7 +334,7 @@ fn act_quant_fields_default_to_none_round_trip_and_match_the_act_fixtures() {
     let text = plain.to_toml().unwrap();
     assert!(!text.contains("act_quant") && !text.contains("[runtime]"), "{text}");
     assert_eq!(Spec::parse(&text).unwrap(), plain);
-    let act = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4-act.toml")).unwrap();
+    let act = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
     assert_eq!((act.act_quant, act.mlp.act_quant), (ActQuant::Fp8, ActQuant::Fp4));
     assert_eq!(Spec::parse(&act.to_toml().unwrap()).unwrap(), act);
     let mut same = act.clone();
@@ -343,7 +343,7 @@ fn act_quant_fields_default_to_none_round_trip_and_match_the_act_fixtures() {
     same.act_quant = ActQuant::None;
     same.mlp.act_quant = ActQuant::None;
     assert_eq!(same, plain);
-    let fp8 = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-act.toml")).unwrap();
+    let fp8 = Spec::load(&root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
     assert_eq!((fp8.act_quant, fp8.mlp.act_quant), (ActQuant::Fp8, ActQuant::None));
 }
 
@@ -468,7 +468,7 @@ fn min_engine_defaults_to_zero_and_a_newer_one_is_refused_by_name() {
 }
 
 fn nvfp4_with_mtp(block: &str) -> anyhow::Result<Spec> {
-    let text = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    let text = std::fs::read_to_string(root().join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap();
     let (head, _) = text.split_once("[mtp]").unwrap();
     Spec::parse(&format!("{head}[mtp]\n{block}"))
 }

@@ -124,8 +124,8 @@ run_vllm() {
 }
 
 run_specrt() {
-    local act=$root/crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4-act.toml
-    local def=$root/crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4.toml
+    local act=$root/crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4.toml
+    local def=$root/crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4-exact.toml
     local spec_name spec flag args name extra
     for spec_name in ${SPECS:-act default}; do
         spec=$act

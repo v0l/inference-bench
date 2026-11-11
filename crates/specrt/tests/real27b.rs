@@ -47,7 +47,7 @@ fn top1_agreement(p: &[f32], q: &[f32], vocab: usize) -> f64 {
 }
 
 fn full_spec() -> Spec {
-    named_spec("qwen3.8-27b")
+    named_spec("qwen3.8-27b-exact")
 }
 
 fn named_spec(default: &str) -> Spec {
@@ -222,7 +222,7 @@ fn real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs() {
 #[ignore = "needs the NVFP4 and FP8 27B checkpoints in the HF cache"]
 fn real_27b_mtp_weights_load_from_both_checkpoints_with_fp8_dequantised_to_bf16() {
     use specrt::weights::{Checkpoint, Matrix, Mixer};
-    for name in ["qwen3.8-27b-nvfp4", "qwen3.8-27b"] {
+    for name in ["qwen3.8-27b-nvfp4-exact", "qwen3.8-27b-exact"] {
         let spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.toml"))).unwrap();
         let ck = Checkpoint::for_repo(&spec.repo).unwrap();
         let m = ck.mtp(&spec).unwrap();
@@ -239,7 +239,7 @@ fn real_27b_mtp_weights_load_from_both_checkpoints_with_fp8_dequantised_to_bf16(
         assert_eq!(len(&a.o), h * spec.q_dim());
         assert!(m.norm.iter().all(|v| v.is_finite()) && m.norm_embed.len() == h && m.norm_hidden.len() == h);
         assert!((m.norm.iter().sum::<f32>() / h as f32 - 2.25).abs() < 0.2, "norms carry the unit offset");
-        if name == "qwen3.8-27b" {
+        if name == "qwen3.8-27b-exact" {
             let raw = ck.view("mtp.layers.0.self_attn.k_proj.weight").unwrap();
             let scale = ck.view("mtp.layers.0.self_attn.k_proj.weight_scale_inv").unwrap();
             let s = specrt::weights::bf16_to_f32(u16::from_le_bytes([scale.data[0], scale.data[1]]));
@@ -256,7 +256,7 @@ fn real_27b_mtp_weights_load_from_both_checkpoints_with_fp8_dequantised_to_bf16(
 #[test]
 #[ignore = "needs about 26 GB of free GPU memory, the NVFP4 27B checkpoint and vllm-spec-greedy.json; then scripts/reference.py real-mtp"]
 fn real_27b_mtp_dumps_hiddens_and_draft_logits_for_the_cpu_oracle() {
-    let spec = named_spec("qwen3.8-27b-nvfp4");
+    let spec = named_spec("qwen3.8-27b-nvfp4-exact");
     let recs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out_dir().join("vllm-spec-greedy.json")).unwrap()).unwrap();
     let mut rt = Runtime::load(&spec, 1024).unwrap();
     let mut records = Vec::new();
@@ -285,7 +285,7 @@ fn real_27b_mtp_acceptance_on_an_isolated_vllms_greedy_tokens() {
 }
 
 fn teacher_forced(file: &str) {
-    let spec = named_spec("qwen3.8-27b-nvfp4");
+    let spec = named_spec("qwen3.8-27b-nvfp4-exact");
     let k = spec.mtp.as_ref().unwrap().draft_tokens;
     let recs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out_dir().join(file)).unwrap()).unwrap();
     let mut rt = Runtime::load(&spec, 1024).unwrap();

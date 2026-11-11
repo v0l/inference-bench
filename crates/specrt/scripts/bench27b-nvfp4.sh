@@ -2,8 +2,8 @@
 set -u
 cd "$(dirname "$0")/.."
 B=${BENCH:-/mnt/data/cargo-target/inference-bench/release/bench}
-spec=tests/fixtures/qwen3.8-27b-nvfp4.toml
-act=tests/fixtures/qwen3.8-27b-nvfp4-act.toml
+spec=tests/fixtures/qwen3.8-27b-nvfp4-exact.toml
+act=tests/fixtures/qwen3.8-27b-nvfp4.toml
 log=${LOG:-out/bench27b-nvfp4.log}
 mkdir -p "$(dirname "$log")"
 : > "$log"

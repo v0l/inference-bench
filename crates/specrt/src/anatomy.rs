@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn qwen3_8_27b_has_sixteen_attention_layers_in_a_three_to_one_rhythm() {
-        let a = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 1, None);
+        let a = ModelAnatomy::new(&fixture("qwen3.8-27b-exact.toml"), 1, None);
         assert_eq!(a.layers.len(), 64);
         assert_eq!(a.count(LayerKind::Attention), 16);
         assert_eq!(a.count(LayerKind::DeltaNet), 48);
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn qwen3_8_27b_parameters_match_the_safetensors_headers() {
-        let a = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 1, None);
+        let a = ModelAnatomy::new(&fixture("qwen3.8-27b-exact.toml"), 1, None);
         let layers: u64 = a.layers.iter().map(|l| l.params).sum();
         assert_eq!(layers, 24_353_196_544);
         assert_eq!(component(&a, "embedding"), 1_271_398_400);
@@ -461,8 +461,8 @@ mod tests {
 
     #[test]
     fn nvfp4_shrinks_the_mlp_only_below_quant_until() {
-        let fp8 = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 0, None);
-        let fp4 = ModelAnatomy::new(&fixture("qwen3.8-27b-nvfp4.toml"), 0, None);
+        let fp8 = ModelAnatomy::new(&fixture("qwen3.8-27b-exact.toml"), 0, None);
+        let fp4 = ModelAnatomy::new(&fixture("qwen3.8-27b-nvfp4-exact.toml"), 0, None);
         assert_eq!(fp4.total_params, fp8.total_params);
         assert!(fp4.total_bytes < fp8.total_bytes);
         assert_eq!(fp4.layers[0].mlp_quant, Quant::Nvfp4G16);
@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn kv_and_state_bytes_follow_the_runtime_allocation() {
-        for name in ["qwen3.8-27b.toml", "qwen3.8-27b-nvfp4.toml"] {
+        for name in ["qwen3.8-27b-exact.toml", "qwen3.8-27b-nvfp4-exact.toml"] {
             let spec = fixture(name);
             let a = ModelAnatomy::new(&spec, 0, None);
             assert_eq!(a.kv_bytes_per_token as usize * PAGE, kv_block_bytes(&spec, 1), "{name}");
@@ -492,7 +492,7 @@ mod tests {
         let bf16 = ModelAnatomy::new(&qwen3(), 0, None);
         assert_eq!(bf16.total_bytes, bf16.total_params * 2);
         assert_eq!(bf16.decode_params, bf16.total_params);
-        let fp8 = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 0, None);
+        let fp8 = ModelAnatomy::new(&fixture("qwen3.8-27b-exact.toml"), 0, None);
         assert!(fp8.total_bytes < fp8.total_params * 2 * 6 / 10);
         assert!(fp8.decode_bytes <= fp8.total_bytes);
         assert_eq!(quant_bytes(32, Quant::Nvfp4G16), 18);
@@ -501,9 +501,9 @@ mod tests {
 
     #[test]
     fn the_quant_mix_lists_every_format_by_weight_bytes() {
-        let mixed = ModelAnatomy::new(&fixture("qwen3.8-27b-nvfp4.toml"), 0, None).quant_mix();
+        let mixed = ModelAnatomy::new(&fixture("qwen3.8-27b-nvfp4-exact.toml"), 0, None).quant_mix();
         assert_eq!(mixed.iter().map(|m| m.0).collect::<Vec<_>>(), vec![Quant::Fp8Channel, Quant::Nvfp4G16]);
-        let plain = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 0, None).quant_mix();
+        let plain = ModelAnatomy::new(&fixture("qwen3.8-27b-exact.toml"), 0, None).quant_mix();
         assert_eq!(plain.len(), 1);
     }
 
@@ -547,14 +547,14 @@ mod tests {
 
     #[test]
     fn dense_models_have_no_moe_summary_and_decode_all_their_weights() {
-        let a = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 0, None);
+        let a = ModelAnatomy::new(&fixture("qwen3.8-27b-exact.toml"), 0, None);
         assert!(a.moe.is_none());
         assert!(a.layers.iter().all(|l| !l.moe && l.active_params == l.params));
     }
 
     #[test]
     fn memory_grows_with_context_and_the_ceiling_follows_bandwidth() {
-        let a = ModelAnatomy::new(&fixture("qwen3.8-27b.toml"), 0, Some(65536));
+        let a = ModelAnatomy::new(&fixture("qwen3.8-27b-exact.toml"), 0, Some(65536));
         assert_eq!(a.max_context, 65536);
         assert_eq!(a.memory_at(2048) - a.memory_at(1024), a.kv_bytes_per_token * 1024);
         let tps = a.decode_tokens_per_second(a.decode_bytes as f64 * 40.0);

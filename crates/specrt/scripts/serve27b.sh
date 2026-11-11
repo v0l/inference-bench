@@ -2,7 +2,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 bin=${CARGO_TARGET_DIR:-$here/../../../target}/release/inference-bench
-spec=$here/../tests/fixtures/qwen3.8-27b.toml
+spec=$here/../tests/fixtures/qwen3.8-27b-exact.toml
 port=${PORT:-18336}
 seqs=${SEQS:-8}
 kv_gb=${KV_GB:-3}

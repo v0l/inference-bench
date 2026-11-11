@@ -326,7 +326,7 @@ fn serving_kv_is_one_f16_copy_per_token() {
     let s = spec_for("tiny-qwen3.5-hd256");
     let per_token = specrt::runtime::kv_block_bytes(&s, 1) / specrt::codegen::PAGE;
     assert_eq!(per_token, s.kv_layers() * s.attention.kv_heads * s.attention.head_dim * 2 * 2);
-    let real = Spec::load(&fixture_dir("qwen3.8-27b.toml")).unwrap();
+    let real = Spec::load(&fixture_dir("qwen3.8-27b-exact.toml")).unwrap();
     assert_eq!(specrt::runtime::kv_block_bytes(&real, 1) / specrt::codegen::PAGE, 68 * 1024);
     let mut plain = real.clone();
     plain.mtp.as_mut().unwrap().speculate = false;

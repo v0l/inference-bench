@@ -58,7 +58,7 @@ fn qwen38_27b_module_compiles_through_nvrtc() {
     let _ = std::fs::remove_dir_all(&dir);
     let ctx = cudarc::driver::CudaContext::new(0).unwrap();
     let jit = Jit::new(ctx, dir.clone()).unwrap();
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-exact.toml");
     let module = Module::generate(&Spec::load(&path).unwrap(), 4096).unwrap();
     let loaded = jit.load(&module).unwrap();
     for name in &module.kernels {

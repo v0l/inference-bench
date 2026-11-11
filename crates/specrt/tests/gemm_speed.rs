@@ -130,13 +130,13 @@ fn time(spec_name: &str, kernel_of: &dyn Fn(&str) -> (String, Tile), fp4: bool) 
 #[test]
 #[ignore = "needs an sm_120 GPU; timing only"]
 fn prefill_gemm_speed_fp8_block() {
-    time("qwen3.8-27b-act", &|l| (format!("{l}_f8_huge"), Tile::FP8_HUGE), false);
+    time("qwen3.8-27b", &|l| (format!("{l}_f8_huge"), Tile::FP8_HUGE), false);
 }
 
 #[test]
 #[ignore = "needs an sm_120 GPU; timing only"]
 fn prefill_gemm_speed_fp8_channel_and_fp4() {
-    let s = spec("qwen3.8-27b-nvfp4-act");
-    time("qwen3.8-27b-nvfp4-act", &|l| (format!("{l}_f8_huge"), Tile::FP8_HUGE), false);
-    time("qwen3.8-27b-nvfp4-act", &|l| (format!("{l}_f4a_big"), Tile::fp4_variant("_big", &s.runtime)), true);
+    let s = spec("qwen3.8-27b-nvfp4");
+    time("qwen3.8-27b-nvfp4", &|l| (format!("{l}_f8_huge"), Tile::FP8_HUGE), false);
+    time("qwen3.8-27b-nvfp4", &|l| (format!("{l}_f4a_big"), Tile::fp4_variant("_big", &s.runtime)), true);
 }

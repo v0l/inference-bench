@@ -82,7 +82,7 @@ struct Gpu {
 }
 
 fn gpu(linear: &str) -> Gpu {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml");
     let module = Module::generate(&Spec::load(&path).unwrap(), 256).unwrap();
     let ctx = CudaContext::new(0).unwrap();
     let jit = Jit::new(ctx.clone(), specrt::jit::default_cache_dir()).unwrap();

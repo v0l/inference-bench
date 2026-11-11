@@ -410,7 +410,7 @@ fn argmax_picks_the_greedy_token_and_gumbel_sampling_is_seeded() {
 
 #[test]
 fn unsupported_features_are_named() {
-    let s = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
+    let s = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap();
     let why = wgsl::unsupported(&s).unwrap();
     assert!(why.contains("not yet on wgpu"), "{why}");
     assert!(wgsl::unsupported(&spec()).is_none());

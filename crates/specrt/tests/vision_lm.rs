@@ -22,7 +22,7 @@ fn has_refs() -> bool {
 }
 
 fn spec() -> Spec {
-    spec_named("qwen3.8-27b")
+    spec_named("qwen3.8-27b-exact")
 }
 
 fn spec_named(name: &str) -> Spec {
@@ -77,7 +77,7 @@ fn real_27b_media_prompts_and_logprobs_agree_with_vllm() {
     if !has_refs() {
         return;
     }
-    let spec = spec_named("qwen3.8-27b-nvfp4");
+    let spec = spec_named("qwen3.8-27b-nvfp4-exact");
     let repo = spec.repo.clone();
     let mut rt = Runtime::load(&spec, 2048).unwrap();
     assert!(rt.has_vision());
@@ -187,7 +187,7 @@ fn kl_against(rt: &mut Runtime, ids: &[u32], rec: &Value) -> (f64, usize, usize)
 #[test]
 #[ignore = "debug bisect"]
 fn real_27b_bisect_video_variants() {
-    let spec = spec_named("qwen3.8-27b-nvfp4");
+    let spec = spec_named("qwen3.8-27b-nvfp4-exact");
     let repo = spec.repo.clone();
     let mut rt = Runtime::load(&spec, 2048).unwrap();
     let rec = record("video");
@@ -238,7 +238,7 @@ fn real_27b_bisect_video_variants() {
 #[test]
 #[ignore = "debug bisect"]
 fn real_27b_video_positions_equal_transformers_get_rope_index() {
-    let spec = spec_named("qwen3.8-27b-nvfp4");
+    let spec = spec_named("qwen3.8-27b-nvfp4-exact");
     let rec = record("video");
     let p = prompt_for(&spec.repo, &CASES[1], &rec);
     let vis = spec.vision.as_ref().unwrap();
@@ -274,7 +274,7 @@ fn noisy(embeds: &[f32], rel: f32, seed: u64) -> Vec<f32> {
 #[test]
 #[ignore = "debug bisect"]
 fn real_27b_embedding_noise_sensitivity() {
-    let spec = spec_named("qwen3.8-27b-nvfp4");
+    let spec = spec_named("qwen3.8-27b-nvfp4-exact");
     let repo = spec.repo.clone();
     let mut rt = Runtime::load(&spec, 2048).unwrap();
     for case in &CASES {
@@ -294,7 +294,7 @@ fn real_27b_embedding_noise_sensitivity() {
 #[test]
 #[ignore = "debug bisect"]
 fn real_27b_prompt_position_kl_against_vllm() {
-    let spec = spec_named("qwen3.8-27b-nvfp4");
+    let spec = spec_named("qwen3.8-27b-nvfp4-exact");
     let repo = spec.repo.clone();
     let mut rt = Runtime::load(&spec, 2048).unwrap();
     let vocab = rt.spec().dims.vocab;
@@ -365,7 +365,7 @@ fn real_27b_text_only_description_control_against_vllm() {
     if !has_refs() {
         return;
     }
-    let spec = spec_named("qwen3.8-27b-nvfp4");
+    let spec = spec_named("qwen3.8-27b-nvfp4-exact");
     let mut rt = Runtime::load(&spec, 2048).unwrap();
     let records: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(ref_dir().join("vllm-textctrl.json")).unwrap()).unwrap();
     let (mut kls, mut top1, mut n) = (Vec::new(), 0, 0);
@@ -403,7 +403,7 @@ fn real_27b_media_population_against_vllm() {
     if !has_refs() {
         return;
     }
-    let spec = spec_named("qwen3.8-27b-nvfp4");
+    let spec = spec_named("qwen3.8-27b-nvfp4-exact");
     let repo = spec.repo.clone();
     let mut rt = Runtime::load(&spec, 4096).unwrap();
     for kind in [MediaKind::Image, MediaKind::Video] {
@@ -438,7 +438,7 @@ fn real_27b_long_text_control_against_vllm() {
     if !has_refs() {
         return;
     }
-    let spec = spec_named("qwen3.8-27b-nvfp4");
+    let spec = spec_named("qwen3.8-27b-nvfp4-exact");
     let mut rt = Runtime::load(&spec, 4096).unwrap();
     let records: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(ref_dir().join("vllm-longtext.json")).unwrap()).unwrap();
     for rec in &records {
@@ -454,7 +454,7 @@ fn real_27b_random_token_control_against_vllm() {
     if !has_refs() {
         return;
     }
-    let spec = spec_named("qwen3.8-27b-nvfp4");
+    let spec = spec_named("qwen3.8-27b-nvfp4-exact");
     let mut rt = Runtime::load(&spec, 4096).unwrap();
     let records: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(ref_dir().join("vllm-randtext.json")).unwrap()).unwrap();
     let (mut sum, mut top1, mut n) = (0.0, 0, 0);
