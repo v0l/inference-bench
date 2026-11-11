@@ -344,6 +344,7 @@ fn build_remote(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::rem
     )?;
     let layout = opts.layout(&spec);
     let mut exec = crate::remote::ChainExecutor::new(coordinator, layout.max_ctx, layout.slots, layout.prefill_chunk);
+    exec.set_micro_batch(placement.micro_batch);
     if let Err(e) = exec.connect_within(Duration::from_millis(remote.connect_wait_ms)) {
         tracing::warn!(error = %format!("{e:#}"), "remote stages are not ready yet, connecting on the first request");
     }

@@ -228,3 +228,38 @@ fn a_stage_that_goes_away_fails_the_next_call_instead_of_hanging() {
 fn an_empty_key_is_refused_at_start() {
     assert!(StageServer::start("127.0.0.1:0", b"", Fake::new(0, 1, true)).is_err());
 }
+
+#[test]
+fn a_pipelined_prefill_sends_every_micro_batch_through_every_stage_in_order() {
+    let a = Fake::new(0, 10, false);
+    let b = Fake::new(10, 20, true);
+    let servers: Vec<_> = [&a, &b].iter().map(|f| StageServer::start("127.0.0.1:0", KEY, (*f).clone()).unwrap()).collect();
+    let addrs: Vec<String> = servers.iter().map(|s| s.addr().to_string()).collect();
+    let mut chain = Chain::connect(&addrs, KEY, T).unwrap();
+    let tokens: Vec<u32> = (1..=10).collect();
+    let (token, times) = chain.forward_pipelined(0, 100, &tokens, 4).unwrap();
+    assert_eq!(times.len(), 3);
+    assert!(times.iter().all(|t| t.stage.len() == 2 && t.compute.len() == 2));
+    let positions = |f: &Fake| -> Vec<u32> {
+        f.seen.lock().unwrap().iter().filter_map(|m| if let Message::Forward { position, .. } = m { Some(*position) } else { None }).collect()
+    };
+    assert_eq!(positions(&a), vec![100, 104, 108]);
+    assert_eq!(positions(&b), vec![100, 104, 108]);
+    let mut plain = Chain::connect(&addrs, KEY, T).unwrap();
+    let (last_piece, _) = plain.forward(0, 108, vec![9, 10], false).unwrap();
+    assert_eq!(token, last_piece);
+}
+
+#[test]
+fn a_pipelined_prefill_fails_cleanly_when_a_stage_is_gone() {
+    let a = Fake::new(0, 10, false);
+    let b = Fake::new(10, 20, true);
+    let servers: Vec<_> = [&a, &b].iter().map(|f| StageServer::start("127.0.0.1:0", KEY, (*f).clone()).unwrap()).collect();
+    let addrs: Vec<String> = servers.iter().map(|s| s.addr().to_string()).collect();
+    let mut chain = Chain::connect(&addrs, KEY, T).unwrap();
+    let mut servers = servers;
+    servers.pop().unwrap().shutdown();
+    std::thread::sleep(Duration::from_millis(600));
+    let err = chain.forward_pipelined(0, 0, &(1..=10).collect::<Vec<u32>>(), 4).unwrap_err();
+    assert!(format!("{err:#}").contains("stage 1"), "{err:#}");
+}

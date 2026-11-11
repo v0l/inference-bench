@@ -144,3 +144,42 @@ fn out_of_order_scheduler_blocks_decode_the_same_over_the_chain() {
     }
     assert_eq!(tokens_of(&events), first);
 }
+
+#[test]
+fn the_remote_chain_reports_stage_and_hop_metrics() {
+    let stage = Arc::new(Echo { range: Mutex::new((0, 0)), seen: Mutex::new(Vec::new()) });
+    let server = StageServer::start("127.0.0.1:0", KEY, stage.clone()).unwrap();
+    let mut exec = executor(&server.addr().to_string());
+    exec.connect().unwrap();
+    let mut sched = Scheduler::new(exec, Config::default());
+    assert_eq!(sched.chain_metrics().unwrap().hops, 0);
+    sched.submit(request(5)).unwrap();
+    drain(&mut sched).unwrap();
+    let m = sched.chain_metrics().unwrap();
+    assert_eq!(m.stages.len(), 1);
+    assert!(m.stages[0].calls >= 4 && m.stages[0].tokens >= 8, "{m:?}");
+    assert_eq!(m.hops, m.stages[0].calls);
+    assert!(m.stages[0].busy_secs > 0.0);
+}
+
+#[test]
+fn a_micro_batched_prefill_over_the_chain_ends_on_the_same_token_as_a_plain_one() {
+    let run = |micro: usize| {
+        let stage = Arc::new(Echo { range: Mutex::new((0, 0)), seen: Mutex::new(Vec::new()) });
+        let server = StageServer::start("127.0.0.1:0", KEY, stage.clone()).unwrap();
+        let mut exec = executor(&server.addr().to_string());
+        exec.set_micro_batch(micro);
+        exec.connect().unwrap();
+        let mut sched = Scheduler::new(exec, Config::default());
+        sched.submit(request(40)).unwrap();
+        let tokens = tokens_of(&drain(&mut sched).unwrap());
+        (tokens, sched.chain_metrics().unwrap(), stage)
+    };
+    let (plain, plain_metrics, _) = run(0);
+    let (piped, piped_metrics, stage) = run(16);
+    assert_eq!(plain, piped);
+    assert_eq!(plain_metrics.overlapped_prefills, 0);
+    assert!(piped_metrics.overlapped_prefills >= 1 && piped_metrics.micro_batches >= 3, "{piped_metrics:?}");
+    let starts: Vec<u32> = stage.seen.lock().unwrap().iter().filter(|(_, _, decode)| !*decode).map(|(_, pos, _)| *pos).collect();
+    assert!(starts.contains(&16) && starts.contains(&32), "{starts:?}");
+}

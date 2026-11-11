@@ -523,6 +523,20 @@ impl Chain {
         }
     }
 
+    pub fn ranges(&self) -> Vec<(u32, u32)> {
+        self.stages
+            .iter()
+            .map(|s| match s.ready {
+                Message::Ready { layer_start, layer_end, .. } => (layer_start, layer_end),
+                _ => (0, 0),
+            })
+            .collect()
+    }
+
+    pub fn hidden(&self) -> u32 {
+        self.stages.first().map_or(0, |s| s.hidden())
+    }
+
     pub fn len(&self) -> usize {
         self.stages.len()
     }
@@ -579,6 +593,83 @@ impl Chain {
             }
         }
         unreachable!()
+    }
+
+    pub fn forward_pipelined(&mut self, slot: u32, position: u32, tokens: &[u32], micro: usize) -> Result<(u32, Vec<ChainTimes>)> {
+        ensure!(micro >= 1 && !tokens.is_empty(), "pipelined prefill needs tokens and a micro-batch size");
+        let last = self.stages.len() - 1;
+        let pieces: Vec<(u32, Vec<u32>)> = tokens
+            .chunks(micro)
+            .enumerate()
+            .map(|(i, c)| (position + (i * micro) as u32, c.to_vec()))
+            .collect();
+        let count = pieces.len();
+        let (first_tx, first_rx) = std::sync::mpsc::channel::<(usize, u32, Input)>();
+        for (i, (at, piece)) in pieces.into_iter().enumerate() {
+            let _ = first_tx.send((i, at, Input::Tokens(piece)));
+        }
+        drop(first_tx);
+        let mut rx = Some(first_rx);
+        let results = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            let mut final_rx = None;
+            for (i, stage) in self.stages.iter_mut().enumerate() {
+                let input_rx = rx.take().expect("a receiver per stage");
+                let (tx, next_rx) = std::sync::mpsc::channel::<(usize, u32, Input)>();
+                if i < last {
+                    rx = Some(next_rx);
+                } else {
+                    final_rx = Some(next_rx);
+                }
+                handles.push(scope.spawn(move || -> Result<Vec<(usize, Duration, Duration)>> {
+                    let mut seen = Vec::new();
+                    for (index, at, input) in input_rx {
+                        let started = Instant::now();
+                        let reply = stage.call(&Message::Forward { slot, position: at, input, decode: false }).with_context(|| format!("stage {i} at {} was lost", stage.addr))?;
+                        let round = started.elapsed();
+                        match reply {
+                            Message::Output { rows, data, compute_us } if i < last => {
+                                seen.push((index, round, Duration::from_micros(compute_us as u64)));
+                                if tx.send((index, at, Input::Hidden { rows, data })).is_err() {
+                                    break;
+                                }
+                            }
+                            Message::Token { token, compute_us } if i == last => {
+                                seen.push((index, round, Duration::from_micros(compute_us as u64)));
+                                let _ = tx.send((index, at, Input::Tokens(vec![token])));
+                            }
+                            other => bail!("stage {i} replied {other:?}"),
+                        }
+                    }
+                    Ok(seen)
+                }));
+            }
+            let final_rx = final_rx.expect("a last stage");
+            let mut token = None;
+            for (index, _, input) in final_rx {
+                if index + 1 == count {
+                    if let Input::Tokens(t) = input {
+                        token = t.first().copied();
+                    }
+                }
+            }
+            let mut per_stage = Vec::new();
+            for h in handles {
+                per_stage.push(h.join().map_err(|_| anyhow::anyhow!("a stage thread panicked"))?);
+            }
+            Ok::<_, anyhow::Error>((token, per_stage))
+        });
+        let (token, per_stage) = results?;
+        let per_stage = per_stage.into_iter().collect::<Result<Vec<_>>>()?;
+        let token = token.context("the last micro-batch produced no token")?;
+        let mut times = vec![ChainTimes::default(); count];
+        for stage in &per_stage {
+            for &(index, round, compute) in stage {
+                times[index].stage.push(round);
+                times[index].compute.push(compute);
+            }
+        }
+        Ok((token, times))
     }
 
     pub fn free(&mut self, slot: u32) -> Result<()> {
