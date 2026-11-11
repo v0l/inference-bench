@@ -98,3 +98,5 @@ Later, and only for fast links. It needs an allreduce per layer (NCCL class), so
 3. Stage server over QUIC or TCP, desktop RTX plus the Spark on the 27B.
 4. Serving integration: scheduler drives a pipelined runtime, micro-batched prefill, stage-chain metrics in `/metrics` and the UI, planner bands on the layer strip.
 5. Discovery and re-planning.
+
+Slice 3 (stage server over TCP, measured on the 27B across the desktop and the Spark) is in `docs/specrt-stage-server.md`.

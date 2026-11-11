@@ -19,9 +19,11 @@ pub mod runtime;
 pub mod sched;
 pub mod serve;
 pub mod spec;
+pub mod stage;
 pub mod statepool;
 pub mod vision;
 pub mod vision_encoder;
 pub mod weights;
+pub mod wire;
 
 pub use engine::Engine;
