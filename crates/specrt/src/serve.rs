@@ -292,7 +292,12 @@ fn build_pipeline(spec: &Spec, opts: &ServeOptions, placement: &crate::placement
         spec.runtime = r.clone();
     }
     opts.speculative.apply(&mut spec)?;
-    spec.mtp = None;
+    if spec.mtp.take().is_some() {
+        tracing::warn!(spec = %spec.name, stages = placement.stages.len(), "pipelined serving runs without MTP speculative decoding");
+    }
+    if spec.runtime.prefix_cache.enabled {
+        tracing::warn!(spec = %spec.name, stages = placement.stages.len(), "pipelined serving runs without the prefix cache");
+    }
     let spec = &spec;
     let layout = opts.layout(spec);
     let mut pipe = crate::pipeline::Pipeline::load(spec, placement, layout, crate::pipeline::Hop::Direct)?;
