@@ -139,10 +139,16 @@ pub(crate) struct Assets {
     pub media: Option<crate::vision::MediaAssets>,
 }
 
+pub fn without_truncation(mut tokenizer: Tokenizer) -> Result<Tokenizer> {
+    tokenizer.with_truncation(None).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    Ok(tokenizer)
+}
+
 impl Assets {
     fn from_gguf(spec: Spec) -> Result<Self> {
         let g = crate::gguf::Gguf::open(Path::new(&spec.repo))?;
         let tokenizer: Tokenizer = std::str::FromStr::from_str(&g.tokenizer_json()?).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let tokenizer = without_truncation(tokenizer)?;
         let tok_cfg = g.tokenizer_config_json();
         let chat = match &tok_cfg {
             Some(c) => ChatTemplate::from_files(c, None)?,
@@ -160,6 +166,7 @@ impl Assets {
         }
         let tokenizer = Tokenizer::from_file(find_in_snapshot(&spec.repo, "tokenizer.json")?)
             .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let tokenizer = without_truncation(tokenizer)?;
         let chat = match find_in_snapshot(&spec.repo, "tokenizer_config.json") {
             Ok(path) => {
                 let jinja = find_in_snapshot(&spec.repo, "chat_template.jinja").ok().and_then(|p| std::fs::read_to_string(p).ok());
@@ -492,6 +499,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_tokenizer_json_truncation_limit_does_not_cut_prompts() {
+        let json = r#"{"version":"1.0","truncation":{"direction":"Right","max_length":8,"strategy":"LongestFirst","stride":0},"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"a":0,"[UNK]":1},"unk_token":"[UNK]"}}"#;
+        let text = "a ".repeat(40);
+        let cut: Tokenizer = std::str::FromStr::from_str(json).unwrap();
+        assert_eq!(cut.encode(text.as_str(), false).unwrap().get_ids().len(), 8);
+        let fixed = without_truncation(cut).unwrap();
+        assert_eq!(fixed.encode(text.as_str(), false).unwrap().get_ids().len(), 40);
+    }
+
+    #[test]
     fn unsupported_model_types_are_reported_as_unsupported_architecture() {
         let e = anyhow::anyhow!("model_type gemma3 is not supported");
         assert_eq!(failure_kind(&e), FailureKind::UnsupportedArchitecture);
@@ -568,7 +585,7 @@ impl MediaPromptAssets {
 }
 
 pub fn media_prompt_assets(spec: &Spec) -> Result<MediaPromptAssets> {
-    let tokenizer = Tokenizer::from_file(find_in_snapshot(&spec.repo, "tokenizer.json")?).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let tokenizer = without_truncation(Tokenizer::from_file(find_in_snapshot(&spec.repo, "tokenizer.json")?).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?)?;
     let media = media_assets(spec, &tokenizer)?.context("the model has no vision_config or preprocessor configs")?;
     Ok(MediaPromptAssets { tokenizer, media })
 }
