@@ -64,7 +64,30 @@ impl BlockPool {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StageMetric {
+    pub device: usize,
+    pub start: usize,
+    pub end: usize,
+    pub busy_secs: f64,
+    pub calls: u64,
+    pub tokens: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ChainMetrics {
+    pub stages: Vec<StageMetric>,
+    pub hops: u64,
+    pub hop_bytes: u64,
+    pub hop_secs: f64,
+    pub micro_batches: u64,
+    pub overlapped_prefills: u64,
+}
+
 pub trait Executor {
+    fn chain_metrics(&self) -> Option<ChainMetrics> {
+        None
+    }
     fn max_ctx(&self) -> usize;
     fn slots(&self) -> usize;
     fn kv_blocks(&self) -> usize;
@@ -239,6 +262,78 @@ impl Executor for GpuExecutor {
 
     fn copy_block(&mut self, src: u32, dst: u32) -> Result<()> {
         self.rt.copy_kv_block(src, dst)
+    }
+}
+
+pub struct PipelineExecutor {
+    pub pipe: crate::pipeline::Pipeline,
+}
+
+impl PipelineExecutor {
+    pub fn new(pipe: crate::pipeline::Pipeline) -> Self {
+        PipelineExecutor { pipe }
+    }
+}
+
+impl Executor for PipelineExecutor {
+    fn max_ctx(&self) -> usize {
+        self.pipe.max_ctx()
+    }
+
+    fn slots(&self) -> usize {
+        self.pipe.slots()
+    }
+
+    fn kv_blocks(&self) -> usize {
+        self.pipe.kv_blocks()
+    }
+
+    fn chunk_limit(&self) -> usize {
+        self.pipe.chunk_limit()
+    }
+
+    fn set_table(&mut self, slot: usize, blocks: &[u32]) -> Result<()> {
+        self.pipe.set_block_table(slot, blocks)
+    }
+
+    fn acquire_state(&mut self, slot: usize) -> Result<()> {
+        self.pipe.acquire_state(slot)
+    }
+
+    fn release_state(&mut self, slot: usize) {
+        self.pipe.release_state(slot)
+    }
+
+    fn prefill(&mut self, slot: usize, tokens: &[u32], start: usize, sample: Option<(Sampling, u32)>) -> Result<Option<u32>> {
+        self.pipe.prefill(slot, tokens, start, sample)
+    }
+
+    fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
+        self.pipe.decode(rows)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.pipe.synchronize()
+    }
+
+    fn chain_metrics(&self) -> Option<ChainMetrics> {
+        let hops = self.pipe.stats();
+        let prefill = self.pipe.prefill_stats();
+        let stages = self
+            .pipe
+            .ranges()
+            .iter()
+            .zip(self.pipe.stage_stats())
+            .map(|(&(device, start, end), s)| StageMetric { device, start, end, busy_secs: s.busy.as_secs_f64(), calls: s.calls, tokens: s.tokens })
+            .collect();
+        Some(ChainMetrics {
+            stages,
+            hops: hops.hops,
+            hop_bytes: hops.bytes,
+            hop_secs: hops.time.as_secs_f64(),
+            micro_batches: prefill.micro_batches,
+            overlapped_prefills: prefill.overlapped_calls,
+        })
     }
 }
 
@@ -431,6 +526,10 @@ impl<E: Executor> Scheduler<E> {
 
     pub fn blocks_total(&self) -> usize {
         self.pool.total()
+    }
+
+    pub fn chain_metrics(&self) -> Option<ChainMetrics> {
+        self.exec.chain_metrics()
     }
 
     pub fn state_refusals(&self) -> u64 {

@@ -75,11 +75,12 @@ pub struct PlacementConfig {
     pub slots: usize,
     pub devices: Vec<DeviceConfig>,
     pub stages: Vec<StageConfig>,
+    pub micro_batch: usize,
 }
 
 impl Default for PlacementConfig {
     fn default() -> Self {
-        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new() }
+        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: 256 }
     }
 }
 

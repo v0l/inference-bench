@@ -150,3 +150,52 @@ fn the_planner_placement_runs_as_a_pipeline() {
     let first = pipe.prefill_slot(0, &p[..100], 0, Some((Sampling::GREEDY, 0))).unwrap();
     assert_eq!(first, Some(expected[0]));
 }
+
+fn scheduled_prompts(vocab: u32) -> Vec<Vec<u32>> {
+    let lens = [3usize, 17, 64, 130, 250, 300];
+    (0..12u32).map(|q| (0..lens[q as usize % lens.len()] as u32).map(|i| (i * 13 + q * 97 + 1) % vocab).collect()).collect()
+}
+
+fn scheduled_through_pipeline(spec: &Spec, micro_batch: usize) -> (Vec<Vec<u32>>, specrt::sched::ChainMetrics) {
+    use specrt::sched::{Config, Event, PipelineExecutor, Request, Scheduler};
+    let layout = Layout { max_ctx: 512, slots: 6, kv_blocks: 6 * 8, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
+    let layers = spec.layers.count;
+    let mut pipe = Pipeline::load_ranges(spec, &[(0, 0, layers / 2), (0, layers / 2, layers)], layout, Hop::Direct).unwrap();
+    pipe.set_micro_batch(micro_batch);
+    let cfg = Config { max_num_seqs: 6, max_batched_tokens: 256, reserve_blocks: Some(1), ..Config::default() };
+    let mut sched = Scheduler::new(PipelineExecutor::new(pipe), cfg);
+    let prompts = scheduled_prompts(spec.dims.vocab as u32);
+    let ids: Vec<u64> = prompts
+        .iter()
+        .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: 16, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() }).unwrap())
+        .collect();
+    let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+    while !sched.idle() {
+        let mut events = Vec::new();
+        sched.step(&mut events).unwrap();
+        for e in events {
+            if let Event::Token { id, token } = e {
+                got.entry(id).or_default().push(token);
+            }
+        }
+    }
+    (ids.iter().map(|id| got[id].clone()).collect(), sched.chain_metrics().unwrap())
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_scheduler_drives_a_pipeline_with_micro_batched_prefill_and_matches_the_single_runtime() {
+    let spec = tiny("tiny-qwen3.5");
+    let mut single = Runtime::load(&spec, 512).unwrap();
+    let want: Vec<Vec<u32>> = scheduled_prompts(spec.dims.vocab as u32).iter().map(|p| single.generate(p, 16, Sampling::GREEDY).unwrap().tokens).collect();
+    drop(single);
+    let (plain, plain_chain) = scheduled_through_pipeline(&spec, 0);
+    assert_eq!(plain, want);
+    assert_eq!(plain_chain.micro_batches, 0);
+    let (micro, chain) = scheduled_through_pipeline(&spec, 32);
+    assert_eq!(micro, want);
+    assert!(chain.micro_batches > 0 && chain.overlapped_prefills > 0, "{chain:?}");
+    assert_eq!(chain.stages.len(), 2);
+    assert!(chain.stages.iter().all(|s| s.calls > 0 && s.tokens > 0 && s.busy_secs > 0.0));
+    assert!(chain.hops > 0 && chain.hop_bytes > 0);
+}

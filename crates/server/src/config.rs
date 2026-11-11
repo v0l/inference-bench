@@ -310,6 +310,7 @@ impl ServerConfig {
             itl_target: self.itl_target_ms.map(std::time::Duration::from_millis).unwrap_or(d.itl_target),
             runtime: self.runtime.clone(),
             speculative: self.speculative,
+            placement: Some(self.placement.clone()),
         })
     }
 

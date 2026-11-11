@@ -30,7 +30,7 @@ impl Default for ServerSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub endpoints: Vec<Endpoint>,
@@ -42,6 +42,8 @@ pub struct Settings {
     pub specrt_ctx: usize,
     #[serde(default)]
     pub gpu_bandwidth_gbs: Option<u64>,
+    #[serde(default)]
+    pub placement: crate::specrt_placement::PlacementConfig,
     #[serde(default)]
     pub hf_token: String,
     #[serde(default)]
@@ -89,6 +91,7 @@ impl Default for Settings {
             server: ServerSettings::default(),
             specrt_ctx: default_ctx(),
             gpu_bandwidth_gbs: None,
+            placement: Default::default(),
             hf_token: String::new(),
             spec_folders: Vec::new(),
             specs_auto_update: true,

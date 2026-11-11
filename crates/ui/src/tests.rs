@@ -753,6 +753,58 @@ fn the_detail_view_draws_the_tiny_fixture_and_hovering_a_cell_shows_its_tooltip(
     assert!(h.query_by_label("memory against context").is_some());
 }
 
+fn two_device_placement() -> specrt::placement::PlacementConfig {
+    toml::from_str(
+        r#"
+        context = 512
+        [[devices]]
+        name = "alpha"
+        memory_gib = 1
+        bandwidth_gbs = 100
+        tflops = 10
+        reserve_gib = 0
+        [[devices]]
+        name = "beta"
+        memory_gib = 1
+        bandwidth_gbs = 100
+        tflops = 10
+        reserve_gib = 0
+        [[stages]]
+        device = "alpha"
+        layers = [0, 1]
+        [[stages]]
+        device = "beta"
+        layers = [1, 3]
+        "#,
+    )
+    .unwrap()
+}
+
+#[test]
+fn placement_bands_follow_the_configured_stages() {
+    let view = detail_view("tiny", None);
+    assert!(detail::placement_bands(&Default::default(), &view.spec).is_none());
+    let bands = detail::placement_bands(&two_device_placement(), &view.spec).unwrap();
+    let ranges: Vec<(usize, usize)> = bands.iter().map(|b| (b.start, b.end)).collect();
+    assert_eq!(ranges, vec![(0, 1), (1, 3)]);
+    assert!(bands[1].tip.contains("stage 1 on beta"));
+}
+
+#[test]
+fn the_detail_view_draws_placement_bands_and_hovering_one_shows_its_stage() {
+    let d = dir("detail-bands");
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        app.tab = Tab::Models;
+        app.settings.placement = two_device_placement();
+        app.models.detail = Some(detail::Detail::from_view(detail_view("tiny", None)));
+        app
+    });
+    h.run();
+    assert!(h.query_by_label_contains("layer 0 ").is_some());
+}
+
 #[test]
 fn a_gguf_model_opens_a_detail_view_from_its_metadata() {
     use specrt::gguf::writer::{Kv, build};

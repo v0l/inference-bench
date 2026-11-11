@@ -96,7 +96,7 @@ Later, and only for fast links. It needs an allreduce per layer (NCCL class), so
 1. Planner and in-process pipeline of several runtimes on one GPU, bit-identical to the single runtime (this change).
 2. Multi-GPU in one process: peer or staged copies.
 3. Stage server over QUIC or TCP, desktop RTX plus the Spark on the 27B.
-4. Serving integration: scheduler drives a pipelined runtime, micro-batched prefill, stage-chain metrics in `/metrics` and the UI, planner bands on the layer strip.
+4. Serving integration (done): `PipelineExecutor` lets the scheduler drive a `Pipeline`. With `[placement] micro_batch = N` (default 256) a prefill chunk is cut into micro-batches and each stage runs on its own thread, so stage k works on micro-batch i while stage k+1 works on i-1. `/metrics` carries `inference_pipeline_*` series per stage (busy seconds, calls, tokens) and for hops and micro-batches. The model detail layer strip draws the planner's stage bands from `[placement]` in the app settings. A pipelined server needs `[[placement.devices]]` and a plan with more than one stage; it runs without MTP and without the prefix cache.
 5. Discovery and re-planning.
 
 Slice 3 (stage server over TCP, measured on the 27B across the desktop and the Spark) is in `docs/specrt-stage-server.md`.

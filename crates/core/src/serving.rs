@@ -117,6 +117,26 @@ fn histogram(o: &mut String, name: &str, help: &str, h: &Histogram) {
     let _ = writeln!(o, "{name}_bucket{{le=\"+Inf\"}} {}\n{name}_sum {}\n{name}_count {}", h.total, h.sum, h.total);
 }
 
+fn chain(o: &mut String, c: &specrt::sched::ChainMetrics) {
+    let _ = writeln!(o, "# HELP inference_pipeline_stages Stages in the pipeline chain.\n# TYPE inference_pipeline_stages gauge\ninference_pipeline_stages {}", c.stages.len());
+    let per_stage: [(&str, &str, &str, fn(&specrt::sched::StageMetric) -> f64); 3] = [
+        ("inference_pipeline_stage_busy_seconds_total", "counter", "Time a stage spent computing.", |m| m.busy_secs),
+        ("inference_pipeline_stage_calls_total", "counter", "Prefill and decode calls a stage ran.", |m| m.calls as f64),
+        ("inference_pipeline_stage_tokens_total", "counter", "Tokens a stage processed.", |m| m.tokens as f64),
+    ];
+    for (name, kind, help, get) in per_stage {
+        let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} {kind}");
+        for (i, m) in c.stages.iter().enumerate() {
+            let _ = writeln!(o, "{name}{{stage=\"{i}\",device=\"{}\",layers=\"{}-{}\"}} {}", m.device, m.start, m.end, get(m));
+        }
+    }
+    let _ = writeln!(o, "# TYPE inference_pipeline_hops_total counter\ninference_pipeline_hops_total {}", c.hops);
+    let _ = writeln!(o, "# TYPE inference_pipeline_hop_bytes_total counter\ninference_pipeline_hop_bytes_total {}", c.hop_bytes);
+    let _ = writeln!(o, "# TYPE inference_pipeline_hop_seconds_total counter\ninference_pipeline_hop_seconds_total {}", c.hop_secs);
+    let _ = writeln!(o, "# TYPE inference_pipeline_prefill_micro_batches_total counter\ninference_pipeline_prefill_micro_batches_total {}", c.micro_batches);
+    let _ = writeln!(o, "# TYPE inference_pipeline_overlapped_prefills_total counter\ninference_pipeline_overlapped_prefills_total {}", c.overlapped_prefills);
+}
+
 pub fn render(s: &Stats) -> String {
     let mut o = String::new();
     let gauge = |o: &mut String, name: &str, help: &str, v: f64| {
@@ -158,6 +178,9 @@ pub fn render(s: &Stats) -> String {
         "# HELP inference_spec_accepted_tokens_total MTP draft tokens the target accepted.\n# TYPE inference_spec_accepted_tokens_total counter\ninference_spec_accepted_tokens_total {}",
         s.spec_accepted
     );
+    if let Some(c) = &s.chain {
+        chain(&mut o, c);
+    }
     histogram(&mut o, "inference_queue_seconds", "Time from arrival to the first scheduled step.", &s.queue_secs);
     histogram(&mut o, "inference_inter_token_seconds", "Time between streamed tokens of one sequence.", &s.inter_token_secs);
     histogram(&mut o, "inference_batch_size", "Decode rows per step.", &s.decode_batch);
@@ -194,5 +217,32 @@ mod tests {
         ] {
             assert!(t.contains(want), "{want} missing from\n{t}");
         }
+    }
+
+    #[test]
+    fn pipeline_chain_renders_per_stage_series() {
+        use specrt::sched::{ChainMetrics, StageMetric};
+        let chain = ChainMetrics {
+            stages: vec![
+                StageMetric { device: 0, start: 0, end: 20, busy_secs: 1.5, calls: 10, tokens: 400 },
+                StageMetric { device: 1, start: 20, end: 40, busy_secs: 1.25, calls: 10, tokens: 400 },
+            ],
+            hops: 10,
+            hop_bytes: 8000,
+            micro_batches: 6,
+            overlapped_prefills: 2,
+            ..ChainMetrics::default()
+        };
+        let t = render(&Stats { chain: Some(chain), ..Stats::default() });
+        for want in [
+            "inference_pipeline_stages 2",
+            "inference_pipeline_stage_busy_seconds_total{stage=\"1\",device=\"1\",layers=\"20-40\"} 1.25",
+            "inference_pipeline_stage_tokens_total{stage=\"0\",device=\"0\",layers=\"0-20\"} 400",
+            "inference_pipeline_hop_bytes_total 8000",
+            "inference_pipeline_prefill_micro_batches_total 6",
+        ] {
+            assert!(t.contains(want), "{want} missing from\n{t}");
+        }
+        assert!(!render(&Stats::default()).contains("inference_pipeline"));
     }
 }

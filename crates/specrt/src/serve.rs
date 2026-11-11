@@ -1,6 +1,6 @@
 use crate::engine::Assets;
 use crate::runtime::{Layout, Runtime, Sampling, kv_block_bytes};
-use crate::sched::{self, Config, Event, Finish, GpuExecutor, Scheduler, SeqId};
+use crate::sched::{self, ChainMetrics, Config, Event, Executor, Finish, GpuExecutor, PipelineExecutor, Scheduler, SeqId};
 use crate::spec::Spec;
 pub use crate::spec::{RuntimeOptions, TileChoice};
 
@@ -50,6 +50,7 @@ pub struct ServeOptions {
     pub itl_target: Duration,
     pub runtime: Option<RuntimeOptions>,
     pub speculative: SpeculativeOptions,
+    pub placement: Option<crate::placement::PlacementConfig>,
 }
 
 impl Default for ServeOptions {
@@ -62,6 +63,7 @@ impl Default for ServeOptions {
             itl_target: Duration::from_millis(100),
             runtime: None,
             speculative: SpeculativeOptions::default(),
+            placement: None,
         }
     }
 }
@@ -124,6 +126,7 @@ pub struct Stats {
     pub decode_batch: Histogram,
     pub prefill_tokens_per_step: Histogram,
     pub step_secs: Histogram,
+    pub chain: Option<ChainMetrics>,
 }
 
 impl Default for Stats {
@@ -148,6 +151,7 @@ impl Default for Stats {
             decode_batch: Histogram::new(&COUNT_BUCKETS),
             prefill_tokens_per_step: Histogram::new(&COUNT_BUCKETS),
             step_secs: Histogram::new(&LATENCY_BUCKETS),
+            chain: None,
         }
     }
 }
@@ -194,18 +198,7 @@ impl Core {
         let thread = std::thread::Builder::new()
             .name("specrt-serve".into())
             .spawn(move || {
-                let built = build(&spec, opts);
-                let mut sched = match built {
-                    Ok(s) => {
-                        let _ = ready_tx.send(Ok(s.exec.rt.has_vision()));
-                        s
-                    }
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                        return;
-                    }
-                };
-                run(&mut sched, inbox, shared);
+                let _ = start_engine(&spec, opts, ready_tx, inbox, shared);
             })
             .context("serving thread")?;
         let vision = ready.recv().context("the serving thread stopped while loading")??;
@@ -250,6 +243,66 @@ impl Drop for Core {
     }
 }
 
+fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>) -> Result<()> {
+    let pipelined = match &opts.placement {
+        Some(p) if !p.devices.is_empty() => {
+            let mut resolved = spec.clone();
+            opts.speculative.apply(&mut resolved)?;
+            let placed = p.place(&resolved)?;
+            (placed.stages.len() > 1).then_some((placed, p.micro_batch))
+        }
+        _ => None,
+    };
+    match pipelined {
+        Some((placement, micro_batch)) => match build_pipeline(spec, &opts, &placement, micro_batch) {
+            Ok(mut sched) => {
+                let _ = ready.send(Ok(false));
+                run(&mut sched, inbox, stats);
+            }
+            Err(e) => {
+                let _ = ready.send(Err(e));
+            }
+        },
+        None => match build(spec, opts) {
+            Ok(mut sched) => {
+                let _ = ready.send(Ok(sched.exec.rt.has_vision()));
+                run(&mut sched, inbox, stats);
+            }
+            Err(e) => {
+                let _ = ready.send(Err(e));
+            }
+        },
+    }
+    Ok(())
+}
+
+fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
+    Config {
+        max_num_seqs: opts.max_num_seqs,
+        max_batched_tokens: opts.max_batched_tokens,
+        itl_target: opts.itl_target,
+        prefix_cache: spec.runtime.prefix_cache,
+        ..Config::default()
+    }
+}
+
+fn build_pipeline(spec: &Spec, opts: &ServeOptions, placement: &crate::placement::Placement, micro_batch: usize) -> Result<Scheduler<PipelineExecutor>> {
+    let mut spec = spec.clone();
+    if let Some(r) = &opts.runtime {
+        spec.runtime = r.clone();
+    }
+    opts.speculative.apply(&mut spec)?;
+    spec.mtp = None;
+    let spec = &spec;
+    let layout = opts.layout(spec);
+    let mut pipe = crate::pipeline::Pipeline::load(spec, placement, layout, crate::pipeline::Hop::Direct)?;
+    pipe.set_micro_batch(micro_batch);
+    tracing::info!(spec = %spec.name, stages = pipe.stages(), kv_blocks = pipe.kv_blocks(), "pipelined serving layout");
+    let mut cfg = serving_config(spec, opts);
+    cfg.prefix_cache.enabled = false;
+    Ok(Scheduler::new(PipelineExecutor::new(pipe), cfg))
+}
+
 fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
     let mut spec = spec.clone();
     if let Some(r) = &opts.runtime {
@@ -273,13 +326,7 @@ fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
         device_bytes = rt.device_bytes,
         "serving layout"
     );
-    let cfg = Config {
-        max_num_seqs: opts.max_num_seqs,
-        max_batched_tokens: opts.max_batched_tokens,
-        itl_target: opts.itl_target,
-        prefix_cache: spec.runtime.prefix_cache,
-        ..Config::default()
-    };
+    let cfg = serving_config(spec, &opts);
     Ok(Scheduler::new(GpuExecutor::new(rt)?, cfg))
 }
 
@@ -294,7 +341,7 @@ pub fn slot_state_bytes(spec: &Spec) -> u64 {
     }
 }
 
-fn run(sched: &mut Scheduler<GpuExecutor>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>) {
+fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>) {
     let mut live: HashMap<SeqId, Live> = HashMap::new();
     let mut open = true;
     {
@@ -406,6 +453,7 @@ fn run(sched: &mut Scheduler<GpuExecutor>, inbox: Receiver<Job>, stats: Arc<Mute
         s.waiting = sched.waiting();
         s.kv_blocks_used = sched.blocks_used();
         s.preemptions = sched.preemptions();
+        s.chain = sched.chain_metrics();
         let p = sched.prefix_stats();
         s.prefix_queries = p.queries;
         s.prefix_hits = p.hits;

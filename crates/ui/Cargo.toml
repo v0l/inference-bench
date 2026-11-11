@@ -30,6 +30,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 serde.workspace = true
 
 [dev-dependencies]
+toml.workspace = true
 tracing-subscriber.workspace = true
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu"] }
 ureq.workspace = true
