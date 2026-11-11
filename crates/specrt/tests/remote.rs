@@ -32,6 +32,10 @@ impl StageHandler for Echo {
                 };
                 Message::Token { token: position + n, compute_us: 1 }
             }
+            Message::DecodeBatch { positions, .. } => {
+                self.seen.lock().unwrap().push((positions[0], positions[0], true));
+                Message::Tokens { tokens: positions.iter().map(|p| p + 1).collect(), compute_us: 1 }
+            }
             Message::Assign { layer_start, layer_end } => {
                 *self.range.lock().unwrap() = (layer_start, layer_end);
                 self.ready()

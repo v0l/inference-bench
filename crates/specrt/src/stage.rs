@@ -185,6 +185,38 @@ impl RuntimeStage {
         let h = rt.export_hidden(rows)?;
         Ok(Message::Output { rows: rows as u32, data: f32_bytes(&h), compute_us })
     }
+    fn decode_batch(&self, slots: Vec<u32>, positions: Vec<u32>, input: Input) -> Result<Message> {
+        let started = Instant::now();
+        ensure!(!slots.is_empty() && slots.len() == positions.len(), "a decode batch needs one position per slot");
+        ensure!(slots.iter().all(|s| (*s as usize) < self.slots), "decode slot out of {}", self.slots);
+        let mut guard = self.inner.lock().unwrap();
+        let Loaded { rt, st, .. } = guard.as_mut().context("this stage has no layers loaded")?;
+        let role = rt.role();
+        let rows = slots.len();
+        let tokens = match input {
+            Input::Tokens(t) => {
+                ensure!(role.first, "this stage has no embedding, send hidden rows");
+                ensure!(t.len() == rows, "{} tokens for {rows} rows", t.len());
+                t
+            }
+            Input::Hidden { rows: n, data } => {
+                ensure!(!role.first, "this stage owns the embedding, send token ids");
+                ensure!(n as usize == rows, "{n} hidden rows for {rows} slots");
+                rt.import_hidden(&bytes_f32(&data)?)?;
+                vec![0; rows]
+            }
+        };
+        let batch: Vec<DecodeRow> = (0..rows)
+            .map(|i| DecodeRow { slot: slots[i] as usize, token: tokens[i], pos: positions[i] as usize, sampling: Sampling::GREEDY, step: 0 })
+            .collect();
+        let out = rt.decode(st, &batch)?;
+        let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+        if role.last {
+            return Ok(Message::Tokens { tokens: out, compute_us });
+        }
+        let h = rt.export_hidden(rows)?;
+        Ok(Message::Output { rows: rows as u32, data: f32_bytes(&h), compute_us })
+    }
 }
 
 impl StageHandler for RuntimeStage {
@@ -196,6 +228,10 @@ impl StageHandler for RuntimeStage {
     fn handle(&self, message: Message) -> Message {
         match message {
             Message::Forward { slot, position, input, decode } => match self.forward(slot, position, input, decode) {
+                Ok(reply) => reply,
+                Err(e) => Message::Error { message: format!("{e:#}") },
+            },
+            Message::DecodeBatch { slots, positions, input } => match self.decode_batch(slots, positions, input) {
                 Ok(reply) => reply,
                 Err(e) => Message::Error { message: format!("{e:#}") },
             },

@@ -28,6 +28,8 @@ pub enum Message {
     Ack,
     Error { message: String },
     Assign { layer_start: u32, layer_end: u32 },
+    DecodeBatch { slots: Vec<u32>, positions: Vec<u32>, input: Input },
+    Tokens { tokens: Vec<u32>, compute_us: u32 },
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -56,6 +58,12 @@ impl<'a> Cursor<'a> {
         let v = self.buf[0];
         self.buf = &self.buf[1..];
         Ok(v)
+    }
+
+    fn u32_list(&mut self) -> Result<Vec<u32>> {
+        let n = self.u32()? as usize;
+        ensure!(n <= self.buf.len() / 4, "token count exceeds frame");
+        (0..n).map(|_| self.u32()).collect()
     }
 
     fn bytes(&mut self) -> Result<Vec<u8>> {
@@ -135,6 +143,35 @@ impl Message {
                 put_u32(&mut out, *layer_start);
                 put_u32(&mut out, *layer_end);
             }
+            Message::DecodeBatch { slots, positions, input } => {
+                out.push(11);
+                put_u32(&mut out, slots.len() as u32);
+                for v in slots.iter().chain(positions) {
+                    put_u32(&mut out, *v);
+                }
+                match input {
+                    Input::Tokens(tokens) => {
+                        out.push(0);
+                        put_u32(&mut out, tokens.len() as u32);
+                        for t in tokens {
+                            put_u32(&mut out, *t);
+                        }
+                    }
+                    Input::Hidden { rows, data } => {
+                        out.push(1);
+                        put_u32(&mut out, *rows);
+                        put_bytes(&mut out, data);
+                    }
+                }
+            }
+            Message::Tokens { tokens, compute_us } => {
+                out.push(12);
+                put_u32(&mut out, *compute_us);
+                put_u32(&mut out, tokens.len() as u32);
+                for t in tokens {
+                    put_u32(&mut out, *t);
+                }
+            }
         }
         out
     }
@@ -178,6 +215,31 @@ impl Message {
             8 => Message::Ack,
             9 => Message::Error { message: String::from_utf8(c.bytes()?).context("error text")? },
             10 => Message::Assign { layer_start: c.u32()?, layer_end: c.u32()? },
+            11 => {
+                let n = c.u32()? as usize;
+                ensure!(n <= c.buf.len() / 8, "row count exceeds frame");
+                let mut slots = Vec::with_capacity(n);
+                let mut positions = Vec::with_capacity(n);
+                for _ in 0..n {
+                    slots.push(c.u32()?);
+                }
+                for _ in 0..n {
+                    positions.push(c.u32()?);
+                }
+                let input = match c.u8()? {
+                    0 => Input::Tokens(c.u32_list()?),
+                    1 => {
+                        let rows = c.u32()?;
+                        Input::Hidden { rows, data: c.bytes()? }
+                    }
+                    other => bail!("unknown input kind {other}"),
+                };
+                Message::DecodeBatch { slots, positions, input }
+            }
+            12 => {
+                let compute_us = c.u32()?;
+                Message::Tokens { tokens: c.u32_list()?, compute_us }
+            }
             other => bail!("unknown message tag {other}"),
         };
         c.done()?;
@@ -486,6 +548,32 @@ impl Chain {
                     times.compute.push(Duration::from_micros(compute_us as u64));
                     times.total = times.stage.iter().sum();
                     return Ok((token, times));
+                }
+                other => bail!("stage {i} replied {other:?}"),
+            }
+        }
+        unreachable!()
+    }
+
+    pub fn forward_batch(&mut self, slots: &[u32], positions: &[u32], tokens: &[u32]) -> Result<(Vec<u32>, ChainTimes)> {
+        let mut times = ChainTimes::default();
+        let last = self.stages.len() - 1;
+        let mut input = Input::Tokens(tokens.to_vec());
+        for (i, stage) in self.stages.iter_mut().enumerate() {
+            let started = Instant::now();
+            let message = Message::DecodeBatch { slots: slots.to_vec(), positions: positions.to_vec(), input };
+            let reply = stage.call(&message).with_context(|| format!("stage {i} at {} was lost", stage.addr))?;
+            times.stage.push(started.elapsed());
+            match reply {
+                Message::Output { rows, data, compute_us } if i < last => {
+                    times.compute.push(Duration::from_micros(compute_us as u64));
+                    input = Input::Hidden { rows, data };
+                }
+                Message::Tokens { tokens, compute_us } if i == last => {
+                    ensure!(tokens.len() == slots.len(), "stage {i} returned {} tokens for {} rows", tokens.len(), slots.len());
+                    times.compute.push(Duration::from_micros(compute_us as u64));
+                    times.total = times.stage.iter().sum();
+                    return Ok((tokens, times));
                 }
                 other => bail!("stage {i} replied {other:?}"),
             }

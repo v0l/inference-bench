@@ -41,6 +41,17 @@ impl StageHandler for Fake {
                     Message::Output { rows: 1, data: vec![1; 16], compute_us: 1 }
                 }
             }
+            Message::DecodeBatch { input, slots, .. } => {
+                let sum: u32 = match &input {
+                    Input::Tokens(t) => t.iter().sum(),
+                    Input::Hidden { data, .. } => data.len() as u32,
+                };
+                if self.last {
+                    Message::Tokens { tokens: slots.iter().map(|s| sum + s).collect(), compute_us: 1 }
+                } else {
+                    Message::Output { rows: slots.len() as u32, data: vec![1; 16 * slots.len()], compute_us: 1 }
+                }
+            }
             Message::Assign { layer_start, layer_end } => {
                 *self.range.lock().unwrap() = (layer_start, layer_end);
                 self.assigns.lock().unwrap().push((layer_start, layer_end));

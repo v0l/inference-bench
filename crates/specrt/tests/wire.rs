@@ -36,6 +36,13 @@ impl StageHandler for Fake {
                     Message::Output { rows: 1, data: vec![sum as u8; 16], compute_us: 7 }
                 }
             }
+            Message::DecodeBatch { slots, .. } => {
+                if self.last {
+                    Message::Tokens { tokens: slots.clone(), compute_us: 7 }
+                } else {
+                    Message::Output { rows: slots.len() as u32, data: vec![1; 16 * slots.len()], compute_us: 7 }
+                }
+            }
             Message::Free { .. } | Message::Cancel { .. } => Message::Ack,
             _ => Message::Error { message: "unexpected".into() },
         }
@@ -59,6 +66,9 @@ fn every_message_round_trips_through_the_codec() {
         Message::Ack,
         Message::Error { message: "no".into() },
         Message::Assign { layer_start: 8, layer_end: 16 },
+        Message::DecodeBatch { slots: vec![0, 3, 5], positions: vec![10, 20, 30], input: Input::Tokens(vec![7, 8, 9]) },
+        Message::DecodeBatch { slots: vec![1, 2], positions: vec![4, 5], input: Input::Hidden { rows: 2, data: vec![3; 32] } },
+        Message::Tokens { tokens: vec![5, 6, 7], compute_us: 12 },
     ];
     for m in messages {
         let mut buf = Vec::new();
@@ -117,6 +127,29 @@ fn a_chain_runs_downstream_first_and_passes_hidden_rows_between_stages() {
         assert!(matches!(seen[1], Message::Cancel { slot: 1 }) && matches!(seen[2], Message::Free { slot: 1 }));
     }
     assert_eq!(chain.ping_all().unwrap().len(), 3);
+}
+
+#[test]
+fn a_decode_batch_makes_one_round_trip_per_stage_and_returns_a_token_per_row() {
+    let a = Fake::new(0, 10, false);
+    let b = Fake::new(10, 20, true);
+    let servers: Vec<_> = [&a, &b].iter().map(|f| StageServer::start("127.0.0.1:0", KEY, (*f).clone()).unwrap()).collect();
+    let addrs: Vec<String> = servers.iter().map(|s| s.addr().to_string()).collect();
+    let mut chain = Chain::connect(&addrs, KEY, T).unwrap();
+    let (tokens, times) = chain.forward_batch(&[0, 1, 2], &[5, 6, 7], &[1, 2, 3]).unwrap();
+    assert_eq!(tokens.len(), 3);
+    assert_eq!(times.stage.len(), 2);
+    assert_eq!(a.seen.lock().unwrap().len(), 1);
+    assert_eq!(b.seen.lock().unwrap().len(), 1);
+    assert!(matches!(&b.seen.lock().unwrap()[0], Message::DecodeBatch { input: Input::Hidden { rows: 3, .. }, .. }));
+}
+
+#[test]
+fn a_decode_batch_with_mismatched_rows_is_rejected() {
+    let bad = Message::DecodeBatch { slots: vec![0, 1], positions: vec![1, 2], input: Input::Tokens(vec![9]) };
+    let mut frame = bad.encode();
+    frame.truncate(frame.len() - 4);
+    assert!(Message::decode(&frame).is_err());
 }
 
 #[test]

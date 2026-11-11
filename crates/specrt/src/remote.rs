@@ -116,7 +116,23 @@ impl Executor for ChainExecutor {
     }
 
     fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
-        rows.iter().map(|r| self.forward(r.slot, r.pos, vec![r.token], true)).collect()
+        for r in rows {
+            ensure!(r.slot < self.slots, "slot {} out of {}", r.slot, self.slots);
+            let covered = self.tables[r.slot].len() * PAGE;
+            ensure!(r.pos + 1 <= covered, "slot {} has {} blocks, not enough for position {}", r.slot, self.tables[r.slot].len(), r.pos + 1);
+        }
+        self.connect()?;
+        let chain = self.chain.as_mut().expect("connected");
+        let slots: Vec<u32> = rows.iter().map(|r| r.slot as u32).collect();
+        let positions: Vec<u32> = rows.iter().map(|r| r.pos as u32).collect();
+        let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
+        match chain.forward_batch(&slots, &positions, &tokens) {
+            Ok((out, _)) => Ok(out),
+            Err(e) => {
+                self.drop_chain(format!("{e:#}"));
+                Err(e.context("a stage was lost, the request is failed"))
+            }
+        }
     }
 
     fn refresh(&mut self) -> Option<String> {
