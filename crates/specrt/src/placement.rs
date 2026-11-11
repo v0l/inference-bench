@@ -118,15 +118,27 @@ pub struct PlacementConfig {
     pub slots: usize,
     pub devices: Vec<DeviceConfig>,
     pub stages: Vec<StageConfig>,
-    pub micro_batch: usize,
+    pub micro_batch: Option<usize>,
     pub discovery: Discovery,
     pub mdns_port: u16,
     pub remote: Option<RemoteConfig>,
 }
 
+pub const REMOTE_MICRO_BATCH: usize = 256;
+
+impl PlacementConfig {
+    pub fn micro_batch_for_remote(&self) -> usize {
+        self.micro_batch.unwrap_or(REMOTE_MICRO_BATCH)
+    }
+
+    pub fn micro_batch_in_process(&self) -> usize {
+        self.micro_batch.unwrap_or(0)
+    }
+}
+
 impl Default for PlacementConfig {
     fn default() -> Self {
-        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: 0, discovery: Discovery::Static, mdns_port: 5353, remote: None }
+        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: None, discovery: Discovery::Static, mdns_port: 5353, remote: None }
     }
 }
 
@@ -600,6 +612,20 @@ pub fn plan(model: &CostModel, devices: &[Device], objective: Objective) -> Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn micro_batch_defaults_to_overlap_for_remote_stages_and_off_in_process() {
+        let mut p = PlacementConfig::default();
+        assert_eq!((p.micro_batch_for_remote(), p.micro_batch_in_process()), (REMOTE_MICRO_BATCH, 0));
+        p.micro_batch = Some(0);
+        assert_eq!((p.micro_batch_for_remote(), p.micro_batch_in_process()), (0, 0));
+        p.micro_batch = Some(64);
+        assert_eq!((p.micro_batch_for_remote(), p.micro_batch_in_process()), (64, 64));
+        let parsed: PlacementConfig = toml::from_str("micro_batch = 128").unwrap();
+        assert_eq!(parsed.micro_batch, Some(128));
+        let unset: PlacementConfig = toml::from_str("slots = 2").unwrap();
+        assert_eq!(unset.micro_batch, None);
+    }
+
     use super::*;
     use std::path::Path;
 

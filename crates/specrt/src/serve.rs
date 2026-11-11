@@ -262,7 +262,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, in
                 let mut resolved = spec.clone();
                 opts.speculative.apply(&mut resolved)?;
                 let placed = p.place(&resolved)?;
-                (placed.stages.len() > 1).then_some((placed, p.micro_batch))
+                (placed.stages.len() > 1).then_some((placed, p.micro_batch_in_process()))
             }
             _ => None,
         })
@@ -344,7 +344,7 @@ fn build_remote(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::rem
     )?;
     let layout = opts.layout(&spec);
     let mut exec = crate::remote::ChainExecutor::new(coordinator, layout.max_ctx, layout.slots, layout.prefill_chunk);
-    exec.set_micro_batch(placement.micro_batch);
+    exec.set_micro_batch(placement.micro_batch_for_remote());
     if let Err(e) = exec.connect_within(Duration::from_millis(remote.connect_wait_ms)) {
         tracing::warn!(error = %format!("{e:#}"), "remote stages are not ready yet, connecting on the first request");
     }
