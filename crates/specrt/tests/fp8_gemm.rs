@@ -23,7 +23,11 @@ fn spec(quant: Quant) -> Spec {
 }
 
 fn run(quant: Quant, linear: &str, suffix: &str, tokens: usize) -> (Vec<f32>, Vec<f64>) {
-    let spec = spec(quant);
+    run_with(spec(quant), linear, suffix, tokens, None)
+}
+
+fn run_with(spec: Spec, linear: &str, suffix: &str, tokens: usize, raster: Option<usize>) -> (Vec<f32>, Vec<f64>) {
+    let quant = spec.quant;
     let (n, k) = match linear {
         "qkv" => (spec.qkv_rows(), spec.dims.hidden),
         _ => (spec.dims.hidden, spec.q_dim()),
@@ -75,7 +79,15 @@ fn run(quant: Quant, linear: &str, suffix: &str, tokens: usize) -> (Vec<f32>, Ve
     let ctx = CudaContext::new(0).unwrap();
     let dir = std::env::temp_dir().join(format!("specrt-fp8-gemm-{quant:?}-{}", std::process::id()));
     let jit = Jit::new(ctx.clone(), dir.clone()).unwrap();
-    let module = Module::generate(&spec, 256).unwrap();
+    let mut module = Module::generate(&spec, 256).unwrap();
+    if let Some(group) = raster {
+        let (g, c) = ("constexpr int RASTER_GROUP = 32;", "constexpr int RASTER_MIN_COLS = 256;");
+        assert!(module.source.contains(g) && module.source.contains(c));
+        module.source = module
+            .source
+            .replace(g, &format!("constexpr int RASTER_GROUP = {group};"))
+            .replace(c, "constexpr int RASTER_MIN_COLS = 1;");
+    }
     let loaded = jit.load(&module).unwrap();
     let kernel = format!("{linear}_f8{suffix}");
     let f = loaded.function(&kernel).unwrap();
@@ -113,6 +125,19 @@ fn check(quant: Quant) {
                 let error = got.iter().zip(&expect).fold(0f64, |m, (g, e)| m.max((*g as f64 - e).abs()));
                 assert!(error <= 1e-5 * scale, "{quant:?} {linear}{suffix} {tokens} rows: {error} against {scale}");
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU with FP8 mma"]
+fn fp8_gemm_with_grouped_tile_order_matches_the_f64_product() {
+    for quant in [Quant::Fp8Channel, Quant::Fp8Block128] {
+        for tokens in [300, 1300] {
+            let (got, expect) = run_with(spec(quant), "qkv", "_huge", tokens, Some(3));
+            let scale = expect.iter().fold(0f64, |m, v| m.max(v.abs()));
+            let error = got.iter().zip(&expect).fold(0f64, |m, (g, e)| m.max((*g as f64 - e).abs()));
+            assert!(error <= 1e-5 * scale, "{quant:?} grouped qkv {tokens} rows: {error} against {scale}");
         }
     }
 }

@@ -80,8 +80,9 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
     int t = lane & 3;
     int wm = warp / WN;
     int wn = warp % WN;
-    int m0 = blockIdx.y * BM;
-    int n0 = blockIdx.x * BN;
+    int2 tile = grouped_tile<N, BN>();
+    int m0 = tile.x * BM;
+    int n0 = tile.y * BN;
     float acc[MI][NJ][4];
 #pragma unroll
     for (int i = 0; i < MI; i++)
@@ -167,6 +168,6 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
         for (int j = 0; j < NJ; j++)
 #pragma unroll
             for (int e = 0; e < 4; e++) acc[i][j][e] *= alpha;
-    gemm_epilogue<N, BM, BN, WM, WN, EPI, false>(acc, nullptr, out, out_hi, out_lo, tokens);
+    gemm_epilogue_at<N, BM, BN, WM, WN, EPI, false>(acc, nullptr, out, out_hi, out_lo, tokens, m0, n0);
 }
 

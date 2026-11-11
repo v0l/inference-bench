@@ -1071,9 +1071,38 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
     gemm_epilogue<N, BM, BN, WM, WN, EPI, BIAS, MFAST>(acc, bias, out, out_hi, out_lo, tokens);
 }
 
+template <int N, int BM, int BN, int WM, int WN, int EPI, bool BIAS>
+__device__ __forceinline__ void gemm_epilogue_at(float (&acc)[BM / WM / 16][BN / WN / 8][4], const float* bias, float* out,
+                                                 bf16_t* out_hi, bf16_t* out_lo, int tokens, int m0, int n0);
+
 template <int N, int BM, int BN, int WM, int WN, int EPI, bool BIAS, bool MFAST>
 __device__ __forceinline__ void gemm_epilogue(float (&acc)[BM / WM / 16][BN / WN / 8][4], const float* bias, float* out,
                                               bf16_t* out_hi, bf16_t* out_lo, int tokens) {
+    int m0 = (MFAST ? blockIdx.x : blockIdx.y) * BM;
+    int n0 = (MFAST ? blockIdx.y : blockIdx.x) * BN;
+    gemm_epilogue_at<N, BM, BN, WM, WN, EPI, BIAS>(acc, bias, out, out_hi, out_lo, tokens, m0, n0);
+}
+
+constexpr int RASTER_GROUP = 32;
+constexpr int RASTER_MIN_COLS = 256;
+
+template <int N, int BN>
+__device__ __forceinline__ int2 grouped_tile() {
+    constexpr int GROUP = (N + BN - 1) / BN >= RASTER_MIN_COLS ? RASTER_GROUP : 1;
+    if (GROUP == 1) return make_int2(blockIdx.y, blockIdx.x);
+    int num_m = gridDim.y;
+    int num_n = gridDim.x;
+    int pid = blockIdx.y * num_n + blockIdx.x;
+    int per_group = GROUP * num_n;
+    int first_m = pid / per_group * GROUP;
+    int size = min(num_m - first_m, GROUP);
+    int in_group = pid % per_group;
+    return make_int2(first_m + in_group % size, in_group / size);
+}
+
+template <int N, int BM, int BN, int WM, int WN, int EPI, bool BIAS>
+__device__ __forceinline__ void gemm_epilogue_at(float (&acc)[BM / WM / 16][BN / WN / 8][4], const float* bias, float* out,
+                                                 bf16_t* out_hi, bf16_t* out_lo, int tokens, int m0, int n0) {
     constexpr int TM = BM / WM;
     constexpr int TN = BN / WN;
     constexpr int MI = TM / 16;
@@ -1084,8 +1113,6 @@ __device__ __forceinline__ void gemm_epilogue(float (&acc)[BM / WM / 16][BN / WN
     int t = lane & 3;
     int wm = warp / WN;
     int wn = warp % WN;
-    int m0 = (MFAST ? blockIdx.x : blockIdx.y) * BM;
-    int n0 = (MFAST ? blockIdx.y : blockIdx.x) * BN;
     if (EPI == EPI_ACT) {
         static_assert(EPI != EPI_ACT || N % 4 == 0, "gate/up pairs");
 #pragma unroll
@@ -1208,8 +1235,9 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
     int t = lane & 3;
     int wm = warp / WN;
     int wn = warp % WN;
-    int m0 = blockIdx.y * BM;
-    int n0 = blockIdx.x * BN;
+    int2 tile = grouped_tile<N, BN>();
+    int m0 = tile.x * BM;
+    int n0 = tile.y * BN;
     float acc[MI][NJ][4];
 #pragma unroll
     for (int i = 0; i < MI; i++)
@@ -1337,7 +1365,7 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
             }
     }
     cp_async_wait<0>();
-    gemm_epilogue<N, BM, BN, WM, WN, EPI, BIAS>(acc, bias, out, out_hi, out_lo, tokens);
+    gemm_epilogue_at<N, BM, BN, WM, WN, EPI, BIAS>(acc, bias, out, out_hi, out_lo, tokens, m0, n0);
 }
 
 extern "C" __global__ void rms_split(const float* x, const float* weight, bf16_t* hi, bf16_t* lo) {
