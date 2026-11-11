@@ -87,7 +87,7 @@ A stage server process runs a layer range. The coordinator opens a stream to eac
 
 A static device list first (the config above), then mDNS. Nostr and relays are out of scope.
 
-Config: `[placement] discovery = "static"` (default) or `"mdns"`, `mdns_port` (default 5353). `[[placement.devices]]` takes an optional `address` for static members. With `mdns`, a `stage serve` config needs a `[stage.device]` table (same fields as a placement device) and may omit `layers`: the stage starts empty and loads whatever range the coordinator assigns.
+Config: `[placement] discovery = "static"` (default) or `"mdns"`, `mdns_port` (default 5353), `mdns_interface` (an interface name or IP; default all interfaces). `micro_batch` unset means 256 over remote stages and 0 in process (measured on the desktop and the Spark in `docs/specrt-stage-server.md`). `[[placement.devices]]` takes an optional `address` for static members. With `mdns`, a `stage serve` config needs a `[stage.device]` table (same fields as a placement device) and may omit `layers`: the stage starts empty and loads whatever range the coordinator assigns.
 
 Crate: `mdns-sd` 0.21 (pure Rust, no async runtime, maintained). Each stage registers `_specrt-stage._tcp.local.` with TXT keys from `encode_announcement` and its TCP address; `discovery::Browser` turns resolved and removed services into `cluster::Event`s.
 

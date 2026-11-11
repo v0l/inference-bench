@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 256 << 20;
 const NONCE_BYTES: usize = 32;
 

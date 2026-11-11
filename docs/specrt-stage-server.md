@@ -94,3 +94,93 @@ Each stage runs `stage serve` with no `layers`, a `[stage.device]` table and `[p
 - MTP and the prefix cache are off on this path.
 
 Checked on this machine with Qwen3-0.6B split 14/14 over two real `stage serve` processes found over loopback mDNS: four concurrent greedy chat completions gave text identical to a single-runtime server; killing stage b mid-stream ended the stream with `a stage was lost ... Connection reset by peer`; requests while it was down failed with `stage 127.0.0.1:7802 is not ready`; after restarting it the same four requests matched again.
+
+## Desktop + Spark end to end (#544)
+
+The 27B NVFP4 (`qwen3.8-27b-nvfp4.toml`) split over the desktop (RTX PRO 6000, `compute_120`) and the DGX Spark (GB10, `compute_121`) on the direct 100 GbE cable, served through `inference-bench-server` with `[placement.remote]`. Both hosts built from the same tree, release, each for its own arch. Keys were mode 600 files, deleted at the end. Work files lived in `~/e544` because `/tmp` filled up (1.7 TB used by other processes).
+
+### Bugs found and fixed on the way
+
+- **Prompts were cut to 2048 tokens.** The checkpoint's `tokenizer.json` carries `"truncation": {"max_length": 2048}`, so `Tokenizer::encode` silently dropped everything past 2048 tokens, in every server, not only the split. A 1024-word and a 4096-word loadtest prompt both reported `prompt_tokens: 2048`. `engine::without_truncation` clears it when the tokenizer is loaded (test `a_tokenizer_json_truncation_limit_does_not_cut_prompts`).
+- **Remote decode was one round trip per row.** `ChainExecutor::decode` sent every row as its own forward, so 8 streams cost 8 steps and aggregate decode stayed flat at 12 to 13 tok/s for 1, 4 and 8 streams. New `DecodeBatch` and `Tokens` frames (wire protocol version 2) carry all rows in one hop per stage (`Chain::forward_batch`; tests `a_decode_batch_makes_one_round_trip_per_stage_and_returns_a_token_per_row`, codec round trip and truncation).
+- **The remote path exported no `inference_pipeline_*` metrics** and ignored `micro_batch`. `ChainExecutor` now records per-stage busy time, calls, tokens, hop time and bytes (`the_remote_chain_reports_stage_and_hop_metrics`), and prefill can be micro-batched over the chain with one thread per stage (`Chain::forward_pipelined`; `a_pipelined_prefill_sends_every_micro_batch_through_every_stage_in_order`, `a_pipelined_prefill_fails_cleanly_when_a_stage_is_gone`, `a_micro_batched_prefill_over_the_chain_ends_on_the_same_token_as_a_plain_one`).
+- **A non-last stage under-reported compute for prefill.** `compute_us` was taken before `export_hidden` waited for the GPU, so stage 0 showed 61 us for a 2.6 ms call and the wait landed in the hop (test `a_first_stage_reports_its_gpu_time_for_prefill_not_just_the_launch`, which failed before the fix).
+- **mDNS had no interface choice.** New `[placement] mdns_interface` (name or IP), used by both the stage announcer and the coordinator's browser (tests `mdns_can_be_bound_to_one_named_interface_and_still_finds_the_stage`, `mdns_bound_to_a_missing_interface_never_sees_a_stage_on_another_one`).
+
+### Sharing during the runs
+
+Not a quiet window on the Spark: vLLM (`VLLM::EngineCore` 50 GB plus a 16.6 GB python process) held the Spark GPU at 96 percent utilisation for the whole session, plus Frigate's detector and ffmpeg. The desktop GPU carried the served vLLM (52 GB used, 100 percent) until the middle of the session; after that it was idle (2.3 GB used, 0 to 14 percent) and the second set of numbers below is from that quiet desktop. Nothing was stopped on either host. The Spark's unified memory was tight (about 19 GB free, 4 GB at the end), which briefly refused a stage reload right after the old process exited (see failure test).
+
+### Placement
+
+```
+inference-bench plan --spec crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4.toml --config plan.toml --objective latency|throughput
+```
+
+`plan.toml`: context 4352, 8 slots, desktop 40 GiB (what vLLM left free), 1792 GB/s, 500 TFLOP/s; Spark 19 GiB free, 273 GB/s, 100 TFLOP/s, link `latency_ms = 0.08` (ping on the cable: 0.103 / 0.164 / 0.211 ms min/avg/max) and 12.5 GB/s (100 Gb/s).
+
+| objective | stages | step | notes |
+|---|---|---|---|
+| latency | desktop 0..64 | 14.0 ms | 21.3 GiB of weights fit on the desktop, so no split |
+| throughput | desktop 0..63, spark 63..64 | 23.6 ms, bottleneck 12.3 ms | one layer on the Spark |
+
+`latency` keeps the 27B on one device, and `throughput` moves one layer, so I pinned the split #540 used with `[[placement.stages]]`: **desktop 0..48, Spark 48..64** (15.4 GB and 7.8 GB of weights).
+
+### 1. Correctness
+
+`stage run` and `inference-bench-server` with `[placement.remote]` (static addresses), 8 concurrent greedy chat completions (`temperature = 0`, 96 tokens, thinking off) against a single-runtime 27B server on the desktop with the same spec:
+
+```
+cmp single/0.txt split/0.txt ... cmp single/7.txt split/7.txt
+cmp 0 identical  cmp 1 identical  cmp 2 identical  cmp 3 identical
+cmp 4 identical  cmp 5 identical  cmp 6 identical  cmp 7 identical
+```
+
+The same 8 files were identical again with batched decode, with micro-batched prefill, over mDNS, and after the stage restart below.
+
+### 2. Discovery
+
+- `discovery = "static"` with `address` on each `[[placement.devices]]`: works (above).
+- `discovery = "mdns"`, port 15353, stages started empty with a `[stage.device]` table, the coordinator assigning 0..48 and 48..64: works with the default of all interfaces, 8 of 8 texts identical. Multicast does cross the cable: both ends have `MULTICAST` set, are joined to 224.0.0.251, the Spark's INPUT policy is ACCEPT, and the two hosts are on one /30 with no router in between. mDNS was likely also running over the 10.100.2.x LAN (all interfaces), so I proved which path carries it: with `mdns_interface = "enp129s0np0"` on the desktop and the Spark announcing on its LAN port `enP7s7`, the server failed with `device spark has no stage address` (the announcement never reached it); with the Spark also on `enp1s0f1np1` (the cable) the 8 texts matched again. So binding mDNS to the 10.100.50.x interface works, and keeps discovery off the LAN. The Spark has two ports on the cable subnet (`enp1s0f1np1` and `enP2p1s0f1np1`, both 10.100.50.2/30); either works, as the stage binds `10.100.50.2:7700`.
+
+### 3. Throughput
+
+Aggregate decode tok/s through the HTTP server (`inference-bench loadtest`, 64 word prompt, 128 new tokens, N concurrent clients). The 27B split 0..48 / 48..64:
+
+| streams | single, quiet desktop | split (Spark under vLLM, quiet desktop) | split (both GPUs under vLLM) | single (desktop under vLLM) | split before batched decode |
+|---|---|---|---|---|---|
+| 1 | 90.5 | 8.0 | 13.8 | 40.3 | 13.0 |
+| 4 | 221.9 | 30.0 | 44.6 | 99.4 | 13.5 |
+| 8 | 300.1 | 51.1 | 72.1 | 116.9 | 12.1 |
+
+The split scales with streams now (a step carries all rows) but never beats single-device. The Spark stage is the limit: its 16 layers took 149 ms per step at batch 1 under vLLM's 96 percent, against 14 ms for all 64 layers on the quiet desktop. A split pays for capacity (the 27B in 15.4 + 7.8 GB), not speed, and only a quiet Spark could narrow that gap (its 273 GB/s floor for 7.8 GB is 28 ms).
+
+TTFT, one client, p50 (single-device, quiet desktop: 0.60 s at 1019 tokens, 2.24 s at 4078 tokens; under vLLM 1.44 s and 5.67 s at 4212 tokens):
+
+| prompt | split `micro_batch = 0` | 256 | 64 |
+|---|---|---|---|
+| 1019 tokens, under vLLM both | 1.37 s | 1.35 s | 1.45 s |
+| 4078 tokens, under vLLM both (2 runs) | 5.34, 6.60 s | 4.92, 5.14 s | 5.81, 8.22 s |
+| 1019 tokens, quiet desktop (2 runs) | 1.63, 2.09 s | 1.50, 1.88 s | 2.55, 2.34 s |
+| 4078 tokens, quiet desktop (2 runs) | 6.63, 6.37 s | 7.44, 6.06 s | 11.04, 9.26 s |
+
+Overlap across two real devices: 256 is 6 percent faster than 0 on average over the four 4096 runs (5.89 s against 6.24 s), inside the run to run noise (one run 12 percent slower), and 64 is clearly worse (8.58 s, 37 percent slower: each micro-batch adds a frame and a sync). The Spark stage is the slower one, so there is little to hide on the desktop side. The default for remote placements is now `micro_batch = 256` (`[placement] micro_batch` unset), 0 stays the default for in-process stages on a shared GPU, and an explicit value wins either way.
+
+### 4. Hop cost
+
+From `/metrics` (`inference_pipeline_stage_busy_seconds_total`, `..._calls_total`, `inference_pipeline_hop_seconds_total`, `..._hops_total`; hop is the stage round trip minus its compute), deltas over a loadtest of N streams, 128 new tokens, so the counts include a few prefill calls:
+
+| batch | desktop compute per call | Spark compute per call | hop per stage call | share of a step |
+|---|---|---|---|---|
+| 1 | 14.1 ms | 149 ms | 0.25 ms | 0.3 percent (2 hops, 0.5 ms) |
+| 8 | 16.7 ms | 128 ms | 0.39 ms | 0.5 percent |
+
+`stage ping` on the cable: 0.006 ms to the local stage and 0.026 ms to the Spark. A hop is not the cost at either batch size; the Spark's share of the compute is.
+
+### 5. Failure
+
+- Killed the Spark stage (SIGTERM) 6 s into a streaming request: the stream had 56 chunks, then `data: {"error":{"message":"a stage was lost, the request is failed: stage 1 at 10.100.50.2:7700 was lost: failed to fill whole buffer", ...}}` and `data: [DONE]`. A request while it was down got a 500 with `stage 1 at 10.100.50.2:7700 was lost: failed to fill whole buffer`.
+- Restarted it (empty, mDNS): the first retries failed with `the GPU ran out of memory: stage 10.100.50.2:7700 could not load layers 48..64 ... cuda init` for about a minute while the Spark's unified memory was still short, and then recovered with no server restart. The 8 texts matched the single-runtime files (8 of 8 identical).
+- Link pull: the Spark is reached over the LAN (10.100.2.32), not the cable, so it was safe. During a streaming request `ip link set ... down` then `up` on both Spark cable ports (`enp1s0f1np1`, `enP2p1s0f1np1`) for 2 s: the stream finished (402 chunks, `finish_reason: length`, no error) because TCP retransmission covered the gap. One port came back DOWN because my command line was wrong; I brought it up again and verified both ports and the route.
+
+Stages and servers on both hosts were stopped at the end.
