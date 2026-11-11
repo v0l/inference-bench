@@ -39,6 +39,10 @@ impl Stepper {
         self.use_graphs = on;
     }
 
+    pub fn rows_for(&self, live: usize) -> usize {
+        if self.use_graphs { pad_rows(live) } else { live }
+    }
+
     pub fn captured_sizes(&self) -> Vec<usize> {
         let mut sizes: Vec<usize> = self.graphs.keys().copied().collect();
         sizes.sort();
@@ -136,7 +140,7 @@ impl Runtime {
         let live = rows.len();
         ensure!(live >= 1 && live <= self.slots, "{live} decode rows for {} slots", self.slots);
         ensure!(rows.iter().all(|r| r.slot < self.slots && r.pos < self.max_ctx), "decode row out of range");
-        let n = if st.use_graphs { pad_rows(live) } else { live };
+        let n = st.rows_for(live);
         let pad = DecodeRow { slot: self.slots, token: 0, pos: 0, sampling: Sampling::GREEDY, step: 0 };
         let padded: Vec<DecodeRow> = rows.iter().copied().chain(std::iter::repeat(pad)).take(n).collect();
         let tokens: Vec<i32> = padded.iter().map(|r| r.token as i32).collect();

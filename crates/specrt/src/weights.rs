@@ -753,8 +753,12 @@ impl Checkpoint {
     }
 
     pub fn layer(&self, spec: &Spec, i: usize) -> Result<Layer<'_>> {
+        self.layer_at(spec, i, i)
+    }
+
+    pub fn layer_at(&self, spec: &Spec, i: usize, global: usize) -> Result<Layer<'_>> {
         let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
-        let p = format!("{}.layers.{i}", self.root());
+        let p = format!("{}.layers.{global}", self.root());
         let mixer = if spec.block(i).is_linear() {
             Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"))?)
         } else {
@@ -820,15 +824,26 @@ impl Checkpoint {
     }
 
     pub fn outside(&self, spec: &Spec) -> Result<Outside<'_>> {
+        let embed = self.embedding(spec)?;
+        let (norm, lm_head) = self.head_from(spec, &embed)?;
+        Ok(Outside { norm, lm_head, embed })
+    }
+
+    pub fn embedding(&self, spec: &Spec) -> Result<Cow<'_, [u16]>> {
         let d = &spec.dims;
-        let root = self.root();
-        let embed = self.bf16(&format!("{root}.embed_tokens.weight"), &[d.vocab, d.hidden])?;
-        let head_quant = spec.lm_head_quant();
-        Ok(Outside {
-            norm: self.norm(spec, &format!("{root}.norm.weight"), d.hidden)?,
-            lm_head: self.head_raw(spec, &embed)?.into_matrix(head_quant, "lm_head")?,
-            embed,
-        })
+        self.bf16(&format!("{}.embed_tokens.weight", self.root()), &[d.vocab, d.hidden])
+    }
+
+    pub fn head(&self, spec: &Spec) -> Result<(Vec<f32>, Matrix<'_>)> {
+        let embed = self.embedding(spec)?;
+        self.head_from(spec, &embed)
+    }
+
+    fn head_from<'s>(&'s self, spec: &Spec, embed: &Cow<'s, [u16]>) -> Result<(Vec<f32>, Matrix<'s>)> {
+        let d = &spec.dims;
+        let norm = self.norm(spec, &format!("{}.norm.weight", self.root()), d.hidden)?;
+        let lm_head = self.head_raw(spec, embed)?.into_matrix(spec.lm_head_quant(), "lm_head")?;
+        Ok((norm, lm_head))
     }
 
     fn head_raw<'s>(&'s self, spec: &Spec, embed: &Cow<'s, [u16]>) -> Result<Raw<'s>> {

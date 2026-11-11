@@ -20,6 +20,20 @@ impl Plans {
     }
 }
 
+impl Plans {
+    pub fn for_stage(mut self, role: super::StageRole) -> Self {
+        for plan in [&mut self.prefill, &mut self.decode] {
+            if !role.first {
+                plan.head.clear();
+            }
+            if !role.last {
+                plan.tail.clear();
+            }
+        }
+        self
+    }
+}
+
 pub(super) struct Run<'a> {
     pub n: usize,
     pub tokens: &'a CudaSlice<i32>,

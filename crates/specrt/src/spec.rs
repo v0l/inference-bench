@@ -1111,6 +1111,20 @@ impl Spec {
         }
     }
 
+    pub fn stage(&self, start: usize, end: usize) -> Spec {
+        let mut s = self.clone();
+        s.name = format!("{}[{start}..{end}]", self.name);
+        s.layers.pattern = (start..end).map(|i| self.block(i)).collect();
+        s.layers.count = end - start;
+        s.mlp.quant_until = self.mlp.quant_until.map(|u| u.saturating_sub(start));
+        if !s.layers.pattern.iter().any(|b| b.is_linear()) {
+            s.linear_attention = None;
+        }
+        s.mtp = None;
+        s.vision = None;
+        s
+    }
+
     pub fn block(&self, layer: usize) -> Block {
         self.layers.pattern[layer % self.layers.pattern.len()]
     }

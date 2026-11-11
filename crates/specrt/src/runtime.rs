@@ -18,10 +18,12 @@ mod exec;
 mod fused;
 mod mtp;
 mod snapshot;
+mod stage;
 mod step;
 pub use fused::PrefillPart;
 use exec::Plans;
 pub use mtp::{SpecRow, SpecStats};
+pub use stage::{StageRange, StageRole};
 pub use step::{DecodeRow, GRAPH_SIZES, Stepper, pad_rows};
 
 enum DeviceMatrix {
@@ -370,6 +372,7 @@ pub struct Runtime {
     prefill_limit: usize,
     use_mma: bool,
     plans: Plans,
+    role: StageRole,
     sms: u32,
     seq: i32,
     batch: usize,
@@ -499,13 +502,20 @@ impl Runtime {
     }
 
     pub fn load_layout(spec: &Spec, layout: Layout) -> Result<Self> {
+        Self::load_stage(spec, layout, StageRange::whole(spec))
+    }
+
+    pub fn load_stage(spec: &Spec, layout: Layout, range: StageRange) -> Result<Self> {
         let resolved = spec.with_env_overrides();
-        let spec = &resolved;
+        range.check(&resolved)?;
+        let role = StageRole::of(&resolved, range);
+        let staged = if role.whole() { resolved.clone() } else { resolved.stage(range.start, range.end) };
+        let spec = &staged;
         ensure!(layout.slots >= 1, "need at least one slot");
         let max_ctx = layout.max_ctx;
         let batch = 1;
         let load_started = Instant::now();
-        let ctx = CudaContext::new(0).context("cuda init")?;
+        let ctx = CudaContext::new(range.device).context("cuda init")?;
         let free_before = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
@@ -541,7 +551,7 @@ impl Runtime {
         let mut layers = Vec::with_capacity(spec.layers.count);
         let (mut kv, mut slot) = (0i32, 0i32);
         for i in 0..spec.layers.count {
-            let l = checkpoint.layer(spec, i).with_context(|| format!("layer {i}"))?;
+            let l = checkpoint.layer_at(spec, i, range.start + i).with_context(|| format!("layer {}", range.start + i))?;
             let mixer = match &l.mixer {
                 Mixer::Attention(a) => {
                     kv += 1;
@@ -579,12 +589,22 @@ impl Runtime {
             drop(l);
             checkpoint.release();
         }
-        let outside = checkpoint.outside(spec)?;
-        let embed = stream.clone_htod(outside.embed.as_ref())?;
-        let norm = stream.clone_htod(&outside.norm)?;
-        let lm_head = up_m(&outside.lm_head)?;
-        stream.synchronize()?;
-        drop(outside);
+        let (embed, norm, lm_head) = if role.whole() {
+            let outside = checkpoint.outside(spec)?;
+            let loaded = (stream.clone_htod(outside.embed.as_ref())?, stream.clone_htod(&outside.norm)?, up_m(&outside.lm_head)?);
+            stream.synchronize()?;
+            loaded
+        } else {
+            let embed = if role.first { stream.clone_htod(checkpoint.embedding(spec)?.as_ref())? } else { stream.alloc_zeros(1)? };
+            let (norm, lm_head) = if role.last {
+                let (norm, head) = checkpoint.head(spec)?;
+                (stream.clone_htod(&norm)?, up_m(&head)?)
+            } else {
+                (stream.alloc_zeros(1)?, DeviceMatrix::Bf16(stream.alloc_zeros(1)?))
+            };
+            stream.synchronize()?;
+            (embed, norm, lm_head)
+        };
         checkpoint.release();
         let mtp_weights = mtp::DeviceMtp::load(&stream, &checkpoint, spec)?;
         checkpoint.release();
@@ -713,7 +733,8 @@ impl Runtime {
             tables: vec![0; (layout.slots + 1) * pages],
             sms,
             use_mma,
-            plans: Plans::build(spec, use_mma),
+            plans: Plans::build(spec, use_mma).for_stage(role),
+            role,
             spec: spec.clone(),
             max_ctx,
             embed,
@@ -755,12 +776,12 @@ impl Runtime {
                 let free = ctx.mem_get_info().map(|(f, _)| f).unwrap_or(0);
                 let spare = free.saturating_sub(layout.kv_headroom);
                 ensure!(spare >= 2 * block_elems * 4, "no device memory left for the KV cache ({free} bytes free)");
-                spare / (block_elems * 4)
+                spare / (block_elems.max(1) * 4)
             }
             n => n,
         };
-        rt.buf.k_cache = rt.stream.alloc_zeros((kv_blocks + 1) * block_elems).context("KV cache")?;
-        rt.buf.v_cache = rt.stream.alloc_zeros((kv_blocks + 1) * block_elems).context("KV cache")?;
+        rt.buf.k_cache = rt.stream.alloc_zeros(((kv_blocks + 1) * block_elems).max(1)).context("KV cache")?;
+        rt.buf.v_cache = rt.stream.alloc_zeros(((kv_blocks + 1) * block_elems).max(1)).context("KV cache")?;
         rt.kv_blocks = kv_blocks;
         let pad_row = layout.slots * pages;
         rt.tables[pad_row] = kv_blocks as i32;
