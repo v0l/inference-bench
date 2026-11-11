@@ -318,14 +318,17 @@ pub fn flash_rows(head_dim: usize) -> usize {
     if head_dim > 128 { 64 } else { 128 }
 }
 
-pub fn flash_keys(head_dim: usize) -> usize {
-    if head_dim > 128 { 16 } else { 32 }
+pub fn flash_keys(head_dim: usize, kv_planes: usize) -> usize {
+    if head_dim > 128 && kv_planes == 2 { 16 } else { 32 }
+}
+
+pub fn flash_stages(head_dim: usize, kv_planes: usize) -> usize {
+    if head_dim > 128 && kv_planes == 1 { 3 } else { 2 }
 }
 
 pub const LA_CHUNK: usize = 64;
 pub const LA_KSPLIT: usize = 4;
 pub const LA_COLS: usize = 16;
-const FLASH_STAGES: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tile {
@@ -893,9 +896,10 @@ impl Module {
         let mut smem = BTreeMap::new();
         let mma = mma_kernels(spec, &mut smem);
         let fp8 = spec.quant.is_fp8();
-        let (flash_rows, flash_keys) = (flash_rows(a.head_dim), flash_keys(a.head_dim));
-        let kv_bytes = FLASH_STAGES * 4 * flash_keys * a.head_dim * 2;
-        let q_bytes = flash_rows * a.head_dim * 4;
+        let (flash_rows, flash_keys) = (flash_rows(a.head_dim), flash_keys(a.head_dim, kv_planes));
+        let flash_stages = flash_stages(a.head_dim, kv_planes);
+        let kv_bytes = flash_stages * 2 * kv_planes * flash_keys * a.head_dim * 2;
+        let q_bytes = flash_rows * a.head_dim * 2;
         let flash_smem = kv_bytes.max(q_bytes);
         anyhow::ensure!(flash_smem <= FLASH_SMEM_LIMIT, "flash_mma needs {flash_smem} bytes of shared memory");
         smem.insert("flash_mma", flash_smem as u32);
@@ -951,7 +955,7 @@ impl Module {
             ("WF", wf.decoder().to_string()),
             ("HEAD_WF", head_wf.decoder().to_string()),
             ("MMA_KERNELS", mma),
-            ("FM_STAGES", FLASH_STAGES.to_string()),
+            ("FM_STAGES", flash_stages.to_string()),
             ("FM_BK", flash_keys.to_string()),
             ("FM_WARPS", (flash_rows / 16).to_string()),
             ("FM_SMEM", kv_bytes.max(q_bytes).to_string()),

@@ -138,7 +138,7 @@ mod tests {
     #[test]
     fn config_keys_the_spec_does_not_read_are_listed_raw() {
         let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/gemma4-31b.config.json")).unwrap();
-        let mut v = view("qwen3.8-27b.toml");
+        let mut v = view("qwen3.8-27b-exact.toml");
         v.unread = specrt::spec::unread_hf_keys(&json);
         let e = entries(&v, None);
         let raw = |k: &str| e.iter().find(|x| x.group == "config keys the spec does not read" && x.field == k).map(|x| x.value.clone());
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn every_group_is_listed_with_its_source() {
-        let e = entries(&view("qwen3.8-27b-nvfp4.toml"), Some(800));
+        let e = entries(&view("qwen3.8-27b-nvfp4-exact.toml"), Some(800));
         for g in ["dims", "attention", "linear attention", "mlp", "norm", "rope and scaling", "quant", "mtp and runtime", "derived"] {
             assert!(e.iter().any(|x| x.group == g), "{g}");
         }
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn the_ceiling_says_so_when_no_bandwidth_is_recorded() {
-        let e = entries(&view("qwen3.8-27b.toml"), None);
+        let e = entries(&view("qwen3.8-27b-exact.toml"), None);
         assert!(e.iter().any(|x| x.field == "decode ceiling" && x.value.starts_with("no bandwidth")));
     }
 }

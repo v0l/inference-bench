@@ -836,7 +836,7 @@ fn a_gguf_model_opens_a_detail_view_from_its_metadata() {
 
 #[test]
 fn the_detail_view_draws_the_27b_with_its_delta_net_rhythm_and_opens_a_block_diagram() {
-    let mut h = detail_harness("detail-27b", egui::vec2(1280.0, 900.0), detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), None);
+    let mut h = detail_harness("detail-27b", egui::vec2(1280.0, 900.0), detail_view("qwen3.8-27b", Some("qwen3.8-27b-exact.toml")), None);
     h.run();
     h.get_by_label("layer 3 full attention").hover();
     h.run();
@@ -855,8 +855,8 @@ fn compare_draws_a_second_strip_on_the_same_scale() {
     let mut h = detail_harness(
         "detail-compare",
         egui::vec2(1280.0, 900.0),
-        detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")),
-        Some(detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml"))),
+        detail_view("qwen3.8-27b", Some("qwen3.8-27b-exact.toml")),
+        Some(detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4-exact.toml"))),
     );
     h.run();
     assert_eq!(h.query_all_by_label("layer 3 full attention").count(), 2);
@@ -873,8 +873,8 @@ fn screenshots_of_the_model_detail_view() {
             let spec = specrt::spec::Spec::describe_hf_config(&json).unwrap();
             detail::View::new("Qwen3.6-35B-A3B-FP8", spec, detail::Source::HfConfig, 1, Some(262144)).with_structure(header_structure("qwen3.6-35b-a3b-fp8"))
         }, None),
-        ("27b-nvfp4", detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml")), None),
-        ("27b-fp8", detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), None),
+        ("27b-nvfp4", detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4-exact.toml")), None),
+        ("27b-fp8", detail_view("qwen3.8-27b", Some("qwen3.8-27b-exact.toml")), None),
         ("qwen3-0.6b", {
             let spec = specrt::spec::Spec::load(&fixtures().join("../../specs/qwen3-0.6b.toml")).unwrap();
             detail::View::new("Qwen3-0.6B", spec, detail::Source::SpecToml, 0, Some(40960)).with_structure(header_structure("qwen3-0.6b"))
@@ -889,7 +889,7 @@ fn screenshots_of_the_model_detail_view() {
             let spec = specrt::spec::Spec::describe_hf_config(&json).unwrap();
             detail::View::new("gemma-4-31B-it", spec, detail::Source::HfConfig, 0, None).with_structure(header_structure("gemma4-31b"))
         }, None),
-        ("compare", detail_view("qwen3.8-27b", Some("qwen3.8-27b.toml")), Some(detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4.toml")))),
+        ("compare", detail_view("qwen3.8-27b", Some("qwen3.8-27b-exact.toml")), Some(detail_view("qwen3.8-27b-nvfp4", Some("qwen3.8-27b-nvfp4-exact.toml")))),
     ];
     for (name, view, other) in cases {
         for (w, h_px) in [(1400.0, 900.0), (1024.0, 700.0), (1400.0, 3000.0)] {

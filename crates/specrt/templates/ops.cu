@@ -1993,7 +1993,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
                                      const int* mm_meta, const int* mm_table, int mm_slot) {
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = FM_BK * HEAD_DIM;
-    static_assert(FM_BQ * HEAD_DIM * 4 <= {{FM_SMEM}}, "Q staging fits");
+    static_assert(FM_BQ * HEAD_DIM * 2 <= {{FM_SMEM}}, "Q staging fits");
     extern __shared__ __align__(16) unsigned char fm_smem[];
     bf16_t* kvs = (bf16_t*)fm_smem;
     float* qs = (float*)fm_smem;
@@ -2014,52 +2014,53 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     unsigned qh[FM_KB][4];
     unsigned ql[FM_KB][4];
     constexpr int PAIRS = (ROT_HALF + 31) / 32;
-    float* wq = qs + warp * 16 * HEAD_DIM;
+    float* wq = qs + warp * 8 * HEAD_DIM;
     float freq[PAIRS];
 #pragma unroll
     for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, ROT_HALF - 1));
-    for (int r = 0; r < 16; r++) {
-        int row = q0 + warp * 16 + r;
-        const float* src = qkv + (size_t)row * QKV_ROW + head * HEAD_DIM;
-        float* dst = wq + r * HEAD_DIM;
-        float ss = 0.0f;
-        for (int d = lane; d < HEAD_DIM; d += 32) {
-            float v = row < tokens ? src[d] : 0.0f;
-            dst[d] = v;
-            ss += v * v;
-        }
-        float inv = QK_NORM ? rsqrtf(warp_sum(ss) / HEAD_DIM + EPS) : 1.0f;
-        __syncwarp();
-        if (QK_NORM)
-            for (int d = lane; d < HEAD_DIM; d += 32) dst[d] = q_norm[d] * (dst[d] * inv);
-        __syncwarp();
 #pragma unroll
-        for (int i = 0; i < PAIRS; i++) {
-            int d = lane + 32 * i;
-            if (d < ROT_HALF) {
-                float x = dst[d], y = dst[d + ROT_HALF];
-                float sn, c;
-                sincosf(rope_position(mm_meta, mm_table, mm_slot, base + row, d) * freq[i], &sn, &c);
-                dst[d] = x * c - y * sn;
-                dst[d + ROT_HALF] = y * c + x * sn;
+    for (int half = 0; half < 2; half++) {
+        for (int r = 0; r < 8; r++) {
+            int row = q0 + warp * 16 + half * 8 + r;
+            const float* src = qkv + (size_t)row * QKV_ROW + head * HEAD_DIM;
+            float* dst = wq + r * HEAD_DIM;
+            float ss = 0.0f;
+            for (int d = lane; d < HEAD_DIM; d += 32) {
+                float v = row < tokens ? src[d] : 0.0f;
+                dst[d] = v;
+                ss += v * v;
+            }
+            float inv = QK_NORM ? rsqrtf(warp_sum(ss) / HEAD_DIM + EPS) : 1.0f;
+            __syncwarp();
+            if (QK_NORM)
+                for (int d = lane; d < HEAD_DIM; d += 32) dst[d] = q_norm[d] * (dst[d] * inv);
+            __syncwarp();
+#pragma unroll
+            for (int i = 0; i < PAIRS; i++) {
+                int d = lane + 32 * i;
+                if (d < ROT_HALF) {
+                    float x = dst[d], y = dst[d + ROT_HALF];
+                    float sn, c;
+                    sincosf(rope_position(mm_meta, mm_table, mm_slot, base + row, d) * freq[i], &sn, &c);
+                    dst[d] = x * c - y * sn;
+                    dst[d + ROT_HALF] = y * c + x * sn;
+                }
+            }
+            __syncwarp();
+        }
+#pragma unroll
+        for (int kb = 0; kb < FM_KB; kb++) {
+            int d = kb * 16 + 2 * t;
+            float2 v0 = *(const float2*)&wq[g * HEAD_DIM + d];
+            float2 v1 = *(const float2*)&wq[g * HEAD_DIM + d + 8];
+            qh[kb][half] = pack_hi(v0.x, v0.y);
+            qh[kb][2 + half] = pack_hi(v1.x, v1.y);
+            if (KV_PLANES == 2) {
+                ql[kb][half] = pack_lo(v0.x, v0.y);
+                ql[kb][2 + half] = pack_lo(v1.x, v1.y);
             }
         }
         __syncwarp();
-    }
-    __syncwarp();
-#pragma unroll
-    for (int kb = 0; kb < FM_KB; kb++) {
-        int d = kb * 16 + 2 * t;
-        float2 v[4];
-        v[0] = *(const float2*)&wq[g * HEAD_DIM + d];
-        v[1] = *(const float2*)&wq[(g + 8) * HEAD_DIM + d];
-        v[2] = *(const float2*)&wq[g * HEAD_DIM + d + 8];
-        v[3] = *(const float2*)&wq[(g + 8) * HEAD_DIM + d + 8];
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            qh[kb][i] = pack_hi(v[i].x, v[i].y);
-            if (KV_PLANES == 2) ql[kb][i] = pack_lo(v[i].x, v[i].y);
-        }
     }
     float o[FM_NB][4];
 #pragma unroll
@@ -2072,7 +2073,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     int warp_last = base + q0 + warp * 16 + 15;
     int tiles = (key_end + FM_BK - 1) / FM_BK;
     auto load_kv = [&](int buf, int k0) {
-        bf16_t* st = kvs + buf * 4 * PLANE;
+        bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
         constexpr int ROW_CHUNKS = KV_PLANES * CPR;
         constexpr int TOTAL = 2 * FM_BK * ROW_CHUNKS;
 #pragma unroll
@@ -2083,7 +2084,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             int c = rem % ROW_CHUNKS;
             int tk = k0 + r;
             const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
-            bf16_t* dst = st + (which * 2 + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
+            bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
             cp_async16_zfill(dst, src + c * 8, tk < key_end);
         }
     };
@@ -2096,9 +2097,9 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         cp_async_commit();
         cp_async_wait<1>();
         __syncthreads();
-        const bf16_t* k_hi = kvs + (kt % FM_STAGES) * 4 * PLANE;
+        const bf16_t* k_hi = kvs + (kt % FM_STAGES) * 2 * KV_PLANES * PLANE;
         const bf16_t* k_lo = k_hi + PLANE;
-        const bf16_t* v_hi = k_lo + PLANE;
+        const bf16_t* v_hi = k_hi + KV_PLANES * PLANE;
         const bf16_t* v_lo = v_hi + PLANE;
         if (k0 > warp_last) {
             __syncthreads();
