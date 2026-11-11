@@ -83,6 +83,39 @@ Changes: flash_mma skips the unused lo KV plane with 1-plane KV (flash_mma 8.6 m
 
 Still about 5x below vLLM at 32k (6,849 tok/s, quiet GPU) on specrt-under-load numbers; on a quiet GPU the branch would be higher.
 
+#517, prefill GEMMs on native low-precision MMA. All numbers were taken with the served vLLM (port 8001) up and under load.
+
+The native kernels were already there: `gemm_fp8` (`mma.sync.m16n8k32.e4m3`, FP8 activations quantised per 128 columns or per token by `quant_rows_fp8`, no hi/lo split) and `gemm_f4a` (`mma.sync.kind::mxf4nvf4.block_scale` with the NVFP4 block scales in the MMA). Both load with a `cp.async` pipeline. The spec picks them (`act_quant = "fp8"`, `[mlp] act_quant = "fp4"`), not the architecture. At 16k tokens they lost a lot to L2 misses. With row-major block order, a 128-row M tile streams the whole weight matrix, so `gate_up` read 178 MB 128 times. The change orders blocks in groups of 32 M tiles per column sweep (`grouped_tile`). This only applies when the GEMM has at least 256 column tiles (`gate_up`). For the narrower `down` and `lin_in` it measured flat or slightly worse, so they keep the old order.
+
+Kernel time per call, `tests/gemm_speed.rs` (CUDA events, median of 10), against cuBLAS FP8 `torch._scaled_mm` with per-row and per-column scales (`scripts/cublas_gemm.py`). The cuBLAS numbers vary 447 to 526 TFLOP/s between runs because of the load.
+
+| GEMM, 16,384 tokens | before | after | cuBLAS FP8 | share of cuBLAS |
+|---|---|---|---|---|
+| `gate_up` FP8 block-128 (`qwen3.8-27b-act`) | 22.6 ms, 259 TFLOP/s | 17.1 ms, 342 | 11.9 ms, 489 | 70% |
+| `down` FP8 block-128 | 8.1 ms, 360 | 8.0 ms, 363 | 5.9 ms, 493 | 74% |
+| `lin_in` FP8 block-128 | 7.2 ms, 380 | 7.2 ms, 384 | 5.6 ms, 487 | 79% |
+| `gate_up` FP8 per-token (`qwen3.8-27b-nvfp4-act`) | 19.3 ms, 303 | 12.3 ms, 473 | | 97% |
+| `down` FP8 per-token | 6.1 ms, 477 | 6.0 ms, 484 | | 98% |
+| `lin_in` FP8 per-token | 5.7 ms, 483 | 5.6 ms, 487 | | 100% |
+| `gate_up` NVFP4 (`gemm_f4a`) | 10.3 ms, 569 | 9.6 ms, 610 | | |
+| `down` NVFP4 | 4.8 ms, 603 | 4.8 ms, 604 | | |
+
+At 2,048 tokens block-128 `gate_up` goes from 327 to 357 TFLOP/s and per-token `gate_up` from 390 to 459. cuBLAS FP8 reaches 493 to 526 there. Against the bf16 hi/lo path in the table above (`gate_up_mma_big` 38 TFLOP/s), the native block-128 kernel is 9x faster.
+
+nsys, `prefixbench long` at 16,384 tokens on `qwen3.8-27b-act.toml`, branch build: 3,763 tok/s. The top kernels are `gate_up_f8_huge` 19.9% (2.36 ms median per 2,048-token chunk), `flash_mma` 10.3%, `down_f8_huge` 10.3% (1.30 ms) and `lin_in_f8_huge` 6.4% (1.02 ms). GEMMs are no longer most of prefill: `gate_up`, `down` and `lin_in` together are 37% of kernel time, against about 64% before. `quant_rows_fp8` costs 2.8%.
+
+End to end, `prefixbench long`, cold, interleaved base/branch, 3 rounds, all three values shown (`scripts/ab517.sh`):
+
+| prompt | master, `qwen3.8-27b.toml` (bf16 hi/lo) | branch, `qwen3.8-27b-act.toml` | master, `qwen3.8-27b-act.toml` | branch gain on the same act spec |
+|---|---|---|---|---|
+| 4,096 | 1,611 (1,653, 1,611, 857) | 4,129 (4,168, 4,129, 4,129) | 3,791 (3,837, 3,791, 3,790) | 1.09x |
+| 32,768 | 1,453 (1,491, 1,453, 1,421) | 3,338 (3,364, 3,338, 3,337) | 3,090 (3,289, 3,090, 3,089) | 1.08x |
+| 65,536 | 1,272 (1,319, 1,272, 1,244) | 2,708 (2,723, 2,708, 2,305) | 2,534 (2,586, 2,534, 2,530) | 1.07x |
+
+So switching a 27B FP8 deployment to `act_quant = "fp8"` gives 2.1x to 2.6x prefill, and this branch adds 7 to 9% on top. The second and third columns come from one interleaved run. The fourth column and the gains come from a second interleaved run, which repeated the branch arm and got the same values within 1%.
+
+Numerics (`tests/real27b.rs`, `qwen3.8-27b-act.toml`, this branch): logits KL against the weight-only FP8 reference 1.08e-3 (gate 1.5x the act reference's 0.86e-3), top-1 0.983 (gate 0.990 - 0.02), error against the activation-quantised reference 0.087 of the largest logit, inside the 0.33 envelope. Greedy runs 32 of 32 tokens on 3 prompts. The other 2 diverge at near ties in the reference (margins 0.10 and 0.17), as before #517. The serving default `qwen3.8-27b.toml` stays weight-only. Its gate (greedy identical, logits 2e-4) and the 1e-3 per-layer trace hold only without activation quantisation, so native FP8 stays opt-in through the spec. `qwen3.8-27b-nvfp4-act.toml` against vLLM: KL mean 0.0126, teacher-forced top-1 1,220 of 1,280.
+
 Decode of 512 tokens after a held prefix (median tok/s):
 
 | held prefix | MTP | off |
