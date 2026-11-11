@@ -3,6 +3,7 @@ pub mod backends;
 pub mod wgsl;
 pub mod structure;
 pub mod chat;
+pub mod cluster;
 pub mod codegen;
 pub mod engine;
 pub mod executor;

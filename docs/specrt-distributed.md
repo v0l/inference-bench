@@ -87,6 +87,8 @@ A stage server process runs a layer range. The coordinator opens a stream to eac
 
 A static device list first (the config above), then mDNS. Nostr and relays are out of scope.
 
+`crates/specrt/src/cluster.rs` holds the transport-free part: `Membership` starts from the static `[[placement.devices]]`, applies `Join` and `Leave` events and expires discovered nodes that stop announcing (static ones never leave), and `replan` reruns the planner over the current members, dropping pinned stages whose device is gone. `diff` reports which stages moved. A node announces itself as `_specrt-stage._tcp.local` TXT records (`encode_announcement` / `decode_announcement`). The mDNS socket and the stage server hookup need the slice 3 stage protocol.
+
 ## Tensor parallel
 
 Later, and only for fast links. It needs an allreduce per layer (NCCL class), so a LAN or PCIe pair will not pay for it. Not built here.
