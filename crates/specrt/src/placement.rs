@@ -88,6 +88,12 @@ pub struct RemoteConfig {
     pub timeout_ms: u64,
     #[serde(default = "default_member_ttl_ms")]
     pub member_ttl_ms: u64,
+    #[serde(default = "default_connect_wait_ms")]
+    pub connect_wait_ms: u64,
+}
+
+fn default_connect_wait_ms() -> u64 {
+    15_000
 }
 
 fn default_remote_timeout_ms() -> u64 {

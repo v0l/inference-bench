@@ -25,8 +25,19 @@ impl ChainExecutor {
         &self.coordinator
     }
 
+    pub fn table(&self, slot: usize) -> &[u32] {
+        &self.tables[slot]
+    }
+
     pub fn connected(&self) -> bool {
         self.chain.is_some()
+    }
+
+    pub fn connect_within(&mut self, wait: std::time::Duration) -> Result<()> {
+        if self.chain.is_none() {
+            self.coordinator.wait_ready(wait)?;
+        }
+        self.connect()
     }
 
     pub fn connect(&mut self) -> Result<()> {

@@ -56,3 +56,41 @@ stage serve local.toml        # on the desktop, under flock /tmp/gpu27.lock
 stage ping local.toml
 stage run local.toml 128,1024,4096 64 3 1024
 ```
+
+## Serving a model over remote stages
+
+`inference-bench-server` can use stage servers as its executor (#543). Set `[placement.remote]` next to the usual `[placement]` table; the server then runs the normal scheduler (continuous batching, preemption) over a `wire::Chain` instead of local GPUs. Every setting is in the config, none in env vars.
+
+```toml
+max_num_seqs = 4
+max_model_len = 512
+
+[placement]
+context = 512
+slots = 4
+discovery = "mdns"
+mdns_port = 15353
+
+[[placement.stages]]
+device = "a"
+layers = [0, 14]
+
+[[placement.stages]]
+device = "b"
+layers = [14, 28]
+
+[placement.remote]
+key_file = "/path/to/key"
+timeout_ms = 120000
+member_ttl_ms = 30000
+connect_wait_ms = 15000
+```
+
+Each stage runs `stage serve` with no `layers`, a `[stage.device]` table and `[placement] discovery = "mdns"` (same port); the coordinator assigns the layer ranges when it connects. With `discovery = "static"`, list `address` on each `[[placement.devices]]` instead.
+
+- **KV mapping:** stage servers keep one contiguous KV region per slot, addressed by slot and position. The scheduler's block tables are only used for admission and accounting, so any block order is served (`out_of_order_scheduler_blocks_decode_the_same_over_the_chain`). `set_table` rejects a block id outside `slots * ceil(max_ctx / 16)`, and a forward past the blocks a sequence owns is an error.
+- **Stage loss:** a failed forward drops the chain and fails every in-flight request with the stage address in the error (streams end with an error event, then `[DONE]`). The next request reconnects, so a restarted stage is picked up with no server restart.
+- **Replan:** the serve loop polls the coordinator each step. An mDNS join or leave that changes the placement or stage addresses fails in-flight requests and rebuilds the chain on the next request.
+- MTP and the prefix cache are off on this path.
+
+Checked on this machine with Qwen3-0.6B split 14/14 over two real `stage serve` processes found over loopback mDNS: four concurrent greedy chat completions gave text identical to a single-runtime server; killing stage b mid-stream ended the stream with `a stage was lost ... Connection reset by peer`; requests while it was down failed with `stage 127.0.0.1:7802 is not ready`; after restarting it the same four requests matched again.

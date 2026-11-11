@@ -113,3 +113,30 @@ fn the_scheduler_serves_over_a_chain_and_fails_in_flight_when_the_stage_dies() {
     assert_eq!(events.iter().filter(|e| matches!(e, Event::Token { .. })).count(), 4);
     drop(again);
 }
+
+fn tokens_of(events: &[Event]) -> Vec<u32> {
+    events.iter().filter_map(|e| if let Event::Token { token, .. } = e { Some(*token) } else { None }).collect()
+}
+
+#[test]
+fn out_of_order_scheduler_blocks_decode_the_same_over_the_chain() {
+    let stage = Arc::new(Echo { range: Mutex::new((0, 0)), seen: Mutex::new(Vec::new()) });
+    let server = StageServer::start("127.0.0.1:0", KEY, stage.clone()).unwrap();
+    let mut exec = executor(&server.addr().to_string());
+    exec.connect().unwrap();
+    let mut sched = Scheduler::new(exec, Config::default());
+    sched.submit(request(40)).unwrap();
+    let first = tokens_of(&drain(&mut sched).unwrap());
+    assert_eq!(first.len(), 4);
+
+    sched.submit(request(40)).unwrap();
+    let mut events = Vec::new();
+    sched.step(&mut events).unwrap();
+    let table: Vec<u32> = (0..2).map(|s| sched.exec.table(s).to_vec()).max_by_key(|t| t.len()).unwrap();
+    assert!(table.len() >= 3);
+    assert!(table.windows(2).any(|w| w[0] > w[1]), "blocks came back in order: {table:?}");
+    while !sched.idle() {
+        sched.step(&mut events).unwrap();
+    }
+    assert_eq!(tokens_of(&events), first);
+}
