@@ -96,7 +96,22 @@ Later, and only for fast links. It needs an allreduce per layer (NCCL class), so
 1. Planner and in-process pipeline of several runtimes on one GPU, bit-identical to the single runtime (this change).
 2. Multi-GPU in one process: peer or staged copies.
 3. Stage server over QUIC or TCP, desktop RTX plus the Spark on the 27B.
-4. Serving integration (done): `PipelineExecutor` lets the scheduler drive a `Pipeline`. With `[placement] micro_batch = N` (default 256) a prefill chunk is cut into micro-batches and each stage runs on its own thread, so stage k works on micro-batch i while stage k+1 works on i-1. `/metrics` carries `inference_pipeline_*` series per stage (busy seconds, calls, tokens) and for hops and micro-batches. The model detail layer strip draws the planner's stage bands from `[placement]` in the app settings. A pipelined server needs `[[placement.devices]]` and a plan with more than one stage; it runs without MTP and without the prefix cache, and logs a warning at startup naming each one that the spec had on.
+4. Serving integration (done): `PipelineExecutor` lets the scheduler drive a `Pipeline`. With `[placement] micro_batch = N` (default 0, off) a prefill chunk is cut into micro-batches and each stage runs on its own thread, so stage k works on micro-batch i while stage k+1 works on i-1. `/metrics` carries `inference_pipeline_*` series per stage (busy seconds, calls, tokens) and for hops and micro-batches. The model detail layer strip draws the planner's stage bands from `[placement]` in the app settings. A pipelined server needs `[[placement.devices]]` and a plan with more than one stage; it runs without MTP and without the prefix cache, and logs a warning at startup naming each one that the spec had on.
 5. Discovery and re-planning.
 
 Slice 3 (stage server over TCP, measured on the 27B across the desktop and the Spark) is in `docs/specrt-stage-server.md`.
+
+## Micro-batch overlap measurement (slice 4)
+
+Qwen3-0.6B bf16, 2 stages of 14 layers on one RTX PRO 6000, direct hop (host staged inside a device, since both stages share the GPU), prefill of one sequence, 3 timed runs after a warm-up, the three settings alternating. Test: `micro_batch_overlap_timing_on_qwen3_0_6b` in `crates/specrt/tests/pipeline.rs`.
+
+| prompt | micro_batch 0 | 256 | 128 |
+|---|---|---|---|
+| 1024 tokens | 30.9 ms | 52.9 ms | 73.2 ms |
+| 4096 tokens | 121.1 ms | 217.8 ms | 343.6 ms |
+
+The overlap does not pay on one GPU: both stages compete for the same SMs and memory bandwidth, so there is nothing to hide, and each micro-batch adds a hop and stream syncs. It is 1.7-2.4x slower at 256 and 2.4-2.8x at 128, so the default is 0. The setting exists for stages on separate devices or hosts, where it is untested here (needs a second GPU or the Spark).
+
+## Real server check
+
+`inference-bench-server` with `[placement]` splitting Qwen3-0.6B into stages 0..14 and 14..28 (two planner devices on CUDA ordinal 0, `ordinal = 0` in `[[placement.devices]]`), `kv_cache_gb = 1.0`, `micro_batch = 32`. Four concurrent greedy chat completions (one with a 146 token prompt) gave text identical to a non-pipelined server. `/metrics` showed `inference_pipeline_stages 2`, 56 calls and 374 tokens per stage, 58 hops, 1531904 hop bytes and 4 micro-batches in 2 overlapped prefills. The non-pipelined server exports no `inference_pipeline_*` series.

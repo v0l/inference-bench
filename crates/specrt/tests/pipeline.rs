@@ -199,3 +199,35 @@ fn the_scheduler_drives_a_pipeline_with_micro_batched_prefill_and_matches_the_si
     assert!(chain.stages.iter().all(|s| s.calls > 0 && s.tokens > 0 && s.busy_secs > 0.0));
     assert!(chain.hops > 0 && chain.hop_bytes > 0);
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU and the HF weights, prints a table"]
+fn micro_batch_overlap_timing_on_qwen3_0_6b() {
+    let spec = named("qwen3-0.6b.toml");
+    let max_ctx: usize = 4608;
+    let pages = max_ctx.div_ceil(specrt::codegen::PAGE);
+    let layout = Layout { max_ctx, slots: 1, kv_blocks: pages, prefill_chunk: 4096, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let half = spec.layers.count / 2;
+    let mut pipe = Pipeline::load_ranges(&spec, &[(0, 0, half), (0, half, spec.layers.count)], layout, Hop::Direct).unwrap();
+    pipe.set_block_table(0, &(0..pages as u32).collect::<Vec<_>>()).unwrap();
+    for len in [1024usize, 4096] {
+        let prompt: Vec<u32> = (0..len as u32).map(|i| (i * 37 + 11) % spec.dims.vocab as u32).collect();
+        let mut times: std::collections::BTreeMap<usize, Vec<f64>> = Default::default();
+        for round in 0..4 {
+            for micro in [0usize, 256, 128] {
+                pipe.set_micro_batch(micro);
+                let began = std::time::Instant::now();
+                pipe.prefill(0, &prompt, 0, Some((Sampling::GREEDY, 0))).unwrap();
+                pipe.synchronize().unwrap();
+                let secs = began.elapsed().as_secs_f64();
+                if round > 0 {
+                    times.entry(micro).or_default().push(secs * 1e3);
+                }
+            }
+        }
+        for (micro, t) in &times {
+            let mean = t.iter().sum::<f64>() / t.len() as f64;
+            println!("TIMING prompt {len} micro_batch {micro}: {:?} ms mean {mean:.1}", t.iter().map(|v| format!("{v:.1}")).collect::<Vec<_>>());
+        }
+    }
+}

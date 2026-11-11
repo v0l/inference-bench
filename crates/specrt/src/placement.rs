@@ -45,6 +45,8 @@ pub struct DeviceConfig {
     pub bandwidth_gbs: f64,
     pub tflops: f64,
     #[serde(default)]
+    pub ordinal: Option<usize>,
+    #[serde(default)]
     pub reserve_gib: Option<f64>,
     #[serde(default)]
     pub link: LinkConfig,
@@ -80,7 +82,7 @@ pub struct PlacementConfig {
 
 impl Default for PlacementConfig {
     fn default() -> Self {
-        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: 256 }
+        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: 0 }
     }
 }
 
@@ -106,6 +108,7 @@ impl PlacementConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Device {
     pub name: String,
+    pub ordinal: Option<usize>,
     pub memory_bytes: u64,
     pub reserve_bytes: u64,
     pub bandwidth: f64,
@@ -121,6 +124,7 @@ impl Device {
         let offload = c.offload.unwrap_or(OffloadConfig { host_gib: 0.0, bandwidth_gbs: 1.0 });
         Device {
             name: c.name.clone(),
+            ordinal: c.ordinal,
             memory_bytes: (c.memory_gib * GIB) as u64,
             reserve_bytes: (c.reserve_gib.unwrap_or(DEFAULT_RESERVE_GIB) * GIB) as u64,
             bandwidth: c.bandwidth_gbs * 1e9,
@@ -224,6 +228,7 @@ impl CostModel {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Stage {
     pub device: usize,
+    pub ordinal: usize,
     pub device_name: String,
     pub start: usize,
     pub end: usize,
@@ -274,7 +279,7 @@ impl Placement {
     }
 
     pub fn ranges(&self) -> Vec<(usize, usize, usize)> {
-        self.stages.iter().map(|s| (s.device, s.start, s.end)).collect()
+        self.stages.iter().map(|s| (s.ordinal, s.start, s.end)).collect()
     }
 
     pub fn stage_of(&self, layer: usize) -> Option<usize> {
@@ -387,6 +392,7 @@ fn fit_stage(model: &CostModel, device_index: usize, device: &Device, start: usi
     Ok(StageFit {
         stage: Stage {
             device: device_index,
+            ordinal: device.ordinal.unwrap_or(device_index),
             device_name: device.name.clone(),
             start,
             end,
@@ -563,6 +569,7 @@ mod tests {
             memory_gib: gib,
             bandwidth_gbs: gbs,
             tflops: 1000.0,
+            ordinal: None,
             reserve_gib: Some(0.0),
             link: LinkConfig { latency_ms: 0.01, bandwidth_gbs: 25.0 },
             offload: None,
@@ -714,5 +721,34 @@ mod tests {
     fn the_hand_off_is_the_hidden_state_of_every_slot() {
         let m = CostModel::new(&qwen27(), 4096, 8);
         assert_eq!(m.hop_bytes(), (8 * 5120 * 4) as f64);
+    }
+
+    #[test]
+    fn two_planner_devices_can_share_a_cuda_ordinal() {
+        let spec = Spec::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/qwen3-0.6b.toml")).unwrap();
+        let toml_text = r#"
+            context = 512
+            [[devices]]
+            name = "a"
+            ordinal = 0
+            memory_gib = 8
+            bandwidth_gbs = 1000
+            tflops = 100
+            [[devices]]
+            name = "b"
+            ordinal = 0
+            memory_gib = 8
+            bandwidth_gbs = 1000
+            tflops = 100
+            [[stages]]
+            device = "a"
+            layers = [0, 10]
+            [[stages]]
+            device = "b"
+            layers = [10, 28]
+        "#;
+        let p = toml::from_str::<PlacementConfig>(toml_text).unwrap().place(&spec).unwrap();
+        assert_eq!(p.ranges(), vec![(0, 0, 10), (0, 10, 28)]);
+        assert_eq!(p.stages[1].device, 1);
     }
 }

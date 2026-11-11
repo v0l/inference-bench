@@ -244,14 +244,23 @@ impl Drop for Core {
 }
 
 fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>) -> Result<()> {
-    let pipelined = match &opts.placement {
-        Some(p) if !p.devices.is_empty() => {
-            let mut resolved = spec.clone();
-            opts.speculative.apply(&mut resolved)?;
-            let placed = p.place(&resolved)?;
-            (placed.stages.len() > 1).then_some((placed, p.micro_batch))
+    let planned = (|| -> Result<_> {
+        Ok(match &opts.placement {
+            Some(p) if !p.devices.is_empty() => {
+                let mut resolved = spec.clone();
+                opts.speculative.apply(&mut resolved)?;
+                let placed = p.place(&resolved)?;
+                (placed.stages.len() > 1).then_some((placed, p.micro_batch))
+            }
+            _ => None,
+        })
+    })();
+    let pipelined = match planned {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = ready.send(Err(e.context("[placement]")));
+            return Ok(());
         }
-        _ => None,
     };
     match pipelined {
         Some((placement, micro_batch)) => match build_pipeline(spec, &opts, &placement, micro_batch) {
