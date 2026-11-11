@@ -177,6 +177,19 @@ enum Cmd {
         #[arg(long, help = "Print the report as JSON")]
         json: bool,
     },
+    #[command(about = "Plan how a model splits into pipeline stages across the devices of a server config")]
+    Plan {
+        #[arg(long, help = "Spec name or path")]
+        spec: String,
+        #[arg(long, help = "Server config with a [placement] section")]
+        config: PathBuf,
+        #[arg(long, help = "Override [placement] context")]
+        context: Option<usize>,
+        #[arg(long, help = "Override [placement] slots")]
+        slots: Option<usize>,
+        #[arg(long, help = "latency or throughput")]
+        objective: Option<String>,
+    },
     #[command(about = "Spec files: where each comes from, and updates from GitHub")]
     Specs {
         #[command(subcommand)]
@@ -214,6 +227,27 @@ fn specs_command(data: &Path, cmd: &SpecsCmd) -> Result<()> {
             println!("rolled back to {} fetched {}", g.short_commit(), g.fetched_at.format("%Y-%m-%d %H:%M UTC"));
         }
     }
+    Ok(())
+}
+
+fn plan_command(data: &Path, spec: &str, config: &Path, context: Option<usize>, slots: Option<usize>, objective: Option<&str>) -> Result<()> {
+    use inference_bench_core::specrt_placement::Objective;
+    let path = resolve_spec_names(data, spec);
+    let spec = inference_bench_core::specrt_spec::Spec::load(Path::new(&path))?;
+    let mut placement = inference_bench_server::ServerConfig::load(config)?.placement;
+    if let Some(c) = context {
+        placement.context = c;
+    }
+    if let Some(s) = slots {
+        placement.slots = s;
+    }
+    match objective {
+        Some("latency") => placement.objective = Objective::Latency,
+        Some("throughput") => placement.objective = Objective::Throughput,
+        Some(other) => bail!("objective {other:?} is not latency or throughput"),
+        None => {}
+    }
+    print!("{}", placement.place(&spec)?.render());
     Ok(())
 }
 
@@ -415,6 +449,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Specs { cmd } => specs_command(&data, cmd)?,
+        Cmd::Plan { spec, config, context, slots, objective } => plan_command(&data, spec, config, *context, *slots, objective.as_deref())?,
     }
     Ok(())
 }

@@ -10,6 +10,7 @@ pub mod gguf;
 pub mod jit;
 pub mod mtp;
 pub mod nvfp4;
+pub mod pipeline;
 pub mod plan;
 pub mod placement;
 pub mod prefix;
