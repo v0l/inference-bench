@@ -202,3 +202,24 @@ Estimated effort (my guess, not measured): the delta-net layers and NVFP4 are ea
 - Throughput lines are the engine's own 10 s averages (`loggers.py`), parsed from the journal. "Running" is the number of requests in the batch at the time of the line.
 - Windows with `Running: 1` and zero prompt throughput are the single-stream sample; windows with prefill in them are excluded from it.
 - The journal also holds earlier deployments (Solstice-AI and FP8 variants of the same model, and runs from 26 Oct). The tables use all windows; the launch and startup facts are from the 7 Nov 11:41 start, which is the current service.
+
+#551, prefill serving default and flash_mma. The server specs are now the activation-quantised ones: `qwen3.8-27b.toml` (FP8 projections, `act_quant = "fp8"`) and `qwen3.8-27b-nvfp4.toml` (FP8 projections, FP4 MLP). The old weight-only specs are `qwen3.8-27b-exact.toml` and `qwen3.8-27b-nvfp4-exact.toml`, used by the exact-reference tests (`SPECRT_27B_SPEC` defaults to them). Gates on this branch: `real27b` weight-only reference (exact spec) greedy 5 of 5 prompts for 32 tokens, logits error 2e-4; act spec KL 1.08e-3 against the 1.5x gate of 0.86e-3, top-1 0.983, greedy 3 of 5 (the two misses are near ties, margins 0.10 and 0.17, as before); NVFP4 act spec against vLLM KL mean 0.0126, teacher-forced top-1 1,220 of 1,280. Non-27B suite: 0 failures (the jit tests need free disk, the MTP reference file comes from `reference.py tiny-mtp`).
+
+flash_mma with 1-plane KV: 3 pipeline stages of 32 keys (was 2 stages, since the lo plane's smem is unused), and the Q staging buffer is bf16-free f32 half tiles (8 rows at a time), so smem is 48 KB. Kernel time, `tests/flash_speed.rs` (2,048 query tokens, head_dim 256, 24:4 heads, CUDA events, min of 10, GPU shared with vLLM):
+
+| keys before the chunk | before | after |
+|---|---|---|
+| 16,384 | 7.4 ms, 119 TFLOP/s | 5.5 ms, 160 TFLOP/s |
+| 30,720 | 17.4 ms, 92 TFLOP/s | 10.3 ms, 156 TFLOP/s |
+
+Sweeps of keys per tile (16, 32, 64) and stages (2, 3, 4) at 16k found 32 keys with 3 stages best; 4 stages and 64 keys do not fit or are slower.
+
+End to end, `prefixbench long`, cold, interleaved, 3 rounds (`scripts/ab517.sh`), master `-exact` vs this branch's default. The served vLLM was at 90-100% GPU util the whole time, so the values swing between rounds (the first two rounds of the branch arm ran against heavier vLLM traffic):
+
+| prompt | master weight-only, tok/s (3 runs) | branch default, tok/s (3 runs) |
+|---|---|---|
+| 4,096 | 786 (1,470, 824, 786) | 3,802 (2,165, 3,802, 3,952) |
+| 32,768 | 768 (772, 746, 768) | 1,849 (1,849, 1,797, 3,433) |
+| 65,536 | 700 (700, 693, 710) | 1,612 (1,567, 1,612, 2,511) |
+
+Best branch values (3,952 / 3,433 / 2,511) are 45% / 50% / 47% of the vLLM quiet-GPU column (8,781 / 6,849 / 5,332). The 70% / 60% targets are not met: GEMM is still about 50% of prefill kernel time (`gate_up_f8_huge` 20%, `down` 10%, `lin_in` 7%, #441 owns that), then `flash_mma` 8% at 16k, `gdn_chunk_scan` 6.7%, `gdn_chunk_prep` 4%, `quant_rows_fp8` 3%. nsys of 32k before the flash change (branch default): `gate_up_f8_huge` 20.6%, `flash_mma` 20.1% (15.1 ms mean per call), `down_f8_huge` 10.9%, `gdn_chunk_scan` 6.8%, `lin_in_f8_huge` 6.7%, `gdn_chunk_prep` 4.2%, `quant_rows_fp8` 3.0%. `scripts/flashprof.sh` reproduces the table. 128k and 260k, chunk size 4k/8k and two-stream overlap were not measured.
