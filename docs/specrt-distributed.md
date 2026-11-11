@@ -75,6 +75,10 @@ link = { latency_ms = 0.3, bandwidth_gbs = 1.1 }
 
 One process, one runtime per device. The hand-off is `Runtime::hand_off`: a device copy when both stages share a device, `cuMemcpyPeerAsync` when peer access exists, and host staging (`export_hidden` / `import_hidden`) otherwise. Staging is also the wire path of the multi-host case, so it is tested in slice 1.
 
+The cross-device copy is `specrt::link::DeviceLink`. `LinkMode::Peer` enables peer access both ways and runs `cuMemcpyPeerAsync` on the destination stream; `LinkMode::Staged` goes device to pinned host to device. Both order the copy with events so the destination stream waits for the source stream's earlier work. `hand_off` picks the mode with `cuDeviceCanAccessPeer`.
+
+Tests in `crates/specrt/tests/link.rs` (ignored, need a GPU) run both modes between two contexts on ordinal 0, which emulates two devices on a one-GPU host, and check that two runtimes in one process agree. Real peer and staged bandwidth has not been measured: it needs a host with two GPUs.
+
 ## Multi host (slice 3)
 
 A stage server process runs a layer range. The coordinator opens a stream to each stage and sends: hidden rows (or token ids to stage 0), slot ids, positions, free and cancel. Downstream stages start first and stage 0 is published when the chain is ready. QUIC (quinn) with a pre-shared key is the target; plain TCP behind config is acceptable for the first cut. A stage loss fails in-flight requests and triggers a re-plan.

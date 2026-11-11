@@ -69,8 +69,9 @@ impl Runtime {
     pub fn hand_off(&self, next: &mut Runtime, rows: usize) -> Result<()> {
         ensure!(self.spec.dims.hidden == next.spec.dims.hidden, "stages disagree on the hidden size");
         if self.device_ordinal() != next.device_ordinal() {
-            let staged = self.export_hidden(rows)?;
-            return next.import_hidden(&staged);
+            let n = rows * self.spec.dims.hidden;
+            let link = crate::link::DeviceLink::new(&self.ctx, &next.ctx)?;
+            return link.copy(&self.pre.x, &self.stream, &mut next.pre.x, &next.stream, n);
         }
         let n = rows * self.spec.dims.hidden;
         ensure!(n <= next.pre.x.len(), "hidden state of {n} floats exceeds the next stage");

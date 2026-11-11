@@ -8,6 +8,7 @@ pub mod engine;
 pub mod executor;
 pub mod gguf;
 pub mod jit;
+pub mod link;
 pub mod mtp;
 pub mod nvfp4;
 pub mod pipeline;

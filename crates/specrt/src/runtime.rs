@@ -828,6 +828,14 @@ impl Runtime {
         self.slots
     }
 
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.ctx
+    }
+
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
     pub fn spec(&self) -> &Spec {
         &self.spec
     }
