@@ -178,13 +178,15 @@ impl RuntimeStage {
             let sample = role.last.then_some((Sampling::GREEDY, 0));
             rt.prefill_slot(st, slot as usize, &tokens, position as usize, sample)?.unwrap_or(0)
         };
-        let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         if role.last {
+            let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
             return Ok(Message::Token { token, compute_us });
         }
         let h = rt.export_hidden(rows)?;
+        let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         Ok(Message::Output { rows: rows as u32, data: f32_bytes(&h), compute_us })
     }
+
     fn decode_batch(&self, slots: Vec<u32>, positions: Vec<u32>, input: Input) -> Result<Message> {
         let started = Instant::now();
         ensure!(!slots.is_empty() && slots.len() == positions.len(), "a decode batch needs one position per slot");
@@ -210,11 +212,12 @@ impl RuntimeStage {
             .map(|i| DecodeRow { slot: slots[i] as usize, token: tokens[i], pos: positions[i] as usize, sampling: Sampling::GREEDY, step: 0 })
             .collect();
         let out = rt.decode(st, &batch)?;
-        let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         if role.last {
+            let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
             return Ok(Message::Tokens { tokens: out, compute_us });
         }
         let h = rt.export_hidden(rows)?;
+        let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
         Ok(Message::Output { rows: rows as u32, data: f32_bytes(&h), compute_us })
     }
 }

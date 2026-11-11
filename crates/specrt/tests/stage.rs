@@ -118,3 +118,16 @@ fn stage_specs_cut_the_pattern_and_the_quant_boundary() {
     assert!(head.mtp.is_none());
     assert_eq!(head.mlp_quant(39), spec.mlp_quant(39));
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_first_stage_reports_its_gpu_time_for_prefill_not_just_the_launch() {
+    let spec = spec_for("tiny-qwen3.5");
+    let p = prompt(500);
+    let mut c = cluster(&spec, &[1], 1024, 1);
+    generate(&mut c.chain, 0, &p, 2, 500).unwrap();
+    let got = generate(&mut c.chain, 0, &p, 2, 500).unwrap();
+    let step = &got.prefill_steps[0];
+    let (compute, round) = (step.compute[0].as_secs_f64(), step.stage[0].as_secs_f64());
+    assert!(compute >= 0.5 * round, "stage 0 reported {compute} s of compute in a {round} s round trip");
+}
