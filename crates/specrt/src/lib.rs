@@ -18,6 +18,7 @@ pub mod pipeline;
 pub mod plan;
 pub mod placement;
 pub mod prefix;
+pub mod remote;
 pub mod runtime;
 pub mod sched;
 pub mod serve;

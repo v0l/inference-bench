@@ -19,6 +19,7 @@ pub struct Coordinator {
     chain: Option<Chain>,
     last_error: Option<String>,
     replans: u64,
+    generation: u64,
 }
 
 impl Coordinator {
@@ -40,6 +41,7 @@ impl Coordinator {
             chain: None,
             last_error: None,
             replans: 0,
+            generation: 0,
         };
         c.replan();
         Ok(c)
@@ -57,6 +59,26 @@ impl Coordinator {
         self.replans
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn connect_chain(&mut self) -> Result<Chain> {
+        self.poll();
+        if self.chain.is_none() {
+            if self.placement.is_none() {
+                bail!("no placement: {}", self.last_error.as_deref().unwrap_or("no stages known"));
+            }
+            self.connect()?;
+        }
+        Ok(self.chain.take().expect("connected"))
+    }
+
+    fn stage_addresses(&self) -> Vec<Option<String>> {
+        let Some(p) = &self.placement else { return Vec::new() };
+        p.stages.iter().map(|s| self.members.members().iter().find(|m| m.device.name == s.device_name).and_then(|m| m.address.clone())).collect()
+    }
+
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
@@ -71,11 +93,15 @@ impl Coordinator {
 
     pub fn apply(&mut self, event: Event) -> Option<Replan> {
         let before = self.placement.clone();
+        let before_addresses = self.stage_addresses();
         if !self.members.apply(event) {
             return None;
         }
         self.chain = None;
         self.replan();
+        if before_addresses != self.stage_addresses() {
+            self.generation += 1;
+        }
         Some(match (&before, &self.placement) {
             (Some(old), Some(new)) => diff(old, new),
             _ => Replan { moved_stages: self.placement.as_ref().map_or(0, |p| p.stages.len()), unchanged: false },
@@ -89,12 +115,14 @@ impl Coordinator {
             Ok(new) => {
                 if previous.as_ref().is_none_or(|old| !diff(old, &new).unchanged) {
                     self.chain = None;
+                    self.generation += 1;
                 }
                 self.placement = Some(new);
                 self.last_error = None;
             }
             Err(e) => {
                 self.chain = None;
+                self.generation += 1;
                 self.last_error = Some(format!("{e:#}"));
             }
         }

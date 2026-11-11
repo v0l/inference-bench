@@ -114,6 +114,9 @@ pub trait Executor {
     fn flush(&mut self) -> Result<()> {
         Ok(())
     }
+    fn refresh(&mut self) -> Option<String> {
+        None
+    }
     fn draft_tokens(&self) -> usize {
         0
     }

@@ -56,7 +56,7 @@ fn default_timeout_ms() -> u64 {
     600_000
 }
 
-fn read_key(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Vec<u8>> {
+pub(crate) fn read_key(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Vec<u8>> {
     let key = match (inline, file) {
         (Some(k), None) => k.clone().into_bytes(),
         (None, Some(f)) => std::fs::read_to_string(f).with_context(|| f.display().to_string())?.trim().as_bytes().to_vec(),

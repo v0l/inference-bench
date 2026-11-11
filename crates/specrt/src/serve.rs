@@ -244,6 +244,18 @@ impl Drop for Core {
 }
 
 fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>) -> Result<()> {
+    if opts.placement.as_ref().is_some_and(|p| p.remote.is_some()) {
+        match build_remote(spec, &opts) {
+            Ok(mut sched) => {
+                let _ = ready.send(Ok(false));
+                run(&mut sched, inbox, stats);
+            }
+            Err(e) => {
+                let _ = ready.send(Err(e.context("[placement.remote]")));
+            }
+        }
+        return Ok(());
+    }
     let planned = (|| -> Result<_> {
         Ok(match &opts.placement {
             Some(p) if !p.devices.is_empty() => {
@@ -315,6 +327,29 @@ fn build_pipeline(spec: &Spec, opts: &ServeOptions, placement: &crate::placement
     let mut cfg = serving_config(spec, opts);
     cfg.prefix_cache.enabled = false;
     Ok(Scheduler::new(PipelineExecutor::new(pipe), cfg))
+}
+
+fn build_remote(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::remote::ChainExecutor>> {
+    let mut spec = spec.clone();
+    opts.speculative.apply(&mut spec)?;
+    spec.mtp = None;
+    let placement = opts.placement.as_ref().context("remote serving needs [placement]")?;
+    let remote = placement.remote.as_ref().context("remote serving needs [placement.remote]")?;
+    let coordinator = crate::coordinator::Coordinator::new(
+        &spec,
+        placement.clone(),
+        remote.key()?,
+        Duration::from_millis(remote.timeout_ms),
+        Duration::from_millis(remote.member_ttl_ms),
+    )?;
+    let layout = opts.layout(&spec);
+    let mut exec = crate::remote::ChainExecutor::new(coordinator, layout.max_ctx, layout.slots, layout.prefill_chunk);
+    if let Err(e) = exec.connect() {
+        tracing::warn!(error = %format!("{e:#}"), "remote stages are not ready yet, connecting on the first request");
+    }
+    let mut cfg = serving_config(&spec, opts);
+    cfg.prefix_cache.enabled = false;
+    Ok(Scheduler::new(exec, cfg))
 }
 
 fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
@@ -404,6 +439,19 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         }
         if !open && live.is_empty() {
             break;
+        }
+        if let Some(reason) = sched.exec.refresh() {
+            if !live.is_empty() {
+                tracing::error!(%reason, "stage chain changed, failing in-flight requests");
+                let mut drop_events = Vec::new();
+                for id in live.keys().copied().collect::<Vec<_>>() {
+                    sched.cancel(id, &mut drop_events);
+                }
+                for (_, l) in live.drain() {
+                    let _ = l.events.send(SeqEvent::Failed(reason.clone()));
+                }
+                continue;
+            }
         }
         let started = Instant::now();
         let report = if sched.idle() { Ok(None) } else { sched.step(&mut events).map(Some) };

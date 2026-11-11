@@ -80,6 +80,31 @@ pub struct StageConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteConfig {
+    pub key: Option<String>,
+    pub key_file: Option<std::path::PathBuf>,
+    #[serde(default = "default_remote_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "default_member_ttl_ms")]
+    pub member_ttl_ms: u64,
+}
+
+fn default_remote_timeout_ms() -> u64 {
+    600_000
+}
+
+fn default_member_ttl_ms() -> u64 {
+    30_000
+}
+
+impl RemoteConfig {
+    pub fn key(&self) -> Result<Vec<u8>> {
+        crate::stage::read_key(&self.key, &self.key_file)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlacementConfig {
     pub objective: Objective,
@@ -90,11 +115,12 @@ pub struct PlacementConfig {
     pub micro_batch: usize,
     pub discovery: Discovery,
     pub mdns_port: u16,
+    pub remote: Option<RemoteConfig>,
 }
 
 impl Default for PlacementConfig {
     fn default() -> Self {
-        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: 0, discovery: Discovery::Static, mdns_port: 5353 }
+        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: 0, discovery: Discovery::Static, mdns_port: 5353, remote: None }
     }
 }
 
