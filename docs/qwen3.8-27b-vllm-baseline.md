@@ -234,3 +234,16 @@ Best branch values (3,952 / 3,433 / 2,511) are 45% / 50% / 47% of the vLLM quiet
 | 260,000 | n/a | 1,694, 1,712, 1,731 | | 2,383 | 72% |
 
 The server specs set `[runtime] prefill_chunk = 4096` (new spec option, default 2,048): 8% to 10% faster at 32k and 128k; 8k chunks add nothing over 4k. Targets: 128k (69%) and 260k (72%, 2,048 chunk) meet the 60% bar; 4k (45%) and 32k (54%) miss the 70% bar. At those lengths the remaining gap is the GEMMs (`gate_up_f8_huge` 20%, `down` 10%, `lin_in` 7% of kernel time, #441) plus `gdn_chunk_scan` 6.7% and `gdn_chunk_prep` 4%. Not done: two-stream overlap of the delta-net scan with attention, split-KV attention, K/V sharing across the 6 query heads of a group, and fixing the gdn kernels; the flash kernel reaches 140 to 170 TFLOP/s at head_dim 256 (FA2-class on this GPU is not measured here).
+
+#551 final quiet-GPU A/B, run through `crates/specrt/scripts/quiet_window.sh` (takes `/tmp/gpu27.lock`, stops local-llm, restarts it in an EXIT/INT/TERM trap, polls :8001 and sends one chat request; tested with a command exiting 7 and with a SIGTERM, the service came back both times). GPU 2.6 GB used, 2% util at the start. Master is the weight-only 27B spec before this issue; branch is the serving default with `prefill_chunk = 4096`. Two interleaved rounds, all values, cold `prefixbench long`:
+
+| prompt | master tok/s | branch tok/s | vLLM quiet | branch / vLLM (best) |
+|---|---|---|---|---|
+| 4,096 | 1,639, 1,582 | 4,102, 4,220 | 8,781 | 48% |
+| 32,768 | 1,455, 1,427 | 3,639, 3,719 | 6,849 | 54% |
+| 131,072 | 1,095 (one run) | 2,601, 2,610 | 3,764 | 69% |
+| 260,000 | n/a | 1,888, 1,879 | 2,383 | 79% |
+
+128k and 260k meet the 60% bar; 4k and 32k are below 70%. Gates in the same window, `real27b` with `--include-ignored --test-threads=1`: act default (`SPECRT_27B_SPEC=qwen3.8-27b`, NVFP4 act spec for the vLLM test) `test result: ok. 10 passed; 0 failed; finished in 283.48s`; exact specs (`qwen3.8-27b-exact`, `qwen3.8-27b-nvfp4-exact`) `test result: ok. 10 passed; 0 failed; finished in 425.25s`. The MTP tests are among the ten.
+
+Attention experiments that did not clear the 10% bar: skipping the per-element causal mask on tiles fully below the diagonal left `flash_mma` at 5.0 ms (16k keys) and 9.5 ms (30k keys), unchanged, so it was reverted. 128 query rows per CTA already shares each K/V tile across 8 warps; sharing it across the 6 query heads of a group, split-KV and the two-stream scan/attention overlap are not implemented. At 32k `flash_mma` is 12.7% of kernel time (170 calls), `gate_up_f8_huge` 22.7%, `down` 11.2%, `gdn_chunk_scan` 7.7%, `lin_in` 7.7%, `gdn_chunk_prep` 4.4%, `quant_rows_fp8` 3.3%.
