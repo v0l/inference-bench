@@ -47,11 +47,15 @@ fn top1_agreement(p: &[f32], q: &[f32], vocab: usize) -> f64 {
 }
 
 fn full_spec() -> Spec {
-    named_spec("qwen3.8-27b-exact")
+    named_spec("SPECRT_27B_SPEC", "qwen3.8-27b-exact")
 }
 
-fn named_spec(default: &str) -> Spec {
-    let name = std::env::var("SPECRT_27B_SPEC").unwrap_or_else(|_| default.into());
+fn nvfp4_spec() -> Spec {
+    named_spec("SPECRT_27B_NVFP4_SPEC", "qwen3.8-27b-nvfp4")
+}
+
+fn named_spec(var: &str, default: &str) -> Spec {
+    let name = std::env::var(var).unwrap_or_else(|_| default.into());
     Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.toml"))).unwrap().with_env_overrides()
 }
 
@@ -131,8 +135,8 @@ fn real_27b_generates_greedy_and_dumps_logits() {
 #[test]
 #[ignore = "needs about 25 GB of free GPU memory, the NVFP4 checkpoint and scripts/vllm_logprobs.py output"]
 fn real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs() {
-    let spec = named_spec("qwen3.8-27b-nvfp4");
-    assert_eq!(spec.mlp.quant, Some(Quant::Nvfp4G16), "SPECRT_27B_SPEC must name an NVFP4 spec for the vLLM comparison");
+    let spec = nvfp4_spec();
+    assert_eq!(spec.mlp.quant, Some(Quant::Nvfp4G16), "SPECRT_27B_NVFP4_SPEC must name an NVFP4 spec for the vLLM comparison");
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out_dir().join("vllm-nvfp4.json")).unwrap()).unwrap();
     let new = meta["new_tokens"].as_u64().unwrap() as usize;
@@ -256,7 +260,7 @@ fn real_27b_mtp_weights_load_from_both_checkpoints_with_fp8_dequantised_to_bf16(
 #[test]
 #[ignore = "needs about 26 GB of free GPU memory, the NVFP4 27B checkpoint and vllm-spec-greedy.json; then scripts/reference.py real-mtp"]
 fn real_27b_mtp_dumps_hiddens_and_draft_logits_for_the_cpu_oracle() {
-    let spec = named_spec("qwen3.8-27b-nvfp4-exact");
+    let spec = nvfp4_spec();
     let recs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out_dir().join("vllm-spec-greedy.json")).unwrap()).unwrap();
     let mut rt = Runtime::load(&spec, 1024).unwrap();
     let mut records = Vec::new();
@@ -285,7 +289,7 @@ fn real_27b_mtp_acceptance_on_an_isolated_vllms_greedy_tokens() {
 }
 
 fn teacher_forced(file: &str) {
-    let spec = named_spec("qwen3.8-27b-nvfp4-exact");
+    let spec = nvfp4_spec();
     let k = spec.mtp.as_ref().unwrap().draft_tokens;
     let recs: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(out_dir().join(file)).unwrap()).unwrap();
     let mut rt = Runtime::load(&spec, 1024).unwrap();
@@ -316,7 +320,7 @@ fn teacher_forced(file: &str) {
 #[test]
 #[ignore = "needs about 25 GB of free GPU memory and scripts/reference.py real-full output"]
 fn real_27b_per_layer_trace_matches_the_cpu_oracle() {
-    let spec = full_spec();
+    let spec = named_spec("SPECRT_27B_TRACE_SPEC", "qwen3.8-27b-exact");
     let meta: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(out_dir().join("real27b-ref.json")).unwrap()).unwrap();
     let seq = ids(&meta["sequences"][0]);
