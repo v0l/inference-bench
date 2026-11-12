@@ -21,7 +21,7 @@ fn flash_mma_prefill_attention_speed() {
     let jit = Jit::new(ctx.clone(), std::env::temp_dir().join(format!("specrt-flash-speed-{}", std::process::id()))).unwrap();
     let stream = ctx.default_stream();
     let tokens = list("SPECRT_FLASH_TOKENS", "2048")[0];
-    let max_ctx = 32768usize;
+    let max_ctx = list("SPECRT_FLASH_CTX", "32768")[0];
     let layers = spec.kv_layers();
     let blocks = max_ctx / 16;
     let module = Module::generate_kv(&spec, max_ctx, 1).unwrap();
@@ -51,6 +51,11 @@ fn flash_mma_prefill_attention_speed() {
                         .replace(&base_text, &format!("constexpr int FM_BK = {bk};"))
                         .replace(&format!("constexpr int FM_STAGES = {};", specrt::codegen::flash_stages(a.head_dim, 1)), &format!("constexpr int FM_STAGES = {stages};"))
                         .replace(&format!("constexpr int FM_WARPS = {};", specrt::codegen::flash_rows(a.head_dim) / 16), &format!("constexpr int FM_WARPS = {warps};"));
+                    if std::env::var("SPECRT_FLASH_NOLOAD").is_ok() {
+                        let patched = m.source.replace("cp_async16_zfill(dst, src + c * 8, tk < key_end);", "(void)dst; (void)src;");
+                        assert_ne!(patched, m.source);
+                        m.source = patched;
+                    }
                     let smem = (stages * 2 * bk * a.head_dim * 2).max(warps * 16 * a.head_dim * 2) as u32;
                     let loaded = jit.load(&m).unwrap();
                     let f = loaded.function("flash_mma").unwrap();
