@@ -8,10 +8,12 @@ unit=${QUIET_WINDOW_UNIT:-local-llm.service}
 port=${QUIET_WINDOW_PORT:-8001}
 lock=${QUIET_WINDOW_LOCK:-/tmp/gpu27.lock}
 wait_s=${QUIET_WINDOW_WAIT_S:-900}
+max_s=${QUIET_WINDOW_MAX_S:-3000}
 log() { echo "[quiet_window $(date +%T)] $*" >&2; }
 
 exec 9>"$lock"
 flock 9
+export GPU27_LOCK_HELD=1
 
 child=0
 restarted=0
@@ -53,10 +55,11 @@ sudo systemctl stop "$unit"
 sleep 5
 log "gpu: $(nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader)"
 
-"$@" &
+timeout --signal=TERM --kill-after=30 "$max_s" "$@" &
 child=$!
 wait "$child"
 rc=$?
 child=0
+[ "$rc" = 124 ] && log "command cut at the ${max_s}s timeout"
 log "command exited $rc"
 exit "$rc"

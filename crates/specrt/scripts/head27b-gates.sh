@@ -16,7 +16,7 @@ gpu() {
     name=$1
     shift
     guard "$name"
-    flock /tmp/gpu27.lock env SPECRT_27B_SPEC="$name" nice -n 15 "$T" --ignored --exact --nocapture "$@" 2>&1 | grep -vE "^\s*$"
+    "$(dirname "$0")/gpulock.sh" env SPECRT_27B_SPEC="$name" nice -n 15 "$T" --ignored --exact --nocapture "$@" 2>&1 | grep -vE "^\s*$"
 }
 gpu qwen3.8-27b-nvfp4 real_27b_generates_greedy_and_dumps_logits
 if [ ! -f "$SPECRT_REF_DIR/real27b-ref.logits.bin" ]; then

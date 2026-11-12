@@ -10,7 +10,7 @@ for spec in ${SPECS:-qwen3.8-27b-nvfp4 qwen3.8-27b-nvfp4-head-fp8 qwen3.8-27b-nv
         sleep 20
     done
     echo "== $spec free $free MiB $(date +%T)"
-    flock /tmp/gpu27.lock bash -c '
+    "$(dirname "$0")/gpulock.sh" bash -c '
         f=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
         [ "$f" -ge 36000 ] || { echo "free $f MiB under the lock, skipped"; exit 1; }
         SPECRT_27B_SPEC='"$spec"' nice -n 15 '"$T"' --ignored --exact --nocapture real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs

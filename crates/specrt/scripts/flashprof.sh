@@ -6,7 +6,7 @@ spec=${SPEC:-$here/tests/fixtures/qwen3.8-27b.toml}
 len=${LEN:-16384}
 out=${OUT:-/tmp/flashprof}
 mkdir -p "$out"
-flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -p MemoryMax=16G -p MemorySwapMax=0 --working-directory="$here" \
+"$(dirname "$0")/gpulock.sh" systemd-run --user --wait --collect -P -p MemoryMax=16G -p MemorySwapMax=0 --working-directory="$here" \
     nsys profile -o "$out/p" -f true --stats=false "$bin" "$spec" long on 0 6 "$len" 2>&1 | grep -E "SUMMARY.*cold|rror|Failed|not found"
 nsys stats --force-export=true -r cuda_gpu_kern_sum --format csv "$out/p.nsys-rep" 2>/dev/null | python3 -c "
 import sys,csv

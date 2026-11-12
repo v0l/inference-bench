@@ -8,7 +8,7 @@ branch_spec=${BRANCH_SPEC:-$here/../tests/fixtures/qwen3.8-27b.toml}
 lengths=${LENGTHS:-4096,32768,65536}
 rounds=${ROUNDS:-3}
 kv_gb=${KV_GB:-6}
-run() { flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -p MemoryMax=16G -p MemorySwapMax=0 "$@"; }
+run() { "$(dirname "$0")/gpulock.sh" systemd-run --user --wait --collect -P -p MemoryMax=16G -p MemorySwapMax=0 "$@"; }
 for r in $(seq "$rounds"); do
     echo "round $r base"
     run "$base" "$base_spec" long on 0 "$kv_gb" "$lengths" 2>&1 | grep -v "^\s*$" | grep -iv warn
