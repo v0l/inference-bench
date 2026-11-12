@@ -729,6 +729,12 @@ call is 603 us min (605 TFLOP/s) against vLLM's 504 us, so the remaining gap is 
 `[runtime] fp4_tile` now also needs bn a multiple of 16 * wn (B fragments load two n tiles per
 ldmatrix).
 
+Gates: `gate_up` output is bit-identical to the #432 kernel on random 27B-shaped data; the non-27B
+suite with `--include-ignored` passes (352 tests); real 27B `real_27b_nvfp4_agrees_with_vllm_greedy_and_logprobs`
+gives the same report on base and branch (top-1 1,220/1,280, mean KL 0.0126, greedy prefixes
+unchanged), and `real_27b_nvfp4_first_layers_match_the_dequantised_checkpoint` and
+`real_27b_generates_greedy_and_dumps_logits` pass.
+
 ### Tried and dropped
 
 Same isolated test, GPU shared with the served vLLM, each against the default in the same run:
