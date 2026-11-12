@@ -342,6 +342,7 @@ fn act_quant_fields_default_to_none_round_trip_and_match_the_act_fixtures() {
     same.min_engine = plain.min_engine;
     same.act_quant = ActQuant::None;
     same.mlp.act_quant = ActQuant::None;
+    same.runtime = plain.runtime.clone();
     assert_eq!(same, plain);
     let fp8 = Spec::load(&root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
     assert_eq!((fp8.act_quant, fp8.mlp.act_quant), (ActQuant::Fp8, ActQuant::None));

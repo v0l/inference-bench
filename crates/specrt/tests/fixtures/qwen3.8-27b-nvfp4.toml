@@ -51,3 +51,6 @@ conv_kernel = 4
 layers = 1
 draft_tokens = 2
 speculate = true
+
+[runtime]
+prefill_chunk = 4096

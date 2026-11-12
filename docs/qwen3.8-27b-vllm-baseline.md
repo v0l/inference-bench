@@ -223,3 +223,14 @@ End to end, `prefixbench long`, cold, interleaved, 3 rounds (`scripts/ab517.sh`)
 | 65,536 | 700 (700, 693, 710) | 1,612 (1,567, 1,612, 2,511) |
 
 Best branch values (3,952 / 3,433 / 2,511) are 45% / 50% / 47% of the vLLM quiet-GPU column (8,781 / 6,849 / 5,332). The 70% / 60% targets are not met: GEMM is still about 50% of prefill kernel time (`gate_up_f8_huge` 20%, `down` 10%, `lin_in` 7%, #441 owns that), then `flash_mma` 8% at 16k, `gdn_chunk_scan` 6.7%, `gdn_chunk_prep` 4%, `quant_rows_fp8` 3%. nsys of 32k before the flash change (branch default): `gate_up_f8_huge` 20.6%, `flash_mma` 20.1% (15.1 ms mean per call), `down_f8_huge` 10.9%, `gdn_chunk_scan` 6.8%, `lin_in_f8_huge` 6.7%, `gdn_chunk_prep` 4.2%, `quant_rows_fp8` 3.0%. `scripts/flashprof.sh` reproduces the table. 128k and 260k, chunk size 4k/8k and two-stream overlap were not measured.
+
+#551, quiet-GPU window (local-llm stopped, GPU 2.5 GB used, 13% util at the start, `flock /tmp/gpu27.lock` held, service restarted and answering a chat request afterwards). `prefixbench long`, cold, 1-plane bf16 KV, 3 interleaved rounds, all values. master is the weight-only spec before this issue; branch is the serving default (`qwen3.8-27b.toml`, 2,048-token chunk) with the 3-stage 128-row `flash_mma`. These are quiet-GPU numbers.
+
+| prompt | master tok/s | branch tok/s | branch, 4,096 chunk | vLLM quiet | branch share of vLLM |
+|---|---|---|---|---|---|
+| 4,096 | 1,541, 1,527, 1,528 | 4,018, 3,954, 3,952 | | 8,781 | 45% |
+| 32,768 | 1,379, 1,372, 1,374 | 3,464, 3,434, 3,439 | 3,732 | 6,849 | 50% (54% at 4k chunk) |
+| 131,072 | 1,070 (one run) | 2,370, 2,372, 2,365 | 2,596 (8k chunk 2,615) | 3,764 | 63% (69% at 4k chunk) |
+| 260,000 | n/a | 1,694, 1,712, 1,731 | | 2,383 | 72% |
+
+The server specs set `[runtime] prefill_chunk = 4096` (new spec option, default 2,048): 8% to 10% faster at 32k and 128k; 8k chunks add nothing over 4k. Targets: 128k (69%) and 260k (72%, 2,048 chunk) meet the 60% bar; 4k (45%) and 32k (54%) miss the 70% bar. At those lengths the remaining gap is the GEMMs (`gate_up_f8_huge` 20%, `down` 10%, `lin_in` 7% of kernel time, #441) plus `gdn_chunk_scan` 6.7% and `gdn_chunk_prep` 4%. Not done: two-stream overlap of the delta-net scan with attention, split-KV attention, K/V sharing across the 6 query heads of a group, and fixing the gdn kernels; the flash kernel reaches 140 to 170 TFLOP/s at head_dim 256 (FA2-class on this GPU is not measured here).
