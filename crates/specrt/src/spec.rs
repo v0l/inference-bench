@@ -171,6 +171,9 @@ impl RuntimeOptions {
                 );
             }
         }
+        if let Some([bm, bn, wm, wn]) = self.fp4_tile {
+            ensure!(bn.is_multiple_of(16 * wn), "[runtime] fp4_tile [{bm}, {bn}, {wm}, {wn}] needs bn a multiple of 16 * wn");
+        }
         for name in &self.unsplit {
             ensure!(
                 crate::codegen::MMA_LINEARS.iter().chain(&crate::codegen::GDN_LINEARS).any(|l| l == name),

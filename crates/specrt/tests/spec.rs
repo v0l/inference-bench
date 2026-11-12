@@ -407,6 +407,7 @@ fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
     assert!(bad("unsplit = [\"nope\"]").contains("nope"));
     assert!(bad("big_tile = [60, 128, 2, 4]").contains("big_tile"));
     assert!(bad("fp4_tile = [60, 128, 2, 4]").contains("fp4_tile"));
+    assert!(bad("fp4_tile = [64, 32, 2, 4]").contains("16 * wn"));
     assert!(bad("fp4_stages = 1").contains("fp4_stages"));
 }
 

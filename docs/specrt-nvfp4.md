@@ -654,11 +654,9 @@ pipeline and the cooperative CUTLASS warp-specialised mainloop. qkv is not NVFP4
 
 ### Pipeline depth
 
-`[runtime] fp4_stages` (default 3, clamped to what fits in 99 KB) sets the cp.async depth.
-128x256 holds 3 stages in 99 KB (2 would fit more tiles per SM but measured slower: gate_up 0.77 ms
-at 1,024, against 0.72 ms for 3). 128x128 with 4 stages measured no better than 3 (the runs were
-contended by other GPU jobs, so treat those as inconclusive). Neither reached the 10% bar, so the
-default stays 3.
+`[runtime] fp4_stages` (default 2 since #441, clamped to what fits in 99 KB) sets the cp.async depth.
+#432 measured 3 stages ahead of 2 on the padded layout; with the swizzled layout below 2 stages win
+(see the #441 table).
 
 ### Other NVFP4 GEMMs (per call, 1,024 / 4,096 tokens, min over launches)
 
@@ -670,9 +668,65 @@ default stays 3.
 Only gate_up and down are NVFP4 in the 27B checkpoint; qkv, o and lin_in/lin_out are FP8 (#416) and
 use the `[runtime] big_tile` path, which this change does not touch.
 
-Swizzled smem and producer/consumer warp specialisation were not ported: without ncu there is no
-bank-conflict or stall signal to justify them, and the GPU was shared with other jobs during
-measurement.
+Swizzled smem was ported in #441 (next section).
+
+## Mainloop: ldmatrix and swizzled smem (#441)
+
+### What limited the kernel
+
+ncu and `nsys --gpu-metrics-devices=all` both fail with ERR_NVGPUCTRPERM, so the evidence is the
+SASS (`cuobjdump -sass` of the NVRTC PTX through `ptxas -arch=sm_120a -v`) and A/B timing.
+
+- `gate_up_f4a_big` before: 128 registers, no spills, 1 barrier. Each 128-wide k tile issued 93
+  scalar `LDS` and 10 `LDS.64` for 32 `OMMA.SF.16864` (block-scaled fp4 mma): every A and B
+  fragment register came through its own 4-byte load from rows padded to 80 bytes.
+- After: 12 `LDSM.16.M88.4` (ldmatrix x4) replace the fragment loads, leaving 30 `LDS` (the
+  ue4m3 scale words) and 10 `LDS.64` per tile, same 128 registers, no spills.
+- The 128-register cap (512 threads, 64 K registers per SM) means one block per SM. Pipeline
+  depth beyond 2 only costs smem: 3 stages measured 7 to 9% slower than 2 once the loads were
+  ldmatrix.
+
+### Layout
+
+Each stage holds the A and B rows as 64 packed bytes (four 16-byte chunks, chunk `c` of row `r`
+stored at `c ^ (r >> 1) & 3`, so the eight rows an ldmatrix phase reads hit distinct banks),
+followed by all the rows' 8-byte scale words. A row is 72 bytes instead of 80; 128x256 with 2
+stages takes 55 KB.
+
+### Numbers
+
+Quiet GPU (local-llm.service stopped for the window), `qwen3.8-27b-nvfp4-act.toml`, three rounds
+alternating base and branch, `nsys --trace=cuda` per-call medians over all launches (min in
+brackets), bench prefill tok/s median of 3 per round:
+
+| | base (#432) | ldmatrix + swizzle, 2 stages | cut |
+|---|---|---|---|
+| gate_up 1,024 tokens | 771 us (688) | 684 us (603) | 11% (12%) |
+| gate_up 2,048-token chunk | 1,533 us (1,459) | 1,358 us (1,300) | 11% (11%) |
+| down `_big` 2,048-token chunk | 790 us (742) | 719 us (669) | 9% (10%) |
+| down 1,024 tokens (`down_f4a`) | 741 us (650) | 590 us (500) | 20% (23%) |
+| prefill 1,024 | 4,863 / 4,936 / 4,730 tok/s | 5,177 / 5,163 / 5,199 tok/s | +6% |
+| prefill 4,096 | 5,207 / 5,151 / 5,236 tok/s | 5,377 / 5,398 / 5,402 tok/s | +3.5% |
+
+Isolated kernel on random data (`cargo test --release --test gemm_speed prefill_gemm_speed_fp4 --
+--ignored --nocapture`, `SPECRT_F4A_VARIANTS` picks tiles, stages or an alternative template;
+quiet GPU, median of 40):
+
+| variant | gate_up 1,024 | gate_up 4,096 | down 1,024 | down 4,096 |
+|---|---|---|---|---|
+| base, 128x256, 3 stages (shared GPU) | 0.611 ms | 2.64 ms | 0.302 ms | 1.40 ms |
+| ldmatrix only, padded rows, 2 stages (shared GPU) | 0.509 ms | 2.23 ms | 0.257 ms | 1.14 ms |
+| ldmatrix + swizzle, 128x256 4x4, 2 stages (default) | 0.494 ms, 738 TFLOP/s | 2.21 ms | 0.243 ms | 1.15 ms |
+| same, 3 stages | 0.533 ms | 2.36 ms | 0.257 ms | 1.26 ms |
+| same, 128x256 2x4 | 0.515 ms | 2.25 ms | 0.247 ms | 1.20 ms |
+| same, 256x128 4x2 | 0.531 ms | 2.22 ms | 0.239 ms | 1.19 ms |
+| same, 128x128 2x4, 2 / 3 / 4 stages | 0.535 / 0.603 / 0.636 ms | 2.38 / 2.48 / 2.62 ms | 0.280 / 0.276 / 0.294 ms | 1.20 / 1.23 / 1.41 ms |
+
+128x128 does not catch 128x256 at any depth on the quiet GPU, so #432's inconclusive 128x128 runs
+are settled. Isolated, gate_up at 1,024 now runs at about vLLM's 724 TFLOP/s; in the model the same
+call is 603 us min (605 TFLOP/s) against vLLM's 504 us, so the remaining gap is in-model.
+`[runtime] fp4_tile` now also needs bn a multiple of 16 * wn (B fragments load two n tiles per
+ldmatrix).
 
 ### FP8 prefill GEMM (#416)
 

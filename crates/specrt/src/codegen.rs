@@ -17,7 +17,7 @@ pub const FP4_ACT_KERNELS: &[&str] = &[
     "down_f4a_big",
     "down_f4a_narrow",
 ];
-const F4A_ROW: usize = 80;
+const F4A_ROW: usize = 72;
 
 pub fn fp4_act_enabled(spec: &Spec) -> bool {
     spec.mlp.act_quant == ActQuant::Fp4
@@ -28,10 +28,11 @@ pub fn fp8_act_enabled(spec: &Spec) -> bool {
 }
 
 const F4A_SMEM_LIMIT: usize = 101376;
+pub const F4A_STAGES: usize = 2;
 
 pub fn f4a_stages(tile: Tile, opts: &RuntimeOptions) -> usize {
     let fit = F4A_SMEM_LIMIT / ((tile.bm + tile.bn) * F4A_ROW);
-    opts.fp4_stages.unwrap_or(FP4_STAGES).min(fit).max(2)
+    opts.fp4_stages.unwrap_or(F4A_STAGES).min(fit).max(2)
 }
 
 pub fn f4a_smem(tile: Tile, opts: &RuntimeOptions) -> u32 {

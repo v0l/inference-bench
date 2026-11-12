@@ -52,7 +52,13 @@ extern "C" __global__ void quant_rows_fp4(const bf16_t* hi, const bf16_t* lo, co
 }
 
 constexpr int F4A_BK = 128;
-constexpr int F4A_ROW = 80;
+constexpr int F4A_DATA = F4A_BK / 2;
+constexpr int F4A_SCALES = F4A_BK / FP4_GROUP;
+constexpr int F4A_ROW = F4A_DATA + F4A_SCALES;
+
+__device__ __forceinline__ int f4a_chunk(int r, int c) {
+    return r * F4A_DATA + ((c ^ (r >> 1)) & 3) * 16;
+}
 
 template <int N, int K, int BM, int BN, int WM, int WN, int STAGES, int EPI>
 __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wscales, const unsigned char* xq,
@@ -65,6 +71,7 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
     constexpr int NJ = TN / 8;
     constexpr int KS = BK / 64;
     constexpr int STAGE_BYTES = (BM + BN) * F4A_ROW;
+    constexpr int SCALE_OFF = (BM + BN) * F4A_DATA;
     constexpr int KT = K / BK;
     constexpr int KG = K / FP4_GROUP;
     constexpr int CHUNKS = 5;
@@ -72,12 +79,12 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
     constexpr int W_ITERS = (BN * CHUNKS + THREADS - 1) / THREADS;
     static_assert(K % BK == 0, "K must be a multiple of 128");
     static_assert(KG % 8 == 0, "scale rows are copied 8 bytes at a time");
+    static_assert(NJ % 2 == 0, "B fragments come two n tiles per ldmatrix");
     extern __shared__ __align__(16) unsigned char gemm_smem[];
     int tid = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
     int g = lane >> 2;
-    int t = lane & 3;
     int wm = warp / WN;
     int wn = warp % WN;
     int2 tile = grouped_tile<N, BN>();
@@ -94,7 +101,9 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
     const unsigned char* wsc = wscales + FP4_HEADER;
     auto load_stage = [&](int buf, int kt) {
         unsigned char* as = gemm_smem + buf * STAGE_BYTES;
-        unsigned char* ws = as + BM * F4A_ROW;
+        unsigned char* ws = as + BM * F4A_DATA;
+        unsigned char* ass = as + SCALE_OFF;
+        unsigned char* wss = ass + BM * F4A_SCALES;
 #pragma unroll
         for (int i = 0; i < A_ITERS; i++) {
             int idx = tid + i * THREADS;
@@ -104,9 +113,9 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
             int m = m0 + r;
             size_t row = (size_t)min(m, last_row);
             if (c < 4) {
-                cp_async16_zfill(as + r * F4A_ROW + c * 16, xq + row * (K / 2) + kt * (BK / 2) + c * 16, m < tokens);
+                cp_async16_zfill(as + f4a_chunk(r, c), xq + row * (K / 2) + kt * (BK / 2) + c * 16, m < tokens);
             } else {
-                cp_async8_zfill(as + r * F4A_ROW + 64, xs + row * KG + kt * (BK / FP4_GROUP), m < tokens);
+                cp_async8_zfill(ass + r * F4A_SCALES, xs + row * KG + kt * (BK / FP4_GROUP), m < tokens);
             }
         }
 #pragma unroll
@@ -117,9 +126,9 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
             int c = idx % CHUNKS;
             size_t n = (size_t)min(n0 + r, N - 1);
             if (c < 4) {
-                cp_async16(ws + r * F4A_ROW + c * 16, (const unsigned char*)w + n * (K / 2) + kt * (BK / 2) + c * 16);
+                cp_async16(ws + f4a_chunk(r, c), (const unsigned char*)w + n * (K / 2) + kt * (BK / 2) + c * 16);
             } else {
-                cp_async8_zfill(ws + r * F4A_ROW + 64, wsc + n * KG + kt * (BK / FP4_GROUP), true);
+                cp_async8_zfill(wss + r * F4A_SCALES, wsc + n * KG + kt * (BK / FP4_GROUP), true);
             }
         }
     };
@@ -135,28 +144,29 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
         if (next < KT) load_stage(next % STAGES, next);
         cp_async_commit();
         const unsigned char* as = gemm_smem + (kt % STAGES) * STAGE_BYTES;
-        const unsigned char* ws = as + BM * F4A_ROW;
+        const unsigned char* ws = as + BM * F4A_DATA;
+        const unsigned char* ass = as + SCALE_OFF;
+        const unsigned char* wss = ass + BM * F4A_SCALES;
 #pragma unroll
         for (int ks = 0; ks < KS; ks++) {
             unsigned a[MI][4], sfa[MI];
 #pragma unroll
             for (int i = 0; i < MI; i++) {
-                const unsigned char* r0 = as + (wm * TM + i * 16 + g) * F4A_ROW + ks * 32 + 4 * t;
-                const unsigned char* r1 = r0 + 8 * F4A_ROW;
-                a[i][0] = *(const unsigned*)r0;
-                a[i][1] = *(const unsigned*)r1;
-                a[i][2] = *(const unsigned*)(r0 + 16);
-                a[i][3] = *(const unsigned*)(r1 + 16);
-                sfa[i] = *(const unsigned*)(as + (wm * TM + i * 16 + g + 8 * (lane & 1)) * F4A_ROW + 64 + ks * 4);
+                int r = wm * TM + i * 16 + (lane & 15);
+                ldsm_x4(a[i], as + f4a_chunk(r, ks * 2 + (lane >> 4)));
+                sfa[i] = *(const unsigned*)(ass + (wm * TM + i * 16 + g + 8 * (lane & 1)) * F4A_SCALES + ks * 4);
             }
 #pragma unroll
-            for (int j = 0; j < NJ; j++) {
-                const unsigned char* p = ws + (wn * TN + j * 8 + g) * F4A_ROW;
-                unsigned b0 = *(const unsigned*)(p + ks * 32 + 4 * t);
-                unsigned b1 = *(const unsigned*)(p + ks * 32 + 4 * t + 16);
-                unsigned sfb = *(const unsigned*)(p + 64 + ks * 4);
+            for (int j = 0; j < NJ; j += 2) {
+                unsigned b[4];
+                int r = wn * TN + j * 8 + (lane & 7) + ((lane >> 4) << 3);
+                ldsm_x4(b, ws + f4a_chunk(r, ks * 2 + ((lane >> 3) & 1)));
 #pragma unroll
-                for (int i = 0; i < MI; i++) mma_fp4(acc[i][j], a[i], b0, b1, sfa[i], sfb);
+                for (int jj = 0; jj < 2; jj++) {
+                    unsigned sfb = *(const unsigned*)(wss + (wn * TN + (j + jj) * 8 + g) * F4A_SCALES + ks * 4);
+#pragma unroll
+                    for (int i = 0; i < MI; i++) mma_fp4(acc[i][j + jj], a[i], b[2 * jj], b[2 * jj + 1], sfa[i], sfb);
+                }
             }
         }
     }
