@@ -251,3 +251,50 @@ Attention experiments that did not clear the 10% bar: skipping the per-element c
 #551 attention follow-up, measured instead of built. (1) GQA K/V sharing: with the K/V `cp.async` loads compiled out of `flash_mma` (`SPECRT_FLASH_NOLOAD=1` in `tests/flash_speed.rs`, patch asserted to apply) the kernel runs at the same speed, 3.52 ms vs 3.51 ms at 15k keys, 6.75 vs 6.75 ms at 30k, 27.5 vs 27.5 ms at 129k keys (2,048 query tokens). K/V traffic is hidden behind the MMAs, so a CTA per KV group cannot cut kernel time by 10%; the limit is the mma/softmax work (about 190 TFLOP/s on a quiet GPU, flat from 15k to 258k keys: 4.37, 8.43, 34.7, 69.3 ms at 15k, 30k, 129k, 258k keys). Not built. (2) Split-KV: the grid is 16 query tiles x 24 heads = 384 CTAs for a 2,048 chunk and 768 for a 4,096 chunk, enough to fill the GPU, and TFLOP/s is already flat in key count, so the partial-softmax plus reduce would only help chunks under about 1,024 tokens (143 to 152 TFLOP/s at 512 and 1,024 query tokens). Not built. (3) Two-stream overlap: in a single-sequence prefill every layer reads the previous layer's output, so a delta-net scan and a full-attention layer are never independent and there is nothing to overlap; only the mtp or multi-sequence batches could, which is the concurrency phase. Not built. Final `flash_mma`: 4.4 ms (15k keys), 8.4 ms (30k), 34.7 ms (129k), 69.3 ms (258k) for 2,048 query tokens.
 
 Gates for the final tree in one quiet window (`quiet_window.sh`), non-27B suite: every `test result:` line `ok`, 0 failed (lib `94 passed`, codegen 13, spec 35, mtp 15, serving, fp4 and fp8 batches, jit 4, vision_lm 3 and the rest). real27b act default (`SPECRT_27B_SPEC=qwen3.8-27b`, `SPECRT_27B_NVFP4_SPEC=qwen3.8-27b-nvfp4`): `test result: ok. 10 passed; 0 failed; 0 ignored; finished in 242.95s`. real27b exact specs: `test result: ok. 10 passed; 0 failed; 0 ignored; finished in 381.73s`. The remaining 4k and 32k gap to 70% of vLLM is the GEMMs (`gate_up`, `down`, `lin_in` are 41% of kernel time at 32k) and belongs to #441; the non-GEMM part owned here (`flash_mma` 12.7%, gdn 12%, quant 3.4%) is already at its measured limit, so the attention side reaches 54% at 32k on its own (3,719 of 6,849 tok/s) and 48% at 4k.
+
+## #555: where the 4k and 32k prefill gap is now
+
+Quiet GPU (local-llm stopped through `quiet_window.sh`, 6.7 GB used and 0% util at the start). Master at af5e214 with #441's fp4 GEMM, `prefixbench long`, cold, `kv_gb` 12, 3 rounds, all values (`scripts/prefill555.sh`). The nvfp4 spec is the like-for-like one: vLLM serves the same NVFP4 checkpoint.
+
+| prompt | `qwen3.8-27b-nvfp4` tok/s | `qwen3.8-27b` (FP8) tok/s | vLLM quiet (MTP on) | nvfp4 / vLLM (best) |
+|---|---|---|---|---|
+| 4,096 | 5,884, 5,719, 5,775 | 4,373, 4,355, 4,358 | 8,781 | 67% |
+| 32,768 | 5,065, 4,868, 4,880 | 3,828, 3,813, 3,812 | 6,849 | 74% |
+| 131,072 | 3,230, 3,158, 3,157 | 2,670, 2,664, 2,661 | 3,764 | 86% |
+
+32k and 128k pass the targets. 4k is 3 points under 70%. The user judged these numbers good enough and closed the phase here.
+
+Timeline (nsys `--trace=cuda` of the nvfp4 spec, `scripts/prefill_timeline.py`). The GPU is busy for 99.9% of the prefill window: 723.2 of 723.6 ms at 4k, 6,844 of 6,848 ms at 32k, no gap over 20 us at 4k and 0.2 ms in total at 32k. There is nothing to win from launch overhead, host syncs or CUDA graphs for prefill chunks. The gap is all kernel time.
+
+Per-kernel, 4,096 tokens, against the #413 vLLM capture (MTP off, 4,096-token request, 518 ms of kernels including one decode step):
+
+| class | specrt kernels, ms (share) | vLLM, ms | ratio |
+|---|---|---|---|
+| linears, NVFP4 MLP | `gate_up_f4a` 148.0 (20.5%), `down_f4a` 81.0 (11.2%), `quant_rows_fp4` 13.4 | 412 for all linears and the head | |
+| linears, FP8 | `lin_in_f8` 82.4 (11.4%), `lin_out_f8` 34.8, `gate_up_f8` 30.2 and `down_f8` 15.6 (the 8 layers after `quant_until = 56`), `qkv_f8` 24.4, `o_f8` 11.5, `lin_ba_mma` 8.0, `quant_rows_fp8_token` 8.6 | | |
+| linears total | about 458 | 412 | 1.11x |
+| MTP layer on the prompt | 38.9 (`mtp_*_mma`) | 0 (MTP off in the capture) | |
+| delta-net | `gdn_chunk_scan` 103.8 (14.4%), `gdn_chunk_prep` 58.1 (8.0%), `gdn_conv_prefill` 12.4, `gdn_gated_norm` 7.6, `gdn_qk_prep` 3.0: 185 | 42 | 4.4x |
+| attention | `flash_mma` 28.9 (4.0%) | 29 | 1.0x |
+| norms | `rms_split` 8.9 | in Inductor fusions | |
+| total | 723 | 518 | 1.40x |
+
+At 32,768 tokens the order changes: `flash_mma` 18.7%, `gate_up_f4a` 17.4%, `gdn_chunk_scan` 12.2%, `lin_in_f8` 9.6%, `down_f4a` 9.5%, `gdn_chunk_prep` 6.8%, `lin_out_f8` 4.1%. Every other class is under 3.5%.
+
+Where the in-model fp4 GEMM loses its 20%. `tests/gemm_speed.rs` `prefill_gemm_fp4_in_model_probe` times `gate_up_f4a_big` and `down_f4a_big` with three kinds of data: the old masked bytes with constant scales, uniform random bytes and scales, and Gaussian values put through `nvfp4::quantize`. For each it measures four L2 states: warm and idle between calls, cold after a 512 MB flush, a back-to-back chain on one weight, and a chain rotating over 4 weight copies. Quiet GPU, median, TFLOP/s:
+
+| | masked, warm | Gaussian, warm | Gaussian, cold L2 | Gaussian, rotating chain |
+|---|---|---|---|---|
+| `gate_up` 2,048 | 727 | 667 | 635 | 582 |
+| `gate_up` 4,096 | 730 | 677 | 656 | 592 |
+| `down` 2,048 | 776 | 732 | 658 | 609 |
+| `down` 4,096 | 680 | 660 | 648 | 586 |
+
+The #441 "matches vLLM in isolation" figure (738 TFLOP/s) was on the masked data, which has low bit entropy and a constant scale byte. Realistic data costs 8%, a cold L2 another 3 to 10%, and back-to-back calls with fresh weights another 7 to 8%. That is the 20%: in the model, `gate_up` at 4,096 tokens is 2.64 ms (553 TFLOP/s). FlashInfer's CUTLASS NVFP4 kernel (`flashinfer_scaled_fp4_mm`, the one vLLM calls), timed once on the same shapes with real quantised Gaussian data, ran at about 1,000 TFLOP/s cold (1,013 at 2,048 tokens, 915 at 4,096) and 844 to 851 in a rotating chain. So isolated, the fp4 GEMM is 1.4x to 1.6x behind CUTLASS on realistic data. That standalone script was removed: calling FlashInfer outside the service rebuilt vLLM's fp4 JIT module with other build flags, and the service then recompiled it with 20 jobs at its next start. Compare against vLLM only through existing nsys captures.
+
+What is left, by size at 4k:
+
+1. Delta-net prefill, 185 ms against 42 (4.4x, about 143 ms, 20% of prefill). `gdn_chunk_prep` does a scalar forward substitution over the 64 rows of each chunk. Every product in both kernels goes through the three-term hi/lo bf16 split (`mma_split_tile`). FLA uses a block-merged 16x16 inverse and single-term products. This is #418's prefill half.
+2. The NVFP4 GEMMs, `gate_up` and `down` about 229 ms. On realistic data they reach 1.4x to 1.6x CUTLASS's time, so closing that is about 70 ms (#441's mainloop: issuing the loads and a `__syncthreads` per k tile from the mma warps, with one block per SM).
+3. The FP8 projections, 177 ms. vLLM runs CUTLASS FP8 for these at 410 to 454 TFLOP/s (#413 table above).
+4. The MTP layer on the prompt, 39 ms (5%). vLLM's capture had MTP off, so this part is not a gap against the MTP-on vLLM numbers in the table.

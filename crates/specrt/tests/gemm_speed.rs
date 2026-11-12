@@ -240,6 +240,159 @@ fn time(spec_name: &str, kernel_of: &dyn Fn(&str) -> (String, Tile), fp4: bool) 
     }
 }
 
+fn noise(len: usize, seed: u64, mask: u8, or: u8) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8 & mask | or
+        })
+        .collect()
+}
+
+fn normal(len: usize, seed: u64) -> Vec<f32> {
+    let mut x = seed.wrapping_mul(0x9e3779b97f4a7c15) | 1;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        ((x >> 40) as f32 + 0.5) / (1u64 << 24) as f32
+    };
+    (0..len.div_ceil(2))
+        .flat_map(|_| {
+            let (u, v) = (next(), next());
+            let r = (-2.0 * u.ln()).sqrt();
+            let t = std::f32::consts::TAU * v;
+            [r * t.cos(), r * t.sin()]
+        })
+        .take(len)
+        .collect()
+}
+
+fn fp4_probe(linear: &str) {
+    let s = spec("qwen3.8-27b-nvfp4");
+    let ctx = CudaContext::new(0).unwrap();
+    let dir = std::env::temp_dir().join(format!("specrt-gemm-probe-{}", std::process::id()));
+    let jit = Jit::new(ctx.clone(), dir).unwrap();
+    let stream = ctx.default_stream();
+    let module = Module::generate(&s, 256).unwrap();
+    let loaded = jit.load(&module).unwrap();
+    let kernel = format!("{linear}_f4a_big");
+    let smem = module.smem[kernel.as_str()];
+    let f = loaded.function(&kernel).unwrap();
+    use cudarc::driver::sys::CUfunction_attribute as A;
+    f.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
+    let tile = Tile::fp4_variant("_big", &s.runtime);
+    let (n, k, _, _) = specrt::codegen::linear_dims(&s, linear);
+    let copies = 4usize;
+    let mut flush = stream.alloc_zeros::<u8>(512 << 20).unwrap();
+    let ev = || {
+        let e = ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).unwrap();
+        e.record(&stream).unwrap();
+        e
+    };
+    for m in list("SPECRT_GEMM_TOKENS", "2048,4096").iter().map(|t| t.parse::<usize>().unwrap()) {
+        let flops = 2.0 * (m * n * k) as f64;
+        for data in ["masked", "entropy", "gaussian"] {
+            let gaussian = |len: usize, seed: u64| {
+                let g = 448.0 * 6.0 / 5.5;
+                let (q, s) = specrt::nvfp4::quantize(&normal(len, seed), k, g);
+                (q, s, g)
+            };
+            let (wq, wsc, wg) = match data {
+                "masked" => (bytes(n * k / 2, 1), vec![0x38u8; n * k / 16], 1.0),
+                "entropy" => (noise(n * k / 2, 11, 0xff, 0), noise(n * k / 16, 21, 0x0f, 0x30), 1.0),
+                _ => gaussian(n * k, 11),
+            };
+            let (xq_h, xs_h, xg) = match data {
+                "masked" => (bytes(m * k / 2, 2), vec![0x38u8; m * k / 16], 1.0),
+                "entropy" => (noise(m * k / 2, 3, 0xff, 0), noise(m * k / 16, 4, 0x0f, 0x30), 1.0),
+                _ => gaussian(m * k, 3),
+            };
+            let weights: Vec<_> = (0..copies)
+                .map(|_| {
+                    let mut hdr = vec![0u8; 16];
+                    hdr[..4].copy_from_slice(&(1.0f32 / wg).to_le_bytes());
+                    hdr[4..8].copy_from_slice(&(xg as f32).to_le_bytes());
+                    hdr.extend(&wsc);
+                    (stream.clone_htod(&wq).unwrap(), stream.clone_htod(&hdr).unwrap())
+                })
+                .collect();
+            let xq = stream.clone_htod(&xq_h).unwrap();
+            let xs = stream.clone_htod(&xs_h).unwrap();
+            let out = stream.alloc_zeros::<f32>(m * n).unwrap();
+            let planes = stream.alloc_zeros::<u16>(m * n).unwrap();
+            let planes2 = stream.alloc_zeros::<u16>(m * n).unwrap();
+            let tokens_i = m as i32;
+            let launch = |c: usize| {
+                let (w, ws) = &weights[c % copies];
+                let mut b = stream.launch_builder(&f);
+                b.arg(w).arg(ws).arg(&xq).arg(&xs).arg(&out).arg(&planes).arg(&planes2).arg(&tokens_i);
+                let config = LaunchConfig {
+                    grid_dim: (n.div_ceil(tile.bn) as u32, m.div_ceil(tile.bm) as u32, 1),
+                    block_dim: (tile.threads(), 1, 1),
+                    shared_mem_bytes: smem,
+                };
+                unsafe { b.launch(config) }.unwrap();
+            };
+            launch(0);
+            stream.synchronize().unwrap();
+            let reps = 20;
+            let mut runs: Vec<(&str, Vec<f32>)> = Vec::new();
+            let mut warm = Vec::new();
+            for _ in 0..reps {
+                let a = ev();
+                launch(0);
+                let b = ev();
+                stream.synchronize().unwrap();
+                warm.push(a.elapsed_ms(&b).unwrap());
+            }
+            runs.push(("warm L2, idle between", warm));
+            let mut cold = Vec::new();
+            for r in 0..reps {
+                stream.memset_zeros(&mut flush).unwrap();
+                let a = ev();
+                launch(r);
+                let b = ev();
+                stream.synchronize().unwrap();
+                cold.push(a.elapsed_ms(&b).unwrap());
+            }
+            runs.push(("cold L2, idle between", cold));
+            for chain in ["warm chain", "rotating chain"] {
+                let mut t = Vec::new();
+                for _ in 0..3 {
+                    let a = ev();
+                    for r in 0..64 {
+                        launch(if chain == "warm chain" { 0 } else { r });
+                    }
+                    let b = ev();
+                    stream.synchronize().unwrap();
+                    t.push(a.elapsed_ms(&b).unwrap() / 64.0);
+                }
+                runs.push((chain, t));
+            }
+            for (name, mut t) in runs {
+                t.sort_by(f32::total_cmp);
+                let ms = t[t.len() / 2];
+                eprintln!(
+                    "{kernel} m={m} {data:7} {name:22}: median {ms:.3} ms, min {:.3} ms, {:.0} TFLOP/s",
+                    t[0],
+                    flops / ms as f64 / 1e9
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU; timing only"]
+fn prefill_gemm_fp4_in_model_probe() {
+    fp4_probe("gate_up");
+    fp4_probe("down");
+}
+
 #[test]
 #[ignore = "needs an sm_120 GPU; timing only"]
 fn prefill_gemm_speed_fp8_block() {
