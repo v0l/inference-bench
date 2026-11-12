@@ -695,7 +695,8 @@ stages takes 55 KB.
 
 ### Numbers
 
-Quiet GPU (local-llm.service stopped for the window), `qwen3.8-27b-nvfp4-act.toml`, three rounds
+Quiet GPU (local-llm.service stopped for the window), `qwen3.8-27b-nvfp4-act.toml` (since folded
+into `qwen3.8-27b-nvfp4.toml`), three rounds
 alternating base and branch, `nsys --trace=cuda` per-call medians over all launches (min in
 brackets), bench prefill tok/s median of 3 per round:
 
@@ -727,6 +728,33 @@ are settled. Isolated, gate_up at 1,024 now runs at about vLLM's 724 TFLOP/s; in
 call is 603 us min (605 TFLOP/s) against vLLM's 504 us, so the remaining gap is in-model.
 `[runtime] fp4_tile` now also needs bn a multiple of 16 * wn (B fragments load two n tiles per
 ldmatrix).
+
+### Tried and dropped
+
+Same isolated test, GPU shared with the served vLLM, each against the default in the same run:
+
+| variant | gate_up 1,024 | gate_up 4,096 | down 1,024 | down 4,096 |
+|---|---|---|---|---|
+| default | 0.484 to 0.522 ms | 1.97 to 2.16 ms | 0.229 to 0.243 ms | 1.04 to 1.14 ms |
+| producer warp + mbarrier ring, 4x4 consumers (544 threads, under 128 registers) | 1.046 ms | 4.25 ms | 0.550 ms | 2.26 ms |
+| producer warp, 2x4 consumers, 2 stages | 0.609 ms | 2.66 ms | 0.283 ms | 1.36 ms |
+| 4 producer warps, 2x4 consumers, 2 stages | 0.543 ms | 2.41 ms | 0.249 ms | 1.20 ms |
+| 4 producer warps, 128x128 2x2, 4 stages | 0.568 ms | 2.44 ms | 0.286 ms | 1.34 ms |
+| TMA (`cp.async.bulk.tensor`, 64-byte swizzle, mbarrier) for the packed data, 2 stages | 0.533 ms | 2.18 ms | 0.234 ms | 1.01 ms |
+| same TMA, 3 stages | 0.635 ms | 2.62 ms | 0.285 ms | 1.18 ms |
+
+Warp specialisation either caps the 4x4 consumer grid below 128 registers (half the speed) or
+halves the mma warps; both lose. TMA matches the output bit for bit but is 9%
+slower on gate_up and flat on down.
+
+Two probes bound what is left. Reloading the same two k tiles every iteration (same
+instructions, L2-hot data) is 4 to 8% faster than the default, so global latency is not the
+limit. Skipping the reloads entirely (mma and ldmatrix on resident stages) is 30 to 37% faster
+(1,011 to 1,108 TFLOP/s). The remaining cost is issuing the loads and the `__syncthreads` per k
+tile inside the same warps that run the mma, which with one block per SM (128 registers x 512
+threads) nothing else hides. Closing it needs a mainloop whose loads do not take issue slots or
+registers from the mma warps without shrinking them, which neither the producer warp (register
+budget) nor TMA with a CTA-wide barrier (still synchronous per tile) gave here.
 
 ### FP8 prefill GEMM (#416)
 

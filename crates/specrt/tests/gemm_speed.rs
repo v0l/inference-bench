@@ -257,5 +257,5 @@ fn prefill_gemm_speed_fp8_channel_and_fp4() {
 #[test]
 #[ignore = "needs an sm_120 GPU; timing only"]
 fn prefill_gemm_speed_fp4() {
-    time_fp4("qwen3.8-27b-nvfp4-act");
+    time_fp4("qwen3.8-27b-nvfp4");
 }
