@@ -105,6 +105,8 @@ pub struct RuntimeOptions {
     pub fp4_tile: Option<[usize; 4]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fp4_stages: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_chunk: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unsplit: Vec<String>,
     pub gemm_fp32: bool,
@@ -148,7 +150,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default() }
     }
 }
 
@@ -160,6 +162,7 @@ impl RuntimeOptions {
     fn validate(&self) -> Result<()> {
         self.prefix_cache.validate()?;
         ensure!(self.fp4_stages.is_none_or(|n| n >= 2), "[runtime] fp4_stages needs at least 2");
+        ensure!(self.prefill_chunk.is_none_or(|n| n >= 64), "[runtime] prefill_chunk needs at least 64 tokens");
         for (key, tile) in [("big_tile", self.big_tile), ("fp4_tile", self.fp4_tile)] {
             if let Some([bm, bn, wm, wn]) = tile {
                 ensure!(

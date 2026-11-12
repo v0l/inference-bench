@@ -468,7 +468,7 @@ impl Layout {
             max_ctx,
             slots,
             kv_blocks: kv_bytes.map_or(0, |b| (b / kv_block_bytes(spec, 1)).max(1)),
-            prefill_chunk: PREFILL_CHUNK,
+            prefill_chunk: spec.runtime.prefill_chunk.unwrap_or(PREFILL_CHUNK),
             kv_planes: 1,
             kv_headroom: (1 << 30) + slots.min(SERVING_RESIDENT_SLOTS) * crate::serve::slot_state_bytes(spec) as usize,
             state_on_demand: true,

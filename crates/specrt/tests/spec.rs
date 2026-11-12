@@ -377,7 +377,7 @@ fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
     assert_eq!(Spec::parse(&base).unwrap().runtime, RuntimeOptions::default());
     let d = RuntimeOptions::default();
     assert!(d.graphs && d.fuse && !d.gemm_fp32 && d.tile == TileChoice::Auto && d.cache_dir.is_none());
-    let with = format!("{base}\n[runtime]\nbackend = \"wgpu\"\ngraphs = false\nfuse = false\ntile = \"big\"\nbig_tile = [64, 128, 2, 4]\nfp4_tile = [64, 256, 2, 4]\nfp4_stages = 4\nunsplit = [\"lm_head\"]\ngemm_fp32 = true\ncache_dir = \"/tmp/x\"\n");
+    let with = format!("{base}\n[runtime]\nbackend = \"wgpu\"\ngraphs = false\nfuse = false\ntile = \"big\"\nbig_tile = [64, 128, 2, 4]\nfp4_tile = [64, 256, 2, 4]\nfp4_stages = 4\nprefill_chunk = 4096\nunsplit = [\"lm_head\"]\ngemm_fp32 = true\ncache_dir = \"/tmp/x\"\n");
     let s = Spec::parse(&with).unwrap();
     assert_eq!(
         s.runtime,
@@ -389,6 +389,7 @@ fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
             big_tile: Some([64, 128, 2, 4]),
             fp4_tile: Some([64, 256, 2, 4]),
             fp4_stages: Some(4),
+            prefill_chunk: Some(4096),
             unsplit: vec!["lm_head".into()],
             gemm_fp32: true,
             cache_dir: Some("/tmp/x".into()),
