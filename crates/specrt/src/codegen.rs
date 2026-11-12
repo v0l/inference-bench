@@ -314,8 +314,8 @@ pub const FP8_BLOCK: usize = 128;
 pub const BATCH_DECODE_SPLITS: usize = 8;
 const FLASH_SMEM_LIMIT: usize = 99 * 1024;
 
-pub fn flash_rows(head_dim: usize) -> usize {
-    if head_dim > 128 { 64 } else { 128 }
+pub fn flash_rows(_head_dim: usize) -> usize {
+    128
 }
 
 pub fn flash_keys(head_dim: usize, kv_planes: usize) -> usize {
