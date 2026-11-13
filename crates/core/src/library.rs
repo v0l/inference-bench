@@ -95,9 +95,6 @@ pub fn hub_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_default().join(".cache/huggingface/hub")
 }
 
-const SPECRT_TYPES: [&str; 4] = ["qwen2", "qwen3", "llama", "mistral"];
-const SPECRT_ACTS: [&str; 4] = ["silu", "gelu_pytorch_tanh", "gelu_new", "gelu_fast"];
-
 const VLLM_ARCHS: [&str; 22] = [
     "LlamaForCausalLM",
     "MistralForCausalLM",
@@ -142,20 +139,24 @@ fn is_text_generation(arch: &str) -> bool {
 }
 
 pub fn specrt_support(config: &Value) -> Support {
-    let cfg = text_config(config);
-    let model_type = cfg["model_type"].as_str().or(config["model_type"].as_str()).unwrap_or("");
-    if !SPECRT_TYPES.contains(&model_type) {
-        return Support::no("specrt", format!("model_type {model_type} is not supported"));
+    match specrt::spec::Spec::from_hf_config(&config.to_string()) {
+        Ok(spec) => Support {
+            backend: "specrt",
+            supported: true,
+            reason: format!("{} on CUDA", describe_spec(&spec)),
+        },
+        Err(e) => Support::no("specrt", e.root_cause().to_string()),
     }
-    let act = cfg["hidden_act"].as_str().unwrap_or("silu");
-    if !SPECRT_ACTS.contains(&act) {
-        return Support::no("specrt", format!("hidden_act {act} is not supported"));
+}
+
+pub fn specrt_wgpu_support(config: &Value) -> Support {
+    match specrt::spec::Spec::from_hf_config(&config.to_string()) {
+        Ok(spec) => match specrt::wgsl::unsupported(&spec) {
+            None => Support { backend: "specrt (wgpu)", supported: true, reason: "dense decoder on Vulkan, Metal or DX12".into() },
+            Some(why) => Support::no("specrt (wgpu)", why),
+        },
+        Err(e) => Support::no("specrt (wgpu)", e.root_cause().to_string()),
     }
-    if let Some(q) = config.get("quantization_config").filter(|q| !q.is_null()) {
-        let method = q["quant_method"].as_str().unwrap_or("unknown");
-        return Support::no("specrt", format!("{method} quantised weights are not supported"));
-    }
-    Support::yes("specrt", "dense decoder, bf16")
 }
 
 fn text_config(config: &Value) -> &Value {
@@ -163,6 +164,12 @@ fn text_config(config: &Value) -> &Value {
         Some(t) if t.is_object() => t,
         _ => config,
     }
+}
+
+fn describe_spec(spec: &specrt::spec::Spec) -> String {
+    let layout = if spec.linear_attention.is_some() { "hybrid delta-net decoder" } else { "dense decoder" };
+    let quant = serde_json::to_value(spec.quant).ok().and_then(|q| q.as_str().map(String::from)).unwrap_or_default();
+    format!("{layout}, {quant}")
 }
 
 fn support_for_safetensors(config: &Value, arch: &str) -> Vec<Support> {
@@ -174,7 +181,7 @@ fn support_for_safetensors(config: &Value, arch: &str) -> Vec<Support> {
         (true, false) => Support::no("vllm", format!("Model architectures ['{arch}'] are not supported")),
     };
     let specrt = if text { specrt_support(config) } else { Support::no("specrt", none()) };
-    let wgpu = Support { backend: "specrt (wgpu)", ..specrt.clone() };
+    let wgpu = if text { specrt_wgpu_support(config) } else { Support::no("specrt (wgpu)", none()) };
     vec![
         specrt,
         wgpu,
@@ -679,6 +686,11 @@ mod tests {
         b
     }
 
+    fn fixture(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures").join(name);
+        std::fs::read_to_string(path).unwrap()
+    }
+
     fn hf_model(hub: &Path, repo: &str, config: &str) -> PathBuf {
         let snap = hub.join(format!("models--{}", repo.replace('/', "--"))).join("snapshots/abc");
         std::fs::create_dir_all(&snap).unwrap();
@@ -701,11 +713,7 @@ mod tests {
     #[test]
     fn the_hub_lists_a_supported_and_an_unsupported_architecture() {
         let hub = temp("hub");
-        hf_model(
-            &hub,
-            "Qwen/Qwen3-0.6B",
-            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","hidden_act":"silu","max_position_embeddings":40960,"torch_dtype":"bfloat16"}"#,
-        );
+        hf_model(&hub, "Qwen/Qwen3-0.6B", &fixture("qwen3-0.6b.config.json"));
         hf_model(
             &hub,
             "acme/Weird-7B",
@@ -740,16 +748,61 @@ mod tests {
     }
 
     #[test]
-    fn quantised_weights_are_refused_by_specrt() {
-        let hub = temp("fp8");
-        hf_model(
-            &hub,
-            "acme/Q-FP8",
-            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","hidden_act":"silu","quantization_config":{"quant_method":"fp8"}}"#,
-        );
+    fn the_real_qwen3_8_27b_fp8_config_is_supported_by_specrt() {
+        let hub = temp("qwen27");
+        hf_model(&hub, "Qwen/Qwen3.8-27B-FP8", &fixture("qwen3.8-27b.config.json"));
         let m = &scan_hub(&hub)[0];
         assert_eq!(m.quant, "FP8");
-        assert!(m.support_for("specrt").unwrap().reason.contains("fp8"));
+        let s = m.support_for("specrt").unwrap();
+        assert!(s.supported, "{}", s.reason);
+        assert!(s.reason.contains("fp8_block128"), "{}", s.reason);
+        let wgpu = m.support_for("specrt (wgpu)").unwrap();
+        assert!(!wgpu.supported && wgpu.reason.contains("delta-net"), "{}", wgpu.reason);
+    }
+
+    #[test]
+    fn the_real_qwen3_8_27b_nvfp4_config_is_supported_by_specrt() {
+        let hub = temp("qwen27-nvfp4");
+        hf_model(&hub, "orcarouter/Qwen3.8-27B-Uncensored-NVFP4", &fixture("qwen3.8-27b-nvfp4.config.json"));
+        let m = &scan_hub(&hub)[0];
+        let s = m.support_for("specrt").unwrap();
+        assert!(s.supported, "{}", s.reason);
+        assert!(s.reason.contains("fp8_channel"), "{}", s.reason);
+        let wgpu = m.support_for("specrt (wgpu)").unwrap();
+        assert!(!wgpu.supported && wgpu.reason.contains("delta-net"), "{}", wgpu.reason);
+    }
+
+    #[test]
+    fn an_unsupported_compressed_tensors_group_is_refused_with_the_spec_error() {
+        let mut config: Value = serde_json::from_str(&fixture("qwen3.8-27b-nvfp4.config.json")).unwrap();
+        config["quantization_config"]["config_groups"]["group_1"]["weights"]["group_size"] = serde_json::json!(32);
+        let s = specrt_support(&config);
+        assert!(!s.supported && s.reason.contains("group_1"), "{}", s.reason);
+    }
+
+    #[test]
+    fn an_unsupported_quant_scheme_is_refused_with_the_spec_error() {
+        let mut config: Value = serde_json::from_str(&fixture("qwen3.8-27b.config.json")).unwrap();
+        config["quantization_config"] = serde_json::json!({"quant_method": "gptq", "bits": 4});
+        let s = specrt_support(&config);
+        assert!(!s.supported && s.reason.contains("quantization") && s.reason.contains("gptq"), "{}", s.reason);
+    }
+
+    #[test]
+    fn an_unknown_model_type_is_refused_with_the_spec_error() {
+        let mut config: Value = serde_json::from_str(&fixture("qwen3-0.6b.config.json")).unwrap();
+        config["model_type"] = "weird".into();
+        let s = specrt_support(&config);
+        assert!(!s.supported && s.reason == "model_type weird is not supported", "{}", s.reason);
+    }
+
+    #[test]
+    fn a_dense_bf16_config_is_supported_on_cuda_and_wgpu() {
+        let hub = temp("dense");
+        hf_model(&hub, "Qwen/Qwen3-0.6B", &fixture("qwen3-0.6b.config.json"));
+        let m = &scan_hub(&hub)[0];
+        assert!(m.support_for("specrt").unwrap().supported);
+        assert!(m.support_for("specrt (wgpu)").unwrap().supported);
     }
 
     #[test]
