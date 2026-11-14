@@ -1,21 +1,6 @@
-use crate::target::{NATIVE, TargetConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Endpoint {
-    pub label: String,
-    pub backend: String,
-    pub url: String,
-    #[serde(default)]
-    pub api_key: String,
-}
-
-impl Endpoint {
-    fn is_http(&self) -> bool {
-        self.url.starts_with("http://") || self.url.starts_with("https://")
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerSettings {
@@ -33,17 +18,13 @@ impl Default for ServerSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
-    pub endpoints: Vec<Endpoint>,
-    #[serde(default)]
     pub model_folders: Vec<PathBuf>,
     #[serde(default)]
     pub server: ServerSettings,
-    #[serde(default = "default_ctx")]
-    pub specrt_ctx: usize,
+    #[serde(default = "default_ctx", alias = "specrt_ctx")]
+    pub default_ctx: usize,
     #[serde(default)]
-    pub gpu_bandwidth_gbs: Option<u64>,
-    #[serde(default)]
-    pub placement: crate::specrt_placement::PlacementConfig,
+    pub model_ctx: BTreeMap<String, usize>,
     #[serde(default)]
     pub hf_token: String,
     #[serde(default)]
@@ -83,15 +64,10 @@ fn default_ctx() -> usize {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            endpoints: vec![
-                Endpoint { label: "llama.cpp".into(), backend: "llama.cpp".into(), url: "http://127.0.0.1:8080".into(), api_key: String::new() },
-                Endpoint { label: "vllm".into(), backend: "vllm".into(), url: "http://127.0.0.1:8000".into(), api_key: String::new() },
-            ],
             model_folders: Vec::new(),
             server: ServerSettings::default(),
-            specrt_ctx: default_ctx(),
-            gpu_bandwidth_gbs: None,
-            placement: Default::default(),
+            default_ctx: default_ctx(),
+            model_ctx: BTreeMap::new(),
             hf_token: String::new(),
             spec_folders: Vec::new(),
             specs_auto_update: true,
@@ -114,20 +90,11 @@ impl Settings {
     }
 
     pub fn parse(text: &str) -> Self {
-        let Ok(mut s) = serde_json::from_str::<Self>(text) else { return Self::default() };
-        for old in ["specrt_worker", "python"] {
-            if serde_json::from_str::<serde_json::Value>(text).is_ok_and(|v| v.get(old).is_some()) {
-                tracing::info!(setting = old, "ignoring a setting for a removed backend");
-            }
-        }
-        s.endpoints.retain(|e| {
-            let keep = e.is_http() && e.label != NATIVE;
-            if !keep {
-                tracing::info!(label = %e.label, url = %e.url, "dropping a backend entry that is not an OpenAI-compatible bench target");
-            }
-            keep
-        });
-        s
+        serde_json::from_str::<Self>(text).unwrap_or_default()
+    }
+
+    pub fn ctx_for(&self, model: &str) -> usize {
+        self.model_ctx.get(model).copied().unwrap_or(self.default_ctx)
     }
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
@@ -142,10 +109,6 @@ impl Settings {
         Ok(())
     }
 
-    pub fn native(&self) -> TargetConfig {
-        TargetConfig::native(Some(self.specrt_ctx))
-    }
-
     pub fn specs(&self) -> crate::specs::SpecsConfig {
         crate::specs::SpecsConfig {
             auto_update: self.specs_auto_update,
@@ -154,31 +117,6 @@ impl Settings {
             tag: self.specs_tag.clone(),
             update_hours: self.specs_update_hours,
             ..crate::specs::SpecsConfig::default()
-        }
-    }
-
-    pub fn bench_targets(&self) -> Vec<String> {
-        let mut names = vec![NATIVE.to_string()];
-        names.extend(self.endpoints.iter().map(|e| e.label.clone()));
-        names
-    }
-
-    pub fn target_for(&self, label: &str) -> Option<TargetConfig> {
-        let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
-        match label {
-            NATIVE => Some(self.native()),
-            other => self.endpoints.iter().find(|e| e.label == other).map(|e| TargetConfig::Openai {
-                url: e.url.clone(),
-                api_key: opt(&e.api_key),
-                label: Some(e.label.clone()),
-            }),
-        }
-    }
-
-    pub fn library_backend(&self, label: &str) -> String {
-        match self.endpoints.iter().find(|e| e.label == label) {
-            Some(e) => e.backend.clone(),
-            None => label.to_string(),
         }
     }
 }
@@ -197,7 +135,7 @@ mod tests {
     fn settings_round_trip_and_keys_are_private() {
         let dir = temp("a");
         let mut s = Settings::default();
-        s.endpoints[0].api_key = "sk-secret".into();
+        s.hf_token = "hf_secret".into();
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), s);
         #[cfg(unix)]
@@ -218,38 +156,38 @@ mod tests {
     }
 
     #[test]
-    fn bench_targets_are_the_native_engine_and_the_http_endpoints() {
-        let s = Settings::default();
-        assert_eq!(s.target_for("specrt").unwrap().kind(), "native");
-        assert_eq!(s.target_for("llama.cpp").unwrap().kind(), "openai");
-        assert!(s.target_for("transformers").is_none());
-        assert_eq!(s.bench_targets(), vec!["specrt", "llama.cpp", "vllm"]);
-    }
-
-    #[test]
-    fn old_settings_with_removed_backends_load_and_keep_their_bench_targets() {
+    fn an_old_settings_file_with_a_global_context_and_bandwidth_still_loads() {
         let old = r#"{
-            "endpoints": [
-                {"label": "llama.cpp", "backend": "llama.cpp", "url": "http://127.0.0.1:8080", "api_key": ""},
-                {"label": "transformers", "backend": "transformers", "url": "", "api_key": ""},
-                {"label": "lmstudio", "backend": "lmstudio", "url": "https://box:1234/v1", "api_key": "k"}
-            ],
+            "endpoints": [{"label": "vllm", "backend": "vllm", "url": "http://127.0.0.1:8000", "api_key": "k"}],
             "model_folders": ["/models"],
             "server": {"port": 9000, "api_key": "", "lan": true},
             "specrt_worker": "/opt/inference-bench-specrt",
             "python": "/usr/bin/python3",
             "specrt_ctx": 4096,
+            "gpu_bandwidth_gbs": 1792,
+            "placement": {"context": 2048, "devices": [], "stages": []},
             "hf_token": "hf_x"
         }"#;
         let s = Settings::parse(old);
-        assert_eq!(s.bench_targets(), vec!["specrt", "llama.cpp", "lmstudio"]);
-        assert_eq!((s.specrt_ctx, s.server.port, s.hf_token.as_str()), (4096, 9000, "hf_x"));
+        assert_eq!((s.default_ctx, s.server.port, s.hf_token.as_str()), (4096, 9000, "hf_x"));
         assert_eq!(s.model_folders, vec![PathBuf::from("/models")]);
-        assert_eq!(s.native(), TargetConfig::native(Some(4096)));
+        assert_eq!(s.ctx_for("anything"), 4096);
         let specs = s.specs();
         assert!(specs.auto_update);
         assert_eq!((specs.repo.as_str(), specs.branch.as_str(), specs.update_hours), ("v0l/inference-bench", "master", 24));
         assert!(s.spec_folders.is_empty());
+        let saved = serde_json::to_string(&s).unwrap();
+        assert!(!saved.contains("specrt_ctx") && !saved.contains("gpu_bandwidth") && !saved.contains("endpoints"));
+    }
+
+    #[test]
+    fn a_remembered_context_wins_over_the_default() {
+        let mut s = Settings::default();
+        s.model_ctx.insert("Qwen3-0.6B".into(), 32768);
+        assert_eq!((s.ctx_for("Qwen3-0.6B"), s.ctx_for("other")), (32768, 8192));
+        let dir = temp("c");
+        s.save(&dir).unwrap();
+        assert_eq!(Settings::load(&dir).ctx_for("Qwen3-0.6B"), 32768);
     }
 
     #[test]

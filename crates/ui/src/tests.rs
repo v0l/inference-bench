@@ -4,7 +4,6 @@ use egui_kittest::kittest::Queryable;
 use inference_bench_core::conversations::Turn;
 use inference_bench_core::fake::{FakeServer, Script, ScriptedModel};
 use inference_bench_core::library::{Format, Support};
-use inference_bench_core::settings::Endpoint;
 
 fn dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ib-ui-{name}-{}", std::process::id()));
@@ -72,7 +71,7 @@ fn harness(name: &str, tab: Tab) -> Harness<'static, App> {
 
 #[test]
 fn every_tab_draws() {
-    for tab in [Tab::Chat, Tab::Models, Tab::Bench, Tab::Server, Tab::Logs, Tab::Settings] {
+    for tab in [Tab::Chat, Tab::Models, Tab::Server, Tab::Logs, Tab::Settings] {
         let mut h = harness(&format!("tab{tab:?}"), tab);
         h.run();
         assert_eq!(h.state().tab, tab);
@@ -194,47 +193,6 @@ fn stop_cancels_a_stream_and_regenerate_replaces_the_last_reply() {
 }
 
 #[test]
-fn the_bench_grid_runs_from_the_ui_against_fake_http_backends() {
-    let a = FakeServer::start(Script { usage: Some((50, 3)), ..script() });
-    let b = FakeServer::start(Script { models: vec!["other".into()], ..script() });
-    let mut h = harness("bench", Tab::Bench);
-    {
-        let app = h.state_mut();
-        app.settings.endpoints = vec![
-            Endpoint { label: "alpha".into(), backend: "vllm".into(), url: a.url.clone(), api_key: String::new() },
-            Endpoint { label: "beta".into(), backend: "vllm".into(), url: b.url.clone(), api_key: String::new() },
-        ];
-        app.bench.models.insert("Qwen3-0.6B".into());
-        app.bench.models.insert("Weird-7B".into());
-        app.bench.backends.insert("alpha".into());
-        app.bench.backends.insert("beta".into());
-        app.bench.lengths = vec![(32, true), (64, true)];
-        app.bench.max_tokens = 3;
-    }
-    h.run();
-    let plan = crate::bench::build_plan(h.state()).expect("a plan");
-    assert_eq!(plan.cells().len(), 8);
-    let wake = h.state().wake.clone();
-    h.state_mut().bench.start(plan, wake);
-    let start = Instant::now();
-    while h.state().bench.running() || h.state().bench.results.is_empty() {
-        assert!(start.elapsed() < Duration::from_secs(20), "bench never finished");
-        h.step();
-        std::thread::sleep(Duration::from_millis(30));
-    }
-    h.run();
-    let results = h.state().bench.results.clone();
-    assert_eq!(results.len(), 8);
-    let find = |b: &str, m: &str| results.iter().find(|r| r.backend == b && r.model == m).unwrap();
-    assert!(find("alpha", "Qwen3-0.6B @32").error.is_none());
-    assert!(find("beta", "Qwen3-0.6B @32").error.is_some());
-    let skipped = find("alpha", "Weird-7B @64").error.as_ref().unwrap();
-    assert_eq!(skipped.kind, inference_bench_core::result::ErrorKind::ModelNotFound);
-    assert_eq!(h.state().bench.sessions.len(), 1);
-    assert!(h.state().dir.join("sessions").is_dir());
-}
-
-#[test]
 fn the_server_tab_starts_and_serves_the_loaded_model() {
     let mut h = harness("server", Tab::Server);
     {
@@ -314,10 +272,10 @@ fn the_logs_tab_filters_searches_and_saves() {
 #[test]
 fn settings_secrets_are_saved_private() {
     let mut h = harness("settings", Tab::Settings);
-    h.state_mut().settings.endpoints[0].api_key = "sk-test".into();
+    h.state_mut().settings.hf_token = "hf_test".into();
     h.state_mut().save_settings();
     let saved = Settings::load(&h.state().dir);
-    assert_eq!(saved.endpoints[0].api_key, "sk-test");
+    assert_eq!(saved.hf_token, "hf_test");
 }
 
 #[test]
@@ -368,7 +326,7 @@ fn a_failed_reply_shows_a_fault_under_the_transcript() {
 }
 
 #[test]
-fn chat_has_no_backend_picker_and_settings_list_bench_targets() {
+fn chat_has_no_backend_picker_and_settings_have_no_bench_or_engine_numbers() {
     let mut h = harness("nopicker", Tab::Chat);
     h.run();
     for name in ["llama.cpp", "vllm", "transformers", "specrt"] {
@@ -378,17 +336,23 @@ fn chat_has_no_backend_picker_and_settings_list_bench_targets() {
     assert!(!tree.contains("specrt") && !tree.contains("vllm"), "chat shows an engine choice: {tree}");
     h.state_mut().tab = Tab::Settings;
     h.run();
-    assert!(h.query_by_label("name for a new bench target").is_some());
+    for gone in ["name for a new bench target", "gpu bandwidth", "context", "native engine"] {
+        assert!(h.query_by_label_contains(gone).is_none(), "settings still has {gone}");
+    }
     assert!(h.query_by_label_contains("python3").is_none());
     assert!(h.query_by_label_contains("inference-bench-specrt").is_none());
-    let app = h.state_mut();
-    app.bench.models.insert("Qwen3-0.6B".into());
-    app.bench.backends.insert("specrt".into());
-    app.bench.backends.insert("llama.cpp".into());
-    app.bench.backends.insert("transformers".into());
-    let plan = crate::bench::build_plan(h.state()).expect("a plan");
-    let kinds: Vec<(&str, &str)> = plan.backends.iter().map(|(l, c)| (l.as_str(), c.kind())).collect();
-    assert_eq!(kinds, [("llama.cpp", "openai"), ("specrt", "native")]);
+    h.get_by_label("/path/to/models");
+}
+
+#[test]
+fn there_is_no_bench_tab() {
+    let mut h = harness("nobench", Tab::Chat);
+    h.run();
+    assert!(h.query_by_label("bench").is_none());
+    for label in ["chat", "models", "server"] {
+        h.get_by_label(label);
+    }
+    assert!(h.query_all_by_label("settings").count() >= 1);
 }
 
 #[test]
@@ -457,7 +421,7 @@ fn screenshots_with_real_data() {
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
         let mut app = App::new(d, wake_for(&cc.egui_ctx));
-        app.settings.specrt_ctx = 4096;
+        app.settings.default_ctx = 4096;
         app
     });
     pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
@@ -505,37 +469,7 @@ fn screenshots_with_real_data() {
     }
     shot(&mut h, "server");
 
-    {
-        let app = h.state_mut();
-        app.unload();
-        app.bench.models.insert("Qwen3-0.6B".into());
-        app.bench.models.insert("SmolLM2-135M".into());
-        app.bench.backends.insert("specrt".into());
-        app.bench.lengths = vec![(128, true), (512, true), (2048, false), (8192, false)];
-        app.bench.max_tokens = 64;
-        app.tab = Tab::Bench;
-    }
-    shot(&mut h, "bench-setup");
-    let plan = crate::bench::build_plan(h.state()).expect("plan");
-    let wake = h.state().wake.clone();
-    h.state_mut().bench.start(plan, wake);
-    pump_until(&mut h, 600, "bench", |a| !a.bench.running());
-    shot(&mut h, "bench-results");
-    {
-        let app = h.state_mut();
-        let first = app.bench.sessions[0].1.clone();
-        let mut second = first.clone();
-        for r in &mut second {
-            r.decode_tok_s = r.decode_tok_s.map(|v| v * 1.07);
-        }
-        app.bench.sessions.insert(0, ("previous run".into(), first));
-        app.bench.sessions[1].0 = "this run".into();
-        app.bench.sessions[1].1 = second;
-        app.bench.left = 0;
-        app.bench.right = 1;
-        app.bench.view = crate::bench::View::Compare;
-    }
-    shot(&mut h, "bench-compare");
+    h.state_mut().unload();
     h.state_mut().tab = Tab::Settings;
     shot(&mut h, "settings");
     h.state_mut().tab = Tab::Models;
@@ -730,7 +664,6 @@ fn detail_harness(name: &str, size: egui::Vec2, view: detail::View, other: Optio
         egui_bench::install(&cc.egui_ctx);
         let mut app = App::bare(d, wake_for(&cc.egui_ctx));
         app.tab = Tab::Models;
-        app.settings.gpu_bandwidth_gbs = Some(800);
         let mut detail = detail::Detail::from_view(view);
         if let Some(o) = other {
             detail.compare_with(o);
@@ -751,58 +684,6 @@ fn the_detail_view_draws_the_tiny_fixture_and_hovering_a_cell_shows_its_tooltip(
     assert!(h.query_by_label_contains("layer 0: ").is_some());
     assert!(h.query_by_label_contains("parameters").is_some());
     assert!(h.query_by_label("memory against context").is_some());
-}
-
-fn two_device_placement() -> specrt::placement::PlacementConfig {
-    toml::from_str(
-        r#"
-        context = 512
-        [[devices]]
-        name = "alpha"
-        memory_gib = 1
-        bandwidth_gbs = 100
-        tflops = 10
-        reserve_gib = 0
-        [[devices]]
-        name = "beta"
-        memory_gib = 1
-        bandwidth_gbs = 100
-        tflops = 10
-        reserve_gib = 0
-        [[stages]]
-        device = "alpha"
-        layers = [0, 1]
-        [[stages]]
-        device = "beta"
-        layers = [1, 3]
-        "#,
-    )
-    .unwrap()
-}
-
-#[test]
-fn placement_bands_follow_the_configured_stages() {
-    let view = detail_view("tiny", None);
-    assert!(detail::placement_bands(&Default::default(), &view.spec).is_none());
-    let bands = detail::placement_bands(&two_device_placement(), &view.spec).unwrap();
-    let ranges: Vec<(usize, usize)> = bands.iter().map(|b| (b.start, b.end)).collect();
-    assert_eq!(ranges, vec![(0, 1), (1, 3)]);
-    assert!(bands[1].tip.contains("stage 1 on beta"));
-}
-
-#[test]
-fn the_detail_view_draws_placement_bands_and_hovering_one_shows_its_stage() {
-    let d = dir("detail-bands");
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
-        egui_bench::install(&cc.egui_ctx);
-        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
-        app.tab = Tab::Models;
-        app.settings.placement = two_device_placement();
-        app.models.detail = Some(detail::Detail::from_view(detail_view("tiny", None)));
-        app
-    });
-    h.run();
-    assert!(h.query_by_label_contains("layer 0 ").is_some());
 }
 
 #[test]

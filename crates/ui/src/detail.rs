@@ -200,28 +200,19 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let back = header(app, &mut detail, ui);
     if !back {
         let free = app.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes));
-        let bands = detail.view.as_ref().ok().and_then(|v| placement_bands(&app.settings.placement, &v.spec)).unwrap_or_default();
-        body(&mut detail, ui, free, app.settings.gpu_bandwidth_gbs, &bands);
+        body(&mut detail, ui, free);
         app.models.detail = Some(detail);
     }
 }
 
-pub fn placement_bands(cfg: &specrt::placement::PlacementConfig, spec: &Spec) -> Option<Vec<strip::Band>> {
-    if cfg.devices.is_empty() {
-        return None;
-    }
-    let placed = cfg.place(spec).ok()?;
-    Some(strip::bands_of(&placed))
-}
-
-fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth: Option<u64>, bands: &[strip::Band]) {
+fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
-        content(detail, ui, free, bandwidth, bands);
+        content(detail, ui, free);
     });
 }
 
-fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth: Option<u64>, bands: &[strip::Band]) {
+fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>) {
     let Detail { view, other, kind, layer, diagram, .. } = detail;
     let view = match view {
         Ok(v) => v,
@@ -245,7 +236,7 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
             if views.len() > 1 {
                 Line::new().legend(&v.name).gap(10.0).value(human_size(v.anatomy.total_bytes)).size(11.0).show(ui);
             }
-            strip::draw(ui, n, &v.anatomy, scale, kind, layer, if n == 0 { bands } else { &[] });
+            strip::draw(ui, n, &v.anatomy, scale, kind, layer);
         }
         strip::legend(ui, &view.anatomy);
     });
@@ -287,7 +278,7 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
             if views.len() > 1 {
                 Line::new().legend(&v.name).show(ui);
             }
-            table::draw(ui, v, bandwidth);
+            table::draw(ui, v);
         }
     });
 }
@@ -452,7 +443,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), v.to_string()).unwrap();
         let view = Detail::open(&local("no-inter", &dir)).view.unwrap_or_else(|e| panic!("{e}"));
-        let entries = crate::table::entries(&view, None);
+        let entries = crate::table::entries(&view);
         assert!(entries.iter().any(|e| e.field == "intermediate" && e.value == "unknown"));
     }
 }

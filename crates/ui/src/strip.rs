@@ -84,46 +84,9 @@ fn find<'a>(a: &'a ModelAnatomy, name: &str) -> Option<&'a Component> {
     a.components.iter().find(|c| c.name == name)
 }
 
-pub struct Band {
-    pub start: usize,
-    pub end: usize,
-    pub label: String,
-    pub tip: String,
-}
-
-pub fn bands_of(p: &specrt::placement::Placement) -> Vec<Band> {
-    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-    p.stages
-        .iter()
-        .enumerate()
-        .map(|(i, s)| Band {
-            start: s.start,
-            end: s.end,
-            label: format!("{} {}", i, s.device_name),
-            tip: format!(
-                "stage {i} on {}\nlayers {}..{}\n{:.2} GiB weights, {:.2} GiB kv, {:.2} GiB of {:.1} GiB\nstep {:.3} ms, hop {:.3} ms",
-                s.device_name,
-                s.start,
-                s.end,
-                gib(s.weight_bytes),
-                gib(s.kv_bytes),
-                gib(s.used_bytes()),
-                gib(s.memory_bytes),
-                s.compute_secs * 1e3,
-                s.hop_secs * 1e3
-            ),
-        })
-        .collect()
-}
-
-pub fn band_tint(i: usize) -> Color32 {
-    [READOUT, OK, TRACE, VALUE][i % 4]
-}
-
-pub fn draw(ui: &mut egui::Ui, salt: usize, a: &ModelAnatomy, scale: u64, kind: &mut LayerKind, picked: &mut Option<usize>, bands: &[Band]) {
+pub fn draw(ui: &mut egui::Ui, salt: usize, a: &ModelAnatomy, scale: u64, kind: &mut LayerKind, picked: &mut Option<usize>) {
     let width = ui.available_width();
-    let band_h = if bands.is_empty() { 0.0 } else { 20.0 };
-    let (outer, _) = ui.allocate_exact_size(vec2(width, STRIP_H + 18.0 + band_h), Sense::hover());
+    let (outer, _) = ui.allocate_exact_size(vec2(width, STRIP_H + 18.0), Sense::hover());
     let base = egui::Id::new(("strip", salt));
     let area = Rect::from_min_size(outer.min, vec2(width, STRIP_H));
     ui.painter().rect_filled(area.expand2(vec2(4.0, 2.0)), 2.0, WELL);
@@ -138,26 +101,10 @@ pub fn draw(ui: &mut egui::Ui, salt: usize, a: &ModelAnatomy, scale: u64, kind: 
         cap(ui, base.with("embed"), r, "embed", c.params, scale, LEGEND, cap_tip(c, "bf16"));
     }
     x += CAP_W + 6.0;
-    let first_x = x;
     for l in &a.layers {
         let r = Rect::from_min_size(pos2(x, area.top()), vec2(cell_w, STRIP_H));
         layer_cell(ui, base.with(l.index), r, l, scale, kind, picked);
         x += cell_w + gap;
-    }
-    for (i, b) in bands.iter().enumerate() {
-        let left = first_x + b.start as f32 * (cell_w + gap);
-        let right = first_x + b.end as f32 * (cell_w + gap) - gap;
-        let r = Rect::from_min_max(pos2(left, area.bottom() + 18.0), pos2(right.max(left + 2.0), area.bottom() + 18.0 + 14.0));
-        let tint = band_tint(i);
-        let resp = ui.interact(r, base.with(("band", i)), Sense::hover());
-        let p = ui.painter();
-        p.rect_filled(r, 2.0, tint.gamma_multiply(0.35));
-        p.rect_stroke(r, 2.0, Stroke::new(1.0, tint), StrokeKind::Inside);
-        if r.width() > 40.0 {
-            let g = p.layout_no_wrap(b.label.clone(), figure(9.0), VALUE);
-            p.galley(pos2(r.left() + 4.0, r.top() + 1.0), g, VALUE);
-        }
-        resp.on_hover_text(b.tip.clone());
     }
     x += 6.0 - gap;
     if let Some(c) = find(a, "lm_head") {

@@ -1,5 +1,3 @@
-mod bench;
-mod chart;
 mod chat;
 mod breakdown;
 mod table;
@@ -16,7 +14,6 @@ mod shell;
 mod specs;
 
 use eframe::egui;
-use egui_bench::prelude::*;
 use inference_bench_core::engine::{Command, Engine, EngineEvent, Wake};
 use inference_bench_core::gpu::GpuStats;
 use inference_bench_core::library::{LocalModel, Sources};
@@ -31,7 +28,6 @@ use std::time::{Duration, Instant};
 pub enum Tab {
     Chat,
     Models,
-    Bench,
     Server,
     Logs,
     Settings,
@@ -52,7 +48,6 @@ pub struct App {
     pub notice: Option<(bool, String)>,
     pub chat: chat::ChatState,
     pub models: models::ModelsState,
-    pub bench: bench::BenchState,
     pub server: server::ServerState,
     pub logs: inference_bench_core::logging::LogBuffer,
     pub logs_ui: logs::LogsState,
@@ -82,7 +77,6 @@ impl App {
             notice: None,
             chat: chat::ChatState::load(&dir, &settings),
             models: models::ModelsState::default(),
-            bench: bench::BenchState::load(&dir),
             server: server::ServerState::default(),
             logs: inference_bench_core::logging::LogBuffer::new(5000),
             logs_ui: logs::LogsState::default(),
@@ -108,10 +102,15 @@ impl App {
     }
 
     pub fn load_model(&mut self, model: &LocalModel) {
+        let ctx = self.settings.ctx_for(&model.name);
+        self.load_model_with(model, ctx);
+    }
+
+    pub fn load_model_with(&mut self, model: &LocalModel, ctx: usize) {
         self.engine.send(Command::Load {
             model_id: model.model_id(inference_bench_core::target::NATIVE),
             display: model.name.clone(),
-            max_ctx: Some(self.settings.specrt_ctx),
+            max_ctx: Some(ctx),
         });
     }
 
@@ -149,7 +148,6 @@ impl App {
         }
         self.chat.pump(&self.dir);
         self.models.pump(&mut self.notice);
-        self.bench.pump(&self.dir, &mut self.notice);
         if self.specs.pump(&self.wake, &self.dir, &self.settings, &mut self.notice) {
             self.rescan();
         }
@@ -171,7 +169,6 @@ impl eframe::App for App {
         }
         let animating = self.chat.streaming()
             || self.loading.is_some()
-            || self.bench.running()
             || self.models.downloading()
             || self.specs.busy()
             || self.scan.busy();

@@ -317,7 +317,7 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn context_limit(app: &App) -> usize {
-    app.settings.specrt_ctx
+    app.loaded().map_or_else(|| app.settings.default_ctx, |l| l.ctx)
 }
 
 fn side_list(app: &mut App, ui: &mut egui::Ui) {

@@ -12,6 +12,7 @@ pub struct Loaded {
     pub display: String,
     pub load_secs: f64,
     pub vision: bool,
+    pub ctx: usize,
 }
 
 pub enum Command {
@@ -131,7 +132,8 @@ fn run(
                     Ok(()) => {
                         let vision = native.capabilities().vision;
                         backend = Some(native);
-                        let info = Loaded { model_id, display, load_secs: started.elapsed().as_secs_f64(), vision };
+                        let ctx = max_ctx.unwrap_or(specrt::engine::DEFAULT_CTX);
+                        let info = Loaded { model_id, display, load_secs: started.elapsed().as_secs_f64(), vision, ctx };
                         *shared.lock().unwrap() = Some(info.clone());
                         emit(EngineEvent::Loaded(info));
                     }
