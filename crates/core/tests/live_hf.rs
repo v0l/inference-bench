@@ -50,3 +50,18 @@ fn live_search_and_a_resumed_download() {
         println!("matches the copy already in the hub cache byte for byte");
     }
 }
+
+#[test]
+#[ignore = "talks to huggingface.co"]
+fn live_model_tree_counts_for_qwen3_8_27b() {
+    use inference_bench_core::hf::model_tree_now;
+    let hub = Hub::new(HF_BASE, "");
+    let cache = std::env::temp_dir().join(format!("ib-live-tree-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&cache);
+    let tree = model_tree_now(&hub, "Qwen/Qwen3.8-27B", &|_| None, &cache).unwrap();
+    println!("chain {:?} counts {:?}", tree.chain, tree.counts);
+    let orca = model_tree_now(&hub, "orcarouter/Qwen3.8-27B-Uncensored-NVFP4", &|_| None, &cache).unwrap();
+    println!("orca chain {:?} {:?}", orca.chain, orca.relations);
+    assert_eq!(orca.chain.last().map(String::as_str), Some("Qwen/Qwen3.8-27B"));
+    assert!(tree.counts.iter().all(|c| c.1 > 0));
+}

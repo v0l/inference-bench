@@ -1593,8 +1593,10 @@ fn tree_hub() -> String {
     use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
+    let own = base.clone();
     std::thread::spawn(move || {
         for mut s in listener.incoming().flatten() {
+            let own = own.clone();
             std::thread::spawn(move || {
                 let mut r = BufReader::new(s.try_clone().unwrap());
                 let mut line = String::new();
@@ -1607,18 +1609,23 @@ fn tree_hub() -> String {
                         break;
                     }
                 }
+                let ids = |n: usize| format!("[{}]", (0..n).map(|i| format!(r#"{{"id":"u/m{i}","downloads":9,"likes":1}}"#)).collect::<Vec<_>>().join(","));
+                let next = |filter: &str| format!("link: <{own}/api/models?filter={filter}&limit=1000&cursor=2>; rel=\"next\"\r\n");
+                let page_two = path.contains("cursor=2");
                 let (extra, body) = if path.starts_with("/api/models/Qwen/Qwen3.8-27B") {
-                    ("", br#"{"cardData":{}}"#.to_vec())
-                } else if path.contains("filter=base_model%3Aquantized%3AQwen%2FQwen3.8-27B") {
-                    ("x-total-count: 1794\r\n", br#"[{"id":"unsloth/Qwen3.8-27B-GGUF","downloads":9,"likes":1}]"#.to_vec())
+                    (String::new(), br#"{"cardData":{}}"#.to_vec())
+                } else if path.contains("filter=base_model%3Aquantized") && page_two {
+                    (String::new(), ids(2).into_bytes())
+                } else if path.contains("filter=base_model%3Aquantized") {
+                    (next("base_model%3Aquantized%3AQwen%2FQwen3.8-27B"), ids(3).into_bytes())
                 } else if path.contains("filter=base_model%3Afinetune") {
-                    ("x-total-count: 902\r\n", b"[]".to_vec())
+                    (String::new(), ids(4).into_bytes())
                 } else if path.contains("filter=base_model%3Aadapter") {
-                    ("x-total-count: 334\r\n", b"[]".to_vec())
+                    (String::new(), ids(1).into_bytes())
                 } else if path.contains("filter=base_model%3Amerge") {
-                    ("x-total-count: 31\r\n", b"[]".to_vec())
+                    (String::new(), b"[]".to_vec())
                 } else {
-                    ("", b"{}".to_vec())
+                    (String::new(), b"{}".to_vec())
                 };
                 let _ = write!(s, "HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                 let _ = s.write_all(&body);
@@ -1698,12 +1705,12 @@ fn the_detail_tree_reads_the_counts_from_the_hub_and_a_count_opens_discover_filt
     let tree = h.state().models.detail.as_ref().unwrap().tree.clone().unwrap().unwrap();
     assert_eq!(tree.chain, ["Qwen/Qwen3.8-27B-FP8", "Qwen/Qwen3.8-27B"]);
     let counts: Vec<u64> = tree.counts.iter().map(|c| c.1).collect();
-    assert_eq!(counts, [334, 902, 31, 1794]);
+    assert_eq!(counts, [1, 4, 0, 5]);
     h.run();
-    h.get_by_label("quantizations 1794").click();
+    h.get_by_label("quantizations 5").click();
     pump_until(&mut h, 20, "discover", |a| a.models.pane == models::Pane::Discover && !a.models.results.is_empty());
     let app = h.state();
-    assert_eq!(app.models.results[0].id, "unsloth/Qwen3.8-27B-GGUF");
+    assert_eq!(app.models.results[0].id, "u/m0");
     assert_eq!(app.models.relation.as_ref().map(|r| (r.0, r.1.as_str())), Some((inference_bench_core::library::Relation::Quantized, "Qwen/Qwen3.8-27B")));
     assert!(app.models.detail.is_none());
 }
@@ -1727,4 +1734,23 @@ fn screenshots_of_the_model_tree() {
     pump_until(&mut h, 20, "tree", |a| a.models.detail.as_ref().is_some_and(|d| d.tree.is_some()));
     h.run();
     h.render().unwrap().save(out.join("detail-tree.png")).unwrap();
+}
+
+#[test]
+#[ignore = "needs the hub cache and huggingface.co; run with SHOTS=/tmp/shots"]
+fn screenshots_of_the_model_tree_with_the_real_hub_cache() {
+    let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("/tmp/shots".into()));
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness("realtree", Tab::Models);
+    h.state_mut().library = inference_bench_core::library::scan_hub(&inference_bench_core::library::hub_dir());
+    h.state_mut().models.show_all = true;
+    assert!(!h.state().library.is_empty());
+    h.run();
+    h.render().unwrap().save(out.join("real-models-tree.png")).unwrap();
+    let pick = std::env::var("PICK").unwrap_or("orcarouter/Qwen3.8-27B-Uncensored-NVFP4".into());
+    let m = h.state().library.iter().find(|m| m.name == pick).cloned().unwrap_or_else(|| h.state().library[0].clone());
+    h.state_mut().models.detail = Some(detail::Detail::open(&m));
+    pump_until(&mut h, 60, "tree", |a| a.models.detail.as_ref().is_some_and(|d| d.tree.is_some()));
+    h.run();
+    h.render().unwrap().save(out.join("real-detail-tree.png")).unwrap();
 }

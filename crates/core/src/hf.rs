@@ -110,16 +110,22 @@ impl Hub {
     }
 
     pub fn child_count(&self, base: &str, relation: Relation) -> Result<u64, String> {
-        let url = self.child_url(base, relation);
-        let mut resp = self.get(&url).query("limit", "1000").call().map_err(|e| format!("{url}: {e}"))?;
-        if resp.status().as_u16() >= 400 {
-            return Err(format!("{url}: HTTP {}", resp.status()));
+        let mut url = format!("{}&limit=1000", self.child_url(base, relation));
+        let mut total = 0u64;
+        for _ in 0..MAX_PAGES {
+            let mut resp = self.get(&url).call().map_err(|e| format!("{url}: {e}"))?;
+            if resp.status().as_u16() >= 400 {
+                return Err(format!("{url}: HTTP {}", resp.status()));
+            }
+            let next = resp.headers().get("link").and_then(|v| v.to_str().ok()).and_then(next_link);
+            let page: Vec<serde::de::IgnoredAny> = resp.body_mut().read_json().map_err(|e| format!("bad children reply: {e}"))?;
+            total += page.len() as u64;
+            match next {
+                Some(n) => url = n,
+                None => break,
+            }
         }
-        if let Some(total) = resp.headers().get("x-total-count").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok()) {
-            return Ok(total);
-        }
-        let page: Vec<serde_json::Value> = resp.body_mut().read_json().map_err(|e| format!("bad children reply: {e}"))?;
-        Ok(page.len() as u64)
+        Ok(total)
     }
 
     pub fn files(&self, repo: &str) -> Result<Vec<RepoFile>, String> {
@@ -232,6 +238,15 @@ struct TreeCache {
 
 const CACHE_SECS: u64 = 86_400;
 const MAX_DEPTH: usize = 6;
+const MAX_PAGES: usize = 40;
+
+fn next_link(header: &str) -> Option<String> {
+    header.split(',').find(|part| part.contains("rel=\"next\"")).and_then(|part| {
+        let start = part.find('<')? + 1;
+        let end = part.find('>')?;
+        Some(part[start..end].to_string())
+    })
+}
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
@@ -422,9 +437,11 @@ mod tests {
     fn tree_server(hits: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
+        let own = base.clone();
         std::thread::spawn(move || {
             for mut s in listener.incoming().flatten() {
                 let hits = hits.clone();
+                let own = own.clone();
                 std::thread::spawn(move || {
                     let mut r = BufReader::new(s.try_clone().unwrap());
                     let mut line = String::new();
@@ -437,15 +454,19 @@ mod tests {
                             break;
                         }
                     }
+                    let page_two = path.contains("cursor=2");
+                    let link = |filter: &str| format!("link: <{own}/api/models?filter={filter}&limit=1000&cursor=2>; rel=\"next\"\r\n");
                     hits.fetch_add(1, Ordering::SeqCst);
                     let (extra, body) = if path.starts_with("/api/models/org/Mid") {
                         (String::new(), br#"{"cardData":{"base_model":"Qwen/Base","base_model_relation":"finetune"}}"#.to_vec())
                     } else if path.starts_with("/api/models/Qwen/Base") {
                         (String::new(), br#"{"cardData":{}}"#.to_vec())
+                    } else if path.contains("filter=base_model%3Aquantized%3AQwen%2FBase") && page_two {
+                        (String::new(), br#"[{"id":"d"},{"id":"e"}]"#.to_vec())
                     } else if path.contains("filter=base_model%3Aquantized%3AQwen%2FBase") {
-                        ("x-total-count: 1794\r\n".to_string(), br#"[{"id":"unsloth/Base-GGUF"}]"#.to_vec())
+                        (link("base_model%3Aquantized%3AQwen%2FBase"), br#"[{"id":"a"},{"id":"b"},{"id":"c"}]"#.to_vec())
                     } else if path.contains("filter=base_model%3Afinetune%3AQwen%2FBase") {
-                        ("x-total-count: 902\r\n".to_string(), b"[]".to_vec())
+                        (String::new(), b"[]".to_vec())
                     } else if path.contains("filter=base_model") {
                         (String::new(), br#"[{"id":"a/b"},{"id":"c/d"}]"#.to_vec())
                     } else {
@@ -471,7 +492,7 @@ mod tests {
         assert_eq!(t.chain, ["org/Mid", "Qwen/Base"]);
         assert_eq!(t.relations, ["finetune"]);
         let count = |name: &str| t.counts.iter().find(|c| c.0 == name).unwrap().1;
-        assert_eq!((count("quantized"), count("finetune"), count("adapter"), count("merge")), (1794, 902, 2, 2));
+        assert_eq!((count("quantized"), count("finetune"), count("adapter"), count("merge")), (5, 0, 2, 2));
         let first = hits.load(Ordering::SeqCst);
         let again = model_tree(&hub, "org/Mid", &none, &cache, 2000).unwrap();
         assert_eq!(again, t);
