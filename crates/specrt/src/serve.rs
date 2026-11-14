@@ -79,6 +79,14 @@ impl ServeOptions {
         }
     }
 
+    pub fn check_pool(&self, spec: &Spec) -> Result<()> {
+        let layout = self.layout(spec);
+        if layout.kv_blocks == 0 {
+            return Ok(());
+        }
+        check_pool_tokens(layout.kv_blocks * crate::codegen::PAGE, layout.max_ctx)
+    }
+
     pub fn layout(&self, spec: &Spec) -> Layout {
         let kv = self.kv_cache_bytes.map(|b| b as usize).or_else(|| {
             self.kv_cache_tokens.map(|t| (t.div_ceil(crate::codegen::PAGE) + self.max_num_seqs) * kv_block_bytes(spec, 1))
@@ -88,6 +96,14 @@ impl ServeOptions {
         layout.prefill_chunk = layout.prefill_chunk.min(self.max_batched_tokens.max(64));
         layout
     }
+}
+
+pub fn check_pool_tokens(pool_tokens: usize, max_model_len: usize) -> Result<()> {
+    anyhow::ensure!(
+        pool_tokens >= max_model_len,
+        "the KV cache holds {pool_tokens} tokens but one request may be {max_model_len} tokens long: raise the KV cache size or lower the context length"
+    );
+    Ok(())
 }
 
 pub const LATENCY_BUCKETS: [f64; 14] =
@@ -237,6 +253,7 @@ impl Core {
     pub fn start(spec: &Spec, opts: ServeOptions) -> Result<Arc<Core>> {
         let max_model_len = opts.model_len(spec)?;
         anyhow::ensure!(opts.max_num_seqs >= 1, "max_num_seqs must be at least 1");
+        opts.check_pool(spec)?;
         let (jobs, inbox) = channel::<Job>();
         let (ready_tx, ready) = channel::<Result<bool>>();
         let stats = Arc::new(Mutex::new(Stats { kv_block_bytes: kv_block_bytes(spec, 1), ..Stats::default() }));
@@ -410,6 +427,7 @@ fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
     let spec = &spec;
     let layout = opts.layout(spec);
     let rt = Runtime::load_layout(spec, layout)?;
+    check_pool_tokens(rt.kv_blocks() * crate::codegen::PAGE, layout.max_ctx)?;
     let block = kv_block_bytes(spec, 1) as u64;
     tracing::info!(
         spec = %spec.name,

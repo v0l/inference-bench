@@ -434,3 +434,53 @@ fn serving_logprobs_match_a_log_softmax_of_the_full_prompt_logits() {
         }
     }
 }
+
+#[test]
+fn a_pool_smaller_than_one_max_model_len_is_refused() {
+    use specrt::serve::{Core, ServeOptions};
+    let s = spec_for("tiny-qwen3.5");
+    let block = specrt::runtime::kv_block_bytes(&s, 1) as u64;
+    let small = ServeOptions { max_model_len: Some(512), max_num_seqs: 4, kv_cache_bytes: Some(block * 31), ..ServeOptions::default() };
+    let e = Core::start(&s, small).err().expect("refused").to_string();
+    assert!(e.contains("KV cache holds 496 tokens") && e.contains("512"), "{e}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn four_requests_share_a_pool_of_one_and_a_half_max_model_lens_and_match_single_sequence() {
+    use specrt::sched::{Finish, Request};
+    use specrt::serve::{Core, Job, SeqEvent, ServeOptions};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let s = spec_for("tiny-qwen3.5");
+    let prompts: Vec<Vec<u32>> = (0..4u32).map(|q| (0..300u32).map(|i| (i * 7 + q * 131 + 3) % 1024).collect()).collect();
+    let want = single_greedy(&s, &prompts, 60);
+    let block = specrt::runtime::kv_block_bytes(&s, 1) as u64;
+    let blocks = 512 * 3 / 2 / specrt::codegen::PAGE as u64;
+    let opts = ServeOptions { max_model_len: Some(512), max_num_seqs: 4, kv_cache_bytes: Some(block * blocks), ..ServeOptions::default() };
+    let core = Core::start(&s, opts).unwrap();
+    let rxs: Vec<_> = prompts
+        .iter()
+        .map(|p| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let request = Request { prompt: p.clone(), max_tokens: 60, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() };
+            core.submit(Job { request, events: tx, cancel: Arc::new(AtomicBool::new(false)) }).unwrap();
+            rx
+        })
+        .collect();
+    for (rx, want) in rxs.iter().zip(&want) {
+        let mut got = Vec::new();
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap() {
+                SeqEvent::Token(t) => got.push(t),
+                SeqEvent::Finished { finish, .. } => {
+                    assert_eq!(finish, Finish::Length);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(&got, want);
+    }
+    assert!(core.stats().preemptions > 0, "four 360 token requests cannot fit a 768 token pool without preemption");
+}

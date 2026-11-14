@@ -263,16 +263,12 @@ fn the_estimate_turns_red_when_the_model_does_not_fit_free_memory() {
 }
 
 #[test]
-fn the_default_context_is_reduced_to_what_fits_and_a_remembered_one_wins() {
+fn the_default_context_is_the_default_and_a_remembered_one_wins_whatever_the_memory() {
     let a = detail_view("27b", Some("qwen3.8-27b-exact.toml")).anatomy;
     let max = crate::load::max_context(&a);
-    let roomy = Some(a.total_bytes + a.state_bytes_per_seq + a.kv_bytes_per_token * 131072);
-    assert_eq!(crate::load::initial_ctx(None, 8192, &a, roomy, 1, max), 8192);
-    let tight = Some(a.total_bytes + a.state_bytes_per_seq + a.kv_bytes_per_token * 3000);
-    assert_eq!(crate::load::initial_ctx(None, 8192, &a, tight, 1, max), 2560);
-    assert_eq!(crate::load::initial_ctx(Some(100_000), 8192, &a, tight, 1, max), 100_000);
-    assert_eq!(crate::load::initial_ctx(Some(999_999), 8192, &a, tight, 1, max), max);
-    assert_eq!(crate::load::initial_ctx(None, 8192, &a, None, 1, max), 8192);
+    assert_eq!(crate::load::initial_ctx(None, 8192, max), 8192);
+    assert_eq!(crate::load::initial_ctx(Some(100_000), 8192, max), 100_000);
+    assert_eq!(crate::load::initial_ctx(Some(999_999), 8192, max), max);
 }
 
 fn loading_harness(name: &str, gate: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Harness<'static, App> {
@@ -386,7 +382,7 @@ fn serving_harness(name: &str, seqs: usize) -> Harness<'static, App> {
         let app = h.state_mut();
         app.engine = inference_bench_core::fake::engine(app.wake.clone(), slow_script());
         let m = app.library[0].clone();
-        app.engine.send(Command::Load { model_id: m.model_id(inference_bench_core::target::NATIVE), display: m.name.clone(), max_ctx: Some(4096), max_num_seqs: Some(seqs), served_names: Vec::new() });
+        app.engine.send(Command::Load { model_id: m.model_id(inference_bench_core::target::NATIVE), display: m.name.clone(), max_ctx: Some(4096), max_num_seqs: Some(seqs), kv_cache_bytes: None, served_names: Vec::new() });
     }
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     let handle = h.state().engine.handle();
@@ -430,16 +426,47 @@ fn the_load_dialog_has_a_parallel_requests_slider_and_the_estimate_grows_with_it
     dialog.seqs = 1;
     let one = dialog.estimate(free).unwrap();
     dialog.seqs = 4;
+    dialog.kv_gb = 1.0;
     let four = dialog.estimate(free).unwrap();
-    assert_eq!(four.kv, one.kv * 4);
-    assert!(four.total() > one.total());
+    assert_eq!(four.kv, 1 << 30);
+    assert_eq!(dialog.max, crate::load::max_context(&dialog.view.as_ref().unwrap().anatomy));
     assert_eq!(four.weights, one.weights);
     let a = detail_view("seqs-27b", Some("qwen3.8-27b-exact.toml")).anatomy;
-    let (a1, a4) = (crate::load::estimate(&a, 8192, 1, None), crate::load::estimate(&a, 8192, 4, None));
+    let (a1, a4) = (crate::load::estimate(&a, 1 << 30, 1, None), crate::load::estimate(&a, 1 << 30, 4, None));
+    assert_eq!(a4.kv, a1.kv);
     assert_eq!(a4.state, a1.state * 4);
     assert!(a.state_bytes_per_seq > 100 << 20);
-    assert_eq!(crate::load::largest_seqs(&a, 8192, Some(a.total_bytes)), 1);
-    assert_eq!(crate::load::largest_seqs(&a, 8192, None), crate::load::MAX_SEQS);
+    assert_eq!(crate::load::largest_seqs(&a, Some(a.total_bytes)), 1);
+    assert_eq!(crate::load::largest_seqs(&a, None), crate::load::MAX_SEQS);
+}
+
+#[test]
+fn the_kv_pool_is_shared_and_must_hold_one_full_length_request() {
+    let a = detail_view("pool-27b", Some("qwen3.8-27b-exact.toml")).anatomy;
+    let max = crate::load::max_context(&a);
+    let pool = a.kv_bytes_per_token * max as u64 * 3 / 2;
+    assert!(crate::load::pool_holds_one(&a, pool, max));
+    assert!((crate::load::concurrency(&a, pool, max) - 1.5).abs() < 0.01);
+    assert!(!crate::load::pool_holds_one(&a, a.kv_bytes_per_token * (max as u64 - 1), max));
+    let free = Some(a.total_bytes + a.state_bytes_per_seq * 8 + (40u64 << 30));
+    let gb = crate::load::default_kv_gb(&a, free, 8, max);
+    assert!(gb * (1u64 << 30) as f64 <= 40.0 * (1u64 << 30) as f64);
+    assert!(gb > 1.0);
+}
+
+#[test]
+fn the_load_dialog_slider_runs_to_the_model_max_with_four_parallel_requests() {
+    let mut h = harness("slider-max", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    let d = h.state_mut().load.as_mut().unwrap();
+    d.seqs = 4;
+    let a = &d.view.as_ref().unwrap().anatomy;
+    assert_eq!(d.max, crate::load::max_context(a));
+    d.ctx = d.max;
+    assert!(d.estimate(Some(96 << 30)).unwrap().kv <= (96u64 << 30));
 }
 
 #[test]

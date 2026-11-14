@@ -36,7 +36,7 @@ pub struct Loaded {
 }
 
 pub enum Command {
-    Load { model_id: String, display: String, max_ctx: Option<usize>, max_num_seqs: Option<usize>, served_names: Vec<String> },
+    Load { model_id: String, display: String, max_ctx: Option<usize>, max_num_seqs: Option<usize>, kv_cache_bytes: Option<u64>, served_names: Vec<String> },
     Unload,
     Chat { request: ChatRequest, events: Sender<ChatEvent>, queued: Instant },
     Shutdown,
@@ -244,11 +244,12 @@ impl Backend {
     }
 }
 
-pub fn serve_options(max_ctx: Option<usize>, seqs: usize) -> ServeOptions {
+pub fn serve_options(max_ctx: Option<usize>, seqs: usize, kv_cache_bytes: Option<u64>) -> ServeOptions {
     ServeOptions {
         max_model_len: max_ctx,
         max_num_seqs: seqs,
-        kv_cache_tokens: max_ctx.map(|c| c.saturating_mul(seqs)),
+        kv_cache_bytes,
+        kv_cache_tokens: None,
         ..ServeOptions::default()
     }
 }
@@ -265,6 +266,7 @@ fn open(
     model_id: &str,
     max_ctx: Option<usize>,
     seqs: usize,
+    kv_cache_bytes: Option<u64>,
     factory: &Factory,
     serving: &ServingFactory,
     stats: &StatsSource,
@@ -273,7 +275,7 @@ fn open(
     let mut note = None;
     let attempts = if seqs > 1 { vec![seqs, 1] } else { Vec::new() };
     for (n, attempt) in attempts.into_iter().enumerate() {
-        let Some(mut target) = serving(serve_options(max_ctx, attempt)) else { break };
+        let Some(mut target) = serving(serve_options(max_ctx, attempt, kv_cache_bytes)) else { break };
         target.set_progress(Some(progress.clone()));
         match target.load(model_id) {
             Ok(()) => {
@@ -324,7 +326,7 @@ fn run(
                 release(&mut backend);
                 emit(EngineEvent::Unloaded);
             }
-            Command::Load { model_id, display, max_ctx, max_num_seqs, served_names } => {
+            Command::Load { model_id, display, max_ctx, max_num_seqs, kv_cache_bytes, served_names } => {
                 release(&mut backend);
                 emit(EngineEvent::Loading(display.clone()));
                 let started = Instant::now();
@@ -336,7 +338,7 @@ fn run(
                         wake();
                     })
                 };
-                match open(&model_id, max_ctx, seqs, &factory, &serving, &shared.stats, &sink) {
+                match open(&model_id, max_ctx, seqs, kv_cache_bytes, &factory, &serving, &shared.stats, &sink) {
                     Ok(o) => {
                         backend = Some(o.backend);
                         let ctx = max_ctx.unwrap_or(specrt::engine::DEFAULT_CTX);
@@ -445,7 +447,7 @@ mod tests {
     }
 
     fn load(model: &str, display: &str) -> Command {
-        Command::Load { model_id: model.into(), display: display.into(), max_ctx: None, max_num_seqs: None, served_names: Vec::new() }
+        Command::Load { model_id: model.into(), display: display.into(), max_ctx: None, max_num_seqs: None, kv_cache_bytes: None, served_names: Vec::new() }
     }
 
     fn engine() -> Engine {
@@ -520,10 +522,16 @@ mod tests {
 
     fn batched(seqs: Option<usize>) -> Engine {
         let e = crate::fake::engine(Arc::new(|| {}), slow_script());
-        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: seqs, served_names: Vec::new() });
+        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: seqs, kv_cache_bytes: None, served_names: Vec::new() });
         wait_event(&e);
         assert!(matches!(wait_event(&e), EngineEvent::Loaded(_)));
         e
+    }
+
+    #[test]
+    fn serve_options_pass_the_pool_size_and_not_context_times_seqs() {
+        let o = serve_options(Some(8192), 4, Some(3 << 30));
+        assert_eq!((o.kv_cache_bytes, o.kv_cache_tokens, o.max_model_len, o.max_num_seqs), (Some(3 << 30), None, Some(8192), 4));
     }
 
     fn ask_all(h: &Handle, n: usize) -> Vec<Receiver<ChatEvent>> {
@@ -628,7 +636,7 @@ mod tests {
             if opts.max_num_seqs > 1 { Some(Box::new(NoParallel) as Box<dyn Target>) } else { inner(opts) }
         });
         let e = Engine::with_factories(Arc::new(|| {}), ScriptedModel::factory(slow_script()), serving);
-        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: Some(4), served_names: Vec::new() });
+        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: Some(4), kv_cache_bytes: Some(1 << 30), served_names: Vec::new() });
         wait_event(&e);
         let EngineEvent::Loaded(l) = wait_event(&e) else { panic!("not loaded") };
         assert_eq!(l.max_num_seqs, 1);
@@ -640,7 +648,7 @@ mod tests {
     #[test]
     fn the_scripted_fake_cannot_load_unknown_models_batched_either() {
         let e = crate::fake::engine(Arc::new(|| {}), slow_script());
-        e.send(Command::Load { model_id: "other".into(), display: "O".into(), max_ctx: None, max_num_seqs: Some(4), served_names: Vec::new() });
+        e.send(Command::Load { model_id: "other".into(), display: "O".into(), max_ctx: None, max_num_seqs: Some(4), kv_cache_bytes: None, served_names: Vec::new() });
         wait_event(&e);
         match wait_event(&e) {
             EngineEvent::Loaded(l) => panic!("{l:?}"),

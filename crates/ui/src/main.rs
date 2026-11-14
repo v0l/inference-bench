@@ -128,20 +128,23 @@ impl App {
     pub fn load_model(&mut self, model: &LocalModel) {
         let ctx = self.settings.ctx_for(&model.name);
         let seqs = self.settings.seqs_for(&model.name);
-        self.load_model_with(model, ctx, seqs);
+        let kv = self.settings.kv_gb_for(&model.name).map(|g| (g * (1u64 << 30) as f64) as u64);
+        let served_names = self.settings.served_names_for(&model.name);
+        self.load_model_named(model, ctx, seqs, kv, served_names);
     }
 
     pub fn load_model_with(&mut self, model: &LocalModel, ctx: usize, seqs: usize) {
         let served_names = self.settings.served_names_for(&model.name);
-        self.load_model_named(model, ctx, seqs, served_names);
+        self.load_model_named(model, ctx, seqs, None, served_names);
     }
 
-    pub fn load_model_named(&mut self, model: &LocalModel, ctx: usize, seqs: usize, served_names: Vec<String>) {
+    pub fn load_model_named(&mut self, model: &LocalModel, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>) {
         self.engine.send(Command::Load {
             model_id: model.model_id(inference_bench_core::target::NATIVE),
             display: model.name.clone(),
             max_ctx: Some(ctx),
             max_num_seqs: Some(seqs),
+            kv_cache_bytes,
             served_names,
         });
     }
