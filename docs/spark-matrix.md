@@ -174,7 +174,7 @@ Where specrt stands:
 
 Follow-ups: batched paged decode attention (#272), decode at long context (#273), 1024-token prefill against vLLM and worker overhead (#274).
 
-Harness changes from this run: bench completions send `ignore_eos` so every engine decodes exactly `max_tokens`, `inference-bench run --prompt-len N` uses the synthetic prompt, `inference-bench batch` runs N concurrent requests per size against any backend, and the worker backends get the raw prompt on `generate` (they applied the chat template, which OpenAI completions do not). vLLM needs `--no-enable-prefix-caching` for repeated-prompt benches, or TTFT drops to the cache hit. The Bench tab already runs vLLM as an endpoint (Settings, backend endpoints: URL, API key; the model id is the HF repo).
+Harness changes from this run: bench completions send `ignore_eos` so every engine decodes exactly `max_tokens`, `inference-bench run --prompt-len N` uses the synthetic prompt, `inference-bench batch` runs N concurrent requests per size against any backend, and the worker backends get the raw prompt on `generate` (they applied the chat template, which OpenAI completions do not). vLLM needs `--no-enable-prefix-caching` for repeated-prompt benches, or TTFT drops to the cache hit. The `inference-bench bench --target openai:URL` command runs vLLM as an endpoint (the model id is the HF repo).
 
 ## Decode at long context (issue #273)
 

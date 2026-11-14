@@ -632,10 +632,15 @@ fn screenshots_with_real_data() {
     shot(&mut h, "models");
 
     let qwen = h.state().library.iter().find(|m| m.name == "Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
+    pump_until(&mut h, 20, "gpu", |a| !a.gpu.is_empty());
+    h.state_mut().open_load_dialog(&qwen);
+    h.state_mut().load.as_mut().unwrap().ctx = 16384;
+    shot(&mut h, "load-dialog");
     {
         let app = h.state_mut();
+        app.load = None;
         app.chat.pick("Qwen3-0.6B");
-        app.load_model(&qwen);
+        app.load_model_with(&qwen, 16384);
         app.tab = Tab::Chat;
     }
     pump_until(&mut h, 120, "load", |a| a.loaded().is_some());
@@ -668,6 +673,7 @@ fn screenshots_with_real_data() {
     }
     shot(&mut h, "server");
 
+    h.state_mut().server.stop();
     h.state_mut().unload();
     h.state_mut().tab = Tab::Settings;
     shot(&mut h, "settings");
@@ -830,7 +836,7 @@ fn screenshots_of_the_server_and_logs_tabs() {
     shot(&mut h, "server");
     h.state_mut().server.pane = crate::server::Pane::Logs;
     h.state_mut().logs_ui.level = tracing::Level::DEBUG;
-    shot(&mut h, "logs");
+    shot(&mut h, "server-logs");
     h.state_mut().server.stop();
 }
 
