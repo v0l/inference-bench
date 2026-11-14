@@ -1553,7 +1553,8 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel("argmax_advance"));
         b.arg(&buf.logits).arg(&buf.token).arg(&buf.pos).arg(&buf.history).arg(&buf.count);
         let inv_temp = sampling.inverse_temperature();
-        b.arg(&inv_temp).arg(&sampling.seed);
+        let top_k = sampling.top_k as i32;
+        b.arg(&inv_temp).arg(&sampling.seed).arg(&top_k).arg(&sampling.top_p).arg(&sampling.min_p);
         unsafe { b.launch(cfg(1, 1024)) }?;
         Ok(())
     }

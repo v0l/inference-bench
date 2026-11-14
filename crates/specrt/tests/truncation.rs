@@ -218,3 +218,69 @@ fn speculative_sampling_follows_the_truncated_distribution() {
         }
     }
 }
+
+fn kept_set(logits: &[f32], t: f32, top_k: u32, top_p: f32, min_p: f32) -> Vec<bool> {
+    truncated(logits, t, top_k, top_p, min_p).iter().map(|&p| p > 0.0).collect()
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn single_sequence_generation_applies_top_k_top_p_and_min_p() {
+    let s = plain(2);
+    let vocab = s.dims.vocab;
+    let p = prompt(3);
+    let logits = last_logits(&mut Runtime::load(&s, 512).unwrap(), vocab, &p);
+    let mut rt = Runtime::load(&s, 512).unwrap();
+    let greedy = rt.generate(&p, 64, Sampling::GREEDY).unwrap().tokens;
+    for seed in 0..4 {
+        let one = Sampling::new(1.0, seed_of(seed)).truncated(1, 1.0, 0.0);
+        assert_eq!(rt.generate(&p, 64, one).unwrap().tokens, greedy, "top_k 1 at temperature 1.0, seed {seed}");
+    }
+    for (name, top_k, top_p, min_p) in [("top_k 5", 5, 1.0, 0.0), ("top_p 0.5", 0, 0.5, 0.0), ("min_p 0.2", 0, 1.0, 0.2)] {
+        let kept = kept_set(&logits, 1.5, top_k, top_p, min_p);
+        assert!(kept.iter().filter(|&&k| k).count() < vocab / 2, "{name}: the case must cut the vocabulary");
+        let mut distinct = std::collections::HashSet::new();
+        for i in 0..300 {
+            let sampling = Sampling::new(1.5, seed_of(i)).truncated(top_k, top_p, min_p);
+            let tok = rt.generate(&p, 1, sampling).unwrap().tokens[0];
+            assert!(kept[tok as usize], "{name}: token {tok} is outside the kept set (seed {i})");
+            distinct.insert(tok);
+        }
+        assert!(distinct.len() > 1, "{name}: sampling collapsed to one token");
+    }
+}
+
+fn scheduled_tokens(s: &Spec, sampling: Sampling, new: usize) -> Vec<u32> {
+    use specrt::sched::Request;
+    use specrt::serve::{Core, Job, SeqEvent, ServeOptions};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let opts = ServeOptions { max_model_len: 512, max_num_seqs: 2, kv_cache_bytes: Some(4 << 20), ..ServeOptions::default() };
+    let core = Core::start(s, opts).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let request = Request { prompt: prompt(5), max_tokens: new, sampling, stop: vec![], salt: String::new(), media: Vec::new() };
+    core.submit(Job { request, events: tx, cancel: Arc::new(AtomicBool::new(false)) }).unwrap();
+    let mut out = Vec::new();
+    loop {
+        match rx.recv().unwrap() {
+            SeqEvent::Token(t) => out.push(t),
+            SeqEvent::Finished { .. } => break,
+            SeqEvent::Failed(e) => panic!("{e}"),
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn scheduled_top_k_one_equals_greedy_with_and_without_speculation() {
+    for (name, s) in [("mtp", spec(2)), ("plain", plain(2))] {
+        let greedy = scheduled_tokens(&s, Sampling::GREEDY, 64);
+        assert_eq!(greedy.len(), 64);
+        for seed in 0..3 {
+            let one = Sampling::new(1.0, seed_of(seed)).truncated(1, 1.0, 0.0);
+            assert_eq!(scheduled_tokens(&s, one, 64), greedy, "{name}: top_k 1 at temperature 1.0, seed {seed}");
+        }
+    }
+}

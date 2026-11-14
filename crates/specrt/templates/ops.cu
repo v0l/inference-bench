@@ -2227,41 +2227,6 @@ __device__ float gumbel(unsigned seed, unsigned step, unsigned i) {
     return -logf(-logf(u));
 }
 
-extern "C" __global__ void argmax_advance(const float* logits, int* token, int* pos, int* history, int* count, float inv_temp, unsigned seed) {
-    __shared__ float best_v[1024];
-    __shared__ int best_i[1024];
-    float bv = NEG_INF;
-    int bi = 0;
-    for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
-        float v = logits[i];
-        if (inv_temp > 0.0f) v = v * inv_temp + gumbel(seed, (unsigned)count[0], (unsigned)i);
-        if (v > bv) {
-            bv = v;
-            bi = i;
-        }
-    }
-    best_v[threadIdx.x] = bv;
-    best_i[threadIdx.x] = bi;
-    __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            float ov = best_v[threadIdx.x + s];
-            int oi = best_i[threadIdx.x + s];
-            if (ov > best_v[threadIdx.x] || (ov == best_v[threadIdx.x] && oi < best_i[threadIdx.x])) {
-                best_v[threadIdx.x] = ov;
-                best_i[threadIdx.x] = oi;
-            }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
-        token[0] = best_i[0];
-        history[count[0]] = best_i[0];
-        count[0] += 1;
-        pos[0] += 1;
-    }
-}
-
 extern "C" __global__ void argmax_rows(const float* logits, int* tokens, int* history, const int* count, int stride) {
     __shared__ float best_v[1024];
     __shared__ int best_i[1024];
@@ -2460,6 +2425,50 @@ extern "C" __global__ void sample_rows(const float* logits, int* tokens, const i
         __syncthreads();
     }
     if (threadIdx.x == 0) tokens[blockIdx.x] = best_i[0];
+}
+
+extern "C" __global__ void argmax_advance(const float* logits, int* token, int* pos, int* history, int* count, float inv_temp, unsigned seed, int top_k, float top_p, float min_p) {
+    __shared__ float best_v[1024];
+    __shared__ int best_i[1024];
+    float thr = NEG_INF;
+    if (inv_temp > 0.0f) {
+        float m;
+        thr = sample_threshold(logits, inv_temp, top_k, top_p, min_p, &m);
+    }
+    float bv = NEG_INF;
+    int bi = 0;
+    for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
+        float v = logits[i];
+        if (inv_temp > 0.0f) {
+            v *= inv_temp;
+            if (v < thr) continue;
+            v += gumbel(seed, (unsigned)count[0], (unsigned)i);
+        }
+        if (v > bv) {
+            bv = v;
+            bi = i;
+        }
+    }
+    best_v[threadIdx.x] = bv;
+    best_i[threadIdx.x] = bi;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            float ov = best_v[threadIdx.x + s];
+            int oi = best_i[threadIdx.x + s];
+            if (ov > best_v[threadIdx.x] || (ov == best_v[threadIdx.x] && oi < best_i[threadIdx.x])) {
+                best_v[threadIdx.x] = ov;
+                best_i[threadIdx.x] = oi;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        token[0] = best_i[0];
+        history[count[0]] = best_i[0];
+        count[0] += 1;
+        pos[0] += 1;
+    }
 }
 
 extern "C" __global__ void bump(int* pos, int* count) {
