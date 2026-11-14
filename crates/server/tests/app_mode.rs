@@ -197,6 +197,20 @@ fn a_served_name_is_an_alias_and_models_lists_only_the_primary_id() {
 }
 
 #[test]
+fn image_input_reaches_a_vision_model_loaded_in_the_app() {
+    let engine = Engine::with_factory(Arc::new(|| {}), ScriptedModel::factory(Script { vision: true, ..script() }));
+    let app = app_rig_with("", engine);
+    app.load("org/one", "One");
+    let body = json!({"model": "One", "max_tokens": 2, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "what is this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+    ]}]});
+    let (status, body) = app.chat(body);
+    assert_eq!(status, 200, "{body}");
+    app.rig.stop();
+}
+
+#[test]
 fn an_omitted_model_with_nothing_loaded_is_a_404() {
     let app = app_rig();
     let (status, body) = app.chat(say(None));

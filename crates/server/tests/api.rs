@@ -23,6 +23,32 @@ fn models_lists_configured_models() {
 }
 
 #[test]
+fn a_served_name_from_server_toml_resolves_to_its_model_and_is_not_listed() {
+    let rig = start(config("[[models]]\nid='m'\nserved_names=['qwen3.8-27b']\n[[models]]\nid='n'"), Shape::default());
+    let (status, body, _) = rig.post("/v1/chat/completions", None, chat("qwen3.8-27b", false));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["model"], "m");
+    let (_, body, _) = rig.get("/v1/models", None);
+    assert!(!body.contains("qwen3.8-27b"), "{body}");
+    rig.stop();
+    assert!(inference_bench_server::ServerConfig::parse("[[models]]\nid='m'\nserved_names=['n']\n[[models]]\nid='n'").is_err());
+}
+
+#[test]
+fn a_developer_message_reaches_the_template_as_system() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    let body = json!({"model": "m", "messages": [{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}], "max_tokens": 2});
+    let (status, body, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 200, "{body}");
+    let requests = rig.stats.requests.lock().unwrap();
+    let sent = requests.last().unwrap();
+    assert_eq!(sent.openai_messages.as_ref().unwrap()[0]["role"], "system");
+    assert_eq!(sent.messages[0].role, inference_bench_core::chat::Role::System);
+    drop(requests);
+    rig.stop();
+}
+
+#[test]
 fn non_streaming_chat_matches_the_openai_schema() {
     let rig = start(config("[[models]]\nid='m'"), Shape::default());
     let (status, body, _) = rig.post("/v1/chat/completions", None, chat("m", false));

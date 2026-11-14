@@ -511,6 +511,12 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_template_error_is_an_invalid_request() {
+        let e = engine_error(&anyhow::anyhow!("chat template: invalid operation: Unexpected message role"));
+        assert_eq!(e.kind, ErrorKind::InvalidRequest, "{e}");
+    }
+
+    #[test]
     fn out_of_memory_is_reported_plainly() {
         let mut n = fake(Arc::default());
         n.load("m").unwrap();
