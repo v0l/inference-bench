@@ -402,6 +402,7 @@ mod tests {
             support: vec![],
             origin: None,
             vision: false,
+            lineage: None,
         }
     }
 

@@ -37,6 +37,7 @@ fn model(name: &str, specrt: bool, reason: &str) -> LocalModel {
         ],
         origin: None,
         vision: false,
+        lineage: None,
     }
 }
 
@@ -53,6 +54,7 @@ fn script() -> Script {
         usage: Some((9, 3)),
         fail_status: None,
         vision: false,
+        lineage: None,
         files: Default::default(),
     }
 }

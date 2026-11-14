@@ -42,6 +42,163 @@ impl Support {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Relation {
+    Adapter,
+    Finetune,
+    Merge,
+    Quantized,
+}
+
+impl Relation {
+    pub const ALL: [Relation; 4] = [Relation::Adapter, Relation::Finetune, Relation::Merge, Relation::Quantized];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Adapter => "adapter",
+            Self::Finetune => "finetune",
+            Self::Merge => "merge",
+            Self::Quantized => "quantized",
+        }
+    }
+
+    pub fn plural(self) -> &'static str {
+        match self {
+            Self::Adapter => "adapters",
+            Self::Finetune => "finetunes",
+            Self::Merge => "merges",
+            Self::Quantized => "quantizations",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim().to_lowercase();
+        Self::ALL.into_iter().find(|r| r.label() == text)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lineage {
+    pub bases: Vec<String>,
+    pub relation: Relation,
+}
+
+impl Lineage {
+    pub fn base(&self) -> &str {
+        self.bases.first().map(String::as_str).unwrap_or("")
+    }
+}
+
+fn unquote(value: &str) -> String {
+    value.trim().trim_matches(|c| c == '"' || c == '\'').trim().to_string()
+}
+
+pub fn parse_card_lineage(readme: &str) -> Option<(Vec<String>, Option<Relation>)> {
+    let mut lines = readme.trim_start_matches('\u{feff}').lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let front: Vec<&str> = lines.take_while(|l| l.trim() != "---").collect();
+    let mut bases = Vec::new();
+    let mut relation = None;
+    let mut i = 0;
+    while i < front.len() {
+        let line = front[i];
+        i += 1;
+        if let Some(rest) = line.strip_prefix("base_model_relation:") {
+            relation = Relation::parse(&unquote(rest));
+        } else if let Some(rest) = line.strip_prefix("base_model:") {
+            let rest = rest.trim();
+            if rest.is_empty() {
+                while i < front.len() && (front[i].starts_with(' ') || front[i].starts_with('-')) {
+                    if let Some(item) = front[i].trim().strip_prefix('-') {
+                        bases.push(unquote(item));
+                    }
+                    i += 1;
+                }
+            } else if let Some(list) = rest.strip_prefix('[') {
+                bases.extend(list.trim_end_matches(']').split(',').map(unquote));
+            } else {
+                bases.push(unquote(rest));
+            }
+        }
+    }
+    bases.retain(|b| !b.is_empty());
+    (!bases.is_empty()).then_some((bases, relation))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRow {
+    pub index: Option<usize>,
+    pub name: String,
+    pub depth: usize,
+    pub relation: Option<Relation>,
+}
+
+pub fn tree(models: &[LocalModel], shown: &[usize]) -> Vec<TreeRow> {
+    let base_of = |i: usize| models[i].lineage.as_ref().map(|l| l.base().to_string());
+    let holder = |repo: &str| (0..models.len()).find(|&j| !repo.is_empty() && models[j].repo == repo);
+    let mut included: std::collections::BTreeSet<usize> = shown.iter().copied().collect();
+    for &i in shown {
+        let mut at = i;
+        for _ in 0..8 {
+            match base_of(at).and_then(|b| holder(&b)) {
+                Some(parent) if parent != at && included.insert(parent) => at = parent,
+                _ => break,
+            }
+        }
+    }
+    let mut rows = Vec::new();
+    let mut placed = std::collections::BTreeSet::new();
+    let mut phantoms: Vec<String> = Vec::new();
+    for &i in &included {
+        if let Some(b) = base_of(i).filter(|b| holder(b).is_none() && !phantoms.contains(b)) {
+            phantoms.push(b);
+        }
+    }
+    fn walk(
+        models: &[LocalModel],
+        included: &std::collections::BTreeSet<usize>,
+        placed: &mut std::collections::BTreeSet<usize>,
+        rows: &mut Vec<TreeRow>,
+        repo: &str,
+        depth: usize,
+    ) {
+        for &i in included {
+            let Some(l) = &models[i].lineage else { continue };
+            if l.base() != repo || !placed.insert(i) {
+                continue;
+            }
+            rows.push(TreeRow { index: Some(i), name: models[i].name.clone(), depth, relation: Some(l.relation) });
+            if depth < 6 && !models[i].repo.is_empty() {
+                walk(models, included, placed, rows, &models[i].repo.clone(), depth + 1);
+            }
+        }
+    }
+    for phantom in &phantoms {
+        rows.push(TreeRow { index: None, name: phantom.clone(), depth: 0, relation: None });
+        walk(models, &included, &mut placed, &mut rows, phantom, 1);
+    }
+    for &i in &included {
+        let is_root = base_of(i).is_none_or(|b| holder(&b).is_none_or(|p| p == i));
+        if !is_root || placed.contains(&i) {
+            continue;
+        }
+        placed.insert(i);
+        rows.push(TreeRow { index: Some(i), name: models[i].name.clone(), depth: 0, relation: None });
+        let repo = models[i].repo.clone();
+        if !repo.is_empty() {
+            walk(models, &included, &mut placed, &mut rows, &repo, 1);
+        }
+    }
+    for &i in &included {
+        if placed.insert(i) {
+            rows.push(TreeRow { index: Some(i), name: models[i].name.clone(), depth: 0, relation: None });
+        }
+    }
+    rows
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalModel {
     pub name: String,
@@ -57,6 +214,7 @@ pub struct LocalModel {
     pub support: Vec<Support>,
     pub origin: Option<SpecOrigin>,
     pub vision: bool,
+    pub lineage: Option<Lineage>,
 }
 
 pub fn config_has_vision(config: &Value) -> bool {
@@ -411,12 +569,13 @@ fn gguf_models(dir: &Path, repo: &str, root: &Path, found: &mut Vec<LocalModel>)
         let key = (f.parent().unwrap().to_path_buf(), shard_key(&name).0);
         groups.entry(key).or_default().push(f);
     }
+    let lineage = read_lineage(dir, |relation| relation.unwrap_or(Relation::Quantized));
     for ((_, stem), shards) in groups {
         let first = shards[0].clone();
         let Some(h) = read_gguf_header(&first) else { continue };
         let name = match repo.is_empty() {
             true => stem.clone(),
-            false => format!("{} {}", repo.rsplit('/').next().unwrap_or(repo), gguf_quant(h.file_type, &stem)),
+            false => format!("{repo} {}", gguf_quant(h.file_type, &stem)),
         };
         found.push(LocalModel {
             name,
@@ -432,8 +591,15 @@ fn gguf_models(dir: &Path, repo: &str, root: &Path, found: &mut Vec<LocalModel>)
             files: shards,
             origin: None,
             vision: false,
+            lineage: lineage.clone(),
         });
     }
+}
+
+fn read_lineage(dir: &Path, relation: impl Fn(Option<Relation>) -> Relation) -> Option<Lineage> {
+    let card = std::fs::read_to_string(dir.join("README.md")).ok()?;
+    let (bases, stated) = parse_card_lineage(&card)?;
+    Some(Lineage { bases, relation: relation(stated) })
 }
 
 fn collect(dir: &Path, depth: usize, keep: &mut dyn FnMut(&Path) -> bool, out: &mut Vec<PathBuf>) {
@@ -476,8 +642,16 @@ fn safetensors_model(dir: &Path, repo: &str, root: &Path) -> Option<LocalModel> 
     };
     let name = match repo.is_empty() {
         true => dir.file_name()?.to_string_lossy().into_owned(),
-        false => repo.rsplit('/').next().unwrap_or(repo).to_string(),
+        false => repo.to_string(),
     };
+    let quantized = config.get("quantization_config").is_some_and(|q| !q.is_null());
+    let adapter = dir.join("adapter_config.json").is_file();
+    let lineage = read_lineage(dir, |relation| match (relation, quantized, adapter) {
+        (Some(r), _, _) => r,
+        (None, true, _) => Relation::Quantized,
+        (None, false, true) => Relation::Adapter,
+        _ => Relation::Finetune,
+    });
     Some(LocalModel {
         name,
         repo: repo.to_string(),
@@ -492,6 +666,7 @@ fn safetensors_model(dir: &Path, repo: &str, root: &Path) -> Option<LocalModel> 
         files,
         origin: None,
         vision: config_has_vision(&config),
+        lineage,
     })
 }
 
@@ -579,6 +754,7 @@ fn spec_model(listed: &specs::Listed, hub: &Path) -> LocalModel {
         vision: files.first().and_then(|f| f.parent()).and_then(|d| std::fs::read_to_string(d.join("config.json")).ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|c| config_has_vision(&c)),
         files,
         origin: Some(listed.origin.clone()),
+        lineage: None,
     }
 }
 
@@ -721,13 +897,13 @@ mod tests {
         );
         let models = scan_hub(&hub);
         assert_eq!(models.len(), 2);
-        let qwen = models.iter().find(|m| m.name == "Qwen3-0.6B").unwrap();
+        let qwen = models.iter().find(|m| m.name == "Qwen/Qwen3-0.6B").unwrap();
         assert_eq!((qwen.quant.as_str(), qwen.context_length, qwen.size_bytes), ("BF16", Some(40960), 2048));
         assert!(qwen.support_for("specrt").unwrap().supported);
         assert!(qwen.support_for("specrt (wgpu)").unwrap().supported);
         assert!(qwen.support_for("vllm").unwrap().supported);
         assert!(!qwen.support_for("llama.cpp").unwrap().supported);
-        let weird = models.iter().find(|m| m.name == "Weird-7B").unwrap();
+        let weird = models.iter().find(|m| m.name == "acme/Weird-7B").unwrap();
         let s = weird.support_for("specrt").unwrap();
         assert!(!s.supported && s.reason.contains("model_type weird is not supported"), "{}", s.reason);
         assert!(weird.support_for("vllm").unwrap().reason.contains("WeirdForCausalLM"));
@@ -947,5 +1123,87 @@ mod tests {
     fn sizes_are_readable() {
         assert_eq!(human_size(3 << 30), "3.0 GB");
         assert_eq!(human_size(5 << 20), "5 MB");
+    }
+
+    fn with_card(snap: &Path, card: &str) {
+        std::fs::write(snap.join("README.md"), card).unwrap();
+    }
+
+    #[test]
+    fn a_card_names_its_base_model_as_a_string_or_a_list() {
+        let (bases, relation) = parse_card_lineage("---\nlicense: mit\nbase_model: Qwen/Qwen3.8-27B\nbase_model_relation: quantized\n---\n# hi").unwrap();
+        assert_eq!((bases, relation), (vec!["Qwen/Qwen3.8-27B".to_string()], Some(Relation::Quantized)));
+        let (bases, relation) = parse_card_lineage("---\nbase_model:\n- a/one\n- \"b/two\"\ntags: [x]\n---\n").unwrap();
+        assert_eq!((bases, relation), (vec!["a/one".to_string(), "b/two".to_string()], None));
+        let (bases, _) = parse_card_lineage("---\nbase_model: [a/one, b/two]\n---\n").unwrap();
+        assert_eq!(bases, ["a/one", "b/two"]);
+        assert!(parse_card_lineage("# no front matter\nbase_model: x/y").is_none());
+        assert!(parse_card_lineage("---\nlicense: mit\n---\n").is_none());
+    }
+
+    #[test]
+    fn a_missing_relation_is_inferred_from_the_quantization_or_adapter_files() {
+        let hub = temp("relations");
+        let quant = hf_model(&hub, "acme/Quant", r#"{"architectures":["X"],"quantization_config":{"quant_method":"fp8"}}"#);
+        with_card(&quant, "---\nbase_model: org/Base\n---\n");
+        let tuned = hf_model(&hub, "acme/Tuned", r#"{"architectures":["X"],"torch_dtype":"bfloat16"}"#);
+        with_card(&tuned, "---\nbase_model: org/Base\n---\n");
+        let lora = hf_model(&hub, "acme/Lora", r#"{"architectures":["X"],"torch_dtype":"bfloat16"}"#);
+        with_card(&lora, "---\nbase_model: org/Base\n---\n");
+        std::fs::write(lora.join("adapter_config.json"), "{}").unwrap();
+        let stated = hf_model(&hub, "acme/Merged", r#"{"architectures":["X"],"torch_dtype":"bfloat16"}"#);
+        with_card(&stated, "---\nbase_model: org/Base\nbase_model_relation: merge\n---\n");
+        let models = scan_hub(&hub);
+        let relation = |n: &str| models.iter().find(|m| m.name == n).unwrap().lineage.clone().unwrap().relation;
+        assert_eq!(relation("acme/Quant"), Relation::Quantized);
+        assert_eq!(relation("acme/Tuned"), Relation::Finetune);
+        assert_eq!(relation("acme/Lora"), Relation::Adapter);
+        assert_eq!(relation("acme/Merged"), Relation::Merge);
+    }
+
+    #[test]
+    fn a_gguf_repo_is_named_with_its_org_and_quant_and_is_quantized_from_its_base() {
+        let hub = temp("gguf-name");
+        let snap = hub.join("models--unsloth--Qwen3-8B-GGUF/snapshots/abc");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("Qwen3-8B-Q4_K_M.gguf"), gguf_bytes("qwen3", 15, 4096)).unwrap();
+        with_card(&snap, "---\nbase_model: Qwen/Qwen3-8B\n---\n");
+        let models = scan_hub(&hub);
+        assert_eq!(models[0].name, "unsloth/Qwen3-8B-GGUF Q4_K_M");
+        assert_eq!(models[0].lineage.as_ref().unwrap().relation, Relation::Quantized);
+    }
+
+    #[test]
+    fn the_tree_groups_two_quants_under_a_base_that_is_not_downloaded() {
+        let hub = temp("tree");
+        for (repo, extra) in [("a/Base-FP8", ""), ("b/Base-NVFP4", ""), ("c/Other", "")] {
+            let snap = hf_model(&hub, repo, r#"{"architectures":["X"],"quantization_config":{"quant_method":"fp8"}}"#);
+            if repo != "c/Other" {
+                with_card(&snap, &format!("---\nbase_model: org/Base{extra}\n---\n"));
+            }
+        }
+        let models = scan_hub(&hub);
+        let all: Vec<usize> = (0..models.len()).collect();
+        let rows = tree(&models, &all);
+        let names: Vec<(&str, usize)> = rows.iter().map(|r| (r.name.as_str(), r.depth)).collect();
+        assert_eq!(names[0], ("org/Base", 0));
+        assert_eq!(rows[0].index, None);
+        assert_eq!(&names[1..3], [("a/Base-FP8", 1), ("b/Base-NVFP4", 1)]);
+        assert_eq!(rows[1].relation, Some(Relation::Quantized));
+        assert_eq!(names[3], ("c/Other", 0));
+    }
+
+    #[test]
+    fn a_downloaded_base_is_the_parent_row_of_its_derivatives() {
+        let hub = temp("tree-local");
+        hf_model(&hub, "org/Base", r#"{"architectures":["X"],"torch_dtype":"bfloat16"}"#);
+        let q = hf_model(&hub, "a/Base-FP8", r#"{"architectures":["X"],"quantization_config":{"quant_method":"fp8"}}"#);
+        with_card(&q, "---\nbase_model: org/Base\n---\n");
+        let models = scan_hub(&hub);
+        let quant = models.iter().position(|m| m.name == "a/Base-FP8").unwrap();
+        let rows = tree(&models, &[quant]);
+        let names: Vec<(&str, usize)> = rows.iter().map(|r| (r.name.as_str(), r.depth)).collect();
+        assert_eq!(names, [("org/Base", 0), ("a/Base-FP8", 1)]);
+        assert!(rows[0].index.is_some());
     }
 }
