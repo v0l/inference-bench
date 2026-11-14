@@ -1,6 +1,6 @@
 use crate::config::ServerConfig;
 use crate::error::ApiError;
-use crate::manager::{EngineFactory, GpuProbe, Manager};
+use crate::manager::{EngineFactory, GpuProbe, Manager, ModelSource};
 use crate::metrics::{Gauges, Metrics, percentile};
 use crate::stop::StopFilter;
 use crate::tools::{Delta, OutputParser};
@@ -43,6 +43,7 @@ impl AppState {
         config: Arc<ServerConfig>,
         factory: Arc<dyn EngineFactory>,
         probe: GpuProbe,
+        source: Option<Arc<dyn ModelSource>>,
     ) -> anyhow::Result<Arc<Self>> {
         let metrics = Arc::new(Metrics::default());
         let access_log = match &config.access_log {
@@ -55,7 +56,7 @@ impl AppState {
             None => None,
         };
         Ok(Arc::new(Self {
-            manager: Arc::new(Manager::new(config.clone(), factory, probe, metrics.clone())),
+            manager: Arc::new(Manager::new(config.clone(), factory, probe, metrics.clone(), source)),
             keys: config.resolved_keys(),
             metrics,
             config,
@@ -472,10 +473,7 @@ fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), Api
 
 fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, ApiError> {
     reject_unsupported_fields(body)?;
-    let model = match body["model"].as_str() {
-        Some(m) if !m.is_empty() => m.to_string(),
-        _ => state.manager.default_model().ok_or_else(|| ApiError::bad_request("model is required"))?,
-    };
+    let model = state.manager.requested_model(body["model"].as_str())?;
     let messages = if chat { chat_messages(body)? } else { vec![Message::new(Role::User, completion_prompt(body)?)] };
     let max_tokens = body["max_completion_tokens"]
         .as_u64()
@@ -765,8 +763,8 @@ pub fn cache_salt(headers: &HeaderMap, body_salt: &str, shared: bool) -> String 
 }
 
 async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: String) -> Result<Response, ApiError> {
-    let p = parse_params(&state, &body, chat)?;
-    state.manager.resolve(&p.model)?;
+    let mut p = parse_params(&state, &body, chat)?;
+    p.model = state.manager.resolve(&p.model)?.id;
     let max_tokens = p.sampling.max_tokens;
     let cancel = Arc::new(AtomicBool::new(false));
     let guard = CancelOnDrop(cancel.clone());
@@ -964,11 +962,8 @@ fn sse_events(
 }
 
 async fn bench(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> Result<Json<Value>, ApiError> {
-    let model = match body["model"].as_str() {
-        Some(m) => m.to_string(),
-        None => state.manager.default_model().ok_or_else(|| ApiError::bad_request("model is required"))?,
-    };
-    state.manager.resolve(&model)?;
+    let model = state.manager.requested_model(body["model"].as_str())?;
+    let model = state.manager.resolve(&model)?.id;
     let prompts: Vec<String> = match body["prompts"].as_array() {
         Some(a) if !a.is_empty() => a.iter().filter_map(|p| p.as_str().map(String::from)).collect(),
         _ => return Err(ApiError::bad_request("prompts must be a non-empty array of strings")),

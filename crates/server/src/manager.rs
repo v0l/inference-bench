@@ -53,6 +53,16 @@ where
 
 pub type GpuProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceModel {
+    pub id: String,
+    pub aliases: Vec<String>,
+}
+
+pub trait ModelSource: Send + Sync + 'static {
+    fn loaded(&self) -> Vec<SourceModel>;
+}
+
 pub fn nvidia_smi_probe() -> GpuProbe {
     Arc::new(crate::gpu::used_bytes)
 }
@@ -123,6 +133,7 @@ pub struct Manager {
     metrics: Arc<Metrics>,
     loaded: Mutex<HashMap<String, Arc<LoadedModel>>>,
     load_lock: tokio::sync::Mutex<()>,
+    source: Option<Arc<dyn ModelSource>>,
 }
 
 impl Manager {
@@ -131,8 +142,9 @@ impl Manager {
         factory: Arc<dyn EngineFactory>,
         probe: GpuProbe,
         metrics: Arc<Metrics>,
+        source: Option<Arc<dyn ModelSource>>,
     ) -> Self {
-        Self { config, factory, probe, metrics, loaded: Mutex::default(), load_lock: Default::default() }
+        Self { config, factory, probe, metrics, loaded: Mutex::default(), load_lock: Default::default(), source }
     }
 
     pub fn gpu_used(&self) -> Option<u64> {
@@ -140,16 +152,36 @@ impl Manager {
     }
 
     pub fn resolve(&self, id: &str) -> Result<ModelConfig, ApiError> {
+        if let Some(source) = &self.source {
+            return match source.loaded().into_iter().find(|m| m.id == id || m.aliases.iter().any(|a| a == id)) {
+                Some(m) => Ok(ModelConfig { id: m.id, ..ModelConfig::default() }),
+                None => Err(ApiError::model_not_found(id)),
+            };
+        }
         if let Some(m) = self.config.model(id) {
             return Ok(m.clone());
         }
         match self.config.models.is_empty() {
             true => Ok(ModelConfig { id: id.to_string(), ..ModelConfig::default() }),
-            false => Err(ApiError::not_found(format!("the model {id} does not exist"))),
+            false => Err(ApiError::model_not_found(id)),
+        }
+    }
+
+    pub fn requested_model(&self, named: Option<&str>) -> Result<String, ApiError> {
+        match named.filter(|m| !m.is_empty()) {
+            Some(m) => Ok(m.to_string()),
+            None => self.default_model().ok_or_else(|| match &self.source {
+                Some(_) => ApiError::new(axum::http::StatusCode::NOT_FOUND, "not_found_error", "no model is loaded")
+                    .with_code("model_not_found", "model"),
+                None => ApiError::bad_request("model is required"),
+            }),
         }
     }
 
     pub fn default_model(&self) -> Option<String> {
+        if let Some(source) = &self.source {
+            return source.loaded().into_iter().next().map(|m| m.id);
+        }
         self.config
             .default_model
             .clone()
@@ -164,6 +196,19 @@ impl Manager {
     }
 
     pub fn loaded_snapshot(&self) -> Vec<(String, u64)> {
+        if let Some(source) = &self.source {
+            let loaded = self.loaded.lock().unwrap();
+            let mut v: Vec<_> = source
+                .loaded()
+                .into_iter()
+                .map(|m| {
+                    let vram = loaded.get(&m.id).map(|l| l.vram).unwrap_or(0);
+                    (m.id, vram)
+                })
+                .collect();
+            v.sort();
+            return v;
+        }
         let mut v: Vec<_> = self.loaded.lock().unwrap().values().map(|m| (m.id.clone(), m.vram)).collect();
         v.sort();
         v
@@ -177,6 +222,23 @@ impl Manager {
 
     pub fn status(&self) -> Vec<ModelStatus> {
         let loaded = self.loaded.lock().unwrap();
+        if let Some(source) = &self.source {
+            return source
+                .loaded()
+                .into_iter()
+                .map(|m| {
+                    let l = loaded.get(&m.id);
+                    ModelStatus {
+                        id: m.id,
+                        backend: l.map(|l| l.backend_label.clone()).unwrap_or_else(|| "engine".to_string()),
+                        loaded: true,
+                        vram_bytes: l.map(|l| l.vram).unwrap_or(0),
+                        active_requests: l.map(|l| l.active()).unwrap_or(0),
+                        idle_secs: l.map(|l| l.idle_for().as_secs_f64()),
+                    }
+                })
+                .collect();
+        }
         let mut out: Vec<ModelStatus> = self
             .config
             .models

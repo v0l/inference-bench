@@ -12,5 +12,5 @@ pub mod tools;
 
 pub use app::{AppState, REQUEST_ID_HEADER, router};
 pub use config::ServerConfig;
-pub use manager::{EngineFactory, NativeFactory};
+pub use manager::{EngineFactory, ModelSource, NativeFactory, SourceModel};
 pub use serve::{Server, ServerHandle};

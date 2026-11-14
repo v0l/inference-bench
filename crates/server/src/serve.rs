@@ -1,6 +1,6 @@
 use crate::app::{AppState, router};
 use crate::config::ServerConfig;
-use crate::manager::{EngineFactory, NativeFactory, GpuProbe, nvidia_smi_probe};
+use crate::manager::{EngineFactory, GpuProbe, ModelSource, NativeFactory, nvidia_smi_probe};
 use anyhow::{Context, Result};
 use inference_bench_core::specs::{Outcome, SpecStore, SpecsConfig};
 use std::net::SocketAddr;
@@ -12,6 +12,7 @@ pub struct Server {
     config: Arc<ServerConfig>,
     factory: Arc<dyn EngineFactory>,
     probe: GpuProbe,
+    source: Option<Arc<dyn ModelSource>>,
 }
 
 pub struct ServerHandle {
@@ -42,7 +43,12 @@ impl ServerHandle {
 
 impl Server {
     pub fn new(config: ServerConfig) -> Self {
-        Self { config: Arc::new(config), factory: Arc::new(NativeFactory), probe: nvidia_smi_probe() }
+        Self { config: Arc::new(config), factory: Arc::new(NativeFactory), probe: nvidia_smi_probe(), source: None }
+    }
+
+    pub fn with_model_source(mut self, source: impl ModelSource) -> Self {
+        self.source = Some(Arc::new(source));
+        self
     }
 
     pub fn with_factory(mut self, factory: impl EngineFactory) -> Self {
@@ -64,7 +70,7 @@ impl Server {
         let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
-        let state = AppState::new(self.config.clone(), self.factory, self.probe)?;
+        let state = AppState::new(self.config.clone(), self.factory, self.probe, self.source)?;
         let app = router(state.clone());
         let (tx, rx) = watch::channel(false);
         spawn_reaper(state.clone(), rx.clone());

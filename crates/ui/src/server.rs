@@ -4,7 +4,7 @@ use eframe::egui;
 use egui_bench::prelude::*;
 use inference_bench_core::engine::Handle;
 use inference_bench_core::logging::LogBuffer;
-use inference_bench_server::config::{ModelConfig, ServerConfig};
+use inference_bench_server::config::ServerConfig;
 use inference_bench_server::engine_backend::EngineBackend;
 use inference_bench_server::{Server, ServerHandle};
 use tracing::Level;
@@ -44,14 +44,11 @@ impl ServerState {
         if !key.trim().is_empty() {
             config.api_keys = vec![key.trim().to_string()];
         }
-        if let Some(l) = engine.loaded() {
-            config.models = vec![ModelConfig { id: l.display.clone(), ..ModelConfig::default() }];
-            config.default_model = Some(l.display);
-        }
+        let source = engine.clone();
         let factory = move |_: Option<usize>| {
             Ok(Box::new(EngineBackend::new(engine.clone())) as Box<dyn inference_bench_core::target::Target>)
         };
-        let started = self.runtime.block_on(Server::new(config).with_factory(factory).with_gpu_probe(std::sync::Arc::new(|| None)).start());
+        let started = self.runtime.block_on(Server::new(config).with_factory(factory).with_model_source(source).with_gpu_probe(std::sync::Arc::new(|| None)).start());
         match started {
             Ok(h) => {
                 self.running = Some(h);
@@ -150,7 +147,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             let url = s.url();
             section(ui, "use it", "any OpenAI-compatible client works", |ui| {
                 note(ui, format!("curl {url}/v1/chat/completions -H 'Content-Type: application/json' -d '{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}'"), LEGEND);
-                note(ui, format!("Metrics at {url}/metrics. The model is the one loaded when the server started; restart it after loading another."), LEGEND);
+                note(ui, format!("Metrics at {url}/metrics. /v1/models lists the model loaded right now."), LEGEND);
             });
         }
         let log = request_lines(&app.logs);

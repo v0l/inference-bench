@@ -10,11 +10,24 @@ pub struct ApiError {
     pub kind: &'static str,
     pub message: String,
     pub retry_after: Option<u64>,
+    pub code: Option<&'static str>,
+    pub param: Option<&'static str>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, kind: &'static str, message: impl Into<String>) -> Self {
-        Self { status, kind, message: message.into(), retry_after: None }
+        Self { status, kind, message: message.into(), retry_after: None, code: None, param: None }
+    }
+
+    pub fn with_code(mut self, code: &'static str, param: &'static str) -> Self {
+        self.code = Some(code);
+        self.param = Some(param);
+        self
+    }
+
+    pub fn model_not_found(id: &str) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found_error", format!("the model {id} does not exist"))
+            .with_code("model_not_found", "model")
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -66,8 +79,8 @@ impl IntoResponse for ApiError {
         let body = json!({"error": {
             "message": self.message,
             "type": self.kind,
-            "param": null,
-            "code": self.status.as_u16().to_string(),
+            "param": self.param,
+            "code": self.code.map(String::from).unwrap_or_else(|| self.status.as_u16().to_string()),
         }});
         let mut response = (self.status, Json(body)).into_response();
         if let Some(secs) = self.retry_after {

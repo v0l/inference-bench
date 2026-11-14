@@ -3,6 +3,17 @@ use inference_bench_core::chat::{ChatRequest, Message, Role, Sampling};
 use inference_bench_core::engine::{ChatEvent, Handle};
 use inference_bench_core::result::{BackendError, ErrorKind, Generation};
 
+use crate::manager::{ModelSource, SourceModel};
+
+impl ModelSource for Handle {
+    fn loaded(&self) -> Vec<SourceModel> {
+        Handle::loaded(self)
+            .map(|l| SourceModel { id: l.display, aliases: vec![l.model_id] })
+            .into_iter()
+            .collect()
+    }
+}
+
 pub struct EngineBackend {
     handle: Handle,
 }
