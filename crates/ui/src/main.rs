@@ -122,11 +122,17 @@ impl App {
     }
 
     pub fn load_model_with(&mut self, model: &LocalModel, ctx: usize, seqs: usize) {
+        let served_names = self.settings.served_names_for(&model.name);
+        self.load_model_named(model, ctx, seqs, served_names);
+    }
+
+    pub fn load_model_named(&mut self, model: &LocalModel, ctx: usize, seqs: usize, served_names: Vec<String>) {
         self.engine.send(Command::Load {
             model_id: model.model_id(inference_bench_core::target::NATIVE),
             display: model.name.clone(),
             max_ctx: Some(ctx),
             max_num_seqs: Some(seqs),
+            served_names,
         });
     }
 

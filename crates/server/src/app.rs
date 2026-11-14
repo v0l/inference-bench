@@ -577,6 +577,15 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
     })
 }
 
+fn system_for_developer(mut list: Vec<Value>) -> Vec<Value> {
+    for m in &mut list {
+        if m["role"] == "developer" {
+            m["role"] = json!("system");
+        }
+    }
+    list
+}
+
 fn content_text(content: &Value) -> String {
     match content {
         Value::String(s) => s.clone(),
@@ -838,7 +847,7 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
     request.use_template = p.use_template;
     request.ignore_eos = p.ignore_eos;
     request.cancel = Some(cancel);
-    request.openai_messages = p.openai_messages;
+    request.openai_messages = p.openai_messages.map(system_for_developer);
     request.cache_salt = Some(salt);
     if let Some(list) = &request.openai_messages
         && inference_bench_core::media::has_media(list)

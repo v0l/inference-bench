@@ -189,6 +189,9 @@ pub fn engine_error(err: &anyhow::Error) -> BackendError {
     if lower.contains("out_of_memory") || lower.contains("out of memory") {
         return BackendError::failed(format!("the GPU ran out of memory: {message}"));
     }
+    if lower.contains("chat template:") {
+        return BackendError::new(ErrorKind::InvalidRequest, message);
+    }
     let kind = match failure_kind(err) {
         FailureKind::UnsupportedArchitecture => ErrorKind::UnsupportedArchitecture,
         FailureKind::ModelNotFound => ErrorKind::ModelNotFound,

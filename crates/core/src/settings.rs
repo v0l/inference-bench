@@ -30,6 +30,8 @@ pub struct Settings {
     #[serde(default)]
     pub model_seqs: BTreeMap<String, usize>,
     #[serde(default)]
+    pub model_served_names: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
     pub hf_token: String,
     #[serde(default)]
     pub spec_folders: Vec<PathBuf>,
@@ -78,6 +80,7 @@ impl Default for Settings {
             model_ctx: BTreeMap::new(),
             default_seqs: default_seqs(),
             model_seqs: BTreeMap::new(),
+            model_served_names: BTreeMap::new(),
             hf_token: String::new(),
             spec_folders: Vec::new(),
             specs_auto_update: true,
@@ -109,6 +112,10 @@ impl Settings {
 
     pub fn seqs_for(&self, model: &str) -> usize {
         self.model_seqs.get(model).copied().unwrap_or(self.default_seqs).max(1)
+    }
+
+    pub fn served_names_for(&self, model: &str) -> Vec<String> {
+        self.model_served_names.get(model).cloned().unwrap_or_default()
     }
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {

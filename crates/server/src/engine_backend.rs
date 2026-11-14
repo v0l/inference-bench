@@ -11,6 +11,7 @@ impl ModelSource for Handle {
             .map(|l| {
                 let mut aliases = vec![l.model_id];
                 aliases.extend(inference_bench_core::library::short_alias(&l.display));
+                aliases.extend(l.served_names);
                 SourceModel { id: l.display, aliases }
             })
             .into_iter()
@@ -42,7 +43,7 @@ impl Target for EngineBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: false, memory: false, vision: false, thinking: self.handle.thinking() }
+        Capabilities { streaming: true, logits: false, memory: false, vision: self.handle.loaded().is_some_and(|l| l.vision), thinking: self.handle.thinking() }
     }
 
     fn load(&mut self, _model: &str) -> Result<(), BackendError> {

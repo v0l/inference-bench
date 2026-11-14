@@ -27,6 +27,8 @@ pub struct ModelConfig {
     pub vram_bytes: Option<u64>,
     #[serde(default)]
     pub preload: bool,
+    #[serde(default)]
+    pub served_names: Vec<String>,
 }
 
 impl ModelConfig {
@@ -268,6 +270,12 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(self.media.max_image_bytes > 0 && self.media.max_video_bytes > 0, "media byte limits must be positive");
         anyhow::ensure!(self.max_concurrent >= 1, "max_concurrent must be at least 1");
+        for (i, m) in self.models.iter().enumerate() {
+            for name in &m.served_names {
+                let taken = self.models.iter().enumerate().any(|(j, o)| o.id == *name || (j != i && o.served_names.contains(name)));
+                anyhow::ensure!(!taken, "served name {name} of model {} is already used by another model", m.id);
+            }
+        }
         anyhow::ensure!(self.max_num_seqs != Some(0), "max_num_seqs must be at least 1");
         anyhow::ensure!(self.max_model_len.is_none_or(|n| n >= 16), "max_model_len must be at least 16");
         anyhow::ensure!(self.default_max_tokens != Some(0), "default_max_tokens must be at least 1");
@@ -294,7 +302,7 @@ impl ServerConfig {
     }
 
     pub fn model(&self, id: &str) -> Option<&ModelConfig> {
-        self.models.iter().find(|m| m.id == id)
+        self.models.iter().find(|m| m.id == id).or_else(|| self.models.iter().find(|m| m.served_names.iter().any(|n| n == id)))
     }
 
     pub fn max_ctx_for(&self, m: &ModelConfig) -> Option<usize> {

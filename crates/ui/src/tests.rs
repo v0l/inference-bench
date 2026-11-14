@@ -352,7 +352,7 @@ fn serving_harness(name: &str, seqs: usize) -> Harness<'static, App> {
         let app = h.state_mut();
         app.engine = inference_bench_core::fake::engine(app.wake.clone(), slow_script());
         let m = app.library[0].clone();
-        app.engine.send(Command::Load { model_id: m.model_id(inference_bench_core::target::NATIVE), display: m.name.clone(), max_ctx: Some(4096), max_num_seqs: Some(seqs) });
+        app.engine.send(Command::Load { model_id: m.model_id(inference_bench_core::target::NATIVE), display: m.name.clone(), max_ctx: Some(4096), max_num_seqs: Some(seqs), served_names: Vec::new() });
     }
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     let handle = h.state().engine.handle();

@@ -20,7 +20,7 @@ impl Role {
 
     pub fn from_name(name: &str) -> Self {
         match name {
-            "system" => Self::System,
+            "system" | "developer" => Self::System,
             "assistant" => Self::Assistant,
             _ => Self::User,
         }

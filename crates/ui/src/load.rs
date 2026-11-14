@@ -73,12 +73,23 @@ pub fn initial_seqs(remembered: Option<usize>, default: usize, a: &ModelAnatomy,
     }
 }
 
+pub fn parse_names(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for n in text.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        if !out.iter().any(|o| o == n) {
+            out.push(n.to_string());
+        }
+    }
+    out
+}
+
 pub struct LoadDialog {
     pub model: LocalModel,
     pub view: Result<View, String>,
     pub ctx: usize,
     pub max: usize,
     pub seqs: usize,
+    pub served_names: String,
     pub remember: bool,
 }
 
@@ -98,7 +109,8 @@ impl LoadDialog {
             }
             Err(_) => (app.settings.ctx_for(&model.name), app.settings.ctx_for(&model.name), app.settings.seqs_for(&model.name)),
         };
-        Self { model: model.clone(), view, ctx, max, seqs, remember: true }
+        let served_names = app.settings.served_names_for(&model.name).join(", ");
+        Self { model: model.clone(), view, ctx, max, seqs, served_names, remember: true }
     }
 
     pub fn estimate(&self, free: Option<u64>) -> Option<Estimate> {
@@ -135,6 +147,12 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                 row_help(ui, "parallel requests", "How many requests the engine runs at once, chat and API clients together. Each one gets its own cache at the full context length, so more of them cost more memory. 1 keeps the plain single-request engine.", |ui| {
                     let suffix = if dialog.seqs == 1 { " request" } else { " requests" };
                     ui.add(egui::Slider::new(&mut dialog.seqs, 1..=MAX_SEQS).suffix(suffix));
+                });
+            });
+            ui.add_space(8.0);
+            section(ui, "api", "extra names API clients can use for this model", |ui| {
+                row_help(ui, "served names", "Comma separated aliases, like vLLM's served model name. /v1/models lists the model's own id, requests may use any of these.", |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut dialog.served_names).hint_text("qwen3.8-27b").desired_width(260.0));
                 });
             });
             ui.add_space(8.0);
@@ -179,13 +197,15 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
     }
     if go {
         let model = dialog.model.clone();
+        let names = parse_names(&dialog.served_names);
         if dialog.remember {
             app.settings.model_ctx.insert(model.name.clone(), dialog.ctx);
             app.settings.model_seqs.insert(model.name.clone(), dialog.seqs);
+            app.settings.model_served_names.insert(model.name.clone(), names.clone());
             let _ = app.settings.save(&app.dir);
         }
         app.chat.load_error = None;
-        app.load_model_with(&model, dialog.ctx, dialog.seqs);
+        app.load_model_named(&model, dialog.ctx, dialog.seqs, names);
         if app.tab == Tab::Models {
             app.tab = Tab::Chat;
         }

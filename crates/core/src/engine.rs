@@ -30,12 +30,13 @@ pub struct Loaded {
     pub vision: bool,
     pub ctx: usize,
     pub max_num_seqs: usize,
+    pub served_names: Vec<String>,
     pub parallel_note: Option<String>,
     pub thinking: specrt::chat::Thinking,
 }
 
 pub enum Command {
-    Load { model_id: String, display: String, max_ctx: Option<usize>, max_num_seqs: Option<usize> },
+    Load { model_id: String, display: String, max_ctx: Option<usize>, max_num_seqs: Option<usize>, served_names: Vec<String> },
     Unload,
     Chat { request: ChatRequest, events: Sender<ChatEvent>, queued: Instant },
     Shutdown,
@@ -315,7 +316,7 @@ fn run(
                 release(&mut backend);
                 emit(EngineEvent::Unloaded);
             }
-            Command::Load { model_id, display, max_ctx, max_num_seqs } => {
+            Command::Load { model_id, display, max_ctx, max_num_seqs, served_names } => {
                 release(&mut backend);
                 emit(EngineEvent::Loading(display.clone()));
                 let started = Instant::now();
@@ -331,6 +332,7 @@ fn run(
                             vision: o.vision,
                             ctx,
                             max_num_seqs: o.seqs,
+                            served_names,
                             parallel_note: o.note,
                             thinking: o.thinking,
                         };
@@ -427,7 +429,7 @@ mod tests {
     }
 
     fn load(model: &str, display: &str) -> Command {
-        Command::Load { model_id: model.into(), display: display.into(), max_ctx: None, max_num_seqs: None }
+        Command::Load { model_id: model.into(), display: display.into(), max_ctx: None, max_num_seqs: None, served_names: Vec::new() }
     }
 
     fn engine() -> Engine {
@@ -502,7 +504,7 @@ mod tests {
 
     fn batched(seqs: Option<usize>) -> Engine {
         let e = crate::fake::engine(Arc::new(|| {}), slow_script());
-        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: seqs });
+        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: seqs, served_names: Vec::new() });
         wait_event(&e);
         assert!(matches!(wait_event(&e), EngineEvent::Loaded(_)));
         e
@@ -583,7 +585,7 @@ mod tests {
     #[test]
     fn the_scripted_fake_cannot_load_unknown_models_batched_either() {
         let e = crate::fake::engine(Arc::new(|| {}), slow_script());
-        e.send(Command::Load { model_id: "other".into(), display: "O".into(), max_ctx: None, max_num_seqs: Some(4) });
+        e.send(Command::Load { model_id: "other".into(), display: "O".into(), max_ctx: None, max_num_seqs: Some(4), served_names: Vec::new() });
         wait_event(&e);
         match wait_event(&e) {
             EngineEvent::Loaded(l) => panic!("{l:?}"),

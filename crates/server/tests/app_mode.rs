@@ -54,7 +54,17 @@ fn start_app(config: inference_bench_server::ServerConfig, factory: impl EngineF
 
 impl AppRig {
     fn load(&self, model: &str, display: &str) {
-        self.engine.send(Command::Load { model_id: model.into(), display: display.into(), max_ctx: None, max_num_seqs: None });
+        self.load_named(model, display, &[]);
+    }
+
+    fn load_named(&self, model: &str, display: &str, served: &[&str]) {
+        self.engine.send(Command::Load {
+            model_id: model.into(),
+            display: display.into(),
+            max_ctx: None,
+            max_num_seqs: None,
+            served_names: served.iter().map(|s| s.to_string()).collect(),
+        });
         loop {
             match self.engine.events.recv_timeout(Duration::from_secs(10)).unwrap() {
                 EngineEvent::Loaded(_) => return,
@@ -168,6 +178,21 @@ fn the_full_repo_id_is_the_model_id_and_the_short_name_still_resolves() {
         assert_eq!(body["model"], "org/one");
     }
     assert_eq!(app.chat(say(Some("two"))).0, 404);
+    app.rig.stop();
+}
+
+#[test]
+fn a_served_name_is_an_alias_and_models_lists_only_the_primary_id() {
+    let app = app_rig();
+    app.load_named("org/one", "One", &["qwen3.8-27b", "gpt-4o"]);
+    assert_eq!(app.model_ids(), ["One"]);
+    for named in ["qwen3.8-27b", "gpt-4o", "One"] {
+        let (status, body) = app.chat(say(Some(named)));
+        assert_eq!(status, 200, "{named}: {body}");
+        assert_eq!(body["model"], "One");
+    }
+    let (status, _) = app.chat(say(Some("other")));
+    assert_eq!(status, 404);
     app.rig.stop();
 }
 
