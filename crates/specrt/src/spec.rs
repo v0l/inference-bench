@@ -114,6 +114,8 @@ pub struct RuntimeOptions {
     pub cache_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "PrefixCacheOptions::is_default")]
     pub prefix_cache: PrefixCacheOptions,
+    #[serde(skip_serializing_if = "crate::loader::LoaderOptions::is_default")]
+    pub loader: crate::loader::LoaderOptions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,7 +152,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default() }
     }
 }
 
@@ -161,6 +163,7 @@ impl RuntimeOptions {
 
     fn validate(&self) -> Result<()> {
         self.prefix_cache.validate()?;
+        self.loader.validate()?;
         ensure!(self.fp4_stages.is_none_or(|n| n >= 2), "[runtime] fp4_stages needs at least 2");
         ensure!(self.prefill_chunk.is_none_or(|n| n >= 64), "[runtime] prefill_chunk needs at least 64 tokens");
         for (key, tile) in [("big_tile", self.big_tile), ("fp4_tile", self.fp4_tile)] {

@@ -2,7 +2,7 @@ use crate::codegen::{LA_CHUNK, LA_COLS, LA_KSPLIT, Module, PAGE};
 use crate::jit::{Jit, default_cache_dir};
 use crate::spec::{LinearAttention, Spec};
 use crate::statepool::StatePool;
-use crate::weights::{Checkpoint, Matrix, Mixer, peak_rss_bytes};
+use crate::weights::{Checkpoint, Feed, Matrix, Mixer, peak_rss_bytes};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::{
@@ -25,6 +25,27 @@ use exec::Plans;
 pub use mtp::{SpecRow, SpecStats};
 pub use stage::{StageRange, StageRole};
 pub use step::{DecodeRow, GRAPH_SIZES, Stepper, pad_rows};
+
+fn weight_groups(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole) -> Vec<Vec<String>> {
+    if !ck.is_safetensors() {
+        return Vec::new();
+    }
+    let root = ck.root();
+    let mut groups: Vec<Vec<String>> =
+        (0..spec.layers.count).map(|i| ck.names_under(&format!("{root}.layers.{}.", range.start + i))).collect();
+    let embed = format!("{root}.embed_tokens.weight");
+    let mut outside = Vec::new();
+    if role.first || (role.last && spec.dims.tie_embeddings) {
+        outside.push(embed);
+    }
+    if role.last {
+        outside.push(format!("{root}.norm.weight"));
+        outside.push("lm_head.weight".to_string());
+    }
+    groups.push(ck.tensor_names(&outside));
+    groups.push(if spec.speculative().is_some() { ck.names_under("mtp.") } else { Vec::new() });
+    groups
+}
 
 enum DeviceMatrix {
     Bf16(CudaSlice<u16>),
@@ -526,6 +547,7 @@ impl Runtime {
         let stream = ctx.new_stream()?;
         let jit = Jit::new(ctx.clone(), spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir))?;
         let module = Module::generate_kv(spec, max_ctx, layout.kv_planes)?;
+        crate::progress::report(crate::progress::Stage::Kernels, 0, 1);
         let jit_started = Instant::now();
         let loaded = jit.load(&module)?;
         let jit_secs = jit_started.elapsed().as_secs_f64();
@@ -544,8 +566,10 @@ impl Runtime {
             kernels.insert(name, f);
         }
         let smem = module.smem.clone();
-        let checkpoint = Checkpoint::for_repo(&spec.repo)?;
+        crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
+        let mut checkpoint = Checkpoint::for_repo(&spec.repo)?;
         let weights_started = Instant::now();
+        let mut feed = Feed::new(&checkpoint, weight_groups(&checkpoint, spec, range, role), &spec.runtime.loader, spec.runtime.loader.enabled, &ctx)?;
         let up_m = |m: &Matrix| DeviceMatrix::upload(&stream, m);
         let up_opt = |v: &Option<Vec<f32>>| -> Result<Option<CudaSlice<f32>>> {
             Ok(match v {
@@ -556,6 +580,7 @@ impl Runtime {
         let mut layers = Vec::with_capacity(spec.layers.count);
         let (mut kv, mut slot) = (0i32, 0i32);
         for i in 0..spec.layers.count {
+            feed.advance(&mut checkpoint)?;
             let l = checkpoint.layer_at(spec, i, range.start + i).with_context(|| format!("layer {}", range.start + i))?;
             let mixer = match &l.mixer {
                 Mixer::Attention(a) => {
@@ -592,8 +617,10 @@ impl Runtime {
             });
             stream.synchronize()?;
             drop(l);
+            feed.complete(&mut checkpoint);
             checkpoint.release();
         }
+        feed.advance(&mut checkpoint)?;
         let (embed, norm, lm_head) = if role.whole() {
             let outside = checkpoint.outside(spec)?;
             let loaded = (stream.clone_htod(outside.embed.as_ref())?, stream.clone_htod(&outside.norm)?, up_m(&outside.lm_head)?);
@@ -610,8 +637,11 @@ impl Runtime {
             stream.synchronize()?;
             (embed, norm, lm_head)
         };
+        feed.complete(&mut checkpoint);
         checkpoint.release();
+        feed.advance(&mut checkpoint)?;
         let mtp_weights = mtp::DeviceMtp::load(&stream, &checkpoint, spec)?;
+        feed.complete(&mut checkpoint);
         checkpoint.release();
         let weight_secs = weights_started.elapsed().as_secs_f64();
         let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
@@ -776,6 +806,7 @@ impl Runtime {
             }
         }
         rt.stream.synchronize()?;
+        crate::progress::report(crate::progress::Stage::KvCache, 0, 1);
         let kv_blocks = match layout.kv_blocks {
             0 => {
                 let free = ctx.mem_get_info().map(|(f, _)| f).unwrap_or(0);
@@ -798,6 +829,7 @@ impl Runtime {
             }
         }
         rt.stream.synchronize()?;
+        crate::progress::report(crate::progress::Stage::KvCache, 1, 1);
         let free_after = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         rt.device_bytes = free_before.saturating_sub(free_after) as u64;
         rt.load_secs = load_started.elapsed().as_secs_f64();

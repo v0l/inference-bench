@@ -103,6 +103,7 @@ pub struct Checkpoint {
     gguf: Option<Gguf>,
     shards: Vec<Shard>,
     names: HashMap<String, usize>,
+    staged: Option<crate::loader::Batch>,
     pub files: Vec<PathBuf>,
 }
 
@@ -130,7 +131,7 @@ fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
 impl Checkpoint {
     pub fn open(dir: &Path) -> Result<Self> {
         if dir.extension().is_some_and(|e| e == "gguf") {
-            return Ok(Checkpoint { gguf: Some(Gguf::open(dir)?), shards: Vec::new(), names: HashMap::new(), files: vec![dir.to_path_buf()] });
+            return Ok(Checkpoint { gguf: Some(Gguf::open(dir)?), shards: Vec::new(), names: HashMap::new(), staged: None, files: vec![dir.to_path_buf()] });
         }
         let files = shard_files(dir)?;
         let mut shards = Vec::with_capacity(files.len());
@@ -147,7 +148,7 @@ impl Checkpoint {
             }
             shards.push(Shard { map, data_start: 8 + header, meta });
         }
-        Ok(Checkpoint { gguf: None, shards, names, files })
+        Ok(Checkpoint { gguf: None, shards, names, staged: None, files })
     }
 
     pub fn for_repo(repo: &str) -> Result<Self> {
@@ -169,11 +170,39 @@ impl Checkpoint {
         let shard = &self.shards[i];
         let info = shard.meta.info(name).context("tensor info")?;
         let (from, to) = info.data_offsets;
-        Ok(View {
-            dtype: info.dtype,
-            shape: info.shape.clone(),
-            data: &shard.map[shard.data_start + from..shard.data_start + to],
-        })
+        let data = match self.staged.as_ref().and_then(|b| b.get(name)) {
+            Some(staged) => staged,
+            None => &shard.map[shard.data_start + from..shard.data_start + to],
+        };
+        Ok(View { dtype: info.dtype, shape: info.shape.clone(), data })
+    }
+
+    pub fn extents(&self, names: &[String]) -> Result<Vec<crate::loader::Item>> {
+        let mut items = Vec::with_capacity(names.len());
+        for name in names {
+            let &file = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+            let shard = &self.shards[file];
+            let (from, to) = shard.meta.info(name).context("tensor info")?.data_offsets;
+            items.push(crate::loader::Item { name: name.clone(), file, offset: (shard.data_start + from) as u64, len: (to - from) as u64 });
+        }
+        items.sort_by_key(|i| (i.file, i.offset));
+        Ok(items)
+    }
+
+    pub fn names_under(&self, prefix: &str) -> Vec<String> {
+        self.names.keys().filter(|n| n.starts_with(prefix)).cloned().collect()
+    }
+
+    pub fn tensor_names(&self, wanted: &[String]) -> Vec<String> {
+        wanted.iter().filter(|n| self.names.contains_key(*n)).cloned().collect()
+    }
+
+    pub fn is_safetensors(&self) -> bool {
+        self.gguf.is_none()
+    }
+
+    pub fn stage(&mut self, batch: Option<crate::loader::Batch>) {
+        self.staged = batch;
     }
 
     pub fn release(&self) {
@@ -1018,5 +1047,67 @@ mod tests {
         assert_eq!(e4m3_to_f32(0x07), 7.0 * 2f32.powi(-9));
         assert_eq!(e4m3_to_f32(0x08), 2f32.powi(-6));
         assert_eq!(e4m3_to_f32(0x80), -0.0);
+    }
+}
+
+pub struct Feed {
+    groups: Vec<Vec<String>>,
+    next: usize,
+    done: u64,
+    total: u64,
+    sizes: Vec<u64>,
+    reader: Option<crate::loader::Prefetcher>,
+}
+
+impl Feed {
+    pub fn new(
+        ck: &Checkpoint,
+        groups: Vec<Vec<String>>,
+        opts: &crate::loader::LoaderOptions,
+        fast: bool,
+        ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+    ) -> Result<Feed> {
+        let mut items = Vec::with_capacity(groups.len());
+        for g in &groups {
+            items.push(ck.extents(g)?);
+        }
+        let sizes: Vec<u64> = items.iter().map(|g| g.iter().map(|i| i.len).sum()).collect();
+        let total = sizes.iter().sum();
+        let reader = if fast && !groups.is_empty() {
+            Some(crate::loader::Prefetcher::start(&ck.files, items, *opts, Some(ctx.clone()))?)
+        } else {
+            None
+        };
+        crate::progress::report(crate::progress::Stage::Weights, 0, total);
+        Ok(Feed { groups, next: 0, done: 0, total, sizes, reader })
+    }
+
+    pub fn direct(&self) -> bool {
+        self.reader.as_ref().is_some_and(|r| r.direct)
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    pub fn advance(&mut self, ck: &mut Checkpoint) -> Result<()> {
+        if self.groups.is_empty() {
+            return Ok(());
+        }
+        ensure!(self.next < self.groups.len(), "the weight plan has no group {}", self.next);
+        self.next += 1;
+        if let Some(r) = &self.reader {
+            ck.stage(Some(r.next()?));
+        }
+        Ok(())
+    }
+
+    pub fn complete(&mut self, ck: &mut Checkpoint) {
+        ck.stage(None);
+        if self.groups.is_empty() {
+            return;
+        }
+        self.done += self.sizes[self.next - 1];
+        crate::progress::report(crate::progress::Stage::Weights, self.done, self.total);
     }
 }

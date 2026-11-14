@@ -1,0 +1,423 @@
+use anyhow::{Context, Result, anyhow, ensure};
+use cudarc::driver::{CudaContext, PinnedHostSlice};
+use serde::{Deserialize, Serialize};
+use std::alloc::Layout;
+use std::collections::HashMap;
+use std::fs::File;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+
+pub const ALIGN: usize = 4096;
+const PIN_CLASS: usize = 64 << 20;
+const PIN_LIMIT: usize = 512 << 20;
+const POOL_KEEP: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoaderOptions {
+    pub enabled: bool,
+    pub direct: bool,
+    pub chunk_mb: usize,
+    pub readers: usize,
+    pub ahead: usize,
+}
+
+impl Default for LoaderOptions {
+    fn default() -> Self {
+        LoaderOptions { enabled: true, direct: true, chunk_mb: 32, readers: 4, ahead: 2 }
+    }
+}
+
+impl LoaderOptions {
+    pub fn is_default(&self) -> bool {
+        *self == LoaderOptions::default()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.chunk_mb >= 1, "[runtime.loader] chunk_mb needs at least 1");
+        ensure!((1..=64).contains(&self.readers), "[runtime.loader] readers must be between 1 and 64");
+        ensure!(self.ahead >= 1, "[runtime.loader] ahead needs at least 1");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Item {
+    pub name: String,
+    pub file: usize,
+    pub offset: u64,
+    pub len: u64,
+}
+
+fn round_up(v: usize, to: usize) -> usize {
+    v.div_ceil(to) * to
+}
+
+enum Backing {
+    Pinned(PinnedHostSlice<u8>),
+    Heap(Layout),
+}
+
+pub struct Host {
+    ptr: *mut u8,
+    cap: usize,
+    backing: Backing,
+}
+
+unsafe impl Send for Host {}
+unsafe impl Sync for Host {}
+
+impl Host {
+    pub fn pinned(&self) -> bool {
+        matches!(self.backing, Backing::Pinned(_))
+    }
+
+    pub fn capacity(&self) -> usize {
+        match &self.backing {
+            Backing::Pinned(p) => p.num_bytes().min(self.cap),
+            Backing::Heap(_) => self.cap,
+        }
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        if let Backing::Heap(layout) = &self.backing {
+            unsafe { std::alloc::dealloc(self.ptr, *layout) };
+        }
+    }
+}
+
+pub struct Pool {
+    ctx: Option<Arc<CudaContext>>,
+    free: Mutex<Vec<Host>>,
+}
+
+impl Pool {
+    pub fn new(ctx: Option<Arc<CudaContext>>) -> Arc<Pool> {
+        Arc::new(Pool { ctx, free: Mutex::new(Vec::new()) })
+    }
+
+    pub fn pinned_buffers(&self) -> usize {
+        self.free.lock().unwrap().iter().filter(|h| h.pinned()).count()
+    }
+
+    fn take(&self, need: usize) -> Result<Host> {
+        let need = round_up(need.max(1), ALIGN);
+        {
+            let mut free = self.free.lock().unwrap();
+            let best = free.iter().enumerate().filter(|(_, h)| h.cap >= need).min_by_key(|(_, h)| h.cap).map(|(i, _)| i);
+            if let Some(i) = best {
+                return Ok(free.swap_remove(i));
+            }
+        }
+        if let Some(ctx) = self.ctx.as_ref().filter(|_| need <= PIN_LIMIT) {
+            let cap = round_up(need, PIN_CLASS);
+            if let Ok(mut slice) = unsafe { ctx.alloc_pinned_with_flags::<u8>(cap, 0) } {
+                let ptr = slice.as_mut_ptr().context("pinned host buffer")?;
+                return Ok(Host { ptr, cap, backing: Backing::Pinned(slice) });
+            }
+        }
+        let layout = Layout::from_size_align(need, ALIGN).context("host buffer layout")?;
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        ensure!(!ptr.is_null(), "out of host memory for a {need} byte read buffer");
+        Ok(Host { ptr, cap: need, backing: Backing::Heap(layout) })
+    }
+
+    fn give(&self, host: Host) {
+        if !host.pinned() {
+            return;
+        }
+        let mut free = self.free.lock().unwrap();
+        free.push(host);
+        if free.len() > POOL_KEEP {
+            let smallest = free.iter().enumerate().min_by_key(|(_, h)| h.cap).map(|(i, _)| i).unwrap_or(0);
+            free.swap_remove(smallest);
+        }
+    }
+}
+
+pub struct Batch {
+    host: Option<Host>,
+    pool: Arc<Pool>,
+    spans: HashMap<String, (usize, usize)>,
+    pub bytes: u64,
+}
+
+impl Batch {
+    pub fn get(&self, name: &str) -> Option<&[u8]> {
+        let &(at, len) = self.spans.get(name)?;
+        let host = self.host.as_ref()?;
+        Some(unsafe { std::slice::from_raw_parts(host.ptr.add(at), len) })
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.spans.keys()
+    }
+
+    pub fn pinned(&self) -> bool {
+        self.host.as_ref().is_some_and(Host::pinned)
+    }
+}
+
+impl Drop for Batch {
+    fn drop(&mut self) {
+        if let Some(host) = self.host.take() {
+            self.pool.give(host);
+        }
+    }
+}
+
+pub struct Source {
+    plain: File,
+    direct: Option<File>,
+    direct_ok: AtomicBool,
+}
+
+impl Source {
+    pub fn open(path: &Path, want_direct: bool) -> Result<Source> {
+        let plain = File::open(path).with_context(|| path.display().to_string())?;
+        let direct = if want_direct { std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path).ok() } else { None };
+        Ok(Source { direct_ok: AtomicBool::new(direct.is_some()), plain, direct })
+    }
+
+    pub fn is_direct(&self) -> bool {
+        self.direct_ok.load(Ordering::Relaxed)
+    }
+
+    pub fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        if self.is_direct() {
+            if let Some(f) = &self.direct {
+                match f.read_at(buf, offset) {
+                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => self.direct_ok.store(false, Ordering::Relaxed),
+                    other => return other,
+                }
+            }
+        }
+        self.plain.read_at(buf, offset)
+    }
+
+    fn fill(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        let mut got = 0;
+        while got < buf.len() {
+            match self.read_at(&mut buf[got..], offset + got as u64) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(got)
+    }
+}
+
+struct Job {
+    file: usize,
+    from: u64,
+    len: usize,
+    to: usize,
+    need: usize,
+}
+
+pub fn read_batch(sources: &[Source], items: &[Item], pool: &Arc<Pool>, opts: &LoaderOptions) -> Result<Batch> {
+    let mut spans = HashMap::with_capacity(items.len());
+    let mut regions = Vec::with_capacity(items.len());
+    let mut total = 0usize;
+    for it in items {
+        let start = it.offset;
+        let from = start & !(ALIGN as u64 - 1);
+        let end = start + it.len;
+        let rlen = round_up((end - from) as usize, ALIGN);
+        spans.insert(it.name.clone(), (total + (start - from) as usize, it.len as usize));
+        regions.push((it.file, from, rlen, total, (end - from) as usize));
+        total += rlen;
+    }
+    let host = pool.take(total)?;
+    let chunk = (opts.chunk_mb << 20).max(ALIGN) & !(ALIGN - 1);
+    let mut jobs = Vec::new();
+    for &(file, from, rlen, to, need) in &regions {
+        let mut done = 0;
+        while done < rlen {
+            let len = chunk.min(rlen - done);
+            jobs.push(Job { file, from: from + done as u64, len, to: to + done, need: need.saturating_sub(done).min(len) });
+            done += len;
+        }
+    }
+    let base = host.ptr as usize;
+    let next = AtomicUsize::new(0);
+    let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..opts.readers.min(jobs.len()).max(1) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(job) = jobs.get(i) else { break };
+                    if failure.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let dst = unsafe { std::slice::from_raw_parts_mut((base + job.to) as *mut u8, job.len) };
+                    let src = &sources[job.file];
+                    match src.fill(dst, job.from) {
+                        Ok(got) if got >= job.need => {}
+                        Ok(got) => {
+                            *failure.lock().unwrap() = Some(anyhow!("short read at offset {}: got {got} of {} bytes, the file is truncated", job.from, job.need));
+                        }
+                        Err(e) => *failure.lock().unwrap() = Some(anyhow!("read at offset {}: {e}", job.from)),
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = failure.into_inner().unwrap() {
+        pool.give(host);
+        return Err(e);
+    }
+    Ok(Batch { host: Some(host), pool: pool.clone(), spans, bytes: items.iter().map(|i| i.len).sum() })
+}
+
+pub struct Prefetcher {
+    rx: Receiver<Result<Batch>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    pub direct: bool,
+    pub total: u64,
+}
+
+impl Prefetcher {
+    pub fn start(files: &[PathBuf], groups: Vec<Vec<Item>>, opts: LoaderOptions, ctx: Option<Arc<CudaContext>>) -> Result<Prefetcher> {
+        let sources = files.iter().map(|p| Source::open(p, opts.direct)).collect::<Result<Vec<_>>>()?;
+        let direct = sources.iter().all(Source::is_direct) && !sources.is_empty();
+        let total = groups.iter().flatten().map(|i| i.len).sum();
+        let pool = Pool::new(ctx.clone());
+        let (tx, rx) = sync_channel(opts.ahead.saturating_sub(1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("specrt-read".into())
+            .spawn(move || {
+                if let Some(ctx) = &ctx {
+                    let _ = ctx.bind_to_thread();
+                }
+                for items in groups {
+                    if flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let batch = read_batch(&sources, &items, &pool, &opts);
+                    let failed = batch.is_err();
+                    if tx.send(batch).is_err() || failed {
+                        break;
+                    }
+                }
+            })
+            .context("reader thread")?;
+        Ok(Prefetcher { rx, stop, thread: Some(thread), direct, total })
+    }
+
+    pub fn next(&self) -> Result<Batch> {
+        self.rx.recv().map_err(|_| anyhow!("the reader thread stopped before the weights were read"))?
+    }
+}
+
+impl Drop for Prefetcher {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        while self.rx.try_recv().is_ok() {}
+        if let Some(t) = self.thread.take() {
+            while !t.is_finished() {
+                while self.rx.try_recv().is_ok() {}
+                std::thread::yield_now();
+            }
+            let _ = t.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn file_with(dir: &Path, name: &str, len: usize) -> (PathBuf, Vec<u8>) {
+        let data: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(31) ^ (i >> 7)) as u8).collect();
+        let path = dir.join(name);
+        std::fs::File::create(&path).unwrap().write_all(&data).unwrap();
+        (path, data)
+    }
+
+    fn items(file: usize, spans: &[(u64, u64)]) -> Vec<Item> {
+        spans.iter().enumerate().map(|(i, &(offset, len))| Item { name: format!("t{file}.{i}"), file, offset, len }).collect()
+    }
+
+    fn check(dir: &Path, direct: bool) -> bool {
+        let (p, data) = file_with(dir, "a.bin", 3 * (1 << 20) + 1234);
+        let opts = LoaderOptions { enabled: true, direct, chunk_mb: 1, readers: 3, ahead: 2 };
+        let spans = [(5u64, 100u64), (4096, 4096), (10_000, 1_500_000), (3 * (1 << 20) + 1000, 234)];
+        let src = Source::open(&p, direct).unwrap();
+        let used_direct = src.is_direct();
+        let pool = Pool::new(None);
+        let it = items(0, &spans);
+        let batch = read_batch(&[src], &it, &pool, &opts).unwrap();
+        for (i, &(off, len)) in spans.iter().enumerate() {
+            assert_eq!(batch.get(&format!("t0.{i}")).unwrap(), &data[off as usize..(off + len) as usize], "span {i}");
+        }
+        used_direct
+    }
+
+    #[test]
+    fn reads_unaligned_extents_exactly_with_direct_io_or_buffered() {
+        let dir = std::env::temp_dir().join(format!("specrt-loader-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        check(&dir, true);
+        check(&dir, false);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_filesystem_that_refuses_direct_io_falls_back_to_buffered_reads() {
+        let dir = PathBuf::from("/dev/shm").join(format!("specrt-loader-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        check(&dir, true);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_buffered_option_never_opens_direct() {
+        let dir = std::env::temp_dir().join(format!("specrt-loader-buf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!check(&dir, false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_past_the_end_of_a_truncated_file_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("specrt-loader-short-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, _) = file_with(&dir, "short.bin", 10_000);
+        let src = Source::open(&p, true).unwrap();
+        let pool = Pool::new(None);
+        let it = items(0, &[(9_000, 5_000)]);
+        let err = read_batch(&[src], &it, &pool, &LoaderOptions::default()).err().expect("short read");
+        assert!(err.to_string().contains("truncated"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_prefetcher_delivers_groups_in_order_and_drops_cleanly() {
+        let dir = std::env::temp_dir().join(format!("specrt-loader-order-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (p, data) = file_with(&dir, "b.bin", 1 << 20);
+        let groups: Vec<Vec<Item>> = (0..6).map(|g| vec![Item { name: "x".into(), file: 0, offset: g * 1000, len: 700 }]).collect();
+        let pf = Prefetcher::start(&[p], groups, LoaderOptions::default(), None).unwrap();
+        assert_eq!(pf.total, 6 * 700);
+        for g in 0..3usize {
+            let b = pf.next().unwrap();
+            assert_eq!(b.get("x").unwrap(), &data[g * 1000..g * 1000 + 700]);
+        }
+        drop(pf);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

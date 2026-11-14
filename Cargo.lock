@@ -3577,6 +3577,7 @@ dependencies = [
  "cudarc",
  "dirs",
  "image",
+ "libc",
  "mdns-sd",
  "memmap2",
  "minijinja",

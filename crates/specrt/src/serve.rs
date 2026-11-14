@@ -50,6 +50,7 @@ pub struct ServeOptions {
     pub runtime: Option<RuntimeOptions>,
     pub speculative: SpeculativeOptions,
     pub placement: Option<crate::placement::PlacementConfig>,
+    pub progress: Option<crate::progress::Sink>,
 }
 
 impl Default for ServeOptions {
@@ -64,6 +65,7 @@ impl Default for ServeOptions {
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,
+            progress: None,
         }
     }
 }
@@ -243,7 +245,8 @@ impl Core {
         let thread = std::thread::Builder::new()
             .name("specrt-serve".into())
             .spawn(move || {
-                let _ = start_engine(&spec, opts, ready_tx, inbox, shared);
+                let sink = opts.progress.clone();
+                let _ = crate::progress::with_sink(sink, || start_engine(&spec, opts, ready_tx, inbox, shared));
             })
             .context("serving thread")?;
         let vision = ready.recv().context("the serving thread stopped while loading")??;

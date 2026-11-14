@@ -391,6 +391,15 @@ impl Engine {
         Self::load_with(model, max_ctx, None)
     }
 
+    pub fn load_with_progress(
+        model: &str,
+        max_ctx: Option<usize>,
+        runtime: Option<&crate::spec::RuntimeOptions>,
+        progress: Option<crate::progress::Sink>,
+    ) -> Result<Self> {
+        crate::progress::with_sink(progress, || Self::load_with(model, max_ctx, runtime))
+    }
+
     pub fn load_with(model: &str, max_ctx: Option<usize>, runtime: Option<&crate::spec::RuntimeOptions>) -> Result<Self> {
         let Assets { mut spec, tokenizer, chat, stop, sampling, media } = Assets::load(model)?;
         if let Some(r) = runtime {
