@@ -18,7 +18,7 @@ fn yes(b: bool) -> String {
     if b { "yes".into() } else { "no".into() }
 }
 
-pub fn entries(view: &View, bandwidth_gbs: Option<u64>) -> Vec<Entry> {
+pub fn entries(view: &View) -> Vec<Entry> {
     let s = &view.spec;
     let a = &view.anatomy;
     let src = view.source.label();
@@ -100,10 +100,6 @@ pub fn entries(view: &View, bandwidth_gbs: Option<u64>) -> Vec<Entry> {
     add("derived", "read per decoded token", human_size(a.decode_bytes), "derived");
     add("derived", "kv per 1k tokens", human_size(a.kv_bytes_per_token * 1024), "derived");
     add("derived", "state per sequence", human_size(a.state_bytes_per_seq), "derived");
-    match bandwidth_gbs {
-        Some(bw) => add("derived", "decode ceiling", format!("{:.1} tok/s at {bw} GB/s", a.decode_tokens_per_second(bw as f64 * 1e9)), "derived"),
-        None => add("derived", "decode ceiling", "no bandwidth recorded".into(), "derived"),
-    }
     for (key, value) in &view.unread {
         let shown = if value.chars().count() > 120 { format!("{}...", value.chars().take(120).collect::<String>()) } else { value.clone() };
         out.push(Entry { group: "config keys the spec does not read", field: key.clone(), value: shown, source: "config.json" });
@@ -111,9 +107,9 @@ pub fn entries(view: &View, bandwidth_gbs: Option<u64>) -> Vec<Entry> {
     out
 }
 
-pub fn draw(ui: &mut egui::Ui, view: &View, bandwidth_gbs: Option<u64>) {
+pub fn draw(ui: &mut egui::Ui, view: &View) {
     let mut group = "";
-    for e in entries(view, bandwidth_gbs) {
+    for e in entries(view) {
         if e.group != group {
             group = e.group;
             ui.add_space(4.0);
@@ -140,7 +136,7 @@ mod tests {
         let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/gemma4-31b.config.json")).unwrap();
         let mut v = view("qwen3.8-27b-exact.toml");
         v.unread = specrt::spec::unread_hf_keys(&json);
-        let e = entries(&v, None);
+        let e = entries(&v);
         let raw = |k: &str| e.iter().find(|x| x.group == "config keys the spec does not read" && x.field == k).map(|x| x.value.clone());
         assert_eq!(raw("final_logit_softcapping").as_deref(), Some("30.0"));
         assert_eq!(raw("global_head_dim").as_deref(), Some("512"));
@@ -149,18 +145,11 @@ mod tests {
 
     #[test]
     fn every_group_is_listed_with_its_source() {
-        let e = entries(&view("qwen3.8-27b-nvfp4-exact.toml"), Some(800));
+        let e = entries(&view("qwen3.8-27b-nvfp4-exact.toml"));
         for g in ["dims", "attention", "linear attention", "mlp", "norm", "rope and scaling", "quant", "mtp and runtime", "derived"] {
             assert!(e.iter().any(|x| x.group == g), "{g}");
         }
         assert!(e.iter().any(|x| x.field == "mlp quant" && x.value.contains("0 to 55")));
         assert!(e.iter().filter(|x| x.group != "derived").all(|x| !x.source.is_empty()));
-        assert!(e.iter().any(|x| x.field == "decode ceiling" && x.value.contains("tok/s at 800 GB/s")));
-    }
-
-    #[test]
-    fn the_ceiling_says_so_when_no_bandwidth_is_recorded() {
-        let e = entries(&view("qwen3.8-27b-exact.toml"), None);
-        assert!(e.iter().any(|x| x.field == "decode ceiling" && x.value.starts_with("no bandwidth")));
     }
 }

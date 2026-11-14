@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/v0l/inference-bench"
-description = "Run LLMs on a native CUDA engine, serve them, and benchmark them against other engines"
+description = "A local LLM server and desktop app on its own spec-driven CUDA engine: model library, chat and an OpenAI-compatible API"
 
 [workspace.dependencies]
 inference-bench-core = { path = "crates/core" }

@@ -1,5 +1,4 @@
 use crate::App;
-use crate::shell::page;
 use eframe::egui;
 use egui_bench::prelude::*;
 use inference_bench_core::logging::LogEntry;
@@ -34,7 +33,7 @@ pub fn save_path(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
-    page(ui, "logs", |ui| {
+    {
         let mut copy = false;
         let mut save = false;
         ui.horizontal(|ui| {
@@ -72,5 +71,5 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 ui.add(egui::Label::new(egui::RichText::new(e.line()).monospace().size(11.5).color(tint(e.level))).truncate());
             }
         });
-    });
+    }
 }

@@ -1,5 +1,3 @@
-mod bench;
-mod chart;
 mod chat;
 mod breakdown;
 mod table;
@@ -8,6 +6,8 @@ mod detail;
 mod engine;
 mod strip;
 mod job;
+mod load;
+mod modelbar;
 mod models;
 mod logs;
 mod server;
@@ -16,7 +16,6 @@ mod shell;
 mod specs;
 
 use eframe::egui;
-use egui_bench::prelude::*;
 use inference_bench_core::engine::{Command, Engine, EngineEvent, Wake};
 use inference_bench_core::gpu::GpuStats;
 use inference_bench_core::library::{LocalModel, Sources};
@@ -31,9 +30,7 @@ use std::time::{Duration, Instant};
 pub enum Tab {
     Chat,
     Models,
-    Bench,
     Server,
-    Logs,
     Settings,
 }
 
@@ -48,16 +45,17 @@ pub struct App {
     pub loading: Option<String>,
     pub gpu: Vec<GpuStats>,
     gpu_poll: Pending<Vec<GpuStats>>,
-    gpu_at: Option<Instant>,
+    pub gpu_at: Option<Instant>,
     pub notice: Option<(bool, String)>,
     pub chat: chat::ChatState,
     pub models: models::ModelsState,
-    pub bench: bench::BenchState,
     pub server: server::ServerState,
     pub logs: inference_bench_core::logging::LogBuffer,
     pub logs_ui: logs::LogsState,
     pub settings_ui: settings::SettingsState,
     pub specs: specs::SpecsUpdater,
+    pub load: Option<load::LoadDialog>,
+    pub picker_query: String,
 }
 
 impl App {
@@ -82,7 +80,6 @@ impl App {
             notice: None,
             chat: chat::ChatState::load(&dir, &settings),
             models: models::ModelsState::default(),
-            bench: bench::BenchState::load(&dir),
             server: server::ServerState::default(),
             logs: inference_bench_core::logging::LogBuffer::new(5000),
             logs_ui: logs::LogsState::default(),
@@ -92,6 +89,8 @@ impl App {
                 s.load_state(&dir);
                 s
             },
+            load: None,
+            picker_query: String::new(),
             settings,
             wake,
             dir,
@@ -107,11 +106,24 @@ impl App {
         self.engine.loaded()
     }
 
+    pub fn free_gpu_bytes(&self) -> Option<u64> {
+        self.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes))
+    }
+
+    pub fn open_load_dialog(&mut self, model: &LocalModel) {
+        self.load = Some(load::LoadDialog::open(self, model));
+    }
+
     pub fn load_model(&mut self, model: &LocalModel) {
+        let ctx = self.settings.ctx_for(&model.name);
+        self.load_model_with(model, ctx);
+    }
+
+    pub fn load_model_with(&mut self, model: &LocalModel, ctx: usize) {
         self.engine.send(Command::Load {
             model_id: model.model_id(inference_bench_core::target::NATIVE),
             display: model.name.clone(),
-            max_ctx: Some(self.settings.specrt_ctx),
+            max_ctx: Some(ctx),
         });
     }
 
@@ -149,7 +161,6 @@ impl App {
         }
         self.chat.pump(&self.dir);
         self.models.pump(&mut self.notice);
-        self.bench.pump(&self.dir, &mut self.notice);
         if self.specs.pump(&self.wake, &self.dir, &self.settings, &mut self.notice) {
             self.rescan();
         }
@@ -171,7 +182,6 @@ impl eframe::App for App {
         }
         let animating = self.chat.streaming()
             || self.loading.is_some()
-            || self.bench.running()
             || self.models.downloading()
             || self.specs.busy()
             || self.scan.busy();

@@ -168,8 +168,9 @@ fn pick_compare(app: &App, detail: &mut Detail, ui: &mut egui::Ui) {
     }
 }
 
-fn header(app: &App, detail: &mut Detail, ui: &mut egui::Ui) -> bool {
+fn header(app: &mut App, detail: &mut Detail, ui: &mut egui::Ui) -> bool {
     let mut back = false;
+    let mut load = false;
     ui.horizontal(|ui| {
         if ui.add(Key::new("back").outline(VALUE)).clicked() {
             back = true;
@@ -188,10 +189,17 @@ fn header(app: &App, detail: &mut Detail, ui: &mut egui::Ui) -> bool {
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let runs = app.library.iter().find(|m| m.name == detail.model).is_some_and(crate::models::runs_here);
+            if runs && ui.add(Key::new("load").solid(READOUT).min_width(100.0).id_salt("detail-load")).clicked() {
+                load = true;
+            }
             pick_compare(app, detail, ui);
             ui.label(legend("compare with"));
         });
     });
+    if load && let Some(m) = app.library.iter().find(|m| m.name == detail.model).cloned() {
+        app.open_load_dialog(&m);
+    }
     back
 }
 
@@ -200,28 +208,19 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let back = header(app, &mut detail, ui);
     if !back {
         let free = app.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes));
-        let bands = detail.view.as_ref().ok().and_then(|v| placement_bands(&app.settings.placement, &v.spec)).unwrap_or_default();
-        body(&mut detail, ui, free, app.settings.gpu_bandwidth_gbs, &bands);
+        body(&mut detail, ui, free);
         app.models.detail = Some(detail);
     }
 }
 
-pub fn placement_bands(cfg: &specrt::placement::PlacementConfig, spec: &Spec) -> Option<Vec<strip::Band>> {
-    if cfg.devices.is_empty() {
-        return None;
-    }
-    let placed = cfg.place(spec).ok()?;
-    Some(strip::bands_of(&placed))
-}
-
-fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth: Option<u64>, bands: &[strip::Band]) {
+fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
-        content(detail, ui, free, bandwidth, bands);
+        content(detail, ui, free);
     });
 }
 
-fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth: Option<u64>, bands: &[strip::Band]) {
+fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>) {
     let Detail { view, other, kind, layer, diagram, .. } = detail;
     let view = match view {
         Ok(v) => v,
@@ -240,12 +239,17 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
     };
     let views: Vec<&View> = std::iter::once(&*view).chain(other).collect();
     let scale = strip::shared_scale(views.iter().map(|v| &v.anatomy));
+    section(ui, "summary", "what this model is and what loading it costs", |ui| {
+        for v in &views {
+            summary(ui, v, free, views.len() > 1);
+        }
+    });
     section(ui, "layers", &layers_note(&view.anatomy, view.spec.layers.window), |ui| {
         for (n, v) in views.iter().enumerate() {
             if views.len() > 1 {
                 Line::new().legend(&v.name).gap(10.0).value(human_size(v.anatomy.total_bytes)).size(11.0).show(ui);
             }
-            strip::draw(ui, n, &v.anatomy, scale, kind, layer, if n == 0 { bands } else { &[] });
+            strip::draw(ui, n, &v.anatomy, scale, kind, layer);
         }
         strip::legend(ui, &view.anatomy);
     });
@@ -287,9 +291,32 @@ fn content(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, bandwidth:
             if views.len() > 1 {
                 Line::new().legend(&v.name).show(ui);
             }
-            table::draw(ui, v, bandwidth);
+            table::draw(ui, v);
         }
     });
+}
+
+fn summary(ui: &mut egui::Ui, v: &View, free: Option<u64>, named: bool) {
+    let a = &v.anatomy;
+    if named {
+        Line::new().legend(&v.name).show(ui);
+    }
+    let quants: Vec<&str> = a.quant_mix().iter().map(|(q, _)| specrt::anatomy::quant_tag(*q)).collect();
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 14.0;
+        Line::new().legend("parameters").value(crate::strip::params_text(a.total_params)).show(ui);
+        Line::new().legend("active per token").value(crate::strip::params_text(a.decode_params)).show(ui);
+        Line::new().legend("quant").value(quants.join(", ")).show(ui);
+        Line::new().legend("max context").value(format!("{} tokens", a.max_context)).show(ui);
+        Line::new().legend("vision").value(if v.spec.vision.is_some() { "yes" } else { "no" }).show(ui);
+        Line::new().legend("mtp").value(if a.mtp_layers > 0 { format!("{} layer", a.mtp_layers) } else { "no".into() }).show(ui);
+    });
+    let at_default = crate::load::estimate(a, crate::load::max_context(a).min(8192), free);
+    let mut line = Line::new().legend("weights").measured(human_size(a.total_bytes)).gap(14.0).legend("kv per 1k tokens").measured(human_size(a.kv_bytes_per_token * 1024));
+    if a.state_bytes_per_seq > 0 {
+        line = line.gap(14.0).legend("state").measured(human_size(a.state_bytes_per_seq));
+    }
+    line.gap(14.0).legend("loads at 8k in").measured(human_size(at_default.total())).show(ui);
 }
 
 fn tower_note(c: &specrt::vision::VisionConfig) -> String {
@@ -452,7 +479,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.json"), v.to_string()).unwrap();
         let view = Detail::open(&local("no-inter", &dir)).view.unwrap_or_else(|e| panic!("{e}"));
-        let entries = crate::table::entries(&view, None);
+        let entries = crate::table::entries(&view);
         assert!(entries.iter().any(|e| e.field == "intermediate" && e.value == "unknown"));
     }
 }

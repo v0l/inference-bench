@@ -7,13 +7,41 @@ use inference_bench_core::logging::LogBuffer;
 use inference_bench_server::config::ServerConfig;
 use inference_bench_server::engine_backend::EngineBackend;
 use inference_bench_server::{Server, ServerHandle};
+use specrt::placement::PlacementConfig;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tracing::Level;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Requests,
+    Logs,
+}
+
+pub fn config_path(dir: &Path) -> PathBuf {
+    dir.join("server.toml")
+}
+
+pub fn configured_placement(dir: &Path) -> Option<Result<PlacementConfig, String>> {
+    let path = config_path(dir);
+    if !path.is_file() {
+        return None;
+    }
+    Some(match ServerConfig::load(&path) {
+        Ok(c) if c.placement.devices.is_empty() => return None,
+        Ok(c) => Ok(c.placement),
+        Err(e) => Err(format!("{e:#}")),
+    })
+}
 
 pub struct ServerState {
     pub running: Option<ServerHandle>,
     pub port_text: String,
     pub error: Option<String>,
     pub shown: usize,
+    pub pane: Pane,
+    pub placement: Option<Result<PlacementConfig, String>>,
+    placement_seen: Option<(Option<std::time::SystemTime>, Instant)>,
     runtime: tokio::runtime::Runtime,
 }
 
@@ -24,6 +52,9 @@ impl Default for ServerState {
             port_text: String::new(),
             error: None,
             shown: 0,
+            pane: Pane::Requests,
+            placement: None,
+            placement_seen: None,
             runtime: tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .enable_all()
@@ -58,6 +89,15 @@ impl ServerState {
         }
     }
 
+    pub fn refresh_placement(&mut self, dir: &Path) {
+        let modified = std::fs::metadata(config_path(dir)).and_then(|m| m.modified()).ok();
+        if self.placement_seen.is_some_and(|(m, at)| m == modified && at.elapsed() < Duration::from_secs(5)) {
+            return;
+        }
+        self.placement_seen = Some((modified, Instant::now()));
+        self.placement = configured_placement(dir);
+    }
+
     pub fn stop(&mut self) {
         if let Some(h) = self.running.take() {
             h.shutdown();
@@ -86,7 +126,9 @@ fn request_lines(logs: &LogBuffer) -> Vec<RequestLine> {
 }
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
+    app.server.refresh_placement(&app.dir.clone());
     page(ui, "server", |ui| {
+        crate::modelbar::draw(app, ui, false, |_| {});
         let running = app.server.running.is_some();
         let loaded = app.loaded();
         if app.server.port_text.is_empty() {
@@ -112,7 +154,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 }
                 match &loaded {
                     Some(l) => Line::new().legend("serving").value(l.display.clone()).show(ui),
-                    None => Line::new().legend("serving").note("nothing loaded: load a model in chat or models").show(ui),
+                    None => Line::new().legend("serving").note("nothing loaded: select a model in the bar above").show(ui),
                 };
                 ui.horizontal(|ui| {
                     if running {
@@ -150,8 +192,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 note(ui, format!("Metrics at {url}/metrics. /v1/models lists the model loaded right now."), LEGEND);
             });
         }
+        if let Some(p) = app.server.placement.clone() {
+            placement_section(ui, &p);
+        }
         let log = request_lines(&app.logs);
-        section(ui, "request log", "newest first, full detail in the logs tab", |ui| {
+        let mut pane = app.server.pane;
+        segments(ui, &mut pane, &[(Pane::Requests, "requests", Some(log.len())), (Pane::Logs, "logs", None)]);
+        app.server.pane = pane;
+        if pane == Pane::Logs {
+            crate::logs::draw(app, ui);
+            return;
+        }
+        section(ui, "request log", "newest first", |ui| {
             if log.is_empty() {
                 note(ui, "no requests yet", LEGEND);
                 return;
@@ -166,5 +218,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 cell(p, rect, at(3), 80.0, &e.ms, TRACE);
             });
         });
+    });
+}
+
+fn placement_section(ui: &mut egui::Ui, placement: &Result<PlacementConfig, String>) {
+    section(ui, "placement", "read only: edit server.toml in the data folder and restart the server", |ui| match placement {
+        Err(e) => status(ui, false, e),
+        Ok(p) => {
+            note(ui, format!("objective {}, context {}, {} slots", format!("{:?}", p.objective).to_lowercase(), p.context, p.slots), VALUE);
+            for d in &p.devices {
+                let place = d.address.as_ref().map_or("on this machine".to_string(), |a| format!("at {a}"));
+                note(ui, format!("{} {:.0} GiB {place}", d.name, d.memory_gib), VALUE);
+            }
+            for (i, s) in p.stages.iter().enumerate() {
+                note(ui, format!("stage {i} {} layers {} to {}", s.device, s.layers[0], s.layers[1]), LEGEND);
+            }
+        }
     });
 }

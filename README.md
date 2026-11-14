@@ -2,27 +2,27 @@
 
 # inference-bench
 
-A local LLM app that runs models on its own CUDA engine, `specrt`, in process: chat, a model
-library, an OpenAI-compatible server, and a benchmark that measures prefill and decode tokens per
-second, time to first token and peak memory, with the real error when a model cannot run
-(including "unsupported architecture").
+A local LLM server and desktop app, in the style of LM Studio, on its own CUDA engine, `specrt`:
+a searchable model library with downloads, chat, and an OpenAI-compatible server. A new model is a
+TOML spec, and specs update themselves from GitHub.
 
 Part of the [bench suite](https://github.com/v0l/bench-suite), a launcher that installs, updates
 and starts it alongside the other bench tools.
 
-## Engine and bench targets
+## Engine
 
 Every model the app loads, chats with or serves runs on the native engine in `crates/specrt`, where
 a new model is a TOML file. It runs on a dedicated thread inside the process: a cancelled reply stops
 at the next decode chunk, and a CUDA error, an out of memory or a panic in the engine comes back as an
 error on that request instead of taking the app down.
 
-Other engines (llama.cpp, vLLM, LM Studio, any OpenAI-compatible server) are only benchmark targets,
-for comparing their speed with ours. They are never used for chat, the library or the server.
+Comparing our speed with llama.cpp or vLLM on the same model and hardware is dev tooling, not an app
+feature: it lives in the `inference-bench bench`, `batch` and `matrix` commands below and has no
+screen. The app never talks to another engine.
 
-The name `specrt` is kept on purpose, even though it is the only engine the app runs. It names the spec-driven design and appears in saved results, the `specrt_ctx` setting and docs/spark-matrix.md, so renaming would break result history and old settings for no visible gain. Revisit only if the engine stops being spec-driven; the plan then is crate `inference-bench-engine`, a serde alias for `specrt_ctx` and `specrt` accepted as an alias in stored results.
+The name `specrt` is kept on purpose, even though it is the only engine the app runs. It names the spec-driven design and appears in saved results and docs/spark-matrix.md, so renaming would break result history for no visible gain. Revisit only if the engine stops being spec-driven; the plan then is crate `inference-bench-engine` and `specrt` accepted as an alias in stored results.
 
-## Command line
+## Command line (dev tooling)
 
 ```
 inference-bench run --model Qwen/Qwen3-0.6B --prompt-file p.txt
@@ -37,27 +37,32 @@ default) or `openai:URL`. A matrix file lists targets as `kind = "native"` or `k
 `logit-diff` compares our prompt logits with a reference written by
 `crates/specrt/scripts/reference.py`.
 
-Results are saved as JSON in the data directory (`INFERENCE_BENCH_DIR` to move it) and shown by
-`inference-bench-ui`.
+Results are saved as JSON in the data directory (`INFERENCE_BENCH_DIR` to move it).
 
 ## Window
 
-`inference-bench-ui` is a local LLM app in the style of LM Studio, with a rail of five tabs. Every
-slow call (disk scan, Hugging Face, model load, generation, bench, GPU poll) runs off the UI thread.
+`inference-bench-ui` follows the LM Studio flow: pick a model, load it with per-load options, then
+chat with it or serve it. A rail of four pages; every slow call (disk scan, Hugging Face, model load,
+generation, GPU poll) runs off the UI thread. The design and its reasons are in
+`docs/gui/redesign.md`.
 
-- Chat: pick a model, load or unload, streaming markdown replies, system prompt,
-  temperature, top-p, seed and max tokens, a context bar, chat template toggle, saved conversations,
-  regenerate, stop and copy. TTFT, prefill and decode tok/s sit under each reply and in the status bar
-  with VRAM and GPU load (`nvidia-smi`).
-- Models: everything found in the Hugging Face cache, GGUF folders and the spec files, with
-  size, architecture, quant, context length and a supported or unsupported architecture badge for
-  the native engine and for the llama.cpp and vLLM bench targets. Each spec says where it came from (your folder, updated from GitHub, or built in), and "check specs now" fetches new ones. Search and download from Hugging Face with resume, reveal in folder, delete.
-- Bench: pick models, targets (the native engine and the bench targets from settings) and prompt lengths, run with live progress, results table and charts,
-  compare two runs, export JSON or CSV.
-- Server: an OpenAI-compatible server (`/v1/models`, `/v1/chat/completions`, `/v1/completions`) for
-  the loaded model, with port, API key, LAN toggle and a request log.
-- Settings: native engine context length, bench target URLs and API keys (`settings.json`, mode
-  0600), model folders, Hugging Face token, spec updates (on or off, repository, branch, tag pin, interval, your own spec folders, roll back).
+- Models: everything found in the Hugging Face cache, GGUF folders and the spec files, with size,
+  architecture, quant, context length and whether the engine runs it. A search field filters the list
+  by name, architecture, quant or format as you type, and "discover" searches Hugging Face and
+  downloads with resume. Each spec says where it came from (your folder, updated from GitHub, or
+  built in). Details show what the model is and what loading it costs: layers, parameters, memory
+  against context, every spec field.
+- Load dialog: opened from a model card, the details page or the model bar. A context length slider
+  runs from 512 to the model's own maximum, with weights, kv cache and state against the GPU's free
+  memory, red when it does not fit. The choice is remembered per model.
+- Chat: a model bar with the loaded model, its context, a searchable picker, unload and VRAM. Streaming
+  markdown replies, system prompt, temperature, top-p, seed and max tokens, a context bar, saved
+  conversations, regenerate, stop and copy, image and video attachments for vision models. TTFT,
+  prefill and decode tok/s sit under each reply and in the status bar.
+- Server: the same model bar, an OpenAI-compatible server (`/v1/models`, `/v1/chat/completions`,
+  `/v1/completions`) for the loaded model with port, API key and LAN toggle, a request table and the
+  app logs. Multi-host placement from `server.toml` in the data folder is shown read only.
+- Settings: model folders, Hugging Face token and spec updates (`settings.json`, mode 0600).
 
 ## Spec updates
 
@@ -67,13 +72,14 @@ snapshot of the specs, so a first run offline works too. `inference-bench specs 
 update` and `specs rollback` manage them from the command line. How it works, the settings and what
 goes over the network: `docs/specs-update.md`.
 
-![chat](docs/gui/chat.png)
 ![models](docs/gui/models.png)
-![bench](docs/gui/bench-results.png)
+![load dialog](docs/gui/load-dialog.png)
+![chat](docs/gui/chat.png)
+![server](docs/gui/server.png)
 
 ## Layout
 
-- `crates/core`: the in-process native engine thread, the `Target` trait and the OpenAI-compatible bench target, `RunResult`, matrix runner, logit diff, settings, library, result store.
+- `crates/core`: the in-process native engine thread, the `Target` trait and the OpenAI-compatible target used by the dev bench commands, `RunResult`, matrix runner, logit diff, settings, library, result store.
 - `crates/cli`: the `inference-bench` command.
 - `crates/ui`: the `inference-bench-ui` window.
 - `crates/server`: the OpenAI-compatible server for the native engine. See `docs/server.md`.

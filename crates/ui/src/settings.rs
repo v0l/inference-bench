@@ -2,13 +2,11 @@ use crate::App;
 use crate::shell::page;
 use eframe::egui;
 use egui_bench::prelude::*;
-use inference_bench_core::settings::Endpoint;
 use std::path::PathBuf;
 
 #[derive(Default)]
 pub struct SettingsState {
     pub new_folder: String,
-    pub new_endpoint: String,
     pub new_spec_folder: String,
 }
 
@@ -86,53 +84,6 @@ fn spec_updates(app: &mut App, ui: &mut egui::Ui) {
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     page(ui, "settings", |ui| {
         let mut save = false;
-        section(ui, "bench targets", "other engines' OpenAI-compatible servers, used only by the bench tab", |ui| {
-            let mut remove = None;
-            for (i, e) in app.settings.endpoints.iter_mut().enumerate() {
-                ui.push_id(i, |ui| {
-                    row(ui, &e.label, |ui| {
-                        field_then(ui, &mut e.url, "http://127.0.0.1:8080", 96.0, |ui| {
-                            if ui.add(Key::new("remove").outline(FAULT)).clicked() {
-                                remove = Some(i);
-                            }
-                        });
-                    });
-                    row(ui, "api key", |ui| {
-                        secret(ui, &mut e.api_key);
-                    });
-                });
-            }
-            if let Some(i) = remove {
-                app.settings.endpoints.remove(i);
-            }
-            let st = &mut app.settings_ui;
-            let mut add = false;
-            let ready = !st.new_endpoint.trim().is_empty();
-            field_then(ui, &mut st.new_endpoint, "name for a new bench target", 96.0, |ui| {
-                add = ui.add(Key::new("add").outline(VALUE).enabled(ready)).clicked();
-            });
-            if add {
-                app.settings.endpoints.push(Endpoint {
-                    label: st.new_endpoint.trim().to_string(),
-                    backend: "vllm".into(),
-                    url: "http://127.0.0.1:8000".into(),
-                    api_key: String::new(),
-                });
-                st.new_endpoint.clear();
-            }
-            hint(ui, "Keys are kept in settings.json in the data folder, readable only by you.");
-        });
-        section(ui, "native engine", "runs every model in this app", |ui| {
-            row(ui, "context", |ui| {
-                ui.add(egui::DragValue::new(&mut app.settings.specrt_ctx).range(512..=131072).speed(64));
-            });
-            row(ui, "gpu bandwidth", |ui| {
-                let mut gbs = app.settings.gpu_bandwidth_gbs.unwrap_or(0);
-                if ui.add(egui::DragValue::new(&mut gbs).range(0..=10000).suffix(" GB/s")).changed() {
-                    app.settings.gpu_bandwidth_gbs = Some(gbs).filter(|g| *g > 0);
-                }
-            });
-        });
         section(ui, "model folders", "searched for GGUF and safetensors, on top of the Hugging Face cache", |ui| {
             let mut remove = None;
             for (i, f) in app.settings.model_folders.iter().enumerate() {
@@ -166,8 +117,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             });
         });
         spec_updates(app, ui);
-        section(ui, "appearance", "shared by every bench-suite app", |ui| {
-            reading(ui, "theme", "bench instrument, dark");
+        section(ui, "app", "where this app keeps its files", |ui| {
+            reading(ui, "theme", "dark, shared with the other bench-suite apps");
             reading(ui, "data folder", app.dir.display().to_string());
         });
         ui.horizontal(|ui| {
