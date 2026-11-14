@@ -454,7 +454,7 @@ fn four_requests_share_a_pool_of_one_and_a_half_max_model_lens_and_match_single_
     use std::sync::atomic::AtomicBool;
     let s = spec_for("tiny-qwen3.5");
     let prompts: Vec<Vec<u32>> = (0..4u32).map(|q| (0..300u32).map(|i| (i * 7 + q * 131 + 3) % 1024).collect()).collect();
-    let want = single_greedy(&s, &prompts, 60);
+    let want = single_greedy(&s, &prompts, 150);
     let block = specrt::runtime::kv_block_bytes(&s, 1) as u64;
     let blocks = 512 * 3 / 2 / specrt::codegen::PAGE as u64;
     let opts = ServeOptions { max_model_len: Some(512), max_num_seqs: 4, kv_cache_bytes: Some(block * blocks), ..ServeOptions::default() };
@@ -463,7 +463,7 @@ fn four_requests_share_a_pool_of_one_and_a_half_max_model_lens_and_match_single_
         .iter()
         .map(|p| {
             let (tx, rx) = std::sync::mpsc::channel();
-            let request = Request { prompt: p.clone(), max_tokens: 60, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() };
+            let request = Request { prompt: p.clone(), max_tokens: 150, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() };
             core.submit(Job { request, events: tx, cancel: Arc::new(AtomicBool::new(false)) }).unwrap();
             rx
         })
@@ -482,5 +482,5 @@ fn four_requests_share_a_pool_of_one_and_a_half_max_model_lens_and_match_single_
         }
         assert_eq!(&got, want);
     }
-    assert!(core.stats().preemptions > 0, "four 360 token requests cannot fit a 768 token pool without preemption");
+    assert!(core.stats().preemptions > 0, "four 350 token requests cannot grow in a 768 token pool without preemption");
 }
