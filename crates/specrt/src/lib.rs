@@ -10,6 +10,7 @@ pub mod codegen;
 pub mod engine;
 pub mod executor;
 pub mod gguf;
+pub mod grammar;
 pub mod jit;
 pub mod link;
 pub mod loader;
