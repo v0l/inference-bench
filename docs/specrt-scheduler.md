@@ -106,7 +106,7 @@ to allocate and free, and a table entry is the same for all layers. The kernels 
 
 Server config keys (or the same flags on `inference-bench serve`): `max_num_seqs` turns the
 serving core on (without it the old single-stream engine serves); `max_model_len` (default
-131072, at most 262144, falls back to `max_ctx`); `kv_cache_gb`; `max_batched_tokens` (default
+the model's own maximum, falls back to `max_ctx`); `kv_cache_gb`; `max_batched_tokens` (default
 8192); `itl_target_ms` (default 100); `[speculative]` with `enabled`, `draft_tokens` (1 to 3) and
 `max_batch` over the spec's `[mtp]` block (see `specrt-mtp.md`). Requests accept `ignore_eos` like vLLM.
 

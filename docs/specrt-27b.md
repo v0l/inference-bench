@@ -94,6 +94,14 @@ Beside the live vLLM (58.2 GB used after its KV was trimmed to 14 GB) 38.9 GB ar
 enough for the 29.5 GB of weights plus 8k of context, and that is how the real-model run below
 was done, with max context capped at 8,192. Longer contexts beside vLLM would need fp8 KV.
 
+### Context limit (#580)
+
+The maximum context is the model's own `max_position_embeddings` (`text_config` first, then the top level of `config.json`; the GGUF `<arch>.context_length` for GGUF files). There is no engine constant: a configured context above it is refused at load with the value named. 262,144 for the 27B. `max_model_len` defaults to that, `max_tokens` defaults to `generation_config.json` `max_new_tokens`/`max_length` or else until the context is full.
+
+What was checked above 131,072: the `seq_table` stride (`PAGES` = ctx / 16 = 16,384 pages per slot) and `mm_table` offsets are `size_t`; the KV slot index is `size_t`; the block table is `(slots + 1) * pages` ints; flash and decode attention use no score buffer sized by context (`SCORE_BUDGET_FLOATS` is not in the tree); rope is computed per position in float, not from a table; prefill chunk is fixed by `prefill_chunk`. Nothing breaks. `engine::tests::kv_paging_and_flat_offsets_do_not_overflow_i32_at_262144` pins the index arithmetic.
+
+GPU run, NVFP4 27B, `--max-model-len 262144 --kv-cache-gb 17`, one sequence (device 45.2 GB, beside the live vLLM): a 153,055 token prompt with the code word at the start answered `PELICAN-4471` correctly, ttft 114 s, decode 33.6 tok/s, request sent without `max_tokens`.
+
 ### Scale grid and row map (#334)
 
 The kernels read a row's scales as `scales[map[row] + k / 128]`. `gemm_tc` and `gemm_fp8` load

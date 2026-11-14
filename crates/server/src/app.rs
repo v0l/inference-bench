@@ -479,7 +479,8 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         .as_u64()
         .or_else(|| body["max_tokens"].as_u64())
         .map(|n| n as usize)
-        .unwrap_or(state.config.default_max_tokens);
+        .or(state.config.default_max_tokens)
+        .unwrap_or(inference_bench_core::chat::UNTIL_FULL);
     if max_tokens == 0 {
         return Err(ApiError::bad_request("max_tokens must be at least 1"));
     }

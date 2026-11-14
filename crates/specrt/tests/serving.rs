@@ -267,7 +267,7 @@ fn the_serving_core_streams_concurrent_jobs_and_cancels_within_a_step() {
     let s = spec_for("tiny-qwen3.5");
     let prompts = mixed_prompts();
     let want = single_greedy(&s, &prompts, 30);
-    let opts = ServeOptions { max_model_len: 512, max_num_seqs: 8, kv_cache_bytes: Some(4 << 20), ..ServeOptions::default() };
+    let opts = ServeOptions { max_model_len: Some(512), max_num_seqs: 8, kv_cache_bytes: Some(4 << 20), ..ServeOptions::default() };
     let core = Core::start(&s, opts).unwrap();
     let mut rxs = Vec::new();
     for p in &prompts {

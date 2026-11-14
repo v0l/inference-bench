@@ -304,6 +304,7 @@ fn ui_role(role: Role) -> chat_ui::Role {
 }
 
 fn sampling_panel(app: &mut App, ui: &mut egui::Ui) {
+    let limit = context_limit(app);
     let st = &mut app.chat;
     let seed_text = &mut st.seed_text;
     let max_text = &mut st.max_tokens_text;
@@ -323,13 +324,14 @@ fn sampling_panel(app: &mut App, ui: &mut egui::Ui) {
             }
         });
         row(ui, "max tokens", |ui| {
-            if max_text.is_empty() {
+            if max_text.is_empty() && c.sampling.max_tokens != inference_bench_core::chat::UNTIL_FULL {
                 *max_text = c.sampling.max_tokens.to_string();
             }
-            if field(ui, max_text, "512").changed()
-                && let Ok(v) = max_text.trim().parse::<usize>()
-            {
-                c.sampling.max_tokens = v.clamp(1, 131072);
+            if field(ui, max_text, "until the context is full").changed() {
+                c.sampling.max_tokens = match max_text.trim().parse::<usize>() {
+                    Ok(v) => v.clamp(1, limit),
+                    Err(_) => inference_bench_core::chat::UNTIL_FULL,
+                };
             }
         });
         row(ui, "seed", |ui| {

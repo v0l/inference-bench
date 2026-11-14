@@ -39,6 +39,8 @@ impl Message {
     }
 }
 
+pub const UNTIL_FULL: usize = specrt::engine::UNTIL_FULL;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Sampling {
     pub temperature: f32,
@@ -54,7 +56,7 @@ pub struct Sampling {
 
 impl Default for Sampling {
     fn default() -> Self {
-        Self { temperature: 0.7, top_p: None, top_k: None, min_p: None, seed: None, max_tokens: 512 }
+        Self { temperature: 0.7, top_p: None, top_k: None, min_p: None, seed: None, max_tokens: UNTIL_FULL }
     }
 }
 

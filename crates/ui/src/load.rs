@@ -31,7 +31,7 @@ pub fn estimate(a: &ModelAnatomy, ctx: usize, free: Option<u64>) -> Estimate {
 }
 
 pub fn max_context(a: &ModelAnatomy) -> usize {
-    a.max_context.min(specrt::engine::MAX_CTX).max(1)
+    a.max_context.max(1)
 }
 
 pub fn largest_fit(a: &ModelAnatomy, free: Option<u64>, max: usize) -> usize {

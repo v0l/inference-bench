@@ -255,7 +255,7 @@ fn scheduled_tokens(s: &Spec, sampling: Sampling, new: usize) -> Vec<u32> {
     use specrt::serve::{Core, Job, SeqEvent, ServeOptions};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
-    let opts = ServeOptions { max_model_len: 512, max_num_seqs: 2, kv_cache_bytes: Some(4 << 20), ..ServeOptions::default() };
+    let opts = ServeOptions { max_model_len: Some(512), max_num_seqs: 2, kv_cache_bytes: Some(4 << 20), ..ServeOptions::default() };
     let core = Core::start(s, opts).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let request = Request { prompt: prompt(5), max_tokens: new, sampling, stop: vec![], salt: String::new(), media: Vec::new() };
