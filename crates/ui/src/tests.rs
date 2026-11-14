@@ -488,6 +488,38 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
 }
 
 #[test]
+fn the_server_tab_kv_total_is_the_shared_pool_chosen_in_the_dialog() {
+    let mut h = harness("kv-total", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), script());
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    let d = h.state_mut().load.as_mut().unwrap();
+    d.seqs = 4;
+    d.kv_gb = 3.0;
+    let pool = d.kv_bytes().unwrap();
+    h.run();
+    h.get_all_by_label("load").last().unwrap().click();
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    let start = Instant::now();
+    let reading = loop {
+        let r = h.state().engine.reading();
+        if r.serving.is_some() {
+            break r;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "no serving reading");
+        h.step();
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let s = reading.serving.as_ref().unwrap();
+    assert_eq!(s.kv_blocks_total as u64 * s.kv_block_bytes as u64, pool);
+    let shown = crate::serving::readings(&reading, 0.0);
+    let kv = shown.iter().find(|(l, _, _)| *l == "kv cache").unwrap();
+    assert_eq!(kv.1, "0 MB / 3.0 GB");
+}
+
+#[test]
 fn served_names_from_the_load_dialog_reach_the_engine_and_are_remembered() {
     let mut h = harness("served-names", Tab::Models);
     with_gpu(&mut h, 0, 96 << 30);
@@ -1206,12 +1238,17 @@ fn screenshot_vision_tower_in_the_model_detail() {
 
 #[test]
 #[ignore = "renders with wgpu; run with SHOTS=dir"]
-fn screenshot_of_the_load_dialog_with_a_shared_kv_pool() {
+fn screenshots_of_the_load_dialog_with_a_shared_kv_pool() {
+    load_dialog_shot("load-dialog-shared-kv.png", 20 << 30);
+    load_dialog_shot("load-dialog-shared-kv-over.png", 50 << 30);
+}
+
+fn load_dialog_shot(file: &str, used: u64) {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
     let mut h = harness("shot-load", Tab::Models);
-    with_gpu(&mut h, 50 << 30, 96 << 30);
-    let d = dir("shot-load-27b");
+    with_gpu(&mut h, used, 96 << 30);
+    let d = dir(&format!("shot-load-{used}"));
     std::fs::create_dir_all(&d).unwrap();
     std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), d.join("config.json")).unwrap();
     let mut m = model("Qwen3.8-27B", true, "dense decoder");
@@ -1226,7 +1263,7 @@ fn screenshot_of_the_load_dialog_with_a_shared_kv_pool() {
     let a = &dialog.view.as_ref().unwrap().anatomy;
     dialog.kv_gb = crate::load::default_kv_gb(a, free, 8, dialog.ctx);
     h.run();
-    h.render().unwrap().save(out.join("load-dialog-shared-kv.png")).unwrap();
+    h.render().unwrap().save(out.join(file)).unwrap();
 }
 
 fn tree_hub() -> String {

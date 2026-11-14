@@ -284,6 +284,7 @@ struct ServingCounters {
 pub struct ScriptedServing {
     script: Script,
     seqs: usize,
+    kv_bytes: Option<u64>,
     loaded: bool,
     counters: Arc<ServingCounters>,
 }
@@ -291,7 +292,7 @@ pub struct ScriptedServing {
 impl ScriptedServing {
     pub fn factory(script: Script) -> crate::engine::ServingFactory {
         Arc::new(move |opts| {
-            Some(Box::new(ScriptedServing { script: script.clone(), seqs: opts.max_num_seqs, loaded: false, counters: Default::default() }) as Box<dyn crate::target::Target>)
+            Some(Box::new(ScriptedServing { script: script.clone(), seqs: opts.max_num_seqs, kv_bytes: opts.kv_cache_bytes, loaded: false, counters: Default::default() }) as Box<dyn crate::target::Target>)
         })
     }
 }
@@ -374,7 +375,7 @@ impl crate::target::Target for ScriptedServing {
     }
 
     fn share(&self) -> Option<Box<dyn crate::target::Target>> {
-        Some(Box::new(ScriptedServing { script: self.script.clone(), seqs: self.seqs, loaded: self.loaded, counters: self.counters.clone() }))
+        Some(Box::new(ScriptedServing { script: self.script.clone(), seqs: self.seqs, kv_bytes: self.kv_bytes, loaded: self.loaded, counters: self.counters.clone() }))
     }
 
     fn stats(&self) -> Option<specrt::serve::Stats> {
@@ -383,7 +384,7 @@ impl crate::target::Target for ScriptedServing {
         let mut s = specrt::serve::Stats {
             running: c.running.load(SeqCst).min(self.seqs),
             waiting: c.running.load(SeqCst).saturating_sub(self.seqs),
-            kv_blocks_total: 100,
+            kv_blocks_total: self.kv_bytes.map_or(100, |b| (b >> 20) as usize),
             kv_blocks_used: c.running.load(SeqCst) * 2,
             kv_block_bytes: 1 << 20,
             generated_tokens: c.generated.load(SeqCst),
