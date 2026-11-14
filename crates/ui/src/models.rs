@@ -4,7 +4,8 @@ use crate::App;
 use eframe::egui;
 use egui_bench::prelude::*;
 use inference_bench_core::hf::{self, Hub, Progress, Repo, RepoFile};
-use inference_bench_core::library::{self, BACKENDS, LocalModel, human_size};
+use inference_bench_core::library::{self, LocalModel, human_size};
+use inference_bench_core::target::NATIVE;
 use std::sync::mpsc::{Receiver, channel};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,6 +25,7 @@ pub struct Download {
 pub struct ModelsState {
     pub pane: Pane,
     pub query: String,
+    pub library_query: String,
     pub results: Vec<Repo>,
     search: Pending<Result<Vec<Repo>, String>>,
     pub picked: Option<String>,
@@ -43,6 +45,7 @@ impl Default for ModelsState {
         Self {
             pane: Pane::Library,
             query: String::new(),
+            library_query: String::new(),
             results: Vec::new(),
             search: Pending::default(),
             picked: None,
@@ -158,18 +161,22 @@ pub fn reveal(model: &LocalModel) {
     let _ = std::process::Command::new(opener).arg(dir).spawn();
 }
 
-pub fn backend_chip(ui: &mut egui::Ui, model: &LocalModel, backend: &str) {
-    let Some(s) = model.support_for(backend) else { return };
-    let (tint, lit) = if s.supported { (OK, true) } else { (WARN, false) };
-    let text = if s.supported { backend.to_string() } else { format!("{backend}: no") };
-    let resp = chip(ui, &text, tint, lit);
-    let label = format!("{backend} {}", if s.supported { "supported" } else { "unsupported architecture" });
-    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
-    resp.on_hover_text(if s.supported {
-        format!("supported: {}", s.reason)
-    } else {
-        format!("unsupported architecture ({})", s.reason)
-    });
+pub fn matches(model: &LocalModel, query: &str) -> bool {
+    let haystack = format!("{} {} {} {} {}", model.name, model.repo, model.architecture, model.quant, model.format.label()).to_lowercase();
+    query.split_whitespace().all(|word| haystack.contains(&word.to_lowercase()))
+}
+
+pub fn runs_here(model: &LocalModel) -> bool {
+    model.support_for(NATIVE).is_some_and(|s| s.supported)
+}
+
+pub fn support_chip(ui: &mut egui::Ui, model: &LocalModel) {
+    let Some(s) = model.support_for(NATIVE) else { return };
+    let (tint, text) = if s.supported { (OK, "runs here") } else { (WARN, "not supported") };
+    let resp = chip(ui, text, tint, s.supported);
+    let label = if s.supported { "runs here" } else { "unsupported architecture" };
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label));
+    resp.on_hover_text(if s.supported { s.reason.clone() } else { format!("unsupported architecture ({})", s.reason) });
 }
 
 fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
@@ -199,27 +206,23 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
                     .show(ui);
             });
             ui.horizontal_wrapped(|ui| {
-                for b in BACKENDS {
-                    backend_chip(ui, &m, b);
-                }
+                support_chip(ui, &m);
                 let tint = if m.vision { OK } else { LEGEND };
                 let chip_text = if m.vision { "vision: yes" } else { "vision: no" };
                 let r = chip(ui, chip_text, tint, m.vision);
                 r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, chip_text));
             });
-            if let Some(why) = m.support.iter().find(|s| !s.supported && s.backend == "specrt") {
-                Line::new().note(format!("specrt: {}", why.reason)).size(10.5).elided(ui);
+            if let Some(why) = m.support_for(NATIVE).filter(|s| !s.supported) {
+                Line::new().note(why.reason.clone()).size(10.5).elided(ui);
             }
             if let Some(origin) = &m.origin {
                 Line::new().legend("spec from").value(origin.label()).size(10.5).elided(ui);
             }
             ui.horizontal(|ui| {
-                if m.support_for("specrt").is_some_and(|s| s.supported) {
+                if runs_here(&m) {
                     let label = if loaded { "reload" } else { "load" };
                     if ui.add(Key::new(label).solid(READOUT).id_salt(("load", i))).clicked() {
-                        app.load_model(&m);
-                        app.tab = crate::Tab::Chat;
-                        app.chat.pick(&m.name);
+                        app.open_load_dialog(&m);
                     }
                 }
                 if ui.add(Key::new("details").outline(READOUT).id_salt(("details", i))).clicked() {
@@ -270,12 +273,31 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
         note(ui, "scanning the hub cache and model folders", LEGEND);
     }
     let n = app.library.len();
-    let usable_at = |m: &LocalModel| m.support.iter().any(|s| s.supported);
-    let usable = app.library.iter().filter(|m| usable_at(m)).count();
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by_key(|&i| !usable_at(&app.library[i]));
+    let usable = app.library.iter().filter(|m| runs_here(m)).count();
+    let mut go_discover = false;
+    field_then(ui, &mut app.models.library_query, "search my models by name, architecture or quant", 150.0, |ui| {
+        go_discover = ui.add(Key::new("search hugging face").outline(READOUT).min_width(140.0)).clicked();
+    });
+    if go_discover {
+        app.models.query = app.models.library_query.clone();
+        app.models.pane = Pane::Discover;
+        return;
+    }
+    let query = app.models.library_query.clone();
+    let mut order: Vec<usize> = (0..n).filter(|&i| matches(&app.library[i], &query)).collect();
+    order.sort_by_key(|&i| !runs_here(&app.library[i]));
+    let visible: Vec<usize> = order.into_iter().filter(|&i| app.models.show_all || runs_here(&app.library[i])).collect();
     ui.horizontal(|ui| {
-        Line::new().legend("models").value(n.to_string()).gap(14.0).legend("usable").value(usable.to_string()).show(ui);
+        Line::new()
+            .legend("models")
+            .value(n.to_string())
+            .gap(14.0)
+            .legend("shown")
+            .value(visible.len().to_string())
+            .gap(14.0)
+            .legend("usable")
+            .value(usable.to_string())
+            .show(ui);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let mut all = app.models.show_all;
             if switch(ui, "show unusable", &mut all, "", "") {
@@ -284,13 +306,13 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
         });
     });
     specs_bar(app, ui);
-    for i in order {
-        if app.models.show_all || usable_at(&app.library[i]) {
-            model_card(app, ui, i);
-        }
+    for &i in &visible {
+        model_card(app, ui, i);
     }
     if n == 0 && !app.scan.busy() {
         note(ui, "no models found: download one from discover, or add a folder in settings", LEGEND);
+    } else if visible.is_empty() && !query.trim().is_empty() {
+        note(ui, format!("no model matches \"{}\": try fewer words, or search Hugging Face", query.trim()), LEGEND);
     }
 }
 

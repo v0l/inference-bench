@@ -6,6 +6,7 @@ mod detail;
 mod engine;
 mod strip;
 mod job;
+mod load;
 mod models;
 mod logs;
 mod server;
@@ -44,7 +45,7 @@ pub struct App {
     pub loading: Option<String>,
     pub gpu: Vec<GpuStats>,
     gpu_poll: Pending<Vec<GpuStats>>,
-    gpu_at: Option<Instant>,
+    pub gpu_at: Option<Instant>,
     pub notice: Option<(bool, String)>,
     pub chat: chat::ChatState,
     pub models: models::ModelsState,
@@ -53,6 +54,7 @@ pub struct App {
     pub logs_ui: logs::LogsState,
     pub settings_ui: settings::SettingsState,
     pub specs: specs::SpecsUpdater,
+    pub load: Option<load::LoadDialog>,
 }
 
 impl App {
@@ -86,6 +88,7 @@ impl App {
                 s.load_state(&dir);
                 s
             },
+            load: None,
             settings,
             wake,
             dir,
@@ -99,6 +102,14 @@ impl App {
 
     pub fn loaded(&self) -> Option<inference_bench_core::engine::Loaded> {
         self.engine.loaded()
+    }
+
+    pub fn free_gpu_bytes(&self) -> Option<u64> {
+        self.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes))
+    }
+
+    pub fn open_load_dialog(&mut self, model: &LocalModel) {
+        self.load = Some(load::LoadDialog::open(self, model));
     }
 
     pub fn load_model(&mut self, model: &LocalModel) {

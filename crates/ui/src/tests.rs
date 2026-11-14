@@ -88,12 +88,149 @@ fn the_rail_switches_tabs() {
 }
 
 #[test]
+fn typing_in_the_library_search_filters_the_list() {
+    let mut h = harness("search", Tab::Models);
+    {
+        let app = h.state_mut();
+        app.models.show_all = true;
+        let mut gguf = model("Llama-3.2-1B-Instruct", true, "dense decoder");
+        (gguf.format, gguf.quant, gguf.architecture) = (Format::Gguf, "Q4_K_M".into(), "llama".into());
+        app.library.push(gguf);
+    }
+    h.run();
+    for name in ["Qwen3-0.6B", "Weird-7B", "Llama-3.2-1B-Instruct"] {
+        h.get_by_label(name);
+    }
+    let search = h.get_by_label("search my models by name, architecture or quant");
+    search.click();
+    h.run();
+    h.get_by_label("search my models by name, architecture or quant").type_text("weird");
+    h.run();
+    assert_eq!(h.state().models.library_query, "weird");
+    h.get_by_label("Weird-7B");
+    assert!(h.query_by_label("Qwen3-0.6B").is_none());
+    assert!(h.query_by_label("Llama-3.2-1B-Instruct").is_none());
+    h.state_mut().models.library_query = "q4_k llama".into();
+    h.run();
+    h.get_by_label("Llama-3.2-1B-Instruct");
+    assert!(h.query_by_label("Weird-7B").is_none());
+    h.state_mut().models.library_query = "nothing like this".into();
+    h.run();
+    h.get_by_label_contains("no model matches");
+}
+
+#[test]
+fn the_search_matches_name_repo_architecture_quant_and_format() {
+    let mut m = model("Qwen3-0.6B", true, "dense decoder");
+    m.quant = "Q8_0".into();
+    m.format = Format::Gguf;
+    for q in ["", "qwen", "acme", "qwen3forcausal", "q8_0", "gguf", "QWEN gguf", "0.6b q8"] {
+        assert!(crate::models::matches(&m, q), "{q}");
+    }
+    for q in ["llama", "qwen vllm", "bf16"] {
+        assert!(!crate::models::matches(&m, q), "{q}");
+    }
+}
+
+fn real_model(name: &str) -> LocalModel {
+    let d = dir(&format!("real-{name}"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::copy(fixtures().join("qwen3-0.6b.config.json"), d.join("config.json")).unwrap();
+    let mut m = model(name, true, "dense decoder");
+    (m.path, m.root) = (d.clone(), d);
+    m
+}
+
+fn with_gpu(h: &mut Harness<'static, App>, used: u64, total: u64) {
+    let app = h.state_mut();
+    app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None }];
+    app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
+}
+
+#[test]
+fn the_context_slider_stops_at_the_models_own_maximum() {
+    let mut h = harness("slider", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    let dialog = h.state().load.as_ref().unwrap();
+    let spec_max = dialog.view.as_ref().unwrap().anatomy.max_context;
+    assert_eq!(spec_max, 40960);
+    assert_eq!(dialog.max, spec_max);
+    h.get_by_label("LOAD QWEN3-0.6B");
+}
+
+#[test]
+fn a_model_with_a_huge_context_is_capped_at_what_the_engine_allows() {
+    let a = detail_view("big", Some("qwen3.8-27b-exact.toml")).anatomy;
+    assert_eq!(a.max_context, 131072);
+    assert_eq!(crate::load::max_context(&a), specrt::engine::MAX_CTX);
+}
+
+#[test]
+fn the_estimate_turns_red_when_the_model_does_not_fit_free_memory() {
+    let mut h = harness("estimate", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    h.get_by_label("fits in free memory");
+    assert!(h.query_by_label_contains("does not fit").is_none());
+    with_gpu(&mut h, 95 << 30, 96 << 30);
+    h.state_mut().load.as_mut().unwrap().ctx = 40960;
+    h.run();
+    h.get_by_label_contains("does not fit in free memory");
+    assert!(h.query_by_label("fits in free memory").is_none());
+    let e = h.state().load.as_ref().unwrap().estimate(h.state().free_gpu_bytes()).unwrap();
+    assert_eq!(e.fits(), Some(false));
+}
+
+#[test]
+fn the_default_context_is_reduced_to_what_fits_and_a_remembered_one_wins() {
+    let a = detail_view("27b", Some("qwen3.8-27b-exact.toml")).anatomy;
+    let max = crate::load::max_context(&a);
+    let roomy = Some(a.total_bytes + a.state_bytes_per_seq + a.kv_bytes_per_token * 131072);
+    assert_eq!(crate::load::initial_ctx(None, 8192, &a, roomy, max), 8192);
+    let tight = Some(a.total_bytes + a.state_bytes_per_seq + a.kv_bytes_per_token * 3000);
+    assert_eq!(crate::load::initial_ctx(None, 8192, &a, tight, max), 2560);
+    assert_eq!(crate::load::initial_ctx(Some(100_000), 8192, &a, tight, max), 100_000);
+    assert_eq!(crate::load::initial_ctx(Some(999_999), 8192, &a, tight, max), max);
+    assert_eq!(crate::load::initial_ctx(None, 8192, &a, None, max), 8192);
+}
+
+#[test]
+fn loading_from_the_dialog_uses_the_chosen_context_and_remembers_it() {
+    let mut h = harness("load-dialog", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    scripted(h.state_mut(), script());
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.state_mut().load.as_mut().unwrap().ctx = 16384;
+    h.run();
+    h.get_all_by_label("load").last().unwrap().click();
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    assert!(h.state().load.is_none());
+    assert_eq!(h.state().loaded().unwrap().ctx, 16384);
+    assert_eq!(h.state().settings.ctx_for("Qwen3-0.6B"), 16384);
+    assert_eq!(Settings::load(&h.state().dir).ctx_for("Qwen3-0.6B"), 16384);
+    assert_eq!(h.state().tab, Tab::Chat);
+    h.state_mut().open_load_dialog(&m);
+    assert_eq!(h.state().load.as_ref().unwrap().ctx, 16384);
+}
+
+#[test]
 fn the_model_list_shows_an_unsupported_architecture_badge() {
     let mut h = harness("badge", Tab::Models);
+    h.state_mut().models.show_all = true;
     h.run();
-    h.get_by_label("specrt unsupported architecture");
-    h.get_by_label("specrt supported");
-    assert_eq!(h.get_all_by_label("llama.cpp unsupported architecture").count(), 2);
+    h.get_by_label("unsupported architecture");
+    h.get_by_label("runs here");
+    assert!(h.query_by_label_contains("llama.cpp").is_none() && h.query_by_label_contains("vllm").is_none());
 }
 
 #[test]
@@ -902,6 +1039,7 @@ fn screenshot_chat_attachment_thumbnail() {
 #[test]
 fn the_models_page_says_vision_yes_only_for_models_with_a_vision_config() {
     let mut h = harness("vision-chip", Tab::Models);
+    h.state_mut().models.show_all = true;
     h.state_mut().library[0].vision = true;
     h.run();
     h.get_by_label("vision: yes");

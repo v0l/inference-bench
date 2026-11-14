@@ -141,6 +141,7 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
         }
     });
     crate::models::modals(app, root.ctx());
+    crate::load::modal(app, root.ctx());
 }
 
 pub fn page(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
