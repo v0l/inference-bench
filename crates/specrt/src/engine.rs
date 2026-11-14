@@ -345,6 +345,7 @@ pub struct Engine {
     runtime: Device,
     max_ctx: usize,
     stop: Vec<u32>,
+    sampling: SamplingDefaults,
     media: Option<crate::vision::MediaAssets>,
 }
 
@@ -354,18 +355,22 @@ impl Engine {
     }
 
     pub fn load_with(model: &str, max_ctx: Option<usize>, runtime: Option<&crate::spec::RuntimeOptions>) -> Result<Self> {
-        let Assets { mut spec, tokenizer, chat, stop, media, .. } = Assets::load(model)?;
+        let Assets { mut spec, tokenizer, chat, stop, sampling, media } = Assets::load(model)?;
         if let Some(r) = runtime {
             spec.runtime = r.clone();
         }
         let max_ctx = max_ctx.unwrap_or(DEFAULT_CTX).min(MAX_CTX);
         tracing::info!(model, spec = %spec.name, max_ctx, "loading model");
         let runtime = Device::load(&spec, max_ctx)?;
-        Ok(Self { spec, tokenizer, chat, runtime, max_ctx, stop, media })
+        Ok(Self { spec, tokenizer, chat, runtime, max_ctx, stop, sampling, media })
     }
 
     pub fn spec(&self) -> &Spec {
         &self.spec
+    }
+
+    pub fn sampling_defaults(&self) -> SamplingDefaults {
+        self.sampling
     }
 
     pub fn max_ctx(&self) -> usize {

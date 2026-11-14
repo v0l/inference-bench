@@ -58,6 +58,16 @@ impl Default for Sampling {
     }
 }
 
+impl Sampling {
+    pub fn resolve(&self, defaults: specrt::engine::SamplingDefaults) -> specrt::runtime::Sampling {
+        specrt::runtime::Sampling::new(self.temperature.max(0.0), self.seed.unwrap_or(0) as u32).truncated(
+            self.top_k.or(defaults.top_k).unwrap_or(0),
+            self.top_p.or(defaults.top_p).unwrap_or(1.0),
+            self.min_p.or(defaults.min_p).unwrap_or(0.0),
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
     pub messages: Vec<Message>,

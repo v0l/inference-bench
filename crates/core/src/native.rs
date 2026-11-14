@@ -28,6 +28,10 @@ pub trait Model {
         false
     }
 
+    fn sampling_defaults(&self) -> specrt::engine::SamplingDefaults {
+        Default::default()
+    }
+
     fn chat_media(
         &mut self,
         _messages: &[Value],
@@ -64,6 +68,10 @@ impl Model for specrt::Engine {
 
     fn accepts_media(&self) -> bool {
         specrt::Engine::accepts_media(self)
+    }
+
+    fn sampling_defaults(&self) -> specrt::engine::SamplingDefaults {
+        specrt::Engine::sampling_defaults(self)
     }
 
     fn chat_media(
@@ -180,10 +188,6 @@ pub fn engine_error(err: &anyhow::Error) -> BackendError {
     BackendError::new(kind, message)
 }
 
-fn sampling(temperature: f32, seed: Option<u64>) -> Sampling {
-    Sampling::new(temperature.max(0.0), seed.unwrap_or(0) as u32)
-}
-
 fn generation(r: Reply) -> Generation {
     Generation {
         text: r.text,
@@ -293,10 +297,11 @@ impl Target for Native {
                 let _ = text.send(Streamed::Text(t.to_string()));
                 !cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             };
+            let resolved = s.resolve(m.sampling_defaults());
             let out = if media.is_empty() {
-                m.chat(&list, template.as_ref(), s.max_tokens, sampling(s.temperature, s.seed), &mut send).map(generation)
+                m.chat(&list, template.as_ref(), s.max_tokens, resolved, &mut send).map(generation)
             } else {
-                m.chat_media(&list, template.as_ref(), &media, budget, s.max_tokens, sampling(s.temperature, s.seed), &mut send)
+                m.chat_media(&list, template.as_ref(), &media, budget, s.max_tokens, resolved, &mut send)
                     .map(|(reply, vision_tokens)| Generation { vision_tokens: vision_tokens as u64, ..generation(reply) })
             };
             let _ = tx.send(Streamed::Done(out.map_err(|e| engine_error(&e))));
@@ -393,6 +398,43 @@ mod tests {
         let mut r = ChatRequest::new(vec![Message::new(Role::User, "hi")], crate::chat::Sampling::default());
         r.sampling.max_tokens = n;
         r
+    }
+
+    struct Recording(Arc<Mutex<Vec<Sampling>>>);
+
+    impl Model for Recording {
+        fn generate(&mut self, _: &str, _: usize, _: Sampling) -> anyhow::Result<Reply> {
+            Ok(reply(String::new(), 0))
+        }
+
+        fn chat(&mut self, _: &[Value], _: Option<&Value>, _: usize, sampling: Sampling, _: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<Reply> {
+            self.0.lock().unwrap().push(sampling);
+            Ok(reply(String::new(), 0))
+        }
+
+        fn logits(&mut self, _: &str) -> anyhow::Result<PromptLogits> {
+            anyhow::bail!("no logits")
+        }
+
+        fn sampling_defaults(&self) -> specrt::engine::SamplingDefaults {
+            specrt::engine::SamplingDefaults { top_k: Some(20), top_p: Some(0.95), min_p: None }
+        }
+    }
+
+    #[test]
+    fn the_model_generation_config_fills_the_sampling_a_request_leaves_out() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let shared = seen.clone();
+        let mut n = Native::with_factory(None, Arc::new(move |_, _| Ok(Box::new(Recording(shared.clone())) as Box<dyn Model>)));
+        n.load("m").unwrap();
+        n.chat(&chat(4), &mut |_| {}).unwrap();
+        let mut explicit = chat(4);
+        explicit.sampling.top_k = Some(1);
+        explicit.sampling.top_p = Some(0.5);
+        n.chat(&explicit, &mut |_| {}).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!((seen[0].top_k, seen[0].top_p, seen[0].min_p), (20, 0.95, 0.0));
+        assert_eq!((seen[1].top_k, seen[1].top_p), (1, 0.5));
     }
 
     #[test]

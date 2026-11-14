@@ -56,14 +56,6 @@ impl ServingTarget {
     }
 }
 
-fn sampling(s: &crate::chat::Sampling, defaults: specrt::engine::SamplingDefaults) -> Sampling {
-    Sampling::new(s.temperature.max(0.0), s.seed.unwrap_or(0) as u32).truncated(
-        s.top_k.or(defaults.top_k).unwrap_or(0),
-        s.top_p.or(defaults.top_p).unwrap_or(1.0),
-        s.min_p.or(defaults.min_p).unwrap_or(0.0),
-    )
-}
-
 impl Target for ServingTarget {
     fn name(&self) -> &str {
         "specrt"
@@ -96,7 +88,7 @@ impl Target for ServingTarget {
                 .map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("{e:#}")))?
         };
         let s = request.sampling;
-        self.run(ids, s.max_tokens, sampling(&s, self.engine()?.sampling_defaults()), !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), media, vision_tokens, on_text)
+        self.run(ids, s.max_tokens, s.resolve(self.engine()?.sampling_defaults()), !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), media, vision_tokens, on_text)
     }
 
     fn share(&self) -> Option<Box<dyn Target>> {
