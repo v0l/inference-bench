@@ -194,7 +194,9 @@ fn the_search_matches_name_repo_architecture_quant_and_format() {
 }
 
 fn real_model(name: &str) -> LocalModel {
-    let d = dir(&format!("real-{name}"));
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let d = dir(&format!("real-{name}-{n}"));
     std::fs::create_dir_all(&d).unwrap();
     std::fs::copy(fixtures().join("qwen3-0.6b.config.json"), d.join("config.json")).unwrap();
     let mut m = model(name, true, "dense decoder");
