@@ -463,7 +463,7 @@ fn four_requests_share_a_pool_of_one_and_a_half_max_model_lens_and_match_single_
         .iter()
         .map(|p| {
             let (tx, rx) = std::sync::mpsc::channel();
-            let request = Request { prompt: p.clone(), max_tokens: 150, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() };
+            let request = Request { prompt: p.clone(), max_tokens: 150, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None };
             core.submit(Job { request, events: tx, cancel: Arc::new(AtomicBool::new(false)) }).unwrap();
             rx
         })
@@ -483,7 +483,9 @@ fn four_requests_share_a_pool_of_one_and_a_half_max_model_lens_and_match_single_
         assert_eq!(&got, want);
     }
     assert!(core.stats().preemptions > 0, "four 350 token requests cannot grow in a 768 token pool without preemption");
+}
 
+#[test]
 #[ignore = "needs a CUDA GPU"]
 fn tiny_json_object_grammar_always_yields_an_object_and_leaves_other_rows_alone() {
     use specrt::grammar::{Grammar, TokenTable};
