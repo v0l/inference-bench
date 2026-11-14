@@ -13,6 +13,7 @@ pub struct Loaded {
     pub load_secs: f64,
     pub vision: bool,
     pub ctx: usize,
+    pub thinking: specrt::chat::Thinking,
 }
 
 pub enum Command {
@@ -56,6 +57,10 @@ impl Handle {
         self.loaded.lock().unwrap().clone()
     }
 
+    pub fn thinking(&self) -> specrt::chat::Thinking {
+        self.loaded().map(|l| l.thinking).unwrap_or_default()
+    }
+
     pub fn chat(&self, request: ChatRequest) -> Receiver<ChatEvent> {
         let (tx, rx) = channel();
         if self.commands.send(Command::Chat { request, events: tx.clone() }).is_err() {
@@ -94,6 +99,10 @@ impl Engine {
     pub fn vision(&self) -> bool {
         self.loaded().is_some_and(|l| l.vision)
     }
+
+    pub fn thinking(&self) -> specrt::chat::Thinking {
+        self.loaded().map(|l| l.thinking).unwrap_or_default()
+    }
 }
 
 impl Drop for Engine {
@@ -130,10 +139,11 @@ fn run(
                 let mut native = Native::with_factory(max_ctx, factory.clone());
                 match native.load(&model_id) {
                     Ok(()) => {
-                        let vision = native.capabilities().vision;
+                        let caps = native.capabilities();
+                        let (vision, thinking) = (caps.vision, caps.thinking);
                         backend = Some(native);
                         let ctx = max_ctx.unwrap_or(specrt::engine::DEFAULT_CTX);
-                        let info = Loaded { model_id, display, load_secs: started.elapsed().as_secs_f64(), vision, ctx };
+                        let info = Loaded { model_id, display, load_secs: started.elapsed().as_secs_f64(), vision, ctx, thinking };
                         *shared.lock().unwrap() = Some(info.clone());
                         emit(EngineEvent::Loaded(info));
                     }

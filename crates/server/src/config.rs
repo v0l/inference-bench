@@ -197,6 +197,13 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn with_thinking(mut self, thinking: inference_bench_core::specrt_chat::Thinking) -> Self {
+        if self.reasoning_parser.is_none() && thinking == inference_bench_core::specrt_chat::Thinking::OpensInPrompt {
+            self.reasoning_parser = Some("qwen3".into());
+        }
+        self
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
         Self::parse(&text).with_context(|| path.display().to_string())

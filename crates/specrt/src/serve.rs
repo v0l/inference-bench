@@ -555,6 +555,10 @@ impl Serving {
         self.assets.sampling
     }
 
+    pub fn thinking(&self) -> crate::chat::Thinking {
+        self.assets.chat.as_ref().map(|c| c.thinking()).unwrap_or_default()
+    }
+
     pub fn load(model: &str, opts: ServeOptions) -> Result<Self> {
         let assets = Assets::load(model)?;
         let core = Core::start(&assets.spec, opts)?;

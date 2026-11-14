@@ -20,8 +20,14 @@ pub struct Conversation {
     pub model: String,
     pub sampling: Sampling,
     pub use_template: bool,
+    #[serde(default = "thinking_on")]
+    pub thinking: bool,
     pub turns: Vec<Turn>,
     pub updated: chrono::DateTime<chrono::Utc>,
+}
+
+fn thinking_on() -> bool {
+    true
 }
 
 impl Conversation {
@@ -34,6 +40,7 @@ impl Conversation {
             model: String::new(),
             sampling: Sampling::default(),
             use_template: true,
+            thinking: true,
             turns: Vec::new(),
             updated: now,
         }
@@ -58,9 +65,13 @@ impl Conversation {
             out.push(serde_json::json!({"role": "system", "content": self.system.trim()}));
         }
         for t in &self.turns {
+            let text = match t.message.role {
+                crate::chat::Role::Assistant => crate::reasoning::answer_of(&t.message.content),
+                _ => t.message.content.clone(),
+            };
             out.push(serde_json::json!({
                 "role": t.message.role.name(),
-                "content": crate::media::content_with_attachments(&t.message.content, &t.attachments),
+                "content": crate::media::content_with_attachments(&text, &t.attachments),
             }));
         }
         Some(out)
@@ -71,8 +82,19 @@ impl Conversation {
         if !self.system.trim().is_empty() {
             out.push(Message::new(crate::chat::Role::System, self.system.trim()));
         }
-        out.extend(self.turns.iter().map(|t| t.message.clone()));
+        out.extend(self.turns.iter().map(|t| match t.message.role {
+            crate::chat::Role::Assistant => Message::new(t.message.role, crate::reasoning::answer_of(&t.message.content)),
+            _ => t.message.clone(),
+        }));
         out
+    }
+
+    pub fn chat_request(&self, thinking: specrt::chat::Thinking) -> crate::chat::ChatRequest {
+        let on = self.thinking && thinking != specrt::chat::Thinking::Unsupported;
+        let mut request = crate::chat::ChatRequest::new(self.messages(), self.sampling).with_thinking(on);
+        request.use_template = self.use_template;
+        request.openai_messages = self.openai_messages();
+        request
     }
 
     pub fn token_estimate(&self) -> usize {

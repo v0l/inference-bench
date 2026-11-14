@@ -8,6 +8,8 @@ pub struct Capabilities {
     pub memory: bool,
     #[serde(default)]
     pub vision: bool,
+    #[serde(default)]
+    pub thinking: specrt::chat::Thinking,
 }
 
 #[derive(Debug, Clone, PartialEq)]

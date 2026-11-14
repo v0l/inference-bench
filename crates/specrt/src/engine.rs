@@ -373,6 +373,10 @@ impl Engine {
         self.sampling
     }
 
+    pub fn thinking(&self) -> crate::chat::Thinking {
+        self.chat.as_ref().map(|c| c.thinking()).unwrap_or_default()
+    }
+
     pub fn max_ctx(&self) -> usize {
         self.max_ctx
     }

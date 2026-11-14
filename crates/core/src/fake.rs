@@ -165,16 +165,25 @@ fn serve(mut stream: TcpStream, script: &Script, seen: &Mutex<Vec<String>>) {
 pub struct ScriptedModel {
     script: Script,
     pub vision: bool,
+    pub thinking: specrt::chat::Thinking,
+    pub templates: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl ScriptedModel {
     pub fn factory(script: Script) -> crate::native::Factory {
-        Arc::new(move |model, _| {
+        Self::factory_probed(script, Default::default()).0
+    }
+
+    pub fn factory_probed(script: Script, thinking: specrt::chat::Thinking) -> (crate::native::Factory, Arc<Mutex<Vec<serde_json::Value>>>) {
+        let templates = Arc::new(Mutex::new(Vec::new()));
+        let seen = templates.clone();
+        let factory: crate::native::Factory = Arc::new(move |model, _| {
             if !script.models.iter().any(|m| m == model) {
                 anyhow::bail!("no config.json for {model} under the fake hub");
             }
-            Ok(Box::new(ScriptedModel { script: script.clone(), vision: script.vision }) as Box<dyn crate::native::Model>)
-        })
+            Ok(Box::new(ScriptedModel { script: script.clone(), vision: script.vision, thinking, templates: seen.clone() }) as Box<dyn crate::native::Model>)
+        });
+        (factory, templates)
     }
 
     fn reply(&self, text: String, pieces: usize, started: std::time::Instant, first: f64) -> specrt::engine::Reply {
@@ -216,11 +225,12 @@ impl crate::native::Model for ScriptedModel {
     fn chat(
         &mut self,
         _: &[serde_json::Value],
-        _: Option<&serde_json::Value>,
+        template: Option<&serde_json::Value>,
         _: usize,
         _: specrt::runtime::Sampling,
         on_text: &mut dyn FnMut(&str) -> bool,
     ) -> anyhow::Result<specrt::engine::Reply> {
+        self.templates.lock().unwrap().push(template.cloned().unwrap_or_default());
         self.stream(on_text)
     }
 
@@ -230,6 +240,10 @@ impl crate::native::Model for ScriptedModel {
 
     fn accepts_media(&self) -> bool {
         self.vision
+    }
+
+    fn thinking(&self) -> specrt::chat::Thinking {
+        self.thinking
     }
 
     fn chat_media(

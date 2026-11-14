@@ -76,6 +76,7 @@ impl ServerState {
             config.api_keys = vec![key.trim().to_string()];
         }
         let source = engine.clone();
+        config = config.with_thinking(engine.thinking());
         let factory = move |_: Option<usize>| {
             Ok(Box::new(EngineBackend::new(engine.clone())) as Box<dyn inference_bench_core::target::Target>)
         };

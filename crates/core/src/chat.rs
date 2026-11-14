@@ -106,6 +106,11 @@ impl ChatRequest {
         }
     }
 
+    pub fn with_thinking(mut self, on: bool) -> Self {
+        self.template_vars["enable_thinking"] = json!(on);
+        self
+    }
+
     pub fn template(&self) -> Option<&Value> {
         self.use_template.then_some(&self.template_vars)
     }
@@ -176,6 +181,8 @@ pub struct Stats {
     pub ttft_secs: f64,
     #[serde(default)]
     pub vision_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
     pub prefill_tok_s: Option<f64>,
     pub decode_tok_s: Option<f64>,
 }
@@ -187,6 +194,7 @@ impl Stats {
             prompt_tokens: g.prompt_tokens,
             completion_tokens: g.completion_tokens,
             vision_tokens: g.vision_tokens,
+            reasoning_tokens: 0,
             ttft_secs: g.ttft_secs,
             prefill_tok_s: r.prefill_tok_s,
             decode_tok_s: r.decode_tok_s,
@@ -219,6 +227,13 @@ mod tests {
         assert!(!r.use_template);
         assert_eq!(r.flatten(), "once upon");
         assert!(ChatRequest::from_openai(&json!({})).is_none());
+    }
+
+    #[test]
+    fn a_chat_request_renders_with_thinking_off_unless_asked() {
+        let r = ChatRequest::new(vec![Message::new(Role::User, "hi")], Sampling::default());
+        assert_eq!(r.template().unwrap()["enable_thinking"], false);
+        assert_eq!(r.with_thinking(true).template().unwrap()["enable_thinking"], true);
     }
 
     #[test]

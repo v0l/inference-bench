@@ -2,6 +2,14 @@ use anyhow::{Context, Result, anyhow};
 use minijinja::{Environment, context};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Thinking {
+    #[default]
+    Unsupported,
+    Optional,
+    OpensInPrompt,
+}
+
 pub struct ChatTemplate {
     source: String,
     bos_token: String,
@@ -44,6 +52,17 @@ impl ChatTemplate {
             bos_token: token_text(&config["bos_token"]),
             eos_token: token_text(&config["eos_token"]),
         }))
+    }
+
+    pub fn thinking(&self) -> Thinking {
+        if !self.source.contains("enable_thinking") {
+            return Thinking::Unsupported;
+        }
+        let probe = [serde_json::json!({"role": "user", "content": "hi"})];
+        match self.render_with(&probe, &serde_json::json!({"enable_thinking": true})) {
+            Ok(text) if text.trim_end().ends_with("<think>") => Thinking::OpensInPrompt,
+            _ => Thinking::Optional,
+        }
     }
 
     fn iterates_content(&self) -> bool {

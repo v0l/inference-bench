@@ -1127,3 +1127,88 @@ fn screenshot_vision_tower_in_the_model_detail() {
     h.run();
     h.render().unwrap().save(out.join("detail-vision-tower.png")).unwrap();
 }
+
+fn thinking_script(chunks: &[&str]) -> Script {
+    Script { chunks: chunks.iter().map(|c| c.to_string()).collect(), ..script() }
+}
+
+fn load_thinking(h: &mut Harness<'static, App>, chunks: &[&str]) -> std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
+    let (factory, seen) = ScriptedModel::factory_probed(thinking_script(chunks), specrt::chat::Thinking::OpensInPrompt);
+    {
+        let app = h.state_mut();
+        app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), factory);
+        let m = app.library[0].clone();
+        app.chat.pick("Qwen3-0.6B");
+        app.load_model(&m);
+    }
+    pump_until(h, 10, "the model to load", |a| a.loaded().is_some());
+    seen
+}
+
+fn say(h: &mut Harness<'static, App>, text: &str) {
+    let app = h.state_mut();
+    app.chat.input = text.into();
+    let handle = app.engine.handle();
+    let d = app.dir.clone();
+    app.chat.send(handle, &d);
+    pump_until(h, 10, "the reply", |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= 2);
+}
+
+#[test]
+fn the_chat_asks_the_model_to_think_when_the_toggle_is_on_and_not_when_it_is_off() {
+    let mut h = harness("think-toggle", Tab::Chat);
+    let seen = load_thinking(&mut h, &["<think>a</think>b"]);
+    say(&mut h, "hi");
+    assert_eq!(seen.lock().unwrap()[0]["enable_thinking"], true);
+    h.state_mut().chat.conv().thinking = false;
+    h.state_mut().chat.conv().turns.truncate(1);
+    say(&mut h, "again");
+    assert_eq!(seen.lock().unwrap()[1]["enable_thinking"], false);
+}
+
+#[test]
+fn a_model_without_thinking_support_is_never_asked_to_think() {
+    let mut h = harness("think-unsupported", Tab::Chat);
+    {
+        let app = h.state_mut();
+        scripted(app, script());
+        let m = app.library[0].clone();
+        app.chat.pick("Qwen3-0.6B");
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 10, "the model to load", |a| a.loaded().is_some());
+    assert!(h.state().chat.conversations[0].thinking);
+    let thinking = h.state().engine.thinking();
+    let request = h.state_mut().chat.conv().chat_request(thinking);
+    assert_eq!(request.template().unwrap()["enable_thinking"], false);
+}
+
+#[test]
+fn streamed_reasoning_lands_in_the_thinking_block_and_the_answer_stays_clean() {
+    let mut h = harness("think-stream", Tab::Chat);
+    load_thinking(&mut h, &["<think>alpha", "</think>bravo"]);
+    say(&mut h, "hi");
+    h.run();
+    let reply = h.state_mut().chat.conv().turns[1].message.content.clone();
+    let split = inference_bench_core::reasoning::split(&reply, false, true);
+    assert_eq!((split.reasoning.as_deref(), split.answer.as_str()), (Some("alpha"), "bravo"));
+    h.get_by_label("> thinking");
+    h.get_by_label_contains("bravo");
+    h.get_by_label("> thinking").click();
+    h.run();
+    h.get_by_label_contains("alpha");
+    let turns = h.state_mut().chat.conv().messages();
+    assert_eq!(turns.last().unwrap().content, "bravo");
+    assert!(h.state().chat.last_stats.unwrap().reasoning_tokens > 0);
+}
+
+#[test]
+fn a_template_that_opens_the_think_block_still_splits_reasoning_from_the_answer() {
+    let mut h = harness("think-open", Tab::Chat);
+    load_thinking(&mut h, &["plan first", "</think>", "done"]);
+    say(&mut h, "hi");
+    h.run();
+    let reply = h.state_mut().chat.conv().turns[1].message.content.clone();
+    let split = inference_bench_core::reasoning::split(&reply, false, true);
+    assert_eq!((split.reasoning.as_deref(), split.answer.as_str()), (Some("plan first"), "done"));
+}

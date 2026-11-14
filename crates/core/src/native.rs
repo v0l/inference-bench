@@ -32,6 +32,10 @@ pub trait Model {
         Default::default()
     }
 
+    fn thinking(&self) -> specrt::chat::Thinking {
+        Default::default()
+    }
+
     fn chat_media(
         &mut self,
         _messages: &[Value],
@@ -72,6 +76,10 @@ impl Model for specrt::Engine {
 
     fn sampling_defaults(&self) -> specrt::engine::SamplingDefaults {
         specrt::Engine::sampling_defaults(self)
+    }
+
+    fn thinking(&self) -> specrt::chat::Thinking {
+        specrt::Engine::thinking(self)
     }
 
     fn chat_media(
@@ -120,6 +128,7 @@ pub struct Native {
     factory: Factory,
     worker: Option<Worker>,
     vision: bool,
+    thinking: specrt::chat::Thinking,
 }
 
 impl Native {
@@ -132,7 +141,7 @@ impl Native {
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {
-        Self { max_ctx, factory, worker: None, vision: false }
+        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default() }
     }
 
     fn send(&mut self, job: Job) -> Result<(), BackendError> {
@@ -206,7 +215,7 @@ fn run_engine(
     model: String,
     max_ctx: Option<usize>,
     factory: Factory,
-    loaded: Sender<Result<bool, BackendError>>,
+    loaded: Sender<Result<(bool, specrt::chat::Thinking), BackendError>>,
     jobs: std::sync::mpsc::Receiver<Job>,
     panic: Arc<Mutex<Option<String>>>,
 ) {
@@ -223,7 +232,7 @@ fn run_engine(
             return;
         }
     };
-    let _ = loaded.send(Ok(engine.accepts_media()));
+    let _ = loaded.send(Ok((engine.accepts_media(), engine.thinking())));
     while let Ok(job) = jobs.recv() {
         if let Err(p) = catch_unwind(AssertUnwindSafe(|| job(engine.as_mut()))) {
             let why = panic_text(p.as_ref());
@@ -246,7 +255,7 @@ impl Target for Native {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: true, memory: true, vision: self.vision }
+        Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
@@ -263,9 +272,10 @@ impl Target for Native {
         let worker = Worker { jobs: Some(jobs), thread: Some(thread), panic };
         let outcome = loaded_rx.recv().unwrap_or_else(|_| Err(BackendError::failed("the native engine stopped while loading")));
         match outcome {
-            Ok(vision) => {
+            Ok((vision, thinking)) => {
                 self.worker = Some(worker);
                 self.vision = vision;
+                self.thinking = thinking;
                 Ok(())
             }
             Err(e) => {

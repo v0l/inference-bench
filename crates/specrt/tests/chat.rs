@@ -74,3 +74,13 @@ fn a_multi_turn_conversation_renders_each_message_with_its_role() {
     assert!(text.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"), "{text}");
     assert!(!text.contains("Human:") && !text.contains("Assistant:"));
 }
+
+#[test]
+fn the_template_says_whether_it_supports_and_opens_thinking() {
+    use specrt::chat::Thinking;
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let read = |f: &str| std::fs::read_to_string(fixtures.join(f)).unwrap();
+    let qwen = ChatTemplate::from_files(&read("qwen3.8-27b.tokenizer_config.json"), Some(&read("qwen3.8-27b.chat_template.jinja"))).unwrap().unwrap();
+    assert_eq!(qwen.thinking(), Thinking::OpensInPrompt);
+    assert_eq!(template("Qwen2.5-0.5B.tokenizer_config.json").thinking(), Thinking::Unsupported);
+}

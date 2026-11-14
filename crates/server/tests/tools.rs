@@ -195,3 +195,60 @@ fn unsupported_fields_are_rejected_naming_the_field() {
     assert_eq!(status, 200, "{text}");
     rig.stop();
 }
+
+fn app_mode(thinking: inference_bench_core::specrt_chat::Thinking) -> inference_bench_server::config::ServerConfig {
+    config("[[models]]\nid='m'\n").with_thinking(thinking)
+}
+
+fn ask(rig: &Rig, extra: Value) -> Value {
+    let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 200, "{text}");
+    serde_json::from_str(&text).unwrap()
+}
+
+#[test]
+fn app_mode_returns_reasoning_content_for_a_template_that_opens_the_think_block() {
+    let rig = start(app_mode(inference_bench_core::specrt_chat::Thinking::OpensInPrompt), pieces(&["plan", "</think>", "answer"]));
+    let v = ask(&rig, json!({}));
+    let m = &v["choices"][0]["message"];
+    assert_eq!((m["reasoning_content"].as_str(), m["content"].as_str()), (Some("plan"), Some("answer")));
+    assert_ne!(rig.stats.requests.lock().unwrap()[0].template_vars["enable_thinking"], false);
+    rig.stop();
+}
+
+#[test]
+fn app_mode_streams_reasoning_deltas_before_the_content() {
+    let rig = start(app_mode(inference_bench_core::specrt_chat::Thinking::OpensInPrompt), pieces(&["plan", "</think>", "answer"]));
+    let (_, body, _) = rig.post("/v1/chat/completions", None, json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": "hi"}]}));
+    let reasoning = body.find("\"reasoning\":\"plan\"").expect(&body);
+    let content = body.find("\"content\":\"answer\"").expect(&body);
+    assert!(reasoning < content, "{body}");
+    rig.stop();
+}
+
+#[test]
+fn app_mode_thinking_can_be_turned_off_per_request() {
+    let rig = start(app_mode(inference_bench_core::specrt_chat::Thinking::OpensInPrompt), pieces(&["answer"]));
+    for extra in [json!({"reasoning_effort": "none"}), json!({"chat_template_kwargs": {"enable_thinking": false}})] {
+        let v = ask(&rig, extra);
+        assert_eq!(v["choices"][0]["message"]["content"], "answer");
+        assert!(v["choices"][0]["message"].get("reasoning_content").is_none());
+    }
+    let seen = rig.stats.requests.lock().unwrap();
+    assert!(seen.iter().all(|r| r.template_vars["enable_thinking"] == false));
+    drop(seen);
+    rig.stop();
+}
+
+#[test]
+fn app_mode_leaves_a_model_without_thinking_alone() {
+    let rig = start(app_mode(inference_bench_core::specrt_chat::Thinking::Unsupported), pieces(&["<think>x</think>y"]));
+    let v = ask(&rig, json!({}));
+    assert_eq!(v["choices"][0]["message"]["content"], "<think>x</think>y");
+    assert_eq!(rig.stats.requests.lock().unwrap()[0].template_vars["enable_thinking"], false);
+    rig.stop();
+}

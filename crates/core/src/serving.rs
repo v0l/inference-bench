@@ -62,7 +62,7 @@ impl Target for ServingTarget {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: false, memory: false, vision: self.serving.as_ref().is_some_and(|s| s.accepts_media()) }
+        Capabilities { streaming: true, logits: false, memory: false, vision: self.serving.as_ref().is_some_and(|s| s.accepts_media()), thinking: self.serving.as_ref().map(|s| s.thinking()).unwrap_or_default() }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {

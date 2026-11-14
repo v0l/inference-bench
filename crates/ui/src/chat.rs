@@ -20,6 +20,8 @@ const IDLE_HINT: &str = "Load a model to chat";
 pub struct Streaming {
     rx: Receiver<ChatEvent>,
     pub text: String,
+    pub opens: bool,
+    pub folded: bool,
     cancel: Arc<AtomicBool>,
 }
 
@@ -102,12 +104,14 @@ impl ChatState {
             }
         }
         let Some(outcome) = outcome else { return };
-        let text = std::mem::take(&mut s.text);
+        let opens = s.opens;
+        let text = inference_bench_core::reasoning::canonical(&std::mem::take(&mut s.text), opens, true);
         self.streaming = None;
         match outcome {
             Ok(g) => {
-                let stats = Stats::of(&g);
-                let reply = if g.text.is_empty() { text } else { g.text };
+                let mut stats = Stats::of(&g);
+                let reply = if g.text.is_empty() { text } else { inference_bench_core::reasoning::canonical(&g.text, opens, true) };
+                stats.reasoning_tokens = inference_bench_core::reasoning::reasoning_of(&reply).map(|r| inference_bench_core::chat::estimate_tokens(&r) as u64).unwrap_or(0);
                 self.last_stats = Some(stats);
                 let c = self.conv();
                 c.turns.push(Turn { message: Message::new(Role::Assistant, reply), stats: Some(stats), attachments: Vec::new() });
@@ -187,17 +191,17 @@ impl ChatState {
 
     pub fn generate(&mut self, handle: inference_bench_core::engine::Handle) {
         self.error = None;
+        let thinking = handle.thinking();
         let c = self.conv();
-        let mut request = ChatRequest::new(c.messages(), c.sampling);
-        request.use_template = c.use_template;
-        request.openai_messages = c.openai_messages();
+        let mut request = c.chat_request(thinking);
+        let opens = c.use_template && inference_bench_core::reasoning::opens_in_prompt(thinking, c.thinking);
         if let Some(list) = &request.openai_messages {
             request.media = inference_bench_core::media::extract(list, &Default::default()).unwrap_or_default();
         }
         let cancel = Arc::new(AtomicBool::new(false));
         request.cancel = Some(cancel.clone());
         let rx = handle.chat(request);
-        self.streaming = Some(Streaming { rx, text: String::new(), cancel });
+        self.streaming = Some(Streaming { rx, text: String::new(), opens, folded: false, cancel });
     }
 
     pub fn stop(&self) {
@@ -284,6 +288,9 @@ pub fn stats_line(s: &Stats) -> Line {
     if let Some(v) = s.decode_tok_s {
         line = line.gap(12.0).legend("decode").measured(format!("{v:.1} tok/s"));
     }
+    if s.reasoning_tokens > 0 {
+        line = line.gap(12.0).legend("thinking").measured(format!("~{} tok", s.reasoning_tokens));
+    }
     line.gap(12.0).legend("tokens").measured(format!("{} + {}", s.prompt_tokens, s.completion_tokens)).size(10.5)
 }
 
@@ -334,6 +341,7 @@ fn sampling_panel(app: &mut App, ui: &mut egui::Ui) {
                 c.sampling.seed = seed_text.trim().parse().ok();
             }
         });
+        switch(ui, "thinking", &mut c.thinking, "let the model think first", "Shown above the answer. Only models whose chat template supports it think.");
         switch(ui, "chat template", &mut c.use_template, "wrap messages in the model's chat template", "Off sends the text as a raw prompt.");
     });
 }
@@ -358,9 +366,42 @@ fn empty_state(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ThinkBlock {
+    Keep,
+    Reset,
+    Fold,
+}
+
+impl ThinkBlock {
+    fn apply(self, ui: &egui::Ui) {
+        if self == ThinkBlock::Keep {
+            return;
+        }
+        let id = ui.make_persistent_id(("thinking", usize::MAX));
+        let Some(mut state) = egui::collapsing_header::CollapsingState::load(ui.ctx(), id) else { return };
+        match self {
+            ThinkBlock::Reset => state.remove(ui.ctx()),
+            _ => {
+                state.set_open(false);
+                state.store(ui.ctx());
+            }
+        }
+    }
+}
+
 fn conversation_view(app: &mut App, ui: &mut egui::Ui) {
     let handle = app.engine.handle();
-    let streaming_text = app.chat.streaming.as_ref().map(|s| s.text.clone());
+    let streaming_text = app.chat.streaming.as_ref().map(|s| inference_bench_core::reasoning::canonical(&s.text, s.opens, false));
+    let mut think_block = ThinkBlock::Keep;
+    if let Some(s) = app.chat.streaming.as_mut() {
+        if s.text.is_empty() {
+            think_block = ThinkBlock::Reset;
+        } else if !s.folded && inference_bench_core::reasoning::split(&s.text, s.opens, false).answering {
+            s.folded = true;
+            think_block = ThinkBlock::Fold;
+        }
+    }
     let last = app.chat.conversations.len() - 1;
     let cur = app.chat.current.min(last);
     let turns = app.chat.conversations[cur].turns.clone();
@@ -381,6 +422,7 @@ fn conversation_view(app: &mut App, ui: &mut egui::Ui) {
         }
     };
     let below = |ui: &mut egui::Ui| {
+        think_block.apply(ui);
         if let Some(e) = &error {
             chat_ui::fault(ui, "generation failed", e);
         }
