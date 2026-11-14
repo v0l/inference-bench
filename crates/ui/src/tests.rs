@@ -427,6 +427,27 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
 }
 
 #[test]
+fn served_names_from_the_load_dialog_reach_the_engine_and_are_remembered() {
+    let mut h = harness("served-names", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), script());
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    h.get_by_label_contains("SERVED NAMES");
+    h.state_mut().load.as_mut().unwrap().served_names = " qwen3.8-27b, gpt-4o ,, qwen3.8-27b".into();
+    h.run();
+    h.get_all_by_label("load").last().unwrap().click();
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    let want = vec!["qwen3.8-27b".to_string(), "gpt-4o".to_string()];
+    assert_eq!(h.state().loaded().unwrap().served_names, want);
+    assert_eq!(Settings::load(&h.state().dir).served_names_for("Qwen3-0.6B"), want);
+    h.state_mut().open_load_dialog(&m);
+    assert_eq!(h.state().load.as_ref().unwrap().served_names, "qwen3.8-27b, gpt-4o");
+}
+
+#[test]
 fn four_parallel_api_requests_reach_running_four_and_chat_keeps_working() {
     let mut h = serving_harness("parallel", 4);
     h.run();

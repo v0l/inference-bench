@@ -61,6 +61,7 @@ id = "qwen3-0.6b"
 model = "specs/qwen3-0.6b.toml"
 vram_bytes = 4000000000              # used for the budget until the measured value is known
 preload = true
+served_names = ["qwen3.8-27b"]       # extra names a request may use, like vLLM's --served-model-name
 
 [specs]                              # spec updates from GitHub, see docs/specs-update.md
 auto_update = true
@@ -111,9 +112,13 @@ The GUI Server tab runs this same library in-process over the loaded model, and 
 
 16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 143.2 tokens/s aggregate, p50 3.5 s, p95 6.5 s (requests queue behind the one engine; latency is queue wait). A streamed reply arrives as 9 chunks, first at 0.03 s and last at 0.73 s. Loaded model VRAM reads 3.9 GB, device used 99 GB.
 
-## Unsupported request fields
+## Request fields
 
-A field the server does not handle returns 400 naming it: `n` other than 1, `logprobs`, `top_logprobs`, `response_format` other than `text`, non-zero `frequency_penalty` or `presence_penalty`, named or `required` `tool_choice`, and any unknown top-level key. `user`, `parallel_tool_calls`, `store` and `metadata` are accepted and ignored.
+`/v1/models` lists each model's own id. A request may name it by id, repo id, short name or any of its `served_names` (server.toml, or the load dialog in the app).
+
+`logprobs: true` with `top_logprobs` up to 20 (chat) or `logprobs: N` (completions) return per-token log probabilities, streamed or not, computed on the host from the sampled row's logits. `n` up to 16 runs that many sequences on the batched engine; usage sums their completion tokens. Both need the batched engine (`max_num_seqs` above 1, or more than one parallel request in the app) and return 400 saying so otherwise. A `developer` message is templated as `system`, and a chat template error from client input is a 400.
+
+A field the server does not handle returns 400 naming it: `response_format` other than `text` (structured output is #591), non-zero `frequency_penalty` or `presence_penalty`, named or `required` `tool_choice`, and any unknown top-level key. `user`, `parallel_tool_calls`, `store` and `metadata` are accepted and ignored.
 
 ## Tool loop parity with vLLM (Qwen3.8-27B)
 
@@ -123,6 +128,6 @@ A field the server does not handle returns 400 naming it: `n` other than 1, `log
 |---|---|
 | 20 single turns, tool name, arguments and finish reason | 20 identical |
 | 3 turn loop (two calls in one reply, then a final answer) | identical |
-| `n=2` through the client | 400 `n: value is not supported` |
+| `n=2` through the client | 2 choices (since #585) |
 
 Qwen3-0.6B with the hermes parser ran the same client loop (call, tool result, answer) correctly.
