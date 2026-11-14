@@ -60,7 +60,7 @@ pub struct LocalModel {
 }
 
 pub fn config_has_vision(config: &Value) -> bool {
-    config.get("vision_config").is_some_and(Value::is_object) && config.get("language_model_only").and_then(Value::as_bool) != Some(true)
+    specrt::vision::Vision::from_hf_config(&config.to_string()).is_ok_and(|v| v.is_some())
 }
 
 impl LocalModel {
@@ -180,8 +180,8 @@ fn support_for_safetensors(config: &Value, arch: &str) -> Vec<Support> {
         (true, true) => Support::yes("vllm", "architecture is registered"),
         (true, false) => Support::no("vllm", format!("Model architectures ['{arch}'] are not supported")),
     };
-    let specrt = if text { specrt_support(config) } else { Support::no("specrt", none()) };
-    let wgpu = if text { specrt_wgpu_support(config) } else { Support::no("specrt (wgpu)", none()) };
+    let specrt = specrt_support(config);
+    let wgpu = specrt_wgpu_support(config);
     vec![
         specrt,
         wgpu,
@@ -778,6 +778,40 @@ mod tests {
         config["quantization_config"]["config_groups"]["group_1"]["weights"]["group_size"] = serde_json::json!(32);
         let s = specrt_support(&config);
         assert!(!s.supported && s.reason.contains("group_1"), "{}", s.reason);
+    }
+
+    fn engine_config_fixtures() -> Vec<(String, Value)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures");
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let path = entry.unwrap().path();
+            let (name, file) = match path.is_dir() {
+                true => (path.file_name().unwrap().to_string_lossy().into_owned(), path.join("config.json")),
+                false => (path.file_name().unwrap().to_string_lossy().into_owned(), path.clone()),
+            };
+            let is_config = match path.is_dir() {
+                true => file.exists(),
+                false => name.ends_with(".config.json"),
+            };
+            if is_config {
+                found.push((name, serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap()));
+            }
+        }
+        found.sort_by(|a, b| a.0.cmp(&b.0));
+        found
+    }
+
+    #[test]
+    fn every_config_the_engine_tests_load_is_supported_by_the_library() {
+        let engine_refuses = ["qwen3.6-35b-a3b-fp8.config.json", "gemma4-31b.config.json"];
+        let fixtures = engine_config_fixtures();
+        assert!(fixtures.len() >= 12, "{} fixtures", fixtures.len());
+        for (name, config) in &fixtures {
+            let engine = specrt::spec::Spec::from_hf_config(&config.to_string());
+            let s = specrt_support(config);
+            assert_eq!(s.supported, engine.is_ok(), "{name}: library says {:?}, engine says {:?}", s, engine.err());
+            assert_eq!(s.supported, !engine_refuses.contains(&name.as_str()), "{name}: {}", s.reason);
+        }
     }
 
     #[test]
