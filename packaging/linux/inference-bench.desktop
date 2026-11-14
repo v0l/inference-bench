@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
 Name=Inference Bench
-GenericName=LLM Inference Benchmark
-Comment=Compare LLM inference backends on speed, latency, memory and accuracy
+GenericName=Local LLM Server
+Comment=Run language models on your own GPU, chat with them and serve them over an OpenAI-compatible API
 Exec=inference-bench-ui
 Icon=inference-bench
 Terminal=false
-Categories=Utility;Science;Development;
-Keywords=llm;inference;benchmark;vllm;llama.cpp;
+Categories=Utility;Development;
+Keywords=llm;inference;server;openai;chat;models;

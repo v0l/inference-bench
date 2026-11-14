@@ -15,12 +15,11 @@ name = "inference-bench"
 maintainer = "v0l <kieran@harkin.me>"
 copyright = "v0l"
 license-file = ["../../LICENSE", "0"]
-section = "science"
+section = "utils"
 priority = "optional"
 extended-description = """\
-Inference Bench runs LLMs on its own spec-driven CUDA engine, serves them over an \
-OpenAI-compatible API, and benchmarks prefill and decode speed, time to first token \
-and memory against other engines such as llama.cpp and vLLM. \
+Inference Bench runs LLMs on its own spec-driven CUDA engine, with a model library, \
+chat and an OpenAI-compatible API server. \
 Ships the inference-bench command line tool and the inference-bench-ui desktop application."""
 assets = [
     ["target/release/inference-bench", "usr/bin/", "755"],
