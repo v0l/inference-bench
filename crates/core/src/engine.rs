@@ -632,7 +632,7 @@ mod tests {
         let inner = crate::fake::ScriptedServing::factory(slow_script());
         let log = seen.clone();
         let serving: ServingFactory = Arc::new(move |opts| {
-            log.lock().unwrap().push((opts.max_num_seqs, opts.kv_cache_tokens));
+            log.lock().unwrap().push((opts.max_num_seqs, opts.kv_cache_bytes));
             if opts.max_num_seqs > 1 { Some(Box::new(NoParallel) as Box<dyn Target>) } else { inner(opts) }
         });
         let e = Engine::with_factories(Arc::new(|| {}), ScriptedModel::factory(slow_script()), serving);
@@ -640,8 +640,8 @@ mod tests {
         wait_event(&e);
         let EngineEvent::Loaded(l) = wait_event(&e) else { panic!("not loaded") };
         assert_eq!(l.max_num_seqs, 1);
-        assert!(l.parallel_note.unwrap().starts_with("parallel requests off"));
-        assert_eq!(*seen.lock().unwrap(), vec![(4, Some(16384)), (1, Some(4096))]);
+        assert!(l.parallel_note.unwrap().starts_with("parallel requests off: the GPU ran out of memory"));
+        assert_eq!(*seen.lock().unwrap(), vec![(4, Some(1 << 30)), (1, Some(1 << 30))]);
         assert!(e.handle().serving_stats().is_some());
     }
 
