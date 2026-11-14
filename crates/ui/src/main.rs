@@ -7,6 +7,7 @@ mod engine;
 mod strip;
 mod job;
 mod load;
+mod modelbar;
 mod models;
 mod logs;
 mod server;
@@ -30,7 +31,6 @@ pub enum Tab {
     Chat,
     Models,
     Server,
-    Logs,
     Settings,
 }
 
@@ -55,6 +55,7 @@ pub struct App {
     pub settings_ui: settings::SettingsState,
     pub specs: specs::SpecsUpdater,
     pub load: Option<load::LoadDialog>,
+    pub picker_query: String,
 }
 
 impl App {
@@ -89,6 +90,7 @@ impl App {
                 s
             },
             load: None,
+            picker_query: String::new(),
             settings,
             wake,
             dir,

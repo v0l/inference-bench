@@ -71,11 +71,72 @@ fn harness(name: &str, tab: Tab) -> Harness<'static, App> {
 
 #[test]
 fn every_tab_draws() {
-    for tab in [Tab::Chat, Tab::Models, Tab::Server, Tab::Logs, Tab::Settings] {
+    for tab in [Tab::Chat, Tab::Models, Tab::Server, Tab::Settings] {
         let mut h = harness(&format!("tab{tab:?}"), tab);
         h.run();
         assert_eq!(h.state().tab, tab);
     }
+}
+
+#[test]
+fn the_server_page_shows_a_configured_placement_read_only() {
+    let mut h = harness("placement", Tab::Server);
+    std::fs::create_dir_all(&h.state().dir).unwrap();
+    std::fs::write(
+        crate::server::config_path(&h.state().dir),
+        r#"
+        [placement]
+        context = 4096
+        [[placement.devices]]
+        name = "alpha"
+        memory_gib = 24
+        bandwidth_gbs = 900
+        tflops = 80
+        [[placement.devices]]
+        name = "beta"
+        memory_gib = 24
+        bandwidth_gbs = 900
+        tflops = 80
+        address = "10.0.0.2:9000"
+        [[placement.stages]]
+        device = "alpha"
+        layers = [0, 20]
+        [[placement.stages]]
+        device = "beta"
+        layers = [20, 40]
+        "#,
+    )
+    .unwrap();
+    h.run();
+    h.get_by_label_contains("alpha 24 GiB on this machine");
+    h.get_by_label_contains("beta 24 GiB at 10.0.0.2:9000");
+    h.get_by_label_contains("stage 1 beta layers 20 to 40");
+    assert!(h.state().server.placement.as_ref().unwrap().is_ok());
+    assert!(h.query_by_label_contains("bandwidth").is_none());
+}
+
+#[test]
+fn the_server_page_has_no_placement_without_a_server_config() {
+    let mut h = harness("noplacement", Tab::Server);
+    h.run();
+    assert!(h.state().server.placement.is_none());
+    assert!(h.query_by_label_contains("stage 0").is_none());
+    h.get_by_label("select a model");
+}
+
+#[test]
+fn the_model_bar_picks_from_a_search_and_opens_the_load_dialog() {
+    let mut h = harness("modelbar", Tab::Chat);
+    h.run();
+    assert!(h.state().loaded().is_none());
+    h.get_by_label("select a model").click();
+    h.run();
+    h.get_by_label("search your models");
+    assert!(h.query_by_label_contains("Weird-7B").is_none(), "unsupported models are not offered");
+    h.get_by_label_contains("Qwen3-0.6B").click();
+    h.run();
+    assert_eq!(h.state().load.as_ref().unwrap().model.name, "Qwen3-0.6B");
+    h.get_by_label("LOAD QWEN3-0.6B");
 }
 
 #[test]
@@ -379,7 +440,8 @@ fn shared_logs() -> inference_bench_core::logging::LogBuffer {
 
 #[test]
 fn the_logs_tab_filters_searches_and_saves() {
-    let mut h = harness("logs", Tab::Logs);
+    let mut h = harness("logs", Tab::Server);
+    h.state_mut().server.pane = crate::server::Pane::Logs;
     {
         let app = h.state_mut();
         app.logs = inference_bench_core::logging::LogBuffer::new(50);
@@ -422,7 +484,7 @@ fn no_model_loaded_disables_sending() {
     assert!(h.state().loaded().is_none());
     assert!(!h.state().chat.streaming());
     assert!(h.get_all_by_label_contains("Load a model to chat").count() >= 1);
-    h.get_by_label("load");
+    h.get_by_label("select a model");
 }
 
 #[test]
@@ -766,7 +828,7 @@ fn screenshots_of_the_server_and_logs_tabs() {
         h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
     };
     shot(&mut h, "server");
-    h.state_mut().tab = Tab::Logs;
+    h.state_mut().server.pane = crate::server::Pane::Logs;
     h.state_mut().logs_ui.level = tracing::Level::DEBUG;
     shot(&mut h, "logs");
     h.state_mut().server.stop();

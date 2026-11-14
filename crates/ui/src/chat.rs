@@ -228,92 +228,17 @@ fn usable_models(app: &App) -> Vec<String> {
         .collect()
 }
 
-enum Status {
-    None,
-    Loading(String),
-    Ready(String),
-    Failed(String),
-}
-
-impl Status {
-    fn of(app: &mut App) -> Self {
-        let model = app.chat.conv().model.clone();
-        match (&app.loading, app.loaded()) {
-            (Some(name), _) => Status::Loading(name.clone()),
-            (None, Some(l)) => Status::Ready(l.display),
-            _ if app.chat.load_error.is_some() && !model.is_empty() => Status::Failed(model),
-            _ => Status::None,
-        }
-    }
-
-    fn model(&self) -> chat_ui::Model<'_> {
-        match self {
-            Status::None => chat_ui::Model::None,
-            Status::Loading(s) => chat_ui::Model::Loading(s),
-            Status::Ready(s) => chat_ui::Model::Ready(s),
-            Status::Failed(s) => chat_ui::Model::Failed(s),
-        }
-    }
-}
-
-fn picker(app: &mut App, ui: &mut egui::Ui) {
-    let model = app.chat.conv().model.clone();
-    let usable = usable_models(app);
-    ui.allocate_ui(egui::vec2(260.0, KEY_H), |ui| {
-        let mut m = model.clone();
-        let mut options: Vec<(String, String)> = usable.iter().map(|x| (x.clone(), x.clone())).collect();
-        if !model.is_empty() && !usable.contains(&model) {
-            options.insert(0, (model.clone(), model.clone()));
-        }
-        if choice(ui, "chat-model", &mut m, options) {
-            app.chat.conv().model = m;
-        }
-    });
-}
-
-fn load_key(app: &mut App, ui: &mut egui::Ui) {
-    let model = app.chat.conv().model.clone();
-    let loaded = app.loaded();
-    let is_loaded = loaded.as_ref().is_some_and(|l| l.display == model);
-    if app.loading.is_some() {
-        ui.add(Key::new("loading").outline(READOUT).enabled(false).min_width(100.0));
-    } else if is_loaded {
-        if ui.add(Key::new("unload").outline(FAULT).min_width(100.0)).clicked() {
-            app.unload();
-        }
-    } else {
-        let found = app.library.iter().find(|m| m.name == model).cloned();
-        if ui.add(Key::new("load").solid(READOUT).enabled(found.is_some()).min_width(100.0)).clicked()
-            && let Some(m) = found
-        {
-            app.chat.load_error = None;
-            app.load_model(&m);
-        }
-    }
-}
-
 fn header(app: &mut App, ui: &mut egui::Ui) {
-    let status = Status::of(app);
     let busy = app.chat.streaming();
     let mut toggle_settings = false;
-    chat_ui::header(ui, status.model(), busy, |ui| {
-        let label = if app.chat.show_settings { "hide settings" } else { "settings" };
+    let show = app.chat.show_settings;
+    crate::modelbar::draw(app, ui, busy, |ui| {
+        let label = if show { "hide settings" } else { "settings" };
         toggle_settings = ui.add(Key::new(label).outline(VALUE).min_width(100.0).id_salt("chat-settings")).clicked();
-        if let Some(g) = app.gpu.first() {
-            Line::new()
-                .legend("vram")
-                .measured(format!("{} / {}", human_size(g.used_bytes), human_size(g.total_bytes)))
-                .size(11.0)
-                .show(ui);
-        }
     });
     if toggle_settings {
         app.chat.show_settings = !app.chat.show_settings;
     }
-    ui.horizontal(|ui| {
-        picker(app, ui);
-        load_key(app, ui);
-    });
 }
 
 fn context_limit(app: &App) -> usize {
@@ -429,7 +354,7 @@ fn empty_state(app: &mut App, ui: &mut egui::Ui) {
             app.tab = Tab::Models;
         }
     } else {
-        chat_ui::welcome(ui, IDLE_HINT, "Pick a model above and load it. It stays loaded for every chat until you unload it.");
+        chat_ui::welcome(ui, IDLE_HINT, "Select a model above, choose its context length and load it. It stays loaded for every chat until you unload it.");
     }
 }
 
