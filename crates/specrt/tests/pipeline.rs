@@ -167,7 +167,7 @@ fn scheduled_through_pipeline(spec: &Spec, micro_batch: usize) -> (Vec<Vec<u32>>
     let prompts = scheduled_prompts(spec.dims.vocab as u32);
     let ids: Vec<u64> = prompts
         .iter()
-        .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: 16, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() }).unwrap())
+        .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: 16, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None }).unwrap())
         .collect();
     let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
     while !sched.idle() {

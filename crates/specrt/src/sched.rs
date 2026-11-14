@@ -1,6 +1,6 @@
 use crate::codegen::PAGE;
 use crate::prefix::{self, Hash, PrefixCache, StateSnapshot};
-use crate::runtime::{DecodeRow, PrefillPart, Runtime, Sampling, SpecRow, Stepper};
+use crate::runtime::{Mask, DecodeRow, PrefillPart, Runtime, Sampling, SpecRow, Stepper};
 use crate::spec::PrefixCacheOptions;
 use anyhow::{Result, bail};
 use std::collections::VecDeque;
@@ -153,6 +153,10 @@ pub trait Executor {
     fn supports_logprobs(&self) -> bool {
         false
     }
+    fn supports_grammar(&self) -> bool {
+        false
+    }
+    fn set_masks(&mut self, _rows: Vec<Option<Mask>>, _first: Option<Mask>) {}
     fn logits_of(&mut self, _at: LogitsAt) -> Result<Vec<f32>> {
         bail!("this executor cannot return logits")
     }
@@ -219,6 +223,14 @@ impl Executor for GpuExecutor {
 
     fn supports_logprobs(&self) -> bool {
         true
+    }
+
+    fn supports_grammar(&self) -> bool {
+        true
+    }
+
+    fn set_masks(&mut self, rows: Vec<Option<Mask>>, first: Option<Mask>) {
+        self.st.set_masks(rows, first)
     }
 
     fn logits_of(&mut self, at: LogitsAt) -> Result<Vec<f32>> {
@@ -397,6 +409,7 @@ pub struct Request {
     pub stop: Vec<u32>,
     pub salt: String,
     pub media: Vec<MediaInput>,
+    pub grammar: Option<Arc<crate::grammar::Grammar>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -446,6 +459,7 @@ struct Seq {
     cached: usize,
     keys: Vec<u32>,
     media: Option<Arc<crate::vision::MediaPlan>>,
+    cursor: Option<crate::grammar::Cursor>,
 }
 
 impl Seq {
@@ -598,8 +612,12 @@ impl<E: Executor> Scheduler<E> {
         if req.sampling.logprobs.is_some() && !self.exec.supports_logprobs() {
             bail!("logprobs are not available on this executor");
         }
+        if req.grammar.is_some() && !self.exec.supports_grammar() {
+            bail!("structured output is not available on this executor");
+        }
         let id = self.next_id;
         self.next_id += 1;
+        let cursor = req.grammar.as_ref().map(|g| g.cursor());
         let tokens = req.prompt.clone();
         let root = self.exec.prefix_root(&req.salt);
         let (media, keys) = if req.media.is_empty() {
@@ -623,6 +641,7 @@ impl<E: Executor> Scheduler<E> {
             cached: 0,
             keys,
             media,
+            cursor,
         });
         Ok(id)
     }
@@ -819,6 +838,13 @@ impl<E: Executor> Scheduler<E> {
         Ok(())
     }
 
+    fn row_masks(&self, rows: &[(usize, DecodeRow)]) -> Vec<Option<Mask>> {
+        if rows.iter().all(|(i, _)| self.running[*i].cursor.is_none()) {
+            return Vec::new();
+        }
+        rows.iter().map(|(i, _)| self.running[*i].cursor.as_ref().map(|c| c.mask())).collect()
+    }
+
     fn record_logprob(&mut self, i: usize, at: LogitsAt, t: u32, events: &mut Vec<Event>) -> Result<()> {
         let s = &self.running[i];
         let Some(top) = s.req.sampling.logprobs else { return Ok(()) };
@@ -872,7 +898,8 @@ impl<E: Executor> Scheduler<E> {
         let mut pending = !rows.is_empty();
         let cap = self.exec.speculation_cap();
         let wants_logprobs = rows.iter().any(|(i, _)| self.running[*i].req.sampling.logprobs.is_some());
-        if pending && rows.len() <= cap && !wants_logprobs {
+        let constrained = rows.iter().any(|(i, _)| self.running[*i].cursor.is_some());
+        if pending && rows.len() <= cap && !wants_logprobs && !constrained {
             pending = false;
             let started = Instant::now();
             let spec: Vec<SpecRow> = rows
@@ -935,13 +962,17 @@ impl<E: Executor> Scheduler<E> {
                 let slot = s.slot.expect("running has a slot");
                 let chunk = s.tokens[s.computed..s.computed + n].to_vec();
                 let start = s.computed;
+                let first = if sample.is_some() { s.cursor.as_ref().map(|c| c.mask()) } else { None };
                 let t = if pending {
                     pending = false;
+                    let masks = self.row_masks(&rows);
+                    self.exec.set_masks(masks, first);
                     let (next, t) = self.exec.fused(&plain, slot, &chunk, start, sample)?;
                     report.decode_rows = rows.len();
                     self.apply_decode(&rows, next, &mut done, events)?;
                     t
                 } else {
+                    self.exec.set_masks(Vec::new(), first);
                     self.exec.prefill(slot, &chunk, start, sample)?
                 };
                 if let Some(t) = t {
@@ -961,6 +992,8 @@ impl<E: Executor> Scheduler<E> {
         }
         if pending {
             let started = Instant::now();
+            let masks = self.row_masks(&rows);
+            self.exec.set_masks(masks, None);
             let next = self.exec.decode(&plain)?;
             report.decode_secs = started.elapsed().as_secs_f64();
             report.decode_rows = rows.len();
@@ -986,15 +1019,20 @@ impl<E: Executor> Scheduler<E> {
     }
 }
 
+fn stopped_by_token(s: &Seq) -> bool {
+    s.tokens.last().is_some_and(|t| s.req.stop.contains(t))
+}
+
 fn finish_of(s: &Seq) -> Finish {
-    match s.tokens.last() {
-        Some(t) if s.req.stop.contains(t) => Finish::Stop,
-        _ => Finish::Length,
+    if stopped_by_token(s) || s.cursor.as_ref().is_some_and(|c| c.finished()) {
+        Finish::Stop
+    } else {
+        Finish::Length
     }
 }
 
 fn finished(s: &Seq, finish: Finish) -> Event {
-    let completion = s.generated() - usize::from(finish == Finish::Stop);
+    let completion = s.generated() - usize::from(stopped_by_token(s));
     Event::Finished { id: s.id, finish, prompt_tokens: s.req.prompt.len(), completion_tokens: completion, cached_tokens: s.cached }
 }
 
@@ -1005,7 +1043,11 @@ fn accept(s: &mut Seq, t: u32, max_ctx: usize, events: &mut Vec<Event>) -> bool 
     if !stop {
         events.push(Event::Token { id: s.id, token: t });
     }
-    stop || s.generated() >= s.req.max_tokens || s.tokens.len() >= max_ctx
+    let grammar_done = s.cursor.as_mut().is_some_and(|c| {
+        c.advance(t);
+        c.finished()
+    });
+    stop || grammar_done || s.generated() >= s.req.max_tokens || s.tokens.len() >= max_ctx
 }
 
 #[cfg(test)]
@@ -1045,6 +1087,15 @@ mod tests {
         pub accept_counts: Vec<usize>,
         last_decode: Vec<u32>,
         last_prefill: Option<u32>,
+        masks: Vec<Option<Mask>>,
+        first_mask: Option<Mask>,
+        pub masked_calls: usize,
+        pub grammar: bool,
+    }
+
+    fn constrain(t: u32, mask: &Option<Mask>) -> u32 {
+        let Some(m) = mask else { return t };
+        (0..VOCAB).map(|d| (t + d) % VOCAB).find(|&c| m[c as usize / 32] >> (c % 32) & 1 == 1).unwrap_or(t)
     }
 
     impl Fake {
@@ -1071,6 +1122,10 @@ mod tests {
                 accept_counts: Vec::new(),
                 last_decode: Vec::new(),
                 last_prefill: None,
+                masks: Vec::new(),
+                first_mask: None,
+                masked_calls: 0,
+                grammar: true,
             }
         }
 
@@ -1133,18 +1188,28 @@ mod tests {
             for (i, &t) in tokens.iter().enumerate() {
                 h = self.write(slot, start + i, t);
             }
-            self.last_prefill = sample.map(|_| next_token(h));
+            let first = self.first_mask.take();
+            self.last_prefill = sample.map(|_| constrain(next_token(h), &first));
             Ok(self.last_prefill)
         }
         fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
             let mut seen = std::collections::HashSet::new();
             assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
             self.decode_calls.push(rows.len());
-            self.last_decode = rows.iter().map(|r| next_token(self.write(r.slot, r.pos, r.token))).collect();
+            let masks = std::mem::take(&mut self.masks);
+            self.masked_calls += usize::from(!masks.is_empty());
+            self.last_decode = rows.iter().enumerate().map(|(i, r)| constrain(next_token(self.write(r.slot, r.pos, r.token)), masks.get(i).unwrap_or(&None))).collect();
             Ok(self.last_decode.clone())
         }
         fn supports_logprobs(&self) -> bool {
             true
+        }
+        fn supports_grammar(&self) -> bool {
+            self.grammar
+        }
+        fn set_masks(&mut self, rows: Vec<Option<Mask>>, first: Option<Mask>) {
+            self.masks = rows;
+            self.first_mask = first;
         }
         fn logits_of(&mut self, at: LogitsAt) -> Result<Vec<f32>> {
             let t = match at {
@@ -1239,6 +1304,7 @@ mod tests {
             stop: Vec::new(),
             salt: String::new(),
             media: Vec::new(),
+            grammar: None,
         }
     }
 
@@ -1261,6 +1327,45 @@ mod tests {
             assert!(steps < 100_000, "the scheduler made no progress");
         }
         (out, all, reports)
+    }
+
+    fn json_grammar() -> Arc<crate::grammar::Grammar> {
+        let mut tokens = vec![Vec::new()];
+        tokens.extend((0u8..=255).map(|b| vec![b]));
+        tokens.resize(VOCAB as usize, Vec::new());
+        crate::grammar::Grammar::json_object(Arc::new(crate::grammar::TokenTable::new(tokens)), VOCAB as usize, vec![0])
+    }
+
+    fn is_json_object(tokens: &[u32]) -> bool {
+        let bytes: Vec<u8> = tokens.iter().filter(|&&t| (1..=256).contains(&t)).map(|&t| (t - 1) as u8).collect();
+        serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|v| v.is_object())
+    }
+
+    #[test]
+    fn constrained_requests_emit_a_json_object_and_finish_by_stop_even_with_a_spec_cap() {
+        let mut fake = Fake::new(4096, 4, 256, 64);
+        fake.spec_cap = 4;
+        fake.spec_k = 2;
+        let mut s = Scheduler::new(fake, Config { max_num_seqs: 4, ..Config::default() });
+        let g = json_grammar();
+        let ids: Vec<SeqId> = (0..3).map(|i| s.submit(Request { grammar: Some(g.clone()), ..request(20 + i, 300, i as u32) }).unwrap()).collect();
+        let plain = s.submit(request(20, 30, 9)).unwrap();
+        let (out, events, _) = drain(&mut s);
+        for id in ids {
+            assert!(is_json_object(&out[&id]), "{:?}", out[&id]);
+            assert!(events.iter().any(|e| matches!(e, Event::Finished { id: i, finish: Finish::Stop, .. } if *i == id)));
+        }
+        assert_eq!(out[&plain].len(), 30);
+        assert!(s.exec.masked_calls > 0);
+    }
+
+    #[test]
+    fn an_executor_without_grammar_support_refuses_a_constrained_request() {
+        let mut fake = Fake::new(4096, 2, 64, 64);
+        fake.grammar = false;
+        let mut s = Scheduler::new(fake, Config::default());
+        assert!(s.submit(Request { grammar: Some(json_grammar()), ..request(8, 8, 1) }).is_err());
+        assert!(s.submit(request(8, 8, 1)).is_ok());
     }
 
     #[test]

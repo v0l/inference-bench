@@ -1,4 +1,4 @@
-use super::step::{DecodeRow, Stepper, params};
+use super::step::{DecodeRow, MaskTarget, Stepper, params};
 use super::{DeviceMixer, GemmOut, Runtime, Sampling, cfg, grid};
 use anyhow::{Result, ensure};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -49,6 +49,7 @@ impl Runtime {
         self.seq = 0;
         ran?;
         let out_rows = nd + usize::from(sampled);
+        self.apply_masks(st, out_rows, nd, MaskTarget::Fused)?;
         let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
         b.arg(&st.bb.logits).arg(&st.bb.tokens).arg(&st.params);
         unsafe { b.launch(cfg(out_rows as u32, 1024)) }?;

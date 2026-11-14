@@ -68,7 +68,7 @@ fn executor(addr: &str) -> ChainExecutor {
 }
 
 fn request(n: usize) -> Request {
-    Request { prompt: (1..=n as u32).collect(), max_tokens: 4, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: vec![] }
+    Request { prompt: (1..=n as u32).collect(), max_tokens: 4, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: vec![], grammar: None }
 }
 
 fn drain(s: &mut Scheduler<ChainExecutor>) -> anyhow::Result<Vec<Event>> {

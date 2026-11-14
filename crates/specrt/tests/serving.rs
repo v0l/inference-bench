@@ -221,7 +221,7 @@ fn scheduled_spec_matches_single(s: &Spec) {
     let mut sched = Scheduler::new(exec, cfg);
     let mut ids = Vec::new();
     for (p, &n) in prompts.iter().zip(&new) {
-        ids.push(sched.submit(Request { prompt: p.clone(), max_tokens: n, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() }).unwrap());
+        ids.push(sched.submit(Request { prompt: p.clone(), max_tokens: n, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None }).unwrap());
     }
     let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
     let mut most = 0;
@@ -272,13 +272,13 @@ fn the_serving_core_streams_concurrent_jobs_and_cancels_within_a_step() {
     let mut rxs = Vec::new();
     for p in &prompts {
         let (tx, rx) = std::sync::mpsc::channel();
-        let request = Request { prompt: p.clone(), max_tokens: 30, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() };
+        let request = Request { prompt: p.clone(), max_tokens: 30, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None };
         core.submit(Job { request, events: tx, cancel: Arc::new(AtomicBool::new(false)) }).unwrap();
         rxs.push(rx);
     }
     let (tx, long_rx) = std::sync::mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    let request = Request { prompt: prompts[0].clone(), max_tokens: 500, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() };
+    let request = Request { prompt: prompts[0].clone(), max_tokens: 500, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None };
     core.submit(Job { request, events: tx, cancel: cancel.clone() }).unwrap();
     let mut seen = 0;
     let generated = loop {
@@ -354,7 +354,7 @@ fn prefix_cached_scheduler_matches_single(dir: &str) {
     let mut sched = Scheduler::new(exec, cfg);
     let ids: Vec<u64> = prompts
         .iter()
-        .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: 20, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new() }).unwrap())
+        .map(|p| sched.submit(Request { prompt: p.clone(), max_tokens: 20, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None }).unwrap())
         .collect();
     let mut got: std::collections::HashMap<u64, Vec<u32>> = Default::default();
     let mut cached = 0;
@@ -397,7 +397,7 @@ fn serving_logprobs_match_a_log_softmax_of_the_full_prompt_logits() {
     let mut rxs = Vec::new();
     for p in &prompts {
         let (tx, rx) = std::sync::mpsc::channel();
-        let request = Request { prompt: p.clone(), max_tokens: new, sampling: Sampling::GREEDY.with_logprobs(Some(3)), stop: vec![], salt: String::new(), media: Vec::new() };
+        let request = Request { prompt: p.clone(), max_tokens: new, sampling: Sampling::GREEDY.with_logprobs(Some(3)), stop: vec![], salt: String::new(), media: Vec::new(), grammar: None };
         core.submit(Job { request, events: tx, cancel: Arc::new(AtomicBool::new(false)) }).unwrap();
         rxs.push(rx);
     }

@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::{CudaGraph, CudaSlice, PushKernelArg};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 pub const GRAPH_SIZES: [usize; 6] = [1, 2, 4, 8, 16, 32];
 
@@ -27,9 +28,22 @@ pub struct DecodeRow {
     pub step: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaskTarget {
+    Decode,
+    Prefill,
+    Fused,
+}
+
+pub type Mask = Arc<Vec<u32>>;
+
 pub struct Stepper {
     pub(super) bb: BatchBuffers,
     pub(super) params: CudaSlice<i32>,
+    mask_bits: CudaSlice<u32>,
+    mask_flags: CudaSlice<i32>,
+    masks: Vec<Option<Mask>>,
+    first_mask: Option<Mask>,
     graphs: HashMap<usize, CudaGraph>,
     use_graphs: bool,
 }
@@ -37,6 +51,15 @@ pub struct Stepper {
 impl Stepper {
     pub fn set_graphs(&mut self, on: bool) {
         self.use_graphs = on;
+    }
+
+    pub fn set_masks(&mut self, rows: Vec<Option<Mask>>, first: Option<Mask>) {
+        self.masks = rows;
+        self.first_mask = first;
+    }
+
+    pub fn has_row_masks(&self) -> bool {
+        self.masks.iter().any(Option::is_some)
     }
 
     pub fn rows_for(&self, live: usize) -> usize {
@@ -74,9 +97,14 @@ impl Runtime {
             pos: self.stream.alloc_zeros(rows)?,
             slots: self.stream.alloc_zeros(rows)?,
         };
+        let words = self.spec.dims.vocab.div_ceil(32);
         Ok(Stepper {
             bb,
             params: self.stream.alloc_zeros(6 * rows)?,
+            mask_bits: self.stream.alloc_zeros(rows * words)?,
+            mask_flags: self.stream.alloc_zeros(rows)?,
+            masks: Vec::new(),
+            first_mask: None,
             graphs: HashMap::new(),
             use_graphs: self.spec.runtime.graphs,
         })
@@ -112,11 +140,42 @@ impl Runtime {
         self.mtp_after_prefill(slot, tokens, start)?;
         let Some((sampling, step)) = sample else { return Ok(None) };
         self.stream.memcpy_htod(&params(sampling, step), &mut st.params.slice_mut(..6))?;
+        self.apply_masks(st, 1, 0, MaskTarget::Prefill)?;
         let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
         b.arg(&self.buf.logits).arg(&st.bb.tokens).arg(&st.params);
         unsafe { b.launch(cfg(1, 1024)) }?;
         let token = self.stream.clone_dtoh(&st.bb.tokens.slice(..1))?;
         Ok(Some(token[0] as u32))
+    }
+
+    pub(super) fn apply_masks(&self, st: &mut Stepper, rows: usize, first_row: usize, target: MaskTarget) -> Result<()> {
+        let words = self.spec.dims.vocab.div_ceil(32);
+        let mut entries: Vec<(usize, Mask)> = Vec::new();
+        if target != MaskTarget::Prefill {
+            entries.extend(st.masks.drain(..).enumerate().filter_map(|(i, m)| m.map(|m| (i, m))));
+        }
+        if target != MaskTarget::Decode
+            && let Some(m) = st.first_mask.take()
+        {
+            entries.push((first_row, m));
+        }
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut flags = vec![0i32; rows];
+        for (row, mask) in entries {
+            ensure!(row < rows && mask.len() == words, "grammar mask does not fit the vocabulary");
+            self.stream.memcpy_htod(mask.as_slice(), &mut st.mask_bits.slice_mut(row * words..(row + 1) * words))?;
+            flags[row] = 1;
+        }
+        self.stream.memcpy_htod(&flags, &mut st.mask_flags.slice_mut(..rows))?;
+        let mut b = self.stream.launch_builder(self.kernel("apply_mask"));
+        let w = words as i32;
+        let logits = if target == MaskTarget::Prefill { &self.buf.logits } else { &st.bb.logits };
+        b.arg(logits).arg(&st.mask_bits).arg(&st.mask_flags).arg(&w);
+        let config = cudarc::driver::LaunchConfig { grid_dim: (rows as u32, 32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
     }
 
     fn decode_and_sample(&self, st: &Stepper, n: usize) -> Result<()> {
@@ -151,7 +210,13 @@ impl Runtime {
         self.stream.memcpy_htod(&pos, &mut st.bb.pos.slice_mut(..n))?;
         self.stream.memcpy_htod(&slots, &mut st.bb.slots.slice_mut(..n))?;
         self.stream.memcpy_htod(&p, &mut st.params.slice_mut(..6 * n))?;
-        if st.use_graphs {
+        if st.has_row_masks() {
+            self.decode_rows(&st.bb, n)?;
+            self.apply_masks(st, n, 0, MaskTarget::Decode)?;
+            let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
+            b.arg(&st.bb.logits).arg(&st.bb.tokens).arg(&st.params);
+            unsafe { b.launch(cfg(n as u32, 1024)) }?;
+        } else if st.use_graphs {
             if !st.graphs.contains_key(&n) {
                 let graph = self.capture_decode(st, n)?;
                 graph.upload()?;

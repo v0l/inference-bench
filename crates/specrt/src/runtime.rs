@@ -24,7 +24,7 @@ pub use fused::PrefillPart;
 use exec::Plans;
 pub use mtp::{SpecRow, SpecStats};
 pub use stage::{StageRange, StageRole};
-pub use step::{DecodeRow, GRAPH_SIZES, Stepper, pad_rows};
+pub use step::{DecodeRow, GRAPH_SIZES, Mask, Stepper, pad_rows};
 
 struct Plan {
     groups: Vec<Vec<String>>,

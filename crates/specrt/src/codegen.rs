@@ -697,6 +697,7 @@ pub const KERNELS: &[&str] = &[
     "argmax_rows",
     "bump",
     "sample_rows",
+    "apply_mask",
     "qkv_mma_narrow",
     "o_mma_narrow",
     "gate_up_mma_narrow",

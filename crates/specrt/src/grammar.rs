@@ -215,6 +215,12 @@ pub struct Grammar {
     cache: Mutex<HashMap<State, Arc<Vec<u32>>>>,
 }
 
+impl PartialEq for Grammar {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
 impl std::fmt::Debug for Grammar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Grammar(root {})", self.root)
@@ -549,6 +555,10 @@ impl Cursor {
 
     pub fn complete(&self) -> bool {
         self.grammar.complete(&self.state)
+    }
+
+    pub fn finished(&self) -> bool {
+        self.state.0.len() == 1 && self.state.0[0].is_empty()
     }
 }
 

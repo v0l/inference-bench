@@ -737,7 +737,7 @@ impl Serving {
         let max_tokens = crate::engine::output_budget(max_tokens, prompt.len(), self.core.max_model_len(), crate::spec::MAX_DRAFT_TOKENS, &self.assets.sampling);
         let (tx, rx) = channel();
         let stop = if use_stop { self.assets.stop.clone() } else { Vec::new() };
-        let request = sched::Request { prompt, max_tokens, sampling, stop, salt, media };
+        let request = sched::Request { prompt, max_tokens, sampling, stop, salt, media, grammar: None };
         self.core.submit(Job { request, events: tx, cancel: cancel.clone() })?;
         let tokenizer = &self.assets.tokenizer;
         let mut out = Completion::default();

@@ -2383,6 +2383,16 @@ __device__ float sample_threshold(const float* row, float inv_temp, int top_k, f
     return thr;
 }
 
+extern "C" __global__ void apply_mask(float* logits, const unsigned* mask, const int* flags, int words) {
+    int row = blockIdx.x;
+    if (!flags[row]) return;
+    logits += (size_t)row * VOCAB;
+    mask += (size_t)row * words;
+    for (int i = blockIdx.y * blockDim.x + threadIdx.x; i < VOCAB; i += gridDim.y * blockDim.x) {
+        if (!((mask[i >> 5] >> (i & 31)) & 1u)) logits[i] = NEG_INF;
+    }
+}
+
 extern "C" __global__ void sample_rows(const float* logits, int* tokens, const int* params) {
     __shared__ float best_v[1024];
     __shared__ int best_i[1024];
