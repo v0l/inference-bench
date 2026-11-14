@@ -1204,6 +1204,31 @@ fn screenshot_vision_tower_in_the_model_detail() {
     h.render().unwrap().save(out.join("detail-vision-tower.png")).unwrap();
 }
 
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshot_of_the_load_dialog_with_a_shared_kv_pool() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness("shot-load", Tab::Models);
+    with_gpu(&mut h, 50 << 30, 96 << 30);
+    let d = dir("shot-load-27b");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), d.join("config.json")).unwrap();
+    let mut m = model("Qwen3.8-27B", true, "dense decoder");
+    (m.path, m.root) = (d.clone(), d);
+    m.context_length = None;
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    let free = h.state().free_gpu_bytes();
+    let dialog = h.state_mut().load.as_mut().unwrap();
+    dialog.ctx = dialog.max;
+    dialog.seqs = 8;
+    let a = &dialog.view.as_ref().unwrap().anatomy;
+    dialog.kv_gb = crate::load::default_kv_gb(a, free, 8, dialog.ctx);
+    h.run();
+    h.render().unwrap().save(out.join("load-dialog-shared-kv.png")).unwrap();
+}
+
 fn tree_hub() -> String {
     use std::io::{BufRead, BufReader, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
