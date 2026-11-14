@@ -202,3 +202,7 @@ failed its model loads with CUDA out of memory, so its numbers are not recorded.
 single stream tok/s with graphs against `[runtime] graphs = false` (57 ms against 45 ms per token),
 `[runtime] fuse = false` against fused for 8 decoders beside a 29k prefill (aggregate tok/s and decoder
 stall max), and the vLLM comparison of the same `loadtest` mix (#307).
+
+## Structured output
+
+`response_format` accepts `json_object` and `json_schema` (`json_schema.schema`). A schema compiles into the grammar in `specrt::grammar` (type, properties, required, enum, const, items, anyOf/oneOf, single-entry allOf, local `$ref`, additionalProperties). Objects are strict by default, like xgrammar: keys not listed in `properties` are rejected. `additionalProperties: true` (or a schema) allows extra keys, and an object with no `properties` accepts any keys. Properties are emitted in declaration order. Schemas that cannot be compiled are a 400.
