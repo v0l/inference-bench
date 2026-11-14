@@ -271,17 +271,21 @@ fn open(
     progress: &specrt::progress::Sink,
 ) -> Result<Opened, BackendError> {
     let mut note = None;
-    if let Some(mut target) = (seqs > 1).then(|| serving(serve_options(max_ctx, seqs))).flatten() {
+    let attempts = if seqs > 1 { vec![seqs, 1] } else { Vec::new() };
+    for (n, attempt) in attempts.into_iter().enumerate() {
+        let Some(mut target) = serving(serve_options(max_ctx, attempt)) else { break };
         target.set_progress(Some(progress.clone()));
         match target.load(model_id) {
             Ok(()) => {
                 let caps = target.capabilities();
                 *stats.lock().unwrap() = target.share();
-                return Ok(Opened { backend: Backend::Batched { target, running: Vec::new() }, vision: caps.vision, thinking: caps.thinking, seqs, note });
+                return Ok(Opened { backend: Backend::Batched { target, running: Vec::new() }, vision: caps.vision, thinking: caps.thinking, seqs: attempt, note });
             }
             Err(e) => {
-                tracing::warn!(model = model_id, seqs, error = %e, "the batched engine could not load, loading with one sequence");
-                note = Some(format!("parallel requests off: {}", e.message));
+                tracing::warn!(model = model_id, seqs = attempt, error = %e, "the serving engine could not load");
+                if n == 0 {
+                    note = Some(format!("parallel requests off: {}", e.message));
+                }
             }
         }
     }
@@ -424,6 +428,7 @@ mod tests {
     use super::*;
     use crate::chat::{Message, Role, Sampling};
     use crate::fake::{Script, ScriptedModel};
+    use crate::target::{Capabilities, Request};
     use std::time::Duration;
 
     fn script() -> Script {
@@ -591,6 +596,45 @@ mod tests {
         assert!(e.loaded().is_none());
         assert!(h.serving_stats().is_none());
         drop(rxs);
+    }
+
+    struct NoParallel;
+
+    impl Target for NoParallel {
+        fn name(&self) -> &str {
+            "no-parallel"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn load(&mut self, _: &str) -> Result<(), BackendError> {
+            Err(BackendError::failed("the GPU ran out of memory: KV cache"))
+        }
+
+        fn generate(&mut self, _: &Request, _: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_failed_parallel_load_falls_back_to_the_serving_engine_with_one_sequence() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let inner = crate::fake::ScriptedServing::factory(slow_script());
+        let log = seen.clone();
+        let serving: ServingFactory = Arc::new(move |opts| {
+            log.lock().unwrap().push((opts.max_num_seqs, opts.kv_cache_tokens));
+            if opts.max_num_seqs > 1 { Some(Box::new(NoParallel) as Box<dyn Target>) } else { inner(opts) }
+        });
+        let e = Engine::with_factories(Arc::new(|| {}), ScriptedModel::factory(slow_script()), serving);
+        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: Some(4), served_names: Vec::new() });
+        wait_event(&e);
+        let EngineEvent::Loaded(l) = wait_event(&e) else { panic!("not loaded") };
+        assert_eq!(l.max_num_seqs, 1);
+        assert!(l.parallel_note.unwrap().starts_with("parallel requests off"));
+        assert_eq!(*seen.lock().unwrap(), vec![(4, Some(16384)), (1, Some(4096))]);
+        assert!(e.handle().serving_stats().is_some());
     }
 
     #[test]

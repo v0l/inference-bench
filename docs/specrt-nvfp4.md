@@ -785,3 +785,28 @@ after step 4, 450 / 880, 1,258 / 2,800, 366 / 801, 504 / 1,086. (The averages mi
 launches per kernel name, so they are the same ones across steps, not the p10 per-layer numbers of #413.)
 Tests: `tests/fp8_gemm.rs` (1, 64, 1,024 rows, every tile, per-token and block-128 scales against an f64
 product of the quantised inputs, error at most 1e-5 of the max), `tests/fp8_act.rs`.
+
+### App decode against the bench (#597)
+
+User report: about 50 tok/s in the app, 85 measured with MTP. Measured on the 27B NVFP4 through `inference-bench serve` on
+another port (262144 context, k = 2, `nvfp4_g16` draft head), vLLM holding 48 GB on the same card at the 300 W cap, 256 new
+tokens, `/metrics` `inference_spec_*` read before and after:
+
+| path | prompt | sampling | tok/s | drafted / accepted | acceptance length |
+|---|---|---|---|---|---|
+| `bench --speculative`, batch 1, 20 prompts | long | greedy | 85.6 | 4,174 / 3,013 | 2.44 |
+| same, MTP off | long | greedy | 42.1 | 0 | 1.00 |
+| serve, max_num_seqs 4 | 46 tokens | temperature 0 | 83.5 to 83.8 | 220 / 145 per request | 2.32 |
+| serve, max_num_seqs 4 | 46 tokens | 0.7, top_k 20, top_p 0.95 | 82.0 | 220 / 145 | 2.32 |
+| serve, max_num_seqs 4, chat | 24 tokens | 0.7, top_k 20, top_p 0.95 | 89.8 | 216 / 147 | 2.36 |
+| serve, max_num_seqs 4 | 13.4k tokens | 0 / 0.7 | 78.8 / 77.9 | 202 / 154, 200 / 155 | 2.53, 2.55 |
+| serve, max_num_seqs 1 | 24 tokens | 0.7, top_k 20, top_p 0.95 | 83.9 | 216 / 147 | 2.36 |
+
+The serving path runs MTP at batch 1 and under sampling (speculative sampling keeps acceptance at the greedy level), and the
+262144 x 4 pool does not slow decode. 50 tok/s is the speed without MTP (42 tok/s plain decode).
+
+The cause was in the app layer: `engine::open` loaded the serving engine only when `max_num_seqs > 1`, and when that load
+failed (the user's log shows `CUDA_ERROR_OUT_OF_MEMORY` in the KV cache beside vLLM, at 16:01 and 22:26) it fell back to the
+single-sequence `Native` runtime, which has no scheduler and no MTP. The fallback now retries the serving engine with one
+sequence, so MTP stays on; the load note still says parallel requests are off. Test:
+`a_failed_parallel_load_falls_back_to_the_serving_engine_with_one_sequence`.
