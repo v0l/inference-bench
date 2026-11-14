@@ -81,6 +81,12 @@ Each model runs one request at a time on the GPU; `max_concurrent` above 1 queue
 
 `inference_requests_total{endpoint,status}`, `inference_prompt_tokens_total{model}`, `inference_completion_tokens_total{model}`, `inference_ttft_seconds` (histogram), `inference_decode_tokens_per_second{window="last|mean"}`, `inference_queue_depth`, `inference_in_flight`, `inference_models_loaded`, `inference_model_vram_bytes{model}`, `inference_gpu_memory_used_bytes` (from `nvidia-smi`, falling back to the CUDA driver's free/total memory where nvidia-smi reports N/A, as on the GB10), `inference_requests_cancelled_total`, model load, failure and unload counters, `inference_specs_checks_total{result="updated|unchanged|failed"}` and `inference_specs_last_success_timestamp_seconds`.
 
+## App engine and the server tab
+
+In the desktop app the load dialog has a parallel requests slider (1 to 64, default 4, remembered per model). With more than one, the app engine loads through `specrt::serve` (the batched scheduler, `ServeOptions.max_num_seqs`), so chat and the app's OpenAI server share one engine and API requests run alongside chat. With 1 it is the plain single-request engine. The memory estimate counts the KV cache for that many sequences at the chosen context, plus the recurrent state per sequence on hybrid models. If the batched engine cannot load, the app falls back to one sequence and says so on the server tab.
+
+The server tab samples the engine once a second off the UI thread (`inference_bench_core::live`, 15 minutes kept) and shows requests per minute, running and waiting sequences, KV use, prefix hit rate, draft acceptance, preemptions, charts of generation and prompt tok/s, TTFT and inter-token p50 and p95, running sequences and KV, and a per-request table. Measured on Qwen3-0.6B (RTX PRO 6000, 4 concurrent requests of 400 tokens): 843 tok/s aggregate at 1 sequence, 2124 tok/s at 4 (`docs/gui/server-live.png`).
+
 ## Logging
 
 All crates use `tracing`. Flags (global on `inference-bench` and `inference-bench-server`):

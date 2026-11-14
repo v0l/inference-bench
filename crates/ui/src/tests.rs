@@ -598,6 +598,81 @@ fn the_metrics_section_shows_throughput_and_ttft_after_a_request() {
     h.state_mut().server.stop();
 }
 
+fn burst(url: &str, n: usize, tokens: usize) -> (f64, u64) {
+    let started = Instant::now();
+    let total: u64 = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..n)
+            .map(|i| {
+                scope.spawn(move || {
+                    let mut resp = ureq::post(format!("{url}/v1/chat/completions"))
+                        .send_json(serde_json::json!({"messages":[{"role":"user","content":format!("Write a long story about robot number {i}.")}],"max_tokens":tokens,"temperature":0.0,"ignore_eos":true}))
+                        .unwrap();
+                    let v: serde_json::Value = resp.body_mut().read_json().unwrap();
+                    v["usage"]["completion_tokens"].as_u64().unwrap()
+                })
+            })
+            .collect();
+        workers.into_iter().map(|w| w.join().unwrap()).sum()
+    });
+    (total as f64 / started.elapsed().as_secs_f64(), total)
+}
+
+#[test]
+#[ignore = "needs a GPU and Qwen3-0.6B in the hub cache; run with SHOTS=dir under flock /tmp/gpu27.lock"]
+fn parallel_requests_with_a_real_model_run_together_and_aggregate_faster() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let d = dir("parallel-real");
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 1500.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::new(d, wake_for(&cc.egui_ctx));
+        app.tab = Tab::Server;
+        app
+    });
+    pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
+    let qwen = h.state().library.iter().find(|m| m.name == "Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
+    let mut rates = Vec::new();
+    for seqs in [1usize, 4] {
+        h.state_mut().load_model_with(&qwen, 4096, seqs);
+        pump_until(&mut h, 180, "load", |a| a.loaded().is_some_and(|l| l.max_num_seqs == seqs));
+        if h.state().server.running.is_none() {
+            let handle = h.state().engine.handle();
+            h.state_mut().server.start(handle, 0, "", false);
+        }
+        let url = h.state().server.running.as_ref().unwrap().url();
+        let _ = burst(&url, 1, 8);
+        let handle = h.state().engine.handle();
+        let peak = std::sync::atomic::AtomicUsize::new(0);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let (rate, total) = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    peak.fetch_max(handle.reading().running, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let r = burst(&url, 4, 400);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            r
+        });
+        let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+        eprintln!("max_num_seqs {seqs}: 4 concurrent requests, {total} tokens, {rate:.1} tok/s aggregate, running peaked at {peak}");
+        rates.push((rate, peak));
+        for _ in 0..12 {
+            h.step();
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+        if seqs == 4 {
+            h.run();
+            h.render().unwrap().save(out.join("server-live.png")).unwrap();
+        }
+    }
+    assert_eq!(rates[0].1, 1);
+    assert_eq!(rates[1].1, 4);
+    assert!(rates[1].0 > rates[0].0 * 1.5, "{rates:?}");
+    h.state_mut().server.stop();
+}
+
 fn shared_logs() -> inference_bench_core::logging::LogBuffer {
     use tracing_subscriber::layer::SubscriberExt;
     static BUF: std::sync::OnceLock<inference_bench_core::logging::LogBuffer> = std::sync::OnceLock::new();
