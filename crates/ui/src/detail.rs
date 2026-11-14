@@ -2,7 +2,8 @@ use crate::App;
 use crate::{block, breakdown, engine, strip, table};
 use eframe::egui;
 use egui_bench::prelude::*;
-use inference_bench_core::library::{Format, LocalModel, human_size};
+use inference_bench_core::hf::{Hub, ModelTree, model_tree_now};
+use inference_bench_core::library::{Format, LocalModel, Lineage, Relation, human_size};
 use serde_json::Value;
 use specrt::anatomy::{LayerKind, ModelAnatomy};
 use specrt::spec::Spec;
@@ -105,6 +106,10 @@ pub struct Detail {
     pub compare: Option<String>,
     pub other: Option<Result<View, String>>,
     pub diagram: Diagram,
+    pub repo: String,
+    pub tree: Option<Result<ModelTree, String>>,
+    tree_job: crate::job::Pending<Result<ModelTree, String>>,
+    tree_started: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -132,12 +137,12 @@ impl Detail {
             Ok(v) if v.anatomy.count(LayerKind::DeltaNet) > 0 => LayerKind::DeltaNet,
             _ => LayerKind::Attention,
         };
-        Detail { model: m.name.clone(), view, kind, layer: None, compare: None, other: None, diagram: Diagram::default() }
+        Detail { model: m.name.clone(), view, kind, layer: None, compare: None, other: None, diagram: Diagram::default(), repo: m.repo.clone(), tree: None, tree_job: Default::default(), tree_started: false }
     }
 
     pub fn from_view(view: View) -> Self {
         let kind = if view.anatomy.count(LayerKind::DeltaNet) > 0 { LayerKind::DeltaNet } else { LayerKind::Attention };
-        Detail { model: view.name.clone(), view: Ok(view), kind, layer: None, compare: None, other: None, diagram: Diagram::default() }
+        Detail { model: view.name.clone(), view: Ok(view), kind, layer: None, compare: None, other: None, diagram: Diagram::default(), repo: String::new(), tree: None, tree_job: Default::default(), tree_started: false }
     }
 
     pub fn compare_with(&mut self, view: View) {
@@ -207,15 +212,79 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let Some(mut detail) = app.models.detail.take() else { return };
     let back = header(app, &mut detail, ui);
     if !back {
+        pump_tree(app, &mut detail);
         let free = app.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes));
-        body(&mut detail, ui, free);
+        let mut open = None;
+        body(&mut detail, ui, free, &mut open);
+        if let Some((relation, of)) = open {
+            let token = app.settings.hf_token.clone();
+            let wake = app.wake.clone();
+            app.models.discover_relation(&wake, &token, relation, &of);
+            app.models.detail = None;
+            return;
+        }
         app.models.detail = Some(detail);
     }
 }
 
-fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>) {
+fn pump_tree(app: &mut App, detail: &mut Detail) {
+    if let Some(r) = detail.tree_job.poll() {
+        detail.tree = Some(r);
+    }
+    if detail.tree_started || detail.repo.is_empty() {
+        return;
+    }
+    detail.tree_started = true;
+    let known: Vec<(String, Lineage)> = app.library.iter().filter_map(|m| m.lineage.clone().map(|l| (m.repo.clone(), l))).collect();
+    let (base, token, repo) = (app.models.hub_base.clone(), app.settings.hf_token.clone(), detail.repo.clone());
+    let cache = app.dir.join("model-tree-cache.json");
+    detail.tree_job.start(crate::job::spawn(&app.wake, move || {
+        let local = |r: &str| known.iter().find(|(k, _)| k == r).map(|(_, l)| l.clone());
+        model_tree_now(&Hub::new(&base, &token), &repo, &local, &cache)
+    }));
+}
+
+fn tree_section(detail: &Detail, ui: &mut egui::Ui, open: &mut Option<(Relation, String)>) {
+    if detail.repo.is_empty() {
+        return;
+    }
+    section(ui, "model tree", "where this model comes from, and what others were made from its base", |ui| {
+        match &detail.tree {
+            None => note(ui, "looking up the base model", LEGEND),
+            Some(Err(e)) => status(ui, false, e),
+            Some(Ok(t)) => {
+                for (depth, name) in t.chain.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(depth as f32 * 18.0);
+                        if depth > 0 {
+                            let relation = t.relations.get(depth - 1).cloned().unwrap_or_default();
+                            chip(ui, &relation, READOUT_DIM, false);
+                        }
+                        ui.label(crate::models::name_job(name, 12.5, false));
+                    });
+                }
+                if t.chain.len() == 1 {
+                    note(ui, "no base model is listed for this repo", LEGEND);
+                }
+                let top = t.chain[t.chain.len() - 1].clone();
+                ui.horizontal_wrapped(|ui| {
+                    for (label, n) in &t.counts {
+                        let Some(relation) = Relation::parse(label) else { continue };
+                        let text = format!("{} {n}", relation.plural());
+                        if ui.add(Key::new(text).outline(READOUT).id_salt(("tree-count", label))).clicked() {
+                            *open = Some((relation, top.clone()));
+                        }
+                    }
+                });
+            }
+        }
+    });
+}
+
+fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, open: &mut Option<(Relation, String)>) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
+        tree_section(detail, ui, open);
         content(detail, ui, free);
     });
 }

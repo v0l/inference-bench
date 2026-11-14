@@ -4,7 +4,7 @@ use crate::App;
 use eframe::egui;
 use egui_bench::prelude::*;
 use inference_bench_core::hf::{self, Hub, Progress, Repo, RepoFile};
-use inference_bench_core::library::{self, LocalModel, human_size};
+use inference_bench_core::library::{self, LocalModel, Relation, human_size};
 use inference_bench_core::target::NATIVE;
 use std::sync::mpsc::{Receiver, channel};
 
@@ -38,6 +38,8 @@ pub struct ModelsState {
     rescan: bool,
     pub message: Option<(bool, String)>,
     pub detail: Option<crate::detail::Detail>,
+    pub tree_view: bool,
+    pub relation: Option<(Relation, String)>,
 }
 
 impl Default for ModelsState {
@@ -58,6 +60,8 @@ impl Default for ModelsState {
             rescan: false,
             message: None,
             detail: None,
+            tree_view: true,
+            relation: None,
         }
     }
 }
@@ -110,7 +114,18 @@ impl ModelsState {
 
     fn start_search(&mut self, app_wake: &inference_bench_core::engine::Wake, token: &str) {
         let (base, token, q) = (self.hub_base.clone(), token.to_string(), self.query.trim().to_string());
-        self.search.start(job::spawn(app_wake, move || Hub::new(&base, &token).search(&q, 25)));
+        match self.relation.clone() {
+            Some((relation, of)) => self.search.start(job::spawn(app_wake, move || Hub::new(&base, &token).children(&of, relation, 25))),
+            None => self.search.start(job::spawn(app_wake, move || Hub::new(&base, &token).search(&q, 25))),
+        }
+    }
+
+    pub fn discover_relation(&mut self, wake: &inference_bench_core::engine::Wake, token: &str, relation: Relation, of: &str) {
+        self.relation = Some((relation, of.to_string()));
+        self.pane = Pane::Discover;
+        self.results.clear();
+        self.picked = None;
+        self.start_search(wake, token);
     }
 
     fn open_repo(&mut self, wake: &inference_bench_core::engine::Wake, token: &str, repo: &str) {
@@ -162,7 +177,8 @@ pub fn reveal(model: &LocalModel) {
 }
 
 pub fn matches(model: &LocalModel, query: &str) -> bool {
-    let haystack = format!("{} {} {} {} {}", model.name, model.repo, model.architecture, model.quant, model.format.label()).to_lowercase();
+    let base = model.lineage.as_ref().map(|l| l.bases.join(" ")).unwrap_or_default();
+    let haystack = format!("{} {} {} {} {} {}", model.name, model.repo, base, model.architecture, model.quant, model.format.label()).to_lowercase();
     query.split_whitespace().all(|word| haystack.contains(&word.to_lowercase()))
 }
 
@@ -179,16 +195,68 @@ pub fn support_chip(ui: &mut egui::Ui, model: &LocalModel) {
     resp.on_hover_text(if s.supported { s.reason.clone() } else { format!("unsupported architecture ({})", s.reason) });
 }
 
-fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
+pub fn name_job(name: &str, size: f32, dim: bool) -> egui::text::LayoutJob {
+    let (org, rest) = match name.split_once('/') {
+        Some((org, rest)) => (format!("{org}/"), rest),
+        None => (String::new(), name),
+    };
+    let mut job = egui::text::LayoutJob::default();
+    let format = |color| egui::TextFormat { font_id: legend_font(size), color, ..Default::default() };
+    job.append(&org, 0.0, format(LEGEND));
+    job.append(rest, 0.0, format(if dim { LEGEND } else { VALUE }));
+    job
+}
+
+pub fn is_loaded(app: &App, m: &LocalModel) -> bool {
+    app.loaded().is_some_and(|l| l.model_id == m.model_id(NATIVE))
+}
+
+fn base_card(app: &mut App, ui: &mut egui::Ui, name: &str, depth: usize) {
+    ui.horizontal_top(|ui| {
+        ui.add_space(depth as f32 * 22.0);
+        ui.vertical(|ui| {
+            card(
+                ui,
+                None,
+                |ui| {
+                    ui.label(name_job(name, 13.5, true));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        chip(ui, "base model", LEGEND, false);
+                    });
+                },
+                |ui| {
+                    Line::new().note("not downloaded").size(10.5).show(ui);
+                    if ui.add(Key::new("find on hugging face").outline(READOUT).id_salt(("find-base", name))).clicked() {
+                        app.models.query = name.to_string();
+                        app.models.relation = None;
+                        app.models.pane = Pane::Discover;
+                    }
+                },
+            );
+        });
+    });
+}
+
+fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize, depth: usize, relation: Option<Relation>) {
+    ui.horizontal_top(|ui| {
+        ui.add_space(depth as f32 * 22.0);
+        ui.vertical(|ui| model_card_body(app, ui, i, relation));
+    });
+}
+
+fn model_card_body(app: &mut App, ui: &mut egui::Ui, i: usize, relation: Option<Relation>) {
     let m = app.library[i].clone();
-    let loaded = app.loaded().is_some_and(|l| l.display == m.name);
+    let loaded = is_loaded(app, &m);
     card(
         ui,
         if loaded { Some(OK) } else { None },
         |ui| {
-            ui.label(egui::RichText::new(&m.name).font(legend_font(13.5)).color(VALUE));
+            ui.label(name_job(&m.name, 13.5, false));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 chip(ui, m.format.label(), LEGEND, false);
+                if let Some(r) = relation {
+                    chip(ui, r.label(), READOUT_DIM, false);
+                }
                 if loaded {
                     chip(ui, "loaded", OK, true);
                 }
@@ -314,9 +382,22 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     });
+    let mut grouped = app.models.tree_view;
+    if switch(ui, "group by base model", &mut grouped, "", "") {
+        app.models.tree_view = grouped;
+    }
     specs_bar(app, ui);
-    for &i in &visible {
-        model_card(app, ui, i);
+    if app.models.tree_view {
+        for row in inference_bench_core::library::tree(&app.library, &visible) {
+            match row.index {
+                Some(i) => model_card(app, ui, i, row.depth, row.relation),
+                None => base_card(app, ui, &row.name, row.depth),
+            }
+        }
+    } else {
+        for &i in &visible {
+            model_card(app, ui, i, 0, None);
+        }
     }
     if n == 0 && !app.scan.busy() {
         note(ui, "no models found: download one from discover, or add a folder in settings", LEGEND);
@@ -333,7 +414,17 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
         go = ui.add(Key::new(if busy { "searching" } else { "search" }).solid(READOUT).enabled(!busy)).clicked();
     });
     if go {
+        app.models.relation = None;
         app.models.start_search(&app.wake, &token);
+    }
+    if let Some((relation, of)) = app.models.relation.clone() {
+        ui.horizontal(|ui| {
+            Line::new().legend(relation.plural()).gap(8.0).legend("of").gap(4.0).value(of).show(ui);
+            if ui.add(Key::new("clear filter").outline(VALUE)).clicked() {
+                app.models.relation = None;
+                app.models.results.clear();
+            }
+        });
     }
     if let Some((ok, text)) = &app.models.message {
         status(ui, *ok, text);
@@ -346,7 +437,7 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
             ui,
             if on { Some(READOUT) } else { None },
             |ui| {
-                ui.label(egui::RichText::new(&r.id).font(legend_font(13.0)).color(VALUE));
+                ui.label(name_job(&r.id, 13.0, false));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     Line::new().legend("downloads").measured(r.downloads.to_string()).gap(10.0).legend("likes").measured(r.likes.to_string()).size(11.0).show(ui);
                 });
