@@ -661,6 +661,20 @@ fn response_format_json_object_is_served_by_the_batched_engine() {
 }
 
 #[test]
+fn response_format_json_schema_is_served_and_bad_schemas_are_a_400() {
+    let rig = compat_rig();
+    let schema = json!({"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]});
+    let ok = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": schema}}});
+    let (status, text, _) = rig.post("/v1/chat/completions", None, ok);
+    assert_eq!(status, 200, "{text}");
+    let bad = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "wat"}}}});
+    let (status, text, _) = rig.post("/v1/chat/completions", None, bad);
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("response_format"), "{text}");
+    rig.stop();
+}
+
+#[test]
 fn response_format_json_object_is_a_clear_400_on_the_single_sequence_engine() {
     let rig = start(config("[[models]]\nid='m'"), Shape::default());
     let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_object"}});

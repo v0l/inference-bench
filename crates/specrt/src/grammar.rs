@@ -111,6 +111,131 @@ impl Compiled {
         let id = self.lit_id(bytes);
         self.push(Node::Lit(id))
     }
+
+    fn from_schema(schema: &Value) -> Result<(Self, u32), String> {
+        let mut c = Compiled::new();
+        let mut refs = HashMap::new();
+        let root = c.schema(schema, schema, &mut refs, 0)?;
+        Ok((c, root))
+    }
+
+    fn schema(&mut self, root: &Value, s: &Value, refs: &mut HashMap<String, u32>, depth: usize) -> Result<u32, String> {
+        if depth > 64 {
+            return Err("schema nests too deeply".into());
+        }
+        let obj = match s {
+            Value::Bool(true) => return Ok(ANY),
+            Value::Bool(false) => return Err("schema false matches nothing".into()),
+            Value::Object(o) => o,
+            _ => return Err("a schema must be an object or a boolean".into()),
+        };
+        if let Some(r) = obj.get("$ref") {
+            let path = r.as_str().ok_or("$ref must be a string")?;
+            if let Some(&id) = refs.get(path) {
+                return Ok(id);
+            }
+            let pointer = path.strip_prefix('#').ok_or_else(|| format!("only local $ref is supported, got {path:?}"))?;
+            let target = root.pointer(pointer).ok_or_else(|| format!("$ref {path:?} does not resolve"))?;
+            let id = self.push(Node::AnyOf(Vec::new()));
+            refs.insert(path.to_string(), id);
+            let inner = self.schema(root, target, refs, depth + 1)?;
+            if inner == id {
+                return Err(format!("$ref {path:?} refers to itself"));
+            }
+            self.nodes[id as usize] = Node::AnyOf(vec![inner]);
+            return Ok(id);
+        }
+        if let Some(v) = obj.get("const") {
+            return Ok(self.values(std::slice::from_ref(v)));
+        }
+        if let Some(v) = obj.get("enum") {
+            let list = v.as_array().filter(|a| !a.is_empty()).ok_or("enum must be a non-empty array")?;
+            return Ok(self.values(list));
+        }
+        for key in ["anyOf", "oneOf"] {
+            if let Some(v) = obj.get(key) {
+                let list = v.as_array().filter(|a| !a.is_empty()).ok_or_else(|| format!("{key} must be a non-empty array"))?;
+                let mut alts = Vec::new();
+                for item in list {
+                    alts.push(self.schema(root, item, refs, depth + 1)?);
+                }
+                return Ok(self.push(Node::AnyOf(alts)));
+            }
+        }
+        if let Some(v) = obj.get("allOf") {
+            return match v.as_array().map(|a| a.as_slice()) {
+                Some([one]) => self.schema(root, one, refs, depth + 1),
+                _ => Err("allOf is only supported with a single schema".into()),
+            };
+        }
+        match obj.get("type") {
+            Some(Value::String(t)) => self.typed(root, obj, t, refs, depth),
+            Some(Value::Array(types)) if !types.is_empty() => {
+                let mut alts = Vec::new();
+                for t in types {
+                    alts.push(self.typed(root, obj, t.as_str().ok_or("type entries must be strings")?, refs, depth)?);
+                }
+                Ok(self.push(Node::AnyOf(alts)))
+            }
+            Some(_) => Err("type must be a string or a non-empty array".into()),
+            None if obj.contains_key("properties") => self.typed(root, obj, "object", refs, depth),
+            None if obj.contains_key("items") => self.typed(root, obj, "array", refs, depth),
+            None => Ok(ANY),
+        }
+    }
+
+    fn values(&mut self, list: &[Value]) -> u32 {
+        let alts: Vec<u32> = list.iter().map(|v| self.literal(v.to_string().as_bytes())).collect();
+        if alts.len() == 1 { alts[0] } else { self.push(Node::AnyOf(alts)) }
+    }
+
+    fn typed(&mut self, root: &Value, obj: &serde_json::Map<String, Value>, t: &str, refs: &mut HashMap<String, u32>, depth: usize) -> Result<u32, String> {
+        Ok(match t {
+            "string" => self.push(Node::Str),
+            "number" => self.push(Node::Num { int: false }),
+            "integer" => self.push(Node::Num { int: true }),
+            "boolean" => {
+                let a = self.literal(b"true");
+                let b = self.literal(b"false");
+                self.push(Node::AnyOf(vec![a, b]))
+            }
+            "null" => self.literal(b"null"),
+            "array" => {
+                let items = match obj.get("items") {
+                    Some(i) => self.schema(root, i, refs, depth + 1)?,
+                    None => ANY,
+                };
+                self.push(Node::Array { items })
+            }
+            "object" => {
+                let required: Vec<&str> = obj.get("required").and_then(|r| r.as_array()).map(|r| r.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+                let mut props = Vec::new();
+                if let Some(p) = obj.get("properties") {
+                    for (name, sub) in p.as_object().ok_or("properties must be an object")? {
+                        let key = self.lit_id(Value::String(name.clone()).to_string().as_bytes());
+                        let node = self.schema(root, sub, refs, depth + 1)?;
+                        props.push(Prop { key, node, required: required.contains(&name.as_str()) });
+                    }
+                }
+                for name in &required {
+                    if !obj.get("properties").is_some_and(|p| p.get(*name).is_some()) {
+                        return Err(format!("required property {name:?} is not declared in properties"));
+                    }
+                }
+                let extra = if !props.is_empty() {
+                    None
+                } else {
+                    match obj.get("additionalProperties") {
+                        None | Some(Value::Bool(true)) => Some(ANY),
+                        Some(Value::Bool(false)) => None,
+                        Some(sub) => Some(self.schema(root, sub, refs, depth + 1)?),
+                    }
+                };
+                self.push(Node::Object { props, extra })
+            }
+            other => return Err(format!("unsupported type {other:?}")),
+        })
+    }
 }
 
 pub struct TokenTable {
@@ -586,7 +711,11 @@ pub fn parse_response_format(value: &Value) -> Result<Option<Schema>, String> {
     match value["type"].as_str() {
         Some("text") => Ok(None),
         Some("json_object") => Ok(Some(Schema::Object)),
-        Some("json_schema") => Err("response_format json_schema is not supported yet".into()),
+        Some("json_schema") => {
+            let schema = value["json_schema"].get("schema").ok_or("json_schema needs a schema")?;
+            Compiled::from_schema(schema)?;
+            Ok(Some(Schema::Json(schema.clone())))
+        }
         Some(other) => Err(format!("response_format type {other:?} is not supported")),
         None => Err("response_format needs a type".into()),
     }
@@ -595,12 +724,17 @@ pub fn parse_response_format(value: &Value) -> Result<Option<Schema>, String> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Schema {
     Object,
+    Json(Value),
 }
 
 impl Schema {
     pub fn build(&self, table: Arc<TokenTable>, vocab: usize, stop: Vec<u32>) -> Arc<Grammar> {
         match self {
             Schema::Object => Grammar::json_object(table, vocab, stop),
+            Schema::Json(schema) => {
+                let (compiled, root) = Compiled::from_schema(schema).expect("schema was validated when parsed");
+                Arc::new(Grammar { compiled, root, table, vocab, stop, cache: Mutex::new(HashMap::new()) })
+            }
         }
     }
 }
@@ -722,6 +856,106 @@ mod tests {
         assert_eq!(token_bytes("<0x41>"), b"A");
         assert_eq!(token_bytes("\u{2581}the"), b" the");
         assert_eq!(token_bytes("{\""), b"{\"");
+    }
+
+    fn validate(schema: &Value, root: &Value, v: &Value) -> bool {
+        if let Some(r) = schema.get("$ref") {
+            return validate(root.pointer(r.as_str().unwrap().trim_start_matches('#')).unwrap(), root, v);
+        }
+        if let Some(e) = schema.get("enum") {
+            return e.as_array().unwrap().contains(v);
+        }
+        if let Some(a) = schema.get("anyOf") {
+            return a.as_array().unwrap().iter().any(|s| validate(s, root, v));
+        }
+        match schema["type"].as_str().unwrap_or("") {
+            "string" => v.is_string(),
+            "integer" => v.is_i64() || v.is_u64() || v.as_f64().is_some_and(|f| f.fract() == 0.0),
+            "number" => v.is_number(),
+            "boolean" => v.is_boolean(),
+            "null" => v.is_null(),
+            "array" => v.as_array().is_some_and(|a| a.iter().all(|x| validate(&schema["items"], root, x))),
+            "object" => {
+                let Some(o) = v.as_object() else { return false };
+                let props = schema["properties"].as_object().unwrap();
+                let required = schema["required"].as_array().map(|r| r.iter().all(|k| o.contains_key(k.as_str().unwrap()))).unwrap_or(true);
+                required && o.iter().all(|(k, x)| props.get(k).is_some_and(|s| validate(s, root, x)))
+            }
+            _ => true,
+        }
+    }
+
+    fn random_output(g: &Arc<Grammar>, seed: u64) -> Option<Vec<u8>> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut c = g.cursor();
+        let mut out = Vec::new();
+        for _ in 0..400 {
+            let m = c.mask();
+            let allowed: Vec<u32> = (0..257u32).filter(|&t| m[t as usize / 32] >> (t % 32) & 1 == 1).collect();
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let t = allowed[(state >> 33) as usize % allowed.len()];
+            if t == EOS {
+                return Some(out);
+            }
+            assert!(c.advance(t));
+            out.push((t - 1) as u8);
+        }
+        None
+    }
+
+    fn schema_value() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+                "kind": {"enum": ["a", "bc", 7, null]},
+                "tags": {"type": "array", "items": {"type": "boolean"}},
+                "child": {"$ref": "#/$defs/leaf"},
+                "either": {"anyOf": [{"type": "number"}, {"type": "null"}]}
+            },
+            "required": ["name", "age"],
+            "additionalProperties": false,
+            "$defs": {"leaf": {"type": "object", "properties": {"x": {"type": "integer"}, "next": {"$ref": "#/$defs/leaf"}}, "required": ["x"]}}
+        })
+    }
+
+    #[test]
+    fn json_schema_outputs_validate_over_many_seeds() {
+        let schema = schema_value();
+        let g = Schema::Json(schema.clone()).build(single_bytes(), 257, vec![EOS]);
+        let mut finished = 0;
+        for seed in 0..300 {
+            let Some(bytes) = random_output(&g, seed) else { continue };
+            let v: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(e) if e.to_string().contains("number out of range") => continue,
+                Err(e) => panic!("{e}: {}", String::from_utf8_lossy(&bytes)),
+            };
+            assert!(validate(&schema, &schema, &v), "{v}");
+            finished += 1;
+        }
+        assert!(finished >= 30, "only {finished} finished");
+    }
+
+    #[test]
+    fn json_schema_accepts_and_rejects() {
+        let schema = schema_value();
+        let g = Schema::Json(schema).build(single_bytes(), 257, vec![EOS]);
+        assert!(accepts(&g, r#"{"name":"x","age":-3}"#));
+        assert!(accepts(&g, r#"{"name":"x","age":3,"kind":"bc","tags":[true,false],"child":{"x":1,"next":{"x":2}},"either":1.5}"#));
+        for bad in [r#"{"name":"x"}"#, r#"{"name":1,"age":1}"#, r#"{"name":"x","age":1.5}"#, r#"{"name":"x","age":1,"zzz":1}"#, r#"{"name":"x","age":1,"kind":"b"}"#, r#"{"name":"x","age":1,"tags":[1]}"#, r#"{"age":1,"name":"x"}"#, "[]"] {
+            assert!(!accepts(&g, bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn json_schema_rejects_what_it_cannot_compile() {
+        use serde_json::json;
+        for bad in [json!({"type": "wat"}), json!({"$ref": "http://x"}), json!({"$ref": "#/nope"}), json!({"$ref": "#"}), json!({"type": "object", "required": ["a"]})] {
+            assert!(parse_response_format(&json!({"type": "json_schema", "json_schema": {"schema": bad}})).is_err(), "{bad}");
+        }
+        assert!(parse_response_format(&json!({"type": "json_schema", "json_schema": {"name": "x"}})).is_err());
     }
 
     #[test]
