@@ -7,13 +7,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const CODELOAD: &str = "https://codeload.github.com";
+pub const GITHUB_API: &str = "https://api.github.com";
 pub const DEFAULT_REPO: &str = "v0l/inference-bench";
 pub const DEFAULT_BRANCH: &str = "master";
 pub const DEFAULT_HOURS: u64 = 24;
 pub const KEEP_GENERATIONS: usize = 3;
-const SPECS_PATH: [&str; 3] = ["crates", "specrt", "specs"];
-const MAX_UNPACKED: u64 = 512 << 20;
+const SPECS_DIR: &str = "crates/specrt/specs";
+const LISTING_LIMIT: u64 = 4 << 20;
 const META: &str = ".meta.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,8 +37,8 @@ impl Default for SpecsConfig {
             branch: DEFAULT_BRANCH.into(),
             tag: String::new(),
             update_hours: DEFAULT_HOURS,
-            base: std::env::var("INFERENCE_BENCH_SPECS_URL").unwrap_or_else(|_| CODELOAD.into()),
-            max_download: 64 << 20,
+            base: std::env::var("INFERENCE_BENCH_SPECS_URL").unwrap_or_else(|_| GITHUB_API.into()),
+            max_download: 8 << 20,
             max_spec: 256 << 10,
             timeout: Duration::from_secs(60),
         }
@@ -59,7 +59,12 @@ impl SpecsConfig {
     }
 
     pub fn url(&self) -> String {
-        format!("{}/{}/tar.gz/{}", self.base.trim_end_matches('/'), self.repo.trim(), self.git_ref())
+        format!("{}/repos/{}/commits/{}", self.base.trim_end_matches('/'), self.repo.trim(), encode_path(&self.git_ref()))
+    }
+
+    fn contents_url(&self, commit: &str, file: Option<&str>) -> String {
+        let tail = file.map(|f| format!("/{f}")).unwrap_or_default();
+        format!("{}/repos/{}/contents/{SPECS_DIR}{tail}?ref={commit}", self.base.trim_end_matches('/'), self.repo.trim())
     }
 
     pub fn interval(&self) -> Option<Duration> {
@@ -274,48 +279,70 @@ struct Extracted {
     too_large: Vec<String>,
 }
 
-fn extract(bytes: &[u8], max_spec: u64) -> Result<Extracted> {
-    let gz = flate2::read::GzDecoder::new(bytes).take(MAX_UNPACKED);
-    let mut archive = tar::Archive::new(gz);
-    let mut out = Extracted::default();
-    for entry in archive.entries().context("reading the spec archive")? {
-        let mut entry = entry.context("reading the spec archive")?;
-        if entry.header().entry_type().is_pax_global_extensions() {
-            if let Ok(Some(ext)) = entry.pax_extensions() {
-                for e in ext.flatten() {
-                    if e.key() == Ok("comment") {
-                        out.commit = e.value().ok().map(|v| v.trim().to_string());
-                    }
-                }
-            }
+fn encode_path(text: &str) -> String {
+    let mut out = String::new();
+    for b in text.bytes() {
+        match b {
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn get(agent: &ureq::Agent, url: &str, accept: &str) -> Result<ureq::http::Response<ureq::Body>> {
+    let resp = agent.get(url).header("Accept", accept).header("User-Agent", "inference-bench").call().with_context(|| format!("fetching {url}"))?;
+    let status = resp.status().as_u16();
+    if status != 200 {
+        bail!("{url} answered {status}");
+    }
+    Ok(resp)
+}
+
+fn download(cfg: &SpecsConfig, agent: &ureq::Agent, commit: &str) -> Result<Extracted> {
+    let listing_url = cfg.contents_url(commit, None);
+    let mut resp = get(agent, &listing_url, "application/vnd.github+json")?;
+    let text = resp
+        .body_mut()
+        .with_config()
+        .limit(LISTING_LIMIT)
+        .read_to_string()
+        .with_context(|| format!("{listing_url}: listing over {LISTING_LIMIT} bytes or broken"))?;
+    let listing: serde_json::Value = serde_json::from_str(&text).with_context(|| format!("{listing_url} is not a directory listing"))?;
+    let entries = listing.as_array().with_context(|| format!("{listing_url} is not a directory listing"))?;
+    let mut out = Extracted { commit: Some(commit.to_string()), ..Extracted::default() };
+    let mut wanted = Vec::new();
+    let mut total = 0u64;
+    for entry in entries {
+        let name = entry.get("name").and_then(|n| n.as_str()).unwrap_or_default();
+        let is_file = entry.get("type").and_then(|t| t.as_str()) == Some("file");
+        if !is_file || !plain_toml(name) {
+            tracing::warn!(entry = %name, "ignoring a listing entry that is not a plain .toml spec");
+            out.ignored.push(name.to_string());
             continue;
         }
-        let path = String::from_utf8_lossy(&entry.path_bytes()).into_owned();
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() < 5 || parts[1..4] != SPECS_PATH {
+        let size = entry.get("size").and_then(|n| n.as_u64()).unwrap_or(0);
+        if size > cfg.max_spec {
+            tracing::warn!(entry = %name, bytes = size, max_spec = cfg.max_spec, "ignoring a spec file over the size cap");
+            out.too_large.push(name.to_string());
             continue;
         }
-        let top_ok = !parts[0].is_empty() && !parts[0].starts_with('.');
-        if parts.len() == 5 && parts[4].is_empty() {
-            continue;
-        }
-        if !top_ok || parts.len() != 5 || !plain_toml(parts[4]) || !entry.header().entry_type().is_file() {
-            tracing::warn!(entry = %path, "ignoring an archive entry that is not a plain .toml spec");
-            out.ignored.push(path);
-            continue;
-        }
-        if entry.size() > max_spec {
-            tracing::warn!(entry = %path, bytes = entry.size(), max_spec, "ignoring a spec file over the size cap");
-            out.too_large.push(parts[4].to_string());
-            continue;
-        }
+        total += size;
+        wanted.push(name.to_string());
+    }
+    if total > cfg.max_download {
+        bail!("the specs add up to {total} bytes, over the {} byte limit", cfg.max_download);
+    }
+    for name in wanted {
+        let url = cfg.contents_url(commit, Some(&name));
+        let mut resp = get(agent, &url, "application/vnd.github.raw+json")?;
         let mut buf = Vec::new();
-        (&mut entry).take(max_spec + 1).read_to_end(&mut buf)?;
-        if buf.len() as u64 > max_spec {
-            out.too_large.push(parts[4].to_string());
-            continue;
+        resp.body_mut().as_reader().take(cfg.max_spec + 1).read_to_end(&mut buf).with_context(|| format!("reading {url}"))?;
+        if buf.len() as u64 > cfg.max_spec {
+            out.too_large.push(name);
+        } else {
+            out.files.push((name, buf));
         }
-        out.files.push((parts[4].to_string(), buf));
     }
     Ok(out)
 }
@@ -516,7 +543,8 @@ impl SpecStore {
     fn fetch_and_apply(&self, cfg: &SpecsConfig, same_source: bool, now: DateTime<Utc>) -> Result<Outcome> {
         let url = cfg.url();
         let etag = std::fs::read_to_string(self.etag_path()).ok().filter(|e| !e.trim().is_empty());
-        let mut req = agent(cfg.timeout).get(&url);
+        let agent = agent(cfg.timeout);
+        let mut req = agent.get(&url).header("Accept", "application/vnd.github.sha").header("User-Agent", "inference-bench");
         if let Some(tag) = etag.as_deref().filter(|_| same_source && self.current().is_dir()) {
             req = req.header("If-None-Match", tag.trim());
         }
@@ -530,15 +558,13 @@ impl SpecStore {
             bail!("{url} answered {status}");
         }
         let new_etag = resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(String::from);
-        let bytes = resp
-            .body_mut()
-            .with_config()
-            .limit(cfg.max_download)
-            .read_to_vec()
-            .with_context(|| format!("{url}: download over {} bytes or broken", cfg.max_download))?;
-        let extracted = extract(&bytes, cfg.max_spec)?;
+        let commit = resp.body_mut().with_config().limit(256).read_to_string().with_context(|| format!("reading {url}"))?.trim().to_string();
+        if commit.is_empty() || commit.len() > 64 || !commit.chars().all(|c| c.is_ascii_alphanumeric()) {
+            bail!("{url} did not answer with a commit id");
+        }
+        let extracted = download(cfg, &agent, &commit)?;
         if extracted.files.is_empty() {
-            bail!("{url} has no spec files under crates/specrt/specs");
+            bail!("{url} has no spec files under {SPECS_DIR}");
         }
         let changes = self.apply(cfg, extracted, now)?;
         std::fs::write(self.etag_path(), new_etag.unwrap_or_default())?;

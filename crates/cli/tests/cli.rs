@@ -1,4 +1,4 @@
-use inference_bench_core::fake::{FakeFile, FakeServer, Script, tarball};
+use inference_bench_core::fake::{FakeServer, Script, publish_specs};
 use inference_bench_core::result::{ErrorKind, RunResult};
 use inference_bench_core::store;
 use std::path::PathBuf;
@@ -188,15 +188,8 @@ fn specrt_spec(file: &str) -> String {
 }
 
 fn publish(script: &Script, entries: &[(&str, String)], etag: &str, commit: &str) {
-    let files: Vec<(String, Vec<u8>)> =
-        entries.iter().map(|(n, t)| (format!("crates/specrt/specs/{n}"), t.as_bytes().to_vec())).collect();
-    let refs: Vec<(&str, &[u8])> = files.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
-    script.serve_file(FakeFile {
-        path: "/v0l/inference-bench/tar.gz/refs/heads/master".into(),
-        body: tarball("inference-bench-master", &refs, Some(commit)),
-        etag: Some(format!("\"{etag}\"")),
-        status: None,
-    });
+    let refs: Vec<(&str, &[u8])> = entries.iter().map(|(n, t)| (*n, t.as_bytes())).collect();
+    publish_specs(script, "v0l/inference-bench", "refs/heads/master", commit, etag, &refs);
 }
 
 fn specs_cmd(out: &PathBuf, url: &str, args: &[&str]) -> Output {

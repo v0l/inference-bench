@@ -400,19 +400,14 @@ fn a_native_model_missing_on_disk_is_a_clean_error() {
 
 #[test]
 fn the_server_checks_specs_at_start_reports_them_and_loads_a_new_spec_by_name() {
-    use inference_bench_core::fake::{FakeFile, FakeServer, Script, tarball};
+    use inference_bench_core::fake::{FakeServer, Script, publish_specs};
     let data = std::env::temp_dir().join(format!("ib-server-specs-update-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&data);
     let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs/qwen3-0.6b.toml")).unwrap();
     let fresh = base.replace("name = \"qwen3-0.6b\"", "name = \"brand-new\"");
     let script = Script::default();
     let github = FakeServer::start(script.clone());
-    script.serve_file(FakeFile {
-        path: "/v0l/inference-bench/tar.gz/refs/heads/master".into(),
-        body: tarball("inference-bench-master", &[("crates/specrt/specs/brand-new.toml", fresh.as_bytes())], Some("cafe123")),
-        etag: Some("\"e1\"".into()),
-        status: None,
-    });
+    publish_specs(&script, "v0l/inference-bench", "refs/heads/master", "cafe123", "e1", &[("brand-new.toml", fresh.as_bytes())]);
     let extra = format!(
         "[[models]]\nid = 'new'\nmodel = 'brand-new'\n[specs]\nurl = {:?}\ndata_dir = {:?}\n",
         github.url,

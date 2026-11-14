@@ -81,6 +81,15 @@ impl SpecsUpdater {
     }
 }
 
+pub fn verdict(ok: bool, detail: &str) -> &'static str {
+    match (detail.is_empty(), ok) {
+        (true, _) => "not checked yet",
+        (false, false) => "failed",
+        (false, true) if detail.contains("up to date") => "up to date",
+        (false, true) => "ok",
+    }
+}
+
 pub fn when(t: Option<chrono::DateTime<chrono::Utc>>) -> String {
     t.map(|t| t.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string()).unwrap_or_else(|| "never".into())
 }

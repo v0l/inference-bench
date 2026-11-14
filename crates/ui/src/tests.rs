@@ -556,17 +556,12 @@ fn there_is_no_bench_tab() {
 
 #[test]
 fn the_model_list_refreshes_when_a_spec_update_lands() {
-    use inference_bench_core::fake::{FakeFile, tarball};
+    use inference_bench_core::fake::publish_specs;
     let base = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs/qwen3-0.6b.toml")).unwrap();
     let fresh = base.replace("name = \"qwen3-0.6b\"", "name = \"landed-from-github\"");
     let gh = Script::default();
     let server = FakeServer::start(gh.clone());
-    gh.serve_file(FakeFile {
-        path: "/v0l/inference-bench/tar.gz/refs/heads/master".into(),
-        body: tarball("inference-bench-master", &[("crates/specrt/specs/landed.toml", fresh.as_bytes())], Some("feed42")),
-        etag: Some("\"x\"".into()),
-        status: None,
-    });
+    publish_specs(&gh, "v0l/inference-bench", "refs/heads/master", "feed42a", "x", &[("landed.toml", fresh.as_bytes())]);
     let mut h = harness("specs-landed", Tab::Models);
     h.state_mut().specs.base = Some(server.url.clone());
     h.state_mut().rescan();
@@ -578,10 +573,38 @@ fn the_model_list_refreshes_when_a_spec_update_lands() {
     pump_until(&mut h, 20, "update and rescan", |a| !a.specs.busy() && !a.scan.busy() && a.library.iter().any(|m| m.name == "landed-from-github"));
     h.run();
     let landed = h.state().library.iter().find(|m| m.name == "landed-from-github").unwrap().clone();
-    assert!(landed.origin.as_ref().unwrap().label().starts_with("updated from GitHub v0l/inference-bench@master (feed42) at "));
+    assert!(landed.origin.as_ref().unwrap().label().starts_with("updated from GitHub v0l/inference-bench@master (feed42a) at "));
     h.get_by_label("landed-from-github");
     assert_eq!(h.state().notice.as_ref().unwrap().1, "specs updated: added landed-from-github");
     assert!(h.state().specs.state.last_ok);
+}
+
+#[test]
+fn a_300_character_spec_error_leaves_the_check_key_its_full_width() {
+    let mut h = harness("specs-long-error", Tab::Models);
+    h.run();
+    let plain = h.get_by_label("check specs now").rect();
+    assert!(plain.width() > 90.0, "{plain:?}");
+    let error = format!("https://example.invalid/{}: {}", "x".repeat(60), "download over 67108864 bytes or broken ".repeat(8));
+    assert!(error.len() >= 300);
+    {
+        let app = h.state_mut();
+        app.specs.last = Some((false, format!("spec update failed: {error}")));
+        app.specs.state.last_ok = false;
+    }
+    h.run();
+    let key = h.get_by_label("check specs now").rect();
+    assert!(key.width() >= plain.width() - 1.0, "key shrank from {} to {}", plain.width(), key.width());
+    assert!(key.height() <= plain.height() + 1.0, "key wrapped to {} high", key.height());
+    assert!(h.query_by_label_contains("download over").is_none());
+}
+
+#[test]
+fn the_spec_verdict_is_one_short_word() {
+    assert_eq!(crate::specs::verdict(true, ""), "not checked yet");
+    assert_eq!(crate::specs::verdict(true, "specs are up to date"), "up to date");
+    assert_eq!(crate::specs::verdict(true, "specs updated: added x"), "ok");
+    assert_eq!(crate::specs::verdict(false, &"boom ".repeat(100)), "failed");
 }
 
 #[test]
@@ -737,7 +760,7 @@ fn chat_screenshots_with_a_real_model() {
 #[test]
 #[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshot_of_spec_provenance_and_update_settings() {
-    use inference_bench_core::fake::{FakeFile, tarball};
+    use inference_bench_core::fake::publish_specs;
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
     let specs_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs");
@@ -746,20 +769,14 @@ fn screenshot_of_spec_provenance_and_update_settings() {
     let future = format!("min_engine = 3\n{}", read("qwen2.5-0.5b.toml").replace("name = \"qwen2.5-0.5b\"", "name = \"qwen2.5-0.5b-moe\""));
     let gh = Script::default();
     let server = FakeServer::start(gh.clone());
-    gh.serve_file(FakeFile {
-        path: "/v0l/inference-bench/tar.gz/refs/heads/master".into(),
-        body: tarball(
-            "inference-bench-master",
-            &[
-                ("crates/specrt/specs/qwen3-0.6b.toml", read("qwen3-0.6b.toml").as_bytes()),
-                ("crates/specrt/specs/qwen3-0.6b-new.toml", newer.as_bytes()),
-                ("crates/specrt/specs/qwen2.5-0.5b-moe.toml", future.as_bytes()),
-            ],
-            Some("5f9d34982b950f61d8f0a238aff52c4676d8b9b1"),
-        ),
-        etag: Some("\"s\"".into()),
-        status: None,
-    });
+    publish_specs(
+        &gh,
+        "v0l/inference-bench",
+        "refs/heads/master",
+        "5f9d34982b950f61d8f0a238aff52c4676d8b9b1",
+        "s",
+        &[("qwen3-0.6b.toml", read("qwen3-0.6b.toml").as_bytes()), ("qwen3-0.6b-new.toml", newer.as_bytes()), ("qwen2.5-0.5b-moe.toml", future.as_bytes())],
+    );
     let d = dir("spec-shot");
     let mine = d.join("my-specs");
     std::fs::create_dir_all(&mine).unwrap();
@@ -795,6 +812,28 @@ fn screenshot_of_spec_provenance_and_update_settings() {
     image::imageops::overlay(&mut both, &models, 0, 0);
     image::imageops::overlay(&mut both, &settings, models.width() as i64, 0);
     both.save(out.join("spec-updates.png")).unwrap();
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshot_of_a_failed_spec_check_line() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let d = dir("spec-failed-shot");
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 420.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        app.tab = Tab::Models;
+        app.logs = shared_logs();
+        app.library = vec![model("Qwen3-0.6B", true, "dense decoder")];
+        let error = format!("https://api.github.com/repos/v0l/inference-bench/commits/refs/heads/master: {}", "download over 67108864 bytes or broken ".repeat(8));
+        app.specs.last = Some((false, format!("spec update failed: {error}")));
+        app.specs.state.checked_at = Some(chrono::Utc::now());
+        app.specs.state.last_ok = false;
+        app
+    });
+    h.run();
+    h.render().unwrap().save(out.join("spec-check-failed.png")).unwrap();
 }
 
 #[test]

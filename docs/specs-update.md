@@ -26,23 +26,33 @@ from GitHub owner/repo@branch (commit) at time", or "embedded in inference-bench
 
 ## How an update works
 
-One HTTPS GET of
-`https://codeload.github.com/<repo>/tar.gz/refs/heads/<branch>` (or `refs/tags/<tag>` when pinned),
-with `If-None-Match` set to the ETag of the last download (kept in `<data dir>/specs/.etag`). An
-unchanged repository answers 304 and nothing else happens. No git is needed.
+The repository is never downloaded. An update asks the GitHub API for three small things:
 
-On a 200 the archive is read in memory, with these limits:
+1. `GET https://api.github.com/repos/<repo>/commits/refs/heads/<branch>` (or `refs/tags/<tag>` when
+   pinned) with `Accept: application/vnd.github.sha`, which answers the commit id as plain text.
+   It carries `If-None-Match` set to the ETag of the last answer (kept in `<data dir>/specs/.etag`).
+   An unchanged branch answers 304 and nothing else happens. No git is needed.
+2. `GET .../contents/crates/specrt/specs?ref=<commit>`: the directory listing.
+3. `GET .../contents/crates/specrt/specs/<name>.toml?ref=<commit>` with
+   `Accept: application/vnd.github.raw+json`, once per spec file.
 
-- The download is capped at 64 MiB and 60 s, each spec file at 256 KiB.
+Every file is read from the same commit, so a push in the middle of an update cannot mix two
+generations. The limits:
+
+- Each spec file is capped at 256 KiB, the listing at 4 MiB, all the specs together at 8 MiB, and
+  the whole update at 60 s. The size of the rest of the repository does not matter.
 - Only regular files directly in `crates/specrt/specs/` whose name is a plain `name.toml`
   (letters, digits, `-`, `_`, `.`, no leading dot, no `..`) are taken. Everything else in the
-  archive, including nested paths, links and other file types, is ignored and never written.
+  listing, including directories, links and other file types, is ignored and never fetched.
 - Each spec is parsed with the engine's own spec check before it is accepted. A spec that fails
   to parse is skipped with a warning, and the previous copy of that spec is kept.
-- Nothing in the archive is executed or interpreted beyond the TOML.
+- Nothing downloaded is executed or interpreted beyond the TOML.
+
+An unauthenticated client gets 60 API requests an hour from one IP address. A check costs
+2 + (number of specs) requests only when the branch moved, and 1 when it did not.
 
 The accepted specs are written to a new folder beside the cache, which then replaces `current/`
-with a rename. A failed update (network error, bad archive, nothing that parses) leaves `current/`
+with a rename. A failed update (network error, bad answer, nothing that parses) leaves `current/`
 as it was. The replaced folder moves to `<data dir>/specs/.history/`, which keeps the last 3
 generations. Every update is logged with `tracing`: which specs were added, updated, removed and
 skipped, and the commit.
@@ -62,7 +72,7 @@ and set `min_engine` in the spec to the new value, so older apps skip it instead
 ## When it runs
 
 - The app: in a background thread a moment after start, then when the interval has passed (it
-  looks every 10 minutes whether a check is due). "check specs now" on the Models page and "check
+  looks every 10 minutes whether a check is due). "check specs now" on the Models page (which shows one word, `ok`, `up to date` or `failed`, with the full text on hover) and "check
   now" in Settings run one straight away, even when automatic updates are off.
 - `inference-bench-server`: at start in the background, then every `update_hours`. The server never
   waits for it to start serving. `/admin/specs` returns the state, and `/metrics` has
@@ -80,7 +90,7 @@ and set `min_engine` in the spec to the new value, so older apps skip it instead
 | `specs_update_hours` | `update_hours` | `24` | Hours between checks, 0 checks at start only |
 | `spec_folders` | `folders` | none | Your own specs, which win over the others |
 | | `data_dir` | the data dir | Where the cache lives |
-| | `url` | `https://codeload.github.com` | A mirror with the same URL layout |
+| | `url` | `https://api.github.com` | A mirror with the same API layout |
 
 `INFERENCE_BENCH_SPECS_URL` overrides the download host for the app and the CLI.
 

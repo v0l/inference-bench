@@ -241,13 +241,27 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
 
 fn specs_bar(app: &mut App, ui: &mut egui::Ui) {
     let state = app.specs.state.clone();
+    let busy = app.specs.busy();
+    let (ok, detail) = match (&app.specs.last, state.last_result.is_empty()) {
+        (Some((ok, text)), _) => (*ok, text.clone()),
+        (None, false) => (state.last_ok, state.last_result.clone()),
+        (None, true) => (true, String::new()),
+    };
+    let label = if busy { "checking" } else { "check specs now" };
     ui.horizontal(|ui| {
-        let result = match (&app.specs.last, state.last_result.is_empty()) {
-            (Some((_, text)), _) => text.clone(),
-            (None, false) => state.last_result.clone(),
-            (None, true) => "not checked yet".into(),
+        let reserve = Key::new("check specs now").width(ui);
+        if ui.add(Key::new(label).outline(READOUT).enabled(!busy).min_width(reserve)).clicked() {
+            let (wake, dir) = (app.wake.clone(), app.dir.clone());
+            app.specs.check_now(&wake, &dir, &app.settings);
+        }
+        let verdict = crate::specs::verdict(ok, &detail);
+        let tint = match (detail.is_empty(), ok) {
+            (true, _) => LEGEND,
+            (false, true) => OK,
+            (false, false) => FAULT,
         };
-        Line::new()
+        let hover = if detail.is_empty() { "the specs have not been checked yet".to_string() } else { detail };
+        let line = Line::new()
             .legend("specs")
             .value(app.settings.specs().source())
             .gap(14.0)
@@ -255,16 +269,11 @@ fn specs_bar(app: &mut App, ui: &mut egui::Ui) {
             .value(crate::specs::when(state.checked_at))
             .gap(14.0)
             .legend("result")
-            .value(result)
+            .tint(tint)
+            .value(verdict)
             .size(11.0)
             .elided(ui);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let busy = app.specs.busy();
-            if ui.add(Key::new(if busy { "checking" } else { "check specs now" }).outline(READOUT).enabled(!busy)).clicked() {
-                let (wake, dir) = (app.wake.clone(), app.dir.clone());
-                app.specs.check_now(&wake, &dir, &app.settings);
-            }
-        });
+        line.on_hover_text(hover);
     });
 }
 

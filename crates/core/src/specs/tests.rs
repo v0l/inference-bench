@@ -1,7 +1,5 @@
 use super::*;
-use crate::fake::{FakeFile, FakeServer, Script, tarball};
-
-const TOP: &str = "inference-bench-abc123";
+use crate::fake::{FakeFile, FakeServer, Script, publish_specs};
 
 fn temp(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("ib-specs-{name}-{}", std::process::id()));
@@ -13,10 +11,6 @@ fn temp(name: &str) -> PathBuf {
 fn spec_text(name: &str, layers: u32) -> String {
     let base = EMBEDDED.iter().find(|(n, _)| *n == "qwen3-0.6b.toml").unwrap().1;
     base.replace("name = \"qwen3-0.6b\"", &format!("name = \"{name}\"")).replace("count = 28", &format!("count = {layers}"))
-}
-
-fn at(rel: &str) -> String {
-    format!("crates/specrt/specs/{rel}")
 }
 
 struct Rig {
@@ -35,12 +29,11 @@ fn rig() -> Rig {
 impl Rig {
     fn publish(&self, entries: &[(String, Vec<u8>)], etag: &str, commit: &str) {
         let refs: Vec<(&str, &[u8])> = entries.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
-        self.script.serve_file(FakeFile {
-            path: format!("/v0l/inference-bench/tar.gz/{}", self.cfg.git_ref()),
-            body: tarball(TOP, &refs, Some(commit)),
-            etag: Some(format!("\"{etag}\"")),
-            status: None,
-        });
+        publish_specs(&self.script, "v0l/inference-bench", &self.cfg.git_ref(), commit, etag, &refs);
+    }
+
+    fn commits_path(&self) -> String {
+        format!("/repos/v0l/inference-bench/commits/{}", self.cfg.git_ref())
     }
 
     fn requests(&self) -> usize {
@@ -49,7 +42,7 @@ impl Rig {
 }
 
 fn file(rel: &str, text: &str) -> (String, Vec<u8>) {
-    (at(rel), text.as_bytes().to_vec())
+    (rel.to_string(), text.as_bytes().to_vec())
 }
 
 fn names(dir: &Path) -> Vec<String> {
@@ -141,6 +134,36 @@ fn files_and_downloads_over_the_size_caps_are_refused() {
 }
 
 #[test]
+fn a_repo_far_bigger_than_the_download_limit_still_updates_its_specs() {
+    let r = rig();
+    let store = SpecStore::new(&temp("bigrepo"));
+    let whole_repo = vec![7u8; 2 << 20];
+    for path in ["/v0l/inference-bench/tar.gz/refs/heads/master", "/repos/v0l/inference-bench/tarball/refs/heads/master"] {
+        r.script.serve_file(FakeFile { path: path.into(), body: whole_repo.clone(), etag: Some("\"big\"".into()), status: None });
+    }
+    r.publish(&[file("a.toml", &spec_text("a", 2)), file("b.toml", &spec_text("b", 3))], "v1", "9999999ffff");
+    let cfg = SpecsConfig { max_download: 64 << 10, ..r.cfg.clone() };
+    assert!(whole_repo.len() as u64 > 10 * cfg.max_download);
+    let Outcome::Updated(changes) = store.update(&cfg).unwrap() else { panic!("expected an update") };
+    assert_eq!(changes.added, vec!["a", "b"]);
+    assert_eq!(names(&store.current()), vec!["a.toml", "b.toml"]);
+    assert_eq!(store.generation().unwrap().commit.as_deref(), Some("9999999ffff"));
+    assert!(r.server.requests.lock().unwrap().iter().all(|q| !q.contains("tar")));
+    assert!(store.state().last_ok);
+}
+
+#[test]
+fn an_unchanged_commit_downloads_no_spec_files() {
+    let r = rig();
+    let store = SpecStore::new(&temp("nofiles"));
+    r.publish(&[file("a.toml", &spec_text("a", 2))], "same", "c1");
+    store.update(&r.cfg).unwrap();
+    let before = r.requests();
+    assert_eq!(store.update(&r.cfg).unwrap(), Outcome::Unchanged);
+    assert_eq!(r.requests(), before + 1);
+}
+
+#[test]
 fn a_failed_update_leaves_the_old_folder_in_place() {
     let r = rig();
     let data = temp("fail");
@@ -157,13 +180,13 @@ fn a_failed_update_leaves_the_old_folder_in_place() {
     assert_eq!(read_dir_files(&store.current()), before);
     std::fs::remove_file(store.root().join(".history")).unwrap();
     r.script.serve_file(FakeFile {
-        path: format!("/v0l/inference-bench/tar.gz/{}", r.cfg.git_ref()),
-        body: b"this is not gzip".to_vec(),
+        path: r.commits_path(),
+        body: b"this is not a commit".to_vec(),
         etag: Some("\"v3\"".into()),
         status: None,
     });
     assert!(store.update(&r.cfg).is_err());
-    r.script.serve_file(FakeFile { path: format!("/v0l/inference-bench/tar.gz/{}", r.cfg.git_ref()), status: Some(500), ..FakeFile::default() });
+    r.script.serve_file(FakeFile { path: r.commits_path(), status: Some(500), ..FakeFile::default() });
     assert!(store.update(&r.cfg).unwrap_err().to_string().contains("500"));
     assert_eq!(read_dir_files(&store.current()), before);
     assert_eq!(std::fs::read_to_string(data.join("specs/.etag")).unwrap(), "\"v2\"");
@@ -222,10 +245,14 @@ fn a_removed_spec_is_reported_and_the_list_follows() {
 #[test]
 fn a_pinned_tag_fetches_the_tag_ref() {
     let cfg = SpecsConfig { tag: "v0.2.0".into(), base: "https://x".into(), ..SpecsConfig::default() };
-    assert_eq!(cfg.url(), "https://x/v0l/inference-bench/tar.gz/refs/tags/v0.2.0");
+    assert_eq!(cfg.url(), "https://x/repos/v0l/inference-bench/commits/refs/tags/v0.2.0");
     assert_eq!(cfg.source(), "v0l/inference-bench@v0.2.0");
     let branch = SpecsConfig { base: "https://x".into(), ..SpecsConfig::default() };
-    assert_eq!(branch.url(), "https://x/v0l/inference-bench/tar.gz/refs/heads/master");
+    assert_eq!(branch.url(), "https://x/repos/v0l/inference-bench/commits/refs/heads/master");
+    assert_eq!(
+        branch.contents_url("abc1234", Some("a.toml")),
+        "https://x/repos/v0l/inference-bench/contents/crates/specrt/specs/a.toml?ref=abc1234"
+    );
 }
 
 #[test]

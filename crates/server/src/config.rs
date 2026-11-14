@@ -424,7 +424,7 @@ python = "python3"
         let c = ServerConfig::parse("[specs]\nauto_update = false\ntag = \"v0.2.0\"\nupdate_hours = 6\nurl = \"http://mirror\"").unwrap();
         let u = c.specs.updater();
         assert!(!u.auto_update);
-        assert_eq!(u.url(), "http://mirror/v0l/inference-bench/tar.gz/refs/tags/v0.2.0");
+        assert_eq!(u.url(), "http://mirror/repos/v0l/inference-bench/commits/refs/tags/v0.2.0");
         assert!(ServerConfig::parse("[specs]\nbogus = 1").is_err());
     }
 

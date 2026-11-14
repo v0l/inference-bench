@@ -32,31 +32,27 @@ impl Script {
     }
 }
 
-pub fn tarball(top: &str, entries: &[(&str, &[u8])], commit: Option<&str>) -> Vec<u8> {
-    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-    let mut b = tar::Builder::new(gz);
-    if let Some(c) = commit {
-        let record = format!(" comment={c}\n");
-        let record = format!("{}{record}", record.len() + (record.len() + 2).to_string().len());
-        let mut h = tar::Header::new_ustar();
-        h.set_entry_type(tar::EntryType::XGlobalHeader);
-        h.set_path("pax_global_header").unwrap();
-        h.set_size(record.len() as u64);
-        h.set_mode(0o666);
-        h.set_cksum();
-        b.append(&h, record.as_bytes()).unwrap();
+pub fn publish_specs(script: &Script, repo: &str, git_ref: &str, commit: &str, etag: &str, files: &[(&str, &[u8])]) {
+    let dir = "crates/specrt/specs";
+    script.serve_file(FakeFile {
+        path: format!("/repos/{repo}/commits/{git_ref}"),
+        body: commit.as_bytes().to_vec(),
+        etag: Some(format!("\"{etag}\"")),
+        status: None,
+    });
+    let listing: Vec<_> = files
+        .iter()
+        .map(|(name, body)| serde_json::json!({"name": name, "path": format!("{dir}/{name}"), "type": "file", "size": body.len()}))
+        .collect();
+    script.serve_file(FakeFile {
+        path: format!("/repos/{repo}/contents/{dir}?ref={commit}"),
+        body: serde_json::to_vec(&listing).unwrap(),
+        etag: None,
+        status: None,
+    });
+    for (name, body) in files {
+        script.serve_file(FakeFile { path: format!("/repos/{repo}/contents/{dir}/{name}?ref={commit}"), body: body.to_vec(), etag: None, status: None });
     }
-    for (path, body) in entries {
-        let mut h = tar::Header::new_old();
-        let full = format!("{top}/{path}");
-        h.as_old_mut().name[..full.len()].copy_from_slice(full.as_bytes());
-        h.set_entry_type(if path.ends_with('/') { tar::EntryType::Directory } else { tar::EntryType::Regular });
-        h.set_size(body.len() as u64);
-        h.set_mode(0o644);
-        h.set_cksum();
-        b.append(&h, *body).unwrap();
-    }
-    b.into_inner().unwrap().finish().unwrap()
 }
 
 pub struct FakeServer {
