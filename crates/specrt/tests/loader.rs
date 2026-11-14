@@ -79,3 +79,18 @@ fn a_model_already_in_the_page_cache_loads_through_the_mmap_path_with_the_same_w
     let (b, _) = logits(&spec("tiny-qwen3.5", false, false));
     assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_tight_host_budget_and_the_split_head_and_mtp_groups_upload_the_same_weights() {
+    for dir in ["tiny-qwen3.5", "tiny-qwen3.5-mtp"] {
+        let (mmap, _) = logits(&spec(dir, false, false));
+        let mut tight = spec(dir, true, true);
+        tight.runtime.loader.host_budget_mb = 64;
+        tight.runtime.loader.workers = 4;
+        let (fast, events) = logits(&tight);
+        assert!(mmap.iter().zip(&fast).all(|(a, b)| a.to_bits() == b.to_bits()), "{dir}");
+        let last = events.iter().filter(|e| e.stage == Stage::Weights).last().unwrap();
+        assert_eq!(last.done, last.total, "{dir}");
+    }
+}

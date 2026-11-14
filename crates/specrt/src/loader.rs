@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -27,11 +27,12 @@ pub struct LoaderOptions {
     pub lanes: usize,
     pub skip_cached: bool,
     pub pinned: bool,
+    pub host_budget_mb: usize,
 }
 
 impl Default for LoaderOptions {
     fn default() -> Self {
-        LoaderOptions { enabled: true, direct: true, chunk_mb: 32, readers: 8, ahead: 2, workers: 4, lanes: 1, skip_cached: true, pinned: false }
+        LoaderOptions { enabled: true, direct: true, chunk_mb: 32, readers: 8, ahead: 2, workers: 4, lanes: 1, skip_cached: true, pinned: false, host_budget_mb: 3584 }
     }
 }
 
@@ -40,13 +41,58 @@ impl LoaderOptions {
         *self == LoaderOptions::default()
     }
 
+    pub fn host_budget_bytes(&self) -> u64 {
+        (self.host_budget_mb as u64) << 20
+    }
+
     pub fn validate(&self) -> Result<()> {
+        ensure!(self.host_budget_mb >= 64, "[runtime.loader] host_budget_mb needs at least 64");
         ensure!(self.chunk_mb >= 1, "[runtime.loader] chunk_mb needs at least 1");
         ensure!((1..=64).contains(&self.readers), "[runtime.loader] readers must be between 1 and 64");
         ensure!(self.ahead >= 1, "[runtime.loader] ahead needs at least 1");
         ensure!((1..=64).contains(&self.workers), "[runtime.loader] workers must be between 1 and 64");
         ensure!((1..=16).contains(&self.lanes), "[runtime.loader] lanes must be between 1 and 16");
         Ok(())
+    }
+}
+
+pub struct Budget {
+    limit: u64,
+    used: Mutex<u64>,
+    peak: AtomicU64,
+    freed: std::sync::Condvar,
+}
+
+pub struct Lease {
+    budget: Arc<Budget>,
+    bytes: u64,
+}
+
+impl Budget {
+    pub fn new(limit: u64) -> Arc<Budget> {
+        Arc::new(Budget { limit, used: Mutex::new(0), peak: AtomicU64::new(0), freed: std::sync::Condvar::new() })
+    }
+
+    pub fn acquire(self: &Arc<Self>, bytes: u64) -> Lease {
+        let mut used = self.used.lock().unwrap();
+        while *used > 0 && *used + bytes > self.limit {
+            used = self.freed.wait(used).unwrap();
+        }
+        *used += bytes;
+        self.peak.fetch_max(*used, Ordering::Relaxed);
+        Lease { budget: self.clone(), bytes }
+    }
+
+    pub fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock().unwrap();
+        *used -= self.bytes;
+        self.budget.freed.notify_all();
     }
 }
 
@@ -152,6 +198,7 @@ impl Pool {
 }
 
 pub struct Batch {
+    lease: Option<Lease>,
     host: Option<Host>,
     pool: Arc<Pool>,
     spans: HashMap<String, (usize, usize)>,
@@ -286,7 +333,7 @@ pub fn read_batch(sources: &[Source], items: &[Item], pool: &Arc<Pool>, opts: &L
         pool.give(host);
         return Err(e);
     }
-    Ok(Batch { host: Some(host), pool: pool.clone(), spans, bytes: items.iter().map(|i| i.len).sum() })
+    Ok(Batch { lease: None, host: Some(host), pool: pool.clone(), spans, bytes: items.iter().map(|i| i.len).sum() })
 }
 
 struct Queue {
@@ -304,7 +351,7 @@ pub struct Prefetcher {
 }
 
 impl Prefetcher {
-    pub fn start(files: &[PathBuf], groups: Vec<Vec<Item>>, opts: LoaderOptions, ctx: Option<Arc<CudaContext>>) -> Result<Prefetcher> {
+    pub fn start(files: &[PathBuf], groups: Vec<Vec<Item>>, opts: LoaderOptions, ctx: Option<Arc<CudaContext>>, budget: Arc<Budget>) -> Result<Prefetcher> {
         let sources = Arc::new(files.iter().map(|p| Source::open(p, opts.direct)).collect::<Result<Vec<_>>>()?);
         let direct = sources.iter().all(Source::is_direct) && !sources.is_empty();
         let total = groups.iter().flatten().map(|i| i.len).sum();
@@ -316,7 +363,7 @@ impl Prefetcher {
         let per_lane = LoaderOptions { readers: opts.readers.div_ceil(lanes).max(1), ..opts };
         let mut threads = Vec::with_capacity(lanes);
         for lane in 0..lanes {
-            let (queue, groups, claim, sources, pool, ctx) = (queue.clone(), groups.clone(), claim.clone(), sources.clone(), pool.clone(), ctx.clone());
+            let (queue, groups, claim, sources, pool, ctx, budget) = (queue.clone(), groups.clone(), claim.clone(), sources.clone(), pool.clone(), ctx.clone(), budget.clone());
             let t = std::thread::Builder::new()
                 .name(format!("specrt-read-{lane}"))
                 .spawn(move || {
@@ -338,7 +385,11 @@ impl Prefetcher {
                                 break;
                             }
                         }
-                        let batch = read_batch(&sources, &groups[g], &pool, &per_lane);
+                        let lease = budget.acquire(groups[g].iter().map(|i| i.len).sum());
+                        let batch = read_batch(&sources, &groups[g], &pool, &per_lane).map(|mut b| {
+                            b.lease = Some(lease);
+                            b
+                        });
                         let failed = batch.is_err();
                         let mut q = lock.lock().unwrap();
                         q.ready.insert(g, batch);
@@ -409,7 +460,7 @@ mod tests {
 
     fn check(dir: &Path, direct: bool) -> bool {
         let (p, data) = file_with(dir, "a.bin", 3 * (1 << 20) + 1234);
-        let opts = LoaderOptions { enabled: true, direct, chunk_mb: 1, readers: 3, ahead: 2, workers: 2, lanes: 2, skip_cached: false, pinned: false };
+        let opts = LoaderOptions { enabled: true, direct, chunk_mb: 1, readers: 3, ahead: 2, workers: 2, lanes: 2, skip_cached: false, pinned: false, host_budget_mb: 3584 };
         let spans = [(5u64, 100u64), (4096, 4096), (10_000, 1_500_000), (3 * (1 << 20) + 1000, 234)];
         let src = Source::open(&p, direct).unwrap();
         let used_direct = src.is_direct();
@@ -448,6 +499,27 @@ mod tests {
     }
 
     #[test]
+    fn the_budget_holds_back_a_second_lease_until_the_first_is_dropped_but_never_blocks_a_lone_oversized_one() {
+        let b = Budget::new(100);
+        let big = b.acquire(500);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let b2 = b.clone();
+        let t = std::thread::spawn(move || {
+            let l = b2.acquire(60);
+            tx.send(()).unwrap();
+            drop(l);
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(100)).is_err());
+        drop(big);
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        t.join().unwrap();
+        let x = b.acquire(40);
+        let y = b.acquire(60);
+        assert_eq!(b.peak(), 500);
+        drop((x, y));
+    }
+
+    #[test]
     fn a_read_past_the_end_of_a_truncated_file_is_an_error() {
         let dir = std::env::temp_dir().join(format!("specrt-loader-short-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -466,7 +538,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (p, data) = file_with(&dir, "b.bin", 1 << 20);
         let groups: Vec<Vec<Item>> = (0..6).map(|g| vec![Item { name: "x".into(), file: 0, offset: g * 1000, len: 700 }]).collect();
-        let pf = Prefetcher::start(&[p], groups, LoaderOptions::default(), None).unwrap();
+        let pf = Prefetcher::start(&[p], groups, LoaderOptions::default(), None, Budget::new(1 << 30)).unwrap();
         assert_eq!(pf.total, 6 * 700);
         for g in [1usize, 0, 2] {
             let b = pf.take(g).unwrap();

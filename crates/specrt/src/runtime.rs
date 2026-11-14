@@ -26,45 +26,57 @@ pub use mtp::{SpecRow, SpecStats};
 pub use stage::{StageRange, StageRole};
 pub use step::{DecodeRow, GRAPH_SIZES, Stepper, pad_rows};
 
-fn weight_groups(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole) -> Vec<Vec<String>> {
+struct Plan {
+    groups: Vec<Vec<String>>,
+    work: Vec<Work>,
+}
+
+fn weight_plan(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole) -> Plan {
     let root = ck.root();
-    let mut groups = Vec::new();
     let embed = format!("{root}.embed_tokens.weight");
-    let mut outside = Vec::new();
-    if role.first || (role.last && spec.dims.tie_embeddings) {
-        outside.push(embed);
-    }
+    let tied = spec.dims.tie_embeddings;
+    let mut head = Vec::new();
     if role.last {
-        outside.push(format!("{root}.norm.weight"));
-        outside.push("lm_head.weight".to_string());
+        head.push(format!("{root}.norm.weight"));
+        head.push(if tied { embed.clone() } else { "lm_head.weight".to_string() });
     }
-    let mut first = ck.tensor_names(&outside);
+    let mut plan = Plan { groups: Vec::new(), work: Vec::new() };
+    let mut push = |names: Vec<String>, work: Work| {
+        plan.groups.push(names);
+        plan.work.push(work);
+    };
+    if role.last {
+        push(ck.tensor_names(&head), Work::Head);
+    }
+    let layers: Vec<usize> = (0..spec.layers.count).collect();
+    let half = layers.len() / 2;
+    for &i in &layers[..half] {
+        push(ck.names_under(&format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
+    }
+    if role.first && !(tied && role.last) {
+        push(ck.tensor_names(&[embed]), Work::Embed);
+    }
     if spec.speculative().is_some() {
-        first.extend(ck.names_under("mtp."));
+        push(ck.names_under("mtp."), Work::Mtp);
     }
-    groups.push(first);
-    groups.extend((0..spec.layers.count).map(|i| ck.names_under(&format!("{root}.layers.{}.", range.start + i))));
-    groups
+    for &i in &layers[half..] {
+        push(ck.names_under(&format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
+    }
+    plan
 }
 
 #[derive(Clone, Copy)]
 enum Work {
-    Outside,
+    Head,
+    Embed,
+    Mtp,
     Layer(usize),
 }
 
-impl Work {
-    fn of(group: usize) -> Work {
-        match group {
-            0 => Work::Outside,
-            n => Work::Layer(n - 1),
-        }
-    }
-}
-
 enum Uploaded {
-    Outside(CudaSlice<u16>, CudaSlice<f32>, DeviceMatrix),
-    Head(Box<Uploaded>, Option<mtp::DeviceMtp>),
+    Head { norm: CudaSlice<f32>, lm_head: DeviceMatrix, embed: Option<CudaSlice<u16>>, draft: Option<DeviceMatrix> },
+    Embed(CudaSlice<u16>),
+    Mtp(Option<mtp::DeviceMtp>),
     Layer(usize, DeviceLayer),
 }
 
@@ -124,19 +136,17 @@ fn copied(stream: &Arc<CudaStream>) -> Result<()> {
     Ok(())
 }
 
-fn upload_outside(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: StageRole) -> Result<Uploaded> {
-    let up = if role.whole() {
-        let o = ck.outside(spec)?;
-        Uploaded::Outside(stream.clone_htod(o.embed.as_ref())?, stream.clone_htod(&o.norm)?, DeviceMatrix::upload(stream, &o.lm_head)?)
-    } else {
-        let embed = if role.first { stream.clone_htod(ck.embedding(spec)?.as_ref())? } else { stream.alloc_zeros(1)? };
-        let (norm, lm_head) = if role.last {
-            let (norm, head) = ck.head(spec)?;
-            (stream.clone_htod(&norm)?, DeviceMatrix::upload(stream, &head)?)
-        } else {
-            (stream.alloc_zeros(1)?, DeviceMatrix::Bf16(stream.alloc_zeros(1)?))
-        };
-        Uploaded::Outside(embed, norm, lm_head)
+fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: StageRole) -> Result<Uploaded> {
+    let (norm, head) = ck.head(spec)?;
+    let embed = if spec.dims.tie_embeddings && role.first { Some(stream.clone_htod(ck.embedding(spec)?.as_ref())?) } else { None };
+    let up = Uploaded::Head {
+        norm: stream.clone_htod(&norm)?,
+        lm_head: DeviceMatrix::upload(stream, &head)?,
+        embed,
+        draft: match spec.draft_head_quant() {
+            Some(q) => Some(DeviceMatrix::upload(stream, &ck.draft_head(spec, q)?)?),
+            None => None,
+        },
     };
     copied(stream)?;
     Ok(up)
@@ -144,9 +154,16 @@ fn upload_outside(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: 
 
 fn upload_group(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole, work: Work) -> Result<Uploaded> {
     match work {
-        Work::Outside => {
-            let outside = upload_outside(stream, ck, spec, role)?;
-            Ok(Uploaded::Head(Box::new(outside), mtp::DeviceMtp::load(stream, ck, spec)?))
+        Work::Head => upload_head(stream, ck, spec, role),
+        Work::Embed => {
+            let e = stream.clone_htod(ck.embedding(spec)?.as_ref())?;
+            copied(stream)?;
+            Ok(Uploaded::Embed(e))
+        }
+        Work::Mtp => {
+            let m = mtp::DeviceMtp::load(stream, ck, spec, false)?;
+            copied(stream)?;
+            Ok(Uploaded::Mtp(m))
         }
         Work::Layer(i) => Ok(Uploaded::Layer(i, upload_layer(stream, ck, spec, i, range.start + i)?)),
     }
@@ -156,10 +173,11 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, Ordering};
     let opts = &spec.runtime.loader;
-    let groups = weight_groups(ck, spec, range, role);
+    let Plan { groups, work } = weight_plan(ck, spec, range, role);
     let count = groups.len();
     let names = groups.clone();
-    let feed = Mutex::new(Feed::new(ck, groups, opts, ctx)?);
+    let budget = crate::loader::Budget::new(opts.host_budget_bytes());
+    let feed = Mutex::new(Feed::new(ck, groups, opts, ctx, budget.clone())?);
     let direct = feed.lock().unwrap().direct();
     let reader = feed.lock().unwrap().reader();
     let next = Mutex::new(0usize);
@@ -171,7 +189,7 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
     let streams = (0..workers).map(|_| ctx.new_stream()).collect::<Result<Vec<_>, _>>()?;
     std::thread::scope(|s| {
         for ws in &streams {
-            let (feed, next, failed, results, errors, sink, names) = (&feed, &next, &failed, &results, &errors, sink.clone(), &names);
+            let (feed, next, failed, results, errors, sink, names, work, budget) = (&feed, &next, &failed, &results, &errors, sink.clone(), &names, &work, &budget);
             s.spawn(move || {
                 crate::progress::with_sink(sink, || {
                     let _ = ctx.bind_to_thread();
@@ -186,19 +204,20 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
                             g
                         };
                         let reader = feed.lock().unwrap().reader();
-                        let claimed = match reader {
-                            Some(r) => r.take(claimed).map(|b| (claimed, Some(b))),
-                            None => Ok((claimed, None)),
+                        let (claimed, lease) = match reader {
+                            Some(r) => (r.take(claimed).map(|b| (claimed, Some(b))), None),
+                            None => (Ok((claimed, None)), Some(budget.acquire(feed.lock().unwrap().size(claimed)))),
                         };
                         let outcome = claimed.and_then(|(g, batch)| {
                             let view = ck.with_staged(batch);
-                            let up = upload_group(ws, &view, spec, range, role, Work::of(g))?;
+                            let up = upload_group(ws, &view, spec, range, role, work[g])?;
                             if !view.has_staged() {
                                 view.release_names(&names[g]);
                             }
                             drop(view);
                             Ok((g, up))
                         });
+                        drop(lease);
                         match outcome {
                             Ok((g, up)) => {
                                 results.lock().unwrap().push(up);
@@ -225,22 +244,34 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
     }
     stream.synchronize()?;
     let mut layers: Vec<Option<DeviceLayer>> = (0..spec.layers.count).map(|_| None).collect();
-    let (mut outside, mut mtp) = (None, None);
+    let (mut head, mut embed, mut mtp, mut draft) = (None, None, None, None);
     for up in results.into_inner().unwrap() {
         match up {
             Uploaded::Layer(i, l) => layers[i] = Some(l),
-            Uploaded::Head(o, m) => {
-                if let Uploaded::Outside(e, n, h) = *o {
-                    outside = Some((e, n, h));
-                }
-                mtp = Some(m);
+            Uploaded::Head { norm, lm_head, embed: tied, draft: d } => {
+                head = Some((norm, lm_head));
+                embed = embed.or(tied);
+                draft = d;
             }
-            Uploaded::Outside(e, n, h) => outside = Some((e, n, h)),
+            Uploaded::Embed(e) => embed = Some(e),
+            Uploaded::Mtp(m) => mtp = m,
         }
     }
-    let (embed, norm, lm_head) = outside.context("the embedding and head were not loaded")?;
+    if let Some(m) = mtp.as_mut() {
+        m.set_head(draft);
+    }
+    let embed = match embed {
+        Some(e) => e,
+        None if role.first => anyhow::bail!("the embedding was not loaded"),
+        None => stream.alloc_zeros(1)?,
+    };
+    let (norm, lm_head) = match head {
+        Some(h) => h,
+        None if role.last => anyhow::bail!("the head was not loaded"),
+        None => (stream.alloc_zeros(1)?, DeviceMatrix::Bf16(stream.alloc_zeros(1)?)),
+    };
     let layers = layers.into_iter().enumerate().map(|(i, l)| l.with_context(|| format!("layer {} was not loaded", range.start + i))).collect::<Result<Vec<_>>>()?;
-    Ok(Weights { layers, embed, norm, lm_head, mtp: mtp.flatten(), direct })
+    Ok(Weights { layers, embed, norm, lm_head, mtp, direct })
 }
 
 enum DeviceMatrix {

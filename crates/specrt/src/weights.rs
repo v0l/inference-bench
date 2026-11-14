@@ -240,7 +240,7 @@ impl Checkpoint {
     }
 
     pub fn cached(&self, opts: &crate::loader::LoaderOptions) -> bool {
-        opts.skip_cached && self.is_safetensors() && self.resident_fraction() >= 0.95
+        opts.skip_cached && self.is_safetensors() && self.resident_fraction() >= 0.8
     }
 
     pub fn with_staged(&self, batch: Option<crate::loader::Batch>) -> Checkpoint {
@@ -1110,6 +1110,7 @@ impl Feed {
         groups: Vec<Vec<String>>,
         opts: &crate::loader::LoaderOptions,
         ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        budget: std::sync::Arc<crate::loader::Budget>,
     ) -> Result<Feed> {
         let mut items = Vec::with_capacity(groups.len());
         for g in &groups {
@@ -1118,7 +1119,7 @@ impl Feed {
         let sizes: Vec<u64> = items.iter().map(|g| g.iter().map(|i| i.len).sum()).collect();
         let total = sizes.iter().sum();
         let reader = if opts.enabled && ck.is_safetensors() && !groups.is_empty() && !ck.cached(opts) {
-            Some(std::sync::Arc::new(crate::loader::Prefetcher::start(&ck.files, items, *opts, Some(ctx.clone()))?))
+            Some(std::sync::Arc::new(crate::loader::Prefetcher::start(&ck.files, items, *opts, Some(ctx.clone()), budget)?))
         } else {
             None
         };
@@ -1136,6 +1137,10 @@ impl Feed {
 
     pub fn reader(&self) -> Option<std::sync::Arc<crate::loader::Prefetcher>> {
         self.reader.clone()
+    }
+
+    pub fn size(&self, group: usize) -> u64 {
+        self.sizes.get(group).copied().unwrap_or(0)
     }
 
     pub fn finished(&mut self, group: usize) {

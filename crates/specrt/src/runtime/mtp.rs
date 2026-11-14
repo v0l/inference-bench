@@ -21,7 +21,11 @@ pub(super) struct DeviceMtp {
 }
 
 impl DeviceMtp {
-    pub(super) fn load(stream: &Arc<CudaStream>, checkpoint: &Checkpoint, spec: &Spec) -> Result<Option<DeviceMtp>> {
+    pub(super) fn set_head(&mut self, head: Option<DeviceMatrix>) {
+        self.head = head;
+    }
+
+    pub(super) fn load(stream: &Arc<CudaStream>, checkpoint: &Checkpoint, spec: &Spec, with_head: bool) -> Result<Option<DeviceMtp>> {
         if spec.speculative().is_none() {
             return Ok(None);
         }
@@ -53,7 +57,7 @@ impl DeviceMtp {
             norm_hidden: stream.clone_htod(&w.norm_hidden)?,
             norm: stream.clone_htod(&w.norm)?,
             layer,
-            head: match spec.draft_head_quant() {
+            head: match spec.draft_head_quant().filter(|_| with_head) {
                 Some(q) => Some(DeviceMatrix::upload(stream, &checkpoint.draft_head(spec, q)?)?),
                 None => None,
             },
