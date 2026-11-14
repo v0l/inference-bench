@@ -427,7 +427,7 @@ mod tests {
         }
 
         fn sampling_defaults(&self) -> specrt::engine::SamplingDefaults {
-            specrt::engine::SamplingDefaults { top_k: Some(20), top_p: Some(0.95), min_p: None }
+            specrt::engine::SamplingDefaults { top_k: Some(20), top_p: Some(0.95), min_p: None, ..Default::default() }
         }
     }
 

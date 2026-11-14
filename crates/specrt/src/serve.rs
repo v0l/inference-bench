@@ -38,12 +38,10 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel}
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub const DEFAULT_MAX_MODEL_LEN: usize = 131072;
-pub const MAX_MODEL_LEN: usize = 262144;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServeOptions {
-    pub max_model_len: usize,
+    pub max_model_len: Option<usize>,
     pub max_num_seqs: usize,
     pub kv_cache_bytes: Option<u64>,
     pub max_batched_tokens: usize,
@@ -56,7 +54,7 @@ pub struct ServeOptions {
 impl Default for ServeOptions {
     fn default() -> Self {
         ServeOptions {
-            max_model_len: DEFAULT_MAX_MODEL_LEN,
+            max_model_len: None,
             max_num_seqs: 32,
             kv_cache_bytes: None,
             max_batched_tokens: 8192,
@@ -69,9 +67,18 @@ impl Default for ServeOptions {
 }
 
 impl ServeOptions {
+    pub fn model_len(&self, spec: &Spec) -> Result<usize> {
+        let model_max = crate::engine::model_max_context(spec);
+        match self.max_model_len {
+            Some(n) => crate::engine::limit_context(n, model_max),
+            None => Ok(model_max.unwrap_or(crate::engine::DEFAULT_CTX)),
+        }
+    }
+
     pub fn layout(&self, spec: &Spec) -> Layout {
         let kv = self.kv_cache_bytes.map(|b| b as usize);
-        let mut layout = Layout::serving(spec, self.max_model_len, self.max_num_seqs, kv);
+        let len = self.model_len(spec).unwrap_or(crate::engine::DEFAULT_CTX);
+        let mut layout = Layout::serving(spec, len, self.max_num_seqs, kv);
         layout.prefill_chunk = layout.prefill_chunk.min(self.max_batched_tokens.max(64));
         layout
     }
@@ -187,14 +194,13 @@ pub struct Core {
 
 impl Core {
     pub fn start(spec: &Spec, opts: ServeOptions) -> Result<Arc<Core>> {
-        anyhow::ensure!(opts.max_model_len <= MAX_MODEL_LEN, "max_model_len above {MAX_MODEL_LEN}");
+        let max_model_len = opts.model_len(spec)?;
         anyhow::ensure!(opts.max_num_seqs >= 1, "max_num_seqs must be at least 1");
         let (jobs, inbox) = channel::<Job>();
         let (ready_tx, ready) = channel::<Result<bool>>();
         let stats = Arc::new(Mutex::new(Stats::default()));
         let shared = stats.clone();
         let spec = spec.clone();
-        let max_model_len = opts.max_model_len;
         let thread = std::thread::Builder::new()
             .name("specrt-serve".into())
             .spawn(move || {
@@ -626,6 +632,7 @@ impl Serving {
         on_text: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion> {
         let started = Instant::now();
+        let max_tokens = crate::engine::output_budget(max_tokens, prompt.len(), self.core.max_model_len(), crate::spec::MAX_DRAFT_TOKENS, &self.assets.sampling);
         let (tx, rx) = channel();
         let stop = if use_stop { self.assets.stop.clone() } else { Vec::new() };
         let request = sched::Request { prompt, max_tokens, sampling, stop, salt, media };

@@ -8,7 +8,40 @@ use std::path::Path;
 use tokenizers::Tokenizer;
 
 pub const DEFAULT_CTX: usize = 2048;
-pub const MAX_CTX: usize = 131072;
+pub const UNTIL_FULL: usize = usize::MAX;
+
+pub fn model_max_context(spec: &Spec) -> Option<usize> {
+    if spec.repo.ends_with(".gguf") {
+        let g = crate::gguf::Gguf::open(Path::new(&spec.repo)).ok()?;
+        return g.count(&format!("{}.context_length", g.architecture().ok()?));
+    }
+    let direct = Path::new(&spec.repo).join("config.json");
+    let path = if direct.is_file() { direct } else { find_in_snapshot(&spec.repo, "config.json").ok()? };
+    context_from_config(&std::fs::read_to_string(path).ok()?)
+}
+
+pub fn context_from_config(json: &str) -> Option<usize> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    v["text_config"]["max_position_embeddings"].as_u64().or(v["max_position_embeddings"].as_u64()).map(|n| n as usize)
+}
+
+pub fn limit_context(requested: usize, model_max: Option<usize>) -> Result<usize> {
+    if let Some(max) = model_max
+        && requested > max
+    {
+        bail!("a context of {requested} tokens is above the {max} this model supports (max_position_embeddings in its config)");
+    }
+    Ok(requested)
+}
+
+pub fn output_budget(requested: usize, prompt: usize, ctx: usize, reserve: usize, defaults: &SamplingDefaults) -> usize {
+    if requested != UNTIL_FULL {
+        return requested;
+    }
+    let room = ctx.saturating_sub(prompt + reserve).max(1);
+    let configured = defaults.max_new_tokens.or(defaults.max_length.map(|n| n.saturating_sub(prompt).max(1)));
+    configured.map_or(room, |n| n.min(room))
+}
 
 pub fn resolve_spec(model: &str) -> Result<Spec> {
     if model.ends_with(".toml") {
@@ -47,6 +80,8 @@ pub struct SamplingDefaults {
     pub top_k: Option<u32>,
     pub top_p: Option<f32>,
     pub min_p: Option<f32>,
+    pub max_new_tokens: Option<usize>,
+    pub max_length: Option<usize>,
 }
 
 impl SamplingDefaults {
@@ -56,6 +91,8 @@ impl SamplingDefaults {
             top_k: v["top_k"].as_u64().map(|n| n as u32),
             top_p: v["top_p"].as_f64().map(|n| n as f32),
             min_p: v["min_p"].as_f64().map(|n| n as f32),
+            max_new_tokens: v["max_new_tokens"].as_u64().map(|n| n as usize),
+            max_length: v["max_length"].as_u64().map(|n| n as usize),
         }
     }
 }
@@ -359,7 +396,8 @@ impl Engine {
         if let Some(r) = runtime {
             spec.runtime = r.clone();
         }
-        let max_ctx = max_ctx.unwrap_or(DEFAULT_CTX).min(MAX_CTX);
+        let model_max = model_max_context(&spec);
+        let max_ctx = limit_context(max_ctx.unwrap_or(DEFAULT_CTX), model_max)?;
         tracing::info!(model, spec = %spec.name, max_ctx, "loading model");
         let runtime = Device::load(&spec, max_ctx)?;
         Ok(Self { spec, tokenizer, chat, runtime, max_ctx, stop, sampling, media })
@@ -432,6 +470,7 @@ impl Engine {
         streaming: bool,
         on_text: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Reply> {
+        let max_tokens = output_budget(max_tokens, ids.len(), self.max_ctx, 0, &self.sampling);
         self.fits(ids.len(), max_tokens)?;
         let mut so_far: Vec<u32> = Vec::new();
         let mut sent = String::new();
@@ -526,8 +565,45 @@ mod tests {
     #[test]
     fn sampling_defaults_come_from_generation_config() {
         let d = SamplingDefaults::from_generation_config(Some(r#"{"top_k": 20, "top_p": 0.95, "temperature": 1.0}"#));
-        assert_eq!(d, SamplingDefaults { top_k: Some(20), top_p: Some(0.95), min_p: None });
+        assert_eq!(d, SamplingDefaults { top_k: Some(20), top_p: Some(0.95), ..Default::default() });
         assert_eq!(SamplingDefaults::from_generation_config(None), SamplingDefaults::default());
+    }
+
+    #[test]
+    fn the_model_config_sets_the_maximum_context() {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/qwen3.8-27b.config.json")).unwrap();
+        assert_eq!(context_from_config(&text), Some(262144));
+        assert_eq!(context_from_config(r#"{"max_position_embeddings": 40960}"#), Some(40960));
+        assert_eq!(context_from_config(r#"{"max_position_embeddings": 8, "text_config": {"max_position_embeddings": 99}}"#), Some(99));
+        assert_eq!(limit_context(262144, Some(262144)).unwrap(), 262144);
+        let e = limit_context(262145, Some(262144)).unwrap_err().to_string();
+        assert!(e.contains("262144") && e.contains("max_position_embeddings"), "{e}");
+    }
+
+    #[test]
+    fn an_omitted_max_tokens_runs_until_the_context_is_full() {
+        let none = SamplingDefaults::default();
+        assert_eq!(output_budget(UNTIL_FULL, 1000, 262144, 0, &none), 261144);
+        assert_eq!(output_budget(UNTIL_FULL, 1000, 262144, 2, &none), 261142);
+        assert_eq!(output_budget(300, 1000, 262144, 0, &none), 300);
+        let cfg = SamplingDefaults::from_generation_config(Some(r#"{"max_new_tokens": 4096}"#));
+        assert_eq!(output_budget(UNTIL_FULL, 1000, 262144, 0, &cfg), 4096);
+        assert_eq!(output_budget(UNTIL_FULL, 1000, 2000, 0, &cfg), 1000);
+        let len = SamplingDefaults::from_generation_config(Some(r#"{"max_length": 5000}"#));
+        assert_eq!(output_budget(UNTIL_FULL, 1000, 262144, 0, &len), 4000);
+    }
+
+    #[test]
+    fn kv_paging_and_flat_offsets_do_not_overflow_i32_at_262144() {
+        let ctx = 262144usize;
+        let pages = ctx.div_ceil(crate::codegen::PAGE);
+        let slots = 33usize;
+        assert!(((slots + 1) * pages) < i32::MAX as usize);
+        assert!(ctx * 3 * (slots + 1) < i32::MAX as usize);
+        let spec = Spec::from_hf_config(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/qwen3.8-27b.config.json")).unwrap()).unwrap();
+        let block_elems = crate::runtime::kv_block_bytes(&spec, 2) / 4;
+        assert!(block_elems * pages < u32::MAX as usize * 4);
+        assert!(spec.attention.kv_heads * ctx * spec.attention.head_dim < i32::MAX as usize);
     }
 
     #[test]

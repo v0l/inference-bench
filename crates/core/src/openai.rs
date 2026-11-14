@@ -127,6 +127,9 @@ impl Target for OpenAi {
         if let Some(seed) = s.seed {
             body["seed"] = json!(seed);
         }
+        if s.max_tokens == crate::chat::UNTIL_FULL {
+            body.as_object_mut().map(|o| o.remove("max_tokens"));
+        }
         let endpoint = match request.use_template {
             true => {
                 body["messages"] = request.messages_json();

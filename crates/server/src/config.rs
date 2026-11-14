@@ -129,7 +129,7 @@ pub struct ServerConfig {
     pub max_loaded_models: usize,
     pub prefix_cache_share_across_keys: bool,
     pub vram_budget_bytes: Option<u64>,
-    pub default_max_tokens: usize,
+    pub default_max_tokens: Option<usize>,
     pub top_k: Option<u32>,
     pub top_p: Option<f32>,
     pub min_p: Option<f32>,
@@ -172,7 +172,7 @@ impl Default for ServerConfig {
             max_loaded_models: 1,
             prefix_cache_share_across_keys: false,
             vram_budget_bytes: None,
-            default_max_tokens: 256,
+            default_max_tokens: None,
             top_k: None,
             top_p: None,
             min_p: None,
@@ -269,13 +269,8 @@ impl ServerConfig {
         anyhow::ensure!(self.media.max_image_bytes > 0 && self.media.max_video_bytes > 0, "media byte limits must be positive");
         anyhow::ensure!(self.max_concurrent >= 1, "max_concurrent must be at least 1");
         anyhow::ensure!(self.max_num_seqs != Some(0), "max_num_seqs must be at least 1");
-        if let Some(n) = self.max_model_len {
-            anyhow::ensure!(
-                (16..=inference_bench_core::specrt_serve::MAX_MODEL_LEN).contains(&n),
-                "max_model_len must be between 16 and {}",
-                inference_bench_core::specrt_serve::MAX_MODEL_LEN
-            );
-        }
+        anyhow::ensure!(self.max_model_len.is_none_or(|n| n >= 16), "max_model_len must be at least 16");
+        anyhow::ensure!(self.default_max_tokens != Some(0), "default_max_tokens must be at least 1");
         anyhow::ensure!(self.kv_cache_gb.is_none_or(|g| g > 0.0), "kv_cache_gb must be positive");
         anyhow::ensure!(self.max_loaded_models >= 1, "max_loaded_models must be at least 1");
         if let Some(p) = &self.tool_parser {
@@ -310,7 +305,7 @@ impl ServerConfig {
         let seqs = self.max_num_seqs?;
         let d = inference_bench_core::specrt_serve::ServeOptions::default();
         Some(inference_bench_core::specrt_serve::ServeOptions {
-            max_model_len: self.max_model_len.or(self.max_ctx_for(m)).unwrap_or(d.max_model_len),
+            max_model_len: self.max_model_len.or(self.max_ctx_for(m)),
             max_num_seqs: seqs,
             kv_cache_bytes: self.kv_cache_gb.map(|g| (g * (1u64 << 30) as f64) as u64),
             max_batched_tokens: self.max_batched_tokens.unwrap_or(d.max_batched_tokens),
@@ -435,7 +430,7 @@ python = "python3"
         )
         .unwrap();
         let o = c.serve_options(&c.models[0]).unwrap();
-        assert_eq!((o.max_num_seqs, o.max_model_len, o.max_batched_tokens), (32, 262144, 16384));
+        assert_eq!((o.max_num_seqs, o.max_model_len, o.max_batched_tokens), (32, Some(262144), 16384));
         assert_eq!(o.kv_cache_bytes, Some(7 << 30));
         assert_eq!(o.itl_target, std::time::Duration::from_millis(80));
         assert_eq!(c.concurrency(), 32);
@@ -443,8 +438,8 @@ python = "python3"
         assert!(plain.serve_options(&plain.models[0]).is_none());
         assert_eq!(plain.concurrency(), 1);
         let c = ServerConfig::parse("max_num_seqs = 4\nmax_ctx = 8192\n[[models]]\nid='m'").unwrap();
-        assert_eq!(c.serve_options(&c.models[0]).unwrap().max_model_len, 8192);
-        assert!(ServerConfig::parse("max_model_len = 300000").is_err());
+        assert_eq!(c.serve_options(&c.models[0]).unwrap().max_model_len, Some(8192));
+        assert!(ServerConfig::parse("max_model_len = 8").is_err());
         assert!(ServerConfig::parse("max_num_seqs = 0").is_err());
     }
 

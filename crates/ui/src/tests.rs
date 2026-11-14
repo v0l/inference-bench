@@ -224,10 +224,21 @@ fn the_context_slider_stops_at_the_models_own_maximum() {
 }
 
 #[test]
-fn a_model_with_a_huge_context_is_capped_at_what_the_engine_allows() {
-    let a = detail_view("big", Some("qwen3.8-27b-exact.toml")).anatomy;
-    assert_eq!(a.max_context, 131072);
-    assert_eq!(crate::load::max_context(&a), specrt::engine::MAX_CTX);
+fn the_27b_config_gives_the_load_dialog_a_262144_maximum() {
+    let mut h = harness("slider-27b", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    let d = dir("real-27b");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), d.join("config.json")).unwrap();
+    let mut m = model("Qwen3.8-27B", true, "dense decoder");
+    (m.path, m.root) = (d.clone(), d);
+    m.context_length = None;
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    let dialog = h.state().load.as_ref().unwrap();
+    assert_eq!(dialog.max, 262144);
+    assert_eq!(crate::load::max_context(&dialog.view.as_ref().unwrap().anatomy), 262144);
 }
 
 #[test]
@@ -853,7 +864,7 @@ fn detail_view(name: &str, toml: Option<&str>) -> detail::View {
     match toml {
         Some(t) => {
             let spec = specrt::spec::Spec::load(&fixtures().join(t)).unwrap();
-            detail::View::new(name, spec, detail::Source::SpecToml, 1, Some(131072)).with_structure(header_structure("qwen3.8-27b-fp8"))
+            detail::View::new(name, spec, detail::Source::SpecToml, 1, Some(262144)).with_structure(header_structure("qwen3.8-27b-fp8"))
         }
         None => {
             let json = std::fs::read_to_string(fixtures().join("tiny-qwen3.5/config.json")).unwrap();

@@ -25,7 +25,7 @@ pub struct ServeArgs {
     pub max_concurrent: Option<usize>,
     #[arg(long, help = "Serve with continuous batching: most sequences decoded together")]
     pub max_num_seqs: Option<usize>,
-    #[arg(long, help = "Longest prompt plus reply with continuous batching (default 131072, up to 262144)")]
+    #[arg(long, help = "Longest prompt plus reply with continuous batching (default the model's own maximum)")]
     pub max_model_len: Option<usize>,
     #[arg(long, help = "KV cache size in GB with continuous batching (default: free memory after the weights)")]
     pub kv_cache_gb: Option<f64>,
