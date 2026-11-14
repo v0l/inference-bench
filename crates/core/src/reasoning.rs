@@ -93,7 +93,8 @@ mod tests {
         assert_eq!(canonical("a", true, false), "<think>\na");
         assert_eq!(canonical("a</think>b", true, false), "<think>\na\n</think>\n\nb");
         assert_eq!(canonical("", true, false), "");
-        assert_eq!(canonical("plain", true, true), "plain");
+        assert_eq!(canonical("plain", true, true), "<think>\nplain");
+        assert_eq!(canonical("plain", false, true), "plain");
         assert_eq!(answer_of(&canonical("a</think>b", true, true)), "b");
         assert_eq!(reasoning_of(&canonical("a</think>b", true, true)).as_deref(), Some("a"));
     }
