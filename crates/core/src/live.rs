@@ -158,7 +158,7 @@ impl Tracked {
     pub fn finish(self, g: &Generation) {
         let mut m = self.meter.inner.lock().unwrap();
         m.generated += g.completion_tokens.saturating_sub(self.pieces);
-        m.prefilled += g.prompt_tokens.saturating_sub(g.cached_tokens);
+        m.prefilled += g.prompt_tokens;
         m.requests += 1;
         let decode_tok_s = match g.decode_secs > 0.0 {
             true => g.completion_tokens.saturating_sub(1) as f64 / g.decode_secs,
@@ -195,10 +195,11 @@ impl Meter {
             Some(s) => (s.running, s.waiting + self.pending()),
             None => (self.running(), self.pending()),
         };
-        let (generated, prefilled, itl) = match &serving {
-            Some(s) => (s.generated_tokens, s.prefill_tokens_per_step.sum as u64, s.inter_token_secs.clone()),
-            None => (m.generated, m.prefilled, m.itl.clone()),
+        let (generated, itl) = match &serving {
+            Some(s) => (s.generated_tokens, s.inter_token_secs.clone()),
+            None => (m.generated, m.itl.clone()),
         };
+        let prefilled = m.prefilled;
         Reading { generated, prefilled, requests: m.requests, running, waiting, max_seqs, ttft: m.ttft.clone(), itl, serving }
     }
 }
@@ -421,6 +422,6 @@ mod tests {
         s.prefill_tokens_per_step.observe(100.0);
         s.prefill_tokens_per_step.observe(50.0);
         let r = meter.read(4, Some(s));
-        assert_eq!((r.running, r.waiting, r.prefilled, r.generated), (3, 2, 150, 40));
+        assert_eq!((r.running, r.waiting, r.prefilled, r.generated), (3, 2, 0, 40));
     }
 }

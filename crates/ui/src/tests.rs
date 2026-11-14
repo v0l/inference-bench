@@ -627,6 +627,7 @@ fn parallel_requests_with_a_real_model_run_together_and_aggregate_faster() {
         egui_bench::install(&cc.egui_ctx);
         let mut app = App::new(d, wake_for(&cc.egui_ctx));
         app.tab = Tab::Server;
+        app.logs = shared_logs();
         app
     });
     pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
@@ -658,11 +659,26 @@ fn parallel_requests_with_a_real_model_run_together_and_aggregate_faster() {
         let peak = peak.load(std::sync::atomic::Ordering::SeqCst);
         eprintln!("max_num_seqs {seqs}: 4 concurrent requests, {total} tokens, {rate:.1} tok/s aggregate, running peaked at {peak}");
         rates.push((rate, peak));
-        for _ in 0..12 {
-            h.step();
-            std::thread::sleep(Duration::from_millis(1000));
-        }
         if seqs == 4 {
+            let until = Instant::now() + Duration::from_secs(36);
+            while Instant::now() < until {
+                let u = url.clone();
+                let t = std::thread::spawn(move || burst(&u, 4, 300));
+                while !t.is_finished() {
+                    h.step();
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                t.join().unwrap();
+                for _ in 0..3 {
+                    h.step();
+                    std::thread::sleep(Duration::from_millis(1000));
+                }
+            }
+            for _ in 0..3 {
+                h.step();
+                std::thread::sleep(Duration::from_millis(1000));
+            }
+
             h.run();
             h.render().unwrap().save(out.join("server-live.png")).unwrap();
         }
@@ -670,6 +686,32 @@ fn parallel_requests_with_a_real_model_run_together_and_aggregate_faster() {
     assert_eq!(rates[0].1, 1);
     assert_eq!(rates[1].1, 4);
     assert!(rates[1].0 > rates[0].0 * 1.5, "{rates:?}");
+    h.state_mut().server.stop();
+}
+
+#[test]
+fn after_a_request_prompt_rate_kv_and_the_request_log_all_show_numbers() {
+    let mut h = serving_harness("after-request", 4);
+    let url = h.state().server.running.as_ref().unwrap().url();
+    chat_once(&url);
+    let start = Instant::now();
+    while !h.state().engine.handle().history().lock().unwrap().points().any(|p| p.prefill_tok_s > 0.0) {
+        assert!(start.elapsed() < Duration::from_secs(10), "prompt tok/s never rose above 0");
+        h.step();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    h.run();
+    let snap = crate::serving::snapshot(h.state(), crate::serving::Span::Five);
+    assert!(snap.last.as_ref().unwrap().prefill_tok_s > 0.0, "{:?}", snap.last);
+    assert!(snap.prefill.iter().any(|v| *v > 0.0));
+    let r = snap.reading.unwrap();
+    let shown = crate::serving::readings(&r, 0.0);
+    let kv = shown.iter().find(|(l, _, _)| *l == "kv cache").unwrap();
+    assert!(kv.1.starts_with("0 MB / "), "{}", kv.1);
+    assert!(!kv.1.contains('-'), "{}", kv.1);
+    let lines = crate::server::request_lines(&h.state().logs);
+    assert!(lines.iter().any(|l| l.request == "POST /v1/chat/completions" && l.status == 200), "request log has no API request");
+    assert!(h.query_by_label("no requests yet").is_none());
     h.state_mut().server.stop();
 }
 

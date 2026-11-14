@@ -109,14 +109,14 @@ impl ServerState {
     }
 }
 
-struct RequestLine {
-    time: String,
-    request: String,
-    status: u16,
-    ms: String,
+pub struct RequestLine {
+    pub time: String,
+    pub request: String,
+    pub status: u16,
+    pub ms: String,
 }
 
-fn request_lines(logs: &LogBuffer) -> Vec<RequestLine> {
+pub fn request_lines(logs: &LogBuffer) -> Vec<RequestLine> {
     logs.snapshot(Level::INFO, "request finished")
         .iter()
         .rev()

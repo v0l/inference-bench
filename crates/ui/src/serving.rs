@@ -61,6 +61,13 @@ pub fn snapshot(app: &App, span: Span) -> Snapshot {
     }
 }
 
+fn size(bytes: u64) -> String {
+    match bytes {
+        b if b >= 1 << 30 => format!("{:.1} GB", b as f64 / (1u64 << 30) as f64),
+        b => format!("{:.0} MB", b as f64 / (1u64 << 20) as f64),
+    }
+}
+
 fn percent(num: u64, den: u64) -> Option<String> {
     (den > 0).then(|| format!("{:.0}%", num as f64 * 100.0 / den as f64))
 }
@@ -75,7 +82,7 @@ pub fn readings(r: &Reading, per_minute: f64) -> Vec<(&'static str, String, egui
         let block = s.kv_block_bytes as u64;
         out.push((
             "kv cache",
-            format!("{} / {}", human_size(s.kv_blocks_used as u64 * block), human_size(s.kv_blocks_total as u64 * block)),
+            format!("{} / {}", size(s.kv_blocks_used as u64 * block), size(s.kv_blocks_total as u64 * block)),
             TRACE,
         ));
         out.push(("kv blocks", format!("{} / {}", s.kv_blocks_used, s.kv_blocks_total), TRACE));
@@ -121,7 +128,7 @@ fn charts(ui: &mut egui::Ui, s: &Snapshot, max_seqs: usize, with_kv: bool) {
         chart(&mut cols[1], "inter-token p50 and p95", format!("{} / {}", ms(p.itl_p50), ms(p.itl_p95)), &[&s.itl_p50, &s.itl_p95], 20.0);
         chart(&mut cols[1], "running sequences", format!("{} of {max_seqs}", p.running), &[&s.running], max_seqs.max(1) as f32);
         if with_kv {
-            let used = format!("{} of {}", human_size(kv_used as u64), human_size(kv_total as u64));
+            let used = format!("{} of {}", size(kv_used as u64), size(kv_total as u64));
             chart(&mut cols[1], "kv cache used", used, &[&s.kv], (kv_total / (1u64 << 30) as f64).max(0.1) as f32);
         }
     });
