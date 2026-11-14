@@ -1,5 +1,6 @@
 use crate::config::ServerConfig;
 use crate::error::ApiError;
+use crate::landing::{self, ApiRoute, routes_json};
 use crate::manager::{EngineFactory, GpuProbe, Manager, ModelSource};
 use crate::metrics::{Gauges, Metrics, percentile};
 use crate::stop::StopFilter;
@@ -9,8 +10,8 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
 use inference_bench_core::chat::{ChatRequest, Message, Role, Sampling};
@@ -141,19 +142,30 @@ impl Drop for Admission {
     }
 }
 
+fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
+    let r = |method, path, purpose| ApiRoute { method, path, purpose };
+    vec![
+        (r("GET", "/", "This page; JSON with Accept: application/json"), get(landing)),
+        (r("GET", "/health", "Liveness, uptime and loaded models"), get(health)),
+        (r("GET", "/metrics", "Prometheus metrics"), get(metrics)),
+        (r("GET", "/v1/models", "List models (OpenAI)"), get(list_models)),
+        (r("POST", "/v1/chat/completions", "Chat completions, streaming, tools"), post(chat_completions)),
+        (r("POST", "/v1/completions", "Text completions"), post(completions)),
+        (r("POST", "/v1/embeddings", "Embeddings (not supported yet)"), post(embeddings)),
+        (r("POST", "/v1/bench", "Run a timed generation"), post(bench)),
+        (r("GET", "/admin/models", "Model status and VRAM"), get(admin_models)),
+        (r("POST", "/admin/models/{id}/load", "Load a model"), post(admin_load)),
+        (r("POST", "/admin/models/{id}/unload", "Unload a model"), post(admin_unload)),
+        (r("GET", "/admin/specs", "Model spec layers and update state"), get(admin_specs)),
+    ]
+}
+
 pub fn router(state: Arc<AppState>) -> Router {
-    let mut app = Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics))
-        .route("/v1/models", get(list_models))
-        .route("/v1/chat/completions", post(chat_completions))
-        .route("/v1/completions", post(completions))
-        .route("/v1/embeddings", post(embeddings))
-        .route("/v1/bench", post(bench))
-        .route("/admin/models", get(admin_models))
-        .route("/admin/models/{id}/load", post(admin_load))
-        .route("/admin/models/{id}/unload", post(admin_unload))
-        .route("/admin/specs", get(admin_specs))
+    let mut app = Router::new();
+    for (route, handler) in api_routes() {
+        app = app.route(route.path, handler);
+    }
+    let mut app = app
         .layer(axum::extract::DefaultBodyLimit::max(state.config.media.request_body_limit()))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(middleware::from_fn_with_state(state.clone(), request_scope))
@@ -243,7 +255,7 @@ fn endpoint_label(path: &str) -> &'static str {
 
 async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path();
-    let open = path == "/health" || (path == "/metrics" && !state.config.protect_metrics);
+    let open = path == "/" || path == "/health" || (path == "/metrics" && !state.config.protect_metrics);
     if !state.auth_required() || open || req.method() == axum::http::Method::OPTIONS {
         return next.run(req).await;
     }
@@ -265,6 +277,59 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+}
+
+async fn landing(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("localhost").to_string();
+    let total = tokio::task::spawn_blocking(crate::gpu::smi_total_bytes).await.ok().flatten();
+    let used = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || state.manager.gpu_used()).await.ok().flatten()
+    };
+    let parallel = state.config.concurrency();
+    let models: Vec<Value> = state
+        .manager
+        .status()
+        .into_iter()
+        .map(|m| {
+            let max_ctx = state.config.models.iter().find(|c| c.id == m.id).and_then(|c| c.max_ctx);
+            json!({
+                "id": m.id,
+                "state": if m.loaded { "loaded" } else { "not loaded" },
+                "loaded": m.loaded,
+                "max_ctx": max_ctx,
+                "parallel_requests": parallel,
+                "active_requests": m.active_requests,
+                "vram_bytes": m.vram_bytes,
+            })
+        })
+        .collect();
+    let s = state.metrics.summary();
+    let info = json!({
+        "name": "inference-bench",
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_hash": env!("INFERENCE_BENCH_GIT_HASH"),
+        "uptime_secs": state.started.elapsed().as_secs(),
+        "base_url": format!("http://{host}/v1"),
+        "auth_required": state.auth_required(),
+        "gpu": {"used_bytes": used, "total_bytes": total},
+        "models": models,
+        "stats": {
+            "requests": s.requests,
+            "prompt_tokens": s.prompt_tokens,
+            "completion_tokens": s.completion_tokens,
+            "ttft_p50_ms": s.ttft_p50_secs.map(|v| v * 1000.0),
+        },
+        "routes": routes_json(&api_routes().into_iter().map(|(r, _)| r).collect::<Vec<_>>()),
+    });
+    let wants_json = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("application/json") && !a.contains("text/html"));
+    match wants_json {
+        true => Json(info).into_response(),
+        false => Html(landing::render(&info)).into_response(),
+    }
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {

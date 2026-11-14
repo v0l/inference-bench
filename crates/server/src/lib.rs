@@ -4,6 +4,7 @@ pub mod config;
 pub mod engine_backend;
 pub mod error;
 pub mod gpu;
+pub mod landing;
 pub mod manager;
 pub mod metrics;
 pub mod serve;

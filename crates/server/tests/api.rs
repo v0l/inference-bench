@@ -513,3 +513,63 @@ fn a_request_body_above_the_old_two_megabyte_default_is_accepted_when_media_limi
     assert_eq!(status, 413);
     rig.stop();
 }
+
+fn get_accept(rig: &Rig, path: &str, accept: &str) -> (u16, String) {
+    let mut resp = agent().get(format!("{}{path}", rig.url)).header("Accept", accept).call().unwrap();
+    (resp.status().as_u16(), resp.body_mut().read_to_string().unwrap())
+}
+
+const ROUTES: &[&str] = &[
+    "/health",
+    "/metrics",
+    "/v1/models",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/bench",
+    "/admin/models",
+    "/admin/models/{id}/load",
+    "/admin/models/{id}/unload",
+    "/admin/specs",
+];
+
+#[test]
+fn landing_page_is_html_and_lists_every_route() {
+    let rig = start(config("[[models]]\nid='alpha'\nmax_ctx=4096"), Shape::default());
+    let (status, body, headers) = rig.get("/", None);
+    assert_eq!(status, 200);
+    assert!(header(&headers, "content-type").unwrap().starts_with("text/html"));
+    for path in ROUTES {
+        assert!(body.contains(path), "{path} missing");
+    }
+    assert!(body.contains("alpha") && body.contains("4096") && body.contains("/v1</code>"));
+    rig.stop();
+}
+
+#[test]
+fn landing_page_returns_json_when_asked() {
+    let rig = start(config("[[models]]\nid='alpha'"), Shape::default());
+    let (status, body) = get_accept(&rig, "/", "application/json");
+    assert_eq!(status, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["name"], "inference-bench");
+    assert_eq!(v["auth_required"], false);
+    assert_eq!(v["models"][0]["id"], "alpha");
+    let paths: Vec<_> = v["routes"].as_array().unwrap().iter().map(|r| r["path"].as_str().unwrap()).collect();
+    for path in ROUTES {
+        assert!(paths.contains(path), "{path} missing");
+    }
+    rig.stop();
+}
+
+#[test]
+fn landing_page_is_public_and_hides_the_key() {
+    let rig = start(config("api_keys = ['sk-secret-one']\n[[models]]\nid='m'"), Shape::default());
+    let (status, body, _) = rig.get("/", None);
+    assert_eq!(status, 200);
+    assert!(!body.contains("sk-secret-one"));
+    assert!(body.contains("required"));
+    let (_, json) = get_accept(&rig, "/", "application/json");
+    assert!(!json.contains("sk-secret-one"));
+    rig.stop();
+}

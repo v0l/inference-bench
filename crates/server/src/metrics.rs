@@ -54,7 +54,32 @@ pub struct Gauges {
     pub engine: String,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Summary {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub ttft_p50_secs: Option<f64>,
+}
+
 impl Metrics {
+    pub fn summary(&self) -> Summary {
+        let m = self.inner.lock().unwrap();
+        let ttft_p50_secs = (m.ttft.total > 0)
+            .then(|| {
+                let half = m.ttft.total.div_ceil(2);
+                TTFT_BUCKETS.iter().zip(m.ttft.counts.iter()).find(|(_, c)| **c >= half).map(|(b, _)| *b)
+            })
+            .flatten()
+            .or((m.ttft.total > 0).then(|| m.ttft.sum / m.ttft.total as f64));
+        Summary {
+            requests: m.requests.values().sum(),
+            prompt_tokens: m.prompt_tokens.values().sum(),
+            completion_tokens: m.completion_tokens.values().sum(),
+            ttft_p50_secs,
+        }
+    }
+
     pub fn request(&self, endpoint: &str, status: u16) {
         *self.inner.lock().unwrap().requests.entry((endpoint.to_string(), status)).or_default() += 1;
     }

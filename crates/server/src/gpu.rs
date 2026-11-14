@@ -30,3 +30,15 @@ pub fn driver_used_bytes() -> Option<u64> {
 pub fn used_bytes() -> Option<u64> {
     smi_used_bytes().or_else(driver_used_bytes)
 }
+
+pub fn smi_total_bytes() -> Option<u64> {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mib: u64 = String::from_utf8_lossy(&out.stdout).lines().next()?.trim().parse().ok()?;
+    Some(mib * 1024 * 1024)
+}
