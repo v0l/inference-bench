@@ -99,6 +99,10 @@ impl Target for ServingTarget {
     fn metrics(&self) -> Option<String> {
         self.serving.as_ref().map(|s| render(&s.stats()))
     }
+
+    fn stats(&self) -> Option<Stats> {
+        self.serving.as_ref().map(|s| s.stats())
+    }
 }
 
 fn histogram(o: &mut String, name: &str, help: &str, h: &Histogram) {

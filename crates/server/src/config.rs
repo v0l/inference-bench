@@ -308,6 +308,7 @@ impl ServerConfig {
             max_model_len: self.max_model_len.or(self.max_ctx_for(m)),
             max_num_seqs: seqs,
             kv_cache_bytes: self.kv_cache_gb.map(|g| (g * (1u64 << 30) as f64) as u64),
+            kv_cache_tokens: None,
             max_batched_tokens: self.max_batched_tokens.unwrap_or(d.max_batched_tokens),
             itl_target: self.itl_target_ms.map(std::time::Duration::from_millis).unwrap_or(d.itl_target),
             runtime: self.runtime.clone(),

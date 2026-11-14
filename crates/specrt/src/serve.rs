@@ -44,6 +44,7 @@ pub struct ServeOptions {
     pub max_model_len: Option<usize>,
     pub max_num_seqs: usize,
     pub kv_cache_bytes: Option<u64>,
+    pub kv_cache_tokens: Option<usize>,
     pub max_batched_tokens: usize,
     pub itl_target: Duration,
     pub runtime: Option<RuntimeOptions>,
@@ -57,6 +58,7 @@ impl Default for ServeOptions {
             max_model_len: None,
             max_num_seqs: 32,
             kv_cache_bytes: None,
+            kv_cache_tokens: None,
             max_batched_tokens: 8192,
             itl_target: Duration::from_millis(100),
             runtime: None,
@@ -76,7 +78,9 @@ impl ServeOptions {
     }
 
     pub fn layout(&self, spec: &Spec) -> Layout {
-        let kv = self.kv_cache_bytes.map(|b| b as usize);
+        let kv = self.kv_cache_bytes.map(|b| b as usize).or_else(|| {
+            self.kv_cache_tokens.map(|t| (t.div_ceil(crate::codegen::PAGE) + self.max_num_seqs) * kv_block_bytes(spec, 1))
+        });
         let len = self.model_len(spec).unwrap_or(crate::engine::DEFAULT_CTX);
         let mut layout = Layout::serving(spec, len, self.max_num_seqs, kv);
         layout.prefill_chunk = layout.prefill_chunk.min(self.max_batched_tokens.max(64));
@@ -97,7 +101,7 @@ pub struct Histogram {
 }
 
 impl Histogram {
-    fn new(bounds: &[f64]) -> Self {
+    pub fn new(bounds: &[f64]) -> Self {
         Histogram { bounds: bounds.to_vec(), counts: vec![0; bounds.len()], sum: 0.0, total: 0 }
     }
 
@@ -110,6 +114,36 @@ impl Histogram {
         self.sum += v;
         self.total += 1;
     }
+
+    pub fn since(&self, older: &Histogram) -> Histogram {
+        if older.bounds != self.bounds || older.total > self.total {
+            return self.clone();
+        }
+        Histogram {
+            bounds: self.bounds.clone(),
+            counts: self.counts.iter().zip(&older.counts).map(|(a, b)| a.saturating_sub(*b)).collect(),
+            sum: (self.sum - older.sum).max(0.0),
+            total: self.total - older.total,
+        }
+    }
+
+    pub fn quantile(&self, p: f64) -> Option<f64> {
+        if self.total == 0 || self.bounds.is_empty() {
+            return None;
+        }
+        let want = p.clamp(0.0, 1.0) * self.total as f64;
+        let mut below = 0.0;
+        let mut lower = 0.0;
+        for (b, c) in self.bounds.iter().zip(&self.counts) {
+            let c = *c as f64;
+            if c >= want && c > below {
+                return Some(lower + (b - lower) * ((want - below) / (c - below)).clamp(0.0, 1.0));
+            }
+            below = c;
+            lower = *b;
+        }
+        self.bounds.last().copied()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +153,7 @@ pub struct Stats {
     pub kv_blocks_used: usize,
     pub kv_blocks_total: usize,
     pub kv_block_tokens: usize,
+    pub kv_block_bytes: usize,
     pub preemptions: u64,
     pub spec_drafted: u64,
     pub spec_accepted: u64,
@@ -128,6 +163,7 @@ pub struct Stats {
     pub prefix_blocks: usize,
     pub prefix_snapshots: usize,
     pub prefix_snapshot_bytes: usize,
+    pub generated_tokens: u64,
     pub queue_secs: Histogram,
     pub inter_token_secs: Histogram,
     pub decode_batch: Histogram,
@@ -144,6 +180,7 @@ impl Default for Stats {
             kv_blocks_used: 0,
             kv_blocks_total: 0,
             kv_block_tokens: crate::codegen::PAGE,
+            kv_block_bytes: 0,
             preemptions: 0,
             spec_drafted: 0,
             spec_accepted: 0,
@@ -153,6 +190,7 @@ impl Default for Stats {
             prefix_blocks: 0,
             prefix_snapshots: 0,
             prefix_snapshot_bytes: 0,
+            generated_tokens: 0,
             queue_secs: Histogram::new(&LATENCY_BUCKETS),
             inter_token_secs: Histogram::new(&LATENCY_BUCKETS),
             decode_batch: Histogram::new(&COUNT_BUCKETS),
@@ -198,7 +236,7 @@ impl Core {
         anyhow::ensure!(opts.max_num_seqs >= 1, "max_num_seqs must be at least 1");
         let (jobs, inbox) = channel::<Job>();
         let (ready_tx, ready) = channel::<Result<bool>>();
-        let stats = Arc::new(Mutex::new(Stats::default()));
+        let stats = Arc::new(Mutex::new(Stats { kv_block_bytes: kv_block_bytes(spec, 1), ..Stats::default() }));
         let shared = stats.clone();
         let spec = spec.clone();
         let thread = std::thread::Builder::new()
@@ -497,6 +535,7 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
                     (id, SeqEvent::Started { queued })
                 }
                 Event::Token { id, token } => {
+                    s.generated_tokens += 1;
                     if let Some(l) = live.get_mut(&id) {
                         if let Some(prev) = l.last_token {
                             s.inter_token_secs.observe(now.duration_since(prev).as_secs_f64());
@@ -684,5 +723,39 @@ impl Serving {
         out.ttft_secs = first.duration_since(started).as_secs_f64();
         out.decode_secs = first.elapsed().as_secs_f64();
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod histogram_tests {
+    use super::*;
+
+    #[test]
+    fn quantiles_interpolate_inside_the_bucket() {
+        let mut h = Histogram::new(&LATENCY_BUCKETS);
+        for _ in 0..50 {
+            h.observe(0.03);
+        }
+        for _ in 0..50 {
+            h.observe(0.4);
+        }
+        let p50 = h.quantile(0.5).unwrap();
+        assert!((0.02..=0.035).contains(&p50), "{p50}");
+        let p95 = h.quantile(0.95).unwrap();
+        assert!((0.3..=0.5).contains(&p95), "{p95}");
+        assert_eq!(Histogram::new(&LATENCY_BUCKETS).quantile(0.5), None);
+    }
+
+    #[test]
+    fn a_window_is_the_difference_of_two_snapshots() {
+        let mut h = Histogram::new(&LATENCY_BUCKETS);
+        h.observe(0.03);
+        let before = h.clone();
+        h.observe(2.0);
+        h.observe(2.0);
+        let window = h.since(&before);
+        assert_eq!(window.total, 2);
+        assert!(window.quantile(0.5).unwrap() > 1.0);
+        assert_eq!(h.since(&h).quantile(0.5), None);
     }
 }

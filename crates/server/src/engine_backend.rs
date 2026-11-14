@@ -25,6 +25,14 @@ impl EngineBackend {
 }
 
 impl Target for EngineBackend {
+    fn share(&self) -> Option<Box<dyn Target>> {
+        Some(Box::new(EngineBackend::new(self.handle.clone())))
+    }
+
+    fn metrics(&self) -> Option<String> {
+        self.handle.serving_metrics()
+    }
+
     fn name(&self) -> &str {
         "engine"
     }

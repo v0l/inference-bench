@@ -256,3 +256,126 @@ impl crate::native::Model for ScriptedModel {
         Ok((reply, 100 * items.len()))
     }
 }
+
+#[derive(Default)]
+struct ServingCounters {
+    running: std::sync::atomic::AtomicUsize,
+    generated: std::sync::atomic::AtomicU64,
+    requests: std::sync::atomic::AtomicU64,
+    prefilled: std::sync::atomic::AtomicU64,
+    ttft: Mutex<Vec<f64>>,
+    itl: Mutex<Vec<f64>>,
+}
+
+pub struct ScriptedServing {
+    script: Script,
+    seqs: usize,
+    loaded: bool,
+    counters: Arc<ServingCounters>,
+}
+
+impl ScriptedServing {
+    pub fn factory(script: Script) -> crate::engine::ServingFactory {
+        Arc::new(move |opts| {
+            Some(Box::new(ScriptedServing { script: script.clone(), seqs: opts.max_num_seqs, loaded: false, counters: Default::default() }) as Box<dyn crate::target::Target>)
+        })
+    }
+}
+
+impl crate::target::Target for ScriptedServing {
+    fn name(&self) -> &str {
+        "scripted-serving"
+    }
+
+    fn capabilities(&self) -> crate::target::Capabilities {
+        crate::target::Capabilities { streaming: true, vision: self.script.vision, ..Default::default() }
+    }
+
+    fn load(&mut self, model: &str) -> Result<(), crate::result::BackendError> {
+        if !self.script.models.iter().any(|m| m == model) {
+            return Err(crate::result::BackendError::new(crate::result::ErrorKind::ModelNotFound, format!("no config.json for {model} under the fake hub")));
+        }
+        self.loaded = true;
+        Ok(())
+    }
+
+    fn generate(&mut self, request: &crate::target::Request, on_text: &mut dyn FnMut(&str)) -> Result<crate::result::Generation, crate::result::BackendError> {
+        let chat = crate::chat::ChatRequest::new(vec![crate::chat::Message::new(crate::chat::Role::User, request.prompt.clone())], crate::chat::Sampling::default());
+        crate::target::Target::chat(self, &chat, on_text)
+    }
+
+    fn chat(&mut self, request: &crate::chat::ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<crate::result::Generation, crate::result::BackendError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let c = &self.counters;
+        c.running.fetch_add(1, SeqCst);
+        let started = std::time::Instant::now();
+        thread::sleep(Duration::from_millis(self.script.first_delay_ms));
+        let mut text = String::new();
+        let mut last = None;
+        let mut pieces = 0u64;
+        for chunk in &self.script.chunks {
+            if request.cancelled() {
+                break;
+            }
+            let at = std::time::Instant::now();
+            match last {
+                Some(prev) => c.itl.lock().unwrap().push(at.duration_since(prev).as_secs_f64()),
+                None => c.ttft.lock().unwrap().push(at.duration_since(started).as_secs_f64()),
+            }
+            last = Some(at);
+            text.push_str(chunk);
+            on_text(chunk);
+            pieces += 1;
+            c.generated.fetch_add(1, SeqCst);
+            thread::sleep(Duration::from_millis(self.script.chunk_delay_ms));
+        }
+        let (prompt, completion) = self.script.usage.unwrap_or((0, pieces));
+        c.prefilled.fetch_add(prompt, SeqCst);
+        c.requests.fetch_add(1, SeqCst);
+        c.running.fetch_sub(1, SeqCst);
+        let elapsed = started.elapsed().as_secs_f64();
+        let ttft = c.ttft.lock().unwrap().last().copied().unwrap_or(elapsed);
+        Ok(crate::result::Generation {
+            text,
+            prompt_tokens: prompt,
+            completion_tokens: completion.min(pieces),
+            ttft_secs: ttft,
+            prefill_secs: ttft,
+            decode_secs: (elapsed - ttft).max(0.0),
+            ..Default::default()
+        })
+    }
+
+    fn share(&self) -> Option<Box<dyn crate::target::Target>> {
+        Some(Box::new(ScriptedServing { script: self.script.clone(), seqs: self.seqs, loaded: self.loaded, counters: self.counters.clone() }))
+    }
+
+    fn stats(&self) -> Option<specrt::serve::Stats> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let c = &self.counters;
+        let mut s = specrt::serve::Stats {
+            running: c.running.load(SeqCst).min(self.seqs),
+            waiting: c.running.load(SeqCst).saturating_sub(self.seqs),
+            kv_blocks_total: 100,
+            kv_blocks_used: c.running.load(SeqCst) * 2,
+            kv_block_bytes: 1 << 20,
+            generated_tokens: c.generated.load(SeqCst),
+            ..Default::default()
+        };
+        if c.prefilled.load(SeqCst) > 0 {
+            s.prefill_tokens_per_step.observe(c.prefilled.load(SeqCst) as f64);
+        }
+        for v in c.itl.lock().unwrap().iter() {
+            s.inter_token_secs.observe(*v);
+        }
+        Some(s)
+    }
+
+    fn metrics(&self) -> Option<String> {
+        self.stats().map(|s| crate::serving::render(&s))
+    }
+}
+
+pub fn engine(wake: crate::engine::Wake, script: Script) -> crate::engine::Engine {
+    crate::engine::Engine::with_factories(wake, ScriptedModel::factory(script.clone()), ScriptedServing::factory(script))
+}

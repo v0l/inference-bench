@@ -84,6 +84,10 @@ pub trait Target: Send {
     fn metrics(&self) -> Option<String> {
         None
     }
+
+    fn stats(&self) -> Option<specrt::serve::Stats> {
+        None
+    }
 }
 
 pub const NATIVE: &str = "specrt";

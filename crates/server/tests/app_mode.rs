@@ -24,13 +24,16 @@ struct AppRig {
 }
 
 fn app_rig() -> AppRig {
-    let engine = Engine::with_factory(Arc::new(|| {}), ScriptedModel::factory(script()));
+    app_rig_with("", Engine::with_factory(Arc::new(|| {}), ScriptedModel::factory(script())))
+}
+
+fn app_rig_with(extra: &str, engine: Engine) -> AppRig {
     let handle = engine.handle();
     let source = handle.clone();
     let factory = move |_: Option<usize>| -> Result<Box<dyn Target>, inference_bench_core::result::BackendError> {
         Ok(Box::new(inference_bench_server::engine_backend::EngineBackend::new(handle.clone())))
     };
-    let rig = start_app(config(""), factory, source);
+    let rig = start_app(config(extra), factory, source);
     AppRig { engine, rig }
 }
 
@@ -51,7 +54,7 @@ fn start_app(config: inference_bench_server::ServerConfig, factory: impl EngineF
 
 impl AppRig {
     fn load(&self, model: &str, display: &str) {
-        self.engine.send(Command::Load { model_id: model.into(), display: display.into(), max_ctx: None });
+        self.engine.send(Command::Load { model_id: model.into(), display: display.into(), max_ctx: None, max_num_seqs: None });
         loop {
             match self.engine.events.recv_timeout(Duration::from_secs(10)).unwrap() {
                 EngineEvent::Loaded(_) => return,
@@ -173,5 +176,47 @@ fn a_switch_is_followed_by_chat_on_the_new_model() {
     let (status, body) = app.chat(say(Some("Two")));
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["model"], "Two");
+    app.rig.stop();
+}
+
+#[test]
+fn four_api_requests_run_together_on_an_engine_loaded_with_four_sequences() {
+    let slow = Script { chunks: (0..30).map(|i| format!("t{i} ")).collect(), chunk_delay_ms: 10, first_delay_ms: 20, ..script() };
+    let engine = inference_bench_core::fake::engine(Arc::new(|| {}), slow);
+    let app = app_rig_with("max_num_seqs = 64\n", engine);
+    app.engine.send(Command::Load { model_id: "org/one".into(), display: "One".into(), max_ctx: Some(4096), max_num_seqs: Some(4) });
+    loop {
+        match app.engine.events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            EngineEvent::Loaded(_) => break,
+            EngineEvent::LoadFailed(e) => panic!("{e:?}"),
+            _ => {}
+        }
+    }
+    let handle = app.engine.handle();
+    let rig = &app.rig;
+    let peak = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                peak.fetch_max(handle.reading().running, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    let (status, body, _) = rig.post("/v1/chat/completions", None, json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 30}));
+                    assert_eq!(status, 200, "{body}");
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 4);
+    assert!(app.rig.metrics().contains("inference_running_seqs"));
     app.rig.stop();
 }
