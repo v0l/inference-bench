@@ -381,3 +381,56 @@ fn prefix_cached_scheduler_matches_single(dir: &str) {
 fn tiny_prefix_cached_scheduling_matches_single_sequence_greedy() {
     prefix_cached_scheduler_matches_single("tiny-qwen3.5");
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn serving_logprobs_match_a_log_softmax_of_the_full_prompt_logits() {
+    use specrt::sched::Request;
+    use specrt::serve::{Core, Job, SeqEvent, ServeOptions};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let s = spec_for("tiny-qwen3.5");
+    let prompts = mixed_prompts();
+    let new = 12;
+    let opts = ServeOptions { max_model_len: Some(512), max_num_seqs: 8, kv_cache_bytes: Some(4 << 20), ..ServeOptions::default() };
+    let core = Core::start(&s, opts).unwrap();
+    let mut rxs = Vec::new();
+    for p in &prompts {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let request = Request { prompt: p.clone(), max_tokens: new, sampling: Sampling::GREEDY.with_logprobs(Some(3)), stop: vec![], salt: String::new(), media: Vec::new() };
+        core.submit(Job { request, events: tx, cancel: Arc::new(AtomicBool::new(false)) }).unwrap();
+        rxs.push(rx);
+    }
+    let got: Vec<(Vec<u32>, Vec<specrt::logprobs::TokenLogprob>)> = rxs
+        .iter()
+        .map(|rx| {
+            let (mut tokens, mut lps) = (Vec::new(), Vec::new());
+            loop {
+                match rx.recv().unwrap() {
+                    SeqEvent::Token(t) => tokens.push(t),
+                    SeqEvent::Logprob(l) => lps.push(l),
+                    SeqEvent::Finished { .. } => break (tokens, lps),
+                    SeqEvent::Failed(e) => panic!("{e}"),
+                    _ => {}
+                }
+            }
+        })
+        .collect();
+    drop(core);
+    let mut rt = Runtime::load(&s, 512).unwrap();
+    let vocab = s.dims.vocab;
+    for (p, (tokens, lps)) in prompts.iter().zip(&got) {
+        assert_eq!(tokens.len(), new);
+        assert_eq!(lps.iter().map(|l| l.token).collect::<Vec<_>>(), *tokens);
+        let whole: Vec<u32> = p.iter().chain(tokens).copied().collect();
+        let logits = rt.prompt_logits(&whole).unwrap();
+        for (j, lp) in lps.iter().enumerate() {
+            let row = &logits[(p.len() - 1 + j) * vocab..(p.len() + j) * vocab];
+            let want = specrt::logprobs::token_logprob(row, lp.token, 3);
+            assert!((lp.logprob - want.logprob).abs() < 2e-2, "prompt {} token {j}: {} vs {}", p.len(), lp.logprob, want.logprob);
+            assert_eq!(lp.top.len(), 3);
+            assert_eq!(lp.top[0].0, lp.token, "greedy picks the top token");
+            assert!(lp.top.windows(2).all(|w| w[0].1 >= w[1].1));
+        }
+    }
+}
