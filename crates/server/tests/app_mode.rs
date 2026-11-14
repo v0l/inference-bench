@@ -158,6 +158,20 @@ fn the_loaded_model_answers_by_id_by_repo_and_when_the_model_is_omitted() {
 }
 
 #[test]
+fn the_full_repo_id_is_the_model_id_and_the_short_name_still_resolves() {
+    let app = app_rig();
+    app.load("org/one", "org/one");
+    assert_eq!(app.model_ids(), ["org/one"]);
+    for named in ["org/one", "one"] {
+        let (status, body) = app.chat(say(Some(named)));
+        assert_eq!(status, 200, "{named}: {body}");
+        assert_eq!(body["model"], "org/one");
+    }
+    assert_eq!(app.chat(say(Some("two"))).0, 404);
+    app.rig.stop();
+}
+
+#[test]
 fn an_omitted_model_with_nothing_loaded_is_a_404() {
     let app = app_rig();
     let (status, body) = app.chat(say(None));

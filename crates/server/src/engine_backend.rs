@@ -8,7 +8,11 @@ use crate::manager::{ModelSource, SourceModel};
 impl ModelSource for Handle {
     fn loaded(&self) -> Vec<SourceModel> {
         Handle::loaded(self)
-            .map(|l| SourceModel { id: l.display, aliases: vec![l.model_id] })
+            .map(|l| {
+                let mut aliases = vec![l.model_id];
+                aliases.extend(inference_bench_core::library::short_alias(&l.display));
+                SourceModel { id: l.display, aliases }
+            })
             .into_iter()
             .collect()
     }

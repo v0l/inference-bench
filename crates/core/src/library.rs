@@ -243,6 +243,15 @@ impl LocalModel {
     }
 }
 
+pub fn short_alias(display: &str) -> Option<String> {
+    let (head, rest) = display.split_once(' ').map_or((display, ""), |(h, r)| (h, r));
+    let (_, short) = head.rsplit_once('/')?;
+    Some(match rest.is_empty() {
+        true => short.to_string(),
+        false => format!("{short} {rest}"),
+    })
+}
+
 pub fn hub_dir() -> PathBuf {
     if let Some(h) = std::env::var_os("HF_HUB_CACHE") {
         return PathBuf::from(h);
