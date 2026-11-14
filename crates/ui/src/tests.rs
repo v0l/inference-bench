@@ -58,8 +58,12 @@ fn script() -> Script {
 }
 
 fn harness(name: &str, tab: Tab) -> Harness<'static, App> {
+    harness_sized(name, tab, 800.0)
+}
+
+fn harness_sized(name: &str, tab: Tab, height: f32) -> Harness<'static, App> {
     let d = dir(name);
-    Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
+    Harness::builder().with_size(egui::vec2(1280.0, height)).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
         let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
         app.tab = tab;
@@ -382,7 +386,7 @@ fn serving_harness(name: &str, seqs: usize) -> Harness<'static, App> {
         let app = h.state_mut();
         app.engine = inference_bench_core::fake::engine(app.wake.clone(), slow_script());
         let m = app.library[0].clone();
-        app.engine.send(Command::Load { model_id: m.model_id(inference_bench_core::target::NATIVE), display: m.name.clone(), max_ctx: Some(4096), max_num_seqs: Some(seqs), kv_cache_bytes: None, served_names: Vec::new() });
+        app.engine.send(Command::Load { model_id: m.model_id(inference_bench_core::target::NATIVE), display: m.name.clone(), max_ctx: Some(4096), max_num_seqs: Some(seqs), kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default() });
     }
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     let handle = h.state().engine.handle();
@@ -418,6 +422,7 @@ fn the_load_dialog_has_a_parallel_requests_slider_and_the_estimate_grows_with_it
     let m = real_model("Qwen3-0.6B");
     h.state_mut().library[0] = m.clone();
     h.state_mut().open_load_dialog(&m);
+    h.state_mut().load.as_mut().unwrap().advanced = true;
     h.run();
     h.get_by_label_contains("PARALLEL REQUESTS");
     let free = h.state().free_gpu_bytes();
@@ -477,7 +482,7 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
     let m = real_model("Qwen3-0.6B");
     h.state_mut().library[0] = m.clone();
     h.state_mut().open_load_dialog(&m);
-    assert_eq!(h.state().load.as_ref().unwrap().seqs, 4);
+    assert_eq!(h.state().load.as_ref().unwrap().seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
     h.state_mut().load.as_mut().unwrap().seqs = 6;
     h.run();
     h.get_all_by_label("load").last().unwrap().click();
@@ -1476,4 +1481,124 @@ fn the_brief_names_the_app_and_the_loaded_model() {
     let brief = backend.brief(std::path::Path::new("/tmp/ws"), &[]);
     assert!(brief.contains("inference-bench") && brief.contains("Qwen3-0.6B") && brief.contains("/tmp/ws"), "{brief}");
     assert_eq!(backend.app(), "inference-bench");
+}
+
+fn open_dialog(name: &str) -> Harness<'static, App> {
+    let mut h = harness_sized(name, Tab::Models, 2600.0);
+    with_gpu(&mut h, 0, 96 << 30);
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), script());
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h
+}
+
+#[test]
+fn the_advanced_section_renders_every_option_the_engine_declares() {
+    let mut h = open_dialog("adv-all");
+    h.run();
+    assert!(h.query_by_label_contains("FAST LOADER").is_none(), "advanced starts folded");
+    h.state_mut().load.as_mut().unwrap().advanced = true;
+    h.run();
+    for f in specrt::options::schema().iter().filter(|f| f.group.advanced()) {
+        let label = f.label.to_uppercase();
+        assert!(h.query_all_by_label_contains(&label).count() >= 1, "{} ({}) is not in the dialog", f.key, f.label);
+    }
+}
+
+#[test]
+fn the_dialog_defaults_are_the_engine_defaults_and_max_performance() {
+    let h = open_dialog("adv-defaults");
+    let d = h.state().load.as_ref().unwrap();
+    assert_eq!(d.seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
+    assert!(!d.choice.is_custom());
+    for f in specrt::options::schema() {
+        if f.key == "runtime.prefix_cache.enabled" {
+            continue;
+        }
+        assert_eq!(d.choice.value(&f.key), f.default, "{}", f.key);
+    }
+    let o = d.serve_options().unwrap();
+    let rt = o.runtime.unwrap();
+    assert!(rt.graphs && rt.fuse && rt.loader.enabled && rt.prefix_cache.enabled);
+    assert_eq!(rt.loader, specrt::loader::LoaderOptions::default());
+}
+
+#[test]
+fn changing_a_field_shows_custom_and_its_reset_key_restores_the_default() {
+    let mut h = open_dialog("adv-custom");
+    h.state_mut().load.as_mut().unwrap().advanced = true;
+    h.run();
+    assert!(h.query_by_label_contains("changed from the profile").is_none());
+    assert!(h.query_by_label("reset").is_none());
+    let d = h.state_mut().load.as_mut().unwrap();
+    d.seqs = 2;
+    d.choice.set("serve.max_num_seqs", serde_json::json!(2));
+    h.run();
+    h.get_by_label_contains("1 advanced option(s) changed from the profile");
+    h.get_by_label("reset");
+    h.state_mut().load.as_mut().unwrap().reset("serve.max_num_seqs");
+    h.run();
+    let d = h.state().load.as_ref().unwrap();
+    assert_eq!(d.seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
+    assert!(!d.choice.is_custom());
+    assert!(h.query_by_label_contains("changed from the profile").is_none());
+}
+
+#[test]
+fn the_low_memory_profile_turns_off_what_it_says_and_reaches_the_engine() {
+    let mut h = open_dialog("adv-low");
+    h.state_mut().load.as_mut().unwrap().choice.select(specrt::options::Profile::LowMemory);
+    let o = h.state().load.as_ref().unwrap().serve_options().unwrap();
+    let rt = o.runtime.unwrap();
+    assert_eq!(o.speculative.enabled, Some(false));
+    assert!(!rt.prefix_cache.enabled);
+    assert_eq!(rt.prefix_cache.max_snapshots, 0);
+    assert!(rt.loader.host_budget_mb < specrt::loader::LoaderOptions::default().host_budget_mb);
+    h.run();
+    h.get_by_label_contains("No MTP draft head copy");
+}
+
+#[test]
+fn engine_options_from_the_dialog_are_remembered_and_shown_on_the_server_tab() {
+    let mut h = open_dialog("adv-remember");
+    h.state_mut().load.as_mut().unwrap().choice.set("runtime.loader.readers", serde_json::json!(3));
+    h.run();
+    h.get_all_by_label("load").last().unwrap().click();
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    let l = h.state().loaded().unwrap();
+    assert!(l.engine.is_custom());
+    assert_eq!(l.engine.value("runtime.loader.readers"), serde_json::json!(3));
+    assert_eq!(Settings::load(&h.state().dir).engine_for("Qwen3-0.6B").value("runtime.loader.readers"), serde_json::json!(3));
+    h.state_mut().tab = Tab::Server;
+    h.run();
+    let rows = crate::running::rows(&l);
+    assert!(rows.contains(&("profile".into(), "custom".into())));
+    assert!(rows.contains(&("readers".into(), "3".into())));
+    assert!(rows.iter().any(|(k, _)| k == "mtp"));
+}
+
+#[test]
+fn screenshots_of_the_load_dialog_with_advanced_folded_and_open() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (open, file) in [(false, "load-dialog-profile-folded.png"), (true, "load-dialog-profile-advanced.png")] {
+        let mut h = harness_sized(&format!("shot-adv-{open}"), Tab::Models, 1500.0);
+        with_gpu(&mut h, 20 << 30, 96 << 30);
+        let d = dir(&format!("shot-adv-model-{open}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), d.join("config.json")).unwrap();
+        let mut m = model("Qwen3.8-27B", true, "dense decoder");
+        (m.path, m.root) = (d.clone(), d);
+        m.context_length = None;
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().open_load_dialog(&m);
+        let dialog = h.state_mut().load.as_mut().unwrap();
+        dialog.ctx = 65536;
+        dialog.advanced = open;
+        h.run();
+        with_gpu(&mut h, 20 << 30, 96 << 30);
+        h.run();
+        h.render().unwrap().save(out.join(file)).unwrap();
+    }
 }

@@ -30,6 +30,10 @@ pub struct Settings {
     #[serde(default)]
     pub model_seqs: BTreeMap<String, usize>,
     #[serde(default)]
+    pub default_profile: specrt::options::Profile,
+    #[serde(default)]
+    pub model_engine: BTreeMap<String, specrt::options::EngineChoice>,
+    #[serde(default)]
     pub model_kv_gb: BTreeMap<String, f64>,
     #[serde(default)]
     pub model_served_names: BTreeMap<String, Vec<String>>,
@@ -70,7 +74,7 @@ fn default_ctx() -> usize {
 }
 
 fn default_seqs() -> usize {
-    4
+    specrt::options::DEFAULT_MAX_NUM_SEQS
 }
 
 impl Default for Settings {
@@ -82,6 +86,8 @@ impl Default for Settings {
             model_ctx: BTreeMap::new(),
             default_seqs: default_seqs(),
             model_seqs: BTreeMap::new(),
+            default_profile: specrt::options::Profile::default(),
+            model_engine: BTreeMap::new(),
             model_kv_gb: BTreeMap::new(),
             model_served_names: BTreeMap::new(),
             hf_token: String::new(),
@@ -115,6 +121,10 @@ impl Settings {
 
     pub fn seqs_for(&self, model: &str) -> usize {
         self.model_seqs.get(model).copied().unwrap_or(self.default_seqs).max(1)
+    }
+
+    pub fn engine_for(&self, model: &str) -> specrt::options::EngineChoice {
+        self.model_engine.get(model).cloned().unwrap_or_else(|| specrt::options::EngineChoice { profile: self.default_profile, overrides: Default::default() })
     }
 
     pub fn kv_gb_for(&self, model: &str) -> Option<f64> {

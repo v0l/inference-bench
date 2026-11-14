@@ -116,6 +116,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 secret(ui, &mut app.settings.hf_token);
             });
         });
+        section(ui, "engine", "the profile a model loads with until you change it for that model", |ui| {
+            row_help(ui, "default profile", "Max performance is the measured best. Low memory drops the MTP draft head copy, shrinks the loader budget and keeps no prefix cache snapshots. A model's own choice in its load dialog wins.", |ui| {
+                let mut p = app.settings.default_profile;
+                if segments(ui, &mut p, &specrt::options::Profile::ALL.map(|p| (p, p.label(), None))) {
+                    app.settings.default_profile = p;
+                }
+            });
+        });
         spec_updates(app, ui);
         section(ui, "app", "where this app keeps its files", |ui| {
             reading(ui, "theme", "dark, shared with the other bench-suite apps");

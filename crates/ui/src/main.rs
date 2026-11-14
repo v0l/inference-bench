@@ -7,6 +7,7 @@ mod engine;
 mod strip;
 mod job;
 mod load;
+mod running;
 mod modelbar;
 mod models;
 mod logs;
@@ -130,15 +131,17 @@ impl App {
         let seqs = self.settings.seqs_for(&model.name);
         let kv = self.settings.kv_gb_for(&model.name).map(|g| (g * (1u64 << 30) as f64) as u64);
         let served_names = self.settings.served_names_for(&model.name);
-        self.load_model_named(model, ctx, seqs, kv, served_names);
+        let engine = self.settings.engine_for(&model.name);
+        self.load_model_named(model, ctx, seqs, kv, served_names, engine);
     }
 
     pub fn load_model_with(&mut self, model: &LocalModel, ctx: usize, seqs: usize) {
         let served_names = self.settings.served_names_for(&model.name);
-        self.load_model_named(model, ctx, seqs, None, served_names);
+        let engine = self.settings.engine_for(&model.name);
+        self.load_model_named(model, ctx, seqs, None, served_names, engine);
     }
 
-    pub fn load_model_named(&mut self, model: &LocalModel, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>) {
+    pub fn load_model_named(&mut self, model: &LocalModel, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice) {
         self.engine.send(Command::Load {
             model_id: model.model_id(inference_bench_core::target::NATIVE),
             display: model.name.clone(),
@@ -146,6 +149,7 @@ impl App {
             max_num_seqs: Some(seqs),
             kv_cache_bytes,
             served_names,
+            engine,
         });
     }
 

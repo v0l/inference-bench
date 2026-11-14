@@ -219,6 +219,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         if let Some(p) = app.server.placement.clone() {
             placement_section(ui, &p);
         }
+        if let Some(l) = &loaded {
+            crate::running::draw(ui, l);
+        }
         crate::serving::draw(app, ui);
         let log = request_lines(&app.logs);
         let mut pane = app.server.pane;

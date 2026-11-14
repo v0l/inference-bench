@@ -94,6 +94,10 @@ pub trait Target: Send {
     fn stats(&self) -> Option<specrt::serve::Stats> {
         None
     }
+
+    fn speculation(&self) -> Option<String> {
+        None
+    }
 }
 
 pub const NATIVE: &str = "specrt";

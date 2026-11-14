@@ -215,7 +215,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         pump_tree(app, &mut detail);
         let free = app.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes));
         let mut open = None;
-        body(&mut detail, ui, free, &mut open);
+        let running = app.engine.loaded().filter(|l| l.display == detail.model);
+        body(&mut detail, ui, free, &mut open, running.as_ref());
         if let Some((relation, of)) = open {
             let token = app.settings.hf_token.clone();
             let wake = app.wake.clone();
@@ -281,9 +282,12 @@ fn tree_section(detail: &Detail, ui: &mut egui::Ui, open: &mut Option<(Relation,
     });
 }
 
-fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, open: &mut Option<(Relation, String)>) {
+fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, open: &mut Option<(Relation, String)>, running: Option<&inference_bench_core::engine::Loaded>) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
+        if let Some(l) = running {
+            crate::running::draw(ui, l);
+        }
         tree_section(detail, ui, open);
         content(detail, ui, free);
     });

@@ -114,6 +114,18 @@ impl Target for ServingTarget {
     fn stats(&self) -> Option<Stats> {
         self.serving.as_ref().map(|s| s.stats())
     }
+
+    fn speculation(&self) -> Option<String> {
+        let spec = self.serving.as_ref()?.spec();
+        Some(match (&spec.mtp, spec.speculative()) {
+            (None, _) => "off: the model has no MTP layer".to_string(),
+            (Some(_), None) => "off: turned off in the engine options".to_string(),
+            (Some(_), Some(m)) => {
+                let head = spec.draft_head_quant().map_or("shared lm_head".to_string(), |q| format!("{q:?} head").to_lowercase());
+                format!("on: {} draft tokens, {head}", m.draft_tokens)
+            }
+        })
+    }
 }
 
 fn histogram(o: &mut String, name: &str, help: &str, h: &Histogram) {

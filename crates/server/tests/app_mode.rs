@@ -65,6 +65,7 @@ impl AppRig {
             max_num_seqs: None,
             kv_cache_bytes: None,
             served_names: served.iter().map(|s| s.to_string()).collect(),
+            engine: Default::default(),
         });
         loop {
             match self.engine.events.recv_timeout(Duration::from_secs(10)).unwrap() {
@@ -238,7 +239,7 @@ fn four_api_requests_run_together_on_an_engine_loaded_with_four_sequences() {
     let slow = Script { chunks: (0..30).map(|i| format!("t{i} ")).collect(), chunk_delay_ms: 10, first_delay_ms: 20, ..script() };
     let engine = inference_bench_core::fake::engine(Arc::new(|| {}), slow);
     let app = app_rig_with("max_num_seqs = 64\n", engine);
-    app.engine.send(Command::Load { model_id: "org/one".into(), display: "One".into(), max_ctx: Some(4096), max_num_seqs: Some(4), kv_cache_bytes: None, served_names: Vec::new() });
+    app.engine.send(Command::Load { model_id: "org/one".into(), display: "One".into(), max_ctx: Some(4096), max_num_seqs: Some(4), kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default() });
     loop {
         match app.engine.events.recv_timeout(Duration::from_secs(10)).unwrap() {
             EngineEvent::Loaded(_) => break,
