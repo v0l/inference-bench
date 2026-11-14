@@ -497,11 +497,24 @@ fn str_step(cont: u8, esc: u8, b: u8) -> Option<Option<(u8, u8)>> {
         if !b.is_ascii_hexdigit() {
             return None;
         }
+        if esc == 14 && matches!(b, b'd' | b'D') {
+            return Some(Some((0, 30)));
+        }
+        if esc == 30 {
+            return matches!(b, b'0'..=b'7').then_some(Some((0, 12)));
+        }
         let left = esc - 11;
         return Some(Some((0, if left == 0 { 0 } else { 10 + left })));
     }
     if cont > 0 {
-        return (0x80..=0xbf).contains(&b).then_some(Some((cont - 1, 0)));
+        let range = match cont >> 4 {
+            1 => 0xa0..=0xbf,
+            2 => 0x80..=0x9f,
+            3 => 0x90..=0xbf,
+            4 => 0x80..=0x8f,
+            _ => 0x80..=0xbf,
+        };
+        return range.contains(&b).then_some(Some(((cont & 0x0f) - 1, 0)));
     }
     match b {
         b'"' => Some(None),
@@ -509,8 +522,12 @@ fn str_step(cont: u8, esc: u8, b: u8) -> Option<Option<(u8, u8)>> {
         0..=0x1f => None,
         0x20..=0x7f => Some(Some((0, 0))),
         0xc2..=0xdf => Some(Some((1, 0))),
-        0xe0..=0xef => Some(Some((2, 0))),
-        0xf0..=0xf4 => Some(Some((3, 0))),
+        0xe0 => Some(Some((0x12, 0))),
+        0xed => Some(Some((0x22, 0))),
+        0xe1..=0xef => Some(Some((2, 0))),
+        0xf0 => Some(Some((0x33, 0))),
+        0xf4 => Some(Some((0x43, 0))),
+        0xf1..=0xf3 => Some(Some((3, 0))),
         _ => None,
     }
 }
@@ -626,9 +643,25 @@ mod tests {
     #[test]
     fn json_object_rejects_everything_else() {
         let g = object();
-        for bad in ["[]", "1", "\"a\"", "{", "{\"a\"}", "{\"a\":}", "{\"a\":1,}", "{\"a\":01}", "{\"a\":1.}", "{\"a\":tru}", "{'a':1}", "{\"a\":\"\\x\"}", "{\"a\":1} x", "{\"a\":\"\n\"}"] {
+        for bad in ["[]", "1", "\"a\"", "{", "{\"a\"}", "{\"a\":}", "{\"a\":1,}", "{\"a\":01}", "{\"a\":1.}", "{\"a\":tru}", "{'a':1}", "{\"a\":\"\\x\"}", "{\"a\":1} x", "{\"a\":\"\n\"}", "{\"a\":\"\\ud800\"}", "{\"a\":\"\\ud8\"}"] {
             assert!(!accepts(&g, bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn strings_only_admit_valid_utf8_and_non_surrogate_escapes() {
+        let g = object();
+        let ok = |b: &[u8]| {
+            let mut c = g.cursor();
+            b.iter().all(|&x| c.advance(x as u32 + 1)) && c.complete()
+        };
+        let wrap = |inner: &[u8]| [b"{\"a\":\"".as_slice(), inner, b"\"}"].concat();
+        assert!(ok(&wrap("é日𝄞".as_bytes())));
+        assert!(ok(&wrap(br"\ud7ff\u0d00\uABCD")));
+        for bad in [&[0xc0u8, 0x80][..], &[0xe0, 0x80, 0x80], &[0xed, 0xa0, 0x80], &[0xf4, 0x90, 0x80, 0x80], &[0xff], &[0xc3]] {
+            assert!(!ok(&wrap(bad)), "{bad:?}");
+        }
+        assert!(!ok(&wrap(br"\udc00")));
     }
 
     #[test]

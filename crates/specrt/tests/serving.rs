@@ -483,4 +483,62 @@ fn four_requests_share_a_pool_of_one_and_a_half_max_model_lens_and_match_single_
         assert_eq!(&got, want);
     }
     assert!(core.stats().preemptions > 0, "four 350 token requests cannot grow in a 768 token pool without preemption");
+
+#[ignore = "needs a CUDA GPU"]
+fn tiny_json_object_grammar_always_yields_an_object_and_leaves_other_rows_alone() {
+    use specrt::grammar::{Grammar, TokenTable};
+    use specrt::sched::{Config, Event, Finish, GpuExecutor, Request, Scheduler};
+    let s = spec_for("tiny-qwen3.5");
+    let vocab = s.dims.vocab;
+    let mut tokens = vec![Vec::new(); vocab];
+    for b in 0..=255u8 {
+        tokens[b as usize + 1] = vec![b];
+    }
+    let grammar = Grammar::json_object(std::sync::Arc::new(TokenTable::new(tokens)), vocab, vec![0]);
+    let layout = Layout { max_ctx: 1024, slots: 8, kv_blocks: 256, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
+    let mut sched = Scheduler::new(exec, Config { max_num_seqs: 8, ..Config::default() });
+    let mut checked = 0;
+    for round in 0..8u32 {
+        let mut ids = Vec::new();
+        for i in 0..6u32 {
+            let seed = round * 16 + i;
+            let sampling = Sampling::new(1.0, seed);
+            let prompt: Vec<u32> = (0..20u32).map(|j| (j * 37 + seed * 11) % 700 + 300).collect();
+            let g = (i != 5).then(|| grammar.clone());
+            ids.push((i, sched.submit(Request { prompt, max_tokens: 700, sampling, stop: vec![], salt: String::new(), media: Vec::new(), grammar: g }).unwrap()));
+        }
+        let mut out: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+        let mut finish: std::collections::HashMap<u64, Finish> = Default::default();
+        while !sched.idle() {
+            let mut events = Vec::new();
+            sched.step(&mut events).unwrap();
+            for e in events {
+                match e {
+                    Event::Token { id, token } => out.entry(id).or_default().push(token),
+                    Event::Finished { id, finish: f, .. } => {
+                        finish.insert(id, f);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (i, id) in ids {
+            if i == 5 {
+                assert_eq!(out[&id].len(), 700, "the unconstrained row is untouched");
+                continue;
+            }
+            let bytes: Vec<u8> = out[&id].iter().map(|&t| (t - 1) as u8).collect();
+            if finish[&id] == Finish::Stop {
+                match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                    Ok(v) => assert!(v.is_object()),
+                    Err(e) => assert!(e.to_string().contains("number out of range"), "{e}: {}", String::from_utf8_lossy(&bytes)),
+                }
+                checked += 1;
+            } else {
+                assert!(out[&id].iter().all(|&t| (1..=256).contains(&t)), "only byte tokens are allowed");
+            }
+        }
+    }
+    assert!(checked >= 8, "only {checked} constrained requests finished");
 }
