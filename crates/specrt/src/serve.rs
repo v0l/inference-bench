@@ -619,11 +619,12 @@ pub struct TokenLogprobText {
 pub struct Serving {
     core: Arc<Core>,
     assets: Arc<Assets>,
+    tokens: Arc<std::sync::OnceLock<Arc<crate::grammar::TokenTable>>>,
 }
 
 impl Clone for Serving {
     fn clone(&self) -> Self {
-        Serving { core: self.core.clone(), assets: self.assets.clone() }
+        Serving { core: self.core.clone(), assets: self.assets.clone(), tokens: self.tokens.clone() }
     }
 }
 
@@ -639,7 +640,7 @@ impl Serving {
     pub fn load(model: &str, opts: ServeOptions) -> Result<Self> {
         let assets = Assets::load(model)?;
         let core = Core::start(&assets.spec, opts)?;
-        Ok(Serving { core, assets: Arc::new(assets) })
+        Ok(Serving { core, assets: Arc::new(assets), tokens: Default::default() })
     }
 
     pub fn spec(&self) -> &Spec {
@@ -702,7 +703,12 @@ impl Serving {
         cancel: Arc<AtomicBool>,
         on_text: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion> {
-        self.complete_with_logprobs(prompt, media, max_tokens, sampling, use_stop, salt, cancel, on_text, &mut |_| {})
+        self.complete_with_logprobs(prompt, media, max_tokens, sampling, use_stop, salt, cancel, None, on_text, &mut |_| {})
+    }
+
+    pub fn grammar(&self, schema: &crate::grammar::Schema) -> Arc<crate::grammar::Grammar> {
+        let table = self.tokens.get_or_init(|| Arc::new(crate::grammar::TokenTable::from_tokenizer(&self.assets.tokenizer))).clone();
+        schema.build(table, self.assets.spec.dims.vocab, self.assets.stop.clone())
     }
 
     pub fn token_text(&self, id: u32) -> (String, Vec<u8>) {
@@ -730,6 +736,7 @@ impl Serving {
         use_stop: bool,
         salt: String,
         cancel: Arc<AtomicBool>,
+        schema: Option<&crate::grammar::Schema>,
         on_text: &mut dyn FnMut(&str) -> bool,
         on_logprob: &mut dyn FnMut(&TokenLogprobText),
     ) -> Result<Completion> {
@@ -737,7 +744,8 @@ impl Serving {
         let max_tokens = crate::engine::output_budget(max_tokens, prompt.len(), self.core.max_model_len(), crate::spec::MAX_DRAFT_TOKENS, &self.assets.sampling);
         let (tx, rx) = channel();
         let stop = if use_stop { self.assets.stop.clone() } else { Vec::new() };
-        let request = sched::Request { prompt, max_tokens, sampling, stop, salt, media, grammar: None };
+        let grammar = schema.map(|s| self.grammar(s));
+        let request = sched::Request { prompt, max_tokens, sampling, stop, salt, media, grammar };
         self.core.submit(Job { request, events: tx, cancel: cancel.clone() })?;
         let tokenizer = &self.assets.tokenizer;
         let mut out = Completion::default();

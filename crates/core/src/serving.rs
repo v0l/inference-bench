@@ -33,12 +33,13 @@ impl ServingTarget {
         media: Vec<specrt::sched::MediaInput>,
         vision_tokens: usize,
         on_logprob: Option<crate::chat::LogprobSink>,
+        schema: Option<&specrt::grammar::Schema>,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError> {
         let engine = self.engine()?;
         let cancel = cancel.unwrap_or_default();
         let c = engine
-            .complete_with_logprobs(prompt, media, max_tokens, sampling, streaming, salt, cancel, &mut |t| {
+            .complete_with_logprobs(prompt, media, max_tokens, sampling, streaming, salt, cancel, schema, &mut |t| {
                 on_text(t);
                 true
             }, &mut |lp| {
@@ -83,7 +84,7 @@ impl Target for ServingTarget {
 
     fn generate(&mut self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let ids = self.engine()?.tokens(&request.prompt).map_err(|e| engine_error(&e))?;
-        self.run(ids, request.max_tokens, Sampling::GREEDY, false, String::new(), None, Vec::new(), 0, None, on_text)
+        self.run(ids, request.max_tokens, Sampling::GREEDY, false, String::new(), None, Vec::new(), 0, None, None, on_text)
     }
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
@@ -98,7 +99,7 @@ impl Target for ServingTarget {
         };
         let s = request.sampling;
         let sampling = s.resolve(self.engine()?.sampling_defaults()).with_logprobs(request.logprobs);
-        self.run(ids, s.max_tokens, sampling, !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), media, vision_tokens, request.on_logprob.clone(), on_text)
+        self.run(ids, s.max_tokens, sampling, !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), media, vision_tokens, request.on_logprob.clone(), request.response_format.as_ref(), on_text)
     }
 
     fn share(&self) -> Option<Box<dyn Target>> {

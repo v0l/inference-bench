@@ -85,6 +85,7 @@ pub struct ChatRequest {
     pub media_max_video_secs: Option<f64>,
     pub logprobs: Option<u32>,
     pub on_logprob: Option<LogprobSink>,
+    pub response_format: Option<specrt::grammar::Schema>,
 }
 
 pub type TokenLogprob = specrt::serve::TokenLogprobText;
@@ -123,6 +124,7 @@ impl ChatRequest {
             media_max_video_secs: None,
             logprobs: None,
             on_logprob: None,
+            response_format: None,
         }
     }
 

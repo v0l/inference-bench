@@ -430,6 +430,7 @@ struct Params {
     ignore_eos: bool,
     n: usize,
     logprobs: Option<u32>,
+    response_format: Option<inference_bench_core::specrt_grammar::Schema>,
 }
 
 #[derive(Clone, Default)]
@@ -479,13 +480,18 @@ fn reject_unsupported_fields(body: &Value) -> Result<(), ApiError> {
         let known = HANDLED_FIELDS.contains(&key) || NEUTRAL_FIELDS.contains(&key);
         let ok = known
             || match key {
-                "response_format" => value.is_null() || value["type"] == "text",
+                "response_format" => inference_bench_core::specrt_grammar::parse_response_format(value).is_ok(),
                 "frequency_penalty" | "presence_penalty" => value.is_null() || value.as_f64() == Some(0.0),
                 _ => false,
             };
         if !ok {
             let why = match key {
-                "response_format" => "structured output (json_object, json_schema) is not supported yet (#591)",
+                "response_format" => {
+                    return Err(ApiError::bad_request(match inference_bench_core::specrt_grammar::parse_response_format(value) {
+                        Err(e) => format!("response_format: {e}"),
+                        Ok(_) => "response_format: invalid".to_string(),
+                    }))
+                }
                 "frequency_penalty" | "presence_penalty" => "value is not supported",
                 _ => "field is not supported",
             };
@@ -618,6 +624,7 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         ignore_eos: body["ignore_eos"].as_bool().unwrap_or(false),
         n: choice_count(body)?,
         logprobs: logprob_request(body, chat)?,
+        response_format: inference_bench_core::specrt_grammar::parse_response_format(&body["response_format"]).map_err(|e| ApiError::bad_request(format!("response_format: {e}")))?,
     })
 }
 
@@ -721,6 +728,8 @@ fn start_generation(
                 Some(format!("n > 1 needs the batched engine: load {model} with more than one parallel request (max_num_seqs above 1)"))
             } else if request.logprobs.is_some() && !caps.logprobs {
                 Some(format!("logprobs need the batched engine: load {model} with more than one parallel request (max_num_seqs above 1)"))
+            } else if request.response_format.is_some() && !caps.batched {
+                Some(format!("response_format needs the batched engine: load {model} with more than one parallel request (max_num_seqs above 1)"))
             } else {
                 None
             };
@@ -939,6 +948,7 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
         request.template_vars = p.template_vars;
     }
     request.logprobs = p.logprobs;
+    request.response_format = p.response_format;
     log_prompt(&state, &request);
     let mut receivers = Vec::with_capacity(p.n);
     for i in 0..p.n {

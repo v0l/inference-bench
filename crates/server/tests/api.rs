@@ -652,14 +652,31 @@ fn every_vllm_client_request_shape_is_a_200() {
 }
 
 #[test]
-fn response_format_json_is_a_clear_400_until_structured_output_lands() {
+fn response_format_json_object_is_served_by_the_batched_engine() {
     let rig = compat_rig();
-    for format in [json!({"type": "json_object"}), json!({"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}})] {
-        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": format});
-        let (status, text, _) = rig.post("/v1/chat/completions", None, body);
-        assert_eq!(status, 400, "{text}");
-        assert!(text.contains("structured output") && text.contains("#591"), "{text}");
-    }
+    let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_object"}});
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 200, "{text}");
+    rig.stop();
+}
+
+#[test]
+fn response_format_json_object_is_a_clear_400_on_the_single_sequence_engine() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "json_object"}});
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("response_format") && text.contains("max_num_seqs"), "{text}");
+    rig.stop();
+}
+
+#[test]
+fn unknown_response_format_types_are_a_400() {
+    let rig = compat_rig();
+    let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": {"type": "xml"}});
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("response_format"), "{text}");
     rig.stop();
 }
 
