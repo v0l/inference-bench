@@ -128,8 +128,12 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
 
 fn empty_state(app: &mut App, ui: &mut egui::Ui) {
     if let (Some(name), Some(p)) = (&app.loading, &app.load_progress) {
-        welcome(ui, &format!("Loading {name}"), &crate::modelbar::progress_text(p));
-        ui.vertical_centered(|ui| crate::modelbar::load_bar(ui, p, 420.0));
+        ui.add_space(40.0);
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new(format!("Loading {name}")).font(legend_font(16.0)).color(VALUE));
+            ui.add_space(10.0);
+            crate::modelbar::load_bar(ui, p, 420.0);
+        });
         return;
     }
     if usable_models(app) == 0 {
