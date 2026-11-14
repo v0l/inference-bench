@@ -1,4 +1,6 @@
-use serde::Deserialize;
+use crate::library::{Lineage, Relation};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -78,6 +80,48 @@ impl Hub {
         resp.body_mut().read_json().map_err(|e| format!("bad search reply: {e}"))
     }
 
+    pub fn base_of(&self, repo: &str) -> Result<Option<Lineage>, String> {
+        let url = format!("{}/api/models/{repo}", self.base);
+        let mut resp = self.get(&url).call().map_err(|e| format!("{url}: {e}"))?;
+        if resp.status().as_u16() >= 400 {
+            return Err(format!("{url}: HTTP {}", resp.status()));
+        }
+        let info: serde_json::Value = resp.body_mut().read_json().map_err(|e| format!("bad model reply: {e}"))?;
+        Ok(lineage_from_info(&info))
+    }
+
+    fn child_url(&self, base: &str, relation: Relation) -> String {
+        format!("{}/api/models?filter=base_model%3A{}%3A{}", self.base, relation.label(), base.replace('/', "%2F"))
+    }
+
+    pub fn children(&self, base: &str, relation: Relation, limit: usize) -> Result<Vec<Repo>, String> {
+        let url = self.child_url(base, relation);
+        let mut resp = self
+            .get(&url)
+            .query("limit", limit.to_string())
+            .query("sort", "downloads")
+            .query("direction", "-1")
+            .call()
+            .map_err(|e| format!("{url}: {e}"))?;
+        if resp.status().as_u16() >= 400 {
+            return Err(format!("{url}: HTTP {}", resp.status()));
+        }
+        resp.body_mut().read_json().map_err(|e| format!("bad children reply: {e}"))
+    }
+
+    pub fn child_count(&self, base: &str, relation: Relation) -> Result<u64, String> {
+        let url = self.child_url(base, relation);
+        let mut resp = self.get(&url).query("limit", "1000").call().map_err(|e| format!("{url}: {e}"))?;
+        if resp.status().as_u16() >= 400 {
+            return Err(format!("{url}: HTTP {}", resp.status()));
+        }
+        if let Some(total) = resp.headers().get("x-total-count").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok()) {
+            return Ok(total);
+        }
+        let page: Vec<serde_json::Value> = resp.body_mut().read_json().map_err(|e| format!("bad children reply: {e}"))?;
+        Ok(page.len() as u64)
+    }
+
     pub fn files(&self, repo: &str) -> Result<Vec<RepoFile>, String> {
         let url = format!("{}/api/models/{repo}/tree/main", self.base);
         let mut resp = self.get(&url).query("recursive", "1").call().map_err(|e| format!("{url}: {e}"))?;
@@ -150,6 +194,101 @@ impl Hub {
         std::fs::rename(&part, &target).map_err(|e| e.to_string())?;
         Ok(target)
     }
+}
+
+pub fn lineage_from_info(info: &serde_json::Value) -> Option<Lineage> {
+    let card = &info["cardData"];
+    let mut bases: Vec<String> = match &card["base_model"] {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        _ => Vec::new(),
+    };
+    let mut relation = card["base_model_relation"].as_str().and_then(Relation::parse);
+    for tag in info["tags"].as_array().into_iter().flatten().filter_map(|t| t.as_str()) {
+        let mut parts = tag.splitn(3, ':');
+        if let (Some("base_model"), Some(rel), Some(repo)) = (parts.next(), parts.next(), parts.next()) {
+            if bases.is_empty() {
+                bases.push(repo.to_string());
+            }
+            relation = relation.or(Relation::parse(rel));
+        }
+    }
+    bases.retain(|b| !b.is_empty());
+    (!bases.is_empty()).then(|| Lineage { bases, relation: relation.unwrap_or(Relation::Finetune) })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ModelTree {
+    pub chain: Vec<String>,
+    pub relations: Vec<String>,
+    pub counts: Vec<(String, u64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct TreeCache {
+    infos: BTreeMap<String, (u64, Option<(Vec<String>, String)>)>,
+    counts: BTreeMap<String, (u64, u64)>,
+}
+
+const CACHE_SECS: u64 = 86_400;
+const MAX_DEPTH: usize = 6;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+pub fn model_tree(
+    hub: &Hub,
+    repo: &str,
+    local: &dyn Fn(&str) -> Option<Lineage>,
+    cache_path: &Path,
+    now: u64,
+) -> Result<ModelTree, String> {
+    let mut cache: TreeCache = std::fs::read_to_string(cache_path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let mut tree = ModelTree { chain: vec![repo.to_string()], ..ModelTree::default() };
+    let mut at = repo.to_string();
+    for _ in 0..MAX_DEPTH {
+        let found = match local(&at) {
+            Some(l) => Some(l),
+            None => match cache.infos.get(&at).filter(|(t, _)| now.saturating_sub(*t) < CACHE_SECS) {
+                Some((_, cached)) => cached.as_ref().map(|(b, r)| Lineage { bases: b.clone(), relation: Relation::parse(r).unwrap_or(Relation::Finetune) }),
+                None => {
+                    let fetched = hub.base_of(&at)?;
+                    cache.infos.insert(at.clone(), (now, fetched.as_ref().map(|l| (l.bases.clone(), l.relation.label().to_string()))));
+                    fetched
+                }
+            },
+        };
+        let Some(l) = found else { break };
+        if tree.chain.iter().any(|c| c == l.base()) {
+            break;
+        }
+        tree.relations.push(l.relation.label().to_string());
+        tree.chain.push(l.base().to_string());
+        at = l.base().to_string();
+    }
+    let top = tree.chain[tree.chain.len() - 1].clone();
+    for relation in Relation::ALL {
+        let key = format!("{}:{top}", relation.label());
+        let n = match cache.counts.get(&key).filter(|(t, _)| now.saturating_sub(*t) < CACHE_SECS) {
+            Some((_, n)) => *n,
+            None => {
+                let n = hub.child_count(&top, relation)?;
+                cache.counts.insert(key, (now, n));
+                n
+            }
+        };
+        tree.counts.push((relation.label().to_string(), n));
+    }
+    if let Some(parent) = cache_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(cache_path, serde_json::to_string(&cache).unwrap_or_default());
+    Ok(tree)
+}
+
+pub fn model_tree_now(hub: &Hub, repo: &str, local: &dyn Fn(&str) -> Option<Lineage>, cache_path: &Path) -> Result<ModelTree, String> {
+    model_tree(hub, repo, local, cache_path, now_secs())
 }
 
 #[derive(Clone, Default)]
@@ -278,5 +417,82 @@ mod tests {
         let hub = Hub::new(&server(), "");
         let e = hub.download("acme/m", "nope.bin", &temp("x"), &Progress::default());
         assert!(e.is_err());
+    }
+
+    fn tree_server(hits: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let hits = hits.clone();
+                std::thread::spawn(move || {
+                    let mut r = BufReader::new(s.try_clone().unwrap());
+                    let mut line = String::new();
+                    r.read_line(&mut line).unwrap();
+                    let path = line.split_whitespace().nth(1).unwrap().to_string();
+                    loop {
+                        line.clear();
+                        r.read_line(&mut line).unwrap();
+                        if line.trim().is_empty() {
+                            break;
+                        }
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let (extra, body) = if path.starts_with("/api/models/org/Mid") {
+                        (String::new(), br#"{"cardData":{"base_model":"Qwen/Base","base_model_relation":"finetune"}}"#.to_vec())
+                    } else if path.starts_with("/api/models/Qwen/Base") {
+                        (String::new(), br#"{"cardData":{}}"#.to_vec())
+                    } else if path.contains("filter=base_model%3Aquantized%3AQwen%2FBase") {
+                        ("x-total-count: 1794\r\n".to_string(), br#"[{"id":"unsloth/Base-GGUF"}]"#.to_vec())
+                    } else if path.contains("filter=base_model%3Afinetune%3AQwen%2FBase") {
+                        ("x-total-count: 902\r\n".to_string(), b"[]".to_vec())
+                    } else if path.contains("filter=base_model") {
+                        (String::new(), br#"[{"id":"a/b"},{"id":"c/d"}]"#.to_vec())
+                    } else {
+                        (String::new(), b"{}".to_vec())
+                    };
+                    use std::io::Write;
+                    let _ = write!(s, "HTTP/1.1 200 OK\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = s.write_all(&body);
+                });
+            }
+        });
+        base
+    }
+
+    #[test]
+    fn the_model_tree_walks_up_and_counts_the_bases_children_and_caches_for_a_day() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hub = Hub::new(&tree_server(hits.clone()), "");
+        let dir = temp("tree");
+        let cache = dir.join("tree.json");
+        let none = |_: &str| None;
+        let t = model_tree(&hub, "org/Mid", &none, &cache, 1000).unwrap();
+        assert_eq!(t.chain, ["org/Mid", "Qwen/Base"]);
+        assert_eq!(t.relations, ["finetune"]);
+        let count = |name: &str| t.counts.iter().find(|c| c.0 == name).unwrap().1;
+        assert_eq!((count("quantized"), count("finetune"), count("adapter"), count("merge")), (1794, 902, 2, 2));
+        let first = hits.load(Ordering::SeqCst);
+        let again = model_tree(&hub, "org/Mid", &none, &cache, 2000).unwrap();
+        assert_eq!(again, t);
+        assert_eq!(hits.load(Ordering::SeqCst), first);
+        model_tree(&hub, "org/Mid", &none, &cache, 1000 + 86_401).unwrap();
+        assert!(hits.load(Ordering::SeqCst) > first);
+    }
+
+    #[test]
+    fn the_local_card_is_used_before_the_hub() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hub = Hub::new(&tree_server(hits), "");
+        let local = |r: &str| (r == "me/Quant").then(|| Lineage { bases: vec!["Qwen/Base".into()], relation: Relation::Quantized });
+        let t = model_tree(&hub, "me/Quant", &local, &temp("tree-local").join("c.json"), 5).unwrap();
+        assert_eq!((t.chain.as_slice(), t.relations.as_slice()), (["me/Quant".to_string(), "Qwen/Base".to_string()].as_slice(), ["quantized".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn hub_tags_give_the_lineage_when_the_card_has_none() {
+        let info: serde_json::Value = serde_json::from_str(r#"{"tags":["gguf","base_model:quantized:Qwen/Qwen3.8-27B"],"cardData":{}}"#).unwrap();
+        let l = lineage_from_info(&info).unwrap();
+        assert_eq!((l.base(), l.relation), ("Qwen/Qwen3.8-27B", Relation::Quantized));
     }
 }
