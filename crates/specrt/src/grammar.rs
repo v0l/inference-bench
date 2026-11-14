@@ -222,11 +222,11 @@ impl Compiled {
                         return Err(format!("required property {name:?} is not declared in properties"));
                     }
                 }
-                let extra = if !props.is_empty() {
-                    None
-                } else {
+                let extra = {
                     match obj.get("additionalProperties") {
-                        None | Some(Value::Bool(true)) => Some(ANY),
+                        Some(Value::Bool(true)) => Some(ANY),
+                        None if props.is_empty() => Some(ANY),
+                        None => None,
                         Some(Value::Bool(false)) => None,
                         Some(sub) => Some(self.schema(root, sub, refs, depth + 1)?),
                     }
@@ -483,13 +483,11 @@ impl Grammar {
                         out.push(st);
                     }
                 } else if b == b'"' {
-                    if props.is_empty() {
-                        if extra.is_some() {
-                            keep(&mut st, next, 2);
-                            st.push(Frame::Str { cont: 0, esc: 0 });
-                            out.push(st);
-                        }
-                        return;
+                    if extra.is_some() && Self::closable(props, next_i) {
+                        let mut cand = st.clone();
+                        keep(&mut cand, props.len() as u16, 2);
+                        cand.push(Frame::Str { cont: 0, esc: 0 });
+                        out.push(cand);
                     }
                     for j in next_i..props.len() {
                         let mut cand = st.clone();
@@ -504,7 +502,7 @@ impl Grammar {
             }
             2 => {
                 if b == b':' {
-                    let (value, after) = if props.is_empty() {
+                    let (value, after) = if next_i >= props.len() {
                         let Some(e) = extra else { return };
                         (*e, next)
                     } else {
@@ -517,7 +515,7 @@ impl Grammar {
             }
             _ => {
                 if b == b',' {
-                    if props.is_empty() || next_i < props.len() {
+                    if extra.is_some() || next_i < props.len() {
                         keep(&mut st, next, 1);
                         out.push(st);
                     }
@@ -947,6 +945,23 @@ mod tests {
         for bad in [r#"{"name":"x"}"#, r#"{"name":1,"age":1}"#, r#"{"name":"x","age":1.5}"#, r#"{"name":"x","age":1,"zzz":1}"#, r#"{"name":"x","age":1,"kind":"b"}"#, r#"{"name":"x","age":1,"tags":[1]}"#, r#"{"age":1,"name":"x"}"#, "[]"] {
             assert!(!accepts(&g, bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn json_schema_is_strict_by_default_and_additional_properties_true_relaxes_it() {
+        let strict = serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]});
+        let mut loose = strict.clone();
+        loose["additionalProperties"] = true.into();
+        let mut typed = strict.clone();
+        typed["additionalProperties"] = serde_json::json!({"type": "string"});
+        let strict = Schema::Json(strict).build(single_bytes(), 257, vec![EOS]);
+        let loose = Schema::Json(loose).build(single_bytes(), 257, vec![EOS]);
+        let typed = Schema::Json(typed).build(single_bytes(), 257, vec![EOS]);
+        let extra = r#"{"a":1,"z":[1,{}]}"#;
+        assert!(accepts(&strict, r#"{"a":1}"#) && !accepts(&strict, extra));
+        assert!(accepts(&loose, r#"{"a":1}"#) && accepts(&loose, extra) && accepts(&loose, r#"{"a":1,"y":null,"z":2}"#));
+        assert!(!accepts(&loose, r#"{"z":1}"#));
+        assert!(accepts(&typed, r#"{"a":1,"z":"s"}"#) && !accepts(&typed, extra));
     }
 
     #[test]

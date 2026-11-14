@@ -544,3 +544,85 @@ fn tiny_json_object_grammar_always_yields_an_object_and_leaves_other_rows_alone(
     }
     assert!(checked >= 8, "only {checked} constrained requests finished");
 }
+
+fn schema_conforms(schema: &serde_json::Value, v: &serde_json::Value) -> bool {
+    let Some(o) = v.as_object() else { return false };
+    let name_ok = o.get("name").is_some_and(|x| x.is_string());
+    let age_ok = o.get("age").is_some_and(|x| x.is_i64() || x.is_u64() || x.as_f64().is_some_and(|f| f.fract() == 0.0));
+    let kind_ok = o.get("kind").is_some_and(|x| ["red", "green", "blue"].iter().any(|k| x == k));
+    let items_ok = o.get("items").is_some_and(|x| {
+        x.as_array().is_some_and(|a| {
+            a.iter().all(|e| {
+                e.as_object().is_some_and(|e| {
+                    e.len() == 2 && e.get("id").is_some_and(|x| x.is_number()) && e.get("label").is_some_and(|x| x.is_string())
+                })
+            })
+        })
+    });
+    let allowed = schema["properties"].as_object().unwrap();
+    name_ok && age_ok && kind_ok && items_ok && o.keys().all(|k| allowed.contains_key(k))
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn tiny_json_schema_grammar_output_validates_over_many_seeds() {
+    use specrt::grammar::{Schema, TokenTable};
+    use specrt::sched::{Config, Event, Finish, GpuExecutor, Request, Scheduler};
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "age": {"type": "integer"},
+            "kind": {"enum": ["red", "green", "blue"]},
+            "items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "number"}, "label": {"type": "string"}}, "required": ["id", "label"]}}
+        },
+        "required": ["name", "age", "kind", "items"]
+    });
+    let s = spec_for("tiny-qwen3.5");
+    let vocab = s.dims.vocab;
+    let mut tokens = vec![Vec::new(); vocab];
+    for b in 0..=255u8 {
+        tokens[b as usize + 1] = vec![b];
+    }
+    let grammar = Schema::Json(schema.clone()).build(std::sync::Arc::new(TokenTable::new(tokens)), vocab, vec![0]);
+    let layout = Layout { max_ctx: 1024, slots: 8, kv_blocks: 256, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
+    let mut sched = Scheduler::new(exec, Config { max_num_seqs: 8, ..Config::default() });
+    let mut checked = 0;
+    for round in 0..12u32 {
+        let mut ids = Vec::new();
+        for i in 0..8u32 {
+            let seed = round * 16 + i;
+            let prompt: Vec<u32> = (0..20u32).map(|j| (j * 37 + seed * 11) % 700 + 300).collect();
+            ids.push(sched.submit(Request { prompt, max_tokens: 900, sampling: Sampling::new(1.0, seed), stop: vec![], salt: String::new(), media: Vec::new(), grammar: Some(grammar.clone()) }).unwrap());
+        }
+        let mut out: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+        let mut finish: std::collections::HashMap<u64, Finish> = Default::default();
+        while !sched.idle() {
+            let mut events = Vec::new();
+            sched.step(&mut events).unwrap();
+            for e in events {
+                match e {
+                    Event::Token { id, token } => out.entry(id).or_default().push(token),
+                    Event::Finished { id, finish: f, .. } => {
+                        finish.insert(id, f);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for id in ids {
+            let bytes: Vec<u8> = out[&id].iter().map(|&t| (t - 1) as u8).collect();
+            if finish[&id] != Finish::Stop {
+                assert!(out[&id].iter().all(|&t| (1..=256).contains(&t)), "only byte tokens are allowed");
+                continue;
+            }
+            match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(v) => assert!(schema_conforms(&schema, &v), "{v}"),
+                Err(e) => assert!(e.to_string().contains("number out of range"), "{e}: {}", String::from_utf8_lossy(&bytes)),
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 8, "only {checked} constrained requests finished");
+}
