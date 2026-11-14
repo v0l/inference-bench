@@ -95,6 +95,23 @@ impl EngineChoice {
         schema().iter().map(|f| (f.key.clone(), self.value(&f.key))).collect()
     }
 
+    fn validate(&self, opts: &ServeOptions) -> Result<()> {
+        let s = &opts.speculative;
+        if let Some(k) = s.draft_tokens {
+            anyhow::ensure!((1..=crate::spec::MAX_DRAFT_TOKENS).contains(&k), "speculative.draft_tokens (draft tokens) must be 1 to {}, not {k}", crate::spec::MAX_DRAFT_TOKENS);
+        }
+        if let Some(b) = s.max_batch {
+            anyhow::ensure!(b >= 1, "speculative.max_batch (mtp batch limit) must be at least 1");
+            anyhow::ensure!(b <= opts.max_num_seqs, "speculative.max_batch (mtp batch limit) {b} is above parallel requests {}", opts.max_num_seqs);
+        }
+        if let Some(r) = &opts.runtime {
+            r.prefix_cache.validate()?;
+            r.loader.validate()?;
+        }
+        anyhow::ensure!(opts.max_batched_tokens >= 64, "serve.max_batched_tokens (batched tokens) must be at least 64");
+        Ok(())
+    }
+
     fn sparse(&self, prefix: &str) -> Map<String, Value> {
         let mut out = Map::new();
         for (k, v) in self.profile.values().into_iter().chain(self.overrides.clone()) {
@@ -122,6 +139,7 @@ impl EngineChoice {
         opts.runtime = Some(serde_json::from_value(runtime).context("runtime options")?);
         let spec = Value::Object(self.sparse("speculative."));
         opts.speculative = serde_json::from_value(spec).context("speculative options")?;
+        self.validate(&opts)?;
         Ok(opts)
     }
 }
@@ -442,6 +460,23 @@ mod tests {
         assert_eq!((rt.loader.readers, rt.prefill_chunk, rt.tile, rt.big_tile), (3, Some(512), TileChoice::Big, Some([64, 64, 32, 4])));
         assert_eq!(o.max_batched_tokens, 2048);
         assert_eq!(o.speculative.head_quant, Some(Quant::Bf16));
+    }
+
+    #[test]
+    fn an_invalid_value_is_refused_naming_the_option() {
+        for (key, value, named) in [
+            ("speculative.draft_tokens", json!(0), "draft_tokens"),
+            ("speculative.draft_tokens", json!(9), "draft_tokens"),
+            ("speculative.max_batch", json!(99), "max_batch"),
+            ("runtime.prefix_cache.snapshot_interval", json!(100), "snapshot_interval"),
+            ("runtime.loader.readers", json!(0), "readers"),
+            ("serve.max_batched_tokens", json!(1), "max_batched_tokens"),
+        ] {
+            let mut c = EngineChoice::default();
+            c.set(key, value);
+            let e = c.apply(ServeOptions { max_num_seqs: 8, ..ServeOptions::default() }).unwrap_err();
+            assert!(format!("{e:#}").contains(named), "{key}: {e:#}");
+        }
     }
 
     #[test]

@@ -344,7 +344,7 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                         let hi = free.map(|f| f as f64 / GB).unwrap_or(base + dialog.kv_gb).max(base + 0.5).max(base + dialog.kv_gb);
                         let mut mem = base + dialog.kv_gb;
                         row_help(ui, "gpu memory", "How much GPU memory this model may use, weights included. What is left after the weights becomes the KV cache every request shares.", |ui| {
-                            if ui.add(egui::Slider::new(&mut mem, (base + 0.25)..=hi).step_by(0.25).suffix(" GB")).changed() {
+                            if ui.add(egui::Slider::new(&mut mem, (base + 0.25)..=hi).step_by(0.25).fixed_decimals(1).suffix(" GB")).changed() {
                                 dialog.kv_gb = ((mem - base) * 4.0).round() / 4.0;
                             }
                         });

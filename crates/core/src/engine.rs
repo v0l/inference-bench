@@ -246,7 +246,7 @@ impl Backend {
     }
 }
 
-pub fn serve_options(max_ctx: Option<usize>, seqs: usize, kv_cache_bytes: Option<u64>, engine: &specrt::options::EngineChoice) -> ServeOptions {
+pub fn serve_options(max_ctx: Option<usize>, seqs: usize, kv_cache_bytes: Option<u64>, engine: &specrt::options::EngineChoice) -> Result<ServeOptions, BackendError> {
     let base = ServeOptions {
         max_model_len: max_ctx,
         max_num_seqs: seqs,
@@ -254,7 +254,7 @@ pub fn serve_options(max_ctx: Option<usize>, seqs: usize, kv_cache_bytes: Option
         kv_cache_tokens: None,
         ..ServeOptions::default()
     };
-    engine.apply(base.clone()).unwrap_or(base)
+    engine.apply(base).map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("engine options: {e:#}")))
 }
 
 struct Opened {
@@ -277,10 +277,11 @@ fn open(
     stats: &StatsSource,
     progress: &specrt::progress::Sink,
 ) -> Result<Opened, BackendError> {
+    serve_options(max_ctx, seqs, kv_cache_bytes, engine)?;
     let mut note = None;
     let attempts = if seqs > 1 { vec![seqs, 1] } else { Vec::new() };
     for (n, attempt) in attempts.into_iter().enumerate() {
-        let Some(mut target) = serving(serve_options(max_ctx, attempt, kv_cache_bytes, engine)) else { break };
+        let Some(mut target) = serving(serve_options(max_ctx, attempt, kv_cache_bytes, engine)?) else { break };
         target.set_progress(Some(progress.clone()));
         match target.load(model_id) {
             Ok(()) => {
@@ -538,8 +539,16 @@ mod tests {
 
     #[test]
     fn serve_options_pass_the_pool_size_and_not_context_times_seqs() {
-        let o = serve_options(Some(8192), 4, Some(3 << 30), &Default::default());
+        let o = serve_options(Some(8192), 4, Some(3 << 30), &Default::default()).unwrap();
         assert_eq!((o.kv_cache_bytes, o.kv_cache_tokens, o.max_model_len, o.max_num_seqs), (Some(3 << 30), None, Some(8192), 4));
+    }
+
+    #[test]
+    fn an_invalid_engine_option_fails_the_load_naming_it() {
+        let mut bad = specrt::options::EngineChoice::default();
+        bad.set("speculative.draft_tokens", serde_json::json!(0));
+        let err = serve_options(Some(4096), 4, None, &bad).unwrap_err();
+        assert!(err.message.contains("draft_tokens"), "{}", err.message);
     }
 
     fn ask_all(h: &Handle, n: usize) -> Vec<Receiver<ChatEvent>> {
