@@ -22,6 +22,7 @@ pub mod result;
 pub mod serving;
 pub use specrt::chat as specrt_chat;
 pub use specrt::serve as specrt_serve;
+pub use specrt::logprobs as specrt_logprobs;
 pub use specrt::placement as specrt_placement;
 pub use specrt::spec as specrt_spec;
 pub mod specs;

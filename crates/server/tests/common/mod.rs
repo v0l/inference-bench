@@ -24,6 +24,7 @@ pub struct Fake {
     pub token_delay_ms: u64,
     pub pieces: Vec<String>,
     pub vision: bool,
+    pub batched: bool,
     pub stats: Arc<Stats>,
 }
 
@@ -33,7 +34,7 @@ impl Target for Fake {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { vision: self.vision, ..Capabilities::default() }
+        Capabilities { vision: self.vision, logprobs: self.batched, batched: self.batched, ..Capabilities::default() }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
@@ -84,6 +85,11 @@ impl Fake {
             };
             text.push_str(&piece);
             on_text(&piece);
+            if let Some(r) = request
+                && let (Some(top), Some(sink)) = (r.logprobs, &r.on_logprob)
+            {
+                sink(&inference_bench_core::fake::fake_logprob(&piece, top));
+            }
         }
         if !request.is_some_and(|r| r.cancelled()) {
             self.stats.generated.fetch_add(1, Ordering::SeqCst);
@@ -119,11 +125,12 @@ pub struct Shape {
     pub token_delay_ms: u64,
     pub pieces: Vec<String>,
     pub vision: bool,
+    pub batched: bool,
 }
 
 impl Default for Shape {
     fn default() -> Self {
-        Self { tokens: 4, first_delay_ms: 0, token_delay_ms: 1, pieces: Vec::new(), vision: false }
+        Self { tokens: 4, first_delay_ms: 0, token_delay_ms: 1, pieces: Vec::new(), vision: false, batched: false }
     }
 }
 
@@ -146,6 +153,7 @@ pub fn start(config: ServerConfig, shape: Shape) -> Rig {
             token_delay_ms: shape.token_delay_ms,
             pieces: shape.pieces.clone(),
             vision: shape.vision,
+            batched: shape.batched,
             stats: s.clone(),
         }))
     };

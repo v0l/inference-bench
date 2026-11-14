@@ -12,6 +12,7 @@ pub mod executor;
 pub mod gguf;
 pub mod jit;
 pub mod link;
+pub mod logprobs;
 pub mod mtp;
 pub mod nvfp4;
 pub mod pipeline;

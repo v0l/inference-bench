@@ -60,7 +60,7 @@ impl Target for OpenAi {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: false, memory: false, vision: false, thinking: Default::default() }
+        Capabilities { streaming: true, logits: false, memory: false, ..Capabilities::default() }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {

@@ -282,13 +282,23 @@ impl ScriptedServing {
     }
 }
 
+pub fn fake_logprob(piece: &str, top: u32) -> crate::chat::TokenLogprob {
+    let alt = |i: u32| (format!("alt{i}"), format!("alt{i}").into_bytes(), -1.0 - i as f32);
+    crate::chat::TokenLogprob {
+        token: piece.to_string(),
+        bytes: piece.as_bytes().to_vec(),
+        logprob: -0.25,
+        top: std::iter::once((piece.to_string(), piece.as_bytes().to_vec(), -0.25)).chain((1..top).map(alt)).collect(),
+    }
+}
+
 impl crate::target::Target for ScriptedServing {
     fn name(&self) -> &str {
         "scripted-serving"
     }
 
     fn capabilities(&self) -> crate::target::Capabilities {
-        crate::target::Capabilities { streaming: true, vision: self.script.vision, ..Default::default() }
+        crate::target::Capabilities { streaming: true, vision: self.script.vision, logprobs: true, batched: true, ..Default::default() }
     }
 
     fn load(&mut self, model: &str) -> Result<(), crate::result::BackendError> {
@@ -325,6 +335,9 @@ impl crate::target::Target for ScriptedServing {
             last = Some(at);
             text.push_str(chunk);
             on_text(chunk);
+            if let (Some(top), Some(sink)) = (request.logprobs, &request.on_logprob) {
+                sink(&fake_logprob(chunk, top));
+            }
             pieces += 1;
             c.generated.fetch_add(1, SeqCst);
             thread::sleep(Duration::from_millis(self.script.chunk_delay_ms));

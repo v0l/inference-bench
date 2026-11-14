@@ -535,8 +535,11 @@ fn a_request_body_above_the_old_two_megabyte_default_is_accepted_when_media_limi
     assert_ne!(status, 413, "{body}");
     rig.stop();
     let rig = start(config("[[models]]\nid='m'\n[media]\nmax_images = 1\nmax_videos = 0\nmax_image_bytes = 1000"), Shape { vision: true, ..Shape::default() });
-    let (status, _, _) = rig.post("/v1/chat/completions", None, image_chat(&big));
-    assert_eq!(status, 413);
+    match agent().post(format!("{}/v1/chat/completions", rig.url)).send_json(image_chat(&big)) {
+        Ok(resp) => assert_eq!(resp.status().as_u16(), 413),
+        Err(ureq::Error::Io(e)) => assert!(matches!(e.kind(), std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset), "{e}"),
+        Err(e) => panic!("{e}"),
+    }
     rig.stop();
 }
 
@@ -597,5 +600,150 @@ fn landing_page_is_public_and_hides_the_key() {
     assert!(body.contains("required"));
     let (_, json) = get_accept(&rig, "/", "application/json");
     assert!(!json.contains("sk-secret-one"));
+    rig.stop();
+}
+
+fn vllm_shapes() -> Vec<(&'static str, Value)> {
+    let user = json!([{"role": "user", "content": "say hello now"}]);
+    let tool = json!([{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]);
+    let base = |extra: Value| {
+        let mut b = json!({"model": "qwen3.8-27b", "messages": user, "max_tokens": 4});
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        b
+    };
+    vec![
+        ("plain", base(json!({}))),
+        ("stream", base(json!({"stream": true}))),
+        ("max_completion_tokens", base(json!({"max_completion_tokens": 4}))),
+        ("tools", base(json!({"tools": tool, "tool_choice": "auto"}))),
+        ("reasoning_effort", base(json!({"reasoning_effort": "low"}))),
+        ("parallel_tool_calls", base(json!({"tools": tool, "parallel_tool_calls": true}))),
+        ("chat_template_kwargs", base(json!({"chat_template_kwargs": {"enable_thinking": false}}))),
+        ("stop list", base(json!({"stop": ["\n\n", "END"]}))),
+        ("temperature 2.5", base(json!({"temperature": 2.5}))),
+        ("n 2", base(json!({"n": 2}))),
+        ("logprobs", base(json!({"logprobs": true, "top_logprobs": 2}))),
+        ("logprobs stream", base(json!({"logprobs": true, "top_logprobs": 2, "stream": true}))),
+        ("developer role", base(json!({"messages": [{"role": "developer", "content": "be brief"}, {"role": "user", "content": "hi"}]}))),
+        ("image_url", base(json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image_url", "image_url": {"url": PIXEL}},
+        ]}]}))),
+    ]
+}
+
+fn compat_rig() -> Rig {
+    start(
+        config("max_num_seqs = 4\n[[models]]\nid='m'\nserved_names=['qwen3.8-27b']"),
+        Shape { vision: true, batched: true, ..Shape::default() },
+    )
+}
+
+#[test]
+fn every_vllm_client_request_shape_is_a_200() {
+    let rig = compat_rig();
+    for (name, body) in vllm_shapes() {
+        let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+        assert_eq!(status, 200, "{name}: {text}");
+    }
+    rig.stop();
+}
+
+#[test]
+fn response_format_json_is_a_clear_400_until_structured_output_lands() {
+    let rig = compat_rig();
+    for format in [json!({"type": "json_object"}), json!({"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "object"}}})] {
+        let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "response_format": format});
+        let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("structured output") && text.contains("#591"), "{text}");
+    }
+    rig.stop();
+}
+
+#[test]
+fn n_choices_come_back_indexed_with_summed_usage() {
+    let rig = compat_rig();
+    let mut body = chat("m", false);
+    body["n"] = json!(3);
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body.clone());
+    assert_eq!(status, 200, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let choices = v["choices"].as_array().unwrap();
+    assert_eq!(choices.iter().map(|c| c["index"].as_u64().unwrap()).collect::<Vec<_>>(), [0, 1, 2]);
+    assert!(choices.iter().all(|c| c["message"]["content"] == "w0 w1 w2 w3 "));
+    assert_eq!(v["usage"]["completion_tokens"], 12);
+    body["stream"] = json!(true);
+    let (_, text, _) = rig.post("/v1/chat/completions", None, body);
+    for i in 0..3 {
+        assert_eq!(text.matches(&format!("\"index\":{i},\"delta\":{{}},\"finish_reason\":\"length\"")).count(), 1, "{i}: {text}");
+    }
+    assert_eq!(text.matches("[DONE]").count(), 1, "{text}");
+    for bad in [json!(0), json!(17), json!("2")] {
+        let mut b = chat("m", false);
+        b["n"] = bad;
+        assert_eq!(rig.post("/v1/chat/completions", None, b).0, 400);
+    }
+    rig.stop();
+}
+
+#[test]
+fn n_above_one_on_a_single_sequence_engine_is_a_400_naming_max_num_seqs() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    let mut body = chat("m", false);
+    body["n"] = json!(2);
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("max_num_seqs"), "{text}");
+    rig.stop();
+}
+
+#[test]
+fn chat_logprobs_list_every_token_with_its_top_alternatives() {
+    let rig = compat_rig();
+    let mut body = chat("m", false);
+    body["logprobs"] = json!(true);
+    body["top_logprobs"] = json!(2);
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body.clone());
+    assert_eq!(status, 200, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let content = v["choices"][0]["logprobs"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 4);
+    assert_eq!(content[0]["token"], "w0 ");
+    assert_eq!(content[0]["logprob"], -0.25);
+    assert_eq!(content[0]["bytes"], json!("w0 ".as_bytes()));
+    assert_eq!(content[0]["top_logprobs"].as_array().unwrap().len(), 2);
+    body["stream"] = json!(true);
+    let (_, text, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(text.matches("\"top_logprobs\":[").count(), 4, "{text}");
+    let mut plain = chat("m", false);
+    plain["top_logprobs"] = json!(2);
+    assert_eq!(rig.post("/v1/chat/completions", None, plain).0, 400);
+    rig.stop();
+}
+
+#[test]
+fn completion_logprobs_use_the_legacy_shape() {
+    let rig = compat_rig();
+    let body = json!({"model": "m", "prompt": "once upon", "max_tokens": 3, "logprobs": 1});
+    let (status, text, _) = rig.post("/v1/completions", None, body);
+    assert_eq!(status, 200, "{text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    let lp = &v["choices"][0]["logprobs"];
+    assert_eq!(lp["tokens"], json!(["w0 ", "w1 ", "w2 "]));
+    assert_eq!(lp["text_offset"], json!([0, 3, 6]));
+    assert_eq!(lp["token_logprobs"].as_array().unwrap().len(), 3);
+    rig.stop();
+}
+
+#[test]
+fn logprobs_on_a_single_sequence_engine_are_a_400() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    let mut body = chat("m", false);
+    body["logprobs"] = json!(true);
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 400, "{text}");
     rig.stop();
 }

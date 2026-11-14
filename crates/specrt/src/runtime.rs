@@ -260,10 +260,11 @@ pub struct Sampling {
     pub top_k: u32,
     pub top_p: f32,
     pub min_p: f32,
+    pub logprobs: Option<u32>,
 }
 
 impl Sampling {
-    pub const GREEDY: Sampling = Sampling { temperature: 0.0, seed: 0, top_k: 0, top_p: 1.0, min_p: 0.0 };
+    pub const GREEDY: Sampling = Sampling { temperature: 0.0, seed: 0, top_k: 0, top_p: 1.0, min_p: 0.0, logprobs: None };
 
     pub fn new(temperature: f32, seed: u32) -> Sampling {
         Sampling { temperature, seed, ..Sampling::GREEDY }
@@ -271,6 +272,10 @@ impl Sampling {
 
     pub fn truncated(self, top_k: u32, top_p: f32, min_p: f32) -> Sampling {
         Sampling { top_k, top_p, min_p, ..self }
+    }
+
+    pub fn with_logprobs(self, top: Option<u32>) -> Sampling {
+        Sampling { logprobs: top, ..self }
     }
 
     pub fn inverse_temperature(&self) -> f32 {

@@ -32,14 +32,19 @@ impl ServingTarget {
         cancel: Option<Arc<AtomicBool>>,
         media: Vec<specrt::sched::MediaInput>,
         vision_tokens: usize,
+        on_logprob: Option<crate::chat::LogprobSink>,
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Generation, BackendError> {
         let engine = self.engine()?;
         let cancel = cancel.unwrap_or_default();
         let c = engine
-            .complete_media(prompt, media, max_tokens, sampling, streaming, salt, cancel, &mut |t| {
+            .complete_with_logprobs(prompt, media, max_tokens, sampling, streaming, salt, cancel, &mut |t| {
                 on_text(t);
                 true
+            }, &mut |lp| {
+                if let Some(sink) = &on_logprob {
+                    sink(lp);
+                }
             })
             .map_err(|e| engine_error(&e))?;
         Ok(Generation {
@@ -62,7 +67,7 @@ impl Target for ServingTarget {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: false, memory: false, vision: self.serving.as_ref().is_some_and(|s| s.accepts_media()), thinking: self.serving.as_ref().map(|s| s.thinking()).unwrap_or_default() }
+        Capabilities { streaming: true, logits: false, memory: false, vision: self.serving.as_ref().is_some_and(|s| s.accepts_media()), thinking: self.serving.as_ref().map(|s| s.thinking()).unwrap_or_default(), logprobs: true, batched: true }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
@@ -74,7 +79,7 @@ impl Target for ServingTarget {
 
     fn generate(&mut self, request: &Request, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let ids = self.engine()?.tokens(&request.prompt).map_err(|e| engine_error(&e))?;
-        self.run(ids, request.max_tokens, Sampling::GREEDY, false, String::new(), None, Vec::new(), 0, on_text)
+        self.run(ids, request.max_tokens, Sampling::GREEDY, false, String::new(), None, Vec::new(), 0, None, on_text)
     }
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
@@ -88,7 +93,8 @@ impl Target for ServingTarget {
                 .map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("{e:#}")))?
         };
         let s = request.sampling;
-        self.run(ids, s.max_tokens, s.resolve(self.engine()?.sampling_defaults()), !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), media, vision_tokens, on_text)
+        let sampling = s.resolve(self.engine()?.sampling_defaults()).with_logprobs(request.logprobs);
+        self.run(ids, s.max_tokens, sampling, !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), media, vision_tokens, request.on_logprob.clone(), on_text)
     }
 
     fn share(&self) -> Option<Box<dyn Target>> {

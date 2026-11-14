@@ -258,7 +258,7 @@ impl Target for Native {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking }
+        Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking, ..Capabilities::default() }
     }
 
     fn load(&mut self, model: &str) -> Result<(), BackendError> {

@@ -14,7 +14,8 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
-use inference_bench_core::chat::{ChatRequest, Message, Role, Sampling};
+use inference_bench_core::chat::{ChatRequest, Message, Role, Sampling, TokenLogprob};
+use inference_bench_core::specrt_logprobs;
 use inference_bench_core::logging::{preview, redact_key};
 use inference_bench_core::result::{BackendError, ErrorKind, Generation};
 use serde_json::{Value, json};
@@ -426,6 +427,8 @@ struct Params {
     stream: bool,
     include_usage: bool,
     ignore_eos: bool,
+    n: usize,
+    logprobs: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -462,7 +465,8 @@ fn stop_strings(body: &Value) -> Result<Vec<String>, ApiError> {
 
 const HANDLED_FIELDS: &[&str] = &[
     "model", "messages", "prompt", "prompts", "repeat", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "seed", "stop", "stream",
-    "stream_options", "ignore_eos", "tools", "tool_choice", "chat_template_kwargs", "reasoning_effort", "cache_salt",
+    "stream_options", "ignore_eos", "tools", "tool_choice", "chat_template_kwargs", "reasoning_effort", "cache_salt", "n", "logprobs",
+    "top_logprobs",
 ];
 
 const NEUTRAL_FIELDS: &[&str] = &["user", "parallel_tool_calls", "store", "metadata"];
@@ -474,22 +478,59 @@ fn reject_unsupported_fields(body: &Value) -> Result<(), ApiError> {
         let known = HANDLED_FIELDS.contains(&key) || NEUTRAL_FIELDS.contains(&key);
         let ok = known
             || match key {
-                "n" => value.is_null() || value.as_u64() == Some(1),
-                "logprobs" => value.is_null() || value == &json!(false),
-                "top_logprobs" => value.is_null() || value.as_u64() == Some(0),
                 "response_format" => value.is_null() || value["type"] == "text",
                 "frequency_penalty" | "presence_penalty" => value.is_null() || value.as_f64() == Some(0.0),
                 _ => false,
             };
         if !ok {
             let why = match key {
-                "n" | "logprobs" | "top_logprobs" | "response_format" | "frequency_penalty" | "presence_penalty" => "value is not supported",
+                "response_format" => "structured output (json_object, json_schema) is not supported yet (#591)",
+                "frequency_penalty" | "presence_penalty" => "value is not supported",
                 _ => "field is not supported",
             };
             return Err(ApiError::bad_request(format!("{key}: {why}")));
         }
     }
     Ok(())
+}
+
+pub const MAX_CHOICES: u64 = 16;
+
+fn choice_count(body: &Value) -> Result<usize, ApiError> {
+    match &body["n"] {
+        Value::Null => Ok(1),
+        v => match v.as_u64() {
+            Some(n) if (1..=MAX_CHOICES).contains(&n) => Ok(n as usize),
+            _ => Err(ApiError::bad_request(format!("n must be an integer from 1 to {MAX_CHOICES}"))),
+        },
+    }
+}
+
+fn logprob_request(body: &Value, chat: bool) -> Result<Option<u32>, ApiError> {
+    let max = specrt_logprobs::MAX_TOP as u64;
+    let top = |v: &Value, name: &str| match v.as_u64() {
+        Some(n) if n <= max => Ok(n as u32),
+        _ => Err(ApiError::bad_request(format!("{name} must be an integer from 0 to {max}"))),
+    };
+    if !chat {
+        return match &body["logprobs"] {
+            Value::Null => Ok(None),
+            v => top(v, "logprobs").map(Some),
+        };
+    }
+    let on = match &body["logprobs"] {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        _ => return Err(ApiError::bad_request("logprobs must be true or false")),
+    };
+    let n = match &body["top_logprobs"] {
+        Value::Null => 0,
+        v => top(v, "top_logprobs")?,
+    };
+    if n > 0 && !on {
+        return Err(ApiError::bad_request("top_logprobs needs logprobs: true"));
+    }
+    Ok(on.then_some(n))
 }
 
 fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), ApiError> {
@@ -574,6 +615,8 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         stream: body["stream"].as_bool().unwrap_or(false),
         include_usage: body["stream_options"]["include_usage"].as_bool().unwrap_or(false),
         ignore_eos: body["ignore_eos"].as_bool().unwrap_or(false),
+        n: choice_count(body)?,
+        logprobs: logprob_request(body, chat)?,
     })
 }
 
@@ -616,6 +659,7 @@ fn completion_prompt(body: &Value) -> Result<String, ApiError> {
 
 enum Gen {
     Text(String),
+    Logprob(TokenLogprob),
     Done(Result<Generation, ApiError>, bool),
 }
 
@@ -640,9 +684,10 @@ fn log_prompt(state: &AppState, request: &ChatRequest) {
 fn start_generation(
     state: &Arc<AppState>,
     model: String,
-    request: ChatRequest,
+    mut request: ChatRequest,
     max_tokens: usize,
     stop: Vec<String>,
+    needs_batched: bool,
 ) -> Result<mpsc::UnboundedReceiver<Gen>, ApiError> {
     let mut admission = state.admit()?;
     let (tx, rx) = mpsc::unbounded_channel();
@@ -668,10 +713,25 @@ fn start_generation(
                 }
             };
             admission.start();
-            if !request.media.is_empty() && !lease.backend().capabilities().vision {
-                let msg = format!("model {model} does not accept image or video input: its config has no vision_config");
+            let caps = lease.backend().capabilities();
+            let refusal = if !request.media.is_empty() && !caps.vision {
+                Some(format!("model {model} does not accept image or video input: its config has no vision_config"))
+            } else if needs_batched && !caps.batched {
+                Some(format!("n > 1 needs the batched engine: load {model} with more than one parallel request (max_num_seqs above 1)"))
+            } else if request.logprobs.is_some() && !caps.logprobs {
+                Some(format!("logprobs need the batched engine: load {model} with more than one parallel request (max_num_seqs above 1)"))
+            } else {
+                None
+            };
+            if let Some(msg) = refusal {
                 let _ = tx.send(Gen::Done(Err(ApiError::bad_request(msg)), false));
                 return;
+            }
+            if request.logprobs.is_some() {
+                let lp_tx = tx.clone();
+                request.on_logprob = Some(Arc::new(move |lp: &TokenLogprob| {
+                    let _ = lp_tx.send(Gen::Logprob(lp.clone()));
+                }));
             }
             Span::current().record("backend", lease.model().backend_label.as_str());
             let queued_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -682,7 +742,7 @@ fn start_generation(
             let outcome = tokio::task::spawn_blocking(move || {
                 span.in_scope(|| {
                     let mut filter = StopFilter::new(stop);
-                    let mut send = |t: &str| {
+                    let send = |t: &str| {
                         if !t.is_empty() && text_tx.send(Gen::Text(t.to_string())).is_err() {
                             flag.store(true, Ordering::SeqCst);
                         }
@@ -791,16 +851,29 @@ fn usage(g: &Generation) -> Value {
     })
 }
 
-async fn collect(mut rx: mpsc::UnboundedReceiver<Gen>) -> Result<(Generation, bool), ApiError> {
+struct Collected {
+    generation: Generation,
+    stopped: bool,
+    logprobs: Vec<TokenLogprob>,
+}
+
+async fn collect(rx: mpsc::UnboundedReceiver<Gen>) -> Result<(Generation, bool), ApiError> {
+    collect_all(rx).await.map(|c| (c.generation, c.stopped))
+}
+
+async fn collect_all(mut rx: mpsc::UnboundedReceiver<Gen>) -> Result<Collected, ApiError> {
     let mut text = String::new();
+    let mut logprobs = Vec::new();
     while let Some(ev) = rx.recv().await {
         match ev {
             Gen::Text(t) => text.push_str(&t),
+            Gen::Logprob(lp) => logprobs.push(lp),
             Gen::Done(Ok(mut g), stopped) => {
                 if g.text.is_empty() {
                     g.text = text;
                 }
-                return Ok((g, stopped));
+                logprobs.truncate(g.completion_tokens as usize);
+                return Ok(Collected { generation: g, stopped, logprobs });
             }
             Gen::Done(Err(e), _) => return Err(e),
         }
@@ -864,32 +937,86 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
     if p.use_template {
         request.template_vars = p.template_vars;
     }
+    request.logprobs = p.logprobs;
     log_prompt(&state, &request);
-    let rx = start_generation(&state, p.model.clone(), request, max_tokens, p.stop)?;
+    let mut receivers = Vec::with_capacity(p.n);
+    for i in 0..p.n {
+        let mut one = request.clone();
+        if i > 0 {
+            one.sampling.seed = Some(request.sampling.seed.unwrap_or(0).wrapping_add(i as u64));
+        }
+        receivers.push(start_generation(&state, p.model.clone(), one, max_tokens, p.stop.clone(), p.n > 1)?);
+    }
     let id = format!("{}-{}", if chat { "chatcmpl" } else { "cmpl" }, &uuid::Uuid::new_v4().simple().to_string()[..24]);
     if p.stream {
-        let events = sse_events(rx, guard, id, p.model, max_tokens, chat, p.include_usage, p.output);
+        let events = sse_events(receivers, guard, id, p.model, max_tokens, chat, p.include_usage, p.output);
         return Ok(Sse::new(events).keep_alive(KeepAlive::default()).into_response());
     }
-    let (g, stopped) = collect(rx).await?;
+    let mut done = Vec::with_capacity(p.n);
+    for rx in receivers {
+        done.push(collect_all(rx).await?);
+    }
     drop(guard);
-    let reason = finish_reason(&g, max_tokens, stopped);
     let created = now();
-    let body = if chat {
-        let (message, reason) = chat_message(&g.text, &p.output, reason);
-        json!({
-            "id": id, "object": "chat.completion", "created": created, "model": p.model,
-            "choices": [{"index": 0, "message": message, "finish_reason": reason}],
-            "usage": usage(&g),
+    let choices: Vec<Value> = done
+        .iter()
+        .enumerate()
+        .map(|(index, c)| {
+            let reason = finish_reason(&c.generation, max_tokens, c.stopped);
+            let logprobs = p.logprobs.map(|_| logprobs_json(&c.logprobs, chat));
+            if chat {
+                let (message, reason) = chat_message(&c.generation.text, &p.output, reason);
+                json!({"index": index, "message": message, "logprobs": logprobs, "finish_reason": reason})
+            } else {
+                json!({"index": index, "text": c.generation.text, "logprobs": logprobs, "finish_reason": reason})
+            }
         })
-    } else {
-        json!({
-            "id": id, "object": "text_completion", "created": created, "model": p.model,
-            "choices": [{"index": 0, "text": g.text, "logprobs": null, "finish_reason": reason}],
-            "usage": usage(&g),
-        })
-    };
+        .collect();
+    let total = merged_usage(done.iter().map(|c| &c.generation));
+    let body = json!({
+        "id": id, "object": if chat { "chat.completion" } else { "text_completion" }, "created": created, "model": p.model,
+        "choices": choices,
+        "usage": total,
+    });
     Ok(Json(body).into_response())
+}
+
+fn merged_usage<'a>(all: impl Iterator<Item = &'a Generation>) -> Value {
+    let mut sum: Option<Generation> = None;
+    for g in all {
+        match sum.as_mut() {
+            None => sum = Some(g.clone()),
+            Some(s) => s.completion_tokens += g.completion_tokens,
+        }
+    }
+    usage(&sum.unwrap_or_default())
+}
+
+fn chat_logprob_entry(lp: &TokenLogprob) -> Value {
+    json!({
+        "token": lp.token,
+        "logprob": lp.logprob,
+        "bytes": lp.bytes,
+        "top_logprobs": lp.top.iter().map(|(t, b, l)| json!({"token": t, "logprob": l, "bytes": b})).collect::<Vec<_>>(),
+    })
+}
+
+fn logprobs_json(list: &[TokenLogprob], chat: bool) -> Value {
+    if chat {
+        return json!({"content": list.iter().map(chat_logprob_entry).collect::<Vec<_>>()});
+    }
+    let mut offset = 0;
+    let mut offsets = Vec::with_capacity(list.len());
+    for lp in list {
+        offsets.push(offset);
+        offset += lp.token.len();
+    }
+    json!({
+        "tokens": list.iter().map(|l| l.token.clone()).collect::<Vec<_>>(),
+        "token_logprobs": list.iter().map(|l| l.logprob).collect::<Vec<_>>(),
+        "top_logprobs": list.iter().map(|l| l.top.iter().map(|(t, _, v)| (t.clone(), json!(v))).collect::<serde_json::Map<_, _>>()).collect::<Vec<_>>(),
+        "text_offset": offsets,
+    })
 }
 
 fn chat_message(text: &str, output: &OutputMode, reason: &'static str) -> (Value, &'static str) {
@@ -954,8 +1081,19 @@ fn chunk(id: &str, model: &str, chat: bool, delta: Option<(&str, &str)>, reason:
     })
 }
 
+struct ChoiceStream {
+    streamed: bool,
+    parser: Option<OutputParser>,
+}
+
+fn indexed(mut v: Value, index: usize) -> Value {
+    v["choices"][0]["index"] = json!(index);
+    v
+}
+
+#[allow(clippy::too_many_arguments)]
 fn sse_events(
-    rx: mpsc::UnboundedReceiver<Gen>,
+    receivers: Vec<mpsc::UnboundedReceiver<Gen>>,
     guard: CancelOnDrop,
     id: String,
     model: String,
@@ -965,71 +1103,91 @@ fn sse_events(
     output: OutputMode,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let data = |v: Value| Ok(Event::default().data(v.to_string()));
-    let opening = match chat {
-        true => vec![data(chunk(&id, &model, true, Some(("assistant", "")), None))],
+    let n = receivers.len();
+    let opening: Vec<Result<Event, Infallible>> = match chat {
+        true => (0..n).map(|i| data(indexed(chunk(&id, &model, true, Some(("assistant", "")), None), i))).collect(),
         false => Vec::new(),
     };
-    let body = stream::unfold((rx, false), |(mut rx, done)| async move {
-        if done {
-            return None;
-        }
-        rx.recv().await.map(|ev| {
-            let finished = matches!(ev, Gen::Done(..));
-            (ev, (rx, finished))
+    let tagged = receivers.into_iter().enumerate().map(|(i, rx)| {
+        stream::unfold((rx, false), move |(mut rx, done)| async move {
+            if done {
+                return None;
+            }
+            rx.recv().await.map(|ev| {
+                let finished = matches!(ev, Gen::Done(..));
+                ((i, ev), (rx, finished))
+            })
         })
+        .boxed()
     });
-    let mut streamed = false;
-    let mut parser = output.parses().then(|| output.parser());
-    let tail = body.flat_map(move |ev| {
+    let body = stream::select_all(tagged);
+    let mut choices: Vec<ChoiceStream> = (0..n).map(|_| ChoiceStream { streamed: false, parser: output.parses().then(|| output.parser()) }).collect();
+    let mut finished = 0usize;
+    let mut failed = false;
+    let mut totals: Option<Generation> = None;
+    let tail = body.flat_map(move |(index, ev)| {
         let _keep = &guard;
-        let deltas = |_: &mut OutputParser, deltas: Vec<Delta>| -> Vec<Result<Event, Infallible>> {
-            deltas.iter().map(|d| data(delta_chunk(&id, &model, delta_json(d)))).collect()
+        let at = |v: Value| data(indexed(v, index));
+        let deltas = |deltas: Vec<Delta>| -> Vec<Result<Event, Infallible>> {
+            deltas.iter().map(|d| at(delta_chunk(&id, &model, delta_json(d)))).collect()
         };
+        let c = &mut choices[index];
         let items: Vec<Result<Event, Infallible>> = match ev {
+            _ if failed => Vec::new(),
             Gen::Text(t) => {
-                streamed = true;
-                match parser.as_mut() {
-                    Some(p) => {
-                        let d = p.feed(&t);
-                        deltas(p, d)
-                    }
-                    None => vec![data(chunk(&id, &model, chat, Some(("", &t)), None))],
+                c.streamed = true;
+                match c.parser.as_mut() {
+                    Some(p) => deltas(p.feed(&t)),
+                    None => vec![at(chunk(&id, &model, chat, Some(("", &t)), None))],
                 }
+            }
+            Gen::Logprob(lp) => {
+                let mut v = chunk(&id, &model, chat, None, None);
+                v["choices"][0]["logprobs"] = logprobs_json(std::slice::from_ref(&lp), chat);
+                vec![at(v)]
             }
             Gen::Done(Ok(g), stopped) => {
                 let mut out = Vec::new();
                 let mut reason = finish_reason(&g, max_tokens, stopped);
-                match parser.as_mut() {
+                match c.parser.as_mut() {
                     Some(p) => {
-                        let mut d = match streamed {
+                        let mut d = match c.streamed {
                             true => Vec::new(),
                             false => p.feed(&g.text),
                         };
                         d.extend(p.finish());
-                        out.extend(deltas(p, d));
+                        out.extend(deltas(d));
                         if p.called() {
                             reason = "tool_calls";
                         }
                     }
-                    None if !streamed && !g.text.is_empty() => {
-                        out.push(data(chunk(&id, &model, chat, Some(("", &g.text)), None)))
-                    }
+                    None if !c.streamed && !g.text.is_empty() => out.push(at(chunk(&id, &model, chat, Some(("", &g.text)), None))),
                     None => {}
                 }
-                out.push(data(chunk(&id, &model, chat, None, Some(reason))));
-                if include_usage {
-                    let mut u = chunk(&id, &model, chat, None, None);
-                    u["choices"] = json!([]);
-                    u["usage"] = usage(&g);
-                    out.push(data(u));
+                out.push(at(chunk(&id, &model, chat, None, Some(reason))));
+                match totals.as_mut() {
+                    None => totals = Some(g.clone()),
+                    Some(t) => t.completion_tokens += g.completion_tokens,
                 }
-                out.push(Ok(Event::default().data("[DONE]")));
+                finished += 1;
+                if finished == n {
+                    if include_usage {
+                        let mut u = chunk(&id, &model, chat, None, None);
+                        u["choices"] = json!([]);
+                        u["usage"] = usage(&totals.clone().unwrap_or_default());
+                        out.push(data(u));
+                    }
+                    out.push(Ok(Event::default().data("[DONE]")));
+                }
                 out
             }
-            Gen::Done(Err(e), _) => vec![
-                data(json!({"error": {"message": e.message, "type": e.kind, "code": e.status.as_u16().to_string()}})),
-                Ok(Event::default().data("[DONE]")),
-            ],
+            Gen::Done(Err(e), _) => {
+                failed = true;
+                vec![
+                    data(json!({"error": {"message": e.message, "type": e.kind, "code": e.status.as_u16().to_string()}})),
+                    Ok(Event::default().data("[DONE]")),
+                ]
+            }
         };
         stream::iter(items)
     });
@@ -1058,7 +1216,7 @@ async fn bench(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> R
             let mut request = ChatRequest::new(vec![Message::new(Role::User, prompt.clone())], sampling);
             request.use_template = false;
             request.cancel = Some(cancel);
-            let outcome = match start_generation(&state, model.clone(), request, max_tokens, Vec::new()) {
+            let outcome = match start_generation(&state, model.clone(), request, max_tokens, Vec::new(), false) {
                 Ok(rx) => collect(rx).await.map(|(g, _)| g),
                 Err(e) => Err(e),
             };

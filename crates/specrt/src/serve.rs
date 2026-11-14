@@ -207,6 +207,7 @@ pub enum SeqEvent {
     Token(u32),
     Preempted,
     Finished { finish: Finish, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize },
+    Logprob(crate::logprobs::TokenLogprob),
     Failed(String),
 }
 
@@ -545,6 +546,7 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
                     (id, SeqEvent::Token(token))
                 }
                 Event::Preempted { id } => (id, SeqEvent::Preempted),
+                Event::Logprob { id, logprob } => (id, SeqEvent::Logprob(logprob)),
                 Event::Finished { id, finish, prompt_tokens, completion_tokens, cached_tokens } => {
                     (id, SeqEvent::Finished { finish, prompt_tokens, completion_tokens, cached_tokens })
                 }
@@ -582,6 +584,15 @@ pub struct Completion {
     pub ttft_secs: f64,
     pub decode_secs: f64,
     pub preemptions: usize,
+    pub logprobs: Vec<TokenLogprobText>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenLogprobText {
+    pub token: String,
+    pub bytes: Vec<u8>,
+    pub logprob: f32,
+    pub top: Vec<(String, Vec<u8>, f32)>,
 }
 
 pub struct Serving {
@@ -670,6 +681,37 @@ impl Serving {
         cancel: Arc<AtomicBool>,
         on_text: &mut dyn FnMut(&str) -> bool,
     ) -> Result<Completion> {
+        self.complete_with_logprobs(prompt, media, max_tokens, sampling, use_stop, salt, cancel, on_text, &mut |_| {})
+    }
+
+    pub fn token_text(&self, id: u32) -> (String, Vec<u8>) {
+        let text = self.assets.tokenizer.decode(&[id], false).unwrap_or_default();
+        let bytes = text.as_bytes().to_vec();
+        (text, bytes)
+    }
+
+    fn logprob_text(&self, lp: &crate::logprobs::TokenLogprob) -> TokenLogprobText {
+        let (token, bytes) = self.token_text(lp.token);
+        let top = lp.top.iter().map(|&(t, l)| {
+            let (s, b) = self.token_text(t);
+            (s, b, l)
+        }).collect();
+        TokenLogprobText { token, bytes, logprob: lp.logprob, top }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_with_logprobs(
+        &self,
+        prompt: Vec<u32>,
+        media: Vec<sched::MediaInput>,
+        max_tokens: usize,
+        sampling: Sampling,
+        use_stop: bool,
+        salt: String,
+        cancel: Arc<AtomicBool>,
+        on_text: &mut dyn FnMut(&str) -> bool,
+        on_logprob: &mut dyn FnMut(&TokenLogprobText),
+    ) -> Result<Completion> {
         let started = Instant::now();
         let max_tokens = crate::engine::output_budget(max_tokens, prompt.len(), self.core.max_model_len(), crate::spec::MAX_DRAFT_TOKENS, &self.assets.sampling);
         let (tx, rx) = channel();
@@ -710,9 +752,15 @@ impl Serving {
                     out.completion_tokens = completion_tokens.min(ids.len());
                     break;
                 }
+                SeqEvent::Logprob(lp) => {
+                    let entry = self.logprob_text(&lp);
+                    on_logprob(&entry);
+                    out.logprobs.push(entry);
+                }
                 SeqEvent::Failed(e) => anyhow::bail!(e),
             }
         }
+        out.logprobs.truncate(out.completion_tokens);
         ids.truncate(out.completion_tokens);
         let text = tokenizer.decode(&ids, true).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
         if text.len() > sent.len() && text.starts_with(&sent) {

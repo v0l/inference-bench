@@ -10,6 +10,10 @@ pub struct Capabilities {
     pub vision: bool,
     #[serde(default)]
     pub thinking: specrt::chat::Thinking,
+    #[serde(default)]
+    pub logprobs: bool,
+    #[serde(default)]
+    pub batched: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

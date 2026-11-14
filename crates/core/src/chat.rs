@@ -70,7 +70,7 @@ impl Sampling {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub sampling: Sampling,
@@ -83,6 +83,22 @@ pub struct ChatRequest {
     pub media: Vec<crate::media::MediaItem>,
     pub media_max_pixels: Option<usize>,
     pub media_max_video_secs: Option<f64>,
+    pub logprobs: Option<u32>,
+    pub on_logprob: Option<LogprobSink>,
+}
+
+pub type TokenLogprob = specrt::serve::TokenLogprobText;
+pub type LogprobSink = std::sync::Arc<dyn Fn(&TokenLogprob) + Send + Sync>;
+
+impl std::fmt::Debug for ChatRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatRequest")
+            .field("messages", &self.messages)
+            .field("sampling", &self.sampling)
+            .field("use_template", &self.use_template)
+            .field("logprobs", &self.logprobs)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChatRequest {
@@ -105,6 +121,8 @@ impl ChatRequest {
             media: Vec::new(),
             media_max_pixels: None,
             media_max_video_secs: None,
+            logprobs: None,
+            on_logprob: None,
         }
     }
 

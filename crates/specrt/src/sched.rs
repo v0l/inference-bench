@@ -150,19 +150,32 @@ pub trait Executor {
     fn copy_block(&mut self, _src: u32, _dst: u32) -> Result<()> {
         bail!("this executor cannot copy KV blocks")
     }
+    fn supports_logprobs(&self) -> bool {
+        false
+    }
+    fn logits_of(&mut self, _at: LogitsAt) -> Result<Vec<f32>> {
+        bail!("this executor cannot return logits")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogitsAt {
+    Decode(usize),
+    Prefill,
 }
 
 pub struct GpuExecutor {
     pub rt: Runtime,
     st: Stepper,
     fuse: bool,
+    fused_prefill: Option<usize>,
 }
 
 impl GpuExecutor {
     pub fn new(rt: Runtime) -> Result<Self> {
         let st = rt.stepper()?;
         let fuse = rt.spec().runtime.fuse && rt.draft_tokens().is_none();
-        Ok(GpuExecutor { rt, st, fuse })
+        Ok(GpuExecutor { rt, st, fuse, fused_prefill: None })
     }
 }
 
@@ -196,11 +209,23 @@ impl Executor for GpuExecutor {
     }
 
     fn prefill(&mut self, slot: usize, tokens: &[u32], start: usize, sample: Option<(Sampling, u32)>) -> Result<Option<u32>> {
+        self.fused_prefill = None;
         self.rt.prefill_slot(&mut self.st, slot, tokens, start, sample)
     }
 
     fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
         self.rt.decode(&mut self.st, rows)
+    }
+
+    fn supports_logprobs(&self) -> bool {
+        true
+    }
+
+    fn logits_of(&mut self, at: LogitsAt) -> Result<Vec<f32>> {
+        match (at, self.fused_prefill) {
+            (LogitsAt::Decode(i), _) | (LogitsAt::Prefill, Some(i)) => self.rt.step_logits(&self.st, i, 1),
+            (LogitsAt::Prefill, None) => self.rt.prefill_logits(),
+        }
     }
 
     fn fused(
@@ -211,6 +236,7 @@ impl Executor for GpuExecutor {
         start: usize,
         sample: Option<(Sampling, u32)>,
     ) -> Result<(Vec<u32>, Option<u32>)> {
+        self.fused_prefill = self.fuse.then_some(rows.len());
         if !self.fuse {
             let next = self.rt.decode(&mut self.st, rows)?;
             let first = self.rt.prefill_slot(&mut self.st, slot, tokens, start, sample)?;
@@ -392,6 +418,7 @@ pub enum Event {
     Token { id: SeqId, token: u32 },
     Preempted { id: SeqId },
     Finished { id: SeqId, finish: Finish, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize },
+    Logprob { id: SeqId, logprob: crate::logprobs::TokenLogprob },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -567,6 +594,9 @@ impl<E: Executor> Scheduler<E> {
         let need = blocks_for(req.prompt.len() + req.max_tokens + self.exec.draft_tokens());
         if need > self.pool.total() {
             bail!("a request of {need} KV blocks can never fit the pool of {}", self.pool.total());
+        }
+        if req.sampling.logprobs.is_some() && !self.exec.supports_logprobs() {
+            bail!("logprobs are not available on this executor");
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -777,14 +807,28 @@ impl<E: Executor> Scheduler<E> {
         prefix::snapshot_points(s.cached, s.prefill_target(), self.cfg.prefix_cache.snapshot_interval)
     }
 
-    fn apply_decode(&mut self, rows: &[(usize, DecodeRow)], next: Vec<u32>, done: &mut Vec<usize>, events: &mut Vec<Event>) {
-        for ((i, _), t) in rows.iter().zip(next) {
+    fn apply_decode(&mut self, rows: &[(usize, DecodeRow)], next: Vec<u32>, done: &mut Vec<usize>, events: &mut Vec<Event>) -> Result<()> {
+        for (row, ((i, _), t)) in rows.iter().zip(next).enumerate() {
+            self.record_logprob(*i, LogitsAt::Decode(row), t, events)?;
             let s = &mut self.running[*i];
             s.computed += 1;
             if accept(s, t, self.exec.max_ctx(), events) {
                 done.push(*i);
             }
         }
+        Ok(())
+    }
+
+    fn record_logprob(&mut self, i: usize, at: LogitsAt, t: u32, events: &mut Vec<Event>) -> Result<()> {
+        let s = &self.running[i];
+        let Some(top) = s.req.sampling.logprobs else { return Ok(()) };
+        if s.req.stop.contains(&t) {
+            return Ok(());
+        }
+        let id = s.id;
+        let row = self.exec.logits_of(at)?;
+        events.push(Event::Logprob { id, logprob: crate::logprobs::token_logprob(&row, t, top) });
+        Ok(())
     }
 
     fn prefill_budget(&self, decodes: usize) -> usize {
@@ -827,7 +871,8 @@ impl<E: Executor> Scheduler<E> {
         let plain: Vec<DecodeRow> = rows.iter().map(|r| r.1).collect();
         let mut pending = !rows.is_empty();
         let cap = self.exec.speculation_cap();
-        if pending && rows.len() <= cap {
+        let wants_logprobs = rows.iter().any(|(i, _)| self.running[*i].req.sampling.logprobs.is_some());
+        if pending && rows.len() <= cap && !wants_logprobs {
             pending = false;
             let started = Instant::now();
             let spec: Vec<SpecRow> = rows
@@ -894,11 +939,14 @@ impl<E: Executor> Scheduler<E> {
                     pending = false;
                     let (next, t) = self.exec.fused(&plain, slot, &chunk, start, sample)?;
                     report.decode_rows = rows.len();
-                    self.apply_decode(&rows, next, &mut done, events);
+                    self.apply_decode(&rows, next, &mut done, events)?;
                     t
                 } else {
                     self.exec.prefill(slot, &chunk, start, sample)?
                 };
+                if let Some(t) = t {
+                    self.record_logprob(i, LogitsAt::Prefill, t, events)?;
+                }
                 let s = &mut self.running[i];
                 s.computed += n;
                 left -= n;
@@ -916,7 +964,7 @@ impl<E: Executor> Scheduler<E> {
             let next = self.exec.decode(&plain)?;
             report.decode_secs = started.elapsed().as_secs_f64();
             report.decode_rows = rows.len();
-            self.apply_decode(&rows, next, &mut done, events);
+            self.apply_decode(&rows, next, &mut done, events)?;
         }
         if report.prefill_tokens > 0 {
             self.exec.flush()?;
@@ -995,6 +1043,8 @@ mod tests {
         pub spec_cap: usize,
         pub spec_calls: Vec<usize>,
         pub accept_counts: Vec<usize>,
+        last_decode: Vec<u32>,
+        last_prefill: Option<u32>,
     }
 
     impl Fake {
@@ -1019,6 +1069,8 @@ mod tests {
                 spec_cap: 0,
                 spec_calls: Vec::new(),
                 accept_counts: Vec::new(),
+                last_decode: Vec::new(),
+                last_prefill: None,
             }
         }
 
@@ -1081,13 +1133,28 @@ mod tests {
             for (i, &t) in tokens.iter().enumerate() {
                 h = self.write(slot, start + i, t);
             }
-            Ok(sample.map(|_| next_token(h)))
+            self.last_prefill = sample.map(|_| next_token(h));
+            Ok(self.last_prefill)
         }
         fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
             let mut seen = std::collections::HashSet::new();
             assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
             self.decode_calls.push(rows.len());
-            Ok(rows.iter().map(|r| next_token(self.write(r.slot, r.pos, r.token))).collect())
+            self.last_decode = rows.iter().map(|r| next_token(self.write(r.slot, r.pos, r.token))).collect();
+            Ok(self.last_decode.clone())
+        }
+        fn supports_logprobs(&self) -> bool {
+            true
+        }
+        fn logits_of(&mut self, at: LogitsAt) -> Result<Vec<f32>> {
+            let t = match at {
+                LogitsAt::Decode(i) => self.last_decode[i],
+                LogitsAt::Prefill => self.last_prefill.expect("a sampled prefill"),
+            };
+            let mut row = vec![0.0; VOCAB as usize];
+            row[t as usize] = 5.0;
+            row[(t as usize + 1) % VOCAB as usize] = 3.0;
+            Ok(row)
         }
         fn supports_prefix_cache(&self) -> bool {
             self.prefix_enabled
@@ -1194,6 +1261,24 @@ mod tests {
             assert!(steps < 100_000, "the scheduler made no progress");
         }
         (out, all, reports)
+    }
+
+    #[test]
+    fn a_request_that_asks_gets_one_logprob_per_generated_token_and_others_get_none() {
+        let mut s = Scheduler::new(Fake::new(1024, 4, 64, 64), Config { max_num_seqs: 4, ..Config::default() });
+        let mut asks = request(100, 6, 1);
+        asks.sampling = Sampling::GREEDY.with_logprobs(Some(2));
+        let a = s.submit(asks.clone()).unwrap();
+        let b = s.submit(request(90, 6, 2)).unwrap();
+        let (out, events, _) = drain(&mut s);
+        let lps: Vec<&crate::logprobs::TokenLogprob> =
+            events.iter().filter_map(|e| match e { Event::Logprob { id, logprob } if *id == a => Some(logprob), _ => None }).collect();
+        assert_eq!(lps.iter().map(|l| l.token).collect::<Vec<_>>(), out[&a]);
+        assert!(lps.iter().all(|l| l.top.len() == 2 && l.top[0].0 == l.token && (l.top[0].1 - l.logprob).abs() < 1e-6));
+        let z = 5f32.exp() + 3f32.exp() + (VOCAB - 2) as f32;
+        assert!((lps[0].logprob - (5f32.exp() / z).ln()).abs() < 1e-4, "{}", lps[0].logprob);
+        assert!(!events.iter().any(|e| matches!(e, Event::Logprob { id, .. } if *id == b)));
+        assert_eq!(out[&a], expected(&asks.prompt, 6, &[]));
     }
 
     #[test]

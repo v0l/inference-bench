@@ -43,7 +43,16 @@ impl Target for EngineBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: false, memory: false, vision: self.handle.loaded().is_some_and(|l| l.vision), thinking: self.handle.thinking() }
+        let loaded = self.handle.loaded();
+        let batched = loaded.as_ref().is_some_and(|l| l.max_num_seqs > 1);
+        Capabilities {
+            streaming: true,
+            vision: loaded.as_ref().is_some_and(|l| l.vision),
+            thinking: self.handle.thinking(),
+            logprobs: batched,
+            batched,
+            ..Capabilities::default()
+        }
     }
 
     fn load(&mut self, _model: &str) -> Result<(), BackendError> {
