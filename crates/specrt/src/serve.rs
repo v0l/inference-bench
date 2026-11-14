@@ -10,6 +10,7 @@ pub struct SpeculativeOptions {
     pub enabled: Option<bool>,
     pub draft_tokens: Option<usize>,
     pub max_batch: Option<usize>,
+    pub head_quant: Option<crate::spec::Quant>,
 }
 
 impl SpeculativeOptions {
@@ -26,6 +27,9 @@ impl SpeculativeOptions {
         }
         if self.max_batch.is_some() {
             m.max_batch = self.max_batch;
+        }
+        if self.head_quant.is_some() {
+            m.head_quant = self.head_quant;
         }
         spec.validate().context("[speculative]")
     }
@@ -57,7 +61,7 @@ impl Default for ServeOptions {
     fn default() -> Self {
         ServeOptions {
             max_model_len: None,
-            max_num_seqs: 32,
+            max_num_seqs: crate::options::DEFAULT_MAX_NUM_SEQS,
             kv_cache_bytes: None,
             kv_cache_tokens: None,
             max_batched_tokens: 8192,

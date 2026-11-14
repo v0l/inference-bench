@@ -17,6 +17,7 @@ pub mod loader;
 pub mod logprobs;
 pub mod mtp;
 pub mod nvfp4;
+pub mod options;
 pub mod pipeline;
 pub mod plan;
 pub mod placement;
