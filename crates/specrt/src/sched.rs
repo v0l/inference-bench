@@ -385,6 +385,7 @@ pub struct Config {
     pub itl_target: Duration,
     pub reserve_blocks: Option<usize>,
     pub min_prefill_chunk: usize,
+    pub whole_prompt_tokens: usize,
     pub prefix_cache: PrefixCacheOptions,
 }
 
@@ -396,6 +397,7 @@ impl Default for Config {
             itl_target: Duration::from_millis(100),
             reserve_blocks: None,
             min_prefill_chunk: 64,
+            whole_prompt_tokens: 0,
             prefix_cache: PrefixCacheOptions::default(),
         }
     }
@@ -443,6 +445,7 @@ pub struct StepReport {
     pub prefill_secs: f64,
     pub drafted: usize,
     pub accepted: usize,
+    pub speculated: bool,
 }
 
 struct Seq {
@@ -488,6 +491,7 @@ pub struct Scheduler<E: Executor> {
     preemptions: u64,
     state_refusals: u64,
     prefill_rate: f64,
+    decode_secs: f64,
     cache: Option<PrefixCache>,
     prefix_queries: u64,
     prefix_hits: u64,
@@ -523,6 +527,7 @@ impl<E: Executor> Scheduler<E> {
             preemptions: 0,
             state_refusals: 0,
             prefill_rate: 0.0,
+            decode_secs: 0.0,
             cache,
             prefix_queries: 0,
             prefix_hits: 0,
@@ -866,9 +871,25 @@ impl<E: Executor> Scheduler<E> {
         if self.prefill_rate <= 0.0 {
             return align.min(full.max(1));
         }
-        let fit = (self.cfg.itl_target.as_secs_f64() * self.prefill_rate) as usize;
+        let room = (self.cfg.itl_target.as_secs_f64() - self.decode_secs).max(0.0);
+        let fit = (room * self.prefill_rate) as usize;
         let fit = if fit > align { fit / align * align } else { align };
+        let fit = fit.max(self.whole_prompt_remaining().unwrap_or(0));
         fit.min(full.max(align))
+    }
+
+    fn whole_prompt_remaining(&self) -> Option<usize> {
+        let limit = self.cfg.whole_prompt_tokens;
+        if limit == 0 {
+            return None;
+        }
+        let next = self
+            .running
+            .iter()
+            .find(|s| s.computed < s.prefill_target())
+            .map(|s| s.prefill_target() - s.computed)
+            .or_else(|| self.waiting.front().map(|s| s.prefill_target()))?;
+        (next <= limit).then_some(next)
     }
 
     pub fn step(&mut self, events: &mut Vec<Event>) -> Result<StepReport> {
@@ -913,6 +934,7 @@ impl<E: Executor> Scheduler<E> {
                 .collect();
             let out = self.exec.speculate(&spec)?;
             report.decode_secs = started.elapsed().as_secs_f64();
+            report.speculated = true;
             report.decode_rows = rows.len();
             report.drafted = rows.len() * self.exec.draft_tokens();
             for ((i, _), emitted) in rows.iter().zip(out) {
@@ -1005,6 +1027,9 @@ impl<E: Executor> Scheduler<E> {
             if report.prefill_tokens >= self.cfg.min_prefill_chunk {
                 self.prefill_rate = ewma(self.prefill_rate, report.prefill_tokens as f64 / report.prefill_secs.max(1e-6));
             }
+        }
+        if report.decode_secs > 0.0 && report.prefill_tokens == 0 {
+            self.decode_secs = ewma(self.decode_secs, report.decode_secs);
         }
         done.sort_unstable();
         done.dedup();
@@ -1736,6 +1761,75 @@ mod tests {
             let took = started.elapsed();
             assert!(took < Duration::from_millis(75), "a step of {took:?} with {} prefill tokens", r.prefill_tokens);
         }
+    }
+
+    fn whole_prompt_steps(whole: usize) -> (usize, Vec<usize>, HashMap<SeqId, Vec<u32>>, HashMap<SeqId, Vec<u32>>) {
+        let mut fake = Fake::new(65536, 8, 8000, 2048);
+        fake.token_cost = Duration::from_micros(100);
+        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(50), whole_prompt_tokens: whole, ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        let mut want = HashMap::new();
+        for q in 0..4u32 {
+            let r = request(50, 300, q);
+            want.insert(s.submit(r.clone()).unwrap(), expected(&r.prompt, r.max_tokens, &[]));
+        }
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            s.step(&mut events).unwrap();
+        }
+        let r = request(1500, 4, 9);
+        want.insert(s.submit(r.clone()).unwrap(), expected(&r.prompt, r.max_tokens, &[]));
+        let mut got: HashMap<SeqId, Vec<u32>> = HashMap::new();
+        for e in &events {
+            if let Event::Token { id, token } = e {
+                got.entry(*id).or_default().push(*token);
+            }
+        }
+        let (rest, _, reports) = drain(&mut s);
+        for (id, v) in rest {
+            got.entry(id).or_default().extend(v);
+        }
+        let prefills: Vec<usize> = reports.iter().map(|r| r.prefill_tokens).filter(|&n| n > 0).collect();
+        (prefills.len(), prefills, got, want)
+    }
+
+    #[test]
+    fn a_prompt_under_the_whole_prompt_limit_prefills_in_one_step_beside_decoders() {
+        let (steps, prefills, got, want) = whole_prompt_steps(4096);
+        assert_eq!(steps, 1, "{prefills:?}");
+        assert_eq!(prefills[0], 1500);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn without_the_whole_prompt_limit_a_prompt_beside_decoders_takes_several_steps() {
+        let (steps, prefills, got, want) = whole_prompt_steps(0);
+        assert!(steps > 2, "{prefills:?}");
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_prompt_over_the_whole_prompt_limit_is_still_chunked() {
+        let (steps, _, got, want) = whole_prompt_steps(1000);
+        assert!(steps > 2);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_slow_decode_step_shrinks_the_prefill_beside_it() {
+        let mut fake = Fake::new(65536, 8, 8000, 2048);
+        fake.token_cost = Duration::from_micros(100);
+        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(60), ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        s.submit(request(50, 400, 1)).unwrap();
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        s.submit(request(20_000, 4, 2)).unwrap();
+        s.step(&mut events).unwrap();
+        let free = s.step(&mut events).unwrap().prefill_tokens;
+        s.decode_secs = 0.045;
+        let slow = s.step(&mut events).unwrap().prefill_tokens;
+        assert!(slow * 2 < free, "free {free} slow {slow}");
     }
 
     #[test]

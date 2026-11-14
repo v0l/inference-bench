@@ -51,6 +51,7 @@ pub struct ServeOptions {
     pub kv_cache_tokens: Option<usize>,
     pub max_batched_tokens: usize,
     pub itl_target: Duration,
+    pub whole_prompt_tokens: usize,
     pub runtime: Option<RuntimeOptions>,
     pub speculative: SpeculativeOptions,
     pub placement: Option<crate::placement::PlacementConfig>,
@@ -66,6 +67,7 @@ impl Default for ServeOptions {
             kv_cache_tokens: None,
             max_batched_tokens: 8192,
             itl_target: Duration::from_millis(100),
+            whole_prompt_tokens: 0,
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,
@@ -371,6 +373,7 @@ fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
         max_num_seqs: opts.max_num_seqs,
         max_batched_tokens: opts.max_batched_tokens,
         itl_target: opts.itl_target,
+        whole_prompt_tokens: opts.whole_prompt_tokens,
         prefix_cache: spec.runtime.prefix_cache,
         ..Config::default()
     }
@@ -547,6 +550,13 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
             s.spec_drafted += r.drafted as u64;
             s.spec_accepted += r.accepted as u64;
             s.step_secs.observe(started.elapsed().as_secs_f64());
+            tracing::debug!(
+                rows = r.decode_rows,
+                mtp = r.speculated,
+                prefill_tokens = r.prefill_tokens,
+                step_ms = started.elapsed().as_secs_f64() * 1e3,
+                "step"
+            );
             if r.decode_rows > 0 {
                 s.decode_batch.observe(r.decode_rows as f64);
             }

@@ -31,6 +31,10 @@ pub struct ServeArgs {
     pub kv_cache_gb: Option<f64>,
     #[arg(long, help = "Token budget per scheduler step (default 8192)")]
     pub max_batched_tokens: Option<usize>,
+    #[arg(long, help = "Inter-token latency target in ms that bounds prefill beside decoders (default 100)")]
+    pub itl_target_ms: Option<u64>,
+    #[arg(long, help = "Prefill a whole prompt in one step when it is at most this many tokens (default 0, off)")]
+    pub whole_prompt_tokens: Option<usize>,
     #[arg(long, help = "Seconds before an idle model is unloaded")]
     pub idle_unload_secs: Option<u64>,
     #[arg(long, help = "Write an access log (JSON lines) here")]
@@ -73,6 +77,8 @@ impl ServeArgs {
         config.max_model_len = self.max_model_len.or(config.max_model_len);
         config.kv_cache_gb = self.kv_cache_gb.or(config.kv_cache_gb);
         config.max_batched_tokens = self.max_batched_tokens.or(config.max_batched_tokens);
+        config.itl_target_ms = self.itl_target_ms.or(config.itl_target_ms);
+        config.whole_prompt_tokens = self.whole_prompt_tokens.or(config.whole_prompt_tokens);
         if let Some(n) = self.idle_unload_secs {
             config.idle_unload_secs = Some(n);
         }
