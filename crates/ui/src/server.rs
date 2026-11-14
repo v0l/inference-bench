@@ -36,6 +36,7 @@ pub fn configured_placement(dir: &Path) -> Option<Result<PlacementConfig, String
 
 pub struct ServerState {
     pub running: Option<ServerHandle>,
+    pub agent: Option<ServerHandle>,
     pub port_text: String,
     pub error: Option<String>,
     pub shown: usize,
@@ -50,6 +51,7 @@ impl Default for ServerState {
     fn default() -> Self {
         Self {
             running: None,
+            agent: None,
             port_text: String::new(),
             error: None,
             shown: 0,
@@ -67,9 +69,9 @@ impl Default for ServerState {
 }
 
 impl ServerState {
-    pub fn start(&mut self, engine: Handle, port: u16, key: &str, lan: bool) {
+    fn launch(&self, engine: Handle, bind: String, key: &str) -> anyhow::Result<ServerHandle> {
         let mut config = ServerConfig {
-            bind: format!("{}:{port}", if lan { "0.0.0.0" } else { "127.0.0.1" }),
+            bind,
             shutdown_grace_secs: 2,
             max_num_seqs: Some(inference_bench_core::engine::MAX_PARALLEL),
             specs: inference_bench_server::config::SpecsSection { auto_update: false, ..Default::default() },
@@ -83,14 +85,26 @@ impl ServerState {
         let factory = move |_: Option<usize>| {
             Ok(Box::new(EngineBackend::new(engine.clone())) as Box<dyn inference_bench_core::target::Target>)
         };
-        let started = self.runtime.block_on(Server::new(config).with_factory(factory).with_model_source(source).with_gpu_probe(std::sync::Arc::new(|| None)).start());
-        match started {
+        self.runtime.block_on(Server::new(config).with_factory(factory).with_model_source(source).with_gpu_probe(std::sync::Arc::new(|| None)).start())
+    }
+
+    pub fn start(&mut self, engine: Handle, port: u16, key: &str, lan: bool) {
+        let bind = format!("{}:{port}", if lan { "0.0.0.0" } else { "127.0.0.1" });
+        match self.launch(engine, bind, key) {
             Ok(h) => {
                 self.running = Some(h);
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("cannot listen on port {port}: {e:#}")),
         }
+    }
+
+    pub fn ensure_agent_endpoint(&mut self, engine: Handle) -> Result<String, String> {
+        if self.agent.is_none() {
+            let h = self.launch(engine, "127.0.0.1:0".into(), "").map_err(|e| format!("agent endpoint: {e:#}"))?;
+            self.agent = Some(h);
+        }
+        Ok(format!("{}/v1", self.agent.as_ref().map(|h| h.url()).unwrap_or_default()))
     }
 
     pub fn refresh_placement(&mut self, dir: &Path) {

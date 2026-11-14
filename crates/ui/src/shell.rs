@@ -98,14 +98,11 @@ fn status_bar(app: &mut App, ui: &mut egui::Ui) {
                 }
                 line.size(11.0).show(ui);
             }
-            if let Some(s) = app.chat.last_stats {
+            if let Some(s) = crate::chat::last_request(app) {
                 ui.add_space(14.0);
                 let mut line = Line::new().legend("ttft").measured(format!("{:.0} ms", s.ttft_secs * 1000.0));
-                if let Some(v) = s.prefill_tok_s {
-                    line = line.gap(10.0).legend("prefill").measured(format!("{v:.0} t/s"));
-                }
-                if let Some(v) = s.decode_tok_s {
-                    line = line.gap(10.0).legend("decode").measured(format!("{v:.1} t/s"));
+                if s.decode_tok_s > 0.0 {
+                    line = line.gap(10.0).legend("decode").measured(format!("{:.1} t/s", s.decode_tok_s));
                 }
                 line.size(11.0).show(ui);
             }

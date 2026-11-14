@@ -185,7 +185,6 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
             let _ = app.settings.save(&app.dir);
         }
         app.chat.load_error = None;
-        app.chat.pick(&model.name);
         app.load_model_with(&model, dialog.ctx, dialog.seqs);
         if app.tab == Tab::Models {
             app.tab = Tab::Chat;

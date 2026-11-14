@@ -21,11 +21,11 @@ tracing.workspace = true
 anyhow.workspace = true
 eframe = "0.37"
 egui = "0.37"
-egui_bench = { version = "0.9.6", features = ["markdown", "chat"] }
+egui_bench = { version = "0.10.0", features = ["markdown"] }
+agent-core = { git = "https://github.com/v0l/agentbench", features = ["sandbox"] }
+agent-ui = { git = "https://github.com/v0l/agentbench", features = ["sandbox"] }
 serde_json.workspace = true
 chrono.workspace = true
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
 
 serde.workspace = true
 
@@ -34,3 +34,4 @@ toml.workspace = true
 tracing-subscriber.workspace = true
 egui_kittest = { version = "0.37", features = ["eframe", "wgpu"] }
 ureq.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

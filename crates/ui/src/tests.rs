@@ -1,7 +1,6 @@
 use super::*;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
-use inference_bench_core::conversations::Turn;
 use inference_bench_core::fake::{FakeServer, Script, ScriptedModel};
 use inference_bench_core::library::{Format, Support};
 
@@ -62,7 +61,7 @@ fn harness(name: &str, tab: Tab) -> Harness<'static, App> {
     let d = dir(name);
     Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
-        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
         app.tab = tab;
         app.logs = shared_logs();
         app.library = vec![model("Qwen3-0.6B", true, "dense decoder"), model("Weird-7B", false, "model_type weird is not supported")];
@@ -307,102 +306,6 @@ fn the_model_list_shows_an_unsupported_architecture_badge() {
 }
 
 #[test]
-fn a_scripted_native_model_fills_a_chat_with_stats() {
-    let mut h = harness("chat", Tab::Chat);
-    {
-        let app = h.state_mut();
-        scripted(app, script());
-        let m = app.library[0].clone();
-        app.chat.pick("Qwen3-0.6B");
-        app.load_model(&m);
-    }
-    let start = Instant::now();
-    while h.state().loaded().is_none() {
-        assert!(start.elapsed() < Duration::from_secs(10), "model never loaded: {:?}", h.state().notice);
-        h.step();
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    {
-        let app = h.state_mut();
-        app.chat.input = "say hi".into();
-        let handle = app.engine.handle();
-        let d = app.dir.clone();
-        app.chat.send(handle, &d);
-    }
-    let start = Instant::now();
-    while h.state().chat.streaming() || h.state().chat.conversations[0].turns.len() < 2 {
-        assert!(start.elapsed() < Duration::from_secs(10), "reply never finished");
-        h.step();
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    h.run();
-    let turns = h.state_mut().chat.conv().turns.clone();
-    assert_eq!(turns[1].message.content, "Hello **world**!");
-    let stats = turns[1].stats.unwrap();
-    assert_eq!((stats.prompt_tokens, stats.completion_tokens), (9, 3));
-    assert!(stats.ttft_secs >= 0.02);
-    assert!(h.state().chat.last_stats.is_some());
-    h.get_by_label_contains("Hello");
-
-    h.get_by_label("copy").click();
-    let mut copied = None;
-    for _ in 0..4 {
-        h.step();
-        for c in &h.output().platform_output.commands {
-            if let egui::OutputCommand::CopyText(t) = c {
-                copied = Some(t.clone());
-            }
-        }
-    }
-    assert_eq!(copied.as_deref(), Some("Hello **world**!"));
-
-    h.get_by_label("regenerate").click();
-    h.step();
-    h.step();
-    assert!(h.state().chat.streaming());
-    let turns = h.state_mut().chat.conv().turns.clone();
-    assert_eq!(turns.len(), 1);
-    assert_eq!(turns[0].message.content, "say hi");
-}
-
-#[test]
-fn stop_cancels_a_stream_and_regenerate_replaces_the_last_reply() {
-    let mut h = harness("regen", Tab::Chat);
-    {
-        let app = h.state_mut();
-        scripted(app, Script { chunks: (0..60).map(|i| format!("w{i} ")).collect(), chunk_delay_ms: 20, ..script() });
-        let m = app.library[0].clone();
-        app.chat.pick("Qwen3-0.6B");
-        app.load_model(&m);
-    }
-    while h.state().loaded().is_none() {
-        h.step();
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    {
-        let app = h.state_mut();
-        app.chat.input = "go".into();
-        let handle = app.engine.handle();
-        let d = app.dir.clone();
-        app.chat.send(handle, &d);
-    }
-    std::thread::sleep(Duration::from_millis(150));
-    h.state().chat.stop();
-    let start = Instant::now();
-    while h.state().chat.streaming() {
-        assert!(start.elapsed() < Duration::from_secs(10));
-        h.step();
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let n = h.state_mut().chat.conv().turns[1].message.content.split_whitespace().count();
-    assert!(n < 60, "stream was not cut: {n} words");
-    let handle = h.state().engine.handle();
-    h.state_mut().chat.regenerate(handle);
-    assert!(h.state().chat.streaming());
-    assert_eq!(h.state_mut().chat.conv().turns.len(), 1);
-}
-
-#[test]
 fn the_server_tab_starts_and_serves_the_loaded_model() {
     let mut h = harness("server", Tab::Server);
     {
@@ -626,7 +529,7 @@ fn parallel_requests_with_a_real_model_run_together_and_aggregate_faster() {
     let d = dir("parallel-real");
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 1500.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
-        let mut app = App::new(d, wake_for(&cc.egui_ctx));
+        let mut app = App::new(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
         app.tab = Tab::Server;
         app.logs = shared_logs();
         app
@@ -793,24 +696,11 @@ fn a_failed_load_shows_a_fault_on_the_chat_page() {
         let app = h.state_mut();
         scripted(app, Script { models: vec![], ..script() });
         let m = app.library[0].clone();
-        app.chat.pick("Qwen3-0.6B");
         app.load_model(&m);
     }
     pump_until(&mut h, 20, "load failure", |a| a.chat.load_error.is_some());
     h.run();
     assert_eq!(h.get_all_by_label_contains("no config.json").count(), 2, "status bar and chat fault");
-}
-
-#[test]
-fn a_failed_reply_shows_a_fault_under_the_transcript() {
-    let mut h = harness("replyfail", Tab::Chat);
-    {
-        let app = h.state_mut();
-        app.chat.conv().turns.push(Turn { message: inference_bench_core::chat::Message::new(inference_bench_core::chat::Role::User, "hi"), stats: None, attachments: Vec::new() });
-        app.chat.error = Some("the engine has stopped".into());
-    }
-    h.run();
-    h.get_by_label_contains("the engine has stopped");
 }
 
 #[test]
@@ -924,129 +814,6 @@ fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl F
 }
 
 #[test]
-#[ignore = "needs a GPU and the hub cache; run with SHOTS=docs/gui"]
-fn screenshots_with_real_data() {
-    let out = shots_dir();
-    std::fs::create_dir_all(&out).unwrap();
-    let d = dir("shots");
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
-        egui_bench::install(&cc.egui_ctx);
-        let mut app = App::new(d, wake_for(&cc.egui_ctx));
-        app.settings.default_ctx = 4096;
-        app
-    });
-    pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
-    let shot = |h: &mut Harness<'static, App>, name: &str| {
-        h.run();
-        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
-    };
-    h.state_mut().tab = Tab::Models;
-    shot(&mut h, "models");
-
-    let qwen = h.state().library.iter().find(|m| m.name == "Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
-    pump_until(&mut h, 20, "gpu", |a| !a.gpu.is_empty());
-    h.state_mut().open_load_dialog(&qwen);
-    h.state_mut().load.as_mut().unwrap().ctx = 16384;
-    shot(&mut h, "load-dialog");
-    {
-        let app = h.state_mut();
-        app.load = None;
-        app.chat.pick("Qwen3-0.6B");
-        app.load_model_with(&qwen, 16384, 1);
-        app.tab = Tab::Chat;
-    }
-    pump_until(&mut h, 120, "load", |a| a.loaded().is_some());
-    for q in ["Explain what a KV cache is in two sentences.", "Show a tiny Rust struct with one method."] {
-        {
-            let app = h.state_mut();
-            app.chat.conv().sampling.max_tokens = 160;
-            app.chat.conv().sampling.temperature = 0.0;
-            app.chat.input = q.into();
-            let (handle, d) = (app.engine.handle(), app.dir.clone());
-            app.chat.send(handle, &d);
-        }
-        let n = h.state_mut().chat.conv().turns.len() + 1;
-        pump_until(&mut h, 120, "reply", move |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= n);
-    }
-    std::thread::sleep(Duration::from_millis(2500));
-    pump_until(&mut h, 20, "gpu", |a| !a.gpu.is_empty());
-    shot(&mut h, "chat");
-
-    {
-        let app = h.state_mut();
-        let handle = app.engine.handle();
-        app.server.start(handle, 0, "", false);
-        let url = app.server.running.as_ref().unwrap().url();
-        for _ in 0..2 {
-            let _ = ureq::get(format!("{url}/v1/models")).call();
-        }
-        let _ = ureq::post(format!("{url}/v1/chat/completions")).send_json(serde_json::json!({"messages":[{"role":"user","content":"Say hi"}],"max_tokens":24,"temperature":0}));
-        app.tab = Tab::Server;
-    }
-    shot(&mut h, "server");
-
-    h.state_mut().server.stop();
-    h.state_mut().unload();
-    h.state_mut().tab = Tab::Settings;
-    shot(&mut h, "settings");
-    h.state_mut().tab = Tab::Models;
-    h.state_mut().models.pane = crate::models::Pane::Discover;
-    shot(&mut h, "models-discover");
-}
-
-#[test]
-#[ignore = "needs a GPU and Qwen3-0.6B in the hub cache; run with SHOTS=dir"]
-fn chat_screenshots_with_a_real_model() {
-    let out = shots_dir();
-    std::fs::create_dir_all(&out).unwrap();
-    let d = dir("chat-shots");
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
-        egui_bench::install(&cc.egui_ctx);
-        App::new(d, wake_for(&cc.egui_ctx))
-    });
-    pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
-    let shot = |h: &mut Harness<'static, App>, name: &str| {
-        h.run();
-        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
-    };
-    let qwen = h.state().library.iter().find(|m| m.name == "Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
-    h.state_mut().chat.pick("Qwen3-0.6B");
-    shot(&mut h, "chat-empty");
-    h.state_mut().load_model(&qwen);
-    pump_until(&mut h, 120, "load", |a| a.loaded().is_some());
-    {
-        let app = h.state_mut();
-        app.chat.conv().sampling.max_tokens = 700;
-        app.chat.conv().sampling.temperature = 0.0;
-        app.chat.input = "Write a Rust struct for a ring buffer with push and pop methods, then explain each method in a short paragraph.".into();
-        let (handle, d) = (app.engine.handle(), app.dir.clone());
-        app.chat.send(handle, &d);
-    }
-    pump_until(&mut h, 60, "first tokens", |a| !a.chat.streaming() || a.chat.streaming.as_ref().is_some_and(|s| s.text.len() > 300));
-    assert!(h.state().chat.error.is_none(), "{:?}", h.state().chat.error);
-    h.step();
-    h.render().unwrap().save(out.join("chat-streaming.png")).unwrap();
-    pump_until(&mut h, 120, "reply", |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= 2);
-    std::thread::sleep(Duration::from_millis(2500));
-    pump_until(&mut h, 20, "gpu", |a| !a.gpu.is_empty());
-    shot(&mut h, "chat-reply");
-    let reply = h.state_mut().chat.conv().turns[1].message.content.clone();
-    assert!(reply.contains("struct"), "{reply}");
-    {
-        let app = h.state_mut();
-        app.chat.conv().sampling.max_tokens = 120;
-        app.chat.input = "Now name the struct you just wrote, in one word.".into();
-        let (handle, d) = (app.engine.handle(), app.dir.clone());
-        app.chat.send(handle, &d);
-    }
-    pump_until(&mut h, 120, "second reply", |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= 4);
-    assert!(h.state().chat.error.is_none(), "{:?}", h.state().chat.error);
-    shot(&mut h, "chat-second-turn");
-    let second = h.state_mut().chat.conv().turns[3].message.content.clone();
-    assert!(second.to_lowercase().replace(' ', "").contains("ringbuffer"), "{second}");
-}
-
-#[test]
 #[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshot_of_spec_provenance_and_update_settings() {
     use inference_bench_core::fake::publish_specs;
@@ -1073,7 +840,7 @@ fn screenshot_of_spec_provenance_and_update_settings() {
     let size = egui::vec2(1280.0, 1000.0);
     let mut h = Harness::builder().with_size(size).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
-        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
         app.tab = Tab::Models;
         app.logs = shared_logs();
         app.specs.base = Some(server.url.clone());
@@ -1111,7 +878,7 @@ fn screenshot_of_a_failed_spec_check_line() {
     let d = dir("spec-failed-shot");
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 420.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
-        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
         app.tab = Tab::Models;
         app.logs = shared_logs();
         app.library = vec![model("Qwen3-0.6B", true, "dense decoder")];
@@ -1195,7 +962,7 @@ fn detail_harness(name: &str, size: egui::Vec2, view: detail::View, other: Optio
     let d = dir(name);
     Harness::builder().with_size(size).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
-        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
         app.tab = Tab::Models;
         let mut detail = detail::Detail::from_view(view);
         if let Some(o) = other {
@@ -1331,107 +1098,6 @@ fn red_png() -> Vec<u8> {
     out
 }
 
-fn load_vision(h: &mut Harness<'static, App>, vision: bool) {
-    {
-        let app = h.state_mut();
-        scripted(app, Script { vision, ..script() });
-        let m = app.library[0].clone();
-        app.chat.pick("Qwen3-0.6B");
-        app.load_model(&m);
-    }
-    pump_until(h, 10, "model never loaded", |a| a.loaded().is_some());
-}
-
-#[test]
-fn a_pasted_image_shows_a_thumbnail_and_goes_out_as_an_attachment() {
-    let mut h = harness("attach", Tab::Chat);
-    load_vision(&mut h, true);
-    assert!(h.state().engine.vision());
-    let rgba = vec![egui::Color32::from_rgb(200, 30, 30); 64 * 48];
-    let img = egui::ColorImage { size: [64, 48], source_size: egui::vec2(64.0, 48.0), pixels: rgba };
-    h.event(egui::Event::PasteImage(std::sync::Arc::new(img)));
-    h.run();
-    assert_eq!(h.state().chat.pending.len(), 1);
-    assert_eq!(h.state().chat.pending[0].mime, "image/png");
-    h.get_by_label_contains("attachment pasted.png");
-    h.get_by_label("remove");
-    {
-        let app = h.state_mut();
-        app.chat.input = "what is this".into();
-        let handle = app.engine.handle();
-        let d = app.dir.clone();
-        app.chat.send(handle, &d);
-    }
-    assert!(h.state().chat.pending.is_empty());
-    let turn = h.state_mut().chat.conv().turns[0].clone();
-    assert_eq!(turn.attachments.len(), 1);
-    pump_until(&mut h, 10, "reply never finished", |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= 2);
-    let stats = h.state_mut().chat.conv().turns[1].stats.unwrap();
-    assert_eq!(stats.vision_tokens, 100);
-    let saved = inference_bench_core::conversations::load_all(&h.state().dir);
-    assert_eq!(saved[0].turns[0].attachments.len(), 1);
-}
-
-#[test]
-fn a_text_only_model_cannot_attach_and_a_dropped_text_file_is_refused() {
-    let mut h = harness("attach-no", Tab::Chat);
-    load_vision(&mut h, false);
-    h.run();
-    assert!(!h.state().engine.vision());
-    h.get_by_label_contains("this model takes text only");
-    h.state_mut().chat.attach_bytes("notes.txt", b"hello");
-    assert!(h.state().chat.pending.is_empty());
-    assert!(h.state().chat.attach_error.as_deref().unwrap().contains("notes.txt"));
-    h.state_mut().chat.attach_bytes("red.png", &red_png());
-    assert_eq!(h.state().chat.pending.len(), 1);
-}
-
-#[test]
-fn a_dropped_image_file_becomes_a_pending_attachment() {
-    #[derive(Debug)]
-    struct File(std::path::PathBuf, Vec<u8>);
-    impl egui::DroppedFile for File {
-        fn path(&self) -> &std::path::Path {
-            &self.0
-        }
-        fn bytes(&self) -> Result<Vec<u8>, String> {
-            Ok(self.1.clone())
-        }
-    }
-    let mut h = harness("drop", Tab::Chat);
-    load_vision(&mut h, true);
-    h.input_mut().dropped_files.push(std::sync::Arc::new(File("/tmp/red.png".into(), red_png())));
-    h.run();
-    assert_eq!(h.state().chat.pending.len(), 1);
-    assert_eq!(h.state().chat.pending[0].name, "red.png");
-}
-
-#[test]
-#[ignore = "renders with wgpu; run with SHOTS=dir"]
-fn screenshot_chat_attachment_thumbnail() {
-    let out = shots_dir();
-    std::fs::create_dir_all(&out).unwrap();
-    let d = dir("shot-attach");
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
-        egui_bench::install(&cc.egui_ctx);
-        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
-        app.tab = Tab::Chat;
-        app.logs = shared_logs();
-        app.library = vec![model("Qwen3-0.6B", true, "dense decoder")];
-        app
-    });
-    load_vision(&mut h, true);
-    let mut img = image::RgbaImage::new(160, 120);
-    for (x, y, p) in img.enumerate_pixels_mut() {
-        *p = image::Rgba([(x * 255 / 160) as u8, (y * 255 / 120) as u8, 120, 255]);
-    }
-    let mut png = Vec::new();
-    image::DynamicImage::ImageRgba8(img).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
-    h.state_mut().chat.attach_bytes("gradient.png", &png);
-    h.run();
-    h.render().unwrap().save(out.join("chat-attachment.png")).unwrap();
-}
-
 #[test]
 fn the_models_page_says_vision_yes_only_for_models_with_a_vision_config() {
     let mut h = harness("vision-chip", Tab::Models);
@@ -1454,139 +1120,6 @@ fn screenshot_vision_tower_in_the_model_detail() {
     let mut h = detail_harness("shot-vision", egui::vec2(1400.0, 3200.0), view, None);
     h.run();
     h.render().unwrap().save(out.join("detail-vision-tower.png")).unwrap();
-}
-
-fn thinking_script(chunks: &[&str]) -> Script {
-    Script { chunks: chunks.iter().map(|c| c.to_string()).collect(), ..script() }
-}
-
-fn load_thinking(h: &mut Harness<'static, App>, chunks: &[&str]) -> std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> {
-    let (factory, seen) = ScriptedModel::factory_probed(thinking_script(chunks), specrt::chat::Thinking::OpensInPrompt);
-    {
-        let app = h.state_mut();
-        app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), factory);
-        let m = app.library[0].clone();
-        app.chat.pick("Qwen3-0.6B");
-        app.load_model(&m);
-    }
-    pump_until(h, 10, "the model to load", |a| a.loaded().is_some());
-    seen
-}
-
-fn say(h: &mut Harness<'static, App>, text: &str) {
-    let app = h.state_mut();
-    app.chat.input = text.into();
-    let handle = app.engine.handle();
-    let d = app.dir.clone();
-    app.chat.send(handle, &d);
-    pump_until(h, 10, "the reply", |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= 2);
-}
-
-#[test]
-fn the_chat_asks_the_model_to_think_when_the_toggle_is_on_and_not_when_it_is_off() {
-    let mut h = harness("think-toggle", Tab::Chat);
-    let seen = load_thinking(&mut h, &["<think>a</think>b"]);
-    say(&mut h, "hi");
-    assert_eq!(seen.lock().unwrap()[0]["enable_thinking"], true);
-    h.state_mut().chat.conv().thinking = false;
-    h.state_mut().chat.conv().turns.truncate(1);
-    say(&mut h, "again");
-    assert_eq!(seen.lock().unwrap()[1]["enable_thinking"], false);
-}
-
-#[test]
-fn a_model_without_thinking_support_is_never_asked_to_think() {
-    let mut h = harness("think-unsupported", Tab::Chat);
-    {
-        let app = h.state_mut();
-        scripted(app, script());
-        let m = app.library[0].clone();
-        app.chat.pick("Qwen3-0.6B");
-        app.load_model(&m);
-    }
-    pump_until(&mut h, 10, "the model to load", |a| a.loaded().is_some());
-    assert!(h.state().chat.conversations[0].thinking);
-    let thinking = h.state().engine.thinking();
-    let request = h.state_mut().chat.conv().chat_request(thinking);
-    assert_eq!(request.template().unwrap()["enable_thinking"], false);
-}
-
-#[test]
-fn streamed_reasoning_lands_in_the_thinking_block_and_the_answer_stays_clean() {
-    let mut h = harness("think-stream", Tab::Chat);
-    load_thinking(&mut h, &["<think>alpha", "</think>bravo"]);
-    say(&mut h, "hi");
-    h.run();
-    let reply = h.state_mut().chat.conv().turns[1].message.content.clone();
-    let split = inference_bench_core::reasoning::split(&reply, false, true);
-    assert_eq!((split.reasoning.as_deref(), split.answer.as_str()), (Some("alpha"), "bravo"));
-    h.get_by_label("> thinking");
-    h.get_by_label_contains("bravo");
-    h.get_by_label("> thinking").click();
-    h.run();
-    h.get_by_label_contains("alpha");
-    let turns = h.state_mut().chat.conv().messages();
-    assert_eq!(turns.last().unwrap().content, "bravo");
-    assert!(h.state().chat.last_stats.unwrap().reasoning_tokens > 0);
-}
-
-#[test]
-fn a_template_that_opens_the_think_block_still_splits_reasoning_from_the_answer() {
-    let mut h = harness("think-open", Tab::Chat);
-    load_thinking(&mut h, &["plan first", "</think>", "done"]);
-    say(&mut h, "hi");
-    h.run();
-    let reply = h.state_mut().chat.conv().turns[1].message.content.clone();
-    let split = inference_bench_core::reasoning::split(&reply, false, true);
-    assert_eq!((split.reasoning.as_deref(), split.answer.as_str()), (Some("plan first"), "done"));
-}
-
-#[test]
-#[ignore = "needs a wgpu adapter; run with SHOTS=dir"]
-fn chat_screenshots_with_a_reasoning_block() {
-    let out = shots_dir();
-    std::fs::create_dir_all(&out).unwrap();
-    let d = dir("think-shots");
-    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
-        egui_bench::install(&cc.egui_ctx);
-        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
-        app.tab = Tab::Chat;
-        app.library = vec![model("Qwen3-0.6B", true, "dense decoder")];
-        app
-    });
-    let chunks = [
-        "The user asks why the sky is blue. ",
-        "Sunlight scatters off air molecules, and Rayleigh scattering is stronger for short wavelengths. ",
-        "So blue is scattered most. Keep it to two sentences.",
-        "</think>",
-        "Sunlight contains every colour, and air molecules scatter the short blue wavelengths far more than the long red ones. ",
-        "That scattered blue light reaches your eyes from every direction, so the sky looks blue.",
-    ];
-    let script = Script { chunks: chunks.iter().map(|c| c.to_string()).collect(), chunk_delay_ms: 350, ..script() };
-    let (factory, _) = ScriptedModel::factory_probed(script, specrt::chat::Thinking::OpensInPrompt);
-    {
-        let app = h.state_mut();
-        app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), factory);
-        let m = app.library[0].clone();
-        app.chat.pick("Qwen3-0.6B");
-        app.load_model(&m);
-    }
-    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
-    {
-        let app = h.state_mut();
-        app.chat.input = "Why is the sky blue?".into();
-        let (handle, d) = (app.engine.handle(), app.dir.clone());
-        app.chat.send(handle, &d);
-    }
-    pump_until(&mut h, 20, "reasoning", |a| a.chat.streaming.as_ref().is_some_and(|s| s.text.contains("Rayleigh")));
-    h.step();
-    h.render().unwrap().save(out.join("chat-thinking-live.png")).unwrap();
-    pump_until(&mut h, 20, "reply", |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= 2);
-    h.run();
-    h.render().unwrap().save(out.join("chat-thinking-folded.png")).unwrap();
-    h.get_by_label("> thinking").click();
-    h.run();
-    h.render().unwrap().save(out.join("chat-thinking-open.png")).unwrap();
 }
 
 fn tree_hub() -> String {
@@ -1753,4 +1286,50 @@ fn screenshots_of_the_model_tree_with_the_real_hub_cache() {
     pump_until(&mut h, 60, "tree", |a| a.models.detail.as_ref().is_some_and(|d| d.tree.is_some()));
     h.run();
     h.render().unwrap().save(out.join("real-detail-tree.png")).unwrap();
+}
+
+#[test]
+fn the_agent_config_follows_the_loaded_model() {
+    let mut h = harness("agent-follow", Tab::Chat);
+    h.run();
+    assert!(h.state().chat.agent.chat.config.model.is_empty());
+    {
+        let app = h.state_mut();
+        scripted(app, script());
+        let m = app.library[0].clone();
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 10, "model never loaded", |a| a.loaded().is_some());
+    h.run();
+    let config = h.state().chat.agent.chat.config.clone();
+    assert_eq!(config.model, "Qwen3-0.6B");
+    let server = h.state().server.agent.as_ref().expect("agent endpoint").url();
+    assert_eq!(config.url, format!("{server}/v1"));
+    assert!(config.url.starts_with("http://127.0.0.1:"));
+    assert!(config.fault().is_none());
+    assert_eq!(ureq::get(format!("{}/models", config.url)).call().unwrap().status(), 200);
+    h.get_by_label_contains("Ask the model to work");
+
+    h.state_mut().unload();
+    pump_until(&mut h, 10, "unload", |a| a.loaded().is_none());
+    h.run();
+    assert!(h.state().chat.agent.chat.config.model.is_empty());
+    h.get_by_label_contains("Load a model to chat");
+}
+
+#[test]
+fn the_brief_names_the_app_and_the_loaded_model() {
+    let mut h = harness("agent-brief", Tab::Chat);
+    {
+        let app = h.state_mut();
+        scripted(app, script());
+        let m = app.library[0].clone();
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 10, "model never loaded", |a| a.loaded().is_some());
+    h.run();
+    let backend = h.state().chat.agent.chat.backend.clone();
+    let brief = backend.brief(std::path::Path::new("/tmp/ws"), &[]);
+    assert!(brief.contains("inference-bench") && brief.contains("Qwen3-0.6B") && brief.contains("/tmp/ws"), "{brief}");
+    assert_eq!(backend.app(), "inference-bench");
 }

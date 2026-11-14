@@ -60,14 +60,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(dir: PathBuf, wake: Wake) -> Self {
-        let mut app = Self::bare(dir, wake);
+    pub fn new(dir: PathBuf, wake: Wake, ctx: &egui::Context) -> Self {
+        let mut app = Self::bare(dir, wake, ctx);
         app.specs.auto = true;
         app.rescan();
         app
     }
 
-    pub fn bare(dir: PathBuf, wake: Wake) -> Self {
+    pub fn bare(dir: PathBuf, wake: Wake, ctx: &egui::Context) -> Self {
         let settings = Settings::load(&dir);
         Self {
             tab: Tab::Chat,
@@ -79,7 +79,7 @@ impl App {
             gpu_poll: Pending::default(),
             gpu_at: None,
             notice: None,
-            chat: chat::ChatState::load(&dir, &settings),
+            chat: chat::ChatState::new(ctx),
             models: models::ModelsState::default(),
             server: server::ServerState::default(),
             logs: inference_bench_core::logging::LogBuffer::new(5000),
@@ -140,7 +140,10 @@ impl App {
         }
         while let Ok(event) = self.engine.events.try_recv() {
             match event {
-                EngineEvent::Loading(name) => self.loading = Some(name),
+                EngineEvent::Loading(name) => {
+                    self.chat.attempted = name.clone();
+                    self.loading = Some(name);
+                }
                 EngineEvent::Loaded(l) => {
                     self.loading = None;
                     self.chat.load_error = None;
@@ -162,7 +165,7 @@ impl App {
             self.gpu_at = Some(Instant::now());
             self.gpu_poll.start(job::spawn(&self.wake, inference_bench_core::gpu::sample));
         }
-        self.chat.pump(&self.dir);
+        self.chat.agent.poll();
         self.models.pump(&mut self.notice);
         if self.specs.pump(&self.wake, &self.dir, &self.settings, &mut self.notice) {
             self.rescan();
@@ -190,6 +193,7 @@ impl eframe::App for App {
             || self.scan.busy();
         self.engine.watch(self.tab == Tab::Server && self.loaded().is_some());
         root.ctx().request_repaint_after(Duration::from_millis(if animating { 100 } else { 2000 }));
+        agent_ui::serve(self, &root.ctx().clone());
         shell::draw(self, root);
     }
 }
@@ -200,6 +204,9 @@ fn wake_for(ctx: &egui::Context) -> Wake {
 }
 
 fn main() -> eframe::Result<()> {
+    if let Some(code) = agent_core::sandbox::run_helper() {
+        std::process::exit(code);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = args.first().map(PathBuf::from).unwrap_or_else(store::data_dir);
     let buffer = inference_bench_core::logging::LogBuffer::new(5000);
@@ -222,7 +229,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             egui_bench::install(&cc.egui_ctx);
-            let mut app = App::new(dir, wake_for(&cc.egui_ctx));
+            let mut app = App::new(dir, wake_for(&cc.egui_ctx), &cc.egui_ctx);
             app.logs = buffer;
             Ok(Box::new(app))
         }),

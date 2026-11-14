@@ -46,7 +46,7 @@ fn picker(app: &mut App, ui: &mut egui::Ui) {
 pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mut egui::Ui)) {
     let loaded = app.loaded();
     let loading = app.loading.clone();
-    let failed = app.chat.load_error.is_some().then(|| app.chat.conv().model.clone()).filter(|m| !m.is_empty());
+    let failed = app.chat.load_error.is_some().then(|| app.chat.attempted.clone()).filter(|m| !m.is_empty());
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         match (&loading, &loaded, &failed) {
