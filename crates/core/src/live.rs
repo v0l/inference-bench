@@ -288,6 +288,14 @@ impl History {
         out
     }
 
+    pub fn recent_mean(&self, n: usize, f: impl Fn(&Point) -> f64) -> f64 {
+        let take = n.min(self.ring.len());
+        if take == 0 {
+            return 0.0;
+        }
+        self.ring.iter().rev().take(take).map(|(_, p)| f(p)).sum::<f64>() / take as f64
+    }
+
     pub fn requests_per_minute(&self) -> f64 {
         let Some((now, last)) = self.ring.iter().next_back() else { return 0.0 };
         let base = self.ring.iter().rev().find(|(at, _)| now.duration_since(*at) >= RATE_WINDOW).or_else(|| self.ring.iter().next());

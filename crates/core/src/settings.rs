@@ -25,6 +25,10 @@ pub struct Settings {
     pub default_ctx: usize,
     #[serde(default)]
     pub model_ctx: BTreeMap<String, usize>,
+    #[serde(default = "default_seqs")]
+    pub default_seqs: usize,
+    #[serde(default)]
+    pub model_seqs: BTreeMap<String, usize>,
     #[serde(default)]
     pub hf_token: String,
     #[serde(default)]
@@ -61,6 +65,10 @@ fn default_ctx() -> usize {
     8192
 }
 
+fn default_seqs() -> usize {
+    4
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -68,6 +76,8 @@ impl Default for Settings {
             server: ServerSettings::default(),
             default_ctx: default_ctx(),
             model_ctx: BTreeMap::new(),
+            default_seqs: default_seqs(),
+            model_seqs: BTreeMap::new(),
             hf_token: String::new(),
             spec_folders: Vec::new(),
             specs_auto_update: true,
@@ -95,6 +105,10 @@ impl Settings {
 
     pub fn ctx_for(&self, model: &str) -> usize {
         self.model_ctx.get(model).copied().unwrap_or(self.default_ctx)
+    }
+
+    pub fn seqs_for(&self, model: &str) -> usize {
+        self.model_seqs.get(model).copied().unwrap_or(self.default_seqs).max(1)
     }
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {

@@ -40,6 +40,7 @@ pub struct ServerState {
     pub error: Option<String>,
     pub shown: usize,
     pub pane: Pane,
+    pub span: crate::serving::Span,
     pub placement: Option<Result<PlacementConfig, String>>,
     placement_seen: Option<(Option<std::time::SystemTime>, Instant)>,
     runtime: tokio::runtime::Runtime,
@@ -53,6 +54,7 @@ impl Default for ServerState {
             error: None,
             shown: 0,
             pane: Pane::Requests,
+            span: crate::serving::Span::Five,
             placement: None,
             placement_seen: None,
             runtime: tokio::runtime::Builder::new_multi_thread()
@@ -69,6 +71,7 @@ impl ServerState {
         let mut config = ServerConfig {
             bind: format!("{}:{port}", if lan { "0.0.0.0" } else { "127.0.0.1" }),
             shutdown_grace_secs: 2,
+            max_num_seqs: Some(inference_bench_core::engine::MAX_PARALLEL),
             specs: inference_bench_server::config::SpecsSection { auto_update: false, ..Default::default() },
             ..ServerConfig::default()
         };
@@ -145,18 +148,31 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 });
             },
             |ui| {
-                match &app.server.running {
-                    Some(s) => {
-                        Line::new().legend("address").measured(format!("{}/v1", s.url())).show(ui);
+                match (&app.server.running, &loaded) {
+                    (Some(s), l) => {
+                        let base = format!("{}/v1", s.url());
+                        ui.horizontal(|ui| {
+                            let line = Line::new().legend("address").measured(base.clone());
+                            let line = match l {
+                                Some(l) => line.gap(14.0).legend("model").value(l.display.clone()),
+                                None => line.gap(14.0).note("nothing loaded: select a model in the bar above"),
+                            };
+                            ui.allocate_ui(egui::vec2((ui.available_width() - 90.0).max(120.0), 0.0), |ui| {
+                                line.wrapped(ui);
+                            });
+                            if ui.add(Key::new("copy").outline(VALUE)).clicked() {
+                                ui.ctx().copy_text(base);
+                            }
+                        });
                     }
-                    None => {
+                    (None, l) => {
                         Line::new().legend("address").note("not listening").show(ui);
+                        match l {
+                            Some(l) => Line::new().legend("serving").value(l.display.clone()).show(ui),
+                            None => Line::new().legend("serving").note("nothing loaded: select a model in the bar above").show(ui),
+                        };
                     }
                 }
-                match &loaded {
-                    Some(l) => Line::new().legend("serving").value(l.display.clone()).show(ui),
-                    None => Line::new().legend("serving").note("nothing loaded: select a model in the bar above").show(ui),
-                };
                 ui.horizontal(|ui| {
                     if running {
                         if ui.add(Key::new("stop server").solid(FAULT).min_width(140.0)).clicked() {
@@ -186,16 +202,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             });
             switch(ui, "allow other machines", &mut app.settings.server.lan, "listen on all interfaces", "Off keeps it on 127.0.0.1.");
         });
-        if let Some(s) = &app.server.running {
-            let url = s.url();
-            section(ui, "use it", "any OpenAI-compatible client works", |ui| {
-                note(ui, format!("curl {url}/v1/chat/completions -H 'Content-Type: application/json' -d '{{\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}'"), LEGEND);
-                note(ui, format!("Metrics at {url}/metrics. /v1/models lists the model loaded right now."), LEGEND);
-            });
-        }
         if let Some(p) = app.server.placement.clone() {
             placement_section(ui, &p);
         }
+        crate::serving::draw(app, ui);
         let log = request_lines(&app.logs);
         let mut pane = app.server.pane;
         segments(ui, &mut pane, &[(Pane::Requests, "requests", Some(log.len())), (Pane::Logs, "logs", None)]);

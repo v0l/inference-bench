@@ -11,6 +11,7 @@ mod modelbar;
 mod models;
 mod logs;
 mod server;
+mod serving;
 mod settings;
 mod shell;
 mod specs;
@@ -116,14 +117,16 @@ impl App {
 
     pub fn load_model(&mut self, model: &LocalModel) {
         let ctx = self.settings.ctx_for(&model.name);
-        self.load_model_with(model, ctx);
+        let seqs = self.settings.seqs_for(&model.name);
+        self.load_model_with(model, ctx, seqs);
     }
 
-    pub fn load_model_with(&mut self, model: &LocalModel, ctx: usize) {
+    pub fn load_model_with(&mut self, model: &LocalModel, ctx: usize, seqs: usize) {
         self.engine.send(Command::Load {
             model_id: model.model_id(inference_bench_core::target::NATIVE),
             display: model.name.clone(),
             max_ctx: Some(ctx),
+            max_num_seqs: Some(seqs),
         });
     }
 
@@ -185,6 +188,7 @@ impl eframe::App for App {
             || self.models.downloading()
             || self.specs.busy()
             || self.scan.busy();
+        self.engine.watch(self.tab == Tab::Server && self.loaded().is_some());
         root.ctx().request_repaint_after(Duration::from_millis(if animating { 100 } else { 2000 }));
         shell::draw(self, root);
     }

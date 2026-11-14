@@ -311,7 +311,7 @@ fn summary(ui: &mut egui::Ui, v: &View, free: Option<u64>, named: bool) {
         Line::new().legend("vision").value(if v.spec.vision.is_some() { "yes" } else { "no" }).show(ui);
         Line::new().legend("mtp").value(if a.mtp_layers > 0 { format!("{} layer", a.mtp_layers) } else { "no".into() }).show(ui);
     });
-    let at_default = crate::load::estimate(a, crate::load::max_context(a).min(8192), free);
+    let at_default = crate::load::estimate(a, crate::load::max_context(a).min(8192), 1, free);
     let mut line = Line::new().legend("weights").measured(human_size(a.total_bytes)).gap(14.0).legend("kv per 1k tokens").measured(human_size(a.kv_bytes_per_token * 1024));
     if a.state_bytes_per_seq > 0 {
         line = line.gap(14.0).legend("state").measured(human_size(a.state_bytes_per_seq));

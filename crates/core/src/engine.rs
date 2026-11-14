@@ -166,6 +166,10 @@ impl Engine {
         self.handle().reading()
     }
 
+    pub fn watch(&self, on: bool) {
+        self.watching.store(on, Ordering::Relaxed);
+    }
+
     pub fn send(&self, command: Command) {
         let _ = self.commands.send(command);
     }
@@ -203,7 +207,8 @@ fn sample(handle: Handle, stop: Arc<AtomicBool>, wake: Wake) {
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(slice);
         since += slice;
-        if since < SAMPLE_EVERY {
+        let baseline = handle.loaded().is_some() && handle.history.lock().unwrap().is_empty();
+        if since < SAMPLE_EVERY && !baseline {
             continue;
         }
         since = Duration::ZERO;

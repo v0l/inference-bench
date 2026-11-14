@@ -265,12 +265,12 @@ fn the_default_context_is_reduced_to_what_fits_and_a_remembered_one_wins() {
     let a = detail_view("27b", Some("qwen3.8-27b-exact.toml")).anatomy;
     let max = crate::load::max_context(&a);
     let roomy = Some(a.total_bytes + a.state_bytes_per_seq + a.kv_bytes_per_token * 131072);
-    assert_eq!(crate::load::initial_ctx(None, 8192, &a, roomy, max), 8192);
+    assert_eq!(crate::load::initial_ctx(None, 8192, &a, roomy, 1, max), 8192);
     let tight = Some(a.total_bytes + a.state_bytes_per_seq + a.kv_bytes_per_token * 3000);
-    assert_eq!(crate::load::initial_ctx(None, 8192, &a, tight, max), 2560);
-    assert_eq!(crate::load::initial_ctx(Some(100_000), 8192, &a, tight, max), 100_000);
-    assert_eq!(crate::load::initial_ctx(Some(999_999), 8192, &a, tight, max), max);
-    assert_eq!(crate::load::initial_ctx(None, 8192, &a, None, max), 8192);
+    assert_eq!(crate::load::initial_ctx(None, 8192, &a, tight, 1, max), 2560);
+    assert_eq!(crate::load::initial_ctx(Some(100_000), 8192, &a, tight, 1, max), 100_000);
+    assert_eq!(crate::load::initial_ctx(Some(999_999), 8192, &a, tight, 1, max), max);
+    assert_eq!(crate::load::initial_ctx(None, 8192, &a, None, 1, max), 8192);
 }
 
 #[test]
@@ -435,6 +435,166 @@ fn the_server_tab_starts_and_serves_the_loaded_model() {
         .unwrap();
     let v: serde_json::Value = resp.body_mut().read_json().unwrap();
     assert_eq!(v["choices"][0]["message"]["content"], "Hello **world**!");
+    h.state_mut().server.stop();
+}
+
+fn slow_script() -> Script {
+    Script { chunks: (0..40).map(|i| format!("t{i} ")).collect(), chunk_delay_ms: 10, first_delay_ms: 20, usage: Some((12, 40)), ..script() }
+}
+
+fn serving_harness(name: &str, seqs: usize) -> Harness<'static, App> {
+    let mut h = harness(name, Tab::Server);
+    {
+        let app = h.state_mut();
+        app.engine = inference_bench_core::fake::engine(app.wake.clone(), slow_script());
+        let m = app.library[0].clone();
+        app.engine.send(Command::Load { model_id: m.model_id(inference_bench_core::target::NATIVE), display: m.name.clone(), max_ctx: Some(4096), max_num_seqs: Some(seqs) });
+    }
+    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
+    let handle = h.state().engine.handle();
+    h.state_mut().server.start(handle, 0, "", false);
+    h
+}
+
+fn chat_once(url: &str) {
+    let mut resp = ureq::post(format!("{url}/v1/chat/completions"))
+        .send_json(serde_json::json!({"messages":[{"role":"user","content":"hi"}],"max_tokens":40}))
+        .unwrap();
+    let _: serde_json::Value = resp.body_mut().read_json().unwrap();
+}
+
+#[test]
+fn the_server_tab_has_no_curl_line_and_one_compact_address_line() {
+    let mut h = serving_harness("nocurl", 4);
+    h.run();
+    let url = h.state().server.running.as_ref().unwrap().url();
+    assert!(h.query_by_label_contains("curl").is_none());
+    assert!(h.query_by_label_contains("use it").is_none());
+    assert!(h.query_by_label_contains("USE IT").is_none());
+    h.get_by_label_contains(&format!("{url}/v1"));
+    assert!(h.get_all_by_label_contains("Qwen3-0.6B").count() >= 1);
+    h.get_by_label("copy");
+    h.state_mut().server.stop();
+}
+
+#[test]
+fn the_load_dialog_has_a_parallel_requests_slider_and_the_estimate_grows_with_it() {
+    let mut h = harness("seqs-dialog", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    h.get_by_label_contains("PARALLEL REQUESTS");
+    let free = h.state().free_gpu_bytes();
+    let dialog = h.state_mut().load.as_mut().unwrap();
+    dialog.ctx = 8192;
+    dialog.seqs = 1;
+    let one = dialog.estimate(free).unwrap();
+    dialog.seqs = 4;
+    let four = dialog.estimate(free).unwrap();
+    assert_eq!(four.kv, one.kv * 4);
+    assert!(four.total() > one.total());
+    assert_eq!(four.weights, one.weights);
+    let a = detail_view("seqs-27b", Some("qwen3.8-27b-exact.toml")).anatomy;
+    let (a1, a4) = (crate::load::estimate(&a, 8192, 1, None), crate::load::estimate(&a, 8192, 4, None));
+    assert_eq!(a4.state, a1.state * 4);
+    assert!(a.state_bytes_per_seq > 100 << 20);
+    assert_eq!(crate::load::largest_seqs(&a, 8192, Some(a.total_bytes)), 1);
+    assert_eq!(crate::load::largest_seqs(&a, 8192, None), crate::load::MAX_SEQS);
+}
+
+#[test]
+fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_them() {
+    let mut h = harness("seqs-load", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), script());
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    assert_eq!(h.state().load.as_ref().unwrap().seqs, 4);
+    h.state_mut().load.as_mut().unwrap().seqs = 6;
+    h.run();
+    h.get_all_by_label("load").last().unwrap().click();
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    assert_eq!(h.state().loaded().unwrap().max_num_seqs, 6);
+    assert_eq!(h.state().settings.seqs_for("Qwen3-0.6B"), 6);
+    assert_eq!(Settings::load(&h.state().dir).seqs_for("Qwen3-0.6B"), 6);
+}
+
+#[test]
+fn four_parallel_api_requests_reach_running_four_and_chat_keeps_working() {
+    let mut h = serving_harness("parallel", 4);
+    h.run();
+    let url = h.state().server.running.as_ref().unwrap().url();
+    let handle = h.state().engine.handle();
+    let peak = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                peak.fetch_max(handle.reading().running, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+        let api: Vec<_> = (0..3).map(|_| scope.spawn(|| chat_once(&url))).collect();
+        std::thread::sleep(Duration::from_millis(60));
+        let rx = handle.chat(inference_bench_core::chat::ChatRequest::new(
+            vec![inference_bench_core::chat::Message::new(inference_bench_core::chat::Role::User, "from the app chat")],
+            inference_bench_core::chat::Sampling::default(),
+        ));
+        let mut chat_done = false;
+        while let Ok(e) = rx.recv_timeout(Duration::from_secs(10)) {
+            if matches!(e, inference_bench_core::engine::ChatEvent::Done(_)) {
+                chat_done = true;
+                break;
+            }
+        }
+        assert!(chat_done);
+        for t in api {
+            t.join().unwrap();
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 4);
+    h.state_mut().server.stop();
+}
+
+#[test]
+fn the_metrics_section_shows_throughput_and_ttft_after_a_request() {
+    let mut h = serving_harness("metrics", 4);
+    let url = h.state().server.running.as_ref().unwrap().url();
+    let t = std::thread::spawn(move || chat_once(&url));
+    let until = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < until {
+        h.step();
+        std::thread::sleep(Duration::from_millis(100));
+        let live = h.state().engine.handle().history().lock().unwrap().points().any(|p| p.gen_tok_s > 0.0);
+        if live && t.is_finished() {
+            break;
+        }
+    }
+    t.join().unwrap();
+    let start = Instant::now();
+    while !h.state().engine.handle().history().lock().unwrap().last().is_some_and(|p| p.ttft_p50 > 0.0) {
+        let hist = h.state().engine.handle().history();
+        let hist = hist.lock().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(10), "points {:?} reading {:?}", hist.points().collect::<Vec<_>>(), hist.latest().map(|r| (r.generated, r.requests, r.ttft.total)));
+        drop(hist);
+        h.step();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    h.run();
+    let snap = crate::serving::snapshot(h.state(), crate::serving::Span::Five);
+    let last = snap.last.unwrap();
+    assert!(snap.generation.iter().any(|v| *v > 0.0), "no throughput in {:?}", snap.generation);
+    assert!(last.ttft_p50 > 0.0 && last.ttft_p95 >= last.ttft_p50);
+    assert_eq!(snap.recent.len(), 1);
+    assert_eq!((snap.recent[0].prompt_tokens, snap.recent[0].completion_tokens), (12, 40));
+    assert!(snap.recent[0].ttft_secs > 0.0 && snap.recent[0].decode_tok_s > 0.0);
+    h.get_by_label_contains("REQUESTS PER MIN");
+    h.get_by_label_contains("KV CACHE");
+    h.get_by_label_contains("PREFIX HITS");
     h.state_mut().server.stop();
 }
 
@@ -674,7 +834,7 @@ fn screenshots_with_real_data() {
         let app = h.state_mut();
         app.load = None;
         app.chat.pick("Qwen3-0.6B");
-        app.load_model_with(&qwen, 16384);
+        app.load_model_with(&qwen, 16384, 1);
         app.tab = Tab::Chat;
     }
     pump_until(&mut h, 120, "load", |a| a.loaded().is_some());
