@@ -1212,3 +1212,51 @@ fn a_template_that_opens_the_think_block_still_splits_reasoning_from_the_answer(
     let split = inference_bench_core::reasoning::split(&reply, false, true);
     assert_eq!((split.reasoning.as_deref(), split.answer.as_str()), (Some("plan first"), "done"));
 }
+
+#[test]
+#[ignore = "needs a wgpu adapter; run with SHOTS=dir"]
+fn chat_screenshots_with_a_reasoning_block() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let d = dir("think-shots");
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx));
+        app.tab = Tab::Chat;
+        app.library = vec![model("Qwen3-0.6B", true, "dense decoder")];
+        app
+    });
+    let chunks = [
+        "The user asks why the sky is blue. ",
+        "Sunlight scatters off air molecules, and Rayleigh scattering is stronger for short wavelengths. ",
+        "So blue is scattered most. Keep it to two sentences.",
+        "</think>",
+        "Sunlight contains every colour, and air molecules scatter the short blue wavelengths far more than the long red ones. ",
+        "That scattered blue light reaches your eyes from every direction, so the sky looks blue.",
+    ];
+    let script = Script { chunks: chunks.iter().map(|c| c.to_string()).collect(), chunk_delay_ms: 350, ..script() };
+    let (factory, _) = ScriptedModel::factory_probed(script, specrt::chat::Thinking::OpensInPrompt);
+    {
+        let app = h.state_mut();
+        app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), factory);
+        let m = app.library[0].clone();
+        app.chat.pick("Qwen3-0.6B");
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
+    {
+        let app = h.state_mut();
+        app.chat.input = "Why is the sky blue?".into();
+        let (handle, d) = (app.engine.handle(), app.dir.clone());
+        app.chat.send(handle, &d);
+    }
+    pump_until(&mut h, 20, "reasoning", |a| a.chat.streaming.as_ref().is_some_and(|s| s.text.contains("Rayleigh")));
+    h.step();
+    h.render().unwrap().save(out.join("chat-thinking-live.png")).unwrap();
+    pump_until(&mut h, 20, "reply", |a| !a.chat.streaming() && a.chat.conversations[0].turns.len() >= 2);
+    h.run();
+    h.render().unwrap().save(out.join("chat-thinking-folded.png")).unwrap();
+    h.get_by_label("> thinking").click();
+    h.run();
+    h.render().unwrap().save(out.join("chat-thinking-open.png")).unwrap();
+}

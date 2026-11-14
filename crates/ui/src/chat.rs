@@ -88,6 +88,7 @@ impl ChatState {
         c.sampling = prev.sampling;
         c.system = prev.system;
         c.use_template = prev.use_template;
+        c.thinking = prev.thinking;
         self.conversations.insert(0, c);
         self.current = 0;
         self.error = None;
@@ -537,6 +538,9 @@ fn composer(app: &mut App, ui: &mut egui::Ui) {
         }
         if ready && !vision {
             ui.label(egui::RichText::new("this model takes text only").size(10.5).color(LEGEND));
+        }
+        if ready && app.engine.thinking() != specrt::chat::Thinking::Unsupported {
+            ui.checkbox(&mut app.chat.conv().thinking, "thinking");
         }
     });
     let streaming = app.chat.streaming();
