@@ -76,6 +76,9 @@ fn status_bar(app: &mut App, ui: &mut egui::Ui) {
         match (&app.loading, app.loaded()) {
             (Some(name), _) => {
                 lamp(ui, &format!("loading {name}"), true, false);
+                if let Some(p) = &app.load_progress {
+                    status(ui, true, &crate::modelbar::progress_text(p));
+                }
             }
             (None, Some(l)) => {
                 lamp(ui, &l.display, true, false);

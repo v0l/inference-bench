@@ -116,6 +116,31 @@ impl Drop for Lease {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
+pub struct LoadingStatus {
+    pub stage: String,
+    pub done: u64,
+    pub total: u64,
+    pub elapsed_secs: f64,
+    pub bytes_per_sec: f64,
+}
+
+struct LoadState {
+    stage: String,
+    done: u64,
+    total: u64,
+    started: Instant,
+    weights_started: Option<Instant>,
+}
+
+impl LoadState {
+    fn status(&self) -> LoadingStatus {
+        let secs = self.weights_started.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let rate = if self.stage == "reading weights" && secs > 0.0 { self.done as f64 / secs } else { 0.0 };
+        LoadingStatus { stage: self.stage.clone(), done: self.done, total: self.total, elapsed_secs: self.started.elapsed().as_secs_f64(), bytes_per_sec: rate }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelStatus {
     pub id: String,
@@ -124,6 +149,7 @@ pub struct ModelStatus {
     pub vram_bytes: u64,
     pub active_requests: usize,
     pub idle_secs: Option<f64>,
+    pub loading: Option<LoadingStatus>,
 }
 
 pub struct Manager {
@@ -132,6 +158,7 @@ pub struct Manager {
     probe: GpuProbe,
     metrics: Arc<Metrics>,
     loaded: Mutex<HashMap<String, Arc<LoadedModel>>>,
+    loading: Arc<Mutex<HashMap<String, LoadState>>>,
     load_lock: tokio::sync::Mutex<()>,
     source: Option<Arc<dyn ModelSource>>,
 }
@@ -144,7 +171,17 @@ impl Manager {
         metrics: Arc<Metrics>,
         source: Option<Arc<dyn ModelSource>>,
     ) -> Self {
-        Self { config, factory, probe, metrics, loaded: Mutex::default(), load_lock: Default::default(), source }
+        Self { config, factory, probe, metrics, loaded: Mutex::default(), loading: Default::default(), load_lock: Default::default(), source }
+    }
+
+    pub fn loading_snapshot(&self) -> Vec<(String, LoadingStatus)> {
+        let mut v: Vec<_> = self.loading.lock().unwrap().iter().map(|(id, s)| (id.clone(), s.status())).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    fn loading_of(&self, id: &str) -> Option<LoadingStatus> {
+        self.loading.lock().unwrap().get(id).map(LoadState::status)
     }
 
     pub fn gpu_used(&self) -> Option<u64> {
@@ -228,6 +265,7 @@ impl Manager {
                 .into_iter()
                 .map(|m| {
                     let l = loaded.get(&m.id);
+                    let loading = self.loading_of(&m.id);
                     ModelStatus {
                         id: m.id,
                         backend: l.map(|l| l.backend_label.clone()).unwrap_or_else(|| "engine".to_string()),
@@ -235,6 +273,7 @@ impl Manager {
                         vram_bytes: l.map(|l| l.vram).unwrap_or(0),
                         active_requests: l.map(|l| l.active()).unwrap_or(0),
                         idle_secs: l.map(|l| l.idle_for().as_secs_f64()),
+                        loading,
                     }
                 })
                 .collect();
@@ -252,6 +291,7 @@ impl Manager {
                     vram_bytes: l.map(|l| l.vram).unwrap_or(0),
                     active_requests: l.map(|l| l.active()).unwrap_or(0),
                     idle_secs: l.map(|l| l.idle_for().as_secs_f64()),
+                    loading: self.loading_of(&m.id),
                 }
             })
             .collect();
@@ -264,6 +304,7 @@ impl Manager {
                     vram_bytes: l.vram,
                     active_requests: l.active(),
                     idle_secs: Some(l.idle_for().as_secs_f64()),
+                    loading: None,
                 });
             }
         }
@@ -313,6 +354,23 @@ impl Manager {
         tracing::info!(model = %cfg.id, upstream = %name, ?max_ctx, ?serving, %spec_hash, vram_before_bytes = ?vram_before, "loading model");
         let factory = self.factory.clone();
         let serving_in = serving.clone();
+        let state = self.loading.clone();
+        let id = cfg.id.clone();
+        state.lock().unwrap().insert(id.clone(), LoadState { stage: "starting".into(), done: 0, total: 0, started: Instant::now(), weights_started: None });
+        let sink = {
+            let (state, id) = (state.clone(), id.clone());
+            inference_bench_core::specrt_progress::Sink::new(move |p| {
+                if let Some(s) = state.lock().unwrap().get_mut(&id) {
+                    let stage = p.stage.label();
+                    if s.stage != stage {
+                        s.weights_started = (p.stage == inference_bench_core::specrt_progress::Stage::Weights).then(Instant::now);
+                    }
+                    s.stage = stage.to_string();
+                    s.done = p.done;
+                    s.total = p.total;
+                }
+            })
+        };
         let span = tracing::Span::current();
         let built = tokio::task::spawn_blocking(move || {
             span.in_scope(|| {
@@ -320,6 +378,7 @@ impl Manager {
                     Some(opts) => factory.build_serving(max_ctx, opts)?,
                     None => factory.build_with(max_ctx, runtime)?,
                 };
+                b.set_progress(Some(sink));
                 b.load(&name)?;
                 let mut backends = Vec::new();
                 if let Some(opts) = &serving_in {
@@ -336,7 +395,9 @@ impl Manager {
         })
         .instrument(tracing::Span::current())
         .await
-        .map_err(|e| ApiError::internal(format!("load task failed: {e}")))?;
+        .map_err(|e| ApiError::internal(format!("load task failed: {e}")));
+        state.lock().unwrap().remove(&id);
+        let built = built?;
         let backends = match built {
             Ok(b) => b,
             Err(e) => {

@@ -35,6 +35,14 @@ pub enum Tab {
     Settings,
 }
 
+#[derive(Debug, Clone)]
+pub struct LoadProgress {
+    pub stage: String,
+    pub done: u64,
+    pub total: u64,
+    pub weights_started: Option<Instant>,
+}
+
 pub struct App {
     pub dir: PathBuf,
     pub tab: Tab,
@@ -44,6 +52,7 @@ pub struct App {
     pub engine: Engine,
     pub wake: Wake,
     pub loading: Option<String>,
+    pub load_progress: Option<LoadProgress>,
     pub gpu: Vec<GpuStats>,
     gpu_poll: Pending<Vec<GpuStats>>,
     pub gpu_at: Option<Instant>,
@@ -75,6 +84,7 @@ impl App {
             scan: Pending::default(),
             engine: Engine::spawn(wake.clone()),
             loading: None,
+            load_progress: None,
             gpu: Vec::new(),
             gpu_poll: Pending::default(),
             gpu_at: None,
@@ -149,14 +159,27 @@ impl App {
                 EngineEvent::Loading(name) => {
                     self.chat.attempted = name.clone();
                     self.loading = Some(name);
+                    self.load_progress = None;
+                }
+                EngineEvent::LoadProgress { stage, done, total } => {
+                    let now = Instant::now();
+                    let p = self.load_progress.get_or_insert_with(|| LoadProgress { stage: String::new(), done: 0, total: 0, weights_started: None });
+                    if p.stage != stage {
+                        p.weights_started = (stage == "reading weights").then_some(now);
+                    }
+                    p.stage = stage;
+                    p.done = done;
+                    p.total = total;
                 }
                 EngineEvent::Loaded(l) => {
                     self.loading = None;
+                    self.load_progress = None;
                     self.chat.load_error = None;
                     self.notice = Some((true, format!("{} loaded in {:.1} s", l.display, l.load_secs)));
                 }
                 EngineEvent::LoadFailed(e) => {
                     self.loading = None;
+                    self.load_progress = None;
                     self.chat.load_error = Some(e.to_string());
                     self.notice = Some((false, e.to_string()));
                 }

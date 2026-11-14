@@ -322,6 +322,7 @@ impl ServerConfig {
             runtime: self.runtime.clone(),
             speculative: self.speculative,
             placement: Some(self.placement.clone()),
+            progress: None,
         })
     }
 

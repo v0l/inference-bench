@@ -127,6 +127,11 @@ fn header(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn empty_state(app: &mut App, ui: &mut egui::Ui) {
+    if let (Some(name), Some(p)) = (&app.loading, &app.load_progress) {
+        welcome(ui, &format!("Loading {name}"), &crate::modelbar::progress_text(p));
+        ui.vertical_centered(|ui| crate::modelbar::load_bar(ui, p, 420.0));
+        return;
+    }
     if usable_models(app) == 0 {
         welcome(ui, IDLE_HINT, "No model on disk runs here yet. Download one from the Models page.");
         if ui.add(Key::new("go to models").solid(READOUT).min_width(140.0).id_salt("chat-to-models")).clicked() {

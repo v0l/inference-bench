@@ -129,6 +129,7 @@ pub struct Native {
     worker: Option<Worker>,
     vision: bool,
     thinking: specrt::chat::Thinking,
+    progress: Option<specrt::progress::Sink>,
 }
 
 impl Native {
@@ -141,7 +142,7 @@ impl Native {
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {
-        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default() }
+        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), progress: None }
     }
 
     fn send(&mut self, job: Job) -> Result<(), BackendError> {
@@ -218,11 +219,12 @@ fn run_engine(
     model: String,
     max_ctx: Option<usize>,
     factory: Factory,
+    progress: Option<specrt::progress::Sink>,
     loaded: Sender<Result<(bool, specrt::chat::Thinking), BackendError>>,
     jobs: std::sync::mpsc::Receiver<Job>,
     panic: Arc<Mutex<Option<String>>>,
 ) {
-    let mut engine = match catch_unwind(AssertUnwindSafe(|| factory(&model, max_ctx))) {
+    let mut engine = match catch_unwind(AssertUnwindSafe(|| specrt::progress::with_sink(progress, || factory(&model, max_ctx)))) {
         Ok(Ok(e)) => e,
         Ok(Err(e)) => {
             let _ = loaded.send(Err(engine_error(&e)));
@@ -261,16 +263,20 @@ impl Target for Native {
         Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking, ..Capabilities::default() }
     }
 
+    fn set_progress(&mut self, sink: Option<specrt::progress::Sink>) {
+        self.progress = sink;
+    }
+
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
         self.worker = None;
         let (jobs, inbox) = channel();
         let (loaded_tx, loaded_rx) = channel();
         let panic = Arc::new(Mutex::new(None));
-        let (name, max_ctx, factory, shared) =
-            (model.to_string(), self.max_ctx, self.factory.clone(), panic.clone());
+        let (name, max_ctx, factory, shared, progress) =
+            (model.to_string(), self.max_ctx, self.factory.clone(), panic.clone(), self.progress.clone());
         let thread = std::thread::Builder::new()
             .name("native-engine".into())
-            .spawn(move || run_engine(name, max_ctx, factory, loaded_tx, inbox, shared))
+            .spawn(move || run_engine(name, max_ctx, factory, progress, loaded_tx, inbox, shared))
             .map_err(|e| BackendError::failed(format!("cannot start the engine thread: {e}")))?;
         let worker = Worker { jobs: Some(jobs), thread: Some(thread), panic };
         let outcome = loaded_rx.recv().unwrap_or_else(|_| Err(BackendError::failed("the native engine stopped while loading")));

@@ -62,6 +62,8 @@ pub trait Target: Send {
 
     fn load(&mut self, model: &str) -> Result<(), BackendError>;
 
+    fn set_progress(&mut self, _sink: Option<specrt::progress::Sink>) {}
+
     fn generate(
         &mut self,
         request: &Request,

@@ -43,6 +43,28 @@ fn picker(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+pub fn progress_text(p: &crate::LoadProgress) -> String {
+    if p.total == 0 {
+        return p.stage.clone();
+    }
+    let secs = p.weights_started.map_or(0.0, |t| t.elapsed().as_secs_f64());
+    if p.stage == "reading weights" {
+        let rate = if secs > 0.2 && p.done > 0 { format!("  {:.1} GB/s", p.done as f64 / secs / 1e9) } else { String::new() };
+        format!("{}  {:.1} / {:.1} GB{rate}", p.stage, p.done as f64 / 1e9, p.total as f64 / 1e9)
+    } else {
+        p.stage.clone()
+    }
+}
+
+pub fn progress_fraction(p: &crate::LoadProgress) -> f32 {
+    if p.total == 0 { 0.0 } else { (p.done as f64 / p.total as f64).clamp(0.0, 1.0) as f32 }
+}
+
+pub fn load_bar(ui: &mut egui::Ui, p: &crate::LoadProgress, width: f32) {
+    let text = progress_text(p);
+    ui.add(egui::ProgressBar::new(progress_fraction(p)).desired_width(width).text(text));
+}
+
 pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mut egui::Ui)) {
     let loaded = app.loaded();
     let loading = app.loading.clone();
@@ -53,6 +75,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mu
             (Some(name), _, _) => {
                 lamp(ui, "loading", true, false);
                 chip(ui, name, READOUT_DIM, false);
+                if let Some(p) = &app.load_progress {
+                    load_bar(ui, p, 320.0);
+                }
             }
             (None, Some(l), _) => {
                 lamp(ui, if busy { "generating" } else { "ready" }, true, false);

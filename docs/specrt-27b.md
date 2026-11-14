@@ -255,3 +255,28 @@ cargo test --release --test real27b real_27b_greedy_and_logits_match -- --ignore
 
 The GPU steps need about 32 GB free (the bench script stops below 36 GB, and if vLLM logs an
 error). The CPU references take about 95 s each on 24 threads, with 3.7 GB of anonymous RSS.
+
+## Fast weight loading (#583)
+
+Technique review of InstantTensor for a single-GPU Rust loader. Used: O_DIRECT reads into aligned buffers, large chunks with several reads in flight, a read-ahead thread so the next layer is read while the previous one converts and uploads. Not used: GPUDirect Storage (cuFile, needs libcufile and a supporting filesystem; not installed here) and multi-rank distribution (single GPU).
+
+`crates/specrt/src/loader.rs`: one reader thread reads each layer's tensors (`ahead` groups queued) with `readers` threads doing `chunk_mb` O_DIRECT `pread`s into a pinned host buffer (`cuMemHostAlloc`, 64 MB classes, recycled). The tensor views point into that buffer, so the conversions (fp8 scales, bf16, NVFP4 repacking) stay on the host exactly as before, and the existing `clone_htod` copies from pinned memory are DMA copies. Conversion stays on the host because it is already cheap next to the read, and it keeps the mmap and fast paths byte-identical (tested). O_DIRECT falls back to buffered reads when the filesystem refuses (tested on /dev/shm). WGPU, Metal and GGUF keep the mmap path.
+
+Knobs, `[runtime.loader]` in the spec or server config: `enabled` (true), `direct` (true), `chunk_mb` (32), `readers` (4), `ahead` (2).
+
+Disk ceiling: `dd iflag=direct bs=16M` reads 12.1 to 12.5 GB/s on this NVMe. Cold = per-file `dd iflag=nocache` eviction first. Measured with `bench`, RTX PRO 6000 (beside the live vLLM), JIT cache warm unless noted.
+
+| model | path | cache | weights | weight_secs | GB/s | load_secs |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B (1.50 GB) | mmap (before) | cold | 1.50 GB | 0.50 | 3.0 | 0.58 |
+| Qwen3-0.6B | mmap (before) | warm | 1.50 GB | 0.17 | 8.8 | 0.25 |
+| Qwen3-0.6B | fast (after) | cold | 1.50 GB | 0.30 | 5.0 | 0.59 |
+| Qwen3-0.6B | fast (after) | warm | 1.50 GB | 0.34 | 4.4 | 0.63 |
+| 27B NVFP4 (24.78 GB uploaded) | mmap (before) | cold | 24.78 GB | 9.56 | 2.6 | 23.94 (JIT miss) |
+| 27B NVFP4 | mmap (before) | warm | 24.78 GB | 8.15 | 3.0 | 8.26 |
+| 27B NVFP4 | fast (after) | cold | 24.78 GB | 5.28 | 4.7 | 5.57 |
+| 27B NVFP4 | fast (after) | warm | 24.78 GB | 4.88 | 5.1 | 5.14 |
+
+The 27B loads 1.6x to 1.8x faster, cold and warm, and cold is now the same as warm (the read no longer limits it). It is still below the 12 GB/s disk ceiling: the remaining time is the single-threaded host conversion and the synchronous per-tensor copies, not the read. The 0.6B (one 1.5 GB tensor-heavy file) is slightly slower warm (0.34 s vs 0.17 s) because the read buffer is pinned and filled once instead of reading from the page cache; it is a 0.2 s difference. Peak host RSS rises from 5.3 to 8.2 GB on the 27B (pinned ring).
+
+Progress: `specrt::progress` reports stages (compiling kernels, reading weights with bytes done/total, allocating KV cache) through a thread-local sink set by `Engine::load_with_progress` and `ServeOptions::progress`. Core turns it into `EngineEvent::LoadProgress`, the UI model bar, chat page and status bar show it (screenshot `docs/gui/load-progress.png`), and the server reports `loading` in `/health` and `/admin/models`.

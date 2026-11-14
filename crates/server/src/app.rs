@@ -338,6 +338,7 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
         "status": "ok",
         "uptime_secs": state.started.elapsed().as_secs(),
         "loaded_models": state.manager.loaded_snapshot().into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+        "loading": state.manager.loading_snapshot().into_iter().map(|(id, l)| json!({"id": id, "stage": l.stage, "done": l.done, "total": l.total, "elapsed_secs": l.elapsed_secs, "bytes_per_sec": l.bytes_per_sec})).collect::<Vec<_>>(),
     }))
 }
 

@@ -275,6 +275,38 @@ fn the_default_context_is_reduced_to_what_fits_and_a_remembered_one_wins() {
     assert_eq!(crate::load::initial_ctx(None, 8192, &a, None, 1, max), 8192);
 }
 
+fn loading_harness(name: &str, gate: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Harness<'static, App> {
+    use specrt::progress::Stage;
+    let mut h = harness(name, Tab::Chat);
+    let steps = vec![(Stage::Kernels, 1, 1), (Stage::Weights, 0, 30_000_000_000), (Stage::Weights, 12_000_000_000, 30_000_000_000)];
+    h.state_mut().engine = inference_bench_core::engine::Engine::with_factory(h.state().wake.clone(), ScriptedModel::factory_loading(script(), steps, 20, Some(gate)));
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().load_model_with(&m, 4096, 1);
+    h
+}
+
+#[test]
+fn the_model_bar_and_the_chat_show_load_progress_with_the_stage_and_bytes() {
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut h = loading_harness("load-progress", gate.clone());
+    pump_until(&mut h, 10, "progress", |a| a.load_progress.as_ref().is_some_and(|p| p.done == 12_000_000_000));
+    h.run();
+    let p = h.state().load_progress.clone().unwrap();
+    assert_eq!(p.stage, "reading weights");
+    assert_eq!(p.total, 30_000_000_000);
+    assert!(h.query_all_by_label_contains("reading weights").count() >= 1);
+    assert!(h.query_all_by_label_contains("12.0 / 30.0 GB").count() >= 1, "bytes done are shown");
+    h.get_by_label_contains("Loading Qwen3-0.6B");
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    h.render().unwrap().save(out.join("load-progress.png")).unwrap();
+    gate.store(true, std::sync::atomic::Ordering::SeqCst);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    assert!(h.state().load_progress.is_none(), "the bar goes away once the model is loaded");
+}
+
 #[test]
 fn loading_from_the_dialog_uses_the_chosen_context_and_remembers_it() {
     let mut h = harness("load-dialog", Tab::Models);

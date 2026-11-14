@@ -21,6 +21,7 @@ pub mod report;
 pub mod result;
 pub mod serving;
 pub use specrt::chat as specrt_chat;
+pub use specrt::progress as specrt_progress;
 pub use specrt::serve as specrt_serve;
 pub use specrt::logprobs as specrt_logprobs;
 pub use specrt::placement as specrt_placement;

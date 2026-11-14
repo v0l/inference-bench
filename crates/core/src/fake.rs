@@ -170,6 +170,20 @@ impl ScriptedModel {
         Self::factory_probed(script, Default::default()).0
     }
 
+    pub fn factory_loading(script: Script, steps: Vec<(specrt::progress::Stage, u64, u64)>, step_ms: u64, gate: Option<Arc<std::sync::atomic::AtomicBool>>) -> crate::native::Factory {
+        let inner = Self::factory(script);
+        Arc::new(move |model, ctx| {
+            for &(stage, done, total) in &steps {
+                specrt::progress::report(stage, done, total);
+                thread::sleep(Duration::from_millis(step_ms));
+            }
+            while gate.as_ref().is_some_and(|g| !g.load(std::sync::atomic::Ordering::SeqCst)) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            inner(model, ctx)
+        })
+    }
+
     pub fn factory_probed(script: Script, thinking: specrt::chat::Thinking) -> (crate::native::Factory, Arc<Mutex<Vec<serde_json::Value>>>) {
         let templates = Arc::new(Mutex::new(Vec::new()));
         let seen = templates.clone();

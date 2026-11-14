@@ -70,6 +70,10 @@ impl Target for ServingTarget {
         Capabilities { streaming: true, logits: false, memory: false, vision: self.serving.as_ref().is_some_and(|s| s.accepts_media()), thinking: self.serving.as_ref().map(|s| s.thinking()).unwrap_or_default(), logprobs: true, batched: true }
     }
 
+    fn set_progress(&mut self, sink: Option<specrt::progress::Sink>) {
+        self.opts.progress = sink;
+    }
+
     fn load(&mut self, model: &str) -> Result<(), BackendError> {
         self.serving = None;
         let s = Serving::load(model, self.opts.clone()).map_err(|e| engine_error(&e))?;

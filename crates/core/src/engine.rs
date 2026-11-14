@@ -52,6 +52,7 @@ pub enum ChatEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineEvent {
     Loading(String),
+    LoadProgress { stage: String, done: u64, total: u64 },
     Loaded(Loaded),
     LoadFailed(BackendError),
     Unloaded,
@@ -267,9 +268,11 @@ fn open(
     factory: &Factory,
     serving: &ServingFactory,
     stats: &StatsSource,
+    progress: &specrt::progress::Sink,
 ) -> Result<Opened, BackendError> {
     let mut note = None;
     if let Some(mut target) = (seqs > 1).then(|| serving(serve_options(max_ctx, seqs))).flatten() {
+        target.set_progress(Some(progress.clone()));
         match target.load(model_id) {
             Ok(()) => {
                 let caps = target.capabilities();
@@ -283,6 +286,7 @@ fn open(
         }
     }
     let mut native = Native::with_factory(max_ctx, factory.clone());
+    native.set_progress(Some(progress.clone()));
     native.load(model_id)?;
     let caps = native.capabilities();
     Ok(Opened { backend: Backend::Single(native), vision: caps.vision, thinking: caps.thinking, seqs: 1, note })
@@ -321,7 +325,14 @@ fn run(
                 emit(EngineEvent::Loading(display.clone()));
                 let started = Instant::now();
                 let seqs = max_num_seqs.unwrap_or(1).max(1);
-                match open(&model_id, max_ctx, seqs, &factory, &serving, &shared.stats) {
+                let sink = {
+                    let (events, wake) = (events.clone(), wake.clone());
+                    specrt::progress::Sink::new(move |p| {
+                        let _ = events.send(EngineEvent::LoadProgress { stage: p.stage.label().to_string(), done: p.done, total: p.total });
+                        wake();
+                    })
+                };
+                match open(&model_id, max_ctx, seqs, &factory, &serving, &shared.stats, &sink) {
                     Ok(o) => {
                         backend = Some(o.backend);
                         let ctx = max_ctx.unwrap_or(specrt::engine::DEFAULT_CTX);
