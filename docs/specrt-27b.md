@@ -258,25 +258,36 @@ error). The CPU references take about 95 s each on 24 threads, with 3.7 GB of an
 
 ## Fast weight loading (#583)
 
-Technique review of InstantTensor for a single-GPU Rust loader. Used: O_DIRECT reads into aligned buffers, large chunks with several reads in flight, a read-ahead thread so the next layer is read while the previous one converts and uploads. Not used: GPUDirect Storage (cuFile, needs libcufile and a supporting filesystem; not installed here) and multi-rank distribution (single GPU).
+Technique review of InstantTensor for a single-GPU Rust loader. Used: O_DIRECT reads into aligned buffers, large chunks with several reads in flight, read-ahead so later groups are read while earlier ones convert and upload, and copies on their own streams. Not used: GPUDirect Storage (cuFile needs libcufile and a supporting filesystem; neither is installed here) and multi-rank distribution (single GPU).
 
-`crates/specrt/src/loader.rs`: one reader thread reads each layer's tensors (`ahead` groups queued) with `readers` threads doing `chunk_mb` O_DIRECT `pread`s into a pinned host buffer (`cuMemHostAlloc`, 64 MB classes, recycled). The tensor views point into that buffer, so the conversions (fp8 scales, bf16, NVFP4 repacking) stay on the host exactly as before, and the existing `clone_htod` copies from pinned memory are DMA copies. Conversion stays on the host because it is already cheap next to the read, and it keeps the mmap and fast paths byte-identical (tested). O_DIRECT falls back to buffered reads when the filesystem refuses (tested on /dev/shm). WGPU, Metal and GGUF keep the mmap path.
+How it works (`crates/specrt/src/loader.rs`, `load_weights` in `crates/specrt/src/runtime.rs`):
 
-Knobs, `[runtime.loader]` in the spec or server config: `enabled` (true), `direct` (true), `chunk_mb` (32), `readers` (4), `ahead` (2).
+- The weights are split into groups: group 0 is the embedding, final norm, `lm_head` and the MTP layer, then one group per decoder layer. Group 0 goes first because it is the largest (5 GB with the MTP draft head quantized to NVFP4) and would otherwise finish last.
+- A reader thread reads each group's tensors with `readers` threads doing `chunk_mb` O_DIRECT `pread`s into one aligned host buffer, at most `ahead` groups ahead of the workers. O_DIRECT falls back to buffered reads when the filesystem refuses (tested on /dev/shm).
+- `workers` threads each take the next group, convert it on the host (fp8 scales, bf16, NVFP4 repacking, gate/up interleave) straight from the read buffer, and copy it with `cuMemcpyHtoDAsync` on that worker's own stream. Each worker records an event after its copies and waits on it before the buffer goes back to the pool, so a buffer is never reused while a copy still reads it. Conversion stays on the host: it is byte-identical to the mmap path (tested on the bf16 and fp8 tiny fixtures), it runs in parallel across groups, and the NVFP4 head and global-scale passes are split across threads.
+- If at least 95% of the checkpoint is already in the page cache (`mincore`), the reader is skipped and the workers convert straight from the mmap. Reading through O_DIRECT again would only copy memory that is already there. Pages are released per group after upload.
 
-Disk ceiling: `dd iflag=direct bs=16M` reads 12.1 to 12.5 GB/s on this NVMe. Cold = per-file `dd iflag=nocache` eviction first. Measured with `bench`, RTX PRO 6000 (beside the live vLLM), JIT cache warm unless noted.
+Knobs, `[runtime.loader]` in the spec or server config: `enabled` (true), `direct` (true), `chunk_mb` (32), `readers` (8), `ahead` (2), `workers` (4), `lanes` (1, reader threads that read different groups at once), `skip_cached` (true), `pinned` (false).
 
-| model | path | cache | weights | weight_secs | GB/s | load_secs |
+Disk ceiling: `dd iflag=direct bs=16M` reads 12.1 to 12.5 GB/s from one file. All six 27B shards read in parallel with `dd iflag=direct` take 2.40 s for 24.7 GB (10.3 GB/s). Cold means each file was evicted first (`dd iflag=nocache count=0`); warm means `cat` of every shard first. With O_DIRECT a cold load leaves the page cache cold. Measured with `bench`, RTX PRO 6000 beside the live vLLM, kernel cache warm. Before and after were alternated. The table gives the median of three.
+
+| model | path | cache | weight_secs | GB/s | load_secs | peak host RSS |
 |---|---|---|---|---|---|---|
-| Qwen3-0.6B (1.50 GB) | mmap (before) | cold | 1.50 GB | 0.50 | 3.0 | 0.58 |
-| Qwen3-0.6B | mmap (before) | warm | 1.50 GB | 0.17 | 8.8 | 0.25 |
-| Qwen3-0.6B | fast (after) | cold | 1.50 GB | 0.30 | 5.0 | 0.59 |
-| Qwen3-0.6B | fast (after) | warm | 1.50 GB | 0.34 | 4.4 | 0.63 |
-| 27B NVFP4 (24.78 GB uploaded) | mmap (before) | cold | 24.78 GB | 9.56 | 2.6 | 23.94 (JIT miss) |
-| 27B NVFP4 | mmap (before) | warm | 24.78 GB | 8.15 | 3.0 | 8.26 |
-| 27B NVFP4 | fast (after) | cold | 24.78 GB | 5.28 | 4.7 | 5.57 |
-| 27B NVFP4 | fast (after) | warm | 24.78 GB | 4.88 | 5.1 | 5.14 |
+| Qwen3-0.6B (1.50 GB) | mmap (before) | cold | 0.55 | 2.7 | 0.83 | 0.52 GB |
+| Qwen3-0.6B | mmap (before) | warm | 0.25 | 6.0 | 0.52 | 0.52 GB |
+| Qwen3-0.6B | fast (after) | cold | 0.20 | 7.5 | 0.47 | 1.03 GB |
+| Qwen3-0.6B | fast (after) | warm | 0.17 | 8.8 | 0.45 | 0.66 GB |
+| 27B NVFP4 (24.78 GB uploaded) | mmap (before) | cold | 9.01 | 2.8 | 9.31 | 5.30 GB |
+| 27B NVFP4 | mmap (before) | warm | 4.11 | 6.0 | 4.42 | 5.31 GB |
+| 27B NVFP4 | fast (after) | cold | 3.13 | 7.9 | 3.41 | 9.45 GB |
+| 27B NVFP4 | fast (after) | warm | 2.42 | 10.2 | 2.73 | 8.86 GB |
 
-The 27B loads 1.6x to 1.8x faster, cold and warm, and cold is now the same as warm (the read no longer limits it). It is still below the 12 GB/s disk ceiling: the remaining time is the single-threaded host conversion and the synchronous per-tensor copies, not the read. The 0.6B (one 1.5 GB tensor-heavy file) is slightly slower warm (0.34 s vs 0.17 s) because the read buffer is pinned and filled once instead of reading from the page cache; it is a 0.2 s difference. Peak host RSS rises from 5.3 to 8.2 GB on the 27B (pinned ring).
+The 27B loads 2.9x faster cold and 1.7x faster warm. Warm is at the 2.4 s parallel-read ceiling. Cold is 0.7 s above it. What limits each case, measured with per-group timers:
 
-Progress: `specrt::progress` reports stages (compiling kernels, reading weights with bytes done/total, allocating KV cache) through a thread-local sink set by `Engine::load_with_progress` and `ServeOptions::progress`. Core turns it into `EngineEvent::LoadProgress`, the UI model bar, chat page and status bar show it (screenshot `docs/gui/load-progress.png`), and the server reports `loading` in `/health` and `/admin/models`.
+- Warm: the four workers spend 14.5 s in total converting and copying 66 groups. Group 0 alone takes 1.05 s (the 2.5 GB bf16 `lm_head` plus quantizing the MTP draft head to NVFP4), so it sets the floor while the layers spread across the other workers. More workers (8, 12) gave 2.17 to 2.31 s at up to 11.4 GB RSS. The NVFP4 draft-head quantize could move to a GPU kernel (`nvfp4.rs` has no device quantizer yet), which would cut about 0.6 s from group 0.
+- Cold: the reader is the long pole at 3.0 s for 24.7 GB (8.2 GB/s), against 2.4 s for six parallel `dd`s. Reading several groups at once (`lanes` = 2 or 4) was slower (3.5 to 3.75 s) and used 12 to 14 GB RSS. More readers or larger chunks (16 x 16 MB, 8 x 64 MB) changed nothing (3.29 to 3.37 s).
+- Pinned buffers (`pinned = true`, `cuMemHostAlloc`) made cold loads slower: 3.30 to 3.42 s, against 2.92 s with aligned heap buffers. Each 256 to 384 MB allocation took 30 to 90 ms, and the copy from pageable memory is not the bottleneck. So pinned buffers are off by default and stay as an option.
+- Peak RSS: 8.9 to 9.5 GB, against 5.3 GB before. Most of it is group 0: the 5 GB read buffer plus its bf16 and NVFP4 copies. With `ahead` = 1 and `workers` = 1, peak RSS was still 7.5 GB at 3.9 s, so the ring (`chunk_mb` x `readers` x `ahead`) is not what adds the memory. Splitting group 0 across workers (the embedding, the head and the MTP layer each on its own) would lower the peak.
+- The 0.6B is now faster both ways: 0.17 s warm, against 0.25 s before (the page-cache check sends it down the mmap path), and 0.20 s cold, against 0.55 s.
+
+Progress: `specrt::progress` reports stages (compiling kernels, reading weights with bytes done and total, allocating KV cache) through a thread-local sink. `Engine::load_with_progress` and `ServeOptions::progress` set the sink, and the load workers inherit it. Core turns it into `EngineEvent::LoadProgress`. The UI model bar, chat page and status bar show it (screenshot `docs/gui/load-progress.png`), and the server reports `loading` in `/health` and `/admin/models`.

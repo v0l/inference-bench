@@ -27,12 +27,8 @@ pub use stage::{StageRange, StageRole};
 pub use step::{DecodeRow, GRAPH_SIZES, Stepper, pad_rows};
 
 fn weight_groups(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole) -> Vec<Vec<String>> {
-    if !ck.is_safetensors() {
-        return Vec::new();
-    }
     let root = ck.root();
-    let mut groups: Vec<Vec<String>> =
-        (0..spec.layers.count).map(|i| ck.names_under(&format!("{root}.layers.{}.", range.start + i))).collect();
+    let mut groups = Vec::new();
     let embed = format!("{root}.embed_tokens.weight");
     let mut outside = Vec::new();
     if role.first || (role.last && spec.dims.tie_embeddings) {
@@ -42,9 +38,209 @@ fn weight_groups(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRol
         outside.push(format!("{root}.norm.weight"));
         outside.push("lm_head.weight".to_string());
     }
-    groups.push(ck.tensor_names(&outside));
-    groups.push(if spec.speculative().is_some() { ck.names_under("mtp.") } else { Vec::new() });
+    let mut first = ck.tensor_names(&outside);
+    if spec.speculative().is_some() {
+        first.extend(ck.names_under("mtp."));
+    }
+    groups.push(first);
+    groups.extend((0..spec.layers.count).map(|i| ck.names_under(&format!("{root}.layers.{}.", range.start + i))));
     groups
+}
+
+#[derive(Clone, Copy)]
+enum Work {
+    Outside,
+    Layer(usize),
+}
+
+impl Work {
+    fn of(group: usize) -> Work {
+        match group {
+            0 => Work::Outside,
+            n => Work::Layer(n - 1),
+        }
+    }
+}
+
+enum Uploaded {
+    Outside(CudaSlice<u16>, CudaSlice<f32>, DeviceMatrix),
+    Head(Box<Uploaded>, Option<mtp::DeviceMtp>),
+    Layer(usize, DeviceLayer),
+}
+
+struct Weights {
+    layers: Vec<DeviceLayer>,
+    embed: CudaSlice<u16>,
+    norm: CudaSlice<f32>,
+    lm_head: DeviceMatrix,
+    mtp: Option<mtp::DeviceMtp>,
+    direct: bool,
+}
+
+fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize, global: usize) -> Result<DeviceLayer> {
+    let l = ck.layer_at(spec, i, global).with_context(|| format!("layer {global}"))?;
+    let up_m = |m: &Matrix| DeviceMatrix::upload(stream, m);
+    let up_opt = |v: &Option<Vec<f32>>| -> Result<Option<CudaSlice<f32>>> {
+        Ok(match v {
+            Some(v) => Some(stream.clone_htod(v)?),
+            None => None,
+        })
+    };
+    let before = |linear: bool| (0..i).filter(|&j| spec.block(j).is_linear() == linear).count() as i32;
+    let mixer = match &l.mixer {
+        Mixer::Attention(a) => DeviceMixer::Attention(DeviceAttn {
+            qkv: up_m(&a.qkv)?,
+            qkv_bias: up_opt(&a.qkv_bias)?,
+            q_norm: up_opt(&a.q_norm)?,
+            k_norm: up_opt(&a.k_norm)?,
+            o: up_m(&a.o)?,
+            kv: before(false),
+        }),
+        Mixer::Linear(g) => DeviceMixer::Linear(DeviceGdn {
+            in_proj: up_m(&g.in_proj)?,
+            ba: up_m(&g.ba)?,
+            conv: stream.clone_htod(&g.conv)?,
+            neg_a: stream.clone_htod(&g.neg_a)?,
+            dt_bias: stream.clone_htod(&g.dt_bias)?,
+            norm: stream.clone_htod(&g.norm)?,
+            out: up_m(&g.out)?,
+            slot: before(true),
+        }),
+    };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)? };
+    copied(stream)?;
+    Ok(layer)
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        let _ = self.stream.synchronize();
+    }
+}
+
+fn copied(stream: &Arc<CudaStream>) -> Result<()> {
+    let done = stream.record_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_BLOCKING_SYNC))?;
+    done.synchronize()?;
+    Ok(())
+}
+
+fn upload_outside(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: StageRole) -> Result<Uploaded> {
+    let up = if role.whole() {
+        let o = ck.outside(spec)?;
+        Uploaded::Outside(stream.clone_htod(o.embed.as_ref())?, stream.clone_htod(&o.norm)?, DeviceMatrix::upload(stream, &o.lm_head)?)
+    } else {
+        let embed = if role.first { stream.clone_htod(ck.embedding(spec)?.as_ref())? } else { stream.alloc_zeros(1)? };
+        let (norm, lm_head) = if role.last {
+            let (norm, head) = ck.head(spec)?;
+            (stream.clone_htod(&norm)?, DeviceMatrix::upload(stream, &head)?)
+        } else {
+            (stream.alloc_zeros(1)?, DeviceMatrix::Bf16(stream.alloc_zeros(1)?))
+        };
+        Uploaded::Outside(embed, norm, lm_head)
+    };
+    copied(stream)?;
+    Ok(up)
+}
+
+fn upload_group(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole, work: Work) -> Result<Uploaded> {
+    match work {
+        Work::Outside => {
+            let outside = upload_outside(stream, ck, spec, role)?;
+            Ok(Uploaded::Head(Box::new(outside), mtp::DeviceMtp::load(stream, ck, spec)?))
+        }
+        Work::Layer(i) => Ok(Uploaded::Layer(i, upload_layer(stream, ck, spec, i, range.start + i)?)),
+    }
+}
+
+fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole) -> Result<Weights> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let opts = &spec.runtime.loader;
+    let groups = weight_groups(ck, spec, range, role);
+    let count = groups.len();
+    let names = groups.clone();
+    let feed = Mutex::new(Feed::new(ck, groups, opts, ctx)?);
+    let direct = feed.lock().unwrap().direct();
+    let reader = feed.lock().unwrap().reader();
+    let next = Mutex::new(0usize);
+    let failed = AtomicBool::new(false);
+    let results: Mutex<Vec<Uploaded>> = Mutex::new(Vec::with_capacity(count));
+    let errors: Mutex<Vec<anyhow::Error>> = Mutex::new(Vec::new());
+    let sink = crate::progress::current();
+    let workers = opts.workers.min(count).max(1);
+    let streams = (0..workers).map(|_| ctx.new_stream()).collect::<Result<Vec<_>, _>>()?;
+    std::thread::scope(|s| {
+        for ws in &streams {
+            let (feed, next, failed, results, errors, sink, names) = (&feed, &next, &failed, &results, &errors, sink.clone(), &names);
+            s.spawn(move || {
+                crate::progress::with_sink(sink, || {
+                    let _ = ctx.bind_to_thread();
+                    while !failed.load(Ordering::Relaxed) {
+                        let claimed = {
+                            let mut n = next.lock().unwrap();
+                            if *n >= count {
+                                break;
+                            }
+                            let g = *n;
+                            *n += 1;
+                            g
+                        };
+                        let reader = feed.lock().unwrap().reader();
+                        let claimed = match reader {
+                            Some(r) => r.take(claimed).map(|b| (claimed, Some(b))),
+                            None => Ok((claimed, None)),
+                        };
+                        let outcome = claimed.and_then(|(g, batch)| {
+                            let view = ck.with_staged(batch);
+                            let up = upload_group(ws, &view, spec, range, role, Work::of(g))?;
+                            if !view.has_staged() {
+                                view.release_names(&names[g]);
+                            }
+                            drop(view);
+                            Ok((g, up))
+                        });
+                        match outcome {
+                            Ok((g, up)) => {
+                                results.lock().unwrap().push(up);
+                                feed.lock().unwrap().finished(g);
+                            }
+                            Err(e) => {
+                                failed.store(true, Ordering::Relaxed);
+                                errors.lock().unwrap().push(e);
+                            }
+                        }
+                    }
+                })
+            });
+        }
+    });
+    if let Some(e) = errors.into_inner().unwrap().into_iter().next() {
+        return Err(e);
+    }
+    drop(feed);
+    drop(reader);
+    ck.release();
+    for ws in &streams {
+        ws.synchronize()?;
+    }
+    stream.synchronize()?;
+    let mut layers: Vec<Option<DeviceLayer>> = (0..spec.layers.count).map(|_| None).collect();
+    let (mut outside, mut mtp) = (None, None);
+    for up in results.into_inner().unwrap() {
+        match up {
+            Uploaded::Layer(i, l) => layers[i] = Some(l),
+            Uploaded::Head(o, m) => {
+                if let Uploaded::Outside(e, n, h) = *o {
+                    outside = Some((e, n, h));
+                }
+                mtp = Some(m);
+            }
+            Uploaded::Outside(e, n, h) => outside = Some((e, n, h)),
+        }
+    }
+    let (embed, norm, lm_head) = outside.context("the embedding and head were not loaded")?;
+    let layers = layers.into_iter().enumerate().map(|(i, l)| l.with_context(|| format!("layer {} was not loaded", range.start + i))).collect::<Result<Vec<_>>>()?;
+    Ok(Weights { layers, embed, norm, lm_head, mtp: mtp.flatten(), direct })
 }
 
 enum DeviceMatrix {
@@ -567,82 +763,10 @@ impl Runtime {
         }
         let smem = module.smem.clone();
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
-        let mut checkpoint = Checkpoint::for_repo(&spec.repo)?;
+        let checkpoint = Checkpoint::for_repo(&spec.repo)?;
         let weights_started = Instant::now();
-        let mut feed = Feed::new(&checkpoint, weight_groups(&checkpoint, spec, range, role), &spec.runtime.loader, spec.runtime.loader.enabled, &ctx)?;
-        let up_m = |m: &Matrix| DeviceMatrix::upload(&stream, m);
-        let up_opt = |v: &Option<Vec<f32>>| -> Result<Option<CudaSlice<f32>>> {
-            Ok(match v {
-                Some(v) => Some(stream.clone_htod(v)?),
-                None => None,
-            })
-        };
-        let mut layers = Vec::with_capacity(spec.layers.count);
-        let (mut kv, mut slot) = (0i32, 0i32);
-        for i in 0..spec.layers.count {
-            feed.advance(&mut checkpoint)?;
-            let l = checkpoint.layer_at(spec, i, range.start + i).with_context(|| format!("layer {}", range.start + i))?;
-            let mixer = match &l.mixer {
-                Mixer::Attention(a) => {
-                    kv += 1;
-                    DeviceMixer::Attention(DeviceAttn {
-                        qkv: up_m(&a.qkv)?,
-                        qkv_bias: up_opt(&a.qkv_bias)?,
-                        q_norm: up_opt(&a.q_norm)?,
-                        k_norm: up_opt(&a.k_norm)?,
-                        o: up_m(&a.o)?,
-                        kv: kv - 1,
-                    })
-                }
-                Mixer::Linear(g) => {
-                    slot += 1;
-                    DeviceMixer::Linear(DeviceGdn {
-                        in_proj: up_m(&g.in_proj)?,
-                        ba: up_m(&g.ba)?,
-                        conv: stream.clone_htod(&g.conv)?,
-                        neg_a: stream.clone_htod(&g.neg_a)?,
-                        dt_bias: stream.clone_htod(&g.dt_bias)?,
-                        norm: stream.clone_htod(&g.norm)?,
-                        out: up_m(&g.out)?,
-                        slot: slot - 1,
-                    })
-                }
-            };
-            layers.push(DeviceLayer {
-                ln1: stream.clone_htod(&l.ln1)?,
-                ln2: stream.clone_htod(&l.ln2)?,
-                mixer,
-                gate_up: up_m(&l.gate_up)?,
-                down: up_m(&l.down)?,
-            });
-            stream.synchronize()?;
-            drop(l);
-            feed.complete(&mut checkpoint);
-            checkpoint.release();
-        }
-        feed.advance(&mut checkpoint)?;
-        let (embed, norm, lm_head) = if role.whole() {
-            let outside = checkpoint.outside(spec)?;
-            let loaded = (stream.clone_htod(outside.embed.as_ref())?, stream.clone_htod(&outside.norm)?, up_m(&outside.lm_head)?);
-            stream.synchronize()?;
-            loaded
-        } else {
-            let embed = if role.first { stream.clone_htod(checkpoint.embedding(spec)?.as_ref())? } else { stream.alloc_zeros(1)? };
-            let (norm, lm_head) = if role.last {
-                let (norm, head) = checkpoint.head(spec)?;
-                (stream.clone_htod(&norm)?, up_m(&head)?)
-            } else {
-                (stream.alloc_zeros(1)?, DeviceMatrix::Bf16(stream.alloc_zeros(1)?))
-            };
-            stream.synchronize()?;
-            (embed, norm, lm_head)
-        };
-        feed.complete(&mut checkpoint);
-        checkpoint.release();
-        feed.advance(&mut checkpoint)?;
-        let mtp_weights = mtp::DeviceMtp::load(&stream, &checkpoint, spec)?;
-        feed.complete(&mut checkpoint);
-        checkpoint.release();
+        let Weights { layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct } =
+            load_weights(&ctx, &stream, &checkpoint, spec, range, role)?;
         let weight_secs = weights_started.elapsed().as_secs_f64();
         let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
             + (embed.num_bytes() + norm.num_bytes()) as u64
@@ -841,6 +965,7 @@ impl Runtime {
             jit_secs = jit_secs,
             arch = %rt.arch,
             shards = checkpoint.files.len(),
+            weights_direct,
             weight_bytes = rt.weight_bytes,
             weight_secs = rt.weight_secs,
             peak_host_rss_bytes = rt.peak_host_rss_bytes,

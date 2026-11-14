@@ -100,9 +100,9 @@ struct Shard {
 }
 
 pub struct Checkpoint {
-    gguf: Option<Gguf>,
-    shards: Vec<Shard>,
-    names: HashMap<String, usize>,
+    gguf: Option<std::sync::Arc<Gguf>>,
+    shards: std::sync::Arc<Vec<Shard>>,
+    names: std::sync::Arc<HashMap<String, usize>>,
     staged: Option<crate::loader::Batch>,
     pub files: Vec<PathBuf>,
 }
@@ -131,7 +131,7 @@ fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
 impl Checkpoint {
     pub fn open(dir: &Path) -> Result<Self> {
         if dir.extension().is_some_and(|e| e == "gguf") {
-            return Ok(Checkpoint { gguf: Some(Gguf::open(dir)?), shards: Vec::new(), names: HashMap::new(), staged: None, files: vec![dir.to_path_buf()] });
+            return Ok(Checkpoint { gguf: Some(std::sync::Arc::new(Gguf::open(dir)?)), shards: Default::default(), names: Default::default(), staged: None, files: vec![dir.to_path_buf()] });
         }
         let files = shard_files(dir)?;
         let mut shards = Vec::with_capacity(files.len());
@@ -148,7 +148,7 @@ impl Checkpoint {
             }
             shards.push(Shard { map, data_start: 8 + header, meta });
         }
-        Ok(Checkpoint { gguf: None, shards, names, staged: None, files })
+        Ok(Checkpoint { gguf: None, shards: std::sync::Arc::new(shards), names: std::sync::Arc::new(names), staged: None, files })
     }
 
     pub fn for_repo(repo: &str) -> Result<Self> {
@@ -201,15 +201,57 @@ impl Checkpoint {
         self.gguf.is_none()
     }
 
-    pub fn stage(&mut self, batch: Option<crate::loader::Batch>) {
-        self.staged = batch;
+    pub fn has_staged(&self) -> bool {
+        self.staged.is_some()
+    }
+
+    pub fn release_names(&self, names: &[String]) {
+        let page = 4096usize;
+        for name in names {
+            let Some(&i) = self.names.get(name) else { continue };
+            let sh = &self.shards[i];
+            let Ok(info) = sh.meta.info(name).context("tensor info") else { continue };
+            let (from, to) = info.data_offsets;
+            let start = (sh.data_start + from).div_ceil(page) * page;
+            let end = (sh.data_start + to) / page * page;
+            if end > start {
+                let _ = unsafe { sh.map.unchecked_advise_range(UncheckedAdvice::DontNeed, start, end - start) };
+            }
+        }
+    }
+
+    pub fn resident_fraction(&self) -> f64 {
+        let page = 4096usize;
+        let (mut resident, mut total) = (0usize, 0usize);
+        for sh in self.shards.iter() {
+            let len = sh.map.len();
+            if len == 0 {
+                continue;
+            }
+            let mut vec = vec![0u8; len.div_ceil(page)];
+            let ok = unsafe { libc::mincore(sh.map.as_ptr() as *mut libc::c_void, len, vec.as_mut_ptr()) } == 0;
+            if !ok {
+                return 0.0;
+            }
+            resident += vec.iter().filter(|&&b| b & 1 == 1).count();
+            total += vec.len();
+        }
+        if total == 0 { 0.0 } else { resident as f64 / total as f64 }
+    }
+
+    pub fn cached(&self, opts: &crate::loader::LoaderOptions) -> bool {
+        opts.skip_cached && self.is_safetensors() && self.resident_fraction() >= 0.95
+    }
+
+    pub fn with_staged(&self, batch: Option<crate::loader::Batch>) -> Checkpoint {
+        Checkpoint { gguf: self.gguf.clone(), shards: self.shards.clone(), names: self.names.clone(), staged: batch, files: self.files.clone() }
     }
 
     pub fn release(&self) {
         if let Some(g) = &self.gguf {
             g.release();
         }
-        for s in &self.shards {
+        for s in self.shards.iter() {
             let _ = unsafe { s.map.unchecked_advise(UncheckedAdvice::DontNeed) };
         }
     }
@@ -654,7 +696,12 @@ pub fn quantize_fp8_channel(w: &[u16], cols: usize) -> (Vec<u8>, Vec<f32>) {
 }
 
 pub fn nvfp4_global_scale(w: &[u16]) -> f32 {
-    let amax = w.iter().map(|&v| bf16_to_f32(v).abs()).fold(0f32, f32::max);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = w.len().div_ceil(threads).max(1 << 16);
+    let amax = std::thread::scope(|s| {
+        let parts: Vec<_> = w.chunks(per).map(|c| s.spawn(move || c.iter().map(|&v| bf16_to_f32(v).abs()).fold(0f32, f32::max))).collect();
+        parts.into_iter().map(|h| h.join().unwrap_or(f32::NAN)).fold(0f32, f32::max)
+    });
     if amax == 0.0 { 1.0 } else { 448.0 * 6.0 / amax }
 }
 
@@ -1051,12 +1098,10 @@ mod tests {
 }
 
 pub struct Feed {
-    groups: Vec<Vec<String>>,
-    next: usize,
     done: u64,
     total: u64,
     sizes: Vec<u64>,
-    reader: Option<crate::loader::Prefetcher>,
+    reader: Option<std::sync::Arc<crate::loader::Prefetcher>>,
 }
 
 impl Feed {
@@ -1064,7 +1109,6 @@ impl Feed {
         ck: &Checkpoint,
         groups: Vec<Vec<String>>,
         opts: &crate::loader::LoaderOptions,
-        fast: bool,
         ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
     ) -> Result<Feed> {
         let mut items = Vec::with_capacity(groups.len());
@@ -1073,13 +1117,13 @@ impl Feed {
         }
         let sizes: Vec<u64> = items.iter().map(|g| g.iter().map(|i| i.len).sum()).collect();
         let total = sizes.iter().sum();
-        let reader = if fast && !groups.is_empty() {
-            Some(crate::loader::Prefetcher::start(&ck.files, items, *opts, Some(ctx.clone()))?)
+        let reader = if opts.enabled && ck.is_safetensors() && !groups.is_empty() && !ck.cached(opts) {
+            Some(std::sync::Arc::new(crate::loader::Prefetcher::start(&ck.files, items, *opts, Some(ctx.clone()))?))
         } else {
             None
         };
         crate::progress::report(crate::progress::Stage::Weights, 0, total);
-        Ok(Feed { groups, next: 0, done: 0, total, sizes, reader })
+        Ok(Feed { done: 0, total, sizes, reader })
     }
 
     pub fn direct(&self) -> bool {
@@ -1090,24 +1134,14 @@ impl Feed {
         self.total
     }
 
-    pub fn advance(&mut self, ck: &mut Checkpoint) -> Result<()> {
-        if self.groups.is_empty() {
-            return Ok(());
-        }
-        ensure!(self.next < self.groups.len(), "the weight plan has no group {}", self.next);
-        self.next += 1;
-        if let Some(r) = &self.reader {
-            ck.stage(Some(r.next()?));
-        }
-        Ok(())
+    pub fn reader(&self) -> Option<std::sync::Arc<crate::loader::Prefetcher>> {
+        self.reader.clone()
     }
 
-    pub fn complete(&mut self, ck: &mut Checkpoint) {
-        ck.stage(None);
-        if self.groups.is_empty() {
-            return;
+    pub fn finished(&mut self, group: usize) {
+        if let Some(&size) = self.sizes.get(group) {
+            self.done += size;
+            crate::progress::report(crate::progress::Stage::Weights, self.done, self.total);
         }
-        self.done += self.sizes[self.next - 1];
-        crate::progress::report(crate::progress::Stage::Weights, self.done, self.total);
     }
 }

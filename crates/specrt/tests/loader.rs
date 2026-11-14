@@ -5,6 +5,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 fn spec(dir: &str, enabled: bool, direct: bool) -> Spec {
+    spec_with(dir, enabled, direct, false)
+}
+
+fn spec_with(dir: &str, enabled: bool, direct: bool, pinned: bool) -> Spec {
     let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(dir);
     let mut s = Spec::from_hf_config(&std::fs::read_to_string(d.join("config.json")).unwrap()).unwrap();
     s.name = dir.into();
@@ -12,6 +16,9 @@ fn spec(dir: &str, enabled: bool, direct: bool) -> Spec {
     s.runtime.loader.enabled = enabled;
     s.runtime.loader.direct = direct;
     s.runtime.loader.chunk_mb = 1;
+    s.runtime.loader.skip_cached = false;
+    s.runtime.loader.pinned = pinned;
+    s.runtime.loader.workers = 3;
     s
 }
 
@@ -30,10 +37,10 @@ fn logits(s: &Spec) -> (Vec<f32>, Vec<Progress>) {
 fn the_fast_loader_uploads_the_same_weights_as_the_mmap_path() {
     for dir in ["tiny-qwen3.5", "tiny-qwen3.5-fp8"] {
         let (mmap, _) = logits(&spec(dir, false, false));
-        for direct in [true, false] {
-            let (fast, _) = logits(&spec(dir, true, direct));
+        for (direct, pinned) in [(true, false), (false, false), (true, true)] {
+            let (fast, _) = logits(&spec_with(dir, true, direct, pinned));
             assert_eq!(mmap.len(), fast.len());
-            assert!(mmap.iter().zip(&fast).all(|(a, b)| a.to_bits() == b.to_bits()), "{dir} direct={direct}");
+            assert!(mmap.iter().zip(&fast).all(|(a, b)| a.to_bits() == b.to_bits()), "{dir} direct={direct} pinned={pinned}");
         }
     }
 }
@@ -56,4 +63,19 @@ fn load_progress_is_monotonic_and_the_weights_end_at_their_total() {
         v
     });
     assert_eq!(stages, vec![Stage::Kernels, Stage::Weights, Stage::KvCache]);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_model_already_in_the_page_cache_loads_through_the_mmap_path_with_the_same_weights() {
+    let mut cached = spec("tiny-qwen3.5", true, true);
+    cached.runtime.loader.skip_cached = true;
+    let ck = specrt::weights::Checkpoint::for_repo(&cached.repo).unwrap();
+    for f in &ck.files {
+        std::fs::read(f).unwrap();
+    }
+    assert!(ck.cached(&cached.runtime.loader));
+    let (a, _) = logits(&cached);
+    let (b, _) = logits(&spec("tiny-qwen3.5", false, false));
+    assert!(a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()));
 }

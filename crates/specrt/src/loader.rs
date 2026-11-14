@@ -7,7 +7,6 @@ use std::fs::File;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -24,11 +23,15 @@ pub struct LoaderOptions {
     pub chunk_mb: usize,
     pub readers: usize,
     pub ahead: usize,
+    pub workers: usize,
+    pub lanes: usize,
+    pub skip_cached: bool,
+    pub pinned: bool,
 }
 
 impl Default for LoaderOptions {
     fn default() -> Self {
-        LoaderOptions { enabled: true, direct: true, chunk_mb: 32, readers: 4, ahead: 2 }
+        LoaderOptions { enabled: true, direct: true, chunk_mb: 32, readers: 8, ahead: 2, workers: 4, lanes: 1, skip_cached: true, pinned: false }
     }
 }
 
@@ -41,6 +44,8 @@ impl LoaderOptions {
         ensure!(self.chunk_mb >= 1, "[runtime.loader] chunk_mb needs at least 1");
         ensure!((1..=64).contains(&self.readers), "[runtime.loader] readers must be between 1 and 64");
         ensure!(self.ahead >= 1, "[runtime.loader] ahead needs at least 1");
+        ensure!((1..=64).contains(&self.workers), "[runtime.loader] workers must be between 1 and 64");
+        ensure!((1..=16).contains(&self.lanes), "[runtime.loader] lanes must be between 1 and 16");
         Ok(())
     }
 }
@@ -95,11 +100,16 @@ impl Drop for Host {
 pub struct Pool {
     ctx: Option<Arc<CudaContext>>,
     free: Mutex<Vec<Host>>,
+    keep: usize,
 }
 
 impl Pool {
     pub fn new(ctx: Option<Arc<CudaContext>>) -> Arc<Pool> {
-        Arc::new(Pool { ctx, free: Mutex::new(Vec::new()) })
+        Self::with_keep(ctx, POOL_KEEP)
+    }
+
+    pub fn with_keep(ctx: Option<Arc<CudaContext>>, keep: usize) -> Arc<Pool> {
+        Arc::new(Pool { ctx, free: Mutex::new(Vec::new()), keep })
     }
 
     pub fn pinned_buffers(&self) -> usize {
@@ -134,7 +144,7 @@ impl Pool {
         }
         let mut free = self.free.lock().unwrap();
         free.push(host);
-        if free.len() > POOL_KEEP {
+        if free.len() > self.keep {
             let smallest = free.iter().enumerate().min_by_key(|(_, h)| h.cap).map(|(i, _)| i).unwrap_or(0);
             free.swap_remove(smallest);
         }
@@ -279,60 +289,105 @@ pub fn read_batch(sources: &[Source], items: &[Item], pool: &Arc<Pool>, opts: &L
     Ok(Batch { host: Some(host), pool: pool.clone(), spans, bytes: items.iter().map(|i| i.len).sum() })
 }
 
+struct Queue {
+    ready: std::collections::BTreeMap<usize, Result<Batch>>,
+    taken: usize,
+    lanes: usize,
+    stop: bool,
+}
+
 pub struct Prefetcher {
-    rx: Receiver<Result<Batch>>,
-    stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    queue: Arc<(Mutex<Queue>, std::sync::Condvar)>,
+    threads: Vec<JoinHandle<()>>,
     pub direct: bool,
     pub total: u64,
 }
 
 impl Prefetcher {
     pub fn start(files: &[PathBuf], groups: Vec<Vec<Item>>, opts: LoaderOptions, ctx: Option<Arc<CudaContext>>) -> Result<Prefetcher> {
-        let sources = files.iter().map(|p| Source::open(p, opts.direct)).collect::<Result<Vec<_>>>()?;
+        let sources = Arc::new(files.iter().map(|p| Source::open(p, opts.direct)).collect::<Result<Vec<_>>>()?);
         let direct = sources.iter().all(Source::is_direct) && !sources.is_empty();
         let total = groups.iter().flatten().map(|i| i.len).sum();
-        let pool = Pool::new(ctx.clone());
-        let (tx, rx) = sync_channel(opts.ahead.saturating_sub(1));
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
-        let thread = std::thread::Builder::new()
-            .name("specrt-read".into())
-            .spawn(move || {
-                if let Some(ctx) = &ctx {
-                    let _ = ctx.bind_to_thread();
-                }
-                for items in groups {
-                    if flag.load(Ordering::Relaxed) {
-                        break;
+        let lanes = opts.lanes.min(groups.len()).max(1);
+        let pool = Pool::with_keep(ctx.clone().filter(|_| opts.pinned), opts.ahead + opts.workers);
+        let queue = Arc::new((Mutex::new(Queue { ready: Default::default(), taken: 0, lanes, stop: false }), std::sync::Condvar::new()));
+        let groups = Arc::new(groups);
+        let claim = Arc::new(AtomicUsize::new(0));
+        let per_lane = LoaderOptions { readers: opts.readers.div_ceil(lanes).max(1), ..opts };
+        let mut threads = Vec::with_capacity(lanes);
+        for lane in 0..lanes {
+            let (queue, groups, claim, sources, pool, ctx) = (queue.clone(), groups.clone(), claim.clone(), sources.clone(), pool.clone(), ctx.clone());
+            let t = std::thread::Builder::new()
+                .name(format!("specrt-read-{lane}"))
+                .spawn(move || {
+                    if let Some(ctx) = &ctx {
+                        let _ = ctx.bind_to_thread();
                     }
-                    let batch = read_batch(&sources, &items, &pool, &opts);
-                    let failed = batch.is_err();
-                    if tx.send(batch).is_err() || failed {
-                        break;
+                    let (lock, cv) = &*queue;
+                    loop {
+                        let g = claim.fetch_add(1, Ordering::Relaxed);
+                        if g >= groups.len() {
+                            break;
+                        }
+                        {
+                            let mut q = lock.lock().unwrap();
+                            while !q.stop && g >= q.taken + opts.ahead {
+                                q = cv.wait(q).unwrap();
+                            }
+                            if q.stop {
+                                break;
+                            }
+                        }
+                        let batch = read_batch(&sources, &groups[g], &pool, &per_lane);
+                        let failed = batch.is_err();
+                        let mut q = lock.lock().unwrap();
+                        q.ready.insert(g, batch);
+                        cv.notify_all();
+                        if failed || q.stop {
+                            break;
+                        }
                     }
-                }
-            })
-            .context("reader thread")?;
-        Ok(Prefetcher { rx, stop, thread: Some(thread), direct, total })
+                    let mut q = lock.lock().unwrap();
+                    q.lanes -= 1;
+                    cv.notify_all();
+                })
+                .context("reader thread")?;
+            threads.push(t);
+        }
+        Ok(Prefetcher { queue, threads, direct, total })
     }
 
-    pub fn next(&self) -> Result<Batch> {
-        self.rx.recv().map_err(|_| anyhow!("the reader thread stopped before the weights were read"))?
+    pub fn take(&self, group: usize) -> Result<Batch> {
+        let (lock, cv) = &*self.queue;
+        let mut q = lock.lock().unwrap();
+        loop {
+            if let Some(b) = q.ready.remove(&group) {
+                q.taken += 1;
+                cv.notify_all();
+                return b;
+            }
+            if q.lanes == 0 {
+                return Err(anyhow!("the reader threads stopped before weight group {group} was read"));
+            }
+            q = cv.wait(q).unwrap();
+        }
     }
+
 }
 
 impl Drop for Prefetcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        while self.rx.try_recv().is_ok() {}
-        if let Some(t) = self.thread.take() {
-            while !t.is_finished() {
-                while self.rx.try_recv().is_ok() {}
-                std::thread::yield_now();
-            }
+        {
+            let (lock, cv) = &*self.queue;
+            let mut q = lock.lock().unwrap();
+            q.stop = true;
+            q.ready.clear();
+            cv.notify_all();
+        }
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
+        self.queue.0.lock().unwrap().ready.clear();
     }
 }
 
@@ -354,7 +409,7 @@ mod tests {
 
     fn check(dir: &Path, direct: bool) -> bool {
         let (p, data) = file_with(dir, "a.bin", 3 * (1 << 20) + 1234);
-        let opts = LoaderOptions { enabled: true, direct, chunk_mb: 1, readers: 3, ahead: 2 };
+        let opts = LoaderOptions { enabled: true, direct, chunk_mb: 1, readers: 3, ahead: 2, workers: 2, lanes: 2, skip_cached: false, pinned: false };
         let spans = [(5u64, 100u64), (4096, 4096), (10_000, 1_500_000), (3 * (1 << 20) + 1000, 234)];
         let src = Source::open(&p, direct).unwrap();
         let used_direct = src.is_direct();
@@ -413,8 +468,8 @@ mod tests {
         let groups: Vec<Vec<Item>> = (0..6).map(|g| vec![Item { name: "x".into(), file: 0, offset: g * 1000, len: 700 }]).collect();
         let pf = Prefetcher::start(&[p], groups, LoaderOptions::default(), None).unwrap();
         assert_eq!(pf.total, 6 * 700);
-        for g in 0..3usize {
-            let b = pf.next().unwrap();
+        for g in [1usize, 0, 2] {
+            let b = pf.take(g).unwrap();
             assert_eq!(b.get("x").unwrap(), &data[g * 1000..g * 1000 + 700]);
         }
         drop(pf);
