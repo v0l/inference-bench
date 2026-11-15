@@ -1287,6 +1287,7 @@ impl Runtime {
             (GemmPath::F4a, _, Some(fa)) => return self.tc_fp4(fa, &choice, w, x, out, rows, tokens),
             (GemmPath::F8b, _, _) => return self.tc_f8b(&choice, w, bias, x, out, rows, tokens),
             (GemmPath::F4b, _, _) => return self.tc_f4b(&choice, w, x, out, rows, tokens),
+            (GemmPath::Rows, _, _) => return self.tc_rows(&choice, w, x, out, rows, tokens),
             (GemmPath::Ggb, _, _) => return self.tc_ggb(&choice, w, bias, x, out, rows, tokens),
             _ => {}
         }
@@ -1306,6 +1307,24 @@ impl Runtime {
             shared_mem_bytes: self.smem[kernel],
         };
         unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn tc_rows(
+        &self,
+        choice: &crate::codegen::KernelChoice,
+        w: &DeviceMatrix,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let GemmOut::F32(o) = out else { unreachable!("tc_rows writes f32") };
+        let n = tokens as i32;
+        let mut b = self.stream.launch_builder(self.kernel(&choice.name));
+        w.args(&mut b, &self.buf.dummy);
+        b.arg(&self.buf.dummy).arg(&x.0).arg(&x.1).arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16).arg(&n);
+        unsafe { b.launch(cfg(rows as u32, 256)) }?;
         Ok(())
     }
 

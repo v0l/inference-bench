@@ -88,6 +88,7 @@ pub const FP4_BATCH_TEMPLATE: &str = include_str!("../templates/fp4_batch.cu");
 pub const F4B_VARIANTS: &[usize] = &[8, 16, 32, 64];
 pub const F4B_MAX_TOKENS: usize = 64;
 pub const F4B_KC: usize = 128;
+pub const ROWS_MAX_TOKENS: usize = 32;
 pub const F4B_REDUCE_BLOCK: usize = 256;
 const SMEM_PER_SM: usize = 100 * 1024;
 const SMEM_RESERVED: usize = 1024;
@@ -520,6 +521,7 @@ pub enum GemmPath {
     F8a,
     F8b,
     F4b,
+    Rows,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -538,6 +540,7 @@ fn decoder_for(path: GemmPath, weight: WeightKind) -> &'static str {
         GemmPath::F4a => "nvfp4 x nvfp4 act",
         GemmPath::F8b => "fp8 batch rows",
         GemmPath::F4b => "nvfp4 batch rows",
+        GemmPath::Rows => "bf16 one block per row",
         GemmPath::Ggb => "ggml to bf16 scratch",
         GemmPath::Mma | GemmPath::F4w => WeightFormat::of_kind(weight).decoder(),
     }
@@ -552,6 +555,7 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
         TileChoice::Big => "_big",
         TileChoice::Narrow => "_narrow",
         _ if tokens <= 16 => "_tiny",
+        _ if linear == "lm_head" && tokens <= ROWS_MAX_TOKENS => "_narrow",
         _ if blocks(big) >= 2 * sms => "_big",
         _ if blocks(Tile::SMALL) >= 2 * sms => "",
         _ => "_narrow",
@@ -572,6 +576,9 @@ pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: us
     let act_quant = !linear.ends_with("head") && suffix != "_tiny";
     let fp8_act = spec.quant.is_fp8() && fp8_act_enabled(spec);
     let fp4_act = spec.mlp.quant == Some(Quant::Nvfp4G16) && fp4_act_enabled(spec);
+    if auto && linear == "lin_ba" && tokens <= ROWS_MAX_TOKENS && weight == WeightKind::Bf16 {
+        return choice("lin_ba_rows".to_string(), GemmPath::Rows, None);
+    }
     match weight {
         WeightKind::Fp8 if act_quant && fp8_act => KernelChoice {
             tile: if huge { Tile::FP8_HUGE } else { tile },
@@ -737,6 +744,7 @@ pub const GDN_KERNELS: &[&str] = &[
     "lin_ba_mma_big",
     "lin_ba_mma_narrow",
     "lin_ba_mma_tiny",
+    "lin_ba_rows",
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -862,6 +870,9 @@ fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
         };
         let split = wf != WeightFormat::Q8 && !unsplit.iter().any(|n| n == linear);
         let (n, k, epi, bias) = linear_dims(spec, linear);
+        if linear == "lin_ba" {
+            smem.insert("lin_ba_rows", 0);
+        }
         for suffix in MMA_VARIANTS {
             let shape = MmaShape::new(Tile::variant(suffix, &spec.runtime), k, wf, split);
             let name = mma_kernel_name(linear, suffix);

@@ -395,3 +395,55 @@ An isolated vLLM round of 52 ms against specrt's 29 ms is not a like-for-like pa
 
 What would still cut the round: the two extra `lm_head` passes (3.3 ms, #415 quantises the draft
 head) and the verify GEMV bandwidth (17.8 ms, #361, #362); the host side is done.
+
+## Batch-8 round at 24 rows (#604)
+
+Quiet card (local-llm stopped, `flock /tmp/gpu27.lock`), `scripts/batch8_604.sh`, 27B NVFP4, 8 clients,
+24 requests, `[mtp] k = 2`, per-round times from nsys over 300 rounds (`--cuda-graph-trace=node`).
+
+What the code does at 24 verify rows:
+
+- `kernel_for` picks the act-quant tile GEMMs (`gate_up_f4a`, `down_f4a_narrow`, `lin_in_f8_narrow`, ...)
+  above 16 rows, before the batched GEMVs. Forcing the 32-row GEMVs (`*_f4b32`, `*_f8b32`) instead was tried
+  and is slower on the 27B, so the dispatch is unchanged.
+- `lm_head` runs the full 248k vocabulary on all 24 verify rows (`lm_head_mma_big`, 2.3 ms per round), then
+  `spec_accept` (0.29 ms) reads the logits. The draft head is `mtp_head_f4w_tiny`, 2.8 ms per round.
+- `gdn_conv_verify`/`gdn_verify` are one launch per layer over (value_heads, sequences), `gdn_commit` one
+  launch for all layers. The MTP layer and `mtp_chain` are batched across sequences. Nothing is per row.
+
+| kernel, per round | master | 17-32 rows forced to the b32 GEMVs |
+|---|---|---|
+| gate_up | 4.05 (f4a) + 1.33 (f4a_big) | 6.44 (f4b32, 160 us per call) |
+| down | 4.16 (f4a_narrow) | 4.16 (f4b32, 101 us) |
+| lin_in | 1.96 (f8_narrow) | 4.23 (f8b32, 115 us) |
+| lin_ba | 2.97 (narrow) | 1.76 (tiny, at 32 rows) |
+| 8 clients, decode tok/s (bench601 load) | 400 | 354 and 363 |
+
+So the b32 GEMV kernels (about 350 GB/s at 24 rows on gate_up) lose to the act-quant tile GEMM, and
+widening the b32 path regresses. The way forward is a faster 17-32 row GEMV (mma small-M with fp4 weights as
+the A operand), then a fused head plus accept; neither is in this change. The 17-32 row GEMV kernels still
+read each weight once but are not at 80 percent of 1,640 GB/s.
+
+### Changes that landed (#604)
+
+`lin_ba` (the 96-row bf16 `in_proj_ba`) ran as a tile GEMM with 3 blocks, 90 us a call, 2.97 ms per round.
+`lin_ba_rows` (templates/gdn.cu) is one block per output row, 256 threads, every token accumulated in
+registers, for up to 32 rows: 1.02 ms per round. `lm_head` for 17 to 32 rows takes the `_narrow` tile
+instead of `_big`: 2.33 to 2.01 ms per round. Same quiet card,
+`scripts/batch8_604.sh`, nsys over about 290 rounds each (the round runs 41 ms on master: kernel sum
+41.1 ms, idle gaps 0.3 ms, so graphs cannot help, the round is all kernels).
+
+| | master | branch |
+|---|---|---|
+| round wall (median) | 41.5 ms | 37.4 ms |
+| kernel sum / idle gaps | 41.1 / 0.3 ms | 37.1 / 0.3 ms |
+| lin_ba | 2.97 ms | 1.02 ms |
+| lm_head | 2.33 ms | 2.01 ms |
+| bench601 load, 8 clients, decode tok/s | 400 (53 per request) | 429 (54 per request) |
+
+The target (30 ms round, 550 tok/s) is not met. What is left per round, from the same capture:
+`down_f4a_narrow` 4.2 ms and `gate_up_f4a` 4.1 + 1.3 ms (about 130 us per call, about 20 percent of the
+read ceiling), `mtp_head_f4w_tiny` 2.7 ms (two draft heads), `batch_decode_attention` 2.2 ms,
+`lin_in_f8_narrow` 2.0 ms, `gdn_verify` 1.3 ms, `gdn_commit` 1.2 ms. The two heads and the fused
+head plus accept were not done; the weight GEMVs at 17 to 32 rows need an mma small-M kernel, since the
+existing 32-row GEMV is slower than the act-quant tile GEMM there (see above).
