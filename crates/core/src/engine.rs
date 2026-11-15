@@ -1,7 +1,7 @@
 use crate::chat::ChatRequest;
 use crate::live::{History, HISTORY_SAMPLES, Meter, Reading, RequestRecord};
 use crate::native::{Factory, Native, specrt_factory};
-use crate::result::{BackendError, Generation};
+use crate::result::{BackendError, ErrorKind, Generation};
 use crate::target::Target;
 use specrt::serve::{ServeOptions, Stats};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +108,10 @@ impl Handle {
 
     pub fn serving_metrics(&self) -> Option<String> {
         self.stats.lock().unwrap().as_ref().and_then(|t| t.metrics())
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        self.stats.lock().unwrap().as_ref().and_then(|t| t.failure())
     }
 
     pub fn reading(&self) -> Reading {
@@ -399,6 +403,11 @@ fn run(
                         );
                     }
                     Some(Backend::Batched { target, running }) => {
+                        if let Some(reason) = target.failure() {
+                            shared.meter.withdrawn();
+                            send(&out, ChatEvent::Failed(BackendError::new(ErrorKind::Unavailable, format!("the model failed: {reason}. Load it again from the model bar"))));
+                            continue;
+                        }
                         running.retain(|r| !r.thread.is_finished());
                         let Some(mut shared_target) = target.share() else {
                             shared.meter.withdrawn();

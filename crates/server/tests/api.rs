@@ -209,6 +209,29 @@ fn full_queue_returns_429_with_retry_after() {
 }
 
 #[test]
+fn a_hung_engine_marks_the_model_failed_answers_503_and_reloads_on_demand() {
+    let rig = start(config("max_num_seqs = 1\n[[models]]\nid='m'"), Shape::default());
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("m", false)).0, 200);
+    rig.stats.hung.store(true, Ordering::SeqCst);
+    let (status, body, _) = rig.post("/v1/chat/completions", None, chat("m", false));
+    assert_eq!(status, 200, "reload_failed_models defaults on: {body}");
+    assert_eq!(rig.stats.loads.load(Ordering::SeqCst), 2);
+    rig.stop();
+    let rig = start(config("max_num_seqs = 1\nreload_failed_models = false\n[[models]]\nid='m'"), Shape::default());
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("m", false)).0, 200);
+    rig.stats.hung.store(true, Ordering::SeqCst);
+    let (status, body, _) = rig.post("/v1/chat/completions", None, chat("m", false));
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("stopped responding"), "{body}");
+    let (_, admin, _) = rig.get("/admin/models", None);
+    assert!(admin.contains("stopped responding"), "{admin}");
+    rig.stats.hung.store(false, Ordering::SeqCst);
+    assert_eq!(rig.post("/admin/models/m/load", None, json!({})).0, 200);
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("m", false)).0, 200);
+    rig.stop();
+}
+
+#[test]
 fn client_disconnect_cancels_generation() {
     let shape = Shape { tokens: 500, first_delay_ms: 0, token_delay_ms: 20, ..Shape::default() };
     let rig = start(config("[[models]]\nid='m'"), shape);

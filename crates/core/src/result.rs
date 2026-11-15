@@ -10,6 +10,7 @@ pub enum ErrorKind {
     Failed,
     Cancelled,
     InvalidRequest,
+    Unavailable,
 }
 
 impl ErrorKind {
@@ -21,6 +22,7 @@ impl ErrorKind {
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
             Self::InvalidRequest => "invalid request",
+            Self::Unavailable => "unavailable",
         }
     }
 

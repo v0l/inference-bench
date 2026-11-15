@@ -87,6 +87,10 @@ impl LoadedModel {
     pub fn active(&self) -> usize {
         self.active.load(Ordering::SeqCst)
     }
+
+    pub fn failure(&self) -> Option<String> {
+        self.stats.lock().unwrap().as_ref().and_then(|t| t.failure())
+    }
 }
 
 pub struct Lease {
@@ -150,6 +154,7 @@ pub struct ModelStatus {
     pub active_requests: usize,
     pub idle_secs: Option<f64>,
     pub loading: Option<LoadingStatus>,
+    pub failed: Option<String>,
 }
 
 pub struct Manager {
@@ -161,6 +166,7 @@ pub struct Manager {
     loading: Arc<Mutex<HashMap<String, LoadState>>>,
     load_lock: tokio::sync::Mutex<()>,
     source: Option<Arc<dyn ModelSource>>,
+    failed: Mutex<HashMap<String, String>>,
 }
 
 impl Manager {
@@ -171,7 +177,28 @@ impl Manager {
         metrics: Arc<Metrics>,
         source: Option<Arc<dyn ModelSource>>,
     ) -> Self {
-        Self { config, factory, probe, metrics, loaded: Mutex::default(), loading: Default::default(), load_lock: Default::default(), source }
+        Self { config, factory, probe, metrics, loaded: Mutex::default(), loading: Default::default(), load_lock: Default::default(), source, failed: Default::default() }
+    }
+
+    pub fn failure_of(&self, id: &str) -> Option<String> {
+        if let Some(m) = self.loaded.lock().unwrap().get(id)
+            && let Some(f) = m.failure()
+        {
+            return Some(f);
+        }
+        self.failed.lock().unwrap().get(id).cloned()
+    }
+
+    fn settle_failure(&self, id: &str) -> Option<String> {
+        let reason = self.failure_of(id)?;
+        let stale = self.loaded.lock().unwrap().remove(id);
+        if let Some(m) = stale {
+            tracing::error!(model = %id, %reason, "model marked failed and unloaded");
+            self.metrics.model_unloaded();
+            drop(m);
+        }
+        self.failed.lock().unwrap().insert(id.to_string(), reason.clone());
+        Some(reason)
     }
 
     pub fn loading_snapshot(&self) -> Vec<(String, LoadingStatus)> {
@@ -266,6 +293,7 @@ impl Manager {
                 .map(|m| {
                     let l = loaded.get(&m.id);
                     let loading = self.loading_of(&m.id);
+                    let failed = self.failed.lock().unwrap().get(&m.id).cloned().or_else(|| l.and_then(|l| l.failure()));
                     ModelStatus {
                         id: m.id,
                         backend: l.map(|l| l.backend_label.clone()).unwrap_or_else(|| "engine".to_string()),
@@ -274,6 +302,7 @@ impl Manager {
                         active_requests: l.map(|l| l.active()).unwrap_or(0),
                         idle_secs: l.map(|l| l.idle_for().as_secs_f64()),
                         loading,
+                        failed,
                     }
                 })
                 .collect();
@@ -292,6 +321,7 @@ impl Manager {
                     active_requests: l.map(|l| l.active()).unwrap_or(0),
                     idle_secs: l.map(|l| l.idle_for().as_secs_f64()),
                     loading: self.loading_of(&m.id),
+                    failed: self.failed.lock().unwrap().get(&m.id).cloned().or_else(|| l.and_then(|l| l.failure())),
                 }
             })
             .collect();
@@ -305,6 +335,7 @@ impl Manager {
                     active_requests: l.active(),
                     idle_secs: Some(l.idle_for().as_secs_f64()),
                     loading: None,
+                    failed: l.failure(),
                 });
             }
         }
@@ -313,6 +344,12 @@ impl Manager {
 
     pub async fn acquire(&self, id: &str) -> Result<Lease, ApiError> {
         let cfg = self.resolve(id)?;
+        if let Some(reason) = self.settle_failure(&cfg.id) {
+            if !self.config.reload_failed_models {
+                return Err(ApiError::unavailable(format!("model {} failed: {reason}. Reload it from the server tab or POST /admin/models/{}/load", cfg.id, cfg.id)));
+            }
+            self.failed.lock().unwrap().remove(&cfg.id);
+        }
         let model = match self.get(&cfg.id) {
             Some(m) => m,
             None => self.load(&cfg).await?,
@@ -340,8 +377,14 @@ impl Manager {
 
     pub async fn load(&self, cfg: &ModelConfig) -> Result<Arc<LoadedModel>, ApiError> {
         let _guard = self.load_lock.lock().await;
+        self.failed.lock().unwrap().remove(&cfg.id);
         if let Some(m) = self.get(&cfg.id) {
-            return Ok(m);
+            if m.failure().is_none() {
+                return Ok(m);
+            }
+            m.active.fetch_sub(1, Ordering::SeqCst);
+            self.settle_failure(&cfg.id);
+            self.failed.lock().unwrap().remove(&cfg.id);
         }
         self.make_room(cfg)?;
         let max_ctx = self.config.max_ctx_for(cfg);

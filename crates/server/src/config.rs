@@ -145,6 +145,8 @@ pub struct ServerConfig {
     pub max_batched_tokens: Option<usize>,
     pub itl_target_ms: Option<u64>,
     pub whole_prompt_tokens: Option<usize>,
+    pub watchdog_secs: u64,
+    pub reload_failed_models: bool,
     pub runtime: Option<inference_bench_core::specrt_serve::RuntimeOptions>,
     pub speculative: inference_bench_core::specrt_serve::SpeculativeOptions,
     pub placement: inference_bench_core::specrt_placement::PlacementConfig,
@@ -189,8 +191,9 @@ impl Default for ServerConfig {
             max_batched_tokens: None,
             itl_target_ms: None,
             whole_prompt_tokens: None,
-            runtime: None,
-            speculative: Default::default(),
+            watchdog_secs: 60,
+            reload_failed_models: true,
+            runtime: None,            speculative: Default::default(),
             placement: Default::default(),
             tool_parser: None,
             reasoning_parser: None,
@@ -326,6 +329,7 @@ impl ServerConfig {
             speculative: self.speculative,
             placement: Some(self.placement.clone()),
             progress: None,
+            watchdog: (self.watchdog_secs > 0).then(|| std::time::Duration::from_secs(self.watchdog_secs)),
         })
     }
 

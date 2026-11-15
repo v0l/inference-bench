@@ -939,6 +939,8 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
         let limits = state.config.media.clone();
         request.media_max_pixels = limits.max_pixels;
         request.media_max_video_secs = limits.max_video_secs;
+        request.media_max_patches = limits.max_patches;
+        request.media_max_video_frames = limits.max_video_frames;
         request.media = tokio::task::spawn_blocking(move || inference_bench_core::media::extract(&list, &limits))
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?

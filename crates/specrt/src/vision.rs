@@ -240,7 +240,8 @@ pub fn patchify(cfg: &Preprocessor, frames: &[Vec<u8>], height: usize, width: us
 }
 
 pub fn preprocess_image(cfg: &Preprocessor, bytes: &[u8]) -> Result<Patches> {
-    let img = image::load_from_memory(bytes).context("decode image")?.to_rgb8();
+    let format = image::guess_format(bytes).map_err(|_| anyhow::anyhow!("the bytes are not a PNG, JPEG, GIF, BMP, TIFF or WebP image: send videos as video_url"))?;
+    let img = image::load_from_memory_with_format(bytes, format).context("decode image")?.to_rgb8();
     let (w, h) = (img.width() as usize, img.height() as usize);
     let frame = Frame { height: h, width: w, rgb: img.into_raw() };
     preprocess_frames(cfg, &[frame], 1)
@@ -502,6 +503,17 @@ pub struct MediaAssets {
 pub struct MediaBudget {
     pub max_pixels: Option<usize>,
     pub max_video_secs: Option<f64>,
+    pub max_video_frames: Option<usize>,
+    pub max_patches: Option<usize>,
+}
+
+fn check_patches(p: &Patches, budget: &MediaBudget) -> Result<()> {
+    let patches: usize = p.grid.iter().product();
+    ensure!(patches > 0, "media produced an empty patch grid");
+    if let Some(limit) = budget.max_patches {
+        ensure!(patches <= limit, "media needs {patches} vision patches (grid {}x{}x{}), the limit is {limit}: send a smaller image or lower media.max_pixels", p.grid[0], p.grid[1], p.grid[2]);
+    }
+    Ok(())
 }
 
 impl MediaAssets {
@@ -515,19 +527,25 @@ impl MediaAssets {
             .map(|item| match item.kind {
                 MediaKind::Image => {
                     let mut cfg = self.image.clone();
-                    if let Some(px) = budget.max_pixels {
+                    let cap = budget.max_patches.map(|n| n.saturating_mul(cfg.patch_size * cfg.patch_size));
+                    if let Some(px) = budget.max_pixels.into_iter().chain(cap).min() {
                         cfg.size.longest_edge = cfg.size.longest_edge.min(px);
                         cfg.size.shortest_edge = cfg.size.shortest_edge.min(cfg.size.longest_edge);
                     }
-                    preprocess_image(&cfg, &item.bytes).map(Processed::Image)
+                    let p = preprocess_image(&cfg, &item.bytes)?;
+                    check_patches(&p, &budget)?;
+                    Ok(Processed::Image(p))
                 }
                 MediaKind::Video => {
                     let mut cfg = self.video.clone();
-                    if let Some(px) = budget.max_pixels {
+                    let cap = budget.max_patches.map(|n| n.saturating_mul(cfg.patch_size * cfg.patch_size * cfg.temporal_patch_size));
+                    if let Some(px) = budget.max_pixels.into_iter().chain(cap).min() {
                         cfg.size.longest_edge = cfg.size.longest_edge.min(px);
                         cfg.size.shortest_edge = cfg.size.shortest_edge.min(cfg.size.longest_edge);
                     }
-                    preprocess_video_limited(&cfg, &item.bytes, budget.max_video_secs).map(Processed::Video)
+                    let v = preprocess_video_limited(&cfg, &item.bytes, budget)?;
+                    check_patches(&v.patches, &budget)?;
+                    Ok(Processed::Video(v))
                 }
             })
             .collect()
@@ -545,15 +563,19 @@ impl MediaAssets {
     }
 }
 
-pub fn preprocess_video_limited(cfg: &Preprocessor, bytes: &[u8], max_secs: Option<f64>) -> Result<VideoPatches> {
+pub fn preprocess_video_limited(cfg: &Preprocessor, bytes: &[u8], budget: MediaBudget) -> Result<VideoPatches> {
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
     let path = std::env::temp_dir().join(format!("specrt-video-{}-{nanos}.bin", std::process::id()));
     std::fs::write(&path, bytes)?;
     let out = (|| {
         let info = probe_video(&path)?;
-        if let Some(limit) = max_secs {
+        if let Some(limit) = budget.max_video_secs {
             let secs = info.frames as f64 / info.fps;
             ensure!(secs <= limit, "video is {secs:.1} s long, the limit is {limit} s");
+        }
+        if let Some(limit) = budget.max_video_frames {
+            let frames = sample_indices(cfg, info.frames, info.fps).len();
+            ensure!(frames <= limit, "video needs {frames} sampled frames, the limit is {limit}");
         }
         preprocess_video_file(cfg, &path)
     })();

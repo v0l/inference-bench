@@ -92,7 +92,7 @@ impl Target for ServingTarget {
         let (ids, media, vision_tokens) = if request.media.is_empty() {
             (self.engine()?.encode_messages(&list, request.template()).map_err(|e| engine_error(&e))?, Vec::new(), 0)
         } else {
-            let budget = specrt::vision::MediaBudget { max_pixels: request.media_max_pixels, max_video_secs: request.media_max_video_secs };
+            let budget = request.media_budget();
             self.engine()?
                 .encode_media_messages(&list, request.template(), &request.media, budget)
                 .map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("{e:#}")))?
@@ -109,6 +109,10 @@ impl Target for ServingTarget {
 
     fn metrics(&self) -> Option<String> {
         self.serving.as_ref().map(|s| render(&s.stats()))
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.serving.as_ref().and_then(|s| s.failure())
     }
 
     fn stats(&self) -> Option<Stats> {

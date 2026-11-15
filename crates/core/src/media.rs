@@ -16,6 +16,8 @@ pub struct MediaLimits {
     pub fetch_timeout_secs: u64,
     pub max_pixels: Option<usize>,
     pub max_video_secs: Option<f64>,
+    pub max_patches: Option<usize>,
+    pub max_video_frames: Option<usize>,
 }
 
 impl MediaLimits {
@@ -37,6 +39,8 @@ impl Default for MediaLimits {
             fetch_timeout_secs: 10,
             max_pixels: None,
             max_video_secs: None,
+            max_patches: Some(16384),
+            max_video_frames: Some(128),
         }
     }
 }

@@ -278,7 +278,7 @@ struct ServeKnobs {
 }
 
 fn knobs(o: &ServeOptions) -> ServeKnobs {
-    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, runtime: _, speculative: _, placement: _, progress: _ } = o;
+    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, runtime: _, speculative: _, placement: _, progress: _, watchdog: _ } = o;
     ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, whole_prompt_tokens: *whole_prompt_tokens }
 }
 

@@ -38,6 +38,10 @@ impl Target for EngineBackend {
         self.handle.serving_metrics()
     }
 
+    fn failure(&self) -> Option<String> {
+        self.handle.failure()
+    }
+
     fn name(&self) -> &str {
         "engine"
     }

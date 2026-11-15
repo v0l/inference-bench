@@ -56,6 +56,7 @@ pub struct ServeOptions {
     pub speculative: SpeculativeOptions,
     pub placement: Option<crate::placement::PlacementConfig>,
     pub progress: Option<crate::progress::Sink>,
+    pub watchdog: Option<Duration>,
 }
 
 impl Default for ServeOptions {
@@ -72,6 +73,7 @@ impl Default for ServeOptions {
             speculative: SpeculativeOptions::default(),
             placement: None,
             progress: None,
+            watchdog: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -247,12 +249,61 @@ struct Live {
     last_token: Option<Instant>,
 }
 
+pub struct Pulse {
+    origin: Instant,
+    busy_since_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Pulse {
+    fn new() -> Self {
+        Pulse { origin: Instant::now(), busy_since_ms: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    fn enter(&self) {
+        self.busy_since_ms.store(self.origin.elapsed().as_millis() as u64 + 1, Ordering::SeqCst);
+    }
+
+    fn leave(&self) {
+        self.busy_since_ms.store(0, Ordering::SeqCst);
+    }
+
+    fn stalled_for(&self) -> Option<Duration> {
+        let since = self.busy_since_ms.load(Ordering::SeqCst);
+        (since > 0).then(|| self.origin.elapsed().saturating_sub(Duration::from_millis(since - 1)))
+    }
+}
+
+type Inflight = Arc<Mutex<Vec<(Sender<SeqEvent>, Arc<AtomicBool>)>>>;
+
+pub const HUNG_MARKER: &str = "the engine stopped responding";
+
 pub struct Core {
     jobs: Mutex<Option<Sender<Job>>>,
     stats: Arc<Mutex<Stats>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     max_model_len: usize,
     vision: bool,
+    failure: Arc<Mutex<Option<String>>>,
+    inflight: Inflight,
+    stopping: Arc<AtomicBool>,
+}
+
+fn watch(pulse: Arc<Pulse>, limit: Duration, failure: Arc<Mutex<Option<String>>>, inflight: Inflight, stopping: Arc<AtomicBool>) {
+    let poll = (limit / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+    while !stopping.load(Ordering::SeqCst) {
+        std::thread::sleep(poll);
+        let Some(stalled) = pulse.stalled_for() else { continue };
+        if stalled < limit {
+            continue;
+        }
+        let reason = format!("{HUNG_MARKER}: no progress for {} s, the model must be reloaded", stalled.as_secs());
+        tracing::error!(%reason, "engine watchdog tripped");
+        *failure.lock().unwrap() = Some(reason.clone());
+        for (tx, _) in inflight.lock().unwrap().drain(..) {
+            let _ = tx.send(SeqEvent::Failed(reason.clone()));
+        }
+        return;
+    }
 }
 
 impl Core {
@@ -260,26 +311,53 @@ impl Core {
         let max_model_len = opts.model_len(spec)?;
         anyhow::ensure!(opts.max_num_seqs >= 1, "max_num_seqs must be at least 1");
         opts.check_pool(spec)?;
+        let kv_block = kv_block_bytes(spec, 1);
+        let watchdog = opts.watchdog;
+        let spec = spec.clone();
+        Core::spawn(max_model_len, kv_block, watchdog, move |ready, inbox, stats, pulse| {
+            let sink = opts.progress.clone();
+            let _ = crate::progress::with_sink(sink, || start_engine(&spec, opts, ready, inbox, stats, pulse));
+        })
+    }
+
+    fn spawn(
+        max_model_len: usize,
+        kv_block_bytes: usize,
+        watchdog: Option<Duration>,
+        engine: impl FnOnce(Sender<Result<bool>>, Receiver<Job>, Arc<Mutex<Stats>>, Arc<Pulse>) + Send + 'static,
+    ) -> Result<Arc<Core>> {
         let (jobs, inbox) = channel::<Job>();
         let (ready_tx, ready) = channel::<Result<bool>>();
-        let stats = Arc::new(Mutex::new(Stats { kv_block_bytes: kv_block_bytes(spec, 1), ..Stats::default() }));
+        let stats = Arc::new(Mutex::new(Stats { kv_block_bytes, ..Stats::default() }));
         let shared = stats.clone();
-        let spec = spec.clone();
+        let pulse = Arc::new(Pulse::new());
+        let thread_pulse = pulse.clone();
         let thread = std::thread::Builder::new()
             .name("specrt-serve".into())
-            .spawn(move || {
-                let sink = opts.progress.clone();
-                let _ = crate::progress::with_sink(sink, || start_engine(&spec, opts, ready_tx, inbox, shared));
-            })
+            .spawn(move || engine(ready_tx, inbox, shared, thread_pulse))
             .context("serving thread")?;
         let vision = ready.recv().context("the serving thread stopped while loading")??;
+        let failure = Arc::new(Mutex::new(None));
+        let inflight: Inflight = Default::default();
+        let stopping = Arc::new(AtomicBool::new(false));
+        if let Some(limit) = watchdog.filter(|d| !d.is_zero()) {
+            let (f, i, s) = (failure.clone(), inflight.clone(), stopping.clone());
+            std::thread::Builder::new().name("specrt-watchdog".into()).spawn(move || watch(pulse, limit, f, i, s)).context("watchdog thread")?;
+        }
         Ok(Arc::new(Core {
             vision,
             jobs: Mutex::new(Some(jobs)),
             stats,
             thread: Mutex::new(Some(thread)),
             max_model_len,
+            failure,
+            inflight,
+            stopping,
         }))
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        self.failure.lock().unwrap().clone()
     }
 
     pub fn max_model_len(&self) -> usize {
@@ -295,6 +373,14 @@ impl Core {
     }
 
     pub fn submit(&self, job: Job) -> Result<()> {
+        if let Some(reason) = self.failure() {
+            anyhow::bail!(reason);
+        }
+        {
+            let mut inflight = self.inflight.lock().unwrap();
+            inflight.retain(|(_, cancel)| Arc::strong_count(cancel) > 1);
+            inflight.push((job.events.clone(), job.cancel.clone()));
+        }
         let jobs = self.jobs.lock().unwrap();
         let tx = jobs.as_ref().context("the serving engine is stopped")?;
         tx.send(job).map_err(|_| anyhow::anyhow!("the serving engine has stopped"))
@@ -302,7 +388,11 @@ impl Core {
 
     pub fn stop(&self) {
         self.jobs.lock().unwrap().take();
+        self.stopping.store(true, Ordering::SeqCst);
         if let Some(t) = self.thread.lock().unwrap().take() {
+            if self.failure().is_some() {
+                return;
+            }
             let _ = t.join();
         }
     }
@@ -314,12 +404,12 @@ impl Drop for Core {
     }
 }
 
-fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>) -> Result<()> {
+fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>, pulse: Arc<Pulse>) -> Result<()> {
     if opts.placement.as_ref().is_some_and(|p| p.remote.is_some()) {
         match build_remote(spec, &opts) {
             Ok(mut sched) => {
                 let _ = ready.send(Ok(false));
-                run(&mut sched, inbox, stats);
+                run(&mut sched, inbox, stats, pulse);
             }
             Err(e) => {
                 let _ = ready.send(Err(e.context("[placement.remote]")));
@@ -349,7 +439,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, in
         Some((placement, micro_batch)) => match build_pipeline(spec, &opts, &placement, micro_batch) {
             Ok(mut sched) => {
                 let _ = ready.send(Ok(false));
-                run(&mut sched, inbox, stats);
+                run(&mut sched, inbox, stats, pulse);
             }
             Err(e) => {
                 let _ = ready.send(Err(e));
@@ -358,7 +448,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, in
         None => match build(spec, opts) {
             Ok(mut sched) => {
                 let _ = ready.send(Ok(sched.exec.rt.has_vision()));
-                run(&mut sched, inbox, stats);
+                run(&mut sched, inbox, stats, pulse);
             }
             Err(e) => {
                 let _ = ready.send(Err(e));
@@ -464,7 +554,7 @@ pub fn slot_state_bytes(spec: &Spec) -> u64 {
     }
 }
 
-fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>) {
+fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>, pulse: Arc<Pulse>) {
     let mut live: HashMap<SeqId, Live> = HashMap::new();
     let mut open = true;
     {
@@ -496,7 +586,14 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
             }
         }
         for job in incoming {
-            match sched.submit(job.request) {
+            if job.cancel.load(Ordering::Relaxed) {
+                let _ = job.events.send(SeqEvent::Finished { finish: Finish::Cancelled, prompt_tokens: 0, completion_tokens: 0, cached_tokens: 0 });
+                continue;
+            }
+            pulse.enter();
+            let submitted = sched.submit(job.request);
+            pulse.leave();
+            match submitted {
                 Ok(id) => {
                     live.insert(id, Live { events: job.events, cancel: job.cancel, last_token: None });
                 }
@@ -528,7 +625,9 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
             }
         }
         let started = Instant::now();
+        pulse.enter();
         let report = if sched.idle() { Ok(None) } else { sched.step(&mut events).map(Some) };
+        pulse.leave();
         let report = match report {
             Ok(r) => r,
             Err(e) => {
@@ -667,6 +766,10 @@ impl Serving {
 
     pub fn max_model_len(&self) -> usize {
         self.core.max_model_len()
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        self.core.failure()
     }
 
     pub fn encode_messages(&self, messages: &[Value], template: Option<&Value>) -> Result<Vec<u32>> {
@@ -814,6 +917,61 @@ impl Serving {
         out.ttft_secs = first.duration_since(started).as_secs_f64();
         out.decode_secs = first.elapsed().as_secs_f64();
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::*;
+
+    fn job() -> (Job, std::sync::mpsc::Receiver<SeqEvent>) {
+        let (tx, rx) = channel();
+        let request = sched::Request { prompt: vec![1], max_tokens: 1, sampling: crate::runtime::Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None };
+        (Job { request, events: tx, cancel: Arc::new(AtomicBool::new(false)) }, rx)
+    }
+
+    fn hanging_core(watchdog: Option<Duration>, release: Arc<AtomicBool>) -> Arc<Core> {
+        Core::spawn(512, 1, watchdog, move |ready, inbox, _stats, pulse| {
+            let _ = ready.send(Ok(false));
+            let Ok(_job) = inbox.recv() else { return };
+            pulse.enter();
+            while !release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            pulse.leave();
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn an_engine_that_never_returns_fails_requests_and_marks_the_core_failed() {
+        let release = Arc::new(AtomicBool::new(false));
+        let core = hanging_core(Some(Duration::from_millis(100)), release.clone());
+        let (j, rx) = job();
+        core.submit(j).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)).expect("the watchdog must answer") {
+            SeqEvent::Failed(e) => assert!(e.contains(HUNG_MARKER), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(core.failure().unwrap().contains(HUNG_MARKER));
+        let (j, _rx) = job();
+        let e = core.submit(j).unwrap_err().to_string();
+        assert!(e.contains(HUNG_MARKER), "{e}");
+        release.store(true, Ordering::SeqCst);
+        core.stop();
+    }
+
+    #[test]
+    fn a_slow_but_finishing_engine_is_not_failed() {
+        let release = Arc::new(AtomicBool::new(false));
+        let core = hanging_core(Some(Duration::from_secs(30)), release.clone());
+        let (j, rx) = job();
+        core.submit(j).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(core.failure().is_none());
+        assert!(rx.try_recv().is_err());
+        release.store(true, Ordering::SeqCst);
+        core.stop();
     }
 }
 

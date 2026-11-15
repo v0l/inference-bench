@@ -205,6 +205,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 if let Some(e) = &app.server.error {
                     status(ui, false, e);
                 }
+                if let Some(f) = app.engine.handle().failure() {
+                    status(ui, false, &format!("model failed: {f}. Load it again from the model bar"));
+                }
             },
         );
         section(ui, "settings", "applied the next time the server starts", |ui| {

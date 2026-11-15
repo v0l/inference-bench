@@ -190,6 +190,9 @@ pub fn engine_error(err: &anyhow::Error) -> BackendError {
     if lower.contains("out_of_memory") || lower.contains("out of memory") {
         return BackendError::failed(format!("the GPU ran out of memory: {message}"));
     }
+    if lower.contains(specrt::serve::HUNG_MARKER) {
+        return BackendError::new(ErrorKind::Unavailable, message);
+    }
     if lower.contains("chat template:") {
         return BackendError::new(ErrorKind::InvalidRequest, message);
     }
@@ -306,7 +309,7 @@ impl Target for Native {
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         let messages = request.messages_json();
         let media = request.media.clone();
-        let budget = specrt::vision::MediaBudget { max_pixels: request.media_max_pixels, max_video_secs: request.media_max_video_secs };
+        let budget = request.media_budget();
         let (template, s, cancel) = (request.template().cloned(), request.sampling, request.cancel.clone());
         let (tx, rx) = channel();
         let job: Job = Box::new(move |m: &mut dyn Model| {

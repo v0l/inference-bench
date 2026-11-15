@@ -10,6 +10,8 @@ use std::sync::Arc;
 pub const VISION_TEMPLATE: &str = include_str!("../templates/vision.cu");
 
 const KERNELS: &[&str] = &["vis_gemm", "vis_layernorm", "vis_rope", "vis_attention"];
+pub const MAX_ENCODE_PATCHES: usize = 32768;
+
 const LAYERNORM_EPS: f32 = 1e-6;
 const ROPE_THETA: f32 = 10000.0;
 
@@ -344,6 +346,8 @@ impl VisionEncoder {
     pub fn encode(&self, patches: &Patches) -> Result<VisionOutput> {
         let cfg = &self.cfg;
         let [t, h, w] = patches.grid;
+        ensure!(t > 0 && h > 0 && w > 0, "grid {t}x{h}x{w} is empty");
+        ensure!(t * h * w <= MAX_ENCODE_PATCHES, "grid {t}x{h}x{w} is {} patches, the encoder takes at most {MAX_ENCODE_PATCHES}", t * h * w);
         let merge = cfg.spatial_merge_size;
         ensure!(h % merge == 0 && w % merge == 0, "grid {h}x{w} is not a multiple of the merge size");
         let tokens = t * h * w;

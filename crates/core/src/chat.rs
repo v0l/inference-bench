@@ -83,6 +83,8 @@ pub struct ChatRequest {
     pub media: Vec<crate::media::MediaItem>,
     pub media_max_pixels: Option<usize>,
     pub media_max_video_secs: Option<f64>,
+    pub media_max_video_frames: Option<usize>,
+    pub media_max_patches: Option<usize>,
     pub logprobs: Option<u32>,
     pub on_logprob: Option<LogprobSink>,
     pub response_format: Option<specrt::grammar::Schema>,
@@ -122,9 +124,20 @@ impl ChatRequest {
             media: Vec::new(),
             media_max_pixels: None,
             media_max_video_secs: None,
+            media_max_video_frames: None,
+            media_max_patches: None,
             logprobs: None,
             on_logprob: None,
             response_format: None,
+        }
+    }
+
+    pub fn media_budget(&self) -> specrt::vision::MediaBudget {
+        specrt::vision::MediaBudget {
+            max_pixels: self.media_max_pixels,
+            max_video_secs: self.media_max_video_secs,
+            max_video_frames: self.media_max_video_frames,
+            max_patches: self.media_max_patches,
         }
     }
 

@@ -239,3 +239,53 @@ fn the_ten_second_clip_has_the_reference_frames_grid_patches_and_timestamps() {
     assert_eq!(stamps, want_stamps);
     assert_eq!(got.patches.tokens(2), 800);
 }
+
+fn assets() -> MediaAssets {
+    let base = |file: &str| {
+        let mut c = config(file);
+        c.size = SizeBounds { shortest_edge: 65536, longest_edge: 16777216 };
+        c
+    };
+    MediaAssets { image: base("qwen3.8-27b.image-preprocessor.json"), video: base("qwen3.8-27b.video-preprocessor.json"), tokens: MediaTokens::default(), ids: tokens() }
+}
+
+fn png(w: u32, h: u32) -> Vec<u8> {
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(w, h, |x, y| image::Rgb([(x % 251) as u8, (y % 241) as u8, 7]))).write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+#[test]
+fn a_video_sent_as_an_image_is_refused_before_any_kernel_launch() {
+    let mp4 = std::fs::read(dir().join("clip.mp4")).unwrap();
+    let item = MediaItem::new(MediaKind::Image, mp4);
+    let e = assets().process(&[item], MediaBudget::default()).unwrap_err().to_string();
+    assert!(e.contains("video_url"), "{e}");
+}
+
+#[test]
+fn a_huge_image_is_scaled_down_to_the_patch_budget() {
+    let item = MediaItem::new(MediaKind::Image, png(4096, 4096));
+    let unlimited = assets().process(std::slice::from_ref(&item), MediaBudget::default()).unwrap();
+    let unlimited_patches: usize = unlimited[0].patches().grid.iter().product();
+    assert!(unlimited_patches > 16384, "{unlimited_patches}");
+    let budget = MediaBudget { max_patches: Some(4096), ..Default::default() };
+    let limited = assets().process(&[item], budget).unwrap();
+    let patches: usize = limited[0].patches().grid.iter().product();
+    assert!(patches <= 4096, "{patches}");
+}
+
+#[test]
+fn an_extreme_aspect_ratio_is_refused() {
+    let item = MediaItem::new(MediaKind::Image, png(4000, 8));
+    let e = assets().process(&[item], MediaBudget::default()).unwrap_err().to_string();
+    assert!(e.contains("aspect ratio"), "{e}");
+}
+
+#[test]
+fn a_video_over_the_frame_limit_is_refused() {
+    let item = MediaItem::new(MediaKind::Video, std::fs::read(dir().join("clip10.mp4")).unwrap());
+    let budget = MediaBudget { max_video_frames: Some(2), ..Default::default() };
+    let e = assets().process(&[item], budget).unwrap_err().to_string();
+    assert!(e.contains("sampled frames"), "{e}");
+}

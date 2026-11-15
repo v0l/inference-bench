@@ -98,6 +98,10 @@ pub trait Target: Send {
     fn speculation(&self) -> Option<String> {
         None
     }
+
+    fn failure(&self) -> Option<String> {
+        None
+    }
 }
 
 pub const NATIVE: &str = "specrt";

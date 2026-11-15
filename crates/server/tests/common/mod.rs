@@ -16,6 +16,7 @@ pub struct Stats {
     pub prompts: Mutex<Vec<String>>,
     pub requests: Mutex<Vec<ChatRequest>>,
     pub loaded_names: Mutex<Vec<String>>,
+    pub hung: AtomicBool,
 }
 
 pub struct Fake {
@@ -53,6 +54,14 @@ impl Target for Fake {
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
         self.stats.requests.lock().unwrap().push(request.clone());
         self.run(&request.flatten(), request.sampling.max_tokens, Some(request), on_text)
+    }
+
+    fn share(&self) -> Option<Box<dyn Target>> {
+        Some(Box::new(Fake { tokens: self.tokens, first_delay_ms: self.first_delay_ms, token_delay_ms: self.token_delay_ms, pieces: self.pieces.clone(), vision: self.vision, batched: self.batched, stats: self.stats.clone() }))
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.stats.hung.load(Ordering::SeqCst).then(|| "the engine stopped responding: no progress for 60 s, the model must be reloaded".to_string())
     }
 }
 
