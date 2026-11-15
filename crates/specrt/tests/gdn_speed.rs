@@ -17,7 +17,7 @@ fn gdn_chunk_kernels_speed_on_a_27b_shaped_layer() {
     let ctx = CudaContext::new(0).unwrap();
     let jit = Jit::new(ctx.clone(), std::env::temp_dir().join(format!("specrt-gdn-speed-{}", std::process::id()))).unwrap();
     let stream = ctx.default_stream();
-    let module = Module::generate_kv(&spec, 4096, 1).unwrap();
+    let module = Module::generate_kv(&spec, 4096, 1, &specrt::codegen::cuda_target(&ctx).unwrap()).unwrap();
     let loaded = jit.load(&module).unwrap();
     let prep = loaded.function("gdn_chunk_prep").unwrap();
     let scan = loaded.function("gdn_chunk_scan").unwrap();
