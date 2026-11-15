@@ -40,6 +40,8 @@ fn gdn_chunk_kernels_speed_on_a_27b_shaped_layer() {
         let u = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
         let o = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
         let aqk = stream.alloc_zeros::<f32>(chunks * vh * c * c).unwrap();
+        let qe = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
+        let kt = stream.alloc_zeros::<f32>(tokens * vh * d).unwrap();
         let gc = stream.alloc_zeros::<f32>(chunks * vh * c).unwrap();
         let state = stream.alloc_zeros::<f32>(vh * d * d).unwrap();
         let ntok = tokens as i32;
@@ -62,14 +64,14 @@ fn gdn_chunk_kernels_speed_on_a_27b_shaped_layer() {
         };
         let run_prep = || {
             let mut b = stream.launch_builder(&prep);
-            b.arg(&qn).arg(&kn).arg(&mix).arg(&g).arg(&beta).arg(&w).arg(&u).arg(&aqk).arg(&gc).arg(&ntok);
+            b.arg(&qn).arg(&kn).arg(&mix).arg(&g).arg(&beta).arg(&w).arg(&u).arg(&aqk).arg(&gc).arg(&qe).arg(&kt).arg(&ntok);
             let cfg = LaunchConfig { grid_dim: (vh as u32, chunks as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem };
             unsafe { b.launch(cfg) }.unwrap();
         };
         let run_scan = || {
             let mut b = stream.launch_builder(&scan);
-            b.arg(&qn).arg(&kn).arg(&w).arg(&u).arg(&aqk).arg(&gc).arg(&state).arg(&o).arg(&slot).arg(&ntok);
-            let cfg = LaunchConfig { grid_dim: (vh as u32, (d / cols) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            b.arg(&w).arg(&qe).arg(&kt).arg(&u).arg(&aqk).arg(&gc).arg(&state).arg(&o).arg(&slot).arg(&ntok);
+            let cfg = LaunchConfig { grid_dim: (vh as u32, (d / cols) as u32, 1), block_dim: ((c / 16 * 32) as u32, 1, 1), shared_mem_bytes: 0 };
             unsafe { b.launch(cfg) }.unwrap();
         };
         let p = time(&run_prep);

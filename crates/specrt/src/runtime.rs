@@ -417,6 +417,8 @@ struct GdnBuffers {
     u: CudaSlice<f32>,
     aqk: CudaSlice<f32>,
     gc: CudaSlice<f32>,
+    qe: CudaSlice<f32>,
+    kt: CudaSlice<f32>,
     o: CudaSlice<f32>,
     planes: Planes,
 }
@@ -459,6 +461,8 @@ impl GdnBuffers {
             u: zeros(padded * la.value_heads * d)?,
             aqk: zeros(chunks * la.value_heads * LA_CHUNK * LA_CHUNK)?,
             gc: zeros(chunks * la.value_heads * LA_CHUNK)?,
+            qe: zeros(padded * la.value_heads * d)?,
+            kt: zeros(padded * la.value_heads * d)?,
             o: zeros(chunk * la.value_dim())?,
             planes: Planes::new(stream, chunk * la.value_dim())?,
         })
@@ -1654,13 +1658,15 @@ impl Runtime {
             .arg(&gb.u)
             .arg(&gb.aqk)
             .arg(&gb.gc)
+            .arg(&gb.qe)
+            .arg(&gb.kt)
             .arg(&ntok);
         let smem = self.smem["gdn_chunk_prep"];
         unsafe { b.launch(launch("prep", (la.value_heads as u32, chunks, 1), 256, smem)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_chunk_scan"));
-        b.arg(&gb.qn)
-            .arg(&gb.kn)
-            .arg(&gb.w)
+        b.arg(&gb.w)
+            .arg(&gb.qe)
+            .arg(&gb.kt)
             .arg(&gb.u)
             .arg(&gb.aqk)
             .arg(&gb.gc)
@@ -1668,7 +1674,7 @@ impl Runtime {
             .arg(&o)
             .arg(&slot)
             .arg(&ntok);
-        unsafe { b.launch(launch("", (la.value_heads as u32, (d / LA_COLS) as u32, 1), 256, 0)) }?;
+        unsafe { b.launch(launch("", (la.value_heads as u32, (d / LA_COLS) as u32, 1), (LA_CHUNK / 16 * 32) as u32, 0)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_gated_norm"));
         b.arg(&o).arg(&lin).arg(&g.norm).arg(&hi).arg(&lo);
         unsafe { b.launch(launch("", (la.value_heads as u32, n as u32, 1), (d / 2) as u32, 0)) }?;
