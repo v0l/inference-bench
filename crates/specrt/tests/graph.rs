@@ -93,7 +93,10 @@ fn the_graph_lowers_to_the_reference_plan_for_every_config() {
         let Ok(spec) = Spec::from_hf_config_serving(&json).or_else(|_| Spec::describe_hf_config(&json)) else { continue };
         for tc in [true, false] {
             for phase in [Phase::Prefill, Phase::Decode] {
-                let want = reference(&spec, phase, tc);
+                let mut want = reference(&spec, phase, tc);
+                if tc && spec.dims.logit_softcap.is_some() {
+                    want.tail.push(Op::LogitSoftcap);
+                }
                 let got = Plan::build(&spec, phase, tc);
                 let what = format!("{} tc={tc} {phase:?}", path.display());
                 assert_eq!(got.head, want.head, "{what}");
