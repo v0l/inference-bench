@@ -1,7 +1,7 @@
 {
   "name": "qwen3_5_moe",
   "repo": "",
-  "quant": "nvfp4_g16",
+  "quant": "bf16",
   "dims": {
     "hidden": 3072,
     "intermediate": 0,
@@ -45,13 +45,15 @@
     }
   },
   "mlp": {
-    "activation": "swiglu"
+    "activation": "swiglu",
+    "quant": "nvfp4_g16"
   },
   "moe": {
     "experts": 256,
     "active": 8,
     "expert_intermediate": 1024,
-    "shared_intermediate": 1024
+    "shared_intermediate": 1024,
+    "shared_gate": true
   },
   "linear_attention": {
     "kind": "gated_delta_net",
@@ -60,10 +62,5 @@
     "key_head_dim": 128,
     "value_head_dim": 128,
     "conv_kernel": 4
-  },
-  "mtp": {
-    "layers": 1,
-    "draft_tokens": 2,
-    "speculate": true
   }
 }

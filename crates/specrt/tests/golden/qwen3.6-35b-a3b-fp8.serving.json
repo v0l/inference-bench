@@ -1,1 +1,1 @@
-refused: mixture-of-experts models are not supported by the specrt engine
+refused: mixture-of-experts with Fp8Block128 expert weights is not supported yet (bf16 and nvfp4_g16 are)
