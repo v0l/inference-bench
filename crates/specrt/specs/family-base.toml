@@ -59,3 +59,11 @@ when = { "input_activations.type" = "float", "input_activations.dynamic" = { any
 [[quantization.act_rules]]
 act = "fp4"
 when = { "input_activations.type" = "float", "input_activations.dynamic" = { any = [true, "local"] }, "input_activations.num_bits" = 4, "input_activations.strategy" = "tensor_group", "input_activations.group_size" = 16 }
+
+[blocks]
+other_layer_type = "full"
+
+[blocks.layer_types]
+linear_attention = "linear"
+full_attention = "full"
+sliding_attention = "sliding"

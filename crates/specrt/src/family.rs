@@ -57,6 +57,8 @@ impl Default for FamilyAttention {
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyBlocks {
     pub kind: BlockKind,
+    pub layer_types: std::collections::BTreeMap<String, crate::spec::Block>,
+    pub other_layer_type: Option<crate::spec::Block>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

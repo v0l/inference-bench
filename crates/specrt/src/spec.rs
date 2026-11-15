@@ -683,15 +683,14 @@ struct HfConfig {
     mtp_num_hidden_layers: usize,
 }
 
-fn layer_pattern(types: &[String], strict: bool) -> Result<Vec<Block>> {
+fn layer_pattern(blocks_spec: &crate::family::FamilyBlocks, types: &[String], strict: bool) -> Result<Vec<Block>> {
     let blocks = types
         .iter()
-        .map(|t| match t.as_str() {
-            "linear_attention" => Ok(Block::Linear),
-            "full_attention" => Ok(Block::Full),
-            "sliding_attention" if !strict => Ok(Block::Sliding),
-            _ if !strict => Ok(Block::Full),
-            other => bail!("layer type {other} is not supported"),
+        .map(|t| match blocks_spec.layer_types.get(t) {
+            Some(Block::Sliding) if strict => bail!("layer type {t} is not supported"),
+            Some(b) => Ok(*b),
+            None if !strict => Ok(blocks_spec.other_layer_type.unwrap_or(Block::Full)),
+            None => bail!("layer type {t} is not supported"),
         })
         .collect::<Result<Vec<_>>>()?;
     ensure!(!blocks.is_empty(), "layer_types is empty");
@@ -1033,7 +1032,7 @@ impl Spec {
         {
             bail!("torch_dtype {dtype} is not supported");
         }
-        let config_hybrid = hf.layer_types.as_ref().is_some_and(|t| t.iter().any(|x| x == "linear_attention"))
+        let config_hybrid = hf.layer_types.as_ref().is_some_and(|t| t.iter().any(|x| family.blocks.layer_types.get(x).is_some_and(|b| b.is_linear())))
             || hf.full_attention_interval.is_some_and(|n| n > 1)
             || hf.linear_num_key_heads.is_some();
         let hybrid = match family.blocks.kind {
@@ -1049,7 +1048,7 @@ impl Spec {
             .filter(|f| *f != 1.0)
             .map(|f| (head_dim as f64 * f).round() as usize);
         let pattern = match &hf.layer_types {
-            Some(types) if hybrid || !strict => layer_pattern(types, strict)?,
+            Some(types) if hybrid || !strict => layer_pattern(&family.blocks, types, strict)?,
             None if hybrid && hf.full_attention_interval.is_some_and(|n| n > 1) => {
                 let n = hf.full_attention_interval.unwrap_or(4);
                 let mut p = vec![Block::Linear; n - 1];
