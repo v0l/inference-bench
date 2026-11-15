@@ -212,6 +212,7 @@ fn with_gpu(h: &mut Harness<'static, App>, used: u64, total: u64) {
     let app = h.state_mut();
     app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None }];
     app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
+    app.gpu_poll = Default::default();
 }
 
 #[test]
