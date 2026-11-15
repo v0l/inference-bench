@@ -95,7 +95,7 @@ impl Runtime {
                         s.qkv_rows(),
                         n,
                     )?;
-                    self.attn_decode_rows(l, bb, nd)?;
+                    self.attn_decode_rows(l, bb, nd, 1)?;
                     self.attn_prefill_rows(l, np, nd)?;
                     self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
                 }

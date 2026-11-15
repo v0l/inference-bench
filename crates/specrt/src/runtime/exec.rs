@@ -78,7 +78,7 @@ impl Runtime {
             Op::QkRope => self.qk_rope_legacy(self.attn_of(layer), n),
             Op::Flash => self.attn_flash_rows(self.attn_of(layer), n, 0),
             Op::FlashLegacy => self.flash_legacy(self.attn_of(layer), n),
-            Op::DecodeAttention => self.attn_decode_rows(self.attn_of(layer), run.bb.expect("decode runs carry batch buffers"), n),
+            Op::DecodeAttention => self.attn_decode_rows(self.attn_of(layer), run.bb.expect("decode runs carry batch buffers"), n, 1),
             Op::Swiglu => self.swiglu_legacy(n),
             Op::GdnPrefill => self.gdn_prefill_rows(self.gdn_of(layer), n, 0),
             Op::GdnDecode => self.gdn_decode_rows(self.gdn_of(layer), &run.bb.expect("decode runs carry batch buffers").slots, n),

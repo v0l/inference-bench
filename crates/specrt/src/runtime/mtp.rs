@@ -128,7 +128,7 @@ pub struct SpecRow {
 
 enum Attn {
     Contiguous,
-    Rows,
+    Rows(usize),
 }
 
 impl MtpState {
@@ -147,7 +147,7 @@ impl MtpState {
         let h = s.dims.hidden;
         let vb_rows = rows.max(rt.slots) + 1;
         let wide = rt.chunk.max(vb_rows);
-        let parts = vb_rows * s.attention.heads * crate::codegen::BATCH_DECODE_SPLITS;
+        let parts = vb_rows * s.attention.heads * crate::codegen::decode_splits(rt.max_ctx);
         let layers = s.linear_layers();
         let vd = la.value_heads * la.key_head_dim;
         let z = |n: usize| stream.alloc_zeros::<f32>(n.max(1));
@@ -321,7 +321,7 @@ impl Runtime {
         self.tc("mtp_qkv", &l.qkv, None, p.xn_planes.all(), GemmOut::F32(&p.qkv), s.qkv_rows(), n)?;
         match attn {
             Attn::Contiguous => self.attn_prefill_rows(l, n, 0)?,
-            Attn::Rows => self.attn_decode_rows(l, &m.vb, n)?,
+            Attn::Rows(qlen) => self.attn_decode_rows(l, &m.vb, n, qlen)?,
         }
         self.tc("mtp_o", &l.o, None, p.attn_planes.all(), GemmOut::F32(&p.x), h, n)?;
         self.rms_split(&p.x.as_view(), &layer.ln2, &p.xn_planes, n)?;
@@ -367,7 +367,7 @@ impl Runtime {
         self.up_i32(hidx, &m.hidx)?;
         self.up_i32(pos, &m.vb.pos)?;
         self.up_i32(slots, &m.vb.slots)?;
-        self.mtp_layer(&m.vb.tokens.as_view(), &m.hidx.as_view(), &m.vx, pre, tokens.len(), Attn::Rows)
+        self.mtp_layer(&m.vb.tokens.as_view(), &m.hidx.as_view(), &m.vx, pre, tokens.len(), Attn::Rows(1))
     }
 
     fn mtp_chain(&self, n: usize, first: &CudaView<i32>, rin: &CudaView<i32>, accepted: &CudaView<i32>) -> Result<()> {
@@ -380,7 +380,7 @@ impl Runtime {
             let mut b = self.stream.launch_builder(self.kernel("mtp_chain_rows"));
             b.arg(rin).arg(&n_i).arg(accepted).arg(&step).arg(&m.vb.pos).arg(&m.vb.slots);
             unsafe { b.launch(cfg(1, n as u32)) }?;
-            self.mtp_layer(&m.ctok.slice(..n), &m.iota.slice(..n), &m.cg, &m.w.norm, n, Attn::Rows)?;
+            self.mtp_layer(&m.ctok.slice(..n), &m.iota.slice(..n), &m.cg, &m.w.norm, n, Attn::Rows(1))?;
             self.mtp_heads(&m.iota.slice(..n), n, i, &slots)?;
         }
         Ok(())
@@ -530,7 +530,7 @@ impl Runtime {
                 }
                 DeviceMixer::Attention(l) => {
                     self.tc("qkv", &l.qkv, l.qkv_bias.as_ref(), pre.xn_planes.all(), GemmOut::F32(&pre.qkv), s.qkv_rows(), n)?;
-                    self.attn_decode_rows(l, &m.vb, n)?;
+                    self.attn_decode_rows(l, &m.vb, n, k1)?;
                     self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
                 }
             }
@@ -596,7 +596,7 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel("mtp_pick_rows"));
         b.arg(&accepted).arg(&k_i).arg(&m.sidx);
         unsafe { b.launch(cfg(1, n as u32)) }?;
-        self.mtp_layer(&vout, &m.iota.slice(..n * k1), &m.vx, &self.norm, n * k1, Attn::Rows)?;
+        self.mtp_layer(&vout, &m.iota.slice(..n * k1), &m.vx, &self.norm, n * k1, Attn::Rows(k1))?;
         let heads = m.sidx.slice(..n);
         self.mtp_chain(n, &heads, &rin, &accepted)?;
         self.copy_rows_by_index(&m.vx, &heads, &m.pending, &rin.slice(2 * n..3 * n), n)

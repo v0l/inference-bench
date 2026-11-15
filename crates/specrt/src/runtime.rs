@@ -2121,8 +2121,10 @@ impl Runtime {
         Ok(())
     }
 
-    fn attn_decode_rows(&self, l: &DeviceAttn, bb: &BatchBuffers, n: usize) -> Result<()> {
+    fn attn_decode_rows(&self, l: &DeviceAttn, bb: &BatchBuffers, n: usize, qlen: usize) -> Result<()> {
         let a = &self.spec.attention;
+        debug_assert!(n.is_multiple_of(qlen) && qlen <= crate::codegen::DECODE_MAX_QLEN);
+        let qlen_i = qlen as i32;
         let pre = &self.pre;
         let buf = &self.buf;
         let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
@@ -2153,16 +2155,17 @@ impl Runtime {
             .arg(&bb.pos)
             .arg(&bb.slots)
             .arg(&l.kv)
+            .arg(&qlen_i)
             .arg(&bb.part_acc)
             .arg(&bb.part_ml);
         let config = LaunchConfig {
-            grid_dim: (a.kv_heads as u32, n as u32, crate::codegen::BATCH_DECODE_SPLITS as u32),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
+            grid_dim: (a.kv_heads as u32, (n / qlen) as u32, crate::codegen::decode_splits(self.max_ctx) as u32),
+            block_dim: (32 * crate::codegen::decode_warps(a.heads / a.kv_heads, qlen) as u32, 1, 1),
+            shared_mem_bytes: self.smem["batch_decode_attention"],
         };
         unsafe { b.launch(config) }?;
         let mut b = self.stream.launch_builder(self.kernel("batch_decode_combine"));
-        b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.qkv).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
+        b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.qkv).arg(&bb.pos).arg(&qlen_i).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
         let config = LaunchConfig {
             grid_dim: (a.heads as u32, n as u32, 1),
             block_dim: (a.head_dim as u32 / 2, 1, 1),
@@ -2179,7 +2182,7 @@ impl Runtime {
     }
 
     fn batch_buffers(&self, rows: usize) -> Result<BatchBuffers> {
-        let parts = rows * self.spec.attention.heads * crate::codegen::BATCH_DECODE_SPLITS;
+        let parts = rows * self.spec.attention.heads * crate::codegen::decode_splits(self.max_ctx);
         Ok(BatchBuffers {
             tokens: self.stream.alloc_zeros(rows)?,
             logits: self.stream.alloc_zeros(rows * self.spec.dims.vocab)?,

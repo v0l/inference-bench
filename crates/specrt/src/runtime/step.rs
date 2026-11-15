@@ -87,7 +87,7 @@ pub(super) fn params(sampling: Sampling, step: u32) -> [i32; 6] {
 impl Runtime {
     pub fn stepper(&self) -> Result<Stepper> {
         let rows = row_capacity(self.slots) + 1;
-        let parts = rows * self.spec.attention.heads * crate::codegen::BATCH_DECODE_SPLITS;
+        let parts = rows * self.spec.attention.heads * crate::codegen::decode_splits(self.max_ctx);
         let bb = BatchBuffers {
             tokens: self.stream.alloc_zeros(rows)?,
             logits: self.stream.alloc_zeros(rows * self.spec.dims.vocab)?,

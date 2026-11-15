@@ -17,8 +17,33 @@ pub const MOE_KERNELS: &[&str] = &["moe_route", "moe_up_bf16", "moe_up_fp4", "mo
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
 pub const FP8_BLOCK: usize = 128;
-pub const BATCH_DECODE_SPLITS: usize = 8;
+pub const DECODE_MAX_SPLITS: usize = 64;
+pub const DECODE_CHUNK: usize = 256;
+pub const DECODE_KEYS: usize = 16;
+pub const DECODE_STAGES: usize = 2;
+pub const DECODE_SPLIT_PRECISION: bool = true;
+pub const DECODE_MAX_QLEN: usize = crate::spec::MAX_DRAFT_TOKENS + 1;
 const FLASH_SMEM_LIMIT: usize = 99 * 1024;
+
+pub fn decode_splits(max_ctx: usize) -> usize {
+    max_ctx.div_ceil(DECODE_CHUNK).clamp(1, DECODE_MAX_SPLITS)
+}
+
+pub fn decode_chunk(len: usize, max_ctx: usize) -> usize {
+    let mut c = DECODE_CHUNK;
+    while c * decode_splits(max_ctx) < len {
+        c <<= 1;
+    }
+    c
+}
+
+pub fn decode_smem(head_dim: usize, kv_planes: usize) -> usize {
+    DECODE_STAGES * 2 * kv_planes * DECODE_KEYS * head_dim * 2
+}
+
+pub fn decode_warps(group: usize, qlen: usize) -> usize {
+    (group * qlen).div_ceil(16)
+}
 
 pub fn flash_rows(_head_dim: usize) -> usize {
     128
@@ -177,6 +202,9 @@ impl Module {
         let flash_smem = kv_bytes.max(q_bytes);
         anyhow::ensure!(flash_smem <= FLASH_SMEM_LIMIT, "flash_mma needs {flash_smem} bytes of shared memory");
         smem.insert("flash_mma", flash_smem as u32);
+        let decode_smem = decode_smem(a.head_dim, kv_planes);
+        anyhow::ensure!(decode_smem <= FLASH_SMEM_LIMIT, "batch_decode_attention needs {decode_smem} bytes of shared memory");
+        smem.insert("batch_decode_attention", decode_smem as u32);
         let la = spec.linear_attention.as_ref();
         let la_dim = |f: fn(&crate::spec::LinearAttention) -> usize| la.map_or("0".into(), |l| f(l).to_string());
         if let Some(l) = la {
@@ -214,7 +242,12 @@ impl Module {
             ("KV_FP8", spec.runtime.kv_dtype.is_fp8().to_string()),
             ("Q8_GROUP", Q8_GROUP.to_string()),
             ("FP8_BLOCK", FP8_BLOCK.to_string()),
-            ("BD_SPLITS", BATCH_DECODE_SPLITS.to_string()),
+            ("BD_SPLITS", decode_splits(max_ctx).to_string()),
+            ("DM_BK", DECODE_KEYS.to_string()),
+            ("DM_STAGES", DECODE_STAGES.to_string()),
+            ("DM_CHUNK", DECODE_CHUNK.to_string()),
+            ("DM_SPLIT", DECODE_SPLIT_PRECISION.to_string()),
+            ("DM_MAX_QLEN", DECODE_MAX_QLEN.to_string()),
             ("Q_DIM", spec.q_dim().to_string()),
             ("QKV_N", spec.qkv_rows().to_string()),
             ("QKV_ROW", spec.qkv_rows().to_string()),
