@@ -260,7 +260,51 @@ pub fn layers(store: &SpecStore, folders: &[PathBuf], checkout: &[PathBuf]) -> V
 }
 
 pub fn standard_layers(data: &Path, folders: &[PathBuf]) -> Vec<SpecDir> {
-    layers(&SpecStore::new(data), folders, &checkout_dirs())
+    let out = layers(&SpecStore::new(data), folders, &checkout_dirs());
+    install_families(&out);
+    out
+}
+
+fn family_texts(layers: &[SpecDir]) -> Vec<(String, SpecOrigin)> {
+    let mut out = Vec::new();
+    for layer in layers {
+        for path in toml_files(&layer.path) {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            if toml::from_str::<toml::Table>(&text).is_ok_and(|t| specrt::family::is_family(&t)) {
+                out.push((text, layer.origin.clone()));
+            }
+        }
+    }
+    out
+}
+
+pub fn install_families(layers: &[SpecDir]) {
+    let texts = family_texts(layers);
+    match specrt::family::Registry::from_texts(texts.iter().map(|(t, _)| t.as_str())) {
+        Ok(registry) => specrt::family::install(registry),
+        Err(e) => tracing::warn!(error = %e, "family specs do not parse, using the embedded families"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FamilySource {
+    pub family: String,
+    pub origin: SpecOrigin,
+}
+
+pub fn family_source(layers: &[SpecDir], model_type: Option<&str>, gguf_arch: Option<&str>) -> Option<FamilySource> {
+    let texts = family_texts(layers);
+    let registry = specrt::family::Registry::from_texts(texts.iter().map(|(t, _)| t.as_str())).ok()?;
+    let family = match (model_type, gguf_arch) {
+        (Some(t), _) => registry.for_model_type(t),
+        (None, Some(a)) => registry.for_gguf(a),
+        _ => None,
+    }?;
+    let origin = texts
+        .into_iter()
+        .find(|(t, _)| toml::from_str::<toml::Table>(t).ok().and_then(|t| t.get("name").and_then(|n| n.as_str().map(String::from))).as_deref() == Some(family.name.as_str()))
+        .map(|(_, o)| o)?;
+    Some(FamilySource { family: family.name.clone(), origin })
 }
 
 fn plain_toml(name: &str) -> bool {

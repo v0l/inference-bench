@@ -141,6 +141,7 @@ pub struct LocalModel {
     pub files: Vec<PathBuf>,
     pub support: Vec<Support>,
     pub origin: Option<SpecOrigin>,
+    pub spec_source: Option<String>,
     pub vision: bool,
     pub lineage: Option<Lineage>,
 }
@@ -527,6 +528,7 @@ fn gguf_models(dir: &Path, repo: &str, root: &Path, found: &mut Vec<LocalModel>)
             architecture: h.architecture,
             files: shards,
             origin: None,
+            spec_source: None,
             vision: false,
             lineage: lineage.clone(),
         });
@@ -602,6 +604,7 @@ fn safetensors_model(dir: &Path, repo: &str, root: &Path) -> Option<LocalModel> 
         context_length: cfg["max_position_embeddings"].as_u64(),
         files,
         origin: None,
+        spec_source: None,
         vision: config_has_vision(&config),
         lineage,
     })
@@ -705,6 +708,7 @@ fn spec_model(listed: &specs::Listed, hub: &Path) -> LocalModel {
         vision: files.first().and_then(|f| f.parent()).and_then(|d| std::fs::read_to_string(d.join("config.json")).ok()).and_then(|t| serde_json::from_str::<Value>(&t).ok()).is_some_and(|c| config_has_vision(&c)),
         files,
         origin: Some(listed.origin.clone()),
+        spec_source: None,
         lineage: None,
     }
 }
@@ -730,11 +734,44 @@ impl Sources {
     }
 }
 
+fn describe_source(model: &LocalModel, layers: &[SpecDir], overrides: &[(String, String)]) -> Option<String> {
+    let (model_type, gguf_arch) = match model.format {
+        Format::Safetensors => {
+            let config: Value = serde_json::from_str(&std::fs::read_to_string(model.path.join("config.json")).ok()?).ok()?;
+            (Some(config["model_type"].as_str()?.to_string()), None)
+        }
+        Format::Gguf => (None, Some(model.architecture.clone())),
+        Format::Spec => return None,
+    };
+    let key = model_type.clone().or(gguf_arch.clone()).unwrap_or_default();
+    let mut text = match specs::family_source(layers, model_type.as_deref(), gguf_arch.as_deref()) {
+        Some(f) => format!("{} family, {}", f.family, f.origin.label()),
+        None => format!("no family spec for model_type {key}: check for spec updates"),
+    };
+    let names: Vec<&str> = overrides.iter().filter(|(repo, _)| !repo.is_empty() && *repo == model.repo).map(|(_, n)| n.as_str()).collect();
+    if !names.is_empty() {
+        text.push_str(&format!(" + override {}", names.join(", ")));
+    }
+    Some(text)
+}
+
 pub fn scan(sources: &Sources) -> Vec<LocalModel> {
     let mut all = scan_hub(&sources.hub);
+    let overrides: Vec<(String, String)> = specs::list(&sources.specs)
+        .iter()
+        .filter(|l| !specrt::family::is_family(&l.table))
+        .map(|l| (l.table.get("repo").and_then(|r| r.as_str()).unwrap_or("").to_string(), l.name.clone()))
+        .collect();
+    for m in &mut all {
+        m.spec_source = describe_source(m, &sources.specs, &overrides);
+    }
     all.extend(spec_models(&sources.specs, &sources.hub));
     for folder in &sources.folders {
-        all.extend(scan_folder(folder));
+        let mut found = scan_folder(folder);
+        for m in &mut found {
+            m.spec_source = describe_source(m, &sources.specs, &overrides);
+        }
+        all.extend(found);
     }
     let mut seen = std::collections::HashSet::new();
     all.retain(|m| seen.insert(m.path.clone()));
@@ -1059,6 +1096,21 @@ mod tests {
         assert!(!deletable(embedded));
         assert!(delete(embedded).is_err());
         assert!(embedded.path.exists());
+    }
+
+    #[test]
+    fn every_library_entry_names_its_family_spec_or_says_there_is_none() {
+        let hub = temp("famhub");
+        hf_model(&hub, "Qwen/Qwen3-0.6B", &fixture("qwen3-0.6b.config.json"));
+        hf_model(&hub, "acme/Weird", r#"{"architectures":["WeirdForCausalLM"],"model_type":"weird"}"#);
+        let data = temp("famdata");
+        let sources = Sources { hub, folders: vec![], specs: specs::layers(&specs::SpecStore::new(&data), &[], &[]) };
+        let all = scan(&sources);
+        let qwen = all.iter().find(|m| m.repo == "Qwen/Qwen3-0.6B" && m.format == Format::Safetensors).unwrap();
+        let text = qwen.spec_source.clone().unwrap();
+        assert!(text.starts_with("qwen3 family, embedded in inference-bench") && text.contains("+ override qwen3-0.6b"), "{text}");
+        let weird = all.iter().find(|m| m.repo == "acme/Weird").unwrap();
+        assert_eq!(weird.spec_source.as_deref(), Some("no family spec for model_type weird: check for spec updates"));
     }
 
     #[test]

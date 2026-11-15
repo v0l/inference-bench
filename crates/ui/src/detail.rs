@@ -512,6 +512,7 @@ mod tests {
             files: vec![],
             support: vec![],
             origin: None,
+            spec_source: None,
             vision: false,
             lineage: None,
         }

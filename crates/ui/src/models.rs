@@ -245,6 +245,9 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
             if let Some(why) = m.support_for(NATIVE).filter(|s| !s.supported) {
                 Line::new().note(why.reason.clone()).size(10.5).elided(ui);
             }
+            if let Some(source) = &m.spec_source {
+                Line::new().legend("spec").value(source.clone()).size(10.5).elided(ui);
+            }
             if let Some(origin) = &m.origin {
                 Line::new().legend("spec from").value(origin.label()).size(10.5).elided(ui);
             }

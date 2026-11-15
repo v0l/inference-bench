@@ -35,6 +35,7 @@ fn model(name: &str, specrt: bool, reason: &str) -> LocalModel {
             Support { backend: "vllm", supported: true, reason: "registered".into() },
         ],
         origin: None,
+        spec_source: None,
         vision: false,
         lineage: None,
     }
