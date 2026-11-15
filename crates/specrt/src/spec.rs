@@ -776,6 +776,13 @@ impl Spec {
     }
 
     pub fn from_hf_config(json: &str) -> Result<Self> {
+        let mut spec = Self::from_hf_config_serving(json)?;
+        spec.act_quant = ActQuant::None;
+        spec.mlp.act_quant = ActQuant::None;
+        Ok(spec)
+    }
+
+    pub fn from_hf_config_serving(json: &str) -> Result<Self> {
         let spec = Self::hf_config(json, true)?;
         spec.validate()?;
         ensure!(spec.moe.is_none(), "{MOE_UNSUPPORTED}");

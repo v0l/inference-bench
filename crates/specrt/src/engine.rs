@@ -55,7 +55,7 @@ pub fn resolve_spec(model: &str) -> Result<Spec> {
         return Ok(spec);
     }
     let config = find_in_snapshot(model, "config.json")?;
-    let mut spec = Spec::from_hf_config(&std::fs::read_to_string(&config)?)
+    let mut spec = Spec::from_hf_config_serving(&std::fs::read_to_string(&config)?)
         .with_context(|| model.to_string())?;
     spec.repo = model.to_string();
     spec.name = model.rsplit('/').next().unwrap_or(model).to_lowercase();
