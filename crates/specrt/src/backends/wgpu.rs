@@ -67,9 +67,11 @@ impl Wgpu {
         required.max_compute_workgroup_size_x = have.max_compute_workgroup_size_x;
         required.max_compute_workgroups_per_dimension = have.max_compute_workgroups_per_dimension;
         let wanted_cache = adapter.features() & wgpu::Features::PIPELINE_CACHE;
+        let wanted_subgroups = adapter.features() & wgpu::Features::SUBGROUP;
+        let subgroups = !wanted_subgroups.is_empty() && info.subgroup_min_size > 0 && info.subgroup_min_size == info.subgroup_max_size;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("specrt"),
-            required_features: wanted_cache,
+            required_features: wanted_cache | if subgroups { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() },
             required_limits: required.clone(),
             ..Default::default()
         }))
@@ -82,6 +84,7 @@ impl Wgpu {
             max_storage_buffers: required.max_storage_buffers_per_shader_stage,
             max_workgroup_invocations: required.max_compute_invocations_per_workgroup,
             max_workgroup_storage: required.max_compute_workgroup_storage_size,
+            subgroup_size: if subgroups { info.subgroup_min_size } else { 0 },
         };
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),

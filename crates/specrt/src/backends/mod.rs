@@ -13,11 +13,13 @@ pub struct DeviceLimits {
     pub max_storage_buffers: u32,
     pub max_workgroup_invocations: u32,
     pub max_workgroup_storage: u32,
+    pub subgroup_size: u32,
 }
 
 impl DeviceLimits {
     pub fn target(&self) -> kir::Target {
-        kir::Target::wgpu(self.max_workgroup_invocations, self.max_workgroup_storage)
+        let t = kir::Target::wgpu(self.max_workgroup_invocations, self.max_workgroup_storage);
+        if self.subgroup_size > 0 { t.with_subgroups(self.subgroup_size) } else { t }
     }
 }
 

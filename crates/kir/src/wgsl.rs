@@ -49,7 +49,7 @@ fn rmsnorm(k: &Kernel, width: u32, eps: f32, sum: BlockSum) -> String {
             ),
         ),
         BlockSum::Subgroup => (
-            "enable subgroups;\n",
+            "",
             "@builtin(local_invocation_index) li: u32, @builtin(subgroup_id) sg: u32, @builtin(subgroup_invocation_id) lane: u32, @builtin(num_subgroups) sgs: u32".to_string(),
             "var<workgroup> red: array<f32, 128>;\n".to_string(),
             "    let part = subgroupAdd(ss);

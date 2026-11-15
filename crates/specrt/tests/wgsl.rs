@@ -35,7 +35,8 @@ fn device() -> Wgpu {
 
 fn setup(spec: &Spec, ctx: usize) -> Wgpu {
     let mut w = device();
-    w.compile(&wgsl::generate(spec, ctx, &kir::Target::wgpu_baseline()).unwrap()).unwrap();
+    let target = specrt::backends::Backend::limits(&w).target();
+    w.compile(&wgsl::generate(spec, ctx, &target).unwrap()).unwrap();
     w
 }
 
@@ -522,4 +523,52 @@ fn qwen3_bf16_speed_on_wgpu() {
     let prefill = 1024.0 / out.prefill_secs;
     eprintln!("SPEED {name}: prefill 1024 tokens {:.2}s ({prefill:.0} tok/s), decode {decode:.1} tok/s", out.prefill_secs);
     assert!(decode > 0.0 && prefill > 0.0);
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn the_live_target_matches_the_adapter_features() {
+    let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let w = device();
+    let info = w.info();
+    let target = specrt::backends::Backend::limits(&w).target();
+    let adapter_has = info.subgroup_min_size > 0 && info.subgroup_min_size == info.subgroup_max_size;
+    eprintln!("subgroup size {}..{} target subgroups {}", info.subgroup_min_size, info.subgroup_max_size, target.has(kir::Feature::Subgroups));
+    if target.has(kir::Feature::Subgroups) {
+        assert!(adapter_has);
+        assert_eq!(target.warp_size, info.subgroup_min_size);
+    } else {
+        assert_eq!(target.warp_size, 1);
+    }
+    let k = wgsl::generate(&spec(), 64, &target).unwrap();
+    let norm = k.iter().find(|k| k.name == "rmsnorm").unwrap();
+    assert_eq!(norm.source.contains("subgroupAdd"), target.has(kir::Feature::Subgroups));
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn rmsnorm_without_subgroups_matches_a_cpu_reference_on_the_same_adapter() {
+    let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let s = spec();
+    let mut w = device();
+    let mut target = specrt::backends::Backend::limits(&w).target();
+    target.features &= !(1 << kir::Feature::Subgroups as u32);
+    target.warp_size = 1;
+    let kernels = wgsl::generate(&s, 64, &target).unwrap();
+    assert!(!kernels.iter().find(|k| k.name == "rmsnorm").unwrap().source.contains("subgroupAdd"));
+    w.compile(&kernels).unwrap();
+    let h = s.dims.hidden;
+    let mut rng = Lcg(5);
+    let rows = 3;
+    let x: Vec<f32> = (0..rows * h).map(|_| rng.unit() * 4.0).collect();
+    let weight: Vec<f32> = (0..h).map(|_| rng.unit() + 1.5).collect();
+    let (xb, wb, ob) = (f32_buf(&w, &x), f32_buf(&w, &weight), f32_buf(&w, &vec![0.0; rows * h]));
+    go(&mut w, "rmsnorm", &[&xb, &wb, &ob], [0, 0, 0, 0, 0, 0, 0, 0], [rows as u32, 1, 1]);
+    let mut want = Vec::new();
+    for r in 0..rows {
+        let row = &x[r * h..(r + 1) * h];
+        let inv = 1.0 / (row.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / h as f64 + s.norm.eps).sqrt();
+        want.extend(row.iter().zip(&weight).map(|(v, w)| (*w as f64 * (*v as f64 * inv)) as f32));
+    }
+    close(&read_f32(&w, &ob, rows * h), &want, 1e-5, "rmsnorm tree");
 }
