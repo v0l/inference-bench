@@ -8,3 +8,11 @@ architectures = ["AcmeForCausalLM"]
 
 [attention]
 qk_norm = true
+
+[activation.map]
+swish_glu = "swiglu"
+tanh_glu = "geglu"
+
+[fields]
+hidden_size = ["n_embd"]
+hidden_act = ["ffn_act"]

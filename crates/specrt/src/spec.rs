@@ -729,14 +729,14 @@ fn target_slot(rule: &crate::family::FamilyQuant, target: &str) -> Result<(usize
     let rest = target
         .split_once(rule.layer_marker.as_str())
         .map(|(_, r)| r)
-        .with_context(|| format!("compressed-tensors target {target} is not a layer projection"))?;
+        .with_context(|| format!("quantisation target {target} is not a layer projection"))?;
     let (layer, module) = rest.split_once('.').context("layer target without a module")?;
     let layer: usize = layer.parse().with_context(|| format!("target {target}"))?;
     Ok((layer, module.starts_with(rule.mlp_marker.as_str())))
 }
 
 fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, layers: usize) -> Result<Quantization> {
-    let groups = q[rule.groups_key.as_str()].as_object().context("compressed-tensors config has no config_groups")?;
+    let groups = q[rule.groups_key.as_str()].as_object().context("the quantisation config has no groups")?;
     let mut projection: Option<Quant> = None;
     let mut act = ActQuant::None;
     let mut mlp_act = ActQuant::None;
@@ -769,7 +769,7 @@ fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, la
             }
         }
     }
-    let quant = projection.context("compressed-tensors config quantises no attention projection")?;
+    let quant = projection.context("the quantisation config covers no attention projection")?;
     ensure!(quant == Quant::Fp8Channel, "attention projections in {quant:?} are not supported");
     let mlp: Vec<Quant> = mlp
         .into_iter()

@@ -40,6 +40,44 @@ fn every_embedded_family_has_a_name_and_a_match_or_is_generic() {
     assert!(r.for_model_type("qwen3_5_text").is_some() && r.for_model_type("mistral").is_some());
 }
 
+fn production_lines(file: &str) -> Vec<(usize, String)> {
+    let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+    let mut out = Vec::new();
+    let mut skipping = false;
+    for (n, line) in text.lines().enumerate() {
+        if line.starts_with("#[cfg(test)]") {
+            break;
+        }
+        if line.starts_with("const ") && line.contains("_ARCHS") {
+            skipping = true;
+        }
+        if skipping {
+            skipping = !line.trim_end().ends_with("];");
+            continue;
+        }
+        out.push((n + 1, line.to_string()));
+    }
+    out
+}
+
+#[test]
+fn the_mapper_names_no_architecture_activation_or_quant_method() {
+    let r = Registry::embedded();
+    let mut forbidden: Vec<String> = r.families().iter().flat_map(|f| f.matches.model_types.iter().cloned()).collect();
+    forbidden.extend(r.families().iter().flat_map(|f| f.activation.map.keys().cloned()));
+    forbidden.extend(r.families().iter().flat_map(|f| f.gguf.pretokenizers.keys().cloned()));
+    forbidden.extend(["gelu", "silu", "swish", "compressed-tensors", "float-quantized", "nvfp4-pack-quantized", "e4m3", "gptq", "awq", "bfloat16", "float16", "float32", "gemma", "phi3", "mistral"].map(String::from));
+    forbidden.sort();
+    forbidden.dedup();
+    for file in ["src/spec.rs", "src/gguf.rs", "src/family.rs"] {
+        for (n, line) in production_lines(file) {
+            for word in &forbidden {
+                assert!(!line.contains(&format!("\"{word}\"")) && !line.contains(&format!("\"{word}")), "{file}:{n} names {word}: {line}");
+            }
+        }
+    }
+}
+
 #[test]
 fn spec_rs_and_library_rs_name_no_model_type() {
     let r = Registry::embedded();
@@ -64,4 +102,32 @@ fn spec_rs_and_library_rs_name_no_model_type() {
             }
         }
     }
+}
+
+#[test]
+fn a_family_with_its_own_key_names_and_activation_builds_by_toml_alone() {
+    let acme = std::fs::read_to_string(fixtures().join("family-acme.toml")).unwrap();
+    let base = std::fs::read_to_string(fixtures().join("qwen3-0.6b.config.json")).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&base).unwrap();
+    v["model_type"] = "acmelm".into();
+    let hidden = v.as_object_mut().unwrap().remove("hidden_size").unwrap();
+    v["n_embd"] = hidden;
+    v.as_object_mut().unwrap().remove("hidden_act");
+    v["ffn_act"] = "tanh_glu".into();
+    let built = Spec::from_hf_config_serving_in(&registry_with(&[&acme]), &v.to_string()).unwrap();
+    assert_eq!(built.dims.hidden, 1024);
+    assert_eq!(built.mlp.activation, specrt::spec::Activation::Geglu);
+    assert!(Spec::from_hf_config_serving_in(&registry_with(&[]), &v.to_string()).is_err());
+}
+
+#[test]
+fn a_gguf_architecture_needs_only_a_family_toml() {
+    let family = Registry::from_texts(EMBEDDED.iter().map(|(_, t)| *t).chain([include_str!("fixtures/family-acme.toml")])).unwrap();
+    assert!(family.for_gguf("acmelm").is_none());
+    let acme = std::fs::read_to_string(fixtures().join("family-acme.toml")).unwrap() + "\n";
+    let with_gguf = acme.replace("model_types = [\"acmelm\"]", "model_types = [\"acmelm\"]\ngguf = [\"acmelm\"]");
+    let r = registry_with(&[&with_gguf]);
+    let f = r.for_gguf("acmelm").unwrap();
+    assert_eq!(f.gguf.key("block_count", "acmelm").unwrap(), "acmelm.block_count");
+    assert_eq!(f.gguf.tensor("embedding").unwrap(), "token_embd.weight");
 }
