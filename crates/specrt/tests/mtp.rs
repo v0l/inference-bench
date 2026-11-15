@@ -588,3 +588,22 @@ fn a_speculative_round_synchronises_the_stream_at_most_once() {
         assert_eq!(sizes, if graphs { vec![4] } else { Vec::new() });
     }
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn speculation_with_fp8_kv_is_identical_to_plain_greedy_with_fp8_kv() {
+    let mut s = spec(2);
+    s.runtime.kv_dtype = specrt::spec::KvDtype::Fp8;
+    let ps = prompts();
+    let want = plain_greedy(&s, &ps);
+    for batch in [1, 4] {
+        let (got, mean) = speculative_greedy(&s, &ps, &want, Drafts::Mtp, batch);
+        eprintln!("fp8 kv, batch {batch}: mean acceptance length {mean:.3}");
+        check(&format!("fp8 kv, batch {batch}"), &got, &want);
+        let (got, _) = speculative_greedy(&s, &ps, &want, Drafts::Wrong(0), batch);
+        check(&format!("fp8 kv, batch {batch}, staggered rejections"), &got, &want);
+        let (got, mean) = speculative_greedy(&s, &ps, &want, Drafts::Oracle(2), batch);
+        assert!(mean > 2.8, "oracle drafts: {mean}");
+        check(&format!("fp8 kv, batch {batch}, oracle drafts"), &got, &want);
+    }
+}

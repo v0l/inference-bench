@@ -49,10 +49,10 @@ fn kv_dtype_reads_from_the_runtime_table() {
 
 fn fp8_logits_track_f16(dir: &str, len: usize) {
     let prompt: Vec<u32> = (0..len as u32).map(|i| (i * 37 + 11) % 1024).collect();
-    let pages = 512usize.div_ceil(specrt::codegen::PAGE) as u32;
+    let pages = 4608usize.div_ceil(specrt::codegen::PAGE) as u32;
     let run = |kv: KvDtype| {
         let s = spec_for(dir, kv);
-        let layout = Layout { prefill_chunk: 128, kv_planes: 1, ..Layout::contiguous(512, 1) };
+        let layout = Layout { prefill_chunk: 128, kv_planes: 1, ..Layout::contiguous(4608, 1) };
         let mut rt = Runtime::load_layout(&s, layout).unwrap();
         rt.set_block_table(0, &(0..pages).collect::<Vec<_>>()).unwrap();
         rt.prompt_logits(&prompt).unwrap()
@@ -76,4 +76,11 @@ fn tiny_fp8_kv_logits_stay_within_the_documented_kl_of_f16() {
 #[ignore = "needs a CUDA GPU"]
 fn head_dim_256_fp8_kv_logits_stay_within_the_documented_kl_of_f16() {
     fp8_logits_track_f16("tiny-qwen3.5-hd256", 300);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn tiny_fp8_kv_logits_stay_close_at_4096_tokens() {
+    fp8_logits_track_f16("tiny-qwen3.5", 4096);
+    fp8_logits_track_f16("tiny-qwen3.5-hd256", 4096);
 }

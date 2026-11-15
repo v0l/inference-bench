@@ -37,15 +37,30 @@ Kernels dequantise in registers: `attention_split` (single stream decode), `batc
 
 Documented bound for fp8: KL against the f16 cache under 0.02 and the same arg max on the tiny fixtures. The bf16 1e-3 logit gate stays for f16.
 
-### Not yet measured
+### 27B NVFP4 gate (15 Nov, desktop window, shared GPU, `scripts/kvgate27b.sh`, `src/bin/kvgate.rs`)
 
-These need the real 27B and a quiet GPU window from the parent, so the default stays `f16` and the numbers are open:
+Prompts are the repeated `spec_prompts.txt` text; each KL row is the mean over the prefill-final position and 8 teacher-forced decode steps per prompt, fp8 KV against the 1-plane f16 KV.
 
-- KL against bf16 KV over 20 prompts at 8k and 32k, a 128k needle, MTP acceptance.
-- Decode tok/s at 32k and 128k single stream and at batch 8 (nsys `attention_split` and `batch_decode_attention` times).
-- KV token capacity of a fixed GB pool (expected about 1.9x f16).
+| context | prompts | mean KL | max KL | top-1 agree |
+| --- | --- | --- | --- | --- |
+| 512 | 4 | 0.00008 | 0.0004 | 1.00 |
+| 2048 | 3 | 0.0008 | 0.020 | 1.00 |
+| 4096 | 3 | 0.118 | 3.13 | 0.96 |
+| 8192 | 20 | 0.291 | 9.65 | 0.93 |
 
-Flip the default in `RuntimeOptions::default` only after those pass.
+The noise floor (f16 1 plane against the 2 plane hi/lo layout, 4096 tokens) is 6e-5, so the loss is real fp8 loss. It grows with context and is dominated by a few positions with a huge KL (a flat position flipping to a sharp one), not by a uniform drift. The tiny fixtures stay at 1e-6 at 4096 tokens, so the kernels are not broken; the 27B keys are simply more sensitive to a 3 bit mantissa than the tiny random weights.
+
+Decode at 8192 tokens, batch 8, 27B NVFP4 (GPU shared with other jobs, so indicative only): f16 276.5 tok/s aggregate, fp8 280.8 tok/s (+1.6 percent). The 32k and 128k speed rows, the 32k KL, the 128k needle and MTP acceptance were not measured: each load costs about 40 s and the window shares the lock with other workers.
+
+Decision: the default stays `f16`. fp8 is opt-in and fails the 27B gate as it stands (KL 0.29 at 8k against a 0.02 bound). vLLM runs fp8 KV with no scale at all, so this is the cost of the same format. Next step before more formats: try a finer scale (per row, per 64 channel group) and keep the first 16 tokens (attention sink) in f16, then rerun `scripts/kvgate27b.sh`.
+
+### Rerun the gate
+
+```sh
+cd crates/specrt
+CARGO_TARGET_DIR=/mnt/data/cargo-target/inference-bench-324 cargo build --release --bin kvgate --bin bench
+flock /tmp/gpu27.lock scripts/kvgate27b.sh /tmp/kv324.txt /mnt/data/cargo-target/inference-bench-324/release [kl|needle|speed|mtp|all]
+```
 
 ## TurboQuant notes
 

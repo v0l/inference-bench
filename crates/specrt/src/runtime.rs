@@ -746,8 +746,12 @@ impl Runtime {
     }
 
     pub fn load_batched(spec: &Spec, max_ctx: usize, batch: usize) -> Result<Self> {
+        Self::load_batched_planes(spec, max_ctx, batch, 2)
+    }
+
+    pub fn load_batched_planes(spec: &Spec, max_ctx: usize, batch: usize, kv_planes: usize) -> Result<Self> {
         ensure!(batch >= 1, "batch must be at least 1");
-        let mut rt = Self::load_layout(spec, Layout::contiguous(max_ctx, batch))?;
+        let mut rt = Self::load_layout(spec, Layout { kv_planes, ..Layout::contiguous(max_ctx, batch) })?;
         rt.batch = batch;
         let pages = rt.pages;
         for slot in 0..batch {
