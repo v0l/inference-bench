@@ -52,6 +52,29 @@ The noise floor (f16 1 plane against the 2 plane hi/lo layout, 4096 tokens) is 6
 
 Decode at 8192 tokens, batch 8, 27B NVFP4 (GPU shared with other jobs, so indicative only): f16 276.5 tok/s aggregate, fp8 280.8 tok/s (+1.6 percent). The 32k and 128k speed rows, the 32k KL, the 128k needle and MTP acceptance were not measured: each load costs about 40 s and the window shares the lock with other workers.
 
+### Where the fp8 loss comes from (15 Nov, bisection)
+
+Not a kernel bug. The loss shows up identically when fp8 is emulated in the store path of the f16 cache (quantise and dequantise at write time, then the unchanged f16 read kernels), so the fp8 read paths in `flash_mma`, `attention_split` and `batch_decode_attention` agree with the store. Prompt 1 at 4096 tokens, KL at the one spiking position (decode step 4, where the f16 reference top-1 probability is only 0.62; everywhere else it is 0.99+):
+
+| fp8 applied to | spike KL |
+| --- | --- |
+| real fp8 kernels, all layers, K and V | 3.13 |
+| emulated, all layers, K and V | 2.82 |
+| emulated, K only | 4.11 |
+| emulated, V only | 3.01 |
+| emulated, KV layers 0 to 7 | 2.63 |
+| emulated, KV layers 8 to 15 | 0.066 |
+| emulated, KV layers 0 to 3 | 2.88 |
+| emulated, KV layers 4 to 7 | 4.22 |
+| emulated, KV layers 8 to 11 | 0.020 |
+| emulated, KV layers 12 to 15 | 0.028 |
+| emulated, scale per 32 channels instead of per row | 1.81 |
+| emulated, first 1 or 16 tokens left exact | 3.16, 3.08 |
+
+So the damage sits in the early full-attention layers (0 to 7), both K and V contribute, finer scales help only a little, and the attention sink tokens are not the cause. The rows are not saturating: the scale is `amax / 448` per row, so the largest channel maps to 448 exactly. The error is the 3 bit mantissa of e4m3 itself (about 6 percent relative) on layers whose attention is sharp, which flips a flat position. Checked: K and V use one scale per row in every kernel (`kv_scale` is read with the same row index as `kv_row`), the cache is one plane under fp8 (`load_stage` forces it), and prefill-final positions agree to 4e-4 while the decode steps carry the spikes.
+
+Options, in order of cost: keep KV layers 0 to 7 in f16 and quantise 8 to 15 (about 0.75x bytes instead of 0.52x, spike KL 0.07), or move to a format with more mantissa for the early layers (int8 with a per-row scale, slice 2). Neither is implemented.
+
 Decision: the default stays `f16`. fp8 is opt-in and fails the 27B gate as it stands (KL 0.29 at 8k against a 0.02 bound). vLLM runs fp8 KV with no scale at all, so this is the cost of the same format. Next step before more formats: try a finer scale (per row, per 64 channel group) and keep the first 16 tokens (attention sink) in f16, then rerun `scripts/kvgate27b.sh`.
 
 ### Rerun the gate

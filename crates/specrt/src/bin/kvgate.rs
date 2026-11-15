@@ -64,7 +64,8 @@ fn text_prompts(spec: &Spec) -> Result<Vec<u32>> {
 
 fn kl_mode(spec: &Spec, len: usize, n: usize, calibrate: bool) -> Result<()> {
     let base = text_prompts(spec)?;
-    let prompts: Vec<Vec<u32>> = (0..n).map(|i| (0..len + DECODE_STEPS).map(|j| base[(j + i * 131) % base.len()]).collect()).collect();
+    let only: Option<usize> = std::env::var("KVGATE_ONLY").ok().and_then(|v| v.parse().ok());
+    let prompts: Vec<Vec<u32>> = (0..n).filter(|i| only.is_none_or(|o| o == *i)).map(|i| (0..len + DECODE_STEPS).map(|j| base[(j + i * 131) % base.len()]).collect()).collect();
     let mut logits: Vec<Vec<Vec<Vec<f32>>>> = Vec::new();
     for dtype in DTYPES {
         let planes = if calibrate && !dtype.is_fp8() { 2 } else { 1 };
@@ -82,6 +83,10 @@ fn kl_mode(spec: &Spec, len: usize, n: usize, calibrate: bool) -> Result<()> {
     for (pa, pb) in logits[0].iter().zip(&logits[1]) {
         let per: Vec<String> = pa.iter().zip(pb).map(|(x, y)| format!("{:.4}", kl(x, y))).collect();
         println!("  per position kl: {}", per.join(" "));
+        let top: Vec<String> = pa.iter().map(|x| format!("{:.3}", log_softmax(x).into_iter().fold(f64::MIN, f64::max).exp())).collect();
+        println!("  reference top1 prob: {}", top.join(" "));
+        let gap: Vec<String> = pa.iter().zip(pb).map(|(x, y)| format!("{}", (argmax(x) == argmax(y)) as u8)).collect();
+        println!("  top1 agree:          {}", gap.join(" "));
         for (x, y) in pa.iter().zip(pb) {
             let d = kl(x, y);
             sum += d;
