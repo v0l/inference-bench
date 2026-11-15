@@ -33,24 +33,31 @@ out = "xn_planes"
 
 ## Status
 
-- `graphs/decoder.toml` is the one embedded graph. It has the head, the tail, and four blocks
-  (attention, linear, attention with sparse MLP, linear with sparse MLP), each node tagged
-  `when = "tensor_core"` or `"legacy"` and `phase`. `Plan::build` lowers it through `graph.rs`;
-  `plan.rs` has no block-kind or op-sequence code. `tests/graph.rs` checks the lowered plan equals the
-  previous hand-written plan for every fixture config in every phase and kernel tier, and greps
-  `plan.rs` for architecture knowledge.
-- kir gained generic light primitives: `rmsnorm_offset` (`(1+w)` norm), `add_rmsnorm` (residual add
-  fused with the norm), `pointwise` (`Scale` for embedding scale, `SoftCap`). Emitted for CUDA, with
-  tests in `crates/kir/tests/emit.rs`. The runtime does not launch them yet.
+- `graphs/decoder.toml` is the one embedded graph. Blocks carry `when` conditions (`plain`,
+  `sandwich`, `tensor_core`, `legacy`, `logit_softcap`, joined with `+`) and `mlp = "dense" | "sparse"`.
+  `Plan::build` lowers it through `graph.rs`; `plan.rs` has no block-kind or op-sequence code.
+  `tests/graph.rs` checks the lowered plan equals the previous hand-written plan for every fixture
+  config, and greps `plan.rs`, `runtime*` and `kir` for architecture knowledge.
+- Generic parameters, all read from the family TOML and the model config: `(1+w)` norm offset
+  (`[norm] unit_offset`), sandwich norms (`[norm] sandwich`, nodes `norm_add` and `clear`), embedding
+  scale (`[embedding] scale`), final logit soft-cap (`logit_softcap` node), attention soft-cap, query
+  scalar, sliding window per layer, and a per-layer rope base (`rope_parameters` keyed by layer type).
+- kir light primitives: `rmsnorm_offset`, `add_rmsnorm`, `norm_add`, `add` and `pointwise` (scale,
+  soft-cap, fill). `norm_add` and `pointwise` run from graph nodes; `add_rmsnorm` and `add` are
+  emitted and tested but not launched. WGSL refuses the new bodies with a clear error (tested).
+- Attention kernels (`flash_mma`, `flash_attention`, `attention_split`, grouped
+  `batch_decode_attention`) take `window` and a compiled soft-cap and query scale.
+- Gemma 3 runs from `family-gemma3.toml` plus the sandwich block, with no Gemma-specific Rust:
+  `tests/gemma3.rs` against `scripts/tiny_gemma3.py` (sliding and global layers, both soft-caps).
+  Sliding is proven by `tests/sliding.rs`.
 
 ## Not done
 
-- Launching the new kir primitives from graph nodes (the runtime still uses the fixed kernels).
-- Sliding-window attention: the flash and decode attention kernels have no window option, and
-  `Spec::validate` refuses sliding layers. The Gemma 3 proof needs that kernel option, the extra
-  pre/post feed-forward norms, per-layer rope base and the embedding scale, each as a generic
-  graph parameter. Waiting on the attention kernel family work (#609, #620-#623).
+- Residual plus norm through the fused `add_rmsnorm` in the existing dense block (the GEMM
+  residual epilogue already fuses the add; a fused kernel needs a GEMM without that epilogue).
 - MTP and vision are still driven by their own runtimes, not graph nodes.
+- Gemma 3 serves through the plan paths (prefill, batch decode); the single-sequence `generate`
+  decode loop (`step_traced`) is still fixed code and does not know sandwich norms.
 
 ## Prior art
 
