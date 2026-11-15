@@ -961,6 +961,70 @@ mod watchdog_tests {
         core.stop();
     }
 
+    struct CountingExec {
+        plans: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Executor for CountingExec {
+        fn max_ctx(&self) -> usize {
+            4096
+        }
+        fn slots(&self) -> usize {
+            2
+        }
+        fn kv_blocks(&self) -> usize {
+            64
+        }
+        fn chunk_limit(&self) -> usize {
+            64
+        }
+        fn set_table(&mut self, _slot: usize, _blocks: &[u32]) -> Result<()> {
+            Ok(())
+        }
+        fn prefill(&mut self, _slot: usize, _tokens: &[u32], _start: usize, _sample: Option<(crate::runtime::Sampling, u32)>) -> Result<Option<u32>> {
+            Ok(Some(1))
+        }
+        fn decode(&mut self, rows: &[crate::runtime::DecodeRow]) -> Result<Vec<u32>> {
+            Ok(vec![1; rows.len()])
+        }
+        fn plan_media(&mut self, _prompt: &[u32], _media: &[sched::MediaInput]) -> Result<Arc<crate::vision::MediaPlan>> {
+            self.plans.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("counted")
+        }
+    }
+
+    fn media_job(cancelled: bool) -> (Job, std::sync::mpsc::Receiver<SeqEvent>) {
+        let (mut j, rx) = job();
+        j.cancel = Arc::new(AtomicBool::new(cancelled));
+        j.request.media = vec![sched::MediaInput {
+            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 80, 60], data: Vec::new() }),
+            hash: [7; 32],
+        }];
+        (j, rx)
+    }
+
+    #[test]
+    fn a_classify_burst_whose_clients_timed_out_is_never_encoded() {
+        let plans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut sched = Scheduler::new(CountingExec { plans: plans.clone() }, Config::default());
+        let (tx, inbox) = channel::<Job>();
+        let mut gone_rx = Vec::new();
+        for _ in 0..7 {
+            let (gone, rx) = media_job(true);
+            tx.send(gone).unwrap();
+            gone_rx.push(rx);
+        }
+        let (stays, stays_rx) = media_job(false);
+        tx.send(stays).unwrap();
+        drop(tx);
+        run(&mut sched, inbox, Arc::new(Mutex::new(Stats::default())), Arc::new(Pulse::new()));
+        for rx in gone_rx {
+            assert!(matches!(rx.try_recv().unwrap(), SeqEvent::Finished { finish: Finish::Cancelled, .. }));
+        }
+        assert!(matches!(stays_rx.try_recv().unwrap(), SeqEvent::Failed(_)));
+        assert_eq!(plans.load(Ordering::SeqCst), 1, "only the live request may reach the vision encoder");
+    }
+
     #[test]
     fn a_slow_but_finishing_engine_is_not_failed() {
         let release = Arc::new(AtomicBool::new(false));

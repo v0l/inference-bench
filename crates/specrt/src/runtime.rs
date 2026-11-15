@@ -1983,7 +1983,9 @@ impl Runtime {
         let mut plan = crate::vision::plan_media(prompt, &vis.tokens, merge, &processed, &hashes)?;
         let mut embeds = Vec::new();
         for p in &processed {
+            let started = std::time::Instant::now();
             embeds.extend(enc.encode(p.patches())?.embeds);
+            tracing::info!(grid = ?p.patches().grid, encode_ms = started.elapsed().as_secs_f64() * 1e3, "vision encode");
         }
         plan.embeds = Arc::new(embeds);
         Ok(Arc::new(plan))
