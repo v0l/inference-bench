@@ -168,6 +168,21 @@ fn chain(o: &mut String, c: &specrt::sched::ChainMetrics) {
     let _ = writeln!(o, "# TYPE inference_pipeline_overlapped_prefills_total counter\ninference_pipeline_overlapped_prefills_total {}", c.overlapped_prefills);
 }
 
+fn vllm_names(o: &mut String, s: &Stats) {
+    let usage = if s.kv_blocks_total > 0 { s.kv_blocks_used as f64 / s.kv_blocks_total as f64 } else { 0.0 };
+    let one = |o: &mut String, name: &str, kind: &str, help: &str, v: f64| {
+        let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}");
+    };
+    one(o, "vllm:kv_cache_usage_perc", "gauge", "KV cache usage, 1 means 100 percent.", usage);
+    one(o, "vllm:num_preemptions_total", "counter", "Cumulative preemptions from the engine.", s.preemptions as f64);
+    one(o, "vllm:prefix_cache_queries_total", "counter", "Prefix cache queries, in tokens.", s.prefix_queries as f64);
+    one(o, "vllm:prefix_cache_hits_total", "counter", "Prefix cache hits, in tokens.", s.prefix_hits as f64);
+    one(o, "vllm:spec_decode_num_draft_tokens_total", "counter", "Number of draft tokens.", s.spec_drafted as f64);
+    one(o, "vllm:spec_decode_num_accepted_tokens_total", "counter", "Number of accepted tokens.", s.spec_accepted as f64);
+    histogram(o, "vllm:inter_token_latency_seconds", "Histogram of inter-token latency in seconds.", &s.inter_token_secs);
+    histogram(o, "vllm:request_queue_time_seconds", "Histogram of time spent in the WAITING phase for a request.", &s.queue_secs);
+}
+
 pub fn render(s: &Stats) -> String {
     let mut o = String::new();
     let gauge = |o: &mut String, name: &str, help: &str, v: f64| {
@@ -209,6 +224,7 @@ pub fn render(s: &Stats) -> String {
         "# HELP inference_spec_accepted_tokens_total MTP draft tokens the target accepted.\n# TYPE inference_spec_accepted_tokens_total counter\ninference_spec_accepted_tokens_total {}",
         s.spec_accepted
     );
+    vllm_names(&mut o, s);
     if let Some(c) = &s.chain {
         chain(&mut o, c);
     }
@@ -242,6 +258,13 @@ mod tests {
             "inference_spec_accepted_tokens_total 7",
             "inference_inter_token_seconds_bucket{le=\"0.035\"} 1",
             "inference_inter_token_seconds_bucket{le=\"+Inf\"} 2",
+            "vllm:kv_cache_usage_perc 0.4",
+            "vllm:num_preemptions_total 1",
+            "vllm:prefix_cache_hits_total 50",
+            "vllm:spec_decode_num_draft_tokens_total 10",
+            "vllm:spec_decode_num_accepted_tokens_total 7",
+            "vllm:inter_token_latency_seconds_bucket{le=\"0.035\"} 1",
+            "vllm:request_queue_time_seconds_count 0",
             "inference_prefill_tokens_per_step_count 0",
             "inference_batch_size_count 0",
             "inference_queue_seconds_count 0",

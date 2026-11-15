@@ -886,3 +886,23 @@ fn before_load_runs_first_and_a_failure_refuses_the_load() {
     assert_eq!(rig.stats.loads.load(Ordering::SeqCst), 0);
     rig.stop();
 }
+
+#[test]
+fn metrics_carry_vllm_names_beside_our_own() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("m", false)).0, 200);
+    let text = rig.metrics();
+    for name in [
+        "vllm:num_requests_running{engine=\"0\",model_name=\"m\"}",
+        "vllm:num_requests_waiting",
+        "vllm:prompt_tokens_total{engine=\"0\",model_name=\"m\"}",
+        "vllm:generation_tokens_total{engine=\"0\",model_name=\"m\"}",
+        "vllm:request_success_total{engine=\"0\",finished_reason=\"length\",model_name=\"m\"} 1",
+        "vllm:time_to_first_token_seconds_bucket",
+        "vllm:time_to_first_token_seconds_count",
+        "inference_ttft_seconds_count",
+    ] {
+        assert!(text.contains(name), "{name} missing from\n{text}");
+    }
+    rig.stop();
+}

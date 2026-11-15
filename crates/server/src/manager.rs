@@ -359,7 +359,10 @@ impl Manager {
     pub fn engine_metrics(&self) -> String {
         let mut models: Vec<Arc<LoadedModel>> = self.loaded.lock().unwrap().values().cloned().collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));
-        models.iter().filter_map(|m| m.stats.lock().unwrap().as_ref().and_then(|t| t.metrics())).collect()
+        models
+            .iter()
+            .filter_map(|m| m.stats.lock().unwrap().as_ref().and_then(|t| t.metrics()).map(|t| crate::metrics::label_vllm(&t, &m.id)))
+            .collect()
     }
 
     pub fn status(&self) -> Vec<ModelStatus> {

@@ -33,6 +33,7 @@ struct Inner {
     decode_secs: f64,
     last_decode_tok_s: f64,
     cancelled: u64,
+    finished: BTreeMap<(String, String), u64>,
     thinking_wrapups: u64,
     model_loads: BTreeMap<String, u64>,
     model_load_failures: u64,
@@ -83,6 +84,10 @@ impl Metrics {
 
     pub fn request(&self, endpoint: &str, status: u16) {
         *self.inner.lock().unwrap().requests.entry((endpoint.to_string(), status)).or_default() += 1;
+    }
+
+    pub fn finished(&self, model: &str, reason: &str) {
+        *self.inner.lock().unwrap().finished.entry((model.to_string(), reason.to_string())).or_default() += 1;
     }
 
     pub fn generation(&self, model: &str, prompt: u64, completion: u64, ttft: f64, decode_tokens: u64, decode_secs: f64) {
@@ -189,8 +194,65 @@ impl Metrics {
             let _ = writeln!(o, "# HELP inference_gpu_memory_used_bytes GPU memory in use on device 0.\n# TYPE inference_gpu_memory_used_bytes gauge\ninference_gpu_memory_used_bytes {used}");
         }
         o.push_str(&g.engine);
+        self.render_vllm(&mut o, &m, g);
         o
     }
+}
+
+impl Metrics {
+    fn render_vllm(&self, o: &mut String, m: &Inner, g: &Gauges) {
+        let models: Vec<&str> = match g.loaded_models.is_empty() {
+            true => m.prompt_tokens.keys().map(String::as_str).collect(),
+            false => g.loaded_models.iter().map(|(id, _)| id.as_str()).collect(),
+        };
+        let first = models.first().copied().unwrap_or("");
+        let _ = writeln!(o, "# HELP vllm:num_requests_running Number of requests in model execution batches.\n# TYPE vllm:num_requests_running gauge");
+        let _ = writeln!(o, "vllm:num_requests_running{{engine=\"0\",model_name=\"{first}\"}} {}", g.in_flight);
+        let _ = writeln!(o, "# HELP vllm:num_requests_waiting Number of requests waiting to be processed.\n# TYPE vllm:num_requests_waiting gauge");
+        let _ = writeln!(o, "vllm:num_requests_waiting{{engine=\"0\",model_name=\"{first}\"}} {}", g.queue_depth);
+        let _ = writeln!(o, "# HELP vllm:prompt_tokens_total Number of prefill tokens processed.\n# TYPE vllm:prompt_tokens_total counter");
+        for (model, n) in &m.prompt_tokens {
+            let _ = writeln!(o, "vllm:prompt_tokens_total{{engine=\"0\",model_name=\"{model}\"}} {n}");
+        }
+        let _ = writeln!(o, "# HELP vllm:generation_tokens_total Number of generation tokens processed.\n# TYPE vllm:generation_tokens_total counter");
+        for (model, n) in &m.completion_tokens {
+            let _ = writeln!(o, "vllm:generation_tokens_total{{engine=\"0\",model_name=\"{model}\"}} {n}");
+        }
+        let _ = writeln!(o, "# HELP vllm:request_success_total Count of successfully processed requests.\n# TYPE vllm:request_success_total counter");
+        for ((model, reason), n) in &m.finished {
+            let _ = writeln!(o, "vllm:request_success_total{{engine=\"0\",finished_reason=\"{reason}\",model_name=\"{model}\"}} {n}");
+        }
+        let _ = writeln!(o, "# HELP vllm:time_to_first_token_seconds Histogram of time to first token in seconds.\n# TYPE vllm:time_to_first_token_seconds histogram");
+        let labels = format!("engine=\"0\",model_name=\"{first}\"");
+        for (i, bound) in TTFT_BUCKETS.iter().enumerate() {
+            let _ = writeln!(o, "vllm:time_to_first_token_seconds_bucket{{{labels},le=\"{bound}\"}} {}", m.ttft.counts[i]);
+        }
+        let _ = writeln!(o, "vllm:time_to_first_token_seconds_bucket{{{labels},le=\"+Inf\"}} {}", m.ttft.total);
+        let _ = writeln!(o, "vllm:time_to_first_token_seconds_sum{{{labels}}} {}\nvllm:time_to_first_token_seconds_count{{{labels}}} {}", m.ttft.sum, m.ttft.total);
+    }
+}
+
+pub fn label_vllm(text: &str, model: &str) -> String {
+    let labels = format!("engine=\"0\",model_name=\"{model}\"");
+    let mut out = String::with_capacity(text.len() + 64);
+    for line in text.lines() {
+        if !line.starts_with("vllm:") {
+            out.push_str(line);
+        } else if let Some(open) = line.find('{') {
+            out.push_str(&line[..=open]);
+            out.push_str(&labels);
+            out.push(',');
+            out.push_str(&line[open + 1..]);
+        } else if let Some(space) = line.find(' ') {
+            out.push_str(&line[..space]);
+            out.push_str(&format!("{{{labels}}}"));
+            out.push_str(&line[space..]);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 pub fn percentile(sorted: &[f64], p: f64) -> f64 {
@@ -216,6 +278,35 @@ mod tests {
         assert!(text.contains("inference_ttft_seconds_count 2"));
         assert!(text.contains("inference_completion_tokens_total{model=\"m\"} 10"));
         assert!(text.contains("inference_decode_tokens_per_second{window=\"mean\"} 20"));
+    }
+
+    #[test]
+    fn vllm_named_series_carry_the_dashboard_labels() {
+        let m = Metrics::default();
+        m.generation("qwen", 3, 5, 0.03, 4, 0.2);
+        m.finished("qwen", "stop");
+        let g = Gauges { queue_depth: 2, in_flight: 1, loaded_models: vec![("qwen".into(), 1)], ..Gauges::default() };
+        let text = m.render(&g);
+        for want in [
+            "vllm:num_requests_running{engine=\"0\",model_name=\"qwen\"} 1",
+            "vllm:num_requests_waiting{engine=\"0\",model_name=\"qwen\"} 2",
+            "vllm:prompt_tokens_total{engine=\"0\",model_name=\"qwen\"} 3",
+            "vllm:generation_tokens_total{engine=\"0\",model_name=\"qwen\"} 5",
+            "vllm:request_success_total{engine=\"0\",finished_reason=\"stop\",model_name=\"qwen\"} 1",
+            "vllm:time_to_first_token_seconds_bucket{engine=\"0\",model_name=\"qwen\",le=\"0.05\"} 1",
+            "vllm:time_to_first_token_seconds_count{engine=\"0\",model_name=\"qwen\"} 1",
+        ] {
+            assert!(text.contains(want), "{want} missing from\n{text}");
+        }
+    }
+
+    #[test]
+    fn engine_series_get_the_model_label_added() {
+        let text = label_vllm("# HELP vllm:a x\nvllm:a 1\nvllm:h_bucket{le=\"0.1\"} 2\ninference_x 3\n", "m");
+        assert!(text.contains("vllm:a{engine=\"0\",model_name=\"m\"} 1"), "{text}");
+        assert!(text.contains("vllm:h_bucket{engine=\"0\",model_name=\"m\",le=\"0.1\"} 2"), "{text}");
+        assert!(text.contains("\ninference_x 3"), "{text}");
+        assert!(text.contains("# HELP vllm:a x"));
     }
 
     #[test]

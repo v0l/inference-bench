@@ -962,6 +962,7 @@ fn record_generation(state: &AppState, model: &str, g: &Generation, max_tokens: 
     span.record("ttft_ms", g.ttft_secs * 1000.0);
     span.record("decode_tok_s", decode_rate(g));
     span.record("finish_reason", reason);
+    state.metrics.finished(model, reason);
     state.metrics.generation(
         model,
         g.prompt_tokens,
