@@ -16,6 +16,7 @@ use std::time::Instant;
 
 mod exec;
 mod fused;
+mod moe;
 mod mtp;
 mod snapshot;
 mod stage;
@@ -119,7 +120,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)? };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m)).transpose()? };
     copied(stream)?;
     Ok(layer)
 }
@@ -363,6 +364,7 @@ struct DeviceLayer {
     mixer: DeviceMixer,
     gate_up: DeviceMatrix,
     down: DeviceMatrix,
+    moe: Option<moe::DeviceMoe>,
 }
 
 fn opt_bytes(v: &Option<CudaSlice<f32>>) -> u64 {
@@ -389,6 +391,7 @@ impl DeviceLayer {
         mixer
             + self.gate_up.bytes()
             + self.down.bytes()
+            + self.moe.as_ref().map_or(0, moe::DeviceMoe::bytes)
             + (self.ln1.num_bytes() + self.ln2.num_bytes()) as u64
     }
 }
@@ -578,6 +581,7 @@ struct PrefillBuffers {
     attn_planes: Planes,
     act_planes: Planes,
     dummy_u16: CudaSlice<u16>,
+    dummy_u8: CudaSlice<u8>,
 }
 
 pub struct BatchGeneration {
@@ -616,6 +620,7 @@ pub struct Runtime {
     buf: Buffers,
     pre: PrefillBuffers,
     gdn: Option<GdnBuffers>,
+    moe: Option<moe::MoeBuffers>,
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
     f4b_part: CudaSlice<f32>,
@@ -853,6 +858,7 @@ impl Runtime {
             attn_planes: Planes::new(&stream, chunk * spec.q_dim())?,
             act_planes: Planes::new(&stream, chunk * d.intermediate)?,
             dummy_u16: stream.alloc_zeros(8)?,
+            dummy_u8: stream.alloc_zeros(8)?,
         };
         let gdn = match &spec.linear_attention {
             Some(la) => Some(GdnBuffers::new(&ctx, &stream, la, spec.linear_layers(), layout.slots + 1, chunk)?),
@@ -915,6 +921,10 @@ impl Runtime {
             smem,
             pre,
             gdn,
+            moe: match &spec.moe {
+                Some(_) => Some(moe::MoeBuffers::new(&stream, chunk, spec)?),
+                None => None,
+            },
             fp8_act,
             fp4_act,
             f4b_part,
@@ -1121,6 +1131,9 @@ impl Runtime {
     }
 
     fn mlp_decode(&self, l: &DeviceLayer) -> Result<()> {
+        if l.moe.is_some() {
+            return self.moe_block(l, &self.buf.x, 1);
+        }
         let s = &self.spec;
         let buf = &self.buf;
         let fp4 = matches!(l.gate_up, DeviceMatrix::Fp4 { .. });

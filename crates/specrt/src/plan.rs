@@ -143,6 +143,9 @@ pub enum Op {
     Swiglu,
     GdnPrefill,
     GdnDecode,
+    MoeRoute,
+    MoeExperts,
+    MoeCombine,
 }
 
 pub fn weight_kind(q: Quant) -> WeightKind {
@@ -170,6 +173,9 @@ impl Op {
             Op::DecodeAttention => "decode attention".into(),
             Op::Swiglu => "swiglu".into(),
             Op::GdnPrefill | Op::GdnDecode => "delta rule".into(),
+            Op::MoeRoute => "router".into(),
+            Op::MoeExperts => "experts".into(),
+            Op::MoeCombine => "combine".into(),
         }
     }
 
@@ -182,6 +188,9 @@ impl Op {
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention => "qkv and kv cache to attn".into(),
             Op::Swiglu => "gate_up to act".into(),
             Op::GdnPrefill | Op::GdnDecode => "lin, ba and state to gdn".into(),
+            Op::MoeRoute => "x to top-k experts".into(),
+            Op::MoeExperts => "x and top-k to expert outputs".into(),
+            Op::MoeCombine => "expert outputs to x".into(),
         }
     }
 
@@ -194,6 +203,8 @@ impl Op {
                 vec!["self_attn.q_norm.weight".into(), "self_attn.k_norm.weight".into()]
             }
             Op::GdnPrefill | Op::GdnDecode => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
+            Op::MoeRoute => vec!["mlp.gate.weight".into(), "mlp.shared_expert_gate.weight".into()],
+            Op::MoeExperts => vec!["mlp.experts".into(), "mlp.shared_expert".into()],
             _ => Vec::new(),
         }
     }
@@ -258,6 +269,9 @@ impl Op {
                 "gdn_gated_norm",
             ]),
             Op::GdnDecode => names(&["gdn_conv_step", "gdn_step", "split_rows"]),
+            Op::MoeRoute => names(&["moe_route"]),
+            Op::MoeExperts => names(&["moe_up_bf16", "moe_down_bf16"]),
+            Op::MoeCombine => names(&["moe_combine"]),
         }
     }
 }
@@ -269,6 +283,8 @@ pub struct Plan {
     pub head: Vec<Op>,
     pub attention: Vec<Op>,
     pub linear: Vec<Op>,
+    pub attention_moe: Vec<Op>,
+    pub linear_moe: Vec<Op>,
     pub tail: Vec<Op>,
 }
 
@@ -293,6 +309,8 @@ impl Plan {
                     lin(Weight::Down, Buf::Act, Buf::X),
                 ],
                 linear: Vec::new(),
+                attention_moe: Vec::new(),
+                linear_moe: Vec::new(),
                 tail: vec![norm(NormKind::Final, Buf::Xn), lin(Weight::LmHead, Buf::Xn, Buf::Logits)],
             };
         }
@@ -318,18 +336,32 @@ impl Plan {
             lin(Weight::LinOut, Buf::GdnPlanes, Buf::X),
         ];
         linear.extend(mlp);
+        let moe = [Op::MoeRoute, Op::MoeExperts, Op::MoeCombine];
+        let swap = |ops: &[Op]| -> Vec<Op> { ops[..ops.len() - mlp.len()].iter().copied().chain(moe).collect() };
+        let (attention_moe, linear_moe) = if spec.moe.is_some() { (swap(&attention), swap(&linear)) } else { (Vec::new(), Vec::new()) };
         Plan {
             phase,
             tensor_core,
             head: vec![Op::Embed],
             attention,
             linear: if spec.linear_attention.is_some() { linear } else { Vec::new() },
+            attention_moe,
+            linear_moe: if spec.linear_attention.is_some() { linear_moe } else { Vec::new() },
             tail: vec![norm(NormKind::Final, Buf::XnPlanes), lin(Weight::LmHead, Buf::XnPlanes, Buf::Logits)],
         }
     }
 
     pub fn layer(&self, block: Block) -> &[Op] {
         if block.is_linear() { &self.linear } else { &self.attention }
+    }
+
+    pub fn layer_of(&self, block: Block, sparse: bool) -> &[Op] {
+        match (block.is_linear(), sparse) {
+            (true, true) => &self.linear_moe,
+            (false, true) => &self.attention_moe,
+            (true, false) => &self.linear,
+            (false, false) => &self.attention,
+        }
     }
 }
 

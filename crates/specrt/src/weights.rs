@@ -40,12 +40,26 @@ pub enum Mixer<'a> {
     Linear(Gdn<'a>),
 }
 
+pub enum Stacked {
+    Bf16(Vec<u16>),
+    Fp4 { packed: Vec<u8>, scales: Vec<u8>, inv_global: Vec<f32> },
+}
+
+pub struct MoeWeights {
+    pub router: Vec<u16>,
+    pub shared_gate: Option<Vec<f32>>,
+    pub gate: Stacked,
+    pub up: Stacked,
+    pub down: Stacked,
+}
+
 pub struct Layer<'a> {
     pub ln1: Vec<f32>,
     pub ln2: Vec<f32>,
     pub mixer: Mixer<'a>,
     pub gate_up: Matrix<'a>,
     pub down: Matrix<'a>,
+    pub moe: Option<MoeWeights>,
 }
 
 pub struct Outside<'a> {
@@ -306,6 +320,14 @@ impl Checkpoint {
     fn raw(&self, weight: &str, rows: usize, cols: usize) -> Result<Raw<'_>> {
         if let Some(g) = &self.gguf {
             return self.gguf_raw(g, weight, rows, cols);
+        }
+        if !self.has(weight)
+            && let Some(module) = weight.strip_suffix(".weight")
+            && self.has(&format!("{module}.weight_packed"))
+        {
+            let fp4 = self.fp4(module, rows, cols)?;
+            let w = (0..rows).flat_map(|r| fp4.dequant_row(r)).map(f32_to_bf16).collect();
+            return Ok(Raw::Bf16 { w: Cow::Owned(w), cols });
         }
         let v = self.view(weight)?;
         if v.dtype != Dtype::F8_E4M3 {
@@ -841,7 +863,11 @@ impl Checkpoint {
             Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"))?)
         };
         let mlp = spec.mlp_quant(i);
-        let (gate_up, down) = if mlp == Quant::Nvfp4G16 {
+        let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(global));
+        let moe = if sparse { Some(self.moe_layer(spec, &p, mlp)?) } else { None };
+        let (gate_up, down) = if sparse {
+            (Matrix::Bf16(Cow::Owned(vec![0; 8])), Matrix::Bf16(Cow::Owned(vec![0; 8])))
+        } else if mlp == Quant::Nvfp4G16 {
             let gate = self.fp4(&format!("{p}.mlp.gate_proj"), inter, h)?;
             let up = self.fp4(&format!("{p}.mlp.up_proj"), inter, h)?;
             (Matrix::Fp4(crate::nvfp4::Fp4::interleave(gate, up)?), Matrix::Fp4(self.fp4(&format!("{p}.mlp.down_proj"), h, inter)?))
@@ -860,6 +886,46 @@ impl Checkpoint {
             mixer,
             gate_up,
             down,
+            moe,
+        })
+    }
+
+    fn moe_layer(&self, spec: &Spec, p: &str, quant: Quant) -> Result<MoeWeights> {
+        let m = spec.moe.as_ref().context("no [moe]")?;
+        let (h, inter, e) = (spec.dims.hidden, m.expert_intermediate, m.experts);
+        let shared = m.shared_intermediate > 0;
+        ensure!(!shared || m.shared_intermediate == inter, "the shared expert must be as wide as the routed experts");
+        let total = e + usize::from(shared);
+        let module = |i: usize, which: &str| {
+            if i < e { format!("{p}.mlp.experts.{i}.{which}_proj") } else { format!("{p}.mlp.shared_expert.{which}_proj") }
+        };
+        let stack = |which: &str, rows: usize, cols: usize| -> Result<Stacked> {
+            if quant == Quant::Nvfp4G16 {
+                let mut packed = Vec::with_capacity(total * rows * cols / 2);
+                let mut scales = Vec::with_capacity(total * rows * cols / crate::nvfp4::GROUP);
+                let mut inv_global = Vec::with_capacity(total);
+                for i in 0..total {
+                    let f = self.fp4(&module(i, which), rows, cols)?;
+                    packed.extend_from_slice(&f.packed);
+                    scales.extend_from_slice(&f.scales);
+                    inv_global.push(1.0 / f.global);
+                }
+                Ok(Stacked::Fp4 { packed, scales, inv_global })
+            } else {
+                let mut w = Vec::with_capacity(total * rows * cols);
+                for i in 0..total {
+                    w.extend_from_slice(&self.bf16(&format!("{}.weight", module(i, which)), &[rows, cols])?);
+                }
+                Ok(Stacked::Bf16(w))
+            }
+        };
+        let shared_gate = if m.shared_gate { Some(self.floats(&format!("{p}.mlp.shared_expert_gate.weight"), &[1, h])?) } else { None };
+        Ok(MoeWeights {
+            router: self.bf16(&format!("{p}.mlp.gate.weight"), &[e, h])?.into_owned(),
+            shared_gate,
+            gate: stack("gate", inter, h)?,
+            up: stack("up", inter, h)?,
+            down: stack("down", h, inter)?,
         })
     }
 
@@ -894,6 +960,7 @@ impl Checkpoint {
                 mixer: Mixer::Attention(attn),
                 gate_up: Raw::interleave(gate, up)?.into_matrix(Quant::Bf16, "mtp gate_up")?,
                 down: bf16(down, "mtp down_proj")?,
+                moe: None,
             },
             norm: self.norm(spec, "mtp.norm.weight", h)?,
         })

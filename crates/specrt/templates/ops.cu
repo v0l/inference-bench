@@ -1755,7 +1755,7 @@ extern "C" __global__ void batch_decode_attention(const float* qkv, const bf16_t
     constexpr int PER_LANE = (HEAD_DIM + 31) / 32;
     __shared__ float sm[BD_WARPS][GROUP];
     __shared__ float sl[BD_WARPS][GROUP];
-    __shared__ float sacc[BD_WARPS][GROUP][HEAD_DIM];
+    __shared__ float sacc[BD_WARPS][HEAD_DIM];
     int kv_head = blockIdx.x;
     int seq = blockIdx.y;
     int split = blockIdx.z;
@@ -1826,33 +1826,34 @@ extern "C" __global__ void batch_decode_attention(const float* qkv, const bf16_t
             sm[warp][g] = m[g];
             sl[warp][g] = l[g];
         }
+    }
+    for (int g = 0; g < GROUP; g++) {
 #pragma unroll
         for (int i = 0; i < PER_LANE; i++) {
             int d = lane + i * 32;
-            if (d < HEAD_DIM) sacc[warp][g][d] = acc[g][i];
+            if (d < HEAD_DIM) sacc[warp][d] = acc[g][i];
         }
-    }
-    __syncthreads();
-    for (int idx = threadIdx.x; idx < GROUP * HEAD_DIM; idx += blockDim.x) {
-        int g = idx / HEAD_DIM;
-        int d = idx % HEAD_DIM;
-        float M = NEG_INF;
-        for (int w = 0; w < BD_WARPS; w++) M = fmaxf(M, sm[w][g]);
-        float L = 0.0f, A = 0.0f;
-        if (M != NEG_INF) {
-            for (int w = 0; w < BD_WARPS; w++) {
-                float c = sm[w][g] == NEG_INF ? 0.0f : expf(sm[w][g] - M);
-                L += sl[w][g] * c;
-                A += sacc[w][g][d] * c;
+        __syncthreads();
+        for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x) {
+            float M = NEG_INF;
+            for (int w = 0; w < BD_WARPS; w++) M = fmaxf(M, sm[w][g]);
+            float L = 0.0f, A = 0.0f;
+            if (M != NEG_INF) {
+                for (int w = 0; w < BD_WARPS; w++) {
+                    float c = sm[w][g] == NEG_INF ? 0.0f : expf(sm[w][g] - M);
+                    L += sl[w][g] * c;
+                    A += sacc[w][d] * c;
+                }
+            }
+            int head = kv_head * GROUP + g;
+            size_t base = ((size_t)seq * HEADS + head) * BD_SPLITS + split;
+            part_acc[base * HEAD_DIM + d] = A;
+            if (d == 0) {
+                part_ml[base * 2] = M;
+                part_ml[base * 2 + 1] = L;
             }
         }
-        int head = kv_head * GROUP + g;
-        size_t base = ((size_t)seq * HEADS + head) * BD_SPLITS + split;
-        part_acc[base * HEAD_DIM + d] = A;
-        if (d == 0) {
-            part_ml[base * 2] = M;
-            part_ml[base * 2 + 1] = L;
-        }
+        __syncthreads();
     }
 }
 

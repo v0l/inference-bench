@@ -100,7 +100,7 @@ impl Runtime {
                     self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
                 }
             }
-            self.mlp_prefill(layer, n)?;
+            self.mlp_rows(layer, n)?;
         }
         let (hi, lo) = (pre.xn_planes.hi.as_view(), pre.xn_planes.lo.as_view());
         self.rms_split_into(&pre.x.as_view(), &self.norm, &hi, &lo, nd)?;

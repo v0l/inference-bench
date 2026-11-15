@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
 pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
+pub const MOE_TEMPLATE: &str = include_str!("../templates/moe.cu");
+pub const MOE_KERNELS: &[&str] = &["moe_route", "moe_up_bf16", "moe_up_fp4", "moe_down_bf16", "moe_down_fp4", "moe_combine", "moe_permute", "moe_group_up_bf16", "moe_group_up_fp4", "moe_group_down_bf16", "moe_group_down_fp4"];
 pub const FP4_TEMPLATE: &str = include_str!("../templates/fp4.cu");
 pub const FP8_BATCH_TEMPLATE: &str = include_str!("../templates/fp8_batch.cu");
 pub const FP4_ACT_TEMPLATE: &str = include_str!("../templates/fp4_act.cu");
@@ -1018,6 +1020,23 @@ impl Module {
             source.push_str(&crate::mtp::mtp_source(spec, &mut smem));
             kernels.extend_from_slice(crate::mtp::MTP_KERNELS);
             kernels.extend_from_slice(crate::mtp::MTP_MMA_KERNELS);
+        }
+        if let Some(m) = &spec.moe {
+            let vars: BTreeMap<&str, String> = [
+                ("MOE_E", m.experts.to_string()),
+                ("MOE_K", m.top_k().to_string()),
+                ("MOE_PAIRS", m.pairs().to_string()),
+                ("MOE_INTER", m.expert_intermediate.to_string()),
+                ("MOE_SHARED", (m.shared_intermediate > 0).to_string()),
+                ("MOE_NORM_TOPK", m.norm_topk.to_string()),
+                ("MOE_SHARED_GATE", m.shared_gate.to_string()),
+                ("MOE_SIGMOID", (m.router == crate::spec::RouterAct::Sigmoid).to_string()),
+            ]
+            .into_iter()
+            .collect();
+            source.push('\n');
+            source.push_str(&render(MOE_TEMPLATE, &vars)?);
+            kernels.extend_from_slice(MOE_KERNELS);
         }
         if fp8 {
             source.push('\n');

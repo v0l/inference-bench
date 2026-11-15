@@ -420,3 +420,41 @@ fn weight_bytes_ignore_device_memory_freed_by_another_thread() {
     churn.store(false, std::sync::atomic::Ordering::Relaxed);
     worker.join().unwrap();
 }
+
+const MOE: &str = "tiny-qwen3.5-moe";
+
+#[test]
+fn moe_fixture_spec_reads_experts_router_and_shared_expert() {
+    let s = spec_for(MOE);
+    let m = s.moe.as_ref().unwrap();
+    assert_eq!((m.experts, m.top_k(), m.expert_intermediate, m.shared_intermediate), (8, 2, 256, 256));
+    assert!(m.shared_gate && m.norm_topk);
+    assert!(s.moe.as_ref().unwrap().is_sparse(0));
+    s.runnable().unwrap();
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-moe output"]
+fn moe_decode_matches_the_reference_per_layer() {
+    decode_matches_reference(MOE, "tinymoe");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-moe output"]
+fn moe_prefill_matches_the_reference_per_layer() {
+    prefill_matches_reference(MOE, "tinymoe");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-moe output"]
+fn moe_logits_and_greedy_match_transformers() {
+    logits_and_greedy_match_reference(MOE, "tinymoe");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn moe_batch_decode_matches_single_sequence_greedy() {
+    for batch in [2, 8, 16] {
+        batch_decode_matches_single_sequence_greedy(MOE, batch);
+    }
+}
