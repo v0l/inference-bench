@@ -198,7 +198,7 @@ fn the_embedded_snapshot_equals_the_specs_folder() {
     assert_eq!(embedded, on_disk);
     assert!(embedded.len() >= 7);
     for (name, text) in EMBEDDED {
-        assert!(Spec::parse(text).is_ok(), "{name}");
+        assert!(matches!(check(text), Ok(Checked::Ready(_) | Checked::Family(_))), "{name}");
     }
 }
 

@@ -356,9 +356,12 @@ impl Gguf {
 
     pub fn spec(&self) -> Result<Spec> {
         let arch = self.architecture()?;
+        let registry = crate::family::active();
+        let supported = registry.gguf_architectures();
         ensure!(
-            matches!(arch, "llama" | "qwen2" | "qwen3"),
-            "GGUF architecture {arch} is not supported (llama, qwen2 and qwen3 are)"
+            registry.for_gguf(arch).is_some(),
+            "GGUF architecture {arch} is not supported ({} are)",
+            supported.join(", ")
         );
         let hidden = self.need_count("embedding_length")?;
         let layers = self.need_count("block_count")?;

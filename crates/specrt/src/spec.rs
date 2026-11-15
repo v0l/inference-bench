@@ -9,6 +9,7 @@ pub const EMBEDDED: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/embedd
 #[derive(Clone, Debug, PartialEq)]
 pub enum Checked {
     Ready(Box<Spec>),
+    Family(String),
     NeedsNewer { name: String, min_engine: u32 },
 }
 
@@ -26,6 +27,10 @@ pub fn check(text: &str) -> Result<Checked> {
     if min_engine > SPEC_FORMAT {
         let name = value.get("name").and_then(|n| n.as_str()).context("spec has no name")?;
         return Ok(Checked::NeedsNewer { name: name.to_string(), min_engine });
+    }
+    if crate::family::is_family(&value) {
+        let family: crate::family::Family = toml::from_str(text)?;
+        return Ok(Checked::Family(family.name));
     }
     let spec: Spec = toml::from_str(text)?;
     spec.validate()?;
@@ -893,6 +898,7 @@ impl Spec {
     pub fn parse(text: &str) -> Result<Self> {
         match check(text)? {
             Checked::Ready(spec) => Ok(*spec),
+            Checked::Family(name) => bail!("{name} is a family spec, not a model spec"),
             Checked::NeedsNewer { name, min_engine } => bail!("spec {name} {}", needs_newer_note(min_engine)),
         }
     }
@@ -915,7 +921,11 @@ impl Spec {
     }
 
     pub fn from_hf_config_serving(json: &str) -> Result<Self> {
-        let spec = Self::hf_config(json, true)?;
+        Self::from_hf_config_serving_in(&crate::family::active(), json)
+    }
+
+    pub fn from_hf_config_serving_in(registry: &crate::family::Registry, json: &str) -> Result<Self> {
+        let spec = Self::hf_config(registry, json, true)?;
         spec.validate()?;
         spec.check_moe_runnable()?;
         ensure!(spec.dims.intermediate > 0 || spec.moe.is_some(), "config has no intermediate_size");
@@ -960,7 +970,7 @@ impl Spec {
     }
 
     pub fn describe_hf_config(json: &str) -> Result<Self> {
-        Self::hf_config(json, false)
+        Self::hf_config(&crate::family::active(), json, false)
     }
 
     pub fn apply_structure(&mut self, structure: &crate::structure::Structure) {
@@ -978,7 +988,7 @@ impl Spec {
         }
     }
 
-    fn hf_config(json: &str, strict: bool) -> Result<Self> {
+    fn hf_config(registry: &crate::family::Registry, json: &str, strict: bool) -> Result<Self> {
         let mut value: serde_json::Value = serde_json::from_str(json)?;
         let quant_config = value.get("quantization_config").cloned();
         let outer_type = value.get("model_type").cloned();
@@ -988,7 +998,6 @@ impl Spec {
                 value["model_type"] = t;
             }
         }
-        let registry = crate::family::active();
         let family = if strict {
             registry.strict_for(value.get("model_type").and_then(|t| t.as_str()).unwrap_or(""))?
         } else {

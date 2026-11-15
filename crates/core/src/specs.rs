@@ -207,7 +207,7 @@ fn read_listed(path: &Path, dir: &SpecDir) -> Option<Listed> {
     let table: toml::Table = toml::from_str(&text).ok()?;
     let name = table.get("name").and_then(|v| v.as_str())?.to_string();
     let problem = match check(&text) {
-        Ok(Checked::Ready(_)) => None,
+        Ok(Checked::Ready(_) | Checked::Family(_)) => None,
         Ok(Checked::NeedsNewer { min_engine, .. }) => Some(needs_newer_note(min_engine)),
         Err(e) => Some(format!("spec does not parse: {e}")),
     };

@@ -710,7 +710,7 @@ fn spec_model(listed: &specs::Listed, hub: &Path) -> LocalModel {
 }
 
 pub fn spec_models(layers: &[SpecDir], hub: &Path) -> Vec<LocalModel> {
-    specs::list(layers).iter().map(|l| spec_model(l, hub)).collect()
+    specs::list(layers).iter().filter(|l| !specrt::family::is_family(&l.table)).map(|l| spec_model(l, hub)).collect()
 }
 
 pub fn scan_specs(dir: &Path, hub: &Path) -> Vec<LocalModel> {

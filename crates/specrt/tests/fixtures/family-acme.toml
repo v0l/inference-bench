@@ -1,0 +1,9 @@
+name = "acme"
+kind = "family"
+
+[match]
+model_types = ["acmelm"]
+architectures = ["AcmeForCausalLM"]
+
+[attention]
+qk_norm = true
