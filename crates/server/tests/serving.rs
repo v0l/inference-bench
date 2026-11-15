@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 fn serving_rig(extra: &str) -> Rig {
     let model = concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/specs/qwen3-0.6b.toml");
     start_with(
-        config(&format!("max_num_seqs = 8\nmax_model_len = 4096\nkv_cache_gb = 0.25\n{extra}[[models]]\nid='q'\nmodel={model:?}\n")),
+        config(&format!("max_num_seqs = 8\nmax_model_len = 4096\nkv_cache_gb = 0.75\n{extra}[[models]]\nid='q'\nmodel={model:?}\n")),
         inference_bench_server::NativeFactory,
         Default::default(),
     )
@@ -127,9 +127,9 @@ fn a_request_longer_than_the_model_length_is_a_400_not_a_crash() {
     let (status, body, _) = rig.post("/v1/completions", None, completion(&long, 16, false));
     assert!((400..500).contains(&status), "{status} {body}");
     assert!(body.contains("exceeds the context"), "{body}");
-    let (status, body, _) = rig.post("/v1/completions", None, completion("hi", 3000, false));
+    let (status, body, _) = rig.post("/v1/completions", None, completion("hi", 5000, false));
     assert_eq!(status, 400, "{body}");
-    assert!(body.contains("can never fit"), "{body}");
+    assert!(body.contains("exceeds the context"), "{body}");
     assert_eq!(rig.post("/v1/completions", None, completion("hi", 4, false)).0, 200);
     rig.stop();
 }

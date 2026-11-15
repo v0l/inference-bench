@@ -654,7 +654,7 @@ fn parallel_requests_with_a_real_model_run_together_and_aggregate_faster() {
         app
     });
     pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
-    let qwen = h.state().library.iter().find(|m| m.name == "Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
+    let qwen = h.state().library.iter().find(|m| m.name == "Qwen/Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
     let mut rates = Vec::new();
     for seqs in [1usize, 4] {
         h.state_mut().load_model_with(&qwen, 4096, seqs);
