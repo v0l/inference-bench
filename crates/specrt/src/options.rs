@@ -130,6 +130,9 @@ impl EngineChoice {
         if let Some(v) = values.get("serve.itl_target_ms").and_then(Value::as_u64) {
             opts.itl_target = Duration::from_millis(v);
         }
+        if let Some(v) = values.get("serve.whole_prompt_tokens").and_then(Value::as_u64) {
+            opts.whole_prompt_tokens = v as usize;
+        }
         let mut runtime = serde_json::to_value(RuntimeOptions::default())?;
         for (key, value) in &values {
             if let Some(path) = key.strip_prefix("runtime.").filter(|_| !value.is_null()) {
@@ -231,6 +234,7 @@ const META: &[Meta] = &[
     Meta { key: "serve.max_num_seqs", label: "parallel requests", group: Group::Parallel, help: "Requests decoded together. They share one KV cache, and a single request still runs at full speed.", choices: &[], range: (1, 64) },
     Meta { key: "serve.max_batched_tokens", label: "batched tokens", group: Group::Serving, help: "Token budget of one scheduler step. Larger prefills faster, smaller keeps decode steps short.", choices: &[], range: (64, 1 << 20) },
     Meta { key: "serve.itl_target_ms", label: "inter-token target", group: Group::Serving, help: "Milliseconds a decode stream may wait between tokens while prompts are being read.", choices: &[], range: (1, 10_000) },
+    Meta { key: "serve.whole_prompt_tokens", label: "whole prompt limit", group: Group::Serving, help: "A new prompt up to this many tokens is read in a single step even while others decode. 0 keeps the inter-token target in charge.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "speculative.enabled", label: "mtp", group: Group::Mtp, help: "Draft tokens with the model's own MTP head and verify them in one step. Output is unchanged.", choices: &[], range: (0, 0) },
     Meta { key: "speculative.draft_tokens", label: "draft tokens", group: Group::Mtp, help: "Tokens drafted per step. Auto uses the model spec, 2 on the 27B.", choices: &[], range: (1, crate::spec::MAX_DRAFT_TOKENS as u64) },
     Meta { key: "speculative.max_batch", label: "mtp batch limit", group: Group::Mtp, help: "Largest batch that still drafts. Auto uses the model spec.", choices: &[], range: (1, 64) },
@@ -270,15 +274,16 @@ struct ServeKnobs {
     kv_cache_bytes: Option<u64>,
     max_batched_tokens: usize,
     itl_target_ms: u64,
+    whole_prompt_tokens: usize,
 }
 
 fn knobs(o: &ServeOptions) -> ServeKnobs {
-    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, runtime: _, speculative: _, placement: _, progress: _ } = o;
-    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64 }
+    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, runtime: _, speculative: _, placement: _, progress: _ } = o;
+    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, whole_prompt_tokens: *whole_prompt_tokens }
 }
 
 fn populated_knobs() -> ServeKnobs {
-    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1 }
+    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, whole_prompt_tokens: 1 }
 }
 
 fn populated_runtime() -> RuntimeOptions {
@@ -402,6 +407,7 @@ mod tests {
         let v = EngineChoice::default();
         assert_eq!(default_of("serve.max_batched_tokens"), Some(json!(d.max_batched_tokens)));
         assert_eq!(default_of("serve.itl_target_ms"), Some(json!(d.itl_target.as_millis() as u64)));
+        assert_eq!(default_of("serve.whole_prompt_tokens"), Some(json!(d.whole_prompt_tokens)));
         assert_eq!(default_of("serve.max_num_seqs"), Some(json!(d.max_num_seqs)));
         let rt = RuntimeOptions::default();
         assert_eq!(default_of("runtime.graphs"), Some(json!(rt.graphs)));
