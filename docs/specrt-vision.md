@@ -151,6 +151,21 @@ named in `deepstack_visual_indexes`), so the engine tab can draw the tower from 
   from the cache or not, so 8 concurrent requests queue behind about 6 s of prefill. That is the
   prefill phase of the parity plan, not the encoder. Greedy answers on four classify photos are
   byte-identical to master with `precision = "fast"`.
+- Against vLLM (`tests/vision_lm.rs`, references from `scripts/vllm_vision.py` on a vLLM started
+  with `docs/qwen27-run/launch.sh kvauto` on port 8011, bf16 KV, no MTP), mean KL over 32 teacher
+  forced tokens. `SPECRT_VISION_PRECISION=fast|exact` picks the encoder for the test:
+
+  | case | fast | exact |
+  |---|---|---|
+  | image (house) | 0.0140, top-1 32/32 | 0.0139, 32/32 |
+  | images3 | 0.0361, 32/32 | 0.0364, 32/32 |
+  | video (6 frames) | 0.0432, 29/32 | 0.0432, 29/32 |
+  | video10 | 0.0577, 30/32 | 0.0570, 30/32 |
+  | 6 image population | 0.0455, 174/192 | 0.0454, 175/192 |
+  | 6 video population | 0.0613, 170/192 | 0.0613, 171/192 |
+  | text control (no media) | 0.0116, 188/192 | 0.0116, 188/192 |
+
+  The fast encoder moves no case by more than 0.0007.
 
 ## LM integration (slice 3, done)
 
