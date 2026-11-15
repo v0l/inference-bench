@@ -63,7 +63,7 @@ fn variants() -> Vec<(String, String)> {
     add("v-qwen3-bias", "qwen3-0.6b.config.json", &|v| v["attention_bias"] = json!(true));
     add("v-llama-bias", "llama-3.2-1b.config.json", &|v| v["attention_bias"] = json!(true));
     add("v-qwen2-no-bias-key", "qwen2.5-0.5b.config.json", &|v| { v.as_object_mut().unwrap().remove("attention_bias"); });
-    add("v-weird", "qwen3-0.6b.config.json", &|v| v["model_type"] = json!("weird"));
+    add("v-weird", "qwen3-0.6b.config.json", &|v| { v["model_type"] = json!("weird"); v["architectures"] = json!(["WeirdForCausalLM"]); });
     add("v-gelu", "qwen3-0.6b.config.json", &|v| v["hidden_act"] = json!("gelu_pytorch_tanh"));
     add("v-relu2", "qwen3-0.6b.config.json", &|v| v["hidden_act"] = json!("relu2"));
     add("v-no-act", "qwen3-0.6b.config.json", &|v| { v.as_object_mut().unwrap().remove("hidden_act"); });
