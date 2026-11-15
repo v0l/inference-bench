@@ -50,6 +50,7 @@ impl DeviceMtp {
             }),
             gate_up: DeviceMatrix::upload(stream, &w.layer.gate_up)?,
             down: DeviceMatrix::upload(stream, &w.layer.down)?,
+            moe: None,
         };
         let m = DeviceMtp {
             fc: DeviceMatrix::upload(stream, &w.fc)?,

@@ -52,6 +52,10 @@ impl PlanBackend<Run<'_>> for Runtime {
         self.spec.block(layer)
     }
 
+    fn sparse(&self, layer: usize) -> bool {
+        self.layers[layer].moe.is_some()
+    }
+
     fn run_op(&self, op: &Op, layer: Option<usize>, run: &Run<'_>) -> Result<()> {
         self.run_one(op, layer.map(|i| &self.layers[i]), run)
     }
@@ -78,6 +82,9 @@ impl Runtime {
             Op::Swiglu => self.swiglu_legacy(n),
             Op::GdnPrefill => self.gdn_prefill_rows(self.gdn_of(layer), n, 0),
             Op::GdnDecode => self.gdn_decode_rows(self.gdn_of(layer), &run.bb.expect("decode runs carry batch buffers").slots, n),
+            Op::MoeRoute => self.moe_route(layer.expect("moe runs inside a layer"), &self.pre.x, n),
+            Op::MoeExperts => self.moe_experts(layer.expect("moe runs inside a layer"), n),
+            Op::MoeCombine => self.moe_combine(&self.pre.x, n),
         }
     }
 

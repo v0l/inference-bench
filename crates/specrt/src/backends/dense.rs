@@ -191,6 +191,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             }
             Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),
             Op::GdnPrefill | Op::GdnDecode => bail!("delta-net is not yet on wgpu"),
+            Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => bail!("mixture of experts is not yet on wgpu"),
         }
     }
 }

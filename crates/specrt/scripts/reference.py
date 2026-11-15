@@ -89,6 +89,112 @@ def tiny_model(fixture, head_dim=128):
     return model
 
 
+def tiny_moe_config():
+    from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
+
+    return Qwen3_5MoeTextConfig(
+        vocab_size=1024,
+        hidden_size=256,
+        num_hidden_layers=3,
+        layer_types=["linear_attention", "linear_attention", "full_attention"],
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=256,
+        linear_num_key_heads=2,
+        linear_num_value_heads=6,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        moe_intermediate_size=256,
+        shared_expert_intermediate_size=256,
+        num_experts=8,
+        num_experts_per_tok=2,
+        rms_norm_eps=1e-6,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000000.0, "partial_rotary_factor": 0.25},
+        attn_output_gate=True,
+        tie_word_embeddings=False,
+        max_position_embeddings=4096,
+        eos_token_id=None,
+        bos_token_id=None,
+        pad_token_id=None,
+    )
+
+
+def tiny_moe_weights(model):
+    g = torch.Generator().manual_seed(TINY_SEED)
+    out = {}
+    for name, p in sorted(model.state_dict().items()):
+        if name.endswith("A_log"):
+            v = torch.empty(p.shape).uniform_(-5.5, -1.0, generator=g)
+        elif name.endswith("dt_bias"):
+            v = 2.8 + 4.0 * torch.randn(p.shape, generator=g)
+        elif name.endswith("linear_attn.norm.weight"):
+            v = torch.empty(p.shape).uniform_(0.8, 1.0, generator=g)
+        elif p.dim() == 1:
+            v = 0.1 * torch.randn(p.shape, generator=g)
+        elif "conv1d" in name:
+            v = 0.3 * torch.randn(p.shape, generator=g)
+        elif "embed_tokens" in name:
+            v = torch.randn(p.shape, generator=g)
+        elif name.endswith("mlp.gate.weight"):
+            v = 3.0 * torch.randn(p.shape, generator=g) / p.shape[-1] ** 0.5
+        else:
+            v = torch.randn(p.shape, generator=g) / p.shape[-1] ** 0.5
+        out[name] = v.to(torch.bfloat16).contiguous()
+    return out
+
+
+def split_experts(state):
+    out = {}
+    for name, w in state.items():
+        if name.endswith("mlp.experts.gate_up_proj"):
+            base = name[: -len("gate_up_proj")]
+            inter = w.shape[1] // 2
+            for e in range(w.shape[0]):
+                out[f"{base}{e}.gate_proj.weight"] = w[e, :inter].contiguous()
+                out[f"{base}{e}.up_proj.weight"] = w[e, inter:].contiguous()
+        elif name.endswith("mlp.experts.down_proj"):
+            base = name[: -len("down_proj")]
+            for e in range(w.shape[0]):
+                out[f"{base}{e}.down_proj.weight"] = w[e].contiguous()
+        else:
+            out[name] = w
+    return out
+
+
+def fuse_experts(state):
+    out, pending = {}, {}
+    for name, w in state.items():
+        if ".mlp.experts." in name and name.endswith(".weight"):
+            head, rest = name.split(".mlp.experts.")
+            e, proj = rest.split(".")[0], rest.split(".")[1]
+            pending.setdefault(head, {}).setdefault(proj, {})[int(e)] = w
+        else:
+            out[name] = w
+    for head, projs in pending.items():
+        count = len(projs["gate_proj"])
+        out[f"{head}.mlp.experts.gate_up_proj"] = torch.stack([torch.cat([projs["gate_proj"][e], projs["up_proj"][e]]) for e in range(count)])
+        out[f"{head}.mlp.experts.down_proj"] = torch.stack([projs["down_proj"][e] for e in range(count)])
+    return out
+
+
+def tiny_moe_model(fixture):
+    from safetensors.torch import load_file, save_file
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
+
+    torch.manual_seed(TINY_SEED)
+    config = tiny_moe_config()
+    model = Qwen3_5MoeForCausalLM(config).float().eval()
+    weights = fixture / "model.safetensors"
+    if not weights.exists():
+        fixture.mkdir(parents=True, exist_ok=True)
+        save_file(split_experts(tiny_moe_weights(model)), weights)
+        config.to_json_file(fixture / "config.json")
+    state = {k: v.float() for k, v in fuse_experts(load_file(weights)).items()}
+    model.load_state_dict(state, strict=True)
+    return model
+
+
 FP8_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z", "out_proj", "gate_proj", "up_proj", "down_proj")
 FP8_BLOCK = 128
 FP8_MAX = 448.0
@@ -498,11 +604,14 @@ def save(out_dir, name, arrays, meta):
     (out_dir / f"{name}.json").write_text(json.dumps(meta))
 
 
-def tiny(fixture, out_dir, head_dim=128, fp8=False, act_quant=False, nvfp4=False):
+def tiny(fixture, out_dir, head_dim=128, fp8=False, act_quant=False, nvfp4=False, moe=False):
     from transformers import DynamicCache
 
     torch.set_num_threads(4)
-    if nvfp4:
+    if moe:
+        model = tiny_moe_model(fixture)
+        prefix = "tinymoe"
+    elif nvfp4:
         model = tiny_nvfp4_model(fixture, act_quant)
         prefix = "tinynvfp4act" if act_quant else "tinynvfp4"
     else:
@@ -868,6 +977,9 @@ def main():
         return
     if sys.argv[1] == "tiny":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), int(sys.argv[4]) if len(sys.argv) > 4 else 128)
+        return
+    if sys.argv[1] == "tiny-moe":
+        tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, moe=True)
         return
     if sys.argv[1] == "tiny-nvfp4":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, nvfp4=True)

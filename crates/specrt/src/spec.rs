@@ -16,7 +16,6 @@ pub fn needs_newer_note(min_engine: u32) -> String {
     format!("needs a newer inference-bench (spec format {min_engine}, this build reads {SPEC_FORMAT})")
 }
 
-const MOE_UNSUPPORTED: &str = "mixture-of-experts models are not supported by the specrt engine";
 
 pub fn check(text: &str) -> Result<Checked> {
     let value: toml::Table = toml::from_str(text)?;
@@ -30,7 +29,7 @@ pub fn check(text: &str) -> Result<Checked> {
     }
     let spec: Spec = toml::from_str(text)?;
     spec.validate()?;
-    ensure!(spec.moe.is_none(), "{MOE_UNSUPPORTED}");
+    spec.check_moe_runnable()?;
     Ok(Checked::Ready(Box::new(spec)))
 }
 
@@ -420,6 +419,30 @@ pub struct Moe {
     pub dense_layers: Vec<usize>,
     #[serde(default = "default_sparse_step", skip_serializing_if = "is_one")]
     pub sparse_step: usize,
+    #[serde(default, skip_serializing_if = "RouterAct::is_softmax")]
+    pub router: RouterAct,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub norm_topk: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shared_gate: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouterAct {
+    #[default]
+    Softmax,
+    Sigmoid,
+}
+
+impl RouterAct {
+    fn is_softmax(&self) -> bool {
+        *self == RouterAct::Softmax
+    }
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 fn default_sparse_step() -> usize {
@@ -437,6 +460,14 @@ fn is_one(n: &usize) -> bool {
 impl Moe {
     pub fn is_sparse(&self, layer: usize) -> bool {
         !self.dense_layers.contains(&layer) && (layer + 1).is_multiple_of(self.sparse_step.max(1))
+    }
+
+    pub fn top_k(&self) -> usize {
+        self.active.unwrap_or(1)
+    }
+
+    pub fn pairs(&self) -> usize {
+        self.top_k() + usize::from(self.shared_intermediate > 0)
     }
 }
 
@@ -585,7 +616,7 @@ fn is_false(b: &bool) -> bool {
 
 pub const HF_CONFIG_KEYS: &[&str] = &[
     "model_type", "hidden_size", "intermediate_size", "moe_intermediate_size", "shared_expert_intermediate_size", "num_experts",
-    "num_experts_per_tok", "mlp_only_layers", "decoder_sparse_step", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
+    "num_experts_per_tok", "mlp_only_layers", "decoder_sparse_step", "norm_topk_prob", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
     "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
@@ -618,6 +649,7 @@ struct HfConfig {
     #[serde(default)]
     mlp_only_layers: Vec<usize>,
     decoder_sparse_step: Option<usize>,
+    norm_topk_prob: Option<bool>,
     num_hidden_layers: usize,
     num_attention_heads: usize,
     num_key_value_heads: Option<usize>,
@@ -885,15 +917,32 @@ impl Spec {
     pub fn from_hf_config_serving(json: &str) -> Result<Self> {
         let spec = Self::hf_config(json, true)?;
         spec.validate()?;
-        ensure!(spec.moe.is_none(), "{MOE_UNSUPPORTED}");
-        ensure!(spec.dims.intermediate > 0, "config has no intermediate_size");
+        spec.check_moe_runnable()?;
+        ensure!(spec.dims.intermediate > 0 || spec.moe.is_some(), "config has no intermediate_size");
         Ok(spec)
     }
 
     pub fn runnable(&self) -> Result<()> {
         self.validate()?;
-        ensure!(self.moe.is_none(), "{MOE_UNSUPPORTED}");
-        ensure!(self.dims.intermediate > 0, "the config has no intermediate_size");
+        self.check_moe_runnable()?;
+        ensure!(self.dims.intermediate > 0 || self.moe.is_some(), "the config has no intermediate_size");
+        Ok(())
+    }
+
+    pub fn check_moe_runnable(&self) -> Result<()> {
+        let Some(m) = &self.moe else { return Ok(()) };
+        ensure!(self.linear_attention.is_some() || self.attention_layers() > 0, "mixture-of-experts needs attention layers");
+        let experts_quant = self.mlp.quant.unwrap_or(self.quant);
+        ensure!(
+            matches!(experts_quant, Quant::Bf16 | Quant::Nvfp4G16),
+            "mixture-of-experts with {experts_quant:?} expert weights is not supported yet (bf16 and nvfp4_g16 are)"
+        );
+        ensure!(self.mtp.is_none(), "mixture-of-experts with an MTP layer is not supported yet");
+        ensure!(self.quant != Quant::Gguf, "mixture-of-experts with GGUF weights is not supported yet");
+        ensure!(m.active.is_some_and(|k| k >= 1 && k <= m.experts), "mixture-of-experts needs num_experts_per_tok between 1 and the expert count");
+        ensure!(m.expert_intermediate.is_multiple_of(256) || experts_quant == Quant::Bf16, "nvfp4 experts need an intermediate size that is a multiple of 256");
+        ensure!(m.expert_intermediate.is_multiple_of(16) && m.shared_intermediate.is_multiple_of(16), "expert intermediate sizes must be multiples of 16");
+        ensure!(self.dims.hidden.is_multiple_of(256), "mixture-of-experts needs hidden to be a multiple of 256");
         Ok(())
     }
 
@@ -962,6 +1011,9 @@ impl Spec {
             (Err(e), true) => return Err(e),
             (Err(_), false) => Quantization::weights(Quant::Bf16),
         };
+        let experts_nvfp4 = hf.num_experts.is_some_and(|e| e > 0) && quant == Quant::Nvfp4G16;
+        let (quant, mlp_quant, act, mlp_act) =
+            if experts_nvfp4 { (Quant::Bf16, Some((Quant::Nvfp4G16, None)), ActQuant::None, ActQuant::None) } else { (quant, mlp_quant, act, mlp_act) };
         let nested = hf
             .rope_parameters
             .as_ref()
@@ -1043,9 +1095,13 @@ impl Spec {
                 shared_intermediate: hf.shared_expert_intermediate_size.unwrap_or(0),
                 dense_layers: hf.mlp_only_layers.clone(),
                 sparse_step: hf.decoder_sparse_step.unwrap_or(1),
+                router: RouterAct::Softmax,
+                norm_topk: hf.norm_topk_prob.unwrap_or(family_hybrid),
+                shared_gate: hf.shared_expert_intermediate_size.unwrap_or(0) > 0,
             }),
             _ => None,
         };
+        let has_moe = moe.is_some();
         let spec = Spec {
             name: hf.model_type.clone(),
             min_engine: 0,
@@ -1055,7 +1111,10 @@ impl Spec {
             act_quant: act,
             dims: Dims {
                 hidden: hf.hidden_size,
-                intermediate: hf.intermediate_size.unwrap_or(0),
+                intermediate: hf.intermediate_size.or_else(|| {
+                    let m = moe.as_ref().filter(|_| strict)?;
+                    Some(if m.shared_intermediate > 0 { m.shared_intermediate } else { m.expert_intermediate })
+                }).unwrap_or(0),
                 vocab: hf.vocab_size,
                 tie_embeddings: hf.tie_word_embeddings,
             },
@@ -1079,7 +1138,7 @@ impl Spec {
                 act_quant: mlp_act,
             },
             moe,
-            mtp: (hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
+            mtp: (hybrid && hf.mtp_num_hidden_layers > 0 && !has_moe).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
             linear_attention,
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             runtime: RuntimeOptions::default(),
@@ -1168,7 +1227,9 @@ impl Spec {
         match (self.mlp.quant, self.mlp.quant_until) {
             (None, Some(_)) => bail!("[mlp] quant_until needs [mlp] quant"),
             (Some(m), until) => {
-                ensure!(m == Quant::Nvfp4G16 && self.quant == Quant::Fp8Channel, "[mlp] quant {m:?} beside {:?} is not supported (nvfp4_g16 beside fp8_channel is)", self.quant);
+                let beside_fp8 = self.quant == Quant::Fp8Channel;
+                let experts = self.quant == Quant::Bf16 && self.moe.is_some();
+                ensure!(m == Quant::Nvfp4G16 && (beside_fp8 || experts), "[mlp] quant {m:?} beside {:?} is not supported (nvfp4_g16 beside fp8_channel is, and beside bf16 for mixture-of-experts)", self.quant);
                 ensure!(until.is_none_or(|u| u > 0 && u < self.layers.count), "[mlp] quant_until must be inside the layer count");
                 ensure!(
                     self.dims.hidden.is_multiple_of(256) && self.dims.intermediate.is_multiple_of(256),
