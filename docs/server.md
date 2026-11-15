@@ -143,3 +143,28 @@ Every chat dialect takes `reasoning_effort` (`none|low|medium|high`), `reasoning
 `reasoning_budget_tokens` (request, or `reasoning_budget_tokens` in the server config) caps the thinking: when the model has produced that many tokens without closing `<think>`, the server appends `reasoning_wrapup` plus `</think>` and the model answers from there. With `answer_room = true` (default) a request with `max_tokens` of 1024 or more and no budget gets one, so thinking is wrapped up when a quarter of the cap (at least 512 tokens) is left. The wrap-up count is `inference_thinking_wrapups_total`.
 
 The tool parser only emits declared tools. It also recovers `<parameter=...>` without a function, JSON inside `<tool_call>`, a `<function=...>` without `<tool_call>`, several calls in one block and a missing `</function>`; repairs trailing commas, single quotes and `True/False/None` in array and object arguments; and maps collapsed namespace names (`mcp_a_b` for `mcp__a__b`) when unambiguous. Anything else stays text. Repairs are counted in `inference_tool_call_repairs_total{kind}`.
+
+## Real client check (Qwen3-0.6B, specrt, hermes parser)
+
+Server: `tool_parser = "hermes"`, `reasoning_parser = "qwen3"`, one model on `crates/specrt/specs/qwen3-0.6b.toml`.
+
+Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:18629 claude -p "Read the file note.txt with the Read tool and tell me what it says." --allowedTools Read`):
+
+```
+assistant thinking  "Okay, let's see. The user wants me to read the file note.txt ... I should use the Read tool ..."
+assistant tool_use  {"name": "Read", "input": {"file_path": "/tmp/t629/work/notes/notes.txt"}}
+user      tool_result "File does not exist. Note: your current working directory is /tmp/t629/work." (is_error)
+assistant thinking  "... the file doesn't exist ..."
+assistant text      "The file `notes.txt` does not exist in your current working directory ..."
+result    completed
+```
+
+Codex CLI (`wire_api = "responses"`, `codex exec`, shell tool):
+
+```
+command_execution  /bin/bash -lc cat   (function_call item from /v1/responses, executed, output sent back as function_call_output)
+agent_message      "The note file has been successfully accessed. ..."
+turn.completed     input_tokens 22413, output_tokens 342
+```
+
+The 0.6B model picks a wrong path or drops an argument, so the answers are poor; the check is that both clients complete the tool round trip over the new endpoints. The ignored test `qwen3_0_6b_serves_a_tool_turn_over_messages_and_responses` asserts a correct `get_weather` call on both APIs.

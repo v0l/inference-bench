@@ -133,3 +133,34 @@ fn a_request_longer_than_the_model_length_is_a_400_not_a_crash() {
     assert_eq!(rig.post("/v1/completions", None, completion("hi", 4, false)).0, 200);
     rig.stop();
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
+fn qwen3_0_6b_serves_a_tool_turn_over_messages_and_responses() {
+    let rig = serving_rig("tool_parser = 'hermes'\nreasoning_parser = 'qwen3'\n");
+    let (s, text, _) = rig.post(
+        "/v1/messages",
+        None,
+        json!({"model": "q", "temperature": 0, "max_tokens": 600, "thinking": {"type": "enabled", "budget_tokens": 200},
+            "tools": [{"name": "get_weather", "description": "Get the weather for a city", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
+            "messages": [{"role": "user", "content": "What is the weather in Paris? Use the tool."}]}),
+    );
+    assert_eq!(s, 200, "{text}");
+    eprintln!("messages: {text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["stop_reason"], "tool_use", "{text}");
+    let call = v["content"].as_array().unwrap().iter().find(|b| b["type"] == "tool_use").unwrap();
+    assert!(call["input"]["city"].as_str().unwrap().contains("Paris"));
+    let (s, text, _) = rig.post(
+        "/v1/responses",
+        None,
+        json!({"model": "q", "temperature": 0, "max_output_tokens": 600, "reasoning": {"effort": "low"},
+            "tools": [{"type": "function", "name": "get_weather", "description": "Get the weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}],
+            "input": "What is the weather in Paris? Use the tool."}),
+    );
+    assert_eq!(s, 200, "{text}");
+    eprintln!("responses: {text}");
+    let v: Value = serde_json::from_str(&text).unwrap();
+    assert!(v["output"].as_array().unwrap().iter().any(|i| i["type"] == "function_call" && i["name"] == "get_weather"), "{text}");
+    rig.stop();
+}
