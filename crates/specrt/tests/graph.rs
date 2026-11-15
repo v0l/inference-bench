@@ -108,6 +108,9 @@ fn the_graph_lowers_to_the_reference_plan_for_every_config() {
         for tc in [true, false] {
             for phase in [Phase::Prefill, Phase::Decode] {
                 let mut want = reference(&spec, phase, tc);
+                if tc && spec.vision.is_some() {
+                    want.head.push(Op::Splice);
+                }
                 if tc && spec.dims.logit_softcap.is_some() {
                     want.tail.push(Op::LogitSoftcap);
                 }
@@ -241,4 +244,39 @@ fn a_spec_without_mtp_has_empty_mtp_plans() {
     let spec = Spec::from_hf_config_serving(&json).unwrap();
     let plan = Plan::build(&spec, Phase::Decode, true);
     assert!(plan.mtp.is_empty() && plan.mtp_head.is_empty());
+}
+
+#[test]
+fn the_vision_plan_comes_from_the_graph() {
+    use specrt::vision_encoder::{VisionOp, plan};
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.multimodal.json")).unwrap();
+    let mut cfg = specrt::vision::Vision::from_hf_config(&json).unwrap().unwrap().config;
+    cfg.deepstack_visual_indexes = vec![2];
+    cfg.depth = 4;
+    let mut want = vec![VisionOp::PatchEmbed];
+    for block in 0..4 {
+        want.extend([
+            VisionOp::Norm { block, which: 1 },
+            VisionOp::Qkv { block },
+            VisionOp::Rope,
+            VisionOp::Attention,
+            VisionOp::Proj { block },
+            VisionOp::Norm { block, which: 2 },
+            VisionOp::MlpUp { block },
+            VisionOp::MlpDown { block },
+        ]);
+        if block == 2 {
+            want.push(VisionOp::DeepstackMerger { index: 0, after_block: 2 });
+        }
+    }
+    want.push(VisionOp::Merger);
+    assert_eq!(plan(&cfg), want);
+}
+
+#[test]
+fn a_vision_spec_splices_media_after_the_embedding() {
+    let spec = mtp_fixture("tiny-qwen3.5-27b");
+    assert!(spec.vision.is_some());
+    let plan = Plan::build(&spec, Phase::Prefill, true);
+    assert_eq!(plan.head, vec![Op::Embed, Op::Splice]);
 }

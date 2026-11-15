@@ -5,6 +5,10 @@ kind = "graph"
 op = "embed"
 out = "x"
 
+[[head]]
+op = "splice"
+when = "vision+tensor_core"
+
 [[block]]
 name = "attention_sandwich"
 when = "sandwich+tensor_core"
@@ -554,3 +558,39 @@ out = "mtp_logits"
 [[mtp_head]]
 op = "mtp_draft"
 when = "speculative+tensor_core"
+
+[[vision_head]]
+op = "patch_embed"
+
+[[vision_block]]
+op = "vnorm"
+weight = "1"
+
+[[vision_block]]
+op = "vqkv"
+
+[[vision_block]]
+op = "vrope"
+
+[[vision_block]]
+op = "vattention"
+
+[[vision_block]]
+op = "vproj"
+
+[[vision_block]]
+op = "vnorm"
+weight = "2"
+
+[[vision_block]]
+op = "vmlp_up"
+
+[[vision_block]]
+op = "vmlp_down"
+
+[[vision_block]]
+op = "deepstack_merger"
+when = "deepstack"
+
+[[vision_tail]]
+op = "vmerger"

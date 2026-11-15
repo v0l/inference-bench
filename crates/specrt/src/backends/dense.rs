@@ -190,6 +190,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
                 be.dispatch(kernels[0], &[&m.scratch.qkv, &l.k_cache, &l.v_cache, &m.scratch.attn], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r, 1])
             }
             Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),
+            Op::Splice => bail!("vision is not yet on wgpu"),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => bail!("delta-net is not yet on wgpu"),
             Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => bail!("MTP is not yet on wgpu"),
             Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => bail!("mixture of experts is not yet on wgpu"),

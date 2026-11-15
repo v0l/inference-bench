@@ -33,6 +33,7 @@ fn float(v: f64) -> String {
 pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static str>> {
     Ok(match op {
         Op::Embed => vec!["embed"],
+        Op::Splice => anyhow::bail!("vision is not yet on wgpu"),
         Op::Norm { .. } => vec!["rmsnorm"],
         Op::Linear { weight, .. } => {
             let mut k = vec![if tokens == 1 { "linear" } else { "linear_t8" }];

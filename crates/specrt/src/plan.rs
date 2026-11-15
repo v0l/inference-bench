@@ -169,6 +169,7 @@ impl NormKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     Embed,
+    Splice,
     Norm { which: NormKind, into: Buf },
     NormAdd { which: NormKind, from: Buf },
     Clear { buf: Buf },
@@ -206,6 +207,7 @@ impl Op {
     pub fn label(&self) -> String {
         match self {
             Op::Embed => "embed".into(),
+            Op::Splice => "media splice".into(),
             Op::Norm { which, .. } => match which {
                 NormKind::Input => "input norm".into(),
                 NormKind::PostAttention => "post attention norm".into(),
@@ -235,6 +237,7 @@ impl Op {
     pub fn flow(&self) -> String {
         match self {
             Op::Embed => "tokens to x".into(),
+            Op::Splice => "media embeddings into x".into(),
             Op::Norm { into, .. } => format!("x to {}", into.label()),
             Op::NormAdd { from, .. } => format!("{} added to x", from.label()),
             Op::LogitSoftcap => "logits to logits".into(),
@@ -302,6 +305,7 @@ impl Op {
         let names = |k: &[&str]| k.iter().map(|s| s.to_string()).collect();
         match self {
             Op::Embed => names(&["embed"]),
+            Op::Splice => names(&["splice_rows"]),
             Op::Norm { into, .. } if matches!(into, Buf::XnPlanes) => names(&["rms_split"]),
             Op::Norm { .. } => names(&["rmsnorm"]),
             Op::NormAdd { .. } => names(&["norm_add"]),

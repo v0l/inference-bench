@@ -84,22 +84,7 @@ impl VisionOp {
 }
 
 pub fn plan(cfg: &VisionConfig) -> Vec<VisionOp> {
-    let mut ops = vec![VisionOp::PatchEmbed];
-    for block in 0..cfg.depth {
-        ops.push(VisionOp::Norm { block, which: 1 });
-        ops.push(VisionOp::Qkv { block });
-        ops.push(VisionOp::Rope);
-        ops.push(VisionOp::Attention);
-        ops.push(VisionOp::Proj { block });
-        ops.push(VisionOp::Norm { block, which: 2 });
-        ops.push(VisionOp::MlpUp { block });
-        ops.push(VisionOp::MlpDown { block });
-        if let Some(index) = cfg.deepstack_visual_indexes.iter().position(|&b| b == block) {
-            ops.push(VisionOp::DeepstackMerger { index, after_block: block });
-        }
-    }
-    ops.push(VisionOp::Merger);
-    ops
+    crate::graph::Graph::decoder().vision_plan(cfg).expect("the embedded decoder graph lowers the vision tower")
 }
 
 struct Linear {
@@ -146,6 +131,7 @@ pub struct VisionEncoder {
     merger: Merger,
     deepstack: Vec<Merger>,
     workspace: std::sync::Mutex<Workspace>,
+    ops: Vec<VisionOp>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -423,6 +409,7 @@ impl VisionEncoder {
             pos: loaded.function("vis_pos")?,
             rope_pack: loaded.function("vis_rope_pack")?,
             flash,
+            ops: plan(cfg),
             cfg: cfg.clone(),
             act,
             patch,
@@ -434,7 +421,7 @@ impl VisionEncoder {
     }
 
     pub fn plan(&self) -> Vec<VisionOp> {
-        plan(&self.cfg)
+        self.ops.clone()
     }
 
     pub fn config(&self) -> &VisionConfig {
@@ -565,44 +552,58 @@ impl VisionEncoder {
         let seg_lo = s.clone_htod(&l.seg_lo)?;
         let seg_hi = s.clone_htod(&l.seg_hi)?;
         let Workspace { input, x, qkv, packed, xn, att, mid, scratch, up, out, .. } = ws;
-        let n = (tokens * self.patch.cols) as i32;
-        let mut b = s.launch_builder(&self.split);
-        b.arg(&*input).arg(&mut mid.hi).arg(&mut mid.lo).arg(&n);
-        unsafe { b.launch(LaunchConfig { grid_dim: ((n as u32 / 2).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
-        let h = hidden as i32;
-        let mut b = s.launch_builder(&self.pos);
-        b.arg(&self.pos_embed).arg(&taps).arg(&tap_weights).arg(&mut *x).arg(&h);
-        unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
-        self.gemm(&self.patch, mid, Out::AddInPlace(x), tokens, Act::None)?;
         let (t32, h32, hd32) = (tokens as i32, heads as i32, head_dim as i32);
         let scale_log2 = (1.0 / (head_dim as f32).sqrt()) * std::f32::consts::LOG2_E;
         let mut deepstack = Vec::new();
-        for (i, blk) in self.blocks.iter().enumerate() {
-            self.layernorm(x, &blk.norm1, xn, tokens, hidden)?;
-            self.gemm(&blk.qkv, xn, Out::Store(qkv), tokens, Act::None)?;
-            let mut b = s.launch_builder(&self.rope_pack);
-            b.arg(&*qkv).arg(&hw).arg(&mut *packed).arg(&t32).arg(&h32).arg(&hd32).arg(&ROPE_THETA);
-            unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, heads as u32, 1), block_dim: (hdp as u32, 1, 1), shared_mem_bytes: 0 }) }?;
-            let mut b = s.launch_builder(&self.flash);
-            b.arg(&*packed).arg(&seg_lo).arg(&seg_hi).arg(&mut att.hi).arg(&mut att.lo).arg(&t32).arg(&h32).arg(&hd32).arg(&scale_log2);
-            unsafe {
-                b.launch(LaunchConfig {
-                    grid_dim: ((tokens as u32).div_ceil(FLASH_BQ), heads as u32, 1),
-                    block_dim: (FLASH_THREADS, 1, 1),
-                    shared_mem_bytes: flash_smem(head_dim),
-                })
-            }?;
-            self.gemm(&blk.proj, att, Out::AddInPlace(x), tokens, Act::None)?;
-            self.layernorm(x, &blk.norm2, xn, tokens, hidden)?;
-            self.gemm(&blk.up, xn, Out::Split(mid), tokens, self.act)?;
-            self.gemm(&blk.down, mid, Out::AddInPlace(x), tokens, Act::None)?;
-            if let Some(d) = cfg.deepstack_visual_indexes.iter().position(|&b| b == i) {
-                let flat = self.run_merger(&self.deepstack[d], x, tokens, scratch, up, out)?;
-                deepstack.push(self.split_rows(flat, &l.merged_rows));
+        let mut merged = Vec::new();
+        for op in &self.ops {
+            match *op {
+                VisionOp::PatchEmbed => {
+                    let n = (tokens * self.patch.cols) as i32;
+                    let mut b = s.launch_builder(&self.split);
+                    b.arg(&*input).arg(&mut mid.hi).arg(&mut mid.lo).arg(&n);
+                    unsafe { b.launch(LaunchConfig { grid_dim: ((n as u32 / 2).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+                    let h = hidden as i32;
+                    let mut b = s.launch_builder(&self.pos);
+                    b.arg(&self.pos_embed).arg(&taps).arg(&tap_weights).arg(&mut *x).arg(&h);
+                    unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+                    self.gemm(&self.patch, mid, Out::AddInPlace(x), tokens, Act::None)?;
+                }
+                VisionOp::Norm { block, which } => {
+                    let blk = &self.blocks[block];
+                    self.layernorm(x, if which == 1 { &blk.norm1 } else { &blk.norm2 }, xn, tokens, hidden)?;
+                }
+                VisionOp::Qkv { block } => self.gemm(&self.blocks[block].qkv, xn, Out::Store(qkv), tokens, Act::None)?,
+                VisionOp::Rope => {
+                    let mut b = s.launch_builder(&self.rope_pack);
+                    b.arg(&*qkv).arg(&hw).arg(&mut *packed).arg(&t32).arg(&h32).arg(&hd32).arg(&ROPE_THETA);
+                    unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, heads as u32, 1), block_dim: (hdp as u32, 1, 1), shared_mem_bytes: 0 }) }?;
+                }
+                VisionOp::Attention => {
+                    let mut b = s.launch_builder(&self.flash);
+                    b.arg(&*packed).arg(&seg_lo).arg(&seg_hi).arg(&mut att.hi).arg(&mut att.lo).arg(&t32).arg(&h32).arg(&hd32).arg(&scale_log2);
+                    unsafe {
+                        b.launch(LaunchConfig {
+                            grid_dim: ((tokens as u32).div_ceil(FLASH_BQ), heads as u32, 1),
+                            block_dim: (FLASH_THREADS, 1, 1),
+                            shared_mem_bytes: flash_smem(head_dim),
+                        })
+                    }?;
+                }
+                VisionOp::Proj { block } => self.gemm(&self.blocks[block].proj, att, Out::AddInPlace(x), tokens, Act::None)?,
+                VisionOp::MlpUp { block } => self.gemm(&self.blocks[block].up, xn, Out::Split(mid), tokens, self.act)?,
+                VisionOp::MlpDown { block } => self.gemm(&self.blocks[block].down, mid, Out::AddInPlace(x), tokens, Act::None)?,
+                VisionOp::DeepstackMerger { index, .. } => {
+                    let flat = self.run_merger(&self.deepstack[index], x, tokens, scratch, up, out)?;
+                    deepstack.push(self.split_rows(flat, &l.merged_rows));
+                }
+                VisionOp::Merger => {
+                    let flat = self.run_merger(&self.merger, x, tokens, scratch, up, out)?;
+                    merged = self.split_rows(flat, &l.merged_rows);
+                }
             }
         }
-        let flat = self.run_merger(&self.merger, x, tokens, scratch, up, out)?;
-        Ok((self.split_rows(flat, &l.merged_rows), deepstack))
+        Ok((merged, deepstack))
     }
 
     fn split_rows(&self, flat: Vec<f32>, rows: &[usize]) -> Vec<Vec<f32>> {

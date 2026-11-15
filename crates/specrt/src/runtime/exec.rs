@@ -69,13 +69,11 @@ impl Runtime {
     pub(super) fn run_one(&self, op: &Op, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
         let n = run.n;
         match *op {
-            Op::Embed => {
-                self.embed_rows(run)?;
-                match run.start {
-                    Some(start) => self.splice_media(self.seq as usize, start, run.n, 0),
-                    None => Ok(()),
-                }
-            }
+            Op::Embed => self.embed_rows(run),
+            Op::Splice => match run.start {
+                Some(start) => self.splice_media(self.seq as usize, start, run.n, 0),
+                None => Ok(()),
+            },
             Op::Norm { which, into } => self.norm_op(which, into, layer, run),
             Op::NormAdd { which, from } => self.norm_add_op(which, from, layer, run),
             Op::Clear { buf } => self.clear_op(buf, run),

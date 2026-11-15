@@ -1,4 +1,6 @@
 use crate::spec::Spec;
+use crate::vision::VisionConfig;
+use crate::vision_encoder::VisionOp;
 use crate::plan::{Buf, QuantSource, NormKind, Op, Phase, Plan, PlanBlock, Weight};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -45,6 +47,12 @@ pub struct Graph {
     pub block: Vec<BlockGraph>,
     #[serde(default)]
     pub tail: Vec<Node>,
+    #[serde(default)]
+    pub vision_head: Vec<Node>,
+    #[serde(default)]
+    pub vision_block: Vec<Node>,
+    #[serde(default)]
+    pub vision_tail: Vec<Node>,
     #[serde(default)]
     pub mtp: Vec<Node>,
     #[serde(default)]
@@ -133,6 +141,7 @@ impl Node {
         let field = |v: &Option<String>, what: &str| v.clone().with_context(|| format!("{} needs {what}", self.op));
         Ok(match self.op.as_str() {
             "embed" => Op::Embed,
+            "splice" => Op::Splice,
             "rmsnorm" => Op::Norm { which: norm(&field(&self.weight, "weight")?)?, into: buffer(&field(&self.out, "out")?)? },
             "linear" => Op::Linear {
                 weight: weight(&field(&self.weight, "weight")?)?,
@@ -173,6 +182,7 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
             "plain" => !spec.norm.sandwich,
             "logit_softcap" => spec.dims.logit_softcap.is_some(),
             "speculative" => spec.speculative().is_some(),
+            "vision" => spec.vision.is_some(),
             _ => false,
         })
     })
@@ -182,7 +192,51 @@ fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec) -> Result
     nodes.iter().filter(|n| n.runs_in(phase, tensor_core, spec)).map(Node::lower).collect()
 }
 
+fn vision_op(node: &Node, block: usize, deepstack: Option<usize>) -> Result<VisionOp> {
+    let which = || -> Result<u8> {
+        match node.weight.as_deref() {
+            Some("1") => Ok(1),
+            Some("2") => Ok(2),
+            other => bail!("vnorm needs weight 1 or 2, got {other:?}"),
+        }
+    };
+    Ok(match node.op.as_str() {
+        "patch_embed" => VisionOp::PatchEmbed,
+        "vnorm" => VisionOp::Norm { block, which: which()? },
+        "vqkv" => VisionOp::Qkv { block },
+        "vrope" => VisionOp::Rope,
+        "vattention" => VisionOp::Attention,
+        "vproj" => VisionOp::Proj { block },
+        "vmlp_up" => VisionOp::MlpUp { block },
+        "vmlp_down" => VisionOp::MlpDown { block },
+        "deepstack_merger" => VisionOp::DeepstackMerger { index: deepstack.context("deepstack merger outside a deepstack block")?, after_block: block },
+        "vmerger" => VisionOp::Merger,
+        other => bail!("unknown vision op {other}"),
+    })
+}
+
+fn vision_holds(when: Option<&str>, deepstack: Option<usize>) -> bool {
+    when.is_none_or(|w| w.split('+').all(|c| c == "deepstack" && deepstack.is_some()))
+}
+
 impl Graph {
+    pub fn vision_plan(&self, cfg: &VisionConfig) -> Result<Vec<VisionOp>> {
+        let mut ops = Vec::new();
+        for n in &self.vision_head {
+            ops.push(vision_op(n, 0, None)?);
+        }
+        for block in 0..cfg.depth {
+            let deepstack = cfg.deepstack_visual_indexes.iter().position(|&b| b == block);
+            for n in self.vision_block.iter().filter(|n| vision_holds(n.when.as_deref(), deepstack)) {
+                ops.push(vision_op(n, block, deepstack)?);
+            }
+        }
+        for n in &self.vision_tail {
+            ops.push(vision_op(n, 0, None)?);
+        }
+        Ok(ops)
+    }
+
     pub fn decoder() -> &'static Graph {
         static DECODER_GRAPH: std::sync::OnceLock<Graph> = std::sync::OnceLock::new();
         DECODER_GRAPH.get_or_init(|| Graph::parse(DECODER).expect("the embedded decoder graph parses"))
