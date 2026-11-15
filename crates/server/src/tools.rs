@@ -1,4 +1,16 @@
 use serde_json::{Map, Value};
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+static REPAIRS: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
+
+pub fn note_repair(kind: &'static str) {
+    *REPAIRS.lock().unwrap().entry(kind).or_default() += 1;
+}
+
+pub fn repair_counts() -> Vec<(&'static str, u64)> {
+    REPAIRS.lock().unwrap().iter().map(|(k, v)| (*k, *v)).collect()
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Delta {
@@ -64,6 +76,7 @@ struct Slot {
     arguments: Option<String>,
     name_sent: bool,
     ended: bool,
+    raw: String,
 }
 
 pub struct OutputParser {
@@ -116,7 +129,7 @@ impl OutputParser {
         let mut out = Vec::new();
         self.drain(true, &mut out);
         if matches!(self.state, State::Preamble | State::Name | State::Args | State::Between) {
-            self.end_call(&mut out);
+            self.end_call(&mut out, "");
         }
         self.state = State::Content;
         if !self.deferred_ws.is_empty() && self.slots.is_empty() {
@@ -207,10 +220,18 @@ impl OutputParser {
                 self.reasoning.push_str(&text);
                 out.push(Delta::Reasoning(text));
             }
-            State::Name => self.slots.last_mut().unwrap().name.push_str(&text),
+            State::Name => {
+                let slot = self.slots.last_mut().unwrap();
+                slot.raw.push_str(&text);
+                slot.name.push_str(&text);
+            }
             State::Args => self.slots.last_mut().unwrap().args.push_str(&text),
-            State::Preamble if self.json_calls => self.slots.last_mut().unwrap().args.push_str(&text),
-            State::Preamble | State::Between => {}
+            State::Preamble => {
+                let slot = self.slots.last_mut().unwrap();
+                slot.raw.push_str(&text);
+                slot.args.push_str(&text);
+            }
+            State::Between => {}
         }
     }
 
@@ -242,75 +263,191 @@ impl OutputParser {
             (Reasoning, ThinkStart) | (Content, ThinkEnd) => {}
             (Reasoning, ThinkEnd) => self.state = Content,
             (Reasoning | Content | Between, ToolStart) => {
-                self.slots.push(Slot::default());
+                self.open_slot(lit);
                 self.state = Preamble;
             }
-            (Preamble, FuncPrefix) => self.state = Name,
+            (Name | Args, ToolStart) => {
+                self.end_call(out, "");
+                self.open_slot(lit);
+                self.state = Preamble;
+            }
+            (Preamble, FuncPrefix) => {
+                let slot = self.slots.last_mut().unwrap();
+                slot.raw.push_str(lit);
+                slot.args.clear();
+                self.state = Name;
+            }
+            (Preamble, ParamStart) if self.slots.last().is_some_and(|s| s.args.trim().is_empty()) => {
+                let slot = self.slots.last_mut().unwrap();
+                slot.raw.push_str(lit);
+                slot.args.clear();
+                note_repair("parameter_as_function");
+                self.state = Name;
+            }
             (Content | Between, FuncPrefix) => {
-                self.slots.push(Slot::default());
+                self.open_slot(lit);
+                self.state = Name;
+            }
+            (Args, FuncPrefix) => {
+                note_repair("missing_function_end");
+                self.end_call(out, "");
+                self.open_slot(lit);
                 self.state = Name;
             }
             (Preamble, ToolEnd) => {
-                self.end_call(out);
+                self.end_call(out, lit);
                 self.state = Content;
             }
             (Name, Close) => {
-                self.send_name(out);
-                self.state = Args;
+                let index = self.slots.len() - 1;
+                self.slots[index].raw.push('>');
+                match self.send_name(index, out) {
+                    true => self.state = Args,
+                    false => {
+                        self.drop_slot_as_text(index, "", out);
+                        self.state = Content;
+                    }
+                }
             }
             (Name | Args, FuncEnd) => {
-                self.end_call(out);
+                self.end_call(out, lit);
                 self.state = Between;
+            }
+            (Name | Args, ToolEnd) => {
+                if self.state == Args {
+                    note_repair("missing_function_end");
+                }
+                self.end_call(out, lit);
+                self.state = Content;
             }
             (Between, ToolEnd) => self.state = Content,
             _ => self.on_text(lit.to_string(), out),
         }
     }
 
-    fn end_json_call(&mut self, index: usize, out: &mut Vec<Delta>) {
-        let slot = &mut self.slots[index];
-        slot.ended = true;
-        let Ok(body) = serde_json::from_str::<Value>(slot.args.trim()) else { return };
-        let Some(name) = body["name"].as_str().filter(|n| !n.is_empty()) else { return };
-        let args = match body.get("arguments").or_else(|| body.get("parameters")) {
-            Some(Value::String(s)) => s.clone(),
-            Some(v) => crate::tools::py_dumps(v),
-            None => "{}".to_string(),
-        };
-        slot.name = name.to_string();
-        self.send_name(out);
-        let slot = &mut self.slots[index];
-        slot.arguments = Some(args.clone());
-        out.push(Delta::Args { index, arguments: args });
+    fn open_slot(&mut self, lit: &str) {
+        self.slots.push(Slot { raw: lit.to_string(), ..Slot::default() });
     }
 
-    fn send_name(&mut self, out: &mut Vec<Delta>) {
-        let index = self.slots.len() - 1;
-        let slot = &mut self.slots[index];
-        let name = slot.name.trim().to_string();
-        if slot.name_sent || name.is_empty() {
-            return;
+    fn drop_slot_as_text(&mut self, index: usize, closer: &str, out: &mut Vec<Delta>) {
+        let slot = self.slots.remove(index);
+        let mut text = slot.raw;
+        text.push_str(closer);
+        if !text.is_empty() {
+            self.push_content(text, out);
         }
+    }
+
+    fn resolve(&self, name: &str) -> Option<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let declared: Vec<&str> = self.tools.iter().filter_map(|t| t["function"]["name"].as_str()).collect();
+        if declared.is_empty() || declared.contains(&name) {
+            return Some(name.to_string());
+        }
+        let squash = |s: &str| {
+            let mut out = String::new();
+            for c in s.chars() {
+                if !(c == '_' && out.ends_with('_')) {
+                    out.push(c);
+                }
+            }
+            out
+        };
+        let wanted = squash(name);
+        let hits: Vec<&&str> = declared.iter().filter(|d| squash(d) == wanted).collect();
+        match hits.as_slice() {
+            [one] => {
+                note_repair("namespace");
+                Some(one.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn end_json_call(&mut self, index: usize, closer: &str, out: &mut Vec<Delta>) {
+        self.slots[index].ended = true;
+        let text = self.slots[index].args.trim().to_string();
+        let calls = self.json_calls_in(&text);
+        if calls.is_empty() {
+            return self.drop_slot_as_text(index, closer, out);
+        }
+        if !self.json_calls {
+            note_repair("json_call");
+        }
+        for (i, (name, args)) in calls.into_iter().enumerate() {
+            let at = match i {
+                0 => index,
+                _ => {
+                    self.slots.push(Slot { ended: true, ..Slot::default() });
+                    self.slots.len() - 1
+                }
+            };
+            self.slots[at].name = name;
+            self.send_name(at, out);
+            self.slots[at].arguments = Some(args.clone());
+            out.push(Delta::Args { index: at, arguments: args });
+        }
+    }
+
+    fn json_calls_in(&self, text: &str) -> Vec<(String, String)> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let strict: Result<Vec<Value>, _> = serde_json::Deserializer::from_str(text).into_iter::<Value>().collect();
+        let values = match strict {
+            Ok(v) => v,
+            Err(_) => match repair_json(text) {
+                Some(v) => {
+                    note_repair("json_arguments");
+                    vec![v]
+                }
+                None => return Vec::new(),
+            },
+        };
+        let mut calls = Vec::new();
+        for v in values {
+            let Some(name) = v["name"].as_str().and_then(|n| self.resolve(n)) else { return Vec::new() };
+            let args = match v.get("arguments").or_else(|| v.get("parameters")) {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => py_dumps(v),
+                None => "{}".to_string(),
+            };
+            calls.push((name, args));
+        }
+        calls
+    }
+
+    fn send_name(&mut self, index: usize, out: &mut Vec<Delta>) -> bool {
+        let name = self.slots[index].name.trim().to_string();
+        if self.slots[index].name_sent {
+            return true;
+        }
+        let Some(name) = self.resolve(&name) else { return false };
+        let slot = &mut self.slots[index];
         slot.name = name.clone();
         slot.name_sent = true;
         slot.id = format!("chatcmpl-tool-{}", uuid::Uuid::new_v4().simple());
         out.push(Delta::Call { index, id: slot.id.clone(), name });
+        true
     }
 
-    fn end_call(&mut self, out: &mut Vec<Delta>) {
+    fn end_call(&mut self, out: &mut Vec<Delta>, closer: &str) {
         let Some(index) = self.slots.len().checked_sub(1) else { return };
         if self.slots[index].ended {
             return;
         }
-        if self.json_calls && self.state == State::Preamble {
-            return self.end_json_call(index, out);
+        if self.state == State::Preamble {
+            return self.end_json_call(index, closer, out);
         }
-        self.send_name(out);
+        if !self.send_name(index, out) {
+            self.slots[index].ended = true;
+            return self.drop_slot_as_text(index, closer, out);
+        }
         let slot = &mut self.slots[index];
         slot.ended = true;
-        if !slot.name_sent {
-            return;
-        }
         let arguments = match slot.args.trim().is_empty() {
             true => "{}".to_string(),
             false => convert_args(&slot.args, properties(&self.tools, &slot.name)),
@@ -453,13 +590,88 @@ fn coerce(value: &str, types: &[String]) -> String {
                 "false" | "0" => Some("false".into()),
                 _ => None,
             },
-            _ => py_json(value),
+            _ => py_json_repaired(value),
         };
         if let Some(v) = hit {
             return v;
         }
     }
-    py_json(value).unwrap_or_else(|| json_str(value))
+    py_json_repaired(value).unwrap_or_else(|| json_str(value))
+}
+
+fn py_json_repaired(value: &str) -> Option<String> {
+    if let Some(v) = py_json(value) {
+        return Some(v);
+    }
+    let v = value.trim();
+    if !(v.starts_with('[') || v.starts_with('{')) {
+        return None;
+    }
+    let repaired = repair_json(v)?;
+    note_repair("arguments");
+    Some(py_dumps(&repaired))
+}
+
+pub fn repair_json(text: &str) -> Option<Value> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '"' | '\'' => {
+                out.push('"');
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    match chars[i] {
+                        '\\' if i + 1 < chars.len() => {
+                            let next = chars[i + 1];
+                            match next == '\'' {
+                                true => out.push('\''),
+                                false => {
+                                    out.push('\\');
+                                    out.push(next);
+                                }
+                            }
+                            i += 2;
+                            continue;
+                        }
+                        '"' => out.push_str("\\\""),
+                        '\n' => out.push_str("\\n"),
+                        ch => out.push(ch),
+                    }
+                    i += 1;
+                }
+                out.push('"');
+                i += 1;
+            }
+            ',' => {
+                let next = chars[i + 1..].iter().find(|c| !c.is_whitespace());
+                if !matches!(next, Some('}') | Some(']')) {
+                    out.push(',');
+                }
+                i += 1;
+            }
+            c if c.is_alphabetic() => {
+                let start = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                out.push_str(match word.as_str() {
+                    "True" => "true",
+                    "False" => "false",
+                    "None" => "null",
+                    w => w,
+                });
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    serde_json::from_str(&out).ok()
 }
 
 fn py_int(value: &str) -> Option<String> {

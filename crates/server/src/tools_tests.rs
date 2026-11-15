@@ -302,7 +302,7 @@ fn with_tool_parsing_off_tags_are_content() {
 
 #[test]
 fn hermes_json_calls_parse_with_python_spacing() {
-    let text = "<think>\nhmm\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\":\"Paris\",\"n\":[1,2]}}\n</tool_call>";
+    let text = "<think>\nhmm\n</think>\n\n<tool_call>\n{\"name\": \"get_current_weather\", \"arguments\": {\"city\":\"Paris\",\"n\":[1,2]}}\n</tool_call>";
     for chunks in [vec![text], by_char(text)] {
         let mut p = OutputParser::new(&weather_tools(), true, true).hermes();
         for c in &chunks {
@@ -310,7 +310,7 @@ fn hermes_json_calls_parse_with_python_spacing() {
         }
         p.finish();
         let r = p.result();
-        assert_eq!(calls(&r), [("get_weather", r#"{"city": "Paris", "n": [1, 2]}"#)]);
+        assert_eq!(calls(&r), [("get_current_weather", r#"{"city": "Paris", "n": [1, 2]}"#)]);
         assert_eq!(r.reasoning.as_deref(), Some("\nhmm\n"));
         assert_eq!(r.content, None);
     }
@@ -321,4 +321,116 @@ fn a_partial_tag_at_a_chunk_edge_is_held_back() {
     let mut p = OutputParser::new(&weather_tools(), true, false);
     assert_eq!(p.feed("Hello <tool"), vec![Delta::Content("Hello ".into())]);
     assert_eq!(p.feed("s are fun"), vec![Delta::Content("<tools are fun".into())]);
+}
+
+fn recovered(text: &str) -> Vec<(String, String)> {
+    let p = OutputParser::parse(&weather_tools(), true, false, text);
+    let whole: Vec<(String, String)> = p.tool_calls.iter().map(|c| (c.name.clone(), c.arguments.clone())).collect();
+    let s = stream(&weather_tools(), false, &by_char(text));
+    let streamed: Vec<(String, String)> = s.calls.iter().map(|(_, n, a)| (n.clone(), a.clone())).collect();
+    assert_eq!(whole, streamed, "{text}");
+    whole
+}
+
+fn kept_as_text(text: &str) {
+    let p = OutputParser::parse(&weather_tools(), true, false, text);
+    assert!(p.tool_calls.is_empty(), "{text}: {:?}", p.tool_calls);
+    assert_eq!(p.content.as_deref().map(str::trim), Some(text.trim()), "{text}");
+    let s = stream(&weather_tools(), false, &by_char(text));
+    assert!(s.calls.is_empty());
+    assert_eq!(s.content.trim(), text.trim());
+}
+
+fn city(c: &str) -> (String, String) {
+    ("get_current_weather".to_string(), format!(r#"{{"city": "{c}"}}"#))
+}
+
+#[test]
+fn malformed_corpus_parameter_tag_without_a_function() {
+    let text = "<tool_call>\n<parameter=city>\nDallas\n</parameter>\n</tool_call>";
+    kept_as_text(text);
+}
+
+#[test]
+fn malformed_corpus_json_inside_tool_call_for_the_qwen_parser() {
+    let text = "<tool_call>\n{\"name\": \"get_current_weather\", \"arguments\": {\"city\": \"Rome\"}}\n</tool_call>";
+    assert_eq!(recovered(text), [city("Rome")]);
+}
+
+#[test]
+fn malformed_corpus_json_with_trailing_comma_and_single_quotes() {
+    let text = "<tool_call>\n{'name': 'get_current_weather', 'arguments': {'city': 'Rome', 'pin': True,},}\n</tool_call>";
+    assert_eq!(recovered(text), [("get_current_weather".to_string(), r#"{"city": "Rome", "pin": true}"#.to_string())]);
+}
+
+#[test]
+fn malformed_corpus_two_json_calls_in_one_block() {
+    let text = "<tool_call>\n{\"name\": \"get_current_weather\", \"arguments\": {\"city\": \"A\"}}\n{\"name\": \"get_current_weather\", \"arguments\": {\"city\": \"B\"}}\n</tool_call>";
+    assert_eq!(recovered(text), [city("A"), city("B")]);
+}
+
+#[test]
+fn malformed_corpus_two_function_blocks_in_one_tool_call() {
+    let text = "<tool_call>\n<function=get_current_weather>\n<parameter=city>\nA\n</parameter>\n</function>\n<function=get_current_weather>\n<parameter=city>\nB\n</parameter>\n</function>\n</tool_call>";
+    assert_eq!(recovered(text), [city("A"), city("B")]);
+}
+
+#[test]
+fn malformed_corpus_missing_function_end() {
+    let text = "<tool_call>\n<function=get_current_weather>\n<parameter=city>\nA\n</parameter>\n</tool_call>";
+    assert_eq!(recovered(text), [city("A")]);
+    let two = "<tool_call>\n<function=get_current_weather>\n<parameter=city>\nA\n</parameter>\n<function=get_current_weather>\n<parameter=city>\nB\n</parameter>\n</function>\n</tool_call>";
+    assert_eq!(recovered(two), [city("A"), city("B")]);
+}
+
+#[test]
+fn malformed_corpus_function_without_tool_call_and_unclosed_at_the_end() {
+    let text = "<function=get_current_weather>\n<parameter=city>\nA\n</parameter>";
+    assert_eq!(recovered(text), [city("A")]);
+}
+
+#[test]
+fn malformed_corpus_undeclared_tools_stay_text() {
+    kept_as_text("<tool_call>\n<function=rm_rf>\n<parameter=path>\n/\n</parameter>\n</function>\n</tool_call>");
+    kept_as_text("<tool_call>\n{\"name\": \"rm_rf\", \"arguments\": {}}\n</tool_call>");
+    kept_as_text("<function=nothing_declared>\n</function>");
+}
+
+#[test]
+fn malformed_corpus_garbage_json_stays_text() {
+    kept_as_text("<tool_call>\n{not json at all\n</tool_call>");
+    kept_as_text("<tool_call>\n</tool_call>");
+}
+
+#[test]
+fn malformed_corpus_collapsed_namespace_maps_to_the_declared_name() {
+    let tools = vec![
+        json!({"type": "function", "function": {"name": "mcp__a__b", "parameters": {"type": "object", "properties": {"x": {"type": "string"}}}}}),
+        json!({"type": "function", "function": {"name": "mcp__c__d", "parameters": {"type": "object", "properties": {}}}}),
+    ];
+    let p = OutputParser::parse(&tools, true, false, "<tool_call>\n<function=mcp_a_b>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>");
+    assert_eq!(calls(&p), [("mcp__a__b", r#"{"x": "1"}"#)]);
+    let ambiguous = vec![
+        json!({"type": "function", "function": {"name": "mcp__a__b", "parameters": {}}}),
+        json!({"type": "function", "function": {"name": "mcp_a__b", "parameters": {}}}),
+    ];
+    let p = OutputParser::parse(&ambiguous, true, false, "<tool_call>\n<function=mcp_a_b>\n</function>\n</tool_call>");
+    assert!(p.tool_calls.is_empty());
+}
+
+#[test]
+fn malformed_corpus_array_and_object_arguments_are_repaired() {
+    let tools = one_tool("edit", json!({"items": {"type": "array"}, "opts": {"type": "object"}}));
+    let text = "<tool_call>\n<function=edit>\n<parameter=items>\n['a', 'b',]\n</parameter>\n<parameter=opts>\n{'k': True, 'n': None, 'list': [1, 2,],}\n</parameter>\n</function>\n</tool_call>";
+    let p = OutputParser::parse(&tools, true, false, text);
+    assert_eq!(calls(&p), [("edit", r#"{"items": ["a", "b"], "opts": {"k": true, "n": null, "list": [1, 2]}}"#)]);
+}
+
+#[test]
+fn repairs_are_counted() {
+    let before: u64 = repair_counts().iter().map(|(_, n)| n).sum();
+    let tools = one_tool("edit", json!({"items": {"type": "array"}}));
+    OutputParser::parse(&tools, true, false, "<tool_call>\n<function=edit>\n<parameter=items>\n['a',]\n</parameter>\n</function>\n</tool_call>");
+    let after: u64 = repair_counts().iter().map(|(_, n)| n).sum();
+    assert!(after > before);
 }
