@@ -26,7 +26,7 @@ fn header(k: &Kernel, enable: &str) -> String {
     s
 }
 
-fn rmsnorm(k: &Kernel, width: u32, eps: f32, sum: BlockSum) -> String {
+fn rmsnorm(k: &Kernel, width: u32, eps: f32, sum: BlockSum, offset: f32) -> String {
     let t = k.threads;
     let (x, w, out) = (k.params[0].name, k.params[1].name, k.params[2].name);
     let (enable, builtins, scratch, reduce) = match sum {
@@ -83,11 +83,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, {builtins}) {{
     }}
 {reduce}    let inv = inverseSqrt(total / f32(WIDTH) + EPS);
     for (var i = li; i < WIDTH; i += {t}u) {{
-        {out}[dst + i] = {w}[i] * ({x}[src + i] * inv);
+        {out}[dst + i] = {wi} * ({x}[src + i] * inv);
     }}
 }}
 ",
         eps = lit(eps),
+        wi = if offset == 0.0 { format!("{w}[i]") } else { format!("({w}[i] + {})", lit(offset)) },
     ));
     s
 }
@@ -98,14 +99,15 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
         return Err(format!("{}: the WGSL emitter cannot target {:?}", k.name, k.target.language));
     }
     Ok(match &k.body {
-        Body::RmsNorm { width, eps, sum } => {
+        Body::AddRmsNorm { .. } | Body::Pointwise { .. } => return Err(format!("{}: no WGSL emitter for this body yet", k.name)),
+        Body::RmsNorm { width, eps, sum, offset } => {
             if *sum == BlockSum::WarpShuffle {
                 return Err(format!("{}: block sum {sum:?} has no WGSL snippet", k.name));
             }
             if *sum == BlockSum::Subgroup && k.threads > 128 * k.target.warp_size.max(1) {
                 return Err(format!("{}: too many subgroups for the scratch array", k.name));
             }
-            rmsnorm(k, *width, *eps, *sum)
+            rmsnorm(k, *width, *eps, *sum, *offset)
         }
         Body::GatedActivation { width, act } => {
             let (gu, out) = (k.params[0].name, k.params[1].name);

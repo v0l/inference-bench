@@ -82,7 +82,7 @@ fn emitters_refuse_the_wrong_language() {
 fn a_block_the_target_cannot_run_is_refused() {
     let mut k = norm(&Target::wgpu_baseline());
     k.body = match k.body {
-        kir::Body::RmsNorm { width, eps, .. } => kir::Body::RmsNorm { width, eps, sum: BlockSum::Subgroup },
+        kir::Body::RmsNorm { width, eps, offset, .. } => kir::Body::RmsNorm { width, eps, offset, sum: BlockSum::Subgroup },
         b => b,
     };
     let err = k.validate().unwrap_err();
@@ -90,7 +90,7 @@ fn a_block_the_target_cannot_run_is_refused() {
     assert!(!Target::wgpu_baseline().has(Feature::Subgroups));
     let mut cuda = norm(&Target::sm_120());
     cuda.body = match cuda.body {
-        kir::Body::RmsNorm { width, eps, .. } => kir::Body::RmsNorm { width, eps, sum: BlockSum::SharedTree },
+        kir::Body::RmsNorm { width, eps, offset, .. } => kir::Body::RmsNorm { width, eps, offset, sum: BlockSum::SharedTree },
         b => b,
     };
     assert!(cuda.validate().unwrap_err().contains("cannot run"));
@@ -234,4 +234,32 @@ mod layouts {
         let l = Layout::new(tuple(vec![leaf(4), tuple(vec![leaf(2), leaf(3)])]), tuple(vec![leaf(1), tuple(vec![leaf(12), leaf(4)])])).unwrap();
         assert_eq!(l.expr(&["a", "b"], Dialect::Cuda).unwrap(), "a + (b % 2) * 12 + (b / 2) * 4");
     }
+}
+
+#[test]
+fn offset_norm_adds_the_offset_to_the_weight() {
+    let k = Kernel::rmsnorm_offset(&Target::sm_120(), 128, 1e-6, 1.0, 256).unwrap();
+    let src = kir::cuda::emit_kernel(&k).unwrap();
+    assert!(src.contains("(weight[i] + 1e0f)"), "{src}");
+    let plain = kir::cuda::emit_kernel(&norm(&Target::sm_120())).unwrap();
+    assert!(!plain.contains("+ 1e0f"));
+}
+
+#[test]
+fn residual_add_and_norm_fuse_into_one_kernel() {
+    let k = Kernel::add_rmsnorm(&Target::sm_120(), 128, 1e-6, 0.0, 256).unwrap();
+    let src = kir::cuda::emit_module(&[k]).unwrap();
+    assert!(src.contains("add_rmsnorm"));
+    assert!(src.contains("x[base + i] + delta[base + i]"));
+    assert!(src.contains("sum[base + i] = v"));
+}
+
+#[test]
+fn soft_cap_and_scale_are_generic_pointwise_primitives() {
+    let t = Target::sm_120();
+    let cap = Kernel::pointwise(&t, "softcap", 64, kir::Pointwise::SoftCap(30.0), 256).unwrap();
+    assert!(kir::cuda::emit_kernel(&cap).unwrap().contains("3e1f * tanhf(v / 3e1f)"));
+    let scale = Kernel::pointwise(&t, "embed_scale", 64, kir::Pointwise::Scale(8.0), 256).unwrap();
+    assert!(kir::cuda::emit_kernel(&scale).unwrap().contains("v * 8e0f"));
+    assert!(Kernel::pointwise(&t, "bad", 64, kir::Pointwise::SoftCap(0.0), 256).is_err());
 }

@@ -3,7 +3,7 @@ mod gemm;
 pub use gemm::{FP4_ACT, FP4_BATCH, FP4_CORE, FP4_HEAD, FP8_ACT, FP8_BATCH, GEMM_CORE, emit_gemm, emit_gemms, gemm_library, needs_arch_features};
 
 use crate::layout::{Dialect, Layout};
-use crate::{Activation, BlockSum, Body, Kernel, Language, lit};
+use crate::{Activation, BlockSum, Body, Kernel, Language, Pointwise, lit};
 
 const WARP_SUM: &str = "__device__ __forceinline__ float kir_warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
@@ -41,10 +41,14 @@ pub fn gate_up_tile_in(width: u32, i: &str, k: &str, dialect: Dialect) -> Result
     Layout::flat(&[width as u64, 2], &[2, 1])?.expr(&[i, k], dialect)
 }
 
+fn weight_expr(w: &str, offset: f32) -> String {
+    if offset == 0.0 { format!("{w}[i]") } else { format!("({w}[i] + {}f)", lit(offset)) }
+}
+
 pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
     check(k)?;
     Ok(match &k.body {
-        Body::RmsNorm { width, eps, sum: BlockSum::WarpShuffle } => format!(
+        Body::RmsNorm { width, eps, sum: BlockSum::WarpShuffle, offset } => format!(
             "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const float* {x}, const float* {w}, float* {out}) {{
     constexpr int WIDTH = {width};
     __shared__ float scratch[32];
@@ -53,7 +57,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
     float ss = 0.0f;
     for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) ss += {x}[i] * {x}[i];
     float inv = rsqrtf(kir_block_sum(ss, scratch) / WIDTH + {eps}f);
-    for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) {out}[i] = {w}[i] * ({x}[i] * inv);
+    for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) {out}[i] = {wi} * ({x}[i] * inv);
 }}
 
 ",
@@ -63,7 +67,48 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
             w = k.params[1].name,
             out = k.params[2].name,
             eps = lit(*eps),
+            wi = weight_expr(k.params[1].name, *offset),
         ),
+        Body::AddRmsNorm { width, eps, sum: BlockSum::WarpShuffle, offset } => format!(
+            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const float* {x}, const float* {d}, const float* {w}, float* {sm}, float* {out}) {{
+    constexpr int WIDTH = {width};
+    __shared__ float scratch[32];
+    size_t base = (size_t)blockIdx.x * WIDTH;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) {{
+        float v = {x}[base + i] + {d}[base + i];
+        {sm}[base + i] = v;
+        ss += v * v;
+    }}
+    float inv = rsqrtf(kir_block_sum(ss, scratch) / WIDTH + {eps}f);
+    for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) {out}[base + i] = {wi} * ({sm}[base + i] * inv);
+}}
+
+",
+            threads = k.threads,
+            name = k.name,
+            x = k.params[0].name,
+            d = k.params[1].name,
+            w = k.params[2].name,
+            sm = k.params[3].name,
+            out = k.params[4].name,
+            eps = lit(*eps),
+            wi = weight_expr(k.params[2].name, *offset),
+        ),
+        Body::Pointwise { width, op } => {
+            let e = match op {
+                Pointwise::Scale(f) => format!("v * {}f", lit(*f)),
+                Pointwise::SoftCap(c) => format!("{c}f * tanhf(v / {c}f)", c = lit(*c)),
+            };
+            format!(
+                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const float* {x}, float* {out}) {{\n    constexpr int WIDTH = {width};\n    {x} += (size_t)blockIdx.y * WIDTH;\n    {out} += (size_t)blockIdx.y * WIDTH;\n    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < WIDTH; i += gridDim.x * blockDim.x) {{\n        float v = {x}[i];\n        {out}[i] = {e};\n    }}\n}}\n\n",
+                threads = k.threads,
+                name = k.name,
+                x = k.params[0].name,
+                out = k.params[1].name,
+            )
+        }
+        Body::AddRmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
         Body::RmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
         Body::GatedActivation { width, act } => {
             let a = match act {
@@ -96,7 +141,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
 
 pub fn emit_module(kernels: &[Kernel]) -> Result<String, String> {
     let mut out = String::new();
-    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. })) {
+    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::AddRmsNorm { .. })) {
         out.push_str(WARP_SUM);
     }
     for k in kernels {
