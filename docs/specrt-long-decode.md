@@ -183,3 +183,26 @@ real122b: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered
 `real122b` greedy: " Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of
 Portugal is Lisbon. The", the continuation in `docs/specrt-moe.md`. 12 x 32k against rebased
 master: 304.8 to 504.9 tok/s (full-batch step 113.2 to 66.4 ms).
+
+## #646: the non-attention part of the round
+
+12 x 32k, MTP k = 2, `long617.sh` (`CASES=12x32768`, `KV_GB=40`), same GPU, master 8f6b1f1 against this branch:
+
+| | aggregate decode | decode step | full-batch step |
+|---|---|---|---|
+| master 8f6b1f1 | 513.5 tok/s | 60.93 ms | 65.34 ms |
+| #646 | 559.4 tok/s | 56.21 ms | 60.14 ms |
+
+Batch 8 (`batch8_604.sh`, 24 requests, 8 clients): 450.3 to 480.8 tok/s decode, prefill 940 to 1,003 tok/s.
+
+What changed:
+
+- `lin_ba` uses the one-block-per-row kernel up to 64 rows (it was 32): 90 us per call at 36 rows to about 35 us, 48 layers per round.
+- The MTP draft head uses the batched fp4 GEMV (`mtp_head_f4b`) at up to 64 rows: 1,349 us to 684 us at 4 rows (1,046 GB/s on the weight bytes), 1,406 us to 864 us at 12 rows. `lm_head` takes the narrow tile up to 64 rows.
+- fp4 act GEMM: 4 stages for the wide tiles (down_f4a 110 to 69 us at 12 x 2k), skinny 32-row tiles from #611 for 17 to 32 rows.
+
+Single-kernel weight bandwidth at 36 rows (27B dims, rotating weights as in the model / L2-hot): `gate_up_f4a_narrow` 1,011 / 1,487 GB/s, `down_f4a_narrow` 848 / 1,035 GB/s, `lin_in_f8_narrow` about 1,300 GB/s from nsys (84 MB in 64 us). These are at the bandwidth the hardware gives, so no new small-M GEMV for them.
+
+`gdn_commit` and `gdn_verify` are bound by the recurrent state: 48 linear layers x 12 sequences x 48 heads x 128 x 128 x 4 B is 1.8 GB. `gdn_commit` reads and writes it (3.6 GB, 2.58 ms per call, 1.4 TB/s) and `gdn_verify` reads it (810 GB/s). Only a different state dtype or skipping the commit write would shrink them, which changes numerics.
+
+Floor for 3x: per round the weights are about 20 GB (fp4 MLP 7.5 GB, fp8 attention and delta-net, bf16 lm_head 2.5 GB), the bf16 KV of 12 x 32k is 25.8 GB (4,096 B per token per layer, 16 layers), the recurrent state 5.4 GB. At 1,640 GB/s that is about 31 ms of pure traffic per round, against 56 ms now. With about 2.6 tokens per sequence per round, 3x master (1,540 tok/s) needs a 20 ms round, which is below that floor. The realistic ceiling with bf16 KV is a 31 ms round, about 1,000 tok/s (roughly 2x master). With fp8 KV (#324) the KV term halves and the floor is about 23 ms.
