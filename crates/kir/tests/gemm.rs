@@ -199,3 +199,15 @@ fn instance_hash_tracks_shape_target_and_tuning() {
     let c = KernelInstance::gemm(&t, "qkv_mma", qkv(), WeightFormat::Bf16, Tile::NARROW, true, false).unwrap();
     assert_ne!(a.hash(), c.hash());
 }
+
+#[test]
+fn nvfp4_act_rows_between_17_and_32_take_the_skinny_tiles() {
+    let t = Target::sm_120();
+    let p = policy(true, true);
+    let gu = select(&t, &p, &req("gate_up", gate_up(), 24, WeightFormat::Fp4)).unwrap();
+    assert_eq!((gu.path, gu.name.as_str(), gu.tile), (GemmPath::F4a, "gate_up_f4a_skinnywide", Tile::SKINNY_WIDE));
+    let dn = select(&t, &p, &req("down", down(), 24, WeightFormat::Fp4)).unwrap();
+    assert_eq!((dn.name.as_str(), dn.tile), ("down_f4a_skinny", Tile::SKINNY));
+    let wide = select(&t, &p, &req("down", down(), 33, WeightFormat::Fp4)).unwrap();
+    assert!(!wide.name.contains("skinny"), "{}", wide.name);
+}

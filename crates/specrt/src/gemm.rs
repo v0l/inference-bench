@@ -78,6 +78,8 @@ pub fn variant_tile(spec: &Spec, suffix: &str) -> Tile {
         "_narrow" => t.tile(Variant::Narrow),
         "_huge" => t.tile(Variant::Huge),
         "_tiny" => t.tile(Variant::Tiny),
+        "_skinny" => t.tile(Variant::Skinny),
+        "_skinnywide" => t.tile(Variant::SkinnyWide),
         "_f4a_big" => t.fp4_tile(Variant::Big),
         _ => t.tile(Variant::Small),
     }
