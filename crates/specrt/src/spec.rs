@@ -1161,7 +1161,7 @@ impl Spec {
                 Some(h) => bail!("[mtp] head_quant {h:?} is not supported (bf16, fp8_channel and nvfp4_g16 are)"),
             }
             ensure!(self.linear_attention.is_some(), "[mtp] needs a hybrid spec with [linear_attention]");
-            ensure!(self.attention.output_gate && self.attention.qk_norm, "[mtp] needs the Qwen3.5 attention (output_gate and qk_norm)");
+            ensure!(self.attention.output_gate && self.attention.qk_norm, "[mtp] needs output-gated, qk-normed attention (output_gate and qk_norm)");
         }
         match self.act_quant {
             ActQuant::None => {}

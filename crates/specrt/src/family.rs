@@ -157,6 +157,7 @@ pub struct FamilyGguf {
     pub tensors: std::collections::BTreeMap<String, String>,
     pub rope_scaling: std::collections::BTreeMap<String, crate::spec::RopeScalingKind>,
     pub unscaled: Vec<String>,
+    pub pretokenizers: std::collections::BTreeMap<String, String>,
 }
 
 impl FamilyGguf {

@@ -491,10 +491,11 @@ impl Gguf {
         let model = self.string("tokenizer.ggml.model").unwrap_or("");
         ensure!(model == "gpt2", "GGUF tokenizer model {model:?} is not supported (gpt2 byte-level BPE is)");
         let pre = self.string("tokenizer.ggml.pre").unwrap_or("default");
-        let pattern = match pre {
-            "qwen2" | "deepseek-r1-qwen" => QWEN2_PRE,
-            "llama-bpe" | "llama3" | "smaug-bpe" => LLAMA3_PRE,
-            other => bail!("GGUF pre-tokenizer {other:?} is not supported (qwen2 and llama-bpe are)"),
+        let registry = crate::family::active();
+        let family = registry.for_gguf(self.architecture()?).context("no family for the GGUF architecture")?;
+        let Some(pattern) = family.gguf.pretokenizers.get(pre) else {
+            let known: Vec<&str> = family.gguf.pretokenizers.keys().map(String::as_str).collect();
+            bail!("GGUF pre-tokenizer {pre:?} is not supported ({} are)", known.join(", "));
         };
         let tokens = self.vocab()?;
         let kinds = self.metadata.get("tokenizer.ggml.token_type").and_then(Value::as_array);
@@ -555,8 +556,6 @@ impl Gguf {
     }
 }
 
-const QWEN2_PRE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
-const LLAMA3_PRE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 pub fn llama3_factors(theta: f64, head_dim: usize, s: &RopeScaling) -> Vec<f64> {
     let (low, high, orig) = (s.low_freq_factor.unwrap_or(1.0), s.high_freq_factor.unwrap_or(4.0), s.original_max_positions.unwrap_or(8192.0));
