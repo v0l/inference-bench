@@ -6,15 +6,17 @@ use specrt::structure::Structure;
 
 const PREFILL_TOKENS: usize = 512;
 const DECODE_ROWS: usize = 8;
-const SMS: usize = 84;
+const SMS: u32 = 84;
 
 fn node(op: &Op, spec: &Spec, layer: usize, phase: Phase, root: &str, index: Option<usize>) -> Node {
     let tokens = match phase {
         Phase::Prefill => PREFILL_TOKENS,
         Phase::Decode => DECODE_ROWS,
     };
-    let kernels = op.kernels(spec, layer, tokens, SMS).join(", ");
-    let decoder = op.decoder(spec, layer, tokens, SMS).map(|d| format!(" [{d}]")).unwrap_or_default();
+    let mut target = specrt::codegen::default_target();
+    target.sm_count = SMS;
+    let kernels = op.kernels(spec, layer, tokens, &target).join(", ");
+    let decoder = op.decoder(spec, layer, tokens, &target).map(|d| format!(" [{d}]")).unwrap_or_default();
     Node {
         title: op.label(),
         shape: format!("{}: {kernels}{decoder}", op.flow()),

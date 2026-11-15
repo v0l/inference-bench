@@ -1,5 +1,5 @@
 use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
-use specrt::codegen::{Module, Tile, linear_dims};
+use specrt::codegen::{Module, linear_dims};
 use specrt::jit::Jit;
 use specrt::spec::Spec;
 use specrt::weights::{bf16_to_f32, f32_to_bf16};
@@ -67,7 +67,7 @@ fn check(spec: &Spec, label: &str, token_counts: &[usize]) -> Option<()> {
 
         let suffix = if tokens <= 16 { "_tiny" } else { "_narrow" };
         let name = format!("lin_ba_mma{suffix}");
-        let tile = Tile::variant(suffix, &spec.runtime);
+        let tile = specrt::gemm::variant_tile(spec, suffix);
         let smem = module.smem[name.as_str()];
         let tf = loaded.function(&name).unwrap();
         use cudarc::driver::sys::CUfunction_attribute as A;

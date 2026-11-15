@@ -38,7 +38,6 @@ extern "C" __global__ void lm_head_gemm(const void* w, const float* s, const flo
     gemm<{{VOCAB}}, {{HIDDEN}}, false, false, {{HEAD_WF}}>(w, s, b, x, out, tokens);
 }
 
-{{MMA_KERNELS}}
 extern "C" __global__ void qkv_proj_norm(const void* w, const float* s, const float* b, const float* x, const float* nw, float* out) {
     linear_norm<{{WF}}, {{QKV_N}}, {{QKV_BIAS}}>(w, s, b, x, nw, out);
 }

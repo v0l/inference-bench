@@ -1,5 +1,6 @@
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod gemm;
 pub mod layout;
 pub mod target;
 #[cfg(feature = "wgsl")]
@@ -37,7 +38,7 @@ pub struct Param {
     pub access: Access,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Activation {
     Silu,
     GeluTanh,
@@ -204,6 +205,19 @@ pub fn module_hash(kernels: &[Kernel]) -> String {
             h ^= b as u64;
             h = h.wrapping_mul(0x100000001b3);
         }
+    }
+    format!("{h:016x}")
+}
+
+pub fn fold_hashes(hashes: impl IntoIterator<Item = String>) -> String {
+    fnv(hashes.into_iter().flat_map(|h| h.into_bytes().into_iter().chain(std::iter::once(0))))
+}
+
+pub(crate) fn fnv(bytes: impl IntoIterator<Item = u8>) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
     }
     format!("{h:016x}")
 }

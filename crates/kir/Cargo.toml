@@ -13,3 +13,6 @@ name = "kir"
 default = ["cuda", "wgsl"]
 cuda = []
 wgsl = []
+
+[dev-dependencies]
+naga = { version = "30.0.1", features = ["wgsl-in"] }

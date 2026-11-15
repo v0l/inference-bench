@@ -424,6 +424,58 @@ fn generated_wgsl_has_no_unfilled_slots() {
     }
 }
 
+#[test]
+fn the_kir_dequant_gemm_needs_shader_f16_and_is_built_from_the_same_builder() {
+    let plain = wgsl::generate(&spec(), 128, &kir::Target::wgpu_baseline()).unwrap();
+    assert!(!plain.iter().any(|k| k.name == "qkv_mma"));
+    let f16 = kir::Target::wgpu_baseline().with_feature(kir::Feature::ShaderF16);
+    let with = wgsl::generate(&spec(), 128, &f16).unwrap();
+    let qkv = with.iter().find(|k| k.name == "qkv_mma").expect("qkv_mma on a ShaderF16 target");
+    assert!(qkv.source.starts_with("enable f16;"));
+    let report = specrt::codegen::kernels_report(&spec(), &f16).unwrap();
+    assert!(report.contains("== family DequantF16"), "{report}");
+}
+
+#[test]
+#[ignore = "needs a GPU adapter with shader-f16"]
+fn kir_dequant_gemm_matches_a_cpu_matmul() {
+    let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = device();
+    let target = specrt::backends::Backend::limits(&w).target();
+    if !target.has(kir::Feature::ShaderF16) {
+        eprintln!("adapter has no shader-f16, skipped");
+        return;
+    }
+    let s = spec();
+    w.compile(&wgsl::generate(&s, 64, &target).unwrap()).unwrap();
+    let shape = specrt::codegen::linear_shape(&s, "qkv");
+    let (n, k, tokens) = (shape.n, shape.k, 5usize);
+    let mut rng = Lcg(5);
+    let wv: Vec<u16> = (0..n * k).map(|_| specrt::weights::f32_to_bf16(rng.unit() * 0.1)).collect();
+    let x: Vec<f32> = (0..tokens * k).map(|_| rng.unit()).collect();
+    let words: Vec<u32> = wv.chunks(2).map(|p| p[0] as u32 | (p[1] as u32) << 16).collect();
+    let wb = u32_buf(&w, &words);
+    let sb = u32_buf(&w, &[0]);
+    let bias = f32_buf(&w, &[0.0]);
+    let xb = f32_buf(&w, &x);
+    let out = f32_buf(&w, &vec![0.0; tokens * n]);
+    let t = kir::gemm::DEQUANT_TILE;
+    go(&mut w, "qkv_mma", &[&wb, &sb, &bias, &xb, &out], [tokens as u32, 0, 0, 0, 0, 0, 0, 0], [(n as u32).div_ceil(t), (tokens as u32).div_ceil(t), 1]);
+    let got = read_f32(&w, &out, tokens * n);
+    let f16 = |v: f32| {
+        let b = v.to_bits();
+        let r = (b + 0x0fff + ((b >> 13) & 1)) & !0x1fff;
+        f32::from_bits(r)
+    };
+    let want: Vec<f32> = (0..tokens * n)
+        .map(|i| {
+            let (m, r) = (i / n, i % n);
+            (0..k).map(|c| f16(specrt::weights::bf16_to_f32(wv[r * k + c])) as f64 * f16(x[m * k + c]) as f64).sum::<f64>() as f32
+        })
+        .collect();
+    close(&got, &want, 1e-3, "kir dequant gemm");
+}
+
 const PROMPT: [u32; 18] = [785, 6722, 315, 9625, 374, 12095, 13, 9645, 264, 2805, 32794, 911, 279, 9396, 323, 279, 9759, 13];
 
 fn log_softmax(row: &[f32]) -> Vec<f64> {

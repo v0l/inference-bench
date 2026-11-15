@@ -76,10 +76,38 @@ On `Target::wgpu_baseline()` the same call picks `SharedTree` and 256 threads, a
 
 In specrt, `codegen::kir_kernels(spec, &target)` builds `rmsnorm` and `swiglu` from the spec. `Module::generate_kv` appends the emitted CUDA to the rendered templates, and `wgsl::generate` appends the WGSL kernels. The old `rmsnorm` and `swiglu` bodies were removed from `ops.cu` and `templates/wgsl`.
 
+## GEMV and GEMM families (slice 2)
+
+`kir::gemm` holds every NVFP4, FP8 and bf16 tile GEMM and batched GEMV as a typed `KernelInstance { name, target, kind, threads, smem_bytes }`. The builders take the target and a `GemmShape { n, k, epi, bias, act }`:
+
+| Builder | Block (`Kind::block`) | Needs |
+|---|---|---|
+| `KernelInstance::gemm` on CUDA | `TileMma`: `gemm_tc` with a weight decoder (`DecBf16`, `DecQ8`, `DecFp8`, `DecGgml`, `DecFp4`), bf16 `mma.m16n8k16` | `Mma16816`, `CpAsync` |
+| `KernelInstance::gemm` on wgpu | `DequantF16`: 16x16 workgroup tile, weights dequantised to f16 in shared memory (bf16, fp8 and nvfp4 decoders) | `ShaderF16` |
+| `fp8_act` | `Fp8ActMma`: e4m3 x e4m3 `mma.m16n8k32` | `Fp8Mma` (sm_89+) |
+| `fp4_act` | `BlockScaledFp4Mma`: `mma ... kind::mxf4nvf4.block_scale` | `BlockScaledFp4` (sm_12x) |
+| `batch`, `batch_reduce` | `BatchRowsMma`, `BatchReduce`: `gemv_f4b` / `gemv_f8b` with split-K | `Mma16816`, `CpAsync` |
+| `quant_fp8`, `quant_fp4` | `QuantRowsFp8`, `QuantRowsFp4` | as the GEMM they feed |
+| `fp4_gemv`, `fp4_head_norm` | `Fp4Gemv`, `Fp4HeadGemv`: one warp per row | `WarpShuffle`, `CpAsync` |
+
+`MmaShape::new(&target, tile, k, format, split)` picks `bk` and stages (NVFP4 stages from `target.smem_limit`), `BatchShape::for_tokens` the batch variant, and `BatchShape::splits(&target, n, k)` the split-K count from `target.sm_count` and `target.smem_per_sm()`. `Tuning` carries the `[runtime]` table: `tile`, `big_tile`, `fp4_tile`, `fp4_stages`. There are no `SPECRT_*` environment knobs left in codegen: the tiny tile width, `bk` and stage counts that `SPECRT_TINY_WN`, `SPECRT_FP8_BK`, `SPECRT_BK` and `SPECRT_STAGES` used to override are fixed or derived from the target.
+
+`kir::gemm::select(&target, &policy, &request)` replaces specrt's old `kernel_for`: it returns a `Choice` with the path, the kernel name, the quantiser and reduce kernel to launch first or after, and the `KernelInstance` it dispatches. specrt's `codegen::kernel_for(spec, &target, linear, tokens, weight)` maps the spec to a `Policy` and calls it. On a target without `BlockScaledFp4` (sm_80, sm_89) an NVFP4 MLP falls back to `f4w`, which dequantises the e2m1 weights to bf16 in shared memory and runs the bf16 mma; without `Fp8Mma` FP8 weights use `DecFp8` through the same tile GEMM.
+
+`specrt::gemm::gemm_kernels(spec, &target)` builds every instance a module needs, so the module list, the shared memory table and dispatch come from one place; a test checks that every `Choice` the runtime can make on sm_120 and sm_80 is an instance in the module. `kir::cuda::emit_gemms` emits the shared device code once (`crates/kir/src/cuda/gemm.cu`, `fp4.cu`, `fp4_act.cu`, `fp8_act.cu`, `fp4_batch.cu`, `fp8_batch.cu`, `fp4_head.cu`, only the parts the instances use) and one `extern "C"` wrapper per instance; `kir::wgsl::emit_gemm` emits one WGSL module per instance. The emitter refuses a block the target cannot run, naming it, for example `qkv_f8b8: block BatchRowsMma has no Wgsl lowering`. On wgpu, `inference-bench kernels` lists the refused blocks after the families. The `{{MMA_KERNELS}}`, `{{F4W_KERNELS}}`, `{{F4A_SOURCE}}`, `{{F4B_KERNELS}}`, `{{F8B_KERNELS}}`, `{{HEAD_F4W_KERNELS}}`, `{{HEAD_F4_ROWS}}`, `{{F4B_KC}}` and `{{F8B_KC}}` slots are gone, with the template files that held them.
+
+Goldens are in `crates/kir/tests/golden/gemm/`, one per family and target (`*_sm120.cu`, `*_sm80.cu`, `*.wgsl`); the WGSL goldens are also parsed and validated with naga.
+
+```
+inference-bench kernels --spec qwen3.8-27b-nvfp4 --target sm_120
+inference-bench kernels --spec qwen3.8-27b-nvfp4 --target sm_80
+inference-bench kernels --spec qwen3.8-27b-nvfp4 --target wgpu
+```
+
 ## Slices
 
-1. This one: crate, Target, Layout, rmsnorm and gated activation.
-2. NVFP4 and FP8 GEMV and GEMM (after #604).
+1. Crate, Target, Layout, rmsnorm and gated activation.
+2. NVFP4 and FP8 GEMV and GEMM (#609, this section).
 3. Delta-net and MTP (after #418).
 4. Attention (after #324).
 5. GGUF and vision.

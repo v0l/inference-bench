@@ -117,14 +117,3 @@ struct DecFp4 : DecBase<DecFp4> {
 __device__ __forceinline__ void load_normed_t(const float* x, const float* nw, float* xt) {
     load_normed<DecFp4>(x, nw, xt);
 }
-
-extern "C" __global__ void __launch_bounds__(FP4_GEMV_THREADS) gate_up_act_f4(const void* w, const unsigned char* s, const float* x, const float* nw, float* out) {
-    gate_up_act_norm<DecFp4>(w, s, x, nw, out);
-}
-
-extern "C" __global__ void __launch_bounds__(FP4_GEMV_THREADS) down_proj_f4(const void* w, const unsigned char* s, const float* b, const float* xt, float* out) {
-    linear_w<DecFp4, HIDDEN, INTER, false, true>(w, s, b, xt, out);
-}
-
-{{F4W_KERNELS}}
-{{F4A_SOURCE}}

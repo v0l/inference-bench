@@ -166,7 +166,7 @@ fn language_matches_target() {
     assert_eq!(Target::wgpu_baseline().language, Language::Wgsl);
 }
 
-const PINNED_SM120_NORM: &str = "69f260464aee0790";
+const PINNED_SM120_NORM: &str = "58cb4e607bffc152";
 
 mod layouts {
     use kir::layout::{Dialect, Layout, leaf, tuple};

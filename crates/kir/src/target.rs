@@ -12,7 +12,22 @@ pub enum Feature {
     Tma,
     Subgroups,
     ShaderF16,
+    Fp8Mma,
+    BlockScaledFp4,
 }
+
+const FEATURES: [Feature; 8] = [
+    Feature::WarpShuffle,
+    Feature::CpAsync,
+    Feature::Mma16816,
+    Feature::Tma,
+    Feature::Subgroups,
+    Feature::ShaderF16,
+    Feature::Fp8Mma,
+    Feature::BlockScaledFp4,
+];
+
+const SMEM_RESERVED_PER_BLOCK: u32 = 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -39,8 +54,14 @@ impl Target {
         if cc >= 80 {
             features |= bit(Feature::CpAsync) | bit(Feature::Mma16816) | bit(Feature::ShaderF16);
         }
+        if cc >= 89 {
+            features |= bit(Feature::Fp8Mma);
+        }
         if cc >= 90 {
             features |= bit(Feature::Tma);
+        }
+        if cc_major == 12 {
+            features |= bit(Feature::BlockScaledFp4);
         }
         Target {
             language: Language::Cuda,
@@ -87,7 +108,7 @@ impl Target {
         match name {
             "sm_120" => Some(Target::sm_120()),
             "sm_80" => Some(Target::sm_80()),
-            "wgpu" => Some(Target::wgpu_baseline().with_subgroups(32)),
+            "wgpu" => Some(Target::wgpu_baseline().with_subgroups(32).with_feature(Feature::ShaderF16)),
             "wgpu-nosubgroups" => Some(Target::wgpu_baseline()),
             _ => None,
         }
@@ -107,15 +128,16 @@ impl Target {
         self.features & bit(f) != 0
     }
 
+    pub fn smem_per_sm(&self) -> u32 {
+        self.smem_limit + SMEM_RESERVED_PER_BLOCK
+    }
+
+    pub fn smem_reserved_per_block(&self) -> u32 {
+        SMEM_RESERVED_PER_BLOCK
+    }
+
     pub fn describe(&self) -> String {
-        let features: Vec<String> = [
-            Feature::WarpShuffle,
-            Feature::CpAsync,
-            Feature::Mma16816,
-            Feature::Tma,
-            Feature::Subgroups,
-            Feature::ShaderF16,
-        ]
+        let features: Vec<String> = FEATURES
         .into_iter()
         .filter(|f| self.has(*f))
         .map(|f| format!("{f:?}"))

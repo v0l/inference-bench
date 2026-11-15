@@ -14,12 +14,14 @@ pub struct DeviceLimits {
     pub max_workgroup_invocations: u32,
     pub max_workgroup_storage: u32,
     pub subgroup_size: u32,
+    pub shader_f16: bool,
 }
 
 impl DeviceLimits {
     pub fn target(&self) -> kir::Target {
         let t = kir::Target::wgpu(self.max_workgroup_invocations, self.max_workgroup_storage);
-        if self.subgroup_size > 0 { t.with_subgroups(self.subgroup_size) } else { t }
+        let t = if self.subgroup_size > 0 { t.with_subgroups(self.subgroup_size) } else { t };
+        if self.shader_f16 { t.with_feature(kir::Feature::ShaderF16) } else { t }
     }
 }
 

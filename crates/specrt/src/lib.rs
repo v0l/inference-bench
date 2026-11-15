@@ -7,6 +7,7 @@ pub mod cluster;
 pub mod coordinator;
 pub mod discovery;
 pub mod codegen;
+pub mod gemm;
 pub mod engine;
 pub mod executor;
 pub mod family;

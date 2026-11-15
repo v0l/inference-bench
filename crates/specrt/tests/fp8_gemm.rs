@@ -1,5 +1,5 @@
 use cudarc::driver::{CudaContext, PushKernelArg, LaunchConfig};
-use specrt::codegen::{FP8_BLOCK, Module, Tile};
+use specrt::codegen::{FP8_BLOCK, Module};
 use specrt::jit::Jit;
 use specrt::spec::{ActQuant, Quant, Spec};
 use specrt::weights::{e4m3_to_f32, f32_to_e4m3, fp8_scales};
@@ -102,7 +102,7 @@ fn run_with(spec: Spec, linear: &str, suffix: &str, tokens: usize, raster: Optio
     let bias = stream.alloc_zeros::<f32>(1).unwrap();
     let out = stream.alloc_zeros::<f32>(tokens * n).unwrap();
     let dummy = stream.alloc_zeros::<u16>(1).unwrap();
-    let tile = Tile::variant(suffix, &spec.runtime);
+    let tile = specrt::gemm::variant_tile(&spec, suffix);
     let tokens_i = tokens as i32;
     let mut b = stream.launch_builder(&f);
     b.arg(&dw).arg(&ds).arg(&bias).arg(&dxq).arg(&dxs).arg(&out).arg(&dummy).arg(&dummy).arg(&tokens_i);

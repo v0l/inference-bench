@@ -1,4 +1,4 @@
-use specrt::codegen::{GDN_LINEARS, MMA_LINEARS, Module, WeightKind, kernel_for, linear_dims, render};
+use specrt::codegen::{GDN_LINEARS, MMA_LINEARS, Module, WeightKind, kernel_for, render};
 use specrt::mtp::MTP_LINEARS;
 use specrt::spec::{Quant, Spec, TileChoice};
 use std::collections::BTreeMap;
@@ -101,15 +101,15 @@ fn head_quant_picks_the_head_kernels_and_bf16_stays_the_master_source() {
     fp4.head_quant = Some(Quant::Nvfp4G16);
     let m = Module::generate(&fp4, 4096).unwrap();
     assert!(!m.source.contains("{{"));
-    for k in specrt::codegen::FP4_HEAD_KERNELS {
-        assert!(m.kernels.contains(k), "{k}");
+    for k in ["lm_head_norm_f4", "lm_head_f4w", "lm_head_f4w_big", "lm_head_f4w_narrow", "lm_head_f4w_tiny"] {
+        assert!(m.kernels.contains(&k), "{k}");
         assert!(m.source.contains(&format!(") {k}(")), "{k}");
-        if *k != "lm_head_norm_f4" {
+        if k != "lm_head_norm_f4" {
             assert!(m.smem.contains_key(k), "{k}");
         }
     }
     assert!(m.source.contains("gemm_tc<248320, 5120, 128, 128, 2, 4, 64, 2, EPI_STORE, false, DecFp4, true, false>"));
-    assert!(m.source.contains("constexpr int HEAD_F4_ROWS = 2;"));
+    assert!(m.source.contains("head_norm_f4<248320, 5120, 2>"));
     let dense = spec("qwen3-0.6b.toml");
     let mut dense_fp4 = dense.clone();
     dense_fp4.head_quant = Some(Quant::Nvfp4G16);
@@ -241,33 +241,42 @@ fn every_dispatched_kernel_is_generated() {
     let mut missing = std::collections::BTreeSet::new();
     for (file, base) in dispatch_specs() {
         for spec in dispatch_variants(&base) {
-            let m = Module::generate(&spec, 256).unwrap();
+            for target in [kir::Target::sm_120(), kir::Target::sm_80()] {
+            let m = Module::generate_kv(&spec, 256, 2, &target).unwrap();
+            let gemms = specrt::gemm::gemm_kernels(&spec, &target).unwrap();
             let gdn: &[&str] = if spec.linear_attention.is_some() { &GDN_LINEARS } else { &[] };
             let mtp: &[&str] = if spec.linear_attention.is_some() && spec.speculative().is_some() { &MTP_LINEARS } else { &[] };
             if !mtp.is_empty() {
                 mtp_specs += 1;
             }
             for &linear in MMA_LINEARS.iter().chain(gdn).chain(mtp) {
-                let rows = if linear.starts_with("mtp_") { specrt::mtp::dims(&spec, linear).0 } else { linear_dims(&spec, linear).0 };
                 for weight in weight_kinds(&spec, linear) {
                     for &n in &tokens {
                         for sms in [48, 84, 188] {
-                            let c = kernel_for(&spec, linear, rows, n, sms, weight);
+                            let t = kir::Target { sm_count: sms, ..target };
+                            let c = kernel_for(&spec, &t, linear, n, weight).unwrap();
                             let mut need = vec![c.name.clone()];
                             need.extend(c.quant.map(str::to_string));
                             need.extend(c.reduce.clone());
                             for k in &need {
                                 if !m.kernels.contains(&k.as_str()) {
-                                    missing.insert(format!("{file} {:?} {k} not generated", spec.runtime.tile));
+                                    missing.insert(format!("{file} {:?} {k} not generated on {}", spec.runtime.tile, target.describe()));
                                 }
                             }
                             if !m.smem.contains_key(c.name.as_str()) {
                                 missing.insert(format!("{file} {} has no smem entry", c.name));
                             }
+                            if let Some(k) = &c.kernel {
+                                let built = gemms.kernels.iter().find(|g| g.name == k.name);
+                                if built.is_none_or(|g| g.kind != k.kind || g.smem_bytes != k.smem_bytes) {
+                                    missing.insert(format!("{file} {} dispatched differs from the generated instance", k.name));
+                                }
+                            }
                             checked += 1;
                         }
                     }
                 }
+            }
             }
         }
     }

@@ -228,17 +228,17 @@ impl Op {
         }
     }
 
-    pub fn decoder(&self, spec: &Spec, layer: usize, tokens: usize, sms: usize) -> Option<&'static str> {
+    pub fn decoder(&self, spec: &Spec, layer: usize, tokens: usize, target: &kir::Target) -> Option<&'static str> {
         match self {
             Op::Linear { weight, .. } => {
                 let kind = weight_kind(weight.quant(spec, layer));
-                Some(kernel_for(spec, weight.name(), weight.rows(spec), tokens, sms, kind).decoder)
+                kernel_for(spec, target, weight.name(), tokens, kind).ok().map(|c| c.decoder)
             }
             _ => None,
         }
     }
 
-    pub fn kernels(&self, spec: &Spec, layer: usize, tokens: usize, sms: usize) -> Vec<String> {
+    pub fn kernels(&self, spec: &Spec, layer: usize, tokens: usize, target: &kir::Target) -> Vec<String> {
         let names = |k: &[&str]| k.iter().map(|s| s.to_string()).collect();
         match self {
             Op::Embed => names(&["embed"]),
@@ -247,7 +247,10 @@ impl Op {
             Op::Linear { weight, .. } => {
                 let w = *weight;
                 let kind = weight_kind(w.quant(spec, layer));
-                let choice = kernel_for(spec, w.name(), w.rows(spec), tokens, sms, kind);
+                let choice = match kernel_for(spec, target, w.name(), tokens, kind) {
+                    Ok(c) => c,
+                    Err(e) => return vec![format!("unsupported: {e}")],
+                };
                 let mut out: Vec<String> = choice.quant.into_iter().map(String::from).collect();
                 out.push(choice.name);
                 out.extend(choice.reduce);
@@ -472,9 +475,10 @@ mod tests {
     fn linear_kernels_come_from_kernel_for() {
         let (spec, _) = described("qwen3-0.6b.config.json", "qwen3-0.6b.json");
         let op = Op::Linear { weight: Weight::Qkv, input: Buf::XnPlanes, output: Buf::Qkv };
-        let direct = kernel_for(&spec, "qkv", spec.qkv_rows(), 512, 84, WeightKind::Bf16);
-        assert_eq!(op.kernels(&spec, 0, 512, 84), vec![direct.name]);
-        assert_eq!(op.decoder(&spec, 0, 512, 84), Some("DecBf16"));
-        assert_eq!(Op::Embed.decoder(&spec, 0, 512, 84), None);
+        let t = kir::Target { sm_count: 84, ..kir::Target::sm_120() };
+        let direct = kernel_for(&spec, &t, "qkv", 512, WeightKind::Bf16).unwrap();
+        assert_eq!(op.kernels(&spec, 0, 512, &t), vec![direct.name]);
+        assert_eq!(op.decoder(&spec, 0, 512, &t), Some("DecBf16"));
+        assert_eq!(Op::Embed.decoder(&spec, 0, 512, &t), None);
     }
 }

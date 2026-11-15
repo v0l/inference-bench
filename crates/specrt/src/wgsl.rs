@@ -157,5 +157,17 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         vars.insert("RED", (tokens * LINEAR_WORKGROUP).to_string());
         out.push(build(name, include_str!("../templates/wgsl/linear.wgsl"), true, &[Read, Write, Read, Read, Uniform], &vars)?);
     }
+    for k in crate::gemm::gemm_kernels(spec, target)?.kernels {
+        let bindings = kir::wgsl::gemm_bindings(&k)
+            .into_iter()
+            .map(|b| match b {
+                kir::wgsl::Binding::Read => Read,
+                kir::wgsl::Binding::Write => Write,
+                kir::wgsl::Binding::Uniform => Uniform,
+            })
+            .collect();
+        let source = kir::wgsl::emit_gemm(&k).map_err(anyhow::Error::msg)?;
+        out.push(WgslKernel { name: crate::gemm::intern(&k.name), source, bindings });
+    }
     Ok(out)
 }

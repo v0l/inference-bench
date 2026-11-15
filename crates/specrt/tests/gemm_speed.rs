@@ -61,8 +61,8 @@ fn time_fp4(spec_name: &str) {
         .map(|(name, s, template)| {
             let mut module = Module::generate(&s, 256).unwrap();
             if let Some(t) = template {
-                assert!(module.source.contains(specrt::codegen::FP4_ACT_TEMPLATE));
-                module.source = module.source.replace(specrt::codegen::FP4_ACT_TEMPLATE, &t);
+                assert!(module.source.contains(kir::cuda::FP4_ACT));
+                module.source = module.source.replace(kir::cuda::FP4_ACT, &t);
             }
             let loaded = jit.load(&module).unwrap();
             (name, s, module, loaded)
@@ -78,7 +78,7 @@ fn time_fp4(spec_name: &str) {
                 let f = l.function(&kernel).unwrap();
                 use cudarc::driver::sys::CUfunction_attribute as A;
                 f.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
-                (f, Tile::fp4_variant("_big", &s.runtime), smem)
+                (f, specrt::gemm::variant_tile(&s, "_f4a_big"), smem)
             })
             .collect();
         for m in list("SPECRT_GEMM_TOKENS", "1024,4096").iter().map(|t| t.parse::<usize>().unwrap()) {
@@ -284,7 +284,7 @@ fn fp4_probe(linear: &str) {
     let f = loaded.function(&kernel).unwrap();
     use cudarc::driver::sys::CUfunction_attribute as A;
     f.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
-    let tile = Tile::fp4_variant("_big", &s.runtime);
+    let tile = specrt::gemm::variant_tile(&s, "_f4a_big");
     let (n, k, _, _) = specrt::codegen::linear_dims(&s, linear);
     let copies = 4usize;
     let mut flush = stream.alloc_zeros::<u8>(512 << 20).unwrap();
@@ -404,7 +404,7 @@ fn prefill_gemm_speed_fp8_block() {
 fn prefill_gemm_speed_fp8_channel_and_fp4() {
     let s = spec("qwen3.8-27b-nvfp4");
     time("qwen3.8-27b-nvfp4", &|l| (format!("{l}_f8_huge"), Tile::FP8_HUGE), false);
-    time("qwen3.8-27b-nvfp4", &|l| (format!("{l}_f4a_big"), Tile::fp4_variant("_big", &s.runtime)), true);
+    time("qwen3.8-27b-nvfp4", &|l| (format!("{l}_f4a_big"), specrt::gemm::variant_tile(&s, "_f4a_big")), true);
 }
 
 #[test]

@@ -1,4 +1,3 @@
-constexpr int F4B_KC = {{F4B_KC}};
 
 __device__ __forceinline__ void f4b_cp_async8(void* smem, const void* gmem, bool valid) {
     unsigned s = (unsigned)__cvta_generic_to_shared(smem);
@@ -188,4 +187,3 @@ __device__ __forceinline__ void f4b_reduce(const float* part, float* out, bf16_t
     f4b_store<N, EPI>(m, r, v, u, out, out_hi, out_lo);
 }
 
-{{F4B_KERNELS}}

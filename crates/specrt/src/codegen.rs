@@ -1,316 +1,18 @@
-use crate::spec::{Activation, ActQuant, Quant, RuntimeOptions, Spec, TileChoice};
+use crate::spec::{Activation, Quant, Spec};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
+
+pub use crate::gemm::{
+    BATCH_MAX_TOKENS, BATCH_REDUCE_BLOCK, BATCH_VARIANTS, BatchShape, FP4_GEMV_THREADS, FP8_ACT_LINEARS, GDN_LINEARS, GGB_LINEARS,
+    GGB_MIN_TOKENS, GemmPath, KernelChoice, MMA_LINEARS, MmaShape, ROWS_MAX_TOKENS, Tile, WeightFormat, WeightKind,
+    fp4_act_enabled, fp8_act_enabled, kernel_for, linear_dims, linear_shape,
+};
 
 pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
 pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
 pub const MOE_TEMPLATE: &str = include_str!("../templates/moe.cu");
 pub const MOE_KERNELS: &[&str] = &["moe_route", "moe_up_bf16", "moe_up_fp4", "moe_down_bf16", "moe_down_fp4", "moe_combine", "moe_permute", "moe_group_up_bf16", "moe_group_up_fp4", "moe_group_down_bf16", "moe_group_down_fp4"];
-pub const FP4_TEMPLATE: &str = include_str!("../templates/fp4.cu");
-pub const FP8_BATCH_TEMPLATE: &str = include_str!("../templates/fp8_batch.cu");
-pub const FP4_ACT_TEMPLATE: &str = include_str!("../templates/fp4_act.cu");
-pub const FP4_ACT_KERNELS: &[&str] = &[
-    "quant_rows_fp4",
-    "gate_up_f4a",
-    "gate_up_f4a_big",
-    "gate_up_f4a_narrow",
-    "down_f4a",
-    "down_f4a_big",
-    "down_f4a_narrow",
-];
-const F4A_ROW: usize = 72;
-
-pub fn fp4_act_enabled(spec: &Spec) -> bool {
-    spec.mlp.act_quant == ActQuant::Fp4
-}
-
-pub fn fp8_act_enabled(spec: &Spec) -> bool {
-    spec.act_quant == ActQuant::Fp8
-}
-
-const F4A_SMEM_LIMIT: usize = 101376;
-pub const F4A_STAGES: usize = 2;
-
-pub fn f4a_stages(tile: Tile, opts: &RuntimeOptions) -> usize {
-    let fit = F4A_SMEM_LIMIT / ((tile.bm + tile.bn) * F4A_ROW);
-    opts.fp4_stages.unwrap_or(F4A_STAGES).min(fit).max(2)
-}
-
-pub fn f4a_smem(tile: Tile, opts: &RuntimeOptions) -> u32 {
-    (f4a_stages(tile, opts) * (tile.bm + tile.bn) * F4A_ROW) as u32
-}
-
-fn fp4_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
-    let mut out = String::from(FP4_ACT_TEMPLATE);
-    for linear in ["gate_up", "down"] {
-        let (n, k, epi, _) = linear_dims(spec, linear);
-        for suffix in FP4_ACT_VARIANTS {
-            let t = Tile::fp4_variant(suffix, &spec.runtime);
-            let name = format!("{linear}_f4a{suffix}");
-            let name = FP4_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_ACT_KERNELS");
-            smem.insert(name, f4a_smem(t, &spec.runtime));
-            out.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const unsigned char* s, const unsigned char* xq, const unsigned char* xs, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_f4a<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {stages}, {epi}>(w, s, xq, xs, out, oh, ol, tokens);\n}}\n\n",
-                threads = t.threads(),
-                bm = t.bm,
-                bn = t.bn,
-                wm = t.wm,
-                wn = t.wn,
-                stages = f4a_stages(t, &spec.runtime),
-            ));
-        }
-    }
-    out
-}
-pub const FP4_KERNELS: &[&str] = &[
-    "gate_up_act_f4",
-    "down_proj_f4",
-    "gate_up_f4w",
-    "gate_up_f4w_big",
-    "gate_up_f4w_narrow",
-    "gate_up_f4w_tiny",
-    "down_f4w",
-    "down_f4w_big",
-    "down_f4w_narrow",
-    "down_f4w_tiny",
-    "gate_up_f4b8",
-    "gate_up_f4b16",
-    "gate_up_f4b32",
-    "gate_up_f4b64",
-    "gate_up_f4b_reduce",
-    "down_f4b8",
-    "down_f4b16",
-    "down_f4b32",
-    "down_f4b64",
-    "down_f4b_reduce",
-];
-pub const FP4_STAGES: usize = 3;
-pub const FP4_BATCH_TEMPLATE: &str = include_str!("../templates/fp4_batch.cu");
-pub const F4B_VARIANTS: &[usize] = &[8, 16, 32, 64];
-pub const F4B_MAX_TOKENS: usize = 64;
-pub const F4B_KC: usize = 128;
-pub const ROWS_MAX_TOKENS: usize = 32;
-pub const F4B_REDUCE_BLOCK: usize = 256;
-const SMEM_PER_SM: usize = 100 * 1024;
-const SMEM_RESERVED: usize = 1024;
-const MAX_BLOCKS_PER_SM: usize = 4;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BatchShape {
-    pub tokens: usize,
-    pub warps: usize,
-    pub stages: usize,
-    pub mj: usize,
-}
-
-impl BatchShape {
-    pub fn for_tokens(tokens: usize) -> BatchShape {
-        match tokens {
-            0..=16 => BatchShape { tokens, warps: 4, stages: 3, mj: 2 },
-            17..=32 => BatchShape { tokens, warps: 8, stages: 3, mj: 1 },
-            _ => BatchShape { tokens, warps: 8, stages: 2, mj: 1 },
-        }
-    }
-
-    pub fn rows(&self) -> usize {
-        self.warps * self.mj * 16
-    }
-
-    pub fn threads(&self) -> u32 {
-        (self.warps * 32) as u32
-    }
-
-    pub fn smem(&self) -> u32 {
-        (self.stages * self.tokens * F4B_KC * 2 * 2) as u32
-    }
-
-    pub fn blocks_per_sm(&self) -> usize {
-        (SMEM_PER_SM / (self.smem() as usize + SMEM_RESERVED)).clamp(1, MAX_BLOCKS_PER_SM)
-    }
-
-    pub fn splits(&self, n: usize, k: usize, sms: usize) -> usize {
-        let blocks = n.div_ceil(self.rows());
-        let most = (k / F4B_KC / 4).max(1);
-        let wave = self.blocks_per_sm() * sms;
-        let fill = |s: usize| (blocks * s) as f64 / ((blocks * s).div_ceil(wave) * wave) as f64;
-        (1..=most).find(|&s| blocks * s >= wave && fill(s) >= 0.85).unwrap_or(most)
-    }
-}
-
-pub fn f4b_tokens(tokens: usize) -> usize {
-    F4B_VARIANTS.iter().copied().find(|&v| v >= tokens).unwrap_or(F4B_MAX_TOKENS)
-}
-
-pub fn f4b_shape(tokens: usize) -> BatchShape {
-    BatchShape::for_tokens(f4b_tokens(tokens))
-}
-
-pub fn f4b_part_len(n: usize, k: usize, sms: usize) -> usize {
-    F4B_VARIANTS.iter().map(|&t| BatchShape::for_tokens(t)).map(|s| s.splits(n, k, sms) * n * s.tokens).max().unwrap_or(0)
-}
-
-fn fp4_batch_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Result<String> {
-    let mut kernels = String::new();
-    for linear in ["gate_up", "down"] {
-        let (n, k, epi, _) = linear_dims(spec, linear);
-        let find = |name: String| FP4_KERNELS.iter().copied().find(|x| *x == name).expect("listed in FP4_KERNELS");
-        for &tokens in F4B_VARIANTS {
-            let name = find(format!("{linear}_f4b{tokens}"));
-            let shape = BatchShape::for_tokens(tokens);
-            smem.insert(name, shape.smem());
-            kernels.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}, {blocks}) {name}(const void* w, const unsigned char* s, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, float* part, int tokens, int splits) {{\n    gemv_f4b<{n}, {k}, {epi}, {nt}, {warps}, {stages}, {mj}>(w, s, xh, xl, out, oh, ol, part, tokens, splits);\n}}\n\n",
-                threads = shape.threads(),
-                blocks = shape.blocks_per_sm(),
-                nt = tokens / 8,
-                warps = shape.warps,
-                stages = shape.stages,
-                mj = shape.mj,
-            ));
-        }
-        let reduce = find(format!("{linear}_f4b_reduce"));
-        kernels.push_str(&format!(
-            "extern \"C\" __global__ void {reduce}(const float* part, float* out, bf16_t* oh, bf16_t* ol, int tokens, int splits) {{\n    f4b_reduce<{n}, {epi}>(part, out, oh, ol, tokens, splits);\n}}\n\n"
-        ));
-    }
-    let vars: BTreeMap<&str, String> = [
-        ("F4B_KC", F4B_KC.to_string()),
-        ("F4B_KERNELS", kernels),
-    ]
-    .into_iter()
-    .collect();
-    render(FP4_BATCH_TEMPLATE, &vars)
-}
-pub const F8B_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
-pub const F8B_KERNELS: &[&str] = &[
-    "qkv_f8b8",
-    "qkv_f8b16",
-    "qkv_f8b32",
-    "qkv_f8b64",
-    "qkv_f8b_reduce",
-    "o_f8b8",
-    "o_f8b16",
-    "o_f8b32",
-    "o_f8b64",
-    "o_f8b_reduce",
-    "gate_up_f8b8",
-    "gate_up_f8b16",
-    "gate_up_f8b32",
-    "gate_up_f8b64",
-    "gate_up_f8b_reduce",
-    "down_f8b8",
-    "down_f8b16",
-    "down_f8b32",
-    "down_f8b64",
-    "down_f8b_reduce",
-    "lin_in_f8b8",
-    "lin_in_f8b16",
-    "lin_in_f8b32",
-    "lin_in_f8b64",
-    "lin_in_f8b_reduce",
-    "lin_out_f8b8",
-    "lin_out_f8b16",
-    "lin_out_f8b32",
-    "lin_out_f8b64",
-    "lin_out_f8b_reduce",
-];
-pub const F8B_VARIANTS: &[usize] = &[8, 16, 32, 64];
-pub const F8B_MAX_TOKENS: usize = 64;
-pub const F8B_REDUCE_BLOCK: usize = 256;
-
-pub fn f8b_tokens(tokens: usize) -> usize {
-    F8B_VARIANTS.iter().copied().find(|&v| v >= tokens).unwrap_or(F8B_MAX_TOKENS)
-}
-
-pub fn f8b_shape(tokens: usize) -> BatchShape {
-    BatchShape::for_tokens(f8b_tokens(tokens))
-}
-
-pub fn f8b_part_len(n: usize, k: usize, sms: usize) -> usize {
-    F8B_VARIANTS.iter().map(|&t| BatchShape::for_tokens(t)).map(|s| s.splits(n, k, sms) * n * s.tokens).max().unwrap_or(0)
-}
-
-fn fp8_batch_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Result<String> {
-    let mut kernels = String::new();
-    let la = spec.linear_attention.is_some();
-    for &linear in F8B_LINEARS.iter().filter(|l| la || !l.starts_with("lin_")) {
-        let (n, k, epi, bias) = linear_dims(spec, linear);
-        let find = |name: String| F8B_KERNELS.iter().copied().find(|x| *x == name).expect("listed in F8B_KERNELS");
-        for &tokens in F8B_VARIANTS {
-            let name = find(format!("{linear}_f8b{tokens}"));
-            let shape = BatchShape::for_tokens(tokens);
-            smem.insert(name, shape.smem());
-            kernels.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}, {blocks}) {name}(const void* w, const float* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, float* part, int tokens, int splits) {{\n    gemv_f8b<{n}, {k}, {epi}, {bias}, {nt}, {warps}, {stages}, {mj}>(w, s, b, xh, xl, out, oh, ol, part, tokens, splits);\n}}\n\n",
-                threads = shape.threads(),
-                blocks = shape.blocks_per_sm(),
-                nt = tokens / 8,
-                warps = shape.warps,
-                stages = shape.stages,
-                mj = shape.mj,
-            ));
-        }
-        let reduce = find(format!("{linear}_f8b_reduce"));
-        kernels.push_str(&format!(
-            "extern \"C\" __global__ void {reduce}(const float* part, const float* b, float* out, bf16_t* oh, bf16_t* ol, int tokens, int splits) {{\n    f8b_reduce<{n}, {epi}, {bias}>(part, b, out, oh, ol, tokens, splits);\n}}\n\n"
-        ));
-    }
-    let vars: BTreeMap<&str, String> = [
-        ("F8B_KC", F4B_KC.to_string()),
-        ("F8B_KERNELS", kernels),
-    ]
-    .into_iter()
-    .collect();
-    render(FP8_BATCH_TEMPLATE, &vars)
-}
-const F4W_BK: usize = 64;
-const F4W_ROW: usize = 48;
-
-pub fn f4w_shape(tile: Tile, k: usize) -> MmaShape {
-    MmaShape::new(tile, k, WeightFormat::Fp4, true)
-}
-
-pub fn f4w_smem(tile: Tile) -> u32 {
-    f4w_shape(tile, F4W_BK).smem_bytes()
-}
-
-fn fp4_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
-    let mut out = String::new();
-    for linear in ["gate_up", "down"] {
-        let (n, k, epi, _) = linear_dims(spec, linear);
-        for suffix in MMA_VARIANTS {
-            let shape = f4w_shape(Tile::variant(suffix, &spec.runtime), k);
-            let name = format!("{linear}_f4w{suffix}");
-            let name = FP4_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_KERNELS");
-            smem.insert(name, shape.smem_bytes());
-            out.push_str(&shape.kernel(name, n, k, epi, false, false));
-        }
-    }
-    out
-}
-pub const FP4_HEAD_TEMPLATE: &str = include_str!("../templates/fp4_head.cu");
-pub const FP4_HEAD_KERNELS: &[&str] =
-    &["lm_head_norm_f4", "lm_head_f4w", "lm_head_f4w_big", "lm_head_f4w_narrow", "lm_head_f4w_tiny"];
-
-pub fn fp4_head_rows(vocab: usize) -> usize {
-    if vocab.is_multiple_of(2) { 2 } else { 1 }
-}
-
-fn fp4_head_source(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Result<String> {
-    let (n, k) = (spec.dims.vocab, spec.dims.hidden);
-    let mut gemms = String::new();
-    for suffix in MMA_VARIANTS {
-        let shape = f4w_shape(Tile::variant(suffix, &spec.runtime), k);
-        let name = format!("lm_head_f4w{suffix}");
-        let name = FP4_HEAD_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP4_HEAD_KERNELS");
-        smem.insert(name, shape.smem_bytes());
-        gemms.push_str(&shape.kernel(name, n, k, "EPI_STORE", false, false));
-    }
-    let vars: BTreeMap<&str, String> =
-        [("HEAD_F4_ROWS", fp4_head_rows(n).to_string()), ("HEAD_F4W_KERNELS", gemms)].into_iter().collect();
-    render(FP4_HEAD_TEMPLATE, &vars)
-}
 
 pub const PAGE: usize = 16;
 pub const Q8_GROUP: usize = 32;
@@ -334,335 +36,6 @@ pub const LA_CHUNK: usize = 64;
 pub const LA_KSPLIT: usize = 4;
 pub const LA_COLS: usize = 16;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Tile {
-    pub bm: usize,
-    pub bn: usize,
-    pub wm: usize,
-    pub wn: usize,
-}
-
-pub const MMA_LINEARS: [&str; 5] = ["qkv", "o", "gate_up", "down", "lm_head"];
-pub const GDN_LINEARS: [&str; 3] = ["lin_in", "lin_out", "lin_ba"];
-pub const MMA_VARIANTS: [&str; 4] = ["", "_big", "_narrow", "_tiny"];
-pub const FP8_ACT_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
-pub const FP4_ACT_VARIANTS: [&str; 3] = ["", "_big", "_narrow"];
-pub const FP8_ACT_VARIANTS: [&str; 4] = ["", "_big", "_narrow", "_huge"];
-pub const FP8_HUGE_MIN_TOKENS: usize = 256;
-pub const FP8_ACT_KERNELS: &[&str] = &[
-    "quant_rows_fp8",
-    "quant_rows_fp8_token",
-    "qkv_f8",
-    "qkv_f8_big",
-    "qkv_f8_narrow",
-    "qkv_f8_huge",
-    "o_f8",
-    "o_f8_big",
-    "o_f8_narrow",
-    "o_f8_huge",
-    "gate_up_f8",
-    "gate_up_f8_big",
-    "gate_up_f8_narrow",
-    "gate_up_f8_huge",
-    "down_f8",
-    "down_f8_big",
-    "down_f8_narrow",
-    "down_f8_huge",
-    "lin_in_f8",
-    "lin_in_f8_big",
-    "lin_in_f8_narrow",
-    "lin_in_f8_huge",
-    "lin_out_f8",
-    "lin_out_f8_big",
-    "lin_out_f8_narrow",
-    "lin_out_f8_huge",
-];
-const FP8_ACT_STAGES: usize = 2;
-
-pub fn fp8_act_smem(tile: Tile) -> u32 {
-    (FP8_ACT_STAGES * (tile.bm + tile.bn) * FP8_BLOCK) as u32
-}
-
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
-
-impl Tile {
-    pub const SMALL: Tile = Tile { bm: 64, bn: 64, wm: 2, wn: 2 };
-    pub const FP4_BIG: Tile = Tile { bm: 128, bn: 256, wm: 4, wn: 4 };
-    pub const FP8_HUGE: Tile = Tile { bm: 128, bn: 128, wm: 2, wn: 4 };
-    pub const NARROW: Tile = Tile { bm: 64, bn: 32, wm: 2, wn: 2 };
-
-    pub fn tiny() -> Tile {
-        let wn = env_usize("SPECRT_TINY_WN", 2);
-        Tile { bm: 16, bn: 16 * wn, wm: 1, wn }
-    }
-
-    pub fn threads(&self) -> u32 {
-        (self.wm * self.wn * 32) as u32
-    }
-
-    pub fn big(opts: &RuntimeOptions) -> Tile {
-        match opts.big_tile {
-            Some([bm, bn, wm, wn]) => Tile { bm, bn, wm, wn },
-            None => Tile { bm: 128, bn: 128, wm: 2, wn: 4 },
-        }
-    }
-
-    pub fn fp4_variant(suffix: &str, opts: &RuntimeOptions) -> Tile {
-        match (suffix, opts.fp4_tile) {
-            ("_big", Some([bm, bn, wm, wn])) => Tile { bm, bn, wm, wn },
-            ("_big", None) => Tile::FP4_BIG,
-            _ => Tile::variant(suffix, opts),
-        }
-    }
-
-    pub fn variant(suffix: &str, opts: &RuntimeOptions) -> Tile {
-        match suffix {
-            "_big" => Tile::big(opts),
-            "_narrow" => Tile::NARROW,
-            "_huge" => Tile::FP8_HUGE,
-            "_tiny" => Tile::tiny(),
-            _ => Tile::SMALL,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WeightFormat {
-    Bf16,
-    Q8,
-    Fp8,
-    Ggml,
-    Fp4,
-}
-
-impl WeightFormat {
-    pub fn of(quant: Quant) -> WeightFormat {
-        match quant {
-            Quant::Bf16 => WeightFormat::Bf16,
-            Quant::Q8 => WeightFormat::Q8,
-            Quant::Fp8Block128 | Quant::Fp8Channel => WeightFormat::Fp8,
-            Quant::Gguf => WeightFormat::Ggml,
-            Quant::Nvfp4G16 => WeightFormat::Fp4,
-        }
-    }
-
-    pub fn of_kind(kind: WeightKind) -> WeightFormat {
-        match kind {
-            WeightKind::Bf16 => WeightFormat::Bf16,
-            WeightKind::Q8 => WeightFormat::Q8,
-            WeightKind::Fp8 => WeightFormat::Fp8,
-            WeightKind::Fp4 => WeightFormat::Fp4,
-            WeightKind::Ggml => WeightFormat::Ggml,
-        }
-    }
-
-    pub fn head(spec: &Spec) -> WeightFormat {
-        match spec.lm_head_quant() {
-            Quant::Nvfp4G16 => WeightFormat::Bf16,
-            q => WeightFormat::of(q),
-        }
-    }
-
-    pub fn decoder(self) -> &'static str {
-        match self {
-            WeightFormat::Bf16 => "DecBf16",
-            WeightFormat::Q8 => "DecQ8",
-            WeightFormat::Fp8 => "DecFp8",
-            WeightFormat::Ggml => "DecGgml",
-            WeightFormat::Fp4 => "DecFp4",
-        }
-    }
-
-    pub fn gemv_rows(self) -> usize {
-        match self {
-            WeightFormat::Ggml => 2,
-            _ => 1,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            WeightFormat::Bf16 => "bf16",
-            WeightFormat::Q8 => "q8",
-            WeightFormat::Fp8 => "fp8",
-            WeightFormat::Ggml => "ggml",
-            WeightFormat::Fp4 => "nvfp4",
-        }
-    }
-
-    pub fn bytes(self) -> bool {
-        matches!(self, WeightFormat::Q8 | WeightFormat::Fp8)
-    }
-
-    fn wrow(self, bk: usize) -> usize {
-        match self {
-            WeightFormat::Q8 | WeightFormat::Fp8 => bk + 16,
-            WeightFormat::Fp4 => F4W_ROW,
-            WeightFormat::Bf16 | WeightFormat::Ggml => bk * 2,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WeightKind {
-    Bf16,
-    Q8,
-    Fp8,
-    Fp4,
-    Ggml,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GemmPath {
-    Mma,
-    Ggb,
-    F4w,
-    F4a,
-    F8a,
-    F8b,
-    F4b,
-    Rows,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct KernelChoice {
-    pub name: String,
-    pub quant: Option<&'static str>,
-    pub reduce: Option<String>,
-    pub tile: Tile,
-    pub path: GemmPath,
-    pub decoder: &'static str,
-}
-
-fn decoder_for(path: GemmPath, weight: WeightKind) -> &'static str {
-    match path {
-        GemmPath::F8a => "fp8 x fp8 act",
-        GemmPath::F4a => "nvfp4 x nvfp4 act",
-        GemmPath::F8b => "fp8 batch rows",
-        GemmPath::F4b => "nvfp4 batch rows",
-        GemmPath::Rows => "bf16 one block per row",
-        GemmPath::Ggb => "ggml to bf16 scratch",
-        GemmPath::Mma | GemmPath::F4w => WeightFormat::of_kind(weight).decoder(),
-    }
-}
-
-pub fn kernel_for(spec: &Spec, linear: &str, rows: usize, tokens: usize, sms: usize, weight: WeightKind) -> KernelChoice {
-    let opts = &spec.runtime;
-    let big = Tile::big(opts);
-    let blocks = |t: Tile| rows.div_ceil(t.bn) * tokens.div_ceil(t.bm);
-    let suffix = match opts.tile {
-        TileChoice::Small => "",
-        TileChoice::Big => "_big",
-        TileChoice::Narrow => "_narrow",
-        _ if tokens <= 16 => "_tiny",
-        _ if linear == "lm_head" && tokens <= ROWS_MAX_TOKENS => "_narrow",
-        _ if blocks(big) >= 2 * sms => "_big",
-        _ if blocks(Tile::SMALL) >= 2 * sms => "",
-        _ => "_narrow",
-    };
-    let huge = spec.quant.is_fp8() && weight == WeightKind::Fp8 && opts.tile == TileChoice::Auto && suffix == "_big" && tokens > FP8_HUGE_MIN_TOKENS;
-    let tile = Tile::variant(suffix, opts);
-    let choice = |name: String, path: GemmPath, quant: Option<&'static str>| KernelChoice {
-        name,
-        quant,
-        reduce: None,
-        tile,
-        path,
-        decoder: decoder_for(path, weight),
-    };
-    let auto = opts.tile == TileChoice::Auto;
-    let f8b = auto && tokens <= F8B_MAX_TOKENS && F8B_LINEARS.contains(&linear);
-    let f4b = auto && tokens <= F4B_MAX_TOKENS && !linear.ends_with("head");
-    let act_quant = !linear.ends_with("head") && suffix != "_tiny";
-    let fp8_act = spec.quant.is_fp8() && fp8_act_enabled(spec);
-    let fp4_act = spec.mlp.quant == Some(Quant::Nvfp4G16) && fp4_act_enabled(spec);
-    if auto && linear == "lin_ba" && tokens <= ROWS_MAX_TOKENS && weight == WeightKind::Bf16 {
-        return choice("lin_ba_rows".to_string(), GemmPath::Rows, None);
-    }
-    match weight {
-        WeightKind::Fp8 if act_quant && fp8_act => KernelChoice {
-            tile: if huge { Tile::FP8_HUGE } else { tile },
-            ..choice(
-                format!("{linear}_f8{}", if huge { "_huge" } else { suffix }),
-                GemmPath::F8a,
-                Some(if spec.quant == Quant::Fp8Channel { "quant_rows_fp8_token" } else { "quant_rows_fp8" }),
-            )
-        },
-        WeightKind::Fp4 if act_quant && fp4_act => KernelChoice {
-            tile: Tile::fp4_variant(suffix, opts),
-            ..choice(format!("{linear}_f4a{suffix}"), GemmPath::F4a, Some("quant_rows_fp4"))
-        },
-        WeightKind::Fp8 if f8b => KernelChoice {
-            reduce: Some(format!("{linear}_f8b_reduce")),
-            ..choice(format!("{linear}_f8b{}", f8b_tokens(tokens)), GemmPath::F8b, None)
-        },
-        WeightKind::Fp4 if f4b => KernelChoice {
-            reduce: Some(format!("{linear}_f4b_reduce")),
-            ..choice(format!("{linear}_f4b{}", f4b_tokens(tokens)), GemmPath::F4b, None)
-        },
-        WeightKind::Fp4 => choice(format!("{linear}_f4w{suffix}"), GemmPath::F4w, None),
-        WeightKind::Ggml if tokens > GGB_MIN_TOKENS && GGB_LINEARS.contains(&linear) => {
-            KernelChoice { quant: Some("gg_dequant_bf16"), ..choice(format!("{linear}_ggb{suffix}"), GemmPath::Ggb, None) }
-        }
-        _ => choice(format!("{linear}_mma{suffix}"), GemmPath::Mma, None),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MmaShape {
-    pub tile: Tile,
-    pub bk: usize,
-    pub stages: usize,
-    pub split: bool,
-    pub wf: WeightFormat,
-}
-
-impl MmaShape {
-    pub fn new(tile: Tile, k: usize, wf: WeightFormat, split: bool) -> MmaShape {
-        let bk = match wf {
-            WeightFormat::Q8 => Q8_GROUP,
-            WeightFormat::Fp4 => F4W_BK,
-            WeightFormat::Fp8 if tile.bm == 16 => 128,
-            WeightFormat::Fp8 => env_usize("SPECRT_FP8_BK", 64),
-            WeightFormat::Bf16 | WeightFormat::Ggml if tile.bm == 16 && k % 128 == 0 => 128,
-            WeightFormat::Bf16 | WeightFormat::Ggml => env_usize("SPECRT_BK", 32),
-        };
-        let stages = match wf {
-            WeightFormat::Fp4 => {
-                let per_stage = tile.bm * bk * 2 * if split { 2 } else { 1 } + tile.bn * wf.wrow(bk);
-                (FLASH_SMEM_LIMIT / per_stage).clamp(2, FP4_STAGES)
-            }
-            _ if tile.bm == 16 => 2,
-            _ => env_usize("SPECRT_STAGES", 2),
-        };
-        MmaShape { tile, bk, stages, split, wf }
-    }
-
-    pub fn smem_bytes(&self) -> u32 {
-        let planes = if self.split { 2 } else { 1 };
-        let a = self.tile.bm * self.bk * 2 * planes;
-        ((a + self.tile.bn * self.wf.wrow(self.bk)) * self.stages) as u32
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn kernel(&self, name: &str, n: usize, k: usize, epi: &str, bias: bool, token_major: bool) -> String {
-        let t = self.tile;
-        format!(
-            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const void* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_tc<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {bk}, {stages}, {epi}, {bias}, {dec}, {split}, {token_major}>(w, s, b, xh, xl, out, oh, ol, tokens);\n}}\n\n",
-            threads = t.threads(),
-            bm = t.bm,
-            bn = t.bn,
-            wm = t.wm,
-            wn = t.wn,
-            bk = self.bk,
-            stages = self.stages,
-            dec = self.wf.decoder(),
-            split = self.split,
-        )
-    }
-}
 
 pub const KERNELS: &[&str] = &[
     "embed",
@@ -686,32 +59,12 @@ pub const KERNELS: &[&str] = &[
     "qkv_proj_norm",
     "gate_up_act",
     "lm_head_norm",
-    "qkv_mma",
-    "o_mma",
-    "gate_up_mma",
-    "down_mma",
-    "lm_head_mma",
-    "qkv_mma_big",
-    "o_mma_big",
-    "gate_up_mma_big",
-    "down_mma_big",
-    "lm_head_mma_big",
     "rms_split",
-    "qkv_mma_tiny",
-    "o_mma_tiny",
-    "gate_up_mma_tiny",
-    "down_mma_tiny",
-    "lm_head_mma_tiny",
     "kv_norm_rope",
     "argmax_rows",
     "bump",
     "sample_rows",
     "apply_mask",
-    "qkv_mma_narrow",
-    "o_mma_narrow",
-    "gate_up_mma_narrow",
-    "down_mma_narrow",
-    "lm_head_mma_narrow",
     "flash_attention",
     "flash_mma",
     "batch_decode_attention",
@@ -734,20 +87,9 @@ pub const GDN_KERNELS: &[&str] = &[
     "lin_in_norm",
     "lin_ba_norm",
     "lin_out_proj",
-    "lin_in_mma",
-    "lin_out_mma",
-    "lin_in_mma_big",
-    "lin_out_mma_big",
-    "lin_in_mma_narrow",
-    "lin_out_mma_narrow",
-    "lin_in_mma_tiny",
-    "lin_out_mma_tiny",
-    "lin_ba_mma",
-    "lin_ba_mma_big",
-    "lin_ba_mma_narrow",
-    "lin_ba_mma_tiny",
     "lin_ba_rows",
 ];
+
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
@@ -806,107 +148,8 @@ fn float_literal(v: f64) -> String {
     format!("{v:e}f")
 }
 
-fn mma_kernel_name(linear: &str, suffix: &str) -> &'static str {
-    let name = format!("{linear}_mma{suffix}");
-    KERNELS
-        .iter()
-        .chain(GDN_KERNELS)
-        .copied()
-        .find(|k| *k == name)
-        .expect("mma kernel listed in KERNELS")
-}
-
-pub fn linear_dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str, bool) {
-    let d = &spec.dims;
-    let la = spec.linear_attention.as_ref();
-    match linear {
-        "qkv" => (spec.qkv_rows(), d.hidden, "EPI_STORE", spec.attention.qkv_bias),
-        "o" => (d.hidden, spec.q_dim(), "EPI_RESIDUAL", false),
-        "gate_up" => (2 * d.intermediate, d.hidden, "EPI_ACT", false),
-        "down" => (d.hidden, d.intermediate, "EPI_RESIDUAL", false),
-        "lin_in" => (la.map_or(0, |l| l.in_proj_rows()), d.hidden, "EPI_STORE", false),
-        "lin_ba" => (la.map_or(0, |l| l.ba_rows()), d.hidden, "EPI_STORE", false),
-        "lin_out" => (d.hidden, la.map_or(0, |l| l.value_dim()), "EPI_RESIDUAL", false),
-        _ => (d.vocab, d.hidden, "EPI_STORE", false),
-    }
-}
-
-pub const GGB_MIN_TOKENS: usize = 32;
-pub const GGB_LINEARS: [&str; 4] = ["qkv", "o", "gate_up", "down"];
-pub const GGB_KERNELS: &[&str] = &[
-    "qkv_ggb", "qkv_ggb_big", "qkv_ggb_narrow", "qkv_ggb_tiny",
-    "o_ggb", "o_ggb_big", "o_ggb_narrow", "o_ggb_tiny",
-    "gate_up_ggb", "gate_up_ggb_big", "gate_up_ggb_narrow", "gate_up_ggb_tiny",
-    "down_ggb", "down_ggb_big", "down_ggb_narrow", "down_ggb_tiny",
-];
-
 pub fn ggb_scratch_len(spec: &Spec) -> usize {
     GGB_LINEARS.iter().map(|l| { let (n, k, _, _) = linear_dims(spec, l); n * k }).max().unwrap_or(0)
-}
-
-fn ggb_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
-    let mut out = String::new();
-    for linear in GGB_LINEARS {
-        let (n, k, epi, bias) = linear_dims(spec, linear);
-        let split = !spec.runtime.unsplit.iter().any(|u| u == linear);
-        for suffix in MMA_VARIANTS {
-            let shape = MmaShape::new(Tile::variant(suffix, &spec.runtime), k, WeightFormat::Bf16, split);
-            let name = format!("{linear}_ggb{suffix}");
-            let name = GGB_KERNELS.iter().copied().find(|g| *g == name).expect("listed in GGB_KERNELS");
-            smem.insert(name, shape.smem_bytes());
-            out.push_str(&shape.kernel(name, n, k, epi, bias, true));
-        }
-    }
-    out
-}
-
-fn mma_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
-    let unsplit = &spec.runtime.unsplit;
-    let mut out = String::new();
-    let gdn: &[&str] = if spec.linear_attention.is_some() { &GDN_LINEARS } else { &[] };
-    for &linear in MMA_LINEARS.iter().chain(gdn) {
-        let wf = match linear {
-            "lm_head" => WeightFormat::head(spec),
-            "lin_ba" => WeightFormat::Bf16,
-            _ => WeightFormat::of(spec.quant),
-        };
-        let split = wf != WeightFormat::Q8 && !unsplit.iter().any(|n| n == linear);
-        let (n, k, epi, bias) = linear_dims(spec, linear);
-        if linear == "lin_ba" {
-            smem.insert("lin_ba_rows", 0);
-        }
-        for suffix in MMA_VARIANTS {
-            let shape = MmaShape::new(Tile::variant(suffix, &spec.runtime), k, wf, split);
-            let name = mma_kernel_name(linear, suffix);
-            smem.insert(name, shape.smem_bytes());
-            out.push_str(&shape.kernel(name, n, k, epi, bias, false));
-        }
-    }
-    out
-}
-
-fn fp8_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> String {
-    let mut out = String::new();
-    let la = spec.linear_attention.is_some();
-    for &linear in FP8_ACT_LINEARS.iter().filter(|l| la || !l.starts_with("lin_")) {
-        let (n, k, epi, bias) = linear_dims(spec, linear);
-        for suffix in FP8_ACT_VARIANTS {
-            let t = Tile::variant(suffix, &spec.runtime);
-            let name = format!("{linear}_f8{suffix}");
-            let name = FP8_ACT_KERNELS.iter().copied().find(|k| *k == name).expect("listed in FP8_ACT_KERNELS");
-            smem.insert(name, fp8_act_smem(t));
-            out.push_str(&format!(
-                "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const void* w, const float* s, const float* b, const unsigned char* xq, const float* xs, float* out, bf16_t* oh, bf16_t* ol, int tokens) {{\n    gemm_fp8<{n}, {k}, {bm}, {bn}, {wm}, {wn}, {FP8_ACT_STAGES}, {epi}, {bias}, {per_token}>(w, s, b, xq, xs, out, oh, ol, tokens);\n}}\n\n",
-                threads = t.threads(),
-                bm = t.bm,
-                bn = t.bn,
-                wm = t.wm,
-                wn = t.wn,
-                per_token = spec.quant == Quant::Fp8Channel,
-            ));
-        }
-    }
-    out
 }
 
 impl Module {
@@ -919,16 +162,14 @@ impl Module {
         anyhow::ensure!(kv_planes == 1 || !spec.runtime.kv_dtype.is_fp8(), "fp8 KV needs a single plane");
         let a = &spec.attention;
         let d = &spec.dims;
-        let wf = WeightFormat::of(spec.quant);
-        let head_wf = WeightFormat::head(spec);
+        let wf = crate::gemm::weight_format(spec.quant);
+        let head_wf = crate::gemm::head_format(spec);
         let rope = spec.rope_constants();
         let act = match spec.mlp.activation {
             Activation::Swiglu => 0,
             Activation::Geglu => 1,
         };
         let mut smem = BTreeMap::new();
-        let mma = mma_kernels(spec, &mut smem);
-        let fp8 = spec.quant.is_fp8();
         let (flash_rows, flash_keys) = (flash_rows(a.head_dim), flash_keys(a.head_dim, kv_planes));
         let flash_stages = flash_stages(a.head_dim, kv_planes);
         let kv_bytes = flash_stages * 2 * kv_planes * flash_keys * a.head_dim * 2;
@@ -989,7 +230,6 @@ impl Module {
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
             ("WF", wf.decoder().to_string()),
             ("HEAD_WF", head_wf.decoder().to_string()),
-            ("MMA_KERNELS", mma),
             ("FM_STAGES", flash_stages.to_string()),
             ("FM_BK", flash_keys.to_string()),
             ("FM_WARPS", (flash_rows / 16).to_string()),
@@ -998,28 +238,22 @@ impl Module {
         .into_iter()
         .collect();
         let kir_kernels = kir_kernels(spec, target)?;
+        let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let kir_source = kir::cuda::emit_module(&kir_kernels).map_err(anyhow::Error::msg)?;
-        let kir_hash = kir::module_hash(&kir_kernels);
-        let mut source =
-            format!("{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, render(MODEL_TEMPLATE, &vars)?, kir_source);
+        let gemm_source = kir::cuda::emit_gemms(&gemms.kernels).map_err(anyhow::Error::msg)?;
+        let kir_hash = kir::fold_hashes([kir::module_hash(&kir_kernels), kir::gemm::instances_hash(&gemms.kernels)]);
+        let mut source = format!("{}\n{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, gemm_source, render(MODEL_TEMPLATE, &vars)?, kir_source);
         let mut kernels = KERNELS.to_vec();
-        let mut arch_features = false;
-        if spec.quant == Quant::Gguf {
-            source.push('\n');
-            source.push_str(&ggb_kernels(spec, &mut smem));
-            kernels.extend_from_slice(GGB_KERNELS);
-            kernels.push("gg_dequant_bf16");
-        }
         if la.is_some() {
             source.push('\n');
             source.push_str(&render(GDN_TEMPLATE, &vars)?);
             kernels.extend_from_slice(GDN_KERNELS);
+            smem.insert("lin_ba_rows", 0);
         }
         if la.is_some() && spec.speculative().is_some() {
             source.push('\n');
-            source.push_str(&crate::mtp::mtp_source(spec, &mut smem));
+            source.push_str(crate::mtp::MTP_TEMPLATE);
             kernels.extend_from_slice(crate::mtp::MTP_KERNELS);
-            kernels.extend_from_slice(crate::mtp::MTP_MMA_KERNELS);
         }
         if let Some(m) = &spec.moe {
             let vars: BTreeMap<&str, String> = [
@@ -1038,46 +272,12 @@ impl Module {
             source.push_str(&render(MOE_TEMPLATE, &vars)?);
             kernels.extend_from_slice(MOE_KERNELS);
         }
-        if fp8 {
-            source.push('\n');
-            source.push_str(&fp8_act_kernels(spec, &mut smem));
-            kernels.push("quant_rows_fp8");
-            kernels.push("quant_rows_fp8_token");
-            source.push('\n');
-            source.push_str(&fp8_batch_kernels(spec, &mut smem)?);
-            kernels.extend(F8B_KERNELS.iter().filter(|k| la.is_some() || !k.starts_with("lin_")));
-            kernels.extend(smem.keys().filter(|k| k.contains("_f8") && !k.contains("_f8b")).copied().collect::<Vec<_>>());
+        if spec.quant == Quant::Gguf {
+            kernels.push("gg_dequant_bf16");
         }
-        let fp4_mlp = spec.mlp.quant == Some(Quant::Nvfp4G16);
-        let fp4_head = spec.lm_head_quant() == Quant::Nvfp4G16;
-        let fp4_draft = spec.draft_head_quant() == Some(Quant::Nvfp4G16);
-        if fp4_mlp || fp4_head || fp4_draft {
-            let mut fp4_vars = BTreeMap::new();
-            fp4_vars.insert("F4W_KERNELS", if fp4_mlp { fp4_kernels(spec, &mut smem) } else { String::new() });
-            let act = fp4_mlp && fp4_act_enabled(spec);
-            fp4_vars.insert("F4A_SOURCE", if act { fp4_act_kernels(spec, &mut smem) } else { String::new() });
-            source.push('\n');
-            source.push_str(&render(FP4_TEMPLATE, &fp4_vars)?);
-            if fp4_mlp {
-                source.push('\n');
-                source.push_str(&fp4_batch_kernels(spec, &mut smem)?);
-                kernels.extend_from_slice(FP4_KERNELS);
-            }
-            if act {
-                kernels.extend_from_slice(FP4_ACT_KERNELS);
-                arch_features = true;
-            }
-        }
-        if fp4_head {
-            source.push('\n');
-            source.push_str(&fp4_head_source(spec, &mut smem)?);
-            kernels.extend_from_slice(FP4_HEAD_KERNELS);
-        }
-        if la.is_some() && spec.speculative().is_some() {
-            source.push('\n');
-            source.push_str(&crate::mtp::head_source(spec, &mut smem));
-            kernels.extend_from_slice(crate::mtp::head_kernels(spec));
-        }
+        kernels.extend(gemms.names());
+        smem.extend(gemms.smem());
+        let arch_features = kir::cuda::needs_arch_features(&gemms.kernels);
         Ok(Module { source, kernels, smem, arch_features, kir_hash })
     }
 }
@@ -1088,15 +288,37 @@ pub fn live_target() -> Result<kir::Target> {
 }
 
 pub fn kernels_report(spec: &Spec, target: &kir::Target) -> Result<String> {
+    let kernels = kir_kernels(spec, target)?;
+    let gemms = crate::gemm::gemm_kernels(spec, target)?;
+    let hash = kir::fold_hashes([kir::module_hash(&kernels), kir::gemm::instances_hash(&gemms.kernels)]);
     let mut out = String::new();
-    out.push_str(&format!("spec {}\n{}\nmodule hash {}\n", spec.name, target.describe(), kir::module_hash(&kir_kernels(spec, target)?)));
-    for k in kir_kernels(spec, target)? {
+    out.push_str(&format!("spec {}\n{}\nmodule hash {hash}\n", spec.name, target.describe()));
+    for k in &kernels {
         out.push_str(&format!("\n== {} ({})\n{}\n\n", k.name, k.hash(), k.describe()));
         let source = match target.language {
-            kir::Language::Cuda => kir::cuda::emit_module(std::slice::from_ref(&k)),
-            kir::Language::Wgsl => kir::wgsl::emit_kernel(&k),
+            kir::Language::Cuda => kir::cuda::emit_module(std::slice::from_ref(k)),
+            kir::Language::Wgsl => kir::wgsl::emit_kernel(k),
         };
         out.push_str(&source.map_err(anyhow::Error::msg)?);
+    }
+    let mut families: BTreeMap<&str, Vec<&kir::gemm::KernelInstance>> = BTreeMap::new();
+    for k in &gemms.kernels {
+        families.entry(k.kind.block()).or_default().push(k);
+    }
+    for (block, ks) in families {
+        out.push_str(&format!("\n== family {block} ({} kernels)\n", ks.len()));
+        for k in ks {
+            out.push_str(&format!("{} ({}) threads={} smem={} {:?}\n", k.name, k.hash(), k.threads, k.smem_bytes, k.kind));
+        }
+        let first = gemms.kernels.iter().find(|k| k.kind.block() == block).expect("family has a kernel");
+        let source = match target.language {
+            kir::Language::Cuda => kir::cuda::emit_gemm(first).map_err(|e| e.to_string()),
+            kir::Language::Wgsl => kir::wgsl::emit_gemm(first),
+        };
+        out.push_str(&source.map_err(anyhow::Error::msg)?);
+    }
+    for r in &gemms.refused {
+        out.push_str(&format!("\n== refused {r}\n"));
     }
     Ok(out)
 }

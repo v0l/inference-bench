@@ -69,9 +69,10 @@ impl Wgpu {
         let wanted_cache = adapter.features() & wgpu::Features::PIPELINE_CACHE;
         let wanted_subgroups = adapter.features() & wgpu::Features::SUBGROUP;
         let subgroups = !wanted_subgroups.is_empty() && info.subgroup_min_size > 0 && info.subgroup_min_size == info.subgroup_max_size;
+        let f16 = adapter.features() & wgpu::Features::SHADER_F16;
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("specrt"),
-            required_features: wanted_cache | if subgroups { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() },
+            required_features: wanted_cache | f16 | if subgroups { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() },
             required_limits: required.clone(),
             ..Default::default()
         }))
@@ -85,6 +86,7 @@ impl Wgpu {
             max_workgroup_invocations: required.max_compute_invocations_per_workgroup,
             max_workgroup_storage: required.max_compute_workgroup_storage_size,
             subgroup_size: if subgroups { info.subgroup_min_size } else { 0 },
+            shader_f16: !f16.is_empty(),
         };
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),

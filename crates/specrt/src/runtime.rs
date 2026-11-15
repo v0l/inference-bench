@@ -636,6 +636,7 @@ pub struct Runtime {
     plans: Plans,
     role: StageRole,
     sms: u32,
+    target: kir::Target,
     seq: i32,
     batch: usize,
     slots: usize,
@@ -675,16 +676,16 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
 }
 
 const LINEAR_ROWS_PER_BLOCK: usize = 8;
-const FP4_GEMV_THREADS: u32 = 512;
+const FP4_GEMV_THREADS: u32 = crate::codegen::FP4_GEMV_THREADS;
 
 fn gemv_cfg(name: &str, rows: usize, w: &DeviceMatrix, sms: u32) -> LaunchConfig {
     if name == "lm_head_norm_f4" {
-        let per_block = FP4_GEMV_THREADS as usize / 32 * crate::codegen::fp4_head_rows(rows);
+        let per_block = FP4_GEMV_THREADS as usize / 32 * if rows.is_multiple_of(2) { 2 } else { 1 };
         cfg(grid(rows, per_block), FP4_GEMV_THREADS)
     } else if name.ends_with("_f4") {
         cfg(grid(rows, FP4_GEMV_THREADS as usize / 32), FP4_GEMV_THREADS)
     } else {
-        let format = crate::codegen::WeightFormat::of_kind(w.kind());
+        let format = w.kind().format();
         let pair = format.gemv_rows();
         let per_warp = if name.starts_with("gate_up_act") || !rows.is_multiple_of(pair) { 1 } else { pair };
         let blocks = grid(rows, LINEAR_ROWS_PER_BLOCK * per_warp);
@@ -892,30 +893,15 @@ impl Runtime {
         } else {
             None
         };
-        let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
+        let target = crate::codegen::cuda_target(&ctx)?;
+        let sms = target.sm_count;
         let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) {
-            use crate::codegen::{F4B_MAX_TOKENS, f4b_part_len};
-            let (h, i) = (d.hidden, 2 * d.intermediate);
-            let most = f4b_part_len(i, h, sms as usize).max(f4b_part_len(h, d.intermediate, sms as usize));
-            stream.alloc_zeros(most.max(F4B_MAX_TOKENS))?
+            stream.alloc_zeros(crate::gemm::batch_part_len(spec, &target, true))?
         } else {
             stream.alloc_zeros(1)?
         };
         let f8b_part = if spec.quant.is_fp8() {
-            use crate::codegen::{F8B_MAX_TOKENS, f8b_part_len};
-            let sms = sms as usize;
-            let mut shapes = vec![
-                (spec.qkv_rows(), d.hidden),
-                (d.hidden, spec.q_dim()),
-                (2 * d.intermediate, d.hidden),
-                (d.hidden, d.intermediate),
-            ];
-            if let Some(la) = &spec.linear_attention {
-                shapes.push((la.in_proj_rows(), d.hidden));
-                shapes.push((d.hidden, la.value_dim()));
-            }
-            let most = shapes.into_iter().map(|(n, k)| f8b_part_len(n, k, sms)).max().unwrap_or(1);
-            stream.alloc_zeros(most.max(F8B_MAX_TOKENS))?
+            stream.alloc_zeros(crate::gemm::batch_part_len(spec, &target, false))?
         } else {
             stream.alloc_zeros(1)?
         };
@@ -944,6 +930,7 @@ impl Runtime {
             kv_planes: layout.kv_planes,
             tables: vec![0; (layout.slots + 1) * pages],
             sms,
+            target,
             use_mma,
             plans: Plans::build(spec, use_mma).for_stage(role),
             role,
@@ -1300,8 +1287,8 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        use crate::codegen::{GemmPath, kernel_for};
-        let choice = kernel_for(&self.spec, name, rows, tokens, self.sms as usize, w.kind());
+        let choice = crate::codegen::kernel_for(&self.spec, &self.target, name, tokens, w.kind())?;
+        use crate::codegen::GemmPath;
         match (choice.path, &self.fp8_act, &self.fp4_act) {
             (GemmPath::F8a, Some(fa), _) => return self.tc_fp8(fa, &choice, w, bias, x, out, rows, tokens),
             (GemmPath::F4a, _, Some(fa)) => return self.tc_fp4(fa, &choice, w, x, out, rows, tokens),
@@ -1402,11 +1389,11 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        use crate::codegen::{F8B_REDUCE_BLOCK, f8b_shape};
+        use crate::codegen::{BATCH_REDUCE_BLOCK as F8B_REDUCE_BLOCK, BatchShape};
         let DeviceMatrix::Fp8 { values, .. } = w else { unreachable!("tc_f8b takes FP8 weights") };
         let width = values.len() / rows;
-        let shape = f8b_shape(tokens);
-        let splits = shape.splits(rows, width, self.sms as usize);
+        let shape = BatchShape::for_tokens(tokens);
+        let splits = shape.splits(&self.target, rows, width);
         let (n, s) = (tokens as i32, splits as i32);
         let mut b = self.stream.launch_builder(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
@@ -1450,11 +1437,11 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        use crate::codegen::{F4B_REDUCE_BLOCK, f4b_shape};
+        use crate::codegen::{BATCH_REDUCE_BLOCK as F4B_REDUCE_BLOCK, BatchShape};
         let DeviceMatrix::Fp4 { packed, .. } = w else { unreachable!("tc_f4b takes NVFP4 weights") };
         let width = packed.len() * 2 / rows;
-        let shape = f4b_shape(tokens);
-        let splits = shape.splits(rows, width, self.sms as usize);
+        let shape = BatchShape::for_tokens(tokens);
+        let splits = shape.splits(&self.target, rows, width);
         let (n, s) = (tokens as i32, splits as i32);
         let mut b = self.stream.launch_builder(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);

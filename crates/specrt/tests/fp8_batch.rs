@@ -1,6 +1,6 @@
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use specrt::codegen::{
-    F8B_REDUCE_BLOCK, F8B_VARIANTS, FP8_BLOCK, Module, Tile, f8b_part_len, f8b_shape, f8b_tokens,
+    BATCH_REDUCE_BLOCK as F8B_REDUCE_BLOCK, BATCH_VARIANTS as F8B_VARIANTS, BatchShape, FP8_BLOCK, Module, Tile,
 };
 use specrt::jit::Jit;
 use specrt::spec::Spec;
@@ -74,7 +74,7 @@ struct Gpu {
     batch: Vec<CudaFunction>,
     reduce: CudaFunction,
     tiny_smem: u32,
-    sms: usize,
+    target: kir::Target,
 }
 
 fn gpu(linear: &str) -> Gpu {
@@ -90,11 +90,11 @@ fn gpu(linear: &str) -> Gpu {
     let batch: Vec<_> = F8B_VARIANTS.iter().map(|t| f(&format!("{linear}_f8b{t}"))).collect();
     use cudarc::driver::sys::CUfunction_attribute as A;
     tiny.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, tiny_smem as i32).unwrap();
-    for (b, &t) in batch.iter().zip(F8B_VARIANTS) {
-        b.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, f8b_shape(t).smem() as i32).unwrap();
+    for (b, &t) in batch.iter().zip(F8B_VARIANTS.iter()) {
+        b.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, BatchShape::for_tokens(t).smem() as i32).unwrap();
     }
-    let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT).unwrap();
-    Gpu { stream: ctx.default_stream(), tiny, batch, reduce: f(&format!("{linear}_f8b_reduce")), tiny_smem, sms: sms as usize }
+    let target = specrt::codegen::cuda_target(&ctx).unwrap();
+    Gpu { stream: ctx.default_stream(), tiny, batch, reduce: f(&format!("{linear}_f8b_reduce")), tiny_smem, target }
 }
 
 struct Run {
@@ -148,7 +148,7 @@ fn read(g: &Gpu, d: &Device, act: bool, n: usize) -> Vec<f32> {
 }
 
 fn run_tiny(g: &Gpu, d: &mut Device, rows: usize, tokens: usize, act: bool) -> Run {
-    let t = Tile::tiny();
+    let t = Tile::TINY;
     let n = tokens as i32;
     let config = LaunchConfig {
         grid_dim: (rows.div_ceil(t.bn) as u32, tokens.div_ceil(t.bm) as u32, 1),
@@ -165,8 +165,8 @@ fn run_tiny(g: &Gpu, d: &mut Device, rows: usize, tokens: usize, act: bool) -> R
 }
 
 fn run_batch(g: &Gpu, d: &mut Device, rows: usize, cols: usize, tokens: usize, act: bool) -> Run {
-    let shape = f8b_shape(tokens);
-    let splits = shape.splits(rows, cols, g.sms);
+    let shape = BatchShape::for_tokens(tokens);
+    let splits = shape.splits(&g.target, rows, cols);
     let (n, s) = (tokens as i32, splits as i32);
     let config = LaunchConfig {
         grid_dim: (rows.div_ceil(shape.rows()) as u32, splits as u32, 1),
@@ -179,7 +179,7 @@ fn run_batch(g: &Gpu, d: &mut Device, rows: usize, cols: usize, tokens: usize, a
         block_dim: (F8B_REDUCE_BLOCK as u32, 1, 1),
         shared_mem_bytes: 0,
     };
-    let kernel = &g.batch[F8B_VARIANTS.iter().position(|&v| v == f8b_tokens(tokens)).unwrap()];
+    let kernel = &g.batch[F8B_VARIANTS.iter().position(|&v| v == BatchShape::for_tokens(tokens).tokens).unwrap()];
     let micros = time(g, d, |d| {
         let mut b = g.stream.launch_builder(kernel);
         b.arg(&d.w).arg(&d.s).arg(&d.dummy).arg(&d.hi).arg(&d.lo).arg(&d.out).arg(&d.oh).arg(&d.ol).arg(&d.part).arg(&n).arg(&s);
@@ -217,7 +217,7 @@ fn compare(linear: &str, rows: usize, cols: usize, batches: &[usize]) {
     let exact = cpu(&m, &x, most);
     let g = gpu(linear);
     let act = linear == "gate_up";
-    let part = f8b_part_len(rows, cols, g.sms);
+    let part = kir::gemm::batch_part_len(&g.target, rows, cols);
     let mut d = Device {
         w: g.stream.clone_htod(&m.values).unwrap(),
         s: g.stream.clone_htod(&m.device_scales()).unwrap(),

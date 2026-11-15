@@ -1,4 +1,3 @@
-constexpr int F8B_KC = {{F8B_KC}};
 
 __device__ __forceinline__ void f8b_cp_async8(void* smem, const void* gmem, bool valid) {
     unsigned s = (unsigned)__cvta_generic_to_shared(smem);
@@ -196,4 +195,3 @@ __device__ __forceinline__ void f8b_reduce(const float* part, const float* bias,
     f8b_store<N, EPI>(m, r, v, u, out, out_hi, out_lo);
 }
 
-{{F8B_KERNELS}}

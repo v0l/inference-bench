@@ -132,7 +132,7 @@ nibble order fails it (4,804 of the first 5,120 values differ).
 
 ## Kernels
 
-`templates/fp4.cu`, rendered only when `[mlp] quant = "nvfp4_g16"`:
+`crates/kir/src/cuda/fp4.cu`, emitted only when `[mlp] quant = "nvfp4_g16"`:
 
 - **Decode GEMV** (`gate_up_act_f4`, `down_proj_f4`). One warp per output row; each lane
   streams one 16-column group (8 bytes, `ld.global.nc.L1::no_allocate`) and its e4m3 scale per
@@ -374,7 +374,7 @@ time, so the checkpoint is unchanged: `fp8_channel` takes one scale per row (`ab
 round to nearest even e4m3) and reuses the FP8 GEMV and `gemm_tc` kernels; `nvfp4_g16` takes a
 global scale of `448 * 6 / absmax` over the whole head and e4m3 scales per 16 columns, exactly
 the checkpoint's own NVFP4 scheme, and runs `lm_head_norm_f4` (the `fp4_rows_dot` GEMV, two rows
-per warp) and `lm_head_f4w*` (`gemm_f4w`) from `templates/fp4_head.cu`. A tied head quantises only
+per warp) and `lm_head_f4w*` (`gemm_f4w`) from `crates/kir/src/cuda/fp4_head.cu`. A tied head quantises only
 its output copy; the embedding lookup stays bf16. The head never goes through the native FP8 or
 FP4 activation paths. `nvfp4_g16` needs the tensor-core path (it is refused with `[runtime]
 gemm_fp32 = true`).
@@ -462,7 +462,7 @@ At batch 8 the MLP pair takes 160 us against 134 us for the single-row GEMVs bef
 against the tuned GEMV. At batch 16 it is 205 us (1.7x): the 16-token variant runs twice the
 mmas per weight byte and the dequant is no longer hidden.
 
-`templates/fp4_batch.cu` (`gemv_f4b`): each warp owns 32 weight rows and puts them on the
+`crates/kir/src/cuda/fp4_batch.cu` (`gemv_f4b`): each warp owns 32 weight rows and puts them on the
 M side of `mma.m16n8k16.bf16`, so the tokens are the N side, 8 per tile (`gate_up_f4b8` for 1
 to 8 rows, `gate_up_f4b16` for 9 to 16). A lane streams 16 bytes of one row per 128-column
 chunk (`ld.global.nc.L1::no_allocate`, prefetched one chunk ahead) and decodes them straight
@@ -487,7 +487,7 @@ to 49 us, `qkv_mma_tiny` 64 us) went through the tile GEMM until #375.
 
 #### FP8 projections on the batched GEMV (#375)
 
-`templates/fp8_batch.cu` (`gemv_f8b`) is `gemv_f4b` for e4m3 per-channel weights: the same
+`crates/kir/src/cuda/fp8_batch.cu` (`gemv_f8b`) is `gemv_f4b` for e4m3 per-channel weights: the same
 warp layout, activation ring and split-K, with a lane streaming 32 bytes of one row per
 128-column chunk and the row's scale for that chunk applied to the chunk's partial sums, so
 the block-128 checkpoint runs through it too. It covers `qkv`, `o`, `lin_in`, `lin_out` and the

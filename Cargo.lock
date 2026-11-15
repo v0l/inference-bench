@@ -3551,6 +3551,9 @@ dependencies = [
 [[package]]
 name = "inference-bench-kir"
 version = "0.1.0"
+dependencies = [
+ "naga",
+]
 
 [[package]]
 name = "inference-bench-server"
