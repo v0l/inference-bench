@@ -249,6 +249,7 @@ impl Runtime {
         let pre = &self.pre;
         let buf = &self.buf;
         let table = self.slot_table(self.seq as usize);
+        let (pages, mm_stride) = (self.pages as i32, self.max_ctx as i32);
         let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
         b.arg(&pre.qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
@@ -260,6 +261,8 @@ impl Runtime {
             .arg(&buf.zero_slots)
             .arg(&l.kv)
             .arg(&0i32)
+            .arg(&pages)
+            .arg(&mm_stride)
             .arg(&self.mm_meta)
             .arg(&self.mm_table)
             .arg(&self.seq);

@@ -104,11 +104,25 @@ inference-bench kernels --spec qwen3.8-27b-nvfp4 --target sm_80
 inference-bench kernels --spec qwen3.8-27b-nvfp4 --target wgpu
 ```
 
+## Attention families (slice 4)
+
+`kir::attention` describes the attention kernels as `AttentionKernel { family, target, shape, threads, smem_bytes }` over an `AttentionShape` (heads, KV heads, head_dim, QKV row, output gate, qk-norm, eps, `RopeShape` with yarn and mrope constants, KV layers, KV planes, fp8 KV). `kir::cuda::emit_attention` emits the shared device code once (`crates/kir/src/cuda/attention/*.cu`) and the kernels of the families asked for.
+
+| Family | Kernels | Needs |
+|---|---|---|
+| `RopeKvWrite` | `qk_norm_rope`, `kv_norm_rope` (qk-norm, rope, bf16 hi/lo or fp8 KV write) | `WarpShuffle` |
+| `SplitDecode` | `attention_split`, `attention_reduce` | `WarpShuffle` |
+| `FlashScalar` | `flash_attention` | `WarpShuffle` |
+| `FlashMma` | `flash_mma` (prefill) | `Mma16816`, `CpAsync` |
+| `GroupedDecodeMma` | `batch_decode_attention`, `batch_decode_combine` (KV read once per sequence, splits grow with length) | `Mma16816`, `CpAsync` |
+
+`MAX_CTX`, `PAGES` and `BD_SPLITS` are no longer source constants. The kernels take `pages` (block-table row stride), `mm_stride` (mrope table stride) and `splits` as launch arguments, so one compiled module serves any context length (#397). The tile constants (`FM_*`, `DM_*`) come from the shape. `specrt::codegen::attention_kernels(spec, kv_planes, target)` builds the set; its hash joins the module hash. Goldens are in `crates/kir/tests/golden/attention/`.
+
 ## Slices
 
 1. Crate, Target, Layout, rmsnorm and gated activation.
 2. NVFP4 and FP8 GEMV and GEMM (#609, this section).
 3. Delta-net and MTP (after #418).
-4. Attention (after #324).
+4. Attention (#621, this section).
 5. GGUF and vision.
 6. Remove `render()`, the `{{SLOT}}`s and the env knobs.

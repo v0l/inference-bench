@@ -1200,6 +1200,7 @@ impl Runtime {
             let kv_layer = l.kv;
             let window = l.window;
             let table = self.slot_table(self.seq as usize);
+            let (pages, mm_stride) = (self.pages as i32, self.max_ctx as i32);
             self.linear_norm(
                 "qkv_proj_norm",
                 &l.qkv,
@@ -1220,6 +1221,8 @@ impl Runtime {
                 .arg(&buf.zero_slots)
                 .arg(&kv_layer)
                 .arg(&0i32)
+                .arg(&pages)
+                .arg(&mm_stride)
                 .arg(&self.mm_meta)
                 .arg(&self.mm_table)
                 .arg(&self.seq);
@@ -1685,6 +1688,7 @@ impl Runtime {
         let pre = &self.pre;
         let buf = &self.buf;
         let table = self.slot_table(self.seq as usize);
+        let mm_stride = self.max_ctx as i32;
         let qkv = pre.qkv.slice(at * self.spec.qkv_rows()..);
         let mut b = self.stream.launch_builder(self.kernel("kv_norm_rope"));
         b.arg(&qkv)
@@ -1697,6 +1701,7 @@ impl Runtime {
             .arg(&l.kv)
             .arg(&self.mm_meta)
             .arg(&self.mm_table)
+            .arg(&mm_stride)
             .arg(&self.seq);
         let config = LaunchConfig {
             grid_dim: ((2 * a.kv_heads) as u32, n as u32, 1),
@@ -1712,6 +1717,7 @@ impl Runtime {
         let pre = &self.pre;
         let buf = &self.buf;
         let table = self.slot_table(self.seq as usize);
+        let mm_stride = self.max_ctx as i32;
         let qkv = pre.qkv.slice(at * self.spec.qkv_rows()..);
         let hi = pre.attn_planes.hi.slice(at * self.spec.q_dim()..);
         let lo = pre.attn_planes.lo.slice(at * self.spec.q_dim()..);
@@ -1729,6 +1735,7 @@ impl Runtime {
             .arg(&ntok)
             .arg(&self.mm_meta)
             .arg(&self.mm_table)
+            .arg(&mm_stride)
             .arg(&self.seq)
             .arg(&l.window);
         let rows = crate::codegen::flash_rows(a.head_dim);
@@ -2134,6 +2141,8 @@ impl Runtime {
         let a = &self.spec.attention;
         debug_assert!(n.is_multiple_of(qlen) && qlen <= crate::codegen::DECODE_MAX_QLEN);
         let qlen_i = qlen as i32;
+        let (pages, mm_stride) = (self.pages as i32, self.max_ctx as i32);
+        let splits_i = crate::codegen::decode_splits(self.max_ctx) as i32;
         let pre = &self.pre;
         let buf = &self.buf;
         let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
@@ -2147,6 +2156,8 @@ impl Runtime {
             .arg(&bb.slots)
             .arg(&l.kv)
             .arg(&1i32)
+            .arg(&pages)
+            .arg(&mm_stride)
             .arg(&self.mm_meta)
             .arg(&self.mm_table)
             .arg(&0i32);
@@ -2165,6 +2176,8 @@ impl Runtime {
             .arg(&bb.slots)
             .arg(&l.kv)
             .arg(&qlen_i)
+            .arg(&pages)
+            .arg(&splits_i)
             .arg(&bb.part_acc)
             .arg(&bb.part_ml)
             .arg(&l.window);
@@ -2175,7 +2188,7 @@ impl Runtime {
         };
         unsafe { b.launch(config) }?;
         let mut b = self.stream.launch_builder(self.kernel("batch_decode_combine"));
-        b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.qkv).arg(&bb.pos).arg(&qlen_i).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
+        b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.qkv).arg(&bb.pos).arg(&qlen_i).arg(&splits_i).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
         let config = LaunchConfig {
             grid_dim: (a.heads as u32, n as u32, 1),
             block_dim: (a.head_dim as u32 / 2, 1, 1),

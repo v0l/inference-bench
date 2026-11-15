@@ -114,6 +114,11 @@ impl Target {
         }
     }
 
+    pub fn without_feature(mut self, f: Feature) -> Target {
+        self.features &= !bit(f);
+        self
+    }
+
     pub fn with_feature(mut self, f: Feature) -> Target {
         self.features |= bit(f);
         self

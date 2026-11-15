@@ -27,7 +27,7 @@ fn module_bakes_spec_constants() {
     assert!(m.source.contains("constexpr int HEAD_DIM = 128;"));
     assert!(m.source.contains("constexpr int GROUP = 2;"));
     assert!(m.source.contains("constexpr bool QK_NORM = true;"));
-    assert!(m.source.contains("constexpr int MAX_CTX = 256;"));
+    assert!(!m.source.contains("MAX_CTX"));
     assert!(m.source.contains("linear_w<DecBf16, 4096, 1024, false, false>"));
     assert!(m.source.contains("linear_w<DecBf16, 151936, 1024, false, false>"));
 }

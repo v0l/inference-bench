@@ -63,7 +63,7 @@ fn flash_mma_prefill_attention_speed() {
                     f.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
                     let launch = || {
                         let mut b = stream.launch_builder(&f);
-                        b.arg(&qkv).arg(&q_norm).arg(&k).arg(&v).arg(&table).arg(&pos).arg(&layer).arg(&hi).arg(&lo).arg(&ntok).arg(&mm_meta).arg(&mm_table).arg(&slot);
+                        b.arg(&qkv).arg(&q_norm).arg(&k).arg(&v).arg(&table).arg(&pos).arg(&layer).arg(&hi).arg(&lo).arg(&ntok).arg(&mm_meta).arg(&mm_table).arg(&1i32).arg(&slot);
                         let config = LaunchConfig {
                             grid_dim: (tokens.div_ceil(warps * 16) as u32, a.heads as u32, 1),
                             block_dim: (warps as u32 * 32, 1, 1),

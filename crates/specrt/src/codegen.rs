@@ -14,47 +14,57 @@ pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
 pub const MOE_TEMPLATE: &str = include_str!("../templates/moe.cu");
 pub const MOE_KERNELS: &[&str] = &["moe_route", "moe_up_bf16", "moe_up_fp4", "moe_down_bf16", "moe_down_fp4", "moe_combine", "moe_permute", "moe_group_up_bf16", "moe_group_up_fp4", "moe_group_down_bf16", "moe_group_down_fp4"];
 
-pub const PAGE: usize = 16;
+pub use kir::attention::PAGE;
 pub const Q8_GROUP: usize = 32;
 pub const FP8_BLOCK: usize = 128;
-pub const DECODE_MAX_SPLITS: usize = 64;
-pub const DECODE_CHUNK: usize = 256;
-pub const DECODE_KEYS: usize = 16;
-pub const DECODE_STAGES: usize = 2;
-pub const DECODE_SPLIT_PRECISION: bool = true;
-pub const DECODE_MAX_QLEN: usize = crate::spec::MAX_DRAFT_TOKENS + 1;
-const FLASH_SMEM_LIMIT: usize = 99 * 1024;
-
-pub fn decode_splits(max_ctx: usize) -> usize {
-    max_ctx.div_ceil(DECODE_CHUNK).clamp(1, DECODE_MAX_SPLITS)
-}
-
-pub fn decode_chunk(len: usize, max_ctx: usize) -> usize {
-    let mut c = DECODE_CHUNK;
-    while c * decode_splits(max_ctx) < len {
-        c <<= 1;
-    }
-    c
-}
-
-pub fn decode_smem(head_dim: usize, kv_planes: usize) -> usize {
-    DECODE_STAGES * 2 * kv_planes * DECODE_KEYS * head_dim * 2
-}
+pub use kir::attention::{DECODE_CHUNK, DECODE_KEYS, DECODE_MAX_QLEN, DECODE_MAX_SPLITS, DECODE_STAGES, decode_chunk, decode_splits, flash_keys, flash_stages};
 
 pub fn decode_warps(group: usize, qlen: usize) -> usize {
     (group * qlen).div_ceil(16)
 }
 
 pub fn flash_rows(_head_dim: usize) -> usize {
-    128
+    kir::attention::FLASH_ROWS
 }
 
-pub fn flash_keys(head_dim: usize, kv_planes: usize) -> usize {
-    if head_dim > 128 && kv_planes == 2 { 16 } else { 32 }
+pub fn attention_shape(spec: &Spec, kv_planes: usize) -> kir::attention::AttentionShape {
+    let a = &spec.attention;
+    let rope = spec.rope_constants();
+    kir::attention::AttentionShape {
+        heads: a.heads,
+        kv_heads: a.kv_heads,
+        head_dim: a.head_dim,
+        qkv_row: spec.qkv_rows(),
+        output_gate: a.output_gate,
+        qk_norm: a.qk_norm,
+        eps: spec.norm.eps,
+        rope: kir::attention::RopeShape {
+            rotary_dim: spec.rotary_dim(),
+            theta: spec.rope.theta,
+            kind: rope.kind as u32,
+            factor: rope.factor,
+            low: rope.low,
+            high: rope.high,
+            original: rope.original,
+            mscale: rope.mscale,
+            mrope: spec.rope.mrope.as_ref().map(|m| kir::attention::MropeShape { section: m.section, interleaved: m.interleaved }),
+        },
+        kv_layers: spec.kv_layers(),
+        kv_planes,
+        kv_fp8: spec.runtime.kv_dtype.is_fp8(),
+        query_scale: spec.attention.query_scalar.map_or(1.0 / (a.head_dim as f64).sqrt(), |q| 1.0 / q.sqrt()),
+        softcap: spec.attention.softcap.unwrap_or(0.0),
+        local_theta: spec.rope.local_theta.unwrap_or(spec.rope.theta),
+        local_rope: (0..spec.layers.count)
+            .filter(|&i| !spec.block(i).is_linear())
+            .map(|i| spec.block(i) == crate::spec::Block::Sliding && spec.rope.local_theta.is_some())
+            .chain(std::iter::repeat_n(false, spec.speculative().map_or(0, |m| m.layers) + 1))
+            .collect(),
+    }
 }
 
-pub fn flash_stages(head_dim: usize, kv_planes: usize) -> usize {
-    if head_dim > 128 && kv_planes == 1 { 3 } else { 2 }
+pub fn attention_kernels(spec: &Spec, kv_planes: usize, target: &kir::Target) -> Result<Vec<kir::attention::AttentionKernel>> {
+    kir::attention::AttentionKernel::set(target, attention_shape(spec, kv_planes)).map_err(anyhow::Error::msg)
 }
 
 pub const LA_CHUNK: usize = 64;
@@ -191,29 +201,26 @@ impl Module {
         Self::generate_kv(spec, max_ctx, 2, &default_target())
     }
 
-    pub fn generate_kv(spec: &Spec, max_ctx: usize, kv_planes: usize, target: &kir::Target) -> Result<Self> {
+    pub fn generate_kv(spec: &Spec, _max_ctx: usize, kv_planes: usize, target: &kir::Target) -> Result<Self> {
         anyhow::ensure!(kv_planes == 1 || kv_planes == 2, "kv planes must be 1 or 2");
         anyhow::ensure!(kv_planes == 1 || !spec.runtime.kv_dtype.is_fp8(), "fp8 KV needs a single plane");
         let a = &spec.attention;
         let d = &spec.dims;
         let wf = crate::gemm::weight_format(spec.quant);
         let head_wf = crate::gemm::head_format(spec);
-        let rope = spec.rope_constants();
         let act = match spec.mlp.activation {
             Activation::Swiglu => 0,
             Activation::Geglu => 1,
         };
         let mut smem = BTreeMap::new();
-        let (flash_rows, flash_keys) = (flash_rows(a.head_dim), flash_keys(a.head_dim, kv_planes));
-        let flash_stages = flash_stages(a.head_dim, kv_planes);
-        let kv_bytes = flash_stages * 2 * kv_planes * flash_keys * a.head_dim * 2;
-        let q_bytes = flash_rows * a.head_dim * 2;
-        let flash_smem = kv_bytes.max(q_bytes);
-        anyhow::ensure!(flash_smem <= FLASH_SMEM_LIMIT, "flash_mma needs {flash_smem} bytes of shared memory");
-        smem.insert("flash_mma", flash_smem as u32);
-        let decode_smem = decode_smem(a.head_dim, kv_planes);
-        anyhow::ensure!(decode_smem <= FLASH_SMEM_LIMIT, "batch_decode_attention needs {decode_smem} bytes of shared memory");
-        smem.insert("batch_decode_attention", decode_smem as u32);
+        let attn = attention_kernels(spec, kv_planes, target)?;
+        for k in &attn {
+            match k.family {
+                kir::attention::Family::FlashMma => smem.insert("flash_mma", k.smem_bytes),
+                kir::attention::Family::GroupedDecode => smem.insert("batch_decode_attention", k.smem_bytes),
+                _ => None,
+            };
+        }
         let la = spec.linear_attention.as_ref();
         let la_dim = |f: fn(&crate::spec::LinearAttention) -> usize| la.map_or("0".into(), |l| f(l).to_string());
         if let Some(l) = la {
@@ -228,45 +235,17 @@ impl Module {
             ("KV_HEADS", a.kv_heads.to_string()),
             ("HEAD_DIM", a.head_dim.to_string()),
             ("GROUP", (a.heads / a.kv_heads).to_string()),
-            ("QK_NORM", a.qk_norm.to_string()),
             ("QKV_BIAS", a.qkv_bias.to_string()),
             ("EPS", float_literal(spec.norm.eps)),
             ("EMBED_SCALE", float_literal(spec.dims.embed_scale.unwrap_or(1.0))),
-            ("QUERY_SCALE", float_literal(spec.attention.query_scalar.map_or(1.0 / (a.head_dim as f64).sqrt(), |q| 1.0 / q.sqrt()))),
-            ("LOCAL_ROPE", (0..spec.layers.count).filter(|&i| !spec.block(i).is_linear()).map(|i| (spec.block(i) == crate::spec::Block::Sliding && spec.rope.local_theta.is_some()).to_string()).chain(std::iter::repeat_n("false".to_string(), spec.speculative().map_or(0, |m| m.layers) + 1)).collect::<Vec<_>>().join(", ")),
-            ("LOCAL_THETA", float_literal(spec.rope.local_theta.unwrap_or(spec.rope.theta))),
-            ("SOFTCAP", float_literal(spec.attention.softcap.unwrap_or(0.0))),
             ("THETA", float_literal(spec.rope.theta)),
-            ("ROPE_KIND", rope.kind.to_string()),
-            ("MROPE", spec.rope.mrope.is_some().to_string()),
-            ("MROPE_INTERLEAVED", spec.rope.mrope.as_ref().is_some_and(|m| m.interleaved).to_string()),
-            ("MROPE_S0", spec.rope.mrope.as_ref().map_or(0, |m| m.section[0]).to_string()),
-            ("MROPE_S1", spec.rope.mrope.as_ref().map_or(0, |m| m.section[1]).to_string()),
-            ("MROPE_S2", spec.rope.mrope.as_ref().map_or(0, |m| m.section[2]).to_string()),
-            ("ROPE_FACTOR", float_literal(rope.factor)),
-            ("ROPE_LOW_FREQ", float_literal(rope.low)),
-            ("ROPE_HIGH_FREQ", float_literal(rope.high)),
-            ("ROPE_ORIG_POS", float_literal(rope.original)),
-            ("ROPE_MSCALE", float_literal(rope.mscale)),
             ("ACT_KIND", act.to_string()),
-            ("MAX_CTX", max_ctx.to_string()),
-            ("PAGE", PAGE.to_string()),
-            ("ATTN_LAYERS", spec.kv_layers().max(1).to_string()),
-            ("KV_PLANES", kv_planes.to_string()),
-            ("KV_FP8", spec.runtime.kv_dtype.is_fp8().to_string()),
             ("Q8_GROUP", Q8_GROUP.to_string()),
             ("FP8_BLOCK", FP8_BLOCK.to_string()),
-            ("BD_SPLITS", decode_splits(max_ctx).to_string()),
-            ("DM_BK", DECODE_KEYS.to_string()),
-            ("DM_STAGES", DECODE_STAGES.to_string()),
-            ("DM_CHUNK", DECODE_CHUNK.to_string()),
-            ("DM_SPLIT", DECODE_SPLIT_PRECISION.to_string()),
-            ("DM_MAX_QLEN", DECODE_MAX_QLEN.to_string()),
             ("Q_DIM", spec.q_dim().to_string()),
             ("QKV_N", spec.qkv_rows().to_string()),
             ("QKV_ROW", spec.qkv_rows().to_string()),
             ("OUT_GATE", a.output_gate.to_string()),
-            ("ROT", spec.rotary_dim().to_string()),
             ("LA_KH", la_dim(|l| l.key_heads)),
             ("LA_VH", la_dim(|l| l.value_heads)),
             ("LA_D", la_dim(|l| l.key_head_dim)),
@@ -277,19 +256,16 @@ impl Module {
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
             ("WF", wf.decoder().to_string()),
             ("HEAD_WF", head_wf.decoder().to_string()),
-            ("FM_STAGES", flash_stages.to_string()),
-            ("FM_BK", flash_keys.to_string()),
-            ("FM_WARPS", (flash_rows / 16).to_string()),
-            ("FM_SMEM", kv_bytes.max(q_bytes).to_string()),
         ]
         .into_iter()
         .collect();
         let kir_kernels = kir_kernels(spec, target)?;
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let kir_source = kir::cuda::emit_module(&kir_kernels).map_err(anyhow::Error::msg)?;
+        let attn_source = kir::cuda::emit_attention(&attn).map_err(anyhow::Error::msg)?;
         let gemm_source = kir::cuda::emit_gemms(&gemms.kernels).map_err(anyhow::Error::msg)?;
-        let kir_hash = kir::fold_hashes([kir::module_hash(&kir_kernels), kir::gemm::instances_hash(&gemms.kernels)]);
-        let mut source = format!("{}\n{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, gemm_source, render(MODEL_TEMPLATE, &vars)?, kir_source);
+        let kir_hash = kir::fold_hashes([kir::module_hash(&kir_kernels), kir::gemm::instances_hash(&gemms.kernels), kir::attention::attention_hash(&attn)]);
+        let mut source = format!("{}\n{}\n{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, attn_source, gemm_source, render(MODEL_TEMPLATE, &vars)?, kir_source);
         let mut kernels = KERNELS.to_vec();
         for k in &kir_kernels {
             if !kernels.contains(&k.name) {

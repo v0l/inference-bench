@@ -1,5 +1,6 @@
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod attention;
 pub mod gemm;
 pub mod layout;
 pub mod target;

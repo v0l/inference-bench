@@ -163,8 +163,10 @@ impl Harness {
         let layer = 0i32;
         let window = self.window.get();
         let qlen = b.qlen as i32;
+        let pages = self.pages() as i32;
+        let splits = specrt::codegen::decode_splits(self.max_ctx) as i32;
         let mut l = self.stream.launch_builder(&self.attn);
-        l.arg(&b.qkv).arg(&b.k).arg(&b.v).arg(&b.table).arg(&b.pos).arg(&b.slots).arg(&layer).arg(&qlen).arg(&b.part_acc).arg(&b.part_ml).arg(&window);
+        l.arg(&b.qkv).arg(&b.k).arg(&b.v).arg(&b.table).arg(&b.pos).arg(&b.slots).arg(&layer).arg(&qlen).arg(&pages).arg(&splits).arg(&b.part_acc).arg(&b.part_ml).arg(&window);
         let config = LaunchConfig {
             grid_dim: (a.kv_heads as u32, (b.rows / b.qlen) as u32, specrt::codegen::decode_splits(self.max_ctx) as u32),
             block_dim: (32 * specrt::codegen::decode_warps(a.heads / a.kv_heads, b.qlen) as u32, 1, 1),
@@ -172,7 +174,7 @@ impl Harness {
         };
         unsafe { l.launch(config) }.unwrap();
         let mut l = self.stream.launch_builder(&self.combine);
-        l.arg(&b.part_acc).arg(&b.part_ml).arg(&b.qkv).arg(&b.pos).arg(&qlen).arg(&b.hi).arg(&b.lo);
+        l.arg(&b.part_acc).arg(&b.part_ml).arg(&b.qkv).arg(&b.pos).arg(&qlen).arg(&splits).arg(&b.hi).arg(&b.lo);
         let config = LaunchConfig { grid_dim: (a.heads as u32, b.rows as u32, 1), block_dim: (a.head_dim as u32 / 2, 1, 1), shared_mem_bytes: 0 };
         unsafe { l.launch(config) }.unwrap();
     }
