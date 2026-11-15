@@ -308,3 +308,21 @@ SPECRT_VISION_REF_DIR=/tmp/vis484 flock /tmp/gpu27.lock cargo test --release -p 
 Without `SPECRT_VISION_REF_DIR` the `vision_lm` tests print `skipped` and pass. The fixtures behind
 `vision.rs` come from `scripts/vision_reference.py` and `scripts/vision_encoder_reference.py`
 (`~/.venv-vllm/bin/python`, CPU only).
+
+## Classify replay TTFT (#612)
+
+`orcarouter/Qwen3.8-27B-Uncensored-NVFP4` is served from its HF config. The checkpoint's compressed-tensors
+`input_activations` (FP8 per token on the projections, FP4 group 16 on the MLPs) now select `act_quant = "fp8"`
+and `[mlp] act_quant = "fp4"` in `Spec::from_hf_config_serving`, which `resolve_spec` uses. `Spec::from_hf_config`
+stays weight-only, so the exact-reference tests are unchanged. Before this, the app served the checkpoint without
+the act-quant path and prefilled 1,505 tokens in 940 to 1,000 ms; now the step is 300 to 360 ms.
+
+Replay (`/mnt/data/tmp/inference-bench-498/replay.sh`, 29 photos, 8 concurrent, 8 slots, 32k context, 8 GB KV,
+max batched tokens 2048, vision cache on, beside the user's other GPU work), on the #498 branch plus this change:
+
+| run | TTFT p50 | TTFT p95 | max | requests over 90 s |
+|---|---|---|---|---|
+| master (before) | 12.3 s | 35.3 s | 36.3 s | 0 |
+| #498 branch, weight-only spec | 3.47 s | 6.18 s | 7.19 s | 0 |
+| #498 branch + act-quant from config, pass 1 | 1.02 s | 2.38 s | 2.67 s | 0 |
+| same, pass 2 (cache warm) | 0.96 s | 2.03 s | 2.44 s | 0 |
