@@ -149,6 +149,16 @@ fn quantised_head_step_decode_and_scheduler_match_single_sequence_greedy() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn fp8_kv_step_decode_matches_single_sequence_greedy() {
+    for dir in ["tiny-qwen3.5", "tiny-qwen3.5-hd256"] {
+        let mut s = spec_for(dir);
+        s.runtime.kv_dtype = specrt::spec::KvDtype::Fp8;
+        stepped_spec_matches_single(&s);
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn tiny_mixed_length_step_decode_matches_single_sequence_greedy() {
     stepped_matches_single("tiny-qwen3.5");
 }

@@ -903,6 +903,7 @@ impl Module {
 
     pub fn generate_kv(spec: &Spec, max_ctx: usize, kv_planes: usize, target: &kir::Target) -> Result<Self> {
         anyhow::ensure!(kv_planes == 1 || kv_planes == 2, "kv planes must be 1 or 2");
+        anyhow::ensure!(kv_planes == 1 || !spec.runtime.kv_dtype.is_fp8(), "fp8 KV needs a single plane");
         let a = &spec.attention;
         let d = &spec.dims;
         let wf = WeightFormat::of(spec.quant);
@@ -963,6 +964,7 @@ impl Module {
             ("PAGE", PAGE.to_string()),
             ("ATTN_LAYERS", spec.kv_layers().max(1).to_string()),
             ("KV_PLANES", kv_planes.to_string()),
+            ("KV_FP8", spec.runtime.kv_dtype.is_fp8().to_string()),
             ("Q8_GROUP", Q8_GROUP.to_string()),
             ("FP8_BLOCK", FP8_BLOCK.to_string()),
             ("BD_SPLITS", BATCH_DECODE_SPLITS.to_string()),

@@ -1,6 +1,6 @@
 use crate::loader::LoaderOptions;
 use crate::serve::{ServeOptions, SpeculativeOptions};
-use crate::spec::{BackendChoice, PrefixCacheOptions, Quant, RuntimeOptions, TileChoice};
+use crate::spec::{BackendChoice, KvDtype, PrefixCacheOptions, Quant, RuntimeOptions, TileChoice};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -254,6 +254,7 @@ const META: &[Meta] = &[
     Meta { key: "runtime.prefill_chunk", label: "prefill chunk", group: Group::Runtime, help: "Tokens read per prefill pass. Auto sizes it from memory.", choices: &[], range: (16, 1 << 20) },
     Meta { key: "runtime.unsplit", label: "unsplit ops", group: Group::Runtime, help: "Names of fused operations to keep whole instead of splitting across the batch.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.gemm_fp32", label: "fp32 accumulate", group: Group::Runtime, help: "Accumulate matrix multiplies in fp32 on the plain path. Slower, for debugging.", choices: &[], range: (0, 0) },
+    Meta { key: "runtime.kv_dtype", label: "kv cache type", group: Group::Runtime, help: "Precision of the KV cache. fp8 stores one byte per value with a scale per head and token, halving KV memory and attention reads against f16.", choices: &["f16", "fp8"], range: (0, 0) },
     Meta { key: "runtime.cache_dir", label: "kernel cache", group: Group::Runtime, help: "Where compiled kernels are kept. Auto uses the user cache folder.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.loader.enabled", label: "fast loader", group: Group::Loader, help: "Read weights with parallel readers straight to the card.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.loader.direct", label: "direct reads", group: Group::Loader, help: "Bypass the page cache with O_DIRECT reads.", choices: &[], range: (0, 0) },
@@ -298,6 +299,7 @@ fn populated_runtime() -> RuntimeOptions {
         prefill_chunk: Some(1),
         unsplit: vec!["x".into()],
         gemm_fp32: true,
+        kv_dtype: KvDtype::Fp8,
         cache_dir: Some("x".into()),
         prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: 16, max_snapshots: 1, max_blocks: 1, async_snapshots: true },
         loader: LoaderOptions { enabled: true, direct: true, chunk_mb: 1, readers: 1, ahead: 1, workers: 1, lanes: 1, skip_cached: true, pinned: true, host_budget_mb: 64 },

@@ -734,6 +734,9 @@ impl Layout {
 }
 
 pub fn kv_block_bytes(spec: &Spec, planes: usize) -> usize {
+    if spec.runtime.kv_dtype.is_fp8() {
+        return 2 * spec.kv_layers() * spec.attention.kv_heads * PAGE * (spec.attention.head_dim + 4);
+    }
     2 * spec.kv_layers() * spec.attention.kv_heads * PAGE * spec.attention.head_dim * planes * 2
 }
 
@@ -765,6 +768,7 @@ impl Runtime {
         let staged = if role.whole() { resolved.clone() } else { resolved.stage(range.start, range.end) };
         let spec = &staged;
         ensure!(layout.slots >= 1, "need at least one slot");
+        let layout = if spec.runtime.kv_dtype.is_fp8() { Layout { kv_planes: 1, ..layout } } else { layout };
         let max_ctx = layout.max_ctx;
         let batch = 1;
         let load_started = Instant::now();

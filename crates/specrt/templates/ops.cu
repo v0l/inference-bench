@@ -34,6 +34,7 @@ constexpr int PAGE = {{PAGE}};
 constexpr int PAGES = (MAX_CTX + PAGE - 1) / PAGE;
 constexpr int ATTN_LAYERS = {{ATTN_LAYERS}};
 constexpr int KV_PLANES = {{KV_PLANES}};
+constexpr bool KV_FP8 = {{KV_FP8}};
 constexpr int Q8_GROUP = {{Q8_GROUP}};
 constexpr int FP8_BLOCK = {{FP8_BLOCK}};
 constexpr int LINEAR_WARPS = 8;
@@ -1449,25 +1450,49 @@ __device__ __forceinline__ size_t kv_slot(const int* block_table, int layer, int
     return (((size_t)block_table[pos / PAGE] * ATTN_LAYERS + layer) * KV_HEADS + kv_head) * PAGE + pos % PAGE;
 }
 
+constexpr size_t KV_ROWS_PER_BLOCK = (size_t)ATTN_LAYERS * KV_HEADS * PAGE;
+constexpr size_t KV_SCALE_OFF = KV_ROWS_PER_BLOCK * HEAD_DIM;
+constexpr size_t KV_BLOCK_BYTES = KV_ROWS_PER_BLOCK * (HEAD_DIM + 4);
+
 __device__ __forceinline__ bf16_t* kv_row(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
+    if (KV_FP8) {
+        size_t within = kv_slot(block_table, layer, kv_head, pos) % KV_ROWS_PER_BLOCK;
+        return (bf16_t*)((unsigned char*)cache + (size_t)block_table[pos / PAGE] * KV_BLOCK_BYTES + within * HEAD_DIM);
+    }
     return cache + kv_slot(block_table, layer, kv_head, pos) * KV_PLANES * HEAD_DIM;
 }
 
 __device__ __forceinline__ const bf16_t* kv_row(const bf16_t* cache, const int* block_table, int layer, int kv_head,
                                                 int pos) {
-    return cache + kv_slot(block_table, layer, kv_head, pos) * KV_PLANES * HEAD_DIM;
+    return kv_row(const_cast<bf16_t*>(cache), block_table, layer, kv_head, pos);
+}
+
+__device__ __forceinline__ float* kv_scale_ptr(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
+    size_t within = kv_slot(block_table, layer, kv_head, pos) % KV_ROWS_PER_BLOCK;
+    return (float*)((unsigned char*)cache + (size_t)block_table[pos / PAGE] * KV_BLOCK_BYTES + KV_SCALE_OFF + within * 4);
+}
+
+__device__ __forceinline__ float kv_scale(const bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
+    if (!KV_FP8) return 1.0f;
+    return *kv_scale_ptr(const_cast<bf16_t*>(cache), block_table, layer, kv_head, pos);
 }
 
 __device__ __forceinline__ const int* seq_table(const int* block_table, const int* slots, int row) {
     return block_table + (size_t)slots[row] * PAGES;
 }
 
-__device__ __forceinline__ float kv_at(const bf16_t* row, int d) {
+__device__ __forceinline__ float kv_at(const bf16_t* row, int d, float sc) {
+    if (KV_FP8) return e4m3_to_f32(((const unsigned char*)row)[d]) * sc;
     float v = attn_float(row[d]);
     return KV_PLANES == 2 ? v + attn_float(row[HEAD_DIM + d]) : v;
 }
 
-__device__ __forceinline__ float4 kv_at4(const bf16_t* row, int d) {
+__device__ __forceinline__ float4 kv_at4(const bf16_t* row, int d, float sc) {
+    if (KV_FP8) {
+        unsigned w = *(const unsigned*)((const unsigned char*)row + d);
+        return make_float4(e4m3_to_f32(w & 0xffu) * sc, e4m3_to_f32((w >> 8) & 0xffu) * sc,
+                           e4m3_to_f32((w >> 16) & 0xffu) * sc, e4m3_to_f32(w >> 24) * sc);
+    }
     uint2 h = *(const uint2*)(row + d);
     float4 v = make_float4(attn_float(h.x), attn_float(h.x >> 16), attn_float(h.y), attn_float(h.y >> 16));
     if (KV_PLANES == 2) {
@@ -1522,6 +1547,11 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
         float s = sinf(angle);
         v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
     }
+    float row_scale = 1.0f;
+    if (KV_FP8 && !is_q) {
+        float amax = block_reduce<true>(fabsf(v), scratch);
+        row_scale = amax > 0.0f ? amax / FP8_MAX : 1.0f;
+    }
     if (d >= HEAD_DIM) return;
     if (is_q) {
         src[d] = v;
@@ -1529,6 +1559,11 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     }
     int kv_head = is_k ? head - HEADS : head - HEADS - KV_HEADS;
     bf16_t* dst = kv_row(is_k ? k_cache : v_cache, block_table, layer, kv_head, pos);
+    if (KV_FP8) {
+        ((unsigned char*)dst)[d] = (unsigned char)(f32x2_to_e4m3x2(v / row_scale, 0.0f) & 0xffu);
+        if (d == 0) *kv_scale_ptr(is_k ? k_cache : v_cache, block_table, layer, kv_head, pos) = row_scale;
+        return;
+    }
     unsigned hi, lo;
     attn_split(v, hi, lo);
     dst[d] = (bf16_t)hi;
@@ -1609,12 +1644,14 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
             int t = min(tb + u * ATTN_WARPS, end - 1);
             const bf16_t* k = kv_row(k_cache, block_table, layer, kv_head, t);
             const bf16_t* v = kv_row(v_cache, block_table, layer, kv_head, t);
+            float ksc = kv_scale(k_cache, block_table, layer, kv_head, t);
+            float vsc = kv_scale(v_cache, block_table, layer, kv_head, t);
 #pragma unroll
             for (int j = 0; j < ATTN_V4; j++) {
                 int c = lane + 32 * j;
                 bool on = c < HEAD_DIM / 4;
-                kr[u][j] = on ? kv_at4(k, 4 * c) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                vr[u][j] = on ? kv_at4(v, 4 * c) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                kr[u][j] = on ? kv_at4(k, 4 * c, ksc) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                vr[u][j] = on ? kv_at4(v, 4 * c, vsc) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
         }
 #pragma unroll
@@ -1751,11 +1788,13 @@ extern "C" __global__ void batch_decode_attention(const float* qkv, const bf16_t
             int t = tb + u * BD_WARPS;
             const bf16_t* k = kv_row(k_cache, table, layer, kv_head, min(t, t1 - 1));
             const bf16_t* v = kv_row(v_cache, table, layer, kv_head, min(t, t1 - 1));
+            float ksc = kv_scale(k_cache, table, layer, kv_head, min(t, t1 - 1));
+            float vsc = kv_scale(v_cache, table, layer, kv_head, min(t, t1 - 1));
 #pragma unroll
             for (int i = 0; i < PER_LANE; i++) {
                 int d = lane + i * 32;
-                kr[u][i] = d < HEAD_DIM ? kv_at(k, d) : 0.0f;
-                vr[u][i] = d < HEAD_DIM ? kv_at(v, d) : 0.0f;
+                kr[u][i] = d < HEAD_DIM ? kv_at(k, d, ksc) : 0.0f;
+                vr[u][i] = d < HEAD_DIM ? kv_at(v, d, vsc) : 0.0f;
             }
         }
 #pragma unroll
@@ -1875,8 +1914,8 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
             int t = k0 + r;
             float kv = 0.0f, vv = 0.0f;
             if (t < key_end) {
-                kv = kv_at(kv_row(k_cache, block_table, layer, kv_head, t), d);
-                vv = kv_at(kv_row(v_cache, block_table, layer, kv_head, t), d);
+                kv = kv_at(kv_row(k_cache, block_table, layer, kv_head, t), d, kv_scale(k_cache, block_table, layer, kv_head, t));
+                vv = kv_at(kv_row(v_cache, block_table, layer, kv_head, t), d, kv_scale(v_cache, block_table, layer, kv_head, t));
             }
             ks[r][d] = kv;
             vs[r][d] = vv;
@@ -2075,6 +2114,19 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             int tk = k0 + r;
             const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
+            if (KV_FP8) {
+                int at = min(tk, key_end - 1);
+                float sc = kv_scale(which ? v_cache : k_cache, block_table, layer, kv_head, at);
+                uint2 raw = *(const uint2*)((const unsigned char*)src + c * 8);
+                unsigned w[4];
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    unsigned two = ((e < 2 ? raw.x : raw.y) >> (16 * (e & 1))) & 0xffffu;
+                    w[e] = attn_bits(e4m3_to_f32(two & 0xffu) * sc) | (attn_bits(e4m3_to_f32(two >> 8) * sc) << 16);
+                }
+                *(uint4*)dst = make_uint4(w[0], w[1], w[2], w[3]);
+                continue;
+            }
             cp_async16_zfill(dst, src + c * 8, tk < key_end);
         }
     };

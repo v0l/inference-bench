@@ -75,6 +75,20 @@ impl ActQuant {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+pub enum KvDtype {
+    #[default]
+    F16,
+    Fp8,
+}
+
+impl KvDtype {
+    pub fn is_fp8(self) -> bool {
+        self == KvDtype::Fp8
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TileChoice {
     #[default]
     Auto,
@@ -110,6 +124,7 @@ pub struct RuntimeOptions {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unsplit: Vec<String>,
     pub gemm_fp32: bool,
+    pub kv_dtype: KvDtype,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "PrefixCacheOptions::is_default")]
@@ -152,7 +167,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default() }
     }
 }
 
