@@ -126,7 +126,7 @@ named in `deepstack_visual_indexes`), so the engine tab can draw the tower from 
   4,800 patches. The engine keeps stepping decode and prefill of running sequences meanwhile, and
   submits a request with its finished plan. The encoder runs on its own CUDA stream.
 - Cache: encoder outputs are kept in host memory by the SHA-256 of the media bytes, least recently
-  used first out, bounded by `[runtime.vision] cache_mb` (512 by default, 0 turns it off). A retry
+  used first out, bounded by `[runtime.vision] cache_mb` (1024 by default, about 40 classify photos; 0 turns it off). A retry
   of the same image is planned without touching the GPU. A 960x1280 photo is 1,200 rows of 5,120
   floats, 24.6 MB.
 - A request cancelled while it waits for the encoder is dropped before or after encoding, never

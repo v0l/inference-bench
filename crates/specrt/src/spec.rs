@@ -145,7 +145,7 @@ pub struct VisionOptions {
 
 impl Default for VisionOptions {
     fn default() -> Self {
-        VisionOptions { precision: crate::vision_encoder::VisionPrecision::Fast, cache_mb: 512, max_batch: 8 }
+        VisionOptions { precision: crate::vision_encoder::VisionPrecision::Fast, cache_mb: 1024, max_batch: 8 }
     }
 }
 
