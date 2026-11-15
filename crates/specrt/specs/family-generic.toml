@@ -1,0 +1,6 @@
+name = "generic"
+kind = "family"
+mtp = true
+
+[blocks]
+kind = "from_config"

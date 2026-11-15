@@ -1,0 +1,10 @@
+name = "qwen3_next"
+kind = "family"
+extends = "qwen3_5"
+
+[match]
+model_types = ["qwen3_next"]
+architectures = ["Qwen3NextForCausalLM"]
+
+[attention]
+output_gate = true

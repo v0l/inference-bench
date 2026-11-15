@@ -1,0 +1,10 @@
+name = "qwen3"
+kind = "family"
+
+[match]
+model_types = ["qwen3", "qwen3_moe"]
+architectures = ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]
+gguf = ["qwen3"]
+
+[attention]
+qk_norm = true

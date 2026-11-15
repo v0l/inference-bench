@@ -1,0 +1,13 @@
+name = "qwen3_5"
+kind = "family"
+mtp = true
+
+[match]
+model_types = ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"]
+architectures = ["Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM", "Qwen3_5MoeForConditionalGeneration"]
+
+[attention]
+qk_norm = true
+
+[blocks]
+kind = "hybrid"

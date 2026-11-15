@@ -34,9 +34,9 @@ family field that now carries it.
 | qk-norm | `match hf.model_type` | `[attention] qk_norm` |
 | output gate | `attn_output_gate \|\| qwen3_next` | `[attention] output_gate` |
 | hybrid with delta-net | `family_hybrid` list | `[blocks] kind = "hybrid"` |
-| unit-offset RMSNorm | follows hybrid | `[blocks] unit_offset` |
-| MTP layers | hybrid and no MoE | `[mtp] enabled` |
-| MoE top-k renormalisation default | `family_hybrid` | `[moe] norm_topk_default` |
+| unit-offset RMSNorm | follows hybrid | follows `[blocks] kind` |
+| MTP layers | hybrid and no MoE | `mtp = true` |
+| MoE top-k renormalisation default | `family_hybrid` | follows `[blocks] kind` (hybrid renormalises) |
 | activation map | silu, gelu variants | `[activation]` (generic) |
 | accepted dtypes | bf16, f16, f32 | `[dtypes]` (generic) |
 | config keys for each dimension | `HfConfig` struct | `[fields]` (generic) |
@@ -61,13 +61,9 @@ output_gate = { config = "attn_output_gate", default = false }
 
 [blocks]
 kind = "hybrid"
-unit_offset = true
 
-[mtp]
-enabled = true
+mtp = true
 
-[moe]
-norm_topk_default = true
 
 [quantization]
 methods = ["compressed-tensors", "fp8"]

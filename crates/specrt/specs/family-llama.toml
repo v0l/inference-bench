@@ -1,0 +1,7 @@
+name = "llama"
+kind = "family"
+
+[match]
+model_types = ["llama", "mistral"]
+architectures = ["LlamaForCausalLM", "MistralForCausalLM"]
+gguf = ["llama"]

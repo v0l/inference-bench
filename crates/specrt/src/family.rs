@@ -57,13 +57,6 @@ impl Default for FamilyAttention {
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyBlocks {
     pub kind: BlockKind,
-    pub unit_offset: bool,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct FamilyMoe {
-    pub norm_topk_default: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -83,8 +76,16 @@ pub struct Family {
     pub blocks: FamilyBlocks,
     #[serde(default)]
     pub mtp: bool,
-    #[serde(default)]
-    pub moe: FamilyMoe,
+}
+
+static ACTIVE: std::sync::RwLock<Option<Registry>> = std::sync::RwLock::new(None);
+
+pub fn install(registry: Registry) {
+    *ACTIVE.write().unwrap() = Some(registry);
+}
+
+pub fn active() -> Registry {
+    ACTIVE.read().unwrap().clone().unwrap_or_else(|| Registry::embedded().clone())
 }
 
 pub const FAMILY_KIND: &str = "family";

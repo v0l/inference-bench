@@ -1,0 +1,11 @@
+name = "qwen2"
+kind = "family"
+
+[match]
+model_types = ["qwen2"]
+architectures = ["Qwen2ForCausalLM"]
+gguf = ["qwen2"]
+
+[attention]
+qkv_bias = true
+qk_norm = false
