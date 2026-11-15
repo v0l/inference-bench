@@ -715,66 +715,47 @@ impl Quantization {
     }
 }
 
-fn compressed_act(g: &serde_json::Value) -> ActQuant {
-    let a = &g["input_activations"];
-    let bits = a.get("num_bits").and_then(|b| b.as_u64());
-    let strategy = a.get("strategy").and_then(|s| s.as_str());
-    let float = a.get("type").and_then(|t| t.as_str()) == Some("float");
-    let dynamic = a.get("dynamic").is_some_and(|d| d.as_bool() == Some(true) || d.as_str() == Some("local"));
-    match (float && dynamic, bits, strategy, a.get("group_size").and_then(|g| g.as_u64())) {
-        (true, Some(8), Some("token"), _) => ActQuant::Fp8,
-        (true, Some(4), Some("tensor_group"), Some(16)) => ActQuant::Fp4,
-        _ => ActQuant::None,
+fn compressed_act(rule: &crate::family::FamilyQuant, g: &serde_json::Value) -> ActQuant {
+    crate::family::first_match(&rule.act_rules, g).unwrap_or(ActQuant::None)
+}
+
+fn compressed_group(rule: &crate::family::FamilyQuant, name: &str, g: &serde_json::Value) -> Result<Quant> {
+    match crate::family::first_match(&rule.group_rules, g) {
+        Some(q) => Ok(q),
+        None => bail!("{}", rule.group_error.replace("{name}", name)),
     }
 }
 
-fn compressed_group(name: &str, g: &serde_json::Value) -> Result<Quant> {
-    let w = &g["weights"];
-    let field = |v: &serde_json::Value, k: &str| v.get(k).cloned().unwrap_or(serde_json::Value::Null);
-    let text = |v: &serde_json::Value, k: &str| field(v, k).as_str().map(str::to_string);
-    let int = |v: &serde_json::Value, k: &str| field(v, k).as_u64();
-    let symmetric = field(w, "symmetric").as_bool() == Some(true);
-    match (text(g, "format").as_deref(), text(w, "type").as_deref(), int(w, "num_bits"), text(w, "strategy").as_deref()) {
-        (Some("float-quantized"), Some("float"), Some(8), Some("channel")) if symmetric => Ok(Quant::Fp8Channel),
-        (Some("nvfp4-pack-quantized"), Some("float"), Some(4), Some("tensor_group"))
-            if symmetric && int(w, "group_size") == Some(16) =>
-        {
-            Ok(Quant::Nvfp4G16)
-        }
-        _ => bail!("compressed-tensors group {name} is not supported (fp8 per-channel and nvfp4 group 16 are)"),
-    }
-}
-
-fn target_slot(target: &str) -> Result<(usize, bool)> {
+fn target_slot(rule: &crate::family::FamilyQuant, target: &str) -> Result<(usize, bool)> {
     let rest = target
-        .split_once("layers.")
+        .split_once(rule.layer_marker.as_str())
         .map(|(_, r)| r)
         .with_context(|| format!("compressed-tensors target {target} is not a layer projection"))?;
     let (layer, module) = rest.split_once('.').context("layer target without a module")?;
     let layer: usize = layer.parse().with_context(|| format!("target {target}"))?;
-    Ok((layer, module.starts_with("mlp.")))
+    Ok((layer, module.starts_with(rule.mlp_marker.as_str())))
 }
 
-fn parse_compressed(q: &serde_json::Value, layers: usize) -> Result<Quantization> {
-    let groups = q["config_groups"].as_object().context("compressed-tensors config has no config_groups")?;
+fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, layers: usize) -> Result<Quantization> {
+    let groups = q[rule.groups_key.as_str()].as_object().context("compressed-tensors config has no config_groups")?;
     let mut projection: Option<Quant> = None;
     let mut act = ActQuant::None;
     let mut mlp_act = ActQuant::None;
     let mut mlp: Vec<Option<Quant>> = vec![None; layers];
     if groups.len() == 1 {
         let (name, g) = groups.iter().next().unwrap();
-        if g["targets"].as_array().is_some_and(|t| t.len() == 1 && t[0].as_str() == Some("Linear")) {
-            let quant = compressed_group(name, g)?;
-            let act = if quant.is_fp8() { compressed_act(g) } else { ActQuant::None };
+        if g["targets"].as_array().is_some_and(|t| t.len() == 1 && t[0].as_str() == Some(rule.all_linear_target.as_str())) {
+            let quant = compressed_group(rule, name, g)?;
+            let act = if quant.is_fp8() { compressed_act(rule, g) } else { ActQuant::None };
             return Ok(Quantization { quant, mlp: None, act, mlp_act: ActQuant::None });
         }
     }
     for (name, g) in groups {
-        let quant = compressed_group(name, g)?;
-        let group_act = compressed_act(g);
+        let quant = compressed_group(rule, name, g)?;
+        let group_act = compressed_act(rule, g);
         for t in g["targets"].as_array().context("group without targets")? {
             let t = t.as_str().context("target is not a string")?;
-            let (layer, is_mlp) = target_slot(t)?;
+            let (layer, is_mlp) = target_slot(rule, t)?;
             ensure!(layer < layers, "target {t} is past the last layer");
             if is_mlp {
                 ensure!(mlp[layer].is_none_or(|m| m == quant), "{t} is in two groups");
@@ -808,22 +789,17 @@ fn parse_compressed(q: &serde_json::Value, layers: usize) -> Result<Quantization
     Ok(Quantization { quant, mlp, act, mlp_act })
 }
 
-fn parse_quantization(value: Option<&serde_json::Value>, layers: usize) -> Result<Quantization> {
+fn parse_quantization(rule: &crate::family::FamilyQuant, value: Option<&serde_json::Value>, layers: usize) -> Result<Quantization> {
     let Some(q) = value.filter(|v| !v.is_null()) else {
         return Ok(Quantization::weights(Quant::Bf16));
     };
-    let method = q.get("quant_method").and_then(|m| m.as_str()).unwrap_or("");
-    if method == "compressed-tensors" {
-        return parse_compressed(q, layers);
+    let method = q.get(rule.method_key.as_str()).and_then(|m| m.as_str()).unwrap_or("");
+    if rule.grouped_methods.iter().any(|m| m == method) {
+        return parse_compressed(rule, q, layers);
     }
-    let fmt = q.get("fmt").and_then(|f| f.as_str()).unwrap_or("e4m3");
-    let block: Option<Vec<u64>> = q
-        .get("weight_block_size")
-        .and_then(|b| b.as_array())
-        .map(|b| b.iter().filter_map(|x| x.as_u64()).collect());
-    match (method, fmt, block.as_deref()) {
-        ("fp8", "e4m3", Some([128, 128])) => Ok(Quantization::weights(Quant::Fp8Block128)),
-        _ => bail!("quantization {q} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are)"),
+    match crate::family::first_match(&rule.flat_rules, q) {
+        Some(quant) => Ok(Quantization::weights(quant)),
+        None => bail!("{}", rule.flat_error.replace("{q}", &q.to_string())),
     }
 }
 
@@ -1020,7 +996,7 @@ impl Spec {
                 None => anyhow::Error::from(e),
             }
         })?;
-        let quantization = parse_quantization(quant_config.as_ref(), hf.num_hidden_layers);
+        let quantization = parse_quantization(&family.quantization, quant_config.as_ref(), hf.num_hidden_layers);
         let Quantization { quant, mlp: mlp_quant, act, mlp_act } = match (quantization, strict) {
             (Ok(q), _) => q,
             (Err(e), true) => return Err(e),

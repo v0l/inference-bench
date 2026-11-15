@@ -90,6 +90,66 @@ impl FamilyRope {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Rule<T> {
+    #[serde(alias = "quant", alias = "act")]
+    pub gives: T,
+    #[serde(default)]
+    pub when: toml::Table,
+    #[serde(default)]
+    pub defaults: toml::Table,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyQuant {
+    pub method_key: String,
+    pub grouped_methods: Vec<String>,
+    pub groups_key: String,
+    pub all_linear_target: String,
+    pub layer_marker: String,
+    pub mlp_marker: String,
+    pub group_rules: Vec<Rule<crate::spec::Quant>>,
+    pub flat_rules: Vec<Rule<crate::spec::Quant>>,
+    pub act_rules: Vec<Rule<crate::spec::ActQuant>>,
+    pub group_error: String,
+    pub flat_error: String,
+}
+
+fn json_at<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.').try_fold(v, |cur, key| cur.get(key))
+}
+
+fn value_matches(want: &toml::Value, got: &serde_json::Value) -> bool {
+    match (want, got) {
+        (toml::Value::Table(t), got) => t.get("any").and_then(|a| a.as_array()).is_some_and(|alts| alts.iter().any(|a| value_matches(a, got))),
+        (toml::Value::String(a), serde_json::Value::String(b)) => a == b,
+        (toml::Value::Boolean(a), serde_json::Value::Bool(b)) => a == b,
+        (toml::Value::Integer(a), serde_json::Value::Number(b)) => b.as_i64() == Some(*a),
+        (toml::Value::Float(a), serde_json::Value::Number(b)) => b.as_f64() == Some(*a),
+        (toml::Value::Array(a), serde_json::Value::Array(b)) => a.len() == b.len() && a.iter().zip(b).all(|(x, y)| value_matches(x, y)),
+        _ => false,
+    }
+}
+
+impl<T: Copy> Rule<T> {
+    pub fn matches(&self, json: &serde_json::Value) -> bool {
+        self.when.iter().all(|(path, want)| match json_at(json, path) {
+            Some(got) => value_matches(want, got),
+            None => self.defaults.get(path).is_some_and(|d| value_matches(want, &toml_to_json(d))),
+        })
+    }
+}
+
+fn toml_to_json(v: &toml::Value) -> serde_json::Value {
+    serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+}
+
+pub fn first_match<T: Copy>(rules: &[Rule<T>], json: &serde_json::Value) -> Option<T> {
+    rules.iter().find(|r| r.matches(json)).map(|r| r.gives)
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Family {
     pub name: String,
     pub kind: String,
@@ -111,6 +171,8 @@ pub struct Family {
     pub dtypes: FamilyDtypes,
     #[serde(default)]
     pub rope: FamilyRope,
+    #[serde(default)]
+    pub quantization: FamilyQuant,
     #[serde(default)]
     pub fields: std::collections::BTreeMap<String, Vec<String>>,
 }

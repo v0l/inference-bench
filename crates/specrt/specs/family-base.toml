@@ -28,3 +28,34 @@ yarn = "yarn"
 
 [rope.keys]
 original_max_positions = "original_max_position_embeddings"
+
+[quantization]
+method_key = "quant_method"
+grouped_methods = ["compressed-tensors"]
+groups_key = "config_groups"
+all_linear_target = "Linear"
+layer_marker = "layers."
+mlp_marker = "mlp."
+group_error = "compressed-tensors group {name} is not supported (fp8 per-channel and nvfp4 group 16 are)"
+flat_error = "quantization {q} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are)"
+
+[[quantization.group_rules]]
+quant = "fp8_channel"
+when = { format = "float-quantized", "weights.type" = "float", "weights.num_bits" = 8, "weights.strategy" = "channel", "weights.symmetric" = true }
+
+[[quantization.group_rules]]
+quant = "nvfp4_g16"
+when = { format = "nvfp4-pack-quantized", "weights.type" = "float", "weights.num_bits" = 4, "weights.strategy" = "tensor_group", "weights.symmetric" = true, "weights.group_size" = 16 }
+
+[[quantization.flat_rules]]
+quant = "fp8_block128"
+when = { quant_method = "fp8", fmt = "e4m3", weight_block_size = [128, 128] }
+defaults = { fmt = "e4m3" }
+
+[[quantization.act_rules]]
+act = "fp8"
+when = { "input_activations.type" = "float", "input_activations.dynamic" = { any = [true, "local"] }, "input_activations.num_bits" = 8, "input_activations.strategy" = "token" }
+
+[[quantization.act_rules]]
+act = "fp4"
+when = { "input_activations.type" = "float", "input_activations.dynamic" = { any = [true, "local"] }, "input_activations.num_bits" = 4, "input_activations.strategy" = "tensor_group", "input_activations.group_size" = 16 }
