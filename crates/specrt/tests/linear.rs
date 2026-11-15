@@ -450,3 +450,11 @@ fn moe_prefill_matches_the_reference_per_layer() {
 fn moe_logits_and_greedy_match_transformers() {
     logits_and_greedy_match_reference(MOE, "tinymoe");
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn moe_batch_decode_matches_single_sequence_greedy() {
+    for batch in [2, 8, 16] {
+        batch_decode_matches_single_sequence_greedy(MOE, batch);
+    }
+}

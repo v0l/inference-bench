@@ -63,7 +63,11 @@ pub(super) struct MoeBuffers {
     coef: CudaSlice<f32>,
     act: CudaSlice<f32>,
     out: CudaSlice<f32>,
+    offsets: CudaSlice<i32>,
+    sorted: CudaSlice<i32>,
 }
+
+pub const GROUP_MIN_TOKENS: usize = 17;
 
 impl MoeBuffers {
     pub(super) fn new(stream: &Arc<cudarc::driver::CudaStream>, rows: usize, spec: &crate::spec::Spec) -> Result<Self> {
@@ -75,6 +79,8 @@ impl MoeBuffers {
             coef: stream.alloc_zeros(pairs)?,
             act: stream.alloc_zeros(pairs * m.expert_intermediate)?,
             out: stream.alloc_zeros(pairs * spec.dims.hidden)?,
+            offsets: stream.alloc_zeros(m.experts + 2)?,
+            sorted: stream.alloc_zeros(pairs)?,
         })
     }
 }
@@ -108,6 +114,9 @@ impl Runtime {
         let mb = self.moe.as_ref().expect("moe buffers");
         let pairs = (n * m.pairs()) as u32;
         let fp4 = w.gate.fp4();
+        if n >= GROUP_MIN_TOKENS {
+            return self.moe_grouped(w, mb, n, fp4);
+        }
         let up = if fp4 { "moe_up_fp4" } else { "moe_up_bf16" };
         let down = if fp4 { "moe_down_fp4" } else { "moe_down_bf16" };
         let mut b = self.stream.launch_builder(self.kernel(up));
@@ -125,6 +134,36 @@ impl Runtime {
         b.arg(&mb.act).arg(&mb.idx).arg(&mb.out);
         let config = LaunchConfig {
             grid_dim: (pairs, self.spec.dims.hidden.div_ceil(ROWS_PER_BLOCK) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn moe_grouped(&self, w: &DeviceMoe, mb: &MoeBuffers, n: usize, fp4: bool) -> Result<()> {
+        let m = self.spec.moe.as_ref().expect("moe spec");
+        let slots = (m.experts + usize::from(m.shared_intermediate > 0)) as u32;
+        let count = (n * m.pairs()) as i32;
+        let mut b = self.stream.launch_builder(self.kernel("moe_permute"));
+        b.arg(&mb.idx).arg(&mb.offsets).arg(&mb.sorted).arg(&count);
+        unsafe { b.launch(cfg(1, 1024)) }?;
+        let (up, down) = if fp4 { ("moe_group_up_fp4", "moe_group_down_fp4") } else { ("moe_group_up_bf16", "moe_group_down_bf16") };
+        let mut b = self.stream.launch_builder(self.kernel(up));
+        self.stack_args(&mut b, &w.gate);
+        self.stack_args(&mut b, &w.up);
+        b.arg(&mb.xn).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.act);
+        let config = LaunchConfig {
+            grid_dim: (slots, m.expert_intermediate.div_ceil(ROWS_PER_BLOCK) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe { b.launch(config) }?;
+        let mut b = self.stream.launch_builder(self.kernel(down));
+        self.stack_args(&mut b, &w.down);
+        b.arg(&mb.act).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.out);
+        let config = LaunchConfig {
+            grid_dim: (slots, self.spec.dims.hidden.div_ceil(ROWS_PER_BLOCK) as u32, 1),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };

@@ -182,3 +182,146 @@ extern "C" __global__ void moe_combine(float* x, const float* out, const float* 
     for (int s = 0; s < MOE_PAIRS; s++) acc += coef[t * MOE_PAIRS + s] * out[((size_t)t * MOE_PAIRS + s) * HIDDEN + i];
     x[(size_t)t * HIDDEN + i] += acc;
 }
+
+constexpr int MOE_TJ = 2;
+constexpr int MOE_SLOTS = MOE_E + (MOE_SHARED ? 1 : 0);
+
+extern "C" __global__ void __launch_bounds__(1024) moe_permute(const int* idx, int* offsets, int* sorted, int pairs) {
+    __shared__ int count[MOE_SLOTS + 1];
+    __shared__ int cursor[MOE_SLOTS];
+    for (int e = threadIdx.x; e <= MOE_SLOTS; e += blockDim.x) count[e] = 0;
+    __syncthreads();
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) atomicAdd(&count[idx[p]], 1);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int run = 0;
+        for (int e = 0; e < MOE_SLOTS; e++) {
+            int c = count[e];
+            offsets[e] = run;
+            cursor[e] = run;
+            run += c;
+        }
+        offsets[MOE_SLOTS] = run;
+    }
+    __syncthreads();
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        int at = atomicAdd(&cursor[idx[p]], 1);
+        sorted[at] = p;
+    }
+}
+
+template <bool FP4, int K, int ROWS>
+__device__ __forceinline__ void moe_dot2(const void* w, const unsigned char* s, const float* g, int expert, int row, const float* xs, int lane, int live, float* result) {
+    size_t at = (size_t)expert * ROWS + row;
+#pragma unroll
+    for (int j = 0; j < MOE_TJ; j++) result[j] = 0.0f;
+    if (FP4) {
+        const unsigned char* wb = (const unsigned char*)w + at * (K / 2);
+        const unsigned char* sb = s + at * (K / 16);
+        for (int grp = lane; grp < K / 16; grp += 32) {
+            uint2 q = *(const uint2*)(wb + (size_t)grp * 8);
+            float v[16];
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                unsigned byte = ((j < 4 ? q.x : q.y) >> (8 * (j & 3))) & 0xffu;
+                v[2 * j] = moe_e2m1(byte & 0xfu);
+                v[2 * j + 1] = moe_e2m1(byte >> 4);
+            }
+            float sc = e4m3_to_f32(sb[grp]);
+#pragma unroll
+            for (int j = 0; j < MOE_TJ; j++) {
+                if (j < live) {
+                    float part = 0.0f;
+#pragma unroll
+                    for (int i = 0; i < 16; i++) part += v[i] * xs[j * K + grp * 16 + i];
+                    result[j] += part * sc;
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < MOE_TJ; j++) result[j] *= g[expert];
+    } else {
+        const bf16_t* wb = (const bf16_t*)w + at * K;
+        for (int k = lane; k < K; k += 32) {
+            float wv = bf16_to_f32(wb[k]);
+#pragma unroll
+            for (int j = 0; j < MOE_TJ; j++) if (j < live) result[j] += wv * xs[j * K + k];
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < MOE_TJ; j++) result[j] = warp_sum(result[j]);
+}
+
+template <bool FP4>
+__device__ __forceinline__ void moe_group_up_impl(const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug,
+                                                  const float* xn, const int* offsets, const int* sorted, float* act) {
+    __shared__ float xs[MOE_TJ * HIDDEN];
+    int expert = blockIdx.x;
+    int begin = offsets[expert];
+    int end = offsets[expert + 1];
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.y * MOE_WARPS + warp;
+    for (int base = begin; base < end; base += MOE_TJ) {
+        int live = min(MOE_TJ, end - base);
+        __syncthreads();
+        for (int j = 0; j < live; j++) {
+            int t = sorted[base + j] / MOE_PAIRS;
+            for (int i = threadIdx.x; i < HIDDEN; i += 256) xs[j * HIDDEN + i] = xn[(size_t)t * HIDDEN + i];
+        }
+        __syncthreads();
+        if (row < MOE_INTER) {
+            float gv[MOE_TJ], uv[MOE_TJ];
+            moe_dot2<FP4, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
+            moe_dot2<FP4, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane, live, uv);
+            if (lane == 0) {
+                for (int j = 0; j < live; j++) act[(size_t)sorted[base + j] * MOE_INTER + row] = activation(gv[j]) * uv[j];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) moe_group_up_bf16(const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug,
+                                                                    const float* xn, const int* offsets, const int* sorted, float* act) {
+    moe_group_up_impl<false>(gw, gs, gg, uw, us, ug, xn, offsets, sorted, act);
+}
+
+extern "C" __global__ void __launch_bounds__(256) moe_group_up_fp4(const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug,
+                                                                   const float* xn, const int* offsets, const int* sorted, float* act) {
+    moe_group_up_impl<true>(gw, gs, gg, uw, us, ug, xn, offsets, sorted, act);
+}
+
+template <bool FP4>
+__device__ __forceinline__ void moe_group_down_impl(const void* w, const unsigned char* s, const float* g, const float* act, const int* offsets, const int* sorted, float* out) {
+    __shared__ float xs[MOE_TJ * MOE_INTER];
+    int expert = blockIdx.x;
+    int begin = offsets[expert];
+    int end = offsets[expert + 1];
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.y * MOE_WARPS + warp;
+    for (int base = begin; base < end; base += MOE_TJ) {
+        int live = min(MOE_TJ, end - base);
+        __syncthreads();
+        for (int j = 0; j < live; j++) {
+            size_t p = sorted[base + j];
+            for (int i = threadIdx.x; i < MOE_INTER; i += 256) xs[j * MOE_INTER + i] = act[p * MOE_INTER + i];
+        }
+        __syncthreads();
+        if (row < HIDDEN) {
+            float v[MOE_TJ];
+            moe_dot2<FP4, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane, live, v);
+            if (lane == 0) {
+                for (int j = 0; j < live; j++) out[(size_t)sorted[base + j] * HIDDEN + row] = v[j];
+            }
+        }
+    }
+}
+
+extern "C" __global__ void __launch_bounds__(256) moe_group_down_bf16(const void* w, const unsigned char* s, const float* g, const float* act, const int* offsets, const int* sorted, float* out) {
+    moe_group_down_impl<false>(w, s, g, act, offsets, sorted, out);
+}
+
+extern "C" __global__ void __launch_bounds__(256) moe_group_down_fp4(const void* w, const unsigned char* s, const float* g, const float* act, const int* offsets, const int* sorted, float* out) {
+    moe_group_down_impl<true>(w, s, g, act, offsets, sorted, out);
+}
