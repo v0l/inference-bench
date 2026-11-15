@@ -143,6 +143,12 @@ fn linear_rope_scaling_logits_match_transformers() {
 
 #[test]
 #[ignore = "needs a CUDA GPU, the HF weights and scripts/reference.py output"]
+fn yarn_rope_scaling_logits_match_transformers() {
+    check("qwen2.5-0.5b-yarn4.toml", 1e-3, true);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the HF weights and scripts/reference.py output"]
 fn gated_gelu_logits_match_transformers() {
     check("qwen2.5-0.5b-geglu.toml", 4e-3, true);
 }
@@ -158,6 +164,7 @@ fn mistral_f16_checkpoint_logits_match_transformers() {
 fn wrong_rope_scaling_or_activation_is_caught_by_the_references() {
     assert!(max_abs_with("llama-3.2-1b.toml", |s| s.rope.scaling = None) > 0.05);
     assert!(max_abs_with("qwen2.5-0.5b-linear4.toml", |s| s.rope.scaling = None) > 0.05);
+    assert!(max_abs_with("qwen2.5-0.5b-yarn4.toml", |s| s.rope.scaling = None) > 0.01);
     assert!(
         max_abs_with("qwen2.5-0.5b-geglu.toml", |s| s.mlp.activation =
             specrt::spec::Activation::Swiglu)

@@ -161,3 +161,53 @@ fn the_extension_options_are_in_the_load_schema_and_reach_the_runtime() {
     let rt = c.apply(specrt::serve::ServeOptions::default()).unwrap().runtime.unwrap();
     assert_eq!(rt.rope_extension, extended(4).rope_extension);
 }
+
+fn yarn_tiny() -> Spec {
+    let mut spec = tiny_spec();
+    spec.rope.scaling = Some(specrt::spec::RopeScaling {
+        kind: RopeScalingKind::Yarn,
+        factor: 4.0,
+        low_freq_factor: None,
+        high_freq_factor: None,
+        original_max_positions: Some(262144.0),
+        yarn: Some(specrt::spec::Yarn { beta_fast: 32.0, beta_slow: 1.0, attention_factor: specrt::spec::yarn_mscale(4.0, 1.0), truncate: true }),
+    });
+    spec
+}
+
+fn past_a_million(spec: &Spec, reversed: bool) -> Vec<f32> {
+    use specrt::runtime::{DecodeRow, Layout, Runtime, Sampling};
+    let max_ctx = 1_100_000usize;
+    let pages = max_ctx.div_ceil(specrt::codegen::PAGE);
+    let layout = Layout { max_ctx, slots: 1, kv_blocks: pages, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let mut rt = Runtime::load_layout(spec, layout).unwrap();
+    let table: Vec<u32> = if reversed { (0..pages as u32).rev().collect() } else { (0..pages as u32).collect() };
+    rt.set_block_table(0, &table).unwrap();
+    let mut st = rt.stepper().unwrap();
+    let start = 1_048_000;
+    let prompt: Vec<u32> = (0..100u32).map(|i| (i * 37 + 11) % 1024).collect();
+    rt.prefill_slot(&mut st, 0, &prompt, start, Some((Sampling::GREEDY, 0))).unwrap();
+    let mut logits = rt.last_logits().unwrap();
+    for step in 0..40usize {
+        let row = DecodeRow { slot: 0, token: (step as u32 * 7 + 3) % 1024, pos: start + prompt.len() + step, sampling: Sampling::GREEDY, step: step as u32 };
+        rt.decode(&mut st, &[row]).unwrap();
+    }
+    rt.synchronize().unwrap();
+    logits.extend(rt.last_logits().unwrap());
+    logits
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU with 2 GB free"]
+fn yarn_paging_and_index_maths_hold_past_a_million_positions() {
+    let spec = yarn_tiny();
+    let straight = past_a_million(&spec, false);
+    let shuffled = past_a_million(&spec, true);
+    assert!(straight.iter().all(|v| v.is_finite()));
+    assert_eq!(straight, shuffled, "page order must not change the numbers");
+    let mut plain = tiny_spec();
+    plain.rope.scaling = None;
+    let unscaled = past_a_million(&plain, false);
+    assert!(unscaled.iter().all(|v| v.is_finite()));
+    assert_ne!(straight, unscaled, "yarn must change the rotation at these positions");
+}
