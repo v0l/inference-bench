@@ -7,6 +7,8 @@ use inference_bench_core::matrix::{MatrixSpec, run_matrix, run_model};
 use inference_bench_core::result::RunResult;
 use inference_bench_core::specs;
 use inference_bench_core::store;
+mod launch;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -95,10 +97,77 @@ struct PromptArgs {
     no_save: bool,
 }
 
+#[derive(Args, Clone)]
+struct ConnectArgs {
+    #[arg(help = "claude-code, codex, opencode, pi or agentbench; all of them when omitted")]
+    app: Option<String>,
+    #[arg(long, help = "Server address (default: the launched server, else http://127.0.0.1:8080)")]
+    url: Option<String>,
+    #[arg(long, env = "INFERENCE_BENCH_API_KEY", help = "API key (default: the launched server's)")]
+    api_key: Option<String>,
+    #[arg(long, help = "Model to name in the config (default: the first the server lists)")]
+    model: Option<String>,
+    #[arg(long, help = "Write the config file instead of printing it, merging into what is there")]
+    write: bool,
+    #[arg(long, help = "Config file to write, for one app")]
+    path: Option<PathBuf>,
+    #[arg(long, help = "Send one prompt and one tool call the way the app does, and report pass or fail")]
+    check: bool,
+    #[arg(long, value_enum, default_value = "text")]
+    output: launch::Output,
+}
+
+fn connect_command(data: &Path, a: &ConnectArgs) -> Result<()> {
+    use inference_bench_server::connect::{self, App, Endpoint};
+    let apps: Vec<App> = match &a.app {
+        Some(name) => vec![App::parse(name).with_context(|| format!("{name:?} is not one of claude-code, codex, opencode, pi, agentbench"))?],
+        None => App::ALL.to_vec(),
+    };
+    let state = launch::State::read(data).filter(|s| s.alive());
+    let url = a.url.clone().or_else(|| state.as_ref().and_then(|s| s.urls.first().cloned())).unwrap_or_else(|| "http://127.0.0.1:8080".into());
+    let key = a.api_key.clone().or_else(|| state.as_ref().and_then(|s| s.api_key.clone()));
+    let model = match &a.model {
+        Some(m) => m.clone(),
+        None => connect::first_model(&url, key.as_deref())?,
+    };
+    let endpoint = Endpoint { url, key, model };
+    let home = dirs_home();
+    let mut reports = Vec::new();
+    for app in &apps {
+        if a.check {
+            reports.push(connect::check(*app, &endpoint));
+        } else if a.write {
+            let path = a.path.clone().or_else(|| app.default_path(&home)).with_context(|| format!("{} has no config file to write, run without --write", app.name()))?;
+            connect::write(*app, &endpoint, &path)?;
+            println!("wrote {}", path.display());
+        } else if a.output == launch::Output::Text {
+            println!("# {}\n{}", app.name(), connect::render(*app, &endpoint));
+        }
+    }
+    if a.check {
+        match a.output {
+            launch::Output::Json => println!("{}", serde_json::to_string_pretty(&reports)?),
+            launch::Output::Text => reports.iter().for_each(|r| print!("{}", r.describe())),
+        }
+        if reports.iter().any(|r| !r.passed) {
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     #[command(alias = "server", about = "Serve an OpenAI-compatible HTTP API")]
     Serve(inference_bench_server::cli::ServeArgs),
+    #[command(about = "Set up, serve and print the addresses in one command: --plan, --status, --stop, --output json")]
+    Launch(launch::LaunchArgs),
+    #[command(about = "Point Claude Code, Codex, OpenCode, pi or agentbench at a running server; --check tries a prompt and a tool call")]
+    Connect(ConnectArgs),
     #[command(about = "Run a model on the native engine and report its speed")]
     Run {
         #[command(flatten)]
@@ -347,6 +416,8 @@ fn main() -> Result<()> {
     }
     match &cli.cmd {
         Cmd::Serve(_) => unreachable!(),
+        Cmd::Launch(args) => launch::run(args, &data)?,
+        Cmd::Connect(args) => connect_command(&data, args)?,
         Cmd::Run { engine, prompt } => {
             let mut prompt = prompt.clone();
             prompt.model = resolve_spec_names(&data, &prompt.model);

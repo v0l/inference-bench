@@ -25,6 +25,7 @@ INFERENCE_BENCH_API_KEYS=sk-local ./target/release/inference-bench-server \
 | `POST /v1/bench` | `{"model", "prompts": [...], "max_tokens", "repeat"}` returns per-run and summary stats (tokens/s, TTFT and decode p50/p95) |
 | `GET /health` | Always open |
 | `GET /metrics` | Prometheus text. Open unless `protect_metrics = true` |
+| `POST /load`, `POST /unload` | Load the default model (or `?model=ID`); unload it to give the GPU back. Unload is 409 while a request is running, `?wait=1` waits for them to finish |
 | `GET /admin/models`, `POST /admin/models/{id}/load`, `POST /admin/models/{id}/unload` | Model management (needs the API key when auth is on) |
 | `GET /admin/specs` | Spec sources, the last update check and where each spec came from. See `docs/specs-update.md` |
 
@@ -85,6 +86,34 @@ Each model runs one request at a time on the GPU; `max_concurrent` above 1 queue
 ## Metrics
 
 `inference_requests_total{endpoint,status}`, `inference_prompt_tokens_total{model}`, `inference_completion_tokens_total{model}`, `inference_ttft_seconds` (histogram), `inference_decode_tokens_per_second{window="last|mean"}`, `inference_queue_depth`, `inference_in_flight`, `inference_models_loaded`, `inference_model_vram_bytes{model}`, `inference_gpu_memory_used_bytes` (from `nvidia-smi`, falling back to the CUDA driver's free/total memory where nvidia-smi reports N/A, as on the GB10), `inference_requests_cancelled_total`, model load, failure and unload counters, `inference_specs_checks_total{result="updated|unchanged|failed"}` and `inference_specs_last_success_timestamp_seconds`.
+
+`vllm:` series sit beside ours so vLLM Grafana dashboards work, labelled `engine="0",model_name=...`: `vllm:num_requests_running`, `vllm:num_requests_waiting`, `vllm:kv_cache_usage_perc`, `vllm:num_preemptions_total`, `vllm:prompt_tokens_total`, `vllm:generation_tokens_total`, `vllm:request_success_total{finished_reason}`, `vllm:time_to_first_token_seconds` and `vllm:inter_token_latency_seconds` (histograms), `vllm:request_queue_time_seconds`, `vllm:prefix_cache_queries_total`, `vllm:prefix_cache_hits_total`, `vllm:spec_decode_num_draft_tokens_total` and `vllm:spec_decode_num_accepted_tokens_total`. The vLLM series with no counterpart (per-request token histograms, e2e latency, iteration tokens) are not emitted.
+
+## Sharing the GPU
+
+For running beside vLLM or other GPU jobs, in the server config:
+
+| Key | Effect |
+| --- | --- |
+| `idle_unload_secs` | Unload a model after this many idle seconds. Works in the app too: the app engine is released (`suspended`) and the next request reloads it with the same settings |
+| `lazy_load = true` | Ignore `preload`: load on the first request |
+| `min_free_vram_mib` | Refuse a load with 503 and `Retry-After` (`retry_after_secs`) while the GPU has less free than this. A loaded model keeps serving |
+| `before_load` | Shell command run before every load (`INFERENCE_BENCH_MODEL` is set); a non-zero exit refuses the load with 503. Use it to stop or wait for another job |
+
+`/health` has `status: "ok" | "loading" | "unloaded"` and `unloaded_models`; `/v1/models` entries carry `status: "loaded" | "loading" | "unloaded"`.
+
+## Launch and connect
+
+```sh
+inference-bench launch Qwen/Qwen3-0.6B --plan                  # what it would download and run, changes nothing
+inference-bench launch Qwen/Qwen3-0.6B --yes --no-tui          # download, load, serve, print addresses and key
+inference-bench launch crates/specrt/specs/qwen3-0.6b.toml --yes --access lan --detach --output json
+inference-bench launch --status                                # also --stop, --output json
+inference-bench connect claude-code --write                    # or codex, opencode, pi, agentbench; no app prints all
+inference-bench connect --check                                # one prompt and one tool call per app, exit 1 on a failure
+```
+
+`launch` uses the load dialog's estimate (`inference_bench_core::fit`, the same code the app calls), refuses a plan that does not fit unless `--force`, and with `--access lan` binds `0.0.0.0` and generates an API key. State is in `launch.json` in the data dir. `connect` takes the address and key from the launched server, or `--url` and `--api-key`; `--write` merges into the app's existing config and keeps a `.bak`. Claude Code is checked over `/v1/messages` and Codex over `/v1/responses`, the others over chat completions.
 
 ## App engine and the server tab
 

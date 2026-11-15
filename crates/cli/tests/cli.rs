@@ -279,3 +279,62 @@ fn kernels_rejects_an_unknown_target() {
     assert!(!o.status.success());
     assert!(String::from_utf8_lossy(&o.stderr).contains("sm_50"));
 }
+
+fn fixture_dir(name: &str) -> String {
+    format!("{}/../specrt/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+#[test]
+fn launch_plan_prints_the_fit_as_json_and_text_and_changes_nothing() {
+    let out = tmp("launch-plan");
+    let o = bin()
+        .args(["--out", out.to_str().unwrap(), "launch", &fixture_dir("tiny-qwen3.5"), "--plan", "--output", "json", "--assume-free-mib", "24576"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["source"], "disk");
+    assert_eq!(v["fits"], true);
+    assert_eq!(v["bind"], "127.0.0.1:8080");
+    assert_eq!(v["context"], 4096);
+    assert!(v["kv_cache_bytes"].as_u64().unwrap() > 0);
+    let o = bin()
+        .args(["--out", out.to_str().unwrap(), "launch", &fixture_dir("tiny-qwen3.5"), "--plan", "--access", "lan", "--assume-free-mib", "0"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&o.stdout);
+    assert!(text.contains("does not fit in free memory"), "{text}");
+    assert!(text.contains("0.0.0.0:8080 (LAN, API key required)"), "{text}");
+    assert!(!out.join("launch.json").exists());
+}
+
+#[test]
+fn launch_status_and_stop_report_nothing_running() {
+    let out = tmp("launch-status");
+    let o = bin().args(["--out", out.to_str().unwrap(), "launch", "--status", "--output", "json"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), r#"{"running":false}"#);
+    let o = bin().args(["--out", out.to_str().unwrap(), "launch", "--stop"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&o.stdout).contains("not running"));
+}
+
+#[test]
+fn launch_without_yes_refuses_to_start_on_a_script() {
+    let out = tmp("launch-noyes");
+    let o = bin().args(["--out", out.to_str().unwrap(), "launch", &fixture_dir("tiny-qwen3.5"), "--no-tui", "--assume-free-mib", "24576"]).output().unwrap();
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("--yes"));
+}
+
+#[test]
+fn connect_prints_a_config_for_every_app_and_check_reports_a_dead_server() {
+    let out = tmp("connect");
+    let o = bin().args(["--out", out.to_str().unwrap(), "connect", "pi", "--url", "http://127.0.0.1:9", "--model", "m"]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("\"baseUrl\": \"http://127.0.0.1:9/v1\""));
+    let o = bin().args(["--out", out.to_str().unwrap(), "connect", "codex", "--check", "--url", "http://127.0.0.1:9", "--model", "m", "--output", "json"]).output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v[0]["passed"], false);
+    let o = bin().args(["--out", out.to_str().unwrap(), "connect", "nope", "--url", "http://x", "--model", "m"]).output().unwrap();
+    assert!(!o.status.success());
+}

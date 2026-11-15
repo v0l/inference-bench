@@ -641,6 +641,20 @@ pub fn scan_hub(hub: &Path) -> Vec<LocalModel> {
     found
 }
 
+pub fn local_model_at(path: &Path) -> Option<LocalModel> {
+    let parent = path.parent().unwrap_or(path);
+    if path.extension().is_some_and(|e| e == "toml") {
+        return scan_specs(parent, &hub_dir()).into_iter().find(|m| m.path == path);
+    }
+    if path.is_dir() {
+        if let Some(m) = safetensors_model(path, "", parent) {
+            return Some(m);
+        }
+        return scan_folder(path).into_iter().next();
+    }
+    scan_folder(parent).into_iter().find(|m| m.path == path)
+}
+
 pub fn scan_folder(folder: &Path) -> Vec<LocalModel> {
     let mut found = Vec::new();
     gguf_models(folder, "", folder, &mut found);

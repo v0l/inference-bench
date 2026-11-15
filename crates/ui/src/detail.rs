@@ -50,52 +50,14 @@ impl View {
     }
 
     pub fn load(m: &LocalModel) -> Result<View, String> {
-        match m.format {
-            Format::Gguf => {
-                let g = specrt::gguf::Gguf::open(&m.path).map_err(|e| format!("{e:#}"))?;
-                let mut spec = g.spec().map_err(|e| format!("{e:#}"))?;
-                spec.name = m.name.clone();
-                Ok(View::new(&m.name, spec, Source::GgufMetadata, 0, m.context_length.map(|c| c as usize)))
-            }
-            Format::Spec => {
-                let mut spec = Spec::load(&m.path).map_err(|e| format!("{e:#}"))?;
-                let cfg = m.files.first().and_then(|f| f.parent()).map(|d| d.join("config.json"));
-                if let Some(text) = cfg.as_deref().and_then(|p| std::fs::read_to_string(p).ok()) {
-                    let _ = spec.complete_from_checkpoint_config(&text);
-                }
-                let (mtp, ctx) = cfg.as_deref().map(config_extras).unwrap_or((0, None));
-                let view = View::new(&m.name, spec, Source::SpecToml, mtp, ctx.or(m.context_length.map(|c| c as usize)));
-                Ok(with_header(view, m))
-            }
-            Format::Safetensors => {
-                let path = m.path.join("config.json");
-                let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-                let mut spec = Spec::describe_hf_config(&text).map_err(|e| format!("{e:#}"))?;
-                spec.name = m.name.clone();
-                spec.vision = specrt::vision::Vision::from_hf_config(&text).ok().flatten();
-                let (mtp, ctx) = config_extras(&path);
-                let mut view = View::new(&m.name, spec, Source::HfConfig, mtp, ctx.or(m.context_length.map(|c| c as usize)));
-                view.unread = specrt::spec::unread_hf_keys(&text);
-                Ok(with_header(view, m))
-            }
-        }
+        let d = inference_bench_core::fit::describe(m)?;
+        let source = match m.format {
+            Format::Gguf => Source::GgufMetadata,
+            Format::Spec => Source::SpecToml,
+            Format::Safetensors => Source::HfConfig,
+        };
+        Ok(View { name: m.name.clone(), spec: d.spec, anatomy: d.anatomy, source, structure: d.structure, unread: d.unread })
     }
-}
-
-fn with_header(view: View, m: &LocalModel) -> View {
-    match Structure::read(&m.files) {
-        Ok(structure) => view.with_structure(structure),
-        Err(_) => view,
-    }
-}
-
-fn config_extras(path: &Path) -> (usize, Option<usize>) {
-    let Some(v) = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else {
-        return (0, None);
-    };
-    let text = v.get("text_config").filter(|t| t.is_object()).unwrap_or(&v);
-    let mtp = text["mtp_num_hidden_layers"].as_u64().unwrap_or(0) as usize;
-    (mtp, text["max_position_embeddings"].as_u64().map(|c| c as usize))
 }
 
 pub struct Detail {

@@ -4,6 +4,7 @@ pub mod bench;
 pub mod chat;
 pub mod conversations;
 pub mod engine;
+pub mod fit;
 pub mod gpu;
 pub mod hf;
 pub mod settings;

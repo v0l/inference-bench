@@ -128,6 +128,15 @@ impl Hub {
         Ok(total)
     }
 
+    pub fn text(&self, repo: &str, file: &str) -> Result<String, String> {
+        let url = format!("{}/{repo}/resolve/main/{file}", self.base);
+        let mut resp = self.get(&url).call().map_err(|e| format!("{url}: {e}"))?;
+        if resp.status().as_u16() >= 400 {
+            return Err(format!("{url}: HTTP {}", resp.status()));
+        }
+        resp.body_mut().read_to_string().map_err(|e| format!("{url}: {e}"))
+    }
+
     pub fn files(&self, repo: &str) -> Result<Vec<RepoFile>, String> {
         let url = format!("{}/api/models/{repo}/tree/main", self.base);
         let mut resp = self.get(&url).query("recursive", "1").call().map_err(|e| format!("{url}: {e}"))?;

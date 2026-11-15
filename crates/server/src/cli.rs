@@ -109,11 +109,38 @@ impl ServeArgs {
     }
 }
 
+pub fn run_config(
+    config: ServerConfig,
+    preload: Option<crate::config::ModelConfig>,
+    on_ready: impl FnOnce(&crate::serve::ServerHandle) -> Result<()>,
+) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(async move {
+        let handle = Server::new(config).start().await?;
+        if let Some(model) = &preload {
+            let loaded = tokio::select! {
+                r = handle.state.manager.preload(model) => r.map_err(|e| anyhow::anyhow!("{}", e.message)),
+                r = shutdown_signal() => r.and_then(|_| Err(anyhow::anyhow!("stopped while loading"))),
+            };
+            if let Err(e) = loaded {
+                let _ = handle.stop().await;
+                return Err(e);
+            }
+        }
+        if let Err(e) = on_ready(&handle) {
+            let _ = handle.stop().await;
+            return Err(e);
+        }
+        shutdown_signal().await?;
+        handle.stop().await
+    })
+}
+
 async fn wait_forever() {
     std::future::pending::<()>().await
 }
 
-async fn shutdown_signal() -> Result<()> {
+pub async fn shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
