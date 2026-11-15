@@ -55,6 +55,19 @@ impl Default for FamilyAttention {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct FamilyNorm {
+    pub unit_offset: Option<bool>,
+    pub sandwich: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyEmbedding {
+    pub scale: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FamilyBlocks {
     pub kind: BlockKind,
     pub layer_types: std::collections::BTreeMap<String, crate::spec::Block>,
@@ -186,6 +199,10 @@ pub struct Family {
     pub attention: FamilyAttention,
     #[serde(default)]
     pub blocks: FamilyBlocks,
+    #[serde(default)]
+    pub norm: FamilyNorm,
+    #[serde(default)]
+    pub embedding: FamilyEmbedding,
     #[serde(default)]
     pub mtp: bool,
     #[serde(default)]

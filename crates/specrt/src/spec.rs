@@ -418,6 +418,10 @@ pub struct Dims {
     pub intermediate: usize,
     pub vocab: usize,
     pub tie_embeddings: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logit_softcap: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -501,6 +505,8 @@ pub struct Norm {
     pub eps: f64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub unit_offset: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandwich: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -518,6 +524,8 @@ pub struct Attention {
     pub rotary_dim: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub softcap: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_scalar: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -529,6 +537,8 @@ pub struct Rope {
     pub scaling: Option<RopeScaling>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mrope: Option<Mrope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_theta: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -636,7 +646,7 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
-    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "text_config", "quantization_config",
+    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "query_pre_attn_scalar", "text_config", "quantization_config",
 ];
 
 pub fn unread_hf_keys(json: &str) -> Vec<(String, String)> {
@@ -693,6 +703,8 @@ struct HfConfig {
     #[serde(default)]
     mtp_num_hidden_layers: usize,
     attn_logit_softcapping: Option<f64>,
+    final_logit_softcapping: Option<f64>,
+    query_pre_attn_scalar: Option<f64>,
 }
 
 fn layer_pattern(blocks_spec: &crate::family::FamilyBlocks, types: &[String], strict: bool) -> Result<Vec<Block>> {
@@ -1028,7 +1040,14 @@ impl Spec {
             Err(e) if strict => return Err(e),
             Err(_) => None,
         };
-        let theta = hf.rope_theta.or(param("rope_theta")).context("no rope_theta")?;
+        let by_block = |block: Block| {
+            let o = params?.as_object()?;
+            o.iter()
+                .find(|(k, v)| family.blocks.layer_types.get(*k) == Some(&block) && v.get("rope_theta").is_some())
+                .and_then(|(_, v)| v.get("rope_theta")?.as_f64())
+        };
+        let local_theta = by_block(Block::Sliding);
+        let theta = hf.rope_theta.or(param("rope_theta")).or(by_block(Block::Full)).context("no rope_theta")?;
         let mapped = hf.hidden_act.as_deref().and_then(|a| family.activation.map.get(a).copied());
         let activation = match (mapped, hf.hidden_act.as_deref(), strict) {
             (Some(a), _, _) => a,
@@ -1111,9 +1130,11 @@ impl Spec {
                 }).unwrap_or(0),
                 vocab: hf.vocab_size,
                 tie_embeddings: hf.tie_word_embeddings,
+                embed_scale: family.embedding.scale.as_deref().and_then(|s| (s == "sqrt_hidden").then(|| (hf.hidden_size as f64).sqrt())),
+                logit_softcap: hf.final_logit_softcapping,
             },
             layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.contains(&Block::Sliding)), pattern },
-            norm: Norm { kind: NormKind::Rmsnorm, eps: hf.rms_norm_eps, unit_offset: hybrid },
+            norm: Norm { kind: NormKind::Rmsnorm, eps: hf.rms_norm_eps, unit_offset: family.norm.unit_offset.unwrap_or(hybrid), sandwich: family.norm.sandwich },
             attention: Attention {
                 kind: AttentionKind::Gqa,
                 heads: hf.num_attention_heads,
@@ -1124,8 +1145,9 @@ impl Spec {
                 output_gate,
                 rotary_dim,
                 softcap: hf.attn_logit_softcapping,
+                query_scalar: hf.query_pre_attn_scalar,
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params) },
+            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta },
             mlp: Mlp {
                 activation,
                 quant: mlp_quant.map(|m| m.0),
