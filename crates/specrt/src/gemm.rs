@@ -190,6 +190,7 @@ impl GemmSet {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn tiles(&mut self, t: &kir::Target, names: &str, shape: GemmShape, wf: WeightFormat, split: bool, token_major: bool, tuning: &Tuning) -> Result<()> {
         let variants: &[Variant] = if t.language == kir::Language::Wgsl { &[Variant::Small] } else { &Variant::MMA };
         for &v in variants {

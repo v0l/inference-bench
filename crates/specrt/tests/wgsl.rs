@@ -434,6 +434,13 @@ fn the_kir_dequant_gemm_needs_shader_f16_and_is_built_from_the_same_builder() {
     assert!(qkv.source.starts_with("enable f16;"));
     let report = specrt::codegen::kernels_report(&spec(), &f16).unwrap();
     assert!(report.contains("== family DequantF16"), "{report}");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml");
+    let nvfp4 = Spec::load(&path).unwrap();
+    let report = specrt::codegen::kernels_report(&nvfp4, &f16).unwrap();
+    assert!(report.contains("gate_up_f4w ("), "{report}");
+    for block in ["BatchRowsMma", "BlockScaledFp4Mma", "Fp8ActMma", "Fp4Gemv"] {
+        assert!(report.contains(&format!("block {block} ")), "{block} not refused by name");
+    }
 }
 
 #[test]
