@@ -9,6 +9,7 @@ pub mod discovery;
 pub mod codegen;
 pub mod engine;
 pub mod executor;
+pub mod family;
 pub mod gguf;
 pub mod grammar;
 pub mod jit;
