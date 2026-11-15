@@ -11,6 +11,11 @@ pub const DEFAULT_CTX: usize = 2048;
 pub const UNTIL_FULL: usize = usize::MAX;
 
 pub fn model_max_context(spec: &Spec) -> Option<usize> {
+    let native = native_max_context(spec)?;
+    Some(native * spec.runtime.rope_extension.map_or(1, |e| e.factor.max(1) as usize))
+}
+
+pub fn native_max_context(spec: &Spec) -> Option<usize> {
     if spec.repo.ends_with(".gguf") {
         let g = crate::gguf::Gguf::open(Path::new(&spec.repo)).ok()?;
         return g.count(&format!("{}.context_length", g.architecture().ok()?));
@@ -23,6 +28,25 @@ pub fn model_max_context(spec: &Spec) -> Option<usize> {
 pub fn context_from_config(json: &str) -> Option<usize> {
     let v: Value = serde_json::from_str(json).ok()?;
     v["text_config"]["max_position_embeddings"].as_u64().or(v["max_position_embeddings"].as_u64()).map(|n| n as usize)
+}
+
+pub fn apply_rope_extension(spec: &Spec) -> Result<Spec> {
+    let mut s = spec.clone();
+    let Some(ext) = s.runtime.rope_extension.take().filter(|e| e.factor > 1) else {
+        return Ok(s);
+    };
+    anyhow::ensure!(s.rope.scaling.is_none(), "rope_extension cannot be applied: {} already declares rope scaling", s.name);
+    let native = native_max_context(spec).context("rope_extension needs the model's max_position_embeddings, which could not be read")?;
+    let factor = ext.factor as f64;
+    s.rope.scaling = Some(crate::spec::RopeScaling {
+        kind: crate::spec::RopeScalingKind::Yarn,
+        factor,
+        low_freq_factor: None,
+        high_freq_factor: None,
+        original_max_positions: Some(native as f64),
+        yarn: Some(crate::spec::Yarn { beta_fast: 32.0, beta_slow: 1.0, attention_factor: crate::spec::yarn_mscale(factor, 1.0), truncate: true }),
+    });
+    Ok(s)
 }
 
 pub fn limit_context(requested: usize, model_max: Option<usize>) -> Result<usize> {

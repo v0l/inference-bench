@@ -766,7 +766,7 @@ impl Runtime {
     }
 
     pub fn load_stage(spec: &Spec, layout: Layout, range: StageRange) -> Result<Self> {
-        let resolved = spec.with_env_overrides();
+        let resolved = crate::engine::apply_rope_extension(&spec.with_env_overrides())?;
         range.check(&resolved)?;
         let role = StageRole::of(&resolved, range);
         let staged = if role.whole() { resolved.clone() } else { resolved.stage(range.start, range.end) };

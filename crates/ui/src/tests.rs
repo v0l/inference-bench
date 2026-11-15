@@ -1650,3 +1650,40 @@ fn screenshots_of_the_load_dialog_with_advanced_folded_and_open() {
         h.render().unwrap().save(out.join(file)).unwrap();
     }
 }
+
+#[test]
+fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_cache() {
+    let mut h = harness("extension", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    let d = dir("ext-27b");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), d.join("config.json")).unwrap();
+    let mut m = model("Qwen3.8-27B", true, "dense decoder");
+    (m.path, m.root) = (d.clone(), d);
+    m.context_length = None;
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    let dialog = h.state_mut().load.as_mut().unwrap();
+    assert_eq!(dialog.max, 262144);
+    dialog.choice.set("runtime.rope_extension.factor", serde_json::json!(4));
+    dialog.sync();
+    assert_eq!(dialog.max, 1_048_576);
+    dialog.ctx = dialog.max;
+    dialog.seqs = 1;
+    let kv = dialog.estimate(Some(96 << 30)).unwrap().kv;
+    let gib = kv as f64 / (1u64 << 30) as f64;
+    assert!((60.0..=70.0).contains(&gib), "bf16 kv at 1M is {gib} GiB");
+    dialog.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
+    dialog.sync();
+    let fp8 = dialog.estimate(Some(96 << 30)).unwrap().kv as f64 / (1u64 << 30) as f64;
+    assert!(fp8 < gib * 0.6, "fp8 kv {fp8} GiB vs {gib}");
+    let fits_big = dialog.can_load(Some(96 << 30));
+    let fits_small = dialog.can_load(Some(40 << 30));
+    assert!(fits_big && !fits_small);
+    assert_eq!(dialog.serve_options().unwrap().runtime.unwrap().rope_extension.unwrap().factor, 4);
+    dialog.choice.reset("runtime.rope_extension.factor");
+    dialog.sync();
+    assert_eq!(dialog.max, 262144);
+    assert_eq!(dialog.ctx, 262144);
+}

@@ -126,6 +126,8 @@ pub struct RuntimeOptions {
     pub gemm_fp32: bool,
     pub kv_dtype: KvDtype,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rope_extension: Option<RopeExtension>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "PrefixCacheOptions::is_default")]
     pub prefix_cache: PrefixCacheOptions,
@@ -133,6 +135,28 @@ pub struct RuntimeOptions {
     pub loader: crate::loader::LoaderOptions,
     #[serde(skip_serializing_if = "VisionOptions::is_default")]
     pub vision: VisionOptions,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RopeExtensionKind {
+    #[default]
+    Yarn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RopeExtension {
+    #[serde(default, rename = "type")]
+    pub kind: RopeExtensionKind,
+    #[serde(default = "RopeExtension::no_factor")]
+    pub factor: u32,
+}
+
+impl RopeExtension {
+    fn no_factor() -> u32 {
+        1
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,7 +213,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 
@@ -204,6 +228,7 @@ impl RuntimeOptions {
         ensure!(self.vision.max_batch >= 1, "[runtime.vision] max_batch needs at least 1");
         ensure!(self.fp4_stages.is_none_or(|n| n >= 2), "[runtime] fp4_stages needs at least 2");
         ensure!(self.prefill_chunk.is_none_or(|n| n >= 64), "[runtime] prefill_chunk needs at least 64 tokens");
+        ensure!(self.rope_extension.is_none_or(|e| e.factor >= 1), "[runtime] rope_extension factor must be at least 1");
         for (key, tile) in [("big_tile", self.big_tile), ("fp4_tile", self.fp4_tile)] {
             if let Some([bm, bn, wm, wn]) = tile {
                 ensure!(

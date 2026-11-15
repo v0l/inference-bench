@@ -80,7 +80,14 @@ impl Default for ServeOptions {
 
 impl ServeOptions {
     pub fn model_len(&self, spec: &Spec) -> Result<usize> {
-        let model_max = crate::engine::model_max_context(spec);
+        let model_max = match &self.runtime {
+            Some(r) if r.rope_extension != spec.runtime.rope_extension => {
+                let mut s = spec.clone();
+                s.runtime.rope_extension = r.rope_extension;
+                crate::engine::model_max_context(&s)
+            }
+            _ => crate::engine::model_max_context(spec),
+        };
         match self.max_model_len {
             Some(n) => crate::engine::limit_context(n, model_max),
             None => Ok(model_max.unwrap_or(crate::engine::DEFAULT_CTX)),

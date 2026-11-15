@@ -1,6 +1,6 @@
 use crate::loader::LoaderOptions;
 use crate::serve::{ServeOptions, SpeculativeOptions};
-use crate::spec::{BackendChoice, KvDtype, PrefixCacheOptions, Quant, RuntimeOptions, TileChoice};
+use crate::spec::{BackendChoice, KvDtype, PrefixCacheOptions, Quant, RopeExtension, RuntimeOptions, TileChoice};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -258,6 +258,8 @@ const META: &[Meta] = &[
     Meta { key: "runtime.vision.cache_mb", label: "vision cache", group: Group::Runtime, help: "Host memory for encoded images, keyed by the image bytes, so a repeated image is not encoded again. 0 turns it off.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "runtime.vision.max_batch", label: "vision batch", group: Group::Runtime, help: "Images encoded together in one pass of the image encoder.", choices: &[], range: (1, 64) },
     Meta { key: "runtime.kv_dtype", label: "kv cache type", group: Group::Runtime, help: "Precision of the KV cache. fp8 stores one byte per value with a scale per head and token, halving KV memory and attention reads against f16.", choices: &["f16", "fp8"], range: (0, 0) },
+    Meta { key: "runtime.rope_extension.type", label: "context extension", group: Group::Runtime, help: "How the context is stretched past what the model was trained on. YaRN changes short context numerics slightly, so leave it off unless you need the length.", choices: &["yarn"], range: (0, 0) },
+    Meta { key: "runtime.rope_extension.factor", label: "extension factor", group: Group::Runtime, help: "Multiplies the model's own maximum context, so 4 takes 262144 tokens to 1048576. 1 or auto keeps the trained length.", choices: &[], range: (1, 16) },
     Meta { key: "runtime.cache_dir", label: "kernel cache", group: Group::Runtime, help: "Where compiled kernels are kept. Auto uses the user cache folder.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.loader.enabled", label: "fast loader", group: Group::Loader, help: "Read weights with parallel readers straight to the card.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.loader.direct", label: "direct reads", group: Group::Loader, help: "Bypass the page cache with O_DIRECT reads.", choices: &[], range: (0, 0) },
@@ -303,6 +305,7 @@ fn populated_runtime() -> RuntimeOptions {
         unsplit: vec!["x".into()],
         gemm_fp32: true,
         kv_dtype: KvDtype::Fp8,
+        rope_extension: Some(RopeExtension { kind: crate::spec::RopeExtensionKind::Yarn, factor: 4 }),
         cache_dir: Some("x".into()),
         prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: 16, max_snapshots: 1, max_blocks: 1, async_snapshots: true },
         loader: LoaderOptions { enabled: true, direct: true, chunk_mb: 1, readers: 1, ahead: 1, workers: 1, lanes: 1, skip_cached: true, pinned: true, host_budget_mb: 64 },

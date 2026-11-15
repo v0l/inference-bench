@@ -299,6 +299,7 @@ impl ServerConfig {
         }
         if let Some(r) = &self.runtime {
             r.prefix_cache.validate()?;
+            anyhow::ensure!(r.rope_extension.is_none_or(|e| e.factor >= 1), "[runtime] rope_extension factor must be at least 1");
         }
         if let Some(d) = &self.default_model {
             anyhow::ensure!(self.model(d).is_some(), "default_model {d} is not a configured model");
@@ -485,6 +486,15 @@ python = "python3"
         let e = ServerConfig::parse("[runtime]\ntile = \"huge\"").unwrap_err();
         assert!(format!("{e:#}").contains("huge"), "{e:#}");
         assert!(ServerConfig::parse("[runtime]\nbogus = 1").is_err());
+    }
+
+    #[test]
+    fn the_rope_extension_reaches_the_serving_options_and_lifts_the_context_limit() {
+        let c = ServerConfig::parse("max_num_seqs = 1\nmax_model_len = 1048576\n[runtime]\nrope_extension = { type = \"yarn\", factor = 4 }\n[[models]]\nid='m'").unwrap();
+        let o = c.serve_options(&c.models[0]).unwrap();
+        assert_eq!(o.runtime.unwrap().rope_extension.unwrap().factor, 4);
+        assert!(ServerConfig::parse("[runtime]\nrope_extension = { type = \"ntk\", factor = 4 }").is_err());
+        assert!(ServerConfig::parse("[runtime]\nrope_extension = { factor = 0 }").is_err());
     }
 
     #[test]
