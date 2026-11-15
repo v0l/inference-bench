@@ -56,8 +56,6 @@ out = "xn_planes"
 - Residual plus norm through the fused `add_rmsnorm` in the existing dense block (the GEMM
   residual epilogue already fuses the add; a fused kernel needs a GEMM without that epilogue).
 - MTP and vision are still driven by their own runtimes, not graph nodes.
-- Gemma 3 serves through the plan paths (prefill, batch decode); the single-sequence `generate`
-  decode loop (`step_traced`) is still fixed code and does not know sandwich norms.
 
 ## Prior art
 
