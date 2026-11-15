@@ -1,0 +1,43 @@
+{
+  "name": "llama",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 2048,
+    "intermediate": 8192,
+    "vocab": 128256,
+    "tie_embeddings": true
+  },
+  "layers": {
+    "count": 16,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 32,
+    "kv_heads": 8,
+    "head_dim": 64,
+    "qkv_bias": true,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 500000.0,
+    "scaling": {
+      "kind": "llama3",
+      "factor": 32.0,
+      "low_freq_factor": 1.0,
+      "high_freq_factor": 4.0,
+      "original_max_positions": 8192.0
+    }
+  },
+  "mlp": {
+    "activation": "swiglu"
+  }
+}

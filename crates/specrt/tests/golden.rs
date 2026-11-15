@@ -34,7 +34,7 @@ fn config_files() -> Vec<(String, PathBuf)> {
 fn render(result: anyhow::Result<Spec>) -> String {
     match result {
         Ok(spec) => serde_json::to_string_pretty(&spec).unwrap(),
-        Err(_) => "refused\n".to_string(),
+        Err(e) => format!("refused: {e:#}\n"),
     }
 }
 
@@ -47,6 +47,58 @@ fn check(name: &str, text: String) {
     }
     let want = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{} is missing, run with GOLDEN_UPDATE=1", path.display()));
     assert_eq!(want, text, "{name}");
+}
+
+fn variants() -> Vec<(String, String)> {
+    let read = |f: &str| serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(fixtures().join(f)).unwrap()).unwrap();
+    let mut out = Vec::new();
+    let mut add = |name: &str, base: &str, edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut v = read(base);
+        edit(&mut v);
+        out.push((name.to_string(), v.to_string()));
+    };
+    use serde_json::json;
+    add("v-qwen3-next", "qwen3.8-27b.config.json", &|v| v["model_type"] = json!("qwen3_next"));
+    add("v-qwen3-moe-dense", "qwen3-0.6b.config.json", &|v| v["model_type"] = json!("qwen3_moe"));
+    add("v-qwen3-bias", "qwen3-0.6b.config.json", &|v| v["attention_bias"] = json!(true));
+    add("v-llama-bias", "llama-3.2-1b.config.json", &|v| v["attention_bias"] = json!(true));
+    add("v-qwen2-no-bias-key", "qwen2.5-0.5b.config.json", &|v| { v.as_object_mut().unwrap().remove("attention_bias"); });
+    add("v-weird", "qwen3-0.6b.config.json", &|v| v["model_type"] = json!("weird"));
+    add("v-gelu", "qwen3-0.6b.config.json", &|v| v["hidden_act"] = json!("gelu_pytorch_tanh"));
+    add("v-relu2", "qwen3-0.6b.config.json", &|v| v["hidden_act"] = json!("relu2"));
+    add("v-no-act", "qwen3-0.6b.config.json", &|v| { v.as_object_mut().unwrap().remove("hidden_act"); });
+    add("v-int8", "qwen3-0.6b.config.json", &|v| v["torch_dtype"] = json!("int8"));
+    add("v-f16", "qwen3-0.6b.config.json", &|v| v["torch_dtype"] = json!("float16"));
+    add("v-linear-rope", "llama-3.2-1b.config.json", &|v| v["rope_scaling"] = json!({"type": "linear", "factor": 4.0}));
+    add("v-bad-rope", "llama-3.2-1b.config.json", &|v| v["rope_scaling"] = json!({"type": "yarn", "factor": 4.0}));
+    add("v-fp8-block", "qwen3-0.6b.config.json", &|v| v["quantization_config"] = json!({"quant_method": "fp8", "fmt": "e4m3", "weight_block_size": [128, 128]}));
+    add("v-gptq", "qwen3-0.6b.config.json", &|v| v["quantization_config"] = json!({"quant_method": "gptq", "bits": 4}));
+    add("v-no-intermediate", "qwen3-0.6b.config.json", &|v| { v.as_object_mut().unwrap().remove("intermediate_size"); });
+    add("v-no-kv-heads", "qwen3-0.6b.config.json", &|v| { v.as_object_mut().unwrap().remove("num_key_value_heads"); });
+    add("v-no-head-dim", "qwen3-0.6b.config.json", &|v| { v.as_object_mut().unwrap().remove("head_dim"); });
+    add("v-no-theta", "qwen3-0.6b.config.json", &|v| { v.as_object_mut().unwrap().remove("rope_theta"); });
+    add("v-27b-no-mtp", "qwen3.8-27b-nvfp4.config.json", &|v| v["text_config"]["mtp_num_hidden_layers"] = json!(0));
+    add("v-27b-sliding", "qwen3.8-27b.config.json", &|v| v["text_config"]["layer_types"][1] = json!("sliding_attention"));
+    add("v-27b-no-layer-types", "qwen3.8-27b.config.json", &|v| { v["text_config"].as_object_mut().unwrap().remove("layer_types"); v["text_config"]["full_attention_interval"] = json!(4); });
+    add("v-27b-no-vision", "qwen3.8-27b.multimodal.json", &|v| v["language_model_only"] = json!(true));
+    add("v-nvfp4-no-act", "qwen3.8-27b-nvfp4.config.json", &|v| {
+        for g in ["group_0", "group_1"] {
+            v["quantization_config"]["config_groups"][g]["input_activations"] = serde_json::Value::Null;
+        }
+    });
+    add("v-nvfp4-group32", "qwen3.8-27b-nvfp4.config.json", &|v| v["quantization_config"]["config_groups"]["group_1"]["weights"]["group_size"] = json!(32));
+    add("v-partial-rotary-top", "qwen3-0.6b.config.json", &|v| v["partial_rotary_factor"] = json!(0.5));
+    add("v-top-level-qwen3_5", "tiny-qwen3.5/config.json", &|v| v["model_type"] = json!("qwen3_5_text"));
+    out
+}
+
+#[test]
+fn every_variant_builds_the_spec_master_built() {
+    for (name, json) in variants() {
+        check(&format!("{name}.serving.json"), render(Spec::from_hf_config_serving(&json)));
+        check(&format!("{name}.plain.json"), render(Spec::from_hf_config(&json)));
+        check(&format!("{name}.describe.json"), render(Spec::describe_hf_config(&json)));
+    }
 }
 
 #[test]

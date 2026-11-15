@@ -1,0 +1,1 @@
+refused: compressed-tensors group group_1 is not supported (fp8 per-channel and nvfp4 group 16 are)

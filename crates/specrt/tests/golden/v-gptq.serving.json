@@ -1,0 +1,1 @@
+refused: quantization {"quant_method":"gptq","bits":4} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are)

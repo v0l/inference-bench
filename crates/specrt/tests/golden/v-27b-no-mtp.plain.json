@@ -1,0 +1,81 @@
+{
+  "name": "qwen3_5",
+  "repo": "",
+  "quant": "fp8_channel",
+  "dims": {
+    "hidden": 5120,
+    "intermediate": 17408,
+    "vocab": 248320,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 64,
+    "pattern": [
+      "linear",
+      "linear",
+      "linear",
+      "full"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6,
+    "unit_offset": true
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 24,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "qkv_bias": false,
+    "qk_norm": true,
+    "output_gate": true,
+    "rotary_dim": 64
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000000.0,
+    "mrope": {
+      "section": [
+        11,
+        11,
+        10
+      ],
+      "interleaved": true
+    }
+  },
+  "mlp": {
+    "activation": "swiglu",
+    "quant": "nvfp4_g16",
+    "quant_until": 56
+  },
+  "linear_attention": {
+    "kind": "gated_delta_net",
+    "key_heads": 16,
+    "value_heads": 48,
+    "key_head_dim": 128,
+    "value_head_dim": 128,
+    "conv_kernel": 4
+  },
+  "vision": {
+    "config": {
+      "depth": 27,
+      "hidden_size": 1152,
+      "intermediate_size": 4304,
+      "num_heads": 16,
+      "patch_size": 16,
+      "spatial_merge_size": 2,
+      "temporal_patch_size": 2,
+      "out_hidden_size": 5120,
+      "num_position_embeddings": 2304,
+      "in_channels": 3,
+      "hidden_act": "gelu_pytorch_tanh"
+    },
+    "tokens": {
+      "image": 248056,
+      "video": 248057,
+      "start": 248053,
+      "end": 248054
+    }
+  }
+}
