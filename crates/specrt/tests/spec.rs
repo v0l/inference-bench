@@ -221,15 +221,35 @@ fn compressed_tensors_nvfp4_checkpoint_derives_fp8_channel_with_nvfp4_mlps_until
     assert_eq!(spec.mlp_quant(63), Quant::Fp8Channel);
     assert_eq!(Spec::parse(&spec.to_toml().unwrap()).unwrap(), spec);
     assert_eq!(spec.rope.mrope, Some(specrt::spec::Mrope { section: [11, 11, 10], interleaved: true }));
+    assert_eq!(spec.act_quant, specrt::spec::ActQuant::Fp8);
+    assert_eq!(spec.mlp.act_quant, specrt::spec::ActQuant::Fp4);
+    let served = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap();
     let file = Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap();
     spec.rope.mrope = None;
     spec.vision = None;
+    spec.name = served.name.clone();
+    spec.repo = served.repo.clone();
+    spec.min_engine = served.min_engine;
+    spec.runtime = served.runtime.clone();
+    assert_eq!(served, spec);
     spec.name = file.name.clone();
-    spec.repo = file.repo.clone();
-    spec.min_engine = file.min_engine;
+    spec.act_quant = specrt::spec::ActQuant::None;
+    spec.mlp.act_quant = specrt::spec::ActQuant::None;
+    spec.runtime = file.runtime.clone();
     assert_eq!(file, spec);
     assert_eq!(file.min_engine, 7);
     assert_eq!(file.mtp, Some(specrt::spec::Mtp::new(1)));
+}
+
+#[test]
+fn compressed_tensors_checkpoint_without_dynamic_input_activations_derives_weight_only() {
+    let mut v = nvfp4_config();
+    for g in ["group_0", "group_1"] {
+        v["quantization_config"]["config_groups"][g]["input_activations"] = serde_json::Value::Null;
+    }
+    let spec = Spec::from_hf_config(&v.to_string()).unwrap();
+    assert_eq!(spec.act_quant, specrt::spec::ActQuant::None);
+    assert_eq!(spec.mlp.act_quant, specrt::spec::ActQuant::None);
 }
 
 fn nvfp4_config() -> serde_json::Value {

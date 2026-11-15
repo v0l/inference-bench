@@ -593,6 +593,27 @@ fn layer_pattern(types: &[String], strict: bool) -> Result<Vec<Block>> {
 pub struct Quantization {
     pub quant: Quant,
     pub mlp: Option<(Quant, Option<usize>)>,
+    pub act: ActQuant,
+    pub mlp_act: ActQuant,
+}
+
+impl Quantization {
+    fn weights(quant: Quant) -> Self {
+        Quantization { quant, mlp: None, act: ActQuant::None, mlp_act: ActQuant::None }
+    }
+}
+
+fn compressed_act(g: &serde_json::Value) -> ActQuant {
+    let a = &g["input_activations"];
+    let bits = a.get("num_bits").and_then(|b| b.as_u64());
+    let strategy = a.get("strategy").and_then(|s| s.as_str());
+    let float = a.get("type").and_then(|t| t.as_str()) == Some("float");
+    let dynamic = a.get("dynamic").is_some_and(|d| d.as_bool() == Some(true) || d.as_str() == Some("local"));
+    match (float && dynamic, bits, strategy, a.get("group_size").and_then(|g| g.as_u64())) {
+        (true, Some(8), Some("token"), _) => ActQuant::Fp8,
+        (true, Some(4), Some("tensor_group"), Some(16)) => ActQuant::Fp4,
+        _ => ActQuant::None,
+    }
 }
 
 fn compressed_group(name: &str, g: &serde_json::Value) -> Result<Quant> {
@@ -625,15 +646,20 @@ fn target_slot(target: &str) -> Result<(usize, bool)> {
 fn parse_compressed(q: &serde_json::Value, layers: usize) -> Result<Quantization> {
     let groups = q["config_groups"].as_object().context("compressed-tensors config has no config_groups")?;
     let mut projection: Option<Quant> = None;
+    let mut act = ActQuant::None;
+    let mut mlp_act = ActQuant::None;
     let mut mlp: Vec<Option<Quant>> = vec![None; layers];
     if groups.len() == 1 {
         let (name, g) = groups.iter().next().unwrap();
         if g["targets"].as_array().is_some_and(|t| t.len() == 1 && t[0].as_str() == Some("Linear")) {
-            return Ok(Quantization { quant: compressed_group(name, g)?, mlp: None });
+            let quant = compressed_group(name, g)?;
+            let act = if quant.is_fp8() { compressed_act(g) } else { ActQuant::None };
+            return Ok(Quantization { quant, mlp: None, act, mlp_act: ActQuant::None });
         }
     }
     for (name, g) in groups {
         let quant = compressed_group(name, g)?;
+        let group_act = compressed_act(g);
         for t in g["targets"].as_array().context("group without targets")? {
             let t = t.as_str().context("target is not a string")?;
             let (layer, is_mlp) = target_slot(t)?;
@@ -641,9 +667,13 @@ fn parse_compressed(q: &serde_json::Value, layers: usize) -> Result<Quantization
             if is_mlp {
                 ensure!(mlp[layer].is_none_or(|m| m == quant), "{t} is in two groups");
                 mlp[layer] = Some(quant);
+                if quant == Quant::Nvfp4G16 {
+                    mlp_act = group_act;
+                }
             } else {
                 ensure!(projection.is_none_or(|p| p == quant), "attention projections mix {projection:?} and {quant:?}");
                 projection = Some(quant);
+                act = group_act;
             }
         }
     }
@@ -661,12 +691,14 @@ fn parse_compressed(q: &serde_json::Value, layers: usize) -> Result<Quantization
         "MLP quantisation must be one kind for the first layers and the projection kind after them"
     );
     let mlp = (first != quant).then_some((first, (until < layers).then_some(until)));
-    Ok(Quantization { quant, mlp })
+    let act = if quant.is_fp8() { act } else { ActQuant::None };
+    let mlp_act = if mlp.is_some_and(|m| m.0 == Quant::Nvfp4G16) && mlp_act == ActQuant::Fp4 { ActQuant::Fp4 } else { ActQuant::None };
+    Ok(Quantization { quant, mlp, act, mlp_act })
 }
 
 fn parse_quantization(value: Option<&serde_json::Value>, layers: usize) -> Result<Quantization> {
     let Some(q) = value.filter(|v| !v.is_null()) else {
-        return Ok(Quantization { quant: Quant::Bf16, mlp: None });
+        return Ok(Quantization::weights(Quant::Bf16));
     };
     let method = q.get("quant_method").and_then(|m| m.as_str()).unwrap_or("");
     if method == "compressed-tensors" {
@@ -678,7 +710,7 @@ fn parse_quantization(value: Option<&serde_json::Value>, layers: usize) -> Resul
         .and_then(|b| b.as_array())
         .map(|b| b.iter().filter_map(|x| x.as_u64()).collect());
     match (method, fmt, block.as_deref()) {
-        ("fp8", "e4m3", Some([128, 128])) => Ok(Quantization { quant: Quant::Fp8Block128, mlp: None }),
+        ("fp8", "e4m3", Some([128, 128])) => Ok(Quantization::weights(Quant::Fp8Block128)),
         _ => bail!("quantization {q} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are)"),
     }
 }
@@ -818,10 +850,10 @@ impl Spec {
             }
         })?;
         let quantization = parse_quantization(quant_config.as_ref(), hf.num_hidden_layers);
-        let Quantization { quant, mlp: mlp_quant } = match (quantization, strict) {
+        let Quantization { quant, mlp: mlp_quant, act, mlp_act } = match (quantization, strict) {
             (Ok(q), _) => q,
             (Err(e), true) => return Err(e),
-            (Err(_), false) => Quantization { quant: Quant::Bf16, mlp: None },
+            (Err(_), false) => Quantization::weights(Quant::Bf16),
         };
         let nested = hf
             .rope_parameters
@@ -913,7 +945,7 @@ impl Spec {
             repo: String::new(),
             quant,
             head_quant: None,
-            act_quant: ActQuant::None,
+            act_quant: act,
             dims: Dims {
                 hidden: hf.hidden_size,
                 intermediate: hf.intermediate_size.unwrap_or(0),
@@ -937,7 +969,7 @@ impl Spec {
                 activation,
                 quant: mlp_quant.map(|m| m.0),
                 quant_until: mlp_quant.and_then(|m| m.1),
-                act_quant: ActQuant::None,
+                act_quant: mlp_act,
             },
             moe,
             mtp: (hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
