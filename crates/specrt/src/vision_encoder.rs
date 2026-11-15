@@ -3,13 +3,24 @@ use crate::jit::Jit;
 use crate::vision::{Patches, VisionConfig};
 use crate::weights::{Checkpoint, bf16_to_f32};
 use anyhow::{Context, Result, bail, ensure};
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub const VISION_TEMPLATE: &str = include_str!("../templates/vision.cu");
 
-const KERNELS: &[&str] = &["vis_gemm", "vis_layernorm", "vis_rope", "vis_attention"];
+const KERNELS: &[&str] = &["vis_mma", "vis_split", "vis_layernorm", "vis_pos", "vis_rope_pack", "vis_flash", "vis_to_f16"];
+const GEMM_BM: u32 = 128;
+const GEMM_BN: u32 = 128;
+const GEMM_THREADS: u32 = 256;
+const GEMM_SMEM: u32 = 3 * (128 * 64 * 2 + 128 * 64 * 2);
+const FLASH_BQ: u32 = 128;
+const FLASH_THREADS: u32 = 256;
+
+fn flash_smem(head_dim: usize) -> u32 {
+    let stride = head_pad(head_dim) + 8;
+    (2 * 128 * stride * 2).max(2 * 4 * 32 * stride * 2) as u32
+}
 pub const MAX_ENCODE_PATCHES: usize = 32768;
 
 const LAYERNORM_EPS: f32 = 1e-6;
@@ -120,17 +131,27 @@ struct Merger {
 
 pub struct VisionEncoder {
     stream: Arc<CudaStream>,
-    gemm: CudaFunction,
+    mma: CudaFunction,
+    split: CudaFunction,
     layernorm: CudaFunction,
-    rope: CudaFunction,
-    attention: CudaFunction,
+    pos: CudaFunction,
+    rope_pack: CudaFunction,
+    flash: CudaFunction,
     cfg: VisionConfig,
     act: Act,
     patch: Linear,
-    pos_embed: Vec<f32>,
+    pos_embed: CudaSlice<f32>,
     blocks: Vec<Block>,
     merger: Merger,
     deepstack: Vec<Merger>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VisionPrecision {
+    #[default]
+    Fast,
+    Exact,
 }
 
 pub struct VisionOutput {
@@ -139,8 +160,32 @@ pub struct VisionOutput {
     pub tokens: usize,
 }
 
-fn module() -> Module {
-    Module { source: VISION_TEMPLATE.to_string(), kernels: KERNELS.to_vec(), smem: BTreeMap::new(), arch_features: false, kir_hash: String::new() }
+struct Planes {
+    hi: CudaSlice<u16>,
+    lo: CudaSlice<u16>,
+}
+
+impl Planes {
+    fn new(s: &Arc<CudaStream>, n: usize) -> Result<Self> {
+        Ok(Planes { hi: unsafe { s.alloc::<u16>(n) }?, lo: unsafe { s.alloc::<u16>(n) }? })
+    }
+}
+
+enum Out<'a> {
+    Store(&'a mut CudaSlice<f32>),
+    AddInPlace(&'a mut CudaSlice<f32>),
+    Split(&'a mut Planes),
+}
+
+fn head_pad(head_dim: usize) -> usize {
+    head_dim.div_ceil(16) * 16
+}
+
+fn module(head_dim: usize, precise: bool) -> Result<Module> {
+    let flag = |on: bool| if on { "true" } else { "false" }.to_string();
+    let vars = BTreeMap::from([("VIS_HDP", head_pad(head_dim).to_string()), ("VIS_GEMM_SPLIT", flag(precise)), ("VIS_ATT_SPLIT", flag(precise))]);
+    let source = crate::codegen::render(VISION_TEMPLATE, &vars)?;
+    Ok(Module { source, kernels: KERNELS.to_vec(), smem: BTreeMap::new(), arch_features: false, kir_hash: String::new() })
 }
 
 fn prefix(ck: &Checkpoint) -> Result<&'static str> {
@@ -158,6 +203,7 @@ fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, name: &str, shape: &[usize]
 }
 
 fn linear(stream: &Arc<CudaStream>, ck: &Checkpoint, base: &str, rows: usize, cols: usize) -> Result<Linear> {
+    ensure!(cols % 8 == 0 && rows % 2 == 0, "{base}: {rows}x{cols} is not a multiple of the mma tile steps");
     Ok(Linear {
         w: upload(stream, ck, &format!("{base}.weight"), &[rows, cols])?,
         b: upload(stream, ck, &format!("{base}.bias"), &[rows])?,
@@ -203,19 +249,30 @@ fn axis_taps(index: usize, size: usize, side: usize) -> [(usize, f32); 2] {
     [(lo, (1.0 - (src - floor)).max(0.0)), (hi, (1.0 - (floor + 1.0 - src).abs()).max(0.0))]
 }
 
-pub fn interpolated_positions(table: &[f32], hidden: usize, side: usize, grid: [usize; 3], merge: usize) -> Vec<f32> {
+pub fn position_taps(side: usize, grid: [usize; 3], merge: usize) -> (Vec<i32>, Vec<f32>) {
     let [_, h, w] = grid;
     let ids = position_ids(grid, merge);
-    let mut out = vec![0f32; ids.len() * hidden];
-    for (i, &(row, col)) in ids.iter().enumerate() {
-        let dst = &mut out[i * hidden..(i + 1) * hidden];
+    let mut taps = Vec::with_capacity(ids.len() * 4);
+    let mut weights = Vec::with_capacity(ids.len() * 4);
+    for &(row, col) in &ids {
         for (ri, rw) in axis_taps(row, h, side) {
             for (ci, cw) in axis_taps(col, w, side) {
-                let weight = rw * cw;
-                let src = &table[(ri * side + ci) * hidden..(ri * side + ci + 1) * hidden];
-                for (d, s) in dst.iter_mut().zip(src) {
-                    *d += weight * s;
-                }
+                taps.push((ri * side + ci) as i32);
+                weights.push(rw * cw);
+            }
+        }
+    }
+    (taps, weights)
+}
+
+pub fn interpolated_positions(table: &[f32], hidden: usize, side: usize, grid: [usize; 3], merge: usize) -> Vec<f32> {
+    let (taps, weights) = position_taps(side, grid, merge);
+    let mut out = vec![0f32; taps.len() / 4 * hidden];
+    for (i, dst) in out.chunks_mut(hidden).enumerate() {
+        for k in 0..4 {
+            let at = taps[i * 4 + k] as usize * hidden;
+            for (d, s) in dst.iter_mut().zip(&table[at..at + hidden]) {
+                *d += weights[i * 4 + k] * s;
             }
         }
     }
@@ -238,25 +295,42 @@ pub fn rope_tables(grid: [usize; 3], merge: usize, head_dim: usize) -> (Vec<f32>
     (cos, sin)
 }
 
+struct BatchLayout {
+    tokens: usize,
+    taps: Vec<i32>,
+    tap_weights: Vec<f32>,
+    hw: Vec<i32>,
+    seg_lo: Vec<i32>,
+    seg_hi: Vec<i32>,
+    merged_rows: Vec<usize>,
+}
+
 impl VisionEncoder {
     pub fn load(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, jit: &Jit, ck: &Checkpoint, cfg: &VisionConfig) -> Result<Self> {
+        Self::load_with(ctx, stream, jit, ck, cfg, VisionPrecision::default())
+    }
+
+    pub fn load_with(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, jit: &Jit, ck: &Checkpoint, cfg: &VisionConfig, precision: VisionPrecision) -> Result<Self> {
+        let precise = precision == VisionPrecision::Exact;
         ensure!(cfg.hidden_size % cfg.num_heads == 0, "vision hidden_size must divide by num_heads");
         let head_dim = cfg.hidden_size / cfg.num_heads;
-        ensure!(head_dim % 4 == 0 && head_dim <= 128, "vision head_dim {head_dim} is not supported");
+        ensure!(head_dim % 8 == 0 && head_dim <= 128, "vision head_dim {head_dim} is not supported");
         let act = Act::from_config(cfg.hidden_act.as_deref())?;
         let p = prefix(ck)?;
-        let loaded = jit.load(&module())?;
+        let loaded = jit.load(&module(head_dim, precise)?)?;
         let _ = ctx;
         let channels = cfg.in_channels.unwrap_or(3);
         let patch_cols = channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
-        let patch = Linear {
+        ensure!(patch_cols % 8 == 0, "patch of {patch_cols} values is not a multiple of 8");
+        let mut patch = Linear {
             w: upload(stream, ck, &format!("{p}.patch_embed.proj.weight"), &[cfg.hidden_size, channels, cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size])?,
             b: upload(stream, ck, &format!("{p}.patch_embed.proj.bias"), &[cfg.hidden_size])?,
             rows: cfg.hidden_size,
             cols: patch_cols,
         };
         let table = ck.bf16(&format!("{p}.pos_embed.weight"), &[cfg.num_position_embeddings, cfg.hidden_size])?;
-        let pos_embed = table.iter().map(|&v| bf16_to_f32(v)).collect();
+        let table: Vec<f32> = table.iter().map(|&v| bf16_to_f32(v)).collect();
+        let pos_embed = stream.clone_htod(&table)?;
         let mut blocks = Vec::with_capacity(cfg.depth);
         for i in 0..cfg.depth {
             let b = format!("{p}.blocks.{i}");
@@ -269,17 +343,47 @@ impl VisionEncoder {
                 down: linear(stream, ck, &format!("{b}.mlp.linear_fc2"), cfg.hidden_size, cfg.intermediate_size)?,
             });
         }
-        let main = merger(stream, ck, &format!("{p}.merger"), cfg, false)?;
+        let mut main = merger(stream, ck, &format!("{p}.merger"), cfg, false)?;
         let mut deepstack = Vec::new();
         for i in 0..cfg.deepstack_visual_indexes.len() {
             deepstack.push(merger(stream, ck, &format!("{p}.deepstack_merger_list.{i}"), cfg, true)?);
         }
+        let mma = loaded.function("vis_mma")?;
+        let flash = loaded.function("vis_flash")?;
+        {
+            use cudarc::driver::sys::CUfunction_attribute as A;
+            mma.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, GEMM_SMEM as i32)?;
+            flash.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, flash_smem(head_dim) as i32)?;
+        }
+        if !precise {
+            let to_f16 = loaded.function("vis_to_f16")?;
+            let mut convert = |w: &mut CudaSlice<u16>| -> Result<()> {
+                let n = w.len() as i32;
+                let mut b = stream.launch_builder(&to_f16);
+                b.arg(w).arg(&n);
+                unsafe { b.launch(LaunchConfig { grid_dim: ((n as u32).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+                Ok(())
+            };
+            convert(&mut patch.w)?;
+            for blk in &mut blocks {
+                for l in [&mut blk.qkv, &mut blk.proj, &mut blk.up, &mut blk.down] {
+                    convert(&mut l.w)?;
+                }
+            }
+            for m in std::iter::once(&mut main).chain(deepstack.iter_mut()) {
+                convert(&mut m.up.w)?;
+                convert(&mut m.down.w)?;
+            }
+        }
+        stream.synchronize()?;
         Ok(VisionEncoder {
             stream: stream.clone(),
-            gemm: loaded.function("vis_gemm")?,
+            mma,
+            split: loaded.function("vis_split")?,
             layernorm: loaded.function("vis_layernorm")?,
-            rope: loaded.function("vis_rope")?,
-            attention: loaded.function("vis_attention")?,
+            pos: loaded.function("vis_pos")?,
+            rope_pack: loaded.function("vis_rope_pack")?,
+            flash,
             cfg: cfg.clone(),
             act,
             patch,
@@ -294,110 +398,177 @@ impl VisionEncoder {
         plan(&self.cfg)
     }
 
-    fn gemm(&self, l: &Linear, a: &CudaSlice<f32>, resid: Option<&CudaSlice<f32>>, out: &mut CudaSlice<f32>, rows: usize, act: Act) -> Result<()> {
-        let (n, m, k, code) = (rows as i32, l.rows as i32, l.cols as i32, act.code());
-        let cfg = LaunchConfig { grid_dim: ((l.rows as u32).div_ceil(64), (rows as u32).div_ceil(64), 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-        let mut b = self.stream.launch_builder(&self.gemm);
-        b.arg(a).arg(&l.w).arg(&l.b);
-        match resid {
-            Some(r) => b.arg(r),
-            None => b.arg(&0u64),
+    pub fn config(&self) -> &VisionConfig {
+        &self.cfg
+    }
+
+    fn gemm(&self, l: &Linear, a: &Planes, out: Out<'_>, rows: usize, act: Act) -> Result<()> {
+        let (m, n, k, code) = (rows as i32, l.rows as i32, l.cols as i32, act.code());
+        let null = 0u64;
+        let ptr = match &out {
+            Out::AddInPlace(o) => o.device_ptr(&self.stream).0,
+            _ => 0,
         };
-        b.arg(out).arg(&n).arg(&m).arg(&k).arg(&code);
+        let cfg = LaunchConfig {
+            grid_dim: ((l.rows as u32).div_ceil(GEMM_BN), (rows as u32).div_ceil(GEMM_BM), 1),
+            block_dim: (GEMM_THREADS, 1, 1),
+            shared_mem_bytes: GEMM_SMEM,
+        };
+        let mut b = self.stream.launch_builder(&self.mma);
+        b.arg(&a.hi).arg(&a.lo).arg(&l.w).arg(&l.b);
+        match out {
+            Out::Store(o) => {
+                b.arg(&null).arg(o).arg(&null).arg(&null);
+            }
+            Out::AddInPlace(_) => {
+                b.arg(&ptr).arg(&ptr).arg(&null).arg(&null);
+            }
+            Out::Split(p) => {
+                b.arg(&null).arg(&null).arg(&mut p.hi).arg(&mut p.lo);
+            }
+        }
+        b.arg(&m).arg(&n).arg(&k).arg(&code);
         unsafe { b.launch(cfg) }?;
         Ok(())
     }
 
-    fn gemm_in_place_resid(&self, l: &Linear, a: &CudaSlice<f32>, x: &mut CudaSlice<f32>, rows: usize) -> Result<()> {
-        let (n, m, k, code) = (rows as i32, l.rows as i32, l.cols as i32, 0i32);
-        let cfg = LaunchConfig { grid_dim: ((l.rows as u32).div_ceil(64), (rows as u32).div_ceil(64), 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-        let mut b = self.stream.launch_builder(&self.gemm);
-        let xp = &*x;
-        b.arg(a).arg(&l.w).arg(&l.b).arg(xp).arg(xp).arg(&n).arg(&m).arg(&k).arg(&code);
-        unsafe { b.launch(cfg) }?;
-        Ok(())
-    }
-
-    fn layernorm(&self, x: &CudaSlice<f32>, nm: &Norm, out: &mut CudaSlice<f32>, rows: usize, width: usize) -> Result<()> {
+    fn layernorm(&self, x: &CudaSlice<f32>, nm: &Norm, out: &mut Planes, rows: usize, width: usize) -> Result<()> {
+        ensure!(width % 2 == 0, "layernorm width {width} is odd");
         let w = width as i32;
         let mut b = self.stream.launch_builder(&self.layernorm);
-        b.arg(x).arg(&nm.w).arg(&nm.b).arg(out).arg(&w).arg(&LAYERNORM_EPS);
+        b.arg(x).arg(&nm.w).arg(&nm.b).arg(&mut out.hi).arg(&mut out.lo).arg(&w).arg(&LAYERNORM_EPS);
         unsafe { b.launch(LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
         Ok(())
     }
 
-    fn run_merger(&self, m: &Merger, x: &CudaSlice<f32>, tokens: usize, scratch: &mut CudaSlice<f32>, mid: &mut CudaSlice<f32>) -> Result<Vec<f32>> {
+    fn run_merger(&self, m: &Merger, x: &CudaSlice<f32>, tokens: usize, scratch: &mut Planes, up: &mut Planes) -> Result<Vec<f32>> {
         let unit = self.cfg.spatial_merge_size * self.cfg.spatial_merge_size;
         let merged_rows = tokens / unit;
-        let merged = self.cfg.hidden_size * unit;
         if m.post_shuffle_norm {
-            self.layernorm(x, &m.norm, scratch, merged_rows, merged)?;
+            self.layernorm(x, &m.norm, scratch, merged_rows, self.cfg.hidden_size * unit)?;
         } else {
             self.layernorm(x, &m.norm, scratch, tokens, self.cfg.hidden_size)?;
         }
-        let mut up = self.stream.alloc_zeros::<f32>(merged_rows * merged)?;
-        self.gemm(&m.up, scratch, None, &mut up, merged_rows, Act::GeluErf)?;
-        let mut out = self.stream.alloc_zeros::<f32>(merged_rows * self.cfg.out_hidden_size)?;
-        self.gemm(&m.down, &up, None, &mut out, merged_rows, Act::None)?;
-        let _ = mid;
+        self.gemm(&m.up, scratch, Out::Split(up), merged_rows, Act::GeluErf)?;
+        let mut out = unsafe { self.stream.alloc::<f32>(merged_rows * self.cfg.out_hidden_size) }?;
+        self.gemm(&m.down, up, Out::Store(&mut out), merged_rows, Act::None)?;
         Ok(self.stream.clone_dtoh(&out)?)
     }
 
-    pub fn encode(&self, patches: &Patches) -> Result<VisionOutput> {
+    fn layout(&self, items: &[&Patches]) -> Result<BatchLayout> {
         let cfg = &self.cfg;
-        let [t, h, w] = patches.grid;
-        ensure!(t > 0 && h > 0 && w > 0, "grid {t}x{h}x{w} is empty");
-        ensure!(t * h * w <= MAX_ENCODE_PATCHES, "grid {t}x{h}x{w} is {} patches, the encoder takes at most {MAX_ENCODE_PATCHES}", t * h * w);
         let merge = cfg.spatial_merge_size;
-        ensure!(h % merge == 0 && w % merge == 0, "grid {h}x{w} is not a multiple of the merge size");
-        let tokens = t * h * w;
-        let hidden = cfg.hidden_size;
-        let head_dim = hidden / cfg.num_heads;
-        let patch_dim = self.patch.cols;
-        ensure!(patches.data.len() == tokens * patch_dim, "patch tensor has {} values, grid needs {}", patches.data.len(), tokens * patch_dim);
         let side = (cfg.num_position_embeddings as f64).sqrt() as usize;
-        let pos = interpolated_positions(&self.pos_embed, hidden, side, patches.grid, merge);
-        let (cos, sin) = rope_tables(patches.grid, merge, head_dim);
-        let frame = h * w;
-        let seg_lo: Vec<i32> = (0..tokens).map(|i| (i / frame * frame) as i32).collect();
-        let seg_hi: Vec<i32> = (0..tokens).map(|i| (i / frame * frame + frame) as i32).collect();
+        let mut l = BatchLayout { tokens: 0, taps: Vec::new(), tap_weights: Vec::new(), hw: Vec::new(), seg_lo: Vec::new(), seg_hi: Vec::new(), merged_rows: Vec::new() };
+        for p in items {
+            let [t, h, w] = p.grid;
+            ensure!(t > 0 && h > 0 && w > 0, "grid {t}x{h}x{w} is empty");
+            ensure!(t * h * w <= MAX_ENCODE_PATCHES, "grid {t}x{h}x{w} is {} patches, the encoder takes at most {MAX_ENCODE_PATCHES}", t * h * w);
+            ensure!(h % merge == 0 && w % merge == 0, "grid {h}x{w} is not a multiple of the merge size");
+            let tokens = t * h * w;
+            ensure!(p.data.len() == tokens * self.patch.cols, "patch tensor has {} values, grid needs {}", p.data.len(), tokens * self.patch.cols);
+            let (taps, weights) = position_taps(side, p.grid, merge);
+            l.taps.extend(taps);
+            l.tap_weights.extend(weights);
+            l.hw.extend(position_ids(p.grid, merge).into_iter().flat_map(|(a, b)| [a as i32, b as i32]));
+            let frame = h * w;
+            for i in 0..tokens {
+                let lo = l.tokens + i / frame * frame;
+                l.seg_lo.push(lo as i32);
+                l.seg_hi.push((lo + frame) as i32);
+            }
+            l.tokens += tokens;
+            l.merged_rows.push(tokens / (merge * merge));
+        }
+        ensure!(l.tokens > 0, "nothing to encode");
+        Ok(l)
+    }
+
+    pub fn encode(&self, patches: &Patches) -> Result<VisionOutput> {
+        let (mut embeds, deepstack) = self.encode_all(&[patches])?;
+        let tokens = patches.tokens(self.cfg.spatial_merge_size);
+        Ok(VisionOutput { embeds: embeds.remove(0), deepstack: deepstack.into_iter().map(|mut d| d.remove(0)).collect(), tokens })
+    }
+
+    pub fn encode_batch(&self, items: &[&Patches]) -> Result<Vec<Vec<f32>>> {
+        Ok(self.encode_all(items)?.0)
+    }
+
+    fn encode_all(&self, items: &[&Patches]) -> Result<(Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>)> {
+        let cfg = &self.cfg;
+        let l = self.layout(items)?;
+        let tokens = l.tokens;
+        let hidden = cfg.hidden_size;
+        let heads = cfg.num_heads;
+        let head_dim = hidden / heads;
+        let hdp = head_pad(head_dim);
         let s = &self.stream;
-        let input = s.clone_htod(&patches.data)?;
-        let pos = s.clone_htod(&pos)?;
-        let cos = s.clone_htod(&cos)?;
-        let sin = s.clone_htod(&sin)?;
-        let lo = s.clone_htod(&seg_lo)?;
-        let hi = s.clone_htod(&seg_hi)?;
-        let mut x = s.alloc_zeros::<f32>(tokens * hidden)?;
-        let mut xn = s.alloc_zeros::<f32>(tokens * hidden)?;
-        let mut qkv = s.alloc_zeros::<f32>(tokens * 3 * hidden)?;
-        let mut att = s.alloc_zeros::<f32>(tokens * hidden)?;
-        let mut mid = s.alloc_zeros::<f32>(tokens * cfg.intermediate_size)?;
-        self.gemm(&self.patch, &input, Some(&pos), &mut x, tokens, Act::None)?;
-        let (heads, hd, scale) = (cfg.num_heads as i32, head_dim as i32, 1.0 / (head_dim as f32).sqrt());
+        let data: Vec<f32> = items.iter().flat_map(|p| p.data.iter().copied()).collect();
+        let input = s.clone_htod(&data)?;
+        let taps = s.clone_htod(&l.taps)?;
+        let tap_weights = s.clone_htod(&l.tap_weights)?;
+        let hw = s.clone_htod(&l.hw)?;
+        let seg_lo = s.clone_htod(&l.seg_lo)?;
+        let seg_hi = s.clone_htod(&l.seg_hi)?;
+        let mut x = unsafe { s.alloc::<f32>(tokens * hidden) }?;
+        let mut qkv = unsafe { s.alloc::<f32>(tokens * 3 * hidden) }?;
+        let mut packed = unsafe { s.alloc::<u16>(6 * heads * tokens * hdp) }?;
+        let mut xn = Planes::new(s, tokens * hidden)?;
+        let mut att = Planes::new(s, tokens * hidden)?;
+        let mut mid = Planes::new(s, tokens * cfg.intermediate_size.max(self.patch.cols).max(hidden))?;
+        let n = (tokens * self.patch.cols) as i32;
+        let mut b = s.launch_builder(&self.split);
+        b.arg(&input).arg(&mut mid.hi).arg(&mut mid.lo).arg(&n);
+        unsafe { b.launch(LaunchConfig { grid_dim: ((n as u32 / 2).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+        let h = hidden as i32;
+        let mut b = s.launch_builder(&self.pos);
+        b.arg(&self.pos_embed).arg(&taps).arg(&tap_weights).arg(&mut x).arg(&h);
+        unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+        self.gemm(&self.patch, &mid, Out::AddInPlace(&mut x), tokens, Act::None)?;
+        let (t32, h32, hd32) = (tokens as i32, heads as i32, head_dim as i32);
+        let scale_log2 = (1.0 / (head_dim as f32).sqrt()) * std::f32::consts::LOG2_E;
         let mut deepstack = Vec::new();
-        let mut scratch = s.alloc_zeros::<f32>(tokens * hidden)?;
         for (i, blk) in self.blocks.iter().enumerate() {
             self.layernorm(&x, &blk.norm1, &mut xn, tokens, hidden)?;
-            self.gemm(&blk.qkv, &xn, None, &mut qkv, tokens, Act::None)?;
-            let mut b = s.launch_builder(&self.rope);
-            b.arg(&mut qkv).arg(&cos).arg(&sin).arg(&heads).arg(&hd);
-            unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, cfg.num_heads as u32, 1), block_dim: (64, 1, 1), shared_mem_bytes: 0 }) }?;
-            let mut b = s.launch_builder(&self.attention);
-            b.arg(&qkv).arg(&mut att).arg(&lo).arg(&hi).arg(&heads).arg(&hd).arg(&scale);
-            unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, cfg.num_heads as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 }) }?;
-            self.gemm_in_place_resid(&blk.proj, &att, &mut x, tokens)?;
+            self.gemm(&blk.qkv, &xn, Out::Store(&mut qkv), tokens, Act::None)?;
+            let mut b = s.launch_builder(&self.rope_pack);
+            b.arg(&qkv).arg(&hw).arg(&mut packed).arg(&t32).arg(&h32).arg(&hd32).arg(&ROPE_THETA);
+            unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, heads as u32, 1), block_dim: (hdp as u32, 1, 1), shared_mem_bytes: 0 }) }?;
+            let mut b = s.launch_builder(&self.flash);
+            b.arg(&packed).arg(&seg_lo).arg(&seg_hi).arg(&mut att.hi).arg(&mut att.lo).arg(&t32).arg(&h32).arg(&hd32).arg(&scale_log2);
+            unsafe {
+                b.launch(LaunchConfig {
+                    grid_dim: ((tokens as u32).div_ceil(FLASH_BQ), heads as u32, 1),
+                    block_dim: (FLASH_THREADS, 1, 1),
+                    shared_mem_bytes: flash_smem(head_dim),
+                })
+            }?;
+            self.gemm(&blk.proj, &att, Out::AddInPlace(&mut x), tokens, Act::None)?;
             self.layernorm(&x, &blk.norm2, &mut xn, tokens, hidden)?;
-            self.gemm(&blk.up, &xn, None, &mut mid, tokens, self.act)?;
-            self.gemm_in_place_resid(&blk.down, &mid, &mut x, tokens)?;
+            self.gemm(&blk.up, &xn, Out::Split(&mut mid), tokens, self.act)?;
+            self.gemm(&blk.down, &mid, Out::AddInPlace(&mut x), tokens, Act::None)?;
             if let Some(d) = cfg.deepstack_visual_indexes.iter().position(|&b| b == i) {
-                let mut dummy = s.alloc_zeros::<f32>(1)?;
-                deepstack.push(self.run_merger(&self.deepstack[d], &x, tokens, &mut scratch, &mut dummy)?);
+                let mut scratch = Planes::new(s, tokens * hidden)?;
+                let mut up = Planes::new(s, tokens * hidden)?;
+                let flat = self.run_merger(&self.deepstack[d], &x, tokens, &mut scratch, &mut up)?;
+                deepstack.push(self.split_rows(flat, &l.merged_rows));
             }
         }
-        let mut dummy = s.alloc_zeros::<f32>(1)?;
-        let embeds = self.run_merger(&self.merger, &x, tokens, &mut scratch, &mut dummy)?;
-        Ok(VisionOutput { embeds, deepstack, tokens: tokens / (merge * merge) })
+        let mut scratch = Planes::new(s, tokens * hidden)?;
+        let mut up = Planes::new(s, tokens * hidden)?;
+        let flat = self.run_merger(&self.merger, &x, tokens, &mut scratch, &mut up)?;
+        Ok((self.split_rows(flat, &l.merged_rows), deepstack))
+    }
+
+    fn split_rows(&self, flat: Vec<f32>, rows: &[usize]) -> Vec<Vec<f32>> {
+        let width = self.cfg.out_hidden_size;
+        let mut out = Vec::with_capacity(rows.len());
+        let mut at = 0;
+        for &r in rows {
+            out.push(flat[at..at + r * width].to_vec());
+            at += r * width;
+        }
+        out
     }
 }
 
