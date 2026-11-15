@@ -73,6 +73,21 @@ pub struct FamilyDtypes {
     pub accepted: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyRope {
+    pub type_keys: Vec<String>,
+    pub unscaled: Vec<String>,
+    pub types: std::collections::BTreeMap<String, crate::spec::RopeScalingKind>,
+    pub keys: std::collections::BTreeMap<String, String>,
+}
+
+impl FamilyRope {
+    pub fn key<'a>(&'a self, canonical: &'a str) -> &'a str {
+        self.keys.get(canonical).map(String::as_str).unwrap_or(canonical)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Family {
@@ -94,6 +109,8 @@ pub struct Family {
     pub activation: FamilyActivation,
     #[serde(default)]
     pub dtypes: FamilyDtypes,
+    #[serde(default)]
+    pub rope: FamilyRope,
     #[serde(default)]
     pub fields: std::collections::BTreeMap<String, Vec<String>>,
 }

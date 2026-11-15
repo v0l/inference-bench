@@ -16,3 +16,15 @@ accepted = ["bfloat16", "float16", "float32"]
 
 [fields]
 hidden_act = ["hidden_activation"]
+
+[rope]
+type_keys = ["rope_type", "type"]
+unscaled = ["default"]
+
+[rope.types]
+linear = "linear"
+llama3 = "llama3"
+yarn = "yarn"
+
+[rope.keys]
+original_max_positions = "original_max_position_embeddings"

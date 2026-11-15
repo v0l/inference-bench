@@ -827,43 +827,45 @@ fn parse_quantization(value: Option<&serde_json::Value>, layers: usize) -> Resul
     }
 }
 
-fn parse_rope_scaling(value: Option<&serde_json::Value>) -> Result<Option<RopeScaling>> {
+fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_json::Value>) -> Result<Option<RopeScaling>> {
     let Some(v) = value.filter(|v| !v.is_null()) else {
         return Ok(None);
     };
-    let kind = v
-        .get("rope_type")
-        .or_else(|| v.get("type"))
+    let kind = rope
+        .type_keys
+        .iter()
+        .find_map(|k| v.get(k))
         .and_then(|k| k.as_str())
         .context("rope_scaling has no type")?;
-    if kind == "default" {
+    if rope.unscaled.iter().any(|u| u == kind) {
         return Ok(None);
     }
-    let num = |key: &str| v.get(key).and_then(|x| x.as_f64());
+    let num = |key: &str| v.get(rope.key(key)).and_then(|x| x.as_f64());
     let factor = num("factor").context("rope_scaling has no factor")?;
     ensure!(factor > 0.0, "rope_scaling factor must be positive");
-    match kind {
-        "linear" => Ok(Some(RopeScaling {
-            kind: RopeScalingKind::Linear,
+    let Some(&scaling_kind) = rope.types.get(kind) else { bail!("rope_scaling {kind} is not supported") };
+    match scaling_kind {
+        RopeScalingKind::Linear => Ok(Some(RopeScaling {
+            kind: scaling_kind,
             factor,
             low_freq_factor: None,
             high_freq_factor: None,
             original_max_positions: None,
             yarn: None,
         })),
-        "llama3" => Ok(Some(RopeScaling {
-            kind: RopeScalingKind::Llama3,
+        RopeScalingKind::Llama3 => Ok(Some(RopeScaling {
+            kind: scaling_kind,
             factor,
             low_freq_factor: Some(num("low_freq_factor").context("no low_freq_factor")?),
             high_freq_factor: Some(num("high_freq_factor").context("no high_freq_factor")?),
             original_max_positions: Some(
-                num("original_max_position_embeddings")
+                num("original_max_positions")
                     .context("no original_max_position_embeddings")?,
             ),
             yarn: None,
         })),
-        "yarn" => {
-            let original = num("original_max_position_embeddings").context("yarn rope_scaling has no original_max_position_embeddings")?;
+        RopeScalingKind::Yarn => {
+            let original = num("original_max_positions").context("yarn rope_scaling has no original_max_position_embeddings")?;
             ensure!(original > 0.0, "original_max_position_embeddings must be positive");
             let attention_factor = match (num("attention_factor"), num("mscale"), num("mscale_all_dim")) {
                 (Some(a), _, _) => a,
@@ -872,9 +874,9 @@ fn parse_rope_scaling(value: Option<&serde_json::Value>) -> Result<Option<RopeSc
             };
             let beta_fast = num("beta_fast").filter(|b| *b != 0.0).unwrap_or(32.0);
             let beta_slow = num("beta_slow").filter(|b| *b != 0.0).unwrap_or(1.0);
-            let truncate = v.get("truncate").and_then(|t| t.as_bool()).unwrap_or(true);
+            let truncate = v.get(rope.key("truncate")).and_then(|t| t.as_bool()).unwrap_or(true);
             Ok(Some(RopeScaling {
-                kind: RopeScalingKind::Yarn,
+                kind: scaling_kind,
                 factor,
                 low_freq_factor: None,
                 high_freq_factor: None,
@@ -882,7 +884,6 @@ fn parse_rope_scaling(value: Option<&serde_json::Value>) -> Result<Option<RopeSc
                 yarn: Some(Yarn { beta_fast, beta_slow, attention_factor, truncate }),
             }))
         }
-        other => bail!("rope_scaling {other} is not supported"),
     }
 }
 
@@ -1036,7 +1037,7 @@ impl Spec {
             .and_then(|o| o.values().find(|v| v.get("rope_theta").is_some()));
         let params = hf.rope_parameters.as_ref();
         let param = |key: &str| params.and_then(|p| p.get(key)).or(nested.and_then(|n| n.get(key))).and_then(|v| v.as_f64());
-        let scaling = match parse_rope_scaling(hf.rope_scaling.as_ref().or(params)) {
+        let scaling = match parse_rope_scaling(&family.rope, hf.rope_scaling.as_ref().or(params)) {
             Ok(s) => s,
             Err(e) if strict => return Err(e),
             Err(_) => None,
