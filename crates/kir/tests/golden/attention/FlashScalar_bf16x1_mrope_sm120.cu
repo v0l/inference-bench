@@ -1,9 +1,13 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
 // attention FlashScalar threads=128 smem=0
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }) }, kv_layers: 16, kv_planes: 1, kv_fp8: false }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }) }, kv_layers: 16, kv_planes: 1, kv_fp8: false, query_scale: 0.0625, softcap: 30.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
 constexpr int ROT = 64;
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = true;
+constexpr bool LOCAL_ROPE[] = { false, true, false, false };
+constexpr float LOCAL_THETA = 1e4f;
+constexpr float QUERY_SCALE = 6.25e-2f;
+constexpr float SOFTCAP = 3e1f;
 constexpr float THETA = 1e7f;
 constexpr int ROPE_KIND = 0;
 constexpr bool MROPE = true;
@@ -21,7 +25,8 @@ constexpr int ATTN_LAYERS = 16;
 constexpr int KV_PLANES = 1;
 constexpr bool KV_FP8 = false;
 
-__device__ __forceinline__ float rope_inv_freq(int i) {
+__device__ __forceinline__ float rope_inv_freq(int i, int layer) {
+    if (LOCAL_ROPE[layer]) return 1.0f / powf(LOCAL_THETA, (float)(2 * i) / (float)ROT);
     float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)ROT);
     if (ROPE_KIND == 1) {
         inv_freq /= ROPE_FACTOR;
@@ -40,6 +45,14 @@ __device__ __forceinline__ float rope_inv_freq(int i) {
         inv_freq = ramp * inv_freq / ROPE_FACTOR + (1.0f - ramp) * inv_freq;
     }
     return inv_freq;
+}
+
+__device__ __forceinline__ float cap_score(float s) {
+    return SOFTCAP > 0.0f ? SOFTCAP * tanhf(s / SOFTCAP) : s;
+}
+
+__device__ __forceinline__ int window_lo(int len, int window) {
+    return window > 0 ? max(0, len - window) : 0;
 }
 
 __device__ __forceinline__ unsigned f16_bits(float v) {
@@ -163,7 +176,7 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     __syncthreads();
     if ((is_q || is_k) && d < ROT) {
         int fi = d < ROT_HALF ? d : d - ROT_HALF;
-        float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi);
+        float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi, layer);
         float c = cosf(angle) * ROPE_MSCALE;
         float s = sinf(angle) * ROPE_MSCALE;
         v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
@@ -199,7 +212,7 @@ constexpr int FA_STRIDE = HEAD_DIM + 1;
 constexpr int FA_OUT = HEAD_DIM / 8;
 
 extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
-                                           const int* block_table, const int* pos_ptr, int layer, float* out, int tokens) {
+                                           const int* block_table, const int* pos_ptr, int layer, float* out, int tokens, int window) {
     __shared__ float qs[FA_BQ][FA_STRIDE];
     __shared__ float ks[FA_BK][FA_STRIDE];
     __shared__ float vs[FA_BK][HEAD_DIM];
@@ -213,7 +226,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
     int sub = tid & 7;
     int qi = q0 + qr;
     int pos = base + qi;
-    float scale = rsqrtf((float)HEAD_DIM);
+    float scale = QUERY_SCALE;
     for (int i = tid; i < FA_BQ * HEAD_DIM; i += FA_THREADS) {
         int r = i / HEAD_DIM;
         int d = i % HEAD_DIM;
@@ -253,7 +266,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             int t = k0 + sub * 4 + j;
-            s[j] = (t <= pos && t < key_end) ? s[j] * scale : NEG_INF;
+            s[j] = (t <= pos && t < key_end && (window <= 0 || t > pos - window)) ? cap_score(s[j] * scale) : NEG_INF;
             tile_max = fmaxf(tile_max, s[j]);
         }
         tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));

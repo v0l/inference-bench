@@ -1,9 +1,13 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
 // attention FlashMma threads=256 smem=98304
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }) }, kv_layers: 16, kv_planes: 1, kv_fp8: false }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }) }, kv_layers: 16, kv_planes: 1, kv_fp8: false, query_scale: 0.0625, softcap: 30.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
 constexpr int ROT = 64;
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = true;
+constexpr bool LOCAL_ROPE[] = { false, true, false, false };
+constexpr float LOCAL_THETA = 1e4f;
+constexpr float QUERY_SCALE = 6.25e-2f;
+constexpr float SOFTCAP = 3e1f;
 constexpr float THETA = 1e7f;
 constexpr int ROPE_KIND = 0;
 constexpr bool MROPE = true;
@@ -28,7 +32,8 @@ constexpr int FM_KB = HEAD_DIM / 16;
 constexpr int FM_NB = HEAD_DIM / 8;
 constexpr int FM_SMEM = 98304;
 
-__device__ __forceinline__ float rope_inv_freq(int i) {
+__device__ __forceinline__ float rope_inv_freq(int i, int layer) {
+    if (LOCAL_ROPE[layer]) return 1.0f / powf(LOCAL_THETA, (float)(2 * i) / (float)ROT);
     float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)ROT);
     if (ROPE_KIND == 1) {
         inv_freq /= ROPE_FACTOR;
@@ -47,6 +52,14 @@ __device__ __forceinline__ float rope_inv_freq(int i) {
         inv_freq = ramp * inv_freq / ROPE_FACTOR + (1.0f - ramp) * inv_freq;
     }
     return inv_freq;
+}
+
+__device__ __forceinline__ float cap_score(float s) {
+    return SOFTCAP > 0.0f ? SOFTCAP * tanhf(s / SOFTCAP) : s;
+}
+
+__device__ __forceinline__ int window_lo(int len, int window) {
+    return window > 0 ? max(0, len - window) : 0;
 }
 
 __device__ __forceinline__ unsigned f16_bits(float v) {
@@ -170,7 +183,7 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     __syncthreads();
     if ((is_q || is_k) && d < ROT) {
         int fi = d < ROT_HALF ? d : d - ROT_HALF;
-        float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi);
+        float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi, layer);
         float c = cosf(angle) * ROPE_MSCALE;
         float s = sinf(angle) * ROPE_MSCALE;
         v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
@@ -241,7 +254,7 @@ __device__ __forceinline__ void mma_kv(float* c, const unsigned* ah, const unsig
 extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
                                      const bf16_t* v_cache, const int* block_table, const int* pos_ptr, int layer,
                                      bf16_t* out_hi, bf16_t* out_lo, int tokens,
-                                     const int* mm_meta, const int* mm_table, int mm_stride, int mm_slot) {
+                                     const int* mm_meta, const int* mm_table, int mm_stride, int mm_slot, int window) {
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = FM_BK * HEAD_DIM;
     static_assert(FM_BQ * HEAD_DIM * 2 <= FM_SMEM, "Q staging fits");
@@ -261,14 +274,15 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     int row1 = row0 + 8;
     int pos0 = base + row0;
     int pos1 = base + row1;
-    float scale_log2 = rsqrtf((float)HEAD_DIM) * 1.4426950408889634f;
+    float scale_log2 = QUERY_SCALE * 1.4426950408889634f;
+    constexpr float LOG2E = 1.4426950408889634f;
     unsigned qh[FM_KB][4];
     unsigned ql[FM_KB][4];
     constexpr int PAIRS = (ROT_HALF + 31) / 32;
     float* wq = qs + warp * 8 * HEAD_DIM;
     float freq[PAIRS];
 #pragma unroll
-    for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, ROT_HALF - 1));
+    for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, ROT_HALF - 1), layer);
 #pragma unroll
     for (int half = 0; half < 2; half++) {
         for (int r = 0; r < 8; r++) {
@@ -367,7 +381,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         const bf16_t* k_lo = k_hi + PLANE;
         const bf16_t* v_hi = k_hi + KV_PLANES * PLANE;
         const bf16_t* v_lo = v_hi + PLANE;
-        if (k0 > warp_last) {
+        if (k0 > warp_last || (window > 0 && k0 + FM_BK - 1 <= base + q0 + warp * 16 - window)) {
             __syncthreads();
             continue;
         }
@@ -396,7 +410,8 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nb * 8 + 2 * t + (e & 1);
                 int pos = e < 2 ? pos0 : pos1;
-                float v = (key <= pos && key < key_end) ? s[nb][e] * scale_log2 : NEG_INF;
+                bool live = key <= pos && key < key_end && (window <= 0 || key > pos - window);
+                float v = live ? (SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2) : NEG_INF;
                 s[nb][e] = v;
                 if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
             }

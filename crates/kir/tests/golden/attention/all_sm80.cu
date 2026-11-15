@@ -1,21 +1,25 @@
 // target Cuda cc=8.0 sms=108 warp=32 threads=1024 smem=166912 graphs=true pdl=false features=[WarpShuffle,CpAsync,Mma16816,ShaderF16]
 // attention RopeKvWrite threads=256 smem=0
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
 // target Cuda cc=8.0 sms=108 warp=32 threads=1024 smem=166912 graphs=true pdl=false features=[WarpShuffle,CpAsync,Mma16816,ShaderF16]
 // attention SplitDecode threads=128 smem=0
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
 // target Cuda cc=8.0 sms=108 warp=32 threads=1024 smem=166912 graphs=true pdl=false features=[WarpShuffle,CpAsync,Mma16816,ShaderF16]
 // attention FlashScalar threads=128 smem=0
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
 // target Cuda cc=8.0 sms=108 warp=32 threads=1024 smem=166912 graphs=true pdl=false features=[WarpShuffle,CpAsync,Mma16816,ShaderF16]
 // attention FlashMma threads=256 smem=98304
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
 // target Cuda cc=8.0 sms=108 warp=32 threads=1024 smem=166912 graphs=true pdl=false features=[WarpShuffle,CpAsync,Mma16816,ShaderF16]
 // attention GroupedDecodeMma threads=64 smem=32768
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: false, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
 constexpr int ROT = 64;
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = true;
+constexpr bool LOCAL_ROPE[] = { false, true, false, false };
+constexpr float LOCAL_THETA = 1e4f;
+constexpr float QUERY_SCALE = 6.25e-2f;
+constexpr float SOFTCAP = 0e0f;
 constexpr float THETA = 1e7f;
 constexpr int ROPE_KIND = 0;
 constexpr bool MROPE = false;
@@ -45,7 +49,8 @@ constexpr int DM_CHUNK = 256;
 constexpr bool DM_SPLIT = true;
 constexpr int DM_MAX_WARPS = 2;
 
-__device__ __forceinline__ float rope_inv_freq(int i) {
+__device__ __forceinline__ float rope_inv_freq(int i, int layer) {
+    if (LOCAL_ROPE[layer]) return 1.0f / powf(LOCAL_THETA, (float)(2 * i) / (float)ROT);
     float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)ROT);
     if (ROPE_KIND == 1) {
         inv_freq /= ROPE_FACTOR;
@@ -64,6 +69,14 @@ __device__ __forceinline__ float rope_inv_freq(int i) {
         inv_freq = ramp * inv_freq / ROPE_FACTOR + (1.0f - ramp) * inv_freq;
     }
     return inv_freq;
+}
+
+__device__ __forceinline__ float cap_score(float s) {
+    return SOFTCAP > 0.0f ? SOFTCAP * tanhf(s / SOFTCAP) : s;
+}
+
+__device__ __forceinline__ int window_lo(int len, int window) {
+    return window > 0 ? max(0, len - window) : 0;
 }
 
 __device__ __forceinline__ unsigned f16_bits(float v) {
@@ -187,7 +200,7 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     __syncthreads();
     if ((is_q || is_k) && d < ROT) {
         int fi = d < ROT_HALF ? d : d - ROT_HALF;
-        float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi);
+        float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi, layer);
         float c = cosf(angle) * ROPE_MSCALE;
         float s = sinf(angle) * ROPE_MSCALE;
         v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
@@ -250,21 +263,22 @@ constexpr int ATTN_WARPS = ATTN_BLOCK / 32;
 constexpr int ATTN_UNROLL = 4;
 
 extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
-                                     const int* block_table, const int* pos_ptr, int layer, float* part) {
+                                     const int* block_table, const int* pos_ptr, int layer, float* part, int window) {
     __shared__ float4 acc_s[ATTN_WARPS][GROUP][HEAD_DIM / 4];
     __shared__ float m_s[ATTN_WARPS][GROUP];
     __shared__ float l_s[ATTN_WARPS][GROUP];
     int kv_head = blockIdx.x;
     int split = blockIdx.y;
     int len = pos_ptr[0] + 1;
-    int chunk = attn_chunk(len);
-    int start = split * chunk;
+    int lo = window_lo(len, window);
+    int chunk = attn_chunk(len - lo);
+    int start = lo + split * chunk;
     if (start >= len) return;
     int end = min(len, start + chunk);
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     static_assert(HEAD_DIM % 4 == 0 && HEAD_DIM <= 256, "unsupported head_dim");
-    float scale = rsqrtf((float)HEAD_DIM);
+    float scale = QUERY_SCALE;
     float4 q[GROUP][ATTN_V4];
 #pragma unroll
     for (int g = 0; g < GROUP; g++)
@@ -309,7 +323,7 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
 #pragma unroll
                 for (int j = 0; j < ATTN_V4; j++)
                     dot += q[g][j].x * kr[u][j].x + q[g][j].y * kr[u][j].y + q[g][j].z * kr[u][j].z + q[g][j].w * kr[u][j].w;
-                dot = warp_sum(dot) * scale;
+                dot = cap_score(warp_sum(dot) * scale);
                 float nm = fmaxf(m[g], dot);
                 float corr = expf(m[g] - nm);
                 float p = expf(dot - nm);
@@ -356,9 +370,9 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
     }
 }
 
-extern "C" __global__ void attention_reduce(const float* part, const int* pos_ptr, const float* qkv, float* out) {
+extern "C" __global__ void attention_reduce(const float* part, const int* pos_ptr, const float* qkv, float* out, int window) {
     int head = blockIdx.x;
-    int len = pos_ptr[0] + 1;
+    int len = pos_ptr[0] + 1 - window_lo(pos_ptr[0] + 1, window);
     int chunk = attn_chunk(len);
     int active = (len + chunk - 1) / chunk;
     const float* base = part + (size_t)head * ATTN_SPLITS * ATTN_PART;
@@ -394,7 +408,7 @@ constexpr int FA_STRIDE = HEAD_DIM + 1;
 constexpr int FA_OUT = HEAD_DIM / 8;
 
 extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
-                                           const int* block_table, const int* pos_ptr, int layer, float* out, int tokens) {
+                                           const int* block_table, const int* pos_ptr, int layer, float* out, int tokens, int window) {
     __shared__ float qs[FA_BQ][FA_STRIDE];
     __shared__ float ks[FA_BK][FA_STRIDE];
     __shared__ float vs[FA_BK][HEAD_DIM];
@@ -408,7 +422,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
     int sub = tid & 7;
     int qi = q0 + qr;
     int pos = base + qi;
-    float scale = rsqrtf((float)HEAD_DIM);
+    float scale = QUERY_SCALE;
     for (int i = tid; i < FA_BQ * HEAD_DIM; i += FA_THREADS) {
         int r = i / HEAD_DIM;
         int d = i % HEAD_DIM;
@@ -448,7 +462,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             int t = k0 + sub * 4 + j;
-            s[j] = (t <= pos && t < key_end) ? s[j] * scale : NEG_INF;
+            s[j] = (t <= pos && t < key_end && (window <= 0 || t > pos - window)) ? cap_score(s[j] * scale) : NEG_INF;
             tile_max = fmaxf(tile_max, s[j]);
         }
         tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
@@ -573,7 +587,7 @@ extern "C" __global__ void batch_decode_combine(const float* part_acc, const flo
 extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
                                      const bf16_t* v_cache, const int* block_table, const int* pos_ptr, int layer,
                                      bf16_t* out_hi, bf16_t* out_lo, int tokens,
-                                     const int* mm_meta, const int* mm_table, int mm_stride, int mm_slot) {
+                                     const int* mm_meta, const int* mm_table, int mm_stride, int mm_slot, int window) {
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = FM_BK * HEAD_DIM;
     static_assert(FM_BQ * HEAD_DIM * 2 <= FM_SMEM, "Q staging fits");
@@ -593,14 +607,15 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     int row1 = row0 + 8;
     int pos0 = base + row0;
     int pos1 = base + row1;
-    float scale_log2 = rsqrtf((float)HEAD_DIM) * 1.4426950408889634f;
+    float scale_log2 = QUERY_SCALE * 1.4426950408889634f;
+    constexpr float LOG2E = 1.4426950408889634f;
     unsigned qh[FM_KB][4];
     unsigned ql[FM_KB][4];
     constexpr int PAIRS = (ROT_HALF + 31) / 32;
     float* wq = qs + warp * 8 * HEAD_DIM;
     float freq[PAIRS];
 #pragma unroll
-    for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, ROT_HALF - 1));
+    for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, ROT_HALF - 1), layer);
 #pragma unroll
     for (int half = 0; half < 2; half++) {
         for (int r = 0; r < 8; r++) {
@@ -699,7 +714,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         const bf16_t* k_lo = k_hi + PLANE;
         const bf16_t* v_hi = k_hi + KV_PLANES * PLANE;
         const bf16_t* v_lo = v_hi + PLANE;
-        if (k0 > warp_last) {
+        if (k0 > warp_last || (window > 0 && k0 + FM_BK - 1 <= base + q0 + warp * 16 - window)) {
             __syncthreads();
             continue;
         }
@@ -728,7 +743,8 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nb * 8 + 2 * t + (e & 1);
                 int pos = e < 2 ? pos0 : pos1;
-                float v = (key <= pos && key < key_end) ? s[nb][e] * scale_log2 : NEG_INF;
+                bool live = key <= pos && key < key_end && (window <= 0 || key > pos - window);
+                float v = live ? (SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2) : NEG_INF;
                 s[nb][e] = v;
                 if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
             }
@@ -808,7 +824,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
 
 extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_attention(
     const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache, const int* block_table, const int* pos, const int* slots,
-    int layer, int qlen, int pages, int splits, float* part_acc, float* part_ml) {
+    int layer, int qlen, int pages, int splits, float* part_acc, float* part_ml, int window) {
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = DM_BK * HEAD_DIM;
     constexpr int KB = HEAD_DIM / 16;
@@ -840,7 +856,8 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
     int pos0 = r0 < rows ? pos[row0] : -1;
     int pos1 = r1 < rows ? pos[row1] : -1;
     const int* table = seq_table(block_table, slots, group * qlen, pages);
-    float scale_log2 = rsqrtf((float)HEAD_DIM) * 1.4426950408889634f;
+    float scale_log2 = QUERY_SCALE * 1.4426950408889634f;
+    constexpr float LOG2E = 1.4426950408889634f;
     unsigned qh[KB][4];
     unsigned ql[KB][4];
     const float* q0 = qkv + (size_t)row0 * QKV_ROW + head0 * HEAD_DIM;
@@ -936,7 +953,9 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nb * 8 + 2 * t + (e & 1);
-                float v = key < key_end && key <= (e < 2 ? pos0 : pos1) ? s[nb][e] * scale_log2 : NEG_INF;
+                int kpos = e < 2 ? pos0 : pos1;
+                bool live = key < key_end && key <= kpos && (window <= 0 || key > kpos - window);
+                float v = live ? (SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2) : NEG_INF;
                 s[nb][e] = v;
                 if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
             }
