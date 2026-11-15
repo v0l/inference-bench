@@ -11,8 +11,19 @@ Cheapest first. Stop at the lowest tier that can fail because of your change.
 | 1. CPU | Unit tests, spec parsing, codegen text, scheduler, wire formats, server, core, cli, ui | none | about 4 min cold build, 30 s warm | every change |
 | 2. Tiny fixtures on GPU | Qwen3-0.6B, Qwen2.5-0.5B variants, Llama-3.2-1B, tinymistral, and the `tiny-qwen3.5*` fixtures, with references in `SPECRT_REF_DIR` | under 3 GB | seconds to 2 min per file | any change to a kernel, the engine, the loader, serving or a spec field |
 | 3. Synthetic 27B-shaped layer | `gemm_speed`, `flash_speed`, `gdn_speed`, `kir_speed`, `fp4_batch`, `fp8_batch`: one layer with the 27B's shapes and random weights | under 4 GB | seconds | kernel speed and kernel correctness at 27B shapes |
-| 4. Mid-size benchmark | Qwen3.5-4B in NVFP4, about 3 GB, fits beside the user's app. Planned in #635, not landed yet. | about 6 GB | minutes | end-to-end speed checks, once it lands |
+| 4. Mid-size benchmark | Qwen3.5-4B in NVFP4 in the 27B's layout (`scripts/bench4b.sh`, 4.9 GB on disk, 7.1 GB on the device), fits beside the user's app | about 8 GB | 5 min | end-to-end speed checks: prefill, decode, batch 4/8/16, MTP |
 | 5. Real 27B | `tests/real27b.rs`, `vision_lm.rs`, `vision_encoder.rs`, `nvfp4.rs`, the `*27b*.sh` scripts | 25 to 96 GB | 15 to 30 min per run | final gate before merge, or a change specific to that checkpoint |
+
+The tiny27b fixture (`tests/fixtures/tiny-qwen3.5-27b`, #635) is the tier 2 stand-in for every 27B code path: 4 layers in the 27B's pattern, FP8 channel plus NVFP4 act-quant config, an MTP head, a vision tower with mrope 11/11/10, and transformers references beside it. Its tests run in about 100 s:
+
+```bash
+flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -q \
+  -p MemoryMax=16G -p MemorySwapMax=0 --working-directory=$PWD \
+  -E CARGO_TARGET_DIR -E CARGO_BUILD_JOBS \
+  cargo test -p inference-bench-specrt --release --test tiny27b -- --include-ignored
+```
+
+Regenerate with `~/.venv-vllm/bin/python crates/specrt/scripts/tiny27b.py all`. Gates and detail: `docs/specrt-test-fixtures.md`.
 
 Specs for tier 2 are in `crates/specrt/specs/` (`qwen3-0.6b`, `qwen3-0.6b-q8`, `qwen2.5-0.5b`, `-geglu`, `-linear4`, `-yarn4`, `llama-3.2-1b`, `tinymistral-248m`). The Qwen3.5 architecture fixtures (delta-net, fp8, NVFP4, MTP, head dim 256) are checked in under `crates/specrt/tests/fixtures/tiny-qwen3.5*`.
 
@@ -162,6 +173,7 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `flash_speed.rs` | attention timing (`SPECRT_FLASH_*`) | 3, timing | 1 | none | 2 GB |
 | `gdn_speed.rs` | delta-net timing (`SPECRT_GDN_TOKENS`) | 3, timing | 1 | none | 2 GB |
 | `kir_speed.rs` | kir kernel timing | 3, timing | 1 | none | 1 GB |
+| `tiny27b.rs` | tiny Qwen3.5 27B-shaped fixture vs transformers: weight-only and act-quant logits KL, greedy identity, MTP drafts, speculative greedy, vision embeddings and mrope logits | CPU (1 spec test), 2 | 6 | none, references are checked in | 1 GB, 100 s |
 | `real27b.rs` | 12 real-checkpoint gates: greedy and logits vs transformers and vLLM, MTP acceptance, per-layer trace, needle at 500k and 1M | 5 | 12 | `SPECRT_REF_DIR=~/.cache/specrt-ref-375`; `SPECRT_27B_SPEC`, `SPECRT_27B_NVFP4_SPEC`, `SPECRT_27B_NEEDLE_MODEL` | 25 to 96 GB; 1 to 30 min each |
 | `vision_encoder.rs`, `vision_lm.rs` | vision tower and image/video chat vs vLLM | 5 | 4, 10 | `SPECRT_VISION_REF_DIR`, `SPECRT_VISION_PRECISION` | 28 to 36 GB |
 | `nvfp4.rs` | real NVFP4 dequant vs `nvfp4-dequant` reference | 5 | 1 | the NVFP4 checkpoint | 26 GB |
@@ -178,6 +190,19 @@ cargo test -p inference-bench-ui
 ```
 
 GPU server tests: `cargo test -p inference-bench-server --release --test serving -- --include-ignored`, under the same flock and systemd-run wrapper.
+
+## Tier 4: Qwen3.5-4B NVFP4
+
+`crates/specrt/scripts/bench4b.sh` quantises `Qwen/Qwen3.5-4B-Base` to the 27B's layout on first use (`quantize4b.py`, into `~/.cache/specrt-models/Qwen3.5-4B-NVFP4`), then runs the bench binary under `flock /tmp/gpu27.lock`: single stream at 128, 1024 and 4096 tokens for the weight-only and act-quant specs, batch 4, 8 and 16, and MTP. Needs about 12 GB free on the card. Baseline (RTX PRO 6000 Max-Q, median of 3, commit 1655db2):
+
+| | weight-only spec | act-quant spec (as served) |
+|---|---|---|
+| prefill 128 / 1,024 / 4,096 tok/s | 5,709 / 9,556 / 9,397 | 11,947 / 23,086 / 21,470 |
+| decode, single, same prompts, tok/s | 255 / 253 / 241 | 253 / 250 / 240 |
+| decode aggregate, batch 4 / 8 / 16 tok/s | | 870 / 1,586 / 2,509 |
+| MTP k=2 / without, tok/s | | 356 (acceptance length 2.27) / 231 |
+
+Predicts reliably: act-quant against weight-only prefill (#612), whether a GEMV or head change helps bandwidth-bound decode, batch scaling shape (#604), MTP identity. Still needs the 27B: kernel dispatch at a row count (#604 b32 GEMV against tile GEMM), long-context decode attention and split counts (#617), memory and KV pool limits, vision timing, and any absolute number. Detail: `docs/specrt-test-fixtures.md`.
 
 ## Tier 5: the real 27B
 
