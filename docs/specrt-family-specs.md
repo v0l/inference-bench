@@ -23,52 +23,53 @@ corrected from tensor names by `apply_structure`.
 
 ## Decision table
 
-Where the master code decided per family (before this change, `crates/specrt/src/spec.rs`), and the
-family field that now carries it.
+Every decision the Rust code used to make per family, and the family field that now carries it.
+Shared defaults live in `family-base.toml`; the other families `extends = "base"`.
 
-| Decision | Master | Family field |
-|---|---|---|
-| allowed `model_type` list | `hf_config`, strict `ensure!` | `[match] model_types` |
-| nested `text_config` takes the outer `model_type` | `hf_config` | `[match] nested_text_config` (generic) |
-| qkv bias | `match hf.model_type` | `[attention] qkv_bias` |
-| qk-norm | `match hf.model_type` | `[attention] qk_norm` |
-| output gate | `attn_output_gate \|\| qwen3_next` | `[attention] output_gate` |
-| hybrid with delta-net | `family_hybrid` list | `[blocks] kind = "hybrid"` |
-| unit-offset RMSNorm | follows hybrid | follows `[blocks] kind` |
-| MTP layers | hybrid and no MoE | `mtp = true` |
-| MoE top-k renormalisation default | `family_hybrid` | follows `[blocks] kind` (hybrid renormalises) |
-| activation map | silu, gelu variants | `[activation]` (generic) |
-| accepted dtypes | bf16, f16, f32 | `[dtypes]` (generic) |
-| config keys for each dimension | `HfConfig` struct | `[fields]` (generic) |
-| quantisation methods | `parse_quantization` | `[quantization] methods` |
-| GGUF architecture | `Gguf::spec` allowlist | `[match] gguf` |
-| GGUF key names | `Gguf::spec` literals | `[gguf_fields]` |
+| Decision | Family field |
+|---|---|
+| allowed `model_type` / architectures / GGUF architecture | `[match] model_types`, `architectures`, `gguf` |
+| qkv bias, qk-norm, output gate | `[attention]` (a bool, or `{ config = "key", default = bool }`) |
+| dense, hybrid or decided by the config | `[blocks] kind` (hybrid also gives unit-offset norm and MoE top-k renormalisation) |
+| `layer_types` strings to blocks | `[blocks.layer_types]`, `other_layer_type` |
+| MTP layers | `mtp = true` |
+| activation names | `[activation.map]`, `lenient_default` |
+| accepted dtypes and the keys that state them | `[dtypes] keys`, `accepted` |
+| config key aliases | `[fields] canonical = ["alias", ...]` |
+| rope scaling type keys, names, parameter keys | `[rope] type_keys`, `unscaled`, `[rope.types]`, `[rope.keys]` |
+| quantisation method, group layout, markers | `[quantization] method_key`, `grouped_methods`, `groups_key`, `all_linear_target`, `layer_marker`, `mlp_marker` |
+| weight quant from a group or flat config | `[[quantization.group_rules]]`, `[[quantization.flat_rules]]` (first rule whose `when` paths all match wins; `defaults` fill absent paths) |
+| act-quant from `input_activations` | `[[quantization.act_rules]]` |
+| GGUF metadata keys and tensor names | `[gguf.keys]` (`{arch}` is replaced), `[gguf.tensors]` |
+| GGUF rope scaling and pre-tokenizers | `[gguf.rope_scaling]`, `unscaled`, `[gguf.pretokenizers]` |
 
-## Schema
+What stays in Rust is the schema: the `Quant`, `ActQuant`, `Activation` and `RopeScalingKind` enums,
+the arithmetic of each scaling kind, and the layout rules (one MLP quant for the first layers, the
+projection quant after them). A new architecture whose config uses these pieces needs only a TOML.
+
+## Strict and describe modes
+
+Strict (`from_hf_config*`) needs a matching family and refuses unknown activations, dtypes, rope
+types and quantisations. Describe (`describe_hf_config`) uses the `generic` family, falls back to
+its `lenient_default` activation, and ignores quantisation and rope errors.
+
+## Example
 
 ```toml
-name = "qwen3_5"
+name = "acme"
+kind = "family"
+extends = "base"
 
 [match]
-model_types = ["qwen3_5", "qwen3_5_text"]
-architectures = ["Qwen3_5ForConditionalGeneration"]
-gguf = ["qwen35"]
+model_types = ["acmelm"]
+gguf = ["acmelm"]
 
 [attention]
-qkv_bias = { config = "attention_bias", default = false }
 qk_norm = true
-output_gate = { config = "attn_output_gate", default = false }
 
-[blocks]
-kind = "hybrid"
+[activation.map]
+swish_glu = "swiglu"
 
-mtp = true
-
-
-[quantization]
-methods = ["compressed-tensors", "fp8"]
+[fields]
+hidden_size = ["n_embd"]
 ```
-
-A flag is `true`, `false`, or `{ config = "<key>", default = <bool> }`. A family may set
-`extends = "<other family>"`: its table is merged over the parent's before parsing, so `qwen3_moe`
-only states what differs from `qwen3`.
