@@ -1297,7 +1297,7 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let choice = crate::codegen::kernel_for(&self.spec, &self.target, name, tokens, w.kind())?;
+        let choice = crate::codegen::select(&self.spec, &self.target, name, tokens, w.kind())?;
         use crate::codegen::GemmPath;
         match (choice.path, &self.fp8_act, &self.fp4_act) {
             (GemmPath::F8a, Some(fa), _) => return self.tc_fp8(fa, &choice, w, bias, x, out, rows, tokens),

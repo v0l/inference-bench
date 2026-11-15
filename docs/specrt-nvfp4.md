@@ -545,7 +545,7 @@ four 8-wide N tiles of accumulators: with two row tiles per warp the FP8 kernel 
 at 128 registers, with one it does not spill. The ring is 3 stages of 32 x 128 hi/lo columns (48
 KB), so 2 blocks fit an SM; `BatchShape::blocks_per_sm` derives that from the shared memory and
 the splits follow from it (`gate_up` 4, `down` 16, `qkv` 6, `lin_in` 5, `o` and `lin_out` 12 on
-188 SMs). Every weight byte is still read once for 17 to 32 rows. Dispatch: `kernel_for` takes
+188 SMs). Every weight byte is still read once for 17 to 32 rows. Dispatch: `select` takes
 the batched GEMV for every FP8/NVFP4 projection up to 32 rows on `tile = "auto"`, before the
 activation-quantised GEMMs; above 32 the GEMMs keep it.
 

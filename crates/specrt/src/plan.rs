@@ -1,4 +1,4 @@
-use crate::codegen::{WeightKind, kernel_for};
+use crate::codegen::{WeightKind, select};
 use crate::spec::{Block, Quant, Spec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,7 +249,7 @@ impl Op {
         match self {
             Op::Linear { weight, .. } => {
                 let kind = weight_kind(weight.quant(spec, layer));
-                kernel_for(spec, target, weight.name(), tokens, kind).ok().map(|c| c.decoder)
+                select(spec, target, weight.name(), tokens, kind).ok().map(|c| c.decoder)
             }
             _ => None,
         }
@@ -267,7 +267,7 @@ impl Op {
             Op::Linear { weight, .. } => {
                 let w = *weight;
                 let kind = weight_kind(w.quant(spec, layer));
-                let choice = match kernel_for(spec, target, w.name(), tokens, kind) {
+                let choice = match select(spec, target, w.name(), tokens, kind) {
                     Ok(c) => c,
                     Err(e) => return vec![format!("unsupported: {e}")],
                 };
@@ -437,11 +437,11 @@ mod tests {
     }
 
     #[test]
-    fn linear_kernels_come_from_kernel_for() {
+    fn linear_kernels_come_from_select() {
         let (spec, _) = described("qwen3-0.6b.config.json", "qwen3-0.6b.json");
         let op = Op::Linear { weight: Weight::Qkv, input: Buf::XnPlanes, output: Buf::Qkv };
         let t = kir::Target { sm_count: 84, ..kir::Target::sm_120() };
-        let direct = kernel_for(&spec, &t, "qkv", 512, WeightKind::Bf16).unwrap();
+        let direct = select(&spec, &t, "qkv", 512, WeightKind::Bf16).unwrap();
         assert_eq!(op.kernels(&spec, 0, 512, &t), vec![direct.name]);
         assert_eq!(op.decoder(&spec, 0, 512, &t), Some("DecBf16"));
         assert_eq!(Op::Embed.decoder(&spec, 0, 512, &t), None);

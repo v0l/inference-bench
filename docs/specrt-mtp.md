@@ -403,7 +403,7 @@ Quiet card (local-llm stopped, `flock /tmp/gpu27.lock`), `scripts/batch8_604.sh`
 
 What the code does at 24 verify rows:
 
-- `kernel_for` picks the act-quant tile GEMMs (`gate_up_f4a`, `down_f4a_narrow`, `lin_in_f8_narrow`, ...)
+- `select` picks the act-quant tile GEMMs (`gate_up_f4a`, `down_f4a_narrow`, `lin_in_f8_narrow`, ...)
   above 16 rows, before the batched GEMVs. Forcing the 32-row GEMVs (`*_f4b32`, `*_f8b32`) instead was tried
   and is slower on the 27B, so the dispatch is unchanged.
 - `lm_head` runs the full 248k vocabulary on all 24 verify rows (`lm_head_mma_big`, 2.3 ms per round), then

@@ -1,4 +1,4 @@
-use specrt::codegen::{GDN_LINEARS, MMA_LINEARS, Module, WeightKind, kernel_for, render};
+use specrt::codegen::{GDN_LINEARS, MMA_LINEARS, Module, WeightKind, select, render};
 use specrt::mtp::MTP_LINEARS;
 use specrt::spec::{Quant, Spec, TileChoice};
 use std::collections::BTreeMap;
@@ -254,7 +254,7 @@ fn every_dispatched_kernel_is_generated() {
                     for &n in &tokens {
                         for sms in [48, 84, 188] {
                             let t = kir::Target { sm_count: sms, ..target };
-                            let c = kernel_for(&spec, &t, linear, n, weight).unwrap();
+                            let c = select(&spec, &t, linear, n, weight).unwrap();
                             let mut need = vec![c.name.clone()];
                             need.extend(c.quant.map(str::to_string));
                             need.extend(c.reduce.clone());

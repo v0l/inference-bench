@@ -141,11 +141,13 @@ fn split(spec: &Spec, linear: &str, wf: WeightFormat) -> bool {
 
 pub type KernelChoice = kg::Choice;
 
-pub fn kernel_for(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, weight: WeightKind) -> Result<KernelChoice> {
+pub fn request<'a>(spec: &Spec, linear: &'a str, tokens: usize, weight: WeightKind) -> Request<'a> {
     let wf = weight.format();
-    let shape = linear_shape(spec, linear);
-    let r = Request { linear, shape, tokens, weight: wf, split: split(spec, linear, wf) };
-    kg::select(target, &policy(spec), &r).map_err(anyhow::Error::msg)
+    Request { linear, shape: linear_shape(spec, linear), tokens, weight: wf, split: split(spec, linear, wf) }
+}
+
+pub fn select(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, weight: WeightKind) -> Result<KernelChoice> {
+    kg::select(target, &policy(spec), &request(spec, linear, tokens, weight)).map_err(anyhow::Error::msg)
 }
 
 pub fn batch_part_len(spec: &Spec, target: &kir::Target, fp4: bool) -> usize {
