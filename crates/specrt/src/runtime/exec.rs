@@ -73,6 +73,9 @@ impl Runtime {
                 }
             }
             Op::Norm { which, into } => self.norm_op(which, into, layer, run),
+            Op::NormAdd { which, from } => self.norm_add_op(which, from, layer, run),
+            Op::Clear { buf } => self.clear_op(buf, run),
+            Op::LogitSoftcap => self.softcap_op(run),
             Op::Linear { weight, input, output } => self.linear_op(weight, input, output, layer, run),
             Op::KvRope => self.attn_rope_rows(self.attn_of(layer), n, 0),
             Op::QkRope => self.qk_rope_legacy(self.attn_of(layer), n),
@@ -115,14 +118,21 @@ impl Runtime {
         Ok(())
     }
 
+    fn norm_weight<'a>(&'a self, which: NormKind, layer: Option<&'a DeviceLayer>) -> &'a CudaSlice<f32> {
+        let l = || layer.expect("layer norm runs inside a layer");
+        match which {
+            NormKind::Input => &l().ln1,
+            NormKind::PostAttention => &l().ln2,
+            NormKind::PreMlp => l().ln_pre_mlp.as_ref().expect("a sandwich layer has a pre mlp norm"),
+            NormKind::PostMlp => l().ln_post_mlp.as_ref().expect("a sandwich layer has a post mlp norm"),
+            NormKind::Final => &self.norm,
+        }
+    }
+
     fn norm_op(&self, which: NormKind, into: Buf, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
         let pre = &self.pre;
         let hidden = self.spec.dims.hidden;
-        let weight = match which {
-            NormKind::Input => &layer.expect("layer norm runs inside a layer").ln1,
-            NormKind::PostAttention => &layer.expect("layer norm runs inside a layer").ln2,
-            NormKind::Final => &self.norm,
-        };
+        let weight = self.norm_weight(which, layer);
         match into {
             Buf::XnPlanes if which == NormKind::Final => {
                 let x = pre.x.slice(run.rows.start * hidden..run.rows.end * hidden);
@@ -132,6 +142,34 @@ impl Runtime {
             Buf::Xn => self.rmsnorm_rows(&pre.x, weight, &pre.xn, run.n),
             other => unreachable!("norm into {}", other.label()),
         }
+    }
+
+    fn norm_add_op(&self, which: NormKind, from: Buf, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+        let weight = self.norm_weight(which, layer);
+        let mut b = self.stream.launch_builder(self.kernel("norm_add"));
+        let delta = self.f32_buf(from, run);
+        b.arg(delta).arg(weight).arg(&self.pre.x).arg(&self.pre.x);
+        unsafe { b.launch(super::cfg(run.n as u32, 1024)) }?;
+        Ok(())
+    }
+
+    fn clear_op(&self, buf: Buf, run: &Run) -> Result<()> {
+        let hidden = self.spec.dims.hidden;
+        let target = self.f32_buf(buf, run);
+        let mut b = self.stream.launch_builder(self.kernel("clear_branch"));
+        b.arg(target).arg(target);
+        let config = LaunchConfig { grid_dim: (grid(hidden, 256), run.n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn softcap_op(&self, run: &Run) -> Result<()> {
+        let vocab = self.spec.dims.vocab;
+        let mut b = self.stream.launch_builder(self.kernel("logit_softcap"));
+        b.arg(run.logits).arg(run.logits);
+        let config = LaunchConfig { grid_dim: (grid(vocab, 256), run.rows.len() as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
     }
 
     fn planes(&self, b: Buf) -> &Planes {
@@ -149,6 +187,7 @@ impl Runtime {
         match b {
             Buf::X => &self.pre.x,
             Buf::Xn => &self.pre.xn,
+            Buf::Branch => &self.pre.branch,
             Buf::Qkv => &self.pre.qkv,
             Buf::Attn => &self.pre.attn,
             Buf::GateUp => &self.pre.gate_up,

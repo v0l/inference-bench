@@ -40,6 +40,8 @@ impl DeviceMtp {
         let layer = DeviceLayer {
             ln1: stream.clone_htod(&w.layer.ln1)?,
             ln2: stream.clone_htod(&w.layer.ln2)?,
+            ln_pre_mlp: None,
+            ln_post_mlp: None,
             mixer: DeviceMixer::Attention(DeviceAttn {
                 qkv: DeviceMatrix::upload(stream, &a.qkv)?,
                 qkv_bias: up(&a.qkv_bias)?,

@@ -5,6 +5,78 @@ kind = "graph"
 op = "embed"
 out = "x"
 
+[[block]]
+name = "attention_sandwich"
+when = "sandwich+tensor_core"
+layers = ["dense", "full", "sliding"]
+mlp = "dense"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+in = "x"
+out = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+in = "xn_planes"
+out = "qkv"
+
+[[block.node]]
+op = "kv_rope"
+phase = "prefill"
+
+[[block.node]]
+op = "flash"
+phase = "prefill"
+
+[[block.node]]
+op = "decode_attention"
+phase = "decode"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+in = "attn_planes"
+out = "branch"
+
+[[block.node]]
+op = "norm_add"
+weight = "post_attention_layernorm.weight"
+in = "branch"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "pre_feedforward_layernorm.weight"
+in = "x"
+out = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+in = "xn_planes"
+out = "act_planes"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+in = "act_planes"
+out = "branch"
+
+[[block.node]]
+op = "norm_add"
+weight = "post_feedforward_layernorm.weight"
+in = "branch"
+
 [[tail]]
 op = "rmsnorm"
 weight = "norm.weight"
@@ -35,6 +107,7 @@ in = "xn_planes"
 
 [[block]]
 name = "attention"
+when = "plain"
 layers = ["dense", "full", "sliding"]
 mlp = "dense"
 
@@ -151,6 +224,7 @@ in = "act_planes"
 
 [[block]]
 name = "linear"
+when = "plain"
 layers = ["linear"]
 mlp = "dense"
 
@@ -215,6 +289,7 @@ in = "act_planes"
 
 [[block]]
 name = "attention_moe"
+when = "plain"
 layers = ["dense", "full", "sliding"]
 mlp = "sparse"
 
@@ -294,6 +369,7 @@ op = "moe_combine"
 
 [[block]]
 name = "linear_moe"
+when = "plain"
 layers = ["linear"]
 mlp = "sparse"
 
@@ -343,3 +419,7 @@ op = "moe_experts"
 
 [[block.node]]
 op = "moe_combine"
+
+[[tail]]
+op = "logit_softcap"
+when = "tensor_core+logit_softcap"

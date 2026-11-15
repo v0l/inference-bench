@@ -121,7 +121,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m)).transpose()? };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m)).transpose()? };
     copied(stream)?;
     Ok(layer)
 }
@@ -363,6 +363,8 @@ enum DeviceMixer {
 struct DeviceLayer {
     ln1: CudaSlice<f32>,
     ln2: CudaSlice<f32>,
+    ln_pre_mlp: Option<CudaSlice<f32>>,
+    ln_post_mlp: Option<CudaSlice<f32>>,
     mixer: DeviceMixer,
     gate_up: DeviceMatrix,
     down: DeviceMatrix,
@@ -579,6 +581,7 @@ struct PrefillBuffers {
     tokens: CudaSlice<i32>,
     x: CudaSlice<f32>,
     xn: CudaSlice<f32>,
+    branch: CudaSlice<f32>,
     qkv: CudaSlice<f32>,
     attn: CudaSlice<f32>,
     gate_up: CudaSlice<f32>,
@@ -856,6 +859,7 @@ impl Runtime {
             tokens: stream.alloc_zeros(chunk)?,
             x: stream.alloc_zeros(chunk * d.hidden)?,
             xn: stream.alloc_zeros(mma_only(chunk * d.hidden))?,
+            branch: stream.alloc_zeros(if spec.norm.sandwich { chunk * d.hidden } else { 1 })?,
             qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
             attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim()))?,
             gate_up: stream.alloc_zeros(mma_only(chunk * 2 * d.intermediate))?,

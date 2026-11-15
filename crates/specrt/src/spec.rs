@@ -1035,7 +1035,8 @@ impl Spec {
             .and_then(|o| o.values().find(|v| v.get("rope_theta").is_some()));
         let params = hf.rope_parameters.as_ref();
         let param = |key: &str| params.and_then(|p| p.get(key)).or(nested.and_then(|n| n.get(key))).and_then(|v| v.as_f64());
-        let scaling = match parse_rope_scaling(&family.rope, hf.rope_scaling.as_ref().or(params)) {
+        let full_params = params.and_then(|p| p.get("full_attention")).filter(|_| family.blocks.layer_types.values().any(|b| *b == Block::Full));
+        let scaling = match parse_rope_scaling(&family.rope, hf.rope_scaling.as_ref().or(full_params).or(params)) {
             Ok(s) => s,
             Err(e) if strict => return Err(e),
             Err(_) => None,

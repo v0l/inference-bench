@@ -17,6 +17,10 @@ constexpr int ROT = {{ROT}};
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = {{QK_NORM}};
 constexpr float EPS = {{EPS}};
+constexpr bool LOCAL_ROPE[] = { {{LOCAL_ROPE}} };
+constexpr float LOCAL_THETA = {{LOCAL_THETA}};
+constexpr float EMBED_SCALE = {{EMBED_SCALE}};
+constexpr float QUERY_SCALE = {{QUERY_SCALE}};
 constexpr float SOFTCAP = {{SOFTCAP}};
 constexpr float THETA = {{THETA}};
 constexpr int ROPE_KIND = {{ROPE_KIND}};
@@ -902,7 +906,7 @@ extern "C" __global__ void embed(const bf16_t* table, const int* token, float* x
     const bf16_t* row = table + (size_t)token[blockIdx.y] * HIDDEN;
     x += (size_t)blockIdx.y * HIDDEN;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x)
-        x[i] = bf16_to_f32(row[i]);
+        x[i] = bf16_to_f32(row[i]) * EMBED_SCALE;
 }
 
 extern "C" __global__ void splice_rows(float* x, const int* rows, const float* embeds) {
@@ -913,7 +917,8 @@ extern "C" __global__ void splice_rows(float* x, const int* rows, const float* e
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x) dst[i] = src[i];
 }
 
-__device__ __forceinline__ float rope_inv_freq(int i) {
+__device__ __forceinline__ float rope_inv_freq(int i, int layer) {
+    if (LOCAL_ROPE[layer]) return 1.0f / powf(LOCAL_THETA, (float)(2 * i) / (float)ROT);
     float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)ROT);
     if (ROPE_KIND == 1) {
         inv_freq /= ROPE_FACTOR;
@@ -1055,7 +1060,7 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     __syncthreads();
     if ((is_q || is_k) && d < ROT) {
         int fi = d < ROT_HALF ? d : d - ROT_HALF;
-        float angle = rope_position(mm_meta, mm_table, slot, pos, fi) * rope_inv_freq(fi);
+        float angle = rope_position(mm_meta, mm_table, slot, pos, fi) * rope_inv_freq(fi, layer);
         float c = cosf(angle) * ROPE_MSCALE;
         float s = sinf(angle) * ROPE_MSCALE;
         v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
@@ -1140,7 +1145,7 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
     int lane = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     static_assert(HEAD_DIM % 4 == 0 && HEAD_DIM <= 256, "unsupported head_dim");
-    float scale = rsqrtf((float)HEAD_DIM);
+    float scale = QUERY_SCALE;
     float4 q[GROUP][ATTN_V4];
 #pragma unroll
     for (int g = 0; g < GROUP; g++)
@@ -1325,7 +1330,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
     int sub = tid & 7;
     int qi = q0 + qr;
     int pos = base + qi;
-    float scale = rsqrtf((float)HEAD_DIM);
+    float scale = QUERY_SCALE;
     for (int i = tid; i < FA_BQ * HEAD_DIM; i += FA_THREADS) {
         int r = i / HEAD_DIM;
         int d = i % HEAD_DIM;
@@ -1482,7 +1487,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     int row1 = row0 + 8;
     int pos0 = base + row0;
     int pos1 = base + row1;
-    float scale_log2 = rsqrtf((float)HEAD_DIM) * 1.4426950408889634f;
+    float scale_log2 = QUERY_SCALE * 1.4426950408889634f;
     constexpr float LOG2E = 1.4426950408889634f;
     unsigned qh[FM_KB][4];
     unsigned ql[FM_KB][4];
@@ -1490,7 +1495,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     float* wq = qs + warp * 8 * HEAD_DIM;
     float freq[PAIRS];
 #pragma unroll
-    for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, ROT_HALF - 1));
+    for (int i = 0; i < PAIRS; i++) freq[i] = rope_inv_freq(min(lane + 32 * i, ROT_HALF - 1), layer);
 #pragma unroll
     for (int half = 0; half < 2; half++) {
         for (int r = 0; r < 8; r++) {

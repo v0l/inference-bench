@@ -1,0 +1,17 @@
+name = "gemma3"
+kind = "family"
+extends = "base"
+
+[match]
+model_types = ["gemma3_text"]
+architectures = ["Gemma3ForCausalLM"]
+
+[attention]
+qk_norm = true
+
+[norm]
+unit_offset = true
+sandwich = true
+
+[embedding]
+scale = "sqrt_hidden"

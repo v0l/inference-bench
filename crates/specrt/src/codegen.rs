@@ -134,7 +134,16 @@ pub fn kir_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>
     let inter = spec.dims.intermediate as u32;
     let norm = kir::Kernel::rmsnorm(target, hidden, spec.norm.eps as f32, 1024).map_err(anyhow::Error::msg)?;
     let gate = kir::Kernel::gated_activation(target, "swiglu", inter, act, 256).map_err(anyhow::Error::msg)?;
-    Ok(vec![norm, gate])
+    let mut out = vec![norm, gate];
+    let err = anyhow::Error::msg;
+    if spec.norm.sandwich {
+        out.push(kir::Kernel::norm_add(target, hidden, spec.norm.eps as f32, 0.0, 1024).map_err(err)?);
+        out.push(kir::Kernel::pointwise(target, "clear_branch", hidden, kir::Pointwise::Fill(0.0), 256).map_err(err)?);
+    }
+    if let Some(cap) = spec.dims.logit_softcap {
+        out.push(kir::Kernel::pointwise(target, "logit_softcap", spec.dims.vocab as u32, kir::Pointwise::SoftCap(cap as f32), 256).map_err(err)?);
+    }
+    Ok(out)
 }
 
 pub fn cuda_target(ctx: &cudarc::driver::CudaContext) -> Result<kir::Target> {
@@ -222,6 +231,10 @@ impl Module {
             ("QK_NORM", a.qk_norm.to_string()),
             ("QKV_BIAS", a.qkv_bias.to_string()),
             ("EPS", float_literal(spec.norm.eps)),
+            ("EMBED_SCALE", float_literal(spec.dims.embed_scale.unwrap_or(1.0))),
+            ("QUERY_SCALE", float_literal(spec.attention.query_scalar.map_or(1.0 / (a.head_dim as f64).sqrt(), |q| 1.0 / q.sqrt()))),
+            ("LOCAL_ROPE", (0..spec.layers.count).filter(|&i| !spec.block(i).is_linear()).map(|i| (spec.block(i) == crate::spec::Block::Sliding && spec.rope.local_theta.is_some()).to_string()).chain(std::iter::repeat_n("false".to_string(), spec.speculative().map_or(0, |m| m.layers) + 1)).collect::<Vec<_>>().join(", ")),
+            ("LOCAL_THETA", float_literal(spec.rope.local_theta.unwrap_or(spec.rope.theta))),
             ("SOFTCAP", float_literal(spec.attention.softcap.unwrap_or(0.0))),
             ("THETA", float_literal(spec.rope.theta)),
             ("ROPE_KIND", rope.kind.to_string()),
@@ -278,6 +291,11 @@ impl Module {
         let kir_hash = kir::fold_hashes([kir::module_hash(&kir_kernels), kir::gemm::instances_hash(&gemms.kernels)]);
         let mut source = format!("{}\n{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, gemm_source, render(MODEL_TEMPLATE, &vars)?, kir_source);
         let mut kernels = KERNELS.to_vec();
+        for k in &kir_kernels {
+            if !kernels.contains(&k.name) {
+                kernels.push(k.name);
+            }
+        }
         if la.is_some() {
             source.push('\n');
             source.push_str(&render(GDN_TEMPLATE, &vars)?);

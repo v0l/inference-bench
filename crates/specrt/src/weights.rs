@@ -56,6 +56,8 @@ pub struct MoeWeights {
 pub struct Layer<'a> {
     pub ln1: Vec<f32>,
     pub ln2: Vec<f32>,
+    pub ln_pre_mlp: Option<Vec<f32>>,
+    pub ln_post_mlp: Option<Vec<f32>>,
     pub mixer: Mixer<'a>,
     pub gate_up: Matrix<'a>,
     pub down: Matrix<'a>,
@@ -883,6 +885,8 @@ impl Checkpoint {
         Ok(Layer {
             ln1: self.norm(spec, &format!("{p}.input_layernorm.weight"), h)?,
             ln2: self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
+            ln_pre_mlp: if spec.norm.sandwich { Some(self.norm(spec, &format!("{p}.pre_feedforward_layernorm.weight"), h)?) } else { None },
+            ln_post_mlp: if spec.norm.sandwich { Some(self.norm(spec, &format!("{p}.post_feedforward_layernorm.weight"), h)?) } else { None },
             mixer,
             gate_up,
             down,
@@ -957,6 +961,8 @@ impl Checkpoint {
             layer: Layer {
                 ln1: self.norm(spec, &format!("{p}.input_layernorm.weight"), h)?,
                 ln2: self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
+                ln_pre_mlp: None,
+                ln_post_mlp: None,
                 mixer: Mixer::Attention(attn),
                 gate_up: Raw::interleave(gate, up)?.into_matrix(Quant::Bf16, "mtp gate_up")?,
                 down: bf16(down, "mtp down_proj")?,

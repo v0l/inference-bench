@@ -21,6 +21,7 @@ pub enum Buf {
     PreLin,
     PreBa,
     GdnPlanes,
+    Branch,
     Logits,
 }
 
@@ -39,6 +40,7 @@ impl Buf {
             Buf::PreLin => "lin",
             Buf::PreBa => "ba",
             Buf::GdnPlanes => "gdn planes",
+            Buf::Branch => "branch",
             Buf::Logits => "logits",
         }
     }
@@ -117,6 +119,8 @@ impl Weight {
 pub enum NormKind {
     Input,
     PostAttention,
+    PreMlp,
+    PostMlp,
     Final,
 }
 
@@ -125,6 +129,8 @@ impl NormKind {
         match self {
             NormKind::Input => "input_layernorm.weight",
             NormKind::PostAttention => "post_attention_layernorm.weight",
+            NormKind::PreMlp => "pre_feedforward_layernorm.weight",
+            NormKind::PostMlp => "post_feedforward_layernorm.weight",
             NormKind::Final => "norm.weight",
         }
     }
@@ -134,6 +140,9 @@ impl NormKind {
 pub enum Op {
     Embed,
     Norm { which: NormKind, into: Buf },
+    NormAdd { which: NormKind, from: Buf },
+    Clear { buf: Buf },
+    LogitSoftcap,
     Linear { weight: Weight, input: Buf, output: Buf },
     KvRope,
     QkRope,
@@ -165,8 +174,13 @@ impl Op {
             Op::Norm { which, .. } => match which {
                 NormKind::Input => "input norm".into(),
                 NormKind::PostAttention => "post attention norm".into(),
+                NormKind::PreMlp => "pre mlp norm".into(),
+                NormKind::PostMlp => "post mlp norm".into(),
                 NormKind::Final => "final norm".into(),
             },
+            Op::NormAdd { which, .. } => format!("{which:?} norm and add"),
+            Op::LogitSoftcap => "logit softcap".into(),
+            Op::Clear { .. } => "clear".into(),
             Op::Linear { weight, .. } => weight.name().into(),
             Op::KvRope | Op::QkRope => "norm and rope".into(),
             Op::Flash | Op::FlashLegacy => "attention".into(),
@@ -183,6 +197,9 @@ impl Op {
         match self {
             Op::Embed => "tokens to x".into(),
             Op::Norm { into, .. } => format!("x to {}", into.label()),
+            Op::NormAdd { from, .. } => format!("{} added to x", from.label()),
+            Op::LogitSoftcap => "logits to logits".into(),
+            Op::Clear { buf } => format!("zero {}", buf.label()),
             Op::Linear { input, output, .. } => format!("{} to {}", input.label(), output.label()),
             Op::KvRope | Op::QkRope => "qkv to kv cache".into(),
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention => "qkv and kv cache to attn".into(),
@@ -197,7 +214,7 @@ impl Op {
     pub fn tensors(&self, spec: &Spec) -> Vec<String> {
         match self {
             Op::Embed => vec!["embed_tokens.weight".into()],
-            Op::Norm { which, .. } => vec![which.tensor().into()],
+            Op::Norm { which, .. } | Op::NormAdd { which, .. } => vec![which.tensor().into()],
             Op::Linear { weight, .. } => weight.tensors(spec),
             Op::KvRope | Op::QkRope | Op::Flash | Op::DecodeAttention if spec.attention.qk_norm => {
                 vec!["self_attn.q_norm.weight".into(), "self_attn.k_norm.weight".into()]
@@ -244,6 +261,9 @@ impl Op {
             Op::Embed => names(&["embed"]),
             Op::Norm { into, .. } if matches!(into, Buf::XnPlanes) => names(&["rms_split"]),
             Op::Norm { .. } => names(&["rmsnorm"]),
+            Op::NormAdd { .. } => names(&["norm_add"]),
+            Op::LogitSoftcap => names(&["logit_softcap"]),
+            Op::Clear { .. } => names(&["clear_branch"]),
             Op::Linear { weight, .. } => {
                 let w = *weight;
                 let kind = weight_kind(w.quant(spec, layer));
@@ -296,8 +316,8 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn build(_spec: &Spec, phase: Phase, tensor_core: bool) -> Plan {
-        crate::graph::Graph::decoder().plan(phase, tensor_core).expect("the embedded decoder graph lowers")
+    pub fn build(spec: &Spec, phase: Phase, tensor_core: bool) -> Plan {
+        crate::graph::Graph::decoder().plan(spec, phase, tensor_core).expect("the embedded decoder graph lowers")
     }
 
     pub fn layer(&self, block: Block) -> &[Op] {
