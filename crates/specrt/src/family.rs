@@ -66,6 +66,13 @@ pub struct FamilyActivation {
     pub lenient_default: Option<crate::spec::Activation>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyDtypes {
+    pub keys: Vec<String>,
+    pub accepted: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Family {
@@ -85,6 +92,24 @@ pub struct Family {
     pub mtp: bool,
     #[serde(default)]
     pub activation: FamilyActivation,
+    #[serde(default)]
+    pub dtypes: FamilyDtypes,
+    #[serde(default)]
+    pub fields: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+impl Family {
+    pub fn normalise(&self, config: &mut serde_json::Value) {
+        let Some(map) = config.as_object_mut() else { return };
+        for (canonical, alternatives) in &self.fields {
+            if map.contains_key(canonical) {
+                continue;
+            }
+            if let Some(v) = alternatives.iter().find_map(|k| map.get(k)).cloned() {
+                map.insert(canonical.clone(), v);
+            }
+        }
+    }
 }
 
 static ACTIVE: std::sync::RwLock<Option<Registry>> = std::sync::RwLock::new(None);

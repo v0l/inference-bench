@@ -662,15 +662,12 @@ struct HfConfig {
     vocab_size: usize,
     rms_norm_eps: f64,
     rope_theta: Option<f64>,
-    #[serde(alias = "hidden_activation")]
     hidden_act: Option<String>,
     #[serde(default)]
     tie_word_embeddings: bool,
     attention_bias: Option<bool>,
     rope_scaling: Option<serde_json::Value>,
     rope_parameters: Option<serde_json::Value>,
-    torch_dtype: Option<String>,
-    dtype: Option<String>,
     #[serde(default)]
     attn_output_gate: bool,
     partial_rotary_factor: Option<f64>,
@@ -1008,7 +1005,14 @@ impl Spec {
             family.attention.qk_norm.read(&value),
             family.attention.output_gate.read(&value),
         );
-        let hf: HfConfig = serde_json::from_value(value).map_err(|e| {
+        family.normalise(&mut value);
+        let dtype_values: std::collections::HashMap<&str, String> = family
+            .dtypes
+            .keys
+            .iter()
+            .filter_map(|k| Some((k.as_str(), value.get(k)?.as_str()?.to_string())))
+            .collect();
+        let hf: HfConfig = serde_json::from_value(value.clone()).map_err(|e| {
             let text = e.to_string();
             match text.strip_prefix("missing field `").and_then(|r| r.split_once('`')) {
                 Some((field, _)) => anyhow::anyhow!("config.json has no {field}"),
@@ -1045,9 +1049,10 @@ impl Spec {
             (None, Some(other), true) => bail!("hidden_act {other} is not supported"),
             (None, None, true) => bail!("config.json has no hidden_act"),
         };
+        let stated_dtype = family.dtypes.keys.iter().find_map(|k| dtype_values.get(k.as_str())).map(String::as_str);
         if strict
-            && let Some(dtype) = hf.torch_dtype.as_deref().or(hf.dtype.as_deref())
-            && !matches!(dtype, "bfloat16" | "float16" | "float32")
+            && let Some(dtype) = stated_dtype
+            && !family.dtypes.accepted.iter().any(|d| d == dtype)
         {
             bail!("torch_dtype {dtype} is not supported");
         }

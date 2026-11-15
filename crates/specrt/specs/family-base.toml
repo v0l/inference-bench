@@ -9,3 +9,10 @@ silu = "swiglu"
 gelu_pytorch_tanh = "geglu"
 gelu_new = "geglu"
 gelu_fast = "geglu"
+
+[dtypes]
+keys = ["torch_dtype", "dtype"]
+accepted = ["bfloat16", "float16", "float32"]
+
+[fields]
+hidden_act = ["hidden_activation"]
