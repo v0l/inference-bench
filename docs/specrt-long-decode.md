@@ -129,3 +129,37 @@ the user's app on master. The 12 x 32k row is the same shape (387k live tokens):
 sequence before and 41.9 after in this bench. The live app's lower number includes prefill
 interleaved with decode, sequences above 32k and HTTP; that run needs the app and was not
 repeated here.
+
+## Tests
+
+`tests/decode_attention.rs`,
+`decode_attention_matches_the_reference_across_splits_mixed_lengths_and_verify_groups`: the kernel
+against an f64 reference on a 27B-shaped layer and on `tiny-qwen3.5`, with lengths 1 to 16,397
+(one chunk, many chunks, chunk boundaries at 255/256/257 and 16,384/16,385), mixed lengths in
+one batch, verify groups of 2, 3 and 4 rows, scattered pages. Max error 4e-6. A row of a verify
+group is bit-identical to the same row run alone when both pick the same chunk.
+
+`SPECRT_REF_DIR=~/.cache/specrt-ref-375`, each suite with `--include-ignored --skip real_27b
+--test-threads=1` (`scripts/suites617.sh`), quiet-GPU window:
+
+```
+decode_attention: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 24.47s
+mtp: test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 207.77s
+serving: test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 103.82s
+linear: test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 74.02s
+truncation: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 64.22s
+generate: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 21.00s
+kv_dtype: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.08s
+fused: test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.61s
+head_quant: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 173.14s
+prefix: test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s
+logits: test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.59s
+real27b: test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 250.40s
+lib: test result: ok. 144 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.32s
+codegen: test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+spec: test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+```
+
+`mtp` includes greedy identity against plain decode at batches 1, 3, 4, 5 and 8 (k = 1 to 3, every
+draft head, fp8 KV) and the chi-square rejection-sampling tests. `real27b` includes the vLLM
+greedy and logprob agreement and the MTP acceptance tests.
