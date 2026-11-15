@@ -41,6 +41,30 @@ impl ServerHandle {
     }
 }
 
+#[derive(Debug, PartialEq)]
+pub struct ListeningLimits {
+    pub admission_limit: usize,
+    pub queue_depth: usize,
+    pub engine_slots: String,
+    pub models: String,
+}
+
+impl ListeningLimits {
+    pub fn new(config: &ServerConfig, source: Option<&dyn ModelSource>) -> Self {
+        let (engine_slots, models) = match source {
+            Some(source) => match source.loaded().first() {
+                Some(m) => (
+                    m.slots.map_or_else(|| "unknown".to_string(), |n| n.to_string()),
+                    format!("engine ({})", m.id),
+                ),
+                None => ("set when a model loads".to_string(), "none loaded yet".to_string()),
+            },
+            None => ("per configured model".to_string(), config.models.len().to_string()),
+        };
+        Self { admission_limit: config.concurrency(), queue_depth: config.queue_depth, engine_slots, models }
+    }
+}
+
 impl Server {
     pub fn new(config: ServerConfig) -> Self {
         Self { config: Arc::new(config), factory: Arc::new(NativeFactory), probe: nvidia_smi_probe(), source: None }
@@ -70,6 +94,7 @@ impl Server {
         let listener = std::net::TcpListener::bind(addr).with_context(|| format!("binding {addr}"))?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
+        let limits = ListeningLimits::new(&self.config, self.source.as_deref());
         let state = AppState::new(self.config.clone(), self.factory, self.probe, self.source)?;
         let app = router(state.clone());
         let (tx, rx) = watch::channel(false);
@@ -81,9 +106,10 @@ impl Server {
             %addr,
             tls = self.config.tls.is_some(),
             auth = state.auth_required(),
-            max_concurrent = self.config.max_concurrent,
-            queue_depth = self.config.queue_depth,
-            models = self.config.models.len(),
+            admission_limit = limits.admission_limit,
+            queue_depth = limits.queue_depth,
+            engine_slots = %limits.engine_slots,
+            models = %limits.models,
             "server listening"
         );
         let task = match &self.config.tls {
@@ -219,4 +245,47 @@ fn spawn_preload(state: Arc<AppState>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manager::SourceModel;
+
+    struct Fixed(Vec<SourceModel>);
+
+    impl ModelSource for Fixed {
+        fn loaded(&self) -> Vec<SourceModel> {
+            self.0.clone()
+        }
+    }
+
+    fn app_config() -> ServerConfig {
+        let mut c = ServerConfig::parse("max_concurrent = 1\nqueue_depth = 16").unwrap();
+        c.max_num_seqs = Some(64);
+        c
+    }
+
+    #[test]
+    fn app_mode_limits_show_effective_admission_and_engine_slots() {
+        let source = Fixed(vec![SourceModel { id: "qwen".into(), aliases: vec![], slots: Some(8) }]);
+        let l = ListeningLimits::new(&app_config(), Some(&source));
+        assert_eq!(l.admission_limit, 64);
+        assert_eq!(l.queue_depth, 16);
+        assert_eq!(l.engine_slots, "8");
+        assert_eq!(l.models, "engine (qwen)");
+    }
+
+    #[test]
+    fn app_mode_without_a_loaded_model_says_none_loaded_yet() {
+        let l = ListeningLimits::new(&app_config(), Some(&Fixed(vec![])));
+        assert_eq!(l.models, "none loaded yet");
+    }
+
+    #[test]
+    fn configured_mode_shows_the_model_count() {
+        let c = ServerConfig::parse("[[models]]\nid='m'").unwrap();
+        let l = ListeningLimits::new(&c, None);
+        assert_eq!(l.models, "1");
+    }
 }

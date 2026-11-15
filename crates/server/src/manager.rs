@@ -57,6 +57,7 @@ pub type GpuProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 pub struct SourceModel {
     pub id: String,
     pub aliases: Vec<String>,
+    pub slots: Option<usize>,
 }
 
 pub trait ModelSource: Send + Sync + 'static {
