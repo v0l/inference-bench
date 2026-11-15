@@ -29,6 +29,10 @@ fn spec_named(name: &str) -> Spec {
     let mut spec = Spec::load(&fixtures().join(format!("{name}.toml"))).unwrap();
     complete_spec(&mut spec).unwrap();
     assert!(spec.vision.is_some() && spec.rope.mrope.is_some());
+    if let Some(p) = std::env::var_os("SPECRT_VISION_PRECISION") {
+        spec.runtime.vision.precision = serde_json::from_value(json!(p.to_string_lossy())).expect("SPECRT_VISION_PRECISION is fast or exact");
+    }
+    eprintln!("vision precision {:?}", spec.runtime.vision.precision);
     spec
 }
 
