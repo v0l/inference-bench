@@ -33,19 +33,24 @@ out = "xn_planes"
 
 ## Status
 
-Slice 1 (landed): grammar, parser (`graph.rs`), `graphs/dense.toml` for qwen2/qwen3/llama/mistral.
-A test proves the graph lowers to exactly the ops `Plan::build` produces today, so the existing
-kernels and golden logits are unchanged.
+- `graphs/decoder.toml` is the one embedded graph. It has the head, the tail, and four blocks
+  (attention, linear, attention with sparse MLP, linear with sparse MLP), each node tagged
+  `when = "tensor_core"` or `"legacy"` and `phase`. `Plan::build` lowers it through `graph.rs`;
+  `plan.rs` has no block-kind or op-sequence code. `tests/graph.rs` checks the lowered plan equals the
+  previous hand-written plan for every fixture config in every phase and kernel tier, and greps
+  `plan.rs` for architecture knowledge.
+- kir gained generic light primitives: `rmsnorm_offset` (`(1+w)` norm), `add_rmsnorm` (residual add
+  fused with the norm), `pointwise` (`Scale` for embedding scale, `SoftCap`). Emitted for CUDA, with
+  tests in `crates/kir/tests/emit.rs`. The runtime does not launch them yet.
 
-## Slices left
+## Not done
 
-1. Light primitives generated and fused by kir from node parameters (norm plus quant, act plus
-   quant, rope plus KV write, residual plus norm).
-2. Heavy primitives selected by node parameters (window, softcap, sinks, GQA, head_dim, quant).
-3. Hybrid delta-net, MTP, vision and MoE graphs.
-4. Switch `Plan::build` to the graph and delete the fixed `Op` list and block-kind match.
-5. Gemma 3 by TOML alone against a tiny transformers reference, then the grep test that keeps
-   architecture knowledge out of `plan.rs`, `runtime*` and `kir`.
+- Launching the new kir primitives from graph nodes (the runtime still uses the fixed kernels).
+- Sliding-window attention: the flash and decode attention kernels have no window option, and
+  `Spec::validate` refuses sliding layers. The Gemma 3 proof needs that kernel option, the extra
+  pre/post feed-forward norms, per-layer rope base and the embedding scale, each as a generic
+  graph parameter. Waiting on the attention kernel family work (#609, #620-#623).
+- MTP and vision are still driven by their own runtimes, not graph nodes.
 
 ## Prior art
 
