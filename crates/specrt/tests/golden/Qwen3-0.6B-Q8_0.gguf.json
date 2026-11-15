@@ -1,0 +1,36 @@
+{
+  "name": "qwen3-0.6b",
+  "repo": "",
+  "quant": "q8",
+  "dims": {
+    "hidden": 1024,
+    "intermediate": 3072,
+    "vocab": 151936,
+    "tie_embeddings": true
+  },
+  "layers": {
+    "count": 28,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 9.999999974752427e-7
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 16,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "qkv_bias": false,
+    "qk_norm": true
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 1000000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  }
+}

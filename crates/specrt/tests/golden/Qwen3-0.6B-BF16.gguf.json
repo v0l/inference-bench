@@ -1,0 +1,36 @@
+{
+  "name": "c1899de289a04d12100db370d81485cdf75e47ca",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 1024,
+    "intermediate": 3072,
+    "vocab": 151936,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 28,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 9.999999974752427e-7
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 16,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "qkv_bias": false,
+    "qk_norm": true
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 1000000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  }
+}

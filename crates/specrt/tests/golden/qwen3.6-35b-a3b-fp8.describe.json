@@ -1,0 +1,69 @@
+{
+  "name": "qwen3_5_moe",
+  "repo": "",
+  "quant": "fp8_block128",
+  "dims": {
+    "hidden": 2048,
+    "intermediate": 0,
+    "vocab": 248320,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 40,
+    "pattern": [
+      "linear",
+      "linear",
+      "linear",
+      "full"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6,
+    "unit_offset": true
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 16,
+    "kv_heads": 2,
+    "head_dim": 256,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "output_gate": true,
+    "rotary_dim": 64
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000000.0,
+    "mrope": {
+      "section": [
+        11,
+        11,
+        10
+      ],
+      "interleaved": true
+    }
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 256,
+    "active": 8,
+    "expert_intermediate": 512,
+    "shared_intermediate": 512
+  },
+  "linear_attention": {
+    "kind": "gated_delta_net",
+    "key_heads": 16,
+    "value_heads": 32,
+    "key_head_dim": 128,
+    "value_head_dim": 128,
+    "conv_kernel": 4
+  },
+  "mtp": {
+    "layers": 1,
+    "draft_tokens": 2,
+    "speculate": true
+  }
+}

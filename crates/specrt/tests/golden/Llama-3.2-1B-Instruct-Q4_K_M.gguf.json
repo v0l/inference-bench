@@ -1,0 +1,63 @@
+{
+  "name": "llama-3.2-1b-instruct",
+  "repo": "",
+  "quant": "gguf",
+  "dims": {
+    "hidden": 2048,
+    "intermediate": 8192,
+    "vocab": 128256,
+    "tie_embeddings": true
+  },
+  "layers": {
+    "count": 16,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 9.999999747378752e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 32,
+    "kv_heads": 8,
+    "head_dim": 64,
+    "qkv_bias": false,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 500000.0,
+    "scaling": {
+      "kind": "llama3",
+      "factor": 32.0,
+      "low_freq_factor": 1.0,
+      "high_freq_factor": 4.0,
+      "original_max_positions": 8192.0
+    }
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "runtime": {
+    "backend": "auto",
+    "graphs": true,
+    "fuse": true,
+    "tile": "auto",
+    "big_tile": [
+      256,
+      128,
+      4,
+      2
+    ],
+    "unsplit": [
+      "qkv",
+      "o",
+      "gate_up",
+      "down"
+    ],
+    "gemm_fp32": false,
+    "kv_dtype": "f16"
+  }
+}
