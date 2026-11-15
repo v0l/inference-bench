@@ -9,6 +9,7 @@ use std::ops::Range;
 pub(super) struct Plans {
     pub prefill: Plan,
     pub decode: Plan,
+    pub verify: Plan,
 }
 
 impl Plans {
@@ -16,13 +17,14 @@ impl Plans {
         Plans {
             prefill: Plan::build(spec, Phase::Prefill, tensor_core),
             decode: Plan::build(spec, Phase::Decode, tensor_core),
+            verify: Plan::build(spec, Phase::Verify, tensor_core),
         }
     }
 }
 
 impl Plans {
     pub fn for_stage(mut self, role: super::StageRole) -> Self {
-        for plan in [&mut self.prefill, &mut self.decode] {
+        for plan in [&mut self.prefill, &mut self.decode, &mut self.verify] {
             if !role.first {
                 plan.head.clear();
             }
@@ -41,6 +43,8 @@ pub(super) struct Run<'a> {
     pub rows: Range<usize>,
     pub bb: Option<&'a BatchBuffers>,
     pub start: Option<usize>,
+    pub qlen: usize,
+    pub mtp: Option<super::mtp::MtpArgs<'a>>,
 }
 
 impl PlanBackend<Run<'_>> for Runtime {
@@ -62,7 +66,7 @@ impl PlanBackend<Run<'_>> for Runtime {
 }
 
 impl Runtime {
-    fn run_one(&self, op: &Op, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+    pub(super) fn run_one(&self, op: &Op, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
         let n = run.n;
         match *op {
             Op::Embed => {
@@ -81,10 +85,12 @@ impl Runtime {
             Op::QkRope => self.qk_rope_legacy(self.attn_of(layer), n),
             Op::Flash => self.attn_flash_rows(self.attn_of(layer), n, 0),
             Op::FlashLegacy => self.flash_legacy(self.attn_of(layer), n),
-            Op::DecodeAttention => self.attn_decode_rows(self.attn_of(layer), run.bb.expect("decode runs carry batch buffers"), n, 1),
+            Op::DecodeAttention => self.attn_decode_rows(self.attn_of(layer), run.bb.expect("decode runs carry batch buffers"), n, run.qlen),
             Op::Swiglu => self.swiglu_legacy(n),
             Op::GdnPrefill => self.gdn_prefill_rows(self.gdn_of(layer), n, 0),
             Op::GdnDecode => self.gdn_decode_rows(self.gdn_of(layer), &run.bb.expect("decode runs carry batch buffers").slots, n),
+            Op::GdnVerify => self.gdn_verify_op(self.gdn_of(layer), run),
+            Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => self.mtp_op(op, run),
             Op::MoeRoute => self.moe_route(layer.expect("moe runs inside a layer"), &self.pre.x, n),
             Op::MoeExperts => self.moe_experts(layer.expect("moe runs inside a layer"), n),
             Op::MoeCombine => self.moe_combine(&self.pre.x, n),
@@ -178,6 +184,7 @@ impl Runtime {
             Buf::AttnPlanes => &self.pre.attn_planes,
             Buf::ActPlanes => &self.pre.act_planes,
             Buf::GdnPlanes => &self.gdn.as_ref().expect("linear layers have gdn buffers").planes,
+            Buf::FcPlanes => self.mtp_fc_planes(),
             other => unreachable!("{} is not a plane pair", other.label()),
         }
     }
@@ -195,12 +202,13 @@ impl Runtime {
             Buf::PreLin => &gdn().pre_lin,
             Buf::PreBa => &gdn().pre_ba,
             Buf::Logits => run.logits,
+            Buf::MtpLogits => self.mtp_logits(),
             other => unreachable!("{} is not an f32 buffer", other.label()),
         }
     }
 
     fn is_planes(b: Buf) -> bool {
-        matches!(b, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes)
+        matches!(b, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::FcPlanes)
     }
 
     fn weight_of<'a>(&'a self, weight: Weight, layer: Option<&'a DeviceLayer>) -> (&'a DeviceMatrix, Option<&'a CudaSlice<f32>>) {
@@ -216,6 +224,11 @@ impl Runtime {
             Weight::LinBa => (&gdn().ba, None),
             Weight::LinOut => (&gdn().out, None),
             Weight::LmHead => (&self.lm_head, None),
+            Weight::MtpQkv => (&attn().qkv, None),
+            Weight::MtpO => (&attn().o, None),
+            Weight::MtpGateUp => (&layer_of().gate_up, None),
+            Weight::MtpDown => (&layer_of().down, None),
+            Weight::MtpFc | Weight::MtpHead => (self.mtp_weight(weight), None),
         }
     }
 
@@ -232,7 +245,8 @@ impl Runtime {
                 Buf::ActPlanes => GemmOut::Planes(&self.pre.act_planes),
                 other => GemmOut::F32(self.f32_buf(other, run)),
             };
-            return self.tc(weight.name(), w, bias, x, out, rows, tokens);
+            let name = if weight == Weight::MtpHead { self.mtp_head_kernel() } else { weight.name() };
+            return self.tc(name, w, bias, x, out, rows, tokens);
         }
         let out = self.f32_buf(output, run);
         let name = format!("{}_gemm", weight.name());

@@ -5,6 +5,7 @@ use crate::spec::{Block, Quant, Spec};
 pub enum Phase {
     Prefill,
     Decode,
+    Verify,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub enum Buf {
     GdnPlanes,
     Branch,
     Logits,
+    FcPlanes,
+    MtpLogits,
 }
 
 impl Buf {
@@ -42,6 +45,8 @@ impl Buf {
             Buf::GdnPlanes => "gdn planes",
             Buf::Branch => "branch",
             Buf::Logits => "logits",
+            Buf::FcPlanes => "fc planes",
+            Buf::MtpLogits => "draft logits",
         }
     }
 }
@@ -56,6 +61,12 @@ pub enum Weight {
     LinBa,
     LinOut,
     LmHead,
+    MtpFc,
+    MtpQkv,
+    MtpO,
+    MtpGateUp,
+    MtpDown,
+    MtpHead,
 }
 
 impl Weight {
@@ -69,18 +80,24 @@ impl Weight {
             Weight::LinBa => "lin_ba",
             Weight::LinOut => "lin_out",
             Weight::LmHead => "lm_head",
+            Weight::MtpFc => "mtp_fc",
+            Weight::MtpQkv => "mtp_qkv",
+            Weight::MtpO => "mtp_o",
+            Weight::MtpGateUp => "mtp_gate_up",
+            Weight::MtpDown => "mtp_down",
+            Weight::MtpHead => "mtp_head",
         }
     }
 
     pub fn rows(self, spec: &Spec) -> usize {
         let la = spec.linear_attention.as_ref();
         match self {
-            Weight::Qkv => spec.qkv_rows(),
-            Weight::GateUp => 2 * spec.dims.intermediate,
-            Weight::O | Weight::Down | Weight::LinOut => spec.dims.hidden,
+            Weight::Qkv | Weight::MtpQkv => spec.qkv_rows(),
+            Weight::GateUp | Weight::MtpGateUp => 2 * spec.dims.intermediate,
+            Weight::O | Weight::Down | Weight::LinOut | Weight::MtpFc | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
             Weight::LinIn => la.map_or(0, |l| l.in_proj_rows()),
             Weight::LinBa => la.map_or(0, |l| l.ba_rows()),
-            Weight::LmHead => spec.dims.vocab,
+            Weight::LmHead | Weight::MtpHead => spec.dims.vocab,
         }
     }
 
@@ -102,6 +119,7 @@ impl Weight {
             Weight::LinOut => vec![w("linear_attn.out_proj")],
             Weight::LmHead if spec.dims.tie_embeddings => vec![w("embed_tokens")],
             Weight::LmHead => vec![w("lm_head")],
+            Weight::MtpFc | Weight::MtpQkv | Weight::MtpO | Weight::MtpGateUp | Weight::MtpDown | Weight::MtpHead => Vec::new(),
         }
     }
 }
@@ -112,6 +130,7 @@ pub enum QuantSource {
     Mlp,
     Bf16,
     Head,
+    DraftHead,
 }
 
 impl QuantSource {
@@ -121,6 +140,7 @@ impl QuantSource {
             QuantSource::Mlp => spec.mlp_quant(layer),
             QuantSource::Bf16 => Quant::Bf16,
             QuantSource::Head => spec.lm_head_quant(),
+            QuantSource::DraftHead => spec.draft_head_quant().unwrap_or_else(|| spec.lm_head_quant()),
         }
     }
 }
@@ -162,6 +182,11 @@ pub enum Op {
     Swiglu,
     GdnPrefill,
     GdnDecode,
+    GdnVerify,
+    MtpIn,
+    MtpGather,
+    MtpNorm,
+    MtpDraft,
     MoeRoute,
     MoeExperts,
     MoeCombine,
@@ -196,7 +221,11 @@ impl Op {
             Op::Flash | Op::FlashLegacy => "attention".into(),
             Op::DecodeAttention => "decode attention".into(),
             Op::Swiglu => "swiglu".into(),
-            Op::GdnPrefill | Op::GdnDecode => "delta rule".into(),
+            Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "delta rule".into(),
+            Op::MtpIn => "draft input".into(),
+            Op::MtpGather => "draft rows".into(),
+            Op::MtpNorm => "draft norm".into(),
+            Op::MtpDraft => "draft tokens".into(),
             Op::MoeRoute => "router".into(),
             Op::MoeExperts => "experts".into(),
             Op::MoeCombine => "combine".into(),
@@ -214,7 +243,11 @@ impl Op {
             Op::KvRope | Op::QkRope => "qkv to kv cache".into(),
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention => "qkv and kv cache to attn".into(),
             Op::Swiglu => "gate_up to act".into(),
-            Op::GdnPrefill | Op::GdnDecode => "lin, ba and state to gdn".into(),
+            Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "lin, ba and state to gdn".into(),
+            Op::MtpIn => "tokens and hidden to fc planes".into(),
+            Op::MtpGather => "hidden rows to draft rows".into(),
+            Op::MtpNorm => "draft rows to xn planes".into(),
+            Op::MtpDraft => "draft logits to draft tokens".into(),
             Op::MoeRoute => "x to top-k experts".into(),
             Op::MoeExperts => "x and top-k to expert outputs".into(),
             Op::MoeCombine => "expert outputs to x".into(),
@@ -302,6 +335,11 @@ impl Op {
                 "gdn_gated_norm",
             ]),
             Op::GdnDecode => names(&["gdn_conv_step", "gdn_step", "split_rows"]),
+            Op::GdnVerify => names(&["gdn_conv_verify", "gdn_verify", "split_rows"]),
+            Op::MtpIn => names(&["mtp_fc_in"]),
+            Op::MtpGather => names(&["mtp_copy"]),
+            Op::MtpNorm => names(&["rms_split"]),
+            Op::MtpDraft => names(&["mtp_draft"]),
             Op::MoeRoute => names(&["moe_route"]),
             Op::MoeExperts => names(&["moe_up_bf16", "moe_down_bf16"]),
             Op::MoeCombine => names(&["moe_combine"]),
@@ -323,6 +361,8 @@ pub struct Plan {
     pub head: Vec<Op>,
     pub blocks: Vec<PlanBlock>,
     pub tail: Vec<Op>,
+    pub mtp: Vec<Op>,
+    pub mtp_head: Vec<Op>,
 }
 
 impl Plan {

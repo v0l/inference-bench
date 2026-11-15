@@ -1777,7 +1777,7 @@ impl Runtime {
         let plan = &self.plans.prefill;
         let out = all_logits.unwrap_or(&self.buf.logits);
         let rows = if all_logits.is_some() { 0..n } else { n - 1..n };
-        let run = exec::Run { n, tokens: &self.pre.tokens, logits: out, rows, bb: None, start: Some(start) };
+        let run = exec::Run { n, tokens: &self.pre.tokens, logits: out, rows, bb: None, start: Some(start), qlen: 1, mtp: None };
         crate::executor::run_plan(self, plan, &run, &mut |i| self.trace_layer(trace, i, n))
     }
 
@@ -2206,7 +2206,7 @@ impl Runtime {
 
     fn decode_rows(&self, bb: &BatchBuffers, n: usize) -> Result<()> {
         let plan = &self.plans.decode;
-        let run = exec::Run { n, tokens: &bb.tokens, logits: &bb.logits, rows: 0..n, bb: Some(bb), start: None };
+        let run = exec::Run { n, tokens: &bb.tokens, logits: &bb.logits, rows: 0..n, bb: Some(bb), start: None, qlen: 1, mtp: None };
         crate::executor::run_plan(self, plan, &run, &mut |_| Ok(()))
     }
 

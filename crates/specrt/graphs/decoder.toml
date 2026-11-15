@@ -34,7 +34,7 @@ phase = "prefill"
 
 [[block.node]]
 op = "decode_attention"
-phase = "decode"
+phase = "rows"
 
 [[block.node]]
 op = "clear"
@@ -176,7 +176,7 @@ phase = "prefill"
 [[block.node]]
 op = "decode_attention"
 when = "tensor_core"
-phase = "decode"
+phase = "rows"
 
 [[block.node]]
 op = "linear"
@@ -276,6 +276,11 @@ when = "tensor_core"
 phase = "decode"
 
 [[block.node]]
+op = "gdn_verify"
+when = "tensor_core"
+phase = "verify"
+
+[[block.node]]
 op = "linear"
 weight = "lin_out"
 quant = "attn"
@@ -371,7 +376,7 @@ phase = "prefill"
 [[block.node]]
 op = "decode_attention"
 when = "tensor_core"
-phase = "decode"
+phase = "rows"
 
 [[block.node]]
 op = "linear"
@@ -430,6 +435,11 @@ when = "tensor_core"
 phase = "decode"
 
 [[block.node]]
+op = "gdn_verify"
+when = "tensor_core"
+phase = "verify"
+
+[[block.node]]
 op = "linear"
 weight = "lin_out"
 quant = "attn"
@@ -449,3 +459,98 @@ op = "moe_combine"
 [[tail]]
 op = "logit_softcap"
 when = "tensor_core+logit_softcap"
+
+[[mtp]]
+op = "mtp_in"
+when = "speculative+tensor_core"
+out = "fc_planes"
+
+[[mtp]]
+op = "linear"
+weight = "mtp_fc"
+quant = "attn"
+when = "speculative+tensor_core"
+in = "fc_planes"
+out = "x"
+
+[[mtp]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+when = "speculative+tensor_core"
+in = "x"
+
+[[mtp]]
+op = "linear"
+weight = "mtp_qkv"
+quant = "attn"
+when = "speculative+tensor_core"
+in = "xn_planes"
+out = "qkv"
+
+[[mtp]]
+op = "kv_rope"
+phase = "prefill"
+when = "speculative+tensor_core"
+
+[[mtp]]
+op = "flash"
+phase = "prefill"
+when = "speculative+tensor_core"
+
+[[mtp]]
+op = "decode_attention"
+phase = "rows"
+when = "speculative+tensor_core"
+
+[[mtp]]
+op = "linear"
+weight = "mtp_o"
+quant = "attn"
+when = "speculative+tensor_core"
+in = "attn_planes"
+out = "x"
+
+[[mtp]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+when = "speculative+tensor_core"
+in = "x"
+
+[[mtp]]
+op = "linear"
+weight = "mtp_gate_up"
+quant = "mlp"
+when = "speculative+tensor_core"
+in = "xn_planes"
+out = "act_planes"
+
+[[mtp]]
+op = "linear"
+weight = "mtp_down"
+quant = "mlp"
+when = "speculative+tensor_core"
+in = "act_planes"
+out = "x"
+
+[[mtp_head]]
+op = "mtp_gather"
+when = "speculative+tensor_core"
+
+[[mtp_head]]
+op = "mtp_norm"
+when = "speculative+tensor_core"
+out = "xn_planes"
+
+[[mtp_head]]
+op = "linear"
+weight = "mtp_head"
+quant = "draft_head"
+when = "speculative+tensor_core"
+in = "xn_planes"
+out = "mtp_logits"
+
+[[mtp_head]]
+op = "mtp_draft"
+when = "speculative+tensor_core"

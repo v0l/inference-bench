@@ -129,6 +129,16 @@ pub struct SpecRow {
     pub max_accept: usize,
 }
 
+pub(super) struct MtpArgs<'a> {
+    pub tokens: &'a CudaView<'a, i32>,
+    pub hidx: &'a CudaView<'a, i32>,
+    pub xsrc: &'a CudaSlice<f32>,
+    pub pre: &'a CudaSlice<f32>,
+    pub src: &'a CudaView<'a, i32>,
+    pub col: usize,
+    pub slots: &'a CudaView<'a, i32>,
+}
+
 enum Attn {
     Contiguous,
     Rows(usize),
@@ -300,52 +310,133 @@ impl Runtime {
         Ok(())
     }
 
-    fn mtp_layer(&self, tokens: &CudaView<i32>, hidx: &CudaView<i32>, xsrc: &CudaSlice<f32>, pre: &CudaSlice<f32>, n: usize, attn: Attn) -> Result<()> {
+    fn mtp_run<'a>(&'a self, n: usize, qlen: usize, args: MtpArgs<'a>, ops: &[crate::plan::Op]) -> Result<()> {
         let m = self.mtp();
-        let s = &self.spec;
-        let h = s.dims.hidden;
-        let p = &self.pre;
-        let mut b = self.stream.launch_builder(self.kernel("mtp_fc_in"));
-        b.arg(&self.embed)
-            .arg(tokens)
-            .arg(xsrc)
-            .arg(&m.pending)
-            .arg(hidx)
-            .arg(pre)
-            .arg(&m.w.norm_embed)
-            .arg(&m.w.norm_hidden)
-            .arg(&m.fc_planes.hi)
-            .arg(&m.fc_planes.lo);
-        unsafe { b.launch(cfg(n as u32, 256)) }?;
-        self.tc("mtp_fc", &m.w.fc, None, m.fc_planes.all(), GemmOut::F32(&p.x), h, n)?;
-        let layer = &m.w.layer;
-        let DeviceMixer::Attention(l) = &layer.mixer else { unreachable!("the MTP layer is full attention") };
-        self.rms_split(&p.x.as_view(), &layer.ln1, &p.xn_planes, n)?;
-        self.tc("mtp_qkv", &l.qkv, None, p.xn_planes.all(), GemmOut::F32(&p.qkv), s.qkv_rows(), n)?;
-        match attn {
-            Attn::Contiguous => self.attn_prefill_rows(l, n, 0)?,
-            Attn::Rows(qlen) => self.attn_decode_rows(l, &m.vb, n, qlen)?,
+        let run = super::exec::Run { n, tokens: &m.vb.tokens, logits: &m.logits, rows: 0..n, bb: Some(&m.vb), start: None, qlen, mtp: Some(args) };
+        for op in ops {
+            self.run_mtp_node(op, &run)?;
         }
-        self.tc("mtp_o", &l.o, None, p.attn_planes.all(), GemmOut::F32(&p.x), h, n)?;
-        self.rms_split(&p.x.as_view(), &layer.ln2, &p.xn_planes, n)?;
-        let inter = s.dims.intermediate;
-        self.tc("mtp_gate_up", &layer.gate_up, None, p.xn_planes.all(), GemmOut::Planes(&p.act_planes), 2 * inter, n)?;
-        self.tc("mtp_down", &layer.down, None, p.act_planes.all(), GemmOut::F32(&p.x), h, n)
+        Ok(())
+    }
+
+    fn mtp_layer(&self, tokens: &CudaView<i32>, hidx: &CudaView<i32>, xsrc: &CudaSlice<f32>, pre: &CudaSlice<f32>, n: usize, attn: Attn) -> Result<()> {
+        let iota = self.mtp().iota.as_view();
+        let args = MtpArgs { tokens, hidx, xsrc, pre, src: &iota, col: 0, slots: &iota };
+        match attn {
+            Attn::Contiguous => self.mtp_run(n, 1, args, &self.plans.prefill.mtp),
+            Attn::Rows(qlen) => self.mtp_run(n, qlen, args, &self.plans.decode.mtp),
+        }
     }
 
     fn mtp_heads(&self, src: &CudaView<i32>, n: usize, col: usize, slots: &CudaView<i32>) -> Result<()> {
         let m = self.mtp();
-        self.copy_rows_by_index(&self.pre.x, src, &m.cg, &m.iota.as_view(), n)?;
-        self.rms_split(&m.cg.as_view(), &m.w.norm, &self.pre.xn_planes, n)?;
-        let (head_name, head) = match &m.w.head {
-            Some(h) => ("mtp_head", h),
-            None => ("lm_head", &self.lm_head),
+        let iota = m.iota.as_view();
+        let args = MtpArgs { tokens: &iota, hidx: &iota, xsrc: &m.vx, pre: &self.norm, src, col, slots };
+        self.mtp_run(n, 1, args, &self.plans.decode.mtp_head)
+    }
+
+    pub(super) fn mtp_logits(&self) -> &CudaSlice<f32> {
+        &self.mtp().logits
+    }
+
+    pub(super) fn mtp_fc_planes(&self) -> &Planes {
+        &self.mtp().fc_planes
+    }
+
+    pub(super) fn mtp_weight(&self, w: crate::plan::Weight) -> &DeviceMatrix {
+        let m = self.mtp();
+        match w {
+            crate::plan::Weight::MtpFc => &m.w.fc,
+            _ => m.w.head.as_ref().unwrap_or(&self.lm_head),
+        }
+    }
+
+    pub(super) fn mtp_head_kernel(&self) -> &'static str {
+        if self.mtp().w.head.is_some() { "mtp_head" } else { "lm_head" }
+    }
+
+    pub(super) fn run_mtp_node(&self, op: &crate::plan::Op, run: &super::exec::Run) -> Result<()> {
+        self.run_one(op, Some(&self.mtp().w.layer), run)
+    }
+
+    pub(super) fn mtp_op(&self, op: &crate::plan::Op, run: &super::exec::Run) -> Result<()> {
+        use crate::plan::Op;
+        let m = self.mtp();
+        let a = run.mtp.as_ref().expect("mtp ops carry their arguments");
+        let n = run.n;
+        match op {
+            Op::MtpIn => {
+                let mut b = self.stream.launch_builder(self.kernel("mtp_fc_in"));
+                b.arg(&self.embed)
+                    .arg(a.tokens)
+                    .arg(a.xsrc)
+                    .arg(&m.pending)
+                    .arg(a.hidx)
+                    .arg(a.pre)
+                    .arg(&m.w.norm_embed)
+                    .arg(&m.w.norm_hidden)
+                    .arg(&m.fc_planes.hi)
+                    .arg(&m.fc_planes.lo);
+                unsafe { b.launch(cfg(n as u32, 256)) }?;
+                Ok(())
+            }
+            Op::MtpGather => self.copy_rows_by_index(&self.pre.x, &a.src, &m.cg, &m.iota.as_view(), n),
+            Op::MtpNorm => self.rms_split(&m.cg.as_view(), &m.w.norm, &self.pre.xn_planes, n),
+            Op::MtpDraft => {
+                let (col, k) = (a.col as i32, m.k as i32);
+                let mut b = self.stream.launch_builder(self.kernel("mtp_draft"));
+                b.arg(&m.logits).arg(&m.drafts).arg(&col).arg(&k).arg(&m.ctok).arg(a.slots);
+                unsafe { b.launch(cfg(n as u32, 1024)) }?;
+                Ok(())
+            }
+            _ => unreachable!("not an MTP op"),
+        }
+    }
+
+    pub(super) fn gdn_verify_op(&self, g: &super::DeviceGdn, run: &super::exec::Run) -> Result<()> {
+        let m = self.mtp();
+        let n = run.n;
+        let k1 = run.qlen;
+        let nseq = n / k1;
+        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
+        let la = &gb.la;
+        let seq_slots = self.spec.linear_layers() as i32;
+        let (vd, rows_i, k1_i) = (la.value_dim(), m.rows, k1 as i32);
+        let l = g.slot as usize;
+        let clog = m.clog.slice(l * rows_i * la.conv_dim()..);
+        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_verify"));
+        b.arg(&gb.pre_lin).arg(&g.conv).arg(&*gb.conv_state).arg(&gb.pre_mix).arg(&clog).arg(&g.slot).arg(&seq_slots).arg(&m.vb.slots).arg(&k1_i);
+        let config = LaunchConfig { grid_dim: (grid(la.conv_dim(), 256), nseq as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        let klog = m.klog.slice(l * rows_i * vd..);
+        let dlog = m.dlog.slice(l * rows_i * vd..);
+        let glog = m.glog.slice(l * rows_i * la.value_heads..);
+        let mut b = self.stream.launch_builder(self.kernel("gdn_verify"));
+        b.arg(&gb.pre_mix)
+            .arg(&gb.pre_lin)
+            .arg(&gb.pre_ba)
+            .arg(&g.neg_a)
+            .arg(&g.dt_bias)
+            .arg(&g.norm)
+            .arg(&*gb.ssm_state)
+            .arg(&gb.o)
+            .arg(&klog)
+            .arg(&dlog)
+            .arg(&glog)
+            .arg(&g.slot)
+            .arg(&seq_slots)
+            .arg(&m.vb.slots)
+            .arg(&k1_i);
+        let config = LaunchConfig {
+            grid_dim: (la.value_heads as u32, nseq as u32, 1),
+            block_dim: ((la.value_head_dim * LA_KSPLIT) as u32, 1, 1),
+            shared_mem_bytes: 0,
         };
-        self.tc(head_name, head, None, self.pre.xn_planes.all(), GemmOut::F32(&m.logits), self.spec.dims.vocab, n)?;
-        let (col, k) = (col as i32, m.k as i32);
-        let mut b = self.stream.launch_builder(self.kernel("mtp_draft"));
-        b.arg(&m.logits).arg(&m.drafts).arg(&col).arg(&k).arg(&m.ctok).arg(slots);
-        unsafe { b.launch(cfg(n as u32, 1024)) }?;
+        unsafe { b.launch(config) }?;
+        let mut b = self.stream.launch_builder(self.kernel("split_rows"));
+        let count = (n * vd) as i32;
+        b.arg(&gb.o).arg(&gb.planes.hi).arg(&gb.planes.lo).arg(&count);
+        unsafe { b.launch(cfg(grid(n * vd, 512), 256)) }?;
         Ok(())
     }
 
@@ -463,84 +554,9 @@ impl Runtime {
 
     fn verify_rows(&self, nseq: usize) -> Result<()> {
         let m = self.mtp();
-        let s = &self.spec;
-        let k1 = m.k + 1;
-        let n = nseq * k1;
-        let hidden = s.dims.hidden;
-        let pre = &self.pre;
-        let mut b = self.stream.launch_builder(self.kernel("embed"));
-        b.arg(&self.embed).arg(&m.vb.tokens).arg(&pre.x);
-        let config = LaunchConfig { grid_dim: (grid(hidden, 256), n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
-        unsafe { b.launch(config) }?;
-        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
-        let la = &gb.la;
-        let seq_slots = s.linear_layers() as i32;
-        let (vd, rows_i, k1_i) = (la.value_dim(), m.rows, k1 as i32);
-        for layer in &self.layers {
-            self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
-            match &layer.mixer {
-                DeviceMixer::Linear(g) => {
-                    self.tc("lin_in", &g.in_proj, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_lin), la.in_proj_rows(), n)?;
-                    self.tc("lin_ba", &g.ba, None, pre.xn_planes.all(), GemmOut::F32(&gb.pre_ba), la.ba_rows(), n)?;
-                    let l = g.slot as usize;
-                    let clog = m.clog.slice(l * rows_i * la.conv_dim()..);
-                    let mut b = self.stream.launch_builder(self.kernel("gdn_conv_verify"));
-                    b.arg(&gb.pre_lin)
-                        .arg(&g.conv)
-                        .arg(&*gb.conv_state)
-                        .arg(&gb.pre_mix)
-                        .arg(&clog)
-                        .arg(&g.slot)
-                        .arg(&seq_slots)
-                        .arg(&m.vb.slots)
-                        .arg(&k1_i);
-                    let config = LaunchConfig {
-                        grid_dim: (grid(la.conv_dim(), 256), nseq as u32, 1),
-                        block_dim: (256, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    unsafe { b.launch(config) }?;
-                    let klog = m.klog.slice(l * rows_i * vd..);
-                    let dlog = m.dlog.slice(l * rows_i * vd..);
-                    let glog = m.glog.slice(l * rows_i * la.value_heads..);
-                    let mut b = self.stream.launch_builder(self.kernel("gdn_verify"));
-                    b.arg(&gb.pre_mix)
-                        .arg(&gb.pre_lin)
-                        .arg(&gb.pre_ba)
-                        .arg(&g.neg_a)
-                        .arg(&g.dt_bias)
-                        .arg(&g.norm)
-                        .arg(&*gb.ssm_state)
-                        .arg(&gb.o)
-                        .arg(&klog)
-                        .arg(&dlog)
-                        .arg(&glog)
-                        .arg(&g.slot)
-                        .arg(&seq_slots)
-                        .arg(&m.vb.slots)
-                        .arg(&k1_i);
-                    let config = LaunchConfig {
-                        grid_dim: (la.value_heads as u32, nseq as u32, 1),
-                        block_dim: ((la.value_head_dim * LA_KSPLIT) as u32, 1, 1),
-                        shared_mem_bytes: 0,
-                    };
-                    unsafe { b.launch(config) }?;
-                    let mut b = self.stream.launch_builder(self.kernel("split_rows"));
-                    let count = (n * vd) as i32;
-                    b.arg(&gb.o).arg(&gb.planes.hi).arg(&gb.planes.lo).arg(&count);
-                    unsafe { b.launch(cfg(grid(n * vd, 512), 256)) }?;
-                    self.tc("lin_out", &g.out, None, gb.planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
-                }
-                DeviceMixer::Attention(l) => {
-                    self.tc("qkv", &l.qkv, l.qkv_bias.as_ref(), pre.xn_planes.all(), GemmOut::F32(&pre.qkv), s.qkv_rows(), n)?;
-                    self.attn_decode_rows(l, &m.vb, n, k1)?;
-                    self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
-                }
-            }
-            self.mlp_prefill(layer, n)?;
-        }
-        self.rms_split(&pre.x.as_view(), &self.norm, &pre.xn_planes, n)?;
-        self.tc("lm_head", &self.lm_head, None, pre.xn_planes.all(), GemmOut::F32(&m.vb.logits), s.dims.vocab, n)
+        let n = nseq * (m.k + 1);
+        let run = super::exec::Run { n, tokens: &m.vb.tokens, logits: &m.vb.logits, rows: 0..n, bb: Some(&m.vb), start: None, qlen: m.k + 1, mtp: None };
+        crate::executor::run_plan(self, &self.plans.verify, &run, &mut |_| Ok(()))
     }
 
     fn commit(&self, nseq: usize) -> Result<()> {

@@ -11,7 +11,7 @@ const SMS: u32 = 84;
 fn node(op: &Op, spec: &Spec, layer: usize, phase: Phase, root: &str, index: Option<usize>) -> Node {
     let tokens = match phase {
         Phase::Prefill => PREFILL_TOKENS,
-        Phase::Decode => DECODE_ROWS,
+        Phase::Decode | Phase::Verify => DECODE_ROWS,
     };
     let mut target = specrt::codegen::default_target();
     target.sm_count = SMS;
@@ -43,6 +43,7 @@ pub fn title(spec: &Spec, layer: usize, phase: Phase) -> String {
     let phase = match phase {
         Phase::Prefill => format!("prefill at {PREFILL_TOKENS} tokens"),
         Phase::Decode => format!("decode at {DECODE_ROWS} rows"),
+        Phase::Verify => format!("verify at {DECODE_ROWS} rows"),
     };
     let kind = if spec.block(layer).is_linear() { "gated delta-net" } else { "attention" };
     format!("engine plan, layer {layer} ({kind}), {phase}")

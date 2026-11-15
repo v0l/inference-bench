@@ -13,7 +13,7 @@ struct Ref {
 
     fn quant_of(weight: Weight) -> QuantSource {
         match weight {
-            Weight::GateUp | Weight::Down => QuantSource::Mlp,
+            Weight::GateUp | Weight::Down | Weight::MtpGateUp | Weight::MtpDown => QuantSource::Mlp,
             Weight::LinBa => QuantSource::Bf16,
             Weight::LmHead => QuantSource::Head,
             _ => QuantSource::Attn,
@@ -172,4 +172,73 @@ fn sandwich_plan_is_well_formed(spec: &Spec) {
         assert_eq!(plan.layer(Block::Sliding), ops);
         assert_eq!(plan.tail.contains(&Op::LogitSoftcap), spec.dims.logit_softcap.is_some());
     }
+}
+
+fn mtp_fixture(name: &str) -> Spec {
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name).join("config.json")).unwrap();
+    Spec::from_hf_config_serving(&json).unwrap()
+}
+
+fn mtp_reference(spec: &Spec, phase: Phase) -> (Vec<Op>, Vec<Op>) {
+    let lin = |weight, input, output| Op::Linear { weight, quant: quant_of(weight), input, output };
+    let norm = |which, into| Op::Norm { which, into };
+    let mut layer = vec![Op::MtpIn, lin(Weight::MtpFc, Buf::FcPlanes, Buf::X), norm(NormKind::Input, Buf::XnPlanes), lin(Weight::MtpQkv, Buf::XnPlanes, Buf::Qkv)];
+    layer.push(if phase == Phase::Prefill { Op::KvRope } else { Op::DecodeAttention });
+    if phase == Phase::Prefill {
+        layer.push(Op::Flash);
+    }
+    layer.extend([
+        lin(Weight::MtpO, Buf::AttnPlanes, Buf::X),
+        norm(NormKind::PostAttention, Buf::XnPlanes),
+        lin(Weight::MtpGateUp, Buf::XnPlanes, Buf::ActPlanes),
+        lin(Weight::MtpDown, Buf::ActPlanes, Buf::X),
+    ]);
+    let head = vec![
+        Op::MtpGather,
+        Op::MtpNorm,
+        Op::Linear { weight: Weight::MtpHead, quant: QuantSource::DraftHead, input: Buf::XnPlanes, output: Buf::MtpLogits },
+        Op::MtpDraft,
+    ];
+    let _ = spec;
+    (layer, head)
+}
+
+#[test]
+fn the_graph_lowers_the_mtp_plans_for_every_mtp_fixture() {
+    for name in ["tiny-qwen3.5-mtp", "tiny-qwen3.5-27b", "tiny-qwen3.5-moe-mtp"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+        if !path.exists() {
+            continue;
+        }
+        let spec = mtp_fixture(name);
+        assert!(spec.speculative().is_some(), "{name}");
+        for phase in [Phase::Prefill, Phase::Decode] {
+            let plan = Plan::build(&spec, phase, true);
+            let (layer, head) = mtp_reference(&spec, phase);
+            assert_eq!(plan.mtp, layer, "{name} {phase:?}");
+            assert_eq!(plan.mtp_head, head, "{name} {phase:?}");
+        }
+        let decode = Plan::build(&spec, Phase::Decode, true);
+        let verify = Plan::build(&spec, Phase::Verify, true);
+        assert_eq!(verify.mtp, decode.mtp);
+        assert_eq!(verify.head, decode.head);
+        assert_eq!(verify.tail, decode.tail);
+        for block in [Block::Linear, Block::Full] {
+            let d = decode.layer_of(block, spec.moe.is_some());
+            let v = verify.layer_of(block, spec.moe.is_some());
+            assert_eq!(d.len(), v.len(), "{name} {block:?}");
+            for (d, v) in d.iter().zip(v) {
+                let swapped = if *d == Op::GdnDecode { Op::GdnVerify } else { *d };
+                assert_eq!(*v, swapped, "{name} {block:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_spec_without_mtp_has_empty_mtp_plans() {
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3-0.6b.config.json")).unwrap();
+    let spec = Spec::from_hf_config_serving(&json).unwrap();
+    let plan = Plan::build(&spec, Phase::Decode, true);
+    assert!(plan.mtp.is_empty() && plan.mtp_head.is_empty());
 }

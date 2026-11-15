@@ -51,6 +51,30 @@ out = "xn_planes"
   `tests/gemma3.rs` against `scripts/tiny_gemma3.py` (sliding and global layers, both soft-caps).
   Sliding is proven by `tests/sliding.rs`.
 
+## MTP as graph nodes
+
+The graph has two more node lists next to `head`, `block` and `tail`, both guarded by `when = "speculative+tensor_core"`:
+
+- `[[mtp]]`: the draft layer. `mtp_in` (embed of the token, the previous hidden row, their two norms and
+  the concat into planes), `linear mtp_fc`, then the same norm, `linear`, attention, norm and MLP nodes
+  a full attention block has, bound to the draft layer's weights. Attention picks `kv_rope`+`flash` in
+  the `prefill` phase and `decode_attention` in the `decode` phase, as in a block.
+- `[[mtp_head]]`: `mtp_gather` (the rows that propose), a norm with `mtp.norm.weight`, `linear mtp_head`
+  (the draft head, or the shared lm_head when the spec has none) and `mtp_draft` (argmax into the draft table).
+
+A third phase, `verify`, runs the main model over `k+1` rows per sequence. It is the decode plan with
+`gdn_verify` in place of `gdn_decode` (it logs the per-row conv and delta states that `commit` keeps up
+to the accepted row). Node phases are `prefill`, `decode`, `verify`, or `rows` (decode and verify).
+`Run` carries the attention query length (`1`, or `k+1` in verify and the chained draft).
+`runtime/mtp.rs` keeps only the round orchestration (drafting loop, accept, commit, graph capture);
+every kernel launch of the draft layer, the head and the verify forward comes from these nodes.
+`tests/graph.rs` compares the lowered `mtp`, `mtp_head` and verify plans with a reference for every fixture spec.
+
+## Vision as graph nodes
+
+`[[vision_block]]` and `[[vision_head]]` follow the same pattern for the encoder (patch embed, blocks,
+merger) and `splice` for the splice into the LM embeddings. See Status for what is lowered.
+
 ## Not done
 
 - Residual plus norm through the fused `add_rmsnorm` in the existing dense block (the GEMM

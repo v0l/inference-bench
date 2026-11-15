@@ -45,6 +45,10 @@ pub struct Graph {
     pub block: Vec<BlockGraph>,
     #[serde(default)]
     pub tail: Vec<Node>,
+    #[serde(default)]
+    pub mtp: Vec<Node>,
+    #[serde(default)]
+    pub mtp_head: Vec<Node>,
 }
 
 pub const DECODER: &str = include_str!("../graphs/decoder.toml");
@@ -65,6 +69,8 @@ fn buffer(name: &str) -> Result<Buf> {
         "ba" => Buf::PreBa,
         "gdn_planes" => Buf::GdnPlanes,
         "branch" => Buf::Branch,
+        "fc_planes" => Buf::FcPlanes,
+        "mtp_logits" => Buf::MtpLogits,
         other => bail!("unknown buffer {other}"),
     })
 }
@@ -79,6 +85,12 @@ fn weight(name: &str) -> Result<Weight> {
         "lin_ba" => Weight::LinBa,
         "lin_out" => Weight::LinOut,
         "lm_head" => Weight::LmHead,
+        "mtp_fc" => Weight::MtpFc,
+        "mtp_qkv" => Weight::MtpQkv,
+        "mtp_o" => Weight::MtpO,
+        "mtp_gate_up" => Weight::MtpGateUp,
+        "mtp_down" => Weight::MtpDown,
+        "mtp_head" => Weight::MtpHead,
         other => bail!("unknown weight {other}"),
     })
 }
@@ -89,6 +101,7 @@ fn quant_source(name: &str) -> Result<QuantSource> {
         "mlp" => QuantSource::Mlp,
         "bf16" => QuantSource::Bf16,
         "head" => QuantSource::Head,
+        "draft_head" => QuantSource::DraftHead,
         other => bail!("unknown quant source {other}"),
     })
 }
@@ -110,6 +123,8 @@ impl Node {
             None => true,
             Some("prefill") => phase == Phase::Prefill,
             Some("decode") => phase == Phase::Decode,
+            Some("verify") => phase == Phase::Verify,
+            Some("rows") => phase != Phase::Prefill,
             Some(_) => false,
         }
     }
@@ -134,6 +149,11 @@ impl Node {
             "swiglu" => Op::Swiglu,
             "gdn_prefill" => Op::GdnPrefill,
             "gdn_decode" => Op::GdnDecode,
+            "gdn_verify" => Op::GdnVerify,
+            "mtp_in" => Op::MtpIn,
+            "mtp_gather" => Op::MtpGather,
+            "mtp_norm" => Op::MtpNorm,
+            "mtp_draft" => Op::MtpDraft,
             "moe_route" => Op::MoeRoute,
             "moe_experts" => Op::MoeExperts,
             "moe_combine" => Op::MoeCombine,
@@ -152,6 +172,7 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
             "sandwich" => spec.norm.sandwich,
             "plain" => !spec.norm.sandwich,
             "logit_softcap" => spec.dims.logit_softcap.is_some(),
+            "speculative" => spec.speculative().is_some(),
             _ => false,
         })
     })
@@ -185,7 +206,7 @@ impl Graph {
             };
             blocks.push(PlanBlock { layers: b.layers.clone(), sparse, ops: lower(&b.node, phase, tensor_core, spec)? });
         }
-        Ok(Plan { phase, tensor_core, head: lower(&self.head, phase, tensor_core, spec)?, blocks, tail: lower(&self.tail, phase, tensor_core, spec)? })
+        Ok(Plan { phase, tensor_core, head: lower(&self.head, phase, tensor_core, spec)?, blocks, tail: lower(&self.tail, phase, tensor_core, spec)?, mtp: lower(&self.mtp, phase, tensor_core, spec)?, mtp_head: lower(&self.mtp_head, phase, tensor_core, spec)? })
     }
 }
 
