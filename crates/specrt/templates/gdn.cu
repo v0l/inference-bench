@@ -297,15 +297,77 @@ extern "C" __global__ void __launch_bounds__(256) gdn_chunk_prep(const float* qn
         }
     }
     __syncthreads();
-    for (int i = 1; i < C; i++) {
-        int j = tid;
+    constexpr int LEAF = 16;
+    for (int i = 1; i < LEAF; i++) {
+        int b = (tid / LEAF) * LEAF;
+        int j = tid % LEAF;
         float next = 0.0f;
-        if (j < i) {
-            next = A[i * LA_AS + j];
-            for (int m = j + 1; m < i; m++) next += A[i * LA_AS + m] * A[m * LA_AS + j];
+        if (tid < C && j < i) {
+            next = A[(b + i) * LA_AS + b + j];
+            for (int m = j + 1; m < i; m++) next += A[(b + i) * LA_AS + b + m] * A[(b + m) * LA_AS + b + j];
         }
         __syncthreads();
-        if (j < i) A[i * LA_AS + j] = next;
+        if (tid < C && j < i) A[(b + i) * LA_AS + b + j] = next;
+        __syncthreads();
+    }
+    for (int sz = LEAF; sz < C; sz *= 2) {
+        constexpr int PER = C * C / 4 / 256;
+        int per = sz * sz * (C / (2 * sz));
+        float acc[PER];
+#pragma unroll
+        for (int p = 0; p < PER; p++) {
+            int e = tid + p * 256;
+            acc[p] = 0.0f;
+            if (e < per) {
+                int blk = e / (sz * sz);
+                int r = (e / sz) % sz;
+                int c2 = e % sz;
+                int base = blk * 2 * sz;
+                float y = A[(base + sz + r) * LA_AS + base + c2];
+                for (int m = c2 + 1; m < sz; m++)
+                    y += A[(base + sz + r) * LA_AS + base + m] * A[(base + m) * LA_AS + base + c2];
+                acc[p] = y;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < PER; p++) {
+            int e = tid + p * 256;
+            if (e < per) {
+                int blk = e / (sz * sz);
+                int r = (e / sz) % sz;
+                int c2 = e % sz;
+                int base = blk * 2 * sz;
+                A[(base + sz + r) * LA_AS + base + c2] = acc[p];
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < PER; p++) {
+            int e = tid + p * 256;
+            if (e < per) {
+                int blk = e / (sz * sz);
+                int r = (e / sz) % sz;
+                int c2 = e % sz;
+                int base = blk * 2 * sz;
+                float x = A[(base + sz + r) * LA_AS + base + c2];
+                for (int m = 0; m < r; m++)
+                    x += A[(base + sz + r) * LA_AS + base + sz + m] * A[(base + sz + m) * LA_AS + base + c2];
+                acc[p] = x;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int p = 0; p < PER; p++) {
+            int e = tid + p * 256;
+            if (e < per) {
+                int blk = e / (sz * sz);
+                int r = (e / sz) % sz;
+                int c2 = e % sz;
+                int base = blk * 2 * sz;
+                A[(base + sz + r) * LA_AS + base + c2] = acc[p];
+            }
+        }
         __syncthreads();
     }
     if (tid < C) A[tid * LA_AS + tid] = 1.0f;
