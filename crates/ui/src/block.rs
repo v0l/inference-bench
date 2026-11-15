@@ -72,7 +72,7 @@ fn mixer_modules<'a>(layer: &'a Layer, mlp: Option<&str>) -> Vec<&'a str> {
 
 fn rope_text(spec: &Spec, head_dim: usize) -> String {
     let scaling = match &spec.rope.scaling {
-        Some(s) => format!(", {} x {}", match s.kind { RopeScalingKind::Linear => "linear", RopeScalingKind::Llama3 => "llama3" }, s.factor),
+        Some(s) => format!(", {} x {}", match s.kind { RopeScalingKind::Linear => "linear", RopeScalingKind::Llama3 => "llama3", RopeScalingKind::Yarn => "yarn" }, s.factor),
         None => String::new(),
     };
     format!("theta {}, {} of {head_dim} dims{scaling}", theta_text(spec.rope.theta), spec.rotary_dim().min(head_dim))

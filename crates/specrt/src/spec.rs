@@ -305,6 +305,57 @@ pub enum Activation {
 pub enum RopeScalingKind {
     Linear,
     Llama3,
+    Yarn,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Yarn {
+    pub beta_fast: f64,
+    pub beta_slow: f64,
+    pub attention_factor: f64,
+    pub truncate: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeConstants {
+    pub kind: u32,
+    pub factor: f64,
+    pub low: f64,
+    pub high: f64,
+    pub original: f64,
+    pub mscale: f64,
+}
+
+pub fn yarn_mscale(scale: f64, mscale: f64) -> f64 {
+    if scale <= 1.0 { 1.0 } else { 0.1 * mscale * scale.ln() + 1.0 }
+}
+
+pub fn yarn_correction_range(theta: f64, rot: usize, original: f64, y: &Yarn) -> (f64, f64) {
+    let dim = |rotations: f64| rot as f64 * (original / (rotations * 2.0 * std::f64::consts::PI)).ln() / (2.0 * theta.ln());
+    let (mut low, mut high) = (dim(y.beta_fast), dim(y.beta_slow));
+    if y.truncate {
+        low = low.floor();
+        high = high.ceil();
+    }
+    let (low, mut high) = (low.max(0.0), high.min(rot as f64 - 1.0));
+    if low == high {
+        high += 0.001;
+    }
+    (low, high)
+}
+
+pub fn yarn_inv_freq(theta: f64, rot: usize, s: &RopeScaling) -> Vec<f64> {
+    let y = s.yarn.as_ref().expect("yarn scaling");
+    let original = s.original_max_positions.unwrap_or(1.0);
+    let (low, high) = yarn_correction_range(theta, rot, original, y);
+    (0..rot / 2)
+        .map(|i| {
+            let pos_freq = theta.powf(2.0 * i as f64 / rot as f64);
+            let ramp = ((i as f64 - low) / (high - low)).clamp(0.0, 1.0);
+            ramp / (s.factor * pos_freq) + (1.0 - ramp) / pos_freq
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -318,6 +369,8 @@ pub struct RopeScaling {
     pub high_freq_factor: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_max_positions: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yarn: Option<Yarn>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -737,6 +790,7 @@ fn parse_rope_scaling(value: Option<&serde_json::Value>) -> Result<Option<RopeSc
             low_freq_factor: None,
             high_freq_factor: None,
             original_max_positions: None,
+            yarn: None,
         })),
         "llama3" => Ok(Some(RopeScaling {
             kind: RopeScalingKind::Llama3,
@@ -747,7 +801,28 @@ fn parse_rope_scaling(value: Option<&serde_json::Value>) -> Result<Option<RopeSc
                 num("original_max_position_embeddings")
                     .context("no original_max_position_embeddings")?,
             ),
+            yarn: None,
         })),
+        "yarn" => {
+            let original = num("original_max_position_embeddings").context("yarn rope_scaling has no original_max_position_embeddings")?;
+            ensure!(original > 0.0, "original_max_position_embeddings must be positive");
+            let attention_factor = match (num("attention_factor"), num("mscale"), num("mscale_all_dim")) {
+                (Some(a), _, _) => a,
+                (None, Some(m), Some(d)) if m != 0.0 && d != 0.0 => yarn_mscale(factor, m) / yarn_mscale(factor, d),
+                _ => yarn_mscale(factor, 1.0),
+            };
+            let beta_fast = num("beta_fast").filter(|b| *b != 0.0).unwrap_or(32.0);
+            let beta_slow = num("beta_slow").filter(|b| *b != 0.0).unwrap_or(1.0);
+            let truncate = v.get("truncate").and_then(|t| t.as_bool()).unwrap_or(true);
+            Ok(Some(RopeScaling {
+                kind: RopeScalingKind::Yarn,
+                factor,
+                low_freq_factor: None,
+                high_freq_factor: None,
+                original_max_positions: Some(original),
+                yarn: Some(Yarn { beta_fast, beta_slow, attention_factor, truncate }),
+            }))
+        }
         other => bail!("rope_scaling {other} is not supported"),
     }
 }
@@ -1229,6 +1304,29 @@ impl Spec {
 
     pub fn kv_layers(&self) -> usize {
         self.attention_layers() + self.speculative().map_or(0, |m| m.layers)
+    }
+
+    pub fn rope_constants(&self) -> RopeConstants {
+        let Some(s) = self.rope.scaling.as_ref() else {
+            return RopeConstants { kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0 };
+        };
+        let original = s.original_max_positions.unwrap_or(1.0);
+        match (s.kind, s.yarn.as_ref()) {
+            (RopeScalingKind::Linear, _) => RopeConstants { kind: 1, factor: s.factor, low: 1.0, high: 1.0, original, mscale: 1.0 },
+            (RopeScalingKind::Llama3, _) => RopeConstants {
+                kind: 2,
+                factor: s.factor,
+                low: s.low_freq_factor.unwrap_or(1.0),
+                high: s.high_freq_factor.unwrap_or(1.0),
+                original,
+                mscale: 1.0,
+            },
+            (RopeScalingKind::Yarn, Some(y)) => {
+                let (low, high) = yarn_correction_range(self.rope.theta, self.rotary_dim(), original, y);
+                RopeConstants { kind: 3, factor: s.factor, low, high, original, mscale: y.attention_factor }
+            }
+            (RopeScalingKind::Yarn, None) => RopeConstants { kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0 },
+        }
     }
 
     pub fn rotary_dim(&self) -> usize {

@@ -73,9 +73,31 @@ fn rejects_unsupported_rope_scaling() {
         .unwrap()
         .replace(
             "\"rope_scaling\": null",
-            "\"rope_scaling\": {\"type\": \"yarn\", \"factor\": 4.0}",
+            "\"rope_scaling\": {\"type\": \"dynamic\", \"factor\": 4.0}",
         );
     assert!(Spec::from_hf_config(&json).is_err());
+}
+
+#[test]
+fn yarn_without_the_original_context_is_refused() {
+    let json = fixture_with("\"rope_scaling\": null", "\"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": 4.0}");
+    assert!(format!("{:#}", Spec::from_hf_config(&json).unwrap_err()).contains("original_max_position_embeddings"));
+}
+
+#[test]
+fn yarn_rope_scaling_is_parsed_with_the_transformers_defaults() {
+    let json = fixture_with(
+        "\"rope_scaling\": null",
+        "\"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": 4.0, \"original_max_position_embeddings\": 262144}",
+    );
+    let spec = Spec::from_hf_config(&json).unwrap();
+    let s = spec.rope.scaling.clone().unwrap();
+    assert_eq!(s.kind, specrt::spec::RopeScalingKind::Yarn);
+    assert_eq!((s.factor, s.original_max_positions), (4.0, Some(262144.0)));
+    let y = s.yarn.clone().unwrap();
+    assert_eq!((y.beta_fast, y.beta_slow, y.truncate), (32.0, 1.0, true));
+    assert!((y.attention_factor - (0.1 * 4f64.ln() + 1.0)).abs() < 1e-12);
+    assert_eq!(Spec::parse(&spec.to_toml().unwrap()).unwrap(), spec);
 }
 
 #[test]

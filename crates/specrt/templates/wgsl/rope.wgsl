@@ -23,6 +23,9 @@ fn inv_freq(i: u32) -> f32 {
             let sm = (ROPE_ORIG_POS / wavelen - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ);
             f = (1.0 - sm) * f / ROPE_FACTOR + sm * f;
         }
+    } else if (ROPE_KIND == 3u) {
+        let ramp = clamp((f32(i) - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ), 0.0, 1.0);
+        f = ramp * f / ROPE_FACTOR + (1.0 - ramp) * f;
     }
     return f;
 }
@@ -65,8 +68,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         if ((is_q || is_k) && d < ROT) {
             let i = select(d - hr, d, d < hr);
             let angle = f32(pos) * inv_freq(i);
-            let c = cos(angle);
-            let s = sin(angle);
+            let c = cos(angle) * ROPE_MSCALE;
+            let s = sin(angle) * ROPE_MSCALE;
             if (d < hr) {
                 v = vec_s[d] * c - vec_s[d + hr] * s;
             } else {
