@@ -57,7 +57,7 @@ cargo test -p inference-bench-ui
 
 The last run gave server 147, 24, 59, 46, 9, 16, 5 and 13 passed, ui 73 passed with 9 ignored, and no failures. Five server tests in `crates/server/tests/serving.rs` and two in `crates/core/tests/live_hf.rs` are `#[ignore]` (GPU and Qwen3-0.6B, or the network).
 
-`cargo test -p inference-bench-ui` has one known flaky test, see the end of this file.
+The ui race from #590 is fixed on master.
 
 ## Tier 2 and 3: GPU tests
 
@@ -229,5 +229,4 @@ flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -q \
 
 | Test | Issue | Note |
 |---|---|---|
-| `crates/ui/src/tests.rs`: `loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_them` | #590 | failed once in a full ui run, passed on rerun. Rerun it alone before blaming your change. |
 | Real 27B tests with vLLM resident | none | OOM, not a bug. Rerun alone when quiet. |
