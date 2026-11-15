@@ -108,6 +108,20 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
                 out = k.params[1].name,
             )
         }
+        Body::Add { width } => format!(
+            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const float* {x}, const float* {d}, float* {out}) {{
+    constexpr int WIDTH = {width};
+    size_t base = (size_t)blockIdx.y * WIDTH;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < WIDTH; i += gridDim.x * blockDim.x) {out}[base + i] = {x}[base + i] + {d}[base + i];
+}}
+
+",
+            threads = k.threads,
+            name = k.name,
+            x = k.params[0].name,
+            d = k.params[1].name,
+            out = k.params[2].name,
+        ),
         Body::AddRmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
         Body::RmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
         Body::GatedActivation { width, act } => {

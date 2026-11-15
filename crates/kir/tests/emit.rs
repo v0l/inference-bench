@@ -263,3 +263,22 @@ fn soft_cap_and_scale_are_generic_pointwise_primitives() {
     assert!(kir::cuda::emit_kernel(&scale).unwrap().contains("v * 8e0f"));
     assert!(Kernel::pointwise(&t, "bad", 64, kir::Pointwise::SoftCap(0.0), 256).is_err());
 }
+
+#[test]
+fn add_is_a_generic_elementwise_primitive() {
+    let k = Kernel::add(&Target::sm_120(), "residual_add", 128, 256).unwrap();
+    assert!(kir::cuda::emit_kernel(&k).unwrap().contains("out[base + i] = x[base + i] + delta[base + i]"));
+}
+
+#[test]
+fn the_new_light_primitives_are_refused_on_wgpu_with_a_clear_error() {
+    let t = Target::wgpu_baseline();
+    for k in [
+        Kernel::add(&t, "residual_add", 128, 256).unwrap(),
+        Kernel::add_rmsnorm(&t, 128, 1e-6, 0.0, 256).unwrap(),
+        Kernel::pointwise(&t, "softcap", 128, kir::Pointwise::SoftCap(30.0), 256).unwrap(),
+    ] {
+        let err = kir::wgsl::emit_kernel(&k).unwrap_err();
+        assert!(err.contains("no WGSL emitter"), "{err}");
+    }
+}

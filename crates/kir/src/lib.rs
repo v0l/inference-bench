@@ -55,6 +55,7 @@ pub enum Body {
     RmsNorm { width: u32, eps: f32, sum: BlockSum, offset: f32 },
     AddRmsNorm { width: u32, eps: f32, sum: BlockSum, offset: f32 },
     Pointwise { width: u32, op: Pointwise },
+    Add { width: u32 },
     GatedActivation { width: u32, act: Activation },
 }
 
@@ -133,6 +134,23 @@ impl Kernel {
         Ok(k)
     }
 
+    pub fn add(t: &Target, name: &'static str, width: u32, threads: u32) -> Result<Kernel, String> {
+        let k = Kernel {
+            name,
+            target: *t,
+            params: vec![
+                param("x", Role::Activation, Access::Read),
+                param("delta", Role::Activation, Access::Read),
+                param("out", Role::Activation, Access::Write),
+            ],
+            threads: pick_threads(t, threads),
+            smem_bytes: 0,
+            body: Body::Add { width },
+        };
+        k.validate()?;
+        Ok(k)
+    }
+
     pub fn pointwise(t: &Target, name: &'static str, width: u32, op: Pointwise, threads: u32) -> Result<Kernel, String> {
         let k = Kernel {
             name,
@@ -165,7 +183,7 @@ impl Kernel {
     pub fn needs(&self) -> Vec<Feature> {
         match &self.body {
             Body::RmsNorm { sum, .. } | Body::AddRmsNorm { sum, .. } => sum.needs().to_vec(),
-            Body::GatedActivation { .. } | Body::Pointwise { .. } => vec![],
+            Body::GatedActivation { .. } | Body::Pointwise { .. } | Body::Add { .. } => vec![],
         }
     }
 
@@ -204,6 +222,12 @@ impl Kernel {
                     (Role::Activation, Access::Write),
                     (Role::Activation, Access::Write),
                 ]
+            }
+            Body::Add { width } => {
+                if *width == 0 {
+                    return Err(format!("{}: width must be positive", self.name));
+                }
+                &[(Role::Activation, Access::Read), (Role::Activation, Access::Read), (Role::Activation, Access::Write)]
             }
             Body::Pointwise { width, op } => {
                 let v = match op {
@@ -254,6 +278,9 @@ impl Kernel {
             }
             Body::AddRmsNorm { width, eps, sum, offset } => {
                 let _ = write!(s, "\n  add_rmsnorm width={width} eps={eps:e} sum={sum:?} offset={offset:e}");
+            }
+            Body::Add { width } => {
+                let _ = write!(s, "\n  add width={width}");
             }
             Body::Pointwise { width, op } => {
                 let _ = write!(s, "\n  pointwise width={width} op={op:?}");

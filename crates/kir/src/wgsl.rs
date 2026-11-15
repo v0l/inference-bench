@@ -99,7 +99,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
         return Err(format!("{}: the WGSL emitter cannot target {:?}", k.name, k.target.language));
     }
     Ok(match &k.body {
-        Body::AddRmsNorm { .. } | Body::Pointwise { .. } => return Err(format!("{}: no WGSL emitter for this body yet", k.name)),
+        Body::AddRmsNorm { .. } | Body::Pointwise { .. } | Body::Add { .. } => return Err(format!("{}: no WGSL emitter for this body yet", k.name)),
         Body::RmsNorm { width, eps, sum, offset } => {
             if *sum == BlockSum::WarpShuffle {
                 return Err(format!("{}: block sum {sum:?} has no WGSL snippet", k.name));
