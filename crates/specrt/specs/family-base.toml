@@ -1,0 +1,11 @@
+name = "base"
+kind = "family"
+
+[activation]
+lenient_default = "swiglu"
+
+[activation.map]
+silu = "swiglu"
+gelu_pytorch_tanh = "geglu"
+gelu_new = "geglu"
+gelu_fast = "geglu"

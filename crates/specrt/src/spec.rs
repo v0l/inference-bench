@@ -1038,12 +1038,12 @@ impl Spec {
             Err(_) => None,
         };
         let theta = hf.rope_theta.or(param("rope_theta")).context("no rope_theta")?;
-        let activation = match (hf.hidden_act.as_deref(), strict) {
-            (Some("silu"), _) => Activation::Swiglu,
-            (Some("gelu_pytorch_tanh" | "gelu_new" | "gelu_fast"), _) => Activation::Geglu,
-            (_, false) => Activation::Swiglu,
-            (Some(other), true) => bail!("hidden_act {other} is not supported"),
-            (None, true) => bail!("config.json has no hidden_act"),
+        let mapped = hf.hidden_act.as_deref().and_then(|a| family.activation.map.get(a).copied());
+        let activation = match (mapped, hf.hidden_act.as_deref(), strict) {
+            (Some(a), _, _) => a,
+            (None, _, false) => family.activation.lenient_default.context("the family has no lenient_default activation")?,
+            (None, Some(other), true) => bail!("hidden_act {other} is not supported"),
+            (None, None, true) => bail!("config.json has no hidden_act"),
         };
         if strict
             && let Some(dtype) = hf.torch_dtype.as_deref().or(hf.dtype.as_deref())

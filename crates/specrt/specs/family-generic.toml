@@ -1,5 +1,6 @@
 name = "generic"
 kind = "family"
+extends = "base"
 mtp = true
 
 [blocks]

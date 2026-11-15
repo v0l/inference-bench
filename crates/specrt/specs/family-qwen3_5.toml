@@ -1,5 +1,6 @@
 name = "qwen3_5"
 kind = "family"
+extends = "base"
 mtp = true
 
 [match]

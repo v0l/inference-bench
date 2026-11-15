@@ -59,6 +59,13 @@ pub struct FamilyBlocks {
     pub kind: BlockKind,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyActivation {
+    pub map: std::collections::BTreeMap<String, crate::spec::Activation>,
+    pub lenient_default: Option<crate::spec::Activation>,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Family {
@@ -76,6 +83,8 @@ pub struct Family {
     pub blocks: FamilyBlocks,
     #[serde(default)]
     pub mtp: bool,
+    #[serde(default)]
+    pub activation: FamilyActivation,
 }
 
 static ACTIVE: std::sync::RwLock<Option<Registry>> = std::sync::RwLock::new(None);

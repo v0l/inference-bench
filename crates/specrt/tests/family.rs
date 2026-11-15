@@ -35,7 +35,7 @@ fn a_family_spec_file_can_change_a_flag_the_code_used_to_fix() {
 fn every_embedded_family_has_a_name_and_a_match_or_is_generic() {
     let r = Registry::embedded();
     for f in r.families() {
-        assert!(f.name == "generic" || !f.matches.model_types.is_empty(), "{}", f.name);
+        assert!(matches!(f.name.as_str(), "generic" | "base") || !f.matches.model_types.is_empty(), "{}", f.name);
     }
     assert!(r.for_model_type("qwen3_5_text").is_some() && r.for_model_type("mistral").is_some());
 }

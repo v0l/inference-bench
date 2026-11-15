@@ -1,5 +1,6 @@
 name = "acme"
 kind = "family"
+extends = "base"
 
 [match]
 model_types = ["acmelm"]

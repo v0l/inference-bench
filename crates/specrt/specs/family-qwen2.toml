@@ -1,5 +1,6 @@
 name = "qwen2"
 kind = "family"
+extends = "base"
 
 [match]
 model_types = ["qwen2"]

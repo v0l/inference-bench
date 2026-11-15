@@ -1,5 +1,6 @@
 name = "llama"
 kind = "family"
+extends = "base"
 
 [match]
 model_types = ["llama", "mistral"]
