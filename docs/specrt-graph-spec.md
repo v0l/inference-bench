@@ -38,6 +38,7 @@ out = "xn_planes"
   `Plan::build` lowers it through `graph.rs`; `plan.rs` has no block-kind or op-sequence code.
   `tests/graph.rs` checks the lowered plan equals the previous hand-written plan for every fixture
   config, and greps `plan.rs`, `runtime*` and `kir` for architecture knowledge.
+- MTP, vision and linear quant are graph nodes (sections below).
 - Generic parameters, all read from the family TOML and the model config: `(1+w)` norm offset
   (`[norm] unit_offset`), sandwich norms (`[norm] sandwich`, nodes `norm_add` and `clear`), embedding
   scale (`[embedding] scale`), final logit soft-cap (`logit_softcap` node), attention soft-cap, query
@@ -53,33 +54,41 @@ out = "xn_planes"
 
 ## MTP as graph nodes
 
-The graph has two more node lists next to `head`, `block` and `tail`, both guarded by `when = "speculative+tensor_core"`:
+The graph has `[[mtp]]` and `[[mtp_head]]` node lists next to `head`, `block` and `tail`, guarded by `when = "speculative+tensor_core"`:
 
 - `[[mtp]]`: the draft layer. `mtp_in` (embed of the token, the previous hidden row, their two norms and
-  the concat into planes), `linear mtp_fc`, then the same norm, `linear`, attention, norm and MLP nodes
-  a full attention block has, bound to the draft layer's weights. Attention picks `kv_rope`+`flash` in
-  the `prefill` phase and `decode_attention` in the `decode` phase, as in a block.
-- `[[mtp_head]]`: `mtp_gather` (the rows that propose), a norm with `mtp.norm.weight`, `linear mtp_head`
-  (the draft head, or the shared lm_head when the spec has none) and `mtp_draft` (argmax into the draft table).
+  the concat into planes), `linear mtp_fc`, then the norm, `linear`, attention, norm and MLP nodes of a
+  full attention block, bound to the draft layer's weights (`mtp_qkv`, `mtp_o`, `mtp_gate_up`, `mtp_down`).
+- `[[mtp_head]]`: `mtp_gather` (the rows that propose), `mtp_norm` with the draft norm, `linear mtp_head`
+  (`quant = "draft_head"`: the draft head's quant, or the lm_head when the spec has none) and `mtp_draft`.
 
-A third phase, `verify`, runs the main model over `k+1` rows per sequence. It is the decode plan with
-`gdn_verify` in place of `gdn_decode` (it logs the per-row conv and delta states that `commit` keeps up
-to the accepted row). Node phases are `prefill`, `decode`, `verify`, or `rows` (decode and verify).
-`Run` carries the attention query length (`1`, or `k+1` in verify and the chained draft).
-`runtime/mtp.rs` keeps only the round orchestration (drafting loop, accept, commit, graph capture);
-every kernel launch of the draft layer, the head and the verify forward comes from these nodes.
-`tests/graph.rs` compares the lowered `mtp`, `mtp_head` and verify plans with a reference for every fixture spec.
+`Phase::Verify` is the third plan. It is the decode plan with `gdn_verify` in place of `gdn_decode`
+(it logs the per-row conv and delta state that `commit` keeps up to the accepted row). Node phases are
+`prefill`, `decode`, `verify` or `rows` (decode and verify). `Run.qlen` carries the attention query length
+(1, or k+1 in verify and in the draft pass over the verified rows). `runtime/mtp.rs` keeps the round
+orchestration (accept, commit, chain, graph capture); every kernel launch of the draft layer, the head and
+the verify forward is run from these plans. `tests/graph.rs` compares the lowered plans for
+`tiny-qwen3.5-mtp`, `tiny-qwen3.5-27b` and `tiny-qwen3.5-moe-mtp`.
+
+## Linear nodes and quant
+
+A `linear` node carries `weight` (which matrix) and `quant` (where its quantisation comes from:
+`attn`, `mlp` (per layer), `bf16`, `head`, `draft_head`). `Op::Linear` resolves the quant from the spec and
+calls `gemm::select` directly; there is no per-op adapter.
 
 ## Vision as graph nodes
 
-`[[vision_block]]` and `[[vision_head]]` follow the same pattern for the encoder (patch embed, blocks,
-merger) and `splice` for the splice into the LM embeddings. See Status for what is lowered.
+`[[vision_head]]` (`patch_embed`), `[[vision_block]]` (norms, qkv, rope, attention, proj, mlp, and a
+`deepstack_merger` guarded by `when = "deepstack"`) and `[[vision_tail]]` (`vmerger`) describe the encoder.
+`Graph::vision_plan` lowers them per layer, and `VisionEncoder::run` executes the plan op by op. The splice
+into the LM is the `splice` head node (`when = "vision+tensor_core"`), after `embed`.
 
 ## Not done
 
-- Residual plus norm through the fused `add_rmsnorm` in the existing dense block (the GEMM
-  residual epilogue already fuses the add; a fused kernel needs a GEMM without that epilogue).
-- MTP and vision are still driven by their own runtimes, not graph nodes.
+- Residual plus norm through the fused `add_rmsnorm`. The GEMM residual epilogue fuses the add already.
+  A fused kernel needs a GEMM store variant of `o` and `down` on every path (mma, f8a, f4a, f8b, f4b)
+  and an `add_rmsnorm` that writes planes; the second pass costs about the traffic it saves, so it is
+  not in the graph yet.
 
 ## Prior art
 
