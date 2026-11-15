@@ -247,7 +247,8 @@ impl Runtime {
             .arg(&buf.pos)
             .arg(&l.kv)
             .arg(&pre.attn)
-            .arg(&ntok);
+            .arg(&ntok)
+            .arg(&l.window);
         let config = LaunchConfig {
             grid_dim: (grid(n, 16), a.heads as u32, 1),
             block_dim: (128, 1, 1),

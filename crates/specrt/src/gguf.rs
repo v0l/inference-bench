@@ -402,6 +402,7 @@ impl Gguf {
                 qk_norm: self.tensors.contains_key(names.tensor("q_norm")?),
                 output_gate: false,
                 rotary_dim: rotary,
+                softcap: None,
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(family, head_dim)?, mrope: None },
             mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None },

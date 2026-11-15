@@ -222,6 +222,7 @@ impl Module {
             ("QK_NORM", a.qk_norm.to_string()),
             ("QKV_BIAS", a.qkv_bias.to_string()),
             ("EPS", float_literal(spec.norm.eps)),
+            ("SOFTCAP", float_literal(spec.attention.softcap.unwrap_or(0.0))),
             ("THETA", float_literal(spec.rope.theta)),
             ("ROPE_KIND", rope.kind.to_string()),
             ("MROPE", spec.rope.mrope.is_some().to_string()),

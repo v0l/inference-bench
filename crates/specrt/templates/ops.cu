@@ -17,6 +17,7 @@ constexpr int ROT = {{ROT}};
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = {{QK_NORM}};
 constexpr float EPS = {{EPS}};
+constexpr float SOFTCAP = {{SOFTCAP}};
 constexpr float THETA = {{THETA}};
 constexpr int ROPE_KIND = {{ROPE_KIND}};
 constexpr bool MROPE = {{MROPE}};
@@ -1112,19 +1113,28 @@ __device__ __forceinline__ int attn_chunk(int len) {
     return max(ATTN_MIN_CHUNK, (len + ATTN_SPLITS - 1) / ATTN_SPLITS);
 }
 
+__device__ __forceinline__ float cap_score(float s) {
+    return SOFTCAP > 0.0f ? SOFTCAP * tanhf(s / SOFTCAP) : s;
+}
+
+__device__ __forceinline__ int window_lo(int len, int window) {
+    return window > 0 ? max(0, len - window) : 0;
+}
+
 constexpr int ATTN_WARPS = ATTN_BLOCK / 32;
 constexpr int ATTN_UNROLL = 4;
 
 extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
-                                     const int* block_table, const int* pos_ptr, int layer, float* part) {
+                                     const int* block_table, const int* pos_ptr, int layer, float* part, int window) {
     __shared__ float4 acc_s[ATTN_WARPS][GROUP][HEAD_DIM / 4];
     __shared__ float m_s[ATTN_WARPS][GROUP];
     __shared__ float l_s[ATTN_WARPS][GROUP];
     int kv_head = blockIdx.x;
     int split = blockIdx.y;
     int len = pos_ptr[0] + 1;
-    int chunk = attn_chunk(len);
-    int start = split * chunk;
+    int lo = window_lo(len, window);
+    int chunk = attn_chunk(len - lo);
+    int start = lo + split * chunk;
     if (start >= len) return;
     int end = min(len, start + chunk);
     int lane = threadIdx.x & 31;
@@ -1175,7 +1185,7 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
 #pragma unroll
                 for (int j = 0; j < ATTN_V4; j++)
                     dot += q[g][j].x * kr[u][j].x + q[g][j].y * kr[u][j].y + q[g][j].z * kr[u][j].z + q[g][j].w * kr[u][j].w;
-                dot = warp_sum(dot) * scale;
+                dot = cap_score(warp_sum(dot) * scale);
                 float nm = fmaxf(m[g], dot);
                 float corr = expf(m[g] - nm);
                 float p = expf(dot - nm);
@@ -1222,9 +1232,9 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
     }
 }
 
-extern "C" __global__ void attention_reduce(const float* part, const int* pos_ptr, const float* qkv, float* out) {
+extern "C" __global__ void attention_reduce(const float* part, const int* pos_ptr, const float* qkv, float* out, int window) {
     int head = blockIdx.x;
-    int len = pos_ptr[0] + 1;
+    int len = pos_ptr[0] + 1 - window_lo(pos_ptr[0] + 1, window);
     int chunk = attn_chunk(len);
     int active = (len + chunk - 1) / chunk;
     const float* base = part + (size_t)head * ATTN_SPLITS * ATTN_PART;
@@ -1301,7 +1311,7 @@ constexpr int FA_STRIDE = HEAD_DIM + 1;
 constexpr int FA_OUT = HEAD_DIM / 8;
 
 extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
-                                           const int* block_table, const int* pos_ptr, int layer, float* out, int tokens) {
+                                           const int* block_table, const int* pos_ptr, int layer, float* out, int tokens, int window) {
     __shared__ float qs[FA_BQ][FA_STRIDE];
     __shared__ float ks[FA_BK][FA_STRIDE];
     __shared__ float vs[FA_BK][HEAD_DIM];
@@ -1355,7 +1365,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
 #pragma unroll
         for (int j = 0; j < 4; j++) {
             int t = k0 + sub * 4 + j;
-            s[j] = (t <= pos && t < key_end) ? s[j] * scale : NEG_INF;
+            s[j] = (t <= pos && t < key_end && (window <= 0 || t > pos - window)) ? cap_score(s[j] * scale) : NEG_INF;
             tile_max = fmaxf(tile_max, s[j]);
         }
         tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
@@ -1452,7 +1462,7 @@ __device__ __forceinline__ void mma_dec(float* c, const unsigned* ah, const unsi
 extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
                                      const bf16_t* v_cache, const int* block_table, const int* pos_ptr, int layer,
                                      bf16_t* out_hi, bf16_t* out_lo, int tokens,
-                                     const int* mm_meta, const int* mm_table, int mm_slot) {
+                                     const int* mm_meta, const int* mm_table, int mm_slot, int window) {
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = FM_BK * HEAD_DIM;
     static_assert(FM_BQ * HEAD_DIM * 2 <= {{FM_SMEM}}, "Q staging fits");
@@ -1473,6 +1483,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     int pos0 = base + row0;
     int pos1 = base + row1;
     float scale_log2 = rsqrtf((float)HEAD_DIM) * 1.4426950408889634f;
+    constexpr float LOG2E = 1.4426950408889634f;
     unsigned qh[FM_KB][4];
     unsigned ql[FM_KB][4];
     constexpr int PAIRS = (ROT_HALF + 31) / 32;
@@ -1578,7 +1589,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         const bf16_t* k_lo = k_hi + PLANE;
         const bf16_t* v_hi = k_hi + KV_PLANES * PLANE;
         const bf16_t* v_lo = v_hi + PLANE;
-        if (k0 > warp_last) {
+        if (k0 > warp_last || (window > 0 && k0 + FM_BK - 1 <= base + q0 + warp * 16 - window)) {
             __syncthreads();
             continue;
         }
@@ -1607,7 +1618,8 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nb * 8 + 2 * t + (e & 1);
                 int pos = e < 2 ? pos0 : pos1;
-                float v = (key <= pos && key < key_end) ? s[nb][e] * scale_log2 : NEG_INF;
+                bool live = key <= pos && key < key_end && (window <= 0 || key > pos - window);
+                float v = live ? (SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2) : NEG_INF;
                 s[nb][e] = v;
                 if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
             }

@@ -516,6 +516,8 @@ pub struct Attention {
     pub output_gate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotary_dim: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub softcap: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1121,6 +1123,7 @@ impl Spec {
                 qk_norm,
                 output_gate,
                 rotary_dim,
+                softcap: None,
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params) },
             mlp: Mlp {
@@ -1140,7 +1143,7 @@ impl Spec {
 
     pub fn validate(&self) -> Result<()> {
         self.runtime.validate()?;
-        ensure!(!self.layers.pattern.contains(&Block::Sliding), "sliding window attention layers are not supported");
+        ensure!(!self.layers.pattern.contains(&Block::Sliding) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
             Some(Quant::Fp8Channel) => {

@@ -1,6 +1,6 @@
 use crate::codegen::{LA_CHUNK, LA_COLS, LA_KSPLIT, Module, PAGE};
 use crate::jit::{Jit, default_cache_dir};
-use crate::spec::{LinearAttention, Spec};
+use crate::spec::{Block, LinearAttention, Spec};
 use crate::statepool::StatePool;
 use crate::weights::{Checkpoint, Feed, Matrix, Mixer, peak_rss_bytes};
 use anyhow::{Context, Result, ensure};
@@ -108,6 +108,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             k_norm: up_opt(&a.k_norm)?,
             o: up_m(&a.o)?,
             kv: before(false),
+            window: if spec.block(i) == Block::Sliding { spec.layers.window.unwrap_or(0) as i32 } else { 0 },
         }),
         Mixer::Linear(g) => DeviceMixer::Linear(DeviceGdn {
             in_proj: up_m(&g.in_proj)?,
@@ -340,6 +341,7 @@ struct DeviceAttn {
     k_norm: Option<CudaSlice<f32>>,
     o: DeviceMatrix,
     kv: i32,
+    window: i32,
 }
 
 struct DeviceGdn {
@@ -1192,6 +1194,7 @@ impl Runtime {
                 DeviceMixer::Attention(l) => l,
             };
             let kv_layer = l.kv;
+            let window = l.window;
             let table = self.slot_table(self.seq as usize);
             self.linear_norm(
                 "qkv_proj_norm",
@@ -1224,7 +1227,8 @@ impl Runtime {
                 .arg(&table)
                 .arg(&buf.pos)
                 .arg(&kv_layer)
-                .arg(&buf.attn_part);
+                .arg(&buf.attn_part)
+                .arg(&window);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: (a.kv_heads as u32, ATTN_SPLITS as u32, 1),
@@ -1233,7 +1237,7 @@ impl Runtime {
                 })
             }?;
             let mut b = self.stream.launch_builder(self.kernel("attention_reduce"));
-            b.arg(&buf.attn_part).arg(&buf.pos).arg(&buf.qkv).arg(&buf.attn);
+            b.arg(&buf.attn_part).arg(&buf.pos).arg(&buf.qkv).arg(&buf.attn).arg(&window);
             unsafe { b.launch(cfg(a.heads as u32, a.head_dim.max(32) as u32)) }?;
             self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
             self.mlp_decode(layer)?;
@@ -1721,7 +1725,8 @@ impl Runtime {
             .arg(&ntok)
             .arg(&self.mm_meta)
             .arg(&self.mm_table)
-            .arg(&self.seq);
+            .arg(&self.seq)
+            .arg(&l.window);
         let rows = crate::codegen::flash_rows(a.head_dim);
         let config = LaunchConfig {
             grid_dim: (grid(n, rows), a.heads as u32, 1),
@@ -2157,7 +2162,8 @@ impl Runtime {
             .arg(&l.kv)
             .arg(&qlen_i)
             .arg(&bb.part_acc)
-            .arg(&bb.part_ml);
+            .arg(&bb.part_ml)
+            .arg(&l.window);
         let config = LaunchConfig {
             grid_dim: (a.kv_heads as u32, (n / qlen) as u32, crate::codegen::decode_splits(self.max_ctx) as u32),
             block_dim: (32 * crate::codegen::decode_warps(a.heads / a.kv_heads, qlen) as u32, 1, 1),
