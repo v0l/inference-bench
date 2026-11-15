@@ -344,6 +344,10 @@ fn serving_kv_is_one_f16_copy_per_token() {
     let layout = Layout::serving(&real, 131072, 32, Some(7 << 30));
     assert_eq!((layout.kv_planes, layout.kv_blocks), (1, (7 << 30) / (68 * 1024 * 16)));
     assert_eq!(Layout::serving(&real, 131072, 32, None).kv_blocks, 0, "0 sizes the pool from free memory");
+    let state = specrt::serve::slot_state_bytes(&real) as usize;
+    let few = Layout::serving(&real, 131072, 8, None).kv_headroom;
+    let many = Layout::serving(&real, 131072, 12, None).kv_headroom;
+    assert_eq!(many - few, 4 * state, "auto-sized pool leaves recurrent state for every slot");
 }
 
 fn prefix_cached_scheduler_matches_single(dir: &str) {

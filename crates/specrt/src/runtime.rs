@@ -696,7 +696,6 @@ fn gemv_cfg(name: &str, rows: usize, w: &DeviceMatrix, sms: u32) -> LaunchConfig
 
 const GEMV_BLOCKS_PER_SM: u32 = 2;
 const PREFILL_CHUNK: usize = 2048;
-const SERVING_RESIDENT_SLOTS: usize = 8;
 const STATE_FREE_MARGIN: usize = 256 << 20;
 const ATTN_SPLITS: usize = 64;
 const ATTN_BLOCK: u32 = 128;
@@ -733,7 +732,7 @@ impl Layout {
             kv_blocks: kv_bytes.map_or(0, |b| (b / kv_block_bytes(spec, 1)).max(1)),
             prefill_chunk: spec.runtime.prefill_chunk.unwrap_or(PREFILL_CHUNK),
             kv_planes: 1,
-            kv_headroom: (1 << 30) + slots.min(SERVING_RESIDENT_SLOTS) * crate::serve::slot_state_bytes(spec) as usize,
+            kv_headroom: (1 << 30) + slots * crate::serve::slot_state_bytes(spec) as usize,
             state_on_demand: true,
         }
     }
