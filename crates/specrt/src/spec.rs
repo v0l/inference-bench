@@ -267,6 +267,15 @@ impl Block {
     pub fn is_linear(self) -> bool {
         self == Block::Linear
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Block::Dense => "dense",
+            Block::Full => "full",
+            Block::Sliding => "sliding",
+            Block::Linear => "linear",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

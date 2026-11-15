@@ -280,91 +280,36 @@ impl Op {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct PlanBlock {
+    pub layers: Vec<String>,
+    pub sparse: bool,
+    pub ops: Vec<Op>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Plan {
     pub phase: Phase,
     pub tensor_core: bool,
     pub head: Vec<Op>,
-    pub attention: Vec<Op>,
-    pub linear: Vec<Op>,
-    pub attention_moe: Vec<Op>,
-    pub linear_moe: Vec<Op>,
+    pub blocks: Vec<PlanBlock>,
     pub tail: Vec<Op>,
 }
 
 impl Plan {
-    pub fn build(spec: &Spec, phase: Phase, tensor_core: bool) -> Plan {
-        let norm = |which, into| Op::Norm { which, into };
-        let lin = |weight, input, output| Op::Linear { weight, input, output };
-        if !tensor_core {
-            return Plan {
-                phase,
-                tensor_core,
-                head: vec![Op::Embed],
-                attention: vec![
-                    norm(NormKind::Input, Buf::Xn),
-                    lin(Weight::Qkv, Buf::Xn, Buf::Qkv),
-                    Op::QkRope,
-                    Op::FlashLegacy,
-                    lin(Weight::O, Buf::Attn, Buf::X),
-                    norm(NormKind::PostAttention, Buf::Xn),
-                    lin(Weight::GateUp, Buf::Xn, Buf::GateUp),
-                    Op::Swiglu,
-                    lin(Weight::Down, Buf::Act, Buf::X),
-                ],
-                linear: Vec::new(),
-                attention_moe: Vec::new(),
-                linear_moe: Vec::new(),
-                tail: vec![norm(NormKind::Final, Buf::Xn), lin(Weight::LmHead, Buf::Xn, Buf::Logits)],
-            };
-        }
-        let mlp = [
-            norm(NormKind::PostAttention, Buf::XnPlanes),
-            lin(Weight::GateUp, Buf::XnPlanes, Buf::ActPlanes),
-            lin(Weight::Down, Buf::ActPlanes, Buf::X),
-        ];
-        let prefill = phase == Phase::Prefill;
-        let mut attention = vec![norm(NormKind::Input, Buf::XnPlanes), lin(Weight::Qkv, Buf::XnPlanes, Buf::Qkv)];
-        if prefill {
-            attention.extend([Op::KvRope, Op::Flash]);
-        } else {
-            attention.push(Op::DecodeAttention);
-        }
-        attention.push(lin(Weight::O, Buf::AttnPlanes, Buf::X));
-        attention.extend(mlp);
-        let mut linear = vec![
-            norm(NormKind::Input, Buf::XnPlanes),
-            lin(Weight::LinIn, Buf::XnPlanes, Buf::PreLin),
-            lin(Weight::LinBa, Buf::XnPlanes, Buf::PreBa),
-            if prefill { Op::GdnPrefill } else { Op::GdnDecode },
-            lin(Weight::LinOut, Buf::GdnPlanes, Buf::X),
-        ];
-        linear.extend(mlp);
-        let moe = [Op::MoeRoute, Op::MoeExperts, Op::MoeCombine];
-        let swap = |ops: &[Op]| -> Vec<Op> { ops[..ops.len() - mlp.len()].iter().copied().chain(moe).collect() };
-        let (attention_moe, linear_moe) = if spec.moe.is_some() { (swap(&attention), swap(&linear)) } else { (Vec::new(), Vec::new()) };
-        Plan {
-            phase,
-            tensor_core,
-            head: vec![Op::Embed],
-            attention,
-            linear: if spec.linear_attention.is_some() { linear } else { Vec::new() },
-            attention_moe,
-            linear_moe: if spec.linear_attention.is_some() { linear_moe } else { Vec::new() },
-            tail: vec![norm(NormKind::Final, Buf::XnPlanes), lin(Weight::LmHead, Buf::XnPlanes, Buf::Logits)],
-        }
+    pub fn build(_spec: &Spec, phase: Phase, tensor_core: bool) -> Plan {
+        crate::graph::Graph::decoder().plan(phase, tensor_core).expect("the embedded decoder graph lowers")
     }
 
     pub fn layer(&self, block: Block) -> &[Op] {
-        if block.is_linear() { &self.linear } else { &self.attention }
+        self.layer_of(block, false)
     }
 
     pub fn layer_of(&self, block: Block, sparse: bool) -> &[Op] {
-        match (block.is_linear(), sparse) {
-            (true, true) => &self.linear_moe,
-            (false, true) => &self.attention_moe,
-            (true, false) => &self.linear,
-            (false, false) => &self.attention,
-        }
+        let name = block.name();
+        self.blocks
+            .iter()
+            .find(|b| b.sparse == sparse && b.layers.iter().any(|l| l == name))
+            .map_or(&[], |b| &b.ops)
     }
 }
 

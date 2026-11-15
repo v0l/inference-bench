@@ -1,0 +1,345 @@
+name = "decoder"
+kind = "graph"
+
+[[head]]
+op = "embed"
+out = "x"
+
+[[tail]]
+op = "rmsnorm"
+weight = "norm.weight"
+out = "xn"
+when = "legacy"
+in = "x"
+
+[[tail]]
+op = "linear"
+weight = "lm_head"
+out = "logits"
+when = "legacy"
+in = "xn"
+
+[[tail]]
+op = "rmsnorm"
+weight = "norm.weight"
+out = "xn_planes"
+when = "tensor_core"
+in = "x"
+
+[[tail]]
+op = "linear"
+weight = "lm_head"
+out = "logits"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block]]
+name = "attention"
+layers = ["dense", "full", "sliding"]
+mlp = "dense"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn"
+when = "legacy"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+out = "qkv"
+when = "legacy"
+in = "xn"
+
+[[block.node]]
+op = "qk_rope"
+when = "legacy"
+
+[[block.node]]
+op = "flash_legacy"
+when = "legacy"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+out = "x"
+when = "legacy"
+in = "attn"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+when = "tensor_core"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+out = "qkv"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "kv_rope"
+when = "tensor_core"
+phase = "prefill"
+
+[[block.node]]
+op = "flash"
+when = "tensor_core"
+phase = "prefill"
+
+[[block.node]]
+op = "decode_attention"
+when = "tensor_core"
+phase = "decode"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+out = "x"
+when = "tensor_core"
+in = "attn_planes"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn"
+when = "legacy"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+out = "gate_up"
+when = "legacy"
+in = "xn"
+
+[[block.node]]
+op = "swiglu"
+when = "legacy"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+out = "x"
+when = "legacy"
+in = "act"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+when = "tensor_core"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+out = "act_planes"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+out = "x"
+when = "tensor_core"
+in = "act_planes"
+
+[[block]]
+name = "linear"
+layers = ["linear"]
+mlp = "dense"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+when = "tensor_core"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "lin_in"
+out = "lin"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "lin_ba"
+out = "ba"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "gdn_prefill"
+when = "tensor_core"
+phase = "prefill"
+
+[[block.node]]
+op = "gdn_decode"
+when = "tensor_core"
+phase = "decode"
+
+[[block.node]]
+op = "linear"
+weight = "lin_out"
+out = "x"
+when = "tensor_core"
+in = "gdn_planes"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+when = "tensor_core"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+out = "act_planes"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+out = "x"
+when = "tensor_core"
+in = "act_planes"
+
+[[block]]
+name = "attention_moe"
+layers = ["dense", "full", "sliding"]
+mlp = "sparse"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn"
+when = "legacy"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+out = "qkv"
+when = "legacy"
+in = "xn"
+
+[[block.node]]
+op = "qk_rope"
+when = "legacy"
+
+[[block.node]]
+op = "flash_legacy"
+when = "legacy"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+out = "x"
+when = "legacy"
+in = "attn"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+when = "tensor_core"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+out = "qkv"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "kv_rope"
+when = "tensor_core"
+phase = "prefill"
+
+[[block.node]]
+op = "flash"
+when = "tensor_core"
+phase = "prefill"
+
+[[block.node]]
+op = "decode_attention"
+when = "tensor_core"
+phase = "decode"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+out = "x"
+when = "tensor_core"
+in = "attn_planes"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "moe_combine"
+
+[[block]]
+name = "linear_moe"
+layers = ["linear"]
+mlp = "sparse"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+when = "tensor_core"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "lin_in"
+out = "lin"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "lin_ba"
+out = "ba"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "gdn_prefill"
+when = "tensor_core"
+phase = "prefill"
+
+[[block.node]]
+op = "gdn_decode"
+when = "tensor_core"
+phase = "decode"
+
+[[block.node]]
+op = "linear"
+weight = "lin_out"
+out = "x"
+when = "tensor_core"
+in = "gdn_planes"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "moe_combine"
