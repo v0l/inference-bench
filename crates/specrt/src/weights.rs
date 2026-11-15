@@ -1007,6 +1007,10 @@ impl Checkpoint {
 }
 
 pub fn find_in_snapshot(repo: &str, file: &str) -> Result<PathBuf> {
+    let local = Path::new(repo).join(file);
+    if Path::new(repo).is_dir() && local.exists() {
+        return Ok(local);
+    }
     let snapshots =
         hub_dir().join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
     for entry in std::fs::read_dir(&snapshots).with_context(|| snapshots.display().to_string())? {
@@ -1021,6 +1025,17 @@ pub fn find_in_snapshot(repo: &str, file: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_in_snapshot_reads_a_local_checkpoint_directory() {
+        let dir = std::env::temp_dir().join(format!("specrt-local-ckpt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tokenizer.json"), "{}").unwrap();
+        let repo = dir.display().to_string();
+        assert_eq!(find_in_snapshot(&repo, "tokenizer.json").unwrap(), dir.join("tokenizer.json"));
+        assert!(find_in_snapshot(&repo, "missing.json").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn f16_converts_to_bf16() {
