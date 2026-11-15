@@ -150,6 +150,26 @@ pub fn first_match<T: Copy>(rules: &[Rule<T>], json: &serde_json::Value) -> Opti
     rules.iter().find(|r| r.matches(json)).map(|r| r.gives)
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyGguf {
+    pub keys: std::collections::BTreeMap<String, String>,
+    pub tensors: std::collections::BTreeMap<String, String>,
+    pub rope_scaling: std::collections::BTreeMap<String, crate::spec::RopeScalingKind>,
+    pub unscaled: Vec<String>,
+}
+
+impl FamilyGguf {
+    pub fn key(&self, canonical: &str, arch: &str) -> Result<String> {
+        let template = self.keys.get(canonical).with_context(|| format!("the family has no GGUF key for {canonical}"))?;
+        Ok(template.replace("{arch}", arch))
+    }
+
+    pub fn tensor(&self, canonical: &str) -> Result<&str> {
+        self.tensors.get(canonical).map(String::as_str).with_context(|| format!("the family has no GGUF tensor name for {canonical}"))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Family {
@@ -175,6 +195,8 @@ pub struct Family {
     pub rope: FamilyRope,
     #[serde(default)]
     pub quantization: FamilyQuant,
+    #[serde(default)]
+    pub gguf: FamilyGguf,
     #[serde(default)]
     pub fields: std::collections::BTreeMap<String, Vec<String>>,
 }

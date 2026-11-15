@@ -67,3 +67,31 @@ other_layer_type = "full"
 linear_attention = "linear"
 full_attention = "full"
 sliding_attention = "sliding"
+
+[gguf]
+unscaled = ["none"]
+
+[gguf.rope_scaling]
+linear = "linear"
+
+[gguf.keys]
+embedding_length = "{arch}.embedding_length"
+block_count = "{arch}.block_count"
+head_count = "{arch}.attention.head_count"
+head_count_kv = "{arch}.attention.head_count_kv"
+feed_forward_length = "{arch}.feed_forward_length"
+key_length = "{arch}.attention.key_length"
+value_length = "{arch}.attention.value_length"
+rope_dimension_count = "{arch}.rope.dimension_count"
+norm_epsilon = "{arch}.attention.layer_norm_rms_epsilon"
+rope_freq_base = "{arch}.rope.freq_base"
+rope_scaling_type = "{arch}.rope.scaling.type"
+rope_scaling_factor = "{arch}.rope.scaling.factor"
+rope_original_context = "{arch}.rope.scaling.original_context_length"
+
+[gguf.tensors]
+embedding = "token_embd.weight"
+output = "output.weight"
+q_bias = "blk.0.attn_q.bias"
+q_norm = "blk.0.attn_q_norm.weight"
+rope_freqs = "rope_freqs.weight"

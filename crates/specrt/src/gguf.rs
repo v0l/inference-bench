@@ -334,15 +334,6 @@ impl Gguf {
         self.string("general.architecture").context("the GGUF file has no general.architecture")
     }
 
-    fn arch_key(&self, key: &str) -> Result<String> {
-        Ok(format!("{}.{key}", self.architecture()?))
-    }
-
-    fn need_count(&self, key: &str) -> Result<usize> {
-        let full = self.arch_key(key)?;
-        self.count(&full).with_context(|| format!("the GGUF file has no {full}"))
-    }
-
     pub fn weight_type_bytes(&self) -> Vec<(GgmlType, usize)> {
         let mut by: HashMap<String, (GgmlType, usize)> = HashMap::new();
         for t in self.tensors.values().filter(|t| t.shape.len() == 2) {
@@ -363,20 +354,29 @@ impl Gguf {
             "GGUF architecture {arch} is not supported ({} are)",
             supported.join(", ")
         );
-        let hidden = self.need_count("embedding_length")?;
-        let layers = self.need_count("block_count")?;
-        let heads = self.need_count("attention.head_count")?;
-        let kv_heads = self.count(&self.arch_key("attention.head_count_kv")?).unwrap_or(heads);
-        let intermediate = self.need_count("feed_forward_length")?;
-        let head_dim = self.count(&self.arch_key("attention.key_length")?).unwrap_or(hidden / heads);
-        let value_dim = self.count(&self.arch_key("attention.value_length")?).unwrap_or(head_dim);
+        let family = registry.for_gguf(arch).context("no family for the GGUF architecture")?;
+        let names = &family.gguf;
+        let key = |canonical: &str| names.key(canonical, arch);
+        let need = |canonical: &str| -> Result<usize> {
+            let full = key(canonical)?;
+            self.count(&full).with_context(|| format!("the GGUF file has no {full}"))
+        };
+        let hidden = need("embedding_length")?;
+        let layers = need("block_count")?;
+        let heads = need("head_count")?;
+        let kv_heads = self.count(&key("head_count_kv")?).unwrap_or(heads);
+        let intermediate = need("feed_forward_length")?;
+        let head_dim = self.count(&key("key_length")?).unwrap_or(hidden / heads);
+        let value_dim = self.count(&key("value_length")?).unwrap_or(head_dim);
         ensure!(value_dim == head_dim, "GGUF key_length {head_dim} and value_length {value_dim} differ");
-        let rotary = self.count(&self.arch_key("rope.dimension_count")?).filter(|&r| r != head_dim);
-        let eps = self.number(&self.arch_key("attention.layer_norm_rms_epsilon")?).context("the GGUF file has no layer_norm_rms_epsilon")?;
-        let theta = self.number(&self.arch_key("rope.freq_base")?).unwrap_or(10000.0);
-        let embd = self.tensor("token_embd.weight").context("the GGUF file has no token_embd.weight")?;
-        ensure!(embd.shape == [embd.rows(), hidden], "token_embd.weight has shape {:?}, expected [vocab, {hidden}]", embd.shape);
-        let tied = !self.tensors.contains_key("output.weight");
+        let rotary = self.count(&key("rope_dimension_count")?).filter(|&r| r != head_dim);
+        let eps_key = key("norm_epsilon")?;
+        let eps = self.number(&eps_key).with_context(|| format!("the GGUF file has no {eps_key}"))?;
+        let theta = self.number(&key("rope_freq_base")?).unwrap_or(10000.0);
+        let embd_name = names.tensor("embedding")?;
+        let embd = self.tensor(embd_name).with_context(|| format!("the GGUF file has no {embd_name}"))?;
+        ensure!(embd.shape == [embd.rows(), hidden], "{embd_name} has shape {:?}, expected [vocab, {hidden}]", embd.shape);
+        let tied = !self.tensors.contains_key(names.tensor("output")?);
         let mut unsupported: Vec<String> = self.tensors.values().filter(|t| t.kind.block().is_none()).map(|t| format!("{} ({})", t.name, t.kind.name())).collect();
         unsupported.sort();
         if let Some(first) = unsupported.first() {
@@ -398,12 +398,12 @@ impl Gguf {
                 heads,
                 kv_heads,
                 head_dim,
-                qkv_bias: self.tensors.contains_key("blk.0.attn_q.bias"),
-                qk_norm: self.tensors.contains_key("blk.0.attn_q_norm.weight"),
+                qkv_bias: self.tensors.contains_key(names.tensor("q_bias")?),
+                qk_norm: self.tensors.contains_key(names.tensor("q_norm")?),
                 output_gate: false,
                 rotary_dim: rotary,
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(head_dim)?, mrope: None },
+            rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(family, head_dim)?, mrope: None },
             mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None },
             moe: None,
             linear_attention: None,
@@ -430,28 +430,35 @@ impl Gguf {
         }
     }
 
-    fn rope_scaling(&self, head_dim: usize) -> Result<Option<RopeScaling>> {
-        let kind = self.string(&self.arch_key("rope.scaling.type")?).unwrap_or("none");
-        let factor = self.number(&self.arch_key("rope.scaling.factor")?);
-        match kind {
-            "linear" => Ok(Some(RopeScaling {
+    fn rope_scaling(&self, family: &crate::family::Family, head_dim: usize) -> Result<Option<RopeScaling>> {
+        let names = &family.gguf;
+        let arch = self.architecture()?;
+        let kind = self.string(&names.key("rope_scaling_type", arch)?).unwrap_or("");
+        let factor = self.number(&names.key("rope_scaling_factor", arch)?);
+        if kind.is_empty() || names.unscaled.iter().any(|u| u == kind) {
+            return match self.tensor(names.tensor("rope_freqs")?) {
+                Some(t) => Ok(Some(self.llama3_scaling(family, t, head_dim)?)),
+                None => Ok(None),
+            };
+        }
+        match names.rope_scaling.get(kind) {
+            Some(RopeScalingKind::Linear) => Ok(Some(RopeScaling {
                 kind: RopeScalingKind::Linear,
-                factor: factor.context("rope.scaling.type is linear but there is no rope.scaling.factor")?,
+                factor: factor.with_context(|| format!("rope scaling type is {kind} but there is no scaling factor"))?,
                 low_freq_factor: None,
                 high_freq_factor: None,
                 original_max_positions: None,
                 yarn: None,
             })),
-            "none" | "" => match self.tensor("rope_freqs.weight") {
-                Some(t) => Ok(Some(self.llama3_scaling(t, head_dim)?)),
-                None => Ok(None),
-            },
-            other => bail!("GGUF rope scaling {other} is not supported"),
+            _ => bail!("GGUF rope scaling {kind} is not supported"),
         }
     }
 
-    fn llama3_scaling(&self, t: &TensorInfo, head_dim: usize) -> Result<RopeScaling> {
-        ensure!(t.kind == GgmlType::F32 && t.shape == [head_dim / 2], "rope_freqs.weight has an unexpected shape or type");
+    fn llama3_scaling(&self, family: &crate::family::Family, t: &TensorInfo, head_dim: usize) -> Result<RopeScaling> {
+        let names = &family.gguf;
+        let arch = self.architecture()?;
+        let freqs_name = names.tensor("rope_freqs")?;
+        ensure!(t.kind == GgmlType::F32 && t.shape == [head_dim / 2], "{freqs_name} has an unexpected shape or type");
         let freqs: Vec<f32> = self.data(t).chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes"))).collect();
         let factor = freqs.iter().copied().fold(1.0f32, f32::max) as f64;
         let scaling = RopeScaling {
@@ -460,16 +467,16 @@ impl Gguf {
             low_freq_factor: Some(1.0),
             high_freq_factor: Some(4.0),
             original_max_positions: Some(
-                self.number(&self.arch_key("rope.scaling.original_context_length")?).unwrap_or(8192.0),
+                self.number(&names.key("rope_original_context", arch)?).unwrap_or(8192.0),
             ),
             yarn: None,
         };
-        let theta = self.number(&self.arch_key("rope.freq_base")?).unwrap_or(10000.0);
+        let theta = self.number(&names.key("rope_freq_base", arch)?).unwrap_or(10000.0);
         let expected = llama3_factors(theta, head_dim, &scaling);
         for (i, (a, b)) in freqs.iter().zip(&expected).enumerate() {
             ensure!(
                 (*a as f64 - b).abs() <= 1e-5 * b.abs().max(1.0),
-                "rope_freqs.weight[{i}] is {a} but llama3 scaling with factor {factor} gives {b}; this rope scaling is not supported"
+                "{freqs_name}[{i}] is {a} but llama3 scaling with factor {factor} gives {b}; this rope scaling is not supported"
             );
         }
         Ok(scaling)
