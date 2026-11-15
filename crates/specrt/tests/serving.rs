@@ -640,3 +640,31 @@ fn tiny_json_schema_grammar_output_validates_over_many_seeds() {
     }
     assert!(checked >= 8, "only {checked} constrained requests finished");
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn auto_sized_pool_admits_and_decodes_more_slots_than_the_old_resident_cap() {
+    use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
+    let mut s = spec_for("tiny-qwen3.5-27b");
+    s.mtp = None;
+    let slots = 12;
+    let layout = Layout::serving(&s, 512, slots, None);
+    assert_eq!(layout.kv_blocks, 0);
+    let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
+    let mut sched = Scheduler::new(exec, Config { max_num_seqs: slots, ..Config::default() });
+    for q in 0..slots as u32 {
+        let prompt = (0..40u32).map(|i| (i * 13 + q * 97 + 1) % 1024).collect();
+        sched.submit(Request { prompt, max_tokens: 24, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None }).unwrap();
+    }
+    let (mut most_running, mut most_rows, mut finished) = (0, 0, 0);
+    while !sched.idle() {
+        let mut events = Vec::new();
+        let r = sched.step(&mut events).unwrap();
+        most_running = most_running.max(sched.running());
+        most_rows = most_rows.max(r.decode_rows);
+        finished += events.iter().filter(|e| matches!(e, Event::Finished { .. })).count();
+    }
+    assert_eq!(most_running, slots, "only {most_running} of {slots} sequences were admitted at once");
+    assert_eq!(most_rows, slots, "decode batches peaked at {most_rows} rows");
+    assert_eq!(finished, slots);
+}
