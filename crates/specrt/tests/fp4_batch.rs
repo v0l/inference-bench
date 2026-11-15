@@ -266,3 +266,9 @@ fn batched_fp4_down_matches_the_tile_path_on_a_random_27b_matrix() {
 fn batched_fp4_gate_up_matches_the_tile_path_on_a_random_27b_matrix() {
     compare("gate_up", 34816, 5120, &[2, 4, 8, 16, 17, 24, 32, 33, 48, 64]);
 }
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
+fn batched_fp4_mtp_head_matches_the_tile_path_on_a_random_27b_matrix() {
+    compare("mtp_head", 248320, 5120, &[4, 12]);
+}

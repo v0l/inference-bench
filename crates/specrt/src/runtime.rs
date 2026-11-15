@@ -900,7 +900,7 @@ impl Runtime {
         };
         let target = crate::codegen::cuda_target(&ctx)?;
         let sms = target.sm_count;
-        let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) {
+        let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) || spec.draft_head_quant() == Some(crate::spec::Quant::Nvfp4G16) {
             stream.alloc_zeros(crate::gemm::batch_part_len(spec, &target, true))?
         } else {
             stream.alloc_zeros(1)?

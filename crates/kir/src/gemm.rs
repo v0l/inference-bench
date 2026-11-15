@@ -660,7 +660,7 @@ pub fn variant_for(t: &Target, tuning: &Tuning, linear: &str, rows: usize, token
         TileChoice::Big => Variant::Big,
         TileChoice::Narrow => Variant::Narrow,
         _ if tokens <= 16 => Variant::Tiny,
-        _ if linear == "lm_head" && tokens <= ROWS_MAX_TOKENS => Variant::Narrow,
+        _ if linear == "lm_head" && tokens <= BATCH_MAX_TOKENS => Variant::Narrow,
         _ if blocks(tuning.tile(Variant::Big)) >= 2 * sms => Variant::Big,
         _ if blocks(Tile::SMALL) >= 2 * sms => Variant::Small,
         _ => Variant::Narrow,
@@ -687,7 +687,7 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
     let fp4_act = policy.fp4_act && t.has(Feature::BlockScaledFp4);
     let mma = t.has(Feature::Mma16816);
     let f8b = auto && mma && r.tokens <= BATCH_MAX_TOKENS && BATCH_LINEARS.contains(&r.linear);
-    let f4b = auto && mma && r.tokens <= BATCH_MAX_TOKENS && !head;
+    let f4b = auto && mma && r.tokens <= BATCH_MAX_TOKENS && (!head || r.linear == "mtp_head");
     let plain = |name: String, path: GemmPath, tile: Tile, kernel: Option<KernelInstance>| Choice {
         name,
         quant: None,

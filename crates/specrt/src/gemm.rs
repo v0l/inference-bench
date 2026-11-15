@@ -157,6 +157,7 @@ pub fn batch_part_len(spec: &Spec, target: &kir::Target, fp4: bool) -> usize {
     let most = linears
         .into_iter()
         .map(|l| linear_shape(spec, l))
+        .chain(fp4.then(|| linear_shape(spec, "lm_head")))
         .map(|s| kg::batch_part_len(target, s.n, s.k))
         .max()
         .unwrap_or(1);
@@ -312,6 +313,12 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
         let shape = linear_shape(spec, "lm_head");
         let (name, wf) = if q == Quant::Nvfp4G16 { ("mtp_head_f4w", WeightFormat::Fp4) } else { ("mtp_head_mma", weight_format(q)) };
         set.tiles(t, name, shape, wf, true, false, &tuning)?;
+        if wf == WeightFormat::Fp4 {
+            for tokens in BATCH_VARIANTS {
+                set.push(KernelInstance::batch(t, &format!("mtp_head_f4b{tokens}"), shape, WeightFormat::Fp4, tokens))?;
+            }
+            set.push(KernelInstance::batch_reduce(t, "mtp_head_f4b_reduce", shape, WeightFormat::Fp4))?;
+        }
     }
     Ok(set)
 }
