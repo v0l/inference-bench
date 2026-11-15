@@ -3517,7 +3517,9 @@ dependencies = [
  "chrono",
  "clap",
  "inference-bench-core",
+ "inference-bench-kir",
  "inference-bench-server",
+ "inference-bench-specrt",
  "serde_json",
  "tracing",
 ]
