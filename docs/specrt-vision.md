@@ -83,16 +83,58 @@ checkpoint and JIT compiled like the other kernels. `vision_encoder::plan(cfg)` 
 attention, proj, norm, mlp up and down, then the merger and a deepstack merger after each block
 named in `deepstack_visual_indexes`), so the engine tab can draw the tower from the same list.
 
-- Weights are the checkpoint's `visual.*` tensors in bf16, kept bf16 on the device. Activations are
-  f32. The patch embed Conv3d is a GEMM over the flattened patch, the bilinear position table
-  interpolation (align_corners) and the rope tables are built on the host.
+- Weights are the checkpoint's `visual.*` tensors in bf16 (converted to f16 on the device in fast
+  mode). The patch embed Conv3d is a GEMM over the flattened patch; position interpolation is
+  align_corners bilinear, as in transformers.
 - Attention is limited to one frame (`h * w` patches), which is how transformers builds `cu_seqlens`
-  for images and videos. Images in one request are encoded one at a time, so no cross image mask is
-  needed.
-- Bound: `tests/vision_encoder.rs` (ignored, needs the 27B FP8 snapshot and a GPU) compares the merged
-  embeddings of three fixtures with `transformers` run by `scripts/vision_encoder_reference.py`.
-  Measured relative rms 2e-6 to 8e-6 and max abs error at most 2.2e-3 on values up to 94. The test
-  asserts rms below 1e-4 and max below 5e-5 of the largest value.
+  for images and videos.
+- Kernels (`templates/vision.cu`): every linear is a tensor-core GEMM (`vis_mma`, 128x128 tiles,
+  three stage cp.async pipeline, bias, gelu and the residual add in the epilogue). Layernorms write the
+  next GEMM's input planes directly. Rope is applied while packing q, k and v per head into
+  `vis_flash`, a flash attention with mma.sync, online softmax and a per patch frame segment, so
+  several images and video frames go through one call without attending across each other. The
+  position table interpolation (`vis_pos`) runs on the device from four taps per patch.
+- Precision, `[runtime.vision] precision`:
+  - `fast` (default): activations and weights in f16, f32 accumulate.
+  - `exact`: each activation is split into a high and a low half (bf16 for the GEMMs against the
+    bf16 weights, f16 for attention), which keeps the f32 transformers bound.
+- Batching: `VisionEncoder::encode_batch` takes several images in one pass. The buffers for 4,800
+  patches (one 960x1280 photo) are allocated at load, before the KV pool takes the free memory, so a
+  normal request never allocates. A larger batch allocates its own.
+- Bounds, `tests/vision_encoder.rs` (ignored, needs the 27B FP8 snapshot and a GPU), merged
+  embeddings of four fixtures against `transformers` fp32 from `scripts/vision_encoder_reference.py`:
+
+  | mode | rel rms | max abs / largest value | asserted |
+  |---|---|---|---|
+  | exact | 2.8e-5 to 4.2e-5 | at most 4.7e-5 | rms < 1e-4, max < 5e-5 |
+  | fast | 4.6e-4 to 2.4e-3 | at most 4.4e-3 | rms < 5e-3, max < 1e-2 |
+
+  The fast error is below the 1 to 6 percent embedding noise that left the LM's KL unchanged (see
+  the table further down), and below the transformers bf16 tower (rel rms 1e-2 to 3e-2).
+- Speed, 960x1280 photo (grid `[1, 80, 60]`, 4,800 patches), best of 5:
+
+  | GPU | master (fp32 GEMM, scalar attention) | exact | fast |
+  |---|---|---|---|
+  | RTX PRO 6000 Max-Q (quiet GPU) | 4,516 ms | 96.8 ms | 54.0 ms |
+  | GB10 (Spark, shared with its vLLM) | 53,456 ms | 503 ms | 442 ms |
+
+## Serving (#498)
+
+- Encoding runs off the engine thread. `serve::run` hands every media request to a
+  `specrt-vision` thread that owns the `MediaEncoder`, which takes all the requests queued at that
+  moment, plans them together and encodes their images in batches of up to `max_batch` images and
+  4,800 patches. The engine keeps stepping decode and prefill of running sequences meanwhile, and
+  submits a request with its finished plan. The encoder runs on its own CUDA stream.
+- Cache: encoder outputs are kept in host memory by the SHA-256 of the media bytes, least recently
+  used first out, bounded by `[runtime.vision] cache_mb` (512 by default, 0 turns it off). A retry
+  of the same image is planned without touching the GPU. A 960x1280 photo is 1,200 rows of 5,120
+  floats, 24.6 MB.
+- A request cancelled while it waits for the encoder is dropped before or after encoding, never
+  admitted.
+- Tests: `serve::watchdog_tests::decode_keeps_stepping_while_an_image_encodes` (a fake encoder held
+  until a 40 token text request has finished; with the old in-submit encoding it times out),
+  `media_encode::tests` (cache hit, LRU bound, one encoder call for a burst, a bad request failing
+  alone).
 
 ## LM integration (slice 3, done)
 
@@ -160,9 +202,8 @@ vLLM on port 8001 (read only) against specrt behind `inference-bench serve`:
 | 3 images | 588 | 0.156 s | 1.046 s |
 | 10 s video, 10 fps 320x240 | 800 (specrt) / 880 (vLLM) | 0.165 s | 1.221 s |
 
-specrt TTFT includes the preprocessing and the vision encoder (a first, unoptimised f32 kernel set
-with a naive GEMM), vLLM's includes its encoder cache; the encoder is the target for a later
-speed pass. `prefixbench` (scheduler only, no HTTP): image_1 cold 815 ms, warm 436 ms with 208 of
+specrt TTFT includes the preprocessing and the vision encoder (the first f32 kernel set with a naive
+GEMM, before #498), vLLM's includes its encoder cache. `prefixbench` (scheduler only, no HTTP): image_1 cold 815 ms, warm 436 ms with 208 of
 211 tokens cached; images_3 2306 ms and 1153 ms; 3 s video 837 ms and 287 ms.
 The frame count differs from vLLM on the 10 s clip (see the follow-up issue).
 

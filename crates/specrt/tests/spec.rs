@@ -409,6 +409,14 @@ fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
     assert!(bad("fp4_tile = [60, 128, 2, 4]").contains("fp4_tile"));
     assert!(bad("fp4_tile = [64, 32, 2, 4]").contains("16 * wn"));
     assert!(bad("fp4_stages = 1").contains("fp4_stages"));
+    let vision = Spec::parse(&format!("{base}\n[runtime.vision]\nprecision = \"exact\"\ncache_mb = 64\nmax_batch = 2\n")).unwrap();
+    assert_eq!(
+        vision.runtime.vision,
+        specrt::spec::VisionOptions { precision: specrt::vision_encoder::VisionPrecision::Exact, cache_mb: 64, max_batch: 2 }
+    );
+    assert_eq!(Spec::parse(&vision.to_toml().unwrap()).unwrap(), vision);
+    assert!(format!("{:#}", Spec::parse(&format!("{base}\n[runtime.vision]\nprecision = \"half\"\n")).unwrap_err()).contains("half"));
+    assert!(format!("{:#}", Spec::parse(&format!("{base}\n[runtime.vision]\nmax_batch = 0\n")).unwrap_err()).contains("max_batch"));
 }
 
 #[test]
