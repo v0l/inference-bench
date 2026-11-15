@@ -193,6 +193,53 @@ SPECRT_BENCH_SERVE=1 cargo run --release --bin bench -- specs/qwen3-0.6b.toml 12
 flock /tmp/gpu27.lock ./scripts/serve27b.sh              # KV_GB, SEQS, MAX_LEN, ONLY=stall
 ```
 
+## #601 batched decode at 8 concurrent
+
+27B NVFP4, `crates/specrt/scripts/bench601.sh`: 8 clients, 24 requests of 1000-1500 words (about 1.3k
+tokens) arriving at once, 300-900 output tokens, 3 GB KV, greedy, MTP 2 drafts. Run 15 Nov 00:05-00:22 with the
+user's app unloaded, but sharing the card with other workers' short jobs, so treat differences under 5 percent as noise.
+Aggregate is completion tokens over wall time. Per-request decode is the median of the server's own
+`decode_tok_s` per request, which is (completion tokens - 1) / (end - first token), so queue and prefill time are not in it.
+
+| Run | Aggregate tok/s | Per-request decode med / min | TTFT p50 / p95 | ITL p95 |
+|---|---|---|---|---|
+| before: master, itl 100 | 366 | 55 / 36 | 0.66 / 2.76 s | 44 ms |
+| itl 50 | 268 | n/a | 3.24 / 9.09 s | 81 ms |
+| itl 100 (decode-aware budget) | 326 | 50 / 35 | 1.27 / 3.91 s | 91 ms |
+| itl 200 | 374 | n/a | 0.61 / 2.46 s | 43 ms |
+| itl 400 | 388 | 55 / 36 | 0.37 / 2.14 s | 43 ms |
+| after: itl 100, whole prompt 4096 (new default) | 386 | 56 / 35 | 0.38 / 2.01 s | 43 ms |
+| after, MTP max_batch 4 | 250 | 34 / 32 | 0.33 / 1.82 s | 28 ms |
+| after, 16 slots, 32 requests, MTP at all sizes | 557 | 45 / 35 | 0.41 / 4.05 s | 50 ms |
+| after, 16 slots, MTP max_batch 8 | 360 | 26 / 23 | 0.38 / 3.98 s | 40 ms |
+
+What the numbers say:
+
+- A small `itl_target` is the cause of the slow TTFT. Beside 8 decoders a step takes about 45 ms on this
+  card, so itl 50 leaves almost no prefill room: p50 TTFT 3.2 s and aggregate down to 268. Itl 200 and 400
+  behave like whole-prompt prefill, because a 1.3k prompt then fits in one step.
+- Whole-prompt prefill (`whole_prompt_tokens`, default 4096) gives the itl 400 result (TTFT p50 0.38 s) without
+  giving up the 100 ms target for long prompts, which stay chunked. ITL p95 stays at 43 ms because a 1.3k prefill
+  step is shorter than the p95 step anyway.
+- The prefill budget now subtracts the measured decode step time from `itl_target` (it used to give prefill the full
+  target on top of a decode step). On its own it makes TTFT worse at itl 100 (1.27 s), so it only pays with the
+  whole-prompt limit.
+- MTP stays on at every batch size (`max_batch` unset means all slots). Capping it at 4 or at 8 with 16 slots drops
+  everyone to plain decode: 250 and 360 tok/s against 386 and 557. Nothing to raise.
+- Targets at 8 concurrent: per-request decode 56 against at least 50 met, TTFT p50 0.38 s against under 1.5 s met,
+  aggregate 386 against at least 450 not met. At 16 concurrent aggregate is 557, above vLLM's 512 at 8, with
+  per-request decode 45. The 8-slot ceiling is the decode step itself (45 ms for 8 rows times
+  about 2.5 tokens per step with MTP), not the scheduler: prefill is a small share of steps at this load. Raising it
+  needs a faster batched MTP verify (kernel work, not this change).
+- The user's screenshot (23-28 tok/s per request, TTFT 3.3 s) is not reproduced here: this load gives 55 and 0.66 s
+  on master. It matches the 16-slot MTP max_batch 8 row (26) and the itl 50 row (3.2 s) in shape, so the live app was
+  probably running with a lower MTP batch limit or `itl_target_ms`, or with 20 slots and other prompts; check its
+  config before blaming the scheduler.
+
+Defaults: `itl_target_ms` stays 100, `whole_prompt_tokens` 4096, `max_batch` unset. Both are in the load dialog
+(serving group) and in the server config (`whole_prompt_tokens`, `itl_target_ms`, `--whole-prompt-tokens`,
+`--itl-target-ms`). `RUST_LOG=inference_bench_specrt=debug` logs rows, MTP or plain, prefill tokens and step ms per step.
+
 ## #360 measurements
 
 Not measured on the real 27B: another process held 24 GB of the GPU next to vLLM's 51 GB (free

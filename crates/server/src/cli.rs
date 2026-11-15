@@ -33,7 +33,7 @@ pub struct ServeArgs {
     pub max_batched_tokens: Option<usize>,
     #[arg(long, help = "Inter-token latency target in ms that bounds prefill beside decoders (default 100)")]
     pub itl_target_ms: Option<u64>,
-    #[arg(long, help = "Prefill a whole prompt in one step when it is at most this many tokens (default 0, off)")]
+    #[arg(long, help = "Prefill a whole prompt in one step when it is at most this many tokens (default 4096, 0 is off)")]
     pub whole_prompt_tokens: Option<usize>,
     #[arg(long, help = "Seconds before an idle model is unloaded")]
     pub idle_unload_secs: Option<u64>,

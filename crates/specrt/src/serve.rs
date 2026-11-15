@@ -67,7 +67,7 @@ impl Default for ServeOptions {
             kv_cache_tokens: None,
             max_batched_tokens: 8192,
             itl_target: Duration::from_millis(100),
-            whole_prompt_tokens: 0,
+            whole_prompt_tokens: 4096,
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,
