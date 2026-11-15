@@ -17,6 +17,7 @@ pub struct Stats {
     pub requests: Mutex<Vec<ChatRequest>>,
     pub loaded_names: Mutex<Vec<String>>,
     pub hung: AtomicBool,
+    pub consumed: AtomicUsize,
 }
 
 pub struct Fake {
@@ -77,12 +78,17 @@ impl Fake {
         let started = Instant::now();
         std::thread::sleep(Duration::from_millis(self.first_delay_ms));
         let ttft = started.elapsed().as_secs_f64();
+        let skip = match request.is_some_and(|r| r.continuation.is_some()) {
+            true => self.stats.consumed.load(Ordering::SeqCst),
+            false => 0,
+        };
         let n = match self.pieces.is_empty() {
             true => self.tokens.min(max_tokens),
-            false => self.pieces.len().min(max_tokens),
+            false => self.pieces.len().saturating_sub(skip).min(max_tokens),
         };
+        self.stats.consumed.store(skip + n, Ordering::SeqCst);
         let mut text = String::new();
-        for i in 0..n {
+        for i in skip..skip + n {
             if request.is_some_and(|r| r.cancelled()) {
                 self.stats.cancelled.fetch_add(1, Ordering::SeqCst);
                 break;

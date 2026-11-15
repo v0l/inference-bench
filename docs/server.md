@@ -17,6 +17,10 @@ INFERENCE_BENCH_API_KEYS=sk-local ./target/release/inference-bench-server \
 | `GET /v1/models` | Configured models, with a `loaded` flag |
 | `POST /v1/chat/completions` | Stream (SSE, `stream_options.include_usage`) and non-stream |
 | `POST /v1/completions` | Stream and non-stream |
+| `POST /v1/messages` | Anthropic Messages, stream and non-stream: tool_use/tool_result, thinking blocks, images, `thinking: {type: disabled|enabled, budget_tokens}`, `output_config.effort`, `x-api-key` auth. A request with no `thinking` field gets no thinking (Claude Code helper calls), switch off with `anthropic_thinking_on_request = false` |
+| `POST /v1/messages/count_tokens` | Rough token estimate |
+| `POST /v1/responses` | OpenAI Responses, stateless (`previous_response_id` is refused), stream and non-stream, function tools, reasoning items |
+| `GET /props`, `GET /slots` | llama.cpp style model properties (chat template, `chat_template_caps`, generation defaults, context) and slots |
 | `POST /v1/embeddings` | 501: the engine has no embeddings |
 | `POST /v1/bench` | `{"model", "prompts": [...], "max_tokens", "repeat"}` returns per-run and summary stats (tokens/s, TTFT and decode p50/p95) |
 | `GET /health` | Always open |
@@ -131,3 +135,11 @@ A field the server does not handle returns 400 naming it: `response_format` othe
 | `n=2` through the client | 2 choices (since #585) |
 
 Qwen3-0.6B with the hermes parser ran the same client loop (call, tool result, answer) correctly.
+
+## Thinking levels and tool-call recovery
+
+Every chat dialect takes `reasoning_effort` (`none|low|medium|high`), `reasoning: {effort}` or `chat_template_kwargs.enable_thinking`. Anthropic budgets map to an effort (under 2K low, under 8K medium, else high) and are also the hard cap.
+
+`reasoning_budget_tokens` (request, or `reasoning_budget_tokens` in the server config) caps the thinking: when the model has produced that many tokens without closing `<think>`, the server appends `reasoning_wrapup` plus `</think>` and the model answers from there. With `answer_room = true` (default) a request with `max_tokens` of 1024 or more and no budget gets one, so thinking is wrapped up when a quarter of the cap (at least 512 tokens) is left. The wrap-up count is `inference_thinking_wrapups_total`.
+
+The tool parser only emits declared tools. It also recovers `<parameter=...>` without a function, JSON inside `<tool_call>`, a `<function=...>` without `<tool_call>`, several calls in one block and a missing `</function>`; repairs trailing commas, single quotes and `True/False/None` in array and object arguments; and maps collapsed namespace names (`mcp_a_b` for `mcp__a__b`) when unambiguous. Anything else stays text. Repairs are counted in `inference_tool_call_repairs_total{kind}`.

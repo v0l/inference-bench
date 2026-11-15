@@ -33,6 +33,7 @@ struct Inner {
     decode_secs: f64,
     last_decode_tok_s: f64,
     cancelled: u64,
+    thinking_wrapups: u64,
     model_loads: BTreeMap<String, u64>,
     model_load_failures: u64,
     model_unloads: u64,
@@ -98,6 +99,10 @@ impl Metrics {
         }
     }
 
+    pub fn thinking_wrapup(&self) {
+        self.inner.lock().unwrap().thinking_wrapups += 1;
+    }
+
     pub fn cancelled(&self) {
         self.inner.lock().unwrap().cancelled += 1;
     }
@@ -133,6 +138,11 @@ impl Metrics {
         for ((endpoint, status), n) in &m.requests {
             let _ = writeln!(o, "inference_requests_total{{endpoint=\"{endpoint}\",status=\"{status}\"}} {n}");
         }
+        let _ = writeln!(o, "# HELP inference_tool_call_repairs_total Tool calls and arguments the parser recovered, by kind.\n# TYPE inference_tool_call_repairs_total counter");
+        for (kind, n) in crate::tools::repair_counts() {
+            let _ = writeln!(o, "inference_tool_call_repairs_total{{kind=\"{kind}\"}} {n}");
+        }
+        let _ = writeln!(o, "# TYPE inference_thinking_wrapups_total counter\ninference_thinking_wrapups_total {}", m.thinking_wrapups);
         let _ = writeln!(o, "# TYPE inference_prompt_tokens_total counter");
         for (model, n) in &m.prompt_tokens {
             let _ = writeln!(o, "inference_prompt_tokens_total{{model=\"{model}\"}} {n}");

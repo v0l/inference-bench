@@ -88,6 +88,7 @@ pub struct ChatRequest {
     pub logprobs: Option<u32>,
     pub on_logprob: Option<LogprobSink>,
     pub response_format: Option<specrt::grammar::Schema>,
+    pub continuation: Option<String>,
 }
 
 pub type TokenLogprob = specrt::serve::TokenLogprobText;
@@ -129,6 +130,7 @@ impl ChatRequest {
             logprobs: None,
             on_logprob: None,
             response_format: None,
+            continuation: None,
         }
     }
 

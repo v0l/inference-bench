@@ -153,6 +153,10 @@ pub struct ServerConfig {
     pub tool_parser: Option<String>,
     pub reasoning_parser: Option<String>,
     pub chat_template_kwargs: toml::Table,
+    pub reasoning_budget_tokens: Option<usize>,
+    pub answer_room: bool,
+    pub reasoning_wrapup: String,
+    pub anthropic_thinking_on_request: bool,
     pub media: inference_bench_core::media::MediaLimits,
 }
 
@@ -198,6 +202,10 @@ impl Default for ServerConfig {
             tool_parser: None,
             reasoning_parser: None,
             chat_template_kwargs: toml::Table::new(),
+            reasoning_budget_tokens: None,
+            answer_room: true,
+            reasoning_wrapup: "\n\nI have thought about this long enough and will answer now.\n".into(),
+            anthropic_thinking_on_request: true,
             media: Default::default(),
         }
     }

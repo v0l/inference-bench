@@ -99,6 +99,10 @@ pub trait Target: Send {
         None
     }
 
+    fn props(&self) -> Option<serde_json::Value> {
+        None
+    }
+
     fn failure(&self) -> Option<String> {
         None
     }

@@ -152,6 +152,11 @@ fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
         (r("GET", "/v1/models", "List models (OpenAI)"), get(list_models)),
         (r("POST", "/v1/chat/completions", "Chat completions, streaming, tools"), post(chat_completions)),
         (r("POST", "/v1/completions", "Text completions"), post(completions)),
+        (r("POST", "/v1/messages", "Anthropic Messages, streaming, tools, thinking"), post(crate::dialects::messages)),
+        (r("POST", "/v1/responses", "OpenAI Responses (stateless), streaming, function tools"), post(crate::dialects::responses)),
+        (r("POST", "/v1/messages/count_tokens", "Anthropic token estimate"), post(crate::dialects::count_tokens)),
+        (r("GET", "/props", "llama.cpp style model properties and chat template"), get(crate::dialects::props)),
+        (r("GET", "/slots", "llama.cpp style slot list"), get(crate::dialects::slots)),
         (r("POST", "/v1/embeddings", "Embeddings (not supported yet)"), post(embeddings)),
         (r("POST", "/v1/bench", "Run a timed generation"), post(bench)),
         (r("GET", "/admin/models", "Model status and VRAM"), get(admin_models)),
@@ -247,6 +252,11 @@ fn endpoint_label(path: &str) -> &'static str {
         "/v1/models" => "models",
         "/v1/chat/completions" => "chat_completions",
         "/v1/completions" => "completions",
+        "/v1/messages" => "messages",
+        "/v1/messages/count_tokens" => "count_tokens",
+        "/v1/responses" => "responses",
+        "/props" => "props",
+        "/slots" => "slots",
         "/v1/embeddings" => "embeddings",
         "/v1/bench" => "bench",
         p if p.starts_with("/admin/") => "admin",
@@ -275,7 +285,10 @@ async fn auth(State(state): State<Arc<AppState>>, req: Request<Body>, next: Next
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return headers.get("x-api-key").and_then(|v| v.to_str().ok()).map(str::trim);
+    };
+    let value = value.to_str().ok()?;
     let (scheme, token) = value.split_once(' ')?;
     scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
 }
@@ -416,25 +429,32 @@ async fn embeddings() -> ApiError {
     )
 }
 
-struct Params {
-    model: String,
+pub(crate) struct Params {
+    pub(crate) model: String,
     messages: Vec<Message>,
     openai_messages: Option<Vec<Value>>,
     template_vars: Value,
-    output: OutputMode,
-    stop: Vec<String>,
+    pub(crate) output: OutputMode,
+    pub(crate) stop: Vec<String>,
     use_template: bool,
-    sampling: Sampling,
-    stream: bool,
+    pub(crate) sampling: Sampling,
+    pub(crate) stream: bool,
     include_usage: bool,
     ignore_eos: bool,
-    n: usize,
+    pub(crate) n: usize,
     logprobs: Option<u32>,
     response_format: Option<inference_bench_core::specrt_grammar::Schema>,
+    think: Option<ThinkCap>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ThinkCap {
+    budget: usize,
+    wrapup: String,
 }
 
 #[derive(Clone, Default)]
-struct OutputMode {
+pub(crate) struct OutputMode {
     tools: Vec<Value>,
     tool_parsing: bool,
     reasoning: bool,
@@ -442,11 +462,11 @@ struct OutputMode {
 }
 
 impl OutputMode {
-    fn parses(&self) -> bool {
+    pub(crate) fn parses(&self) -> bool {
         self.tool_parsing || self.reasoning
     }
 
-    fn parser(&self) -> OutputParser {
+    pub(crate) fn parser(&self) -> OutputParser {
         let p = OutputParser::new(&self.tools, self.tool_parsing, self.reasoning);
         if self.hermes { p.hermes() } else { p }
     }
@@ -468,7 +488,7 @@ fn stop_strings(body: &Value) -> Result<Vec<String>, ApiError> {
 const HANDLED_FIELDS: &[&str] = &[
     "model", "messages", "prompt", "prompts", "repeat", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "seed", "stop", "stream",
     "stream_options", "ignore_eos", "tools", "tool_choice", "chat_template_kwargs", "reasoning_effort", "cache_salt", "n", "logprobs",
-    "top_logprobs",
+    "top_logprobs", "reasoning", "reasoning_budget_tokens", "thinking_budget_tokens",
 ];
 
 const NEUTRAL_FIELDS: &[&str] = &["user", "parallel_tool_calls", "store", "metadata"];
@@ -540,6 +560,30 @@ fn logprob_request(body: &Value, chat: bool) -> Result<Option<u32>, ApiError> {
     Ok(on.then_some(n))
 }
 
+fn normalize_effort(effort: &str) -> &str {
+    match effort {
+        "minimal" => "low",
+        "xhigh" | "max" => "high",
+        other => other,
+    }
+}
+
+fn think_cap(state: &AppState, body: &Value, reasoning: bool, max_tokens: usize) -> Option<ThinkCap> {
+    if !reasoning {
+        return None;
+    }
+    let requested = body["reasoning_budget_tokens"]
+        .as_u64()
+        .or_else(|| body["thinking_budget_tokens"].as_u64())
+        .map(|n| n as usize)
+        .or(state.config.reasoning_budget_tokens)
+        .filter(|n| *n > 0);
+    let room = (state.config.answer_room && max_tokens != inference_bench_core::chat::UNTIL_FULL && max_tokens >= 1024)
+        .then(|| max_tokens - (max_tokens / 4).max(512));
+    let budget = requested.or(room)?;
+    Some(ThinkCap { budget: budget.max(1), wrapup: state.config.reasoning_wrapup.clone() })
+}
+
 fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), ApiError> {
     let mut vars = toml_json(&state.config.chat_template_kwargs);
     let user = match &body["chat_template_kwargs"] {
@@ -547,7 +591,8 @@ fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), Api
         Value::Null => Default::default(),
         _ => return Err(ApiError::bad_request("chat_template_kwargs must be an object")),
     };
-    if let Some(effort) = body["reasoning_effort"].as_str() {
+    let effort = body["reasoning_effort"].as_str().or_else(|| body["reasoning"]["effort"].as_str()).map(normalize_effort);
+    if let Some(effort) = effort {
         vars["reasoning_effort"] = json!(effort);
         if !user.contains_key("enable_thinking") {
             vars["enable_thinking"] = json!(effort != "none");
@@ -610,6 +655,7 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         true => chat_setup(state, body)?,
         false => (Value::Null, OutputMode::default()),
     };
+    let think = think_cap(state, body, output.reasoning, max_tokens);
     Ok(Params {
         model,
         messages,
@@ -625,6 +671,7 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         n: choice_count(body)?,
         logprobs: logprob_request(body, chat)?,
         response_format: inference_bench_core::specrt_grammar::parse_response_format(&body["response_format"]).map_err(|e| ApiError::bad_request(format!("response_format: {e}")))?,
+        think,
     })
 }
 
@@ -665,13 +712,13 @@ fn completion_prompt(body: &Value) -> Result<String, ApiError> {
     }
 }
 
-enum Gen {
+pub(crate) enum Gen {
     Text(String),
     Logprob(TokenLogprob),
     Done(Result<Generation, ApiError>, bool),
 }
 
-struct CancelOnDrop(Arc<AtomicBool>);
+pub(crate) struct CancelOnDrop(Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -696,10 +743,12 @@ fn start_generation(
     max_tokens: usize,
     stop: Vec<String>,
     needs_batched: bool,
+    think: Option<ThinkCap>,
 ) -> Result<mpsc::UnboundedReceiver<Gen>, ApiError> {
     let mut admission = state.admit()?;
     let (tx, rx) = mpsc::unbounded_channel();
     let state = state.clone();
+    let metrics = state.metrics.clone();
     let span = Span::current();
     span.record("model", model.as_str());
     tokio::spawn(
@@ -757,13 +806,34 @@ fn start_generation(
                             flag.store(true, Ordering::SeqCst);
                         }
                     };
-                    let result = lease.backend().chat(&request, &mut |t| {
+                    let acc = std::cell::RefCell::new(String::new());
+                    let mut emit = |t: &str| {
+                        if think.is_some() {
+                            acc.borrow_mut().push_str(t);
+                        }
                         let out = filter.feed(t);
                         send(&out);
                         if filter.hit {
                             flag.store(true, Ordering::SeqCst);
                         }
-                    });
+                    };
+                    let total = request.sampling.max_tokens;
+                    let first_cap = think.as_ref().map_or(total, |c| c.budget.min(total));
+                    request.sampling.max_tokens = first_cap;
+                    let mut result = lease.backend().chat(&request, &mut |t| emit(t));
+                    if let (Some(cap), Ok(first)) = (&think, &result)
+                        && first_cap < total
+                        && first.completion_tokens as usize >= first_cap
+                        && !flag.load(Ordering::SeqCst)
+                        && thinking_open(&acc.borrow())
+                    {
+                        metrics.thinking_wrapup();
+                        emit(&format!("{}</think>\n\n", cap.wrapup));
+                        let first = first.clone();
+                        request.continuation = Some(acc.borrow().clone());
+                        request.sampling.max_tokens = total.saturating_sub(first.completion_tokens as usize).max(1);
+                        result = lease.backend().chat(&request, &mut |t| emit(t)).map(|second| join_generations(first, second));
+                    }
                     let tail = filter.finish();
                     send(&tail);
                     let hit = filter.hit;
@@ -804,14 +874,28 @@ fn start_generation(
     Ok(rx)
 }
 
-fn finish_reason(g: &Generation, max_tokens: usize, stopped: bool) -> &'static str {
+fn thinking_open(generated: &str) -> bool {
+    !generated.contains("</think>")
+}
+
+fn join_generations(first: Generation, second: Generation) -> Generation {
+    Generation {
+        text: second.text,
+        completion_tokens: first.completion_tokens + second.completion_tokens,
+        decode_secs: first.decode_secs + second.decode_secs,
+        peak_memory_bytes: second.peak_memory_bytes.or(first.peak_memory_bytes),
+        ..first
+    }
+}
+
+pub(crate) fn finish_reason(g: &Generation, max_tokens: usize, stopped: bool) -> &'static str {
     match !stopped && g.completion_tokens as usize >= max_tokens {
         true => "length",
         false => "stop",
     }
 }
 
-fn decode_rate(g: &Generation) -> f64 {
+pub(crate) fn decode_rate(g: &Generation) -> f64 {
     match g.decode_secs > 0.0 {
         true => g.completion_tokens.saturating_sub(1) as f64 / g.decode_secs,
         false => 0.0,
@@ -844,7 +928,7 @@ fn record_generation(state: &AppState, model: &str, g: &Generation, max_tokens: 
     );
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
@@ -861,9 +945,9 @@ fn usage(g: &Generation) -> Value {
     })
 }
 
-struct Collected {
-    generation: Generation,
-    stopped: bool,
+pub(crate) struct Collected {
+    pub(crate) generation: Generation,
+    pub(crate) stopped: bool,
     logprobs: Vec<TokenLogprob>,
 }
 
@@ -871,7 +955,7 @@ async fn collect(rx: mpsc::UnboundedReceiver<Gen>) -> Result<(Generation, bool),
     collect_all(rx).await.map(|c| (c.generation, c.stopped))
 }
 
-async fn collect_all(mut rx: mpsc::UnboundedReceiver<Gen>) -> Result<Collected, ApiError> {
+pub(crate) async fn collect_all(mut rx: mpsc::UnboundedReceiver<Gen>) -> Result<Collected, ApiError> {
     let mut text = String::new();
     let mut logprobs = Vec::new();
     while let Some(ev) = rx.recv().await {
@@ -891,7 +975,7 @@ async fn collect_all(mut rx: mpsc::UnboundedReceiver<Gen>) -> Result<Collected, 
     Err(ApiError::internal("generation ended without a result"))
 }
 
-async fn chat_completions(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<Value>) -> Result<Response, ApiError> {
+pub(crate) async fn chat_completions(State(state): State<Arc<AppState>>, headers: HeaderMap, Json(body): Json<Value>) -> Result<Response, ApiError> {
     let salt = cache_salt(&headers, &body_salt(&body), state_shares_keys(&state));
     generate_endpoint(state, body, true, salt).await
 }
@@ -901,11 +985,11 @@ async fn completions(State(state): State<Arc<AppState>>, headers: HeaderMap, Jso
     generate_endpoint(state, body, false, salt).await
 }
 
-fn state_shares_keys(state: &AppState) -> bool {
+pub(crate) fn state_shares_keys(state: &AppState) -> bool {
     state.config.prefix_cache_share_across_keys || !state.auth_required()
 }
 
-fn body_salt(body: &Value) -> String {
+pub(crate) fn body_salt(body: &Value) -> String {
     body["cache_salt"].as_str().unwrap_or_default().to_string()
 }
 
@@ -920,17 +1004,17 @@ pub fn cache_salt(headers: &HeaderMap, body_salt: &str, shared: bool) -> String 
     format!("key:{tag}|{body_salt}")
 }
 
-async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: String) -> Result<Response, ApiError> {
+pub(crate) async fn prepare(state: Arc<AppState>, body: Value, chat: bool, salt: String) -> Result<Prepared, ApiError> {
     let mut p = parse_params(&state, &body, chat)?;
     p.model = state.manager.resolve(&p.model)?.id;
     let max_tokens = p.sampling.max_tokens;
     let cancel = Arc::new(AtomicBool::new(false));
     let guard = CancelOnDrop(cancel.clone());
-    let mut request = ChatRequest::new(p.messages, p.sampling);
+    let mut request = ChatRequest::new(std::mem::take(&mut p.messages), p.sampling);
     request.use_template = p.use_template;
     request.ignore_eos = p.ignore_eos;
     request.cancel = Some(cancel);
-    request.openai_messages = p.openai_messages.map(system_for_developer);
+    request.openai_messages = p.openai_messages.take().map(system_for_developer);
     request.cache_salt = Some(salt);
     if let Some(list) = &request.openai_messages
         && inference_bench_core::media::has_media(list)
@@ -947,10 +1031,10 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
             .map_err(|e| ApiError::bad_request(e.0))?;
     }
     if p.use_template {
-        request.template_vars = p.template_vars;
+        request.template_vars = p.template_vars.take();
     }
     request.logprobs = p.logprobs;
-    request.response_format = p.response_format;
+    request.response_format = p.response_format.take();
     log_prompt(&state, &request);
     let mut receivers = Vec::with_capacity(p.n);
     for i in 0..p.n {
@@ -958,8 +1042,20 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
         if i > 0 {
             one.sampling.seed = Some(request.sampling.seed.unwrap_or(0).wrapping_add(i as u64));
         }
-        receivers.push(start_generation(&state, p.model.clone(), one, max_tokens, p.stop.clone(), p.n > 1)?);
+        receivers.push(start_generation(&state, p.model.clone(), one, max_tokens, p.stop.clone(), p.n > 1, p.think.clone())?);
     }
+    Ok(Prepared { p, receivers, guard, max_tokens })
+}
+
+pub(crate) struct Prepared {
+    pub(crate) p: Params,
+    pub(crate) receivers: Vec<mpsc::UnboundedReceiver<Gen>>,
+    pub(crate) guard: CancelOnDrop,
+    pub(crate) max_tokens: usize,
+}
+
+async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: String) -> Result<Response, ApiError> {
+    let Prepared { p, receivers, guard, max_tokens } = prepare(state, body, chat, salt).await?;
     let id = format!("{}-{}", if chat { "chatcmpl" } else { "cmpl" }, &uuid::Uuid::new_v4().simple().to_string()[..24]);
     if p.stream {
         let events = sse_events(receivers, guard, id, p.model, max_tokens, chat, p.include_usage, p.output);
@@ -1229,7 +1325,7 @@ async fn bench(State(state): State<Arc<AppState>>, Json(body): Json<Value>) -> R
             let mut request = ChatRequest::new(vec![Message::new(Role::User, prompt.clone())], sampling);
             request.use_template = false;
             request.cancel = Some(cancel);
-            let outcome = match start_generation(&state, model.clone(), request, max_tokens, Vec::new(), false) {
+            let outcome = match start_generation(&state, model.clone(), request, max_tokens, Vec::new(), false, None) {
                 Ok(rx) => collect(rx).await.map(|(g, _)| g),
                 Err(e) => Err(e),
             };

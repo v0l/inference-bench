@@ -876,6 +876,22 @@ impl Serving {
         self.assets.chat.as_ref().map(|c| c.thinking()).unwrap_or_default()
     }
 
+    pub fn props(&self) -> serde_json::Value {
+        use serde_json::json;
+        let d = self.assets.sampling;
+        let chat = self.assets.chat.as_ref();
+        json!({
+            "chat_template": chat.map(|c| c.source()).unwrap_or(""),
+            "bos_token": chat.map(|c| c.bos_token()).unwrap_or(""),
+            "eos_token": chat.map(|c| c.eos_token()).unwrap_or(""),
+            "chat_template_caps": chat.map(|c| c.capabilities()).unwrap_or_else(|| json!({})),
+            "thinking": format!("{:?}", self.thinking()),
+            "n_ctx": self.max_model_len(),
+            "generation": {"top_k": d.top_k, "top_p": d.top_p, "min_p": d.min_p, "max_new_tokens": d.max_new_tokens},
+            "vision": self.accepts_media(),
+        })
+    }
+
     pub fn load(model: &str, opts: ServeOptions) -> Result<Self> {
         let assets = Assets::load(model)?;
         let core = Core::start(&assets.spec, opts)?;

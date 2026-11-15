@@ -279,6 +279,16 @@ impl Manager {
         v
     }
 
+    pub fn props(&self, id: &str) -> Option<serde_json::Value> {
+        let loaded = self.loaded.lock().unwrap();
+        let m = loaded.get(id)?;
+        m.stats.lock().unwrap().as_ref().and_then(|t| t.props())
+    }
+
+    pub fn active_of(&self, id: &str) -> usize {
+        self.loaded.lock().unwrap().get(id).map(|m| m.active()).unwrap_or(0)
+    }
+
     pub fn engine_metrics(&self) -> String {
         let mut models: Vec<Arc<LoadedModel>> = self.loaded.lock().unwrap().values().cloned().collect();
         models.sort_by(|a, b| a.id.cmp(&b.id));

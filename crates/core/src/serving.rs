@@ -97,6 +97,10 @@ impl Target for ServingTarget {
                 .encode_media_messages(&list, request.template(), &request.media, budget)
                 .map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("{e:#}")))?
         };
+        let mut ids = ids;
+        if let Some(tail) = request.continuation.as_deref().filter(|t| !t.is_empty()) {
+            ids.extend(self.engine()?.tokens(tail).map_err(|e| engine_error(&e))?);
+        }
         let s = request.sampling;
         let sampling = s.resolve(self.engine()?.sampling_defaults()).with_logprobs(request.logprobs);
         self.run(ids, s.max_tokens, sampling, !request.ignore_eos, request.cache_salt.clone().unwrap_or_default(), request.cancel.clone(), media, vision_tokens, request.on_logprob.clone(), request.response_format.as_ref(), on_text)
@@ -117,6 +121,10 @@ impl Target for ServingTarget {
 
     fn stats(&self) -> Option<Stats> {
         self.serving.as_ref().map(|s| s.stats())
+    }
+
+    fn props(&self) -> Option<serde_json::Value> {
+        self.serving.as_ref().map(|s| s.props())
     }
 
     fn speculation(&self) -> Option<String> {

@@ -54,6 +54,49 @@ impl ChatTemplate {
         }))
     }
 
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn bos_token(&self) -> &str {
+        &self.bos_token
+    }
+
+    pub fn eos_token(&self) -> &str {
+        &self.eos_token
+    }
+
+    pub fn capabilities(&self) -> Value {
+        use serde_json::json;
+        let user = json!({"role": "user", "content": "hi"});
+        let renders = |messages: Vec<Value>, vars: Value, needle: &str| {
+            self.render_with(&messages, &vars).is_ok_and(|t| t.contains(needle))
+        };
+        let tool = |name: &str| json!({"type": "function", "function": {"name": name, "description": "probe", "parameters": {"type": "object", "properties": {"a": {"type": "integer"}}}}});
+        let call = |name: &str| json!({"id": format!("call_{name}"), "type": "function", "function": {"name": name, "arguments": {"a": 1}}});
+        let assistant = |calls: Vec<Value>| json!({"role": "assistant", "content": null, "tool_calls": calls});
+        let result = |name: &str| json!({"role": "tool", "tool_call_id": format!("call_{name}"), "content": "done"});
+        let none = json!({"enable_thinking": false});
+        let with_tool = json!({"enable_thinking": false, "tools": [tool("probe_a")]});
+        json!({
+            "supports_system_role": renders(vec![json!({"role": "system", "content": "SYSPROBE"}), user.clone()], none.clone(), "SYSPROBE"),
+            "supports_tools": renders(vec![user.clone()], with_tool.clone(), "probe_a"),
+            "supports_tool_calls": renders(vec![user.clone(), assistant(vec![call("probe_a")]), result("probe_a")], with_tool.clone(), "probe_a"),
+            "supports_parallel_tool_calls": renders(
+                vec![user.clone(), assistant(vec![call("probe_a"), call("probe_b")]), result("probe_a"), result("probe_b")],
+                json!({"enable_thinking": false, "tools": [tool("probe_a"), tool("probe_b")]}),
+                "probe_b",
+            ),
+            "supports_string_content": renders(vec![user.clone()], none.clone(), "hi"),
+            "supports_object_arguments": renders(vec![user.clone(), assistant(vec![call("probe_a")]), result("probe_a")], with_tool, "probe_a"),
+            "supports_preserve_reasoning": renders(
+                vec![user.clone(), json!({"role": "assistant", "content": "ok", "reasoning_content": "REASONPROBE"}), json!({"role": "user", "content": "again"})],
+                none,
+                "REASONPROBE",
+            ),
+        })
+    }
+
     pub fn thinking(&self) -> Thinking {
         if !self.source.contains("enable_thinking") {
             return Thinking::Unsupported;
