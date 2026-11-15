@@ -80,6 +80,7 @@ struct Harness {
     combine: CudaFunction,
     smem: u32,
     max_ctx: usize,
+    window: std::cell::Cell<i32>,
 }
 
 struct Batch {
@@ -119,7 +120,7 @@ impl Harness {
         let combine = loaded.function("batch_decode_combine").unwrap();
         use cudarc::driver::sys::CUfunction_attribute as A;
         attn.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
-        Harness { spec, ctx, stream, attn, combine, smem, max_ctx }
+        Harness { spec, ctx, stream, attn, combine, smem, max_ctx, window: std::cell::Cell::new(0) }
     }
 
     fn pages(&self) -> usize {
@@ -160,9 +161,10 @@ impl Harness {
     fn launch(&self, b: &Batch) {
         let a = &self.spec.attention;
         let layer = 0i32;
+        let window = self.window.get();
         let qlen = b.qlen as i32;
         let mut l = self.stream.launch_builder(&self.attn);
-        l.arg(&b.qkv).arg(&b.k).arg(&b.v).arg(&b.table).arg(&b.pos).arg(&b.slots).arg(&layer).arg(&qlen).arg(&b.part_acc).arg(&b.part_ml);
+        l.arg(&b.qkv).arg(&b.k).arg(&b.v).arg(&b.table).arg(&b.pos).arg(&b.slots).arg(&layer).arg(&qlen).arg(&b.part_acc).arg(&b.part_ml).arg(&window);
         let config = LaunchConfig {
             grid_dim: (a.kv_heads as u32, (b.rows / b.qlen) as u32, specrt::codegen::decode_splits(self.max_ctx) as u32),
             block_dim: (32 * specrt::codegen::decode_warps(a.heads / a.kv_heads, b.qlen) as u32, 1, 1),
@@ -198,7 +200,7 @@ impl Harness {
     }
 }
 
-fn reference(spec: &Spec, qkv: &[f32], pos: &[i32], slots: &[i32], table: &[i32], pages: usize, k: &[u16], v: &[u16]) -> Vec<f32> {
+fn reference(spec: &Spec, window: usize, qkv: &[f32], pos: &[i32], slots: &[i32], table: &[i32], pages: usize, k: &[u16], v: &[u16]) -> Vec<f32> {
     let a = &spec.attention;
     let (hd, group, qrow) = (a.head_dim, a.heads / a.kv_heads, spec.qkv_rows());
     let page = specrt::codegen::PAGE;
@@ -212,14 +214,17 @@ fn reference(spec: &Spec, qkv: &[f32], pos: &[i32], slots: &[i32], table: &[i32]
         for head in 0..a.heads {
             let kvh = head / group;
             let q = &qkv[row * qrow + head * hd..row * qrow + (head + 1) * hd];
+            let scale = a.query_scalar.map_or(1.0 / (hd as f64).sqrt(), |s| 1.0 / s.sqrt());
+            let cap = |s: f64| a.softcap.map_or(s, |c| c * (s / c).tanh());
             let scores: Vec<f64> = (0..=p as usize)
                 .map(|t| {
                     let kr = &k[at(slot, t, kvh)..at(slot, t, kvh) + hd];
-                    q.iter().zip(kr).map(|(&x, &y)| x as f64 * f16_value(y) as f64).sum::<f64>() / (hd as f64).sqrt()
+                    let dot = q.iter().zip(kr).map(|(&x, &y)| x as f64 * f16_value(y) as f64).sum::<f64>() * scale;
+                    if window > 0 && (t as i64) <= p as i64 - window as i64 { f64::NEG_INFINITY } else { cap(dot) }
                 })
                 .collect();
             let m = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let w: Vec<f64> = scores.iter().map(|s| (s - m).exp()).collect();
+            let w: Vec<f64> = scores.iter().map(|s| if *s == f64::NEG_INFINITY { 0.0 } else { (s - m).exp() }).collect();
             let l: f64 = w.iter().sum();
             for d in 0..hd {
                 let acc: f64 = w.iter().enumerate().map(|(t, &wt)| wt * f16_value(v[at(slot, t, kvh) + d]) as f64).sum();
@@ -249,7 +254,12 @@ fn rows_of(case: &Case) -> (Vec<i32>, Vec<i32>) {
 }
 
 fn check_against_reference(spec: Spec, max_ctx: usize, cases: &[Case]) {
+    check_windowed(spec, max_ctx, 0, cases)
+}
+
+fn check_windowed(spec: Spec, max_ctx: usize, window: usize, cases: &[Case]) {
     let h = Harness::new(spec.clone(), max_ctx);
+    h.window.set(window as i32);
     let mut rng = Rng(0x9e3779b97f4a7c15);
     for case in cases {
         let seqs = case.lens.len();
@@ -267,7 +277,7 @@ fn check_against_reference(spec: Spec, max_ctx: usize, cases: &[Case]) {
         let b = h.batch(&qkv, &pos, &slots, case.qlen, &table, &k, &v);
         h.launch(&b);
         let got = h.output(&b);
-        let want = reference(&spec, &qkv, &pos, &slots, &table, pages, &k, &v);
+        let want = reference(&spec, window, &qkv, &pos, &slots, &table, pages, &k, &v);
         let worst = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).fold(0.0f32, f32::max);
         let scale = want.iter().map(|w| w.abs()).fold(0.0f32, f32::max);
         eprintln!("{} lens={:?} qlen={}: max abs error {worst:.2e} (largest output {scale:.3})", spec.name, case.lens, case.qlen);
@@ -359,5 +369,21 @@ fn batch_decode_attention_speed_on_a_27b_shaped_layer() {
                 (k, v) = (b.k, b.v);
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU with NVRTC"]
+fn decode_attention_applies_window_and_softcap_like_the_reference() {
+    let cases = [
+        Case { lens: vec![3, 40, 600], qlen: 1 },
+        Case { lens: vec![200, 1000, 5000], qlen: 3 },
+        Case { lens: vec![16397, 70], qlen: 2 },
+    ];
+    for window in [0usize, 16, 128] {
+        let mut spec = tiny();
+        spec.attention.softcap = Some(30.0);
+        spec.attention.query_scalar = Some(48.0);
+        check_windowed(spec, 16384 + 256, window, &cases);
     }
 }

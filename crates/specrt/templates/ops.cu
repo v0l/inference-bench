@@ -1704,7 +1704,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
 
 extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_attention(
     const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache, const int* block_table, const int* pos, const int* slots,
-    int layer, int qlen, float* part_acc, float* part_ml) {
+    int layer, int qlen, float* part_acc, float* part_ml, int window) {
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = DM_BK * HEAD_DIM;
     constexpr int KB = HEAD_DIM / 16;
@@ -1736,7 +1736,8 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
     int pos0 = r0 < rows ? pos[row0] : -1;
     int pos1 = r1 < rows ? pos[row1] : -1;
     const int* table = seq_table(block_table, slots, group * qlen);
-    float scale_log2 = rsqrtf((float)HEAD_DIM) * 1.4426950408889634f;
+    float scale_log2 = QUERY_SCALE * 1.4426950408889634f;
+    constexpr float LOG2E = 1.4426950408889634f;
     unsigned qh[KB][4];
     unsigned ql[KB][4];
     const float* q0 = qkv + (size_t)row0 * QKV_ROW + head0 * HEAD_DIM;
@@ -1832,7 +1833,9 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nb * 8 + 2 * t + (e & 1);
-                float v = key < key_end && key <= (e < 2 ? pos0 : pos1) ? s[nb][e] * scale_log2 : NEG_INF;
+                int kpos = e < 2 ? pos0 : pos1;
+                bool live = key < key_end && key <= kpos && (window <= 0 || key > kpos - window);
+                float v = live ? (SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2) : NEG_INF;
                 s[nb][e] = v;
                 if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
             }
