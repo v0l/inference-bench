@@ -59,7 +59,9 @@ impl Jit {
 
     pub fn load(&self, module: &Module) -> Result<Loaded> {
         let arch = self.arch_for(module);
-        let key = cache_key(&module.source, arch, &self.options);
+        let mut options = self.options.clone();
+        options.push(format!("kir={}", module.kir_hash));
+        let key = cache_key(&module.source, arch, &options);
         let path = self.dir.join(format!("{key}.ptx"));
         let (ptx, cache_hit) = match std::fs::read_to_string(&path) {
             Ok(text) => (text, true),

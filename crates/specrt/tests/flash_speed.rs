@@ -24,7 +24,7 @@ fn flash_mma_prefill_attention_speed() {
     let max_ctx = list("SPECRT_FLASH_CTX", "32768")[0];
     let layers = spec.kv_layers();
     let blocks = max_ctx / 16;
-    let module = Module::generate_kv(&spec, max_ctx, 1).unwrap();
+    let module = Module::generate_kv(&spec, max_ctx, 1, &specrt::codegen::default_target()).unwrap();
     let base_text = format!("constexpr int FM_BK = {};", specrt::codegen::flash_keys(a.head_dim, 1));
     assert!(module.source.contains(&base_text));
     let qkv = stream.clone_htod(&vec![0.05f32; tokens * spec.qkv_rows()]).unwrap();

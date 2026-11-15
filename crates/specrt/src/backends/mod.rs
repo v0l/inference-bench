@@ -11,6 +11,14 @@ pub struct DeviceLimits {
     pub max_buffer_bytes: u64,
     pub max_binding_bytes: u64,
     pub max_storage_buffers: u32,
+    pub max_workgroup_invocations: u32,
+    pub max_workgroup_storage: u32,
+}
+
+impl DeviceLimits {
+    pub fn target(&self) -> kir::Target {
+        kir::Target::wgpu(self.max_workgroup_invocations, self.max_workgroup_storage)
+    }
 }
 
 pub trait Backend {

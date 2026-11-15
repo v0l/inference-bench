@@ -745,6 +745,31 @@ pub struct Module {
     pub kernels: Vec<&'static str>,
     pub smem: BTreeMap<&'static str, u32>,
     pub arch_features: bool,
+    pub kir_hash: String,
+}
+
+pub fn kir_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let act = match spec.mlp.activation {
+        Activation::Swiglu => kir::Activation::Silu,
+        Activation::Geglu => kir::Activation::GeluTanh,
+    };
+    let hidden = spec.dims.hidden as u32;
+    let inter = spec.dims.intermediate as u32;
+    let norm = kir::Kernel::rmsnorm(target, hidden, spec.norm.eps as f32, 1024).map_err(anyhow::Error::msg)?;
+    let gate = kir::Kernel::gated_activation(target, "swiglu", inter, act, 256).map_err(anyhow::Error::msg)?;
+    Ok(vec![norm, gate])
+}
+
+pub fn cuda_target(ctx: &cudarc::driver::CudaContext) -> Result<kir::Target> {
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    let (major, minor) = ctx.compute_capability()?;
+    let sms = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
+    let smem = ctx.attribute(A::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)? as u32;
+    Ok(kir::Target::cuda(major as u32, minor as u32, sms, smem))
+}
+
+pub fn default_target() -> kir::Target {
+    kir::Target::sm_120()
 }
 
 pub fn render(template: &str, vars: &BTreeMap<&str, String>) -> Result<String> {
@@ -873,10 +898,10 @@ fn fp8_act_kernels(spec: &Spec, smem: &mut BTreeMap<&'static str, u32>) -> Strin
 
 impl Module {
     pub fn generate(spec: &Spec, max_ctx: usize) -> Result<Self> {
-        Self::generate_kv(spec, max_ctx, 2)
+        Self::generate_kv(spec, max_ctx, 2, &default_target())
     }
 
-    pub fn generate_kv(spec: &Spec, max_ctx: usize, kv_planes: usize) -> Result<Self> {
+    pub fn generate_kv(spec: &Spec, max_ctx: usize, kv_planes: usize, target: &kir::Target) -> Result<Self> {
         anyhow::ensure!(kv_planes == 1 || kv_planes == 2, "kv planes must be 1 or 2");
         let a = &spec.attention;
         let d = &spec.dims;
@@ -964,8 +989,11 @@ impl Module {
         ]
         .into_iter()
         .collect();
+        let kir_kernels = kir_kernels(spec, target)?;
+        let kir_source = kir::cuda::emit_module(&kir_kernels).map_err(anyhow::Error::msg)?;
+        let kir_hash = kir::module_hash(&kir_kernels);
         let mut source =
-            format!("{}\n{}", render(OPS_TEMPLATE, &vars)?, render(MODEL_TEMPLATE, &vars)?);
+            format!("{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, render(MODEL_TEMPLATE, &vars)?, kir_source);
         let mut kernels = KERNELS.to_vec();
         let mut arch_features = false;
         if spec.quant == Quant::Gguf {
@@ -1025,6 +1053,6 @@ impl Module {
             source.push_str(&crate::mtp::head_source(spec, &mut smem));
             kernels.extend_from_slice(crate::mtp::head_kernels(spec));
         }
-        Ok(Module { source, kernels, smem, arch_features })
+        Ok(Module { source, kernels, smem, arch_features, kir_hash })
     }
 }

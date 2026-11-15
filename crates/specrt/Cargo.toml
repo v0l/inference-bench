@@ -17,6 +17,7 @@ wgpu = ["dep:wgpu", "dep:pollster"]
 wgpu = { version = "30", optional = true, default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl"] }
 pollster = { version = "1", optional = true }
 anyhow.workspace = true
+inference-bench-kir = { path = "../kir" }
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
 dirs.workspace = true
 memmap2 = "0.9"

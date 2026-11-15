@@ -1,0 +1,15 @@
+[package]
+name = "inference-bench-kir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kernel IR: typed kernel descriptions with CUDA and WGSL source emitters"
+
+[lib]
+name = "kir"
+
+[features]
+default = ["cuda", "wgsl"]
+cuda = []
+wgsl = []

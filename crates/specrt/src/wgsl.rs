@@ -90,7 +90,7 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
     None
 }
 
-pub fn generate(spec: &Spec, max_ctx: usize) -> Result<Vec<WgslKernel>> {
+pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec<WgslKernel>> {
     let a = &spec.attention;
     let d = &spec.dims;
     let scaling = spec.rope.scaling.as_ref();
@@ -139,14 +139,23 @@ pub fn generate(spec: &Spec, max_ctx: usize) -> Result<Vec<WgslKernel>> {
     };
     let mut out = vec![
         build("embed", include_str!("../templates/wgsl/embed.wgsl"), true, &[Read, Read, Read, Write, Uniform], &vars)?,
-        build("rmsnorm", include_str!("../templates/wgsl/rmsnorm.wgsl"), false, &[Read, Read, Write, Uniform], &vars)?,
         build("rope", include_str!("../templates/wgsl/rope.wgsl"), false, &[Write, Read, Read, Write, Write, Uniform], &vars)?,
         build("attention", include_str!("../templates/wgsl/attention.wgsl"), false, &[Read, Read, Read, Write, Uniform], &vars)?,
-        build("swiglu", include_str!("../templates/wgsl/swiglu.wgsl"), false, &[Read, Write, Uniform], &vars)?,
         build("bias", include_str!("../templates/wgsl/bias.wgsl"), false, &[Write, Read, Uniform], &vars)?,
         build("argmax", include_str!("../templates/wgsl/argmax.wgsl"), false, &[Read, Write, Uniform], &vars)?,
         build("dequant", include_str!("../templates/wgsl/dequant.wgsl"), true, &[Read, Read, Write, Uniform], &vars)?,
     ];
+    for k in crate::codegen::kir_kernels(spec, target)? {
+        let bindings = kir::wgsl::bindings(&k)
+            .into_iter()
+            .map(|b| match b {
+                kir::wgsl::Binding::Read => Read,
+                kir::wgsl::Binding::Write => Write,
+                kir::wgsl::Binding::Uniform => Uniform,
+            })
+            .collect();
+        out.push(WgslKernel { name: k.name, source: kir::wgsl::emit_kernel(&k).map_err(anyhow::Error::msg)?, bindings });
+    }
     for (name, tokens) in [("linear", 1), ("linear_t8", LINEAR_TOKENS)] {
         vars.insert("TT", tokens.to_string());
         vars.insert("RED", (tokens * LINEAR_WORKGROUP).to_string());

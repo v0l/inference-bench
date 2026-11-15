@@ -1402,16 +1402,6 @@ extern "C" __global__ void splice_rows(float* x, const int* rows, const float* e
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x) dst[i] = src[i];
 }
 
-extern "C" __global__ void rmsnorm(const float* x, const float* weight, float* out) {
-    __shared__ float scratch[32];
-    x += (size_t)blockIdx.x * HIDDEN;
-    out += (size_t)blockIdx.x * HIDDEN;
-    float ss = 0.0f;
-    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) ss += x[i] * x[i];
-    float inv = rsqrtf(block_reduce<false>(ss, scratch) / HIDDEN + EPS);
-    for (int i = threadIdx.x; i < HIDDEN; i += blockDim.x) out[i] = weight[i] * (x[i] * inv);
-}
-
 __device__ __forceinline__ float rope_inv_freq(int i) {
     float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)ROT);
     if (ROPE_KIND == 1) {
@@ -2205,18 +2195,6 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         if (row1 < tokens)
             split_store2(out_hi, out_lo, (size_t)row1 * Q_DIM + at, o[nb][2] * i1 * out_gate(qkv, row1, at),
                          o[nb][3] * i1 * out_gate(qkv, row1, at + 1));
-    }
-}
-
-extern "C" __global__ void swiglu(const float* gate_up, float* out) {
-    gate_up += (size_t)blockIdx.y * 2 * INTER;
-    out += (size_t)blockIdx.y * INTER;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < INTER; i += gridDim.x * blockDim.x) {
-        float g = gate_up[2 * i];
-        float a = ACT_KIND == 1
-            ? 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)))
-            : g / (1.0f + expf(-g));
-        out[i] = a * gate_up[2 * i + 1];
     }
 }
 

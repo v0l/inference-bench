@@ -80,6 +80,8 @@ impl Wgpu {
             max_buffer_bytes: required.max_buffer_size,
             max_binding_bytes: required.max_storage_buffer_binding_size as u64,
             max_storage_buffers: required.max_storage_buffers_per_shader_stage,
+            max_workgroup_invocations: required.max_compute_invocations_per_workgroup,
+            max_workgroup_storage: required.max_compute_workgroup_storage_size,
         };
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),

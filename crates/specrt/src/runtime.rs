@@ -773,7 +773,7 @@ impl Runtime {
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let jit = Jit::new(ctx.clone(), spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir))?;
-        let module = Module::generate_kv(spec, max_ctx, layout.kv_planes)?;
+        let module = Module::generate_kv(spec, max_ctx, layout.kv_planes, &crate::codegen::cuda_target(&ctx)?)?;
         crate::progress::report(crate::progress::Stage::Kernels, 0, 1);
         let jit_started = Instant::now();
         let loaded = jit.load(&module)?;

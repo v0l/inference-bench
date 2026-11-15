@@ -35,7 +35,7 @@ fn device() -> Wgpu {
 
 fn setup(spec: &Spec, ctx: usize) -> Wgpu {
     let mut w = device();
-    w.compile(&wgsl::generate(spec, ctx).unwrap()).unwrap();
+    w.compile(&wgsl::generate(spec, ctx, &kir::Target::wgpu_baseline()).unwrap()).unwrap();
     w
 }
 
@@ -418,7 +418,7 @@ fn unsupported_features_are_named() {
 
 #[test]
 fn generated_wgsl_has_no_unfilled_slots() {
-    for k in wgsl::generate(&spec(), 128).unwrap() {
+    for k in wgsl::generate(&spec(), 128, &kir::Target::wgpu_baseline()).unwrap() {
         assert!(!k.source.contains("{{"), "{} has an unfilled slot", k.name);
     }
 }

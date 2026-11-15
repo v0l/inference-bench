@@ -292,3 +292,23 @@ fn rope_scaling_and_activation_are_baked() {
     assert!(m.source.contains("constexpr int ACT_KIND = 1;"));
     assert!(!m.source.contains("{{"));
 }
+
+#[test]
+fn kir_kernels_are_emitted_and_hashed_into_the_module() {
+    let s = spec("qwen3-0.6b.toml");
+    let m = Module::generate(&s, 256).unwrap();
+    assert!(m.source.contains("kir_block_sum"));
+    assert!(m.source.contains("extern \"C\" __global__ void __launch_bounds__(1024) rmsnorm("));
+    assert!(m.source.contains("constexpr int WIDTH = 1024;"));
+    let other = Module::generate(&spec("qwen2.5-0.5b.toml"), 256).unwrap();
+    assert_ne!(m.kir_hash, other.kir_hash);
+    assert_eq!(m.kir_hash, Module::generate(&s, 256).unwrap().kir_hash);
+}
+
+#[test]
+fn kir_kernels_follow_the_target() {
+    let s = spec("qwen3-0.6b.toml");
+    let tree = specrt::codegen::kir_kernels(&s, &kir::Target::wgpu_baseline()).unwrap();
+    let sub = specrt::codegen::kir_kernels(&s, &kir::Target::wgpu_baseline().with_subgroups(32)).unwrap();
+    assert_ne!(kir::module_hash(&tree), kir::module_hash(&sub));
+}

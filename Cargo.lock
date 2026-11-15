@@ -3544,6 +3544,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "inference-bench-kir"
+version = "0.1.0"
+
+[[package]]
 name = "inference-bench-server"
 version = "0.1.0"
 dependencies = [
@@ -3577,6 +3581,7 @@ dependencies = [
  "cudarc",
  "dirs",
  "image",
+ "inference-bench-kir",
  "libc",
  "mdns-sd",
  "memmap2",

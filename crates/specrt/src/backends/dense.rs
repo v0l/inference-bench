@@ -215,7 +215,7 @@ impl<B: Backend> Dense<B> {
         }
         let limits = be.limits();
         ensure!(limits.max_storage_buffers >= 5, "this adapter allows {} storage buffers per stage, specrt needs 5", limits.max_storage_buffers);
-        be.compile(&wgsl::generate(spec, max_ctx)?)?;
+        be.compile(&wgsl::generate(spec, max_ctx, &limits.target())?)?;
         let checkpoint = Checkpoint::for_repo(&spec.repo)?;
         let d = &spec.dims;
         let a = &spec.attention;

@@ -138,7 +138,7 @@ pub struct VisionOutput {
 }
 
 fn module() -> Module {
-    Module { source: VISION_TEMPLATE.to_string(), kernels: KERNELS.to_vec(), smem: BTreeMap::new(), arch_features: false }
+    Module { source: VISION_TEMPLATE.to_string(), kernels: KERNELS.to_vec(), smem: BTreeMap::new(), arch_features: false, kir_hash: String::new() }
 }
 
 fn prefix(ck: &Checkpoint) -> Result<&'static str> {
