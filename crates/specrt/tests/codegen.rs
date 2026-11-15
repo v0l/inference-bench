@@ -285,6 +285,7 @@ fn rope_scaling_and_activation_are_baked() {
         low_freq_factor: None,
         high_freq_factor: None,
         original_max_positions: None,
+        yarn: None,
     });
     s.mlp.activation = specrt::spec::Activation::Geglu;
     let m = Module::generate(&s, 256).unwrap();

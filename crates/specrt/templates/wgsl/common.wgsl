@@ -13,6 +13,7 @@ const ROPE_FACTOR: f32 = {{ROPE_FACTOR}};
 const ROPE_LOW_FREQ: f32 = {{ROPE_LOW_FREQ}};
 const ROPE_HIGH_FREQ: f32 = {{ROPE_HIGH_FREQ}};
 const ROPE_ORIG_POS: f32 = {{ROPE_ORIG_POS}};
+const ROPE_MSCALE: f32 = {{ROPE_MSCALE}};
 const ACT_KIND: u32 = {{ACT_KIND}}u;
 const MAX_CTX: u32 = {{MAX_CTX}}u;
 const Q_DIM: u32 = {{Q_DIM}}u;

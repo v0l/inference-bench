@@ -1,4 +1,4 @@
-use crate::spec::{Activation, ActQuant, Quant, RopeScalingKind, RuntimeOptions, Spec, TileChoice};
+use crate::spec::{Activation, ActQuant, Quant, RuntimeOptions, Spec, TileChoice};
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
@@ -919,15 +919,7 @@ impl Module {
         let d = &spec.dims;
         let wf = WeightFormat::of(spec.quant);
         let head_wf = WeightFormat::head(spec);
-        let scaling = spec.rope.scaling.as_ref();
-        let rope_kind = match scaling.map(|s| s.kind) {
-            None => 0,
-            Some(RopeScalingKind::Linear) => 1,
-            Some(RopeScalingKind::Llama3) => 2,
-        };
-        let opt = |f: fn(&crate::spec::RopeScaling) -> Option<f64>| {
-            float_literal(scaling.and_then(f).unwrap_or(1.0))
-        };
+        let rope = spec.rope_constants();
         let act = match spec.mlp.activation {
             Activation::Swiglu => 0,
             Activation::Geglu => 1,
@@ -960,16 +952,17 @@ impl Module {
             ("QKV_BIAS", a.qkv_bias.to_string()),
             ("EPS", float_literal(spec.norm.eps)),
             ("THETA", float_literal(spec.rope.theta)),
-            ("ROPE_KIND", rope_kind.to_string()),
+            ("ROPE_KIND", rope.kind.to_string()),
             ("MROPE", spec.rope.mrope.is_some().to_string()),
             ("MROPE_INTERLEAVED", spec.rope.mrope.as_ref().is_some_and(|m| m.interleaved).to_string()),
             ("MROPE_S0", spec.rope.mrope.as_ref().map_or(0, |m| m.section[0]).to_string()),
             ("MROPE_S1", spec.rope.mrope.as_ref().map_or(0, |m| m.section[1]).to_string()),
             ("MROPE_S2", spec.rope.mrope.as_ref().map_or(0, |m| m.section[2]).to_string()),
-            ("ROPE_FACTOR", float_literal(scaling.map_or(1.0, |s| s.factor))),
-            ("ROPE_LOW_FREQ", opt(|s| s.low_freq_factor)),
-            ("ROPE_HIGH_FREQ", opt(|s| s.high_freq_factor)),
-            ("ROPE_ORIG_POS", opt(|s| s.original_max_positions)),
+            ("ROPE_FACTOR", float_literal(rope.factor)),
+            ("ROPE_LOW_FREQ", float_literal(rope.low)),
+            ("ROPE_HIGH_FREQ", float_literal(rope.high)),
+            ("ROPE_ORIG_POS", float_literal(rope.original)),
+            ("ROPE_MSCALE", float_literal(rope.mscale)),
             ("ACT_KIND", act.to_string()),
             ("MAX_CTX", max_ctx.to_string()),
             ("PAGE", PAGE.to_string()),

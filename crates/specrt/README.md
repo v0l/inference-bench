@@ -69,6 +69,7 @@ Features added for issue #244, each checked against transformers (fp32, CPU) on 
 |---|---|---|---|
 | llama-3.2-1b | Llama 3.x `rope_scaling` llama3 | 8e-5 | 43/43 |
 | qwen2.5-0.5b-linear4 | linear `rope_scaling` factor 4 (Qwen2.5 weights, scaling forced in both) | 2.4e-4 | all |
+| qwen2.5-0.5b-yarn4 | YaRN `rope_scaling` factor 4, original 32768 (Qwen2.5 weights, scaling forced in both) | 1e-3 gate | all |
 | qwen2.5-0.5b-geglu | gelu_pytorch_tanh gated MLP (Qwen2.5 weights, activation forced in both) | 4.9e-4 | all |
 | tinymistral-248m | Mistral, float16 checkpoint (sliding window off in the reference) | 4.6e-2 | all |
 

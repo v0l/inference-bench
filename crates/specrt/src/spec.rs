@@ -126,6 +126,8 @@ pub struct RuntimeOptions {
     pub gemm_fp32: bool,
     pub kv_dtype: KvDtype,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rope_extension: Option<RopeExtension>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "PrefixCacheOptions::is_default")]
     pub prefix_cache: PrefixCacheOptions,
@@ -133,6 +135,28 @@ pub struct RuntimeOptions {
     pub loader: crate::loader::LoaderOptions,
     #[serde(skip_serializing_if = "VisionOptions::is_default")]
     pub vision: VisionOptions,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RopeExtensionKind {
+    #[default]
+    Yarn,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RopeExtension {
+    #[serde(default, rename = "type")]
+    pub kind: RopeExtensionKind,
+    #[serde(default = "RopeExtension::no_factor")]
+    pub factor: u32,
+}
+
+impl RopeExtension {
+    fn no_factor() -> u32 {
+        1
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,7 +213,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 
@@ -204,6 +228,7 @@ impl RuntimeOptions {
         ensure!(self.vision.max_batch >= 1, "[runtime.vision] max_batch needs at least 1");
         ensure!(self.fp4_stages.is_none_or(|n| n >= 2), "[runtime] fp4_stages needs at least 2");
         ensure!(self.prefill_chunk.is_none_or(|n| n >= 64), "[runtime] prefill_chunk needs at least 64 tokens");
+        ensure!(self.rope_extension.is_none_or(|e| e.factor >= 1), "[runtime] rope_extension factor must be at least 1");
         for (key, tile) in [("big_tile", self.big_tile), ("fp4_tile", self.fp4_tile)] {
             if let Some([bm, bn, wm, wn]) = tile {
                 ensure!(
@@ -305,6 +330,57 @@ pub enum Activation {
 pub enum RopeScalingKind {
     Linear,
     Llama3,
+    Yarn,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Yarn {
+    pub beta_fast: f64,
+    pub beta_slow: f64,
+    pub attention_factor: f64,
+    pub truncate: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RopeConstants {
+    pub kind: u32,
+    pub factor: f64,
+    pub low: f64,
+    pub high: f64,
+    pub original: f64,
+    pub mscale: f64,
+}
+
+pub fn yarn_mscale(scale: f64, mscale: f64) -> f64 {
+    if scale <= 1.0 { 1.0 } else { 0.1 * mscale * scale.ln() + 1.0 }
+}
+
+pub fn yarn_correction_range(theta: f64, rot: usize, original: f64, y: &Yarn) -> (f64, f64) {
+    let dim = |rotations: f64| rot as f64 * (original / (rotations * 2.0 * std::f64::consts::PI)).ln() / (2.0 * theta.ln());
+    let (mut low, mut high) = (dim(y.beta_fast), dim(y.beta_slow));
+    if y.truncate {
+        low = low.floor();
+        high = high.ceil();
+    }
+    let (low, mut high) = (low.max(0.0), high.min(rot as f64 - 1.0));
+    if low == high {
+        high += 0.001;
+    }
+    (low, high)
+}
+
+pub fn yarn_inv_freq(theta: f64, rot: usize, s: &RopeScaling) -> Vec<f64> {
+    let y = s.yarn.as_ref().expect("yarn scaling");
+    let original = s.original_max_positions.unwrap_or(1.0);
+    let (low, high) = yarn_correction_range(theta, rot, original, y);
+    (0..rot / 2)
+        .map(|i| {
+            let pos_freq = theta.powf(2.0 * i as f64 / rot as f64);
+            let ramp = ((i as f64 - low) / (high - low)).clamp(0.0, 1.0);
+            ramp / (s.factor * pos_freq) + (1.0 - ramp) / pos_freq
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -318,6 +394,8 @@ pub struct RopeScaling {
     pub high_freq_factor: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub original_max_positions: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yarn: Option<Yarn>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -737,6 +815,7 @@ fn parse_rope_scaling(value: Option<&serde_json::Value>) -> Result<Option<RopeSc
             low_freq_factor: None,
             high_freq_factor: None,
             original_max_positions: None,
+            yarn: None,
         })),
         "llama3" => Ok(Some(RopeScaling {
             kind: RopeScalingKind::Llama3,
@@ -747,7 +826,28 @@ fn parse_rope_scaling(value: Option<&serde_json::Value>) -> Result<Option<RopeSc
                 num("original_max_position_embeddings")
                     .context("no original_max_position_embeddings")?,
             ),
+            yarn: None,
         })),
+        "yarn" => {
+            let original = num("original_max_position_embeddings").context("yarn rope_scaling has no original_max_position_embeddings")?;
+            ensure!(original > 0.0, "original_max_position_embeddings must be positive");
+            let attention_factor = match (num("attention_factor"), num("mscale"), num("mscale_all_dim")) {
+                (Some(a), _, _) => a,
+                (None, Some(m), Some(d)) if m != 0.0 && d != 0.0 => yarn_mscale(factor, m) / yarn_mscale(factor, d),
+                _ => yarn_mscale(factor, 1.0),
+            };
+            let beta_fast = num("beta_fast").filter(|b| *b != 0.0).unwrap_or(32.0);
+            let beta_slow = num("beta_slow").filter(|b| *b != 0.0).unwrap_or(1.0);
+            let truncate = v.get("truncate").and_then(|t| t.as_bool()).unwrap_or(true);
+            Ok(Some(RopeScaling {
+                kind: RopeScalingKind::Yarn,
+                factor,
+                low_freq_factor: None,
+                high_freq_factor: None,
+                original_max_positions: Some(original),
+                yarn: Some(Yarn { beta_fast, beta_slow, attention_factor, truncate }),
+            }))
+        }
         other => bail!("rope_scaling {other} is not supported"),
     }
 }
@@ -1229,6 +1329,29 @@ impl Spec {
 
     pub fn kv_layers(&self) -> usize {
         self.attention_layers() + self.speculative().map_or(0, |m| m.layers)
+    }
+
+    pub fn rope_constants(&self) -> RopeConstants {
+        let Some(s) = self.rope.scaling.as_ref() else {
+            return RopeConstants { kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0 };
+        };
+        let original = s.original_max_positions.unwrap_or(1.0);
+        match (s.kind, s.yarn.as_ref()) {
+            (RopeScalingKind::Linear, _) => RopeConstants { kind: 1, factor: s.factor, low: 1.0, high: 1.0, original, mscale: 1.0 },
+            (RopeScalingKind::Llama3, _) => RopeConstants {
+                kind: 2,
+                factor: s.factor,
+                low: s.low_freq_factor.unwrap_or(1.0),
+                high: s.high_freq_factor.unwrap_or(1.0),
+                original,
+                mscale: 1.0,
+            },
+            (RopeScalingKind::Yarn, Some(y)) => {
+                let (low, high) = yarn_correction_range(self.rope.theta, self.rotary_dim(), original, y);
+                RopeConstants { kind: 3, factor: s.factor, low, high, original, mscale: y.attention_factor }
+            }
+            (RopeScalingKind::Yarn, None) => RopeConstants { kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0 },
+        }
     }
 
     pub fn rotary_dim(&self) -> usize {

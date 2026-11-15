@@ -28,6 +28,7 @@ constexpr float ROPE_FACTOR = {{ROPE_FACTOR}};
 constexpr float ROPE_LOW_FREQ = {{ROPE_LOW_FREQ}};
 constexpr float ROPE_HIGH_FREQ = {{ROPE_HIGH_FREQ}};
 constexpr float ROPE_ORIG_POS = {{ROPE_ORIG_POS}};
+constexpr float ROPE_MSCALE = {{ROPE_MSCALE}};
 constexpr int ACT_KIND = {{ACT_KIND}};
 constexpr int MAX_CTX = {{MAX_CTX}};
 constexpr int PAGE = {{PAGE}};
@@ -1417,6 +1418,9 @@ __device__ __forceinline__ float rope_inv_freq(int i) {
             float smooth = (ROPE_ORIG_POS / wavelen - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ);
             inv_freq = (1.0f - smooth) * inv_freq / ROPE_FACTOR + smooth * inv_freq;
         }
+    } else if (ROPE_KIND == 3) {
+        float ramp = fminf(fmaxf(((float)i - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ), 0.0f), 1.0f);
+        inv_freq = ramp * inv_freq / ROPE_FACTOR + (1.0f - ramp) * inv_freq;
     }
     return inv_freq;
 }
@@ -1543,8 +1547,8 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     if ((is_q || is_k) && d < ROT) {
         int fi = d < ROT_HALF ? d : d - ROT_HALF;
         float angle = rope_position(mm_meta, mm_table, slot, pos, fi) * rope_inv_freq(fi);
-        float c = cosf(angle);
-        float s = sinf(angle);
+        float c = cosf(angle) * ROPE_MSCALE;
+        float s = sinf(angle) * ROPE_MSCALE;
         v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
     }
     float row_scale = 1.0f;
@@ -2071,6 +2075,8 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
                     float x = dst[d], y = dst[d + ROT_HALF];
                     float sn, c;
                     sincosf(rope_position(mm_meta, mm_table, mm_slot, base + row, d) * freq[i], &sn, &c);
+                    c *= ROPE_MSCALE;
+                    sn *= ROPE_MSCALE;
                     dst[d] = x * c - y * sn;
                     dst[d + ROT_HALF] = y * c + x * sn;
                 }

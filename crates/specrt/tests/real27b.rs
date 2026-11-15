@@ -452,3 +452,51 @@ fn first_layers_match(fixture: &str, reference: &str, quant: Quant) {
     eprintln!("decode {n} steps: logits {step_logits}");
     assert!(step_logits <= 2e-3, "{step_logits}");
 }
+
+fn needle_prompt(engine: &specrt::engine::Engine, tokens: usize, depth: f64) -> (String, String) {
+    let sentence = "The grass is green, the sky is blue and the afternoon train leaves the quiet station on time. ";
+    let per = engine.encode_messages(&[serde_json::json!({"role": "user", "content": sentence.repeat(100)})], None).unwrap().len() as f64 / 100.0;
+    let sentences = (tokens as f64 / per) as usize;
+    let at = (sentences as f64 * depth) as usize;
+    let code = "7316-amber-falcon".to_string();
+    let mut text = String::new();
+    for i in 0..sentences {
+        if i == at {
+            text.push_str(&format!("Remember this: the vault passphrase is {code}. "));
+        }
+        text.push_str(sentence);
+    }
+    text.push_str("\nWhat is the vault passphrase? Answer with the passphrase only.");
+    (text, code)
+}
+
+fn needle_at(tokens: usize, depth: f64) {
+    use specrt::spec::{KvDtype, RopeExtension, RopeExtensionKind, RuntimeOptions};
+    let model = std::env::var("SPECRT_27B_NEEDLE_MODEL").unwrap_or_else(|_| "orcarouter/Qwen3.8-27B-Uncensored-NVFP4".into());
+    let runtime = RuntimeOptions {
+        kv_dtype: KvDtype::Fp8,
+        prefill_chunk: Some(4096),
+        rope_extension: Some(RopeExtension { kind: RopeExtensionKind::Yarn, factor: 4 }),
+        ..RuntimeOptions::default()
+    };
+    let ctx = tokens + 2048;
+    let mut engine = specrt::engine::Engine::load_with(&model, Some(ctx), Some(&runtime)).unwrap();
+    let (prompt, code) = needle_prompt(&engine, tokens, depth);
+    let messages = [serde_json::json!({"role": "user", "content": prompt})];
+    let reply = engine.chat(&messages, None, 24, specrt::runtime::Sampling::GREEDY, &mut |_| true).unwrap();
+    eprintln!("needle at {tokens}: prompt {} tokens, prefill {:.0}s, reply {:?}", reply.prompt_tokens, reply.prefill_secs, reply.text);
+    assert!(reply.prompt_tokens >= tokens * 9 / 10, "{} prompt tokens", reply.prompt_tokens);
+    assert!(reply.text.contains(&code), "needle {code} not found in {:?}", reply.text);
+}
+
+#[test]
+#[ignore = "needs a free 96 GB GPU, the NVFP4 27B and about 15 minutes; run under flock /tmp/gpu27.lock"]
+fn real_27b_finds_a_needle_at_500k_with_yarn_extension() {
+    needle_at(500_000, 0.35);
+}
+
+#[test]
+#[ignore = "needs a free 96 GB GPU, the NVFP4 27B and about 30 minutes; run under flock /tmp/gpu27.lock"]
+fn real_27b_finds_a_needle_at_1m_with_yarn_extension() {
+    needle_at(1_000_000, 0.6);
+}

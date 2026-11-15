@@ -82,6 +82,9 @@ pub fn namespace(spec: &Spec, kv_planes: usize, salt: &str) -> Hash {
     keyed.runtime = Default::default();
     let mut h = Sha256::new();
     h.update(serde_json::to_vec(&keyed).expect("a spec serialises"));
+    if let Some(e) = spec.runtime.rope_extension.filter(|e| e.factor > 1) {
+        h.update(serde_json::to_vec(&e).expect("an extension serialises"));
+    }
     h.update((kv_planes as u64).to_le_bytes());
     h.update([spec.runtime.kv_dtype as u8]);
     h.update((PAGE as u64).to_le_bytes());

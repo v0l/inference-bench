@@ -210,6 +210,7 @@ fn mat<B: Backend>(be: &B, m: &Matrix, nrows: usize, cols: usize, what: &str) ->
 
 impl<B: Backend> Dense<B> {
     pub fn load(mut be: B, spec: &Spec, max_ctx: usize) -> Result<Self> {
+        let spec = &crate::engine::apply_rope_extension(spec)?;
         if let Some(why) = wgsl::unsupported(spec) {
             bail!("{} is not supported on backend wgpu: {why}", spec.name);
         }

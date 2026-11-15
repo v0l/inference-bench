@@ -898,7 +898,8 @@ def main():
             "rope_theta": theta,
             "rope_type": scaling["kind"],
             "factor": scaling["factor"],
-            **{k: v for k, v in scaling.items() if k not in ("kind", "factor", "original_max_positions")},
+            **{k: v for k, v in scaling.items() if k not in ("kind", "factor", "original_max_positions", "yarn")},
+            **scaling.get("yarn", {}),
             **({"original_max_position_embeddings": int(scaling["original_max_positions"])} if "original_max_positions" in scaling else {}),
         }
         config.rope_parameters = params

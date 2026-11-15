@@ -1,0 +1,43 @@
+name = "qwen2.5-0.5b-yarn4"
+repo = "Qwen/Qwen2.5-0.5B"
+quant = "bf16"
+
+[dims]
+hidden = 896
+intermediate = 4864
+vocab = 151936
+tie_embeddings = true
+
+[layers]
+count = 24
+pattern = ["dense"]
+
+[norm]
+kind = "rmsnorm"
+eps = 1e-6
+
+[attention]
+kind = "gqa"
+heads = 14
+kv_heads = 2
+head_dim = 64
+qkv_bias = true
+qk_norm = false
+
+[rope]
+style = "neox"
+theta = 1000000.0
+
+[rope.scaling]
+kind = "yarn"
+factor = 4.0
+original_max_positions = 32768.0
+
+[rope.scaling.yarn]
+beta_fast = 32.0
+beta_slow = 1.0
+attention_factor = 1.138629436111989
+truncate = true
+
+[mlp]
+activation = "swiglu"

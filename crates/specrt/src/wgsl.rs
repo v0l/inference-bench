@@ -1,6 +1,6 @@
 use crate::codegen::render;
 use crate::plan::{Op, Phase, Plan, Weight};
-use crate::spec::{ActQuant, Quant, RopeScalingKind, Spec};
+use crate::spec::{ActQuant, Quant, Spec};
 use anyhow::Result;
 use std::collections::BTreeMap;
 
@@ -93,13 +93,7 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
 pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec<WgslKernel>> {
     let a = &spec.attention;
     let d = &spec.dims;
-    let scaling = spec.rope.scaling.as_ref();
-    let rope_kind = match scaling.map(|s| s.kind) {
-        None => 0,
-        Some(RopeScalingKind::Linear) => 1,
-        Some(RopeScalingKind::Llama3) => 2,
-    };
-    let opt = |f: fn(&crate::spec::RopeScaling) -> Option<f64>| float(scaling.and_then(f).unwrap_or(1.0));
+    let rope = spec.rope_constants();
     let act = match spec.mlp.activation {
         crate::spec::Activation::Swiglu => 0,
         crate::spec::Activation::Geglu => 1,
@@ -115,11 +109,12 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         ("QK_NORM", a.qk_norm.to_string()),
         ("EPS", float(spec.norm.eps)),
         ("THETA", float(spec.rope.theta)),
-        ("ROPE_KIND", rope_kind.to_string()),
-        ("ROPE_FACTOR", float(scaling.map_or(1.0, |s| s.factor))),
-        ("ROPE_LOW_FREQ", opt(|s| s.low_freq_factor)),
-        ("ROPE_HIGH_FREQ", opt(|s| s.high_freq_factor)),
-        ("ROPE_ORIG_POS", opt(|s| s.original_max_positions)),
+        ("ROPE_KIND", rope.kind.to_string()),
+        ("ROPE_FACTOR", float(rope.factor)),
+        ("ROPE_LOW_FREQ", float(rope.low)),
+        ("ROPE_HIGH_FREQ", float(rope.high)),
+        ("ROPE_ORIG_POS", float(rope.original)),
+        ("ROPE_MSCALE", float(rope.mscale)),
         ("ACT_KIND", act.to_string()),
         ("MAX_CTX", max_ctx.to_string()),
         ("Q_DIM", spec.q_dim().to_string()),
