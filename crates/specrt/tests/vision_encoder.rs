@@ -85,7 +85,13 @@ fn a_batch_of_images_encodes_like_each_image_alone() {
 #[test]
 #[ignore = "needs the 27B FP8 checkpoint in the HF cache and a GPU"]
 fn a_960x1280_classify_photo_encodes_in_under_150_ms() {
-    let enc = encoder(VisionPrecision::default());
+    for precision in [VisionPrecision::Exact, VisionPrecision::Fast] {
+        classify_photo_speed(precision);
+    }
+}
+
+fn classify_photo_speed(precision: VisionPrecision) {
+    let enc = encoder(precision);
     let cfg = Preprocessor::from_json(&std::fs::read_to_string(specrt::weights::find_in_snapshot(REPO, "preprocessor_config.json").unwrap()).unwrap()).unwrap();
     let img = image::RgbImage::from_fn(960, 1280, |x, y| image::Rgb([(x * 7 % 251) as u8, (y * 3 % 241) as u8, ((x + y) % 239) as u8]));
     let mut jpeg = std::io::Cursor::new(Vec::new());
@@ -105,6 +111,6 @@ fn a_960x1280_classify_photo_encodes_in_under_150_ms() {
     let t = std::time::Instant::now();
     enc.encode_batch(&four).unwrap();
     let batch_ms = t.elapsed().as_secs_f64() * 1e3;
-    eprintln!("960x1280 grid [1, 80, 60]: best of 5 {best:.1} ms, batch of 4 {batch_ms:.1} ms");
+    eprintln!("{precision:?} 960x1280 grid [1, 80, 60]: best of 5 {best:.1} ms, batch of 4 {batch_ms:.1} ms");
     assert!(best < 150.0, "encode took {best:.1} ms");
 }

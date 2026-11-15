@@ -123,7 +123,7 @@ __device__ __forceinline__ int swz4(int r, int c) { return r * 4 + (c ^ ((r >> 1
 
 constexpr int GM_BM = 128;
 constexpr int GM_BN = 128;
-constexpr int GM_BK = GEMM_SPLIT ? 32 : 64;
+constexpr int GM_BK = 32;
 constexpr int GM_CPR = GM_BK / 8;
 constexpr int GM_PLANES = GEMM_SPLIT ? 2 : 1;
 constexpr int GM_WM = 2;

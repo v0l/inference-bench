@@ -13,7 +13,7 @@ const KERNELS: &[&str] = &["vis_mma", "vis_split", "vis_layernorm", "vis_pos", "
 const GEMM_BM: u32 = 128;
 const GEMM_BN: u32 = 128;
 const GEMM_THREADS: u32 = 256;
-const GEMM_SMEM: u32 = 3 * (128 * 64 * 2 + 128 * 64 * 2);
+const GEMM_SMEM: u32 = 3 * (128 * 32 * 2 * 2 + 128 * 32 * 2);
 const FLASH_BQ: u32 = 128;
 const FLASH_THREADS: u32 = 256;
 
