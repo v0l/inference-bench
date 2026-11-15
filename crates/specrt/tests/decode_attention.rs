@@ -27,6 +27,17 @@ fn tiny() -> Spec {
     spec
 }
 
+fn one_layer_122b() -> Spec {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.5-122b-a10b-nvfp4.config.json");
+    let mut spec = Spec::from_hf_config(&std::fs::read_to_string(path).unwrap()).unwrap();
+    spec.name = "qwen3.5-122b-a10b".into();
+    spec.layers.count = spec.layers.pattern.len();
+    spec.mtp = None;
+    assert_eq!((spec.attention.heads, spec.attention.kv_heads, spec.attention.head_dim), (32, 2, 256));
+    assert_eq!(spec.kv_layers(), 1);
+    spec
+}
+
 fn f16_value(bits: u16) -> f32 {
     let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
     let exp = ((bits >> 10) & 0x1f) as i32;
@@ -296,6 +307,7 @@ fn decode_attention_matches_the_reference_across_splits_mixed_lengths_and_verify
     ];
     check_against_reference(one_layer_27b(), 16384 + 256, &cases);
     check_against_reference(tiny(), 16384 + 256, &cases);
+    check_against_reference(one_layer_122b(), 16384 + 256, &cases);
 }
 
 #[test]
