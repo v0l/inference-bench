@@ -636,7 +636,7 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
-    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "text_config", "quantization_config",
+    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "text_config", "quantization_config",
 ];
 
 pub fn unread_hf_keys(json: &str) -> Vec<(String, String)> {
@@ -692,13 +692,13 @@ struct HfConfig {
     linear_conv_kernel_dim: Option<usize>,
     #[serde(default)]
     mtp_num_hidden_layers: usize,
+    attn_logit_softcapping: Option<f64>,
 }
 
 fn layer_pattern(blocks_spec: &crate::family::FamilyBlocks, types: &[String], strict: bool) -> Result<Vec<Block>> {
     let blocks = types
         .iter()
         .map(|t| match blocks_spec.layer_types.get(t) {
-            Some(Block::Sliding) if strict => bail!("layer type {t} is not supported"),
             Some(b) => Ok(*b),
             None if !strict => Ok(blocks_spec.other_layer_type.unwrap_or(Block::Full)),
             None => bail!("layer type {t} is not supported"),
@@ -1059,7 +1059,7 @@ impl Spec {
             .filter(|f| *f != 1.0)
             .map(|f| (head_dim as f64 * f).round() as usize);
         let pattern = match &hf.layer_types {
-            Some(types) if hybrid || !strict => layer_pattern(&family.blocks, types, strict)?,
+            Some(types) if hybrid || !strict || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
             None if hybrid && hf.full_attention_interval.is_some_and(|n| n > 1) => {
                 let n = hf.full_attention_interval.unwrap_or(4);
                 let mut p = vec![Block::Linear; n - 1];
@@ -1123,7 +1123,7 @@ impl Spec {
                 qk_norm,
                 output_gate,
                 rotary_dim,
-                softcap: None,
+                softcap: hf.attn_logit_softcapping,
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params) },
             mlp: Mlp {
