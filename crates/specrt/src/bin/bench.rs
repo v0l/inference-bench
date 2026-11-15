@@ -176,9 +176,13 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
 fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize, sampled: bool) -> Result<()> {
     use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
     let max_ctx = prompt_len + new_tokens + 16;
-    let layout = specrt::runtime::Layout::serving(spec, max_ctx, batch, None);
+    let kv_bytes = std::env::var("SPECRT_BENCH_KV_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|gb| (gb * (1u64 << 30) as f64) as usize);
+    let layout = specrt::runtime::Layout::serving(spec, max_ctx, batch, kv_bytes);
     let rt = Runtime::load_layout(spec, layout)?;
-    let mut sched = Scheduler::new(GpuExecutor::new(rt)?, Config { max_num_seqs: batch, ..Config::default() });
+    let mut sched = Scheduler::new(
+        GpuExecutor::new(rt)?,
+        Config { max_num_seqs: batch, max_batched_tokens: 16384, itl_target: std::time::Duration::from_secs(10), ..Config::default() },
+    );
     for round in 0..runs() {
         for s in 0..batch as u32 {
             let prompt = (0..prompt_len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect();
@@ -186,21 +190,39 @@ fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize, 
             sched.submit(Request { prompt, max_tokens: new_tokens, sampling, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None })?;
         }
         let (mut decode_secs, mut decode_tokens, mut prefill_secs, mut steps) = (0.0, 0, 0.0, 0);
+        let (mut pure_secs, mut pure_tokens, mut pure_steps, mut preempted) = (0.0, 0, 0, 0);
+        let mut profiling = false;
         let started = std::time::Instant::now();
         while !sched.idle() {
             let mut events = Vec::new();
             let r = sched.step(&mut events)?;
             decode_secs += r.decode_secs;
-            decode_tokens += r.decode_rows;
+            decode_tokens += r.decode_rows + r.accepted;
             prefill_secs += r.prefill_secs;
             steps += 1;
+            preempted += r.preemptions;
+            if r.prefill_tokens == 0 && r.decode_rows == batch && !profiling && std::env::var_os("SPECRT_BENCH_PROFILE").is_some() {
+                profiling = true;
+                unsafe { cudarc::driver::sys::cuProfilerStart() };
+            }
+            if r.prefill_tokens == 0 && r.decode_rows == batch {
+                pure_secs += r.decode_secs;
+                pure_tokens += r.decode_rows + r.accepted;
+                pure_steps += 1;
+            }
             let _ = events.iter().filter(|e| matches!(e, Event::Token { .. })).count();
         }
+        if std::env::var_os("SPECRT_BENCH_PROFILE").is_some() {
+            unsafe { cudarc::driver::sys::cuProfilerStop() };
+        }
         println!(
-            "{} serve round={round} batch={batch} prompt={prompt_len} new={new_tokens} steps={steps} decode={:.1} tok/s aggregate (decode step {:.2} ms) prefill {:.2} s wall {:.2} s",
+            "{} serve round={round} batch={batch} prompt={prompt_len} new={new_tokens} steps={steps} decode={:.1} tok/s aggregate (decode step {:.2} ms, {decode_secs:.3} s decoding) full-batch decode={:.1} tok/s over {pure_steps} steps of {:.2} ms preemptions={preempted} kv_blocks={} prefill {:.2} s wall {:.2} s",
             spec.name,
             decode_tokens as f64 / decode_secs,
             decode_secs * 1e3 / (steps as f64),
+            pure_tokens as f64 / pure_secs,
+            pure_secs * 1e3 / pure_steps.max(1) as f64,
+            sched.exec.rt.kv_blocks(),
             prefill_secs,
             started.elapsed().as_secs_f64(),
         );
