@@ -12,7 +12,25 @@ pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
 pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
 pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
 pub const MOE_TEMPLATE: &str = include_str!("../templates/moe.cu");
-pub const MOE_KERNELS: &[&str] = &["moe_route", "moe_up_bf16", "moe_up_fp4", "moe_down_bf16", "moe_down_fp4", "moe_combine", "moe_permute", "moe_group_up_bf16", "moe_group_up_fp4", "moe_group_down_bf16", "moe_group_down_fp4"];
+pub const MOE_KERNELS: &[&str] = &["moe_route_logits", "moe_route", "moe_up_bf16", "moe_up_fp4", "moe_down_bf16", "moe_down_fp4", "moe_combine", "moe_permute", "moe_group_up_bf16", "moe_group_up_fp4", "moe_group_down_bf16", "moe_group_down_fp4", "moe_up_fp8", "moe_down_fp8", "moe_group_up_fp8", "moe_group_down_fp8"];
+pub const MOE_MMA_TEMPLATE: &str = include_str!("../templates/moe_mma.cu");
+pub const MOE_MMA_KERNELS: &[&str] = &["moe_quant_f32", "moe_tiles", "moe_mma_up", "moe_mma_up_s", "moe_mma_down", "moe_mma_down_s"];
+pub const MOE_MMA_BM: usize = 64;
+pub const MOE_MMA_BM_SMALL: usize = 16;
+pub const MOE_MMA_STAGES: usize = 3;
+pub const MOE_MMA_BN: usize = 64;
+const MOE_MMA_ROW: usize = 72;
+
+pub fn moe_mma_enabled(spec: &Spec, target: &kir::Target) -> bool {
+    spec.moe.is_some()
+        && spec.mlp.quant == Some(Quant::Nvfp4G16)
+        && spec.mlp.act_quant == crate::spec::ActQuant::Fp4
+        && target.compute_capability.0 >= 12
+}
+
+pub fn moe_mma_smem(rows_per_tile: usize, weights: usize) -> u32 {
+    (MOE_MMA_STAGES * (rows_per_tile + weights * MOE_MMA_BN) * MOE_MMA_ROW) as u32
+}
 
 pub use kir::attention::PAGE;
 pub const Q8_GROUP: usize = 32;
@@ -220,6 +238,7 @@ impl Module {
             match k.family {
                 kir::attention::Family::FlashMma => smem.insert("flash_mma", k.smem_bytes),
                 kir::attention::Family::GroupedDecode => smem.insert("batch_decode_attention", k.smem_bytes),
+                kir::attention::Family::FlashLegacy => smem.insert("flash_attention", k.smem_bytes),
                 _ => None,
             };
         }
@@ -301,6 +320,16 @@ impl Module {
             source.push('\n');
             source.push_str(&render(MOE_TEMPLATE, &vars)?);
             kernels.extend_from_slice(MOE_KERNELS);
+            if moe_mma_enabled(spec, target) {
+                source.push('\n');
+                source.push_str(MOE_MMA_TEMPLATE);
+                kernels.extend_from_slice(MOE_MMA_KERNELS);
+                smem.insert("moe_mma_up", moe_mma_smem(MOE_MMA_BM, 2));
+                smem.insert("moe_mma_up_s", moe_mma_smem(MOE_MMA_BM_SMALL, 2));
+                smem.insert("moe_mma_down", moe_mma_smem(MOE_MMA_BM, 1));
+                smem.insert("moe_mma_down_s", moe_mma_smem(MOE_MMA_BM_SMALL, 1));
+                arch_features = true;
+            }
         }
         if spec.quant == Quant::Gguf {
             kernels.push("gg_dequant_bf16");

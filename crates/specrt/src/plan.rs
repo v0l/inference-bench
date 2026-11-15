@@ -344,7 +344,7 @@ impl Op {
             Op::MtpGather => names(&["mtp_copy"]),
             Op::MtpNorm => names(&["rms_split"]),
             Op::MtpDraft => names(&["mtp_draft"]),
-            Op::MoeRoute => names(&["moe_route"]),
+            Op::MoeRoute => names(&["moe_route_logits", "moe_route"]),
             Op::MoeExperts => names(&["moe_up_bf16", "moe_down_bf16"]),
             Op::MoeCombine => names(&["moe_combine"]),
         }

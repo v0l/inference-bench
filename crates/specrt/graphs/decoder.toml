@@ -519,14 +519,26 @@ out = "x"
 op = "rmsnorm"
 weight = "post_attention_layernorm.weight"
 out = "xn_planes"
-when = "speculative+tensor_core"
+when = "speculative+tensor_core+dense"
 in = "x"
+
+[[mtp]]
+op = "moe_route"
+when = "speculative+tensor_core+moe"
+
+[[mtp]]
+op = "moe_experts"
+when = "speculative+tensor_core+moe"
+
+[[mtp]]
+op = "moe_combine"
+when = "speculative+tensor_core+moe"
 
 [[mtp]]
 op = "linear"
 weight = "mtp_gate_up"
 quant = "mlp"
-when = "speculative+tensor_core"
+when = "speculative+tensor_core+dense"
 in = "xn_planes"
 out = "act_planes"
 
@@ -534,7 +546,7 @@ out = "act_planes"
 op = "linear"
 weight = "mtp_down"
 quant = "mlp"
-when = "speculative+tensor_core"
+when = "speculative+tensor_core+dense"
 in = "act_planes"
 out = "x"
 

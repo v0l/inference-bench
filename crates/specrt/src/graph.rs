@@ -183,6 +183,8 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
             "logit_softcap" => spec.dims.logit_softcap.is_some(),
             "speculative" => spec.speculative().is_some(),
             "vision" => spec.vision.is_some(),
+            "moe" => spec.moe.is_some(),
+            "dense" => spec.moe.is_none(),
             _ => false,
         })
     })

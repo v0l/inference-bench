@@ -365,7 +365,13 @@ impl Gguf {
         let layers = need("block_count")?;
         let heads = need("head_count")?;
         let kv_heads = self.count(&key("head_count_kv")?).unwrap_or(heads);
-        let intermediate = need("feed_forward_length")?;
+        let experts = self.count(&key("expert_count")?).filter(|&e| e > 0);
+        let expert_width = self.count(&key("expert_feed_forward_length")?);
+        let intermediate = match (self.count(&key("feed_forward_length")?), expert_width) {
+            (Some(i), _) => i,
+            (None, Some(w)) if experts.is_some() => w,
+            _ => need("feed_forward_length")?,
+        };
         let head_dim = self.count(&key("key_length")?).unwrap_or(hidden / heads);
         let value_dim = self.count(&key("value_length")?).unwrap_or(head_dim);
         ensure!(value_dim == head_dim, "GGUF key_length {head_dim} and value_length {value_dim} differ");
@@ -383,6 +389,24 @@ impl Gguf {
             bail!("GGUF tensor type is not supported: {first} and {} more (F32, F16, BF16, Q8_0, Q4_K, Q5_K and Q6_K are)", unsupported.len() - 1);
         }
         let quant = self.weight_quant();
+        let moe = match experts {
+            Some(experts) => {
+                let width = expert_width.context("the GGUF file has no expert_feed_forward_length")?;
+                let shared = self.count(&key("expert_shared_feed_forward_length")?).unwrap_or(0);
+                Some(crate::spec::Moe {
+                    experts,
+                    active: self.count(&key("expert_used_count")?),
+                    expert_intermediate: width,
+                    shared_intermediate: shared,
+                    dense_layers: Vec::new(),
+                    sparse_step: 1,
+                    router: crate::spec::RouterAct::Softmax,
+                    norm_topk: true,
+                    shared_gate: shared > 0 && self.tensors.contains_key("blk.0.ffn_gate_inp_shexp.weight"),
+                })
+            }
+            None => None,
+        };
         let spec = Spec {
             name: self.string("general.name").unwrap_or(arch).to_lowercase().replace(' ', "-"),
             min_engine: 0,
@@ -407,7 +431,7 @@ impl Gguf {
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(family, head_dim)?, mrope: None, local_theta: None },
             mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None },
-            moe: None,
+            moe,
             linear_attention: None,
             mtp: None,
             vision: None,

@@ -558,10 +558,11 @@ fn mtp_block_defaults_to_two_draft_tokens_and_rejects_what_cannot_run() {
 }
 
 #[test]
-fn moe_configs_without_an_intermediate_size_are_described_but_refused_for_serving() {
+fn the_35b_fp8_moe_config_is_runnable_with_mtp_and_block_fp8_experts() {
     let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3.6-35b-a3b-fp8.config.json")).unwrap();
-    let e = Spec::from_hf_config(&json).unwrap_err().to_string();
-    assert!(e.contains("mixture-of-experts"), "{e}");
+    let served = Spec::from_hf_config(&json).unwrap();
+    assert!(served.quant.is_fp8() && served.moe.is_some() && served.speculative().is_some());
+    served.runnable().unwrap();
     let spec = Spec::describe_hf_config(&json).unwrap();
     assert_eq!(spec.dims.intermediate, 0);
     let moe = spec.moe.unwrap();

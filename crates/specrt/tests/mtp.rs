@@ -607,3 +607,37 @@ fn speculation_with_fp8_kv_is_identical_to_plain_greedy_with_fp8_kv() {
         check(&format!("fp8 kv, batch {batch}, oracle drafts"), &got, &want);
     }
 }
+
+fn moe_spec(k: usize) -> Spec {
+    let dir = root().join("tests/fixtures/tiny-qwen3.5-moe-mtp");
+    let mut s = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    s.name = "tiny-qwen3.5-moe-mtp".into();
+    s.repo = dir.display().to_string();
+    s.mtp.as_mut().unwrap().draft_tokens = k;
+    s.mtp.as_mut().unwrap().graph = true;
+    s.mtp.as_mut().unwrap().head_quant = Some(Quant::Bf16);
+    s
+}
+
+#[test]
+fn moe_with_an_mtp_layer_is_runnable() {
+    let s = moe_spec(2);
+    assert!(s.moe.is_some() && s.speculative().is_some());
+    s.runnable().unwrap();
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn moe_speculative_greedy_is_identical_to_plain_greedy() {
+    for k in 1..=2 {
+        let s = moe_spec(k);
+        let ps: Vec<Vec<u32>> = (0..6).map(prompt).collect();
+        let want = plain_greedy(&s, &ps);
+        let (got, mean) = speculative_greedy(&s, &ps, &want, Drafts::Mtp, 1);
+        eprintln!("moe k = {k}: mean acceptance length {mean:.3}");
+        check(&format!("moe MTP drafts, k = {k}"), &got, &want);
+        let (got, mean) = speculative_greedy(&s, &ps, &want, Drafts::Oracle(k), 4);
+        assert!(mean > k as f64 + 0.8, "{mean}");
+        check(&format!("moe oracle drafts, k = {k}"), &got, &want);
+    }
+}

@@ -819,6 +819,11 @@ fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, la
     Ok(Quantization { quant, mlp, act, mlp_act })
 }
 
+fn moe_act(q: Option<&serde_json::Value>) -> ActQuant {
+    let groups = q.and_then(|q| q["config_groups"].as_object());
+    groups.and_then(|g| g.values().next()).map_or(ActQuant::None, compressed_act)
+}
+
 fn parse_quantization(rule: &crate::family::FamilyQuant, value: Option<&serde_json::Value>, layers: usize) -> Result<Quantization> {
     let Some(q) = value.filter(|v| !v.is_null()) else {
         return Ok(Quantization::weights(Quant::Bf16));
@@ -948,11 +953,9 @@ impl Spec {
         ensure!(self.linear_attention.is_some() || self.attention_layers() > 0, "mixture-of-experts needs attention layers");
         let experts_quant = self.mlp.quant.unwrap_or(self.quant);
         ensure!(
-            matches!(experts_quant, Quant::Bf16 | Quant::Nvfp4G16),
-            "mixture-of-experts with {experts_quant:?} expert weights is not supported yet (bf16 and nvfp4_g16 are)"
+            matches!(experts_quant, Quant::Bf16 | Quant::Nvfp4G16 | Quant::Fp8Block128 | Quant::Gguf | Quant::Q8),
+            "mixture-of-experts with {experts_quant:?} expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are)"
         );
-        ensure!(self.mtp.is_none(), "mixture-of-experts with an MTP layer is not supported yet");
-        ensure!(self.quant != Quant::Gguf, "mixture-of-experts with GGUF weights is not supported yet");
         ensure!(m.active.is_some_and(|k| k >= 1 && k <= m.experts), "mixture-of-experts needs num_experts_per_tok between 1 and the expert count");
         ensure!(m.expert_intermediate.is_multiple_of(256) || experts_quant == Quant::Bf16, "nvfp4 experts need an intermediate size that is a multiple of 256");
         ensure!(m.expert_intermediate.is_multiple_of(16) && m.shared_intermediate.is_multiple_of(16), "expert intermediate sizes must be multiples of 16");
@@ -1034,7 +1037,7 @@ impl Spec {
         };
         let experts_nvfp4 = hf.num_experts.is_some_and(|e| e > 0) && quant == Quant::Nvfp4G16;
         let (quant, mlp_quant, act, mlp_act) =
-            if experts_nvfp4 { (Quant::Bf16, Some((Quant::Nvfp4G16, None)), ActQuant::None, ActQuant::None) } else { (quant, mlp_quant, act, mlp_act) };
+            if experts_nvfp4 { (Quant::Bf16, Some((Quant::Nvfp4G16, None)), ActQuant::None, moe_act(quant_config.as_ref())) } else { (quant, mlp_quant, act, mlp_act) };
         let nested = hf
             .rope_parameters
             .as_ref()
@@ -1128,7 +1131,6 @@ impl Spec {
             }),
             _ => None,
         };
-        let has_moe = moe.is_some();
         let spec = Spec {
             name: hf.model_type.clone(),
             min_engine: 0,
@@ -1169,7 +1171,7 @@ impl Spec {
                 act_quant: mlp_act,
             },
             moe,
-            mtp: (family.mtp && hybrid && hf.mtp_num_hidden_layers > 0 && !has_moe).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
+            mtp: (family.mtp && hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
             linear_attention,
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             runtime: RuntimeOptions::default(),

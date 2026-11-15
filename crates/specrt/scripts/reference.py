@@ -290,6 +290,19 @@ def quantize_projection_inputs(model):
             module.register_forward_pre_hook(lambda _m, args: (quantize_activation_fp8(args[0]),))
 
 
+def tiny_moe_fp8_model(fixture):
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
+
+    src = fixture.parent / "tiny-qwen3.5-moe"
+    if not (fixture / "model.safetensors.index.json").exists():
+        write_fp8_shards(src, fixture)
+    torch.manual_seed(TINY_SEED)
+    model = Qwen3_5MoeForCausalLM(tiny_moe_config()).float().eval()
+    state = {k: v.float() for k, v in fuse_experts(dequantized_state(fixture)).items()}
+    model.load_state_dict(state, strict=True)
+    return model
+
+
 def tiny_fp8_model(fixture, act_quant=False):
     from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 
@@ -604,11 +617,14 @@ def save(out_dir, name, arrays, meta):
     (out_dir / f"{name}.json").write_text(json.dumps(meta))
 
 
-def tiny(fixture, out_dir, head_dim=128, fp8=False, act_quant=False, nvfp4=False, moe=False):
+def tiny(fixture, out_dir, head_dim=128, fp8=False, act_quant=False, nvfp4=False, moe=False, moe_fp8=False):
     from transformers import DynamicCache
 
     torch.set_num_threads(4)
-    if moe:
+    if moe_fp8:
+        model = tiny_moe_fp8_model(fixture)
+        prefix = "tinymoefp8"
+    elif moe:
         model = tiny_moe_model(fixture)
         prefix = "tinymoe"
     elif nvfp4:
@@ -980,6 +996,9 @@ def main():
         return
     if sys.argv[1] == "tiny-moe":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, moe=True)
+        return
+    if sys.argv[1] == "tiny-moe-fp8":
+        tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, moe_fp8=True)
         return
     if sys.argv[1] == "tiny-nvfp4":
         tiny(Path(sys.argv[2]), Path(sys.argv[3]), 256, nvfp4=True)

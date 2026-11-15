@@ -6,10 +6,11 @@ constexpr int FA_OUT = HEAD_DIM / 8;
 
 extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
                                            const int* block_table, const int* pos_ptr, int layer, float* out, int tokens, int window) {
-    __shared__ float qs[FA_BQ][FA_STRIDE];
-    __shared__ float ks[FA_BK][FA_STRIDE];
-    __shared__ float vs[FA_BK][HEAD_DIM];
-    __shared__ float ps[FA_BQ][FA_BK + 1];
+    extern __shared__ __align__(16) float fa_smem[];
+    float (*qs)[FA_STRIDE] = (float (*)[FA_STRIDE])fa_smem;
+    float (*ks)[FA_STRIDE] = (float (*)[FA_STRIDE])(fa_smem + FA_BQ * FA_STRIDE);
+    float (*vs)[HEAD_DIM] = (float (*)[HEAD_DIM])(fa_smem + (FA_BQ + FA_BK) * FA_STRIDE);
+    float (*ps)[FA_BK + 1] = (float (*)[FA_BK + 1])(fa_smem + (FA_BQ + FA_BK) * FA_STRIDE + FA_BK * HEAD_DIM);
     int head = blockIdx.y;
     int kv_head = head / GROUP;
     int q0 = blockIdx.x * FA_BQ;

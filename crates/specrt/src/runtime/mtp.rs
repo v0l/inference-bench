@@ -53,7 +53,7 @@ impl DeviceMtp {
             }),
             gate_up: DeviceMatrix::upload(stream, &w.layer.gate_up)?,
             down: DeviceMatrix::upload(stream, &w.layer.down)?,
-            moe: None,
+            moe: w.layer.moe.as_ref().map(super::moe::DeviceMoe::upload_with(stream)).transpose()?,
         };
         let m = DeviceMtp {
             fc: DeviceMatrix::upload(stream, &w.fc)?,

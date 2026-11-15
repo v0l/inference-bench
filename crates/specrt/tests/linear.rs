@@ -458,3 +458,38 @@ fn moe_batch_decode_matches_single_sequence_greedy() {
         batch_decode_matches_single_sequence_greedy(MOE, batch);
     }
 }
+
+const MOE_FP8: &str = "tiny-qwen3.5-moe-fp8";
+
+#[test]
+fn moe_fp8_fixture_spec_is_runnable_with_block_fp8_experts() {
+    let s = spec_for(MOE_FP8);
+    assert!(s.moe.is_some() && s.mlp.quant.unwrap_or(s.quant).is_fp8());
+    s.runnable().unwrap();
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-moe-fp8 output"]
+fn moe_fp8_decode_matches_the_reference_per_layer() {
+    decode_matches_reference(MOE_FP8, "tinymoefp8");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-moe-fp8 output"]
+fn moe_fp8_prefill_matches_the_reference_per_layer() {
+    prefill_matches_reference(MOE_FP8, "tinymoefp8");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/reference.py tiny-moe-fp8 output"]
+fn moe_fp8_logits_and_greedy_match_transformers() {
+    logits_and_greedy_match_reference(MOE_FP8, "tinymoefp8");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn moe_fp8_batch_decode_matches_single_sequence_greedy() {
+    for batch in [2, 8, 16] {
+        batch_decode_matches_single_sequence_greedy(MOE_FP8, batch);
+    }
+}

@@ -798,7 +798,8 @@ impl Runtime {
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let jit = Jit::new(ctx.clone(), spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir))?;
-        let module = Module::generate_kv(spec, max_ctx, layout.kv_planes, &crate::codegen::cuda_target(&ctx)?)?;
+        let target = crate::codegen::cuda_target(&ctx)?;
+        let module = Module::generate_kv(spec, max_ctx, layout.kv_planes, &target)?;
         crate::progress::report(crate::progress::Stage::Kernels, 0, 1);
         let jit_started = Instant::now();
         let loaded = jit.load(&module)?;
@@ -921,7 +922,7 @@ impl Runtime {
             pre,
             gdn,
             moe: match &spec.moe {
-                Some(_) => Some(moe::MoeBuffers::new(&stream, chunk, spec)?),
+                Some(_) => Some(moe::MoeBuffers::new(&stream, chunk, spec, crate::codegen::moe_mma_enabled(spec, &target))?),
                 None => None,
             },
             fp8_act,
@@ -1805,6 +1806,9 @@ impl Runtime {
     }
 
     fn mlp_prefill(&self, l: &DeviceLayer, n: usize) -> Result<()> {
+        if l.moe.is_some() {
+            return self.moe_block(l, &self.pre.x, n);
+        }
         let pre = &self.pre;
         let (hidden, inter) = (self.spec.dims.hidden, self.spec.dims.intermediate);
         self.rms_split(&pre.x.as_view(), &l.ln2, &pre.xn_planes, n)?;

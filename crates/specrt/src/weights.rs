@@ -42,7 +42,8 @@ pub enum Mixer<'a> {
 
 pub enum Stacked {
     Bf16(Vec<u16>),
-    Fp4 { packed: Vec<u8>, scales: Vec<u8>, inv_global: Vec<f32> },
+    Fp4 { packed: Vec<u8>, scales: Vec<u8>, inv_global: Vec<f32>, input_global: f32 },
+    Fp8 { values: Vec<u8>, grid: Vec<f32> },
 }
 
 pub struct MoeWeights {
@@ -900,7 +901,49 @@ impl Checkpoint {
         })
     }
 
+    fn gguf_stack(&self, g: &Gguf, name: &str, shape: &[usize], out: &mut Vec<u16>) -> Result<()> {
+        let mapped = name.to_string();
+        let info = g.tensor(&mapped).with_context(|| format!("{mapped} is not in the GGUF file"))?;
+        ensure!(info.shape == shape, "{mapped} has shape {:?}, expected {shape:?}", info.shape);
+        let mut values = vec![0f32; shape.iter().product()];
+        crate::gguf::dequantize(info.kind, g.data(info), &mut values).with_context(|| mapped.clone())?;
+        out.extend(values.into_iter().map(f32_to_bf16));
+        Ok(())
+    }
+
+    fn gguf_moe_layer(&self, g: &Gguf, spec: &Spec, global: usize) -> Result<MoeWeights> {
+        let m = spec.moe.as_ref().context("no [moe]")?;
+        let (h, inter, e) = (spec.dims.hidden, m.expert_intermediate, m.experts);
+        let shared = m.shared_intermediate > 0;
+        ensure!(!shared || m.shared_intermediate == inter, "the shared expert must be as wide as the routed experts");
+        let blk = format!("blk.{global}");
+        let stack = |which: &str, rows: usize, cols: usize| -> Result<Stacked> {
+            let mut w = Vec::with_capacity((e + 1) * rows * cols);
+            self.gguf_stack(g, &format!("{blk}.ffn_{which}_exps.weight"), &[e, rows, cols], &mut w)?;
+            if shared {
+                self.gguf_stack(g, &format!("{blk}.ffn_{which}_shexp.weight"), &[rows, cols], &mut w)?;
+            }
+            Ok(Stacked::Bf16(w))
+        };
+        let mut router = Vec::with_capacity(e * h);
+        self.gguf_stack(g, &format!("{blk}.ffn_gate_inp.weight"), &[e, h], &mut router)?;
+        let shared_gate = if m.shared_gate {
+            let name = format!("{blk}.ffn_gate_inp_shexp.weight");
+            let info = g.tensor(&name).with_context(|| format!("{name} is not in the GGUF file"))?;
+            let mut v = vec![0f32; h];
+            crate::gguf::dequantize(info.kind, g.data(info), &mut v)?;
+            Some(v)
+        } else {
+            None
+        };
+        Ok(MoeWeights { router, shared_gate, gate: stack("gate", inter, h)?, up: stack("up", inter, h)?, down: stack("down", h, inter)? })
+    }
+
     fn moe_layer(&self, spec: &Spec, p: &str, quant: Quant) -> Result<MoeWeights> {
+        if let Some(g) = &self.gguf {
+            let global: usize = p.rsplit('.').next().and_then(|n| n.parse().ok()).context("GGUF layer index")?;
+            return self.gguf_moe_layer(g, spec, global);
+        }
         let m = spec.moe.as_ref().context("no [moe]")?;
         let (h, inter, e) = (spec.dims.hidden, m.expert_intermediate, m.experts);
         let shared = m.shared_intermediate > 0;
@@ -910,17 +953,32 @@ impl Checkpoint {
             if i < e { format!("{p}.mlp.experts.{i}.{which}_proj") } else { format!("{p}.mlp.shared_expert.{which}_proj") }
         };
         let stack = |which: &str, rows: usize, cols: usize| -> Result<Stacked> {
-            if quant == Quant::Nvfp4G16 {
+            if quant == Quant::Fp8Block128 {
+                let mut values = Vec::with_capacity(total * rows * cols);
+                let mut grid = Vec::new();
+                for i in 0..total {
+                    let Raw::Fp8 { w, grid: g, .. } = self.raw(&format!("{}.weight", module(i, which)), rows, cols)? else {
+                        bail!("{} is not FP8", module(i, which));
+                    };
+                    values.extend_from_slice(&w);
+                    grid.extend_from_slice(&g);
+                }
+                Ok(Stacked::Fp8 { values, grid })
+            } else if quant == Quant::Nvfp4G16 {
                 let mut packed = Vec::with_capacity(total * rows * cols / 2);
                 let mut scales = Vec::with_capacity(total * rows * cols / crate::nvfp4::GROUP);
                 let mut inv_global = Vec::with_capacity(total);
+                let mut input_global = f32::MAX;
                 for i in 0..total {
                     let f = self.fp4(&module(i, which), rows, cols)?;
                     packed.extend_from_slice(&f.packed);
                     scales.extend_from_slice(&f.scales);
                     inv_global.push(1.0 / f.global);
+                    if f.input_global > 0.0 {
+                        input_global = input_global.min(f.input_global);
+                    }
                 }
-                Ok(Stacked::Fp4 { packed, scales, inv_global })
+                Ok(Stacked::Fp4 { packed, scales, inv_global, input_global })
             } else {
                 let mut w = Vec::with_capacity(total * rows * cols);
                 for i in 0..total {
@@ -957,9 +1015,16 @@ impl Checkpoint {
         let bf16 = |r: Raw<'a>, what: &str| -> Result<Matrix<'a>> { r.dequantized().into_matrix(Quant::Bf16, what) };
         let p = "mtp.layers.0";
         let attn = self.attention_as(spec, &format!("{p}.self_attn"), true)?;
-        let gate = self.raw(&format!("{p}.mlp.gate_proj.weight"), inter, h)?.dequantized();
-        let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?.dequantized();
-        let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
+        let sparse = spec.moe.is_some();
+        let (gate_up, down, moe) = if sparse {
+            let dummy = || Matrix::Bf16(Cow::Owned(vec![0; 8]));
+            (dummy(), dummy(), Some(self.moe_layer(spec, p, if spec.quant == Quant::Fp8Block128 { Quant::Fp8Block128 } else { Quant::Bf16 })?))
+        } else {
+            let gate = self.raw(&format!("{p}.mlp.gate_proj.weight"), inter, h)?.dequantized();
+            let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?.dequantized();
+            let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
+            (Raw::interleave(gate, up)?.into_matrix(Quant::Bf16, "mtp gate_up")?, bf16(down, "mtp down_proj")?, None)
+        };
         Ok(MtpWeights {
             fc: bf16(self.raw("mtp.fc.weight", h, 2 * h)?, "mtp.fc")?,
             norm_embed: self.norm(spec, "mtp.pre_fc_norm_embedding.weight", h)?,
@@ -970,9 +1035,9 @@ impl Checkpoint {
                 ln_pre_mlp: None,
                 ln_post_mlp: None,
                 mixer: Mixer::Attention(attn),
-                gate_up: Raw::interleave(gate, up)?.into_matrix(Quant::Bf16, "mtp gate_up")?,
-                down: bf16(down, "mtp down_proj")?,
-                moe: None,
+                gate_up,
+                down,
+                moe,
             },
             norm: self.norm(spec, "mtp.norm.weight", h)?,
         })
@@ -1056,6 +1121,63 @@ mod tests {
         assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
         assert_eq!(f32_to_bf16(1.0), 0x3f80);
         assert_eq!(bf16_to_f32(f32_to_bf16(f16_to_f32(0x3555))), 0.333_984_38);
+    }
+
+    #[test]
+    fn gguf_expert_tensors_become_stacked_experts_with_the_shared_expert_last() {
+        use crate::gguf::writer::{Kv, build};
+        let (h, inter, e) = (256usize, 16usize, 3usize);
+        let f32s = |n: usize, base: f32| -> Vec<u8> { (0..n).flat_map(|i| (base + i as f32).to_le_bytes()).collect() };
+        let gate = f32s(e * inter * h, 0.0);
+        let shared_gate = f32s(inter * h, 1000.0);
+        let router = f32s(e * h, 0.0);
+        let gate_inp_shexp = f32s(h, 5.0);
+        let up = f32s(e * inter * h, 0.0);
+        let shared_up = f32s(inter * h, 0.0);
+        let down = f32s(e * h * inter, 0.0);
+        let shared_down = f32s(h * inter, 0.0);
+        let embd = f32s(8 * h, 0.0);
+        let bytes = build(
+            3,
+            &[
+                ("general.architecture", Kv::Str("qwen3moe")),
+                ("qwen3moe.block_count", Kv::U32(1)),
+                ("qwen3moe.embedding_length", Kv::U32(h as u32)),
+                ("qwen3moe.attention.head_count", Kv::U32(2)),
+                ("qwen3moe.attention.head_count_kv", Kv::U32(1)),
+                ("qwen3moe.attention.key_length", Kv::U32(4)),
+                ("qwen3moe.attention.layer_norm_rms_epsilon", Kv::F32(1e-6)),
+                ("qwen3moe.expert_count", Kv::U32(e as u32)),
+                ("qwen3moe.expert_used_count", Kv::U32(2)),
+                ("qwen3moe.expert_feed_forward_length", Kv::U32(inter as u32)),
+                ("qwen3moe.expert_shared_feed_forward_length", Kv::U32(inter as u32)),
+            ],
+            &[
+                ("token_embd.weight", &[h as u64, 8], 0, &embd),
+                ("blk.0.ffn_gate_inp.weight", &[h as u64, e as u64], 0, &router),
+                ("blk.0.ffn_gate_inp_shexp.weight", &[h as u64], 0, &gate_inp_shexp),
+                ("blk.0.ffn_gate_exps.weight", &[h as u64, inter as u64, e as u64], 0, &gate),
+                ("blk.0.ffn_up_exps.weight", &[h as u64, inter as u64, e as u64], 0, &up),
+                ("blk.0.ffn_down_exps.weight", &[inter as u64, h as u64, e as u64], 0, &down),
+                ("blk.0.ffn_gate_shexp.weight", &[h as u64, inter as u64], 0, &shared_gate),
+                ("blk.0.ffn_up_shexp.weight", &[h as u64, inter as u64], 0, &shared_up),
+                ("blk.0.ffn_down_shexp.weight", &[inter as u64, h as u64], 0, &shared_down),
+            ],
+        );
+        let g = Gguf::from_bytes(bytes).unwrap();
+        let spec = g.spec().unwrap();
+        let m = spec.moe.as_ref().unwrap();
+        assert_eq!((m.experts, m.top_k(), m.expert_intermediate, m.shared_intermediate, m.shared_gate), (e, 2, inter, inter, true));
+        spec.check_moe_runnable().unwrap();
+        let ck = Checkpoint { gguf: Some(std::sync::Arc::new(g)), shards: Default::default(), names: Default::default(), staged: None, files: Vec::new() };
+        let w = ck.moe_layer(&spec, "model.layers.0", Quant::Bf16).unwrap();
+        let Stacked::Bf16(gate) = &w.gate else { panic!("bf16 stack") };
+        assert_eq!(gate.len(), (e + 1) * inter * h);
+        assert_eq!(bf16_to_f32(gate[0]), 0.0);
+        assert_eq!(bf16_to_f32(gate[inter * h]), 4096.0);
+        assert_eq!(bf16_to_f32(gate[e * inter * h]), 1000.0);
+        assert_eq!(w.router.len(), e * h);
+        assert_eq!(w.shared_gate.as_deref(), Some(&(0..h).map(|v| 5.0 + v as f32).collect::<Vec<_>>()[..]));
     }
 
     #[test]

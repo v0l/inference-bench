@@ -73,6 +73,10 @@ impl AttentionShape {
         kv.max(FLASH_ROWS * self.head_dim * 2)
     }
 
+    pub fn legacy_flash_smem(&self) -> usize {
+        ((16 + 32) * (self.head_dim + 1) + 32 * self.head_dim + 16 * 33) * 4
+    }
+
     pub fn decode_smem(&self) -> usize {
         DECODE_STAGES * 2 * self.kv_planes * DECODE_KEYS * self.head_dim * 2
     }
@@ -172,7 +176,7 @@ impl AttentionKernel {
         let (threads, smem_bytes) = match family {
             Family::RopeKv => (shape.head_dim.max(32) as u32, 0),
             Family::SplitDecode => (SPLIT_BLOCK, 0),
-            Family::FlashLegacy => (128, 0),
+            Family::FlashLegacy => (128, shape.legacy_flash_smem() as u32),
             Family::FlashMma => (32 * shape.flash_warps() as u32, shape.flash_smem() as u32),
             Family::GroupedDecode => (32 * shape.decode_max_warps() as u32, shape.decode_smem() as u32),
         };

@@ -967,7 +967,7 @@ mod tests {
 
     #[test]
     fn every_config_the_engine_tests_load_is_supported_by_the_library() {
-        let engine_refuses = ["qwen3.6-35b-a3b-fp8.config.json", "gemma4-31b.config.json"];
+        let engine_refuses = ["gemma4-31b.config.json"];
         let fixtures = engine_config_fixtures();
         assert!(fixtures.len() >= 12, "{} fixtures", fixtures.len());
         for (name, config) in &fixtures {

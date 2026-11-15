@@ -306,7 +306,7 @@ impl Runtime {
         let config = LaunchConfig {
             grid_dim: (grid(n, 16), a.heads as u32, 1),
             block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
+            shared_mem_bytes: self.smem["flash_attention"],
         };
         unsafe { b.launch(config) }?;
         Ok(())

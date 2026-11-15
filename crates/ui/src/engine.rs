@@ -34,7 +34,7 @@ pub fn rows_for(spec: &Spec, structure: &Structure, layer: usize, phase: Phase) 
     let root = structure.root().ok_or("not runnable on specrt: the checkpoint has no layer stack")?;
     let plan = Plan::build(spec, phase, true);
     let mut rows = column(&plan.head, spec, layer, phase, root, None);
-    rows.extend(column(plan.layer(spec.block(layer)), spec, layer, phase, root, Some(layer)));
+    rows.extend(column(plan.layer_of(spec.block(layer), spec.moe.as_ref().is_some_and(|m| m.is_sparse(layer))), spec, layer, phase, root, Some(layer)));
     rows.extend(column(&plan.tail, spec, layer, phase, root, None));
     Ok(rows)
 }
@@ -116,9 +116,17 @@ mod tests {
 
     #[test]
     fn a_model_specrt_cannot_run_shows_the_reason() {
-        let (spec, structure) = load("qwen3.6-35b-a3b-fp8.config.json", "qwen3.6-35b-a3b-fp8.json");
+        let (mut spec, structure) = load("qwen3.6-35b-a3b-fp8.config.json", "qwen3.6-35b-a3b-fp8.json");
+        spec.moe.as_mut().unwrap().active = None;
         let err = rows_for(&spec, &structure, 0, Phase::Prefill).unwrap_err();
         assert!(err.starts_with("not runnable on specrt: "), "{err}");
         assert!(err.contains("mixture-of-experts"), "{err}");
+    }
+
+    #[test]
+    fn the_35b_fp8_moe_model_draws_its_expert_row() {
+        let (spec, structure) = load("qwen3.6-35b-a3b-fp8.config.json", "qwen3.6-35b-a3b-fp8.json");
+        let rows = rows_for(&spec, &structure, 0, Phase::Prefill).unwrap();
+        assert!(nodes(&rows).iter().any(|n| n.shape.contains("moe_")), "{:?}", nodes(&rows).iter().map(|n| &n.title).collect::<Vec<_>>());
     }
 }

@@ -5,7 +5,7 @@ extends = "base"
 [match]
 model_types = ["qwen3", "qwen3_moe"]
 architectures = ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"]
-gguf = ["qwen3"]
+gguf = ["qwen3", "qwen3moe"]
 
 [attention]
 qk_norm = true
