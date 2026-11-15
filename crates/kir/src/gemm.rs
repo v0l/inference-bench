@@ -697,7 +697,7 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
         decoder: decoder_for(path, r.weight),
         kernel,
     };
-    if auto && mma && r.linear == "lin_ba" && r.tokens <= ROWS_MAX_TOKENS && r.weight == WeightFormat::Bf16 {
+    if auto && mma && r.linear == "lin_ba" && r.tokens <= BATCH_MAX_TOKENS && r.weight == WeightFormat::Bf16 {
         return Ok(plain("lin_ba_rows".to_string(), GemmPath::Rows, tile, None));
     }
     Ok(match r.weight {
