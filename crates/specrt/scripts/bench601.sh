@@ -42,7 +42,11 @@ P
     kill $server 2>/dev/null; wait $server 2>/dev/null || true
     trap - RETURN
 }
+if [ -n "${BASELINE:-}" ]; then
+    run_config "${TAG:-baseline}"
+    exit 0
+fi
 for itl in ${ITLS:-50 100 200 400}; do
-    run_config "itl$itl" --itl-target-ms "$itl"
+    run_config "${TAG:-}itl$itl" --itl-target-ms "$itl"
 done
-run_config "whole4k" --itl-target-ms 100 --whole-prompt-tokens 4096
+run_config "${TAG:-}whole4k" --itl-target-ms 100 --whole-prompt-tokens 4096
