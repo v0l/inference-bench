@@ -169,7 +169,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
                 };
                 be.dispatch(kernels[0], &[&m.scratch.x, w, self.buf(into)], [row0 as u32, 0, 0, 0, 0, 0, 0, 0], [r, 1, 1])
             }
-            Op::Linear { weight, input, output } => {
+            Op::Linear { weight, input, output, .. } => {
                 let w = self.weight(weight, l);
                 let grid = [w.nrows.min(ROW_SPAN), w.nrows.div_ceil(ROW_SPAN), rows.div_ceil(if rows == 1 { 1 } else { LINEAR_TOKENS }) as u32];
                 let accumulate = output == Buf::X;

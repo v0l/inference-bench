@@ -1,5 +1,5 @@
 use crate::spec::Spec;
-use crate::plan::{Buf, NormKind, Op, Phase, Plan, PlanBlock, Weight};
+use crate::plan::{Buf, QuantSource, NormKind, Op, Phase, Plan, PlanBlock, Weight};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
@@ -9,6 +9,8 @@ pub struct Node {
     pub op: String,
     #[serde(default)]
     pub weight: Option<String>,
+    #[serde(default)]
+    pub quant: Option<String>,
     #[serde(default, rename = "in")]
     pub input: Option<String>,
     #[serde(default)]
@@ -81,6 +83,16 @@ fn weight(name: &str) -> Result<Weight> {
     })
 }
 
+fn quant_source(name: &str) -> Result<QuantSource> {
+    Ok(match name {
+        "attn" => QuantSource::Attn,
+        "mlp" => QuantSource::Mlp,
+        "bf16" => QuantSource::Bf16,
+        "head" => QuantSource::Head,
+        other => bail!("unknown quant source {other}"),
+    })
+}
+
 fn norm(name: &str) -> Result<NormKind> {
     Ok(match name {
         "input_layernorm.weight" => NormKind::Input,
@@ -109,6 +121,7 @@ impl Node {
             "rmsnorm" => Op::Norm { which: norm(&field(&self.weight, "weight")?)?, into: buffer(&field(&self.out, "out")?)? },
             "linear" => Op::Linear {
                 weight: weight(&field(&self.weight, "weight")?)?,
+                quant: quant_source(&field(&self.quant, "quant")?)?,
                 input: buffer(&field(&self.input, "in")?)?,
                 output: buffer(&field(&self.out, "out")?)?,
             },

@@ -1,4 +1,4 @@
-use specrt::plan::{Buf, NormKind, Op, Phase, Plan, Weight};
+use specrt::plan::{Buf, NormKind, Op, Phase, Plan, QuantSource, Weight};
 use specrt::spec::{Block, Spec};
 use std::path::Path;
 
@@ -11,9 +11,18 @@ struct Ref {
     tail: Vec<Op>,
 }
 
+    fn quant_of(weight: Weight) -> QuantSource {
+        match weight {
+            Weight::GateUp | Weight::Down => QuantSource::Mlp,
+            Weight::LinBa => QuantSource::Bf16,
+            Weight::LmHead => QuantSource::Head,
+            _ => QuantSource::Attn,
+        }
+    }
+
     fn reference(spec: &Spec, phase: Phase, tensor_core: bool) -> Ref {
         let norm = |which, into| Op::Norm { which, into };
-        let lin = |weight, input, output| Op::Linear { weight, input, output };
+        let lin = |weight, input, output| Op::Linear { weight, quant: quant_of(weight), input, output };
         if !tensor_core {
             return Ref {
                     head: vec![Op::Embed],

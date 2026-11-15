@@ -76,7 +76,7 @@ impl Runtime {
             Op::NormAdd { which, from } => self.norm_add_op(which, from, layer, run),
             Op::Clear { buf } => self.clear_op(buf, run),
             Op::LogitSoftcap => self.softcap_op(run),
-            Op::Linear { weight, input, output } => self.linear_op(weight, input, output, layer, run),
+            Op::Linear { weight, input, output, .. } => self.linear_op(weight, input, output, layer, run),
             Op::KvRope => self.attn_rope_rows(self.attn_of(layer), n, 0),
             Op::QkRope => self.qk_rope_legacy(self.attn_of(layer), n),
             Op::Flash => self.attn_flash_rows(self.attn_of(layer), n, 0),

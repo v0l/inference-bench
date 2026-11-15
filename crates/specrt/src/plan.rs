@@ -84,15 +84,6 @@ impl Weight {
         }
     }
 
-    pub fn quant(self, spec: &Spec, layer: usize) -> Quant {
-        match self {
-            Weight::Qkv | Weight::O | Weight::LinIn | Weight::LinOut => spec.quant,
-            Weight::GateUp | Weight::Down => spec.mlp_quant(layer),
-            Weight::LinBa => Quant::Bf16,
-            Weight::LmHead => spec.lm_head_quant(),
-        }
-    }
-
     pub fn tensors(self, spec: &Spec) -> Vec<String> {
         let w = |m: &str| format!("{m}.weight");
         match self {
@@ -111,6 +102,25 @@ impl Weight {
             Weight::LinOut => vec![w("linear_attn.out_proj")],
             Weight::LmHead if spec.dims.tie_embeddings => vec![w("embed_tokens")],
             Weight::LmHead => vec![w("lm_head")],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuantSource {
+    Attn,
+    Mlp,
+    Bf16,
+    Head,
+}
+
+impl QuantSource {
+    pub fn resolve(self, spec: &Spec, layer: usize) -> Quant {
+        match self {
+            QuantSource::Attn => spec.quant,
+            QuantSource::Mlp => spec.mlp_quant(layer),
+            QuantSource::Bf16 => Quant::Bf16,
+            QuantSource::Head => spec.lm_head_quant(),
         }
     }
 }
@@ -143,7 +153,7 @@ pub enum Op {
     NormAdd { which: NormKind, from: Buf },
     Clear { buf: Buf },
     LogitSoftcap,
-    Linear { weight: Weight, input: Buf, output: Buf },
+    Linear { weight: Weight, quant: QuantSource, input: Buf, output: Buf },
     KvRope,
     QkRope,
     Flash,
@@ -240,15 +250,15 @@ impl Op {
 
     pub fn quant(&self, spec: &Spec, layer: usize) -> Option<Quant> {
         match self {
-            Op::Linear { weight, .. } => Some(weight.quant(spec, layer)),
+            Op::Linear { quant, .. } => Some(quant.resolve(spec, layer)),
             _ => None,
         }
     }
 
     pub fn decoder(&self, spec: &Spec, layer: usize, tokens: usize, target: &kir::Target) -> Option<&'static str> {
         match self {
-            Op::Linear { weight, .. } => {
-                let kind = weight_kind(weight.quant(spec, layer));
+            Op::Linear { weight, quant, .. } => {
+                let kind = weight_kind(quant.resolve(spec, layer));
                 select(spec, target, weight.name(), tokens, kind).ok().map(|c| c.decoder)
             }
             _ => None,
@@ -264,9 +274,9 @@ impl Op {
             Op::NormAdd { .. } => names(&["norm_add"]),
             Op::LogitSoftcap => names(&["logit_softcap"]),
             Op::Clear { .. } => names(&["clear_branch"]),
-            Op::Linear { weight, .. } => {
+            Op::Linear { weight, quant, .. } => {
                 let w = *weight;
-                let kind = weight_kind(w.quant(spec, layer));
+                let kind = weight_kind(quant.resolve(spec, layer));
                 let choice = match select(spec, target, w.name(), tokens, kind) {
                     Ok(c) => c,
                     Err(e) => return vec![format!("unsupported: {e}")],
@@ -439,7 +449,7 @@ mod tests {
     #[test]
     fn linear_kernels_come_from_select() {
         let (spec, _) = described("qwen3-0.6b.config.json", "qwen3-0.6b.json");
-        let op = Op::Linear { weight: Weight::Qkv, input: Buf::XnPlanes, output: Buf::Qkv };
+        let op = Op::Linear { weight: Weight::Qkv, quant: QuantSource::Attn, input: Buf::XnPlanes, output: Buf::Qkv };
         let t = kir::Target { sm_count: 84, ..kir::Target::sm_120() };
         let direct = select(&spec, &t, "qkv", 512, WeightKind::Bf16).unwrap();
         assert_eq!(op.kernels(&spec, 0, 512, &t), vec![direct.name]);
