@@ -175,6 +175,9 @@ fn dispatch_specs() -> Vec<(String, Spec)> {
     for path in files {
         let name = path.strip_prefix(root).unwrap().display().to_string();
         if name.ends_with(".toml") {
+            if name.contains("family-") {
+                continue;
+            }
             out.push((name, Spec::load(&path).unwrap()));
         } else if name.ends_with("config.json") && !name.contains("tokenizer") && path.exists() {
             let json = std::fs::read_to_string(&path).unwrap();
