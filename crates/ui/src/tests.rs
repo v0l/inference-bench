@@ -1354,17 +1354,16 @@ fn two_models_with_one_short_name_show_distinct_names_and_only_the_loaded_one_is
 }
 
 #[test]
-fn the_library_tree_puts_two_quants_under_their_base_and_search_matches_the_base() {
-    let mut h = harness("libtree", Tab::Models);
+fn the_library_list_is_flat_and_search_matches_the_base() {
+    let mut h = harness("libflat", Tab::Models);
     tree_library(h.state_mut());
     h.state_mut().models.show_all = true;
     h.run();
-    let app = h.state();
-    let rows = inference_bench_core::library::tree(&app.library, &[0, 1, 2, 3]);
-    let shape: Vec<(&str, usize)> = rows.iter().map(|r| (r.name.as_str(), r.depth)).collect();
-    assert_eq!(shape[0], ("Qwen/Qwen3.8-27B", 0));
-    assert_eq!(&shape[1..3], [("Qwen/Qwen3.8-27B-FP8", 1), ("orcarouter/Qwen3.8-27B-Uncensored-NVFP4", 1)]);
-    h.get_by_label("find on hugging face");
+    assert!(h.query_by_label("find on hugging face").is_none());
+    assert!(h.query_by_label_contains("group by base model").is_none());
+    assert!(h.query_by_label_contains("not downloaded").is_none());
+    h.get_by_label_contains("Qwen/Qwen3.8-27B-FP8");
+    h.get_by_label_contains("orcarouter/Qwen3.8-27B-Uncensored-NVFP4");
     assert!(models::matches(&h.state().library[1], "Qwen3.8-27B uncensored"));
     assert!(models::matches(&h.state().library[1], "org/none") == false);
     let mut quant = h.state().library[3].clone();
@@ -1398,6 +1397,37 @@ fn the_detail_tree_reads_the_counts_from_the_hub_and_a_count_opens_discover_filt
 }
 
 #[test]
+fn the_detail_tree_shows_the_chain_and_local_siblings_and_a_click_opens_one() {
+    let hub = tree_hub();
+    let mut h = harness("detailsib", Tab::Models);
+    {
+        let app = h.state_mut();
+        tree_library(app);
+        app.models.hub_base = hub;
+        let m = app.library[0].clone();
+        app.models.detail = Some(detail::Detail::open(&m));
+    }
+    pump_until(&mut h, 20, "tree", |a| a.models.detail.as_ref().is_some_and(|d| d.tree.is_some()));
+    let t = h.state().models.detail.as_ref().unwrap().tree.clone().unwrap().unwrap();
+    let rows = detail::lineage_rows(&t.chain, &t.relations, &h.state().library);
+    let shape: Vec<(&str, usize, Option<usize>, bool)> = rows.iter().map(|r| (r.name.as_str(), r.depth, r.local, r.current)).collect();
+    assert_eq!(
+        shape,
+        [
+            ("Qwen/Qwen3.8-27B", 0, None, false),
+            ("orcarouter/Qwen3.8-27B-Uncensored-NVFP4", 1, Some(1), false),
+            ("Qwen/Qwen3.8-27B-FP8", 1, Some(0), true),
+        ]
+    );
+    h.run();
+    h.get_by_label("find on hugging face");
+    h.get_by_label_contains("this model");
+    h.get_by_label("open orcarouter/Qwen3.8-27B-Uncensored-NVFP4").click();
+    h.run();
+    assert_eq!(h.state().models.detail.as_ref().unwrap().model, "orcarouter/Qwen3.8-27B-Uncensored-NVFP4");
+}
+
+#[test]
 #[ignore = "renders pictures; run with SHOTS=/tmp/shots"]
 fn screenshots_of_the_model_tree() {
     let out = PathBuf::from(std::env::var("SHOTS").unwrap_or("/tmp/shots".into()));
@@ -1406,9 +1436,6 @@ fn screenshots_of_the_model_tree() {
     let mut h = harness("treeshot", Tab::Models);
     tree_library(h.state_mut());
     h.state_mut().models.hub_base = hub;
-    h.run();
-    h.render().unwrap().save(out.join("models-tree.png")).unwrap();
-    h.state_mut().models.tree_view = false;
     h.run();
     h.render().unwrap().save(out.join("models-flat.png")).unwrap();
     let m = h.state().library[0].clone();
@@ -1428,7 +1455,7 @@ fn screenshots_of_the_model_tree_with_the_real_hub_cache() {
     h.state_mut().models.show_all = true;
     assert!(!h.state().library.is_empty());
     h.run();
-    h.render().unwrap().save(out.join("real-models-tree.png")).unwrap();
+    h.render().unwrap().save(out.join("real-models-flat.png")).unwrap();
     let pick = std::env::var("PICK").unwrap_or("orcarouter/Qwen3.8-27B-Uncensored-NVFP4".into());
     let m = h.state().library.iter().find(|m| m.name == pick).cloned().unwrap_or_else(|| h.state().library[0].clone());
     h.state_mut().models.detail = Some(detail::Detail::open(&m));

@@ -38,7 +38,6 @@ pub struct ModelsState {
     rescan: bool,
     pub message: Option<(bool, String)>,
     pub detail: Option<crate::detail::Detail>,
-    pub tree_view: bool,
     pub relation: Option<(Relation, String)>,
 }
 
@@ -60,7 +59,6 @@ impl Default for ModelsState {
             rescan: false,
             message: None,
             detail: None,
-            tree_view: true,
             relation: None,
         }
     }
@@ -211,40 +209,7 @@ pub fn is_loaded(app: &App, m: &LocalModel) -> bool {
     app.loaded().is_some_and(|l| l.model_id == m.model_id(NATIVE))
 }
 
-fn base_card(app: &mut App, ui: &mut egui::Ui, name: &str, depth: usize) {
-    ui.horizontal_top(|ui| {
-        ui.add_space(depth as f32 * 22.0);
-        ui.vertical(|ui| {
-            card(
-                ui,
-                None,
-                |ui| {
-                    ui.label(name_job(name, 13.5, true));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        chip(ui, "base model", LEGEND, false);
-                    });
-                },
-                |ui| {
-                    Line::new().note("not downloaded").size(10.5).show(ui);
-                    if ui.add(Key::new("find on hugging face").outline(READOUT).id_salt(("find-base", name))).clicked() {
-                        app.models.query = name.to_string();
-                        app.models.relation = None;
-                        app.models.pane = Pane::Discover;
-                    }
-                },
-            );
-        });
-    });
-}
-
-fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize, depth: usize, relation: Option<Relation>) {
-    ui.horizontal_top(|ui| {
-        ui.add_space(depth as f32 * 22.0);
-        ui.vertical(|ui| model_card_body(app, ui, i, relation));
-    });
-}
-
-fn model_card_body(app: &mut App, ui: &mut egui::Ui, i: usize, relation: Option<Relation>) {
+fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
     let m = app.library[i].clone();
     let loaded = is_loaded(app, &m);
     card(
@@ -254,9 +219,6 @@ fn model_card_body(app: &mut App, ui: &mut egui::Ui, i: usize, relation: Option<
             ui.label(name_job(&m.name, 13.5, false));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 chip(ui, m.format.label(), LEGEND, false);
-                if let Some(r) = relation {
-                    chip(ui, r.label(), READOUT_DIM, false);
-                }
                 if loaded {
                     chip(ui, "loaded", OK, true);
                 }
@@ -382,22 +344,9 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     });
-    let mut grouped = app.models.tree_view;
-    if switch(ui, "group by base model", &mut grouped, "", "") {
-        app.models.tree_view = grouped;
-    }
     specs_bar(app, ui);
-    if app.models.tree_view {
-        for row in inference_bench_core::library::tree(&app.library, &visible) {
-            match row.index {
-                Some(i) => model_card(app, ui, i, row.depth, row.relation),
-                None => base_card(app, ui, &row.name, row.depth),
-            }
-        }
-    } else {
-        for &i in &visible {
-            model_card(app, ui, i, 0, None);
-        }
+    for &i in &visible {
+        model_card(app, ui, i);
     }
     if n == 0 && !app.scan.busy() {
         note(ui, "no models found: download one from discover, or add a folder in settings", LEGEND);

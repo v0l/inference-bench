@@ -127,78 +127,6 @@ pub fn parse_card_lineage(readme: &str) -> Option<(Vec<String>, Option<Relation>
     (!bases.is_empty()).then_some((bases, relation))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeRow {
-    pub index: Option<usize>,
-    pub name: String,
-    pub depth: usize,
-    pub relation: Option<Relation>,
-}
-
-pub fn tree(models: &[LocalModel], shown: &[usize]) -> Vec<TreeRow> {
-    let base_of = |i: usize| models[i].lineage.as_ref().map(|l| l.base().to_string());
-    let holder = |repo: &str| (0..models.len()).find(|&j| !repo.is_empty() && models[j].repo == repo);
-    let mut included: std::collections::BTreeSet<usize> = shown.iter().copied().collect();
-    for &i in shown {
-        let mut at = i;
-        for _ in 0..8 {
-            match base_of(at).and_then(|b| holder(&b)) {
-                Some(parent) if parent != at && included.insert(parent) => at = parent,
-                _ => break,
-            }
-        }
-    }
-    let mut rows = Vec::new();
-    let mut placed = std::collections::BTreeSet::new();
-    let mut phantoms: Vec<String> = Vec::new();
-    for &i in &included {
-        if let Some(b) = base_of(i).filter(|b| holder(b).is_none() && !phantoms.contains(b)) {
-            phantoms.push(b);
-        }
-    }
-    fn walk(
-        models: &[LocalModel],
-        included: &std::collections::BTreeSet<usize>,
-        placed: &mut std::collections::BTreeSet<usize>,
-        rows: &mut Vec<TreeRow>,
-        repo: &str,
-        depth: usize,
-    ) {
-        for &i in included {
-            let Some(l) = &models[i].lineage else { continue };
-            if l.base() != repo || !placed.insert(i) {
-                continue;
-            }
-            rows.push(TreeRow { index: Some(i), name: models[i].name.clone(), depth, relation: Some(l.relation) });
-            if depth < 6 && !models[i].repo.is_empty() {
-                walk(models, included, placed, rows, &models[i].repo.clone(), depth + 1);
-            }
-        }
-    }
-    for phantom in &phantoms {
-        rows.push(TreeRow { index: None, name: phantom.clone(), depth: 0, relation: None });
-        walk(models, &included, &mut placed, &mut rows, phantom, 1);
-    }
-    for &i in &included {
-        let is_root = base_of(i).is_none_or(|b| holder(&b).is_none_or(|p| p == i));
-        if !is_root || placed.contains(&i) {
-            continue;
-        }
-        placed.insert(i);
-        rows.push(TreeRow { index: Some(i), name: models[i].name.clone(), depth: 0, relation: None });
-        let repo = models[i].repo.clone();
-        if !repo.is_empty() {
-            walk(models, &included, &mut placed, &mut rows, &repo, 1);
-        }
-    }
-    for &i in &included {
-        if placed.insert(i) {
-            rows.push(TreeRow { index: Some(i), name: models[i].name.clone(), depth: 0, relation: None });
-        }
-    }
-    rows
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalModel {
     pub name: String,
@@ -1182,37 +1110,4 @@ mod tests {
         assert_eq!(models[0].lineage.as_ref().unwrap().relation, Relation::Quantized);
     }
 
-    #[test]
-    fn the_tree_groups_two_quants_under_a_base_that_is_not_downloaded() {
-        let hub = temp("tree");
-        for (repo, extra) in [("a/Base-FP8", ""), ("b/Base-NVFP4", ""), ("c/Other", "")] {
-            let snap = hf_model(&hub, repo, r#"{"architectures":["X"],"quantization_config":{"quant_method":"fp8"}}"#);
-            if repo != "c/Other" {
-                with_card(&snap, &format!("---\nbase_model: org/Base{extra}\n---\n"));
-            }
-        }
-        let models = scan_hub(&hub);
-        let all: Vec<usize> = (0..models.len()).collect();
-        let rows = tree(&models, &all);
-        let names: Vec<(&str, usize)> = rows.iter().map(|r| (r.name.as_str(), r.depth)).collect();
-        assert_eq!(names[0], ("org/Base", 0));
-        assert_eq!(rows[0].index, None);
-        assert_eq!(&names[1..3], [("a/Base-FP8", 1), ("b/Base-NVFP4", 1)]);
-        assert_eq!(rows[1].relation, Some(Relation::Quantized));
-        assert_eq!(names[3], ("c/Other", 0));
-    }
-
-    #[test]
-    fn a_downloaded_base_is_the_parent_row_of_its_derivatives() {
-        let hub = temp("tree-local");
-        hf_model(&hub, "org/Base", r#"{"architectures":["X"],"torch_dtype":"bfloat16"}"#);
-        let q = hf_model(&hub, "a/Base-FP8", r#"{"architectures":["X"],"quantization_config":{"quant_method":"fp8"}}"#);
-        with_card(&q, "---\nbase_model: org/Base\n---\n");
-        let models = scan_hub(&hub);
-        let quant = models.iter().position(|m| m.name == "a/Base-FP8").unwrap();
-        let rows = tree(&models, &[quant]);
-        let names: Vec<(&str, usize)> = rows.iter().map(|r| (r.name.as_str(), r.depth)).collect();
-        assert_eq!(names, [("org/Base", 0), ("a/Base-FP8", 1)]);
-        assert!(rows[0].index.is_some());
-    }
 }

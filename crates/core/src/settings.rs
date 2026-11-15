@@ -194,6 +194,12 @@ mod tests {
     }
 
     #[test]
+    fn an_old_settings_file_with_tree_view_still_loads() {
+        let s = Settings::parse(r#"{"tree_view": true, "default_ctx": 4096}"#);
+        assert_eq!(s.default_ctx, 4096);
+    }
+
+    #[test]
     fn an_old_settings_file_with_a_global_context_and_bandwidth_still_loads() {
         let old = r#"{
             "endpoints": [{"label": "vllm", "backend": "vllm", "url": "http://127.0.0.1:8000", "api_key": "k"}],

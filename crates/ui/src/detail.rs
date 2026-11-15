@@ -214,10 +214,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if !back {
         pump_tree(app, &mut detail);
         let free = app.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes));
-        let mut open = None;
+        let mut act = TreeAction::default();
         let running = app.engine.loaded().filter(|l| l.display == detail.model);
-        body(&mut detail, ui, free, &mut open, running.as_ref());
-        if let Some((relation, of)) = open {
+        body(&mut detail, &app.library, ui, free, &mut act, running.as_ref());
+        if let Some(i) = act.open.filter(|i| *i < app.library.len()) {
+            app.models.detail = Some(Detail::open(&app.library[i]));
+            return;
+        }
+        if let Some(name) = act.find {
+            app.models.query = name;
+            app.models.relation = None;
+            app.models.pane = crate::models::Pane::Discover;
+            app.models.detail = None;
+            return;
+        }
+        if let Some((relation, of)) = act.discover {
             let token = app.settings.hf_token.clone();
             let wake = app.wake.clone();
             app.models.discover_relation(&wake, &token, relation, &of);
@@ -245,23 +256,81 @@ fn pump_tree(app: &mut App, detail: &mut Detail) {
     }));
 }
 
-fn tree_section(detail: &Detail, ui: &mut egui::Ui, open: &mut Option<(Relation, String)>) {
+#[derive(Default)]
+struct TreeAction {
+    discover: Option<(Relation, String)>,
+    find: Option<String>,
+    open: Option<usize>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct LineageRow {
+    pub name: String,
+    pub depth: usize,
+    pub relation: Option<String>,
+    pub local: Option<usize>,
+    pub current: bool,
+}
+
+pub fn lineage_rows(chain: &[String], relations: &[String], library: &[LocalModel]) -> Vec<LineageRow> {
+    let held = |repo: &str| library.iter().position(|m| !repo.is_empty() && m.repo == repo);
+    let mut rows = Vec::new();
+    let n = chain.len();
+    for k in 0..n {
+        let at = n - 1 - k;
+        let name = &chain[at];
+        rows.push(LineageRow {
+            name: name.clone(),
+            depth: k,
+            relation: (k > 0).then(|| relations.get(at).cloned().unwrap_or_default()),
+            local: held(name),
+            current: at == 0,
+        });
+        let next = at.checked_sub(1).map(|a| chain[a].as_str());
+        for (i, m) in library.iter().enumerate() {
+            let Some(l) = &m.lineage else { continue };
+            if l.base() != name || m.repo.is_empty() || m.repo == *name || Some(m.repo.as_str()) == next || chain.contains(&m.repo) {
+                continue;
+            }
+            rows.push(LineageRow { name: m.repo.clone(), depth: k + 1, relation: Some(l.relation.label().to_string()), local: Some(i), current: false });
+        }
+    }
+    rows
+}
+
+fn tree_section(detail: &Detail, library: &[LocalModel], ui: &mut egui::Ui, act: &mut TreeAction) {
     if detail.repo.is_empty() {
         return;
     }
-    section(ui, "model tree", "where this model comes from, and what others were made from its base", |ui| {
+    section(ui, "model tree", "where this model comes from, and what else you downloaded from its base", |ui| {
         match &detail.tree {
             None => note(ui, "looking up the base model", LEGEND),
             Some(Err(e)) => status(ui, false, e),
             Some(Ok(t)) => {
-                for (depth, name) in t.chain.iter().enumerate() {
+                for (n, row) in lineage_rows(&t.chain, &t.relations, library).iter().enumerate() {
                     ui.horizontal(|ui| {
-                        ui.add_space(depth as f32 * 18.0);
-                        if depth > 0 {
-                            let relation = t.relations.get(depth - 1).cloned().unwrap_or_default();
-                            chip(ui, &relation, READOUT_DIM, false);
+                        ui.add_space(row.depth as f32 * 18.0);
+                        if let Some(relation) = &row.relation {
+                            chip(ui, relation, READOUT_DIM, false);
                         }
-                        ui.label(crate::models::name_job(name, 12.5, false));
+                        let dim = row.local.is_none() && !row.current;
+                        let label = ui.add(egui::Label::new(crate::models::name_job(&row.name, 12.5, dim)).sense(egui::Sense::click()));
+                        if let (Some(i), false) = (row.local, row.current) {
+                            let text = format!("open {}", row.name);
+                            label.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, text.clone()));
+                            if label.clicked() {
+                                act.open = Some(i);
+                            }
+                        }
+                        if row.current {
+                            let r = chip(ui, "this model", READOUT, true);
+                            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "this model"));
+                        } else if dim {
+                            Line::new().note("not downloaded").size(10.5).show(ui);
+                            if ui.add(Key::new("find on hugging face").outline(READOUT).id_salt(("find-base", n))).clicked() {
+                                act.find = Some(row.name.clone());
+                            }
+                        }
                     });
                 }
                 if t.chain.len() == 1 {
@@ -273,7 +342,7 @@ fn tree_section(detail: &Detail, ui: &mut egui::Ui, open: &mut Option<(Relation,
                         let Some(relation) = Relation::parse(label) else { continue };
                         let text = format!("{} {n}", relation.plural());
                         if ui.add(Key::new(text).outline(READOUT).id_salt(("tree-count", label))).clicked() {
-                            *open = Some((relation, top.clone()));
+                            act.discover = Some((relation, top.clone()));
                         }
                     }
                 });
@@ -282,13 +351,13 @@ fn tree_section(detail: &Detail, ui: &mut egui::Ui, open: &mut Option<(Relation,
     });
 }
 
-fn body(detail: &mut Detail, ui: &mut egui::Ui, free: Option<u64>, open: &mut Option<(Relation, String)>, running: Option<&inference_bench_core::engine::Loaded>) {
+fn body(detail: &mut Detail, library: &[LocalModel], ui: &mut egui::Ui, free: Option<u64>, act: &mut TreeAction, running: Option<&inference_bench_core::engine::Loaded>) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
         if let Some(l) = running {
             crate::running::draw(ui, l);
         }
-        tree_section(detail, ui, open);
+        tree_section(detail, library, ui, act);
         content(detail, ui, free);
     });
 }
