@@ -1,0 +1,70 @@
+name = "dense"
+kind = "graph"
+
+[[head]]
+op = "embed"
+out = "x"
+
+[[block]]
+name = "attention"
+layers = ["dense", "full", "sliding"]
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+in = "x"
+out = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+in = "xn_planes"
+out = "qkv"
+
+[[block.node]]
+op = "kv_rope"
+phase = "prefill"
+
+[[block.node]]
+op = "flash"
+phase = "prefill"
+
+[[block.node]]
+op = "decode_attention"
+phase = "decode"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+in = "attn_planes"
+out = "x"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+in = "x"
+out = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+in = "xn_planes"
+out = "act_planes"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+in = "act_planes"
+out = "x"
+
+[[tail]]
+op = "rmsnorm"
+weight = "norm.weight"
+in = "x"
+out = "xn_planes"
+
+[[tail]]
+op = "linear"
+weight = "lm_head"
+in = "xn_planes"
+out = "logits"
