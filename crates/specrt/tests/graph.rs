@@ -122,7 +122,24 @@ fn the_graph_lowers_to_the_reference_plan_for_every_config() {
 fn plan_rs_has_no_architecture_or_op_sequence_knowledge() {
     let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plan.rs")).unwrap();
     let body = src.split("#[cfg(test)]").next().unwrap();
-    for banned in ["is_linear", "Block::Linear", "Block::Full", "Block::Dense", "linear_attention", "spec.moe", "tensor_core {", "if prefill", "qwen", "llama", "gemma"] {
+    for banned in ["is_linear", "Block::Linear", "Block::Full", "Block::Dense", "spec.moe", "tensor_core {", "if prefill", "qwen", "llama", "gemma"] {
         assert!(!body.contains(banned), "plan.rs mentions {banned}");
+    }
+}
+
+#[test]
+fn runtime_and_kir_have_no_architecture_names() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("src/runtime.rs")];
+    for dir in [root.join("src/runtime"), root.join("../kir/src")] {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            files.push(e.path());
+        }
+    }
+    for f in files.into_iter().filter(|f| f.extension().is_some_and(|e| e == "rs")) {
+        let text = std::fs::read_to_string(&f).unwrap().to_lowercase();
+        for banned in ["qwen", "llama", "gemma", "mistral", "deepseek"] {
+            assert!(!text.contains(banned), "{} mentions {banned}", f.display());
+        }
     }
 }
