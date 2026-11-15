@@ -135,6 +135,22 @@ named in `deepstack_visual_indexes`), so the engine tab can draw the tower from 
   until a 40 token text request has finished; with the old in-submit encoding it times out),
   `media_encode::tests` (cache hit, LRU bound, one encoder call for a burst, a bad request failing
   alone).
+- Classify replay (#606 set: 29 property photos, mostly 960x1280, 16 output tokens, 8 concurrent
+  clients, streamed; orcarouter/Qwen3.8-27B-Uncensored-NVFP4, 8 slots, 8 GB KV, max batched tokens
+  2048; quiet RTX PRO 6000, `/mnt/data/tmp/inference-bench-498/replay.sh`):
+
+  | run | req/min | TTFT p50 | TTFT p95 | over 90 s | encoder calls |
+  |---|---|---|---|---|---|
+  | master, first pass | 10.7 | 12.3 s | 35.3 s | 0 | 29 (265 s of encoding) |
+  | master, same images again | 10.7 | 12.2 s | 36.7 s | 0 | 29 |
+  | branch, first pass | 58.3 | 3.07 s | 6.14 s | 0 | 23 (about 1.6 s) |
+  | branch, same images again | 59.6 | 2.82 s | 5.94 s | 0 | 0 |
+
+  What is left of TTFT is LM prefill: each request is 956 to 1,826 prompt tokens, about 1,200 of
+  them vision tokens, and the server prefills at about 1,500 tokens/s whether the images come
+  from the cache or not, so 8 concurrent requests queue behind about 6 s of prefill. That is the
+  prefill phase of the parity plan, not the encoder. Greedy answers on four classify photos are
+  byte-identical to master with `precision = "fast"`.
 
 ## LM integration (slice 3, done)
 
