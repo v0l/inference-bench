@@ -15,6 +15,7 @@ pub mod jit;
 pub mod link;
 pub mod loader;
 pub mod logprobs;
+pub mod media_encode;
 pub mod mtp;
 pub mod nvfp4;
 pub mod options;

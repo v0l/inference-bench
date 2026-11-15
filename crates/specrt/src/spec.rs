@@ -131,6 +131,28 @@ pub struct RuntimeOptions {
     pub prefix_cache: PrefixCacheOptions,
     #[serde(skip_serializing_if = "crate::loader::LoaderOptions::is_default")]
     pub loader: crate::loader::LoaderOptions,
+    #[serde(skip_serializing_if = "VisionOptions::is_default")]
+    pub vision: VisionOptions,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisionOptions {
+    pub precision: crate::vision_encoder::VisionPrecision,
+    pub cache_mb: usize,
+    pub max_batch: usize,
+}
+
+impl Default for VisionOptions {
+    fn default() -> Self {
+        VisionOptions { precision: crate::vision_encoder::VisionPrecision::Fast, cache_mb: 512, max_batch: 8 }
+    }
+}
+
+impl VisionOptions {
+    pub fn is_default(&self) -> bool {
+        *self == VisionOptions::default()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +189,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 
@@ -179,6 +201,7 @@ impl RuntimeOptions {
     fn validate(&self) -> Result<()> {
         self.prefix_cache.validate()?;
         self.loader.validate()?;
+        ensure!(self.vision.max_batch >= 1, "[runtime.vision] max_batch needs at least 1");
         ensure!(self.fp4_stages.is_none_or(|n| n >= 2), "[runtime] fp4_stages needs at least 2");
         ensure!(self.prefill_chunk.is_none_or(|n| n >= 64), "[runtime] prefill_chunk needs at least 64 tokens");
         for (key, tile) in [("big_tile", self.big_tile), ("fp4_tile", self.fp4_tile)] {

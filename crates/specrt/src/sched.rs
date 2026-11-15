@@ -135,6 +135,9 @@ pub trait Executor {
     fn set_media(&mut self, _slot: usize, _plan: Option<&crate::vision::MediaPlan>) -> Result<()> {
         Ok(())
     }
+    fn media_encoder(&self) -> Option<Arc<crate::media_encode::MediaEncoder>> {
+        None
+    }
     fn hybrid(&self) -> bool {
         false
     }
@@ -279,6 +282,10 @@ impl Executor for GpuExecutor {
 
     fn plan_media(&mut self, prompt: &[u32], media: &[MediaInput]) -> Result<Arc<crate::vision::MediaPlan>> {
         self.rt.plan_media(prompt, media)
+    }
+
+    fn media_encoder(&self) -> Option<Arc<crate::media_encode::MediaEncoder>> {
+        self.rt.media_encoder()
     }
 
     fn set_media(&mut self, slot: usize, plan: Option<&crate::vision::MediaPlan>) -> Result<()> {
@@ -598,6 +605,10 @@ impl<E: Executor> Scheduler<E> {
     }
 
     pub fn submit(&mut self, req: Request) -> Result<SeqId> {
+        self.submit_planned(req, None)
+    }
+
+    pub fn check(&self, req: &Request) -> Result<()> {
         let max_ctx = self.exec.max_ctx();
         if req.prompt.is_empty() || req.max_tokens == 0 {
             bail!("empty prompt or nothing to generate");
@@ -620,6 +631,11 @@ impl<E: Executor> Scheduler<E> {
         if req.grammar.is_some() && !self.exec.supports_grammar() {
             bail!("structured output is not available on this executor");
         }
+        Ok(())
+    }
+
+    pub fn submit_planned(&mut self, req: Request, plan: Option<Arc<crate::vision::MediaPlan>>) -> Result<SeqId> {
+        self.check(&req)?;
         let id = self.next_id;
         self.next_id += 1;
         let cursor = req.grammar.as_ref().map(|g| g.cursor());
@@ -628,7 +644,10 @@ impl<E: Executor> Scheduler<E> {
         let (media, keys) = if req.media.is_empty() {
             (None, tokens.clone())
         } else {
-            let plan = self.exec.plan_media(&req.prompt, &req.media)?;
+            let plan = match plan {
+                Some(p) => p,
+                None => self.exec.plan_media(&req.prompt, &req.media)?,
+            };
             let keys = tokens.iter().zip(&plan.tags).map(|(&t, &tag)| if tag != 0 { tag } else { t }).collect();
             (Some(plan), keys)
         };

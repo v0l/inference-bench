@@ -649,7 +649,7 @@ pub struct Runtime {
     mm_meta: CudaSlice<i32>,
     mm_table: CudaSlice<i32>,
     media: Vec<Option<MediaDevice>>,
-    vision: Option<crate::vision_encoder::VisionEncoder>,
+    vision: Option<Arc<crate::media_encode::MediaEncoder>>,
 }
 
 struct MediaDevice {
@@ -964,7 +964,10 @@ impl Runtime {
         }
         if let Some(v) = &spec.vision {
             if spec.rope.mrope.is_some() && checkpoint.has("model.visual.patch_embed.proj.weight") {
-                rt.vision = Some(crate::vision_encoder::VisionEncoder::load(&rt.ctx, &rt.stream, &jit, &checkpoint, &v.config)?);
+                let opts = spec.runtime.vision;
+                let stream = rt.ctx.new_stream()?;
+                let enc = crate::vision_encoder::VisionEncoder::load_with(&rt.ctx, &stream, &jit, &checkpoint, &v.config, opts.precision)?;
+                rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::new(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, opts)));
                 checkpoint.release();
             }
         }
@@ -2003,19 +2006,11 @@ impl Runtime {
 
     pub fn plan_media(&mut self, prompt: &[u32], media: &[crate::sched::MediaInput]) -> Result<Arc<crate::vision::MediaPlan>> {
         let enc = self.vision.as_ref().context("this model was loaded without a vision encoder")?;
-        let vis = self.spec.vision.as_ref().context("the spec has no vision config")?;
-        let merge = vis.config.spatial_merge_size;
-        let processed: Vec<crate::vision::Processed> = media.iter().map(|m| m.processed.clone()).collect();
-        let hashes: Vec<[u8; 32]> = media.iter().map(|m| m.hash).collect();
-        let mut plan = crate::vision::plan_media(prompt, &vis.tokens, merge, &processed, &hashes)?;
-        let mut embeds = Vec::new();
-        for p in &processed {
-            let started = std::time::Instant::now();
-            embeds.extend(enc.encode(p.patches())?.embeds);
-            tracing::info!(grid = ?p.patches().grid, encode_ms = started.elapsed().as_secs_f64() * 1e3, "vision encode");
-        }
-        plan.embeds = Arc::new(embeds);
-        Ok(Arc::new(plan))
+        Ok(Arc::new(enc.plan(prompt, media)?))
+    }
+
+    pub fn media_encoder(&self) -> Option<Arc<crate::media_encode::MediaEncoder>> {
+        self.vision.clone()
     }
 
     pub fn set_media(&mut self, slot: usize, plan: Option<&crate::vision::MediaPlan>) -> Result<()> {

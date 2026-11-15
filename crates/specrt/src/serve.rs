@@ -554,6 +554,88 @@ pub fn slot_state_bytes(spec: &Spec) -> u64 {
     }
 }
 
+struct Encoded {
+    job: Job,
+    plan: Result<Arc<crate::vision::MediaPlan>>,
+}
+
+struct EncodeLane {
+    jobs: Option<Sender<Job>>,
+    done: Receiver<Encoded>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    pending: usize,
+}
+
+impl EncodeLane {
+    fn start(encoder: Arc<crate::media_encode::MediaEncoder>) -> Result<Self> {
+        let (jobs, inbox) = channel::<Job>();
+        let (done_tx, done) = channel::<Encoded>();
+        let thread = std::thread::Builder::new()
+            .name("specrt-vision".into())
+            .spawn(move || {
+                while let Ok(first) = inbox.recv() {
+                    let mut batch = vec![first];
+                    while let Ok(j) = inbox.try_recv() {
+                        batch.push(j);
+                    }
+                    let (gone, keep): (Vec<Job>, Vec<Job>) = batch.into_iter().partition(|j| j.cancel.load(Ordering::Relaxed));
+                    for job in gone {
+                        if done_tx.send(Encoded { job, plan: Err(anyhow::anyhow!(CANCELLED_BEFORE_ENCODE)) }).is_err() {
+                            return;
+                        }
+                    }
+                    let requests: Vec<crate::media_encode::MediaRequest> =
+                        keep.iter().map(|j| crate::media_encode::MediaRequest { prompt: &j.request.prompt, media: &j.request.media }).collect();
+                    let plans = encoder.plan_batch(&requests);
+                    drop(requests);
+                    for (job, plan) in keep.into_iter().zip(plans) {
+                        if done_tx.send(Encoded { job, plan: plan.map(Arc::new) }).is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+            .context("vision encode thread")?;
+        Ok(EncodeLane { jobs: Some(jobs), done, thread: Some(thread), pending: 0 })
+    }
+
+    fn send(&mut self, job: Job) {
+        self.pending += 1;
+        if let Some(tx) = &self.jobs {
+            let _ = tx.send(job);
+        }
+    }
+
+    fn ready(&mut self, wait: Option<Duration>) -> Vec<Encoded> {
+        let mut out = Vec::new();
+        if let Some(d) = wait.filter(|_| self.pending > 0)
+            && let Ok(e) = self.done.recv_timeout(d)
+        {
+            out.push(e);
+        }
+        while let Ok(e) = self.done.try_recv() {
+            out.push(e);
+        }
+        self.pending -= out.len();
+        out
+    }
+}
+
+impl Drop for EncodeLane {
+    fn drop(&mut self) {
+        self.jobs = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+const CANCELLED_BEFORE_ENCODE: &str = "cancelled before encoding";
+
+fn cancelled(job: &Job) {
+    let _ = job.events.send(SeqEvent::Finished { finish: Finish::Cancelled, prompt_tokens: 0, completion_tokens: 0, cached_tokens: 0 });
+}
+
 fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>, pulse: Arc<Pulse>) {
     let mut live: HashMap<SeqId, Live> = HashMap::new();
     let mut open = true;
@@ -561,8 +643,21 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         let mut s = stats.lock().unwrap();
         s.kv_blocks_total = sched.blocks_total();
     }
-    while open || !live.is_empty() {
-        let first = if live.is_empty() {
+    let mut lane = match sched.exec.media_encoder().map(EncodeLane::start) {
+        Some(Ok(l)) => Some(l),
+        Some(Err(e)) => {
+            tracing::error!(error = %format!("{e:#}"), "no vision encode thread, encoding on the engine thread");
+            None
+        }
+        None => None,
+    };
+    let encoding = |lane: &Option<EncodeLane>| lane.as_ref().map_or(0, |l| l.pending);
+    while open || !live.is_empty() || encoding(&lane) > 0 {
+        let mut ready: Vec<Encoded> = Vec::new();
+        if let Some(l) = lane.as_mut() {
+            ready = l.ready(live.is_empty().then_some(Duration::from_millis(20)));
+        }
+        let first = if live.is_empty() && ready.is_empty() && encoding(&lane) == 0 {
             match inbox.recv_timeout(Duration::from_millis(50)) {
                 Ok(j) => Some(j),
                 Err(RecvTimeoutError::Timeout) => None,
@@ -587,12 +682,36 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         }
         for job in incoming {
             if job.cancel.load(Ordering::Relaxed) {
-                let _ = job.events.send(SeqEvent::Finished { finish: Finish::Cancelled, prompt_tokens: 0, completion_tokens: 0, cached_tokens: 0 });
+                cancelled(&job);
+                continue;
+            }
+            if let Some(l) = lane.as_mut().filter(|_| !job.request.media.is_empty()) {
+                match sched.check(&job.request) {
+                    Ok(()) => l.send(job),
+                    Err(e) => {
+                        let _ = job.events.send(SeqEvent::Failed(format!("{e:#}")));
+                    }
+                }
                 continue;
             }
             pulse.enter();
             let submitted = sched.submit(job.request);
             pulse.leave();
+            match submitted {
+                Ok(id) => {
+                    live.insert(id, Live { events: job.events, cancel: job.cancel, last_token: None });
+                }
+                Err(e) => {
+                    let _ = job.events.send(SeqEvent::Failed(format!("{e:#}")));
+                }
+            }
+        }
+        for Encoded { job, plan } in ready {
+            if job.cancel.load(Ordering::Relaxed) {
+                cancelled(&job);
+                continue;
+            }
+            let submitted = plan.and_then(|p| sched.submit_planned(job.request, Some(p)));
             match submitted {
                 Ok(id) => {
                     live.insert(id, Live { events: job.events, cancel: job.cancel, last_token: None });
@@ -608,7 +727,7 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         for id in gone {
             sched.cancel(id, &mut events);
         }
-        if !open && live.is_empty() {
+        if !open && live.is_empty() && encoding(&lane) == 0 {
             break;
         }
         if let Some(reason) = sched.exec.refresh() {
@@ -694,7 +813,7 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
             }
         }
         s.running = sched.running();
-        s.waiting = sched.waiting();
+        s.waiting = sched.waiting() + encoding(&lane);
         s.kv_blocks_used = sched.blocks_used();
         s.preemptions = sched.preemptions();
         s.chain = sched.chain_metrics();
@@ -1023,6 +1142,114 @@ mod watchdog_tests {
         }
         assert!(matches!(stays_rx.try_recv().unwrap(), SeqEvent::Failed(_)));
         assert_eq!(plans.load(Ordering::SeqCst), 1, "only the live request may reach the vision encoder");
+    }
+
+    struct HeldEncoder {
+        release: Arc<AtomicBool>,
+        started: Arc<AtomicBool>,
+    }
+
+    impl crate::media_encode::EncodeImages for HeldEncoder {
+        fn encode_images(&self, items: &[&crate::vision::Patches]) -> Result<Vec<Vec<f32>>> {
+            self.started.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(items.iter().map(|p| vec![0.5; p.grid.iter().product::<usize>() / 4 * 8]).collect())
+        }
+    }
+
+    struct VisionExec {
+        encoder: Arc<crate::media_encode::MediaEncoder>,
+    }
+
+    impl Executor for VisionExec {
+        fn max_ctx(&self) -> usize {
+            4096
+        }
+        fn slots(&self) -> usize {
+            2
+        }
+        fn kv_blocks(&self) -> usize {
+            64
+        }
+        fn chunk_limit(&self) -> usize {
+            64
+        }
+        fn set_table(&mut self, _slot: usize, _blocks: &[u32]) -> Result<()> {
+            Ok(())
+        }
+        fn prefill(&mut self, _slot: usize, _tokens: &[u32], _start: usize, _sample: Option<(crate::runtime::Sampling, u32)>) -> Result<Option<u32>> {
+            Ok(Some(1))
+        }
+        fn decode(&mut self, rows: &[crate::runtime::DecodeRow]) -> Result<Vec<u32>> {
+            Ok(vec![1; rows.len()])
+        }
+        fn plan_media(&mut self, _prompt: &[u32], _media: &[sched::MediaInput]) -> Result<Arc<crate::vision::MediaPlan>> {
+            anyhow::bail!("the engine thread must not encode")
+        }
+        fn media_encoder(&self) -> Option<Arc<crate::media_encode::MediaEncoder>> {
+            Some(self.encoder.clone())
+        }
+    }
+
+    #[test]
+    fn decode_keeps_stepping_while_an_image_encodes() {
+        let release = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let tokens = crate::vision::VisionTokens { image: 9, video: 10, start: 11, end: 12 };
+        let encoder = crate::media_encode::MediaEncoder::new(
+            Box::new(HeldEncoder { release: release.clone(), started: started.clone() }),
+            tokens,
+            2,
+            crate::spec::VisionOptions::default(),
+        );
+        let mut sched = Scheduler::new(VisionExec { encoder: Arc::new(encoder) }, Config::default());
+        let (tx, inbox) = channel::<Job>();
+        let (mut image, image_rx) = job();
+        image.request.prompt = vec![1, 11, 9, 9, 9, 9, 12, 2];
+        image.request.max_tokens = 4;
+        image.request.media = vec![sched::MediaInput {
+            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 4, 4], data: vec![0.0; 16] }),
+            hash: [3; 32],
+        }];
+        tx.send(image).unwrap();
+        let engine = std::thread::spawn(move || run(&mut sched, inbox, Arc::new(Mutex::new(Stats::default())), Arc::new(Pulse::new())));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !started.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the encoder never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (mut text, text_rx) = job();
+        text.request.max_tokens = 40;
+        tx.send(text).unwrap();
+        let mut generated = 0;
+        loop {
+            match text_rx.recv_timeout(Duration::from_secs(5)).expect("the text request must finish while the image is still encoding") {
+                SeqEvent::Token(_) => generated += 1,
+                SeqEvent::Finished { completion_tokens, .. } => {
+                    assert_eq!(completion_tokens, 40);
+                    break;
+                }
+                SeqEvent::Failed(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        assert_eq!(generated, 40);
+        assert!(image_rx.try_recv().is_err(), "the image request is still encoding");
+        release.store(true, Ordering::SeqCst);
+        loop {
+            match image_rx.recv_timeout(Duration::from_secs(5)).expect("the image request finishes once encoded") {
+                SeqEvent::Finished { completion_tokens, .. } => {
+                    assert_eq!(completion_tokens, 4);
+                    break;
+                }
+                SeqEvent::Failed(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        drop(tx);
+        engine.join().unwrap();
     }
 
     #[test]

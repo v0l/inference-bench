@@ -254,6 +254,9 @@ const META: &[Meta] = &[
     Meta { key: "runtime.prefill_chunk", label: "prefill chunk", group: Group::Runtime, help: "Tokens read per prefill pass. Auto sizes it from memory.", choices: &[], range: (16, 1 << 20) },
     Meta { key: "runtime.unsplit", label: "unsplit ops", group: Group::Runtime, help: "Names of fused operations to keep whole instead of splitting across the batch.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.gemm_fp32", label: "fp32 accumulate", group: Group::Runtime, help: "Accumulate matrix multiplies in fp32 on the plain path. Slower, for debugging.", choices: &[], range: (0, 0) },
+    Meta { key: "runtime.vision.precision", label: "vision precision", group: Group::Runtime, help: "Arithmetic of the image encoder. fast runs f16 tensor cores; exact splits every value into two halves and matches transformers in f32 at about twice the time.", choices: &["fast", "exact"], range: (0, 0) },
+    Meta { key: "runtime.vision.cache_mb", label: "vision cache", group: Group::Runtime, help: "Host memory for encoded images, keyed by the image bytes, so a repeated image is not encoded again. 0 turns it off.", choices: &[], range: (0, 1 << 20) },
+    Meta { key: "runtime.vision.max_batch", label: "vision batch", group: Group::Runtime, help: "Images encoded together in one pass of the image encoder.", choices: &[], range: (1, 64) },
     Meta { key: "runtime.kv_dtype", label: "kv cache type", group: Group::Runtime, help: "Precision of the KV cache. fp8 stores one byte per value with a scale per head and token, halving KV memory and attention reads against f16.", choices: &["f16", "fp8"], range: (0, 0) },
     Meta { key: "runtime.cache_dir", label: "kernel cache", group: Group::Runtime, help: "Where compiled kernels are kept. Auto uses the user cache folder.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.loader.enabled", label: "fast loader", group: Group::Loader, help: "Read weights with parallel readers straight to the card.", choices: &[], range: (0, 0) },
@@ -303,6 +306,7 @@ fn populated_runtime() -> RuntimeOptions {
         cache_dir: Some("x".into()),
         prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: 16, max_snapshots: 1, max_blocks: 1, async_snapshots: true },
         loader: LoaderOptions { enabled: true, direct: true, chunk_mb: 1, readers: 1, ahead: 1, workers: 1, lanes: 1, skip_cached: true, pinned: true, host_budget_mb: 64 },
+        vision: crate::spec::VisionOptions { precision: crate::vision_encoder::VisionPrecision::Exact, cache_mb: 1, max_batch: 1 },
     }
 }
 

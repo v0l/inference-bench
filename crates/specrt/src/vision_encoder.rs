@@ -22,6 +22,7 @@ fn flash_smem(head_dim: usize) -> u32 {
     (2 * 128 * stride * 2).max(2 * 4 * 32 * stride * 2) as u32
 }
 pub const MAX_ENCODE_PATCHES: usize = 32768;
+pub const WORKSPACE_PATCHES: usize = 4800;
 
 const LAYERNORM_EPS: f32 = 1e-6;
 const ROPE_THETA: f32 = 10000.0;
@@ -144,6 +145,7 @@ pub struct VisionEncoder {
     blocks: Vec<Block>,
     merger: Merger,
     deepstack: Vec<Merger>,
+    workspace: std::sync::Mutex<Workspace>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -295,6 +297,41 @@ pub fn rope_tables(grid: [usize; 3], merge: usize, head_dim: usize) -> (Vec<f32>
     (cos, sin)
 }
 
+struct Workspace {
+    patches: usize,
+    input: CudaSlice<f32>,
+    x: CudaSlice<f32>,
+    qkv: CudaSlice<f32>,
+    packed: CudaSlice<u16>,
+    xn: Planes,
+    att: Planes,
+    mid: Planes,
+    scratch: Planes,
+    up: Planes,
+    out: CudaSlice<f32>,
+}
+
+impl Workspace {
+    fn new(s: &Arc<CudaStream>, cfg: &VisionConfig, patch_cols: usize, patches: usize) -> Result<Self> {
+        let hidden = cfg.hidden_size;
+        let unit = cfg.spatial_merge_size * cfg.spatial_merge_size;
+        let hdp = head_pad(hidden / cfg.num_heads);
+        Ok(Workspace {
+            patches,
+            input: unsafe { s.alloc::<f32>(patches * patch_cols) }?,
+            x: unsafe { s.alloc::<f32>(patches * hidden) }?,
+            qkv: unsafe { s.alloc::<f32>(patches * 3 * hidden) }?,
+            packed: unsafe { s.alloc::<u16>(6 * cfg.num_heads * patches * hdp) }?,
+            xn: Planes::new(s, patches * hidden)?,
+            att: Planes::new(s, patches * hidden)?,
+            mid: Planes::new(s, patches * cfg.intermediate_size.max(patch_cols).max(hidden))?,
+            scratch: Planes::new(s, patches * hidden)?,
+            up: Planes::new(s, patches * hidden)?,
+            out: unsafe { s.alloc::<f32>(patches / unit * cfg.out_hidden_size) }?,
+        })
+    }
+}
+
 struct BatchLayout {
     tokens: usize,
     taps: Vec<i32>,
@@ -357,7 +394,7 @@ impl VisionEncoder {
         }
         if !precise {
             let to_f16 = loaded.function("vis_to_f16")?;
-            let mut convert = |w: &mut CudaSlice<u16>| -> Result<()> {
+            let convert = |w: &mut CudaSlice<u16>| -> Result<()> {
                 let n = w.len() as i32;
                 let mut b = stream.launch_builder(&to_f16);
                 b.arg(w).arg(&n);
@@ -375,8 +412,10 @@ impl VisionEncoder {
                 convert(&mut m.down.w)?;
             }
         }
+        let workspace = std::sync::Mutex::new(Workspace::new(stream, cfg, patch_cols, WORKSPACE_PATCHES)?);
         stream.synchronize()?;
         Ok(VisionEncoder {
+            workspace,
             stream: stream.clone(),
             mma,
             split: loaded.function("vis_split")?,
@@ -441,7 +480,7 @@ impl VisionEncoder {
         Ok(())
     }
 
-    fn run_merger(&self, m: &Merger, x: &CudaSlice<f32>, tokens: usize, scratch: &mut Planes, up: &mut Planes) -> Result<Vec<f32>> {
+    fn run_merger(&self, m: &Merger, x: &CudaSlice<f32>, tokens: usize, scratch: &mut Planes, up: &mut Planes, out: &mut CudaSlice<f32>) -> Result<Vec<f32>> {
         let unit = self.cfg.spatial_merge_size * self.cfg.spatial_merge_size;
         let merged_rows = tokens / unit;
         if m.post_shuffle_norm {
@@ -450,9 +489,11 @@ impl VisionEncoder {
             self.layernorm(x, &m.norm, scratch, tokens, self.cfg.hidden_size)?;
         }
         self.gemm(&m.up, scratch, Out::Split(up), merged_rows, Act::GeluErf)?;
-        let mut out = unsafe { self.stream.alloc::<f32>(merged_rows * self.cfg.out_hidden_size) }?;
-        self.gemm(&m.down, up, Out::Store(&mut out), merged_rows, Act::None)?;
-        Ok(self.stream.clone_dtoh(&out)?)
+        let n = merged_rows * self.cfg.out_hidden_size;
+        self.gemm(&m.down, up, Out::Store(out), merged_rows, Act::None)?;
+        let mut host = vec![0f32; n];
+        self.stream.memcpy_dtoh(&out.slice(..n), &mut host)?;
+        Ok(host)
     }
 
     fn layout(&self, items: &[&Patches]) -> Result<BatchLayout> {
@@ -495,47 +536,55 @@ impl VisionEncoder {
     }
 
     fn encode_all(&self, items: &[&Patches]) -> Result<(Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>)> {
-        let cfg = &self.cfg;
         let l = self.layout(items)?;
+        let mut shared = self.workspace.lock().unwrap();
+        if l.tokens <= shared.patches {
+            return self.run(items, &l, &mut shared);
+        }
+        drop(shared);
+        let mut own = Workspace::new(&self.stream, &self.cfg, self.patch.cols, l.tokens)?;
+        self.run(items, &l, &mut own)
+    }
+
+    fn run(&self, items: &[&Patches], l: &BatchLayout, ws: &mut Workspace) -> Result<(Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>)> {
+        let cfg = &self.cfg;
         let tokens = l.tokens;
         let hidden = cfg.hidden_size;
         let heads = cfg.num_heads;
         let head_dim = hidden / heads;
         let hdp = head_pad(head_dim);
         let s = &self.stream;
-        let data: Vec<f32> = items.iter().flat_map(|p| p.data.iter().copied()).collect();
-        let input = s.clone_htod(&data)?;
+        let mut at = 0;
+        for p in items {
+            s.memcpy_htod(&p.data, &mut ws.input.slice_mut(at..at + p.data.len()))?;
+            at += p.data.len();
+        }
         let taps = s.clone_htod(&l.taps)?;
         let tap_weights = s.clone_htod(&l.tap_weights)?;
         let hw = s.clone_htod(&l.hw)?;
         let seg_lo = s.clone_htod(&l.seg_lo)?;
         let seg_hi = s.clone_htod(&l.seg_hi)?;
-        let mut x = unsafe { s.alloc::<f32>(tokens * hidden) }?;
-        let mut qkv = unsafe { s.alloc::<f32>(tokens * 3 * hidden) }?;
-        let mut packed = unsafe { s.alloc::<u16>(6 * heads * tokens * hdp) }?;
-        let mut xn = Planes::new(s, tokens * hidden)?;
-        let mut att = Planes::new(s, tokens * hidden)?;
-        let mut mid = Planes::new(s, tokens * cfg.intermediate_size.max(self.patch.cols).max(hidden))?;
+        let Workspace { input, x, qkv, packed, xn, att, mid, scratch, up, out, .. } = ws;
         let n = (tokens * self.patch.cols) as i32;
         let mut b = s.launch_builder(&self.split);
-        b.arg(&input).arg(&mut mid.hi).arg(&mut mid.lo).arg(&n);
+        b.arg(&*input).arg(&mut mid.hi).arg(&mut mid.lo).arg(&n);
         unsafe { b.launch(LaunchConfig { grid_dim: ((n as u32 / 2).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
         let h = hidden as i32;
         let mut b = s.launch_builder(&self.pos);
-        b.arg(&self.pos_embed).arg(&taps).arg(&tap_weights).arg(&mut x).arg(&h);
+        b.arg(&self.pos_embed).arg(&taps).arg(&tap_weights).arg(&mut *x).arg(&h);
         unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
-        self.gemm(&self.patch, &mid, Out::AddInPlace(&mut x), tokens, Act::None)?;
+        self.gemm(&self.patch, mid, Out::AddInPlace(x), tokens, Act::None)?;
         let (t32, h32, hd32) = (tokens as i32, heads as i32, head_dim as i32);
         let scale_log2 = (1.0 / (head_dim as f32).sqrt()) * std::f32::consts::LOG2_E;
         let mut deepstack = Vec::new();
         for (i, blk) in self.blocks.iter().enumerate() {
-            self.layernorm(&x, &blk.norm1, &mut xn, tokens, hidden)?;
-            self.gemm(&blk.qkv, &xn, Out::Store(&mut qkv), tokens, Act::None)?;
+            self.layernorm(x, &blk.norm1, xn, tokens, hidden)?;
+            self.gemm(&blk.qkv, xn, Out::Store(qkv), tokens, Act::None)?;
             let mut b = s.launch_builder(&self.rope_pack);
-            b.arg(&qkv).arg(&hw).arg(&mut packed).arg(&t32).arg(&h32).arg(&hd32).arg(&ROPE_THETA);
+            b.arg(&*qkv).arg(&hw).arg(&mut *packed).arg(&t32).arg(&h32).arg(&hd32).arg(&ROPE_THETA);
             unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, heads as u32, 1), block_dim: (hdp as u32, 1, 1), shared_mem_bytes: 0 }) }?;
             let mut b = s.launch_builder(&self.flash);
-            b.arg(&packed).arg(&seg_lo).arg(&seg_hi).arg(&mut att.hi).arg(&mut att.lo).arg(&t32).arg(&h32).arg(&hd32).arg(&scale_log2);
+            b.arg(&*packed).arg(&seg_lo).arg(&seg_hi).arg(&mut att.hi).arg(&mut att.lo).arg(&t32).arg(&h32).arg(&hd32).arg(&scale_log2);
             unsafe {
                 b.launch(LaunchConfig {
                     grid_dim: ((tokens as u32).div_ceil(FLASH_BQ), heads as u32, 1),
@@ -543,20 +592,16 @@ impl VisionEncoder {
                     shared_mem_bytes: flash_smem(head_dim),
                 })
             }?;
-            self.gemm(&blk.proj, &att, Out::AddInPlace(&mut x), tokens, Act::None)?;
-            self.layernorm(&x, &blk.norm2, &mut xn, tokens, hidden)?;
-            self.gemm(&blk.up, &xn, Out::Split(&mut mid), tokens, self.act)?;
-            self.gemm(&blk.down, &mid, Out::AddInPlace(&mut x), tokens, Act::None)?;
+            self.gemm(&blk.proj, att, Out::AddInPlace(x), tokens, Act::None)?;
+            self.layernorm(x, &blk.norm2, xn, tokens, hidden)?;
+            self.gemm(&blk.up, xn, Out::Split(mid), tokens, self.act)?;
+            self.gemm(&blk.down, mid, Out::AddInPlace(x), tokens, Act::None)?;
             if let Some(d) = cfg.deepstack_visual_indexes.iter().position(|&b| b == i) {
-                let mut scratch = Planes::new(s, tokens * hidden)?;
-                let mut up = Planes::new(s, tokens * hidden)?;
-                let flat = self.run_merger(&self.deepstack[d], &x, tokens, &mut scratch, &mut up)?;
+                let flat = self.run_merger(&self.deepstack[d], x, tokens, scratch, up, out)?;
                 deepstack.push(self.split_rows(flat, &l.merged_rows));
             }
         }
-        let mut scratch = Planes::new(s, tokens * hidden)?;
-        let mut up = Planes::new(s, tokens * hidden)?;
-        let flat = self.run_merger(&self.merger, &x, tokens, &mut scratch, &mut up)?;
+        let flat = self.run_merger(&self.merger, x, tokens, scratch, up, out)?;
         Ok((self.split_rows(flat, &l.merged_rows), deepstack))
     }
 
