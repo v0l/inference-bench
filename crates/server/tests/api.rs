@@ -2,6 +2,7 @@ mod common;
 
 use common::*;
 use serde_json::{Value, json};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -799,5 +800,89 @@ fn logprobs_on_a_single_sequence_engine_are_a_400() {
     body["logprobs"] = json!(true);
     let (status, text, _) = rig.post("/v1/chat/completions", None, body);
     assert_eq!(status, 400, "{text}");
+    rig.stop();
+}
+
+#[test]
+fn a_busy_gpu_refuses_a_load_with_503_and_retry_after_until_memory_is_free() {
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(500));
+    let rig = start_probed(config("min_free_vram_mib = 4000\nretry_after_secs = 7\n[[models]]\nid='m'"), Shape::default(), free.clone());
+    let (status, body, headers) = rig.post("/v1/chat/completions", None, chat("m", false));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(header(&headers, "retry-after"), Some("7"));
+    assert!(body.contains("500 MiB free"), "{body}");
+    assert_eq!(rig.stats.loads.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.post("/load", None, json!({})).0, 503);
+    free.store(8000, Ordering::SeqCst);
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("m", false)).0, 200);
+    assert_eq!(rig.stats.loads.load(Ordering::SeqCst), 1);
+    free.store(10, Ordering::SeqCst);
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("m", false)).0, 200, "a loaded model keeps serving");
+    rig.stop();
+}
+
+#[test]
+fn unload_and_load_endpoints_give_the_gpu_back_and_report_unloaded() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    assert_eq!(rig.post("/load", None, json!({})).0, 200);
+    assert_eq!(rig.stats.loads.load(Ordering::SeqCst), 1);
+    let health: Value = serde_json::from_str(&rig.get("/health", None).1).unwrap();
+    assert_eq!(health["status"], "ok");
+    assert_eq!(rig.post("/unload", None, json!({})).0, 200);
+    let health: Value = serde_json::from_str(&rig.get("/health", None).1).unwrap();
+    assert_eq!(health["status"], "unloaded");
+    assert_eq!(health["unloaded_models"][0], "m");
+    let models: Value = serde_json::from_str(&rig.get("/v1/models", None).1).unwrap();
+    assert_eq!(models["data"][0]["status"], "unloaded");
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("m", false)).0, 200);
+    assert_eq!(rig.stats.loads.load(Ordering::SeqCst), 2);
+    rig.stop();
+}
+
+#[test]
+fn unload_is_409_while_busy_and_waits_when_asked() {
+    let shape = Shape { tokens: 30, token_delay_ms: 20, ..Shape::default() };
+    let rig = start(config("[[models]]\nid='m'"), shape);
+    let body = json!({"model": "m", "messages": [{"role": "user", "content": "go"}], "max_tokens": 30, "stream": true});
+    let mut s = rig.raw_post("/v1/chat/completions", &body.to_string());
+    assert!(read_until(&mut s, "w1 ").contains("w1 "));
+    assert_eq!(rig.post("/unload", None, json!({})).0, 409);
+    let (status, body, _) = rig.post("/unload?wait=1", None, json!({}));
+    assert_eq!(status, 200, "{body}");
+    assert!(read_until(&mut s, "[DONE]").contains("[DONE]"));
+    let health: Value = serde_json::from_str(&rig.get("/health", None).1).unwrap();
+    assert_eq!(health["status"], "unloaded");
+    rig.stop();
+}
+
+#[test]
+fn lazy_load_skips_the_preload_until_the_first_request() {
+    let rig = start(config("lazy_load = true\n[[models]]\nid='m'\npreload = true"), Shape::default());
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(rig.stats.loads.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("m", false)).0, 200);
+    assert_eq!(rig.stats.loads.load(Ordering::SeqCst), 1);
+    rig.stop();
+}
+
+#[test]
+fn eager_preload_loads_at_start() {
+    let rig = start(config("[[models]]\nid='m'\npreload = true"), Shape::default());
+    wait_for("preload", || rig.stats.loads.load(Ordering::SeqCst) == 1);
+    rig.stop();
+}
+
+#[test]
+fn before_load_runs_first_and_a_failure_refuses_the_load() {
+    let marker = std::env::temp_dir().join(format!("ib-before-load-{}", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let rig = start(config(&format!("before_load = \"touch {}\"\n[[models]]\nid='m'", marker.display())), Shape::default());
+    assert_eq!(rig.post("/v1/chat/completions", None, chat("m", false)).0, 200);
+    assert!(marker.exists());
+    rig.stop();
+    let rig = start(config("before_load = \"exit 3\"\n[[models]]\nid='m'"), Shape::default());
+    let (status, body, _) = rig.post("/v1/chat/completions", None, chat("m", false));
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(rig.stats.loads.load(Ordering::SeqCst), 0);
     rig.stop();
 }

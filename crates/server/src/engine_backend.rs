@@ -17,6 +17,26 @@ impl ModelSource for Handle {
             .into_iter()
             .collect()
     }
+
+    fn suspended(&self) -> Vec<SourceModel> {
+        Handle::suspended(self)
+            .map(|l| {
+                let mut aliases = vec![l.model_id];
+                aliases.extend(inference_bench_core::library::short_alias(&l.display));
+                aliases.extend(l.served_names);
+                SourceModel { id: l.display, aliases, slots: Some(l.max_num_seqs) }
+            })
+            .into_iter()
+            .collect()
+    }
+
+    fn suspend(&self) -> bool {
+        Handle::suspend(self)
+    }
+
+    fn resume(&self) -> Result<(), BackendError> {
+        Handle::resume(self)
+    }
 }
 
 pub struct EngineBackend {

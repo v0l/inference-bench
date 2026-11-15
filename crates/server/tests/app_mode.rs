@@ -275,3 +275,30 @@ fn four_api_requests_run_together_on_an_engine_loaded_with_four_sequences() {
     assert!(app.rig.metrics().contains("inference_running_seqs"));
     app.rig.stop();
 }
+
+#[test]
+fn app_mode_idle_unload_frees_the_engine_and_the_next_request_resumes_it() {
+    let app = app_rig_with("idle_unload_secs = 1", Engine::with_factory(Arc::new(|| {}), ScriptedModel::factory(script())));
+    app.load("org/one", "One");
+    assert_eq!(app.chat(say(None)).0, 200);
+    wait_for("idle unload", || app.engine.loaded().is_none());
+    assert!(app.engine.handle().suspended().is_some());
+    let health: Value = serde_json::from_str(&app.rig.get("/health", None).1).unwrap();
+    assert_eq!(health["status"], "unloaded");
+    let (status, body) = app.chat(say(Some("One")));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+    assert!(app.engine.loaded().is_some());
+    app.rig.stop();
+}
+
+#[test]
+fn app_mode_unload_and_load_endpoints_suspend_and_resume() {
+    let app = app_rig();
+    app.load("org/one", "One");
+    assert_eq!(app.rig.post("/unload", None, json!({})).0, 200);
+    assert!(app.engine.loaded().is_none());
+    assert_eq!(app.rig.post("/load", None, json!({})).0, 200);
+    assert_eq!(app.engine.loaded().unwrap().display, "One");
+    app.rig.stop();
+}

@@ -62,6 +62,24 @@ pub struct SourceModel {
 
 pub trait ModelSource: Send + Sync + 'static {
     fn loaded(&self) -> Vec<SourceModel>;
+
+    fn suspended(&self) -> Vec<SourceModel> {
+        Vec::new()
+    }
+
+    fn suspend(&self) -> bool {
+        false
+    }
+
+    fn resume(&self) -> Result<(), BackendError> {
+        Ok(())
+    }
+}
+
+pub type TotalProbe = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
+
+pub fn nvidia_smi_total() -> TotalProbe {
+    Arc::new(crate::gpu::smi_total_bytes)
 }
 
 pub fn nvidia_smi_probe() -> GpuProbe {
@@ -162,6 +180,7 @@ pub struct Manager {
     config: Arc<ServerConfig>,
     factory: Arc<dyn EngineFactory>,
     probe: GpuProbe,
+    total: TotalProbe,
     metrics: Arc<Metrics>,
     loaded: Mutex<HashMap<String, Arc<LoadedModel>>>,
     loading: Arc<Mutex<HashMap<String, LoadState>>>,
@@ -175,10 +194,11 @@ impl Manager {
         config: Arc<ServerConfig>,
         factory: Arc<dyn EngineFactory>,
         probe: GpuProbe,
+        total: TotalProbe,
         metrics: Arc<Metrics>,
         source: Option<Arc<dyn ModelSource>>,
     ) -> Self {
-        Self { config, factory, probe, metrics, loaded: Mutex::default(), loading: Default::default(), load_lock: Default::default(), source, failed: Default::default() }
+        Self { config, factory, probe, total, metrics, loaded: Mutex::default(), loading: Default::default(), load_lock: Default::default(), source, failed: Default::default() }
     }
 
     pub fn failure_of(&self, id: &str) -> Option<String> {
@@ -216,9 +236,56 @@ impl Manager {
         (self.probe)()
     }
 
+    pub async fn gate_load(&self, id: &str) -> Result<(), ApiError> {
+        if let Some(min) = self.config.min_free_vram_mib {
+            if let Some(free) = self.gpu_free() {
+                if free < min << 20 {
+                    tracing::warn!(model = %id, free_mib = free >> 20, min_free_mib = min, "not loading: the GPU is busy");
+                    let mut e = ApiError::unavailable(format!(
+                        "the GPU has {} MiB free and {} MiB are required to load {id}; retry when the other job is done",
+                        free >> 20,
+                        min
+                    ));
+                    e.retry_after = Some(self.config.retry_after_secs.max(1));
+                    return Err(e);
+                }
+            }
+        }
+        if let Some(command) = self.config.before_load.clone() {
+            let id = id.to_string();
+            let status = tokio::task::spawn_blocking(move || {
+                std::process::Command::new("sh").arg("-c").arg(&command).env("INFERENCE_BENCH_MODEL", &id).status()
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("before_load task failed: {e}")))?;
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => return Err(ApiError::unavailable(format!("before_load command failed: {s}"))),
+                Err(e) => return Err(ApiError::unavailable(format!("before_load command did not run: {e}"))),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn gpu_free(&self) -> Option<u64> {
+        let total = (self.total)()?;
+        Some(total.saturating_sub((self.probe)()?))
+    }
+
+    fn source_models(&self) -> Vec<SourceModel> {
+        match &self.source {
+            Some(s) => {
+                let mut all = s.loaded();
+                all.extend(s.suspended());
+                all
+            }
+            None => Vec::new(),
+        }
+    }
+
     pub fn resolve(&self, id: &str) -> Result<ModelConfig, ApiError> {
-        if let Some(source) = &self.source {
-            return match source.loaded().into_iter().find(|m| m.id == id || m.aliases.iter().any(|a| a == id)) {
+        if self.source.is_some() {
+            return match self.source_models().into_iter().find(|m| m.id == id || m.aliases.iter().any(|a| a == id)) {
                 Some(m) => Ok(ModelConfig { id: m.id, ..ModelConfig::default() }),
                 None => Err(ApiError::model_not_found(id)),
             };
@@ -244,8 +311,8 @@ impl Manager {
     }
 
     pub fn default_model(&self) -> Option<String> {
-        if let Some(source) = &self.source {
-            return source.loaded().into_iter().next().map(|m| m.id);
+        if self.source.is_some() {
+            return self.source_models().into_iter().next().map(|m| m.id);
         }
         self.config
             .default_model
@@ -298,7 +365,21 @@ impl Manager {
     pub fn status(&self) -> Vec<ModelStatus> {
         let loaded = self.loaded.lock().unwrap();
         if let Some(source) = &self.source {
-            return source
+            let suspended = source.suspended();
+            let mut out: Vec<ModelStatus> = suspended
+                .into_iter()
+                .map(|m| ModelStatus {
+                    id: m.id.clone(),
+                    backend: "engine".to_string(),
+                    loaded: false,
+                    vram_bytes: 0,
+                    active_requests: 0,
+                    idle_secs: None,
+                    loading: self.loading_of(&m.id),
+                    failed: self.failed.lock().unwrap().get(&m.id).cloned(),
+                })
+                .collect();
+            out.extend(source
                 .loaded()
                 .into_iter()
                 .map(|m| {
@@ -315,8 +396,8 @@ impl Manager {
                         loading,
                         failed,
                     }
-                })
-                .collect();
+                }));
+            return out;
         }
         let mut out: Vec<ModelStatus> = self
             .config
@@ -361,6 +442,7 @@ impl Manager {
             }
             self.failed.lock().unwrap().remove(&cfg.id);
         }
+        self.resume_source(&cfg.id).await?;
         let model = match self.get(&cfg.id) {
             Some(m) => m,
             None => self.load(&cfg).await?,
@@ -380,7 +462,28 @@ impl Manager {
         Ok(lease)
     }
 
+    async fn resume_source(&self, id: &str) -> Result<(), ApiError> {
+        let Some(source) = self.source.clone() else { return Ok(()) };
+        if !source.suspended().iter().any(|m| m.id == id || m.aliases.iter().any(|a| a == id)) {
+            return Ok(());
+        }
+        let _guard = self.load_lock.lock().await;
+        if source.suspended().is_empty() {
+            return Ok(());
+        }
+        self.gate_load(id).await?;
+        let started = Instant::now();
+        let source_in = source.clone();
+        tokio::task::spawn_blocking(move || source_in.resume())
+            .await
+            .map_err(|e| ApiError::internal(format!("resume task failed: {e}")))??;
+        tracing::info!(model = %id, load_secs = started.elapsed().as_secs_f64(), "model resumed");
+        self.metrics.model_loaded(id);
+        Ok(())
+    }
+
     pub async fn preload(&self, cfg: &ModelConfig) -> Result<(), ApiError> {
+        self.resume_source(&cfg.id).await?;
         let model = self.load(cfg).await?;
         model.active.fetch_sub(1, Ordering::SeqCst);
         Ok(())
@@ -396,6 +499,9 @@ impl Manager {
             m.active.fetch_sub(1, Ordering::SeqCst);
             self.settle_failure(&cfg.id);
             self.failed.lock().unwrap().remove(&cfg.id);
+        }
+        if self.source.is_none() {
+            self.gate_load(&cfg.id).await?;
         }
         self.make_room(cfg)?;
         let max_ctx = self.config.max_ctx_for(cfg);
@@ -548,7 +654,29 @@ impl Manager {
     }
 
     pub fn is_loaded(&self, id: &str) -> bool {
+        if let Some(source) = &self.source {
+            return source.loaded().iter().any(|m| m.id == id || m.aliases.iter().any(|a| a == id));
+        }
         self.loaded.lock().unwrap().contains_key(id)
+    }
+
+    pub fn release(&self, id: &str) -> bool {
+        let freed = self.unload(id);
+        match &self.source {
+            Some(source) if !self.is_busy(id) => {
+                let had = source.suspend();
+                self.loaded.lock().unwrap().remove(id);
+                had || freed
+            }
+            _ => freed,
+        }
+    }
+
+    pub fn is_suspended(&self, id: &str) -> bool {
+        match &self.source {
+            Some(s) => s.suspended().iter().any(|m| m.id == id || m.aliases.iter().any(|a| a == id)),
+            None => false,
+        }
     }
 
     pub fn is_busy(&self, id: &str) -> bool {
@@ -564,7 +692,7 @@ impl Manager {
             .filter(|m| m.active() == 0 && m.idle_for() >= idle)
             .map(|m| m.id.clone())
             .collect();
-        stale.iter().filter(|id| self.unload(id)).count()
+        stale.iter().filter(|id| self.release(id)).count()
     }
 
     pub fn unload_all(&self) {

@@ -1,6 +1,6 @@
 use crate::app::{AppState, router};
 use crate::config::ServerConfig;
-use crate::manager::{EngineFactory, GpuProbe, ModelSource, NativeFactory, nvidia_smi_probe};
+use crate::manager::{EngineFactory, GpuProbe, ModelSource, NativeFactory, TotalProbe, nvidia_smi_probe, nvidia_smi_total};
 use anyhow::{Context, Result};
 use inference_bench_core::specs::{Outcome, SpecStore, SpecsConfig};
 use std::net::SocketAddr;
@@ -12,6 +12,7 @@ pub struct Server {
     config: Arc<ServerConfig>,
     factory: Arc<dyn EngineFactory>,
     probe: GpuProbe,
+    total: TotalProbe,
     source: Option<Arc<dyn ModelSource>>,
 }
 
@@ -67,7 +68,7 @@ impl ListeningLimits {
 
 impl Server {
     pub fn new(config: ServerConfig) -> Self {
-        Self { config: Arc::new(config), factory: Arc::new(NativeFactory), probe: nvidia_smi_probe(), source: None }
+        Self { config: Arc::new(config), factory: Arc::new(NativeFactory), probe: nvidia_smi_probe(), total: nvidia_smi_total(), source: None }
     }
 
     pub fn with_model_source(mut self, source: impl ModelSource) -> Self {
@@ -85,6 +86,11 @@ impl Server {
         self
     }
 
+    pub fn with_gpu_total(mut self, total: TotalProbe) -> Self {
+        self.total = total;
+        self
+    }
+
     pub async fn start(self) -> Result<ServerHandle> {
         let addr: SocketAddr = self
             .config
@@ -95,7 +101,7 @@ impl Server {
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
         let limits = ListeningLimits::new(&self.config, self.source.as_deref());
-        let state = AppState::new(self.config.clone(), self.factory, self.probe, self.source)?;
+        let state = AppState::new(self.config.clone(), self.factory, self.probe, self.total, self.source)?;
         let app = router(state.clone());
         let (tx, rx) = watch::channel(false);
         spawn_reaper(state.clone(), rx.clone());
@@ -234,7 +240,7 @@ fn spawn_spec_updates(state: Arc<AppState>, mut rx: watch::Receiver<bool>) {
 }
 
 fn spawn_preload(state: Arc<AppState>) {
-    let ids: Vec<_> = state.config.models.iter().filter(|m| m.preload).cloned().collect();
+    let ids: Vec<_> = state.config.models.iter().filter(|m| m.preload && !state.config.lazy_load).cloned().collect();
     if ids.is_empty() {
         return;
     }

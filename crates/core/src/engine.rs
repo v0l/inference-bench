@@ -40,6 +40,8 @@ pub struct Loaded {
 pub enum Command {
     Load { model_id: String, display: String, max_ctx: Option<usize>, max_num_seqs: Option<usize>, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice },
     Unload,
+    Suspend { done: Sender<bool> },
+    Resume { done: Sender<Result<(), BackendError>> },
     Chat { request: ChatRequest, events: Sender<ChatEvent>, queued: Instant },
     Shutdown,
 }
@@ -66,6 +68,7 @@ pub struct Engine {
     commands: Sender<Command>,
     pub events: Receiver<EngineEvent>,
     loaded: Arc<Mutex<Option<Loaded>>>,
+    suspended: Arc<Mutex<Option<Loaded>>>,
     meter: Arc<Meter>,
     stats: StatsSource,
     history: Arc<Mutex<History>>,
@@ -77,6 +80,7 @@ pub struct Engine {
 pub struct Handle {
     commands: Sender<Command>,
     loaded: Arc<Mutex<Option<Loaded>>>,
+    suspended: Arc<Mutex<Option<Loaded>>>,
     meter: Arc<Meter>,
     stats: StatsSource,
     history: Arc<Mutex<History>>,
@@ -90,6 +94,21 @@ impl Handle {
 
     pub fn thinking(&self) -> specrt::chat::Thinking {
         self.loaded().map(|l| l.thinking).unwrap_or_default()
+    }
+
+    pub fn suspended(&self) -> Option<Loaded> {
+        self.suspended.lock().unwrap().clone()
+    }
+
+    pub fn suspend(&self) -> bool {
+        let (done, rx) = channel();
+        self.commands.send(Command::Suspend { done }).is_ok() && rx.recv().unwrap_or(false)
+    }
+
+    pub fn resume(&self) -> Result<(), BackendError> {
+        let (done, rx) = channel();
+        self.commands.send(Command::Resume { done }).map_err(|_| BackendError::failed("the engine has stopped"))?;
+        rx.recv().unwrap_or_else(|_| Err(BackendError::failed("the engine has stopped")))
     }
 
     pub fn chat(&self, request: ChatRequest) -> Receiver<ChatEvent> {
@@ -145,13 +164,14 @@ impl Engine {
         let (commands, inbox) = channel();
         let (events_tx, events) = channel();
         let loaded = Arc::new(Mutex::new(None));
+        let suspended = Arc::new(Mutex::new(None));
         let meter = Arc::new(Meter::default());
         let stats: StatsSource = Arc::new(Mutex::new(None));
         let history = Arc::new(Mutex::new(History::new(HISTORY_SAMPLES)));
         let watching = Arc::new(AtomicBool::new(false));
         let stop_sampler = Arc::new(AtomicBool::new(false));
-        let shared = Shared { loaded: loaded.clone(), meter: meter.clone(), stats: stats.clone(), history: history.clone() };
-        let this = Self { commands, events, loaded, meter, stats, history, watching, stop_sampler };
+        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), meter: meter.clone(), stats: stats.clone(), history: history.clone() };
+        let this = Self { commands, events, loaded, suspended, meter, stats, history, watching, stop_sampler };
         let handle = this.handle();
         let (stop, wake_sampler) = (this.stop_sampler.clone(), wake.clone());
         std::thread::spawn(move || run(inbox, events_tx, shared, wake, factory, serving));
@@ -163,6 +183,7 @@ impl Engine {
         Handle {
             commands: self.commands.clone(),
             loaded: self.loaded.clone(),
+            suspended: self.suspended.clone(),
             meter: self.meter.clone(),
             stats: self.stats.clone(),
             history: self.history.clone(),
@@ -204,6 +225,7 @@ impl Drop for Engine {
 
 struct Shared {
     loaded: Arc<Mutex<Option<Loaded>>>,
+    suspended: Arc<Mutex<Option<Loaded>>>,
     meter: Arc<Meter>,
     stats: StatsSource,
     history: Arc<Mutex<History>>,
@@ -330,15 +352,55 @@ fn run(
         *shared.loaded.lock().unwrap() = None;
         shared.history.lock().unwrap().clear();
     };
-    while let Ok(command) = inbox.recv() {
+    let mut last_load: Option<Command> = None;
+    let mut parked: Option<Command> = None;
+    let mut resume_reply: Option<Sender<Result<(), BackendError>>> = None;
+    let mut next: Option<Command> = None;
+    loop {
+        let command = match next.take() {
+            Some(c) => c,
+            None => match inbox.recv() {
+                Ok(c) => c,
+                Err(_) => break,
+            },
+        };
         match command {
             Command::Shutdown => break,
             Command::Unload => {
                 release(&mut backend);
+                last_load = None;
+                parked = None;
+                *shared.suspended.lock().unwrap() = None;
                 emit(EngineEvent::Unloaded);
             }
+            Command::Suspend { done } => {
+                let was_loaded = backend.is_some();
+                if was_loaded {
+                    let info = shared.loaded.lock().unwrap().clone();
+                    release(&mut backend);
+                    parked = last_load.take();
+                    *shared.suspended.lock().unwrap() = info;
+                    emit(EngineEvent::Unloaded);
+                }
+                let _ = done.send(was_loaded);
+            }
+            Command::Resume { done } => match parked.take() {
+                Some(load) => {
+                    resume_reply = Some(done);
+                    next = Some(load);
+                }
+                None => {
+                    let _ = done.send(match backend.is_some() {
+                        true => Ok(()),
+                        false => Err(BackendError::new(ErrorKind::ModelNotFound, "no model is loaded in the app")),
+                    });
+                }
+            },
             Command::Load { model_id, display, max_ctx, max_num_seqs, kv_cache_bytes, served_names, engine } => {
                 release(&mut backend);
+                *shared.suspended.lock().unwrap() = None;
+                last_load = None;
+                let again = Command::Load { model_id: model_id.clone(), display: display.clone(), max_ctx, max_num_seqs, kv_cache_bytes, served_names: served_names.clone(), engine: engine.clone() };
                 emit(EngineEvent::Loading(display.clone()));
                 let started = Instant::now();
                 let seqs = max_num_seqs.unwrap_or(1).max(1);
@@ -367,9 +429,18 @@ fn run(
                             thinking: o.thinking,
                         };
                         *shared.loaded.lock().unwrap() = Some(info.clone());
+                        last_load = Some(again);
+                        if let Some(done) = resume_reply.take() {
+                            let _ = done.send(Ok(()));
+                        }
                         emit(EngineEvent::Loaded(info));
                     }
-                    Err(e) => emit(EngineEvent::LoadFailed(e)),
+                    Err(e) => {
+                        if let Some(done) = resume_reply.take() {
+                            let _ = done.send(Err(e.clone()));
+                        }
+                        emit(EngineEvent::LoadFailed(e))
+                    }
                 }
             }
             Command::Chat { mut request, events: out, queued } => {

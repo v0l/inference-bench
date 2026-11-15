@@ -175,6 +175,37 @@ pub fn start(config: ServerConfig, shape: Shape) -> Rig {
     start_with(config, factory, stats)
 }
 
+pub fn start_probed(config: ServerConfig, shape: Shape, free_mib: Arc<std::sync::atomic::AtomicU64>) -> Rig {
+    let stats = Arc::new(Stats::default());
+    let s = stats.clone();
+    let factory = move |_: Option<usize>| -> Result<Box<dyn Target>, BackendError> {
+        Ok(Box::new(Fake {
+            tokens: shape.tokens,
+            first_delay_ms: shape.first_delay_ms,
+            token_delay_ms: shape.token_delay_ms,
+            pieces: shape.pieces.clone(),
+            vision: shape.vision,
+            batched: shape.batched,
+            stats: s.clone(),
+        }))
+    };
+    init_logs();
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+    const TOTAL_MIB: u64 = 100_000;
+    let used = free_mib.clone();
+    let handle = rt
+        .block_on(
+            Server::new(config)
+                .with_factory(factory)
+                .with_gpu_total(Arc::new(|| Some(TOTAL_MIB << 20)))
+                .with_gpu_probe(Arc::new(move || Some((TOTAL_MIB - used.load(Ordering::SeqCst)) << 20)))
+                .start(),
+        )
+        .unwrap();
+    let url = handle.url();
+    Rig { rt, handle: Some(handle), stats, url }
+}
+
 pub fn start_with(config: ServerConfig, factory: impl inference_bench_server::EngineFactory, stats: Arc<Stats>) -> Rig {
     init_logs();
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();

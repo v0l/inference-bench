@@ -45,6 +45,7 @@ impl AppState {
         config: Arc<ServerConfig>,
         factory: Arc<dyn EngineFactory>,
         probe: GpuProbe,
+        total: crate::manager::TotalProbe,
         source: Option<Arc<dyn ModelSource>>,
     ) -> anyhow::Result<Arc<Self>> {
         let metrics = Arc::new(Metrics::default());
@@ -58,7 +59,7 @@ impl AppState {
             None => None,
         };
         Ok(Arc::new(Self {
-            manager: Arc::new(Manager::new(config.clone(), factory, probe, metrics.clone(), source)),
+            manager: Arc::new(Manager::new(config.clone(), factory, probe, total, metrics.clone(), source)),
             keys: config.resolved_keys(),
             metrics,
             config,
@@ -79,6 +80,10 @@ impl AppState {
             gpu_used_bytes: self.manager.gpu_used(),
             engine: self.manager.engine_metrics(),
         }
+    }
+
+    pub fn admitted_now(&self) -> usize {
+        self.admitted.load(Ordering::SeqCst)
     }
 
     pub fn auth_required(&self) -> bool {
@@ -159,6 +164,8 @@ fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
         (r("GET", "/slots", "llama.cpp style slot list"), get(crate::dialects::slots)),
         (r("POST", "/v1/embeddings", "Embeddings (not supported yet)"), post(embeddings)),
         (r("POST", "/v1/bench", "Run a timed generation"), post(bench)),
+        (r("POST", "/load", "Load the default model, or ?model=ID"), post(load_default)),
+        (r("POST", "/unload", "Unload to free the GPU: 409 while busy, ?wait waits for requests to finish"), post(unload_default)),
         (r("GET", "/admin/models", "Model status and VRAM"), get(admin_models)),
         (r("POST", "/admin/models/{id}/load", "Load a model"), post(admin_load)),
         (r("POST", "/admin/models/{id}/unload", "Unload a model"), post(admin_unload)),
@@ -347,8 +354,17 @@ async fn landing(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let status = state.manager.status();
+    let unloaded: Vec<String> = status.iter().filter(|m| !m.loaded && m.loading.is_none()).map(|m| m.id.clone()).collect();
+    let state_word = match (state.manager.loading_snapshot().is_empty(), status.iter().any(|m| m.loaded), unloaded.is_empty()) {
+        (false, _, _) => "loading",
+        (true, true, _) => "ok",
+        (true, false, false) => "unloaded",
+        (true, false, true) => "ok",
+    };
     Json(json!({
-        "status": "ok",
+        "status": state_word,
+        "unloaded_models": unloaded,
         "uptime_secs": state.started.elapsed().as_secs(),
         "loaded_models": state.manager.loaded_snapshot().into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
         "loading": state.manager.loading_snapshot().into_iter().map(|(id, l)| json!({"id": id, "stage": l.stage, "done": l.done, "total": l.total, "elapsed_secs": l.elapsed_secs, "bytes_per_sec": l.bytes_per_sec})).collect::<Vec<_>>(),
@@ -372,7 +388,7 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
         .manager
         .status()
         .into_iter()
-        .map(|m| json!({"id": m.id, "object": "model", "created": 0, "owned_by": "inference-bench", "loaded": m.loaded}))
+        .map(|m| json!({"id": m.id, "object": "model", "created": 0, "owned_by": "inference-bench", "loaded": m.loaded, "status": if m.loaded { "loaded" } else if m.loading.is_some() { "loading" } else { "unloaded" }}))
         .collect();
     Json(json!({"object": "list", "data": data}))
 }
@@ -404,6 +420,47 @@ async fn admin_models(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"models": state.manager.status()}))
 }
 
+#[derive(serde::Deserialize, Default)]
+struct ModelQuery {
+    model: Option<String>,
+    wait: Option<String>,
+}
+
+impl ModelQuery {
+    fn waits(&self) -> bool {
+        self.wait.as_deref().is_some_and(|w| !matches!(w, "0" | "false" | "no"))
+    }
+}
+
+async fn load_default(State(state): State<Arc<AppState>>, axum::extract::Query(q): axum::extract::Query<ModelQuery>) -> Result<Json<Value>, ApiError> {
+    let id = state.manager.requested_model(q.model.as_deref())?;
+    admin_load(State(state), Path(id)).await
+}
+
+async fn unload_default(State(state): State<Arc<AppState>>, axum::extract::Query(q): axum::extract::Query<ModelQuery>) -> Result<Json<Value>, ApiError> {
+    let waits = q.waits();
+    let id = state.manager.requested_model(q.model.as_deref())?;
+    release_model(&state, &id, waits).await
+}
+
+const UNLOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+async fn release_model(state: &Arc<AppState>, id: &str, wait: bool) -> Result<Json<Value>, ApiError> {
+    let cfg = state.manager.resolve(id)?;
+    let deadline = Instant::now() + UNLOAD_WAIT;
+    while state.manager.is_busy(&cfg.id) || state.admitted_now() > 0 {
+        if !wait {
+            return Err(ApiError::new(StatusCode::CONFLICT, "conflict", format!("{id} has requests in flight")));
+        }
+        if Instant::now() > deadline {
+            return Err(ApiError::new(StatusCode::CONFLICT, "conflict", format!("{id} still has requests in flight after {} s", UNLOAD_WAIT.as_secs())));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    state.manager.release(&cfg.id);
+    Ok(Json(json!({"id": cfg.id, "loaded": state.manager.is_loaded(&cfg.id), "status": "unloaded"})))
+}
+
 async fn admin_load(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
     let cfg = state.manager.resolve(&id)?;
     if !state.manager.is_loaded(&id) {
@@ -412,13 +469,8 @@ async fn admin_load(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
     Ok(Json(json!({"id": id, "loaded": true})))
 }
 
-async fn admin_unload(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
-    state.manager.resolve(&id)?;
-    if state.manager.is_busy(&id) {
-        return Err(ApiError::new(StatusCode::CONFLICT, "conflict", format!("{id} has requests in flight")));
-    }
-    let unloaded = state.manager.unload(&id);
-    Ok(Json(json!({"id": id, "loaded": !unloaded && state.manager.is_loaded(&id)})))
+async fn admin_unload(State(state): State<Arc<AppState>>, Path(id): Path<String>, axum::extract::Query(q): axum::extract::Query<ModelQuery>) -> Result<Json<Value>, ApiError> {
+    release_model(&state, &id, q.waits()).await
 }
 
 async fn embeddings() -> ApiError {
