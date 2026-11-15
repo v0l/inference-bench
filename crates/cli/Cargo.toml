@@ -30,6 +30,8 @@ assets = [
 ]
 
 [dependencies]
+specrt = { package = "inference-bench-specrt", path = "../specrt" }
+inference-bench-kir = { path = "../kir" }
 inference-bench-core.workspace = true
 inference-bench-server = { path = "../server" }
 tracing.workspace = true

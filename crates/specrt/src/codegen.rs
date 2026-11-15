@@ -1056,3 +1056,22 @@ impl Module {
         Ok(Module { source, kernels, smem, arch_features, kir_hash })
     }
 }
+
+pub fn live_target() -> Result<kir::Target> {
+    let ctx = cudarc::driver::CudaContext::new(0).map_err(|e| anyhow::anyhow!("no CUDA device for the live target: {e:?}"))?;
+    cuda_target(&ctx)
+}
+
+pub fn kernels_report(spec: &Spec, target: &kir::Target) -> Result<String> {
+    let mut out = String::new();
+    out.push_str(&format!("spec {}\n{}\nmodule hash {}\n", spec.name, target.describe(), kir::module_hash(&kir_kernels(spec, target)?)));
+    for k in kir_kernels(spec, target)? {
+        out.push_str(&format!("\n== {} ({})\n{}\n\n", k.name, k.hash(), k.describe()));
+        let source = match target.language {
+            kir::Language::Cuda => kir::cuda::emit_module(std::slice::from_ref(&k)),
+            kir::Language::Wgsl => kir::wgsl::emit_kernel(&k),
+        };
+        out.push_str(&source.map_err(anyhow::Error::msg)?);
+    }
+    Ok(out)
+}

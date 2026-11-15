@@ -72,7 +72,7 @@ let k = Kernel::rmsnorm(&target, 1024, 1e-6, 1024)?;
 let cuda = kir::cuda::emit_module(&[k])?;
 ```
 
-On `Target::wgpu_baseline()` the same call picks `SharedTree` and 256 threads, and `kir::wgsl::emit_kernel` emits the workgroup tree reduction. On `Target::wgpu_baseline().with_subgroups(32)` it picks `Subgroup` and emits `subgroupAdd` with `enable subgroups;`.
+On `Target::wgpu_baseline()` the same call picks `SharedTree` and 256 threads, and `kir::wgsl::emit_kernel` emits the workgroup tree reduction. On `Target::wgpu_baseline().with_subgroups(32)` it picks `Subgroup` and emits `subgroupAdd`.
 
 In specrt, `codegen::kir_kernels(spec, &target)` builds `rmsnorm` and `swiglu` from the spec. `Module::generate_kv` appends the emitted CUDA to the rendered templates, and `wgsl::generate` appends the WGSL kernels. The old `rmsnorm` and `swiglu` bodies were removed from `ops.cu` and `templates/wgsl`.
 

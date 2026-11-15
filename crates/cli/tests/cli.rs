@@ -242,3 +242,40 @@ fn a_failed_specs_update_exits_nonzero_and_status_shows_it() {
     assert!(text.contains("last result  failed: fetching http://127.0.0.1:9/"), "{text}");
     assert!(text.contains("last success never"), "{text}");
 }
+
+fn kernels_output(target: &str) -> String {
+    let spec = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/specs/qwen3-0.6b.toml");
+    let o = bin().args(["kernels", "--spec", spec.to_str().unwrap(), "--target", target]).output().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    stdout(&o)
+}
+
+fn kernels_golden(file: &str, target: &str) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden").join(file);
+    let got = kernels_output(target);
+    if std::env::var_os("KIR_BLESS").is_some() {
+        std::fs::write(&path, &got).unwrap();
+    }
+    assert_eq!(got, std::fs::read_to_string(&path).unwrap(), "{file} differs, rerun with KIR_BLESS=1");
+}
+
+#[test]
+fn kernels_prints_the_ir_and_cuda_source_for_a_named_target() {
+    kernels_golden("kernels_sm120.txt", "sm_120");
+}
+
+#[test]
+fn kernels_prints_wgsl_with_and_without_subgroups() {
+    kernels_golden("kernels_wgpu.txt", "wgpu");
+    kernels_golden("kernels_wgpu_nosubgroups.txt", "wgpu-nosubgroups");
+    assert!(kernels_output("wgpu").contains("subgroupAdd"));
+    assert!(!kernels_output("wgpu-nosubgroups").contains("subgroupAdd"));
+}
+
+#[test]
+fn kernels_rejects_an_unknown_target() {
+    let spec = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/specs/qwen3-0.6b.toml");
+    let o = bin().args(["kernels", "--spec", spec.to_str().unwrap(), "--target", "sm_50"]).output().unwrap();
+    assert!(!o.status.success());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("sm_50"));
+}

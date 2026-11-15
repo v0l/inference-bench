@@ -1,0 +1,73 @@
+spec qwen3-0.6b
+target Wgsl cc=0.0 sms=0 warp=1 threads=256 smem=16384 graphs=false pdl=false features=[]
+module hash 455163a56a7fa2b4
+
+== rmsnorm (dfc9813380035323)
+target Wgsl cc=0.0 sms=0 warp=1 threads=256 smem=16384 graphs=false pdl=false features=[]
+kernel rmsnorm threads=256 smem=1024
+  param x F32 Activation Read
+  param weight F32 Weight Read
+  param out F32 Activation Write
+  rmsnorm width=1024 eps=1e-6 sum=SharedTree
+
+@group(0) @binding(0) var<storage, read> x: array<f32>;
+@group(0) @binding(1) var<storage, read> weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
+struct P { a: vec4<u32>, b: vec4<u32> };
+@group(0) @binding(3) var<uniform> p: P;
+
+const WIDTH: u32 = 1024u;
+const EPS: f32 = 1e-6;
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
+    let t = wid.x;
+    let src = (p.a.x + t) * WIDTH;
+    let dst = (p.a.y + t) * WIDTH;
+    var ss = 0.0;
+    for (var i = li; i < WIDTH; i += 256u) {
+        let v = x[src + i];
+        ss += v * v;
+    }
+    red[li] = ss;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s >>= 1u) {
+        if (li < s) {
+            red[li] += red[li + s];
+        }
+        workgroupBarrier();
+    }
+    let total = red[0];
+    let inv = inverseSqrt(total / f32(WIDTH) + EPS);
+    for (var i = li; i < WIDTH; i += 256u) {
+        out[dst + i] = weight[i] * (x[src + i] * inv);
+    }
+}
+
+== swiglu (c2b23dd811a1d0b0)
+target Wgsl cc=0.0 sms=0 warp=1 threads=256 smem=16384 graphs=false pdl=false features=[]
+kernel swiglu threads=256 smem=0
+  param gate_up F32 Activation Read
+  param out F32 Activation Write
+  gated_activation width=3072 act=Silu
+
+@group(0) @binding(0) var<storage, read> gate_up: array<f32>;
+@group(0) @binding(1) var<storage, read_write> out: array<f32>;
+struct P { a: vec4<u32>, b: vec4<u32> };
+@group(0) @binding(2) var<uniform> p: P;
+
+const WIDTH: u32 = 3072u;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x + gid.y * 8388608u;
+    if (idx >= p.a.x * WIDTH) {
+        return;
+    }
+    let t = idx / WIDTH;
+    let i = idx % WIDTH;
+    let g = gate_up[t * 2u * WIDTH + i * 2u];
+    let a = g / (1.0 + exp(-g));
+    out[idx] = a * gate_up[t * 2u * WIDTH + i * 2u + 1u];
+}

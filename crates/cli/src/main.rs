@@ -190,6 +190,13 @@ enum Cmd {
         #[arg(long, help = "latency or throughput")]
         objective: Option<String>,
     },
+    #[command(about = "Print the IR and emitted source of the kernels a spec builds, for the live device or a named target")]
+    Kernels {
+        #[arg(long, help = "Spec name or path")]
+        spec: String,
+        #[arg(long, help = "sm_120, sm_80, wgpu or wgpu-nosubgroups; the live CUDA device when omitted")]
+        target: Option<String>,
+    },
     #[command(about = "Spec files: where each comes from, and updates from GitHub")]
     Specs {
         #[command(subcommand)]
@@ -248,6 +255,17 @@ fn plan_command(data: &Path, spec: &str, config: &Path, context: Option<usize>, 
         None => {}
     }
     print!("{}", placement.place(&spec)?.render());
+    Ok(())
+}
+
+fn kernels_command(data: &Path, spec: &str, target: Option<&str>) -> Result<()> {
+    let path = resolve_spec_names(data, spec);
+    let spec = specrt::spec::Spec::load(Path::new(&path))?;
+    let target = match target {
+        Some(name) => kir::Target::named(name).with_context(|| format!("target {name:?} is not sm_120, sm_80, wgpu or wgpu-nosubgroups"))?,
+        None => specrt::codegen::live_target()?,
+    };
+    print!("{}", specrt::codegen::kernels_report(&spec, &target)?);
     Ok(())
 }
 
@@ -449,6 +467,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Specs { cmd } => specs_command(&data, cmd)?,
+        Cmd::Kernels { spec, target } => kernels_command(&data, spec, target.as_deref())?,
         Cmd::Plan { spec, config, context, slots, objective } => plan_command(&data, spec, config, *context, *slots, objective.as_deref())?,
     }
     Ok(())

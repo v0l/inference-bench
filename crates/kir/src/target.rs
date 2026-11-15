@@ -83,6 +83,16 @@ impl Target {
         Target::wgpu(256, 16 * 1024)
     }
 
+    pub fn named(name: &str) -> Option<Target> {
+        match name {
+            "sm_120" => Some(Target::sm_120()),
+            "sm_80" => Some(Target::sm_80()),
+            "wgpu" => Some(Target::wgpu_baseline().with_subgroups(32)),
+            "wgpu-nosubgroups" => Some(Target::wgpu_baseline()),
+            _ => None,
+        }
+    }
+
     pub fn with_feature(mut self, f: Feature) -> Target {
         self.features |= bit(f);
         self

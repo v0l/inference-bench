@@ -1,0 +1,60 @@
+spec qwen3-0.6b
+target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16]
+module hash f1f94926d23f41e7
+
+== rmsnorm (69f260464aee0790)
+target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16]
+kernel rmsnorm threads=1024 smem=128
+  param x F32 Activation Read
+  param weight F32 Weight Read
+  param out F32 Activation Write
+  rmsnorm width=1024 eps=1e-6 sum=WarpShuffle
+
+__device__ __forceinline__ float kir_warp_sum(float v) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    return v;
+}
+
+__device__ float kir_block_sum(float v, float* scratch) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+    int warps = (blockDim.x + 31) >> 5;
+    v = kir_warp_sum(v);
+    __syncthreads();
+    if (lane == 0) scratch[warp] = v;
+    __syncthreads();
+    float r = 0.0f;
+    for (int i = 0; i < warps; i++) r += scratch[i];
+    return r;
+}
+
+extern "C" __global__ void __launch_bounds__(1024) rmsnorm(const float* x, const float* weight, float* out) {
+    constexpr int WIDTH = 1024;
+    __shared__ float scratch[32];
+    x += (size_t)blockIdx.x * WIDTH;
+    out += (size_t)blockIdx.x * WIDTH;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) ss += x[i] * x[i];
+    float inv = rsqrtf(kir_block_sum(ss, scratch) / WIDTH + 1e-6f);
+    for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) out[i] = weight[i] * (x[i] * inv);
+}
+
+
+== swiglu (08311374b93c0e61)
+target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16]
+kernel swiglu threads=256 smem=0
+  param gate_up F32 Activation Read
+  param out F32 Activation Write
+  gated_activation width=3072 act=Silu
+
+extern "C" __global__ void __launch_bounds__(256) swiglu(const float* gate_up, float* out) {
+    constexpr int WIDTH = 3072;
+    gate_up += (size_t)blockIdx.y * 2 * WIDTH;
+    out += (size_t)blockIdx.y * WIDTH;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < WIDTH; i += gridDim.x * blockDim.x) {
+        float g = gate_up[i * 2];
+        float a = g / (1.0f + expf(-g));
+        out[i] = a * gate_up[i * 2 + 1];
+    }
+}
+
