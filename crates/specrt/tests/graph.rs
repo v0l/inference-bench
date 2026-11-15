@@ -91,6 +91,11 @@ fn the_graph_lowers_to_the_reference_plan_for_every_config() {
     for path in configs() {
         let json = std::fs::read_to_string(&path).unwrap();
         let Ok(spec) = Spec::from_hf_config_serving(&json).or_else(|_| Spec::describe_hf_config(&json)) else { continue };
+        if spec.norm.sandwich {
+            sandwich_plan_is_well_formed(&spec);
+            checked += 1;
+            continue;
+        }
         for tc in [true, false] {
             for phase in [Phase::Prefill, Phase::Decode] {
                 let mut want = reference(&spec, phase, tc);
@@ -144,5 +149,18 @@ fn runtime_and_kir_have_no_architecture_names() {
         for banned in ["qwen", "llama", "gemma", "mistral", "deepseek"] {
             assert!(!text.contains(banned), "{} mentions {banned}", f.display());
         }
+    }
+}
+
+fn sandwich_plan_is_well_formed(spec: &Spec) {
+    for phase in [Phase::Prefill, Phase::Decode] {
+        let plan = Plan::build(spec, phase, true);
+        let ops = plan.layer(Block::Full);
+        let adds: Vec<_> = ops.iter().filter(|o| matches!(o, Op::NormAdd { .. })).collect();
+        assert_eq!(adds.len(), 2, "{phase:?}");
+        assert!(ops.contains(&Op::Norm { which: NormKind::PreMlp, into: Buf::XnPlanes }));
+        assert_eq!(ops.iter().filter(|o| matches!(o, Op::Clear { .. })).count(), 2);
+        assert_eq!(plan.layer(Block::Sliding), ops);
+        assert_eq!(plan.tail.contains(&Op::LogitSoftcap), spec.dims.logit_softcap.is_some());
     }
 }
