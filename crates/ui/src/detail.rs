@@ -173,6 +173,11 @@ fn pick_compare(app: &App, detail: &mut Detail, ui: &mut egui::Ui) {
     }
 }
 
+fn header_chip(ui: &mut egui::Ui, text: &str, tint: egui::Color32, lit: bool) {
+    let r = chip(ui, text, tint, lit);
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("header chip {text}")));
+}
+
 fn header(app: &mut App, detail: &mut Detail, ui: &mut egui::Ui) -> bool {
     let mut back = false;
     let mut load = false;
@@ -181,18 +186,6 @@ fn header(app: &mut App, detail: &mut Detail, ui: &mut egui::Ui) -> bool {
             back = true;
         }
         ui.label(egui::RichText::new(&detail.model).font(legend_font(14.0)).color(VALUE));
-        if let Ok(v) = &detail.view {
-            chip(ui, v.source.label(), LEGEND, false);
-            let mix = v.anatomy.quant_mix();
-            let total: u64 = mix.iter().map(|m| m.1).sum::<u64>().max(1);
-            for (q, bytes) in &mix {
-                let text = match mix.len() {
-                    1 => specrt::anatomy::quant_tag(*q).to_string(),
-                    _ => format!("{} {:.0}%", specrt::anatomy::quant_tag(*q), *bytes as f64 / total as f64 * 100.0),
-                };
-                chip(ui, &text, READOUT, true);
-            }
-        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let runs = app.library.iter().find(|m| m.name == detail.model).is_some_and(crate::models::runs_here);
             if runs && ui.add(Key::new("load").solid(READOUT).min_width(100.0).id_salt("detail-load")).clicked() {
@@ -202,6 +195,20 @@ fn header(app: &mut App, detail: &mut Detail, ui: &mut egui::Ui) -> bool {
             ui.label(legend("compare with"));
         });
     });
+    if let Ok(v) = &detail.view {
+        ui.horizontal_wrapped(|ui| {
+            header_chip(ui, v.source.label(), LEGEND, false);
+            let mix = v.anatomy.quant_mix();
+            let total: u64 = mix.iter().map(|m| m.1).sum::<u64>().max(1);
+            for (q, bytes) in &mix {
+                let text = match mix.len() {
+                    1 => specrt::anatomy::quant_tag(*q).to_string(),
+                    _ => format!("{} {:.0}%", specrt::anatomy::quant_tag(*q), *bytes as f64 / total as f64 * 100.0),
+                };
+                header_chip(ui, &text, READOUT, true);
+            }
+        });
+    }
     if load && let Some(m) = app.library.iter().find(|m| m.name == detail.model).cloned() {
         app.open_load_dialog(&m);
     }

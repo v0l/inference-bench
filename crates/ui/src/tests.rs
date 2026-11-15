@@ -1354,6 +1354,27 @@ fn two_models_with_one_short_name_show_distinct_names_and_only_the_loaded_one_is
 }
 
 #[test]
+fn the_detail_header_chips_do_not_overlap_the_compare_label_at_1280() {
+    let mut h = harness("headerfit", Tab::Models);
+    let view = detail_view("orcarouter/Qwen3.8-27B-Uncensored-NVFP4", Some("qwen3.8-27b-exact.toml"));
+    let mut view = view;
+    view.name = "orcarouter/Qwen3.8-27B-Uncensored-NVFP4".into();
+    let mut d = detail::Detail::from_view(view);
+    d.model = "orcarouter/Qwen3.8-27B-Uncensored-NVFP4".into();
+    h.state_mut().models.detail = Some(d);
+    h.run();
+    let compare = h.get_by_label_contains("compare with").rect();
+    let chips: Vec<egui::Rect> = h.query_all_by_label_contains("header chip").map(|n| n.rect()).collect();
+    assert!(chips.len() >= 2, "{}", chips.len());
+    for (i, c) in chips.iter().enumerate() {
+        assert!(!c.intersects(compare), "chip {i} {c:?} overlaps {compare:?}");
+        for o in &chips[i + 1..] {
+            assert!(!c.intersects(*o), "{c:?} {o:?}");
+        }
+    }
+}
+
+#[test]
 fn the_library_list_is_flat_and_search_matches_the_base() {
     let mut h = harness("libflat", Tab::Models);
     tree_library(h.state_mut());
