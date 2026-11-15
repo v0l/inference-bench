@@ -163,3 +163,23 @@ spec: test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered ou
 `mtp` includes greedy identity against plain decode at batches 1, 3, 4, 5 and 8 (k = 1 to 3, every
 draft head, fp8 KV) and the chi-square rejection-sampling tests. `real27b` includes the vLLM
 greedy and logprob agreement and the MTP acceptance tests.
+
+### After the rebase onto 6a536ce
+
+The reference test also covers the 122B's GQA 32/2 shape (32 q heads over 2 KV heads, group 16,
+verify groups up to 4 rows: 64 query rows, 4 warps). Shared memory holds only the K/V tiles
+(32 KB at head_dim 256), so it does not grow with the group; max error 3.9e-6.
+
+```
+decode_attention: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 52.88s
+mtp: test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 200.85s
+serving: test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 106.31s
+linear: test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 83.79s
+truncation: test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 61.44s
+tiny27b: test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 102.40s
+real122b: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 33.63s
+```
+
+`real122b` greedy: " Berlin. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of
+Portugal is Lisbon. The", the continuation in `docs/specrt-moe.md`. 12 x 32k against rebased
+master: 304.8 to 504.9 tok/s (full-batch step 113.2 to 66.4 ms).
