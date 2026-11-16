@@ -61,7 +61,19 @@ Measured on the RTX PRO 6000 beside other jobs; none of these are speed numbers.
 | Tiny SigLIP fixture, square and 4-tile | embeddings 2e-4, logits KL under 2e-5 on every row that predicts a token |
 | 27B FP8 (RedHatAI) against vLLM, 9 prompts including a 3,630 token one past the window | top-1 419 of 432, mean KL 0.0037, max 0.11 |
 
-The tiny fixture does not compare the logits of the image-token rows themselves. Their next token is another
-image token, so nothing reads them. Their per-layer hidden states agree with transformers to about 0.2% of the
-row scale, yet their logits differ by a KL near 0.05; that gap is not explained. The rows that read the image
-(every text row after it) match to KL 2e-5, so the bidirectional block mask and the splice are exercised.
+## The image-token rows of the tiny fixture
+
+An earlier version of the tiny test left out the rows of the image tokens, because their logits were 0.04 to 0.05
+KL from the reference while their hidden states agreed. The cause was the reference, not the engine:
+`Gemma3ForConditionalGeneration` in transformers 5.22 does not apply `final_logit_softcapping` (only
+`Gemma3ForCausalLM` does), so its logits are uncapped. The fixture sets a cap of 30, which the text-only model
+and this engine apply.
+
+| Row group | After final norm, ours against `hidden_states[-1]` | Logits against HF, uncapped | Logits against HF with the cap applied |
+|---|---|---|---|
+| text rows | relative up to 6e-4 | KL 1e-6 to 2e-5 | KL below 1e-8 |
+| image rows (4) | relative 7e-4 to 1.3e-3 | KL 3.7e-2 to 5.3e-2 | KL 4e-7 to 5e-6 |
+
+The head itself is the same on every row: our kernel logits equal the head applied to our own hidden state to
+5e-5. `scripts/tiny_gemma3_vision.py` now applies the cap to the reference, and the test checks every row with a
+bound of 1e-4. The real 4B and 27B configs set no final soft-cap, so they never saw this.

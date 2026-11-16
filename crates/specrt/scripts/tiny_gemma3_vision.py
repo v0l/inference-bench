@@ -145,6 +145,9 @@ def main(out_dir):
         with torch.inference_mode():
             feats = model.get_image_features(pixel_values=pixel).pooler_output.reshape(-1, 128).float()
             logits = model(input_ids=input_ids, pixel_values=pixel, token_type_ids=token_type).logits[0]
+            cap = cfg.get_text_config().final_logit_softcapping
+            if cap:
+                logits = cap * torch.tanh(logits / cap)
         feats.numpy().astype(np.float32).tofile(out / f"{name}.embeds.bin")
         logits.float().numpy().astype(np.float32).tofile(out / f"{name}.logits.bin")
         (out / f"{name}.json").write_text(json.dumps({"ids": ids, "tiles": len(tiles), "vocab": 600, "grid": [len(tiles), gh, gh]}))

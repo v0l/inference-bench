@@ -66,7 +66,7 @@ fn pan_and_scan_boxes_follow_the_processor_rules() {
 
 #[test]
 #[ignore = "needs a CUDA GPU and scripts/tiny_gemma3_vision.py output in SPECRT_REF_DIR"]
-fn tiny_gemma3_vision_matches_transformers_on_every_row_that_predicts_a_token() {
+fn tiny_gemma3_vision_matches_transformers_on_every_row() {
     let mut rt = Runtime::load(&spec(), 256).unwrap();
     assert!(rt.has_vision());
     let vocab = 600;
@@ -95,13 +95,10 @@ fn tiny_gemma3_vision_matches_transformers_on_every_row_that_predicts_a_token() 
             let b = &theirs[r * vocab..(r + 1) * vocab];
             let (la, lb) = (log_softmax(a), log_softmax(b));
             let kl: f64 = lb.iter().zip(&la).map(|(q, p)| q.exp() * (q - p)).sum();
-            if ids[r] == 592 {
-                continue;
-            }
             worst = worst.max(kl);
         }
-        eprintln!("{case}: worst logits KL over the rows that are not image tokens {worst:e}");
-        assert!(worst < 5e-3, "{case}: logits KL {worst}");
+        eprintln!("{case}: worst logits KL over every row, image tokens included {worst:e}");
+        assert!(worst < 1e-4, "{case}: logits KL {worst}");
     }
 }
 
