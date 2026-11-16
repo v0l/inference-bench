@@ -466,6 +466,10 @@ impl Engine {
         self.sampling
     }
 
+    pub fn tool_format(&self) -> crate::chat::ToolFormat {
+        self.chat.as_ref().map(|c| c.tool_format()).unwrap_or_default()
+    }
+
     pub fn thinking(&self) -> crate::chat::Thinking {
         self.chat.as_ref().map(|c| c.thinking()).unwrap_or_default()
     }

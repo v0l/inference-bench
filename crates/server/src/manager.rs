@@ -67,6 +67,10 @@ pub trait ModelSource: Send + Sync + 'static {
         Vec::new()
     }
 
+    fn tool_format(&self) -> inference_bench_core::specrt_chat::ToolFormat {
+        Default::default()
+    }
+
     fn suspend(&self) -> bool {
         false
     }
@@ -96,6 +100,7 @@ pub struct LoadedModel {
     pool: Mutex<Vec<Box<dyn Target>>>,
     sem: Arc<Semaphore>,
     stats: Mutex<Option<Box<dyn Target>>>,
+    pub tools: inference_bench_core::specrt_chat::ToolFormat,
 }
 
 impl LoadedModel {
@@ -346,6 +351,13 @@ impl Manager {
         v
     }
 
+    pub fn tool_format(&self, id: &str) -> inference_bench_core::specrt_chat::ToolFormat {
+        if let Some(source) = &self.source {
+            return source.tool_format();
+        }
+        self.loaded.lock().unwrap().get(id).map(|m| m.tools).unwrap_or_default()
+    }
+
     pub fn props(&self, id: &str) -> Option<serde_json::Value> {
         let loaded = self.loaded.lock().unwrap();
         let m = loaded.get(id)?;
@@ -576,6 +588,12 @@ impl Manager {
         };
         let vram = if measured > 0 { measured } else { cfg.vram_bytes.unwrap_or(0) };
         let backend_label = backends.first().map(|b| b.name().to_string()).unwrap_or_default();
+        let tools = backends.first().map(|b| b.capabilities().tools).unwrap_or_default();
+        match (tools, &self.config.tool_parser) {
+            (inference_bench_core::specrt_chat::ToolFormat::Unparsed, None) => tracing::warn!(model = %cfg.id, "the chat template has a tool format this server cannot parse: tool calls will come back as raw text"),
+            (format, None) => tracing::info!(model = %cfg.id, tool_parser = ?format.parser(), "tool parser inferred from the chat template"),
+            _ => {}
+        }
         let stats = backends.first().and_then(|b| b.share()).filter(|_| serving.is_some());
         tracing::info!(
             model = %cfg.id,
@@ -598,6 +616,7 @@ impl Manager {
             sem: Arc::new(Semaphore::new(backends.len())),
             pool: Mutex::new(backends),
             stats: Mutex::new(stats),
+            tools,
         });
         self.loaded.lock().unwrap().insert(cfg.id.clone(), model.clone());
         Ok(model)

@@ -23,9 +23,23 @@ pub fn rows(loaded: &Loaded) -> Vec<(String, String)> {
     rows
 }
 
+pub fn parser_rows(loaded: &Loaded) -> Vec<(String, String)> {
+    use inference_bench_core::specrt_chat::ToolFormat;
+    let config = inference_bench_server::config::ServerConfig::default().with_thinking(loaded.thinking).with_tools(loaded.tools);
+    let tools = match (&config.tool_parser, loaded.tools) {
+        (Some(p), _) => p.clone(),
+        (None, ToolFormat::Unparsed) => "not parsed: the template uses a tool format this server cannot read".to_string(),
+        (None, _) => "off: the template has no tools".to_string(),
+    };
+    let reasoning = config.reasoning_parser.unwrap_or_else(|| "off".to_string());
+    vec![("tool parser".to_string(), tools), ("reasoning parser".to_string(), reasoning)]
+}
+
 pub fn draw(ui: &mut egui::Ui, loaded: &Loaded) {
     section(ui, "running options", "what the loaded model is using now", |ui| {
-        let rows = rows(loaded);
+        let mut rows = rows(loaded);
+        let defaults_only = rows.len() <= 4 && loaded.parallel_note.is_none();
+        rows.extend(parser_rows(loaded));
         for (label, value) in &rows {
             let line = Line::new().legend(label).column(ui, 120.0);
             if label == "fallback" {
@@ -34,7 +48,7 @@ pub fn draw(ui: &mut egui::Ui, loaded: &Loaded) {
                 line.value(value.clone()).show(ui);
             }
         }
-        if rows.len() <= 4 && loaded.parallel_note.is_none() {
+        if defaults_only {
             hint(ui, "every advanced option is at its default");
         }
     });

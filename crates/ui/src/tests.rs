@@ -378,6 +378,120 @@ fn the_server_tab_starts_and_serves_the_loaded_model() {
     h.state_mut().server.stop();
 }
 
+const WEATHER_XML: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nDublin\n</parameter>\n</function>\n</tool_call>";
+
+fn weather_tools() -> serde_json::Value {
+    serde_json::json!([{"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}])
+}
+
+fn tool_server(h: &mut Harness<'static, App>, tools: inference_bench_core::specrt_chat::ToolFormat) -> String {
+    {
+        let app = h.state_mut();
+        let script = Script { chunks: vec![WEATHER_XML.into()], ..script() };
+        let (factory, _) = ScriptedModel::factory_with_tools(script, Default::default(), tools);
+        app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), factory);
+        let m = app.library[0].clone();
+        app.load_model(&m);
+    }
+    pump_until(h, 20, "load", |a| a.loaded().is_some());
+    let handle = h.state().engine.handle();
+    h.state_mut().server.start(handle, 0, "", false);
+    h.state().server.running.as_ref().expect("server running").url()
+}
+
+#[test]
+fn the_app_server_parses_tool_calls_for_a_qwen_template() {
+    use inference_bench_core::specrt_chat::ToolFormat;
+    let mut h = harness("toolcalls", Tab::Server);
+    let url = tool_server(&mut h, ToolFormat::Qwen3Coder);
+    let body = |stream: bool| serde_json::json!({"messages":[{"role":"user","content":"weather?"}],"tools":weather_tools(),"stream":stream,"max_tokens":64});
+    let mut resp = ureq::post(format!("{url}/v1/chat/completions")).send_json(body(false)).unwrap();
+    let v: serde_json::Value = resp.body_mut().read_json().unwrap();
+    let choice = &v["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls", "{v}");
+    assert_eq!(choice["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+    let args: serde_json::Value = serde_json::from_str(choice["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args, serde_json::json!({"city": "Dublin"}));
+    assert!(choice["message"]["content"].as_str().is_none_or(str::is_empty), "{v}");
+    let mut resp = ureq::post(format!("{url}/v1/chat/completions")).send_json(body(true)).unwrap();
+    let text = resp.body_mut().read_to_string().unwrap();
+    assert!(text.contains("\"tool_calls\"") && text.contains("get_weather") && text.contains("Dublin"), "{text}");
+    assert!(text.contains("\"finish_reason\":\"tool_calls\""), "{text}");
+    assert!(!text.contains("<function="), "{text}");
+    let mut resp = ureq::get(format!("{url}/props")).call().unwrap();
+    let props: serde_json::Value = resp.body_mut().read_json().unwrap();
+    assert_eq!(props["tool_parser"], "qwen3_coder");
+    h.state_mut().server.stop();
+}
+
+#[test]
+fn the_app_server_reports_a_tool_format_it_cannot_parse() {
+    use inference_bench_core::specrt_chat::ToolFormat;
+    let mut h = harness("toolcalls-unparsed", Tab::Server);
+    let url = tool_server(&mut h, ToolFormat::Unparsed);
+    let mut resp = ureq::get(format!("{url}/props")).call().unwrap();
+    let props: serde_json::Value = resp.body_mut().read_json().unwrap();
+    assert!(props["tool_parser"].is_null());
+    assert_eq!(props["tool_format"], "Unparsed");
+    h.state_mut().server.stop();
+}
+
+struct XmlThenAnswer;
+
+impl inference_bench_core::native::Model for XmlThenAnswer {
+    fn generate(&mut self, _: &str, _: usize, _: specrt::runtime::Sampling) -> anyhow::Result<specrt::engine::Reply> {
+        anyhow::bail!("chat only")
+    }
+
+    fn chat(&mut self, messages: &[serde_json::Value], _: Option<&serde_json::Value>, _: usize, _: specrt::runtime::Sampling, on_text: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<specrt::engine::Reply> {
+        let text = if messages.iter().any(|m| m["role"] == "tool") { "The workspace is ready." } else { "<tool_call>\n<function=workspace>\n</function>\n</tool_call>" };
+        on_text(text);
+        Ok(specrt::engine::Reply { text: text.into(), prompt_tokens: 4, completion_tokens: 4, prefill_secs: 0.0, decode_secs: 0.0, peak_device_bytes: 0 })
+    }
+
+    fn logits(&mut self, _: &str) -> anyhow::Result<specrt::engine::PromptLogits> {
+        anyhow::bail!("chat only")
+    }
+
+    fn tool_format(&self) -> specrt::chat::ToolFormat {
+        specrt::chat::ToolFormat::Qwen3Coder
+    }
+}
+
+#[test]
+fn the_agent_chat_runs_a_tool_the_model_asked_for_in_xml() {
+    use agent_ui::chat::Turn;
+    let mut h = harness("agent-tools", Tab::Chat);
+    let work = dir("agent-tools-ws");
+    std::fs::create_dir_all(&work).unwrap();
+    {
+        let app = h.state_mut();
+        let factory: inference_bench_core::native::Factory = std::sync::Arc::new(|_, _| Ok(Box::new(XmlThenAnswer) as Box<dyn inference_bench_core::native::Model>));
+        app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), factory);
+        let m = app.library[0].clone();
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 10, "model never loaded", |a| a.loaded().is_some());
+    h.run();
+    let (desk, _asks) = agent_core::Desk::new(|| {});
+    {
+        let chat = &mut h.state_mut().chat.agent.chat;
+        chat.config.workspace = work.display().to_string();
+        chat.ask("check the workspace", desk);
+    }
+    pump_until(&mut h, 20, "agent turn", |a| !a.chat.agent.chat.busy());
+    let turns = &h.state().chat.agent.chat.turns;
+    let did = turns.iter().find_map(|t| match t {
+        Turn::Did { name, answer, .. } => Some((name.clone(), answer.clone())),
+        _ => None,
+    });
+    let (name, answer) = did.unwrap_or_else(|| panic!("no tool turn: {}", turns.iter().map(|t| match t { Turn::You(s) | Turn::Said(s) | Turn::Fault(s) => s.clone(), Turn::Did { name, .. } => name.clone() }).collect::<Vec<_>>().join(" | ")));
+    assert_eq!(name, "workspace");
+    assert!(matches!(answer, Some(Ok(_))), "{answer:?}");
+    assert!(turns.iter().any(|t| matches!(t, Turn::Said(s) if s.contains("workspace is ready"))));
+    assert!(!turns.iter().any(|t| matches!(t, Turn::Said(s) if s.contains("<function="))));
+}
+
 fn slow_script() -> Script {
     Script { chunks: (0..40).map(|i| format!("t{i} ")).collect(), chunk_delay_ms: 10, first_delay_ms: 20, usage: Some((12, 40)), ..script() }
 }

@@ -227,6 +227,17 @@ impl ServerConfig {
         self
     }
 
+    pub fn with_tools(mut self, tools: inference_bench_core::specrt_chat::ToolFormat) -> Self {
+        if self.tool_parser.is_none() {
+            self.tool_parser = tools.parser().map(String::from);
+        }
+        self
+    }
+
+    pub fn tool_parser_for(&self, tools: inference_bench_core::specrt_chat::ToolFormat) -> Option<String> {
+        self.tool_parser.clone().or_else(|| tools.parser().map(String::from))
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
         Self::parse(&text).with_context(|| path.display().to_string())
@@ -368,6 +379,17 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_parser_is_inferred_from_the_template_unless_configured() {
+        use inference_bench_core::specrt_chat::ToolFormat;
+        let inferred = ServerConfig::default().with_tools(ToolFormat::Qwen3Coder);
+        assert_eq!(inferred.tool_parser.as_deref(), Some("qwen3_coder"));
+        assert_eq!(ServerConfig::default().with_tools(ToolFormat::Hermes).tool_parser.as_deref(), Some("hermes"));
+        assert_eq!(ServerConfig::default().with_tools(ToolFormat::Unparsed).tool_parser, None);
+        let explicit = ServerConfig { tool_parser: Some("hermes".into()), ..ServerConfig::default() };
+        assert_eq!(explicit.with_tools(ToolFormat::Qwen3Coder).tool_parser.as_deref(), Some("hermes"));
+    }
 
     #[test]
     fn parses_models_and_limits() {

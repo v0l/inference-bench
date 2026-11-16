@@ -819,7 +819,11 @@ pub(crate) async fn props(State(state): State<Arc<AppState>>, Query(query): Quer
     let engine = engine.unwrap_or_else(|| json!({}));
     let defaults = &engine["generation"];
     let n_ctx = engine["n_ctx"].as_u64().or(state.config.max_model_len.map(|n| n as u64));
+    let tool_format = state.manager.tool_format(&id);
     Ok(Json(json!({
+        "tool_parser": state.config.tool_parser_for(tool_format),
+        "tool_format": format!("{tool_format:?}"),
+        "reasoning_parser": state.config.reasoning_parser,
         "model_alias": id,
         "model_path": state.config.model(&id).and_then(|m| m.model.clone()),
         "total_slots": state.config.concurrency(),

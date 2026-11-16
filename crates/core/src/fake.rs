@@ -162,6 +162,7 @@ pub struct ScriptedModel {
     script: Script,
     pub vision: bool,
     pub thinking: specrt::chat::Thinking,
+    pub tools: specrt::chat::ToolFormat,
     pub templates: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
@@ -185,13 +186,17 @@ impl ScriptedModel {
     }
 
     pub fn factory_probed(script: Script, thinking: specrt::chat::Thinking) -> (crate::native::Factory, Arc<Mutex<Vec<serde_json::Value>>>) {
+        Self::factory_with_tools(script, thinking, Default::default())
+    }
+
+    pub fn factory_with_tools(script: Script, thinking: specrt::chat::Thinking, tools: specrt::chat::ToolFormat) -> (crate::native::Factory, Arc<Mutex<Vec<serde_json::Value>>>) {
         let templates = Arc::new(Mutex::new(Vec::new()));
         let seen = templates.clone();
         let factory: crate::native::Factory = Arc::new(move |model, _| {
             if !script.models.iter().any(|m| m == model) {
                 anyhow::bail!("no config.json for {model} under the fake hub");
             }
-            Ok(Box::new(ScriptedModel { script: script.clone(), vision: script.vision, thinking, templates: seen.clone() }) as Box<dyn crate::native::Model>)
+            Ok(Box::new(ScriptedModel { script: script.clone(), vision: script.vision, thinking, tools, templates: seen.clone() }) as Box<dyn crate::native::Model>)
         });
         (factory, templates)
     }
@@ -254,6 +259,10 @@ impl crate::native::Model for ScriptedModel {
 
     fn thinking(&self) -> specrt::chat::Thinking {
         self.thinking
+    }
+
+    fn tool_format(&self) -> specrt::chat::ToolFormat {
+        self.tools
     }
 
     fn chat_media(

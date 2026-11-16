@@ -636,7 +636,7 @@ fn think_cap(state: &AppState, body: &Value, reasoning: bool, max_tokens: usize)
     Some(ThinkCap { budget: budget.max(1), wrapup: state.config.reasoning_wrapup.clone() })
 }
 
-fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), ApiError> {
+fn chat_setup(state: &AppState, body: &Value, model: &str) -> Result<(Value, OutputMode), ApiError> {
     let mut vars = toml_json(&state.config.chat_template_kwargs);
     let user = match &body["chat_template_kwargs"] {
         Value::Object(o) => o.clone(),
@@ -672,10 +672,11 @@ fn chat_setup(state: &AppState, body: &Value) -> Result<(Value, OutputMode), Api
     if !tools.is_empty() {
         vars["tools"] = Value::Array(tools.clone());
     }
+    let tool_parser = state.config.tool_parser_for(state.manager.tool_format(model));
     let output = OutputMode {
-        tool_parsing: state.config.tool_parser.is_some() && !tools.is_empty() && choice == "auto",
+        tool_parsing: tool_parser.is_some() && !tools.is_empty() && choice == "auto",
         reasoning: state.config.reasoning_parser.is_some() && vars["enable_thinking"] != json!(false),
-        hermes: state.config.tool_parser.as_deref() == Some("hermes"),
+        hermes: tool_parser.as_deref() == Some("hermes"),
         tools,
     };
     Ok((vars, output))
@@ -704,7 +705,7 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         max_tokens,
     };
     let (template_vars, output) = match chat {
-        true => chat_setup(state, body)?,
+        true => chat_setup(state, body, &state.manager.resolve(&model)?.id)?,
         false => (Value::Null, OutputMode::default()),
     };
     let think = think_cap(state, body, output.reasoning, max_tokens);
@@ -1058,6 +1059,12 @@ pub fn cache_salt(headers: &HeaderMap, body_salt: &str, shared: bool) -> String 
 }
 
 pub(crate) async fn prepare(state: Arc<AppState>, body: Value, chat: bool, salt: String) -> Result<Prepared, ApiError> {
+    if chat && body["tools"].as_array().is_some_and(|t| !t.is_empty()) {
+        let cfg = state.manager.resolve(&state.manager.requested_model(body["model"].as_str())?)?;
+        if !state.manager.is_loaded(&cfg.id) {
+            state.manager.preload(&cfg).await?;
+        }
+    }
     let mut p = parse_params(&state, &body, chat)?;
     p.model = state.manager.resolve(&p.model)?.id;
     let max_tokens = p.sampling.max_tokens;

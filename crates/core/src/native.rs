@@ -36,6 +36,10 @@ pub trait Model {
         Default::default()
     }
 
+    fn tool_format(&self) -> specrt::chat::ToolFormat {
+        Default::default()
+    }
+
     fn chat_media(
         &mut self,
         _messages: &[Value],
@@ -80,6 +84,10 @@ impl Model for specrt::Engine {
 
     fn thinking(&self) -> specrt::chat::Thinking {
         specrt::Engine::thinking(self)
+    }
+
+    fn tool_format(&self) -> specrt::chat::ToolFormat {
+        specrt::Engine::tool_format(self)
     }
 
     fn chat_media(
@@ -129,6 +137,7 @@ pub struct Native {
     worker: Option<Worker>,
     vision: bool,
     thinking: specrt::chat::Thinking,
+    tools: specrt::chat::ToolFormat,
     progress: Option<specrt::progress::Sink>,
 }
 
@@ -142,7 +151,7 @@ impl Native {
     }
 
     pub fn with_factory(max_ctx: Option<usize>, factory: Factory) -> Self {
-        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), progress: None }
+        Self { max_ctx, factory, worker: None, vision: false, thinking: Default::default(), tools: Default::default(), progress: None }
     }
 
     fn send(&mut self, job: Job) -> Result<(), BackendError> {
@@ -223,7 +232,7 @@ fn run_engine(
     max_ctx: Option<usize>,
     factory: Factory,
     progress: Option<specrt::progress::Sink>,
-    loaded: Sender<Result<(bool, specrt::chat::Thinking), BackendError>>,
+    loaded: Sender<Result<(bool, specrt::chat::Thinking, specrt::chat::ToolFormat), BackendError>>,
     jobs: std::sync::mpsc::Receiver<Job>,
     panic: Arc<Mutex<Option<String>>>,
 ) {
@@ -240,7 +249,7 @@ fn run_engine(
             return;
         }
     };
-    let _ = loaded.send(Ok((engine.accepts_media(), engine.thinking())));
+    let _ = loaded.send(Ok((engine.accepts_media(), engine.thinking(), engine.tool_format())));
     while let Ok(job) = jobs.recv() {
         if let Err(p) = catch_unwind(AssertUnwindSafe(|| job(engine.as_mut()))) {
             let why = panic_text(p.as_ref());
@@ -263,7 +272,7 @@ impl Target for Native {
     }
 
     fn capabilities(&self) -> Capabilities {
-        Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking, ..Capabilities::default() }
+        Capabilities { streaming: true, logits: true, memory: true, vision: self.vision, thinking: self.thinking, tools: self.tools, ..Capabilities::default() }
     }
 
     fn set_progress(&mut self, sink: Option<specrt::progress::Sink>) {
@@ -284,10 +293,11 @@ impl Target for Native {
         let worker = Worker { jobs: Some(jobs), thread: Some(thread), panic };
         let outcome = loaded_rx.recv().unwrap_or_else(|_| Err(BackendError::failed("the native engine stopped while loading")));
         match outcome {
-            Ok((vision, thinking)) => {
+            Ok((vision, thinking, tools)) => {
                 self.worker = Some(worker);
                 self.vision = vision;
                 self.thinking = thinking;
+                self.tools = tools;
                 Ok(())
             }
             Err(e) => {

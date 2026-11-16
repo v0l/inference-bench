@@ -1,4 +1,4 @@
-use specrt::chat::ChatTemplate;
+use specrt::chat::{ChatTemplate, ToolFormat};
 use std::path::Path;
 
 fn template(file: &str) -> ChatTemplate {
@@ -83,4 +83,57 @@ fn the_template_says_whether_it_supports_and_opens_thinking() {
     let qwen = ChatTemplate::from_files(&read("qwen3.8-27b.tokenizer_config.json"), Some(&read("qwen3.8-27b.chat_template.jinja"))).unwrap().unwrap();
     assert_eq!(qwen.thinking(), Thinking::OpensInPrompt);
     assert_eq!(template("Qwen2.5-0.5B.tokenizer_config.json").thinking(), Thinking::Unsupported);
+}
+
+fn cached_template(repo: &str) -> Option<ChatTemplate> {
+    let snapshots = dirs_home()?.join(".cache/huggingface/hub").join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
+    let snapshot = std::fs::read_dir(snapshots).ok()?.next()?.ok()?.path();
+    let config = std::fs::read_to_string(snapshot.join("tokenizer_config.json")).ok()?;
+    let jinja = std::fs::read_to_string(snapshot.join("chat_template.jinja")).ok();
+    ChatTemplate::from_files(&config, jinja.as_deref()).ok()?
+}
+
+fn dirs_home() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(Into::into)
+}
+
+#[test]
+fn every_family_template_gets_its_tool_parser_or_an_explicit_none() {
+    let table = [
+        ("Qwen/Qwen3-0.6B", ToolFormat::Hermes),
+        ("Qwen/Qwen2.5-0.5B", ToolFormat::Hermes),
+        ("Qwen/Qwen3.5-4B-Base", ToolFormat::Qwen3Coder),
+        ("Qwen/Qwen3.8-27B-FP8", ToolFormat::Qwen3Coder),
+        ("orcarouter/Qwen3.8-27B-Uncensored-NVFP4", ToolFormat::Qwen3Coder),
+        ("Sehyo/Qwen3.5-122B-A10B-NVFP4", ToolFormat::Qwen3Coder),
+        ("HuggingFaceTB/SmolLM3-3B", ToolFormat::Unparsed),
+        ("microsoft/Phi-4-mini-instruct", ToolFormat::Unparsed),
+        ("microsoft/Phi-3-mini-4k-instruct", ToolFormat::None),
+        ("allenai/OLMo-2-0425-1B", ToolFormat::None),
+        ("ibm-granite/granite-3.3-2b-base", ToolFormat::Unparsed),
+        ("Locutusque/TinyMistral-248M", ToolFormat::None),
+        ("RedHatAI/Mistral-Small-24B-Instruct-2501-FP8-dynamic", ToolFormat::None),
+        ("unsloth/Llama-3.2-1B", ToolFormat::Unparsed),
+    ];
+    let mut seen = 0;
+    for (repo, want) in table {
+        if let Some(t) = cached_template(repo) {
+            seen += 1;
+            eprintln!("{repo}: {:?}", t.tool_format());
+            assert_eq!(t.tool_format(), want, "{repo}");
+        }
+    }
+    eprintln!("{seen} cached family templates checked");
+}
+
+#[test]
+fn the_tool_format_comes_from_the_template_text() {
+    let json = |t: &str| format!(r#"{{"chat_template": {}}}"#, serde_json::to_string(t).unwrap());
+    let format = |t: &str| ChatTemplate::from_tokenizer_config(&json(t)).unwrap().unwrap().tool_format();
+    assert_eq!(format("{{ messages }}"), ToolFormat::None);
+    assert_eq!(format("{% if tools %}<tool_call>{\"name\": \"x\"}</tool_call>{% endif %}"), ToolFormat::Hermes);
+    assert_eq!(format("{% if tools %}<tool_call>\n<function=x>\n<parameter=a>{% endif %}"), ToolFormat::Qwen3Coder);
+    assert_eq!(format("{% if tools %}[AVAILABLE_TOOLS]{% endif %}"), ToolFormat::Unparsed);
+    assert_eq!(ToolFormat::Hermes.parser(), Some("hermes"));
+    assert_eq!(ToolFormat::Unparsed.parser(), None);
 }

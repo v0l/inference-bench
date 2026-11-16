@@ -18,6 +18,10 @@ impl ModelSource for Handle {
             .collect()
     }
 
+    fn tool_format(&self) -> inference_bench_core::specrt_chat::ToolFormat {
+        Handle::tools(self)
+    }
+
     fn suspended(&self) -> Vec<SourceModel> {
         Handle::suspended(self)
             .map(|l| {
@@ -73,6 +77,7 @@ impl Target for EngineBackend {
             streaming: true,
             vision: loaded.as_ref().is_some_and(|l| l.vision),
             thinking: self.handle.thinking(),
+            tools: self.handle.tools(),
             logprobs: batched,
             batched,
             ..Capabilities::default()

@@ -10,6 +10,25 @@ pub enum Thinking {
     OpensInPrompt,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ToolFormat {
+    #[default]
+    None,
+    Qwen3Coder,
+    Hermes,
+    Unparsed,
+}
+
+impl ToolFormat {
+    pub fn parser(self) -> Option<&'static str> {
+        match self {
+            ToolFormat::Qwen3Coder => Some("qwen3_coder"),
+            ToolFormat::Hermes => Some("hermes"),
+            ToolFormat::None | ToolFormat::Unparsed => None,
+        }
+    }
+}
+
 pub struct ChatTemplate {
     source: String,
     bos_token: String,
@@ -105,6 +124,19 @@ impl ChatTemplate {
         match self.render_with(&probe, &serde_json::json!({"enable_thinking": true})) {
             Ok(text) if text.trim_end().ends_with("<think>") => Thinking::OpensInPrompt,
             _ => Thinking::Optional,
+        }
+    }
+
+    pub fn tool_format(&self) -> ToolFormat {
+        let s = &self.source;
+        if s.contains("<function=") && s.contains("<parameter=") {
+            ToolFormat::Qwen3Coder
+        } else if s.contains("<tool_call>") {
+            ToolFormat::Hermes
+        } else if s.contains("tools") || s.contains("tool_calls") {
+            ToolFormat::Unparsed
+        } else {
+            ToolFormat::None
         }
     }
 

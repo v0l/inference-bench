@@ -35,6 +35,7 @@ pub struct Loaded {
     pub engine: specrt::options::EngineChoice,
     pub speculation: Option<String>,
     pub thinking: specrt::chat::Thinking,
+    pub tools: specrt::chat::ToolFormat,
 }
 
 pub enum Command {
@@ -94,6 +95,10 @@ impl Handle {
 
     pub fn thinking(&self) -> specrt::chat::Thinking {
         self.loaded().map(|l| l.thinking).unwrap_or_default()
+    }
+
+    pub fn tools(&self) -> specrt::chat::ToolFormat {
+        self.loaded().map(|l| l.tools).unwrap_or_default()
     }
 
     pub fn suspended(&self) -> Option<Loaded> {
@@ -214,6 +219,10 @@ impl Engine {
     pub fn thinking(&self) -> specrt::chat::Thinking {
         self.loaded().map(|l| l.thinking).unwrap_or_default()
     }
+
+    pub fn tools(&self) -> specrt::chat::ToolFormat {
+        self.loaded().map(|l| l.tools).unwrap_or_default()
+    }
 }
 
 impl Drop for Engine {
@@ -287,6 +296,7 @@ struct Opened {
     backend: Backend,
     vision: bool,
     thinking: specrt::chat::Thinking,
+    tools: specrt::chat::ToolFormat,
     seqs: usize,
     note: Option<String>,
     speculation: Option<String>,
@@ -314,7 +324,7 @@ fn open(
                 let caps = target.capabilities();
                 *stats.lock().unwrap() = target.share();
                 let speculation = target.speculation();
-                return Ok(Opened { backend: Backend::Batched { target, running: Vec::new() }, vision: caps.vision, thinking: caps.thinking, seqs: attempt, note, speculation });
+                return Ok(Opened { backend: Backend::Batched { target, running: Vec::new() }, vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: attempt, note, speculation });
             }
             Err(e) => {
                 tracing::warn!(model = model_id, seqs = attempt, error = %e, "the serving engine could not load");
@@ -328,7 +338,7 @@ fn open(
     native.set_progress(Some(progress.clone()));
     native.load(model_id)?;
     let caps = native.capabilities();
-    Ok(Opened { backend: Backend::Single(native), vision: caps.vision, thinking: caps.thinking, seqs: 1, note, speculation: None })
+    Ok(Opened { backend: Backend::Single(native), vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: 1, note, speculation: None })
 }
 
 fn run(
@@ -427,6 +437,7 @@ fn run(
                             engine,
                             speculation: o.speculation,
                             thinking: o.thinking,
+                            tools: o.tools,
                         };
                         *shared.loaded.lock().unwrap() = Some(info.clone());
                         last_load = Some(again);
