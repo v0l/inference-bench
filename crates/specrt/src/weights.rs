@@ -246,7 +246,7 @@ impl Checkpoint {
                 continue;
             }
             let mut vec = vec![0u8; len.div_ceil(page)];
-            let ok = unsafe { libc::mincore(sh.map.as_ptr() as *mut libc::c_void, len, vec.as_mut_ptr()) } == 0;
+            let ok = unsafe { libc::mincore(sh.map.as_ptr() as *mut libc::c_void, len, vec.as_mut_ptr() as *mut _) } == 0;
             if !ok {
                 return 0.0;
             }

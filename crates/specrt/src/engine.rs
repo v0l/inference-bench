@@ -354,6 +354,7 @@ impl Device {
         match spec.runtime.backend {
             BackendChoice::Cuda => Ok(Device::Cuda(Runtime::load(spec, max_ctx)?)),
             BackendChoice::Wgpu => Self::wgpu(spec, max_ctx),
+            BackendChoice::Auto if !crate::hardware::cuda_present() => Self::wgpu(spec, max_ctx),
             BackendChoice::Auto => match Runtime::load(spec, max_ctx) {
                 Ok(rt) => Ok(Device::Cuda(rt)),
                 Err(cuda) => Self::wgpu(spec, max_ctx).map_err(|wgpu| cuda.context(format!("wgpu fallback failed too: {wgpu:#}"))),

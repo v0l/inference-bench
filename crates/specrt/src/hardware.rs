@@ -255,7 +255,14 @@ pub fn estimated_bandwidth_gbs(memory_clock_khz: i32, bus_bits: i32) -> f64 {
     2.0 * memory_clock_khz as f64 * 1e3 * (bus_bits as f64 / 8.0) / 1e9
 }
 
+pub fn cuda_present() -> bool {
+    unsafe { cudarc::driver::sys::is_culib_present() }
+}
+
 pub fn probe_idle_cuda() -> Result<Machine> {
+    if !cuda_present() {
+        return Err(anyhow!("no CUDA driver library on this machine"));
+    }
     use cudarc::driver::sys::CUdevice_attribute as A;
     use cudarc::driver::result;
     result::init().map_err(|e| anyhow!("no CUDA driver: {e:?}"))?;
@@ -282,6 +289,9 @@ pub fn probe_idle_cuda() -> Result<Machine> {
 }
 
 pub fn probe_cuda() -> Result<Machine> {
+    if !cuda_present() {
+        return Err(anyhow!("no CUDA driver library on this machine"));
+    }
     use cudarc::driver::sys::CUdevice_attribute as A;
     use cudarc::driver::{CudaContext, result, sys};
     let count = CudaContext::device_count().map_err(|e| anyhow!("no CUDA driver: {e:?}"))? as usize;

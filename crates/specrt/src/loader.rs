@@ -235,10 +235,20 @@ pub struct Source {
     direct_ok: AtomicBool,
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn direct_flag() -> i32 {
+    libc::O_DIRECT
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn direct_flag() -> i32 {
+    0
+}
+
 impl Source {
     pub fn open(path: &Path, want_direct: bool) -> Result<Source> {
         let plain = File::open(path).with_context(|| path.display().to_string())?;
-        let direct = if want_direct { std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path).ok() } else { None };
+        let direct = if want_direct && cfg!(any(target_os = "linux", target_os = "android")) { std::fs::OpenOptions::new().read(true).custom_flags(direct_flag()).open(path).ok() } else { None };
         Ok(Source { direct_ok: AtomicBool::new(direct.is_some()), plain, direct })
     }
 

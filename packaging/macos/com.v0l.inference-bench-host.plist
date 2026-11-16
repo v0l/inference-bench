@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.v0l.inference-bench-host</string>
+    <key>UserName</key>
+    <string>kieran</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/inference-bench/inference-bench</string>
+        <string>host</string>
+        <string>--config</string>
+        <string>/Users/kieran/.config/inference-bench/host.toml</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/kieran</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/inference-bench-host.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/inference-bench-host.log</string>
+</dict>
+</plist>
