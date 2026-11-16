@@ -338,3 +338,49 @@ fn mdns_bound_to_a_missing_interface_never_sees_a_stage_on_another_one() {
         }
     }
 }
+
+#[test]
+fn two_app_instances_see_each_other_with_all_gpus_and_busy_state() {
+    use specrt::cluster::{ANNOUNCEMENT_VERSION, Peer, PeerGpu};
+    use specrt::discovery::{PeerAnnouncer, PeerBrowser, PeerEvent};
+    let port = 15490;
+    if !multicast_works(port) {
+        eprintln!("multicast is not available here, skipping");
+        return;
+    }
+    let gpu = |host: &str, i: usize| {
+        let mut d = device(&specrt::hardware::device_name(host, i), None);
+        d.ordinal = Some(i);
+        d.reserve_gib = None;
+        PeerGpu { device: d, gpu_name: "NVIDIA RTX PRO 6000".into() }
+    };
+    let peer = |host: &str, busy: bool| Peer {
+        version: ANNOUNCEMENT_VERSION,
+        host: host.into(),
+        app_version: Some("test".into()),
+        busy,
+        serving: busy.then(|| "Qwen3-0.6B".to_string()),
+        control: None,
+        gpus: vec![gpu(host, 0), gpu(host, 1)],
+    };
+    let browser = PeerBrowser::start(port + 1, None).unwrap();
+    let a = PeerAnnouncer::start(&peer("app-a", false), "127.0.0.1:7801".parse().unwrap(), port + 1, None).unwrap();
+    let b = PeerAnnouncer::start(&peer("app-b", true), "127.0.0.1:7802".parse().unwrap(), port + 1, None).unwrap();
+    let mut seen = std::collections::BTreeMap::new();
+    until("both peers", || {
+        if let Ok(PeerEvent::Up(p)) = browser.events().recv_timeout(Duration::from_millis(200)) {
+            seen.insert(p.host.clone(), p);
+        }
+        (seen.len() == 2).then_some(())
+    });
+    assert_eq!(seen["app-a"].gpus.len(), 2);
+    assert!(!seen["app-a"].busy && seen["app-b"].busy);
+    assert_eq!(seen["app-b"].serving.as_deref(), Some("Qwen3-0.6B"));
+    assert_eq!(seen["app-b"].control.as_deref(), Some("127.0.0.1:7802"));
+    drop(a);
+    until("a leaves", || match browser.events().recv_timeout(Duration::from_millis(200)) {
+        Ok(PeerEvent::Down { host }) if host == "app-a" => Some(()),
+        _ => None,
+    });
+    drop(b);
+}

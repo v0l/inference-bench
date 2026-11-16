@@ -80,6 +80,145 @@ pub fn decode_announcement(txt: &[String]) -> Result<(DeviceConfig, String)> {
     Ok((device, text("addr")?))
 }
 
+pub const APP_SERVICE_NAME: &str = "_inference-bench._tcp.local.";
+pub const ANNOUNCEMENT_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerGpu {
+    pub device: DeviceConfig,
+    pub gpu_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Peer {
+    pub version: u32,
+    pub host: String,
+    pub app_version: Option<String>,
+    pub busy: bool,
+    pub serving: Option<String>,
+    pub control: Option<String>,
+    pub gpus: Vec<PeerGpu>,
+}
+
+impl Peer {
+    pub fn summary(&self) -> String {
+        crate::hardware::summarize(&self.host, &self.gpus.iter().map(|g| g.gpu_name.as_str()).collect::<Vec<_>>())
+    }
+
+    pub fn memory_gib(&self) -> f64 {
+        self.gpus.iter().map(|g| g.device.memory_gib).sum()
+    }
+
+    pub fn devices(&self) -> Vec<DeviceConfig> {
+        self.gpus.iter().map(|g| g.device.clone()).collect()
+    }
+}
+
+fn clean(text: &str) -> String {
+    text.replace(['|', '\n'], " ")
+}
+
+pub fn encode_peer(peer: &Peer) -> Vec<String> {
+    let mut txt = vec![format!("v={ANNOUNCEMENT_VERSION}"), format!("host={}", clean(&peer.host)), format!("busy={}", peer.busy as u8), format!("gpus={}", peer.gpus.len())];
+    if let Some(a) = &peer.app_version {
+        txt.push(format!("app={}", clean(a)));
+    }
+    if let Some(s) = &peer.serving {
+        txt.push(format!("serving={}", clean(s)));
+    }
+    if let Some(c) = &peer.control {
+        txt.push(format!("ctl={c}"));
+    }
+    for (i, g) in peer.gpus.iter().enumerate() {
+        let d = &g.device;
+        txt.push(format!(
+            "g{i}={}|{}|{}|{}|{}|{}|{}|{}|{}",
+            d.ordinal.unwrap_or(i),
+            clean(&g.gpu_name),
+            d.memory_gib,
+            d.bandwidth_gbs,
+            d.tflops,
+            d.address.clone().unwrap_or_default(),
+            d.link.latency_ms,
+            d.link.bandwidth_gbs,
+            d.reserve_gib.map_or(String::new(), |r| r.to_string())
+        ));
+    }
+    txt
+}
+
+fn field_map(txt: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut fields = BTreeMap::new();
+    for entry in txt {
+        let (k, v) = entry.split_once('=').ok_or_else(|| anyhow!("announcement entry {entry:?} has no '='"))?;
+        fields.insert(k.to_string(), v.to_string());
+    }
+    Ok(fields)
+}
+
+fn parse_gpu(host: &str, i: usize, raw: &str) -> Result<PeerGpu> {
+    let f: Vec<&str> = raw.split('|').collect();
+    if f.len() < 8 {
+        bail!("announcement gpu {i} has {} fields, expected 8 or more", f.len());
+    }
+    let number = |k: &str, v: &str| -> Result<f64> {
+        let n: f64 = v.parse().map_err(|_| anyhow!("announcement gpu {i} field {k} is not a number"))?;
+        if !n.is_finite() || n < 0.0 {
+            bail!("announcement gpu {i} field {k} is out of range");
+        }
+        Ok(n)
+    };
+    let ordinal: usize = f[0].parse().map_err(|_| anyhow!("announcement gpu {i} has a bad ordinal"))?;
+    let address = (!f[5].is_empty()).then(|| f[5].to_string());
+    let reserve = match f.get(8) {
+        Some(r) if !r.is_empty() => Some(number("reserve", r)?),
+        _ => None,
+    };
+    Ok(PeerGpu {
+        gpu_name: f[1].to_string(),
+        device: DeviceConfig {
+            name: crate::hardware::device_name(host, ordinal),
+            memory_gib: number("mem", f[2])?,
+            bandwidth_gbs: number("bw", f[3])?,
+            tflops: number("tflops", f[4])?,
+            ordinal: Some(ordinal),
+            address,
+            reserve_gib: reserve,
+            link: LinkConfig { latency_ms: number("lat", f[6])?, bandwidth_gbs: number("link", f[7])? },
+            offload: None,
+        },
+    })
+}
+
+pub fn decode_peer(txt: &[String]) -> Result<Peer> {
+    let fields = field_map(txt)?;
+    let Some(version) = fields.get("v") else {
+        let (device, address) = decode_announcement(txt)?;
+        let host = device.name.clone();
+        let mut device = device;
+        device.address = Some(address);
+        return Ok(Peer { version: 1, host, app_version: None, busy: false, serving: None, control: None, gpus: vec![PeerGpu { gpu_name: device.name.clone(), device }] });
+    };
+    let version: u32 = version.parse().map_err(|_| anyhow!("announcement version {version:?} is not a number"))?;
+    let host = fields.get("host").cloned().filter(|h| !h.is_empty()).ok_or_else(|| anyhow!("announcement lacks host"))?;
+    let count: usize = fields.get("gpus").ok_or_else(|| anyhow!("announcement lacks gpus"))?.parse().map_err(|_| anyhow!("announcement gpus is not a number"))?;
+    if count > 64 {
+        bail!("announcement lists {count} gpus");
+    }
+    let gpus = (0..count)
+        .map(|i| parse_gpu(&host, i, fields.get(&format!("g{i}")).ok_or_else(|| anyhow!("announcement lacks g{i}"))?))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Peer {
+        version,
+        host,
+        app_version: fields.get("app").cloned(),
+        busy: fields.get("busy").is_some_and(|b| b == "1"),
+        serving: fields.get("serving").cloned().filter(|s| !s.is_empty()),
+        control: fields.get("ctl").cloned().filter(|s| !s.is_empty()),
+        gpus,
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct Membership {
     members: Vec<Member>,
@@ -233,6 +372,61 @@ mod tests {
         d.link = LinkConfig { latency_ms: 0.3, bandwidth_gbs: 1.1 };
         let txt = encode_announcement(&d, "10.0.0.5:7600");
         assert_eq!(decode_announcement(&txt).unwrap(), (d, "10.0.0.5:7600".to_string()));
+    }
+
+    fn peer(host: &str, n: usize) -> Peer {
+        let gpus = (0..n)
+            .map(|i| {
+                let mut d = dev(&crate::hardware::device_name(host, i), 96.0 - i as f64);
+                d.ordinal = Some(i);
+                d.address = Some(format!("10.0.0.5:{}", 7600 + i));
+                d.reserve_gib = None;
+                PeerGpu { device: d, gpu_name: "NVIDIA RTX PRO 6000".into() }
+            })
+            .collect();
+        Peer { version: ANNOUNCEMENT_VERSION, host: host.into(), app_version: Some("0.4.0".into()), busy: true, serving: Some("Qwen3-0.6B".into()), control: Some("10.0.0.5:7599".into()), gpus }
+    }
+
+    #[test]
+    fn a_two_gpu_peer_announcement_round_trips_per_gpu() {
+        let p = peer("desk", 2);
+        let txt = encode_peer(&p);
+        assert_eq!(decode_peer(&txt).unwrap(), p);
+        assert_eq!(p.summary(), "desk: 2 × RTX PRO 6000");
+        assert_eq!(p.memory_gib(), 96.0 + 95.0);
+        assert!(txt.iter().all(|e| e.len() <= 255));
+    }
+
+    #[test]
+    fn a_v1_stage_announcement_decodes_as_a_one_gpu_peer() {
+        let d = dev("spark", 110.0);
+        let txt = encode_announcement(&d, "10.0.0.9:7600");
+        let p = decode_peer(&txt).unwrap();
+        assert_eq!((p.version, p.host.as_str(), p.busy, p.control.clone()), (1, "spark", false, None));
+        assert_eq!(p.gpus.len(), 1);
+        assert_eq!(p.gpus[0].device.address.as_deref(), Some("10.0.0.9:7600"));
+        assert_eq!(p.gpus[0].device.memory_gib, 110.0);
+    }
+
+    #[test]
+    fn a_newer_announcement_with_unknown_fields_still_decodes() {
+        let mut txt = encode_peer(&peer("desk", 1));
+        txt.push("future=1".into());
+        txt.retain(|e| !e.starts_with("v="));
+        txt.push("v=9".into());
+        let p = decode_peer(&txt).unwrap();
+        assert_eq!((p.version, p.gpus.len()), (9, 1));
+    }
+
+    #[test]
+    fn a_v2_announcement_missing_a_gpu_is_rejected() {
+        let mut txt = encode_peer(&peer("desk", 2));
+        txt.retain(|e| !e.starts_with("g1="));
+        assert!(decode_peer(&txt).is_err());
+        let mut bad = encode_peer(&peer("desk", 1));
+        bad.retain(|e| !e.starts_with("g0="));
+        bad.push("g0=0|x|nan|1|1||0|1".into());
+        assert!(decode_peer(&bad).is_err());
     }
 
     #[test]
