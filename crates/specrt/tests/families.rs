@@ -267,3 +267,78 @@ fn real_phi3_mini_matches_transformers() {
 fn real_phi4_mini_matches_transformers() {
     real("phi4-mini", "microsoft/Phi-4-mini-instruct");
 }
+
+fn mistral_small_dir() -> PathBuf {
+    let home = PathBuf::from(std::env::var("HOME").unwrap());
+    let snapshots = home.join(".cache/huggingface/hub/models--RedHatAI--Mistral-Small-24B-Instruct-2501-FP8-dynamic/snapshots");
+    std::fs::read_dir(&snapshots).unwrap().flatten().map(|e| e.path()).find(|p| p.join("config.json").exists()).unwrap()
+}
+
+fn mistral_small(layers: Option<usize>) -> Spec {
+    let dir = mistral_small_dir();
+    let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    spec.repo = dir.display().to_string();
+    if let Some(n) = layers {
+        spec.layers.count = n;
+    }
+    spec
+}
+
+#[test]
+#[ignore = "needs the cached RedHatAI Mistral-Small-24B-Instruct-2501-FP8-dynamic checkpoint"]
+fn mistral_small_fp8_maps_through_the_llama_family() {
+    let s = mistral_small(None);
+    assert_eq!(s.quant, specrt::spec::Quant::Fp8Channel);
+    assert_eq!(s.layers.window, None);
+    assert_eq!((s.dims.hidden, s.layers.count, s.attention.head_dim), (5120, 40, 128));
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the cached Mistral Small FP8 checkpoint and scripts/mistral_slice.py output in SPECRT_REF_DIR"]
+fn mistral_small_fp8_first_four_layers_match_transformers() {
+    let want = reference("mistral-small-4l");
+    let rows = want.logits.len() / want.vocab;
+    let mut rt = Runtime::load(&mistral_small(Some(4)), 512).unwrap();
+    let ours = rt.prompt_logits(&want.tokens).unwrap();
+    let first = want.tokens.len() - rows;
+    let mut worst = 0f64;
+    for r in 0..rows {
+        let a = &ours[(first + r) * want.vocab..(first + r + 1) * want.vocab];
+        let b = &want.logits[r * want.vocab..(r + 1) * want.vocab];
+        let (la, lb) = (log_softmax(a), log_softmax(b));
+        let kl: f64 = lb.iter().zip(&la).map(|(q, p)| q.exp() * (q - p)).sum();
+        let top = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0;
+        let margin = { let mut t = b.to_vec(); t.sort_by(|x, y| y.total_cmp(x)); t[0] - t[1] };
+        eprintln!("mistral-small-4l row {r} kl {kl} top1 ours {} ref {} margin {margin}", top(a), top(b));
+        worst = worst.max(kl);
+    }
+    assert!(worst < 0.05, "kl {worst}");
+    let got = rt.generate(&want.tokens, want.greedy.len(), Sampling::GREEDY).unwrap();
+    let same = got.tokens.iter().zip(&want.greedy).take_while(|(a, b)| a == b).count();
+    eprintln!("mistral-small-4l greedy prefix {same}/{}", want.greedy.len());
+    assert!(worst < 0.001, "a slice this shallow has near-flat logits, so only the distribution is compared");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU with about 30 GB free, the cached Mistral Small FP8 checkpoint and scripts/mistral_slice.py ... 40 output in SPECRT_REF_DIR"]
+fn mistral_small_fp8_full_model_matches_transformers() {
+    let want = reference("mistral-small-24b");
+    let rows = want.logits.len() / want.vocab;
+    let mut rt = Runtime::load(&mistral_small(None), 512).unwrap();
+    let ours = rt.prompt_logits(&want.tokens).unwrap();
+    let first = want.tokens.len() - rows;
+    let mut worst = 0f64;
+    for r in 0..rows {
+        let a = &ours[(first + r) * want.vocab..(first + r + 1) * want.vocab];
+        let b = &want.logits[r * want.vocab..(r + 1) * want.vocab];
+        let (la, lb) = (log_softmax(a), log_softmax(b));
+        let kl: f64 = lb.iter().zip(&la).map(|(q, p)| q.exp() * (q - p)).sum();
+        eprintln!("mistral-small row {r} kl {kl}");
+        worst = worst.max(kl);
+    }
+    assert!(worst < 0.05, "kl {worst}");
+    let got = rt.generate(&want.tokens, want.greedy.len(), Sampling::GREEDY).unwrap();
+    let same = got.tokens.iter().zip(&want.greedy).take_while(|(a, b)| a == b).count();
+    eprintln!("mistral-small greedy prefix {same}/{}", want.greedy.len());
+    assert!(same * 2 >= want.greedy.len());
+}
