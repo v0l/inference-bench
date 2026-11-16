@@ -125,11 +125,11 @@ impl App {
     }
 
     pub fn free_gpu_list(&self) -> Vec<u64> {
-        self.gpu.iter().map(|g| g.total_bytes.saturating_sub(g.used_bytes)).collect()
+        self.gpu.iter().map(|g| g.available_bytes()).collect()
     }
 
     pub fn free_gpu_bytes(&self) -> Option<u64> {
-        self.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes))
+        self.gpu.first().map(|g| g.available_bytes())
     }
 
     pub fn open_load_dialog(&mut self, model: &LocalModel) {

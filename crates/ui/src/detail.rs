@@ -182,7 +182,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let back = header(app, &mut detail, ui);
     if !back {
         pump_tree(app, &mut detail);
-        let free = app.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes));
+        let free = app.gpu.first().map(|g| g.available_bytes());
         let mut act = TreeAction::default();
         let running = app.engine.loaded().filter(|l| l.display == detail.model);
         body(&mut detail, &app.library, ui, free, &mut act, running.as_ref());

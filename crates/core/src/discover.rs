@@ -399,6 +399,9 @@ pub fn config_shape_of(repo: &str, text: &str) -> (Result<Shape, String>, Option
         let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let support = library::specrt_support(&v);
         if !support.supported {
+            if v["quantization_config"]["quant_method"].as_str() == Some("modelopt") {
+                return Err("modelopt NVFP4 not supported yet".into());
+            }
             return Err(short_reason(&support.reason));
         }
         let d = fit::describe_config_json(repo, text).map_err(|e| short_reason(&e))?;
@@ -883,12 +886,23 @@ mod tests {
     }
 
     #[test]
-    fn a_huge_quantization_config_error_stays_one_short_line() {
+    fn modelopt_nvfp4_is_flagged_with_one_short_reason() {
         let text = include_str!("../tests/fixtures/hf/nvfp4-qwen3.8-27b-config.json");
         let (shape, draft) = config_shape_of("nvidia/Qwen3.8-27B-NVFP4", text);
         assert!(draft.is_none());
         let e = shape.err().expect("specrt does not read modelopt mixed precision yet");
-        assert!(e.chars().count() < 200 && e.contains("is not supported"), "{e}");
+        assert_eq!(e, "modelopt NVFP4 not supported yet");
+    }
+
+    #[test]
+    fn the_users_compressed_tensors_nvfp4_27b_is_supported_and_sized_for_the_gpu() {
+        let text = include_str!("../tests/fixtures/hf/orcarouter-nvfp4-config.json");
+        let (shape, draft) = config_shape_of("orcarouter/Qwen3.8-27B-Uncensored-NVFP4", text);
+        assert!(draft.is_none());
+        let shape = shape.unwrap_or_else(|e| panic!("{e}"));
+        assert!(shape.anatomy.total_bytes > 10 * GB && shape.anatomy.total_bytes < 30 * GB, "{}", shape.anatomy.total_bytes);
+        let a = assess(&shape.spec, &shape.anatomy, 20 * GB, &[90 * GB], 1);
+        assert_ne!(a.verdict, Verdict::DoesNotFit);
     }
 
     #[test]

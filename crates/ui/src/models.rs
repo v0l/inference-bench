@@ -379,6 +379,12 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+pub fn budget_line(gpus: &[inference_bench_core::gpu::GpuStats], seqs: usize) -> String {
+    let available: u64 = gpus.iter().map(|g| g.available_bytes()).sum();
+    let other: u64 = gpus.iter().map(|g| g.other_bytes()).sum();
+    format!("{} available for a model ({} used by other processes), {seqs} parallel requests", human_size(available), human_size(other))
+}
+
 fn need_line(f: &discover::Assessment) -> String {
     format!("needs {}, {} free", human_size(f.need), f.free.map_or("-".into(), human_size))
 }
@@ -542,8 +548,7 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
     }
     let gpus = app.free_gpu_list();
     if !gpus.is_empty() {
-        let each: Vec<String> = gpus.iter().map(|g| human_size(*g)).collect();
-        note(ui, format!("free on the gpu: {}, {} parallel requests", each.join(" + "), app.settings.default_seqs), LEGEND);
+        note(ui, budget_line(&app.gpu, app.settings.default_seqs), LEGEND);
     }
     let plans = app.models.plans(&gpus, app.settings.default_seqs);
     let results = app.models.results.clone();

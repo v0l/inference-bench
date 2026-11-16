@@ -211,7 +211,7 @@ fn real_model(name: &str) -> LocalModel {
 
 fn with_gpu(h: &mut Harness<'static, App>, used: u64, total: u64) {
     let app = h.state_mut();
-    app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None }];
+    app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None, uuid: String::new(), own_bytes: 0 }];
     app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
     app.gpu_poll = Default::default();
 }
@@ -2185,7 +2185,11 @@ fn screenshot_of_discover() {
     let mut fixture = discover_harness("discover-shot");
     fixture.run();
     fixture.render().unwrap().save(out.join("discover-fixture.png")).unwrap();
-    let gpus = inference_bench_core::gpu::sample();
+    let mut gpus = inference_bench_core::gpu::sample();
+    let apps = std::process::Command::new("nvidia-smi").args(["--query-compute-apps=gpu_uuid,pid,used_memory,process_name", "--format=csv,noheader,nounits"]).output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+    let running_app: Vec<u32> = apps.lines().filter(|l| l.contains("inference-bench-ui")).filter_map(|l| l.split(',').nth(1)?.trim().parse().ok()).collect();
+    let parsed = inference_bench_core::gpu::parse_compute_apps(&apps.lines().map(|l| l.rsplitn(2, ',').last().unwrap_or("").to_string()).collect::<Vec<_>>().join("\n"));
+    inference_bench_core::gpu::attribute(&mut gpus, &parsed, &running_app);
     assert!(!gpus.is_empty(), "no gpu reading on this machine");
     for (file, query) in [("discover-1017.png", "1017"), ("discover-qwen3.8-27b.png", "qwen3.8 27b"), ("discover-qwen3.8-27b-fp8.png", "Qwen3.8-27B-FP8"), ("discover-qwen3-8b-gguf.png", "Qwen3-8B-GGUF")] {
         let mut h = harness_sized("discover-live", Tab::Models, 1400.0);
@@ -2203,4 +2207,26 @@ fn screenshot_of_discover() {
         h.run();
         h.render().unwrap().save(out.join(file)).unwrap();
     }
+}
+
+#[test]
+fn the_budget_excludes_this_apps_own_memory_and_a_model_that_fits_then_shows_as_fitting() {
+    use inference_bench_core::gpu::{GpuStats, attribute, parse_compute_apps};
+    let mut gpu = vec![GpuStats { name: "RTX".into(), used_bytes: 87 << 30, total_bytes: 96 << 30, util_percent: None, uuid: "GPU-a".into(), own_bytes: 0 }];
+    attribute(&mut gpu, &parse_compute_apps("GPU-a, 4242, 61440\nGPU-a, 7, 12288\n"), &[4242]);
+    let mut h = harness("budget", Tab::Models);
+    h.state_mut().gpu = gpu;
+    h.state_mut().gpu_at = Some(Instant::now() + Duration::from_secs(600));
+    h.state_mut().gpu_poll = Default::default();
+    assert_eq!(h.state().free_gpu_list(), [(96u64 << 30) - (27u64 << 30)]);
+    assert_eq!(models::budget_line(&h.state().gpu, 8), "69.0 GB available for a model (27.0 GB used by other processes), 8 parallel requests");
+    let g = specrt::gguf::Gguf::from_header(gguf_header("qwen3", 131072)).unwrap();
+    let spec = g.spec().unwrap();
+    let anatomy = specrt::anatomy::ModelAnatomy::new(&spec, 0, Some(131072));
+    let raw_free = (96u64 << 30) - (87u64 << 30);
+    let weights = 30u64 << 30;
+    assert_eq!(inference_bench_core::discover::assess(&spec, &anatomy, weights, &[raw_free], 1).verdict, inference_bench_core::discover::Verdict::DoesNotFit);
+    let budget = h.state().free_gpu_list();
+    let a = inference_bench_core::discover::assess(&spec, &anatomy, weights, &budget, 1);
+    assert_eq!((a.verdict, a.full()), (inference_bench_core::discover::Verdict::Fits, true));
 }
