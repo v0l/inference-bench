@@ -92,9 +92,12 @@ leaves the window off. The generic additions were:
 | `[norm] pre = false` (with `sandwich = true`) | The graph drops the input and pre-MLP norms (a `split` node copies `x` into the GEMM planes) and norms each branch before the add, which is OLMo 2's post-norm placement. |
 | `[attention] qk_norm_full` | A kir `rmsnorm_segment` kernel normalises the q and k slices of each qkv row over the full width, before rope. The attention kernels skip their per-head norm. |
 | `[multipliers]` | Each entry names a config key. `embedding` sets `embed_scale`, `attention` becomes the query scale, `residual` scales each branch before the add (kir `add_scaled`, node `add_scaled`), `logits_divisor` becomes a `logit_scale` node after the head. |
+| `[rope.types] longrope` | Phi-4-mini's `longrope`: per-frequency short and long factors (chosen by `max_ctx` against `original_max_position_embeddings`) divide the inverse frequencies (rope kind 4, kir `RopeShape.freq_factors`) and an attention factor scales cos and sin. Not on wgpu. |
 | `[rope] nope_flags` | Layers whose flag is 0 skip rope. kir attention shapes carry a per-layer `nope` table and both the rope-and-cache-write and the flash kernels test it. |
 
 Tests: `tests/families.rs` (spec mapping, plan shape, and GPU logits, greedy and served greedy
 against transformers on `tests/fixtures/tiny-{mistral,phi3,smollm3,olmo2,granite}` built by
 `scripts/tiny_families.py`, plus real checkpoints against `scripts/families_real.py`). Branch
 families (`uses_branch`) turn off the fused prefill-plus-decode step, which only runs the plain layer.
+
+Real checks: Phi-4-mini (partial rotary 0.75 plus longrope), Phi-3-mini, OLMo-2-1B, Granite-3.3-2B, SmolLM3-3B, and Mistral-Small-24B-Instruct-2501 FP8 (`RedHatAI/...-FP8-dynamic`, all 40 layers) against transformers.
