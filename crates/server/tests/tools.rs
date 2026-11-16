@@ -216,6 +216,7 @@ fn app_mode_returns_reasoning_content_for_a_template_that_opens_the_think_block(
     let v = ask(&rig, json!({}));
     let m = &v["choices"][0]["message"];
     assert_eq!((m["reasoning_content"].as_str(), m["content"].as_str()), (Some("plan"), Some("answer")));
+    assert_eq!(m["reasoning"], "plan");
     assert_ne!(rig.stats.requests.lock().unwrap()[0].template_vars["enable_thinking"], false);
     rig.stop();
 }
@@ -224,7 +225,8 @@ fn app_mode_returns_reasoning_content_for_a_template_that_opens_the_think_block(
 fn app_mode_streams_reasoning_deltas_before_the_content() {
     let rig = start(app_mode(inference_bench_core::specrt_chat::Thinking::OpensInPrompt), pieces(&["plan", "</think>", "answer"]));
     let (_, body, _) = rig.post("/v1/chat/completions", None, json!({"model": "m", "stream": true, "messages": [{"role": "user", "content": "hi"}]}));
-    let reasoning = body.find("\"reasoning\":\"plan\"").expect(&body);
+    let reasoning = body.find("\"reasoning_content\":\"plan\"").expect(&body);
+    assert!(!body.contains("\"reasoning\":"), "{body}");
     let content = body.find("\"content\":\"answer\"").expect(&body);
     assert!(reasoning < content, "{body}");
     rig.stop();

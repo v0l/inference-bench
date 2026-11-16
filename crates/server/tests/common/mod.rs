@@ -121,6 +121,7 @@ impl Fake {
             completion_tokens,
             ttft_secs: ttft,
             prefill_secs: ttft,
+            queue_secs: 0.0,
             decode_secs: started.elapsed().as_secs_f64() - ttft,
             peak_memory_bytes: None,
         })
