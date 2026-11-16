@@ -3588,6 +3588,7 @@ dependencies = [
  "base64 0.22.1",
  "cudarc",
  "dirs",
+ "if-addrs",
  "image",
  "inference-bench-kir",
  "libc",

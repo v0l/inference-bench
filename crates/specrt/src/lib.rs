@@ -12,6 +12,7 @@ pub mod engine;
 pub mod executor;
 pub mod family;
 pub mod gguf;
+pub mod hardware;
 pub mod graph;
 pub mod grammar;
 pub mod jit;
