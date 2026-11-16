@@ -77,6 +77,10 @@ Options, in order of cost: keep KV layers 0 to 7 in f16 and quantise 8 to 15 (ab
 
 Decision: the default stays `f16`. fp8 is opt-in and fails the 27B gate as it stands (KL 0.29 at 8k against a 0.02 bound). vLLM runs fp8 KV with no scale at all, so this is the cost of the same format. Next step before more formats: try a finer scale (per row, per 64 channel group) and keep the first 16 tokens (attention sink) in f16, then rerun `scripts/kvgate27b.sh`.
 
+### Mixed layout (16 Nov)
+
+`kv_dtype = "fp8"` now keeps the first `[runtime] kv_f16_layers` attention layers in f16 (one plane, 2 bytes per value) and stores the rest as e4m3 with a per-row scale. Default is half of the attention layers (8 of 16 on the 27B), from the bisection above. `kv_f16_layers = 0` is the old all-fp8 layout. Each block holds the f16 layers first, then the fp8 layers, so `kv_block_bytes` is 0.75x of f16 on the 27B. Option key `runtime.kv_f16_layers` in the load dialog. Tests: `mixed_kv_keeps_the_early_layers_f16_and_defaults_to_half` (sizes), `mixed_kv_logits_track_f16_at_4096_tokens` (GPU, 0, 1 and 2 f16 layers on the 3-layer 27B-shaped fixture, KL under 0.02), the golden kernels in `crates/kir/tests/golden/attention`.
+
 ### Rerun the gate
 
 ```sh
