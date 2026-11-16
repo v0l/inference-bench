@@ -1,5 +1,5 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
-// attention FlashMma threads=256 smem=98304
+// attention FlashMma threads=256 smem=99072
 //   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, freq_factors: [], mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: true, kv_f16_layers: 8, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false], bidirectional: false, nope: [false, false, true, false] }
 constexpr int ROT = 64;
 constexpr int ROT_HALF = ROT / 2;
@@ -34,7 +34,7 @@ constexpr int FM_BK = 32;
 constexpr int FM_STAGES = 3;
 constexpr int FM_KB = HEAD_DIM / 16;
 constexpr int FM_NB = HEAD_DIM / 8;
-constexpr int FM_SMEM = 98304;
+constexpr int FM_SMEM = 99072;
 
 __device__ __forceinline__ float rope_inv_freq(int i, int layer) {
     if (LOCAL_ROPE[layer]) return 1.0f / powf(LOCAL_THETA, (float)(2 * i) / (float)ROT);
@@ -274,6 +274,11 @@ __device__ __forceinline__ void mma_kv(float* c, const unsigned* ah, const unsig
     mma_f16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
 }
 
+__device__ __forceinline__ void fm_cp_async4(void* smem, const void* gmem) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(gmem));
+}
+
 extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
                                      const bf16_t* v_cache, const int* block_table, const int* pos_ptr, int layer,
                                      bf16_t* out_hi, bf16_t* out_lo, int tokens,
@@ -368,8 +373,29 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         warp_last = max(warp_last, span_end(mm_meta, bidi, mm_stride, mm_slot, min(warp_last, base + tokens - 1)));
     }
     int tiles = (key_end + FM_BK - 1) / FM_BK;
+    constexpr int PLANE_BYTES = PLANE * 2;
+    float* kv_scales = (float*)(fm_smem + FM_STAGES * 2 * PLANE_BYTES);
     auto load_kv = [&](int buf, int k0) {
         bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
+        if (kv_q(layer)) {
+            unsigned char* raw_st = (unsigned char*)st + PLANE_BYTES / 2;
+            constexpr int RAW_CHUNKS = HEAD_DIM / 16;
+            constexpr int TOTAL = 2 * FM_BK * RAW_CHUNKS;
+#pragma unroll
+            for (int i = tid; i < TOTAL; i += 32 * FM_WARPS) {
+                int which = i / (FM_BK * RAW_CHUNKS);
+                int rem = i % (FM_BK * RAW_CHUNKS);
+                int r = rem / RAW_CHUNKS;
+                int c = rem % RAW_CHUNKS;
+                int tk = k0 + r;
+                int at = min(tk, key_end - 1);
+                const bf16_t* cache = which ? v_cache : k_cache;
+                const unsigned char* src = (const unsigned char*)kv_row(cache, block_table, layer, kv_head, at);
+                cp_async16_zfill(raw_st + which * PLANE_BYTES + r * HEAD_DIM + c * 16, src + c * 16, tk < key_end);
+                if (c == 0) fm_cp_async4(kv_scales + buf * 2 * FM_BK + which * FM_BK + r, kv_scale_ptr(const_cast<bf16_t*>(cache), block_table, layer, kv_head, at));
+            }
+            return;
+        }
         constexpr int ROW_CHUNKS = KV_PLANES * CPR;
         constexpr int TOTAL = 2 * FM_BK * ROW_CHUNKS;
 #pragma unroll
@@ -381,20 +407,43 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             int tk = k0 + r;
             const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
-            if (kv_q(layer)) {
-                int at = min(tk, key_end - 1);
-                float sc = kv_scale(which ? v_cache : k_cache, block_table, layer, kv_head, at);
-                uint2 raw = *(const uint2*)((const unsigned char*)src + c * 8);
+            cp_async16_zfill(dst, src + c * 8, tk < key_end);
+        }
+    };
+    auto convert_kv = [&](int buf) {
+        bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
+        const unsigned char* raw_st = (const unsigned char*)st + PLANE_BYTES / 2;
+        const float* sc = kv_scales + buf * 2 * FM_BK;
+        constexpr int ITEMS = (2 * FM_BK * CPR + 32 * FM_WARPS - 1) / (32 * FM_WARPS);
+        uint4 out[ITEMS];
+#pragma unroll
+        for (int j = 0; j < ITEMS; j++) {
+            int i = tid + j * 32 * FM_WARPS;
+            if (i < 2 * FM_BK * CPR) {
+                int which = i / (FM_BK * CPR);
+                int rem = i % (FM_BK * CPR);
+                int r = rem / CPR;
+                int c = rem % CPR;
+                float s = sc[which * FM_BK + r];
+                uint2 raw = *(const uint2*)(raw_st + which * PLANE_BYTES + r * HEAD_DIM + c * 8);
                 unsigned w[4];
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     unsigned two = ((e < 2 ? raw.x : raw.y) >> (16 * (e & 1))) & 0xffffu;
-                    w[e] = attn_bits(e4m3_to_f32(two & 0xffu) * sc) | (attn_bits(e4m3_to_f32(two >> 8) * sc) << 16);
+                    w[e] = attn_bits(e4m3_to_f32(two & 0xffu) * s) | (attn_bits(e4m3_to_f32(two >> 8) * s) << 16);
                 }
-                *(uint4*)dst = make_uint4(w[0], w[1], w[2], w[3]);
-                continue;
+                out[j] = make_uint4(w[0], w[1], w[2], w[3]);
             }
-            cp_async16_zfill(dst, src + c * 8, tk < key_end);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < ITEMS; j++) {
+            int i = tid + j * 32 * FM_WARPS;
+            if (i < 2 * FM_BK * CPR) {
+                int which = i / (FM_BK * CPR);
+                int rem = i % (FM_BK * CPR);
+                *(uint4*)(st + which * PLANE + swz<CPR>(rem / CPR, rem % CPR) * 8) = out[j];
+            }
         }
     };
     __syncthreads();
@@ -406,6 +455,10 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         cp_async_commit();
         cp_async_wait<1>();
         __syncthreads();
+        if (kv_q(layer)) {
+            convert_kv(kt % FM_STAGES);
+            __syncthreads();
+        }
         const bf16_t* k_hi = kvs + (kt % FM_STAGES) * 2 * KV_PLANES * PLANE;
         const bf16_t* k_lo = k_hi + PLANE;
         const bf16_t* v_hi = k_hi + KV_PLANES * PLANE;
