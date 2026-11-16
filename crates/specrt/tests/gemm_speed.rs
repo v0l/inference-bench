@@ -279,12 +279,13 @@ fn fp4_probe(linear: &str) {
     let stream = ctx.default_stream();
     let module = Module::generate(&s, 256).unwrap();
     let loaded = jit.load(&module).unwrap();
-    let kernel = format!("{linear}_f4a_big");
+    let suffix = std::env::var("SPECRT_GEMM_SUFFIX").unwrap_or("_big".into());
+    let kernel = format!("{linear}_f4a{suffix}");
     let smem = module.smem[kernel.as_str()];
     let f = loaded.function(&kernel).unwrap();
     use cudarc::driver::sys::CUfunction_attribute as A;
     f.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
-    let tile = specrt::gemm::variant_tile(&s, "_f4a_big");
+    let tile = specrt::gemm::variant_tile(&s, &if suffix == "_big" { "_f4a_big".to_string() } else { suffix.clone() });
     let (n, k, _, _) = specrt::codegen::linear_dims(&s, linear);
     let copies = 4usize;
     let mut flush = stream.alloc_zeros::<u8>(512 << 20).unwrap();
@@ -377,9 +378,10 @@ fn fp4_probe(linear: &str) {
                 t.sort_by(f32::total_cmp);
                 let ms = t[t.len() / 2];
                 eprintln!(
-                    "{kernel} m={m} {data:7} {name:22}: median {ms:.3} ms, min {:.3} ms, {:.0} TFLOP/s",
+                    "{kernel} m={m} {data:7} {name:22}: median {ms:.3} ms, min {:.3} ms, {:.1} TFLOP/s, {:.0} GB/s weights",
                     t[0],
-                    flops / ms as f64 / 1e9
+                    flops / ms as f64 / 1e9,
+                    (n * k / 2 + n * k / 16) as f64 / ms as f64 / 1e6
                 );
             }
         }

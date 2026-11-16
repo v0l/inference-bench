@@ -8,13 +8,15 @@ pub const FP4_STAGES: usize = 3;
 pub const F4W_BK: usize = 64;
 pub const F4W_ROW: usize = 48;
 pub const F4A_ROW: usize = 72;
-pub const F4A_STAGES: usize = 2;
+pub const F4A_STAGES: usize = 4;
+pub const F4A_SKINNY_STAGES: usize = 3;
 pub const FP8_ACT_STAGES: usize = 2;
 pub const BATCH_KC: usize = 128;
 pub const BATCH_VARIANTS: [usize; 4] = [8, 16, 32, 64];
 pub const BATCH_MAX_TOKENS: usize = 64;
 pub const BATCH_REDUCE_BLOCK: usize = 256;
 pub const BATCH_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
+pub const SKINNY_WIDE_MIN_ROWS: usize = 16384;
 pub const ROWS_MAX_TOKENS: usize = 32;
 pub const FP8_HUGE_MIN_TOKENS: usize = 256;
 pub const GGB_MIN_TOKENS: usize = 32;
@@ -124,6 +126,8 @@ impl Tile {
     pub const FP4_BIG: Tile = Tile { bm: 128, bn: 256, wm: 4, wn: 4 };
     pub const FP8_HUGE: Tile = Tile { bm: 128, bn: 128, wm: 2, wn: 4 };
     pub const NARROW: Tile = Tile { bm: 64, bn: 32, wm: 2, wn: 2 };
+    pub const SKINNY: Tile = Tile { bm: 32, bn: 32, wm: 2, wn: 2 };
+    pub const SKINNY_WIDE: Tile = Tile { bm: 32, bn: 64, wm: 2, wn: 2 };
     pub const TINY: Tile = Tile { bm: 16, bn: 16 * TINY_WN, wm: 1, wn: TINY_WN };
 
     pub fn from_array([bm, bn, wm, wn]: [usize; 4]) -> Tile {
@@ -151,11 +155,13 @@ pub enum Variant {
     Narrow,
     Tiny,
     Huge,
+    Skinny,
+    SkinnyWide,
 }
 
 impl Variant {
     pub const MMA: [Variant; 4] = [Variant::Small, Variant::Big, Variant::Narrow, Variant::Tiny];
-    pub const FP4_ACT: [Variant; 3] = [Variant::Small, Variant::Big, Variant::Narrow];
+    pub const FP4_ACT: [Variant; 5] = [Variant::Small, Variant::Big, Variant::Narrow, Variant::Skinny, Variant::SkinnyWide];
     pub const FP8_ACT: [Variant; 4] = [Variant::Small, Variant::Big, Variant::Narrow, Variant::Huge];
 
     pub fn suffix(self) -> &'static str {
@@ -165,6 +171,8 @@ impl Variant {
             Variant::Narrow => "_narrow",
             Variant::Tiny => "_tiny",
             Variant::Huge => "_huge",
+            Variant::Skinny => "_skinny",
+            Variant::SkinnyWide => "_skinnywide",
         }
     }
 }
@@ -185,6 +193,8 @@ impl Tuning {
             Variant::Narrow => Tile::NARROW,
             Variant::Tiny => Tile::TINY,
             Variant::Huge => Tile::FP8_HUGE,
+            Variant::Skinny => Tile::SKINNY,
+            Variant::SkinnyWide => Tile::SKINNY_WIDE,
         }
     }
 
@@ -197,7 +207,7 @@ impl Tuning {
 
     pub fn f4a_stages(&self, t: &Target, tile: Tile) -> usize {
         let fit = t.smem_limit as usize / ((tile.bm + tile.bn) * F4A_ROW);
-        self.fp4_stages.unwrap_or(F4A_STAGES).min(fit).max(2)
+        self.fp4_stages.unwrap_or(if tile.bm <= 32 { F4A_SKINNY_STAGES } else { F4A_STAGES }).min(fit).max(2)
     }
 }
 
@@ -650,11 +660,18 @@ pub fn variant_for(t: &Target, tuning: &Tuning, linear: &str, rows: usize, token
         TileChoice::Big => Variant::Big,
         TileChoice::Narrow => Variant::Narrow,
         _ if tokens <= 16 => Variant::Tiny,
-        _ if linear == "lm_head" && tokens <= ROWS_MAX_TOKENS => Variant::Narrow,
+        _ if linear == "lm_head" && tokens <= BATCH_MAX_TOKENS => Variant::Narrow,
         _ if blocks(tuning.tile(Variant::Big)) >= 2 * sms => Variant::Big,
         _ if blocks(Tile::SMALL) >= 2 * sms => Variant::Small,
         _ => Variant::Narrow,
     }
+}
+
+fn skinny_variant(r: &Request, tuning: &Tuning) -> Option<Variant> {
+    if tuning.tile != TileChoice::Auto || r.tokens <= BATCH_VARIANTS[1] || r.tokens > ROWS_MAX_TOKENS {
+        return None;
+    }
+    Some(if r.shape.n >= SKINNY_WIDE_MIN_ROWS { Variant::SkinnyWide } else { Variant::Skinny })
 }
 
 pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmError> {
@@ -670,7 +687,7 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
     let fp4_act = policy.fp4_act && t.has(Feature::BlockScaledFp4);
     let mma = t.has(Feature::Mma16816);
     let f8b = auto && mma && r.tokens <= BATCH_MAX_TOKENS && BATCH_LINEARS.contains(&r.linear);
-    let f4b = auto && mma && r.tokens <= BATCH_MAX_TOKENS && !head;
+    let f4b = auto && mma && r.tokens <= BATCH_MAX_TOKENS && (!head || r.linear == "mtp_head");
     let plain = |name: String, path: GemmPath, tile: Tile, kernel: Option<KernelInstance>| Choice {
         name,
         quant: None,
@@ -680,7 +697,7 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
         decoder: decoder_for(path, r.weight),
         kernel,
     };
-    if auto && mma && r.linear == "lin_ba" && r.tokens <= ROWS_MAX_TOKENS && r.weight == WeightFormat::Bf16 {
+    if auto && mma && r.linear == "lin_ba" && r.tokens <= BATCH_MAX_TOKENS && r.weight == WeightFormat::Bf16 {
         return Ok(plain("lin_ba_rows".to_string(), GemmPath::Rows, tile, None));
     }
     Ok(match r.weight {
@@ -695,8 +712,9 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
             Choice { quant: Some(quant), ..plain(name, GemmPath::F8a, tile, Some(k)) }
         }
         WeightFormat::Fp4 if act_quant && fp4_act => {
+            let variant = skinny_variant(&r, tuning).unwrap_or(variant);
             let tile = tuning.fp4_tile(variant);
-            let name = format!("{}_f4a{suffix}", r.linear);
+            let name = format!("{}_f4a{}", r.linear, variant.suffix());
             let k = KernelInstance::fp4_act(t, &name, r.shape, tile, tuning)?;
             Choice { quant: Some("quant_rows_fp4"), ..plain(name, GemmPath::F4a, tile, Some(k)) }
         }

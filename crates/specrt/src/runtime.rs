@@ -900,7 +900,7 @@ impl Runtime {
         };
         let target = crate::codegen::cuda_target(&ctx)?;
         let sms = target.sm_count;
-        let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) {
+        let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) || spec.draft_head_quant() == Some(crate::spec::Quant::Nvfp4G16) {
             stream.alloc_zeros(crate::gemm::batch_part_len(spec, &target, true))?
         } else {
             stream.alloc_zeros(1)?
@@ -1341,7 +1341,13 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
         b.arg(&self.buf.dummy).arg(&x.0).arg(&x.1).arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16).arg(&n);
-        unsafe { b.launch(cfg(rows as u32, 256)) }?;
+        unsafe {
+            b.launch(LaunchConfig {
+                grid_dim: (rows as u32, tokens.div_ceil(crate::codegen::ROWS_MAX_TOKENS) as u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            })
+        }?;
         Ok(())
     }
 

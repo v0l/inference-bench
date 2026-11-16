@@ -60,7 +60,7 @@ fn check(spec: &Spec, label: &str, token_counts: &[usize]) -> Option<()> {
         let mut b = stream.launch_builder(&f);
         b.arg(&dw).arg(&dummy).arg(&dummy).arg(&dh).arg(&dl).arg(&out).arg(&dummy16).arg(&dummy16).arg(&n);
         unsafe {
-            b.launch(LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+            b.launch(LaunchConfig { grid_dim: (rows as u32, tokens.div_ceil(32) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
         }
         .unwrap();
         let got = stream.clone_dtoh(&out).unwrap();
@@ -104,12 +104,12 @@ fn check(spec: &Spec, label: &str, token_counts: &[usize]) -> Option<()> {
 fn lin_ba_rows_matches_the_tile_path_on_a_random_27b_in_proj_ba() {
     let spec = fixture_spec("qwen3.8-27b-nvfp4.toml");
     assert_eq!(linear_dims(&spec, "lin_ba").0, 96);
-    check(&spec, "27b", &[1, 2, 8, 16, 17, 24, 32]).expect("a CUDA device");
+    check(&spec, "27b", &[1, 2, 8, 16, 17, 24, 32, 33, 36, 48, 64]).expect("a CUDA device");
 }
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn lin_ba_rows_matches_the_tile_path_on_the_tiny_fixture() {
     let spec = fixture_spec("tiny-qwen3.5");
-    check(&spec, "tiny", &[1, 17, 24, 32]).expect("a CUDA device");
+    check(&spec, "tiny", &[1, 17, 24, 32, 36, 64]).expect("a CUDA device");
 }

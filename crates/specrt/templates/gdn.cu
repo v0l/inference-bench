@@ -610,6 +610,8 @@ extern "C" __global__ void lin_ba_rows(const bf16_t* w, const float* s, const fl
     static_assert(K % (8 * BA_ROWS_THREADS / 4) == 0 || K % 8 == 0, "rows are read 8 bf16 at a time");
     __shared__ float part[BA_ROWS_THREADS / 32][BA_ROWS_MAX_TOKENS];
     int row = blockIdx.x;
+    int m0 = blockIdx.y * BA_ROWS_MAX_TOKENS;
+    int chunk = min(tokens - m0, BA_ROWS_MAX_TOKENS);
     int tid = threadIdx.x;
     float acc[BA_ROWS_MAX_TOKENS];
 #pragma unroll
@@ -626,9 +628,9 @@ extern "C" __global__ void lin_ba_rows(const bf16_t* w, const float* s, const fl
         }
 #pragma unroll
         for (int m = 0; m < BA_ROWS_MAX_TOKENS; m++) {
-            if (m < tokens) {
-                uint4 h = ((const uint4*)(xh + (size_t)m * K))[i];
-                uint4 l = ((const uint4*)(xl + (size_t)m * K))[i];
+            if (m < chunk) {
+                uint4 h = ((const uint4*)(xh + (size_t)(m0 + m) * K))[i];
+                uint4 l = ((const uint4*)(xl + (size_t)(m0 + m) * K))[i];
                 unsigned hw[4] = {h.x, h.y, h.z, h.w};
                 unsigned lw[4] = {l.x, l.y, l.z, l.w};
                 float a = acc[m];
@@ -649,11 +651,11 @@ extern "C" __global__ void lin_ba_rows(const bf16_t* w, const float* s, const fl
         if ((tid & 31) == 0) part[tid >> 5][m] = v;
     }
     __syncthreads();
-    if (tid < tokens) {
+    if (tid < chunk) {
         float v = 0.0f;
 #pragma unroll
         for (int wp = 0; wp < BA_ROWS_THREADS / 32; wp++) v += part[wp][tid];
-        out[(size_t)tid * LA_BA_ROWS + row] = v;
+        out[(size_t)(m0 + tid) * LA_BA_ROWS + row] = v;
     }
 }
 
