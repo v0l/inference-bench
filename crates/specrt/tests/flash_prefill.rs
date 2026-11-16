@@ -97,10 +97,10 @@ fn run(heads: usize, kv_heads: usize, head_dim: usize, planes: usize, tokens: us
     let norm = stream.clone_htod(&nw).unwrap();
     let mm_meta = stream.alloc_zeros::<i32>(4).unwrap();
     let mm_table = stream.alloc_zeros::<i32>(1).unwrap();
-    let (layer, slot, ntok) = (0i32, 0i32, tokens as i32);
+    let (layer, slot, ntok, window, stride) = (0i32, 0i32, tokens as i32, 0i32, max_ctx as i32);
     let rows = flash_rows(head_dim);
     let mut b = stream.launch_builder(&f);
-    b.arg(&dq).arg(&norm).arg(&dk).arg(&dv).arg(&table).arg(&pos).arg(&layer).arg(&hi).arg(&lo).arg(&ntok).arg(&mm_meta).arg(&mm_table).arg(&slot);
+    b.arg(&dq).arg(&norm).arg(&dk).arg(&dv).arg(&table).arg(&pos).arg(&layer).arg(&hi).arg(&lo).arg(&ntok).arg(&mm_meta).arg(&mm_table).arg(&stride).arg(&slot).arg(&window);
     let config = LaunchConfig { grid_dim: (tokens.div_ceil(rows) as u32, heads as u32, 1), block_dim: (rows as u32 * 2, 1, 1), shared_mem_bytes: smem };
     unsafe { b.launch(config) }.unwrap();
     stream.synchronize().unwrap();

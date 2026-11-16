@@ -190,19 +190,22 @@ fn mtp_reference(spec: &Spec, phase: Phase) -> (Vec<Op>, Vec<Op>) {
     if phase == Phase::Prefill {
         layer.push(Op::Flash);
     }
-    layer.extend([
-        lin(Weight::MtpO, Buf::AttnPlanes, Buf::X),
-        norm(NormKind::PostAttention, Buf::XnPlanes),
-        lin(Weight::MtpGateUp, Buf::XnPlanes, Buf::ActPlanes),
-        lin(Weight::MtpDown, Buf::ActPlanes, Buf::X),
-    ]);
+    layer.push(lin(Weight::MtpO, Buf::AttnPlanes, Buf::X));
+    if spec.moe.is_some() {
+        layer.extend([Op::MoeRoute, Op::MoeExperts, Op::MoeCombine]);
+    } else {
+        layer.extend([
+            norm(NormKind::PostAttention, Buf::XnPlanes),
+            lin(Weight::MtpGateUp, Buf::XnPlanes, Buf::ActPlanes),
+            lin(Weight::MtpDown, Buf::ActPlanes, Buf::X),
+        ]);
+    }
     let head = vec![
         Op::MtpGather,
         Op::MtpNorm,
         Op::Linear { weight: Weight::MtpHead, quant: QuantSource::DraftHead, input: Buf::XnPlanes, output: Buf::MtpLogits },
         Op::MtpDraft,
     ];
-    let _ = spec;
     (layer, head)
 }
 
