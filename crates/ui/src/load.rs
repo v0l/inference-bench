@@ -175,7 +175,7 @@ impl LoadDialog {
                 let ctx = p.context.clamp(MIN_CTX.min(max), max);
                 if p.kv != inference_bench_core::discover::Kv::F16 {
                     choice.set("runtime.kv_dtype", json!("fp8"));
-                    if let Some(n) = p.kv.f16_layers() {
+                    if let Some(n) = p.kv.f16_layers(&v.spec) {
                         choice.set("runtime.kv_f16_layers", json!(n));
                     }
                 }
@@ -208,6 +208,7 @@ impl LoadDialog {
         let mut a = v.anatomy.clone();
         let mut spec = v.spec.clone();
         spec.runtime.kv_dtype = self.kv_dtype();
+        spec.runtime.kv_f16_layers = self.choice.value("runtime.kv_f16_layers").as_u64().map(|n| n as usize);
         a.kv_bytes_per_token = (specrt::runtime::kv_block_bytes(&spec, 1) / specrt::codegen::PAGE) as u64;
         if self.native_max == 0 {
             self.native_max = a.max_context;

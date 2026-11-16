@@ -124,6 +124,10 @@ impl App {
         self.engine.loaded()
     }
 
+    pub fn free_gpu_list(&self) -> Vec<u64> {
+        self.gpu.iter().map(|g| g.total_bytes.saturating_sub(g.used_bytes)).collect()
+    }
+
     pub fn free_gpu_bytes(&self) -> Option<u64> {
         self.gpu.first().map(|g| g.total_bytes.saturating_sub(g.used_bytes))
     }

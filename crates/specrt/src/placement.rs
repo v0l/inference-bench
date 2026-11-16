@@ -284,6 +284,7 @@ struct LayerCost {
     state_bytes: u64,
 }
 
+#[derive(Clone)]
 pub struct CostModel {
     pub name: String,
     pub context: usize,
@@ -356,6 +357,27 @@ impl CostModel {
                 counts
             },
         }
+    }
+
+    pub fn rescale_weights(&mut self, weight_bytes: u64) {
+        let own: u64 = self.layers.iter().map(|l| l.weight_bytes).sum::<u64>() + self.embedding_bytes + self.head_bytes + self.norm_bytes;
+        let factor = if own == 0 { 1.0 } else { weight_bytes as f64 / own as f64 };
+        let scale = |b: u64| (b as f64 * factor) as u64;
+        for l in &mut self.layers {
+            l.weight_bytes = scale(l.weight_bytes);
+        }
+        self.embedding_bytes = scale(self.embedding_bytes);
+        self.head_bytes = scale(self.head_bytes);
+    }
+
+    pub fn set_kv(&mut self, kv_bytes_per_token: u64, context: usize) {
+        let kv_layers = self.layers.iter().filter(|l| l.kind != LayerKind::DeltaNet).count().max(1) as u64;
+        for l in &mut self.layers {
+            if l.kind != LayerKind::DeltaNet {
+                l.kv_bytes = kv_bytes_per_token / kv_layers * context as u64;
+            }
+        }
+        self.context = context;
     }
 
     pub fn stage_bytes(&self, start: usize, end: usize) -> u64 {

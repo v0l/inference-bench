@@ -1,6 +1,6 @@
 use super::*;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use inference_bench_core::fake::{FakeServer, Script, ScriptedModel};
 use inference_bench_core::library::{Format, Support};
 
@@ -2096,8 +2096,12 @@ fn discover_hub() -> String {
 }
 
 fn discover_harness(name: &str) -> Harness<'static, App> {
+    discover_harness_on(name, 24 << 30)
+}
+
+fn discover_harness_on(name: &str, total: u64) -> Harness<'static, App> {
     let mut h = harness(name, Tab::Models);
-    with_gpu(&mut h, 0, 24 << 30);
+    with_gpu(&mut h, 0, total);
     {
         let app = h.state_mut();
         app.models.hub_base = discover_hub();
@@ -2115,7 +2119,7 @@ fn discover_harness(name: &str) -> Harness<'static, App> {
 #[test]
 fn discover_shows_one_row_per_repo_with_its_best_quant_and_no_file_rows() {
     let h = discover_harness("discover-rows");
-    let plans = h.state().models.plans(h.state().free_gpu_bytes(), 1);
+    let plans = h.state().models.plans(&h.state().free_gpu_list(), 1);
     assert_eq!(plans.iter().map(|p| p.repo.as_str()).collect::<Vec<_>>(), ["acme/Big-GGUF", "acme/Huge-GGUF", "acme/Odd-GGUF"]);
     let line = models::headline(&plans[0]).unwrap();
     assert!(line.starts_with("Best fit: Q8_0, full 128k context, "), "{line}");
@@ -2123,15 +2127,20 @@ fn discover_shows_one_row_per_repo_with_its_best_quant_and_no_file_rows() {
     assert!(h.query_by_label_contains("Big-Q4_K_M.gguf").is_none());
     assert!(h.query_by_label_contains("mmproj").is_none());
     assert!(h.query_by_label_contains("00001-of-00002").is_none());
-    assert_eq!(h.query_all_by_label("download").count(), 2, "the unsupported repo has no download button");
+    let buttons: Vec<bool> = h.query_all_by_label("download").map(|n| n.accesskit_node().is_disabled()).collect();
+    assert_eq!(buttons.len(), 2, "the unsupported repo has no download button");
+    assert_eq!(buttons.iter().filter(|d| !**d).count(), 1, "the repo that does not fit has a disabled download");
+    h.get_by_label_contains("supported");
+    assert!(h.query_by_label_contains("RUNS HERE").is_none() && h.query_by_label_contains("runs here").is_none());
 }
 
 #[test]
 fn discover_says_when_nothing_fits_and_flags_unsupported_architectures() {
     let h = discover_harness("discover-nofit");
-    let plans = h.state().models.plans(h.state().free_gpu_bytes(), 1);
-    assert_eq!(models::headline(&plans[1]).map(|l| l.starts_with("Best fit: none, does not fit: needs")), Some(true));
-    h.get_by_label_contains("does not fit: needs");
+    let plans = h.state().models.plans(&h.state().free_gpu_list(), 1);
+    assert_eq!(models::headline(&plans[1]).map(|l| l.starts_with("Does not fit: needs")), Some(true));
+    h.get_by_label_contains("Does not fit: needs");
+    assert!(h.query_by_label_contains("context 0").is_none() && h.query_by_label_contains("0 of").is_none());
     h.get_by_label_contains("not supported");
     assert!(plans[2].unsupported.as_deref().is_some_and(|w| w.contains("brandnew")), "{:?}", plans[2].unsupported);
 }
@@ -2155,11 +2164,16 @@ fn a_finished_download_preselects_its_fitted_context_and_kv_in_the_load_dialog()
     let m = LocalModel { path: dir("preselect-model"), ..m };
     std::fs::create_dir_all(&m.path).unwrap();
     std::fs::copy(fixtures().join("qwen3-0.6b.config.json"), m.path.join("config.json")).unwrap();
-    app.models.preselect.push(models::Preselect { model: m.name.clone(), context: 16384, kv: Kv::Fp8 });
+    app.models.preselect.push(models::Preselect { model: m.name.clone(), context: 16384, kv: Kv::MixedFp8 });
     app.open_load_dialog(&m);
     let d = app.load.as_ref().unwrap();
     assert_eq!(d.ctx, 16384);
     assert_eq!(d.kv_dtype(), specrt::spec::KvDtype::Fp8);
+    let layers = d.choice.value("runtime.kv_f16_layers").as_u64().unwrap();
+    assert!(layers > 0, "mixed fp8 keeps the early layers in f16");
+    let a = d.anatomy().unwrap();
+    let fp8_only = Kv::Fp8.bytes_per_token(&d.view.as_ref().unwrap().spec);
+    assert!(a.kv_bytes_per_token > fp8_only, "{} {}", a.kv_bytes_per_token, fp8_only);
     assert!(app.models.preselect.is_empty());
 }
 
@@ -2168,24 +2182,24 @@ fn a_finished_download_preselects_its_fitted_context_and_kv_in_the_load_dialog()
 fn screenshot_of_discover() {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
-    for (file, query) in [("discover.png", None), ("discover-qwen.png", Some("qwen3 8b gguf")), ("discover-1017.png", Some("1017"))] {
-        let Some(query) = query else {
-            let mut h = discover_harness("discover-shot");
-            h.run();
-            h.render().unwrap().save(out.join(file)).unwrap();
-            continue;
-        };
+    let mut fixture = discover_harness("discover-shot");
+    fixture.run();
+    fixture.render().unwrap().save(out.join("discover-fixture.png")).unwrap();
+    let gpus = inference_bench_core::gpu::sample();
+    assert!(!gpus.is_empty(), "no gpu reading on this machine");
+    for (file, query) in [("discover-1017.png", "1017"), ("discover-qwen3.8-27b.png", "qwen3.8 27b"), ("discover-qwen3-8b-gguf.png", "Qwen3-8B-GGUF")] {
         let mut h = harness_sized("discover-live", Tab::Models, 1000.0);
-        with_gpu(&mut h, 0, 96 << 30);
         {
             let app = h.state_mut();
+            app.gpu = gpus.clone();
+            app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
+            app.gpu_poll = Default::default();
             app.models.pane = models::Pane::Discover;
             app.models.query = query.into();
-            app.settings.default_seqs = 1;
         }
         h.run();
         h.get_by_label("search").click();
-        pump_until(&mut h, 120, "live inspect", |a| !a.models.results.is_empty() && a.models.infos.len() == a.models.results.len());
+        pump_until(&mut h, 180, "live inspect", |a| !a.models.results.is_empty() && a.models.infos.len() == a.models.results.len());
         h.run();
         h.render().unwrap().save(out.join(file)).unwrap();
     }

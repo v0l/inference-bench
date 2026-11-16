@@ -2,6 +2,7 @@ use crate::fit;
 use crate::hf::{self, Hub, RepoFile};
 use crate::library::{self, Format};
 use specrt::anatomy::ModelAnatomy;
+use specrt::placement::{CostModel, DeviceConfig, PlacementConfig};
 use specrt::spec::{KvDtype, Spec};
 use std::collections::BTreeMap;
 
@@ -167,14 +168,18 @@ impl Kv {
         }
     }
 
-    pub fn f16_layers(self) -> Option<usize> {
-        (self == Kv::Fp8).then_some(0)
+    pub fn f16_layers(self, spec: &Spec) -> Option<usize> {
+        match self {
+            Kv::F16 => None,
+            Kv::MixedFp8 => Some(spec.attention_layers() / 2),
+            Kv::Fp8 => Some(0),
+        }
     }
 
     pub fn bytes_per_token(self, spec: &Spec) -> u64 {
         let mut s = spec.clone();
         s.runtime.kv_dtype = self.dtype();
-        s.runtime.kv_f16_layers = self.f16_layers();
+        s.runtime.kv_f16_layers = self.f16_layers(spec);
         (specrt::runtime::kv_block_bytes(&s, 1) / specrt::codegen::PAGE) as u64
     }
 }
@@ -215,6 +220,7 @@ pub struct Assessment {
     pub verdict: Verdict,
     pub need: u64,
     pub free: Option<u64>,
+    pub gpus: usize,
 }
 
 impl Assessment {
@@ -223,10 +229,54 @@ impl Assessment {
     }
 }
 
-pub fn assess(spec: &Spec, base: &ModelAnatomy, weights: u64, free: Option<u64>, seqs: usize) -> Assessment {
+fn pooled_context(spec: &Spec, anatomy: &ModelAnatomy, weights: u64, gpus: &[u64], seqs: usize, kv: Kv, native: usize) -> usize {
+    let devices: Vec<DeviceConfig> = gpus
+        .iter()
+        .enumerate()
+        .map(|(i, free)| DeviceConfig {
+            name: format!("gpu{i}"),
+            memory_gib: (*free as f64 * fit::GPU_UTILIZATION) / fit::GB,
+            bandwidth_gbs: 1000.0,
+            tflops: 100.0,
+            ordinal: Some(i),
+            address: None,
+            reserve_gib: Some(0.0),
+            link: Default::default(),
+            offload: None,
+            host: None,
+            peer: None,
+        })
+        .collect();
+    let per_token = kv.bytes_per_token(spec);
+    let fits = |ctx: usize| {
+        let config = PlacementConfig { context: ctx, slots: seqs.max(1), devices: devices.clone(), max_tp: Some(1), ..PlacementConfig::default() };
+        let mut model = CostModel::new(spec, ctx, seqs.max(1));
+        model.rescale_weights(weights);
+        model.set_kv(per_token, ctx);
+        let _ = anatomy;
+        let devs: Vec<specrt::placement::Device> = config.devices.iter().map(specrt::placement::Device::from_config).collect();
+        specrt::placement::plan(&model, &devs, specrt::placement::Objective::Latency).is_ok()
+    };
+    if !fits(fit::MIN_CTX.min(native)) {
+        return 0;
+    }
+    let (mut lo, mut hi) = (fit::MIN_CTX.min(native), native);
+    while lo < hi {
+        let mid = (lo + (hi - lo).div_ceil(2)).min(hi);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+pub fn assess(spec: &Spec, base: &ModelAnatomy, weights: u64, gpus: &[u64], seqs: usize) -> Assessment {
     let mut a = base.clone();
     a.total_bytes = weights;
     let native = fit::max_context(&a);
+    let free: Option<u64> = (!gpus.is_empty()).then(|| gpus.iter().sum());
     let usable = free.map(|f| (f as f64 * fit::GPU_UTILIZATION) as u64);
     let room = fit::room_bytes(&a, usable, seqs);
     let kvs: Vec<KvFit> = Kv::ALL
@@ -234,13 +284,17 @@ pub fn assess(spec: &Spec, base: &ModelAnatomy, weights: u64, free: Option<u64>,
         .map(|&kv| {
             let bytes_per_token = kv.bytes_per_token(spec);
             a.kv_bytes_per_token = bytes_per_token;
-            let context = room.map_or(0, |r| fit::pool_tokens(&a, r).min(native));
+            let context = match gpus.len() {
+                0 => 0,
+                1 => room.map_or(0, |r| fit::pool_tokens(&a, r).min(native)),
+                _ => pooled_context(spec, base, weights, gpus, seqs, kv, native),
+            };
             KvFit { kv, bytes_per_token, context }
         })
         .collect();
     let f16 = kvs[0].clone();
     let need = weights + a.state_bytes_per_seq * seqs.max(1) as u64 + kvs[0].bytes_per_token * fit::TYPICAL_REQUEST as u64;
-    let (chosen, tier, verdict) = match room {
+    let (chosen, tier, verdict) = match free {
         None => (f16, 3, Verdict::Unknown),
         Some(_) => match kvs.iter().find(|k| k.context >= native) {
             Some(k) if k.kv == Kv::F16 => (k.clone(), 0, Verdict::Fits),
@@ -253,7 +307,7 @@ pub fn assess(spec: &Spec, base: &ModelAnatomy, weights: u64, free: Option<u64>,
             }
         },
     };
-    Assessment { weights, native, kvs, chosen, tier, verdict, need, free }
+    Assessment { weights, native, kvs, chosen, tier, verdict, need, free, gpus: gpus.len() }
 }
 
 pub fn context_label(tokens: usize) -> String {
@@ -385,7 +439,7 @@ impl RepoPlan {
     }
 }
 
-pub fn plan(info: &RepoInfo, free: Option<u64>, seqs: usize) -> RepoPlan {
+pub fn plan(info: &RepoInfo, gpus: &[u64], seqs: usize) -> RepoPlan {
     let mut ranked: Vec<Scored> = info
         .grouped
         .variants
@@ -400,7 +454,7 @@ pub fn plan(info: &RepoInfo, free: Option<u64>, seqs: usize) -> RepoPlan {
             let (fit, bits) = match &info.shape {
                 Ok(s) => {
                     let bits = if v.format == Format::Gguf { v.bits } else { (v.size as f64 * 8.0 / s.anatomy.total_params.max(1) as f64) as f32 };
-                    (Some(assess(&s.spec, &s.anatomy, v.size, free, seqs)), bits)
+                    (Some(assess(&s.spec, &s.anatomy, v.size, gpus, seqs)), bits)
                 }
                 Err(_) => (None, v.bits),
             };
@@ -579,7 +633,7 @@ mod tests {
         let s = shape();
         let weights = 5 * GB;
         let free = 12 * GB;
-        let a = assess(&s.spec, &s.anatomy, weights, Some(free), 1);
+        let a = assess(&s.spec, &s.anatomy, weights, &[free], 1);
         let mut base = s.anatomy.clone();
         base.total_bytes = weights;
         let room = fit::room_bytes(&base, Some((free as f64 * fit::GPU_UTILIZATION) as u64), 1).unwrap();
@@ -595,25 +649,55 @@ mod tests {
     #[test]
     fn plenty_of_room_gives_full_context_with_f16_and_less_room_falls_back_to_quantized_kv() {
         let s = shape();
-        let roomy = assess(&s.spec, &s.anatomy, 5 * GB, Some(80 * GB), 1);
+        let roomy = assess(&s.spec, &s.anatomy, 5 * GB, &[80 * GB], 1);
         assert_eq!((roomy.chosen.kv, roomy.tier, roomy.verdict), (Kv::F16, 0, Verdict::Fits));
         assert!(roomy.full());
         let f16_need = Kv::F16.bytes_per_token(&s.spec) * 131072;
         let mixed_need = Kv::MixedFp8.bytes_per_token(&s.spec) * 131072;
         let free = (((5 * GB + mixed_need + GB) as f64) / fit::GPU_UTILIZATION) as u64;
         assert!(f16_need > mixed_need + GB);
-        let tight = assess(&s.spec, &s.anatomy, 5 * GB, Some(free), 1);
+        let tight = assess(&s.spec, &s.anatomy, 5 * GB, &[free], 1);
         assert_eq!((tight.chosen.kv, tight.tier, tight.verdict), (Kv::MixedFp8, 1, Verdict::Fits));
         assert!(tight.full());
     }
 
     #[test]
+    fn a_model_that_fits_only_across_two_gpus_is_planned_across_both() {
+        let s = shape();
+        let one = assess(&s.spec, &s.anatomy, 30 * GB, &[24 * GB], 1);
+        assert_eq!((one.verdict, one.chosen.context), (Verdict::DoesNotFit, 0));
+        let two = assess(&s.spec, &s.anatomy, 30 * GB, &[24 * GB, 24 * GB], 1);
+        assert_eq!(two.gpus, 2);
+        assert!(two.chosen.context >= fit::TYPICAL_REQUEST && two.verdict != Verdict::DoesNotFit, "{two:?}");
+        assert_eq!(two.free, Some(48 * GB));
+        let three = assess(&s.spec, &s.anatomy, 30 * GB, &[24 * GB, 24 * GB, 24 * GB], 1);
+        assert!(three.kvs[0].context >= two.kvs[0].context);
+        let roomy = assess(&s.spec, &s.anatomy, 5 * GB, &[40 * GB, 40 * GB], 1);
+        assert_eq!((roomy.chosen.kv, roomy.tier), (Kv::F16, 0));
+    }
+
+    #[test]
+    fn mixed_fp8_is_its_own_choice_between_f16_and_fp8() {
+        let s = shape();
+        let f16 = Kv::F16.bytes_per_token(&s.spec);
+        let mixed = Kv::MixedFp8.bytes_per_token(&s.spec);
+        let fp8 = Kv::Fp8.bytes_per_token(&s.spec);
+        assert!(fp8 < mixed && mixed < f16);
+        assert_eq!(Kv::MixedFp8.f16_layers(&s.spec), Some(18));
+        assert_eq!(Kv::Fp8.f16_layers(&s.spec), Some(0));
+        let need = |per: u64| 5 * GB + per * 131072 + GB / 2;
+        let free = (need(mixed) as f64 / fit::GPU_UTILIZATION) as u64;
+        let a = assess(&s.spec, &s.anatomy, 5 * GB, &[free], 1);
+        assert_eq!((a.chosen.kv, a.chosen.kv.label(), a.tier), (Kv::MixedFp8, "mixed fp8 KV", 1));
+    }
+
+    #[test]
     fn nothing_fits_is_reported_with_what_the_smallest_variant_needs() {
         let s = shape();
-        let a = assess(&s.spec, &s.anatomy, 30 * GB, Some(8 * GB), 1);
+        let a = assess(&s.spec, &s.anatomy, 30 * GB, &[8 * GB], 1);
         assert_eq!((a.verdict, a.tier, a.chosen.context), (Verdict::DoesNotFit, 3, 0));
         assert!(a.need > 30 * GB && a.free == Some(8 * GB));
-        let unknown = assess(&s.spec, &s.anatomy, 5 * GB, None, 1);
+        let unknown = assess(&s.spec, &s.anatomy, 5 * GB, &[], 1);
         assert_eq!(unknown.verdict, Verdict::Unknown);
     }
 
@@ -625,21 +709,21 @@ mod tests {
     #[test]
     fn ranking_prefers_full_f16_then_full_quantized_then_widest_and_takes_the_highest_bits_within_a_tier() {
         let all = [("Q4_K_M", 5 * GB), ("Q5_K_M", 6 * GB), ("Q6_K", 7 * GB), ("Q8_0", 9 * GB)];
-        let plan_big = plan(&info(&all), Some(80 * GB), 1);
+        let plan_big = plan(&info(&all), &[80 * GB], 1);
         assert_eq!(plan_big.best().unwrap().variant.label, "Q8_0");
         assert_eq!(plan_big.ranked.iter().map(|s| s.variant.label.as_str()).collect::<Vec<_>>(), ["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M"]);
         let s = shape();
         let mixed_need = Kv::Fp8.bytes_per_token(&s.spec) * 131072;
         let free = (((9 * GB + mixed_need + GB / 4) as f64) / fit::GPU_UTILIZATION) as u64;
-        let squeezed = plan(&info(&all), Some(free), 1);
+        let squeezed = plan(&info(&all), &[free], 1);
         let best = squeezed.best().unwrap();
         assert_eq!((best.variant.label.as_str(), best.fit.as_ref().unwrap().chosen.kv, best.fit.as_ref().unwrap().tier), ("Q8_0", Kv::Fp8, 1));
         let free = (((7 * GB + mixed_need + GB / 4) as f64) / fit::GPU_UTILIZATION) as u64;
-        let mid = plan(&info(&all), Some(free), 1);
+        let mid = plan(&info(&all), &[free], 1);
         assert_eq!(mid.best().unwrap().variant.label, "Q6_K");
         let tiers: Vec<u8> = mid.ranked.iter().map(|s| s.fit.as_ref().unwrap().tier).collect();
         assert!(tiers.windows(2).all(|w| w[0] <= w[1]), "{tiers:?}");
-        let tiny = plan(&info(&all), Some(7 * GB + GB / 2), 1);
+        let tiny = plan(&info(&all), &[7 * GB + GB / 2], 1);
         let best = tiny.best().unwrap();
         assert_eq!(best.variant.label, "Q5_K_M", "only the best reduced-context tier that fits at all: {:?}", tiny.ranked.iter().map(|s| (&s.variant.label, s.fit.as_ref().unwrap().tier)).collect::<Vec<_>>());
         assert_eq!(best.fit.as_ref().unwrap().tier, 2);
@@ -649,12 +733,12 @@ mod tests {
     fn unsupported_quant_types_and_incomplete_splits_are_never_the_best() {
         let files = files_1017();
         let info = RepoInfo { repo: "x/y".into(), grouped: group(&files, None), shape: Ok(shape()) };
-        let p = plan(&info, Some(500 * GB), 1);
+        let p = plan(&info, &[500 * GB], 1);
         let best = p.best().unwrap();
         assert!(best.variant.label == "IQ4_NL" || best.runnable.is_err() || !best.variant.complete());
         assert!(p.ranked.iter().all(|s| s.runnable.is_err()), "IQ quants are not supported by specrt");
         let unsupported = RepoInfo { shape: Err("model_type deepseek_v4 is not supported".into()), ..info };
-        let p = plan(&unsupported, Some(500 * GB), 1);
+        let p = plan(&unsupported, &[500 * GB], 1);
         assert_eq!(p.unsupported.as_deref(), Some("model_type deepseek_v4 is not supported"));
         assert!(p.best().is_some_and(|b| !b.downloadable()));
     }
@@ -664,13 +748,13 @@ mod tests {
         let mk = |name: &str, free: u64, size: u64| {
             let mut i = info(&[("Q4_K_M", size)]);
             i.repo = name.into();
-            plan(&i, Some(free), 1)
+            plan(&i, &[free], 1)
         };
         let unsupported = {
             let mut i = info(&[("Q4_K_M", GB)]);
             i.repo = "z/unsupported".into();
             i.shape = Err("nope".into());
-            plan(&i, Some(80 * GB), 1)
+            plan(&i, &[80 * GB], 1)
         };
         let ranked = rank_repos(vec![unsupported, mk("a/too-big", 80 * GB, 90 * GB), mk("b/ok", 80 * GB, 5 * GB)]);
         assert_eq!(ranked.iter().map(|p| p.repo.as_str()).collect::<Vec<_>>(), ["b/ok", "a/too-big", "z/unsupported"]);

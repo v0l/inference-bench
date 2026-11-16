@@ -151,8 +151,8 @@ impl ModelsState {
         self.inspecting.start(job::spawn(wake, move || discover::inspect_all(&Hub::new(&base, &token), &repos)));
     }
 
-    pub fn plans(&self, free: Option<u64>, seqs: usize) -> Vec<RepoPlan> {
-        let planned: Vec<RepoPlan> = self.infos.values().filter_map(|i| i.as_ref().ok()).map(|i| discover::plan(i, free, seqs)).collect();
+    pub fn plans(&self, gpus: &[u64], seqs: usize) -> Vec<RepoPlan> {
+        let planned: Vec<RepoPlan> = self.infos.values().filter_map(|i| i.as_ref().ok()).map(|i| discover::plan(i, gpus, seqs)).collect();
         let ranked = discover::rank_repos(planned);
         let mut out: Vec<RepoPlan> = Vec::new();
         for r in &self.results {
@@ -379,15 +379,22 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+fn need_line(f: &discover::Assessment) -> String {
+    format!("needs {}, {} free", human_size(f.need), f.free.map_or("-".into(), human_size))
+}
+
 fn best_line(s: &Scored) -> String {
     let Some(f) = &s.fit else { return String::new() };
-    let ctx = discover::context_label(f.chosen.context);
     match f.verdict {
         Verdict::Unknown => format!("{} on the gpu, no gpu reading to check fit", human_size(f.weights)),
-        Verdict::DoesNotFit => format!("does not fit: needs {}, {} free", human_size(f.need), f.free.map_or("-".into(), human_size)),
+        Verdict::DoesNotFit => need_line(f),
         _ if f.full() => format!("full {} context, {}", discover::context_label(f.native), f.chosen.kv.label()),
-        _ => format!("{ctx} of {} context, {}", discover::context_label(f.native), f.chosen.kv.label()),
+        _ => format!("{} of {} context, {}", discover::context_label(f.chosen.context), discover::context_label(f.native), f.chosen.kv.label()),
     }
+}
+
+fn fits_somewhere(plan: &RepoPlan) -> bool {
+    plan.ranked.iter().any(|s| s.downloadable() && s.fit.as_ref().is_some_and(|f| f.verdict != Verdict::DoesNotFit))
 }
 
 pub fn headline(plan: &RepoPlan) -> Option<String> {
@@ -397,7 +404,7 @@ pub fn headline(plan: &RepoPlan) -> Option<String> {
     }
     let f = s.fit.as_ref()?;
     match f.verdict {
-        Verdict::DoesNotFit => Some(format!("Best fit: none, {}", best_line(s))),
+        Verdict::DoesNotFit => Some(format!("Does not fit: {}", need_line(f))),
         _ => Some(format!("Best fit: {}, {}", s.variant.label, best_line(s))),
     }
 }
@@ -413,7 +420,11 @@ fn verdict_chip(ui: &mut egui::Ui, s: &Scored) {
     chip(ui, f.verdict.label(), tint, lit);
 }
 
-fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>, token: &str, free: Option<u64>) {
+pub fn can_download(s: &Scored) -> bool {
+    s.downloadable() && s.fit.as_ref().is_none_or(|f| f.verdict != Verdict::DoesNotFit)
+}
+
+fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>, token: &str) {
     card(
         ui,
         None,
@@ -434,42 +445,43 @@ fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>,
             let Some(best) = plan.best() else { return };
             let chosen_label = app.models.picks.get(&r.id).cloned().unwrap_or_else(|| best.variant.label.clone());
             let shown = plan.ranked.iter().find(|s| s.variant.label == chosen_label).unwrap_or(best).clone();
-            if let Some(why) = &plan.unsupported {
+            if let Some(why) = plan.unsupported.clone().or_else(|| shown.runnable.clone().err()) {
                 ui.horizontal_wrapped(|ui| {
                     chip(ui, "not supported", WARN, false);
-                    note(ui, why.clone(), LEGEND);
+                    note(ui, why, LEGEND);
                 });
                 return;
             }
-            if shown.runnable.is_err() {
-                ui.horizontal_wrapped(|ui| {
-                    chip(ui, "not supported", WARN, false);
-                    note(ui, shown.runnable.clone().err().unwrap_or_default(), LEGEND);
-                });
-                return;
-            }
-            if let Some(line) = headline(plan).filter(|_| shown.variant.label == best.variant.label) {
-                ui.label(egui::RichText::new(line).color(VALUE).size(12.5));
+            let fits = shown.fit.as_ref().is_none_or(|f| f.verdict != Verdict::DoesNotFit);
+            if shown.variant.label == best.variant.label {
+                if let Some(line) = headline(plan) {
+                    let tint = if fits { VALUE } else { FAULT };
+                    ui.label(egui::RichText::new(line).color(tint).size(12.5));
+                }
             }
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 Line::new().legend("quant").value(shown.variant.label.clone()).show(ui);
                 if let Some(f) = &shown.fit {
                     Line::new().legend("on gpu").value(human_size(f.weights)).show(ui);
-                    Line::new().legend("context").value(format!("{} of {}", discover::context_label(f.chosen.context), discover::context_label(f.native))).show(ui);
-                    Line::new().legend("kv").value(f.chosen.kv.label()).show(ui);
+                    if fits {
+                        Line::new().legend("context").value(format!("{} of {}", discover::context_label(f.chosen.context), discover::context_label(f.native))).show(ui);
+                        Line::new().legend("kv").value(f.chosen.kv.label()).show(ui);
+                    }
                 }
                 verdict_chip(ui, &shown);
-                chip(ui, "runs here", OK, true);
+                chip(ui, "supported", OK, true);
             });
-            if shown.variant.label != best.variant.label && shown.fit.as_ref().is_some_and(|f| f.verdict == Verdict::DoesNotFit) {
-                note(ui, best_line(&shown), FAULT);
+            if !fits && shown.variant.label != best.variant.label {
+                if let Some(f) = &shown.fit {
+                    note(ui, need_line(f), FAULT);
+                }
             }
             let info = app.models.infos.get(&r.id).and_then(|i| i.as_ref().ok()).cloned();
             let Some(info) = info else { return };
             let running = app.models.downloads.iter().any(|d| d.repo == r.id && d.result.is_none());
             ui.horizontal(|ui| {
-                let key = Key::new(if running { "downloading" } else { "download" }).solid(READOUT).enabled(!running && shown.downloadable()).id_salt(("dl", &r.id));
+                let key = Key::new(if running { "downloading" } else { "download" }).solid(READOUT).enabled(!running && can_download(&shown)).id_salt(("dl", &r.id));
                 if ui.add(key).clicked() {
                     let files = discover::download_list(&info.grouped, &shown.variant);
                     let first = shown.variant.files.first().map(|f| f.path.clone()).unwrap_or_default();
@@ -478,7 +490,7 @@ fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>,
                     let wake = app.wake.clone();
                     app.models.start_download(&wake, token, &r.id, &label, files, fitted, first, shown.variant.format);
                 }
-                if plan.ranked.len() > 1 {
+                if plan.ranked.len() > 1 && (fits_somewhere(plan) || !fits) {
                     let mut picked = shown.variant.label.clone();
                     let options: Vec<(String, String)> = plan
                         .ranked
@@ -494,7 +506,6 @@ fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>,
                     }
                 }
             });
-            let _ = free;
         },
     );
 }
@@ -522,18 +533,19 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
     if let Some((ok, text)) = &app.models.message {
         status(ui, *ok, text);
     }
-    let free = app.free_gpu_bytes();
-    if let Some(f) = free {
-        note(ui, format!("{} free on the gpu, {} parallel requests", human_size(f), app.settings.default_seqs), LEGEND);
+    let gpus = app.free_gpu_list();
+    if !gpus.is_empty() {
+        let each: Vec<String> = gpus.iter().map(|g| human_size(*g)).collect();
+        note(ui, format!("free on the gpu: {}, {} parallel requests", each.join(" + "), app.settings.default_seqs), LEGEND);
     }
-    let plans = app.models.plans(free, app.settings.default_seqs);
+    let plans = app.models.plans(&gpus, app.settings.default_seqs);
     let results = app.models.results.clone();
     let mut order: Vec<&Repo> = results.iter().filter(|r| plans.iter().any(|p| p.repo == r.id)).collect();
     order.sort_by_key(|r| plans.iter().position(|p| p.repo == r.id));
     let pending: Vec<&Repo> = results.iter().filter(|r| !plans.iter().any(|p| p.repo == r.id)).collect();
     for r in order.into_iter().chain(pending) {
         let plan = plans.iter().find(|p| p.repo == r.id).cloned();
-        repo_row(app, ui, r, plan.as_ref(), &token, free);
+        repo_row(app, ui, r, plan.as_ref(), &token);
     }
     downloads_section(app, ui);
 }
