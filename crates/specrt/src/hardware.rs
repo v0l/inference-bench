@@ -176,6 +176,31 @@ pub fn estimated_bandwidth_gbs(memory_clock_khz: i32, bus_bits: i32) -> f64 {
     2.0 * memory_clock_khz as f64 * 1e3 * (bus_bits as f64 / 8.0) / 1e9
 }
 
+pub fn probe_idle() -> Result<Machine> {
+    use cudarc::driver::sys::CUdevice_attribute as A;
+    use cudarc::driver::result;
+    result::init().map_err(|e| anyhow!("no CUDA driver: {e:?}"))?;
+    let count = result::device::get_count().map_err(|e| anyhow!("no CUDA driver: {e:?}"))? as usize;
+    let mut gpus = Vec::new();
+    for ordinal in 0..count {
+        let dev = result::device::get(ordinal as i32).map_err(|e| anyhow!("CUDA device {ordinal}: {e:?}"))?;
+        let attr = |a| unsafe { result::device::get_attribute(dev, a) }.unwrap_or(0);
+        let total = unsafe { result::device::total_mem(dev) }.map_err(|e| anyhow!("{e:?}"))? as u64;
+        let sms = attr(A::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT) as u32;
+        gpus.push(GpuInfo {
+            ordinal,
+            name: result::device::get_name(dev).map_err(|e| anyhow!("{e:?}"))?,
+            compute: (attr(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR) as u32, attr(A::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR) as u32),
+            sms,
+            total_bytes: total,
+            free_bytes: total,
+            bandwidth_gbs: estimated_bandwidth_gbs(attr(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE), attr(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)),
+            tflops: estimated_tflops(sms, attr(A::CU_DEVICE_ATTRIBUTE_CLOCK_RATE)),
+        });
+    }
+    Ok(machine_with(gpus, Vec::new()))
+}
+
 pub fn probe() -> Result<Machine> {
     use cudarc::driver::sys::CUdevice_attribute as A;
     use cudarc::driver::{CudaContext, result, sys};

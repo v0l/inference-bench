@@ -187,7 +187,7 @@ pub fn run(args: &HostArgs, data: &Path) -> Result<()> {
         libc::signal(libc::SIGTERM, on_term as *const () as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_term as *const () as libc::sighandler_t);
     }
-    let machine = specrt::hardware::probe()?;
+    let machine = specrt::hardware::probe_idle()?;
     let running = start(&file, data, machine)?;
     tracing::info!(control = %running.control_addr(), socket = %running.socket().display(), mdns_port = file.mdns_port, "host is sharing this machine, pair with `inference-bench host pair`");
     while !TERM.load(Ordering::SeqCst) {
