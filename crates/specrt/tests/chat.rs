@@ -85,45 +85,33 @@ fn the_template_says_whether_it_supports_and_opens_thinking() {
     assert_eq!(template("Qwen2.5-0.5B.tokenizer_config.json").thinking(), Thinking::Unsupported);
 }
 
-fn cached_template(repo: &str) -> Option<ChatTemplate> {
-    let snapshots = dirs_home()?.join(".cache/huggingface/hub").join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
-    let snapshot = std::fs::read_dir(snapshots).ok()?.next()?.ok()?.path();
-    let config = std::fs::read_to_string(snapshot.join("tokenizer_config.json")).ok()?;
-    let jinja = std::fs::read_to_string(snapshot.join("chat_template.jinja")).ok();
-    ChatTemplate::from_files(&config, jinja.as_deref()).ok()?
-}
-
-fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(Into::into)
+fn family_template(name: &str) -> ChatTemplate {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/templates").join(format!("{name}.jinja"));
+    let source = std::fs::read_to_string(path).unwrap();
+    ChatTemplate::from_files("{}", Some(&source)).unwrap().unwrap()
 }
 
 #[test]
 fn every_family_template_gets_its_tool_parser_or_an_explicit_none() {
     let table = [
-        ("Qwen/Qwen3-0.6B", ToolFormat::Hermes),
-        ("Qwen/Qwen2.5-0.5B", ToolFormat::Hermes),
-        ("Qwen/Qwen3.5-4B-Base", ToolFormat::Qwen3Coder),
-        ("Qwen/Qwen3.8-27B-FP8", ToolFormat::Qwen3Coder),
-        ("orcarouter/Qwen3.8-27B-Uncensored-NVFP4", ToolFormat::Qwen3Coder),
-        ("Sehyo/Qwen3.5-122B-A10B-NVFP4", ToolFormat::Qwen3Coder),
-        ("HuggingFaceTB/SmolLM3-3B", ToolFormat::Unparsed),
-        ("microsoft/Phi-4-mini-instruct", ToolFormat::Unparsed),
-        ("microsoft/Phi-3-mini-4k-instruct", ToolFormat::None),
-        ("allenai/OLMo-2-0425-1B", ToolFormat::None),
-        ("ibm-granite/granite-3.3-2b-base", ToolFormat::Unparsed),
-        ("Locutusque/TinyMistral-248M", ToolFormat::None),
-        ("RedHatAI/Mistral-Small-24B-Instruct-2501-FP8-dynamic", ToolFormat::None),
-        ("unsloth/Llama-3.2-1B", ToolFormat::Unparsed),
+        ("gemma3", ToolFormat::None),
+        ("smollm3", ToolFormat::Hermes),
+        ("olmo2", ToolFormat::None),
+        ("granite3", ToolFormat::Unparsed),
+        ("llama3", ToolFormat::Unparsed),
+        ("mistral-small3", ToolFormat::None),
+        ("phi3", ToolFormat::None),
+        ("phi4", ToolFormat::Unparsed),
+        ("qwen3", ToolFormat::Hermes),
+        ("qwen3.5", ToolFormat::Qwen3Coder),
+        ("qwen3.5-moe", ToolFormat::Qwen3Coder),
+        ("qwen3.8", ToolFormat::Qwen3Coder),
     ];
-    let mut seen = 0;
-    for (repo, want) in table {
-        if let Some(t) = cached_template(repo) {
-            seen += 1;
-            eprintln!("{repo}: {:?}", t.tool_format());
-            assert_eq!(t.tool_format(), want, "{repo}");
-        }
+    for (family, want) in table {
+        let got = family_template(family).tool_format();
+        eprintln!("{family}: {got:?}");
+        assert_eq!(got, want, "{family}");
     }
-    eprintln!("{seen} cached family templates checked");
 }
 
 #[test]
