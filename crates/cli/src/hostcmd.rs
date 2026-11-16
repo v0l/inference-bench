@@ -3,6 +3,7 @@ use clap::{Args, Subcommand};
 use serde::Deserialize;
 use specrt::hardware::Machine;
 use specrt::host::{Host, HostConfig};
+use specrt::stage::MemoryGuard;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -35,11 +36,12 @@ pub struct HostFile {
     pub control_socket: Option<PathBuf>,
     pub gpus: Vec<usize>,
     pub max_memory_gb: Option<f64>,
+    pub reserve_gb: f64,
 }
 
 impl Default for HostFile {
     fn default() -> Self {
-        Self { bind: "0.0.0.0:0".into(), mdns_port: 5353, interface: None, key_file: None, control_socket: None, gpus: Vec::new(), max_memory_gb: None }
+        Self { bind: "0.0.0.0:0".into(), mdns_port: 5353, interface: None, key_file: None, control_socket: None, gpus: Vec::new(), max_memory_gb: None, reserve_gb: 4.0 }
     }
 }
 
@@ -50,6 +52,9 @@ impl HostFile {
             && !(gb > 0.0)
         {
             bail!("max_memory_gb must be above 0");
+        }
+        if file.reserve_gb < 0.0 {
+            bail!("reserve_gb must not be negative");
         }
         Ok(file)
     }
@@ -139,7 +144,23 @@ impl Drop for Running {
     }
 }
 
+pub type FreeMemory = Arc<dyn Fn(usize) -> Result<u64> + Send + Sync>;
+
+pub fn live_free_memory() -> FreeMemory {
+    Arc::new(|gpu| {
+        let cuda = specrt::hardware::probe().ok().and_then(|m| m.gpus.into_iter().find(|g| g.ordinal == gpu)).map(|g| g.free_bytes);
+        match cuda {
+            Some(free) => Ok(free),
+            None => Ok(std::fs::read_to_string("/proc/meminfo").map(|t| specrt::hardware::parse_meminfo(&t).1).unwrap_or(0)),
+        }
+    })
+}
+
 pub fn start(file: &HostFile, data: &Path, machine: Machine) -> Result<Running> {
+    start_with(file, data, machine, live_free_memory())
+}
+
+pub fn start_with(file: &HostFile, data: &Path, machine: Machine, free: FreeMemory) -> Result<Running> {
     let shared = file.shared(&machine)?;
     let machine = file.capped(machine);
     let config = HostConfig { key_file: file.key_file(data), mdns_port: file.mdns_port, interface: file.interface.clone(), bind: file.bind.clone(), app_version: env!("CARGO_PKG_VERSION").into() };
@@ -148,7 +169,9 @@ pub fn start(file: &HostFile, data: &Path, machine: Machine) -> Result<Running> 
         std::fs::create_dir_all(dir)?;
     }
     let _ = std::fs::remove_file(&socket);
+    let host_name = machine.host.clone();
     let host = Arc::new(Host::start(config, machine, shared)?);
+    host.guard_memory(MemoryGuard { host: host_name, reserve_bytes: (file.reserve_gb * (1u64 << 30) as f64) as u64, free });
     let listener = UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     let stop = Arc::new(AtomicBool::new(false));
@@ -223,6 +246,28 @@ mod tests {
         assert_eq!(HostFile::parse("").unwrap(), HostFile::default());
         assert!(HostFile::parse("blind = 1").is_err());
         assert!(HostFile::parse("max_memory_gb = 0").is_err());
+    }
+
+    #[test]
+    fn a_stage_that_does_not_fit_the_free_memory_is_refused_by_host_name() {
+        let d = dir("guard");
+        let file = HostFile { bind: "127.0.0.1:0".into(), mdns_port: 15620, reserve_gb: 4.0, ..HostFile::default() };
+        let mut machine = fake_gpus("tight-spark", 1, true);
+        machine.host = "tight-spark".into();
+        let running = start_with(&file, &d, machine, Arc::new(|_| Ok(6u64 << 30))).unwrap();
+        let control = running.control_addr().to_string();
+        let key = specrt::pairing::generate_key().unwrap();
+        let code = request_code(running.socket()).unwrap().0;
+        pair_with(&control, &code, &key).unwrap();
+        let spec = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/qwen3.8-27b.toml").display().to_string();
+        let addrs = specrt::host::request_stages(&control, &key, &spec, 512, 1, &[0]).unwrap();
+        let raw = specrt::pairing::unhex(&key).unwrap();
+        let mut client = specrt::wire::StageClient::connect(&addrs[0], key.as_bytes(), Duration::from_secs(5)).unwrap();
+        let _ = raw;
+        let err = client.assign(0, 64).unwrap_err().to_string();
+        assert!(err.contains("tight-spark refuses layers 0-64"), "{err}");
+        assert!(err.contains("6.0 GiB free"), "{err}");
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]

@@ -108,7 +108,35 @@ struct Loaded {
 
 unsafe impl Send for Loaded {}
 
+#[derive(Clone)]
+pub struct MemoryGuard {
+    pub host: String,
+    pub reserve_bytes: u64,
+    pub free: Arc<dyn Fn(usize) -> Result<u64> + Send + Sync>,
+}
+
+impl MemoryGuard {
+    pub fn check(&self, spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize, device: usize) -> Result<()> {
+        let need = crate::placement::CostModel::new(spec, max_ctx, slots).stage_bytes(layers[0], layers[1]);
+        let free = (self.free)(device)?;
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        anyhow::ensure!(
+            need + self.reserve_bytes <= free,
+            "{} refuses layers {}-{} of {}: they need about {:.1} GiB, GPU {device} has {:.1} GiB free and {:.1} GiB is kept in reserve",
+            self.host,
+            layers[0],
+            layers[1],
+            spec.name,
+            gib(need),
+            gib(free),
+            gib(self.reserve_bytes)
+        );
+        Ok(())
+    }
+}
+
 pub struct RuntimeStage {
+    guard: Mutex<Option<MemoryGuard>>,
     spec: Spec,
     max_ctx: usize,
     slots: usize,
@@ -132,7 +160,7 @@ fn load_range(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize, dev
 impl RuntimeStage {
     pub fn load(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize) -> Result<RuntimeStage> {
         let loaded = load_range(spec, layers, max_ctx, slots, 0)?;
-        Ok(RuntimeStage { spec: spec.clone(), max_ctx, slots, device: 0, inner: Mutex::new(Some(loaded)) })
+        Ok(RuntimeStage { spec: spec.clone(), max_ctx, slots, device: 0, inner: Mutex::new(Some(loaded)), guard: Mutex::new(None) })
     }
 
     pub fn unloaded(spec: &Spec, max_ctx: usize, slots: usize) -> RuntimeStage {
@@ -140,7 +168,11 @@ impl RuntimeStage {
     }
 
     pub fn unloaded_on(spec: &Spec, max_ctx: usize, slots: usize, device: usize) -> RuntimeStage {
-        RuntimeStage { spec: spec.clone(), max_ctx, slots, device, inner: Mutex::new(None) }
+        RuntimeStage { spec: spec.clone(), max_ctx, slots, device, inner: Mutex::new(None), guard: Mutex::new(None) }
+    }
+
+    pub fn guard_memory(&self, guard: Option<MemoryGuard>) {
+        *self.guard.lock().unwrap() = guard;
     }
 
     pub fn assign(&self, layers: [usize; 2]) -> Result<()> {
@@ -149,6 +181,9 @@ impl RuntimeStage {
             return Ok(());
         }
         *guard = None;
+        if let Some(g) = self.guard.lock().unwrap().clone() {
+            g.check(&self.spec, layers, self.max_ctx, self.slots, self.device)?;
+        }
         *guard = Some(load_range(&self.spec, layers, self.max_ctx, self.slots, self.device)?);
         Ok(())
     }

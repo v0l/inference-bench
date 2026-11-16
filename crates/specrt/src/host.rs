@@ -2,7 +2,7 @@ use crate::cluster::{ANNOUNCEMENT_VERSION, Peer, PeerGpu};
 use crate::discovery::PeerAnnouncer;
 use crate::hardware::{self, Machine};
 use crate::pairing::{self, Offer};
-use crate::stage::RuntimeStage;
+use crate::stage::{MemoryGuard, RuntimeStage};
 use crate::wire::{StageServer, hmac_sha256};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -19,9 +19,14 @@ pub struct HostedStage {
 }
 
 pub fn spawn_stage(model: &str, ctx: usize, slots: usize, gpu: usize, key: &[u8], bind: &str) -> Result<HostedStage> {
+    spawn_stage_guarded(model, ctx, slots, gpu, key, bind, None)
+}
+
+pub fn spawn_stage_guarded(model: &str, ctx: usize, slots: usize, gpu: usize, key: &[u8], bind: &str, guard: Option<MemoryGuard>) -> Result<HostedStage> {
     let mut spec = crate::engine::resolve_spec(model).with_context(|| model.to_string())?;
     spec.mtp = None;
     let stage = Arc::new(RuntimeStage::unloaded_on(&spec, ctx, slots, gpu));
+    stage.guard_memory(guard);
     let server = StageServer::start(bind, key, stage.clone())?;
     Ok(HostedStage { server, stage })
 }
@@ -65,6 +70,7 @@ struct State {
     offer: Option<Offer>,
     stages: Vec<HostedStage>,
     paired: bool,
+    guard: Option<MemoryGuard>,
 }
 
 pub struct Host {
@@ -169,10 +175,11 @@ fn run(state: &Arc<Mutex<State>>, request: Request, key: &[u8], local_ip: std::n
         Request::Stage { model, ctx, slots, gpus } => {
             let mut s = state.lock().unwrap();
             s.stages.clear();
+            let guard = s.guard.clone();
             let mut addrs = Vec::new();
             for gpu in gpus {
                 ensure!(s.shared.contains(&gpu), "GPU {gpu} is not shared by this machine");
-                let hosted = spawn_stage(&model, ctx, slots, gpu, key, &format!("{local_ip}:0"))?;
+                let hosted = spawn_stage_guarded(&model, ctx, slots, gpu, key, &format!("{local_ip}:0"), guard.clone())?;
                 addrs.push(hosted.server.addr().to_string());
                 s.stages.push(hosted);
             }
@@ -197,7 +204,7 @@ impl Host {
         listener.set_nonblocking(true)?;
         let control = listener.local_addr()?;
         let paired = pairing::read_key(&config.key_file).is_ok();
-        let state = Arc::new(Mutex::new(State { machine, shared, busy: false, serving: None, offer: None, stages: Vec::new(), paired }));
+        let state = Arc::new(Mutex::new(State { machine, shared, busy: false, serving: None, offer: None, stages: Vec::new(), paired, guard: None }));
         let peer = peer_of(&config, &state.lock().unwrap());
         let announcer = PeerAnnouncer::start(&peer, control, config.mdns_port, config.interface.as_deref())?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -222,6 +229,10 @@ impl Host {
             })?
         };
         Ok(Host { config, state, announcer, control, stop, thread: Some(thread) })
+    }
+
+    pub fn guard_memory(&self, guard: MemoryGuard) {
+        self.state.lock().unwrap().guard = Some(guard);
     }
 
     pub fn control_addr(&self) -> SocketAddr {

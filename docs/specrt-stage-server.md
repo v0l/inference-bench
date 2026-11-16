@@ -187,7 +187,7 @@ Stages and servers on both hosts were stopped at the end.
 
 ## Headless host service (#664)
 
-`inference-bench host --config host.toml` runs `specrt::host::Host` with no UI: it announces every shared GPU over mDNS, accepts pairing and stage requests, and releases stages and withdraws the announcement on SIGTERM. Config keys (all optional, see `packaging/systemd/inference-bench-host.example.toml`): `bind`, `mdns_port`, `interface`, `key_file` (default `cluster.key` in the data dir), `control_socket` (default `host.sock` beside the key), `gpus` (default all), `max_memory_gb` (caps the memory the host announces per GPU, so the planner gives it smaller stages).
+`inference-bench host --config host.toml` runs `specrt::host::Host` with no UI: it announces every shared GPU over mDNS, accepts pairing and stage requests, and releases stages and withdraws the announcement on SIGTERM. Config keys (all optional, see `packaging/systemd/inference-bench-host.example.toml`): `bind`, `mdns_port`, `interface`, `key_file` (default `cluster.key` in the data dir), `control_socket` (default `host.sock` beside the key), `gpus` (default all), `reserve_gb`, `max_memory_gb` (caps the memory the host announces per GPU, so the planner gives it smaller stages).
 
 Pairing without a screen: `inference-bench host pair --config host.toml` asks the running host over its local unix socket (mode 0600) for a fresh 8 character code and prints it with the seconds left (5 minutes, 3 attempts). Enter it in the desktop app's Hardware tab. The cluster key is never logged.
 
@@ -201,4 +201,4 @@ scp packaging/systemd/inference-bench-host.example.toml spark:.config/inference-
 ssh -t spark 'sudo cp ~/git/inference-bench/packaging/systemd/inference-bench-host.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now inference-bench-host'
 ```
 
-The unit binds the 100 GbE cable address (10.100.50.2:7710) and announces on `enp1s0f1np1`, with `MemoryHigh=16G` and `MemoryMax=20G` so a stage load cannot take Frigate or Home Assistant down. Check with `systemctl status inference-bench-host`; pair with `ssh spark inference-bench host pair --config ~/.config/inference-bench/host.toml`.
+The unit binds the 100 GbE cable address (10.100.50.2:7710) and announces on `enp1s0f1np1`, with `OOMScoreAdjust=1000` (the host is killed first, never Frigate, Home Assistant or vLLM), `MemoryHigh=10G` and `MemoryMax=12G`. CUDA allocations on the GB10's unified memory may not be charged to the cgroup, so the host also refuses a stage assignment by itself: when the planner's estimate for the layer range plus `reserve_gb` (default 4) is above the GPU's free memory at that moment, the assignment fails with `<host> refuses layers a-b of <model>: ...` and the coordinator shows that message. Check with `systemctl status inference-bench-host`; pair with `ssh spark inference-bench host pair --config ~/.config/inference-bench/host.toml`.

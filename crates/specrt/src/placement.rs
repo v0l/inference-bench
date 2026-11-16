@@ -358,6 +358,18 @@ impl CostModel {
         }
     }
 
+    pub fn stage_bytes(&self, start: usize, end: usize) -> u64 {
+        let slice = &self.layers[start.min(self.layers.len())..end.min(self.layers.len())];
+        let mut bytes: u64 = slice.iter().map(|l| l.weight_bytes).sum();
+        if start == 0 {
+            bytes += self.embedding_bytes;
+        }
+        if end >= self.layers.len() {
+            bytes += self.head_bytes + self.norm_bytes;
+        }
+        bytes + slice.iter().map(|l| (l.kv_bytes + l.state_bytes) * self.slots as u64).sum::<u64>()
+    }
+
     pub fn allows_tp(&self, tp: usize) -> Result<(), String> {
         if tp == 0 {
             return Err("tp must be at least 1".into());
