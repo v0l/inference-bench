@@ -304,6 +304,7 @@ impl Module {
             source.push_str(crate::mtp::MTP_TEMPLATE);
             kernels.extend_from_slice(crate::mtp::MTP_KERNELS);
         }
+        let mut moe_arch = false;
         if let Some(m) = &spec.moe {
             let vars: BTreeMap<&str, String> = [
                 ("MOE_E", m.experts.to_string()),
@@ -328,7 +329,7 @@ impl Module {
                 smem.insert("moe_mma_up_s", moe_mma_smem(MOE_MMA_BM_SMALL, 2));
                 smem.insert("moe_mma_down", moe_mma_smem(MOE_MMA_BM, 1));
                 smem.insert("moe_mma_down_s", moe_mma_smem(MOE_MMA_BM_SMALL, 1));
-                arch_features = true;
+                moe_arch = true;
             }
         }
         if spec.quant == Quant::Gguf {
@@ -336,7 +337,7 @@ impl Module {
         }
         kernels.extend(gemms.names());
         smem.extend(gemms.smem());
-        let arch_features = kir::cuda::needs_arch_features(&gemms.kernels);
+        let arch_features = moe_arch || kir::cuda::needs_arch_features(&gemms.kernels);
         Ok(Module { source, kernels, smem, arch_features, kir_hash })
     }
 }

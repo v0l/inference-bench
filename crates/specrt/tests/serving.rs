@@ -668,3 +668,16 @@ fn auto_sized_pool_admits_and_decodes_more_slots_than_the_old_resident_cap() {
     assert_eq!(most_rows, slots, "decode batches peaked at {most_rows} rows");
     assert_eq!(finished, slots);
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_contiguous_layout_without_set_block_table_maps_every_page_to_its_own_block() {
+    let s = spec_for("tiny-qwen3.5");
+    let prompt: Vec<u32> = (0..70u32).map(|i| (i * 37 + 11) % 1024).collect();
+    let mut loaded = Runtime::load(&s, 512).unwrap();
+    let want = loaded.prompt_logits(&prompt).unwrap();
+    drop(loaded);
+    let mut bare = Runtime::load_layout(&s, Layout::contiguous(512, 1)).unwrap();
+    let got = bare.prompt_logits(&prompt).unwrap();
+    assert!(max_abs(&got, &want) <= 1e-5, "{}", max_abs(&got, &want));
+}

@@ -1000,6 +1000,10 @@ impl Runtime {
         let pad_row = layout.slots * pages;
         rt.tables[pad_row] = kv_blocks as i32;
         rt.stream.memcpy_htod(&[kv_blocks as i32], &mut rt.buf.block_table.slice_mut(pad_row..pad_row + 1))?;
+        for slot in 0..layout.slots.min(kv_blocks / pages.max(1)) {
+            let blocks: Vec<u32> = (0..pages as u32).map(|p| (slot * pages) as u32 + p).collect();
+            rt.set_block_table(slot, &blocks)?;
+        }
         rt.acquire_state(layout.slots)?;
         if !layout.state_on_demand {
             for slot in 0..layout.slots {

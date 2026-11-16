@@ -34,26 +34,30 @@ Fixture `tests/fixtures/tiny-qwen3.5-moe` (3 layers, 8 experts, top-2, shared ex
 
 | Measure | specrt before (#632) | specrt now | vLLM |
 | --- | --- | --- | --- |
-| decode, batch 1 | about 68 tok/s | about 96 tok/s | 95.9 tok/s |
-| decode, batch 8 (aggregate) | not measured | 346 tok/s | 430 tok/s |
-| prefill, 4096 tokens | 10.3 s | 0.85 s (12x) | 0.22 s |
+| decode, batch 1 | about 68 tok/s | about 100 tok/s | 99.9 tok/s |
+| decode, batch 8 (aggregate) | not measured | 365 tok/s | 435 tok/s |
+| prefill, 4096 tokens | 10.3 s | 0.79 s (13x) | 0.21 s |
 
-Decode b1 got there by splitting `moe_route` (one block read the whole router at 2 bytes a load, 3.6 ms a token) into a multi-block logits kernel and a one-warp select. Prefill went 10.3 s, to 2.98 s (mma), to 0.85 s after the old timing stopped copying 4096 x 248320 logits to the host.
+Decode b1 got there by splitting `moe_route` (one block read the whole router at 2 bytes a load, 3.6 ms a token) into a multi-block logits kernel and a one-warp select. Prefill went 10.3 s, to 2.98 s (mma), to 0.79 s after the old timing stopped copying 4096 x 248320 logits to the host.
 
 Achieved bandwidth on active-expert bytes (NVFP4 weights plus group scales, 5.3 MB per expert, 3 matrices of 1024 x 3072, 9 experts per token per layer including the shared one, 48 layers):
 
 | Case | Active expert bytes per step | Steps per s | Rate |
 | --- | --- | --- | --- |
-| decode b1 | 2.29 GB | 96 | about 220 GB/s |
-| decode b8 | about 14.8 GB (about 58 distinct experts a layer) | 43 | about 640 GB/s |
+| decode b1 | 2.29 GB | 100 | about 230 GB/s |
+| decode b8 | about 14.8 GB (about 58 distinct experts a layer) | 46 | about 680 GB/s |
 | prefill 4096 | all 257 experts a layer, 12.5 GB per token pass | 1.2 passes/s | about 15 GB/s of weights, compute bound |
 
 Batch 1 reaches about 12% of the card's roughly 1.8 TB/s: the expert kernels are about a third of the token time, the rest is the linear attention, attention projections and the head, and 9 x 3 small GEMVs per layer.
 
-### Against vLLM logits
+### Against vLLM and transformers
 
-`real_122b_top1_and_kl_match_vllm` feeds our greedy-from-vLLM continuation (48 tokens after the capital-cities prompt) through a full prefill and compares the top-20 logprobs. With `[mlp] act_quant = "fp4"` (the checkpoint's setting) top-1 agrees on 43 of 48 positions, mean KL 0.29; with bf16 activations 41 of 48, mean KL 0.29. The mean KL of 0.29 is higher than the dense 27B comparisons and its cause is not isolated (the tiny MoE fixtures match transformers to 1e-3, so the kernels are right at that size; at 122B depth the candidates are bf16 versus fp32 residual handling and vLLM's Marlin weight-only path). The misses are 5 to 7 of 48 positions, all in repetitive text. The test currently asserts at most 6 top-1 misses and mean KL under 0.4.
+`scripts/moe_trace.py` runs the 122B through transformers layer by layer on the free card (NVFP4 weights dequantised per layer, 38 s) and writes the hidden state after every layer. `real_122b_per_layer_trace_matches_the_transformers_oracle` compares specrt with it (bf16 activations on our side, since the oracle has none): the 90th percentile token error stays under 1e-2 of the layer's largest value across all 48 layers and layers 0 to 2 match to 1e-6.
+
+`real_122b_top1_and_kl_match_vllm` feeds vLLM's greedy continuation (64 tokens after a 99 token prompt of prose, code and a question) through a full prefill and compares the top-20 logprobs. With the checkpoint's fp4 activations: top-1 64 of 64, mean KL 0.0106, max 0.24. It asserts the 27B thresholds (top-1 at least 90%, mean KL at most 0.05).
+
+The first version of this comparison gave 43 of 48 and mean KL 0.29. The cause was not MoE: `Runtime::load_layout` left every slot's block table at zero, so with a contiguous layout every KV page aliased block 0. Prompts of 16 tokens or fewer fit in one page and were exact; from 17 tokens the first full-attention layer attended over a corrupted cache. The 27B tests never hit it because they set the table (`load_batched`, `set_block_table`). `load_layout` now gives each slot its own contiguous blocks, and `serving.rs` has a test for it. `tests/flash_prefill.rs` and `tests/gemm_shapes.rs` check the flash kernel and the attention GEMMs at the 122B shapes against a CPU reference, so those are known good.
 
 ## Not done
 
-Nothing from the issue list. `SPECRT_122B_ACT=0` runs the 122B with bf16 activations for comparison. The 122B decode b8 gap to vLLM (346 vs 430) and the 4k prefill gap (0.85 vs 0.22 s) remain.
+Nothing from the issue list. The 122B decode b8 gap to vLLM (365 vs 435) and the 4k prefill gap (0.79 vs 0.21 s) remain.

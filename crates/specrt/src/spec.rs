@@ -819,9 +819,9 @@ fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, la
     Ok(Quantization { quant, mlp, act, mlp_act })
 }
 
-fn moe_act(q: Option<&serde_json::Value>) -> ActQuant {
+fn moe_act(rule: &crate::family::FamilyQuant, q: Option<&serde_json::Value>) -> ActQuant {
     let groups = q.and_then(|q| q["config_groups"].as_object());
-    groups.and_then(|g| g.values().next()).map_or(ActQuant::None, compressed_act)
+    groups.and_then(|g| g.values().next()).map_or(ActQuant::None, |g| compressed_act(rule, g))
 }
 
 fn parse_quantization(rule: &crate::family::FamilyQuant, value: Option<&serde_json::Value>, layers: usize) -> Result<Quantization> {
@@ -1037,7 +1037,7 @@ impl Spec {
         };
         let experts_nvfp4 = hf.num_experts.is_some_and(|e| e > 0) && quant == Quant::Nvfp4G16;
         let (quant, mlp_quant, act, mlp_act) =
-            if experts_nvfp4 { (Quant::Bf16, Some((Quant::Nvfp4G16, None)), ActQuant::None, moe_act(quant_config.as_ref())) } else { (quant, mlp_quant, act, mlp_act) };
+            if experts_nvfp4 { (Quant::Bf16, Some((Quant::Nvfp4G16, None)), ActQuant::None, moe_act(&family.quantization, quant_config.as_ref())) } else { (quant, mlp_quant, act, mlp_act) };
         let nested = hf
             .rope_parameters
             .as_ref()
