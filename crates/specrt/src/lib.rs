@@ -13,6 +13,7 @@ pub mod executor;
 pub mod family;
 pub mod gguf;
 pub mod hardware;
+pub mod host;
 pub mod graph;
 pub mod grammar;
 pub mod jit;
