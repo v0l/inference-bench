@@ -328,6 +328,9 @@ fn open(
             }
             Err(e) => {
                 tracing::warn!(model = model_id, seqs = attempt, error = %e, "the serving engine could not load");
+                if target.requires_serving() {
+                    return Err(e);
+                }
                 if n == 0 {
                     note = Some(format!("parallel requests off: {}", e.message));
                 }

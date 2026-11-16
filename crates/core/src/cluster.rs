@@ -141,6 +141,12 @@ impl Prepared {
     }
 }
 
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub struct Run<'a> {
     pub model_id: &'a str,
     pub ctx: usize,

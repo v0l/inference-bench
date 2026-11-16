@@ -115,6 +115,10 @@ impl Target for ServingTarget {
         self.serving.as_ref().map(|s| render(&s.stats()))
     }
 
+    fn requires_serving(&self) -> bool {
+        self.opts.placement.as_ref().is_some_and(|p| !p.devices.is_empty())
+    }
+
     fn failure(&self) -> Option<String> {
         self.serving.as_ref().and_then(|s| s.failure())
     }

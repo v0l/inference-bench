@@ -101,6 +101,10 @@ pub trait Target: Send {
         None
     }
 
+    fn requires_serving(&self) -> bool {
+        false
+    }
+
     fn props(&self) -> Option<serde_json::Value> {
         None
     }

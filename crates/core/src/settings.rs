@@ -60,6 +60,7 @@ pub struct Settings {
 pub struct ClusterSettings {
     pub share: bool,
     pub interface: String,
+    pub paired: std::collections::BTreeSet<String>,
     pub mdns_port: u16,
     pub link_latency_ms: f64,
     pub link_bandwidth_gbs: f64,
@@ -68,7 +69,7 @@ pub struct ClusterSettings {
 
 impl Default for ClusterSettings {
     fn default() -> Self {
-        Self { share: false, interface: String::new(), mdns_port: 5353, link_latency_ms: 0.3, link_bandwidth_gbs: 1.1, objective: specrt::placement::Objective::Latency }
+        Self { share: false, interface: String::new(), paired: Default::default(), mdns_port: 5353, link_latency_ms: 0.3, link_bandwidth_gbs: 1.1, objective: specrt::placement::Objective::Latency }
     }
 }
 
