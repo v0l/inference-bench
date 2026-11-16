@@ -236,7 +236,7 @@ What the numbers say:
   probably running with a lower MTP batch limit or `itl_target_ms`, or with 20 slots and other prompts; check its
   config before blaming the scheduler.
 
-Defaults: `itl_target_ms` stays 100, `whole_prompt_tokens` 4096, `max_batch` unset. Both are in the load dialog
+Defaults: `itl_target_ms` stays 100, `whole_prompt_tokens` 1024 (see #655), `max_batch` unset. Both are in the load dialog
 (serving group) and in the server config (`whole_prompt_tokens`, `itl_target_ms`, `--whole-prompt-tokens`,
 `--itl-target-ms`). `RUST_LOG=inference_bench_specrt=debug` logs rows, MTP or plain, prefill tokens and step ms per step.
 
@@ -248,24 +248,32 @@ Under load the decode step alone fills `itl_target_ms`, so the budget left for p
 - `prefill_rate` is only updated from steps that read at least `max(min_prefill_chunk, min_prefill_tokens / 2)` tokens, so small steps no longer drag the EWMA down.
 - Short prompts go first: running prefills are served shortest-remaining-first, `whole_prompt_remaining` looks at the shortest unfinished prompt rather than the head, and a prompt larger than the step budget is not admitted while another long one is already in flight. The long prompt still gets the leftover budget every step, so it is slowed, not starved.
 
-Simulated (CPU, `Fake` engine, `print_load_table` in `sched.rs`). Decode step 0.56 ms per row, prefill 20 us per token, `itl_target` 10 ms, `whole_prompt_tokens` 4096, all times multiplied by 10 so decode steps read 45-100 ms like the 27B and `itl_target` reads 100 ms, so `room` is 0 as on the user's app. Load: N long decoders, one 20k prompt at t0, eight 1.2k prompts 10 steps apart, three 8-12k agent prompts every 25 steps. "master" is bf7e6b3 with its shipping defaults. Times in seconds (scaled), TTFT is time to first token.
+Simulated (CPU, `Fake` engine, `print_load_table` and `print_sweep_table` in `sched.rs`). Decode step 0.56 ms per row, prefill 20 us per token, `itl_target` 10 ms; all times are multiplied by 10 so decode steps read 45-100 ms like the 27B and `itl_target` reads 100 ms, so `room` is 0 as on the user's app. Load: N long decoders, one 20k prompt at t0, eight 1.2k prompts 10 steps apart, three 8-12k agent prompts every 25 steps. "master" is bf7e6b3 with its shipping defaults (`whole_prompt_tokens` 4096). Times in seconds (scaled).
 
 | decoders | variant | 1.2k TTFT p50 / p95 | long TTFT p50 / max | long tok per step | step p95 |
 |---|---|---|---|---|---|
-| 8 | master | 21.7 / 35.3 | 21.7 / 35.7 | 110 | 0.07 |
-| 8 | shortest-first only | 0.29 / 3.28 | 7.4 / 12.2 | 314 | 0.39 |
-| 8 | min 512 only | 5.4 / 7.8 | 7.5 / 9.4 | 733 | 0.31 |
-| 8 | both (default) | 0.29 / 2.01 | 5.2 / 9.6 | 859 | 0.48 |
-| 16 | master | 36.0 / 57.2 | 36.1 / 58.1 | 107 | 0.11 |
-| 16 | shortest-first only | 0.34 / 4.00 | 8.7 / 18.8 | 306 | 0.43 |
-| 16 | min 512 only | 6.1 / 9.3 | 9.0 / 11.1 | 733 | 0.35 |
-| 16 | both (default) | 0.34 / 2.23 | 6.1 / 10.9 | 859 | 0.53 |
-| 20 | master | 42.8 / 67.8 | 43.0 / 68.9 | 107 | 0.14 |
-| 20 | shortest-first only | 0.36 / 4.18 | 9.5 / 21.9 | 306 | 0.47 |
-| 20 | min 512 only | 6.5 / 10.0 | 9.7 / 11.9 | 733 | 0.37 |
-| 20 | both (default) | 0.36 / 2.40 | 6.6 / 11.7 | 859 | 0.56 |
+| 8 | master | 21.6 / 35.3 | 21.6 / 35.6 | 110 | 0.07 |
+| 8 | shortest + 512, whole 4096 | 0.30 / 2.01 | 5.4 / 9.6 | 859 | 0.48 |
+| 8 | shortest + 512, whole 2048 | 0.30 / 2.03 | 6.0 / 9.8 | 736 | 0.48 |
+| 8 | shortest + 512, whole 1024 (default) | 2.9 / 4.7 | 10.4 / 11.8 | 532 | 0.24 |
+| 8 | shortest + 512, whole 0 | 3.4 / 4.7 | 10.8 / 12.0 | 509 | 0.23 |
+| 8 | shortest + 256, whole 0 | 8.5 / 12.1 | 15.5 / 20.3 | 256 | 0.14 |
+| 16 | master | 36.0 / 57.3 | 36.2 / 58.2 | 107 | 0.12 |
+| 16 | shortest + 512, whole 4096 | 0.34 / 2.23 | 6.1 / 10.9 | 859 | 0.52 |
+| 16 | shortest + 512, whole 2048 | 0.34 / 2.24 | 7.2 / 11.3 | 736 | 0.53 |
+| 16 | shortest + 512, whole 1024 (default) | 3.5 / 5.6 | 12.9 / 14.5 | 532 | 0.28 |
+| 16 | shortest + 512, whole 0 | 4.3 / 6.0 | 13.6 / 14.8 | 509 | 0.28 |
+| 16 | shortest + 256, whole 0 | 11.7 / 17.0 | 21.5 / 28.3 | 256 | 0.18 |
+| 20 | master | 42.8 / 67.8 | 43.1 / 69.0 | 107 | 0.14 |
+| 20 | shortest + 512, whole 4096 | 0.36 / 2.36 | 6.6 / 11.6 | 859 | 0.56 |
+| 20 | shortest + 512, whole 2048 | 0.36 / 2.38 | 7.9 / 12.1 | 736 | 0.55 |
+| 20 | shortest + 512, whole 1024 (default) | 3.9 / 6.1 | 14.3 / 15.9 | 532 | 0.31 |
+| 20 | shortest + 512, whole 0 | 4.7 / 6.6 | 15.0 / 16.4 | 509 | 0.30 |
+| 20 | shortest + 256, whole 0 | 13.2 / 19.4 | 24.4 / 32.3 | 256 | 0.21 |
 
-Master reads about 110 tokens per step for the long prompts, which is the user's plateau. Each part alone is not enough: shortest-first fixes the median for short prompts but leaves the long ones at about 300 tokens per step and a 19-22 s worst case; the 512 floor alone fixes long-prompt throughput but the short prompts wait behind the long ones (6 s). Both together win on every column except step p95, so both stay on and 512 is the default (256 gave worse TTFT everywhere in the same run). The step p95 cost is real: steps that read a whole 4096-token prompt take about 5x `itl_target`; master avoided that only by starving the prompts. Lower `whole_prompt_tokens` to bound it. The regression test is `prompts_stay_bounded_behind_each_other_with_full_decoders`; on bf7e6b3 it fails (`short ttft p95 57.331s`), on this branch it passes.
+Master reads about 110 tokens per step for every prompt, which is the user's plateau. Shortest-first alone and the 512 floor alone are each worse than both together (see measured at 16 decoders before the sweep: 1.2k p95 4.0 s and long prompts at 306 tokens per step for shortest-first alone, 1.2k p95 9.3 s for the floor alone). A second prompt over 2048 tokens is not admitted while another is in flight, so the long ones are served in turn and all complete.
+
+What bounds the step: a step is the decode plus every prefill token it carries, so the step p95 is decode plus the floor (512 tokens, about 0.1 s) plus any whole-prompt remainder. `whole_prompt_tokens` 4096 lets whole prompts ride in one step (0.5 s steps); 1024 roughly halves the step p95 for a 0.5-1.5 s worse 1.2k p95. A cap on prefill tokens per step was also swept (1024 and 512 on top of whole 4096): it gave the same step p95 as the matching whole limit with worse TTFT, so it is not a separate option. The 2x `itl_target` bound (0.2 s) is not reachable together with a useful TTFT: only 256 reaches it at 8-16 decoders, at 12-19 s 1.2k p95. Defaults chosen: `min_prefill_tokens` 512, `whole_prompt_tokens` 1024 (was 4096), step p95 about 2.4-3.1x `itl_target` at 8-20 decoders, against 1.2k TTFT p95 of 5-6 s in place of master's 35-68 s. Lower `min_prefill_tokens` to 256 to hold the 2x bound at the cost of slower prefill. The regression test `prompts_stay_bounded_behind_each_other_with_full_decoders` asserts 1.2k TTFT p95 under 8 s, long TTFT max under 20 s, over 400 long-prompt tokens per step and step p95 at most 0.35 s; on bf7e6b3 it fails (`short ttft p95 57.331s`).
 
 Real-27B A/B for the supervisor (GPU free, under `flock /tmp/gpu27.lock`, 20 slots, classify-shaped 1.2k prompts plus a few 10-20k agent prompts): run `crates/specrt/scripts/serve27b.sh` with `--min-prefill-tokens 0` then `512` (and 256), and drive it with `loadtest` at 16-20 concurrent; compare TTFT p50/p95, `inference_prefill_tokens_per_step` and per-request decode tok/s.
 

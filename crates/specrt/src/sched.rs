@@ -385,6 +385,8 @@ impl Executor for PipelineExecutor {
     }
 }
 
+const LONG_PROMPT: usize = 2048;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Config {
     pub max_num_seqs: usize,
@@ -736,13 +738,13 @@ impl<E: Executor> Scheduler<E> {
     fn admit(&mut self, budget: usize) -> Result<()> {
         let cap = self.cfg.max_num_seqs.min(self.exec.slots());
         let mut planned = 0;
-        let mut long_in_flight = self.cfg.shortest_first && self.running.iter().any(|s| s.prefill_target() - s.computed > budget);
+        let mut long_in_flight = self.cfg.shortest_first && self.running.iter().any(|s| s.prefill_target() - s.computed > LONG_PROMPT);
         while let Some(s) = self.waiting.front() {
             if self.running.len() >= cap || self.free_slots.is_empty() || planned >= budget {
                 break;
             }
             let target = s.prefill_target();
-            if target > budget && long_in_flight {
+            if target > LONG_PROMPT && long_in_flight {
                 break;
             }
             let need = blocks_for(target + 1);
@@ -806,7 +808,7 @@ impl<E: Executor> Scheduler<E> {
             self.admissions += 1;
             s.admitted = self.admissions;
             let remaining = target - s.computed;
-            if remaining > budget {
+            if remaining > LONG_PROMPT {
                 long_in_flight = true;
             } else {
                 planned += remaining;
@@ -1984,7 +1986,11 @@ mod tests {
     }
 
     fn load_cfg(min_prefill_tokens: usize, shortest_first: bool) -> Config {
-        Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(10), whole_prompt_tokens: 4096, min_prefill_tokens, shortest_first, ..Config::default() }
+        sweep_cfg(min_prefill_tokens, shortest_first, if shortest_first || min_prefill_tokens > 0 { 1024 } else { 4096 })
+    }
+
+    fn sweep_cfg(min_prefill_tokens: usize, shortest_first: bool, whole_prompt_tokens: usize) -> Config {
+        Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(10), whole_prompt_tokens, min_prefill_tokens, shortest_first, ..Config::default() }
     }
 
     #[test]
@@ -1992,10 +1998,24 @@ mod tests {
         let mut r = loaded(16, load_cfg(512, true));
         let short = pct(&mut r.short_ttft, 0.95);
         let long = pct(&mut r.long_ttft, 1.0);
-        assert!(short < 4.0, "short ttft p95 {short:.3}s");
+        assert!(short < 8.0, "short ttft p95 {short:.3}s");
         assert!(long < 20.0, "long ttft max {long:.3}s");
-        assert!(r.long_tok_per_step > 256.0, "long prompts read {:.0} tokens per step", r.long_tok_per_step);
-        assert!(r.step_p95 <= 0.7, "step p95 {:.3}s", r.step_p95);
+        assert!(r.long_tok_per_step > 400.0, "long prompts read {:.0} tokens per step", r.long_tok_per_step);
+        assert!(r.step_p95 <= 0.35, "step p95 {:.3}s", r.step_p95);
+    }
+
+    #[test]
+    #[ignore]
+    fn print_sweep_table() {
+        for decoders in [8usize, 16, 20] {
+            for (whole, min) in [(4096usize, 512usize), (2048, 512), (1536, 512), (1024, 512), (0, 512), (0, 384), (0, 256), (1024, 256)] {
+                let mut r = loaded(decoders, sweep_cfg(min, true, whole));
+                println!(
+                    "decoders {decoders} whole {whole} min {min}: short ttft p50 {:.2} p95 {:.2} long ttft p50 {:.2} max {:.2} long tok/step {:.0} step p95 {:.3}",
+                    pct(&mut r.short_ttft, 0.5), pct(&mut r.short_ttft, 0.95), pct(&mut r.long_ttft, 0.5), pct(&mut r.long_ttft, 1.0), r.long_tok_per_step, r.step_p95
+                );
+            }
+        }
     }
 
     #[test]
