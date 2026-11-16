@@ -79,6 +79,19 @@ impl Coordinator {
         p.stages.iter().map(|s| self.members.members().iter().find(|m| m.device.name == s.device_name).and_then(|m| m.address.clone())).collect()
     }
 
+    pub fn stage_names(&self) -> Vec<String> {
+        self.placement.as_ref().map(|p| p.stages.iter().map(|s| s.device_name.clone()).collect()).unwrap_or_default()
+    }
+
+    pub fn stage_names_and_addresses(&self) -> Vec<(String, String)> {
+        let Some(p) = &self.placement else { return Vec::new() };
+        p.stages
+            .iter()
+            .zip(self.stage_addresses())
+            .filter_map(|(s, a)| a.map(|a| (s.device_name.clone(), a)))
+            .collect()
+    }
+
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }

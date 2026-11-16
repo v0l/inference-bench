@@ -96,6 +96,7 @@ impl BlockPool {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StageMetric {
+    pub name: String,
     pub device: usize,
     pub start: usize,
     pub end: usize,
@@ -112,6 +113,7 @@ pub struct ChainMetrics {
     pub hop_secs: f64,
     pub micro_batches: u64,
     pub overlapped_prefills: u64,
+    pub lost: Option<String>,
 }
 
 pub trait Executor {
@@ -402,7 +404,7 @@ impl Executor for PipelineExecutor {
             .ranges()
             .iter()
             .zip(self.pipe.stage_stats())
-            .map(|(&(device, start, end), s)| StageMetric { device, start, end, busy_secs: s.busy.as_secs_f64(), calls: s.calls, tokens: s.tokens })
+            .map(|(&(device, start, end), s)| StageMetric { name: String::new(), device, start, end, busy_secs: s.busy.as_secs_f64(), calls: s.calls, tokens: s.tokens })
             .collect();
         Some(ChainMetrics {
             stages,
@@ -411,6 +413,7 @@ impl Executor for PipelineExecutor {
             hop_secs: hops.time.as_secs_f64(),
             micro_batches: prefill.micro_batches,
             overlapped_prefills: prefill.overlapped_calls,
+            lost: None,
         })
     }
 }

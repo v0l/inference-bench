@@ -448,8 +448,8 @@ impl StageClient {
     }
 
     pub fn call(&mut self, message: &Message) -> Result<Message> {
-        write_frame(&mut self.stream, message)?;
-        match read_frame(&mut self.stream)? {
+        write_frame(&mut self.stream, message).with_context(|| format!("stage {}", self.addr))?;
+        match read_frame(&mut self.stream).with_context(|| format!("stage {}", self.addr))? {
             Message::Error { message } => bail!("stage {} error: {message}", self.addr),
             reply => Ok(reply),
         }

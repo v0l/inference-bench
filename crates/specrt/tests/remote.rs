@@ -103,7 +103,8 @@ fn the_scheduler_serves_over_a_chain_and_fails_in_flight_when_the_stage_dies() {
     let err = drain(&mut sched).unwrap_err();
     assert!(format!("{err:#}").contains("stage"), "{err:#}");
     let reason = sched.exec.refresh().expect("the loss is reported");
-    assert!(reason.contains("lost") || !reason.is_empty());
+    assert!(reason.contains("stage a was lost"), "{reason}");
+    assert!(sched.exec.chain_metrics().unwrap().lost.unwrap().contains("stage a was lost"));
     assert!(!sched.exec.connected());
 
     let again = StageServer::start(&addr, KEY, stage.clone()).unwrap();

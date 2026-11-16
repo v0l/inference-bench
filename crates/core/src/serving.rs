@@ -158,9 +158,10 @@ fn chain(o: &mut String, c: &specrt::sched::ChainMetrics) {
     for (name, kind, help, get) in per_stage {
         let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} {kind}");
         for (i, m) in c.stages.iter().enumerate() {
-            let _ = writeln!(o, "{name}{{stage=\"{i}\",device=\"{}\",layers=\"{}-{}\"}} {}", m.device, m.start, m.end, get(m));
+            let _ = writeln!(o, "{name}{{stage=\"{i}\",device=\"{}\",layers=\"{}-{}\"}} {}", if m.name.is_empty() { m.device.to_string() } else { m.name.clone() }, m.start, m.end, get(m));
         }
     }
+    let _ = writeln!(o, "# HELP inference_pipeline_stage_lost A stage left the chain and the chain was dropped.\n# TYPE inference_pipeline_stage_lost gauge\ninference_pipeline_stage_lost {}", c.lost.is_some() as u8);
     let _ = writeln!(o, "# TYPE inference_pipeline_hops_total counter\ninference_pipeline_hops_total {}", c.hops);
     let _ = writeln!(o, "# TYPE inference_pipeline_hop_bytes_total counter\ninference_pipeline_hop_bytes_total {}", c.hop_bytes);
     let _ = writeln!(o, "# TYPE inference_pipeline_hop_seconds_total counter\ninference_pipeline_hop_seconds_total {}", c.hop_secs);
@@ -279,8 +280,8 @@ mod tests {
         use specrt::sched::{ChainMetrics, StageMetric};
         let chain = ChainMetrics {
             stages: vec![
-                StageMetric { device: 0, start: 0, end: 20, busy_secs: 1.5, calls: 10, tokens: 400 },
-                StageMetric { device: 1, start: 20, end: 40, busy_secs: 1.25, calls: 10, tokens: 400 },
+                StageMetric { device: 0, name: String::new(), start: 0, end: 20, busy_secs: 1.5, calls: 10, tokens: 400 },
+                StageMetric { device: 1, name: String::new(), start: 20, end: 40, busy_secs: 1.25, calls: 10, tokens: 400 },
             ],
             hops: 10,
             hop_bytes: 8000,

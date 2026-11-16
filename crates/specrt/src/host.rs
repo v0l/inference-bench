@@ -5,7 +5,6 @@ use crate::pairing::{self, Offer};
 use crate::stage::RuntimeStage;
 use crate::wire::{StageServer, hmac_sha256};
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use std::io::Read as _;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -115,7 +114,7 @@ fn handle(config: &HostConfig, state: &Arc<Mutex<State>>, stream: TcpStream) -> 
         other => {
             let key = pairing::read_key(&config.key_file).ok().and_then(|k| pairing::unhex(&k).ok());
             match key {
-                Some(key) if constant_eq(tag, &auth_tag(&key, &nonce, body)) => run(state, other, &key, local_ip),
+                Some(key) if constant_eq(tag, &auth_tag(&key, &nonce, body)) => run(state, other, pairing::hex(&key).as_bytes(), local_ip),
                 Some(_) => Err(anyhow!("authentication failed")),
                 None => Err(anyhow!("this machine is not paired")),
             }

@@ -55,8 +55,10 @@ impl ChainExecutor {
         self.generation = self.coordinator.generation();
         self.hidden_row_bytes = 4 * chain.hidden() as u64;
         let ranges = chain.ranges();
+        let names = self.coordinator.stage_names();
+        self.metrics.lost = None;
         if self.metrics.stages.len() != ranges.len() {
-            self.metrics.stages = ranges.iter().enumerate().map(|(i, &(a, b))| StageMetric { device: i, start: a as usize, end: b as usize, ..StageMetric::default() }).collect();
+            self.metrics.stages = ranges.iter().enumerate().map(|(i, &(a, b))| StageMetric { name: names.get(i).cloned().unwrap_or_default(), device: i, start: a as usize, end: b as usize, ..StageMetric::default() }).collect();
         }
         self.chain = Some(chain);
         Ok(())
@@ -77,6 +79,12 @@ impl ChainExecutor {
     }
 
     fn drop_chain(&mut self, reason: String) {
+        let stage = self.coordinator.stage_names_and_addresses().into_iter().find(|(_, a)| reason.contains(a.as_str())).map(|(n, _)| n);
+        let reason = match stage {
+            Some(name) => format!("stage {name} was lost: {reason}"),
+            None => reason,
+        };
+        self.metrics.lost = Some(reason.clone());
         self.chain = None;
         self.lost = Some(reason);
     }

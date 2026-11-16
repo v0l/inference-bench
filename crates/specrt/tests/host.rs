@@ -44,8 +44,8 @@ fn pairing_then_a_stage_request_opens_authenticated_stage_servers_for_each_share
     assert_eq!(peer.staged(), 2);
     let raw = specrt::pairing::unhex(&key).unwrap();
     for a in &addrs {
-        assert!(StageClient::connect(a, key.as_bytes(), Duration::from_secs(5)).is_err());
-        StageClient::connect(a, &raw, Duration::from_secs(5)).unwrap();
+        assert!(StageClient::connect(a, &raw, Duration::from_secs(5)).is_err());
+        StageClient::connect(a, key.as_bytes(), Duration::from_secs(5)).unwrap();
     }
     release_stages(&control, &key).unwrap();
     assert_eq!(peer.staged(), 0);
