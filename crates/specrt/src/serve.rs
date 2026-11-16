@@ -434,6 +434,9 @@ fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, in
                 let mut resolved = spec.clone();
                 opts.speculative.apply(&mut resolved)?;
                 let placed = p.place(&resolved)?;
+                if let Some(s) = placed.stages.iter().find(|s| s.tp > 1) {
+                    anyhow::bail!("the plan puts {} on a tensor parallel group, which the engine cannot run yet; remove the host from those devices", s.label());
+                }
                 (placed.stages.len() > 1).then_some((placed, p.micro_batch_in_process()))
             }
             _ => None,

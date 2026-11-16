@@ -1,0 +1,3 @@
+qwen3.8-27b-exact: 64 layers in 1 stage, context 8192, 4 slots, objective Latency
+  stage 0  box / GPU 0+1 (tp 2)         layers   0..64  (64)  weights   13.72 GiB  kv   1.00  state   0.29  of   96.0 GiB  step   9.809 ms  allreduce  1.385 ms (14.1%)  hop  0.000 ms  bound by memory bandwidth
+  decode step 9.809 ms (one stream 407.8 tok/s), slowest stage 9.809 ms (pipeline full 407.8 tok/s)

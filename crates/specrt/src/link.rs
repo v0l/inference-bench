@@ -89,3 +89,59 @@ impl DeviceLink {
         Ok(())
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PairProbe {
+    pub a: usize,
+    pub b: usize,
+    pub p2p: bool,
+    pub latency_ms: f64,
+    pub bandwidth_gbs: f64,
+}
+
+const PROBE_LATENCY_BYTES: usize = 4096;
+const PROBE_BANDWIDTH_BYTES: usize = 64 << 20;
+const PROBE_ROUNDS: usize = 20;
+
+fn median_secs(mut v: Vec<f64>) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+fn timed_copies(link: &DeviceLink, sa: &Arc<CudaStream>, sb: &Arc<CudaStream>, bytes: usize) -> Result<f64> {
+    let src = sa.alloc_zeros::<u8>(bytes)?;
+    let mut dst = sb.alloc_zeros::<u8>(bytes)?;
+    link.copy(&src, sa, &mut dst, sb, bytes)?;
+    sb.synchronize()?;
+    let mut times = Vec::with_capacity(PROBE_ROUNDS);
+    for _ in 0..PROBE_ROUNDS {
+        let started = std::time::Instant::now();
+        link.copy(&src, sa, &mut dst, sb, bytes)?;
+        sb.synchronize()?;
+        times.push(started.elapsed().as_secs_f64());
+    }
+    Ok(median_secs(times))
+}
+
+pub fn probe_pair(a: usize, b: usize) -> Result<PairProbe> {
+    ensure!(a != b, "a link probe needs two different devices");
+    let (ca, cb) = (CudaContext::new(a)?, CudaContext::new(b)?);
+    let p2p = peer_access(&ca, &cb) && peer_access(&cb, &ca);
+    let mode = if p2p { LinkMode::Peer } else { LinkMode::Staged };
+    let link = DeviceLink::with_mode(&ca, &cb, mode)?;
+    let (sa, sb) = (ca.new_stream()?, cb.new_stream()?);
+    let small = timed_copies(&link, &sa, &sb, PROBE_LATENCY_BYTES)?;
+    let large = timed_copies(&link, &sa, &sb, PROBE_BANDWIDTH_BYTES)?;
+    Ok(PairProbe { a, b, p2p, latency_ms: small * 1e3, bandwidth_gbs: PROBE_BANDWIDTH_BYTES as f64 / large / 1e9 })
+}
+
+pub fn probe_local() -> Result<Vec<PairProbe>> {
+    let count = CudaContext::device_count()? as usize;
+    let mut out = Vec::new();
+    for a in 0..count {
+        for b in a + 1..count {
+            out.push(probe_pair(a, b)?);
+        }
+    }
+    Ok(out)
+}

@@ -54,6 +54,10 @@ pub struct DeviceConfig {
     pub link: LinkConfig,
     #[serde(default)]
     pub offload: Option<OffloadConfig>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub peer: Option<LinkConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +148,35 @@ impl Default for PlacementConfig {
 }
 
 impl PlacementConfig {
+    pub fn apply_peer_probes(&mut self, probes: &[crate::link::PairProbe]) {
+        for i in 0..self.devices.len() {
+            let Some(host) = self.devices[i].host.clone() else { continue };
+            if self.devices[i].peer.is_some() {
+                continue;
+            }
+            let ordinal = self.devices[i].ordinal.unwrap_or(i);
+            let measured: Vec<&crate::link::PairProbe> = probes
+                .iter()
+                .filter(|p| (p.a == ordinal || p.b == ordinal) && self.devices.iter().enumerate().any(|(j, d)| j != i && d.host.as_deref() == Some(&host) && d.ordinal.unwrap_or(j) == if p.a == ordinal { p.b } else { p.a }))
+                .collect();
+            if measured.is_empty() {
+                continue;
+            }
+            self.devices[i].peer = Some(LinkConfig {
+                latency_ms: measured.iter().map(|p| p.latency_ms).fold(0.0, f64::max),
+                bandwidth_gbs: measured.iter().map(|p| p.bandwidth_gbs).fold(f64::INFINITY, f64::min),
+            });
+        }
+    }
+
+    pub fn apply_network_rtts(&mut self, rtts_ms: &[(String, f64)]) {
+        for d in &mut self.devices {
+            if let Some((_, rtt)) = rtts_ms.iter().find(|(a, _)| Some(a) == d.address.as_ref()) {
+                d.link.latency_ms = rtt / 2.0;
+            }
+        }
+    }
+
     pub fn place(&self, spec: &Spec) -> Result<Placement> {
         ensure!(self.slots >= 1 && self.context >= 1, "placement needs at least one slot and one token of context");
         let model = CostModel::new(spec, self.context, self.slots);
@@ -174,9 +207,45 @@ pub struct Device {
     pub link_bandwidth: f64,
     pub offload_bytes: u64,
     pub offload_bandwidth: f64,
+    pub host: Option<String>,
+    pub peer_latency: f64,
+    pub peer_bandwidth: f64,
+    pub tp: usize,
+    pub ordinals: Vec<usize>,
+    pub allreduce_latency: f64,
+    pub allreduce_bandwidth: f64,
 }
 
 impl Device {
+    pub fn group(members: &[(usize, &Device)]) -> Device {
+        let first = members[0].1;
+        if members.len() == 1 {
+            let mut d = first.clone();
+            d.ordinals = vec![first.ordinal.unwrap_or(members[0].0)];
+            return d;
+        }
+        let inner = &members[1..];
+        Device {
+            name: members.iter().map(|m| m.1.name.as_str()).collect::<Vec<_>>().join("+"),
+            ordinal: Some(first.ordinal.unwrap_or(members[0].0)),
+            memory_bytes: members.iter().map(|m| m.1.memory_bytes).min().unwrap_or(0),
+            reserve_bytes: members.iter().map(|m| m.1.reserve_bytes).max().unwrap_or(0),
+            bandwidth: members.iter().map(|m| m.1.bandwidth).fold(f64::INFINITY, f64::min),
+            flops: members.iter().map(|m| m.1.flops).fold(f64::INFINITY, f64::min),
+            link_latency: first.link_latency,
+            link_bandwidth: first.link_bandwidth,
+            offload_bytes: members.iter().map(|m| m.1.offload_bytes).min().unwrap_or(0),
+            offload_bandwidth: members.iter().map(|m| m.1.offload_bandwidth).fold(f64::INFINITY, f64::min),
+            host: first.host.clone(),
+            peer_latency: first.peer_latency,
+            peer_bandwidth: first.peer_bandwidth,
+            tp: members.len(),
+            ordinals: members.iter().map(|m| m.1.ordinal.unwrap_or(m.0)).collect(),
+            allreduce_latency: inner.iter().map(|m| m.1.peer_latency).fold(0.0, f64::max),
+            allreduce_bandwidth: inner.iter().map(|m| m.1.peer_bandwidth).fold(f64::INFINITY, f64::min),
+        }
+    }
+
     pub fn from_config(c: &DeviceConfig) -> Device {
         let offload = c.offload.unwrap_or(OffloadConfig { host_gib: 0.0, bandwidth_gbs: 1.0 });
         Device {
@@ -190,6 +259,13 @@ impl Device {
             link_bandwidth: c.link.bandwidth_gbs * 1e9,
             offload_bytes: (offload.host_gib * GIB) as u64,
             offload_bandwidth: offload.bandwidth_gbs * 1e9,
+            host: c.host.clone(),
+            peer_latency: c.peer.map_or(c.link.latency_ms, |p| p.latency_ms) * 1e-3,
+            peer_bandwidth: c.peer.map_or(c.link.bandwidth_gbs, |p| p.bandwidth_gbs) * 1e9,
+            tp: 1,
+            ordinals: Vec::new(),
+            allreduce_latency: 0.0,
+            allreduce_bandwidth: f64::INFINITY,
         }
     }
 }
@@ -215,7 +291,11 @@ pub struct CostModel {
     norm_bytes: u64,
     pub hidden: usize,
     pub hop_bytes_per_element: usize,
+    head_counts: Vec<(&'static str, usize)>,
 }
+
+const ALLREDUCES_PER_LAYER: f64 = 2.0;
+const ALLREDUCE_BYTES_PER_ELEMENT: usize = 2;
 
 impl CostModel {
     pub fn new(spec: &Spec, context: usize, slots: usize) -> CostModel {
@@ -261,7 +341,31 @@ impl CostModel {
             norm_bytes: 2 * spec.dims.hidden as u64,
             hidden: spec.dims.hidden,
             hop_bytes_per_element: 4,
+            head_counts: {
+                let mut counts = vec![("attention heads", spec.attention.heads), ("kv heads", spec.attention.kv_heads)];
+                if let Some(la) = &spec.linear_attention {
+                    counts.push(("delta-net key heads", la.key_heads));
+                    counts.push(("delta-net value heads", la.value_heads));
+                }
+                counts
+            },
         }
+    }
+
+    pub fn allows_tp(&self, tp: usize) -> Result<(), String> {
+        if tp == 0 {
+            return Err("tp must be at least 1".into());
+        }
+        for (what, count) in &self.head_counts {
+            if count % tp != 0 {
+                return Err(format!("tp {tp} does not divide the {count} {what} of {}", self.name));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn allreduce_bytes(&self) -> f64 {
+        (self.slots * self.hidden * ALLREDUCE_BYTES_PER_ELEMENT) as f64
     }
 
     pub fn layer_count(&self) -> usize {
@@ -282,9 +386,15 @@ impl CostModel {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Stage {
     pub device: usize,
+    pub host: Option<String>,
+    pub tp: usize,
+    pub ordinals: Vec<usize>,
+    pub allreduce_secs: f64,
+    pub memory_bound_secs: f64,
+    pub flop_bound_secs: f64,
     pub ordinal: usize,
     pub device_name: String,
     pub start: usize,
@@ -312,9 +422,33 @@ impl Stage {
     pub fn total_secs(&self) -> f64 {
         self.compute_secs + self.hop_secs
     }
+
+    pub fn label(&self) -> String {
+        match &self.host {
+            Some(host) => {
+                let gpus = self.ordinals.iter().map(|o| o.to_string()).collect::<Vec<_>>().join("+");
+                format!("{host} / GPU {gpus} (tp {})", self.tp)
+            }
+            None => self.device_name.clone(),
+        }
+    }
+
+    pub fn allreduce_share(&self) -> f64 {
+        if self.compute_secs > 0.0 { self.allreduce_secs / self.compute_secs } else { 0.0 }
+    }
+
+    pub fn bottleneck(&self) -> &'static str {
+        let parts = [
+            (self.memory_bound_secs, "memory bandwidth"),
+            (self.flop_bound_secs, "compute"),
+            (self.allreduce_secs, "allreduce"),
+            (self.hop_secs, "hop"),
+        ];
+        parts.iter().fold((-1.0, ""), |best, &(t, n)| if t > best.0 { (t, n) } else { best }).1
+    }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Placement {
     pub model: String,
     pub objective: Objective,
@@ -358,8 +492,8 @@ impl Placement {
         );
         for (i, s) in self.stages.iter().enumerate() {
             out.push_str(&format!(
-                "  stage {i}  {:<16} layers {:>3}..{:<3} ({:>2})  weights {:>7.2} GiB  kv {:>6.2}  state {:>6.2}  of {:>6.1} GiB  step {:>7.3} ms  hop {:>6.3} ms",
-                s.device_name,
+                "  stage {i}  {:<28} layers {:>3}..{:<3} ({:>2})  weights {:>7.2} GiB  kv {:>6.2}  state {:>6.2}  of {:>6.1} GiB  step {:>7.3} ms  allreduce {:>6.3} ms ({:>4.1}%)  hop {:>6.3} ms  bound by {}",
+                s.label(),
                 s.start,
                 s.end,
                 s.layers(),
@@ -368,7 +502,10 @@ impl Placement {
                 gib(s.state_bytes),
                 gib(s.memory_bytes),
                 s.compute_secs * 1e3,
-                s.hop_secs * 1e3
+                s.allreduce_secs * 1e3,
+                s.allreduce_share() * 100.0,
+                s.hop_secs * 1e3,
+                s.bottleneck()
             ));
             if let Some(from) = s.offloaded_from {
                 out.push_str(&format!("  offload layers {from}..{} ({:.2} GiB to host)", s.end, gib(s.offloaded_bytes)));
@@ -399,6 +536,8 @@ fn hop_between(devices: &[Device], from: usize, to: usize, bytes: f64) -> f64 {
 
 fn fit_stage(model: &CostModel, device_index: usize, device: &Device, start: usize, end: usize) -> Result<StageFit, String> {
     let n = model.layers.len();
+    let tp = device.tp.max(1);
+    let share = |bytes: u64| bytes.div_ceil(tp as u64);
     let slice = &model.layers[start..end];
     let mut weights: u64 = slice.iter().map(|l| l.weight_bytes).sum();
     if start == 0 {
@@ -407,8 +546,9 @@ fn fit_stage(model: &CostModel, device_index: usize, device: &Device, start: usi
     if end == n {
         weights += model.head_bytes + model.norm_bytes;
     }
-    let kv: u64 = slice.iter().map(|l| l.kv_bytes).sum::<u64>() * model.slots as u64;
-    let state: u64 = slice.iter().map(|l| l.state_bytes).sum::<u64>() * model.slots as u64;
+    let weights = share(weights);
+    let kv: u64 = share(slice.iter().map(|l| l.kv_bytes).sum::<u64>() * model.slots as u64);
+    let state: u64 = share(slice.iter().map(|l| l.state_bytes).sum::<u64>() * model.slots as u64);
     let available = device.memory_bytes.saturating_sub(device.reserve_bytes);
     let needed = weights + kv + state;
     let (mut offloaded_from, mut offloaded_bytes) = (None, 0u64);
@@ -418,16 +558,17 @@ fn fit_stage(model: &CostModel, device_index: usize, device: &Device, start: usi
         let mut from = end;
         while moved < excess && from > start {
             from -= 1;
-            moved += model.layers[from].weight_bytes;
+            moved += share(model.layers[from].weight_bytes);
         }
         if moved < excess || moved > device.offload_bytes {
             return Err(format!(
-                "stage {start}..{end} on {} needs {:.2} GiB ({:.2} GiB weights, {:.2} GiB kv, {:.2} GiB state) and {} has {:.2} GiB after its reserve{}",
+                "stage {start}..{end} on {} needs {:.2} GiB ({:.2} GiB weights, {:.2} GiB kv, {:.2} GiB state){} and {} has {:.2} GiB after its reserve{}",
                 device.name,
                 needed as f64 / GIB,
                 weights as f64 / GIB,
                 kv as f64 / GIB,
                 state as f64 / GIB,
+                if tp > 1 { " per rank" } else { "" },
                 device.name,
                 available as f64 / GIB,
                 if device.offload_bytes == 0 { String::new() } else { format!(" and {:.2} GiB of host offload", device.offload_bytes as f64 / GIB) }
@@ -436,20 +577,36 @@ fn fit_stage(model: &CostModel, device_index: usize, device: &Device, start: usi
         offloaded_from = Some(from);
         offloaded_bytes = moved;
     }
-    let mut compute = 0.0;
+    let ranks = tp as f64;
+    let (mut memory_bound, mut flop_bound) = (0.0, 0.0);
+    let mut add = |reads: f64, flops: f64, bandwidth: f64| {
+        let (r, f) = (reads / ranks / bandwidth, flops / ranks / device.flops);
+        if r >= f { memory_bound += r } else { flop_bound += f }
+    };
     for (i, l) in slice.iter().enumerate() {
         let layer = start + i;
         let hosted = offloaded_from.is_some_and(|f| layer >= f);
-        let bandwidth = if hosted { device.offload_bandwidth } else { device.bandwidth };
-        compute += (l.read_bytes / bandwidth).max(l.flops / device.flops);
+        add(l.read_bytes, l.flops, if hosted { device.offload_bandwidth } else { device.bandwidth });
     }
     if end == n {
-        compute += (model.head_bytes as f64 / device.bandwidth).max(model.head_flops / device.flops);
+        add(model.head_bytes as f64, model.head_flops, device.bandwidth);
     }
+    let allreduce = if tp > 1 {
+        slice.len() as f64 * ALLREDUCES_PER_LAYER * (device.allreduce_latency + model.allreduce_bytes() / device.allreduce_bandwidth)
+    } else {
+        0.0
+    };
+    let ordinal = device.ordinal.unwrap_or(device_index);
     Ok(StageFit {
         stage: Stage {
             device: device_index,
-            ordinal: device.ordinal.unwrap_or(device_index),
+            host: device.host.clone(),
+            tp,
+            ordinals: if device.ordinals.is_empty() { vec![ordinal] } else { device.ordinals.clone() },
+            allreduce_secs: allreduce,
+            memory_bound_secs: memory_bound,
+            flop_bound_secs: flop_bound,
+            ordinal,
             device_name: device.name.clone(),
             start,
             end,
@@ -460,17 +617,17 @@ fn fit_stage(model: &CostModel, device_index: usize, device: &Device, start: usi
             memory_bytes: device.memory_bytes,
             offloaded_from,
             offloaded_bytes,
-            compute_secs: compute,
+            compute_secs: memory_bound + flop_bound + allreduce,
             hop_secs: 0.0,
         },
     })
 }
 
-fn assemble(model: &CostModel, devices: &[Device], objective: Objective, mut stages: Vec<Stage>) -> Placement {
+fn assemble(model: &CostModel, devices: &[Device], objective: Objective, mut stages: Vec<Stage>, spans: &[(usize, usize)]) -> Placement {
     let mut previous: Option<usize> = None;
-    for s in &mut stages {
-        s.hop_secs = previous.map_or(0.0, |p| hop_between(devices, p, s.device, model.hop_bytes()));
-        previous = Some(s.device);
+    for (s, &(first, last)) in stages.iter_mut().zip(spans) {
+        s.hop_secs = previous.map_or(0.0, |p| hop_between(devices, p, first, model.hop_bytes()));
+        previous = Some(last);
     }
     Placement {
         model: model.name.clone(),
@@ -485,23 +642,73 @@ fn assemble(model: &CostModel, devices: &[Device], objective: Objective, mut sta
 }
 
 pub fn evaluate(model: &CostModel, devices: &[Device], ranges: &[(usize, usize, usize)], objective: Objective) -> Result<Placement> {
-    ensure!(!ranges.is_empty(), "no stages");
+    let groups: Vec<(usize, usize, usize, usize)> = ranges.iter().map(|&(d, s, e)| (d, d, s, e)).collect();
+    evaluate_groups(model, devices, &groups, objective)
+}
+
+pub fn evaluate_groups(model: &CostModel, devices: &[Device], groups: &[(usize, usize, usize, usize)], objective: Objective) -> Result<Placement> {
+    ensure!(!groups.is_empty(), "no stages");
     let mut next = 0;
     let mut last_device: Option<usize> = None;
     let mut stages = Vec::new();
-    for &(device, start, end) in ranges {
-        ensure!(device < devices.len(), "stage uses device {device} of {}", devices.len());
-        ensure!(last_device.is_none_or(|d| device > d), "stages must follow the device order, each device at most once");
+    let mut spans = Vec::new();
+    for &(first, last, start, end) in groups {
+        ensure!(first <= last && last < devices.len(), "stage uses devices {first}..={last} of {}", devices.len());
+        ensure!(last_device.is_none_or(|d| first > d), "stages must follow the device order, each device at most once");
         ensure!(start == next && end > start, "stages must be non-empty and contiguous: expected a stage starting at layer {next}, got {start}..{end}");
-        match fit_stage(model, device, &devices[device], start, end) {
+        let device = group_device(model, devices, first, last).map_err(anyhow::Error::msg)?;
+        match fit_stage(model, first, &device, start, end) {
             Ok(fit) => stages.push(fit.stage),
             Err(why) => bail!(why),
         }
+        spans.push((first, last));
         next = end;
-        last_device = Some(device);
+        last_device = Some(last);
     }
     ensure!(next == model.layer_count(), "stages end at layer {next} but the model has {}", model.layer_count());
-    Ok(assemble(model, devices, objective, stages))
+    Ok(assemble(model, devices, objective, stages, &spans))
+}
+
+fn group_device(model: &CostModel, devices: &[Device], first: usize, last: usize) -> Result<Device, String> {
+    let tp = last - first + 1;
+    if tp > 1 {
+        let host = devices[first].host.as_ref().ok_or_else(|| format!("{} has no host, so it cannot join a tensor parallel group", devices[first].name))?;
+        if devices[first..=last].iter().any(|d| d.host.as_ref() != Some(host)) {
+            return Err(format!("a tensor parallel group must stay on one host, {host} is not the host of every member"));
+        }
+        model.allows_tp(tp)?;
+    }
+    let members: Vec<(usize, &Device)> = (first..=last).map(|i| (i, &devices[i])).collect();
+    Ok(Device::group(&members))
+}
+
+fn tp_groups(model: &CostModel, devices: &[Device]) -> Vec<(usize, usize)> {
+    let mut groups: Vec<(usize, usize)> = (0..devices.len()).map(|i| (i, i)).collect();
+    let mut run_start = 0;
+    while run_start < devices.len() {
+        let Some(host) = &devices[run_start].host else {
+            run_start += 1;
+            continue;
+        };
+        let mut run_end = run_start;
+        while run_end + 1 < devices.len() && devices[run_end + 1].host.as_ref() == Some(host) {
+            run_end += 1;
+        }
+        let count = run_end - run_start + 1;
+        for tp in 2..=count {
+            if count % tp != 0 || model.allows_tp(tp).is_err() {
+                continue;
+            }
+            let mut f = run_start;
+            while f + tp <= run_end + 1 {
+                groups.push((f, f + tp - 1));
+                f += tp;
+            }
+        }
+        run_start = run_end + 1;
+    }
+    groups.sort_by_key(|&(f, l)| (l, f));
+    groups
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -521,18 +728,28 @@ impl Score {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Link {
+    score: Score,
+    previous: usize,
+    start: usize,
+    group: usize,
+}
+
 pub fn plan(model: &CostModel, devices: &[Device], objective: Objective) -> Result<Placement> {
     ensure!(!devices.is_empty(), "no devices to place the model on");
     let n = model.layer_count();
     let d = devices.len();
-    let mut table: Vec<Vec<Option<(Score, usize, usize)>>> = vec![vec![None; n + 1]; d];
+    let groups = tp_groups(model, devices);
+    let mut table: Vec<Vec<Option<Link>>> = vec![vec![None; n + 1]; d];
     let mut reasons: Vec<String> = Vec::new();
     let hop_bytes = model.hop_bytes();
-    for dev in 0..d {
+    for (gi, &(first, last)) in groups.iter().enumerate() {
+        let device = group_device(model, devices, first, last).expect("candidate groups are valid");
         for end in 1..=n {
-            let mut best: Option<(Score, usize, usize)> = None;
+            let mut best: Option<Link> = table[last][end];
             for start in 0..end {
-                let fit = match fit_stage(model, dev, &devices[dev], start, end) {
+                let fit = match fit_stage(model, first, &device, start, end) {
                     Ok(f) => f,
                     Err(why) => {
                         if reasons.len() < 64 && start == 0 {
@@ -543,36 +760,36 @@ pub fn plan(model: &CostModel, devices: &[Device], objective: Objective) -> Resu
                 };
                 let compute = fit.stage.compute_secs;
                 let candidate = if start == 0 {
-                    Some((Score { primary: compute, secondary: compute }, usize::MAX, 0))
+                    Some(Link { score: Score { primary: compute, secondary: compute }, previous: usize::MAX, start: 0, group: gi })
                 } else {
-                    let mut chosen: Option<(Score, usize, usize)> = None;
-                    for prev in 0..dev {
-                        let Some((p, _, _)) = table[prev][start] else { continue };
-                        let cost = compute + hop_between(devices, prev, dev, hop_bytes);
+                    let mut chosen: Option<Link> = None;
+                    for prev in 0..first {
+                        let Some(p) = table[prev][start] else { continue };
+                        let cost = compute + hop_between(devices, prev, first, hop_bytes);
                         let total = match objective {
-                            Objective::Latency => Score { primary: p.primary + cost, secondary: p.secondary.max(cost) },
-                            Objective::Throughput => Score { primary: p.primary.max(cost), secondary: p.secondary + cost },
+                            Objective::Latency => Score { primary: p.score.primary + cost, secondary: p.score.secondary.max(cost) },
+                            Objective::Throughput => Score { primary: p.score.primary.max(cost), secondary: p.score.secondary + cost },
                         };
-                        if chosen.as_ref().is_none_or(|c| total.better_than(&c.0)) {
-                            chosen = Some((total, prev, start));
+                        if chosen.as_ref().is_none_or(|c| total.better_than(&c.score)) {
+                            chosen = Some(Link { score: total, previous: prev, start, group: gi });
                         }
                     }
                     chosen
                 };
                 if let Some(c) = candidate {
-                    if best.as_ref().is_none_or(|b| c.0.better_than(&b.0)) {
+                    if best.as_ref().is_none_or(|b| c.score.better_than(&b.score)) {
                         best = Some(c);
                     }
                 }
             }
-            table[dev][end] = best;
+            table[last][end] = best;
         }
     }
     let mut finish: Option<(Score, usize)> = None;
     for dev in 0..d {
-        if let Some((s, _, _)) = table[dev][n] {
-            if finish.as_ref().is_none_or(|f| s.better_than(&f.0)) {
-                finish = Some((s, dev));
+        if let Some(l) = table[dev][n] {
+            if finish.as_ref().is_none_or(|f| l.score.better_than(&f.0)) {
+                finish = Some((l.score, dev));
             }
         }
     }
@@ -596,19 +813,20 @@ pub fn plan(model: &CostModel, devices: &[Device], objective: Objective) -> Resu
             reasons.first().map(|r| format!(" ({r})")).unwrap_or_default()
         );
     };
-    let mut ranges = Vec::new();
+    let mut chosen = Vec::new();
     let mut end = n;
     loop {
-        let (_, prev, start) = table[dev][end].expect("the chosen chain is filled");
-        ranges.push((dev, start, end));
-        if prev == usize::MAX {
+        let l = table[dev][end].expect("the chosen chain is filled");
+        let (first, last) = groups[l.group];
+        chosen.push((first, last, l.start, end));
+        if l.previous == usize::MAX {
             break;
         }
-        dev = prev;
-        end = start;
+        dev = l.previous;
+        end = l.start;
     }
-    ranges.reverse();
-    evaluate(model, devices, &ranges, objective)
+    chosen.reverse();
+    evaluate_groups(model, devices, &chosen, objective)
 }
 
 #[cfg(test)]
@@ -645,6 +863,8 @@ mod tests {
             reserve_gib: Some(0.0),
             link: LinkConfig { latency_ms: 0.01, bandwidth_gbs: 25.0 },
             offload: None,
+            host: None,
+            peer: None,
         })
     }
 
@@ -822,5 +1042,140 @@ mod tests {
         let p = toml::from_str::<PlacementConfig>(toml_text).unwrap().place(&spec).unwrap();
         assert_eq!(p.ranges(), vec![(0, 0, 10), (0, 10, 28)]);
         assert_eq!(p.stages[1].device, 1);
+    }
+
+    fn gpu(name: &str, host: &str, gib: f64) -> Device {
+        let mut d = device(name, gib, 1800.0);
+        d.host = Some(host.into());
+        d.peer_latency = 0.000_01;
+        d.peer_bandwidth = 50e9;
+        d
+    }
+
+    fn pcie_only(devices: &mut [Device]) {
+        for d in devices {
+            d.peer_latency = 0.004;
+            d.peer_bandwidth = 6e9;
+        }
+    }
+
+    #[test]
+    fn a_two_gpu_host_picks_tp2_when_it_fits_one_gpu_but_tp_is_faster() {
+        let m = CostModel::new(&qwen27(), 8192, 4);
+        let devices = [gpu("g0", "box", 96.0), gpu("g1", "box", 96.0)];
+        let p = plan(&m, &devices, Objective::Latency).unwrap();
+        assert_eq!(p.stages.len(), 1, "{}", p.render());
+        assert_eq!(p.stages[0].tp, 2, "{}", p.render());
+        assert_eq!(p.stages[0].ordinals, vec![0, 1]);
+        let single = evaluate(&m, &devices, &[(0, 0, 64)], Objective::Latency).unwrap();
+        assert!(p.step_secs < single.step_secs);
+        assert!(p.stages[0].allreduce_secs > 0.0);
+    }
+
+    #[test]
+    fn tp_halves_the_memory_each_rank_holds() {
+        let m = CostModel::new(&qwen27(), 8192, 4);
+        let devices = [gpu("g0", "box", 96.0), gpu("g1", "box", 96.0)];
+        let tp2 = evaluate_groups(&m, &devices, &[(0, 1, 0, 64)], Objective::Latency).unwrap();
+        let tp1 = evaluate(&m, &devices, &[(0, 0, 64)], Objective::Latency).unwrap();
+        let (a, b) = (tp2.stages[0].weight_bytes, tp1.stages[0].weight_bytes);
+        assert!(a.abs_diff(b / 2) <= 1);
+    }
+
+    #[test]
+    fn a_two_gpu_host_beside_a_spark_keeps_the_model_local_until_memory_forces_a_pipeline() {
+        let m = CostModel::new(&qwen27(), 8192, 4);
+        let mut spark = device("spark", 100.0, 270.0);
+        spark.host = Some("spark".into());
+        spark.link_latency = 0.0005;
+        spark.link_bandwidth = 1.2e9;
+        let roomy = [gpu("g0", "box", 96.0), gpu("g1", "box", 96.0), spark.clone()];
+        let p = plan(&m, &roomy, Objective::Latency).unwrap();
+        assert_eq!(p.stages.len(), 1, "{}", p.render());
+        assert_eq!(p.stages[0].tp, 2);
+        let tight = [gpu("g0", "box", 5.0), gpu("g1", "box", 5.0), spark];
+        let q = plan(&m, &tight, Objective::Latency).unwrap();
+        assert_eq!(q.stages.len(), 2, "{}", q.render());
+        assert_eq!(q.stages[0].tp, 2, "{}", q.render());
+        assert_eq!(q.stages[1].device_name, "spark");
+        assert!(q.stages.iter().all(|s| s.used_bytes() <= s.memory_bytes));
+    }
+
+    #[test]
+    fn heads_that_tp_does_not_divide_are_rejected() {
+        let mut spec = qwen27();
+        spec.attention.kv_heads = 3;
+        let m = CostModel::new(&spec, 4096, 1);
+        assert!(m.allows_tp(2).unwrap_err().contains("kv heads"));
+        let devices = [gpu("g0", "box", 96.0), gpu("g1", "box", 96.0)];
+        let err = evaluate_groups(&m, &devices, &[(0, 1, 0, 64)], Objective::Latency).unwrap_err().to_string();
+        assert!(err.contains("does not divide"), "{err}");
+        let p = plan(&m, &devices, Objective::Latency).unwrap();
+        assert!(p.stages.iter().all(|s| s.tp == 1));
+        let mut delta = qwen27();
+        delta.linear_attention.as_mut().unwrap().value_heads = 3;
+        assert!(CostModel::new(&delta, 4096, 1).allows_tp(2).unwrap_err().contains("delta-net"));
+    }
+
+    #[test]
+    fn a_group_must_stay_on_one_host() {
+        let m = CostModel::new(&qwen27(), 4096, 1);
+        let devices = [gpu("g0", "a", 96.0), gpu("g1", "b", 96.0)];
+        let err = evaluate_groups(&m, &devices, &[(0, 1, 0, 64)], Objective::Latency).unwrap_err().to_string();
+        assert!(err.contains("one host"), "{err}");
+        let p = plan(&m, &devices, Objective::Throughput).unwrap();
+        assert!(p.stages.iter().all(|s| s.tp == 1));
+    }
+
+    #[test]
+    fn a_probe_without_p2p_raises_the_allreduce_cost_and_can_flip_the_choice() {
+        let m = CostModel::new(&qwen27(), 8192, 4);
+        let mut devices = [gpu("g0", "box", 96.0), gpu("g1", "box", 96.0)];
+        let fast = plan(&m, &devices, Objective::Latency).unwrap();
+        assert_eq!(fast.stages[0].tp, 2);
+        pcie_only(&mut devices);
+        let staged = plan(&m, &devices, Objective::Latency).unwrap();
+        assert_eq!(staged.stages[0].tp, 1, "{}", staged.render());
+        let forced = evaluate_groups(&m, &devices, &[(0, 1, 0, 64)], Objective::Latency).unwrap();
+        assert!(forced.stages[0].allreduce_secs > fast.stages[0].allreduce_secs * 10.0);
+    }
+
+    #[test]
+    fn probes_override_the_declared_peer_link_unless_one_is_configured() {
+        let mut cfg: PlacementConfig = toml::from_str(
+            r#"
+            [[devices]]
+            name = "g0"
+            host = "box"
+            ordinal = 0
+            memory_gib = 96
+            bandwidth_gbs = 1800
+            tflops = 1000
+            [[devices]]
+            name = "g1"
+            host = "box"
+            ordinal = 1
+            memory_gib = 96
+            bandwidth_gbs = 1800
+            tflops = 1000
+            [devices.peer]
+            latency_ms = 0.5
+            bandwidth_gbs = 2
+        "#,
+        )
+        .unwrap();
+        cfg.apply_peer_probes(&[crate::link::PairProbe { a: 0, b: 1, p2p: false, latency_ms: 0.05, bandwidth_gbs: 12.0 }]);
+        assert_eq!(cfg.devices[0].peer, Some(LinkConfig { latency_ms: 0.05, bandwidth_gbs: 12.0 }));
+        assert_eq!(cfg.devices[1].peer, Some(LinkConfig { latency_ms: 0.5, bandwidth_gbs: 2.0 }));
+    }
+
+    #[test]
+    fn the_plan_output_names_the_group_and_what_bounds_each_stage() {
+        let m = CostModel::new(&qwen27(), 8192, 4);
+        let devices = [gpu("g0", "box", 96.0), gpu("g1", "box", 96.0)];
+        let p = plan(&m, &devices, Objective::Latency).unwrap();
+        let text = p.render();
+        let golden = include_str!("../tests/golden/plan-tp2.txt");
+        assert_eq!(text, golden, "{text}");
     }
 }

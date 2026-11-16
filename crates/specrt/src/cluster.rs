@@ -74,6 +74,8 @@ pub fn decode_announcement(txt: &[String]) -> Result<(DeviceConfig, String)> {
         reserve_gib: if fields.contains_key("reserve") { Some(number("reserve")?) } else { None },
         link,
         offload: None,
+        host: None,
+        peer: None,
     };
     Ok((device, text("addr")?))
 }
@@ -197,6 +199,8 @@ mod tests {
             reserve_gib: Some(0.0),
             link: LinkConfig::default(),
             offload: None,
+            host: None,
+            peer: None,
         }
     }
 

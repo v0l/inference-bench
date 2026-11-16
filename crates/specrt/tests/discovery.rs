@@ -74,6 +74,8 @@ fn device(name: &str, address: Option<String>) -> DeviceConfig {
         reserve_gib: Some(0.0),
         link: LinkConfig::default(),
         offload: None,
+        host: None,
+        peer: None,
     }
 }
 

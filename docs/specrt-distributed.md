@@ -127,3 +127,9 @@ The overlap does not pay on one GPU: both stages compete for the same SMs and me
 ## Real server check
 
 `inference-bench-server` with `[placement]` splitting Qwen3-0.6B into stages 0..14 and 14..28 (two planner devices on CUDA ordinal 0, `ordinal = 0` in `[[placement.devices]]`), `kv_cache_gb = 1.0`, `micro_batch = 32`. Four concurrent greedy chat completions (one with a 146 token prompt) gave text identical to a non-pipelined server. `/metrics` showed `inference_pipeline_stages 2`, 56 calls and 374 tokens per stage, 58 hops, 1531904 hop bytes and 4 micro-batches in 2 overlapped prefills. The non-pipelined server exports no `inference_pipeline_*` series.
+
+## Tensor parallel groups in the planner
+
+A `[[placement.devices]]` entry may set `host = "name"`. Neighbouring devices with the same host can form a tensor parallel group: the planner tries every tp that divides the host's run of GPUs and the q, kv and delta-net head counts of the spec. Per-layer bytes and FLOPs divide by tp, weights, KV and state are split per rank, and each layer adds two allreduces of `slots x hidden x 2` bytes over the peer link (`[placement.devices.peer]`, default the device `link`). Between hosts the plan stays a pipeline.
+
+`inference-bench plan --probe` measures peer copies between local GPUs (P2P, or host staged when P2P is off) and the round trip to devices with an `address`, and uses them unless `peer` is declared. Without `--objective` it prints both objectives; each stage shows `host / GPU 0+1 (tp 2)`, memory, step time, allreduce share and what bounds it. `Placement` and `Stage` are `Serialize` for the app's cluster preview. The serving path refuses a plan with tp above 1 until the engine can run one.

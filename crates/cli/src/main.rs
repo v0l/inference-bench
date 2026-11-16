@@ -256,8 +256,10 @@ enum Cmd {
         context: Option<usize>,
         #[arg(long, help = "Override [placement] slots")]
         slots: Option<usize>,
-        #[arg(long, help = "latency or throughput")]
+        #[arg(long, help = "latency or throughput; both are printed when omitted")]
         objective: Option<String>,
+        #[arg(long, help = "Measure peer-to-peer links between local GPUs and the network round trip to devices with an address")]
+        probe: bool,
     },
     #[command(about = "Print the IR and emitted source of the kernels a spec builds, for the live device or a named target")]
     Kernels {
@@ -306,7 +308,7 @@ fn specs_command(data: &Path, cmd: &SpecsCmd) -> Result<()> {
     Ok(())
 }
 
-fn plan_command(data: &Path, spec: &str, config: &Path, context: Option<usize>, slots: Option<usize>, objective: Option<&str>) -> Result<()> {
+fn plan_command(data: &Path, spec: &str, config: &Path, context: Option<usize>, slots: Option<usize>, objective: Option<&str>, probe: bool) -> Result<()> {
     use inference_bench_core::specrt_placement::Objective;
     let path = resolve_spec_names(data, spec);
     let spec = inference_bench_core::specrt_spec::Spec::load(Path::new(&path))?;
@@ -317,14 +319,55 @@ fn plan_command(data: &Path, spec: &str, config: &Path, context: Option<usize>, 
     if let Some(s) = slots {
         placement.slots = s;
     }
-    match objective {
-        Some("latency") => placement.objective = Objective::Latency,
-        Some("throughput") => placement.objective = Objective::Throughput,
+    let objectives = match objective {
+        Some("latency") => vec![Objective::Latency],
+        Some("throughput") => vec![Objective::Throughput],
         Some(other) => bail!("objective {other:?} is not latency or throughput"),
-        None => {}
+        None => vec![Objective::Latency, Objective::Throughput],
+    };
+    if probe {
+        probe_links(&mut placement);
     }
-    print!("{}", placement.place(&spec)?.render());
+    for objective in objectives {
+        placement.objective = objective;
+        print!("{}", placement.place(&spec)?.render());
+    }
     Ok(())
+}
+
+fn probe_links(placement: &mut inference_bench_core::specrt_placement::PlacementConfig) {
+    match specrt::link::probe_local() {
+        Ok(probes) => {
+            for p in &probes {
+                println!("probe GPU {}-{}: {} {:.1} GB/s, {:.3} ms", p.a, p.b, if p.p2p { "p2p" } else { "host staged" }, p.bandwidth_gbs, p.latency_ms);
+            }
+            placement.apply_peer_probes(&probes);
+        }
+        Err(e) => println!("no local GPU probe: {e}"),
+    }
+    let Some(remote) = placement.remote.clone() else { return };
+    let Ok(key) = remote.key() else { return };
+    let mut rtts = Vec::new();
+    for d in &placement.devices {
+        let Some(addr) = &d.address else { continue };
+        let timeout = std::time::Duration::from_millis(remote.timeout_ms);
+        let rtt = specrt::wire::StageClient::connect(addr, &key, timeout).and_then(|mut c| {
+            let mut samples = Vec::new();
+            for _ in 0..20 {
+                samples.push(c.ping()?.as_secs_f64() * 1e3);
+            }
+            samples.sort_by(f64::total_cmp);
+            Ok(samples[samples.len() / 2])
+        });
+        match rtt {
+            Ok(ms) => {
+                println!("probe {} at {addr}: round trip {ms:.3} ms", d.name);
+                rtts.push((addr.clone(), ms));
+            }
+            Err(e) => println!("probe {} at {addr}: {e:#}", d.name),
+        }
+    }
+    placement.apply_network_rtts(&rtts);
 }
 
 fn kernels_command(data: &Path, spec: &str, target: Option<&str>) -> Result<()> {
@@ -539,7 +582,7 @@ fn main() -> Result<()> {
         }
         Cmd::Specs { cmd } => specs_command(&data, cmd)?,
         Cmd::Kernels { spec, target } => kernels_command(&data, spec, target.as_deref())?,
-        Cmd::Plan { spec, config, context, slots, objective } => plan_command(&data, spec, config, *context, *slots, objective.as_deref())?,
+        Cmd::Plan { spec, config, context, slots, objective, probe } => plan_command(&data, spec, config, *context, *slots, objective.as_deref(), *probe)?,
     }
     Ok(())
 }
