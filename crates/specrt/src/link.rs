@@ -89,3 +89,97 @@ impl DeviceLink {
         Ok(())
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PairProbe {
+    pub a: usize,
+    pub b: usize,
+    pub p2p: bool,
+    pub latency_ms: f64,
+    pub bandwidth_gbs: f64,
+}
+
+const PROBE_LATENCY_BYTES: usize = 4096;
+const PROBE_BANDWIDTH_BYTES: usize = 64 << 20;
+const PROBE_ROUNDS: usize = 20;
+
+fn median_secs(mut v: Vec<f64>) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+fn timed_copies(link: &DeviceLink, sa: &Arc<CudaStream>, sb: &Arc<CudaStream>, bytes: usize) -> Result<f64> {
+    let src = sa.alloc_zeros::<u8>(bytes)?;
+    let mut dst = sb.alloc_zeros::<u8>(bytes)?;
+    link.copy(&src, sa, &mut dst, sb, bytes)?;
+    sb.synchronize()?;
+    let mut times = Vec::with_capacity(PROBE_ROUNDS);
+    for _ in 0..PROBE_ROUNDS {
+        let started = std::time::Instant::now();
+        link.copy(&src, sa, &mut dst, sb, bytes)?;
+        sb.synchronize()?;
+        times.push(started.elapsed().as_secs_f64());
+    }
+    Ok(median_secs(times))
+}
+
+impl PairProbe {
+    pub fn from_timings(a: usize, b: usize, p2p: bool, small_secs: f64, large_secs: f64) -> PairProbe {
+        PairProbe { a, b, p2p, latency_ms: small_secs * 1e3, bandwidth_gbs: PROBE_BANDWIDTH_BYTES as f64 / large_secs / 1e9 }
+    }
+}
+
+pub fn probe_mode(a_to_b: bool, b_to_a: bool) -> LinkMode {
+    if a_to_b && b_to_a { LinkMode::Peer } else { LinkMode::Staged }
+}
+
+pub fn median_of(v: Vec<f64>) -> f64 {
+    median_secs(v)
+}
+
+pub fn probe_pair(a: usize, b: usize) -> Result<PairProbe> {
+    ensure!(a != b, "a link probe needs two different devices");
+    let (ca, cb) = (CudaContext::new(a)?, CudaContext::new(b)?);
+    let mode = probe_mode(peer_access(&ca, &cb), peer_access(&cb, &ca));
+    let link = DeviceLink::with_mode(&ca, &cb, mode)?;
+    let (sa, sb) = (ca.new_stream()?, cb.new_stream()?);
+    let small = timed_copies(&link, &sa, &sb, PROBE_LATENCY_BYTES)?;
+    let large = timed_copies(&link, &sa, &sb, PROBE_BANDWIDTH_BYTES)?;
+    Ok(PairProbe::from_timings(a, b, mode == LinkMode::Peer, small, large))
+}
+
+pub fn probe_local() -> Result<Vec<PairProbe>> {
+    let count = CudaContext::device_count()? as usize;
+    let mut out = Vec::new();
+    for a in 0..count {
+        for b in a + 1..count {
+            out.push(probe_pair(a, b)?);
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timings_become_latency_and_bandwidth() {
+        let p = PairProbe::from_timings(0, 1, true, 12e-6, 64.0 * 1048576.0 / 25e9);
+        assert!((p.latency_ms - 0.012).abs() < 1e-9);
+        assert!((p.bandwidth_gbs - 25.0).abs() < 1e-6);
+        assert!(p.p2p);
+    }
+
+    #[test]
+    fn peer_access_in_only_one_direction_falls_back_to_host_staging() {
+        assert_eq!(probe_mode(true, true), LinkMode::Peer);
+        assert_eq!(probe_mode(true, false), LinkMode::Staged);
+        assert_eq!(probe_mode(false, false), LinkMode::Staged);
+    }
+
+    #[test]
+    fn the_median_ignores_one_slow_outlier() {
+        assert_eq!(median_of(vec![3.0, 1.0, 100.0, 2.0, 2.5]), 2.5);
+    }
+}

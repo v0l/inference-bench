@@ -514,6 +514,19 @@ python = "python3"
     }
 
     #[test]
+    fn a_placement_with_a_tensor_parallel_group_is_refused_with_the_stage_and_tp() {
+        let c = ServerConfig::parse(
+            "max_num_seqs = 4\n[placement]\ncontext = 8192\nslots = 4\n[[placement.devices]]\nname='g0'\nhost='box'\nmemory_gib=96\nbandwidth_gbs=1800\ntflops=1000\n[[placement.devices]]\nname='g1'\nhost='box'\nmemory_gib=96\nbandwidth_gbs=1800\ntflops=1000\n[[models]]\nid='m'",
+        )
+        .unwrap();
+        let spec_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/qwen3.8-27b-exact.toml");
+        let spec = inference_bench_core::specrt_spec::Spec::load(&spec_path).unwrap();
+        let placement = c.serve_options(&c.models[0]).unwrap().placement.unwrap();
+        let err = placement.place(&spec).unwrap().ensure_runnable().unwrap_err().to_string();
+        assert!(err.contains("stage 0") && err.contains("tp 2"), "{err}");
+    }
+
+    #[test]
     fn the_runtime_table_reaches_the_serving_options_with_defaults_for_missing_keys() {
         use inference_bench_core::specrt_serve::{RuntimeOptions, TileChoice};
         let c = ServerConfig::parse("max_num_seqs = 4\n[runtime]\ngraphs = false\ntile = \"narrow\"\ncache_dir = \"/tmp/ptx\"\n[[models]]\nid='m'").unwrap();

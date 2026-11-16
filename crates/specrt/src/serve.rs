@@ -434,6 +434,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, in
                 let mut resolved = spec.clone();
                 opts.speculative.apply(&mut resolved)?;
                 let placed = p.place(&resolved)?;
+                placed.ensure_runnable()?;
                 (placed.stages.len() > 1).then_some((placed, p.micro_batch_in_process()))
             }
             _ => None,
