@@ -1215,7 +1215,7 @@ fn chat_message(text: &str, output: &OutputMode, reason: &'static str) -> (Value
 fn delta_json(d: &Delta) -> Value {
     match d {
         Delta::Content(t) => json!({"content": t}),
-        Delta::Reasoning(t) => json!({"reasoning": t, "reasoning_content": t}),
+        Delta::Reasoning(t) => json!({"reasoning_content": t}),
         Delta::Call { index, id, name } => {
             json!({"tool_calls": [{"index": index, "id": id, "type": "function", "function": {"name": name, "arguments": ""}}]})
         }

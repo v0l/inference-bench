@@ -444,7 +444,7 @@ impl inference_bench_core::native::Model for XmlThenAnswer {
     }
 
     fn chat(&mut self, messages: &[serde_json::Value], _: Option<&serde_json::Value>, _: usize, _: specrt::runtime::Sampling, on_text: &mut dyn FnMut(&str) -> bool) -> anyhow::Result<specrt::engine::Reply> {
-        let text = if messages.iter().any(|m| m["role"] == "tool") { "The workspace is ready." } else { "<tool_call>\n<function=workspace>\n</function>\n</tool_call>" };
+        let text = if messages.iter().any(|m| m["role"] == "tool") { "Nothing more to check.\n</think>\n\nThe workspace is ready." } else { "The user wants the workspace checked, so I will call the workspace tool first.\n</think>\n\n<tool_call>\n<function=workspace>\n</function>\n</tool_call>" };
         on_text(text);
         Ok(specrt::engine::Reply { text: text.into(), prompt_tokens: 4, completion_tokens: 4, prefill_secs: 0.0, decode_secs: 0.0, peak_device_bytes: 0 })
     }
@@ -455,6 +455,10 @@ impl inference_bench_core::native::Model for XmlThenAnswer {
 
     fn tool_format(&self) -> specrt::chat::ToolFormat {
         specrt::chat::ToolFormat::Qwen3Coder
+    }
+
+    fn thinking(&self) -> specrt::chat::Thinking {
+        specrt::chat::Thinking::OpensInPrompt
     }
 }
 
@@ -485,11 +489,64 @@ fn the_agent_chat_runs_a_tool_the_model_asked_for_in_xml() {
         Turn::Did { name, answer, .. } => Some((name.clone(), answer.clone())),
         _ => None,
     });
-    let (name, answer) = did.unwrap_or_else(|| panic!("no tool turn: {}", turns.iter().map(|t| match t { Turn::You(s) | Turn::Said(s) | Turn::Fault(s) => s.clone(), Turn::Did { name, .. } => name.clone() }).collect::<Vec<_>>().join(" | ")));
+    let (name, answer) = did.unwrap_or_else(|| panic!("no tool turn: {}", format!("{} turns", turns.len())));
     assert_eq!(name, "workspace");
     assert!(matches!(answer, Some(Ok(_))), "{answer:?}");
     assert!(turns.iter().any(|t| matches!(t, Turn::Said(s) if s.contains("workspace is ready"))));
     assert!(!turns.iter().any(|t| matches!(t, Turn::Said(s) if s.contains("<function="))));
+}
+
+#[test]
+fn the_agent_chat_shows_the_reasoning_parser_output_as_thinking() {
+    use agent_ui::chat::Turn;
+    let mut h = harness("agent-reasoning", Tab::Chat);
+    {
+        let app = h.state_mut();
+        let script = Script { chunks: vec!["weigh the options\n".into(), "</think>\n\n".into(), "The answer is 42.".into()], ..script() };
+        let (factory, _) = ScriptedModel::factory_probed(script, inference_bench_core::specrt_chat::Thinking::OpensInPrompt);
+        app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), factory);
+        let m = app.library[0].clone();
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 10, "model never loaded", |a| a.loaded().is_some());
+    h.run();
+    let (desk, _asks) = agent_core::Desk::new(|| {});
+    h.state_mut().chat.agent.chat.ask("what is the answer", desk);
+    pump_until(&mut h, 20, "agent turn", |a| !a.chat.agent.chat.busy());
+    let turns = &h.state().chat.agent.chat.turns;
+    assert!(turns.iter().any(|t| matches!(t, Turn::Thinking(s) if s.contains("weigh the options"))), "no thinking turn in {} turns", turns.len());
+    assert!(turns.iter().any(|t| matches!(t, Turn::Said(s) if s.contains("The answer is 42.") && !s.contains("think>") && !s.contains("weigh"))));
+    assert!(!turns.iter().any(|t| matches!(t, Turn::Fault(_))));
+    let thoughts: Vec<String> = turns.iter().filter_map(|t| match t { Turn::Thinking(s) => Some(s.trim().to_string()), _ => None }).collect();
+    assert_eq!(thoughts, ["weigh the options"]);
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+fn screenshot_of_the_chat_with_thinking_and_a_tool_row() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness_sized("shots-chat", Tab::Chat, 800.0);
+    let work = dir("shots-chat-ws");
+    std::fs::create_dir_all(&work).unwrap();
+    {
+        let app = h.state_mut();
+        let factory: inference_bench_core::native::Factory = std::sync::Arc::new(|_, _| Ok(Box::new(XmlThenAnswer) as Box<dyn inference_bench_core::native::Model>));
+        app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), factory);
+        let m = app.library[0].clone();
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 10, "model never loaded", |a| a.loaded().is_some());
+    h.run();
+    let (desk, _asks) = agent_core::Desk::new(|| {});
+    {
+        let chat = &mut h.state_mut().chat.agent.chat;
+        chat.config.workspace = work.display().to_string();
+        chat.ask("check the workspace", desk);
+    }
+    pump_until(&mut h, 20, "agent turn", |a| !a.chat.agent.chat.busy());
+    h.run();
+    h.render().unwrap().save(out.join("chat-thinking-tool-composer.png")).unwrap();
 }
 
 fn slow_script() -> Script {
