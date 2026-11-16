@@ -1,0 +1,74 @@
+{
+  "name": "gemma3",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 128,
+    "intermediate": 256,
+    "vocab": 600,
+    "tie_embeddings": true,
+    "embed_scale": 11.313708498984761,
+    "logit_softcap": 30.0
+  },
+  "layers": {
+    "count": 6,
+    "pattern": [
+      "sliding",
+      "sliding",
+      "full"
+    ],
+    "window": 16
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6,
+    "unit_offset": true,
+    "sandwich": true
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 64,
+    "qkv_bias": false,
+    "qk_norm": true,
+    "softcap": 50.0,
+    "query_scalar": 48.0
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 1000000.0,
+    "local_theta": 10000.0
+  },
+  "mlp": {
+    "activation": "geglu"
+  },
+  "vision": {
+    "config": {
+      "depth": 2,
+      "hidden_size": 64,
+      "intermediate_size": 128,
+      "num_heads": 4,
+      "patch_size": 14,
+      "spatial_merge_size": 1,
+      "temporal_patch_size": 1,
+      "out_hidden_size": 128,
+      "num_position_embeddings": 16,
+      "in_channels": 3,
+      "hidden_act": "gelu_pytorch_tanh",
+      "tower": "pooled",
+      "image_size": 56,
+      "mm_tokens": 4,
+      "layer_norm_eps": 1e-6,
+      "bidirectional": true,
+      "placeholder": "<start_of_image>",
+      "wrap": "\n\n"
+    },
+    "tokens": {
+      "image": 592,
+      "video": 4294967295,
+      "start": 590,
+      "end": 591
+    }
+  }
+}

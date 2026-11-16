@@ -743,8 +743,14 @@ fn compressed_act(rule: &crate::family::FamilyQuant, g: &serde_json::Value) -> A
     crate::family::first_match(&rule.act_rules, g).unwrap_or(ActQuant::None)
 }
 
-fn compressed_group(rule: &crate::family::FamilyQuant, name: &str, g: &serde_json::Value) -> Result<Quant> {
-    match crate::family::first_match(&rule.group_rules, g) {
+fn compressed_group(rule: &crate::family::FamilyQuant, name: &str, g: &serde_json::Value, outer: &serde_json::Value) -> Result<Quant> {
+    let mut g = g.clone();
+    if g.get("format").is_none()
+        && let Some(f) = outer.get("format")
+    {
+        g["format"] = f.clone();
+    }
+    match crate::family::first_match(&rule.group_rules, &g) {
         Some(q) => Ok(q),
         None => bail!("{}", rule.group_error.replace("{name}", name)),
     }
@@ -769,13 +775,13 @@ fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, la
     if groups.len() == 1 {
         let (name, g) = groups.iter().next().unwrap();
         if g["targets"].as_array().is_some_and(|t| t.len() == 1 && t[0].as_str() == Some(rule.all_linear_target.as_str())) {
-            let quant = compressed_group(rule, name, g)?;
+            let quant = compressed_group(rule, name, g, q)?;
             let act = if quant.is_fp8() { compressed_act(rule, g) } else { ActQuant::None };
             return Ok(Quantization { quant, mlp: None, act, mlp_act: ActQuant::None });
         }
     }
     for (name, g) in groups {
-        let quant = compressed_group(rule, name, g)?;
+        let quant = compressed_group(rule, name, g, q)?;
         let group_act = compressed_act(rule, g);
         for t in g["targets"].as_array().context("group without targets")? {
             let t = t.as_str().context("target is not a string")?;

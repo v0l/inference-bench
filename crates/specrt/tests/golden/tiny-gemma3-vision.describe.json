@@ -1,0 +1,43 @@
+{
+  "name": "gemma3",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 128,
+    "intermediate": 256,
+    "vocab": 600,
+    "tie_embeddings": true,
+    "logit_softcap": 30.0
+  },
+  "layers": {
+    "count": 6,
+    "pattern": [
+      "sliding",
+      "sliding",
+      "full"
+    ],
+    "window": 16
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 64,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "softcap": 50.0,
+    "query_scalar": 48.0
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 1000000.0,
+    "local_theta": 10000.0
+  },
+  "mlp": {
+    "activation": "geglu"
+  }
+}

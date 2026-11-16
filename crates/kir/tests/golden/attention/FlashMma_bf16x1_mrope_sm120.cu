@@ -1,12 +1,13 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
 // attention FlashMma threads=256 smem=98304
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }) }, kv_layers: 16, kv_planes: 1, kv_fp8: false, kv_f16_layers: 0, query_scale: 0.0625, softcap: 30.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }) }, kv_layers: 16, kv_planes: 1, kv_fp8: false, kv_f16_layers: 0, query_scale: 0.0625, softcap: 30.0, local_theta: 10000.0, local_rope: [false, true, false, false], bidirectional: false }
 constexpr int ROT = 64;
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = true;
 constexpr bool LOCAL_ROPE[] = { false, true, false, false };
 constexpr float LOCAL_THETA = 1e4f;
 constexpr float QUERY_SCALE = 6.25e-2f;
+constexpr bool BIDI = false;
 constexpr float SOFTCAP = 3e1f;
 constexpr float THETA = 1e7f;
 constexpr int ROPE_KIND = 0;
@@ -176,6 +177,11 @@ __device__ __forceinline__ float rope_position(const int* mm_meta, const int* mm
     return (float)(idx + mm_meta[2 * slot + 1]);
 }
 
+__device__ __forceinline__ int span_end(const int* mm_meta, const int* bidi, int mm_stride, int slot, int idx) {
+    if (!BIDI) return idx;
+    return idx < mm_meta[2 * slot] ? max(idx, bidi[(size_t)slot * mm_stride + idx]) : idx;
+}
+
 __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, const float* k_norm,
                                                bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
                                                int pos, int layer, int head, int row,
@@ -267,7 +273,7 @@ __device__ __forceinline__ void mma_kv(float* c, const unsigned* ah, const unsig
 extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
                                      const bf16_t* v_cache, const int* block_table, const int* pos_ptr, int layer,
                                      bf16_t* out_hi, bf16_t* out_lo, int tokens,
-                                     const int* mm_meta, const int* mm_table, int mm_stride, int mm_slot, int window) {
+                                     const int* mm_meta, const int* mm_table, int mm_stride, int mm_slot, int window, const int* bidi) {
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = FM_BK * HEAD_DIM;
     static_assert(FM_BQ * HEAD_DIM * 2 <= FM_SMEM, "Q staging fits");
@@ -351,6 +357,12 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     int last = min(q0 + FM_BQ, tokens) - 1;
     int key_end = base + last + 1;
     int warp_last = base + q0 + warp * 16 + 15;
+    int span0 = span_end(mm_meta, bidi, mm_stride, mm_slot, pos0);
+    int span1 = span_end(mm_meta, bidi, mm_stride, mm_slot, pos1);
+    if (BIDI) {
+        key_end = min(max(key_end, span_end(mm_meta, bidi, mm_stride, mm_slot, base + last) + 1), base + tokens);
+        warp_last = max(warp_last, span_end(mm_meta, bidi, mm_stride, mm_slot, min(warp_last, base + tokens - 1)));
+    }
     int tiles = (key_end + FM_BK - 1) / FM_BK;
     auto load_kv = [&](int buf, int k0) {
         bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
@@ -423,7 +435,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             for (int e = 0; e < 4; e++) {
                 int key = k0 + nb * 8 + 2 * t + (e & 1);
                 int pos = e < 2 ? pos0 : pos1;
-                bool live = key <= pos && key < key_end && (window <= 0 || key > pos - window);
+                bool live = (key <= pos || key <= (e < 2 ? span0 : span1)) && key < key_end && (window <= 0 || key > pos - window);
                 float v = live ? (SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2) : NEG_INF;
                 s[nb][e] = v;
                 if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
