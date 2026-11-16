@@ -83,12 +83,21 @@ calls `gemm::select` directly; there is no per-op adapter.
 `Graph::vision_plan` lowers them per layer, and `VisionEncoder::run` executes the plan op by op. The splice
 into the LM is the `splice` head node (`when = "vision+tensor_core"`), after `embed`.
 
-## Not done
+## Fused residual plus norm: dropped, with a measurement
 
-- Residual plus norm through the fused `add_rmsnorm`. The GEMM residual epilogue fuses the add already.
-  A fused kernel needs a GEMM store variant of `o` and `down` on every path (mma, f8a, f4a, f8b, f4b)
-  and an `add_rmsnorm` that writes planes; the second pass costs about the traffic it saves, so it is
-  not in the graph yet.
+The GEMM residual epilogue already does the add, so the only thing a fused `add_rmsnorm` can remove is
+the separate norm pass's read of `x`. nsys of the 27B NVFP4 spec with MTP (`scripts/nsys617.sh`,
+`SEQS=1` and `SEQS=8`, 2048 context, 128 new tokens, 3 GB KV, desktop second card, 2026-11-16):
+
+| | kernel time | `rms_split` | `qk_norm_rope` |
+|---|---|---|---|
+| b1 | 1173.6 ms | 2.5% (6075 launches) | 0.2% |
+| b8 | 2049.4 ms | 1.8% (8100 launches) | 0.2% |
+
+`rms_split` is the whole input and post-attention norm including the bf16 plane split, so the share a fusion
+could save is a fraction of 2.5% (b1) and 1.8% (b8). It would also need a store-epilogue variant of `o` and
+`down` on every GEMM path (mma, f8a, f4a, f8b, f4b), and the extra `add_rmsnorm` pass costs the traffic it
+saves. The fusion is not built; `add_rmsnorm` stays in kir as a tested primitive.
 
 ## Prior art
 
