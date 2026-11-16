@@ -196,7 +196,8 @@ impl RuntimeStage {
     }
 
     pub fn unloaded_on(spec: &Spec, max_ctx: usize, slots: usize, device: usize) -> RuntimeStage {
-        Self::unloaded_with(spec, max_ctx, slots, device, Api::Cuda)
+        let api = if spec.runtime.backend == crate::spec::BackendChoice::Wgpu { Api::Wgpu } else { Api::Cuda };
+        Self::unloaded_with(spec, max_ctx, slots, device, api)
     }
 
     pub fn unloaded_with(spec: &Spec, max_ctx: usize, slots: usize, device: usize, api: Api) -> RuntimeStage {
