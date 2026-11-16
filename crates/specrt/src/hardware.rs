@@ -98,6 +98,12 @@ impl Machine {
         self.links.iter().find(|l| (l.a, l.b) == (a, b) || (l.a, l.b) == (b, a)).map_or(LinkKind::HostStaged, |l| l.kind)
     }
 
+    pub fn peer_link(&self, ordinal: usize) -> Option<LinkConfig> {
+        let kinds: Vec<LinkKind> = self.gpus.iter().filter(|g| g.ordinal != ordinal).map(|g| self.link_between(ordinal, g.ordinal)).collect();
+        let worst = if kinds.contains(&LinkKind::HostStaged) { LinkKind::HostStaged } else { *kinds.first()? };
+        Some(worst.config())
+    }
+
     pub fn devices(&self, excluded: &[usize]) -> Vec<DeviceConfig> {
         let mut out: Vec<DeviceConfig> = Vec::new();
         let mut previous: Option<usize> = None;
@@ -113,6 +119,8 @@ impl Machine {
                 reserve_gib: None,
                 link,
                 offload: None,
+                host: Some(self.host.clone()),
+                peer: self.peer_link(g.ordinal),
             });
             previous = Some(g.ordinal);
         }

@@ -143,6 +143,10 @@ pub fn encode_peer(peer: &Peer) -> Vec<String> {
             d.link.bandwidth_gbs,
             d.reserve_gib.map_or(String::new(), |r| r.to_string())
         ));
+        if let Some(p) = d.peer {
+            let last = txt.last_mut().expect("gpu entry");
+            last.push_str(&format!("|{}|{}", p.latency_ms, p.bandwidth_gbs));
+        }
     }
     txt
 }
@@ -174,6 +178,10 @@ fn parse_gpu(host: &str, i: usize, raw: &str) -> Result<PeerGpu> {
         Some(r) if !r.is_empty() => Some(number("reserve", r)?),
         _ => None,
     };
+    let peer = match (f.get(9), f.get(10)) {
+        (Some(l), Some(b)) => Some(LinkConfig { latency_ms: number("peer_lat", l)?, bandwidth_gbs: number("peer_bw", b)? }),
+        _ => None,
+    };
     Ok(PeerGpu {
         gpu_name: f[1].to_string(),
         device: DeviceConfig {
@@ -186,6 +194,8 @@ fn parse_gpu(host: &str, i: usize, raw: &str) -> Result<PeerGpu> {
             reserve_gib: reserve,
             link: LinkConfig { latency_ms: number("lat", f[6])?, bandwidth_gbs: number("link", f[7])? },
             offload: None,
+            host: Some(host.to_string()),
+            peer,
         },
     })
 }
@@ -381,6 +391,8 @@ mod tests {
                 d.ordinal = Some(i);
                 d.address = Some(format!("10.0.0.5:{}", 7600 + i));
                 d.reserve_gib = None;
+                d.host = Some(host.into());
+                d.peer = Some(LinkConfig { latency_ms: 0.01, bandwidth_gbs: 25.0 });
                 PeerGpu { device: d, gpu_name: "NVIDIA RTX PRO 6000".into() }
             })
             .collect();

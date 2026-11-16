@@ -71,6 +71,17 @@ pub fn preview(spec: &Spec, devices: Vec<DeviceConfig>, ctx: usize, slots: usize
     Preview { latency: run(Objective::Latency), throughput: run(Objective::Throughput), devices }
 }
 
+pub fn runnable_plan(spec: &Spec, devices: &[DeviceConfig], ctx: usize, slots: usize, objective: Objective) -> Result<Placement, String> {
+    let flat: Vec<DeviceConfig> = devices.iter().cloned().map(|mut d| {
+        d.host = None;
+        d
+    }).collect();
+    let config = PlacementConfig { objective, context: ctx, slots, devices: flat, ..PlacementConfig::default() };
+    let placement = config.place(spec).map_err(|e| format!("{e:#}"))?;
+    runnable(&placement)?;
+    Ok(placement)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StageRow {
     pub label: String,
@@ -80,6 +91,7 @@ pub struct StageRow {
     pub step_ms: f64,
     pub hop_ms: f64,
     pub hop: String,
+    pub needs_tensor_parallel: bool,
 }
 
 pub fn hop_label(previous: Option<&DeviceConfig>, current: &DeviceConfig, local_host: &str) -> String {
@@ -108,16 +120,23 @@ pub fn stage_rows(placement: &Placement, devices: &[DeviceConfig], local_host: &
             };
             previous = device;
             StageRow {
-                label: hardware::display_name(&s.device_name),
+                label: if s.tp > 1 { s.label() } else { hardware::display_name(&s.device_name) },
                 layers: format!("{}..{}", s.start, s.end),
                 gib: s.used_bytes() as f64 / GIB,
                 of_gib: s.memory_bytes as f64 / GIB,
                 step_ms: s.compute_secs * 1e3,
                 hop_ms: s.hop_secs * 1e3,
                 hop,
+                needs_tensor_parallel: s.tp > 1,
             }
         })
         .collect()
+}
+
+pub const TP_NOTE: &str = "needs tensor parallel (#658)";
+
+pub fn runnable(placement: &Placement) -> Result<(), String> {
+    placement.ensure_runnable().map_err(|e| format!("{e:#}"))
 }
 
 pub fn bottleneck(placement: &Placement) -> Option<String> {
@@ -165,7 +184,10 @@ pub fn is_remote(run: &Run) -> bool {
 
 pub fn prepare(run: &Run) -> Result<Prepared> {
     let key = specrt::pairing::ensure_key(run.key_file)?;
-    let mut devices = run.devices.to_vec();
+    let mut devices: Vec<DeviceConfig> = run.devices.iter().cloned().map(|mut d| {
+        d.host = None;
+        d
+    }).collect();
     let mut stages = Vec::new();
     let mut local = Vec::new();
     let mut used_peers = Vec::new();
@@ -287,11 +309,15 @@ mod tests {
         let p = preview(&spec(), devices.clone(), 2048, 1);
         for placement in [p.latency.as_ref().unwrap(), p.throughput.as_ref().unwrap()] {
             assert_eq!(placement.stages.iter().map(|s| s.layers()).sum::<usize>(), placement.layers);
-            assert!(placement.stages.len() >= 2);
             assert!(placement.step_secs > 0.0 && placement.bottleneck_secs > 0.0);
         }
-        let placement = p.latency.unwrap();
+        let grouped = stage_rows(p.latency.as_ref().unwrap(), &devices, "desk");
+        assert!(grouped.iter().any(|r| r.needs_tensor_parallel && r.label.contains("GPU 0+1 (tp 2)")));
+        assert!(runnable(p.latency.as_ref().unwrap()).is_err());
+        let placement = runnable_plan(&spec(), &devices, 2048, 1, Objective::Latency).unwrap();
+        assert!(placement.stages.len() >= 2);
         let rows = stage_rows(&placement, &devices, "desk");
+        assert!(rows.iter().all(|r| !r.needs_tensor_parallel));
         assert_eq!(rows[0].label, "desk / GPU 0");
         assert_eq!(rows[0].hop, "first stage");
         assert_eq!(rows[1].hop, "peer copy");
@@ -329,8 +355,7 @@ mod tests {
             g.free_bytes = 20 << 30;
         }
         let devices = candidate_devices(&local, &[], &Selection::default(), ClusterSettings::default().network_link());
-        let p = preview(&spec(), devices.clone(), 2048, 1);
-        let placement = p.latency.unwrap();
+        let placement = runnable_plan(&spec(), &devices, 2048, 1, Objective::Latency).unwrap();
         let dir = std::env::temp_dir().join(format!("cl-{}", std::process::id()));
         let run = Run { model_id: "m", ctx: 2048, slots: 1, placement: &placement, devices: &devices, local: &local, peers: &[], settings: &ClusterSettings::default(), key_file: &dir.join("cluster.key") };
         assert!(!is_remote(&run));
@@ -348,7 +373,7 @@ mod tests {
         let mut sel = Selection::default();
         sel.toggle_peer("spark");
         let devices = candidate_devices(&local, &peers, &sel, ClusterSettings::default().network_link());
-        let placement = preview(&spec(), devices.clone(), 2048, 1).latency.unwrap();
+        let placement = runnable_plan(&spec(), &devices, 2048, 1, Objective::Latency).unwrap();
         assert!(placement.stages.iter().any(|s| s.device_name.starts_with("spark")));
         let dir = std::env::temp_dir().join(format!("cl2-{}", std::process::id()));
         let run = Run { model_id: &fixture(), ctx: 2048, slots: 1, placement: &placement, devices: &devices, local: &local, peers: &[], settings: &ClusterSettings::default(), key_file: &dir.join("cluster.key") };
