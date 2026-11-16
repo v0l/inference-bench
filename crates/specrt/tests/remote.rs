@@ -59,6 +59,7 @@ fn device(name: &str, address: String) -> DeviceConfig {
         offload: None,
         host: None,
         peer: None,
+        wgpu: false,
     }
 }
 

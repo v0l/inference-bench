@@ -148,6 +148,9 @@ pub type FreeMemory = Arc<dyn Fn(usize) -> Result<u64> + Send + Sync>;
 
 pub fn live_free_memory() -> FreeMemory {
     Arc::new(|gpu| {
+        if let Some((_, free)) = specrt::hardware::unified_memory() {
+            return Ok(free);
+        }
         let cuda = specrt::hardware::probe().ok().and_then(|m| m.gpus.into_iter().find(|g| g.ordinal == gpu)).map(|g| g.free_bytes);
         match cuda {
             Some(free) => Ok(free),
@@ -267,6 +270,25 @@ mod tests {
         let err = client.assign(0, 64).unwrap_err().to_string();
         assert!(err.contains("tight-spark refuses layers 0-64"), "{err}");
         assert!(err.contains("6.0 GiB free"), "{err}");
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_metal_host_refuses_delta_net_layers_by_name_and_accepts_dense_ones() {
+        let d = dir("metal");
+        let file = HostFile { bind: "127.0.0.1:0".into(), mdns_port: 15630, ..HostFile::default() };
+        let mut machine = specrt::hardware::machine_from_adapters(vec![("Apple M1 Pro".into(), specrt::hardware::GpuBackend::Metal)], Some((16 << 30, 12 << 30))).unwrap();
+        machine.host = "macbook".into();
+        let running = start_with(&file, &d, machine, Arc::new(|_| Ok(12u64 << 30))).unwrap();
+        let control = running.control_addr().to_string();
+        let key = specrt::pairing::generate_key().unwrap();
+        let code = request_code(running.socket()).unwrap().0;
+        pair_with(&control, &code, &key).unwrap();
+        let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures");
+        let hybrid = fixtures.join("qwen3.8-27b.toml").display().to_string();
+        let err = specrt::host::request_stages(&control, &key, &hybrid, 512, 1, &[0]).unwrap_err().to_string();
+        assert!(err.contains("macbook runs the Metal/wgpu backend and refuses"), "{err}");
+        assert!(err.contains("delta-net") && err.contains("#491"), "{err}");
         let _ = std::fs::remove_dir_all(d);
     }
 

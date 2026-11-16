@@ -311,7 +311,7 @@ mod tests {
         let mut d = machine.devices(&[]).remove(0);
         d.memory_gib = gib;
         d.address = Some(":7600".into());
-        Peer { version: ANNOUNCEMENT_VERSION, host: host.into(), app_version: Some("x".into()), busy: false, serving: None, control: Some("10.0.0.7:7599".into()), gpus: vec![PeerGpu { device: d, gpu_name: "NVIDIA GB10".into() }] }
+        Peer { version: ANNOUNCEMENT_VERSION, host: host.into(), app_version: Some("x".into()), busy: false, serving: None, control: Some("10.0.0.7:7599".into()), gpus: vec![PeerGpu { device: d, gpu_name: "NVIDIA GB10".into(), backend: specrt::hardware::GpuBackend::Cuda }] }
     }
 
     fn small_local() -> Machine {

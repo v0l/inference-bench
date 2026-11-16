@@ -1823,7 +1823,7 @@ fn fake_peer(host: &str, gib: f64, busy: bool) -> specrt::cluster::Peer {
         busy,
         serving: busy.then(|| "Qwen3-0.6B".to_string()),
         control: Some("10.0.0.7:7599".into()),
-        gpus: vec![specrt::cluster::PeerGpu { device: d, gpu_name: "NVIDIA GB10".into() }],
+        gpus: vec![specrt::cluster::PeerGpu { device: d, gpu_name: "NVIDIA GB10".into(), backend: specrt::hardware::GpuBackend::Cuda }],
     }
 }
 

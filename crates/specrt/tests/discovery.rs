@@ -76,6 +76,7 @@ fn device(name: &str, address: Option<String>) -> DeviceConfig {
         offload: None,
         host: None,
         peer: None,
+        wgpu: false,
     }
 }
 
@@ -352,7 +353,7 @@ fn two_app_instances_see_each_other_with_all_gpus_and_busy_state() {
         let mut d = device(&specrt::hardware::device_name(host, i), None);
         d.ordinal = Some(i);
         d.reserve_gib = None;
-        PeerGpu { device: d, gpu_name: "NVIDIA RTX PRO 6000".into() }
+        PeerGpu { device: d, gpu_name: "NVIDIA RTX PRO 6000".into(), backend: specrt::hardware::GpuBackend::Cuda }
     };
     let peer = |host: &str, busy: bool| Peer {
         version: ANNOUNCEMENT_VERSION,

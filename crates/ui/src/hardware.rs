@@ -8,7 +8,7 @@ use inference_bench_core::engine::Command;
 use inference_bench_core::library::human_size;
 use specrt::cluster::Peer;
 use specrt::discovery::{PeerBrowser, PeerEvent};
-use specrt::hardware::{Machine, display_name, short_gpu};
+use specrt::hardware::{Machine, display_name};
 use specrt::host::{Host, HostConfig};
 use specrt::placement::{DeviceConfig, Objective};
 use std::collections::BTreeMap;
@@ -101,7 +101,7 @@ pub fn gpu_lines(m: &Machine) -> Vec<String> {
             format!(
                 "GPU {}  {}  {}  {} total  {} free  {:.0} GB/s  {:.0} TFLOP/s",
                 g.ordinal,
-                short_gpu(&g.name),
+                g.label(),
                 g.arch(),
                 human_size(g.total_bytes),
                 human_size(g.free_bytes),

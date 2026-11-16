@@ -58,6 +58,8 @@ pub struct DeviceConfig {
     pub host: Option<String>,
     #[serde(default)]
     pub peer: Option<LinkConfig>,
+    #[serde(default)]
+    pub wgpu: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +220,7 @@ pub struct Device {
     pub ordinals: Vec<usize>,
     pub allreduce_latency: f64,
     pub allreduce_bandwidth: f64,
+    pub wgpu: bool,
 }
 
 impl Device {
@@ -247,6 +250,7 @@ impl Device {
             ordinals: members.iter().map(|m| m.1.ordinal.unwrap_or(m.0)).collect(),
             allreduce_latency: inner.iter().map(|m| m.1.peer_latency).fold(0.0, f64::max),
             allreduce_bandwidth: inner.iter().map(|m| m.1.peer_bandwidth).fold(f64::INFINITY, f64::min),
+            wgpu: first.wgpu,
         }
     }
 
@@ -270,6 +274,7 @@ impl Device {
             ordinals: Vec::new(),
             allreduce_latency: 0.0,
             allreduce_bandwidth: f64::INFINITY,
+            wgpu: c.wgpu,
         }
     }
 }
@@ -290,6 +295,7 @@ pub struct CostModel {
     pub context: usize,
     pub slots: usize,
     layers: Vec<LayerCost>,
+    pub wgpu_blocker: Option<String>,
     embedding_bytes: u64,
     head_bytes: u64,
     head_flops: f64,
@@ -341,6 +347,7 @@ impl CostModel {
             context,
             slots,
             layers,
+            wgpu_blocker: crate::wgsl::unsupported(&Spec { mtp: None, ..spec.clone() }),
             embedding_bytes: 2 * matrix,
             head_bytes: quant_bytes(matrix, anatomy.head_quant),
             head_flops: FLOPS_PER_PARAM * matrix as f64 * rows,
@@ -588,6 +595,11 @@ fn fit_stage(model: &CostModel, device_index: usize, device: &Device, start: usi
     let n = model.layers.len();
     let tp = device.tp.max(1);
     let share = |bytes: u64| bytes.div_ceil(tp as u64);
+    if device.wgpu
+        && let Some(why) = &model.wgpu_blocker
+    {
+        return Err(format!("{} runs on the wgpu backend and can't take layers of {}: {why} (#491)", device.name, model.name));
+    }
     let slice = &model.layers[start..end];
     let mut weights: u64 = slice.iter().map(|l| l.weight_bytes).sum();
     if start == 0 {
@@ -886,7 +898,7 @@ mod tests {
         let spec = fixture("qwen3.8-27b-exact.toml");
         let mut config = PlacementConfig { context: 2048, slots: 1, ..PlacementConfig::default() };
         for i in 0..2 {
-            config.devices.push(DeviceConfig { name: format!("box/gpu{i}"), memory_gib: 20.0, bandwidth_gbs: 1792.0, tflops: 500.0, ordinal: Some(i), address: None, reserve_gib: Some(0.0), link: LinkConfig::default(), offload: None, host: Some("box".into()), peer: Some(LinkConfig::default()) });
+            config.devices.push(DeviceConfig { name: format!("box/gpu{i}"), memory_gib: 20.0, bandwidth_gbs: 1792.0, tflops: 500.0, ordinal: Some(i), address: None, reserve_gib: Some(0.0), link: LinkConfig::default(), offload: None, host: Some("box".into()), peer: Some(LinkConfig::default()), wgpu: false });
         }
         let open = config.place(&spec).unwrap();
         config.max_tp = Some(1);
@@ -930,6 +942,7 @@ mod tests {
             offload: None,
             host: None,
             peer: None,
+            wgpu: false,
         })
     }
 
@@ -939,6 +952,23 @@ mod tests {
 
     fn qwen3() -> Spec {
         Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/qwen3-0.6b.toml")).unwrap()
+    }
+
+    #[test]
+    fn a_wgpu_device_is_never_given_layers_the_backend_cannot_run() {
+        let mut metal = device("mac", 12.0, 200.0);
+        metal.wgpu = true;
+        let cuda = device("desk", 96.0, 1800.0);
+        let hybrid = CostModel::new(&qwen27(), 4096, 1);
+        assert!(hybrid.wgpu_blocker.as_deref().is_some_and(|w| w.contains("delta-net")));
+        let p = plan(&hybrid, &[metal.clone(), cuda.clone()], Objective::Latency).unwrap();
+        assert!(p.stages.iter().all(|s| s.device_name == "desk"), "{}", p.render());
+        let only = plan(&hybrid, &[metal.clone()], Objective::Latency).unwrap_err().to_string();
+        assert!(only.contains("mac") && only.contains("wgpu") && only.contains("delta-net"), "{only}");
+        let dense = CostModel::new(&qwen3(), 2048, 1);
+        assert!(dense.wgpu_blocker.is_none());
+        let p = plan(&dense, &[metal], Objective::Latency).unwrap();
+        assert_eq!(p.stages[0].device_name, "mac");
     }
 
     fn covers(p: &Placement, layers: usize) {

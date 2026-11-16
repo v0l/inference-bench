@@ -2,7 +2,7 @@ use crate::cluster::{ANNOUNCEMENT_VERSION, Peer, PeerGpu};
 use crate::discovery::PeerAnnouncer;
 use crate::hardware::{self, Machine};
 use crate::pairing::{self, Offer};
-use crate::stage::{MemoryGuard, RuntimeStage};
+use crate::stage::{Api, MemoryGuard, RuntimeStage};
 use crate::wire::{StageServer, hmac_sha256};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -22,10 +22,26 @@ pub fn spawn_stage(model: &str, ctx: usize, slots: usize, gpu: usize, key: &[u8]
     spawn_stage_guarded(model, ctx, slots, gpu, key, bind, None)
 }
 
+pub fn wgpu_refusal(host: &str, spec: &crate::spec::Spec) -> Option<String> {
+    let mut plain = spec.clone();
+    plain.mtp = None;
+    crate::wgsl::unsupported(&plain).map(|why| format!("{host} runs the Metal/wgpu backend and refuses {}: {why} (#491)", spec.name))
+}
+
 pub fn spawn_stage_guarded(model: &str, ctx: usize, slots: usize, gpu: usize, key: &[u8], bind: &str, guard: Option<MemoryGuard>) -> Result<HostedStage> {
+    spawn_stage_on(model, ctx, slots, gpu, Api::Cuda, "this machine", key, bind, guard)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_stage_on(model: &str, ctx: usize, slots: usize, gpu: usize, api: Api, host: &str, key: &[u8], bind: &str, guard: Option<MemoryGuard>) -> Result<HostedStage> {
     let mut spec = crate::engine::resolve_spec(model).with_context(|| model.to_string())?;
     spec.mtp = None;
-    let stage = Arc::new(RuntimeStage::unloaded_on(&spec, ctx, slots, gpu));
+    if api == Api::Wgpu
+        && let Some(why) = wgpu_refusal(host, &spec)
+    {
+        bail!("{why}");
+    }
+    let stage = Arc::new(RuntimeStage::unloaded_with(&spec, ctx, slots, gpu, api));
     stage.guard_memory(guard);
     let server = StageServer::start(bind, key, stage.clone())?;
     Ok(HostedStage { server, stage })
@@ -91,7 +107,7 @@ fn peer_of(config: &HostConfig, s: &State) -> Peer {
         .iter()
         .filter(|g| s.shared.contains(&g.ordinal))
         .zip(devices)
-        .map(|(g, device)| PeerGpu { device, gpu_name: g.name.clone() })
+        .map(|(g, device)| PeerGpu { device, gpu_name: g.name.clone(), backend: g.backend })
         .collect();
     Peer { version: ANNOUNCEMENT_VERSION, host: s.machine.host.clone(), app_version: Some(config.app_version.clone()), busy: s.busy, serving: s.serving.clone(), control: None, gpus }
 }
@@ -179,7 +195,8 @@ fn run(state: &Arc<Mutex<State>>, request: Request, key: &[u8], local_ip: std::n
             let mut addrs = Vec::new();
             for gpu in gpus {
                 ensure!(s.shared.contains(&gpu), "GPU {gpu} is not shared by this machine");
-                let hosted = spawn_stage_guarded(&model, ctx, slots, gpu, key, &format!("{local_ip}:0"), guard.clone())?;
+                let api = s.machine.gpus.iter().find(|g| g.ordinal == gpu).map_or(Api::Cuda, |g| if g.backend.is_wgpu() { Api::Wgpu } else { Api::Cuda });
+                let hosted = spawn_stage_on(&model, ctx, slots, gpu, api, &s.machine.host, key, &format!("{local_ip}:0"), guard.clone())?;
                 addrs.push(hosted.server.addr().to_string());
                 s.stages.push(hosted);
             }

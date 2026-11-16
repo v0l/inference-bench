@@ -32,8 +32,8 @@ struct LayerBuffers<B: Backend> {
     o: WMat<B>,
     gate_up: WMat<B>,
     down: WMat<B>,
-    k_cache: B::Buffer,
-    v_cache: B::Buffer,
+    k_cache: Vec<B::Buffer>,
+    v_cache: Vec<B::Buffer>,
 }
 
 struct Scratch<B: Backend> {
@@ -50,10 +50,13 @@ struct Scratch<B: Backend> {
 struct Model<B: Backend> {
     spec: Spec,
     max_ctx: usize,
-    embed: WMat<B>,
+    slots: usize,
+    first: bool,
+    last: bool,
+    embed: Option<WMat<B>>,
     layers: Vec<LayerBuffers<B>>,
-    final_norm: B::Buffer,
-    head: WMat<B>,
+    final_norm: Option<B::Buffer>,
+    head: Option<WMat<B>>,
     scratch: Scratch<B>,
     weight_bytes: u64,
     prefill: Plan,
@@ -102,6 +105,7 @@ fn upload_floats<B: Backend>(be: &B, v: &[f32]) -> Result<B::Buffer> {
 }
 
 struct Step {
+    slot: usize,
     pos0: usize,
     rows: usize,
     head: Range<usize>,
@@ -134,7 +138,7 @@ impl<B: Backend> Exec<'_, B> {
             Weight::O => &l().o,
             Weight::GateUp => &l().gate_up,
             Weight::Down => &l().down,
-            Weight::LmHead => &self.m.head,
+            Weight::LmHead => self.m.head.as_ref().expect("the last stage owns the head"),
             other => unreachable!("{} is not on wgpu", other.name()),
         }
     }
@@ -160,12 +164,13 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
         let kernels = wgsl::kernels_for(op, spec, rows)?;
         let r = rows as u32;
         match *op {
-            Op::Embed => be.dispatch(kernels[0], &[&m.scratch.tokens, &m.embed.data, &m.embed.rows, &m.scratch.x], [0, run.pos0 as u32, 0, 0, 0, 0, 0, 0], [r, 1, 1]),
+            Op::Embed => be.dispatch(kernels[0], &[&m.scratch.tokens, &m.embed.as_ref().expect("the first stage owns the embedding").data, &m.embed.as_ref().expect("the first stage owns the embedding").rows, &m.scratch.x], [0, run.pos0 as u32, 0, 0, 0, 0, 0, 0], [r, 1, 1]),
             Op::Norm { which, into } => {
                 let w = match which {
                     NormKind::Input => &l.expect("layer norm needs a layer").ln1,
                     NormKind::PostAttention => &l.expect("layer norm needs a layer").ln2,
-                    NormKind::Final => &m.final_norm,
+                    NormKind::Final => m.final_norm.as_ref().expect("the last stage owns the final norm"),
+                    NormKind::PreMlp | NormKind::PostMlp => bail!("sandwich norms are not yet on wgpu"),
                 };
                 be.dispatch(kernels[0], &[&m.scratch.x, w, self.buf(into)], [row0 as u32, 0, 0, 0, 0, 0, 0, 0], [r, 1, 1])
             }
@@ -183,13 +188,14 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             Op::KvRope | Op::QkRope => {
                 let l = l.expect("rope needs a layer");
                 let a = &spec.attention;
-                be.dispatch(kernels[0], &[&m.scratch.qkv, &l.q_norm, &l.k_norm, &l.k_cache, &l.v_cache], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [(a.heads + 2 * a.kv_heads) as u32, r, 1])
+                be.dispatch(kernels[0], &[&m.scratch.qkv, &l.q_norm, &l.k_norm, &l.k_cache[run.slot], &l.v_cache[run.slot]], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [(a.heads + 2 * a.kv_heads) as u32, r, 1])
             }
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention => {
                 let l = l.expect("attention needs a layer");
-                be.dispatch(kernels[0], &[&m.scratch.qkv, &l.k_cache, &l.v_cache, &m.scratch.attn], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r, 1])
+                be.dispatch(kernels[0], &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r, 1])
             }
             Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),
+            Op::NormAdd { .. } | Op::Clear { .. } | Op::Split { .. } | Op::QkNorm | Op::ScaledAdd { .. } | Op::LogitScale | Op::LogitSoftcap => bail!("{} is not yet on wgpu", op.label()),
             Op::Splice => bail!("vision is not yet on wgpu"),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => bail!("delta-net is not yet on wgpu"),
             Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => bail!("MTP is not yet on wgpu"),
@@ -211,29 +217,69 @@ fn mat<B: Backend>(be: &B, m: &Matrix, nrows: usize, cols: usize, what: &str) ->
     upload_rows(be, rows_of(m, nrows, cols, what)?, nrows, what)
 }
 
+pub enum StageInput<'a> {
+    Tokens(&'a [u32]),
+    Hidden(&'a [f32]),
+}
+
+pub enum StageOutput {
+    Token(u32),
+    Hidden(Vec<f32>),
+}
+
+fn stage_plan(spec: &Spec, phase: Phase, first: bool, last: bool) -> Plan {
+    let mut plan = wgsl::plan(spec, phase);
+    if !first {
+        plan.head.clear();
+    }
+    if !last {
+        plan.tail.clear();
+    }
+    plan
+}
+
 impl<B: Backend> Dense<B> {
-    pub fn load(mut be: B, spec: &Spec, max_ctx: usize) -> Result<Self> {
+    pub fn load(be: B, spec: &Spec, max_ctx: usize) -> Result<Self> {
+        Self::load_stage(be, spec, max_ctx, 1, 0, spec.layers.count)
+    }
+
+    pub fn load_stage(mut be: B, spec: &Spec, max_ctx: usize, slots: usize, start: usize, end: usize) -> Result<Self> {
         let spec = &crate::engine::apply_rope_extension(spec)?;
         if let Some(why) = wgsl::unsupported(spec) {
             bail!("{} is not supported on backend wgpu: {why}", spec.name);
         }
+        ensure!(start < end && end <= spec.layers.count && slots >= 1, "stage layers {start}..{end} with {slots} slots do not fit the {} layers of {}", spec.layers.count, spec.name);
+        let (first, last) = (start == 0, end == spec.layers.count);
+        let staged = if first && last { spec.clone() } else { spec.stage(start, end) };
         let limits = be.limits();
         ensure!(limits.max_storage_buffers >= 5, "this adapter allows {} storage buffers per stage, specrt needs 5", limits.max_storage_buffers);
-        be.compile(&wgsl::generate(spec, max_ctx, &limits.target())?)?;
+        be.compile(&wgsl::generate(&staged, max_ctx, &limits.target())?)?;
         let checkpoint = Checkpoint::for_repo(&spec.repo)?;
         let d = &spec.dims;
         let a = &spec.attention;
-        let out = checkpoint.outside(spec)?;
-        let embed = upload_rows(&be, DeviceRows::from_bf16(&out.embed, d.hidden)?, d.vocab, "embed")?;
-        let head = mat(&be, &out.lm_head, d.vocab, d.hidden, "lm_head")?;
-        let final_norm = upload_floats(&be, &out.norm)?;
+        let (mut embed, mut head, mut final_norm, mut weight_bytes) = (None, None, None, 0);
+        if first || last {
+            let out = checkpoint.outside(spec)?;
+            if first {
+                let e = upload_rows(&be, DeviceRows::from_bf16(&out.embed, d.hidden)?, d.vocab, "embed")?;
+                weight_bytes += e.bytes;
+                embed = Some(e);
+            }
+            if last {
+                let h = mat(&be, &out.lm_head, d.vocab, d.hidden, "lm_head")?;
+                weight_bytes += h.bytes;
+                head = Some(h);
+                final_norm = Some(upload_floats(&be, &out.norm)?);
+            }
+        }
         let kv_floats = a.kv_heads * max_ctx * a.head_dim;
-        let mut layers = Vec::with_capacity(spec.layers.count);
-        let mut weight_bytes = embed.bytes + head.bytes;
-        for i in 0..spec.layers.count {
-            let l = checkpoint.layer(spec, i).with_context(|| format!("layer {i}"))?;
-            let Mixer::Attention(at) = &l.mixer else { bail!("layer {i} is not attention, which is the only mixer on wgpu") };
+        let mut layers = Vec::with_capacity(end - start);
+        for i in 0..end - start {
+            let global = start + i;
+            let l = checkpoint.layer_at(&staged, i, global).with_context(|| format!("layer {global}"))?;
+            let Mixer::Attention(at) = &l.mixer else { bail!("layer {global} is not attention, which is the only mixer on wgpu") };
             let norm = |v: &Option<Vec<f32>>| -> Result<B::Buffer> { upload_floats(&be, v.as_deref().unwrap_or(&[0.0; 4])) };
+            let caches = |be: &B| -> Result<Vec<B::Buffer>> { (0..slots).map(|_| be.alloc(kv_floats as u64 * 4)).collect() };
             let lb = LayerBuffers {
                 ln1: upload_floats(&be, &l.ln1)?,
                 ln2: upload_floats(&be, &l.ln2)?,
@@ -244,8 +290,8 @@ impl<B: Backend> Dense<B> {
                 o: mat(&be, &at.o, d.hidden, spec.q_dim(), "o")?,
                 gate_up: mat(&be, &l.gate_up, 2 * d.intermediate, d.hidden, "gate_up")?,
                 down: mat(&be, &l.down, d.hidden, d.intermediate, "down")?,
-                k_cache: be.alloc(kv_floats as u64 * 4)?,
-                v_cache: be.alloc(kv_floats as u64 * 4)?,
+                k_cache: caches(&be)?,
+                v_cache: caches(&be)?,
             };
             weight_bytes += lb.qkv.bytes + lb.o.bytes + lb.gate_up.bytes + lb.down.bytes;
             layers.push(lb);
@@ -258,10 +304,67 @@ impl<B: Backend> Dense<B> {
             attn: be.alloc((rows * spec.q_dim() * 4) as u64)?,
             gate_up: be.alloc((rows * 2 * d.intermediate * 4) as u64)?,
             act: be.alloc((rows * d.intermediate * 4) as u64)?,
-            logits: be.alloc((rows * d.vocab * 4) as u64).context("logits buffer")?,
+            logits: be.alloc(if last { (rows * d.vocab * 4) as u64 } else { 16 }).context("logits buffer")?,
             tokens: be.alloc(((max_ctx + 2) * 4) as u64)?,
         };
-        Ok(Dense { be, m: Model { spec: spec.clone(), max_ctx, embed, layers, final_norm, head, scratch, weight_bytes, prefill: wgsl::plan(spec, Phase::Prefill), decode: wgsl::plan(spec, Phase::Decode) } })
+        let prefill = stage_plan(&staged, Phase::Prefill, first, last);
+        let decode = stage_plan(&staged, Phase::Decode, first, last);
+        Ok(Dense { be, m: Model { spec: staged, max_ctx, slots, first, last, embed, layers, final_norm, head, scratch, weight_bytes, prefill, decode } })
+    }
+
+    pub fn hidden(&self) -> usize {
+        self.m.spec.dims.hidden
+    }
+
+    pub fn stage_forward(&mut self, slot: usize, pos0: usize, input: StageInput<'_>, decode: bool, sample: bool) -> Result<StageOutput> {
+        let Self { be, m } = self;
+        ensure!(slot < m.slots, "slot {slot} out of {}", m.slots);
+        let hidden = m.spec.dims.hidden;
+        let n = match &input {
+            StageInput::Tokens(t) => {
+                ensure!(m.first, "this stage has no embedding, send hidden rows");
+                t.len()
+            }
+            StageInput::Hidden(h) => {
+                ensure!(!m.first, "this stage owns the embedding, send token ids");
+                ensure!(!h.is_empty() && h.len() % hidden == 0, "hidden state of {} floats", h.len());
+                h.len() / hidden
+            }
+        };
+        ensure!(n >= 1 && pos0 + n <= m.max_ctx, "{n} rows at position {pos0} exceed max_ctx {}", m.max_ctx);
+        let plan = if decode { &m.decode } else { &m.prefill };
+        let mut carried = Vec::new();
+        let mut token = 0;
+        let mut c0 = 0;
+        while c0 < n {
+            let rows = PREFILL_CHUNK.min(n - c0);
+            let last_chunk = c0 + rows == n;
+            match &input {
+                StageInput::Tokens(t) => be.upload(&m.scratch.tokens, ((pos0 + c0) * 4) as u64, &words(&t[c0..c0 + rows])),
+                StageInput::Hidden(h) => be.upload(&m.scratch.x, 0, &floats(&h[c0 * hidden..(c0 + rows) * hidden])),
+            }
+            let sampled = m.last && sample && last_chunk;
+            let head = if sampled { rows - 1..rows } else { 0..0 };
+            let exec = Exec { be: RefCell::new(&mut *be), m };
+            crate::executor::run_plan(&exec, plan, &Step { slot, pos0: pos0 + c0, rows, head }, &mut |_| Ok(()))?;
+            if sampled {
+                Self::argmax(be, m, Sampling::GREEDY, 0, m.max_ctx + 1)?;
+            }
+            be.submit()?;
+            if sampled {
+                let bytes = be.download(&m.scratch.tokens, ((m.max_ctx + 1) * 4) as u64, 4)?;
+                token = u32::from_le_bytes(bytes[..4].try_into().expect("4 bytes"));
+            } else if !m.last {
+                let bytes = be.download(&m.scratch.x, 0, (rows * hidden * 4) as u64)?;
+                carried.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes"))));
+            }
+            c0 += rows;
+        }
+        Ok(if m.last { StageOutput::Token(token) } else { StageOutput::Hidden(carried) })
+    }
+
+    pub fn stage_role(&self) -> (bool, bool) {
+        (self.m.first, self.m.last)
     }
 
     pub fn description(&self) -> String {
@@ -285,9 +388,9 @@ impl<B: Backend> Dense<B> {
         be.dispatch("argmax", &[&m.scratch.logits, &m.scratch.tokens], [0, inv, sampling.seed, step as u32, slot as u32, 0, 0, 0], [1, 1, 1])
     }
 
-    fn run(be: &mut B, m: &Model<B>, plan: &Plan, pos0: usize, rows: usize, head: Range<usize>) -> Result<()> {
+    fn run(be: &mut B, m: &Model<B>, plan: &Plan, slot: usize, pos0: usize, rows: usize, head: Range<usize>) -> Result<()> {
         let exec = Exec { be: RefCell::new(be), m };
-        crate::executor::run_plan(&exec, plan, &Step { pos0, rows, head }, &mut |_| Ok(()))
+        crate::executor::run_plan(&exec, plan, &Step { slot, pos0, rows, head }, &mut |_| Ok(()))
     }
 
     fn prefill(&mut self, prompt: &[u32], all_logits: bool, sampling: Sampling) -> Result<Vec<f32>> {
@@ -301,7 +404,7 @@ impl<B: Backend> Dense<B> {
             let rows = PREFILL_CHUNK.min(n - c0);
             let last = c0 + rows == n;
             let head = if all_logits { 0..rows } else if last { rows - 1..rows } else { 0..0 };
-            Self::run(be, m, &m.prefill, c0, rows, head)?;
+            Self::run(be, m, &m.prefill, 0, c0, rows, head)?;
             if all_logits {
                 be.submit()?;
                 let bytes = be.download(&m.scratch.logits, 0, (rows * vocab * 4) as u64)?;
@@ -318,7 +421,7 @@ impl<B: Backend> Dense<B> {
     }
 
     fn decode_step(be: &mut B, m: &Model<B>, pos: usize, sampling: Sampling) -> Result<()> {
-        Self::run(be, m, &m.decode, pos, 1, 0..1)?;
+        Self::run(be, m, &m.decode, 0, pos, 1, 0..1)?;
         Self::argmax(be, m, sampling, pos, pos + 1)
     }
 

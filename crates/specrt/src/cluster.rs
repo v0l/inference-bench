@@ -76,6 +76,7 @@ pub fn decode_announcement(txt: &[String]) -> Result<(DeviceConfig, String)> {
         offload: None,
         host: None,
         peer: None,
+        wgpu: false,
     };
     Ok((device, text("addr")?))
 }
@@ -87,6 +88,7 @@ pub const ANNOUNCEMENT_VERSION: u32 = 2;
 pub struct PeerGpu {
     pub device: DeviceConfig,
     pub gpu_name: String,
+    pub backend: crate::hardware::GpuBackend,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -102,7 +104,7 @@ pub struct Peer {
 
 impl Peer {
     pub fn summary(&self) -> String {
-        crate::hardware::summarize(&self.host, &self.gpus.iter().map(|g| g.gpu_name.as_str()).collect::<Vec<_>>())
+        crate::hardware::summarize_labels(&self.host, &self.gpus.iter().map(|g| crate::hardware::gpu_label(&g.gpu_name, g.backend)).collect::<Vec<_>>())
     }
 
     pub fn memory_gib(&self) -> f64 {
@@ -147,6 +149,9 @@ pub fn encode_peer(peer: &Peer) -> Vec<String> {
             let last = txt.last_mut().expect("gpu entry");
             last.push_str(&format!("|{}|{}", p.latency_ms, p.bandwidth_gbs));
         }
+        if g.backend.is_wgpu() {
+            txt.push(format!("be{i}={}", g.backend.key()));
+        }
     }
     txt
 }
@@ -160,7 +165,7 @@ fn field_map(txt: &[String]) -> Result<BTreeMap<String, String>> {
     Ok(fields)
 }
 
-fn parse_gpu(host: &str, i: usize, raw: &str) -> Result<PeerGpu> {
+fn parse_gpu(host: &str, i: usize, raw: &str, backend: crate::hardware::GpuBackend) -> Result<PeerGpu> {
     let f: Vec<&str> = raw.split('|').collect();
     if f.len() < 8 {
         bail!("announcement gpu {i} has {} fields, expected 8 or more", f.len());
@@ -183,6 +188,7 @@ fn parse_gpu(host: &str, i: usize, raw: &str) -> Result<PeerGpu> {
         _ => None,
     };
     Ok(PeerGpu {
+        backend,
         gpu_name: f[1].to_string(),
         device: DeviceConfig {
             name: crate::hardware::device_name(host, ordinal),
@@ -196,6 +202,7 @@ fn parse_gpu(host: &str, i: usize, raw: &str) -> Result<PeerGpu> {
             offload: None,
             host: Some(host.to_string()),
             peer,
+            wgpu: backend.is_wgpu(),
         },
     })
 }
@@ -207,7 +214,7 @@ pub fn decode_peer(txt: &[String]) -> Result<Peer> {
         let host = device.name.clone();
         let mut device = device;
         device.address = Some(address);
-        return Ok(Peer { version: 1, host, app_version: None, busy: false, serving: None, control: None, gpus: vec![PeerGpu { gpu_name: device.name.clone(), device }] });
+        return Ok(Peer { version: 1, host, app_version: None, busy: false, serving: None, control: None, gpus: vec![PeerGpu { gpu_name: device.name.clone(), device, backend: crate::hardware::GpuBackend::Cuda }] });
     };
     let version: u32 = version.parse().map_err(|_| anyhow!("announcement version {version:?} is not a number"))?;
     let host = fields.get("host").cloned().filter(|h| !h.is_empty()).ok_or_else(|| anyhow!("announcement lacks host"))?;
@@ -216,7 +223,10 @@ pub fn decode_peer(txt: &[String]) -> Result<Peer> {
         bail!("announcement lists {count} gpus");
     }
     let gpus = (0..count)
-        .map(|i| parse_gpu(&host, i, fields.get(&format!("g{i}")).ok_or_else(|| anyhow!("announcement lacks g{i}"))?))
+        .map(|i| {
+            let backend = fields.get(&format!("be{i}")).map_or(crate::hardware::GpuBackend::Cuda, |b| crate::hardware::GpuBackend::from_key(b));
+            parse_gpu(&host, i, fields.get(&format!("g{i}")).ok_or_else(|| anyhow!("announcement lacks g{i}"))?, backend)
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(Peer {
         version,
@@ -350,6 +360,7 @@ mod tests {
             offload: None,
             host: None,
             peer: None,
+            wgpu: false,
         }
     }
 
@@ -393,7 +404,7 @@ mod tests {
                 d.reserve_gib = None;
                 d.host = Some(host.into());
                 d.peer = Some(LinkConfig { latency_ms: 0.01, bandwidth_gbs: 25.0 });
-                PeerGpu { device: d, gpu_name: "NVIDIA RTX PRO 6000".into() }
+                PeerGpu { device: d, gpu_name: "NVIDIA RTX PRO 6000".into(), backend: crate::hardware::GpuBackend::Cuda }
             })
             .collect();
         Peer { version: ANNOUNCEMENT_VERSION, host: host.into(), app_version: Some("0.4.0".into()), busy: true, serving: Some("Qwen3-0.6B".into()), control: Some("10.0.0.5:7599".into()), gpus }
@@ -418,6 +429,27 @@ mod tests {
         assert_eq!(p.gpus.len(), 1);
         assert_eq!(p.gpus[0].device.address.as_deref(), Some("10.0.0.9:7600"));
         assert_eq!(p.gpus[0].device.memory_gib, 110.0);
+    }
+
+    #[test]
+    fn a_metal_gpu_round_trips_with_its_backend_and_old_peers_read_as_cuda() {
+        let mut p = peer("mac", 1);
+        p.gpus[0].gpu_name = "Apple M1 Pro".into();
+        p.gpus[0].backend = crate::hardware::GpuBackend::Metal;
+        p.gpus[0].device.wgpu = true;
+        let txt = encode_peer(&p);
+        assert!(txt.iter().any(|e| e == "be0=metal"));
+        let back = decode_peer(&txt).unwrap();
+        assert_eq!(back, p);
+        assert_eq!(back.summary(), "mac: Apple M1 Pro (Metal)");
+        let old: Vec<String> = txt.iter().filter(|e| !e.starts_with("be0=")).cloned().collect();
+        let legacy = decode_peer(&old).unwrap();
+        assert_eq!(legacy.gpus[0].backend, crate::hardware::GpuBackend::Cuda);
+        assert!(!legacy.gpus[0].device.wgpu);
+        let mut cuda = encode_peer(&peer("desk", 1));
+        assert!(!cuda.iter().any(|e| e.starts_with("be0=")));
+        cuda.push("be0=metal".into());
+        assert_eq!(decode_peer(&cuda).unwrap().gpus[0].backend, crate::hardware::GpuBackend::Metal);
     }
 
     #[test]
