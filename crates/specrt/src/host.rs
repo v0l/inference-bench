@@ -38,7 +38,8 @@ pub struct HostConfig {
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    Pair { nc: String, proof: String, sealed: String },
+    PairStart { msg: String },
+    PairFinish { confirm: String, nonce: String, sealed: String },
     Stage { model: String, ctx: usize, slots: usize, gpus: Vec<usize> },
     Release,
 }
@@ -49,7 +50,9 @@ pub struct Reply {
     #[serde(default)]
     pub error: String,
     #[serde(default)]
-    pub proof: String,
+    pub msg: String,
+    #[serde(default)]
+    pub confirm: String,
     #[serde(default)]
     pub addrs: Vec<String>,
 }
@@ -98,19 +101,26 @@ fn auth_tag(key: &[u8], nonce: &str, body: &str) -> String {
     pairing::hex(&hmac_sha256(key, format!("{nonce}\n{body}").as_bytes()))
 }
 
+fn read_line(reader: &mut BufReader<TcpStream>) -> Result<String> {
+    let mut line = String::new();
+    std::io::Read::take(&mut *reader, 1 << 16).read_line(&mut line)?;
+    ensure!(line.ends_with('\n'), "request line is incomplete or too long");
+    Ok(line)
+}
+
 fn handle(config: &HostConfig, state: &Arc<Mutex<State>>, stream: TcpStream) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     let local_ip = stream.local_addr()?.ip();
     let mut writer = stream.try_clone()?;
+    let mut reader = BufReader::new(stream);
     let nonce = pairing::hex(&pairing::fresh_nonce()?);
     write_json(&mut writer, &serde_json::json!({ "nonce": nonce }))?;
-    let mut line = String::new();
-    std::io::Read::take(BufReader::new(stream), 1 << 16).read_line(&mut line)?;
-    ensure!(line.ends_with('\n'), "request line is incomplete or too long");
+    let line = read_line(&mut reader)?;
     let (tag, body) = line.trim_end().split_once(' ').ok_or_else(|| anyhow!("request has no auth tag"))?;
     let request: Request = serde_json::from_str(body).context("request")?;
     let reply = match request {
-        Request::Pair { nc, proof, sealed } => pair(config, state, &nonce, &nc, &proof, &sealed),
+        Request::PairStart { msg } => pair(config, state, &msg, &mut reader, &mut writer),
+        Request::PairFinish { .. } => Err(anyhow!("pairing must start with a first message")),
         other => {
             let key = pairing::read_key(&config.key_file).ok().and_then(|k| pairing::unhex(&k).ok());
             match key {
@@ -131,14 +141,27 @@ fn constant_eq(a: &str, b: &str) -> bool {
     a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn pair(config: &HostConfig, state: &Arc<Mutex<State>>, ns: &str, nc: &str, proof: &str, sealed: &str) -> Result<Reply> {
+fn pair(config: &HostConfig, state: &Arc<Mutex<State>>, msg: &str, reader: &mut BufReader<TcpStream>, writer: &mut TcpStream) -> Result<Reply> {
+    let (session, msg_b, confirm_b) = {
+        let mut s = state.lock().unwrap();
+        let offer = s.offer.as_mut().ok_or_else(|| anyhow!("no pairing code is showing on this machine"))?;
+        let (msg_b, confirm_b, session) = offer.start(&pairing::unhex(msg)?)?;
+        (session, msg_b, confirm_b)
+    };
+    write_json(writer, &Reply { ok: true, msg: pairing::hex(&msg_b), confirm: pairing::hex(&confirm_b), ..Reply::default() })?;
+    let line = read_line(reader)?;
+    let Request::PairFinish { confirm, nonce, sealed } = serde_json::from_str(line.trim_end().split_once(' ').map_or("", |(_, b)| b)).context("second pairing message")? else {
+        bail!("expected the second pairing message");
+    };
+    let key = session.open(&pairing::unhex(&confirm)?, &pairing::unhex(&nonce)?, &pairing::unhex(&sealed)?)?;
+    pairing::write_key(&config.key_file, &key)?;
     let mut s = state.lock().unwrap();
-    let offer = s.offer.as_mut().ok_or_else(|| anyhow!("no pairing code is showing on this machine"))?;
-    let accepted = offer.accept(&pairing::unhex(nc)?, &pairing::unhex(ns)?, &pairing::unhex(proof)?, &pairing::unhex(sealed)?)?;
-    pairing::write_key(&config.key_file, &accepted.key)?;
+    if let Some(o) = s.offer.as_mut() {
+        o.consume();
+    }
     s.offer = None;
     s.paired = true;
-    Ok(Reply { ok: true, proof: pairing::hex(&accepted.server_proof), ..Reply::default() })
+    Ok(Reply { ok: true, ..Reply::default() })
 }
 
 fn run(state: &Arc<Mutex<State>>, request: Request, key: &[u8], local_ip: std::net::IpAddr) -> Result<Reply> {
@@ -164,7 +187,7 @@ fn run(state: &Arc<Mutex<State>>, request: Request, key: &[u8], local_ip: std::n
             s.serving = None;
             Ok(Reply { ok: true, ..Reply::default() })
         }
-        Request::Pair { .. } => bail!("unreachable"),
+        Request::PairStart { .. } | Request::PairFinish { .. } => bail!("unreachable"),
     }
 }
 
@@ -251,43 +274,54 @@ impl Drop for Host {
     }
 }
 
-fn call(control: &str, timeout: Duration, make: impl FnOnce(&str) -> Result<(String, String)>) -> Result<(Reply, String)> {
+struct Conn {
+    writer: TcpStream,
+    reader: BufReader<TcpStream>,
+    nonce: String,
+    control: String,
+}
+
+fn connect(control: &str, timeout: Duration) -> Result<Conn> {
     let addr = std::net::ToSocketAddrs::to_socket_addrs(control).with_context(|| control.to_string())?.next().context("no address")?;
     let stream = TcpStream::connect_timeout(&addr, timeout).with_context(|| format!("connect {control}"))?;
     stream.set_read_timeout(Some(timeout))?;
-    let mut writer = stream.try_clone()?;
+    let writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
     let nonce = serde_json::from_str::<serde_json::Value>(&line)?["nonce"].as_str().context("no nonce")?.to_string();
-    let (tag, body) = make(&nonce)?;
-    writer.write_all(format!("{tag} {body}\n").as_bytes())?;
-    let mut answer = String::new();
-    reader.read_line(&mut answer)?;
-    let reply: Reply = serde_json::from_str(&answer).context("reply")?;
-    if !reply.ok {
-        bail!("{control}: {}", reply.error);
+    Ok(Conn { writer, reader, nonce, control: control.to_string() })
+}
+
+impl Conn {
+    fn send(&mut self, tag: &str, request: &Request) -> Result<Reply> {
+        let body = serde_json::to_string(request)?;
+        self.writer.write_all(format!("{tag} {body}\n").as_bytes())?;
+        let mut answer = String::new();
+        self.reader.read_line(&mut answer)?;
+        let reply: Reply = serde_json::from_str(&answer).context("reply")?;
+        if !reply.ok {
+            bail!("{}: {}", self.control, reply.error);
+        }
+        Ok(reply)
     }
-    Ok((reply, nonce))
 }
 
 pub fn pair_with(control: &str, code: &str, key: &str) -> Result<()> {
-    let nc = pairing::fresh_nonce()?;
-    let (reply, nonce) = call(control, Duration::from_secs(10), |ns| {
-        let sealed = pairing::seal(code, key, &nc, &pairing::unhex(ns)?)?;
-        let body = serde_json::to_string(&Request::Pair { nc: pairing::hex(&nc), proof: pairing::hex(&sealed.proof), sealed: pairing::hex(&sealed.sealed_key) })?;
-        Ok(("-".to_string(), body))
-    })?;
-    pairing::verify_server(code, &nc, &pairing::unhex(&nonce)?, &pairing::unhex(&reply.proof)?)
+    let mut conn = connect(control, Duration::from_secs(10))?;
+    let (client, msg_a) = pairing::ClientSession::start(code);
+    let first = conn.send("-", &Request::PairStart { msg: pairing::hex(&msg_a) })?;
+    let sealed = client.finish(&pairing::unhex(&first.msg)?, &pairing::unhex(&first.confirm)?, key).map_err(|e| if e.to_string().contains("did not prove") { anyhow!("wrong pairing code") } else { e })?;
+    conn.send("-", &Request::PairFinish { confirm: pairing::hex(&sealed.confirm), nonce: pairing::hex(&sealed.nonce), sealed: pairing::hex(&sealed.ciphertext) })?;
+    Ok(())
 }
 
 fn authed(control: &str, key: &str, request: &Request, timeout: Duration) -> Result<Reply> {
     let raw = pairing::unhex(key)?;
-    call(control, timeout, |nonce| {
-        let body = serde_json::to_string(request)?;
-        Ok((auth_tag(&raw, nonce, &body), body))
-    })
-    .map(|(reply, _)| reply)
+    let mut conn = connect(control, timeout)?;
+    let body = serde_json::to_string(request)?;
+    let tag = auth_tag(&raw, &conn.nonce, &body);
+    conn.send(&tag, request)
 }
 
 pub fn request_stages(control: &str, key: &str, model: &str, ctx: usize, slots: usize, gpus: &[usize]) -> Result<Vec<String>> {

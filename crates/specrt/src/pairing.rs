@@ -1,5 +1,9 @@
-use crate::wire::hmac_sha256;
-use anyhow::{Context, Result, bail, ensure};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use hkdf::Hkdf;
+use sha2::Sha256;
+use spake2::{Ed25519Group, Identity, Password, Spake2};
+use anyhow::{Context, Result, anyhow, ensure};
 use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -68,6 +72,14 @@ pub fn display_code(code: &str) -> String {
     format!("{}-{}", &code[..n], &code[n..])
 }
 
+const CLIENT_ID: &[u8] = b"inference-bench-client";
+const HOST_ID: &[u8] = b"inference-bench-host";
+const NONCE_LEN: usize = 12;
+
+pub fn fresh_nonce() -> Result<Vec<u8>> {
+    random(16)
+}
+
 pub struct Offer {
     code: String,
     expires: Instant,
@@ -96,89 +108,150 @@ impl Offer {
         self.expires.saturating_duration_since(Instant::now()).as_secs()
     }
 
-    pub fn accept(&mut self, nonce_client: &[u8], nonce_server: &[u8], client_proof: &[u8], sealed_key: &[u8]) -> Result<Accepted> {
+    pub fn start(&mut self, msg_a: &[u8]) -> Result<(Vec<u8>, Vec<u8>, HostSession)> {
         ensure!(self.live(), "the pairing code is no longer valid");
-        let expected = proof(self.code.as_bytes(), b"client", nonce_client, nonce_server);
-        if !equal(&expected, client_proof) {
-            self.attempts += 1;
-            bail!("wrong pairing code");
-        }
-        ensure!(sealed_key.len() == KEY_BYTES, "sealed key has {} bytes", sealed_key.len());
-        let mask = proof(self.code.as_bytes(), b"key", nonce_client, nonce_server);
-        let raw: Vec<u8> = sealed_key.iter().zip(mask).map(|(a, b)| a ^ b).collect();
+        self.attempts += 1;
+        let (state, msg_b) = Spake2::<Ed25519Group>::start_b(&Password::new(self.code.as_bytes()), &Identity::new(CLIENT_ID), &Identity::new(HOST_ID));
+        let shared = state.finish(msg_a).map_err(|e| anyhow!("pairing message rejected: {e:?}"))?;
+        let keys = Keys::derive(&shared, msg_a, &msg_b);
+        let confirm_b = keys.host_confirm.to_vec();
+        Ok((msg_b, confirm_b, HostSession { keys }))
+    }
+
+    pub fn consume(&mut self) {
         self.attempts = MAX_ATTEMPTS;
-        Ok(Accepted { key: hex(&raw), server_proof: proof(self.code.as_bytes(), b"server", nonce_client, nonce_server).to_vec() })
     }
 }
 
-pub struct Accepted {
-    pub key: String,
-    pub server_proof: Vec<u8>,
+struct Keys {
+    host_confirm: [u8; 32],
+    client_confirm: [u8; 32],
+    wrap: [u8; 32],
+    transcript: Vec<u8>,
 }
 
+impl Keys {
+    fn derive(shared: &[u8], msg_a: &[u8], msg_b: &[u8]) -> Keys {
+        let mut transcript = msg_a.to_vec();
+        transcript.extend_from_slice(msg_b);
+        let hk = Hkdf::<Sha256>::new(Some(&transcript), shared);
+        let mut okm = [0u8; 96];
+        hk.expand(b"inference-bench pairing v1", &mut okm).expect("96 bytes is a valid hkdf length");
+        let mut host_confirm = [0u8; 32];
+        let mut client_confirm = [0u8; 32];
+        let mut wrap = [0u8; 32];
+        host_confirm.copy_from_slice(&okm[..32]);
+        client_confirm.copy_from_slice(&okm[32..64]);
+        wrap.copy_from_slice(&okm[64..]);
+        Keys { host_confirm, client_confirm, wrap, transcript }
+    }
+}
+
+pub struct HostSession {
+    keys: Keys,
+}
+
+impl HostSession {
+    pub fn open(&self, confirm: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<String> {
+        ensure!(equal(&self.keys.client_confirm, confirm), "wrong pairing code");
+        ensure!(nonce.len() == NONCE_LEN, "bad nonce length");
+        let cipher = ChaCha20Poly1305::new((&self.keys.wrap).into());
+        let raw = cipher
+            .decrypt(Nonce::from_slice(nonce), Payload { msg: ciphertext, aad: &self.keys.transcript })
+            .map_err(|_| anyhow!("the sealed key did not decrypt"))?;
+        ensure!(raw.len() == KEY_BYTES, "sealed key has {} bytes", raw.len());
+        Ok(hex(&raw))
+    }
+}
+
+pub struct ClientSession {
+    state: Spake2<Ed25519Group>,
+    msg_a: Vec<u8>,
+}
+
+#[derive(Debug)]
 pub struct Sealed {
-    pub proof: Vec<u8>,
-    pub sealed_key: Vec<u8>,
+    pub confirm: Vec<u8>,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
 }
 
-pub fn seal(code: &str, key: &str, nonce_client: &[u8], nonce_server: &[u8]) -> Result<Sealed> {
-    let code = normalize_code(code);
-    let raw = unhex(key)?;
-    ensure!(raw.len() == KEY_BYTES, "the cluster key must be a generated key");
-    let mask = proof(code.as_bytes(), b"key", nonce_client, nonce_server);
-    Ok(Sealed {
-        proof: proof(code.as_bytes(), b"client", nonce_client, nonce_server).to_vec(),
-        sealed_key: raw.iter().zip(mask).map(|(a, b)| a ^ b).collect(),
-    })
-}
+impl ClientSession {
+    pub fn start(code: &str) -> (ClientSession, Vec<u8>) {
+        let (state, msg_a) = Spake2::<Ed25519Group>::start_a(&Password::new(normalize_code(code).as_bytes()), &Identity::new(CLIENT_ID), &Identity::new(HOST_ID));
+        (ClientSession { state, msg_a: msg_a.clone() }, msg_a)
+    }
 
-pub fn verify_server(code: &str, nonce_client: &[u8], nonce_server: &[u8], server_proof: &[u8]) -> Result<()> {
-    let expected = proof(normalize_code(code).as_bytes(), b"server", nonce_client, nonce_server);
-    ensure!(equal(&expected, server_proof), "the peer did not prove it knows the pairing code");
-    Ok(())
+    pub fn finish(self, msg_b: &[u8], host_confirm: &[u8], key: &str) -> Result<Sealed> {
+        let raw = unhex(key)?;
+        ensure!(raw.len() == KEY_BYTES, "the cluster key must be a generated key");
+        let shared = self.state.finish(msg_b).map_err(|e| anyhow!("pairing message rejected: {e:?}"))?;
+        let keys = Keys::derive(&shared, &self.msg_a, msg_b);
+        ensure!(equal(&keys.host_confirm, host_confirm), "the peer did not prove it knows the pairing code");
+        let nonce = random(NONCE_LEN)?;
+        let cipher = ChaCha20Poly1305::new((&keys.wrap).into());
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce), Payload { msg: &raw, aad: &keys.transcript })
+            .map_err(|_| anyhow!("could not seal the key"))?;
+        Ok(Sealed { confirm: keys.client_confirm.to_vec(), nonce, ciphertext })
+    }
 }
 
 fn equal(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn proof(code: &[u8], role: &[u8], nonce_client: &[u8], nonce_server: &[u8]) -> [u8; 32] {
-    let mut data = role.to_vec();
-    data.extend_from_slice(nonce_client);
-    data.extend_from_slice(nonce_server);
-    hmac_sha256(code, &data)
-}
-
-pub fn fresh_nonce() -> Result<Vec<u8>> {
-    random(16)
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn exchange(offer: &mut Offer, typed: &str, key: &str) -> Result<String> {
-        let (nc, ns) = (fresh_nonce()?, fresh_nonce()?);
-        let sealed = seal(typed, key, &nc, &ns)?;
-        let accepted = offer.accept(&nc, &ns, &sealed.proof, &sealed.sealed_key)?;
-        verify_server(typed, &nc, &ns, &accepted.server_proof)?;
-        Ok(accepted.key)
+    #[derive(Debug)]
+    struct Transcript {
+        msg_a: Vec<u8>,
+        msg_b: Vec<u8>,
+        confirm_b: Vec<u8>,
+        sealed: Sealed,
+    }
+
+    fn exchange(offer: &mut Offer, typed: &str, key: &str) -> Result<(String, Transcript)> {
+        let (client, msg_a) = ClientSession::start(typed);
+        let (msg_b, confirm_b, session) = offer.start(&msg_a)?;
+        let sealed = client.finish(&msg_b, &confirm_b, key)?;
+        let got = session.open(&sealed.confirm, &sealed.nonce, &sealed.ciphertext)?;
+        offer.consume();
+        Ok((got, Transcript { msg_a, msg_b, confirm_b, sealed }))
     }
 
     #[test]
-    fn the_right_code_delivers_the_key_without_it_appearing_in_the_exchange() {
+    fn the_right_code_delivers_the_key_and_the_wire_never_carries_it() {
         let key = generate_key().unwrap();
         let mut offer = Offer::new("peer").unwrap();
         let code = offer.code();
-        let (nc, ns) = (fresh_nonce().unwrap(), fresh_nonce().unwrap());
-        let sealed = seal(&code.to_lowercase(), &key, &nc, &ns).unwrap();
-        assert_ne!(sealed.sealed_key, unhex(&key).unwrap());
-        let accepted = offer.accept(&nc, &ns, &sealed.proof, &sealed.sealed_key).unwrap();
-        assert_eq!(accepted.key, key);
+        let (got, t) = exchange(&mut offer, &code.to_lowercase(), &key).unwrap();
+        assert_eq!(got, key);
+        let raw = unhex(&key).unwrap();
+        for part in [&t.msg_a, &t.msg_b, &t.confirm_b, &t.sealed.ciphertext, &t.sealed.confirm] {
+            assert!(!part.windows(raw.len()).any(|w| w == raw.as_slice()));
+        }
     }
 
     #[test]
-    fn a_wrong_code_fails_three_times_then_the_offer_is_dead_even_for_the_right_code() {
+    fn a_recorded_transcript_cannot_be_opened_by_guessing_codes_offline_even_the_right_one() {
+        let key = generate_key().unwrap();
+        let mut offer = Offer::with_code("ABCD-2345", Duration::from_secs(60));
+        let (_, t) = exchange(&mut offer, "ABCD-2345", &key).unwrap();
+        for guess in ["ABCD-2345", "ABCD-2346", "AAAA-AAAA", "ZZZZ-9999"] {
+            let (attacker, _) = ClientSession::start(guess);
+            let attempt = attacker.finish(&t.msg_b, &t.confirm_b, &key);
+            assert!(attempt.is_err(), "guess {guess} validated against a recorded transcript");
+        }
+        let (second, _) = ClientSession::start("ABCD-2345");
+        assert!(second.finish(&t.msg_b, &t.confirm_b, &key).is_err());
+    }
+
+    #[test]
+    fn a_wrong_code_fails_and_three_handshakes_kill_the_offer_even_for_the_right_code() {
         let key = generate_key().unwrap();
         let mut offer = Offer::with_code("ABCD-2345", Duration::from_secs(60));
         for _ in 0..MAX_ATTEMPTS {
@@ -192,7 +265,7 @@ mod tests {
     fn a_code_works_once() {
         let key = generate_key().unwrap();
         let mut offer = Offer::with_code("ABCD2345", Duration::from_secs(60));
-        assert_eq!(exchange(&mut offer, "abcd-2345", &key).unwrap(), key);
+        assert_eq!(exchange(&mut offer, "abcd-2345", &key).unwrap().0, key);
         assert!(exchange(&mut offer, "ABCD2345", &key).is_err());
     }
 
@@ -204,13 +277,23 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_that_does_not_know_the_code_is_detected() {
+    fn a_host_that_does_not_know_the_code_is_detected_by_the_client() {
         let key = generate_key().unwrap();
         let mut rogue = Offer::with_code("WXYZ6789", Duration::from_secs(60));
-        let (nc, ns) = (fresh_nonce().unwrap(), fresh_nonce().unwrap());
-        let sealed = seal("WXYZ6789", &key, &nc, &ns).unwrap();
-        let forged = rogue.accept(&nc, &ns, &sealed.proof, &sealed.sealed_key).unwrap();
-        assert!(verify_server("ABCD2345", &nc, &ns, &forged.server_proof).is_err());
+        let (client, msg_a) = ClientSession::start("ABCD2345");
+        let (msg_b, confirm_b, _) = rogue.start(&msg_a).unwrap();
+        assert!(client.finish(&msg_b, &confirm_b, &key).is_err());
+    }
+
+    #[test]
+    fn a_tampered_ciphertext_is_rejected() {
+        let key = generate_key().unwrap();
+        let mut offer = Offer::with_code("ABCD2345", Duration::from_secs(60));
+        let (client, msg_a) = ClientSession::start("ABCD2345");
+        let (msg_b, confirm_b, session) = offer.start(&msg_a).unwrap();
+        let mut sealed = client.finish(&msg_b, &confirm_b, &key).unwrap();
+        sealed.ciphertext[0] ^= 1;
+        assert!(session.open(&sealed.confirm, &sealed.nonce, &sealed.ciphertext).is_err());
     }
 
     #[test]
