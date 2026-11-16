@@ -2,6 +2,7 @@ pub mod batch;
 pub mod logging;
 pub mod bench;
 pub mod chat;
+pub mod cluster;
 pub mod conversations;
 pub mod engine;
 pub mod fit;

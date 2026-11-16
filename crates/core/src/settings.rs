@@ -51,6 +51,35 @@ pub struct Settings {
     pub specs_tag: String,
     #[serde(default = "default_specs_hours")]
     pub specs_update_hours: u64,
+    #[serde(default)]
+    pub cluster: ClusterSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClusterSettings {
+    pub share: bool,
+    pub interface: String,
+    pub mdns_port: u16,
+    pub link_latency_ms: f64,
+    pub link_bandwidth_gbs: f64,
+    pub objective: specrt::placement::Objective,
+}
+
+impl Default for ClusterSettings {
+    fn default() -> Self {
+        Self { share: false, interface: String::new(), mdns_port: 5353, link_latency_ms: 0.3, link_bandwidth_gbs: 1.1, objective: specrt::placement::Objective::Latency }
+    }
+}
+
+impl ClusterSettings {
+    pub fn interface(&self) -> Option<&str> {
+        Some(self.interface.trim()).filter(|i| !i.is_empty())
+    }
+
+    pub fn network_link(&self) -> specrt::placement::LinkConfig {
+        specrt::placement::LinkConfig { latency_ms: self.link_latency_ms, bandwidth_gbs: self.link_bandwidth_gbs }
+    }
 }
 
 fn yes() -> bool {
@@ -97,6 +126,7 @@ impl Default for Settings {
             specs_branch: default_specs_branch(),
             specs_tag: String::new(),
             specs_update_hours: default_specs_hours(),
+            cluster: ClusterSettings::default(),
         }
     }
 }
@@ -232,6 +262,17 @@ mod tests {
         let dir = temp("c");
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir).ctx_for("Qwen3-0.6B"), 32768);
+    }
+
+    #[test]
+    fn sharing_is_off_by_default_and_an_old_file_keeps_it_off() {
+        assert!(!Settings::default().cluster.share);
+        let s = Settings::parse(r#"{"default_ctx": 4096}"#);
+        assert!(!s.cluster.share);
+        assert_eq!(s.cluster.interface(), None);
+        let on = Settings::parse(r#"{"cluster": {"share": true, "interface": "eth0"}}"#);
+        assert!(on.cluster.share);
+        assert_eq!((on.cluster.interface(), on.cluster.mdns_port), (Some("eth0"), 5353));
     }
 
     #[test]

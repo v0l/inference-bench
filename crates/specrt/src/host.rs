@@ -19,7 +19,8 @@ pub struct HostedStage {
 }
 
 pub fn spawn_stage(model: &str, ctx: usize, slots: usize, gpu: usize, key: &[u8], bind: &str) -> Result<HostedStage> {
-    let spec = crate::engine::resolve_spec(model).with_context(|| model.to_string())?;
+    let mut spec = crate::engine::resolve_spec(model).with_context(|| model.to_string())?;
+    spec.mtp = None;
     let stage = Arc::new(RuntimeStage::unloaded_on(&spec, ctx, slots, gpu));
     let server = StageServer::start(bind, key, stage.clone())?;
     Ok(HostedStage { server, stage })
@@ -73,16 +74,15 @@ pub struct Host {
 }
 
 fn peer_of(config: &HostConfig, s: &State) -> Peer {
+    let hidden: Vec<usize> = s.machine.gpus.iter().map(|g| g.ordinal).filter(|o| !s.shared.contains(o)).collect();
+    let devices = s.machine.devices(&hidden);
     let gpus = s
         .machine
         .gpus
         .iter()
         .filter(|g| s.shared.contains(&g.ordinal))
-        .map(|g| {
-            let mut devices = s.machine.devices(&s.machine.gpus.iter().map(|x| x.ordinal).filter(|o| *o != g.ordinal).collect::<Vec<_>>());
-            let device = devices.remove(0);
-            PeerGpu { device, gpu_name: g.name.clone() }
-        })
+        .zip(devices)
+        .map(|(g, device)| PeerGpu { device, gpu_name: g.name.clone() })
         .collect();
     Peer { version: ANNOUNCEMENT_VERSION, host: s.machine.host.clone(), app_version: Some(config.app_version.clone()), busy: s.busy, serving: s.serving.clone(), control: None, gpus }
 }
