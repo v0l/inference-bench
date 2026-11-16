@@ -31,6 +31,12 @@ pub struct RepoFile {
     pub kind: String,
 }
 
+impl RepoFile {
+    pub fn new(path: &str, size: u64) -> Self {
+        Self { path: path.to_string(), size, kind: "file".into() }
+    }
+}
+
 pub struct Hub {
     base: String,
     token: Option<String>,
@@ -147,6 +153,41 @@ impl Hub {
         Ok(all.into_iter().filter(|f| f.kind == "file" || f.kind.is_empty()).collect())
     }
 
+    pub fn range(&self, repo: &str, file: &str, len: usize) -> Result<Vec<u8>, String> {
+        let url = format!("{}/{repo}/resolve/main/{file}", self.base);
+        let resp = self.get(&url).header("Range", &format!("bytes=0-{}", len.saturating_sub(1))).call().map_err(|e| format!("{url}: {e}"))?;
+        let status = resp.status().as_u16();
+        if status >= 400 {
+            return Err(format!("{url}: HTTP {status}"));
+        }
+        let mut out = Vec::new();
+        resp.into_body().into_reader().take(len as u64).read_to_end(&mut out).map_err(|e| format!("{url}: {e}"))?;
+        Ok(out)
+    }
+
+    pub fn gguf_header(&self, repo: &str, file: &str) -> Result<specrt::gguf::Gguf, String> {
+        self.gguf_header_from(repo, file, 4 << 20, 128 << 20)
+    }
+
+    pub fn gguf_header_from(&self, repo: &str, file: &str, first: usize, most: usize) -> Result<specrt::gguf::Gguf, String> {
+        let mut len = first;
+        loop {
+            let bytes = self.range(repo, file, len)?;
+            let whole_file = bytes.len() < len;
+            match specrt::gguf::Gguf::from_header(bytes) {
+                Ok(g) => return Ok(g),
+                Err(e) => {
+                    let text = format!("{e:#}");
+                    let truncated = ["ends early", "does not fit", "larger than the file"].iter().any(|m| text.contains(m));
+                    if whole_file || !truncated || len >= most {
+                        return Err(format!("{file}: {text}"));
+                    }
+                    len = (len * 2).min(most);
+                }
+            }
+        }
+    }
+
     pub fn download(
         &self,
         repo: &str,
@@ -154,6 +195,38 @@ impl Hub {
         hub_dir: &Path,
         progress: &Progress,
     ) -> Result<PathBuf, String> {
+        self.fetch(repo, file, hub_dir, progress, 0, None)
+    }
+
+    pub fn download_variant(&self, repo: &str, files: &[RepoFile], hub_dir: &Path, progress: &Progress) -> Result<Vec<PathBuf>, String> {
+        let total: u64 = files.iter().map(|f| f.size).sum();
+        progress.total.store(total, Ordering::Relaxed);
+        progress.done.store(0, Ordering::Relaxed);
+        let mut offset = 0u64;
+        let mut paths = Vec::new();
+        for f in files {
+            let target = snapshot_path(hub_dir, repo, &f.path);
+            let have = std::fs::metadata(&target).map(|m| m.len()).ok();
+            if f.size > 0 && have == Some(f.size) {
+                offset += f.size;
+                progress.done.store(offset, Ordering::Relaxed);
+                paths.push(target);
+                continue;
+            }
+            let path = self.fetch(repo, &f.path, hub_dir, progress, offset, Some(total))?;
+            let got = std::fs::metadata(&path).map(|m| m.len()).map_err(|e| e.to_string())?;
+            if f.size > 0 && got != f.size {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!("{}: got {got} bytes, expected {}", f.path, f.size));
+            }
+            offset += got;
+            progress.done.store(offset, Ordering::Relaxed);
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
+    fn fetch(&self, repo: &str, file: &str, hub_dir: &Path, progress: &Progress, offset: u64, total: Option<u64>) -> Result<PathBuf, String> {
         let target = snapshot_path(hub_dir, repo, file);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -169,6 +242,7 @@ impl Hub {
         let status = resp.status().as_u16();
         if status == 416 && have > 0 {
             std::fs::rename(&part, &target).map_err(|e| e.to_string())?;
+            progress.done.store(offset + have, Ordering::Relaxed);
             return Ok(target);
         }
         if status >= 400 {
@@ -182,8 +256,8 @@ impl Hub {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         let start = if resumed { have } else { 0 };
-        progress.total.store(start + remaining, Ordering::Relaxed);
-        progress.done.store(start, Ordering::Relaxed);
+        progress.total.store(total.unwrap_or(offset + start + remaining), Ordering::Relaxed);
+        progress.done.store(offset + start, Ordering::Relaxed);
         let mut out = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -338,7 +412,19 @@ pub fn is_weight_file(path: &str) -> bool {
 }
 
 pub fn companion_files(files: &[RepoFile]) -> Vec<&RepoFile> {
-    let wanted = ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "special_tokens_map.json", "vocab.json", "merges.txt"];
+    let wanted = [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "generation_config.json",
+        "special_tokens_map.json",
+        "vocab.json",
+        "merges.txt",
+        "chat_template.jinja",
+        "chat_template.json",
+        "preprocessor_config.json",
+        "model.safetensors.index.json",
+    ];
     files.iter().filter(|f| wanted.contains(&f.path.as_str())).collect()
 }
 

@@ -336,7 +336,7 @@ fn dir_size(files: &[PathBuf]) -> u64 {
     files.iter().filter_map(|f| std::fs::metadata(f).ok()).map(|m| m.len()).sum()
 }
 
-fn gguf_quant(file_type: Option<u32>, file_name: &str) -> String {
+pub fn gguf_quant(file_type: Option<u32>, file_name: &str) -> String {
     let named = match file_type {
         Some(0) => "F32",
         Some(1) => "F16",
@@ -482,7 +482,7 @@ pub fn read_gguf_header(path: &Path) -> Option<GgufHeader> {
     Some(header)
 }
 
-fn shard_key(file: &str) -> (String, bool) {
+pub fn shard_key(file: &str) -> (String, bool) {
     let stem = file.trim_end_matches(".gguf");
     if let Some(i) = stem.rfind("-of-")
         && let Some(j) = stem[..i].rfind('-')

@@ -169,6 +169,7 @@ pub struct Gguf {
     pub metadata: HashMap<String, Value>,
     pub tensors: HashMap<String, TensorInfo>,
     data_start: usize,
+    header_only: bool,
 }
 
 struct Reader<'a> {
@@ -234,14 +235,18 @@ impl Gguf {
     pub fn open(path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
         let map = unsafe { Mmap::map(&file)? };
-        Self::parse(Backing::Map(map)).with_context(|| path.display().to_string())
+        Self::parse(Backing::Map(map), false).with_context(|| path.display().to_string())
     }
 
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
-        Self::parse(Backing::Owned(bytes))
+        Self::parse(Backing::Owned(bytes), false)
     }
 
-    fn parse(backing: Backing) -> Result<Self> {
+    pub fn from_header(bytes: Vec<u8>) -> Result<Self> {
+        Self::parse(Backing::Owned(bytes), true)
+    }
+
+    fn parse(backing: Backing, header_only: bool) -> Result<Self> {
         let bytes: &[u8] = match &backing {
             Backing::Map(m) => m,
             Backing::Owned(v) => v,
@@ -285,15 +290,15 @@ impl Gguf {
             ensure!(tensors.insert(name.clone(), TensorInfo { name: name.clone(), shape, kind, offset, bytes }).is_none(), "tensor {name} appears twice");
         }
         let data_start = r.pos.next_multiple_of(alignment);
-        ensure!(tensors.is_empty() || data_start <= bytes.len(), "the GGUF file ends before its tensor data");
-        for info in tensors.values() {
+        ensure!(header_only || tensors.is_empty() || data_start <= bytes.len(), "the GGUF file ends before its tensor data");
+        for info in tensors.values().filter(|_| !header_only) {
             ensure!(
                 info.offset.is_multiple_of(alignment) && data_start + info.offset + info.bytes <= bytes.len(),
                 "tensor {} lies outside the file or is not aligned",
                 info.name
             );
         }
-        Ok(Gguf { backing, version, alignment, metadata, tensors, data_start })
+        Ok(Gguf { backing, version, alignment, metadata, tensors, data_start, header_only })
     }
 
     fn bytes(&self) -> &[u8] {
@@ -380,12 +385,18 @@ impl Gguf {
         let eps = self.number(&eps_key).with_context(|| format!("the GGUF file has no {eps_key}"))?;
         let theta = self.number(&key("rope_freq_base")?).unwrap_or(10000.0);
         let embd_name = names.tensor("embedding")?;
-        let embd = self.tensor(embd_name).with_context(|| format!("the GGUF file has no {embd_name}"))?;
-        ensure!(embd.shape == [embd.rows(), hidden], "{embd_name} has shape {:?}, expected [vocab, {hidden}]", embd.shape);
+        let vocab = match self.tensor(embd_name) {
+            Some(embd) => {
+                ensure!(embd.shape == [embd.rows(), hidden], "{embd_name} has shape {:?}, expected [vocab, {hidden}]", embd.shape);
+                embd.rows()
+            }
+            None if self.header_only => self.metadata.get("tokenizer.ggml.tokens").and_then(|t| t.as_array()).map_or(0, |t| t.len()),
+            None => bail!("the GGUF file has no {embd_name}"),
+        };
         let tied = !self.tensors.contains_key(names.tensor("output")?);
         let mut unsupported: Vec<String> = self.tensors.values().filter(|t| t.kind.block().is_none()).map(|t| format!("{} ({})", t.name, t.kind.name())).collect();
         unsupported.sort();
-        if let Some(first) = unsupported.first() {
+        if let Some(first) = unsupported.first().filter(|_| !self.header_only) {
             bail!("GGUF tensor type is not supported: {first} and {} more (F32, F16, BF16, Q8_0, Q4_K, Q5_K and Q6_K are)", unsupported.len() - 1);
         }
         let quant = self.weight_quant();
@@ -414,7 +425,7 @@ impl Gguf {
             quant,
             head_quant: None,
             act_quant: ActQuant::None,
-            dims: Dims { hidden, intermediate, vocab: embd.rows(), tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None },
+            dims: Dims { hidden, intermediate, vocab, tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None },
             layers: Layers { count: layers, pattern: vec![Block::Dense], window: None },
             norm: Norm { kind: NormKind::Rmsnorm, eps, unit_offset: false, sandwich: false, pre: true, residual_scale: None },
             attention: Attention {
@@ -464,7 +475,7 @@ impl Gguf {
         let kind = self.string(&names.key("rope_scaling_type", arch)?).unwrap_or("");
         let factor = self.number(&names.key("rope_scaling_factor", arch)?);
         if kind.is_empty() || names.unscaled.iter().any(|u| u == kind) {
-            return match self.tensor(names.tensor("rope_freqs")?) {
+            return match self.tensor(names.tensor("rope_freqs")?).filter(|_| !self.header_only) {
                 Some(t) => Ok(Some(self.llama3_scaling(family, t, head_dim)?)),
                 None => Ok(None),
             };
@@ -586,6 +597,12 @@ impl Gguf {
     }
 }
 
+
+pub fn quant_label_supported(label: &str) -> bool {
+    let upper = label.to_uppercase();
+    let upper = upper.strip_prefix("UD-").unwrap_or(&upper);
+    ["Q4_K", "Q5_K", "Q6_K", "Q8_0", "BF16", "F16", "F32"].iter().any(|q| upper.starts_with(q))
+}
 
 pub fn llama3_factors(theta: f64, head_dim: usize, s: &RopeScaling) -> Vec<f64> {
     let (low, high, orig) = (s.low_freq_factor.unwrap_or(1.0), s.high_freq_factor.unwrap_or(4.0), s.original_max_positions.unwrap_or(8192.0));
