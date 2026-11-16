@@ -81,6 +81,20 @@ Decision: the default stays `f16`. fp8 is opt-in and fails the 27B gate as it st
 
 `kv_dtype = "fp8"` now keeps the first `[runtime] kv_f16_layers` attention layers in f16 (one plane, 2 bytes per value) and stores the rest as e4m3 with a per-row scale. Default is half of the attention layers (8 of 16 on the 27B), from the bisection above. `kv_f16_layers = 0` is the old all-fp8 layout. Each block holds the f16 layers first, then the fp8 layers, so `kv_block_bytes` is 0.75x of f16 on the 27B. Option key `runtime.kv_f16_layers` in the load dialog. Tests: `mixed_kv_keeps_the_early_layers_f16_and_defaults_to_half` (sizes), `mixed_kv_logits_track_f16_at_4096_tokens` (GPU, 0, 1 and 2 f16 layers on the 3-layer 27B-shaped fixture, KL under 0.02), the golden kernels in `crates/kir/tests/golden/attention`.
 
+### Mixed layout on the 27B NVFP4 (16 Nov, `kvgate27b.sh all`, 8 f16 + 8 fp8 layers)
+
+| row | f16 | mixed fp8 |
+| --- | --- | --- |
+| KL 8192, 20 prompts | 0 | mean 0.0028, max 0.112, top-1 0.989 |
+| KL 32768, 10 prompts | 0 | mean 0.00007, max 0.0042, top-1 1.0 |
+| needle 32k at 0.1, 0.5, 0.9 | 3 of 3 | 3 of 3 |
+| needle 128k at 0.5 | found, decode 37.8 tok/s | found, decode 40.1 tok/s |
+| MTP k=2, 20 prompts, mean acceptance length | 2.414 (97.3 tok/s) | 2.405 (93.5 tok/s) |
+| batch 8 decode at 8192 | 299.7 tok/s | 262.7 tok/s |
+| batch 8 decode at 32768 | 222.9 tok/s (222.1 on rerun) | 158.0 tok/s (158.0 on rerun) |
+
+Quality passes the 0.02 bound on average at 8k and 32k (all-fp8 was 0.29 at 8k); the worst single position at 8k is 0.112, above 0.02. Single stream decode at 128k is faster (+6 percent). But batched decode (the grouped `batch_decode_attention` kernel) is 12 to 29 percent slower, reproducibly: its fp8 tile load does a synchronous global read, convert and shared store per thread instead of the `cp.async` pipeline, so it loses the overlap that the f16 path has. The default therefore stays f16. Fixing that load (cp.async the raw bytes and convert from shared memory) is the next step before fp8 can be the default; `long617.sh` against master was not run for that reason.
+
 ### Rerun the gate
 
 ```sh
