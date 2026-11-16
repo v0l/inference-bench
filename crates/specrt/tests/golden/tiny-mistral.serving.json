@@ -22,7 +22,7 @@
     "kind": "gqa",
     "heads": 4,
     "kv_heads": 2,
-    "head_dim": 48,
+    "head_dim": 64,
     "qkv_bias": false,
     "qk_norm": false
   },

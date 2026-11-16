@@ -1,0 +1,38 @@
+{
+  "name": "phi3",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 192,
+    "intermediate": 384,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 2,
+    "kv_heads": 2,
+    "head_dim": 96,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "fused_qkv": true
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0
+  },
+  "mlp": {
+    "activation": "swiglu",
+    "fused_gate_up": true
+  }
+}
