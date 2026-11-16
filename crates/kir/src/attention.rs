@@ -72,7 +72,8 @@ impl AttentionShape {
 
     pub fn flash_smem(&self) -> usize {
         let kv = self.flash_stages() * 2 * self.kv_planes * self.flash_keys() * self.head_dim * 2;
-        kv.max(FLASH_ROWS * self.head_dim * 2)
+        let scales = if self.kv_fp8 { self.flash_stages() * 2 * self.flash_keys() * 4 } else { 0 };
+        kv.max(FLASH_ROWS * self.head_dim * 2) + scales
     }
 
     pub fn legacy_flash_smem(&self) -> usize {
@@ -80,7 +81,12 @@ impl AttentionShape {
     }
 
     pub fn decode_smem(&self) -> usize {
-        DECODE_STAGES * 2 * self.kv_planes * DECODE_KEYS * self.head_dim * 2
+        let raw_layers = DECODE_STAGES * 2 * self.kv_planes * DECODE_KEYS * self.head_dim * 2;
+        if !self.kv_fp8 {
+            return raw_layers;
+        }
+        let quantised = DECODE_STAGES * 2 * DECODE_KEYS * (self.head_dim + 4);
+        if self.kv_f16_layers > 0 { quantised.max(raw_layers) } else { quantised }
     }
 
     pub fn decode_warps(&self, qlen: usize) -> usize {

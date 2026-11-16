@@ -143,7 +143,8 @@ fn needle_mode(spec: &Spec, len: usize, depths: &[f64]) -> Result<()> {
 }
 
 fn batch_mode(spec: &Spec, len: usize, batch: usize, new_tokens: usize) -> Result<()> {
-    for dtype in DTYPES {
+    let only = std::env::var("KVGATE_DTYPE").ok();
+    for dtype in DTYPES.into_iter().filter(|d| only.as_deref().is_none_or(|o| o == name(*d))) {
         let mut rt = load(spec, dtype, len + new_tokens, batch)?;
         let prompts: Vec<Vec<u32>> = (0..batch as u32).map(|s| (0..len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect()).collect();
         rt.generate_batch(&prompts, 4)?;

@@ -1,3 +1,15 @@
+__device__ __forceinline__ unsigned e4m3x2_to_f16x2(unsigned two) {
+    unsigned short in = (unsigned short)two;
+    unsigned r;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(in));
+    return r;
+}
+
+__device__ __forceinline__ void dm_cp_async4(void* smem, const void* gmem) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(gmem));
+}
+
 __device__ __forceinline__ int group_len(const int* pos, int group, int qlen) {
     int len = 0;
     for (int j = 0; j < qlen; j++) len = max(len, pos[group * qlen + j] + 1);

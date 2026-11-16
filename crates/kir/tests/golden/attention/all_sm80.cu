@@ -562,6 +562,18 @@ __device__ __forceinline__ void mma_kv(float* c, const unsigned* ah, const unsig
     mma_f16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
 }
 
+__device__ __forceinline__ unsigned e4m3x2_to_f16x2(unsigned two) {
+    unsigned short in = (unsigned short)two;
+    unsigned r;
+    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(in));
+    return r;
+}
+
+__device__ __forceinline__ void dm_cp_async4(void* smem, const void* gmem) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(gmem));
+}
+
 __device__ __forceinline__ int group_len(const int* pos, int group, int qlen) {
     int len = 0;
     for (int j = 0; j < qlen; j++) len = max(len, pos[group * qlen + j] + 1);
@@ -605,6 +617,11 @@ extern "C" __global__ void batch_decode_combine(const float* part_acc, const flo
     }
     int at = head * HEAD_DIM + d;
     split_store2(out_hi, out_lo, (size_t)seq * Q_DIM + at, A0 / L * out_gate(qkv, seq, at), A1 / L * out_gate(qkv, seq, at + 1));
+}
+
+__device__ __forceinline__ void fm_cp_async4(void* smem, const void* gmem) {
+    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(gmem));
 }
 
 extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const float* qkv, const float* q_norm, const bf16_t* k_cache,
@@ -701,8 +718,29 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         warp_last = max(warp_last, span_end(mm_meta, bidi, mm_stride, mm_slot, min(warp_last, base + tokens - 1)));
     }
     int tiles = (key_end + FM_BK - 1) / FM_BK;
+    constexpr int PLANE_BYTES = PLANE * 2;
+    float* kv_scales = (float*)(fm_smem + FM_STAGES * 2 * PLANE_BYTES);
     auto load_kv = [&](int buf, int k0) {
         bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
+        if (KV_FP8) {
+            unsigned char* raw_st = (unsigned char*)st + PLANE_BYTES / 2;
+            constexpr int RAW_CHUNKS = HEAD_DIM / 16;
+            constexpr int TOTAL = 2 * FM_BK * RAW_CHUNKS;
+#pragma unroll
+            for (int i = tid; i < TOTAL; i += 32 * FM_WARPS) {
+                int which = i / (FM_BK * RAW_CHUNKS);
+                int rem = i % (FM_BK * RAW_CHUNKS);
+                int r = rem / RAW_CHUNKS;
+                int c = rem % RAW_CHUNKS;
+                int tk = k0 + r;
+                int at = min(tk, key_end - 1);
+                const bf16_t* cache = which ? v_cache : k_cache;
+                const unsigned char* src = (const unsigned char*)kv_row(cache, block_table, layer, kv_head, at);
+                cp_async16_zfill(raw_st + which * PLANE_BYTES + r * HEAD_DIM + c * 16, src + c * 16, tk < key_end);
+                if (c == 0) fm_cp_async4(kv_scales + buf * 2 * FM_BK + which * FM_BK + r, kv_scale_ptr(const_cast<bf16_t*>(cache), block_table, layer, kv_head, at));
+            }
+            return;
+        }
         constexpr int ROW_CHUNKS = KV_PLANES * CPR;
         constexpr int TOTAL = 2 * FM_BK * ROW_CHUNKS;
 #pragma unroll
@@ -714,20 +752,50 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             int tk = k0 + r;
             const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
+<<<<<<< HEAD
             if (kv_q(layer)) {
                 int at = min(tk, key_end - 1);
                 float sc = kv_scale(which ? v_cache : k_cache, block_table, layer, kv_head, at);
                 uint2 raw = *(const uint2*)((const unsigned char*)src + c * 8);
+=======
+            cp_async16_zfill(dst, src + c * 8, tk < key_end);
+        }
+    };
+    auto convert_kv = [&](int buf) {
+        bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
+        const unsigned char* raw_st = (const unsigned char*)st + PLANE_BYTES / 2;
+        const float* sc = kv_scales + buf * 2 * FM_BK;
+        constexpr int ITEMS = (2 * FM_BK * CPR + 32 * FM_WARPS - 1) / (32 * FM_WARPS);
+        uint4 out[ITEMS];
+#pragma unroll
+        for (int j = 0; j < ITEMS; j++) {
+            int i = tid + j * 32 * FM_WARPS;
+            if (i < 2 * FM_BK * CPR) {
+                int which = i / (FM_BK * CPR);
+                int rem = i % (FM_BK * CPR);
+                int r = rem / CPR;
+                int c = rem % CPR;
+                float s = sc[which * FM_BK + r];
+                uint2 raw = *(const uint2*)(raw_st + which * PLANE_BYTES + r * HEAD_DIM + c * 8);
+>>>>>>> 937d493 (fp8 KV decode and prefill tiles via cp.async raw bytes)
                 unsigned w[4];
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
                     unsigned two = ((e < 2 ? raw.x : raw.y) >> (16 * (e & 1))) & 0xffffu;
-                    w[e] = attn_bits(e4m3_to_f32(two & 0xffu) * sc) | (attn_bits(e4m3_to_f32(two >> 8) * sc) << 16);
+                    w[e] = attn_bits(e4m3_to_f32(two & 0xffu) * s) | (attn_bits(e4m3_to_f32(two >> 8) * s) << 16);
                 }
-                *(uint4*)dst = make_uint4(w[0], w[1], w[2], w[3]);
-                continue;
+                out[j] = make_uint4(w[0], w[1], w[2], w[3]);
             }
-            cp_async16_zfill(dst, src + c * 8, tk < key_end);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < ITEMS; j++) {
+            int i = tid + j * 32 * FM_WARPS;
+            if (i < 2 * FM_BK * CPR) {
+                int which = i / (FM_BK * CPR);
+                int rem = i % (FM_BK * CPR);
+                *(uint4*)(st + which * PLANE + swz<CPR>(rem / CPR, rem % CPR) * 8) = out[j];
+            }
         }
     };
     __syncthreads();
@@ -739,6 +807,10 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         cp_async_commit();
         cp_async_wait<1>();
         __syncthreads();
+        if (KV_FP8) {
+            convert_kv(kt % FM_STAGES);
+            __syncthreads();
+        }
         const bf16_t* k_hi = kvs + (kt % FM_STAGES) * 2 * KV_PLANES * PLANE;
         const bf16_t* k_lo = k_hi + PLANE;
         const bf16_t* v_hi = k_hi + KV_PLANES * PLANE;
@@ -915,7 +987,30 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
 #pragma unroll
         for (int e = 0; e < 4; e++) o[i][e] = 0.0f;
     float m0 = NEG_INF, m1 = NEG_INF, l0 = 0.0f, l1 = 0.0f;
+    constexpr int RAW_TILE = 2 * DM_BK * HEAD_DIM;
+    constexpr int SCALE_TILE = 2 * DM_BK * 4;
+    unsigned char* raw_base = dm_smem + 2 * KV_PLANES * PLANE * 2;
+    auto raw_stage = [&](int buf) { return raw_base + buf * (RAW_TILE + SCALE_TILE); };
     auto load_kv = [&](int buf, int k0) {
+        if (KV_FP8) {
+            unsigned char* raw = raw_stage(buf);
+            float* scales = (float*)(raw + RAW_TILE);
+            constexpr int RAW_CHUNKS = HEAD_DIM / 16;
+            constexpr int TOTAL = 2 * DM_BK * RAW_CHUNKS;
+            for (int i = tid; i < TOTAL; i += blockDim.x) {
+                int which = i / (DM_BK * RAW_CHUNKS);
+                int rem = i % (DM_BK * RAW_CHUNKS);
+                int r = rem / RAW_CHUNKS;
+                int c = rem % RAW_CHUNKS;
+                int tk = k0 + r;
+                int at = min(tk, len - 1);
+                const bf16_t* cache = which ? v_cache : k_cache;
+                const unsigned char* src = (const unsigned char*)kv_row(cache, table, layer, kv_head, at);
+                cp_async16_zfill(raw + (which * DM_BK + r) * HEAD_DIM + ((c ^ (r & 7)) << 4), src + c * 16, tk < len);
+                if (c == 0) dm_cp_async4(scales + which * DM_BK + r, kv_scale_ptr(const_cast<bf16_t*>(cache), table, layer, kv_head, at));
+            }
+            return;
+        }
         bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
         constexpr int ROW_CHUNKS = KV_PLANES * CPR;
         constexpr int TOTAL = 2 * DM_BK * ROW_CHUNKS;
@@ -928,6 +1023,7 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
             int at = min(tk, len - 1);
             const bf16_t* src = kv_row(which ? v_cache : k_cache, table, layer, kv_head, at);
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
+<<<<<<< HEAD
             if (kv_q(layer)) {
                 float sc = kv_scale(which ? v_cache : k_cache, table, layer, kv_head, at);
                 uint2 raw = tk < len ? *(const uint2*)((const unsigned char*)src + c * 8) : make_uint2(0, 0);
@@ -940,7 +1036,19 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
                 *(uint4*)dst = make_uint4(w[0], w[1], w[2], w[3]);
                 continue;
             }
+=======
+>>>>>>> 937d493 (fp8 KV decode and prefill tiles via cp.async raw bytes)
             cp_async16_zfill(dst, src + c * 8, tk < len);
+        }
+    };
+    auto convert_v = [&](int buf) {
+        const unsigned char* raw = raw_stage(buf) + DM_BK * HEAD_DIM;
+        for (int i = tid; i < DM_BK * CPR; i += blockDim.x) {
+            int r = i / CPR;
+            int c = i % CPR;
+            uint2 in = *(const uint2*)(raw + r * HEAD_DIM + (((c >> 1) ^ (r & 7)) << 4) + (c & 1) * 8);
+            *(uint4*)(kvs + PLANE + swz<CPR>(r, c) * 8) =
+                make_uint4(e4m3x2_to_f16x2(in.x), e4m3x2_to_f16x2(in.x >> 16), e4m3x2_to_f16x2(in.y), e4m3x2_to_f16x2(in.y >> 16));
         }
     };
 #pragma unroll
@@ -954,8 +1062,13 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
         cp_async_commit();
         cp_async_wait<DM_STAGES - 1>();
         __syncthreads();
+        const unsigned char* k_raw = raw_stage(i % DM_STAGES);
+        if (KV_FP8) {
+            convert_v(i % DM_STAGES);
+            __syncthreads();
+        }
         int k0 = key_begin + i * DM_BK;
-        const bf16_t* k_hi = kvs + (i % DM_STAGES) * 2 * KV_PLANES * PLANE;
+        const bf16_t* k_hi = kvs + (KV_FP8 ? 0 : i % DM_STAGES) * 2 * KV_PLANES * PLANE;
         const bf16_t* k_lo = k_hi + PLANE;
         const bf16_t* v_hi = k_hi + KV_PLANES * PLANE;
         const bf16_t* v_lo = v_hi + PLANE;
@@ -971,11 +1084,27 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
                 unsigned bh[4], bl[4] = {0, 0, 0, 0};
                 int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
                 int at = swz<CPR>(kr, kb * 2 + ((lane >> 3) & 1)) * 8;
-                ldsm_x4(bh, k_hi + at);
+                if (KV_FP8) {
+                    const unsigned char* row0p = k_raw + (np * 16 + g) * HEAD_DIM + ((kb ^ g) << 4) + 2 * t;
+                    const unsigned char* row1p = row0p + 8 * HEAD_DIM;
+                    bh[0] = e4m3x2_to_f16x2(*(const unsigned short*)row0p);
+                    bh[1] = e4m3x2_to_f16x2(*(const unsigned short*)(row0p + 8));
+                    bh[2] = e4m3x2_to_f16x2(*(const unsigned short*)row1p);
+                    bh[3] = e4m3x2_to_f16x2(*(const unsigned short*)(row1p + 8));
+                } else {
+                    ldsm_x4(bh, k_hi + at);
+                }
                 if (KV_PLANES == 2) ldsm_x4(bl, k_lo + at);
                 mma_dec(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
                 mma_dec(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
             }
+        const float* tile_scales = (const float*)(raw_stage(i % DM_STAGES) + RAW_TILE);
+        if (KV_FP8) {
+#pragma unroll
+            for (int nb = 0; nb < SB; nb++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) s[nb][e] *= tile_scales[nb * 8 + 2 * t + (e & 1)];
+        }
         float mx0 = NEG_INF, mx1 = NEG_INF;
 #pragma unroll
         for (int nb = 0; nb < SB; nb++)
@@ -1014,6 +1143,12 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
         l1 = l1 * a1 + sum1;
         m0 = n0;
         m1 = n1;
+        if (KV_FP8) {
+#pragma unroll
+            for (int nb = 0; nb < SB; nb++)
+#pragma unroll
+                for (int e = 0; e < 4; e++) s[nb][e] *= tile_scales[DM_BK + nb * 8 + 2 * t + (e & 1)];
+        }
 #pragma unroll
         for (int nb = 0; nb < NB; nb++) {
             o[nb][0] *= a0;

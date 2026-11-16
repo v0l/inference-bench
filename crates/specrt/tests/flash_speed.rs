@@ -15,7 +15,11 @@ fn pattern(len: usize, seed: u32) -> Vec<u16> {
 #[test]
 #[ignore = "needs a CUDA GPU with NVRTC"]
 fn flash_mma_prefill_attention_speed() {
-    let spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
+    let mut spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
+    let fp8 = std::env::var("SPECRT_FLASH_FP8").is_ok();
+    if fp8 {
+        spec.runtime.kv_dtype = specrt::spec::KvDtype::Fp8;
+    }
     let a = &spec.attention;
     let ctx = CudaContext::new(0).unwrap();
     let jit = Jit::new(ctx.clone(), std::env::temp_dir().join(format!("specrt-flash-speed-{}", std::process::id()))).unwrap();
@@ -56,7 +60,7 @@ fn flash_mma_prefill_attention_speed() {
                         assert_ne!(patched, m.source);
                         m.source = patched;
                     }
-                    let smem = (stages * 2 * bk * a.head_dim * 2).max(warps * 16 * a.head_dim * 2) as u32;
+                    let smem = if fp8 { module.smem["flash_mma"] } else { (stages * 2 * bk * a.head_dim * 2).max(warps * 16 * a.head_dim * 2) as u32 };
                     let loaded = jit.load(&m).unwrap();
                     let f = loaded.function("flash_mma").unwrap();
                     use cudarc::driver::sys::CUfunction_attribute as A;
