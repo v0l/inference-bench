@@ -43,6 +43,7 @@ pub struct AttentionShape {
     pub kv_layers: usize,
     pub kv_planes: usize,
     pub kv_fp8: bool,
+    pub kv_f16_layers: usize,
     pub query_scale: f64,
     pub softcap: f64,
     pub local_theta: f64,
@@ -258,6 +259,7 @@ pub(crate) fn constants(s: &AttentionShape, families: &[Family]) -> String {
     let _ = writeln!(o, "constexpr int ATTN_LAYERS = {};", s.kv_layers.max(1));
     let _ = writeln!(o, "constexpr int KV_PLANES = {};", s.kv_planes);
     let _ = writeln!(o, "constexpr bool KV_FP8 = {};", s.kv_fp8);
+    let _ = writeln!(o, "constexpr int KV_F16_LAYERS = {};", if s.kv_fp8 { s.kv_f16_layers.min(s.kv_layers) } else { 0 });
     if families.contains(&Family::FlashMma) {
         let _ = writeln!(o, "constexpr int FM_WARPS = {};", s.flash_warps());
         let _ = writeln!(o, "constexpr int FM_BQ = 16 * FM_WARPS;");

@@ -60,8 +60,8 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
             for (int j = 0; j < ATTN_V4; j++) {
                 int c = lane + 32 * j;
                 bool on = c < HEAD_DIM / 4;
-                kr[u][j] = on ? kv_at4(k, 4 * c, ksc) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                vr[u][j] = on ? kv_at4(v, 4 * c, vsc) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                kr[u][j] = on ? kv_at4(k, 4 * c, ksc, kv_q(layer)) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                vr[u][j] = on ? kv_at4(v, 4 * c, vsc, kv_q(layer)) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
         }
 #pragma unroll

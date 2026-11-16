@@ -749,7 +749,9 @@ impl Layout {
 
 pub fn kv_block_bytes(spec: &Spec, planes: usize) -> usize {
     if spec.runtime.kv_dtype.is_fp8() {
-        return 2 * spec.kv_layers() * spec.attention.kv_heads * PAGE * (spec.attention.head_dim + 4);
+        let raw = spec.kv_f16_layers();
+        let rows = 2 * spec.attention.kv_heads * PAGE;
+        return rows * (raw * spec.attention.head_dim * 2 + (spec.kv_layers() - raw) * (spec.attention.head_dim + 4));
     }
     2 * spec.kv_layers() * spec.attention.kv_heads * PAGE * spec.attention.head_dim * planes * 2
 }

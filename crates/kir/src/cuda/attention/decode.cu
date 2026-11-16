@@ -75,7 +75,7 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
             int at = min(tk, len - 1);
             const bf16_t* src = kv_row(which ? v_cache : k_cache, table, layer, kv_head, at);
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
-            if (KV_FP8) {
+            if (kv_q(layer)) {
                 float sc = kv_scale(which ? v_cache : k_cache, table, layer, kv_head, at);
                 uint2 raw = tk < len ? *(const uint2*)((const unsigned char*)src + c * 8) : make_uint2(0, 0);
                 unsigned w[4];

@@ -41,8 +41,8 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
             int t = k0 + r;
             float kv = 0.0f, vv = 0.0f;
             if (t < key_end) {
-                kv = kv_at(kv_row(k_cache, block_table, layer, kv_head, t), d, kv_scale(k_cache, block_table, layer, kv_head, t));
-                vv = kv_at(kv_row(v_cache, block_table, layer, kv_head, t), d, kv_scale(v_cache, block_table, layer, kv_head, t));
+                kv = kv_at(kv_row(k_cache, block_table, layer, kv_head, t), d, kv_scale(k_cache, block_table, layer, kv_head, t), kv_q(layer));
+                vv = kv_at(kv_row(v_cache, block_table, layer, kv_head, t), d, kv_scale(v_cache, block_table, layer, kv_head, t), kv_q(layer));
             }
             ks[r][d] = kv;
             vs[r][d] = vv;
