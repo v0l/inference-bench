@@ -979,6 +979,25 @@ mod tests {
     }
 
     #[test]
+    fn each_dense_family_config_is_supported_through_its_family_spec() {
+        let registry = specrt::family::Registry::embedded();
+        for (file, model_type) in [
+            ("phi3-mini.config.json", "phi3"),
+            ("olmo2-1b.config.json", "olmo2"),
+            ("granite-3.3-2b.config.json", "granite"),
+            ("smollm3-3b.config.json", "smollm3"),
+            ("tinymistral-248m.config.json", "mistral"),
+        ] {
+            let config: Value = serde_json::from_str(&fixture(file)).unwrap();
+            let family = registry.for_model_type(model_type).unwrap_or_else(|| panic!("no family spec for {model_type}"));
+            assert!(family.matches.model_types.iter().any(|m| m == model_type), "{file}");
+            let s = specrt_support(&config);
+            assert!(s.supported && s.reason.contains("dense decoder"), "{file}: {}", s.reason);
+            assert!(specrt_wgpu_support(&config).supported == specrt::wgsl::unsupported(&specrt::spec::Spec::from_hf_config(&config.to_string()).unwrap()).is_none(), "{file}");
+        }
+    }
+
+    #[test]
     fn an_unsupported_quant_scheme_is_refused_with_the_spec_error() {
         let mut config: Value = serde_json::from_str(&fixture("qwen3.8-27b.config.json")).unwrap();
         config["quantization_config"] = serde_json::json!({"quant_method": "gptq", "bits": 4});
