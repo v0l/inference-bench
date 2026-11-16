@@ -77,6 +77,7 @@ pub struct MediaEncoder {
     encoder: Box<dyn EncodeImages>,
     tokens: VisionTokens,
     merge: usize,
+    tile_tokens: usize,
     max_batch: usize,
     max_patches: usize,
     cache: Mutex<EmbedCache>,
@@ -91,10 +92,15 @@ pub struct MediaRequest<'a> {
 
 impl MediaEncoder {
     pub fn new(encoder: Box<dyn EncodeImages>, tokens: VisionTokens, merge: usize, opts: crate::spec::VisionOptions) -> Self {
+        Self::with_tiles(encoder, tokens, merge, 0, opts)
+    }
+
+    pub fn with_tiles(encoder: Box<dyn EncodeImages>, tokens: VisionTokens, merge: usize, tile_tokens: usize, opts: crate::spec::VisionOptions) -> Self {
         MediaEncoder {
             encoder,
             tokens,
             merge,
+            tile_tokens,
             max_batch: opts.max_batch.max(1),
             max_patches: BATCH_PATCHES,
             cache: Mutex::new(EmbedCache::new(opts.cache_mb)),
@@ -121,7 +127,11 @@ impl MediaEncoder {
             .map(|r| {
                 let processed: Vec<crate::vision::Processed> = r.media.iter().map(|m| m.processed.clone()).collect();
                 let hashes: Vec<[u8; 32]> = r.media.iter().map(|m| m.hash).collect();
-                crate::vision::plan_media(r.prompt, &self.tokens, self.merge, &processed, &hashes)
+                if self.tile_tokens > 0 {
+                    crate::vision::plan_tiles(r.prompt, &self.tokens, self.tile_tokens, &processed, &hashes)
+                } else {
+                    crate::vision::plan_media(r.prompt, &self.tokens, self.merge, &processed, &hashes)
+                }
             })
             .collect();
         let mut found: HashMap<[u8; 32], Arc<Vec<f32>>> = HashMap::new();

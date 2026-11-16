@@ -67,6 +67,38 @@ pub struct FamilyEmbedding {
     pub tie: Option<bool>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct VisionTokenKeys {
+    pub image: String,
+    pub video: String,
+    pub start: String,
+    pub end: String,
+}
+
+impl Default for VisionTokenKeys {
+    fn default() -> Self {
+        VisionTokenKeys { image: "image_token_id".into(), video: "video_token_id".into(), start: "vision_start_token_id".into(), end: "vision_end_token_id".into() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyVision {
+    pub pooled: bool,
+    pub bidirectional: bool,
+    pub soft_tokens_key: String,
+    pub placeholder: Option<String>,
+    pub wrap: String,
+    pub token_keys: VisionTokenKeys,
+}
+
+impl Default for FamilyVision {
+    fn default() -> Self {
+        FamilyVision { pooled: false, bidirectional: false, soft_tokens_key: String::new(), placeholder: None, wrap: String::new(), token_keys: VisionTokenKeys::default() }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyBlocks {
@@ -206,6 +238,8 @@ pub struct Family {
     pub norm: FamilyNorm,
     #[serde(default)]
     pub embedding: FamilyEmbedding,
+    #[serde(default)]
+    pub vision: FamilyVision,
     #[serde(default)]
     pub mtp: bool,
     #[serde(default)]

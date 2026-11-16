@@ -663,6 +663,7 @@ pub struct Runtime {
     snap: snapshot::SnapshotPool,
     mm_meta: CudaSlice<i32>,
     mm_table: CudaSlice<i32>,
+    mm_bidi: CudaSlice<i32>,
     media: Vec<Option<MediaDevice>>,
     vision: Option<Arc<crate::media_encode::MediaEncoder>>,
 }
@@ -914,6 +915,7 @@ impl Runtime {
         };
         let mm_meta = stream.alloc_zeros(2 * (layout.slots + 1))?;
         let mm_table = stream.alloc_zeros(if spec.rope.mrope.is_some() { (layout.slots + 1) * max_ctx * 3 } else { 1 })?;
+        let mm_bidi = stream.alloc_zeros(if spec.vision.as_ref().is_some_and(|v| v.config.bidirectional) { (layout.slots + 1) * max_ctx } else { 1 })?;
         let mut rt = Runtime {
             smem,
             pre,
@@ -964,6 +966,7 @@ impl Runtime {
             snap: Default::default(),
             mm_meta,
             mm_table,
+            mm_bidi,
             media: (0..=layout.slots).map(|_| None).collect(),
             vision: None,
         };
@@ -971,11 +974,11 @@ impl Runtime {
             rt.mtp = Some(mtp::MtpState::new(&rt, w)?);
         }
         if let Some(v) = &spec.vision {
-            if spec.rope.mrope.is_some() && checkpoint.has("model.visual.patch_embed.proj.weight") {
+            if crate::vision_encoder::has_tower(&checkpoint, &v.config) {
                 let opts = spec.runtime.vision;
                 let stream = rt.ctx.new_stream()?;
                 let enc = crate::vision_encoder::VisionEncoder::load_with(&rt.ctx, &stream, &jit, &checkpoint, &v.config, opts.precision)?;
-                rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::new(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, opts)));
+                rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::with_tiles(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, if v.config.pooled() { v.config.tokens_per_tile() } else { 0 }, opts)));
                 checkpoint.release();
             }
         }
@@ -1789,7 +1792,8 @@ impl Runtime {
             .arg(&self.mm_table)
             .arg(&mm_stride)
             .arg(&self.seq)
-            .arg(&l.window);
+            .arg(&l.window)
+            .arg(&self.mm_bidi);
         let rows = crate::codegen::flash_rows(a.head_dim);
         let config = LaunchConfig {
             grid_dim: (grid(n, rows), a.heads as u32, 1),
@@ -2093,15 +2097,20 @@ impl Runtime {
             self.stream.memcpy_htod(&[0i32, 0], &mut self.mm_meta.slice_mut(2 * slot..2 * slot + 2))?;
             return Ok(());
         };
-        ensure!(self.spec.rope.mrope.is_some(), "the model has no mrope section in its spec");
+        ensure!(self.spec.rope.mrope.is_some() || self.spec.vision.as_ref().is_some_and(|v| v.config.pooled()), "the model has no mrope section in its spec");
         let n = plan.positions.len();
         ensure!(n <= self.max_ctx, "media prompt longer than max_ctx");
         let hidden = self.spec.dims.hidden;
         ensure!(plan.embeds.len() % hidden == 0, "media embeddings are not rows of {hidden}");
         let table: Vec<i32> = plan.positions.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
         let base = slot * self.max_ctx * 3;
-        self.stream.memcpy_htod(&table, &mut self.mm_table.slice_mut(base..base + table.len()))?;
+        if self.spec.rope.mrope.is_some() {
+            self.stream.memcpy_htod(&table, &mut self.mm_table.slice_mut(base..base + table.len()))?;
+        }
         self.stream.memcpy_htod(&[n as i32, plan.delta], &mut self.mm_meta.slice_mut(2 * slot..2 * slot + 2))?;
+        if !plan.spans.is_empty() && self.mm_bidi.len() >= (slot + 1) * self.max_ctx {
+            self.stream.memcpy_htod(&plan.spans, &mut self.mm_bidi.slice_mut(slot * self.max_ctx..slot * self.max_ctx + n))?;
+        }
         let rows: Vec<i32> = plan.positions.iter().map(|p| p[3]).collect();
         let embeds = self.stream.clone_htod(plan.embeds.as_slice())?;
         self.media[slot] = Some(MediaDevice { embeds, rows });

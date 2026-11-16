@@ -594,3 +594,8 @@ when = "deepstack"
 
 [[vision_tail]]
 op = "vmerger"
+when = "merged"
+
+[[vision_tail]]
+op = "vpool"
+when = "pooled"

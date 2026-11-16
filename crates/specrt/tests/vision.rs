@@ -246,7 +246,7 @@ fn assets() -> MediaAssets {
         c.size = SizeBounds { shortest_edge: 65536, longest_edge: 16777216 };
         c
     };
-    MediaAssets { image: base("qwen3.8-27b.image-preprocessor.json"), video: base("qwen3.8-27b.video-preprocessor.json"), tokens: MediaTokens::default(), ids: tokens() }
+    MediaAssets { image: base("qwen3.8-27b.image-preprocessor.json"), video: base("qwen3.8-27b.video-preprocessor.json"), tokens: MediaTokens::default(), ids: tokens(), tiles: None }
 }
 
 fn png(w: u32, h: u32) -> Vec<u8> {

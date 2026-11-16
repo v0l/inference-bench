@@ -171,11 +171,12 @@ pub struct VisionOptions {
     pub precision: crate::vision_encoder::VisionPrecision,
     pub cache_mb: usize,
     pub max_batch: usize,
+    pub pan_and_scan: bool,
 }
 
 impl Default for VisionOptions {
     fn default() -> Self {
-        VisionOptions { precision: crate::vision_encoder::VisionPrecision::Fast, cache_mb: 1024, max_batch: 8 }
+        VisionOptions { precision: crate::vision_encoder::VisionPrecision::Fast, cache_mb: 1024, max_batch: 8, pan_and_scan: false }
     }
 }
 

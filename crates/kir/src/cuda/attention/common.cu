@@ -141,6 +141,11 @@ __device__ __forceinline__ float rope_position(const int* mm_meta, const int* mm
     return (float)(idx + mm_meta[2 * slot + 1]);
 }
 
+__device__ __forceinline__ int span_end(const int* mm_meta, const int* bidi, int mm_stride, int slot, int idx) {
+    if (!BIDI) return idx;
+    return idx < mm_meta[2 * slot] ? max(idx, bidi[(size_t)slot * mm_stride + idx]) : idx;
+}
+
 __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, const float* k_norm,
                                                bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
                                                int pos, int layer, int head, int row,

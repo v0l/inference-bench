@@ -3,8 +3,8 @@ kind = "family"
 extends = "base"
 
 [match]
-model_types = ["gemma3_text"]
-architectures = ["Gemma3ForCausalLM"]
+model_types = ["gemma3_text", "gemma3"]
+architectures = ["Gemma3ForCausalLM", "Gemma3ForConditionalGeneration"]
 
 [attention]
 qk_norm = true
@@ -22,3 +22,16 @@ sandwich = true
 [embedding]
 scale = "sqrt_hidden"
 tie = true
+
+[vision]
+pooled = true
+bidirectional = true
+soft_tokens_key = "mm_tokens_per_image"
+placeholder = "<start_of_image>"
+wrap = "\n\n"
+
+[vision.token_keys]
+image = "image_token_index"
+video = ""
+start = "boi_token_index"
+end = "eoi_token_index"

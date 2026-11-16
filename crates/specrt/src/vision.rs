@@ -42,6 +42,20 @@ impl Preprocessor {
         serde_json::from_str(json).context("preprocessor config")
     }
 
+    pub fn unused() -> Self {
+        Preprocessor {
+            size: SizeBounds { shortest_edge: 0, longest_edge: 0 },
+            patch_size: 1,
+            temporal_patch_size: 1,
+            merge_size: 1,
+            image_mean: [0.0; 3],
+            image_std: [1.0; 3],
+            fps: default_fps(),
+            min_frames: default_min_frames(),
+            max_frames: default_max_frames(),
+        }
+    }
+
     pub fn factor(&self) -> usize {
         self.patch_size * self.merge_size
     }
@@ -100,6 +114,28 @@ pub fn smart_resize(frames: usize, temporal: usize, height: usize, width: usize,
     Ok((h_bar as usize, w_bar as usize))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    Cubic,
+    Triangle,
+}
+
+impl Filter {
+    fn support(self) -> f64 {
+        match self {
+            Filter::Cubic => 2.0,
+            Filter::Triangle => 1.0,
+        }
+    }
+
+    fn weight(self, x: f64) -> f64 {
+        match self {
+            Filter::Cubic => cubic(x),
+            Filter::Triangle => (1.0 - x.abs()).max(0.0),
+        }
+    }
+}
+
 fn cubic(x: f64) -> f64 {
     let a = -0.5;
     let x = x.abs();
@@ -119,10 +155,10 @@ struct Coefficients {
     precision: u32,
 }
 
-fn coefficients(input: usize, output: usize) -> Coefficients {
+fn coefficients(input: usize, output: usize, filter: Filter) -> Coefficients {
     let scale = input as f64 / output as f64;
     let filter_scale = scale.max(1.0);
-    let support = 2.0 * filter_scale;
+    let support = filter.support() * filter_scale;
     let size = support.ceil() as usize * 2 + 1;
     let mut bounds = Vec::with_capacity(output);
     let mut weights = vec![0f64; output * size];
@@ -133,7 +169,7 @@ fn coefficients(input: usize, output: usize) -> Coefficients {
         let xmax = (((center + support + 0.5) as i64).min(input as i64) as usize).saturating_sub(xmin);
         let mut total = 0.0;
         for x in 0..xmax {
-            let v = cubic((x as f64 + xmin as f64 - center + 0.5) / filter_scale);
+            let v = filter.weight((x as f64 + xmin as f64 - center + 0.5) / filter_scale);
             weights[xx * size + x] = v;
             total += v;
         }
@@ -162,10 +198,18 @@ fn clip(v: i64, precision: u32) -> u8 {
 }
 
 pub fn resize_bicubic(src: &[u8], h: usize, w: usize, new_h: usize, new_w: usize) -> Vec<u8> {
+    resize(src, h, w, new_h, new_w, Filter::Cubic)
+}
+
+pub fn resize_bilinear(src: &[u8], h: usize, w: usize, new_h: usize, new_w: usize) -> Vec<u8> {
+    resize(src, h, w, new_h, new_w, Filter::Triangle)
+}
+
+fn resize(src: &[u8], h: usize, w: usize, new_h: usize, new_w: usize, filter: Filter) -> Vec<u8> {
     let horizontal = if new_w == w {
         src.to_vec()
     } else {
-        let c = coefficients(w, new_w);
+        let c = coefficients(w, new_w, filter);
         let init = 1i64 << (c.precision.max(1) - 1);
         let mut out = vec![0u8; h * new_w * 3];
         for y in 0..h {
@@ -186,7 +230,7 @@ pub fn resize_bicubic(src: &[u8], h: usize, w: usize, new_h: usize, new_w: usize
     if new_h == h {
         return horizontal;
     }
-    let c = coefficients(h, new_h);
+    let c = coefficients(h, new_h, filter);
     let init = 1i64 << (c.precision.max(1) - 1);
     let mut out = vec![0u8; new_h * new_w * 3];
     for y in 0..new_h {
@@ -361,12 +405,141 @@ pub struct MediaTokens {
     pub video: String,
     pub start: String,
     pub end: String,
+    pub placeholder: Option<String>,
+    pub wrap: String,
+    pub tile_tokens: usize,
 }
 
 impl Default for MediaTokens {
     fn default() -> Self {
-        MediaTokens { image: "<|image_pad|>".into(), video: "<|video_pad|>".into(), start: "<|vision_start|>".into(), end: "<|vision_end|>".into() }
+        MediaTokens {
+            image: "<|image_pad|>".into(),
+            video: "<|video_pad|>".into(),
+            start: "<|vision_start|>".into(),
+            end: "<|vision_end|>".into(),
+            placeholder: None,
+            wrap: String::new(),
+            tile_tokens: 0,
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PanAndScan {
+    pub min_crop: usize,
+    pub max_crops: usize,
+    pub min_ratio: f64,
+}
+
+impl Default for PanAndScan {
+    fn default() -> Self {
+        PanAndScan { min_crop: 256, max_crops: 4, min_ratio: 1.2 }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct TileSize {
+    pub height: usize,
+    pub width: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct TileConfig {
+    pub size: TileSize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    #[serde(default)]
+    pub pan_and_scan_min_crop_size: Option<usize>,
+    #[serde(default)]
+    pub pan_and_scan_max_num_crops: Option<usize>,
+    #[serde(default)]
+    pub pan_and_scan_min_ratio_to_activate: Option<f64>,
+}
+
+impl TileConfig {
+    pub fn from_json(json: &str) -> Result<Self> {
+        serde_json::from_str(json).context("preprocessor config")
+    }
+
+    pub fn pan_and_scan(&self) -> PanAndScan {
+        let d = PanAndScan::default();
+        PanAndScan {
+            min_crop: self.pan_and_scan_min_crop_size.unwrap_or(d.min_crop),
+            max_crops: self.pan_and_scan_max_num_crops.unwrap_or(d.max_crops),
+            min_ratio: self.pan_and_scan_min_ratio_to_activate.unwrap_or(d.min_ratio),
+        }
+    }
+}
+
+pub fn pan_and_scan_boxes(height: usize, width: usize, p: PanAndScan) -> Vec<[usize; 4]> {
+    let landscape = width >= height;
+    let (long, short) = if landscape { (width, height) } else { (height, width) };
+    if (long as f64) / (short as f64) < p.min_ratio {
+        return Vec::new();
+    }
+    let ideal = ((long as f64 / short as f64) + 0.5).floor() as usize;
+    let crops = ideal.min(long / p.min_crop).max(2).min(p.max_crops);
+    let (nw, nh) = if landscape { (crops, 1) } else { (1, crops) };
+    let (cw, ch) = (width.div_ceil(nw), height.div_ceil(nh));
+    if cw.min(ch) < p.min_crop {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for iy in 0..nh {
+        for ix in 0..nw {
+            let (y, x) = (iy * ch, ix * cw);
+            out.push([y, x, (y + ch).min(height), (x + cw).min(width)]);
+        }
+    }
+    out
+}
+
+fn crop_rgb(frame: &Frame, b: [usize; 4]) -> Frame {
+    let (h, w) = (b[2] - b[0], b[3] - b[1]);
+    let mut rgb = Vec::with_capacity(h * w * 3);
+    for y in b[0]..b[2] {
+        rgb.extend_from_slice(&frame.rgb[(y * frame.width + b[1]) * 3..(y * frame.width + b[3]) * 3]);
+    }
+    Frame { height: h, width: w, rgb }
+}
+
+pub fn tile_patches(cfg: &TileConfig, patch: usize, tiles: &[Vec<u8>]) -> Patches {
+    let (h, w) = (cfg.size.height, cfg.size.width);
+    let (gh, gw) = (h / patch, w / patch);
+    let scale: Vec<(f32, f32)> = (0..3).map(|c| (cfg.image_mean[c] * 255.0, cfg.image_std[c] * 255.0)).collect();
+    let mut data = Vec::with_capacity(tiles.len() * gh * gw * 3 * patch * patch);
+    for tile in tiles {
+        for by in 0..gh {
+            for bx in 0..gw {
+                for c in 0..3 {
+                    for py in 0..patch {
+                        for px in 0..patch {
+                            let v = tile[((by * patch + py) * w + bx * patch + px) * 3 + c] as f32;
+                            data.push((v - scale[c].0) / scale[c].1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Patches { grid: [tiles.len(), gh, gw], data }
+}
+
+pub fn preprocess_tiles(cfg: &TileConfig, patch: usize, bytes: &[u8], pan: Option<PanAndScan>) -> Result<Patches> {
+    let format = image::guess_format(bytes).map_err(|_| anyhow::anyhow!("the bytes are not a PNG, JPEG, GIF, BMP, TIFF or WebP image"))?;
+    let img = image::load_from_memory_with_format(bytes, format).context("decode image")?.to_rgb8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let whole = Frame { height: h, width: w, rgb: img.into_raw() };
+    let mut sources = vec![whole.clone()];
+    if let Some(p) = pan {
+        sources.extend(pan_and_scan_boxes(h, w, p).into_iter().map(|b| crop_rgb(&whole, b)));
+    }
+    let (th, tw) = (cfg.size.height, cfg.size.width);
+    let tiles: Vec<Vec<u8>> = sources
+        .iter()
+        .map(|f| if (f.height, f.width) == (th, tw) { f.rgb.clone() } else { resize_bilinear(&f.rgb, f.height, f.width, th, tw) })
+        .collect();
+    Ok(tile_patches(cfg, patch, &tiles))
 }
 
 pub enum Media<'a> {
@@ -374,7 +547,36 @@ pub enum Media<'a> {
     Video(&'a VideoPatches),
 }
 
+fn tile_sequence(tokens: &MediaTokens) -> String {
+    format!("{}{}{}{}{}", tokens.wrap, tokens.start, tokens.image.repeat(tokens.tile_tokens), tokens.end, tokens.wrap)
+}
+
+pub fn expand_tiles(prompt: &str, tokens: &MediaTokens, media: &[Media]) -> Result<String> {
+    let slot = tokens.placeholder.as_deref().context("the model has no image placeholder")?;
+    let sequence = tile_sequence(tokens);
+    let mut out = String::with_capacity(prompt.len());
+    let mut rest = prompt;
+    for item in media {
+        let Media::Image(p) = item else { bail!("the model takes images only") };
+        let crops = p.grid[0] - 1;
+        let expansion = if crops == 0 {
+            sequence.clone()
+        } else {
+            format!("Here is the original image {sequence} and here are some crops to help you see better {}", vec![sequence.as_str(); crops].join(" "))
+        };
+        let at = rest.find(slot).context("prompt has fewer media placeholders than media items")?;
+        out.push_str(&rest[..at]);
+        out.push_str(&expansion);
+        rest = &rest[at + slot.len()..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 pub fn expand_placeholders(prompt: &str, tokens: &MediaTokens, merge_size: usize, media: &[Media]) -> Result<String> {
+    if tokens.placeholder.is_some() {
+        return expand_tiles(prompt, tokens, media);
+    }
     let image_slot = format!("{}{}{}", tokens.start, tokens.image, tokens.end);
     let video_slot = format!("{}{}{}", tokens.start, tokens.video, tokens.end);
     let mut out = String::with_capacity(prompt.len());
@@ -401,23 +603,81 @@ pub fn expand_placeholders(prompt: &str, tokens: &MediaTokens, merge_size: usize
     Ok(out)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tower {
+    #[default]
+    Merged,
+    Pooled,
+}
+
+fn one() -> usize {
+    1
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VisionConfig {
+    #[serde(alias = "num_hidden_layers")]
     pub depth: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    #[serde(alias = "num_attention_heads")]
     pub num_heads: usize,
     pub patch_size: usize,
+    #[serde(default = "one")]
     pub spatial_merge_size: usize,
+    #[serde(default = "one")]
     pub temporal_patch_size: usize,
+    #[serde(default)]
     pub out_hidden_size: usize,
+    #[serde(default)]
     pub num_position_embeddings: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, alias = "num_channels", skip_serializing_if = "Option::is_none")]
     pub in_channels: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hidden_act: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deepstack_visual_indexes: Vec<usize>,
+    #[serde(default, skip_serializing_if = "is_default_tower")]
+    pub tower: Tower,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_size: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_norm_eps: Option<f64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bidirectional: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub wrap: String,
+}
+
+fn is_default_tower(t: &Tower) -> bool {
+    *t == Tower::Merged
+}
+
+impl VisionConfig {
+    pub fn pooled(&self) -> bool {
+        self.tower == Tower::Pooled
+    }
+
+    pub fn side(&self) -> usize {
+        match self.image_size {
+            Some(size) if self.pooled() => size / self.patch_size,
+            _ => (self.num_position_embeddings as f64).sqrt() as usize,
+        }
+    }
+
+    pub fn tokens_per_tile(&self) -> usize {
+        self.mm_tokens.unwrap_or(0)
+    }
+
+    pub fn pool_kernel(&self) -> usize {
+        let per_side = (self.tokens_per_tile() as f64).sqrt() as usize;
+        if per_side == 0 { 1 } else { self.side() / per_side }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -436,18 +696,38 @@ pub struct Vision {
 
 impl Vision {
     pub fn from_hf_config(json: &str) -> Result<Option<Self>> {
+        let family = crate::family::active();
+        Self::from_hf_with(json, &family)
+    }
+
+    pub fn from_hf_with(json: &str, registry: &crate::family::Registry) -> Result<Option<Self>> {
         let top: serde_json::Value = serde_json::from_str(json).context("config.json")?;
         let Some(vc) = top.get("vision_config").filter(|v| v.is_object()) else { return Ok(None) };
         if top.get("language_model_only").and_then(|v| v.as_bool()) == Some(true) {
             return Ok(None);
         }
-        let config: VisionConfig = serde_json::from_value(vc.clone()).context("vision_config")?;
+        let family = top.get("model_type").and_then(|t| t.as_str()).and_then(|t| registry.for_model_type(t));
+        let spec = family.map(|f| f.vision.clone()).unwrap_or_default();
+        let mut config: VisionConfig = serde_json::from_value(vc.clone()).context("vision_config")?;
+        if spec.pooled {
+            let text = top.get("text_config").unwrap_or(&top);
+            config.tower = Tower::Pooled;
+            config.bidirectional = spec.bidirectional;
+            config.placeholder = spec.placeholder.clone();
+            config.wrap = spec.wrap.clone();
+            config.out_hidden_size = text.get("hidden_size").and_then(|v| v.as_u64()).context("text_config has no hidden_size")? as usize;
+            config.mm_tokens = top.get(spec.soft_tokens_key.as_str()).and_then(|v| v.as_u64()).map(|v| v as usize);
+            let image = config.image_size.context("vision_config has no image_size")?;
+            config.num_position_embeddings = (image / config.patch_size).pow(2);
+            ensure!(config.mm_tokens.is_some_and(|n| n > 0), "config.json has no {}", spec.soft_tokens_key);
+        }
         let id = |k: &str| top.get(k).and_then(|v| v.as_u64()).map(|v| v as u32).with_context(|| format!("config.json has no {k}"));
+        let keys = &spec.token_keys;
         let tokens = VisionTokens {
-            image: id("image_token_id")?,
-            video: id("video_token_id")?,
-            start: id("vision_start_token_id")?,
-            end: id("vision_end_token_id")?,
+            image: id(&keys.image)?,
+            video: if keys.video.is_empty() { u32::MAX } else { id(&keys.video)? },
+            start: id(&keys.start)?,
+            end: id(&keys.end)?,
         };
         Ok(Some(Vision { config, tokens }))
     }
@@ -497,6 +777,14 @@ pub struct MediaAssets {
     pub video: Preprocessor,
     pub tokens: MediaTokens,
     pub ids: VisionTokens,
+    pub tiles: Option<TileAssets>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileAssets {
+    pub config: TileConfig,
+    pub patch: usize,
+    pub pan_and_scan: Option<PanAndScan>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -522,6 +810,19 @@ impl MediaAssets {
     }
 
     pub fn process(&self, items: &[MediaItem], budget: MediaBudget) -> Result<Vec<Processed>> {
+        if let Some(t) = &self.tiles {
+            return items
+                .iter()
+                .map(|item| match item.kind {
+                    MediaKind::Image => {
+                        let p = preprocess_tiles(&t.config, t.patch, &item.bytes, t.pan_and_scan)?;
+                        check_patches(&p, &budget)?;
+                        Ok(Processed::Image(p))
+                    }
+                    MediaKind::Video => bail!("the model takes images only"),
+                })
+                .collect();
+        }
         items
             .iter()
             .map(|item| match item.kind {
@@ -589,6 +890,27 @@ pub struct MediaPlan {
     pub delta: i32,
     pub tags: Vec<u32>,
     pub embeds: Arc<Vec<f32>>,
+    pub spans: Vec<i32>,
+}
+
+impl MediaPlan {
+    pub fn extend_chunk(&self, start: usize, end: usize, limit: usize) -> usize {
+        if self.spans.is_empty() || end == 0 || end > self.spans.len() {
+            return end;
+        }
+        let last = end - 1;
+        if self.spans[last] as usize <= last {
+            return end;
+        }
+        let mut block_start = last;
+        while block_start > 0 && self.spans[block_start - 1] == self.spans[last] {
+            block_start -= 1;
+        }
+        if block_start > start {
+            return block_start;
+        }
+        (self.spans[last] as usize + 1).min(start + limit)
+    }
 }
 
 fn tag(hash: &[u8; 32], row: usize) -> u32 {
@@ -649,5 +971,47 @@ pub fn plan_media(ids: &[u32], vis: &VisionTokens, merge: usize, processed: &[Pr
         i = j;
     }
     ensure!(next_item == processed.len(), "fewer media placeholders than media items");
-    Ok(MediaPlan { positions, delta: cur - ids.len() as i32, tags, embeds: Arc::new(Vec::new()) })
+    Ok(MediaPlan { positions, delta: cur - ids.len() as i32, tags, embeds: Arc::new(Vec::new()), spans: Vec::new() })
+}
+
+pub fn plan_tiles(ids: &[u32], vis: &VisionTokens, tile_tokens: usize, processed: &[Processed], hashes: &[[u8; 32]]) -> Result<MediaPlan> {
+    ensure!(processed.len() == hashes.len(), "one hash per media item");
+    let mut positions: Vec<[i32; 4]> = (0..ids.len() as i32).map(|v| [v, v, v, -1]).collect();
+    let mut tags = vec![0u32; ids.len()];
+    let mut spans: Vec<i32> = (0..ids.len() as i32).collect();
+    let mut tiles_left = 0usize;
+    let mut next_item = 0usize;
+    let mut item_row = 0usize;
+    let mut embed_row = 0i32;
+    let mut i = 0;
+    while i < ids.len() {
+        if ids[i] != vis.image {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < ids.len() && ids[j] == vis.image {
+            j += 1;
+        }
+        ensure!(j - i == tile_tokens, "an image run of {} tokens, a tile has {tile_tokens}", j - i);
+        if tiles_left == 0 {
+            let item = processed.get(next_item).context("more image placeholders than images")?;
+            tiles_left = item.patches().grid[0];
+            item_row = 0;
+        }
+        for k in i..j {
+            positions[k][3] = embed_row;
+            tags[k] = tag(&hashes[next_item], item_row);
+            spans[k] = (j - 1) as i32;
+            embed_row += 1;
+            item_row += 1;
+        }
+        tiles_left -= 1;
+        if tiles_left == 0 {
+            next_item += 1;
+        }
+        i = j;
+    }
+    ensure!(tiles_left == 0 && next_item == processed.len(), "fewer image placeholders than images");
+    Ok(MediaPlan { positions, delta: 0, tags, embeds: Arc::new(Vec::new()), spans })
 }

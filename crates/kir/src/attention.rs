@@ -48,6 +48,7 @@ pub struct AttentionShape {
     pub softcap: f64,
     pub local_theta: f64,
     pub local_rope: Vec<bool>,
+    pub bidirectional: bool,
 }
 
 impl AttentionShape {
@@ -242,6 +243,7 @@ pub(crate) fn constants(s: &AttentionShape, families: &[Family]) -> String {
     let _ = writeln!(o, "constexpr bool LOCAL_ROPE[] = {{ {} }};", if local.is_empty() { "false".into() } else { local.join(", ") });
     let _ = writeln!(o, "constexpr float LOCAL_THETA = {};", f(s.local_theta));
     let _ = writeln!(o, "constexpr float QUERY_SCALE = {};", f(s.query_scale));
+    let _ = writeln!(o, "constexpr bool BIDI = {};", s.bidirectional);
     let _ = writeln!(o, "constexpr float SOFTCAP = {};", f(s.softcap));
     let _ = writeln!(o, "constexpr float THETA = {};", f(r.theta));
     let _ = writeln!(o, "constexpr int ROPE_KIND = {};", r.kind);

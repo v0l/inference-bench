@@ -997,6 +997,10 @@ impl<E: Executor> Scheduler<E> {
                         n = n.min(p - self.running[i].computed);
                     }
                 }
+                if let Some(m) = self.running[i].media.clone() {
+                    let from = self.running[i].computed;
+                    n = m.extend_chunk(from, from + n, limit) - from;
+                }
                 let s = &self.running[i];
                 let last = s.computed + n == target;
                 let sample = (last && s.generated() == 0).then_some((s.req.sampling, 0));

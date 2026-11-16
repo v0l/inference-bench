@@ -55,6 +55,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize) -> kir::attention::Attenti
         kv_f16_layers: spec.kv_f16_layers(),
         query_scale: spec.attention.query_scalar.map_or(1.0 / (a.head_dim as f64).sqrt(), |q| 1.0 / q.sqrt()),
         softcap: spec.attention.softcap.unwrap_or(0.0),
+        bidirectional: spec.vision.as_ref().is_some_and(|v| v.config.bidirectional),
         local_theta: spec.rope.local_theta.unwrap_or(spec.rope.theta),
         local_rope: (0..spec.layers.count)
             .filter(|&i| !spec.block(i).is_linear())

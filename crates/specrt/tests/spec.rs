@@ -465,7 +465,7 @@ fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
     let vision = Spec::parse(&format!("{base}\n[runtime.vision]\nprecision = \"exact\"\ncache_mb = 64\nmax_batch = 2\n")).unwrap();
     assert_eq!(
         vision.runtime.vision,
-        specrt::spec::VisionOptions { precision: specrt::vision_encoder::VisionPrecision::Exact, cache_mb: 64, max_batch: 2 }
+        specrt::spec::VisionOptions { precision: specrt::vision_encoder::VisionPrecision::Exact, cache_mb: 64, max_batch: 2, pan_and_scan: false }
     );
     assert_eq!(Spec::parse(&vision.to_toml().unwrap()).unwrap(), vision);
     assert!(format!("{:#}", Spec::parse(&format!("{base}\n[runtime.vision]\nprecision = \"half\"\n")).unwrap_err()).contains("half"));

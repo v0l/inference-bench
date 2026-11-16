@@ -275,7 +275,13 @@ impl Checkpoint {
     pub fn root(&self) -> &'static str {
         if self.gguf.is_some() {
             "model"
-        } else if self.has("model.language_model.embed_tokens.weight") { "model.language_model" } else { "model" }
+        } else if self.has("model.language_model.embed_tokens.weight") {
+            "model.language_model"
+        } else if self.has("language_model.model.embed_tokens.weight") {
+            "language_model.model"
+        } else {
+            "model"
+        }
     }
 
     fn shaped(&self, name: &str, shape: &[usize]) -> Result<View<'_>> {

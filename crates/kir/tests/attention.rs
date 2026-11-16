@@ -44,6 +44,7 @@ fn shape(planes: usize, fp8: bool, mrope: bool) -> AttentionShape {
         softcap: if mrope { 30.0 } else { 0.0 },
         local_theta: 10000.0,
         local_rope: vec![false, true, false, false],
+        bidirectional: false,
     }
 }
 

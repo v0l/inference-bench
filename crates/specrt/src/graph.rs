@@ -211,12 +211,20 @@ fn vision_op(node: &Node, block: usize, deepstack: Option<usize>) -> Result<Visi
         "vmlp_down" => VisionOp::MlpDown { block },
         "deepstack_merger" => VisionOp::DeepstackMerger { index: deepstack.context("deepstack merger outside a deepstack block")?, after_block: block },
         "vmerger" => VisionOp::Merger,
+        "vpool" => VisionOp::Pool,
         other => bail!("unknown vision op {other}"),
     })
 }
 
-fn vision_holds(when: Option<&str>, deepstack: Option<usize>) -> bool {
-    when.is_none_or(|w| w.split('+').all(|c| c == "deepstack" && deepstack.is_some()))
+fn vision_holds(when: Option<&str>, deepstack: Option<usize>, cfg: &VisionConfig) -> bool {
+    when.is_none_or(|w| {
+        w.split('+').all(|c| match c {
+            "deepstack" => deepstack.is_some(),
+            "pooled" => cfg.pooled(),
+            "merged" => !cfg.pooled(),
+            _ => false,
+        })
+    })
 }
 
 impl Graph {
@@ -227,11 +235,11 @@ impl Graph {
         }
         for block in 0..cfg.depth {
             let deepstack = cfg.deepstack_visual_indexes.iter().position(|&b| b == block);
-            for n in self.vision_block.iter().filter(|n| vision_holds(n.when.as_deref(), deepstack)) {
+            for n in self.vision_block.iter().filter(|n| vision_holds(n.when.as_deref(), deepstack, cfg)) {
                 ops.push(vision_op(n, block, deepstack)?);
             }
         }
-        for n in &self.vision_tail {
+        for n in self.vision_tail.iter().filter(|n| vision_holds(n.when.as_deref(), None, cfg)) {
             ops.push(vision_op(n, 0, None)?);
         }
         Ok(ops)

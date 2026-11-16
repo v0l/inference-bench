@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 pub const VISION_TEMPLATE: &str = include_str!("../templates/vision.cu");
 
-const KERNELS: &[&str] = &["vis_mma", "vis_split", "vis_layernorm", "vis_pos", "vis_rope_pack", "vis_flash", "vis_to_f16"];
+const KERNELS: &[&str] = &["vis_mma", "vis_split", "vis_layernorm", "vis_pos", "vis_rope_pack", "vis_flash", "vis_to_f16", "vis_pool"];
 const GEMM_BM: u32 = 128;
 const GEMM_BN: u32 = 128;
 const GEMM_THREADS: u32 = 256;
@@ -63,6 +63,7 @@ pub enum VisionOp {
     MlpUp { block: usize },
     MlpDown { block: usize },
     Merger,
+    Pool,
     DeepstackMerger { index: usize, after_block: usize },
 }
 
@@ -78,6 +79,7 @@ impl VisionOp {
             VisionOp::MlpUp { block } => format!("block {block} mlp up"),
             VisionOp::MlpDown { block } => format!("block {block} mlp down"),
             VisionOp::Merger => "patch merger".into(),
+            VisionOp::Pool => "post norm, average pool, soft embedding norm, projector".into(),
             VisionOp::DeepstackMerger { index, after_block } => format!("deepstack merger {index} after block {after_block}"),
         }
     }
@@ -115,6 +117,15 @@ struct Merger {
     post_shuffle_norm: bool,
 }
 
+struct Pool {
+    post: Norm,
+    soft_norm: CudaSlice<f32>,
+    proj: Linear,
+    kernel: usize,
+    side: usize,
+    eps: f32,
+}
+
 pub struct VisionEncoder {
     stream: Arc<CudaStream>,
     mma: CudaFunction,
@@ -128,7 +139,9 @@ pub struct VisionEncoder {
     patch: Linear,
     pos_embed: CudaSlice<f32>,
     blocks: Vec<Block>,
-    merger: Merger,
+    merger: Option<Merger>,
+    pool: Option<Pool>,
+    pool_fn: CudaFunction,
     deepstack: Vec<Merger>,
     workspace: std::sync::Mutex<Workspace>,
     ops: Vec<VisionOp>,
@@ -183,6 +196,88 @@ fn prefix(ck: &Checkpoint) -> Result<&'static str> {
         }
     }
     bail!("the checkpoint has no vision tensors")
+}
+
+pub fn has_tower(ck: &Checkpoint, cfg: &VisionConfig) -> bool {
+    if cfg.pooled() { pooled_prefix(ck).is_some() } else { prefix(ck).is_ok() }
+}
+
+fn pooled_prefix(ck: &Checkpoint) -> Option<&'static str> {
+    ["vision_tower.vision_model", "model.vision_tower.vision_model", "model.vision_tower", "vision_tower"].into_iter().find(|p| ck.has(&format!("{p}.embeddings.patch_embedding.weight")))
+}
+
+fn projector_prefix(ck: &Checkpoint) -> &'static str {
+    if ck.has("model.multi_modal_projector.mm_input_projection_weight") { "model.multi_modal_projector" } else { "multi_modal_projector" }
+}
+
+fn stacked(stream: &Arc<CudaStream>, ck: &Checkpoint, bases: &[String], rows: usize, cols: usize) -> Result<Linear> {
+    let mut w: Vec<u16> = Vec::with_capacity(bases.len() * rows * cols);
+    let mut b: Vec<u16> = Vec::with_capacity(bases.len() * rows);
+    for base in bases {
+        w.extend_from_slice(ck.bf16(&format!("{base}.weight"), &[rows, cols]).with_context(|| base.clone())?.as_ref());
+        b.extend_from_slice(ck.bf16(&format!("{base}.bias"), &[rows]).with_context(|| base.clone())?.as_ref());
+    }
+    Ok(Linear { w: stream.clone_htod(&w)?, b: stream.clone_htod(&b)?, rows: bases.len() * rows, cols })
+}
+
+fn padded_columns(w: &[u16], rows: usize, cols: usize, to: usize) -> Vec<u16> {
+    let mut out = vec![0u16; rows * to];
+    for r in 0..rows {
+        out[r * to..r * to + cols].copy_from_slice(&w[r * cols..(r + 1) * cols]);
+    }
+    out
+}
+
+fn pooled_parts(stream: &Arc<CudaStream>, ck: &Checkpoint, cfg: &VisionConfig) -> Result<(Linear, CudaSlice<f32>, Vec<Block>, Pool)> {
+    let p = pooled_prefix(ck).context("the checkpoint has no SigLIP tensors")?;
+    let hidden = cfg.hidden_size;
+    let channels = cfg.in_channels.unwrap_or(3);
+    let raw = channels * cfg.patch_size * cfg.patch_size;
+    let cols = raw.div_ceil(8) * 8;
+    let conv = ck.bf16(&format!("{p}.embeddings.patch_embedding.weight"), &[hidden, channels, cfg.patch_size, cfg.patch_size])?;
+    let patch = Linear {
+        w: stream.clone_htod(&padded_columns(&conv, hidden, raw, cols))?,
+        b: upload(stream, ck, &format!("{p}.embeddings.patch_embedding.bias"), &[hidden])?,
+        rows: hidden,
+        cols,
+    };
+    let positions = ck.bf16(&format!("{p}.embeddings.position_embedding.weight"), &[cfg.num_position_embeddings, hidden])?;
+    let positions: Vec<f32> = positions.iter().map(|&v| bf16_to_f32(v)).collect();
+    let pos_embed = stream.clone_htod(&positions)?;
+    let mut blocks = Vec::with_capacity(cfg.depth);
+    for i in 0..cfg.depth {
+        let b = format!("{p}.encoder.layers.{i}");
+        let qkv: Vec<String> = ["q_proj", "k_proj", "v_proj"].iter().map(|n| format!("{b}.self_attn.{n}")).collect();
+        blocks.push(Block {
+            norm1: norm(stream, ck, &format!("{b}.layer_norm1"), hidden)?,
+            norm2: norm(stream, ck, &format!("{b}.layer_norm2"), hidden)?,
+            qkv: stacked(stream, ck, &qkv, hidden, hidden)?,
+            proj: linear(stream, ck, &format!("{b}.self_attn.out_proj"), hidden, hidden)?,
+            up: linear(stream, ck, &format!("{b}.mlp.fc1"), cfg.intermediate_size, hidden)?,
+            down: linear(stream, ck, &format!("{b}.mlp.fc2"), hidden, cfg.intermediate_size)?,
+        });
+    }
+    let mp = projector_prefix(ck);
+    let soft = ck.bf16(&format!("{mp}.mm_soft_emb_norm.weight"), &[hidden])?;
+    let soft_norm = stream.clone_htod(&soft.iter().map(|&v| 1.0 + bf16_to_f32(v)).collect::<Vec<f32>>())?;
+    let out = cfg.out_hidden_size;
+    let projection = ck.bf16(&format!("{mp}.mm_input_projection_weight"), &[hidden, out])?;
+    let mut transposed = vec![0u16; out * hidden];
+    for k in 0..hidden {
+        for n in 0..out {
+            transposed[n * hidden + k] = projection[k * out + n];
+        }
+    }
+    let proj = Linear { w: stream.clone_htod(&transposed)?, b: stream.clone_htod(&vec![0u16; out])?, rows: out, cols: hidden };
+    let pool = Pool {
+        post: norm(stream, ck, &format!("{p}.post_layernorm"), hidden)?,
+        soft_norm,
+        proj,
+        kernel: cfg.pool_kernel(),
+        side: cfg.side(),
+        eps: cfg.layer_norm_eps.unwrap_or(1e-6) as f32,
+    };
+    Ok((patch, pos_embed, blocks, pool))
 }
 
 fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, name: &str, shape: &[usize]) -> Result<CudaSlice<u16>> {
@@ -339,38 +434,45 @@ impl VisionEncoder {
         let head_dim = cfg.hidden_size / cfg.num_heads;
         ensure!(head_dim % 8 == 0 && head_dim <= 128, "vision head_dim {head_dim} is not supported");
         let act = Act::from_config(cfg.hidden_act.as_deref())?;
-        let p = prefix(ck)?;
         let loaded = jit.load(&module(head_dim, precise)?)?;
         let _ = ctx;
-        let channels = cfg.in_channels.unwrap_or(3);
-        let patch_cols = channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
-        ensure!(patch_cols % 8 == 0, "patch of {patch_cols} values is not a multiple of 8");
-        let mut patch = Linear {
-            w: upload(stream, ck, &format!("{p}.patch_embed.proj.weight"), &[cfg.hidden_size, channels, cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size])?,
-            b: upload(stream, ck, &format!("{p}.patch_embed.proj.bias"), &[cfg.hidden_size])?,
-            rows: cfg.hidden_size,
-            cols: patch_cols,
+        let (mut patch, pos_embed, mut blocks, mut main, mut deepstack, mut pool) = if cfg.pooled() {
+            let (patch, pos_embed, blocks, pool) = pooled_parts(stream, ck, cfg)?;
+            (patch, pos_embed, blocks, None, Vec::new(), Some(pool))
+        } else {
+            let p = prefix(ck)?;
+            let channels = cfg.in_channels.unwrap_or(3);
+            let patch_cols = channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+            ensure!(patch_cols % 8 == 0, "patch of {patch_cols} values is not a multiple of 8");
+            let patch = Linear {
+                w: upload(stream, ck, &format!("{p}.patch_embed.proj.weight"), &[cfg.hidden_size, channels, cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size])?,
+                b: upload(stream, ck, &format!("{p}.patch_embed.proj.bias"), &[cfg.hidden_size])?,
+                rows: cfg.hidden_size,
+                cols: patch_cols,
+            };
+            let table = ck.bf16(&format!("{p}.pos_embed.weight"), &[cfg.num_position_embeddings, cfg.hidden_size])?;
+            let table: Vec<f32> = table.iter().map(|&v| bf16_to_f32(v)).collect();
+            let pos_embed = stream.clone_htod(&table)?;
+            let mut blocks = Vec::with_capacity(cfg.depth);
+            for i in 0..cfg.depth {
+                let b = format!("{p}.blocks.{i}");
+                blocks.push(Block {
+                    norm1: norm(stream, ck, &format!("{b}.norm1"), cfg.hidden_size)?,
+                    norm2: norm(stream, ck, &format!("{b}.norm2"), cfg.hidden_size)?,
+                    qkv: linear(stream, ck, &format!("{b}.attn.qkv"), 3 * cfg.hidden_size, cfg.hidden_size)?,
+                    proj: linear(stream, ck, &format!("{b}.attn.proj"), cfg.hidden_size, cfg.hidden_size)?,
+                    up: linear(stream, ck, &format!("{b}.mlp.linear_fc1"), cfg.intermediate_size, cfg.hidden_size)?,
+                    down: linear(stream, ck, &format!("{b}.mlp.linear_fc2"), cfg.hidden_size, cfg.intermediate_size)?,
+                });
+            }
+            let main = merger(stream, ck, &format!("{p}.merger"), cfg, false)?;
+            let mut deepstack = Vec::new();
+            for i in 0..cfg.deepstack_visual_indexes.len() {
+                deepstack.push(merger(stream, ck, &format!("{p}.deepstack_merger_list.{i}"), cfg, true)?);
+            }
+            (patch, pos_embed, blocks, Some(main), deepstack, None)
         };
-        let table = ck.bf16(&format!("{p}.pos_embed.weight"), &[cfg.num_position_embeddings, cfg.hidden_size])?;
-        let table: Vec<f32> = table.iter().map(|&v| bf16_to_f32(v)).collect();
-        let pos_embed = stream.clone_htod(&table)?;
-        let mut blocks = Vec::with_capacity(cfg.depth);
-        for i in 0..cfg.depth {
-            let b = format!("{p}.blocks.{i}");
-            blocks.push(Block {
-                norm1: norm(stream, ck, &format!("{b}.norm1"), cfg.hidden_size)?,
-                norm2: norm(stream, ck, &format!("{b}.norm2"), cfg.hidden_size)?,
-                qkv: linear(stream, ck, &format!("{b}.attn.qkv"), 3 * cfg.hidden_size, cfg.hidden_size)?,
-                proj: linear(stream, ck, &format!("{b}.attn.proj"), cfg.hidden_size, cfg.hidden_size)?,
-                up: linear(stream, ck, &format!("{b}.mlp.linear_fc1"), cfg.intermediate_size, cfg.hidden_size)?,
-                down: linear(stream, ck, &format!("{b}.mlp.linear_fc2"), cfg.hidden_size, cfg.intermediate_size)?,
-            });
-        }
-        let mut main = merger(stream, ck, &format!("{p}.merger"), cfg, false)?;
-        let mut deepstack = Vec::new();
-        for i in 0..cfg.deepstack_visual_indexes.len() {
-            deepstack.push(merger(stream, ck, &format!("{p}.deepstack_merger_list.{i}"), cfg, true)?);
-        }
+        let patch_cols = patch.cols;
         let mma = loaded.function("vis_mma")?;
         let flash = loaded.function("vis_flash")?;
         {
@@ -393,9 +495,12 @@ impl VisionEncoder {
                     convert(&mut l.w)?;
                 }
             }
-            for m in std::iter::once(&mut main).chain(deepstack.iter_mut()) {
+            for m in main.iter_mut().chain(deepstack.iter_mut()) {
                 convert(&mut m.up.w)?;
                 convert(&mut m.down.w)?;
+            }
+            if let Some(p) = pool.as_mut() {
+                convert(&mut p.proj.w)?;
             }
         }
         let workspace = std::sync::Mutex::new(Workspace::new(stream, cfg, patch_cols, WORKSPACE_PATCHES)?);
@@ -416,12 +521,19 @@ impl VisionEncoder {
             pos_embed,
             blocks,
             merger: main,
+            pool,
+            pool_fn: loaded.function("vis_pool")?,
             deepstack,
         })
     }
 
     pub fn plan(&self) -> Vec<VisionOp> {
         self.ops.clone()
+    }
+
+    fn raw_cols(&self) -> usize {
+        let cfg = &self.cfg;
+        cfg.in_channels.unwrap_or(3) * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size
     }
 
     pub fn config(&self) -> &VisionConfig {
@@ -486,7 +598,7 @@ impl VisionEncoder {
     fn layout(&self, items: &[&Patches]) -> Result<BatchLayout> {
         let cfg = &self.cfg;
         let merge = cfg.spatial_merge_size;
-        let side = (cfg.num_position_embeddings as f64).sqrt() as usize;
+        let side = cfg.side();
         let mut l = BatchLayout { tokens: 0, taps: Vec::new(), tap_weights: Vec::new(), hw: Vec::new(), seg_lo: Vec::new(), seg_hi: Vec::new(), merged_rows: Vec::new() };
         for p in items {
             let [t, h, w] = p.grid;
@@ -494,7 +606,8 @@ impl VisionEncoder {
             ensure!(t * h * w <= MAX_ENCODE_PATCHES, "grid {t}x{h}x{w} is {} patches, the encoder takes at most {MAX_ENCODE_PATCHES}", t * h * w);
             ensure!(h % merge == 0 && w % merge == 0, "grid {h}x{w} is not a multiple of the merge size");
             let tokens = t * h * w;
-            ensure!(p.data.len() == tokens * self.patch.cols, "patch tensor has {} values, grid needs {}", p.data.len(), tokens * self.patch.cols);
+            let raw = self.raw_cols();
+            ensure!(p.data.len() == tokens * raw, "patch tensor has {} values, grid needs {}", p.data.len(), tokens * raw);
             let (taps, weights) = position_taps(side, p.grid, merge);
             l.taps.extend(taps);
             l.tap_weights.extend(weights);
@@ -506,7 +619,7 @@ impl VisionEncoder {
                 l.seg_hi.push((lo + frame) as i32);
             }
             l.tokens += tokens;
-            l.merged_rows.push(tokens / (merge * merge));
+            l.merged_rows.push(if cfg.pooled() { t * cfg.tokens_per_tile() } else { tokens / (merge * merge) });
         }
         ensure!(l.tokens > 0, "nothing to encode");
         Ok(l)
@@ -542,9 +655,20 @@ impl VisionEncoder {
         let hdp = head_pad(head_dim);
         let s = &self.stream;
         let mut at = 0;
+        let (raw, cols) = (self.raw_cols(), self.patch.cols);
         for p in items {
-            s.memcpy_htod(&p.data, &mut ws.input.slice_mut(at..at + p.data.len()))?;
-            at += p.data.len();
+            if raw == cols {
+                s.memcpy_htod(&p.data, &mut ws.input.slice_mut(at..at + p.data.len()))?;
+                at += p.data.len();
+            } else {
+                let rows = p.data.len() / raw;
+                let mut padded = vec![0f32; rows * cols];
+                for r in 0..rows {
+                    padded[r * cols..r * cols + raw].copy_from_slice(&p.data[r * raw..(r + 1) * raw]);
+                }
+                s.memcpy_htod(&padded, &mut ws.input.slice_mut(at..at + padded.len()))?;
+                at += padded.len();
+            }
         }
         let taps = s.clone_htod(&l.taps)?;
         let tap_weights = s.clone_htod(&l.tap_weights)?;
@@ -576,7 +700,8 @@ impl VisionEncoder {
                 VisionOp::Qkv { block } => self.gemm(&self.blocks[block].qkv, xn, Out::Store(qkv), tokens, Act::None)?,
                 VisionOp::Rope => {
                     let mut b = s.launch_builder(&self.rope_pack);
-                    b.arg(&*qkv).arg(&hw).arg(&mut *packed).arg(&t32).arg(&h32).arg(&hd32).arg(&ROPE_THETA);
+                    let theta = if cfg.pooled() { 0.0 } else { ROPE_THETA };
+                    b.arg(&*qkv).arg(&hw).arg(&mut *packed).arg(&t32).arg(&h32).arg(&hd32).arg(&theta);
                     unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, heads as u32, 1), block_dim: (hdp as u32, 1, 1), shared_mem_bytes: 0 }) }?;
                 }
                 VisionOp::Attention => {
@@ -598,8 +723,24 @@ impl VisionEncoder {
                     deepstack.push(self.split_rows(flat, &l.merged_rows));
                 }
                 VisionOp::Merger => {
-                    let flat = self.run_merger(&self.merger, x, tokens, scratch, up, out)?;
+                    let m = self.merger.as_ref().context("this tower has no patch merger")?;
+                    let flat = self.run_merger(m, x, tokens, scratch, up, out)?;
                     merged = self.split_rows(flat, &l.merged_rows);
+                }
+                VisionOp::Pool => {
+                    let pool = self.pool.as_ref().context("this tower has no pooled projector")?;
+                    let tiles: usize = items.iter().map(|p| p.grid[0]).sum();
+                    let out_side = cfg.tokens_per_tile().isqrt();
+                    let rows = tiles * cfg.tokens_per_tile();
+                    let (hidden32, side, kernel, out_side32) = (hidden as i32, pool.side as i32, pool.kernel as i32, out_side as i32);
+                    let mut b = s.launch_builder(&self.pool_fn);
+                    b.arg(&*x).arg(&pool.post.w).arg(&pool.post.b).arg(&pool.soft_norm).arg(&mut scratch.hi).arg(&mut scratch.lo);
+                    b.arg(&hidden32).arg(&side).arg(&kernel).arg(&out_side32).arg(&LAYERNORM_EPS).arg(&pool.eps);
+                    unsafe { b.launch(LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 4 * hidden as u32 }) }?;
+                    self.gemm(&pool.proj, scratch, Out::Store(out), rows, Act::None)?;
+                    let mut host = vec![0f32; rows * cfg.out_hidden_size];
+                    s.memcpy_dtoh(&out.slice(..host.len()), &mut host)?;
+                    merged = self.split_rows(host, &l.merged_rows);
                 }
             }
         }

@@ -221,7 +221,10 @@ impl Assets {
     }
 
     pub fn load(model: &str) -> Result<Self> {
-        let spec = resolve_spec(model)?;
+        Self::for_spec(model, resolve_spec(model)?)
+    }
+
+    pub fn for_spec(model: &str, spec: Spec) -> Result<Self> {
         if model.ends_with(".gguf") {
             return Self::from_gguf(spec);
         }
@@ -303,6 +306,23 @@ fn media_assets(spec: &Spec, tokenizer: &Tokenizer) -> Result<Option<crate::visi
     use crate::vision::{MediaAssets, MediaTokens, Preprocessor};
     let Some(vision) = &spec.vision else { return Ok(None) };
     let read = |f: &str| find_in_snapshot(&spec.repo, f).ok().and_then(|p| std::fs::read_to_string(p).ok());
+    if vision.config.pooled() {
+        let Some(image) = read("preprocessor_config.json") else { return Ok(None) };
+        let text = |id: u32| tokenizer.id_to_token(id).with_context(|| format!("no token {id}"));
+        let config = crate::vision::TileConfig::from_json(&image)?;
+        let pan_and_scan = spec.runtime.vision.pan_and_scan.then(|| config.pan_and_scan());
+        let tokens = MediaTokens {
+            image: text(vision.tokens.image)?,
+            video: String::new(),
+            start: text(vision.tokens.start)?,
+            end: text(vision.tokens.end)?,
+            placeholder: vision.config.placeholder.clone(),
+            wrap: vision.config.wrap.clone(),
+            tile_tokens: vision.config.tokens_per_tile(),
+        };
+        let tiles = crate::vision::TileAssets { config, patch: vision.config.patch_size, pan_and_scan };
+        return Ok(Some(MediaAssets { image: Preprocessor::unused(), video: Preprocessor::unused(), tokens, ids: vision.tokens.clone(), tiles: Some(tiles) }));
+    }
     let (Some(image), Some(video)) = (read("preprocessor_config.json"), read("video_preprocessor_config.json")) else { return Ok(None) };
     let text = |id: u32| tokenizer.id_to_token(id).with_context(|| format!("no token {id}"));
     let tokens = MediaTokens {
@@ -310,8 +330,9 @@ fn media_assets(spec: &Spec, tokenizer: &Tokenizer) -> Result<Option<crate::visi
         video: text(vision.tokens.video)?,
         start: text(vision.tokens.start)?,
         end: text(vision.tokens.end)?,
+        ..MediaTokens::default()
     };
-    Ok(Some(MediaAssets { image: Preprocessor::from_json(&image)?, video: Preprocessor::from_json(&video)?, tokens, ids: vision.tokens.clone() }))
+    Ok(Some(MediaAssets { image: Preprocessor::from_json(&image)?, video: Preprocessor::from_json(&video)?, tokens, ids: vision.tokens.clone(), tiles: None }))
 }
 
 pub fn render_prompt(chat: Option<&ChatTemplate>, messages: &[Value], template: Option<&Value>) -> Result<String> {
@@ -682,7 +703,11 @@ pub struct MediaPrompt {
 }
 
 pub fn encode_media_prompt(model: &str, messages: &[Value], template: Option<&Value>, items: &[crate::vision::MediaItem]) -> Result<MediaPrompt> {
-    let assets = Assets::load(model)?;
+    encode_media_prompt_with(resolve_spec(model)?, messages, template, items)
+}
+
+pub fn encode_media_prompt_with(spec: Spec, messages: &[Value], template: Option<&Value>, items: &[crate::vision::MediaItem]) -> Result<MediaPrompt> {
+    let assets = Assets::for_spec(&spec.repo.clone(), spec)?;
     let (ids, media, vision_tokens) = assets.encode_media_messages(messages, template, items, Default::default())?;
     Ok(MediaPrompt { ids, media, vision_tokens })
 }
