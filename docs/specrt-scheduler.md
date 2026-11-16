@@ -248,15 +248,24 @@ Under load the decode step alone fills `itl_target_ms`, so the budget left for p
 - `prefill_rate` is only updated from steps that read at least `max(min_prefill_chunk, min_prefill_tokens / 2)` tokens, so small steps no longer drag the EWMA down.
 - Short prompts go first: running prefills are served shortest-remaining-first, `whole_prompt_remaining` looks at the shortest unfinished prompt rather than the head, and a prompt larger than the step budget is not admitted while another long one is already in flight. The long prompt still gets the leftover budget every step, so it is slowed, not starved.
 
-Simulated (CPU, `Fake` engine, `print_load_table` in `sched.rs`: decode step 1.25 ms per row, prefill 20 us per token, itl_target 20 ms, N long decoders, one 20k prompt, then eight 1.2k prompts 10 steps apart; times are wall seconds of the simulation, a real 27B step is about 40x slower):
+Simulated (CPU, `Fake` engine, `print_load_table` in `sched.rs`). Decode step 0.56 ms per row, prefill 20 us per token, `itl_target` 10 ms, `whole_prompt_tokens` 4096, all times multiplied by 10 so decode steps read 45-100 ms like the 27B and `itl_target` reads 100 ms, so `room` is 0 as on the user's app. Load: N long decoders, one 20k prompt at t0, eight 1.2k prompts 10 steps apart, three 8-12k agent prompts every 25 steps. "master" is bf7e6b3 with its shipping defaults. Times in seconds (scaled), TTFT is time to first token.
 
-| decoders | before TTFT p50 / p95 | after TTFT p50 / p95 | before step p95 | after step p95 |
-|---|---|---|---|---|
-| 8 | 3.86 / 4.15 | 0.035 / 0.035 | 0.013 | 0.035 |
-| 16 | 7.90 / 8.46 | 0.045 / 0.045 | 0.023 | 0.045 |
-| 20 | 9.68 / 10.36 | 0.050 / 0.050 | 0.028 | 0.050 |
+| decoders | variant | 1.2k TTFT p50 / p95 | long TTFT p50 / max | long tok per step | step p95 |
+|---|---|---|---|---|---|
+| 8 | master | 21.7 / 35.3 | 21.7 / 35.7 | 110 | 0.07 |
+| 8 | shortest-first only | 0.29 / 3.28 | 7.4 / 12.2 | 314 | 0.39 |
+| 8 | min 512 only | 5.4 / 7.8 | 7.5 / 9.4 | 733 | 0.31 |
+| 8 | both (default) | 0.29 / 2.01 | 5.2 / 9.6 | 859 | 0.48 |
+| 16 | master | 36.0 / 57.2 | 36.1 / 58.1 | 107 | 0.11 |
+| 16 | shortest-first only | 0.34 / 4.00 | 8.7 / 18.8 | 306 | 0.43 |
+| 16 | min 512 only | 6.1 / 9.3 | 9.0 / 11.1 | 733 | 0.35 |
+| 16 | both (default) | 0.34 / 2.23 | 6.1 / 10.9 | 859 | 0.53 |
+| 20 | master | 42.8 / 67.8 | 43.0 / 68.9 | 107 | 0.14 |
+| 20 | shortest-first only | 0.36 / 4.18 | 9.5 / 21.9 | 306 | 0.47 |
+| 20 | min 512 only | 6.5 / 10.0 | 9.7 / 11.9 | 733 | 0.37 |
+| 20 | both (default) | 0.36 / 2.40 | 6.6 / 11.7 | 859 | 0.56 |
 
-"Before" is `min_prefill_tokens = 0` and `whole_prompt_tokens = 0`. The cost is the decode step p95: it grows from about 0.65x to 2x `itl_target` (a step is decode plus 512 prompt tokens). The regression test `short_prompts_get_a_first_token_quickly_behind_a_long_one_with_full_decoders` asserts TTFT p95 under 0.2 s and step p95 at most 2.75x the target. On the 27B 512 tokens is about 0.1 s of prefill at the 5 ktok/s batched rate; lower `min_prefill_tokens` to 256 to trade TTFT for inter-token time.
+Master reads about 110 tokens per step for the long prompts, which is the user's plateau. Each part alone is not enough: shortest-first fixes the median for short prompts but leaves the long ones at about 300 tokens per step and a 19-22 s worst case; the 512 floor alone fixes long-prompt throughput but the short prompts wait behind the long ones (6 s). Both together win on every column except step p95, so both stay on and 512 is the default (256 gave worse TTFT everywhere in the same run). The step p95 cost is real: steps that read a whole 4096-token prompt take about 5x `itl_target`; master avoided that only by starving the prompts. Lower `whole_prompt_tokens` to bound it. The regression test is `prompts_stay_bounded_behind_each_other_with_full_decoders`; on bf7e6b3 it fails (`short ttft p95 57.331s`), on this branch it passes.
 
 Real-27B A/B for the supervisor (GPU free, under `flock /tmp/gpu27.lock`, 20 slots, classify-shaped 1.2k prompts plus a few 10-20k agent prompts): run `crates/specrt/scripts/serve27b.sh` with `--min-prefill-tokens 0` then `512` (and 256), and drive it with `loadtest` at 16-20 concurrent; compare TTFT p50/p95, `inference_prefill_tokens_per_step` and per-request decode tok/s.
 
