@@ -377,7 +377,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     float* kv_scales = (float*)(fm_smem + FM_STAGES * 2 * PLANE_BYTES);
     auto load_kv = [&](int buf, int k0) {
         bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
-        if (KV_FP8) {
+        if (kv_q(layer)) {
             unsigned char* raw_st = (unsigned char*)st + PLANE_BYTES / 2;
             constexpr int RAW_CHUNKS = HEAD_DIM / 16;
             constexpr int TOTAL = 2 * FM_BK * RAW_CHUNKS;
@@ -407,12 +407,6 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             int tk = k0 + r;
             const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
-<<<<<<< HEAD
-            if (kv_q(layer)) {
-                int at = min(tk, key_end - 1);
-                float sc = kv_scale(which ? v_cache : k_cache, block_table, layer, kv_head, at);
-                uint2 raw = *(const uint2*)((const unsigned char*)src + c * 8);
-=======
             cp_async16_zfill(dst, src + c * 8, tk < key_end);
         }
     };
@@ -432,7 +426,6 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
                 int c = rem % CPR;
                 float s = sc[which * FM_BK + r];
                 uint2 raw = *(const uint2*)(raw_st + which * PLANE_BYTES + r * HEAD_DIM + c * 8);
->>>>>>> 937d493 (fp8 KV decode and prefill tiles via cp.async raw bytes)
                 unsigned w[4];
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
@@ -462,7 +455,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         cp_async_commit();
         cp_async_wait<1>();
         __syncthreads();
-        if (KV_FP8) {
+        if (kv_q(layer)) {
             convert_kv(kt % FM_STAGES);
             __syncthreads();
         }

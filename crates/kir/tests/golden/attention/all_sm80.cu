@@ -722,7 +722,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
     float* kv_scales = (float*)(fm_smem + FM_STAGES * 2 * PLANE_BYTES);
     auto load_kv = [&](int buf, int k0) {
         bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
-        if (KV_FP8) {
+        if (kv_q(layer)) {
             unsigned char* raw_st = (unsigned char*)st + PLANE_BYTES / 2;
             constexpr int RAW_CHUNKS = HEAD_DIM / 16;
             constexpr int TOTAL = 2 * FM_BK * RAW_CHUNKS;
@@ -752,12 +752,6 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             int tk = k0 + r;
             const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
-<<<<<<< HEAD
-            if (kv_q(layer)) {
-                int at = min(tk, key_end - 1);
-                float sc = kv_scale(which ? v_cache : k_cache, block_table, layer, kv_head, at);
-                uint2 raw = *(const uint2*)((const unsigned char*)src + c * 8);
-=======
             cp_async16_zfill(dst, src + c * 8, tk < key_end);
         }
     };
@@ -777,7 +771,6 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
                 int c = rem % CPR;
                 float s = sc[which * FM_BK + r];
                 uint2 raw = *(const uint2*)(raw_st + which * PLANE_BYTES + r * HEAD_DIM + c * 8);
->>>>>>> 937d493 (fp8 KV decode and prefill tiles via cp.async raw bytes)
                 unsigned w[4];
 #pragma unroll
                 for (int e = 0; e < 4; e++) {
@@ -807,7 +800,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         cp_async_commit();
         cp_async_wait<1>();
         __syncthreads();
-        if (KV_FP8) {
+        if (kv_q(layer)) {
             convert_kv(kt % FM_STAGES);
             __syncthreads();
         }
@@ -989,10 +982,10 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
     float m0 = NEG_INF, m1 = NEG_INF, l0 = 0.0f, l1 = 0.0f;
     constexpr int RAW_TILE = 2 * DM_BK * HEAD_DIM;
     constexpr int SCALE_TILE = 2 * DM_BK * 4;
-    unsigned char* raw_base = dm_smem + 2 * KV_PLANES * PLANE * 2;
+    unsigned char* raw_base = dm_smem;
     auto raw_stage = [&](int buf) { return raw_base + buf * (RAW_TILE + SCALE_TILE); };
     auto load_kv = [&](int buf, int k0) {
-        if (KV_FP8) {
+        if (kv_q(layer)) {
             unsigned char* raw = raw_stage(buf);
             float* scales = (float*)(raw + RAW_TILE);
             constexpr int RAW_CHUNKS = HEAD_DIM / 16;
@@ -1023,32 +1016,7 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
             int at = min(tk, len - 1);
             const bf16_t* src = kv_row(which ? v_cache : k_cache, table, layer, kv_head, at);
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
-<<<<<<< HEAD
-            if (kv_q(layer)) {
-                float sc = kv_scale(which ? v_cache : k_cache, table, layer, kv_head, at);
-                uint2 raw = tk < len ? *(const uint2*)((const unsigned char*)src + c * 8) : make_uint2(0, 0);
-                unsigned w[4];
-#pragma unroll
-                for (int e = 0; e < 4; e++) {
-                    unsigned two = ((e < 2 ? raw.x : raw.y) >> (16 * (e & 1))) & 0xffffu;
-                    w[e] = attn_bits(e4m3_to_f32(two & 0xffu) * sc) | (attn_bits(e4m3_to_f32(two >> 8) * sc) << 16);
-                }
-                *(uint4*)dst = make_uint4(w[0], w[1], w[2], w[3]);
-                continue;
-            }
-=======
->>>>>>> 937d493 (fp8 KV decode and prefill tiles via cp.async raw bytes)
             cp_async16_zfill(dst, src + c * 8, tk < len);
-        }
-    };
-    auto convert_v = [&](int buf) {
-        const unsigned char* raw = raw_stage(buf) + DM_BK * HEAD_DIM;
-        for (int i = tid; i < DM_BK * CPR; i += blockDim.x) {
-            int r = i / CPR;
-            int c = i % CPR;
-            uint2 in = *(const uint2*)(raw + r * HEAD_DIM + (((c >> 1) ^ (r & 7)) << 4) + (c & 1) * 8);
-            *(uint4*)(kvs + PLANE + swz<CPR>(r, c) * 8) =
-                make_uint4(e4m3x2_to_f16x2(in.x), e4m3x2_to_f16x2(in.x >> 16), e4m3x2_to_f16x2(in.y), e4m3x2_to_f16x2(in.y >> 16));
         }
     };
 #pragma unroll
@@ -1063,12 +1031,8 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
         cp_async_wait<DM_STAGES - 1>();
         __syncthreads();
         const unsigned char* k_raw = raw_stage(i % DM_STAGES);
-        if (KV_FP8) {
-            convert_v(i % DM_STAGES);
-            __syncthreads();
-        }
         int k0 = key_begin + i * DM_BK;
-        const bf16_t* k_hi = kvs + (KV_FP8 ? 0 : i % DM_STAGES) * 2 * KV_PLANES * PLANE;
+        const bf16_t* k_hi = kvs + (kv_q(layer) ? 0 : i % DM_STAGES) * 2 * KV_PLANES * PLANE;
         const bf16_t* k_lo = k_hi + PLANE;
         const bf16_t* v_hi = k_hi + KV_PLANES * PLANE;
         const bf16_t* v_lo = v_hi + PLANE;
@@ -1084,7 +1048,7 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
                 unsigned bh[4], bl[4] = {0, 0, 0, 0};
                 int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
                 int at = swz<CPR>(kr, kb * 2 + ((lane >> 3) & 1)) * 8;
-                if (KV_FP8) {
+                if (kv_q(layer)) {
                     const unsigned char* row0p = k_raw + (np * 16 + g) * HEAD_DIM + ((kb ^ g) << 4) + 2 * t;
                     const unsigned char* row1p = row0p + 8 * HEAD_DIM;
                     bh[0] = e4m3x2_to_f16x2(*(const unsigned short*)row0p);
@@ -1099,7 +1063,7 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
                 mma_dec(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
             }
         const float* tile_scales = (const float*)(raw_stage(i % DM_STAGES) + RAW_TILE);
-        if (KV_FP8) {
+        if (kv_q(layer)) {
 #pragma unroll
             for (int nb = 0; nb < SB; nb++)
 #pragma unroll
@@ -1143,7 +1107,7 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
         l1 = l1 * a1 + sum1;
         m0 = n0;
         m1 = n1;
-        if (KV_FP8) {
+        if (kv_q(layer)) {
 #pragma unroll
             for (int nb = 0; nb < SB; nb++)
 #pragma unroll
@@ -1174,7 +1138,18 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
                 unsigned bh[4], bl[4] = {0, 0, 0, 0};
                 int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
                 int at = swz<CPR>(kr, np * 2 + (lane >> 4)) * 8;
-                ldsm_x4_t(bh, v_hi + at);
+                if (kv_q(layer)) {
+                    const unsigned char* v_raw = k_raw + DM_BK * HEAD_DIM;
+                    int key = kb * 16 + 2 * t;
+                    int dim = np * 16 + g;
+                    auto byte_at = [&](int k, int d) -> unsigned { return v_raw[k * HEAD_DIM + (((d >> 4) ^ (k & 7)) << 4) + (d & 15)]; };
+                    bh[0] = e4m3x2_to_f16x2(byte_at(key, dim) | (byte_at(key + 1, dim) << 8));
+                    bh[1] = e4m3x2_to_f16x2(byte_at(key + 8, dim) | (byte_at(key + 9, dim) << 8));
+                    bh[2] = e4m3x2_to_f16x2(byte_at(key, dim + 8) | (byte_at(key + 1, dim + 8) << 8));
+                    bh[3] = e4m3x2_to_f16x2(byte_at(key + 8, dim + 8) | (byte_at(key + 9, dim + 8) << 8));
+                } else {
+                    ldsm_x4_t(bh, v_hi + at);
+                }
                 if (KV_PLANES == 2) ldsm_x4_t(bl, v_lo + at);
                 mma_dec(o[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
                 mma_dec(o[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
