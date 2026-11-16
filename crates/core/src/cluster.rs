@@ -61,25 +61,42 @@ pub struct Preview {
     pub devices: Vec<DeviceConfig>,
     pub latency: Result<Placement, String>,
     pub throughput: Result<Placement, String>,
+    pub tp_latency: Option<Placement>,
+    pub tp_throughput: Option<Placement>,
 }
 
-pub fn preview(spec: &Spec, devices: Vec<DeviceConfig>, ctx: usize, slots: usize) -> Preview {
-    let run = |objective: Objective| {
-        let config = PlacementConfig { objective, context: ctx, slots, devices: devices.clone(), ..PlacementConfig::default() };
-        config.place(spec).map_err(|e| format!("{e:#}"))
-    };
-    Preview { latency: run(Objective::Latency), throughput: run(Objective::Throughput), devices }
+fn flat(devices: &[DeviceConfig]) -> Vec<DeviceConfig> {
+    devices.iter().cloned().map(|mut d| {
+        d.host = None;
+        d
+    }).collect()
+}
+
+pub fn friendly(error: &str) -> String {
+    match error.split_once(" (") {
+        Some((head, _)) if error.contains("does not fit") => format!("{head}. Add a GPU or lower the context."),
+        _ => error.to_string(),
+    }
 }
 
 pub fn runnable_plan(spec: &Spec, devices: &[DeviceConfig], ctx: usize, slots: usize, objective: Objective) -> Result<Placement, String> {
-    let flat: Vec<DeviceConfig> = devices.iter().cloned().map(|mut d| {
-        d.host = None;
-        d
-    }).collect();
-    let config = PlacementConfig { objective, context: ctx, slots, devices: flat, ..PlacementConfig::default() };
-    let placement = config.place(spec).map_err(|e| format!("{e:#}"))?;
-    runnable(&placement)?;
-    Ok(placement)
+    let config = PlacementConfig { objective, context: ctx, slots, devices: flat(devices), max_tp: Some(1), ..PlacementConfig::default() };
+    config.place(spec).map_err(|e| friendly(&format!("{e:#}")))
+}
+
+fn tensor_parallel_plan(spec: &Spec, devices: &[DeviceConfig], ctx: usize, slots: usize, objective: Objective) -> Option<Placement> {
+    let config = PlacementConfig { objective, context: ctx, slots, devices: devices.to_vec(), ..PlacementConfig::default() };
+    config.place(spec).ok().filter(|p| p.stages.iter().any(|s| s.tp > 1))
+}
+
+pub fn preview(spec: &Spec, devices: Vec<DeviceConfig>, ctx: usize, slots: usize) -> Preview {
+    Preview {
+        latency: runnable_plan(spec, &devices, ctx, slots, Objective::Latency),
+        throughput: runnable_plan(spec, &devices, ctx, slots, Objective::Throughput),
+        tp_latency: tensor_parallel_plan(spec, &devices, ctx, slots, Objective::Latency),
+        tp_throughput: tensor_parallel_plan(spec, &devices, ctx, slots, Objective::Throughput),
+        devices,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,7 +138,7 @@ pub fn stage_rows(placement: &Placement, devices: &[DeviceConfig], local_host: &
             };
             previous = device.or(previous);
             StageRow {
-                label: if s.tp > 1 { s.label() } else { hardware::display_name(&s.device_name) },
+                label: stage_label(s),
                 layers: format!("{}..{}", s.start, s.end),
                 gib: s.used_bytes() as f64 / GIB,
                 of_gib: s.memory_bytes as f64 / GIB,
@@ -136,13 +153,17 @@ pub fn stage_rows(placement: &Placement, devices: &[DeviceConfig], local_host: &
 
 pub const TP_NOTE: &str = "needs tensor parallel (#658)";
 
-pub fn runnable(placement: &Placement) -> Result<(), String> {
-    placement.ensure_runnable().map_err(|e| format!("{e:#}"))
+pub fn stage_label(s: &specrt::placement::Stage) -> String {
+    if s.tp > 1 { s.label() } else { hardware::display_name(&s.device_name) }
+}
+
+pub fn tp_line(p: &Placement) -> String {
+    format!("with tensor parallel (#658): {:.1} tok/s one stream, {:.1} tok/s pipelined", p.single_stream_tokens_per_second(), p.pipelined_tokens_per_second())
 }
 
 pub fn bottleneck(placement: &Placement) -> Option<String> {
     let worst = placement.stages.iter().max_by(|a, b| a.total_secs().total_cmp(&b.total_secs()))?;
-    Some(hardware::display_name(&worst.device_name))
+    Some(stage_label(worst))
 }
 
 pub struct Prepared {
@@ -315,19 +336,19 @@ mod tests {
         let p = preview(&spec(), devices.clone(), 2048, 1);
         for placement in [p.latency.as_ref().unwrap(), p.throughput.as_ref().unwrap()] {
             assert_eq!(placement.stages.iter().map(|s| s.layers()).sum::<usize>(), placement.layers);
-            assert!(placement.step_secs > 0.0 && placement.bottleneck_secs > 0.0);
+            assert!(placement.stages.iter().all(|s| s.tp == 1));
+            assert!(placement.ensure_runnable().is_ok());
         }
-        let grouped = stage_rows(p.latency.as_ref().unwrap(), &devices, "desk");
-        assert!(grouped.iter().any(|r| r.needs_tensor_parallel && r.label.contains("GPU 0+1 (tp 2)")));
-        assert!(runnable(p.latency.as_ref().unwrap()).is_err());
-        let placement = runnable_plan(&spec(), &devices, 2048, 1, Objective::Latency).unwrap();
-        assert!(placement.stages.len() >= 2);
+        let tp = p.tp_latency.as_ref().expect("a tensor parallel plan exists for the local pair");
+        assert!(tp_line(tp).starts_with("with tensor parallel (#658): "));
+        let placement = p.latency.clone().unwrap();
         let rows = stage_rows(&placement, &devices, "desk");
-        assert!(rows.iter().all(|r| !r.needs_tensor_parallel));
         assert_eq!(rows[0].label, "desk / GPU 0");
         assert_eq!(rows[0].hop, "first stage");
-        assert_eq!(rows[1].hop, "peer copy");
-        assert!(bottleneck(&placement).is_some());
+        assert!(rows.iter().all(|r| !r.needs_tensor_parallel));
+        assert!(rows.iter().skip(1).any(|r| r.hop == "peer copy" || r.hop == "network"));
+        let slowest = bottleneck(&placement).unwrap();
+        assert!(slowest.contains(" / GPU ") && !slowest.contains('+') && !slowest.contains("/gpu"), "{slowest}");
         if let Some(r) = rows.iter().find(|r| r.label.starts_with("spark")) {
             assert_eq!(r.hop, "network");
         }

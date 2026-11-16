@@ -3,7 +3,7 @@ use crate::job::Pending;
 use crate::shell::page;
 use eframe::egui;
 use egui_bench::prelude::*;
-use inference_bench_core::cluster::{Preview, Prepared, Run, Selection, StageRow, TP_NOTE, bottleneck, candidate_devices, preview, runnable, runnable_plan, stage_rows};
+use inference_bench_core::cluster::{Preview, Prepared, Run, Selection, StageRow, bottleneck, candidate_devices, preview, runnable_plan, stage_rows, tp_line};
 use inference_bench_core::engine::Command;
 use inference_bench_core::library::human_size;
 use specrt::cluster::Peer;
@@ -220,17 +220,18 @@ fn refresh_preview(app: &mut App) {
     if app.hardware.shown.as_ref().is_some_and(|s| s.key == key) {
         return;
     }
-    let preview = specrt::engine::resolve_spec(&id).map_err(|e| format!("{e:#}")).map(|spec| preview(&spec, devices.clone(), ctx, slots));
+    let preview = specrt::engine::resolve_spec(&id).map_err(|e| format!("this model cannot be planned: {e:#}")).map(|spec| preview(&spec, devices.clone(), ctx, slots));
     app.hardware.shown = Some(Shown { key, preview, devices });
+}
+
+pub fn stage_text(i: usize, r: &StageRow) -> String {
+    let hop = if r.hop == "first stage" { "first stage".to_string() } else { format!("hop {:.2} ms, {}", r.hop_ms, r.hop) };
+    format!("stage {i}  {}  layers {}  {:.1} of {:.1} GiB  step {:.2} ms  {hop}", r.label, r.layers, r.gib, r.of_gib, r.step_ms)
 }
 
 fn stage_table(ui: &mut egui::Ui, rows: &[StageRow]) {
     for (i, r) in rows.iter().enumerate() {
-        let mut text = format!("stage {i}  {}  layers {}  {:.1} of {:.1} GiB  step {:.2} ms  hop {:.2} ms ({})", r.label, r.layers, r.gib, r.of_gib, r.step_ms, r.hop_ms, r.hop);
-        if r.needs_tensor_parallel {
-            text.push_str(&format!("  {TP_NOTE}"));
-        }
-        note(ui, text, if r.needs_tensor_parallel { WARN } else { VALUE });
+        note(ui, stage_text(i, r), VALUE);
     }
 }
 
@@ -247,7 +248,7 @@ pub fn placement_lines(placement: &specrt::placement::Placement, devices: &[Devi
     (rows, summary)
 }
 
-fn objective_view(ui: &mut egui::Ui, label: &str, result: &Result<specrt::placement::Placement, String>, devices: &[DeviceConfig], local: &str) {
+fn objective_view(ui: &mut egui::Ui, label: &str, result: &Result<specrt::placement::Placement, String>, tp: Option<&specrt::placement::Placement>, devices: &[DeviceConfig], local: &str) {
     Line::new().legend(label).show(ui);
     match result {
         Err(e) => status(ui, false, e),
@@ -255,10 +256,10 @@ fn objective_view(ui: &mut egui::Ui, label: &str, result: &Result<specrt::placem
             let (rows, summary) = placement_lines(p, devices, local);
             stage_table(ui, &rows);
             note(ui, summary, LEGEND);
-            if let Err(e) = runnable(p) {
-                status(ui, false, &e);
-            }
         }
+    }
+    if let Some(p) = tp {
+        note(ui, tp_line(p), LEGEND.gamma_multiply(0.7));
     }
 }
 
@@ -432,9 +433,9 @@ fn run_section(app: &mut App, ui: &mut egui::Ui) {
             Some(shown) => match &shown.preview {
                 Err(e) => status(ui, false, e),
                 Ok(p) => {
-                    objective_view(ui, "latency", &p.latency, &shown.devices, &machine.host);
-                    objective_view(ui, "throughput", &p.throughput, &shown.devices, &machine.host);
-                    runnable_choice = Some((p.latency.as_ref().ok().is_some_and(|x| runnable(x).is_ok()), p.throughput.as_ref().ok().is_some_and(|x| runnable(x).is_ok())));
+                    objective_view(ui, "latency", &p.latency, p.tp_latency.as_ref(), &shown.devices, &machine.host);
+                    objective_view(ui, "throughput", &p.throughput, p.tp_throughput.as_ref(), &shown.devices, &machine.host);
+                    runnable_choice = Some((p.latency.is_ok(), p.throughput.is_ok()));
                 }
             },
         }

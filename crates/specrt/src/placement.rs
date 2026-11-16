@@ -127,6 +127,7 @@ pub struct PlacementConfig {
     pub mdns_port: u16,
     pub mdns_interface: Option<String>,
     pub remote: Option<RemoteConfig>,
+    pub max_tp: Option<usize>,
 }
 
 pub const REMOTE_MICRO_BATCH: usize = 256;
@@ -143,7 +144,7 @@ impl PlacementConfig {
 
 impl Default for PlacementConfig {
     fn default() -> Self {
-        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: None, discovery: Discovery::Static, mdns_port: 5353, mdns_interface: None, remote: None }
+        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: None, discovery: Discovery::Static, mdns_port: 5353, mdns_interface: None, remote: None, max_tp: None }
     }
 }
 
@@ -179,7 +180,10 @@ impl PlacementConfig {
 
     pub fn place(&self, spec: &Spec) -> Result<Placement> {
         ensure!(self.slots >= 1 && self.context >= 1, "placement needs at least one slot and one token of context");
-        let model = CostModel::new(spec, self.context, self.slots);
+        let mut model = CostModel::new(spec, self.context, self.slots);
+        if let Some(tp) = self.max_tp {
+            model.max_tp = tp.max(1);
+        }
         let devices: Vec<Device> = self.devices.iter().map(Device::from_config).collect();
         if self.stages.is_empty() {
             return plan(&model, &devices, self.objective);
@@ -292,6 +296,7 @@ pub struct CostModel {
     pub hidden: usize,
     pub hop_bytes_per_element: usize,
     head_counts: Vec<(&'static str, usize)>,
+    pub max_tp: usize,
 }
 
 const ALLREDUCES_PER_LAYER: f64 = 2.0;
@@ -341,6 +346,7 @@ impl CostModel {
             norm_bytes: 2 * spec.dims.hidden as u64,
             hidden: spec.dims.hidden,
             hop_bytes_per_element: 4,
+            max_tp: usize::MAX,
             head_counts: {
                 let mut counts = vec![("attention heads", spec.attention.heads), ("kv heads", spec.attention.kv_heads)];
                 if let Some(la) = &spec.linear_attention {
@@ -355,6 +361,9 @@ impl CostModel {
     pub fn allows_tp(&self, tp: usize) -> Result<(), String> {
         if tp == 0 {
             return Err("tp must be at least 1".into());
+        }
+        if tp > self.max_tp {
+            return Err(format!("tp {tp} is above the allowed maximum of {}", self.max_tp));
         }
         for (what, count) in &self.head_counts {
             if count % tp != 0 {
@@ -838,6 +847,21 @@ pub fn plan(model: &CostModel, devices: &[Device], objective: Objective) -> Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn max_tp_one_keeps_a_same_host_pair_in_separate_stages() {
+        let spec = fixture("qwen3.8-27b-exact.toml");
+        let mut config = PlacementConfig { context: 2048, slots: 1, ..PlacementConfig::default() };
+        for i in 0..2 {
+            config.devices.push(DeviceConfig { name: format!("box/gpu{i}"), memory_gib: 20.0, bandwidth_gbs: 1792.0, tflops: 500.0, ordinal: Some(i), address: None, reserve_gib: Some(0.0), link: LinkConfig::default(), offload: None, host: Some("box".into()), peer: Some(LinkConfig::default()) });
+        }
+        let open = config.place(&spec).unwrap();
+        config.max_tp = Some(1);
+        let capped = config.place(&spec).unwrap();
+        assert!(capped.stages.iter().all(|s| s.tp == 1));
+        assert!(capped.ensure_runnable().is_ok());
+        assert!(open.stages.iter().any(|s| s.tp == 2));
+    }
+
     #[test]
     fn micro_batch_defaults_to_overlap_for_remote_stages_and_off_in_process() {
         let mut p = PlacementConfig::default();

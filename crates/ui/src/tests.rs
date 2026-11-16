@@ -1905,9 +1905,39 @@ fn the_placement_preview_shows_both_objectives_with_a_local_gpu_pair_and_a_remot
         assert!(!rows.is_empty() && summary.contains("bottleneck"), "{summary}");
     }
     let lat = preview.latency.as_ref().unwrap();
-    assert!(lat.stages.iter().any(|s| s.tp > 1));
-    h.get_by_label_contains("needs tensor parallel (#658)");
+    assert!(lat.stages.iter().all(|s| s.tp == 1));
+    let tp = preview.tp_latency.as_ref().expect("the tensor parallel plan is shown as a dimmed line");
+    assert!(tp.stages.iter().any(|s| s.tp > 1));
+    assert_eq!(h.get_all_by_label_contains("with tensor parallel (#658): ").count(), 1);
     assert_eq!(h.get_all_by_label_contains("slowest stage").count(), 2);
+    assert!(h.query_by_label_contains("leave `host`").is_none() && h.query_by_label_contains("engine cannot").is_none());
+    assert!(!h.state().hardware.shown.as_ref().unwrap().preview.as_ref().unwrap().latency.is_err());
+}
+
+#[test]
+fn stage_and_bottleneck_strings_use_one_host_gpu_label_and_never_show_empty_parentheses() {
+    let mut h = hardware_harness("hwstrings", 2);
+    {
+        let app = h.state_mut();
+        app.hardware.peers.insert("spark".into(), fake_peer("spark", 14.0, false));
+        app.hardware.selection.peers.insert("spark".into());
+        app.hardware.model = "Qwen27".into();
+        app.hardware.ctx = 2048;
+    }
+    h.run();
+    h.run();
+    let shown = h.state().hardware.shown.as_ref().unwrap();
+    let p = shown.preview.as_ref().unwrap().latency.as_ref().unwrap();
+    let rows = inference_bench_core::cluster::stage_rows(p, &shown.devices, "desk");
+    let first = crate::hardware::stage_text(0, &rows[0]);
+    assert!(first.starts_with("stage 0  desk / GPU 0  layers 0.."), "{first}");
+    assert!(first.ends_with("first stage") && !first.contains("()") && !first.contains("hop 0.00"), "{first}");
+    let second = crate::hardware::stage_text(1, &rows[1]);
+    assert!(second.contains(" hop ") && second.contains("desk / GPU 1") || second.contains("spark / GPU 0"), "{second}");
+    let (_, summary) = crate::hardware::placement_lines(p, &shown.devices, "desk");
+    let bottleneck = summary.rsplit("bottleneck ").next().unwrap();
+    assert!(bottleneck == "desk / GPU 0" || bottleneck == "desk / GPU 1" || bottleneck == "spark / GPU 0", "{bottleneck}");
+    assert!(h.get_all_by_label_contains(&first).count() >= 1);
 }
 
 #[test]
