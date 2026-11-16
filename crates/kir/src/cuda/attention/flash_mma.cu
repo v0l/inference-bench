@@ -99,7 +99,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             int tk = k0 + r;
             const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
-            if (KV_FP8) {
+            if (kv_q(layer)) {
                 int at = min(tk, key_end - 1);
                 float sc = kv_scale(which ? v_cache : k_cache, block_table, layer, kv_head, at);
                 uint2 raw = *(const uint2*)((const unsigned char*)src + c * 8);

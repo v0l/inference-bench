@@ -1,6 +1,6 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
 // attention FlashMma threads=256 smem=65536
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 2, kv_fp8: false, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 2, kv_fp8: false, kv_f16_layers: 0, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
 constexpr int ROT = 64;
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = true;
@@ -24,6 +24,7 @@ constexpr int PAGE = 16;
 constexpr int ATTN_LAYERS = 16;
 constexpr int KV_PLANES = 2;
 constexpr bool KV_FP8 = false;
+constexpr int KV_F16_LAYERS = 0;
 constexpr int FM_WARPS = 8;
 constexpr int FM_BQ = 16 * FM_WARPS;
 constexpr int FM_BK = 16;
@@ -91,14 +92,26 @@ __device__ __forceinline__ size_t kv_slot(const int* block_table, int layer, int
     return (((size_t)block_table[pos / PAGE] * ATTN_LAYERS + layer) * KV_HEADS + kv_head) * PAGE + pos % PAGE;
 }
 
-constexpr size_t KV_ROWS_PER_BLOCK = (size_t)ATTN_LAYERS * KV_HEADS * PAGE;
-constexpr size_t KV_SCALE_OFF = KV_ROWS_PER_BLOCK * HEAD_DIM;
-constexpr size_t KV_BLOCK_BYTES = KV_ROWS_PER_BLOCK * (HEAD_DIM + 4);
+constexpr size_t KV_ROWS_PER_LAYER = (size_t)KV_HEADS * PAGE;
+constexpr size_t KV_RAW_LAYER_BYTES = KV_ROWS_PER_LAYER * HEAD_DIM * 2 * KV_PLANES;
+constexpr size_t KV_Q_LAYER_BYTES = KV_ROWS_PER_LAYER * (HEAD_DIM + 4);
+constexpr size_t KV_BLOCK_BYTES = KV_F16_LAYERS * KV_RAW_LAYER_BYTES + (ATTN_LAYERS - KV_F16_LAYERS) * KV_Q_LAYER_BYTES;
+
+__device__ __forceinline__ bool kv_q(int layer) {
+    return KV_FP8 && layer >= KV_F16_LAYERS;
+}
+
+__device__ __forceinline__ size_t kv_layer_base(const int* block_table, int layer, int pos) {
+    size_t within = layer < KV_F16_LAYERS ? (size_t)layer * KV_RAW_LAYER_BYTES
+                                          : KV_F16_LAYERS * KV_RAW_LAYER_BYTES + (size_t)(layer - KV_F16_LAYERS) * KV_Q_LAYER_BYTES;
+    return (size_t)block_table[pos / PAGE] * KV_BLOCK_BYTES + within;
+}
 
 __device__ __forceinline__ bf16_t* kv_row(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
     if (KV_FP8) {
-        size_t within = kv_slot(block_table, layer, kv_head, pos) % KV_ROWS_PER_BLOCK;
-        return (bf16_t*)((unsigned char*)cache + (size_t)block_table[pos / PAGE] * KV_BLOCK_BYTES + within * HEAD_DIM);
+        size_t row = (size_t)kv_head * PAGE + pos % PAGE;
+        size_t base = kv_layer_base(block_table, layer, pos);
+        return (bf16_t*)((unsigned char*)cache + base + row * (kv_q(layer) ? HEAD_DIM : HEAD_DIM * 2 * KV_PLANES));
     }
     return cache + kv_slot(block_table, layer, kv_head, pos) * KV_PLANES * HEAD_DIM;
 }
@@ -109,12 +122,12 @@ __device__ __forceinline__ const bf16_t* kv_row(const bf16_t* cache, const int* 
 }
 
 __device__ __forceinline__ float* kv_scale_ptr(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
-    size_t within = kv_slot(block_table, layer, kv_head, pos) % KV_ROWS_PER_BLOCK;
-    return (float*)((unsigned char*)cache + (size_t)block_table[pos / PAGE] * KV_BLOCK_BYTES + KV_SCALE_OFF + within * 4);
+    size_t row = (size_t)kv_head * PAGE + pos % PAGE;
+    return (float*)((unsigned char*)cache + kv_layer_base(block_table, layer, pos) + KV_ROWS_PER_LAYER * HEAD_DIM + row * 4);
 }
 
 __device__ __forceinline__ float kv_scale(const bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
-    if (!KV_FP8) return 1.0f;
+    if (!kv_q(layer)) return 1.0f;
     return *kv_scale_ptr(const_cast<bf16_t*>(cache), block_table, layer, kv_head, pos);
 }
 
@@ -122,14 +135,14 @@ __device__ __forceinline__ const int* seq_table(const int* block_table, const in
     return block_table + (size_t)slots[row] * pages;
 }
 
-__device__ __forceinline__ float kv_at(const bf16_t* row, int d, float sc) {
-    if (KV_FP8) return e4m3_to_f32(((const unsigned char*)row)[d]) * sc;
+__device__ __forceinline__ float kv_at(const bf16_t* row, int d, float sc, bool q) {
+    if (q) return e4m3_to_f32(((const unsigned char*)row)[d]) * sc;
     float v = attn_float(row[d]);
     return KV_PLANES == 2 ? v + attn_float(row[HEAD_DIM + d]) : v;
 }
 
-__device__ __forceinline__ float4 kv_at4(const bf16_t* row, int d, float sc) {
-    if (KV_FP8) {
+__device__ __forceinline__ float4 kv_at4(const bf16_t* row, int d, float sc, bool q) {
+    if (q) {
         unsigned w = *(const unsigned*)((const unsigned char*)row + d);
         return make_float4(e4m3_to_f32(w & 0xffu) * sc, e4m3_to_f32((w >> 8) & 0xffu) * sc,
                            e4m3_to_f32((w >> 16) & 0xffu) * sc, e4m3_to_f32(w >> 24) * sc);
@@ -189,7 +202,7 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
         v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
     }
     float row_scale = 1.0f;
-    if (KV_FP8 && !is_q) {
+    if (kv_q(layer) && !is_q) {
         float amax = block_reduce<true>(fabsf(v), scratch);
         row_scale = amax > 0.0f ? amax / FP8_MAX : 1.0f;
     }
@@ -200,7 +213,7 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     }
     int kv_head = is_k ? head - HEADS : head - HEADS - KV_HEADS;
     bf16_t* dst = kv_row(is_k ? k_cache : v_cache, block_table, layer, kv_head, pos);
-    if (KV_FP8) {
+    if (kv_q(layer)) {
         ((unsigned char*)dst)[d] = (unsigned char)(f32x2_to_e4m3x2(v / row_scale, 0.0f) & 0xffu);
         if (d == 0) *kv_scale_ptr(is_k ? k_cache : v_cache, block_table, layer, kv_head, pos) = row_scale;
         return;
@@ -352,7 +365,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             int tk = k0 + r;
             const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
             bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
-            if (KV_FP8) {
+            if (kv_q(layer)) {
                 int at = min(tk, key_end - 1);
                 float sc = kv_scale(which ? v_cache : k_cache, block_table, layer, kv_head, at);
                 uint2 raw = *(const uint2*)((const unsigned char*)src + c * 8);

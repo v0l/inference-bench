@@ -39,6 +39,7 @@ fn shape(planes: usize, fp8: bool, mrope: bool) -> AttentionShape {
         kv_layers: 16,
         kv_planes: planes,
         kv_fp8: fp8,
+        kv_f16_layers: if fp8 { 8 } else { 0 },
         query_scale: 1.0 / 16.0,
         softcap: if mrope { 30.0 } else { 0.0 },
         local_theta: 10000.0,

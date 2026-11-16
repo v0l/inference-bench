@@ -130,6 +130,8 @@ pub struct RuntimeOptions {
     pub gemm_fp32: bool,
     pub kv_dtype: KvDtype,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_f16_layers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rope_extension: Option<RopeExtension>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
@@ -217,7 +219,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 
@@ -1404,6 +1406,13 @@ impl Spec {
 
     pub fn speculative(&self) -> Option<&Mtp> {
         self.mtp.as_ref().filter(|m| m.speculate)
+    }
+
+    pub fn kv_f16_layers(&self) -> usize {
+        if !self.runtime.kv_dtype.is_fp8() {
+            return 0;
+        }
+        self.runtime.kv_f16_layers.unwrap_or(self.attention_layers() / 2).min(self.kv_layers())
     }
 
     pub fn kv_layers(&self) -> usize {

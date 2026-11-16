@@ -1679,7 +1679,7 @@ fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_ca
     dialog.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
     dialog.sync();
     let fp8 = dialog.estimate(Some(96 << 30)).unwrap().kv as f64 / (1u64 << 30) as f64;
-    assert!(fp8 < gib * 0.6, "fp8 kv {fp8} GiB vs {gib}");
+    assert!(fp8 < gib * 0.8 && fp8 > gib * 0.7, "mixed fp8 kv {fp8} GiB vs {gib}");
     let fits_big = dialog.can_load(Some(96 << 30));
     let fits_small = dialog.can_load(Some(40 << 30));
     assert!(fits_big && !fits_small);
