@@ -553,6 +553,29 @@ fn qwen3_bf16_logits_match_cuda_and_greedy_64_tokens_are_equal() {
 }
 
 #[test]
+#[ignore = "needs a GPU adapter, Qwen3-0.6B in the HF cache and the CUDA reference tokens in ~/.cache/specrt-wgpu-ref"]
+fn two_wgpu_stages_split_at_layer_14_give_the_cuda_greedy_text() {
+    use specrt::backends::dense::{Dense, StageInput, StageOutput};
+    let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let s = spec();
+    let (_, cuda_tokens) = cuda_reference(&s, 64);
+    let mut first = Dense::load_stage(device(), &s, 256, 1, 0, 14).unwrap();
+    let mut last = Dense::load_stage(device(), &s, 256, 1, 14, 28).unwrap();
+    let step = |first: &mut Dense<Wgpu>, last: &mut Dense<Wgpu>, pos: usize, tokens: &[u32], decode: bool| -> u32 {
+        let StageOutput::Hidden(h) = first.stage_forward(0, pos, StageInput::Tokens(tokens), decode, false).unwrap() else { panic!("the first stage returns hidden rows") };
+        let StageOutput::Token(t) = last.stage_forward(0, pos, StageInput::Hidden(&h), decode, true).unwrap() else { panic!("the last stage returns a token") };
+        t
+    };
+    let mut got = vec![step(&mut first, &mut last, 0, &PROMPT, false)];
+    while got.len() < 64 {
+        let pos = PROMPT.len() + got.len() - 1;
+        let next = step(&mut first, &mut last, pos, &[*got.last().unwrap()], true);
+        got.push(next);
+    }
+    assert_eq!(got, cuda_tokens[..64], "staged wgpu greedy text differs from CUDA");
+}
+
+#[test]
 #[ignore = "needs a GPU adapter, the CUDA backend and the Qwen3-0.6B Q4_K_M GGUF in ~/.cache/specrt-gguf"]
 fn qwen3_q4_k_m_gguf_logits_match_cuda_within_the_kl_bound() {
     let s = Spec::from_gguf_file(&gguf_dir().join("Qwen3-0.6B-Q4_K_M.gguf")).unwrap();
