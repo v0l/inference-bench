@@ -1,6 +1,6 @@
 spec qwen3-0.6b
 target Wgsl cc=0.0 sms=0 warp=1 threads=256 smem=16384 graphs=false pdl=false features=[]
-module hash 455163a56a7fa2b4
+module hash 288df7d3e3e0624e
 
 == rmsnorm (dfc9813380035323)
 target Wgsl cc=0.0 sms=0 warp=1 threads=256 smem=16384 graphs=false pdl=false features=[]
@@ -71,3 +71,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let a = g / (1.0 + exp(-g));
     out[idx] = a * gate_up[t * 2u * WIDTH + i * 2u + 1u];
 }
+
+== refused qkv_mma: block DequantF16 needs ShaderF16, which the target lacks
+
+== refused o_mma: block DequantF16 needs ShaderF16, which the target lacks
+
+== refused gate_up_mma: block DequantF16 needs ShaderF16, which the target lacks
+
+== refused down_mma: block DequantF16 needs ShaderF16, which the target lacks
+
+== refused lm_head_mma: block DequantF16 needs ShaderF16, which the target lacks
