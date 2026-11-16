@@ -11,7 +11,7 @@ pub const DECODE_MAX_QLEN: usize = 4;
 pub const FLASH_ROWS: usize = 128;
 pub const SPLIT_BLOCK: u32 = 128;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RopeShape {
     pub rotary_dim: usize,
     pub theta: f64,
@@ -21,6 +21,7 @@ pub struct RopeShape {
     pub high: f64,
     pub original: f64,
     pub mscale: f64,
+    pub freq_factors: Vec<f64>,
     pub mrope: Option<MropeShape>,
 }
 
@@ -263,6 +264,8 @@ pub(crate) fn constants(s: &AttentionShape, families: &[Family]) -> String {
     let _ = writeln!(o, "constexpr float ROPE_LOW_FREQ = {};", f(r.low));
     let _ = writeln!(o, "constexpr float ROPE_HIGH_FREQ = {};", f(r.high));
     let _ = writeln!(o, "constexpr float ROPE_ORIG_POS = {};", f(r.original));
+    let factors: Vec<String> = r.freq_factors.iter().map(|v| f(*v)).collect();
+    let _ = writeln!(o, "constexpr float ROPE_FREQ_FACTORS[] = {{ {} }};", if factors.is_empty() { "1.0f".into() } else { factors.join(", ") });
     let _ = writeln!(o, "constexpr float ROPE_MSCALE = {};", f(r.mscale));
     let _ = writeln!(o, "constexpr int PAGE = {PAGE};");
     let _ = writeln!(o, "constexpr int ATTN_LAYERS = {};", s.kv_layers.max(1));

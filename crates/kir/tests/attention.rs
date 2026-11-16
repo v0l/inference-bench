@@ -22,6 +22,7 @@ fn rope(mrope: bool) -> RopeShape {
         high: 1.0,
         original: 1.0,
         mscale: 1.0,
+        freq_factors: vec![],
         mrope: mrope.then_some(MropeShape { section: [11, 11, 10], interleaved: true }),
     }
 }

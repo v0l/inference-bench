@@ -983,6 +983,7 @@ mod tests {
         let registry = specrt::family::Registry::embedded();
         for (file, model_type) in [
             ("phi3-mini.config.json", "phi3"),
+            ("phi4-mini.config.json", "phi3"),
             ("olmo2-1b.config.json", "olmo2"),
             ("granite-3.3-2b.config.json", "granite"),
             ("smollm3-3b.config.json", "smollm3"),

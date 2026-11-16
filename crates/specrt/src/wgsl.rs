@@ -85,6 +85,9 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
             Quant::Nvfp4G16 => return Some("NVFP4 weights are not yet on wgpu".into()),
         }
     }
+    if spec.rope_constants().kind == 4 {
+        return Some("longrope scaling is not yet on wgpu".into());
+    }
     if spec.attention.head_dim > 256 {
         return Some("head_dim above 256 is not yet on wgpu".into());
     }

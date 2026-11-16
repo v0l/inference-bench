@@ -9,5 +9,8 @@ architectures = ["Phi3ForCausalLM"]
 [attention]
 fused_qkv = true
 
+[rope.types]
+longrope = "longrope"
+
 [mlp]
 fused_gate_up = true

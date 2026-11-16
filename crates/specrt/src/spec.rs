@@ -347,6 +347,7 @@ pub enum RopeScalingKind {
     Linear,
     Llama3,
     Yarn,
+    Longrope,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -412,6 +413,16 @@ pub struct RopeScaling {
     pub original_max_positions: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yarn: Option<Yarn>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longrope: Option<Longrope>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Longrope {
+    pub short_factor: Vec<f64>,
+    pub long_factor: Vec<f64>,
+    pub attention_factor: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -862,7 +873,7 @@ fn parse_quantization(rule: &crate::family::FamilyQuant, value: Option<&serde_js
     }
 }
 
-fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_json::Value>) -> Result<Option<RopeScaling>> {
+fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_json::Value>, config: &serde_json::Value) -> Result<Option<RopeScaling>> {
     let Some(v) = value.filter(|v| !v.is_null()) else {
         return Ok(None);
     };
@@ -876,10 +887,31 @@ fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_jso
         return Ok(None);
     }
     let num = |key: &str| v.get(rope.key(key)).and_then(|x| x.as_f64());
+    if rope.types.get(kind) == Some(&RopeScalingKind::Longrope) {
+        let list = |key: &str| -> Result<Vec<f64>> {
+            let items = v.get(key).and_then(|x| x.as_array()).with_context(|| format!("longrope has no {key}"))?;
+            items.iter().map(|x| x.as_f64().with_context(|| format!("longrope {key} has a non-number"))).collect()
+        };
+        let (short_factor, long_factor) = (list("short_factor")?, list("long_factor")?);
+        ensure!(short_factor.len() == long_factor.len() && !short_factor.is_empty(), "longrope short_factor and long_factor must be the same non-zero length");
+        let original = config.get(rope.key("original_max_positions")).and_then(|x| x.as_f64()).context("longrope needs original_max_position_embeddings")?;
+        let max = config.get("max_position_embeddings").and_then(|x| x.as_f64()).unwrap_or(original);
+        let attention_factor = num("attention_factor").unwrap_or_else(|| if max > original { (1.0 + (max / original).ln() / original.ln()).sqrt() } else { 1.0 });
+        return Ok(Some(RopeScaling {
+            kind: RopeScalingKind::Longrope,
+            factor: max / original,
+            low_freq_factor: None,
+            high_freq_factor: None,
+            original_max_positions: Some(original),
+            yarn: None,
+            longrope: Some(Longrope { short_factor, long_factor, attention_factor }),
+        }));
+    }
     let factor = num("factor").context("rope_scaling has no factor")?;
     ensure!(factor > 0.0, "rope_scaling factor must be positive");
     let Some(&scaling_kind) = rope.types.get(kind) else { bail!("rope_scaling {kind} is not supported") };
     match scaling_kind {
+        RopeScalingKind::Longrope => unreachable!("handled above"),
         RopeScalingKind::Linear => Ok(Some(RopeScaling {
             kind: scaling_kind,
             factor,
@@ -887,6 +919,7 @@ fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_jso
             high_freq_factor: None,
             original_max_positions: None,
             yarn: None,
+            longrope: None,
         })),
         RopeScalingKind::Llama3 => Ok(Some(RopeScaling {
             kind: scaling_kind,
@@ -898,6 +931,7 @@ fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_jso
                     .context("no original_max_position_embeddings")?,
             ),
             yarn: None,
+            longrope: None,
         })),
         RopeScalingKind::Yarn => {
             let original = num("original_max_positions").context("yarn rope_scaling has no original_max_position_embeddings")?;
@@ -917,6 +951,7 @@ fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_jso
                 high_freq_factor: None,
                 original_max_positions: Some(original),
                 yarn: Some(Yarn { beta_fast, beta_slow, attention_factor, truncate }),
+                longrope: None,
             }))
         }
     }
@@ -1071,7 +1106,7 @@ impl Spec {
         let params = hf.rope_parameters.as_ref();
         let param = |key: &str| params.and_then(|p| p.get(key)).or(nested.and_then(|n| n.get(key))).and_then(|v| v.as_f64());
         let full_params = params.and_then(|p| p.get("full_attention")).filter(|_| family.blocks.layer_types.values().any(|b| *b == Block::Full));
-        let scaling = match parse_rope_scaling(&family.rope, hf.rope_scaling.as_ref().or(full_params).or(params)) {
+        let scaling = match parse_rope_scaling(&family.rope, hf.rope_scaling.as_ref().or(full_params).or(params), &value) {
             Ok(s) => s,
             Err(e) if strict => return Err(e),
             Err(_) => None,
@@ -1500,8 +1535,15 @@ impl Spec {
                 let (low, high) = yarn_correction_range(self.rope.theta, self.rotary_dim(), original, y);
                 RopeConstants { kind: 3, factor: s.factor, low, high, original, mscale: y.attention_factor }
             }
+            (RopeScalingKind::Longrope, _) => RopeConstants { kind: 4, factor: s.factor, low: 1.0, high: 1.0, original, mscale: s.longrope.as_ref().map_or(1.0, |l| l.attention_factor) },
             (RopeScalingKind::Yarn, None) => RopeConstants { kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0 },
         }
+    }
+
+    pub fn rope_freq_factors(&self, max_ctx: usize) -> Vec<f64> {
+        let Some(l) = self.rope.scaling.as_ref().and_then(|s| s.longrope.as_ref().map(|l| (s, l))) else { return Vec::new() };
+        let original = l.0.original_max_positions.unwrap_or(f64::MAX);
+        if max_ctx as f64 > original { l.1.long_factor.clone() } else { l.1.short_factor.clone() }
     }
 
     pub fn rotary_dim(&self) -> usize {

@@ -171,6 +171,7 @@ fn yarn_tiny() -> Spec {
         high_freq_factor: None,
         original_max_positions: Some(262144.0),
         yarn: Some(specrt::spec::Yarn { beta_fast: 32.0, beta_slow: 1.0, attention_factor: specrt::spec::yarn_mscale(4.0, 1.0), truncate: true }),
+        longrope: None,
     });
     spec
 }

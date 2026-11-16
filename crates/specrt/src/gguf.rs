@@ -477,6 +477,7 @@ impl Gguf {
                 high_freq_factor: None,
                 original_max_positions: None,
                 yarn: None,
+                longrope: None,
             })),
             _ => bail!("GGUF rope scaling {kind} is not supported"),
         }
@@ -498,6 +499,7 @@ impl Gguf {
                 self.number(&names.key("rope_original_context", arch)?).unwrap_or(8192.0),
             ),
             yarn: None,
+            longrope: None,
         };
         let theta = self.number(&names.key("rope_freq_base", arch)?).unwrap_or(10000.0);
         let expected = llama3_factors(theta, head_dim, &scaling);
@@ -1054,7 +1056,7 @@ mod tests {
 
     #[test]
     fn the_llama3_scale_factors_match_the_converter_for_llama_3_2_1b() {
-        let s = RopeScaling { kind: RopeScalingKind::Llama3, factor: 32.0, low_freq_factor: Some(1.0), high_freq_factor: Some(4.0), original_max_positions: Some(8192.0), yarn: None };
+        let s = RopeScaling { kind: RopeScalingKind::Llama3, factor: 32.0, low_freq_factor: Some(1.0), high_freq_factor: Some(4.0), original_max_positions: Some(8192.0), yarn: None, longrope: None };
         let f = llama3_factors(500000.0, 64, &s);
         assert_eq!(f.len(), 32);
         assert_eq!(f[0], 1.0);

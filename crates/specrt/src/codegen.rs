@@ -45,7 +45,7 @@ pub fn flash_rows(_head_dim: usize) -> usize {
     kir::attention::FLASH_ROWS
 }
 
-pub fn attention_shape(spec: &Spec, kv_planes: usize) -> kir::attention::AttentionShape {
+pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::attention::AttentionShape {
     let a = &spec.attention;
     let rope = spec.rope_constants();
     kir::attention::AttentionShape {
@@ -65,6 +65,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize) -> kir::attention::Attenti
             high: rope.high,
             original: rope.original,
             mscale: rope.mscale,
+            freq_factors: spec.rope_freq_factors(max_ctx),
             mrope: spec.rope.mrope.as_ref().map(|m| kir::attention::MropeShape { section: m.section, interleaved: m.interleaved }),
         },
         kv_layers: spec.kv_layers(),
@@ -84,8 +85,8 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize) -> kir::attention::Attenti
     }
 }
 
-pub fn attention_kernels(spec: &Spec, kv_planes: usize, target: &kir::Target) -> Result<Vec<kir::attention::AttentionKernel>> {
-    kir::attention::AttentionKernel::set(target, attention_shape(spec, kv_planes)).map_err(anyhow::Error::msg)
+pub fn attention_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: &kir::Target) -> Result<Vec<kir::attention::AttentionKernel>> {
+    kir::attention::AttentionKernel::set(target, attention_shape(spec, kv_planes, max_ctx)).map_err(anyhow::Error::msg)
 }
 
 pub const LA_CHUNK: usize = 64;
@@ -234,7 +235,7 @@ impl Module {
         Self::generate_kv(spec, max_ctx, 2, &default_target())
     }
 
-    pub fn generate_kv(spec: &Spec, _max_ctx: usize, kv_planes: usize, target: &kir::Target) -> Result<Self> {
+    pub fn generate_kv(spec: &Spec, max_ctx: usize, kv_planes: usize, target: &kir::Target) -> Result<Self> {
         anyhow::ensure!(kv_planes == 1 || kv_planes == 2, "kv planes must be 1 or 2");
         anyhow::ensure!(kv_planes == 1 || !spec.runtime.kv_dtype.is_fp8(), "fp8 KV needs a single plane");
         let a = &spec.attention;
@@ -246,7 +247,7 @@ impl Module {
             Activation::Geglu => 1,
         };
         let mut smem = BTreeMap::new();
-        let attn = attention_kernels(spec, kv_planes, target)?;
+        let attn = attention_kernels(spec, kv_planes, max_ctx, target)?;
         for k in &attn {
             match k.family {
                 kir::attention::Family::FlashMma => smem.insert("flash_mma", k.smem_bytes),

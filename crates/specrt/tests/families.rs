@@ -109,6 +109,19 @@ fn phi3_reads_fused_tensors_and_partial_rotary_from_the_family() {
 }
 
 #[test]
+fn phi4_mini_has_partial_rotary_and_longrope_from_the_family() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/phi4-mini.config.json")).unwrap();
+    let s = Spec::from_hf_config(&json).unwrap();
+    assert_eq!(s.attention.head_dim, 128);
+    assert_eq!(s.rotary_dim(), 96);
+    let l = s.rope.scaling.as_ref().and_then(|r| r.longrope.as_ref()).unwrap();
+    assert_eq!(l.short_factor.len(), 48);
+    assert!(l.attention_factor > 1.0);
+    assert_eq!(s.rope_freq_factors(2048), l.short_factor);
+    assert_eq!(s.rope_freq_factors(8192), l.long_factor);
+}
+
+#[test]
 fn smollm3_marks_every_fourth_layer_without_rope() {
     let s = spec("tiny-smollm3");
     assert_eq!(s.rope.nope_layers, vec![1, 3]);
@@ -247,4 +260,10 @@ fn real_granite_3_3_2b_matches_transformers() {
 #[ignore = "needs a CUDA GPU, the cached HF checkpoint and scripts/families_real.py output in SPECRT_REF_DIR"]
 fn real_phi3_mini_matches_transformers() {
     real("phi3-mini", "microsoft/Phi-3-mini-4k-instruct");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the cached HF checkpoint and scripts/families_real.py output in SPECRT_REF_DIR"]
+fn real_phi4_mini_matches_transformers() {
+    real("phi4-mini", "microsoft/Phi-4-mini-instruct");
 }

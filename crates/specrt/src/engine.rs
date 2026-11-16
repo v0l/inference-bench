@@ -45,6 +45,7 @@ pub fn apply_rope_extension(spec: &Spec) -> Result<Spec> {
         high_freq_factor: None,
         original_max_positions: Some(native as f64),
         yarn: Some(crate::spec::Yarn { beta_fast: 32.0, beta_slow: 1.0, attention_factor: crate::spec::yarn_mscale(factor, 1.0), truncate: true }),
+        longrope: None,
     });
     Ok(s)
 }

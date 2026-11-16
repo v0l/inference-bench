@@ -14,6 +14,7 @@ REPOS = {
     "smollm3-3b": "HuggingFaceTB/SmolLM3-3B",
     "granite-3.3-2b": "ibm-granite/granite-3.3-2b-base",
     "phi3-mini": "microsoft/Phi-3-mini-4k-instruct",
+    "phi4-mini": "microsoft/Phi-4-mini-instruct",
 }
 
 

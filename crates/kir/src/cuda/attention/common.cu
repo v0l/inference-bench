@@ -16,6 +16,8 @@ __device__ __forceinline__ float rope_inv_freq(int i, int layer) {
     } else if (ROPE_KIND == 3) {
         float ramp = fminf(fmaxf(((float)i - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ), 0.0f), 1.0f);
         inv_freq = ramp * inv_freq / ROPE_FACTOR + (1.0f - ramp) * inv_freq;
+    } else if (ROPE_KIND == 4) {
+        inv_freq /= ROPE_FREQ_FACTORS[i];
     }
     return inv_freq;
 }
