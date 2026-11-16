@@ -86,6 +86,7 @@ pub fn readings(r: &Reading, per_minute: f64) -> Vec<(&'static str, String, egui
             TRACE,
         ));
         out.push(("kv blocks", format!("{} / {}", s.kv_blocks_used, s.kv_blocks_total), TRACE));
+        out.push(("reusable kv", size(s.kv_blocks_cached as u64 * block), TRACE));
         out.push(("prefix hits", percent(s.prefix_hits, s.prefix_queries).unwrap_or_else(|| "none yet".into()), TRACE));
         if s.spec_drafted > 0 {
             out.push(("draft accepted", percent(s.spec_accepted, s.spec_drafted).unwrap_or_default(), TRACE));

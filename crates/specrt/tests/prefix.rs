@@ -531,3 +531,42 @@ fn the_cache_key_follows_the_final_templated_ids_across_thinking_turns() {
     let off = ids(&t, &tok, &[system, user1], &json!({"enable_thinking": false}));
     assert_ne!(block_hashes(&r, &off).last(), block_hashes(&r, &as_text).last(), "thinking on and off are different prompts and never share a tail");
 }
+
+fn evict_cost(chains: usize) -> std::time::Duration {
+    let mut pool = BlockPool::new(chains * 4 + 64);
+    let mut cache = PrefixCache::new(&options(0, 4), false);
+    for c in 0..chains {
+        let (_, mut blocks) = register_chain(&mut cache, &mut pool, &root(&c.to_string()), &tokens(4 * PAGE, 1));
+        pool.release(&mut blocks);
+    }
+    let start = std::time::Instant::now();
+    for _ in 0..3000 {
+        assert!(cache.evict_one(&mut pool));
+    }
+    start.elapsed()
+}
+
+#[test]
+fn evicting_a_never_hit_block_costs_the_same_with_ten_times_the_blocks_cached() {
+    let small = (0..3).map(|_| evict_cost(1000)).min().unwrap();
+    let large = (0..3).map(|_| evict_cost(10000)).min().unwrap();
+    assert!(large < small * 2 + std::time::Duration::from_millis(1), "3000 evictions took {small:?} with 4k blocks cached and {large:?} with 40k");
+}
+
+#[test]
+fn cache_only_blocks_are_counted_apart_from_blocks_a_sequence_holds() {
+    let mut pool = BlockPool::new(16);
+    let mut cache = PrefixCache::new(&options(0, 4), false);
+    let r = root("");
+    let (hashes, mut blocks) = register_chain(&mut cache, &mut pool, &r, &tokens(3 * PAGE, 0));
+    assert_eq!((pool.used(), pool.cache_only(), pool.live()), (3, 0, 3));
+    pool.release(&mut blocks);
+    assert_eq!((pool.used(), pool.cache_only(), pool.live()), (3, 3, 0));
+    let hit = cache.lookup(&hashes, 3 * PAGE, &mut pool);
+    assert_eq!((pool.cache_only(), pool.live()), (0, 3));
+    let mut held = hit.blocks;
+    pool.release(&mut held);
+    assert_eq!(pool.cache_only(), 3);
+    assert!(cache.evict_one(&mut pool));
+    assert_eq!((pool.used(), pool.cache_only()), (2, 2));
+}

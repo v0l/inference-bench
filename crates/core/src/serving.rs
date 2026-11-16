@@ -190,7 +190,8 @@ pub fn render(s: &Stats) -> String {
     };
     gauge(&mut o, "inference_running_seqs", "Sequences in the running batch.", s.running as f64);
     gauge(&mut o, "inference_waiting_seqs", "Sequences waiting for admission.", s.waiting as f64);
-    gauge(&mut o, "inference_kv_blocks_used", "KV cache blocks in use.", s.kv_blocks_used as f64);
+    gauge(&mut o, "inference_kv_blocks_used", "KV cache blocks held by running sequences.", s.kv_blocks_used as f64);
+    gauge(&mut o, "inference_kv_blocks_cached", "KV cache blocks held only by the prefix cache, evicted on demand.", s.kv_blocks_cached as f64);
     gauge(&mut o, "inference_kv_blocks_total", "KV cache blocks in the pool.", s.kv_blocks_total as f64);
     gauge(&mut o, "inference_kv_block_tokens", "Tokens per KV cache block.", s.kv_block_tokens as f64);
     let _ = writeln!(

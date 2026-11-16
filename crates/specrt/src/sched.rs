@@ -17,12 +17,14 @@ pub fn blocks_for(tokens: usize) -> usize {
 pub struct BlockPool {
     free: Vec<u32>,
     refs: Vec<u32>,
+    cached: Vec<bool>,
+    cache_only: usize,
     total: usize,
 }
 
 impl BlockPool {
     pub fn new(total: usize) -> Self {
-        BlockPool { free: (0..total as u32).rev().collect(), refs: vec![0; total], total }
+        BlockPool { free: (0..total as u32).rev().collect(), refs: vec![0; total], cached: vec![false; total], cache_only: 0, total }
     }
 
     pub fn refs(&self, block: u32) -> u32 {
@@ -30,8 +32,34 @@ impl BlockPool {
     }
 
     pub fn retain(&mut self, block: u32) {
-        debug_assert!(self.refs[block as usize] > 0);
-        self.refs[block as usize] += 1;
+        let i = block as usize;
+        debug_assert!(self.refs[i] > 0);
+        if self.cached[i] && self.refs[i] == 1 {
+            self.cache_only -= 1;
+        }
+        self.refs[i] += 1;
+    }
+
+    pub fn retain_for_cache(&mut self, block: u32) {
+        self.retain(block);
+        self.cached[block as usize] = true;
+    }
+
+    pub fn release_from_cache(&mut self, block: u32) {
+        let i = block as usize;
+        if self.cached[i] && self.refs[i] == 1 {
+            self.cache_only -= 1;
+        }
+        self.cached[i] = false;
+        self.release(&mut vec![block]);
+    }
+
+    pub fn cache_only(&self) -> usize {
+        self.cache_only
+    }
+
+    pub fn live(&self) -> usize {
+        self.used() - self.cache_only
     }
 
     pub fn total(&self) -> usize {
@@ -56,8 +84,10 @@ impl BlockPool {
         for b in blocks.drain(..) {
             debug_assert!((b as usize) < self.total && self.refs[b as usize] > 0);
             self.refs[b as usize] -= 1;
-            if self.refs[b as usize] == 0 {
-                self.free.push(b);
+            match self.refs[b as usize] {
+                0 => self.free.push(b),
+                1 if self.cached[b as usize] => self.cache_only += 1,
+                _ => {}
             }
         }
         debug_assert!(self.free.len() <= self.total);
@@ -584,6 +614,14 @@ impl<E: Executor> Scheduler<E> {
 
     pub fn blocks_used(&self) -> usize {
         self.pool.used()
+    }
+
+    pub fn blocks_live(&self) -> usize {
+        self.pool.live()
+    }
+
+    pub fn blocks_cached(&self) -> usize {
+        self.pool.cache_only()
     }
 
     pub fn blocks_total(&self) -> usize {
@@ -1897,7 +1935,7 @@ mod tests {
         s.submit(request(20_000, 4, 3)).unwrap();
         let mut last: Option<Instant> = None;
         let mut worst = Duration::ZERO;
-        for _ in 0..40 {
+        for _ in 0..200 {
             let mut ev = Vec::new();
             s.step(&mut ev).unwrap();
             if ev.iter().any(|e| matches!(e, Event::Token { id, .. } if *id == a)) {
@@ -2030,6 +2068,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn never_hit_cached_blocks_are_not_live_and_never_hold_up_admission() {
+        let mut s = Scheduler::new(Fake::new(2048, 4, 64, 256), cached_config(64, 4));
+        for q in 0..6 {
+            run_one(&mut s, request(300, 4, 100 + q));
+        }
+        assert_eq!(s.blocks_live(), 0);
+        assert!(s.blocks_cached() > 40, "the pool is mostly cache: {}", s.blocks_cached());
+        assert_eq!(s.blocks_used(), s.blocks_cached());
+        let big = request(900, 4, 777);
+        let want = expected(&big.prompt, 4, &[]);
+        let id = s.submit(big).unwrap();
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        assert_eq!(s.running(), 1, "admitted at once by evicting cache");
+        assert_eq!(s.waiting(), 0);
+        assert!(s.blocks_live() > 0);
+        let (got, _, _) = drain(&mut s);
+        let mut all: Vec<u32> = events.iter().filter_map(|e| match e { Event::Token { token, .. } => Some(*token), _ => None }).collect();
+        all.extend(got.get(&id).cloned().unwrap_or_default());
+        assert_eq!(all, want);
+        assert_eq!(s.blocks_live(), 0);
     }
 
     #[test]

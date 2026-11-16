@@ -2,7 +2,7 @@ use crate::codegen::PAGE;
 use crate::sched::BlockPool;
 use crate::spec::{PrefixCacheOptions, Spec};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 pub type Hash = [u8; 32];
@@ -174,6 +174,7 @@ pub struct PrefixCache {
     states: HashMap<Hash, Stored>,
     tails: HashMap<Hash, Tail>,
     tails_by_parent: HashMap<Hash, Vec<Hash>>,
+    order: BTreeSet<(u64, bool, Hash)>,
     tick: u64,
 }
 
@@ -187,6 +188,7 @@ impl PrefixCache {
             states: HashMap::new(),
             tails: HashMap::new(),
             tails_by_parent: HashMap::new(),
+            order: BTreeSet::new(),
             tick: 0,
         }
     }
@@ -208,6 +210,20 @@ impl PrefixCache {
             + self.tails.values().filter_map(|t| t.state.as_ref()).map(|s| s.bytes()).sum::<usize>()
     }
 
+    fn touch_entry(&mut self, hash: &Hash, tick: u64) {
+        let e = self.entries.get_mut(hash).expect("entry exists");
+        self.order.remove(&(e.tick, true, *hash));
+        e.tick = tick;
+        self.order.insert((tick, true, *hash));
+    }
+
+    fn touch_tail(&mut self, key: &Hash, tick: u64) {
+        let t = self.tails.get_mut(key).expect("tail exists");
+        self.order.remove(&(t.tick, false, *key));
+        t.tick = tick;
+        self.order.insert((tick, false, *key));
+    }
+
     fn next_ticks(&mut self, n: usize) -> u64 {
         let base = self.tick;
         self.tick += n as u64 + 1;
@@ -219,15 +235,16 @@ impl PrefixCache {
         let base = self.next_ticks(n);
         for i in 0..n {
             let tick = base + (n - i) as u64;
-            if let Some(e) = self.entries.get_mut(&hashes[i]) {
-                e.tick = tick;
+            if self.entries.contains_key(&hashes[i]) {
+                self.touch_entry(&hashes[i], tick);
                 continue;
             }
             if self.max_blocks > 0 && self.blocks() >= self.max_blocks && !self.evict_one(pool) {
                 break;
             }
-            pool.retain(blocks[i]);
+            pool.retain_for_cache(blocks[i]);
             self.entries.insert(hashes[i], Entry { block: blocks[i], tick });
+            self.order.insert((tick, true, hashes[i]));
         }
     }
 
@@ -272,8 +289,9 @@ impl PrefixCache {
         let key = tail_key(&parent, tokens);
         let tick = parent_tick.saturating_sub(1);
         let state_tick = self.next_ticks(0);
-        if let Some(t) = self.tails.get_mut(&key) {
-            t.tick = tick;
+        if self.tails.contains_key(&key) {
+            self.touch_tail(&key, tick);
+            let t = self.tails.get_mut(&key).expect("tail exists");
             if t.state.is_none() || state.is_some() {
                 t.state = state;
                 t.state_tick = state_tick;
@@ -286,21 +304,23 @@ impl PrefixCache {
         if self.max_blocks > 0 && self.blocks() >= self.max_blocks && !self.evict_one(pool) {
             return false;
         }
-        pool.retain(block);
+        pool.retain_for_cache(block);
         self.tails_by_parent.entry(parent).or_default().push(key);
         self.tails.insert(key, Tail { parent, tokens: tokens.to_vec(), block, tick, state, state_tick });
+        self.order.insert((tick, false, key));
         true
     }
 
     fn remove_tail(&mut self, key: &Hash, pool: &mut BlockPool) {
         let Some(t) = self.tails.remove(key) else { return };
+        self.order.remove(&(t.tick, false, *key));
         if let Some(list) = self.tails_by_parent.get_mut(&t.parent) {
             list.retain(|k| k != key);
             if list.is_empty() {
                 self.tails_by_parent.remove(&t.parent);
             }
         }
-        pool.release(&mut vec![t.block]);
+        pool.release_from_cache(t.block);
     }
 
     pub fn has_block(&self, hash: &Hash) -> bool {
@@ -351,14 +371,14 @@ impl PrefixCache {
             let base = self.next_ticks(t);
             let mut blocks = Vec::with_capacity(t);
             for (i, h) in hashes[..t].iter().enumerate() {
-                let e = self.entries.get_mut(h).expect("run is cached");
-                e.tick = base + (t - i) as u64;
-                pool.retain(e.block);
-                blocks.push(e.block);
+                self.touch_entry(h, base + (t - i) as u64);
+                let block = self.entries[h].block;
+                pool.retain(block);
+                blocks.push(block);
             }
             let state_tick = self.next_ticks(0);
+            self.touch_tail(&key, base);
             let tail = self.tails.get_mut(&key).expect("tail exists");
-            tail.tick = base;
             tail.state_tick = state_tick;
             pool.retain(tail.block);
             return Hit { tokens: tail_tokens, blocks, tail: Some(tail.block), snapshot: tail.state.clone() };
@@ -369,10 +389,10 @@ impl PrefixCache {
         let base = self.next_ticks(depth);
         let mut blocks = Vec::with_capacity(depth);
         for (i, h) in hashes[..depth].iter().enumerate() {
-            let e = self.entries.get_mut(h).expect("run is cached");
-            e.tick = base + (depth - i) as u64;
-            pool.retain(e.block);
-            blocks.push(e.block);
+            self.touch_entry(h, base + (depth - i) as u64);
+            let block = self.entries[h].block;
+            pool.retain(block);
+            blocks.push(block);
         }
         let snapshot = if self.hybrid {
             let s = self.states.get_mut(&hashes[depth - 1]).expect("depth has a state");
@@ -385,21 +405,28 @@ impl PrefixCache {
     }
 
     pub fn evict_one(&mut self, pool: &mut BlockPool) -> bool {
-        let entry = self.entries.iter().filter(|(_, e)| pool.refs(e.block) == 1).min_by_key(|(_, e)| e.tick).map(|(h, e)| (*h, e.tick));
-        let tail = self.tails.iter().filter(|(_, t)| pool.refs(t.block) == 1).min_by_key(|(_, t)| t.tick).map(|(k, t)| (*k, t.tick));
-        match (entry, tail) {
-            (_, Some((k, tt))) if entry.is_none_or(|(_, et)| tt <= et) => {
+        let victim = self
+            .order
+            .iter()
+            .find(|(_, is_entry, h)| {
+                let block = if *is_entry { self.entries[h].block } else { self.tails[h].block };
+                pool.refs(block) == 1
+            })
+            .copied();
+        match victim {
+            Some((_, false, k)) => {
                 self.remove_tail(&k, pool);
                 true
             }
-            (Some((h, _)), _) => {
+            Some((_, true, h)) => {
                 let e = self.entries.remove(&h).expect("victim exists");
+                self.order.remove(&(e.tick, true, h));
                 self.states.remove(&h);
                 let orphans: Vec<Hash> = self.tails_by_parent.get(&h).cloned().unwrap_or_default();
                 for k in orphans {
                     self.remove_tail(&k, pool);
                 }
-                pool.release(&mut vec![e.block]);
+                pool.release_from_cache(e.block);
                 true
             }
             _ => false,

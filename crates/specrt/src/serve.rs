@@ -186,6 +186,7 @@ pub struct Stats {
     pub running: usize,
     pub waiting: usize,
     pub kv_blocks_used: usize,
+    pub kv_blocks_cached: usize,
     pub kv_blocks_total: usize,
     pub kv_block_tokens: usize,
     pub kv_block_bytes: usize,
@@ -213,6 +214,7 @@ impl Default for Stats {
             running: 0,
             waiting: 0,
             kv_blocks_used: 0,
+            kv_blocks_cached: 0,
             kv_blocks_total: 0,
             kv_block_tokens: crate::codegen::PAGE,
             kv_block_bytes: 0,
@@ -824,7 +826,8 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         }
         s.running = sched.running();
         s.waiting = sched.waiting() + encoding(&lane);
-        s.kv_blocks_used = sched.blocks_used();
+        s.kv_blocks_used = sched.blocks_live();
+        s.kv_blocks_cached = sched.blocks_cached();
         s.preemptions = sched.preemptions();
         s.chain = sched.chain_metrics();
         let p = sched.prefix_stats();
