@@ -113,11 +113,11 @@ The in-memory state snapshots (`StateSnapshot`) hold recurrent state only, not K
 
 ## Decode attention speed (#651)
 
-Batch 8 decode on the 27B (`kvgate27b.sh speed`), tok/s, f16 against fp8 after the cp.async work:
+Batch 8 decode on the 27B (`kvgate27b.sh speed`, 3 paired runs, tok/s), K and V both converted at fragment load:
 
 | context | f16 | fp8 |
 |---|---|---|
-| 8k | 299.4 | 295.8 |
-| 32k | 223.1 | 215.0 |
+| 8k | 299.5 to 299.9 | 298.9 to 299.1 |
+| 32k | 223.0 to 223.2 | 220.8 to 220.9 |
 
-12 x 32k (`long617.sh`, KV_GB=40): f16 575.0, fp8 577.8 tok/s aggregate (fp8 holds 75915 KV blocks against 38550). fp8 stays opt-in: decode is 1 to 4 percent slower at batch 8. The decode kernel is 0.84 ms (f16) against 1.06 ms (fp8, before the K fragment convert) per call at 8 x 32k in nsys. The fp8 tile loads raw e4m3 and scales with cp.async, converts V to f16 in shared and K straight into the mma fragments.
+fp8 is within 0.3 percent at 8k and 1 percent at 32k, so the default stays f16. At 12 x 32k (`long617.sh`, KV_GB=40) fp8 matches f16 (577.8 against 575.0 tok/s) and holds twice the KV blocks (75915 against 38550). The decode kernel loads raw e4m3 and the per-row scales with cp.async, converts K and V straight into the mma fragments with `cvt.rn.f16x2.e4m3x2` and applies the scales to the scores. `flash_mma` uses the same raw cp.async load for prefill.
