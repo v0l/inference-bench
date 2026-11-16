@@ -331,6 +331,39 @@ pub struct RepoInfo {
     pub repo: String,
     pub grouped: Grouped,
     pub shape: Result<Shape, String>,
+    pub draft: Option<String>,
+}
+
+pub fn short_reason(text: &str) -> String {
+    const MAX: usize = 190;
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= MAX {
+        return text.to_string();
+    }
+    let tail: String = chars[chars.len() - 100..].iter().collect();
+    let head: String = chars[..50].iter().collect();
+    format!("{head} ... {tail}")
+}
+
+pub fn draft_of(config: &serde_json::Value) -> Option<String> {
+    let text = config.get("text_config").filter(|t| t.is_object()).unwrap_or(config);
+    let names_drafter = config["architectures"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| a.as_str())
+        .any(|a| ["Draft", "DFlash", "DSpark", "Eagle", "Medusa"].iter().any(|m| a.contains(m)));
+    let target_layers = text["num_target_layers"].as_u64().or(config["num_target_layers"].as_u64());
+    let has_target_ids = config.as_object().is_some_and(|o| o.values().any(|v| v.get("target_layer_ids").is_some())) || config.get("target_layer_ids").is_some();
+    let named = ["target_model", "target_model_name_or_path"].iter().find_map(|k| config[*k].as_str().map(String::from));
+    if !(names_drafter || target_layers.is_some() || has_target_ids || named.is_some()) {
+        return None;
+    }
+    Some(match (named, target_layers) {
+        (Some(n), _) => n,
+        (None, Some(l)) => format!("a larger model with {l} layers"),
+        (None, None) => "a larger model".into(),
+    })
 }
 
 fn gguf_shape(hub: &Hub, repo: &str, g: &Grouped) -> Result<Shape, String> {
@@ -357,21 +390,30 @@ fn gguf_shape(hub: &Hub, repo: &str, g: &Grouped) -> Result<Shape, String> {
     Err(last)
 }
 
-fn config_shape(hub: &Hub, repo: &str) -> (Result<Shape, String>, Option<String>) {
-    let text = match hub.text(repo, "config.json") {
-        Ok(t) => t,
-        Err(e) => return (Err(e), None),
-    };
+pub fn config_shape_of(repo: &str, text: &str) -> (Result<Shape, String>, Option<String>) {
+    let draft = serde_json::from_str::<serde_json::Value>(text).ok().and_then(|v| draft_of(&v));
+    if let Some(target) = &draft {
+        return (Err(format!("draft model for {target}, it only speeds up its target and cannot run alone")), draft);
+    }
     let shape = (|| {
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let support = library::specrt_support(&v);
         if !support.supported {
-            return Err(support.reason);
+            return Err(short_reason(&support.reason));
         }
-        let d = fit::describe_config_json(repo, &text)?;
+        let d = fit::describe_config_json(repo, text).map_err(|e| short_reason(&e))?;
         Ok(Shape { spec: d.spec, anatomy: d.anatomy })
     })();
-    (shape, Some(text))
+    (shape, None)
+}
+
+fn config_shape(hub: &Hub, repo: &str) -> (Result<Shape, String>, Option<String>, Option<String>) {
+    let text = match hub.text(repo, "config.json") {
+        Ok(t) => t,
+        Err(e) => return (Err(e), None, None),
+    };
+    let (shape, draft) = config_shape_of(repo, &text);
+    (shape, draft, Some(text))
 }
 
 pub fn inspect(hub: &Hub, repo: &str) -> Result<RepoInfo, String> {
@@ -380,13 +422,13 @@ pub fn inspect(hub: &Hub, repo: &str) -> Result<RepoInfo, String> {
     if has_gguf {
         let grouped = group(&files, None);
         let shape = gguf_shape(hub, repo, &grouped);
-        return Ok(RepoInfo { repo: repo.to_string(), grouped, shape });
+        return Ok(RepoInfo { repo: repo.to_string(), grouped, shape, draft: None });
     }
     if !files.iter().any(|f| f.path.ends_with(".safetensors")) {
         return Err("no GGUF or safetensors files".into());
     }
-    let (shape, text) = config_shape(hub, repo);
-    Ok(RepoInfo { repo: repo.to_string(), grouped: group(&files, text.as_deref()), shape })
+    let (shape, draft, text) = config_shape(hub, repo);
+    Ok(RepoInfo { repo: repo.to_string(), grouped: group(&files, text.as_deref()), shape, draft })
 }
 
 pub fn inspect_all(hub: &Hub, repos: &[String]) -> Vec<(String, Result<RepoInfo, String>)> {
@@ -422,6 +464,7 @@ impl Scored {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RepoPlan {
     pub repo: String,
+    pub draft: Option<String>,
     pub unsupported: Option<String>,
     pub ranked: Vec<Scored>,
 }
@@ -433,7 +476,7 @@ impl RepoPlan {
 
     pub fn key(&self) -> (u8, u8, std::cmp::Reverse<u32>, u64) {
         match self.best() {
-            Some(b) if self.unsupported.is_none() => b.key(),
+            Some(b) if self.unsupported.is_none() && self.draft.is_none() => b.key(),
             _ => (3, 3, std::cmp::Reverse(0), u64::MAX),
         }
     }
@@ -462,7 +505,7 @@ pub fn plan(info: &RepoInfo, gpus: &[u64], seqs: usize) -> RepoPlan {
         })
         .collect();
     ranked.sort_by_key(|s| s.key());
-    RepoPlan { repo: info.repo.clone(), unsupported: info.shape.as_ref().err().cloned(), ranked }
+    RepoPlan { repo: info.repo.clone(), draft: info.draft.clone(), unsupported: info.shape.as_ref().err().cloned().filter(|_| info.draft.is_none()), ranked }
 }
 
 pub fn rank_repos(mut plans: Vec<RepoPlan>) -> Vec<RepoPlan> {
@@ -703,7 +746,7 @@ mod tests {
 
     fn info(variants: &[(&str, u64)]) -> RepoInfo {
         let files: Vec<RepoFile> = variants.iter().map(|(l, size)| RepoFile::new(&format!("m-{l}.gguf"), *size)).collect();
-        RepoInfo { repo: "acme/m".into(), grouped: group(&files, None), shape: Ok(shape()) }
+        RepoInfo { repo: "acme/m".into(), grouped: group(&files, None), shape: Ok(shape()), draft: None }
     }
 
     #[test]
@@ -732,7 +775,7 @@ mod tests {
     #[test]
     fn unsupported_quant_types_and_incomplete_splits_are_never_the_best() {
         let files = files_1017();
-        let info = RepoInfo { repo: "x/y".into(), grouped: group(&files, None), shape: Ok(shape()) };
+        let info = RepoInfo { repo: "x/y".into(), grouped: group(&files, None), shape: Ok(shape()), draft: None };
         let p = plan(&info, &[500 * GB], 1);
         let best = p.best().unwrap();
         assert!(best.variant.label == "IQ4_NL" || best.runnable.is_err() || !best.variant.complete());
@@ -813,6 +856,39 @@ mod tests {
         let v = g.variants.iter().find(|v| v.label == "IQ4_NL").unwrap();
         let names: Vec<String> = download_list(&g, v).into_iter().map(|f| f.path).collect();
         assert_eq!(names, ["chat_template.jinja", "mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf", "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"]);
+    }
+
+    #[test]
+    fn a_dflash_draft_repo_is_a_draft_model_not_a_runnable_one_and_ranks_below_real_models() {
+        let text = include_str!("../tests/fixtures/hf/dflash2-draft-config.json");
+        let (shape, draft) = config_shape_of("z-lab/Qwen3.8-27B-DFlash2", text);
+        assert_eq!(draft.as_deref(), Some("a larger model with 64 layers"));
+        assert!(shape.as_ref().err().is_some_and(|e| e.starts_with("draft model for")), "{:?}", shape.as_ref().err());
+        let files = vec![RepoFile::new("model.safetensors", 3 * GB), RepoFile::new("config.json", 100)];
+        let drafter = RepoInfo { repo: "z-lab/Qwen3.8-27B-DFlash2".into(), grouped: group(&files, Some(text)), shape, draft };
+        let real = info(&[("Q4_K_M", 5 * GB)]);
+        let plans = rank_repos(vec![plan(&drafter, &[90 * GB], 1), plan(&real, &[90 * GB], 1)]);
+        assert_eq!(plans[0].repo, "acme/m");
+        assert!(plans[1].draft.is_some() && plans[1].unsupported.is_none());
+        assert!(!plans[1].best().unwrap().downloadable());
+    }
+
+    #[test]
+    fn target_and_drafter_markers_are_read_from_the_config_and_plain_models_are_not_drafts() {
+        let v = |t: &str| serde_json::from_str::<serde_json::Value>(t).unwrap();
+        assert!(draft_of(&v(r#"{"architectures":["LlamaForCausalLMEagle"]}"#)).is_some());
+        assert_eq!(draft_of(&v(r#"{"target_model":"org/Big"}"#)).as_deref(), Some("org/Big"));
+        assert!(draft_of(&v(r#"{"architectures":["Qwen3ForCausalLM"],"num_hidden_layers":36}"#)).is_none());
+        assert!(draft_of(&v(r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"text_config":{"mtp_num_hidden_layers":1}}"#)).is_none());
+    }
+
+    #[test]
+    fn a_huge_quantization_config_error_stays_one_short_line() {
+        let text = include_str!("../tests/fixtures/hf/nvfp4-qwen3.8-27b-config.json");
+        let (shape, draft) = config_shape_of("nvidia/Qwen3.8-27B-NVFP4", text);
+        assert!(draft.is_none());
+        let e = shape.err().expect("specrt does not read modelopt mixed precision yet");
+        assert!(e.chars().count() < 200 && e.contains("is not supported"), "{e}");
     }
 
     #[test]

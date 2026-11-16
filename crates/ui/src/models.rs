@@ -445,6 +445,13 @@ fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>,
             let Some(best) = plan.best() else { return };
             let chosen_label = app.models.picks.get(&r.id).cloned().unwrap_or_else(|| best.variant.label.clone());
             let shown = plan.ranked.iter().find(|s| s.variant.label == chosen_label).unwrap_or(best).clone();
+            if let Some(target) = &plan.draft {
+                ui.horizontal_wrapped(|ui| {
+                    chip(ui, "draft model", WARN, false);
+                    note(ui, format!("draft model for {target}: speeds up its target model and cannot run alone"), LEGEND);
+                });
+                return;
+            }
             if let Some(why) = plan.unsupported.clone().or_else(|| shown.runnable.clone().err()) {
                 ui.horizontal_wrapped(|ui| {
                     chip(ui, "not supported", WARN, false);

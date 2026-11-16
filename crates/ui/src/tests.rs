@@ -2187,8 +2187,8 @@ fn screenshot_of_discover() {
     fixture.render().unwrap().save(out.join("discover-fixture.png")).unwrap();
     let gpus = inference_bench_core::gpu::sample();
     assert!(!gpus.is_empty(), "no gpu reading on this machine");
-    for (file, query) in [("discover-1017.png", "1017"), ("discover-qwen3.8-27b.png", "qwen3.8 27b"), ("discover-qwen3-8b-gguf.png", "Qwen3-8B-GGUF")] {
-        let mut h = harness_sized("discover-live", Tab::Models, 1000.0);
+    for (file, query) in [("discover-1017.png", "1017"), ("discover-qwen3.8-27b.png", "qwen3.8 27b"), ("discover-qwen3.8-27b-fp8.png", "Qwen3.8-27B-FP8"), ("discover-qwen3-8b-gguf.png", "Qwen3-8B-GGUF")] {
+        let mut h = harness_sized("discover-live", Tab::Models, 1400.0);
         {
             let app = h.state_mut();
             app.gpu = gpus.clone();
