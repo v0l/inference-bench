@@ -1,0 +1,36 @@
+{
+  "name": "smollm3",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 2048,
+    "intermediate": 11008,
+    "vocab": 128256,
+    "tie_embeddings": true
+  },
+  "layers": {
+    "count": 36,
+    "pattern": [
+      "full"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 16,
+    "kv_heads": 4,
+    "head_dim": 128,
+    "qkv_bias": false,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 5000000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  }
+}

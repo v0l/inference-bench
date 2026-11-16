@@ -425,6 +425,8 @@ pub struct Dims {
     pub embed_scale: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logit_softcap: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logit_scale: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -510,6 +512,10 @@ pub struct Norm {
     pub unit_offset: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub sandwich: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub pre: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_scale: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -529,6 +535,10 @@ pub struct Attention {
     pub softcap: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query_scalar: Option<f64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub qk_norm_full: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fused_qkv: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -542,6 +552,8 @@ pub struct Rope {
     pub mrope: Option<Mrope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_theta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nope_layers: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,6 +583,8 @@ pub struct Mlp {
     pub quant_until: Option<usize>,
     #[serde(default, skip_serializing_if = "ActQuant::is_none")]
     pub act_quant: ActQuant,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fused_gate_up: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -649,7 +663,7 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
-    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config",
+    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "embedding_multiplier", "attention_multiplier", "residual_multiplier", "logits_scaling", "no_rope_layers", "no_rope_layer_interval", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config",
 ];
 
 pub fn unread_hf_keys(json: &str) -> Vec<(String, String)> {
@@ -707,6 +721,16 @@ struct HfConfig {
     attn_logit_softcapping: Option<f64>,
     final_logit_softcapping: Option<f64>,
     query_pre_attn_scalar: Option<f64>,
+}
+
+fn nope_layers(rope: &crate::family::FamilyRope, config: &serde_json::Value) -> Vec<usize> {
+    let Some(flags) = rope.nope_flags.as_deref().and_then(|k| config.get(k)).and_then(|v| v.as_array()) else { return Vec::new() };
+    flags
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.as_u64() == Some(0) || f.as_bool() == Some(false))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn layer_pattern(blocks_spec: &crate::family::FamilyBlocks, types: &[String], strict: bool) -> Result<Vec<Block>> {
@@ -1083,6 +1107,7 @@ impl Spec {
             crate::family::BlockKind::FromConfig => config_hybrid,
         };
         let (qkv_bias, qk_norm, output_gate) = attn_flags;
+        let multiplier = |key: &Option<String>| key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_f64());
         let head_dim = hf.head_dim.unwrap_or(hf.hidden_size / hf.num_attention_heads);
         let rotary_dim = hf
             .partial_rotary_factor
@@ -1146,11 +1171,24 @@ impl Spec {
                 }).unwrap_or(0),
                 vocab: hf.vocab_size,
                 tie_embeddings: hf.tie_word_embeddings.or(family.embedding.tie).unwrap_or(false),
-                embed_scale: family.embedding.scale.as_deref().and_then(|s| (s == "sqrt_hidden").then(|| (hf.hidden_size as f64).sqrt())),
+                embed_scale: family
+                    .embedding
+                    .scale
+                    .as_deref()
+                    .and_then(|s| (s == "sqrt_hidden").then(|| (hf.hidden_size as f64).sqrt()))
+                    .or(multiplier(&family.multipliers.embedding)),
                 logit_softcap: hf.final_logit_softcapping,
+                logit_scale: multiplier(&family.multipliers.logits_divisor).filter(|d| *d > 0.0).map(|d| 1.0 / d),
             },
             layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.contains(&Block::Sliding)), pattern },
-            norm: Norm { kind: NormKind::Rmsnorm, eps: hf.rms_norm_eps, unit_offset: family.norm.unit_offset.unwrap_or(hybrid), sandwich: family.norm.sandwich },
+            norm: Norm {
+                kind: NormKind::Rmsnorm,
+                eps: hf.rms_norm_eps,
+                unit_offset: family.norm.unit_offset.unwrap_or(hybrid),
+                sandwich: family.norm.sandwich,
+                pre: family.norm.pre,
+                residual_scale: multiplier(&family.multipliers.residual),
+            },
             attention: Attention {
                 kind: AttentionKind::Gqa,
                 heads: hf.num_attention_heads,
@@ -1161,14 +1199,17 @@ impl Spec {
                 output_gate,
                 rotary_dim,
                 softcap: hf.attn_logit_softcapping,
-                query_scalar: hf.query_pre_attn_scalar,
+                query_scalar: hf.query_pre_attn_scalar.or(multiplier(&family.multipliers.attention).filter(|m| *m > 0.0).map(|m| 1.0 / (m * m))),
+                qk_norm_full: qk_norm && family.attention.qk_norm_full,
+                fused_qkv: family.attention.fused_qkv,
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta },
+            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value) },
             mlp: Mlp {
                 activation,
                 quant: mlp_quant.map(|m| m.0),
                 quant_until: mlp_quant.and_then(|m| m.1),
                 act_quant: mlp_act,
+                fused_gate_up: family.mlp.fused_gate_up,
             },
             moe,
             mtp: (family.mtp && hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
@@ -1403,6 +1444,14 @@ impl Spec {
         s.mtp = None;
         s.vision = None;
         s
+    }
+
+    pub fn uses_branch(&self) -> bool {
+        self.norm.sandwich || self.norm.residual_scale.is_some()
+    }
+
+    pub fn nope(&self, layer: usize) -> bool {
+        self.rope.nope_layers.contains(&layer)
     }
 
     pub fn block(&self, layer: usize) -> Block {

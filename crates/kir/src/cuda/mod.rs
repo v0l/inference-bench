@@ -71,6 +71,26 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
             eps = lit(*eps),
             wi = weight_expr(k.params[1].name, *offset),
         ),
+        Body::RmsNormSegment { width, stride, start, eps, sum: BlockSum::WarpShuffle } => format!(
+            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const float* {x}, const float* {w}, float* {out}) {{
+    constexpr int WIDTH = {width};
+    __shared__ float scratch[32];
+    size_t base = (size_t)blockIdx.x * {stride} + {start};
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) ss += {x}[base + i] * {x}[base + i];
+    float inv = rsqrtf(kir_block_sum(ss, scratch) / WIDTH + {eps}f);
+    for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) {out}[base + i] = {w}[i] * ({x}[base + i] * inv);
+}}
+
+",
+            threads = k.threads,
+            name = k.name,
+            x = k.params[0].name,
+            w = k.params[1].name,
+            out = k.params[2].name,
+            eps = lit(*eps),
+        ),
+        Body::RmsNormSegment { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
         Body::AddRmsNorm { width, eps, sum: BlockSum::WarpShuffle, offset } => format!(
             "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const float* {x}, const float* {d}, const float* {w}, float* {sm}, float* {out}) {{
     constexpr int WIDTH = {width};
@@ -133,11 +153,11 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
             wi = weight_expr(k.params[1].name, *offset),
         ),
         Body::NormAdd { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
-        Body::Add { width } => format!(
+        Body::Add { width, scale } => format!(
             "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(const float* {x}, const float* {d}, float* {out}) {{
     constexpr int WIDTH = {width};
     size_t base = (size_t)blockIdx.y * WIDTH;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < WIDTH; i += gridDim.x * blockDim.x) {out}[base + i] = {x}[base + i] + {d}[base + i];
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < WIDTH; i += gridDim.x * blockDim.x) {out}[base + i] = {x}[base + i] + {scaled}{d}[base + i];
 }}
 
 ",
@@ -146,6 +166,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
             x = k.params[0].name,
             d = k.params[1].name,
             out = k.params[2].name,
+            scaled = if *scale == 1.0 { String::new() } else { format!("{}f * ", lit(*scale)) },
         ),
         Body::AddRmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
         Body::RmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
@@ -180,7 +201,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
 
 pub fn emit_module(kernels: &[Kernel]) -> Result<String, String> {
     let mut out = String::new();
-    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. })) {
+    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. })) {
         out.push_str(WARP_SUM);
     }
     for k in kernels {

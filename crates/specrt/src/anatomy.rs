@@ -136,7 +136,11 @@ fn attention_counts(spec: &Spec) -> Counts {
     let h = spec.dims.hidden as u64;
     let a = &spec.attention;
     let bias = if a.qkv_bias { (spec.qkv_rows() + spec.dims.hidden) as u64 } else { 0 };
-    let norms = if a.qk_norm { 2 * a.head_dim as u64 } else { 0 };
+    let norms = match (a.qk_norm, a.qk_norm_full) {
+        (true, true) => (spec.q_dim() + spec.kv_dim()) as u64,
+        (true, false) => 2 * a.head_dim as u64,
+        _ => 0,
+    };
     Counts { quantised: spec.qkv_rows() as u64 * h + h * spec.q_dim() as u64, plain: bias + norms }
 }
 

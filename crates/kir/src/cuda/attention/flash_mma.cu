@@ -50,7 +50,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
 #pragma unroll
             for (int i = 0; i < PAIRS; i++) {
                 int d = lane + 32 * i;
-                if (d < ROT_HALF) {
+                if (!NOPE[layer] && d < ROT_HALF) {
                     float x = dst[d], y = dst[d + ROT_HALF];
                     float sn, c;
                     sincosf(rope_position(mm_meta, mm_table, mm_stride, mm_slot, base + row, d) * freq[i], &sn, &c);

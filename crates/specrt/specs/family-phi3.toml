@@ -1,0 +1,13 @@
+name = "phi3"
+kind = "family"
+extends = "base"
+
+[match]
+model_types = ["phi3"]
+architectures = ["Phi3ForCausalLM"]
+
+[attention]
+fused_qkv = true
+
+[mlp]
+fused_gate_up = true

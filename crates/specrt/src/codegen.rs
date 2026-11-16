@@ -54,7 +54,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize) -> kir::attention::Attenti
         head_dim: a.head_dim,
         qkv_row: spec.qkv_rows(),
         output_gate: a.output_gate,
-        qk_norm: a.qk_norm,
+        qk_norm: a.qk_norm && !a.qk_norm_full,
         eps: spec.norm.eps,
         rope: kir::attention::RopeShape {
             rotary_dim: spec.rotary_dim(),
@@ -75,6 +75,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize) -> kir::attention::Attenti
         softcap: spec.attention.softcap.unwrap_or(0.0),
         bidirectional: spec.vision.as_ref().is_some_and(|v| v.config.bidirectional),
         local_theta: spec.rope.local_theta.unwrap_or(spec.rope.theta),
+        nope: (0..spec.layers.count).filter(|&i| !spec.block(i).is_linear()).map(|i| spec.nope(i)).chain(std::iter::repeat_n(false, spec.speculative().map_or(0, |m| m.layers) + 1)).collect(),
         local_rope: (0..spec.layers.count)
             .filter(|&i| !spec.block(i).is_linear())
             .map(|i| spec.block(i) == crate::spec::Block::Sliding && spec.rope.local_theta.is_some())
@@ -166,9 +167,21 @@ pub fn kir_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>
     let gate = kir::Kernel::gated_activation(target, "swiglu", inter, act, 256).map_err(anyhow::Error::msg)?;
     let mut out = vec![norm, gate];
     let err = anyhow::Error::msg;
-    if spec.norm.sandwich {
+    if spec.uses_branch() {
         out.push(kir::Kernel::norm_add(target, hidden, spec.norm.eps as f32, 0.0, 1024).map_err(err)?);
         out.push(kir::Kernel::pointwise(target, "clear_branch", hidden, kir::Pointwise::Fill(0.0), 256).map_err(err)?);
+    }
+    if let Some(scale) = spec.norm.residual_scale {
+        out.push(kir::Kernel::add_scaled(target, "residual_add", hidden, scale as f32, 256).map_err(err)?);
+    }
+    if spec.attention.qk_norm_full {
+        let (q, kv, row) = (spec.q_dim() as u32, spec.kv_dim() as u32, spec.qkv_rows() as u32);
+        let eps = spec.norm.eps as f32;
+        out.push(kir::Kernel::rmsnorm_segment(target, "q_norm_rows", q, row, 0, eps, 1024).map_err(err)?);
+        out.push(kir::Kernel::rmsnorm_segment(target, "k_norm_rows", kv, row, q, eps, 1024).map_err(err)?);
+    }
+    if let Some(scale) = spec.dims.logit_scale {
+        out.push(kir::Kernel::pointwise(target, "logit_scale", spec.dims.vocab as u32, kir::Pointwise::Scale(scale as f32), 256).map_err(err)?);
     }
     if let Some(cap) = spec.dims.logit_softcap {
         out.push(kir::Kernel::pointwise(target, "logit_softcap", spec.dims.vocab as u32, kir::Pointwise::SoftCap(cap as f32), 256).map_err(err)?);

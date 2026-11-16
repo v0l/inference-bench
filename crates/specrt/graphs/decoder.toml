@@ -10,8 +10,8 @@ op = "splice"
 when = "vision+tensor_core"
 
 [[block]]
-name = "attention_sandwich"
-when = "sandwich+tensor_core"
+name = "attention_branch"
+when = "branch+tensor_core"
 layers = ["dense", "full", "sliding"]
 mlp = "dense"
 
@@ -20,6 +20,13 @@ op = "rmsnorm"
 weight = "input_layernorm.weight"
 in = "x"
 out = "xn_planes"
+when = "pre"
+
+[[block.node]]
+op = "split"
+in = "x"
+out = "xn_planes"
+when = "nopre"
 
 [[block.node]]
 op = "linear"
@@ -27,6 +34,10 @@ weight = "qkv"
 quant = "attn"
 in = "xn_planes"
 out = "qkv"
+
+[[block.node]]
+op = "qk_norm"
+when = "qk_norm_full"
 
 [[block.node]]
 op = "kv_rope"
@@ -55,12 +66,32 @@ out = "branch"
 op = "norm_add"
 weight = "post_attention_layernorm.weight"
 in = "branch"
+when = "sandwich"
+
+[[block.node]]
+op = "add_scaled"
+in = "branch"
+when = "scaled"
 
 [[block.node]]
 op = "rmsnorm"
 weight = "pre_feedforward_layernorm.weight"
 in = "x"
 out = "xn_planes"
+when = "sandwich+pre"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+in = "x"
+out = "xn_planes"
+when = "scaled"
+
+[[block.node]]
+op = "split"
+in = "x"
+out = "xn_planes"
+when = "nopre"
 
 [[block.node]]
 op = "linear"
@@ -84,6 +115,12 @@ out = "branch"
 op = "norm_add"
 weight = "post_feedforward_layernorm.weight"
 in = "branch"
+when = "sandwich"
+
+[[block.node]]
+op = "add_scaled"
+in = "branch"
+when = "scaled"
 
 [[tail]]
 op = "rmsnorm"
@@ -459,6 +496,10 @@ op = "moe_experts"
 
 [[block.node]]
 op = "moe_combine"
+
+[[tail]]
+op = "logit_scale"
+when = "tensor_core+logit_scale"
 
 [[tail]]
 op = "logit_softcap"

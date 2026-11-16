@@ -1,0 +1,10 @@
+name = "smollm3"
+kind = "family"
+extends = "base"
+
+[match]
+model_types = ["smollm3"]
+architectures = ["SmolLM3ForCausalLM"]
+
+[rope]
+nope_flags = "no_rope_layers"

@@ -66,7 +66,7 @@ fn the_mapper_names_no_architecture_activation_or_quant_method() {
     let mut forbidden: Vec<String> = r.families().iter().flat_map(|f| f.matches.model_types.iter().cloned()).collect();
     forbidden.extend(r.families().iter().flat_map(|f| f.activation.map.keys().cloned()));
     forbidden.extend(r.families().iter().flat_map(|f| f.gguf.pretokenizers.keys().cloned()));
-    forbidden.extend(["gelu", "silu", "swish", "compressed-tensors", "float-quantized", "nvfp4-pack-quantized", "e4m3", "gptq", "awq", "bfloat16", "float16", "float32", "gemma", "phi3", "mistral"].map(String::from));
+    forbidden.extend(["gelu", "silu", "swish", "compressed-tensors", "float-quantized", "nvfp4-pack-quantized", "e4m3", "gptq", "awq", "bfloat16", "float16", "float32", "gemma", "mistral"].map(String::from));
     forbidden.sort();
     forbidden.dedup();
     for file in ["src/spec.rs", "src/gguf.rs", "src/family.rs"] {

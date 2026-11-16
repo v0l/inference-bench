@@ -1,0 +1,39 @@
+{
+  "name": "olmo2",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 2048,
+    "intermediate": 8192,
+    "vocab": 100352,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 16,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6,
+    "sandwich": true,
+    "pre": false
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 16,
+    "kv_heads": 16,
+    "head_dim": 128,
+    "qkv_bias": false,
+    "qk_norm": true,
+    "qk_norm_full": true
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 500000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  }
+}

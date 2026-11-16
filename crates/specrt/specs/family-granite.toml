@@ -1,0 +1,13 @@
+name = "granite"
+kind = "family"
+extends = "base"
+
+[match]
+model_types = ["granite"]
+architectures = ["GraniteForCausalLM"]
+
+[multipliers]
+embedding = "embedding_multiplier"
+attention = "attention_multiplier"
+residual = "residual_multiplier"
+logits_divisor = "logits_scaling"

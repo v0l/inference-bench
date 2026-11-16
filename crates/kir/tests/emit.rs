@@ -296,3 +296,19 @@ fn fill_writes_a_constant() {
     let k = Kernel::pointwise(&Target::sm_120(), "clear", 64, kir::Pointwise::Fill(0.0), 256).unwrap();
     assert!(kir::cuda::emit_kernel(&k).unwrap().contains("out[i] = 0e0f;"));
 }
+
+#[test]
+fn add_scaled_scales_the_delta() {
+    let k = Kernel::add_scaled(&Target::sm_120(), "scaled_add", 128, 0.22, 256).unwrap();
+    let src = kir::cuda::emit_kernel(&k).unwrap();
+    assert!(src.contains("out[base + i] = x[base + i] + 2.2e-1f * delta[base + i]"), "{src}");
+}
+
+#[test]
+fn a_segment_norm_normalises_a_slice_of_each_row_in_place() {
+    let k = Kernel::rmsnorm_segment(&Target::sm_120(), "q_norm_full", 64, 192, 0, 1e-6, 256).unwrap();
+    let src = kir::cuda::emit_module(&[k]).unwrap();
+    assert!(src.contains("size_t base = (size_t)blockIdx.x * 192 + 0;"), "{src}");
+    assert!(src.contains("out[base + i] = weight[i] * (x[base + i] * inv)"), "{src}");
+    assert!(Kernel::rmsnorm_segment(&Target::sm_120(), "bad", 64, 100, 64, 1e-6, 256).is_err());
+}

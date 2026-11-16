@@ -77,7 +77,11 @@ impl Runtime {
             Op::Norm { which, into } => self.norm_op(which, into, layer, run),
             Op::NormAdd { which, from } => self.norm_add_op(which, from, layer, run),
             Op::Clear { buf } => self.clear_op(buf, run),
-            Op::LogitSoftcap => self.softcap_op(run),
+            Op::LogitSoftcap => self.softcap_op(run, "logit_softcap"),
+            Op::LogitScale => self.softcap_op(run, "logit_scale"),
+            Op::Split { from, into } => self.split_op(from, into, run),
+            Op::QkNorm => self.qk_norm_op(self.attn_of(layer), run.n),
+            Op::ScaledAdd { from } => self.scaled_add_op(from, run),
             Op::Linear { weight, input, output, .. } => self.linear_op(weight, input, output, layer, run),
             Op::KvRope => self.attn_rope_rows(self.attn_of(layer), n, 0),
             Op::QkRope => self.qk_rope_legacy(self.attn_of(layer), n),
@@ -167,9 +171,39 @@ impl Runtime {
         Ok(())
     }
 
-    fn softcap_op(&self, run: &Run) -> Result<()> {
+    fn split_op(&self, from: Buf, into: Buf, run: &Run) -> Result<()> {
+        let planes = self.planes(into);
+        let source = self.f32_buf(from, run);
+        let count = (run.n * self.spec.dims.hidden) as i32;
+        let mut b = self.stream.launch_builder(self.kernel("split_rows"));
+        b.arg(source).arg(&planes.hi).arg(&planes.lo).arg(&count);
+        unsafe { b.launch(super::cfg(super::grid(count as usize, 512), 256)) }?;
+        Ok(())
+    }
+
+    fn qk_norm_op(&self, l: &DeviceAttn, n: usize) -> Result<()> {
+        let (q, k) = (l.q_norm.as_ref().expect("full-width qk norm has weights"), l.k_norm.as_ref().expect("full-width qk norm has weights"));
+        for (name, w) in [("q_norm_rows", q), ("k_norm_rows", k)] {
+            let mut b = self.stream.launch_builder(self.kernel(name));
+            b.arg(&self.pre.qkv).arg(w).arg(&self.pre.qkv);
+            unsafe { b.launch(super::cfg(n as u32, 1024)) }?;
+        }
+        Ok(())
+    }
+
+    fn scaled_add_op(&self, from: Buf, run: &Run) -> Result<()> {
+        let hidden = self.spec.dims.hidden;
+        let delta = self.f32_buf(from, run);
+        let mut b = self.stream.launch_builder(self.kernel("residual_add"));
+        b.arg(&self.pre.x).arg(delta).arg(&self.pre.x);
+        let config = LaunchConfig { grid_dim: (grid(hidden, 256), run.n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn softcap_op(&self, run: &Run, name: &str) -> Result<()> {
         let vocab = self.spec.dims.vocab;
-        let mut b = self.stream.launch_builder(self.kernel("logit_softcap"));
+        let mut b = self.stream.launch_builder(self.kernel(name));
         b.arg(run.logits).arg(run.logits);
         let config = LaunchConfig { grid_dim: (grid(vocab, 256), run.rows.len() as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;

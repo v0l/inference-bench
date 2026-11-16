@@ -1,0 +1,15 @@
+name = "olmo2"
+kind = "family"
+extends = "base"
+
+[match]
+model_types = ["olmo2"]
+architectures = ["Olmo2ForCausalLM"]
+
+[attention]
+qk_norm = true
+qk_norm_full = true
+
+[norm]
+sandwich = true
+pre = false

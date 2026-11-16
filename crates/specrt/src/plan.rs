@@ -105,13 +105,15 @@ impl Weight {
         let w = |m: &str| format!("{m}.weight");
         match self {
             Weight::Qkv => {
-                let mut t: Vec<String> = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"].iter().map(|m| w(m)).collect();
+                let names: &[&str] = if spec.attention.fused_qkv { &["self_attn.qkv_proj"] } else { &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] };
+                let mut t: Vec<String> = names.iter().map(|m| w(m)).collect();
                 if spec.attention.qkv_bias {
                     t.extend(["self_attn.q_proj.bias", "self_attn.k_proj.bias", "self_attn.v_proj.bias"].map(String::from));
                 }
                 t
             }
             Weight::O => vec![w("self_attn.o_proj")],
+            Weight::GateUp if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
             Weight::GateUp => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
             Weight::Down => vec![w("mlp.down_proj")],
             Weight::LinIn => vec![w("linear_attn.in_proj_qkv"), w("linear_attn.in_proj_z")],
@@ -173,6 +175,10 @@ pub enum Op {
     Norm { which: NormKind, into: Buf },
     NormAdd { which: NormKind, from: Buf },
     Clear { buf: Buf },
+    Split { from: Buf, into: Buf },
+    QkNorm,
+    ScaledAdd { from: Buf },
+    LogitScale,
     LogitSoftcap,
     Linear { weight: Weight, quant: QuantSource, input: Buf, output: Buf },
     KvRope,
@@ -217,7 +223,11 @@ impl Op {
             },
             Op::NormAdd { which, .. } => format!("{which:?} norm and add"),
             Op::LogitSoftcap => "logit softcap".into(),
+            Op::LogitScale => "logit scale".into(),
             Op::Clear { .. } => "clear".into(),
+            Op::Split { .. } => "split".into(),
+            Op::QkNorm => "qk norm".into(),
+            Op::ScaledAdd { .. } => "scaled add".into(),
             Op::Linear { weight, .. } => weight.name().into(),
             Op::KvRope | Op::QkRope => "norm and rope".into(),
             Op::Flash | Op::FlashLegacy => "attention".into(),
@@ -240,8 +250,11 @@ impl Op {
             Op::Splice => "media embeddings into x".into(),
             Op::Norm { into, .. } => format!("x to {}", into.label()),
             Op::NormAdd { from, .. } => format!("{} added to x", from.label()),
-            Op::LogitSoftcap => "logits to logits".into(),
+            Op::LogitSoftcap | Op::LogitScale => "logits to logits".into(),
             Op::Clear { buf } => format!("zero {}", buf.label()),
+            Op::Split { from, into } => format!("{} to {}", from.label(), into.label()),
+            Op::QkNorm => "qkv to qkv".into(),
+            Op::ScaledAdd { from } => format!("{} scaled and added to x", from.label()),
             Op::Linear { input, output, .. } => format!("{} to {}", input.label(), output.label()),
             Op::KvRope | Op::QkRope => "qkv to kv cache".into(),
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention => "qkv and kv cache to attn".into(),
@@ -262,7 +275,7 @@ impl Op {
             Op::Embed => vec!["embed_tokens.weight".into()],
             Op::Norm { which, .. } | Op::NormAdd { which, .. } => vec![which.tensor().into()],
             Op::Linear { weight, .. } => weight.tensors(spec),
-            Op::KvRope | Op::QkRope | Op::Flash | Op::DecodeAttention if spec.attention.qk_norm => {
+            Op::KvRope | Op::QkRope | Op::Flash | Op::DecodeAttention | Op::QkNorm if spec.attention.qk_norm => {
                 vec!["self_attn.q_norm.weight".into(), "self_attn.k_norm.weight".into()]
             }
             Op::GdnPrefill | Op::GdnDecode => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
@@ -310,7 +323,11 @@ impl Op {
             Op::Norm { .. } => names(&["rmsnorm"]),
             Op::NormAdd { .. } => names(&["norm_add"]),
             Op::LogitSoftcap => names(&["logit_softcap"]),
+            Op::LogitScale => names(&["logit_scale"]),
             Op::Clear { .. } => names(&["clear_branch"]),
+            Op::Split { .. } => names(&["split_rows"]),
+            Op::QkNorm => names(&["q_norm_rows", "k_norm_rows"]),
+            Op::ScaledAdd { .. } => names(&["residual_add"]),
             Op::Linear { weight, quant, .. } => {
                 let w = *weight;
                 let kind = weight_kind(quant.resolve(spec, layer));

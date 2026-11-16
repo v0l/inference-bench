@@ -174,8 +174,8 @@ fn mistral_f16_spec_matches_hf_config() {
 }
 
 #[test]
-fn gemma2_phi3_and_unknown_types_stay_unsupported_with_the_model_type_in_the_error() {
-    for model_type in ["gemma2", "phi3", "not_a_model"] {
+fn gemma2_and_unknown_types_stay_unsupported_with_the_model_type_in_the_error() {
+    for model_type in ["gemma2", "not_a_model"] {
         let json =
             fixture_with("\"model_type\": \"qwen3\"", &format!("\"model_type\": \"{model_type}\""));
         let e = Spec::from_hf_config(&json).unwrap_err().to_string();

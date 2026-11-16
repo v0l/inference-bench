@@ -45,6 +45,7 @@ fn shape(planes: usize, fp8: bool, mrope: bool) -> AttentionShape {
         local_theta: 10000.0,
         local_rope: vec![false, true, false, false],
         bidirectional: false,
+        nope: vec![false, false, true, false],
     }
 }
 

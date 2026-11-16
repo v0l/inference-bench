@@ -49,6 +49,7 @@ pub struct AttentionShape {
     pub local_theta: f64,
     pub local_rope: Vec<bool>,
     pub bidirectional: bool,
+    pub nope: Vec<bool>,
 }
 
 impl AttentionShape {
@@ -245,6 +246,8 @@ pub(crate) fn constants(s: &AttentionShape, families: &[Family]) -> String {
     let _ = writeln!(o, "constexpr bool QK_NORM = {};", s.qk_norm);
     let local: Vec<String> = s.local_rope.iter().map(|b| b.to_string()).collect();
     let _ = writeln!(o, "constexpr bool LOCAL_ROPE[] = {{ {} }};", if local.is_empty() { "false".into() } else { local.join(", ") });
+    let nope: Vec<String> = s.nope.iter().map(|b| b.to_string()).collect();
+    let _ = writeln!(o, "constexpr bool NOPE[] = {{ {} }};", if nope.is_empty() { "false".into() } else { nope.join(", ") });
     let _ = writeln!(o, "constexpr float LOCAL_THETA = {};", f(s.local_theta));
     let _ = writeln!(o, "constexpr float QUERY_SCALE = {};", f(s.query_scale));
     let _ = writeln!(o, "constexpr bool BIDI = {};", s.bidirectional);

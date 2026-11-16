@@ -863,7 +863,7 @@ impl Runtime {
             tokens: stream.alloc_zeros(chunk)?,
             x: stream.alloc_zeros(chunk * d.hidden)?,
             xn: stream.alloc_zeros(mma_only(chunk * d.hidden))?,
-            branch: stream.alloc_zeros(if spec.norm.sandwich { chunk * d.hidden } else { 1 })?,
+            branch: stream.alloc_zeros(if spec.uses_branch() { chunk * d.hidden } else { 1 })?,
             qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
             attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim()))?,
             gate_up: stream.alloc_zeros(mma_only(chunk * 2 * d.intermediate))?,
@@ -1144,15 +1144,32 @@ impl Runtime {
         let buf = &self.buf;
         let fp4 = matches!(l.gate_up, DeviceMatrix::Fp4 { .. });
         let (act, down) = if fp4 { ("gate_up_act_f4", "down_proj_f4") } else { ("gate_up_act", "down_proj") };
-        let pre = l.ln_pre_mlp.as_ref().unwrap_or(&l.ln2);
-        self.linear_norm(act, &l.gate_up, None, &buf.x, pre, &buf.act, s.dims.intermediate)?;
-        match &l.ln_post_mlp {
-            Some(post) => {
-                self.clear_branch()?;
-                self.linear(down, &l.down, None, &buf.act, &self.pre.branch, s.dims.hidden)?;
-                self.add_normed_branch(post)
+        if s.norm.pre {
+            let pre = l.ln_pre_mlp.as_ref().unwrap_or(&l.ln2);
+            self.linear_norm(act, &l.gate_up, None, &buf.x, pre, &buf.act, s.dims.intermediate)?;
+        } else {
+            self.linear("gate_up_proj", &l.gate_up, None, &buf.x, &buf.gate_up, 2 * s.dims.intermediate)?;
+            let mut b = self.stream.launch_builder(self.kernel("swiglu"));
+            b.arg(&buf.gate_up).arg(&buf.act);
+            unsafe { b.launch(cfg(grid(s.dims.intermediate, 256), 256)) }?;
+        }
+        if s.uses_branch() {
+            self.clear_branch()?;
+            self.linear(down, &l.down, None, &buf.act, &self.pre.branch, s.dims.hidden)?;
+            return self.merge_branch(l.ln_post_mlp.as_ref());
+        }
+        self.linear(down, &l.down, None, &buf.act, &buf.x, s.dims.hidden)
+    }
+
+    fn merge_branch(&self, post: Option<&CudaSlice<f32>>) -> Result<()> {
+        match post {
+            Some(weight) => self.add_normed_branch(weight),
+            None => {
+                let mut b = self.stream.launch_builder(self.kernel("residual_add"));
+                b.arg(&self.buf.x).arg(&self.pre.branch).arg(&self.buf.x);
+                unsafe { b.launch(cfg(grid(self.spec.dims.hidden, 256), 256)) }?;
+                Ok(())
             }
-            None => self.linear(down, &l.down, None, &buf.act, &buf.x, s.dims.hidden),
         }
     }
 
@@ -1173,22 +1190,35 @@ impl Runtime {
 
     fn attention_out_decode(&self, l: &DeviceAttn, layer: &DeviceLayer) -> Result<()> {
         let hidden = self.spec.dims.hidden;
-        if layer.ln_pre_mlp.is_some() {
+        if self.spec.uses_branch() {
             self.clear_branch()?;
             self.linear("o_proj", &l.o, None, &self.buf.attn, &self.pre.branch, hidden)?;
-            return self.add_normed_branch(&layer.ln2);
+            return self.merge_branch(self.spec.norm.sandwich.then_some(&layer.ln2));
         }
         self.linear("o_proj", &l.o, None, &self.buf.attn, &self.buf.x, hidden)
     }
 
-    fn softcap_decode(&self) -> Result<()> {
-        if self.spec.dims.logit_softcap.is_none() {
+    fn qk_norm_decode(&self, l: &DeviceAttn) -> Result<()> {
+        if !self.spec.attention.qk_norm_full {
             return Ok(());
         }
+        for (name, w) in [("q_norm_rows", &l.q_norm), ("k_norm_rows", &l.k_norm)] {
+            let mut b = self.stream.launch_builder(self.kernel(name));
+            b.arg(&self.buf.qkv).arg(w.as_ref().expect("full-width qk norm has weights")).arg(&self.buf.qkv);
+            unsafe { b.launch(cfg(1, 1024)) }?;
+        }
+        Ok(())
+    }
+
+    fn softcap_decode(&self) -> Result<()> {
         let vocab = self.spec.dims.vocab;
-        let mut b = self.stream.launch_builder(self.kernel("logit_softcap"));
-        b.arg(&self.buf.logits).arg(&self.buf.logits);
-        unsafe { b.launch(cfg(grid(vocab, 256), 256)) }?;
+        for (present, name) in [(self.spec.dims.logit_scale.is_some(), "logit_scale"), (self.spec.dims.logit_softcap.is_some(), "logit_softcap")] {
+            if present {
+                let mut b = self.stream.launch_builder(self.kernel(name));
+                b.arg(&self.buf.logits).arg(&self.buf.logits);
+                unsafe { b.launch(cfg(grid(vocab, 256), 256)) }?;
+            }
+        }
         Ok(())
     }
 
@@ -1255,15 +1285,12 @@ impl Runtime {
             let window = l.window;
             let table = self.slot_table(self.seq as usize);
             let (pages, mm_stride) = (self.pages as i32, self.max_ctx as i32);
-            self.linear_norm(
-                "qkv_proj_norm",
-                &l.qkv,
-                l.qkv_bias.as_ref(),
-                &buf.x,
-                &layer.ln1,
-                &buf.qkv,
-                qkv_rows,
-            )?;
+            if s.norm.pre {
+                self.linear_norm("qkv_proj_norm", &l.qkv, l.qkv_bias.as_ref(), &buf.x, &layer.ln1, &buf.qkv, qkv_rows)?;
+            } else {
+                self.linear("qkv_proj", &l.qkv, l.qkv_bias.as_ref(), &buf.x, &buf.qkv, qkv_rows)?;
+            }
+            self.qk_norm_decode(l)?;
             let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
             b.arg(&buf.qkv)
                 .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))

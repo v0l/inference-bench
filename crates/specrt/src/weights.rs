@@ -801,18 +801,23 @@ impl Checkpoint {
         };
         let mut parts = Vec::new();
         let mut gates = Vec::new();
-        if a.output_gate {
-            let both = w("q_proj", 2 * q, h)?;
-            let hd = a.head_dim;
-            for head in 0..a.heads {
-                parts.push(both.slice_rows(2 * head * hd, (2 * head + 1) * hd));
-                gates.push(both.slice_rows((2 * head + 1) * hd, (2 * head + 2) * hd));
-            }
+        if a.fused_qkv {
+            ensure!(!a.output_gate, "fused qkv with an output gate is not supported");
+            parts.push(w("qkv_proj", q + 2 * kv, h)?);
         } else {
-            parts.push(w("q_proj", q, h)?);
+            if a.output_gate {
+                let both = w("q_proj", 2 * q, h)?;
+                let hd = a.head_dim;
+                for head in 0..a.heads {
+                    parts.push(both.slice_rows(2 * head * hd, (2 * head + 1) * hd));
+                    gates.push(both.slice_rows((2 * head + 1) * hd, (2 * head + 2) * hd));
+                }
+            } else {
+                parts.push(w("q_proj", q, h)?);
+            }
+            parts.push(w("k_proj", kv, h)?);
+            parts.push(w("v_proj", kv, h)?);
         }
-        parts.push(w("k_proj", kv, h)?);
-        parts.push(w("v_proj", kv, h)?);
         parts.extend(gates);
         let qkv_bias = if a.qkv_bias {
             ensure!(!a.output_gate, "qkv bias with an output gate is not supported");
@@ -823,10 +828,11 @@ impl Checkpoint {
         } else {
             None
         };
+        let (q_len, k_len) = if a.qk_norm_full { (q, kv) } else { (a.head_dim, a.head_dim) };
         let (q_norm, k_norm) = if a.qk_norm {
             (
-                Some(self.norm(spec, &format!("{attn}.q_norm.weight"), a.head_dim)?),
-                Some(self.norm(spec, &format!("{attn}.k_norm.weight"), a.head_dim)?),
+                Some(self.norm(spec, &format!("{attn}.q_norm.weight"), q_len)?),
+                Some(self.norm(spec, &format!("{attn}.k_norm.weight"), k_len)?),
             )
         } else {
             (None, None)
@@ -881,8 +887,12 @@ impl Checkpoint {
             let up = self.fp4(&format!("{p}.mlp.up_proj"), inter, h)?;
             (Matrix::Fp4(crate::nvfp4::Fp4::interleave(gate, up)?), Matrix::Fp4(self.fp4(&format!("{p}.mlp.down_proj"), h, inter)?))
         } else {
-            let gate = self.raw(&format!("{p}.mlp.gate_proj.weight"), inter, h)?;
-            let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?;
+            let (gate, up) = if spec.mlp.fused_gate_up {
+                let both = self.raw(&format!("{p}.mlp.gate_up_proj.weight"), 2 * inter, h)?;
+                (both.slice_rows(0, inter), both.slice_rows(inter, 2 * inter))
+            } else {
+                (self.raw(&format!("{p}.mlp.gate_proj.weight"), inter, h)?, self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?)
+            };
             let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
             (
                 Raw::interleave(gate, up)?.into_matrix(mlp, &format!("{p}.mlp.gate_up"))?,
@@ -890,9 +900,9 @@ impl Checkpoint {
             )
         };
         Ok(Layer {
-            ln1: self.norm(spec, &format!("{p}.input_layernorm.weight"), h)?,
+            ln1: if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] },
             ln2: self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
-            ln_pre_mlp: if spec.norm.sandwich { Some(self.norm(spec, &format!("{p}.pre_feedforward_layernorm.weight"), h)?) } else { None },
+            ln_pre_mlp: if spec.norm.sandwich && spec.norm.pre { Some(self.norm(spec, &format!("{p}.pre_feedforward_layernorm.weight"), h)?) } else { None },
             ln_post_mlp: if spec.norm.sandwich { Some(self.norm(spec, &format!("{p}.post_feedforward_layernorm.weight"), h)?) } else { None },
             mixer,
             gate_up,

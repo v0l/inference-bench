@@ -41,6 +41,8 @@ pub struct FamilyAttention {
     pub qkv_bias: Flag,
     pub qk_norm: Flag,
     pub output_gate: Flag,
+    pub qk_norm_full: bool,
+    pub fused_qkv: bool,
 }
 
 impl Default for FamilyAttention {
@@ -49,15 +51,39 @@ impl Default for FamilyAttention {
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
             qk_norm: Flag::Fixed(false),
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },
+            qk_norm_full: false,
+            fused_qkv: false,
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyNorm {
+    pub unit_offset: Option<bool>,
+    pub sandwich: bool,
+    pub pre: bool,
+}
+
+impl Default for FamilyNorm {
+    fn default() -> Self {
+        FamilyNorm { unit_offset: None, sandwich: false, pre: true }
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct FamilyNorm {
-    pub unit_offset: Option<bool>,
-    pub sandwich: bool,
+pub struct FamilyMultipliers {
+    pub embedding: Option<String>,
+    pub attention: Option<String>,
+    pub residual: Option<String>,
+    pub logits_divisor: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyMlp {
+    pub fused_gate_up: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -130,6 +156,7 @@ pub struct FamilyRope {
     pub types: std::collections::BTreeMap<String, crate::spec::RopeScalingKind>,
     pub keys: std::collections::BTreeMap<String, String>,
     pub local_theta_key: Option<String>,
+    pub nope_flags: Option<String>,
 }
 
 impl FamilyRope {
@@ -236,6 +263,10 @@ pub struct Family {
     pub blocks: FamilyBlocks,
     #[serde(default)]
     pub norm: FamilyNorm,
+    #[serde(default)]
+    pub multipliers: FamilyMultipliers,
+    #[serde(default)]
+    pub mlp: FamilyMlp,
     #[serde(default)]
     pub embedding: FamilyEmbedding,
     #[serde(default)]

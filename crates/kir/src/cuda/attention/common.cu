@@ -164,7 +164,7 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     }
     if (d < HEAD_DIM) vec[d] = v;
     __syncthreads();
-    if ((is_q || is_k) && d < ROT) {
+    if (!NOPE[layer] && (is_q || is_k) && d < ROT) {
         int fi = d < ROT_HALF ? d : d - ROT_HALF;
         float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi, layer);
         float c = cosf(angle) * ROPE_MSCALE;

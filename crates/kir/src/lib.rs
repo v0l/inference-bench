@@ -55,10 +55,11 @@ pub enum Pointwise {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Body {
     RmsNorm { width: u32, eps: f32, sum: BlockSum, offset: f32 },
+    RmsNormSegment { width: u32, stride: u32, start: u32, eps: f32, sum: BlockSum },
     AddRmsNorm { width: u32, eps: f32, sum: BlockSum, offset: f32 },
     NormAdd { width: u32, eps: f32, sum: BlockSum, offset: f32 },
     Pointwise { width: u32, op: Pointwise },
-    Add { width: u32 },
+    Add { width: u32, scale: f32 },
     GatedActivation { width: u32, act: Activation },
 }
 
@@ -112,6 +113,29 @@ impl Kernel {
         Ok(k)
     }
 
+    pub fn rmsnorm_segment(t: &Target, name: &'static str, width: u32, stride: u32, start: u32, eps: f32, threads: u32) -> Result<Kernel, String> {
+        let threads = pick_threads(t, threads);
+        let sum = BlockSum::for_target(t);
+        let smem_bytes = match sum {
+            BlockSum::WarpShuffle => 32 * 4,
+            BlockSum::Subgroup | BlockSum::SharedTree => threads * 4,
+        };
+        let k = Kernel {
+            name,
+            target: *t,
+            params: vec![
+                param("x", Role::Activation, Access::Read),
+                param("weight", Role::Weight, Access::Read),
+                param("out", Role::Activation, Access::Write),
+            ],
+            threads,
+            smem_bytes,
+            body: Body::RmsNormSegment { width, stride, start, eps, sum },
+        };
+        k.validate()?;
+        Ok(k)
+    }
+
     pub fn add_rmsnorm(t: &Target, width: u32, eps: f32, offset: f32, threads: u32) -> Result<Kernel, String> {
         let threads = pick_threads(t, threads);
         let sum = BlockSum::for_target(t);
@@ -148,8 +172,15 @@ impl Kernel {
             ],
             threads: pick_threads(t, threads),
             smem_bytes: 0,
-            body: Body::Add { width },
+            body: Body::Add { width, scale: 1.0 },
         };
+        k.validate()?;
+        Ok(k)
+    }
+
+    pub fn add_scaled(t: &Target, name: &'static str, width: u32, scale: f32, threads: u32) -> Result<Kernel, String> {
+        let mut k = Kernel::add(t, name, width, threads)?;
+        k.body = Body::Add { width, scale };
         k.validate()?;
         Ok(k)
     }
@@ -209,7 +240,7 @@ impl Kernel {
 
     pub fn needs(&self) -> Vec<Feature> {
         match &self.body {
-            Body::RmsNorm { sum, .. } | Body::AddRmsNorm { sum, .. } | Body::NormAdd { sum, .. } => sum.needs().to_vec(),
+            Body::RmsNorm { sum, .. } | Body::RmsNormSegment { sum, .. } | Body::AddRmsNorm { sum, .. } | Body::NormAdd { sum, .. } => sum.needs().to_vec(),
             Body::GatedActivation { .. } | Body::Pointwise { .. } | Body::Add { .. } => vec![],
         }
     }
@@ -259,8 +290,8 @@ impl Kernel {
                 }
                 &[(Role::Activation, Access::Read), (Role::Weight, Access::Read), (Role::Activation, Access::Read), (Role::Activation, Access::Write)]
             }
-            Body::Add { width } => {
-                if *width == 0 {
+            Body::Add { width, scale } => {
+                if *width == 0 || !scale.is_finite() {
                     return Err(format!("{}: width must be positive", self.name));
                 }
                 &[(Role::Activation, Access::Read), (Role::Activation, Access::Read), (Role::Activation, Access::Write)]
@@ -277,6 +308,15 @@ impl Kernel {
             Body::RmsNorm { width, eps, sum, .. } => {
                 if *width == 0 || !eps.is_finite() || *eps < 0.0 {
                     return Err(format!("{}: bad rmsnorm width or eps", self.name));
+                }
+                if sum.language() != t.language {
+                    return Err(format!("{}: block sum {sum:?} cannot run on {:?}", self.name, t.language));
+                }
+                &[(Role::Activation, Access::Read), (Role::Weight, Access::Read), (Role::Activation, Access::Write)]
+            }
+            Body::RmsNormSegment { width, stride, start, eps, sum } => {
+                if *width == 0 || start + width > *stride || !eps.is_finite() || *eps < 0.0 {
+                    return Err(format!("{}: bad segment norm width, stride, start or eps", self.name));
                 }
                 if sum.language() != t.language {
                     return Err(format!("{}: block sum {sum:?} cannot run on {:?}", self.name, t.language));
@@ -312,14 +352,20 @@ impl Kernel {
                     let _ = write!(s, " offset={offset:e}");
                 }
             }
+            Body::RmsNormSegment { width, stride, start, eps, sum } => {
+                let _ = write!(s, "\n  rmsnorm_segment width={width} stride={stride} start={start} eps={eps:e} sum={sum:?}");
+            }
             Body::AddRmsNorm { width, eps, sum, offset } => {
                 let _ = write!(s, "\n  add_rmsnorm width={width} eps={eps:e} sum={sum:?} offset={offset:e}");
             }
             Body::NormAdd { width, eps, sum, offset } => {
                 let _ = write!(s, "\n  norm_add width={width} eps={eps:e} sum={sum:?} offset={offset:e}");
             }
-            Body::Add { width } => {
+            Body::Add { width, scale } => {
                 let _ = write!(s, "\n  add width={width}");
+                if *scale != 1.0 {
+                    let _ = write!(s, " scale={scale:e}");
+                }
             }
             Body::Pointwise { width, op } => {
                 let _ = write!(s, "\n  pointwise width={width} op={op:?}");
