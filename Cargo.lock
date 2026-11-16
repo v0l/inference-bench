@@ -3617,6 +3617,7 @@ dependencies = [
  "inference-bench-kir",
  "inference-bench-server",
  "inference-bench-specrt",
+ "libc",
  "serde",
  "serde_json",
  "toml 0.9.12+spec-1.1.0",

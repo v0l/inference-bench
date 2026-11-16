@@ -184,3 +184,21 @@ From `/metrics` (`inference_pipeline_stage_busy_seconds_total`, `..._calls_total
 - Link pull: the Spark is reached over the LAN (10.100.2.32), not the cable, so it was safe. During a streaming request `ip link set ... down` then `up` on both Spark cable ports (`enp1s0f1np1`, `enP2p1s0f1np1`) for 2 s: the stream finished (402 chunks, `finish_reason: length`, no error) because TCP retransmission covered the gap. One port came back DOWN because my command line was wrong; I brought it up again and verified both ports and the route.
 
 Stages and servers on both hosts were stopped at the end.
+
+## Headless host service (#664)
+
+`inference-bench host --config host.toml` runs `specrt::host::Host` with no UI: it announces every shared GPU over mDNS, accepts pairing and stage requests, and releases stages and withdraws the announcement on SIGTERM. Config keys (all optional, see `packaging/systemd/inference-bench-host.example.toml`): `bind`, `mdns_port`, `interface`, `key_file` (default `cluster.key` in the data dir), `control_socket` (default `host.sock` beside the key), `gpus` (default all), `max_memory_gb` (caps the memory the host announces per GPU, so the planner gives it smaller stages).
+
+Pairing without a screen: `inference-bench host pair --config host.toml` asks the running host over its local unix socket (mode 0600) for a fresh 8 character code and prints it with the seconds left (5 minutes, 3 attempts). Enter it in the desktop app's Hardware tab. The cluster key is never logged.
+
+Install on the Spark (system unit like `ggml-rpc.service`):
+
+```
+rsync -az --delete --exclude target --exclude .git ./ spark:git/inference-bench/
+ssh spark 'cd ~/git/inference-bench && systemd-run --user --wait --collect -P -q -p MemoryMax=8G -p WorkingDirectory=$PWD --setenv=CARGO_BUILD_JOBS=2 --setenv=PATH=$PATH cargo build --release -p inference-bench-cli'
+ssh spark 'mkdir -p ~/.config/inference-bench'
+scp packaging/systemd/inference-bench-host.example.toml spark:.config/inference-bench/host.toml
+ssh -t spark 'sudo cp ~/git/inference-bench/packaging/systemd/inference-bench-host.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now inference-bench-host'
+```
+
+The unit binds the 100 GbE cable address (10.100.50.2:7710) and announces on `enp1s0f1np1`, with `MemoryHigh=16G` and `MemoryMax=20G` so a stage load cannot take Frigate or Home Assistant down. Check with `systemctl status inference-bench-host`; pair with `ssh spark inference-bench host pair --config ~/.config/inference-bench/host.toml`.

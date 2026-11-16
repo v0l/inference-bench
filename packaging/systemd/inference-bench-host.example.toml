@@ -1,0 +1,5 @@
+bind = "10.100.50.2:7710"
+mdns_port = 5353
+interface = "enp1s0f1np1"
+gpus = [0]
+max_memory_gb = 16

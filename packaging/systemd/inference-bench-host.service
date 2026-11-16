@@ -1,0 +1,22 @@
+[Unit]
+Description=Inference Bench host (shares this machine's GPU with paired inference-bench apps)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kieran
+WorkingDirectory=/home/kieran/git/inference-bench
+ExecStartPre=+/sbin/ip link set enp1s0f1np1 mtu 9000
+ExecStart=/home/kieran/git/inference-bench/target/release/inference-bench host --config /home/kieran/.config/inference-bench/host.toml
+Restart=always
+RestartSec=5
+OOMScoreAdjust=-300
+MemoryHigh=16G
+MemoryMax=20G
+MemorySwapMax=0
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

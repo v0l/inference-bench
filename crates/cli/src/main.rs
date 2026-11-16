@@ -7,6 +7,7 @@ use inference_bench_core::matrix::{MatrixSpec, run_matrix, run_model};
 use inference_bench_core::result::RunResult;
 use inference_bench_core::specs;
 use inference_bench_core::store;
+mod hostcmd;
 mod launch;
 
 use std::io::Write;
@@ -268,6 +269,8 @@ enum Cmd {
         #[arg(long, help = "sm_120, sm_80, wgpu or wgpu-nosubgroups; the live CUDA device when omitted")]
         target: Option<String>,
     },
+    #[command(about = "Share this machine's GPUs with other inference-bench apps, headless; `host pair` prints a pairing code")]
+    Host(hostcmd::HostArgs),
     #[command(about = "Spec files: where each comes from, and updates from GitHub")]
     Specs {
         #[command(subcommand)]
@@ -580,6 +583,7 @@ fn main() -> Result<()> {
                 false => println!("{}", report.describe()),
             }
         }
+        Cmd::Host(args) => hostcmd::run(args, &data)?,
         Cmd::Specs { cmd } => specs_command(&data, cmd)?,
         Cmd::Kernels { spec, target } => kernels_command(&data, spec, target.as_deref())?,
         Cmd::Plan { spec, config, context, slots, objective, probe } => plan_command(&data, spec, config, *context, *slots, objective.as_deref(), *probe)?,
