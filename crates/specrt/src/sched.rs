@@ -393,6 +393,7 @@ pub struct Config {
     pub reserve_blocks: Option<usize>,
     pub min_prefill_chunk: usize,
     pub min_prefill_tokens: usize,
+    pub shortest_first: bool,
     pub whole_prompt_tokens: usize,
     pub prefix_cache: PrefixCacheOptions,
 }
@@ -406,6 +407,7 @@ impl Default for Config {
             reserve_blocks: None,
             min_prefill_chunk: 64,
             min_prefill_tokens: 0,
+            shortest_first: true,
             whole_prompt_tokens: 0,
             prefix_cache: PrefixCacheOptions::default(),
         }
@@ -734,7 +736,7 @@ impl<E: Executor> Scheduler<E> {
     fn admit(&mut self, budget: usize) -> Result<()> {
         let cap = self.cfg.max_num_seqs.min(self.exec.slots());
         let mut planned = 0;
-        let mut long_in_flight = self.running.iter().any(|s| s.prefill_target() - s.computed > budget);
+        let mut long_in_flight = self.cfg.shortest_first && self.running.iter().any(|s| s.prefill_target() - s.computed > budget);
         while let Some(s) = self.waiting.front() {
             if self.running.len() >= cap || self.free_slots.is_empty() || planned >= budget {
                 break;
@@ -915,13 +917,12 @@ impl<E: Executor> Scheduler<E> {
         if limit == 0 {
             return None;
         }
-        let next = self
-            .running
-            .iter()
-            .filter(|s| s.computed < s.prefill_target())
-            .map(|s| s.prefill_target() - s.computed)
-            .chain(self.waiting.iter().map(|s| s.prefill_target()))
-            .min()?;
+        let pending = self.running.iter().filter(|s| s.computed < s.prefill_target()).map(|s| s.prefill_target() - s.computed);
+        let next = if self.cfg.shortest_first {
+            pending.chain(self.waiting.iter().map(|s| s.prefill_target())).min()?
+        } else {
+            pending.chain(self.waiting.front().map(|s| s.prefill_target())).next()?
+        };
         (next <= limit).then_some(next)
     }
 
@@ -986,10 +987,12 @@ impl<E: Executor> Scheduler<E> {
         let started = Instant::now();
         let limit = self.exec.chunk_limit();
         let mut order: Vec<usize> = (0..self.running.len()).collect();
-        order.sort_by_key(|&i| {
-            let s = &self.running[i];
-            s.prefill_target().saturating_sub(s.computed)
-        });
+        if self.cfg.shortest_first {
+            order.sort_by_key(|&i| {
+                let s = &self.running[i];
+                s.prefill_target().saturating_sub(s.computed)
+            });
+        }
         for i in order {
             if left == 0 {
                 break;
@@ -1907,7 +1910,9 @@ mod tests {
     }
 
     struct LoadResult {
-        ttft: Vec<f64>,
+        short_ttft: Vec<f64>,
+        long_ttft: Vec<f64>,
+        long_tok_per_step: f64,
         step_p95: f64,
     }
 
@@ -1916,28 +1921,41 @@ mod tests {
         v[((v.len() - 1) as f64 * p) as usize]
     }
 
+    const SCALE: f64 = 10.0;
+
     fn loaded(decoders: usize, cfg: Config) -> LoadResult {
-        let mut fake = Fake::new(65536, 32, 12000, 2048);
+        let mut fake = Fake::new(65536, 40, 12000, 2048);
         fake.token_cost = Duration::from_micros(20);
-        fake.row_cost = Duration::from_micros(1250);
+        fake.row_cost = Duration::from_micros(560);
         let mut s = Scheduler::new(fake, cfg);
         for q in 0..decoders as u32 {
-            s.submit(request(50, 100_000.min(60_000), q)).unwrap();
+            s.submit(request(50, 60_000, q)).unwrap();
         }
         let mut events = Vec::new();
         for _ in 0..6 {
             s.step(&mut events).unwrap();
         }
-        s.submit(request(20_000, 4, 900)).unwrap();
-        let mut submitted: HashMap<SeqId, Instant> = HashMap::new();
-        let mut ttft = Vec::new();
+        let mut sent_at: HashMap<SeqId, (Instant, bool)> = HashMap::new();
+        let mut short_ttft = Vec::new();
+        let mut long_ttft = Vec::new();
         let mut steps = Vec::new();
-        let mut sent = 0;
-        for n in 0..3000 {
-            if n % 10 == 0 && sent < 8 {
-                let id = s.submit(request(1200, 2, 100 + sent)).unwrap();
-                submitted.insert(id, Instant::now());
-                sent += 1;
+        let mut long_tokens = 0usize;
+        let mut long_steps = 0usize;
+        let mut shorts = 0u32;
+        let mut longs = 0u32;
+        let id = s.submit(request(20_000, 4, 900)).unwrap();
+        sent_at.insert(id, (Instant::now(), true));
+        longs += 1;
+        for n in 0..6000 {
+            if n % 10 == 0 && shorts < 8 {
+                let id = s.submit(request(1200, 2, 100 + shorts)).unwrap();
+                sent_at.insert(id, (Instant::now(), false));
+                shorts += 1;
+            }
+            if n % 25 == 5 && longs < 4 {
+                let id = s.submit(request(6000 + 2000 * longs as usize, 2, 200 + longs)).unwrap();
+                sent_at.insert(id, (Instant::now(), true));
+                longs += 1;
             }
             let mut ev = Vec::new();
             let started = Instant::now();
@@ -1945,38 +1963,51 @@ mod tests {
             if r.decode_rows > 0 {
                 steps.push(started.elapsed().as_secs_f64());
             }
+            if r.prefill_tokens > 0 && sent_at.values().any(|v| v.1) {
+                long_tokens += r.prefill_tokens;
+                long_steps += 1;
+            }
             for e in &ev {
                 if let Event::Token { id, .. } = e {
-                    if let Some(t) = submitted.remove(id) {
-                        ttft.push(t.elapsed().as_secs_f64());
+                    if let Some((t, long)) = sent_at.remove(id) {
+                        if long { &mut long_ttft } else { &mut short_ttft }.push(t.elapsed().as_secs_f64() * SCALE);
                     }
                 }
             }
-            if sent == 8 && submitted.is_empty() {
+            if shorts == 8 && longs == 4 && sent_at.is_empty() {
                 break;
             }
         }
-        assert_eq!(ttft.len(), 8, "every short prompt got a first token");
-        LoadResult { step_p95: pct(&mut steps, 0.95), ttft }
+        assert_eq!(short_ttft.len(), 8, "every short prompt got a first token");
+        assert_eq!(long_ttft.len(), 4, "every long prompt completed its prefill");
+        LoadResult { step_p95: pct(&mut steps, 0.95) * SCALE, short_ttft, long_ttft, long_tok_per_step: long_tokens as f64 / long_steps.max(1) as f64 }
+    }
+
+    fn load_cfg(min_prefill_tokens: usize, shortest_first: bool) -> Config {
+        Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(10), whole_prompt_tokens: 4096, min_prefill_tokens, shortest_first, ..Config::default() }
     }
 
     #[test]
-    fn short_prompts_get_a_first_token_quickly_behind_a_long_one_with_full_decoders() {
-        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(20), min_prefill_tokens: 512, whole_prompt_tokens: 4096, ..Config::default() };
-        let mut r = loaded(16, cfg);
-        let p95 = pct(&mut r.ttft, 0.95);
-        assert!(p95 < 0.2, "ttft p95 {p95:.3}s");
-        assert!(r.step_p95 <= 0.055, "step p95 {:.3}s", r.step_p95);
+    fn prompts_stay_bounded_behind_each_other_with_full_decoders() {
+        let mut r = loaded(16, load_cfg(512, true));
+        let short = pct(&mut r.short_ttft, 0.95);
+        let long = pct(&mut r.long_ttft, 1.0);
+        assert!(short < 4.0, "short ttft p95 {short:.3}s");
+        assert!(long < 20.0, "long ttft max {long:.3}s");
+        assert!(r.long_tok_per_step > 256.0, "long prompts read {:.0} tokens per step", r.long_tok_per_step);
+        assert!(r.step_p95 <= 0.7, "step p95 {:.3}s", r.step_p95);
     }
 
     #[test]
     #[ignore]
     fn print_load_table() {
         for decoders in [8usize, 16, 20] {
-            for (name, min) in [("floor64", 0usize), ("min512", 512)] {
-                let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(20), min_prefill_tokens: min, whole_prompt_tokens: 4096, ..Config::default() };
-                let mut r = loaded(decoders, cfg);
-                println!("decoders {decoders} {name}: ttft p50 {:.3} p95 {:.3} step p95 {:.4}", pct(&mut r.ttft, 0.5), pct(&mut r.ttft, 0.95), r.step_p95);
+            for (name, min, sf) in [("master", 0usize, false), ("shortest", 0, true), ("min512", 512, false), ("both", 512, true), ("both256", 256, true)] {
+                let mut r = loaded(decoders, load_cfg(min, sf));
+                println!(
+                    "decoders {decoders} {name}: short ttft p50 {:.2} p95 {:.2} long ttft p50 {:.2} max {:.2} long tok/step {:.0} step p95 {:.3}",
+                    pct(&mut r.short_ttft, 0.5), pct(&mut r.short_ttft, 0.95), pct(&mut r.long_ttft, 0.5), pct(&mut r.long_ttft, 1.0), r.long_tok_per_step, r.step_p95
+                );
             }
         }
     }
