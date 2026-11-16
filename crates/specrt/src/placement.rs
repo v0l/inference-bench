@@ -469,6 +469,13 @@ impl Placement {
         self.slots as f64 / self.bottleneck_secs
     }
 
+    pub fn ensure_runnable(&self) -> Result<()> {
+        if let Some((i, s)) = self.stages.iter().enumerate().find(|(_, s)| s.tp > 1) {
+            bail!("stage {i} ({}) is a tensor parallel group with tp {}, which the engine cannot run yet; leave `host` unset on those devices", s.label(), s.tp);
+        }
+        Ok(())
+    }
+
     pub fn ranges(&self) -> Vec<(usize, usize, usize)> {
         self.stages.iter().map(|s| (s.ordinal, s.start, s.end)).collect()
     }
@@ -1115,6 +1122,17 @@ mod tests {
         let mut delta = qwen27();
         delta.linear_attention.as_mut().unwrap().value_heads = 3;
         assert!(CostModel::new(&delta, 4096, 1).allows_tp(2).unwrap_err().contains("delta-net"));
+    }
+
+    #[test]
+    fn a_plan_with_a_tensor_parallel_stage_is_refused_by_name() {
+        let m = CostModel::new(&qwen27(), 8192, 4);
+        let devices = [gpu("g0", "box", 96.0), gpu("g1", "box", 96.0)];
+        let p = plan(&m, &devices, Objective::Latency).unwrap();
+        let err = p.ensure_runnable().unwrap_err().to_string();
+        assert!(err.contains("stage 0") && err.contains("tp 2") && err.contains("box / GPU 0+1"), "{err}");
+        let single = evaluate(&m, &devices, &[(0, 0, 64)], Objective::Latency).unwrap();
+        assert!(single.ensure_runnable().is_ok());
     }
 
     #[test]
