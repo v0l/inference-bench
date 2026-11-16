@@ -77,3 +77,14 @@ and this engine apply.
 The head itself is the same on every row: our kernel logits equal the head applied to our own hidden state to
 5e-5. `scripts/tiny_gemma3_vision.py` now applies the cap to the reference, and the test checks every row with a
 bound of 1e-4. The real 4B and 27B configs set no final soft-cap, so they never saw this.
+
+## Causal prefill speed
+
+The bidirectional image-block option (`BIDI`) is compiled out for models without it. `flash_speed` at 2048 tokens,
+27B shapes, three rounds alternating master and this branch, min kernel time:
+
+| Context before the chunk | master | branch |
+|---|---|---|
+| 0 | 0.476 to 0.477 ms | 0.475 to 0.477 ms |
+| 16,384 | 4.766 to 4.778 ms | 4.766 to 4.778 ms |
+| 30,720 | 8.733 to 8.747 ms | 8.733 to 8.745 ms |
