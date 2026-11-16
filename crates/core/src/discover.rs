@@ -245,6 +245,7 @@ fn pooled_context(spec: &Spec, anatomy: &ModelAnatomy, weights: u64, gpus: &[u64
             offload: None,
             host: None,
             peer: None,
+            wgpu: false,
         })
         .collect();
     let per_token = kv.bytes_per_token(spec);
