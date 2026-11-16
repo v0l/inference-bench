@@ -721,10 +721,12 @@ __device__ __forceinline__ void split_store2(bf16_t* hi, bf16_t* lo, size_t at, 
 
 template <int CPR>
 __device__ __forceinline__ int swz(int r, int c) {
-    static_assert(CPR >= 4, "rows of at least 64 bytes");
+    static_assert(CPR == 4 || CPR % 8 == 0 || CPR % 8 == 4, "head_dim of 32, or a multiple of 32 or 32 + 64k");
     constexpr int GROUP_ROWS = CPR >= 8 ? 1 : 8 / CPR;
     constexpr int MASK = CPR >= 8 ? 7 : CPR - 1;
-    return r * CPR + (c ^ ((r / GROUP_ROWS) & MASK));
+    int m = (r / GROUP_ROWS) & MASK;
+    if (CPR % 8 == 4 && CPR > 8 && c >= CPR - 4) m &= 3;
+    return r * CPR + (c ^ m);
 }
 
 constexpr int ACC_PLAIN = 0;

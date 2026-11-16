@@ -33,6 +33,7 @@ def families():
     return {
         "tiny-mistral": (MistralConfig, dict(COMMON, head_dim=64, sliding_window=None, tie_word_embeddings=False, rope_parameters={"rope_type": "default", "rope_theta": 1000000.0})),
         "tiny-phi3": (Phi3Config, dict(COMMON, num_key_value_heads=4, tie_word_embeddings=False, rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5})),
+        "tiny-phi3-hd96": (Phi3Config, dict(COMMON, hidden_size=192, intermediate_size=384, num_attention_heads=2, num_key_value_heads=2, tie_word_embeddings=False, rope_parameters={"rope_type": "default", "rope_theta": 10000.0})),
         "tiny-smollm3": (SmolLM3Config, dict(COMMON, no_rope_layers=[1, 0, 1, 0], use_sliding_window=False, tie_word_embeddings=True, rope_parameters={"rope_type": "default", "rope_theta": 2000000.0})),
         "tiny-olmo2": (Olmo2Config, dict(COMMON, num_key_value_heads=4, tie_word_embeddings=False, rope_parameters={"rope_type": "default", "rope_theta": 500000.0})),
         "tiny-granite": (

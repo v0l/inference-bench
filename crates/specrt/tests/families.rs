@@ -166,6 +166,12 @@ fn tiny_phi3_matches_transformers() {
 
 #[test]
 #[ignore = "needs a CUDA GPU and scripts/tiny_families.py output in SPECRT_REF_DIR"]
+fn tiny_phi3_with_head_dim_96_matches_transformers() {
+    check("tiny-phi3-hd96", 2e-3);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_families.py output in SPECRT_REF_DIR"]
 fn tiny_smollm3_matches_transformers() {
     check("tiny-smollm3", 2e-3);
 }
@@ -180,4 +186,65 @@ fn tiny_olmo2_matches_transformers() {
 #[ignore = "needs a CUDA GPU and scripts/tiny_families.py output in SPECRT_REF_DIR"]
 fn tiny_granite_matches_transformers() {
     check("tiny-granite", 2e-3);
+}
+
+fn log_softmax(row: &[f32]) -> Vec<f64> {
+    let max = row.iter().cloned().fold(f32::MIN, f32::max) as f64;
+    let sum: f64 = row.iter().map(|&v| (v as f64 - max).exp()).sum();
+    row.iter().map(|&v| v as f64 - max - sum.ln()).collect()
+}
+
+fn real(name: &str, repo: &str) {
+    let dir = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface"));
+    let snapshots = dir.join("hub").join(format!("models--{}", repo.replace('/', "--"))).join("snapshots");
+    let snapshot = std::fs::read_dir(&snapshots).unwrap().flatten().map(|e| e.path()).find(|p| p.join("config.json").exists()).unwrap();
+    let json = std::fs::read_to_string(snapshot.join("config.json")).unwrap();
+    let mut spec = Spec::from_hf_config(&json).unwrap();
+    spec.name = name.into();
+    spec.repo = snapshot.display().to_string();
+    let want = reference(name);
+    let rows = want.logits.len() / want.vocab;
+    let mut rt = Runtime::load(&spec, 512).unwrap();
+    let ours = rt.prompt_logits(&want.tokens).unwrap();
+    let first = want.tokens.len() - rows;
+    let mut worst_kl = 0f64;
+    for r in 0..rows {
+        let a = &ours[(first + r) * want.vocab..(first + r + 1) * want.vocab];
+        let b = &want.logits[r * want.vocab..(r + 1) * want.vocab];
+        let (la, lb) = (log_softmax(a), log_softmax(b));
+        let kl: f64 = lb.iter().zip(&la).map(|(q, p)| q.exp() * (q - p)).sum();
+        eprintln!("{name} row {r} kl {kl}");
+        worst_kl = worst_kl.max(kl);
+        let top = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0;
+        assert_eq!(top(a), top(b), "{name} row {r} top-1");
+    }
+    assert!(worst_kl < 0.02, "{name} kl {worst_kl}");
+    let got = rt.generate(&want.tokens, want.greedy.len(), Sampling::GREEDY).unwrap();
+    let same = got.tokens.iter().zip(&want.greedy).take_while(|(a, b)| a == b).count();
+    eprintln!("{name} greedy prefix {same}/{}", want.greedy.len());
+    assert!(same * 4 >= want.greedy.len() * 3, "{name} greedy diverged after {same}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the cached HF checkpoint and scripts/families_real.py f32 output in SPECRT_REF_DIR (a bf16 reference flips a near-tie at token 2)"]
+fn real_olmo2_1b_matches_transformers_f32() {
+    real("olmo2-1b", "allenai/OLMo-2-0425-1B");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the cached HF checkpoint and scripts/families_real.py output in SPECRT_REF_DIR"]
+fn real_smollm3_3b_matches_transformers() {
+    real("smollm3-3b", "HuggingFaceTB/SmolLM3-3B");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the cached HF checkpoint and scripts/families_real.py output in SPECRT_REF_DIR"]
+fn real_granite_3_3_2b_matches_transformers() {
+    real("granite-3.3-2b", "ibm-granite/granite-3.3-2b-base");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the cached HF checkpoint and scripts/families_real.py output in SPECRT_REF_DIR"]
+fn real_phi3_mini_matches_transformers() {
+    real("phi3-mini", "microsoft/Phi-3-mini-4k-instruct");
 }
