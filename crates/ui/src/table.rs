@@ -138,7 +138,7 @@ mod tests {
         v.unread = specrt::spec::unread_hf_keys(&json);
         let e = entries(&v);
         let raw = |k: &str| e.iter().find(|x| x.group == "config keys the spec does not read" && x.field == k).map(|x| x.value.clone());
-        assert_eq!(raw("final_logit_softcapping").as_deref(), Some("30.0"));
+        assert!(raw("final_logit_softcapping").is_none());
         assert_eq!(raw("global_head_dim").as_deref(), Some("512"));
         assert!(raw("hidden_size").is_none() && raw("layer_types").is_none() && raw("sliding_window").is_none());
     }

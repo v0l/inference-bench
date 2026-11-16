@@ -1,1 +1,1 @@
-refused: layer type sliding_attention is not supported
+refused: sliding layers need a sliding_window

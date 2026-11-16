@@ -6,7 +6,8 @@
     "hidden": 5376,
     "intermediate": 21504,
     "vocab": 262144,
-    "tie_embeddings": true
+    "tie_embeddings": true,
+    "logit_softcap": 30.0
   },
   "layers": {
     "count": 60,
@@ -35,7 +36,8 @@
   },
   "rope": {
     "style": "neox",
-    "theta": 1000000.0
+    "theta": 1000000.0,
+    "local_theta": 10000.0
   },
   "mlp": {
     "activation": "geglu"

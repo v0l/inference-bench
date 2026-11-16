@@ -174,13 +174,20 @@ fn mistral_f16_spec_matches_hf_config() {
 }
 
 #[test]
-fn gemma_and_phi3_stay_unsupported_with_the_model_type_in_the_error() {
-    for model_type in ["gemma2", "gemma3_text", "phi3"] {
+fn gemma2_phi3_and_unknown_types_stay_unsupported_with_the_model_type_in_the_error() {
+    for model_type in ["gemma2", "phi3", "not_a_model"] {
         let json =
             fixture_with("\"model_type\": \"qwen3\"", &format!("\"model_type\": \"{model_type}\""));
         let e = Spec::from_hf_config(&json).unwrap_err().to_string();
         assert_eq!(e, format!("model_type {model_type} is not supported"));
     }
+}
+
+#[test]
+fn gemma3_is_supported() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/tiny-gemma3/config.json")).unwrap();
+    let spec = Spec::from_hf_config(&json).unwrap();
+    assert!(spec.norm.sandwich);
 }
 
 #[test]
