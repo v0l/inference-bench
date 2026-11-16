@@ -225,6 +225,12 @@ pub fn interfaces() -> Vec<NetInterface> {
         .unwrap_or_default()
 }
 
+#[cfg(not(unix))]
+fn os_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok().filter(|n| !n.is_empty())
+}
+
+#[cfg(unix)]
 fn os_hostname() -> Option<String> {
     let mut buf = [0u8; 256];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };

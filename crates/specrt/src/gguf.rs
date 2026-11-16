@@ -319,7 +319,10 @@ impl Gguf {
 
     pub fn release(&self) {
         if let Backing::Map(m) = &self.backing {
+            #[cfg(unix)]
             let _ = unsafe { m.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+            #[cfg(not(unix))]
+            let _ = m;
         }
     }
 

@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::alloc::Layout;
 use std::collections::HashMap;
 use std::fs::File;
+#[cfg(unix)]
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -245,10 +248,30 @@ fn direct_flag() -> i32 {
     0
 }
 
+#[cfg(unix)]
+fn pread(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    f.read_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pread(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    f.seek_read(buf, offset)
+}
+
+#[cfg(unix)]
+fn open_direct(path: &Path) -> Option<File> {
+    std::fs::OpenOptions::new().read(true).custom_flags(direct_flag()).open(path).ok()
+}
+
+#[cfg(not(unix))]
+fn open_direct(_path: &Path) -> Option<File> {
+    None
+}
+
 impl Source {
     pub fn open(path: &Path, want_direct: bool) -> Result<Source> {
         let plain = File::open(path).with_context(|| path.display().to_string())?;
-        let direct = if want_direct && cfg!(any(target_os = "linux", target_os = "android")) { std::fs::OpenOptions::new().read(true).custom_flags(direct_flag()).open(path).ok() } else { None };
+        let direct = if want_direct && cfg!(any(target_os = "linux", target_os = "android")) { open_direct(path) } else { None };
         Ok(Source { direct_ok: AtomicBool::new(direct.is_some()), plain, direct })
     }
 
@@ -259,13 +282,13 @@ impl Source {
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
         if self.is_direct() {
             if let Some(f) = &self.direct {
-                match f.read_at(buf, offset) {
-                    Err(e) if e.raw_os_error() == Some(libc::EINVAL) => self.direct_ok.store(false, Ordering::Relaxed),
+                match pread(f, buf, offset) {
+                    Err(e) if e.raw_os_error() == Some(22) => self.direct_ok.store(false, Ordering::Relaxed),
                     other => return other,
                 }
             }
         }
-        self.plain.read_at(buf, offset)
+        pread(&self.plain, buf, offset)
     }
 
     fn fill(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {

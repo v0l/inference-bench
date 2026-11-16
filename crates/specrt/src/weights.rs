@@ -2,7 +2,9 @@ use crate::codegen::{FP8_BLOCK, Q8_GROUP};
 use crate::gguf::{DeviceRows, GgmlType, Gguf};
 use crate::spec::{Quant, Spec};
 use anyhow::{Context, Result, bail, ensure};
-use memmap2::{Mmap, UncheckedAdvice};
+use memmap2::Mmap;
+#[cfg(unix)]
+use memmap2::UncheckedAdvice;
 use safetensors::tensor::Metadata;
 use safetensors::{Dtype, SafeTensors};
 use std::borrow::Cow;
@@ -231,12 +233,19 @@ impl Checkpoint {
             let (from, to) = info.data_offsets;
             let start = (sh.data_start + from).div_ceil(page) * page;
             let end = (sh.data_start + to) / page * page;
+            #[cfg(unix)]
             if end > start {
                 let _ = unsafe { sh.map.unchecked_advise_range(UncheckedAdvice::DontNeed, start, end - start) };
             }
         }
     }
 
+    #[cfg(not(unix))]
+    pub fn resident_fraction(&self) -> f64 {
+        0.0
+    }
+
+    #[cfg(unix)]
     pub fn resident_fraction(&self) -> f64 {
         let page = 4096usize;
         let (mut resident, mut total) = (0usize, 0usize);
@@ -269,7 +278,10 @@ impl Checkpoint {
             g.release();
         }
         for s in self.shards.iter() {
+            #[cfg(unix)]
             let _ = unsafe { s.map.unchecked_advise(UncheckedAdvice::DontNeed) };
+            #[cfg(not(unix))]
+            let _ = &s.map;
         }
     }
 
