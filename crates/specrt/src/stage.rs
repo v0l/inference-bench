@@ -112,13 +112,14 @@ pub struct RuntimeStage {
     spec: Spec,
     max_ctx: usize,
     slots: usize,
+    device: usize,
     inner: Mutex<Option<Loaded>>,
 }
 
-fn load_range(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize) -> Result<Loaded> {
+fn load_range(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize, device: usize) -> Result<Loaded> {
     let pages = max_ctx.div_ceil(crate::codegen::PAGE);
     let layout = Layout { kv_planes: 1, ..Layout::contiguous(max_ctx, slots) };
-    let range = StageRange { device: 0, start: layers[0], end: layers[1] };
+    let range = StageRange { device, start: layers[0], end: layers[1] };
     let mut rt = Runtime::load_stage(spec, layout, range)?;
     for slot in 0..slots {
         let blocks: Vec<u32> = (0..pages as u32).map(|p| (slot * pages) as u32 + p).collect();
@@ -130,12 +131,16 @@ fn load_range(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize) -> 
 
 impl RuntimeStage {
     pub fn load(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize) -> Result<RuntimeStage> {
-        let loaded = load_range(spec, layers, max_ctx, slots)?;
-        Ok(RuntimeStage { spec: spec.clone(), max_ctx, slots, inner: Mutex::new(Some(loaded)) })
+        let loaded = load_range(spec, layers, max_ctx, slots, 0)?;
+        Ok(RuntimeStage { spec: spec.clone(), max_ctx, slots, device: 0, inner: Mutex::new(Some(loaded)) })
     }
 
     pub fn unloaded(spec: &Spec, max_ctx: usize, slots: usize) -> RuntimeStage {
-        RuntimeStage { spec: spec.clone(), max_ctx, slots, inner: Mutex::new(None) }
+        Self::unloaded_on(spec, max_ctx, slots, 0)
+    }
+
+    pub fn unloaded_on(spec: &Spec, max_ctx: usize, slots: usize, device: usize) -> RuntimeStage {
+        RuntimeStage { spec: spec.clone(), max_ctx, slots, device, inner: Mutex::new(None) }
     }
 
     pub fn assign(&self, layers: [usize; 2]) -> Result<()> {
@@ -144,7 +149,7 @@ impl RuntimeStage {
             return Ok(());
         }
         *guard = None;
-        *guard = Some(load_range(&self.spec, layers, self.max_ctx, self.slots)?);
+        *guard = Some(load_range(&self.spec, layers, self.max_ctx, self.slots, self.device)?);
         Ok(())
     }
 

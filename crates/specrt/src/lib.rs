@@ -23,6 +23,7 @@ pub mod media_encode;
 pub mod mtp;
 pub mod nvfp4;
 pub mod options;
+pub mod pairing;
 pub mod pipeline;
 pub mod plan;
 pub mod placement;
