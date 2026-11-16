@@ -648,7 +648,7 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
-    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "query_pre_attn_scalar", "text_config", "quantization_config",
+    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config",
 ];
 
 pub fn unread_hf_keys(json: &str) -> Vec<(String, String)> {
@@ -686,8 +686,7 @@ struct HfConfig {
     rms_norm_eps: f64,
     rope_theta: Option<f64>,
     hidden_act: Option<String>,
-    #[serde(default)]
-    tie_word_embeddings: bool,
+    tie_word_embeddings: Option<bool>,
     attention_bias: Option<bool>,
     rope_scaling: Option<serde_json::Value>,
     rope_parameters: Option<serde_json::Value>,
@@ -1049,7 +1048,7 @@ impl Spec {
                 .find(|(k, v)| family.blocks.layer_types.get(*k) == Some(&block) && v.get("rope_theta").is_some())
                 .and_then(|(_, v)| v.get("rope_theta")?.as_f64())
         };
-        let local_theta = by_block(Block::Sliding);
+        let local_theta = by_block(Block::Sliding).or_else(|| family.rope.local_theta_key.as_deref().and_then(|k| value.get(k)?.as_f64()));
         let theta = hf.rope_theta.or(param("rope_theta")).or(by_block(Block::Full)).context("no rope_theta")?;
         let mapped = hf.hidden_act.as_deref().and_then(|a| family.activation.map.get(a).copied());
         let activation = match (mapped, hf.hidden_act.as_deref(), strict) {
@@ -1082,6 +1081,11 @@ impl Spec {
             .map(|f| (head_dim as f64 * f).round() as usize);
         let pattern = match &hf.layer_types {
             Some(types) if hybrid || !strict || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
+            None if family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).is_some_and(|n| n > 1) && hf.sliding_window.is_some() => {
+                let n = family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).unwrap_or(2) as usize;
+                let all: Vec<String> = (0..hf.num_hidden_layers).map(|i| if (i + 1) % n == 0 { "full_attention" } else { "sliding_attention" }.to_string()).collect();
+                layer_pattern(&family.blocks, &all, strict)?
+            }
             None if hybrid && hf.full_attention_interval.is_some_and(|n| n > 1) => {
                 let n = hf.full_attention_interval.unwrap_or(4);
                 let mut p = vec![Block::Linear; n - 1];
@@ -1132,7 +1136,7 @@ impl Spec {
                     Some(if m.shared_intermediate > 0 { m.shared_intermediate } else { m.expert_intermediate })
                 }).unwrap_or(0),
                 vocab: hf.vocab_size,
-                tie_embeddings: hf.tie_word_embeddings,
+                tie_embeddings: hf.tie_word_embeddings.or(family.embedding.tie).unwrap_or(false),
                 embed_scale: family.embedding.scale.as_deref().and_then(|s| (s == "sqrt_hidden").then(|| (hf.hidden_size as f64).sqrt())),
                 logit_softcap: hf.final_logit_softcapping,
             },

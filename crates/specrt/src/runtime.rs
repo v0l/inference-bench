@@ -1136,8 +1136,52 @@ impl Runtime {
         let buf = &self.buf;
         let fp4 = matches!(l.gate_up, DeviceMatrix::Fp4 { .. });
         let (act, down) = if fp4 { ("gate_up_act_f4", "down_proj_f4") } else { ("gate_up_act", "down_proj") };
-        self.linear_norm(act, &l.gate_up, None, &buf.x, &l.ln2, &buf.act, s.dims.intermediate)?;
-        self.linear(down, &l.down, None, &buf.act, &buf.x, s.dims.hidden)
+        let pre = l.ln_pre_mlp.as_ref().unwrap_or(&l.ln2);
+        self.linear_norm(act, &l.gate_up, None, &buf.x, pre, &buf.act, s.dims.intermediate)?;
+        match &l.ln_post_mlp {
+            Some(post) => {
+                self.clear_branch()?;
+                self.linear(down, &l.down, None, &buf.act, &self.pre.branch, s.dims.hidden)?;
+                self.add_normed_branch(post)
+            }
+            None => self.linear(down, &l.down, None, &buf.act, &buf.x, s.dims.hidden),
+        }
+    }
+
+    fn clear_branch(&self) -> Result<()> {
+        let hidden = self.spec.dims.hidden;
+        let mut b = self.stream.launch_builder(self.kernel("clear_branch"));
+        b.arg(&self.pre.branch).arg(&self.pre.branch);
+        unsafe { b.launch(cfg(grid(hidden, 256), 256)) }?;
+        Ok(())
+    }
+
+    fn add_normed_branch(&self, weight: &CudaSlice<f32>) -> Result<()> {
+        let mut b = self.stream.launch_builder(self.kernel("norm_add"));
+        b.arg(&self.pre.branch).arg(weight).arg(&self.buf.x).arg(&self.buf.x);
+        unsafe { b.launch(cfg(1, 1024)) }?;
+        Ok(())
+    }
+
+    fn attention_out_decode(&self, l: &DeviceAttn, layer: &DeviceLayer) -> Result<()> {
+        let hidden = self.spec.dims.hidden;
+        if layer.ln_pre_mlp.is_some() {
+            self.clear_branch()?;
+            self.linear("o_proj", &l.o, None, &self.buf.attn, &self.pre.branch, hidden)?;
+            return self.add_normed_branch(&layer.ln2);
+        }
+        self.linear("o_proj", &l.o, None, &self.buf.attn, &self.buf.x, hidden)
+    }
+
+    fn softcap_decode(&self) -> Result<()> {
+        if self.spec.dims.logit_softcap.is_none() {
+            return Ok(());
+        }
+        let vocab = self.spec.dims.vocab;
+        let mut b = self.stream.launch_builder(self.kernel("logit_softcap"));
+        b.arg(&self.buf.logits).arg(&self.buf.logits);
+        unsafe { b.launch(cfg(grid(vocab, 256), 256)) }?;
+        Ok(())
     }
 
     fn trace_layer(&self, trace: Option<&CudaSlice<f32>>, layer: usize, tokens: usize) -> Result<()> {
@@ -1248,7 +1292,7 @@ impl Runtime {
             let mut b = self.stream.launch_builder(self.kernel("attention_reduce"));
             b.arg(&buf.attn_part).arg(&buf.pos).arg(&buf.qkv).arg(&buf.attn).arg(&window);
             unsafe { b.launch(cfg(a.heads as u32, a.head_dim.max(32) as u32)) }?;
-            self.linear("o_proj", &l.o, None, &buf.attn, &buf.x, s.dims.hidden)?;
+            self.attention_out_decode(l, layer)?;
             self.mlp_decode(layer)?;
             self.trace_layer(trace, i, 1)?;
         }
@@ -1262,7 +1306,7 @@ impl Runtime {
             &buf.logits,
             s.dims.vocab,
         )?;
-        Ok(())
+        self.softcap_decode()
     }
 
     fn gemm(

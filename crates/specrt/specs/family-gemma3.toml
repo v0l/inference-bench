@@ -9,9 +9,16 @@ architectures = ["Gemma3ForCausalLM"]
 [attention]
 qk_norm = true
 
+[blocks]
+sliding_period_key = "sliding_window_pattern"
+
+[rope]
+local_theta_key = "rope_local_base_freq"
+
 [norm]
 unit_offset = true
 sandwich = true
 
 [embedding]
 scale = "sqrt_hidden"
+tie = true
