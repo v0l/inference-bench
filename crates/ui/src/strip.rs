@@ -19,12 +19,7 @@ pub fn shared_scale<'a>(models: impl Iterator<Item = &'a ModelAnatomy>) -> u64 {
 }
 
 pub fn params_text(n: u64) -> String {
-    match n {
-        n if n >= 1_000_000_000 => format!("{:.2} B", n as f64 / 1e9),
-        n if n >= 1_000_000 => format!("{:.1} M", n as f64 / 1e6),
-        n if n >= 1_000 => format!("{:.1} K", n as f64 / 1e3),
-        n => n.to_string(),
-    }
+    crate::fmt::count(n)
 }
 
 pub fn layer_tip(l: &LayerInfo) -> String {

@@ -440,24 +440,15 @@ fn tower_note(c: &specrt::vision::VisionConfig) -> String {
         c.spatial_merge_size,
         c.spatial_merge_size,
         c.out_hidden_size,
-        human_count(specrt::vision_encoder::tower_params(c))
+        crate::fmt::count(specrt::vision_encoder::tower_params(c))
     )
-}
-
-fn human_count(n: u64) -> String {
-    match n {
-        1_000_000_000.. => format!("{:.2} B", n as f64 / 1e9),
-        1_000_000.. => format!("{:.1} M", n as f64 / 1e6),
-        1_000.. => format!("{:.1} K", n as f64 / 1e3),
-        _ => n.to_string(),
-    }
 }
 
 fn tower(ui: &mut egui::Ui, c: &specrt::vision::VisionConfig) {
     let parts = specrt::vision_encoder::tower_parts(c);
     for p in &parts {
         let times = if p.count > 1 { format!("{} x ", p.count) } else { String::new() };
-        Line::new().legend(&p.name).gap(10.0).value(format!("{times}{}", human_count(p.params))).show(ui);
+        Line::new().legend(&p.name).gap(10.0).value(format!("{times}{}", crate::fmt::count(p.params))).show(ui);
     }
     let ops = specrt::vision_encoder::plan(c);
     let labels: Vec<String> = ops.iter().take(9).map(|o| o.label()).collect();

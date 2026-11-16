@@ -2230,3 +2230,58 @@ fn the_budget_excludes_this_apps_own_memory_and_a_model_that_fits_then_shows_as_
     let a = inference_bench_core::discover::assess(&spec, &anatomy, weights, &budget, 1);
     assert_eq!((a.verdict, a.full()), (inference_bench_core::discover::Verdict::Fits, true));
 }
+
+fn request(ttft: f64, prompt: u64, cached: u64, completion: u64, prefill: f64, decode: f64) -> inference_bench_core::live::RequestRecord {
+    inference_bench_core::live::RequestRecord {
+        at: chrono::Utc::now(),
+        ttft_secs: ttft,
+        prompt_tokens: prompt,
+        cached_tokens: cached,
+        completion_tokens: completion,
+        prefill_tok_s: prefill,
+        decode_tok_s: decode,
+    }
+}
+
+#[test]
+fn the_per_request_table_shows_clean_units_and_cache_columns() {
+    let plain = request(0.842, 625, 0, 1574, 742.3, 35.44);
+    assert_eq!(crate::serving::request_cells(&plain, false), ["842 ms", "625", "1.57k", "742 tok/s", "35.4 tok/s"]);
+    let warm = request(1.308, 1450, 1000, 40, 2310.4, 35.44);
+    assert_eq!(crate::serving::request_cells(&warm, true), ["1.31 s", "1.45k", "69%", "1.00k", "450", "40", "2,310 tok/s", "35.4 tok/s"]);
+    let full = request(0.05, 512, 512, 8, 0.0, 20.0);
+    assert_eq!(crate::serving::request_cells(&full, true)[6], "cached");
+    let cols = |c: bool| crate::serving::request_columns(c).iter().map(|c| c.0).collect::<Vec<_>>();
+    assert_eq!(cols(false), ["time", "ttft", "prompt", "completion", "prefill", "decode"]);
+    assert_eq!(cols(true), ["time", "ttft", "prompt", "cache hit", "cache read", "cache write", "completion", "prefill", "decode"]);
+}
+
+#[test]
+fn the_per_request_table_renders_with_and_without_cache_columns() {
+    let recent = vec![request(0.842, 625, 0, 1574, 742.3, 35.4), request(1.308, 1450, 1000, 40, 2310.4, 35.4)];
+    let mut h = Harness::new_ui(|ui| {
+        egui_bench::install(ui.ctx());
+        crate::serving::per_request(ui, &recent);
+    });
+    h.run();
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+fn screenshot_of_the_per_request_table() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let recent = vec![
+        request(0.842, 625, 0, 1574, 742.3, 35.4),
+        request(2.254, 14_500, 0, 912, 6431.0, 33.1),
+        request(12.43, 145_000, 120_000, 300, 2310.4, 31.9),
+        request(0.05, 512, 512, 8, 0.0, 41.2),
+        request(65.0, 1_200_000, 1_000_000, 4096, 3100.0, 28.0),
+    ];
+    let mut h = Harness::builder().with_size(egui::vec2(1000.0, 220.0)).with_accessibility_check(false).allow_missing_glyphs().build_ui(|ui| {
+        egui_bench::install(ui.ctx());
+        crate::serving::per_request(ui, &recent);
+    });
+    h.run();
+    h.render().unwrap().save(out.join("server-per-request.png")).unwrap();
+}

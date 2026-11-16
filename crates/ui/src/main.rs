@@ -4,6 +4,7 @@ mod table;
 mod block;
 mod detail;
 mod engine;
+mod fmt;
 mod hardware;
 mod strip;
 mod job;

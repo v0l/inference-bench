@@ -1,7 +1,6 @@
 use crate::App;
 use eframe::egui;
 use egui_bench::prelude::*;
-use inference_bench_core::library::human_size;
 use inference_bench_core::live::{HISTORY_SAMPLES, Point, Reading, RequestRecord};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,7 +68,7 @@ fn size(bytes: u64) -> String {
 }
 
 fn percent(num: u64, den: u64) -> Option<String> {
-    (den > 0).then(|| format!("{:.0}%", num as f64 * 100.0 / den as f64))
+    (den > 0).then(|| crate::fmt::percent(num as f64 / den as f64))
 }
 
 pub fn readings(r: &Reading, per_minute: f64) -> Vec<(&'static str, String, egui::Color32)> {
@@ -116,7 +115,7 @@ fn chart(ui: &mut egui::Ui, label: &str, now: String, series: &[&[f32]], floor: 
 }
 
 fn ms(v: f64) -> String {
-    format!("{:.0} ms", v * 1000.0)
+    crate::fmt::duration(v)
 }
 
 fn charts(ui: &mut egui::Ui, s: &Snapshot, max_seqs: usize, with_kv: bool) {
@@ -135,20 +134,53 @@ fn charts(ui: &mut egui::Ui, s: &Snapshot, max_seqs: usize, with_kv: bool) {
     });
 }
 
-fn per_request(ui: &mut egui::Ui, recent: &[RequestRecord]) {
+fn right(p: &egui::Painter, row: egui::Rect, x: f32, w: f32, text: &str, col: egui::Color32) {
+    let r = egui::Rect::from_min_max(egui::pos2(x, row.top()), egui::pos2(x + w - 12.0, row.bottom()));
+    p.with_clip_rect(r.intersect(p.clip_rect())).text(egui::pos2(r.right(), r.center().y), egui::Align2::RIGHT_CENTER, text, figure(11.0), col);
+}
+
+pub fn request_cells(r: &RequestRecord, with_cache: bool) -> Vec<String> {
+    let mut out = vec![crate::fmt::duration(r.ttft_secs), crate::fmt::count(r.prompt_tokens)];
+    if with_cache {
+        let hit = if r.prompt_tokens > 0 { crate::fmt::percent(r.cached_tokens as f64 / r.prompt_tokens as f64) } else { "-".into() };
+        out.push(hit);
+        out.push(crate::fmt::count(r.cached_tokens));
+        out.push(crate::fmt::count(r.prompt_tokens - r.cached_tokens));
+    }
+    out.push(crate::fmt::count(r.completion_tokens));
+    out.push(match (r.prefill_tok_s > 0.0, r.prompt_tokens > 0 && r.cached_tokens >= r.prompt_tokens) {
+        (true, _) => crate::fmt::rate(r.prefill_tok_s),
+        (false, true) => "cached".into(),
+        _ => "-".into(),
+    });
+    out.push(if r.decode_tok_s > 0.0 { crate::fmt::rate(r.decode_tok_s) } else { "-".into() });
+    out
+}
+
+pub fn request_columns(with_cache: bool) -> Vec<(&'static str, f32)> {
+    let mut cols = vec![("time", 80.0), ("ttft", 90.0), ("prompt", 80.0)];
+    if with_cache {
+        cols.extend([("cache hit", 90.0), ("cache read", 100.0), ("cache write", 110.0)]);
+    }
+    cols.extend([("completion", 100.0), ("prefill", 130.0), ("decode", 130.0)]);
+    cols
+}
+
+pub fn per_request(ui: &mut egui::Ui, recent: &[RequestRecord]) {
     section(ui, "per request", "newest first", |ui| {
         if recent.is_empty() {
             note(ui, "no completed requests yet", LEGEND);
             return;
         }
-        let cols: [(&str, f32); 5] = [("time", 90.0), ("ttft ms", 90.0), ("prompt", 90.0), ("completion", 100.0), ("decode tok/s", 110.0)];
+        let with_cache = recent.iter().any(|r| r.cached_tokens > 0);
+        let cols = request_columns(with_cache);
         Table::new(&cols, recent.len().min(12)).show(ui, |i, p, rect, at| {
             let r = &recent[recent.len() - 1 - i];
-            cell(p, rect, at(0), 90.0, &r.at.with_timezone(&chrono::Local).format("%H:%M:%S").to_string(), LEGEND);
-            cell(p, rect, at(1), 90.0, &format!("{:.0}", r.ttft_secs * 1000.0), TRACE);
-            cell(p, rect, at(2), 90.0, &r.prompt_tokens.to_string(), VALUE);
-            cell(p, rect, at(3), 100.0, &r.completion_tokens.to_string(), VALUE);
-            cell(p, rect, at(4), 110.0, &format!("{:.1}", r.decode_tok_s), TRACE);
+            cell(p, rect, at(0), cols[0].1, &r.at.with_timezone(&chrono::Local).format("%H:%M:%S").to_string(), LEGEND);
+            for (k, text) in request_cells(r, with_cache).iter().enumerate() {
+                let tint = if matches!(cols[k + 1].0, "ttft" | "prefill" | "decode") { TRACE } else { VALUE };
+                right(p, rect, at(k + 1), cols[k + 1].1, text, tint);
+            }
         });
     });
 }

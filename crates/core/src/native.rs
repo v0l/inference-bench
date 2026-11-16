@@ -222,6 +222,7 @@ fn generation(r: Reply) -> Generation {
         completion_tokens: r.completion_tokens as u64,
         ttft_secs: r.prefill_secs,
         prefill_secs: r.prefill_secs,
+        queue_secs: 0.0,
         decode_secs: r.decode_secs,
         peak_memory_bytes: Some(r.peak_device_bytes),
     }

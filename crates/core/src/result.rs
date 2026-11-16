@@ -90,6 +90,8 @@ pub struct Generation {
     pub completion_tokens: u64,
     pub ttft_secs: f64,
     pub prefill_secs: f64,
+    #[serde(default)]
+    pub queue_secs: f64,
     pub decode_secs: f64,
     pub peak_memory_bytes: Option<u64>,
 }
