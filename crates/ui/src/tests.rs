@@ -76,7 +76,7 @@ fn harness_sized(name: &str, tab: Tab, height: f32) -> Harness<'static, App> {
 
 #[test]
 fn every_tab_draws() {
-    for tab in [Tab::Chat, Tab::Models, Tab::Server, Tab::Settings] {
+    for tab in [Tab::Chat, Tab::Models, Tab::Server, Tab::Hardware, Tab::Settings] {
         let mut h = harness(&format!("tab{tab:?}"), tab);
         h.run();
         assert_eq!(h.state().tab, tab);
@@ -1802,4 +1802,164 @@ fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_ca
     dialog.sync();
     assert_eq!(dialog.max, 262144);
     assert_eq!(dialog.ctx, 262144);
+}
+
+fn fixture_spec_model() -> LocalModel {
+    let mut m = model("Qwen27", true, "dense decoder");
+    m.format = Format::Spec;
+    m.path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/qwen3.8-27b.toml");
+    m
+}
+
+fn fake_peer(host: &str, gib: f64, busy: bool) -> specrt::cluster::Peer {
+    let machine = specrt::hardware::fake_gpus(host, 1, true);
+    let mut d = machine.devices(&[]).remove(0);
+    d.memory_gib = gib;
+    d.address = Some(format!("10.0.0.7:{}", 7600));
+    specrt::cluster::Peer {
+        version: specrt::cluster::ANNOUNCEMENT_VERSION,
+        host: host.into(),
+        app_version: Some("0.1".into()),
+        busy,
+        serving: busy.then(|| "Qwen3-0.6B".to_string()),
+        control: Some("10.0.0.7:7599".into()),
+        gpus: vec![specrt::cluster::PeerGpu { device: d, gpu_name: "NVIDIA GB10".into() }],
+    }
+}
+
+fn hardware_harness(name: &str, gpus: usize) -> Harness<'static, App> {
+    let mut h = harness(name, Tab::Hardware);
+    {
+        let app = h.state_mut();
+        app.hardware.auto = false;
+        let mut m = specrt::hardware::fake_gpus("desk", gpus, true);
+        for g in &mut m.gpus {
+            g.free_bytes = 12 << 30;
+        }
+        m.interfaces = vec![specrt::hardware::NetInterface { name: "eth0".into(), ip: "192.168.1.5".parse().unwrap() }];
+        app.hardware.machine = Some(m);
+        app.library = vec![fixture_spec_model()];
+    }
+    h
+}
+
+#[test]
+fn the_hardware_tab_lists_every_gpu_with_memory_bandwidth_and_the_links_between_them() {
+    for n in [2usize, 4] {
+        let mut h = hardware_harness(&format!("hw{n}"), n);
+        h.run();
+        for i in 0..n {
+            h.get_by_label_contains(&format!("GPU {i}  RTX PRO 6000 Blackwell Max-Q  sm_120"));
+        }
+        assert_eq!(h.get_all_by_label_contains("12.0 GB free").count(), n);
+        assert_eq!(h.get_all_by_label_contains("1792 GB/s").count(), n);
+        h.get_by_label_contains("GPU 0 and GPU 1: peer to peer");
+        h.get_by_label_contains("network eth0 192.168.1.5");
+        assert_eq!(crate::hardware::gpu_lines(h.state().hardware.machine.as_ref().unwrap()).len(), n);
+    }
+}
+
+#[test]
+fn the_hardware_tab_marks_unlinked_gpus_as_host_staged() {
+    let mut h = hardware_harness("hwstaged", 2);
+    h.state_mut().hardware.machine = Some(specrt::hardware::fake_gpus("desk", 2, false));
+    h.run();
+    h.get_by_label_contains("GPU 0 and GPU 1: staged through host memory");
+}
+
+#[test]
+fn peers_from_fake_announcements_show_name_gpus_memory_and_busy_state() {
+    let mut h = hardware_harness("hwpeers", 1);
+    {
+        let app = h.state_mut();
+        app.hardware.peers.insert("spark".into(), fake_peer("spark", 110.0, true));
+        app.hardware.peers.insert("nuc".into(), fake_peer("nuc", 16.0, false));
+        app.hardware.peers.insert("desk".into(), fake_peer("desk", 96.0, false));
+    }
+    h.run();
+    h.get_by_label_contains("spark: GB10  118 GB  busy, serving Qwen3-0.6B  10.0.0.7:7599");
+    h.get_by_label_contains("nuc: GB10  17 GB  idle");
+    assert!(h.query_by_label_contains("desk: GB10").is_none());
+}
+
+#[test]
+fn the_placement_preview_shows_both_objectives_with_a_local_gpu_pair_and_a_remote_gpu() {
+    let mut h = hardware_harness("hwplan", 2);
+    {
+        let app = h.state_mut();
+        app.hardware.peers.insert("spark".into(), fake_peer("spark", 14.0, false));
+        app.settings.cluster.paired.insert("spark".into());
+        app.hardware.selection.peers.insert("spark".into());
+        app.hardware.model = "Qwen27".into();
+        app.hardware.ctx = 2048;
+    }
+    h.run();
+    h.run();
+    let shown = h.state().hardware.shown.as_ref().unwrap();
+    let preview = shown.preview.as_ref().unwrap();
+    let names: Vec<&str> = shown.devices.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(names, ["desk/gpu0", "desk/gpu1", "spark/gpu0"]);
+    for result in [&preview.latency, &preview.throughput] {
+        let p = result.as_ref().unwrap();
+        let (rows, summary) = crate::hardware::placement_lines(p, &shown.devices, "desk");
+        assert!(!rows.is_empty() && summary.contains("bottleneck"), "{summary}");
+    }
+    let lat = preview.latency.as_ref().unwrap();
+    assert!(lat.stages.iter().any(|s| s.tp > 1));
+    h.get_by_label_contains("needs tensor parallel (#658)");
+    assert_eq!(h.get_all_by_label_contains("slowest stage").count(), 2);
+}
+
+#[test]
+fn excluding_a_local_gpu_in_the_run_section_removes_it_from_the_plan() {
+    let mut h = hardware_harness("hwexclude", 2);
+    {
+        let app = h.state_mut();
+        app.hardware.model = "Qwen27".into();
+        app.hardware.ctx = 2048;
+        app.hardware.selection.excluded.insert("desk/gpu1".into());
+    }
+    h.run();
+    h.run();
+    let shown = h.state().hardware.shown.as_ref().unwrap();
+    assert_eq!(shown.devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["desk/gpu0"]);
+    assert!(shown.preview.as_ref().unwrap().latency.is_err());
+}
+
+#[test]
+fn an_unpaired_peer_cannot_be_selected_and_pairing_with_a_wrong_code_fails() {
+    let mut h = hardware_harness("hwpair", 1);
+    h.state_mut().hardware.peers.insert("spark".into(), fake_peer("spark", 14.0, false));
+    h.run();
+    h.get_by_label_contains("use spark: GB10 (not paired)");
+    assert!(h.state().hardware.selection.peers.is_empty());
+}
+
+#[test]
+fn sharing_is_off_until_the_switch_is_turned_on() {
+    let mut h = hardware_harness("hwshare", 1);
+    h.run();
+    assert!(!h.state().settings.cluster.share);
+    assert!(h.state().hardware.host.is_none());
+}
+
+#[test]
+fn the_pipeline_section_names_each_stage_and_shows_a_lost_stage() {
+    use specrt::sched::{ChainMetrics, StageMetric};
+    let chain = ChainMetrics {
+        stages: vec![
+            StageMetric { name: "desk/gpu0".into(), device: 0, start: 0, end: 32, busy_secs: 1.5, calls: 10, tokens: 40 },
+            StageMetric { name: "spark/gpu0".into(), device: 1, start: 32, end: 64, busy_secs: 1.0, calls: 10, tokens: 40 },
+        ],
+        hops: 10,
+        hop_secs: 0.02,
+        hop_bytes: 4 << 20,
+        lost: Some("stage spark/gpu0 was lost: connection reset".into()),
+        ..ChainMetrics::default()
+    };
+    let rows = crate::hardware::pipeline_rows(&specrt::serve::Stats { chain: Some(chain), ..Default::default() });
+    assert!(rows[0].starts_with("stage 0 desk / GPU 0  layers 0..32"));
+    assert!(rows[1].contains("spark / GPU 0"));
+    assert!(rows[2].contains("2.00 ms each"));
+    assert!(rows[3].starts_with("lost: stage spark/gpu0 was lost"));
 }

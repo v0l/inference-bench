@@ -192,6 +192,11 @@ pub fn prepare(run: &Run) -> Result<Prepared> {
     let mut local = Vec::new();
     let mut used_peers = Vec::new();
     if !is_remote(run) {
+        if let [only] = run.placement.stages.as_slice()
+            && only.ordinal != 0
+        {
+            bail!("the model fits on {} alone, and a single GPU run always uses GPU 0: include GPU 0 or add a second GPU", hardware::display_name(&only.device_name));
+        }
         stages = run.placement.stages.iter().map(|s| StageConfig { device: s.device_name.clone(), layers: [s.start, s.end] }).collect();
         let placement = PlacementConfig { objective: run.placement.objective, context: run.ctx, slots: run.slots, devices, stages, ..PlacementConfig::default() };
         return Ok(Prepared { placement, local, peers: used_peers, key });

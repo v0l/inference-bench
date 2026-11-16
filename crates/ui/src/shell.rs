@@ -6,10 +6,11 @@ use inference_bench_core::library::human_size;
 const RAIL_W: f32 = 92.0;
 const RAIL_ITEM_H: f32 = 64.0;
 
-const TABS: [(Tab, &str); 4] = [
+const TABS: [(Tab, &str); 5] = [
     (Tab::Chat, "chat"),
     (Tab::Models, "models"),
     (Tab::Server, "server"),
+    (Tab::Hardware, "hardware"),
     (Tab::Settings, "settings"),
 ];
 
@@ -60,6 +61,16 @@ fn glyph(p: &egui::Painter, tab: Tab, c: Pos2, tint: egui::Color32) {
             p.rect_stroke(Rect::from_center_size(c + Vec2::new(0.0, 6.0), Vec2::new(22.0, 8.0)), 1.0, s, egui::StrokeKind::Middle);
             p.circle_filled(c + Vec2::new(-7.0, -5.0), 1.5, tint);
             p.circle_filled(c + Vec2::new(-7.0, 6.0), 1.5, tint);
+        }
+        Tab::Hardware => {
+            p.rect_stroke(Rect::from_center_size(c, Vec2::new(18.0, 18.0)), 2.0, s, egui::StrokeKind::Middle);
+            p.rect_stroke(Rect::from_center_size(c, Vec2::new(8.0, 8.0)), 1.0, s, egui::StrokeKind::Middle);
+            for d in [-5.0f32, 5.0] {
+                p.line_segment([c + Vec2::new(d, -9.0), c + Vec2::new(d, -13.0)], s);
+                p.line_segment([c + Vec2::new(d, 9.0), c + Vec2::new(d, 13.0)], s);
+                p.line_segment([c + Vec2::new(-9.0, d), c + Vec2::new(-13.0, d)], s);
+                p.line_segment([c + Vec2::new(9.0, d), c + Vec2::new(13.0, d)], s);
+            }
         }
         Tab::Settings => {
             for (i, x) in [-0.4f32, 0.5, -0.1].iter().enumerate() {
@@ -129,6 +140,7 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
             Tab::Chat => crate::chat::draw(app, ui),
             Tab::Models => crate::models::draw(app, ui),
             Tab::Server => crate::server::draw(app, ui),
+            Tab::Hardware => crate::hardware::draw(app, ui),
             Tab::Settings => crate::settings::draw(app, ui),
         }
     });

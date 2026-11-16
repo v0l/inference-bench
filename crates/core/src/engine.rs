@@ -315,7 +315,8 @@ fn open(
 ) -> Result<Opened, BackendError> {
     serve_options(max_ctx, seqs, kv_cache_bytes, engine)?;
     let mut note = None;
-    let attempts = if seqs > 1 { vec![seqs, 1] } else { Vec::new() };
+    let placed = serving(serve_options(max_ctx, seqs, kv_cache_bytes, engine)?).is_some_and(|t| t.requires_serving());
+    let attempts = if seqs > 1 { vec![seqs, 1] } else if placed { vec![1] } else { Vec::new() };
     for (n, attempt) in attempts.into_iter().enumerate() {
         let Some(mut target) = serving(serve_options(max_ctx, attempt, kv_cache_bytes, engine)?) else { break };
         target.set_progress(Some(progress.clone()));

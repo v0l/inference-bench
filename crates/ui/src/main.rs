@@ -4,6 +4,7 @@ mod table;
 mod block;
 mod detail;
 mod engine;
+mod hardware;
 mod strip;
 mod job;
 mod load;
@@ -33,6 +34,7 @@ pub enum Tab {
     Chat,
     Models,
     Server,
+    Hardware,
     Settings,
 }
 
@@ -61,6 +63,7 @@ pub struct App {
     pub chat: chat::ChatState,
     pub models: models::ModelsState,
     pub server: server::ServerState,
+    pub hardware: hardware::HardwareState,
     pub logs: inference_bench_core::logging::LogBuffer,
     pub logs_ui: logs::LogsState,
     pub settings_ui: settings::SettingsState,
@@ -73,17 +76,19 @@ impl App {
     pub fn new(dir: PathBuf, wake: Wake, ctx: &egui::Context) -> Self {
         let mut app = Self::bare(dir, wake, ctx);
         app.specs.auto = true;
+        app.hardware.auto = true;
         app.rescan();
         app
     }
 
     pub fn bare(dir: PathBuf, wake: Wake, ctx: &egui::Context) -> Self {
         let settings = Settings::load(&dir);
+        let hardware_slot = inference_bench_core::cluster::ClusterSlot::default();
         Self {
             tab: Tab::Chat,
             library: Vec::new(),
             scan: Pending::default(),
-            engine: Engine::spawn(wake.clone()),
+            engine: engine_for(&hardware_slot, wake.clone()),
             loading: None,
             load_progress: None,
             gpu: Vec::new(),
@@ -93,6 +98,7 @@ impl App {
             chat: chat::ChatState::new(ctx),
             models: models::ModelsState::default(),
             server: server::ServerState::default(),
+            hardware: hardware::HardwareState::with_slot(hardware_slot.clone()),
             logs: inference_bench_core::logging::LogBuffer::new(5000),
             logs_ui: logs::LogsState::default(),
             settings_ui: settings::SettingsState::default(),
@@ -142,6 +148,7 @@ impl App {
     }
 
     pub fn load_model_named(&mut self, model: &LocalModel, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice) {
+        self.hardware.release();
         self.engine.send(Command::Load {
             model_id: model.model_id(inference_bench_core::target::NATIVE),
             display: model.name.clone(),
@@ -154,6 +161,7 @@ impl App {
     }
 
     pub fn unload(&mut self) {
+        self.hardware.release();
         self.engine.send(Command::Unload);
     }
 
@@ -232,6 +240,10 @@ impl eframe::App for App {
         agent_ui::serve(self, &root.ctx().clone());
         shell::draw(self, root);
     }
+}
+
+fn engine_for(slot: &inference_bench_core::cluster::ClusterSlot, wake: Wake) -> Engine {
+    Engine::with_factories(wake, inference_bench_core::native::specrt_factory(), inference_bench_core::cluster::serving_factory(slot.clone()))
 }
 
 fn wake_for(ctx: &egui::Context) -> Wake {
