@@ -169,6 +169,20 @@ impl LoadDialog {
         let served_names = app.settings.served_names_for(&model.name).join(", ");
         let mut choice = app.settings.engine_for(&model.name);
         choice.set("serve.max_num_seqs", json!(seqs));
+        let fitted = app.models.preselect.iter().find(|p| p.model == model.name);
+        let (ctx, kv_gb) = match (fitted, &view) {
+            (Some(p), Ok(v)) => {
+                let ctx = p.context.clamp(MIN_CTX.min(max), max);
+                if p.kv != inference_bench_core::discover::Kv::F16 {
+                    choice.set("runtime.kv_dtype", json!("fp8"));
+                    if let Some(n) = p.kv.f16_layers() {
+                        choice.set("runtime.kv_f16_layers", json!(n));
+                    }
+                }
+                (ctx, default_kv_gb(&v.anatomy, free, seqs, ctx))
+            }
+            _ => (ctx, kv_gb),
+        };
         let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, texts: BTreeMap::new(), anatomy: None, native_max: max };
         dialog.sync();
         dialog

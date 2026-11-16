@@ -2024,3 +2024,169 @@ fn screenshot_of_the_hardware_tab() {
     h.run();
     h.render().unwrap().save(out.join("hardware.png")).unwrap();
 }
+
+fn gguf_header(arch: &str, context: u32) -> Vec<u8> {
+    use specrt::gguf::writer::{Kv as W, build};
+    let key = |k: &str| format!("{arch}.{k}");
+    let (a, b, c, d, e, f, g) = (key("block_count"), key("embedding_length"), key("feed_forward_length"), key("attention.head_count"), key("attention.head_count_kv"), key("attention.key_length"), key("context_length"));
+    let eps = key("attention.layer_norm_rms_epsilon");
+    build(
+        3,
+        &[
+            ("general.architecture", W::Str(arch)),
+            (&a, W::U32(36)),
+            (&b, W::U32(4096)),
+            (&c, W::U32(12288)),
+            (&d, W::U32(32)),
+            (&e, W::U32(8)),
+            (&f, W::U32(128)),
+            (&eps, W::F32(1e-6)),
+            (&g, W::U32(context)),
+            ("tokenizer.ggml.tokens", W::Strs(&["a", "b"])),
+        ],
+        &[],
+    )
+}
+
+fn discover_hub() -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let gb = |n: u64| n << 30;
+    let tree = |files: &[(&str, u64)]| format!("[{}]", files.iter().map(|(p, s)| format!(r#"{{"type":"file","path":"{p}","size":{s}}}"#)).collect::<Vec<_>>().join(","));
+    let big = tree(&[("Big-Q4_K_M.gguf", gb(5)), ("Big-Q5_K_M.gguf", gb(6)), ("Big-Q8_0.gguf", gb(9)), ("mmproj-Big-BF16.gguf", gb(1)), ("config.json", 100)]);
+    let odd = tree(&[("Odd-Q4_K_M-00001-of-00002.gguf", gb(3)), ("Odd-Q4_K_M-00002-of-00002.gguf", gb(3))]);
+    let huge = tree(&[("Huge-Q4_K_M.gguf", gb(200))]);
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let (big, odd, huge) = (big.clone(), odd.clone(), huge.clone());
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                let path = line.split_whitespace().nth(1).unwrap().to_string();
+                loop {
+                    line.clear();
+                    r.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                let (head, body): (&str, Vec<u8>) = if path.starts_with("/api/models?") {
+                    ("200 OK", br#"[{"id":"acme/Huge-GGUF","downloads":900,"likes":1},{"id":"acme/Odd-GGUF","downloads":500,"likes":1},{"id":"acme/Big-GGUF","downloads":100,"likes":1}]"#.to_vec())
+                } else if path.starts_with("/api/models/acme/Big-GGUF/tree") {
+                    ("200 OK", big.into_bytes())
+                } else if path.starts_with("/api/models/acme/Odd-GGUF/tree") {
+                    ("200 OK", odd.into_bytes())
+                } else if path.starts_with("/api/models/acme/Huge-GGUF/tree") {
+                    ("200 OK", huge.into_bytes())
+                } else if path.starts_with("/acme/Odd-GGUF/resolve") {
+                    ("206 Partial Content", gguf_header("brandnew", 8192))
+                } else if path.contains("/resolve/") {
+                    ("206 Partial Content", gguf_header("qwen3", 131072))
+                } else {
+                    ("404 Not Found", Vec::new())
+                };
+                let _ = write!(s, "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(&body);
+            });
+        }
+    });
+    base
+}
+
+fn discover_harness(name: &str) -> Harness<'static, App> {
+    let mut h = harness(name, Tab::Models);
+    with_gpu(&mut h, 0, 24 << 30);
+    {
+        let app = h.state_mut();
+        app.models.hub_base = discover_hub();
+        app.models.pane = models::Pane::Discover;
+        app.models.query = "1017".into();
+        app.settings.default_seqs = 1;
+    }
+    h.run();
+    h.get_by_label("search").click();
+    pump_until(&mut h, 20, "inspected", |a| a.models.infos.len() == 3);
+    h.run();
+    h
+}
+
+#[test]
+fn discover_shows_one_row_per_repo_with_its_best_quant_and_no_file_rows() {
+    let h = discover_harness("discover-rows");
+    let plans = h.state().models.plans(h.state().free_gpu_bytes(), 1);
+    assert_eq!(plans.iter().map(|p| p.repo.as_str()).collect::<Vec<_>>(), ["acme/Big-GGUF", "acme/Huge-GGUF", "acme/Odd-GGUF"]);
+    let line = models::headline(&plans[0]).unwrap();
+    assert!(line.starts_with("Best fit: Q8_0, full 128k context, "), "{line}");
+    h.get_by_label_contains("Best fit: Q8_0, full 128k context");
+    assert!(h.query_by_label_contains("Big-Q4_K_M.gguf").is_none());
+    assert!(h.query_by_label_contains("mmproj").is_none());
+    assert!(h.query_by_label_contains("00001-of-00002").is_none());
+    assert_eq!(h.query_all_by_label("download").count(), 2, "the unsupported repo has no download button");
+}
+
+#[test]
+fn discover_says_when_nothing_fits_and_flags_unsupported_architectures() {
+    let h = discover_harness("discover-nofit");
+    let plans = h.state().models.plans(h.state().free_gpu_bytes(), 1);
+    assert_eq!(models::headline(&plans[1]).map(|l| l.starts_with("Best fit: none, does not fit: needs")), Some(true));
+    h.get_by_label_contains("does not fit: needs");
+    h.get_by_label_contains("not supported");
+    assert!(plans[2].unsupported.as_deref().is_some_and(|w| w.contains("brandnew")), "{:?}", plans[2].unsupported);
+}
+
+#[test]
+fn discover_other_quants_are_a_collapsed_picker_not_rows() {
+    let mut h = discover_harness("discover-picker");
+    h.state_mut().models.picks.insert("acme/Big-GGUF".into(), "Q4_K_M".into());
+    h.run();
+    assert_eq!(h.query_all_by_label_contains("Best fit: Q8_0").count(), 0, "a picked quant replaces the best-fit line");
+    assert_eq!(h.query_all_by_label_contains("Big-Q8_0.gguf").count(), 0);
+}
+
+#[test]
+fn a_finished_download_preselects_its_fitted_context_and_kv_in_the_load_dialog() {
+    use inference_bench_core::discover::Kv;
+    let mut h = harness("preselect", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    let m = hub_model("acme/Qwen3-0.6B", None);
+    let app = h.state_mut();
+    let m = LocalModel { path: dir("preselect-model"), ..m };
+    std::fs::create_dir_all(&m.path).unwrap();
+    std::fs::copy(fixtures().join("qwen3-0.6b.config.json"), m.path.join("config.json")).unwrap();
+    app.models.preselect.push(models::Preselect { model: m.name.clone(), context: 16384, kv: Kv::Fp8 });
+    app.open_load_dialog(&m);
+    let d = app.load.as_ref().unwrap();
+    assert_eq!(d.ctx, 16384);
+    assert_eq!(d.kv_dtype(), specrt::spec::KvDtype::Fp8);
+    assert!(app.models.preselect.is_empty());
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+fn screenshot_of_discover() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (file, query) in [("discover.png", None), ("discover-qwen.png", Some("qwen3 8b gguf")), ("discover-1017.png", Some("1017"))] {
+        let Some(query) = query else {
+            let mut h = discover_harness("discover-shot");
+            h.run();
+            h.render().unwrap().save(out.join(file)).unwrap();
+            continue;
+        };
+        let mut h = harness_sized("discover-live", Tab::Models, 1000.0);
+        with_gpu(&mut h, 0, 96 << 30);
+        {
+            let app = h.state_mut();
+            app.models.pane = models::Pane::Discover;
+            app.models.query = query.into();
+            app.settings.default_seqs = 1;
+        }
+        h.run();
+        h.get_by_label("search").click();
+        pump_until(&mut h, 120, "live inspect", |a| !a.models.results.is_empty() && a.models.infos.len() == a.models.results.len());
+        h.run();
+        h.render().unwrap().save(out.join(file)).unwrap();
+    }
+}

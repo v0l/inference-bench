@@ -280,15 +280,27 @@ pub struct RepoInfo {
 }
 
 fn gguf_shape(hub: &Hub, repo: &str, g: &Grouped) -> Result<Shape, String> {
-    let probe = g.variants.iter().find(|v| v.format == Format::Gguf && v.complete()).or(g.variants.first()).ok_or("no weights in this repo")?;
-    let first = &probe.files.first().ok_or("no weights in this repo")?.path;
-    let header = hub.gguf_header(repo, first)?;
-    let mut spec = header.spec().map_err(|e| format!("{:#}", e.root_cause()))?;
-    spec.name = repo.to_string();
-    let arch = header.architecture().map_err(|e| e.to_string())?.to_string();
-    let ctx = header.count(&format!("{arch}.context_length"));
-    let anatomy = ModelAnatomy::new(&spec, 0, ctx);
-    Ok(Shape { spec, anatomy })
+    let mut probes: Vec<&Variant> = g.variants.iter().filter(|v| v.format == Format::Gguf && !v.files.is_empty()).collect();
+    probes.sort_by_key(|v| !v.complete());
+    if probes.is_empty() {
+        return Err("no weights in this repo".into());
+    }
+    let mut last = String::new();
+    for v in probes.into_iter().take(3) {
+        let attempt = (|| {
+            let header = hub.gguf_header(repo, &v.files[0].path)?;
+            let mut spec = header.spec().map_err(|e| format!("{:#}", e.root_cause()))?;
+            spec.name = repo.to_string();
+            let arch = header.architecture().map_err(|e| e.to_string())?.to_string();
+            let anatomy = ModelAnatomy::new(&spec, 0, header.count(&format!("{arch}.context_length")));
+            Ok(Shape { spec, anatomy })
+        })();
+        match attempt {
+            Ok(shape) => return Ok(shape),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 fn config_shape(hub: &Hub, repo: &str) -> (Result<Shape, String>, Option<String>) {

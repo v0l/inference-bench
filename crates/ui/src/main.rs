@@ -130,6 +130,7 @@ impl App {
 
     pub fn open_load_dialog(&mut self, model: &LocalModel) {
         self.load = Some(load::LoadDialog::open(self, model));
+        self.models.preselect.retain(|p| p.model != model.name);
     }
 
     pub fn load_model(&mut self, model: &LocalModel) {
@@ -210,7 +211,7 @@ impl App {
             self.gpu_poll.start(job::spawn(&self.wake, inference_bench_core::gpu::sample));
         }
         self.chat.agent.poll();
-        self.models.pump(&mut self.notice);
+        self.models.pump(&self.wake, &self.settings.hf_token, &mut self.notice);
         if self.specs.pump(&self.wake, &self.dir, &self.settings, &mut self.notice) {
             self.rescan();
         }

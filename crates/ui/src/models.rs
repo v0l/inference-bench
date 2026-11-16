@@ -3,9 +3,11 @@ use crate::shell::page;
 use crate::App;
 use eframe::egui;
 use egui_bench::prelude::*;
+use inference_bench_core::discover::{self, Kv, RepoInfo, RepoPlan, Scored, Verdict};
 use inference_bench_core::hf::{self, Hub, Progress, Repo, RepoFile};
 use inference_bench_core::library::{self, LocalModel, Relation, human_size};
 use inference_bench_core::target::NATIVE;
+use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, channel};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -19,8 +21,18 @@ pub struct Download {
     pub file: String,
     pub progress: Progress,
     pub result: Option<Result<(), String>>,
-    rx: Receiver<Result<(), String>>,
+    files: Vec<RepoFile>,
+    fitted: Option<(usize, Kv)>,
+    rx: Receiver<Result<String, String>>,
 }
+
+pub struct Preselect {
+    pub model: String,
+    pub context: usize,
+    pub kv: Kv,
+}
+
+type Inspected = Vec<(String, Result<RepoInfo, String>)>;
 
 pub struct ModelsState {
     pub pane: Pane,
@@ -28,9 +40,10 @@ pub struct ModelsState {
     pub library_query: String,
     pub results: Vec<Repo>,
     search: Pending<Result<Vec<Repo>, String>>,
-    pub picked: Option<String>,
-    pub files: Vec<RepoFile>,
-    listing: Pending<Result<Vec<RepoFile>, String>>,
+    pub infos: BTreeMap<String, Result<RepoInfo, String>>,
+    inspecting: Pending<Inspected>,
+    pub picks: BTreeMap<String, String>,
+    pub preselect: Vec<Preselect>,
     pub downloads: Vec<Download>,
     pub confirm_delete: Option<usize>,
     pub show_all: bool,
@@ -49,9 +62,10 @@ impl Default for ModelsState {
             library_query: String::new(),
             results: Vec::new(),
             search: Pending::default(),
-            picked: None,
-            files: Vec::new(),
-            listing: Pending::default(),
+            infos: BTreeMap::new(),
+            inspecting: Pending::default(),
+            picks: BTreeMap::new(),
+            preselect: Vec::new(),
             downloads: Vec::new(),
             confirm_delete: None,
             show_all: false,
@@ -66,43 +80,46 @@ impl Default for ModelsState {
 
 impl ModelsState {
     pub fn downloading(&self) -> bool {
-        self.downloads.iter().any(|d| d.result.is_none()) || self.search.busy() || self.listing.busy()
+        self.downloads.iter().any(|d| d.result.is_none()) || self.search.busy() || self.inspecting.busy()
     }
 
     pub fn take_rescan(&mut self) -> bool {
         std::mem::take(&mut self.rescan)
     }
 
-    pub fn pump(&mut self, notice: &mut Option<(bool, String)>) {
+    pub fn pump(&mut self, wake: &inference_bench_core::engine::Wake, token: &str, notice: &mut Option<(bool, String)>) {
         if let Some(r) = self.search.poll() {
             match r {
                 Ok(list) => {
                     self.message = Some((true, format!("{} repos", list.len())));
                     self.results = list;
+                    self.infos.clear();
+                    self.picks.clear();
+                    self.inspect_results(wake, token);
                 }
                 Err(e) => self.message = Some((false, e)),
             }
         }
-        if let Some(r) = self.listing.poll() {
-            match r {
-                Ok(files) => self.files = files,
-                Err(e) => self.message = Some((false, e)),
-            }
+        if let Some(found) = self.inspecting.poll() {
+            self.infos.extend(found);
         }
         let mut finished = false;
         for d in &mut self.downloads {
             if d.result.is_none()
                 && let Ok(r) = d.rx.try_recv()
             {
-                if r.is_ok() {
-                    finished = true;
-                    *notice = Some((true, format!("downloaded {}", d.file)));
-                } else if let Err(e) = &r
-                    && e != "paused"
-                {
-                    *notice = Some((false, format!("{}: {e}", d.file)));
+                match &r {
+                    Ok(model) => {
+                        finished = true;
+                        *notice = Some((true, format!("downloaded {}", d.file)));
+                        if let Some((context, kv)) = d.fitted {
+                            self.preselect.push(Preselect { model: model.clone(), context, kv });
+                        }
+                    }
+                    Err(e) if e != "paused" => *notice = Some((false, format!("{}: {e}", d.file))),
+                    Err(_) => {}
                 }
-                d.result = Some(r);
+                d.result = Some(r.map(|_| ()));
             }
         }
         if finished {
@@ -122,43 +139,47 @@ impl ModelsState {
         self.relation = Some((relation, of.to_string()));
         self.pane = Pane::Discover;
         self.results.clear();
-        self.picked = None;
         self.start_search(wake, token);
     }
 
-    fn open_repo(&mut self, wake: &inference_bench_core::engine::Wake, token: &str, repo: &str) {
-        self.picked = Some(repo.to_string());
-        self.files.clear();
-        let (base, token, repo) = (self.hub_base.clone(), token.to_string(), repo.to_string());
-        self.listing.start(job::spawn(wake, move || Hub::new(&base, &token).files(&repo)));
+    fn inspect_results(&mut self, wake: &inference_bench_core::engine::Wake, token: &str) {
+        let repos: Vec<String> = self.results.iter().map(|r| r.id.clone()).collect();
+        let (base, token) = (self.hub_base.clone(), token.to_string());
+        if repos.is_empty() {
+            return;
+        }
+        self.inspecting.start(job::spawn(wake, move || discover::inspect_all(&Hub::new(&base, &token), &repos)));
     }
 
-    pub fn start_download(
-        &mut self,
-        wake: &inference_bench_core::engine::Wake,
-        token: &str,
-        repo: &str,
-        files: Vec<String>,
-    ) {
+    pub fn plans(&self, free: Option<u64>, seqs: usize) -> Vec<RepoPlan> {
+        let planned: Vec<RepoPlan> = self.infos.values().filter_map(|i| i.as_ref().ok()).map(|i| discover::plan(i, free, seqs)).collect();
+        let ranked = discover::rank_repos(planned);
+        let mut out: Vec<RepoPlan> = Vec::new();
+        for r in &self.results {
+            if let Some(p) = ranked.iter().find(|p| p.repo == r.id) {
+                out.push(p.clone());
+            }
+        }
+        out.sort_by_key(|p| p.key());
+        out
+    }
+
+    pub fn start_download(&mut self, wake: &inference_bench_core::engine::Wake, token: &str, repo: &str, label: &str, files: Vec<RepoFile>, fitted: Option<(usize, Kv)>, first_weight: String, format: library::Format) {
         let progress = Progress::default();
         let (tx, rx) = channel();
         let (base, token, hub_dir) = (self.hub_base.clone(), token.to_string(), library::hub_dir());
-        let (r, p, w) = (repo.to_string(), progress.clone(), wake.clone());
-        let label = files.first().cloned().unwrap_or_default();
+        let (r, p, w, list) = (repo.to_string(), progress.clone(), wake.clone(), files.clone());
         std::thread::spawn(move || {
             let hub = Hub::new(&base, &token);
-            let mut outcome = Ok(());
-            for f in &files {
-                if let Err(e) = hub.download(&r, f, &hub_dir, &p) {
-                    outcome = Err(e);
-                    break;
-                }
-                w();
-            }
+            let outcome = hub.download_variant(&r, &list, &hub_dir, &p).map(|_| {
+                let first = hf::snapshot_path(&hub_dir, &r, &first_weight);
+                let v = discover::Variant { label: String::new(), format, files: Vec::new(), expected_parts: 1, size: 0, bits: 0.0 };
+                discover::model_name(&r, &v, &first)
+            });
             let _ = tx.send(outcome);
             w();
         });
-        self.downloads.push(Download { repo: repo.to_string(), file: label, progress, result: None, rx });
+        self.downloads.push(Download { repo: repo.to_string(), file: label.to_string(), progress, result: None, files, fitted, rx });
     }
 }
 
@@ -358,6 +379,126 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+fn best_line(s: &Scored) -> String {
+    let Some(f) = &s.fit else { return String::new() };
+    let ctx = discover::context_label(f.chosen.context);
+    match f.verdict {
+        Verdict::Unknown => format!("{} on the gpu, no gpu reading to check fit", human_size(f.weights)),
+        Verdict::DoesNotFit => format!("does not fit: needs {}, {} free", human_size(f.need), f.free.map_or("-".into(), human_size)),
+        _ if f.full() => format!("full {} context, {}", discover::context_label(f.native), f.chosen.kv.label()),
+        _ => format!("{ctx} of {} context, {}", discover::context_label(f.native), f.chosen.kv.label()),
+    }
+}
+
+pub fn headline(plan: &RepoPlan) -> Option<String> {
+    let s = plan.best()?;
+    if plan.unsupported.is_some() || !s.downloadable() {
+        return None;
+    }
+    let f = s.fit.as_ref()?;
+    match f.verdict {
+        Verdict::DoesNotFit => Some(format!("Best fit: none, {}", best_line(s))),
+        _ => Some(format!("Best fit: {}, {}", s.variant.label, best_line(s))),
+    }
+}
+
+fn verdict_chip(ui: &mut egui::Ui, s: &Scored) {
+    let Some(f) = &s.fit else { return };
+    let (tint, lit) = match f.verdict {
+        Verdict::Fits => (OK, true),
+        Verdict::Tight => (WARN, true),
+        Verdict::DoesNotFit => (FAULT, true),
+        Verdict::Unknown => (LEGEND, false),
+    };
+    chip(ui, f.verdict.label(), tint, lit);
+}
+
+fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>, token: &str, free: Option<u64>) {
+    card(
+        ui,
+        None,
+        |ui| {
+            ui.label(name_job(&r.id, 13.0, false));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                Line::new().legend("downloads").measured(r.downloads.to_string()).gap(10.0).legend("likes").measured(r.likes.to_string()).size(11.0).show(ui);
+            });
+        },
+        |ui| {
+            let Some(plan) = plan else {
+                match app.models.infos.get(&r.id) {
+                    Some(Err(e)) => note(ui, e.clone(), LEGEND),
+                    _ => note(ui, "reading the model header", LEGEND),
+                }
+                return;
+            };
+            let Some(best) = plan.best() else { return };
+            let chosen_label = app.models.picks.get(&r.id).cloned().unwrap_or_else(|| best.variant.label.clone());
+            let shown = plan.ranked.iter().find(|s| s.variant.label == chosen_label).unwrap_or(best).clone();
+            if let Some(why) = &plan.unsupported {
+                ui.horizontal_wrapped(|ui| {
+                    chip(ui, "not supported", WARN, false);
+                    note(ui, why.clone(), LEGEND);
+                });
+                return;
+            }
+            if shown.runnable.is_err() {
+                ui.horizontal_wrapped(|ui| {
+                    chip(ui, "not supported", WARN, false);
+                    note(ui, shown.runnable.clone().err().unwrap_or_default(), LEGEND);
+                });
+                return;
+            }
+            if let Some(line) = headline(plan).filter(|_| shown.variant.label == best.variant.label) {
+                ui.label(egui::RichText::new(line).color(VALUE).size(12.5));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                Line::new().legend("quant").value(shown.variant.label.clone()).show(ui);
+                if let Some(f) = &shown.fit {
+                    Line::new().legend("on gpu").value(human_size(f.weights)).show(ui);
+                    Line::new().legend("context").value(format!("{} of {}", discover::context_label(f.chosen.context), discover::context_label(f.native))).show(ui);
+                    Line::new().legend("kv").value(f.chosen.kv.label()).show(ui);
+                }
+                verdict_chip(ui, &shown);
+                chip(ui, "runs here", OK, true);
+            });
+            if shown.variant.label != best.variant.label && shown.fit.as_ref().is_some_and(|f| f.verdict == Verdict::DoesNotFit) {
+                note(ui, best_line(&shown), FAULT);
+            }
+            let info = app.models.infos.get(&r.id).and_then(|i| i.as_ref().ok()).cloned();
+            let Some(info) = info else { return };
+            let running = app.models.downloads.iter().any(|d| d.repo == r.id && d.result.is_none());
+            ui.horizontal(|ui| {
+                let key = Key::new(if running { "downloading" } else { "download" }).solid(READOUT).enabled(!running && shown.downloadable()).id_salt(("dl", &r.id));
+                if ui.add(key).clicked() {
+                    let files = discover::download_list(&info.grouped, &shown.variant);
+                    let first = shown.variant.files.first().map(|f| f.path.clone()).unwrap_or_default();
+                    let fitted = shown.fit.as_ref().filter(|f| f.verdict != Verdict::DoesNotFit && f.verdict != Verdict::Unknown).map(|f| (f.chosen.context, f.chosen.kv));
+                    let label = format!("{} {}", r.id, shown.variant.label);
+                    let wake = app.wake.clone();
+                    app.models.start_download(&wake, token, &r.id, &label, files, fitted, first, shown.variant.format);
+                }
+                if plan.ranked.len() > 1 {
+                    let mut picked = shown.variant.label.clone();
+                    let options: Vec<(String, String)> = plan
+                        .ranked
+                        .iter()
+                        .filter(|s| s.runnable.is_ok())
+                        .map(|s| {
+                            let tail = s.fit.as_ref().map_or(String::new(), |f| format!(", {} {}", human_size(f.weights), f.verdict.label()));
+                            (s.variant.label.clone(), format!("{}{tail}", s.variant.label))
+                        })
+                        .collect();
+                    if options.len() > 1 && choice(ui, ("quant", &r.id), &mut picked, options) {
+                        app.models.picks.insert(r.id.clone(), picked);
+                    }
+                }
+            });
+            let _ = free;
+        },
+    );
+}
+
 fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
     let mut go = false;
     let token = app.settings.hf_token.clone();
@@ -367,7 +508,7 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
     });
     if go {
         app.models.relation = None;
-        app.models.start_search(&app.wake, &token);
+        app.models.start_search(&app.wake.clone(), &token);
     }
     if let Some((relation, of)) = app.models.relation.clone() {
         ui.horizontal(|ui| {
@@ -381,52 +522,18 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
     if let Some((ok, text)) = &app.models.message {
         status(ui, *ok, text);
     }
+    let free = app.free_gpu_bytes();
+    if let Some(f) = free {
+        note(ui, format!("{} free on the gpu, {} parallel requests", human_size(f), app.settings.default_seqs), LEGEND);
+    }
+    let plans = app.models.plans(free, app.settings.default_seqs);
     let results = app.models.results.clone();
-    let picked = app.models.picked.clone();
-    for r in &results {
-        let on = picked.as_deref() == Some(r.id.as_str());
-        card(
-            ui,
-            if on { Some(READOUT) } else { None },
-            |ui| {
-                ui.label(name_job(&r.id, 13.0, false));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    Line::new().legend("downloads").measured(r.downloads.to_string()).gap(10.0).legend("likes").measured(r.likes.to_string()).size(11.0).show(ui);
-                });
-            },
-            |ui| {
-                if !on {
-                    if ui.add(Key::new("files").outline(VALUE).id_salt(("files", &r.id))).clicked() {
-                        let wake = app.wake.clone();
-                        app.models.open_repo(&wake, &token, &r.id);
-                    }
-                    return;
-                }
-                if app.models.listing.busy() {
-                    note(ui, "listing files", LEGEND);
-                }
-                let files: Vec<RepoFile> = app.models.files.iter().filter(|f| hf::is_weight_file(&f.path)).cloned().collect();
-                let companions: Vec<String> = hf::companion_files(&app.models.files).iter().map(|f| f.path.clone()).collect();
-                for f in &files {
-                    ui.horizontal(|ui| {
-                        Line::new().value(f.path.clone()).gap(10.0).measured(human_size(f.size)).elided(ui);
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let running = app.models.downloads.iter().any(|d| d.file == f.path && d.result.is_none());
-                            let key = Key::new(if running { "downloading" } else { "download" }).solid(READOUT).enabled(!running).id_salt(("dl", &f.path));
-                            if ui.add(key).clicked() {
-                                let mut all = companions.clone();
-                                all.push(f.path.clone());
-                                let wake = app.wake.clone();
-                                app.models.start_download(&wake, &token, &r.id, all);
-                            }
-                        });
-                    });
-                }
-                if files.is_empty() && !app.models.listing.busy() {
-                    note(ui, "no GGUF or safetensors files in this repo", LEGEND);
-                }
-            },
-        );
+    let mut order: Vec<&Repo> = results.iter().filter(|r| plans.iter().any(|p| p.repo == r.id)).collect();
+    order.sort_by_key(|r| plans.iter().position(|p| p.repo == r.id));
+    let pending: Vec<&Repo> = results.iter().filter(|r| !plans.iter().any(|p| p.repo == r.id)).collect();
+    for r in order.into_iter().chain(pending) {
+        let plan = plans.iter().find(|p| p.repo == r.id).cloned();
+        repo_row(app, ui, r, plan.as_ref(), &token, free);
     }
     downloads_section(app, ui);
 }
@@ -442,7 +549,7 @@ fn downloads_section(app: &mut App, ui: &mut egui::Ui) {
             let total = d.progress.total.load(std::sync::atomic::Ordering::Relaxed) as f32;
             Line::new().legend(&d.repo).gap(8.0).value(d.file.clone()).elided(ui);
             match &d.result {
-                None => progress(ui, "file", done, Some(total), &format!("{} / {}", human_size(done as u64), human_size(total as u64))),
+                None => progress(ui, "model", done, Some(total), &format!("{} / {}", human_size(done as u64), human_size(total as u64))),
                 Some(Ok(())) => status(ui, true, "done"),
                 Some(Err(e)) => {
                     status(ui, false, e);
@@ -457,11 +564,10 @@ fn downloads_section(app: &mut App, ui: &mut egui::Ui) {
         }
         if let Some(i) = retry {
             let d = app.models.downloads.remove(i);
-            let companions: Vec<String> = hf::companion_files(&app.models.files).iter().map(|f| f.path.clone()).collect();
-            let mut all = companions;
-            all.push(d.file);
             let (wake, token) = (app.wake.clone(), app.settings.hf_token.clone());
-            app.models.start_download(&wake, &token, &d.repo, all);
+            let first = d.files.iter().find(|f| f.path.ends_with(".gguf") && !f.path.starts_with("mmproj")).or(d.files.last()).map(|f| f.path.clone()).unwrap_or_default();
+            let format = if first.ends_with(".gguf") { library::Format::Gguf } else { library::Format::Safetensors };
+            app.models.start_download(&wake, &token, &d.repo, &d.file, d.files, d.fitted, first, format);
         }
     });
 }
