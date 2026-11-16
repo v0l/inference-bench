@@ -175,6 +175,7 @@ pub struct PrefixCache {
     tails: HashMap<Hash, Tail>,
     tails_by_parent: HashMap<Hash, Vec<Hash>>,
     order: BTreeSet<(u64, bool, Hash)>,
+    evictions: u64,
     tick: u64,
 }
 
@@ -189,8 +190,13 @@ impl PrefixCache {
             tails: HashMap::new(),
             tails_by_parent: HashMap::new(),
             order: BTreeSet::new(),
+            evictions: 0,
             tick: 0,
         }
+    }
+
+    pub fn evictions(&self) -> u64 {
+        self.evictions
     }
 
     pub fn blocks(&self) -> usize {
@@ -413,6 +419,7 @@ impl PrefixCache {
                 pool.refs(block) == 1
             })
             .copied();
+        self.evictions += u64::from(victim.is_some());
         match victim {
             Some((_, false, k)) => {
                 self.remove_tail(&k, pool);

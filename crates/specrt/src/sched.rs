@@ -547,6 +547,7 @@ pub struct PrefixStats {
     pub blocks: usize,
     pub snapshots: usize,
     pub snapshot_bytes: usize,
+    pub evictions: u64,
 }
 
 fn ewma(old: f64, new: f64) -> f64 {
@@ -585,6 +586,7 @@ impl<E: Executor> Scheduler<E> {
             blocks: c.map_or(0, |c| c.blocks()),
             snapshots: c.map_or(0, |c| c.snapshots()),
             snapshot_bytes: c.map_or(0, |c| c.snapshot_bytes()),
+            evictions: c.map_or(0, |c| c.evictions()),
         }
     }
 
@@ -1189,6 +1191,7 @@ mod tests {
         pub state_budget: usize,
         pub states_live: std::collections::HashSet<usize>,
         pub hybrid: bool,
+        pub light: bool,
         pub prefix_enabled: bool,
         pub restores: usize,
         pub block_copies: usize,
@@ -1225,6 +1228,7 @@ mod tests {
                 state_budget: usize::MAX,
                 states_live: Default::default(),
                 hybrid: true,
+                light: false,
                 prefix_enabled: true,
                 restores: 0,
                 block_copies: 0,
@@ -1250,6 +1254,9 @@ mod tests {
             }
             let h = if self.hybrid { mix(h, t) } else { 0 };
             self.state[slot] = (h, pos + 1);
+            if self.light {
+                return 0;
+            }
             let mut check = 0u64;
             for p in 0..=pos {
                 let b = self.tables[slot][p / PAGE] as usize;
@@ -2092,6 +2099,71 @@ mod tests {
         all.extend(got.get(&id).cloned().unwrap_or_default());
         assert_eq!(all, want);
         assert_eq!(s.blocks_live(), 0);
+    }
+
+    struct Window {
+        us_per_step: f64,
+        evictions_per_step: f64,
+        prefill_per_step: f64,
+        preemptions: u64,
+    }
+
+    fn host_cost_per_step(pool_blocks: usize, steps_each: usize) -> (Window, Window, usize) {
+        let mut fake = Fake::new(8192, 8, pool_blocks, 2048);
+        fake.light = true;
+        let cfg = Config { max_num_seqs: 8, prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: 2048, max_snapshots: 4, max_blocks: 0, async_snapshots: true }, ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        let mut next = 1u32;
+        let window = |s: &mut Scheduler<Fake>, steps: usize, next: &mut u32| {
+            let mut spent = Duration::ZERO;
+            let mut events = Vec::new();
+            let (evict0, pre0) = (s.prefix_stats().evictions, s.preemptions());
+            let mut prefill = 0;
+            for _ in 0..steps {
+                while s.waiting() + s.running() < 12 {
+                    *next += 1;
+                    let r = if *next % 10 == 0 { request(1000, 2000 + (*next as usize * 7919) % 4000, *next) } else { request(1200, 8 + (*next as usize * 31) % 40, *next) };
+                    s.submit(r).unwrap();
+                }
+                events.clear();
+                let t = Instant::now();
+                let report = s.step(&mut events).unwrap();
+                spent += t.elapsed();
+                prefill += report.prefill_tokens;
+            }
+            Window {
+                us_per_step: spent.as_secs_f64() * 1e6 / steps as f64,
+                evictions_per_step: (s.prefix_stats().evictions - evict0) as f64 / steps as f64,
+                prefill_per_step: prefill as f64 / steps as f64,
+                preemptions: s.preemptions() - pre0,
+            }
+        };
+        let early = window(&mut s, steps_each, &mut next);
+        let mut rounds = 0;
+        while s.blocks_used() * 100 < pool_blocks * 98 {
+            window(&mut s, 200, &mut next);
+            rounds += 1;
+            assert!(rounds < 3000, "the pool never filled");
+        }
+        let late = window(&mut s, steps_each, &mut next);
+        (early, late, s.prefix_stats().blocks)
+    }
+
+    #[test]
+    fn host_time_per_step_stays_flat_while_never_hit_cache_fills_the_pool() {
+        for pool in [10_900, 58_066] {
+            let (early, late, blocks) = host_cost_per_step(pool, 3000);
+            println!(
+                "pool {pool}: early {:.1} us/step, late {:.1} us/step; evictions/step {:.3} -> {:.3}; prefill tokens/step {:.0} -> {:.0}; preemptions {} -> {}; cached {blocks}",
+                early.us_per_step, late.us_per_step, early.evictions_per_step, late.evictions_per_step, early.prefill_per_step, late.prefill_per_step, early.preemptions, late.preemptions
+            );
+            assert!(
+                late.us_per_step < early.us_per_step * 1.5 + 5.0,
+                "pool {pool}: {:.1} us per step early, {:.1} us late with {blocks} blocks cached",
+                early.us_per_step,
+                late.us_per_step
+            );
+        }
     }
 
     #[test]
