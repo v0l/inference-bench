@@ -35,6 +35,8 @@ pub struct ServeArgs {
     pub itl_target_ms: Option<u64>,
     #[arg(long, help = "Prefill a whole prompt in one step when it is at most this many tokens (default 4096, 0 is off)")]
     pub whole_prompt_tokens: Option<usize>,
+    #[arg(long, help = "Prompt tokens prefilled every step beside decoders (default 512)")]
+    pub min_prefill_tokens: Option<usize>,
     #[arg(long, help = "Seconds before an idle model is unloaded")]
     pub idle_unload_secs: Option<u64>,
     #[arg(long, help = "Write an access log (JSON lines) here")]
@@ -79,6 +81,7 @@ impl ServeArgs {
         config.max_batched_tokens = self.max_batched_tokens.or(config.max_batched_tokens);
         config.itl_target_ms = self.itl_target_ms.or(config.itl_target_ms);
         config.whole_prompt_tokens = self.whole_prompt_tokens.or(config.whole_prompt_tokens);
+        config.min_prefill_tokens = self.min_prefill_tokens.or(config.min_prefill_tokens);
         if let Some(n) = self.idle_unload_secs {
             config.idle_unload_secs = Some(n);
         }

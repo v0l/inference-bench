@@ -392,6 +392,7 @@ pub struct Config {
     pub itl_target: Duration,
     pub reserve_blocks: Option<usize>,
     pub min_prefill_chunk: usize,
+    pub min_prefill_tokens: usize,
     pub whole_prompt_tokens: usize,
     pub prefix_cache: PrefixCacheOptions,
 }
@@ -404,6 +405,7 @@ impl Default for Config {
             itl_target: Duration::from_millis(100),
             reserve_blocks: None,
             min_prefill_chunk: 64,
+            min_prefill_tokens: 0,
             whole_prompt_tokens: 0,
             prefix_cache: PrefixCacheOptions::default(),
         }
@@ -732,11 +734,15 @@ impl<E: Executor> Scheduler<E> {
     fn admit(&mut self, budget: usize) -> Result<()> {
         let cap = self.cfg.max_num_seqs.min(self.exec.slots());
         let mut planned = 0;
+        let mut long_in_flight = self.running.iter().any(|s| s.prefill_target() - s.computed > budget);
         while let Some(s) = self.waiting.front() {
             if self.running.len() >= cap || self.free_slots.is_empty() || planned >= budget {
                 break;
             }
             let target = s.prefill_target();
+            if target > budget && long_in_flight {
+                break;
+            }
             let need = blocks_for(target + 1);
             let reserve = if self.running.is_empty() { 0 } else { self.reserve() };
             let hit = match self.cache.as_mut() {
@@ -797,7 +803,12 @@ impl<E: Executor> Scheduler<E> {
             s.slot = Some(slot);
             self.admissions += 1;
             s.admitted = self.admissions;
-            planned += target - s.computed;
+            let remaining = target - s.computed;
+            if remaining > budget {
+                long_in_flight = true;
+            } else {
+                planned += remaining;
+            }
             self.running.push(s);
         }
         Ok(())
@@ -887,12 +898,14 @@ impl<E: Executor> Scheduler<E> {
         if decodes == 0 {
             return full.max(align);
         }
+        let floor = self.cfg.min_prefill_tokens.div_ceil(align) * align;
         if self.prefill_rate <= 0.0 {
-            return align.min(full.max(1));
+            return align.max(floor).min(full.max(1));
         }
         let room = (self.cfg.itl_target.as_secs_f64() - self.decode_secs).max(0.0);
         let fit = (room * self.prefill_rate) as usize;
         let fit = if fit > align { fit / align * align } else { align };
+        let fit = fit.max(floor);
         let fit = fit.max(self.whole_prompt_remaining().unwrap_or(0));
         fit.min(full.max(align))
     }
@@ -905,9 +918,10 @@ impl<E: Executor> Scheduler<E> {
         let next = self
             .running
             .iter()
-            .find(|s| s.computed < s.prefill_target())
+            .filter(|s| s.computed < s.prefill_target())
             .map(|s| s.prefill_target() - s.computed)
-            .or_else(|| self.waiting.front().map(|s| s.prefill_target()))?;
+            .chain(self.waiting.iter().map(|s| s.prefill_target()))
+            .min()?;
         (next <= limit).then_some(next)
     }
 
@@ -971,7 +985,12 @@ impl<E: Executor> Scheduler<E> {
         let mut left = budget;
         let started = Instant::now();
         let limit = self.exec.chunk_limit();
-        for i in 0..self.running.len() {
+        let mut order: Vec<usize> = (0..self.running.len()).collect();
+        order.sort_by_key(|&i| {
+            let s = &self.running[i];
+            s.prefill_target().saturating_sub(s.computed)
+        });
+        for i in order {
             if left == 0 {
                 break;
             }
@@ -1047,7 +1066,7 @@ impl<E: Executor> Scheduler<E> {
         if report.prefill_tokens > 0 {
             self.exec.flush()?;
             report.prefill_secs = started.elapsed().as_secs_f64();
-            if report.prefill_tokens >= self.cfg.min_prefill_chunk {
+            if report.prefill_tokens >= self.cfg.min_prefill_chunk.max(self.cfg.min_prefill_tokens / 2) {
                 self.prefill_rate = ewma(self.prefill_rate, report.prefill_tokens as f64 / report.prefill_secs.max(1e-6));
             }
         }
@@ -1121,6 +1140,7 @@ mod tests {
         state: Vec<(u64, usize)>,
         chunk: usize,
         pub token_cost: Duration,
+        pub row_cost: Duration,
         pub decode_calls: Vec<usize>,
         pub prefill_calls: Vec<usize>,
         pub state_budget: usize,
@@ -1156,6 +1176,7 @@ mod tests {
                 state: vec![(0, 0); slots],
                 chunk,
                 token_cost: Duration::ZERO,
+                row_cost: Duration::ZERO,
                 decode_calls: Vec::new(),
                 prefill_calls: Vec::new(),
                 state_budget: usize::MAX,
@@ -1244,6 +1265,7 @@ mod tests {
             let mut seen = std::collections::HashSet::new();
             assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
             self.decode_calls.push(rows.len());
+            std::thread::sleep(self.row_cost * rows.len() as u32);
             let masks = std::mem::take(&mut self.masks);
             self.masked_calls += usize::from(!masks.is_empty());
             self.last_decode = rows.iter().enumerate().map(|(i, r)| constrain(next_token(self.write(r.slot, r.pos, r.token)), masks.get(i).unwrap_or(&None))).collect();
@@ -1882,6 +1904,81 @@ mod tests {
             }
         }
         assert!(worst < Duration::from_millis(90), "a {worst:?} gap after the first token");
+    }
+
+    struct LoadResult {
+        ttft: Vec<f64>,
+        step_p95: f64,
+    }
+
+    fn pct(v: &mut Vec<f64>, p: f64) -> f64 {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[((v.len() - 1) as f64 * p) as usize]
+    }
+
+    fn loaded(decoders: usize, cfg: Config) -> LoadResult {
+        let mut fake = Fake::new(65536, 32, 12000, 2048);
+        fake.token_cost = Duration::from_micros(20);
+        fake.row_cost = Duration::from_micros(1250);
+        let mut s = Scheduler::new(fake, cfg);
+        for q in 0..decoders as u32 {
+            s.submit(request(50, 100_000.min(60_000), q)).unwrap();
+        }
+        let mut events = Vec::new();
+        for _ in 0..6 {
+            s.step(&mut events).unwrap();
+        }
+        s.submit(request(20_000, 4, 900)).unwrap();
+        let mut submitted: HashMap<SeqId, Instant> = HashMap::new();
+        let mut ttft = Vec::new();
+        let mut steps = Vec::new();
+        let mut sent = 0;
+        for n in 0..3000 {
+            if n % 10 == 0 && sent < 8 {
+                let id = s.submit(request(1200, 2, 100 + sent)).unwrap();
+                submitted.insert(id, Instant::now());
+                sent += 1;
+            }
+            let mut ev = Vec::new();
+            let started = Instant::now();
+            let r = s.step(&mut ev).unwrap();
+            if r.decode_rows > 0 {
+                steps.push(started.elapsed().as_secs_f64());
+            }
+            for e in &ev {
+                if let Event::Token { id, .. } = e {
+                    if let Some(t) = submitted.remove(id) {
+                        ttft.push(t.elapsed().as_secs_f64());
+                    }
+                }
+            }
+            if sent == 8 && submitted.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(ttft.len(), 8, "every short prompt got a first token");
+        LoadResult { step_p95: pct(&mut steps, 0.95), ttft }
+    }
+
+    #[test]
+    fn short_prompts_get_a_first_token_quickly_behind_a_long_one_with_full_decoders() {
+        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(20), min_prefill_tokens: 512, whole_prompt_tokens: 4096, ..Config::default() };
+        let mut r = loaded(16, cfg);
+        let p95 = pct(&mut r.ttft, 0.95);
+        assert!(p95 < 0.2, "ttft p95 {p95:.3}s");
+        assert!(r.step_p95 <= 0.055, "step p95 {:.3}s", r.step_p95);
+    }
+
+    #[test]
+    #[ignore]
+    fn print_load_table() {
+        for decoders in [8usize, 16, 20] {
+            for (name, min) in [("floor64", 0usize), ("min512", 512)] {
+                let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(20), min_prefill_tokens: min, whole_prompt_tokens: 4096, ..Config::default() };
+                let mut r = loaded(decoders, cfg);
+                println!("decoders {decoders} {name}: ttft p50 {:.3} p95 {:.3} step p95 {:.4}", pct(&mut r.ttft, 0.5), pct(&mut r.ttft, 0.95), r.step_p95);
+            }
+        }
     }
 
     #[test]

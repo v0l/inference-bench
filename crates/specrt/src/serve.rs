@@ -52,6 +52,7 @@ pub struct ServeOptions {
     pub max_batched_tokens: usize,
     pub itl_target: Duration,
     pub whole_prompt_tokens: usize,
+    pub min_prefill_tokens: usize,
     pub runtime: Option<RuntimeOptions>,
     pub speculative: SpeculativeOptions,
     pub placement: Option<crate::placement::PlacementConfig>,
@@ -69,6 +70,7 @@ impl Default for ServeOptions {
             max_batched_tokens: 8192,
             itl_target: Duration::from_millis(100),
             whole_prompt_tokens: 4096,
+            min_prefill_tokens: 512,
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,
@@ -471,6 +473,7 @@ fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
         max_batched_tokens: opts.max_batched_tokens,
         itl_target: opts.itl_target,
         whole_prompt_tokens: opts.whole_prompt_tokens,
+        min_prefill_tokens: opts.min_prefill_tokens,
         prefix_cache: spec.runtime.prefix_cache,
         ..Config::default()
     }

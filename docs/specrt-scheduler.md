@@ -240,6 +240,26 @@ Defaults: `itl_target_ms` stays 100, `whole_prompt_tokens` 4096, `max_batch` uns
 (serving group) and in the server config (`whole_prompt_tokens`, `itl_target_ms`, `--whole-prompt-tokens`,
 `--itl-target-ms`). `RUST_LOG=inference_bench_specrt=debug` logs rows, MTP or plain, prefill tokens and step ms per step.
 
+## Guaranteed prefill share (#655)
+
+Under load the decode step alone fills `itl_target_ms`, so the budget left for prefill was the 64 token floor and a 1.2k prompt took about 20 steps (TTFT 3-5 s). Three changes in `sched.rs`:
+
+- `min_prefill_tokens` (default 512, `serve.min_prefill_tokens` in the options schema, `min_prefill_tokens` in the server config, `--min-prefill-tokens`): prompt tokens read every step beside decoders, whatever the decode step costs. 0 restores the old target-only behaviour.
+- `prefill_rate` is only updated from steps that read at least `max(min_prefill_chunk, min_prefill_tokens / 2)` tokens, so small steps no longer drag the EWMA down.
+- Short prompts go first: running prefills are served shortest-remaining-first, `whole_prompt_remaining` looks at the shortest unfinished prompt rather than the head, and a prompt larger than the step budget is not admitted while another long one is already in flight. The long prompt still gets the leftover budget every step, so it is slowed, not starved.
+
+Simulated (CPU, `Fake` engine, `print_load_table` in `sched.rs`: decode step 1.25 ms per row, prefill 20 us per token, itl_target 20 ms, N long decoders, one 20k prompt, then eight 1.2k prompts 10 steps apart; times are wall seconds of the simulation, a real 27B step is about 40x slower):
+
+| decoders | before TTFT p50 / p95 | after TTFT p50 / p95 | before step p95 | after step p95 |
+|---|---|---|---|---|
+| 8 | 3.86 / 4.15 | 0.035 / 0.035 | 0.013 | 0.035 |
+| 16 | 7.90 / 8.46 | 0.045 / 0.045 | 0.023 | 0.045 |
+| 20 | 9.68 / 10.36 | 0.050 / 0.050 | 0.028 | 0.050 |
+
+"Before" is `min_prefill_tokens = 0` and `whole_prompt_tokens = 0`. The cost is the decode step p95: it grows from about 0.65x to 2x `itl_target` (a step is decode plus 512 prompt tokens). The regression test `short_prompts_get_a_first_token_quickly_behind_a_long_one_with_full_decoders` asserts TTFT p95 under 0.2 s and step p95 at most 2.75x the target. On the 27B 512 tokens is about 0.1 s of prefill at the 5 ktok/s batched rate; lower `min_prefill_tokens` to 256 to trade TTFT for inter-token time.
+
+Real-27B A/B for the supervisor (GPU free, under `flock /tmp/gpu27.lock`, 20 slots, classify-shaped 1.2k prompts plus a few 10-20k agent prompts): run `crates/specrt/scripts/serve27b.sh` with `--min-prefill-tokens 0` then `512` (and 256), and drive it with `loadtest` at 16-20 concurrent; compare TTFT p50/p95, `inference_prefill_tokens_per_step` and per-request decode tok/s.
+
 ## #360 measurements
 
 Not measured on the real 27B: another process held 24 GB of the GPU next to vLLM's 51 GB (free
