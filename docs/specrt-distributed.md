@@ -133,3 +133,21 @@ The overlap does not pay on one GPU: both stages compete for the same SMs and me
 A `[[placement.devices]]` entry may set `host = "name"`. Neighbouring devices with the same host can form a tensor parallel group: the planner tries every tp that divides the host's run of GPUs and the q, kv and delta-net head counts of the spec. Per-layer bytes and FLOPs divide by tp, weights, KV and state are split per rank, and each layer adds two allreduces of `slots x hidden x 2` bytes over the peer link (`[placement.devices.peer]`, default the device `link`). Between hosts the plan stays a pipeline.
 
 `inference-bench plan --probe` measures peer copies between local GPUs (P2P, or host staged when P2P is off) and the round trip to devices with an `address`, and uses them unless `peer` is declared. Without `--objective` it prints both objectives; each stage shows `host / GPU 0+1 (tp 2)`, memory, step time, allreduce share and what bounds it. `Placement` and `Stage` are `Serialize` for the app's cluster preview. The serving path refuses a plan with tp above 1 until the engine can run one.
+
+## App cluster check (issue #657)
+
+CPU coverage: `cargo test -p inference-bench-specrt --test discovery --test host`, `cargo test -p inference-bench-core --lib cluster`, `cargo test -p inference-bench-ui`.
+
+GPU end to end (needs a free GPU, run under `flock /tmp/gpu27.lock`): two app instances on this machine with different data folders, sharing on in the second, Qwen3-0.6B split across both over loopback, text identical to a single runtime.
+
+```bash
+flock /tmp/gpu27.lock sh -c '
+A=$(mktemp -d); B=$(mktemp -d)
+echo "{\"cluster\":{\"share\":true}}" > $B/settings.json
+inference-bench-ui $B & PB=$!
+# in the first app: Hardware tab, wait for the peer, enter the code shown in the second, tick the peer, pick Qwen3-0.6B, split 14/14, Load
+inference-bench-ui $A
+kill $PB'
+```
+
+Then ask both the cluster and a single-runtime load of the same model the same greedy prompt (`temperature=0`, same `max_tokens`) and diff the text.

@@ -1963,3 +1963,34 @@ fn the_pipeline_section_names_each_stage_and_shows_a_lost_stage() {
     assert!(rows[2].contains("2.00 ms each"));
     assert!(rows[3].starts_with("lost: stage spark/gpu0 was lost"));
 }
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+fn screenshot_of_the_hardware_tab() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let d = dir("hw-shot");
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 1500.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
+        app.tab = Tab::Hardware;
+        app.logs = shared_logs();
+        let mut m = specrt::hardware::fake_gpus("desk", 2, true);
+        for g in &mut m.gpus {
+            g.free_bytes = 12 << 30;
+        }
+        m.interfaces = vec![specrt::hardware::NetInterface { name: "enp5s0".into(), ip: "192.168.1.5".parse().unwrap() }];
+        app.hardware.machine = Some(m);
+        app.hardware.peers.insert("spark".into(), fake_peer("spark", 14.0, false));
+        app.hardware.peers.insert("nuc".into(), fake_peer("nuc", 16.0, true));
+        app.settings.cluster.paired.insert("spark".into());
+        app.hardware.selection.peers.insert("spark".into());
+        app.library = vec![fixture_spec_model()];
+        app.hardware.model = "Qwen27".into();
+        app.hardware.ctx = 2048;
+        app
+    });
+    h.run();
+    h.run();
+    h.render().unwrap().save(out.join("hardware.png")).unwrap();
+}

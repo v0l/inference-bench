@@ -116,9 +116,10 @@ pub fn stage_rows(placement: &Placement, devices: &[DeviceConfig], local_host: &
             let device = devices.iter().find(|d| d.name == s.device_name);
             let hop = match device {
                 Some(d) => hop_label(previous, d, local_host),
-                None => String::new(),
+                None if previous.is_none() => "first stage".to_string(),
+                None => "group".to_string(),
             };
-            previous = device;
+            previous = device.or(previous);
             StageRow {
                 label: if s.tp > 1 { s.label() } else { hardware::display_name(&s.device_name) },
                 layers: format!("{}..{}", s.start, s.end),

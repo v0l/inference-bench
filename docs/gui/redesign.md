@@ -180,3 +180,17 @@ house palette; no bars, no measured line.
 5. Model bar.
 6. Rail of four, logs folded into server, placement on the server page.
 7. Icon, screenshots, README.
+
+## Hardware tab (issue #657)
+
+Rail: **chat**, **models**, **server**, **hardware**, **settings**. Everything on the page comes from specrt: GPUs and links from `specrt::hardware::probe` (cudarc driver API, `cuDeviceCanAccessPeer`, no `nvidia-smi`), peers from `cluster::decode_peer`, placement from `PlacementConfig::place`.
+
+![hardware](hardware.png)
+
+- **This machine**: host, RAM, one line per GPU (name, arch, total and free memory, bandwidth and TFLOP/s as the planner sees them), the link between each GPU pair (peer to peer or staged through host memory) and the network interfaces usable for mDNS.
+- **Cluster**: "Share this machine's GPU in a cluster" (off by default) with an interface picker. On announces `_inference-bench._tcp` with a versioned TXT record (`v=2`, host, app version, busy, serving, one `gN` entry per GPU). The peer list shows `host: 2 x GPU`, memory, idle or busy, and what it serves. A v1 stage announcement still decodes as a one-GPU peer.
+- **Pair**: the peer shows a short code (8 characters, 5 minutes, 3 tries). The coordinator types it; the key from `cluster.key` travels masked with an HMAC of the code, never over mDNS. Peers must be paired before they can be selected.
+- **Run a cluster**: pick a model, context and parallel requests, include or exclude each local and remote GPU. The preview shows both objectives: stage per `host / GPU n`, layer range, memory, step and hop time with the hop kind (peer copy, host staged, network), the slowest stage and the bottleneck. A stage the planner groups with tensor parallel is marked "needs tensor parallel (#658)" and cannot be loaded yet. Load starts local stage servers in process and asks each peer for its stages, then loads through `[placement.remote]` with the generated key file.
+- **Server tab**: a pipeline panel with per stage busy time, calls, tokens, hop time and bytes, and the lost stage by name.
+
+Two-instance GPU check (supervisor, GPU free, loopback): see `docs/specrt-distributed.md`, section "App cluster check".
