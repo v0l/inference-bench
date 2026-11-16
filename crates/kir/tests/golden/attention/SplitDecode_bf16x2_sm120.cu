@@ -240,7 +240,7 @@ constexpr int ATTN_UNROLL = 4;
 
 extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
                                      const int* block_table, const int* pos_ptr, int layer, float* part, int window) {
-    __shared__ float4 acc_s[ATTN_WARPS][GROUP][HEAD_DIM / 4];
+    __shared__ float4 acc_s[ATTN_WARPS][HEAD_DIM / 4];
     __shared__ float m_s[ATTN_WARPS][GROUP];
     __shared__ float l_s[ATTN_WARPS][GROUP];
     int kv_head = blockIdx.x;
@@ -323,26 +323,25 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
         }
 #pragma unroll
         for (int j = 0; j < ATTN_V4; j++)
-            if (lane + 32 * j < HEAD_DIM / 4) acc_s[warp][g][lane + 32 * j] = acc[g][j];
-    }
-    __syncthreads();
-    for (int idx = threadIdx.x; idx < GROUP * HEAD_DIM; idx += ATTN_BLOCK) {
-        int g = idx / HEAD_DIM;
-        int d = idx % HEAD_DIM;
-        float M = NEG_INF;
-        for (int w = 0; w < ATTN_WARPS; w++) M = fmaxf(M, m_s[w][g]);
-        float L = 0.0f, A = 0.0f;
-        for (int w = 0; w < ATTN_WARPS; w++) {
-            float c = m_s[w][g] == NEG_INF ? 0.0f : expf(m_s[w][g] - M);
-            L += l_s[w][g] * c;
-            A += ((const float*)acc_s[w][g])[d] * c;
+            if (lane + 32 * j < HEAD_DIM / 4) acc_s[warp][lane + 32 * j] = acc[g][j];
+        __syncthreads();
+        for (int d = threadIdx.x; d < HEAD_DIM; d += ATTN_BLOCK) {
+            float M = NEG_INF;
+            for (int w = 0; w < ATTN_WARPS; w++) M = fmaxf(M, m_s[w][g]);
+            float L = 0.0f, A = 0.0f;
+            for (int w = 0; w < ATTN_WARPS; w++) {
+                float c = m_s[w][g] == NEG_INF ? 0.0f : expf(m_s[w][g] - M);
+                L += l_s[w][g] * c;
+                A += ((const float*)acc_s[w])[d] * c;
+            }
+            float* dst = part + ((size_t)(kv_head * GROUP + g) * ATTN_SPLITS + split) * ATTN_PART;
+            dst[d] = A;
+            if (d == 0) {
+                dst[HEAD_DIM] = M;
+                dst[HEAD_DIM + 1] = L;
+            }
         }
-        float* dst = part + ((size_t)(kv_head * GROUP + g) * ATTN_SPLITS + split) * ATTN_PART;
-        dst[d] = A;
-        if (d == 0) {
-            dst[HEAD_DIM] = M;
-            dst[HEAD_DIM + 1] = L;
-        }
+        __syncthreads();
     }
 }
 

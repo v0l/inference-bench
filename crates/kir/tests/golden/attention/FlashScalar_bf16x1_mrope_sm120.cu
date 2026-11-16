@@ -1,13 +1,12 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
-// attention FlashScalar threads=128 smem=0
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }) }, kv_layers: 16, kv_planes: 1, kv_fp8: false, kv_f16_layers: 0, query_scale: 0.0625, softcap: 30.0, local_theta: 10000.0, local_rope: [false, true, false, false], bidirectional: false }
+// attention FlashScalar threads=128 smem=84224
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }) }, kv_layers: 16, kv_planes: 1, kv_fp8: false, kv_f16_layers: 0, query_scale: 0.0625, softcap: 30.0, local_theta: 10000.0, local_rope: [false, true, false, false] }
 constexpr int ROT = 64;
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = true;
 constexpr bool LOCAL_ROPE[] = { false, true, false, false };
 constexpr float LOCAL_THETA = 1e4f;
 constexpr float QUERY_SCALE = 6.25e-2f;
-constexpr bool BIDI = false;
 constexpr float SOFTCAP = 3e1f;
 constexpr float THETA = 1e7f;
 constexpr int ROPE_KIND = 0;
@@ -170,11 +169,6 @@ __device__ __forceinline__ float rope_position(const int* mm_meta, const int* mm
     return (float)(idx + mm_meta[2 * slot + 1]);
 }
 
-__device__ __forceinline__ int span_end(const int* mm_meta, const int* bidi, int mm_stride, int slot, int idx) {
-    if (!BIDI) return idx;
-    return idx < mm_meta[2 * slot] ? max(idx, bidi[(size_t)slot * mm_stride + idx]) : idx;
-}
-
 __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, const float* k_norm,
                                                bf16_t* k_cache, bf16_t* v_cache, const int* block_table,
                                                int pos, int layer, int head, int row,
@@ -232,10 +226,11 @@ constexpr int FA_OUT = HEAD_DIM / 8;
 
 extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache,
                                            const int* block_table, const int* pos_ptr, int layer, float* out, int tokens, int window) {
-    __shared__ float qs[FA_BQ][FA_STRIDE];
-    __shared__ float ks[FA_BK][FA_STRIDE];
-    __shared__ float vs[FA_BK][HEAD_DIM];
-    __shared__ float ps[FA_BQ][FA_BK + 1];
+    extern __shared__ __align__(16) float fa_smem[];
+    float (*qs)[FA_STRIDE] = (float (*)[FA_STRIDE])fa_smem;
+    float (*ks)[FA_STRIDE] = (float (*)[FA_STRIDE])(fa_smem + FA_BQ * FA_STRIDE);
+    float (*vs)[HEAD_DIM] = (float (*)[HEAD_DIM])(fa_smem + (FA_BQ + FA_BK) * FA_STRIDE);
+    float (*ps)[FA_BK + 1] = (float (*)[FA_BK + 1])(fa_smem + (FA_BQ + FA_BK) * FA_STRIDE + FA_BK * HEAD_DIM);
     int head = blockIdx.y;
     int kv_head = head / GROUP;
     int q0 = blockIdx.x * FA_BQ;

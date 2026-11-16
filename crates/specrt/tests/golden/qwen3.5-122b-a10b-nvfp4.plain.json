@@ -63,6 +63,11 @@
     "value_head_dim": 128,
     "conv_kernel": 4
   },
+  "mtp": {
+    "layers": 1,
+    "draft_tokens": 2,
+    "speculate": true
+  },
   "vision": {
     "config": {
       "depth": 27,

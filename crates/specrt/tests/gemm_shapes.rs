@@ -1,5 +1,5 @@
 use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
-use specrt::codegen::{Module, WeightKind, cuda_target, kernel_for};
+use specrt::codegen::{Module, WeightKind, cuda_target, select};
 use specrt::jit::Jit;
 use specrt::spec::Spec;
 use std::path::Path;
@@ -22,7 +22,7 @@ fn run(linear: &str, tokens: usize) -> f64 {
     let jit = Jit::new(ctx.clone(), std::env::temp_dir().join(format!("specrt-gemm-shapes-{}", std::process::id()))).unwrap();
     let loaded = jit.load(&module).unwrap();
     let stream = ctx.default_stream();
-    let choice = kernel_for(&spec, &target, linear, tokens, WeightKind::Bf16).unwrap();
+    let choice = select(&spec, &target, linear, tokens, WeightKind::Bf16).unwrap();
     let shape = specrt::codegen::linear_shape(&spec, linear);
     let (n, k) = (shape.n, shape.k);
     let kernel = loaded.function(&choice.name).unwrap();
