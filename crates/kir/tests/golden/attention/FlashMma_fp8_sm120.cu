@@ -1,6 +1,6 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
 // attention FlashMma threads=256 smem=98304
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: true, kv_f16_layers: 8, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false], bidirectional: false, nope: [false, false, true, false] }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, freq_factors: [], mrope: None }, kv_layers: 16, kv_planes: 1, kv_fp8: true, kv_f16_layers: 8, query_scale: 0.0625, softcap: 0.0, local_theta: 10000.0, local_rope: [false, true, false, false], bidirectional: false, nope: [false, false, true, false] }
 constexpr int ROT = 64;
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = true;
@@ -21,6 +21,7 @@ constexpr float ROPE_FACTOR = 1e0f;
 constexpr float ROPE_LOW_FREQ = 1e0f;
 constexpr float ROPE_HIGH_FREQ = 1e0f;
 constexpr float ROPE_ORIG_POS = 1e0f;
+constexpr float ROPE_FREQ_FACTORS[] = { 1.0f };
 constexpr float ROPE_MSCALE = 1e0f;
 constexpr int PAGE = 16;
 constexpr int ATTN_LAYERS = 16;
@@ -53,6 +54,8 @@ __device__ __forceinline__ float rope_inv_freq(int i, int layer) {
     } else if (ROPE_KIND == 3) {
         float ramp = fminf(fmaxf(((float)i - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ), 0.0f), 1.0f);
         inv_freq = ramp * inv_freq / ROPE_FACTOR + (1.0f - ramp) * inv_freq;
+    } else if (ROPE_KIND == 4) {
+        inv_freq /= ROPE_FREQ_FACTORS[i];
     }
     return inv_freq;
 }
