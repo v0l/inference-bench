@@ -1063,6 +1063,13 @@ fn adding_a_model_folder_saves_it_and_rescans() {
 }
 
 #[test]
+fn downloading_the_cuda_compiler_shows_megabytes_in_the_load_bar() {
+    let p = crate::LoadProgress { stage: "downloading the CUDA compiler".into(), done: 47_000_000, total: 95_436_000, weights_started: None };
+    assert_eq!(crate::modelbar::progress_text(&p), "downloading the CUDA compiler  47 / 95 MB");
+    assert!((crate::modelbar::progress_fraction(&p) - 0.49).abs() < 0.01);
+}
+
+#[test]
 fn no_model_loaded_disables_sending() {
     let mut h = harness("nomodel", Tab::Chat);
     h.run();

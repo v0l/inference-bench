@@ -1,5 +1,5 @@
 use crate::placement::{DeviceConfig, LinkConfig};
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, ensure};
 use std::net::IpAddr;
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -267,6 +267,18 @@ pub fn cuda_present() -> bool {
 
 pub fn nvrtc_present() -> bool {
     unsafe { cudarc::nvrtc::sys::is_culib_present() }
+}
+
+pub fn ensure_nvrtc(cache_dir: &std::path::Path) -> Result<()> {
+    if nvrtc_present() {
+        return Ok(());
+    }
+    if !cfg!(windows) {
+        return Err(anyhow!(nvrtc_missing_message()));
+    }
+    crate::nvrtc::provide(cache_dir, &crate::nvrtc::Source::nvidia_cuda_13()).map_err(|e| anyhow!("{} ({e:#})", nvrtc_missing_message()))?;
+    ensure!(nvrtc_present(), "{}", nvrtc_missing_message());
+    Ok(())
 }
 
 pub fn nvrtc_missing_message() -> String {

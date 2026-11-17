@@ -23,6 +23,7 @@ pub mod logprobs;
 pub mod media_encode;
 pub mod mtp;
 pub mod nvfp4;
+pub mod nvrtc;
 pub mod options;
 pub mod pairing;
 pub mod pipeline;

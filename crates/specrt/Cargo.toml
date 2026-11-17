@@ -18,6 +18,8 @@ wgpu = { version = "30", optional = true, default-features = false, features = [
 pollster = { version = "1", optional = true }
 anyhow.workspace = true
 getrandom = "0.3"
+ureq.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
 inference-bench-kir = { path = "../kir" }
 cudarc = { version = "0.19.10", default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-13000"] }
 dirs.workspace = true
@@ -40,3 +42,6 @@ tracing-subscriber.workspace = true
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 minijinja = { version = "2", features = ["json", "serde_json", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"

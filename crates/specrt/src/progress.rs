@@ -7,6 +7,7 @@ pub enum Stage {
     Kernels,
     Weights,
     KvCache,
+    CudaCompiler,
 }
 
 impl Stage {
@@ -15,6 +16,7 @@ impl Stage {
             Stage::Kernels => "compiling kernels",
             Stage::Weights => "reading weights",
             Stage::KvCache => "allocating KV cache",
+            Stage::CudaCompiler => "downloading the CUDA compiler",
         }
     }
 }

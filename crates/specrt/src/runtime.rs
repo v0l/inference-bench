@@ -793,7 +793,7 @@ impl Runtime {
         let max_ctx = layout.max_ctx;
         let batch = 1;
         let load_started = Instant::now();
-        ensure!(crate::hardware::nvrtc_present(), "{}", crate::hardware::nvrtc_missing_message());
+        crate::hardware::ensure_nvrtc(&spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir))?;
         let ctx = CudaContext::new(range.device).context("cuda init")?;
         let free_before = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         unsafe { ctx.disable_event_tracking() };

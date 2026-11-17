@@ -51,6 +51,8 @@ pub fn progress_text(p: &crate::LoadProgress) -> String {
     if p.stage == "reading weights" {
         let rate = if secs > 0.2 && p.done > 0 { format!("  {:.1} GB/s", p.done as f64 / secs / 1e9) } else { String::new() };
         format!("{}  {:.1} / {:.1} GB{rate}", p.stage, p.done as f64 / 1e9, p.total as f64 / 1e9)
+    } else if p.stage == "downloading the CUDA compiler" {
+        format!("{}  {:.0} / {:.0} MB", p.stage, p.done as f64 / 1e6, p.total as f64 / 1e6)
     } else {
         p.stage.clone()
     }
