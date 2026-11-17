@@ -1975,8 +1975,9 @@ mod tests {
 
     fn loaded(decoders: usize, cfg: Config) -> LoadResult {
         let mut fake = Fake::new(65536, 40, 12000, 2048);
-        fake.token_cost = Duration::from_micros(20);
-        fake.row_cost = Duration::from_micros(560);
+        let (token_cost, row_cost) = (Duration::from_micros(20), Duration::from_micros(560));
+        fake.token_cost = token_cost;
+        fake.row_cost = row_cost;
         let mut s = Scheduler::new(fake, cfg);
         for q in 0..decoders as u32 {
             s.submit(request(50, 60_000, q)).unwrap();
@@ -2008,10 +2009,9 @@ mod tests {
                 longs += 1;
             }
             let mut ev = Vec::new();
-            let started = Instant::now();
             let r = s.step(&mut ev).unwrap();
             if r.decode_rows > 0 {
-                steps.push(started.elapsed().as_secs_f64());
+                steps.push((token_cost * r.prefill_tokens as u32 + row_cost * r.decode_rows as u32).as_secs_f64());
             }
             if r.prefill_tokens > 0 && sent_at.values().any(|v| v.1) {
                 long_tokens += r.prefill_tokens;
