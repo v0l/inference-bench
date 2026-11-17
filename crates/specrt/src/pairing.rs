@@ -14,9 +14,9 @@ pub const MAX_ATTEMPTS: u32 = 3;
 pub const CODE_LIFETIME: Duration = Duration::from_secs(300);
 pub const KEY_BYTES: usize = 32;
 
-fn random(n: usize) -> Result<Vec<u8>> {
+pub fn random(n: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; n];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut out)).context("read /dev/urandom")?;
+    getrandom::fill(&mut out).map_err(|e| anyhow::anyhow!("system random source: {e}"))?;
     Ok(out)
 }
 
@@ -294,6 +294,16 @@ mod tests {
         let mut sealed = client.finish(&msg_b, &confirm_b, &key).unwrap();
         sealed.ciphertext[0] ^= 1;
         assert!(session.open(&sealed.confirm, &sealed.nonce, &sealed.ciphertext).is_err());
+    }
+
+    #[test]
+    fn randomness_comes_from_the_system_source_not_a_unix_device_file() {
+        let (a, b) = (random(32).unwrap(), random(32).unwrap());
+        assert_eq!((a.len(), b.len()), (32, 32));
+        assert_ne!(a, b);
+        assert!(a.iter().any(|x| *x != 0));
+        let source = include_str!("pairing.rs").to_string() + include_str!("wire.rs");
+        assert!(!source.contains(&format!("/dev/{}", "urandom")));
     }
 
     #[test]

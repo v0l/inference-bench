@@ -290,14 +290,7 @@ fn bind_addr(args: &LaunchArgs) -> String {
 }
 
 pub fn generate_key() -> String {
-    let mut bytes = [0u8; 24];
-    let filled = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut bytes)).is_ok();
-    if !filled {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        for (i, b) in bytes.iter_mut().enumerate() {
-            *b = (nanos >> ((i % 16) * 8)) as u8 ^ (std::process::id() as u8).wrapping_mul(i as u8 + 1);
-        }
-    }
+    let bytes = specrt::pairing::random(24).expect("the system random source");
     format!("sk-ib-{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 

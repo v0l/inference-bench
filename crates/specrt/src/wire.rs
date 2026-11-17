@@ -291,7 +291,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 fn fresh_nonce() -> Result<[u8; NONCE_BYTES]> {
     let mut nonce = [0u8; NONCE_BYTES];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut nonce)).context("read /dev/urandom")?;
+    nonce.copy_from_slice(&crate::pairing::random(NONCE_BYTES)?);
     Ok(nonce)
 }
 
