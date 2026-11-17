@@ -780,10 +780,12 @@ fn compressed_act(rule: &crate::family::FamilyQuant, g: &serde_json::Value) -> A
 
 fn compressed_group(rule: &crate::family::FamilyQuant, name: &str, g: &serde_json::Value, outer: &serde_json::Value) -> Result<Quant> {
     let mut g = g.clone();
-    if g.get("format").is_none()
-        && let Some(f) = outer.get("format")
-    {
-        g["format"] = f.clone();
+    for key in ["format", "quant_method"] {
+        if g.get(key).is_none()
+            && let Some(f) = outer.get(key)
+        {
+            g[key] = f.clone();
+        }
     }
     match crate::family::first_match(&rule.group_rules, &g) {
         Some(q) => Ok(q),
@@ -791,18 +793,111 @@ fn compressed_group(rule: &crate::family::FamilyQuant, name: &str, g: &serde_jso
     }
 }
 
-fn target_slot(rule: &crate::family::FamilyQuant, target: &str) -> Result<(usize, bool)> {
+struct Slot {
+    layer: usize,
+    module: String,
+}
+
+impl Slot {
+    fn is_mlp(&self, rule: &crate::family::FamilyQuant) -> bool {
+        self.module.starts_with(rule.mlp_marker.as_str())
+    }
+}
+
+fn target_slot(rule: &crate::family::FamilyQuant, target: &str) -> Result<Slot> {
     let rest = target
         .split_once(rule.layer_marker.as_str())
         .map(|(_, r)| r)
         .with_context(|| format!("quantisation target {target} is not a layer projection"))?;
     let (layer, module) = rest.split_once('.').context("layer target without a module")?;
     let layer: usize = layer.parse().with_context(|| format!("target {target}"))?;
-    Ok((layer, module.starts_with(rule.mlp_marker.as_str())))
+    Ok(Slot { layer, module: module.to_string() })
+}
+
+fn anchored(pattern: &str) -> Result<fancy_regex::Regex> {
+    fancy_regex::Regex::new(&format!("^(?:{pattern})")).with_context(|| format!("quantisation target pattern {pattern}"))
+}
+
+fn pattern_slots(rule: &crate::family::FamilyQuant, pattern: &str, ignore: &[fancy_regex::Regex], layers: usize) -> Result<Vec<Slot>> {
+    let re = anchored(pattern)?;
+    let mut slots = Vec::new();
+    for layer in 0..layers {
+        for module in &rule.projections {
+            let names: Vec<String> = rule.layer_prefixes.iter().map(|p| format!("{p}{layer}.{module}")).collect();
+            let hit = |r: &fancy_regex::Regex| names.iter().any(|n| r.is_match(n).unwrap_or(false));
+            if hit(&re) && !ignore.iter().any(hit) {
+                slots.push(Slot { layer, module: module.clone() });
+            }
+        }
+    }
+    Ok(slots)
+}
+
+fn ignore_patterns(q: &serde_json::Value) -> Result<Vec<fancy_regex::Regex>> {
+    let list = q["ignore"].as_array().map(Vec::as_slice).unwrap_or_default();
+    list.iter().filter_map(|i| i.as_str()?.strip_prefix("re:")).map(anchored).collect()
+}
+
+fn quant_groups(rule: &crate::family::FamilyQuant, q: &serde_json::Value) -> Result<serde_json::Map<String, serde_json::Value>> {
+    if !rule.layers_key.is_empty()
+        && let Some(layers) = q[rule.layers_key.as_str()].as_object()
+    {
+        let mut groups = serde_json::Map::new();
+        for (module, spec) in layers {
+            let algo = spec["quant_algo"].as_str().with_context(|| format!("{module} has no quant_algo"))?;
+            let mut key = algo.to_string();
+            if let Some(size) = spec["group_size"].as_u64() {
+                key.push_str(&format!("/g{size}"));
+            }
+            let group = groups.entry(key).or_insert_with(|| {
+                let mut g = spec.clone();
+                g["targets"] = serde_json::json!([]);
+                g["quant_method"] = q[rule.method_key.as_str()].clone();
+                g
+            });
+            group["targets"].as_array_mut().unwrap().push(module.clone().into());
+        }
+        return Ok(groups);
+    }
+    Ok(q[rule.groups_key.as_str()].as_object().context("the quantisation config has no groups")?.clone())
+}
+
+fn group_slots(rule: &crate::family::FamilyQuant, q: &serde_json::Value, g: &serde_json::Value, layers: usize) -> Result<Vec<(String, Slot)>> {
+    let ignore = ignore_patterns(q)?;
+    let mut out = Vec::new();
+    for t in g["targets"].as_array().context("group without targets")? {
+        let t = t.as_str().context("target is not a string")?;
+        if rule.skip_targets.iter().any(|s| s == t) {
+            continue;
+        }
+        if let Some(pattern) = t.strip_prefix("re:") {
+            out.extend(pattern_slots(rule, pattern, &ignore, layers)?.into_iter().map(|s| (t.to_string(), s)));
+        } else {
+            out.push((t.to_string(), target_slot(rule, t)?));
+        }
+    }
+    Ok(out)
+}
+
+pub fn module_quants(json: &str) -> Result<Vec<(usize, String, Quant)>> {
+    let value: serde_json::Value = serde_json::from_str(json)?;
+    let layers = value["num_hidden_layers"].as_u64().or_else(|| value["text_config"]["num_hidden_layers"].as_u64()).context("config.json has no num_hidden_layers")? as usize;
+    let q = value.get("quantization_config").context("config.json has no quantization_config")?;
+    let family = crate::family::active();
+    let rule = &family.describing()?.quantization;
+    let mut out = Vec::new();
+    for (name, g) in quant_groups(rule, q)? {
+        let quant = compressed_group(rule, &name, &g, q)?;
+        for (_, slot) in group_slots(rule, q, &g, layers)? {
+            out.push((slot.layer, slot.module, quant));
+        }
+    }
+    out.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+    Ok(out)
 }
 
 fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, layers: usize) -> Result<Quantization> {
-    let groups = q[rule.groups_key.as_str()].as_object().context("the quantisation config has no groups")?;
+    let groups = quant_groups(rule, q)?;
     let mut projection: Option<Quant> = None;
     let mut act = ActQuant::None;
     let mut mlp_act = ActQuant::None;
@@ -815,21 +910,24 @@ fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, la
             return Ok(Quantization { quant, mlp: None, act, mlp_act: ActQuant::None });
         }
     }
-    for (name, g) in groups {
+    for (name, g) in &groups {
         let quant = compressed_group(rule, name, g, q)?;
         let group_act = compressed_act(rule, g);
-        for t in g["targets"].as_array().context("group without targets")? {
-            let t = t.as_str().context("target is not a string")?;
-            let (layer, is_mlp) = target_slot(rule, t)?;
-            ensure!(layer < layers, "target {t} is past the last layer");
-            if is_mlp {
-                ensure!(mlp[layer].is_none_or(|m| m == quant), "{t} is in two groups");
+        for (t, slot) in group_slots(rule, q, g, layers)? {
+            ensure!(slot.layer < layers, "target {t} is past the last layer");
+            let layer = slot.layer;
+            if slot.is_mlp(rule) {
+                ensure!(mlp[layer].is_none_or(|m| m == quant), "layer {layer} {} is in two groups", slot.module);
                 mlp[layer] = Some(quant);
                 if quant == Quant::Nvfp4G16 {
                     mlp_act = group_act;
                 }
             } else {
-                ensure!(projection.is_none_or(|p| p == quant), "attention projections mix {projection:?} and {quant:?}");
+                ensure!(
+                    projection.is_none_or(|p| p == quant),
+                    "layer {layer} {} is {quant:?} but other attention projections are {projection:?}",
+                    slot.module
+                );
                 projection = Some(quant);
                 act = group_act;
             }
@@ -864,7 +962,8 @@ fn parse_quantization(rule: &crate::family::FamilyQuant, value: Option<&serde_js
         return Ok(Quantization::weights(Quant::Bf16));
     };
     let method = q.get(rule.method_key.as_str()).and_then(|m| m.as_str()).unwrap_or("");
-    if rule.grouped_methods.iter().any(|m| m == method) {
+    let has_groups = q.get(rule.groups_key.as_str()).is_some_and(|g| g.is_object()) || q.get(rule.layers_key.as_str()).is_some_and(|g| g.is_object());
+    if rule.grouped_methods.iter().any(|m| m == method) && (has_groups || crate::family::first_match(&rule.flat_rules, q).is_none()) {
         return parse_compressed(rule, q, layers);
     }
     match crate::family::first_match(&rule.flat_rules, q) {

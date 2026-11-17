@@ -342,9 +342,8 @@ impl Checkpoint {
         if let Some(g) = &self.gguf {
             return self.gguf_raw(g, weight, rows, cols);
         }
-        if !self.has(weight)
-            && let Some(module) = weight.strip_suffix(".weight")
-            && self.has(&format!("{module}.weight_packed"))
+        if let Some(module) = weight.strip_suffix(".weight")
+            && self.is_fp4(module)
         {
             let fp4 = self.fp4(module, rows, cols)?;
             let w = (0..rows).flat_map(|r| fp4.dequant_row(r)).map(f32_to_bf16).collect();
@@ -358,7 +357,11 @@ impl Checkpoint {
         let kb = cols.div_ceil(FP8_BLOCK);
         let channel = format!("{weight}_scale");
         if !self.has(&format!("{weight}_scale_inv")) && self.has(&channel) {
-            let per_row = self.floats(&channel, &[rows, 1])?;
+            let per_row = if self.view(&channel)?.shape.iter().product::<usize>() == 1 {
+                vec![self.floats(&channel, &self.view(&channel)?.shape)?[0]; rows]
+            } else {
+                self.floats(&channel, &[rows, 1])?
+            };
             let grid = per_row.iter().flat_map(|&s| std::iter::repeat_n(s, kb)).collect();
             let map = (0..rows).map(|r| (r * kb) as u32).collect();
             return Ok(Raw::Fp8 { w: Cow::Borrowed(v.data), grid, map, cols });
@@ -1019,15 +1022,37 @@ impl Checkpoint {
         })
     }
 
+    fn is_fp4(&self, module: &str) -> bool {
+        self.has(&format!("{module}.weight_packed"))
+            || (self.has(&format!("{module}.weight_scale_2")) && self.view(&format!("{module}.weight")).is_ok_and(|v| v.dtype == Dtype::U8))
+    }
+
+    fn scalar(&self, name: &str) -> Result<f32> {
+        let shape = self.view(name)?.shape;
+        ensure!(shape.iter().product::<usize>() == 1, "{name} has shape {shape:?}, expected one value");
+        Ok(self.floats(name, &shape)?[0])
+    }
+
+    fn global_scale(&self, module: &str, divisor: &str, multiplier: &str) -> Result<Option<f32>> {
+        if self.has(&format!("{module}.{divisor}")) {
+            return Ok(Some(self.scalar(&format!("{module}.{divisor}"))?));
+        }
+        if self.has(&format!("{module}.{multiplier}")) {
+            return Ok(Some(1.0 / self.scalar(&format!("{module}.{multiplier}"))?));
+        }
+        Ok(None)
+    }
+
     pub fn fp4(&self, module: &str, rows: usize, cols: usize) -> Result<crate::nvfp4::Fp4<'_>> {
         use crate::nvfp4::GROUP;
-        let packed = self.shaped(&format!("{module}.weight_packed"), &[rows, cols / 2])?;
-        ensure!(packed.dtype == Dtype::U8, "{module}.weight_packed is {:?}, expected U8", packed.dtype);
+        let weight = if self.has(&format!("{module}.weight_packed")) { format!("{module}.weight_packed") } else { format!("{module}.weight") };
+        let packed = self.shaped(&weight, &[rows, cols / 2])?;
+        ensure!(packed.dtype == Dtype::U8, "{weight} is {:?}, expected U8", packed.dtype);
         let scales = self.shaped(&format!("{module}.weight_scale"), &[rows, cols / GROUP])?;
         ensure!(scales.dtype == Dtype::F8_E4M3, "{module}.weight_scale is {:?}, expected F8_E4M3", scales.dtype);
-        let global = self.floats(&format!("{module}.weight_global_scale"), &[1])?[0];
+        let global = self.global_scale(module, "weight_global_scale", "weight_scale_2")?.with_context(|| format!("{module} has no weight_global_scale or weight_scale_2"))?;
         let mut m = crate::nvfp4::Fp4::new(Cow::Borrowed(packed.data), Cow::Borrowed(scales.data), global, rows, cols)?;
-        m.input_global = self.floats(&format!("{module}.input_global_scale"), &[1])?[0];
+        m.input_global = self.global_scale(module, "input_global_scale", "input_scale")?.unwrap_or(0.0);
         Ok(m)
     }
 

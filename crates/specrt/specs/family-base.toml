@@ -31,7 +31,11 @@ original_max_positions = "original_max_position_embeddings"
 
 [quantization]
 method_key = "quant_method"
-grouped_methods = ["compressed-tensors"]
+grouped_methods = ["compressed-tensors", "modelopt"]
+layers_key = "quantized_layers"
+layer_prefixes = ["model.language_model.layers.", "model.layers."]
+projections = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.out_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"]
+skip_targets = ["lm_head"]
 groups_key = "config_groups"
 all_linear_target = "Linear"
 layer_marker = "layers."
@@ -47,6 +51,18 @@ when = { format = "float-quantized", "weights.type" = "float", "weights.num_bits
 quant = "nvfp4_g16"
 when = { format = "nvfp4-pack-quantized", "weights.type" = "float", "weights.num_bits" = 4, "weights.strategy" = "tensor_group", "weights.symmetric" = true, "weights.group_size" = 16 }
 
+[[quantization.group_rules]]
+quant = "fp8_channel"
+when = { quant_method = "modelopt", quant_algo = "FP8" }
+
+[[quantization.group_rules]]
+quant = "nvfp4_g16"
+when = { quant_method = "modelopt", quant_algo = { any = ["NVFP4", "W4A16_NVFP4"] }, group_size = 16 }
+
+[[quantization.flat_rules]]
+quant = "fp8_channel"
+when = { quant_method = "modelopt", quant_algo = "FP8" }
+
 [[quantization.flat_rules]]
 quant = "fp8_block128"
 when = { quant_method = "fp8", fmt = "e4m3", weight_block_size = [128, 128] }
@@ -59,6 +75,10 @@ when = { "input_activations.type" = "float", "input_activations.dynamic" = { any
 [[quantization.act_rules]]
 act = "fp4"
 when = { "input_activations.type" = "float", "input_activations.dynamic" = { any = [true, "local"] }, "input_activations.num_bits" = 4, "input_activations.strategy" = "tensor_group", "input_activations.group_size" = 16 }
+
+[[quantization.act_rules]]
+act = "fp4"
+when = { quant_method = "modelopt", quant_algo = "NVFP4" }
 
 [blocks]
 other_layer_type = "full"

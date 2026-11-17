@@ -642,3 +642,41 @@ fn mtp_head_quant_defaults_to_the_target_head_and_validates() {
     bad.mtp.as_mut().unwrap().head_quant = Some(Quant::Q8);
     assert!(bad.validate().unwrap_err().to_string().contains("[mtp] head_quant"));
 }
+
+fn core_fixture(name: &str) -> String {
+    std::fs::read_to_string(root().join("../core/tests/fixtures/hf").join(name)).unwrap()
+}
+
+fn kinds(json: &str) -> std::collections::BTreeMap<(usize, String), Quant> {
+    specrt::spec::module_quants(json).unwrap().into_iter().map(|(l, m, q)| ((l, m), q)).collect()
+}
+
+#[test]
+fn compressed_tensors_regex_targets_resolve_to_per_layer_dtypes() {
+    let json = core_fixture("primitive-ai-config.json");
+    let refusal = Spec::from_hf_config_serving(&json).unwrap_err().to_string();
+    assert!(refusal.contains("layer 8 linear_attn.in_proj_qkv") && refusal.contains("Nvfp4G16"), "{refusal}");
+    let k = kinds(&json);
+    let at = |l: usize, m: &str| k.get(&(l, m.to_string())).copied();
+    assert_eq!(at(3, "self_attn.q_proj"), Some(Quant::Fp8Channel));
+    assert_eq!(at(5, "linear_attn.in_proj_qkv"), Some(Quant::Fp8Channel));
+    assert_eq!(at(9, "linear_attn.in_proj_qkv"), Some(Quant::Nvfp4G16));
+    assert_eq!(at(9, "linear_attn.out_proj"), Some(Quant::Fp8Channel));
+    assert_eq!(at(0, "mlp.up_proj"), Some(Quant::Nvfp4G16));
+    assert_eq!(at(0, "linear_attn.in_proj_a"), None);
+}
+
+#[test]
+fn modelopt_mixed_config_maps_quant_algos_to_the_same_kernels() {
+    let json = core_fixture("darkstar-config.json");
+    let spec = Spec::from_hf_config_serving(&json).unwrap();
+    assert_eq!(spec.quant, Quant::Fp8Channel);
+    assert_eq!((spec.mlp.quant, spec.mlp.quant_until), (Some(Quant::Nvfp4G16), None));
+    assert_eq!(spec.mlp.act_quant, specrt::spec::ActQuant::None);
+    let k = kinds(&json);
+    assert_eq!(k[&(0, "linear_attn.out_proj".to_string())], Quant::Fp8Channel);
+    assert_eq!(k[&(63, "self_attn.o_proj".to_string())], Quant::Fp8Channel);
+    assert_eq!(k[&(63, "mlp.down_proj".to_string())], Quant::Nvfp4G16);
+    let nvfp4 = Spec::from_hf_config_serving(&core_fixture("nvfp4-qwen3.8-27b-config.json")).unwrap();
+    assert_eq!((nvfp4.quant, nvfp4.mlp.quant), (Quant::Fp8Channel, Some(Quant::Nvfp4G16)));
+}
