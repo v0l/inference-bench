@@ -223,6 +223,32 @@ impl LoadDialog {
         self.holds_one_request() && self.estimate(free).is_none_or(|e| e.fits() != Some(false))
     }
 
+    pub fn plan_context(&self) -> Option<usize> {
+        let a = self.anatomy()?;
+        Some(pool_tokens(a, self.kv_bytes()?).min(self.max).div_ceil(self.seqs.max(1)).max(1))
+    }
+
+    pub fn spread(&self, gpus: &[u64]) -> Option<Result<specrt::placement::Placement, String>> {
+        if gpus.len() < 2 {
+            return None;
+        }
+        let v = self.view.as_ref().ok()?;
+        let a = self.anatomy()?;
+        let per_slot = self.plan_context()?;
+        let mut spec = v.spec.clone();
+        spec.runtime.kv_dtype = self.kv_dtype();
+        spec.runtime.kv_f16_layers = self.choice.value("runtime.kv_f16_layers").as_u64().map(|n| n as usize);
+        let devices = inference_bench_core::discover::pool_devices(gpus);
+        Some(inference_bench_core::discover::place_on(&spec, a.total_bytes, a.kv_bytes_per_token, per_slot, self.seqs, &devices).map_err(|e| format!("{e:#}")))
+    }
+
+    pub fn can_load_on(&self, gpus: &[u64]) -> bool {
+        match self.spread(gpus) {
+            Some(placed) => self.holds_one_request() && placed.is_ok(),
+            None => self.can_load(gpus.first().copied()),
+        }
+    }
+
     pub fn kv_bytes(&self) -> Option<u64> {
         self.anatomy().map(|a| pool_bytes(a, self.ctx, self.seqs, self.kv_gb))
     }
@@ -260,9 +286,11 @@ impl LoadDialog {
 
 pub fn modal(app: &mut App, ctx: &egui::Context) {
     let Some(mut dialog) = app.load.take() else { return };
+    let gpus = app.free_gpu_list();
     let free = app.free_gpu_bytes();
     dialog.sync();
     let est = dialog.estimate(free);
+    let spread = dialog.spread(&gpus);
     let (mut go, mut close) = (false, false);
     let r = egui::Modal::new(egui::Id::new("load-model"))
         .backdrop_color(egui::Color32::from_black_alpha(150))
@@ -273,6 +301,10 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                 status(ui, false, e);
                 note(ui, "The engine will read the model itself and report what is wrong.", LEGEND);
             }
+            let body_w = ui.available_width();
+            let body_h = (ui.ctx().content_rect().height() - 200.0).clamp(200.0, 900.0);
+            egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(body_h).show(ui, |ui| {
+            ui.set_max_width(body_w);
             section(ui, "profile", "one switch for the measured best, or for the least memory", |ui| {
                 let mut pick = if dialog.choice.is_custom() { ProfilePick::Custom } else { ProfilePick::Profile(dialog.choice.profile) };
                 let before = pick;
@@ -289,7 +321,7 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                 }
                 match dialog.choice.profile {
                     Profile::MaxPerformance if !dialog.choice.is_custom() => hint(ui, "MTP, CUDA graphs, fused kernels, the fast loader and the prefix cache are on."),
-                    Profile::LowMemory if !dialog.choice.is_custom() => hint(ui, "No MTP draft head copy, a small loader budget and no prefix cache snapshots."),
+                    Profile::LowMemory if !dialog.choice.is_custom() => hint(ui, "fp8 KV cache, 2 parallel requests, smaller batches and prefill chunks, no MTP draft head, no prefix cache, small loader and image budgets."),
                     _ => hint(ui, &format!("{} advanced option(s) changed from the profile.", dialog.choice.overrides.len())),
                 }
             });
@@ -356,6 +388,16 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                     let total = if e.fits() == Some(false) { total.value(human_size(e.total())).tint(FAULT) } else { total.value(human_size(e.total())) };
                     total.show(ui);
                     match e.free {
+                        Some(f) if gpus.len() > 1 => {
+                            let label = format!("free on {} gpus", gpus.len());
+                            let r = Line::new().legend(&label).column(ui, 120.0).measured(human_size(f)).show(ui);
+                            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
+                            match &spread {
+                                Some(Ok(p)) => status(ui, true, &format!("fits across {} gpus in {} stage(s)", gpus.len(), p.stages.len())),
+                                Some(Err(why)) => status(ui, false, &format!("does not fit across {} gpus: {why}", gpus.len())),
+                                None => {}
+                            }
+                        }
                         Some(f) => {
                             Line::new().legend("free on the gpu").column(ui, 120.0).measured(human_size(f)).show(ui);
                             match e.fits() {
@@ -377,16 +419,13 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                 hint(ui, "every engine option, with its default");
             });
             if dialog.advanced {
-                let w = ui.available_width();
-                egui::ScrollArea::vertical().auto_shrink([false, true]).max_height((ui.ctx().content_rect().height() * 0.45).clamp(240.0, 560.0)).show(ui, |ui| {
-                    ui.set_max_width(w);
-                    advanced_groups(ui, &mut dialog);
-                });
+                advanced_groups(ui, &mut dialog);
             }
             ui.add_space(8.0);
             switch(ui, "remember for this model", &mut dialog.remember, "use this context and parallel requests next time", "Saved with the app settings, per model.");
+            });
             footer(ui, |ui| {
-                if ui.add_enabled(dialog.can_load(free), Key::new("load").solid(READOUT).min_width(100.0)).clicked() {
+                if ui.add_enabled(dialog.can_load_on(&gpus), Key::new("load").solid(READOUT).min_width(100.0)).clicked() {
                     go = true;
                 }
                 if ui.add(Key::new("cancel").outline(VALUE).min_width(100.0)).clicked() {
@@ -412,7 +451,14 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
         }
         app.chat.load_error = None;
         let kv = dialog.view.is_ok().then(|| dialog.kv_bytes()).flatten().filter(|_| dialog.seqs > 1);
-        app.load_model_named(&model, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone());
+        let spans = matches!(&spread, Some(Ok(p)) if p.stages.len() > 1);
+        let outcome = if spans { crate::hardware::load_spanning(app, &model, dialog.plan_context().unwrap_or(dialog.ctx), dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone()) } else {
+            app.load_model_named(&model, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone());
+            Ok(())
+        };
+        if let Err(e) = outcome {
+            app.notice = Some((false, e));
+        }
         if app.tab == Tab::Models {
             app.tab = Tab::Chat;
         }

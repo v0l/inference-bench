@@ -1,3 +1,4 @@
+mod working;
 mod chat;
 mod breakdown;
 mod table;
@@ -125,12 +126,19 @@ impl App {
         self.engine.loaded()
     }
 
+    pub fn gpu_enabled(&self, ordinal: usize) -> bool {
+        let host = self.hardware.machine.as_ref().map_or_else(specrt::hardware::host_name, |m| m.host.clone());
+        let name = specrt::hardware::device_name(&host, ordinal);
+        !self.settings.cluster.disabled_gpus.contains(&name)
+    }
+
     pub fn free_gpu_list(&self) -> Vec<u64> {
-        self.gpu.iter().map(|g| g.available_bytes()).collect()
+        self.gpu.iter().enumerate().filter(|(i, _)| self.gpu_enabled(*i)).map(|(_, g)| g.available_bytes()).collect()
     }
 
     pub fn free_gpu_bytes(&self) -> Option<u64> {
-        self.gpu.first().map(|g| g.available_bytes())
+        let list = self.free_gpu_list();
+        (!list.is_empty()).then(|| list.iter().sum())
     }
 
     pub fn open_load_dialog(&mut self, model: &LocalModel) {

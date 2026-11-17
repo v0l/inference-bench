@@ -3,22 +3,15 @@ use crate::job::Pending;
 use crate::shell::page;
 use eframe::egui;
 use egui_bench::prelude::*;
-use inference_bench_core::cluster::{Preview, Prepared, Run, Selection, StageRow, bottleneck, candidate_devices, preview, runnable_plan, stage_rows, tp_line};
+use inference_bench_core::cluster::{Prepared, Run, Selection, candidate_devices, runnable_plan};
 use inference_bench_core::engine::Command;
 use inference_bench_core::library::human_size;
 use specrt::cluster::Peer;
 use specrt::discovery::{PeerBrowser, PeerEvent};
-use specrt::hardware::{Machine, display_name};
+use specrt::hardware::{GpuInfo, Machine, display_name};
 use specrt::host::{Host, HostConfig};
-use specrt::placement::{DeviceConfig, Objective};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
-
-pub struct Shown {
-    key: String,
-    pub preview: Result<Preview, String>,
-    pub devices: Vec<DeviceConfig>,
-}
 
 pub struct HardwareState {
     pub auto: bool,
@@ -31,11 +24,6 @@ pub struct HardwareState {
     host_sig: Option<(bool, String)>,
     browser: Option<PeerBrowser>,
     pub peers: BTreeMap<String, Peer>,
-    pub selection: Selection,
-    pub model: String,
-    pub ctx: usize,
-    pub slots: usize,
-    pub objective: Objective,
     pub pair_input: BTreeMap<String, String>,
     pub pair_notice: Option<(bool, String)>,
     pub code: Option<String>,
@@ -43,7 +31,6 @@ pub struct HardwareState {
     pub run_label: Option<String>,
     pub slot: inference_bench_core::cluster::ClusterSlot,
     announced: Option<String>,
-    pub shown: Option<Shown>,
 }
 
 impl Default for HardwareState {
@@ -59,11 +46,6 @@ impl Default for HardwareState {
             host_sig: None,
             browser: None,
             peers: BTreeMap::new(),
-            selection: Selection::default(),
-            model: String::new(),
-            ctx: 8192,
-            slots: 1,
-            objective: Objective::Latency,
             pair_input: BTreeMap::new(),
             pair_notice: None,
             code: None,
@@ -71,12 +53,15 @@ impl Default for HardwareState {
             run_label: None,
             slot: Default::default(),
             announced: None,
-            shown: None,
         }
     }
 }
 
 impl HardwareState {
+    pub fn selection(&self, settings: &inference_bench_core::settings::ClusterSettings) -> Selection {
+        Selection { peers: settings.peers_in_use.clone(), excluded: settings.disabled_gpus.clone() }
+    }
+
     pub fn with_slot(slot: inference_bench_core::cluster::ClusterSlot) -> Self {
         Self { slot, ..Self::default() }
     }
@@ -94,33 +79,54 @@ impl HardwareState {
     }
 }
 
-pub fn gpu_lines(m: &Machine) -> Vec<String> {
-    m.gpus
-        .iter()
-        .map(|g| {
-            format!(
-                "GPU {}  {}  {}  {} total  {} free  {:.0} GB/s  {:.0} TFLOP/s",
-                g.ordinal,
-                g.label(),
-                g.arch(),
-                human_size(g.total_bytes),
-                human_size(g.free_bytes),
-                g.bandwidth_gbs,
-                g.tflops
-            )
-        })
-        .collect()
+fn tag(ui: &mut egui::Ui, text: &str, tint: egui::Color32, lit: bool) {
+    let r = chip(ui, text, tint, lit);
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text));
 }
 
-pub fn link_lines(m: &Machine) -> Vec<String> {
-    m.links.iter().map(|l| format!("GPU {} and GPU {}: {}", l.a, l.b, l.kind.label())).collect()
+fn spoken(r: egui::Response, text: String) {
+    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text.clone()));
 }
 
-pub fn peer_line(p: &Peer) -> String {
-    let state = if p.busy { "busy" } else { "idle" };
-    let serving = p.serving.as_deref().map_or(String::new(), |s| format!(", serving {s}"));
-    let address = p.control.as_deref().unwrap_or("no address");
-    format!("{}  {:.0} GB  {state}{serving}  {address}", p.summary(), p.memory_gib() * 1.073_741_824)
+fn peer_row(ui: &mut egui::Ui, p: &Peer) {
+    ui.horizontal(|ui| {
+        let r = Line::new().value(p.summary()).gap(10.0).measured(format!("{:.0} GB", p.memory_gib() * 1.073_741_824)).show(ui);
+        spoken(r, format!("{}  {:.0} GB", p.summary(), p.memory_gib() * 1.073_741_824));
+        tag(ui, if p.busy { "busy" } else { "idle" }, if p.busy { WARN } else { OK }, true);
+        if let Some(s) = &p.serving {
+            let text = format!("serving {s}");
+            let r = Line::new().note(text.clone()).show(ui);
+            spoken(r, text);
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let address = p.control.as_deref().unwrap_or("no address");
+            let r = Line::new().note(address).show(ui);
+            spoken(r, address.to_string());
+        });
+    });
+}
+
+fn gpu_card(ui: &mut egui::Ui, g: &GpuInfo, on: bool) {
+    let used = g.total_bytes.saturating_sub(g.free_bytes);
+    card(
+        ui,
+        if on { Some(TRACE) } else { None },
+        |ui| {
+            let r = Line::new().legend(&format!("gpu {}", g.ordinal)).gap(10.0).value(g.label()).show(ui);
+            spoken(r, format!("GPU {}  {}", g.ordinal, g.label()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| tag(ui, &g.arch(), LEGEND, false));
+        },
+        |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
+            bar(&ui.painter_at(rect), rect, used as f32 / g.total_bytes.max(1) as f32, TRACE);
+            let free = format!("{} free of {}", human_size(g.free_bytes), human_size(g.total_bytes));
+            let r = Line::new().legend("memory").measured(format!("{} used", human_size(used))).gap(10.0).note(free.clone()).show(ui);
+            spoken(r, free);
+            let speed = format!("{:.0} GB/s  {:.0} TFLOP/s", g.bandwidth_gbs, g.tflops);
+            let r = Line::new().legend("bandwidth").measured(format!("{:.0} GB/s", g.bandwidth_gbs)).gap(18.0).legend("compute").measured(format!("{:.0} TFLOP/s", g.tflops)).show(ui);
+            spoken(r, speed);
+        },
+    );
 }
 
 pub fn pump(app: &mut App) {
@@ -199,95 +205,106 @@ pub fn pump(app: &mut App) {
     }
 }
 
-fn model_ids(app: &App) -> Vec<(String, String)> {
-    crate::modelbar::usable(app, "").into_iter().map(|i| (app.library[i].name.clone(), app.library[i].model_id(inference_bench_core::target::NATIVE))).collect()
+pub fn pipeline_rows(stats: &specrt::serve::Stats) -> Vec<String> {
+    let Some(c) = &stats.chain else { return Vec::new() };
+    let mut rows: Vec<String> = c
+        .stages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let name = if m.name.is_empty() { format!("stage {i}") } else { format!("stage {i} {}", display_name(&m.name)) };
+            format!("{name}  layers {}..{}  busy {:.1} s  {} calls  {} tokens", m.start, m.end, m.busy_secs, m.calls, m.tokens)
+        })
+        .collect();
+    let hop_ms = if c.hops > 0 { c.hop_secs / c.hops as f64 * 1e3 } else { 0.0 };
+    rows.push(format!("hops {}  {:.2} ms each  {} moved", c.hops, hop_ms, human_size(c.hop_bytes)));
+    if let Some(lost) = &c.lost {
+        rows.push(format!("lost: {lost}"));
+    }
+    rows
 }
 
-fn refresh_preview(app: &mut App) {
-    let Some(machine) = app.hardware.machine.clone() else { return };
-    let own = machine.host.clone();
-    let peers = app.hardware.peer_list(&own);
-    let net = app.settings.cluster.network_link();
-    let sel = app.hardware.selection.clone();
-    let devices = candidate_devices(&machine, &peers, &sel, net);
-    let ids = model_ids(app);
-    let Some((_, id)) = ids.iter().find(|(n, _)| *n == app.hardware.model).cloned() else {
-        app.hardware.shown = None;
-        return;
-    };
-    let (ctx, slots) = (app.hardware.ctx, app.hardware.slots);
-    let key = format!("{id}|{ctx}|{slots}|{devices:?}");
-    if app.hardware.shown.as_ref().is_some_and(|s| s.key == key) {
+pub fn pipeline_section(app: &App, ui: &mut egui::Ui) {
+    let Some(stats) = app.engine.handle().serving_stats() else { return };
+    let rows = pipeline_rows(&stats);
+    if rows.is_empty() {
         return;
     }
-    let preview = specrt::engine::resolve_spec(&id).map_err(|e| format!("this model cannot be planned: {e:#}")).map(|spec| preview(&spec, devices.clone(), ctx, slots));
-    app.hardware.shown = Some(Shown { key, preview, devices });
-}
-
-pub fn stage_text(i: usize, r: &StageRow) -> String {
-    let hop = if r.hop == "first stage" { "first stage".to_string() } else { format!("hop {:.2} ms, {}", r.hop_ms, r.hop) };
-    format!("stage {i}  {}  layers {}  {:.1} of {:.1} GiB  step {:.2} ms  {hop}", r.label, r.layers, r.gib, r.of_gib, r.step_ms)
-}
-
-fn stage_table(ui: &mut egui::Ui, rows: &[StageRow]) {
-    for (i, r) in rows.iter().enumerate() {
-        note(ui, stage_text(i, r), VALUE);
-    }
-}
-
-pub fn placement_lines(placement: &specrt::placement::Placement, devices: &[DeviceConfig], local: &str) -> (Vec<StageRow>, String) {
-    let rows = stage_rows(placement, devices, local);
-    let summary = format!(
-        "step {:.2} ms ({:.1} tok/s one stream), slowest stage {:.2} ms ({:.1} tok/s pipelined), bottleneck {}",
-        placement.step_secs * 1e3,
-        placement.single_stream_tokens_per_second(),
-        placement.bottleneck_secs * 1e3,
-        placement.pipelined_tokens_per_second(),
-        bottleneck(placement).unwrap_or_default()
-    );
-    (rows, summary)
-}
-
-fn objective_view(ui: &mut egui::Ui, label: &str, result: &Result<specrt::placement::Placement, String>, tp: Option<&specrt::placement::Placement>, devices: &[DeviceConfig], local: &str) {
-    Line::new().legend(label).show(ui);
-    match result {
-        Err(e) => status(ui, false, e),
-        Ok(p) => {
-            let (rows, summary) = placement_lines(p, devices, local);
-            stage_table(ui, &rows);
-            note(ui, summary, LEGEND);
+    section(ui, "pipeline", "per stage work and the hops between stages", |ui| {
+        for r in rows {
+            note(ui, r.clone(), if r.starts_with("lost") { FAULT } else { VALUE });
         }
-    }
-    if let Some(p) = tp {
-        note(ui, tp_line(p), LEGEND.gamma_multiply(0.7));
-    }
+    });
+}
+
+pub fn planning_devices(app: &App) -> Option<(specrt::hardware::Machine, Vec<specrt::placement::DeviceConfig>)> {
+    let machine = app.hardware.machine.clone().or_else(|| specrt::hardware::probe().ok())?;
+    let own = machine.host.clone();
+    let peers: Vec<Peer> = app.hardware.peer_list(&own).into_iter().filter(|p| app.settings.cluster.paired.contains(&p.host)).collect();
+    let selection = app.hardware.selection(&app.settings.cluster);
+    let devices = candidate_devices(&machine, &peers, &selection, app.settings.cluster.network_link());
+    Some((machine, devices))
+}
+
+pub fn load_spanning(app: &mut App, model: &inference_bench_core::library::LocalModel, plan_ctx: usize, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice) -> Result<(), String> {
+    let (machine, devices) = planning_devices(app).ok_or_else(|| "no GPU reading yet".to_string())?;
+    let id = model.model_id(inference_bench_core::target::NATIVE);
+    let spec = specrt::engine::resolve_spec(&id).map_err(|e| format!("{e:#}"))?;
+    let placement = runnable_plan(&spec, &devices, plan_ctx, seqs, app.settings.cluster.objective)?;
+    app.hardware.release();
+    let own = machine.host.clone();
+    let peers: Vec<Peer> = app.hardware.peer_list(&own);
+    let key_file = inference_bench_core::cluster::key_path(&app.dir);
+    let prepared = inference_bench_core::cluster::prepare(&Run { model_id: &id, ctx: plan_ctx, slots: seqs, placement: &placement, devices: &devices, local: &machine, peers: &peers, settings: &app.settings.cluster, key_file: &key_file }).map_err(|e| format!("{e:#}"))?;
+    *app.hardware.slot.lock().unwrap() = Some(prepared.placement.clone());
+    app.hardware.run_label = Some(format!("{} on {} stages", model.name, prepared.placement.stages.len()));
+    app.hardware.run = Some(prepared);
+    app.engine.send(Command::Load { model_id: id, display: model.name.clone(), max_ctx: Some(ctx), max_num_seqs: Some(seqs), kv_cache_bytes, served_names, engine });
+    Ok(())
 }
 
 fn this_machine(app: &mut App, ui: &mut egui::Ui) {
-    section(ui, "this machine", "read from the CUDA driver", |ui| {
-        let Some(m) = &app.hardware.machine else {
+    section(ui, "this machine", "every GPU is used for loading unless you switch it off", |ui| {
+        let Some(m) = app.hardware.machine.clone() else {
             match &app.hardware.probe_error {
                 Some(e) => status(ui, false, e),
-                None => note(ui, "reading the GPUs", LEGEND),
+                None => crate::working::working(ui, "reading the GPUs"),
             }
             return;
         };
-        Line::new().legend("host").value(m.host.clone()).gap(14.0).legend("ram").measured(format!("{} / {} available", human_size(m.ram_available_bytes), human_size(m.ram_total_bytes))).show(ui);
+        let gpus = m.gpus.len().to_string();
+        readouts(ui, &[("host", m.host.clone(), VALUE), ("gpus", gpus, VALUE), ("ram free", human_size(m.ram_available_bytes), TRACE), ("ram total", human_size(m.ram_total_bytes), VALUE)]);
         if m.gpus.is_empty() {
             note(ui, "no CUDA GPU found", WARN);
         }
-        for line in gpu_lines(m) {
-            note(ui, line, VALUE);
+        for g in &m.gpus {
+            let name = specrt::hardware::device_name(&m.host, g.ordinal);
+            let on = !app.settings.cluster.disabled_gpus.contains(&name);
+            gpu_card(ui, g, on);
+            let r = ui.add(Key::new(if on { "in use" } else { "switched off" }).outline(if on { OK } else { LEGEND }).id_salt(("gpu-switch", g.ordinal)));
+            if r.clicked() {
+                if !app.settings.cluster.disabled_gpus.remove(&name) {
+                    app.settings.cluster.disabled_gpus.insert(name);
+                }
+                app.save_settings();
+            }
         }
-        for line in link_lines(m) {
-            note(ui, line, LEGEND);
+        if !m.links.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for l in &m.links {
+                    let ok = l.kind == specrt::hardware::LinkKind::PeerToPeer;
+                    tag(ui, &format!("GPU {} and GPU {}: {}", l.a, l.b, l.kind.label()), if ok { OK } else { WARN }, true);
+                }
+            });
         }
         if m.interfaces.is_empty() {
             note(ui, "no network interface is up for mDNS", WARN);
         }
-        for i in &m.interfaces {
-            note(ui, format!("network {} {}", i.name, i.ip), LEGEND);
-        }
+        ui.horizontal_wrapped(|ui| {
+            for i in &m.interfaces {
+                tag(ui, &format!("{} {}", i.name, i.ip), LEGEND, false);
+            }
+        });
     });
 }
 
@@ -336,7 +353,17 @@ fn sharing(app: &mut App, ui: &mut egui::Ui) {
             note(ui, "no other inference-bench machine found yet", LEGEND);
         }
         for p in &peers {
-            note(ui, peer_line(p), VALUE);
+            peer_row(ui, p);
+            let paired = app.settings.cluster.paired.contains(&p.host);
+            if paired {
+                let on = app.settings.cluster.peers_in_use.contains(&p.host);
+                if ui.add(Key::new(if on { "in use" } else { "not in use" }).outline(if on { OK } else { LEGEND }).id_salt(("peer-use", &p.host))).clicked() {
+                    if !app.settings.cluster.peers_in_use.remove(&p.host) {
+                        app.settings.cluster.peers_in_use.insert(p.host.clone());
+                    }
+                    app.save_settings();
+                }
+            }
         }
     });
 }
@@ -381,117 +408,19 @@ fn pairing(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-fn run_section(app: &mut App, ui: &mut egui::Ui) {
-    let Some(machine) = app.hardware.machine.clone() else { return };
-    section(ui, "run a cluster", "this app is the coordinator, peers run the other layers", |ui| {
-        let ids = model_ids(app);
-        if app.hardware.model.is_empty()
-            && let Some((n, _)) = ids.first()
-        {
-            app.hardware.model = n.clone();
-        }
-        let mut picked = app.hardware.model.clone();
-        row(ui, "model", |ui| {
-            choice(ui, "cluster-model", &mut picked, ids.iter().map(|(n, _)| (n.clone(), n.clone())));
-        });
-        app.hardware.model = picked;
-        row(ui, "context", |ui| {
-            ui.add(egui::DragValue::new(&mut app.hardware.ctx).range(256..=1 << 20).speed(64.0));
-        });
-        row(ui, "parallel", |ui| {
-            ui.add(egui::DragValue::new(&mut app.hardware.slots).range(1..=64));
-        });
-        Line::new().legend("gpus").show(ui);
-        for g in &machine.gpus {
-            let name = specrt::hardware::device_name(&machine.host, g.ordinal);
-            let mut on = app.hardware.selection.includes(&name);
-            if ui.checkbox(&mut on, display_name(&name)).changed() {
-                app.hardware.selection.toggle_gpu(&name);
+fn running_section(app: &App, ui: &mut egui::Ui) {
+    let Some(label) = &app.hardware.run_label else { return };
+    let Some(machine) = &app.hardware.machine else { return };
+    section(ui, "running now", "the model is spread over these GPUs", |ui| {
+        note(ui, format!("running {label}"), OK);
+        if let Some(p) = app.hardware.slot.lock().unwrap().clone() {
+            for d in &p.stages {
+                let name = d.device.clone();
+                Line::new().legend("stage").value(format!("{}  layers {}..{}", display_name(&name), d.layers[0], d.layers[1])).show(ui);
             }
         }
-        let peers = app.hardware.peer_list(&machine.host);
-        for p in &peers {
-            let paired = app.settings.cluster.paired.contains(&p.host);
-            let mut on = app.hardware.selection.peers.contains(&p.host);
-            let label = if paired { format!("use {}", p.summary()) } else { format!("use {} (not paired)", p.summary()) };
-            if ui.add_enabled(paired, egui::Checkbox::new(&mut on, label)).changed() {
-                app.hardware.selection.toggle_peer(&p.host);
-            }
-            if on {
-                for g in &p.gpus {
-                    let mut gon = app.hardware.selection.includes(&g.device.name);
-                    if ui.checkbox(&mut gon, format!("    {}", display_name(&g.device.name))).changed() {
-                        app.hardware.selection.toggle_gpu(&g.device.name);
-                    }
-                }
-            }
-        }
-        refresh_preview(app);
-        let mut runnable_choice = None;
-        match &app.hardware.shown {
-            None => note(ui, "pick a model on disk to see the placement", LEGEND),
-            Some(shown) => match &shown.preview {
-                Err(e) => status(ui, false, e),
-                Ok(p) => {
-                    objective_view(ui, "latency", &p.latency, p.tp_latency.as_ref(), &shown.devices, &machine.host);
-                    objective_view(ui, "throughput", &p.throughput, p.tp_throughput.as_ref(), &shown.devices, &machine.host);
-                    runnable_choice = Some((p.latency.is_ok(), p.throughput.is_ok()));
-                }
-            },
-        }
-        let mut objective = app.hardware.objective;
-        segments(ui, &mut objective, &[(Objective::Latency, "latency", None), (Objective::Throughput, "throughput", None)]);
-        app.hardware.objective = objective;
-        let can = runnable_choice.is_some_and(|(l, t)| if objective == Objective::Latency { l } else { t }) && app.loading.is_none();
-        ui.horizontal(|ui| {
-            if ui.add(Key::new("load across the cluster").solid(READOUT).enabled(can).min_width(200.0)).clicked() {
-                load(app);
-            }
-            if app.hardware.run.is_some() && ui.add(Key::new("stop cluster").outline(FAULT)).clicked() {
-                app.unload();
-            }
-        });
-        if let Some(l) = &app.hardware.run_label {
-            note(ui, format!("running {l}"), OK);
-        }
+        let _ = machine;
     });
-}
-
-pub fn load(app: &mut App) {
-    let Some(machine) = app.hardware.machine.clone() else { return };
-    let Some(shown) = &app.hardware.shown else { return };
-    let devices = shown.devices.clone();
-    let Some(model) = app.library.iter().find(|m| m.name == app.hardware.model).cloned() else { return };
-    let id = model.model_id(inference_bench_core::target::NATIVE);
-    let (ctx, slots) = (app.hardware.ctx, app.hardware.slots);
-    let spec = match specrt::engine::resolve_spec(&id) {
-        Ok(s) => s,
-        Err(e) => {
-            app.notice = Some((false, format!("{e:#}")));
-            return;
-        }
-    };
-    let placement = match runnable_plan(&spec, &devices, ctx, slots, app.hardware.objective) {
-        Ok(p) => p,
-        Err(e) => {
-            app.notice = Some((false, e));
-            return;
-        }
-    };
-    app.hardware.release();
-    let peers = app.hardware.peer_list(&machine.host);
-    let key_file = inference_bench_core::cluster::key_path(&app.dir);
-    let prepared = inference_bench_core::cluster::prepare(&Run { model_id: &id, ctx, slots, placement: &placement, devices: &devices, local: &machine, peers: &peers, settings: &app.settings.cluster, key_file: &key_file });
-    match prepared {
-        Ok(p) => {
-            *app.hardware.slot.lock().unwrap() = Some(p.placement.clone());
-            app.hardware.run_label = Some(format!("{} on {} stages", model.name, p.placement.stages.len()));
-            app.hardware.run = Some(p);
-            let engine = app.settings.engine_for(&model.name);
-            app.engine.send(Command::Load { model_id: id, display: model.name.clone(), max_ctx: Some(ctx), max_num_seqs: Some(slots), kv_cache_bytes: None, served_names: app.settings.served_names_for(&model.name), engine });
-        }
-        Err(e) => app.notice = Some((false, format!("{e:#}"))),
-    }
 }
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
@@ -500,38 +429,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         this_machine(app, ui);
         sharing(app, ui);
         pairing(app, ui);
-        run_section(app, ui);
-    });
-}
-
-pub fn pipeline_rows(stats: &specrt::serve::Stats) -> Vec<String> {
-    let Some(c) = &stats.chain else { return Vec::new() };
-    let mut rows: Vec<String> = c
-        .stages
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            let name = if m.name.is_empty() { format!("stage {i}") } else { format!("stage {i} {}", display_name(&m.name)) };
-            format!("{name}  layers {}..{}  busy {:.1} s  {} calls  {} tokens", m.start, m.end, m.busy_secs, m.calls, m.tokens)
-        })
-        .collect();
-    let hop_ms = if c.hops > 0 { c.hop_secs / c.hops as f64 * 1e3 } else { 0.0 };
-    rows.push(format!("hops {}  {:.2} ms each  {} moved", c.hops, hop_ms, human_size(c.hop_bytes)));
-    if let Some(lost) = &c.lost {
-        rows.push(format!("lost: {lost}"));
-    }
-    rows
-}
-
-pub fn pipeline_section(app: &App, ui: &mut egui::Ui) {
-    let Some(stats) = app.engine.handle().serving_stats() else { return };
-    let rows = pipeline_rows(&stats);
-    if rows.is_empty() {
-        return;
-    }
-    section(ui, "pipeline", "per stage work and the hops between stages", |ui| {
-        for r in rows {
-            note(ui, r.clone(), if r.starts_with("lost") { FAULT } else { VALUE });
-        }
+        running_section(app, ui);
     });
 }

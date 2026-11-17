@@ -180,7 +180,7 @@ fn free_gpu(args: &LaunchArgs) -> Option<u64> {
     if let Some(m) = args.assume_free_mib {
         return Some(m << 20);
     }
-    inference_bench_core::gpu::sample().first().map(|g| g.total_bytes.saturating_sub(g.used_bytes))
+    inference_bench_core::gpu::sample().iter().map(|g| g.total_bytes.saturating_sub(g.used_bytes)).reduce(|a, b| a + b)
 }
 
 pub fn resolve(args: &LaunchArgs, data: &Path, settings: &Settings) -> Result<Source> {

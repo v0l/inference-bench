@@ -66,11 +66,13 @@ pub struct ClusterSettings {
     pub link_latency_ms: f64,
     pub link_bandwidth_gbs: f64,
     pub objective: specrt::placement::Objective,
+    pub disabled_gpus: std::collections::BTreeSet<String>,
+    pub peers_in_use: std::collections::BTreeSet<String>,
 }
 
 impl Default for ClusterSettings {
     fn default() -> Self {
-        Self { share: false, name: String::new(), interface: String::new(), paired: Default::default(), mdns_port: 5353, link_latency_ms: 0.3, link_bandwidth_gbs: 1.1, objective: specrt::placement::Objective::Latency }
+        Self { share: false, name: String::new(), interface: String::new(), paired: Default::default(), mdns_port: 5353, link_latency_ms: 0.3, link_bandwidth_gbs: 1.1, objective: specrt::placement::Objective::Latency, disabled_gpus: Default::default(), peers_in_use: Default::default() }
     }
 }
 

@@ -182,7 +182,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let back = header(app, &mut detail, ui);
     if !back {
         pump_tree(app, &mut detail);
-        let free = app.gpu.first().map(|g| g.available_bytes());
+        let free = app.free_gpu_bytes();
         let mut act = TreeAction::default();
         let running = app.engine.loaded().filter(|l| l.display == detail.model);
         body(&mut detail, &app.library, ui, free, &mut act, running.as_ref());
@@ -273,7 +273,7 @@ fn tree_section(detail: &Detail, library: &[LocalModel], ui: &mut egui::Ui, act:
     }
     section(ui, "model tree", "where this model comes from, and what else you downloaded from its base", |ui| {
         match &detail.tree {
-            None => note(ui, "looking up the base model", LEGEND),
+            None => crate::working::working(ui, "looking up the base model"),
             Some(Err(e)) => status(ui, false, e),
             Some(Ok(t)) => {
                 for (n, row) in lineage_rows(&t.chain, &t.relations, library).iter().enumerate() {
