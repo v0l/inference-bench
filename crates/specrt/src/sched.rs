@@ -476,7 +476,7 @@ impl Default for Config {
             whole_prompt_tokens: 0,
             prefix_cache: PrefixCacheOptions::default(),
             swap_space_bytes: 0,
-            admit_lookahead: 512,
+            admit_lookahead: 0,
         }
     }
 }

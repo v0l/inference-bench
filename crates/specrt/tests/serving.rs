@@ -758,9 +758,9 @@ fn repeated_parking_leaves_no_pinned_memory_behind() {
         assert_eq!(host.bytes, rt.swap_bytes(blocks.len()));
         rt.resume(0, &blocks, &host).unwrap();
     }
-    assert_eq!(specrt::runtime::pinned_parked_bytes(), 0);
+    assert_eq!(rt.host_pool().used(), 0);
     let held: Vec<_> = (0..3).map(|_| rt.park(0, &blocks).unwrap()).collect();
-    assert!(specrt::runtime::pinned_parked_bytes() > 0);
+    assert!(rt.host_pool().used() > 0);
     drop(held);
-    assert_eq!(specrt::runtime::pinned_parked_bytes(), 0);
+    assert_eq!(rt.host_pool().used(), 0);
 }

@@ -1,27 +1,14 @@
 use super::Runtime;
 use crate::prefix::{SnapshotData, StateSnapshot};
+use crate::hostpool::PinnedBuf;
 use crate::sched::HostSeq;
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, result};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-static PINNED_PARKED: AtomicUsize = AtomicUsize::new(0);
-
-pub fn pinned_parked_bytes() -> usize {
-    PINNED_PARKED.load(Ordering::SeqCst)
-}
-
 struct Parked {
-    kv: PinnedHostSlice<u8>,
+    kv: PinnedBuf,
     state: Option<StateSnapshot>,
-    bytes: usize,
-}
-
-impl Drop for Parked {
-    fn drop(&mut self) {
-        PINNED_PARKED.fetch_sub(self.bytes, Ordering::SeqCst);
-    }
 }
 
 type HostPool = Arc<Mutex<Vec<PinnedHostSlice<f32>>>>;
@@ -195,7 +182,7 @@ impl Runtime {
         let state = if self.gdn.is_some() { Some(self.snapshot_state_blocking(slot)?) } else { None };
         let per = self.kv_cache_block_bytes();
         let total = blocks.len() * 2 * per;
-        let mut host = unsafe { self.ctx.alloc_pinned_with_flags::<u8>(total.max(1), 0) }.context("pinned swap buffer")?;
+        let mut host = self.host.alloc(total)?;
         if self.snap.side.is_none() {
             self.snap.side = Some(self.stream.fork()?);
         }
@@ -213,9 +200,8 @@ impl Runtime {
             }
         }
         side.synchronize()?;
-        PINNED_PARKED.fetch_add(total, Ordering::SeqCst);
         let bytes = total + state.as_ref().map_or(0, |s| (s.conv().len() + s.ssm().len() + s.pending().len()) * 4);
-        Ok(HostSeq { bytes, blocks: blocks.len(), payload: Box::new(Parked { kv: host, state, bytes: total }) })
+        Ok(HostSeq { bytes, blocks: blocks.len(), payload: Box::new(Parked { kv: host, state }) })
     }
 
     pub fn resume(&mut self, slot: usize, blocks: &[u32], seq: &HostSeq) -> Result<()> {

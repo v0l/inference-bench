@@ -25,7 +25,6 @@ pub use fused::PrefillPart;
 use exec::Plans;
 pub use mtp::{SpecRow, SpecStats};
 pub use stage::{StageRange, StageRole};
-pub use snapshot::pinned_parked_bytes;
 pub use step::{DecodeRow, GRAPH_SIZES, Mask, Stepper, pad_rows};
 
 struct Plan {
@@ -662,6 +661,7 @@ pub struct Runtime {
     baseline_free: usize,
     mtp: Option<mtp::MtpState>,
     snap: snapshot::SnapshotPool,
+    host: crate::hostpool::HostPool,
     mm_meta: CudaSlice<i32>,
     mm_table: CudaSlice<i32>,
     mm_bidi: CudaSlice<i32>,
@@ -967,6 +967,7 @@ impl Runtime {
             baseline_free: free_before,
             mtp: None,
             snap: Default::default(),
+            host: crate::hostpool::HostPool::new(ctx.clone()),
             mm_meta,
             mm_table,
             mm_bidi,
@@ -1064,6 +1065,10 @@ impl Runtime {
 
     pub fn kv_blocks(&self) -> usize {
         self.kv_blocks
+    }
+
+    pub fn host_pool(&self) -> &crate::hostpool::HostPool {
+        &self.host
     }
 
     pub fn kv_planes(&self) -> usize {

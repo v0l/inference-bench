@@ -74,7 +74,7 @@ impl Default for ServeOptions {
             whole_prompt_tokens: 1024,
             min_prefill_tokens: 512,
             swap_space_gb: 0.0,
-            admit_lookahead: 512,
+            admit_lookahead: 0,
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,

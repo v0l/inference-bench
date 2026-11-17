@@ -35,11 +35,11 @@ pub struct ServeArgs {
     pub itl_target_ms: Option<u64>,
     #[arg(long, help = "Prefill a whole prompt in one step when it is at most this many tokens (default 1024, 0 is off)")]
     pub whole_prompt_tokens: Option<usize>,
-    #[arg(long, help = "Prompt tokens prefilled every step beside decoders (default 512)")]
+    #[arg(long, help = "Prompt tokens prefilled every step beside decoders (default 0, off)")]
     pub min_prefill_tokens: Option<usize>,
     #[arg(long, help = "Pinned host memory in GB where preempted requests park their KV cache instead of recomputing (default 0, off)")]
     pub swap_space_gb: Option<f64>,
-    #[arg(long, help = "Tokens of generation to reserve KV room for at admission (default 512)")]
+    #[arg(long, help = "Tokens of generation to reserve KV room for at admission (default 0, off)")]
     pub admit_lookahead: Option<usize>,
     #[arg(long, help = "Seconds before an idle model is unloaded")]
     pub idle_unload_secs: Option<u64>,
