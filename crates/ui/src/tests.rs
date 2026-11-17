@@ -549,6 +549,52 @@ fn screenshot_of_the_chat_with_thinking_and_a_tool_row() {
     h.render().unwrap().save(out.join("chat-thinking-tool-composer.png")).unwrap();
 }
 
+fn shared_transcript_harness(name: &str) -> Harness<'static, App> {
+    use agent_ui::chat::{Attached, Turn};
+    let mut h = harness(name, Tab::Chat);
+    {
+        let app = h.state_mut();
+        let factory: inference_bench_core::native::Factory = std::sync::Arc::new(|_, _| Ok(Box::new(XmlThenAnswer) as Box<dyn inference_bench_core::native::Model>));
+        app.engine = inference_bench_core::engine::Engine::with_factory(app.wake.clone(), factory);
+        let m = app.library[0].clone();
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 10, "model never loaded", |a| a.loaded().is_some());
+    h.run();
+    let png = Attached { name: "red.png".into(), mime: "image/png".into(), data: std::sync::Arc::new(red_png()) };
+    let turns = &mut h.state_mut().chat.agent.chat.turns;
+    turns.push(Turn::You { text: "what is in this picture".into(), files: vec![png] });
+    turns.push(Turn::Thinking("A red rectangle, so I should say that.".into()));
+    turns.push(Turn::Did { name: "workspace".into(), args: "{}".into(), answer: Some(Ok("The workspace is /tmp/ws.".into())) });
+    turns.push(Turn::Said("It is a red rectangle.".into()));
+    h.run();
+    h
+}
+
+#[test]
+fn the_chat_draws_reasoning_an_attachment_and_a_tool_row_with_the_shared_widgets() {
+    let mut h = shared_transcript_harness("shared-transcript");
+    h.run();
+    h.get_by_label_contains("what is in this picture");
+    h.get_by_label_contains("It is a red rectangle.");
+    h.get_by_label_contains("A red rectangle, so I should say that.");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "workspace");
+    h.get_by_label_contains("The workspace is /tmp/ws.");
+    let turns = &h.state().chat.agent.chat.turns;
+    assert!(turns.iter().any(|t| matches!(t, agent_ui::chat::Turn::You { files, .. } if files.len() == 1 && files[0].is_image())));
+    assert!(turns.iter().any(|t| matches!(t, agent_ui::chat::Turn::Thinking(_))));
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+fn screenshot_of_the_chat_with_reasoning_attachment_and_tool_row() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = shared_transcript_harness("shots-shared");
+    h.run();
+    h.render().unwrap().save(out.join("chat-shared-widgets.png")).unwrap();
+}
+
 fn slow_script() -> Script {
     Script { chunks: (0..40).map(|i| format!("t{i} ")).collect(), chunk_delay_ms: 10, first_delay_ms: 20, usage: Some((12, 40)), ..script() }
 }
