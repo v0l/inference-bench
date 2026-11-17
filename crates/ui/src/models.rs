@@ -32,6 +32,23 @@ pub struct Preselect {
     pub kv: Kv,
 }
 
+pub struct PlanRow {
+    pub repo: Repo,
+    pub plan: Option<RepoPlan>,
+    pub height: Option<f32>,
+}
+
+#[derive(PartialEq)]
+struct PlanKey {
+    generation: u64,
+    results: usize,
+    infos: usize,
+    seqs: usize,
+    gpus: Vec<u64>,
+}
+
+const BUDGET_BUCKET: u64 = 256 << 20;
+
 type Inspected = Vec<(String, Result<RepoInfo, String>)>;
 
 pub struct ModelsState {
@@ -52,6 +69,11 @@ pub struct ModelsState {
     pub message: Option<(bool, String)>,
     pub detail: Option<crate::detail::Detail>,
     pub relation: Option<(Relation, String)>,
+    pub info_dir: std::path::PathBuf,
+    generation: u64,
+    plan_key: Option<PlanKey>,
+    rows: Vec<PlanRow>,
+    pub plan_runs: usize,
 }
 
 impl Default for ModelsState {
@@ -74,11 +96,20 @@ impl Default for ModelsState {
             message: None,
             detail: None,
             relation: None,
+            info_dir: std::path::PathBuf::new(),
+            generation: 0,
+            plan_key: None,
+            rows: Vec::new(),
+            plan_runs: 0,
         }
     }
 }
 
 impl ModelsState {
+    pub fn with_info_dir(info_dir: std::path::PathBuf) -> Self {
+        Self { info_dir, ..Self::default() }
+    }
+
     pub fn downloading(&self) -> bool {
         self.downloads.iter().any(|d| d.result.is_none()) || self.search.busy() || self.inspecting.busy()
     }
@@ -93,6 +124,7 @@ impl ModelsState {
                 Ok(list) => {
                     self.message = Some((true, format!("{} repos", list.len())));
                     self.results = list;
+                    self.generation += 1;
                     self.infos.clear();
                     self.picks.clear();
                     self.inspect_results(wake, token);
@@ -101,6 +133,7 @@ impl ModelsState {
             }
         }
         if let Some(found) = self.inspecting.poll() {
+            self.generation += 1;
             self.infos.extend(found);
         }
         let mut finished = false;
@@ -144,11 +177,11 @@ impl ModelsState {
 
     fn inspect_results(&mut self, wake: &inference_bench_core::engine::Wake, token: &str) {
         let repos: Vec<String> = self.results.iter().map(|r| r.id.clone()).collect();
-        let (base, token) = (self.hub_base.clone(), token.to_string());
+        let (base, token, dir) = (self.hub_base.clone(), token.to_string(), self.info_dir.clone());
         if repos.is_empty() {
             return;
         }
-        self.inspecting.start(job::spawn(wake, move || discover::inspect_all(&Hub::new(&base, &token), &repos)));
+        self.inspecting.start(job::spawn(wake, move || discover::inspect_all(&Hub::new(&base, &token), &repos, &dir)));
     }
 
     pub fn plans(&self, gpus: &[u64], seqs: usize) -> Vec<RepoPlan> {
@@ -162,6 +195,32 @@ impl ModelsState {
         }
         out.sort_by_key(|p| p.key());
         out
+    }
+
+    pub fn refresh_rows(&mut self, gpus: &[u64], seqs: usize) {
+        let key = PlanKey {
+            generation: self.generation,
+            results: self.results.len(),
+            infos: self.infos.len(),
+            seqs,
+            gpus: gpus.iter().map(|g| g / BUDGET_BUCKET).collect(),
+        };
+        if self.plan_key.as_ref() == Some(&key) {
+            return;
+        }
+        self.plan_runs += 1;
+        let plans = self.plans(gpus, seqs);
+        let mut by_repo: BTreeMap<String, RepoPlan> = plans.iter().map(|p| (p.repo.clone(), p.clone())).collect();
+        let mut planned = Vec::new();
+        for p in &plans {
+            if let Some(r) = self.results.iter().find(|r| r.id == p.repo) {
+                planned.push(PlanRow { repo: r.clone(), plan: by_repo.remove(&p.repo), height: None });
+            }
+        }
+        let pending = self.results.iter().filter(|r| !plans.iter().any(|p| p.repo == r.id)).map(|r| PlanRow { repo: r.clone(), plan: None, height: None });
+        planned.extend(pending);
+        self.rows = planned;
+        self.plan_key = Some(key);
     }
 
     pub fn start_download(&mut self, wake: &inference_bench_core::engine::Wake, token: &str, repo: &str, label: &str, files: Vec<RepoFile>, fitted: Option<(usize, Kv)>, first_weight: String, format: library::Format) {
@@ -550,15 +609,22 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
     if !gpus.is_empty() {
         note(ui, budget_line(&app.gpu, app.settings.default_seqs), LEGEND);
     }
-    let plans = app.models.plans(&gpus, app.settings.default_seqs);
-    let results = app.models.results.clone();
-    let mut order: Vec<&Repo> = results.iter().filter(|r| plans.iter().any(|p| p.repo == r.id)).collect();
-    order.sort_by_key(|r| plans.iter().position(|p| p.repo == r.id));
-    let pending: Vec<&Repo> = results.iter().filter(|r| !plans.iter().any(|p| p.repo == r.id)).collect();
-    for r in order.into_iter().chain(pending) {
-        let plan = plans.iter().find(|p| p.repo == r.id).cloned();
-        repo_row(app, ui, r, plan.as_ref(), &token);
+    app.models.refresh_rows(&gpus, app.settings.default_seqs);
+    let mut rows = std::mem::take(&mut app.models.rows);
+    let gap = ui.spacing().item_spacing.y;
+    let view = ui.clip_rect().expand(300.0);
+    for row in &mut rows {
+        let top = ui.cursor().min.y;
+        if let Some(h) = row.height
+            && (top + h < view.min.y || top > view.max.y)
+        {
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+            continue;
+        }
+        repo_row(app, ui, &row.repo, row.plan.as_ref(), &token);
+        row.height = Some(ui.cursor().min.y - top - gap);
     }
+    app.models.rows = rows;
     downloads_section(app, ui);
 }
 

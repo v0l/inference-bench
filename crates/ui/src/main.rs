@@ -97,7 +97,7 @@ impl App {
             gpu_at: None,
             notice: None,
             chat: chat::ChatState::new(ctx),
-            models: models::ModelsState::default(),
+            models: models::ModelsState::with_info_dir(dir.join("repo-info")),
             server: server::ServerState::default(),
             hardware: hardware::HardwareState::with_slot(hardware_slot.clone()),
             logs: inference_bench_core::logging::LogBuffer::new(5000),

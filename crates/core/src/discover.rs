@@ -1,10 +1,12 @@
 use crate::fit;
 use crate::hf::{self, Hub, RepoFile};
 use crate::library::{self, Format};
+use serde::{Deserialize, Serialize};
 use specrt::anatomy::ModelAnatomy;
 use specrt::placement::{CostModel, DeviceConfig, PlacementConfig};
 use specrt::spec::{KvDtype, Spec};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Variant {
@@ -367,7 +369,13 @@ pub fn draft_of(config: &serde_json::Value) -> Option<String> {
     })
 }
 
-fn gguf_shape(hub: &Hub, repo: &str, g: &Grouped) -> Result<Shape, String> {
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredGguf {
+    spec: Spec,
+    context: Option<usize>,
+}
+
+fn gguf_probe(hub: &Hub, repo: &str, g: &Grouped) -> Result<StoredGguf, String> {
     let mut probes: Vec<&Variant> = g.variants.iter().filter(|v| v.format == Format::Gguf && !v.files.is_empty()).collect();
     probes.sort_by_key(|v| !v.complete());
     if probes.is_empty() {
@@ -380,15 +388,19 @@ fn gguf_shape(hub: &Hub, repo: &str, g: &Grouped) -> Result<Shape, String> {
             let mut spec = header.spec().map_err(|e| format!("{:#}", e.root_cause()))?;
             spec.name = repo.to_string();
             let arch = header.architecture().map_err(|e| e.to_string())?.to_string();
-            let anatomy = ModelAnatomy::new(&spec, 0, header.count(&format!("{arch}.context_length")));
-            Ok(Shape { spec, anatomy })
+            Ok(StoredGguf { spec, context: header.count(&format!("{arch}.context_length")) })
         })();
         match attempt {
-            Ok(shape) => return Ok(shape),
+            Ok(stored) => return Ok(stored),
             Err(e) => last = e,
         }
     }
     Err(last)
+}
+
+fn gguf_shape(stored: StoredGguf) -> Shape {
+    let anatomy = ModelAnatomy::new(&stored.spec, 0, stored.context);
+    Shape { spec: stored.spec, anatomy }
 }
 
 pub fn config_shape_of(repo: &str, text: &str) -> (Result<Shape, String>, Option<String>) {
@@ -411,33 +423,115 @@ pub fn config_shape_of(repo: &str, text: &str) -> (Result<Shape, String>, Option
     (shape, None)
 }
 
-fn config_shape(hub: &Hub, repo: &str) -> (Result<Shape, String>, Option<String>, Option<String>) {
-    let text = match hub.text(repo, "config.json") {
-        Ok(t) => t,
-        Err(e) => return (Err(e), None, None),
+const ENGINE: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredInfo {
+    engine: String,
+    fetched: u64,
+    sha: String,
+    files: Vec<RepoFile>,
+    config: Option<String>,
+    gguf: Option<StoredGguf>,
+}
+
+fn info_from(repo: &str, s: &StoredInfo, gguf_err: Option<String>) -> Result<RepoInfo, String> {
+    let has_gguf = s.files.iter().any(|f| f.path.ends_with(".gguf") && !f.path.contains("mmproj"));
+    if has_gguf {
+        let grouped = group(&s.files, None);
+        let shape = match (&s.gguf, gguf_err) {
+            (Some(g), _) => Ok(gguf_shape(g.clone())),
+            (None, Some(e)) => Err(e),
+            (None, None) => Err("no weights in this repo".into()),
+        };
+        return Ok(RepoInfo { repo: repo.to_string(), grouped, shape, draft: None });
+    }
+    if !s.files.iter().any(|f| f.path.ends_with(".safetensors")) {
+        return Err("no GGUF or safetensors files".into());
+    }
+    let (shape, draft) = match &s.config {
+        Some(text) => config_shape_of(repo, text),
+        None => (Err("no config.json".into()), None),
     };
-    let (shape, draft) = config_shape_of(repo, &text);
-    (shape, draft, Some(text))
+    Ok(RepoInfo { repo: repo.to_string(), grouped: group(&s.files, s.config.as_deref()), shape, draft })
+}
+
+fn fetch_info(hub: &Hub, repo: &str, sha: String, now: u64) -> (Result<RepoInfo, String>, Option<StoredInfo>) {
+    let files = match hub.files(repo) {
+        Ok(f) => f,
+        Err(e) => return (Err(e), None),
+    };
+    let mut stored = StoredInfo { engine: ENGINE.into(), fetched: now, sha, files, config: None, gguf: None };
+    let has_gguf = stored.files.iter().any(|f| f.path.ends_with(".gguf") && !f.path.contains("mmproj"));
+    let mut transient = None;
+    if has_gguf {
+        match gguf_probe(hub, repo, &group(&stored.files, None)) {
+            Ok(g) => stored.gguf = Some(g),
+            Err(e) => transient = Some(e),
+        }
+    } else if stored.files.iter().any(|f| f.path.ends_with(".safetensors")) {
+        match hub.text(repo, "config.json") {
+            Ok(t) => stored.config = Some(t),
+            Err(e) => transient = Some(e),
+        }
+    }
+    let info = match (&transient, has_gguf) {
+        (Some(e), false) => {
+            let grouped = group(&stored.files, None);
+            Ok(RepoInfo { repo: repo.to_string(), grouped, shape: Err(e.clone()), draft: None })
+        }
+        _ => info_from(repo, &stored, transient.clone()),
+    };
+    let keep = info.is_ok() && transient.is_none();
+    (info, keep.then_some(stored))
 }
 
 pub fn inspect(hub: &Hub, repo: &str) -> Result<RepoInfo, String> {
-    let files = hub.files(repo)?;
-    let has_gguf = files.iter().any(|f| f.path.ends_with(".gguf") && !f.path.contains("mmproj"));
-    if has_gguf {
-        let grouped = group(&files, None);
-        let shape = gguf_shape(hub, repo, &grouped);
-        return Ok(RepoInfo { repo: repo.to_string(), grouped, shape, draft: None });
-    }
-    if !files.iter().any(|f| f.path.ends_with(".safetensors")) {
-        return Err("no GGUF or safetensors files".into());
-    }
-    let (shape, draft, text) = config_shape(hub, repo);
-    Ok(RepoInfo { repo: repo.to_string(), grouped: group(&files, text.as_deref()), shape, draft })
+    fetch_info(hub, repo, String::new(), 0).0
 }
 
-pub fn inspect_all(hub: &Hub, repos: &[String]) -> Vec<(String, Result<RepoInfo, String>)> {
+pub const INFO_TTL_SECS: u64 = 3600;
+
+fn info_path(dir: &Path, repo: &str) -> PathBuf {
+    dir.join(format!("{}.json", repo.replace('/', "__")))
+}
+
+fn save_info(path: &Path, stored: &StoredInfo) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, serde_json::to_string(stored).unwrap_or_default());
+}
+
+pub fn inspect_cached(hub: &Hub, repo: &str, dir: &Path, ttl: u64, now: u64) -> Result<RepoInfo, String> {
+    let path = info_path(dir, repo);
+    let stored: Option<StoredInfo> = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).filter(|s: &StoredInfo| s.engine == ENGINE);
+    if let Some(mut s) = stored {
+        if now.saturating_sub(s.fetched) < ttl {
+            return info_from(repo, &s, None);
+        }
+        match hub.sha(repo) {
+            Ok(sha) if !s.sha.is_empty() && sha == s.sha => {
+                s.fetched = now;
+                save_info(&path, &s);
+                return info_from(repo, &s, None);
+            }
+            Err(_) if !s.sha.is_empty() => return info_from(repo, &s, None),
+            _ => {}
+        }
+    }
+    let sha = hub.sha(repo).unwrap_or_default();
+    let (info, stored) = fetch_info(hub, repo, sha, now);
+    if let Some(s) = stored {
+        save_info(&path, &s);
+    }
+    info
+}
+
+pub fn inspect_all(hub: &Hub, repos: &[String], dir: &Path) -> Vec<(String, Result<RepoInfo, String>)> {
+    let now = hf::now_secs();
     std::thread::scope(|s| {
-        let jobs: Vec<_> = repos.iter().map(|r| s.spawn(move || (r.clone(), inspect(hub, r)))).collect();
+        let jobs: Vec<_> = repos.iter().map(|r| s.spawn(move || (r.clone(), inspect_cached(hub, r, dir, INFO_TTL_SECS, now)))).collect();
         jobs.into_iter().filter_map(|j| j.join().ok()).collect()
     })
 }
@@ -654,6 +748,46 @@ mod tests {
         assert_eq!((spec.layers.count, spec.attention.kv_heads, spec.attention.head_dim, spec.dims.vocab), (36, 8, 128, 3));
         let e = hub.gguf_header_from("acme/m", "missing.gguf", 64, 1024).err().unwrap();
         assert!(e.contains("404"), "{e}");
+    }
+
+    fn cached_repo_routes(sha: &str) -> Vec<(String, Vec<u8>)> {
+        vec![
+            ("/api/models/acme/m/tree".into(), br#"[{"type":"file","path":"m-Q4_K_M.gguf","size":5000000000}]"#.to_vec()),
+            ("/api/models/acme/m".into(), format!(r#"{{"sha":"{sha}"}}"#).into_bytes()),
+            ("/acme/m/resolve/main/m-Q4_K_M.gguf".into(), qwen3_header(131072)),
+        ]
+    }
+
+    #[test]
+    fn a_cached_repo_is_not_refetched_while_fresh_or_while_its_revision_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("ib-info-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (base, log) = serve(cached_repo_routes("rev1"));
+        let hub = Hub::new(&base, "");
+        let first = inspect_cached(&hub, "acme/m", &dir, 100, 1000).unwrap();
+        assert!(first.shape.is_ok());
+        let after_first = log.lock().unwrap().len();
+        assert!(after_first >= 3);
+        let fresh = inspect_cached(&hub, "acme/m", &dir, 100, 1050).unwrap();
+        assert_eq!(log.lock().unwrap().len(), after_first, "fresh entry makes no request");
+        assert_eq!(fresh.shape.unwrap().spec, first.shape.unwrap().spec);
+        inspect_cached(&hub, "acme/m", &dir, 100, 1500).unwrap();
+        assert_eq!(log.lock().unwrap().len(), after_first + 1, "stale entry only checks the revision");
+        inspect_cached(&hub, "acme/m", &dir, 100, 1550).unwrap();
+        assert_eq!(log.lock().unwrap().len(), after_first + 1, "the revision check renews the entry");
+    }
+
+    #[test]
+    fn a_changed_revision_refetches_the_repo() {
+        let dir = std::env::temp_dir().join(format!("ib-info-rev-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (base, log) = serve(cached_repo_routes("rev1"));
+        inspect_cached(&Hub::new(&base, ""), "acme/m", &dir, 100, 1000).unwrap();
+        let after_first = log.lock().unwrap().len();
+        let (base2, log2) = serve(cached_repo_routes("rev2"));
+        inspect_cached(&Hub::new(&base2, ""), "acme/m", &dir, 100, 2000).unwrap();
+        let paths = log2.lock().unwrap().clone();
+        assert!(paths.iter().any(|p| p.contains("/tree/")) && paths.iter().any(|p| p.contains("/resolve/")), "{paths:?} after {after_first}");
     }
 
     fn shape() -> Shape {

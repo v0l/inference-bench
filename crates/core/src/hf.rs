@@ -22,7 +22,7 @@ pub struct Repo {
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RepoFile {
     pub path: String,
     #[serde(default)]
@@ -84,6 +84,16 @@ impl Hub {
             return Err(format!("{url}: HTTP {}", resp.status()));
         }
         resp.body_mut().read_json().map_err(|e| format!("bad search reply: {e}"))
+    }
+
+    pub fn sha(&self, repo: &str) -> Result<String, String> {
+        let url = format!("{}/api/models/{repo}", self.base);
+        let mut resp = self.get(&url).call().map_err(|e| format!("{url}: {e}"))?;
+        if resp.status().as_u16() >= 400 {
+            return Err(format!("{url}: HTTP {}", resp.status()));
+        }
+        let info: serde_json::Value = resp.body_mut().read_json().map_err(|e| format!("bad model reply: {e}"))?;
+        info["sha"].as_str().map(String::from).ok_or_else(|| "no sha in model reply".into())
     }
 
     pub fn base_of(&self, repo: &str) -> Result<Option<Lineage>, String> {
@@ -331,7 +341,7 @@ fn next_link(header: &str) -> Option<String> {
     })
 }
 
-fn now_secs() -> u64 {
+pub fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 

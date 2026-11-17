@@ -2342,3 +2342,117 @@ fn screenshot_of_the_per_request_table() {
     h.run();
     h.render().unwrap().save(out.join("server-per-request.png")).unwrap();
 }
+
+fn many_hub(repos: usize, sha: std::sync::Arc<std::sync::Mutex<String>>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = hits.clone();
+    let list = format!("[{}]", (0..repos).map(|i| format!(r#"{{"id":"acme/M{i}-GGUF","downloads":{},"likes":1}}"#, 1000 - i)).collect::<Vec<_>>().join(","));
+    let gb = |n: u64| n << 30;
+    let tree = format!(
+        r#"[{{"type":"file","path":"M-Q4_K_M.gguf","size":{}}},{{"type":"file","path":"M-Q5_K_M.gguf","size":{}}},{{"type":"file","path":"M-Q8_0.gguf","size":{}}}]"#,
+        gb(5),
+        gb(6),
+        gb(9)
+    );
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().flatten() {
+            let (list, tree, sha, counter) = (list.clone(), tree.clone(), sha.clone(), counter.clone());
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                let path = line.split_whitespace().nth(1).unwrap().to_string();
+                loop {
+                    line.clear();
+                    r.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                }
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (head, body): (&str, Vec<u8>) = if path.starts_with("/api/models?") {
+                    ("200 OK", list.into_bytes())
+                } else if path.contains("/tree/") {
+                    ("200 OK", tree.into_bytes())
+                } else if path.starts_with("/api/models/") {
+                    ("200 OK", format!(r#"{{"sha":"{}"}}"#, sha.lock().unwrap()).into_bytes())
+                } else if path.contains("/resolve/") {
+                    ("206 Partial Content", gguf_header("qwen3", 131072))
+                } else {
+                    ("404 Not Found", Vec::new())
+                };
+                let _ = write!(s, "HTTP/1.1 {head}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                let _ = s.write_all(&body);
+            });
+        }
+    });
+    (base, hits)
+}
+
+fn many_harness(name: &str, repos: usize, sha: &std::sync::Arc<std::sync::Mutex<String>>) -> (Harness<'static, App>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let mut h = harness_sized(name, Tab::Models, 800.0);
+    with_gpu(&mut h, 0, 96 << 30);
+    let (hub, hits) = many_hub(repos, sha.clone());
+    {
+        let app = h.state_mut();
+        app.models.hub_base = hub;
+        app.models.pane = models::Pane::Discover;
+        app.models.query = "m".into();
+        app.settings.default_seqs = 1;
+    }
+    h.run();
+    h.get_by_label("search").click();
+    pump_until(&mut h, 60, "inspected", |a| a.models.infos.len() == repos);
+    h.run();
+    (h, hits)
+}
+
+fn frame_ms(h: &mut Harness<'static, App>, frames: usize) -> f64 {
+    let start = Instant::now();
+    for _ in 0..frames {
+        h.step();
+    }
+    start.elapsed().as_secs_f64() * 1000.0 / frames as f64
+}
+
+#[test]
+fn discover_plans_once_and_frames_stay_cheap_with_100_results() {
+    let sha = std::sync::Arc::new(std::sync::Mutex::new("abc".to_string()));
+    let (mut h, _) = many_harness("frame-time-100", 100, &sha);
+    let runs = h.state().models.plan_runs;
+    let ms = frame_ms(&mut h, 30);
+    eprintln!("discover frame 100 results: {ms:.2} ms");
+    assert_eq!(h.state().models.plan_runs, runs, "frames must not replan");
+    assert!(ms < 6.0, "{ms} ms per frame");
+    assert!(runs <= 3, "{runs} plan runs while loading");
+}
+
+#[test]
+fn discover_replans_when_the_gpu_budget_moves_past_a_bucket_only() {
+    let sha = std::sync::Arc::new(std::sync::Mutex::new("abc".to_string()));
+    let (mut h, _) = many_harness("replan-budget", 5, &sha);
+    h.state_mut().gpu[0].used_bytes = 100 << 20;
+    h.run();
+    let runs = h.state().models.plan_runs;
+    h.state_mut().gpu[0].used_bytes += 1 << 20;
+    h.run();
+    assert_eq!(h.state().models.plan_runs, runs);
+    h.state_mut().gpu[0].used_bytes += 40 << 30;
+    h.run();
+    assert_eq!(h.state().models.plan_runs, runs + 1);
+}
+
+#[test]
+fn a_second_search_for_the_same_repos_reads_the_disk_cache_not_the_hub() {
+    let sha = std::sync::Arc::new(std::sync::Mutex::new("abc".to_string()));
+    let (mut h, hits) = many_harness("info-cache", 4, &sha);
+    let before = hits.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(before > 4, "{before}");
+    h.state_mut().models.infos.clear();
+    h.get_by_label("search").click();
+    pump_until(&mut h, 20, "reinspected", |a| a.models.infos.len() == 4);
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before + 1, "only the search itself hits the hub");
+}
