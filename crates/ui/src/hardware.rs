@@ -88,7 +88,8 @@ fn spoken(r: egui::Response, text: String) {
     r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, text.clone()));
 }
 
-fn peer_row(ui: &mut egui::Ui, p: &Peer) {
+fn peer_row(ui: &mut egui::Ui, p: &Peer, use_state: Option<bool>) -> bool {
+    let mut toggled = false;
     ui.horizontal(|ui| {
         let r = Line::new().value(p.summary()).gap(10.0).measured(format!("{:.0} GB", p.memory_gib() * 1.073_741_824)).show(ui);
         spoken(r, format!("{}  {:.0} GB", p.summary(), p.memory_gib() * 1.073_741_824));
@@ -99,14 +100,19 @@ fn peer_row(ui: &mut egui::Ui, p: &Peer) {
             spoken(r, text);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if let Some(on) = use_state {
+                toggled = ui.add(Key::new(if on { "in use" } else { "not in use" }).outline(if on { OK } else { LEGEND }).id_salt(("peer-use", &p.host))).clicked();
+            }
             let address = p.control.as_deref().unwrap_or("no address");
             let r = Line::new().note(address).show(ui);
             spoken(r, address.to_string());
         });
     });
+    toggled
 }
 
-fn gpu_card(ui: &mut egui::Ui, g: &GpuInfo, on: bool) {
+fn gpu_card(ui: &mut egui::Ui, g: &GpuInfo, on: bool) -> bool {
+    let mut toggled = false;
     let used = g.total_bytes.saturating_sub(g.free_bytes);
     card(
         ui,
@@ -114,7 +120,10 @@ fn gpu_card(ui: &mut egui::Ui, g: &GpuInfo, on: bool) {
         |ui| {
             let r = Line::new().legend(&format!("gpu {}", g.ordinal)).gap(10.0).value(g.label()).show(ui);
             spoken(r, format!("GPU {}  {}", g.ordinal, g.label()));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| tag(ui, &g.arch(), LEGEND, false));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                toggled = ui.add(Key::new(if on { "in use" } else { "switched off" }).outline(if on { OK } else { LEGEND }).id_salt(("gpu-switch", g.ordinal))).clicked();
+                tag(ui, &g.arch(), LEGEND, false);
+            });
         },
         |ui| {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
@@ -127,6 +136,7 @@ fn gpu_card(ui: &mut egui::Ui, g: &GpuInfo, on: bool) {
             spoken(r, speed);
         },
     );
+    toggled
 }
 
 pub fn pump(app: &mut App) {
@@ -280,9 +290,7 @@ fn this_machine(app: &mut App, ui: &mut egui::Ui) {
         for g in &m.gpus {
             let name = specrt::hardware::device_name(&m.host, g.ordinal);
             let on = !app.settings.cluster.disabled_gpus.contains(&name);
-            gpu_card(ui, g, on);
-            let r = ui.add(Key::new(if on { "in use" } else { "switched off" }).outline(if on { OK } else { LEGEND }).id_salt(("gpu-switch", g.ordinal)));
-            if r.clicked() {
+            if gpu_card(ui, g, on) {
                 if !app.settings.cluster.disabled_gpus.remove(&name) {
                     app.settings.cluster.disabled_gpus.insert(name);
                 }
@@ -353,16 +361,13 @@ fn sharing(app: &mut App, ui: &mut egui::Ui) {
             note(ui, "no other inference-bench machine found yet", LEGEND);
         }
         for p in &peers {
-            peer_row(ui, p);
             let paired = app.settings.cluster.paired.contains(&p.host);
-            if paired {
-                let on = app.settings.cluster.peers_in_use.contains(&p.host);
-                if ui.add(Key::new(if on { "in use" } else { "not in use" }).outline(if on { OK } else { LEGEND }).id_salt(("peer-use", &p.host))).clicked() {
-                    if !app.settings.cluster.peers_in_use.remove(&p.host) {
-                        app.settings.cluster.peers_in_use.insert(p.host.clone());
-                    }
-                    app.save_settings();
+            let state = paired.then(|| app.settings.cluster.peers_in_use.contains(&p.host));
+            if peer_row(ui, p, state) {
+                if !app.settings.cluster.peers_in_use.remove(&p.host) {
+                    app.settings.cluster.peers_in_use.insert(p.host.clone());
                 }
+                app.save_settings();
             }
         }
     });
