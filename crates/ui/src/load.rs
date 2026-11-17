@@ -219,10 +219,6 @@ impl LoadDialog {
         self.anatomy = Some(a);
     }
 
-    pub fn can_load(&self, free: Option<u64>) -> bool {
-        self.holds_one_request() && self.estimate(free).is_none_or(|e| e.fits() != Some(false))
-    }
-
     pub fn plan_context(&self) -> Option<usize> {
         let a = self.anatomy()?;
         Some(pool_tokens(a, self.kv_bytes()?).min(self.max).div_ceil(self.seqs.max(1)).max(1))
@@ -240,13 +236,6 @@ impl LoadDialog {
         spec.runtime.kv_f16_layers = self.choice.value("runtime.kv_f16_layers").as_u64().map(|n| n as usize);
         let devices = inference_bench_core::discover::pool_devices(gpus);
         Some(inference_bench_core::discover::place_on(&spec, a.total_bytes, a.kv_bytes_per_token, per_slot, self.seqs, &devices).map_err(|e| format!("{e:#}")))
-    }
-
-    pub fn can_load_on(&self, gpus: &[u64]) -> bool {
-        match self.spread(gpus) {
-            Some(placed) => self.holds_one_request() && placed.is_ok(),
-            None => self.can_load(gpus.first().copied()),
-        }
     }
 
     pub fn kv_bytes(&self) -> Option<u64> {
@@ -281,6 +270,39 @@ impl LoadDialog {
 
     pub fn estimate(&self, free: Option<u64>) -> Option<Estimate> {
         self.anatomy().map(|a| estimate(a, pool_bytes(a, self.ctx, self.seqs, self.kv_gb), self.seqs, free))
+    }
+}
+
+pub struct PlanRow {
+    pub device: String,
+    pub layers: Option<(usize, usize)>,
+    pub weights: u64,
+    pub kv: u64,
+    pub state: u64,
+}
+
+pub fn plan_rows(p: &specrt::placement::Placement) -> Vec<PlanRow> {
+    p.stages
+        .iter()
+        .map(|s| PlanRow {
+            device: if s.device_name.is_empty() { format!("gpu {}", s.ordinal) } else { format!("{} #{}", s.device_name, s.ordinal) },
+            layers: Some((s.start, s.end)),
+            weights: s.weight_bytes,
+            kv: s.kv_bytes,
+            state: s.state_bytes,
+        })
+        .collect()
+}
+
+fn load_plan(ui: &mut egui::Ui, rows: &[PlanRow]) {
+    ui.add_space(4.0);
+    let head = Line::new().legend("load plan").size(10.5).show(ui);
+    head.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "load plan"));
+    for r in rows {
+        let layers = r.layers.map_or(String::new(), |(a, b)| format!("layers {a}-{}  ", b.saturating_sub(1)));
+        let text = format!("{layers}weights {}  kv {}  state {}", human_size(r.weights), human_size(r.kv), human_size(r.state));
+        let line = Line::new().legend(&r.device).column(ui, 120.0).note(text.clone()).size(11.0).show(ui);
+        line.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{} {text}", r.device)));
     }
 }
 
@@ -379,7 +401,7 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                         Line::new().legend("kv at maximum").column(ui, 120.0).value(format!("{} f16, {} fp8 at {} tokens", human_size(kv_cost_at(&v.spec, F16, at)), human_size(kv_cost_at(&v.spec, Fp8, at)), at)).size(11.0).show(ui);
                     }
                     if !dialog.holds_one_request() {
-                        status(ui, false, &format!("the KV cache cannot hold one request of {} tokens: raise it or lower the context length", dialog.ctx));
+                        status(ui, false, &format!("the KV cache cannot hold one request of {} tokens: raise it or lower the context length. You can still try to load it.", dialog.ctx));
                     }
                     if e.state > 0 {
                         let each = if dialog.seqs > 1 { format!("{} each", human_size(e.state / dialog.seqs as u64)) } else { String::new() };
@@ -395,16 +417,20 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                             r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
                             match &spread {
                                 Some(Ok(p)) => status(ui, true, &format!("fits across {} gpus in {} stage(s)", gpus.len(), p.stages.len())),
-                                Some(Err(why)) => status(ui, false, &format!("does not fit across {} gpus: {why}", gpus.len())),
+                                Some(Err(why)) => status(ui, false, &format!("the planner says it does not fit across {} gpus: {why}. You can still try to load it.", gpus.len())),
                                 None => {}
+                            }
+                            if let Some(Ok(p)) = &spread {
+                                load_plan(ui, &plan_rows(p));
                             }
                         }
                         Some(f) => {
                             Line::new().legend("free on the gpu").column(ui, 120.0).measured(human_size(f)).show(ui);
                             match e.fits() {
-                                Some(false) => status(ui, false, &format!("does not fit in free memory, {} over", human_size(e.total() - f))),
+                                Some(false) => status(ui, false, &format!("the planner says it is {} over free memory. You can still try to load it.", human_size(e.total() - f))),
                                 _ => status(ui, true, "fits in free memory"),
                             }
+                            load_plan(ui, &[PlanRow { device: "gpu 0".into(), layers: None, weights: e.weights, kv: e.kv, state: e.state }]);
                         }
                         None => note(ui, "No GPU reading yet, so the estimate cannot be checked against free memory.", LEGEND),
                     }
@@ -426,7 +452,7 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
             switch(ui, "remember for this model", &mut dialog.remember, "use this context and parallel requests next time", "Saved with the app settings, per model.");
             });
             footer(ui, |ui| {
-                if ui.add_enabled(dialog.can_load_on(&gpus), Key::new("load").solid(READOUT).min_width(100.0)).clicked() {
+                if ui.add(Key::new("load").solid(READOUT).min_width(100.0)).clicked() {
                     go = true;
                 }
                 if ui.add(Key::new("cancel").outline(VALUE).min_width(100.0)).clicked() {

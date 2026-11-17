@@ -287,9 +287,28 @@ fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
     assert!(weights > list[0], "the model must be too big for GPU 0 alone");
     assert_eq!(h.state().free_gpu_bytes(), Some(list.iter().sum()));
     assert!(matches!(dialog.spread(&list), Some(Ok(_))));
-    assert!(dialog.can_load_on(&list));
-    assert!(!dialog.can_load_on(&list[..1]));
     h.get_by_label_contains("free on 3 gpus");
+    h.get_by_label_contains("load plan");
+    h.get_by_label_contains("layers 0-");
+}
+
+#[test]
+fn load_stays_available_when_the_planner_says_the_model_will_not_fit() {
+    let mut h = harness("load-anyway", Tab::Models);
+    with_gpu(&mut h, 95 << 30, 96 << 30);
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.state_mut().load.as_mut().unwrap().ctx = 40960;
+    h.run();
+    assert!(h.query_all_by_label_contains("still try to load").count() >= 1);
+    h.get_by_label_contains("load plan");
+    let load = click_load_node(&mut h);
+    assert!(!load, "the load key must not be disabled");
+}
+
+fn click_load_node(h: &mut Harness<'static, App>) -> bool {
+    h.query_all_by_label("load").last().expect("a load key").accesskit_node().is_disabled()
 }
 
 #[test]
@@ -305,7 +324,8 @@ fn the_estimate_turns_red_when_the_model_does_not_fit_free_memory() {
     with_gpu(&mut h, 95 << 30, 96 << 30);
     h.state_mut().load.as_mut().unwrap().ctx = 40960;
     h.run();
-    h.get_by_label_contains("does not fit in free memory");
+    h.get_by_label_contains("planner says it is");
+    assert!(!click_load_node(&mut h));
     assert!(h.query_by_label("fits in free memory").is_none());
     let e = h.state().load.as_ref().unwrap().estimate(h.state().free_gpu_bytes()).unwrap();
     assert_eq!(e.fits(), Some(false));
@@ -1968,8 +1988,8 @@ fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_ca
     dialog.sync();
     let fp8 = dialog.estimate(Some(96 << 30)).unwrap().kv as f64 / (1u64 << 30) as f64;
     assert!(fp8 < gib * 0.8 && fp8 > gib * 0.7, "mixed fp8 kv {fp8} GiB vs {gib}");
-    let fits_big = dialog.can_load(Some(96 << 30));
-    let fits_small = dialog.can_load(Some(40 << 30));
+    let fits_big = dialog.estimate(Some(96 << 30)).is_none_or(|e| e.fits() != Some(false));
+    let fits_small = dialog.estimate(Some(40 << 30)).is_none_or(|e| e.fits() != Some(false));
     assert!(fits_big && !fits_small);
     assert_eq!(dialog.serve_options().unwrap().runtime.unwrap().rope_extension.unwrap().factor, 4);
     dialog.choice.reset("runtime.rope_extension.factor");
