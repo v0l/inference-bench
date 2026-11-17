@@ -1,8 +1,28 @@
 use super::Runtime;
 use crate::prefix::{SnapshotData, StateSnapshot};
+use crate::sched::HostSeq;
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr, PinnedHostSlice, result};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+static PINNED_PARKED: AtomicUsize = AtomicUsize::new(0);
+
+pub fn pinned_parked_bytes() -> usize {
+    PINNED_PARKED.load(Ordering::SeqCst)
+}
+
+struct Parked {
+    kv: PinnedHostSlice<u8>,
+    state: Option<StateSnapshot>,
+    bytes: usize,
+}
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        PINNED_PARKED.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
+}
 
 type HostPool = Arc<Mutex<Vec<PinnedHostSlice<f32>>>>;
 
@@ -157,6 +177,64 @@ impl Runtime {
             unsafe {
                 result::memcpy_dtod_async(base + (dst as usize * bytes) as u64, base + (src as usize * bytes) as u64, bytes, self.stream.cu_stream())
             }?;
+        }
+        Ok(())
+    }
+
+    fn kv_cache_block_bytes(&self) -> usize {
+        super::kv_block_bytes(&self.spec, self.kv_planes) / 4 * std::mem::size_of::<u16>()
+    }
+
+    pub fn swap_bytes(&self, blocks: usize) -> usize {
+        let state = if self.gdn.is_some() { self.state_lens().map_or(0, |(c, s)| (c + s + self.pending_len()) * 4) } else { 0 };
+        blocks * 2 * self.kv_cache_block_bytes() + state
+    }
+
+    pub fn park(&mut self, slot: usize, blocks: &[u32]) -> Result<HostSeq> {
+        ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
+        let state = if self.gdn.is_some() { Some(self.snapshot_state_blocking(slot)?) } else { None };
+        let per = self.kv_cache_block_bytes();
+        let total = blocks.len() * 2 * per;
+        let mut host = unsafe { self.ctx.alloc_pinned_with_flags::<u8>(total.max(1), 0) }.context("pinned swap buffer")?;
+        if self.snap.side.is_none() {
+            self.snap.side = Some(self.stream.fork()?);
+        }
+        let side = self.snap.side.clone().expect("side stream");
+        let ready = self.stream.record_event(None)?;
+        side.wait(&ready)?;
+        {
+            let dst = host.as_mut_slice()?;
+            for (c, cache) in [&self.buf.k_cache, &self.buf.v_cache].into_iter().enumerate() {
+                let (base, _guard) = cache.device_ptr(&side);
+                for (i, &b) in blocks.iter().enumerate() {
+                    let at = (c * blocks.len() + i) * per;
+                    unsafe { result::memcpy_dtoh_async(&mut dst[at..at + per], base + (b as usize * per) as u64, side.cu_stream()) }?;
+                }
+            }
+        }
+        side.synchronize()?;
+        PINNED_PARKED.fetch_add(total, Ordering::SeqCst);
+        let bytes = total + state.as_ref().map_or(0, |s| (s.conv().len() + s.ssm().len() + s.pending().len()) * 4);
+        Ok(HostSeq { bytes, blocks: blocks.len(), payload: Box::new(Parked { kv: host, state, bytes: total }) })
+    }
+
+    pub fn resume(&mut self, slot: usize, blocks: &[u32], seq: &HostSeq) -> Result<()> {
+        let parked = seq.payload.downcast_ref::<Parked>().context("not a parked sequence of this runtime")?;
+        ensure!(blocks.len() == seq.blocks, "{} blocks for a parked sequence of {}", blocks.len(), seq.blocks);
+        ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
+        let per = self.kv_cache_block_bytes();
+        let src = parked.kv.as_slice()?;
+        self.stream.synchronize()?;
+        for (c, cache) in [&self.buf.k_cache, &self.buf.v_cache].into_iter().enumerate() {
+            let (base, _guard) = cache.device_ptr(&self.stream);
+            for (i, &b) in blocks.iter().enumerate() {
+                let at = (c * blocks.len() + i) * per;
+                unsafe { result::memcpy_htod_async(base + (b as usize * per) as u64, &src[at..at + per], self.stream.cu_stream()) }?;
+            }
+        }
+        self.stream.synchronize()?;
+        if let Some(state) = &parked.state {
+            self.restore_state(slot, state)?;
         }
         Ok(())
     }

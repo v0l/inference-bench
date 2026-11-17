@@ -142,6 +142,12 @@ impl EngineChoice {
         if let Some(v) = values.get("serve.min_prefill_tokens").and_then(Value::as_u64) {
             opts.min_prefill_tokens = v as usize;
         }
+        if let Some(v) = values.get("serve.swap_space_gb").and_then(Value::as_f64) {
+            opts.swap_space_gb = v;
+        }
+        if let Some(v) = values.get("serve.admit_lookahead").and_then(Value::as_u64) {
+            opts.admit_lookahead = v as usize;
+        }
         let mut runtime = serde_json::to_value(RuntimeOptions::default())?;
         for (key, value) in &values {
             if let Some(path) = key.strip_prefix("runtime.").filter(|_| !value.is_null()) {
@@ -245,6 +251,8 @@ const META: &[Meta] = &[
     Meta { key: "serve.itl_target_ms", label: "inter-token target", group: Group::Serving, help: "Milliseconds a decode stream may wait between tokens while prompts are being read.", choices: &[], range: (1, 10_000) },
     Meta { key: "serve.whole_prompt_tokens", label: "whole prompt limit", group: Group::Serving, help: "A new prompt up to this many tokens is read in a single step even while others decode. 0 keeps the inter-token target in charge.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "serve.min_prefill_tokens", label: "guaranteed prefill per step", group: Group::Serving, help: "Prompt tokens read every step even when decoders already fill the inter-token target. Keeps time to first token bounded under load. 0 leaves prefill to the target alone.", choices: &[], range: (0, 1 << 20) },
+    Meta { key: "serve.swap_space_gb", label: "swap space", group: Group::Serving, help: "Gigabytes of pinned host memory where a preempted request parks its KV cache and state, instead of recomputing its prompt. 0 always recomputes.", choices: &[], range: (0, 1 << 20) },
+    Meta { key: "serve.admit_lookahead", label: "admission lookahead", group: Group::Serving, help: "Tokens of generation a new request and each running one reserve KV room for before another request is admitted. Fewer preemptions, later admission. 0 reserves the prompt only.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "speculative.enabled", label: "mtp", group: Group::Mtp, help: "Draft tokens with the model's own MTP head and verify them in one step. Output is unchanged.", choices: &[], range: (0, 0) },
     Meta { key: "speculative.draft_tokens", label: "draft tokens", group: Group::Mtp, help: "Tokens drafted per step. Auto uses the model spec, 2 on the 27B.", choices: &[], range: (1, crate::spec::MAX_DRAFT_TOKENS as u64) },
     Meta { key: "speculative.max_batch", label: "mtp batch limit", group: Group::Mtp, help: "Largest batch that still drafts. Auto uses the model spec.", choices: &[], range: (1, 64) },
@@ -294,15 +302,17 @@ struct ServeKnobs {
     itl_target_ms: u64,
     whole_prompt_tokens: usize,
     min_prefill_tokens: usize,
+    swap_space_gb: f64,
+    admit_lookahead: usize,
 }
 
 fn knobs(o: &ServeOptions) -> ServeKnobs {
-    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, min_prefill_tokens, runtime: _, speculative: _, placement: _, progress: _, watchdog: _ } = o;
-    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens }
+    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, runtime: _, speculative: _, placement: _, progress: _, watchdog: _ } = o;
+    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead }
 }
 
 fn populated_knobs() -> ServeKnobs {
-    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, whole_prompt_tokens: 1, min_prefill_tokens: 1 }
+    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, whole_prompt_tokens: 1, min_prefill_tokens: 1, swap_space_gb: 1.0, admit_lookahead: 1 }
 }
 
 fn populated_runtime() -> RuntimeOptions {
@@ -432,6 +442,8 @@ mod tests {
         assert_eq!(default_of("serve.itl_target_ms"), Some(json!(d.itl_target.as_millis() as u64)));
         assert_eq!(default_of("serve.whole_prompt_tokens"), Some(json!(d.whole_prompt_tokens)));
         assert_eq!(default_of("serve.min_prefill_tokens"), Some(json!(d.min_prefill_tokens)));
+        assert_eq!(default_of("serve.swap_space_gb"), Some(json!(d.swap_space_gb)));
+        assert_eq!(default_of("serve.admit_lookahead"), Some(json!(d.admit_lookahead)));
         assert_eq!(default_of("serve.max_num_seqs"), Some(json!(d.max_num_seqs)));
         let rt = RuntimeOptions::default();
         assert_eq!(default_of("runtime.graphs"), Some(json!(rt.graphs)));

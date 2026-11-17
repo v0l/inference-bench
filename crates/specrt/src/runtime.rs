@@ -18,13 +18,14 @@ mod exec;
 mod fused;
 mod moe;
 mod mtp;
-mod snapshot;
+pub(crate) mod snapshot;
 mod stage;
 mod step;
 pub use fused::PrefillPart;
 use exec::Plans;
 pub use mtp::{SpecRow, SpecStats};
 pub use stage::{StageRange, StageRole};
+pub use snapshot::pinned_parked_bytes;
 pub use step::{DecodeRow, GRAPH_SIZES, Mask, Stepper, pad_rows};
 
 struct Plan {

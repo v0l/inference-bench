@@ -53,6 +53,8 @@ pub struct ServeOptions {
     pub itl_target: Duration,
     pub whole_prompt_tokens: usize,
     pub min_prefill_tokens: usize,
+    pub swap_space_gb: f64,
+    pub admit_lookahead: usize,
     pub runtime: Option<RuntimeOptions>,
     pub speculative: SpeculativeOptions,
     pub placement: Option<crate::placement::PlacementConfig>,
@@ -71,6 +73,8 @@ impl Default for ServeOptions {
             itl_target: Duration::from_millis(100),
             whole_prompt_tokens: 1024,
             min_prefill_tokens: 512,
+            swap_space_gb: 0.0,
+            admit_lookahead: 512,
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,
@@ -477,6 +481,8 @@ fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
         itl_target: opts.itl_target,
         whole_prompt_tokens: opts.whole_prompt_tokens,
         min_prefill_tokens: opts.min_prefill_tokens,
+        swap_space_bytes: (opts.swap_space_gb * (1u64 << 30) as f64) as u64,
+        admit_lookahead: opts.admit_lookahead,
         prefix_cache: spec.runtime.prefix_cache,
         ..Config::default()
     }

@@ -3,6 +3,7 @@ use crate::prefix::{self, Hash, PrefixCache, StateSnapshot};
 use crate::runtime::{Mask, DecodeRow, PrefillPart, Runtime, Sampling, SpecRow, Stepper};
 use crate::spec::PrefixCacheOptions;
 use anyhow::{Result, bail};
+use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -116,7 +117,22 @@ pub struct ChainMetrics {
     pub lost: Option<String>,
 }
 
+pub struct HostSeq {
+    pub bytes: usize,
+    pub blocks: usize,
+    pub payload: Box<dyn Any + Send>,
+}
+
 pub trait Executor {
+    fn swap_bytes(&self, _blocks: usize) -> usize {
+        0
+    }
+    fn park(&mut self, _slot: usize, _blocks: &[u32]) -> Result<Option<HostSeq>> {
+        Ok(None)
+    }
+    fn resume(&mut self, _slot: usize, _blocks: &[u32], _host: &HostSeq) -> Result<()> {
+        bail!("this executor cannot resume a parked sequence")
+    }
     fn chain_metrics(&self) -> Option<ChainMetrics> {
         None
     }
@@ -343,6 +359,18 @@ impl Executor for GpuExecutor {
     fn copy_block(&mut self, src: u32, dst: u32) -> Result<()> {
         self.rt.copy_kv_block(src, dst)
     }
+
+    fn swap_bytes(&self, blocks: usize) -> usize {
+        self.rt.swap_bytes(blocks)
+    }
+
+    fn park(&mut self, slot: usize, blocks: &[u32]) -> Result<Option<HostSeq>> {
+        self.rt.park(slot, blocks).map(Some)
+    }
+
+    fn resume(&mut self, slot: usize, blocks: &[u32], host: &HostSeq) -> Result<()> {
+        self.rt.resume(slot, blocks, host)
+    }
 }
 
 pub struct PipelineExecutor {
@@ -431,6 +459,8 @@ pub struct Config {
     pub shortest_first: bool,
     pub whole_prompt_tokens: usize,
     pub prefix_cache: PrefixCacheOptions,
+    pub swap_space_bytes: u64,
+    pub admit_lookahead: usize,
 }
 
 impl Default for Config {
@@ -445,6 +475,8 @@ impl Default for Config {
             shortest_first: true,
             whole_prompt_tokens: 0,
             prefix_cache: PrefixCacheOptions::default(),
+            swap_space_bytes: 0,
+            admit_lookahead: 512,
         }
     }
 }
@@ -509,6 +541,7 @@ struct Seq {
     keys: Vec<u32>,
     media: Option<Arc<crate::vision::MediaPlan>>,
     cursor: Option<crate::grammar::Cursor>,
+    parked: Option<HostSeq>,
 }
 
 impl Seq {
@@ -535,6 +568,10 @@ pub struct Scheduler<E: Executor> {
     next_id: SeqId,
     admissions: u64,
     preemptions: u64,
+    swapped_out: u64,
+    swapped_in: u64,
+    swapped_bytes: u64,
+    recomputed_tokens: u64,
     state_refusals: u64,
     prefill_rate: f64,
     decode_secs: f64,
@@ -572,6 +609,10 @@ impl<E: Executor> Scheduler<E> {
             next_id: 1,
             admissions: 0,
             preemptions: 0,
+            swapped_out: 0,
+            swapped_in: 0,
+            swapped_bytes: 0,
+            recomputed_tokens: 0,
             state_refusals: 0,
             prefill_rate: 0.0,
             decode_secs: 0.0,
@@ -645,6 +686,22 @@ impl<E: Executor> Scheduler<E> {
         self.preemptions
     }
 
+    pub fn swapped_out(&self) -> u64 {
+        self.swapped_out
+    }
+
+    pub fn swapped_in(&self) -> u64 {
+        self.swapped_in
+    }
+
+    pub fn swapped_bytes(&self) -> u64 {
+        self.swapped_bytes
+    }
+
+    pub fn recomputed_tokens(&self) -> u64 {
+        self.recomputed_tokens
+    }
+
     pub fn idle(&self) -> bool {
         self.running.is_empty() && self.waiting.is_empty()
     }
@@ -715,6 +772,7 @@ impl<E: Executor> Scheduler<E> {
             keys,
             media,
             cursor,
+            parked: None,
         });
         Ok(id)
     }
@@ -722,6 +780,9 @@ impl<E: Executor> Scheduler<E> {
     pub fn cancel(&mut self, id: SeqId, events: &mut Vec<Event>) {
         if let Some(i) = self.waiting.iter().position(|s| s.id == id) {
             let s = self.waiting.remove(i).expect("index from position");
+            if let Some(h) = &s.parked {
+                self.swapped_bytes -= h.bytes as u64;
+            }
             events.push(finished(&s, Finish::Cancelled));
             return;
         }
@@ -740,11 +801,47 @@ impl<E: Executor> Scheduler<E> {
         }
     }
 
+    fn try_park(&mut self, s: &Seq) -> Option<HostSeq> {
+        let slot = s.slot?;
+        if s.computed == 0 {
+            return None;
+        }
+        let bytes = self.exec.swap_bytes(s.blocks.len()) as u64;
+        if bytes == 0 || self.swapped_bytes + bytes > self.cfg.swap_space_bytes {
+            return None;
+        }
+        match self.exec.park(slot, &s.blocks) {
+            Ok(Some(h)) => {
+                self.swapped_bytes += h.bytes as u64;
+                self.swapped_out += 1;
+                Some(h)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "parking a sequence failed, it will be recomputed");
+                None
+            }
+        }
+    }
+
+    fn promise(&self, s: &Seq, held: usize) -> usize {
+        let ahead = (s.req.max_tokens - s.generated()).min(self.cfg.admit_lookahead);
+        blocks_for(s.tokens.len() + ahead + self.exec.draft_tokens()).saturating_sub(held)
+    }
+
+    fn running_promise(&self) -> usize {
+        self.running.iter().map(|s| self.promise(s, s.blocks.len())).sum()
+    }
+
     fn preempt_latest(&mut self, events: &mut Vec<Event>) -> SeqId {
         let i = (0..self.running.len()).max_by_key(|&i| self.running[i].admitted).expect("something is running");
         let mut s = self.running.remove(i);
+        s.parked = self.try_park(&s);
         self.release(&mut s);
-        s.computed = 0;
+        if s.parked.is_none() {
+            self.recomputed_tokens += s.computed as u64;
+            s.computed = 0;
+        }
         self.preemptions += 1;
         events.push(Event::Preempted { id: s.id });
         let id = s.id;
@@ -792,6 +889,13 @@ impl<E: Executor> Scheduler<E> {
             }
             let need = blocks_for(target + 1);
             let reserve = if self.running.is_empty() { 0 } else { self.reserve() };
+            if s.parked.is_some() {
+                if !self.resume_front(reserve)? {
+                    break;
+                }
+                continue;
+            }
+            let lookahead = if self.running.is_empty() { 0 } else { self.promise(s, 0).saturating_sub(need).min(self.cfg.admit_lookahead) + self.running_promise() };
             let hit = match self.cache.as_mut() {
                 Some(cache) => {
                     let hashes = prefix::block_hashes(&s.root, &s.keys[..target]);
@@ -801,13 +905,13 @@ impl<E: Executor> Scheduler<E> {
                 None => prefix::Hit::default(),
             };
             let fresh = need - hit.blocks.len();
-            while self.pool.free_count() < fresh + reserve {
+            while self.pool.free_count() < fresh + reserve + lookahead {
                 let evicted = self.cache.as_mut().is_some_and(|c| c.evict_one(&mut self.pool));
                 if !evicted {
                     break;
                 }
             }
-            if self.pool.free_count() < fresh + reserve {
+            if self.pool.free_count() < fresh + reserve + lookahead {
                 self.give_back(hit);
                 break;
             }
@@ -859,6 +963,52 @@ impl<E: Executor> Scheduler<E> {
             self.running.push(s);
         }
         Ok(())
+    }
+
+    fn resume_front(&mut self, reserve: usize) -> Result<bool> {
+        let front = self.waiting.front().expect("front exists");
+        let held = front.parked.as_ref().map_or(0, |h| h.blocks);
+        let total = held.max(blocks_for(front.tokens.len() + self.exec.draft_tokens()));
+        let promised = self.running_promise();
+        while self.pool.free_count() < total + reserve + promised {
+            let evicted = self.cache.as_mut().is_some_and(|c| c.evict_one(&mut self.pool));
+            if !evicted {
+                break;
+            }
+        }
+        let tight = self.pool.free_count() < total + reserve + promised;
+        if self.pool.free_count() < total + reserve || (tight && !self.running.is_empty()) {
+            return Ok(false);
+        }
+        let slot = *self.free_slots.last().expect("a free slot");
+        if self.exec.acquire_state(slot).is_err() {
+            self.state_refusals += 1;
+            return Ok(false);
+        }
+        let mut s = self.waiting.pop_front().expect("front exists");
+        let host = s.parked.take().expect("parked");
+        let mut blocks = Vec::with_capacity(total);
+        for _ in 0..total {
+            blocks.push(self.pool.alloc().expect("checked free blocks"));
+        }
+        let restored = self.exec.set_table(slot, &blocks).and_then(|_| self.exec.resume(slot, &blocks[..held], &host));
+        if let Err(e) = restored {
+            self.exec.release_state(slot);
+            self.pool.release(&mut blocks);
+            s.parked = Some(host);
+            self.waiting.push_front(s);
+            return Err(e);
+        }
+        self.swapped_bytes -= host.bytes as u64;
+        self.swapped_in += 1;
+        self.free_slots.pop();
+        self.exec.set_media(slot, s.media.as_deref())?;
+        s.blocks = blocks;
+        s.slot = Some(slot);
+        self.admissions += 1;
+        s.admitted = self.admissions;
+        self.running.push(s);
+        Ok(true)
     }
 
     fn give_back(&mut self, hit: prefix::Hit) {
@@ -1208,6 +1358,9 @@ mod tests {
         first_mask: Option<Mask>,
         pub masked_calls: usize,
         pub grammar: bool,
+        pub swap: bool,
+        pub parks: usize,
+        pub resumes: usize,
     }
 
     fn constrain(t: u32, mask: &Option<Mask>) -> u32 {
@@ -1245,6 +1398,9 @@ mod tests {
                 first_mask: None,
                 masked_calls: 0,
                 grammar: true,
+                swap: false,
+                parks: 0,
+                resumes: 0,
             }
         }
 
@@ -1366,6 +1522,26 @@ mod tests {
                 self.kv[dst as usize * PAGE + i] = self.kv[src as usize * PAGE + i];
             }
             self.block_copies += 1;
+            Ok(())
+        }
+        fn swap_bytes(&self, blocks: usize) -> usize {
+            if self.swap { blocks * 1000 + 100 } else { 0 }
+        }
+        fn park(&mut self, slot: usize, blocks: &[u32]) -> Result<Option<HostSeq>> {
+            if !self.swap {
+                return Ok(None);
+            }
+            self.parks += 1;
+            let kv: Vec<Vec<Option<u32>>> = blocks.iter().map(|&b| self.kv[b as usize * PAGE..(b as usize + 1) * PAGE].to_vec()).collect();
+            Ok(Some(HostSeq { bytes: blocks.len() * 1000 + 100, blocks: blocks.len(), payload: Box::new((kv, self.state[slot])) }))
+        }
+        fn resume(&mut self, slot: usize, blocks: &[u32], host: &HostSeq) -> Result<()> {
+            self.resumes += 1;
+            let (kv, state) = host.payload.downcast_ref::<(Vec<Vec<Option<u32>>>, (u64, usize))>().unwrap();
+            for (&b, page) in blocks.iter().zip(kv) {
+                self.kv[b as usize * PAGE..(b as usize + 1) * PAGE].copy_from_slice(page);
+            }
+            self.state[slot] = *state;
             Ok(())
         }
         fn draft_tokens(&self) -> usize {
@@ -1512,7 +1688,7 @@ mod tests {
     #[test]
     fn sixty_four_mixed_sequences_match_single_sequence_output_under_preemption() {
         let fake = Fake::new(2048, 16, 120, 256);
-        let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), ..Config::default() };
+        let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), admit_lookahead: 0, ..Config::default() };
         let mut s = Scheduler::new(fake, cfg);
         let mut want = HashMap::new();
         for q in 0..64u32 {
@@ -1527,13 +1703,90 @@ mod tests {
         assert_eq!(finished, 64);
     }
 
+    fn pressured(swap_gb: u64, lookahead: usize) -> (Scheduler<Fake>, HashMap<SeqId, Vec<u32>>) {
+        let mut fake = Fake::new(2048, 16, 120, 256);
+        fake.swap = true;
+        let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), swap_space_bytes: swap_gb, admit_lookahead: lookahead, ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        let mut want = HashMap::new();
+        for q in 0..64u32 {
+            let r = request([3, 17, 90, 400, 1100][q as usize % 5], 20 + (q as usize * 13) % 200, q);
+            want.insert(s.submit(r.clone()).unwrap(), expected(&r.prompt, r.max_tokens, &[]));
+        }
+        (s, want)
+    }
+
+    #[test]
+    fn swap_preemption_keeps_outputs_and_reprefills_nothing_when_the_host_pool_fits() {
+        let (mut s, want) = pressured(1 << 30, 0);
+        let (got, events, reports) = drain(&mut s);
+        assert!(s.preemptions() > 0, "the pool was meant to run out");
+        assert_eq!(s.swapped_out(), s.preemptions());
+        assert_eq!(s.swapped_in(), s.swapped_out());
+        assert_eq!(s.recomputed_tokens(), 0);
+        assert_eq!(s.exec.parks, s.exec.resumes);
+        assert_eq!(s.swapped_bytes(), 0);
+        assert_eq!(s.blocks_used(), 0);
+        assert_eq!(got, want);
+        let prompt_tokens: usize = (0..64usize).map(|q| [3, 17, 90, 400, 1100][q % 5]).sum();
+        let prefilled: usize = reports.iter().map(|r| r.prefill_tokens).sum();
+        assert_eq!(prefilled, prompt_tokens);
+        assert_eq!(events.iter().filter(|e| matches!(e, Event::Finished { finish: Finish::Length, .. })).count(), 64);
+    }
+
+    #[test]
+    fn swap_falls_back_to_recompute_when_the_host_pool_is_full() {
+        let (mut s, want) = pressured(2500, 0);
+        let (got, _, _) = drain(&mut s);
+        assert!(s.swapped_out() > 0);
+        assert!(s.recomputed_tokens() > 0);
+        assert_eq!(s.swapped_bytes(), 0);
+        assert_eq!(got, want);
+        let (mut none, want) = pressured(0, 0);
+        let (got, _, _) = drain(&mut none);
+        assert_eq!(none.swapped_out(), 0);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn cancelling_a_parked_sequence_returns_its_host_space() {
+        let (mut s, _) = pressured(1 << 30, 0);
+        let mut events = Vec::new();
+        while s.swapped_bytes() == 0 {
+            s.step(&mut events).unwrap();
+        }
+        let ids: Vec<SeqId> = s.waiting.iter().filter(|q| q.parked.is_some()).map(|q| q.id).collect();
+        for id in ids {
+            s.cancel(id, &mut events);
+        }
+        assert_eq!(s.swapped_bytes(), 0);
+    }
+
+    #[test]
+    fn lookahead_admission_preempts_less_than_prompt_only_admission() {
+        let run = |lookahead: usize| {
+            let mut fake = Fake::new(2048, 16, 120, 256);
+            let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), admit_lookahead: lookahead, ..Config::default() };
+            let mut s = Scheduler::new(fake, cfg);
+            let mut want = HashMap::new();
+            for q in 0..64u32 {
+                let r = request([3, 17, 90, 400, 1100][q as usize % 5], 20 + (q as usize * 13) % 200, q);
+                want.insert(s.submit(r.clone()).unwrap(), expected(&r.prompt, r.max_tokens, &[]));
+            }
+            let (got, _, _) = drain(&mut s);
+            assert_eq!(got, want);
+            s.preemptions()
+        };
+        assert!(run(512) < run(0));
+    }
+
     #[test]
     fn speculative_steps_with_different_accept_counts_match_single_sequence_output_under_preemption() {
         for (k, cap) in [(1, 16), (2, 16), (3, 16), (2, 4)] {
             let mut fake = Fake::new(2048, 16, 120, 256);
             fake.spec_k = k;
             fake.spec_cap = cap;
-            let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), ..Config::default() };
+            let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), admit_lookahead: 0, ..Config::default() };
             let mut s = Scheduler::new(fake, cfg);
             let mut want = HashMap::new();
             for q in 0..64u32 {
@@ -1823,7 +2076,7 @@ mod tests {
     fn recurrent_states_are_freed_by_finish_cancel_and_preemption_with_no_growth() {
         let mut fake = Fake::new(512, 6, 60, 256);
         fake.state_budget = 4;
-        let mut s = Scheduler::new(fake, Config { max_num_seqs: 6, reserve_blocks: Some(1), ..Config::default() });
+        let mut s = Scheduler::new(fake, Config { max_num_seqs: 6, reserve_blocks: Some(1), admit_lookahead: 0, ..Config::default() });
         let mut x = 12345u64;
         let mut events = Vec::new();
         for round in 0..1000u32 {
