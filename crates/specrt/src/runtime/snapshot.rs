@@ -224,4 +224,64 @@ impl Runtime {
         }
         Ok(())
     }
+
+    pub fn session_compat(&self) -> crate::sessions::Compat {
+        let model = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(self.spec.name.as_bytes());
+            h.update(self.spec.repo.as_bytes());
+            h.finalize().into()
+        };
+        crate::sessions::Compat {
+            model_hash: model,
+            spec_hash: crate::prefix::namespace(&self.spec, self.kv_planes, ""),
+            kv_dtype: self.spec.runtime.kv_dtype as u32,
+            layers: self.spec.kv_layers() as u32,
+            block_size: crate::codegen::PAGE as u32,
+        }
+    }
+
+    pub fn save_kv_blocks(&mut self, blocks: &[u32]) -> Result<(Vec<u8>, Vec<u8>)> {
+        ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
+        let per = self.kv_cache_block_bytes();
+        let total = blocks.len() * per;
+        let mut host = self.host.alloc(total * 2)?;
+        if self.snap.side.is_none() {
+            self.snap.side = Some(self.stream.fork()?);
+        }
+        let side = self.snap.side.clone().expect("side stream");
+        let ready = self.stream.record_event(None)?;
+        side.wait(&ready)?;
+        let mut out = Vec::with_capacity(2);
+        for (c, cache) in [&self.buf.k_cache, &self.buf.v_cache].into_iter().enumerate() {
+            let (base, _guard) = cache.device_ptr(&side);
+            let dst = host.as_mut_slice()?;
+            for (i, &b) in blocks.iter().enumerate() {
+                let at = c * total + i * per;
+                unsafe { result::memcpy_dtoh_async(&mut dst[at..at + per], base + (b as usize * per) as u64, side.cu_stream()) }?;
+            }
+        }
+        side.synchronize()?;
+        let all = host.as_slice()?;
+        out.push(all[..total].to_vec());
+        out.push(all[total..].to_vec());
+        let v = out.pop().expect("v");
+        let k = out.pop().expect("k");
+        Ok((k, v))
+    }
+
+    pub fn load_kv_blocks(&mut self, blocks: &[u32], k: &[u8], v: &[u8]) -> Result<()> {
+        ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
+        let per = self.kv_cache_block_bytes();
+        ensure!(k.len() == blocks.len() * per && v.len() == k.len(), "session KV is {} bytes, expected {}", k.len(), blocks.len() * per);
+        for (cache, data) in [(&self.buf.k_cache, k), (&self.buf.v_cache, v)] {
+            let (base, _guard) = cache.device_ptr(&self.stream);
+            for (i, &b) in blocks.iter().enumerate() {
+                unsafe { result::memcpy_htod_async(base + (b as usize * per) as u64, &data[i * per..(i + 1) * per], self.stream.cu_stream()) }?;
+            }
+        }
+        self.stream.synchronize()?;
+        Ok(())
+    }
 }

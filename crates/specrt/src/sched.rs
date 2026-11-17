@@ -201,6 +201,15 @@ pub trait Executor {
     fn copy_block(&mut self, _src: u32, _dst: u32) -> Result<()> {
         bail!("this executor cannot copy KV blocks")
     }
+    fn session_compat(&self) -> Option<crate::sessions::Compat> {
+        None
+    }
+    fn save_session(&mut self, _blocks: &[u32], _state: Option<&StateSnapshot>) -> Result<Vec<Vec<u8>>> {
+        bail!("this executor cannot save sessions")
+    }
+    fn restore_session(&mut self, _slot: usize, _blocks: &[u32], _sections: &[Vec<u8>]) -> Result<()> {
+        bail!("this executor cannot restore sessions")
+    }
     fn supports_logprobs(&self) -> bool {
         false
     }
@@ -370,6 +379,24 @@ impl Executor for GpuExecutor {
 
     fn resume(&mut self, slot: usize, blocks: &[u32], host: &HostSeq) -> Result<()> {
         self.rt.resume(slot, blocks, host)
+    }
+
+    fn session_compat(&self) -> Option<crate::sessions::Compat> {
+        Some(self.rt.session_compat())
+    }
+
+    fn save_session(&mut self, blocks: &[u32], state: Option<&StateSnapshot>) -> Result<Vec<Vec<u8>>> {
+        let (k, v) = self.rt.save_kv_blocks(blocks)?;
+        Ok(crate::sessions::pack_sections(k, v, state))
+    }
+
+    fn restore_session(&mut self, slot: usize, blocks: &[u32], sections: &[Vec<u8>]) -> Result<()> {
+        let state = crate::sessions::unpack_state(sections)?;
+        self.rt.load_kv_blocks(blocks, &sections[crate::sessions::SECTION_K], &sections[crate::sessions::SECTION_V])?;
+        if let Some(state) = state {
+            self.rt.restore_state(slot, &state)?;
+        }
+        Ok(())
     }
 }
 
@@ -580,6 +607,42 @@ pub struct Scheduler<E: Executor> {
     cache: Option<PrefixCache>,
     prefix_queries: u64,
     prefix_hits: u64,
+    sessions: Option<Sessions>,
+}
+
+struct Held {
+    scope: Hash,
+    tokens: Vec<u32>,
+    blocks: Vec<u32>,
+    state: Option<Arc<StateSnapshot>>,
+}
+
+struct Sessions {
+    shared: Arc<crate::sessions::Shared>,
+    janitor: crate::sessions::Janitor,
+    held: std::collections::HashMap<String, Held>,
+    clock: Box<dyn Fn() -> u64 + Send>,
+    last_tick: u64,
+}
+
+struct Capturing<'a, E: Executor> {
+    exec: &'a mut E,
+    pool: &'a mut BlockPool,
+    held: &'a mut std::collections::HashMap<String, Held>,
+}
+
+impl<E: Executor> crate::sessions::Capture for Capturing<'_, E> {
+    fn capture(&mut self, key: &str) -> Result<crate::sessions::Session> {
+        let h = self.held.get(key).ok_or_else(|| anyhow::anyhow!("session {key} is not resident"))?;
+        let sections = self.exec.save_session(&h.blocks, h.state.as_deref())?;
+        Ok(crate::sessions::Session { scope: h.scope, tokens: h.tokens.clone(), sections })
+    }
+
+    fn release(&mut self, key: &str) {
+        if let Some(mut h) = self.held.remove(key) {
+            self.pool.release(&mut h.blocks);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -623,6 +686,143 @@ impl<E: Executor> Scheduler<E> {
             cache,
             prefix_queries: 0,
             prefix_hits: 0,
+            sessions: None,
+        }
+    }
+
+    pub fn enable_sessions(&mut self, shared: Arc<crate::sessions::Shared>) {
+        let janitor = crate::sessions::Janitor::new(shared.options.clone());
+        self.sessions = Some(Sessions { shared, janitor, held: Default::default(), clock: Box::new(crate::sessions::now_seconds), last_tick: 0 });
+    }
+
+    pub fn set_session_clock(&mut self, clock: Box<dyn Fn() -> u64 + Send>) {
+        if let Some(s) = self.sessions.as_mut() {
+            s.clock = clock;
+        }
+    }
+
+    pub fn resident_sessions(&self) -> usize {
+        self.sessions.as_ref().map_or(0, |s| s.held.len())
+    }
+
+    fn track_session(&mut self, i: usize) {
+        let Some(sessions) = self.sessions.as_mut() else { return };
+        let s = &self.running[i];
+        let n = s.computed;
+        if n < sessions.shared.options.min_tokens.max(1) || !s.req.media.is_empty() || s.slot.is_none() {
+            return;
+        }
+        let Some(compat) = self.exec.session_compat() else { return };
+        let state = if self.exec.hybrid() {
+            match self.exec.snapshot(s.slot.expect("slot")) {
+                Ok(st) => Some(Arc::new(st)),
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "session state not captured");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let tokens = s.keys[..n].to_vec();
+        let scope = s.root;
+        let id = crate::sessions::session_id(&compat, &scope, &tokens);
+        let mut blocks = s.blocks[..blocks_for(n)].to_vec();
+        for &b in &blocks {
+            self.pool.retain(b);
+        }
+        let superseded: Vec<String> = sessions.held.iter().filter(|(_, h)| h.scope == scope && tokens.starts_with(&h.tokens)).map(|(k, _)| k.clone()).collect();
+        for k in superseded {
+            if let Some(mut h) = sessions.held.remove(&k) {
+                self.pool.release(&mut h.blocks);
+            }
+        }
+        if let Some(mut old) = sessions.held.remove(&id) {
+            self.pool.release(&mut old.blocks);
+        }
+        let now = (sessions.clock)();
+        sessions.janitor.tracker.touch(&id, now, n);
+        sessions.held.insert(id, Held { scope, tokens, blocks: std::mem::take(&mut blocks), state });
+        self.publish_residents();
+    }
+
+    fn publish_residents(&self) {
+        let Some(sessions) = self.sessions.as_ref() else { return };
+        let mut list: Vec<crate::sessions::Resident> = sessions
+            .held
+            .iter()
+            .map(|(id, h)| crate::sessions::Resident { id: id.clone(), tokens: h.tokens.len(), last_used: sessions.janitor.tracker.last_request(id).map_or(0, |l| l.0) })
+            .collect();
+        list.sort_by(|a, b| a.id.cmp(&b.id));
+        *sessions.shared.resident.lock().expect("residents") = list;
+    }
+
+    pub fn tick_sessions(&mut self) {
+        let Some(sessions) = self.sessions.as_mut() else { return };
+        let now = (sessions.clock)();
+        let forced: Vec<String> = std::mem::take(&mut *sessions.shared.force.lock().expect("force"));
+        let mut keys: Vec<String> = forced.into_iter().filter(|k| sessions.held.contains_key(k)).collect();
+        keys.extend(sessions.janitor.tracker.due(now, sessions.janitor.options.idle_seconds, sessions.janitor.options.min_tokens).into_iter().filter(|k| sessions.held.contains_key(k)));
+        keys.dedup();
+        let store = &sessions.shared.store;
+        store.expire(now, sessions.janitor.options.ttl_seconds());
+        let mut cap = Capturing { exec: &mut self.exec, pool: &mut self.pool, held: &mut sessions.held };
+        let written = sessions.janitor.save_keys(keys, now, store, &mut cap);
+        for e in &written {
+            tracing::info!(session = %e.id, tokens = e.tokens, bytes = e.bytes, "session snapshot written");
+        }
+        store.enforce_budget(sessions.janitor.options.max_bytes);
+        sessions.last_tick = now;
+        self.publish_residents();
+    }
+
+    fn spill_one_session(&mut self) -> bool {
+        let Some(sessions) = self.sessions.as_mut() else { return false };
+        let oldest = sessions.held.keys().min_by_key(|k| sessions.janitor.tracker.last_request(k).map_or(0, |l| l.0)).cloned();
+        let Some(key) = oldest else { return false };
+        let now = (sessions.clock)();
+        let mut cap = Capturing { exec: &mut self.exec, pool: &mut self.pool, held: &mut sessions.held };
+        let written = sessions.janitor.save_keys(vec![key.clone()], now, &sessions.shared.store, &mut cap);
+        if written.is_empty() {
+            if let Some(mut h) = sessions.held.remove(&key) {
+                self.pool.release(&mut h.blocks);
+            }
+        }
+        self.publish_residents();
+        true
+    }
+
+    fn session_hit(&self, s: &Seq, target: usize, better_than: usize) -> Option<crate::sessions::Entry> {
+        let sessions = self.sessions.as_ref()?;
+        if s.generated() != 0 || !s.req.media.is_empty() {
+            return None;
+        }
+        let e = sessions.shared.store.find_prefix(&s.root, &s.keys[..target])?;
+        (e.tokens > better_than && e.tokens < target).then_some(e)
+    }
+
+    fn restore_session(&mut self, entry: &crate::sessions::Entry, s: &mut Seq, slot: usize) {
+        let Some(sessions) = self.sessions.as_ref() else { return };
+        let now = (sessions.clock)();
+        let started = Instant::now();
+        let loaded = sessions.shared.store.load(&entry.id, now);
+        let outcome = loaded.and_then(|session| {
+            anyhow::ensure!(session.tokens.len() == entry.tokens && s.keys.starts_with(&session.tokens), "snapshot tokens differ from the prompt");
+            self.exec.restore_session(slot, &s.blocks[..blocks_for(entry.tokens)], &session.sections)
+        });
+        match outcome {
+            Ok(()) => {
+                s.computed = entry.tokens;
+                s.cached = entry.tokens;
+                tracing::info!(session = %entry.id, tokens = entry.tokens, secs = started.elapsed().as_secs_f64(), "session restored without prefill");
+                if !sessions.shared.options.keep_after_restore {
+                    let _ = sessions.shared.store.delete(&entry.id);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(session = %entry.id, error = %format!("{e:#}"), "session restore failed, prefilling the prompt");
+                let _ = sessions.shared.store.delete(&entry.id);
+            }
         }
     }
 
@@ -643,8 +843,8 @@ impl<E: Executor> Scheduler<E> {
             if let Some(b) = self.pool.alloc() {
                 return Some(b);
             }
-            let cache = self.cache.as_mut()?;
-            if !cache.evict_one(&mut self.pool) {
+            let evicted = self.cache.as_mut().is_some_and(|c| c.evict_one(&mut self.pool));
+            if !evicted && !self.spill_one_session() {
                 return None;
             }
         }
@@ -920,9 +1120,16 @@ impl<E: Executor> Scheduler<E> {
                 }
                 None => prefix::Hit::default(),
             };
+            let from_disk = self.session_hit(s, target, hit.tokens);
+            let hit = if from_disk.is_some() {
+                self.give_back(hit);
+                prefix::Hit::default()
+            } else {
+                hit
+            };
             let fresh = need - hit.blocks.len();
             while self.pool.free_count() < fresh + reserve + lookahead {
-                let evicted = self.cache.as_mut().is_some_and(|c| c.evict_one(&mut self.pool));
+                let evicted = self.cache.as_mut().is_some_and(|c| c.evict_one(&mut self.pool)) || self.spill_one_session();
                 if !evicted {
                     break;
                 }
@@ -967,6 +1174,9 @@ impl<E: Executor> Scheduler<E> {
             }
             self.exec.set_table(slot, &s.blocks)?;
             self.exec.set_media(slot, s.media.as_deref())?;
+            if let Some(entry) = from_disk {
+                self.restore_session(&entry, &mut s, slot);
+            }
             s.slot = Some(slot);
             self.admissions += 1;
             s.admitted = self.admissions;
@@ -1293,6 +1503,7 @@ impl<E: Executor> Scheduler<E> {
         done.dedup();
         for &i in done.iter().rev() {
             self.cache_progress(i, true)?;
+            self.track_session(i);
             let mut s = self.running.remove(i);
             self.release(&mut s);
             let finish = finish_of(&s);
@@ -1365,6 +1576,7 @@ mod tests {
         pub light: bool,
         pub prefix_enabled: bool,
         pub restores: usize,
+        pub session_restores: usize,
         pub block_copies: usize,
         pub spec_k: usize,
         pub spec_cap: usize,
@@ -1405,6 +1617,7 @@ mod tests {
                 light: false,
                 prefix_enabled: true,
                 restores: 0,
+                session_restores: 0,
                 block_copies: 0,
                 spec_k: 0,
                 spec_cap: 0,
@@ -1533,6 +1746,34 @@ mod tests {
             let h = s[0].to_bits() as u64 | (s[1].to_bits() as u64) << 32;
             self.state[slot] = (h, s[2].to_bits() as usize);
             self.restores += 1;
+            Ok(())
+        }
+        fn session_compat(&self) -> Option<crate::sessions::Compat> {
+            Some(crate::sessions::Compat { model_hash: [1; 32], spec_hash: [2; 32], kv_dtype: 0, layers: 1, block_size: PAGE as u32 })
+        }
+        fn save_session(&mut self, blocks: &[u32], state: Option<&StateSnapshot>) -> Result<Vec<Vec<u8>>> {
+            let mut k = Vec::new();
+            for &b in blocks {
+                for i in 0..PAGE {
+                    k.extend(self.kv[b as usize * PAGE + i].map_or(u32::MAX, |t| t).to_le_bytes());
+                }
+            }
+            Ok(crate::sessions::pack_sections(k, Vec::new(), state))
+        }
+        fn restore_session(&mut self, slot: usize, blocks: &[u32], sections: &[Vec<u8>]) -> Result<()> {
+            let k = &sections[crate::sessions::SECTION_K];
+            assert_eq!(k.len(), blocks.len() * PAGE * 4);
+            for (j, &b) in blocks.iter().enumerate() {
+                for i in 0..PAGE {
+                    let at = (j * PAGE + i) * 4;
+                    let t = u32::from_le_bytes(k[at..at + 4].try_into().unwrap());
+                    self.kv[b as usize * PAGE + i] = (t != u32::MAX).then_some(t);
+                }
+            }
+            if let Some(state) = crate::sessions::unpack_state(sections)? {
+                self.restore(slot, &state)?;
+            }
+            self.session_restores += 1;
             Ok(())
         }
         fn copy_block(&mut self, src: u32, dst: u32) -> Result<()> {
@@ -1920,6 +2161,113 @@ mod tests {
             assert_eq!(cached, 368, "an identical prompt hits all but its last token's block");
             assert_eq!(s.blocks_used(), s.prefix_stats().blocks, "only the cache holds blocks when idle");
         }
+    }
+
+    fn session_scheduler(hybrid: bool, tag: &str) -> (Scheduler<Fake>, Arc<std::sync::atomic::AtomicU64>, Arc<crate::sessions::Shared>) {
+        let dir = std::env::temp_dir().join(format!("sched-sessions-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut fake = Fake::new(4096, 4, 200, 256);
+        fake.hybrid = hybrid;
+        let compat = fake.session_compat().unwrap();
+        let options = crate::sessions::SessionOptions { enabled: true, min_tokens: 64, ..Default::default() };
+        let shared = Arc::new(crate::sessions::Shared::new(crate::sessions::SessionStore::open(&dir, compat).unwrap(), options));
+        let mut s = Scheduler::new(fake, Config::default());
+        s.enable_sessions(shared.clone());
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let c = clock.clone();
+        s.set_session_clock(Box::new(move || c.load(std::sync::atomic::Ordering::SeqCst)));
+        (s, clock, shared)
+    }
+
+    #[test]
+    fn a_turn_after_six_idle_minutes_restores_from_disk_and_prefills_only_the_suffix() {
+        for hybrid in [false, true] {
+            let (mut s, clock, shared) = session_scheduler(hybrid, if hybrid { "h" } else { "p" });
+            let first = request(150, 40, 3);
+            let (out, cached, prefilled) = run_one(&mut s, first.clone());
+            assert_eq!((cached, prefilled), (0, 150));
+            let held = 150 + 40 - 1;
+            assert_eq!(s.resident_sessions(), 1);
+            let used_with_session = s.blocks_used();
+            assert!(used_with_session >= blocks_for(held));
+            clock.fetch_add(299, std::sync::atomic::Ordering::SeqCst);
+            s.tick_sessions();
+            assert!(shared.store.list().is_empty(), "4:59 idle is not written");
+            clock.fetch_add(2, std::sync::atomic::Ordering::SeqCst);
+            s.tick_sessions();
+            let listed = shared.store.list();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].tokens, held);
+            assert_eq!(s.resident_sessions(), 0);
+            assert_eq!(s.blocks_used(), 0, "the GPU blocks are free after the write");
+            clock.fetch_add(60, std::sync::atomic::Ordering::SeqCst);
+            let mut turn2 = first.clone();
+            turn2.prompt.extend(&out);
+            turn2.prompt.extend((0..30u32).map(|i| (i * 7 + 1) % VOCAB));
+            let (got, cached, prefilled) = run_one(&mut s, turn2.clone());
+            assert_eq!(got, expected(&turn2.prompt, 40, &[]), "hybrid = {hybrid}");
+            assert_eq!(cached, held, "hybrid = {hybrid}");
+            assert_eq!(prefilled, turn2.prompt.len() - held);
+            assert_eq!(s.exec.session_restores, 1);
+            assert!(shared.store.list().is_empty(), "keep_after_restore is off");
+        }
+    }
+
+    #[test]
+    fn a_session_is_deleted_after_eight_hours_and_then_the_prompt_is_prefilled_in_full() {
+        let (mut s, clock, shared) = session_scheduler(true, "ttl");
+        let first = request(150, 10, 5);
+        let (out, _, _) = run_one(&mut s, first.clone());
+        clock.fetch_add(301, std::sync::atomic::Ordering::SeqCst);
+        s.tick_sessions();
+        assert_eq!(shared.store.list().len(), 1);
+        clock.fetch_add(8 * 3600 + 301, std::sync::atomic::Ordering::SeqCst);
+        s.tick_sessions();
+        assert!(shared.store.list().is_empty());
+        let mut turn2 = first.clone();
+        turn2.prompt.extend(&out);
+        turn2.prompt.extend([1, 2, 3]);
+        let (got, cached, prefilled) = run_one(&mut s, turn2.clone());
+        assert_eq!((cached, prefilled), (0, turn2.prompt.len()));
+        assert_eq!(got, expected(&turn2.prompt, 10, &[]));
+    }
+
+    #[test]
+    fn a_corrupt_snapshot_falls_back_to_a_full_prefill_with_the_same_output() {
+        let (mut s, clock, shared) = session_scheduler(true, "corrupt");
+        let first = request(150, 10, 6);
+        let (out, _, _) = run_one(&mut s, first.clone());
+        clock.fetch_add(301, std::sync::atomic::Ordering::SeqCst);
+        s.tick_sessions();
+        let id = shared.store.list()[0].id.clone();
+        let path = shared.store.dir().join(format!("{id}.kvs"));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        let mut turn2 = first.clone();
+        turn2.prompt.extend(&out);
+        turn2.prompt.extend([1, 2, 3]);
+        let (got, cached, prefilled) = run_one(&mut s, turn2.clone());
+        assert_eq!((cached, prefilled), (0, turn2.prompt.len()));
+        assert_eq!(got, expected(&turn2.prompt, 10, &[]));
+        assert!(shared.store.list().is_empty());
+    }
+
+    #[test]
+    fn a_different_salt_never_restores_another_sessions_snapshot() {
+        let (mut s, clock, shared) = session_scheduler(false, "salt");
+        let first = request(150, 10, 7);
+        let (out, _, _) = run_one(&mut s, first.clone());
+        clock.fetch_add(301, std::sync::atomic::Ordering::SeqCst);
+        s.tick_sessions();
+        assert_eq!(shared.store.list().len(), 1);
+        let mut other = first.clone();
+        other.salt = "tenant-b".into();
+        other.prompt.extend(&out);
+        other.prompt.extend([1, 2, 3]);
+        let (_, cached, _) = run_one(&mut s, other);
+        assert_eq!(cached, 0);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const VERSION: u32 = 1;
 const MAGIC: &[u8; 8] = b"SPKVS\0\0\x01";
 const FOOTER: &[u8; 8] = b"SPKVSEND";
-const HEADER_LEN: usize = 8 + 4 * 4 + 8 * 3 + 32 * 2 + 4 * 2 + 4;
+const HEADER_LEN: usize = 8 + 4 * 4 + 8 * 3 + 32 * 3 + 4 * 2 + 4;
 const LAST_USED_AT: usize = 8 + 4 * 4 + 8 * 2;
 const SUFFIX: &str = "kvs";
 
@@ -56,6 +56,7 @@ pub struct Compat {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Session {
+    pub scope: [u8; 32],
     pub tokens: Vec<u32>,
     pub sections: Vec<Vec<u8>>,
 }
@@ -63,6 +64,7 @@ pub struct Session {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     pub id: String,
+    pub scope: [u8; 32],
     pub tokens: usize,
     pub bytes: u64,
     pub created: u64,
@@ -112,10 +114,11 @@ fn crc32_update(crc: u32, data: &[u8]) -> u32 {
     !c
 }
 
-pub fn session_id(compat: &Compat, tokens: &[u32]) -> String {
+pub fn session_id(compat: &Compat, scope: &[u8; 32], tokens: &[u32]) -> String {
     let mut h = Sha256::new();
     h.update(compat.model_hash);
     h.update(compat.spec_hash);
+    h.update(scope);
     for t in tokens {
         h.update(t.to_le_bytes());
     }
@@ -124,6 +127,7 @@ pub fn session_id(compat: &Compat, tokens: &[u32]) -> String {
 
 struct Header {
     compat: Compat,
+    scope: [u8; 32],
     tokens: u64,
     created: u64,
     last_used: u64,
@@ -143,6 +147,7 @@ fn encode_header(h: &Header) -> Vec<u8> {
     b.extend_from_slice(&h.last_used.to_le_bytes());
     b.extend_from_slice(&h.compat.model_hash);
     b.extend_from_slice(&h.compat.spec_hash);
+    b.extend_from_slice(&h.scope);
     b.extend_from_slice(&h.sections.to_le_bytes());
     b.extend_from_slice(&(h.stripped as u32).to_le_bytes());
     let crc = crc32(&b);
@@ -165,21 +170,24 @@ fn decode_header(b: &[u8]) -> Result<Header> {
     ensure!(crc32(&b[..HEADER_LEN - 4]) == u32_at(b, HEADER_LEN - 4), "header checksum mismatch");
     let mut model_hash = [0u8; 32];
     let mut spec_hash = [0u8; 32];
+    let mut scope = [0u8; 32];
     model_hash.copy_from_slice(&b[48..80]);
     spec_hash.copy_from_slice(&b[80..112]);
+    scope.copy_from_slice(&b[112..144]);
     Ok(Header {
+        scope,
         compat: Compat { model_hash, spec_hash, kv_dtype: u32_at(b, 12), layers: u32_at(b, 16), block_size: u32_at(b, 20) },
         tokens: u64_at(b, 24),
         created: u64_at(b, 32),
         last_used: u64_at(b, 40),
-        sections: u32_at(b, 112),
-        stripped: u32_at(b, 116) != 0,
+        sections: u32_at(b, 144),
+        stripped: u32_at(b, 148) != 0,
     })
 }
 
 fn encode(compat: &Compat, session: &Session, created: u64, last_used: u64, stripped: bool) -> Vec<u8> {
     let sections = if stripped { &[][..] } else { &session.sections[..] };
-    let header = Header { compat: compat.clone(), tokens: session.tokens.len() as u64, created, last_used, sections: sections.len() as u32, stripped };
+    let header = Header { compat: compat.clone(), scope: session.scope, tokens: session.tokens.len() as u64, created, last_used, sections: sections.len() as u32, stripped };
     let mut out = encode_header(&header);
     let mut tok = Vec::with_capacity(session.tokens.len() * 4);
     for t in &session.tokens {
@@ -232,7 +240,8 @@ fn read_full(path: &Path) -> Result<(Header, Session)> {
     let footer = read_exact_at(&mut f, 16)?;
     ensure!(&footer[..8] == FOOTER && u64_at(&footer, 8) == file_len, "bad footer");
     ensure!(f.stream_position()? == file_len, "trailing bytes");
-    Ok((header, Session { tokens, sections }))
+    let scope = header.scope;
+    Ok((header, Session { scope, tokens, sections }))
 }
 
 fn read_light(path: &Path) -> Result<(Header, Vec<u32>, u64)> {
@@ -249,6 +258,7 @@ fn read_light(path: &Path) -> Result<(Header, Vec<u32>, u64)> {
 
 struct Indexed {
     entry: Entry,
+    scope: [u8; 32],
     tokens: Vec<u32>,
 }
 
@@ -271,6 +281,10 @@ impl SessionStore {
         Ok(store)
     }
 
+    pub fn compat(&self) -> &Compat {
+        &self.compat
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -291,8 +305,8 @@ impl SessionStore {
             let Some(id) = name.strip_suffix(&format!(".{SUFFIX}")) else { continue };
             match read_light(&path) {
                 Ok((h, tokens, bytes)) if self.accepts(&h) => {
-                    let entry = Entry { id: id.to_string(), tokens: tokens.len(), bytes, created: h.created, last_used: h.last_used, stripped: h.stripped };
-                    index.insert(id.to_string(), Indexed { entry, tokens });
+                    let entry = Entry { id: id.to_string(), scope: h.scope, tokens: tokens.len(), bytes, created: h.created, last_used: h.last_used, stripped: h.stripped };
+                    index.insert(id.to_string(), Indexed { entry, scope: h.scope, tokens });
                 }
                 Ok(_) => {
                     tracing::info!(file = %path.display(), "session snapshot is for another spec or dtype, removing");
@@ -338,7 +352,7 @@ impl SessionStore {
     }
 
     fn write_inner(&self, session: &Session, now: u64, stripped: bool) -> Result<Entry> {
-        let id = session_id(&self.compat, &session.tokens);
+        let id = session_id(&self.compat, &session.scope, &session.tokens);
         let created = self.index.lock().expect("index").get(&id).map(|i| i.entry.created).unwrap_or(now);
         let bytes = encode(&self.compat, session, created, now, stripped);
         let tmp = self.dir.join(format!(".tmp-{}-{}", std::process::id(), self.writes.fetch_add(1, Ordering::Relaxed)));
@@ -355,16 +369,16 @@ impl SessionStore {
             let _ = fs::remove_file(&tmp);
             return Err(e).context("write session snapshot");
         }
-        let entry = Entry { id: id.clone(), tokens: session.tokens.len(), bytes: bytes.len() as u64, created, last_used: now, stripped };
-        self.index.lock().expect("index").insert(id, Indexed { entry: entry.clone(), tokens: session.tokens.clone() });
+        let entry = Entry { id: id.clone(), scope: session.scope, tokens: session.tokens.len(), bytes: bytes.len() as u64, created, last_used: now, stripped };
+        self.index.lock().expect("index").insert(id, Indexed { entry: entry.clone(), scope: session.scope, tokens: session.tokens.clone() });
         Ok(entry)
     }
 
-    pub fn find_prefix(&self, prompt: &[u32]) -> Option<Entry> {
+    pub fn find_prefix(&self, scope: &[u8; 32], prompt: &[u32]) -> Option<Entry> {
         let index = self.index.lock().expect("index");
         index
             .values()
-            .filter(|i| !i.entry.stripped && i.tokens.len() < prompt.len() && prompt.starts_with(&i.tokens))
+            .filter(|i| &i.scope == scope && !i.entry.stripped && i.tokens.len() < prompt.len() && prompt.starts_with(&i.tokens))
             .max_by_key(|i| i.tokens.len())
             .map(|i| i.entry.clone())
     }
@@ -398,7 +412,7 @@ impl SessionStore {
         let (header, session) = read_full(&path)?;
         ensure!(self.accepts(&header), "snapshot is for another model, spec or dtype");
         ensure!(!header.stripped, "session {id} is stripped, needs a prefill");
-        ensure!(session_id(&self.compat, &session.tokens) == id, "token list does not match the session id");
+        ensure!(session_id(&self.compat, &session.scope, &session.tokens) == id, "token list does not match the session id");
         self.touch(id, now)?;
         Ok(session)
     }
@@ -513,6 +527,44 @@ fn restrict_file(f: &File) {
 #[cfg(not(unix))]
 fn restrict_file(_: &File) {}
 
+pub const SECTION_META: usize = 0;
+pub const SECTION_K: usize = 1;
+pub const SECTION_V: usize = 2;
+pub const SECTION_STATE: usize = 3;
+
+fn f32_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn bytes_f32(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().expect("4 bytes"))).collect()
+}
+
+pub fn pack_sections(k: Vec<u8>, v: Vec<u8>, state: Option<&crate::prefix::StateSnapshot>) -> Vec<Vec<u8>> {
+    let (meta, body) = match state {
+        Some(s) => {
+            let mut body = f32_bytes(s.conv());
+            body.extend(f32_bytes(s.ssm()));
+            body.extend(f32_bytes(s.pending()));
+            ([1u64, s.conv().len() as u64, s.ssm().len() as u64, s.pending().len() as u64], body)
+        }
+        None => ([0u64; 4], Vec::new()),
+    };
+    vec![meta.iter().flat_map(|m| m.to_le_bytes()).collect(), k, v, body]
+}
+
+pub fn unpack_state(sections: &[Vec<u8>]) -> Result<Option<crate::prefix::StateSnapshot>> {
+    ensure!(sections.len() == 4 && sections[SECTION_META].len() == 32, "session payload has {} sections, expected 4", sections.len());
+    let m: Vec<u64> = sections[SECTION_META].chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect();
+    if m[0] == 0 {
+        return Ok(None);
+    }
+    let all = bytes_f32(&sections[SECTION_STATE]);
+    let (c, s, p) = (m[1] as usize, m[2] as usize, m[3] as usize);
+    ensure!(all.len() == c + s + p, "recurrent state section is {} values, expected {}", all.len(), c + s + p);
+    Ok(Some(crate::prefix::StateSnapshot::new(all[..c].to_vec(), all[c..c + s].to_vec(), all[c + s..].to_vec())))
+}
+
 pub trait Capture {
     fn capture(&mut self, key: &str) -> Result<Session>;
     fn release(&mut self, key: &str);
@@ -549,6 +601,10 @@ impl Tracker {
         v
     }
 
+    pub fn last_request(&self, key: &str) -> Option<(u64, usize)> {
+        self.live.get(key).map(|l| (l.last_request, l.tokens))
+    }
+
     fn mark_saved(&mut self, key: &str) {
         if let Some(l) = self.live.get_mut(key) {
             l.saved = true;
@@ -568,8 +624,15 @@ impl Janitor {
 
     pub fn tick(&mut self, now: u64, store: &SessionStore, source: &mut dyn Capture) -> Result<Vec<Entry>> {
         store.expire(now, self.options.ttl_seconds());
+        let due = self.tracker.due(now, self.options.idle_seconds, self.options.min_tokens);
+        let written = self.save_keys(due, now, store, source);
+        store.enforce_budget(self.options.max_bytes);
+        Ok(written)
+    }
+
+    pub fn save_keys(&mut self, keys: Vec<String>, now: u64, store: &SessionStore, source: &mut dyn Capture) -> Vec<Entry> {
         let mut written = Vec::new();
-        for key in self.tracker.due(now, self.options.idle_seconds, self.options.min_tokens) {
+        for key in keys {
             let session = match source.capture(&key) {
                 Ok(s) => s,
                 Err(e) => {
@@ -588,9 +651,32 @@ impl Janitor {
                 }
             }
         }
-        store.enforce_budget(self.options.max_bytes);
-        Ok(written)
+        written
     }
+}
+
+pub struct Shared {
+    pub store: SessionStore,
+    pub options: SessionOptions,
+    pub force: Mutex<Vec<String>>,
+    pub resident: Mutex<Vec<Resident>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Resident {
+    pub id: String,
+    pub tokens: usize,
+    pub last_used: u64,
+}
+
+impl Shared {
+    pub fn new(store: SessionStore, options: SessionOptions) -> Self {
+        Shared { store, options, force: Mutex::new(Vec::new()), resident: Mutex::new(Vec::new()) }
+    }
+}
+
+pub fn now_seconds() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 pub fn free_space_budget(free_bytes: u64, percent: u64) -> u64 {
@@ -606,7 +692,7 @@ mod tests {
     }
 
     fn session(n: u32, fill: u8) -> Session {
-        Session { tokens: (0..n).collect(), sections: vec![vec![fill; 1000], vec![fill.wrapping_add(1); 300], vec![7; 50]] }
+        Session { scope: [0; 32], tokens: (0..n).collect(), sections: vec![vec![fill; 1000], vec![fill.wrapping_add(1); 300], vec![7; 50]] }
     }
 
     fn tmp(name: &str) -> PathBuf {
@@ -652,11 +738,11 @@ mod tests {
         let short = store.write(&session(50, 1), 0).unwrap();
         let long = store.write(&session(80, 2), 0).unwrap();
         let prompt: Vec<u32> = (0..120).collect();
-        assert_eq!(store.find_prefix(&prompt).unwrap().id, long.id);
+        assert_eq!(store.find_prefix(&[0; 32], &prompt).unwrap().id, long.id);
         let exact: Vec<u32> = (0..80).collect();
-        assert_eq!(store.find_prefix(&exact).unwrap().id, short.id);
+        assert_eq!(store.find_prefix(&[0; 32], &exact).unwrap().id, short.id);
         let other: Vec<u32> = (1..200).collect();
-        assert!(store.find_prefix(&other).is_none());
+        assert!(store.find_prefix(&[0; 32], &other).is_none());
     }
 
     #[test]
@@ -735,7 +821,7 @@ mod tests {
         let root = tmp("crash");
         let store = SessionStore::open(&root, compat()).unwrap();
         let s = session(64, 3);
-        let id = session_id(&compat(), &s.tokens);
+        let id = session_id(&compat(), &s.scope, &s.tokens);
         let full = encode(&compat(), &s, 0, 0, false);
         fs::write(store.dir().join(".tmp-999-0"), &full[..full.len() / 2]).unwrap();
         fs::write(store.dir().join(format!("{id}.{SUFFIX}.partial")), &full[..10]).unwrap();
@@ -863,7 +949,7 @@ mod tests {
         let e = store.write(&session(100, 1), 5).unwrap();
         let stripped = store.strip(&e.id, 9).unwrap();
         assert!(stripped.stripped && stripped.bytes < e.bytes && stripped.tokens == 100 && stripped.last_used == 5);
-        assert!(store.find_prefix(&(0..200).collect::<Vec<u32>>()).is_none());
+        assert!(store.find_prefix(&[0; 32], &(0..200).collect::<Vec<u32>>()).is_none());
         assert!(store.load(&e.id, 10).is_err());
     }
 
@@ -875,6 +961,15 @@ mod tests {
         store.write(&session(101, 1), 0).unwrap();
         assert_eq!(purge_root(&root).unwrap(), 2);
         assert!(SessionStore::open(&root, compat()).unwrap().list().is_empty());
+    }
+
+    #[test]
+    fn sections_roundtrip_the_recurrent_state_exactly() {
+        let state = crate::prefix::StateSnapshot::new(vec![1.0, -2.5], vec![f32::MIN_POSITIVE, 3.0, 4.0], vec![9.0]);
+        let packed = pack_sections(vec![1, 2, 3], vec![4, 5], Some(&state));
+        assert_eq!(unpack_state(&packed).unwrap().unwrap(), state);
+        assert!(unpack_state(&pack_sections(vec![], vec![], None)).unwrap().is_none());
+        assert!(unpack_state(&packed[..2]).is_err());
     }
 
     #[test]
