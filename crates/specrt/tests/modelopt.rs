@@ -31,7 +31,13 @@ fn f32_bytes(v: f32) -> Vec<u8> {
     v.to_le_bytes().to_vec()
 }
 
-fn convert(out: &Path) {
+#[derive(Clone, Copy, PartialEq)]
+enum Format {
+    Modelopt,
+    ScalarCompressed,
+}
+
+fn convert(out: &Path, format: Format) {
     std::fs::create_dir_all(out).unwrap();
     let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fixture().join("model.safetensors.index.json")).unwrap()).unwrap();
     let mut map = serde_json::Map::new();
@@ -41,10 +47,18 @@ fn convert(out: &Path) {
         let st = SafeTensors::deserialize(&bytes).unwrap();
         let mut tensors: BTreeMap<String, Owned> = BTreeMap::new();
         for (name, v) in st.tensors() {
-            let new = modelopt_name(&name);
+            let modelopt = format == Format::Modelopt;
+            let new = if modelopt { modelopt_name(&name) } else { name.clone() };
             let owned = if name.ends_with(".weight_scale") && v.shape().len() == 2 && v.shape()[1] == 1 {
                 let first = half_or_f32(&v);
-                Owned { dtype: Dtype::F32, shape: vec![], data: f32_bytes(first) }
+                if modelopt {
+                    Owned { dtype: Dtype::F32, shape: vec![], data: f32_bytes(first) }
+                } else {
+                    let bf16 = (first.to_bits() >> 16) as u16;
+                    Owned { dtype: Dtype::BF16, shape: v.shape().to_vec(), data: (0..v.shape()[0]).flat_map(|_| bf16.to_le_bytes()).collect() }
+                }
+            } else if !modelopt {
+                Owned { dtype: v.dtype(), shape: v.shape().to_vec(), data: v.data().to_vec() }
             } else if name.ends_with(".weight_global_scale") {
                 let g = f32::from_le_bytes(v.data()[..4].try_into().unwrap());
                 Owned { dtype: Dtype::F32, shape: vec![], data: f32_bytes(1.0 / g) }
@@ -82,7 +96,7 @@ fn fp8_parts(m: &Matrix) -> (Vec<u8>, Vec<f32>) {
 #[test]
 fn modelopt_tensor_names_load_as_the_compressed_tensors_matrices() {
     let out = std::env::temp_dir().join(format!("specrt-modelopt-{}", std::process::id()));
-    convert(&out);
+    convert(&out, Format::Modelopt);
     let spec = {
         let json = std::fs::read_to_string(fixture().join("config.json")).unwrap();
         Spec::from_hf_config(&json).unwrap()
@@ -115,4 +129,60 @@ fn modelopt_tensor_names_load_as_the_compressed_tensors_matrices() {
         }
     }
     std::fs::remove_dir_all(&out).ok();
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("specrt-modelopt-{tag}-{}", std::process::id()))
+}
+
+fn spec_at(dir: &Path, serving: bool) -> Spec {
+    let json = std::fs::read_to_string(fixture().join("config.json")).unwrap();
+    let mut s = if serving { Spec::from_hf_config_serving(&json).unwrap() } else { Spec::from_hf_config(&json).unwrap() };
+    s.name = "tiny-qwen3.5-27b".into();
+    s.repo = dir.display().to_string();
+    s.runtime.vision.precision = specrt::vision_encoder::VisionPrecision::Exact;
+    s.mtp.as_mut().unwrap().head_quant = Some(specrt::spec::Quant::Bf16);
+    s
+}
+
+fn logits_of(dir: &Path, serving: bool) -> (Vec<f32>, Spec) {
+    let s = spec_at(dir, serving);
+    let seq: Vec<u32> = (0..48).map(|i| (i * 37 + 11) % 1000).collect();
+    let mut rt = specrt::runtime::Runtime::load(&s, 256).unwrap();
+    (rt.prompt_logits(&seq).unwrap(), s)
+}
+
+fn assert_same_logits(a: &[f32], b: &[f32], what: &str) {
+    assert_eq!(a.len(), b.len());
+    let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let err = a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max) / scale;
+    eprintln!("{what}: max relative difference {err:e}");
+    assert!(err <= 1e-5, "{what}: {err}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn modelopt_fixture_gives_the_compressed_tensors_logits_weight_only() {
+    let (modelopt, ct) = (scratch("w-mo"), scratch("w-ct"));
+    convert(&modelopt, Format::Modelopt);
+    convert(&ct, Format::ScalarCompressed);
+    let (a, _) = logits_of(&ct, false);
+    let (b, _) = logits_of(&modelopt, false);
+    assert_same_logits(&a, &b, "weight-only");
+    std::fs::remove_dir_all(&modelopt).ok();
+    std::fs::remove_dir_all(&ct).ok();
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn modelopt_input_scale_gives_the_compressed_tensors_logits_with_fp4_activations() {
+    let (modelopt, ct) = (scratch("a-mo"), scratch("a-ct"));
+    convert(&modelopt, Format::Modelopt);
+    convert(&ct, Format::ScalarCompressed);
+    let (a, s) = logits_of(&ct, true);
+    assert_eq!(s.mlp.act_quant, specrt::spec::ActQuant::Fp4);
+    let (b, _) = logits_of(&modelopt, true);
+    assert_same_logits(&a, &b, "fp4 activations");
+    std::fs::remove_dir_all(&modelopt).ok();
+    std::fs::remove_dir_all(&ct).ok();
 }

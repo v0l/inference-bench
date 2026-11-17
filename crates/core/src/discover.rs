@@ -421,6 +421,9 @@ pub fn config_shape_of(repo: &str, text: &str) -> (Result<Shape, String>, Option
         if !support.supported {
             return Err(short_reason(&support.reason));
         }
+        if v["quantization_config"]["quant_method"].as_str() == Some("modelopt") && !specrt::spec::modelopt_verified() {
+            return Err("modelopt NVFP4 reads but is untested on the 27B".into());
+        }
         let d = fit::describe_config_json(repo, text).map_err(|e| short_reason(&e))?;
         Ok(Shape { spec: d.spec, anatomy: d.anatomy })
     })();
@@ -1063,9 +1066,15 @@ mod tests {
     #[test]
     fn modelopt_and_regex_target_nvfp4_configs_are_supported() {
         let modelopt = include_str!("../tests/fixtures/hf/nvfp4-qwen3.8-27b-config.json");
-        assert!(config_shape_of("nvidia/Qwen3.8-27B-NVFP4", modelopt).0.is_ok());
         let darkstar = include_str!("../tests/fixtures/hf/darkstar-config.json");
-        assert!(config_shape_of("HangGlidersRule/Darkstar-Qwen3.8-27B-Base-ModelOpt-W4A16-NVFP4-Mixed-FP8", darkstar).0.is_ok());
+        for (repo, text) in [("nvidia/Qwen3.8-27B-NVFP4", modelopt), ("HangGlidersRule/Darkstar-Qwen3.8-27B-Base-ModelOpt-W4A16-NVFP4-Mixed-FP8", darkstar)] {
+            let shape = config_shape_of(repo, text).0;
+            if specrt::spec::modelopt_verified() {
+                assert!(shape.is_ok(), "{repo}");
+            } else {
+                assert_eq!(shape.err().unwrap(), "modelopt NVFP4 reads but is untested on the 27B");
+            }
+        }
         let primitive = include_str!("../tests/fixtures/hf/primitive-ai-config.json");
         let e = config_shape_of("primitive-ai/Qwen3.8-27B-mixed-NVFP4-FP8", primitive).0.err().expect("fp4 gdn projections are not supported");
         assert!(!e.contains("not a layer projection"), "{e}");

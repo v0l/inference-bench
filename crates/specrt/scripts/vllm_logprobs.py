@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import urllib.request
 from pathlib import Path
@@ -6,8 +7,8 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 URL = "http://127.0.0.1:8001/v1/completions"
-MODEL = "qwen3.8-27b"
-REPO = "orcarouter/Qwen3.8-27B-Uncensored-NVFP4"
+MODEL = os.environ.get("VLLM_MODEL", "qwen3.8-27b")
+REPO = os.environ.get("VLLM_REPO", "orcarouter/Qwen3.8-27B-Uncensored-NVFP4")
 NEW = 64
 TOP = 20
 

@@ -4,6 +4,10 @@ use std::path::{Path, PathBuf};
 
 pub const SPEC_FORMAT: u32 = 7;
 
+pub fn modelopt_verified() -> bool {
+    include_str!("../modelopt-verified.txt").trim() == "pass"
+}
+
 pub const EMBEDDED: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/embedded_specs.rs"));
 
 #[derive(Clone, Debug, PartialEq)]
