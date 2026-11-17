@@ -551,6 +551,7 @@ mod tests {
             fail_status: None,
             vision: false,
             files: Default::default(),
+            sessions: Default::default(),
         }
     }
 

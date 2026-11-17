@@ -32,13 +32,38 @@ last use, and restored on the next request that continues it, so only the new su
   `..._restores_total{result}`, `..._snapshot_bytes`, `..._restore_seconds`,
   `..._prefill_tokens_saved_total`.
 
-## Not done yet
+## Wired in
 
-- Engine side `Capture`: copy a sequence's KV blocks per full attention layer (packed layout,
-  side stream to pinned memory, as `snapshot_state_async` does for the state) and restore into
-  fresh blocks plus `restore_state`. Needs the GPU.
-- Scheduler hook: record requests in `Tracker`, call `Janitor::tick` from a timer, look up
-  `find_prefix` at admission when the prefix cache misses, report `cached_tokens`.
-- Server: `[sessions]` config mapping, `/admin/sessions` routes, metrics export,
-  `--purge-sessions`, UI section.
-- Roundtrip logits test on the tiny hybrid fixture, end to end test, 32k measurement table.
+- `Executor::session_compat`, `save_session(blocks, state)` and `restore_session(slot, blocks, sections)`.
+  `GpuExecutor` copies each KV block of the K and V caches through pinned memory on a forked side
+  stream (`Runtime::save_kv_blocks`) and packs four sections: meta, K, V, recurrent state (conv, ssm,
+  MTP pending). Restore (`load_kv_blocks`, `restore_state`) is a straight copy, no re-encoding.
+- `Scheduler::enable_sessions`: a finished request that reached `min_tokens` stays held on the GPU
+  (blocks retained) and is tracked by the janitor. `tick_sessions` (called every loop turn in
+  `serve::run`) writes sessions idle for `idle_seconds`, then releases their blocks, expires after
+  `ttl_hours` and enforces `max_bytes` (default 20 percent of free space). Under block pressure the
+  oldest held session is written first. At admission `find_prefix` matches on salt scope plus token
+  prefix, the blocks are allocated fresh, the payload is restored, only the suffix is prefilled and
+  `cached_tokens` reports the restored length. A failed restore deletes the snapshot and prefills.
+- Server: `[sessions]` table, `GET /admin/sessions`, `DELETE /admin/sessions/{id}`,
+  `POST /admin/sessions/{id}/save|restore|strip`, Prometheus `inference_session_*`,
+  `inference-bench-server --purge-sessions`. Sessions are off by default.
+- UI: Sessions section on the server tab (size, idle, expires in, restore, strip, delete).
+
+## Tests
+
+CPU: `sessions::tests` (store, janitor with a fake clock), `sched::tests` (two turns 6 minutes apart
+on the fake executor, 8 h expiry, corrupt snapshot, salt isolation), `tests/api.rs` (routes, config,
+purge), `serving::tests` (metrics), ui `the_server_tab_lists_saved_sessions_...`.
+GPU (ignored): `tests/sessions.rs` roundtrips the tiny hybrid and a dense fixture through a fresh
+engine and compares 64 greedy tokens and every logprob bit for bit.
+Run both, and the 32k measurement table, with `crates/specrt/scripts/sessions326.sh` (`MEASURE=1`
+adds `sessionbench`, which prints snapshot bytes, write time, restore time and TTFT with and without
+the snapshot).
+
+## Left
+
+- Run `sessions326.sh` on a free GPU and paste the table here.
+- Sidecar index file for faster start (the index is built from the file headers, which is fast enough
+  until thousands of sessions exist).
+- Optional zstd for the recurrent state.

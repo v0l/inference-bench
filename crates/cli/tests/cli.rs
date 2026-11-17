@@ -25,6 +25,7 @@ fn server(models: &[&str]) -> FakeServer {
         fail_status: None,
         vision: false,
         files: Default::default(),
+        sessions: Default::default(),
     })
 }
 
