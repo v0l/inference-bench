@@ -3,7 +3,7 @@ use crate::hf::{self, Hub, RepoFile};
 use crate::library::{self, Format};
 use serde::{Deserialize, Serialize};
 use specrt::anatomy::ModelAnatomy;
-use specrt::placement::{CostModel, DeviceConfig, PlacementConfig};
+use specrt::placement::{CostModel, DeviceConfig};
 use specrt::spec::{KvDtype, Spec};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -231,9 +231,8 @@ impl Assessment {
     }
 }
 
-fn pooled_context(spec: &Spec, anatomy: &ModelAnatomy, weights: u64, gpus: &[u64], seqs: usize, kv: Kv, native: usize) -> usize {
-    let devices: Vec<DeviceConfig> = gpus
-        .iter()
+pub fn pool_devices(gpus: &[u64]) -> Vec<DeviceConfig> {
+    gpus.iter()
         .enumerate()
         .map(|(i, free)| DeviceConfig {
             name: format!("gpu{i}"),
@@ -249,16 +248,24 @@ fn pooled_context(spec: &Spec, anatomy: &ModelAnatomy, weights: u64, gpus: &[u64
             peer: None,
             wgpu: false,
         })
-        .collect();
+        .collect()
+}
+
+pub fn place_on(spec: &Spec, weights: u64, kv_bytes_per_token: u64, context: usize, seqs: usize, devices: &[DeviceConfig]) -> anyhow::Result<specrt::placement::Placement> {
+    let mut model = CostModel::new(spec, context, seqs.max(1));
+    model.max_tp = 1;
+    model.rescale_weights(weights);
+    model.set_kv(kv_bytes_per_token, context);
+    let devs: Vec<specrt::placement::Device> = devices.iter().map(specrt::placement::Device::from_config).collect();
+    specrt::placement::plan(&model, &devs, specrt::placement::Objective::Latency)
+}
+
+fn pooled_context(spec: &Spec, anatomy: &ModelAnatomy, weights: u64, gpus: &[u64], seqs: usize, kv: Kv, native: usize) -> usize {
+    let devices = pool_devices(gpus);
     let per_token = kv.bytes_per_token(spec);
     let fits = |ctx: usize| {
-        let config = PlacementConfig { context: ctx, slots: seqs.max(1), devices: devices.clone(), max_tp: Some(1), ..PlacementConfig::default() };
-        let mut model = CostModel::new(spec, ctx, seqs.max(1));
-        model.rescale_weights(weights);
-        model.set_kv(per_token, ctx);
         let _ = anatomy;
-        let devs: Vec<specrt::placement::Device> = config.devices.iter().map(specrt::placement::Device::from_config).collect();
-        specrt::placement::plan(&model, &devs, specrt::placement::Objective::Latency).is_ok()
+        place_on(spec, weights, per_token, ctx, seqs, &devices).is_ok()
     };
     if !fits(fit::MIN_CTX.min(native)) {
         return 0;
@@ -572,10 +579,13 @@ impl RepoPlan {
         self.ranked.first()
     }
 
-    pub fn key(&self) -> (u8, u8, std::cmp::Reverse<u32>, u64) {
+    pub fn key(&self) -> (u8, u8) {
         match self.best() {
-            Some(b) if self.unsupported.is_none() && self.draft.is_none() => b.key(),
-            _ => (3, 3, std::cmp::Reverse(0), u64::MAX),
+            Some(b) if self.unsupported.is_none() && self.draft.is_none() => {
+                let (rank, tier, _, _) = b.key();
+                (rank, tier)
+            }
+            _ => (3, 3),
         }
     }
 }
@@ -843,6 +853,21 @@ mod tests {
     }
 
     #[test]
+    fn place_on_agrees_with_assess_for_a_5080_and_two_3090s() {
+        let s = shape();
+        let cards = [16 * GB, 24 * GB, 24 * GB];
+        let weights = 27 * GB;
+        assert_eq!(assess(&s.spec, &s.anatomy, weights, &cards[..1], 1).verdict, Verdict::DoesNotFit);
+        let pooled = assess(&s.spec, &s.anatomy, weights, &cards, 1);
+        assert_ne!(pooled.verdict, Verdict::DoesNotFit, "{pooled:?}");
+        let devices = pool_devices(&cards);
+        let per_token = pooled.chosen.kv.bytes_per_token(&s.spec);
+        let placed = place_on(&s.spec, weights, per_token, pooled.chosen.context, 1, &devices).unwrap();
+        assert!(placed.stages.len() >= 2);
+        assert!(place_on(&s.spec, weights, per_token, pooled.chosen.context, 1, &devices[..1]).is_err());
+    }
+
+    #[test]
     fn a_model_that_fits_only_across_two_gpus_is_planned_across_both() {
         let s = shape();
         let one = assess(&s.spec, &s.anatomy, 30 * GB, &[24 * GB], 1);
@@ -939,6 +964,17 @@ mod tests {
         };
         let ranked = rank_repos(vec![unsupported, mk("a/too-big", 80 * GB, 90 * GB), mk("b/ok", 80 * GB, 5 * GB)]);
         assert_eq!(ranked.iter().map(|p| p.repo.as_str()).collect::<Vec<_>>(), ["b/ok", "a/too-big", "z/unsupported"]);
+    }
+
+    #[test]
+    fn repos_that_fit_equally_keep_the_search_order_whatever_their_size() {
+        let mk = |name: &str, size: u64| {
+            let mut i = info(&[("Q4_K_M", size)]);
+            i.repo = name.into();
+            plan(&i, &[80 * GB], 1)
+        };
+        let ranked = rank_repos(vec![mk("popular/big", 20 * GB), mk("second/small", 2 * GB), mk("third/mid", 8 * GB)]);
+        assert_eq!(ranked.iter().map(|p| p.repo.as_str()).collect::<Vec<_>>(), ["popular/big", "second/small", "third/mid"]);
     }
 
     #[test]
