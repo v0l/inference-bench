@@ -21,8 +21,9 @@ fn gdn_chunk_kernels_speed_on_a_27b_shaped_layer() {
     let loaded = jit.load(&module).unwrap();
     let prep = loaded.function("gdn_chunk_prep").unwrap();
     let scan = loaded.function("gdn_chunk_scan").unwrap();
-    let c = specrt::codegen::LA_CHUNK;
-    let cols = specrt::codegen::LA_COLS;
+    let tuning = kir::linear::LinearTuning::for_target(&specrt::codegen::cuda_target(&ctx).unwrap());
+    let c = tuning.chunk;
+    let cols = tuning.cols;
     let smem = module.smem["gdn_chunk_prep"];
     use cudarc::driver::sys::CUfunction_attribute as A;
     prep.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
