@@ -4,7 +4,6 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use anyhow::{Context, Result, anyhow, ensure};
-use std::io::Read;
 use std::path::Path;
 use std::time::{Duration, Instant};
 

@@ -265,6 +265,18 @@ pub fn cuda_present() -> bool {
     unsafe { cudarc::driver::sys::is_culib_present() }
 }
 
+pub fn nvrtc_present() -> bool {
+    unsafe { cudarc::nvrtc::sys::is_culib_present() }
+}
+
+pub fn nvrtc_missing_message() -> String {
+    if cfg!(windows) {
+        "The CUDA compiler library (nvrtc64_130_0.dll) was not found. Install the CUDA Toolkit 13 from developer.nvidia.com/cuda-downloads, or copy nvrtc64_130_0.dll and nvrtc-builtins64_130.dll next to inference-bench-ui.exe, then load again.".to_string()
+    } else {
+        "The CUDA compiler library (libnvrtc.so.13) was not found. Install the CUDA Toolkit 13 or add its lib64 folder to LD_LIBRARY_PATH, then load again.".to_string()
+    }
+}
+
 pub fn probe_idle_cuda() -> Result<Machine> {
     if !cuda_present() {
         return Err(anyhow!("no CUDA driver library on this machine"));
@@ -463,6 +475,14 @@ pub fn fake_gpus(host: &str, n: usize, p2p: bool) -> Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_nvrtc_is_one_short_actionable_sentence_naming_the_library_and_the_fix() {
+        let m = nvrtc_missing_message();
+        assert!(m.len() < 260 && !m.contains('\n'), "{m}");
+        assert!(m.contains("nvrtc") && m.contains("CUDA Toolkit"), "{m}");
+        assert!(!m.contains("GitHub issue") && !m.contains("searched for library names"), "{m}");
+    }
 
     #[test]
     fn meminfo_is_read_in_bytes() {
