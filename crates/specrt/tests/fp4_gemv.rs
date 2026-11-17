@@ -139,6 +139,7 @@ fn compare(label: &str, spec: &Spec, case: &Case) -> bool {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn tuned_fp4_gemvs_equal_the_reference_kernels_bit_for_bit_on_the_tiny_fixture() {
     let spec = tiny_spec();
     if !compare("tiny", &spec, &fixture_case(&spec)) {
@@ -147,6 +148,7 @@ fn tuned_fp4_gemvs_equal_the_reference_kernels_bit_for_bit_on_the_tiny_fixture()
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
 fn tuned_fp4_gemvs_equal_the_reference_kernels_bit_for_bit_on_a_random_5120_by_17408_matrix() {
     let spec = big_spec();
     assert_eq!((spec.dims.hidden, spec.dims.intermediate), (5120, 17408));

@@ -6,6 +6,27 @@ All notable changes to Inference Bench are listed here. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-17
+
+### Added
+- Windows: when nvrtc is missing, the app downloads the two CUDA compiler DLLs from NVIDIA (checked against pinned checksums) the first time a model loads, with a progress bar.
+- The Hardware tab has an in use switch for every GPU and every paired machine. Switched-off GPUs are left out of fit checks and loads.
+- The load dialog shows the load plan per GPU, and Load stays available when the planner thinks a model will not fit.
+- A Mac running the app can share its Metal GPU in a cluster.
+
+### Changed
+- The top and bottom bars sum VRAM and average utilisation over every GPU.
+- Discover keeps Hugging Face's order, checks repos as they arrive, connects over IPv4 and fetches GGUF headers in one pass; a 25 repo search takes about 10 s instead of 33 s.
+- Fit checks in Discover and the load dialog use the same multi-GPU planner.
+- The Low memory profile changes ten options instead of four.
+- The Models page header is one compact toolbar; library cards no longer show spec lines.
+- Model folders save and rescan when changed.
+- The load dialog scrolls on small windows, and long status lines are shortened.
+
+### Fixed
+- Pairing, the wire handshake and API key generation read `/dev/urandom` and failed on Windows.
+- A missing nvrtc now gives one short message instead of a long library search list.
+
 ## [0.1.0] - 2026-11-17
 
 ### Added
