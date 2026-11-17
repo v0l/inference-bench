@@ -577,6 +577,9 @@ fn the_chat_draws_reasoning_an_attachment_and_a_tool_row_with_the_shared_widgets
     h.run();
     h.get_by_label_contains("what is in this picture");
     h.get_by_label_contains("It is a red rectangle.");
+    h.get_by_label_contains("A red rectangle, so I should say that.");
+    h.get_by_role_and_label(egui::accesskit::Role::Button, "workspace");
+    h.get_by_label_contains("The workspace is /tmp/ws.");
     let turns = &h.state().chat.agent.chat.turns;
     assert!(turns.iter().any(|t| matches!(t, agent_ui::chat::Turn::You { files, .. } if files.len() == 1 && files[0].is_image())));
     assert!(turns.iter().any(|t| matches!(t, agent_ui::chat::Turn::Thinking(_))));
