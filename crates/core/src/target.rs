@@ -101,6 +101,10 @@ pub trait Target: Send {
         None
     }
 
+    fn sessions(&self) -> Option<std::sync::Arc<specrt::sessions::Shared>> {
+        None
+    }
+
     fn requires_serving(&self) -> bool {
         false
     }

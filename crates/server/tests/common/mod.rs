@@ -18,6 +18,7 @@ pub struct Stats {
     pub loaded_names: Mutex<Vec<String>>,
     pub hung: AtomicBool,
     pub consumed: AtomicUsize,
+    pub sessions: Mutex<Option<Arc<inference_bench_core::specrt_sessions::Shared>>>,
 }
 
 pub struct Fake {
@@ -59,6 +60,10 @@ impl Target for Fake {
 
     fn share(&self) -> Option<Box<dyn Target>> {
         Some(Box::new(Fake { tokens: self.tokens, first_delay_ms: self.first_delay_ms, token_delay_ms: self.token_delay_ms, pieces: self.pieces.clone(), vision: self.vision, batched: self.batched, stats: self.stats.clone() }))
+    }
+
+    fn sessions(&self) -> Option<Arc<inference_bench_core::specrt_sessions::Shared>> {
+        self.stats.sessions.lock().unwrap().clone()
     }
 
     fn failure(&self) -> Option<String> {

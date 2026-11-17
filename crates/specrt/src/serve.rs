@@ -3,6 +3,7 @@ use crate::runtime::{Layout, Runtime, Sampling, kv_block_bytes};
 use crate::sched::{self, ChainMetrics, Config, Event, Executor, Finish, GpuExecutor, PipelineExecutor, Scheduler, SeqId};
 use crate::spec::Spec;
 pub use crate::spec::{RuntimeOptions, TileChoice};
+pub use crate::sessions::SessionOptions;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -60,6 +61,7 @@ pub struct ServeOptions {
     pub placement: Option<crate::placement::PlacementConfig>,
     pub progress: Option<crate::progress::Sink>,
     pub watchdog: Option<Duration>,
+    pub sessions: Option<crate::sessions::SessionOptions>,
 }
 
 impl Default for ServeOptions {
@@ -80,6 +82,7 @@ impl Default for ServeOptions {
             placement: None,
             progress: None,
             watchdog: Some(Duration::from_secs(60)),
+            sessions: None,
         }
     }
 }
@@ -214,6 +217,7 @@ pub struct Stats {
     pub prefill_tokens_per_step: Histogram,
     pub step_secs: Histogram,
     pub chain: Option<ChainMetrics>,
+    pub sessions: Option<crate::sessions::Stats>,
 }
 
 impl Default for Stats {
@@ -246,6 +250,7 @@ impl Default for Stats {
             prefill_tokens_per_step: Histogram::new(&COUNT_BUCKETS),
             step_secs: Histogram::new(&LATENCY_BUCKETS),
             chain: None,
+            sessions: None,
         }
     }
 }
@@ -309,6 +314,7 @@ pub struct Core {
     failure: Arc<Mutex<Option<String>>>,
     inflight: Inflight,
     stopping: Arc<AtomicBool>,
+    sessions: Option<Arc<crate::sessions::Shared>>,
 }
 
 fn watch(pulse: Arc<Pulse>, limit: Duration, failure: Arc<Mutex<Option<String>>>, inflight: Inflight, stopping: Arc<AtomicBool>) {
@@ -337,9 +343,11 @@ impl Core {
         let kv_block = kv_block_bytes(spec, 1);
         let watchdog = opts.watchdog;
         let spec = spec.clone();
-        Core::spawn(max_model_len, kv_block, watchdog, move |ready, inbox, stats, pulse| {
+        let sessions = open_sessions(&spec, &opts)?;
+        let shared = sessions.clone();
+        Core::spawn(max_model_len, kv_block, watchdog, sessions, move |ready, inbox, stats, pulse| {
             let sink = opts.progress.clone();
-            let _ = crate::progress::with_sink(sink, || start_engine(&spec, opts, ready, inbox, stats, pulse));
+            let _ = crate::progress::with_sink(sink, || start_engine(&spec, opts, shared, ready, inbox, stats, pulse));
         })
     }
 
@@ -347,6 +355,7 @@ impl Core {
         max_model_len: usize,
         kv_block_bytes: usize,
         watchdog: Option<Duration>,
+        sessions: Option<Arc<crate::sessions::Shared>>,
         engine: impl FnOnce(Sender<Result<bool>>, Receiver<Job>, Arc<Mutex<Stats>>, Arc<Pulse>) + Send + 'static,
     ) -> Result<Arc<Core>> {
         let (jobs, inbox) = channel::<Job>();
@@ -376,6 +385,7 @@ impl Core {
             failure,
             inflight,
             stopping,
+            sessions,
         }))
     }
 
@@ -392,7 +402,13 @@ impl Core {
     }
 
     pub fn stats(&self) -> Stats {
-        self.stats.lock().unwrap().clone()
+        let mut s = self.stats.lock().unwrap().clone();
+        s.sessions = self.sessions.as_ref().map(|x| x.stats());
+        s
+    }
+
+    pub fn sessions(&self) -> Option<Arc<crate::sessions::Shared>> {
+        self.sessions.clone()
     }
 
     pub fn submit(&self, job: Job) -> Result<()> {
@@ -427,7 +443,26 @@ impl Drop for Core {
     }
 }
 
-fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>, pulse: Arc<Pulse>) -> Result<()> {
+fn open_sessions(spec: &Spec, opts: &ServeOptions) -> Result<Option<Arc<crate::sessions::Shared>>> {
+    let Some(o) = opts.sessions.clone().filter(|o| o.enabled) else { return Ok(None) };
+    o.validate()?;
+    let mut resolved = spec.clone();
+    if let Some(r) = &opts.runtime {
+        resolved.runtime = r.clone();
+    }
+    opts.speculative.apply(&mut resolved)?;
+    let planes = if resolved.runtime.kv_dtype.is_fp8() { 1 } else { 2 };
+    let root = if o.dir.is_empty() { crate::sessions::default_dir() } else { std::path::PathBuf::from(&o.dir) };
+    let store = crate::sessions::SessionStore::open(&root, crate::sessions::compat_for(&resolved, planes))?;
+    let mut o = o;
+    if o.max_bytes == 0 {
+        o.max_bytes = crate::sessions::free_space_budget(crate::sessions::available_bytes(store.dir()) + store.total_bytes(), 20);
+    }
+    store.expire(crate::sessions::now_seconds(), o.ttl_seconds());
+    Ok(Some(Arc::new(crate::sessions::Shared::new(store, o))))
+}
+
+fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::sessions::Shared>>, ready: Sender<Result<bool>>, inbox: Receiver<Job>, stats: Arc<Mutex<Stats>>, pulse: Arc<Pulse>) -> Result<()> {
     if opts.placement.as_ref().is_some_and(|p| p.remote.is_some()) {
         match build_remote(spec, &opts) {
             Ok(mut sched) => {
@@ -471,6 +506,9 @@ fn start_engine(spec: &Spec, opts: ServeOptions, ready: Sender<Result<bool>>, in
         },
         None => match build(spec, opts) {
             Ok(mut sched) => {
+                if let Some(shared) = sessions {
+                    sched.enable_sessions(shared);
+                }
                 let _ = ready.send(Ok(sched.exec.rt.has_vision()));
                 run(&mut sched, inbox, stats, pulse);
             }
@@ -770,6 +808,9 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
                 continue;
             }
         }
+        pulse.enter();
+        sched.tick_sessions();
+        pulse.leave();
         let started = Instant::now();
         pulse.enter();
         let report = if sched.idle() { Ok(None) } else { sched.step(&mut events).map(Some) };
@@ -934,6 +975,10 @@ impl Serving {
 
     pub fn stats(&self) -> Stats {
         self.core.stats()
+    }
+
+    pub fn sessions(&self) -> Option<Arc<crate::sessions::Shared>> {
+        self.core.sessions()
     }
 
     pub fn max_model_len(&self) -> usize {
@@ -1103,7 +1148,7 @@ mod watchdog_tests {
     }
 
     fn hanging_core(watchdog: Option<Duration>, release: Arc<AtomicBool>) -> Arc<Core> {
-        Core::spawn(512, 1, watchdog, move |ready, inbox, _stats, pulse| {
+        Core::spawn(512, 1, watchdog, None, move |ready, inbox, _stats, pulse| {
             let _ = ready.send(Ok(false));
             let Ok(_job) = inbox.recv() else { return };
             pulse.enter();

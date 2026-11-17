@@ -364,6 +364,18 @@ impl Manager {
         m.stats.lock().unwrap().as_ref().and_then(|t| t.props())
     }
 
+    pub fn sessions_of(&self, id: &str) -> Option<std::sync::Arc<inference_bench_core::specrt_sessions::Shared>> {
+        let loaded = self.loaded.lock().unwrap();
+        let m = loaded.get(id)?;
+        m.stats.lock().unwrap().as_ref().and_then(|t| t.sessions())
+    }
+
+    pub fn sessions_all(&self) -> Vec<(String, std::sync::Arc<inference_bench_core::specrt_sessions::Shared>)> {
+        let mut ids: Vec<String> = self.loaded.lock().unwrap().keys().cloned().collect();
+        ids.sort();
+        ids.into_iter().filter_map(|id| self.sessions_of(&id).map(|s| (id, s))).collect()
+    }
+
     pub fn active_of(&self, id: &str) -> usize {
         self.loaded.lock().unwrap().get(id).map(|m| m.active()).unwrap_or(0)
     }

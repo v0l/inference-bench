@@ -133,6 +133,7 @@ pub struct ServerConfig {
     pub before_load: Option<String>,
     pub max_loaded_models: usize,
     pub prefix_cache_share_across_keys: bool,
+    pub sessions: inference_bench_core::specrt_serve::SessionOptions,
     pub vram_budget_bytes: Option<u64>,
     pub default_max_tokens: Option<usize>,
     pub top_k: Option<u32>,
@@ -189,6 +190,7 @@ impl Default for ServerConfig {
             before_load: None,
             max_loaded_models: 1,
             prefix_cache_share_across_keys: false,
+            sessions: Default::default(),
             vram_budget_bytes: None,
             default_max_tokens: None,
             top_k: None,
@@ -328,6 +330,7 @@ impl ServerConfig {
             anyhow::ensure!(!m.id.is_empty(), "a model has an empty id");
             anyhow::ensure!(seen.insert(&m.id), "model {} is listed twice", m.id);
         }
+        self.sessions.validate()?;
         if let Some(r) = &self.runtime {
             r.prefix_cache.validate()?;
             anyhow::ensure!(r.rope_extension.is_none_or(|e| e.factor >= 1), "[runtime] rope_extension factor must be at least 1");
@@ -365,6 +368,7 @@ impl ServerConfig {
             placement: Some(self.placement.clone()),
             progress: None,
             watchdog: (self.watchdog_secs > 0).then(|| std::time::Duration::from_secs(self.watchdog_secs)),
+            sessions: Some(self.sessions.clone()),
         })
     }
 

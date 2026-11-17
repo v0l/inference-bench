@@ -417,6 +417,22 @@ impl SessionStore {
         Ok(session)
     }
 
+    pub fn verify(&self, id: &str) -> Result<Entry> {
+        let entry = self.list().into_iter().find(|e| e.id == id).with_context(|| format!("no session {id}"))?;
+        ensure!(!entry.stripped, "session {id} is stripped, restoring it needs a prefill");
+        let checked = read_full(&self.path(id)).and_then(|(header, session)| {
+            ensure!(self.accepts(&header), "snapshot is for another model, spec or dtype");
+            ensure!(session_id(&self.compat, &session.scope, &session.tokens) == id, "token list does not match the session id");
+            Ok(())
+        });
+        if let Err(e) = checked {
+            self.metrics.restores_corrupt.fetch_add(1, Ordering::Relaxed);
+            let _ = self.delete(id);
+            return Err(e);
+        }
+        Ok(entry)
+    }
+
     pub fn touch(&self, id: &str, now: u64) -> Result<()> {
         let path = self.path(id);
         let mut f = OpenOptions::new().read(true).write(true).open(&path)?;
@@ -672,6 +688,80 @@ pub struct Resident {
 impl Shared {
     pub fn new(store: SessionStore, options: SessionOptions) -> Self {
         Shared { store, options, force: Mutex::new(Vec::new()), resident: Mutex::new(Vec::new()) }
+    }
+}
+
+pub fn compat_for(spec: &crate::spec::Spec, kv_planes: usize) -> Compat {
+    let mut h = Sha256::new();
+    h.update(spec.name.as_bytes());
+    h.update(spec.repo.as_bytes());
+    Compat {
+        model_hash: h.finalize().into(),
+        spec_hash: crate::prefix::namespace(spec, kv_planes, ""),
+        kv_dtype: spec.runtime.kv_dtype as u32,
+        layers: spec.kv_layers() as u32,
+        block_size: crate::codegen::PAGE as u32,
+    }
+}
+
+pub fn default_dir() -> PathBuf {
+    dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("inference-bench")
+}
+
+#[cfg(unix)]
+pub fn available_bytes(path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else { return 0 };
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return 0;
+    }
+    st.f_bavail as u64 * st.f_frsize as u64
+}
+
+#[cfg(not(unix))]
+pub fn available_bytes(_: &Path) -> u64 {
+    0
+}
+
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct Stats {
+    pub snapshots: u64,
+    pub snapshot_bytes: u64,
+    pub snapshot_failures: u64,
+    pub restores_ok: u64,
+    pub restores_miss: u64,
+    pub restores_corrupt: u64,
+    pub restore_seconds: f64,
+    pub prefill_tokens_saved: u64,
+    pub stored: usize,
+    pub stored_bytes: u64,
+}
+
+impl Shared {
+    pub fn stats(&self) -> Stats {
+        let m = &self.store.metrics;
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        Stats {
+            snapshots: get(&m.snapshots),
+            snapshot_bytes: get(&m.snapshot_bytes),
+            snapshot_failures: get(&m.snapshot_failures),
+            restores_ok: get(&m.restores_ok),
+            restores_miss: get(&m.restores_miss),
+            restores_corrupt: get(&m.restores_corrupt),
+            restore_seconds: get(&m.restore_micros) as f64 / 1e6,
+            prefill_tokens_saved: get(&m.prefill_tokens_saved),
+            stored: self.store.list().len(),
+            stored_bytes: self.store.total_bytes(),
+        }
+    }
+
+    pub fn request_save(&self, id: &str) -> bool {
+        if !self.resident.lock().expect("residents").iter().any(|r| r.id == id) {
+            return false;
+        }
+        self.force.lock().expect("force").push(id.to_string());
+        true
     }
 }
 
@@ -951,6 +1041,20 @@ mod tests {
         assert!(stripped.stripped && stripped.bytes < e.bytes && stripped.tokens == 100 && stripped.last_used == 5);
         assert!(store.find_prefix(&[0; 32], &(0..200).collect::<Vec<u32>>()).is_none());
         assert!(store.load(&e.id, 10).is_err());
+    }
+
+    #[test]
+    fn verify_reads_every_checksum_without_counting_a_restore() {
+        let store = SessionStore::open(&tmp("verify"), compat()).unwrap();
+        let e = store.write(&session(100, 1), 0).unwrap();
+        assert_eq!(store.verify(&e.id).unwrap().tokens, 100);
+        assert_eq!(store.metrics.restores_ok.load(Ordering::Relaxed), 0);
+        let mut bytes = fs::read(store.path(&e.id)).unwrap();
+        let at = bytes.len() / 2;
+        bytes[at] ^= 1;
+        fs::write(store.path(&e.id), bytes).unwrap();
+        assert!(store.verify(&e.id).is_err());
+        assert!(store.verify("nope").is_err());
     }
 
     #[test]

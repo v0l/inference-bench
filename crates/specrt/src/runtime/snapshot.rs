@@ -226,20 +226,7 @@ impl Runtime {
     }
 
     pub fn session_compat(&self) -> crate::sessions::Compat {
-        let model = {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(self.spec.name.as_bytes());
-            h.update(self.spec.repo.as_bytes());
-            h.finalize().into()
-        };
-        crate::sessions::Compat {
-            model_hash: model,
-            spec_hash: crate::prefix::namespace(&self.spec, self.kv_planes, ""),
-            kv_dtype: self.spec.runtime.kv_dtype as u32,
-            layers: self.spec.kv_layers() as u32,
-            block_size: crate::codegen::PAGE as u32,
-        }
+        crate::sessions::compat_for(&self.spec, self.kv_planes)
     }
 
     pub fn save_kv_blocks(&mut self, blocks: &[u32]) -> Result<(Vec<u8>, Vec<u8>)> {

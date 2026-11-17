@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{MethodRouter, get, post};
+use axum::routing::{MethodRouter, delete, get, post};
 use axum::{Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
 use inference_bench_core::chat::{ChatRequest, Message, Role, Sampling, TokenLogprob};
@@ -169,6 +169,11 @@ fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
         (r("GET", "/admin/models", "Model status and VRAM"), get(admin_models)),
         (r("POST", "/admin/models/{id}/load", "Load a model"), post(admin_load)),
         (r("POST", "/admin/models/{id}/unload", "Unload a model"), post(admin_unload)),
+        (r("GET", "/admin/sessions", "Idle session snapshots on disk and sessions held on the GPU"), get(admin_sessions)),
+        (r("DELETE", "/admin/sessions/{id}", "Delete a session snapshot"), delete(admin_session_delete)),
+        (r("POST", "/admin/sessions/{id}/save", "Write a resident session to disk now"), post(admin_session_save)),
+        (r("POST", "/admin/sessions/{id}/restore", "Verify a snapshot, it is restored by the next request that continues it"), post(admin_session_restore)),
+        (r("POST", "/admin/sessions/{id}/strip", "Keep the tokens, drop the KV payload"), post(admin_session_strip)),
         (r("GET", "/admin/specs", "Model spec layers and update state"), get(admin_specs)),
     ]
 }
@@ -391,6 +396,55 @@ async fn list_models(State(state): State<Arc<AppState>>) -> Json<Value> {
         .map(|m| json!({"id": m.id, "object": "model", "created": 0, "owned_by": "inference-bench", "loaded": m.loaded, "status": if m.loaded { "loaded" } else if m.loading.is_some() { "loading" } else { "unloaded" }}))
         .collect();
     Json(json!({"object": "list", "data": data}))
+}
+
+fn find_session(state: &AppState, id: &str) -> Result<(String, Arc<inference_bench_core::specrt_sessions::Shared>), ApiError> {
+    let all = state.manager.sessions_all();
+    if let Some(found) = all.into_iter().find(|(_, s)| s.store.list().iter().any(|e| e.id == id) || s.resident.lock().unwrap().iter().any(|r| r.id == id)) {
+        return Ok(found);
+    }
+    Err(ApiError::new(StatusCode::NOT_FOUND, "not_found", format!("no session {id}")))
+}
+
+async fn admin_sessions(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let ttl_for = |s: &inference_bench_core::specrt_sessions::Shared| s.options.ttl_seconds();
+    let mut data = Vec::new();
+    for (model, s) in state.manager.sessions_all() {
+        let ttl = ttl_for(&s);
+        for e in s.store.list() {
+            data.push(json!({"id": e.id, "model": model, "state": if e.stripped { "stripped" } else { "disk" }, "tokens": e.tokens, "bytes": e.bytes, "created": e.created, "last_used": e.last_used, "expires": e.expires(ttl)}));
+        }
+        for r in s.resident.lock().unwrap().iter() {
+            data.push(json!({"id": r.id, "model": model, "state": "resident", "tokens": r.tokens, "bytes": 0, "last_used": r.last_used, "expires": Value::Null}));
+        }
+    }
+    Json(json!({"object": "list", "data": data}))
+}
+
+async fn admin_session_delete(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let (_, s) = find_session(&state, &id)?;
+    s.store.delete(&id).map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("{e:#}")))?;
+    Ok(Json(json!({"id": id, "deleted": true})))
+}
+
+async fn admin_session_save(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let (_, s) = find_session(&state, &id)?;
+    if !s.request_save(&id) {
+        return Err(ApiError::new(StatusCode::CONFLICT, "conflict", format!("session {id} is not held on the GPU")));
+    }
+    Ok(Json(json!({"id": id, "queued": true})))
+}
+
+async fn admin_session_restore(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let (_, s) = find_session(&state, &id)?;
+    let e = s.store.verify(&id).map_err(|e| ApiError::new(StatusCode::CONFLICT, "conflict", format!("{e:#}")))?;
+    Ok(Json(json!({"id": id, "verified": true, "tokens": e.tokens, "stripped": e.stripped})))
+}
+
+async fn admin_session_strip(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, ApiError> {
+    let (_, s) = find_session(&state, &id)?;
+    let e = s.store.strip(&id, inference_bench_core::specrt_sessions::now_seconds()).map_err(|e| ApiError::new(StatusCode::CONFLICT, "conflict", format!("{e:#}")))?;
+    Ok(Json(json!({"id": id, "stripped": true, "bytes": e.bytes})))
 }
 
 async fn admin_specs(State(state): State<Arc<AppState>>) -> Json<Value> {

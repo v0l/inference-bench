@@ -128,6 +128,10 @@ impl Target for ServingTarget {
         self.serving.as_ref().map(|s| s.stats())
     }
 
+    fn sessions(&self) -> Option<std::sync::Arc<specrt::sessions::Shared>> {
+        self.serving.as_ref()?.sessions()
+    }
+
     fn props(&self) -> Option<serde_json::Value> {
         self.serving.as_ref().map(|s| s.props())
     }
@@ -189,6 +193,28 @@ fn vllm_names(o: &mut String, s: &Stats) {
     histogram(o, "vllm:request_queue_time_seconds", "Histogram of time spent in the WAITING phase for a request.", &s.queue_secs);
 }
 
+fn sessions(o: &mut String, s: &Stats) {
+    let Some(x) = &s.sessions else { return };
+    let mut put = |name: &str, kind: &str, help: &str, line: String| {
+        let _ = writeln!(o, "# HELP {name} {help}\n# TYPE {name} {kind}\n{line}");
+    };
+    put("inference_session_snapshots_total", "counter", "Session snapshots written to disk.", format!("inference_session_snapshots_total {}", x.snapshots));
+    put("inference_session_snapshot_failures_total", "counter", "Session snapshots that could not be written.", format!("inference_session_snapshot_failures_total {}", x.snapshot_failures));
+    put("inference_session_snapshot_bytes", "gauge", "Bytes of session snapshots on disk.", format!("inference_session_snapshot_bytes {}", x.stored_bytes));
+    put("inference_session_snapshots_stored", "gauge", "Session snapshots on disk.", format!("inference_session_snapshots_stored {}", x.stored));
+    put(
+        "inference_session_restores_total",
+        "counter",
+        "Session restores by result.",
+        format!(
+            "inference_session_restores_total{{result=\"ok\"}} {}\ninference_session_restores_total{{result=\"corrupt\"}} {}\ninference_session_restores_total{{result=\"miss\"}} {}",
+            x.restores_ok, x.restores_corrupt, x.restores_miss
+        ),
+    );
+    put("inference_session_restore_seconds", "counter", "Seconds spent reading session snapshots.", format!("inference_session_restore_seconds {}", x.restore_seconds));
+    put("inference_session_prefill_tokens_saved_total", "counter", "Prompt tokens not prefilled thanks to a restored session.", format!("inference_session_prefill_tokens_saved_total {}", x.prefill_tokens_saved));
+}
+
 pub fn render(s: &Stats) -> String {
     let mut o = String::new();
     let gauge = |o: &mut String, name: &str, help: &str, v: f64| {
@@ -229,6 +255,7 @@ pub fn render(s: &Stats) -> String {
     gauge(&mut o, "inference_prefix_cache_hit_rate", "Share of looked up prompt tokens that hit the prefix cache.", rate);
     gauge(&mut o, "inference_prefix_cache_blocks", "KV blocks held by the prefix cache.", s.prefix_blocks as f64);
     gauge(&mut o, "inference_prefix_cache_snapshots", "Recurrent state snapshots held by the prefix cache.", s.prefix_snapshots as f64);
+    sessions(&mut o, s);
     gauge(&mut o, "inference_prefix_cache_snapshot_bytes", "Host bytes of the recurrent state snapshots.", s.prefix_snapshot_bytes as f64);
     let _ = writeln!(
         o,
@@ -255,6 +282,23 @@ pub fn render(s: &Stats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_counters_render_with_the_documented_names() {
+        let s = Stats { sessions: Some(specrt::sessions::Stats { snapshots: 3, restores_ok: 2, restores_corrupt: 1, stored_bytes: 99, prefill_tokens_saved: 7000, restore_seconds: 1.5, ..Default::default() }), ..Stats::default() };
+        let text = render(&s);
+        for want in [
+            "inference_session_snapshots_total 3",
+            "inference_session_restores_total{result=\"ok\"} 2",
+            "inference_session_restores_total{result=\"corrupt\"} 1",
+            "inference_session_snapshot_bytes 99",
+            "inference_session_restore_seconds 1.5",
+            "inference_session_prefill_tokens_saved_total 7000",
+        ] {
+            assert!(text.contains(want), "{want}");
+        }
+        assert!(!render(&Stats::default()).contains("inference_session"));
+    }
 
     #[test]
     fn serving_stats_render_as_prometheus_text() {

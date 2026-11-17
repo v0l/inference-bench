@@ -701,6 +701,10 @@ impl<E: Executor> Scheduler<E> {
         }
     }
 
+    pub fn session_stats(&self) -> Option<crate::sessions::Stats> {
+        self.sessions.as_ref().map(|s| s.shared.stats())
+    }
+
     pub fn resident_sessions(&self) -> usize {
         self.sessions.as_ref().map_or(0, |s| s.held.len())
     }
@@ -760,6 +764,9 @@ impl<E: Executor> Scheduler<E> {
     pub fn tick_sessions(&mut self) {
         let Some(sessions) = self.sessions.as_mut() else { return };
         let now = (sessions.clock)();
+        if now == sessions.last_tick && sessions.shared.force.lock().expect("force").is_empty() {
+            return;
+        }
         let forced: Vec<String> = std::mem::take(&mut *sessions.shared.force.lock().expect("force"));
         let mut keys: Vec<String> = forced.into_iter().filter(|k| sessions.held.contains_key(k)).collect();
         keys.extend(sessions.janitor.tracker.due(now, sessions.janitor.options.idle_seconds, sessions.janitor.options.min_tokens).into_iter().filter(|k| sessions.held.contains_key(k)));

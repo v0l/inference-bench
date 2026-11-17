@@ -45,6 +45,8 @@ pub struct ServeArgs {
     pub idle_unload_secs: Option<u64>,
     #[arg(long, help = "Write an access log (JSON lines) here")]
     pub access_log: Option<PathBuf>,
+    #[arg(long, help = "Delete every saved session snapshot and exit")]
+    pub purge_sessions: bool,
 }
 
 impl ServeArgs {
@@ -99,7 +101,17 @@ impl ServeArgs {
         Ok(config)
     }
 
+    pub fn purge(&self) -> Result<usize> {
+        let config = self.into_config(false)?;
+        let root = if config.sessions.dir.is_empty() { inference_bench_core::specrt_sessions::default_dir() } else { PathBuf::from(&config.sessions.dir) };
+        inference_bench_core::specrt_sessions::purge_root(&root)
+    }
+
     pub fn run(&self, log: &LogArgs) -> Result<()> {
+        if self.purge_sessions {
+            println!("deleted {} session snapshots", self.purge()?);
+            return Ok(());
+        }
         let _guard = init(&log.config())?;
         self.run_initialised(log)
     }

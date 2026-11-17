@@ -906,3 +906,103 @@ fn metrics_carry_vllm_names_beside_our_own() {
     }
     rig.stop();
 }
+
+fn session_rig(tag: &str) -> (Rig, Arc<inference_bench_core::specrt_sessions::Shared>, String, String) {
+    use inference_bench_core::specrt_sessions::*;
+    let dir = std::env::temp_dir().join(format!("api-sessions-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let compat = Compat { model_hash: [1; 32], spec_hash: [2; 32], kv_dtype: 0, layers: 1, block_size: 16 };
+    let shared = Arc::new(Shared::new(SessionStore::open(&dir, compat).unwrap(), SessionOptions { enabled: true, ..Default::default() }));
+    let session = Session { scope: [0; 32], tokens: (0..5000).collect(), sections: vec![vec![0; 32], vec![1; 100], vec![2; 100], vec![]] };
+    let on_disk = shared.store.write(&session, now_seconds()).unwrap().id;
+    shared.resident.lock().unwrap().push(Resident { id: "resident-1".into(), tokens: 6000, last_used: now_seconds() });
+    let rig = start(config("max_num_seqs = 2\n[[models]]\nid='m'"), Shape::default());
+    *rig.stats.sessions.lock().unwrap() = Some(shared.clone());
+    assert_eq!(rig.post("/admin/models/m/load", None, json!({})).0, 200);
+    (rig, shared, on_disk, dir.display().to_string())
+}
+
+#[test]
+fn admin_sessions_list_restore_strip_and_delete() {
+    let (rig, shared, id, _) = session_rig("ops");
+    let (code, body, _) = rig.get("/admin/sessions", None);
+    assert_eq!(code, 200);
+    let list: Value = serde_json::from_str(&body).unwrap();
+    let rows = list["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let disk = rows.iter().find(|r| r["id"] == id.as_str()).unwrap();
+    assert_eq!((disk["state"].as_str(), disk["tokens"].as_u64(), disk["model"].as_str()), (Some("disk"), Some(5000), Some("m")));
+    assert!(disk["bytes"].as_u64().unwrap() > 0);
+    assert_eq!(disk["expires"].as_u64().unwrap() - disk["last_used"].as_u64().unwrap(), 8 * 3600);
+    assert_eq!(rows.iter().find(|r| r["id"] == "resident-1").unwrap()["state"], "resident");
+
+    let (code, body, _) = rig.post(&format!("/admin/sessions/{id}/restore"), None, json!({}));
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["verified"], true);
+
+    assert_eq!(rig.post("/admin/sessions/resident-1/save", None, json!({})).0, 200);
+    assert_eq!(shared.force.lock().unwrap().as_slice(), ["resident-1".to_string()]);
+    assert_eq!(rig.post(&format!("/admin/sessions/{id}/save"), None, json!({})).0, 409);
+
+    let (code, _, _) = rig.post(&format!("/admin/sessions/{id}/strip"), None, json!({}));
+    assert_eq!(code, 200);
+    let rows: Value = serde_json::from_str(&rig.get("/admin/sessions", None).1).unwrap();
+    let stripped = rows["data"].as_array().unwrap().iter().find(|r| r["id"] == id.as_str()).unwrap().clone();
+    assert_eq!((stripped["state"].as_str(), stripped["tokens"].as_u64()), (Some("stripped"), Some(5000)));
+    assert_eq!(rig.post(&format!("/admin/sessions/{id}/restore"), None, json!({})).0, 409);
+
+    let req = agent().delete(format!("{}/admin/sessions/{id}", rig.url));
+    assert_eq!(req.call().unwrap().status().as_u16(), 200);
+    assert!(shared.store.list().is_empty());
+    assert_eq!(rig.post("/admin/sessions/zzz/restore", None, json!({})).0, 404);
+    rig.stop();
+}
+
+#[test]
+fn a_corrupt_snapshot_is_dropped_when_a_restore_is_requested() {
+    let (rig, shared, id, dir) = session_rig("corrupt");
+    let path = std::fs::read_dir(shared.store.dir()).unwrap().map(|e| e.unwrap().path()).find(|p| p.extension().is_some_and(|e| e == "kvs")).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = bytes.len() - 40;
+    bytes[at] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+    assert_eq!(rig.post(&format!("/admin/sessions/{id}/restore"), None, json!({})).0, 409);
+    assert!(!path.exists(), "{dir}");
+    rig.stop();
+}
+
+#[test]
+fn session_routes_need_the_api_key_like_other_admin_routes() {
+    let rig = start(config("api_keys = ['k']\n[[models]]\nid='m'"), Shape::default());
+    assert_eq!(rig.get("/admin/sessions", None).0, 401);
+    assert_eq!(rig.get("/admin/sessions", Some("k")).0, 200);
+    rig.stop();
+}
+
+#[test]
+fn the_sessions_table_reaches_the_serving_options_and_defaults_to_off() {
+    let c = inference_bench_server::ServerConfig::parse("max_num_seqs = 4\n[sessions]\nenabled = true\nidle_seconds = 60\nttl_hours = 2\nmin_tokens = 128\n[[models]]\nid='m'").unwrap();
+    let o = c.serve_options(&c.models[0]).unwrap().sessions.unwrap();
+    assert_eq!((o.enabled, o.idle_seconds, o.ttl_hours, o.min_tokens), (true, 60, 2, 128));
+    let d = inference_bench_server::ServerConfig::parse("max_num_seqs = 4\n[[models]]\nid='m'").unwrap();
+    let o = d.serve_options(&d.models[0]).unwrap().sessions.unwrap();
+    assert_eq!((o.enabled, o.idle_seconds, o.ttl_hours, o.min_tokens), (false, 300, 8, 4096));
+    assert!(inference_bench_server::ServerConfig::parse("[sessions]\nidle_seconds = 0").is_err());
+}
+
+#[test]
+fn purge_sessions_deletes_every_snapshot_under_the_configured_dir() {
+    use inference_bench_core::specrt_sessions::*;
+    let dir = std::env::temp_dir().join(format!("api-purge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let compat = Compat { model_hash: [1; 32], spec_hash: [2; 32], kv_dtype: 0, layers: 1, block_size: 16 };
+    let store = SessionStore::open(&dir, compat).unwrap();
+    for n in [100u32, 101] {
+        store.write(&Session { scope: [0; 32], tokens: (0..n).collect(), sections: vec![vec![]; 4] }, 0).unwrap();
+    }
+    let cfg = dir.join("server.toml");
+    std::fs::write(&cfg, format!("[sessions]\ndir = '{}'\n", dir.display())).unwrap();
+    let args = inference_bench_server::cli::ServeArgs { config: Some(cfg), purge_sessions: true, ..Default::default() };
+    assert_eq!(args.purge().unwrap(), 2);
+    assert!(SessionStore::open(&dir, store.compat().clone()).unwrap().list().is_empty());
+}
