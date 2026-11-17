@@ -20,6 +20,15 @@ impl GpuStats {
     }
 }
 
+pub fn used_total(stats: &[GpuStats]) -> Option<(u64, u64)> {
+    (!stats.is_empty()).then(|| (stats.iter().map(|g| g.used_bytes).sum(), stats.iter().map(|g| g.total_bytes).sum()))
+}
+
+pub fn mean_util(stats: &[GpuStats]) -> Option<u32> {
+    let utils: Vec<u32> = stats.iter().filter_map(|g| g.util_percent).collect();
+    (!utils.is_empty()).then(|| utils.iter().sum::<u32>() / utils.len() as u32)
+}
+
 pub fn parse_compute_apps(output: &str) -> Vec<(String, u32, u64)> {
     output
         .lines()
@@ -119,6 +128,14 @@ mod tests {
         assert_eq!(g.len(), 2);
         assert_eq!((g[0].used_bytes, g[0].total_bytes, g[0].util_percent), (85926 << 20, 97887 << 20, Some(96)));
         assert_eq!(g[1].util_percent, None);
+    }
+
+    #[test]
+    fn used_memory_and_utilisation_cover_every_gpu() {
+        let g = parse_nvidia_smi("RTX, 1000, 96000, 90\nRTX, 3000, 96000, 10\n");
+        assert_eq!(used_total(&g), Some((4000 << 20, 192000 << 20)));
+        assert_eq!(mean_util(&g), Some(50));
+        assert_eq!(used_total(&[]), None);
     }
 
     #[test]

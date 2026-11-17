@@ -100,14 +100,13 @@ fn status_bar(app: &mut App, ui: &mut egui::Ui) {
         }
         if let Some((ok, text)) = &app.notice {
             ui.add_space(10.0);
-            status(ui, *ok, text);
+            crate::working::status_line(ui, *ok, text, 460.0);
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some(g) = app.gpu.first() {
-                let mut line = Line::new()
-                    .legend("vram")
-                    .measured(format!("{} / {}", human_size(g.used_bytes), human_size(g.total_bytes)));
-                if let Some(u) = g.util_percent {
+            if let Some((used, total)) = inference_bench_core::gpu::used_total(&app.gpu) {
+                let legend = if app.gpu.len() > 1 { format!("vram x{}", app.gpu.len()) } else { "vram".into() };
+                let mut line = Line::new().legend(&legend).measured(format!("{} / {}", human_size(used), human_size(total)));
+                if let Some(u) = inference_bench_core::gpu::mean_util(&app.gpu) {
                     line = line.gap(12.0).legend("gpu").measured(format!("{u}%"));
                 }
                 line.size(11.0).show(ui);

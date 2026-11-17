@@ -62,7 +62,11 @@ pub fn progress_fraction(p: &crate::LoadProgress) -> f32 {
 
 pub fn load_bar(ui: &mut egui::Ui, p: &crate::LoadProgress, width: f32) {
     let text = progress_text(p);
-    ui.add(egui::ProgressBar::new(progress_fraction(p)).desired_width(width).text(text));
+    ui.scope(|ui| {
+        ui.set_width(width);
+        let total = (p.total > 0).then_some(1.0);
+        progress(ui, "", progress_fraction(p), total, &text);
+    });
 }
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mut egui::Ui)) {
@@ -101,8 +105,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mu
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             right(ui);
-            if let Some(g) = app.gpu.first() {
-                Line::new().legend("vram").measured(format!("{} / {}", human_size(g.used_bytes), human_size(g.total_bytes))).size(11.0).show(ui);
+            if let Some((used, total)) = inference_bench_core::gpu::used_total(&app.gpu) {
+                let legend = if app.gpu.len() > 1 { format!("vram x{}", app.gpu.len()) } else { "vram".into() };
+                Line::new().legend(&legend).measured(format!("{} / {}", human_size(used), human_size(total))).size(11.0).show(ui);
             }
         });
     });
