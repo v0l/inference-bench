@@ -64,10 +64,12 @@ pub fn progress_fraction(p: &crate::LoadProgress) -> f32 {
 
 pub fn load_bar(ui: &mut egui::Ui, p: &crate::LoadProgress, width: f32) {
     let text = progress_text(p);
-    ui.scope(|ui| {
+    ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
         ui.set_width(width);
+        ui.spacing_mut().item_spacing.y = 1.0;
         let total = (p.total > 0).then_some(1.0);
-        progress(ui, "", progress_fraction(p), total, &text);
+        progress(ui, "", progress_fraction(p), total, "");
+        Line::new().value(text).size(10.5).elided(ui);
     });
 }
 

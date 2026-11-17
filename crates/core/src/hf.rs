@@ -46,7 +46,8 @@ pub struct Hub {
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .timeout_connect(Some(std::time::Duration::from_secs(10)))
+        .ip_family(ureq::config::IpFamily::Ipv4Only)
         .timeout_recv_body(Some(std::time::Duration::from_secs(60)))
         .build()
         .into()
@@ -164,8 +165,13 @@ impl Hub {
     }
 
     pub fn range(&self, repo: &str, file: &str, len: usize) -> Result<Vec<u8>, String> {
+        self.range_between(repo, file, 0, len)
+    }
+
+    pub fn range_between(&self, repo: &str, file: &str, from: usize, to: usize) -> Result<Vec<u8>, String> {
+        let len = to - from;
         let url = format!("{}/{repo}/resolve/main/{file}", self.base);
-        let resp = self.get(&url).header("Range", &format!("bytes=0-{}", len.saturating_sub(1))).call().map_err(|e| format!("{url}: {e}"))?;
+        let resp = self.get(&url).header("Range", &format!("bytes={from}-{}", to.saturating_sub(1))).call().map_err(|e| format!("{url}: {e}"))?;
         let status = resp.status().as_u16();
         if status >= 400 {
             return Err(format!("{url}: HTTP {status}"));
@@ -180,19 +186,21 @@ impl Hub {
     }
 
     pub fn gguf_header_from(&self, repo: &str, file: &str, first: usize, most: usize) -> Result<specrt::gguf::Gguf, String> {
-        let mut len = first;
+        let mut bytes = self.range(repo, file, first)?;
+        let mut asked = first;
         loop {
-            let bytes = self.range(repo, file, len)?;
-            let whole_file = bytes.len() < len;
-            match specrt::gguf::Gguf::from_header(bytes) {
+            let whole_file = bytes.len() < asked;
+            match specrt::gguf::Gguf::from_header(bytes.clone()) {
                 Ok(g) => return Ok(g),
                 Err(e) => {
                     let text = format!("{e:#}");
                     let truncated = ["ends early", "does not fit", "larger than the file"].iter().any(|m| text.contains(m));
-                    if whole_file || !truncated || len >= most {
+                    if whole_file || !truncated || asked >= most {
                         return Err(format!("{file}: {text}"));
                     }
-                    len = (len * 2).min(most);
+                    let next = (asked + first).min(most);
+                    bytes.extend(self.range_between(repo, file, asked, next)?);
+                    asked = next;
                 }
             }
         }

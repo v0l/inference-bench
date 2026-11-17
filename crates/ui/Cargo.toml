@@ -29,6 +29,9 @@ chrono.workspace = true
 
 serde.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+specrt = { package = "inference-bench-specrt", path = "../specrt", features = ["wgpu"] }
+
 [dev-dependencies]
 toml.workspace = true
 tracing-subscriber.workspace = true

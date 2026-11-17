@@ -302,7 +302,8 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                 note(ui, "The engine will read the model itself and report what is wrong.", LEGEND);
             }
             let body_w = ui.available_width();
-            let body_h = (ui.ctx().content_rect().height() - 200.0).clamp(200.0, 900.0);
+            let room = (ui.ctx().content_rect().height() - 200.0).clamp(200.0, 900.0);
+            let body_h = if dialog.advanced { room } else { room.min(560.0) };
             egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(body_h).show(ui, |ui| {
             ui.set_max_width(body_w);
             section(ui, "profile", "one switch for the measured best, or for the least memory", |ui| {

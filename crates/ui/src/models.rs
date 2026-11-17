@@ -49,8 +49,6 @@ struct PlanKey {
 
 const BUDGET_BUCKET: u64 = 256 << 20;
 
-type Inspected = Vec<(String, Result<RepoInfo, String>)>;
-
 pub struct ModelsState {
     pub pane: Pane,
     pub query: String,
@@ -58,7 +56,8 @@ pub struct ModelsState {
     pub results: Vec<Repo>,
     search: Pending<Result<Vec<Repo>, String>>,
     pub infos: BTreeMap<String, Result<RepoInfo, String>>,
-    inspecting: Pending<Inspected>,
+    inspecting: Option<std::sync::mpsc::Receiver<(String, Result<RepoInfo, String>)>>,
+    pub inspect_total: usize,
     pub picks: BTreeMap<String, String>,
     pub preselect: Vec<Preselect>,
     pub downloads: Vec<Download>,
@@ -85,7 +84,8 @@ impl Default for ModelsState {
             results: Vec::new(),
             search: Pending::default(),
             infos: BTreeMap::new(),
-            inspecting: Pending::default(),
+            inspecting: None,
+            inspect_total: 0,
             picks: BTreeMap::new(),
             preselect: Vec::new(),
             downloads: Vec::new(),
@@ -111,7 +111,7 @@ impl ModelsState {
     }
 
     pub fn downloading(&self) -> bool {
-        self.downloads.iter().any(|d| d.result.is_none()) || self.search.busy() || self.inspecting.busy()
+        self.downloads.iter().any(|d| d.result.is_none()) || self.search.busy() || self.inspecting.is_some()
     }
 
     pub fn take_rescan(&mut self) -> bool {
@@ -132,9 +132,20 @@ impl ModelsState {
                 Err(e) => self.message = Some((false, e)),
             }
         }
-        if let Some(found) = self.inspecting.poll() {
-            self.generation += 1;
-            self.infos.extend(found);
+        if let Some(rx) = &self.inspecting {
+            loop {
+                match rx.try_recv() {
+                    Ok((repo, info)) => {
+                        self.generation += 1;
+                        self.infos.insert(repo, info);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.inspecting = None;
+                        break;
+                    }
+                }
+            }
         }
         let mut finished = false;
         for d in &mut self.downloads {
@@ -181,7 +192,18 @@ impl ModelsState {
         if repos.is_empty() {
             return;
         }
-        self.inspecting.start(job::spawn(wake, move || discover::inspect_all(&Hub::new(&base, &token), &repos, &dir)));
+        self.inspect_total = repos.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wake = wake.clone();
+        std::thread::spawn(move || {
+            let hub = Hub::new(&base, &token);
+            let tx = std::sync::Mutex::new(tx);
+            discover::inspect_each(&hub, &repos, &dir, &|repo, info| {
+                let _ = tx.lock().unwrap().send((repo, info));
+                wake();
+            });
+        });
+        self.inspecting = Some(rx);
     }
 
     pub fn plans(&self, gpus: &[u64], seqs: usize) -> Vec<RepoPlan> {
@@ -354,33 +376,29 @@ fn specs_bar(app: &mut App, ui: &mut egui::Ui) {
         (None, false) => (state.last_ok, state.last_result.clone()),
         (None, true) => (true, String::new()),
     };
-    let label = if busy { "checking" } else { "check specs now" };
+    let label = if busy { "checking" } else { "check specs" };
     if busy {
         crate::working::working(ui, "checking GitHub for spec updates");
     }
+    let verdict = crate::specs::verdict(ok, &detail);
+    let tint = match (detail.is_empty(), ok) {
+        (true, _) => LEGEND,
+        (false, true) => OK,
+        (false, false) => FAULT,
+    };
+    let hover = if detail.is_empty() { "the specs have not been checked yet".to_string() } else { detail };
     ui.horizontal(|ui| {
-        let reserve = Key::new("check specs now").width(ui);
-        if ui.add(Key::new(label).outline(READOUT).enabled(!busy).min_width(reserve)).clicked() {
+        let reserve = Key::new("check specs").width(ui);
+        if ui.add(Key::new(label).outline(VALUE).enabled(!busy).min_width(reserve)).clicked() {
             let (wake, dir) = (app.wake.clone(), app.dir.clone());
             app.specs.check_now(&wake, &dir, &app.settings);
         }
-        let verdict = crate::specs::verdict(ok, &detail);
-        let tint = match (detail.is_empty(), ok) {
-            (true, _) => LEGEND,
-            (false, true) => OK,
-            (false, false) => FAULT,
-        };
-        let hover = if detail.is_empty() { "the specs have not been checked yet".to_string() } else { detail };
         let line = Line::new()
             .legend("specs")
-            .value(app.settings.specs().source())
-            .gap(14.0)
-            .legend("checked")
-            .value(crate::specs::when(state.checked_at))
-            .gap(14.0)
-            .legend("result")
             .tint(tint)
             .value(verdict)
+            .gap(10.0)
+            .note(format!("{}, checked {}", app.settings.specs().source(), crate::specs::when(state.checked_at)))
             .size(11.0)
             .elided(ui);
         line.on_hover_text(hover);
@@ -394,8 +412,10 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
     let n = app.library.len();
     let usable = app.library.iter().filter(|m| runs_here(m)).count();
     let mut go_discover = false;
-    field_then(ui, &mut app.models.library_query, "search my models by name, architecture or quant", 150.0, |ui| {
-        go_discover = ui.add(Key::new("search hugging face").outline(READOUT).min_width(140.0)).clicked();
+    ui.horizontal(|ui| {
+        field_then(ui, &mut app.models.library_query, "search my models by name, architecture or quant", 190.0, |ui| {
+            go_discover = ui.add(Key::new("search hugging face").solid(READOUT).min_width(170.0)).clicked();
+        });
     });
     if go_discover {
         app.models.query = app.models.library_query.clone();
@@ -406,25 +426,17 @@ fn library_pane(app: &mut App, ui: &mut egui::Ui) {
     let mut order: Vec<usize> = (0..n).filter(|&i| matches(&app.library[i], &query)).collect();
     order.sort_by_key(|&i| !runs_here(&app.library[i]));
     let visible: Vec<usize> = order.into_iter().filter(|&i| app.models.show_all || runs_here(&app.library[i])).collect();
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
-        Line::new()
-            .legend("models")
-            .value(n.to_string())
-            .gap(14.0)
-            .legend("shown")
-            .value(visible.len().to_string())
-            .gap(14.0)
-            .legend("usable")
-            .value(usable.to_string())
-            .show(ui);
+        Line::new().legend("models").value(n.to_string()).gap(12.0).legend("shown").value(visible.len().to_string()).gap(12.0).legend("usable").value(usable.to_string()).show(ui);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let mut all = app.models.show_all;
-            if switch(ui, "show unusable", &mut all, "", "") {
-                app.models.show_all = all;
+            if toggle(ui, "show unusable", app.models.show_all).clicked() {
+                app.models.show_all = !app.models.show_all;
             }
         });
     });
     specs_bar(app, ui);
+    ui.add_space(6.0);
     for &i in &visible {
         model_card(app, ui, i);
     }
@@ -589,8 +601,10 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
     let mut go = false;
     let token = app.settings.hf_token.clone();
     let busy = app.models.search.busy();
-    field_then(ui, &mut app.models.query, "search Hugging Face, e.g. qwen3 gguf", 110.0, |ui| {
-        go = ui.add(Key::new(if busy { "searching" } else { "search" }).solid(READOUT).enabled(!busy)).clicked();
+    ui.horizontal(|ui| {
+        field_then(ui, &mut app.models.query, "search Hugging Face, e.g. qwen3 gguf", 110.0, |ui| {
+            go = ui.add(Key::new(if busy { "searching" } else { "search" }).solid(READOUT).enabled(!busy)).clicked();
+        });
     });
     if go {
         app.models.relation = None;
@@ -610,8 +624,9 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
     }
     if app.models.search.busy() {
         crate::working::working(ui, "searching Hugging Face");
-    } else if app.models.inspecting.busy() {
-        crate::working::working(ui, "checking which quants fit and run");
+    } else if app.models.inspecting.is_some() {
+        let done = app.models.infos.len();
+        crate::working::working(ui, &format!("checking which quants fit and run, {done} of {}", app.models.inspect_total));
     }
     let gpus = app.free_gpu_list();
     if !gpus.is_empty() {

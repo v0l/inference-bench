@@ -535,12 +535,19 @@ pub fn inspect_cached(hub: &Hub, repo: &str, dir: &Path, ttl: u64, now: u64) -> 
     info
 }
 
-pub fn inspect_all(hub: &Hub, repos: &[String], dir: &Path) -> Vec<(String, Result<RepoInfo, String>)> {
+pub fn inspect_each(hub: &Hub, repos: &[String], dir: &Path, on_result: &(dyn Fn(String, Result<RepoInfo, String>) + Sync)) {
     let now = hf::now_secs();
     std::thread::scope(|s| {
-        let jobs: Vec<_> = repos.iter().map(|r| s.spawn(move || (r.clone(), inspect_cached(hub, r, dir, INFO_TTL_SECS, now)))).collect();
-        jobs.into_iter().filter_map(|j| j.join().ok()).collect()
-    })
+        for r in repos {
+            s.spawn(move || on_result(r.clone(), inspect_cached(hub, r, dir, INFO_TTL_SECS, now)));
+        }
+    });
+}
+
+pub fn inspect_all(hub: &Hub, repos: &[String], dir: &Path) -> Vec<(String, Result<RepoInfo, String>)> {
+    let out = std::sync::Mutex::new(Vec::new());
+    inspect_each(hub, repos, dir, &|repo, info| out.lock().unwrap().push((repo, info)));
+    out.into_inner().unwrap()
 }
 
 #[derive(Debug, Clone, PartialEq)]

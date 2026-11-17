@@ -1148,7 +1148,7 @@ fn the_model_list_refreshes_when_a_spec_update_lands() {
     assert!(!h.state().library.iter().any(|m| m.name == "landed-from-github"));
     h.state_mut().models.show_all = true;
     h.run();
-    h.get_by_label("check specs now").click();
+    h.get_by_label("check specs").click();
     pump_until(&mut h, 20, "update and rescan", |a| !a.specs.busy() && !a.scan.busy() && a.library.iter().any(|m| m.name == "landed-from-github"));
     h.run();
     let landed = h.state().library.iter().find(|m| m.name == "landed-from-github").unwrap().clone();
@@ -1162,7 +1162,7 @@ fn the_model_list_refreshes_when_a_spec_update_lands() {
 fn a_300_character_spec_error_leaves_the_check_key_its_full_width() {
     let mut h = harness("specs-long-error", Tab::Models);
     h.run();
-    let plain = h.get_by_label("check specs now").rect();
+    let plain = h.get_by_label("check specs").rect();
     assert!(plain.width() > 90.0, "{plain:?}");
     let error = format!("https://example.invalid/{}: {}", "x".repeat(60), "download over 67108864 bytes or broken ".repeat(8));
     assert!(error.len() >= 300);
@@ -1172,7 +1172,7 @@ fn a_300_character_spec_error_leaves_the_check_key_its_full_width() {
         app.specs.state.last_ok = false;
     }
     h.run();
-    let key = h.get_by_label("check specs now").rect();
+    let key = h.get_by_label("check specs").rect();
     assert!(key.width() >= plain.width() - 1.0, "key shrank from {} to {}", plain.width(), key.width());
     assert!(key.height() <= plain.height() + 1.0, "key wrapped to {} high", key.height());
     assert!(h.query_by_label_contains("download over").is_none());
@@ -1249,7 +1249,7 @@ fn screenshot_of_spec_provenance_and_update_settings() {
         app
     });
     h.run();
-    h.get_by_label("check specs now").click();
+    h.get_by_label("check specs").click();
     pump_until(&mut h, 30, "update", |a| !a.specs.busy() && a.specs.state.last_ok);
     pump_until(&mut h, 30, "scan", |a| !a.scan.busy() && a.library.iter().any(|m| m.name == "qwen3-0.6b-new"));
     h.state_mut().notice = None;
@@ -1908,11 +1908,20 @@ fn engine_options_from_the_dialog_are_remembered_and_shown_on_the_server_tab() {
 }
 
 #[test]
+fn screenshot_of_the_models_page_header() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness_sized("shot-models-header", Tab::Models, 520.0);
+    h.run();
+    h.render().unwrap().save(out.join("models-header.png")).unwrap();
+}
+
+#[test]
 fn screenshots_of_the_load_dialog_with_advanced_folded_and_open() {
     let out = shots_dir();
     std::fs::create_dir_all(&out).unwrap();
     for (open, file) in [(false, "load-dialog-profile-folded.png"), (true, "load-dialog-profile-advanced.png")] {
-        let mut h = harness_sized(&format!("shot-adv-{open}"), Tab::Models, 1500.0);
+        let mut h = harness_sized(&format!("shot-adv-{open}"), Tab::Models, 760.0);
         with_gpu(&mut h, 20 << 30, 96 << 30);
         let d = dir(&format!("shot-adv-model-{open}"));
         std::fs::create_dir_all(&d).unwrap();
