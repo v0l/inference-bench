@@ -50,6 +50,13 @@ last use, and restored on the next request that continues it, so only the new su
   `inference-bench-server --purge-sessions`. Sessions are off by default.
 - UI: Sessions section on the server tab (size, idle, expires in, restore, strip, delete).
 
+## Shared pinned pool (#402)
+
+Session saves and restores take their pinned staging memory from `rt.host_pool()`, the same pool
+`park`/`resume` use for swapped sequences. `swap_space_gb` is the one limit for both
+(`Executor::set_host_limit`), so a parked sequence and a session write compete for the same bytes;
+a save that does not fit fails, the session stays held on the GPU and is retried on the next tick.
+
 ## Tests
 
 CPU: `sessions::tests` (store, janitor with a fake clock), `sched::tests` (two turns 6 minutes apart

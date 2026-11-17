@@ -262,10 +262,19 @@ impl Runtime {
         ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
         let per = self.kv_cache_block_bytes();
         ensure!(k.len() == blocks.len() * per && v.len() == k.len(), "session KV is {} bytes, expected {}", k.len(), blocks.len() * per);
-        for (cache, data) in [(&self.buf.k_cache, k), (&self.buf.v_cache, v)] {
+        let total = k.len();
+        let mut host = self.host.alloc(total * 2)?;
+        {
+            let dst = host.as_mut_slice()?;
+            dst[..total].copy_from_slice(k);
+            dst[total..].copy_from_slice(v);
+        }
+        let src = host.as_slice()?;
+        for (c, cache) in [&self.buf.k_cache, &self.buf.v_cache].into_iter().enumerate() {
             let (base, _guard) = cache.device_ptr(&self.stream);
             for (i, &b) in blocks.iter().enumerate() {
-                unsafe { result::memcpy_htod_async(base + (b as usize * per) as u64, &data[i * per..(i + 1) * per], self.stream.cu_stream()) }?;
+                let at = c * total + i * per;
+                unsafe { result::memcpy_htod_async(base + (b as usize * per) as u64, &src[at..at + per], self.stream.cu_stream()) }?;
             }
         }
         self.stream.synchronize()?;

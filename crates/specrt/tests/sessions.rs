@@ -112,3 +112,24 @@ fn tiny_hybrid_session_restored_into_a_fresh_engine_matches_the_uninterrupted_ru
 fn tiny_dense_session_restored_into_a_fresh_engine_matches_the_uninterrupted_run() {
     roundtrip("tiny-granite");
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn saved_kv_blocks_come_back_bit_identical_through_the_shared_host_pool() {
+    let s = spec_for("tiny-qwen3.5");
+    let layout = Layout { max_ctx: 1024, slots: 2, kv_blocks: 64, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
+    let mut rt = Runtime::load_layout(&s, layout).unwrap();
+    let mut st = rt.stepper().unwrap();
+    let blocks: Vec<u32> = (0..10).collect();
+    rt.set_block_table(0, &blocks).unwrap();
+    rt.prefill_slot(&mut st, 0, &prompt(150), 0, None).unwrap();
+    let (k, v) = rt.save_kv_blocks(&blocks).unwrap();
+    assert_eq!(rt.host_pool().used(), 0, "pinned bytes are returned after a save");
+    let other: Vec<u32> = (20..30).collect();
+    rt.load_kv_blocks(&other, &k, &v).unwrap();
+    let (k2, v2) = rt.save_kv_blocks(&other).unwrap();
+    assert_eq!((k, v), (k2, v2));
+    rt.host_pool().set_limit(16);
+    assert!(rt.save_kv_blocks(&blocks).is_err(), "the shared limit applies to sessions");
+    assert_eq!(rt.host_pool().used(), 0);
+}

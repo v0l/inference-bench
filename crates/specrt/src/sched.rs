@@ -127,6 +127,10 @@ pub trait Executor {
     fn swap_bytes(&self, _blocks: usize) -> usize {
         0
     }
+    fn set_host_limit(&mut self, _bytes: usize) {}
+    fn host_used(&self) -> usize {
+        0
+    }
     fn park(&mut self, _slot: usize, _blocks: &[u32]) -> Result<Option<HostSeq>> {
         Ok(None)
     }
@@ -371,6 +375,14 @@ impl Executor for GpuExecutor {
 
     fn swap_bytes(&self, blocks: usize) -> usize {
         self.rt.swap_bytes(blocks)
+    }
+
+    fn set_host_limit(&mut self, bytes: usize) {
+        self.rt.host_pool().set_limit(bytes);
+    }
+
+    fn host_used(&self) -> usize {
+        self.rt.host_pool().used()
     }
 
     fn park(&mut self, slot: usize, blocks: &[u32]) -> Result<Option<HostSeq>> {
@@ -664,6 +676,10 @@ impl<E: Executor> Scheduler<E> {
         let pool = BlockPool::new(exec.kv_blocks());
         let free_slots = (0..exec.slots()).rev().collect();
         let cache = (cfg.prefix_cache.enabled && exec.supports_prefix_cache()).then(|| PrefixCache::new(&cfg.prefix_cache, exec.hybrid()));
+        let mut exec = exec;
+        if cfg.swap_space_bytes > 0 {
+            exec.set_host_limit(cfg.swap_space_bytes as usize);
+        }
         Scheduler {
             exec,
             cfg,
@@ -1026,7 +1042,7 @@ impl<E: Executor> Scheduler<E> {
             return None;
         }
         let bytes = self.exec.swap_bytes(s.blocks.len()) as u64;
-        if bytes == 0 || self.swapped_bytes + bytes > self.cfg.swap_space_bytes {
+        if bytes == 0 || self.swapped_bytes + bytes > self.cfg.swap_space_bytes || self.exec.host_used() as u64 + bytes > self.cfg.swap_space_bytes {
             return None;
         }
         let started = Instant::now();
@@ -1566,7 +1582,17 @@ mod tests {
         (h % VOCAB as u64) as u32
     }
 
+    pub struct HostGuard(Arc<std::sync::atomic::AtomicUsize>, usize);
+
+    impl Drop for HostGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(self.1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
     pub struct Fake {
+        pub host_limit: usize,
+        pub host_used: Arc<std::sync::atomic::AtomicUsize>,
         max_ctx: usize,
         slots: usize,
         kv: Vec<Option<u32>>,
@@ -1608,6 +1634,8 @@ mod tests {
     impl Fake {
         pub fn new(max_ctx: usize, slots: usize, blocks: usize, chunk: usize) -> Self {
             Fake {
+                host_limit: usize::MAX,
+                host_used: Default::default(),
                 max_ctx,
                 slots,
                 kv: vec![None; blocks * PAGE],
@@ -1640,6 +1668,15 @@ mod tests {
                 parks: 0,
                 resumes: 0,
             }
+        }
+
+        fn host_alloc(&self, bytes: usize) -> Result<HostGuard> {
+            let before = self.host_used.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+            if before.saturating_add(bytes) > self.host_limit {
+                self.host_used.fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+                bail!("pinned host pool is full");
+            }
+            Ok(HostGuard(self.host_used.clone(), bytes))
         }
 
         fn write(&mut self, slot: usize, pos: usize, t: u32) -> u64 {
@@ -1759,6 +1796,7 @@ mod tests {
             Some(crate::sessions::Compat { model_hash: [1; 32], spec_hash: [2; 32], kv_dtype: 0, layers: 1, block_size: PAGE as u32 })
         }
         fn save_session(&mut self, blocks: &[u32], state: Option<&StateSnapshot>) -> Result<Vec<Vec<u8>>> {
+            let _pinned = self.host_alloc(blocks.len() * PAGE * 4)?;
             let mut k = Vec::new();
             for &b in blocks {
                 for i in 0..PAGE {
@@ -1770,6 +1808,7 @@ mod tests {
         fn restore_session(&mut self, slot: usize, blocks: &[u32], sections: &[Vec<u8>]) -> Result<()> {
             let k = &sections[crate::sessions::SECTION_K];
             assert_eq!(k.len(), blocks.len() * PAGE * 4);
+            let _pinned = self.host_alloc(k.len())?;
             for (j, &b) in blocks.iter().enumerate() {
                 for i in 0..PAGE {
                     let at = (j * PAGE + i) * 4;
@@ -1793,17 +1832,25 @@ mod tests {
         fn swap_bytes(&self, blocks: usize) -> usize {
             if self.swap { blocks * 1000 + 100 } else { 0 }
         }
+        fn set_host_limit(&mut self, bytes: usize) {
+            self.host_limit = bytes;
+        }
+        fn host_used(&self) -> usize {
+            self.host_used.load(std::sync::atomic::Ordering::SeqCst)
+        }
         fn park(&mut self, slot: usize, blocks: &[u32]) -> Result<Option<HostSeq>> {
             if !self.swap {
                 return Ok(None);
             }
+            let bytes = blocks.len() * 1000 + 100;
+            let guard = self.host_alloc(bytes)?;
             self.parks += 1;
             let kv: Vec<Vec<Option<u32>>> = blocks.iter().map(|&b| self.kv[b as usize * PAGE..(b as usize + 1) * PAGE].to_vec()).collect();
-            Ok(Some(HostSeq { bytes: blocks.len() * 1000 + 100, blocks: blocks.len(), payload: Box::new((kv, self.state[slot])) }))
+            Ok(Some(HostSeq { bytes: blocks.len() * 1000 + 100, blocks: blocks.len(), payload: Box::new((kv, self.state[slot], guard)) }))
         }
         fn resume(&mut self, slot: usize, blocks: &[u32], host: &HostSeq) -> Result<()> {
             self.resumes += 1;
-            let (kv, state) = host.payload.downcast_ref::<(Vec<Vec<Option<u32>>>, (u64, usize))>().unwrap();
+            let (kv, state, _) = host.payload.downcast_ref::<(Vec<Vec<Option<u32>>>, (u64, usize), HostGuard)>().unwrap();
             for (&b, page) in blocks.iter().zip(kv) {
                 self.kv[b as usize * PAGE..(b as usize + 1) * PAGE].copy_from_slice(page);
             }
@@ -2218,6 +2265,70 @@ mod tests {
             assert_eq!(s.exec.session_restores, 1);
             assert!(shared.store.list().is_empty(), "keep_after_restore is off");
         }
+    }
+
+    #[test]
+    fn a_held_session_and_parked_sequences_compete_for_one_host_pool() {
+        let dir = std::env::temp_dir().join(format!("sched-sessions-pool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut fake = Fake::new(4096, 16, 120, 256);
+        fake.swap = true;
+        fake.hybrid = true;
+        let compat = fake.session_compat().unwrap();
+        let options = crate::sessions::SessionOptions { enabled: true, min_tokens: 64, ..Default::default() };
+        let shared = Arc::new(crate::sessions::Shared::new(crate::sessions::SessionStore::open(&dir, compat).unwrap(), options));
+        let used = fake.host_used.clone();
+        let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), swap_space_bytes: 6000, ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        assert_eq!(s.exec.host_limit, 6000, "one limit for parking and sessions");
+        s.enable_sessions(shared.clone());
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(1_000));
+        let c = clock.clone();
+        s.set_session_clock(Box::new(move || c.load(std::sync::atomic::Ordering::SeqCst)));
+        let first = request(150, 10, 9);
+        let (out, _, _) = run_one(&mut s, first.clone());
+        assert_eq!(s.resident_sessions(), 1);
+
+        let mut want = HashMap::new();
+        for q in 0..64u32 {
+            let r = request([3, 17, 90, 400, 1100][q as usize % 5], 20 + (q as usize * 13) % 200, q + 100);
+            want.insert(s.submit(r.clone()).unwrap(), expected(&r.prompt, r.max_tokens, &[]));
+        }
+        let mut events = Vec::new();
+        let mut early: HashMap<SeqId, Vec<u32>> = HashMap::new();
+        while s.swapped_bytes() == 0 {
+            s.step(&mut events).unwrap();
+            for e in events.drain(..) {
+                if let Event::Token { id, token } = e {
+                    early.entry(id).or_default().push(token);
+                }
+            }
+        }
+        let parked = used.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(parked > 0 && parked <= 6000);
+        clock.fetch_add(301, std::sync::atomic::Ordering::SeqCst);
+        s.tick_sessions();
+        let session_cost = blocks_for(150 + 10 - 1) * PAGE * 4;
+        if parked + session_cost > 6000 {
+            assert!(shared.store.list().is_empty(), "the session write waits while parked sequences hold the pool");
+            assert_eq!(s.resident_sessions(), 1);
+        }
+        assert!(used.load(std::sync::atomic::Ordering::SeqCst) <= 6000);
+        let (got, _, _) = drain(&mut s);
+        for (id, w) in &want {
+            let mut all = early.get(id).cloned().unwrap_or_default();
+            all.extend(got.get(id).cloned().unwrap_or_default());
+            assert_eq!(&all, w);
+        }
+        assert_eq!(used.load(std::sync::atomic::Ordering::SeqCst), 0, "every pinned byte is returned");
+        clock.fetch_add(10, std::sync::atomic::Ordering::SeqCst);
+        s.tick_sessions();
+        assert!(shared.store.list().iter().any(|e| e.tokens == 150 + 10 - 1), "once the pool is free the session is written");
+        let mut turn2 = first.clone();
+        turn2.prompt.extend(&out);
+        turn2.prompt.extend([1, 2, 3]);
+        let (_, cached, _) = run_one(&mut s, turn2);
+        assert_eq!(cached, 150 + 10 - 1);
     }
 
     #[test]
