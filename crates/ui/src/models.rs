@@ -325,12 +325,6 @@ fn model_card(app: &mut App, ui: &mut egui::Ui, i: usize) {
             if let Some(why) = m.support_for(NATIVE).filter(|s| !s.supported) {
                 Line::new().note(why.reason.clone()).size(10.5).elided(ui);
             }
-            if let Some(source) = &m.spec_source {
-                Line::new().legend("spec").value(source.clone()).size(10.5).elided(ui);
-            }
-            if let Some(origin) = &m.origin {
-                Line::new().legend("spec from").value(origin.label()).size(10.5).elided(ui);
-            }
             ui.horizontal(|ui| {
                 if runs_here(&m) {
                     let label = if loaded { "reload" } else { "load" };
@@ -361,6 +355,9 @@ fn specs_bar(app: &mut App, ui: &mut egui::Ui) {
         (None, true) => (true, String::new()),
     };
     let label = if busy { "checking" } else { "check specs now" };
+    if busy {
+        crate::working::working(ui, "checking GitHub for spec updates");
+    }
     ui.horizontal(|ui| {
         let reserve = Key::new("check specs now").width(ui);
         if ui.add(Key::new(label).outline(READOUT).enabled(!busy).min_width(reserve)).clicked() {
@@ -391,8 +388,8 @@ fn specs_bar(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn library_pane(app: &mut App, ui: &mut egui::Ui) {
-    if app.scan.busy() && app.library.is_empty() {
-        note(ui, "scanning the hub cache and model folders", LEGEND);
+    if app.scan.busy() {
+        crate::working::working(ui, "scanning the hub cache and model folders");
     }
     let n = app.library.len();
     let usable = app.library.iter().filter(|m| runs_here(m)).count();
@@ -578,6 +575,12 @@ fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>,
                     }
                 }
             });
+            if let Some(d) = app.models.downloads.iter().find(|d| d.repo == r.id && d.result.is_none()) {
+                let done = d.progress.done.load(std::sync::atomic::Ordering::Relaxed);
+                let total = d.progress.total.load(std::sync::atomic::Ordering::Relaxed);
+                let said = if total == 0 { "starting download".to_string() } else { format!("{} / {}", human_size(done), human_size(total)) };
+                progress(ui, "downloading", done as f32, (total > 0).then_some(total as f32), &said);
+            }
         },
     );
 }
@@ -604,6 +607,11 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
     }
     if let Some((ok, text)) = &app.models.message {
         status(ui, *ok, text);
+    }
+    if app.models.search.busy() {
+        crate::working::working(ui, "searching Hugging Face");
+    } else if app.models.inspecting.busy() {
+        crate::working::working(ui, "checking which quants fit and run");
     }
     let gpus = app.free_gpu_list();
     if !gpus.is_empty() {

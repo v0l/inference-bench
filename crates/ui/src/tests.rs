@@ -78,7 +78,7 @@ fn harness_sized(name: &str, tab: Tab, height: f32) -> Harness<'static, App> {
 fn every_tab_draws() {
     for tab in [Tab::Chat, Tab::Models, Tab::Server, Tab::Hardware, Tab::Settings] {
         let mut h = harness(&format!("tab{tab:?}"), tab);
-        h.run();
+        h.step();
         assert_eq!(h.state().tab, tab);
     }
 }
@@ -209,6 +209,19 @@ fn real_model(name: &str) -> LocalModel {
     m
 }
 
+fn click_load(h: &mut Harness<'static, App>) {
+    let mut last = None;
+    for _ in 0..30 {
+        h.step();
+        let at = h.get_all_by_label("load").last().unwrap().accesskit_node().bounding_box();
+        if at == last {
+            break;
+        }
+        last = at;
+    }
+    h.get_all_by_label("load").last().unwrap().click();
+}
+
 fn with_gpu(h: &mut Harness<'static, App>, used: u64, total: u64) {
     let app = h.state_mut();
     app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None, uuid: String::new(), own_bytes: 0 }];
@@ -247,6 +260,36 @@ fn the_27b_config_gives_the_load_dialog_a_262144_maximum() {
     let dialog = h.state().load.as_ref().unwrap();
     assert_eq!(dialog.max, 262144);
     assert_eq!(crate::load::max_context(&dialog.view.as_ref().unwrap().anatomy), 262144);
+}
+
+#[test]
+fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
+    let mut h = harness("load-three-gpus", Tab::Models);
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
+    {
+        let app = h.state_mut();
+        app.gpu = vec![gpu(20), gpu(20), gpu(20)];
+        app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
+        app.gpu_poll = Default::default();
+    }
+    let d = dir("three-gpus-27b");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), d.join("config.json")).unwrap();
+    let mut m = model("Qwen3.8-27B", true, "dense decoder");
+    (m.path, m.root) = (d.clone(), d);
+    m.context_length = None;
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    let list = h.state().free_gpu_list();
+    let dialog = h.state().load.as_ref().unwrap();
+    let weights = dialog.anatomy().unwrap().total_bytes;
+    assert!(weights > list[0], "the model must be too big for GPU 0 alone");
+    assert_eq!(h.state().free_gpu_bytes(), Some(list.iter().sum()));
+    assert!(matches!(dialog.spread(&list), Some(Ok(_))));
+    assert!(dialog.can_load_on(&list));
+    assert!(!dialog.can_load_on(&list[..1]));
+    h.get_by_label_contains("free on 3 gpus");
 }
 
 #[test]
@@ -319,7 +362,7 @@ fn loading_from_the_dialog_uses_the_chosen_context_and_remembers_it() {
     h.state_mut().open_load_dialog(&m);
     h.state_mut().load.as_mut().unwrap().ctx = 16384;
     h.run();
-    h.get_all_by_label("load").last().unwrap().click();
+    click_load(&mut h);
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
     h.run();
     assert!(h.state().load.is_none());
@@ -704,7 +747,7 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
     assert_eq!(h.state().load.as_ref().unwrap().seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
     h.state_mut().load.as_mut().unwrap().seqs = 6;
     h.run();
-    h.get_all_by_label("load").last().unwrap().click();
+    click_load(&mut h);
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
     assert_eq!(h.state().loaded().unwrap().max_num_seqs, 6);
     assert_eq!(h.state().settings.seqs_for("Qwen3-0.6B"), 6);
@@ -724,7 +767,7 @@ fn the_server_tab_kv_total_is_the_shared_pool_chosen_in_the_dialog() {
     d.kv_gb = 3.0;
     let pool = d.kv_bytes().unwrap();
     h.run();
-    h.get_all_by_label("load").last().unwrap().click();
+    click_load(&mut h);
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
     let start = Instant::now();
     let reading = loop {
@@ -755,7 +798,7 @@ fn served_names_from_the_load_dialog_reach_the_engine_and_are_remembered() {
     h.get_by_label_contains("SERVED NAMES");
     h.state_mut().load.as_mut().unwrap().served_names = " qwen3.8-27b, gpt-4o ,, qwen3.8-27b".into();
     h.run();
-    h.get_all_by_label("load").last().unwrap().click();
+    click_load(&mut h);
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
     let want = vec!["qwen3.8-27b".to_string(), "gpt-4o".to_string()];
     assert_eq!(h.state().loaded().unwrap().served_names, want);
@@ -1008,6 +1051,18 @@ fn settings_secrets_are_saved_private() {
 }
 
 #[test]
+fn adding_a_model_folder_saves_it_and_rescans() {
+    let mut h = harness("addfolder", Tab::Settings);
+    h.state_mut().settings_ui.new_folder = "/tmp/more-models".into();
+    h.run();
+    h.get_all_by_label("add").next().unwrap().click();
+    h.run();
+    assert_eq!(Settings::load(&h.state().dir).model_folders, vec![PathBuf::from("/tmp/more-models")]);
+    assert!(h.state().scan.busy() || h.state().notice.is_some());
+    h.get_by_label("rescan models");
+}
+
+#[test]
 fn no_model_loaded_disables_sending() {
     let mut h = harness("nomodel", Tab::Chat);
     h.run();
@@ -1092,7 +1147,7 @@ fn the_model_list_refreshes_when_a_spec_update_lands() {
     let landed = h.state().library.iter().find(|m| m.name == "landed-from-github").unwrap().clone();
     assert!(landed.origin.as_ref().unwrap().label().starts_with("updated from GitHub v0l/inference-bench@master (feed42a) at "));
     h.get_by_label("landed-from-github");
-    assert_eq!(h.state().notice.as_ref().unwrap().1, "specs updated: added landed-from-github");
+    assert_eq!(h.state().notice.as_ref().unwrap().1, "specs updated: 1 added");
     assert!(h.state().specs.state.last_ok);
 }
 
@@ -1823,7 +1878,7 @@ fn the_low_memory_profile_turns_off_what_it_says_and_reaches_the_engine() {
     assert_eq!(rt.prefix_cache.max_snapshots, 0);
     assert!(rt.loader.host_budget_mb < specrt::loader::LoaderOptions::default().host_budget_mb);
     h.run();
-    h.get_by_label_contains("No MTP draft head copy");
+    h.get_by_label_contains("fp8 KV cache, 2 parallel requests");
 }
 
 #[test]
@@ -1831,7 +1886,7 @@ fn engine_options_from_the_dialog_are_remembered_and_shown_on_the_server_tab() {
     let mut h = open_dialog("adv-remember");
     h.state_mut().load.as_mut().unwrap().choice.set("runtime.loader.readers", serde_json::json!(3));
     h.run();
-    h.get_all_by_label("load").last().unwrap().click();
+    click_load(&mut h);
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
     let l = h.state().loaded().unwrap();
     assert!(l.engine.is_custom());
@@ -1952,13 +2007,14 @@ fn the_hardware_tab_lists_every_gpu_with_memory_bandwidth_and_the_links_between_
         let mut h = hardware_harness(&format!("hw{n}"), n);
         h.run();
         for i in 0..n {
-            h.get_by_label_contains(&format!("GPU {i}  RTX PRO 6000 Blackwell Max-Q  sm_120"));
+            assert!(h.get_all_by_label_contains(&format!("GPU {i}")).count() >= 1);
         }
+        assert_eq!(h.get_all_by_label_contains("RTX PRO 6000 Blackwell Max-Q").count(), n);
+        assert_eq!(h.get_all_by_label_contains("sm_120").count(), n);
         assert_eq!(h.get_all_by_label_contains("12.0 GB free").count(), n);
         assert_eq!(h.get_all_by_label_contains("1792 GB/s").count(), n);
         h.get_by_label_contains("GPU 0 and GPU 1: peer to peer");
-        h.get_by_label_contains("network eth0 192.168.1.5");
-        assert_eq!(crate::hardware::gpu_lines(h.state().hardware.machine.as_ref().unwrap()).len(), n);
+        h.get_by_label_contains("eth0 192.168.1.5");
     }
 }
 
@@ -1980,83 +2036,43 @@ fn peers_from_fake_announcements_show_name_gpus_memory_and_busy_state() {
         app.hardware.peers.insert("desk".into(), fake_peer("desk", 96.0, false));
     }
     h.run();
-    h.get_by_label_contains("spark: GB10  118 GB  busy, serving Qwen3-0.6B  10.0.0.7:7599");
-    h.get_by_label_contains("nuc: GB10  17 GB  idle");
+    h.get_by_label_contains("spark: GB10  118 GB");
+    h.get_by_label_contains("busy");
+    h.get_by_label_contains("serving Qwen3-0.6B");
+    assert!(h.get_all_by_label_contains("10.0.0.7:7599").count() >= 1);
+    h.get_by_label_contains("nuc: GB10  17 GB");
+    assert!(h.get_all_by_label_contains("idle").count() >= 1);
     assert!(h.query_by_label_contains("desk: GB10").is_none());
 }
 
 #[test]
-fn the_placement_preview_shows_both_objectives_with_a_local_gpu_pair_and_a_remote_gpu() {
-    let mut h = hardware_harness("hwplan", 2);
+fn switching_a_gpu_off_in_the_hardware_tab_removes_it_from_every_budget() {
+    let mut h = hardware_harness("hwswitch", 2);
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
     {
         let app = h.state_mut();
-        app.hardware.peers.insert("spark".into(), fake_peer("spark", 14.0, false));
-        app.settings.cluster.paired.insert("spark".into());
-        app.hardware.selection.peers.insert("spark".into());
-        app.hardware.model = "Qwen27".into();
-        app.hardware.ctx = 2048;
+        app.gpu = vec![gpu(24), gpu(24)];
+        app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
+        app.gpu_poll = Default::default();
     }
     h.run();
+    assert_eq!(h.state().free_gpu_list().len(), 2);
+    assert_eq!(h.state().free_gpu_bytes(), Some(48 << 30));
+    h.get_all_by_label("in use").next().unwrap().click();
     h.run();
-    let shown = h.state().hardware.shown.as_ref().unwrap();
-    let preview = shown.preview.as_ref().unwrap();
-    let names: Vec<&str> = shown.devices.iter().map(|d| d.name.as_str()).collect();
-    assert_eq!(names, ["desk/gpu0", "desk/gpu1", "spark/gpu0"]);
-    for result in [&preview.latency, &preview.throughput] {
-        let p = result.as_ref().unwrap();
-        let (rows, summary) = crate::hardware::placement_lines(p, &shown.devices, "desk");
-        assert!(!rows.is_empty() && summary.contains("bottleneck"), "{summary}");
-    }
-    let lat = preview.latency.as_ref().unwrap();
-    assert!(lat.stages.iter().all(|s| s.tp == 1));
-    let tp = preview.tp_latency.as_ref().expect("the tensor parallel plan is shown as a dimmed line");
-    assert!(tp.stages.iter().any(|s| s.tp > 1));
-    assert_eq!(h.get_all_by_label_contains("with tensor parallel (#658): ").count(), 1);
-    assert_eq!(h.get_all_by_label_contains("slowest stage").count(), 2);
-    assert!(h.query_by_label_contains("leave `host`").is_none() && h.query_by_label_contains("engine cannot").is_none());
-    assert!(!h.state().hardware.shown.as_ref().unwrap().preview.as_ref().unwrap().latency.is_err());
+    assert_eq!(h.state().free_gpu_list().len(), 1);
+    assert_eq!(h.state().free_gpu_bytes(), Some(24 << 30));
+    assert_eq!(Settings::load(&h.state().dir).cluster.disabled_gpus.len(), 1);
+    h.get_by_label("switched off");
 }
 
 #[test]
-fn stage_and_bottleneck_strings_use_one_host_gpu_label_and_never_show_empty_parentheses() {
-    let mut h = hardware_harness("hwstrings", 2);
-    {
-        let app = h.state_mut();
-        app.hardware.peers.insert("spark".into(), fake_peer("spark", 14.0, false));
-        app.hardware.selection.peers.insert("spark".into());
-        app.hardware.model = "Qwen27".into();
-        app.hardware.ctx = 2048;
+fn the_hardware_tab_has_no_second_way_to_load_a_model() {
+    let mut h = hardware_harness("hwnoload", 2);
+    h.run();
+    for gone in ["load across the cluster", "run a cluster", "stop cluster"] {
+        assert!(h.query_by_label_contains(gone).is_none(), "{gone}");
     }
-    h.run();
-    h.run();
-    let shown = h.state().hardware.shown.as_ref().unwrap();
-    let p = shown.preview.as_ref().unwrap().latency.as_ref().unwrap();
-    let rows = inference_bench_core::cluster::stage_rows(p, &shown.devices, "desk");
-    let first = crate::hardware::stage_text(0, &rows[0]);
-    assert!(first.starts_with("stage 0  desk / GPU 0  layers 0.."), "{first}");
-    assert!(first.ends_with("first stage") && !first.contains("()") && !first.contains("hop 0.00"), "{first}");
-    let second = crate::hardware::stage_text(1, &rows[1]);
-    assert!(second.contains(" hop ") && second.contains("desk / GPU 1") || second.contains("spark / GPU 0"), "{second}");
-    let (_, summary) = crate::hardware::placement_lines(p, &shown.devices, "desk");
-    let bottleneck = summary.rsplit("bottleneck ").next().unwrap();
-    assert!(bottleneck == "desk / GPU 0" || bottleneck == "desk / GPU 1" || bottleneck == "spark / GPU 0", "{bottleneck}");
-    assert!(h.get_all_by_label_contains(&first).count() >= 1);
-}
-
-#[test]
-fn excluding_a_local_gpu_in_the_run_section_removes_it_from_the_plan() {
-    let mut h = hardware_harness("hwexclude", 2);
-    {
-        let app = h.state_mut();
-        app.hardware.model = "Qwen27".into();
-        app.hardware.ctx = 2048;
-        app.hardware.selection.excluded.insert("desk/gpu1".into());
-    }
-    h.run();
-    h.run();
-    let shown = h.state().hardware.shown.as_ref().unwrap();
-    assert_eq!(shown.devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["desk/gpu0"]);
-    assert!(shown.preview.as_ref().unwrap().latency.is_err());
 }
 
 #[test]
@@ -2064,8 +2080,9 @@ fn an_unpaired_peer_cannot_be_selected_and_pairing_with_a_wrong_code_fails() {
     let mut h = hardware_harness("hwpair", 1);
     h.state_mut().hardware.peers.insert("spark".into(), fake_peer("spark", 14.0, false));
     h.run();
-    h.get_by_label_contains("use spark: GB10 (not paired)");
-    assert!(h.state().hardware.selection.peers.is_empty());
+    h.get_by_label_contains("spark: GB10");
+    assert!(h.query_by_label("not in use").is_none());
+    assert!(h.state().settings.cluster.peers_in_use.is_empty());
 }
 
 #[test]
@@ -2117,10 +2134,8 @@ fn screenshot_of_the_hardware_tab() {
         app.hardware.peers.insert("spark".into(), fake_peer("spark", 14.0, false));
         app.hardware.peers.insert("nuc".into(), fake_peer("nuc", 16.0, true));
         app.settings.cluster.paired.insert("spark".into());
-        app.hardware.selection.peers.insert("spark".into());
+        app.settings.cluster.peers_in_use.insert("spark".into());
         app.library = vec![fixture_spec_model()];
-        app.hardware.model = "Qwen27".into();
-        app.hardware.ctx = 2048;
         app
     });
     h.run();

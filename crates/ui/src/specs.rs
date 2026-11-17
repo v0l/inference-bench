@@ -69,13 +69,13 @@ impl SpecsUpdater {
         let Some(done) = self.check.poll() else { return false };
         self.load_state(dir);
         let Some(result) = done else { return false };
-        let (ok, text, landed) = match result {
-            Ok(o) => (true, o.describe(), matches!(o, Outcome::Updated(_))),
-            Err(e) => (false, format!("spec update failed: {e}"), false),
+        let (ok, text, brief, landed) = match result {
+            Ok(o) => (true, o.describe(), o.describe_brief(), matches!(o, Outcome::Updated(_))),
+            Err(e) => (false, format!("spec update failed: {e}"), format!("spec update failed: {e}"), false),
         };
-        self.last = Some((ok, text.clone()));
+        self.last = Some((ok, text));
         if landed || !ok {
-            *notice = Some((ok, text));
+            *notice = Some((ok, brief));
         }
         landed
     }

@@ -108,6 +108,16 @@ impl Changes {
         self.added.is_empty() && self.updated.is_empty() && self.removed.is_empty()
     }
 
+    pub fn brief(&self) -> String {
+        let mut parts = Vec::new();
+        for (label, names) in [("added", &self.added), ("updated", &self.updated), ("removed", &self.removed), ("skipped", &self.skipped.iter().map(|(n, _)| n.clone()).collect())] {
+            if !names.is_empty() {
+                parts.push(format!("{} {label}", names.len()));
+            }
+        }
+        if parts.is_empty() { "no changes".into() } else { parts.join(", ") }
+    }
+
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         for (label, names) in [("added", &self.added), ("updated", &self.updated), ("removed", &self.removed)] {
@@ -135,6 +145,13 @@ impl Outcome {
             Outcome::Disabled => "automatic spec updates are off".into(),
             Outcome::Unchanged => "specs are up to date".into(),
             Outcome::Updated(c) => format!("specs updated: {}", c.summary()),
+        }
+    }
+
+    pub fn describe_brief(&self) -> String {
+        match self {
+            Outcome::Updated(c) => format!("specs updated: {}", c.brief()),
+            other => other.describe(),
         }
     }
 }
