@@ -36,6 +36,7 @@ pub mod remote;
 pub mod runtime;
 pub mod sched;
 pub mod serve;
+pub mod sessions;
 pub mod spec;
 pub mod stage;
 pub mod statepool;
