@@ -22,8 +22,8 @@ anyhow.workspace = true
 eframe = "0.37"
 egui = "0.37"
 egui_bench = { version = "0.10.0", features = ["markdown"] }
-agent-core = { git = "https://github.com/v0l/agentbench", rev = "046f730", features = ["sandbox"] }
-agent-ui = { git = "https://github.com/v0l/agentbench", rev = "046f730", features = ["sandbox"] }
+agent-core = { git = "https://github.com/v0l/agentbench", rev = "8865c7f", features = ["sandbox"] }
+agent-ui = { git = "https://github.com/v0l/agentbench", rev = "8865c7f", features = ["sandbox"] }
 serde_json.workspace = true
 chrono.workspace = true
 
