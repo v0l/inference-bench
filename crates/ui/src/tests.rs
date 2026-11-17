@@ -55,6 +55,7 @@ fn script() -> Script {
         fail_status: None,
         vision: false,
         files: Default::default(),
+        sessions: Default::default(),
     }
 }
 
@@ -2552,4 +2553,44 @@ fn a_second_search_for_the_same_repos_reads_the_disk_cache_not_the_hub() {
     h.get_by_label("search").click();
     pump_until(&mut h, 20, "reinspected", |a| a.models.infos.len() == 4);
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), before + 1, "only the search itself hits the hub");
+}
+
+#[test]
+fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
+    use inference_bench_core::specrt_sessions::*;
+    let mut h = harness_sized("sessions", Tab::Server, 2400.0);
+    let dir = std::env::temp_dir().join(format!("ui-sessions-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let compat = Compat { model_hash: [1; 32], spec_hash: [2; 32], kv_dtype: 0, layers: 1, block_size: 16 };
+    let shared = std::sync::Arc::new(Shared::new(SessionStore::open(&dir, compat).unwrap(), SessionOptions { enabled: true, ..Default::default() }));
+    let now = now_seconds();
+    let id = shared.store.write(&Session { scope: [0; 32], tokens: (0..5000).collect(), sections: vec![vec![0; 32], vec![1; 2 << 20], vec![2; 100], vec![]] }, now - 600).unwrap().id;
+    let rows = crate::sessions::rows(&shared, now);
+    assert_eq!((rows[0].tokens, rows[0].age_secs, rows[0].expires_in_secs, rows[0].stripped), (5000, 600, 8 * 3600 - 600, false));
+    let mut s = script();
+    s.sessions = std::sync::Arc::new(std::sync::Mutex::new(Some(shared.clone())));
+    {
+        let app = h.state_mut();
+        app.engine = inference_bench_core::engine::Engine::with_factories(app.wake.clone(), ScriptedModel::factory(s.clone()), inference_bench_core::fake::ScriptedServing::factory(s));
+        app.settings.server.port = 0;
+        let m = app.library[0].clone();
+        app.load_model(&m);
+    }
+    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
+    h.run();
+    h.get_by_label_contains("5000 tokens");
+    h.get_by_label_contains("10m 00s");
+    h.get_by_label("restore").click();
+    h.run();
+    assert!(h.state().notice.as_ref().is_some_and(|n| n.1.contains("session verified")), "{:?}", h.state().notice);
+    h.get_by_label("strip").click();
+    h.step();
+    h.step();
+    assert!(shared.store.list()[0].stripped, "{:?}", h.state().notice);
+    h.get_by_label_contains("stripped");
+    h.get_by_label("delete").click();
+    h.run();
+    assert!(shared.store.list().is_empty());
+    assert!(!id.is_empty());
+    h.get_by_label("no saved sessions");
 }

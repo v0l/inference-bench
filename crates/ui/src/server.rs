@@ -227,6 +227,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
         crate::hardware::pipeline_section(app, ui);
         crate::serving::draw(app, ui);
+        crate::sessions::draw(app, ui);
         let log = request_lines(&app.logs);
         let mut pane = app.server.pane;
         segments(ui, &mut pane, &[(Pane::Requests, "requests", Some(log.len())), (Pane::Logs, "logs", None)]);

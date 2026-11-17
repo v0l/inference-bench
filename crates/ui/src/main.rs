@@ -16,6 +16,7 @@ mod models;
 mod logs;
 mod server;
 mod serving;
+mod sessions;
 mod settings;
 mod shell;
 mod specs;
@@ -90,7 +91,7 @@ impl App {
             tab: Tab::Chat,
             library: Vec::new(),
             scan: Pending::default(),
-            engine: engine_for(&hardware_slot, wake.clone()),
+            engine: engine_for(&hardware_slot, wake.clone(), &dir),
             loading: None,
             load_progress: None,
             gpu: Vec::new(),
@@ -256,8 +257,14 @@ impl eframe::App for App {
     }
 }
 
-fn engine_for(slot: &inference_bench_core::cluster::ClusterSlot, wake: Wake) -> Engine {
-    Engine::with_factories(wake, inference_bench_core::native::specrt_factory(), inference_bench_core::cluster::serving_factory(slot.clone()))
+fn engine_for(slot: &inference_bench_core::cluster::ClusterSlot, wake: Wake, dir: &std::path::Path) -> Engine {
+    let sessions = inference_bench_server::ServerConfig::load(&server::config_path(dir)).ok().map(|c| c.sessions).filter(|s| s.enabled);
+    let inner = inference_bench_core::cluster::serving_factory(slot.clone());
+    let serving: inference_bench_core::engine::ServingFactory = Arc::new(move |mut opts| {
+        opts.sessions = sessions.clone();
+        inner(opts)
+    });
+    Engine::with_factories(wake, inference_bench_core::native::specrt_factory(), serving)
 }
 
 fn wake_for(ctx: &egui::Context) -> Wake {

@@ -130,6 +130,10 @@ impl Handle {
         self.stats.lock().unwrap().as_ref().and_then(|t| t.stats())
     }
 
+    pub fn sessions(&self) -> Option<Arc<specrt::sessions::Shared>> {
+        self.stats.lock().unwrap().as_ref().and_then(|t| t.sessions())
+    }
+
     pub fn serving_metrics(&self) -> Option<String> {
         self.stats.lock().unwrap().as_ref().and_then(|t| t.metrics())
     }

@@ -14,6 +14,7 @@ pub struct Script {
     pub fail_status: Option<(u16, String)>,
     pub vision: bool,
     pub files: Arc<Mutex<Vec<FakeFile>>>,
+    pub sessions: Arc<Mutex<Option<Arc<specrt::sessions::Shared>>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -406,6 +407,10 @@ impl crate::target::Target for ScriptedServing {
             s.inter_token_secs.observe(*v);
         }
         Some(s)
+    }
+
+    fn sessions(&self) -> Option<Arc<specrt::sessions::Shared>> {
+        self.script.sessions.lock().unwrap().clone()
     }
 
     fn metrics(&self) -> Option<String> {
