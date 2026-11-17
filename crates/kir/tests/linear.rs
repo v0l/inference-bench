@@ -13,7 +13,7 @@ fn golden(name: &str, actual: &str) {
 }
 
 fn shape() -> LinearShape {
-    LinearShape { key_heads: 16, value_heads: 48, head_dim: 128, conv_kernel: 4 }
+    LinearShape { key_heads: 16, value_heads: 48, head_dim: 128, conv_kernel: 4, tiled_value_heads: false }
 }
 
 fn emit(t: &Target, s: LinearShape, fam: &[Family]) -> String {

@@ -237,12 +237,52 @@ pub struct FamilyGguf {
     pub rope_scaling: std::collections::BTreeMap<String, crate::spec::RopeScalingKind>,
     pub unscaled: Vec<String>,
     pub pretokenizers: std::collections::BTreeMap<String, String>,
+    pub names: std::collections::BTreeMap<String, String>,
+    pub layer: std::collections::BTreeMap<String, String>,
+    pub mtp: std::collections::BTreeMap<String, String>,
+    pub permuted_qk: bool,
+    pub v_heads: crate::spec::VHeadOrder,
+    pub output_gate: bool,
+    pub mrope_interleaved: bool,
+    pub a_stored_negated: bool,
 }
 
 impl FamilyGguf {
     pub fn key(&self, canonical: &str, arch: &str) -> Result<String> {
         let template = self.keys.get(canonical).with_context(|| format!("the family has no GGUF key for {canonical}"))?;
         Ok(template.replace("{arch}", arch))
+    }
+
+    pub fn key_if_declared(&self, canonical: &str, arch: &str) -> Option<String> {
+        self.keys.get(canonical).map(|t| t.replace("{arch}", arch))
+    }
+
+    pub fn with_default_names(&self, defaults: &FamilyGguf) -> FamilyGguf {
+        let mut out = self.clone();
+        for (k, v) in &defaults.names {
+            out.names.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        for (k, v) in &defaults.layer {
+            out.layer.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        out
+    }
+
+    pub fn hf_to_gguf(&self, hf: &str, main_layers: usize) -> Option<String> {
+        if let Some(name) = self.names.get(hf) {
+            return Some(name.clone());
+        }
+        if let Some(rest) = hf.strip_prefix("model.layers.") {
+            let (layer, tail) = rest.split_once('.')?;
+            return Some(format!("blk.{layer}.{}", self.layer.get(tail)?));
+        }
+        if let Some(rest) = hf.strip_prefix("mtp.layers.") {
+            let (index, tail) = rest.split_once('.')?;
+            let layer = main_layers + index.parse::<usize>().ok()?;
+            return Some(format!("blk.{layer}.{}", self.layer.get(tail)?));
+        }
+        let tail = hf.strip_prefix("mtp.")?;
+        Some(format!("blk.{main_layers}.{}", self.mtp.get(tail)?))
     }
 
     pub fn tensor(&self, canonical: &str) -> Result<&str> {
@@ -378,7 +418,13 @@ impl Registry {
     }
 
     pub fn gguf_architectures(&self) -> Vec<&str> {
-        self.families.iter().flat_map(|f| f.matches.gguf.iter().map(String::as_str)).collect()
+        let mut out: Vec<&str> = Vec::new();
+        for arch in self.families.iter().flat_map(|f| f.matches.gguf.iter().map(String::as_str)) {
+            if !out.contains(&arch) {
+                out.push(arch);
+            }
+        }
+        out
     }
 
     pub fn strict_for(&self, model_type: &str) -> Result<&Family> {
@@ -401,6 +447,9 @@ fn resolve(table: &toml::Table, all: &[toml::Table], depth: usize) -> Result<tom
         .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(parent))
         .with_context(|| format!("family extends {parent}, which does not exist"))?;
     let mut merged = resolve(base, all, depth + 1)?;
+    if let Some(toml::Value::Table(m)) = merged.get_mut("match") {
+        m.remove("gguf");
+    }
     merge(&mut merged, table.clone());
     merged.remove("extends");
     Ok(merged)

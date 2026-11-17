@@ -53,7 +53,7 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_verify(const 
     int h = blockIdx.x;
     int seq = blockIdx.y;
     slot += slots[seq * rows] * seq_slots;
-    int kh = h / LA_RATIO;
+    int kh = la_kh(h);
     int tid = threadIdx.x;
     int v = tid % LA_D;
     int ks = tid / LA_D;

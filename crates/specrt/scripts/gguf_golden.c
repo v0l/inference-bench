@@ -19,9 +19,9 @@ static float next_float(void) {
 int main(int argc, char** argv) {
     if (argc < 2) return 2;
     FILE* out = fopen(argv[1], "wb");
-    enum ggml_type types[] = {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K};
+    enum ggml_type types[] = {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q4_0, GGML_TYPE_Q5_0};
     const int rows = 4, cols = 512, n = rows * cols;
-    for (int t = 0; t < 4; t++) {
+    for (int t = 0; t < 6; t++) {
         enum ggml_type ty = types[t];
         float* src = malloc(n * sizeof(float));
         for (int i = 0; i < n; i++) src[i] = next_float();

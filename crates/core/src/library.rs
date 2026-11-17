@@ -1048,15 +1048,31 @@ mod tests {
             )
         };
         std::fs::write(snap.join("Tiny-Q4_K_M.gguf"), file(12, &vec![0u8; 256 * 144])).unwrap();
-        std::fs::write(snap.join("Tiny-Q4_0.gguf"), file(2, &vec![0u8; 256 * 8 * 18])).unwrap();
+        std::fs::write(snap.join("Tiny-Q2_K.gguf"), file(10, &vec![0u8; 256 * 256 / 256 * 84])).unwrap();
         let models = scan_hub(&hub);
         let find = |q: &str| models.iter().find(|m| m.path.to_string_lossy().contains(q)).unwrap();
         let good = find("Q4_K_M");
         let s = good.support_for("specrt").unwrap();
         assert!(s.supported && s.reason.contains("Q4_K"), "{}", s.reason);
         assert_eq!(good.model_id("specrt"), good.path.display().to_string());
-        let bad = find("Q4_0").support_for("specrt").unwrap();
-        assert!(!bad.supported && bad.reason.contains("Q4_0") && bad.reason.contains("not supported"), "{}", bad.reason);
+        let bad = find("Q2_K").support_for("specrt").unwrap();
+        assert!(!bad.supported && bad.reason.contains("Q2_K") && bad.reason.contains("not supported"), "{}", bad.reason);
+    }
+
+    #[test]
+    fn a_qwen35_gguf_is_supported_by_specrt_because_the_engine_reads_it() {
+        let hub = temp("specrt-qwen35-gguf");
+        let snap = hub.join("models--acme--Tiny-Qwen3.8-GGUF/snapshots/abc");
+        std::fs::create_dir_all(&snap).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/qwen35-gguf");
+        for file in ["tiny-mtp-Q8_0.gguf", "tiny-mtp-Q4_K_M.gguf", "tiny-mtp-Q4_0.gguf"] {
+            std::fs::copy(fixtures.join(file), snap.join(file.replace("tiny-mtp", "Tiny-Qwen3.8"))).unwrap();
+        }
+        for m in scan_hub(&hub) {
+            let s = m.support_for("specrt").unwrap();
+            assert!(s.supported, "{}: {}", m.path.display(), s.reason);
+            assert_eq!(m.architecture, "qwen35");
+        }
     }
 
     #[test]

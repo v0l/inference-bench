@@ -59,7 +59,7 @@ extern "C" __global__ void __launch_bounds__(256) gdn_chunk_prep(const float* qn
     float* gs = A + C * LA_AS;
     float* bs = gs + C;
     int h = blockIdx.x;
-    int kh = h / LA_RATIO;
+    int kh = la_kh(h);
     int c = blockIdx.y;
     int t0 = c * C;
     int tid = threadIdx.x;

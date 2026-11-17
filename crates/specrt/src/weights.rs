@@ -179,7 +179,7 @@ impl Checkpoint {
 
     pub fn has(&self, name: &str) -> bool {
         match &self.gguf {
-            Some(g) => gguf_name(name).is_some_and(|n| g.tensors.contains_key(&n)),
+            Some(g) => g.tensor_for_hf(name).is_some_and(|n| g.tensors.contains_key(&n)),
             None => self.names.contains_key(name),
         }
     }
@@ -372,35 +372,6 @@ impl Checkpoint {
     }
 }
 
-fn gguf_name(hf: &str) -> Option<String> {
-    match hf {
-        "model.embed_tokens.weight" => return Some("token_embd.weight".into()),
-        "model.norm.weight" => return Some("output_norm.weight".into()),
-        "lm_head.weight" => return Some("output.weight".into()),
-        _ => {}
-    }
-    let rest = hf.strip_prefix("model.layers.")?;
-    let (layer, tail) = rest.split_once('.')?;
-    let tail = match tail {
-        "self_attn.q_proj.weight" => "attn_q.weight",
-        "self_attn.k_proj.weight" => "attn_k.weight",
-        "self_attn.v_proj.weight" => "attn_v.weight",
-        "self_attn.q_proj.bias" => "attn_q.bias",
-        "self_attn.k_proj.bias" => "attn_k.bias",
-        "self_attn.v_proj.bias" => "attn_v.bias",
-        "self_attn.o_proj.weight" => "attn_output.weight",
-        "self_attn.q_norm.weight" => "attn_q_norm.weight",
-        "self_attn.k_norm.weight" => "attn_k_norm.weight",
-        "input_layernorm.weight" => "attn_norm.weight",
-        "post_attention_layernorm.weight" => "ffn_norm.weight",
-        "mlp.gate_proj.weight" => "ffn_gate.weight",
-        "mlp.up_proj.weight" => "ffn_up.weight",
-        "mlp.down_proj.weight" => "ffn_down.weight",
-        _ => return None,
-    };
-    Some(format!("blk.{layer}.{tail}"))
-}
-
 fn unpermute_rows(data: &[u8], heads: usize, rows: usize) -> Vec<u8> {
     let row_bytes = data.len() / rows;
     let head_dim = rows / heads;
@@ -419,19 +390,21 @@ fn unpermute_rows(data: &[u8], heads: usize, rows: usize) -> Vec<u8> {
 
 impl Checkpoint {
     fn gguf_tensor<'g>(&self, g: &'g Gguf, name: &str, shape: &[usize]) -> Result<(&'g crate::gguf::TensorInfo, Cow<'g, [u8]>)> {
-        let mapped = gguf_name(name).with_context(|| format!("{name} has no GGUF tensor name"))?;
+        let mapped = g.tensor_for_hf(name).with_context(|| format!("{name} has no GGUF tensor name"))?;
         let info = g.tensor(&mapped).with_context(|| format!("{mapped} is not in the GGUF file"))?;
-        ensure!(info.shape == shape, "{mapped} has shape {:?}, expected {shape:?}", info.shape);
+        let squeeze = |s: &[usize]| s.iter().copied().filter(|&d| d != 1).collect::<Vec<_>>();
+        ensure!(squeeze(&info.shape) == squeeze(shape), "{mapped} has shape {:?}, expected {shape:?}", info.shape);
         let data = g.data(info);
+        let naming = g.naming().context("no family for the GGUF architecture")?;
         let arch = g.architecture()?;
         let heads = match mapped.rsplit_once('.') {
-            Some((m, "weight")) if m.ends_with(".attn_q") => g.count(&format!("{arch}.attention.head_count")),
-            Some((m, "weight")) if m.ends_with(".attn_k") => g.count(&format!("{arch}.attention.head_count_kv")).or(g.count(&format!("{arch}.attention.head_count"))),
+            Some((m, "weight")) if naming.family.permuted_qk && m.ends_with(".attn_q") => g.count(&naming.family.key("head_count", arch)?),
+            Some((m, "weight")) if naming.family.permuted_qk && m.ends_with(".attn_k") => g.count(&naming.family.key("head_count_kv", arch)?).or(g.count(&naming.family.key("head_count", arch)?)),
             _ => None,
         };
         Ok(match heads {
-            Some(h) if arch == "llama" => (info, Cow::Owned(unpermute_rows(data, h, info.rows()))),
-            _ => (info, Cow::Borrowed(data)),
+            Some(h) => (info, Cow::Owned(unpermute_rows(data, h, info.rows()))),
+            None => (info, Cow::Borrowed(data)),
         })
     }
 
@@ -861,6 +834,12 @@ impl Checkpoint {
         })
     }
 
+    fn neg_a(&self, name: &str, heads: usize) -> Result<Vec<f32>> {
+        let stored = self.f32(name, heads)?;
+        let negated = self.gguf.as_ref().and_then(|g| g.naming()).is_some_and(|n| n.family.a_stored_negated);
+        Ok(if negated { stored } else { stored.into_iter().map(|a| -a.exp()).collect() })
+    }
+
     fn gated_delta_net(&self, spec: &Spec, p: &str) -> Result<Gdn<'_>> {
         let la = spec.linear_attention.as_ref().context("no [linear_attention]")?;
         let h = spec.dims.hidden;
@@ -873,7 +852,7 @@ impl Checkpoint {
             in_proj: in_proj.into_matrix(spec.quant, &format!("{p}.in_proj"))?,
             ba: Matrix::Bf16(Cow::Owned(ba)),
             conv: self.floats(&format!("{p}.conv1d.weight"), &[conv_dim, 1, la.conv_kernel])?,
-            neg_a: self.f32(&format!("{p}.A_log"), heads)?.into_iter().map(|a| -a.exp()).collect(),
+            neg_a: self.neg_a(&format!("{p}.A_log"), heads)?,
             dt_bias: self.f32(&format!("{p}.dt_bias"), heads)?,
             norm: self.f32(&format!("{p}.norm.weight"), la.value_head_dim)?,
             out: w("out_proj", h, value_dim)?.into_matrix(spec.quant, &format!("{p}.out_proj"))?,

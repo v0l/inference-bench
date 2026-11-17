@@ -90,7 +90,7 @@ fn every_quant_type_dequantises_bit_exact_against_ggml() {
         dequantize(g.kind, g.quant, &mut got).unwrap();
         assert_bits(&g.kind.name(), &got, &g.want);
     }
-    assert_eq!(all.iter().map(|g| g.kind).collect::<Vec<_>>(), [GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K]);
+    assert_eq!(all.iter().map(|g| g.kind).collect::<Vec<_>>(), [GgmlType::Q8_0, GgmlType::Q4K, GgmlType::Q5K, GgmlType::Q6K, GgmlType::Q4_0, GgmlType::Q5_0]);
 }
 
 #[test]

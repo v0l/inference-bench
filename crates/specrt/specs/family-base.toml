@@ -1,5 +1,6 @@
 name = "base"
 kind = "family"
+min_engine = 8
 
 [activation]
 lenient_default = "swiglu"
@@ -109,6 +110,15 @@ value_length = "{arch}.attention.value_length"
 rope_dimension_count = "{arch}.rope.dimension_count"
 norm_epsilon = "{arch}.attention.layer_norm_rms_epsilon"
 rope_freq_base = "{arch}.rope.freq_base"
+rope_sections = "{arch}.rope.dimension_sections"
+nextn_predict_layers = "{arch}.nextn_predict_layers"
+ssm_conv_kernel = "{arch}.ssm.conv_kernel"
+ssm_state_size = "{arch}.ssm.state_size"
+ssm_group_count = "{arch}.ssm.group_count"
+ssm_time_step_rank = "{arch}.ssm.time_step_rank"
+ssm_inner_size = "{arch}.ssm.inner_size"
+recurrent_layers = "{arch}.attention.recurrent_layers"
+full_attention_interval = "{arch}.full_attention_interval"
 rope_scaling_type = "{arch}.rope.scaling.type"
 rope_scaling_factor = "{arch}.rope.scaling.factor"
 rope_original_context = "{arch}.rope.scaling.original_context_length"
@@ -116,11 +126,33 @@ rope_original_context = "{arch}.rope.scaling.original_context_length"
 [gguf.tensors]
 embedding = "token_embd.weight"
 output = "output.weight"
-q_bias = "blk.0.attn_q.bias"
-q_norm = "blk.0.attn_q_norm.weight"
+q_bias = "attn_q.bias"
+q_norm = "attn_q_norm.weight"
 rope_freqs = "rope_freqs.weight"
 
+[gguf.names]
+"model.embed_tokens.weight" = "token_embd.weight"
+"model.norm.weight" = "output_norm.weight"
+"lm_head.weight" = "output.weight"
+
+[gguf.layer]
+"self_attn.q_proj.weight" = "attn_q.weight"
+"self_attn.k_proj.weight" = "attn_k.weight"
+"self_attn.v_proj.weight" = "attn_v.weight"
+"self_attn.q_proj.bias" = "attn_q.bias"
+"self_attn.k_proj.bias" = "attn_k.bias"
+"self_attn.v_proj.bias" = "attn_v.bias"
+"self_attn.o_proj.weight" = "attn_output.weight"
+"self_attn.q_norm.weight" = "attn_q_norm.weight"
+"self_attn.k_norm.weight" = "attn_k_norm.weight"
+"input_layernorm.weight" = "attn_norm.weight"
+"post_attention_layernorm.weight" = "ffn_norm.weight"
+"mlp.gate_proj.weight" = "ffn_gate.weight"
+"mlp.up_proj.weight" = "ffn_up.weight"
+"mlp.down_proj.weight" = "ffn_down.weight"
+
 [gguf.pretokenizers]
+qwen35 = '''(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+'''
 qwen2 = '''(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+'''
 deepseek-r1-qwen = '''(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+'''
 llama-bpe = '''(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+'''

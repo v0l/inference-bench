@@ -1,14 +1,43 @@
 name = "qwen3_5"
 kind = "family"
+min_engine = 8
 extends = "base"
 mtp = true
 
 [match]
 model_types = ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"]
 architectures = ["Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM", "Qwen3_5MoeForConditionalGeneration"]
+gguf = ["qwen35", "qwen35moe"]
 
 [attention]
 qk_norm = true
 
 [blocks]
 kind = "hybrid"
+
+[gguf]
+output_gate = true
+mrope_interleaved = true
+a_stored_negated = true
+v_heads = "tiled"
+
+[gguf.tensors]
+linear_layer = "ssm_a"
+
+[gguf.layer]
+"post_attention_layernorm.weight" = "post_attention_norm.weight"
+"linear_attn.in_proj_qkv.weight" = "attn_qkv.weight"
+"linear_attn.in_proj_z.weight" = "attn_gate.weight"
+"linear_attn.in_proj_b.weight" = "ssm_beta.weight"
+"linear_attn.in_proj_a.weight" = "ssm_alpha.weight"
+"linear_attn.conv1d.weight" = "ssm_conv1d.weight"
+"linear_attn.A_log" = "ssm_a"
+"linear_attn.dt_bias" = "ssm_dt.bias"
+"linear_attn.norm.weight" = "ssm_norm.weight"
+"linear_attn.out_proj.weight" = "ssm_out.weight"
+
+[gguf.mtp]
+"fc.weight" = "nextn.eh_proj.weight"
+"pre_fc_norm_embedding.weight" = "nextn.enorm.weight"
+"pre_fc_norm_hidden.weight" = "nextn.hnorm.weight"
+"norm.weight" = "nextn.shared_head_norm.weight"

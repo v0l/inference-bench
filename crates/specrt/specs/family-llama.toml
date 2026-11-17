@@ -1,8 +1,12 @@
 name = "llama"
 kind = "family"
+min_engine = 8
 extends = "base"
 
 [match]
 model_types = ["llama", "mistral"]
 architectures = ["LlamaForCausalLM", "MistralForCausalLM"]
 gguf = ["llama"]
+
+[gguf]
+permuted_qk = true

@@ -25,6 +25,7 @@ pub struct LinearShape {
     pub value_heads: usize,
     pub head_dim: usize,
     pub conv_kernel: usize,
+    pub tiled_value_heads: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -201,6 +202,8 @@ pub(crate) fn constants(s: &LinearShape, u: &LinearTuning) -> String {
     ] {
         let _ = writeln!(o, "{l}");
     }
+    let _ = writeln!(o, "constexpr bool LA_TILED = {};", s.tiled_value_heads);
+    let _ = writeln!(o, "__device__ __forceinline__ int la_kh(int h) {{ return LA_TILED ? h % LA_KH : h / LA_RATIO; }}");
     let _ = writeln!(o, "constexpr int LA_CHUNK = {};", u.chunk);
     let _ = writeln!(o, "constexpr int LA_KSPLIT = {};", u.ksplit);
     let _ = writeln!(o, "constexpr int LA_KS = LA_D + 1;");

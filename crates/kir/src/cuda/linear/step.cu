@@ -17,7 +17,7 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const fl
     ba += (size_t)seq * LA_BA_ROWS;
     out += (size_t)seq * LA_VALUE_DIM;
     slot += slots[seq] * seq_slots;
-    int kh = h / LA_RATIO;
+    int kh = la_kh(h);
     int tid = threadIdx.x;
     int v = tid % LA_D;
     int ks = tid / LA_D;

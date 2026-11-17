@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const SPEC_FORMAT: u32 = 7;
+pub const SPEC_FORMAT: u32 = 8;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -291,6 +291,20 @@ pub enum LinearKind {
     GatedDeltaNet,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VHeadOrder {
+    #[default]
+    Grouped,
+    Tiled,
+}
+
+impl VHeadOrder {
+    pub fn is_grouped(&self) -> bool {
+        *self == VHeadOrder::Grouped
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LinearAttention {
@@ -300,6 +314,8 @@ pub struct LinearAttention {
     pub key_head_dim: usize,
     pub value_head_dim: usize,
     pub conv_kernel: usize,
+    #[serde(default, skip_serializing_if = "VHeadOrder::is_grouped")]
+    pub v_heads: VHeadOrder,
 }
 
 impl LinearAttention {
@@ -1276,6 +1292,7 @@ impl Spec {
                 key_head_dim: need(hf.linear_key_head_dim, "linear_key_head_dim")?,
                 value_head_dim: need(hf.linear_value_head_dim, "linear_value_head_dim")?,
                 conv_kernel: need(hf.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+                v_heads: VHeadOrder::Grouped,
             })
         } else {
             None
@@ -1434,7 +1451,8 @@ impl Spec {
                 [self.dims.hidden, self.dims.intermediate, self.q_dim()].iter().all(|d| d.is_multiple_of(crate::gguf::DEVICE_SUPERBLOCK)),
                 "quant = \"gguf\" needs hidden, intermediate and heads * head_dim to be multiples of 256"
             );
-            ensure!(self.linear_attention.is_none(), "quant = \"gguf\" is for dense attention models");
+            let value_dim = self.linear_attention.as_ref().map_or(0, |l| l.value_dim());
+            ensure!(value_dim.is_multiple_of(crate::gguf::DEVICE_SUPERBLOCK), "quant = \"gguf\" needs the linear value dim to be a multiple of 256");
         }
         match (self.mlp.quant, self.mlp.quant_until) {
             (None, Some(_)) => bail!("[mlp] quant_until needs [mlp] quant"),

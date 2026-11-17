@@ -71,6 +71,8 @@ pub enum GgmlType {
     F32,
     F16,
     Bf16,
+    Q4_0,
+    Q5_0,
     Q8_0,
     Q4K,
     Q5K,
@@ -83,6 +85,8 @@ impl GgmlType {
         match id {
             0 => GgmlType::F32,
             1 => GgmlType::F16,
+            2 => GgmlType::Q4_0,
+            6 => GgmlType::Q5_0,
             8 => GgmlType::Q8_0,
             12 => GgmlType::Q4K,
             13 => GgmlType::Q5K,
@@ -97,14 +101,14 @@ impl GgmlType {
             GgmlType::F32 => "F32".into(),
             GgmlType::F16 => "F16".into(),
             GgmlType::Bf16 => "BF16".into(),
+            GgmlType::Q4_0 => "Q4_0".into(),
+            GgmlType::Q5_0 => "Q5_0".into(),
             GgmlType::Q8_0 => "Q8_0".into(),
             GgmlType::Q4K => "Q4_K".into(),
             GgmlType::Q5K => "Q5_K".into(),
             GgmlType::Q6K => "Q6_K".into(),
             GgmlType::Other(id) => match id {
-                2 => "Q4_0".into(),
                 3 => "Q4_1".into(),
-                6 => "Q5_0".into(),
                 7 => "Q5_1".into(),
                 9 => "Q8_1".into(),
                 10 => "Q2_K".into(),
@@ -119,6 +123,8 @@ impl GgmlType {
         Some(match self {
             GgmlType::F32 => (1, 4),
             GgmlType::F16 | GgmlType::Bf16 => (1, 2),
+            GgmlType::Q4_0 => (32, 18),
+            GgmlType::Q5_0 => (32, 22),
             GgmlType::Q8_0 => (32, 34),
             GgmlType::Q4K => (QK_K, 144),
             GgmlType::Q5K => (QK_K, 176),
@@ -162,8 +168,14 @@ enum Backing {
     Owned(Vec<u8>),
 }
 
+pub struct Naming {
+    pub family: crate::family::FamilyGguf,
+    pub main_layers: usize,
+}
+
 pub struct Gguf {
     backing: Backing,
+    naming: std::sync::OnceLock<Option<Naming>>,
     pub version: u32,
     pub alignment: usize,
     pub metadata: HashMap<String, Value>,
@@ -298,7 +310,7 @@ impl Gguf {
                 info.name
             );
         }
-        Ok(Gguf { backing, version, alignment, metadata, tensors, data_start, header_only })
+        Ok(Gguf { backing, naming: std::sync::OnceLock::new(), version, alignment, metadata, tensors, data_start, header_only })
     }
 
     fn bytes(&self) -> &[u8] {
@@ -342,6 +354,33 @@ impl Gguf {
         self.string("general.architecture").context("the GGUF file has no general.architecture")
     }
 
+    fn count_declared(&self, names: &crate::family::FamilyGguf, canonical: &str, arch: &str) -> Option<usize> {
+        self.count(&names.key_if_declared(canonical, arch)?)
+    }
+
+    pub fn has_layer_tensor(&self, suffix: &str) -> bool {
+        self.tensors.keys().any(|n| n.strip_prefix("blk.").and_then(|r| r.split_once('.')).is_some_and(|(i, t)| t == suffix && i.bytes().all(|b| b.is_ascii_digit())))
+    }
+
+    pub fn naming(&self) -> Option<&Naming> {
+        self.naming
+            .get_or_init(|| {
+                let arch = self.architecture().ok()?;
+                let registry = crate::family::active();
+                let family = registry.for_gguf(arch)?;
+                let total = self.count(&family.gguf.key("block_count", arch).ok()?)?;
+                let nextn = self.count_declared(&family.gguf, "nextn_predict_layers", arch).unwrap_or(0);
+                let defaults = crate::family::Registry::embedded().named("base").map(|b| b.gguf.clone()).unwrap_or_default();
+                Some(Naming { family: family.gguf.with_default_names(&defaults), main_layers: total.saturating_sub(nextn) })
+            })
+            .as_ref()
+    }
+
+    pub fn tensor_for_hf(&self, hf: &str) -> Option<String> {
+        let naming = self.naming()?;
+        naming.family.hf_to_gguf(hf, naming.main_layers)
+    }
+
     pub fn weight_type_bytes(&self) -> Vec<(GgmlType, usize)> {
         let mut by: HashMap<String, (GgmlType, usize)> = HashMap::new();
         for t in self.tensors.values().filter(|t| t.shape.len() == 2) {
@@ -370,7 +409,9 @@ impl Gguf {
             self.count(&full).with_context(|| format!("the GGUF file has no {full}"))
         };
         let hidden = need("embedding_length")?;
-        let layers = need("block_count")?;
+        let total_layers = need("block_count")?;
+        let nextn = self.count_declared(&family.gguf, "nextn_predict_layers", arch).unwrap_or(0);
+        let layers = total_layers - nextn.min(total_layers.saturating_sub(1));
         let heads = need("head_count")?;
         let kv_heads = self.count(&key("head_count_kv")?).unwrap_or(heads);
         let experts = self.count(&key("expert_count")?).filter(|&e| e > 0);
@@ -387,6 +428,8 @@ impl Gguf {
         let eps_key = key("norm_epsilon")?;
         let eps = self.number(&eps_key).with_context(|| format!("the GGUF file has no {eps_key}"))?;
         let theta = self.number(&key("rope_freq_base")?).unwrap_or(10000.0);
+        let (linear_attention, pattern) = self.linear_attention(family, arch, layers)?;
+        let mrope = self.mrope(family, arch, rotary.unwrap_or(head_dim))?;
         let embd_name = names.tensor("embedding")?;
         let vocab = match self.tensor(embd_name) {
             Some(embd) => {
@@ -400,9 +443,12 @@ impl Gguf {
         let mut unsupported: Vec<String> = self.tensors.values().filter(|t| t.kind.block().is_none()).map(|t| format!("{} ({})", t.name, t.kind.name())).collect();
         unsupported.sort();
         if let Some(first) = unsupported.first().filter(|_| !self.header_only) {
-            bail!("GGUF tensor type is not supported: {first} and {} more (F32, F16, BF16, Q8_0, Q4_K, Q5_K and Q6_K are)", unsupported.len() - 1);
+            bail!("GGUF tensor type is not supported: {first} and {} more (F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K and Q6_K are)", unsupported.len() - 1);
         }
-        let quant = self.weight_quant();
+        let quant = match self.weight_quant() {
+            Quant::Q8 if linear_attention.is_some() => Quant::Gguf,
+            q => q,
+        };
         let moe = match experts {
             Some(experts) => {
                 let width = expert_width.context("the GGUF file has no expert_feed_forward_length")?;
@@ -421,7 +467,7 @@ impl Gguf {
             }
             None => None,
         };
-        let spec = Spec {
+        let mut spec = Spec {
             name: self.string("general.name").unwrap_or(arch).to_lowercase().replace(' ', "-"),
             min_engine: 0,
             repo: String::new(),
@@ -429,47 +475,97 @@ impl Gguf {
             head_quant: None,
             act_quant: ActQuant::None,
             dims: Dims { hidden, intermediate, vocab, tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None },
-            layers: Layers { count: layers, pattern: vec![Block::Dense], window: None },
+            layers: Layers { count: layers, pattern, window: None },
             norm: Norm { kind: NormKind::Rmsnorm, eps, unit_offset: false, sandwich: false, pre: true, residual_scale: None },
             attention: Attention {
                 kind: AttentionKind::Gqa,
                 heads,
                 kv_heads,
                 head_dim,
-                qkv_bias: self.tensors.contains_key(names.tensor("q_bias")?),
-                qk_norm: self.tensors.contains_key(names.tensor("q_norm")?),
-                output_gate: false,
+                qkv_bias: self.has_layer_tensor(names.tensor("q_bias")?),
+                qk_norm: self.has_layer_tensor(names.tensor("q_norm")?),
+                output_gate: family.gguf.output_gate,
                 rotary_dim: rotary,
                 softcap: None,
                 query_scalar: None,
                 qk_norm_full: false,
                 fused_qkv: false,
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(family, head_dim)?, mrope: None, local_theta: None, nope_layers: Vec::new() },
+            rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(family, head_dim)?, mrope, local_theta: None, nope_layers: Vec::new() },
             mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, fused_gate_up: false },
             moe,
-            linear_attention: None,
-            mtp: None,
+            linear_attention,
+            mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),
             vision: None,
             runtime: RuntimeOptions {
-                unsplit: if quant == Quant::Gguf { crate::codegen::GGB_LINEARS.iter().map(|l| l.to_string()).collect() } else { Vec::new() },
+                unsplit: Vec::new(),
                 big_tile: if quant == Quant::Gguf { Some([256, 128, 4, 2]) } else { None },
                 ..RuntimeOptions::default()
             },
         };
+        if quant == Quant::Gguf {
+            let hybrid: &[&str] = if spec.linear_attention.is_some() { &["lin_in", "lin_out"] } else { &[] };
+            spec.runtime.unsplit = crate::codegen::GGB_LINEARS.iter().chain(hybrid).map(|l| l.to_string()).collect();
+        }
         spec.validate()?;
         Ok(spec)
     }
 
     pub fn weight_quant(&self) -> Quant {
         let kinds: Vec<GgmlType> = self.tensors.values().filter(|t| t.name.starts_with("blk.") && t.shape.len() == 2).map(|t| t.kind).collect();
-        if kinds.iter().any(|k| matches!(k, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q6K)) {
+        let packed = kinds.iter().any(|k| k.quantised() && *k != GgmlType::Q8_0);
+        let mixed_q8 = kinds.contains(&GgmlType::Q8_0) && kinds.iter().any(|k| matches!(k, GgmlType::F16 | GgmlType::Bf16));
+        if packed || mixed_q8 {
             Quant::Gguf
         } else if kinds.contains(&GgmlType::Q8_0) {
             Quant::Q8
         } else {
             Quant::Bf16
         }
+    }
+
+    fn linear_attention(&self, family: &crate::family::Family, arch: &str, layers: usize) -> Result<(Option<crate::spec::LinearAttention>, Vec<Block>)> {
+        let names = &family.gguf;
+        let count = |canonical: &str| -> Result<Option<usize>> { Ok(self.count_declared(names, canonical, arch)) };
+        let Some(conv_kernel) = count("ssm_conv_kernel")? else { return Ok((None, vec![Block::Dense])) };
+        let need = |canonical: &str| count(canonical)?.with_context(|| format!("the GGUF file has no {}", names.key_if_declared(canonical, arch).unwrap_or_default()));
+        let (key_heads, value_heads, state, inner) = (need("ssm_group_count")?, need("ssm_time_step_rank")?, need("ssm_state_size")?, need("ssm_inner_size")?);
+        ensure!(value_heads > 0 && inner.is_multiple_of(value_heads), "ssm inner size {inner} is not a multiple of the {value_heads} time step heads");
+        let marker = names.tensors.get("linear_layer");
+        let by_tensor = |i: usize| marker.map(|m| self.tensors.contains_key(&format!("blk.{i}.{m}")));
+        let flags = names.key_if_declared("recurrent_layers", arch).and_then(|k| self.metadata.get(&k)).and_then(Value::as_array).filter(|a| a.len() >= layers);
+        let interval = count("full_attention_interval")?.filter(|&n| n > 1);
+        let pattern: Vec<Block> = (0..layers)
+            .map(|i| {
+                let linear = match (by_tensor(i), flags, interval) {
+                    (Some(l), _, _) => l,
+                    (None, Some(f), _) => matches!(f[i], Value::Bool(true)),
+                    (None, None, Some(n)) => (i + 1) % n != 0,
+                    _ => true,
+                };
+                if linear { Block::Linear } else { Block::Full }
+            })
+            .collect();
+        let period = (1..=pattern.len()).find(|p| pattern.len() % p == 0 && pattern.iter().enumerate().all(|(i, b)| *b == pattern[i % p])).unwrap_or(pattern.len());
+        let pattern = pattern[..period].to_vec();
+        let la = crate::spec::LinearAttention {
+            kind: crate::spec::LinearKind::GatedDeltaNet,
+            key_heads,
+            value_heads,
+            key_head_dim: state,
+            value_head_dim: inner / value_heads,
+            conv_kernel,
+            v_heads: names.v_heads,
+        };
+        Ok((Some(la), pattern))
+    }
+
+    fn mrope(&self, family: &crate::family::Family, arch: &str, rotary: usize) -> Result<Option<crate::spec::Mrope>> {
+        let Some(sections) = family.gguf.key_if_declared("rope_sections", arch).and_then(|k| self.metadata.get(&k)).and_then(Value::as_array) else { return Ok(None) };
+        let mut it = sections.iter().filter_map(Value::as_u64).map(|v| v as usize);
+        let (Some(t), Some(h), Some(w)) = (it.next(), it.next(), it.next()) else { return Ok(None) };
+        let section = [t, h, w];
+        Ok((section.iter().sum::<usize>() == rotary / 2).then_some(crate::spec::Mrope { section, interleaved: family.gguf.mrope_interleaved }))
     }
 
     fn rope_scaling(&self, family: &crate::family::Family, head_dim: usize) -> Result<Option<RopeScaling>> {
@@ -559,7 +655,7 @@ impl Gguf {
             "truncation": null,
             "padding": null,
             "added_tokens": added,
-            "normalizer": null,
+            "normalizer": if matches!(self.metadata.get("tokenizer.ggml.normalizer.nfc"), Some(Value::Bool(true))) { json!({"type": "NFC"}) } else { Json::Null },
             "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
                 {"type": "Split", "pattern": {"Regex": pattern}, "behavior": "Isolated", "invert": false},
                 {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false}
@@ -604,7 +700,7 @@ impl Gguf {
 pub fn quant_label_supported(label: &str) -> bool {
     let upper = label.to_uppercase();
     let upper = upper.strip_prefix("UD-").unwrap_or(&upper);
-    ["Q4_K", "Q5_K", "Q6_K", "Q8_0", "BF16", "F16", "F32"].iter().any(|q| upper.starts_with(q))
+    ["Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "BF16", "F16", "F32"].iter().any(|q| upper.starts_with(q))
 }
 
 pub fn llama3_factors(theta: f64, head_dim: usize, s: &RopeScaling) -> Vec<f64> {
@@ -636,6 +732,64 @@ fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     } else {
         ((q[j + 4] & 0xf) | ((q[j - 4] >> 6) << 4), (q[j + 4] >> 4) | ((q[j] >> 6) << 4))
     }
+}
+
+pub fn dequantize_q4_0(block: &[u8], out: &mut [f32]) {
+    let d = f16(block);
+    for j in 0..16 {
+        let q = block[2 + j];
+        out[j] = d * ((q & 0xf) as i32 - 8) as f32;
+        out[j + 16] = d * ((q >> 4) as i32 - 8) as f32;
+    }
+}
+
+pub fn dequantize_q5_0(block: &[u8], out: &mut [f32]) {
+    let d = f16(block);
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    for j in 0..16 {
+        let q = block[6 + j];
+        let lo = ((q & 0xf) as u32 | ((qh >> j) << 4) & 0x10) as i32 - 16;
+        let hi = ((q >> 4) as u32 | (qh >> (j + 12)) & 0x10) as i32 - 16;
+        out[j] = d * lo as f32;
+        out[j + 16] = d * hi as f32;
+    }
+}
+
+pub fn q4_0_as_q8_0(block: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(&block[..2]);
+    let mut q = [0u8; 32];
+    for j in 0..16 {
+        q[j] = (((block[2 + j] & 0xf) as i32 - 8) as i8) as u8;
+        q[j + 16] = (((block[2 + j] >> 4) as i32 - 8) as i8) as u8;
+    }
+    out.extend_from_slice(&q);
+}
+
+pub fn q5_0_as_q8_0(block: &[u8], out: &mut Vec<u8>) {
+    out.extend_from_slice(&block[..2]);
+    let qh = u32::from_le_bytes([block[2], block[3], block[4], block[5]]);
+    let mut q = [0u8; 32];
+    for j in 0..16 {
+        let lo = ((block[6 + j] & 0xf) as u32 | ((qh >> j) << 4) & 0x10) as i32 - 16;
+        let hi = ((block[6 + j] >> 4) as u32 | (qh >> (j + 12)) & 0x10) as i32 - 16;
+        q[j] = (lo as i8) as u8;
+        q[j + 16] = (hi as i8) as u8;
+    }
+    out.extend_from_slice(&q);
+}
+
+pub fn as_q8_0(kind: GgmlType, data: &[u8]) -> Option<Vec<u8>> {
+    let (_, bytes) = kind.block()?;
+    let convert: fn(&[u8], &mut Vec<u8>) = match kind {
+        GgmlType::Q4_0 => q4_0_as_q8_0,
+        GgmlType::Q5_0 => q5_0_as_q8_0,
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(data.len() / bytes * 34);
+    for block in data.chunks_exact(bytes) {
+        convert(block, &mut out);
+    }
+    Some(out)
 }
 
 pub fn dequantize_q8_0(block: &[u8], out: &mut [f32]) {
@@ -713,6 +867,8 @@ pub fn dequantize(kind: GgmlType, data: &[u8], out: &mut [f32]) -> Result<()> {
         GgmlType::Bf16 => out.iter_mut().zip(data.chunks_exact(2)).for_each(|(o, b)| *o = crate::weights::bf16_to_f32(u16::from_le_bytes([b[0], b[1]]))),
         _ => {
             let f: fn(&[u8], &mut [f32]) = match kind {
+                GgmlType::Q4_0 => dequantize_q4_0,
+                GgmlType::Q5_0 => dequantize_q5_0,
                 GgmlType::Q8_0 => dequantize_q8_0,
                 GgmlType::Q4K => dequantize_q4_k,
                 GgmlType::Q5K => dequantize_q5_k,
@@ -744,7 +900,7 @@ impl DeviceRow {
             GgmlType::Q4K => DeviceRow::Q4K,
             GgmlType::Q5K => DeviceRow::Q5K,
             GgmlType::Q6K => DeviceRow::Q6K,
-            GgmlType::Q8_0 => DeviceRow::Q8,
+            GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::Q5_0 => DeviceRow::Q8,
             GgmlType::Bf16 | GgmlType::F32 => DeviceRow::Bf16,
             GgmlType::F16 => DeviceRow::F16,
             GgmlType::Other(_) => bail!("GGUF tensor type {} is not supported", kind.name()),
@@ -785,6 +941,9 @@ impl DeviceRows {
         ensure!(cols.is_multiple_of(DEVICE_SUPERBLOCK), "a {} row of {cols} is not a whole number of 256-element blocks", kind.name());
         let src_row = kind.row_bytes(cols)?;
         ensure!(data.len() == src_row * rows, "{} data of {} bytes is not {rows} rows of {cols}", kind.name(), data.len());
+        if let Some(q8) = as_q8_0(kind, data) {
+            return DeviceRows::pack(GgmlType::Q8_0, &q8, rows, cols);
+        }
         let per_row = cols / DEVICE_SUPERBLOCK * row.bytes();
         let mut out = Vec::with_capacity(per_row * rows);
         for src in data.chunks_exact(src_row) {
@@ -1026,11 +1185,11 @@ mod tests {
 
     #[test]
     fn an_unknown_tensor_type_parses_and_is_named_when_used() {
-        let g = Gguf::from_bytes(build(3, &[], &[("t", &[32], 2, &[0u8; 18])])).unwrap();
+        let g = Gguf::from_bytes(build(3, &[], &[("t", &[256], 10, &[0u8; 84])])).unwrap();
         let t = g.tensor("t").unwrap();
-        assert_eq!(t.kind.name(), "Q4_0");
-        let e = dequantize(t.kind, g.data(t), &mut [0.0; 32]).err().unwrap().to_string();
-        assert!(e.contains("Q4_0 is not supported"), "{e}");
+        assert_eq!(t.kind.name(), "Q2_K");
+        let e = dequantize(t.kind, g.data(t), &mut [0.0; 256]).err().unwrap().to_string();
+        assert!(e.contains("Q2_K is not supported"), "{e}");
     }
 
     #[test]

@@ -6,9 +6,9 @@ specrt loads a llama.cpp GGUF file directly. `model` is the path of the `.gguf` 
 
 | Item | Supported |
 | --- | --- |
-| Architectures | `llama`, `qwen2`, `qwen3` (dense). Others fail with "GGUF architecture X is not supported". |
-| Tensor types | F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K. Any other type fails at load and in the library with the tensor name and type. |
-| Tokenizer | `tokenizer.ggml.model = gpt2` with `pre` of `qwen2` or `llama-bpe` |
+| Architectures | the `gguf = [...]` list of every family TOML: `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35` (Qwen3.5/3.6/3.8 delta-net hybrids, with their MTP block) and `qwen35moe`. Others fail with "GGUF architecture X is not supported (list, each once)". |
+| Tensor types | F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K. Any other type fails at load and in the library with the tensor name and type. |
+| Tokenizer | `tokenizer.ggml.model = gpt2` with a `pre` named in the family TOML `[gguf.pretokenizers]` (`qwen2`, `qwen35`, `llama-bpe`, ...); `tokenizer.ggml.normalizer.nfc` adds an NFC normaliser |
 | Files | one file. Split GGUF (`-0000N-of-0000M`) is listed but marked unsupported for specrt. |
 
 ## Layout
@@ -20,13 +20,26 @@ specrt loads a llama.cpp GGUF file directly. `model` is the path of the `.gguf` 
 - Llama 3 rope scaling is stored as a `rope_freqs.weight` tensor. The reader takes `factor` from its maximum, uses the converter defaults (low 1, high 4, original 8192) and checks the recomputed factors against the tensor, failing if they differ.
 - `general.file_type` is not trusted: the spec quant is chosen from the tensor types in the blocks.
 
+## qwen35 (delta-net hybrids)
+
+`qwen35` and `qwen35moe` are mapped by `family-qwen3_5.toml`; no Rust names the architecture.
+
+- Metadata: `[gguf.keys]` in `family-base.toml` names the `{arch}.ssm.*`, `full_attention_interval`, `attention.recurrent_layers`, `rope.dimension_sections` and `nextn_predict_layers` keys. The layer pattern comes from which blocks have the family's `[gguf.tensors] linear_layer` tensor (`ssm_a`), the MTP block is the layers past `block_count - nextn_predict_layers`.
+- Tensor names: `[gguf.layer]` maps each HF tail (`linear_attn.in_proj_qkv.weight`) to its GGUF tail (`attn_qkv.weight`), `[gguf.mtp]` the `mtp.*` tensors to the `nextn.*` ones on the layer after the main stack.
+- Converter changes that the family states: `a_stored_negated` (`ssm_a` is `-exp(A_log)` already), RMSNorm weights already carry the `+1`, `output_gate`, interleaved mrope.
+- Value heads: llama.cpp reorders the value heads of every linear-attention tensor from grouped (HF) to tiled so ggml can broadcast. specrt does not permute the tensors, because that would break the K-quant block layout of the out projection (its columns are the permuted axis). `[linear_attention] v_heads = "tiled"` (from the family `[gguf] v_heads`) makes the kernels read the key head of value head `h` as `h % key_heads` instead of `h / ratio`. Tests: `gguf_qwen35.rs`.
+- The hybrid linears `lin_in` and `lin_out` run the `DecGgml` decoder; the delta-net kernels are unchanged.
+- The vocabulary is not trimmed: `token_embd` has the full vocab rows, so `dims.vocab` comes from it.
+
 ## Quant paths
 
 | File | Spec quant | Path |
 | --- | --- | --- |
 | F16, BF16, F32 | `bf16` | converted to bf16 at load |
 | Q8_0 | `q8` | Q8_0 is int8 with one scale per 32, the same as the existing `q8` path, so it loads without loss (the f16 scale becomes f32) |
+| Q4_0, Q5_0 | `gguf` | repacked to Q8_0 blocks at load (the int values and scale are exact) |
 | any K-quant (Q4_K_M, Q5_K_M, Q6_K) | `gguf` | blocks are kept as they are on the GPU |
+| Q8_0 mixed with F16 or BF16 tensors (for example a Q8_K_P recipe), or any hybrid qwen35 file | `gguf` | row table per matrix, so each row keeps its own type |
 
 For `gguf`, every matrix carries a row table: each row has its own byte offset and type (Q4_K, Q5_K, Q6_K, Q8_0, BF16), so a fused matrix (qkv, gate and up interleaved) can mix types the way Q4_K_M does (`attn_v` and some `ffn_down` are Q6_K). Q6_K blocks are padded from 210 to 224 bytes so every row starts 16-byte aligned.
 
@@ -58,9 +71,11 @@ No environment variables. A spec derived from a GGUF takes the same `[runtime]` 
 | Test | What |
 | --- | --- |
 | `gguf.rs` unit tests | tiny generated GGUF files: every metadata type, arrays, alignment 32 and 64, bad magic, bad versions, truncation, unknown tensor type, unknown architecture, metadata to spec |
-| `tests/gguf.rs` | Q8_0, Q4_K, Q5_K and Q6_K dequantised bit exact against ggml on `fixtures/ggml-golden.bin` (written by `scripts/gguf_golden.c` with libggml); the same through `DeviceRows` with mixed types; the same on the GPU; spec and tokenizer of the real Qwen3-0.6B and Llama-3.2-1B files against the HF specs and `llama-tokenize` |
+| `tests/gguf.rs` | Q8_0, Q4_K, Q5_K, Q6_K, Q4_0 and Q5_0 dequantised bit exact against ggml on `fixtures/ggml-golden.bin` (written by `scripts/gguf_golden.c` with libggml); the same through `DeviceRows` with mixed types; the same on the GPU; spec and tokenizer of the real Qwen3-0.6B and Llama-3.2-1B files against the HF specs and `llama-tokenize` |
 | `tests/gguf_logits.rs` | logits and greedy generation against llama.cpp; native kernels against bf16; engine chat on a GGUF |
-| `core::library` | specrt support for a dense qwen3 GGUF, and the reason for an unsupported type |
+| `tests/gguf_qwen35.rs` | tiny qwen35 GGUFs made by llama.cpp `convert_hf_to_gguf.py` and `llama-quantize` from `tiny-qwen3.5-hd256` (`scripts/qwen35_gguf_fixture.py`, `qwen35_mtp_fixture.py`): the spec equals the safetensors spec, every value-head tensor lands in the same tiled order, the MTP block equals the safetensors MTP, Q8_0, Q5_K_M, Q5_0, Q4_K_M and Q4_0 load inside their error bound, the module compiles with NVRTC, the tokenizer uses the family pre-tokenizer |
+| `tests/gguf_qwen35_gpu.rs` | ignored GPU tests: tiny Q8_0 against the safetensors logits, a real file against llama.cpp logits, KL and greedy, and native kernels against bf16. `scripts/gate676.sh <file.gguf>` builds the llama.cpp reference and runs them |
+| `core::library` | specrt support for a dense qwen3 GGUF, a qwen35 GGUF, and the reason for an unsupported type |
 | `ui` | the detail view reads GGUF metadata |
 
 The reference logits come from `scripts/gguf_reference.c` (links libllama): all prompt logits and 64 greedy tokens for the 18-token prompt in the test. `scripts/gguf_kl.py` compares two dumps.

@@ -153,6 +153,8 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `prefix.rs` | prefix cache, snapshots, block tables | CPU, 2 ign | 2 | none | none, 0.4 s |
 | `yarn.rs` | YaRN rope against `yarn_reference.json` | CPU, 1 ign | 1 | none | 2 GB |
 | `gguf.rs` | GGUF parse, spec from GGUF | CPU, 3 ign | 3 | GGUF files in `~/.cache/specrt-gguf` | 2 GB |
+| `gguf_qwen35.rs` | qwen35 GGUF fixtures (llama.cpp converted) against the safetensors weights, spec, MTP, quant bounds, NVRTC compile | CPU, 1 ign | 1 | checked in (`fixtures/qwen35-gguf`) | none, 1 s |
+| `gguf_qwen35_gpu.rs` | qwen35 GGUF logits against safetensors and llama.cpp | 3 | 3 | `SPECRT_GGUF_FILE`, `SPECRT_GGUF_REF` (`scripts/gate676.sh`) | 3 to 40 GB |
 | `jit.rs` | NVRTC compile and launch, cache | 2 | 2 | none | 1 GB, 13 s |
 | `fused.rs` | fused kernels vs unfused | 2 | 6 | none | 1 GB, 1 s |
 | `link.rs`, `loader.rs`, `statepool.rs`, `kv_dtype.rs`, `lin_ba_rows.rs` | linking, weight loading, state pool, KV dtypes, the lin_ba rows fix (#604) | 2 | all | none | 1 to 3 GB, under 30 s each |
