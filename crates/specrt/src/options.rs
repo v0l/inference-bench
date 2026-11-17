@@ -35,8 +35,14 @@ impl Profile {
             }
             Profile::LowMemory => {
                 v.insert("speculative.enabled".into(), json!(false));
+                v.insert("runtime.kv_dtype".into(), json!("fp8"));
+                v.insert("serve.max_num_seqs".into(), json!(2));
+                v.insert("serve.max_batched_tokens".into(), json!(2048));
+                v.insert("runtime.prefill_chunk".into(), json!(512));
                 v.insert("runtime.prefix_cache.enabled".into(), json!(false));
                 v.insert("runtime.prefix_cache.max_snapshots".into(), json!(0));
+                v.insert("runtime.vision.cache_mb".into(), json!(64));
+                v.insert("runtime.vision.max_batch".into(), json!(1));
                 v.insert("runtime.loader.host_budget_mb".into(), json!(512));
             }
         }
@@ -445,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn low_memory_drops_the_draft_head_the_snapshots_and_the_loader_budget() {
+    fn low_memory_halves_the_kv_cache_shrinks_batches_and_drops_the_draft_head_and_snapshots() {
         let mut c = EngineChoice::default();
         c.select(Profile::LowMemory);
         assert!(!c.is_custom());
@@ -455,6 +461,15 @@ mod tests {
         assert!(!rt.prefix_cache.enabled);
         assert_eq!(rt.prefix_cache.max_snapshots, 0);
         assert_eq!(rt.loader.host_budget_mb, 512);
+        assert_eq!(rt.kv_dtype, KvDtype::Fp8);
+        assert_eq!(rt.prefill_chunk, Some(512));
+        assert_eq!((rt.vision.cache_mb, rt.vision.max_batch), (64, 1));
+        assert_eq!(o.max_batched_tokens, 2048);
+        assert_eq!(c.value("serve.max_num_seqs"), json!(2));
+        assert!(rt.graphs && rt.fuse);
+        let max = EngineChoice::default();
+        let changed = schema().iter().filter(|f| max.value(&f.key) != c.value(&f.key)).count();
+        assert!(changed >= 9, "low memory changes only {changed} options");
         assert!(rt.graphs && rt.fuse);
     }
 

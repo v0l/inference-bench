@@ -35,6 +35,9 @@ fn spec_updates(app: &mut App, ui: &mut egui::Ui) {
         if !state.last_result.is_empty() {
             status(ui, state.last_ok, &state.last_result);
         }
+        if app.specs.busy() {
+            crate::working::working(ui, "checking GitHub for spec updates");
+        }
         ui.horizontal(|ui| {
             let busy = app.specs.busy();
             if ui.add(Key::new(if busy { "checking" } else { "check now" }).outline(READOUT).enabled(!busy)).clicked() {
@@ -84,6 +87,7 @@ fn spec_updates(app: &mut App, ui: &mut egui::Ui) {
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     page(ui, "settings", |ui| {
         let mut save = false;
+        let mut changed = false;
         section(ui, "model folders", "searched for GGUF and safetensors, on top of the Hugging Face cache", |ui| {
             let mut remove = None;
             for (i, f) in app.settings.model_folders.iter().enumerate() {
@@ -98,6 +102,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             }
             if let Some(i) = remove {
                 app.settings.model_folders.remove(i);
+                changed = true;
             }
             let st = &mut app.settings_ui;
             let mut add = false;
@@ -108,16 +113,24 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             if add {
                 app.settings.model_folders.push(PathBuf::from(st.new_folder.trim()));
                 st.new_folder.clear();
+                changed = true;
             }
             Line::new().legend("hub cache").value(inference_bench_core::library::hub_dir().display().to_string()).elided(ui);
+            if ui.add(Key::new("rescan models").outline(VALUE).min_width(140.0)).clicked() {
+                changed = true;
+            }
         });
+        if changed {
+            app.save_settings();
+            app.rescan();
+        }
         section(ui, "hugging face", "for gated repos and faster downloads", |ui| {
             row(ui, "token", |ui| {
                 secret(ui, &mut app.settings.hf_token);
             });
         });
         section(ui, "engine", "the profile a model loads with until you change it for that model", |ui| {
-            row_help(ui, "default profile", "Max performance is the measured best. Low memory drops the MTP draft head copy, shrinks the loader budget and keeps no prefix cache snapshots. A model's own choice in its load dialog wins.", |ui| {
+            row_help(ui, "default profile", "Max performance is the measured best. Low memory uses an fp8 KV cache, 2 parallel requests, smaller batches, no MTP draft head, no prefix cache and small loader and image budgets. A model's own choice in its load dialog wins.", |ui| {
                 let mut p = app.settings.default_profile;
                 if segments(ui, &mut p, &specrt::options::Profile::ALL.map(|p| (p, p.label(), None))) {
                     app.settings.default_profile = p;
@@ -132,10 +145,6 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.add(Key::new("save settings").solid(READOUT).min_width(140.0)).clicked() {
                 save = true;
-            }
-            if ui.add(Key::new("rescan models").outline(VALUE).min_width(140.0)).clicked() {
-                save = true;
-                app.rescan();
             }
         });
         if save {
