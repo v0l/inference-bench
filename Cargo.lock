@@ -3629,7 +3629,7 @@ dependencies = [
 
 [[package]]
 name = "inference-bench-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3648,7 +3648,7 @@ dependencies = [
 
 [[package]]
 name = "inference-bench-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3669,14 +3669,14 @@ dependencies = [
 
 [[package]]
 name = "inference-bench-kir"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "naga",
 ]
 
 [[package]]
 name = "inference-bench-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -3701,7 +3701,7 @@ dependencies = [
 
 [[package]]
 name = "inference-bench-specrt"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3736,7 +3736,7 @@ dependencies = [
 
 [[package]]
 name = "inference-bench-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "agent-core",
  "agent-ui",
