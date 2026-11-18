@@ -130,24 +130,6 @@ pub fn zero_tiles(indent: &str, name: &str, dims: &[&str]) -> String {
     s
 }
 
-pub fn quad_reduce(indent: &str, regs: &[&str], max: bool) -> String {
-    let mut s = String::new();
-    for r in regs {
-        for o in [1, 2] {
-            let _ = if max {
-                writeln!(s, "{indent}{r} = fmaxf({r}, __shfl_xor_sync(0xffffffff, {r}, {o}));")
-            } else {
-                writeln!(s, "{indent}{r} += __shfl_xor_sync(0xffffffff, {r}, {o});")
-            };
-        }
-    }
-    s
-}
-
-pub fn rescale_acc(blocks: &str) -> String {
-    format!("#pragma unroll\n        for (int i = 0; i < {blocks}; i++) {{\n            o[i][0] *= a0;\n            o[i][1] *= a0;\n            o[i][2] *= a1;\n            o[i][3] *= a1;\n        }}\n")
-}
-
 pub fn pack_probs() -> String {
     let mut s = String::new();
     for (name, f) in [("ph", "pack_f16_hi"), ("pl", "pack_f16_lo")] {

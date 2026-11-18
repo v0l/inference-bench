@@ -1,4 +1,5 @@
 use super::prim::{self, fill};
+use crate::cuda::attention::prim::{self as attn, Reduce};
 use crate::vision::VisionKernel;
 
 fn slots(k: &VisionKernel) -> Vec<(&'static str, String)> {
@@ -8,9 +9,9 @@ fn slots(k: &VisionKernel) -> Vec<(&'static str, String)> {
         ("ZERO_ACC", prim::zero_tiles("    ", "acc", &["GM_MI", "GM_NJ", "4"])),
         ("ZERO_O", prim::zero_tiles("    ", "o", &["AT_NB", "4"])),
         ("ZERO_S", prim::zero_tiles("        ", "s", &["SB", "4"])),
-        ("QUAD_MAX", prim::quad_reduce("        ", &["mx0", "mx1"], true)),
-        ("QUAD_SUM", prim::quad_reduce("        ", &["sum0", "sum1"], false)),
-        ("RESCALE", prim::rescale_acc("AT_NB")),
+        ("QUAD_MAX", ["mx0", "mx1"].iter().map(|v| attn::xor_reduce(Reduce::Max, v, &[1, 2])).collect()),
+        ("QUAD_SUM", ["sum0", "sum1"].iter().map(|v| attn::xor_reduce(Reduce::Sum, v, &[1, 2])).collect()),
+        ("RESCALE", attn::rescale_acc("i", "AT_NB")),
         ("PACK_PROBS", prim::pack_probs()),
         ("EXP_SUM", prim::exp_sum()),
         ("INV_L", prim::inv_l()),

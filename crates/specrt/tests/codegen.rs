@@ -463,3 +463,10 @@ fn kir_kernels_follow_the_target() {
     let sub = specrt::codegen::kir_kernels(&s, &kir::Target::wgpu_baseline().with_subgroups(32)).unwrap();
     assert_ne!(kir::module_hash(&tree), kir::module_hash(&sub));
 }
+
+#[test]
+fn vision_builders_use_prims() {
+    let kir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kir/src/cuda/vision");
+    let text = std::fs::read_to_string(kir.join("kernels.rs")).unwrap();
+    assert!(text.contains("prim::") && text.contains("attn::xor_reduce") && text.contains("attn::rescale_acc"), "vision builders must call the shared prims");
+}
