@@ -151,3 +151,11 @@ kill $PB'
 ```
 
 Then ask both the cluster and a single-runtime load of the same model the same greedy prompt (`temperature=0`, same `max_tokens`) and diff the text.
+
+## One plan for the load dialog and the engine (issue #776)
+
+The app load dialog and the engine now share one plan. `core::cluster::Planned` is built once from the dialog's devices (free memory per GPU times 0.9, in HF order), the dialog's weight bytes, KV pool and slots, through `PlacementConfig { weight_bytes, kv_pool_bytes, .. }`. The same `PlacementConfig` (with the stage ranges filled in) goes into the `ClusterSlot`, and `ServeOptions::plan` re-places it with the pool size from `kv_cache_bytes`, so the engine's per-stage bytes equal what the dialog showed. The KV pool is a total across GPUs: each stage allocates `kv_blocks` blocks of its own layers only (`Spec::stage` narrows `kv_f16_layers` to the stage), so the per-stage bytes sum to the pool and none holds all of it.
+
+A placed load never falls back to one GPU: `engine::open` returns the stage error (`stage 1 (layers 36..64) on GPU 1: ... out of memory`). The dialog says "will span N GPUs" when the memory it sizes is more than the largest GPU and blocks the load when the planner says it does not fit.
+
+Real check (needs both GPUs idle): `crates/specrt/scripts/gate776_two_gpu.sh`, defaults are the user's settings (27B NVFP4, fp8 KV, 21 seqs, ctx 262144, 95 GB KV pool). It checks both cards are empty, prints the plan, loads through `[placement]`, and reports VRAM per GPU and `inference_running_seqs` under 21 parallel requests.
