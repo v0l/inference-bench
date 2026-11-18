@@ -1,16 +1,14 @@
 mod chunk;
 mod common;
 mod conv;
+mod prim;
 mod draft;
 mod step;
 mod verify;
 
 use chunk::CHUNK;
 use common::COMMON;
-use conv::CONV;
 use draft::DRAFT;
-use step::STEP;
-use verify::VERIFY;
 use crate::linear::{Family, LinearError, LinearKernel, constants};
 
 
@@ -35,16 +33,16 @@ pub fn emit_linear(kernels: &[LinearKernel]) -> Result<String, LinearError> {
         push(COMMON);
     }
     if has(Family::Conv) {
-        push(CONV);
+        push(&conv::body());
     }
     if has(Family::Step) {
-        push(STEP);
+        push(&step::body());
     }
     if has(Family::Chunk) {
         push(CHUNK);
     }
     if has(Family::Verify) {
-        push(VERIFY);
+        push(&verify::body());
     }
     if has(Family::Draft) {
         push(DRAFT);
