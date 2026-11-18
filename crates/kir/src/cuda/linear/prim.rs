@@ -184,3 +184,65 @@ for (int w = blockDim.x / 2; w > 0; w >>= 1) {
 ",
     )
 }
+
+pub const FRAG: [&str; 3] = ["int j = 0; j < DPW; j++", "int n = 0; n < NT; n++", "int e = 0; e < 4; e++"];
+pub const FRAG_NE: [&str; 2] = ["int n = 0; n < NT; n++", "int e = 0; e < 4; e++"];
+
+pub const FRAG_ROW: &str = "int d = (warp + j * WARPS) * 16 + g + (e >> 1) * 8;";
+pub const FRAG_COL: &str = "int col = n * 8 + 2 * t4 + (e & 1);";
+
+pub fn state_tile_load(n: usize) -> String {
+    nest(n, &FRAG, &format!("{FRAG_ROW}\nsr[j][n][e] = st[(size_t)d * LA_D + c0 + n * 8 + 2 * t4 + (e & 1)];\n"))
+}
+
+pub fn state_tile_store(n: usize) -> String {
+    nest(n, &FRAG, &format!("{FRAG_ROW}\nst[(size_t)d * LA_D + c0 + n * 8 + 2 * t4 + (e & 1)] = sr[j][n][e];\n"))
+}
+
+pub fn split_plane_store(n: usize, hi: &str, lo: &str, pitch: &str, row: &str, col: &str, value: &str) -> String {
+    at(
+        n,
+        &format!(
+            "unsigned hi, lo;
+split_hi_lo({value}, hi, lo);
+{hi}[{col} * {pitch} + {row}] = (unsigned short)hi;
+{lo}[{col} * {pitch} + {row}] = (unsigned short)lo;
+"
+        ),
+    )
+}
+
+pub fn store_state_planes(n: usize) -> String {
+    let mut o = at(n, "auto store_state_planes = [&]() {\n");
+    let body = format!("{FRAG_ROW}\n{FRAG_COL}\n{}", split_plane_store(0, "sh", "sl", "SP", "d", "col", "sr[j][n][e]"));
+    o += &nest(n + 4, &FRAG, &body);
+    o += &at(n, "};\n");
+    o
+}
+
+pub fn acc_row() -> &'static str {
+    "int m = warp * 16 + g + (e >> 1) * 8;\nint col = n * 8 + 2 * t4 + (e & 1);\n"
+}
+
+pub fn acc_zero(n: usize) -> String {
+    nest(n, &FRAG_NE, "acc[n][e] = 0.0f;")
+}
+
+pub fn chunk_ptrs(n: usize) -> String {
+    at(
+        n,
+        "int t0 = c * C;
+size_t ch = (size_t)(c * LA_VH + h);
+const uint4* wp = (const uint4*)w + ch * (C * LA_D / 4) + 2 * (warp * KD * 32 + lane);
+const uint4* qp = (const uint4*)qe + ch * (C * LA_D / 4) + 2 * (warp * KD * 32 + lane);
+const uint4* ap = (const uint4*)aqk + ch * (C * C / 4) + 2 * (warp * KC * 32 + lane);
+const uint4* kp = (const uint4*)kt;
+float decay = expf(gc[ch * C + C - 1]);
+float acc[NT][4];
+",
+    )
+}
+
+pub fn mma_planes(n: usize, k: &str, acc: &str, frag: &str, hi: &str, lo: &str, pitch: &str) -> String {
+    at(n, &format!("gdn_mma_planes<{k}, NT>({acc}, {frag}, {hi}, {lo}, {pitch}, g, t4);\n"))
+}

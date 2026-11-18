@@ -1,4 +1,9 @@
-pub const DRAFT: &str = r##"extern "C" __global__ void mtp_fc_in(const bf16_t* table, const int* tokens, const float* xsrc, const float* psrc,
+use super::prim::block_argmax_tree;
+use crate::cuda::attention::prim::{Reduce, block_reduce};
+
+pub fn body() -> String {
+    let mut o = String::new();
+    o.push_str(r##"extern "C" __global__ void mtp_fc_in(const bf16_t* table, const int* tokens, const float* xsrc, const float* psrc,
                                      const int* hidx, const float* pre, const float* ne, const float* nh, bf16_t* hi,
                                      bf16_t* lo) {
     __shared__ float scratch[32];
@@ -41,21 +46,9 @@ extern "C" __global__ void mtp_draft(const float* logits, int* drafts, int col, 
             bi = i;
         }
     }
-    best_v[threadIdx.x] = bv;
-    best_i[threadIdx.x] = bi;
-    __syncthreads();
-    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
-        if (threadIdx.x < w) {
-            float ov = best_v[threadIdx.x + w];
-            int oi = best_i[threadIdx.x + w];
-            if (ov > best_v[threadIdx.x] || (ov == best_v[threadIdx.x] && oi < best_i[threadIdx.x])) {
-                best_v[threadIdx.x] = ov;
-                best_i[threadIdx.x] = oi;
-            }
-        }
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) {
+"##);
+    o.push_str(&block_argmax_tree(4));
+    o.push_str(r##"    if (threadIdx.x == 0) {
         drafts[dslots[s] * k + col] = best_i[0];
         ctok[s] = best_i[0];
     }
@@ -94,7 +87,9 @@ extern "C" __global__ void spec_accept(const float* logits, const int* vtok, con
                     float v = row[i] * inv_temp;
                     if (v >= thr) sum += expf(v - m);
                 }
-                sum = block_reduce<false>(sum, scratch);
+                "##);
+    o.push_str(&format!("sum = {};", block_reduce(Reduce::Sum, "sum", "scratch")));
+    o.push_str(r##"
                 float vd = row[d] * inv_temp;
                 take = vd >= thr && spec_uniform(seed, step + j) < expf(vd - m) / sum;
             }
@@ -118,21 +113,9 @@ extern "C" __global__ void spec_accept(const float* logits, const int* vtok, con
                 }
             }
             __syncthreads();
-            best_v[threadIdx.x] = bv;
-            best_i[threadIdx.x] = bi;
-            __syncthreads();
-            for (int w = blockDim.x / 2; w > 0; w >>= 1) {
-                if (threadIdx.x < w) {
-                    float ov = best_v[threadIdx.x + w];
-                    int oi = best_i[threadIdx.x + w];
-                    if (ov > best_v[threadIdx.x] || (ov == best_v[threadIdx.x] && oi < best_i[threadIdx.x])) {
-                        best_v[threadIdx.x] = ov;
-                        best_i[threadIdx.x] = oi;
-                    }
-                }
-                __syncthreads();
-            }
-            tok = best_i[0];
+"##);
+    o.push_str(&block_argmax_tree(12));
+    o.push_str(r##"            tok = best_i[0];
             take = !sampled && may && tok == d;
         }
         if (threadIdx.x == 0) out[s * (k + 1) + j] = tok;
@@ -182,4 +165,6 @@ extern "C" __global__ void mtp_copy(const float* src, const int* sidx, float* ds
     float* b = dst + (size_t)didx[s] * HIDDEN;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x) b[i] = a[i];
 }
-"##;
+"##);
+    o
+}
