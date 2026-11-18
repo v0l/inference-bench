@@ -3,11 +3,11 @@ set -uo pipefail
 side=${1:?usage: gate763_spark.sh <ours|old> <loop|kl|needle> [args...]}
 mode=${2:?}
 shift 2
-root=$HOME/ib-gates/763
-[ "$side" = old ] && root=$HOME/ib-gates/763-old
+root=$HOME/ib763/ours
+[ "$side" = old ] && root=$HOME/ib763/old
 target=$HOME/ib-gates-target/763-$side
 spec=$root/crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4-exact.toml
-out=$HOME/ib-gates/out763
+out=$HOME/ib763/out
 mkdir -p "$out"
 avail=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
 echo "MemAvailable ${avail} GB"
