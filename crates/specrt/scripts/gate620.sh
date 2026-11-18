@@ -60,7 +60,9 @@ fi
 if [ ! -d "$master_tree" ]; then
     git -C "$repo" worktree add -q --detach "$master_tree" master || exit 1
 fi
-git -C "$master_tree" checkout -q --detach master || exit 1
+if [ -e "$master_tree/.git" ]; then
+    git -C "$master_tree" checkout -q --detach master || exit 1
+fi
 
 for refdir in "$ref_tiny" "$ref_real"; do
     [ -d "$refdir" ] || { echo "missing reference dir $refdir (see project notes: reference.py)" >&2; exit 1; }
