@@ -63,7 +63,7 @@ systemd-run --user --wait --collect -P -q -p MemoryMax=10G --working-directory="
     cargo build --release -p inference-bench-cli
 
 serve() {
-    "$bin" serve --bind 127.0.0.1:$port --model "$spec" --max-num-seqs "$seqs" --max-model-len "$max_len" \
+    exec "$bin" serve --bind 127.0.0.1:$port --model "$spec" --max-num-seqs "$seqs" --max-model-len "$max_len" \
         --max-batched-tokens 2048 "$@"
 }
 
