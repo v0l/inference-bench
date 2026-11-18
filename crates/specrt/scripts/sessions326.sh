@@ -13,7 +13,7 @@ if [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && [ -z
 fi
 exec 9>/tmp/gpu27.lock
 flock 9
-systemd-run --user --wait --collect -P -q -p MemoryMax=10G --working-directory="$root" \
+systemd-run --user --wait --collect -P -q -p MemoryMax=${MEMORY_MAX:-10G} --working-directory="$root" \
     -E CARGO_TARGET_DIR -E CARGO_BUILD_JOBS -E PATH \
     cargo test -p inference-bench-specrt --release --test sessions -- --include-ignored --test-threads=1 2>&1 | tee "$out/roundtrip.log" || true
 echo "== sessions326 results =="

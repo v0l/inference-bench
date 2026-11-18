@@ -31,7 +31,7 @@ fn scheduler_with(s: &Spec, cache: bool) -> Scheduler<GpuExecutor> {
 }
 
 fn with_sessions(s: &Spec, dir: &Path, clock: Arc<AtomicU64>) -> (Scheduler<GpuExecutor>, Arc<Shared>) {
-    let mut sched = scheduler(s);
+    let mut sched = scheduler_with(s, true);
     let compat = sched.exec.session_compat().unwrap();
     let options = SessionOptions { enabled: true, min_tokens: 64, ..Default::default() };
     let shared = Arc::new(Shared::new(SessionStore::open(dir, compat).unwrap(), options));
@@ -82,7 +82,7 @@ fn roundtrip(name: &str) {
     let saved = shared.store.list();
     assert_eq!(saved.len(), 1);
     assert_eq!(saved[0].tokens, 150 + 40 - 1);
-    assert_eq!(a.blocks_used(), 0);
+    assert_eq!(a.blocks_live(), 0);
     drop(a);
     drop(shared);
 
