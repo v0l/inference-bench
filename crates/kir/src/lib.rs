@@ -2,6 +2,7 @@
 pub mod cuda;
 pub mod allreduce;
 pub mod attention;
+pub mod desc;
 pub mod gemm;
 pub mod gemv;
 pub mod ggml;

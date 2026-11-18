@@ -1,0 +1,9 @@
+kind = "kir-kernel"
+family = "rmsnorm"
+name = "rmsnorm"
+threads = 1024
+
+[args]
+width = "hidden"
+eps = "norm_eps"
+offset = 0

@@ -166,37 +166,51 @@ pub struct Module {
     pub kir_hash: String,
 }
 
-pub fn kir_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+pub fn kir_shape(spec: &Spec) -> kir::desc::Shape {
     let act = match spec.mlp.activation {
-        Activation::Swiglu => kir::Activation::Silu,
-        Activation::Geglu => kir::Activation::GeluTanh,
+        Activation::Swiglu => "silu",
+        Activation::Geglu => "gelu_tanh",
     };
-    let hidden = spec.dims.hidden as u32;
-    let inter = spec.dims.intermediate as u32;
-    let norm = kir::Kernel::rmsnorm(target, hidden, spec.norm.eps as f32, 1024).map_err(anyhow::Error::msg)?;
-    let gate = kir::Kernel::gated_activation(target, "swiglu", inter, act, 256).map_err(anyhow::Error::msg)?;
-    let mut out = vec![norm, gate];
-    let err = anyhow::Error::msg;
-    if spec.uses_branch() {
-        out.push(kir::Kernel::norm_add(target, hidden, spec.norm.eps as f32, 0.0, 1024).map_err(err)?);
-        out.push(kir::Kernel::pointwise(target, "clear_branch", hidden, kir::Pointwise::Fill(0.0), 256).map_err(err)?);
+    let mut shape = kir::desc::Shape::new()
+        .num("hidden", spec.dims.hidden as f64)
+        .num("inter", spec.dims.intermediate as f64)
+        .num("vocab", spec.dims.vocab as f64)
+        .num("norm_eps", spec.norm.eps)
+        .num("q_dim", spec.q_dim() as f64)
+        .num("kv_dim", spec.kv_dim() as f64)
+        .num("qkv_row", spec.qkv_rows() as f64)
+        .word("mlp_act", act);
+    if let Some(v) = spec.norm.residual_scale {
+        shape = shape.num("residual_scale", v);
     }
-    if let Some(scale) = spec.norm.residual_scale {
-        out.push(kir::Kernel::add_scaled(target, "residual_add", hidden, scale as f32, 256).map_err(err)?);
+    if let Some(v) = spec.dims.logit_scale {
+        shape = shape.num("logit_scale", v);
+    }
+    if let Some(v) = spec.dims.logit_softcap {
+        shape = shape.num("logit_softcap", v);
+    }
+    shape
+}
+
+pub fn kir_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let shape = kir_shape(spec);
+    let mut names = vec!["rmsnorm", "swiglu"];
+    if spec.uses_branch() {
+        names.extend(["norm_add", "clear_branch"]);
+    }
+    if spec.norm.residual_scale.is_some() {
+        names.push("residual_add");
     }
     if spec.attention.qk_norm_full {
-        let (q, kv, row) = (spec.q_dim() as u32, spec.kv_dim() as u32, spec.qkv_rows() as u32);
-        let eps = spec.norm.eps as f32;
-        out.push(kir::Kernel::rmsnorm_segment(target, "q_norm_rows", q, row, 0, eps, 1024).map_err(err)?);
-        out.push(kir::Kernel::rmsnorm_segment(target, "k_norm_rows", kv, row, q, eps, 1024).map_err(err)?);
+        names.extend(["q_norm_rows", "k_norm_rows"]);
     }
-    if let Some(scale) = spec.dims.logit_scale {
-        out.push(kir::Kernel::pointwise(target, "logit_scale", spec.dims.vocab as u32, kir::Pointwise::Scale(scale as f32), 256).map_err(err)?);
+    if spec.dims.logit_scale.is_some() {
+        names.push("logit_scale");
     }
-    if let Some(cap) = spec.dims.logit_softcap {
-        out.push(kir::Kernel::pointwise(target, "logit_softcap", spec.dims.vocab as u32, kir::Pointwise::SoftCap(cap as f32), 256).map_err(err)?);
+    if spec.dims.logit_softcap.is_some() {
+        names.push("logit_softcap");
     }
-    Ok(out)
+    names.into_iter().map(|n| kir::desc::build_builtin(n, target, &shape).map_err(anyhow::Error::msg)).collect()
 }
 
 pub fn cuda_target(ctx: &cudarc::driver::CudaContext) -> Result<kir::Target> {

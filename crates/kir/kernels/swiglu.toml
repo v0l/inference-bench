@@ -1,0 +1,8 @@
+kind = "kir-kernel"
+family = "gated_activation"
+name = "swiglu"
+threads = 256
+
+[args]
+width = "inter"
+act = "mlp_act"

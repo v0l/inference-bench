@@ -1,0 +1,9 @@
+kind = "kir-kernel"
+family = "pointwise"
+name = "clear_branch"
+threads = 256
+
+[args]
+width = "hidden"
+op = "fill"
+value = 0

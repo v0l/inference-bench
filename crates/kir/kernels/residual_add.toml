@@ -1,0 +1,8 @@
+kind = "kir-kernel"
+family = "add"
+name = "residual_add"
+threads = 256
+
+[args]
+width = "hidden"
+scale = "residual_scale"

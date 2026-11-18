@@ -1,0 +1,10 @@
+kind = "kir-kernel"
+family = "rmsnorm_segment"
+name = "k_norm_rows"
+threads = 1024
+
+[args]
+width = "kv_dim"
+stride = "qkv_row"
+start = "q_dim"
+eps = "norm_eps"

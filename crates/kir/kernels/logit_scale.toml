@@ -1,0 +1,9 @@
+kind = "kir-kernel"
+family = "pointwise"
+name = "logit_scale"
+threads = 256
+
+[args]
+width = "vocab"
+op = "scale"
+value = "logit_scale"
