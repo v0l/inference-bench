@@ -378,7 +378,11 @@ fn causal_attention_matches_a_cpu_softmax_reference() {
     let vcache: Vec<f32> = (0..kv_len).map(|_| rng.unit()).collect();
     let (qb, kc, vc) = (f32_buf(&w, &qkv), f32_buf(&w, &kcache), f32_buf(&w, &vcache));
     let ob = f32_buf(&w, &vec![0.0; rows * a.heads * hd]);
-    go(&mut w, "attention", &[&qb, &kc, &vc, &ob], [pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [a.heads as u32, rows as u32, 1]);
+    if specrt::backends::Backend::limits(&w).subgroup_size == 32 {
+        go(&mut w, "flash", &[&qb, &kc, &vc, &ob], [pos0 as u32, rows as u32, 0, 0, 0, 0, 0, 0], [a.heads as u32, (rows as u32).div_ceil(wgsl::FLASH_TOKENS), 1]);
+    } else {
+        go(&mut w, "attention", &[&qb, &kc, &vc, &ob], [pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [a.heads as u32, rows as u32, 1]);
+    }
     let got = read_f32(&w, &ob, rows * a.heads * hd);
     let mut want = vec![0f32; rows * a.heads * hd];
     for t in 0..rows {

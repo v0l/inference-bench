@@ -202,6 +202,9 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             }
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention => {
                 let l = l.expect("attention needs a layer");
+                if rows > 1 && be.limits().subgroup_size == 32 {
+                    return be.dispatch("flash", &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, r, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r.div_ceil(wgsl::FLASH_TOKENS), 1]);
+                }
                 be.dispatch(kernels[0], &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r, 1])
             }
             Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),

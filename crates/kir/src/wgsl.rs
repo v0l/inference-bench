@@ -871,6 +871,88 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     )
 }
 
+pub const FLASH_GROUPS: u32 = 4;
+pub const FLASH_TOKENS: u32 = FLASH_GROUPS;
+
+pub fn emit_flash_op(s: &crate::ops::WgslShape) -> String {
+    let mut out = ops_header(s);
+    out.push_str(&flash());
+    out
+}
+
+fn flash() -> String {
+    format!(
+        "{bind}
+const EPL: u32 = (HEAD_DIM + 31u) / 32u;
+var<workgroup> qs: array<f32, {qs}>;
+
+@compute @workgroup_size({threads})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let head = wid.x;
+    let g = li / 32u;
+    let t = wid.y * {FLASH_GROUPS}u + g;
+    let lane = li % 32u;
+    let live_row = t < p.a.y;
+    let tt = min(t, p.a.y - 1u);
+    let kvh = head / GROUP;
+    let len = p.a.x + tt + 1u;
+    let head_base = kvh * MAX_CTX * HEAD_DIM;
+    let scale = inverseSqrt(f32(HEAD_DIM));
+    for (var d = lane; d < HEAD_DIM; d += 32u) {{
+        qs[g * HEAD_DIM + d] = qkv[tt * QKV_ROW + head * HEAD_DIM + d] * scale;
+    }}
+    workgroupBarrier();
+    var acc: array<f32, EPL>;
+    var m = NEG_INF;
+    var l = 0.0;
+    for (var key0 = 0u; key0 < len; key0 += 32u) {{
+        let key = key0 + lane;
+        var s = NEG_INF;
+        if (key < len) {{
+            let kb = head_base + key * HEAD_DIM;
+            var dot = 0.0;
+            for (var d = 0u; d < HEAD_DIM; d++) {{
+                dot += qs[g * HEAD_DIM + d] * k_cache[kb + d];
+            }}
+            s = dot;
+        }}
+        let m_new = max(m, subgroupMax(s));
+        let corr = exp(m - m_new);
+        let pr = select(0.0, exp(s - m_new), key < len);
+        l = l * corr + subgroupAdd(pr);
+        for (var i = 0u; i < EPL; i++) {{
+            acc[i] *= corr;
+        }}
+        let n = min(32u, len - key0);
+        for (var j = 0u; j < n; j++) {{
+            let pj = subgroupShuffle(pr, j);
+            let vb = head_base + (key0 + j) * HEAD_DIM;
+            for (var i = 0u; i < EPL; i++) {{
+                let d = lane + 32u * i;
+                if (d < HEAD_DIM) {{
+                    acc[i] += pj * v_cache[vb + d];
+                }}
+            }}
+        }}
+        m = m_new;
+    }}
+    if (live_row) {{
+        let ob = t * HEADS * HEAD_DIM + head * HEAD_DIM;
+        for (var i = 0u; i < EPL; i++) {{
+            let d = lane + 32u * i;
+            if (d < HEAD_DIM) {{
+                out[ob + d] = acc[i] / l;
+            }}
+        }}
+    }}
+}}
+",
+        bind = storage(&[("qkv", false, "f32"), ("k_cache", false, "f32"), ("v_cache", false, "f32"), ("out", true, "f32")]),
+        threads = 32 * FLASH_GROUPS,
+        qs = FLASH_GROUPS * 256,
+    )
+}
+
 pub const ROW_SPAN: u32 = 32768;
 
 fn linear_rows(tokens: usize, workgroup: usize) -> String {
