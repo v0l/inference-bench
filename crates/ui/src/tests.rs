@@ -1742,11 +1742,13 @@ fn the_detail_tree_shows_the_chain_and_local_siblings_and_a_click_opens_one() {
             ("Qwen/Qwen3.8-27B-FP8", 1, Some(0), true),
         ]
     );
-    h.run();
+    for _ in 0..8 {
+        h.step();
+    }
     h.get_by_label("find on hugging face");
     h.get_by_label_contains("this model");
     h.get_by_label("open orcarouter/Qwen3.8-27B-Uncensored-NVFP4").click();
-    h.run();
+    pump_until(&mut h, 20, "opened", |a| a.models.detail.as_ref().is_some_and(|d| d.model == "orcarouter/Qwen3.8-27B-Uncensored-NVFP4"));
     assert_eq!(h.state().models.detail.as_ref().unwrap().model, "orcarouter/Qwen3.8-27B-Uncensored-NVFP4");
 }
 
