@@ -2527,7 +2527,7 @@ fn discover_plans_once_and_frames_stay_cheap_with_100_results() {
     eprintln!("discover frame 100 results: {ms:.2} ms");
     assert_eq!(h.state().models.plan_runs, runs, "frames must not replan");
     assert!(ms < 6.0, "{ms} ms per frame");
-    assert!(runs <= 10, "{runs} plan runs while loading 100 results");
+    assert!(runs <= 3, "{runs} plan runs while loading");
 }
 
 #[test]

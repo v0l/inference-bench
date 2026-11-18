@@ -230,6 +230,14 @@ impl ModelsState {
         if self.plan_key.as_ref() == Some(&key) {
             return;
         }
+        if self.inspecting.is_some()
+            && let Some(old) = &self.plan_key
+            && old.results == key.results
+            && old.seqs == key.seqs
+            && old.gpus == key.gpus
+        {
+            return;
+        }
         self.plan_runs += 1;
         let plans = self.plans(gpus, seqs);
         let mut by_repo: BTreeMap<String, RepoPlan> = plans.iter().map(|p| (p.repo.clone(), p.clone())).collect();
