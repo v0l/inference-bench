@@ -18,6 +18,7 @@ pub mod graph;
 pub mod grammar;
 pub mod jit;
 pub mod link;
+pub mod loops;
 pub mod loader;
 pub mod logprobs;
 pub mod media_encode;
