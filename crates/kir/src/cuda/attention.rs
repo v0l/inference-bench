@@ -15,7 +15,7 @@ mod flash_mma;
 #[path = "attention/mma.rs"]
 mod mma;
 #[path = "attention/prim.rs"]
-mod prim;
+pub(crate) mod prim;
 #[path = "attention/rope.rs"]
 mod rope;
 #[path = "attention/split.rs"]

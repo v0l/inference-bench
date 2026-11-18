@@ -18,12 +18,6 @@ const KIR_SNIPPETS: &[&str] = &[
     "cuda/ggml/dec.cu",
     "cuda/ggml/decode.cu",
     "cuda/ggml/to_bf16.cu",
-    "cuda/linear/chunk.cu",
-    "cuda/linear/common.cu",
-    "cuda/linear/conv.cu",
-    "cuda/linear/draft.cu",
-    "cuda/linear/step.cu",
-    "cuda/linear/verify.cu",
     "cuda/moe.cu",
     "cuda/moe_mma.cu",
     "cuda/prelude.cu",
@@ -39,7 +33,13 @@ const KIR_SNIPPETS: &[&str] = &[
 ];
 
 
-const LIBRARY_ONLY: &[&str] = &["cuda/prelude.cu", "cuda/linear/common.cu", "cuda/gemm.cu"];
+const LIBRARY_ONLY: &[&str] = &["cuda/prelude.cu", "cuda/gemm.cu"];
+
+const VERBATIM_LINEAR: &[(&str, &str)] = &[
+    ("cuda/linear/common.rs", "device functions by design, shared by every linear family"),
+    ("cuda/linear/chunk_lib.rs", "mma split tile and fragment device functions by design"),
+    ("cuda/linear/chunk_prep.rs", "triangular solve and WY prep is verbatim text, to port onto tile prims (#794)"),
+];
 
 const VERBATIM_ATTENTION: &[(&str, &str)] = &[
     ("cuda/attention/rope.rs", "verbatim text, to port onto kir::rope (#791)"),
@@ -120,6 +120,29 @@ fn attention_builders_use_prims_unless_listed() {
     }
     assert!(seen >= 9);
     for (f, why) in VERBATIM_ATTENTION.iter().chain(PRIM_LIBRARY_ATTENTION) {
+        assert!(kir.join(f).exists() && !why.is_empty(), "stale allowlist entry {f}");
+    }
+}
+
+#[test]
+fn linear_builders_use_prims_unless_listed() {
+    let kir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kir/src");
+    let dir = kir.join("cuda/linear");
+    let mut seen = 0;
+    for e in std::fs::read_dir(&dir).unwrap() {
+        let path = e.unwrap().path();
+        if path.extension().is_none_or(|x| x != "rs") || path.file_name().is_some_and(|n| n == "prim.rs") {
+            continue;
+        }
+        seen += 1;
+        let rel = path.strip_prefix(&kir).unwrap().display().to_string();
+        let text = std::fs::read_to_string(&path).unwrap();
+        if !VERBATIM_LINEAR.iter().any(|(f, _)| *f == rel) {
+            assert!(text.contains("prim::") || text.contains("chunk_"), "{rel} is verbatim kernel text: build it from prims or list it with a reason");
+        }
+    }
+    assert!(seen >= 8);
+    for (f, why) in VERBATIM_LINEAR {
         assert!(kir.join(f).exists() && !why.is_empty(), "stale allowlist entry {f}");
     }
 }
