@@ -1,6 +1,6 @@
 use crate::codegen::{Module, cuda_target};
 use crate::jit::Jit;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::sys;
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
 use kir::allreduce::{AllReduceKernel, Dtype, MAX_BLOCKS, MAX_RANKS, Mode, allreduce_hash, flag_words};
@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub const ONE_SHOT_MAX_BYTES: usize = 1 << 20;
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+const PROBE_MAGIC: u32 = 0x6587_1a2b;
 const DEFAULT_BLOCKS: u32 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +53,7 @@ impl Drop for Owned {
         for r in [&self.data, &self.flags] {
             let _ = self.ctx.bind_to_thread();
             match r {
+                Region::Host(p) if p.is_null() => None,
                 Region::Host(p) => unsafe { cudarc::driver::result::free_host(*p).ok() },
                 Region::Device(p) => unsafe { sys::cuMemFree_v2(*p).result().ok() },
             };
@@ -130,6 +133,82 @@ pub fn iommu_mode(ctx: &Arc<CudaContext>) -> Option<String> {
     std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+fn distinct_contexts(ctxs: &[Arc<CudaContext>]) -> Vec<Arc<CudaContext>> {
+    let mut distinct: Vec<Arc<CudaContext>> = Vec::new();
+    for c in ctxs {
+        if !distinct.iter().any(|d| d.ordinal() == c.ordinal()) {
+            distinct.push(c.clone());
+        }
+    }
+    distinct
+}
+
+struct ProbeKernels {
+    _module: Arc<cudarc::driver::CudaModule>,
+    wait: CudaFunction,
+    store: CudaFunction,
+}
+
+fn probe_kernels(ctx: &Arc<CudaContext>) -> Result<ProbeKernels> {
+    let (major, minor) = ctx.compute_capability()?;
+    let arch: &'static str = Box::leak(format!("compute_{major}{minor}").into_boxed_str());
+    let opts = cudarc::nvrtc::CompileOptions { arch: Some(arch), options: vec!["--std=c++17".into()], ..Default::default() };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(kir::cuda::emit_peer_probe(), opts).map_err(|e| anyhow::anyhow!("nvrtc peer probe: {e:?}"))?;
+    let module = ctx.load_module(ptx)?;
+    Ok(ProbeKernels { wait: module.load_function(kir::cuda::PROBE_WAIT)?, store: module.load_function(kir::cuda::PROBE_STORE)?, _module: module })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Landed,
+    TimedOut,
+}
+
+pub fn probe_pair(from: &Arc<CudaContext>, to: &Arc<CudaContext>, timeout: std::time::Duration, write: bool) -> Result<ProbeOutcome> {
+    let (pf, pt) = (probe_kernels(from)?, probe_kernels(to)?);
+    let (sf, st) = (from.new_stream()?, to.new_stream()?);
+    let (region, words) = device_region(to, 8)?;
+    let (flag, result) = (words, words + 4);
+    let launched = (|| -> Result<ProbeOutcome> {
+        let (magic, ns) = (PROBE_MAGIC, timeout.as_nanos() as u64);
+        let one = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
+        let mut b = st.launch_builder(&pt.wait);
+        b.arg(&flag).arg(&magic).arg(&ns).arg(&result);
+        unsafe { b.launch(one) }?;
+        if write {
+            let mut b = sf.launch_builder(&pf.store);
+            b.arg(&flag).arg(&magic);
+            unsafe { b.launch(one) }?;
+        }
+        st.synchronize()?;
+        sf.synchronize()?;
+        let mut got = 0u32;
+        to.bind_to_thread()?;
+        unsafe { sys::cuMemcpyDtoH_v2(&mut got as *mut u32 as *mut std::ffi::c_void, result, 4).result()? };
+        Ok(if got == 1 { ProbeOutcome::Landed } else { ProbeOutcome::TimedOut })
+    })();
+    drop(Owned { ctx: to.clone(), data: region, flags: Region::Host(std::ptr::null_mut()) });
+    launched
+}
+
+pub fn peer_writes_land(ctxs: &[Arc<CudaContext>], timeout: std::time::Duration, write: bool) -> Result<Vec<(usize, usize, ProbeOutcome)>> {
+    let distinct = distinct_contexts(ctxs);
+    let mut out = Vec::new();
+    for a in &distinct {
+        for b in &distinct {
+            if a.ordinal() != b.ordinal() || distinct.len() == 1 {
+                let outcome = probe_pair(a, b, timeout, write).with_context(|| format!("peer write probe gpu{} to gpu{} faulted; force the host-pinned transport on this machine", a.ordinal(), b.ordinal()))?;
+                out.push((a.ordinal(), b.ordinal(), outcome));
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn settle(candidate: Transport, probes: &[(usize, usize, ProbeOutcome)]) -> Transport {
+    if candidate == Transport::HostPinned || probes.iter().all(|p| p.2 == ProbeOutcome::Landed) { candidate } else { Transport::HostPinned }
+}
+
 pub fn contexts(devices: &[usize]) -> Result<Vec<Arc<CudaContext>>> {
     let mut ctxs: Vec<Arc<CudaContext>> = Vec::new();
     for &d in devices {
@@ -143,6 +222,10 @@ pub fn contexts(devices: &[usize]) -> Result<Vec<Arc<CudaContext>>> {
 
 impl Fabric {
     pub fn new(ctxs: &[Arc<CudaContext>], capacity_bytes: usize, force: Option<Transport>) -> Result<Fabric> {
+        Self::with_probe(ctxs, capacity_bytes, force, |c| peer_writes_land(c, PROBE_TIMEOUT, true))
+    }
+
+    pub fn with_probe(ctxs: &[Arc<CudaContext>], capacity_bytes: usize, force: Option<Transport>, probe: impl FnOnce(&[Arc<CudaContext>]) -> Result<Vec<(usize, usize, ProbeOutcome)>>) -> Result<Fabric> {
         let n = ctxs.len();
         ensure!(n >= 2 && n <= MAX_RANKS as usize, "an allreduce group needs 2..={MAX_RANKS} ranks, got {n}");
         ensure!(capacity_bytes > 0, "empty allreduce buffer");
@@ -160,13 +243,16 @@ impl Fabric {
             }
         }
         if transport == Transport::Peer {
-            let mut distinct: Vec<Arc<CudaContext>> = Vec::new();
-            for c in ctxs {
-                if !distinct.iter().any(|d| d.ordinal() == c.ordinal()) {
-                    distinct.push(c.clone());
-                }
+            enable_peers(&distinct_contexts(ctxs))?;
+        }
+        if force.is_none() && transport != Transport::HostPinned {
+            let probes = probe(ctxs)?;
+            let settled = settle(transport, &probes);
+            if settled != transport {
+                let missed: Vec<(usize, usize)> = probes.iter().filter(|p| p.2 != ProbeOutcome::Landed).map(|p| (p.0, p.1)).collect();
+                tracing::warn!(pairs = ?missed, timeout_ms = PROBE_TIMEOUT.as_millis() as u64, "a kernel store to a peer GPU did not arrive, so the allreduce goes through pinned host memory");
             }
-            enable_peers(&distinct)?;
+            transport = settled;
         }
         let flag_bytes = flag_words() * 4;
         let (mut owned, mut data, mut flags) = (Vec::new(), Vec::new(), Vec::new());
@@ -350,6 +436,16 @@ mod tests {
         assert!(iommu_translates("DMA"));
         assert!(!iommu_translates("identity"));
         assert!(!iommu_translates("blocked"));
+    }
+
+    #[test]
+    fn one_missing_peer_write_sends_the_group_through_host_memory() {
+        let ok = (0, 1, ProbeOutcome::Landed);
+        let lost = (1, 0, ProbeOutcome::TimedOut);
+        assert_eq!(settle(Transport::Peer, &[ok, ok]), Transport::Peer);
+        assert_eq!(settle(Transport::Peer, &[ok, lost]), Transport::HostPinned);
+        assert_eq!(settle(Transport::SameDevice, &[lost]), Transport::HostPinned);
+        assert_eq!(settle(Transport::HostPinned, &[ok]), Transport::HostPinned);
     }
 
     #[test]

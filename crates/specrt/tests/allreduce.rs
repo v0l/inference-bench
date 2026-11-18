@@ -1,6 +1,6 @@
 use cudarc::driver::{CudaSlice, CudaStream};
 use kir::allreduce::Dtype;
-use specrt::allreduce::{Comm, Fabric, Transport, contexts};
+use specrt::allreduce::{Comm, Fabric, PROBE_TIMEOUT, ProbeOutcome, Transport, contexts, peer_writes_land};
 use std::sync::Arc;
 
 struct Rng(u64);
@@ -211,12 +211,32 @@ fn the_fused_add_rmsnorm_sums_exactly_and_normalises() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_peer_write_that_never_lands_falls_back_to_host_memory_within_the_timeout() {
+    let d = gpu_ordinal();
+    let ctxs = contexts(&[d, d]).unwrap();
+    let landed = peer_writes_land(&ctxs, PROBE_TIMEOUT, true).unwrap();
+    assert!(landed.iter().all(|p| p.2 == ProbeOutcome::Landed), "{landed:?}");
+    let started = std::time::Instant::now();
+    let fabric = Fabric::with_probe(&ctxs, 1 << 20, None, |c| peer_writes_land(c, PROBE_TIMEOUT, false)).unwrap();
+    let waited = started.elapsed();
+    eprintln!("dropped peer write: transport {:?} after {waited:?}", fabric.transport());
+    assert_eq!(fabric.transport(), Transport::HostPinned);
+    assert!(waited < std::time::Duration::from_secs(2), "the probe took {waited:?}");
+    let trusted = Fabric::with_probe(&ctxs, 1 << 20, None, |c| peer_writes_land(c, PROBE_TIMEOUT, true)).unwrap();
+    assert_eq!(trusted.transport(), Transport::SameDevice);
+    drop((fabric, trusted));
+    run(&[d, d], Some(Transport::HostPinned), Dtype::Bf16, 64 * 1024, 77);
+}
+
+#[test]
 #[ignore = "needs two CUDA GPUs and the user's GPU 0 free"]
 fn two_gpu_transport_report() {
     let ctxs = contexts(&[0, 1]).unwrap();
     for c in &ctxs {
         eprintln!("gpu{} iommu group type: {:?}", c.ordinal(), specrt::allreduce::iommu_mode(c));
     }
+    eprintln!("peer writes: {:?}", peer_writes_land(&ctxs, PROBE_TIMEOUT, true).unwrap());
     let f = Fabric::new(&ctxs, 1 << 20, None).unwrap();
     eprintln!("auto transport for gpu0+gpu1: {:?}", f.transport());
 }

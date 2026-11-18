@@ -18,6 +18,14 @@ fn emit(t: &Target, ranks: u32, dtype: Dtype, mode: Mode) -> String {
 }
 
 #[test]
+fn the_peer_probe_waits_on_a_system_flag_with_a_timer() {
+    let src = kir::cuda::emit_peer_probe();
+    golden("peer_probe.cu", &src);
+    assert!(src.contains("%globaltimer") && src.contains("ld.acquire.sys") && src.contains("st.release.sys"));
+    assert!(src.contains(kir::cuda::PROBE_WAIT) && src.contains(kir::cuda::PROBE_STORE));
+}
+
+#[test]
 fn allreduce_goldens_per_mode_dtype_and_target() {
     for (tag, t) in [("sm120", Target::sm_120()), ("sm80", Target::sm_80())] {
         for dtype in [Dtype::F32, Dtype::Bf16] {

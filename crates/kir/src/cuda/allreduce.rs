@@ -110,6 +110,20 @@ fn add_rmsnorm(k: &AllReduceKernel, width: u32, eps: f32) -> String {
     s
 }
 
+pub const PROBE_WAIT: &str = "ar_probe_wait";
+pub const PROBE_STORE: &str = "ar_probe_store";
+
+pub fn emit_peer_probe() -> String {
+    let mut s = String::from("typedef unsigned short bf16_t;\n\n");
+    s += &prim::flag_ops();
+    s += &prim::global_timer();
+    s += &header(1, PROBE_WAIT, "const unsigned* flag, unsigned magic, unsigned long long timeout_ns, unsigned* result");
+    s += "    unsigned long long start = ar_now_ns();\n    while (ar_load_acquire(flag) != magic) {\n        if (ar_now_ns() - start > timeout_ns) {\n            *result = 2;\n            return;\n        }\n    }\n    *result = 1;\n}\n\n";
+    s += &header(1, PROBE_STORE, "unsigned* flag, unsigned magic");
+    s += "    __threadfence_system();\n    ar_store_release(flag, magic);\n}\n\n";
+    s
+}
+
 pub fn emit_allreduce(kernels: &[AllReduceKernel]) -> Result<String, AllReduceError> {
     let Some(first) = kernels.first() else { return Ok(String::new()) };
     for k in kernels {

@@ -38,9 +38,17 @@ pub fn split_planes() -> String {
     )
 }
 
-pub fn system_flags() -> String {
+pub fn flag_ops() -> String {
     device("unsigned", "ar_load_acquire", "const unsigned* p", "    unsigned v;\n    asm volatile(\"ld.acquire.sys.global.u32 %0, [%1];\" : \"=r\"(v) : \"l\"(p) : \"memory\");\n    return v;\n")
         + &device("void", "ar_store_release", "unsigned* p, unsigned v", "    asm volatile(\"st.release.sys.global.u32 [%0], %1;\" :: \"l\"(p), \"r\"(v) : \"memory\");\n")
+}
+
+pub fn global_timer() -> String {
+    device("unsigned long long", "ar_now_ns", "", "    unsigned long long t;\n    asm volatile(\"mov.u64 %0, %globaltimer;\" : \"=l\"(t));\n    return t;\n")
+}
+
+pub fn system_flags() -> String {
+    flag_ops()
         + &device("unsigned*", "ar_flags", "const unsigned long long* table, int rank", "    return (unsigned*)table[AR_RANKS + rank];\n")
 }
 

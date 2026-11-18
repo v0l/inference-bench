@@ -8,7 +8,7 @@ mod vision;
 mod ops;
 mod moe;
 
-pub use allreduce::emit_allreduce;
+pub use allreduce::{PROBE_STORE, PROBE_WAIT, emit_allreduce, emit_peer_probe};
 pub use attention::emit_attention;
 pub use linear::emit_linear;
 pub use ggml::emit_ggml;
