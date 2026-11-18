@@ -1,6 +1,6 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
 // linear GdnChunk threads=256 smem=50176 chunk=64 ksplit=4 cols=16
-//   LinearShape { key_heads: 16, value_heads: 48, head_dim: 128, conv_kernel: 4 }
+//   LinearShape { key_heads: 16, value_heads: 48, head_dim: 128, conv_kernel: 4, tiled_value_heads: false }
 constexpr int LA_KH = 16;
 constexpr int LA_VH = 48;
 constexpr int LA_D = 128;
@@ -16,6 +16,10 @@ constexpr int LA_Z_OFF = LA_CONV_DIM;
 constexpr int LA_B_OFF = 0;
 constexpr int LA_A_OFF = LA_VH;
 constexpr int LA_STATE = LA_D * LA_D;
+constexpr bool LA_TILED = false;
+__device__ __forceinline__ int la_kh(int h) {
+    return LA_TILED ? h % LA_KH : h / LA_RATIO;
+}
 constexpr int LA_CHUNK = 64;
 constexpr int LA_KSPLIT = 4;
 constexpr int LA_KS = LA_D + 1;
@@ -119,7 +123,7 @@ extern "C" __global__ void __launch_bounds__(256) gdn_chunk_prep(const float* qn
     float* gs = A + C * LA_AS;
     float* bs = gs + C;
     int h = blockIdx.x;
-    int kh = h / LA_RATIO;
+    int kh = la_kh(h);
     int c = blockIdx.y;
     int t0 = c * C;
     int tid = threadIdx.x;

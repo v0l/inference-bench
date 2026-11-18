@@ -1,6 +1,6 @@
 // target Cuda cc=8.0 sms=108 warp=32 threads=1024 smem=166912 graphs=true pdl=false features=[WarpShuffle,CpAsync,Mma16816,ShaderF16]
 // linear MtpDraft threads=256 smem=0 chunk=64 ksplit=4 cols=16
-//   LinearShape { key_heads: 16, value_heads: 48, head_dim: 128, conv_kernel: 4 }
+//   LinearShape { key_heads: 16, value_heads: 48, head_dim: 128, conv_kernel: 4, tiled_value_heads: false }
 extern "C" __global__ void mtp_fc_in(const bf16_t* table, const int* tokens, const float* xsrc, const float* psrc,
                                      const int* hidx, const float* pre, const float* ne, const float* nh, bf16_t* hi,
                                      bf16_t* lo) {

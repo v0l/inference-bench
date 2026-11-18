@@ -27,7 +27,11 @@ fn kir_linear_kernels_equal_the_pre_kir_template_text_for_the_27b_fixture() {
     let spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b.toml")).unwrap();
     let module = Module::generate_kv(&spec, 4096, 1, &kir::Target::sm_120()).unwrap();
     let got: BTreeSet<String> = blocks(&module.source).into_iter().filter(|b| linear_related(b)).collect();
-    let want: BTreeSet<String> = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/master_linear_27b.txt"))
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/master_linear_27b.txt");
+    if std::env::var_os("KIR_BLESS").is_some() {
+        std::fs::write(&golden, got.iter().map(|b| format!("{b}\n")).collect::<String>()).unwrap();
+    }
+    let want: BTreeSet<String> = std::fs::read_to_string(&golden)
         .unwrap()
         .lines()
         .map(str::to_string)
