@@ -56,15 +56,6 @@ pub fn window_store(n: usize, from: &str) -> String {
     unroll(n, WINDOW_TAPS, &format!("s[j] = {from};"))
 }
 
-pub fn conv_thread(n: usize, z: Option<&str>) -> String {
-    let mut s = String::from("int c = blockIdx.x * blockDim.x + threadIdx.x;\n");
-    match z {
-        Some(axis) => s.push_str(&format!("int {axis};\n")),
-        None => {}
-    }
-    at(n, &s)
-}
-
 pub fn history_gather(n: usize, dst: &str, count: &str, upto: &str) -> String {
     unroll_block(
         n,
@@ -121,13 +112,11 @@ pub fn memory_read(n: usize, decayed: &str, value: &str) -> String {
     );
     o += &at(
         n,
-        &format!(
-            "part[ks][v] = acc;
+        "part[ks][v] = acc;
 __syncthreads();
-if (ks == 0) {{
+if (ks == 0) {
     float mem = 0.0f;
-"
-        ),
+",
     );
     o += &unroll(n + 4, "int j = 0; j < LA_KSPLIT; j++", "mem += part[j][v];");
     o += &at(n, &format!("    delta_s[v] = ({value} - mem) * beta;\n}}\n__syncthreads();\n"));
@@ -154,14 +143,6 @@ if (ks == 0) {dst} = norm_w[v] * (o * inv) * silu({z});
         ),
     );
     o
-}
-
-pub fn lane_ids(n: usize, g: &str, t: &str) -> String {
-    at(n, &format!("int {g} = lane >> 2;\nint {t} = lane & 3;\n"))
-}
-
-pub fn zero_acc(n: usize, headers: &[&str], target: &str) -> String {
-    nest(n, headers, &format!("{target} = 0.0f;"))
 }
 
 pub fn block_argmax_tree(n: usize) -> String {

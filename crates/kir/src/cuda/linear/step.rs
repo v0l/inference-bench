@@ -1,4 +1,4 @@
-use super::prim::{self, at, delta_update, gate, gated_output, load_state, memory_read, qk_norm};
+use super::prim::{self, at, delta_update, gate, gated_output, memory_read, qk_norm};
 
 pub fn body() -> String {
     let mut o = String::new();
