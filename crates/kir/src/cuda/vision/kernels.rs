@@ -1,19 +1,27 @@
 use super::prim::{self, fill};
-use crate::cuda::attention::prim::{self as attn, Reduce};
+use crate::cuda::attention::prim::{self as attn, Scores};
 use crate::vision::VisionKernel;
 
 fn slots(k: &VisionKernel) -> Vec<(&'static str, String)> {
+    let scores = Scores {
+        neg: "NEG",
+        binds: "                bool ok = e < 2 ? (key >= lo0 && key < hi0) : (key >= lo1 && key < hi1);\n",
+        live: "ok",
+        score: "s[nb][e] * scale_log2",
+    };
     vec![
+        ("LOAD_STAGE", prim::gemm_load_stage()),
+        ("MAINLOOP", prim::gemm_mainloop()),
         ("GM_CONSTS", prim::gemm_consts()),
         ("AT_CONSTS", prim::attention_consts(k.precise)),
         ("ZERO_ACC", prim::zero_tiles("    ", "acc", &["GM_MI", "GM_NJ", "4"])),
         ("ZERO_O", prim::zero_tiles("    ", "o", &["AT_NB", "4"])),
-        ("ZERO_S", prim::zero_tiles("        ", "s", &["SB", "4"])),
-        ("QUAD_MAX", ["mx0", "mx1"].iter().map(|v| attn::xor_reduce(Reduce::Max, v, &[1, 2])).collect()),
-        ("QUAD_SUM", ["sum0", "sum1"].iter().map(|v| attn::xor_reduce(Reduce::Sum, v, &[1, 2])).collect()),
+        ("ZERO_S", attn::zero_scores().replace("        float s[SB][4];\n", "")),
+        ("QK", prim::qk_scores()),
+        ("SOFTMAX", attn::online_softmax_with(&scores)),
         ("RESCALE", attn::rescale_acc("i", "AT_NB")),
-        ("PACK_PROBS", prim::pack_probs()),
-        ("EXP_SUM", prim::exp_sum()),
+        ("PACK_PROBS", format!("{}{}", attn::pack_rows("            ", "ph", "pack_f16_hi"), attn::pack_rows("            ", "pl", "pack_f16_lo"))),
+        ("PV", prim::pv_accumulate()),
         ("INV_L", prim::inv_l()),
     ]
 }
@@ -41,33 +49,7 @@ extern "C" __global__ void __launch_bounds__(GM_THREADS) vis_mma(const bf16_t* a
     int n0 = blockIdx.x * GM_BN;
     int kt_count = (K + GM_BK - 1) / GM_BK;
     float acc[GM_MI][GM_NJ][4];
-@ZERO_ACC@    auto load_stage = [&](int buf, int kt) {
-        unsigned char* base = gm_smem + buf * GM_STAGE_BYTES;
-#pragma unroll
-        for (int i = 0; i < (GM_PLANES * GM_BM * GM_CPR) / GM_THREADS; i++) {
-            int idx = tid + i * GM_THREADS;
-            int p = idx / (GM_BM * GM_CPR);
-            int rem = idx % (GM_BM * GM_CPR);
-            int r = rem / GM_CPR;
-            int c = rem % GM_CPR;
-            int m = m0 + r;
-            int k = kt * GM_BK + c * 8;
-            const bf16_t* src = (p ? a_lo : a_hi) + (size_t)min(m, M - 1) * K + min(k, K - 8);
-            cp_async16_zfill(base + p * GM_A_TILE * 2 + gswz(r, c) * 16, src, m < M && k < K);
-        }
-        unsigned char* ws = base + GM_A_BYTES;
-#pragma unroll
-        for (int i = 0; i < (GM_BN * GM_CPR) / GM_THREADS; i++) {
-            int idx = tid + i * GM_THREADS;
-            int r = idx / GM_CPR;
-            int c = idx % GM_CPR;
-            int n = n0 + r;
-            int k = kt * GM_BK + c * 8;
-            const bf16_t* src = w + (size_t)min(n, N - 1) * K + min(k, K - 8);
-            cp_async16_zfill(ws + gswz(r, c) * 16, src, n < N && k < K);
-        }
-    };
-#pragma unroll
+@ZERO_ACC@@LOAD_STAGE@#pragma unroll
     for (int st = 0; st < GM_STAGES - 1; st++) {
         if (st < kt_count) load_stage(st, st);
         cp_async_commit();
@@ -82,37 +64,7 @@ extern "C" __global__ void __launch_bounds__(GM_THREADS) vis_mma(const bf16_t* a
         const bf16_t* sa_hi = (const bf16_t*)base;
         const bf16_t* sa_lo = sa_hi + GM_A_TILE;
         const unsigned char* ws = base + GM_A_BYTES;
-#pragma unroll
-        for (int ks = 0; ks < GM_BK / 16; ks++) {
-            unsigned bw[GM_NJ][2];
-#pragma unroll
-            for (int jp = 0; jp < GM_NJ / 2; jp++) {
-                unsigned r[4];
-                int row = wn * GM_TN + jp * 16 + (lane >> 4) * 8 + (lane & 7);
-                ldsm_x4(r, ws + gswz(row, ks * 2 + ((lane >> 3) & 1)) * 16);
-                bw[2 * jp][0] = r[0];
-                bw[2 * jp][1] = r[1];
-                bw[2 * jp + 1][0] = r[2];
-                bw[2 * jp + 1][1] = r[3];
-            }
-#pragma unroll
-            for (int i = 0; i < GM_MI; i++) {
-                unsigned ah[4], al[4];
-                int row = wm * GM_TM + i * 16 + (lane & 15);
-                int at = gswz(row, ks * 2 + (lane >> 4)) * 8;
-                ldsm_x4(ah, &sa_hi[at]);
-                if (GEMM_SPLIT) ldsm_x4(al, &sa_lo[at]);
-#pragma unroll
-                for (int j = 0; j < GM_NJ; j++) {
-                    if (GEMM_SPLIT) {
-                        mma_bf16(acc[i][j], al, bw[j][0], bw[j][1]);
-                        mma_bf16(acc[i][j], ah, bw[j][0], bw[j][1]);
-                    } else {
-                        mma_f16(acc[i][j], ah, bw[j][0], bw[j][1]);
-                    }
-                }
-            }
-        }
+@MAINLOOP@        }
     }
     cp_async_wait<0>();
 #pragma unroll
@@ -327,61 +279,10 @@ extern "C" __global__ void __launch_bounds__(32 * AT_WARPS) vis_flash(const bf16
         const bf16_t* vl = vh + AT_TILE;
         constexpr int SB = AT_BK / 8;
         float s[SB][4];
-@ZERO_S@#pragma unroll
-        for (int np = 0; np < SB / 2; np++)
-#pragma unroll
-            for (int kb = 0; kb < AT_KB; kb++) {
-                unsigned bh[4], bl[4];
-                int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
-                int at = kr * AT_STRIDE + kb * 16 + ((lane >> 3) & 1) * 8;
-                ldsm_x4(bh, kh + at);
-                if (ATT_SPLIT) {
-                    ldsm_x4(bl, kl + at);
-                    mma_f16_hi_lo(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
-                    mma_f16_hi_lo(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
-                } else {
-                    mma_f16(s[2 * np], qh[kb], bh[0], bh[1]);
-                    mma_f16(s[2 * np + 1], qh[kb], bh[2], bh[3]);
-                }
-            }
-        float mx0 = NEG, mx1 = NEG;
-#pragma unroll
-        for (int nb = 0; nb < SB; nb++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                int key = k0 + nb * 8 + 2 * t + (e & 1);
-                bool ok = e < 2 ? (key >= lo0 && key < hi0) : (key >= lo1 && key < hi1);
-                float v = ok ? s[nb][e] * scale_log2 : NEG;
-                s[nb][e] = v;
-                if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
-            }
-@QUAD_MAX@        float n0 = fmaxf(m0, mx0);
-        float n1 = fmaxf(m1, mx1);
-        float a0 = m0 == NEG ? 0.0f : fast_exp2(m0 - n0);
-        float a1 = m1 == NEG ? 0.0f : fast_exp2(m1 - n1);
-@EXP_SUM@@QUAD_SUM@        l0 = l0 * a0 + sum0;
-        l1 = l1 * a1 + sum1;
-        m0 = n0;
-        m1 = n1;
-@RESCALE@#pragma unroll
+@ZERO_S@@QK@@SOFTMAX@@RESCALE@#pragma unroll
         for (int kb = 0; kb < SB / 2; kb++) {
             unsigned ph[4], pl[4];
-@PACK_PROBS@#pragma unroll
-            for (int np = 0; np < AT_NB / 2; np++) {
-                unsigned bh[4], bl[4];
-                int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-                int at = kr * AT_STRIDE + np * 16 + (lane >> 4) * 8;
-                ldsm_x4_t(bh, vh + at);
-                if (ATT_SPLIT) {
-                    ldsm_x4_t(bl, vl + at);
-                    mma_f16_hi_lo(o[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
-                    mma_f16_hi_lo(o[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
-                } else {
-                    mma_f16(o[2 * np], ph, bh[0], bh[1]);
-                    mma_f16(o[2 * np + 1], ph, bh[2], bh[3]);
-                }
-            }
-        }
+@PACK_PROBS@@PV@        }
         __syncthreads();
     }
 @INV_L@    size_t width = (size_t)heads * head_dim;

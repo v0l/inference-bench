@@ -464,9 +464,38 @@ fn kir_kernels_follow_the_target() {
     assert_ne!(kir::module_hash(&tree), kir::module_hash(&sub));
 }
 
+const VERBATIM_VISION: &[(&str, &str)] = &[
+    ("vis_rope_pack", "verbatim text, to port onto kir::rope (#792)"),
+    ("vis_layernorm", "verbatim text, to port onto the block reduction prims (#792)"),
+    ("vis_pool", "verbatim text, to port onto the block reduction prims (#792)"),
+    ("vis_pos", "verbatim text, to port onto a gather prim (#792)"),
+    ("vis_split", "verbatim text, to port onto the split store prim (#792)"),
+    ("vis_to_f16", "one-line elementwise kernel in prim.rs (#792)"),
+];
+
+const PRIM_VISION: &[(&str, &[&str])] = &[("vis_mma", &["@LOAD_STAGE@", "@MAINLOOP@"]), ("vis_flash", &["@QK@", "@SOFTMAX@", "@PV@", "@PACK_PROBS@"])];
+
 #[test]
-fn vision_builders_use_prims() {
-    let kir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kir/src/cuda/vision");
-    let text = std::fs::read_to_string(kir.join("kernels.rs")).unwrap();
-    assert!(text.contains("prim::") && text.contains("attn::xor_reduce") && text.contains("attn::rescale_acc"), "vision builders must call the shared prims");
+fn vision_builders_use_prims_unless_listed() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kir/src/cuda/vision");
+    let text = std::fs::read_to_string(dir.join("kernels.rs")).unwrap();
+    let prim = std::fs::read_to_string(dir.join("prim.rs")).unwrap();
+    assert!(text.contains("attn::zero_scores") && text.contains("attn::rescale_acc") && text.contains("attn::pack_rows") && text.contains("attn::online_softmax_with"), "vision builders must call the shared attention prims");
+    let all = format!("{text}{prim}");
+    let mut found = Vec::new();
+    for line in all.lines() {
+        if let Some(rest) = line.split("__global__ void ").nth(1) {
+            let rest = rest.strip_prefix("__launch_bounds__(GM_THREADS) ").or_else(|| rest.strip_prefix("__launch_bounds__(32 * AT_WARPS) ")).unwrap_or(rest);
+            found.push(rest.split('(').next().unwrap().to_string());
+        }
+    }
+    assert!(found.len() >= 8, "{found:?}");
+    for name in &found {
+        let listed = VERBATIM_VISION.iter().any(|(n, _)| n == name);
+        let prim_built = PRIM_VISION.iter().find(|(n, _)| n == name).is_some_and(|(_, slots)| slots.iter().all(|s| text.contains(s)));
+        assert!(listed || prim_built, "{name} is verbatim kernel text: build it from prims or list it with a reason and issue");
+    }
+    for (n, why) in VERBATIM_VISION {
+        assert!(found.iter().any(|f| f == n) && why.contains('#'), "stale allowlist entry {n}");
+    }
 }

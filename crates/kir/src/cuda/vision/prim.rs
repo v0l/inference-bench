@@ -130,18 +130,48 @@ pub fn zero_tiles(indent: &str, name: &str, dims: &[&str]) -> String {
     s
 }
 
-pub fn pack_probs() -> String {
-    let mut s = String::new();
-    for (name, f) in [("ph", "pack_f16_hi"), ("pl", "pack_f16_lo")] {
-        for (i, (row, c)) in [("2 * kb", 0), ("2 * kb", 2), ("2 * kb + 1", 0), ("2 * kb + 1", 2)].iter().enumerate() {
-            let _ = writeln!(s, "            {name}[{i}] = {f}(s[{row}][{c}], s[{row}][{}]);", c + 1);
-        }
+fn split_branch(indent: &str, load_lo: &str, accs: [&str; 2], a_hi: &str, a_lo: &str) -> String {
+    let mut s = format!("{indent}if (ATT_SPLIT) {{\n{indent}    {load_lo}\n");
+    for (n, acc) in accs.iter().enumerate() {
+        let (b0, b1) = if n == 0 { (0, 1) } else { (2, 3) };
+        s += &format!("{indent}    mma_f16_hi_lo({acc}, {a_hi}, {a_lo}, bh[{b0}], bh[{b1}], bl[{b0}], bl[{b1}]);\n");
     }
-    s
+    s += &format!("{indent}}} else {{\n");
+    for (n, acc) in accs.iter().enumerate() {
+        let (b0, b1) = if n == 0 { (0, 1) } else { (2, 3) };
+        s += &format!("{indent}    mma_f16({acc}, {a_hi}, bh[{b0}], bh[{b1}]);\n");
+    }
+    s + &format!("{indent}}}\n")
 }
 
-pub fn exp_sum() -> String {
-    "        float sum0 = 0.0f, sum1 = 0.0f;\n#pragma unroll\n        for (int nb = 0; nb < SB; nb++)\n#pragma unroll\n            for (int e = 0; e < 4; e++) {\n                float nm = e < 2 ? n0 : n1;\n                float p = s[nb][e] == NEG ? 0.0f : fast_exp2(s[nb][e] - nm);\n                s[nb][e] = p;\n                if (e < 2) sum0 += p; else sum1 += p;\n            }\n".to_string()
+pub fn qk_scores() -> String {
+    format!(
+        "#pragma unroll
+        for (int np = 0; np < SB / 2; np++)
+#pragma unroll
+            for (int kb = 0; kb < AT_KB; kb++) {{
+                unsigned bh[4], bl[4];
+                int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
+                int at = kr * AT_STRIDE + kb * 16 + ((lane >> 3) & 1) * 8;
+                ldsm_x4(bh, kh + at);
+{branch}            }}
+",
+        branch = split_branch("                ", "ldsm_x4(bl, kl + at);", ["s[2 * np]", "s[2 * np + 1]"], "qh[kb]", "ql[kb]")
+    )
+}
+
+pub fn pv_accumulate() -> String {
+    format!(
+        "#pragma unroll
+            for (int np = 0; np < AT_NB / 2; np++) {{
+                unsigned bh[4], bl[4];
+                int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+                int at = kr * AT_STRIDE + np * 16 + (lane >> 4) * 8;
+                ldsm_x4_t(bh, vh + at);
+{branch}            }}
+",
+        branch = split_branch("                ", "ldsm_x4_t(bl, vl + at);", ["o[2 * np]", "o[2 * np + 1]"], "ph", "pl")
+    )
 }
 
 pub fn inv_l() -> String {
@@ -183,4 +213,65 @@ pub fn attention_consts(_precise: bool) -> String {
         ("AT_STAGE", "(ATT_SPLIT ? 4 : 2) * AT_TILE".into()),
     ];
     constexpr_ints(&ints)
+}
+
+fn tile_copy(count: &str, decl: &str, src: &str, dst: &str, valid: &str) -> String {
+    format!(
+        "#pragma unroll
+        for (int i = 0; i < {count}; i++) {{
+            int idx = tid + i * GM_THREADS;
+{decl}            int k = kt * GM_BK + c * 8;
+{src}            cp_async16_zfill({dst}, src, {valid});
+        }}
+"
+    )
+}
+
+pub fn gemm_load_stage() -> String {
+    let a = tile_copy(
+        "(GM_PLANES * GM_BM * GM_CPR) / GM_THREADS",
+        "            int p = idx / (GM_BM * GM_CPR);\n            int rem = idx % (GM_BM * GM_CPR);\n            int r = rem / GM_CPR;\n            int c = rem % GM_CPR;\n            int m = m0 + r;\n",
+        "            const bf16_t* src = (p ? a_lo : a_hi) + (size_t)min(m, M - 1) * K + min(k, K - 8);\n",
+        "base + p * GM_A_TILE * 2 + gswz(r, c) * 16",
+        "m < M && k < K",
+    );
+    let w = tile_copy(
+        "(GM_BN * GM_CPR) / GM_THREADS",
+        "            int r = idx / GM_CPR;\n            int c = idx % GM_CPR;\n            int n = n0 + r;\n",
+        "            const bf16_t* src = w + (size_t)min(n, N - 1) * K + min(k, K - 8);\n",
+        "ws + gswz(r, c) * 16",
+        "n < N && k < K",
+    );
+    format!("    auto load_stage = [&](int buf, int kt) {{\n        unsigned char* base = gm_smem + buf * GM_STAGE_BYTES;\n{a}        unsigned char* ws = base + GM_A_BYTES;\n{w}    }};\n")
+}
+
+pub fn gemm_mainloop() -> String {
+    let weights = "            unsigned bw[GM_NJ][2];
+#pragma unroll
+            for (int jp = 0; jp < GM_NJ / 2; jp++) {
+                unsigned r[4];
+                int row = wn * GM_TN + jp * 16 + (lane >> 4) * 8 + (lane & 7);
+                ldsm_x4(r, ws + gswz(row, ks * 2 + ((lane >> 3) & 1)) * 16);
+                bw[2 * jp][0] = r[0];
+                bw[2 * jp][1] = r[1];
+                bw[2 * jp + 1][0] = r[2];
+                bw[2 * jp + 1][1] = r[3];
+            }
+";
+    let acts = "                unsigned ah[4], al[4];
+                int row = wm * GM_TM + i * 16 + (lane & 15);
+                int at = gswz(row, ks * 2 + (lane >> 4)) * 8;
+                ldsm_x4(ah, &sa_hi[at]);
+                if (GEMM_SPLIT) ldsm_x4(al, &sa_lo[at]);
+#pragma unroll
+                for (int j = 0; j < GM_NJ; j++) {
+                    if (GEMM_SPLIT) {
+                        mma_bf16(acc[i][j], al, bw[j][0], bw[j][1]);
+                        mma_bf16(acc[i][j], ah, bw[j][0], bw[j][1]);
+                    } else {
+                        mma_f16(acc[i][j], ah, bw[j][0], bw[j][1]);
+                    }
+                }
+";
+    format!("#pragma unroll\n        for (int ks = 0; ks < GM_BK / 16; ks++) {{\n{weights}#pragma unroll\n            for (int i = 0; i < GM_MI; i++) {{\n{acts}            }}\n")
 }

@@ -12,50 +12,68 @@ pub fn zero_scores() -> &'static str {
 "
 }
 
+pub const SCORE_SOFTCAP: &str = "(SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2)";
+
+pub struct Scores<'a> {
+    pub neg: &'a str,
+    pub binds: &'a str,
+    pub live: &'a str,
+    pub score: &'a str,
+}
+
 pub fn online_softmax(mask: &Mask) -> String {
+    let binds = format!("                int {pos} = e < 2 ? pos0 : pos1;\n                bool live = {live};\n", pos = mask.pos, live = mask.live);
+    online_softmax_with(&Scores { neg: "NEG_INF", binds: &binds, live: "live", score: SCORE_SOFTCAP })
+}
+
+pub fn online_softmax_with(sc: &Scores) -> String {
     format!(
-        "        float mx0 = NEG_INF, mx1 = NEG_INF;
+        "        float mx0 = {neg}, mx1 = {neg};
 #pragma unroll
         for (int nb = 0; nb < SB; nb++)
 #pragma unroll
             for (int e = 0; e < 4; e++) {{
                 int key = k0 + nb * 8 + 2 * t + (e & 1);
-                int {pos} = e < 2 ? pos0 : pos1;
-                bool live = {live};
-                float v = live ? (SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2) : NEG_INF;
+{binds}                float v = {live} ? {score} : {neg};
                 s[nb][e] = v;
                 if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
             }}
 {reduce}",
-        pos = mask.pos,
-        live = mask.live,
-        reduce = softmax_update(),
+        neg = sc.neg,
+        binds = sc.binds,
+        live = sc.live,
+        score = sc.score,
+        reduce = softmax_update_with(sc.neg),
     )
 }
 
 pub fn softmax_update() -> String {
+    softmax_update_with("NEG_INF")
+}
+
+pub fn softmax_update_with(neg: &str) -> String {
     let quad_max = |m: &str| xor_reduce(Reduce::Max, m, &[1, 2]);
     let quad_sum = |m: &str| xor_reduce(Reduce::Sum, m, &[1, 2]);
     let mut o = String::new();
     o.push_str(&quad_max("mx0"));
     o.push_str(&quad_max("mx1"));
-    o.push_str(
+    o.push_str(&format!(
         "        float n0 = fmaxf(m0, mx0);
         float n1 = fmaxf(m1, mx1);
-        float a0 = m0 == NEG_INF ? 0.0f : fast_exp2(m0 - n0);
-        float a1 = m1 == NEG_INF ? 0.0f : fast_exp2(m1 - n1);
+        float a0 = m0 == {neg} ? 0.0f : fast_exp2(m0 - n0);
+        float a1 = m1 == {neg} ? 0.0f : fast_exp2(m1 - n1);
         float sum0 = 0.0f, sum1 = 0.0f;
 #pragma unroll
         for (int nb = 0; nb < SB; nb++)
 #pragma unroll
-            for (int e = 0; e < 4; e++) {
+            for (int e = 0; e < 4; e++) {{
                 float nm = e < 2 ? n0 : n1;
-                float p = s[nb][e] == NEG_INF ? 0.0f : fast_exp2(s[nb][e] - nm);
+                float p = s[nb][e] == {neg} ? 0.0f : fast_exp2(s[nb][e] - nm);
                 s[nb][e] = p;
                 if (e < 2) sum0 += p; else sum1 += p;
-            }
-",
-    );
+            }}
+"
+    ));
     o.push_str(&quad_sum("sum0"));
     o.push_str(&quad_sum("sum1"));
     o.push_str("        l0 = l0 * a0 + sum0;\n        l1 = l1 * a1 + sum1;\n        m0 = n0;\n        m1 = n1;\n");
@@ -76,20 +94,17 @@ pub fn rescale_acc(var: &str, blocks: &str) -> String {
 }
 
 pub fn pack_probs(low_plane: &str) -> String {
-    format!(
-        "            unsigned ph[4], pl[4];
-            ph[0] = pack_hi(s[2 * kb][0], s[2 * kb][1]);
-            ph[1] = pack_hi(s[2 * kb][2], s[2 * kb][3]);
-            ph[2] = pack_hi(s[2 * kb + 1][0], s[2 * kb + 1][1]);
-            ph[3] = pack_hi(s[2 * kb + 1][2], s[2 * kb + 1][3]);
-            if ({low_plane}) {{
-                pl[0] = pack_lo(s[2 * kb][0], s[2 * kb][1]);
-                pl[1] = pack_lo(s[2 * kb][2], s[2 * kb][3]);
-                pl[2] = pack_lo(s[2 * kb + 1][0], s[2 * kb + 1][1]);
-                pl[3] = pack_lo(s[2 * kb + 1][2], s[2 * kb + 1][3]);
-            }}
-"
-    )
+    let hi = pack_rows("            ", "ph", "pack_hi");
+    let lo = pack_rows("                ", "pl", "pack_lo");
+    format!("            unsigned ph[4], pl[4];\n{hi}            if ({low_plane}) {{\n{lo}            }}\n")
+}
+
+pub fn pack_rows(indent: &str, dst: &str, f: &str) -> String {
+    let mut s = String::new();
+    for (i, (row, c)) in [("2 * kb", 0), ("2 * kb", 2), ("2 * kb + 1", 0), ("2 * kb + 1", 2)].iter().enumerate() {
+        s.push_str(&format!("{indent}{dst}[{i}] = {f}(s[{row}][{c}], s[{row}][{}]);\n", c + 1));
+    }
+    s
 }
 
 pub struct TileLoad<'a> {
