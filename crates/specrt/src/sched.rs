@@ -2542,6 +2542,21 @@ mod tests {
     }
 
     #[test]
+    fn running_never_exceeds_max_num_seqs_even_when_the_executor_has_more_slots() {
+        let mut s = Scheduler::new(Fake::new(1024, 42, 400, 512), Config { max_num_seqs: 21, ..Config::default() });
+        for q in 0..42 {
+            s.submit(request(20, 30, q)).unwrap();
+        }
+        let mut peak = 0;
+        while !s.idle() {
+            let mut events = Vec::new();
+            s.step(&mut events).unwrap();
+            peak = peak.max(s.running());
+        }
+        assert_eq!(peak, 21);
+    }
+
+    #[test]
     fn admission_stops_cleanly_when_no_recurrent_state_can_be_allocated() {
         let mut fake = Fake::new(1024, 8, 400, 512);
         fake.state_budget = 2;

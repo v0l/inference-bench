@@ -10,20 +10,19 @@ pub struct Sample {
 }
 
 fn value(text: &str, names: &[&str]) -> Option<f64> {
-    let mut total: Option<f64> = None;
-    for line in text.lines().filter(|l| !l.starts_with('#')) {
-        let (key, v) = match line.rsplit_once(' ') {
-            Some(kv) => kv,
-            None => continue,
-        };
-        let name = key.split('{').next().unwrap_or(key);
-        if names.contains(&name)
-            && let Ok(v) = v.trim().parse::<f64>()
-        {
-            *total.get_or_insert(0.0) += v;
+    names.iter().find_map(|wanted| {
+        let mut total: Option<f64> = None;
+        for line in text.lines().filter(|l| !l.starts_with('#')) {
+            let Some((key, v)) = line.rsplit_once(' ') else { continue };
+            let name = key.split('{').next().unwrap_or(key);
+            if name == *wanted
+                && let Ok(v) = v.trim().parse::<f64>()
+            {
+                *total.get_or_insert(0.0) += v;
+            }
         }
-    }
-    total
+        total
+    })
 }
 
 pub fn scrape(text: &str, at: f64) -> Sample {
@@ -52,5 +51,18 @@ mod tests {
         let vllm = "# HELP x\nvllm:kv_cache_usage_perc{engine=\"0\",model_name=\"m\"} 0.37\nvllm:num_requests_running{engine=\"0\"} 9.0\nvllm:num_preemptions_total{engine=\"0\"} 3.0\n";
         let s = scrape(vllm, 0.0);
         assert_eq!((s.kv_use, s.running, s.preemptions, s.waiting), (Some(0.37), Some(9.0), Some(3.0), None));
+    }
+
+    #[test]
+    fn a_server_exposing_both_metric_families_is_not_counted_twice() {
+        let both = "inference_running_seqs 21\ninference_waiting_seqs 3\ninference_preemptions_total 2\nvllm:num_requests_running{engine=\"0\",model_name=\"m\"} 21\nvllm:num_requests_waiting{engine=\"0\",model_name=\"m\"} 3\nvllm:num_preemptions_total{engine=\"0\",model_name=\"m\"} 2\n";
+        let s = scrape(both, 0.0);
+        assert_eq!((s.running, s.waiting, s.preemptions), (Some(21.0), Some(3.0), Some(2.0)));
+    }
+
+    #[test]
+    fn labelled_series_of_one_metric_still_add_up() {
+        let two = "inference_running_seqs{model=\"a\"} 4\ninference_running_seqs{model=\"b\"} 5\n";
+        assert_eq!(scrape(two, 0.0).running, Some(9.0));
     }
 }
