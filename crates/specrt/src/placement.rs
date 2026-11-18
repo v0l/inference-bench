@@ -130,6 +130,8 @@ pub struct PlacementConfig {
     pub mdns_interface: Option<String>,
     pub remote: Option<RemoteConfig>,
     pub max_tp: Option<usize>,
+    pub weight_bytes: Option<u64>,
+    pub kv_pool_bytes: Option<u64>,
 }
 
 pub const REMOTE_MICRO_BATCH: usize = 256;
@@ -146,7 +148,7 @@ impl PlacementConfig {
 
 impl Default for PlacementConfig {
     fn default() -> Self {
-        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: None, discovery: Discovery::Static, mdns_port: 5353, mdns_interface: None, remote: None, max_tp: None }
+        PlacementConfig { objective: Objective::Latency, context: 8192, slots: 1, devices: Vec::new(), stages: Vec::new(), micro_batch: None, discovery: Discovery::Static, mdns_port: 5353, mdns_interface: None, remote: None, max_tp: None, weight_bytes: None, kv_pool_bytes: None }
     }
 }
 
@@ -183,6 +185,12 @@ impl PlacementConfig {
     pub fn place(&self, spec: &Spec) -> Result<Placement> {
         ensure!(self.slots >= 1 && self.context >= 1, "placement needs at least one slot and one token of context");
         let mut model = CostModel::new(spec, self.context, self.slots);
+        if let Some(bytes) = self.weight_bytes {
+            model.rescale_weights(bytes);
+        }
+        if let Some(bytes) = self.kv_pool_bytes {
+            model.scale_kv_pool(bytes);
+        }
         if let Some(tp) = self.max_tp {
             model.max_tp = tp.max(1);
         }
@@ -312,7 +320,18 @@ const ALLREDUCE_BYTES_PER_ELEMENT: usize = 2;
 impl CostModel {
     pub fn new(spec: &Spec, context: usize, slots: usize) -> CostModel {
         let anatomy = ModelAnatomy::new(spec, 0, Some(context));
-        let kv_per_token = (2 * spec.attention.kv_heads * spec.attention.head_dim * 2) as u64;
+        let f16_kv_per_token = (2 * spec.attention.kv_heads * spec.attention.head_dim * 2) as u64;
+        let fp8_kv = spec.runtime.kv_dtype.is_fp8();
+        let f16_kv_layers = spec.kv_f16_layers();
+        let kv_per_token = |attention_index: usize| -> u64 {
+            if !fp8_kv {
+                return f16_kv_per_token;
+            }
+            let rows = (2 * spec.attention.kv_heads) as u64;
+            let head = spec.attention.head_dim as u64;
+            if attention_index < f16_kv_layers { rows * head * 2 } else { rows * (head + 4) }
+        };
+        let mut attention_index = 0usize;
         let state_per_seq = match &spec.linear_attention {
             Some(la) => {
                 let ssm = la.value_heads * la.key_head_dim * la.key_head_dim;
@@ -328,7 +347,11 @@ impl CostModel {
             .map(|l| {
                 let (kv_bytes, state_bytes) = match l.kind {
                     LayerKind::DeltaNet => (0, state_per_seq),
-                    _ => (kv_per_token * context as u64, 0),
+                    _ => {
+                        let bytes = kv_per_token(attention_index) * context as u64;
+                        attention_index += 1;
+                        (bytes, 0)
+                    }
                 };
                 let traffic = kv_bytes as f64 * rows + 2.0 * state_bytes as f64 * rows;
                 LayerCost {
@@ -375,6 +398,17 @@ impl CostModel {
         }
         self.embedding_bytes = scale(self.embedding_bytes);
         self.head_bytes = scale(self.head_bytes);
+    }
+
+    pub fn scale_kv_pool(&mut self, pool_bytes: u64) {
+        let own: u64 = self.layers.iter().map(|l| l.kv_bytes).sum::<u64>() * self.slots as u64;
+        if own == 0 {
+            return;
+        }
+        let factor = pool_bytes as f64 / own as f64;
+        for l in &mut self.layers {
+            l.kv_bytes = (l.kv_bytes as f64 * factor) as u64;
+        }
     }
 
     pub fn set_kv(&mut self, kv_bytes_per_token: u64, context: usize) {

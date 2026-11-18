@@ -2,6 +2,7 @@ use crate::detail::View;
 use crate::{App, Tab};
 use eframe::egui;
 use egui_bench::prelude::*;
+use inference_bench_core::cluster::{Planned, Sizing};
 use inference_bench_core::library::{LocalModel, human_size};
 use serde_json::{Value, json};
 use specrt::anatomy::ModelAnatomy;
@@ -10,6 +11,10 @@ use std::collections::BTreeMap;
 
 pub use inference_bench_core::fit::*;
 
+
+fn round_up_quarter(bytes: u64) -> f64 {
+    ((bytes as f64 / GB) * 4.0).ceil() / 4.0
+}
 
 pub fn parse_names(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -185,7 +190,18 @@ impl LoadDialog {
         };
         let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, texts: BTreeMap::new(), anatomy: None, native_max: max };
         dialog.sync();
+        if app.settings.kv_gb_for(&model.name).is_none() && fitted.is_none() {
+            dialog.shrink_pool_to_plan(&crate::hardware::load_devices(app), app.settings.cluster.objective);
+        }
         dialog
+    }
+
+    pub fn shrink_pool_to_plan(&mut self, devices: &[specrt::placement::DeviceConfig], objective: specrt::placement::Objective) {
+        let Some(a) = self.anatomy() else { return };
+        let floor = round_up_quarter(a.kv_bytes_per_token * self.ctx as u64);
+        while self.kv_gb > floor && matches!(self.plan(devices, objective), Some(Err(_))) {
+            self.kv_gb = (self.kv_gb - 0.25).max(floor);
+        }
     }
 
     pub fn anatomy(&self) -> Option<&ModelAnatomy> {
@@ -224,18 +240,17 @@ impl LoadDialog {
         Some(pool_tokens(a, self.kv_bytes()?).min(self.max).div_ceil(self.seqs.max(1)).max(1))
     }
 
-    pub fn spread(&self, gpus: &[u64]) -> Option<Result<specrt::placement::Placement, String>> {
-        if gpus.len() < 2 {
+    pub fn plan(&self, devices: &[specrt::placement::DeviceConfig], objective: specrt::placement::Objective) -> Option<Result<Planned, String>> {
+        if devices.len() < 2 {
             return None;
         }
         let v = self.view.as_ref().ok()?;
         let a = self.anatomy()?;
-        let per_slot = self.plan_context()?;
         let mut spec = v.spec.clone();
         spec.runtime.kv_dtype = self.kv_dtype();
         spec.runtime.kv_f16_layers = self.choice.value("runtime.kv_f16_layers").as_u64().map(|n| n as usize);
-        let devices = inference_bench_core::discover::pool_devices(gpus);
-        Some(inference_bench_core::discover::place_on(&spec, a.total_bytes, a.kv_bytes_per_token, per_slot, self.seqs, &devices).map_err(|e| format!("{e:#}")))
+        let sizing = Sizing { weight_bytes: Some(a.total_bytes), kv_pool_bytes: Some(self.kv_bytes()?) };
+        Some(Planned::plan(&spec, devices, self.plan_context()?, self.seqs, sizing, objective))
     }
 
     pub fn kv_bytes(&self) -> Option<u64> {
@@ -312,7 +327,7 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
     let free = app.free_gpu_bytes();
     dialog.sync();
     let est = dialog.estimate(free);
-    let spread = dialog.spread(&gpus);
+    let spread = dialog.plan(&crate::hardware::load_devices(app), app.settings.cluster.objective);
     let (mut go, mut close) = (false, false);
     let r = egui::Modal::new(egui::Id::new("load-model"))
         .backdrop_color(egui::Color32::from_black_alpha(150))
@@ -419,12 +434,21 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                             let r = Line::new().legend(&label).column(ui, 120.0).measured(human_size(f)).show(ui);
                             r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
                             match &spread {
-                                Some(Ok(p)) => status(ui, true, &format!("fits across {} gpus in {} stage(s)", gpus.len(), p.stages.len())),
+                                Some(Ok(p)) => {
+                                    let largest = gpus.iter().copied().max().unwrap_or(0);
+                                    let line = if p.spans() && e.total() > largest {
+                                        format!("{} is more than the largest gpu ({}): it will span {} gpus, split as below", human_size(e.total()), human_size(largest), p.placement.stages.len())
+                                    } else {
+                                        format!("fits across {} gpus in {} stage(s)", gpus.len(), p.placement.stages.len())
+                                    };
+                                    status(ui, true, &line);
+                                }
+                                Some(Err(why)) if e.total() > gpus.iter().copied().max().unwrap_or(0) => status(ui, false, &format!("the planner says it does not fit across {} gpus: {why}. Loading is blocked: lower the memory, the context or the parallel requests.", gpus.len())),
                                 Some(Err(why)) => status(ui, false, &format!("the planner says it does not fit across {} gpus: {why}. You can still try to load it.", gpus.len())),
                                 None => {}
                             }
                             if let Some(Ok(p)) = &spread {
-                                load_plan(ui, &plan_rows(p));
+                                load_plan(ui, &plan_rows(&p.placement));
                             }
                         }
                         Some(f) => {
@@ -481,8 +505,13 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
         }
         app.chat.load_error = None;
         let kv = dialog.view.is_ok().then(|| dialog.kv_bytes()).flatten().filter(|_| dialog.seqs > 1);
-        let spans = matches!(&spread, Some(Ok(p)) if p.stages.len() > 1);
-        let outcome = if spans { crate::hardware::load_spanning(app, &model, dialog.plan_context().unwrap_or(dialog.ctx), dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone()) } else {
+        let largest = gpus.iter().copied().max().unwrap_or(0);
+        let too_big_for_one = est.as_ref().is_some_and(|e| e.total() > largest);
+        let outcome = if let Some(Err(why)) = spread.as_ref().filter(|_| too_big_for_one) {
+            Err(format!("not loaded: the plan across {} gpus does not fit: {why}", gpus.len()))
+        } else if let Some(Ok(planned)) = spread.filter(|r| r.as_ref().is_ok_and(Planned::spans)) {
+            crate::hardware::load_spanning(app, &model, planned, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone())
+        } else {
             app.load_model_named(&model, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone());
             Ok(())
         };

@@ -39,9 +39,8 @@ impl Selection {
     }
 }
 
-pub fn candidate_devices(local: &Machine, peers: &[Peer], selection: &Selection, network: specrt::placement::LinkConfig) -> Vec<DeviceConfig> {
-    let skip: Vec<usize> = local.gpus.iter().map(|g| g.ordinal).filter(|o| !selection.includes(&hardware::device_name(&local.host, *o))).collect();
-    let mut devices = local.devices(&skip);
+pub fn peer_devices(peers: &[Peer], selection: &Selection, network: specrt::placement::LinkConfig) -> Vec<DeviceConfig> {
+    let mut devices = Vec::new();
     for peer in peers.iter().filter(|p| selection.peers.contains(&p.host)) {
         let mut first = true;
         for g in peer.gpus.iter().filter(|g| selection.includes(&g.device.name)) {
@@ -53,6 +52,13 @@ pub fn candidate_devices(local: &Machine, peers: &[Peer], selection: &Selection,
             devices.push(d);
         }
     }
+    devices
+}
+
+pub fn candidate_devices(local: &Machine, peers: &[Peer], selection: &Selection, network: specrt::placement::LinkConfig) -> Vec<DeviceConfig> {
+    let skip: Vec<usize> = local.gpus.iter().map(|g| g.ordinal).filter(|o| !selection.includes(&hardware::device_name(&local.host, *o))).collect();
+    let mut devices = local.devices(&skip);
+    devices.extend(peer_devices(peers, selection, network));
     devices
 }
 
@@ -79,9 +85,48 @@ pub fn friendly(error: &str) -> String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sizing {
+    pub weight_bytes: Option<u64>,
+    pub kv_pool_bytes: Option<u64>,
+}
+
+pub fn runnable_config(devices: &[DeviceConfig], ctx: usize, slots: usize, sizing: Sizing, objective: Objective) -> PlacementConfig {
+    PlacementConfig { objective, context: ctx, slots, devices: flat(devices), max_tp: Some(1), weight_bytes: sizing.weight_bytes, kv_pool_bytes: sizing.kv_pool_bytes, ..PlacementConfig::default() }
+}
+
+pub fn sized_plan(spec: &Spec, devices: &[DeviceConfig], ctx: usize, slots: usize, sizing: Sizing, objective: Objective) -> Result<Placement, String> {
+    runnable_config(devices, ctx, slots, sizing, objective).place(spec).map_err(|e| friendly(&format!("{e:#}")))
+}
+
+#[derive(Clone, Debug)]
+pub struct Planned {
+    pub placement: Placement,
+    pub devices: Vec<DeviceConfig>,
+    pub sizing: Sizing,
+    pub ctx: usize,
+    pub slots: usize,
+    pub objective: Objective,
+}
+
+impl Planned {
+    pub fn plan(spec: &Spec, devices: &[DeviceConfig], ctx: usize, slots: usize, sizing: Sizing, objective: Objective) -> Result<Planned, String> {
+        let placement = sized_plan(spec, devices, ctx, slots, sizing, objective)?;
+        Ok(Planned { placement, devices: devices.to_vec(), sizing, ctx, slots, objective })
+    }
+
+    pub fn spans(&self) -> bool {
+        self.placement.stages.len() > 1
+    }
+
+    pub fn config(&self) -> PlacementConfig {
+        let stages = self.placement.stages.iter().map(|s| StageConfig { device: s.device_name.clone(), layers: [s.start, s.end] }).collect();
+        PlacementConfig { stages, ..runnable_config(&self.devices, self.ctx, self.slots, self.sizing, self.objective) }
+    }
+}
+
 pub fn runnable_plan(spec: &Spec, devices: &[DeviceConfig], ctx: usize, slots: usize, objective: Objective) -> Result<Placement, String> {
-    let config = PlacementConfig { objective, context: ctx, slots, devices: flat(devices), max_tp: Some(1), ..PlacementConfig::default() };
-    config.place(spec).map_err(|e| friendly(&format!("{e:#}")))
+    sized_plan(spec, devices, ctx, slots, Sizing::default(), objective)
 }
 
 fn tensor_parallel_plan(spec: &Spec, devices: &[DeviceConfig], ctx: usize, slots: usize, objective: Objective) -> Option<Placement> {
@@ -192,6 +237,7 @@ pub struct Run<'a> {
     pub model_id: &'a str,
     pub ctx: usize,
     pub slots: usize,
+    pub sizing: Sizing,
     pub placement: &'a Placement,
     pub devices: &'a [DeviceConfig],
     pub local: &'a Machine,
@@ -220,7 +266,7 @@ pub fn prepare(run: &Run) -> Result<Prepared> {
             bail!("the model fits on {} alone, and a single GPU run always uses GPU 0: include GPU 0 or add a second GPU", hardware::display_name(&only.device_name));
         }
         stages = run.placement.stages.iter().map(|s| StageConfig { device: s.device_name.clone(), layers: [s.start, s.end] }).collect();
-        let placement = PlacementConfig { objective: run.placement.objective, context: run.ctx, slots: run.slots, devices, stages, ..PlacementConfig::default() };
+        let placement = PlacementConfig { stages, ..runnable_config(&devices, run.ctx, run.slots, run.sizing, run.placement.objective) };
         return Ok(Prepared { placement, local, peers: used_peers, key });
     }
     let result = (|| -> Result<()> {
@@ -271,14 +317,11 @@ pub fn prepare(run: &Run) -> Result<Prepared> {
     }
     devices.retain(|d| stages.iter().any(|s| s.device == d.name));
     prepared.placement = PlacementConfig {
-        objective: run.placement.objective,
-        context: run.ctx,
-        slots: run.slots,
-        devices,
         stages,
+        devices,
         mdns_port: run.settings.mdns_port,
         remote: Some(RemoteConfig { key: None, key_file: Some(run.key_file.to_path_buf()), timeout_ms: 600_000, member_ttl_ms: 30_000, connect_wait_ms: 15_000 }),
-        ..PlacementConfig::default()
+        ..runnable_config(&[], run.ctx, run.slots, run.sizing, run.placement.objective)
     };
     Ok(prepared)
 }
@@ -384,7 +427,7 @@ mod tests {
         let devices = candidate_devices(&local, &[], &Selection::default(), ClusterSettings::default().network_link());
         let placement = runnable_plan(&spec(), &devices, 2048, 1, Objective::Latency).unwrap();
         let dir = std::env::temp_dir().join(format!("cl-{}", std::process::id()));
-        let run = Run { model_id: "m", ctx: 2048, slots: 1, placement: &placement, devices: &devices, local: &local, peers: &[], settings: &ClusterSettings::default(), key_file: &dir.join("cluster.key") };
+        let run = Run { model_id: "m", ctx: 2048, slots: 1, sizing: Sizing::default(), placement: &placement, devices: &devices, local: &local, peers: &[], settings: &ClusterSettings::default(), key_file: &dir.join("cluster.key") };
         assert!(!is_remote(&run));
         let prepared = prepare(&run).unwrap();
         assert!(prepared.placement.remote.is_none());
@@ -403,7 +446,7 @@ mod tests {
         let placement = runnable_plan(&spec(), &devices, 2048, 1, Objective::Latency).unwrap();
         assert!(placement.stages.iter().any(|s| s.device_name.starts_with("spark")));
         let dir = std::env::temp_dir().join(format!("cl2-{}", std::process::id()));
-        let run = Run { model_id: &fixture(), ctx: 2048, slots: 1, placement: &placement, devices: &devices, local: &local, peers: &[], settings: &ClusterSettings::default(), key_file: &dir.join("cluster.key") };
+        let run = Run { model_id: &fixture(), ctx: 2048, slots: 1, sizing: Sizing::default(), placement: &placement, devices: &devices, local: &local, peers: &[], settings: &ClusterSettings::default(), key_file: &dir.join("cluster.key") };
         let err = prepare(&run).err().unwrap();
         assert!(format!("{err:#}").contains("spark"), "{err:#}");
         let _ = std::fs::remove_dir_all(dir);

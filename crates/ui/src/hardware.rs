@@ -3,7 +3,7 @@ use crate::job::Pending;
 use crate::shell::page;
 use eframe::egui;
 use egui_bench::prelude::*;
-use inference_bench_core::cluster::{Prepared, Run, Selection, candidate_devices, runnable_plan};
+use inference_bench_core::cluster::{Planned, Prepared, Run, Selection};
 use inference_bench_core::engine::Command;
 use inference_bench_core::library::human_size;
 use specrt::cluster::Peer;
@@ -247,25 +247,43 @@ pub fn pipeline_section(app: &App, ui: &mut egui::Ui) {
     });
 }
 
-pub fn planning_devices(app: &App) -> Option<(specrt::hardware::Machine, Vec<specrt::placement::DeviceConfig>)> {
-    let machine = app.hardware.machine.clone().or_else(|| specrt::hardware::probe().ok())?;
-    let own = machine.host.clone();
-    let peers: Vec<Peer> = app.hardware.peer_list(&own).into_iter().filter(|p| app.settings.cluster.paired.contains(&p.host)).collect();
-    let selection = app.hardware.selection(&app.settings.cluster);
-    let devices = candidate_devices(&machine, &peers, &selection, app.settings.cluster.network_link());
-    Some((machine, devices))
+pub fn planning_machine(app: &App) -> Option<specrt::hardware::Machine> {
+    app.hardware.machine.clone().or_else(|| specrt::hardware::probe().ok())
 }
 
-pub fn load_spanning(app: &mut App, model: &inference_bench_core::library::LocalModel, plan_ctx: usize, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice) -> Result<(), String> {
-    let (machine, devices) = planning_devices(app).ok_or_else(|| "no GPU reading yet".to_string())?;
+pub fn load_devices(app: &App) -> Vec<specrt::placement::DeviceConfig> {
+    use inference_bench_core::fit::{GB, GPU_UTILIZATION};
+    let machine = app.hardware.machine.as_ref();
+    let cards: Vec<(usize, u64)> = app.gpu.iter().enumerate().filter(|(i, _)| app.gpu_enabled(*i)).map(|(i, g)| (i, g.available_bytes())).collect();
+    let mut devices = match machine {
+        Some(m) => {
+            let skip: Vec<usize> = m.gpus.iter().map(|g| g.ordinal).filter(|o| !app.gpu_enabled(*o)).collect();
+            let mut local = m.devices(&skip);
+            for d in &mut local {
+                if let Some(&(_, free)) = cards.iter().find(|(o, _)| Some(*o) == d.ordinal) {
+                    d.memory_gib = free as f64 * GPU_UTILIZATION / GB;
+                    d.reserve_gib = Some(0.0);
+                }
+            }
+            local
+        }
+        None => inference_bench_core::discover::pool_devices_on(&specrt::hardware::host_name(), &cards),
+    };
+    let own = machine.map_or_else(specrt::hardware::host_name, |m| m.host.clone());
+    let peers: Vec<Peer> = app.hardware.peer_list(&own).into_iter().filter(|p| app.settings.cluster.paired.contains(&p.host)).collect();
+    let selection = app.hardware.selection(&app.settings.cluster);
+    devices.extend(inference_bench_core::cluster::peer_devices(&peers, &selection, app.settings.cluster.network_link()));
+    devices
+}
+
+pub fn load_spanning(app: &mut App, model: &inference_bench_core::library::LocalModel, planned: Planned, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice) -> Result<(), String> {
+    let machine = planning_machine(app).ok_or_else(|| "no GPU reading yet".to_string())?;
     let id = model.model_id(inference_bench_core::target::NATIVE);
-    let spec = specrt::engine::resolve_spec(&id).map_err(|e| format!("{e:#}"))?;
-    let placement = runnable_plan(&spec, &devices, plan_ctx, seqs, app.settings.cluster.objective)?;
     app.hardware.release();
     let own = machine.host.clone();
     let peers: Vec<Peer> = app.hardware.peer_list(&own);
     let key_file = inference_bench_core::cluster::key_path(&app.dir);
-    let prepared = inference_bench_core::cluster::prepare(&Run { model_id: &id, ctx: plan_ctx, slots: seqs, placement: &placement, devices: &devices, local: &machine, peers: &peers, settings: &app.settings.cluster, key_file: &key_file }).map_err(|e| format!("{e:#}"))?;
+    let prepared = inference_bench_core::cluster::prepare(&Run { model_id: &id, ctx: planned.ctx, slots: planned.slots, sizing: planned.sizing, placement: &planned.placement, devices: &planned.devices, local: &machine, peers: &peers, settings: &app.settings.cluster, key_file: &key_file }).map_err(|e| format!("{e:#}"))?;
     *app.hardware.slot.lock().unwrap() = Some(prepared.placement.clone());
     app.hardware.run_label = Some(format!("{} on {} stages", model.name, prepared.placement.stages.len()));
     app.hardware.run = Some(prepared);

@@ -55,21 +55,25 @@ pub fn room_bytes(a: &ModelAnatomy, free: Option<u64>, seqs: usize) -> Option<u6
 }
 
 pub fn default_kv_gb(a: &ModelAnatomy, free: Option<u64>, seqs: usize, ctx: usize) -> f64 {
-    let needed = a.kv_bytes_per_token * ctx as u64;
-    let bytes = match free {
+    let needed = round_gb(a.kv_bytes_per_token * ctx as u64);
+    match free {
         Some(f) => {
             let usable = (f as f64 * GPU_UTILIZATION) as u64;
-            usable.saturating_sub(a.total_bytes + a.state_bytes_per_seq * seqs.max(1) as u64)
+            let room = usable.saturating_sub(a.total_bytes + a.state_bytes_per_seq * seqs.max(1) as u64);
+            round_gb_down(room).max(needed)
         }
         None => needed,
-    };
-    round_gb(bytes.max(needed))
+    }
 }
 
 pub fn max_kv_gb(a: &ModelAnatomy, free: Option<u64>, seqs: usize, ctx: usize) -> f64 {
     let needed = a.kv_bytes_per_token * ctx as u64;
     let room = room_bytes(a, free, seqs).unwrap_or(needed * 4);
     round_gb(room.max(needed)).max(default_kv_gb(a, free, seqs, ctx)).max(0.25)
+}
+
+fn round_gb_down(bytes: u64) -> f64 {
+    ((bytes as f64 / GB) * 4.0).floor() / 4.0
 }
 
 fn round_gb(bytes: u64) -> f64 {

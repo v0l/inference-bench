@@ -269,7 +269,7 @@ fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
     let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
     {
         let app = h.state_mut();
-        app.gpu = vec![gpu(20), gpu(20), gpu(20)];
+        app.gpu = vec![gpu(24), gpu(24), gpu(24)];
         app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
         app.gpu_poll = Default::default();
     }
@@ -287,7 +287,9 @@ fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
     let weights = dialog.anatomy().unwrap().total_bytes;
     assert!(weights > list[0], "the model must be too big for GPU 0 alone");
     assert_eq!(h.state().free_gpu_bytes(), Some(list.iter().sum()));
-    assert!(matches!(dialog.spread(&list), Some(Ok(_))));
+    let devices = inference_bench_core::discover::pool_devices(&list);
+    let r = dialog.plan(&devices, Default::default());
+    assert!(matches!(r, Some(Ok(_))), "{:?} {:?} {:?}", r.map(|r| r.map(|p| p.placement.render())), devices.iter().map(|d| d.memory_gib).collect::<Vec<_>>(), dialog.seqs);
     h.get_by_label_contains("free on 3 gpus");
     h.get_by_label_contains("load plan");
     h.get_by_label_contains("layers 0-");
@@ -2611,4 +2613,128 @@ fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
     assert!(shared.store.list().is_empty());
     assert!(!id.is_empty());
     h.get_by_label("no saved sessions");
+}
+
+fn two_gpu_27b_dialog(name: &str) -> Harness<'static, App> {
+    let mut h = harness(name, Tab::Models);
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
+    {
+        let app = h.state_mut();
+        app.gpu = vec![gpu(96), gpu(96)];
+        app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
+        app.gpu_poll = Default::default();
+        let mut m = specrt::hardware::fake_gpus("desk", 2, true);
+        for g in &mut m.gpus {
+            g.free_bytes = 96 << 30;
+        }
+        app.hardware.machine = Some(m);
+    }
+    let d = dir(&format!("{name}-model"));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::copy(fixtures().join("qwen3.8-27b-nvfp4.config.json"), d.join("config.json")).unwrap();
+    let mut m = model("Qwen3.8-27B-NVFP4", true, "dense decoder");
+    (m.path, m.root) = (d.clone(), d);
+    m.context_length = None;
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    h
+}
+
+#[test]
+fn the_user_settings_on_two_96gb_gpus_plan_across_both() {
+    let mut h = two_gpu_27b_dialog("two96");
+    {
+        let d = h.state_mut().load.as_mut().unwrap();
+        d.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
+        d.choice.set("runtime.kv_f16_layers", serde_json::json!(0));
+        d.seqs = 21;
+        d.ctx = 262144;
+        d.sync();
+        let base = d.anatomy().unwrap().total_bytes + d.anatomy().unwrap().state_bytes_per_seq * 21;
+        d.kv_gb = ((120.0 - base as f64 / (1u64 << 30) as f64) * 4.0).round() / 4.0;
+    }
+    let app = h.state();
+    let devices = crate::hardware::load_devices(app);
+    let d = app.load.as_ref().unwrap();
+    let planned = d.plan(&devices, app.settings.cluster.objective).unwrap().unwrap();
+    assert_eq!(planned.placement.stages.len(), 2);
+    assert!(planned.placement.stages.iter().all(|s| s.kv_bytes > 20 << 30), "the whole 120 GB request is planned, not one GPU's share");
+    let kv_total: u64 = planned.placement.stages.iter().map(|s| s.kv_bytes).sum();
+    let pool = d.kv_bytes().unwrap();
+    assert!(kv_total <= pool + (1 << 20) && kv_total + (1 << 30) > pool, "{kv_total} against pool {pool}");
+    assert_eq!(planned.placement.slots, 21);
+    h.run();
+    h.get_by_label_contains("will span 2 gpus");
+    h.get_by_label_contains("desk/gpu0");
+    h.get_by_label_contains("desk/gpu1");
+}
+
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(usize, Option<u64>, Option<specrt::placement::PlacementConfig>)>>>;
+
+fn recording_engine(app: &mut App) -> Seen {
+    let seen: Seen = Default::default();
+    let log = seen.clone();
+    let slot = app.hardware.slot.clone();
+    let script = Script { models: vec!["acme/Qwen3.8-27B-NVFP4".into()], ..script() };
+    let fake = inference_bench_core::fake::ScriptedServing::factory(script.clone());
+    let serving: inference_bench_core::engine::ServingFactory = std::sync::Arc::new(move |mut opts| {
+        if let Some(p) = slot.lock().unwrap().clone() {
+            opts.placement = Some(p);
+        }
+        log.lock().unwrap().push((opts.max_num_seqs, opts.kv_cache_bytes, opts.placement.clone()));
+        fake(opts)
+    });
+    app.engine = inference_bench_core::engine::Engine::with_factories(app.wake.clone(), ScriptedModel::factory(script), serving);
+    seen
+}
+
+#[test]
+fn loading_the_user_settings_hands_the_engine_the_plan_the_dialog_showed() {
+    let mut h = two_gpu_27b_dialog("two96load");
+    let seen = recording_engine(h.state_mut());
+    {
+        let app = h.state_mut();
+        app.library[0].repo = "acme/Qwen3.8-27B-NVFP4".into();
+        let d = app.load.as_mut().unwrap();
+        d.model.repo = "acme/Qwen3.8-27B-NVFP4".into();
+        d.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
+        d.choice.set("runtime.kv_f16_layers", serde_json::json!(0));
+        d.seqs = 21;
+        d.ctx = 262144;
+        d.sync();
+        let base = d.anatomy().unwrap().total_bytes + d.anatomy().unwrap().state_bytes_per_seq * 21;
+        d.kv_gb = ((120.0 - base as f64 / (1u64 << 30) as f64) * 4.0).round() / 4.0;
+    }
+    let (shown, pool, mut spec) = {
+        let app = h.state();
+        let devices = crate::hardware::load_devices(app);
+        let d = app.load.as_ref().unwrap();
+        (d.plan(&devices, app.settings.cluster.objective).unwrap().unwrap(), d.kv_bytes().unwrap(), d.view.as_ref().unwrap().spec.clone())
+    };
+    spec.runtime.kv_dtype = specrt::spec::KvDtype::Fp8;
+    spec.runtime.kv_f16_layers = Some(0);
+    h.run();
+    click_load(&mut h);
+    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
+    let loaded = h.state().loaded().unwrap();
+    assert_eq!(loaded.max_num_seqs, 21);
+    assert!(loaded.parallel_note.is_none(), "{:?}", loaded.parallel_note);
+    let calls = seen.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let (seqs, kv, placement) = calls[0].clone();
+    assert_eq!((seqs, kv), (21, Some(pool)));
+    let placement = placement.expect("the engine is given the placement");
+    assert_eq!(placement, shown.config());
+    assert_eq!(placement.stages.len(), 2);
+    assert_eq!(placement.slots, 21);
+    assert_eq!(placement.weight_bytes, shown.sizing.weight_bytes);
+    assert_eq!(placement.kv_pool_bytes, Some(pool));
+    let engine_plan = placement.place(&spec).unwrap();
+    assert_eq!(engine_plan.ranges(), shown.placement.ranges());
+    for (a, b) in engine_plan.stages.iter().zip(&shown.placement.stages) {
+        assert_eq!((a.kv_bytes, a.weight_bytes, a.state_bytes), (b.kv_bytes, b.weight_bytes, b.state_bytes));
+    }
+    let per_device: Vec<u64> = engine_plan.stages.iter().map(|s| s.used_bytes()).collect();
+    assert!(per_device.iter().all(|b| *b <= 96 << 30), "{per_device:?}");
 }

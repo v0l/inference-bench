@@ -232,11 +232,16 @@ impl Assessment {
 }
 
 pub fn pool_devices(gpus: &[u64]) -> Vec<DeviceConfig> {
-    gpus.iter()
-        .enumerate()
-        .map(|(i, free)| DeviceConfig {
-            name: format!("gpu{i}"),
-            memory_gib: (*free as f64 * fit::GPU_UTILIZATION) / fit::GB,
+    let cards: Vec<(usize, u64)> = gpus.iter().copied().enumerate().collect();
+    pool_devices_on("", &cards)
+}
+
+pub fn pool_devices_on(host: &str, cards: &[(usize, u64)]) -> Vec<DeviceConfig> {
+    cards
+        .iter()
+        .map(|&(i, free)| DeviceConfig {
+            name: if host.is_empty() { format!("gpu{i}") } else { specrt::hardware::device_name(host, i) },
+            memory_gib: (free as f64 * fit::GPU_UTILIZATION) / fit::GB,
             bandwidth_gbs: 1000.0,
             tflops: 100.0,
             ordinal: Some(i),

@@ -322,7 +322,8 @@ fn open(
     let placed = seqs <= 1 && serving(serve_options(max_ctx, 1, kv_cache_bytes, engine)?).is_some_and(|t| t.requires_serving());
     let attempts = if seqs > 1 { vec![seqs, 1] } else if placed { vec![1] } else { Vec::new() };
     for (n, attempt) in attempts.into_iter().enumerate() {
-        let Some(mut target) = serving(serve_options(max_ctx, attempt, kv_cache_bytes, engine)?) else { break };
+        let pool = if attempt > 1 { kv_cache_bytes } else { None };
+        let Some(mut target) = serving(serve_options(max_ctx, attempt, pool, engine)?) else { break };
         target.set_progress(Some(progress.clone()));
         match target.load(model_id) {
             Ok(()) => {
@@ -758,8 +759,51 @@ mod tests {
         let EngineEvent::Loaded(l) = wait_event(&e) else { panic!("not loaded") };
         assert_eq!(l.max_num_seqs, 1);
         assert!(l.parallel_note.unwrap().starts_with("parallel requests off: the GPU ran out of memory"));
-        assert_eq!(*seen.lock().unwrap(), vec![(4, Some(1 << 30)), (1, Some(1 << 30))]);
+        assert_eq!(*seen.lock().unwrap(), vec![(4, Some(1 << 30)), (1, None)]);
         assert!(e.handle().serving_stats().is_some());
+    }
+
+    struct StageOom;
+
+    impl Target for StageOom {
+        fn name(&self) -> &str {
+            "stage-oom"
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        fn requires_serving(&self) -> bool {
+            true
+        }
+
+        fn load(&mut self, _: &str) -> Result<(), BackendError> {
+            Err(BackendError::failed("the GPU ran out of memory: stage 1 (layers 36..64) on GPU 1: KV cache"))
+        }
+
+        fn generate(&mut self, _: &Request, _: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn a_placed_load_that_fails_reports_the_stage_and_never_retries_on_one_gpu() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let serving: ServingFactory = Arc::new(move |opts| {
+            log.lock().unwrap().push(opts.max_num_seqs);
+            Some(Box::new(StageOom) as Box<dyn Target>)
+        });
+        let e = Engine::with_factories(Arc::new(|| {}), ScriptedModel::factory(slow_script()), serving);
+        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: Some(21), kv_cache_bytes: Some(1 << 30), served_names: Vec::new(), engine: Default::default() });
+        wait_event(&e);
+        match wait_event(&e) {
+            EngineEvent::LoadFailed(err) => assert!(err.message.contains("stage 1 (layers 36..64) on GPU 1"), "{}", err.message),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![21]);
+        assert!(e.loaded().is_none());
     }
 
     #[test]
