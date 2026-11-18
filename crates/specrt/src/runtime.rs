@@ -1,4 +1,5 @@
-use crate::codegen::{LA_CHUNK, LA_COLS, LA_KSPLIT, Module, PAGE};
+use crate::codegen::{Module, PAGE};
+use kir::linear::LinearTuning;
 use crate::jit::{Jit, default_cache_dir};
 use crate::spec::{Block, LinearAttention, Spec};
 use crate::statepool::StatePool;
@@ -435,14 +436,16 @@ impl GdnBuffers {
         layers: usize,
         slots: usize,
         chunk: usize,
+        tuning: LinearTuning,
     ) -> Result<Self> {
         let d = la.key_head_dim;
+        let la_chunk = tuning.chunk;
         let conv_pool = StatePool::new(ctx, layers * la.conv_dim() * (la.conv_kernel - 1) * 4, slots)?;
         let ssm_pool = StatePool::new(ctx, layers * la.value_heads * d * d * 4, slots)?;
         let conv_state = ManuallyDrop::new(conv_pool.slice(stream));
         let ssm_state = ManuallyDrop::new(ssm_pool.slice(stream));
-        let chunks = chunk.div_ceil(LA_CHUNK);
-        let padded = chunks * LA_CHUNK;
+        let chunks = chunk.div_ceil(la_chunk);
+        let padded = chunks * la_chunk;
         let zeros = |n: usize| stream.alloc_zeros::<f32>(n);
         Ok(GdnBuffers {
             la: la.clone(),
@@ -463,8 +466,8 @@ impl GdnBuffers {
             beta: zeros(chunk * la.value_heads)?,
             w: zeros(padded * la.value_heads * d)?,
             u: zeros(padded * la.value_heads * d)?,
-            aqk: zeros(chunks * la.value_heads * LA_CHUNK * LA_CHUNK)?,
-            gc: zeros(chunks * la.value_heads * LA_CHUNK)?,
+            aqk: zeros(chunks * la.value_heads * la_chunk * la_chunk)?,
+            gc: zeros(chunks * la.value_heads * la_chunk)?,
             qe: zeros(padded * la.value_heads * d)?,
             kt: zeros(padded * la.value_heads * d)?,
             o: zeros(chunk * la.value_dim())?,
@@ -622,6 +625,7 @@ pub struct Runtime {
     stream: Arc<CudaStream>,
     kernels: HashMap<&'static str, CudaFunction>,
     smem: std::collections::BTreeMap<&'static str, u32>,
+    linear_tuning: LinearTuning,
     embed: CudaSlice<u16>,
     norm: CudaSlice<f32>,
     lm_head: DeviceMatrix,
@@ -820,6 +824,7 @@ impl Runtime {
             kernels.insert(name, f);
         }
         let smem = module.smem.clone();
+        let linear_tuning = LinearTuning::for_target(&target);
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
         let checkpoint = Checkpoint::for_repo(&spec.repo)?;
         let weights_started = Instant::now();
@@ -876,7 +881,7 @@ impl Runtime {
             dummy_u8: stream.alloc_zeros(8)?,
         };
         let gdn = match &spec.linear_attention {
-            Some(la) => Some(GdnBuffers::new(&ctx, &stream, la, spec.linear_layers(), layout.slots + 1, chunk)?),
+            Some(la) => Some(GdnBuffers::new(&ctx, &stream, la, spec.linear_layers(), layout.slots + 1, chunk, linear_tuning)?),
             None => None,
         };
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
@@ -920,6 +925,7 @@ impl Runtime {
         let mm_bidi = stream.alloc_zeros(if spec.vision.as_ref().is_some_and(|v| v.config.bidirectional) { (layout.slots + 1) * max_ctx } else { 1 })?;
         let mut rt = Runtime {
             smem,
+            linear_tuning,
             pre,
             gdn,
             moe: match &spec.moe {
@@ -1260,7 +1266,7 @@ impl Runtime {
             .arg(&g.slot)
             .arg(&zero)
             .arg(&self.buf.zero_slots);
-        unsafe { b.launch(cfg(la.value_heads as u32, (la.value_head_dim * LA_KSPLIT) as u32)) }?;
+        unsafe { b.launch(cfg(la.value_heads as u32, (la.value_head_dim * self.linear_tuning.ksplit) as u32)) }?;
         self.linear("lin_out_proj", &g.out, None, &gb.out, x, self.spec.dims.hidden)
     }
 
@@ -1732,7 +1738,7 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel("gdn_gates"));
         b.arg(&ba).arg(&g.neg_a).arg(&g.dt_bias).arg(&gb.g).arg(&gb.beta);
         unsafe { b.launch(cfg(n as u32, 64)) }?;
-        let chunks = n.div_ceil(LA_CHUNK) as u32;
+        let chunks = n.div_ceil(self.linear_tuning.chunk) as u32;
         let mut b = self.stream.launch_builder(self.kernel("gdn_chunk_prep"));
         b.arg(&gb.qn)
             .arg(&gb.kn)
@@ -1759,7 +1765,7 @@ impl Runtime {
             .arg(&o)
             .arg(&slot)
             .arg(&ntok);
-        unsafe { b.launch(launch("", (la.value_heads as u32, (d / LA_COLS) as u32, 1), (LA_CHUNK / 16 * 32) as u32, 0)) }?;
+        unsafe { b.launch(launch("", (la.value_heads as u32, (d / self.linear_tuning.cols) as u32, 1), self.linear_tuning.chunk_threads(), 0)) }?;
         let mut b = self.stream.launch_builder(self.kernel("gdn_gated_norm"));
         b.arg(&o).arg(&lin).arg(&g.norm).arg(&hi).arg(&lo);
         unsafe { b.launch(launch("", (la.value_heads as u32, n as u32, 1), (d / 2) as u32, 0)) }?;
@@ -2036,7 +2042,7 @@ impl Runtime {
             .arg(slots);
         let config = LaunchConfig {
             grid_dim: (la.value_heads as u32, n as u32, 1),
-            block_dim: ((la.value_head_dim * LA_KSPLIT) as u32, 1, 1),
+            block_dim: ((la.value_head_dim * self.linear_tuning.ksplit) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;

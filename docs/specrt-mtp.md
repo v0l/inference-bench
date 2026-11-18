@@ -427,7 +427,7 @@ read each weight once but are not at 80 percent of 1,640 GB/s.
 ### Changes that landed (#604)
 
 `lin_ba` (the 96-row bf16 `in_proj_ba`) ran as a tile GEMM with 3 blocks, 90 us a call, 2.97 ms per round.
-`lin_ba_rows` (templates/gdn.cu) is one block per output row, 256 threads, every token accumulated in
+`lin_ba_rows` (templates/lin.cu) is one block per output row, 256 threads, every token accumulated in
 registers, for up to 32 rows: 1.02 ms per round. `lm_head` for 17 to 32 rows takes the `_narrow` tile
 instead of `_big`: 2.33 to 2.01 ms per round. Same quiet card,
 `scripts/batch8_604.sh`, nsys over about 290 rounds each (the round runs 41 ms on master: kernel sum

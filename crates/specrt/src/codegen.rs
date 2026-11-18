@@ -10,7 +10,7 @@ pub use crate::gemm::{
 
 pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
 pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
-pub const GDN_TEMPLATE: &str = include_str!("../templates/gdn.cu");
+pub const LIN_TEMPLATE: &str = include_str!("../templates/lin.cu");
 pub const MOE_TEMPLATE: &str = include_str!("../templates/moe.cu");
 pub const MOE_KERNELS: &[&str] = &["moe_route_logits", "moe_route", "moe_up_bf16", "moe_up_fp4", "moe_down_bf16", "moe_down_fp4", "moe_combine", "moe_permute", "moe_group_up_bf16", "moe_group_up_fp4", "moe_group_down_bf16", "moe_group_down_fp4", "moe_up_fp8", "moe_down_fp8", "moe_group_up_fp8", "moe_group_down_fp8"];
 pub const MOE_MMA_TEMPLATE: &str = include_str!("../templates/moe_mma.cu");
@@ -89,9 +89,25 @@ pub fn attention_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
     kir::attention::AttentionKernel::set(target, attention_shape(spec, kv_planes, max_ctx)).map_err(anyhow::Error::msg)
 }
 
-pub const LA_CHUNK: usize = 64;
-pub const LA_KSPLIT: usize = 4;
-pub const LA_COLS: usize = 16;
+pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::LinearShape {
+    kir::linear::LinearShape { key_heads: la.key_heads, value_heads: la.value_heads, head_dim: la.key_head_dim, conv_kernel: la.conv_kernel }
+}
+
+pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::linear::LinearKernel>> {
+    let Some(la) = spec.linear_attention.as_ref() else { return Ok(Vec::new()) };
+    let shape = linear_kernel_shape(la);
+    let mut out = Vec::new();
+    for f in kir::linear::Family::ALL {
+        let needed = match f {
+            kir::linear::Family::Verify | kir::linear::Family::Draft => spec.speculative().is_some(),
+            _ => true,
+        };
+        if needed {
+            out.push(kir::linear::LinearKernel::new(target, f, shape.clone()).map_err(anyhow::Error::msg)?);
+        }
+    }
+    Ok(out)
+}
 
 
 pub const KERNELS: &[&str] = &[
@@ -131,21 +147,7 @@ pub const KERNELS: &[&str] = &[
     "gg_dequant_rows",
 ];
 
-pub const GDN_KERNELS: &[&str] = &[
-    "gdn_conv_step",
-    "gdn_conv_prefill",
-    "gdn_conv_keep",
-    "gdn_step",
-    "gdn_qk_prep",
-    "gdn_gates",
-    "gdn_chunk_prep",
-    "gdn_chunk_scan",
-    "gdn_gated_norm",
-    "lin_in_norm",
-    "lin_ba_norm",
-    "lin_out_proj",
-    "lin_ba_rows",
-];
+pub const GDN_KERNELS: &[&str] = &["lin_in_norm", "lin_ba_norm", "lin_out_proj", "lin_ba_rows"];
 
 
 #[derive(Clone, Debug, PartialEq)]
@@ -258,9 +260,11 @@ impl Module {
         }
         let la = spec.linear_attention.as_ref();
         let la_dim = |f: fn(&crate::spec::LinearAttention) -> usize| la.map_or("0".into(), |l| f(l).to_string());
-        if let Some(l) = la {
-            let floats = LA_CHUNK * (l.key_head_dim + 1) + LA_CHUNK * (LA_CHUNK + 1) + 2 * LA_CHUNK;
-            smem.insert("gdn_chunk_prep", (floats * 4) as u32);
+        let linear = linear_kernels(spec, target)?;
+        for k in &linear {
+            if k.family == kir::linear::Family::Chunk {
+                smem.insert("gdn_chunk_prep", k.smem_bytes);
+            }
         }
         let vars: BTreeMap<&str, String> = [
             ("HIDDEN", d.hidden.to_string()),
@@ -285,9 +289,6 @@ impl Module {
             ("LA_VH", la_dim(|l| l.value_heads)),
             ("LA_D", la_dim(|l| l.key_head_dim)),
             ("LA_CONV_K", la_dim(|l| l.conv_kernel)),
-            ("LA_CHUNK", LA_CHUNK.to_string()),
-            ("LA_KSPLIT", LA_KSPLIT.to_string()),
-            ("LA_COLS", LA_COLS.to_string()),
             ("GATE_UP_N", (2 * d.intermediate).to_string()),
             ("WF", wf.decoder().to_string()),
             ("HEAD_WF", head_wf.decoder().to_string()),
@@ -299,7 +300,13 @@ impl Module {
         let kir_source = kir::cuda::emit_module(&kir_kernels).map_err(anyhow::Error::msg)?;
         let attn_source = kir::cuda::emit_attention(&attn).map_err(anyhow::Error::msg)?;
         let gemm_source = kir::cuda::emit_gemms(&gemms.kernels).map_err(anyhow::Error::msg)?;
-        let kir_hash = kir::fold_hashes([kir::module_hash(&kir_kernels), kir::gemm::instances_hash(&gemms.kernels), kir::attention::attention_hash(&attn)]);
+        let linear_source = kir::cuda::emit_linear(&linear).map_err(anyhow::Error::msg)?;
+        let kir_hash = kir::fold_hashes([
+            kir::module_hash(&kir_kernels),
+            kir::gemm::instances_hash(&gemms.kernels),
+            kir::attention::attention_hash(&attn),
+            kir::linear::linear_hash(&linear),
+        ]);
         let mut source = format!("{}\n{}\n{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, attn_source, gemm_source, render(MODEL_TEMPLATE, &vars)?, kir_source);
         let mut kernels = KERNELS.to_vec();
         for k in &kir_kernels {
@@ -309,14 +316,14 @@ impl Module {
         }
         if la.is_some() {
             source.push('\n');
-            source.push_str(&render(GDN_TEMPLATE, &vars)?);
+            source.push_str(&linear_source);
+            source.push('\n');
+            source.push_str(&render(LIN_TEMPLATE, &vars)?);
+            for k in &linear {
+                kernels.extend_from_slice(k.family.kernels());
+            }
             kernels.extend_from_slice(GDN_KERNELS);
             smem.insert("lin_ba_rows", 0);
-        }
-        if la.is_some() && spec.speculative().is_some() {
-            source.push('\n');
-            source.push_str(crate::mtp::MTP_TEMPLATE);
-            kernels.extend_from_slice(crate::mtp::MTP_KERNELS);
         }
         let mut moe_arch = false;
         if let Some(m) = &spec.moe {

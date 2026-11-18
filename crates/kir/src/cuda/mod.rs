@@ -1,7 +1,9 @@
 mod attention;
 mod gemm;
+mod linear;
 
 pub use attention::emit_attention;
+pub use linear::emit_linear;
 pub use gemm::{FP4_ACT, FP4_BATCH, FP4_CORE, FP4_HEAD, FP8_ACT, FP8_BATCH, GEMM_CORE, emit_gemm, emit_gemms, gemm_library, needs_arch_features};
 
 use crate::layout::{Dialect, Layout};

@@ -3,6 +3,7 @@ pub mod cuda;
 pub mod attention;
 pub mod gemm;
 pub mod layout;
+pub mod linear;
 pub mod target;
 #[cfg(feature = "wgsl")]
 pub mod wgsl;

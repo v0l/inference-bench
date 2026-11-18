@@ -1,7 +1,6 @@
 use super::{
     BatchBuffers, DeviceAttn, DeviceLayer, DeviceMatrix, DeviceMixer, GemmOut, Planes, Runtime, Sampling, cfg, grid,
 };
-use crate::codegen::LA_KSPLIT;
 use crate::spec::Spec;
 use crate::weights::{Checkpoint, Mixer};
 use anyhow::{Context, Result, ensure};
@@ -429,7 +428,7 @@ impl Runtime {
             .arg(&k1_i);
         let config = LaunchConfig {
             grid_dim: (la.value_heads as u32, nseq as u32, 1),
-            block_dim: ((la.value_head_dim * LA_KSPLIT) as u32, 1, 1),
+            block_dim: ((la.value_head_dim * self.linear_tuning.ksplit) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
@@ -586,7 +585,7 @@ impl Runtime {
             .arg(&log_rows);
         let config = LaunchConfig {
             grid_dim: (la.value_heads as u32, nseq as u32, layers),
-            block_dim: ((la.value_head_dim * LA_KSPLIT) as u32, 1, 1),
+            block_dim: ((la.value_head_dim * self.linear_tuning.ksplit) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
