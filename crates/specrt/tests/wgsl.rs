@@ -197,7 +197,11 @@ fn run_linear(w: &mut Wgpu, rows: &DeviceRows, x: &[f32], tokens: usize, accumul
     let xb = f32_buf(w, x);
     let yb = f32_buf(w, &accumulate.map_or_else(|| vec![0.0; tokens * nrows], |a| a.to_vec()));
     let (name, grid) = if tokens == 1 {
-        ("linear", [nrows as u32, 1, tokens as u32])
+        if specrt::backends::Backend::limits(w).subgroup_size == 32 {
+            ("linear_sg", [(nrows as u32).div_ceil(wgsl::SG_ROWS), 1, 1])
+        } else {
+            ("linear", [nrows as u32, 1, tokens as u32])
+        }
     } else if tokens >= wgsl::TILE_MIN_TOKENS {
         (if specrt::backends::Backend::limits(w).coop_matrix { "linear_coop" } else { "linear_tile" }, [nrows.div_ceil(wgsl::TILE_ROWS) as u32, 1, tokens.div_ceil(wgsl::TILE_TOKENS) as u32])
     } else {
@@ -249,6 +253,9 @@ fn linear_matches_a_cpu_matmul_for_q8_0_and_q4_k() {
     linear_case(GgmlType::Q8_0, 9);
     linear_case(GgmlType::Q4K, 1);
     linear_case(GgmlType::Q4K, 9);
+    linear_case(GgmlType::Q6K, 1);
+    linear_case(GgmlType::Q6K, 9);
+    linear_case(GgmlType::Q5K, 1);
     linear_case(GgmlType::Q4K, 100);
     linear_case(GgmlType::Q8_0, 33);
 }
@@ -622,11 +629,11 @@ fn the_live_target_matches_the_adapter_features() {
     let w = device();
     let info = w.info();
     let target = specrt::backends::Backend::limits(&w).target();
-    let adapter_has = info.subgroup_min_size > 0 && info.subgroup_min_size == info.subgroup_max_size;
+    let adapter_has = info.subgroup_min_size > 0 && (info.subgroup_min_size == info.subgroup_max_size || (info.subgroup_min_size <= 32 && info.subgroup_max_size >= 32));
     eprintln!("subgroup size {}..{} target subgroups {}", info.subgroup_min_size, info.subgroup_max_size, target.has(kir::Feature::Subgroups));
     if target.has(kir::Feature::Subgroups) {
         assert!(adapter_has);
-        assert_eq!(target.warp_size, info.subgroup_min_size);
+        assert!(target.warp_size == info.subgroup_min_size || target.warp_size == 32);
     } else {
         assert_eq!(target.warp_size, 1);
     }

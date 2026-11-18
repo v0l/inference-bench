@@ -177,8 +177,12 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             Op::Linear { weight, input, output, .. } => {
                 let w = self.weight(weight, l);
                 let coop = kernels[0] == "linear_tile" && be.limits().coop_matrix;
-                let kernel = if coop { "linear_coop" } else { kernels[0] };
-                let grid = if kernels[0] == "linear_tile" {
+                let sg = rows == 1 && be.limits().subgroup_size == 32;
+                let kernel = if coop { "linear_coop" } else if sg { "linear_sg" } else { kernels[0] };
+                let grid = if sg {
+                    let groups = w.nrows.div_ceil(wgsl::SG_ROWS);
+                    [groups.min(ROW_SPAN), groups.div_ceil(ROW_SPAN), 1]
+                } else if kernels[0] == "linear_tile" {
                     [w.nrows.div_ceil(wgsl::TILE_ROWS as u32), 1, rows.div_ceil(wgsl::TILE_TOKENS) as u32]
                 } else {
                     [w.nrows.min(ROW_SPAN), w.nrows.div_ceil(ROW_SPAN), rows.div_ceil(if rows == 1 { 1 } else { LINEAR_TOKENS }) as u32]

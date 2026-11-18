@@ -569,6 +569,136 @@ fn coop_mma() -> String {
     s
 }
 
+pub const SG_ROWS: u32 = 4;
+pub const SG_LANE_ELEMS: u32 = 8;
+
+pub fn emit_linear_sg_op(s: &crate::ops::WgslShape) -> String {
+    let mut out = ops_header(s);
+    out.push_str(&linear_sg());
+    out.push_str(&ggml_decode());
+    out
+}
+
+fn linear_sg() -> String {
+    format!(
+        "{bind}
+@compute @workgroup_size({threads})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @builtin(subgroup_invocation_id) lane: u32) {{
+    let nrows = p.a.x;
+    let cols = p.a.y;
+    let x_row0 = p.a.w;
+    let y_row0 = p.b.x;
+    let accumulate = p.b.y;
+    let r = (wid.x + wid.y * {ROW_SPAN}u) * {SG_ROWS}u + sg;
+    if (r >= nrows) {{
+        return;
+    }}
+    let entry = rows[r];
+    let base = (entry >> 3u) * 16u;
+    let code = entry & 7u;
+    var acc = 0.0;
+    let xo = x_row0 * cols;
+    if (code == 4u) {{
+        let b4 = base >> 2u;
+        for (var q = lane; q < cols / 2u; q += 32u) {{
+            let w = wdata[b4 + q];
+            acc += bitcast<f32>(w << 16u) * x[xo + 2u * q] + bitcast<f32>(w & 0xffff0000u) * x[xo + 2u * q + 1u];
+        }}
+    }} else if (code == 0u) {{
+        let j = lane / 8u;
+        let l4 = (lane % 8u) * 4u;
+        for (var sb = 0u; sb < cols / 256u; sb++) {{
+            let b = base + sb * 144u;
+            let d = wf16(b);
+            let dmin = wf16(b + 2u);
+            let s0 = scale_min_k4(2u * j, b);
+            let s1 = scale_min_k4(2u * j + 1u, b);
+            let q = wdata[(b + 16u + 32u * j + l4) >> 2u];
+            let xb = xo + sb * 256u + j * 64u + l4;
+            var lo = 0.0;
+            var hi = 0.0;
+            var xl = 0.0;
+            var xh = 0.0;
+            for (var i = 0u; i < 4u; i++) {{
+                let byte = (q >> (8u * i)) & 0xffu;
+                lo += f32(byte & 0xfu) * x[xb + i];
+                hi += f32(byte >> 4u) * x[xb + 32u + i];
+                xl += x[xb + i];
+                xh += x[xb + 32u + i];
+            }}
+            acc += d * (f32(s0.x) * lo + f32(s1.x) * hi) - dmin * (f32(s0.y) * xl + f32(s1.y) * xh);
+        }}
+    }} else if (code == 2u) {{
+        let hr = lane / 16u;
+        let l0 = (lane % 16u) * 2u;
+        let isc = l0 / 16u;
+        for (var sb = 0u; sb < cols / 256u; sb++) {{
+            let b = base + sb * 224u;
+            let d = wf16(b + 208u);
+            let ql = b + 64u * hr + l0;
+            let qh = b + 128u + 32u * hr + l0;
+            let sc = b + 192u + 8u * hr + isc;
+            let xb = xo + sb * 256u + hr * 128u + l0;
+            let h0 = wbyte(qh);
+            let h1 = wbyte(qh + 1u);
+            var part = 0.0;
+            for (var sg4 = 0u; sg4 < 4u; sg4++) {{
+                let o = (sg4 & 1u) * 32u;
+                let b0 = wbyte(ql + o);
+                let b1 = wbyte(ql + o + 1u);
+                var n0 = b0 & 0xfu;
+                var n1 = b1 & 0xfu;
+                if (sg4 >= 2u) {{
+                    n0 = b0 >> 4u;
+                    n1 = b1 >> 4u;
+                }}
+                let q0 = i32(n0 | (((h0 >> (2u * sg4)) & 3u) << 4u)) - 32;
+                let q1 = i32(n1 | (((h1 >> (2u * sg4)) & 3u) << 4u)) - 32;
+                part += wi8(sc + 2u * sg4) * (f32(q0) * x[xb + sg4 * 32u] + f32(q1) * x[xb + sg4 * 32u + 1u]);
+            }}
+            acc += d * part;
+        }}
+    }} else if (code == 3u) {{
+        let blk = lane / 4u;
+        let off = (lane % 4u) * 8u;
+        for (var sb = 0u; sb < cols / 256u; sb++) {{
+            let b = base + sb * 272u + blk * 34u;
+            let d = wf16(b);
+            let xb = xo + sb * 256u + blk * 32u + off;
+            var part = 0.0;
+            for (var i = 0u; i < 8u; i++) {{
+                part += wi8(b + 2u + off + i) * x[xb + i];
+            }}
+            acc += d * part;
+        }}
+    }} else {{
+        for (var c0 = 0u; c0 < cols; c0 += {span}u) {{
+            let e0 = c0 + lane * {SG_LANE_ELEMS}u;
+            for (var i = 0u; i < {SG_LANE_ELEMS}u; i++) {{
+                let e = e0 + i;
+                if (e < cols) {{
+                    acc += dequant_at(base, code, e) * x[xo + e];
+                }}
+            }}
+        }}
+    }}
+    let total = subgroupAdd(acc);
+    if (lane == 0u) {{
+        let at = y_row0 * nrows + r;
+        if (accumulate == 1u) {{
+            y[at] = y[at] + total;
+        }} else {{
+            y[at] = total;
+        }}
+    }}
+}}
+",
+        bind = storage(&[("x", false, "f32"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
+        threads = 32 * SG_ROWS,
+        span = 32 * SG_LANE_ELEMS,
+    )
+}
+
 const PARAMS: &str = "struct P { a: vec4<u32>, b: vec4<u32> };\n";
 
 fn storage(list: &[(&str, bool, &str)]) -> String {

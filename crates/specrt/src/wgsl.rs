@@ -18,6 +18,7 @@ pub struct WgslKernel {
 
 pub const LINEAR_TOKENS: usize = 8;
 pub const LINEAR_WORKGROUP: usize = 64;
+pub const SG_ROWS: u32 = kir::wgsl::SG_ROWS;
 pub const TILE_MIN_TOKENS: usize = 32;
 pub const TILE_TOKENS: usize = kir::wgsl::TILE_TOKENS as usize;
 pub const TILE_ROWS: usize = kir::wgsl::TILE_ROWS as usize;
@@ -145,6 +146,9 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         out.push(WgslKernel { name, source: kir::wgsl::emit_linear_op(&shape, tokens, LINEAR_WORKGROUP), bindings: vec![Read, Write, Read, Read, Uniform] });
     }
     out.push(WgslKernel { name: "linear_tile", source: kir::wgsl::emit_linear_tile_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
+    if target.has(kir::Feature::Subgroups) && target.warp_size == 32 {
+        out.push(WgslKernel { name: "linear_sg", source: kir::wgsl::emit_linear_sg_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
+    }
     if target.has(kir::Feature::CoopMatrix) {
         out.push(WgslKernel { name: "linear_coop", source: kir::wgsl::emit_linear_coop_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
     }
