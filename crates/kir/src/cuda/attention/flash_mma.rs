@@ -192,7 +192,7 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         r##""##.to_string(),
         prim::online_softmax(&Mask { pos: "pos", live: "(key <= pos || key <= (e < 2 ? span0 : span1)) && key < key_end && (window <= 0 || key > pos - window)" }),
         r##""##.to_string(),
-        prim::rescale_acc("FM_NB"),
+        prim::rescale_acc("i", "FM_NB"),
         r##"#pragma unroll
         for (int kb = 0; kb < SB / 2; kb++) {
 "##.to_string(),

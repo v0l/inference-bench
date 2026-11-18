@@ -62,14 +62,14 @@ pub fn softmax_update() -> String {
     o
 }
 
-pub fn rescale_acc(blocks: &str) -> String {
+pub fn rescale_acc(var: &str, blocks: &str) -> String {
     format!(
         "#pragma unroll
-        for (int nb = 0; nb < {blocks}; nb++) {{
-            o[nb][0] *= a0;
-            o[nb][1] *= a0;
-            o[nb][2] *= a1;
-            o[nb][3] *= a1;
+        for (int {var} = 0; {var} < {blocks}; {var}++) {{
+            o[{var}][0] *= a0;
+            o[{var}][1] *= a0;
+            o[{var}][2] *= a1;
+            o[{var}][3] *= a1;
         }}
 "
     )

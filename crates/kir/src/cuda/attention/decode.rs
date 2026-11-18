@@ -131,7 +131,7 @@ pub fn body() -> String {
                 for (int e = 0; e < 4; e++) s[nb][e] *= tile_scales[DM_BK + nb * 8 + 2 * t + (e & 1)];
         }
 "##.to_string(),
-        prim::rescale_acc("NB"),
+        prim::rescale_acc("nb", "NB"),
         r##"#pragma unroll
         for (int kb = 0; kb < SB / 2; kb++) {
 "##.to_string(),

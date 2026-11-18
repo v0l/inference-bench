@@ -869,11 +869,11 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         m0 = n0;
         m1 = n1;
 #pragma unroll
-        for (int nb = 0; nb < FM_NB; nb++) {
-            o[nb][0] *= a0;
-            o[nb][1] *= a0;
-            o[nb][2] *= a1;
-            o[nb][3] *= a1;
+        for (int i = 0; i < FM_NB; i++) {
+            o[i][0] *= a0;
+            o[i][1] *= a0;
+            o[i][2] *= a1;
+            o[i][3] *= a1;
         }
 #pragma unroll
         for (int kb = 0; kb < SB / 2; kb++) {
