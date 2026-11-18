@@ -197,7 +197,7 @@ pub fn compare(left: &[RunResult], right: &[RunResult], value: impl Fn(&RunResul
         }
     }
     let pick = |set: &[RunResult], k: &(String, String, u64)| {
-        set.iter().filter(|r| r.backend == k.0 && r.model == k.1 && r.prompt_tokens == k.2).last().and_then(&value)
+        set.iter().rfind(|r| r.backend == k.0 && r.model == k.1 && r.prompt_tokens == k.2).and_then(&value)
     };
     keys.into_iter()
         .map(|k| Delta { left: pick(left, &k), right: pick(right, &k), backend: k.0, model: k.1, prompt_tokens: k.2 })

@@ -128,13 +128,12 @@ fn finish(m: &crate::library::LocalModel, spec: specrt::spec::Spec, source: &'st
     let mut anatomy = ModelAnatomy::new(&spec, mtp, ctx);
     let mut spec = spec;
     let mut structure = None;
-    if with_header {
-        if let Ok(st) = specrt::structure::Structure::read(&m.files) {
+    if with_header
+        && let Ok(st) = specrt::structure::Structure::read(&m.files) {
             spec.apply_structure(&st);
             anatomy = ModelAnatomy::new(&spec, anatomy.mtp_layers, Some(anatomy.max_context));
             structure = Some(st);
         }
-    }
     Described { spec, anatomy, structure, unread: Vec::new(), source }
 }
 

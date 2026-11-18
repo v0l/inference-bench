@@ -363,11 +363,10 @@ fn server_config(args: &LaunchArgs, plan: &Plan, model: &LocalModel, key: &Optio
 
 fn urls(args: &LaunchArgs, addr: std::net::SocketAddr) -> Vec<String> {
     let mut v = vec![format!("http://127.0.0.1:{}", addr.port())];
-    if args.access == Access::Lan {
-        if let Some(ip) = lan_address() {
+    if args.access == Access::Lan
+        && let Some(ip) = lan_address() {
             v.push(format!("http://{ip}:{}", addr.port()));
         }
-    }
     v
 }
 

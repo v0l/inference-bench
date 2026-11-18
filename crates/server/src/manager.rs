@@ -242,9 +242,9 @@ impl Manager {
     }
 
     pub async fn gate_load(&self, id: &str) -> Result<(), ApiError> {
-        if let Some(min) = self.config.min_free_vram_mib {
-            if let Some(free) = self.gpu_free() {
-                if free < min << 20 {
+        if let Some(min) = self.config.min_free_vram_mib
+            && let Some(free) = self.gpu_free()
+                && free < min << 20 {
                     tracing::warn!(model = %id, free_mib = free >> 20, min_free_mib = min, "not loading: the GPU is busy");
                     let mut e = ApiError::unavailable(format!(
                         "the GPU has {} MiB free and {} MiB are required to load {id}; retry when the other job is done",
@@ -254,8 +254,6 @@ impl Manager {
                     e.retry_after = Some(self.config.retry_after_secs.max(1));
                     return Err(e);
                 }
-            }
-        }
         if let Some(command) = self.config.before_load.clone() {
             let id = id.to_string();
             let status = tokio::task::spawn_blocking(move || {

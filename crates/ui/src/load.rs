@@ -105,11 +105,10 @@ fn edit_field(ui: &mut egui::Ui, f: &Field, choice: &mut EngineChoice, texts: &m
         Kind::Text | Kind::Json => {
             let buf = texts.entry(f.key.clone()).or_insert_with(|| if current.is_null() { String::new() } else { display_value(&current) });
             let r = ui.add(egui::TextEdit::singleline(buf).hint_text("auto").desired_width(180.0));
-            if r.changed() {
-                if let Some(v) = parse_text(f, buf) {
+            if r.changed()
+                && let Some(v) = parse_text(f, buf) {
                     choice.set(&f.key, v);
                 }
-            }
         }
     }
 }
@@ -138,11 +137,10 @@ fn advanced_groups(ui: &mut egui::Ui, dialog: &mut LoadDialog) {
                         edit_field(ui, f, &mut dialog.choice, &mut dialog.texts);
                     }
                     let at_default = if f.key == "serve.max_num_seqs" { Some(json!(dialog.seqs)) == f.default.as_u64().map(|d| json!(d)) } else { dialog.choice.is_default(&f.key) };
-                    if !at_default {
-                        if ui.add(Key::new("reset").outline(READOUT)).clicked() {
+                    if !at_default
+                        && ui.add(Key::new("reset").outline(READOUT)).clicked() {
                             dialog.reset(&f.key);
                         }
-                    }
                     Line::new().note(format!("default {}", display_value(&dialog.choice.base(&f.key)))).size(10.5).show(ui);
                 });
             }
@@ -252,11 +250,10 @@ impl LoadDialog {
     pub fn reset(&mut self, key: &str) {
         self.choice.reset(key);
         self.texts.remove(key);
-        if key == "serve.max_num_seqs" {
-            if let Some(n) = specrt::options::default_of(key).and_then(|d| d.as_u64()) {
+        if key == "serve.max_num_seqs"
+            && let Some(n) = specrt::options::default_of(key).and_then(|d| d.as_u64()) {
                 self.seqs = n as usize;
             }
-        }
     }
 
     pub fn serve_options(&self) -> Option<specrt::serve::ServeOptions> {
@@ -336,12 +333,11 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                     options.push((ProfilePick::Custom, "custom", None));
                 }
                 segments(ui, &mut pick, &options);
-                if pick != before {
-                    if let ProfilePick::Profile(p) = pick {
+                if pick != before
+                    && let ProfilePick::Profile(p) = pick {
                         dialog.choice.select(p);
                         dialog.seqs = dialog.choice.value("serve.max_num_seqs").as_u64().map_or(dialog.seqs, |n| n as usize);
                     }
-                }
                 match dialog.choice.profile {
                     Profile::MaxPerformance if !dialog.choice.is_custom() => hint(ui, "MTP, CUDA graphs, fused kernels, the fast loader and the prefix cache are on."),
                     Profile::LowMemory if !dialog.choice.is_custom() => hint(ui, "fp8 KV cache, 2 parallel requests, smaller batches and prefill chunks, no MTP draft head, no prefix cache, small loader and image budgets."),

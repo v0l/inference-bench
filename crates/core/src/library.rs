@@ -419,8 +419,8 @@ fn read_value(r: &mut impl Read, kind: u32) -> Option<Scalar> {
     Some(match kind {
         0 | 1 | 7 => Scalar::Num(fixed(r, 1)?),
         2 | 3 => Scalar::Num(fixed(r, 2)?),
-        4 | 5 | 6 => Scalar::Num(fixed(r, 4)?),
-        10 | 11 | 12 => Scalar::Num(fixed(r, 8)?),
+        4..=6 => Scalar::Num(fixed(r, 4)?),
+        10..=12 => Scalar::Num(fixed(r, 8)?),
         8 => Scalar::Text(read_string(r)?),
         9 => {
             let inner = read_u32(r)?;

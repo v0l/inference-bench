@@ -40,7 +40,7 @@ impl Logits {
         let bytes = std::fs::read(path)
             .map_err(|e| BackendError::failed(format!("{}: {e}", path.display())))?;
         let values: Vec<f32> =
-            bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+            bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
         if values.len() != tokens.len() * vocab {
             return Err(BackendError::failed(format!(
                 "logits file has {} values, expected {} x {}",
