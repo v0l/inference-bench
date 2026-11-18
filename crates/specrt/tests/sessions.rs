@@ -62,7 +62,7 @@ fn run(sched: &mut Scheduler<GpuExecutor>, prompt: Vec<u32>, n: usize) -> Reply 
 }
 
 fn prompt(n: usize) -> Vec<u32> {
-    (0..n as u32).map(|i| (i * 37 + 5) % 1024).collect()
+    (0..n as u32).map(|i| (i * 37 + 5) % 512).collect()
 }
 
 fn roundtrip(name: &str) {
@@ -84,7 +84,7 @@ fn roundtrip(name: &str) {
 
     let mut turn2 = first_prompt.clone();
     turn2.extend(&turn1.tokens);
-    turn2.extend(prompt(30).iter().map(|t| (t + 3) % 1024));
+    turn2.extend(prompt(30).iter().map(|t| (t + 3) % 512));
 
     let mut fresh = scheduler(&s);
     let want = run(&mut fresh, turn2.clone(), 64);
@@ -117,10 +117,11 @@ fn tiny_dense_session_restored_into_a_fresh_engine_matches_the_uninterrupted_run
 #[ignore = "needs a CUDA GPU"]
 fn saved_kv_blocks_come_back_bit_identical_through_the_shared_host_pool() {
     let s = spec_for("tiny-qwen3.5");
-    let layout = Layout { max_ctx: 1024, slots: 2, kv_blocks: 64, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
+    let layout = Layout { max_ctx: 1024, slots: 2, kv_blocks: 64, prefill_chunk: 192, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
     let mut rt = Runtime::load_layout(&s, layout).unwrap();
     let mut st = rt.stepper().unwrap();
     let blocks: Vec<u32> = (0..10).collect();
+    rt.acquire_state(0).unwrap();
     rt.set_block_table(0, &blocks).unwrap();
     rt.prefill_slot(&mut st, 0, &prompt(150), 0, None).unwrap();
     let (k, v) = rt.save_kv_blocks(&blocks).unwrap();
