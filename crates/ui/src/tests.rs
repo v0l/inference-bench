@@ -65,7 +65,7 @@ fn harness(name: &str, tab: Tab) -> Harness<'static, App> {
 
 fn harness_sized(name: &str, tab: Tab, height: f32) -> Harness<'static, App> {
     let d = dir(name);
-    Harness::builder().with_size(egui::vec2(1280.0, height)).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
+    Harness::builder().with_size(egui::vec2(1280.0, height)).with_max_steps(100).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
         let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
         app.tab = tab;
