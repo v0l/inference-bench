@@ -75,9 +75,9 @@ fn text_prompts(spec: &Spec) -> Result<Vec<u32>> {
 fn kl_mode(spec: &Spec, len: usize, n: usize, calibrate: bool) -> Result<()> {
     let steps = decode_steps();
     let corpus = std::env::var("KVGATE_CORPUS").is_ok();
-    let base = if corpus { agentic_transcript(&tokenizer(spec)?, len + steps + 64 * n, std::env::var("KVGATE_CORPUS")?.as_str())? } else { text_prompts(spec)? };
+    let base = if corpus { agentic_transcript(&tokenizer(spec)?, len + steps + 1000 * n, std::env::var("KVGATE_CORPUS")?.as_str())? } else { text_prompts(spec)? };
     let only: Option<usize> = std::env::var("KVGATE_ONLY").ok().and_then(|v| v.parse().ok());
-    let prompts: Vec<Vec<u32>> = (0..n).filter(|i| only.is_none_or(|o| o == *i)).map(|i| (0..len + steps).map(|j| base[(j + i * if corpus { 0 } else { 131 }) % base.len()]).collect()).collect();
+    let prompts: Vec<Vec<u32>> = (0..n).filter(|i| only.is_none_or(|o| o == *i)).map(|i| (0..len + steps).map(|j| base[(j + i * if corpus { 1000 } else { 131 }) % base.len()]).collect()).collect();
     let mut logits: Vec<Vec<Vec<Vec<f32>>>> = Vec::new();
     for dtype in DTYPES {
         let planes = if calibrate && !dtype.is_fp8() { 2 } else { 1 };
