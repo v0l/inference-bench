@@ -1,4 +1,4 @@
-#![allow(deprecated, clippy::too_many_arguments, dead_code)]
+#![allow(deprecated, clippy::too_many_arguments)]
 
 mod working;
 mod chat;

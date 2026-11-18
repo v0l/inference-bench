@@ -103,7 +103,7 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         qk_norm: a.qk_norm,
         eps: spec.norm.eps,
         theta: spec.rope.theta,
-        rope_kind: rope.kind as u32,
+        rope_kind: rope.kind,
         rope_factor: rope.factor,
         rope_low: rope.low,
         rope_high: rope.high,
