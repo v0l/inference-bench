@@ -147,6 +147,8 @@ Each slice is its own issue under goal g4 (backlog, no goal set). The order is a
 | e | `topk` with groups, `gather`/`scatter`, `lookup`, dequant blocks as data (MXFP4): group-limited sigmoid MoE, gpt-oss, hash layers, DSA indexer. Absorbs #640 and #642. | tiny gpt-oss and GLM MoE fixtures |
 | f | Allowlist test: per-architecture names appear nowhere in Rust. | grep test in CI |
 
+Issues: a2 #804, a3 #805, b #806, c #807, d #808, e #809, f #810.
+
 Fixtures and GPU runs follow `docs/testing.md`: CPU and tiny tiers first, the Spark for the real models, never the desktop GPUs while the user's app is running.
 
 ## 5. Status of slice (a)
