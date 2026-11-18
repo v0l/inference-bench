@@ -124,7 +124,8 @@ impl Outcome {
 
 fn check(dir: &str, serving: bool, tps: &[usize]) {
     for &tp in tps {
-        for graphs in [false] {
+        {
+            let graphs = false;
             let o = compare(dir, serving, tp, None, graphs);
             assert_eq!(o.streams, 6);
             assert!(o.logit_err <= 2e-3 * o.logit_scale.max(1.0), "{dir} tp{tp} graphs {graphs}: logits drift by {}", o.logit_err);

@@ -64,7 +64,7 @@ pub fn layout(spec: &Spec, weight: &str) -> Result<Layout> {
 }
 
 fn split_even(len: usize, tp: usize, rank: usize) -> Result<Range<usize>> {
-    ensure!(len % tp == 0, "{len} does not divide by tp {tp}");
+    ensure!(len.is_multiple_of(tp), "{len} does not divide by tp {tp}");
     let each = len / tp;
     Ok(rank * each..(rank + 1) * each)
 }
@@ -80,6 +80,10 @@ pub struct Slice {
     pub cols: Range<usize>,
 }
 
+fn one(r: Range<usize>) -> Vec<Range<usize>> {
+    std::iter::once(r).collect()
+}
+
 impl Slice {
     pub fn row_count(&self) -> usize {
         self.rows.iter().map(|r| r.len()).sum()
@@ -91,7 +95,7 @@ pub fn slice_of(spec: &Spec, weight: &str, shard: Shard, tp: usize, rank: usize)
     let l = layout(spec, weight)?;
     let total: usize = l.rows.iter().sum();
     if tp == 1 || shard == Shard::Replicate {
-        return Ok(Slice { rows: vec![0..total], cols: 0..l.cols });
+        return Ok(Slice { rows: one(0..total), cols: 0..l.cols });
     }
     if let Some(la) = &spec.linear_attention {
         ensure!(la.v_heads == VHeadOrder::Grouped, "tp needs grouped delta-net value heads, {} has tiled ones", spec.name);
@@ -109,7 +113,7 @@ pub fn slice_of(spec: &Spec, weight: &str, shard: Shard, tp: usize, rank: usize)
         }
         Shard::Row => {
             let cols = split_even(l.cols, tp, rank).map_err(|e| anyhow::anyhow!("{weight}: {e}"))?;
-            Ok(Slice { rows: vec![0..total], cols })
+            Ok(Slice { rows: one(0..total), cols })
         }
         Shard::Vocab => Ok(Slice { rows: vec![split_ceil(total, tp, rank)], cols: 0..l.cols }),
         Shard::Replicate => unreachable!(),
@@ -127,7 +131,7 @@ pub struct Heads {
 pub fn heads_per_rank(spec: &Spec, tp: usize) -> Result<Heads> {
     ensure!(tp >= 1, "tp must be at least 1");
     let div = |what: &str, n: usize| -> Result<usize> {
-        ensure!(n % tp == 0, "tp {tp} does not divide the {n} {what} of {}", spec.name);
+        ensure!(n.is_multiple_of(tp), "tp {tp} does not divide the {n} {what} of {}", spec.name);
         Ok(n / tp)
     };
     let (key, value) = match &spec.linear_attention {
@@ -139,14 +143,14 @@ pub fn heads_per_rank(spec: &Spec, tp: usize) -> Result<Heads> {
 
 pub fn supports(spec: &Spec, tp: usize) -> Result<()> {
     heads_per_rank(spec, tp)?;
-    ensure!(spec.dims.intermediate % tp == 0, "tp {tp} does not divide the intermediate size {} of {}", spec.dims.intermediate, spec.name);
+    ensure!(spec.dims.intermediate.is_multiple_of(tp), "tp {tp} does not divide the intermediate size {} of {}", spec.dims.intermediate, spec.name);
     if tp > 1 {
         crate::allreduce::bail_unsupported(tp)?;
         ensure!(spec.moe.is_none(), "tp over mixture of experts models is not built yet ({})", spec.name);
         ensure!(spec.runtime.backend != crate::spec::BackendChoice::Wgpu, "tp runs on CUDA only");
         ensure!(spec.quant != crate::spec::Quant::Gguf, "tp does not slice GGUF weights yet ({})", spec.name);
         ensure!(!spec.uses_branch(), "tp does not cover sandwich or scaled residual norms yet ({})", spec.name);
-        ensure!(spec.attention.qk_norm_full == false, "tp does not split full-width qk norms yet ({})", spec.name);
+        ensure!(!spec.attention.qk_norm_full, "tp does not split full-width qk norms yet ({})", spec.name);
         if let Some(l) = &spec.linear_attention {
             ensure!(l.v_heads == VHeadOrder::Grouped, "tp needs grouped delta-net value heads, {} has tiled ones", spec.name);
         }
@@ -196,7 +200,7 @@ pub struct RankCut {
 
 fn heads_cut(heads: usize, head_rows: usize, tp: usize, rank: usize) -> Cut {
     let each = heads / tp * head_rows;
-    Cut::Rows(vec![rank * each..(rank + 1) * each])
+    Cut::Rows(one(rank * each..(rank + 1) * each))
 }
 
 impl RankCut {
@@ -211,7 +215,7 @@ impl RankCut {
         let a = &spec.attention;
         let hd = a.head_dim;
         let d = &spec.dims;
-        let rowcut = |n: usize| Cut::Rows(vec![rank * n / tp..(rank + 1) * n / tp]);
+        let rowcut = |n: usize| Cut::Rows(one(rank * n / tp..(rank + 1) * n / tp));
         let colcut = |n: usize| Cut::Cols(rank * n / tp..(rank + 1) * n / tp);
         let shard = |w: &str| shards.get(w).copied().unwrap_or(Shard::Replicate);
         let mut add = |key: &str, c: Cut| rules.push((key.to_string(), c));
@@ -278,7 +282,7 @@ impl RankCut {
             return Ok(None);
         }
         let aligned = |v: usize, unit: usize| -> Result<usize> {
-            ensure!(v % unit == 0, "{name}: tp {} cuts at {v}, inside a {unit} wide scale block", self.tp);
+            ensure!(v.is_multiple_of(unit), "{name}: tp {} cuts at {v}, inside a {unit} wide scale block", self.tp);
             Ok(v / unit)
         };
         Ok(match cut {
@@ -350,7 +354,7 @@ pub const FP8_BLOCK: usize = 128;
 pub const Q8_GROUP: usize = 32;
 
 pub fn fp4_rank(packed: &[u8], scales: &[u8], cols: usize, slice: &Slice) -> Result<(Vec<u8>, Vec<u8>)> {
-    ensure!(slice.cols.start % FP4_GROUP == 0 && slice.cols.end % FP4_GROUP == 0, "an nvfp4 column slice must sit on {FP4_GROUP} element groups");
+    ensure!(slice.cols.start.is_multiple_of(FP4_GROUP) && slice.cols.end.is_multiple_of(FP4_GROUP), "an nvfp4 column slice must sit on {FP4_GROUP} element groups");
     let p = take_rows(packed, cols / 2, &slice.rows);
     let s = take_rows(scales, cols / FP4_GROUP, &slice.rows);
     let (pw, sw) = (cols / 2, cols / FP4_GROUP);
@@ -360,7 +364,7 @@ pub fn fp4_rank(packed: &[u8], scales: &[u8], cols: usize, slice: &Slice) -> Res
 }
 
 pub fn q8_rank(values: &[i8], scales: &[f32], cols: usize, slice: &Slice) -> Result<(Vec<i8>, Vec<f32>)> {
-    ensure!(slice.cols.start % Q8_GROUP == 0 && slice.cols.end % Q8_GROUP == 0, "a q8 column slice must sit on {Q8_GROUP} element groups");
+    ensure!(slice.cols.start.is_multiple_of(Q8_GROUP) && slice.cols.end.is_multiple_of(Q8_GROUP), "a q8 column slice must sit on {Q8_GROUP} element groups");
     let v = take_rows(values, cols, &slice.rows);
     let s = take_rows(scales, cols / Q8_GROUP, &slice.rows);
     let v = if slice.cols == (0..cols) { v } else { take_cols(&v, cols, slice.cols.clone()) };
@@ -369,7 +373,7 @@ pub fn q8_rank(values: &[i8], scales: &[f32], cols: usize, slice: &Slice) -> Res
 }
 
 pub fn fp8_rank(values: &[u8], grid: &[f32], map: &[u32], cols: usize, slice: &Slice) -> Result<(Vec<u8>, Vec<f32>, Vec<u32>)> {
-    ensure!(slice.cols.start % FP8_BLOCK == 0 && (slice.cols.end % FP8_BLOCK == 0 || slice.cols.end == cols), "an fp8 column slice must sit on {FP8_BLOCK} wide blocks");
+    ensure!(slice.cols.start.is_multiple_of(FP8_BLOCK) && (slice.cols.end.is_multiple_of(FP8_BLOCK) || slice.cols.end == cols), "an fp8 column slice must sit on {FP8_BLOCK} wide blocks");
     let kb = cols.div_ceil(FP8_BLOCK);
     let v = take_rows(values, cols, &slice.rows);
     let v = if slice.cols == (0..cols) { v } else { take_cols(&v, cols, slice.cols.clone()) };
@@ -427,7 +431,7 @@ mod tests {
                     continue;
                 }
                 cut_any += 1;
-                let elem = whole.dtype.size();
+                let elem = whole.dtype.bitsize() / 8;
                 if parts[0].shape[0] == whole.shape[0] {
                     let width = whole.shape[1] * elem;
                     for row in 0..whole.shape[0] {
@@ -539,7 +543,7 @@ mod tests {
     fn row_parallel_weights_split_the_input_columns() {
         let s = spec("qwen3.8-27b.config.json");
         let o = slice_of(&s, "o", Shard::Row, 4, 3).unwrap();
-        assert_eq!(o.rows, vec![0..s.dims.hidden]);
+        assert_eq!(o.rows, one(0..s.dims.hidden));
         assert_eq!(o.cols, 3 * s.q_dim() / 4..s.q_dim());
         let down = slice_of(&s, "down", Shard::Row, 2, 0).unwrap();
         assert_eq!(down.cols, 0..s.dims.intermediate / 2);
@@ -591,12 +595,12 @@ mod tests {
         let (rows, cols) = (4usize, 64usize);
         let packed: Vec<u8> = (0..rows * cols / 2).map(|i| i as u8).collect();
         let scales: Vec<u8> = (0..rows * cols / FP4_GROUP).map(|i| 100 + i as u8).collect();
-        let slice = Slice { rows: vec![2..4], cols: 32..64 };
+        let slice = Slice { rows: one(2..4), cols: 32..64 };
         let (p, s) = fp4_rank(&packed, &scales, cols, &slice).unwrap();
         assert_eq!(p.len(), 2 * 16);
         assert_eq!(&p[..16], &packed[2 * 32 + 16..2 * 32 + 32]);
         assert_eq!(&s[..2], &scales[2 * 4 + 2..2 * 4 + 4]);
-        let bad = Slice { rows: vec![0..4], cols: 8..64 };
+        let bad = Slice { rows: one(0..4), cols: 8..64 };
         assert!(fp4_rank(&packed, &scales, cols, &bad).is_err());
     }
 
@@ -605,7 +609,7 @@ mod tests {
         let (rows, cols) = (2usize, 128usize);
         let v: Vec<i8> = (0..rows * cols).map(|i| (i % 127) as i8).collect();
         let s: Vec<f32> = (0..rows * cols / Q8_GROUP).map(|i| i as f32).collect();
-        let (pv, ps) = q8_rank(&v, &s, cols, &Slice { rows: vec![1..2], cols: 64..128 }).unwrap();
+        let (pv, ps) = q8_rank(&v, &s, cols, &Slice { rows: one(1..2), cols: 64..128 }).unwrap();
         assert_eq!(pv, v[cols + 64..cols + 128]);
         assert_eq!(ps, vec![6.0, 7.0]);
     }
@@ -617,12 +621,12 @@ mod tests {
         let values: Vec<u8> = (0..rows * cols).map(|i| (i % 251) as u8).collect();
         let grid: Vec<f32> = (0..(rows / FP8_BLOCK) * kb).map(|i| i as f32 + 1.0).collect();
         let map: Vec<u32> = (0..rows).map(|r| (r / FP8_BLOCK * kb) as u32).collect();
-        let slice = Slice { rows: vec![128..256], cols: 128..256 };
+        let slice = Slice { rows: one(128..256), cols: 128..256 };
         let (v, g, m) = fp8_rank(&values, &grid, &map, cols, &slice).unwrap();
         assert_eq!(v.len(), 128 * 128);
         assert_eq!(g, vec![4.0]);
         assert!(m.iter().all(|&i| g[i as usize] == 4.0));
-        let whole = Slice { rows: vec![0..256], cols: 0..128 };
+        let whole = Slice { rows: one(0..256), cols: 0..128 };
         let (_, g, m) = fp8_rank(&values, &grid, &map, cols, &whole).unwrap();
         assert_eq!(g, vec![1.0, 3.0]);
         assert_eq!(g[m[0] as usize], 1.0);

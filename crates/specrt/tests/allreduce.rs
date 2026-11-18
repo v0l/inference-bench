@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use cudarc::driver::{CudaSlice, CudaStream};
 use kir::allreduce::Dtype;
 use specrt::allreduce::{Comm, Fabric, PROBE_TIMEOUT, ProbeOutcome, Transport, contexts, peer_writes_land};

@@ -206,7 +206,7 @@ impl Checkpoint {
         let full = self.full_view(name)?;
         let Some(cut) = self.cut.as_deref() else { return Ok(full) };
         let Some(rule) = cut.rule(name, &full.shape)? else { return Ok(full) };
-        let elem = full.dtype.size();
+        let elem = full.dtype.bitsize() / 8;
         let (shape, bytes) = crate::tp::cut_bytes(full.data, &full.shape, elem, &rule).with_context(|| format!("slicing {name} for rank {}", cut.rank))?;
         Ok(View { dtype: full.dtype, shape, data: match bytes { std::borrow::Cow::Borrowed(b) => b, std::borrow::Cow::Owned(v) => self.keep(v) } })
     }
