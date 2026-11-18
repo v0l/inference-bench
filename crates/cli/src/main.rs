@@ -1,3 +1,5 @@
+#![allow(clippy::large_enum_variant)]
+
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use inference_bench_core::target::{NATIVE, Request, TargetConfig};

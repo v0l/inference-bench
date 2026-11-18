@@ -36,8 +36,10 @@ fn run(file: &str) -> Outcome {
     let stem = file.trim_end_matches(".gguf").trim_start_matches("Qwen3-0.6B-");
     let reference: Vec<f32> = std::fs::read(dir().join(format!("q3-{stem}.logits.bin")))
         .unwrap()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
     let greedy: Vec<u32> = std::fs::read_to_string(dir().join(format!("q3-{stem}.greedy.txt"))).unwrap().lines().map(|l| l.parse().unwrap()).collect();
     let spec = Spec::from_gguf_file(&dir().join(file)).unwrap();

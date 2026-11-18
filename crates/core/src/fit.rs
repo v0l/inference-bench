@@ -39,7 +39,7 @@ pub fn pool_bytes(a: &ModelAnatomy, ctx: usize, seqs: usize, kv_gb: f64) -> u64 
 }
 
 pub fn pool_tokens(a: &ModelAnatomy, kv_bytes: u64) -> usize {
-    if a.kv_bytes_per_token == 0 { usize::MAX } else { (kv_bytes / a.kv_bytes_per_token) as usize }
+    kv_bytes.checked_div(a.kv_bytes_per_token).map_or(usize::MAX, |n| n as usize)
 }
 
 pub fn pool_holds_one(a: &ModelAnatomy, kv_bytes: u64, ctx: usize) -> bool {
@@ -132,13 +132,12 @@ fn finish(m: &crate::library::LocalModel, spec: specrt::spec::Spec, source: &'st
     let mut anatomy = ModelAnatomy::new(&spec, mtp, ctx);
     let mut spec = spec;
     let mut structure = None;
-    if with_header {
-        if let Ok(st) = specrt::structure::Structure::read(&m.files) {
+    if with_header
+        && let Ok(st) = specrt::structure::Structure::read(&m.files) {
             spec.apply_structure(&st);
             anatomy = ModelAnatomy::new(&spec, anatomy.mtp_layers, Some(anatomy.max_context));
             structure = Some(st);
         }
-    }
     Described { spec, anatomy, structure, unread: Vec::new(), source }
 }
 

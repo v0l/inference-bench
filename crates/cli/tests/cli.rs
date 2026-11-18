@@ -193,7 +193,7 @@ fn publish(script: &Script, entries: &[(&str, String)], etag: &str, commit: &str
     publish_specs(script, "v0l/inference-bench", "refs/heads/master", commit, etag, &refs);
 }
 
-fn specs_cmd(out: &PathBuf, url: &str, args: &[&str]) -> Output {
+fn specs_cmd(out: &std::path::Path, url: &str, args: &[&str]) -> Output {
     bin().env("INFERENCE_BENCH_SPECS_URL", url).args(["--out", out.to_str().unwrap(), "specs"]).args(args).output().unwrap()
 }
 

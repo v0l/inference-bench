@@ -811,7 +811,7 @@ mod tests {
         let allowed = |m: &[u32], t: u32| m[t as usize / 32] >> (t % 32) & 1 == 1;
         let m = c.mask();
         let open: Vec<u32> = (0..257).filter(|&t| allowed(&m, t)).collect();
-        let mut want: Vec<u32> = [b' ', b'\t', b'\n', b'\r', b'{'].iter().map(|&b| b as u32 + 1).collect();
+        let mut want: Vec<u32> = b" \t\n\r{".iter().map(|&b| b as u32 + 1).collect();
         want.sort();
         assert_eq!(open, want);
         assert!(c.advance(b'{' as u32 + 1) && c.advance(b'}' as u32 + 1));

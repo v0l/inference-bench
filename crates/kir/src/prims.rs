@@ -87,7 +87,7 @@ impl PrimKernel {
         }
         match self.prim {
             Prim::Embed { width, scale, .. } if width == 0 || !scale.is_finite() => Err(format!("{}: bad embed width or scale", self.name)),
-            Prim::SpliceRows { width } if width == 0 => Err(format!("{}: width must be positive", self.name)),
+            Prim::SpliceRows { width: 0 } => Err(format!("{}: width must be positive", self.name)),
             Prim::RmsSplit { width, eps } if width == 0 || !width.is_multiple_of(4) || !eps.is_finite() || eps < 0.0 => {
                 Err(format!("{}: rms_split needs a width that is a multiple of 4 and a finite eps", self.name))
             }

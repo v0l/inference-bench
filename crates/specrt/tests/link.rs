@@ -28,10 +28,10 @@ fn round_trip(mode: LinkMode) {
     let link = DeviceLink::with_mode(&a, &b, mode).unwrap();
     assert_eq!(link.mode(), mode);
     let host = pattern(100_003);
-    let src = sa.memcpy_stod(&host).unwrap();
+    let src = sa.clone_htod(&host).unwrap();
     let mut dst = sb.alloc_zeros::<f32>(host.len()).unwrap();
     link.copy(&src, &sa, &mut dst, &sb, host.len()).unwrap();
-    let back = sb.memcpy_dtov(&dst).unwrap();
+    let back = sb.clone_dtoh(&dst).unwrap();
     assert_eq!(back, host);
 }
 

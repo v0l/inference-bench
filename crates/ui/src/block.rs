@@ -264,7 +264,6 @@ fn paint_node(ui: &egui::Ui, rect: Rect, n: &Node, tint: Color32) {
 }
 
 pub fn draw(ui: &mut egui::Ui, rows: &[Row]) {
-    let rows = rows;
     let width = ui.available_width().min(720.0);
     let (area, _) = ui.allocate_exact_size(vec2(width, total_height(rows)), Sense::hover());
     let skip_x = area.left() + 8.0;

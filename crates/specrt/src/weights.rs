@@ -737,7 +737,7 @@ pub fn quantize_nvfp4(w: &[u16], cols: usize) -> crate::nvfp4::Fp4<'static> {
             for (i, &v) in group.iter().enumerate() {
                 let q = if s > 0.0 { f32_to_e2m1(bf16_to_f32(v) / s) } else { 0 };
                 let at = g * GROUP + i;
-                out[at / 2] |= if at % 2 == 0 { q } else { q << 4 };
+                out[at / 2] |= if at.is_multiple_of(2) { q } else { q << 4 };
             }
         }
     });
@@ -1142,6 +1142,60 @@ pub fn find_in_snapshot(repo: &str, file: &str) -> Result<PathBuf> {
     bail!("no {file} for {repo} under {}", snapshots.display())
 }
 
+pub struct Feed {
+    done: u64,
+    total: u64,
+    sizes: Vec<u64>,
+    reader: Option<std::sync::Arc<crate::loader::Prefetcher>>,
+}
+
+impl Feed {
+    pub fn new(
+        ck: &Checkpoint,
+        groups: Vec<Vec<String>>,
+        opts: &crate::loader::LoaderOptions,
+        ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
+        budget: std::sync::Arc<crate::loader::Budget>,
+    ) -> Result<Feed> {
+        let mut items = Vec::with_capacity(groups.len());
+        for g in &groups {
+            items.push(ck.extents(g)?);
+        }
+        let sizes: Vec<u64> = items.iter().map(|g| g.iter().map(|i| i.len).sum()).collect();
+        let total = sizes.iter().sum();
+        let reader = if opts.enabled && ck.is_safetensors() && !groups.is_empty() && !ck.cached(opts) {
+            Some(std::sync::Arc::new(crate::loader::Prefetcher::start(&ck.files, items, *opts, Some(ctx.clone()), budget)?))
+        } else {
+            None
+        };
+        crate::progress::report(crate::progress::Stage::Weights, 0, total);
+        Ok(Feed { done: 0, total, sizes, reader })
+    }
+
+    pub fn direct(&self) -> bool {
+        self.reader.as_ref().is_some_and(|r| r.direct)
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    pub fn reader(&self) -> Option<std::sync::Arc<crate::loader::Prefetcher>> {
+        self.reader.clone()
+    }
+
+    pub fn size(&self, group: usize) -> u64 {
+        self.sizes.get(group).copied().unwrap_or(0)
+    }
+
+    pub fn finished(&mut self, group: usize) {
+        if let Some(&size) = self.sizes.get(group) {
+            self.done += size;
+            crate::progress::report(crate::progress::Stage::Weights, self.done, self.total);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1331,7 +1385,7 @@ mod tests {
         assert_eq!(m.packed.as_ref(), packed.as_slice());
         assert_eq!(m.scales.as_ref(), scales.as_slice());
         assert_eq!(m.rows(), rows);
-        assert!(m.scales.iter().any(|&s| s == 0x7e), "the largest group uses the top e4m3 scale");
+        assert!(m.scales.contains(&0x7e), "the largest group uses the top e4m3 scale");
     }
 
     #[test]
@@ -1353,59 +1407,5 @@ mod tests {
         assert_eq!(e4m3_to_f32(0x07), 7.0 * 2f32.powi(-9));
         assert_eq!(e4m3_to_f32(0x08), 2f32.powi(-6));
         assert_eq!(e4m3_to_f32(0x80), -0.0);
-    }
-}
-
-pub struct Feed {
-    done: u64,
-    total: u64,
-    sizes: Vec<u64>,
-    reader: Option<std::sync::Arc<crate::loader::Prefetcher>>,
-}
-
-impl Feed {
-    pub fn new(
-        ck: &Checkpoint,
-        groups: Vec<Vec<String>>,
-        opts: &crate::loader::LoaderOptions,
-        ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
-        budget: std::sync::Arc<crate::loader::Budget>,
-    ) -> Result<Feed> {
-        let mut items = Vec::with_capacity(groups.len());
-        for g in &groups {
-            items.push(ck.extents(g)?);
-        }
-        let sizes: Vec<u64> = items.iter().map(|g| g.iter().map(|i| i.len).sum()).collect();
-        let total = sizes.iter().sum();
-        let reader = if opts.enabled && ck.is_safetensors() && !groups.is_empty() && !ck.cached(opts) {
-            Some(std::sync::Arc::new(crate::loader::Prefetcher::start(&ck.files, items, *opts, Some(ctx.clone()), budget)?))
-        } else {
-            None
-        };
-        crate::progress::report(crate::progress::Stage::Weights, 0, total);
-        Ok(Feed { done: 0, total, sizes, reader })
-    }
-
-    pub fn direct(&self) -> bool {
-        self.reader.as_ref().is_some_and(|r| r.direct)
-    }
-
-    pub fn total(&self) -> u64 {
-        self.total
-    }
-
-    pub fn reader(&self) -> Option<std::sync::Arc<crate::loader::Prefetcher>> {
-        self.reader.clone()
-    }
-
-    pub fn size(&self, group: usize) -> u64 {
-        self.sizes.get(group).copied().unwrap_or(0)
-    }
-
-    pub fn finished(&mut self, group: usize) {
-        if let Some(&size) = self.sizes.get(group) {
-            self.done += size;
-            crate::progress::report(crate::progress::Stage::Weights, self.done, self.total);
-        }
     }
 }

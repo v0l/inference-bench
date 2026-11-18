@@ -145,7 +145,7 @@ fn messages_effort_and_budget_reach_the_template() {
 
 #[test]
 fn messages_tool_results_and_images_reach_the_model_as_chat_turns() {
-    let rig = start(config(&format!("{AGENT}")), Shape { vision: true, ..pieces(&["ok", ""]) });
+    let rig = start(config(AGENT), Shape { vision: true, ..pieces(&["ok", ""]) });
     let body = json!({
         "model": "m", "max_tokens": 50, "tools": weather(), "thinking": {"type": "disabled"},
         "messages": [
@@ -326,7 +326,7 @@ fn a_budget_that_is_not_reached_changes_nothing() {
 
 #[test]
 fn a_max_tokens_cap_leaves_room_for_the_answer_when_there_is_no_budget() {
-    let rig = start(config(&format!("{AGENT}")), pieces(&["t "; 1200].iter().copied().chain(["</think>", "answer"]).collect::<Vec<_>>()));
+    let rig = start(config(AGENT), pieces(&["t "; 1200].iter().copied().chain(["</think>", "answer"]).collect::<Vec<_>>()));
     let body = json!({"model": "m", "max_tokens": 1024, "messages": [{"role": "user", "content": "hi"}]});
     let (_, text, _) = rig.post("/v1/chat/completions", None, body);
     let v: Value = serde_json::from_str(&text).unwrap();

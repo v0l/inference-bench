@@ -65,7 +65,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::at
         rope: kir::attention::RopeShape {
             rotary_dim: spec.rotary_dim(),
             theta: spec.rope.theta,
-            kind: rope.kind as u32,
+            kind: rope.kind,
             factor: rope.factor,
             low: rope.low,
             high: rope.high,

@@ -59,11 +59,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         app.notice = Some((true, "session verified, the next request that continues it skips the prefill".into()));
                     }
                 }
-                if ui.add(Key::new("strip").outline(VALUE).enabled(!r.stripped).id_salt(("session-strip", i))).clicked() {
-                    if let Err(e) = shared.store.strip(&r.id, now_seconds()) {
+                if ui.add(Key::new("strip").outline(VALUE).enabled(!r.stripped).id_salt(("session-strip", i))).clicked()
+                    && let Err(e) = shared.store.strip(&r.id, now_seconds()) {
                         app.notice = Some((false, format!("{e:#}")));
                     }
-                }
                 if ui.add(Key::new("delete").outline(FAULT).id_salt(("session-delete", i))).clicked() {
                     let _ = shared.store.delete(&r.id);
                 }

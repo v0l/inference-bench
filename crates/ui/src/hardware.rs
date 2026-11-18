@@ -13,6 +13,7 @@ use specrt::host::{Host, HostConfig};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+#[derive(Default)]
 pub struct HardwareState {
     pub auto: bool,
     pub machine: Option<Machine>,
@@ -33,29 +34,6 @@ pub struct HardwareState {
     announced: Option<String>,
 }
 
-impl Default for HardwareState {
-    fn default() -> Self {
-        Self {
-            auto: false,
-            machine: None,
-            probe: Pending::default(),
-            probe_at: None,
-            probe_error: None,
-            host: None,
-            host_error: None,
-            host_sig: None,
-            browser: None,
-            peers: BTreeMap::new(),
-            pair_input: BTreeMap::new(),
-            pair_notice: None,
-            code: None,
-            run: None,
-            run_label: None,
-            slot: Default::default(),
-            announced: None,
-        }
-    }
-}
 
 impl HardwareState {
     pub fn selection(&self, settings: &inference_bench_core::settings::ClusterSettings) -> Selection {

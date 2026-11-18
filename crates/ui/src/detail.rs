@@ -4,11 +4,9 @@ use eframe::egui;
 use egui_bench::prelude::*;
 use inference_bench_core::hf::{Hub, ModelTree, model_tree_now};
 use inference_bench_core::library::{Format, LocalModel, Lineage, Relation, human_size};
-use serde_json::Value;
 use specrt::anatomy::{LayerKind, ModelAnatomy};
 use specrt::spec::Spec;
 use specrt::structure::Structure;
-use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -483,7 +481,8 @@ fn layers_note(a: &ModelAnatomy, window: Option<usize>) -> String {
 mod tests {
     use super::*;
     use inference_bench_core::library::{hub_dir, scan_hub};
-    use std::path::PathBuf;
+    use serde_json::Value;
+    use std::path::{Path, PathBuf};
 
     fn fixtures() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures")
@@ -622,6 +621,7 @@ fn block_section(ui: &mut egui::Ui, view: &View, _kind: LayerKind, layer: Option
 #[cfg(test)]
 mod note_tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn the_layer_note_counts_sliding_layers_with_the_window() {

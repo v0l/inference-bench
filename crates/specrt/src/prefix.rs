@@ -10,6 +10,9 @@ pub type Hash = [u8; 32];
 pub trait SnapshotData: Send + Sync {
     fn floats(&self) -> &[f32];
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Clone)]

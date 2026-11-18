@@ -286,7 +286,7 @@ fn the_new_light_primitives_are_refused_on_wgpu_with_a_clear_error() {
 #[test]
 fn norm_add_adds_the_normed_delta_to_the_residual() {
     let k = Kernel::norm_add(&Target::sm_120(), 128, 1e-6, 0.0, 256).unwrap();
-    let src = kir::cuda::emit_module(&[k.clone()]).unwrap();
+    let src = kir::cuda::emit_module(std::slice::from_ref(&k)).unwrap();
     assert!(src.contains("out[base + i] = resid[base + i] + weight[i] * (delta[base + i] * inv)"), "{src}");
     assert!(kir::wgsl::emit_kernel(&Kernel::norm_add(&Target::wgpu_baseline(), 128, 1e-6, 0.0, 256).unwrap()).unwrap_err().contains("no WGSL emitter"));
 }

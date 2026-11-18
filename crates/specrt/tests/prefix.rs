@@ -359,7 +359,7 @@ fn evicting_a_parent_drops_the_tails_under_it() {
             pool.release(&mut vec![b]);
         }
     }
-    let mut budget = PrefixCache::new(&options(0, 4), false);
+    let budget = PrefixCache::new(&options(0, 4), false);
     assert_eq!(budget.tails(), 0);
     assert!(cache.evict_one(&mut pool));
     assert!(cache.evict_one(&mut pool));

@@ -31,7 +31,6 @@ pub struct Snapshot {
     pub running: Vec<f32>,
     pub kv: Vec<f32>,
     pub recent: Vec<RequestRecord>,
-    pub samples: usize,
 }
 
 pub fn snapshot(app: &App, span: Span) -> Snapshot {
@@ -56,7 +55,6 @@ pub fn snapshot(app: &App, span: Span) -> Snapshot {
             drop(h);
             handle.recent_requests()
         },
-        samples: history.lock().unwrap().len(),
     }
 }
 

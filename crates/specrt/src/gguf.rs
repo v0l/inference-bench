@@ -211,7 +211,7 @@ impl<'a> Reader<'a> {
 
     fn string(&mut self) -> Result<String> {
         let len = usize::try_from(self.u64()?)?;
-        Ok(String::from_utf8(self.take(len)?.to_vec()).context("a GGUF string is not UTF-8")?)
+        String::from_utf8(self.take(len)?.to_vec()).context("a GGUF string is not UTF-8")
     }
 
     fn value(&mut self, kind: u32) -> Result<Value> {
@@ -546,7 +546,7 @@ impl Gguf {
                 if linear { Block::Linear } else { Block::Full }
             })
             .collect();
-        let period = (1..=pattern.len()).find(|p| pattern.len() % p == 0 && pattern.iter().enumerate().all(|(i, b)| *b == pattern[i % p])).unwrap_or(pattern.len());
+        let period = (1..=pattern.len()).find(|p| pattern.len().is_multiple_of(*p) && pattern.iter().enumerate().all(|(i, b)| *b == pattern[i % p])).unwrap_or(pattern.len());
         let pattern = pattern[..period].to_vec();
         let la = crate::spec::LinearAttention {
             kind: crate::spec::LinearKind::GatedDeltaNet,
@@ -1033,33 +1033,67 @@ pub mod writer {
 
     fn put_kv(out: &mut Vec<u8>, kv: &Kv) {
         match kv {
-            Kv::U8(v) => (out.extend(0u32.to_le_bytes()), out.push(*v)),
-            Kv::I8(v) => (out.extend(1u32.to_le_bytes()), out.push(*v as u8)),
-            Kv::U16(v) => (out.extend(2u32.to_le_bytes()), out.extend(v.to_le_bytes())),
-            Kv::I16(v) => (out.extend(3u32.to_le_bytes()), out.extend(v.to_le_bytes())),
-            Kv::U32(v) => (out.extend(4u32.to_le_bytes()), out.extend(v.to_le_bytes())),
-            Kv::I32(v) => (out.extend(5u32.to_le_bytes()), out.extend(v.to_le_bytes())),
-            Kv::F32(v) => (out.extend(6u32.to_le_bytes()), out.extend(v.to_le_bytes())),
-            Kv::Bool(v) => (out.extend(7u32.to_le_bytes()), out.push(*v as u8)),
-            Kv::Str(s) => (out.extend(8u32.to_le_bytes()), put_str(out, s)),
-            Kv::U64(v) => (out.extend(10u32.to_le_bytes()), out.extend(v.to_le_bytes())),
-            Kv::I64(v) => (out.extend(11u32.to_le_bytes()), out.extend(v.to_le_bytes())),
-            Kv::F64(v) => (out.extend(12u32.to_le_bytes()), out.extend(v.to_le_bytes())),
+            Kv::U8(v) => {
+                out.extend(0u32.to_le_bytes());
+                out.push(*v);
+            }
+            Kv::I8(v) => {
+                out.extend(1u32.to_le_bytes());
+                out.push(*v as u8);
+            }
+            Kv::U16(v) => {
+                out.extend(2u32.to_le_bytes());
+                out.extend(v.to_le_bytes());
+            }
+            Kv::I16(v) => {
+                out.extend(3u32.to_le_bytes());
+                out.extend(v.to_le_bytes());
+            }
+            Kv::U32(v) => {
+                out.extend(4u32.to_le_bytes());
+                out.extend(v.to_le_bytes());
+            }
+            Kv::I32(v) => {
+                out.extend(5u32.to_le_bytes());
+                out.extend(v.to_le_bytes());
+            }
+            Kv::F32(v) => {
+                out.extend(6u32.to_le_bytes());
+                out.extend(v.to_le_bytes());
+            }
+            Kv::Bool(v) => {
+                out.extend(7u32.to_le_bytes());
+                out.push(*v as u8);
+            }
+            Kv::Str(s) => {
+                out.extend(8u32.to_le_bytes());
+                put_str(out, s);
+            }
+            Kv::U64(v) => {
+                out.extend(10u32.to_le_bytes());
+                out.extend(v.to_le_bytes());
+            }
+            Kv::I64(v) => {
+                out.extend(11u32.to_le_bytes());
+                out.extend(v.to_le_bytes());
+            }
+            Kv::F64(v) => {
+                out.extend(12u32.to_le_bytes());
+                out.extend(v.to_le_bytes());
+            }
             Kv::Strs(list) => {
                 out.extend(9u32.to_le_bytes());
                 out.extend(8u32.to_le_bytes());
                 out.extend((list.len() as u64).to_le_bytes());
                 list.iter().for_each(|s| put_str(out, s));
-                return;
             }
             Kv::U32s(list) => {
                 out.extend(9u32.to_le_bytes());
                 out.extend(4u32.to_le_bytes());
                 out.extend((list.len() as u64).to_le_bytes());
                 list.iter().for_each(|v| out.extend(v.to_le_bytes()));
-                return;
             }
-        };
+        }
     }
 
     pub fn build(version: u32, kvs: &[(&str, Kv)], tensors: &[(&str, &[u64], u32, &[u8])]) -> Vec<u8> {
@@ -1200,7 +1234,7 @@ mod tests {
     }
 
     fn tiny_qwen3() -> Vec<u8> {
-        let norm = vec![0u8; 4 * 8];
+        let norm = [0u8; 4 * 8];
         let embd = vec![0u8; 4 * 8 * 16];
         build(
             3,

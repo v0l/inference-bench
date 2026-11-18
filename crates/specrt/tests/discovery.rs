@@ -113,11 +113,10 @@ fn multicast_works(port: u16) -> bool {
     let Ok(_announce) = Announcer::start(&d, "127.0.0.1:9".parse().unwrap(), port) else { return false };
     let deadline = Instant::now() + Duration::from_secs(8);
     while Instant::now() < deadline {
-        if let Ok(Event::Join { device, .. }) = browser.events().recv_timeout(Duration::from_millis(200)) {
-            if device.name == "probe" {
+        if let Ok(Event::Join { device, .. }) = browser.events().recv_timeout(Duration::from_millis(200))
+            && device.name == "probe" {
                 return true;
             }
-        }
     }
     false
 }
@@ -244,14 +243,14 @@ fn tiny_spec() -> Spec {
 
 struct Node {
     server: StageServer,
-    announcer: Option<Announcer>,
+    _announcer: Option<Announcer>,
 }
 
 fn node(spec: &Spec, name: &str, bind: &str, announce_port: Option<u16>) -> Node {
     let stage = Arc::new(specrt::stage::RuntimeStage::unloaded(spec, 512, 1));
     let server = StageServer::start(bind, KEY, stage).unwrap();
     let announcer = announce_port.map(|p| Announcer::start(&device(name, None), server.addr(), p).unwrap());
-    Node { server, announcer }
+    Node { server, _announcer: announcer }
 }
 
 #[test]

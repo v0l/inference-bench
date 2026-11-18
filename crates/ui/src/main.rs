@@ -1,3 +1,5 @@
+#![allow(deprecated, clippy::too_many_arguments)]
+
 mod working;
 mod chat;
 mod breakdown;
@@ -279,9 +281,11 @@ fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = args.first().map(PathBuf::from).unwrap_or_else(store::data_dir);
     let buffer = inference_bench_core::logging::LogBuffer::new(5000);
-    let mut log = inference_bench_core::logging::LogConfig::default();
-    log.buffer = Some(buffer.clone());
-    log.file = Some(inference_bench_core::logging::FileLog::in_dir(inference_bench_core::logging::default_log_dir()));
+    let log = inference_bench_core::logging::LogConfig {
+        buffer: Some(buffer.clone()),
+        file: Some(inference_bench_core::logging::FileLog::in_dir(inference_bench_core::logging::default_log_dir())),
+        ..Default::default()
+    };
     let _log_guard = inference_bench_core::logging::init(&log).ok();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

@@ -59,10 +59,7 @@ fn convert(out: &Path, format: Format) {
                 }
             } else if !modelopt {
                 Owned { dtype: v.dtype(), shape: v.shape().to_vec(), data: v.data().to_vec() }
-            } else if name.ends_with(".weight_global_scale") {
-                let g = f32::from_le_bytes(v.data()[..4].try_into().unwrap());
-                Owned { dtype: Dtype::F32, shape: vec![], data: f32_bytes(1.0 / g) }
-            } else if name.ends_with(".input_global_scale") {
+            } else if name.ends_with(".weight_global_scale") || name.ends_with(".input_global_scale") {
                 let g = f32::from_le_bytes(v.data()[..4].try_into().unwrap());
                 Owned { dtype: Dtype::F32, shape: vec![], data: f32_bytes(1.0 / g) }
             } else {
@@ -106,14 +103,11 @@ fn modelopt_tensor_names_load_as_the_compressed_tensors_matrices() {
     assert!(ours.has("model.language_model.layers.0.mlp.gate_proj.weight_scale_2"));
     for i in 0..spec.layers.count {
         let (a, b) = (theirs.layer(&spec, i).unwrap(), ours.layer(&spec, i).unwrap());
-        match (&a.gate_up, &b.gate_up) {
-            (Matrix::Fp4(x), Matrix::Fp4(y)) => {
-                assert_eq!(x.packed, y.packed, "layer {i} gate_up packed");
-                assert_eq!(x.scales, y.scales);
-                assert!((x.global / y.global - 1.0).abs() < 1e-6);
-                assert!((x.input_global / y.input_global - 1.0).abs() < 1e-6);
-            }
-            _ => {}
+        if let (Matrix::Fp4(x), Matrix::Fp4(y)) = (&a.gate_up, &b.gate_up) {
+            assert_eq!(x.packed, y.packed, "layer {i} gate_up packed");
+            assert_eq!(x.scales, y.scales);
+            assert!((x.global / y.global - 1.0).abs() < 1e-6);
+            assert!((x.input_global / y.input_global - 1.0).abs() < 1e-6);
         }
         if let (Mixer::Attention(x), Mixer::Attention(y)) = (&a.mixer, &b.mixer) {
             let (xv, xs) = fp8_parts(&x.qkv);

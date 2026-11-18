@@ -412,8 +412,8 @@ where
     fn on_record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>, ctx: LayerContext<'_, S>) {
         let mut v = Fields::default();
         values.record(&mut v);
-        if let Some(span) = ctx.span(id) {
-            if let Some(f) = span.extensions_mut().get_mut::<SpanFields>() {
+        if let Some(span) = ctx.span(id)
+            && let Some(f) = span.extensions_mut().get_mut::<SpanFields>() {
                 for (k, val) in v.fields {
                     match f.0.iter_mut().find(|(name, _)| *name == k) {
                         Some(slot) => slot.1 = val,
@@ -421,7 +421,6 @@ where
                     }
                 }
             }
-        }
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: LayerContext<'_, S>) {

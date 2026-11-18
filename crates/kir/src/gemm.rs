@@ -712,7 +712,7 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
             Choice { quant: Some(quant), ..plain(name, GemmPath::F8a, tile, Some(k)) }
         }
         WeightFormat::Fp4 if act_quant && fp4_act => {
-            let variant = skinny_variant(&r, tuning).unwrap_or(variant);
+            let variant = skinny_variant(r, tuning).unwrap_or(variant);
             let tile = tuning.fp4_tile(variant);
             let name = format!("{}_f4a{}", r.linear, variant.suffix());
             let k = KernelInstance::fp4_act(t, &name, r.shape, tile, tuning)?;

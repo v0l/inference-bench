@@ -1,4 +1,3 @@
-use specrt::codegen::PAGE;
 use specrt::runtime::{Layout, Runtime, Sampling};
 use specrt::sched::{Config, Event, Executor, GpuExecutor, Request, Scheduler};
 use specrt::sessions::{SessionOptions, SessionStore, Shared};
@@ -17,10 +16,6 @@ fn spec_for(dir: &str) -> Spec {
     spec.name = dir.into();
     spec.repo = fixture_dir(dir).display().to_string();
     spec
-}
-
-fn scheduler(s: &Spec) -> Scheduler<GpuExecutor> {
-    scheduler_with(s, false)
 }
 
 fn scheduler_with(s: &Spec, cache: bool) -> Scheduler<GpuExecutor> {
@@ -105,7 +100,6 @@ fn roundtrip(name: &str) {
     assert_eq!(got.logprobs, want.logprobs, "logits of every step bit identical");
     assert_eq!(shared.stats().restores_ok, 1);
     assert_eq!(shared.stats().prefill_tokens_saved, saved[0].tokens as u64);
-    assert!(PAGE > 0);
 }
 
 #[test]

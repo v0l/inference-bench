@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::large_enum_variant, clippy::type_complexity, clippy::needless_range_loop, clippy::chunks_exact_to_as_chunks)]
+
 pub mod anatomy;
 pub mod backends;
 pub mod wgsl;

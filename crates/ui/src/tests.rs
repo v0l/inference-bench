@@ -555,7 +555,7 @@ fn the_agent_chat_runs_a_tool_the_model_asked_for_in_xml() {
         Turn::Did { name, answer, .. } => Some((name.clone(), answer.clone())),
         _ => None,
     });
-    let (name, answer) = did.unwrap_or_else(|| panic!("no tool turn: {}", format!("{} turns", turns.len())));
+    let (name, answer) = did.unwrap_or_else(|| panic!("no tool turn: {} turns", turns.len()));
     assert_eq!(name, "workspace");
     assert!(matches!(answer, Some(Ok(_))), "{answer:?}");
     assert!(turns.iter().any(|t| matches!(t, Turn::Said(s) if s.contains("workspace is ready"))));
@@ -1690,7 +1690,7 @@ fn the_library_list_is_flat_and_search_matches_the_base() {
     h.get_by_label_contains("Qwen/Qwen3.8-27B-FP8");
     h.get_by_label_contains("orcarouter/Qwen3.8-27B-Uncensored-NVFP4");
     assert!(models::matches(&h.state().library[1], "Qwen3.8-27B uncensored"));
-    assert!(models::matches(&h.state().library[1], "org/none") == false);
+    assert!(!models::matches(&h.state().library[1], "org/none"));
     let mut quant = h.state().library[3].clone();
     quant.lineage = h.state().library[0].lineage.clone();
     assert!(models::matches(&quant, "Qwen/Qwen3.8-27B"));

@@ -806,11 +806,10 @@ impl<E: Executor> Scheduler<E> {
         let now = (sessions.clock)();
         let mut cap = Capturing { exec: &mut self.exec, pool: &mut self.pool, held: &mut sessions.held };
         let written = sessions.janitor.save_keys(vec![key.clone()], now, &sessions.shared.store, &mut cap);
-        if written.is_empty() {
-            if let Some(mut h) = sessions.held.remove(&key) {
+        if written.is_empty()
+            && let Some(mut h) = sessions.held.remove(&key) {
                 self.pool.release(&mut h.blocks);
             }
-        }
         self.publish_residents();
         true
     }
@@ -1168,14 +1167,13 @@ impl<E: Executor> Scheduler<E> {
                 break;
             }
             let mut s = self.waiting.pop_front().expect("front exists");
-            if let Some(state) = &hit.snapshot {
-                if let Err(e) = self.exec.restore(slot, state) {
+            if let Some(state) = &hit.snapshot
+                && let Err(e) = self.exec.restore(slot, state) {
                     self.exec.release_state(slot);
                     self.give_back(hit);
                     self.waiting.push_front(s);
                     return Err(e);
                 }
-            }
             self.free_slots.pop();
             if s.generated() == 0 && self.cache.is_some() {
                 self.prefix_queries += s.req.prompt.len() as u64;
@@ -1460,11 +1458,10 @@ impl<E: Executor> Scheduler<E> {
                     break;
                 }
                 let mut n = (target - s.computed).min(limit).min(left);
-                if self.cache.is_some() && self.exec.hybrid() {
-                    if let Some(p) = self.snapshot_points(i).into_iter().find(|&p| p > self.running[i].computed) {
+                if self.cache.is_some() && self.exec.hybrid()
+                    && let Some(p) = self.snapshot_points(i).into_iter().find(|&p| p > self.running[i].computed) {
                         n = n.min(p - self.running[i].computed);
                     }
-                }
                 if let Some(m) = self.running[i].media.clone() {
                     let from = self.running[i].computed;
                     n = m.extend_chunk(from, from + n, limit) - from;
@@ -1800,7 +1797,7 @@ mod tests {
             let mut k = Vec::new();
             for &b in blocks {
                 for i in 0..PAGE {
-                    k.extend(self.kv[b as usize * PAGE + i].map_or(u32::MAX, |t| t).to_le_bytes());
+                    k.extend(self.kv[b as usize * PAGE + i].unwrap_or(u32::MAX).to_le_bytes());
                 }
             }
             Ok(crate::sessions::pack_sections(k, Vec::new(), state))
@@ -1929,10 +1926,7 @@ mod tests {
             let mut events = Vec::new();
             reports.push(s.step(&mut events).unwrap());
             for e in &events {
-                match e {
-                    Event::Token { id, token } => out.entry(*id).or_default().push(*token),
-                    _ => {}
-                }
+                if let Event::Token { id, token } = e { out.entry(*id).or_default().push(*token) }
             }
             all.extend(events);
             steps += 1;
@@ -2081,7 +2075,7 @@ mod tests {
     #[test]
     fn lookahead_admission_preempts_less_than_prompt_only_admission() {
         let run = |lookahead: usize| {
-            let mut fake = Fake::new(2048, 16, 120, 256);
+            let fake = Fake::new(2048, 16, 120, 256);
             let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), admit_lookahead: lookahead, ..Config::default() };
             let mut s = Scheduler::new(fake, cfg);
             let mut want = HashMap::new();
@@ -2583,7 +2577,7 @@ mod tests {
         let mut events = Vec::new();
         for round in 0..1000u32 {
             x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            if (x >> 40) % 3 != 0 && s.waiting() < 8 {
+            if !(x >> 40).is_multiple_of(3) && s.waiting() < 8 {
                 s.submit(request(1 + ((x >> 20) % 200) as usize, 1 + ((x >> 8) % 12) as usize, round)).unwrap();
             }
             s.step(&mut events).unwrap();
@@ -2721,7 +2715,7 @@ mod tests {
         step_p95: f64,
     }
 
-    fn pct(v: &mut Vec<f64>, p: f64) -> f64 {
+    fn pct(v: &mut [f64], p: f64) -> f64 {
         v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         v[((v.len() - 1) as f64 * p) as usize]
     }
@@ -2773,11 +2767,10 @@ mod tests {
                 long_steps += 1;
             }
             for e in &ev {
-                if let Event::Token { id, .. } = e {
-                    if let Some((t, long)) = sent_at.remove(id) {
+                if let Event::Token { id, .. } = e
+                    && let Some((t, long)) = sent_at.remove(id) {
                         if long { &mut long_ttft } else { &mut short_ttft }.push(t.elapsed().as_secs_f64() * SCALE);
                     }
-                }
             }
             if shorts == 8 && longs == 4 && sent_at.is_empty() {
                 break;
@@ -2880,7 +2873,7 @@ mod tests {
             for _ in 0..steps {
                 while s.waiting() + s.running() < 12 {
                     *next += 1;
-                    let r = if *next % 10 == 0 { request(1000, 2000 + (*next as usize * 7919) % 4000, *next) } else { request(1200, 8 + (*next as usize * 31) % 40, *next) };
+                    let r = if (*next).is_multiple_of(10) { request(1000, 2000 + (*next as usize * 7919) % 4000, *next) } else { request(1200, 8 + (*next as usize * 31) % 40, *next) };
                     s.submit(r).unwrap();
                 }
                 events.clear();

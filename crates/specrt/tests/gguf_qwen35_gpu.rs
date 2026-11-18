@@ -28,7 +28,7 @@ fn argmax(row: &[f32]) -> usize {
 }
 
 fn floats(path: &Path) -> Vec<f32> {
-    std::fs::read(path).unwrap().chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+    std::fs::read(path).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 #[test]

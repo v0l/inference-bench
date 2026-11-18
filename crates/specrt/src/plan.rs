@@ -319,7 +319,7 @@ impl Op {
         match self {
             Op::Embed => names(&["embed"]),
             Op::Splice => names(&["splice_rows"]),
-            Op::Norm { into, .. } if matches!(into, Buf::XnPlanes) => names(&["rms_split"]),
+            Op::Norm { into: Buf::XnPlanes, .. } => names(&["rms_split"]),
             Op::Norm { .. } => names(&["rmsnorm"]),
             Op::NormAdd { .. } => names(&["norm_add"]),
             Op::LogitSoftcap => names(&["logit_softcap"]),

@@ -741,11 +741,8 @@ struct HfConfig {
     rope_theta: Option<f64>,
     hidden_act: Option<String>,
     tie_word_embeddings: Option<bool>,
-    attention_bias: Option<bool>,
     rope_scaling: Option<serde_json::Value>,
     rope_parameters: Option<serde_json::Value>,
-    #[serde(default)]
-    attn_output_gate: bool,
     partial_rotary_factor: Option<f64>,
     layer_types: Option<Vec<String>>,
     full_attention_interval: Option<usize>,

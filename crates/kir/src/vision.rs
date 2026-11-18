@@ -64,7 +64,7 @@ impl VisionKernel {
                 return bad(format!("needs {f:?}, which the target lacks"));
             }
         }
-        if self.head_dim == 0 || self.head_dim % 8 != 0 || self.head_dim > MAX_HEAD_DIM {
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(8) || self.head_dim > MAX_HEAD_DIM {
             return bad(format!("head_dim {} must be a multiple of 8 and at most {MAX_HEAD_DIM}", self.head_dim));
         }
         if GEMM_THREADS > t.max_threads || FLASH_THREADS > t.max_threads {

@@ -1,3 +1,4 @@
+#![allow(clippy::type_complexity)]
 use specrt::pipeline::{Hop, Pipeline};
 use specrt::runtime::{DecodeRow, Layout, Runtime, Sampling};
 use specrt::spec::Spec;

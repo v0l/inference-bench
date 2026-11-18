@@ -321,7 +321,7 @@ pub fn sample_indices(cfg: &Preprocessor, total: usize, fps: f64) -> Vec<usize> 
 
 pub fn timestamps(indices: &[usize], fps: f64, temporal: usize) -> Vec<f64> {
     let mut idx = indices.to_vec();
-    while idx.len() % temporal != 0 {
+    while !idx.len().is_multiple_of(temporal) {
         idx.push(*idx.last().unwrap());
     }
     idx.chunks(temporal).map(|c| (c[0] as f64 / fps + c[temporal - 1] as f64 / fps) / 2.0).collect()
@@ -676,7 +676,7 @@ impl VisionConfig {
 
     pub fn pool_kernel(&self) -> usize {
         let per_side = (self.tokens_per_tile() as f64).sqrt() as usize;
-        if per_side == 0 { 1 } else { self.side() / per_side }
+        self.side().checked_div(per_side).unwrap_or(1)
     }
 }
 

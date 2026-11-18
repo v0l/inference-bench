@@ -542,12 +542,11 @@ fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>,
                 return;
             }
             let fits = shown.fit.as_ref().is_none_or(|f| f.verdict != Verdict::DoesNotFit);
-            if shown.variant.label == best.variant.label {
-                if let Some(line) = headline(plan) {
+            if shown.variant.label == best.variant.label
+                && let Some(line) = headline(plan) {
                     let tint = if fits { VALUE } else { FAULT };
                     ui.label(egui::RichText::new(line).color(tint).size(12.5));
                 }
-            }
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 Line::new().legend("quant").value(shown.variant.label.clone()).show(ui);
@@ -561,11 +560,10 @@ fn repo_row(app: &mut App, ui: &mut egui::Ui, r: &Repo, plan: Option<&RepoPlan>,
                 verdict_chip(ui, &shown);
                 chip(ui, "supported", OK, true);
             });
-            if !fits && shown.variant.label != best.variant.label {
-                if let Some(f) = &shown.fit {
+            if !fits && shown.variant.label != best.variant.label
+                && let Some(f) = &shown.fit {
                     note(ui, need_line(f), FAULT);
                 }
-            }
             let info = app.models.infos.get(&r.id).and_then(|i| i.as_ref().ok()).cloned();
             let Some(info) = info else { return };
             let running = app.models.downloads.iter().any(|d| d.repo == r.id && d.result.is_none());

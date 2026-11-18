@@ -497,7 +497,6 @@ pub struct LinearStates {
 
 struct Buffers {
     x: CudaSlice<f32>,
-    xn: CudaSlice<f32>,
     qkv: CudaSlice<f32>,
     attn: CudaSlice<f32>,
     attn_part: CudaSlice<f32>,
@@ -849,7 +848,6 @@ impl Runtime {
         let mma_only = |n: usize| if use_mma { 1 } else { n };
         let buf = Buffers {
             x: stream.alloc_zeros(d.hidden)?,
-            xn: stream.alloc_zeros(d.hidden)?,
             qkv: stream.alloc_zeros(spec.qkv_rows())?,
             attn: stream.alloc_zeros(spec.q_dim())?,
             attn_part: stream.alloc_zeros(spec.attention.heads * ATTN_SPLITS * (spec.attention.head_dim + 2))?,
@@ -983,15 +981,14 @@ impl Runtime {
         if let Some(w) = mtp_weights {
             rt.mtp = Some(mtp::MtpState::new(&rt, w)?);
         }
-        if let Some(v) = &spec.vision {
-            if crate::vision_encoder::has_tower(&checkpoint, &v.config) {
+        if let Some(v) = &spec.vision
+            && crate::vision_encoder::has_tower(&checkpoint, &v.config) {
                 let opts = spec.runtime.vision;
                 let stream = rt.ctx.new_stream()?;
                 let enc = crate::vision_encoder::VisionEncoder::load_with(&rt.ctx, &stream, &jit, &checkpoint, &v.config, opts.precision)?;
                 rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::with_tiles(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, if v.config.pooled() { v.config.tokens_per_tile() } else { 0 }, opts)));
                 checkpoint.release();
             }
-        }
         rt.stream.synchronize()?;
         crate::progress::report(crate::progress::Stage::KvCache, 0, 1);
         let kv_blocks = match layout.kv_blocks {
@@ -1135,13 +1132,6 @@ impl Runtime {
         }
         b.arg(x).arg(norm).arg(out);
         unsafe { b.launch(gemv_cfg(name, rows, w, self.sms)) }?;
-        Ok(())
-    }
-
-    fn rmsnorm(&self, x: &CudaSlice<f32>, w: &CudaSlice<f32>, out: &CudaSlice<f32>) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel("rmsnorm"));
-        b.arg(x).arg(w).arg(out);
-        unsafe { b.launch(cfg(1, 1024)) }?;
         Ok(())
     }
 
@@ -1983,7 +1973,7 @@ impl Runtime {
         self.stream.synchronize()?;
         let started = Instant::now();
         let mut made = 1;
-        let mut tokens: Vec<u32> = Vec::new();
+        let mut tokens: Vec<u32>;
         let mut shown = 0;
         loop {
             let seen = self.stream.clone_dtoh(&self.buf.history.slice(..made))?;
