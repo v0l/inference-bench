@@ -6,12 +6,56 @@ use tokenizers::Tokenizer;
 
 const DTYPES: [KvDtype; 2] = [KvDtype::F16, KvDtype::Fp8];
 
+const FLAGS_USAGE: &str = "flags: --corpus <dir> --only <prompt> --steps <n> --temp <t> --f16-layers <n> --dtype <f16|fp8>";
+
+struct Opts {
+    corpus: Option<String>,
+    only: Option<usize>,
+    steps: usize,
+    temp: f32,
+    f16_layers: Option<usize>,
+    dtype: Option<String>,
+}
+
+static OPTS: std::sync::OnceLock<Opts> = std::sync::OnceLock::new();
+
+fn opts() -> &'static Opts {
+    OPTS.get().expect("options parsed in main")
+}
+
+fn parse_flags(args: Vec<String>) -> Result<(Opts, Vec<String>)> {
+    let mut o = Opts { corpus: None, only: None, steps: 8, temp: 1.0, f16_layers: None, dtype: None };
+    let mut rest = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        let Some(flag) = a.strip_prefix("--") else {
+            rest.push(a);
+            continue;
+        };
+        let (key, inline) = match flag.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (flag.to_string(), None),
+        };
+        let mut value = || inline.clone().or_else(|| it.next()).with_context(|| format!("--{key} needs a value"));
+        match key.as_str() {
+            "corpus" => o.corpus = Some(value()?),
+            "only" => o.only = Some(value()?.parse()?),
+            "steps" => o.steps = value()?.parse()?,
+            "temp" => o.temp = value()?.parse()?,
+            "f16-layers" => o.f16_layers = Some(value()?.parse()?),
+            "dtype" => o.dtype = Some(value()?),
+            _ => bail!("unknown flag --{key}; {FLAGS_USAGE}"),
+        }
+    }
+    Ok((o, rest))
+}
+
 fn decode_steps() -> usize {
-    std::env::var("KVGATE_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(8)
+    opts().steps
 }
 
 fn arm_layers() -> Option<usize> {
-    std::env::var("KVGATE_F16_LAYERS").ok().and_then(|v| v.parse().ok())
+    opts().f16_layers
 }
 
 fn name(d: KvDtype) -> &'static str {
@@ -74,9 +118,9 @@ fn text_prompts(spec: &Spec) -> Result<Vec<u32>> {
 
 fn kl_mode(spec: &Spec, len: usize, n: usize, calibrate: bool) -> Result<()> {
     let steps = decode_steps();
-    let corpus = std::env::var("KVGATE_CORPUS").is_ok();
-    let base = if corpus { agentic_transcript(&tokenizer(spec)?, len + steps + 1000 * n, std::env::var("KVGATE_CORPUS")?.as_str())? } else { text_prompts(spec)? };
-    let only: Option<usize> = std::env::var("KVGATE_ONLY").ok().and_then(|v| v.parse().ok());
+    let corpus = opts().corpus.is_some();
+    let base = if let Some(root) = &opts().corpus { agentic_transcript(&tokenizer(spec)?, len + steps + 1000 * n, root)? } else { text_prompts(spec)? };
+    let only = opts().only;
     let prompts: Vec<Vec<u32>> = (0..n).filter(|i| only.is_none_or(|o| o == *i)).map(|i| (0..len + steps).map(|j| base[(j + i * if corpus { 1000 } else { 131 }) % base.len()]).collect()).collect();
     let mut logits: Vec<Vec<Vec<Vec<f32>>>> = Vec::new();
     for dtype in DTYPES {
@@ -162,7 +206,7 @@ fn agentic_transcript(tok: &Tokenizer, len: usize, root: &str) -> Result<Vec<u32
 
 fn transcript_mode(spec: &Spec, len: usize, out: &str) -> Result<()> {
     let tok = tokenizer(spec)?;
-    let root = std::env::var("KVGATE_CORPUS").unwrap_or_default();
+    let root = opts().corpus.clone().unwrap_or_default();
     let mut ids = agentic_transcript(&tok, len, &root)?;
     ids.extend(encode(&tok, USER_ASK)?);
     std::fs::write(out, tok.decode(&ids, false).map_err(|e| anyhow::anyhow!("{e}"))?)?;
@@ -182,7 +226,7 @@ fn detect_mode(spec: &Spec, files: &[String]) -> Result<()> {
 
 fn loop_mode(spec: &Spec, len: usize, seeds: usize, new_tokens: usize, arms: &[&str]) -> Result<()> {
     let tok = tokenizer(spec)?;
-    let root = std::env::var("KVGATE_CORPUS").unwrap_or_default();
+    let root = opts().corpus.clone().unwrap_or_default();
     let tail = encode(&tok, USER_ASK)?;
     let mut prompt = agentic_transcript(&tok, len - tail.len(), &root)?;
     prompt.extend(tail);
@@ -198,7 +242,7 @@ fn loop_mode(spec: &Spec, len: usize, seeds: usize, new_tokens: usize, arms: &[&
         s.runtime.kv_f16_layers = layers.or(s.runtime.kv_f16_layers);
         let mut rt = load(&s, dtype, len + new_tokens + 16, 1)?;
         for seed in 0..seeds as u32 {
-            let temperature = std::env::var("KVGATE_TEMP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            let temperature = opts().temp;
             let sampling = Sampling::new(temperature, seed + 1).truncated(20, 0.95, 0.0);
             let g = rt.generate_until(&prompt, new_tokens, sampling, &stops, &mut |_| true)?;
             let report = specrt::loops::detect(&g.tokens);
@@ -262,8 +306,8 @@ fn needle_mode(spec: &Spec, len: usize, depths: &[f64]) -> Result<()> {
 }
 
 fn batch_mode(spec: &Spec, len: usize, batch: usize, new_tokens: usize) -> Result<()> {
-    let only = std::env::var("KVGATE_DTYPE").ok();
-    for dtype in DTYPES.into_iter().filter(|d| only.as_deref().is_none_or(|o| o == name(*d))) {
+    let only = opts().dtype.as_deref();
+    for dtype in DTYPES.into_iter().filter(|d| only.is_none_or(|o| o == name(*d))) {
         let mut rt = load(spec, dtype, len + new_tokens, batch)?;
         let prompts: Vec<Vec<u32>> = (0..batch as u32).map(|s| (0..len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect()).collect();
         rt.generate_batch(&prompts, 4)?;
@@ -276,10 +320,12 @@ fn batch_mode(spec: &Spec, len: usize, batch: usize, new_tokens: usize) -> Resul
 
 fn main() -> Result<()> {
     let usage = "usage: kvgate <spec.toml> kl <len> <prompts> | needle <len> <depth,..> | batch <len> <batch> <new> | loop <len> <seeds> <new> [f16,fp8,fp8:16]";
-    let mut args = std::env::args().skip(1);
+    let (parsed, positional) = parse_flags(std::env::args().skip(1).collect())?;
+    let _ = OPTS.set(parsed);
+    let mut args = positional.into_iter();
     let spec = Spec::load(&PathBuf::from(args.next().context(usage)?))?;
     let mode = args.next().context(usage)?;
-    let mut num = |args: &mut std::iter::Skip<std::env::Args>| -> Result<usize> { Ok(args.next().context(usage)?.parse()?) };
+    let mut num = |args: &mut std::vec::IntoIter<String>| -> Result<usize> { Ok(args.next().context(usage)?.parse()?) };
     match mode.as_str() {
         "kl" => {
             let (len, n) = (num(&mut args)?, num(&mut args)?);

@@ -14,11 +14,9 @@ echo "MemAvailable ${avail} GB"
 [ "$avail" -ge 40 ] || { echo "need 40 GB available"; exit 1; }
 run() {
     systemd-run --user --wait --collect -P -q -p MemoryMax=60G -p MemorySwapMax=0 -p WorkingDirectory="$root/crates/specrt" \
-        --setenv=PATH="$PATH" --setenv=HOME="$HOME" --setenv=CARGO_TARGET_DIR="$target" \
-        --setenv=KVGATE_CORPUS="${KVGATE_CORPUS:-$root/crates}" ${KVGATE_STEPS:+--setenv=KVGATE_STEPS=$KVGATE_STEPS} ${KVGATE_TEMP:+--setenv=KVGATE_TEMP=$KVGATE_TEMP} \
-        ${KVGATE_F16_LAYERS:+--setenv=KVGATE_F16_LAYERS=$KVGATE_F16_LAYERS} "$@"
+        --setenv=PATH="$PATH" --setenv=HOME="$HOME" --setenv=CARGO_TARGET_DIR="$target" "$@"
 }
 run -p MemoryMax=20G cargo build --release --bin kvgate 2>&1 | tail -1
 exec 9>/tmp/gpu27.lock
 echo "waiting for gpu27.lock"; flock 9; echo "lock held"
-run "$target/release/kvgate" "$spec" "$mode" "$@"
+run "$target/release/kvgate" "$spec" "$mode" --corpus "${KVGATE_CORPUS:-$root/crates}" ${KVGATE_STEPS:+--steps "$KVGATE_STEPS"} ${KVGATE_TEMP:+--temp "$KVGATE_TEMP"} ${KVGATE_F16_LAYERS:+--f16-layers "$KVGATE_F16_LAYERS"} "$@"

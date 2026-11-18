@@ -18,7 +18,7 @@ echo "MemAvailable ${avail} GB"
 [ "$avail" -ge 40 ] || { echo "need 40 GB available"; exit 1; }
 run() {
     systemd-run --user --wait --collect -P -q -p MemoryMax=60G -p MemorySwapMax=0 -p WorkingDirectory="$root/crates/specrt" \
-        --setenv=PATH="$PATH" --setenv=HOME="$HOME" --setenv=CARGO_TARGET_DIR="$target" --setenv=KVGATE_CORPUS="$root/crates" "$@"
+        --setenv=PATH="$PATH" --setenv=HOME="$HOME" --setenv=CARGO_TARGET_DIR="$target" "$@"
 }
 base=$root/crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4-exact.toml
 tag=$side-${arm//:/_}-p$prefix-m$mtp
@@ -36,8 +36,8 @@ fi
 run -p MemoryMax=20G cargo build --release --bin kvgate 2>&1 | tail -1
 run -p MemoryMax=20G cargo build --release -p inference-bench-cli --bin inference-bench 2>&1 | tail -1
 if [ ! -f "$out/tx$len.txt" ] || [ ! -f "$out/tx$warm.txt" ]; then
-    run "$target/release/kvgate" "$base" transcript "$len" "$out/tx$len.txt"
-    run "$target/release/kvgate" "$base" transcript "$warm" "$out/tx$warm.txt"
+    run "$target/release/kvgate" "$base" transcript "$len" "$out/tx$len.txt" --corpus "$root/crates"
+    run "$target/release/kvgate" "$base" transcript "$warm" "$out/tx$warm.txt" --corpus "$root/crates"
 fi
 exec 9>/tmp/gpu27.lock
 echo "waiting for gpu27.lock"; flock 9; echo "lock held"
