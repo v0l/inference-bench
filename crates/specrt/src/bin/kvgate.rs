@@ -320,12 +320,17 @@ fn batch_mode(spec: &Spec, len: usize, batch: usize, new_tokens: usize) -> Resul
 
 fn main() -> Result<()> {
     let usage = "usage: kvgate <spec.toml> kl <len> <prompts> | needle <len> <depth,..> | batch <len> <batch> <new> | loop <len> <seeds> <new> [f16,fp8,fp8:16]";
-    let (parsed, positional) = parse_flags(std::env::args().skip(1).collect())?;
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{usage}\n{FLAGS_USAGE}");
+        return Ok(());
+    }
+    let (parsed, positional) = parse_flags(raw)?;
     let _ = OPTS.set(parsed);
     let mut args = positional.into_iter();
     let spec = Spec::load(&PathBuf::from(args.next().context(usage)?))?;
     let mode = args.next().context(usage)?;
-    let mut num = |args: &mut std::vec::IntoIter<String>| -> Result<usize> { Ok(args.next().context(usage)?.parse()?) };
+    let num = |args: &mut std::vec::IntoIter<String>| -> Result<usize> { Ok(args.next().context(usage)?.parse()?) };
     match mode.as_str() {
         "kl" => {
             let (len, n) = (num(&mut args)?, num(&mut args)?);
@@ -352,5 +357,43 @@ fn main() -> Result<()> {
             batch_mode(&spec, len, b, new)
         }
         _ => bail!(usage),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn defaults_without_flags() {
+        let (o, rest) = parse_flags(args(&["spec.toml", "kl", "8192", "2"])).unwrap();
+        assert_eq!((o.corpus, o.only, o.steps, o.temp, o.f16_layers, o.dtype), (None, None, 8, 1.0, None, None));
+        assert_eq!(rest, args(&["spec.toml", "kl", "8192", "2"]));
+    }
+
+    #[test]
+    fn space_and_equals_forms() {
+        let (o, rest) = parse_flags(args(&["spec.toml", "--corpus", "/x", "loop", "--steps=16", "--temp", "0.7", "--only=3", "--f16-layers=8", "--dtype", "fp8"])).unwrap();
+        assert_eq!(o.corpus.as_deref(), Some("/x"));
+        assert_eq!((o.steps, o.temp, o.only, o.f16_layers), (16, 0.7, Some(3), Some(8)));
+        assert_eq!(o.dtype.as_deref(), Some("fp8"));
+        assert_eq!(rest, args(&["spec.toml", "loop"]));
+    }
+
+    #[test]
+    fn unknown_flag_is_an_error() {
+        let e = parse_flags(args(&["--bogus", "1"])).err().unwrap().to_string();
+        assert!(e.contains("unknown flag --bogus"), "{e}");
+    }
+
+    #[test]
+    fn missing_value_is_an_error() {
+        let e = parse_flags(args(&["kl", "--steps"])).err().unwrap().to_string();
+        assert!(e.contains("--steps needs a value"), "{e}");
+        assert!(parse_flags(args(&["--temp", "abc"])).is_err());
     }
 }
