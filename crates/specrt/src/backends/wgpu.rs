@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 const PARAM_SLOT: u64 = 256;
 const PARAM_SLOTS: u64 = 8192;
+const UPLOAD_FLUSH: u64 = 128 << 20;
 
 pub struct Buffer {
     pub raw: wgpu::Buffer,
@@ -26,6 +27,7 @@ pub struct Wgpu {
     pipelines: HashMap<&'static str, Pipeline>,
     params: wgpu::Buffer,
     slot: u64,
+    pending_upload: std::cell::Cell<u64>,
     encoder: Option<wgpu::CommandEncoder>,
     pass: Option<wgpu::ComputePass<'static>>,
     cache_dir: Option<PathBuf>,
@@ -115,7 +117,7 @@ impl Wgpu {
             }
             _ => (None, None),
         };
-        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, encoder: None, pass: None, cache_dir, cache, cache_path })
+        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, pending_upload: Default::default(), encoder: None, pass: None, cache_dir, cache, cache_path })
     }
 
     pub fn info(&self) -> &wgpu::AdapterInfo {
@@ -176,6 +178,14 @@ impl Backend for Wgpu {
     }
 
     fn upload(&self, buffer: &Buffer, offset: u64, data: &[u8]) {
+        let pending = self.pending_upload.get() + data.len() as u64;
+        if pending >= UPLOAD_FLUSH {
+            self.queue.submit([]);
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.pending_upload.set(0);
+        } else {
+            self.pending_upload.set(pending);
+        }
         if data.len().is_multiple_of(4) {
             self.queue.write_buffer(&buffer.raw, offset, data);
         } else {
