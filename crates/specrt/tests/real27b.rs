@@ -56,7 +56,8 @@ fn nvfp4_spec() -> Spec {
 
 fn named_spec(var: &str, default: &str) -> Spec {
     let name = std::env::var(var).unwrap_or_else(|_| default.into());
-    Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.toml"))).unwrap().with_env_overrides()
+    let path = if name.ends_with(".toml") { Path::new(&name).to_path_buf() } else { Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/{name}.toml")) };
+    Spec::load(&path).unwrap().with_env_overrides()
 }
 
 fn ids(v: &serde_json::Value) -> Vec<u32> {

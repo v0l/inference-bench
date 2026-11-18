@@ -263,6 +263,15 @@ enum Cmd {
         #[arg(long, help = "Measure peer-to-peer links between local GPUs and the network round trip to devices with an address")]
         probe: bool,
     },
+    #[command(about = "Build the spec for a model the way the app does (config.json through Spec::from_hf_config_serving), print its per-layer dtypes and optionally save it")]
+    Spec {
+        #[arg(long, help = "HF repo, checkpoint directory or spec path")]
+        model: String,
+        #[arg(long, help = "Write the derived spec TOML here")]
+        out: Option<PathBuf>,
+        #[arg(long, help = "Fail unless the activation quantisation is none, fp8 or fp4")]
+        expect_act_quant: Option<String>,
+    },
     #[command(about = "Print the IR and emitted source of the kernels a spec builds, for the live device or a named target")]
     Kernels {
         #[arg(long, help = "Spec name or path")]
@@ -383,6 +392,41 @@ fn kernels_command(data: &Path, spec: &str, target: Option<&str>) -> Result<()> 
         None => specrt::codegen::live_target()?,
     };
     print!("{}", specrt::codegen::kernels_report(&spec, &target)?);
+    Ok(())
+}
+
+fn spec_command(model: &str, out: Option<&Path>, expect_act_quant: Option<&str>) -> Result<()> {
+    use specrt::spec::ActQuant;
+    let spec = specrt::engine::resolve_spec(model)?;
+    let name = |a: ActQuant| match a {
+        ActQuant::None => "none",
+        ActQuant::Fp8 => "fp8",
+        ActQuant::Fp4 => "fp4",
+    };
+    println!("spec {} repo {}", spec.name, spec.repo);
+    println!("act_quant {} mlp.act_quant {} head_quant {:?}", name(spec.act_quant), name(spec.mlp.act_quant), spec.lm_head_quant());
+    println!("weights quant {:?}", spec.quant);
+    let mut runs: Vec<(usize, usize, specrt::spec::Quant)> = Vec::new();
+    for layer in 0..spec.layers.count {
+        let q = spec.mlp_quant(layer);
+        match runs.last_mut() {
+            Some((_, end, last)) if *last == q => *end = layer,
+            _ => runs.push((layer, layer, q)),
+        }
+    }
+    for (start, end, q) in runs {
+        println!("layers {start}..={end} attention {:?} mlp {:?}", spec.quant, q);
+    }
+    if let Some(want) = expect_act_quant {
+        let got = [name(spec.act_quant), name(spec.mlp.act_quant)];
+        if got.iter().any(|g| *g != want) {
+            bail!("expected act_quant {want}, derived {} / {}", got[0], got[1]);
+        }
+    }
+    if let Some(path) = out {
+        std::fs::write(path, spec.to_toml()?)?;
+        println!("wrote {}", path.display());
+    }
     Ok(())
 }
 
@@ -588,6 +632,7 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Cmd::Host(args) => hostcmd::run(args, &data)?,
         Cmd::Specs { cmd } => specs_command(&data, cmd)?,
+        Cmd::Spec { model, out, expect_act_quant } => spec_command(model, out.as_deref(), expect_act_quant.as_deref())?,
         Cmd::Kernels { spec, target } => kernels_command(&data, spec, target.as_deref())?,
         Cmd::Plan { spec, config, context, slots, objective, probe } => plan_command(&data, spec, config, *context, *slots, objective.as_deref(), *probe)?,
     }
