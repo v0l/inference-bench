@@ -235,7 +235,8 @@ fn the_qwen35_gguf_tokenizer_uses_the_family_pretokenizer_and_the_nfc_flag() {
 fn the_hybrid_gguf_module_decodes_ggml_rows_in_the_linear_attention_kernels() {
     let spec = gguf_spec("tiny-mtp-Q4_K_M.gguf");
     let module = specrt::codegen::Module::generate(&spec, 256).unwrap();
-    assert!(module.source.contains("linear_norm<DecGgml, LA_IN_ROWS, false>"));
+    let rows = spec.linear_attention.as_ref().unwrap().in_proj_rows();
+    assert!(module.source.contains(&format!("linear_norm<DecGgml, {rows}, false>")));
     assert!(module.source.contains("constexpr bool LA_TILED = true;"));
     let grouped = specrt::codegen::Module::generate(&hf_spec("tiny-qwen3.5-hd256"), 256).unwrap();
     assert!(grouped.source.contains("constexpr bool LA_TILED = false;"));

@@ -4,12 +4,14 @@ mod linear;
 mod ggml;
 mod vision;
 mod ops;
+mod moe;
 
 pub use attention::emit_attention;
 pub use linear::emit_linear;
 pub use ggml::emit_ggml;
 pub use vision::emit_vision;
-pub use ops::{emit_lin, emit_model, emit_moe, emit_moe_mma, emit_ops};
+pub use ops::emit_ops;
+pub use moe::emit_moe;
 pub use gemm::{FP4_ACT, FP4_BATCH, FP4_CORE, FP4_HEAD, FP8_ACT, FP8_BATCH, GEMM_CORE, emit_gemm, emit_gemms, gemm_library, needs_arch_features};
 
 use crate::layout::{Dialect, Layout};

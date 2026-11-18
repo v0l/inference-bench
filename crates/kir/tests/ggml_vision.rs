@@ -34,8 +34,9 @@ fn ggml_decoders_cover_every_block_type() {
 
 #[test]
 fn ggml_wgsl_decoder_shares_the_block_sizes() {
+    let src = kir::ggml::wgsl_decoder();
     for (_, bytes) in kir::ggml::BLOCK_BYTES {
-        assert!(kir::wgsl::GGML_DECODE.contains(&format!("return {bytes}u;")), "{bytes}");
+        assert!(src.contains(&format!("return {bytes}u;")), "{bytes}");
     }
     assert_eq!(kir::wgsl::ggml_bindings().len(), 4);
 }
@@ -43,7 +44,8 @@ fn ggml_wgsl_decoder_shares_the_block_sizes() {
 #[test]
 fn ggml_wgsl_decoder_parses() {
     let head = "@group(0) @binding(0) var<storage, read> wdata: array<u32>;\n";
-    naga::front::wgsl::parse_str(&format!("{head}{}", kir::wgsl::GGML_DECODE)).unwrap();
+    naga::front::wgsl::parse_str(&format!("{head}{}", kir::ggml::wgsl_decoder())).unwrap();
+    golden("ggml_decoder.wgsl", &kir::ggml::wgsl_decoder());
 }
 
 #[test]

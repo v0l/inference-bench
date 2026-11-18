@@ -8,13 +8,9 @@ pub use crate::gemm::{
     fp4_act_enabled, fp8_act_enabled, select, linear_dims, linear_shape,
 };
 
-pub const MOE_KERNELS: &[&str] = &["moe_route_logits", "moe_route", "moe_up_bf16", "moe_up_fp4", "moe_down_bf16", "moe_down_fp4", "moe_combine", "moe_permute", "moe_group_up_bf16", "moe_group_up_fp4", "moe_group_down_bf16", "moe_group_down_fp4", "moe_up_fp8", "moe_down_fp8", "moe_group_up_fp8", "moe_group_down_fp8"];
-pub const MOE_MMA_KERNELS: &[&str] = &["moe_quant_f32", "moe_tiles", "moe_mma_up", "moe_mma_up_s", "moe_mma_down", "moe_mma_down_s"];
-pub const MOE_MMA_BM: usize = 64;
-pub const MOE_MMA_BM_SMALL: usize = 16;
-pub const MOE_MMA_STAGES: usize = 3;
-pub const MOE_MMA_BN: usize = 64;
-const MOE_MMA_ROW: usize = 72;
+pub const MOE_KERNELS: &[&str] = kir::moe::Family::Experts.kernels();
+pub const MOE_MMA_KERNELS: &[&str] = kir::moe::Family::GroupedMma.kernels();
+pub use kir::moe::{MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
 
 pub fn moe_mma_enabled(spec: &Spec, target: &kir::Target) -> bool {
     spec.moe.is_some()
@@ -23,8 +19,23 @@ pub fn moe_mma_enabled(spec: &Spec, target: &kir::Target) -> bool {
         && target.compute_capability.0 >= 12
 }
 
-pub fn moe_mma_smem(rows_per_tile: usize, weights: usize) -> u32 {
-    (MOE_MMA_STAGES * (rows_per_tile + weights * MOE_MMA_BN) * MOE_MMA_ROW) as u32
+pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::MoeKernel>> {
+    let Some(m) = &spec.moe else { return Ok(Vec::new()) };
+    let shape = kir::moe::MoeShape {
+        experts: m.experts,
+        top_k: m.top_k(),
+        pairs: m.pairs(),
+        inter: m.expert_intermediate,
+        shared: m.shared_intermediate > 0,
+        norm_topk: m.norm_topk,
+        shared_gate: m.shared_gate,
+        sigmoid: m.router == crate::spec::RouterAct::Sigmoid,
+    };
+    let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
+    if moe_mma_enabled(spec, target) {
+        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::GroupedMma, shape).map_err(anyhow::Error::msg)?);
+    }
+    Ok(out)
 }
 
 pub use kir::attention::PAGE;
@@ -199,6 +210,38 @@ pub fn default_target() -> kir::Target {
     kir::Target::sm_120()
 }
 
+pub fn gemv_kernels(spec: &Spec, target: &kir::Target, ops: &kir::ops::OpsShape) -> Result<Vec<kir::gemv::GemvKernel>> {
+    use kir::gemv::Gemv;
+    let (wf, hwf) = (ops.weight_decoder.clone(), ops.head_decoder.clone());
+    let (n, h, i, v, q) = (ops.qkv_row, ops.hidden, ops.inter, ops.vocab, ops.q_dim);
+    let bias = ops.qkv_bias;
+    let gu = 2 * ops.inter;
+    let lin = |d: &str, n, k, bias, residual| Gemv::Linear { decoder: d.to_string(), n, k, bias, residual };
+    let tiled = |d: &str, n, k, bias, residual| Gemv::Tiled { decoder: d.to_string(), n, k, bias, residual };
+    let mut ops_list = vec![
+        ("qkv_proj", lin(&wf, n, h, bias, false)),
+        ("o_proj", lin(&wf, h, q, false, true)),
+        ("gate_up_proj", lin(&wf, gu, h, false, false)),
+        ("down_proj", lin(&wf, h, i, false, true)),
+        ("lm_head", lin(&hwf, v, h, false, false)),
+        ("qkv_gemm", tiled(&wf, n, h, bias, false)),
+        ("o_gemm", tiled(&wf, h, q, false, true)),
+        ("gate_up_gemm", tiled(&wf, gu, h, false, false)),
+        ("down_gemm", tiled(&wf, h, i, false, true)),
+        ("lm_head_gemm", tiled(&hwf, v, h, false, false)),
+        ("qkv_proj_norm", Gemv::Norm { decoder: wf.clone(), n, bias }),
+        ("gate_up_act", Gemv::GateUpAct { decoder: wf.clone() }),
+        ("lm_head_norm", Gemv::Norm { decoder: hwf.clone(), n: v, bias: false }),
+    ];
+    if let Some(la) = spec.linear_attention.as_ref() {
+        ops_list.push(("lin_in_norm", Gemv::Norm { decoder: wf.clone(), n: la.in_proj_rows(), bias: false }));
+        ops_list.push(("lin_ba_norm", Gemv::Norm { decoder: "DecBf16".into(), n: la.ba_rows(), bias: false }));
+        ops_list.push(("lin_ba_rows", Gemv::Bf16Rows { n: la.ba_rows(), k: h }));
+        ops_list.push(("lin_out_proj", lin(&wf, h, la.value_dim(), false, true)));
+    }
+    ops_list.into_iter().map(|(name, op)| kir::gemv::GemvKernel::new(target, name, op).map_err(anyhow::Error::msg)).collect()
+}
+
 pub fn ggb_scratch_len(spec: &Spec) -> usize {
     GGB_LINEARS.iter().map(|l| { let (n, k, _, _) = linear_dims(spec, l); n * k }).max().unwrap_or(0)
 }
@@ -264,8 +307,19 @@ impl Module {
             kir::linear::linear_hash(&linear),
         ]);
         let ggml = kir::ggml::GgmlKernel::new(target);
-        let kir_hash = kir::fold_hashes([kir_hash, ggml.hash()]);
-        let mut source = format!("{}\n{}\n{}\n{}\n{}\n{}", kir::cuda::emit_ops(&ops), ggml.emit().map_err(anyhow::Error::msg)?, attn_source, gemm_source, kir::cuda::emit_model(&ops), kir_source);
+        let prims = kir::prims::cuda_prims(target, d.hidden, d.vocab, spec.norm.eps, spec.dims.embed_scale.unwrap_or(1.0)).map_err(anyhow::Error::msg)?;
+        let gemvs = gemv_kernels(spec, target, &ops)?;
+        let kir_hash = kir::fold_hashes([kir_hash, ggml.hash(), kir::prims::prims_hash(&prims), kir::gemv::gemv_hash(&gemvs)]);
+        let mut source = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            kir::cuda::emit_ops(&ops),
+            kir::prims::emit_cuda(&prims).map_err(anyhow::Error::msg)?,
+            ggml.emit().map_err(anyhow::Error::msg)?,
+            attn_source,
+            gemm_source,
+            kir::gemv::emit_gemvs(&gemvs).map_err(anyhow::Error::msg)?,
+            kir_source
+        );
         let mut kernels = KERNELS.to_vec();
         for k in &kir_kernels {
             if !kernels.contains(&k.name) {
@@ -275,8 +329,6 @@ impl Module {
         if la.is_some() {
             source.push('\n');
             source.push_str(&linear_source);
-            source.push('\n');
-            source.push_str(&kir::cuda::emit_lin(&ops));
             for k in &linear {
                 kernels.extend_from_slice(k.family.kernels());
             }
@@ -284,31 +336,17 @@ impl Module {
             smem.insert("lin_ba_rows", 0);
         }
         let mut moe_arch = false;
-        if let Some(m) = &spec.moe {
-            let shape = kir::ops::MoeShape {
-                experts: m.experts,
-                top_k: m.top_k(),
-                pairs: m.pairs(),
-                inter: m.expert_intermediate,
-                shared: m.shared_intermediate > 0,
-                norm_topk: m.norm_topk,
-                shared_gate: m.shared_gate,
-                sigmoid: m.router == crate::spec::RouterAct::Sigmoid,
-            };
+        let moe = moe_kernels(spec, target)?;
+        if !moe.is_empty() {
             source.push('\n');
-            source.push_str(&kir::cuda::emit_moe(&shape));
-            kernels.extend_from_slice(MOE_KERNELS);
-            if moe_mma_enabled(spec, target) {
-                source.push('\n');
-                source.push_str(kir::cuda::emit_moe_mma());
-                kernels.extend_from_slice(MOE_MMA_KERNELS);
-                smem.insert("moe_mma_up", moe_mma_smem(MOE_MMA_BM, 2));
-                smem.insert("moe_mma_up_s", moe_mma_smem(MOE_MMA_BM_SMALL, 2));
-                smem.insert("moe_mma_down", moe_mma_smem(MOE_MMA_BM, 1));
-                smem.insert("moe_mma_down_s", moe_mma_smem(MOE_MMA_BM_SMALL, 1));
-                moe_arch = true;
+            source.push_str(&kir::cuda::emit_moe(&moe).map_err(anyhow::Error::msg)?);
+            for k in &moe {
+                kernels.extend_from_slice(k.family.kernels());
+                smem.extend(k.smem());
+                moe_arch |= k.arch_features();
             }
         }
+        let kir_hash = kir::fold_hashes([kir_hash, kir::moe::moe_hash(&moe)]);
         if spec.quant == Quant::Gguf {
             kernels.push("gg_dequant_bf16");
         }
