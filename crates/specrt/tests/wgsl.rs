@@ -196,8 +196,13 @@ fn run_linear(w: &mut Wgpu, rows: &DeviceRows, x: &[f32], tokens: usize, accumul
     let table = u32_buf(w, &rows.rows);
     let xb = f32_buf(w, x);
     let yb = f32_buf(w, &accumulate.map_or_else(|| vec![0.0; tokens * nrows], |a| a.to_vec()));
-    let (name, tt) = if tokens == 1 { ("linear", 1) } else { ("linear_t8", wgsl::LINEAR_TOKENS) };
-    let grid = [nrows as u32, 1, tokens.div_ceil(tt) as u32];
+    let (name, grid) = if tokens == 1 {
+        ("linear", [nrows as u32, 1, tokens as u32])
+    } else if tokens >= wgsl::TILE_MIN_TOKENS {
+        ("linear_tile", [nrows.div_ceil(wgsl::TILE_ROWS) as u32, 1, tokens.div_ceil(wgsl::TILE_TOKENS) as u32])
+    } else {
+        ("linear_t8", [nrows as u32, 1, tokens.div_ceil(wgsl::LINEAR_TOKENS) as u32])
+    };
     let params = [nrows as u32, rows.cols as u32, tokens as u32, 0, 0, accumulate.is_some() as u32, 0, 0];
     go(w, name, &[&xb, &yb, &data, &table], params, grid);
     read_f32(w, &yb, tokens * nrows)
@@ -223,10 +228,10 @@ fn linear_case(kind: GgmlType, tokens: usize) {
             want[t * nrows + r] = (0..cols).map(|c| weights[r][c] as f64 * x[t * cols + c] as f64).sum::<f64>() as f32;
         }
     }
-    close(&run_linear(&mut w, &packed, &x, tokens, None), &want, 2e-4, "linear");
+    close(&run_linear(&mut w, &packed, &x, tokens, None), &want, 2e-4, &format!("linear {tokens}"));
     let base: Vec<f32> = (0..tokens * nrows).map(|_| rng.unit()).collect();
     let plus: Vec<f32> = want.iter().zip(&base).map(|(a, b)| a + b).collect();
-    close(&run_linear(&mut w, &packed, &x, tokens, Some(&base)), &plus, 2e-4, "linear accumulate");
+    close(&run_linear(&mut w, &packed, &x, tokens, Some(&base)), &plus, 2e-4, &format!("linear accumulate {tokens}"));
 }
 
 #[test]
@@ -234,6 +239,7 @@ fn linear_case(kind: GgmlType, tokens: usize) {
 fn linear_matches_a_cpu_matmul_for_bf16_at_one_and_many_tokens() {
     linear_case(GgmlType::Bf16, 1);
     linear_case(GgmlType::Bf16, 11);
+    linear_case(GgmlType::Bf16, 70);
 }
 
 #[test]
@@ -243,6 +249,8 @@ fn linear_matches_a_cpu_matmul_for_q8_0_and_q4_k() {
     linear_case(GgmlType::Q8_0, 9);
     linear_case(GgmlType::Q4K, 1);
     linear_case(GgmlType::Q4K, 9);
+    linear_case(GgmlType::Q4K, 100);
+    linear_case(GgmlType::Q8_0, 33);
 }
 
 #[test]

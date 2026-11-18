@@ -364,6 +364,95 @@ pub fn emit_linear_op(s: &crate::ops::WgslShape, tokens: usize, workgroup: usize
     out
 }
 
+pub const TILE_TOKENS: u32 = 64;
+pub const TILE_ROWS: u32 = 64;
+pub const TILE_K: u32 = 16;
+
+pub fn emit_linear_tile_op(s: &crate::ops::WgslShape) -> String {
+    let mut out = ops_header(s);
+    out.push_str(&linear_tile());
+    out.push_str(&ggml_decode());
+    out
+}
+
+fn linear_tile() -> String {
+    format!(
+        "{bind}
+const BM: u32 = {TILE_TOKENS}u;
+const BN: u32 = {TILE_ROWS}u;
+const BK: u32 = {TILE_K}u;
+var<workgroup> xs: array<f32, {xs}>;
+var<workgroup> ws: array<f32, {ws}>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let nrows = p.a.x;
+    let cols = p.a.y;
+    let tokens = p.a.z;
+    let x_row0 = p.a.w;
+    let y_row0 = p.b.x;
+    let accumulate = p.b.y;
+    let r0 = wid.x * BN;
+    let t0 = wid.z * BM;
+    let tx = li % 16u;
+    let ty = li / 16u;
+    var acc: array<vec4<f32>, 4>;
+    for (var k0 = 0u; k0 < cols; k0 += BK) {{
+        for (var n = 0u; n < 4u; n++) {{
+            let idx = li + n * 256u;
+            let k = idx % BK;
+            let m = idx / BK;
+            let c = k0 + k;
+            let t = t0 + m;
+            var xv = 0.0;
+            if (t < tokens && c < cols) {{
+                xv = x[(x_row0 + t) * cols + c];
+            }}
+            xs[k * BM + m] = xv;
+            let r = min(r0 + m, nrows - 1u);
+            var wv = 0.0;
+            if (c < cols) {{
+                let entry = rows[r];
+                wv = dequant_at((entry >> 3u) * 16u, entry & 7u, c);
+            }}
+            ws[k * BN + m] = wv;
+        }}
+        workgroupBarrier();
+        for (var k = 0u; k < BK; k++) {{
+            let a = vec4<f32>(xs[k * BM + ty * 4u], xs[k * BM + ty * 4u + 1u], xs[k * BM + ty * 4u + 2u], xs[k * BM + ty * 4u + 3u]);
+            let b = vec4<f32>(ws[k * BN + tx * 4u], ws[k * BN + tx * 4u + 1u], ws[k * BN + tx * 4u + 2u], ws[k * BN + tx * 4u + 3u]);
+            acc[0] += a.x * b;
+            acc[1] += a.y * b;
+            acc[2] += a.z * b;
+            acc[3] += a.w * b;
+        }}
+        workgroupBarrier();
+    }}
+    for (var i = 0u; i < 4u; i++) {{
+        let t = t0 + ty * 4u + i;
+        if (t >= tokens) {{
+            continue;
+        }}
+        for (var j = 0u; j < 4u; j++) {{
+            let r = r0 + tx * 4u + j;
+            if (r < nrows) {{
+                let at = (y_row0 + t) * nrows + r;
+                if (accumulate == 1u) {{
+                    y[at] = y[at] + acc[i][j];
+                }} else {{
+                    y[at] = acc[i][j];
+                }}
+            }}
+        }}
+    }}
+}}
+",
+        bind = storage(&[("x", false, "f32"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
+        xs = TILE_K * TILE_TOKENS,
+        ws = TILE_K * TILE_ROWS,
+    )
+}
+
 const PARAMS: &str = "struct P { a: vec4<u32>, b: vec4<u32> };\n";
 
 fn storage(list: &[(&str, bool, &str)]) -> String {

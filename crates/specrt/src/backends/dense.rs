@@ -176,7 +176,11 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             }
             Op::Linear { weight, input, output, .. } => {
                 let w = self.weight(weight, l);
-                let grid = [w.nrows.min(ROW_SPAN), w.nrows.div_ceil(ROW_SPAN), rows.div_ceil(if rows == 1 { 1 } else { LINEAR_TOKENS }) as u32];
+                let grid = if kernels[0] == "linear_tile" {
+                    [w.nrows.div_ceil(wgsl::TILE_ROWS as u32), 1, rows.div_ceil(wgsl::TILE_TOKENS) as u32]
+                } else {
+                    [w.nrows.min(ROW_SPAN), w.nrows.div_ceil(ROW_SPAN), rows.div_ceil(if rows == 1 { 1 } else { LINEAR_TOKENS }) as u32]
+                };
                 let accumulate = output == Buf::X;
                 be.dispatch(kernels[0], &[self.buf(input), self.buf(output), &w.data, &w.rows], [w.nrows, w.cols, r, 0, 0, accumulate as u32, 0, 0], grid)?;
                 if let (Weight::Qkv, Some(b)) = (weight, l.and_then(|l| l.bias.as_ref())) {

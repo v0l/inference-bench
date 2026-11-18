@@ -18,6 +18,9 @@ pub struct WgslKernel {
 
 pub const LINEAR_TOKENS: usize = 8;
 pub const LINEAR_WORKGROUP: usize = 64;
+pub const TILE_MIN_TOKENS: usize = 32;
+pub const TILE_TOKENS: usize = kir::wgsl::TILE_TOKENS as usize;
+pub const TILE_ROWS: usize = kir::wgsl::TILE_ROWS as usize;
 pub const ROW_SPAN: u32 = 32768;
 pub const ELEMENT_SPAN: u32 = 8388608;
 
@@ -28,7 +31,7 @@ pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static s
         Op::Splice => anyhow::bail!("vision is not yet on wgpu"),
         Op::Norm { .. } => vec!["rmsnorm"],
         Op::Linear { weight, .. } => {
-            let mut k = vec![if tokens == 1 { "linear" } else { "linear_t8" }];
+            let mut k = vec![if tokens == 1 { "linear" } else if tokens >= TILE_MIN_TOKENS { "linear_tile" } else { "linear_t8" }];
             if *weight == Weight::Qkv && spec.attention.qkv_bias {
                 k.push("bias");
             }
@@ -141,6 +144,7 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
     for (name, tokens) in [("linear", 1), ("linear_t8", LINEAR_TOKENS)] {
         out.push(WgslKernel { name, source: kir::wgsl::emit_linear_op(&shape, tokens, LINEAR_WORKGROUP), bindings: vec![Read, Write, Read, Read, Uniform] });
     }
+    out.push(WgslKernel { name: "linear_tile", source: kir::wgsl::emit_linear_tile_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
     for k in crate::gemm::gemm_kernels(spec, target)?.kernels {
         let bindings = kir::wgsl::gemm_bindings(&k)
             .into_iter()
