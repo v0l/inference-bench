@@ -811,9 +811,9 @@ impl Runtime {
         let role = StageRole::of(&resolved, range);
         let full = if role.whole() { resolved.clone() } else { resolved.stage(range.start, range.end) };
         let staged = match tp {
-            Some((n, _, _)) => {
+            Some((n, rank, _)) => {
                 ensure!(role.whole(), "a tensor parallel rank runs every layer");
-                crate::tp::rank_spec(&full, n)?
+                crate::tp::rank_spec_of(&full, n, rank)?
             }
             None => full.clone(),
         };

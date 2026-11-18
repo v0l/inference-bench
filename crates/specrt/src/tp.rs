@@ -169,7 +169,21 @@ pub fn supports(spec: &Spec, tp: usize) -> Result<()> {
     Ok(())
 }
 
-fn moe_split(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeSplit {
+    Experts,
+    Columns,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MoePlan {
+    pub split: MoeSplit,
+    pub reason: String,
+}
+
+const MIN_COLUMNS_PER_RANK: usize = 256;
+
+fn columns_fit(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<()> {
     for (what, n) in [("expert intermediate size", m.expert_intermediate), ("shared expert intermediate size", m.shared_intermediate)] {
         ensure!(n % tp == 0, "tp {tp} does not divide the {what} {n} of {}", spec.name);
         ensure!((n / tp) % 16 == 0, "tp {tp} leaves {} {what} columns per rank in {}, which is not a multiple of 16", n / tp, spec.name);
@@ -183,7 +197,50 @@ fn moe_split(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<()> {
     Ok(())
 }
 
+fn experts_fit(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<()> {
+    ensure!(m.experts % tp == 0, "tp {tp} does not divide the {} experts of {}", m.experts, spec.name);
+    Ok(())
+}
+
+pub fn plan_moe(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<MoePlan> {
+    use crate::spec::TpSplit;
+    let (columns, experts) = (columns_fit(spec, m, tp), experts_fit(spec, m, tp));
+    let plan = |split, reason: String| Ok(MoePlan { split, reason });
+    match m.tp_split {
+        TpSplit::Experts => {
+            experts?;
+            plan(MoeSplit::Experts, "forced by [moe] tp_split".into())
+        }
+        TpSplit::Columns => {
+            columns?;
+            plan(MoeSplit::Columns, "forced by [moe] tp_split".into())
+        }
+        TpSplit::Auto => match (columns, experts) {
+            (Err(c), Err(e)) => anyhow::bail!("{c}; {e}"),
+            (Ok(()), Err(e)) => plan(MoeSplit::Columns, format!("the experts cannot be split evenly ({e})")),
+            (Err(c), Ok(())) => plan(MoeSplit::Experts, format!("columns cannot be split ({c}); each rank owns {} of {} experts", m.experts / tp, m.experts)),
+            (Ok(()), Ok(())) => {
+                let width = m.expert_intermediate / tp;
+                if width < MIN_COLUMNS_PER_RANK {
+                    plan(MoeSplit::Experts, format!("a column split leaves {width} columns per expert per rank, under {MIN_COLUMNS_PER_RANK}; each rank owns {} of {} experts, {} active per token", m.experts / tp, m.experts, m.top_k()))
+                } else {
+                    plan(MoeSplit::Columns, format!("{width} columns per expert per rank keep the kernels wide and every rank works on every token's {} active experts; the shared expert is split too", m.top_k()))
+                }
+            }
+        },
+    }
+}
+
+fn moe_split(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<()> {
+    plan_moe(spec, m, tp).map(|_| ())
+}
+
 pub fn rank_spec(spec: &Spec, tp: usize) -> Result<Spec> {
+    rank_spec_of(spec, tp, 0)
+}
+
+pub fn rank_spec_of(spec: &Spec, tp: usize, rank: usize) -> Result<Spec> {
+    ensure!(rank < tp.max(1), "rank {rank} outside tp {tp}");
     supports(spec, tp)?;
     if tp == 1 {
         return Ok(spec.clone());
@@ -194,8 +251,13 @@ pub fn rank_spec(spec: &Spec, tp: usize) -> Result<Spec> {
     s.attention.kv_heads = h.kv;
     s.dims.intermediate = spec.dims.intermediate / tp;
     if let Some(m) = s.moe.as_mut() {
-        m.expert_intermediate /= tp;
-        m.shared_intermediate /= tp;
+        match plan_moe(spec, m, tp)?.split {
+            MoeSplit::Columns => {
+                m.expert_intermediate /= tp;
+                m.shared_intermediate /= tp;
+            }
+            MoeSplit::Experts => m.local = Some(crate::spec::ExpertRange { first: rank * (m.experts / tp), count: m.experts / tp }),
+        }
     }
     if let Some(l) = s.linear_attention.as_mut() {
         l.key_heads = h.key;
@@ -274,11 +336,13 @@ impl RankCut {
             add("mlp.down_proj", colcut(d.intermediate));
         }
         if let Some(m) = &spec.moe {
-            let inter = m.expert_intermediate;
-            for expert in ["mlp.experts.*", "mlp.shared_expert"] {
-                add(&format!("{expert}.gate_proj"), rowcut(inter));
-                add(&format!("{expert}.up_proj"), rowcut(inter));
-                add(&format!("{expert}.down_proj"), colcut(inter));
+            if plan_moe(spec, m, tp)?.split == MoeSplit::Columns {
+                let inter = m.expert_intermediate;
+                for expert in ["mlp.experts.*", "mlp.shared_expert"] {
+                    add(&format!("{expert}.gate_proj"), rowcut(inter));
+                    add(&format!("{expert}.up_proj"), rowcut(inter));
+                    add(&format!("{expert}.down_proj"), colcut(inter));
+                }
             }
         }
         if let Some(l) = &spec.linear_attention {
@@ -506,7 +570,8 @@ mod tests {
     fn moe_fixtures_cut_every_expert_and_leave_the_router_whole() {
         for f in ["tiny-qwen3.5-moe", "tiny-qwen3.5-moe-fp8"] {
             let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(f);
-            let s = spec(&format!("{f}/config.json"));
+            let mut s = spec(&format!("{f}/config.json"));
+            s.moe.as_mut().unwrap().tp_split = crate::spec::TpSplit::Columns;
             let full = crate::weights::Checkpoint::open(&dir).unwrap();
             let root = full.root();
             let names = full.names_under(&format!("{root}.layers."));
@@ -528,6 +593,35 @@ mod tests {
             }
             assert!(cut >= 6 * 9 && whole >= 2, "{f}: cut {cut} whole {whole}");
         }
+    }
+
+    #[test]
+    fn the_planner_picks_the_moe_split_from_the_expert_widths() {
+        use crate::spec::TpSplit;
+        for f in ["tiny-qwen3.5-moe", "tiny-qwen3.5-moe-fp8"] {
+            let s = spec(&format!("{f}/config.json"));
+            let m = s.moe.as_ref().unwrap();
+            let plan = plan_moe(&s, m, 2).unwrap();
+            assert_eq!(plan.split, MoeSplit::Experts, "{f}: {}", plan.reason);
+            assert!(plan.reason.contains("4 of 8 experts"), "{}", plan.reason);
+            let r = rank_spec_of(&s, 2, 1).unwrap().moe.unwrap();
+            assert_eq!((r.first_expert(), r.local_experts(), r.expert_intermediate), (4, 4, m.expert_intermediate));
+            let mut forced = m.clone();
+            forced.tp_split = TpSplit::Columns;
+            assert_eq!(plan_moe(&s, &forced, 2).unwrap().split, MoeSplit::Columns);
+        }
+        let big = spec("qwen3.5-122b-a10b-nvfp4.config.json");
+        let m = big.moe.as_ref().unwrap();
+        let plan = plan_moe(&big, m, 2).unwrap();
+        assert_eq!(plan.split, MoeSplit::Columns, "{}", plan.reason);
+        let wide = plan_moe(&big, m, 4).unwrap();
+        assert_eq!(wide.split, MoeSplit::Columns, "{}", wide.reason);
+        let eight = plan_moe(&big, m, 8).unwrap();
+        assert_eq!(eight.split, MoeSplit::Experts, "{}", eight.reason);
+        let mut odd = m.clone();
+        odd.experts = 255;
+        odd.tp_split = TpSplit::Experts;
+        assert!(plan_moe(&big, &odd, 2).unwrap_err().to_string().contains("does not divide"));
     }
 
     #[test]

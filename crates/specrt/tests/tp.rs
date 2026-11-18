@@ -75,7 +75,14 @@ struct Outcome {
 }
 
 fn compare(dir: &str, serving: bool, tp: usize, force: Option<Transport>, graphs: bool) -> Outcome {
+    compare_split(dir, serving, tp, force, graphs, specrt::spec::TpSplit::Auto)
+}
+
+fn compare_split(dir: &str, serving: bool, tp: usize, force: Option<Transport>, graphs: bool, split: specrt::spec::TpSplit) -> Outcome {
     let mut s = spec_for(dir, serving);
+    if let Some(m) = s.moe.as_mut() {
+        m.tp_split = split;
+    }
     s.runtime.graphs = graphs;
     let slots = 4;
     let lay = layout(&s, slots);
@@ -196,8 +203,16 @@ fn mtp_speculation_under_tp_emits_the_tp1_greedy_tokens() {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn moe_tp_matches_tp1_on_virtual_ranks() {
-    check("tiny-qwen3.5-moe", false, &[2]);
-    check("tiny-qwen3.5-moe-fp8", false, &[2]);
+    use specrt::spec::TpSplit;
+    for dir in ["tiny-qwen3.5-moe", "tiny-qwen3.5-moe-fp8"] {
+        for split in [TpSplit::Columns, TpSplit::Experts, TpSplit::Auto] {
+            eprintln!("{dir} split {split:?}");
+            let o = compare_split(dir, false, 2, None, false, split);
+            assert!(o.logit_err <= 2e-3 * o.logit_scale.max(1.0), "{dir} {split:?}: logits drift by {}", o.logit_err);
+            assert_eq!(o.top1, o.rows, "{dir} {split:?}: top-1 changed");
+            assert!(o.tokens_equal + 1 >= o.streams, "{dir} {split:?}: only {}/{} greedy streams match", o.tokens_equal, o.streams);
+        }
+    }
 }
 
 #[test]

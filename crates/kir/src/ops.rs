@@ -22,6 +22,7 @@ pub struct OpsShape {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoeShape {
     pub experts: usize,
+    pub local: usize,
     pub top_k: usize,
     pub pairs: usize,
     pub inter: usize,

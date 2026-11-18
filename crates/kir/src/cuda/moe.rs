@@ -11,6 +11,7 @@ pub fn emit_moe(kernels: &[MoeKernel]) -> Result<String, String> {
         match k.family {
             Family::Experts => out.push_str(&format!(
                 "constexpr int MOE_E = {};
+constexpr int MOE_LOCAL = {};
 constexpr int MOE_K = {};
 constexpr int MOE_PAIRS = {};
 constexpr int MOE_INTER = {};
@@ -19,7 +20,7 @@ constexpr bool MOE_NORM_TOPK = {};
 constexpr bool MOE_SHARED_GATE = {};
 constexpr bool MOE_SIGMOID = {};
 {MOE}",
-                m.experts, m.top_k, m.pairs, m.inter, m.shared, m.norm_topk, m.shared_gate, m.sigmoid
+                m.experts, m.local, m.top_k, m.pairs, m.inter, m.shared, m.norm_topk, m.shared_gate, m.sigmoid
             )),
             Family::GroupedMma => {
                 out.push('\n');

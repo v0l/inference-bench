@@ -23,6 +23,7 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
     let Some(m) = &spec.moe else { return Ok(Vec::new()) };
     let shape = kir::moe::MoeShape {
         experts: m.experts,
+        local: m.local_experts(),
         top_k: m.top_k(),
         pairs: m.pairs(),
         inter: m.expert_intermediate,

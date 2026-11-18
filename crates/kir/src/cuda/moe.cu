@@ -51,7 +51,9 @@ extern "C" __global__ void __launch_bounds__(256) moe_route_logits(const float* 
     if (lane == 0) logits[(size_t)t * (MOE_E + 1) + e] = a;
 }
 
-extern "C" __global__ void __launch_bounds__(32) moe_route(const float* logits, int* idx, float* coef) {
+constexpr bool MOE_PARALLEL = MOE_LOCAL != MOE_E;
+
+extern "C" __global__ void __launch_bounds__(32) moe_route(const float* logits, int* idx, float* coef, int first) {
     __shared__ float probs[MOE_E];
     __shared__ float top_v[MOE_K];
     __shared__ int top_i[MOE_K];
@@ -92,12 +94,15 @@ extern "C" __global__ void __launch_bounds__(32) moe_route(const float* logits, 
         __syncwarp();
     }
     for (int k = lane; k < MOE_K; k += 32) {
-        idx[t * MOE_PAIRS + k] = top_i[k];
-        coef[t * MOE_PAIRS + k] = MOE_NORM_TOPK ? top_v[k] / picked : top_v[k];
+        int local = top_i[k] - first;
+        bool mine = local >= 0 && local < MOE_LOCAL;
+        idx[t * MOE_PAIRS + k] = mine ? local : -1;
+        coef[t * MOE_PAIRS + k] = mine ? (MOE_NORM_TOPK ? top_v[k] / picked : top_v[k]) : 0.0f;
     }
     if (MOE_SHARED && lane == 0) {
-        idx[t * MOE_PAIRS + MOE_K] = MOE_E;
-        coef[t * MOE_PAIRS + MOE_K] = MOE_SHARED_GATE ? 1.0f / (1.0f + expf(-gate_logit)) : 1.0f;
+        bool mine = !MOE_PARALLEL || first == 0;
+        idx[t * MOE_PAIRS + MOE_K] = mine ? MOE_LOCAL : -1;
+        coef[t * MOE_PAIRS + MOE_K] = !mine ? 0.0f : MOE_SHARED_GATE ? 1.0f / (1.0f + expf(-gate_logit)) : 1.0f;
     }
 }
 
@@ -142,14 +147,13 @@ __device__ __forceinline__ void moe_up_impl(const void* gw, const unsigned char*
     int pair = blockIdx.x;
     int t = pair / MOE_PAIRS;
     int expert = idx[pair];
+    if (expert < 0) return;
     for (int i = threadIdx.x; i < HIDDEN; i += 256) xs[i] = xn[(size_t)t * HIDDEN + i];
     __syncthreads();
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int row = blockIdx.y * MOE_WARPS + warp;
     if (row >= MOE_INTER) return;
-    int stack = MOE_SHARED ? MOE_E + 1 : MOE_E;
-    (void)stack;
     float g = moe_dot<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
     float u = moe_dot<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane);
     if (lane == 0) act[(size_t)pair * MOE_INTER + row] = activation(g) * u;
@@ -175,6 +179,7 @@ __device__ __forceinline__ void moe_down_impl(const void* w, const unsigned char
     __shared__ __align__(16) float xs[MOE_INTER];
     int pair = blockIdx.x;
     int expert = idx[pair];
+    if (expert < 0) return;
     for (int i = threadIdx.x; i < MOE_INTER; i += 256) xs[i] = act[(size_t)pair * MOE_INTER + i];
     __syncthreads();
     int warp = threadIdx.x >> 5;
@@ -202,19 +207,22 @@ extern "C" __global__ void moe_combine(float* x, const float* out, const float* 
     int i = blockIdx.x * 256 + threadIdx.x;
     if (i >= HIDDEN) return;
     float acc = 0.0f;
-    for (int s = 0; s < MOE_PAIRS; s++) acc += coef[t * MOE_PAIRS + s] * out[((size_t)t * MOE_PAIRS + s) * HIDDEN + i];
+    for (int s = 0; s < MOE_PAIRS; s++) {
+        float c = coef[t * MOE_PAIRS + s];
+        if (c != 0.0f) acc += c * out[((size_t)t * MOE_PAIRS + s) * HIDDEN + i];
+    }
     x[(size_t)t * HIDDEN + i] += acc;
 }
 
 constexpr int MOE_TJ = 2;
-constexpr int MOE_SLOTS = MOE_E + (MOE_SHARED ? 1 : 0);
+constexpr int MOE_SLOTS = MOE_LOCAL + (MOE_SHARED ? 1 : 0);
 
 extern "C" __global__ void __launch_bounds__(1024) moe_permute(const int* idx, int* offsets, int* sorted, int pairs) {
     __shared__ int count[MOE_SLOTS + 1];
     __shared__ int cursor[MOE_SLOTS];
     for (int e = threadIdx.x; e <= MOE_SLOTS; e += blockDim.x) count[e] = 0;
     __syncthreads();
-    for (int p = threadIdx.x; p < pairs; p += blockDim.x) atomicAdd(&count[idx[p]], 1);
+    for (int p = threadIdx.x; p < pairs; p += blockDim.x) if (idx[p] >= 0) atomicAdd(&count[idx[p]], 1);
     __syncthreads();
     if (threadIdx.x == 0) {
         int run = 0;
@@ -228,6 +236,7 @@ extern "C" __global__ void __launch_bounds__(1024) moe_permute(const int* idx, i
     }
     __syncthreads();
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
+        if (idx[p] < 0) continue;
         int at = atomicAdd(&cursor[idx[p]], 1);
         sorted[at] = p;
     }

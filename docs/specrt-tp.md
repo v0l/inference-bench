@@ -15,7 +15,7 @@ Our own tensor-parallel mode, with no NCCL. `serve.tp = N` splits one model acro
 | MTP under tp | done, the draft layer is sharded like a decoder layer, the draft head is replicated |
 | `serve.tp` in the options schema and the server config | done, default 1 |
 | Load dialog choice | left to #776, which owns `load.rs` |
-| MoE | per-expert split (#798): `mlp.experts.N.*` and `mlp.shared_expert.*` cut by column like the dense MLP, router replicated, `Op::AllReduce` after `moe_combine` (which writes `Buf::Partial`). CPU tests pass; the virtual-rank GPU test `moe_tp_matches_tp1_on_virtual_ranks` is written but not run (both desktop cards are busy). Expert parallel is not built |
+| MoE | two splits (#798), chosen by `tp::plan_moe` with the reason; `[moe] tp_split = "auto" / "experts" / "columns"` overrides. `columns`: every expert cut like the dense MLP. `experts`: rank r owns experts r*E/tp.. (the shared expert lives on rank 0), every rank routes all tokens, `moe_route` writes idx -1 and coef 0 for experts it does not own, so the rank's `moe_combine` writes a zero contribution into `Buf::Partial`. Both end in `Op::AllReduce`. Auto picks columns when each rank keeps at least 256 columns per expert, else experts; it falls back to whichever divides. Virtual-rank tests pass on the Spark for both |
 | 27B TP=2 against TP=1 numbers | script ready (`pair658.sh`), not run |
 
 ## Sharding in the spec

@@ -482,6 +482,31 @@ pub struct Moe {
     pub norm_topk: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub shared_gate: bool,
+    #[serde(default, skip_serializing_if = "TpSplit::is_auto")]
+    pub tp_split: TpSplit,
+    #[serde(skip)]
+    pub local: Option<ExpertRange>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TpSplit {
+    #[default]
+    Auto,
+    Experts,
+    Columns,
+}
+
+impl TpSplit {
+    fn is_auto(&self) -> bool {
+        *self == TpSplit::Auto
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertRange {
+    pub first: usize,
+    pub count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,6 +542,14 @@ fn is_one(n: &usize) -> bool {
 impl Moe {
     pub fn is_sparse(&self, layer: usize) -> bool {
         !self.dense_layers.contains(&layer) && (layer + 1).is_multiple_of(self.sparse_step.max(1))
+    }
+
+    pub fn local_experts(&self) -> usize {
+        self.local.map_or(self.experts, |r| r.count)
+    }
+
+    pub fn first_expert(&self) -> usize {
+        self.local.map_or(0, |r| r.first)
     }
 
     pub fn top_k(&self) -> usize {
@@ -1308,6 +1341,8 @@ impl Spec {
                 router: RouterAct::Softmax,
                 norm_topk: hf.norm_topk_prob.unwrap_or(hybrid),
                 shared_gate: hf.shared_expert_intermediate_size.unwrap_or(0) > 0,
+                tp_split: TpSplit::Auto,
+                local: None,
             }),
             _ => None,
         };

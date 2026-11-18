@@ -463,6 +463,8 @@ impl Gguf {
                     router: crate::spec::RouterAct::Softmax,
                     norm_topk: true,
                     shared_gate: shared > 0 && self.tensors.contains_key("blk.0.ffn_gate_inp_shexp.weight"),
+                    tp_split: crate::spec::TpSplit::Auto,
+                    local: None,
                 })
             }
             None => None,

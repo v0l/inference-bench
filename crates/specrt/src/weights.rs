@@ -983,11 +983,12 @@ impl Checkpoint {
         }
         let m = spec.moe.as_ref().context("no [moe]")?;
         let (h, inter, e) = (spec.dims.hidden, m.expert_intermediate, m.experts);
+        let (local, first) = (m.local_experts(), m.first_expert());
         let shared = m.shared_intermediate > 0;
         ensure!(!shared || m.shared_intermediate == inter, "the shared expert must be as wide as the routed experts");
-        let total = e + usize::from(shared);
+        let total = local + usize::from(shared);
         let module = |i: usize, which: &str| {
-            if i < e { format!("{p}.mlp.experts.{i}.{which}_proj") } else { format!("{p}.mlp.shared_expert.{which}_proj") }
+            if i < local { format!("{p}.mlp.experts.{}.{which}_proj", first + i) } else { format!("{p}.mlp.shared_expert.{which}_proj") }
         };
         let stack = |which: &str, rows: usize, cols: usize| -> Result<Stacked> {
             if quant == Quant::Fp8Block128 {
