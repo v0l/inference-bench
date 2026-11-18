@@ -83,7 +83,7 @@ fn round_gb(bytes: u64) -> f64 {
 pub fn kv_cost_at(spec: &specrt::spec::Spec, dtype: specrt::spec::KvDtype, ctx: usize) -> u64 {
     let mut s = spec.clone();
     s.runtime.kv_dtype = dtype;
-    (specrt::runtime::kv_block_bytes(&s, 1) / specrt::codegen::PAGE) as u64 * ctx as u64
+    (specrt::runtime::kv_block_bytes(&s.for_kv_context(ctx), 1) / specrt::codegen::PAGE) as u64 * ctx as u64
 }
 
 pub fn max_context(a: &ModelAnatomy) -> usize {

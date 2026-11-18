@@ -88,6 +88,14 @@ impl Default for ServeOptions {
 }
 
 impl ServeOptions {
+    pub fn for_kv_context(&self, spec: &Spec, context: usize) -> (Spec, ServeOptions) {
+        let mut opts = self.clone();
+        if let Some(r) = opts.runtime.as_mut() {
+            *r = Spec { runtime: r.clone(), ..spec.clone() }.for_kv_context(context).runtime;
+        }
+        (spec.for_kv_context(context), opts)
+    }
+
     pub fn model_len(&self, spec: &Spec) -> Result<usize> {
         let model_max = match &self.runtime {
             Some(r) if r.rope_extension != spec.runtime.rope_extension => {
@@ -357,9 +365,13 @@ fn watch(pulse: Arc<Pulse>, limit: Duration, failure: Arc<Mutex<Option<String>>>
 impl Core {
     pub fn start(spec: &Spec, opts: ServeOptions) -> Result<Arc<Core>> {
         let max_model_len = opts.model_len(spec)?;
-        let kv_dtype = opts.runtime.as_ref().map_or(spec.runtime.kv_dtype, |r| r.kv_dtype);
-        if let Some(w) = kv_dtype.context_warning(max_model_len) {
-            tracing::warn!(spec = %spec.name, "{w}");
+        let (spec, opts) = opts.for_kv_context(spec, max_model_len);
+        let spec = &spec;
+        let effective = opts.runtime.as_ref().map_or_else(|| spec.clone(), |r| Spec { runtime: r.clone(), ..spec.clone() });
+        match effective.kv_context_note(max_model_len) {
+            Some((false, w)) => tracing::warn!(spec = %spec.name, "{w}"),
+            Some((true, n)) => tracing::info!(spec = %spec.name, "{n}"),
+            None => {}
         }
         anyhow::ensure!(opts.max_num_seqs >= 1, "max_num_seqs must be at least 1");
         opts.check_pool(spec)?;

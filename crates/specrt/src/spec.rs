@@ -90,16 +90,11 @@ pub enum KvDtype {
 }
 
 pub const FP8_KV_VERIFIED_CONTEXT: usize = 32768;
+pub const FP8_KV_LONG_VERIFIED_CONTEXT: usize = 163840;
 
 impl KvDtype {
     pub fn is_fp8(self) -> bool {
         self == KvDtype::Fp8
-    }
-
-    pub fn context_warning(self, context: usize) -> Option<String> {
-        (self.is_fp8() && context > FP8_KV_VERIFIED_CONTEXT).then(|| {
-            format!("fp8 KV cache is only verified up to {FP8_KV_VERIFIED_CONTEXT} tokens; at {context} tokens it drifts from f16 (see docs/specrt-kv-quant.md). Use f16 for long contexts.")
-        })
     }
 }
 
@@ -1578,6 +1573,37 @@ impl Spec {
             return 0;
         }
         self.runtime.kv_f16_layers.unwrap_or(self.attention_layers() / 2).min(self.kv_layers())
+    }
+
+    pub fn default_kv_f16_layers(&self, context: usize) -> usize {
+        if context > FP8_KV_VERIFIED_CONTEXT { (self.attention_layers() * 3).div_ceil(4) } else { self.attention_layers() / 2 }
+    }
+
+    pub fn for_kv_context(&self, context: usize) -> Spec {
+        let mut s = self.clone();
+        if s.runtime.kv_dtype.is_fp8() && s.runtime.kv_f16_layers.is_none() {
+            s.runtime.kv_f16_layers = Some(s.default_kv_f16_layers(context));
+        }
+        s
+    }
+
+    pub fn kv_context_note(&self, context: usize) -> Option<(bool, String)> {
+        if !self.runtime.kv_dtype.is_fp8() {
+            return None;
+        }
+        let resolved = self.for_kv_context(context);
+        let (raw, all) = (resolved.kv_f16_layers().min(self.attention_layers()), self.attention_layers());
+        let size = crate::runtime::kv_block_bytes(&resolved, 1) as f64 / crate::runtime::kv_block_bytes(&Spec { runtime: RuntimeOptions { kv_dtype: KvDtype::F16, ..self.runtime.clone() }, ..self.clone() }, 1) as f64;
+        let split = format!("{raw} of {all} attention layers keep f16 KV, {:.2}x the size of f16", size);
+        if context <= FP8_KV_VERIFIED_CONTEXT {
+            return Some((true, format!("fp8 KV: {split}.")));
+        }
+        let safe = self.default_kv_f16_layers(context);
+        if raw < safe {
+            return Some((false, format!("fp8 KV: {split}. Past {FP8_KV_VERIFIED_CONTEXT} tokens fewer than {safe} f16 layers drift from f16 and can derail long generations; leave f16 kv layers on auto or use f16 (docs/specrt-kv-quant.md).")));
+        }
+        let note = if context > FP8_KV_LONG_VERIFIED_CONTEXT { format!(", verified to {FP8_KV_LONG_VERIFIED_CONTEXT} tokens") } else { String::new() };
+        Some((true, format!("fp8 KV past {FP8_KV_VERIFIED_CONTEXT} tokens: {split}{note}.")))
     }
 
     pub fn kv_layers(&self) -> usize {

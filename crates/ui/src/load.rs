@@ -178,8 +178,8 @@ impl LoadDialog {
                 let ctx = p.context.clamp(MIN_CTX.min(max), max);
                 if p.kv != inference_bench_core::discover::Kv::F16 {
                     choice.set("runtime.kv_dtype", json!("fp8"));
-                    if let Some(n) = p.kv.f16_layers(&v.spec) {
-                        choice.set("runtime.kv_f16_layers", json!(n));
+                    if p.kv == inference_bench_core::discover::Kv::Fp8 {
+                        choice.set("runtime.kv_f16_layers", json!(0));
                     }
                 }
                 (ctx, default_kv_gb(&v.anatomy, free, seqs, ctx))
@@ -217,12 +217,25 @@ impl LoadDialog {
         }
     }
 
+    fn raw_kv_spec(&self) -> Option<specrt::spec::Spec> {
+        let mut spec = self.view.as_ref().ok()?.spec.clone();
+        spec.runtime.kv_dtype = self.kv_dtype();
+        spec.runtime.kv_f16_layers = self.choice.value("runtime.kv_f16_layers").as_u64().map(|n| n as usize);
+        Some(spec)
+    }
+
+    pub fn kv_spec(&self) -> Option<specrt::spec::Spec> {
+        Some(self.raw_kv_spec()?.for_kv_context(self.ctx))
+    }
+
+    pub fn kv_note(&self) -> Option<(bool, String)> {
+        self.raw_kv_spec()?.kv_context_note(self.ctx)
+    }
+
     pub fn sync(&mut self) {
         let Ok(v) = &self.view else { return };
         let mut a = v.anatomy.clone();
-        let mut spec = v.spec.clone();
-        spec.runtime.kv_dtype = self.kv_dtype();
-        spec.runtime.kv_f16_layers = self.choice.value("runtime.kv_f16_layers").as_u64().map(|n| n as usize);
+        let spec = self.kv_spec().unwrap();
         a.kv_bytes_per_token = (specrt::runtime::kv_block_bytes(&spec, 1) / specrt::codegen::PAGE) as u64;
         if self.native_max == 0 {
             self.native_max = a.max_context;
@@ -242,11 +255,8 @@ impl LoadDialog {
         if devices.len() < 2 {
             return None;
         }
-        let v = self.view.as_ref().ok()?;
         let a = self.anatomy()?;
-        let mut spec = v.spec.clone();
-        spec.runtime.kv_dtype = self.kv_dtype();
-        spec.runtime.kv_f16_layers = self.choice.value("runtime.kv_f16_layers").as_u64().map(|n| n as usize);
+        let spec = self.kv_spec()?;
         let sizing = Sizing { weight_bytes: Some(a.total_bytes), kv_pool_bytes: Some(self.kv_bytes()?) };
         Some(Planned::plan(&spec, devices, self.plan_context()?, self.seqs, sizing, objective))
     }
@@ -411,8 +421,8 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                         let at = dialog.max;
                         Line::new().legend("kv at maximum").column(ui, 120.0).value(format!("{} f16, {} fp8 at {} tokens", human_size(kv_cost_at(&v.spec, F16, at)), human_size(kv_cost_at(&v.spec, Fp8, at)), at)).size(11.0).show(ui);
                     }
-                    if let Some(w) = dialog.kv_dtype().context_warning(dialog.ctx) {
-                        status(ui, false, &w);
+                    if let Some((ok, note)) = dialog.kv_note() {
+                        status(ui, ok, &note);
                     }
                     if !dialog.holds_one_request() {
                         status(ui, false, &format!("the KV cache cannot hold one request of {} tokens: raise it or lower the context length. You can still try to load it.", dialog.ctx));

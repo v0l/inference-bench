@@ -173,7 +173,7 @@ impl Kv {
     pub fn f16_layers(self, spec: &Spec) -> Option<usize> {
         match self {
             Kv::F16 => None,
-            Kv::MixedFp8 => Some(spec.attention_layers() / 2),
+            Kv::MixedFp8 => Some(spec.default_kv_f16_layers(usize::MAX)),
             Kv::Fp8 => Some(0),
         }
     }
@@ -827,7 +827,8 @@ mod tests {
         assert_eq!(f16, fit::kv_cost_at(&s.spec, KvDtype::F16, 1));
         let mixed = Kv::MixedFp8.bytes_per_token(&s.spec);
         let fp8 = Kv::Fp8.bytes_per_token(&s.spec);
-        assert_eq!(mixed, fit::kv_cost_at(&s.spec, KvDtype::Fp8, 1));
+        assert_eq!(mixed * 131072, fit::kv_cost_at(&s.spec, KvDtype::Fp8, 131072));
+        assert!(fit::kv_cost_at(&s.spec, KvDtype::Fp8, 1) < mixed, "short contexts keep fewer f16 layers");
         assert!(fp8 < mixed && mixed < f16, "{fp8} {mixed} {f16}");
     }
 
@@ -901,7 +902,7 @@ mod tests {
         let mixed = Kv::MixedFp8.bytes_per_token(&s.spec);
         let fp8 = Kv::Fp8.bytes_per_token(&s.spec);
         assert!(fp8 < mixed && mixed < f16);
-        assert_eq!(Kv::MixedFp8.f16_layers(&s.spec), Some(18));
+        assert_eq!(Kv::MixedFp8.f16_layers(&s.spec), Some(27));
         assert_eq!(Kv::Fp8.f16_layers(&s.spec), Some(0));
         let need = |per: u64| 5 * GB + per * 131072 + GB / 2;
         let free = (need(mixed) as f64 / fit::GPU_UTILIZATION) as u64;

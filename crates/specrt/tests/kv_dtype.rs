@@ -127,10 +127,55 @@ fn mixed_kv_logits_track_f16_at_4096_tokens() {
 }
 
 #[test]
-fn fp8_kv_warns_past_the_verified_context_and_f16_never_does() {
+fn fp8_kv_keeps_half_the_layers_f16_up_to_32k_and_three_quarters_above() {
     use specrt::spec::FP8_KV_VERIFIED_CONTEXT;
-    assert!(KvDtype::Fp8.context_warning(FP8_KV_VERIFIED_CONTEXT).is_none());
-    let w = KvDtype::Fp8.context_warning(FP8_KV_VERIFIED_CONTEXT + 1).unwrap();
-    assert!(w.contains("only verified up to"), "{w}");
-    assert!(KvDtype::F16.context_warning(1 << 20).is_none());
+    let mut s = Spec::load(&fixture_dir("qwen3.8-27b-exact.toml")).unwrap();
+    s.runtime.kv_dtype = KvDtype::Fp8;
+    assert_eq!(s.for_kv_context(8192).kv_f16_layers(), 8);
+    assert_eq!(s.for_kv_context(FP8_KV_VERIFIED_CONTEXT).kv_f16_layers(), 8);
+    assert_eq!(s.for_kv_context(FP8_KV_VERIFIED_CONTEXT + 1).kv_f16_layers(), 12);
+    assert_eq!(s.for_kv_context(262144).kv_f16_layers(), 12);
+    let per_token = |s: &Spec| kv_block_bytes(s, 1);
+    let mut f16 = s.clone();
+    f16.runtime.kv_dtype = KvDtype::F16;
+    let long = per_token(&s.for_kv_context(262144)) as f64 / per_token(&f16) as f64;
+    assert!(long > 0.85 && long < 0.9, "{long}");
+}
+
+#[test]
+fn an_explicit_kv_f16_layers_wins_over_the_context_default() {
+    let mut s = Spec::load(&fixture_dir("qwen3.8-27b-exact.toml")).unwrap();
+    s.runtime.kv_dtype = KvDtype::Fp8;
+    s.runtime.kv_f16_layers = Some(4);
+    assert_eq!(s.for_kv_context(262144).kv_f16_layers(), 4);
+    let (ok, note) = s.kv_context_note(262144).unwrap();
+    assert!(!ok && note.contains("4 of 16") && note.contains("fewer than 12"), "{note}");
+    s.runtime.kv_f16_layers = Some(14);
+    assert_eq!(s.for_kv_context(8192).kv_f16_layers(), 14);
+    assert!(s.kv_context_note(262144).unwrap().0);
+}
+
+#[test]
+fn the_kv_note_shows_the_effective_split_and_f16_has_none() {
+    let mut s = Spec::load(&fixture_dir("qwen3.8-27b-exact.toml")).unwrap();
+    assert!(s.kv_context_note(262144).is_none());
+    s.runtime.kv_dtype = KvDtype::Fp8;
+    let (ok, short) = s.kv_context_note(32768).unwrap();
+    assert!(ok && short.contains("8 of 16") && short.contains("0.74x"), "{short}");
+    let (ok, long) = s.kv_context_note(150000).unwrap();
+    assert!(ok && long.contains("12 of 16") && long.contains("0.86x") && long.contains("past 32768"), "{long}");
+    assert!(s.kv_context_note(262144).unwrap().1.contains("verified to 163840"));
+}
+
+#[test]
+fn serving_resolves_the_kv_split_from_the_served_context() {
+    let mut s = Spec::load(&fixture_dir("qwen3.8-27b-exact.toml")).unwrap();
+    s.runtime.kv_dtype = KvDtype::Fp8;
+    let rt = specrt::spec::RuntimeOptions { kv_dtype: KvDtype::Fp8, ..Default::default() };
+    let opts = specrt::serve::ServeOptions { runtime: Some(rt), ..Default::default() };
+    let (spec, opts) = opts.for_kv_context(&s, 150000);
+    assert_eq!(spec.kv_f16_layers(), 12);
+    assert_eq!(opts.runtime.unwrap().kv_f16_layers, Some(12));
+    let (short, _) = specrt::serve::ServeOptions::default().for_kv_context(&s, 4096);
+    assert_eq!(short.kv_f16_layers(), 8);
 }

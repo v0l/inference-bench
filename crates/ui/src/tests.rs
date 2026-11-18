@@ -1879,7 +1879,7 @@ fn the_dialog_defaults_are_the_engine_defaults_and_max_performance() {
 }
 
 #[test]
-fn fp8_kv_over_the_verified_context_warns_in_the_load_dialog() {
+fn the_load_dialog_shows_the_fp8_kv_split_for_the_context_and_warns_on_a_short_override() {
     let mut h = open_dialog("fp8-warn");
     {
         let d = h.state_mut().load.as_mut().unwrap();
@@ -1888,10 +1888,30 @@ fn fp8_kv_over_the_verified_context_warns_in_the_load_dialog() {
         d.sync();
     }
     h.run();
-    assert!(h.query_by_label_contains("fp8 KV cache is only verified").is_some());
+    let d = h.state().load.as_ref().unwrap();
+    let all = d.view.as_ref().unwrap().spec.attention_layers();
+    let long = format!("{} of {all} attention layers keep f16 KV", (all * 3).div_ceil(4));
+    assert!(d.ctx > specrt::spec::FP8_KV_VERIFIED_CONTEXT, "{}", d.ctx);
+    assert!(h.query_by_label_contains(&long).is_some(), "{long}");
+    assert!(h.query_by_label_contains("past 32768 tokens").is_some());
+    {
+        let d = h.state_mut().load.as_mut().unwrap();
+        d.choice.set("runtime.kv_f16_layers", serde_json::json!(1));
+        d.sync();
+    }
+    h.run();
+    assert!(h.query_by_label_contains("drift from f16 and can derail").is_some());
+    {
+        let d = h.state_mut().load.as_mut().unwrap();
+        d.choice.reset("runtime.kv_f16_layers");
+        d.ctx = 8192;
+        d.sync();
+    }
+    h.run();
+    assert!(h.query_by_label_contains(&format!("{} of {all} attention layers keep f16 KV", all / 2)).is_some());
     h.state_mut().load.as_mut().unwrap().choice.set("runtime.kv_dtype", serde_json::json!("f16"));
     h.run();
-    assert!(h.query_by_label_contains("fp8 KV cache is only verified").is_none());
+    assert!(h.query_by_label_contains("attention layers keep f16 KV").is_none());
 }
 
 #[test]
@@ -2008,7 +2028,7 @@ fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_ca
     dialog.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
     dialog.sync();
     let fp8 = dialog.estimate(Some(96 << 30)).unwrap().kv as f64 / (1u64 << 30) as f64;
-    assert!(fp8 < gib * 0.8 && fp8 > gib * 0.7, "mixed fp8 kv {fp8} GiB vs {gib}");
+    assert!(fp8 < gib * 0.9 && fp8 > gib * 0.8, "mixed fp8 kv {fp8} GiB vs {gib}");
     let fits_big = dialog.estimate(Some(96 << 30)).is_none_or(|e| e.fits() != Some(false));
     let fits_small = dialog.estimate(Some(40 << 30)).is_none_or(|e| e.fits() != Some(false));
     assert!(fits_big && !fits_small);
@@ -2344,7 +2364,8 @@ fn a_finished_download_preselects_its_fitted_context_and_kv_in_the_load_dialog()
     let d = app.load.as_ref().unwrap();
     assert_eq!(d.ctx, 16384);
     assert_eq!(d.kv_dtype(), specrt::spec::KvDtype::Fp8);
-    let layers = d.choice.value("runtime.kv_f16_layers").as_u64().unwrap();
+    assert!(d.choice.value("runtime.kv_f16_layers").is_null(), "mixed fp8 leaves the split to the context-aware default");
+    let layers = d.kv_spec().unwrap().kv_f16_layers();
     assert!(layers > 0, "mixed fp8 keeps the early layers in f16");
     let a = d.anatomy().unwrap();
     let fp8_only = Kv::Fp8.bytes_per_token(&d.view.as_ref().unwrap().spec);

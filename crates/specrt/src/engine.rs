@@ -454,6 +454,7 @@ impl Engine {
         }
         let model_max = model_max_context(&spec);
         let max_ctx = limit_context(max_ctx.unwrap_or(DEFAULT_CTX), model_max)?;
+        let spec = spec.for_kv_context(max_ctx);
         tracing::info!(model, spec = %spec.name, max_ctx, "loading model");
         let runtime = Device::load(&spec, max_ctx)?;
         Ok(Self { spec, tokenizer, chat, runtime, max_ctx, stop, sampling, media })
