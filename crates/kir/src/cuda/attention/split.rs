@@ -1,4 +1,5 @@
-constexpr int ATTN_SPLITS = 64;
+pub fn body() -> String {
+    r##"constexpr int ATTN_SPLITS = 64;
 constexpr int ATTN_TILE = 16;
 constexpr int ATTN_MIN_CHUNK = 16;
 constexpr int ATTN_BLOCK = 128;
@@ -148,4 +149,7 @@ extern "C" __global__ void attention_reduce(const float* part, const int* pos_pt
         for (int i = 0; i < active; i++) total += w_s[i] * base[i * ATTN_PART + d];
         out[head * HEAD_DIM + d] = total / l * out_gate(qkv, 0, head * HEAD_DIM + d);
     }
+}
+"##
+    .to_string()
 }

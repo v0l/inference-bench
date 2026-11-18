@@ -1,4 +1,5 @@
-extern "C" __global__ void batch_decode_combine(const float* part_acc, const float* part_ml, const float* qkv, const int* pos, int qlen, int splits,
+pub fn body() -> String {
+    r##"extern "C" __global__ void batch_decode_combine(const float* part_acc, const float* part_ml, const float* qkv, const int* pos, int qlen, int splits,
                                                 bf16_t* out_hi, bf16_t* out_lo) {
     int head = blockIdx.x;
     int seq = blockIdx.y;
@@ -18,4 +19,7 @@ extern "C" __global__ void batch_decode_combine(const float* part_acc, const flo
     }
     int at = head * HEAD_DIM + d;
     split_store2(out_hi, out_lo, (size_t)seq * Q_DIM + at, A0 / L * out_gate(qkv, seq, at), A1 / L * out_gate(qkv, seq, at + 1));
+}
+"##
+    .to_string()
 }

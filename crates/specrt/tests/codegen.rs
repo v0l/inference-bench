@@ -8,15 +8,6 @@ fn spec(file: &str) -> Spec {
 }
 
 const KIR_SNIPPETS: &[&str] = &[
-    "cuda/attention/combine.cu",
-    "cuda/attention/common.cu",
-    "cuda/attention/decode_common.cu",
-    "cuda/attention/decode.cu",
-    "cuda/attention/flash_legacy.cu",
-    "cuda/attention/flash_mma.cu",
-    "cuda/attention/mma.cu",
-    "cuda/attention/rope.cu",
-    "cuda/attention/split.cu",
     "cuda/fp4_act.cu",
     "cuda/fp4_batch.cu",
     "cuda/fp4.cu",
@@ -47,7 +38,8 @@ const KIR_SNIPPETS: &[&str] = &[
     "cuda/vision/pos.cu",
 ];
 
-const LIBRARY_ONLY: &[&str] = &["cuda/prelude.cu", "cuda/attention/common.cu", "cuda/linear/common.cu", "cuda/gemm.cu"];
+
+const LIBRARY_ONLY: &[&str] = &["cuda/prelude.cu", "cuda/linear/common.cu", "cuda/gemm.cu"];
 
 const BUILT_IN_RUST: &[&str] = &["embed", "splice_rows", "rms_split", "argmax_rows", "apply_mask", "sample_rows", "argmax_advance", "bump", "copy_rows", "split_rows", "rope_inv_freq", "lin_ba_rows", "lin_in_norm", "lin_out_proj", "qkv_proj", "lm_head_norm"];
 

@@ -1,4 +1,8 @@
-extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_attention(
+use super::prim::{self, Mask};
+
+pub fn body() -> String {
+    [
+        r##"extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_attention(
     const float* qkv, const bf16_t* k_cache, const bf16_t* v_cache, const int* block_table, const int* pos, const int* slots,
     int layer, int qlen, int pages, int splits, float* part_acc, float* part_ml, int window) {
     constexpr int CPR = HEAD_DIM / 8;
@@ -118,12 +122,9 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
         const bf16_t* k_lo = k_hi + PLANE;
         const bf16_t* v_hi = k_hi + KV_PLANES * PLANE;
         const bf16_t* v_lo = v_hi + PLANE;
-        float s[SB][4];
-#pragma unroll
-        for (int nb = 0; nb < SB; nb++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) s[nb][e] = 0.0f;
-#pragma unroll
+"##.to_string(),
+        prim::zero_scores().to_string(),
+        r##"#pragma unroll
         for (int np = 0; np < SB / 2; np++)
 #pragma unroll
             for (int kb = 0; kb < KB; kb++) {
@@ -151,71 +152,21 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
 #pragma unroll
                 for (int e = 0; e < 4; e++) s[nb][e] *= tile_scales[nb * 8 + 2 * t + (e & 1)];
         }
-        float mx0 = NEG_INF, mx1 = NEG_INF;
-#pragma unroll
-        for (int nb = 0; nb < SB; nb++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                int key = k0 + nb * 8 + 2 * t + (e & 1);
-                int kpos = e < 2 ? pos0 : pos1;
-                bool live = key < key_end && key <= kpos && (window <= 0 || key > kpos - window);
-                float v = live ? (SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2) : NEG_INF;
-                s[nb][e] = v;
-                if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
-            }
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1));
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
-        float n0 = fmaxf(m0, mx0);
-        float n1 = fmaxf(m1, mx1);
-        float a0 = m0 == NEG_INF ? 0.0f : fast_exp2(m0 - n0);
-        float a1 = m1 == NEG_INF ? 0.0f : fast_exp2(m1 - n1);
-        float sum0 = 0.0f, sum1 = 0.0f;
-#pragma unroll
-        for (int nb = 0; nb < SB; nb++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                float nm = e < 2 ? n0 : n1;
-                float p = s[nb][e] == NEG_INF ? 0.0f : fast_exp2(s[nb][e] - nm);
-                s[nb][e] = p;
-                if (e < 2) sum0 += p; else sum1 += p;
-            }
-        sum0 += __shfl_xor_sync(0xffffffff, sum0, 1);
-        sum0 += __shfl_xor_sync(0xffffffff, sum0, 2);
-        sum1 += __shfl_xor_sync(0xffffffff, sum1, 1);
-        sum1 += __shfl_xor_sync(0xffffffff, sum1, 2);
-        l0 = l0 * a0 + sum0;
-        l1 = l1 * a1 + sum1;
-        m0 = n0;
-        m1 = n1;
-        if (kv_q(layer)) {
+"##.to_string(),
+        prim::online_softmax(&Mask { pos: "kpos", live: "key < key_end && key <= kpos && (window <= 0 || key > kpos - window)" }),
+        r##"        if (kv_q(layer)) {
 #pragma unroll
             for (int nb = 0; nb < SB; nb++)
 #pragma unroll
                 for (int e = 0; e < 4; e++) s[nb][e] *= tile_scales[DM_BK + nb * 8 + 2 * t + (e & 1)];
         }
-#pragma unroll
-        for (int nb = 0; nb < NB; nb++) {
-            o[nb][0] *= a0;
-            o[nb][1] *= a0;
-            o[nb][2] *= a1;
-            o[nb][3] *= a1;
-        }
-#pragma unroll
+"##.to_string(),
+        prim::rescale_acc("NB"),
+        r##"#pragma unroll
         for (int kb = 0; kb < SB / 2; kb++) {
-            unsigned ph[4], pl[4];
-            ph[0] = pack_hi(s[2 * kb][0], s[2 * kb][1]);
-            ph[1] = pack_hi(s[2 * kb][2], s[2 * kb][3]);
-            ph[2] = pack_hi(s[2 * kb + 1][0], s[2 * kb + 1][1]);
-            ph[3] = pack_hi(s[2 * kb + 1][2], s[2 * kb + 1][3]);
-            if (DM_SPLIT || KV_PLANES == 2) {
-                pl[0] = pack_lo(s[2 * kb][0], s[2 * kb][1]);
-                pl[1] = pack_lo(s[2 * kb][2], s[2 * kb][3]);
-                pl[2] = pack_lo(s[2 * kb + 1][0], s[2 * kb + 1][1]);
-                pl[3] = pack_lo(s[2 * kb + 1][2], s[2 * kb + 1][3]);
-            }
-#pragma unroll
+"##.to_string(),
+        prim::pack_probs("DM_SPLIT || KV_PLANES == 2"),
+        r##"#pragma unroll
             for (int np = 0; np < NB / 2; np++) {
                 unsigned bh[4], bl[4] = {0, 0, 0, 0};
                 int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
@@ -251,4 +202,8 @@ extern "C" __global__ void __launch_bounds__(32 * DM_MAX_WARPS) batch_decode_att
         if (pos0 >= 0) *(float2*)&part_ml[base0 * 2] = make_float2(m0, l0);
         if (pos1 >= 0) *(float2*)&part_ml[base1 * 2] = make_float2(m1, l1);
     }
+}
+"##.to_string(),
+    ]
+    .concat()
 }

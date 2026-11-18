@@ -1,4 +1,5 @@
-constexpr int FA_BQ = 16;
+pub fn body() -> String {
+    r##"constexpr int FA_BQ = 16;
 constexpr int FA_BK = 32;
 constexpr int FA_THREADS = 128;
 constexpr int FA_STRIDE = HEAD_DIM + 1;
@@ -96,4 +97,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
 #pragma unroll
         for (int i = 0; i < FA_OUT; i++) dst[sub + 8 * i] = o[i] * inv * out_gate(qkv, qi, head * HEAD_DIM + sub + 8 * i);
     }
+}
+"##
+    .to_string()
 }

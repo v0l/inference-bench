@@ -1,14 +1,26 @@
 use crate::attention::{AttentionError, AttentionKernel, Family, constants};
 
-const COMMON: &str = include_str!("attention/common.cu");
-const ROPE: &str = include_str!("attention/rope.cu");
-const SPLIT: &str = include_str!("attention/split.cu");
-const FLASH_LEGACY: &str = include_str!("attention/flash_legacy.cu");
-const MMA: &str = include_str!("attention/mma.cu");
-const DECODE_COMMON: &str = include_str!("attention/decode_common.cu");
-const COMBINE: &str = include_str!("attention/combine.cu");
-const FLASH_MMA: &str = include_str!("attention/flash_mma.cu");
-const DECODE: &str = include_str!("attention/decode.cu");
+#[path = "attention/combine.rs"]
+mod combine;
+#[path = "attention/common.rs"]
+mod common;
+#[path = "attention/decode.rs"]
+mod decode;
+#[path = "attention/decode_common.rs"]
+mod decode_common;
+#[path = "attention/flash_legacy.rs"]
+mod flash_legacy;
+#[path = "attention/flash_mma.rs"]
+mod flash_mma;
+#[path = "attention/mma.rs"]
+mod mma;
+#[path = "attention/prim.rs"]
+mod prim;
+#[path = "attention/rope.rs"]
+mod rope;
+#[path = "attention/split.rs"]
+mod split;
+
 
 pub fn emit_attention(kernels: &[AttentionKernel]) -> Result<String, AttentionError> {
     let Some(first) = kernels.first() else { return Ok(String::new()) };
@@ -26,28 +38,28 @@ pub fn emit_attention(kernels: &[AttentionKernel]) -> Result<String, AttentionEr
         out.push_str(s);
     };
     push(&crate::rope::inv_freq_fn(crate::layout::Dialect::Cuda, &[1, 2, 3, 4]));
-    push(COMMON);
+    push(&common::body());
     if has(Family::RopeKv) {
-        push(ROPE);
+        push(&rope::body());
     }
     if has(Family::SplitDecode) {
-        push(SPLIT);
+        push(&split::body());
     }
     if has(Family::FlashLegacy) {
-        push(FLASH_LEGACY);
+        push(&flash_legacy::body());
     }
     if has(Family::FlashMma) || has(Family::GroupedDecode) {
-        push(MMA);
+        push(&mma::body());
     }
     if has(Family::GroupedDecode) {
-        push(DECODE_COMMON);
-        push(COMBINE);
+        push(&decode_common::body());
+        push(&combine::body());
     }
     if has(Family::FlashMma) {
-        push(FLASH_MMA);
+        push(&flash_mma::body());
     }
     if has(Family::GroupedDecode) {
-        push(DECODE);
+        push(&decode::body());
     }
     Ok(out)
 }

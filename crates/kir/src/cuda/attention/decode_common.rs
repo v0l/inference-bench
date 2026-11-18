@@ -1,4 +1,5 @@
-__device__ __forceinline__ unsigned e4m3x2_to_f16x2(unsigned two) {
+pub fn body() -> String {
+    r##"__device__ __forceinline__ unsigned e4m3x2_to_f16x2(unsigned two) {
     unsigned short in = (unsigned short)two;
     unsigned r;
     asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(r) : "h"(in));
@@ -32,3 +33,6 @@ __device__ __forceinline__ void mma_dec(float* c, const unsigned* ah, const unsi
     mma_f16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
 }
 
+"##
+    .to_string()
+}

@@ -1,4 +1,5 @@
-__device__ __forceinline__ float cap_score(float s) {
+pub fn body() -> String {
+    r##"__device__ __forceinline__ float cap_score(float s) {
     return SOFTCAP > 0.0f ? SOFTCAP * tanhf(s / SOFTCAP) : s;
 }
 
@@ -172,3 +173,6 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     if (KV_PLANES == 2) dst[HEAD_DIM + d] = (bf16_t)lo;
 }
 
+"##
+    .to_string()
+}

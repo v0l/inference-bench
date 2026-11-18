@@ -1,4 +1,5 @@
-__device__ __forceinline__ unsigned pack_hi(float a, float b) {
+pub fn body() -> String {
+    r##"__device__ __forceinline__ unsigned pack_hi(float a, float b) {
     return attn_bits(a) | (attn_bits(b) << 16);
 }
 
@@ -35,4 +36,7 @@ __device__ __forceinline__ void mma_kv(float* c, const unsigned* ah, const unsig
         return;
     }
     mma_f16(c, ah[0], ah[1], ah[2], ah[3], bh0, bh1);
+}
+"##
+    .to_string()
 }

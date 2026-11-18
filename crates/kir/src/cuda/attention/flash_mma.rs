@@ -1,4 +1,8 @@
-__device__ __forceinline__ void fm_cp_async4(void* smem, const void* gmem) {
+use super::prim::{self, Mask};
+
+pub fn body() -> String {
+    [
+        r##"__device__ __forceinline__ void fm_cp_async4(void* smem, const void* gmem) {
     unsigned s = (unsigned)__cvta_generic_to_shared(smem);
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(gmem));
 }
@@ -192,12 +196,9 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             continue;
         }
         constexpr int SB = FM_BK / 8;
-        float s[SB][4];
-#pragma unroll
-        for (int nb = 0; nb < SB; nb++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) s[nb][e] = 0.0f;
-#pragma unroll
+"##.to_string(),
+        prim::zero_scores().to_string(),
+        r##"#pragma unroll
         for (int np = 0; np < SB / 2; np++)
 #pragma unroll
             for (int kb = 0; kb < FM_KB; kb++) {
@@ -209,65 +210,15 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
                 mma_kv(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
                 mma_kv(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
             }
-        float mx0 = NEG_INF, mx1 = NEG_INF;
-#pragma unroll
-        for (int nb = 0; nb < SB; nb++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                int key = k0 + nb * 8 + 2 * t + (e & 1);
-                int pos = e < 2 ? pos0 : pos1;
-                bool live = (key <= pos || key <= (e < 2 ? span0 : span1)) && key < key_end && (window <= 0 || key > pos - window);
-                float v = live ? (SOFTCAP > 0.0f ? cap_score(s[nb][e] * (scale_log2 / LOG2E)) * LOG2E : s[nb][e] * scale_log2) : NEG_INF;
-                s[nb][e] = v;
-                if (e < 2) mx0 = fmaxf(mx0, v); else mx1 = fmaxf(mx1, v);
-            }
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 1));
-        mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffff, mx0, 2));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 1));
-        mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffff, mx1, 2));
-        float n0 = fmaxf(m0, mx0);
-        float n1 = fmaxf(m1, mx1);
-        float a0 = m0 == NEG_INF ? 0.0f : fast_exp2(m0 - n0);
-        float a1 = m1 == NEG_INF ? 0.0f : fast_exp2(m1 - n1);
-        float sum0 = 0.0f, sum1 = 0.0f;
-#pragma unroll
-        for (int nb = 0; nb < SB; nb++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                float nm = e < 2 ? n0 : n1;
-                float p = s[nb][e] == NEG_INF ? 0.0f : fast_exp2(s[nb][e] - nm);
-                s[nb][e] = p;
-                if (e < 2) sum0 += p; else sum1 += p;
-            }
-        sum0 += __shfl_xor_sync(0xffffffff, sum0, 1);
-        sum0 += __shfl_xor_sync(0xffffffff, sum0, 2);
-        sum1 += __shfl_xor_sync(0xffffffff, sum1, 1);
-        sum1 += __shfl_xor_sync(0xffffffff, sum1, 2);
-        l0 = l0 * a0 + sum0;
-        l1 = l1 * a1 + sum1;
-        m0 = n0;
-        m1 = n1;
-#pragma unroll
-        for (int i = 0; i < FM_NB; i++) {
-            o[i][0] *= a0;
-            o[i][1] *= a0;
-            o[i][2] *= a1;
-            o[i][3] *= a1;
-        }
-#pragma unroll
+"##.to_string(),
+        prim::online_softmax(&Mask { pos: "pos", live: "(key <= pos || key <= (e < 2 ? span0 : span1)) && key < key_end && (window <= 0 || key > pos - window)" }),
+        r##""##.to_string(),
+        prim::rescale_acc("FM_NB"),
+        r##"#pragma unroll
         for (int kb = 0; kb < SB / 2; kb++) {
-            unsigned ph[4], pl[4];
-            ph[0] = pack_hi(s[2 * kb][0], s[2 * kb][1]);
-            ph[1] = pack_hi(s[2 * kb][2], s[2 * kb][3]);
-            ph[2] = pack_hi(s[2 * kb + 1][0], s[2 * kb + 1][1]);
-            ph[3] = pack_hi(s[2 * kb + 1][2], s[2 * kb + 1][3]);
-            if (KV_PLANES == 2) {
-                pl[0] = pack_lo(s[2 * kb][0], s[2 * kb][1]);
-                pl[1] = pack_lo(s[2 * kb][2], s[2 * kb][3]);
-                pl[2] = pack_lo(s[2 * kb + 1][0], s[2 * kb + 1][1]);
-                pl[3] = pack_lo(s[2 * kb + 1][2], s[2 * kb + 1][3]);
-            }
-#pragma unroll
+"##.to_string(),
+        prim::pack_probs("KV_PLANES == 2"),
+        r##"#pragma unroll
             for (int np = 0; np < FM_NB / 2; np++) {
                 unsigned bh[4], bl[4] = {0, 0, 0, 0};
                 int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
@@ -293,4 +244,8 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             split_store2(out_hi, out_lo, (size_t)row1 * Q_DIM + at, o[nb][2] * i1 * out_gate(qkv, row1, at),
                          o[nb][3] * i1 * out_gate(qkv, row1, at + 1));
     }
+}
+"##.to_string(),
+    ]
+    .concat()
 }
