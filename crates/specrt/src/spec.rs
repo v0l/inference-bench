@@ -89,9 +89,17 @@ pub enum KvDtype {
     Fp8,
 }
 
+pub const FP8_KV_VERIFIED_CONTEXT: usize = 32768;
+
 impl KvDtype {
     pub fn is_fp8(self) -> bool {
         self == KvDtype::Fp8
+    }
+
+    pub fn context_warning(self, context: usize) -> Option<String> {
+        (self.is_fp8() && context > FP8_KV_VERIFIED_CONTEXT).then(|| {
+            format!("fp8 KV cache is only verified up to {FP8_KV_VERIFIED_CONTEXT} tokens; at {context} tokens it drifts from f16 (see docs/specrt-kv-quant.md). Use f16 for long contexts.")
+        })
     }
 }
 

@@ -125,3 +125,12 @@ fn mixed_kv_logits_track_f16_at_4096_tokens() {
         assert!(d < 0.02, "kl {d}");
     }
 }
+
+#[test]
+fn fp8_kv_warns_past_the_verified_context_and_f16_never_does() {
+    use specrt::spec::FP8_KV_VERIFIED_CONTEXT;
+    assert!(KvDtype::Fp8.context_warning(FP8_KV_VERIFIED_CONTEXT).is_none());
+    let w = KvDtype::Fp8.context_warning(FP8_KV_VERIFIED_CONTEXT + 1).unwrap();
+    assert!(w.contains("only verified up to"), "{w}");
+    assert!(KvDtype::F16.context_warning(1 << 20).is_none());
+}

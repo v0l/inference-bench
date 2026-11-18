@@ -400,6 +400,9 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                         let at = dialog.max;
                         Line::new().legend("kv at maximum").column(ui, 120.0).value(format!("{} f16, {} fp8 at {} tokens", human_size(kv_cost_at(&v.spec, F16, at)), human_size(kv_cost_at(&v.spec, Fp8, at)), at)).size(11.0).show(ui);
                     }
+                    if let Some(w) = dialog.kv_dtype().context_warning(dialog.ctx) {
+                        status(ui, false, &w);
+                    }
                     if !dialog.holds_one_request() {
                         status(ui, false, &format!("the KV cache cannot hold one request of {} tokens: raise it or lower the context length. You can still try to load it.", dialog.ctx));
                     }

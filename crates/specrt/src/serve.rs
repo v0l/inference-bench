@@ -338,6 +338,10 @@ fn watch(pulse: Arc<Pulse>, limit: Duration, failure: Arc<Mutex<Option<String>>>
 impl Core {
     pub fn start(spec: &Spec, opts: ServeOptions) -> Result<Arc<Core>> {
         let max_model_len = opts.model_len(spec)?;
+        let kv_dtype = opts.runtime.as_ref().map_or(spec.runtime.kv_dtype, |r| r.kv_dtype);
+        if let Some(w) = kv_dtype.context_warning(max_model_len) {
+            tracing::warn!(spec = %spec.name, "{w}");
+        }
         anyhow::ensure!(opts.max_num_seqs >= 1, "max_num_seqs must be at least 1");
         opts.check_pool(spec)?;
         let kv_block = kv_block_bytes(spec, 1);

@@ -1877,6 +1877,22 @@ fn the_dialog_defaults_are_the_engine_defaults_and_max_performance() {
 }
 
 #[test]
+fn fp8_kv_over_the_verified_context_warns_in_the_load_dialog() {
+    let mut h = open_dialog("fp8-warn");
+    {
+        let d = h.state_mut().load.as_mut().unwrap();
+        d.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
+        d.ctx = d.max;
+        d.sync();
+    }
+    h.run();
+    assert!(h.query_by_label_contains("fp8 KV cache is only verified").is_some());
+    h.state_mut().load.as_mut().unwrap().choice.set("runtime.kv_dtype", serde_json::json!("f16"));
+    h.run();
+    assert!(h.query_by_label_contains("fp8 KV cache is only verified").is_none());
+}
+
+#[test]
 fn changing_a_field_shows_custom_and_its_reset_key_restores_the_default() {
     let mut h = open_dialog("adv-custom");
     h.state_mut().load.as_mut().unwrap().advanced = true;
