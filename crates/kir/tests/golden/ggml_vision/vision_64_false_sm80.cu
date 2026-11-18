@@ -1,3 +1,5 @@
+// target Cuda cc=8.0 sms=108 warp=32 threads=1024 smem=166912 graphs=true pdl=false features=[WarpShuffle,CpAsync,Mma16816,ShaderF16]
+// vision head_dim=64 hdp=64 precise=false gemm_smem=73728 flash_smem=36864
 typedef unsigned short bf16_t;
 
 __device__ __forceinline__ float bf(bf16_t v) { return __uint_as_float(((unsigned)v) << 16); }
@@ -49,8 +51,8 @@ __device__ __forceinline__ unsigned pack_f16_lo(float a, float b) {
     return f16_bits(a - f16_float(f16_bits(a))) | (f16_bits(b - f16_float(f16_bits(b))) << 16);
 }
 
-constexpr bool GEMM_SPLIT = {{VIS_GEMM_SPLIT}};
-constexpr bool ATT_SPLIT = {{VIS_ATT_SPLIT}};
+constexpr bool GEMM_SPLIT = false;
+constexpr bool ATT_SPLIT = false;
 
 __device__ __forceinline__ void store_act2(bf16_t* hi, bf16_t* lo, size_t at, float a, float b) {
     if (GEMM_SPLIT) {
@@ -320,7 +322,7 @@ extern "C" __global__ void vis_pos(const float* table, const int* taps, const fl
     }
 }
 
-constexpr int AT_HDP = {{VIS_HDP}};
+constexpr int AT_HDP = 64;
 constexpr int AT_STRIDE = AT_HDP + 8;
 constexpr int AT_WARPS = 8;
 constexpr int AT_BQ = 16 * AT_WARPS;
