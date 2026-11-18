@@ -53,6 +53,8 @@ pub struct ServeOptions {
     pub itl_target: Duration,
     pub whole_prompt_tokens: usize,
     pub min_prefill_tokens: usize,
+    pub swap_space_gb: f64,
+    pub admit_lookahead: usize,
     pub runtime: Option<RuntimeOptions>,
     pub speculative: SpeculativeOptions,
     pub placement: Option<crate::placement::PlacementConfig>,
@@ -71,6 +73,8 @@ impl Default for ServeOptions {
             itl_target: Duration::from_millis(100),
             whole_prompt_tokens: 1024,
             min_prefill_tokens: 512,
+            swap_space_gb: 0.0,
+            admit_lookahead: 0,
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,
@@ -191,6 +195,10 @@ pub struct Stats {
     pub kv_block_tokens: usize,
     pub kv_block_bytes: usize,
     pub preemptions: u64,
+    pub swap_preemptions: u64,
+    pub swapped_bytes_total: u64,
+    pub swap_secs: f64,
+    pub reprefilled_tokens: u64,
     pub spec_drafted: u64,
     pub spec_accepted: u64,
     pub steps: u64,
@@ -219,6 +227,10 @@ impl Default for Stats {
             kv_block_tokens: crate::codegen::PAGE,
             kv_block_bytes: 0,
             preemptions: 0,
+            swap_preemptions: 0,
+            swapped_bytes_total: 0,
+            swap_secs: 0.0,
+            reprefilled_tokens: 0,
             spec_drafted: 0,
             spec_accepted: 0,
             steps: 0,
@@ -477,6 +489,8 @@ fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
         itl_target: opts.itl_target,
         whole_prompt_tokens: opts.whole_prompt_tokens,
         min_prefill_tokens: opts.min_prefill_tokens,
+        swap_space_bytes: (opts.swap_space_gb * (1u64 << 30) as f64) as u64,
+        admit_lookahead: opts.admit_lookahead,
         prefix_cache: spec.runtime.prefix_cache,
         ..Config::default()
     }
@@ -830,6 +844,10 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         s.kv_blocks_used = sched.blocks_live();
         s.kv_blocks_cached = sched.blocks_cached();
         s.preemptions = sched.preemptions();
+        s.swap_preemptions = sched.swapped_out();
+        s.swapped_bytes_total = sched.swapped_bytes_total();
+        s.swap_secs = sched.swap_secs();
+        s.reprefilled_tokens = sched.recomputed_tokens();
         s.chain = sched.chain_metrics();
         let p = sched.prefix_stats();
         s.prefix_queries = p.queries;

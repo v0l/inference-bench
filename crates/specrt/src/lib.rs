@@ -27,6 +27,7 @@ pub mod nvrtc;
 pub mod options;
 pub mod pairing;
 pub mod pipeline;
+pub mod hostpool;
 pub mod plan;
 pub mod placement;
 pub mod prefix;

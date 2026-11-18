@@ -681,3 +681,86 @@ fn a_contiguous_layout_without_set_block_table_maps_every_page_to_its_own_block(
     let got = bare.prompt_logits(&prompt).unwrap();
     assert!(max_abs(&got, &want) <= 1e-5, "{}", max_abs(&got, &want));
 }
+
+fn parked_run(s: &Spec, park_after: Option<usize>) -> Vec<Vec<f32>> {
+    let prompt: Vec<u32> = (0..150u32).map(|i| (i * 11 + 5) % 1024).collect();
+    let other: Vec<u32> = (0..90u32).map(|i| (i * 3 + 17) % 1024).collect();
+    let pages = 512usize.div_ceil(specrt::codegen::PAGE);
+    let slots = 3;
+    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 192, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let mut rt = Runtime::load_layout(s, layout).unwrap();
+    let pool = shuffled((slots * pages) as u32, 9);
+    let mut blocks: Vec<u32> = pool[..pages].to_vec();
+    let mut slot = 2;
+    let mut st = rt.stepper().unwrap();
+    rt.acquire_state(slot).unwrap();
+    rt.set_block_table(slot, &blocks).unwrap();
+    let mut token = rt.prefill_slot(&mut st, slot, &prompt, 0, Some((Sampling::GREEDY, 0))).unwrap().unwrap();
+    let mut logits = Vec::new();
+    for step in 0..8usize {
+        if park_after == Some(step) {
+            let held = blocks_for_tokens(prompt.len() + step);
+            let host = rt.park(slot, &blocks[..held]).unwrap();
+            rt.release_state(slot);
+            rt.acquire_state(1).unwrap();
+            rt.set_block_table(1, &blocks).unwrap();
+            rt.prefill_slot(&mut st, 1, &other, 0, Some((Sampling::GREEDY, 0))).unwrap();
+            rt.release_state(1);
+            slot = 0;
+            blocks = pool[pages..2 * pages].to_vec();
+            rt.acquire_state(slot).unwrap();
+            rt.set_block_table(slot, &blocks).unwrap();
+            rt.resume(slot, &blocks[..held], &host).unwrap();
+        }
+        let row = DecodeRow { slot, token, pos: prompt.len() + step, sampling: Sampling::GREEDY, step: step as u32 + 1 };
+        token = rt.decode(&mut st, &[row]).unwrap()[0];
+        logits.push(rt.step_logits(&st, 0, 1).unwrap());
+    }
+    logits
+}
+
+fn blocks_for_tokens(tokens: usize) -> usize {
+    specrt::sched::blocks_for(tokens)
+}
+
+fn park_resume_is_bit_identical(dir: &str) {
+    let s = spec_for(dir);
+    let straight = parked_run(&s, None);
+    for at in [0, 3, 7] {
+        assert_eq!(parked_run(&s, Some(at)), straight, "park after {at} decode steps");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn tiny_hybrid_park_then_resume_gives_bit_identical_logits() {
+    park_resume_is_bit_identical("tiny-qwen3.5");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn tiny_mtp_park_then_resume_gives_bit_identical_logits() {
+    park_resume_is_bit_identical("tiny-qwen3.5-mtp");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn repeated_parking_leaves_no_pinned_memory_behind() {
+    let s = spec_for("tiny-qwen3.5");
+    let pages = 512usize.div_ceil(specrt::codegen::PAGE);
+    let layout = Layout { max_ctx: 512, slots: 2, kv_blocks: 2 * pages, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let mut rt = Runtime::load_layout(&s, layout).unwrap();
+    let blocks: Vec<u32> = (0..8).collect();
+    rt.acquire_state(0).unwrap();
+    rt.set_block_table(0, &blocks).unwrap();
+    for _ in 0..200 {
+        let host = rt.park(0, &blocks).unwrap();
+        assert_eq!(host.bytes, rt.swap_bytes(blocks.len()));
+        rt.resume(0, &blocks, &host).unwrap();
+    }
+    assert_eq!(rt.host_pool().used(), 0);
+    let held: Vec<_> = (0..3).map(|_| rt.park(0, &blocks).unwrap()).collect();
+    assert!(rt.host_pool().used() > 0);
+    drop(held);
+    assert_eq!(rt.host_pool().used(), 0);
+}

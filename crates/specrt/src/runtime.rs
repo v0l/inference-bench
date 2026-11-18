@@ -19,7 +19,7 @@ mod exec;
 mod fused;
 mod moe;
 mod mtp;
-mod snapshot;
+pub(crate) mod snapshot;
 mod stage;
 mod step;
 pub use fused::PrefillPart;
@@ -665,6 +665,7 @@ pub struct Runtime {
     baseline_free: usize,
     mtp: Option<mtp::MtpState>,
     snap: snapshot::SnapshotPool,
+    host: crate::hostpool::HostPool,
     mm_meta: CudaSlice<i32>,
     mm_table: CudaSlice<i32>,
     mm_bidi: CudaSlice<i32>,
@@ -972,6 +973,7 @@ impl Runtime {
             baseline_free: free_before,
             mtp: None,
             snap: Default::default(),
+            host: crate::hostpool::HostPool::new(ctx.clone()),
             mm_meta,
             mm_table,
             mm_bidi,
@@ -1069,6 +1071,10 @@ impl Runtime {
 
     pub fn kv_blocks(&self) -> usize {
         self.kv_blocks
+    }
+
+    pub fn host_pool(&self) -> &crate::hostpool::HostPool {
+        &self.host
     }
 
     pub fn kv_planes(&self) -> usize {
