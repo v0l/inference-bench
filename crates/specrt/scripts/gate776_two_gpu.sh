@@ -70,7 +70,17 @@ curl -sf "localhost:$port/v1/completions" -H 'content-type: application/json' \
 echo "== VRAM per GPU" | tee "$out/report.txt"
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv | tee -a "$out/report.txt"
 grep -E "pipelined serving layout|stage_kv_bytes" "$out/server.log" | tee -a "$out/report.txt" || true
+echo "== one request above the planned per-slot context ($plan_ctx)" | tee -a "$out/report.txt"
+long_report() {
+    jq -c '{prompt_tokens:.usage.prompt_tokens,completion_tokens:.usage.completion_tokens,finish:.choices[0].finish_reason,error}'
+}
+for words in $((plan_ctx / 10 + 800)) ${LONG_WORDS:-$((ctx / 10 - 300))} $((ctx / 10 + 800)); do
+    awk -v n="$words" 'BEGIN{for(i=0;i<n;i++)printf "The quick brown fox jumps over the lazy dog. "; printf "The quick brown fox"}' | jq -Rs '{model:"qwen3.8-27b",prompt:.,max_tokens:16,temperature:0}' >"$out/long.json"
+    curl -s -m 900 "localhost:$port/v1/completions" -H 'content-type: application/json' -d @"$out/long.json" | tee "$out/long.out" | long_report | tee -a "$out/report.txt"
+done
 echo "== parallel $seqs" | tee -a "$out/report.txt"
 "$bin" loadtest --url "http://127.0.0.1:$port" --model qwen3.8-27b --requests "$seqs" --rate 0 --clients "$seqs" --mix "1:512-512" --output 128-128 --json >"$out/parallel.json"
-curl -s "localhost:$port/metrics" | grep -E '^inference_(running_seqs|kv_blocks_total|pipeline_stages|preemptions_total)' | tee -a "$out/report.txt"
+curl -s "localhost:$port/metrics" | grep -E '^(inference_(running_seqs|kv_blocks_total|pipeline_stages|preemptions_total)|vllm:num_requests_running)' | tee -a "$out/report.txt"
+jq -c '{requests,failed,running_max,decode_tok_s}' "$out/parallel.json" | tee -a "$out/report.txt"
+grep -ci 'parallel requests off' "$out/server.log" | sed 's/^/parallel-off lines: /' | tee -a "$out/report.txt" || true
 nvidia-smi --query-gpu=index,memory.used --format=csv | tee -a "$out/report.txt"

@@ -571,7 +571,7 @@ impl Placement {
     pub fn render(&self) -> String {
         let gib = |b: u64| b as f64 / GIB;
         let mut out = format!(
-            "{}: {} layers in {} stage{}, context {}, {} slot{}, objective {:?}\n",
+            "{}: {} layers in {} stage{}, context {} per slot, {} slot{}, objective {:?}\n",
             self.model,
             self.layers,
             self.stages.len(),

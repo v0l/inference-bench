@@ -258,7 +258,7 @@ fn placement_section(ui: &mut egui::Ui, placement: &Result<PlacementConfig, Stri
     section(ui, "placement", "read only: edit server.toml in the data folder and restart the server", |ui| match placement {
         Err(e) => status(ui, false, e),
         Ok(p) => {
-            note(ui, format!("objective {}, context {}, {} slots", format!("{:?}", p.objective).to_lowercase(), p.context, p.slots), VALUE);
+            note(ui, format!("objective {}, context {} per slot, {} slots", format!("{:?}", p.objective).to_lowercase(), p.context, p.slots), VALUE);
             for d in &p.devices {
                 let place = d.address.as_ref().map_or("on this machine".to_string(), |a| format!("at {a}"));
                 note(ui, format!("{} {:.0} GiB {place}", d.name, d.memory_gib), VALUE);
