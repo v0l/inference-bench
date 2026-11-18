@@ -54,7 +54,7 @@ impl Jit {
     }
 
     pub fn arch_for(&self, module: &Module) -> &'static str {
-        if module.arch_features && self.arch == "compute_120" { "compute_120a" } else { self.arch }
+        if module.arch_features && matches!(self.arch, "compute_120" | "compute_121") { if self.arch == "compute_120" { "compute_120a" } else { "compute_121a" } } else { self.arch }
     }
 
     pub fn load(&self, module: &Module) -> Result<Loaded> {
