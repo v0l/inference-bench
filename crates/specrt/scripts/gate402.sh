@@ -64,6 +64,23 @@ fi
 systemd-run --user --wait --collect -P -q -p MemoryMax=10G --working-directory="$PWD" -E CARGO_TARGET_DIR -E CARGO_BUILD_JOBS -E PATH \
     cargo build --release -p inference-bench-cli
 
+port_free() {
+    for _ in $(seq 90); do
+        curl -s -m 2 "localhost:$port/v1/models" >/dev/null 2>&1 || return 0
+        sleep 1
+    done
+    echo "port $port still answers" >&2
+    return 1
+}
+
+stop_server() {
+    kill "$1" 2>/dev/null || true
+    for _ in $(seq 40); do kill -0 "$1" 2>/dev/null || break; sleep 1; done
+    kill -9 "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
+    port_free
+}
+
 serve() {
     exec "$bin" serve --bind 127.0.0.1:$port --model "$spec" --max-num-seqs "$seqs" --max-model-len "$max_len" \
         --max-batched-tokens 2048 "$@"
@@ -89,23 +106,6 @@ else
     kv_gb=$(python3 -c "import sys; held=int(sys.argv[1]); probe=float(sys.argv[2]); max_len=int(sys.argv[3]); print(round(probe*(max_len+4096)/held,3))" "$held" "$probe_gb" "$max_len")
 fi
 echo "KV budget $kv_gb GB (just above one $max_len token sequence plus 4096; eight journal-mix rows need about 70k tokens)" | tee -a "$out/report.txt"
-
-port_free() {
-    for _ in $(seq 90); do
-        curl -s -m 2 "localhost:$port/v1/models" >/dev/null 2>&1 || return 0
-        sleep 1
-    done
-    echo "port $port still answers" >&2
-    return 1
-}
-
-stop_server() {
-    kill "$1" 2>/dev/null || true
-    for _ in $(seq 40); do kill -0 "$1" 2>/dev/null || break; sleep 1; done
-    kill -9 "$1" 2>/dev/null || true
-    wait "$1" 2>/dev/null || true
-    port_free
-}
 
 scrape() {
     curl -s "localhost:$port/metrics" | grep -E '^(inference_preemptions_total|specrt_)' >"$out/$1.metrics" || true
