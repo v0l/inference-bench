@@ -186,3 +186,45 @@ fn modelopt_input_scale_gives_the_compressed_tensors_logits_with_fp4_activations
     std::fs::remove_dir_all(&modelopt).ok();
     std::fs::remove_dir_all(&ct).ok();
 }
+
+fn weight_only_checkpoint(tag: &str, tensors: &[&str]) -> PathBuf {
+    let dir = scratch(tag);
+    std::fs::create_dir_all(&dir).unwrap();
+    let data = 1f32.to_le_bytes();
+    let views: Vec<(String, TensorView)> = tensors.iter().map(|n| (n.to_string(), TensorView::new(Dtype::F32, vec![], &data).unwrap())).collect();
+    safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
+    dir
+}
+
+fn darkstar_spec() -> Spec {
+    let json = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/tests/fixtures/hf/darkstar-config.json")).unwrap();
+    Spec::from_hf_config_serving(&json).unwrap()
+}
+
+#[test]
+fn mlp_fp4_activations_are_refused_on_a_checkpoint_without_input_scales() {
+    let dir = weight_only_checkpoint("weight-only-mlp", &["model.language_model.embed_tokens.weight", "model.language_model.layers.0.mlp.gate_proj.weight_scale_2"]);
+    let mut spec = darkstar_spec();
+    spec.mlp.act_quant = specrt::spec::ActQuant::Fp4;
+    spec.validate().unwrap();
+    let err = Checkpoint::open(&dir).unwrap().layer(&spec, 0).err().expect("must refuse").to_string();
+    assert!(err.contains("layer 0") && err.contains("mlp.gate_proj has no input_scale") && err.contains("weight-only"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn darkstar_with_both_activation_quants_forced_on_is_refused_at_load() {
+    let dir = weight_only_checkpoint("weight-only-both", &["model.language_model.embed_tokens.weight"]);
+    let mut spec = darkstar_spec();
+    spec.act_quant = specrt::spec::ActQuant::Fp8;
+    spec.mlp.act_quant = specrt::spec::ActQuant::Fp4;
+    let err = Checkpoint::open(&dir).unwrap().layer(&spec, 0).err().expect("must refuse").to_string();
+    assert!(err.contains("layer 0") && err.contains("weight-only"), "{err}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn darkstar_as_derived_from_its_config_runs_without_activation_quantisation() {
+    let spec = darkstar_spec();
+    assert_eq!((spec.act_quant, spec.mlp.act_quant), (specrt::spec::ActQuant::None, specrt::spec::ActQuant::None));
+}

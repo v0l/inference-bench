@@ -9,7 +9,7 @@ export SPECRT_REF_DIR=${SPECRT_REF_DIR:-${TMPDIR:-/tmp}/gate677-ref}
 failed=0
 step() {
     local name=$1; shift
-    case " ${GATE_SKIP:-} " in *" $name "*) echo "SKIP $name"; return 0;; esac
+    case " ${GATE_SKIP:-} " in *" $name "*) echo "SKIP $name"; failed=1; return 0;; esac
     if "$@"; then echo "PASS $name"; else echo "FAIL $name"; failed=1; fi
 }
 cargo_test() { systemd-run --user --wait --collect -P -q -p MemoryMax=10G -E CARGO_TARGET_DIR="$CARGO_TARGET_DIR" --working-directory="$root" cargo test -p inference-bench-specrt "$@"; }

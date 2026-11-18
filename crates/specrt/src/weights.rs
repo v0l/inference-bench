@@ -866,6 +866,7 @@ impl Checkpoint {
     pub fn layer_at(&self, spec: &Spec, i: usize, global: usize) -> Result<Layer<'_>> {
         let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
         let p = format!("{}.layers.{global}", self.root());
+        self.require_activation_scales(spec, i, global, &p)?;
         let mixer = if spec.block(i).is_linear() {
             Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"))?)
         } else {
@@ -999,6 +1000,22 @@ impl Checkpoint {
             up: stack("up", inter, h)?,
             down: stack("down", h, inter)?,
         })
+    }
+
+    fn has_input_scale(&self, module: &str) -> bool {
+        self.has(&format!("{module}.input_scale")) || self.has(&format!("{module}.input_global_scale"))
+    }
+
+    fn require_activation_scales(&self, spec: &Spec, i: usize, global: usize, p: &str) -> Result<()> {
+        use crate::spec::ActQuant;
+        let mut modules: Vec<String> = Vec::new();
+        if spec.mlp.act_quant == ActQuant::Fp4 && spec.mlp_quant(i) == Quant::Nvfp4G16 && !spec.moe.as_ref().is_some_and(|m| m.is_sparse(global)) {
+            modules.extend(["gate_proj", "up_proj", "down_proj"].map(|m| format!("{p}.mlp.{m}")));
+        }
+        if let Some(missing) = modules.iter().find(|m| !self.has_input_scale(m)) {
+            bail!("layer {global}: {missing} has no input_scale, so this checkpoint is weight-only for those layers; remove act_quant (and [mlp] act_quant) from the spec");
+        }
+        Ok(())
     }
 
     fn is_fp4(&self, module: &str) -> bool {
