@@ -134,6 +134,8 @@ const NARRATION: [&str; 6] = [
     "Running the tests for {}. Two of them are slow because they start the full pipeline, so I will filter to the relevant module first.",
 ];
 
+const USER_ASK: &str = "<|im_start|>user\nNow write the complete checkout automation script in full, one function per step, then walk through every step and say what you would test next. Take your time and be thorough.<|im_end|>\n<|im_start|>assistant\n<think>\n";
+
 fn agentic_transcript(tok: &Tokenizer, len: usize, root: &str) -> Result<Vec<u32>> {
     let root = if root.is_empty() || root == "1" { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..") } else { PathBuf::from(root) };
     let mut files = Vec::new();
@@ -158,10 +160,30 @@ fn agentic_transcript(tok: &Tokenizer, len: usize, root: &str) -> Result<Vec<u32
     Ok(out)
 }
 
+fn transcript_mode(spec: &Spec, len: usize, out: &str) -> Result<()> {
+    let tok = tokenizer(spec)?;
+    let root = std::env::var("KVGATE_CORPUS").unwrap_or_default();
+    let mut ids = agentic_transcript(&tok, len, &root)?;
+    ids.extend(encode(&tok, USER_ASK)?);
+    std::fs::write(out, tok.decode(&ids, false).map_err(|e| anyhow::anyhow!("{e}"))?)?;
+    println!("wrote {} tokens to {out}", ids.len());
+    Ok(())
+}
+
+fn detect_mode(spec: &Spec, files: &[String]) -> Result<()> {
+    let tok = tokenizer(spec)?;
+    for f in files {
+        let ids = encode(&tok, &std::fs::read_to_string(f)?)?;
+        let r = specrt::loops::detect(&ids);
+        println!("detect file={f} tokens={} repeat_ratio={:.3} worst_repeats={} looping={}", ids.len(), r.repeat_ratio, r.worst_repeats, r.looping);
+    }
+    Ok(())
+}
+
 fn loop_mode(spec: &Spec, len: usize, seeds: usize, new_tokens: usize, arms: &[&str]) -> Result<()> {
     let tok = tokenizer(spec)?;
     let root = std::env::var("KVGATE_CORPUS").unwrap_or_default();
-    let tail = encode(&tok, "<|im_start|>user\nNow write the complete checkout automation script in full, one function per step, then walk through every step and say what you would test next. Take your time and be thorough.<|im_end|>\n<|im_start|>assistant\n<think>\n")?;
+    let tail = encode(&tok, USER_ASK)?;
     let mut prompt = agentic_transcript(&tok, len - tail.len(), &root)?;
     prompt.extend(tail);
     let stops = [248046u32, 248044];
@@ -273,6 +295,11 @@ fn main() -> Result<()> {
             let arms = args.next().unwrap_or_else(|| "f16,fp8".into());
             loop_mode(&spec, len, seeds, new, &arms.split(',').collect::<Vec<_>>())
         }
+        "transcript" => {
+            let len = num(&mut args)?;
+            transcript_mode(&spec, len, &args.next().context(usage)?)
+        }
+        "detect" => detect_mode(&spec, &args.collect::<Vec<_>>()),
         "batch" => {
             let (len, b, new) = (num(&mut args)?, num(&mut args)?, num(&mut args)?);
             batch_mode(&spec, len, b, new)
