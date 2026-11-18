@@ -195,6 +195,10 @@ pub struct Stats {
     pub kv_block_tokens: usize,
     pub kv_block_bytes: usize,
     pub preemptions: u64,
+    pub swap_preemptions: u64,
+    pub swapped_bytes_total: u64,
+    pub swap_secs: f64,
+    pub reprefilled_tokens: u64,
     pub spec_drafted: u64,
     pub spec_accepted: u64,
     pub steps: u64,
@@ -223,6 +227,10 @@ impl Default for Stats {
             kv_block_tokens: crate::codegen::PAGE,
             kv_block_bytes: 0,
             preemptions: 0,
+            swap_preemptions: 0,
+            swapped_bytes_total: 0,
+            swap_secs: 0.0,
+            reprefilled_tokens: 0,
             spec_drafted: 0,
             spec_accepted: 0,
             steps: 0,
@@ -836,6 +844,10 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         s.kv_blocks_used = sched.blocks_live();
         s.kv_blocks_cached = sched.blocks_cached();
         s.preemptions = sched.preemptions();
+        s.swap_preemptions = sched.swapped_out();
+        s.swapped_bytes_total = sched.swapped_bytes_total();
+        s.swap_secs = sched.swap_secs();
+        s.reprefilled_tokens = sched.recomputed_tokens();
         s.chain = sched.chain_metrics();
         let p = sched.prefix_stats();
         s.prefix_queries = p.queries;

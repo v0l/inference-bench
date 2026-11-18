@@ -205,6 +205,15 @@ pub fn render(s: &Stats) -> String {
         "# HELP inference_preemptions_total Sequences preempted for KV space.\n# TYPE inference_preemptions_total counter\ninference_preemptions_total {}",
         s.preemptions
     );
+    let _ = writeln!(
+        o,
+        "# HELP specrt_preemptions_total Preemptions by how the sequence was freed.\n# TYPE specrt_preemptions_total counter\nspecrt_preemptions_total{{kind=\"swap\"}} {}\nspecrt_preemptions_total{{kind=\"recompute\"}} {}",
+        s.swap_preemptions,
+        s.preemptions.saturating_sub(s.swap_preemptions)
+    );
+    let _ = writeln!(o, "# TYPE specrt_swapped_bytes_total counter\nspecrt_swapped_bytes_total {}", s.swapped_bytes_total);
+    let _ = writeln!(o, "# TYPE specrt_swap_seconds counter\nspecrt_swap_seconds {}", s.swap_secs);
+    let _ = writeln!(o, "# TYPE specrt_reprefilled_tokens_total counter\nspecrt_reprefilled_tokens_total {}", s.reprefilled_tokens);
     let _ = writeln!(o, "# TYPE inference_steps_total counter\ninference_steps_total {}", s.steps);
     let _ = writeln!(
         o,
@@ -249,7 +258,7 @@ mod tests {
 
     #[test]
     fn serving_stats_render_as_prometheus_text() {
-        let mut s = Stats { running: 3, waiting: 2, kv_blocks_used: 40, kv_blocks_total: 100, preemptions: 1, spec_drafted: 10, spec_accepted: 7, prefix_queries: 200, prefix_hits: 50, ..Stats::default() };
+        let mut s = Stats { running: 3, waiting: 2, kv_blocks_used: 40, kv_blocks_total: 100, preemptions: 3, swap_preemptions: 2, swapped_bytes_total: 4096, swap_secs: 0.5, reprefilled_tokens: 700, spec_drafted: 10, spec_accepted: 7, prefix_queries: 200, prefix_hits: 50, ..Stats::default() };
         s.inter_token_secs.observe(0.03);
         s.inter_token_secs.observe(0.3);
         let t = render(&s);
@@ -257,7 +266,12 @@ mod tests {
             "inference_running_seqs 3",
             "inference_waiting_seqs 2",
             "inference_kv_blocks_used 40",
-            "inference_preemptions_total 1",
+            "inference_preemptions_total 3",
+            "specrt_preemptions_total{kind=\"swap\"} 2",
+            "specrt_preemptions_total{kind=\"recompute\"} 1",
+            "specrt_swapped_bytes_total 4096",
+            "specrt_swap_seconds 0.5",
+            "specrt_reprefilled_tokens_total 700",
             "inference_spec_drafted_tokens_total 10",
             "inference_prefix_cache_queries_total 200",
             "inference_prefix_cache_hit_tokens_total 50",
@@ -266,7 +280,7 @@ mod tests {
             "inference_inter_token_seconds_bucket{le=\"0.035\"} 1",
             "inference_inter_token_seconds_bucket{le=\"+Inf\"} 2",
             "vllm:kv_cache_usage_perc 0.4",
-            "vllm:num_preemptions_total 1",
+            "vllm:num_preemptions_total 3",
             "vllm:prefix_cache_hits_total 50",
             "vllm:spec_decode_num_draft_tokens_total 10",
             "vllm:spec_decode_num_accepted_tokens_total 7",

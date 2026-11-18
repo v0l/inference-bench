@@ -571,6 +571,8 @@ pub struct Scheduler<E: Executor> {
     swapped_out: u64,
     swapped_in: u64,
     swapped_bytes: u64,
+    swapped_bytes_total: u64,
+    swap_secs: f64,
     recomputed_tokens: u64,
     state_refusals: u64,
     prefill_rate: f64,
@@ -612,6 +614,8 @@ impl<E: Executor> Scheduler<E> {
             swapped_out: 0,
             swapped_in: 0,
             swapped_bytes: 0,
+            swapped_bytes_total: 0,
+            swap_secs: 0.0,
             recomputed_tokens: 0,
             state_refusals: 0,
             prefill_rate: 0.0,
@@ -696,6 +700,14 @@ impl<E: Executor> Scheduler<E> {
 
     pub fn swapped_bytes(&self) -> u64 {
         self.swapped_bytes
+    }
+
+    pub fn swapped_bytes_total(&self) -> u64 {
+        self.swapped_bytes_total
+    }
+
+    pub fn swap_secs(&self) -> f64 {
+        self.swap_secs
     }
 
     pub fn recomputed_tokens(&self) -> u64 {
@@ -810,9 +822,13 @@ impl<E: Executor> Scheduler<E> {
         if bytes == 0 || self.swapped_bytes + bytes > self.cfg.swap_space_bytes {
             return None;
         }
-        match self.exec.park(slot, &s.blocks) {
+        let started = Instant::now();
+        let parked = self.exec.park(slot, &s.blocks);
+        self.swap_secs += started.elapsed().as_secs_f64();
+        match parked {
             Ok(Some(h)) => {
                 self.swapped_bytes += h.bytes as u64;
+                self.swapped_bytes_total += h.bytes as u64;
                 self.swapped_out += 1;
                 Some(h)
             }
@@ -991,7 +1007,9 @@ impl<E: Executor> Scheduler<E> {
         for _ in 0..total {
             blocks.push(self.pool.alloc().expect("checked free blocks"));
         }
+        let started = Instant::now();
         let restored = self.exec.set_table(slot, &blocks).and_then(|_| self.exec.resume(slot, &blocks[..held], &host));
+        self.swap_secs += started.elapsed().as_secs_f64();
         if let Err(e) = restored {
             self.exec.release_state(slot);
             self.pool.release(&mut blocks);
@@ -1724,6 +1742,8 @@ mod tests {
         assert_eq!(s.swapped_out(), s.preemptions());
         assert_eq!(s.swapped_in(), s.swapped_out());
         assert_eq!(s.recomputed_tokens(), 0);
+        assert!(s.swapped_bytes_total() >= s.exec.parks as u64 * 1100);
+        assert!(s.swap_secs() >= 0.0);
         assert_eq!(s.exec.parks, s.exec.resumes);
         assert_eq!(s.swapped_bytes(), 0);
         assert_eq!(s.blocks_used(), 0);
@@ -1740,6 +1760,7 @@ mod tests {
         let (got, _, _) = drain(&mut s);
         assert!(s.swapped_out() > 0);
         assert!(s.recomputed_tokens() > 0);
+        assert!(s.preemptions() > s.swapped_out());
         assert_eq!(s.swapped_bytes(), 0);
         assert_eq!(got, want);
         let (mut none, want) = pressured(0, 0);

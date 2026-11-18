@@ -18,6 +18,8 @@ lookahead=${LOOKAHEAD:-512}
 max_len=${MAX_LEN:-32768}
 requests=${REQUESTS:-32}
 probe_gb=${PROBE_GB:-1.5}
+pressure_requests=${PRESSURE_REQUESTS:-8}
+pressure_output=${PRESSURE_OUTPUT:-2048-4096}
 out=${OUT:-$here/../out/gate402}
 mkdir -p "$out"
 [ "${SKIP_TESTS:-0}" = 1 ] || : >"$out/report.txt"
@@ -105,6 +107,10 @@ stop_server() {
     port_free
 }
 
+scrape() {
+    curl -s "localhost:$port/metrics" | grep -E '^(inference_preemptions_total|specrt_)' >"$out/$1.metrics" || true
+}
+
 arm() {
     port_free
     local name=$1 swap=$2 look=$3
@@ -118,9 +124,14 @@ arm() {
     done
     curl -sf "localhost:$port/v1/completions" -H 'content-type: application/json' \
         -d '{"model":"'"$model"'","prompt":"hello","max_tokens":4}' >/dev/null
+    scrape "$name.journal.before"
     "$bin" loadtest --url "http://127.0.0.1:$port" --model "$model" --json --requests "$requests" --rate 0.5 --clients "$seqs" \
-        --mix "0.6:1k-8k,0.3:8k-16k,0.1:16k-28k" --output 128-512 --seed 402 >"$out/$name.json"
-    curl -s "localhost:$port/metrics" | grep -E '^inference_(preemptions_total|swap)' >"$out/$name.metrics" || true
+        --mix "0.6:1k-8k,0.3:8k-16k,0.1:16k-28k" --output 128-512 --seed 402 >"$out/$name.journal.json"
+    scrape "$name.journal.after"
+    scrape "$name.pressure.before"
+    "$bin" loadtest --url "http://127.0.0.1:$port" --model "$model" --json --requests "$pressure_requests" --rate 0 --clients "$seqs" \
+        --mix "1:8k-16k" --output "$pressure_output" --seed 403 >"$out/$name.pressure.json"
+    scrape "$name.pressure.after"
     stop_server $server
     trap - RETURN
 }
@@ -130,12 +141,25 @@ arm lookahead 0 "$lookahead"
 arm both "$swap_gb" "$lookahead"
 
 python3 - "$out" <<'PY' | tee -a "$out/report.txt"
-import json, sys
+import json, sys, re
 out = sys.argv[1]
-print(f"{'arm':<10} {'ttft p99 s':>10} {'itl max ms':>11} {'tok/s':>8} {'preempt':>8} {'failed':>7}")
-for arm in ("recompute", "swap", "lookahead", "both"):
-    r = json.load(open(f"{out}/{arm}.json"))
-    print(f"{arm:<10} {r['ttft_p99']:>10.2f} {r['itl_max']*1e3:>11.0f} {r['decode_tok_s']:>8.1f} {r['preemptions'] or 0:>8.0f} {r['failed']:>7}")
+def metrics(name):
+    m = {}
+    try:
+        for line in open(f"{out}/{name}.metrics"):
+            k, v = line.rsplit(" ", 1)
+            m[k] = float(v)
+    except FileNotFoundError:
+        pass
+    return m
+for mix in ("journal", "pressure"):
+    print(f"\n{mix} mix")
+    print(f"{'arm':<10} {'ttft p99 s':>10} {'itl max ms':>11} {'tok/s':>7} {'swap':>5} {'recomp':>6} {'reprefill tok':>13} {'swapped GB':>10} {'swap s':>7} {'failed':>6}")
+    for arm in ("recompute", "swap", "lookahead", "both"):
+        r = json.load(open(f"{out}/{arm}.{mix}.json"))
+        b, a = metrics(f"{arm}.{mix}.before"), metrics(f"{arm}.{mix}.after")
+        d = lambda k: a.get(k, 0.0) - b.get(k, 0.0)
+        print(f"{arm:<10} {r['ttft_p99']:>10.2f} {r['itl_max']*1e3:>11.0f} {r['decode_tok_s']:>7.1f} {d('specrt_preemptions_total{kind=\"swap\"}'):>5.0f} {d('specrt_preemptions_total{kind=\"recompute\"}'):>6.0f} {d('specrt_reprefilled_tokens_total'):>13.0f} {d('specrt_swapped_bytes_total')/2**30:>10.2f} {d('specrt_swap_seconds'):>7.1f} {r['failed']:>6}")
 PY
 if [ "$tests_ok" = 1 ]; then
     echo "bit-identical and leak tests: PASS" | tee -a "$out/report.txt"
@@ -143,10 +167,13 @@ else
     echo "bit-identical and leak tests: FAIL" | tee -a "$out/report.txt"
     exit 1
 fi
+min_pressure=${MIN_PRESSURE_PREEMPTIONS:-20}
 for arm in recompute swap; do
-    n=$(python3 -c "import json,sys; print(int(json.load(open(sys.argv[1]))['preemptions'] or 0))" "$out/$arm.json")
-    if [ "$n" -eq 0 ]; then
-        echo "FAIL arm $arm saw 0 preemptions, the KV budget $kv_gb GB did not force any: the table is void" | tee -a "$out/report.txt"
+    n=$(python3 -c "import json,sys; print(int(json.load(open(sys.argv[1]))['preemptions'] or 0))" "$out/$arm.pressure.json")
+    if [ "$n" -lt "$min_pressure" ]; then
+        echo "FAIL arm $arm saw $n preemptions on the pressure mix, need $min_pressure: the table is void" | tee -a "$out/report.txt"
         exit 1
     fi
 done
+n=$(python3 -c "import json,sys; print(int(json.load(open(sys.argv[1]))['preemptions'] or 0))" "$out/recompute.journal.json")
+echo "journal mix recompute preemptions: $n" | tee -a "$out/report.txt"
