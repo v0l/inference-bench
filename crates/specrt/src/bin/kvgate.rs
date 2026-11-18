@@ -161,7 +161,7 @@ fn agentic_transcript(tok: &Tokenizer, len: usize, root: &str) -> Result<Vec<u32
 fn loop_mode(spec: &Spec, len: usize, seeds: usize, new_tokens: usize, arms: &[&str]) -> Result<()> {
     let tok = tokenizer(spec)?;
     let root = std::env::var("KVGATE_CORPUS").unwrap_or_default();
-    let tail = encode(&tok, "<|im_start|>assistant\n<think>\n")?;
+    let tail = encode(&tok, "<|im_start|>user\nNow write the complete checkout automation script in full, one function per step, then walk through every step and say what you would test next. Take your time and be thorough.<|im_end|>\n<|im_start|>assistant\n<think>\n")?;
     let mut prompt = agentic_transcript(&tok, len - tail.len(), &root)?;
     prompt.extend(tail);
     let stops = [248046u32, 248044];
