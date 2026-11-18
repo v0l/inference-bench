@@ -186,19 +186,19 @@ const MIN_COLUMNS_PER_RANK: usize = 256;
 fn columns_fit(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<()> {
     for (what, n) in [("expert intermediate size", m.expert_intermediate), ("shared expert intermediate size", m.shared_intermediate)] {
         ensure!(n % tp == 0, "tp {tp} does not divide the {what} {n} of {}", spec.name);
-        ensure!((n / tp) % 16 == 0, "tp {tp} leaves {} {what} columns per rank in {}, which is not a multiple of 16", n / tp, spec.name);
+        ensure!((n / tp).is_multiple_of(16), "tp {tp} leaves {} {what} columns per rank in {}, which is not a multiple of 16", n / tp, spec.name);
     }
     let per_rank = m.expert_intermediate / tp;
     match spec.mlp.quant.unwrap_or(spec.quant) {
-        crate::spec::Quant::Nvfp4G16 => ensure!(per_rank % 256 == 0, "tp {tp} leaves {per_rank} nvfp4 expert columns per rank in {}, which must be a multiple of 256", spec.name),
-        crate::spec::Quant::Fp8Block128 => ensure!(per_rank % FP8_BLOCK == 0, "tp {tp} cuts fp8 128 blocks in the experts of {}", spec.name),
+        crate::spec::Quant::Nvfp4G16 => ensure!(per_rank.is_multiple_of(256), "tp {tp} leaves {per_rank} nvfp4 expert columns per rank in {}, which must be a multiple of 256", spec.name),
+        crate::spec::Quant::Fp8Block128 => ensure!(per_rank.is_multiple_of(FP8_BLOCK), "tp {tp} cuts fp8 128 blocks in the experts of {}", spec.name),
         _ => {}
     }
     Ok(())
 }
 
 fn experts_fit(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<()> {
-    ensure!(m.experts % tp == 0, "tp {tp} does not divide the {} experts of {}", m.experts, spec.name);
+    ensure!(m.experts.is_multiple_of(tp), "tp {tp} does not divide the {} experts of {}", m.experts, spec.name);
     Ok(())
 }
 
@@ -335,14 +335,14 @@ impl RankCut {
         if shard("down") == Shard::Row {
             add("mlp.down_proj", colcut(d.intermediate));
         }
-        if let Some(m) = &spec.moe {
-            if plan_moe(spec, m, tp)?.split == MoeSplit::Columns {
-                let inter = m.expert_intermediate;
-                for expert in ["mlp.experts.*", "mlp.shared_expert"] {
-                    add(&format!("{expert}.gate_proj"), rowcut(inter));
-                    add(&format!("{expert}.up_proj"), rowcut(inter));
-                    add(&format!("{expert}.down_proj"), colcut(inter));
-                }
+        if let Some(m) = &spec.moe
+            && plan_moe(spec, m, tp)?.split == MoeSplit::Columns
+        {
+            let inter = m.expert_intermediate;
+            for expert in ["mlp.experts.*", "mlp.shared_expert"] {
+                add(&format!("{expert}.gate_proj"), rowcut(inter));
+                add(&format!("{expert}.up_proj"), rowcut(inter));
+                add(&format!("{expert}.down_proj"), colcut(inter));
             }
         }
         if let Some(l) = &spec.linear_attention {
