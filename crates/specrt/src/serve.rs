@@ -1423,9 +1423,7 @@ mod placement_tests {
     }
 
     fn two_gpu_options(pool: u64) -> ServeOptions {
-        let mut runtime = crate::spec::RuntimeOptions::default();
-        runtime.kv_dtype = crate::spec::KvDtype::Fp8;
-        runtime.kv_f16_layers = Some(0);
+        let runtime = crate::spec::RuntimeOptions { kv_dtype: crate::spec::KvDtype::Fp8, kv_f16_layers: Some(0), ..Default::default() };
         let placement = PlacementConfig { context: 12484, slots: 21, devices: vec![device(0), device(1)], max_tp: Some(1), ..PlacementConfig::default() };
         ServeOptions { max_model_len: Some(262144), max_num_seqs: 21, kv_cache_bytes: Some(pool), runtime: Some(runtime), placement: Some(placement), ..Default::default() }
     }
