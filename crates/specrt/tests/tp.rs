@@ -217,7 +217,8 @@ fn moe_tp_matches_tp1_on_virtual_ranks() {
 
 #[test]
 fn moe_specs_split_every_expert_and_refuse_widths_that_do_not_divide() {
-    let s = spec_for("tiny-qwen3.5-moe", false);
+    let mut s = spec_for("tiny-qwen3.5-moe", false);
+    s.moe.as_mut().unwrap().tp_split = specrt::spec::TpSplit::Columns;
     specrt::tp::supports(&s, 2).unwrap();
     let r = specrt::tp::rank_spec(&s, 2).unwrap();
     assert_eq!(r.moe.as_ref().unwrap().expert_intermediate, s.moe.as_ref().unwrap().expert_intermediate / 2);
