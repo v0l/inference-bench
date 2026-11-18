@@ -95,6 +95,36 @@ Decision: the default stays `f16`. fp8 is opt-in and fails the 27B gate as it st
 
 Quality passes the 0.02 bound on average at 8k and 32k (all-fp8 was 0.29 at 8k); the worst single position at 8k is 0.112, above 0.02. Single stream decode at 128k is faster (+6 percent). But batched decode (the grouped `batch_decode_attention` kernel) is 12 to 29 percent slower, reproducibly: its fp8 tile load does a synchronous global read, convert and shared store per thread instead of the `cp.async` pipeline, so it loses the overlap that the f16 path has. The default therefore stays f16. Fixing that load (cp.async the raw bytes and convert from shared memory) is the next step before fp8 can be the default; `long617.sh` against master was not run for that reason.
 
+### Long context and the 150k loop report (#763, 18 Nov)
+
+The user saw a verbatim paragraph loop at about 150k tokens with `kv_dtype = "fp8"` (8 f16 + 8 fp8 layers) on the 27B NVFP4. Harness: `kvgate loop` builds a 150k-token agentic transcript from the repo files (chat template, think blocks, tool calls, repeated similar narration), samples like the agent (temperature 1.0, top_k 20, top_p 0.95 from `generation_config.json`, thinking on) and flags a loop when a 40-token span repeats 3 or more times (`specrt::loops`). `kvgate kl` with `--corpus` uses the same transcript for KL. Scripts: `gate763_spark.sh`, `gate763_serve_spark.sh` (the server path with prefix cache and MTP), `gate763_desktop.sh`.
+
+Loops, 1536 generated tokens at 150k, none looped (repeat ratio 0.000, worst repeat 1 in every run):
+
+| build | path | arms | seeds |
+| --- | --- | --- | --- |
+| master (Spark) | engine, sampled | f16, fp8 (8 f16 layers), fp8 with 16 f16 layers | 2 each |
+| master (desktop) | engine, greedy | f16, fp8 | 1 each |
+| master (Spark) | server, prefix cache warmed at 120k, MTP on | fp8 | 2 |
+| 583024b, the user's build (Spark) | server, prefix cache warmed at 120k, MTP on | fp8 | 3 |
+
+KL of fp8 against f16 on the same transcript, 48 teacher-forced decode steps per prompt after the prefill:
+
+| context | f16 layers | prompts | mean KL | max KL | top-1 agree | positions above 0.1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 32768 | 8 | 4 | 0.021 | 1.19 | 0.959 | 9 of 196 |
+| 65536 | 8 | 3 | 0.129 | 14.2 | 0.952 | 4 of 147 |
+| 131072 | 8 | 2 | 0.186 | 11.7 | 0.929 | 8 of 98 |
+| 163840 | 8 | 2 | 0.036 | 2.25 | 0.980 | 5 of 98 |
+| 65536 | 4 | 3 | 0.114 | 4.77 | 0.898 | 16 of 147 |
+| 65536 | 12 | 3 | 0.00095 | 0.027 | 0.993 | 0 of 147 |
+| 131072 | 12 | 2 | 0.0016 | 0.031 | 0.980 | 0 of 98 |
+| 163840 | 12 | 2 | 0.00083 | 0.029 | 1.000 | 0 of 98 |
+
+Conclusion: the loop was not reproduced on either build or either path. But fp8 with 8 f16 layers drifts badly from 64k (max KL 14, top-1 flips on 5 to 7 percent of positions), which is enough to tip a long sampled generation. With 12 f16 layers it stays clean to 160k. The 8k and 32k rows above used `spec_prompts.txt`, so they understated the drift on agentic text.
+
+Default since #763: with fp8 KV and `kv_f16_layers` unset, the engine keeps half the attention layers in f16 up to 32768 tokens of configured context, and three quarters (12 of 16 on the 27B) above it (`Spec::for_kv_context`, applied by `Engine::load_with`, `Core::start` and the load dialog). An explicit `kv_f16_layers` still wins; below three quarters past 32k the dialog and the engine log warn. Cost: KV per token goes from 0.74x to 0.86x of f16, so fp8 holds about 1.16x the tokens of f16 instead of 1.35x. Verified bound with the default: 163840 tokens. int8 with a per-row scale (llama.cpp q8_0 style, about 0.51x of f16) is the planned long-context replacement.
+
 ### Rerun the gate
 
 ```sh
