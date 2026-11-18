@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
+. "$here/gate776_guard.sh"
 bin=${CARGO_TARGET_DIR:-$here/../../../target}/release/inference-bench
 model=${MODEL:-orcarouter/Qwen3.8-27B-Uncensored-NVFP4}
 port=${PORT:-18776}
@@ -50,22 +51,11 @@ model = "$model"
 EOF
 "$bin" plan --spec "${SPEC:-$here/../tests/fixtures/qwen3.8-27b-nvfp4.toml}" --config "$cfg" --objective latency | tee "$out/plan.txt"
 [ $plan_only = 1 ] && exit 0
-apps=$(nvidia-smi --query-compute-apps=process_name --format=csv,noheader)
-if grep -qi vllm <<<"$apps"; then
-    echo "a vLLM worker holds a GPU, stop local-llm.service in the quiet window first" >&2
-    exit 1
-fi
+require_idle_gpus || exit 1
 if curl -sf -m 2 localhost:8001/v1/models >/dev/null; then
     echo "the app on :8001 is serving, stop it first" >&2
     exit 1
 fi
-for g in 0 1; do
-    used=$(nvidia-smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits)
-    if [ "$used" -gt 4000 ]; then
-        echo "GPU $g has $used MiB in use, stop what runs on it first" >&2
-        exit 1
-    fi
-done
 "$bin" serve --config "$cfg" --bind 127.0.0.1:$port >"$out/server.log" 2>&1 &
 server=$!
 trap 'kill $server 2>/dev/null; wait $server 2>/dev/null || true' EXIT
