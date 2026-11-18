@@ -145,6 +145,9 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         out.push(WgslKernel { name, source: kir::wgsl::emit_linear_op(&shape, tokens, LINEAR_WORKGROUP), bindings: vec![Read, Write, Read, Read, Uniform] });
     }
     out.push(WgslKernel { name: "linear_tile", source: kir::wgsl::emit_linear_tile_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
+    if target.has(kir::Feature::CoopMatrix) {
+        out.push(WgslKernel { name: "linear_coop", source: kir::wgsl::emit_linear_coop_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
+    }
     for k in crate::gemm::gemm_kernels(spec, target)?.kernels {
         let bindings = kir::wgsl::gemm_bindings(&k)
             .into_iter()

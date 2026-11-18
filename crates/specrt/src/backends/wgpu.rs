@@ -30,6 +30,7 @@ pub struct Wgpu {
     cache_dir: Option<PathBuf>,
     cache: Option<wgpu::PipelineCache>,
     cache_path: Option<PathBuf>,
+    prof: std::collections::BTreeMap<String, (u32, f64)>,
 }
 
 pub fn adapters() -> Vec<wgpu::AdapterInfo> {
@@ -70,10 +71,16 @@ impl Wgpu {
         let wanted_subgroups = adapter.features() & wgpu::Features::SUBGROUP;
         let subgroups = !wanted_subgroups.is_empty() && info.subgroup_min_size > 0 && info.subgroup_min_size == info.subgroup_max_size;
         let f16 = adapter.features() & wgpu::Features::SHADER_F16;
+        let coop = adapter.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+            && adapter.cooperative_matrix_properties().iter().any(|c| {
+                c.m_size == 8 && c.n_size == 8 && c.k_size == 8 && c.ab_type == wgpu::CooperativeScalarType::F32 && c.cr_type == wgpu::CooperativeScalarType::F32
+            });
+        let coop = coop && std::env::var_os("SPECRT_NO_COOP").is_none();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("specrt"),
-            required_features: wanted_cache | f16 | if subgroups { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() },
+            required_features: wanted_cache | f16 | if coop { wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX } else { wgpu::Features::empty() } | if subgroups { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() },
             required_limits: required.clone(),
+            experimental_features: if coop { unsafe { wgpu::ExperimentalFeatures::enabled() } } else { wgpu::ExperimentalFeatures::disabled() },
             ..Default::default()
         }))
         .with_context(|| format!("wgpu device on {}", info.name))?;
@@ -87,6 +94,7 @@ impl Wgpu {
             max_workgroup_storage: required.max_compute_workgroup_storage_size,
             subgroup_size: if subgroups { info.subgroup_min_size } else { 0 },
             shader_f16: !f16.is_empty(),
+            coop_matrix: coop,
         };
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
@@ -106,7 +114,7 @@ impl Wgpu {
             }
             _ => (None, None),
         };
-        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, encoder: None, cache_dir, cache, cache_path })
+        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, encoder: None, cache_dir, cache, cache_path, prof: Default::default() })
     }
 
     pub fn info(&self) -> &wgpu::AdapterInfo {
@@ -134,6 +142,7 @@ impl Wgpu {
 
 impl Drop for Wgpu {
     fn drop(&mut self) {
+        for (k, (n, t)) in &self.prof { eprintln!("PROF {k} n={n} total={:.1}ms each={:.3}ms", t * 1e3, t * 1e3 / *n as f64); }
         self.save_cache();
     }
 }
@@ -251,7 +260,7 @@ impl Backend for Wgpu {
                 layout: Some(&pl),
                 module: &module,
                 entry_point: Some("main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: false, ..Default::default() },
                 cache: self.cache.as_ref(),
             });
             if let Some(e) = pollster::block_on(scope.pop()) {
@@ -298,6 +307,14 @@ impl Backend for Wgpu {
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(grid[0], grid[1], grid[2]);
+        drop(pass);
+        if std::env::var_os("SPECRT_PROF").is_some() {
+            let t = std::time::Instant::now();
+            self.submit()?;
+            let e = self.prof.entry(kernel.to_string()).or_default();
+            e.0 += 1;
+            e.1 += t.elapsed().as_secs_f64();
+        }
         Ok(())
     }
 

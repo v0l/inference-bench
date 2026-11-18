@@ -14,9 +14,10 @@ pub enum Feature {
     ShaderF16,
     Fp8Mma,
     BlockScaledFp4,
+    CoopMatrix,
 }
 
-const FEATURES: [Feature; 8] = [
+const FEATURES: [Feature; 9] = [
     Feature::WarpShuffle,
     Feature::CpAsync,
     Feature::Mma16816,
@@ -25,6 +26,7 @@ const FEATURES: [Feature; 8] = [
     Feature::ShaderF16,
     Feature::Fp8Mma,
     Feature::BlockScaledFp4,
+    Feature::CoopMatrix,
 ];
 
 const SMEM_RESERVED_PER_BLOCK: u32 = 1024;

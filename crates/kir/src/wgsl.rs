@@ -453,6 +453,122 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     )
 }
 
+pub const COOP_THREADS: u32 = 128;
+pub const COOP_TOKENS: u32 = 64;
+pub const COOP_ROWS: u32 = 64;
+pub const COOP_K: u32 = 16;
+
+pub fn emit_linear_coop_op(s: &crate::ops::WgslShape) -> String {
+    let mut out = String::from("enable wgpu_cooperative_matrix;\n");
+    out.push_str(&ops_header(s));
+    out.push_str(&linear_coop());
+    out.push_str(&ggml_decode());
+    out
+}
+
+fn linear_coop() -> String {
+    format!(
+        "{bind}
+const BM: u32 = {COOP_TOKENS}u;
+const BN: u32 = {COOP_ROWS}u;
+const BK: u32 = {COOP_K}u;
+const WOFF: u32 = {woff}u;
+var<workgroup> sh: array<f32, {os}>;
+
+@compute @workgroup_size({COOP_THREADS})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let nrows = p.a.x;
+    let cols = p.a.y;
+    let tokens = p.a.z;
+    let x_row0 = p.a.w;
+    let y_row0 = p.b.x;
+    let accumulate = p.b.y;
+    let r0 = wid.x * BN;
+    let t0 = wid.z * BM;
+    let sg = li / 32u;
+    let sm = (sg / 2u) * 32u;
+    let sn = (sg % 2u) * 32u;
+{acc_init}    var ents: array<u32, {pairs}>;
+    for (var n = 0u; n < {pairs}u; n++) {{
+        ents[n] = rows[min(r0 + (li + n * {COOP_THREADS}u) / (BK / 2u), nrows - 1u)];
+    }}
+    for (var k0 = 0u; k0 < cols; k0 += BK) {{
+        for (var n = 0u; n < {pairs}u; n++) {{
+            let idx = li + n * {COOP_THREADS}u;
+            let kp = idx % (BK / 2u);
+            let m = idx / (BK / 2u);
+            let c = k0 + kp * 2u;
+            let t = t0 + m;
+            var x0 = 0.0;
+            var x1 = 0.0;
+            if (t < tokens && c < cols) {{
+                x0 = x[(x_row0 + t) * cols + c];
+                x1 = x[(x_row0 + t) * cols + c + 1u];
+            }}
+            sh[m * BK + kp * 2u] = x0;
+            sh[m * BK + kp * 2u + 1u] = x1;
+            var w0 = 0.0;
+            var w1 = 0.0;
+            if (c < cols) {{
+                let entry = ents[n];
+                let base = (entry >> 3u) * 16u;
+                let code = entry & 7u;
+                if (code == 4u) {{
+                    let w = wdata[(base + 2u * c) >> 2u];
+                    w0 = bitcast<f32>(w << 16u);
+                    w1 = bitcast<f32>(w & 0xffff0000u);
+                }} else {{
+                    w0 = dequant_at(base, code, c);
+                    w1 = dequant_at(base, code, c + 1u);
+                }}
+            }}
+            sh[WOFF + m * BK + kp * 2u] = w0;
+            sh[WOFF + m * BK + kp * 2u + 1u] = w1;
+        }}
+        workgroupBarrier();
+        for (var kk = 0u; kk < BK; kk += 8u) {{
+{mma}        }}
+        workgroupBarrier();
+    }}
+{store}    workgroupBarrier();
+    for (var e = li; e < BM * BN; e += {COOP_THREADS}u) {{
+        let m = e / BN;
+        let n = e % BN;
+        let t = t0 + m;
+        let r = r0 + n;
+        if (t < tokens && r < nrows) {{
+            let at = (y_row0 + t) * nrows + r;
+            if (accumulate == 1u) {{
+                y[at] = y[at] + sh[e];
+            }} else {{
+                y[at] = sh[e];
+            }}
+        }}
+    }}
+}}
+",
+        bind = storage(&[("x", false, "f32"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
+        woff = COOP_K * COOP_TOKENS,
+        os = COOP_TOKENS * COOP_ROWS,
+        pairs = COOP_K * COOP_TOKENS / 2 / COOP_THREADS,
+        acc_init = (0..16).map(|n| format!("    var acc{n} = coop_mat8x8<f32, C>();\n")).collect::<String>(),
+        mma = coop_mma(),
+        store = (0..16).map(|n| format!("    coopStoreT(acc{n}, &sh[(sm + {}u) * BN + sn + {}u], BN);\n", (n / 4) * 8, (n % 4) * 8)).collect::<String>(),
+    )
+}
+
+fn coop_mma() -> String {
+    let mut s = String::new();
+    for i in 0..4 {
+        s.push_str(&format!("            let a{i} = coopLoadT<coop_mat8x8<f32, A>>(&sh[(sm + {}u) * BK + kk], BK);\n", i * 8));
+        s.push_str(&format!("            let b{i} = coopLoad<coop_mat8x8<f32, B>>(&sh[WOFF + (sn + {}u) * BK + kk], BK);\n", i * 8));
+    }
+    for n in 0..16 {
+        s.push_str(&format!("            acc{n} = coopMultiplyAdd(a{}, b{}, acc{n});\n", n / 4, n % 4));
+    }
+    s
+}
+
 const PARAMS: &str = "struct P { a: vec4<u32>, b: vec4<u32> };\n";
 
 fn storage(list: &[(&str, bool, &str)]) -> String {
