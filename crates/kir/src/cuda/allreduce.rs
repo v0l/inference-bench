@@ -1,7 +1,10 @@
 use crate::allreduce::{AllReduceError, AllReduceKernel, Dtype, Mode};
 use crate::lit;
 
-const COMMON: &str = include_str!("allreduce/common.cu");
+#[path = "allreduce/prim.rs"]
+mod prim;
+
+const SPIN_LIMIT: u64 = 20_000_000_000;
 
 fn store(d: Dtype, v: &str) -> String {
     match d {
@@ -17,136 +20,94 @@ fn accumulate(d: Dtype, at: &str, v: &str) -> String {
     }
 }
 
+fn header(threads: u32, name: &str, args: &str) -> String {
+    format!("extern \"C\" __global__ void __launch_bounds__({threads}) {name}({args}) {{\n")
+}
+
+const PLAIN_ARGS: &str = "int rank, int n, int add, int clear";
+
+fn plain_header(k: &AllReduceKernel) -> String {
+    let t = k.dtype.ctype();
+    let mut s = header(k.threads, &k.name(), &format!("{t}* in, {t}* out, const unsigned long long* table, {PLAIN_ARGS}"));
+    s += &format!("    __shared__ unsigned epoch;\n    ar_begin(table, rank, &epoch);\n    {t}* mine = ({t}*)table[rank];\n");
+    s
+}
+
+const STRIDE: &str = "    size_t stride = (size_t)gridDim.x * blockDim.x;\n    size_t first = (size_t)blockIdx.x * blockDim.x + threadIdx.x;\n";
+
 fn one_shot(k: &AllReduceKernel) -> String {
     let t = k.dtype.ctype();
-    format!(
-        "extern \"C\" __global__ void __launch_bounds__({threads}) {name}({t}* in, {t}* out, const unsigned long long* table, int rank, int n, int add, int clear) {{
-    __shared__ unsigned epoch;
-    ar_begin(table, rank, &epoch);
-    {t}* mine = ({t}*)table[rank];
-    size_t stride = (size_t)gridDim.x * blockDim.x;
-    size_t first = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    for (size_t i = first; i < (size_t)n; i += stride) {{
-        mine[i] = in[i];
-        if (clear) in[i] = 0;
-    }}
-    ar_barrier(table, rank, epoch + 1);
-    for (size_t i = first; i < (size_t)n; i += stride) {{
-        float acc = 0.0f;
-#pragma unroll
-        for (int p = 0; p < AR_RANKS; p++) acc += ar_ld(&(({t}*)table[p])[i]);
-        {acc}
-    }}
-    ar_barrier(table, rank, epoch + 2);
-    ar_end(table, rank, epoch + 2);
-}}
+    let mut s = plain_header(k);
+    s += STRIDE;
+    s += &prim::grid_stride(4, "first", "(size_t)n", &prim::stage(8));
+    s += &prim::sync_point(1);
+    s += &prim::grid_stride(4, "first", "(size_t)n", &format!("{}        {}\n", prim::rank_sum(8, t, "i"), accumulate(k.dtype, "i", "acc")));
+    s += &prim::finish(2);
+    s
+}
 
-",
-        threads = k.threads,
-        name = k.name(),
-        acc = accumulate(k.dtype, "i", "acc"),
-    )
+fn per_chunk(n: usize, c: &str, body: &str) -> String {
+    let p = prim::pad(n);
+    format!("{p}for (int c = 0; c < AR_RANKS; c++) {{\n{}{body}{p}}}\n", prim::chunk_bounds(n + 4, c))
 }
 
 fn two_shot(k: &AllReduceKernel) -> String {
     let t = k.dtype.ctype();
-    format!(
-        "extern \"C\" __global__ void __launch_bounds__({threads}) {name}({t}* in, {t}* out, const unsigned long long* table, int rank, int n, int add, int clear) {{
-    __shared__ unsigned epoch;
-    ar_begin(table, rank, &epoch);
-    {t}* mine = ({t}*)table[rank];
-    size_t chunk = ((size_t)n + AR_RANKS - 1) / AR_RANKS;
-    size_t stride = (size_t)gridDim.x * blockDim.x;
-    size_t first = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    for (int c = 0; c < AR_RANKS; c++) {{
-        size_t lo = (size_t)c * chunk;
-        size_t hi = lo + chunk < (size_t)n ? lo + chunk : (size_t)n;
-        for (size_t i = lo + first; i < hi; i += stride) {{
-            mine[i] = in[i];
-            if (clear) in[i] = 0;
-        }}
-    }}
-    ar_barrier(table, rank, epoch + 1);
-    {{
-        size_t lo = (size_t)rank * chunk;
-        size_t hi = lo + chunk < (size_t)n ? lo + chunk : (size_t)n;
-        for (size_t i = lo + first; i < hi; i += stride) {{
-            float acc = 0.0f;
-#pragma unroll
-            for (int p = 0; p < AR_RANKS; p++) acc += ar_ld(&(({t}*)table[p])[i]);
-            mine[i] = {st};
-        }}
-    }}
-    ar_barrier(table, rank, epoch + 2);
-    for (int c = 0; c < AR_RANKS; c++) {{
-        size_t lo = (size_t)c * chunk;
-        size_t hi = lo + chunk < (size_t)n ? lo + chunk : (size_t)n;
-        const {t}* src = (const {t}*)table[c];
-        for (size_t i = lo + first; i < hi; i += stride) {{
-            float v = ar_ld(&src[i]);
-            {acc}
-        }}
-    }}
-    ar_barrier(table, rank, epoch + 3);
-    ar_end(table, rank, epoch + 3);
-}}
+    let mut s = plain_header(k);
+    s += "    size_t chunk = ((size_t)n + AR_RANKS - 1) / AR_RANKS;\n";
+    s += STRIDE;
+    s += &per_chunk(4, "c", &prim::grid_stride(8, "lo + first", "hi", &prim::stage(12)));
+    s += &prim::sync_point(1);
+    s += &format!(
+        "    {{\n{}{}    }}\n",
+        prim::chunk_bounds(8, "rank"),
+        prim::grid_stride(8, "lo + first", "hi", &format!("{}            mine[i] = {};\n", prim::rank_sum(12, t, "i"), store(k.dtype, "acc")))
+    );
+    s += &prim::sync_point(2);
+    s += &per_chunk(
+        4,
+        "c",
+        &format!("        const {t}* src = (const {t}*)table[c];\n{}", prim::grid_stride(8, "lo + first", "hi", &format!("            float v = ar_ld(&src[i]);\n            {}\n", accumulate(k.dtype, "i", "v")))),
+    );
+    s += &prim::finish(3);
+    s
+}
 
-",
-        threads = k.threads,
-        name = k.name(),
-        st = store(k.dtype, "acc"),
-        acc = accumulate(k.dtype, "i", "v"),
+fn rows_loop(n: usize, body: &str) -> String {
+    let p = prim::pad(n);
+    format!("{p}for (int r = blockIdx.x; r < rows; r += gridDim.x) {{\n{body}{p}}}\n")
+}
+
+fn quads(n: usize, body: &str) -> String {
+    let p = prim::pad(n);
+    format!("{p}for (int i = threadIdx.x; i < WIDTH / 4; i += blockDim.x) {{\n{body}{p}}}\n")
+}
+
+fn residual_sum() -> String {
+    format!(
+        "            float4 v = ((const float4*)(x + base))[i];\n            float s[4] = {{v.x, v.y, v.z, v.w}};\n#pragma unroll\n            for (int j = 0; j < 4; j++) {{\n{}                s[j] = s[j] + acc;\n            }}\n            ss += s[0] * s[0] + s[1] * s[1] + s[2] * s[2] + s[3] * s[3];\n            ((float4*)(x + base))[i] = make_float4(s[0], s[1], s[2], s[3]);\n",
+        prim::rank_sum(16, "float", "base + 4 * i + j")
     )
 }
 
-fn add_rmsnorm(k: &AllReduceKernel, width: u32, eps: f32) -> String {
-    format!(
-        "extern \"C\" __global__ void __launch_bounds__({threads}) {name}(float* in, float* x, const float* weight, bf16_t* hi, bf16_t* lo, const unsigned long long* table, int rank, int rows) {{
-    constexpr int WIDTH = {width};
-    __shared__ unsigned epoch;
-    __shared__ float scratch[32];
-    ar_begin(table, rank, &epoch);
-    float* mine = (float*)table[rank];
-    for (int r = blockIdx.x; r < rows; r += gridDim.x)
-        for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) {{
-            mine[(size_t)r * WIDTH + i] = in[(size_t)r * WIDTH + i];
-            in[(size_t)r * WIDTH + i] = 0.0f;
-        }}
-    ar_barrier(table, rank, epoch + 1);
-    for (int r = blockIdx.x; r < rows; r += gridDim.x) {{
-        size_t base = (size_t)r * WIDTH;
-        float ss = 0.0f;
-        for (int i = threadIdx.x; i < WIDTH / 4; i += blockDim.x) {{
-            float4 v = ((const float4*)(x + base))[i];
-            float s[4] = {{v.x, v.y, v.z, v.w}};
-#pragma unroll
-            for (int j = 0; j < 4; j++) {{
-                float acc = 0.0f;
-#pragma unroll
-                for (int p = 0; p < AR_RANKS; p++) acc += ar_ld(&((float*)table[p])[base + 4 * i + j]);
-                s[j] = s[j] + acc;
-            }}
-            ss += s[0] * s[0] + s[1] * s[1] + s[2] * s[2] + s[3] * s[3];
-            ((float4*)(x + base))[i] = make_float4(s[0], s[1], s[2], s[3]);
-        }}
-        float inv = rsqrtf(ar_block_sum(ss, scratch) / WIDTH + {eps}f);
-        for (int i = threadIdx.x; i < WIDTH / 4; i += blockDim.x) {{
-            float4 v = ((const float4*)(x + base))[i];
-            float4 w = ((const float4*)weight)[i];
-            ar_split2(hi, lo, base + 4 * i, w.x * (v.x * inv), w.y * (v.y * inv));
-            ar_split2(hi, lo, base + 4 * i + 2, w.z * (v.z * inv), w.w * (v.w * inv));
-        }}
-        __syncthreads();
-    }}
-    ar_barrier(table, rank, epoch + 2);
-    ar_end(table, rank, epoch + 2);
-}}
+fn norm_planes() -> &'static str {
+    "            float4 v = ((const float4*)(x + base))[i];\n            float4 w = ((const float4*)weight)[i];\n            ar_split2(hi, lo, base + 4 * i, w.x * (v.x * inv), w.y * (v.y * inv));\n            ar_split2(hi, lo, base + 4 * i + 2, w.z * (v.z * inv), w.w * (v.w * inv));\n"
+}
 
-",
-        threads = k.threads,
-        name = k.name(),
-        eps = lit(eps),
-    )
+fn add_rmsnorm(k: &AllReduceKernel, width: u32, eps: f32) -> String {
+    let mut s = header(k.threads, &k.name(), "float* in, float* x, const float* weight, bf16_t* hi, bf16_t* lo, const unsigned long long* table, int rank, int rows");
+    s += &format!("    constexpr int WIDTH = {width};\n    __shared__ unsigned epoch;\n    __shared__ float scratch[32];\n    ar_begin(table, rank, &epoch);\n    float* mine = (float*)table[rank];\n");
+    s += "    for (int r = blockIdx.x; r < rows; r += gridDim.x)\n        for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) {\n            mine[(size_t)r * WIDTH + i] = in[(size_t)r * WIDTH + i];\n            in[(size_t)r * WIDTH + i] = 0.0f;\n        }\n";
+    s += &prim::sync_point(1);
+    let body = format!(
+        "        size_t base = (size_t)r * WIDTH;\n        float ss = 0.0f;\n{}        float inv = rsqrtf(ar_block_sum(ss, scratch) / WIDTH + {}f);\n{}        __syncthreads();\n",
+        quads(8, &residual_sum()),
+        lit(eps),
+        quads(8, norm_planes())
+    );
+    s += &rows_loop(4, &body);
+    s += &prim::finish(2);
+    s
 }
 
 pub fn emit_allreduce(kernels: &[AllReduceKernel]) -> Result<String, AllReduceError> {
@@ -158,7 +119,7 @@ pub fn emit_allreduce(kernels: &[AllReduceKernel]) -> Result<String, AllReduceEr
         }
     }
     let mut out = format!("constexpr int AR_RANKS = {};\n", first.ranks);
-    out.push_str(COMMON);
+    out.push_str(&prim::library(crate::allreduce::MAX_BLOCKS, SPIN_LIMIT));
     for k in kernels {
         out.push_str(&match k.mode {
             Mode::OneShot => one_shot(k),

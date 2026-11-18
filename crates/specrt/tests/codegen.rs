@@ -62,6 +62,18 @@ fn gemm_and_ggml_builders_use_prims_unless_listed() {
     }
 }
 
+#[test]
+fn allreduce_builders_use_prims() {
+    let kir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kir/src");
+    let family = std::fs::read_to_string(kir.join("cuda/allreduce.rs")).unwrap();
+    assert!(!family.contains("include_str!"), "allreduce kernels are built, not included from text");
+    for p in ["prim::rank_sum", "prim::grid_stride", "prim::sync_point", "prim::finish", "prim::library"] {
+        assert!(family.contains(p), "cuda/allreduce.rs must build its bodies from {p}");
+    }
+    let lib = std::fs::read_to_string(kir.join("cuda/allreduce/prim.rs")).unwrap();
+    assert!(!lib.contains("__global__"), "cuda/allreduce/prim.rs is a device library and must not define kernels");
+}
+
 const BUILT_IN_RUST: &[&str] = &["embed", "splice_rows", "rms_split", "argmax_rows", "apply_mask", "sample_rows", "argmax_advance", "bump", "copy_rows", "split_rows", "rope_inv_freq", "lin_ba_rows", "lin_in_norm", "lin_out_proj", "qkv_proj", "lm_head_norm"];
 
 fn kernel_files(dir: &Path) -> Vec<String> {
