@@ -60,8 +60,8 @@ arm() {
         sleep 1
     done
     curl -sf "localhost:$port/v1/completions" -H 'content-type: application/json' \
-        -d '{"model":"qwen3.8-27b","prompt":"hello","max_tokens":4}' >/dev/null
-    "$bin" loadtest --url "http://127.0.0.1:$port" --model qwen3.8-27b --json --requests "$requests" --rate 0.5 --clients "$seqs" \
+        -d '{"model":"qwen3.8-27b-exact","prompt":"hello","max_tokens":4}' >/dev/null
+    "$bin" loadtest --url "http://127.0.0.1:$port" --model qwen3.8-27b-exact --json --requests "$requests" --rate 0.5 --clients "$seqs" \
         --mix "0.6:1k-8k,0.3:8k-16k,0.1:16k-28k" --output 128-512 --seed 402 >"$out/$name.json"
     curl -s "localhost:$port/metrics" | grep -E '^inference_(preemptions_total|swap)' >"$out/$name.metrics" || true
     kill $server 2>/dev/null; wait $server 2>/dev/null || true

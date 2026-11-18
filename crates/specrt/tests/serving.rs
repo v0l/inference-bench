@@ -687,7 +687,7 @@ fn parked_run(s: &Spec, park_after: Option<usize>) -> Vec<Vec<f32>> {
     let other: Vec<u32> = (0..90u32).map(|i| (i * 3 + 17) % 1024).collect();
     let pages = 512usize.div_ceil(specrt::codegen::PAGE);
     let slots = 3;
-    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let layout = Layout { max_ctx: 512, slots, kv_blocks: slots * pages, prefill_chunk: 192, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
     let mut rt = Runtime::load_layout(s, layout).unwrap();
     let pool = shuffled((slots * pages) as u32, 9);
     let mut blocks: Vec<u32> = pool[..pages].to_vec();
