@@ -15,7 +15,7 @@ echo "MemAvailable ${avail} GB"
 run() {
     systemd-run --user --wait --collect -P -q -p MemoryMax=60G -p MemorySwapMax=0 -p WorkingDirectory="$root/crates/specrt" \
         --setenv=PATH="$PATH" --setenv=HOME="$HOME" --setenv=CARGO_TARGET_DIR="$target" \
-        --setenv=KVGATE_CORPUS="${KVGATE_CORPUS:-$root/crates}" ${KVGATE_STEPS:+--setenv=KVGATE_STEPS=$KVGATE_STEPS} \
+        --setenv=KVGATE_CORPUS="${KVGATE_CORPUS:-$root/crates}" ${KVGATE_STEPS:+--setenv=KVGATE_STEPS=$KVGATE_STEPS} ${KVGATE_TEMP:+--setenv=KVGATE_TEMP=$KVGATE_TEMP} \
         ${KVGATE_F16_LAYERS:+--setenv=KVGATE_F16_LAYERS=$KVGATE_F16_LAYERS} "$@"
 }
 run -p MemoryMax=20G cargo build --release --bin kvgate 2>&1 | tail -1

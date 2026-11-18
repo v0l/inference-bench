@@ -198,7 +198,8 @@ fn loop_mode(spec: &Spec, len: usize, seeds: usize, new_tokens: usize, arms: &[&
         s.runtime.kv_f16_layers = layers.or(s.runtime.kv_f16_layers);
         let mut rt = load(&s, dtype, len + new_tokens + 16, 1)?;
         for seed in 0..seeds as u32 {
-            let sampling = Sampling::new(1.0, seed + 1).truncated(20, 0.95, 0.0);
+            let temperature = std::env::var("KVGATE_TEMP").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            let sampling = Sampling::new(temperature, seed + 1).truncated(20, 0.95, 0.0);
             let g = rt.generate_until(&prompt, new_tokens, sampling, &stops, &mut |_| true)?;
             let report = specrt::loops::detect(&g.tokens);
             let text = tok.decode(&g.tokens, false).map_err(|e| anyhow::anyhow!("{e}"))?;
