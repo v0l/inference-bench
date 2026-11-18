@@ -12,11 +12,11 @@ bin=$CARGO_TARGET_DIR/release/inference-bench
 spec=$here/../tests/fixtures/qwen3.8-27b-exact.toml
 port=${PORT:-18402}
 seqs=${SEQS:-8}
-kv_gb=${KV_GB:-1.5}
 swap_gb=${SWAP_GB:-16}
 lookahead=${LOOKAHEAD:-512}
 max_len=${MAX_LEN:-32768}
 requests=${REQUESTS:-32}
+probe_gb=${PROBE_GB:-1.5}
 out=${OUT:-$here/../out/gate402}
 mkdir -p "$out"
 : >"$out/report.txt"
@@ -41,6 +41,15 @@ run_test() {
         tests_ok=0
     fi
 }
+echo "== serving suite" | tee -a "$out/report.txt"
+if systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 --working-directory="$PWD" \
+    -E CARGO_TARGET_DIR -E CARGO_BUILD_JOBS -E PATH -E SPECRT_REF_DIR \
+    cargo test --release -p inference-bench-specrt --test serving -- --include-ignored --test-threads=1 2>&1 | tee "$out/serving-suite.log" | grep -q "test result: ok\."; then
+    echo "PASS serving suite" | tee -a "$out/report.txt"
+else
+    echo "FAIL serving suite" | tee -a "$out/report.txt"
+    tests_ok=0
+fi
 run_test tiny_hybrid_park_then_resume_gives_bit_identical_logits
 run_test tiny_mtp_park_then_resume_gives_bit_identical_logits
 run_test repeated_parking_leaves_no_pinned_memory_behind
@@ -48,10 +57,27 @@ run_test repeated_parking_leaves_no_pinned_memory_behind
 systemd-run --user --wait --collect -P -q -p MemoryMax=10G --working-directory="$PWD" -E CARGO_TARGET_DIR -E CARGO_BUILD_JOBS -E PATH \
     cargo build --release -p inference-bench-cli
 
+serve() {
+    "$bin" serve --bind 127.0.0.1:$port --model "$spec" --max-num-seqs "$seqs" --max-model-len "$max_len" \
+        --max-batched-tokens 2048 "$@"
+}
+
+if [ -n "${KV_GB:-}" ]; then
+    kv_gb=$KV_GB
+else
+    timeout 120 "$bin" serve --bind 127.0.0.1:$port --model "$spec" --max-num-seqs "$seqs" --max-model-len "$max_len" --max-batched-tokens 2048 --kv-cache-gb "$probe_gb" >"$out/probe.log" 2>&1 || true
+    held=$(grep -oE 'KV cache holds [0-9]+ tokens' "$out/probe.log" | grep -oE '[0-9]+' | head -1 || true)
+    if [ -z "$held" ]; then
+        echo "could not read the KV tokens per GB from $out/probe.log; set KV_GB" >&2
+        exit 1
+    fi
+    kv_gb=$(python3 -c "import sys; held=int(sys.argv[1]); probe=float(sys.argv[2]); max_len=int(sys.argv[3]); print(round(probe*(max_len+4096)/held,3))" "$held" "$probe_gb" "$max_len")
+fi
+echo "KV budget $kv_gb GB (just above one $max_len token sequence plus 4096; eight journal-mix rows need about 70k tokens)" | tee -a "$out/report.txt"
+
 arm() {
     local name=$1 swap=$2 look=$3
-    "$bin" serve --bind 127.0.0.1:$port --model "$spec" --max-num-seqs "$seqs" --max-model-len "$max_len" \
-        --kv-cache-gb "$kv_gb" --max-batched-tokens 2048 --swap-space-gb "$swap" --admit-lookahead "$look" >"$out/$name.server.log" 2>&1 &
+    serve --kv-cache-gb "$kv_gb" --swap-space-gb "$swap" --admit-lookahead "$look" >"$out/$name.server.log" 2>&1 &
     local server=$!
     trap 'kill $server 2>/dev/null; wait $server 2>/dev/null || true' RETURN
     for _ in $(seq 180); do
@@ -87,3 +113,10 @@ else
     echo "bit-identical and leak tests: FAIL" | tee -a "$out/report.txt"
     exit 1
 fi
+for arm in recompute swap lookahead both; do
+    n=$(python3 -c "import json,sys; print(int(json.load(open(sys.argv[1]))['preemptions'] or 0))" "$out/$arm.json")
+    if [ "$n" -eq 0 ]; then
+        echo "FAIL arm $arm saw 0 preemptions, the KV budget $kv_gb GB did not force any: the table is void" | tee -a "$out/report.txt"
+        exit 1
+    fi
+done
