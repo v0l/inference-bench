@@ -1,7 +1,7 @@
 use crate::placement::Placement;
 use crate::runtime::{DecodeRow, Layout, Runtime, Sampling, StageRange, Stepper};
 use crate::spec::Spec;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -74,8 +74,8 @@ impl Pipeline {
         ensure!(!ranges.is_empty(), "a pipeline needs at least one stage");
         let mut stages = Vec::new();
         let mut steppers = Vec::new();
-        for &(device, start, end) in ranges {
-            let rt = Runtime::load_stage(spec, layout, StageRange { device, start, end })?;
+        for (i, &(device, start, end)) in ranges.iter().enumerate() {
+            let rt = Runtime::load_stage(spec, layout, StageRange { device, start, end }).with_context(|| format!("stage {i} (layers {start}..{end}) on GPU {device}"))?;
             steppers.push(rt.stepper()?);
             stages.push(rt);
         }

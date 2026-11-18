@@ -111,6 +111,25 @@ impl ServeOptions {
         check_pool_tokens(layout.kv_blocks * crate::codegen::PAGE, layout.max_ctx)
     }
 
+    pub fn plan(&self, spec: &Spec) -> Result<Option<(crate::placement::Placement, usize)>> {
+        let Some(p) = self.placement.as_ref().filter(|p| !p.devices.is_empty()) else { return Ok(None) };
+        let mut resolved = spec.clone();
+        if let Some(r) = &self.runtime {
+            resolved.runtime = r.clone();
+        }
+        self.speculative.apply(&mut resolved)?;
+        let mut sized = p.clone();
+        sized.kv_pool_bytes = sized.kv_pool_bytes.or(self.kv_cache_bytes);
+        let placed = sized.place(&resolved)?;
+        placed.ensure_runnable()?;
+        Ok((placed.stages.len() > 1).then_some((placed, p.micro_batch_in_process())))
+    }
+
+    pub fn stage_kv_bytes(&self, spec: &Spec, placement: &crate::placement::Placement) -> Vec<u64> {
+        let blocks = self.layout(spec).kv_blocks;
+        placement.stages.iter().map(|s| (blocks * kv_block_bytes(&spec.stage(s.start, s.end), 1)) as u64).collect()
+    }
+
     pub fn layout(&self, spec: &Spec) -> Layout {
         let kv = self.kv_cache_bytes.map(|b| b as usize).or_else(|| {
             self.kv_cache_tokens.map(|t| (t.div_ceil(crate::codegen::PAGE) + self.max_num_seqs) * kv_block_bytes(spec, 1))
@@ -475,18 +494,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
         }
         return Ok(());
     }
-    let planned = (|| -> Result<_> {
-        Ok(match &opts.placement {
-            Some(p) if !p.devices.is_empty() => {
-                let mut resolved = spec.clone();
-                opts.speculative.apply(&mut resolved)?;
-                let placed = p.place(&resolved)?;
-                placed.ensure_runnable()?;
-                (placed.stages.len() > 1).then_some((placed, p.micro_batch_in_process()))
-            }
-            _ => None,
-        })
-    })();
+    let planned = opts.plan(spec);
     let pipelined = match planned {
         Ok(p) => p,
         Err(e) => {
@@ -550,7 +558,7 @@ fn build_pipeline(spec: &Spec, opts: &ServeOptions, placement: &crate::placement
     let layout = opts.layout(spec);
     let mut pipe = crate::pipeline::Pipeline::load(spec, placement, layout, crate::pipeline::Hop::Direct)?;
     pipe.set_micro_batch(micro_batch);
-    tracing::info!(spec = %spec.name, stages = pipe.stages(), kv_blocks = pipe.kv_blocks(), "pipelined serving layout");
+    tracing::info!(spec = %spec.name, stages = pipe.stages(), kv_blocks = pipe.kv_blocks(), stage_kv_bytes = ?opts.stage_kv_bytes(spec, placement), "pipelined serving layout");
     let mut cfg = serving_config(spec, opts);
     cfg.prefix_cache.enabled = false;
     Ok(Scheduler::new(PipelineExecutor::new(pipe), cfg))
@@ -1395,5 +1403,68 @@ mod histogram_tests {
         assert_eq!(window.total, 2);
         assert!(window.quantile(0.5).unwrap() > 1.0);
         assert_eq!(h.since(&h).quantile(0.5), None);
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use crate::placement::{DeviceConfig, LinkConfig, PlacementConfig};
+
+    fn spec() -> Spec {
+        Spec::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap()
+    }
+
+    fn device(i: usize) -> DeviceConfig {
+        DeviceConfig { name: format!("box/gpu{i}"), memory_gib: 86.0, bandwidth_gbs: 1792.0, tflops: 500.0, ordinal: Some(i), address: None, reserve_gib: Some(0.0), link: LinkConfig::default(), offload: None, host: Some("box".into()), peer: None, wgpu: false }
+    }
+
+    fn two_gpu_options(pool: u64) -> ServeOptions {
+        let mut runtime = crate::spec::RuntimeOptions::default();
+        runtime.kv_dtype = crate::spec::KvDtype::Fp8;
+        runtime.kv_f16_layers = Some(0);
+        let placement = PlacementConfig { context: 12484, slots: 21, devices: vec![device(0), device(1)], max_tp: Some(1), ..PlacementConfig::default() };
+        ServeOptions { max_model_len: Some(262144), max_num_seqs: 21, kv_cache_bytes: Some(pool), runtime: Some(runtime), placement: Some(placement), ..Default::default() }
+    }
+
+    #[test]
+    fn a_two_stage_load_sizes_each_stage_kv_from_its_own_layers_within_the_plan() {
+        let pool = 100u64 << 30;
+        let opts = two_gpu_options(pool);
+        let (placed, _) = opts.plan(&spec()).unwrap().expect("two stages");
+        assert_eq!(placed.stages.len(), 2);
+        let mut resolved = spec();
+        resolved.runtime = opts.runtime.clone().unwrap();
+        let per_stage = opts.stage_kv_bytes(&resolved, &placed);
+        assert_eq!(per_stage.len(), 2);
+        assert!(per_stage.iter().sum::<u64>() <= pool, "{per_stage:?} against a pool of {pool}");
+        for (bytes, stage) in per_stage.iter().zip(&placed.stages) {
+            let block = kv_block_bytes(&resolved.stage(stage.start, stage.end), 1) as u64;
+            assert!(*bytes <= stage.kv_bytes + block, "stage {}..{}: {bytes} against planned {}", stage.start, stage.end, stage.kv_bytes);
+            assert!(*bytes < pool, "a stage must not hold the whole pool");
+        }
+    }
+
+    #[test]
+    fn the_engine_plan_sizes_the_pool_like_the_dialog_plan_so_the_stages_match() {
+        let opts = two_gpu_options(100u64 << 30);
+        let (from_engine, _) = opts.plan(&spec()).unwrap().unwrap();
+        let mut sized = opts.placement.clone().unwrap();
+        sized.kv_pool_bytes = Some(100u64 << 30);
+        let mut resolved = spec();
+        resolved.runtime = opts.runtime.clone().unwrap();
+        let from_dialog = sized.place(&resolved).unwrap();
+        assert_eq!(from_engine.ranges(), from_dialog.ranges());
+    }
+
+    #[test]
+    fn a_stage_holds_the_f16_kv_layers_that_fall_inside_its_range() {
+        let mut s = spec();
+        s.mtp = None;
+        s.runtime.kv_dtype = crate::spec::KvDtype::Fp8;
+        s.runtime.kv_f16_layers = Some(10);
+        let whole = kv_block_bytes(&s, 1);
+        let parts: usize = [(0, 36), (36, 64)].iter().map(|&(a, b)| kv_block_bytes(&s.stage(a, b), 1)).sum();
+        assert_eq!(whole, parts);
     }
 }
