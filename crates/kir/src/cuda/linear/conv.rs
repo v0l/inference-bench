@@ -1,4 +1,4 @@
-extern "C" __global__ void gdn_conv_step(const float* lin, const float* w, float* state, float* mix, int slot, int seq_slots,
+pub const CONV: &str = r##"extern "C" __global__ void gdn_conv_step(const float* lin, const float* w, float* state, float* mix, int slot, int seq_slots,
                                          const int* slots) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     int seq = blockIdx.y;
@@ -42,3 +42,4 @@ extern "C" __global__ void gdn_conv_keep(const float* lin, float* state, int slo
 #pragma unroll
     for (int j = 0; j < LA_K - 1; j++) s[j] = keep[j];
 }
+"##;

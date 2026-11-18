@@ -1,4 +1,4 @@
-extern "C" __global__ void mtp_fc_in(const bf16_t* table, const int* tokens, const float* xsrc, const float* psrc,
+pub const DRAFT: &str = r##"extern "C" __global__ void mtp_fc_in(const bf16_t* table, const int* tokens, const float* xsrc, const float* psrc,
                                      const int* hidx, const float* pre, const float* ne, const float* nh, bf16_t* hi,
                                      bf16_t* lo) {
     __shared__ float scratch[32];
@@ -182,3 +182,4 @@ extern "C" __global__ void mtp_copy(const float* src, const int* sidx, float* ds
     float* b = dst + (size_t)didx[s] * HIDDEN;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x) b[i] = a[i];
 }
+"##;

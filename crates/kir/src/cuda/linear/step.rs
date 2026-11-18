@@ -1,4 +1,4 @@
-extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const float* mix, const float* lin,
+pub const STEP: &str = r##"extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const float* mix, const float* lin,
                                                                         const float* ba,
                                                                         const float* neg_a, const float* dt_bias,
                                                                         const float* norm_w, float* state,
@@ -94,3 +94,4 @@ extern "C" __global__ void gdn_gates(const float* ba, const float* neg_a, const 
         gdn_gate(ba + (size_t)t * LA_BA_ROWS, neg_a, dt_bias, h, g[at], beta[at]);
     }
 }
+"##;

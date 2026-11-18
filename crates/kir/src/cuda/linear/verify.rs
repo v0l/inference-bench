@@ -1,4 +1,4 @@
-extern "C" __global__ void gdn_conv_verify(const float* lin, const float* w, const float* state, float* mix, float* log,
+pub const VERIFY: &str = r##"extern "C" __global__ void gdn_conv_verify(const float* lin, const float* w, const float* state, float* mix, float* log,
                                            int slot, int seq_slots, const int* slots, int rows) {
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     int seq = blockIdx.y;
@@ -152,3 +152,4 @@ extern "C" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_commit(float*
 #pragma unroll
     for (int i = 0; i < KS; i++) S[(ks * KS + i) * LA_D + v] = s[i];
 }
+"##;

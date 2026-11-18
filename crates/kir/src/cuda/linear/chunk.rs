@@ -1,4 +1,4 @@
-template <int KSTEPS, typename FA, typename FB>
+pub const CHUNK: &str = r##"template <int KSTEPS, typename FA, typename FB>
 __device__ __forceinline__ void mma_split_tile(float* c, int m0, int n0, int lane, FA a_at, FB b_at) {
     int g = lane >> 2;
     int t = lane & 3;
@@ -393,3 +393,4 @@ extern "C" __global__ void gdn_gated_norm(const float* o, const float* lin, cons
     split_store2(hi, lo, (size_t)t * LA_VALUE_DIM + h * LA_D + d, norm_w[d] * (a * inv) * silu(z[d]),
                  norm_w[d + 1] * (b * inv) * silu(z[d + 1]));
 }
+"##;

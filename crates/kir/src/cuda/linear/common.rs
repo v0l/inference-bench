@@ -1,4 +1,4 @@
-__device__ __forceinline__ float silu(float x) {
+pub const COMMON: &str = r##"__device__ __forceinline__ float silu(float x) {
     return x / (1.0f + expf(-x));
 }
 
@@ -30,3 +30,4 @@ __device__ __forceinline__ float l2_k(float v, float ss) {
 __device__ __forceinline__ float* conv_state_row(float* state, int slot, int c) {
     return state + ((size_t)slot * LA_CONV_DIM + c) * (LA_K - 1);
 }
+"##;

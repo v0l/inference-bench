@@ -1,11 +1,18 @@
+mod chunk;
+mod common;
+mod conv;
+mod draft;
+mod step;
+mod verify;
+
+use chunk::CHUNK;
+use common::COMMON;
+use conv::CONV;
+use draft::DRAFT;
+use step::STEP;
+use verify::VERIFY;
 use crate::linear::{Family, LinearError, LinearKernel, constants};
 
-const COMMON: &str = include_str!("linear/common.cu");
-const CONV: &str = include_str!("linear/conv.cu");
-const STEP: &str = include_str!("linear/step.cu");
-const CHUNK: &str = include_str!("linear/chunk.cu");
-const VERIFY: &str = include_str!("linear/verify.cu");
-const DRAFT: &str = include_str!("linear/draft.cu");
 
 pub fn emit_linear(kernels: &[LinearKernel]) -> Result<String, LinearError> {
     let Some(first) = kernels.iter().find(|k| k.family.uses_shape()).or(kernels.first()) else { return Ok(String::new()) };
