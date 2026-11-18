@@ -1,3 +1,4 @@
+use super::attention::prim::{Reduce, block_reduce};
 use crate::gemm::Fp8Scale;
 
 pub fn quant_fp4(name: &str) -> String {
@@ -44,12 +45,13 @@ pub fn quant_fp8(name: &str, scale: Fp8Scale) -> String {
     size_t at = (size_t)row * width + c;
     float a = bf16_to_f32(hi[at]) + bf16_to_f32(lo[at]);
     float b = bf16_to_f32(hi[at + 1]) + bf16_to_f32(lo[at + 1]);
-    float amax = block_reduce<true>(fmaxf(fabsf(a), fabsf(b)), scratch);
+    float amax = {reduce};
     float s = amax > 0.0f ? amax / FP8_MAX : 1.0f;
     *(unsigned short*)(q + at) = (unsigned short)f32x2_to_e4m3x2(a / s, b / s);
     if (threadIdx.x == 0) scale[(size_t)row * (width / FP8_BLOCK) + block] = s;
 }}
-"#
+"#,
+            reduce = block_reduce(Reduce::Max, "fmaxf(fabsf(a), fabsf(b))", "scratch")
         ),
         Fp8Scale::Channel => format!(
             r#"extern "C" __global__ void {name}(const bf16_t* hi, const bf16_t* lo, unsigned char* q, float* scale, int width) {{
@@ -61,7 +63,7 @@ pub fn quant_fp8(name: &str, scale: Fp8Scale) -> String {
         float b = bf16_to_f32(hi[row + c + 1]) + bf16_to_f32(lo[row + c + 1]);
         amax = fmaxf(amax, fmaxf(fabsf(a), fabsf(b)));
     }}
-    amax = block_reduce<true>(amax, scratch);
+    amax = {reduce};
     float s = amax > 0.0f ? amax / FP8_MAX : 1.0f;
     for (int c = threadIdx.x * 2; c < width; c += blockDim.x * 2) {{
         float a = bf16_to_f32(hi[row + c]) + bf16_to_f32(lo[row + c]);
@@ -70,7 +72,8 @@ pub fn quant_fp8(name: &str, scale: Fp8Scale) -> String {
     }}
     if (threadIdx.x == 0) scale[blockIdx.x] = s;
 }}
-"#
+"#,
+            reduce = block_reduce(Reduce::Max, "amax", "scratch")
         ),
     }
 }

@@ -1,3 +1,4 @@
+use super::super::attention::prim::{Reduce, warp_reduce};
 use super::super::gemm::prim;
 
 pub fn body() -> String {
@@ -35,7 +36,9 @@ pub fn body() -> String {
             for (int r = 0; r < ROWS; r++) out[r] = dot<K>(w, s, row0 + r * stride, x, lane);
         }
 #pragma unroll
-        for (int r = 0; r < ROWS; r++) out[r] = warp_sum(out[r]);
+        for (int r = 0; r < ROWS; r++) out[r] = "##.to_string(),
+        warp_reduce(Reduce::Sum, "out[r]"),
+        r##";
     }
     template <int K> static __device__ __forceinline__ float at(const void* w, const void* s, int n, int k) {
         float v[8];

@@ -41,6 +41,33 @@ const PRIM_LIBRARY_ATTENTION: &[(&str, &str)] = &[
     ("cuda/attention/decode_common.rs", "cp.async and fp8 convert prims plus decode chunk helpers, device functions by design"),
 ];
 
+const VERBATIM_QUANT: &[(&str, &str)] = &[
+    ("cuda/gemm/fp4.rs", "fp4 gemv and dequant text, to port onto prims (#793)"),
+    ("cuda/gemm/fp4_head.rs", "head norm gemv text, to port onto prims (#793)"),
+    ("cuda/ggml/decode.rs", "ggml Q4_K, Q5_K, Q6_K, Q8_0 row decoders, to port onto prims (#793)"),
+    ("cuda/gemm/prim.rs", "the prim library itself"),
+];
+
+#[test]
+fn gemm_and_ggml_builders_use_prims_unless_listed() {
+    let kir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kir/src");
+    for sub in ["cuda/gemm", "cuda/ggml"] {
+        for e in std::fs::read_dir(kir.join(sub)).unwrap() {
+            let path = e.unwrap().path();
+            let rel = path.strip_prefix(&kir).unwrap().display().to_string();
+            let text = std::fs::read_to_string(&path).unwrap();
+            if !VERBATIM_QUANT.iter().any(|(f, _)| *f == rel) {
+                assert!(text.contains("prim::") || text.contains("warp_reduce"), "{rel} is verbatim kernel text: build it from prims or list it with a reason");
+            }
+        }
+    }
+    let quant = std::fs::read_to_string(kir.join("cuda/quant.rs")).unwrap();
+    assert!(quant.contains("block_reduce") && quant.contains("pack_bf16x8"));
+    for (f, why) in VERBATIM_QUANT {
+        assert!(kir.join(f).exists() && !why.is_empty(), "stale allowlist entry {f}");
+    }
+}
+
 const BUILT_IN_RUST: &[&str] = &["embed", "splice_rows", "rms_split", "argmax_rows", "apply_mask", "sample_rows", "argmax_advance", "bump", "copy_rows", "split_rows", "rope_inv_freq", "lin_ba_rows", "lin_in_norm", "lin_out_proj", "qkv_proj", "lm_head_norm"];
 
 fn kernel_files(dir: &Path) -> Vec<String> {
