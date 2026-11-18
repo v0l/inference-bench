@@ -3,8 +3,47 @@ use specrt::runtime::{Generation, Runtime, Sampling};
 use specrt::spec::Spec;
 use std::path::{Path, PathBuf};
 
+struct Flags {
+    runs: usize,
+    serve: bool,
+    profile: bool,
+    kv_gb: Option<f64>,
+}
+
+static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
+
+fn flags() -> &'static Flags {
+    FLAGS.get().expect("flags are parsed first")
+}
+
 fn runs() -> usize {
-    std::env::var("SPECRT_BENCH_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(6)
+    flags().runs
+}
+
+fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
+    let mut f = Flags { runs: 6, serve: false, profile: false, kv_gb: None };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--serve" => f.serve = true,
+            "--profile" => f.profile = true,
+            "--runs" | "--kv-gb" => {
+                let name = args.remove(i);
+                anyhow::ensure!(i < args.len(), "{name} needs a value");
+                if name == "--runs" {
+                    f.runs = args[i].parse().context("--runs")?;
+                } else {
+                    f.kv_gb = Some(args[i].parse().context("--kv-gb")?);
+                }
+            }
+            _ => {
+                i += 1;
+                continue;
+            }
+        }
+        args.remove(i);
+    }
+    Ok(f)
 }
 
 fn load_spec(path: &Path) -> Result<Spec> {
@@ -28,6 +67,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 fn main() -> Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let _ = FLAGS.set(take_flags(&mut args)?);
     let speculative = args.first().is_some_and(|a| a == "--speculative");
     if speculative {
         args.remove(0);
@@ -37,7 +77,7 @@ fn main() -> Result<()> {
         args.remove(0);
     }
     let mut args = args.into_iter();
-    let usage = "usage: bench [--speculative] [--sampled] <spec.toml | checkpoint dir | model.gguf> [prompt_len[,prompt_len..]] [new_tokens] [batch]";
+    let usage = "usage: bench [--runs N] [--serve] [--kv-gb GB] [--profile] [--speculative] [--sampled] <spec.toml | checkpoint dir | model.gguf> [prompt_len[,prompt_len..]] [new_tokens] [batch]";
     let spec_path = PathBuf::from(args.next().context(usage)?);
     let prompts: Vec<usize> = args
         .next()
@@ -52,7 +92,7 @@ fn main() -> Result<()> {
     if speculative {
         return bench_spec(&spec, new_tokens, batch.max(1), longest);
     }
-    if std::env::var_os("SPECRT_BENCH_SERVE").is_some() {
+    if flags().serve {
         return bench_serve(&spec, longest, new_tokens, batch.max(1), sampled);
     }
     if batch > 0 {
@@ -176,7 +216,7 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
 fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize, sampled: bool) -> Result<()> {
     use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
     let max_ctx = prompt_len + new_tokens + 16;
-    let kv_bytes = std::env::var("SPECRT_BENCH_KV_GB").ok().and_then(|v| v.parse::<f64>().ok()).map(|gb| (gb * (1u64 << 30) as f64) as usize);
+    let kv_bytes = flags().kv_gb.map(|gb| (gb * (1u64 << 30) as f64) as usize);
     let layout = specrt::runtime::Layout::serving(spec, max_ctx, batch, kv_bytes);
     let rt = Runtime::load_layout(spec, layout)?;
     let mut sched = Scheduler::new(
@@ -201,7 +241,7 @@ fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize, 
             prefill_secs += r.prefill_secs;
             steps += 1;
             preempted += r.preemptions;
-            if r.prefill_tokens == 0 && r.decode_rows == batch && !profiling && std::env::var_os("SPECRT_BENCH_PROFILE").is_some() {
+            if r.prefill_tokens == 0 && r.decode_rows == batch && !profiling && flags().profile {
                 profiling = true;
                 unsafe { cudarc::driver::sys::cuProfilerStart() };
             }
@@ -212,7 +252,7 @@ fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize, 
             }
             let _ = events.iter().filter(|e| matches!(e, Event::Token { .. })).count();
         }
-        if std::env::var_os("SPECRT_BENCH_PROFILE").is_some() {
+        if flags().profile {
             unsafe { cudarc::driver::sys::cuProfilerStop() };
         }
         println!(

@@ -18,7 +18,7 @@ export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-4}
 
 cargo_run() {
     systemd-run --user --wait --collect -P -q -p MemoryMax=16G -p MemorySwapMax=0 \
-        -E CARGO_TARGET_DIR -E CARGO_BUILD_JOBS -E PATH -E HOME -E SPECRT_REF_DIR -E SPECRT_GDN_TOKENS -E SPECRT_BENCH_RUNS \
+        -E CARGO_TARGET_DIR -E CARGO_BUILD_JOBS -E PATH -E HOME -E SPECRT_REF_DIR -E SPECRT_GDN_TOKENS \
         -p "WorkingDirectory=$PWD" "$@"
 }
 
@@ -108,8 +108,8 @@ for batch in 1 4 8; do
     : > "$out/mtp_b$batch.branch.log"
     : > "$out/mtp_b$batch.master.log"
     for i in $(seq "$runs"); do
-        (cd "$master_tree/crates/specrt" && SPECRT_BENCH_RUNS=3 "$master_target/release/bench" --speculative "$spec27" 8192 128 "$batch") >> "$out/mtp_b$batch.master.log" 2>&1
-        (cd "$repo/crates/specrt" && SPECRT_BENCH_RUNS=3 "$branch_target/release/bench" --speculative "$spec27" 8192 128 "$batch") >> "$out/mtp_b$batch.branch.log" 2>&1
+        (cd "$master_tree/crates/specrt" && "$master_target/release/bench" --runs 3 --speculative "$spec27" 8192 128 "$batch") >> "$out/mtp_b$batch.master.log" 2>&1
+        (cd "$repo/crates/specrt" && "$branch_target/release/bench" --runs 3 --speculative "$spec27" 8192 128 "$batch") >> "$out/mtp_b$batch.branch.log" 2>&1
     done
     b=$(grep -oE "decode=[0-9.]+ tok/s aggregate" "$out/mtp_b$batch.branch.log" | grep -oE "[0-9.]+" | sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}')
     m=$(grep -oE "decode=[0-9.]+ tok/s aggregate" "$out/mtp_b$batch.master.log" | grep -oE "[0-9.]+" | sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}')

@@ -138,9 +138,9 @@ run_specrt() {
             for args in "${runs[@]}"; do
                 guard specrt "$spec_name" "$flag" "$args"
                 name=specrt-$spec_name-$flag-${args// /_}
-                SPECRT_BENCH_RUNS=3 nice -n 15 nsys profile --cuda-graph-trace=node --trace=cuda,nvtx \
+                nice -n 15 nsys profile --cuda-graph-trace=node --trace=cuda,nvtx \
                     --force-overwrite=true -o "$out/$name" \
-                    "$bench" $extra "$spec" $args >"$out/$name.txt" 2>&1
+                    "$bench" --runs 3 $extra "$spec" $args >"$out/$name.txt" 2>&1
                 nsys stats --report cuda_gpu_kern_sum --format csv --output "$out/$name" "$out/$name.nsys-rep" >/dev/null 2>&1
                 tail -3 "$out/$name.txt" | tee -a "$log"
             done

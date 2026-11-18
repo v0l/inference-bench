@@ -5,9 +5,9 @@
 struct P { a: vec4<u32>, b: vec4<u32> };
 @group(0) @binding(4) var<uniform> p: P;
 
-const TT: u32 = {{TT}}u;
+const TT: u32 = TOKENS_PER_GROUPu;
 const WG: u32 = 64u;
-var<workgroup> red: array<f32, {{RED}}>;
+var<workgroup> red: array<f32, REDUCE_LEN>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {
@@ -23,7 +23,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let entry = rows[r];
     let base = (entry >> 3u) * 16u;
     let code = entry & 7u;
-    var acc: array<f32, {{TT}}>;
+    var acc: array<f32, TOKENS_PER_GROUP>;
     for (var c = li; c < cols; c += WG) {
         let w = dequant_at(base, code, c);
         for (var j = 0u; j < TT; j++) {

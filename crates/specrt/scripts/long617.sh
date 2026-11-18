@@ -20,11 +20,11 @@ for bin in ${BINS:-$bin}; do
     log="$out/$(basename "$bin")-$case.txt"
     if [ -n "${NSYS:-}" ]; then
         flock /tmp/gpu27.lock nsys profile -t cuda --cuda-graph-trace=node -o "$out/$(basename "$bin")-$case" --force-overwrite true \
-            env SPECRT_BENCH_SERVE=1 SPECRT_BENCH_RUNS=1 "$bin" "$spec" "$prompt" "$gen" "$seqs" >"$log" 2>&1
+            "$bin" --serve --runs 1 "$spec" "$prompt" "$gen" "$seqs" >"$log" 2>&1
         nsys stats -r cuda_gpu_kern_sum -f csv -o "$out/$(basename "$bin")-$case" "$out/$(basename "$bin")-$case.nsys-rep" >/dev/null 2>&1 || true
     else
-        SPECRT_BENCH_SERVE=1 SPECRT_BENCH_RUNS=1 SPECRT_BENCH_KV_GB=${KV_GB:-40} flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -q -p MemoryMax=24G -p MemorySwapMax=0 \
-            -E SPECRT_BENCH_SERVE -E SPECRT_BENCH_RUNS -E SPECRT_BENCH_KV_GB -E HOME="$HOME" "$bin" "$spec" "$prompt" "$gen" "$seqs" >"$log" 2>&1 || true
+        flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -q -p MemoryMax=24G -p MemorySwapMax=0 \
+            -E HOME="$HOME" "$bin" --serve --runs 1 --kv-gb ${KV_GB:-40} "$spec" "$prompt" "$gen" "$seqs" >"$log" 2>&1 || true
     fi
     grep "serve round" "$log" | sed "s|^|$case $(basename "$bin") |" || tail -3 "$log"
 done

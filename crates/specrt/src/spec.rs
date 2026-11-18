@@ -1504,68 +1504,6 @@ impl Spec {
         Ok(())
     }
 
-    pub fn with_env_overrides(&self) -> Spec {
-        let mut s = self.clone();
-        let env = |name: &str| std::env::var(name).ok();
-        let on = |name: &str| env(name).is_some_and(|v| v != "0");
-        let mut changed = Vec::new();
-        if on("SPECRT_FP8_ACT") && s.quant.is_fp8() && s.act_quant != ActQuant::Fp8 {
-            s.act_quant = ActQuant::Fp8;
-            changed.push("SPECRT_FP8_ACT");
-        }
-        if on("SPECRT_FP4_ACT") && s.mlp.quant == Some(Quant::Nvfp4G16) && s.mlp.act_quant != ActQuant::Fp4 {
-            s.mlp.act_quant = ActQuant::Fp4;
-            changed.push("SPECRT_FP4_ACT");
-        }
-        if env("SPECRT_NO_GRAPH").is_some() && s.runtime.graphs {
-            s.runtime.graphs = false;
-            changed.push("SPECRT_NO_GRAPH");
-        }
-        if env("SPECRT_NO_FUSE").is_some() && s.runtime.fuse {
-            s.runtime.fuse = false;
-            changed.push("SPECRT_NO_FUSE");
-        }
-        if env("SPECRT_GEMM_FP32").is_some() && !s.runtime.gemm_fp32 {
-            s.runtime.gemm_fp32 = true;
-            changed.push("SPECRT_GEMM_FP32");
-        }
-        let tile = match env("SPECRT_TILE").as_deref() {
-            Some("small") => Some(TileChoice::Small),
-            Some("big") => Some(TileChoice::Big),
-            Some("narrow") => Some(TileChoice::Narrow),
-            _ => None,
-        };
-        if let Some(t) = tile.filter(|t| *t != s.runtime.tile) {
-            s.runtime.tile = t;
-            changed.push("SPECRT_TILE");
-        }
-        let big = env("SPECRT_BIG_TILE").and_then(|v| {
-            let p: Vec<usize> = v.split(',').filter_map(|x| x.parse().ok()).collect();
-            <[usize; 4]>::try_from(p).ok()
-        });
-        if let Some(b) = big.filter(|b| s.runtime.big_tile != Some(*b)) {
-            s.runtime.big_tile = Some(b);
-            changed.push("SPECRT_BIG_TILE");
-        }
-        if let Some(u) = env("SPECRT_UNSPLIT") {
-            let names: Vec<String> = u.split(',').filter(|n| !n.is_empty()).map(String::from).collect();
-            if !names.is_empty() && names != s.runtime.unsplit {
-                s.runtime.unsplit = names;
-                changed.push("SPECRT_UNSPLIT");
-            }
-        }
-        if let Some(dir) = std::env::var_os("SPECRT_CACHE").map(PathBuf::from)
-            && s.runtime.cache_dir.as_ref() != Some(&dir)
-        {
-            s.runtime.cache_dir = Some(dir);
-            changed.push("SPECRT_CACHE");
-        }
-        for var in changed {
-            tracing::warn!(spec = %s.name, var, "{var} is a development override and is deprecated; set it in the spec (act_quant, [mlp] act_quant or [runtime]) or the server config");
-        }
-        s
-    }
-
     pub fn lm_head_quant(&self) -> Quant {
         match self.head_quant {
             Some(q) => q,

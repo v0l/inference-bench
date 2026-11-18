@@ -8,7 +8,7 @@ run() { systemd-run --user --wait --collect -P -p MemoryMax=16G -p MemorySwapMax
 {
     idle; run "$bin/logitdump" "$spec" 17,300 4
     for _ in 1 2; do
-        idle; run -E SPECRT_BENCH_RUNS=5 "$bin/bench" "$spec" 1024,4096 128 | grep prompt=
-        idle; run -E SPECRT_BENCH_RUNS=5 "$bin/bench" "$spec" 512 128 8 | grep batch=
+        idle; run "$bin/bench" --runs 5 "$spec" 1024,4096 128 | grep prompt=
+        idle; run "$bin/bench" --runs 5 "$spec" 512 128 8 | grep batch=
     done
 } >"$out" 2>&1

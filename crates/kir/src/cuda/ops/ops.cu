@@ -1,23 +1,3 @@
-typedef unsigned short bf16_t;
-typedef signed char i8_t;
-
-constexpr int HIDDEN = {{HIDDEN}};
-constexpr int INTER = {{INTER}};
-constexpr int VOCAB = {{VOCAB}};
-constexpr int HEADS = {{HEADS}};
-constexpr int KV_HEADS = {{KV_HEADS}};
-constexpr int HEAD_DIM = {{HEAD_DIM}};
-constexpr int GROUP = {{GROUP}};
-constexpr int Q_DIM = HEADS * HEAD_DIM;
-constexpr int KV_DIM = KV_HEADS * HEAD_DIM;
-constexpr int QKV_ROW = {{QKV_ROW}};
-constexpr int GATE_OFF = Q_DIM + 2 * KV_DIM;
-constexpr bool OUT_GATE = {{OUT_GATE}};
-constexpr float EPS = {{EPS}};
-constexpr float EMBED_SCALE = {{EMBED_SCALE}};
-constexpr int ACT_KIND = {{ACT_KIND}};
-constexpr int Q8_GROUP = {{Q8_GROUP}};
-constexpr int FP8_BLOCK = {{FP8_BLOCK}};
 constexpr int LINEAR_WARPS = 8;
 #define NEG_INF __int_as_float(0xff800000)
 

@@ -5,6 +5,7 @@ pub mod gemm;
 pub mod ggml;
 pub mod layout;
 pub mod linear;
+pub mod ops;
 pub mod target;
 pub mod vision;
 #[cfg(feature = "wgsl")]

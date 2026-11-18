@@ -7,6 +7,6 @@ idle() { for _ in $(seq 150); do u=$(nvidia-smi --query-gpu=utilization.gpu --fo
 for _ in $(seq "$rounds"); do
     for bin in "$a" "$b"; do
         idle
-        echo "$(basename "$(dirname "$bin")")/$(basename "$bin") $(SPECRT_BENCH_RUNS=5 "$bin" "$model" "$prompts" "$new" 2>&1 | grep -o 'prompt=[0-9]* prefill=[0-9.]* tok/s decode=[0-9]* tokens [0-9.]* tok/s' | tr '\n' ' ')"
+        echo "$(basename "$(dirname "$bin")")/$(basename "$bin") $("$bin" --runs 5 "$model" "$prompts" "$new" 2>&1 | grep -o 'prompt=[0-9]* prefill=[0-9.]* tok/s decode=[0-9]* tokens [0-9.]* tok/s' | tr '\n' ' ')"
     done
 done

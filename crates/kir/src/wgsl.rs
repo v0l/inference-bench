@@ -279,3 +279,96 @@ pub const GGML_ROWS: &str = include_str!("wgsl_ggml/ggml_rows.wgsl");
 pub fn ggml_bindings() -> Vec<Binding> {
     vec![Binding::Read, Binding::Read, Binding::Write, Binding::Uniform]
 }
+
+const OPS_EMBED: &str = include_str!("wgsl_ops/embed.wgsl");
+const OPS_ROPE: &str = include_str!("wgsl_ops/rope.wgsl");
+const OPS_ATTENTION: &str = include_str!("wgsl_ops/attention.wgsl");
+const OPS_BIAS: &str = include_str!("wgsl_ops/bias.wgsl");
+const OPS_ARGMAX: &str = include_str!("wgsl_ops/argmax.wgsl");
+const OPS_LINEAR: &str = include_str!("wgsl_ops/linear.wgsl");
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpKind {
+    Embed,
+    Rope,
+    Attention,
+    Bias,
+    Argmax,
+    Dequant,
+}
+
+pub fn ops_header(s: &crate::ops::WgslShape) -> String {
+    use crate::ops::wgsl_float as f;
+    format!(
+        "const HIDDEN: u32 = {}u;
+const INTER: u32 = {}u;
+const VOCAB: u32 = {}u;
+const HEADS: u32 = {}u;
+const KV_HEADS: u32 = {}u;
+const HEAD_DIM: u32 = {}u;
+const GROUP: u32 = {}u;
+const QK_NORM: bool = {};
+const EPS: f32 = {};
+const THETA: f32 = {};
+const ROPE_KIND: u32 = {}u;
+const ROPE_FACTOR: f32 = {};
+const ROPE_LOW_FREQ: f32 = {};
+const ROPE_HIGH_FREQ: f32 = {};
+const ROPE_ORIG_POS: f32 = {};
+const ROPE_MSCALE: f32 = {};
+const ACT_KIND: u32 = {}u;
+const MAX_CTX: u32 = {}u;
+const Q_DIM: u32 = {}u;
+const QKV_ROW: u32 = {}u;
+const ROT: u32 = {}u;
+const NEG_INF: f32 = -3.0e38;
+",
+        s.hidden,
+        s.inter,
+        s.vocab,
+        s.heads,
+        s.kv_heads,
+        s.head_dim,
+        s.heads / s.kv_heads,
+        s.qk_norm,
+        f(s.eps),
+        f(s.theta),
+        s.rope_kind,
+        f(s.rope_factor),
+        f(s.rope_low),
+        f(s.rope_high),
+        f(s.rope_original),
+        f(s.rope_mscale),
+        if s.gated_gelu { 1 } else { 0 },
+        s.max_ctx,
+        s.q_dim,
+        s.qkv_row,
+        s.rotary_dim,
+    )
+}
+
+pub fn emit_op(kind: OpKind, s: &crate::ops::WgslShape) -> String {
+    let mut out = ops_header(s);
+    match kind {
+        OpKind::Embed => {
+            out.push_str(OPS_EMBED);
+            out.push_str(GGML_DECODE);
+        }
+        OpKind::Rope => out.push_str(OPS_ROPE),
+        OpKind::Attention => out.push_str(OPS_ATTENTION),
+        OpKind::Bias => out.push_str(OPS_BIAS),
+        OpKind::Argmax => out.push_str(OPS_ARGMAX),
+        OpKind::Dequant => {
+            out.push_str(GGML_ROWS);
+            out.push_str(GGML_DECODE);
+        }
+    }
+    out
+}
+
+pub fn emit_linear_op(s: &crate::ops::WgslShape, tokens: usize, workgroup: usize) -> String {
+    let mut out = ops_header(s);
+    out.push_str(&OPS_LINEAR.replace("TOKENS_PER_GROUP", &tokens.to_string()).replace("REDUCE_LEN", &(tokens * workgroup).to_string()));
+    out.push_str(GGML_DECODE);
+    out
+}

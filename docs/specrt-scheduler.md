@@ -134,7 +134,7 @@ both specrt's and vLLM's metric names, so the same command runs against both.
 
 ### Qwen3-0.6B (bf16), shared GPU
 
-`SPECRT_BENCH_SERVE=1 bench specs/qwen3-0.6b.toml <prompt> <new> <batch>` drives the scheduler
+`bench --serve specs/qwen3-0.6b.toml <prompt> <new> <batch>` drives the scheduler
 in-process. vLLM was serving beside it the whole time, so these are indicative.
 
 | prompt | batch | decode tok/s aggregate | decode step |
@@ -189,7 +189,7 @@ cd crates/specrt
 SPECRT_REF_DIR=~/.cache/specrt-ref-335 cargo test --release --test serving -- --include-ignored --test-threads=1
 cargo test --release --lib sched
 cargo test --release -p inference-bench-server --test serving -- --include-ignored --test-threads=1
-SPECRT_BENCH_SERVE=1 cargo run --release --bin bench -- specs/qwen3-0.6b.toml 128 128 8
+cargo run --release --bin bench -- --serve specs/qwen3-0.6b.toml 128 128 8
 flock /tmp/gpu27.lock ./scripts/serve27b.sh              # KV_GB, SEQS, MAX_LEN, ONLY=stall
 ```
 

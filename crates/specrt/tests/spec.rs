@@ -318,30 +318,6 @@ fn mlp_quant_needs_fp8_channel_projections_and_a_layer_inside_the_count() {
 }
 
 #[test]
-fn deprecated_env_overrides_still_switch_the_resolved_spec() {
-    use specrt::spec::{ActQuant, TileChoice};
-    let plain = Spec::parse(&nvfp4_text()).unwrap();
-    assert_eq!(plain.with_env_overrides(), plain);
-    unsafe {
-        std::env::set_var("SPECRT_FP4_ACT", "1");
-        std::env::set_var("SPECRT_FP8_ACT", "1");
-        std::env::set_var("SPECRT_NO_GRAPH", "1");
-        std::env::set_var("SPECRT_TILE", "narrow");
-    }
-    let r = plain.with_env_overrides();
-    unsafe {
-        for v in ["SPECRT_FP4_ACT", "SPECRT_FP8_ACT", "SPECRT_NO_GRAPH", "SPECRT_TILE"] {
-            std::env::remove_var(v);
-        }
-    }
-    assert_eq!((r.act_quant, r.mlp.act_quant), (ActQuant::Fp8, ActQuant::Fp4));
-    assert!(!r.runtime.graphs);
-    assert_eq!(r.runtime.tile, TileChoice::Narrow);
-    assert!(r.runtime.fuse);
-    r.validate().unwrap();
-}
-
-#[test]
 fn head_quant_defaults_to_the_checkpoint_head_round_trips_and_rejects_other_formats() {
     let text = nvfp4_text();
     let plain = Spec::parse(&text).unwrap();

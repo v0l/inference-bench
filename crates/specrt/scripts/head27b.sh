@@ -17,7 +17,7 @@ for head in bf16 fp8 nvfp4; do
         exit 1
     fi
     echo "== $head free $free MiB util $(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader) $(date +%T)"
-    SPECRT_BENCH_RUNS=3 nice -n 15 "$B" "$spec" 128 128
-    SPECRT_BENCH_RUNS=1 nice -n 15 "$NSYS" profile --cuda-graph-trace=node -t cuda -o "$out/$head" -f true "$B" "$spec" 128 64 > /dev/null 2>&1
+    nice -n 15 "$B" --runs 3 "$spec" 128 128
+    nice -n 15 "$NSYS" profile --cuda-graph-trace=node -t cuda -o "$out/$head" -f true "$B" --runs 1 "$spec" 128 64 > /dev/null 2>&1
     "$NSYS" stats -q -r cuda_gpu_kern_sum -f csv -o "$out/$head" "$out/$head.nsys-rep" > /dev/null 2>&1
 done

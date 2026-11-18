@@ -1,5 +1,5 @@
 use crate::spec::{Activation, Quant, Spec};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::collections::BTreeMap;
 
 pub use crate::gemm::{
@@ -8,12 +8,7 @@ pub use crate::gemm::{
     fp4_act_enabled, fp8_act_enabled, select, linear_dims, linear_shape,
 };
 
-pub const OPS_TEMPLATE: &str = include_str!("../templates/ops.cu");
-pub const MODEL_TEMPLATE: &str = include_str!("../templates/model.cu");
-pub const LIN_TEMPLATE: &str = include_str!("../templates/lin.cu");
-pub const MOE_TEMPLATE: &str = include_str!("../templates/moe.cu");
 pub const MOE_KERNELS: &[&str] = &["moe_route_logits", "moe_route", "moe_up_bf16", "moe_up_fp4", "moe_down_bf16", "moe_down_fp4", "moe_combine", "moe_permute", "moe_group_up_bf16", "moe_group_up_fp4", "moe_group_down_bf16", "moe_group_down_fp4", "moe_up_fp8", "moe_down_fp8", "moe_group_up_fp8", "moe_group_down_fp8"];
-pub const MOE_MMA_TEMPLATE: &str = include_str!("../templates/moe_mma.cu");
 pub const MOE_MMA_KERNELS: &[&str] = &["moe_quant_f32", "moe_tiles", "moe_mma_up", "moe_mma_up_s", "moe_mma_down", "moe_mma_down_s"];
 pub const MOE_MMA_BM: usize = 64;
 pub const MOE_MMA_BM_SMALL: usize = 16;
@@ -204,30 +199,6 @@ pub fn default_target() -> kir::Target {
     kir::Target::sm_120()
 }
 
-pub fn render(template: &str, vars: &BTreeMap<&str, String>) -> Result<String> {
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find("{{") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let Some(end) = after.find("}}") else {
-            bail!("unterminated slot");
-        };
-        let key = &after[..end];
-        match vars.get(key) {
-            Some(v) => out.push_str(v),
-            None => bail!("template slot {key} has no value"),
-        }
-        rest = &after[end + 2..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
-fn float_literal(v: f64) -> String {
-    format!("{v:e}f")
-}
-
 pub fn ggb_scratch_len(spec: &Spec) -> usize {
     GGB_LINEARS.iter().map(|l| { let (n, k, _, _) = linear_dims(spec, l); n * k }).max().unwrap_or(0)
 }
@@ -244,10 +215,6 @@ impl Module {
         let d = &spec.dims;
         let wf = crate::gemm::weight_format(spec.quant);
         let head_wf = crate::gemm::head_format(spec);
-        let act = match spec.mlp.activation {
-            Activation::Swiglu => 0,
-            Activation::Geglu => 1,
-        };
         let mut smem = BTreeMap::new();
         let attn = attention_kernels(spec, kv_planes, max_ctx, target)?;
         for k in &attn {
@@ -259,42 +226,31 @@ impl Module {
             };
         }
         let la = spec.linear_attention.as_ref();
-        let la_dim = |f: fn(&crate::spec::LinearAttention) -> usize| la.map_or("0".into(), |l| f(l).to_string());
         let linear = linear_kernels(spec, target)?;
         for k in &linear {
             if k.family == kir::linear::Family::Chunk {
                 smem.insert("gdn_chunk_prep", k.smem_bytes);
             }
         }
-        let vars: BTreeMap<&str, String> = [
-            ("HIDDEN", d.hidden.to_string()),
-            ("INTER", d.intermediate.to_string()),
-            ("VOCAB", d.vocab.to_string()),
-            ("HEADS", a.heads.to_string()),
-            ("KV_HEADS", a.kv_heads.to_string()),
-            ("HEAD_DIM", a.head_dim.to_string()),
-            ("GROUP", (a.heads / a.kv_heads).to_string()),
-            ("QKV_BIAS", a.qkv_bias.to_string()),
-            ("EPS", float_literal(spec.norm.eps)),
-            ("EMBED_SCALE", float_literal(spec.dims.embed_scale.unwrap_or(1.0))),
-            ("THETA", float_literal(spec.rope.theta)),
-            ("ACT_KIND", act.to_string()),
-            ("Q8_GROUP", Q8_GROUP.to_string()),
-            ("FP8_BLOCK", FP8_BLOCK.to_string()),
-            ("Q_DIM", spec.q_dim().to_string()),
-            ("QKV_N", spec.qkv_rows().to_string()),
-            ("QKV_ROW", spec.qkv_rows().to_string()),
-            ("OUT_GATE", a.output_gate.to_string()),
-            ("LA_KH", la_dim(|l| l.key_heads)),
-            ("LA_VH", la_dim(|l| l.value_heads)),
-            ("LA_D", la_dim(|l| l.key_head_dim)),
-            ("LA_CONV_K", la_dim(|l| l.conv_kernel)),
-            ("GATE_UP_N", (2 * d.intermediate).to_string()),
-            ("WF", wf.decoder().to_string()),
-            ("HEAD_WF", head_wf.decoder().to_string()),
-        ]
-        .into_iter()
-        .collect();
+        let ops = kir::ops::OpsShape {
+            hidden: d.hidden,
+            inter: d.intermediate,
+            vocab: d.vocab,
+            heads: a.heads,
+            kv_heads: a.kv_heads,
+            head_dim: a.head_dim,
+            qkv_row: spec.qkv_rows(),
+            q_dim: spec.q_dim(),
+            output_gate: a.output_gate,
+            qkv_bias: a.qkv_bias,
+            eps: spec.norm.eps,
+            embed_scale: spec.dims.embed_scale.unwrap_or(1.0),
+            gated_gelu: spec.mlp.activation == Activation::Geglu,
+            q8_group: Q8_GROUP,
+            fp8_block: FP8_BLOCK,
+            weight_decoder: wf.decoder().to_string(),
+            head_decoder: head_wf.decoder().to_string(),
+        };
         let kir_kernels = kir_kernels(spec, target)?;
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let kir_source = kir::cuda::emit_module(&kir_kernels).map_err(anyhow::Error::msg)?;
@@ -309,7 +265,7 @@ impl Module {
         ]);
         let ggml = kir::ggml::GgmlKernel::new(target);
         let kir_hash = kir::fold_hashes([kir_hash, ggml.hash()]);
-        let mut source = format!("{}\n{}\n{}\n{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, ggml.emit().map_err(anyhow::Error::msg)?, attn_source, gemm_source, render(MODEL_TEMPLATE, &vars)?, kir_source);
+        let mut source = format!("{}\n{}\n{}\n{}\n{}\n{}", kir::cuda::emit_ops(&ops), ggml.emit().map_err(anyhow::Error::msg)?, attn_source, gemm_source, kir::cuda::emit_model(&ops), kir_source);
         let mut kernels = KERNELS.to_vec();
         for k in &kir_kernels {
             if !kernels.contains(&k.name) {
@@ -320,7 +276,7 @@ impl Module {
             source.push('\n');
             source.push_str(&linear_source);
             source.push('\n');
-            source.push_str(&render(LIN_TEMPLATE, &vars)?);
+            source.push_str(&kir::cuda::emit_lin(&ops));
             for k in &linear {
                 kernels.extend_from_slice(k.family.kernels());
             }
@@ -329,24 +285,22 @@ impl Module {
         }
         let mut moe_arch = false;
         if let Some(m) = &spec.moe {
-            let vars: BTreeMap<&str, String> = [
-                ("MOE_E", m.experts.to_string()),
-                ("MOE_K", m.top_k().to_string()),
-                ("MOE_PAIRS", m.pairs().to_string()),
-                ("MOE_INTER", m.expert_intermediate.to_string()),
-                ("MOE_SHARED", (m.shared_intermediate > 0).to_string()),
-                ("MOE_NORM_TOPK", m.norm_topk.to_string()),
-                ("MOE_SHARED_GATE", m.shared_gate.to_string()),
-                ("MOE_SIGMOID", (m.router == crate::spec::RouterAct::Sigmoid).to_string()),
-            ]
-            .into_iter()
-            .collect();
+            let shape = kir::ops::MoeShape {
+                experts: m.experts,
+                top_k: m.top_k(),
+                pairs: m.pairs(),
+                inter: m.expert_intermediate,
+                shared: m.shared_intermediate > 0,
+                norm_topk: m.norm_topk,
+                shared_gate: m.shared_gate,
+                sigmoid: m.router == crate::spec::RouterAct::Sigmoid,
+            };
             source.push('\n');
-            source.push_str(&render(MOE_TEMPLATE, &vars)?);
+            source.push_str(&kir::cuda::emit_moe(&shape));
             kernels.extend_from_slice(MOE_KERNELS);
             if moe_mma_enabled(spec, target) {
                 source.push('\n');
-                source.push_str(MOE_MMA_TEMPLATE);
+                source.push_str(kir::cuda::emit_moe_mma());
                 kernels.extend_from_slice(MOE_MMA_KERNELS);
                 smem.insert("moe_mma_up", moe_mma_smem(MOE_MMA_BM, 2));
                 smem.insert("moe_mma_up_s", moe_mma_smem(MOE_MMA_BM_SMALL, 2));

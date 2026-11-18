@@ -4,7 +4,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-/mnt/data/cargo-target/inference-bench-635}
 model=${MODEL_DIR:-$HOME/.cache/specrt-models/Qwen3.5-4B-NVFP4}
 out=${OUT:-$here/../out/bench4b}
-runs=${SPECRT_BENCH_RUNS:-3}
+runs=${RUNS:-3}
 mkdir -p "$out"
 if [ ! -f "$model/model.safetensors.index.json" ]; then
     flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -p MemoryMax=16G -p MemorySwapMax=0 \
@@ -30,12 +30,12 @@ log=$out/bench4b.log
     echo "== $(date '+%F %T') $(git -C "$here" rev-parse --short HEAD) free ${free} MiB"
     for spec in "$weight" "$act"; do
         echo "== single $(basename "$spec")"
-        SPECRT_BENCH_RUNS=$runs "$bin" "$spec" 128,1024,4096 128
+        "$bin" --runs $runs "$spec" 128,1024,4096 128
     done
     for batch in 4 8 16; do
         echo "== batch $batch act"
-        SPECRT_BENCH_RUNS=$runs "$bin" "$act" 128 128 "$batch"
+        "$bin" --runs $runs "$act" 128 128 "$batch"
     done
     echo "== speculative act"
-    SPECRT_BENCH_RUNS=$runs "$bin" --speculative "$act" 1024 128 1
+    "$bin" --runs $runs --speculative "$act" 1024 128 1
 } 2>&1 | tee -a "$log"

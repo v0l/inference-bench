@@ -25,9 +25,7 @@ untouched. cudarc uses `dynamic-loading`, so building needs no CUDA toolkit. Run
   `[runtime]` table with `graphs = true`, `fuse = true`, `tile = "auto"` (`small`, `big`, `narrow`),
   `big_tile = [bm, bn, wm, wn]`, `unsplit = [linear, ...]`, `gemm_fp32 = false` and `cache_dir`.
   The server config takes the same `[runtime]` table and hands it to every model it loads. The old
-  `SPECRT_FP8_ACT`, `SPECRT_FP4_ACT`, `SPECRT_NO_GRAPH`, `SPECRT_NO_FUSE`, `SPECRT_TILE`,
-  `SPECRT_BIG_TILE`, `SPECRT_UNSPLIT`, `SPECRT_GEMM_FP32` and `SPECRT_CACHE` variables still
-  override them for development and log a deprecation warning when they change anything.
+  `SPECRT_*` environment variables are gone.
 - `runtime::Runtime` loads `model.safetensors` from the HF hub cache, fuses q/k/v and gate/up,
   quantises to Q8 (per 32-weight group, f32 scale) when the spec asks, and runs single-stream
   decode. The KV cache is paged (16-token pages through a block table). Each decode step, argmax

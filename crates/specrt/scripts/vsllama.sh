@@ -11,5 +11,5 @@ for _ in $(seq "$rounds"); do
     idle
     "$llama" -m "$model" -ngl 99 -fa 1 -p 0 -n 128 -d 1024,4096 -r 3 -o json 2>/dev/null | jq -r '.[] | "llama.cpp decode d=\(.n_depth) \(.avg_ts * 10 | floor / 10) +- \(.stddev_ts * 10 | floor / 10)"'
     idle
-    SPECRT_BENCH_RUNS=3 "$bench" "$model" 1024,4096 128 2>&1 | grep -o 'prompt=[0-9]* prefill=[0-9.]* tok/s decode=[0-9]* tokens [0-9.]* tok/s' | sed 's/^/specrt /'
+    "$bench" --runs 3 "$model" 1024,4096 128 2>&1 | grep -o 'prompt=[0-9]* prefill=[0-9.]* tok/s decode=[0-9]* tokens [0-9.]* tok/s' | sed 's/^/specrt /'
 done

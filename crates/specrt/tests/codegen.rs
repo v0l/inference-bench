@@ -1,7 +1,6 @@
-use specrt::codegen::{GDN_LINEARS, MMA_LINEARS, Module, WeightKind, select, render};
+use specrt::codegen::{GDN_LINEARS, MMA_LINEARS, Module, WeightKind, select};
 use specrt::mtp::MTP_LINEARS;
 use specrt::spec::{Quant, Spec, TileChoice};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 fn spec(file: &str) -> Spec {
@@ -9,15 +8,27 @@ fn spec(file: &str) -> Spec {
 }
 
 #[test]
-fn render_substitutes_every_slot() {
-    let vars = BTreeMap::from([("A", "1".to_string()), ("B", "two".to_string())]);
-    assert_eq!(render("x{{A}}y{{B}}{{A}}", &vars).unwrap(), "x1ytwo1");
-}
-
-#[test]
-fn render_rejects_unknown_slot() {
-    let vars = BTreeMap::from([("A", "1".to_string())]);
-    assert!(render("{{A}}{{MISSING}}", &vars).is_err());
+fn every_kernel_comes_from_kir() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut stray = Vec::new();
+    let mut stack = vec![root.join("templates")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries {
+            let path = e.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|x| x == "cu" || x == "wgsl") {
+                stray.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(stray.is_empty(), "kernel text belongs in kir: {stray:?}");
+    for file in ["src/codegen.rs", "src/wgsl.rs"] {
+        let text = std::fs::read_to_string(root.join(file)).unwrap();
+        assert!(!text.contains("render("), "{file} must not template kernel text");
+        assert!(!text.contains("{{"), "{file} must not carry template slots");
+    }
 }
 
 #[test]
