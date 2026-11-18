@@ -47,10 +47,6 @@ pub fn online_softmax_with(sc: &Scores) -> String {
     )
 }
 
-pub fn softmax_update() -> String {
-    softmax_update_with("NEG_INF")
-}
-
 pub fn softmax_update_with(neg: &str) -> String {
     let quad_max = |m: &str| xor_reduce(Reduce::Max, m, &[1, 2]);
     let quad_sum = |m: &str| xor_reduce(Reduce::Sum, m, &[1, 2]);

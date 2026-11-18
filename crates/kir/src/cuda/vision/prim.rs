@@ -19,9 +19,7 @@ pub fn scalar_prelude() -> String {
         "float",
         "activate",
         "float x, int kind",
-        &format!(
-            "    if (kind == 1) {{\n        float u = 0.7978845608028654f * (x + 0.044715f * x * x * x);\n        return 0.5f * x * (1.0f + tanhf(u));\n    }}\n    if (kind == 2) {{\n        return 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));\n    }}\n    return x;\n"
-        ),
+        "    if (kind == 1) {\n        float u = 0.7978845608028654f * (x + 0.044715f * x * x * x);\n        return 0.5f * x * (1.0f + tanhf(u));\n    }\n    if (kind == 2) {\n        return 0.5f * x * (1.0f + erff(x * 0.7071067811865476f));\n    }\n    return x;\n",
     );
     s += &forceinline("unsigned", "bf16_bits_rn", "float v", "    unsigned u = __float_as_uint(v);\n    return (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;\n");
     s += &forceinline("void", "split_bf16", "float v, unsigned& hi, unsigned& lo", "    hi = bf16_bits_rn(v);\n    lo = bf16_bits_rn(v - __uint_as_float(hi << 16));\n");
