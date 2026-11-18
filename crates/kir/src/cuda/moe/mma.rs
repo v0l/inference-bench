@@ -83,7 +83,7 @@ fn geometry() -> &'static str {
 "##
 }
 
-fn tile_setup() -> &'static str {
+fn tile_setup_head() -> &'static str {
     r##"    extern __shared__ __align__(16) unsigned char gemm_smem[];
     __shared__ int src[BM];
     __shared__ int dst[BM];
@@ -111,13 +111,19 @@ fn tile_setup() -> &'static str {
     float acc[NW][MI][NJ][4];
 #pragma unroll
     for (int w = 0; w < NW; w++)
-#pragma unroll
-        for (int i = 0; i < MI; i++)
-#pragma unroll
-            for (int j = 0; j < NJ; j++)
-#pragma unroll
-                for (int x = 0; x < 4; x++) acc[w][i][j][x] = 0.0f;
 "##
+}
+
+fn zero_acc() -> String {
+    prim::zero_frag("acc[w]", ("i", "MI"), ("j", "NJ"), 8)
+}
+
+fn tile_setup() -> String {
+    format!("{}{}", tile_setup_head(), zero_acc())
+}
+
+fn prologue() -> String {
+    prim::pipeline_prologue("KT", "load_stage(st, st)")
 }
 
 fn load_stage() -> &'static str {
@@ -154,12 +160,7 @@ fn load_stage() -> &'static str {
 }
 
 fn mainloop() -> &'static str {
-    r##"#pragma unroll
-    for (int stg = 0; stg < STAGES - 1; stg++) {
-        if (stg < KT) load_stage(stg, stg);
-        cp_async_commit();
-    }
-    for (int kt = 0; kt < KT; kt++) {
+    r##"    for (int kt = 0; kt < KT; kt++) {
         cp_async_wait<STAGES - 2>();
         __syncthreads();
         int next = kt + STAGES - 1;
@@ -230,7 +231,7 @@ fn gemm() -> String {
             "void",
             "moe_gemm_f4",
             "const unsigned char* w0, const unsigned char* s0, const float* g0, const unsigned char* w1, const unsigned char* s1,\n                                            const float* g1, float inv_in, const unsigned char* aq, const unsigned char* as, const int* offsets, const int* sorted,\n                                            const int* tile_map, float* out",
-            &format!("{}{}{}{}{}", geometry(), tile_setup(), load_stage(), mainloop(), epilogue())
+            &format!("{}{}{}{}{}{}", geometry(), tile_setup(), load_stage(), prologue(), mainloop(), epilogue())
         )
     )
 }
@@ -250,12 +251,12 @@ fn variant(name: &str, tile: &str) -> String {
 pub fn grouped() -> String {
     let mut out = String::new();
     out.push_str(constants());
-    out.push_str(&prim::mma_fp4());
-    out.push_str(&prim::e2m1x2());
-    out.push_str(&prim::cp8());
+    out.push_str(&prim::mma_fp4("moe_mma_fp4"));
+    out.push_str(&prim::e2m1x2("moe_e2m1x2"));
+    out.push_str(&prim::cp8_zfill("moe_cp8"));
     out.push_str(&quant_f32());
     out.push_str(&tiles());
-    out.push_str(&prim::swizzle());
+    out.push_str(&prim::swizzle("mma_chunk", "MMA_DATA"));
     out.push_str(&gemm());
     out.push_str(&variant("moe_mma_up", "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false"));
     out.push_str(&variant("moe_mma_up_s", "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 3, false"));

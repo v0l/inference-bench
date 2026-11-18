@@ -263,7 +263,7 @@ fn entries(out: &mut String, stem: &str, args: &str, impl_name: &str, call: &str
 pub fn gemv() -> String {
     let mut out = String::new();
     out.push_str(prim::fp8_grid());
-    out.push_str(&prim::e2m1());
+    out.push_str(&prim::e2m1_to_f32("moe_e2m1"));
     out.push_str(&dot());
     out.push_str(&up_impl());
     out.push_str(&down_impl());
