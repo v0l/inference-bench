@@ -8,8 +8,6 @@ fn spec(file: &str) -> Spec {
 }
 
 const KIR_SNIPPETS: &[&str] = &[
-    "cuda/moe.cu",
-    "cuda/moe_mma.cu",
     "cuda/prelude.cu",
     "cuda/quant_fp4.cu",
     "cuda/quant_fp8_block.cu",

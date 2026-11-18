@@ -1,30 +1,15 @@
-constexpr int MMA_DATA = 64;
-constexpr int MMA_SCALES = 8;
-constexpr int MMA_ROW = MMA_DATA + MMA_SCALES;
+use super::prim;
 
-__device__ __forceinline__ void moe_mma_fp4(float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa, unsigned sfb) {
-    unsigned short z = 0;
-    asm volatile(
-        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(z), "h"(z), "r"(sfb), "h"(z), "h"(z));
+pub fn constants() -> &'static str {
+    "constexpr int MMA_DATA = 64;\nconstexpr int MMA_SCALES = 8;\nconstexpr int MMA_ROW = MMA_DATA + MMA_SCALES;\n\n"
 }
 
-__device__ __forceinline__ unsigned moe_e2m1x2(float lo, float hi) {
-    unsigned short r;
-    asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %1, %2; cvt.u16.u8 %0, t; }" : "=h"(r) : "f"(hi), "f"(lo));
-    return r & 0xffu;
-}
-
-__device__ __forceinline__ void moe_cp8(void* smem, const void* gmem, bool valid) {
-    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
-    int n = valid ? 8 : 0;
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(s), "l"(gmem), "r"(n));
-}
-
-extern "C" __global__ void __launch_bounds__(256) moe_quant_f32(const float* x, unsigned char* q, unsigned char* qs, int width, float igs) {
-  int groups = width / 16;
+pub fn quant_f32() -> String {
+    prim::global(
+        Some(256),
+        "moe_quant_f32",
+        "const float* x, unsigned char* q, unsigned char* qs, int width, float igs",
+        r##"  int groups = width / 16;
   size_t row = blockIdx.x;
   for (int grp = threadIdx.x; grp < groups; grp += 256) {
     size_t at = row * width + (size_t)grp * 16;
@@ -52,10 +37,16 @@ extern "C" __global__ void __launch_bounds__(256) moe_quant_f32(const float* x, 
     *(uint2*)(q + at / 2) = make_uint2(w0, w1);
     qs[row * groups + grp] = (unsigned char)sbits;
   }
+"##,
+    )
 }
 
-extern "C" __global__ void moe_tiles(const int* offsets, int* tile_map, int bm, int max_tiles) {
-    if (threadIdx.x != 0) return;
+pub fn tiles() -> String {
+    prim::global(
+        None,
+        "moe_tiles",
+        "const int* offsets, int* tile_map, int bm, int max_tiles",
+        r##"    if (threadIdx.x != 0) return;
     int t = 0;
     for (int e = 0; e < MOE_SLOTS; e++) {
         int count = offsets[e + 1] - offsets[e];
@@ -68,17 +59,12 @@ extern "C" __global__ void moe_tiles(const int* offsets, int* tile_map, int bm, 
         }
     }
     for (; t < max_tiles; t++) tile_map[2 * t] = -1;
+"##,
+    )
 }
 
-__device__ __forceinline__ int mma_chunk(int r, int c) {
-    return r * MMA_DATA + ((c ^ (r >> 1)) & 3) * 16;
-}
-
-template <int N, int K, int NW, int BM, int BN, int WM, int WN, int STAGES, bool DOWN>
-__device__ __forceinline__ void moe_gemm_f4(const unsigned char* w0, const unsigned char* s0, const float* g0, const unsigned char* w1, const unsigned char* s1,
-                                            const float* g1, float inv_in, const unsigned char* aq, const unsigned char* as, const int* offsets, const int* sorted,
-                                            const int* tile_map, float* out) {
-    constexpr int THREADS = WM * WN * 32;
+fn geometry() -> &'static str {
+    r##"    constexpr int THREADS = WM * WN * 32;
     constexpr int TM = BM / WM;
     constexpr int TN = BN / WN;
     constexpr int MI = TM / 16;
@@ -94,7 +80,11 @@ __device__ __forceinline__ void moe_gemm_f4(const unsigned char* w0, const unsig
     static_assert(K % 128 == 0, "K must be a multiple of 128");
     static_assert(N % BN == 0, "N must be a multiple of the tile");
     static_assert(NJ % 2 == 0, "B fragments come two n tiles per ldmatrix");
-    extern __shared__ __align__(16) unsigned char gemm_smem[];
+"##
+}
+
+fn tile_setup() -> &'static str {
+    r##"    extern __shared__ __align__(16) unsigned char gemm_smem[];
     __shared__ int src[BM];
     __shared__ int dst[BM];
     int tile = blockIdx.y;
@@ -127,7 +117,11 @@ __device__ __forceinline__ void moe_gemm_f4(const unsigned char* w0, const unsig
             for (int j = 0; j < NJ; j++)
 #pragma unroll
                 for (int x = 0; x < 4; x++) acc[w][i][j][x] = 0.0f;
-    auto load_stage = [&](int buf, int kt) {
+"##
+}
+
+fn load_stage() -> &'static str {
+    r##"    auto load_stage = [&](int buf, int kt) {
         unsigned char* st = gemm_smem + buf * STAGE_BYTES;
 #pragma unroll
         for (int it = 0; it < A_ITERS; it++) {
@@ -156,7 +150,11 @@ __device__ __forceinline__ void moe_gemm_f4(const unsigned char* w0, const unsig
             }
         }
     };
-#pragma unroll
+"##
+}
+
+fn mainloop() -> &'static str {
+    r##"#pragma unroll
     for (int stg = 0; stg < STAGES - 1; stg++) {
         if (stg < KT) load_stage(stg, stg);
         cp_async_commit();
@@ -196,7 +194,11 @@ __device__ __forceinline__ void moe_gemm_f4(const unsigned char* w0, const unsig
         }
     }
     cp_async_wait<0>();
-    float alpha0 = g0[e] * inv_in;
+"##
+}
+
+fn epilogue() -> &'static str {
+    r##"    float alpha0 = g0[e] * inv_in;
     float alpha1 = NW > 1 ? g1[e] * inv_in : 0.0f;
 #pragma unroll
     for (int i = 0; i < MI; i++)
@@ -218,23 +220,46 @@ __device__ __forceinline__ void moe_gemm_f4(const unsigned char* w0, const unsig
                 }
                 *(float2*)(out + (size_t)d * N + col) = v;
             }
+"##
 }
 
-#define MOE_MMA_ARGS const unsigned char* gw, const unsigned char* gs, const float* gg, const unsigned char* uw, const unsigned char* us, const float* ug, float inv_in, \
-    const unsigned char* aq, const unsigned char* as, const int* offsets, const int* sorted, const int* tile_map, float* out
-
-extern "C" __global__ void __launch_bounds__(128) moe_mma_up(MOE_MMA_ARGS) {
-    moe_gemm_f4<MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false>(gw, gs, gg, uw, us, ug, inv_in, aq, as, offsets, sorted, tile_map, out);
+fn gemm() -> String {
+    format!(
+        "template <int N, int K, int NW, int BM, int BN, int WM, int WN, int STAGES, bool DOWN>\n{}",
+        prim::device(
+            "void",
+            "moe_gemm_f4",
+            "const unsigned char* w0, const unsigned char* s0, const float* g0, const unsigned char* w1, const unsigned char* s1,\n                                            const float* g1, float inv_in, const unsigned char* aq, const unsigned char* as, const int* offsets, const int* sorted,\n                                            const int* tile_map, float* out",
+            &format!("{}{}{}{}{}", geometry(), tile_setup(), load_stage(), mainloop(), epilogue())
+        )
+    )
 }
 
-extern "C" __global__ void __launch_bounds__(128) moe_mma_up_s(MOE_MMA_ARGS) {
-    moe_gemm_f4<MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 3, false>(gw, gs, gg, uw, us, ug, inv_in, aq, as, offsets, sorted, tile_map, out);
+const ARGS: &str = "const unsigned char* gw, const unsigned char* gs, const float* gg, const unsigned char* uw, const unsigned char* us, const float* ug, float inv_in,\n    const unsigned char* aq, const unsigned char* as, const int* offsets, const int* sorted, const int* tile_map, float* out";
+
+fn variant(name: &str, tile: &str) -> String {
+    prim::delegate(
+        128,
+        name,
+        ARGS,
+        &format!("moe_gemm_f4<{tile}>"),
+        "gw, gs, gg, uw, us, ug, inv_in, aq, as, offsets, sorted, tile_map, out",
+    )
 }
 
-extern "C" __global__ void __launch_bounds__(128) moe_mma_down(MOE_MMA_ARGS) {
-    moe_gemm_f4<HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true>(gw, gs, gg, uw, us, ug, inv_in, aq, as, offsets, sorted, tile_map, out);
-}
-
-extern "C" __global__ void __launch_bounds__(128) moe_mma_down_s(MOE_MMA_ARGS) {
-    moe_gemm_f4<HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 3, true>(gw, gs, gg, uw, us, ug, inv_in, aq, as, offsets, sorted, tile_map, out);
+pub fn grouped() -> String {
+    let mut out = String::new();
+    out.push_str(constants());
+    out.push_str(&prim::mma_fp4());
+    out.push_str(&prim::e2m1x2());
+    out.push_str(&prim::cp8());
+    out.push_str(&quant_f32());
+    out.push_str(&tiles());
+    out.push_str(&prim::swizzle());
+    out.push_str(&gemm());
+    out.push_str(&variant("moe_mma_up", "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false"));
+    out.push_str(&variant("moe_mma_up_s", "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 3, false"));
+    out.push_str(&variant("moe_mma_down", "HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true"));
+    out.push_str(&variant("moe_mma_down_s", "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 3, true"));
+    out
 }
