@@ -307,7 +307,9 @@ impl Module {
             kir::attention::attention_hash(&attn),
             kir::linear::linear_hash(&linear),
         ]);
-        let mut source = format!("{}\n{}\n{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, attn_source, gemm_source, render(MODEL_TEMPLATE, &vars)?, kir_source);
+        let ggml = kir::ggml::GgmlKernel::new(target);
+        let kir_hash = kir::fold_hashes([kir_hash, ggml.hash()]);
+        let mut source = format!("{}\n{}\n{}\n{}\n{}\n{}", render(OPS_TEMPLATE, &vars)?, ggml.emit().map_err(anyhow::Error::msg)?, attn_source, gemm_source, render(MODEL_TEMPLATE, &vars)?, kir_source);
         let mut kernels = KERNELS.to_vec();
         for k in &kir_kernels {
             if !kernels.contains(&k.name) {

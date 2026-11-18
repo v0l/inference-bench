@@ -7,19 +7,10 @@ use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, DevicePtr
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub const VISION_TEMPLATE: &str = include_str!("../templates/vision.cu");
-
-const KERNELS: &[&str] = &["vis_mma", "vis_split", "vis_layernorm", "vis_pos", "vis_rope_pack", "vis_flash", "vis_to_f16", "vis_pool"];
-const GEMM_BM: u32 = 128;
-const GEMM_BN: u32 = 128;
-const GEMM_THREADS: u32 = 256;
-const GEMM_SMEM: u32 = 3 * (128 * 32 * 2 * 2 + 128 * 32 * 2);
-const FLASH_BQ: u32 = 128;
-const FLASH_THREADS: u32 = 256;
+use kir::vision::{FLASH_BQ, FLASH_THREADS, GEMM_BM, GEMM_BN, GEMM_SMEM, GEMM_THREADS, KERNELS, head_pad};
 
 fn flash_smem(head_dim: usize) -> u32 {
-    let stride = head_pad(head_dim) + 8;
-    (2 * 128 * stride * 2).max(2 * 4 * 32 * stride * 2) as u32
+    kir::vision::VisionKernel { target: crate::codegen::default_target(), head_dim, precise: false }.flash_smem()
 }
 pub const MAX_ENCODE_PATCHES: usize = 32768;
 pub const WORKSPACE_PATCHES: usize = 4800;
@@ -178,15 +169,10 @@ enum Out<'a> {
     Split(&'a mut Planes),
 }
 
-fn head_pad(head_dim: usize) -> usize {
-    head_dim.div_ceil(16) * 16
-}
-
-fn module(head_dim: usize, precise: bool) -> Result<Module> {
-    let flag = |on: bool| if on { "true" } else { "false" }.to_string();
-    let vars = BTreeMap::from([("VIS_HDP", head_pad(head_dim).to_string()), ("VIS_GEMM_SPLIT", flag(precise)), ("VIS_ATT_SPLIT", flag(precise))]);
-    let source = crate::codegen::render(VISION_TEMPLATE, &vars)?;
-    Ok(Module { source, kernels: KERNELS.to_vec(), smem: BTreeMap::new(), arch_features: false, kir_hash: String::new() })
+fn module(head_dim: usize, precise: bool, target: &kir::Target) -> Result<Module> {
+    let k = kir::vision::VisionKernel::new(target, head_dim, precise).map_err(anyhow::Error::msg)?;
+    let source = kir::cuda::emit_vision(&k).map_err(anyhow::Error::msg)?;
+    Ok(Module { source, kernels: KERNELS.to_vec(), smem: BTreeMap::new(), arch_features: false, kir_hash: k.hash() })
 }
 
 fn prefix(ck: &Checkpoint) -> Result<&'static str> {
@@ -434,8 +420,7 @@ impl VisionEncoder {
         let head_dim = cfg.hidden_size / cfg.num_heads;
         ensure!(head_dim % 8 == 0 && head_dim <= 128, "vision head_dim {head_dim} is not supported");
         let act = Act::from_config(cfg.hidden_act.as_deref())?;
-        let loaded = jit.load(&module(head_dim, precise)?)?;
-        let _ = ctx;
+        let loaded = jit.load(&module(head_dim, precise, &crate::codegen::cuda_target(ctx)?)?)?;
         let (mut patch, pos_embed, mut blocks, mut main, mut deepstack, mut pool) = if cfg.pooled() {
             let (patch, pos_embed, blocks, pool) = pooled_parts(stream, ck, cfg)?;
             (patch, pos_embed, blocks, None, Vec::new(), Some(pool))

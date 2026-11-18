@@ -24,7 +24,7 @@ pub const ROW_SPAN: u32 = 32768;
 pub const ELEMENT_SPAN: u32 = 8388608;
 
 const COMMON: &str = include_str!("../templates/wgsl/common.wgsl");
-const DECODE: &str = include_str!("../templates/wgsl/decode.wgsl");
+const DECODE: &str = kir::wgsl::GGML_DECODE;
 
 fn float(v: f64) -> String {
     format!("{v:e}")
@@ -145,7 +145,7 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         build("attention", include_str!("../templates/wgsl/attention.wgsl"), false, &[Read, Read, Read, Write, Uniform], &vars)?,
         build("bias", include_str!("../templates/wgsl/bias.wgsl"), false, &[Write, Read, Uniform], &vars)?,
         build("argmax", include_str!("../templates/wgsl/argmax.wgsl"), false, &[Read, Write, Uniform], &vars)?,
-        build("dequant", include_str!("../templates/wgsl/dequant.wgsl"), true, &[Read, Read, Write, Uniform], &vars)?,
+        build("dequant", kir::wgsl::GGML_ROWS, true, &[Read, Read, Write, Uniform], &vars)?,
     ];
     for k in crate::codegen::kir_kernels(spec, target)? {
         let bindings = kir::wgsl::bindings(&k)

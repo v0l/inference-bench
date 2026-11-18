@@ -272,3 +272,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid
     ));
     Ok(s)
 }
+
+pub const GGML_DECODE: &str = include_str!("wgsl_ggml/ggml_decode.wgsl");
+pub const GGML_ROWS: &str = include_str!("wgsl_ggml/ggml_rows.wgsl");
+
+pub fn ggml_bindings() -> Vec<Binding> {
+    vec![Binding::Read, Binding::Read, Binding::Write, Binding::Uniform]
+}
