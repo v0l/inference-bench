@@ -12,7 +12,7 @@ source "$HOME/.cargo/env"
 export PATH=/opt/homebrew/bin:$PATH
 ROUNDS=${ROUNDS:-3}
 RUNS=${SPECRT_BENCH_RUNS:-3}
-MODELS=${MODELS:-"Qwen3-0.6B-BF16 Qwen3-0.6B-Q4_K_M Llama-3.2-1B-Instruct-Q4_K_M"}
+MODELS=${MODELS-"Qwen3-0.6B-BF16 Qwen3-0.6B-Q4_K_M Llama-3.2-1B-Instruct-Q4_K_M"}
 BIG=${BIG:-Qwen2.5-7B-Instruct-Q4_K_M}
 OUT=${OUT:-$HOME/bench-out/$(date +%Y%m%d-%H%M)}
 SRC=$HOME/git/ib-bench
@@ -69,16 +69,24 @@ for round in $(seq 1 "$ROUNDS"); do
 done
 
 if [ -n "$BIG" ] && [ -f "$HOME/models/$BIG.gguf" ]; then
-  load_note > "$OUT/big.load.txt"
-  run_llama "$BIG" "big.$BIG" 128
-  run_specrt "$BIG" "big.$BIG" 1 128
+  for round in $(seq 1 "$ROUNDS"); do
+    load_note > "$OUT/big$round.load.txt"
+    tag=big$round.$BIG
+    if [ $((round % 2)) -eq 1 ]; then
+      run_specrt "$BIG" "$tag" 1 128,1024
+      run_llama "$BIG" "$tag" 128,1024
+    else
+      run_llama "$BIG" "$tag" 128,1024
+      run_specrt "$BIG" "$tag" 1 128,1024
+    fi
+  done
 fi
 
 python3 - "$OUT" <<'PY'
 import sys, glob, json, re, statistics, os
 out = sys.argv[1]
 rows = {}
-for f in sorted(glob.glob(out + "/round*.llama.txt") + glob.glob(out + "/big.*.llama.txt")):
+for f in sorted(glob.glob(out + "/round*.llama.txt") + glob.glob(out + "/big*.llama.txt")):
     base = os.path.basename(f)[:-len(".llama.txt")]
     text = open(f).read()
     start = text.index("[")

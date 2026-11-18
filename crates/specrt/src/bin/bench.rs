@@ -85,6 +85,7 @@ fn main() -> Result<()> {
         let prompt = args.get(2).context("--text <model> <prompt> [tokens]")?;
         let n: usize = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(32);
         let mut engine = specrt::engine::Engine::load(model, Some(512))?;
+        println!("PROMPT_IDS {:?}", engine.tokens(prompt)?);
         let reply = engine.generate(prompt, n, Sampling::GREEDY)?;
         println!("TEXT_BEGIN{}TEXT_END", reply.text);
         return Ok(());
