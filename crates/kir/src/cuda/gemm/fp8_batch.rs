@@ -1,37 +1,18 @@
+use super::prim;
 
-__device__ __forceinline__ void f8b_cp_async8(void* smem, const void* gmem, bool valid) {
-    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
-    int n = valid ? 8 : 0;
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(s), "l"(gmem), "r"(n));
-}
-
-__device__ __forceinline__ uint4 f8b_load16(const void* p) {
-    uint4 r;
-    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
-                 : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
-    return r;
-}
-
+pub fn body() -> String {
+    [
+        prim::batch_helpers("f8b"),
+        r##"
 __device__ __forceinline__ unsigned f8b_word(const uint4& a, const uint4& b, int i) {
     const uint4& q = i < 4 ? a : b;
     int j = i & 3;
     return j == 0 ? q.x : j == 1 ? q.y : j == 2 ? q.z : q.w;
 }
 
-template <int N, int EPI>
-__device__ __forceinline__ void f8b_store(int m, int r, float v, float u, float* out, bf16_t* out_hi, bf16_t* out_lo) {
-    if (EPI == EPI_ACT) {
-        unsigned hi, lo;
-        split_hi_lo(activation(v) * u, hi, lo);
-        size_t at = (size_t)m * (N / 2) + r / 2;
-        out_hi[at] = (bf16_t)hi;
-        out_lo[at] = (bf16_t)lo;
-    } else {
-        float* o = out + (size_t)m * N + r;
-        *o = EPI == EPI_RESIDUAL ? *o + v : v;
-    }
-}
-
+"##.to_string(),
+        prim::batch_store("f8b"),
+        r##"
 template <int N, int K, int EPI, bool BIAS, int NT, int WARPS, int STAGES, int MJ>
 __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, const float* bias, const bf16_t* x_hi,
                                          const bf16_t* x_lo, float* out, bf16_t* out_hi, bf16_t* out_lo, float* part,
@@ -89,18 +70,10 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
             }
     };
     float acc[MJ][NT][4];
-#pragma unroll
-    for (int i = 0; i < MJ; i++)
-#pragma unroll
-        for (int n = 0; n < NT; n++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) acc[i][n][e] = 0.0f;
-#pragma unroll
-    for (int st = 0; st < STAGES - 1; st++) {
-        if (st < nc) stage(st, c_begin + st);
-        cp_async_commit();
-    }
-    uint4 q[MJ][2][2];
+"##.to_string(),
+        prim::zero_frag("acc", ("i", "MJ"), ("n", "NT"), 4),
+        prim::pipeline_prologue("nc", "stage(st, c_begin + st)"),
+        r##"    uint4 q[MJ][2][2];
     float s[MJ][2];
     if (nc > 0) load_w(c_begin, q, s);
     for (int it = 0; it < nc; it++) {
@@ -114,13 +87,9 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
         const bf16_t* xh = xs + (it % STAGES) * STAGE;
         const bf16_t* xl = xh + PLANE;
         float c[MJ][NT][4];
-#pragma unroll
-        for (int i = 0; i < MJ; i++)
-#pragma unroll
-            for (int n = 0; n < NT; n++)
-#pragma unroll
-                for (int e = 0; e < 4; e++) c[i][n][e] = 0.0f;
-#pragma unroll
+"##.to_string(),
+        prim::zero_frag("c", ("i", "MJ"), ("n", "NT"), 8),
+        r##"#pragma unroll
         for (int k = 0; k < 8; k++) {
             uint2 bh[NT], bl[NT];
 #pragma unroll
@@ -195,3 +164,7 @@ __device__ __forceinline__ void f8b_reduce(const float* part, const float* bias,
     f8b_store<N, EPI>(m, r, v, u, out, out_hi, out_lo);
 }
 
+"##.to_string(),
+    ]
+    .concat()
+}

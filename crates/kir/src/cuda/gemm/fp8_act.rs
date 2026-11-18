@@ -1,4 +1,8 @@
-template <int N, int K, int BM, int BN, int WM, int WN, int STAGES, int EPI, bool BIAS, bool PER_TOKEN = false>
+use super::prim;
+
+pub fn body() -> String {
+    [
+        r##"template <int N, int K, int BM, int BN, int WM, int WN, int STAGES, int EPI, bool BIAS, bool PER_TOKEN = false>
 __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, const float* bias, const unsigned char* xq,
                                          const float* xscale, float* out, bf16_t* out_hi, bf16_t* out_lo, int tokens) {
     constexpr int BK = FP8_BLOCK;
@@ -27,20 +31,12 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
     int m0 = tile.x * BM;
     int n0 = tile.y * BN;
     float acc[MI][NJ][4];
-#pragma unroll
-    for (int i = 0; i < MI; i++)
-#pragma unroll
-        for (int j = 0; j < NJ; j++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
-    float c[MI][NJ][4];
-#pragma unroll
-    for (int i = 0; i < MI; i++)
-#pragma unroll
-        for (int j = 0; j < NJ; j++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) c[i][j][e] = 0.0f;
-    int last_row = max(tokens - 1, 0);
+"##.to_string(),
+        prim::zero_frag("acc", ("i", "MI"), ("j", "NJ"), 4),
+        r##"    float c[MI][NJ][4];
+"##.to_string(),
+        prim::zero_frag("c", ("i", "MI"), ("j", "NJ"), 4),
+        r##"    int last_row = max(tokens - 1, 0);
     unsigned srow0[NJ], srow1[NJ];
 #pragma unroll
     for (int j = 0; j < NJ; j++) {
@@ -70,12 +66,9 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
             cp_async16(ws + r * ROW + ((c ^ (r & 7)) << 4), (const unsigned char*)w + (size_t)n * K + kt * BK + c * 16);
         }
     };
-#pragma unroll
-    for (int st = 0; st < STAGES - 1; st++) {
-        if (st < KT) load_stage(st, st);
-        cp_async_commit();
-    }
-    for (int kt = 0; kt < KT; kt++) {
+"##.to_string(),
+        prim::pipeline_prologue("KT", "load_stage(st, st)"),
+        r##"    for (int kt = 0; kt < KT; kt++) {
         cp_async_wait<STAGES - 2>();
         __syncthreads();
         int next = kt + STAGES - 1;
@@ -97,13 +90,9 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
                     int m = min(m0 + wm * TM + i * 16 + g + h * 8, last_row);
                     sa[i][h] = xscale[(size_t)m * KT + kt];
                 }
-#pragma unroll
-            for (int i = 0; i < MI; i++)
-#pragma unroll
-                for (int j = 0; j < NJ; j++)
-#pragma unroll
-                    for (int e = 0; e < 4; e++) c[i][j][e] = 0.0f;
-        }
+"##.to_string(),
+        prim::zero_frag("c", ("i", "MI"), ("j", "NJ"), 12),
+        r##"        }
 #pragma unroll
         for (int ks = 0; ks < KS; ks++) {
             unsigned a[MI][4];
@@ -154,4 +143,8 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
     }
     cp_async_wait<0>();
     gemm_epilogue_at<N, BM, BN, WM, WN, EPI, BIAS>(acc, bias, out, out_hi, out_lo, tokens, m0, n0);
+}
+"##.to_string(),
+    ]
+    .concat()
 }

@@ -1,4 +1,5 @@
-constexpr int FP4_GROUP = 16;
+pub fn body() -> String {
+    r##"constexpr int FP4_GROUP = 16;
 constexpr int FP4_HEADER = 16;
 constexpr int FP4_GEMV_THREADS = 512;
 
@@ -116,4 +117,6 @@ struct DecFp4 : DecBase<DecFp4> {
 
 __device__ __forceinline__ void load_normed_t(const float* x, const float* nw, float* xt) {
     load_normed<DecFp4>(x, nw, xt);
+}
+"##.to_string()
 }

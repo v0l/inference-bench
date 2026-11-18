@@ -1,4 +1,8 @@
-__device__ __forceinline__ void mma_fp4(float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa, unsigned sfb) {
+use super::prim;
+
+pub fn body() -> String {
+    [
+        r##"__device__ __forceinline__ void mma_fp4(float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa, unsigned sfb) {
     unsigned short z = 0;
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
@@ -63,13 +67,9 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
     int m0 = tile.x * BM;
     int n0 = tile.y * BN;
     float acc[MI][NJ][4];
-#pragma unroll
-    for (int i = 0; i < MI; i++)
-#pragma unroll
-        for (int j = 0; j < NJ; j++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
-    int last_row = max(tokens - 1, 0);
+"##.to_string(),
+        prim::zero_frag("acc", ("i", "MI"), ("j", "NJ"), 4),
+        r##"    int last_row = max(tokens - 1, 0);
     const unsigned char* wsc = wscales + FP4_HEADER;
     auto load_stage = [&](int buf, int kt) {
         unsigned char* as = gemm_smem + buf * STAGE_BYTES;
@@ -104,12 +104,9 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
             }
         }
     };
-#pragma unroll
-    for (int st = 0; st < STAGES - 1; st++) {
-        if (st < KT) load_stage(st, st);
-        cp_async_commit();
-    }
-    for (int kt = 0; kt < KT; kt++) {
+"##.to_string(),
+        prim::pipeline_prologue("KT", "load_stage(st, st)"),
+        r##"    for (int kt = 0; kt < KT; kt++) {
         cp_async_wait<STAGES - 2>();
         __syncthreads();
         int next = kt + STAGES - 1;
@@ -153,3 +150,7 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
     gemm_epilogue_at<N, BM, BN, WM, WN, EPI, false>(acc, nullptr, out, out_hi, out_lo, tokens, m0, n0);
 }
 
+"##.to_string(),
+    ]
+    .concat()
+}

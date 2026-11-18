@@ -1,7 +1,6 @@
-const DECODE: &str = include_str!("ggml/decode.cu");
-const TO_BF16: &str = include_str!("ggml/to_bf16.cu");
-const DEC: &str = include_str!("ggml/dec.cu");
+mod dec;
+mod decode;
 
 pub fn emit_ggml() -> String {
-    format!("{DECODE}\n{TO_BF16}\n{DEC}\n")
+    format!("{}\n{}\n{}\n", decode::body(), super::quant::dequant_bf16("gg_dequant_bf16"), dec::body())
 }

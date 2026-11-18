@@ -1,4 +1,5 @@
-constexpr int GG_Q4K = 0;
+pub fn body() -> String {
+    r##"constexpr int GG_Q4K = 0;
 constexpr int GG_Q5K = 1;
 constexpr int GG_Q6K = 2;
 constexpr int GG_Q8 = 3;
@@ -355,4 +356,6 @@ extern "C" __global__ void gg_dequant_rows(const void* w, const unsigned* table,
     gg_load8(w, table, row, k, v);
 #pragma unroll
     for (int i = 0; i < 8; i++) out[(size_t)row * cols + k + i] = v[i];
+}
+"##.to_string()
 }

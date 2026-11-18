@@ -8,16 +8,6 @@ fn spec(file: &str) -> Spec {
 }
 
 const KIR_SNIPPETS: &[&str] = &[
-    "cuda/fp4_act.cu",
-    "cuda/fp4_batch.cu",
-    "cuda/fp4.cu",
-    "cuda/fp4_head.cu",
-    "cuda/fp8_act.cu",
-    "cuda/fp8_batch.cu",
-    "cuda/gemm.cu",
-    "cuda/ggml/dec.cu",
-    "cuda/ggml/decode.cu",
-    "cuda/ggml/to_bf16.cu",
     "cuda/moe.cu",
     "cuda/moe_mma.cu",
     "cuda/prelude.cu",
@@ -33,7 +23,7 @@ const KIR_SNIPPETS: &[&str] = &[
 ];
 
 
-const LIBRARY_ONLY: &[&str] = &["cuda/prelude.cu", "cuda/gemm.cu"];
+const LIBRARY_ONLY: &[&str] = &["cuda/prelude.cu"];
 
 const VERBATIM_LINEAR: &[(&str, &str)] = &[
     ("cuda/linear/common.rs", "device functions by design, shared by every linear family"),

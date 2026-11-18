@@ -61,8 +61,9 @@ fn time_fp4(spec_name: &str) {
         .map(|(name, s, template)| {
             let mut module = Module::generate(&s, 256).unwrap();
             if let Some(t) = template {
-                assert!(module.source.contains(kir::cuda::FP4_ACT));
-                module.source = module.source.replace(kir::cuda::FP4_ACT, &t);
+                let act = kir::cuda::fp4_act_source();
+                assert!(module.source.contains(&act));
+                module.source = module.source.replace(&act, &t);
             }
             let loaded = jit.load(&module).unwrap();
             (name, s, module, loaded)

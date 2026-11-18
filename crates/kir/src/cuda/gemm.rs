@@ -1,16 +1,20 @@
 use crate::gemm::{BATCH_KC, Fp4Gemv, Fp8Scale, GemmError, Kind, KernelInstance, Mainloop, WeightFormat};
 use crate::Language;
 
-pub const GEMM_CORE: &str = include_str!("gemm.cu");
-pub const FP4_CORE: &str = include_str!("fp4.cu");
-pub const FP4_ACT: &str = include_str!("fp4_act.cu");
-pub const FP8_ACT: &str = include_str!("fp8_act.cu");
-pub const FP4_BATCH: &str = include_str!("fp4_batch.cu");
-pub const FP8_BATCH: &str = include_str!("fp8_batch.cu");
-pub const FP4_HEAD: &str = include_str!("fp4_head.cu");
-const QUANT_FP4: &str = include_str!("quant_fp4.cu");
-const QUANT_FP8_BLOCK: &str = include_str!("quant_fp8_block.cu");
-const QUANT_FP8_TOKEN: &str = include_str!("quant_fp8_token.cu");
+mod core;
+mod fp4;
+mod fp4_act;
+mod fp4_batch;
+mod fp4_head;
+mod fp8_act;
+mod fp8_batch;
+pub mod prim;
+
+use super::quant;
+
+pub fn fp4_act_source() -> String {
+    fp4_act::body()
+}
 
 fn uses_fp4(k: &KernelInstance) -> bool {
     match k.kind {
@@ -33,28 +37,28 @@ pub fn needs_arch_features(kernels: &[KernelInstance]) -> bool {
 
 pub fn gemm_library(kernels: &[KernelInstance]) -> String {
     let any = |f: &dyn Fn(&KernelInstance) -> bool| kernels.iter().any(f);
-    let mut out = String::from(GEMM_CORE);
+    let mut out = core::body();
     let mut push = |s: &str| {
         out.push('\n');
         out.push_str(s);
     };
     if any(&|k| matches!(k.kind, Kind::Fp8Act { .. })) {
-        push(FP8_ACT);
+        push(&fp8_act::body());
     }
     if any(&uses_fp4) {
-        push(FP4_CORE);
+        push(&fp4::body());
     }
     if any(&|k| matches!(k.kind, Kind::Fp4Act { .. } | Kind::QuantFp4)) {
-        push(FP4_ACT);
+        push(&fp4_act::body());
     }
     if any(&|k| batch_of(k) == Some(WeightFormat::Fp4)) {
-        push(&format!("constexpr int F4B_KC = {BATCH_KC};\n{FP4_BATCH}"));
+        push(&format!("constexpr int F4B_KC = {BATCH_KC};\n{}", fp4_batch::body()));
     }
     if any(&|k| batch_of(k) == Some(WeightFormat::Fp8)) {
-        push(&format!("constexpr int F8B_KC = {BATCH_KC};\n{FP8_BATCH}"));
+        push(&format!("constexpr int F8B_KC = {BATCH_KC};\n{}", fp8_batch::body()));
     }
     if any(&|k| matches!(k.kind, Kind::HeadNormFp4 { .. })) {
-        push(FP4_HEAD);
+        push(&fp4_head::body());
     }
     out
 }
@@ -136,9 +140,9 @@ pub fn emit_gemm(k: &KernelInstance) -> Result<String, GemmError> {
             epi = shape.epi.cuda(),
             bias = shape.bias,
         ),
-        Kind::QuantFp8 { scale: Fp8Scale::Block } => format!("{QUANT_FP8_BLOCK}\n"),
-        Kind::QuantFp8 { scale: Fp8Scale::Channel } => format!("{QUANT_FP8_TOKEN}\n"),
-        Kind::QuantFp4 => format!("{QUANT_FP4}\n"),
+        Kind::QuantFp8 { scale: Fp8Scale::Block } => format!("{}\n", quant::quant_fp8(name, Fp8Scale::Block)),
+        Kind::QuantFp8 { scale: Fp8Scale::Channel } => format!("{}\n", quant::quant_fp8(name, Fp8Scale::Channel)),
+        Kind::QuantFp4 => format!("{}\n", quant::quant_fp4(name)),
         Kind::Gemv { op: Fp4Gemv::GateUpAct, .. } => format!(
             "extern \"C\" __global__ void __launch_bounds__(FP4_GEMV_THREADS) {name}(const void* w, const unsigned char* s, const float* x, const float* nw, float* out) {{\n    gate_up_act_norm<DecFp4>(w, s, x, nw, out);\n}}\n\n"
         ),

@@ -1,4 +1,8 @@
-constexpr int EPI_STORE = 0;
+use super::prim;
+
+pub fn body() -> String {
+    [
+        r##"constexpr int EPI_STORE = 0;
 constexpr int EPI_RESIDUAL = 1;
 constexpr int EPI_ACT = 2;
 
@@ -43,13 +47,9 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
     int m0 = (MFAST ? blockIdx.x : blockIdx.y) * BM;
     int n0 = (MFAST ? blockIdx.y : blockIdx.x) * BN;
     float acc[MI][NJ][4];
-#pragma unroll
-    for (int i = 0; i < MI; i++)
-#pragma unroll
-        for (int j = 0; j < NJ; j++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) acc[i][j][e] = 0.0f;
-    int last_row = max(tokens - 1, 0);
+"##.to_string(),
+        prim::zero_frag("acc", ("i", "MI"), ("j", "NJ"), 4),
+        r##"    int last_row = max(tokens - 1, 0);
     unsigned srow0[SCALED ? NJ : 1], srow1[SCALED ? NJ : 1];
     if (SCALED) {
 #pragma unroll
@@ -84,12 +84,9 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
             D::template load<K, BK, CPR, WROW>(ws, w, scales, r, n, kt, ck);
         }
     };
-#pragma unroll
-    for (int st = 0; st < STAGES - 1; st++) {
-        if (st < KT) load_stage(st, st);
-        cp_async_commit();
-    }
-    for (int kt = 0; kt < KT; kt++) {
+"##.to_string(),
+        prim::pipeline_prologue("KT", "load_stage(st, st)"),
+        r##"    for (int kt = 0; kt < KT; kt++) {
         cp_async_wait<STAGES - 2>();
         __syncthreads();
         int next = kt + STAGES - 1;
@@ -101,13 +98,9 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
         const unsigned char* ws = base + A_BYTES;
         float part[SPLIT ? MI : 1][SPLIT ? NJ : 1][4];
         if (SPLIT) {
-#pragma unroll
-            for (int i = 0; i < MI; i++)
-#pragma unroll
-                for (int j = 0; j < NJ; j++)
-#pragma unroll
-                    for (int e = 0; e < 4; e++) part[i][j][e] = 0.0f;
-        }
+"##.to_string(),
+        prim::zero_frag("part", ("i", "MI"), ("j", "NJ"), 12),
+        r##"        }
         float s0[NJ], s1[NJ];
 #pragma unroll
         for (int j = 0; j < NJ; j++) {
@@ -297,4 +290,8 @@ __device__ __forceinline__ void mma_e4m3(float* c, const unsigned* a, unsigned b
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 #endif
+}
+"##.to_string(),
+    ]
+    .concat()
 }

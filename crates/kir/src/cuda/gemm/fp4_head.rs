@@ -1,4 +1,5 @@
-template <int N, int K, int ROWS>
+pub fn body() -> String {
+    r##"template <int N, int K, int ROWS>
 __device__ __forceinline__ void head_norm_f4(const void* w, const unsigned char* s, const float* x, const float* nw, float* out) {
     static_assert(K == HIDDEN, "the head reads the normed hidden row");
     __shared__ __align__(16) float xt[K];
@@ -13,4 +14,6 @@ __device__ __forceinline__ void head_norm_f4(const void* w, const unsigned char*
 #pragma unroll
         for (int r = 0; r < ROWS; r++) out[row + r] = acc[r];
     }
+}
+"##.to_string()
 }

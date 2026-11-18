@@ -1,12 +1,17 @@
-struct DecGgml : DecBase<DecGgml> {
+use super::super::gemm::prim;
+
+pub fn body() -> String {
+    [
+        r##"struct DecGgml : DecBase<DecGgml> {
     static constexpr int PAIR = 2;
     static constexpr bool STRIDE = true;
     template <int K, int BK, int CPR, int WROW>
     static __device__ __forceinline__ void load(unsigned char* ws, const void* w, const void* s, int r, int n, int kt, int ck) {
         float v[8];
         gg_load8(w, (const unsigned*)s, n, kt * BK + ck * 8, v);
-        uint4 packed = make_uint4(bf16_bits_rn(v[0]) | (bf16_bits_rn(v[1]) << 16), bf16_bits_rn(v[2]) | (bf16_bits_rn(v[3]) << 16),
-                                  bf16_bits_rn(v[4]) | (bf16_bits_rn(v[5]) << 16), bf16_bits_rn(v[6]) | (bf16_bits_rn(v[7]) << 16));
+        uint4 packed = "##.to_string(),
+        prim::pack_bf16x8(34),
+        r##";
         *(uint4*)(ws + swz<CPR>(r, ck) * 16) = packed;
     }
     template <int K> static __device__ __forceinline__ float dot(const void* w, const void* s, int row, const float* x, int lane) {
@@ -38,3 +43,7 @@ struct DecGgml : DecBase<DecGgml> {
         return v[k & 7];
     }
 };
+"##.to_string(),
+    ]
+    .concat()
+}
