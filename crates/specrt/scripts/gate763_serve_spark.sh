@@ -33,9 +33,9 @@ if [ "$prefix" = on ]; then
     if grep -q '^\[runtime\]' "$spec"; then printf '[runtime.prefix_cache]\nenabled = true\n' >>"$spec"; else printf '\n[runtime]\n[runtime.prefix_cache]\nenabled = true\n' >>"$spec"; fi
 fi
 [ "$mtp" = off ] && sed -i 's/^speculate = true/speculate = false/' "$spec"
+run -p MemoryMax=20G cargo build --release --bin kvgate 2>&1 | tail -1
+run -p MemoryMax=20G cargo build --release -p inference-bench-cli --bin inference-bench 2>&1 | tail -1
 if [ ! -f "$out/tx$len.txt" ] || [ ! -f "$out/tx$warm.txt" ]; then
-    run -p MemoryMax=20G cargo build --release --bin kvgate 2>&1 | tail -1
-    run -p MemoryMax=20G cargo build --release -p inference-bench-cli --bin inference-bench 2>&1 | tail -1
     run "$target/release/kvgate" "$base" transcript "$len" "$out/tx$len.txt"
     run "$target/release/kvgate" "$base" transcript "$warm" "$out/tx$warm.txt"
 fi
