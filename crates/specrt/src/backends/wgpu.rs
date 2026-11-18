@@ -27,6 +27,7 @@ pub struct Wgpu {
     params: wgpu::Buffer,
     slot: u64,
     encoder: Option<wgpu::CommandEncoder>,
+    pass: Option<wgpu::ComputePass<'static>>,
     cache_dir: Option<PathBuf>,
     cache: Option<wgpu::PipelineCache>,
     cache_path: Option<PathBuf>,
@@ -114,7 +115,7 @@ impl Wgpu {
             }
             _ => (None, None),
         };
-        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, encoder: None, cache_dir, cache, cache_path })
+        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, encoder: None, pass: None, cache_dir, cache, cache_path })
     }
 
     pub fn info(&self) -> &wgpu::AdapterInfo {
@@ -300,9 +301,12 @@ impl Backend for Wgpu {
             .collect();
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.layout, entries: &entries });
         let pipeline = p.pipeline.clone();
-        let device = &self.device;
-        let encoder = self.encoder.get_or_insert_with(|| device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("specrt") }));
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("specrt"), timestamp_writes: None });
+        if self.pass.is_none() {
+            let device = &self.device;
+            let encoder = self.encoder.get_or_insert_with(|| device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("specrt") }));
+            self.pass = Some(encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("specrt"), timestamp_writes: None }).forget_lifetime());
+        }
+        let pass = self.pass.as_mut().expect("a compute pass is open");
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(grid[0], grid[1], grid[2]);
@@ -311,6 +315,7 @@ impl Backend for Wgpu {
 
     fn submit(&mut self) -> Result<()> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        self.pass = None;
         if let Some(e) = self.encoder.take() {
             self.queue.submit([e.finish()]);
         }
