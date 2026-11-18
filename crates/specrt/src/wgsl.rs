@@ -41,6 +41,7 @@ pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static s
         Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => anyhow::bail!("delta-net is not yet on wgpu"),
         Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => anyhow::bail!("MTP is not yet on wgpu"),
         Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => anyhow::bail!("mixture of experts is not yet on wgpu"),
+        Op::AllReduce | Op::AllReduceNorm { .. } => anyhow::bail!("tensor parallel is not on wgpu"),
     })
 }
 

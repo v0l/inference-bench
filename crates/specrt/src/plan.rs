@@ -26,6 +26,7 @@ pub enum Buf {
     Logits,
     FcPlanes,
     MtpLogits,
+    Partial,
 }
 
 impl Buf {
@@ -47,6 +48,7 @@ impl Buf {
             Buf::Logits => "logits",
             Buf::FcPlanes => "fc planes",
             Buf::MtpLogits => "draft logits",
+            Buf::Partial => "rank partial",
         }
     }
 }
@@ -197,6 +199,8 @@ pub enum Op {
     MoeRoute,
     MoeExperts,
     MoeCombine,
+    AllReduce,
+    AllReduceNorm { which: NormKind },
 }
 
 pub fn weight_kind(q: Quant) -> WeightKind {
@@ -241,6 +245,8 @@ impl Op {
             Op::MoeRoute => "router".into(),
             Op::MoeExperts => "experts".into(),
             Op::MoeCombine => "combine".into(),
+            Op::AllReduce => "allreduce".into(),
+            Op::AllReduceNorm { .. } => "allreduce, add and norm".into(),
         }
     }
 
@@ -267,6 +273,8 @@ impl Op {
             Op::MoeRoute => "x to top-k experts".into(),
             Op::MoeExperts => "x and top-k to expert outputs".into(),
             Op::MoeCombine => "expert outputs to x".into(),
+            Op::AllReduce => "rank partials summed into x".into(),
+            Op::AllReduceNorm { .. } => "rank partials summed into x, x to xn planes".into(),
         }
     }
 
@@ -364,6 +372,8 @@ impl Op {
             Op::MoeRoute => names(&["moe_route_logits", "moe_route"]),
             Op::MoeExperts => names(&["moe_up_bf16", "moe_down_bf16"]),
             Op::MoeCombine => names(&["moe_combine"]),
+            Op::AllReduce => names(&["ar_one_shot_f32", "ar_two_shot_f32"]),
+            Op::AllReduceNorm { .. } => names(&["ar_add_rmsnorm_f32"]),
         }
     }
 }
@@ -391,6 +401,18 @@ impl Plan {
         crate::graph::Graph::decoder().plan(spec, phase, tensor_core).expect("the embedded decoder graph lowers")
     }
 
+    pub fn for_tp(mut self, shards: &std::collections::BTreeMap<String, crate::tp::Shard>, fuse: bool) -> Plan {
+        let rewrite = |ops: &[Op]| tp_ops(ops, shards, fuse);
+        for b in &mut self.blocks {
+            b.ops = rewrite(&b.ops);
+        }
+        self.head = rewrite(&self.head);
+        self.tail = rewrite(&self.tail);
+        self.mtp = rewrite(&self.mtp);
+        self.mtp_head = rewrite(&self.mtp_head);
+        self
+    }
+
     pub fn layer(&self, block: Block) -> &[Op] {
         self.layer_of(block, false)
     }
@@ -404,6 +426,28 @@ impl Plan {
     }
 }
 
+fn tp_ops(ops: &[Op], shards: &std::collections::BTreeMap<String, crate::tp::Shard>, fuse: bool) -> Vec<Op> {
+    let mut out = Vec::with_capacity(ops.len() + 4);
+    let mut i = 0;
+    while i < ops.len() {
+        match ops[i] {
+            Op::Linear { weight, quant, input, output: Buf::X } if shards.get(weight.name()).is_some_and(|s| s.needs_allreduce()) => {
+                out.push(Op::Linear { weight, quant, input, output: Buf::Partial });
+                match ops.get(i + 1) {
+                    Some(Op::Norm { which, into: Buf::XnPlanes }) if fuse => {
+                        out.push(Op::AllReduceNorm { which: *which });
+                        i += 1;
+                    }
+                    _ => out.push(Op::AllReduce),
+                }
+            }
+            op => out.push(op),
+        }
+        i += 1;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +456,49 @@ mod tests {
 
     fn fixtures() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    fn tp_plan(fuse: bool) -> Plan {
+        let json = std::fs::read_to_string(fixtures().join("qwen3.8-27b.config.json")).unwrap();
+        let spec = Spec::from_hf_config_serving(&json).unwrap();
+        let shards = crate::graph::Graph::decoder().shards().unwrap();
+        Plan::build(&spec, Phase::Decode, true).for_tp(&shards, fuse)
+    }
+
+    #[test]
+    fn every_row_parallel_linear_is_followed_by_an_allreduce() {
+        let plan = tp_plan(false);
+        for block in [Block::Linear, Block::Full] {
+            let ops = plan.layer(block);
+            let partials = ops.iter().filter(|o| matches!(o, Op::Linear { output: Buf::Partial, .. })).count();
+            assert_eq!(partials, 2, "{block:?}: mixer out and down");
+            assert_eq!(ops.iter().filter(|o| **o == Op::AllReduce).count(), 2);
+            for (i, o) in ops.iter().enumerate() {
+                if matches!(o, Op::Linear { output: Buf::Partial, .. }) {
+                    assert_eq!(ops[i + 1], Op::AllReduce);
+                }
+            }
+            assert!(!ops.iter().any(|o| matches!(o, Op::Linear { output: Buf::X, .. })), "no row linear writes x directly");
+        }
+        assert_eq!(plan.mtp.iter().filter(|o| **o == Op::AllReduce).count(), 2, "the draft layer is sharded too");
+        assert!(plan.tail.iter().all(|o| !matches!(o, Op::AllReduce | Op::AllReduceNorm { .. })), "the head is replicated");
+    }
+
+    #[test]
+    fn the_allreduce_fuses_with_the_next_norm_when_asked() {
+        let plan = tp_plan(true);
+        let ops = plan.layer(Block::Full);
+        assert!(ops.contains(&Op::AllReduceNorm { which: NormKind::PostAttention }));
+        assert!(!ops.iter().any(|o| matches!(o, Op::Norm { which: NormKind::PostAttention, .. })));
+        assert_eq!(ops.last(), Some(&Op::AllReduce), "down has no norm after it inside the layer");
+    }
+
+    #[test]
+    fn tp_one_plans_are_untouched() {
+        let json = std::fs::read_to_string(fixtures().join("qwen3.8-27b.config.json")).unwrap();
+        let spec = Spec::from_hf_config_serving(&json).unwrap();
+        let plain = Plan::build(&spec, Phase::Decode, true);
+        assert_eq!(plain.clone().for_tp(&Default::default(), true), plain);
     }
 
     fn described(config: &str, header: &str) -> (Spec, Structure) {

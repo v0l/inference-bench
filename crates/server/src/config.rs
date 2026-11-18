@@ -152,6 +152,7 @@ pub struct ServerConfig {
     pub min_prefill_tokens: Option<usize>,
     pub swap_space_gb: Option<f64>,
     pub admit_lookahead: Option<usize>,
+    pub tp: Option<usize>,
     pub watchdog_secs: u64,
     pub reload_failed_models: bool,
     pub runtime: Option<inference_bench_core::specrt_serve::RuntimeOptions>,
@@ -209,6 +210,7 @@ impl Default for ServerConfig {
             min_prefill_tokens: None,
             swap_space_gb: None,
             admit_lookahead: None,
+            tp: None,
             watchdog_secs: 60,
             reload_failed_models: true,
             runtime: None,            speculative: Default::default(),
@@ -369,6 +371,7 @@ impl ServerConfig {
             progress: None,
             watchdog: (self.watchdog_secs > 0).then(|| std::time::Duration::from_secs(self.watchdog_secs)),
             sessions: Some(self.sessions.clone()),
+            tp: self.tp.unwrap_or(d.tp),
         })
     }
 

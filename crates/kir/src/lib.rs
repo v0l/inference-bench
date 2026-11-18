@@ -1,5 +1,6 @@
 #[cfg(feature = "cuda")]
 pub mod cuda;
+pub mod allreduce;
 pub mod attention;
 pub mod gemm;
 pub mod gemv;

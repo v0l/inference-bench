@@ -23,6 +23,10 @@ impl Plans {
 }
 
 impl Plans {
+    pub fn for_tp(self, shards: &std::collections::BTreeMap<String, crate::tp::Shard>, fuse: bool) -> Self {
+        Plans { prefill: self.prefill.for_tp(shards, fuse), decode: self.decode.for_tp(shards, fuse), verify: self.verify.for_tp(shards, fuse) }
+    }
+
     pub fn for_stage(mut self, role: super::StageRole) -> Self {
         for plan in [&mut self.prefill, &mut self.decode, &mut self.verify] {
             if !role.first {
@@ -96,7 +100,25 @@ impl Runtime {
             Op::MoeRoute => self.moe_route(layer.expect("moe runs inside a layer"), &self.pre.x, n),
             Op::MoeExperts => self.moe_experts(layer.expect("moe runs inside a layer"), n),
             Op::MoeCombine => self.moe_combine(&self.pre.x, n),
+            Op::AllReduce => self.allreduce_op(n),
+            Op::AllReduceNorm { which } => self.allreduce_norm_op(which, layer, n),
         }
+    }
+
+    fn comm(&self) -> &crate::allreduce::Comm {
+        self.comm.as_ref().expect("allreduce ops run on a tensor parallel rank")
+    }
+
+    fn allreduce_op(&self, rows: usize) -> Result<()> {
+        let n = rows * self.spec.dims.hidden;
+        self.comm().add_into(&self.stream, &self.partial.slice(..n), &self.pre.x.slice(..n), n)
+    }
+
+    fn allreduce_norm_op(&self, which: NormKind, layer: Option<&DeviceLayer>, rows: usize) -> Result<()> {
+        let n = rows * self.spec.dims.hidden;
+        let weight = self.norm_weight(which, layer);
+        let planes = &self.pre.xn_planes;
+        self.comm().allreduce_add_norm(&self.stream, &self.partial.slice(..n), &self.pre.x.slice(..n), weight, &planes.hi.slice(..n), &planes.lo.slice(..n), rows)
     }
 
     fn attn_of<'a>(&self, layer: Option<&'a DeviceLayer>) -> &'a DeviceAttn {
@@ -235,6 +257,7 @@ impl Runtime {
             Buf::PreBa => &gdn().pre_ba,
             Buf::Logits => run.logits,
             Buf::MtpLogits => self.mtp_logits(),
+            Buf::Partial => &self.partial,
             other => unreachable!("{} is not an f32 buffer", other.label()),
         }
     }

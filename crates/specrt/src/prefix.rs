@@ -66,6 +66,32 @@ impl StateSnapshot {
     pub fn bytes(&self) -> usize {
         self.total * 4
     }
+
+    pub fn stacked(parts: Vec<StateSnapshot>) -> StateSnapshot {
+        let mut all = vec![parts.len() as f32];
+        for p in &parts {
+            all.extend([p.conv_len as f32, p.ssm_len as f32, (p.total - p.conv_len - p.ssm_len) as f32]);
+        }
+        for p in &parts {
+            all.extend_from_slice(p.floats());
+        }
+        let total = all.len();
+        StateSnapshot { store: Store::Host(all), conv_len: 0, ssm_len: 0, total }
+    }
+
+    pub fn unstack(&self, ranks: usize) -> anyhow::Result<Vec<StateSnapshot>> {
+        let f = self.floats();
+        anyhow::ensure!(!f.is_empty() && f[0] as usize == ranks, "the snapshot was taken over {} ranks, not {ranks}", f.first().copied().unwrap_or(0.0));
+        let mut at = 1 + 3 * ranks;
+        let mut out = Vec::with_capacity(ranks);
+        for r in 0..ranks {
+            let (c, s, p) = (f[1 + 3 * r] as usize, f[2 + 3 * r] as usize, f[3 + 3 * r] as usize);
+            let part = &f[at..at + c + s + p];
+            out.push(StateSnapshot::new(part[..c].to_vec(), part[c..c + s].to_vec(), part[c + s..].to_vec()));
+            at += c + s + p;
+        }
+        Ok(out)
+    }
 }
 
 impl std::fmt::Debug for StateSnapshot {

@@ -62,6 +62,7 @@ pub struct ServeOptions {
     pub progress: Option<crate::progress::Sink>,
     pub watchdog: Option<Duration>,
     pub sessions: Option<crate::sessions::SessionOptions>,
+    pub tp: usize,
 }
 
 impl Default for ServeOptions {
@@ -83,6 +84,7 @@ impl Default for ServeOptions {
             progress: None,
             watchdog: Some(Duration::from_secs(60)),
             sessions: None,
+            tp: 1,
         }
     }
 }
@@ -518,6 +520,22 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
             return Ok(());
         }
     };
+    if opts.tp > 1 {
+        if pipelined.is_some() {
+            let _ = ready.send(Err(anyhow::anyhow!("serve.tp = {} with a multi-stage [placement] is not supported; use one or the other", opts.tp)));
+            return Ok(());
+        }
+        match build_tp(spec, &opts) {
+            Ok(mut sched) => {
+                let _ = ready.send(Ok(false));
+                run(&mut sched, inbox, stats, pulse);
+            }
+            Err(e) => {
+                let _ = ready.send(Err(e));
+            }
+        }
+        return Ok(());
+    }
     match pipelined {
         Some((placement, micro_batch)) => match build_pipeline(spec, &opts, &placement, micro_batch) {
             Ok(mut sched) => {
@@ -601,6 +619,32 @@ fn build_remote(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::rem
     }
     let mut cfg = serving_config(&spec, opts);
     cfg.prefix_cache.enabled = false;
+    Ok(Scheduler::new(exec, cfg))
+}
+
+pub fn tp_devices(tp: usize, available: usize) -> Result<Vec<usize>> {
+    anyhow::ensure!(tp <= available, "serve.tp = {tp} needs {tp} CUDA devices, {available} are visible");
+    Ok((0..tp).collect())
+}
+
+fn build_tp(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::tp_exec::TpExecutor>> {
+    let mut spec = spec.clone();
+    if let Some(r) = &opts.runtime {
+        spec.runtime = r.clone();
+    }
+    opts.speculative.apply(&mut spec)?;
+    let spec = &spec;
+    let rank_spec = crate::tp::rank_spec(spec, opts.tp)?;
+    let mut layout = opts.layout(&rank_spec);
+    if let Some(bytes) = opts.kv_cache_bytes {
+        layout.kv_blocks = ((bytes as usize / opts.tp) / kv_block_bytes(&rank_spec, 1)).max(1);
+    }
+    let count = cudarc::driver::CudaContext::device_count()? as usize;
+    let devices = tp_devices(opts.tp, count)?;
+    let exec = crate::tp_exec::TpExecutor::load(spec, layout, &devices)?;
+    check_pool_tokens(exec.kv_blocks() * crate::codegen::PAGE, layout.max_ctx)?;
+    tracing::info!(spec = %spec.name, tp = opts.tp, devices = ?devices, max_model_len = layout.max_ctx, max_num_seqs = layout.slots, kv_blocks = exec.kv_blocks(), "tensor parallel serving layout");
+    let cfg = serving_config(spec, opts);
     Ok(Scheduler::new(exec, cfg))
 }
 

@@ -123,6 +123,8 @@ pub struct Checkpoint {
     shards: std::sync::Arc<Vec<Shard>>,
     names: std::sync::Arc<HashMap<String, usize>>,
     staged: Option<crate::loader::Batch>,
+    cut: Option<std::sync::Arc<crate::tp::RankCut>>,
+    owned: std::sync::Arc<std::sync::Mutex<Vec<Box<[u8]>>>>,
     pub files: Vec<PathBuf>,
 }
 
@@ -150,7 +152,7 @@ fn shard_files(dir: &Path) -> Result<Vec<PathBuf>> {
 impl Checkpoint {
     pub fn open(dir: &Path) -> Result<Self> {
         if dir.extension().is_some_and(|e| e == "gguf") {
-            return Ok(Checkpoint { gguf: Some(std::sync::Arc::new(Gguf::open(dir)?)), shards: Default::default(), names: Default::default(), staged: None, files: vec![dir.to_path_buf()] });
+            return Ok(Checkpoint { gguf: Some(std::sync::Arc::new(Gguf::open(dir)?)), shards: Default::default(), names: Default::default(), staged: None, cut: None, owned: Default::default(), files: vec![dir.to_path_buf()] });
         }
         let files = shard_files(dir)?;
         let mut shards = Vec::with_capacity(files.len());
@@ -167,7 +169,23 @@ impl Checkpoint {
             }
             shards.push(Shard { map, data_start: 8 + header, meta });
         }
-        Ok(Checkpoint { gguf: None, shards: std::sync::Arc::new(shards), names: std::sync::Arc::new(names), staged: None, files })
+        Ok(Checkpoint { gguf: None, shards: std::sync::Arc::new(shards), names: std::sync::Arc::new(names), staged: None, cut: None, owned: Default::default(), files })
+    }
+
+    pub fn for_rank(&self, cut: crate::tp::RankCut) -> Result<Checkpoint> {
+        ensure!(self.gguf.is_none(), "tp does not slice GGUF checkpoints");
+        Ok(Checkpoint { cut: Some(std::sync::Arc::new(cut)), owned: Default::default(), ..self.with_staged(None) })
+    }
+
+    pub fn rank_cut(&self) -> Option<&crate::tp::RankCut> {
+        self.cut.as_deref()
+    }
+
+    fn keep(&self, bytes: Vec<u8>) -> &[u8] {
+        let boxed = bytes.into_boxed_slice();
+        let (ptr, len) = (boxed.as_ptr(), boxed.len());
+        self.owned.lock().unwrap().push(boxed);
+        unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 
     pub fn for_repo(repo: &str) -> Result<Self> {
@@ -185,6 +203,20 @@ impl Checkpoint {
     }
 
     pub fn view(&self, name: &str) -> Result<View<'_>> {
+        let full = self.full_view(name)?;
+        let Some(cut) = self.cut.as_deref() else { return Ok(full) };
+        let Some(rule) = cut.rule(name, &full.shape)? else { return Ok(full) };
+        let elem = full.dtype.size();
+        let (shape, bytes) = crate::tp::cut_bytes(full.data, &full.shape, elem, &rule).with_context(|| format!("slicing {name} for rank {}", cut.rank))?;
+        Ok(View { dtype: full.dtype, shape, data: match bytes { std::borrow::Cow::Borrowed(b) => b, std::borrow::Cow::Owned(v) => self.keep(v) } })
+    }
+
+    pub fn shape_of(&self, name: &str) -> Result<Vec<usize>> {
+        let &i = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+        Ok(self.shards[i].meta.info(name).context("tensor info")?.shape.clone())
+    }
+
+    fn full_view(&self, name: &str) -> Result<View<'_>> {
         let &i = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
         let shard = &self.shards[i];
         let info = shard.meta.info(name).context("tensor info")?;
@@ -270,7 +302,7 @@ impl Checkpoint {
     }
 
     pub fn with_staged(&self, batch: Option<crate::loader::Batch>) -> Checkpoint {
-        Checkpoint { gguf: self.gguf.clone(), shards: self.shards.clone(), names: self.names.clone(), staged: batch, files: self.files.clone() }
+        Checkpoint { gguf: self.gguf.clone(), shards: self.shards.clone(), names: self.names.clone(), staged: batch, cut: self.cut.clone(), owned: Default::default(), files: self.files.clone() }
     }
 
     pub fn release(&self) {
@@ -1266,7 +1298,7 @@ mod tests {
         let m = spec.moe.as_ref().unwrap();
         assert_eq!((m.experts, m.top_k(), m.expert_intermediate, m.shared_intermediate, m.shared_gate), (e, 2, inter, inter, true));
         spec.check_moe_runnable().unwrap();
-        let ck = Checkpoint { gguf: Some(std::sync::Arc::new(g)), shards: Default::default(), names: Default::default(), staged: None, files: Vec::new() };
+        let ck = Checkpoint { gguf: Some(std::sync::Arc::new(g)), shards: Default::default(), names: Default::default(), staged: None, cut: None, owned: Default::default(), files: Vec::new() };
         let w = ck.moe_layer(&spec, "model.layers.0", Quant::Bf16).unwrap();
         let Stacked::Bf16(gate) = &w.gate else { panic!("bf16 stack") };
         assert_eq!(gate.len(), (e + 1) * inter * h);

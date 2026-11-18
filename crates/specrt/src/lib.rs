@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments, clippy::large_enum_variant, clippy::type_complexity, clippy::needless_range_loop, clippy::chunks_exact_to_as_chunks)]
 
+pub mod allreduce;
 pub mod anatomy;
 pub mod backends;
 pub mod wgsl;
@@ -40,6 +41,8 @@ pub mod runtime;
 pub mod sched;
 pub mod serve;
 pub mod sessions;
+pub mod tp;
+pub mod tp_exec;
 pub mod spec;
 pub mod stage;
 pub mod statepool;

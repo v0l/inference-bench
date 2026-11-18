@@ -670,6 +670,8 @@ pub struct Runtime {
     mm_bidi: CudaSlice<i32>,
     media: Vec<Option<MediaDevice>>,
     vision: Option<Arc<crate::media_encode::MediaEncoder>>,
+    partial: CudaSlice<f32>,
+    comm: Option<crate::allreduce::Comm>,
 }
 
 struct MediaDevice {
@@ -787,10 +789,34 @@ impl Runtime {
     }
 
     pub fn load_stage(spec: &Spec, layout: Layout, range: StageRange) -> Result<Self> {
+        Self::load_inner(spec, layout, range, None)
+    }
+
+    pub fn chunk_rows(layout: &Layout) -> usize {
+        layout.max_ctx.min(layout.prefill_chunk).max(layout.slots) + crate::runtime::step::row_capacity(layout.slots)
+    }
+
+    pub fn load_rank(spec: &Spec, layout: Layout, device: usize, rank: usize, fabric: &crate::allreduce::Fabric) -> Result<Self> {
+        let range = StageRange { device, ..StageRange::whole(spec) };
+        Self::load_inner(spec, layout, range, Some((fabric.ranks(), rank, fabric)))
+    }
+
+    pub fn tp_rank(&self) -> Option<(usize, usize)> {
+        self.comm.as_ref().map(|c| (c.ranks(), c.rank()))
+    }
+
+    fn load_inner(spec: &Spec, layout: Layout, range: StageRange, tp: Option<(usize, usize, &crate::allreduce::Fabric)>) -> Result<Self> {
         let resolved = crate::engine::apply_rope_extension(spec)?;
         range.check(&resolved)?;
         let role = StageRole::of(&resolved, range);
-        let staged = if role.whole() { resolved.clone() } else { resolved.stage(range.start, range.end) };
+        let full = if role.whole() { resolved.clone() } else { resolved.stage(range.start, range.end) };
+        let staged = match tp {
+            Some((n, _, _)) => {
+                ensure!(role.whole(), "a tensor parallel rank runs every layer");
+                crate::tp::rank_spec(&full, n)?
+            }
+            None => full.clone(),
+        };
         let spec = &staged;
         ensure!(layout.slots >= 1, "need at least one slot");
         let layout = if spec.runtime.kv_dtype.is_fp8() { Layout { kv_planes: 1, ..layout } } else { layout };
@@ -802,7 +828,12 @@ impl Runtime {
         let free_before = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
-        let jit = Jit::new(ctx.clone(), spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir))?;
+        let cache_dir = spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
+        let jit = Jit::new(ctx.clone(), cache_dir.clone())?;
+        let comm = match tp {
+            Some((_, rank, fabric)) => Some(fabric.comm(rank, &stream, cache_dir, Some((spec.dims.hidden as u32, spec.norm.eps as f32)))?),
+            None => None,
+        };
         let target = crate::codegen::cuda_target(&ctx)?;
         let module = Module::generate_kv(spec, max_ctx, layout.kv_planes, &target)?;
         crate::progress::report(crate::progress::Stage::Kernels, 0, 1);
@@ -826,7 +857,10 @@ impl Runtime {
         let smem = module.smem.clone();
         let linear_tuning = LinearTuning::for_target(&target);
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
-        let checkpoint = Checkpoint::for_repo(&spec.repo)?;
+        let checkpoint = match tp {
+            Some((n, rank, _)) => Checkpoint::for_repo(&spec.repo)?.for_rank(crate::tp::RankCut::new(&full, crate::graph::Graph::decoder(), n, rank)?)?,
+            None => Checkpoint::for_repo(&spec.repo)?,
+        };
         let weights_started = Instant::now();
         let Weights { layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct } =
             load_weights(&ctx, &stream, &checkpoint, spec, range, role)?;
@@ -845,6 +879,7 @@ impl Runtime {
             use_mma || (spec.lm_head_quant() != crate::spec::Quant::Nvfp4G16 && spec.draft_head_quant() != Some(crate::spec::Quant::Nvfp4G16)),
             "head_quant = \"nvfp4_g16\" needs the tensor-core prefill path (an Ampere or newer GPU and [runtime] gemm_fp32 = false)"
         );
+        ensure!(use_mma || tp.is_none(), "tensor parallel needs the tensor core path (an Ampere or newer GPU and [runtime] gemm_fp32 = false)");
         let mma_only = |n: usize| if use_mma { 1 } else { n };
         let buf = Buffers {
             x: stream.alloc_zeros(d.hidden)?,
@@ -948,7 +983,12 @@ impl Runtime {
             sms,
             target,
             use_mma,
-            plans: Plans::build(spec, use_mma).for_stage(role),
+            plans: match tp {
+                Some(_) => Plans::build(spec, use_mma).for_stage(role).for_tp(&crate::graph::Graph::decoder().shards()?, spec.runtime.fuse),
+                None => Plans::build(spec, use_mma).for_stage(role),
+            },
+            partial: stream.alloc_zeros(if tp.is_some() { chunk * d.hidden } else { 1 })?,
+            comm,
             role,
             spec: spec.clone(),
             max_ctx,
@@ -1955,6 +1995,7 @@ impl Runtime {
         chunked: bool,
         on_tokens: &mut dyn FnMut(&[u32]) -> bool,
     ) -> Result<Generation> {
+        ensure!(self.comm.is_none(), "a tensor parallel rank generates through the scheduler, not the single stream loop");
         ensure!(!prompt.is_empty() && new_tokens > 0, "empty prompt or nothing to generate");
         ensure!(
             prompt.len() + new_tokens <= self.max_ctx,

@@ -2,7 +2,7 @@ use crate::spec::Spec;
 use crate::vision::VisionConfig;
 use crate::vision_encoder::VisionOp;
 use crate::plan::{Buf, QuantSource, NormKind, Op, Phase, Plan, PlanBlock, Weight};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -13,6 +13,8 @@ pub struct Node {
     pub weight: Option<String>,
     #[serde(default)]
     pub quant: Option<String>,
+    #[serde(default)]
+    pub shard: Option<String>,
     #[serde(default, rename = "in")]
     pub input: Option<String>,
     #[serde(default)]
@@ -255,6 +257,19 @@ impl Graph {
             ops.push(vision_op(n, 0, None)?);
         }
         Ok(ops)
+    }
+
+    pub fn shards(&self) -> Result<std::collections::BTreeMap<String, crate::tp::Shard>> {
+        let mut out = std::collections::BTreeMap::new();
+        let nodes = self.head.iter().chain(self.block.iter().flat_map(|b| b.node.iter())).chain(&self.tail).chain(&self.mtp).chain(&self.mtp_head);
+        for n in nodes.filter(|n| n.op == "linear") {
+            let (Some(w), Some(s)) = (&n.weight, &n.shard) else { bail!("linear node {:?} declares no shard", n.weight) };
+            let shard = crate::tp::Shard::parse(s)?;
+            if let Some(old) = out.insert(w.clone(), shard) {
+                ensure!(old == shard, "weight {w} is sharded two ways");
+            }
+        }
+        Ok(out)
     }
 
     pub fn decoder() -> &'static Graph {
