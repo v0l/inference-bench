@@ -441,6 +441,10 @@ fn tp_ops(ops: &[Op], shards: &std::collections::BTreeMap<String, crate::tp::Sha
                     _ => out.push(Op::AllReduce),
                 }
             }
+            Op::MoeCombine if !shards.is_empty() => {
+                out.push(Op::MoeCombine);
+                out.push(Op::AllReduce);
+            }
             op => out.push(op),
         }
         i += 1;

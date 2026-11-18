@@ -194,10 +194,21 @@ fn mtp_speculation_under_tp_emits_the_tp1_greedy_tokens() {
 }
 
 #[test]
-fn moe_specs_are_refused_with_a_reason() {
+#[ignore = "needs a CUDA GPU"]
+fn moe_tp_matches_tp1_on_virtual_ranks() {
+    check("tiny-qwen3.5-moe", false, &[2]);
+    check("tiny-qwen3.5-moe-fp8", false, &[2]);
+}
+
+#[test]
+fn moe_specs_split_every_expert_and_refuse_widths_that_do_not_divide() {
     let s = spec_for("tiny-qwen3.5-moe", false);
-    let e = specrt::tp::supports(&s, 2).unwrap_err().to_string();
-    assert!(e.contains("mixture of experts"), "{e}");
+    specrt::tp::supports(&s, 2).unwrap();
+    let r = specrt::tp::rank_spec(&s, 2).unwrap();
+    assert_eq!(r.moe.as_ref().unwrap().expert_intermediate, s.moe.as_ref().unwrap().expert_intermediate / 2);
+    let mut odd = s.clone();
+    odd.moe.as_mut().unwrap().expert_intermediate = 272;
+    assert!(specrt::tp::supports(&odd, 2).unwrap_err().to_string().contains("expert"));
 }
 
 #[test]

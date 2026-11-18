@@ -99,7 +99,7 @@ impl Runtime {
             Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => self.mtp_op(op, run),
             Op::MoeRoute => self.moe_route(layer.expect("moe runs inside a layer"), &self.pre.x, n),
             Op::MoeExperts => self.moe_experts(layer.expect("moe runs inside a layer"), n),
-            Op::MoeCombine => self.moe_combine(&self.pre.x, n),
+            Op::MoeCombine => self.moe_combine(if self.comm.is_some() { &self.partial } else { &self.pre.x }, n),
             Op::AllReduce => self.allreduce_op(n),
             Op::AllReduceNorm { which } => self.allreduce_norm_op(which, layer, n),
         }

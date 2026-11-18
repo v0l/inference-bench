@@ -146,7 +146,9 @@ pub fn supports(spec: &Spec, tp: usize) -> Result<()> {
     ensure!(spec.dims.intermediate.is_multiple_of(tp), "tp {tp} does not divide the intermediate size {} of {}", spec.dims.intermediate, spec.name);
     if tp > 1 {
         crate::allreduce::bail_unsupported(tp)?;
-        ensure!(spec.moe.is_none(), "tp over mixture of experts models is not built yet ({})", spec.name);
+        if let Some(m) = &spec.moe {
+            moe_split(spec, m, tp)?;
+        }
         ensure!(spec.runtime.backend != crate::spec::BackendChoice::Wgpu, "tp runs on CUDA only");
         ensure!(spec.quant != crate::spec::Quant::Gguf, "tp does not slice GGUF weights yet ({})", spec.name);
         ensure!(!spec.uses_branch(), "tp does not cover sandwich or scaled residual norms yet ({})", spec.name);
@@ -167,6 +169,20 @@ pub fn supports(spec: &Spec, tp: usize) -> Result<()> {
     Ok(())
 }
 
+fn moe_split(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<()> {
+    for (what, n) in [("expert intermediate size", m.expert_intermediate), ("shared expert intermediate size", m.shared_intermediate)] {
+        ensure!(n % tp == 0, "tp {tp} does not divide the {what} {n} of {}", spec.name);
+        ensure!((n / tp) % 16 == 0, "tp {tp} leaves {} {what} columns per rank in {}, which is not a multiple of 16", n / tp, spec.name);
+    }
+    let per_rank = m.expert_intermediate / tp;
+    match spec.mlp.quant.unwrap_or(spec.quant) {
+        crate::spec::Quant::Nvfp4G16 => ensure!(per_rank % 256 == 0, "tp {tp} leaves {per_rank} nvfp4 expert columns per rank in {}, which must be a multiple of 256", spec.name),
+        crate::spec::Quant::Fp8Block128 => ensure!(per_rank % FP8_BLOCK == 0, "tp {tp} cuts fp8 128 blocks in the experts of {}", spec.name),
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn rank_spec(spec: &Spec, tp: usize) -> Result<Spec> {
     supports(spec, tp)?;
     if tp == 1 {
@@ -177,6 +193,10 @@ pub fn rank_spec(spec: &Spec, tp: usize) -> Result<Spec> {
     s.attention.heads = h.attention;
     s.attention.kv_heads = h.kv;
     s.dims.intermediate = spec.dims.intermediate / tp;
+    if let Some(m) = s.moe.as_mut() {
+        m.expert_intermediate /= tp;
+        m.shared_intermediate /= tp;
+    }
     if let Some(l) = s.linear_attention.as_mut() {
         l.key_heads = h.key;
         l.value_heads = h.value;
@@ -196,6 +216,17 @@ pub struct RankCut {
     pub rank: usize,
     pub tp: usize,
     pub rules: Vec<(String, Cut)>,
+}
+
+fn expert_pattern(rest: &str) -> String {
+    if let Some(tail) = rest.strip_prefix("mlp.experts.")
+        && let Some((index, after)) = tail.split_once('.')
+        && !index.is_empty()
+        && index.bytes().all(|b| b.is_ascii_digit())
+    {
+        return format!("mlp.experts.*.{after}");
+    }
+    rest.to_string()
 }
 
 fn heads_cut(heads: usize, head_rows: usize, tp: usize, rank: usize) -> Cut {
@@ -242,6 +273,14 @@ impl RankCut {
         if shard("down") == Shard::Row {
             add("mlp.down_proj", colcut(d.intermediate));
         }
+        if let Some(m) = &spec.moe {
+            let inter = m.expert_intermediate;
+            for expert in ["mlp.experts.*", "mlp.shared_expert"] {
+                add(&format!("{expert}.gate_proj"), rowcut(inter));
+                add(&format!("{expert}.up_proj"), rowcut(inter));
+                add(&format!("{expert}.down_proj"), colcut(inter));
+            }
+        }
         if let Some(l) = &spec.linear_attention {
             let key = l.key_heads * l.key_head_dim;
             let value = l.value_dim();
@@ -273,6 +312,7 @@ impl RankCut {
             return Ok(None);
         }
         let Some(rest) = name.split_once(".layers.").and_then(|(_, r)| r.split_once('.')).map(|(_, r)| r) else { return Ok(None) };
+        let rest = &expert_pattern(rest);
         if let Some(c) = self.find(rest) {
             return Ok(Some(c.clone()));
         }
@@ -463,6 +503,34 @@ mod tests {
     }
 
     #[test]
+    fn moe_fixtures_cut_every_expert_and_leave_the_router_whole() {
+        for f in ["tiny-qwen3.5-moe", "tiny-qwen3.5-moe-fp8"] {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(f);
+            let s = spec(&format!("{f}/config.json"));
+            let full = crate::weights::Checkpoint::open(&dir).unwrap();
+            let root = full.root();
+            let names = full.names_under(&format!("{root}.layers."));
+            let ranks: Vec<_> = (0..2).map(|r| full.for_rank(RankCut::new(&s, crate::graph::Graph::decoder(), 2, r).unwrap()).unwrap()).collect();
+            let (mut cut, mut whole) = (0, 0);
+            for name in names.iter().filter(|n| n.contains(".mlp.")) {
+                let w = full.view(name).unwrap();
+                let parts: Vec<_> = ranks.iter().map(|c| c.view(name).unwrap()).collect();
+                let expert = name.contains(".experts.") || name.contains(".shared_expert.");
+                if expert && w.shape.iter().product::<usize>() > 1 {
+                    cut += 1;
+                    let bytes: usize = parts.iter().map(|p| p.data.len()).sum();
+                    assert_eq!(bytes, w.data.len(), "{name}: the two ranks cover every byte once");
+                    assert!(parts.iter().all(|p| p.data.len() * 2 == w.data.len()), "{name}");
+                } else {
+                    whole += 1;
+                    assert!(parts.iter().all(|p| p.data == w.data), "{name} stays whole on every rank");
+                }
+            }
+            assert!(cut >= 6 * 9 && whole >= 2, "{f}: cut {cut} whole {whole}");
+        }
+    }
+
+    #[test]
     fn the_real_27b_nvfp4_checkpoint_cuts_cleanly_at_tp_2() {
         let s = Spec::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap();
         rank_spec(&s, 2).unwrap();
@@ -558,14 +626,14 @@ mod tests {
     }
 
     #[test]
-    fn tiny_fixtures_support_tp_2_and_the_moe_fixture_is_refused() {
+    fn tiny_fixtures_support_tp_2_and_the_moe_fixture_is_split_per_expert() {
         for f in ["tiny-qwen3.5-27b", "tiny-qwen3.5"] {
             let s = spec(&format!("{f}/config.json"));
             supports(&s, 2).unwrap_or_else(|e| panic!("{f}: {e}"));
         }
         let moe = spec("tiny-qwen3.5-moe/config.json");
         assert!(supports(&moe, 1).is_ok());
-        assert!(supports(&moe, 2).unwrap_err().to_string().contains("mixture of experts"));
+        assert!(supports(&moe, 2).is_ok());
     }
 
     #[test]

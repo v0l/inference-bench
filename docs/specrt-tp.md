@@ -15,7 +15,7 @@ Our own tensor-parallel mode, with no NCCL. `serve.tp = N` splits one model acro
 | MTP under tp | done, the draft layer is sharded like a decoder layer, the draft head is replicated |
 | `serve.tp` in the options schema and the server config | done, default 1 |
 | Load dialog choice | left to #776, which owns `load.rs` |
-| MoE | refused at tp above 1, follow-up #798 |
+| MoE | per-expert split (#798): `mlp.experts.N.*` and `mlp.shared_expert.*` cut by column like the dense MLP, router replicated, `Op::AllReduce` after `moe_combine` (which writes `Buf::Partial`). CPU tests pass; the virtual-rank GPU test `moe_tp_matches_tp1_on_virtual_ranks` is written but not run (both desktop cards are busy). Expert parallel is not built |
 | 27B TP=2 against TP=1 numbers | script ready (`pair658.sh`), not run |
 
 ## Sharding in the spec
@@ -40,7 +40,7 @@ Each `linear` node in `graphs/decoder.toml` has a `shard`:
 
 `tp::rank_spec(spec, tp)` gives the per-rank spec: heads, KV heads, delta-net key and value heads and the intermediate size divided by tp. The kernels are generated from that spec as for any model, so a rank runs the same JIT kernels as a smaller model.
 
-`tp::supports` refuses, with the reason: head counts tp does not divide, MoE, GGUF weights, sandwich or scaled residual norms (gemma3, olmo2, granite), full-width qk norms, tiled delta-net value heads, and per-rank widths that are not multiples of 16.
+`tp::supports` refuses, with the reason: head counts tp does not divide, expert widths tp does not divide (a multiple of 256 per rank for NVFP4 experts, of 128 for FP8 blocks), GGUF weights, sandwich or scaled residual norms (gemma3, olmo2, granite), full-width qk norms, tiled delta-net value heads, and per-rank widths that are not multiples of 16.
 
 ## Allreduce family
 
