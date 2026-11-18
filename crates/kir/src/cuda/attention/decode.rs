@@ -91,20 +91,9 @@ pub fn body() -> String {
             return;
         }
         bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
-        constexpr int ROW_CHUNKS = KV_PLANES * CPR;
-        constexpr int TOTAL = 2 * DM_BK * ROW_CHUNKS;
-        for (int i = tid; i < TOTAL; i += blockDim.x) {
-            int which = i / (DM_BK * ROW_CHUNKS);
-            int rem = i % (DM_BK * ROW_CHUNKS);
-            int r = rem / ROW_CHUNKS;
-            int c = rem % ROW_CHUNKS;
-            int tk = k0 + r;
-            int at = min(tk, len - 1);
-            const bf16_t* src = kv_row(which ? v_cache : k_cache, table, layer, kv_head, at);
-            bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
-            cp_async16_zfill(dst, src + c * 8, tk < len);
-        }
-    };
+"##.to_string(),
+        prim::load_kv_planes(&prim::TileLoad { table: "table", bound: "len", stride: "blockDim.x", unroll: false }),
+        r##"    };
 #pragma unroll
     for (int s = 0; s < DM_STAGES - 1; s++) {
         if (s < mine) load_kv(s, key_begin + s * DM_BK);
@@ -124,28 +113,9 @@ pub fn body() -> String {
         const bf16_t* v_lo = v_hi + PLANE;
 "##.to_string(),
         prim::zero_scores().to_string(),
-        r##"#pragma unroll
-        for (int np = 0; np < SB / 2; np++)
-#pragma unroll
-            for (int kb = 0; kb < KB; kb++) {
-                unsigned bh[4], bl[4] = {0, 0, 0, 0};
-                int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
-                int at = swz<CPR>(kr, kb * 2 + ((lane >> 3) & 1)) * 8;
-                if (kv_q(layer)) {
-                    const unsigned char* row0p = k_raw + (np * 16 + g) * HEAD_DIM + ((kb ^ g) << 4) + 2 * t;
-                    const unsigned char* row1p = row0p + 8 * HEAD_DIM;
-                    bh[0] = e4m3x2_to_f16x2(*(const unsigned short*)row0p);
-                    bh[1] = e4m3x2_to_f16x2(*(const unsigned short*)(row0p + 8));
-                    bh[2] = e4m3x2_to_f16x2(*(const unsigned short*)row1p);
-                    bh[3] = e4m3x2_to_f16x2(*(const unsigned short*)(row1p + 8));
-                } else {
-                    ldsm_x4(bh, k_hi + at);
-                }
-                if (KV_PLANES == 2) ldsm_x4(bl, k_lo + at);
-                mma_dec(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
-                mma_dec(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
-            }
-        const float* tile_scales = (const float*)(raw_stage(i % DM_STAGES) + RAW_TILE);
+        r##""##.to_string(),
+        prim::qk_scores("KB", "mma_dec", DEC_K_FRAG),
+        r##"        const float* tile_scales = (const float*)(raw_stage(i % DM_STAGES) + RAW_TILE);
         if (kv_q(layer)) {
 #pragma unroll
             for (int nb = 0; nb < SB; nb++)
@@ -166,28 +136,9 @@ pub fn body() -> String {
         for (int kb = 0; kb < SB / 2; kb++) {
 "##.to_string(),
         prim::pack_probs("DM_SPLIT || KV_PLANES == 2"),
-        r##"#pragma unroll
-            for (int np = 0; np < NB / 2; np++) {
-                unsigned bh[4], bl[4] = {0, 0, 0, 0};
-                int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-                int at = swz<CPR>(kr, np * 2 + (lane >> 4)) * 8;
-                if (kv_q(layer)) {
-                    const unsigned char* v_raw = k_raw + DM_BK * HEAD_DIM;
-                    int key = kb * 16 + 2 * t;
-                    int dim = np * 16 + g;
-                    auto byte_at = [&](int k, int d) -> unsigned { return v_raw[k * HEAD_DIM + (((d >> 4) ^ (k & 7)) << 4) + (d & 15)]; };
-                    bh[0] = e4m3x2_to_f16x2(byte_at(key, dim) | (byte_at(key + 1, dim) << 8));
-                    bh[1] = e4m3x2_to_f16x2(byte_at(key + 8, dim) | (byte_at(key + 9, dim) << 8));
-                    bh[2] = e4m3x2_to_f16x2(byte_at(key, dim + 8) | (byte_at(key + 1, dim + 8) << 8));
-                    bh[3] = e4m3x2_to_f16x2(byte_at(key + 8, dim + 8) | (byte_at(key + 9, dim + 8) << 8));
-                } else {
-                    ldsm_x4_t(bh, v_hi + at);
-                }
-                if (KV_PLANES == 2) ldsm_x4_t(bl, v_lo + at);
-                mma_dec(o[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
-                mma_dec(o[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
-            }
-        }
+        r##""##.to_string(),
+        prim::pv_accumulate("NB", "mma_dec", DEC_V_FRAG),
+        r##"        }
         __syncthreads();
     }
     size_t base0 = ((size_t)row0 * HEADS + head0) * splits + z;
@@ -207,3 +158,29 @@ pub fn body() -> String {
     ]
     .concat()
 }
+
+const DEC_K_FRAG: &str = r##"                if (kv_q(layer)) {
+                    const unsigned char* row0p = k_raw + (np * 16 + g) * HEAD_DIM + ((kb ^ g) << 4) + 2 * t;
+                    const unsigned char* row1p = row0p + 8 * HEAD_DIM;
+                    bh[0] = e4m3x2_to_f16x2(*(const unsigned short*)row0p);
+                    bh[1] = e4m3x2_to_f16x2(*(const unsigned short*)(row0p + 8));
+                    bh[2] = e4m3x2_to_f16x2(*(const unsigned short*)row1p);
+                    bh[3] = e4m3x2_to_f16x2(*(const unsigned short*)(row1p + 8));
+                } else {
+                    ldsm_x4(bh, k_hi + at);
+                }
+"##;
+
+const DEC_V_FRAG: &str = r##"                if (kv_q(layer)) {
+                    const unsigned char* v_raw = k_raw + DM_BK * HEAD_DIM;
+                    int key = kb * 16 + 2 * t;
+                    int dim = np * 16 + g;
+                    auto byte_at = [&](int k, int d) -> unsigned { return v_raw[k * HEAD_DIM + (((d >> 4) ^ (k & 7)) << 4) + (d & 15)]; };
+                    bh[0] = e4m3x2_to_f16x2(byte_at(key, dim) | (byte_at(key + 1, dim) << 8));
+                    bh[1] = e4m3x2_to_f16x2(byte_at(key + 8, dim) | (byte_at(key + 9, dim) << 8));
+                    bh[2] = e4m3x2_to_f16x2(byte_at(key, dim + 8) | (byte_at(key + 1, dim + 8) << 8));
+                    bh[3] = e4m3x2_to_f16x2(byte_at(key + 8, dim + 8) | (byte_at(key + 9, dim + 8) << 8));
+                } else {
+                    ldsm_x4_t(bh, v_hi + at);
+                }
+"##;

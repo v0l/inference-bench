@@ -91,3 +91,69 @@ pub fn pack_probs(low_plane: &str) -> String {
 "
     )
 }
+
+pub struct TileLoad<'a> {
+    pub table: &'a str,
+    pub bound: &'a str,
+    pub stride: &'a str,
+    pub unroll: bool,
+}
+
+pub fn load_kv_planes(l: &TileLoad) -> String {
+    let unroll = if l.unroll { "#pragma unroll\n" } else { "" };
+    format!(
+        "        constexpr int ROW_CHUNKS = KV_PLANES * CPR;
+        constexpr int TOTAL = 2 * {bk} * ROW_CHUNKS;
+{unroll}        for (int i = tid; i < TOTAL; i += {stride}) {{
+            int which = i / ({bk} * ROW_CHUNKS);
+            int rem = i % ({bk} * ROW_CHUNKS);
+            int r = rem / ROW_CHUNKS;
+            int c = rem % ROW_CHUNKS;
+            int tk = k0 + r;
+            {src}
+            bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
+            cp_async16_zfill(dst, src + c * 8, tk < {bound});
+        }}
+",
+        bk = if l.stride.starts_with("32") { "FM_BK" } else { "DM_BK" },
+        stride = l.stride,
+        bound = l.bound,
+        src = if l.stride.starts_with("32") {
+            format!("const bf16_t* src = kv_row(which ? v_cache : k_cache, {}, layer, kv_head, min(tk, {} - 1));", l.table, l.bound)
+        } else {
+            format!("int at = min(tk, {} - 1);\n            const bf16_t* src = kv_row(which ? v_cache : k_cache, {}, layer, kv_head, at);", l.bound, l.table)
+        },
+    )
+}
+
+pub fn qk_scores(key_blocks: &str, mma: &str, k_frag: &str) -> String {
+    format!(
+        "#pragma unroll
+        for (int np = 0; np < SB / 2; np++)
+#pragma unroll
+            for (int kb = 0; kb < {key_blocks}; kb++) {{
+                unsigned bh[4], bl[4] = {{0, 0, 0, 0}};
+                int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
+                int at = swz<CPR>(kr, kb * 2 + ((lane >> 3) & 1)) * 8;
+{k_frag}                if (KV_PLANES == 2) ldsm_x4(bl, k_lo + at);
+                {mma}(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
+                {mma}(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
+            }}
+"
+    )
+}
+
+pub fn pv_accumulate(out_blocks: &str, mma: &str, v_frag: &str) -> String {
+    format!(
+        "#pragma unroll
+            for (int np = 0; np < {out_blocks} / 2; np++) {{
+                unsigned bh[4], bl[4] = {{0, 0, 0, 0}};
+                int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+                int at = swz<CPR>(kr, np * 2 + (lane >> 4)) * 8;
+{v_frag}                if (KV_PLANES == 2) ldsm_x4_t(bl, v_lo + at);
+                {mma}(o[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
+                {mma}(o[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
+            }}
+"
+    )
+}

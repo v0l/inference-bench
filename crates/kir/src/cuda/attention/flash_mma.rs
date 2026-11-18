@@ -124,20 +124,9 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
             }
             return;
         }
-        constexpr int ROW_CHUNKS = KV_PLANES * CPR;
-        constexpr int TOTAL = 2 * FM_BK * ROW_CHUNKS;
-#pragma unroll
-        for (int i = tid; i < TOTAL; i += 32 * FM_WARPS) {
-            int which = i / (FM_BK * ROW_CHUNKS);
-            int rem = i % (FM_BK * ROW_CHUNKS);
-            int r = rem / ROW_CHUNKS;
-            int c = rem % ROW_CHUNKS;
-            int tk = k0 + r;
-            const bf16_t* src = kv_row(which ? v_cache : k_cache, block_table, layer, kv_head, min(tk, key_end - 1));
-            bf16_t* dst = st + (which * KV_PLANES + c / CPR) * PLANE + swz<CPR>(r, c % CPR) * 8;
-            cp_async16_zfill(dst, src + c * 8, tk < key_end);
-        }
-    };
+"##.to_string(),
+        prim::load_kv_planes(&prim::TileLoad { table: "block_table", bound: "key_end", stride: "32 * FM_WARPS", unroll: true }),
+        r##"    };
     auto convert_kv = [&](int buf) {
         bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
         const unsigned char* raw_st = (const unsigned char*)st + PLANE_BYTES / 2;
@@ -198,19 +187,9 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         constexpr int SB = FM_BK / 8;
 "##.to_string(),
         prim::zero_scores().to_string(),
-        r##"#pragma unroll
-        for (int np = 0; np < SB / 2; np++)
-#pragma unroll
-            for (int kb = 0; kb < FM_KB; kb++) {
-                unsigned bh[4], bl[4] = {0, 0, 0, 0};
-                int kr = np * 16 + (lane >> 4) * 8 + (lane & 7);
-                int at = swz<CPR>(kr, kb * 2 + ((lane >> 3) & 1)) * 8;
-                ldsm_x4(bh, k_hi + at);
-                if (KV_PLANES == 2) ldsm_x4(bl, k_lo + at);
-                mma_kv(s[2 * np], qh[kb], ql[kb], bh[0], bh[1], bl[0], bl[1]);
-                mma_kv(s[2 * np + 1], qh[kb], ql[kb], bh[2], bh[3], bl[2], bl[3]);
-            }
-"##.to_string(),
+        r##""##.to_string(),
+        prim::qk_scores("FM_KB", "mma_kv", "                ldsm_x4(bh, k_hi + at);\n"),
+        r##""##.to_string(),
         prim::online_softmax(&Mask { pos: "pos", live: "(key <= pos || key <= (e < 2 ? span0 : span1)) && key < key_end && (window <= 0 || key > pos - window)" }),
         r##""##.to_string(),
         prim::rescale_acc("FM_NB"),
@@ -218,17 +197,9 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
         for (int kb = 0; kb < SB / 2; kb++) {
 "##.to_string(),
         prim::pack_probs("KV_PLANES == 2"),
-        r##"#pragma unroll
-            for (int np = 0; np < FM_NB / 2; np++) {
-                unsigned bh[4], bl[4] = {0, 0, 0, 0};
-                int kr = kb * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
-                int at = swz<CPR>(kr, np * 2 + (lane >> 4)) * 8;
-                ldsm_x4_t(bh, v_hi + at);
-                if (KV_PLANES == 2) ldsm_x4_t(bl, v_lo + at);
-                mma_kv(o[2 * np], ph, pl, bh[0], bh[1], bl[0], bl[1]);
-                mma_kv(o[2 * np + 1], ph, pl, bh[2], bh[3], bl[2], bl[3]);
-            }
-        }
+        r##""##.to_string(),
+        prim::pv_accumulate("FM_NB", "mma_kv", "                ldsm_x4_t(bh, v_hi + at);\n"),
+        r##"        }
         __syncthreads();
     }
     float i0 = 1.0f / l0;
