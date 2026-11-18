@@ -14,12 +14,6 @@ const KIR_SNIPPETS: &[&str] = &[
     "cuda/quant_fp4.cu",
     "cuda/quant_fp8_block.cu",
     "cuda/quant_fp8_token.cu",
-    "cuda/vision/attention.cu",
-    "cuda/vision/gemm.cu",
-    "cuda/vision/head.cu",
-    "cuda/vision/norm.cu",
-    "cuda/vision/pool.cu",
-    "cuda/vision/pos.cu",
 ];
 
 
