@@ -2,9 +2,14 @@
 pub mod cuda;
 pub mod attention;
 pub mod gemm;
+pub mod gemv;
 pub mod ggml;
 pub mod layout;
 pub mod linear;
+pub mod moe;
+pub mod ops;
+pub mod prims;
+pub mod rope;
 pub mod target;
 pub mod vision;
 #[cfg(feature = "wgsl")]

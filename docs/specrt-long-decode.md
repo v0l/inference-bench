@@ -67,7 +67,7 @@ chunk helps only 1 x 8k (0.044 ms), and 512 hurts short contexts.
 
 ## 27B end to end
 
-`scripts/long617.sh` runs `bench` with `SPECRT_BENCH_SERVE=1` (the scheduler, no HTTP) on
+`scripts/long617.sh` runs `bench --serve` (the scheduler, no HTTP) on
 `qwen3.8-27b-nvfp4.toml` (MTP k = 2, 1-plane bf16 KV), N sequences of `ctx - new` prompt tokens
 each, 256 new tokens for one sequence and 512 for more. The bench admits every prompt before
 decoding starts (`max_batched_tokens` 16,384, a 10 s ITL target), so decode runs as one batch.
@@ -90,7 +90,7 @@ sequences decoding, nothing prefilling), one speculative round of k + 1 verify r
 | 1 x 128k | 49.1 | 77.0 | 1.57x | 61.0 | 38.9 |
 | 4 x 128k | 79.3 | 171.3 | 2.16x | 143.0 | 66.2 |
 
-The 12-sequence rows use a fixed 40 GB KV pool (`SPECRT_BENCH_KV_GB`, a bench-only knob). With
+The 12-sequence rows use a fixed 40 GB KV pool (`bench --kv-gb 40`). With
 the pool sized from free memory the recurrent state of the later slots cannot be allocated, so
 only some of the 12 decode together (#647); the first 12 x 8k and 12 x 32k runs (595 vs 478 and 259 vs
 385 tok/s) were taken that way and are not comparable.

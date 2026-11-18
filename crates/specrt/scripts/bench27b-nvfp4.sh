@@ -25,14 +25,14 @@ for round in 1 2; do
     for mode in weight act; do
         guard single $mode round $round
         if [ "$mode" = act ]; then
-            SPECRT_BENCH_RUNS=3 nice -n 15 "$B" "$act" 128,1024,4096 128 >> "$log" 2>&1
+            nice -n 15 "$B" --runs 3 "$act" 128,1024,4096 128 >> "$log" 2>&1
         else
-            SPECRT_BENCH_RUNS=3 nice -n 15 "$B" "$spec" 128,1024,4096 128 >> "$log" 2>&1
+            nice -n 15 "$B" --runs 3 "$spec" 128,1024,4096 128 >> "$log" 2>&1
         fi
     done
 done
 for batch in 4 8 16; do
     guard batch $batch
-    SPECRT_BENCH_RUNS=3 nice -n 15 "$B" "$act" 128 128 "$batch" >> "$log" 2>&1
+    nice -n 15 "$B" --runs 3 "$act" 128 128 "$batch" >> "$log" 2>&1
 done
 echo "done free $(nvidia-smi --query-gpu=memory.free --format=csv,noheader) $(date +%T)" >> "$log"

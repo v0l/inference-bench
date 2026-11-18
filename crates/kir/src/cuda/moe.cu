@@ -1,11 +1,3 @@
-constexpr int MOE_E = {{MOE_E}};
-constexpr int MOE_K = {{MOE_K}};
-constexpr int MOE_PAIRS = {{MOE_PAIRS}};
-constexpr int MOE_INTER = {{MOE_INTER}};
-constexpr bool MOE_SHARED = {{MOE_SHARED}};
-constexpr bool MOE_NORM_TOPK = {{MOE_NORM_TOPK}};
-constexpr bool MOE_SHARED_GATE = {{MOE_SHARED_GATE}};
-constexpr bool MOE_SIGMOID = {{MOE_SIGMOID}};
 constexpr int MOE_WARPS = 8;
 template <int K> constexpr int MOE_FP8_KB = (K + FP8_BLOCK - 1) / FP8_BLOCK;
 template <int ROWS, int K> constexpr int MOE_FP8_GRID = ((ROWS + FP8_BLOCK - 1) / FP8_BLOCK) * MOE_FP8_KB<K>;

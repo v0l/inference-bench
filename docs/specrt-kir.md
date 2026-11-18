@@ -118,6 +118,23 @@ inference-bench kernels --spec qwen3.8-27b-nvfp4 --target wgpu
 
 `MAX_CTX`, `PAGES` and `BD_SPLITS` are no longer source constants. The kernels take `pages` (block-table row stride), `mm_stride` (mrope table stride) and `splits` as launch arguments, so one compiled module serves any context length (#397). The tile constants (`FM_*`, `DM_*`) come from the shape. `specrt::codegen::attention_kernels(spec, kv_planes, target)` builds the set; its hash joins the module hash. Goldens are in `crates/kir/tests/golden/attention/`.
 
+## Remaining kernels (slice 6)
+
+The template directories are gone. Every kernel is emitted by a kir builder from a typed description:
+
+| Module | Builder | Kernels |
+|---|---|---|
+| `kir::prims` | `PrimKernel { name, target, prim }` | CUDA `embed`, `splice_rows`, `rms_split`, `argmax_rows`, `sample_rows`, `argmax_advance`, `apply_mask`, `bump`, `copy_rows`, `split_rows`; WGSL `embed`, `argmax`, `bias`, `dequant` |
+| `kir::gemv` | `GemvKernel { name, target, op }` | `qkv_proj`, `o_proj`, `gate_up_proj`, `down_proj`, `lm_head`, the tiled `*_gemm`, `qkv_proj_norm`, `gate_up_act`, `lm_head_norm`, `lin_in_norm`, `lin_ba_norm`, `lin_ba_rows`, `lin_out_proj` |
+| `kir::moe` | `MoeKernel { family, target, shape }` | `Experts` (route, per-pair and grouped GEMV), `GroupedMma` (block-scaled fp4 grouped GEMM) |
+| `kir::rope` | `inv_freq_fn(dialect, kinds)` | rope frequencies for the CUDA attention kernels and the WGSL `rope` |
+| `kir::ggml` | `wgsl_decoder()` | the WGSL ggml block decoders, sized from `BLOCK_BYTES` |
+| `kir::wgsl` | `emit_op`, `emit_linear_op` | WGSL `rope`, `attention`, `linear`, `linear_t8` |
+
+Shape constants are baked from the spec (`HIDDEN`, `VOCAB`, eps and the embedding scale are literals in the prim kernels), and the Gumbel hash and the argmax reduction tree are one builder for both dialects. Each builder validates its target and shape, and its hash joins the module hash.
+
+What stays as `.cu` text under `crates/kir/src/cuda` are device libraries and kernel bodies that each family selects and parameterises (`prelude.cu` with the decoders and `linear_w`/`linear_norm`, the GEMM, attention, delta-net, GGUF, vision and MoE bodies). The test `every_kernel_comes_from_kir` in `crates/specrt/tests/codegen.rs` lists them by name: a new `.cu` or any `.wgsl` file under `crates/kir/src` fails it, so does a `__global__` in a library file, and so does text for any kernel a builder now generates. Porting those bodies to kir primitives is tracked per family in follow-up issues.
+
 ## Slices
 
 1. Crate, Target, Layout, rmsnorm and gated activation.
@@ -125,4 +142,4 @@ inference-bench kernels --spec qwen3.8-27b-nvfp4 --target wgpu
 3. Delta-net and MTP (after #418).
 4. Attention (#621, this section).
 5. GGUF and vision.
-6. Remove `render()`, the `{{SLOT}}`s and the env knobs.
+6. Remove `render()`, the `{{SLOT}}`s and the env knobs; builders for the remaining kernels (#623, this section).

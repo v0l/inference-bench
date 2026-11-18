@@ -1,27 +1,3 @@
-__device__ __forceinline__ float rope_inv_freq(int i, int layer) {
-    if (LOCAL_ROPE[layer]) return 1.0f / powf(LOCAL_THETA, (float)(2 * i) / (float)ROT);
-    float inv_freq = 1.0f / powf(THETA, (float)(2 * i) / (float)ROT);
-    if (ROPE_KIND == 1) {
-        inv_freq /= ROPE_FACTOR;
-    } else if (ROPE_KIND == 2) {
-        float wavelen = 6.283185307179586f / inv_freq;
-        float low_wavelen = ROPE_ORIG_POS / ROPE_LOW_FREQ;
-        float high_wavelen = ROPE_ORIG_POS / ROPE_HIGH_FREQ;
-        if (wavelen > low_wavelen) {
-            inv_freq /= ROPE_FACTOR;
-        } else if (wavelen >= high_wavelen) {
-            float smooth = (ROPE_ORIG_POS / wavelen - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ);
-            inv_freq = (1.0f - smooth) * inv_freq / ROPE_FACTOR + smooth * inv_freq;
-        }
-    } else if (ROPE_KIND == 3) {
-        float ramp = fminf(fmaxf(((float)i - ROPE_LOW_FREQ) / (ROPE_HIGH_FREQ - ROPE_LOW_FREQ), 0.0f), 1.0f);
-        inv_freq = ramp * inv_freq / ROPE_FACTOR + (1.0f - ramp) * inv_freq;
-    } else if (ROPE_KIND == 4) {
-        inv_freq /= ROPE_FREQ_FACTORS[i];
-    }
-    return inv_freq;
-}
-
 __device__ __forceinline__ float cap_score(float s) {
     return SOFTCAP > 0.0f ? SOFTCAP * tanhf(s / SOFTCAP) : s;
 }

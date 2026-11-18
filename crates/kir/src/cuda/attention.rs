@@ -25,6 +25,7 @@ pub fn emit_attention(kernels: &[AttentionKernel]) -> Result<String, AttentionEr
         out.push('\n');
         out.push_str(s);
     };
+    push(&crate::rope::inv_freq_fn(crate::layout::Dialect::Cuda, &[1, 2, 3, 4]));
     push(COMMON);
     if has(Family::RopeKv) {
         push(ROPE);

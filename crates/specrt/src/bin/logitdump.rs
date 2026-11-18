@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     let path = PathBuf::from(args.next().context(usage)?);
     let lens: Vec<usize> = args.next().unwrap_or_else(|| "17,300,1100".into()).split(',').map(|s| s.parse().context(usage)).collect::<Result<_>>()?;
     let batch: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(4);
-    let spec = load_spec(&path)?.with_env_overrides();
+    let spec = load_spec(&path)?;
     let vocab = spec.dims.vocab as u32;
     let longest = *lens.iter().max().context(usage)?;
     let mut rt = Runtime::load(&spec, longest + 32)?;

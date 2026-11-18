@@ -239,12 +239,12 @@ flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -q \
 - Never stop, restart or signal the user's app, local-llm.service or anything on the Spark without being told to. The Spark rule: `free -g` first, stay under 20 GB, lock file, per-issue target dir.
 - If a tier 5 run needs memory you do not have, do not queue behind the lock for hours. Run tiers 1 to 3, then report.
 - Evidence enough to hand back: tier 1 green, every tier 2 or 3 file your change touches green with the `test result:` lines pasted, and the exact tier 5 command (test names, ref dir, spec) for the supervisor's window. A change specific to the 27B checkpoint still has a tier 2 proof if the code path exists in the tiny Qwen3.5 fixtures.
-- Config rule: behaviour comes from the spec TOML or server config. Env vars are deprecated dev overrides.
+- Config rule: behaviour comes from the spec TOML or server config. There are no env vars for behaviour. The variables the tests read (`SPECRT_REF_DIR`, `SPECRT_GGUF_*`, `SPECRT_VISION_*`, `SPECRT_27B_*`, and the `SPECRT_GEMM_*` and `SPECRT_FLASH_*` lists in `gemm_speed.rs` and `flash_speed.rs`) are test inputs and parameters, not engine knobs: nothing under `src/` reads them.
 
 ## Measuring speed
 
 - Paired A/B only. Never compare a number from today with one from last week, since the card clock, the user's app and other jobs move it. Run base and branch back to back, interleaved, 3 rounds, on the same card, under the lock.
-- Build each side with its own `CARGO_TARGET_DIR`, and look in the PTX (`SPECRT_CACHE=<tmpdir>`) for the JIT source you changed before trusting a number.
+- Build each side with its own `CARGO_TARGET_DIR`, and look in the PTX (`[runtime] cache_dir = "<tmpdir>"` in the spec) for the JIT source you changed before trusting a number.
 - `scripts/ab517.sh`: `BASE=<prefixbench> BRANCH=<prefixbench> ./scripts/ab517.sh`, long-context prefill A/B (`LENGTHS`, `ROUNDS`, `KV_GB`, `BASE_SPEC`, `BRANCH_SPEC`).
 - `scripts/prefill555.sh`: `BIN=<prefixbench> [ALT_BIN=...] ./scripts/prefill555.sh`, prefill tables plus nsys per length. Set `NSYS=0` to skip the profile.
 - `scripts/batch8_604.sh`: serves the NVFP4 27B with 8 slots, runs `loadtest` with 8 clients and takes an nsys of the round. Refuses to start under `NEED_MIB` of free memory (36000).

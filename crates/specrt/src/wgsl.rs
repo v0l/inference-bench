@@ -1,8 +1,6 @@
-use crate::codegen::render;
 use crate::plan::{Op, Phase, Plan, Weight};
 use crate::spec::{ActQuant, Quant, Spec};
 use anyhow::Result;
-use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -23,12 +21,6 @@ pub const LINEAR_WORKGROUP: usize = 64;
 pub const ROW_SPAN: u32 = 32768;
 pub const ELEMENT_SPAN: u32 = 8388608;
 
-const COMMON: &str = include_str!("../templates/wgsl/common.wgsl");
-const DECODE: &str = kir::wgsl::GGML_DECODE;
-
-fn float(v: f64) -> String {
-    format!("{v:e}")
-}
 
 pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static str>> {
     Ok(match op {
@@ -101,51 +93,38 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
     let a = &spec.attention;
     let d = &spec.dims;
     let rope = spec.rope_constants();
-    let act = match spec.mlp.activation {
-        crate::spec::Activation::Swiglu => 0,
-        crate::spec::Activation::Geglu => 1,
+    let shape = kir::ops::WgslShape {
+        hidden: d.hidden,
+        inter: d.intermediate,
+        vocab: d.vocab,
+        heads: a.heads,
+        kv_heads: a.kv_heads,
+        head_dim: a.head_dim,
+        qk_norm: a.qk_norm,
+        eps: spec.norm.eps,
+        theta: spec.rope.theta,
+        rope_kind: rope.kind as u32,
+        rope_factor: rope.factor,
+        rope_low: rope.low,
+        rope_high: rope.high,
+        rope_original: rope.original,
+        rope_mscale: rope.mscale,
+        gated_gelu: spec.mlp.activation == crate::spec::Activation::Geglu,
+        max_ctx,
+        q_dim: spec.q_dim(),
+        qkv_row: spec.qkv_rows(),
+        rotary_dim: spec.rotary_dim(),
     };
-    let mut vars: BTreeMap<&str, String> = [
-        ("HIDDEN", d.hidden.to_string()),
-        ("INTER", d.intermediate.to_string()),
-        ("VOCAB", d.vocab.to_string()),
-        ("HEADS", a.heads.to_string()),
-        ("KV_HEADS", a.kv_heads.to_string()),
-        ("HEAD_DIM", a.head_dim.to_string()),
-        ("GROUP", (a.heads / a.kv_heads).to_string()),
-        ("QK_NORM", a.qk_norm.to_string()),
-        ("EPS", float(spec.norm.eps)),
-        ("THETA", float(spec.rope.theta)),
-        ("ROPE_KIND", rope.kind.to_string()),
-        ("ROPE_FACTOR", float(rope.factor)),
-        ("ROPE_LOW_FREQ", float(rope.low)),
-        ("ROPE_HIGH_FREQ", float(rope.high)),
-        ("ROPE_ORIG_POS", float(rope.original)),
-        ("ROPE_MSCALE", float(rope.mscale)),
-        ("ACT_KIND", act.to_string()),
-        ("MAX_CTX", max_ctx.to_string()),
-        ("Q_DIM", spec.q_dim().to_string()),
-        ("QKV_ROW", spec.qkv_rows().to_string()),
-        ("ROT", spec.rotary_dim().to_string()),
-    ]
-    .into_iter()
-    .collect();
     use Access::*;
-    let build = |name: &'static str, body: &str, decode: bool, bindings: &[Access], vars: &BTreeMap<&str, String>| -> Result<WgslKernel> {
-        let mut source = render(COMMON, vars)?;
-        source.push_str(&render(body, vars)?);
-        if decode {
-            source.push_str(DECODE);
-        }
-        Ok(WgslKernel { name, source, bindings: bindings.to_vec() })
-    };
+    use kir::wgsl::OpKind;
+    let op = |name: &'static str, kind: OpKind, bindings: &[Access]| WgslKernel { name, source: kir::wgsl::emit_op(kind, &shape), bindings: bindings.to_vec() };
     let mut out = vec![
-        build("embed", include_str!("../templates/wgsl/embed.wgsl"), true, &[Read, Read, Read, Write, Uniform], &vars)?,
-        build("rope", include_str!("../templates/wgsl/rope.wgsl"), false, &[Write, Read, Read, Write, Write, Uniform], &vars)?,
-        build("attention", include_str!("../templates/wgsl/attention.wgsl"), false, &[Read, Read, Read, Write, Uniform], &vars)?,
-        build("bias", include_str!("../templates/wgsl/bias.wgsl"), false, &[Write, Read, Uniform], &vars)?,
-        build("argmax", include_str!("../templates/wgsl/argmax.wgsl"), false, &[Read, Write, Uniform], &vars)?,
-        build("dequant", kir::wgsl::GGML_ROWS, true, &[Read, Read, Write, Uniform], &vars)?,
+        op("embed", OpKind::Embed, &[Read, Read, Read, Write, Uniform]),
+        op("rope", OpKind::Rope, &[Write, Read, Read, Write, Write, Uniform]),
+        op("attention", OpKind::Attention, &[Read, Read, Read, Write, Uniform]),
+        op("bias", OpKind::Bias, &[Write, Read, Uniform]),
+        op("argmax", OpKind::Argmax, &[Read, Write, Uniform]),
+        op("dequant", OpKind::Dequant, &[Read, Read, Write, Uniform]),
     ];
     for k in crate::codegen::kir_kernels(spec, target)? {
         let bindings = kir::wgsl::bindings(&k)
@@ -159,9 +138,7 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         out.push(WgslKernel { name: k.name, source: kir::wgsl::emit_kernel(&k).map_err(anyhow::Error::msg)?, bindings });
     }
     for (name, tokens) in [("linear", 1), ("linear_t8", LINEAR_TOKENS)] {
-        vars.insert("TT", tokens.to_string());
-        vars.insert("RED", (tokens * LINEAR_WORKGROUP).to_string());
-        out.push(build(name, include_str!("../templates/wgsl/linear.wgsl"), true, &[Read, Write, Read, Read, Uniform], &vars)?);
+        out.push(WgslKernel { name, source: kir::wgsl::emit_linear_op(&shape, tokens, LINEAR_WORKGROUP), bindings: vec![Read, Write, Read, Read, Uniform] });
     }
     for k in crate::gemm::gemm_kernels(spec, target)?.kernels {
         let bindings = kir::wgsl::gemm_bindings(&k)
