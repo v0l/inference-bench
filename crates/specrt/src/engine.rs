@@ -602,6 +602,43 @@ impl Engine {
     }
 }
 
+pub struct MediaPrompt {
+    pub ids: Vec<u32>,
+    pub media: Vec<crate::sched::MediaInput>,
+    pub vision_tokens: usize,
+}
+
+pub fn encode_media_prompt(model: &str, messages: &[Value], template: Option<&Value>, items: &[crate::vision::MediaItem]) -> Result<MediaPrompt> {
+    encode_media_prompt_with(resolve_spec(model)?, messages, template, items)
+}
+
+pub fn encode_media_prompt_with(spec: Spec, messages: &[Value], template: Option<&Value>, items: &[crate::vision::MediaItem]) -> Result<MediaPrompt> {
+    let assets = Assets::for_spec(&spec.repo.clone(), spec)?;
+    let (ids, media, vision_tokens) = assets.encode_media_messages(messages, template, items, Default::default())?;
+    Ok(MediaPrompt { ids, media, vision_tokens })
+}
+
+pub struct MediaPromptAssets {
+    tokenizer: Tokenizer,
+    media: crate::vision::MediaAssets,
+}
+
+impl MediaPromptAssets {
+    pub fn encode(&self, templated: &str, items: &[crate::vision::MediaItem]) -> Result<(Vec<u32>, Vec<crate::sched::MediaInput>, usize)> {
+        let processed = self.media.process(items, Default::default())?;
+        let ids = self.tokenizer.encode(self.media.expand(templated, &processed)?, false).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?.get_ids().to_vec();
+        let vision = ids.iter().filter(|&&t| t == self.media.ids.image || t == self.media.ids.video).count();
+        let inputs = processed.into_iter().zip(items).map(|(processed, item)| crate::sched::MediaInput { processed, hash: item.hash }).collect();
+        Ok((ids, inputs, vision))
+    }
+}
+
+pub fn media_prompt_assets(spec: &Spec) -> Result<MediaPromptAssets> {
+    let tokenizer = without_truncation(Tokenizer::from_file(find_in_snapshot(&spec.repo, "tokenizer.json")?).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?)?;
+    let media = media_assets(spec, &tokenizer)?.context("the model has no vision_config or preprocessor configs")?;
+    Ok(MediaPromptAssets { tokenizer, media })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -700,41 +737,4 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/specs/qwen3-0.6b.toml");
         assert_eq!(resolve_spec(path).unwrap().repo, "Qwen/Qwen3-0.6B");
     }
-}
-
-pub struct MediaPrompt {
-    pub ids: Vec<u32>,
-    pub media: Vec<crate::sched::MediaInput>,
-    pub vision_tokens: usize,
-}
-
-pub fn encode_media_prompt(model: &str, messages: &[Value], template: Option<&Value>, items: &[crate::vision::MediaItem]) -> Result<MediaPrompt> {
-    encode_media_prompt_with(resolve_spec(model)?, messages, template, items)
-}
-
-pub fn encode_media_prompt_with(spec: Spec, messages: &[Value], template: Option<&Value>, items: &[crate::vision::MediaItem]) -> Result<MediaPrompt> {
-    let assets = Assets::for_spec(&spec.repo.clone(), spec)?;
-    let (ids, media, vision_tokens) = assets.encode_media_messages(messages, template, items, Default::default())?;
-    Ok(MediaPrompt { ids, media, vision_tokens })
-}
-
-pub struct MediaPromptAssets {
-    tokenizer: Tokenizer,
-    media: crate::vision::MediaAssets,
-}
-
-impl MediaPromptAssets {
-    pub fn encode(&self, templated: &str, items: &[crate::vision::MediaItem]) -> Result<(Vec<u32>, Vec<crate::sched::MediaInput>, usize)> {
-        let processed = self.media.process(items, Default::default())?;
-        let ids = self.tokenizer.encode(self.media.expand(templated, &processed)?, false).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?.get_ids().to_vec();
-        let vision = ids.iter().filter(|&&t| t == self.media.ids.image || t == self.media.ids.video).count();
-        let inputs = processed.into_iter().zip(items).map(|(processed, item)| crate::sched::MediaInput { processed, hash: item.hash }).collect();
-        Ok((ids, inputs, vision))
-    }
-}
-
-pub fn media_prompt_assets(spec: &Spec) -> Result<MediaPromptAssets> {
-    let tokenizer = without_truncation(Tokenizer::from_file(find_in_snapshot(&spec.repo, "tokenizer.json")?).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?)?;
-    let media = media_assets(spec, &tokenizer)?.context("the model has no vision_config or preprocessor configs")?;
-    Ok(MediaPromptAssets { tokenizer, media })
 }

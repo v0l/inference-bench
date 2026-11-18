@@ -400,7 +400,7 @@ pub fn parse_vm_stat(text: &str) -> u64 {
         .lines()
         .next()
         .and_then(|l| l.split("page size of").nth(1))
-        .and_then(|r| r.trim().split_whitespace().next())
+        .and_then(|r| r.split_whitespace().next())
         .and_then(|n| n.parse::<u64>().ok())
         .unwrap_or(16384);
     let pages = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)?.trim().trim_end_matches('.').parse::<u64>().ok()).unwrap_or(0);

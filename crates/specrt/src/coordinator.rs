@@ -157,11 +157,10 @@ impl Coordinator {
                 Event::Join { device, address, .. } => Event::Join { device, address, now_ms: self.now_ms() },
                 other => other,
             };
-            if let Event::Leave { name } = &e {
-                if !self.members.names().contains(&name.as_str()) {
+            if let Event::Leave { name } = &e
+                && !self.members.names().contains(&name.as_str()) {
                     continue;
                 }
-            }
             if self.apply(e).is_some() {
                 handled += 1;
             }

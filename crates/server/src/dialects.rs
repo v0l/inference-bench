@@ -18,8 +18,8 @@ use tokio::sync::mpsc;
 pub(crate) enum Piece {
     Content(String),
     Reasoning(String),
-    Call { index: usize, id: String, name: String },
-    Args { index: usize, arguments: String },
+    Call { id: String, name: String },
+    Args { arguments: String },
     Finished { generation: Generation, reason: &'static str, stopped: bool },
     Failed(ApiError),
 }
@@ -37,8 +37,8 @@ fn from_delta(d: Delta) -> Piece {
     match d {
         Delta::Content(t) => Piece::Content(t),
         Delta::Reasoning(t) => Piece::Reasoning(t),
-        Delta::Call { index, id, name } => Piece::Call { index, id, name },
-        Delta::Args { index, arguments } => Piece::Args { index, arguments },
+        Delta::Call { id, name, .. } => Piece::Call { id, name },
+        Delta::Args { arguments, .. } => Piece::Args { arguments },
     }
 }
 

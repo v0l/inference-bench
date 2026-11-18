@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::large_enum_variant, clippy::type_complexity)]
+
 pub mod batch;
 pub mod logging;
 pub mod bench;

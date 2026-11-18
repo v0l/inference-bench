@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use inference_bench_core::target::{Target, Capabilities, Request};
 use inference_bench_core::chat::ChatRequest;
 use inference_bench_core::result::{BackendError, ErrorKind, Generation};

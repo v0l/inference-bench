@@ -90,7 +90,7 @@ fn a_tight_host_budget_and_the_split_head_and_mtp_groups_upload_the_same_weights
         tight.runtime.loader.workers = 4;
         let (fast, events) = logits(&tight);
         assert!(mmap.iter().zip(&fast).all(|(a, b)| a.to_bits() == b.to_bits()), "{dir}");
-        let last = events.iter().filter(|e| e.stage == Stage::Weights).last().unwrap();
+        let last = events.iter().rfind(|e| e.stage == Stage::Weights).unwrap();
         assert_eq!(last.done, last.total, "{dir}");
     }
 }

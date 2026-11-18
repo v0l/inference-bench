@@ -21,7 +21,7 @@ fn golden() -> Vec<Golden> {
         at += 12;
         let quant = &GOLDEN[at..at + bytes];
         at += bytes;
-        let want = GOLDEN[at..at + 4 * n].chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let want = GOLDEN[at..at + 4 * n].as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
         at += 4 * n;
         out.push(Golden { kind: GgmlType::from_id(ty as u32), quant, want });
     }

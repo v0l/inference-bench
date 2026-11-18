@@ -194,7 +194,7 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
         let per_position: Vec<f64> = (0..k.min(4)).map(|j| (after.position_accepted[j] - before.position_accepted[j]) as f64 / rows).collect();
         println!(
             "  per_position_accepted={:?} per_position_proposed={rows} per_position_rate={per_position:.3?}",
-            &after.position_accepted[..k.min(4)].iter().zip(&before.position_accepted).map(|(a, b)| a - b).collect::<Vec<_>>(),
+            after.position_accepted[..k.min(4)].iter().zip(&before.position_accepted).map(|(a, b)| a - b).collect::<Vec<_>>(),
         );
         println!(
             "{}",

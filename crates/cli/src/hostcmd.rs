@@ -49,7 +49,7 @@ impl HostFile {
     pub fn parse(text: &str) -> Result<HostFile> {
         let file: HostFile = toml::from_str(text).context("host config")?;
         if let Some(gb) = file.max_memory_gb
-            && !(gb > 0.0)
+            && gb.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
         {
             bail!("max_memory_gb must be above 0");
         }

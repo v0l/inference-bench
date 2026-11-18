@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_arguments)]
 use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 use specrt::codegen::Module;
 use specrt::jit::Jit;

@@ -509,7 +509,7 @@ impl Chain {
             let Message::Ready { layer_start, layer_end, hidden: h } = stage.ready else { unreachable!() };
             ensure!(layer_start == expected, "stage {i} starts at layer {layer_start}, expected {expected}");
             ensure!(layer_end > layer_start, "stage {i} serves no layers");
-            ensure!(hidden.map_or(true, |x| x == h), "stage {i} hidden size {h} differs from the previous stage");
+            ensure!(hidden.is_none_or(|x| x == h), "stage {i} hidden size {h} differs from the previous stage");
             hidden = Some(h);
             expected = layer_end;
         }
@@ -647,11 +647,10 @@ impl Chain {
             let final_rx = final_rx.expect("a last stage");
             let mut token = None;
             for (index, _, input) in final_rx {
-                if index + 1 == count {
-                    if let Input::Tokens(t) = input {
+                if index + 1 == count
+                    && let Input::Tokens(t) = input {
                         token = t.first().copied();
                     }
-                }
             }
             let mut per_stage = Vec::new();
             for h in handles {

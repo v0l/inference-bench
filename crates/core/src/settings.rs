@@ -210,8 +210,7 @@ mod tests {
     #[test]
     fn settings_round_trip_and_keys_are_private() {
         let dir = temp("a");
-        let mut s = Settings::default();
-        s.hf_token = "hf_secret".into();
+        let s = Settings { hf_token: "hf_secret".into(), ..Settings::default() };
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), s);
         #[cfg(unix)]

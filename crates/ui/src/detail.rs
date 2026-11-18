@@ -621,6 +621,7 @@ fn block_section(ui: &mut egui::Ui, view: &View, _kind: LayerKind, layer: Option
 #[cfg(test)]
 mod note_tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn the_layer_note_counts_sliding_layers_with_the_window() {

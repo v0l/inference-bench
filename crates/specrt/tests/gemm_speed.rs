@@ -78,7 +78,7 @@ fn time_fp4(spec_name: &str) {
                 let f = l.function(&kernel).unwrap();
                 use cudarc::driver::sys::CUfunction_attribute as A;
                 f.set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem as i32).unwrap();
-                (f, specrt::gemm::variant_tile(&s, "_f4a_big"), smem)
+                (f, specrt::gemm::variant_tile(s, "_f4a_big"), smem)
             })
             .collect();
         for m in list("SPECRT_GEMM_TOKENS", "1024,4096").iter().map(|t| t.parse::<usize>().unwrap()) {
@@ -316,7 +316,7 @@ fn fp4_probe(linear: &str) {
                 .map(|_| {
                     let mut hdr = vec![0u8; 16];
                     hdr[..4].copy_from_slice(&(1.0f32 / wg).to_le_bytes());
-                    hdr[4..8].copy_from_slice(&(xg as f32).to_le_bytes());
+                    hdr[4..8].copy_from_slice(&xg.to_le_bytes());
                     hdr.extend(&wsc);
                     (stream.clone_htod(&wq).unwrap(), stream.clone_htod(&hdr).unwrap())
                 })

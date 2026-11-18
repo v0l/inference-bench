@@ -95,7 +95,7 @@ pub fn f32_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 pub fn bytes_f32(b: &[u8]) -> Result<Vec<f32>> {
-    ensure!(b.len() % 4 == 0, "hidden payload of {} bytes is not f32", b.len());
+    ensure!(b.len().is_multiple_of(4), "hidden payload of {} bytes is not f32", b.len());
     Ok(b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect())
 }
 

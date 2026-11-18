@@ -94,7 +94,7 @@ pub fn quantize(w: &[f32], cols: usize, global: f32) -> (Vec<u8>, Vec<u8>) {
         for (i, v) in group.iter().enumerate() {
             let q = if s > 0.0 { f32_to_e2m1(v / s) } else { 0 };
             let at = g * GROUP + i;
-            packed[at / 2] |= if at % 2 == 0 { q } else { q << 4 };
+            packed[at / 2] |= if at.is_multiple_of(2) { q } else { q << 4 };
         }
     }
     debug_assert!(w.len().is_multiple_of(cols));

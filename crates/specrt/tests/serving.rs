@@ -249,7 +249,7 @@ fn scheduled_spec_matches_single(s: &Spec) {
     assert!(most > 8, "decode batches stayed at {most} rows");
     assert_eq!(sched.blocks_used(), 0);
     assert_eq!(sched.exec.rt.state_live_slots(), 1);
-    assert_eq!(sched.exec.rt.state_mapped_bytes() > 0, true);
+    assert!(sched.exec.rt.state_mapped_bytes() > 0);
     for (i, id) in ids.iter().enumerate() {
         assert_eq!(got[id], want[i], "sequence {i}");
     }

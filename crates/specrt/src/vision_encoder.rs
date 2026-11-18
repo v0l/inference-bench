@@ -272,7 +272,7 @@ fn upload(stream: &Arc<CudaStream>, ck: &Checkpoint, name: &str, shape: &[usize]
 }
 
 fn linear(stream: &Arc<CudaStream>, ck: &Checkpoint, base: &str, rows: usize, cols: usize) -> Result<Linear> {
-    ensure!(cols % 8 == 0 && rows % 2 == 0, "{base}: {rows}x{cols} is not a multiple of the mma tile steps");
+    ensure!(cols.is_multiple_of(8) && rows.is_multiple_of(2), "{base}: {rows}x{cols} is not a multiple of the mma tile steps");
     Ok(Linear {
         w: upload(stream, ck, &format!("{base}.weight"), &[rows, cols])?,
         b: upload(stream, ck, &format!("{base}.bias"), &[rows])?,
@@ -416,9 +416,9 @@ impl VisionEncoder {
 
     pub fn load_with(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, jit: &Jit, ck: &Checkpoint, cfg: &VisionConfig, precision: VisionPrecision) -> Result<Self> {
         let precise = precision == VisionPrecision::Exact;
-        ensure!(cfg.hidden_size % cfg.num_heads == 0, "vision hidden_size must divide by num_heads");
+        ensure!(cfg.hidden_size.is_multiple_of(cfg.num_heads), "vision hidden_size must divide by num_heads");
         let head_dim = cfg.hidden_size / cfg.num_heads;
-        ensure!(head_dim % 8 == 0 && head_dim <= 128, "vision head_dim {head_dim} is not supported");
+        ensure!(head_dim.is_multiple_of(8) && head_dim <= 128, "vision head_dim {head_dim} is not supported");
         let act = Act::from_config(cfg.hidden_act.as_deref())?;
         let loaded = jit.load(&module(head_dim, precise, &crate::codegen::cuda_target(ctx)?)?)?;
         let (mut patch, pos_embed, mut blocks, mut main, mut deepstack, mut pool) = if cfg.pooled() {
@@ -428,7 +428,7 @@ impl VisionEncoder {
             let p = prefix(ck)?;
             let channels = cfg.in_channels.unwrap_or(3);
             let patch_cols = channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
-            ensure!(patch_cols % 8 == 0, "patch of {patch_cols} values is not a multiple of 8");
+            ensure!(patch_cols.is_multiple_of(8), "patch of {patch_cols} values is not a multiple of 8");
             let patch = Linear {
                 w: upload(stream, ck, &format!("{p}.patch_embed.proj.weight"), &[cfg.hidden_size, channels, cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size])?,
                 b: upload(stream, ck, &format!("{p}.patch_embed.proj.bias"), &[cfg.hidden_size])?,
@@ -556,7 +556,7 @@ impl VisionEncoder {
     }
 
     fn layernorm(&self, x: &CudaSlice<f32>, nm: &Norm, out: &mut Planes, rows: usize, width: usize) -> Result<()> {
-        ensure!(width % 2 == 0, "layernorm width {width} is odd");
+        ensure!(width.is_multiple_of(2), "layernorm width {width} is odd");
         let w = width as i32;
         let mut b = self.stream.launch_builder(&self.layernorm);
         b.arg(x).arg(&nm.w).arg(&nm.b).arg(&mut out.hi).arg(&mut out.lo).arg(&w).arg(&LAYERNORM_EPS);

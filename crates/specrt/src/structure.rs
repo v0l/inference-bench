@@ -112,12 +112,11 @@ type Raw = (String, String, Vec<usize>);
 fn layer_split(name: &str) -> Option<(String, usize, String)> {
     let parts: Vec<&str> = name.split('.').collect();
     for i in 0..parts.len().saturating_sub(2) {
-        if matches!(parts[i], "layers" | "blk" | "h" | "blocks") {
-            if let Ok(index) = parts[i + 1].parse::<usize>() {
+        if matches!(parts[i], "layers" | "blk" | "h" | "blocks")
+            && let Ok(index) = parts[i + 1].parse::<usize>() {
                 let prefix = parts[..=i].join(".");
                 return Some((prefix, index, parts[i + 2..].join(".")));
             }
-        }
     }
     None
 }

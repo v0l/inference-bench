@@ -46,7 +46,7 @@ impl Matrix {
 
     fn weight(&self, r: usize, c: usize) -> f64 {
         let b = self.packed[(r * self.cols + c) / 2];
-        let nibble = if c % 2 == 0 { b & 15 } else { b >> 4 };
+        let nibble = if c.is_multiple_of(2) { b & 15 } else { b >> 4 };
         let s = e4m3_to_f32(self.scales[(r * self.cols + c) / 16]);
         (e2m1_to_f32(nibble) * s) as f64 * self.inv_global as f64
     }

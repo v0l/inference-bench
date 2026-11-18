@@ -838,22 +838,20 @@ pub fn plan(model: &CostModel, devices: &[Device], objective: Objective) -> Resu
                     }
                     chosen
                 };
-                if let Some(c) = candidate {
-                    if best.as_ref().is_none_or(|b| c.score.better_than(&b.score)) {
+                if let Some(c) = candidate
+                    && best.as_ref().is_none_or(|b| c.score.better_than(&b.score)) {
                         best = Some(c);
                     }
-                }
             }
             table[last][end] = best;
         }
     }
     let mut finish: Option<(Score, usize)> = None;
     for dev in 0..d {
-        if let Some(l) = table[dev][n] {
-            if finish.as_ref().is_none_or(|f| l.score.better_than(&f.0)) {
+        if let Some(l) = table[dev][n]
+            && finish.as_ref().is_none_or(|f| l.score.better_than(&f.0)) {
                 finish = Some((l.score, dev));
             }
-        }
     }
     let Some((_, mut dev)) = finish else {
         let total: u64 = model.layers.iter().map(|l| l.weight_bytes).sum::<u64>() + model.embedding_bytes + model.head_bytes + model.norm_bytes;

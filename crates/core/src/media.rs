@@ -285,7 +285,7 @@ mod tests {
         let mp4 = [0, 0, 0, 0x18, b'f', b't', b'y', b'p', b'm', b'p', b'4', b'2'];
         assert_eq!(Attachment::from_bytes("clip.mp4", &mp4).unwrap().kind, MediaKind::Video);
         assert!(Attachment::from_bytes("notes.txt", b"hello").is_none());
-        let content = content_with_attachments("what is it", &[a.clone()]);
+        let content = content_with_attachments("what is it", std::slice::from_ref(&a));
         let items = extract(&[serde_json::json!({"role": "user", "content": content})], &MediaLimits::default()).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].bytes.as_slice(), png);

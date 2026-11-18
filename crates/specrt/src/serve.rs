@@ -799,8 +799,8 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         if !open && live.is_empty() && encoding(&lane) == 0 {
             break;
         }
-        if let Some(reason) = sched.exec.refresh() {
-            if !live.is_empty() {
+        if let Some(reason) = sched.exec.refresh()
+            && !live.is_empty() {
                 tracing::error!(%reason, "stage chain changed, failing in-flight requests");
                 let mut drop_events = Vec::new();
                 for id in live.keys().copied().collect::<Vec<_>>() {
@@ -811,7 +811,6 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
                 }
                 continue;
             }
-        }
         pulse.enter();
         sched.tick_sessions();
         pulse.leave();

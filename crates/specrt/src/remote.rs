@@ -163,11 +163,10 @@ impl Executor for ChainExecutor {
         if let Some(t) = self.tables.get_mut(slot) {
             t.clear();
         }
-        if let Some(chain) = self.chain.as_mut() {
-            if let Err(e) = chain.free(slot as u32) {
+        if let Some(chain) = self.chain.as_mut()
+            && let Err(e) = chain.free(slot as u32) {
                 self.drop_chain(format!("{e:#}"));
             }
-        }
     }
 
     fn prefill(&mut self, slot: usize, tokens: &[u32], start: usize, sample: Option<(Sampling, u32)>) -> Result<Option<u32>> {
@@ -184,7 +183,7 @@ impl Executor for ChainExecutor {
         for r in rows {
             ensure!(r.slot < self.slots, "slot {} out of {}", r.slot, self.slots);
             let covered = self.tables[r.slot].len() * PAGE;
-            ensure!(r.pos + 1 <= covered, "slot {} has {} blocks, not enough for position {}", r.slot, self.tables[r.slot].len(), r.pos + 1);
+            ensure!(r.pos < covered, "slot {} has {} blocks, not enough for position {}", r.slot, self.tables[r.slot].len(), r.pos + 1);
         }
         self.connect()?;
         let chain = self.chain.as_mut().expect("connected");

@@ -39,7 +39,7 @@ pub fn pool_bytes(a: &ModelAnatomy, ctx: usize, seqs: usize, kv_gb: f64) -> u64 
 }
 
 pub fn pool_tokens(a: &ModelAnatomy, kv_bytes: u64) -> usize {
-    if a.kv_bytes_per_token == 0 { usize::MAX } else { (kv_bytes / a.kv_bytes_per_token) as usize }
+    kv_bytes.checked_div(a.kv_bytes_per_token).map_or(usize::MAX, |n| n as usize)
 }
 
 pub fn pool_holds_one(a: &ModelAnatomy, kv_bytes: u64, ctx: usize) -> bool {

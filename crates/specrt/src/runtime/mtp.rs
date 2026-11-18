@@ -1,5 +1,5 @@
 use super::{
-    BatchBuffers, DeviceAttn, DeviceLayer, DeviceMatrix, DeviceMixer, GemmOut, Planes, Runtime, Sampling, cfg, grid,
+    BatchBuffers, DeviceAttn, DeviceLayer, DeviceMatrix, DeviceMixer, Planes, Runtime, Sampling, cfg, grid,
 };
 use crate::spec::Spec;
 use crate::weights::{Checkpoint, Mixer};
@@ -379,7 +379,7 @@ impl Runtime {
                 unsafe { b.launch(cfg(n as u32, 256)) }?;
                 Ok(())
             }
-            Op::MtpGather => self.copy_rows_by_index(&self.pre.x, &a.src, &m.cg, &m.iota.as_view(), n),
+            Op::MtpGather => self.copy_rows_by_index(&self.pre.x, a.src, &m.cg, &m.iota.as_view(), n),
             Op::MtpNorm => self.rms_split(&m.cg.as_view(), &m.w.norm, &self.pre.xn_planes, n),
             Op::MtpDraft => {
                 let (col, k) = (a.col as i32, m.k as i32);

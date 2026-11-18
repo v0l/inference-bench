@@ -280,14 +280,13 @@ impl Source {
     }
 
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
-        if self.is_direct() {
-            if let Some(f) = &self.direct {
+        if self.is_direct()
+            && let Some(f) = &self.direct {
                 match pread(f, buf, offset) {
                     Err(e) if e.raw_os_error() == Some(22) => self.direct_ok.store(false, Ordering::Relaxed),
                     other => return other,
                 }
             }
-        }
         pread(&self.plain, buf, offset)
     }
 

@@ -110,6 +110,7 @@ impl Default for VisionTokenKeys {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct FamilyVision {
     pub pooled: bool,
     pub bidirectional: bool,
@@ -119,11 +120,6 @@ pub struct FamilyVision {
     pub token_keys: VisionTokenKeys,
 }
 
-impl Default for FamilyVision {
-    fn default() -> Self {
-        FamilyVision { pooled: false, bidirectional: false, soft_tokens_key: String::new(), placeholder: None, wrap: String::new(), token_keys: VisionTokenKeys::default() }
-    }
-}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
