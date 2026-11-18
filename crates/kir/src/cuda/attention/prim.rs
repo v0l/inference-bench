@@ -34,8 +34,8 @@ pub fn online_softmax(mask: &Mask) -> String {
 }
 
 pub fn softmax_update() -> String {
-    let quad_max = |m: &str| format!("        {m} = fmaxf({m}, __shfl_xor_sync(0xffffffff, {m}, 1));\n        {m} = fmaxf({m}, __shfl_xor_sync(0xffffffff, {m}, 2));\n");
-    let quad_sum = |m: &str| format!("        {m} += __shfl_xor_sync(0xffffffff, {m}, 1);\n        {m} += __shfl_xor_sync(0xffffffff, {m}, 2);\n");
+    let quad_max = |m: &str| xor_reduce(Reduce::Max, m, &[1, 2]);
+    let quad_sum = |m: &str| xor_reduce(Reduce::Sum, m, &[1, 2]);
     let mut o = String::new();
     o.push_str(&quad_max("mx0"));
     o.push_str(&quad_max("mx1"));
@@ -156,4 +156,37 @@ pub fn pv_accumulate(out_blocks: &str, mma: &str, v_frag: &str) -> String {
             }}
 "
     )
+}
+
+#[derive(Clone, Copy)]
+pub enum Reduce {
+    Max,
+    Sum,
+}
+
+pub fn xor_reduce(op: Reduce, var: &str, masks: &[u32]) -> String {
+    masks
+        .iter()
+        .map(|m| match op {
+            Reduce::Max => format!("        {var} = fmaxf({var}, __shfl_xor_sync(0xffffffff, {var}, {m}));\n"),
+            Reduce::Sum => format!("        {var} += __shfl_xor_sync(0xffffffff, {var}, {m});\n"),
+        })
+        .collect()
+}
+
+pub fn warp_reduce(op: Reduce, expr: &str) -> String {
+    match op {
+        Reduce::Max => format!("warp_max({expr})"),
+        Reduce::Sum => format!("warp_sum({expr})"),
+    }
+}
+
+pub fn block_reduce(op: Reduce, expr: &str, scratch: &str) -> String {
+    let max = matches!(op, Reduce::Max);
+    format!("block_reduce<{max}>({expr}, {scratch})")
+}
+
+pub fn max_over(indent: usize, var: &str, idx: &str, count: &str, expr: &str) -> String {
+    let pad = " ".repeat(indent);
+    format!("{pad}float {var} = NEG_INF;\n{pad}for (int {idx} = 0; {idx} < {count}; {idx}++) {var} = fmaxf({var}, {expr});\n")
 }

@@ -1,5 +1,8 @@
+use super::prim::{self, Reduce};
+
 pub fn body() -> String {
-    r##"constexpr int ATTN_SPLITS = 64;
+    [
+        r##"constexpr int ATTN_SPLITS = 64;
 constexpr int ATTN_TILE = 16;
 constexpr int ATTN_MIN_CHUNK = 16;
 constexpr int ATTN_BLOCK = 128;
@@ -74,7 +77,9 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
 #pragma unroll
                 for (int j = 0; j < ATTN_V4; j++)
                     dot += q[g][j].x * kr[u][j].x + q[g][j].y * kr[u][j].y + q[g][j].z * kr[u][j].z + q[g][j].w * kr[u][j].w;
-                dot = cap_score(warp_sum(dot) * scale);
+                dot = cap_score("##.to_string(),
+        prim::warp_reduce(Reduce::Sum, "dot"),
+        r##" * scale);
                 float nm = fmaxf(m[g], dot);
                 float corr = expf(m[g] - nm);
                 float p = expf(dot - nm);
@@ -101,9 +106,9 @@ extern "C" __global__ void __launch_bounds__(ATTN_BLOCK) attention_split(const f
             if (lane + 32 * j < HEAD_DIM / 4) acc_s[warp][lane + 32 * j] = acc[g][j];
         __syncthreads();
         for (int d = threadIdx.x; d < HEAD_DIM; d += ATTN_BLOCK) {
-            float M = NEG_INF;
-            for (int w = 0; w < ATTN_WARPS; w++) M = fmaxf(M, m_s[w][g]);
-            float L = 0.0f, A = 0.0f;
+"##.to_string(),
+        prim::max_over(12, "M", "w", "ATTN_WARPS", "m_s[w][g]"),
+        r##"            float L = 0.0f, A = 0.0f;
             for (int w = 0; w < ATTN_WARPS; w++) {
                 float c = m_s[w][g] == NEG_INF ? 0.0f : expf(m_s[w][g] - M);
                 L += l_s[w][g] * c;
@@ -130,7 +135,9 @@ extern "C" __global__ void attention_reduce(const float* part, const int* pos_pt
     int d = threadIdx.x;
     float ms = d < active ? base[d * ATTN_PART + HEAD_DIM] : NEG_INF;
     float ls = d < active ? base[d * ATTN_PART + HEAD_DIM + 1] : 0.0f;
-    float m = warp_max(ms);
+    float m = "##.to_string(),
+        prim::warp_reduce(Reduce::Max, "ms"),
+        r##";
     if (ATTN_SPLITS > 32) {
         __shared__ float wm[ATTN_SPLITS / 32 + 1];
         if ((d & 31) == 0 && d < ATTN_SPLITS) wm[d >> 5] = m;
@@ -150,6 +157,7 @@ extern "C" __global__ void attention_reduce(const float* part, const int* pos_pt
         out[head * HEAD_DIM + d] = total / l * out_gate(qkv, 0, head * HEAD_DIM + d);
     }
 }
-"##
-    .to_string()
+"##.to_string(),
+    ]
+    .concat()
 }

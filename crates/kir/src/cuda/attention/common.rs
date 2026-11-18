@@ -1,5 +1,8 @@
+use super::prim::{self, Reduce};
+
 pub fn body() -> String {
-    r##"__device__ __forceinline__ float cap_score(float s) {
+    [
+        r##"__device__ __forceinline__ float cap_score(float s) {
     return SOFTCAP > 0.0f ? SOFTCAP * tanhf(s / SOFTCAP) : s;
 }
 
@@ -137,7 +140,9 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     float* src = qkv + (size_t)row * QKV_ROW + head * HEAD_DIM;
     float v = d < HEAD_DIM ? src[d] : 0.0f;
     if (QK_NORM && (is_q || is_k)) {
-        float inv = rsqrtf(block_reduce<false>(v * v, scratch) / HEAD_DIM + EPS);
+        float inv = rsqrtf("##.to_string(),
+        prim::block_reduce(Reduce::Sum, "v * v", "scratch"),
+        r##" / HEAD_DIM + EPS);
         const float* w = is_q ? q_norm : k_norm;
         if (d < HEAD_DIM) v = w[d] * (v * inv);
     }
@@ -152,7 +157,9 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     }
     float row_scale = 1.0f;
     if (kv_q(layer) && !is_q) {
-        float amax = block_reduce<true>(fabsf(v), scratch);
+        float amax = "##.to_string(),
+        prim::block_reduce(Reduce::Max, "fabsf(v)", "scratch"),
+        r##";
         row_scale = amax > 0.0f ? amax / FP8_MAX : 1.0f;
     }
     if (d >= HEAD_DIM) return;
@@ -173,6 +180,7 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     if (KV_PLANES == 2) dst[HEAD_DIM + d] = (bf16_t)lo;
 }
 
-"##
-    .to_string()
+"##.to_string(),
+    ]
+    .concat()
 }

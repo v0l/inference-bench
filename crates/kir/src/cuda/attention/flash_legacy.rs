@@ -1,5 +1,8 @@
+use super::prim::{self, Reduce};
+
 pub fn body() -> String {
-    r##"constexpr int FA_BQ = 16;
+    [
+        r##"constexpr int FA_BQ = 16;
 constexpr int FA_BK = 32;
 constexpr int FA_THREADS = 128;
 constexpr int FA_STRIDE = HEAD_DIM + 1;
@@ -64,10 +67,9 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
             s[j] = (t <= pos && t < key_end && (window <= 0 || t > pos - window)) ? cap_score(s[j] * scale) : NEG_INF;
             tile_max = fmaxf(tile_max, s[j]);
         }
-        tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 1));
-        tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 2));
-        tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffff, tile_max, 4));
-        float m_new = fmaxf(m, tile_max);
+"##.to_string(),
+        prim::xor_reduce(Reduce::Max, "tile_max", &[1, 2, 4]),
+        r##"        float m_new = fmaxf(m, tile_max);
         float alpha = m == NEG_INF ? 0.0f : expf(m - m_new);
         float row_sum = 0.0f;
 #pragma unroll
@@ -76,10 +78,9 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
             ps[qr][sub * 4 + j] = p;
             row_sum += p;
         }
-        row_sum += __shfl_xor_sync(0xffffffff, row_sum, 1);
-        row_sum += __shfl_xor_sync(0xffffffff, row_sum, 2);
-        row_sum += __shfl_xor_sync(0xffffffff, row_sum, 4);
-        l = l * alpha + row_sum;
+"##.to_string(),
+        prim::xor_reduce(Reduce::Sum, "row_sum", &[1, 2, 4]),
+        r##"        l = l * alpha + row_sum;
         m = m_new;
 #pragma unroll
         for (int i = 0; i < FA_OUT; i++) o[i] *= alpha;
@@ -98,6 +99,7 @@ extern "C" __global__ void flash_attention(const float* qkv, const bf16_t* k_cac
         for (int i = 0; i < FA_OUT; i++) dst[sub + 8 * i] = o[i] * inv * out_gate(qkv, qi, head * HEAD_DIM + sub + 8 * i);
     }
 }
-"##
-    .to_string()
+"##.to_string(),
+    ]
+    .concat()
 }
