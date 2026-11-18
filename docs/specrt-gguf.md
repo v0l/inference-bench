@@ -162,3 +162,19 @@ Remaining per-step gap on the 7B (llama.cpp 239 and 222 tok/s, specrt 216 and 20
 | Attention reduce fused into `attention_split` | 195 against 216 tok/s at 1,024 |
 | int8 `dp4a` K-quant dot on quantised activations | 201 against 217 tok/s at 1,024 |
 | GEMV block size 32 to 512, grid cap 1 to 8 blocks per SM | within noise of the shipped 256 threads and 2 blocks per SM |
+
+### Tried and dropped: MMQ int8 on Q8_1 activations (#499)
+
+Built as a second multiply kind for GGUF prefill: activations quantised per 32 values to int8 with an f32 scale and sum (`quant_rows_q81`), Q4_K and Q6_K blocks copied raw by `cp.async`, `mma.sync m16n8k32 s8` per 32-wide sub-block with the scale and min applied in fp32, behind `act_quant = "q8_1"` and `[mlp] act_quant = "q8_1"`. The code lives on branch `archive/499-mmq`, commit `d3bef6b` (kernels in `crates/kir/src/cuda/mmq.cu` and `quant_q81.cu`, selection in `kir/src/gemm.rs`, `GemmPath::Mmq`).
+
+Qwen2.5-7B-Instruct Q4_K_M, 1,024 token prefill, GB10 (Spark), alternating runs, tok/s:
+
+| Path | prefill |
+| --- | ---: |
+| bf16 scratch GEMM | 2,666 and 2,676 |
+| q8_1 MMQ | 2,575 and 2,422 |
+| llama.cpp (`llama-bench` pp1024) | 3,015 |
+
+Numerics: Qwen3-0.6B Q4_K_M, 160 token prompt, q8_1 against bf16 activations: mean KL 1.3e-3, max KL 2.6e-2, top-1 148/160. Not compared against llama.cpp logits.
+
+Why it is slower (nsys of one 1,024 token prefill on the Spark, 56 layer calls each): `gate_up_mmq_big` 7.5 ms, `down_mmq_big` 3.8 ms, `qkv` 0.93 ms, `o` 0.84 ms, and the quantise pass 0.18 ms per call (4.9% of the GPU time). The two big GEMMs are 76% of the time, so the multiply loop is the cost, not the quantise pass. Likely causes, not isolated: the sub-block scale and min are applied per mma in fp32 with scalar shared-memory loads of the packed Q4_K header and scales, and a 2-stage pipeline at bk 128 with a 128x128 tile leaves little to hide the raw-block decode. Occupancy on sm_121 and the tile choice were not swept.
