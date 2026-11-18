@@ -8,7 +8,7 @@ Our own tensor-parallel mode, with no NCCL. `serve.tp = N` splits one model acro
 | --- | --- |
 | Shard declarations in `graphs/decoder.toml` | done, `shard = ...` on every `linear` node |
 | Per-rank cut table (`tp::RankCut`) and loader slicing (`Checkpoint::for_rank`) | done, CPU tests on the tiny 27B fixture and on the real 27B NVFP4 checkpoint |
-| Allreduce kir family (`kir::allreduce`, `kir::cuda::emit_allreduce`) | done, goldens, nvcc builds for sm_80 and sm_120 |
+| Allreduce kir family (`kir::allreduce`, `kir::cuda::emit_allreduce`) | done, built from `cuda/allreduce/prim.rs` builders, goldens, nvcc builds for sm_80 and sm_120 |
 | Per-rank communicator (`allreduce::Fabric`, `Comm`) | done, virtual ranks on one GPU and on two GPUs |
 | Plan rewrite: `Partial` buffer, `AllReduce`, `AllReduceNorm` ops (`Plan::for_tp`) | done |
 | Rank runtime (`Runtime::load_rank`) and executor, one thread per rank (`tp_exec::TpExecutor`) | done |
@@ -61,6 +61,8 @@ Barriers are per block. Each block stores an epoch into its peers' flag words wi
 - `Transport::Peer`: device buffers with peer access enabled between contexts.
 - `Transport::SameDevice`: virtual ranks, every rank on one GPU, through device memory. Used for tests.
 - `Transport::HostPinned`: pinned host memory mapped into every context. Used when `cuDeviceCanAccessPeer` is false either way, or when the GPUs sit behind a translating IOMMU (the sysfs `iommu_group/type` is `DMA` or `DMA-FQ`). On this desktop before the `iommu=pt` reboot, the driver reported peer access as OK but kernel stores to the peer never landed (copies read zeros, loads faulted), which is the same fault that hung NCCL with P2P on. The check reads sysfs instead of trusting `canAccessPeer`.
+
+Whenever the transport would be `Peer` or `SameDevice`, `Fabric::new` then runs a timed probe for every ordered GPU pair (`allreduce::peer_writes_land`). A one-thread kernel on the target GPU spins on a flag in its own memory against `%globaltimer`. A kernel on the source GPU stores a magic word there with `st.release.sys`, and the target reports whether it arrived within `PROBE_TIMEOUT` (200 ms). One missed write sends the whole group through pinned host memory, with a warning naming the pair. A machine where peer access fails some other way therefore falls back at init in about 200 ms, instead of trapping at the first barrier. `the_peer_probe_waits_on_a_system_flag_with_a_timer` pins the probe source, and `a_peer_write_that_never_lands_falls_back_to_host_memory_within_the_timeout` drops the store on virtual ranks and checks the fallback (213 ms on the GB10).
 
 ## Runtime
 
@@ -142,6 +144,7 @@ After the reboot with `iommu=pt`, NCCL reaches about 35 GB/s busbw over P2P (sup
 
 | measurement | value |
 | --- | --- |
+| peer write probe on the pair after `iommu=pt` | not measured |
 | allreduce 1 / 8 / 64 rows bf16, ours over peer | not measured |
 | 27B NVFP4 tp2 vs tp1: top-1 and KL | not measured |
 | 27B decode batch 1 and 8, tp1 and tp2 (target tp2 batch 1 at least 1.6x tp1) | not measured |
