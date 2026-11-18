@@ -18,7 +18,7 @@ Sparse layers use `Op::MoeRoute`, `Op::MoeExperts`, `Op::MoeCombine` in place of
 | `moe_quant_f32`, `moe_tiles`, `moe_mma_up[_s]`, `moe_mma_down[_s]` | NVFP4 tensor-core path: activations quantised to fp4, one launch per GEMM over per-expert tiles of the permuted tokens, `mma.kind::mxf4nvf4.block_scale` m16n8k64, gate and up in one pass with SwiGLU in the epilogue, then down |
 | `moe_combine` | weighted sum plus shared expert, added into the residual |
 
-The shared expert is stacked as expert index `experts`, so it goes through the same grouped path. NVFP4 expert weights are stacked per layer with a per-expert inverse global scale. The mma path (`templates/moe_mma.cu`) runs when the spec has NVFP4 experts with `[mlp] act_quant = "fp4"` (read from the checkpoint's `input_activations` by `Spec::from_hf_config_serving`) on sm_120, for 8 or more tokens; 64-row tiles when experts get at least 32 tokens each, else 16-row tiles. Below 8 tokens the per-pair GEMV kernels are faster. It is a template next to `moe.cu`, not a kir family (#609 has not merged here).
+The shared expert is stacked as expert index `experts`, so it goes through the same grouped path. NVFP4 expert weights are stacked per layer with a per-expert inverse global scale. The mma path (`kir::cuda::moe::mma`) runs when the spec has NVFP4 experts with `[mlp] act_quant = "fp4"` (read from the checkpoint's `input_activations` by `Spec::from_hf_config_serving`) on sm_120, for 8 or more tokens; 64-row tiles when experts get at least 32 tokens each, else 16-row tiles. Below 8 tokens the per-pair GEMV kernels are faster. It is a kir family (`kir::moe::Family::GroupedMma`).
 
 ## Correctness
 

@@ -2,40 +2,22 @@ use super::prim;
 
 pub fn body() -> String {
     [
-        r##"__device__ __forceinline__ void mma_fp4(float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa, unsigned sfb) {
-    unsigned short z = 0;
-    asm volatile(
-        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(z), "h"(z), "r"(sfb), "h"(z), "h"(z));
-}
-
-__device__ __forceinline__ unsigned f32x2_to_e2m1x2(float lo, float hi) {
-    unsigned short r;
-    asm("{ .reg .b8 t; cvt.rn.satfinite.e2m1x2.f32 t, %1, %2; cvt.u16.u8 %0, t; }" : "=h"(r) : "f"(hi), "f"(lo));
-    return r & 0xffu;
-}
-
-__device__ __forceinline__ unsigned f32_to_e4m3_bits(float v) {
+        prim::mma_fp4("mma_fp4"),
+        prim::e2m1x2("f32x2_to_e2m1x2"),
+        r##"__device__ __forceinline__ unsigned f32_to_e4m3_bits(float v) {
     return f32x2_to_e4m3x2(v, 0.0f) & 0xffu;
 }
 
-__device__ __forceinline__ void cp_async8_zfill(void* smem, const void* gmem, bool valid) {
-    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
-    int n = valid ? 8 : 0;
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(s), "l"(gmem), "r"(n));
-}
-
-constexpr int F4A_BK = 128;
+"##.to_string(),
+        prim::cp8_zfill("cp_async8_zfill"),
+        r##"constexpr int F4A_BK = 128;
 constexpr int F4A_DATA = F4A_BK / 2;
 constexpr int F4A_SCALES = F4A_BK / FP4_GROUP;
 constexpr int F4A_ROW = F4A_DATA + F4A_SCALES;
 
-__device__ __forceinline__ int f4a_chunk(int r, int c) {
-    return r * F4A_DATA + ((c ^ (r >> 1)) & 3) * 16;
-}
-
+"##.to_string(),
+        prim::swizzle("f4a_chunk", "F4A_DATA"),
+        r##"
 template <int N, int K, int BM, int BN, int WM, int WN, int STAGES, int EPI>
 __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wscales, const unsigned char* xq,
                                          const unsigned char* xs, float* out, bf16_t* out_hi, bf16_t* out_lo, int tokens) {

@@ -8,8 +8,6 @@ fn spec(file: &str) -> Spec {
 }
 
 const KIR_SNIPPETS: &[&str] = &[
-    "cuda/moe.cu",
-    "cuda/moe_mma.cu",
     "cuda/prelude.cu",
     "cuda/quant_fp4.cu",
     "cuda/quant_fp8_block.cu",
@@ -41,6 +39,27 @@ const VERBATIM_QUANT: &[(&str, &str)] = &[
     ("cuda/ggml/decode.rs", "ggml Q4_K, Q5_K, Q6_K, Q8_0 row decoders, to port onto prims (#793)"),
     ("cuda/gemm/prim.rs", "the prim library itself"),
 ];
+
+const VERBATIM_MOE: &[(&str, &str)] = &[
+    ("cuda/moe/route.rs", "top-k routing, permute, combine are MoE-specific; the logits block sum keeps its warp-sum plus smem loop because block_reduce adds a __syncthreads and changes the PTX"),
+    ("cuda/moe/gemv.rs", "expert row dots read per-expert fp4/fp8/bf16 rows; porting onto the shared row dots changes the PTX (#793)"),
+    ("cuda/moe/prim.rs", "re-exports the shared gemm prims plus MoE constants and launch wrappers"),
+];
+
+#[test]
+fn moe_builders_use_shared_prims_unless_listed() {
+    let kir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kir/src");
+    let mma = std::fs::read_to_string(kir.join("cuda/moe/mma.rs")).unwrap();
+    for p in ["prim::mma_fp4", "prim::e2m1x2", "prim::cp8_zfill", "prim::swizzle", "prim::zero_frag", "prim::pipeline_prologue"] {
+        assert!(mma.contains(p), "cuda/moe/mma.rs must build from {p}");
+    }
+    let gemv = std::fs::read_to_string(kir.join("cuda/moe/gemv.rs")).unwrap();
+    assert!(gemv.contains("prim::e2m1_to_f32") && gemv.contains("prim::warp_ids"));
+    assert!(!kir.join("cuda/moe.cu").exists() && !kir.join("cuda/moe_mma.cu").exists());
+    for (f, why) in VERBATIM_MOE {
+        assert!(kir.join(f).exists() && !why.is_empty(), "stale allowlist entry {f}");
+    }
+}
 
 #[test]
 fn gemm_and_ggml_builders_use_prims_unless_listed() {
