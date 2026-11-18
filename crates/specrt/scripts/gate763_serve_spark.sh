@@ -35,7 +35,7 @@ fi
 [ "$mtp" = off ] && sed -i 's/^speculate = true/speculate = false/' "$spec"
 if [ ! -f "$out/tx$len.txt" ] || [ ! -f "$out/tx$warm.txt" ]; then
     run -p MemoryMax=20G cargo build --release --bin kvgate 2>&1 | tail -1
-    run -p MemoryMax=20G cargo build --release --bin inference-bench 2>&1 | tail -1
+    run -p MemoryMax=20G cargo build --release -p inference-bench-cli --bin inference-bench 2>&1 | tail -1
     run "$target/release/kvgate" "$base" transcript "$len" "$out/tx$len.txt"
     run "$target/release/kvgate" "$base" transcript "$warm" "$out/tx$warm.txt"
 fi
