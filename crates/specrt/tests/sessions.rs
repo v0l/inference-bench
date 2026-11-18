@@ -20,9 +20,13 @@ fn spec_for(dir: &str) -> Spec {
 }
 
 fn scheduler(s: &Spec) -> Scheduler<GpuExecutor> {
+    scheduler_with(s, false)
+}
+
+fn scheduler_with(s: &Spec, cache: bool) -> Scheduler<GpuExecutor> {
     let layout = Layout { max_ctx: 1024, slots: 4, kv_blocks: 200, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
     let exec = GpuExecutor::new(Runtime::load_layout(s, layout).unwrap()).unwrap();
-    let cfg = Config { max_num_seqs: 4, prefix_cache: PrefixCacheOptions { enabled: false, ..Default::default() }, ..Config::default() };
+    let cfg = Config { max_num_seqs: 4, prefix_cache: PrefixCacheOptions { enabled: cache, snapshot_interval: 2048, max_snapshots: 4, max_blocks: 0, async_snapshots: false }, ..Config::default() };
     Scheduler::new(exec, cfg)
 }
 
@@ -86,9 +90,12 @@ fn roundtrip(name: &str) {
     turn2.extend(&turn1.tokens);
     turn2.extend(prompt(30).iter().map(|t| (t + 3) % 512));
 
-    let mut fresh = scheduler(&s);
-    let want = run(&mut fresh, turn2.clone(), 64);
-    drop(fresh);
+    let mut uninterrupted = scheduler_with(&s, true);
+    let again = run(&mut uninterrupted, first_prompt.clone(), 40);
+    assert_eq!(again.tokens, turn1.tokens, "the reference history is the same");
+    let want = run(&mut uninterrupted, turn2.clone(), 64);
+    assert_eq!(want.cached, saved[0].tokens, "the reference continues from the same decode written state, no save or restore");
+    drop(uninterrupted);
 
     let (mut b, shared) = with_sessions(&s, &dir, clock);
     assert_eq!(shared.store.list().len(), 1, "the snapshot survives a new process and engine");

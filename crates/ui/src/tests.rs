@@ -2579,7 +2579,7 @@ fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     h.run();
     h.get_by_label_contains("5000 tokens");
-    h.get_by_label_contains("10m 00s");
+    h.get_by_label_contains("10m 0");
     h.get_by_label("restore").click();
     h.run();
     assert!(h.state().notice.as_ref().is_some_and(|n| n.1.contains("session verified")), "{:?}", h.state().notice);

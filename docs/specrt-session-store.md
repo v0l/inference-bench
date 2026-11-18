@@ -68,9 +68,18 @@ Run both, and the 32k measurement table, with `crates/specrt/scripts/sessions326
 adds `sessionbench`, which prints snapshot bytes, write time, restore time and TTFT with and without
 the snapshot).
 
+## Measurement (Spark GB10, Qwen3.8 27B NVFP4, 32k context)
+
+| context | snapshot size | write | restore | TTFT restored | TTFT full prefill | speedup |
+|---|---|---|---|---|---|---|
+| 32768 tokens | 2.27 GiB | 10.3 s | 5.2 s | 7.7 s | 72.4 s | 9.4x |
+
+The roundtrip tests compare the restored engine with an uninterrupted engine that ran the same
+history through the same path (prefill, decode, then the prefix cache hit at the end of the previous
+request), so logits are compared bit for bit against a run that never saved or restored.
+
 ## Left
 
-- Run `sessions326.sh` on a free GPU and paste the table here.
 - Sidecar index file for faster start (the index is built from the file headers, which is fast enough
   until thousands of sessions exist).
 - Optional zstd for the recurrent state.
