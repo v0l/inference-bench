@@ -76,8 +76,21 @@ fn main() -> Result<()> {
     if sampled {
         args.remove(0);
     }
+    let wgpu = args.first().is_some_and(|a| a == "--wgpu");
+    if wgpu {
+        args.remove(0);
+    }
+    if args.first().is_some_and(|a| a == "--text") {
+        let model = args.get(1).context("--text <model> <prompt> [tokens]")?;
+        let prompt = args.get(2).context("--text <model> <prompt> [tokens]")?;
+        let n: usize = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(32);
+        let mut engine = specrt::engine::Engine::load(model, Some(512))?;
+        let reply = engine.generate(prompt, n, Sampling::GREEDY)?;
+        println!("TEXT_BEGIN{}TEXT_END", reply.text);
+        return Ok(());
+    }
     let mut args = args.into_iter();
-    let usage = "usage: bench [--runs N] [--serve] [--kv-gb GB] [--profile] [--speculative] [--sampled] <spec.toml | checkpoint dir | model.gguf> [prompt_len[,prompt_len..]] [new_tokens] [batch]";
+    let usage = "usage: bench [--wgpu] [--runs N] [--serve] [--kv-gb GB] [--profile] [--speculative] [--sampled] <spec.toml | checkpoint dir | model.gguf> [prompt_len[,prompt_len..]] [new_tokens] [batch]";
     let spec_path = PathBuf::from(args.next().context(usage)?);
     let prompts: Vec<usize> = args
         .next()
@@ -89,6 +102,9 @@ fn main() -> Result<()> {
     let batch: usize = args.next().map(|s| s.parse()).transpose()?.unwrap_or(0);
     let spec = load_spec(&spec_path)?;
     let longest = *prompts.iter().max().context(usage)?;
+    if wgpu {
+        return bench_wgpu(&spec, &prompts, new_tokens);
+    }
     if speculative {
         return bench_spec(&spec, new_tokens, batch.max(1), longest);
     }
@@ -294,4 +310,26 @@ fn bench_batch(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize) 
         runs()
     );
     Ok(())
+}
+
+#[cfg(feature = "wgpu")]
+fn bench_wgpu(spec: &Spec, prompts: &[usize], new_tokens: usize) -> Result<()> {
+    let started = std::time::Instant::now();
+    let be = specrt::backends::wgpu::Wgpu::new(None)?;
+    let mut dense = specrt::backends::dense::Dense::load(be, spec, prompts.iter().max().copied().unwrap_or(128) + new_tokens)?;
+    println!("{} adapter={} load={:.2}s weights={:.2} GB", spec.name, dense.description(), started.elapsed().as_secs_f64(), dense.weight_bytes() as f64 / 1e9);
+    for &prompt_len in prompts {
+        let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 1000 + i * 7 % 5000).collect();
+        dense.generate(&prompt, 8.min(new_tokens), Sampling::GREEDY)?;
+        let runs: Vec<Generation> = (0..runs()).map(|_| dense.generate(&prompt, new_tokens, Sampling::GREEDY)).collect::<Result<_>>()?;
+        let prefill = median(runs.iter().map(|g| prompt_len as f64 / g.prefill_secs).collect());
+        let decode = median(runs.iter().map(|g| (new_tokens - 1) as f64 / g.decode_secs).collect());
+        println!("  prompt={prompt_len} prefill={prefill:.1} tok/s decode={decode:.1} tok/s (median of {})", runs.len());
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "wgpu"))]
+fn bench_wgpu(_: &Spec, _: &[usize], _: usize) -> Result<()> {
+    anyhow::bail!("build with --features wgpu")
 }
