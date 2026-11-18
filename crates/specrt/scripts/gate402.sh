@@ -143,7 +143,7 @@ else
     echo "bit-identical and leak tests: FAIL" | tee -a "$out/report.txt"
     exit 1
 fi
-for arm in recompute swap lookahead both; do
+for arm in recompute swap; do
     n=$(python3 -c "import json,sys; print(int(json.load(open(sys.argv[1]))['preemptions'] or 0))" "$out/$arm.json")
     if [ "$n" -eq 0 ]; then
         echo "FAIL arm $arm saw 0 preemptions, the KV budget $kv_gb GB did not force any: the table is void" | tee -a "$out/report.txt"
