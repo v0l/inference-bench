@@ -326,7 +326,15 @@ fn plan_command(data: &Path, spec: &str, config: &Path, context: Option<usize>, 
     use inference_bench_core::specrt_placement::Objective;
     let path = resolve_spec_names(data, spec);
     let spec = inference_bench_core::specrt_spec::Spec::load(Path::new(&path))?;
-    let mut placement = inference_bench_server::ServerConfig::load(config)?.placement;
+    let server = inference_bench_server::ServerConfig::load(config)?;
+    let mut spec = spec;
+    if let Some(r) = &server.runtime {
+        spec.runtime = r.clone();
+    }
+    let mut placement = server.placement.clone();
+    if placement.kv_pool_bytes.is_none() {
+        placement.kv_pool_bytes = server.kv_cache_gb.map(|g| (g * (1u64 << 30) as f64) as u64);
+    }
     if let Some(c) = context {
         placement.context = c;
     }
