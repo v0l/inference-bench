@@ -157,6 +157,8 @@ fn attention_descriptions_build_the_same_kernels_as_the_rust_builders() {
             ("kv_norm_rope", Family::RopeKv),
             ("attention_split", Family::SplitDecode),
             ("attention_reduce", Family::SplitDecode),
+            ("flash_attention", Family::FlashLegacy),
+            ("flash_mma", Family::FlashMma),
             ("batch_decode_attention", Family::GroupedDecode),
             ("batch_decode_combine", Family::GroupedDecode),
         ];

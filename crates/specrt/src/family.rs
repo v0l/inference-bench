@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
+use kir;
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -355,6 +356,10 @@ pub const FAMILY_KIND: &str = "family";
 
 pub fn is_family(table: &toml::Table) -> bool {
     table.get("kind").and_then(|k| k.as_str()) == Some(FAMILY_KIND)
+}
+
+pub fn is_kernel(table: &toml::Table) -> bool {
+    table.get("kind").and_then(|k| k.as_str()) == Some(kir::desc::KIND)
 }
 
 fn merge(base: &mut toml::Table, over: toml::Table) {

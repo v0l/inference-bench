@@ -346,6 +346,9 @@ fn dispatch_specs() -> Vec<(String, Spec)> {
             if name.contains("family-") {
                 continue;
             }
+            if std::fs::read_to_string(&path).map(|t| t.contains("kind = \"kir-kernel\"")).unwrap_or(false) {
+                continue;
+            }
             out.push((name, Spec::load(&path).unwrap()));
         } else if name.ends_with("config.json") && !name.contains("tokenizer") && path.exists() {
             let json = std::fs::read_to_string(&path).unwrap();

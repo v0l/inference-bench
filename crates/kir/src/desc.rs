@@ -33,11 +33,13 @@ pub const COMPOSED: [(&str, &str); 8] = [
     ("clear_branch", include_str!("../kernels/compose_clear_branch.toml")),
 ];
 
-pub const ATTENTION: [(&str, &str); 6] = [
+pub const ATTENTION: [(&str, &str); 8] = [
     ("qk_norm_rope", include_str!("../kernels/qk_norm_rope.toml")),
     ("kv_norm_rope", include_str!("../kernels/kv_norm_rope.toml")),
     ("attention_split", include_str!("../kernels/attention_split.toml")),
     ("attention_reduce", include_str!("../kernels/attention_reduce.toml")),
+    ("flash_attention", include_str!("../kernels/flash_attention.toml")),
+    ("flash_mma", include_str!("../kernels/flash_mma.toml")),
     ("batch_decode_attention", include_str!("../kernels/batch_decode_attention.toml")),
     ("batch_decode_combine", include_str!("../kernels/batch_decode_combine.toml")),
 ];
@@ -173,10 +175,14 @@ impl AttentionShapeDesc {
                 v => Err(format!("{name}: {key:?} is {v}, not a boolean")),
             }
         };
-        let list = |v: &Value, key: &str| -> Result<Vec<f64>, String> {
-            match get(v, key)? {
-                Value::Array(a) => a.iter().map(|x| num(x, key)).collect(),
-                v => Err(format!("{name}: {key:?} is {v}, not a list")),
+        let optional = |v: &Option<Value>, key: &str| -> Result<Vec<f64>, String> {
+            let Some(v) = v else { return Ok(Vec::new()) };
+            match shape.get(v.as_str().unwrap_or_default()) {
+                None if v.as_str().is_some() => Ok(Vec::new()),
+                _ => match get(v, key)? {
+                    Value::Array(a) => a.iter().map(|x| num(x, key)).collect(),
+                    v => Err(format!("{name}: {key:?} is {v}, not a list")),
+                },
             }
         };
         let flags = |v: &Value, key: &str| -> Result<Vec<bool>, String> {
@@ -187,6 +193,7 @@ impl AttentionShapeDesc {
         };
         let mrope = match self.mrope_section.as_ref() {
             None => None,
+            Some(v) if v.as_str().is_some() && shape.get(v.as_str().unwrap()).is_none() => None,
             Some(v) => {
                 let section = match get(v, "mrope_section")? {
                     Value::Array(a) if a.len() == 3 => {
@@ -226,10 +233,7 @@ impl AttentionShapeDesc {
                 high: num(&self.high, "high")?,
                 original: num(&self.original, "original")?,
                 mscale: num(&self.mscale, "mscale")?,
-                freq_factors: match self.freq_factors.as_ref() {
-                    None => Vec::new(),
-                    Some(v) => list(v, "freq_factors")?,
-                },
+                freq_factors: optional(&self.freq_factors, "freq_factors")?,
                 mrope,
             },
             kv_layers: count(&self.kv_layers, "kv_layers")?,
@@ -624,6 +628,8 @@ impl Description {
         let family = match self.family.as_str() {
             "rope_kv_write" => Family::RopeKv,
             "split_decode" => Family::SplitDecode,
+            "flash_scalar" => Family::FlashLegacy,
+            "flash_mma" => Family::FlashMma,
             "grouped_decode" => Family::GroupedDecode,
             f => return Err(format!("{}: unknown attention family {f:?}", self.name)),
         };
