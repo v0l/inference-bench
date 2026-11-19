@@ -73,22 +73,27 @@ struct DecFp4 : DecBase<DecFp4> {
     template <int W> static __device__ __forceinline__ int x_at(int i) { return fp4_t(i, W / FP4_GROUP); }
     template <int K, int ROWS>
     static __device__ __forceinline__ void rows(const void* w, const void* s, int row0, int stride, const float* x, int lane, float* out) {
-        fp4_rows_dot<K, ROWS, 4 / ROWS>(w, (const unsigned char*)s, row0, stride, x, lane, out);
-    }
+"##.to_string(),
+        format!("        {}\n", prim::cp_async_call("fp4_rows_dot<K, ROWS, 4 / ROWS>", &["w", "(const unsigned char*)s", "row0", "stride", "x", "lane", "out"])),
+        r##"    }
     template <int K, int BK, int CPR, int WROW>
     static __device__ __forceinline__ void load(unsigned char* ws, const void* w, const void* s, int r, int n, int kt, int ck) {
         static_assert(BK == F4W_BK, "nvfp4 tiles are 64 wide");
-        if (ck < 2) {
-            cp_async16(ws + r * F4W_ROW + ck * 16, (const unsigned char*)w + (size_t)n * (K / 2) + kt * (BK / 2) + ck * 16);
-        } else {
-            cp_async4(ws + r * F4W_ROW + 32, (const unsigned char*)s + FP4_HEADER + (size_t)n * (K / FP4_GROUP) + kt * (BK / FP4_GROUP));
-        }
-    }
+"##.to_string(),
+        prim::split_copy(
+            "ck < 2",
+            &prim::cp_async_call("cp_async16", &["ws + r * F4W_ROW + ck * 16", "(const unsigned char*)w + (size_t)n * (K / 2) + kt * (BK / 2) + ck * 16"]),
+            &prim::cp_async_call("cp_async4", &["ws + r * F4W_ROW + 32", "(const unsigned char*)s + FP4_HEADER + (size_t)n * (K / FP4_GROUP) + kt * (BK / FP4_GROUP)"]),
+        )
+        .lines()
+        .map(|l| format!("        {l}\n"))
+        .collect::<String>(),
+        r##"    }
     static __device__ __forceinline__ void frag(unsigned* bw, const unsigned char* p, int ks, int t) {
         float sc = e4m3_to_f32(p[32 + ks]);
-        bw[0] = fp4_pair_bf16(p[ks * 8 + t], sc);
-        bw[1] = fp4_pair_bf16(p[ks * 8 + 4 + t], sc);
-    }
+"##.to_string(),
+        ["ks * 8 + t", "ks * 8 + 4 + t"].iter().enumerate().map(|(i, e)| format!("        bw[{i}] = fp4_pair_bf16(p[{e}], sc);\n")).collect::<String>(),
+        r##"    }
     template <int MI, int NJ> static __device__ __forceinline__ void finish(float (&acc)[MI][NJ][4], const void* s) {
         float inv = fp4_inv_global((const unsigned char*)s);
 "##.to_string(),
