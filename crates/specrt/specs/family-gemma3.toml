@@ -35,3 +35,6 @@ image = "image_token_index"
 video = ""
 start = "boi_token_index"
 end = "eoi_token_index"
+
+[runtime]
+split_activations = false

@@ -136,7 +136,7 @@ pub fn linear_dims(spec: &Spec, linear: &str) -> (usize, usize, &'static str, bo
 }
 
 fn split(spec: &Spec, linear: &str, wf: WeightFormat) -> bool {
-    wf != WeightFormat::Q8 && !spec.runtime.unsplit.iter().any(|n| n == linear)
+    wf != WeightFormat::Q8 && spec.split_activations() && !spec.runtime.unsplit.iter().any(|n| n == linear)
 }
 
 pub type KernelChoice = kg::Choice;

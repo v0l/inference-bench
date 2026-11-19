@@ -42,5 +42,6 @@
   },
   "mlp": {
     "activation": "geglu"
-  }
+  },
+  "plain_activations": true
 }

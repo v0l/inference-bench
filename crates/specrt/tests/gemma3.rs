@@ -17,6 +17,7 @@ fn spec() -> Spec {
     let mut spec = Spec::from_hf_config(&json).unwrap();
     spec.name = NAME.into();
     spec.repo = fixture().display().to_string();
+    spec.runtime.split_activations = Some(true);
     spec
 }
 

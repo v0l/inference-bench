@@ -94,6 +94,7 @@ pub fn entries(view: &View) -> Vec<Entry> {
     add("mtp and runtime", "fuse", yes(r.fuse), src);
     add("mtp and runtime", "tile", tile.into(), src);
     add("mtp and runtime", "gemm_fp32", yes(r.gemm_fp32), src);
+    add("mtp and runtime", "split activations", yes(s.split_activations()), src);
     add("derived", "total parameters", params_text(a.total_params), "derived");
     add("derived", "active parameters per token", params_text(a.decode_params), "derived");
     add("derived", "weights", human_size(a.total_bytes), "derived");

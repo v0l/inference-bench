@@ -143,5 +143,6 @@
   "mlp": {
     "activation": "swiglu",
     "fused_gate_up": true
-  }
+  },
+  "plain_activations": true
 }

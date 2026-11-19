@@ -70,5 +70,6 @@
       "start": 590,
       "end": 591
     }
-  }
+  },
+  "plain_activations": true
 }

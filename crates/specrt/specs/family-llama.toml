@@ -10,3 +10,6 @@ gguf = ["llama"]
 
 [gguf]
 permuted_qk = true
+
+[runtime]
+split_activations = false

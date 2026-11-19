@@ -8,3 +8,6 @@ architectures = ["SmolLM3ForCausalLM"]
 
 [rope]
 nope_flags = "no_rope_layers"
+
+[runtime]
+split_activations = false

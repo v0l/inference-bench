@@ -32,5 +32,6 @@
   },
   "mlp": {
     "activation": "swiglu"
-  }
+  },
+  "plain_activations": true
 }

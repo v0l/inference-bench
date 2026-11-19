@@ -160,6 +160,7 @@ fn matches_hf(spec_file: &str, fixture: &str) {
     let mut from_hf = derived(fixture);
     from_hf.name = spec.name.clone();
     from_hf.repo = spec.repo.clone();
+    from_hf.plain_activations = false;
     assert_eq!(spec, from_hf);
 }
 

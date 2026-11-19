@@ -141,6 +141,8 @@ pub struct RuntimeOptions {
     pub prefill_chunk: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unsplit: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_activations: Option<bool>,
     pub gemm_fp32: bool,
     pub kv_dtype: KvDtype,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,7 +236,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), gemm_fp32: false, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 
@@ -694,6 +696,8 @@ pub struct Spec {
     pub vision: Option<crate::vision::Vision>,
     #[serde(default, skip_serializing_if = "RuntimeOptions::is_default")]
     pub runtime: RuntimeOptions,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub plain_activations: bool,
 }
 
 pub const MAX_DRAFT_TOKENS: usize = 3;
@@ -1439,8 +1443,13 @@ impl Spec {
             linear_attention,
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             runtime: RuntimeOptions::default(),
+            plain_activations: !family.runtime.split_activations,
         };
         Ok(spec)
+    }
+
+    pub fn split_activations(&self) -> bool {
+        self.runtime.split_activations.unwrap_or(!self.plain_activations)
     }
 
     pub fn validate(&self) -> Result<()> {

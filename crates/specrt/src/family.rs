@@ -111,6 +111,18 @@ pub struct FamilyMlp {
     pub fused_gate_up: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyRuntime {
+    pub split_activations: bool,
+}
+
+impl Default for FamilyRuntime {
+    fn default() -> Self {
+        FamilyRuntime { split_activations: true }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyEmbedding {
@@ -332,6 +344,8 @@ pub struct Family {
     pub multipliers: FamilyMultipliers,
     #[serde(default)]
     pub mlp: FamilyMlp,
+    #[serde(default)]
+    pub runtime: FamilyRuntime,
     #[serde(default)]
     pub embedding: FamilyEmbedding,
     #[serde(default)]
