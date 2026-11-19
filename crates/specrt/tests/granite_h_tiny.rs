@@ -102,3 +102,33 @@ fn granite_h_tiny_resumes_from_a_checkpointed_prefix_bit_identically() {
         (t0, t2) = (out[0], out[1]);
     }
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU with 20 GB free and GRANITE_H_TINY_DIR"]
+fn granite_h_tiny_prefill_speed() {
+    use specrt::codegen::PAGE;
+    use specrt::runtime::{Layout, Sampling};
+    let s = spec();
+    let vocab = s.dims.vocab as u32;
+    let max_ctx: usize = 16384 + 64;
+    let pages = max_ctx.div_ceil(PAGE);
+    let layout = Layout { max_ctx, slots: 1, kv_blocks: pages, prefill_chunk: 2048, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let mut rt = Runtime::load_layout(&s, layout).unwrap();
+    let mut st = rt.stepper().unwrap();
+    rt.set_block_table(0, &(0..pages as u32).collect::<Vec<_>>()).unwrap();
+    for len in [4096usize, 16384] {
+        let prompt: Vec<u32> = (0..len as u32).map(|i| (i * 7919 + 13) % vocab).collect();
+        let mut best = f64::MAX;
+        for _ in 0..4 {
+            rt.reset_slot(0).unwrap();
+            let t = std::time::Instant::now();
+            for at in (0..len).step_by(2048) {
+                let end = (at + 2048).min(len);
+                let sample = (end == len).then_some((Sampling::GREEDY, 0));
+                rt.prefill_slot(&mut st, 0, &prompt[at..end], at, sample).unwrap();
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("{NAME} prefill {len} tokens: {:.0} tok/s", len as f64 / best);
+    }
+}

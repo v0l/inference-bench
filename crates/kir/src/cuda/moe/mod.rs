@@ -3,6 +3,7 @@ use crate::moe::{Family, MoeKernel};
 mod gemv;
 mod mma;
 mod mma8;
+mod mma_bf16;
 mod prim;
 mod route;
 
@@ -32,6 +33,10 @@ pub fn emit_moe(kernels: &[MoeKernel]) -> Result<String, String> {
             Family::GroupedMx => {
                 out.push('\n');
                 out.push_str(&mma::grouped(true));
+            }
+            Family::GroupedMmaBf16 => {
+                out.push('\n');
+                out.push_str(&mma_bf16::grouped());
             }
             Family::GroupedMmaFp8 => {
                 out.push('\n');

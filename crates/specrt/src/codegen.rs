@@ -10,7 +10,7 @@ pub use crate::gemm::{
 
 pub const MOE_KERNELS: &[&str] = kir::moe::Family::Experts.kernels();
 pub const MOE_MMA_KERNELS: &[&str] = kir::moe::Family::GroupedMma.kernels();
-pub use kir::moe::{mma8_smem as moe_mma8_smem, MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
+pub use kir::moe::{mma8_smem as moe_mma8_smem, mma_bf16_smem as moe_mma_bf16_smem, MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
 
 pub fn moe_mma_enabled(spec: &Spec, target: &kir::Target) -> bool {
     let Some(m) = &spec.moe else { return false };
@@ -19,6 +19,16 @@ pub fn moe_mma_enabled(spec: &Spec, target: &kir::Target) -> bool {
         None => spec.mlp.quant == Some(Quant::Nvfp4G16),
     };
     weights && spec.mlp.act_quant == crate::spec::ActQuant::Fp4 && target.compute_capability.0 >= 12
+}
+
+pub fn moe_mma_bf16_enabled(spec: &Spec, target: &kir::Target) -> bool {
+    let Some(m) = &spec.moe else { return false };
+    spec.mlp.quant.unwrap_or(spec.quant) == Quant::Bf16
+        && m.expert_block.is_none()
+        && target.has(kir::Feature::Mma16816)
+        && target.has(kir::Feature::CpAsync)
+        && m.expert_intermediate.is_multiple_of(64)
+        && spec.dims.hidden.is_multiple_of(32)
 }
 
 pub fn moe_mma_fp8_enabled(spec: &Spec, target: &kir::Target) -> bool {
@@ -57,6 +67,9 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
     if moe_mma_enabled(spec, target) {
         let family = if m.expert_block.is_some() { kir::moe::Family::GroupedMx } else { kir::moe::Family::GroupedMma };
         out.push(kir::moe::MoeKernel::new(target, family, shape.clone()).map_err(anyhow::Error::msg)?);
+    }
+    if moe_mma_bf16_enabled(spec, target) {
+        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::GroupedMmaBf16, shape.clone()).map_err(anyhow::Error::msg)?);
     }
     if moe_mma_fp8_enabled(spec, target) {
         out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::GroupedMmaFp8, shape).map_err(anyhow::Error::msg)?);
