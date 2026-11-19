@@ -38,4 +38,12 @@ The 0.8x target at 1,024 tokens is reached on phi3 only. phi3's vLLM column did 
 
 ## qwen3_5 (#815)
 
-Qwen3.5-9B on the Spark, prefill paired A/B (split vs single plane, 4 rounds): 1024 tokens 1850 to 2040-2190 tok/s (about 1.11x), 4096 tokens 1720 to 2020-2150 (about 1.20x); decode level. Distance between the two paths on 235 prompt rows: mean KL 1.1e-5, max 2.1e-4, top-1 234 of 235 identical. `family-qwen3_5.toml` now sets `split_activations = false`; `[runtime] split_activations = true` restores the exact path. The remaining gap to llama.cpp is the bf16 GEMM main loop (gate_up_mma_big 45% of prefill) and gdn_chunk_prep/scan (5%).
+Qwen3.5-9B on the Spark, prefill paired A/B (split vs single plane, 4 rounds): 1024 tokens 1850 to 2040-2190 tok/s (about 1.11x), 4096 tokens 1720 to 2020-2150 (about 1.20x); decode level. Against fp32 transformers (CPU, TF32 off, 312 rows of 8 prompts, same prompts as the other families):
+
+| path | mean KL | max KL | top-1 of 312 |
+|---|---|---|---|
+| vLLM | 2.78e-04 | 1.54e-03 | 306 |
+| specrt split (old default) | 1.1e-10 | 9.9e-10 | 312 |
+| specrt single plane (new default) | 1.07e-05 | 2.09e-04 | 311 |
+
+Single plane is 26x closer to fp32 than vLLM on mean KL, 7x on max, with more top-1 matches. Rerun: `envelope <checkpoint> prompts.json out split plain` then `envelope.py compare`. `family-qwen3_5.toml` now sets `split_activations = false`; `[runtime] split_activations = true` restores the exact path. The remaining gap to llama.cpp is the bf16 GEMM main loop (gate_up_mma_big 45% of prefill) and gdn_chunk_prep/scan (5%).

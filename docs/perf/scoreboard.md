@@ -43,6 +43,8 @@ Ratios are specrt / best competitor, above 1.00 means we are faster. Rows are re
 
 
 
+
+
 | family | model | ours decode b1 | ours prefill | ours decode b8 | best competitor | their decode b1 | their prefill | their decode b8 | decode ratio | prefill ratio | b8 ratio | date | commit | command |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | gemma3 | `gemma-3-1b-it` | 100.4 | 18408.3 | 670.5 | llama.cpp/vllm | 101.5 | 26430.8 | 743.6 | 0.99 | 0.70 | 0.90 | 2026-11-19 | 9f648cd | `crates/specrt/scripts/perfpass.sh gemma3 --model /home/kieran/ib-gates/821/models/gemma-3-1b-it --host spark` |
@@ -54,5 +56,5 @@ Ratios are specrt / best competitor, above 1.00 means we are faster. Rows are re
 | phi3 | `Phi-3-mini-4k-instruct` | 25.1 | 4610.8 | 203.0 | llama.cpp | 28.7 | 5763.5 | 191.4 | 0.87 | 0.80 | 1.06 | 2026-11-19 | 9f648cd | `crates/specrt/scripts/perfpass.sh phi3 --model /home/kieran/ib-gates/821/models/Phi-3-mini-4k-instruct --host spark` |
 | qwen2 | `060db6499f32faf8b98477b0a26969ef7d8b9987` | 191.3 | 31007.0 | 1350.0 | llama.cpp/vllm | 195.5 | 43384.1 | 1338.6 | 0.98 | 0.71 | 1.01 | 2026-11-19 | 5c53f27 | `crates/specrt/scripts/perfpass.sh qwen2 --model /home/kieran/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987 --host spark` |
 | qwen3 | `qwen3-0.6b.toml` | 140.0 | 21997.5 | 1081.9 | llama.cpp | 158.9 | 23136.2 | 994.4 | 0.88 | 0.95 | 1.09 | 2026-11-19 | 5c53f27 | `crates/specrt/scripts/perfpass.sh qwen3 --model /home/kieran/ib-gates/803/src/crates/specrt/specs/qwen3-0.6b.toml --host spark` |
-| qwen3_5 | `Qwen3.5-9B` | 12.8 | 1404.4 | 176.1 | llama.cpp | 13.0 | 2580.1 | 72.0 | 0.99 | 0.54 | 2.45 | 2026-11-19 | 0338df9 | `crates/specrt/scripts/perfpass.sh qwen3_5 --model /home/kieran/models/Qwen3.5-9B --host spark` |
+| qwen3_5 | `Qwen3.5-9B` | 12.5 | 2180.0 | 180.4 | llama.cpp | 12.9 | 2457.2 | 69.6 | 0.97 | 0.89 | 2.59 | 2026-11-19 | d9d799c | `crates/specrt/scripts/perfpass.sh qwen3_5 --model /home/kieran/models/Qwen3.5-9B --host spark` |
 | smollm3 | `SmolLM3-3B` | 33.4 | 5808.3 | 264.3 | llama.cpp/vllm | 35.2 | 9055.0 | 259.4 | 0.95 | 0.64 | 1.02 | 2026-11-19 | 9f648cd | `crates/specrt/scripts/perfpass.sh smollm3 --model /home/kieran/ib-gates/821/models/SmolLM3-3B --host spark` |
