@@ -145,5 +145,5 @@ fn gemv_wrappers_golden_and_refusals() {
 #[ignore = "writes the linear_coop WGSL to KIR_DUMP_COOP"]
 fn dump_linear_coop_wgsl() {
     let Some(path) = std::env::var_os("KIR_DUMP_COOP") else { return };
-    std::fs::write(path, kir::wgsl::emit_linear_coop_op(&shape(0, 128))).unwrap();
+    std::fs::write(path, kir::wgsl::emit_linear_coop_op(&shape(0, 128), kir::wgsl::SgVariant::Any)).unwrap();
 }

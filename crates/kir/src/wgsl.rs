@@ -460,15 +460,88 @@ pub const COOP_TOKENS: u32 = 64;
 pub const COOP_ROWS: u32 = 64;
 pub const COOP_K: u32 = 32;
 
-pub fn emit_linear_coop_op(s: &crate::ops::WgslShape) -> String {
+pub fn emit_linear_coop_op(s: &crate::ops::WgslShape, variant: SgVariant) -> String {
     let mut out = String::from("enable wgpu_cooperative_matrix;\n");
     out.push_str(&ops_header(s));
-    out.push_str(&linear_coop());
+    out.push_str(&linear_coop(variant));
     out.push_str(&ggml_decode());
     out
 }
 
-fn linear_coop() -> String {
+const COOP_DENSE: &str = r####"let wa = wdata[(base + 2u * c) >> 2u];
+let wb = wdata[((base + 2u * c) >> 2u) + 1u];
+w0 = bitcast<f32>(wa << 16u);
+w1 = bitcast<f32>(wa & 0xffff0000u);
+w2 = bitcast<f32>(wb << 16u);
+w3 = bitcast<f32>(wb & 0xffff0000u);
+"####;
+
+const COOP_Q4K: &str = r####"let sb = base + (c / 256u) * 144u;
+let i = c % 256u;
+let j = i / 64u;
+let hi = (i % 64u) >= 32u;
+let sm = scale_min_k4(2u * j + select(0u, 1u, hi), sb);
+let d1 = wf16(sb) * f32(sm.x);
+let mm = wf16(sb + 2u) * f32(sm.y);
+var q = wdata[(sb + 16u + 32u * j + (i % 32u)) >> 2u];
+if (hi) {
+    q = q >> 4u;
+}
+w0 = d1 * f32(q & 0xfu) - mm;
+w1 = d1 * f32((q >> 8u) & 0xfu) - mm;
+w2 = d1 * f32((q >> 16u) & 0xfu) - mm;
+w3 = d1 * f32((q >> 24u) & 0xfu) - mm;
+"####;
+
+const COOP_Q6K: &str = r####"let sb = base + (c / 256u) * 224u;
+let i = c % 256u;
+let hr = i / 128u;
+let r = i % 128u;
+let seg = r / 32u;
+let l = r % 32u;
+let ql = wdata[(sb + 64u * hr + (seg & 1u) * 32u + l) >> 2u] >> (4u * (seg >> 1u));
+let qh = wdata[(sb + 128u + 32u * hr + l) >> 2u] >> (2u * seg);
+let v = (ql & 0x0f0f0f0fu) | ((qh & 0x03030303u) << 4u);
+let dd = wf16(sb + 208u) * wi8(sb + 192u + 8u * hr + r / 16u);
+w0 = dd * (f32(v & 0xffu) - 32.0);
+w1 = dd * (f32((v >> 8u) & 0xffu) - 32.0);
+w2 = dd * (f32((v >> 16u) & 0xffu) - 32.0);
+w3 = dd * (f32(v >> 24u) - 32.0);
+"####;
+
+const COOP_FALLBACK: &str = r####"w0 = dequant_at(base, code, c);
+w1 = dequant_at(base, code, c + 1u);
+w2 = dequant_at(base, code, c + 2u);
+w3 = dequant_at(base, code, c + 3u);
+"####;
+
+fn indent(body: &str, by: usize) -> String {
+    let pad = " ".repeat(by);
+    body.lines().map(|l| format!("{pad}{l}\n")).collect()
+}
+
+fn coop_load(variant: SgVariant) -> String {
+    let head = r####"                let entry = ents[n];
+                let base = (entry >> 3u) * 16u;
+                let code = entry & 7u;
+"####;
+    let chain = match variant {
+        SgVariant::Bf16 => indent(COOP_DENSE, 0),
+        SgVariant::Q4K => indent(COOP_Q4K, 0),
+        SgVariant::Q6K => indent(COOP_Q6K, 0),
+        SgVariant::Any => format!(
+            "{}{}{}{}",
+            format!("    if (code == 4u) {{\n{}", indent(COOP_DENSE, 4)),
+            format!("    }} else if (code == 0u) {{\n{}", indent(COOP_Q4K, 4)),
+            format!("    }} else if (code == 2u) {{\n{}", indent(COOP_Q6K, 4)),
+            format!("    }} else {{\n{}    }}\n", indent(COOP_FALLBACK, 4))
+        ),
+    };
+    format!("{head}{chain}            }}\n")
+}
+
+fn linear_coop(variant: SgVariant) -> String {
+    let load = coop_load(variant);
     format!(
         "{bind}
 const BM: u32 = {COOP_TOKENS}u;
@@ -514,54 +587,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                 xv = x[(x_row0 + t) * cols4 + c / 4u];
             }}
             if (c < cols) {{
-                let entry = ents[n];
-                let base = (entry >> 3u) * 16u;
-                let code = entry & 7u;
-                if (code == 4u) {{
-                    let wa = wdata[(base + 2u * c) >> 2u];
-                    let wb = wdata[((base + 2u * c) >> 2u) + 1u];
-                    w0 = bitcast<f32>(wa << 16u);
-                    w1 = bitcast<f32>(wa & 0xffff0000u);
-                    w2 = bitcast<f32>(wb << 16u);
-                    w3 = bitcast<f32>(wb & 0xffff0000u);
-                }} else if (code == 0u) {{
-                    let sb = base + (c / 256u) * 144u;
-                    let i = c % 256u;
-                    let j = i / 64u;
-                    let hi = (i % 64u) >= 32u;
-                    let sm = scale_min_k4(2u * j + select(0u, 1u, hi), sb);
-                    let d1 = wf16(sb) * f32(sm.x);
-                    let mm = wf16(sb + 2u) * f32(sm.y);
-                    var q = wdata[(sb + 16u + 32u * j + (i % 32u)) >> 2u];
-                    if (hi) {{
-                        q = q >> 4u;
-                    }}
-                    w0 = d1 * f32(q & 0xfu) - mm;
-                    w1 = d1 * f32((q >> 8u) & 0xfu) - mm;
-                    w2 = d1 * f32((q >> 16u) & 0xfu) - mm;
-                    w3 = d1 * f32((q >> 24u) & 0xfu) - mm;
-                }} else if (code == 2u) {{
-                    let sb = base + (c / 256u) * 224u;
-                    let i = c % 256u;
-                    let hr = i / 128u;
-                    let r = i % 128u;
-                    let seg = r / 32u;
-                    let l = r % 32u;
-                    let ql = wdata[(sb + 64u * hr + (seg & 1u) * 32u + l) >> 2u] >> (4u * (seg >> 1u));
-                    let qh = wdata[(sb + 128u + 32u * hr + l) >> 2u] >> (2u * seg);
-                    let v = (ql & 0x0f0f0f0fu) | ((qh & 0x03030303u) << 4u);
-                    let dd = wf16(sb + 208u) * wi8(sb + 192u + 8u * hr + r / 16u);
-                    w0 = dd * (f32(v & 0xffu) - 32.0);
-                    w1 = dd * (f32((v >> 8u) & 0xffu) - 32.0);
-                    w2 = dd * (f32((v >> 16u) & 0xffu) - 32.0);
-                    w3 = dd * (f32(v >> 24u) - 32.0);
-                }} else {{
-                    w0 = dequant_at(base, code, c);
-                    w1 = dequant_at(base, code, c + 1u);
-                    w2 = dequant_at(base, code, c + 2u);
-                    w3 = dequant_at(base, code, c + 3u);
-                }}
-            }}
+{load}
             let so = ((m / 8u) * (BK / 8u) + (kq * 4u) / 8u) * 64u + (m % 8u) * 8u + (kq * 4u) % 8u;
             sh[so] = xv.x;
             sh[so + 1u] = xv.y;
@@ -597,6 +623,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     }}
 }}
 ",
+        load = load,
         bind = storage(&[("x", false, "vec4<f32>"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
         woff = COOP_K * COOP_TOKENS,
         os = (COOP_TOKENS * COOP_ROWS).max(COOP_K * (COOP_TOKENS + COOP_ROWS)),

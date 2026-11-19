@@ -165,7 +165,9 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         if spec.attention.head_dim.is_multiple_of(8) && spec.attention.head_dim <= 256 {
             out.push(WgslKernel { name: "flash_coop", source: kir::wgsl::emit_flash_coop_op(&shape), bindings: vec![Read, Read, Read, Write, Uniform] });
         }
-        out.push(WgslKernel { name: "linear_coop", source: kir::wgsl::emit_linear_coop_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
+        for (name, variant) in [("linear_coop", SgVariant::Any), ("linear_coop_bf16", SgVariant::Bf16), ("linear_coop_q4k", SgVariant::Q4K), ("linear_coop_q6k", SgVariant::Q6K)] {
+            out.push(WgslKernel { name, source: kir::wgsl::emit_linear_coop_op(&shape, variant), bindings: vec![Read, Write, Read, Read, Uniform] });
+        }
     }
     for k in crate::gemm::gemm_kernels(spec, target)?.kernels {
         let bindings = kir::wgsl::gemm_bindings(&k)
@@ -180,6 +182,15 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         out.push(WgslKernel { name: crate::gemm::intern(&k.name), source, bindings });
     }
     Ok(out)
+}
+
+pub fn coop_kernel_for(rows: &[u32]) -> &'static str {
+    match sg_kernel_for(rows) {
+        "linear_sg_bf16" => "linear_coop_bf16",
+        "linear_sg_q4k" => "linear_coop_q4k",
+        "linear_sg_q6k" => "linear_coop_q6k",
+        _ => "linear_coop",
+    }
 }
 
 pub fn sg_kernel_for(rows: &[u32]) -> &'static str {
