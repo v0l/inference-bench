@@ -181,6 +181,11 @@ pub struct ModelStatus {
     pub failed: Option<String>,
 }
 
+fn remapped(requested: &str, cfg: ModelConfig) -> ModelConfig {
+    tracing::debug!(requested = %requested, served = %cfg.id, "answering an unknown model name with the only loaded model");
+    cfg
+}
+
 pub struct Manager {
     config: Arc<ServerConfig>,
     factory: Arc<dyn EngineFactory>,
@@ -287,18 +292,27 @@ impl Manager {
     }
 
     pub fn resolve(&self, id: &str) -> Result<ModelConfig, ApiError> {
-        if self.source.is_some() {
-            return match self.source_models().into_iter().find(|m| m.id == id || m.aliases.iter().any(|a| a == id)) {
-                Some(m) => Ok(ModelConfig { id: m.id, ..ModelConfig::default() }),
-                None => Err(ApiError::model_not_found(id)),
+        self.resolve_named(id).map(|(cfg, _)| cfg)
+    }
+
+    pub fn resolve_named(&self, id: &str) -> Result<(ModelConfig, bool), ApiError> {
+        if let Some(source) = &self.source {
+            if let Some(m) = self.source_models().into_iter().find(|m| m.id == id || m.aliases.iter().any(|a| a == id)) {
+                return Ok((ModelConfig { id: m.id, ..ModelConfig::default() }, false));
+            }
+            let loaded = source.loaded();
+            return match loaded.as_slice() {
+                [only] if self.config.any_model_name => Ok((remapped(id, ModelConfig { id: only.id.clone(), ..ModelConfig::default() }), true)),
+                _ => Err(ApiError::model_not_found(id)),
             };
         }
         if let Some(m) = self.config.model(id) {
-            return Ok(m.clone());
+            return Ok((m.clone(), false));
         }
-        match self.config.models.is_empty() {
-            true => Ok(ModelConfig { id: id.to_string(), ..ModelConfig::default() }),
-            false => Err(ApiError::model_not_found(id)),
+        match self.config.models.as_slice() {
+            [] => Ok((ModelConfig { id: id.to_string(), ..ModelConfig::default() }, false)),
+            [only] if self.config.any_model_name => Ok((remapped(id, only.clone()), true)),
+            _ => Err(ApiError::model_not_found(id)),
         }
     }
 

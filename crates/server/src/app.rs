@@ -537,6 +537,7 @@ async fn embeddings() -> ApiError {
 
 pub(crate) struct Params {
     pub(crate) model: String,
+    pub(crate) shown_model: String,
     messages: Vec<Message>,
     openai_messages: Option<Vec<Value>>,
     template_vars: Value,
@@ -764,6 +765,7 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
     };
     let think = think_cap(state, body, output.reasoning, max_tokens);
     Ok(Params {
+        shown_model: model.clone(),
         model,
         messages,
         openai_messages: chat.then(|| body["messages"].as_array().cloned().unwrap_or_default()),
@@ -1120,7 +1122,10 @@ pub(crate) async fn prepare(state: Arc<AppState>, body: Value, chat: bool, salt:
         }
     }
     let mut p = parse_params(&state, &body, chat)?;
-    p.model = state.manager.resolve(&p.model)?.id;
+    let requested = p.model.clone();
+    let (cfg, remapped) = state.manager.resolve_named(&requested)?;
+    p.model = cfg.id;
+    p.shown_model = if remapped { requested } else { p.model.clone() };
     let max_tokens = p.sampling.max_tokens;
     let cancel = Arc::new(AtomicBool::new(false));
     let guard = CancelOnDrop(cancel.clone());
@@ -1172,7 +1177,7 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
     let Prepared { p, receivers, guard, max_tokens } = prepare(state, body, chat, salt).await?;
     let id = format!("{}-{}", if chat { "chatcmpl" } else { "cmpl" }, &uuid::Uuid::new_v4().simple().to_string()[..24]);
     if p.stream {
-        let events = sse_events(receivers, guard, id, p.model, max_tokens, chat, p.include_usage, p.output);
+        let events = sse_events(receivers, guard, id, p.shown_model, max_tokens, chat, p.include_usage, p.output);
         return Ok(Sse::new(events).keep_alive(KeepAlive::default()).into_response());
     }
     let mut done = Vec::with_capacity(p.n);
@@ -1197,7 +1202,7 @@ async fn generate_endpoint(state: Arc<AppState>, body: Value, chat: bool, salt: 
         .collect();
     let total = merged_usage(done.iter().map(|c| &c.generation));
     let body = json!({
-        "id": id, "object": if chat { "chat.completion" } else { "text_completion" }, "created": created, "model": p.model,
+        "id": id, "object": if chat { "chat.completion" } else { "text_completion" }, "created": created, "model": p.shown_model,
         "choices": choices,
         "usage": total,
     });

@@ -157,6 +157,21 @@ fn a_model_that_is_not_loaded_is_a_404_model_not_found() {
 }
 
 #[test]
+fn any_model_name_applies_only_while_exactly_one_model_is_loaded() {
+    let app = app_rig_with("any_model_name = true", Engine::with_factory(Arc::new(|| {}), ScriptedModel::factory(script())));
+    let (status, _) = app.chat(say(Some("x")));
+    assert_eq!(status, 404);
+    app.load("org/one", "One");
+    let (status, body) = app.chat(say(Some("x")));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["model"], "x");
+    app.unload();
+    let (status, _) = app.chat(say(Some("x")));
+    assert_eq!(status, 404);
+    app.rig.stop();
+}
+
+#[test]
 fn the_loaded_model_answers_by_id_by_repo_and_when_the_model_is_omitted() {
     let app = app_rig();
     app.load("org/one", "One");

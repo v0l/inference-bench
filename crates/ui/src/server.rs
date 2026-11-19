@@ -69,9 +69,10 @@ impl Default for ServerState {
 }
 
 impl ServerState {
-    fn launch(&self, engine: Handle, bind: String, key: &str) -> anyhow::Result<ServerHandle> {
+    fn launch(&self, engine: Handle, bind: String, key: &str, any_model_name: bool) -> anyhow::Result<ServerHandle> {
         let mut config = ServerConfig {
             bind,
+            any_model_name,
             shutdown_grace_secs: 2,
             max_num_seqs: Some(inference_bench_core::engine::MAX_PARALLEL),
             specs: inference_bench_server::config::SpecsSection { auto_update: false, ..Default::default() },
@@ -88,9 +89,9 @@ impl ServerState {
         self.runtime.block_on(Server::new(config).with_factory(factory).with_model_source(source).with_gpu_probe(std::sync::Arc::new(|| None)).start())
     }
 
-    pub fn start(&mut self, engine: Handle, port: u16, key: &str, lan: bool) {
+    pub fn start(&mut self, engine: Handle, port: u16, key: &str, lan: bool, any_model_name: bool) {
         let bind = format!("{}:{port}", if lan { "0.0.0.0" } else { "127.0.0.1" });
-        match self.launch(engine, bind, key) {
+        match self.launch(engine, bind, key, any_model_name) {
             Ok(h) => {
                 self.running = Some(h);
                 self.error = None;
@@ -101,7 +102,7 @@ impl ServerState {
 
     pub fn ensure_agent_endpoint(&mut self, engine: Handle) -> Result<String, String> {
         if self.agent.is_none() {
-            let h = self.launch(engine, "127.0.0.1:0".into(), "").map_err(|e| format!("agent endpoint: {e:#}"))?;
+            let h = self.launch(engine, "127.0.0.1:0".into(), "", false).map_err(|e| format!("agent endpoint: {e:#}"))?;
             self.agent = Some(h);
         }
         Ok(format!("{}/v1", self.agent.as_ref().map(|h| h.url()).unwrap_or_default()))
@@ -198,7 +199,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             && let Some(p) = port
                         {
                             app.settings.server.port = p;
-                            app.server.start(app.engine.handle(), p, &app.settings.server.api_key, app.settings.server.lan);
+                            app.server.start(app.engine.handle(), p, &app.settings.server.api_key, app.settings.server.lan, app.settings.server.any_model_name);
                         }
                     }
                 });
@@ -218,6 +219,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 secret(ui, &mut app.settings.server.api_key);
             });
             switch(ui, "allow other machines", &mut app.settings.server.lan, "listen on all interfaces", "Off keeps it on 127.0.0.1.");
+            let mut any = app.settings.server.any_model_name;
+            if switch(ui, "answer to any model name", &mut any, "Answer to any model name when one model is loaded", "Callers keep working when you switch models. With none or several loaded, unknown names still fail.") {
+                app.settings.server.any_model_name = any;
+                app.save_settings();
+            }
         });
         if let Some(p) = app.server.placement.clone() {
             placement_section(ui, &p);
