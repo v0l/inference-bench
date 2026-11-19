@@ -42,28 +42,13 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
     const unsigned char* wrow[MJ][2];
     const float* srow[MJ][2];
 "##.to_string(),
-        prim::unroll_nest(4, &[("i", "MJ"), ("h", "2")], true, r##"int r = min(row0 + i * 16 + g + 8 * h, N - 1);
-wrow[i][h] = wb + (size_t)r * K + t * 32;
-srow[i][h] = fp8_row_scales(scales, r);
-"##),
-        r##"    auto stage = [&](int buf, int c) {
-        bf16_t* base = xs + buf * STAGE;
-        for (int i = tid; i < LOADS; i += WARPS * 32) {
-            int p = i / (M * PIECES);
-            int m = (i / PIECES) % M;
-            int piece = i % PIECES;
-            const bf16_t* src = (p ? x_lo : x_hi) + (size_t)min(m, last) * K + c * F8B_KC + piece * 4;
-            f8b_cp_async8(base + p * PLANE + (((piece & 7) * M + m) * 4 + (piece >> 3)) * 4, src, m < tokens);
-        }
-    };
-    auto load_w = [&](int c, uint4 (&q)[MJ][2][2], float (&s)[MJ][2]) {
-"##.to_string(),
-        prim::unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, r##"q[i][h][0] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC);
-q[i][h][1] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC + 16);
-s[i][h] = __ldg(srow[i][h] + c);
-"##),
-        r##"    };
-    float acc[MJ][NT][4];
+        prim::batch_row_ptrs(4, &["wrow[i][h] = wb + (size_t)r * K + t * 32;".to_string(), "srow[i][h] = fp8_row_scales(scales, r);".to_string()]),
+        prim::batch_stage("F8B_KC", "cp_async8", "f8b"),
+        prim::batch_load_w(
+            "uint4 (&q)[MJ][2][2], float (&s)[MJ][2]",
+            &["q[i][h][0] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC);", "q[i][h][1] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC + 16);", "s[i][h] = __ldg(srow[i][h] + c);"],
+        ),
+        r##"    float acc[MJ][NT][4];
 "##.to_string(),
         prim::zero_frag("acc", ("i", "MJ"), ("n", "NT"), 4),
         prim::pipeline_prologue("nc", "stage(st, c_begin + st)"),

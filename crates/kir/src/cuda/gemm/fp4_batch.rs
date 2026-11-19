@@ -42,27 +42,13 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
     const unsigned char* wrow[MJ][2];
     const unsigned char* srow[MJ][2];
 "##.to_string(),
-        prim::unroll_nest(4, &[("i", "MJ"), ("h", "2")], true, r##"int r = min(row0 + i * 16 + g + 8 * h, N - 1);
-wrow[i][h] = wb + (size_t)r * (K / 2) + t * 16;
-srow[i][h] = sb + (size_t)r * KG + 2 * t;
-"##),
-        r##"    auto stage = [&](int buf, int c) {
-        bf16_t* base = xs + buf * STAGE;
-        for (int i = tid; i < LOADS; i += WARPS * 32) {
-            int p = i / (M * PIECES);
-            int m = (i / PIECES) % M;
-            int piece = i % PIECES;
-            const bf16_t* src = (p ? x_lo : x_hi) + (size_t)min(m, last) * K + c * F4B_KC + piece * 4;
-            f4b_cp_async8(base + p * PLANE + (((piece & 7) * M + m) * 4 + (piece >> 3)) * 4, src, m < tokens);
-        }
-    };
-    auto load_w = [&](int c, uint4 (&q)[MJ][2], unsigned (&s)[MJ][2]) {
-"##.to_string(),
-        prim::unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, r##"q[i][h] = f4b_load16(wrow[i][h] + (size_t)c * (F4B_KC / 2));
-s[i][h] = __ldg((const unsigned short*)(srow[i][h] + c * (F4B_KC / FP4_GROUP)));
-"##),
-        r##"    };
-    float acc[MJ][NT][4];
+        prim::batch_row_ptrs(4, &["wrow[i][h] = wb + (size_t)r * (K / 2) + t * 16;".to_string(), "srow[i][h] = sb + (size_t)r * KG + 2 * t;".to_string()]),
+        prim::batch_stage("F4B_KC", "cp_async8", "f4b"),
+        prim::batch_load_w(
+            "uint4 (&q)[MJ][2], unsigned (&s)[MJ][2]",
+            &["q[i][h] = f4b_load16(wrow[i][h] + (size_t)c * (F4B_KC / 2));", "s[i][h] = __ldg((const unsigned short*)(srow[i][h] + c * (F4B_KC / FP4_GROUP)));"],
+        ),
+        r##"    float acc[MJ][NT][4];
 "##.to_string(),
         prim::zero_frag("acc", ("i", "MJ"), ("n", "NT"), 4),
         prim::pipeline_prologue("nc", "stage(st, c_begin + st)"),

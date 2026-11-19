@@ -57,21 +57,26 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
     auto load_stage = [&](int buf, int kt) {
         unsigned char* base = gemm_smem + buf * STAGE_BYTES;
 "##.to_string(),
-        prim::load_iters("A_ITERS", "A_TOTAL", r##"int p = idx / (BM * A_CHUNKS);
-int rem = idx % (BM * A_CHUNKS);
-int r = rem / A_CHUNKS;
-int c = rem % A_CHUNKS;
-int m = m0 + r;
-const bf16_t* src = (p ? x_lo : x_hi) + (size_t)min(m, last_row) * K + kt * BK + c * 8;
-cp_async16_zfill(base + p * A_TILE * 2 + swz<CPR>(r, c) * 16, src, m < tokens);
-"##),
+        prim::cp_async_stage(
+            "A_ITERS",
+            "A_TOTAL",
+            "A_CHUNKS",
+            "c",
+            true,
+            "int m = m0 + r;\nconst bf16_t* src = (p ? x_lo : x_hi) + (size_t)min(m, last_row) * K + kt * BK + c * 8;\n",
+            &prim::cp_async_call("cp_async16_zfill", &["base + p * A_TILE * 2 + swz<CPR>(r, c) * 16", "src", "m < tokens"]),
+        ),
         r##"        unsigned char* ws = base + A_BYTES;
 "##.to_string(),
-        prim::load_iters("W_ITERS", "BN * W_CHUNKS", r##"int r = idx / W_CHUNKS;
-int ck = idx % W_CHUNKS;
-int n = min(n0 + r, N - 1);
-D::template load<K, BK, CPR, WROW>(ws, w, scales, r, n, kt, ck);
-"##),
+        prim::cp_async_stage(
+            "W_ITERS",
+            "BN * W_CHUNKS",
+            "W_CHUNKS",
+            "ck",
+            false,
+            "int n = min(n0 + r, N - 1);\n",
+            &prim::cp_async_call("D::template load<K, BK, CPR, WROW>", &["ws", "w", "scales", "r", "n", "kt", "ck"]),
+        ),
         r##"    };
 "##.to_string(),
         prim::pipeline_prologue("KT", "load_stage(st, st)"),
@@ -123,36 +128,19 @@ D::template load<K, BK, CPR, WROW>(ws, w, scales, r, n, kt, ck);
             }
             if (DIRECT) {
 "##.to_string(),
-        prim::unroll_nest(16, &[("i", "MI"), ("j", "NJ")], true, r##"if (SPLIT) mma_bf16(acc[i][j], al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
-mma_bf16(acc[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-"##),
+        prim::mma_tile(16, "acc[i][j]", prim::Lo::IfSplit, false),
         r##"            } else if (SPLIT && SCALED) {
 "##.to_string(),
-        prim::unroll_nest(16, &[("i", "MI"), ("j", "NJ")], true, r##"float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-mma_bf16(c, al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
-mma_bf16(c, ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-acc[i][j][0] += c[0] * s0[j];
-acc[i][j][1] += c[1] * s1[j];
-acc[i][j][2] += c[2] * s0[j];
-acc[i][j][3] += c[3] * s1[j];
-"##),
+        prim::mma_tile(16, "acc[i][j]", prim::Lo::Always, true),
         r##"            } else if (SPLIT) {
 "##.to_string(),
-        prim::unroll_nest(16, &[("i", "MI"), ("j", "NJ")], true, r##"mma_bf16(part[i][j], al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
-mma_bf16(part[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-"##),
+        prim::mma_tile(16, "part[i][j]", prim::Lo::Always, false),
         r##"            } else if (!SCALED) {
 "##.to_string(),
-        prim::unroll_nest(16, &[("i", "MI"), ("j", "NJ")], false, "mma_bf16(acc[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);"),
+        prim::mma_tile(16, "acc[i][j]", prim::Lo::No, false),
         r##"            } else {
 "##.to_string(),
-        prim::unroll_nest(16, &[("i", "MI"), ("j", "NJ")], true, r##"float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-mma_bf16(c, ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-acc[i][j][0] += c[0] * s0[j];
-acc[i][j][1] += c[1] * s1[j];
-acc[i][j][2] += c[2] * s0[j];
-acc[i][j][3] += c[3] * s1[j];
-"##),
+        prim::mma_tile(16, "acc[i][j]", prim::Lo::No, true),
         r##"            }
         }
         if (SPLIT && !SCALED && !DIRECT) {

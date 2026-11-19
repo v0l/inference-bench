@@ -55,26 +55,33 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
         unsigned char* ass = as + SCALE_OFF;
         unsigned char* wss = ass + BM * F4A_SCALES;
 "##.to_string(),
-        prim::load_iters("A_ITERS", "BM * CHUNKS", r##"int r = idx / CHUNKS;
-int c = idx % CHUNKS;
-int m = m0 + r;
-size_t row = (size_t)min(m, last_row);
-if (c < 4) {
-    cp_async16_zfill(as + f4a_chunk(r, c), xq + row * (K / 2) + kt * (BK / 2) + c * 16, m < tokens);
-} else {
-    cp_async8_zfill(ass + r * F4A_SCALES, xs + row * KG + kt * (BK / FP4_GROUP), m < tokens);
-}
-"##),
+        prim::cp_async_stage(
+            "A_ITERS",
+            "BM * CHUNKS",
+            "CHUNKS",
+            "c",
+            false,
+            "int m = m0 + r;\nsize_t row = (size_t)min(m, last_row);\n",
+            &prim::split_copy(
+                "c < 4",
+                &prim::cp_async_call("cp_async16_zfill", &["as + f4a_chunk(r, c)", "xq + row * (K / 2) + kt * (BK / 2) + c * 16", "m < tokens"]),
+                &prim::cp_async_call("cp_async8_zfill", &["ass + r * F4A_SCALES", "xs + row * KG + kt * (BK / FP4_GROUP)", "m < tokens"]),
+            ),
+        ),
         r##""##.to_string(),
-        prim::load_iters("W_ITERS", "BN * CHUNKS", r##"int r = idx / CHUNKS;
-int c = idx % CHUNKS;
-size_t n = (size_t)min(n0 + r, N - 1);
-if (c < 4) {
-    cp_async16(ws + f4a_chunk(r, c), (const unsigned char*)w + n * (K / 2) + kt * (BK / 2) + c * 16);
-} else {
-    cp_async8_zfill(wss + r * F4A_SCALES, wsc + n * KG + kt * (BK / FP4_GROUP), true);
-}
-"##),
+        prim::cp_async_stage(
+            "W_ITERS",
+            "BN * CHUNKS",
+            "CHUNKS",
+            "c",
+            false,
+            "size_t n = (size_t)min(n0 + r, N - 1);\n",
+            &prim::split_copy(
+                "c < 4",
+                &prim::cp_async_call("cp_async16", &["ws + f4a_chunk(r, c)", "(const unsigned char*)w + n * (K / 2) + kt * (BK / 2) + c * 16"]),
+                &prim::cp_async_call("cp_async8_zfill", &["wss + r * F4A_SCALES", "wsc + n * KG + kt * (BK / FP4_GROUP)", "true"]),
+            ),
+        ),
         r##"    };
 "##.to_string(),
         prim::pipeline_prologue("KT", "load_stage(st, st)"),
@@ -100,9 +107,9 @@ if (c < 4) {
 #pragma unroll
                 for (int jj = 0; jj < 2; jj++) {
                     unsigned sfb = *(const unsigned*)(wss + (wn * TN + (j + jj) * 8 + g) * F4A_SCALES + ks * 4);
-#pragma unroll
-                    for (int i = 0; i < MI; i++) mma_fp4(acc[i][j + jj], a[i], b[2 * jj], b[2 * jj + 1], sfa[i], sfb);
-                }
+"##.to_string(),
+        prim::mma_fp4_tile(),
+        r##"                }
             }
         }
     }

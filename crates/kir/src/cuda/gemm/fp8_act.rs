@@ -43,17 +43,25 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
         unsigned char* as = gemm_smem + buf * STAGE_BYTES;
         unsigned char* ws = as + BM * ROW;
 "##.to_string(),
-        prim::load_iters("A_ITERS", "BM * CHUNKS", r##"int r = idx / CHUNKS;
-int c = idx % CHUNKS;
-int m = m0 + r;
-cp_async16_zfill(as + r * ROW + ((c ^ (r & 7)) << 4), xq + (size_t)min(m, last_row) * K + kt * BK + c * 16, m < tokens);
-"##),
+        prim::cp_async_stage(
+            "A_ITERS",
+            "BM * CHUNKS",
+            "CHUNKS",
+            "c",
+            false,
+            "int m = m0 + r;\n",
+            &prim::cp_async_call("cp_async16_zfill", &["as + r * ROW + ((c ^ (r & 7)) << 4)", "xq + (size_t)min(m, last_row) * K + kt * BK + c * 16", "m < tokens"]),
+        ),
         r##""##.to_string(),
-        prim::load_iters("W_ITERS", "BN * CHUNKS", r##"int r = idx / CHUNKS;
-int c = idx % CHUNKS;
-int n = min(n0 + r, N - 1);
-cp_async16(ws + r * ROW + ((c ^ (r & 7)) << 4), (const unsigned char*)w + (size_t)n * K + kt * BK + c * 16);
-"##),
+        prim::cp_async_stage(
+            "W_ITERS",
+            "BN * CHUNKS",
+            "CHUNKS",
+            "c",
+            false,
+            "int n = min(n0 + r, N - 1);\n",
+            &prim::cp_async_call("cp_async16", &["ws + r * ROW + ((c ^ (r & 7)) << 4)", "(const unsigned char*)w + (size_t)n * K + kt * BK + c * 16"]),
+        ),
         r##"    };
 "##.to_string(),
         prim::pipeline_prologue("KT", "load_stage(st, st)"),
@@ -89,12 +97,9 @@ sa[i][h] = xscale[(size_t)m * KT + kt];
                 int r = wn * TN + jj * 8 + (lane & 7) + (lane >> 4) * 8;
                 int ch = ks * 2 + ((lane >> 3) & 1);
                 ldsm_x4(b, ws + r * ROW + ((ch ^ (r & 7)) << 4));
-#pragma unroll
-                for (int i = 0; i < MI; i++) {
-                    mma_e4m3(c[i][jj], a[i], b[0], b[1]);
-                    mma_e4m3(c[i][jj + 1], a[i], b[2], b[3]);
-                }
-            }
+"##.to_string(),
+        prim::mma_e4m3_pair(16),
+        r##"            }
         }
         if (!PER_TOKEN) {
 "##.to_string(),

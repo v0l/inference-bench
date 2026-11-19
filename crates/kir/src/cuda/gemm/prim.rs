@@ -244,12 +244,107 @@ pub fn unroll_nest(indent: usize, levels: &[(&str, &str)], block: bool, body: &s
     out.push_str(" {\n");
     let pad = " ".repeat(indent + 4 * levels.len());
     for l in body.lines() {
-        if l.is_empty() {
-            out.push('\n');
+        if l.is_empty() || l.starts_with('#') {
+            out.push_str(&format!("{l}\n"));
         } else {
             out.push_str(&format!("{pad}{l}\n"));
         }
     }
     out.push_str(&format!("{}}}\n", " ".repeat(indent + 4 * (levels.len() - 1))));
     out
+}
+
+pub enum Lo {
+    No,
+    Always,
+    IfSplit,
+}
+
+pub fn mma_bf16_call(acc: &str, a: &str, b: &str) -> String {
+    format!("mma_bf16({acc}, {a}[0], {a}[1], {a}[2], {a}[3], {b}[0], {b}[1]);")
+}
+
+pub fn mma_tile(indent: usize, acc: &str, lo: Lo, scaled: bool) -> String {
+    let call = |dst: &str, a: &str| mma_bf16_call(dst, a, "bw[j]");
+    let lo_call = |dst: &str| call(dst, "al[i]");
+    let hi_call = |dst: &str| call(dst, "ah[i]");
+    let target = if scaled { "c" } else { acc };
+    let mut body = String::new();
+    if scaled {
+        body.push_str("float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n");
+    }
+    match lo {
+        Lo::No => {}
+        Lo::Always => body.push_str(&format!("{}\n", lo_call(target))),
+        Lo::IfSplit => body.push_str(&format!("if (SPLIT) {}\n", lo_call(target))),
+    }
+    body.push_str(&format!("{}\n", hi_call(target)));
+    if scaled {
+        body.push_str(
+            "acc[i][j][0] += c[0] * s0[j];\nacc[i][j][1] += c[1] * s1[j];\nacc[i][j][2] += c[2] * s0[j];\nacc[i][j][3] += c[3] * s1[j];\n",
+        );
+    }
+    let single = body.lines().count() == 1;
+    let body = if single { body.trim_end().to_string() } else { body };
+    unroll_nest(indent, &[("i", "MI"), ("j", "NJ")], !single, &body)
+}
+
+pub fn cp_async_call(func: &str, args: &[&str]) -> String {
+    format!("{func}({});", args.join(", "))
+}
+
+pub fn cp_async_stage(iters: &str, total: &str, chunks: &str, col: &str, planes: bool, prelude: &str, copy: &str) -> String {
+    let head = if planes {
+        format!("int p = idx / ({total});\nint rem = idx % ({total});\nint r = rem / {chunks};\nint {col} = rem % {chunks};\n")
+    } else {
+        format!("int r = idx / {chunks};\nint {col} = idx % {chunks};\n")
+    };
+    load_iters(iters, total, &format!("{head}{prelude}{copy}\n"))
+}
+
+pub fn batch_row_ptrs(indent: usize, stmts: &[String]) -> String {
+    let mut body = String::from("int r = min(row0 + i * 16 + g + 8 * h, N - 1);\n");
+    for s in stmts {
+        body.push_str(s);
+        body.push('\n');
+    }
+    unroll_nest(indent, &[("i", "MJ"), ("h", "2")], true, &body)
+}
+
+pub fn batch_stage(chunk: &str, cp: &str, p: &str) -> String {
+    format!(
+        "    auto stage = [&](int buf, int c) {{
+        bf16_t* base = xs + buf * STAGE;
+        for (int i = tid; i < LOADS; i += WARPS * 32) {{
+            int p = i / (M * PIECES);
+            int m = (i / PIECES) % M;
+            int piece = i % PIECES;
+            const bf16_t* src = (p ? x_lo : x_hi) + (size_t)min(m, last) * K + c * {chunk} + piece * 4;
+            {p}_{cp}(base + p * PLANE + (((piece & 7) * M + m) * 4 + (piece >> 3)) * 4, src, m < tokens);
+        }}
+    }};
+"
+    )
+}
+
+pub fn split_copy(cond: &str, first: &str, second: &str) -> String {
+    format!("if ({cond}) {{\n    {first}\n}} else {{\n    {second}\n}}")
+}
+
+pub fn mma_fp4_tile() -> String {
+    unroll_nest(20, &[("i", "MI")], false, "mma_fp4(acc[i][j + jj], a[i], b[2 * jj], b[2 * jj + 1], sfa[i], sfb);")
+}
+
+pub fn mma_e4m3_pair(indent: usize) -> String {
+    let body = "mma_e4m3(c[i][jj], a[i], b[0], b[1]);\nmma_e4m3(c[i][jj + 1], a[i], b[2], b[3]);\n";
+    unroll_nest(indent, &[("i", "MI")], true, body)
+}
+
+pub fn batch_load_w(sig: &str, loads: &[&str]) -> String {
+    let mut body = String::new();
+    for l in loads {
+        body.push_str(l);
+        body.push('\n');
+    }
+    format!("    auto load_w = [&](int c, {sig}) {{\n{}    }};\n", unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, &body))
 }
