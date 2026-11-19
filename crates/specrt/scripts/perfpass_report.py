@@ -13,6 +13,13 @@ HEADER = (
 )
 
 
+def label(model):
+    parts = Path(model).parts
+    if "snapshots" in parts:
+        return parts[parts.index("snapshots") - 1].replace("models--", "").replace("--", "/")
+    return Path(model).name
+
+
 def fnum(x):
     return "n/a" if x is None else f"{x:.1f}"
 
@@ -143,7 +150,7 @@ def family_report(family, model, raw, out, commit, roof, batch, lens, command):
     prat = ratio(ours_p, theirs[1])
     brat = ratio(b8, theirs[2])
     row = (
-        f"| {family} | `{Path(model).name}` | {fnum(ours_d)} | {fnum(ours_p)} | {fnum(b8)} | {best} | {fnum(theirs[0])} | {fnum(theirs[1])} | {fnum(theirs[2])} "
+        f"| {family} | `{label(model)}` | {fnum(ours_d)} | {fnum(ours_p)} | {fnum(b8)} | {best} | {fnum(theirs[0])} | {fnum(theirs[1])} | {fnum(theirs[2])} "
         f"| {fratio(drat)} | {fratio(prat)} | {fratio(brat)} | {today} | {commit} | `{command}` |"
     )
     (out / f"{today}.row").write_text(row + "\n")
