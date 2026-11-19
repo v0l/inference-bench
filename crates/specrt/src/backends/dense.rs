@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::time::Instant;
 
-const PREFILL_CHUNK: usize = 64;
+const PREFILL_CHUNK: usize = 512;
 const DECODE_STEPS_PER_SUBMIT: usize = 4;
 
 pub struct WMat<B: Backend> {
