@@ -1,0 +1,38 @@
+{
+  "name": "granitemoehybrid",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 256,
+    "intermediate": 256,
+    "vocab": 512,
+    "tie_embeddings": true
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "linear",
+      "full"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001,
+    "unit_offset": true
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 64,
+    "qkv_bias": false,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  }
+}

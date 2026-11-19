@@ -536,6 +536,10 @@ pub struct Moe {
     pub expert_bias: bool,
     #[serde(default = "default_router_module", skip_serializing_if = "is_default_router_module")]
     pub router_module: String,
+    #[serde(default = "default_routed_scale", skip_serializing_if = "is_default_routed_scale")]
+    pub out_scale: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fused_experts: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub hash_layers: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -951,7 +955,12 @@ struct HfConfig {
     query_pre_attn_scalar: Option<f64>,
 }
 
-fn nope_layers(rope: &crate::family::FamilyRope, config: &serde_json::Value) -> Vec<usize> {
+fn nope_layers(rope: &crate::family::FamilyRope, config: &serde_json::Value, layers: usize) -> Vec<usize> {
+    if let (Some(key), Some(value)) = (rope.nope_key.as_deref(), rope.nope_value.as_deref())
+        && config.get(key).and_then(|v| v.as_str()) == Some(value)
+    {
+        return (0..layers).collect();
+    }
     let Some(flags) = rope.nope_flags.as_deref().and_then(|k| config.get(k)).and_then(|v| v.as_array()) else { return Vec::new() };
     flags
         .iter()
@@ -1550,6 +1559,8 @@ impl Spec {
                     router_bias: family.moe.router_bias,
                     expert_bias: family.moe.expert_bias,
                     router_module: family.moe.router_module.clone().unwrap_or_else(default_router_module),
+                    out_scale: multiplier(&family.multipliers.residual).unwrap_or(1.0),
+                    fused_experts: family.moe.fused_experts,
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,
@@ -1612,7 +1623,7 @@ impl Spec {
                 scratch: family.attention.scratch.clone(),
                 int_scratch: family.attention.int_scratch.clone(),
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value) },
+            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value, hf.num_hidden_layers) },
             mlp: Mlp {
                 activation,
                 quant: mlp_quant.map(|m| m.0),
@@ -1864,8 +1875,7 @@ impl Spec {
             }
         }
         ensure!(self.speculative().is_none(), "[mixer] cannot be combined with [mtp] yet");
-        ensure!(self.moe.is_none(), "[mixer] layers with mixture of experts are not supported yet");
-        ensure!(!self.uses_branch(), "[mixer] layers with sandwich or scaled residual norms are not supported yet");
+        ensure!(!self.norm.sandwich, "[mixer] layers with sandwich norms are not supported yet");
         Ok(())
     }
 

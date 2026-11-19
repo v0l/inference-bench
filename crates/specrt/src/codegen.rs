@@ -32,6 +32,7 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         shared: m.shared_slots(),
         norm_topk: m.norm_topk,
         routed_scale: m.routed_scale,
+        out_scale: m.out_scale,
         shared_gate: m.shared_gate,
         sigmoid: m.router == crate::spec::RouterAct::Sigmoid,
         groups: m.groups,

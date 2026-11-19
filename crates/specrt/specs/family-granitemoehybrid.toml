@@ -1,0 +1,142 @@
+name = "granitemoehybrid"
+kind = "family"
+min_engine = 11
+extends = "base"
+
+[match]
+model_types = ["granitemoehybrid"]
+architectures = ["GraniteMoeHybridForCausalLM"]
+
+[blocks]
+kind = "hybrid"
+types_key = "layer_types"
+
+[blocks.layer_types]
+mamba = "linear"
+attention = "full"
+
+[norm]
+unit_offset = false
+
+[multipliers]
+embedding = "embedding_multiplier"
+attention = "attention_multiplier"
+residual = "residual_multiplier"
+logits_divisor = "logits_scaling"
+
+[fields]
+moe_intermediate_size = ["intermediate_size"]
+num_experts = ["num_local_experts"]
+shared_expert_intermediate_size = ["shared_intermediate_size"]
+
+[rope]
+nope_key = "position_embedding_type"
+nope_value = "nope"
+
+[moe]
+router_module = "router"
+shared_module = "shared_mlp"
+shared_gate = false
+norm_topk = true
+fused_experts = true
+
+[tensors]
+".block_sparse_moe.input_linear." = ".mlp.experts.gate_up_proj."
+".block_sparse_moe.output_linear." = ".mlp.experts.down_proj."
+".block_sparse_moe.router.layer." = ".mlp.router."
+
+".shared_mlp." = ".mlp.shared_mlp."
+
+[runtime]
+split_activations = false
+
+[[state]]
+name = "conv"
+per = "sequence"
+layers = "linear"
+shape = ["ssm_conv", "ssm_taps - 1"]
+dtype = "f32"
+rollback = "checkpoint"
+
+[[state]]
+name = "ssm"
+per = "sequence"
+layers = "linear"
+shape = ["ssm_heads", "ssm_state", "ssm_head_dim"]
+dtype = "f32"
+rollback = "checkpoint"
+
+[[state]]
+name = "k"
+per = "token"
+layers = "attention"
+shape = ["kv_heads", "head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "v"
+per = "token"
+layers = "attention"
+shape = ["kv_heads", "head_dim"]
+dtype = "bf16"
+rollback = "positional"
+[mixer]
+module = "mamba"
+out_tensor = "out_proj"
+out_cols = "ssm_inner"
+
+[[mixer.projection]]
+tensor = "in_proj"
+rows = "ssm_in"
+
+[mixer.params]
+ssm_heads = { config = "mamba_n_heads" }
+ssm_head_dim = { config = "mamba_d_head" }
+ssm_state = { config = "mamba_d_state" }
+ssm_groups = { config = "mamba_n_groups" }
+ssm_taps = { config = "mamba_d_conv" }
+ssm_inner = { expr = "mamba_expand * hidden_size" }
+ssm_conv = { expr = "ssm_inner + 2 * ssm_groups * ssm_state" }
+ssm_in = { expr = "ssm_inner + ssm_conv + ssm_heads" }
+ssm_conv_blocks = { expr = "floor((ssm_conv + 127) / 128)" }
+
+[mixer.scratch]
+xbc = "ssm_conv"
+ssm_y = "ssm_inner"
+
+[[mixer.node]]
+op = "kernel"
+kernel = "mamba2_conv"
+grid = ["ssm_conv_blocks", "seqs"]
+
+[mixer.node.bind]
+x = { buffer = "mix" }
+w = { weight = "conv1d.weight", len = "ssm_conv * ssm_taps" }
+bias = { weight = "conv1d.bias", len = "ssm_conv" }
+y = { buffer = "xbc" }
+state = { state = "conv" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "mamba2_scan"
+grid = ["ssm_heads", "seqs"]
+
+[mixer.node.bind]
+mix = { buffer = "mix" }
+xbc = { buffer = "xbc" }
+a_log = { weight = "A_log", len = "ssm_heads" }
+dt_bias = { weight = "dt_bias", len = "ssm_heads" }
+skip = { weight = "D", len = "ssm_heads" }
+y = { buffer = "ssm_y" }
+ssm = { state = "ssm" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "mamba2_gated_norm"
+grid = ["ssm_groups", "rows"]
+
+[mixer.node.bind]
+x = { buffer = "ssm_y" }
+g = { buffer = "mix" }
+w = { weight = "norm.weight", len = "ssm_inner" }

@@ -1145,6 +1145,26 @@ impl Checkpoint {
                 let (gate, up) = self.block_gate_up(format, &format!("{p}.mlp.experts.gate_up_proj"), e, inter, h, m.gate_up_interleaved)?;
                 (gate, up, self.block_stack(format, &format!("{p}.mlp.experts.down_proj"), e, h, inter)?)
             }
+            None if m.fused_experts => {
+                ensure!(quant == Quant::Bf16, "fused experts are bf16 only");
+                let shared = m.shared_intermediate;
+                let fused = self.bf16(&format!("{p}.mlp.experts.gate_up_proj.weight"), &[e, 2 * inter, h])?;
+                let (mut gate, mut up) = split_gate_up(&fused, h, e, inter, false);
+                let mut down = self.bf16(&format!("{p}.mlp.experts.down_proj.weight"), &[e, h, inter])?.into_owned();
+                if shared > 0 {
+                    let both = self.bf16(&format!("{shared_module}.input_linear.weight"), &[2 * shared, h])?;
+                    gate.extend_from_slice(&both[..shared * h]);
+                    up.extend_from_slice(&both[shared * h..]);
+                    let all = self.bf16(&format!("{shared_module}.output_linear.weight"), &[h, shared])?;
+                    for s in 0..shared_slots {
+                        for r in 0..h {
+                            let start = r * shared + s * inter;
+                            down.extend_from_slice(&all[start..start + inter]);
+                        }
+                    }
+                }
+                (Stacked::Bf16(gate), Stacked::Bf16(up), Stacked::Bf16(down))
+            }
             None => (stack("gate", inter, h)?, stack("up", inter, h)?, stack("down", h, inter)?),
         };
         Ok(MoeWeights {

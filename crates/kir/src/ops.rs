@@ -48,6 +48,7 @@ pub struct MoeShape {
     pub shared: usize,
     pub norm_topk: bool,
     pub routed_scale: f64,
+    pub out_scale: f64,
     pub shared_gate: bool,
     pub sigmoid: bool,
     pub groups: usize,
