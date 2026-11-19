@@ -151,8 +151,8 @@ impl Runtime {
                     _ => bail!("param {name:?} is not bound to a weight"),
                 },
                 (_, "qkv") => b.arg(&self.pre.qkv),
-                (_, "k_cache") => b.arg(&self.buf.k_cache),
-                (_, "v_cache") => b.arg(&self.buf.v_cache),
+                (_, "k_cache") => b.arg(self.buf.k_cache()),
+                (_, "v_cache") => b.arg(self.buf.v_cache()),
                 (_, "block_table") => b.arg(&table),
                 (_, "pos") => b.arg(pos),
                 (_, "slots") => b.arg(slots),
@@ -394,8 +394,8 @@ impl Runtime {
         b.arg(&pre.qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
             .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
-            .arg(&buf.k_cache)
-            .arg(&buf.v_cache)
+            .arg(buf.k_cache())
+            .arg(buf.v_cache())
             .arg(&table)
             .arg(&buf.pos)
             .arg(&buf.zero_slots)
@@ -423,8 +423,8 @@ impl Runtime {
         let ntok = n as i32;
         let mut b = self.stream.launch_builder(self.kernel("flash_attention"));
         b.arg(&pre.qkv)
-            .arg(&buf.k_cache)
-            .arg(&buf.v_cache)
+            .arg(buf.k_cache())
+            .arg(buf.v_cache())
             .arg(&table)
             .arg(&buf.pos)
             .arg(&l.kv)

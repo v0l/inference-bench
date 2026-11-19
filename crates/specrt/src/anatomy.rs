@@ -326,14 +326,7 @@ impl ModelAnatomy {
         });
 
         let kv_bytes_per_token = (crate::runtime::kv_block_bytes(spec, 1) / crate::codegen::PAGE) as u64;
-        let state_bytes_per_seq = match &spec.linear_attention {
-            Some(la) => {
-                let ssm = la.value_heads * la.key_head_dim * la.key_head_dim;
-                let conv = la.conv_dim() * (la.conv_kernel - 1);
-                (spec.linear_layers() * (ssm + conv) * 4) as u64
-            }
-            None => 0,
-        };
+        let state_bytes_per_seq = crate::state::sequence_bytes(spec);
 
         ModelAnatomy {
             name: spec.name.clone(),

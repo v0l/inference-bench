@@ -694,6 +694,8 @@ pub struct Spec {
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<crate::vision::Vision>,
+    #[serde(default = "crate::state::stock", skip_serializing_if = "crate::state::is_stock")]
+    pub state: Vec<crate::state::State>,
     #[serde(default, skip_serializing_if = "RuntimeOptions::is_default")]
     pub runtime: RuntimeOptions,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -1442,6 +1444,7 @@ impl Spec {
             mtp: (family.mtp && hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
             linear_attention,
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
+            state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
             runtime: RuntimeOptions::default(),
             plain_activations: !family.runtime.split_activations,
         };
@@ -1456,6 +1459,7 @@ impl Spec {
         self.runtime.validate()?;
         ensure!(!self.layers.pattern.contains(&Block::Sliding) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
         self.validate_attention_nodes()?;
+        crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
             Some(Quant::Fp8Channel) => {

@@ -155,11 +155,17 @@ impl Runtime {
         Ok(())
     }
 
+    fn cache_block_bytes(&self) -> Vec<usize> {
+        crate::state::positional(&self.spec).map(|s| s.block_bytes(&self.spec, self.kv_planes)).collect()
+    }
+
+    fn kv_bytes_per_block(&self) -> usize {
+        self.cache_block_bytes().iter().sum()
+    }
+
     pub fn copy_kv_block(&mut self, src: u32, dst: u32) -> Result<()> {
         ensure!((src as usize) <= self.kv_blocks && (dst as usize) <= self.kv_blocks, "KV block out of range");
-        let elems = super::kv_block_bytes(&self.spec, self.kv_planes) / 4;
-        let bytes = elems * std::mem::size_of::<u16>();
-        for cache in [&self.buf.k_cache, &self.buf.v_cache] {
+        for (cache, bytes) in self.buf.caches.iter().zip(self.cache_block_bytes()) {
             let (base, _guard) = cache.device_ptr(&self.stream);
             unsafe {
                 result::memcpy_dtod_async(base + (dst as usize * bytes) as u64, base + (src as usize * bytes) as u64, bytes, self.stream.cu_stream())
@@ -168,38 +174,49 @@ impl Runtime {
         Ok(())
     }
 
-    fn kv_cache_block_bytes(&self) -> usize {
-        super::kv_block_bytes(&self.spec, self.kv_planes) / 4 * std::mem::size_of::<u16>()
-    }
-
     pub fn swap_bytes(&self, blocks: usize) -> usize {
         let state = if self.gdn.is_some() { self.state_lens().map_or(0, |(c, s)| (c + s + self.pending_len()) * 4) } else { 0 };
-        blocks * 2 * self.kv_cache_block_bytes() + state
+        blocks * self.kv_bytes_per_block() + state
     }
 
-    pub fn park(&mut self, slot: usize, blocks: &[u32]) -> Result<HostSeq> {
-        ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
-        let state = if self.gdn.is_some() { Some(self.snapshot_state_blocking(slot)?) } else { None };
-        let per = self.kv_cache_block_bytes();
-        let total = blocks.len() * 2 * per;
-        let mut host = self.host.alloc(total)?;
+    fn blocks_to_host(&mut self, blocks: &[u32], dst: &mut [u8]) -> Result<()> {
         if self.snap.side.is_none() {
             self.snap.side = Some(self.stream.fork()?);
         }
         let side = self.snap.side.clone().expect("side stream");
         let ready = self.stream.record_event(None)?;
         side.wait(&ready)?;
-        {
-            let dst = host.as_mut_slice()?;
-            for (c, cache) in [&self.buf.k_cache, &self.buf.v_cache].into_iter().enumerate() {
-                let (base, _guard) = cache.device_ptr(&side);
-                for (i, &b) in blocks.iter().enumerate() {
-                    let at = (c * blocks.len() + i) * per;
-                    unsafe { result::memcpy_dtoh_async(&mut dst[at..at + per], base + (b as usize * per) as u64, side.cu_stream()) }?;
-                }
+        let mut at = 0;
+        for (cache, per) in self.buf.caches.iter().zip(self.cache_block_bytes()) {
+            let (base, _guard) = cache.device_ptr(&side);
+            for &b in blocks {
+                unsafe { result::memcpy_dtoh_async(&mut dst[at..at + per], base + (b as usize * per) as u64, side.cu_stream()) }?;
+                at += per;
             }
         }
         side.synchronize()?;
+        Ok(())
+    }
+
+    fn blocks_from_host(&mut self, blocks: &[u32], src: &[u8]) -> Result<()> {
+        let mut at = 0;
+        for (cache, per) in self.buf.caches.iter().zip(self.cache_block_bytes()) {
+            let (base, _guard) = cache.device_ptr(&self.stream);
+            for &b in blocks {
+                unsafe { result::memcpy_htod_async(base + (b as usize * per) as u64, &src[at..at + per], self.stream.cu_stream()) }?;
+                at += per;
+            }
+        }
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    pub fn park(&mut self, slot: usize, blocks: &[u32]) -> Result<HostSeq> {
+        ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
+        let state = if self.gdn.is_some() { Some(self.snapshot_state_blocking(slot)?) } else { None };
+        let total = blocks.len() * self.kv_bytes_per_block();
+        let mut host = self.host.alloc(total)?;
+        self.blocks_to_host(blocks, host.as_mut_slice()?)?;
         let bytes = total + state.as_ref().map_or(0, |s| (s.conv().len() + s.ssm().len() + s.pending().len()) * 4);
         Ok(HostSeq { bytes, blocks: blocks.len(), payload: Box::new(Parked { kv: host, state }) })
     }
@@ -208,17 +225,8 @@ impl Runtime {
         let parked = seq.payload.downcast_ref::<Parked>().context("not a parked sequence of this runtime")?;
         ensure!(blocks.len() == seq.blocks, "{} blocks for a parked sequence of {}", blocks.len(), seq.blocks);
         ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
-        let per = self.kv_cache_block_bytes();
-        let src = parked.kv.as_slice()?;
         self.stream.synchronize()?;
-        for (c, cache) in [&self.buf.k_cache, &self.buf.v_cache].into_iter().enumerate() {
-            let (base, _guard) = cache.device_ptr(&self.stream);
-            for (i, &b) in blocks.iter().enumerate() {
-                let at = (c * blocks.len() + i) * per;
-                unsafe { result::memcpy_htod_async(base + (b as usize * per) as u64, &src[at..at + per], self.stream.cu_stream()) }?;
-            }
-        }
-        self.stream.synchronize()?;
+        self.blocks_from_host(blocks, parked.kv.as_slice()?)?;
         if let Some(state) = &parked.state {
             self.restore_state(slot, state)?;
         }
@@ -231,53 +239,24 @@ impl Runtime {
 
     pub fn save_kv_blocks(&mut self, blocks: &[u32]) -> Result<(Vec<u8>, Vec<u8>)> {
         ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
-        let per = self.kv_cache_block_bytes();
-        let total = blocks.len() * per;
-        let mut host = self.host.alloc(total * 2)?;
-        if self.snap.side.is_none() {
-            self.snap.side = Some(self.stream.fork()?);
-        }
-        let side = self.snap.side.clone().expect("side stream");
-        let ready = self.stream.record_event(None)?;
-        side.wait(&ready)?;
-        let mut out = Vec::with_capacity(2);
-        for (c, cache) in [&self.buf.k_cache, &self.buf.v_cache].into_iter().enumerate() {
-            let (base, _guard) = cache.device_ptr(&side);
-            let dst = host.as_mut_slice()?;
-            for (i, &b) in blocks.iter().enumerate() {
-                let at = c * total + i * per;
-                unsafe { result::memcpy_dtoh_async(&mut dst[at..at + per], base + (b as usize * per) as u64, side.cu_stream()) }?;
-            }
-        }
-        side.synchronize()?;
+        let total = blocks.len() * self.kv_bytes_per_block();
+        let first = blocks.len() * self.cache_block_bytes().first().copied().unwrap_or(0);
+        let mut host = self.host.alloc(total)?;
+        self.blocks_to_host(blocks, host.as_mut_slice()?)?;
         let all = host.as_slice()?;
-        out.push(all[..total].to_vec());
-        out.push(all[total..].to_vec());
-        let v = out.pop().expect("v");
-        let k = out.pop().expect("k");
-        Ok((k, v))
+        Ok((all[..first].to_vec(), all[first..total].to_vec()))
     }
 
     pub fn load_kv_blocks(&mut self, blocks: &[u32], k: &[u8], v: &[u8]) -> Result<()> {
         ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
-        let per = self.kv_cache_block_bytes();
-        ensure!(k.len() == blocks.len() * per && v.len() == k.len(), "session KV is {} bytes, expected {}", k.len(), blocks.len() * per);
-        let total = k.len();
-        let mut host = self.host.alloc(total * 2)?;
+        let total = blocks.len() * self.kv_bytes_per_block();
+        ensure!(k.len() + v.len() == total, "session KV is {} bytes, expected {total}", k.len() + v.len());
+        let mut host = self.host.alloc(total)?;
         {
             let dst = host.as_mut_slice()?;
-            dst[..total].copy_from_slice(k);
-            dst[total..].copy_from_slice(v);
+            dst[..k.len()].copy_from_slice(k);
+            dst[k.len()..total].copy_from_slice(v);
         }
-        let src = host.as_slice()?;
-        for (c, cache) in [&self.buf.k_cache, &self.buf.v_cache].into_iter().enumerate() {
-            let (base, _guard) = cache.device_ptr(&self.stream);
-            for (i, &b) in blocks.iter().enumerate() {
-                let at = c * total + i * per;
-                unsafe { result::memcpy_htod_async(base + (b as usize * per) as u64, &src[at..at + per], self.stream.cu_stream()) }?;
-            }
-        }
-        self.stream.synchronize()?;
-        Ok(())
+        self.blocks_from_host(blocks, host.as_slice()?)
     }
 }

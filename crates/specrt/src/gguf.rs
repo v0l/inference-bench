@@ -506,6 +506,7 @@ impl Gguf {
             mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),
             vision: None,
             plain_activations: false,
+            state: crate::state::stock(),
             runtime: RuntimeOptions {
                 unsplit: Vec::new(),
                 big_tile: if quant == Quant::Gguf { Some([256, 128, 4, 2]) } else { None },

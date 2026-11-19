@@ -677,14 +677,7 @@ fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
 }
 
 pub fn slot_state_bytes(spec: &Spec) -> u64 {
-    match &spec.linear_attention {
-        Some(la) => {
-            let ssm = la.value_heads * la.key_head_dim * la.key_head_dim;
-            let conv = la.conv_dim() * (la.conv_kernel - 1);
-            (spec.linear_layers() * (ssm + conv) * 4) as u64
-        }
-        None => 0,
-    }
+    crate::state::sequence_bytes(spec)
 }
 
 struct Encoded {

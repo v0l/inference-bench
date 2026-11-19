@@ -364,6 +364,8 @@ pub struct Family {
     pub gguf: FamilyGguf,
     #[serde(default)]
     pub fields: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub state: Vec<crate::state::State>,
 }
 
 impl Family {

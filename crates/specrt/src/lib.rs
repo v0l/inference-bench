@@ -47,6 +47,7 @@ pub mod tp_exec;
 pub mod spec;
 pub mod stage;
 pub mod statepool;
+pub mod state;
 pub mod vision;
 pub mod vision_encoder;
 pub mod weights;

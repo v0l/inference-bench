@@ -81,6 +81,38 @@ when = { "input_activations.type" = "float", "input_activations.dynamic" = { any
 act = "fp4"
 when = { quant_method = "modelopt", quant_algo = "NVFP4" }
 
+[[state]]
+name = "k"
+per = "token"
+layers = "attention"
+shape = ["kv_heads", "head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "v"
+per = "token"
+layers = "attention"
+shape = ["kv_heads", "head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "conv"
+per = "sequence"
+layers = "linear"
+shape = ["conv_dim", "conv_taps"]
+dtype = "f32"
+rollback = "checkpoint"
+
+[[state]]
+name = "ssm"
+per = "sequence"
+layers = "linear"
+shape = ["value_heads", "key_head_dim", "key_head_dim"]
+dtype = "f32"
+rollback = "checkpoint"
+
 [blocks]
 other_layer_type = "full"
 

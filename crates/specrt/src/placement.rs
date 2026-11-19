@@ -320,26 +320,9 @@ const ALLREDUCE_BYTES_PER_ELEMENT: usize = 2;
 impl CostModel {
     pub fn new(spec: &Spec, context: usize, slots: usize) -> CostModel {
         let anatomy = ModelAnatomy::new(spec, 0, Some(context));
-        let f16_kv_per_token = (2 * spec.attention.kv_heads * spec.attention.head_dim * 2) as u64;
-        let fp8_kv = spec.runtime.kv_dtype.is_fp8();
-        let f16_kv_layers = spec.kv_f16_layers();
-        let kv_per_token = |attention_index: usize| -> u64 {
-            if !fp8_kv {
-                return f16_kv_per_token;
-            }
-            let rows = (2 * spec.attention.kv_heads) as u64;
-            let head = spec.attention.head_dim as u64;
-            if attention_index < f16_kv_layers { rows * head * 2 } else { rows * (head + 4) }
-        };
+        let kv_per_token = |attention_index: usize| -> u64 { crate::state::kv_bytes_per_token_at(spec, attention_index) };
         let mut attention_index = 0usize;
-        let state_per_seq = match &spec.linear_attention {
-            Some(la) => {
-                let ssm = la.value_heads * la.key_head_dim * la.key_head_dim;
-                let conv = la.conv_dim() * (la.conv_kernel - 1);
-                ((ssm + conv) * 4) as u64
-            }
-            None => 0,
-        };
+        let state_per_seq = crate::state::sequence_bytes_per_layer(spec, crate::state::Layers::Linear);
         let rows = slots as f64;
         let layers = anatomy
             .layers

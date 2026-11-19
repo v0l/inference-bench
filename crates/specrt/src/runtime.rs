@@ -513,8 +513,7 @@ struct Buffers {
     gate_up: CudaSlice<f32>,
     act: CudaSlice<f32>,
     logits: CudaSlice<f32>,
-    k_cache: CudaSlice<u16>,
-    v_cache: CudaSlice<u16>,
+    caches: Vec<CudaSlice<u16>>,
     block_table: CudaSlice<i32>,
     zero_slots: CudaSlice<i32>,
     token: CudaSlice<i32>,
@@ -522,6 +521,16 @@ struct Buffers {
     history: CudaSlice<i32>,
     count: CudaSlice<i32>,
     dummy: CudaSlice<f32>,
+}
+
+impl Buffers {
+    fn k_cache(&self) -> &CudaSlice<u16> {
+        &self.caches[0]
+    }
+
+    fn v_cache(&self) -> &CudaSlice<u16> {
+        self.caches.get(1).unwrap_or(&self.caches[0])
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -766,12 +775,7 @@ impl Layout {
 }
 
 pub fn kv_block_bytes(spec: &Spec, planes: usize) -> usize {
-    if spec.runtime.kv_dtype.is_fp8() {
-        let raw = spec.kv_f16_layers();
-        let rows = 2 * spec.attention.kv_heads * PAGE;
-        return rows * (raw * spec.attention.head_dim * 2 + (spec.kv_layers() - raw) * (spec.attention.head_dim + 4));
-    }
-    2 * spec.kv_layers() * spec.attention.kv_heads * PAGE * spec.attention.head_dim * planes * 2
+    crate::state::kv_block_bytes(spec, planes)
 }
 
 impl Runtime {
@@ -905,8 +909,7 @@ impl Runtime {
             gate_up: stream.alloc_zeros(2 * d.intermediate)?,
             act: stream.alloc_zeros(d.intermediate)?,
             logits: stream.alloc_zeros(d.vocab)?,
-            k_cache: stream.alloc_zeros(1)?,
-            v_cache: stream.alloc_zeros(1)?,
+            caches: vec![stream.alloc_zeros(1)?],
             block_table: stream.alloc_zeros((layout.slots + 1) * pages)?,
             zero_slots: stream.alloc_zeros(chunk)?,
             token: stream.alloc_zeros(1)?,
@@ -1057,8 +1060,12 @@ impl Runtime {
             }
             n => n,
         };
-        rt.buf.k_cache = rt.stream.alloc_zeros(((kv_blocks + 1) * block_elems).max(1)).context("KV cache")?;
-        rt.buf.v_cache = rt.stream.alloc_zeros(((kv_blocks + 1) * block_elems).max(1)).context("KV cache")?;
+        rt.buf.caches = crate::state::positional(spec)
+            .map(|s| rt.stream.alloc_zeros(((kv_blocks + 1) * s.block_bytes(spec, layout.kv_planes) / 2).max(1)).with_context(|| format!("KV cache {}", s.name)))
+            .collect::<Result<_>>()?;
+        if rt.buf.caches.is_empty() {
+            rt.buf.caches.push(rt.stream.alloc_zeros(1)?);
+        }
         rt.kv_blocks = kv_blocks;
         let pad_row = layout.slots * pages;
         rt.tables[pad_row] = kv_blocks as i32;
@@ -1356,8 +1363,8 @@ impl Runtime {
             b.arg(&buf.qkv)
                 .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
                 .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
-                .arg(&buf.k_cache)
-                .arg(&buf.v_cache)
+                .arg(buf.k_cache())
+                .arg(buf.v_cache())
                 .arg(&table)
                 .arg(&buf.pos)
                 .arg(&buf.zero_slots)
@@ -1371,8 +1378,8 @@ impl Runtime {
             unsafe { b.launch(cfg((a.heads + 2 * a.kv_heads) as u32, a.head_dim.max(32) as u32)) }?;
             let mut b = self.stream.launch_builder(self.kernel("attention_split"));
             b.arg(&buf.qkv)
-                .arg(&buf.k_cache)
-                .arg(&buf.v_cache)
+                .arg(buf.k_cache())
+                .arg(buf.v_cache())
                 .arg(&table)
                 .arg(&buf.pos)
                 .arg(&kv_layer)
@@ -1842,8 +1849,8 @@ impl Runtime {
         b.arg(&qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
             .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
-            .arg(&buf.k_cache)
-            .arg(&buf.v_cache)
+            .arg(buf.k_cache())
+            .arg(buf.v_cache())
             .arg(&table)
             .arg(&buf.pos)
             .arg(&l.kv)
@@ -1873,8 +1880,8 @@ impl Runtime {
         let ntok = n as i32;
         b.arg(&qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
-            .arg(&buf.k_cache)
-            .arg(&buf.v_cache)
+            .arg(buf.k_cache())
+            .arg(buf.v_cache())
             .arg(&table)
             .arg(&buf.pos)
             .arg(&l.kv)
@@ -2304,8 +2311,8 @@ impl Runtime {
         b.arg(&pre.qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
             .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
-            .arg(&buf.k_cache)
-            .arg(&buf.v_cache)
+            .arg(buf.k_cache())
+            .arg(buf.v_cache())
             .arg(&buf.block_table)
             .arg(&bb.pos)
             .arg(&bb.slots)
@@ -2336,8 +2343,8 @@ impl Runtime {
         self.decode_rope_rows(l, bb, n)?;
         let mut b = self.stream.launch_builder(self.kernel("batch_decode_attention"));
         b.arg(&pre.qkv)
-            .arg(&buf.k_cache)
-            .arg(&buf.v_cache)
+            .arg(buf.k_cache())
+            .arg(buf.v_cache())
             .arg(&buf.block_table)
             .arg(&bb.pos)
             .arg(&bb.slots)
