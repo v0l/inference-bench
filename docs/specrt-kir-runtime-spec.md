@@ -195,3 +195,22 @@ tiny-sinks   prefill max_abs 0.00030136108, greedy decode tokens equal
 ```
 
 Not covered: WGSL for scan bodies, the single stream `step` path (a spec with nodes runs through prefill, `generate_batch` and the scheduler), MTP together with nodes, and tensor core (mma) scan bodies. The scan is a scalar warp kernel, so these descriptions are correct, not fast.
+
+## 9. Status of slice (c)
+
+Plumbing (commits "Spec-declared state tables" and "State-bound scan, row prims, split QK/V dims"), variant free:
+
+- `specrt::state`: `[[state]]` tables (`name`, `per = token | sequence | layer`, `layers = attention | linear`, `shape` as size expressions over model symbols and `[attention.params]`, `dtype`, `snapshot`, `prefix_share`, `rollback = positional | checkpoint`, `owner = "layer:N"`). `family-base.toml` declares the stock `k`, `v`, `conv` and `ssm` states, so stock specs serialise as before and every golden is unchanged. The runtime allocates one paged cache per per-token state; copy, park, resume and session save/load walk the declared caches. `kv_block_bytes`, the anatomy fit, `slot_state_bytes` and the placement cost model read the state shapes.
+- `kir::scan` takes an optional `[geometry]` with `[[query]]` segments: K and V come from named state bindings with their own row width, value offset and width (split QK and V head dims), and the result goes to an f32 buffer. Stock scan emission is unchanged.
+- `kir::rows`: `span_rope` (rope over a span of each head, `style = "halves" | "pairs"`), `state_write` (rows into a paged state) and `head_matvec` (`y[h] = W[h] · x[h]` with the weight addressed by head, inner and out strides plus an offset).
+- Node bindings `{ buffer = "qkv" | "attn" | <scratch> }` and `{ state = <name> }`; `[attention.scratch]` rows; `[[attention.projection]]` for the fused input linear and `o_cols` for the output linear; `[attention.params]` entries can be `{ expr = "..." }` over config keys (dotted paths) and other params. `SPEC_FORMAT` 10.
+
+The variant (no Rust): `specs/family-deepseek_v2.toml` and seven `specs/mla_*.toml` descriptions. The q and kv_a projections are one linear, then latent rmsnorm (`rmsnorm_segment`), pair rope on q and k rope slices, the latent write, W_UK absorption of q_nope, scan attention over the 1 x (kv_lora_rank + rope) latent (K = whole row, V = first kv_lora_rank), W_UV expansion into the attention planes, o_proj. The softmax scale includes the YaRN `mscale_all_dim` correction as a param expression.
+
+Proof (`tests/variants.rs`, fixture `tiny-deepseek-v2`, reference `scripts/tiny_variants.py`, transformers `DeepseekV2ForCausalLM` with random weights), Spark GB10, release:
+
+```text
+tiny-deepseek-v2 prefill max_abs 0.00039076805, greedy decode tokens equal
+```
+
+Not covered: the fixture's MLP is dense, because V2 MoE (two shared experts wider than the routed ones) does not load yet (#830); the real DeepSeek-V2-Lite is about 31 GB in bf16, over the Spark budget. The MLA kernels are scalar, correct rather than fast.
