@@ -135,6 +135,8 @@ impl Weight {
             Weight::GateUp if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
             Weight::GateUp => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
             Weight::Down => vec![w("mlp.down_proj")],
+            Weight::LinIn if spec.linear_attention.as_ref().is_some_and(|l| l.fused_interleaved) => vec![w("linear_attn.in_proj_qkvz")],
+            Weight::LinBa if spec.linear_attention.as_ref().is_some_and(|l| l.fused_interleaved) => vec![w("linear_attn.in_proj_ba")],
             Weight::LinIn => vec![w("linear_attn.in_proj_qkv"), w("linear_attn.in_proj_z")],
             Weight::LinBa => vec![w("linear_attn.in_proj_b"), w("linear_attn.in_proj_a")],
             Weight::LinOut => vec![w("linear_attn.out_proj")],

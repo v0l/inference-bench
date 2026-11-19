@@ -578,6 +578,19 @@ impl<'a> Raw<'a> {
         }
     }
 
+    fn split_groups(&self, groups: usize, widths: &[usize]) -> Result<Vec<Raw<'a>>> {
+        let stride: usize = widths.iter().sum();
+        ensure!(self.rows() == groups * stride, "fused rows {} do not split into {groups} groups of {stride}", self.rows());
+        let mut out = Vec::new();
+        let mut offset = 0;
+        for &width in widths {
+            let parts = (0..groups).map(|g| self.slice_rows(g * stride + offset, g * stride + offset + width)).collect();
+            out.push(Raw::concat(parts)?);
+            offset += width;
+        }
+        Ok(out)
+    }
+
     fn dequantized(self) -> Raw<'a> {
         match self {
             Raw::Fp8 { w, grid, map, cols } => {
@@ -949,9 +962,22 @@ impl Checkpoint {
         let h = spec.dims.hidden;
         let (conv_dim, value_dim, heads) = (la.conv_dim(), la.value_dim(), la.value_heads);
         let w = |n: &str, rows: usize, cols: usize| self.raw(&format!("{p}.{n}.weight"), rows, cols);
-        let in_proj = Raw::concat(vec![w("in_proj_qkv", conv_dim, h)?, w("in_proj_z", value_dim, h)?])?;
-        let mut ba = self.bf16(&format!("{p}.in_proj_b.weight"), &[heads, h])?.into_owned();
-        ba.extend_from_slice(&self.bf16(&format!("{p}.in_proj_a.weight"), &[heads, h])?);
+        let (in_proj, ba) = if la.fused_interleaved {
+            let key_dim = la.key_head_dim;
+            let per_group = heads / la.key_heads;
+            let value_per_group = per_group * la.value_head_dim;
+            let mut pieces = w("in_proj_qkvz", la.in_proj_rows(), h)?.split_groups(la.key_heads, &[key_dim, key_dim, value_per_group, value_per_group])?;
+            let z = pieces.pop().context("no z rows")?;
+            let in_proj = Raw::concat(vec![pieces.remove(0), pieces.remove(0), pieces.remove(0), z])?;
+            let pair = w("in_proj_ba", la.ba_rows(), h)?.split_groups(la.key_heads, &[per_group, per_group])?;
+            let Raw::Bf16 { w: b, .. } = Raw::concat(pair)?.dequantized() else { bail!("{p}.in_proj_ba is not bf16") };
+            (in_proj, b.into_owned())
+        } else {
+            let in_proj = Raw::concat(vec![w("in_proj_qkv", conv_dim, h)?, w("in_proj_z", value_dim, h)?])?;
+            let mut ba = self.bf16(&format!("{p}.in_proj_b.weight"), &[heads, h])?.into_owned();
+            ba.extend_from_slice(&self.bf16(&format!("{p}.in_proj_a.weight"), &[heads, h])?);
+            (in_proj, ba)
+        };
         Ok(Gdn {
             in_proj: in_proj.into_matrix(spec.quant, &format!("{p}.in_proj"))?,
             ba: Matrix::Bf16(Cow::Owned(ba)),
@@ -1456,6 +1482,21 @@ mod tests {
         assert_eq!(find_in_snapshot(&repo, "tokenizer.json").unwrap(), dir.join("tokenizer.json"));
         assert!(find_in_snapshot(&repo, "missing.json").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fused_interleaved_rows_split_by_key_group() {
+        let rows: Vec<u16> = (0..12).collect();
+        let fused = Raw::Bf16 { w: Cow::Owned(rows), cols: 1 };
+        let parts = fused.split_groups(2, &[1, 2, 3]).unwrap();
+        let flat = |r: &Raw| match r {
+            Raw::Bf16 { w, .. } => w.to_vec(),
+            _ => unreachable!(),
+        };
+        assert_eq!(flat(&parts[0]), vec![0, 6]);
+        assert_eq!(flat(&parts[1]), vec![1, 2, 7, 8]);
+        assert_eq!(flat(&parts[2]), vec![3, 4, 5, 9, 10, 11]);
+        assert!(Raw::Bf16 { w: Cow::Owned(vec![0; 5]), cols: 1 }.split_groups(2, &[1, 2]).is_err());
     }
 
     #[test]

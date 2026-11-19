@@ -361,6 +361,8 @@ pub struct LinearAttention {
     pub conv_kernel: usize,
     #[serde(default, skip_serializing_if = "VHeadOrder::is_grouped")]
     pub v_heads: VHeadOrder,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fused_interleaved: bool,
 }
 
 impl LinearAttention {
@@ -1202,7 +1204,16 @@ fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, la
 
 fn moe_act(rule: &crate::family::FamilyQuant, q: Option<&serde_json::Value>) -> ActQuant {
     let groups = q.and_then(|q| q["config_groups"].as_object());
-    groups.and_then(|g| g.values().next()).map_or(ActQuant::None, |g| compressed_act(rule, g))
+    let Some(g) = groups.and_then(|g| g.values().next()) else { return ActQuant::None };
+    let mut g = g.clone();
+    for key in ["format", "quant_method", "quant_algo"] {
+        if g.get(key).is_none()
+            && let Some(v) = q.and_then(|q| q.get(key))
+        {
+            g[key] = v.clone();
+        }
+    }
+    compressed_act(rule, &g)
 }
 
 fn parse_quantization(rule: &crate::family::FamilyQuant, value: Option<&serde_json::Value>, layers: usize) -> Result<Quantization> {
@@ -1555,6 +1566,7 @@ impl Spec {
                     value_head_dim: need(hf.linear_value_head_dim, "linear_value_head_dim")?,
                     conv_kernel: need(hf.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
                     v_heads: VHeadOrder::Grouped,
+                    fused_interleaved: family.linear.fused_interleaved,
                 })
             })();
             if strict { Some(dims?) } else { dims.ok() }
