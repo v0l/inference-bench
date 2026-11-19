@@ -60,3 +60,44 @@ fn qwen3_next_nvfp4_agrees_with_vllm_logprobs() {
     assert!(top1 * 10 >= total * 9, "teacher-forced top-1 {top1}/{total}");
     assert!(mean <= 0.05, "mean KL {mean}");
 }
+
+fn log_softmax(row: &[f32]) -> Vec<f64> {
+    let max = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v));
+    let lse = max as f64 + row.iter().map(|&v| ((v - max) as f64).exp()).sum::<f64>().ln();
+    row.iter().map(|&v| v as f64 - lse).collect()
+}
+
+#[test]
+#[ignore = "needs the Qwen3-Next NVFP4 checkpoint in SPECRT_NEXT_DIR, qwen3-next-3l.ref.* in SPECRT_REF_DIR (scripts/next_slice.py) and about 20 GB of free GPU memory"]
+fn qwen3_next_nvfp4_first_three_layers_match_transformers() {
+    let dir = PathBuf::from(std::env::var_os("SPECRT_NEXT_DIR").expect("SPECRT_NEXT_DIR"));
+    let refs = PathBuf::from(std::env::var_os("SPECRT_REF_DIR").expect("SPECRT_REF_DIR"));
+    let n: usize = std::env::var("SPECRT_NEXT_LAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(refs.join(format!("qwen3-next-{n}l.ref.json"))).unwrap()).unwrap();
+    let tokens = ids(&meta["tokens"]);
+    let greedy = ids(&meta["greedy"]);
+    let vocab = meta["vocab"].as_u64().unwrap() as usize;
+    let bytes = std::fs::read(refs.join(format!("qwen3-next-{n}l.ref.bin"))).unwrap();
+    let want: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+    let rows = want.len() / vocab;
+    let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    spec.repo = dir.display().to_string();
+    spec.layers.count = n;
+    let mut rt = Runtime::load(&spec, 512).unwrap();
+    let ours = rt.prompt_logits(&tokens).unwrap();
+    let first = tokens.len() - rows;
+    let (mut worst, mut top1) = (0f64, 0usize);
+    for r in 0..rows {
+        let a = &ours[(first + r) * vocab..(first + r + 1) * vocab];
+        let b = &want[r * vocab..(r + 1) * vocab];
+        let (la, lb) = (log_softmax(a), log_softmax(b));
+        let kl: f64 = lb.iter().zip(&la).map(|(q, p)| q.exp() * (q - p)).sum();
+        worst = worst.max(kl);
+        top1 += (argmax(a) == argmax(b)) as usize;
+        eprintln!("qwen3-next-{n}l row {r} kl {kl}");
+    }
+    let same = if greedy.is_empty() { 0 } else { rt.generate(&tokens, greedy.len(), specrt::runtime::Sampling::GREEDY).unwrap().tokens.iter().zip(&greedy).take_while(|(a, b)| a == b).count() };
+    eprintln!("qwen3-next-{n}l rows {rows} worst kl {worst} top1 {top1}/{rows} greedy prefix {same}/{}", greedy.len());
+    assert!(worst < 0.001, "kl {worst}");
+    assert_eq!(top1, rows, "top-1 {top1}/{rows}");
+}
