@@ -226,8 +226,9 @@ pub fn total_height(rows: &[Row]) -> f32 {
     rows.iter().map(row_height).sum::<f32>() + GAP * rows.len().saturating_sub(1) as f32 + 4.0
 }
 
-pub fn theta_text(theta: f64) -> String {
-    match theta {
+pub fn theta_text(theta: Option<f64>) -> String {
+    let Some(t) = theta else { return "unknown".to_string() };
+    match t {
         t if t >= 1e6 && (t / 1e6).fract() == 0.0 => format!("{}M", t / 1e6),
         t if t >= 1e3 && (t / 1e3).fract() == 0.0 => format!("{}k", t / 1e3),
         t => format!("{t}"),
@@ -425,7 +426,7 @@ mod tests {
 
     #[test]
     fn the_rope_label_has_no_strikethrough_and_a_compact_theta() {
-        assert_eq!(theta_text(10_000_000.0), "10M");
+        assert_eq!(theta_text(Some(10_000_000.0)), "10M");
         let job = shape_job("theta 10M, 64 of 256 dims", 300.0);
         assert!(!job.sections.is_empty());
         for s in &job.sections {

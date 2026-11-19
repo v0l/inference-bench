@@ -122,7 +122,7 @@ fn run(heads: usize, kv_heads: usize, head_dim: usize, planes: usize, tokens: us
             }
             let rot = spec.rotary_dim();
             for d in 0..rot / 2 {
-                let angle = t as f64 * (spec.rope.theta as f64).powf(-(2.0 * d as f64) / rot as f64);
+                let angle = t as f64 * (spec.theta() as f64).powf(-(2.0 * d as f64) / rot as f64);
                 let (sn, c) = angle.sin_cos();
                 let (x, y) = (q[d] as f64, q[d + rot / 2] as f64);
                 q[d] = (x * c - y * sn) as f32;

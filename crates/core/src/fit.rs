@@ -124,7 +124,7 @@ fn config_extras(path: &std::path::Path) -> (usize, Option<usize>) {
         return (0, None);
     };
     let text = v.get("text_config").filter(|t| t.is_object()).unwrap_or(&v);
-    let mtp = text["mtp_num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+    let mtp = text["mtp_num_hidden_layers"].as_u64().or_else(|| text["num_nextn_predict_layers"].as_u64()).unwrap_or(0) as usize;
     (mtp, text["max_position_embeddings"].as_u64().map(|c| c as usize))
 }
 
@@ -191,7 +191,7 @@ pub fn describe_spec_file(name: &str, path: &std::path::Path, config_text: Optio
         let _ = spec.complete_from_checkpoint_config(text);
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
             let t = v.get("text_config").filter(|t| t.is_object()).unwrap_or(&v);
-            mtp = t["mtp_num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+            mtp = t["mtp_num_hidden_layers"].as_u64().or_else(|| t["num_nextn_predict_layers"].as_u64()).unwrap_or(0) as usize;
             ctx = t["max_position_embeddings"].as_u64().map(|c| c as usize);
         }
     }
@@ -203,7 +203,7 @@ pub fn describe_spec_file(name: &str, path: &std::path::Path, config_text: Optio
 pub fn describe_config_json(name: &str, text: &str) -> Result<Described, String> {
     let v: serde_json::Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
     let t = v.get("text_config").filter(|t| t.is_object()).unwrap_or(&v);
-    let mtp = t["mtp_num_hidden_layers"].as_u64().unwrap_or(0) as usize;
+    let mtp = t["mtp_num_hidden_layers"].as_u64().or_else(|| t["num_nextn_predict_layers"].as_u64()).unwrap_or(0) as usize;
     describe_hf_config(name, text, mtp, t["max_position_embeddings"].as_u64().map(|c| c as usize))
 }
 

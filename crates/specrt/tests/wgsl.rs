@@ -306,7 +306,7 @@ fn swiglu_matches_a_cpu_reference() {
 }
 
 fn rope_inv_freq(s: &Spec, i: usize) -> f64 {
-    1.0 / s.rope.theta.powf(2.0 * i as f64 / s.rotary_dim() as f64)
+    1.0 / s.theta().powf(2.0 * i as f64 / s.rotary_dim() as f64)
 }
 
 #[test]

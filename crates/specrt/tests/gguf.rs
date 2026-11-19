@@ -75,7 +75,7 @@ fn the_llama_gguf_spec_recovers_llama3_rope_scaling_and_tokenizes_like_llama_cpp
     let mut hf = specrt::spec::Spec::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/llama-3.2-1b.toml")).unwrap();
     (hf.name, hf.repo, hf.quant) = (spec.name.clone(), spec.repo.clone(), specrt::spec::Quant::Gguf);
     hf.norm.eps = spec.norm.eps;
-    hf.rope.theta = spec.rope.theta;
+    hf.rope.theta = Some(spec.rope.theta.unwrap_or(10000.0));
     hf.runtime.unsplit = ["qkv", "o", "gate_up", "down"].map(String::from).to_vec();
     hf.runtime.big_tile = Some([256, 128, 4, 2]);
     assert_eq!(spec, hf);

@@ -330,16 +330,33 @@ pub struct Family {
 
 impl Family {
     pub fn normalise(&self, config: &mut serde_json::Value) {
-        let Some(map) = config.as_object_mut() else { return };
         for (canonical, alternatives) in &self.fields {
-            if map.contains_key(canonical) {
+            if dotted(config, canonical).is_some() {
                 continue;
             }
-            if let Some(v) = alternatives.iter().find_map(|k| map.get(k)).cloned() {
-                map.insert(canonical.clone(), v);
+            if let Some(v) = alternatives.iter().find_map(|alt| dotted(config, alt)).cloned() {
+                if let Some(map) = config.as_object_mut() {
+                    insert_dotted(map, canonical, v);
+                }
             }
         }
     }
+}
+
+fn dotted<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.').try_fold(value, |v, k| v.get(k))
+}
+
+fn insert_dotted(map: &mut serde_json::Map<String, serde_json::Value>, path: &str, value: serde_json::Value) {
+    let (last, parents) = match path.rsplit_once('.') {
+        Some((rest, last)) => (last, rest.split('.').collect::<Vec<_>>()),
+        None => (path, Vec::new()),
+    };
+    let mut at = map;
+    for parent in parents {
+        at = at.entry(parent.to_string()).or_insert_with(|| serde_json::json!({})).as_object_mut().expect("a dotted field alias overwrote a non-object");
+    }
+    at.insert(last.to_string(), value);
 }
 
 static ACTIVE: std::sync::RwLock<Option<Registry>> = std::sync::RwLock::new(None);
