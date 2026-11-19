@@ -1334,6 +1334,8 @@ impl Spec {
         let mut spec = Self::from_hf_config_serving(json)?;
         spec.act_quant = ActQuant::None;
         spec.mlp.act_quant = ActQuant::None;
+        spec.mlp.up_act_planes = 1;
+        spec.mlp.down_act_planes = 1;
         Ok(spec)
     }
 
