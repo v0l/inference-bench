@@ -176,6 +176,7 @@ pub struct FamilyMoe {
     pub router_bias: bool,
     pub expert_bias: bool,
     pub router_module: Option<String>,
+    pub fused_experts: bool,
     pub hash_table: Option<String>,
 }
 
@@ -294,6 +295,8 @@ pub struct FamilyRope {
     pub scaling_path: Option<String>,
     pub rotary_dim_key: Option<String>,
     pub yarn_attention_factor: Option<f64>,
+    pub nope_key: Option<String>,
+    pub nope_value: Option<String>,
 }
 
 impl FamilyRope {
@@ -527,6 +530,9 @@ impl Family {
             push(k, &mut out);
         }
         if let Some(k) = self.rope.nope_flags.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.rope.nope_key.as_deref() {
             push(k, &mut out);
         }
         for k in &self.rope.type_keys {

@@ -477,6 +477,8 @@ impl Gguf {
                     router_bias: false,
                     expert_bias: false,
                     router_module: "gate".to_string(),
+                    out_scale: 1.0,
+                    fused_experts: false,
                     hash_layers: 0,
                     hash_table: None,
                     tp_split: crate::spec::TpSplit::Auto,
