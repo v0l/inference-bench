@@ -105,6 +105,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
         Mixer::Attention(a) => DeviceMixer::Attention(DeviceAttn {
             qkv: up_m(&a.qkv)?,
             qkv_bias: up_opt(&a.qkv_bias)?,
+            o_bias: up_opt(&a.o_bias)?,
             q_norm: up_opt(&a.q_norm)?,
             k_norm: up_opt(&a.k_norm)?,
             o: up_m(&a.o)?,
@@ -346,6 +347,7 @@ struct DescribedLaunch {
 struct DeviceAttn {
     qkv: DeviceMatrix,
     qkv_bias: Option<CudaSlice<f32>>,
+    o_bias: Option<CudaSlice<f32>>,
     q_norm: Option<CudaSlice<f32>>,
     k_norm: Option<CudaSlice<f32>>,
     o: DeviceMatrix,
@@ -393,6 +395,7 @@ impl DeviceLayer {
                 a.qkv.bytes()
                     + a.o.bytes()
                     + opt_bytes(&a.qkv_bias)
+                    + opt_bytes(&a.o_bias)
                     + opt_bytes(&a.q_norm)
                     + opt_bytes(&a.k_norm)
             }
@@ -1212,7 +1215,7 @@ impl Runtime {
 
     fn mlp_decode(&self, l: &DeviceLayer) -> Result<()> {
         if l.moe.is_some() {
-            return self.moe_block(l, &self.buf.x, 1);
+            return self.moe_block(l, &self.buf.x, &self.buf.token, 1);
         }
         let s = &self.spec;
         let buf = &self.buf;
@@ -1266,10 +1269,10 @@ impl Runtime {
         let hidden = self.spec.dims.hidden;
         if self.spec.uses_branch() {
             self.clear_branch()?;
-            self.linear("o_proj", &l.o, None, &self.buf.attn, &self.pre.branch, hidden)?;
+            self.linear("o_proj", &l.o, l.o_bias.as_ref(), &self.buf.attn, &self.pre.branch, hidden)?;
             return self.merge_branch(self.spec.norm.sandwich.then_some(&layer.ln2));
         }
-        self.linear("o_proj", &l.o, None, &self.buf.attn, &self.buf.x, hidden)
+        self.linear("o_proj", &l.o, l.o_bias.as_ref(), &self.buf.attn, &self.buf.x, hidden)
     }
 
     fn qk_norm_decode(&self, l: &DeviceAttn) -> Result<()> {
@@ -1913,7 +1916,7 @@ impl Runtime {
 
     fn mlp_prefill(&self, l: &DeviceLayer, n: usize) -> Result<()> {
         if l.moe.is_some() {
-            return self.moe_block(l, &self.pre.x, n);
+            return self.moe_block(l, &self.pre.x, &self.pre.tokens, n);
         }
         let pre = &self.pre;
         let (hidden, inter) = (self.spec.dims.hidden, self.spec.dims.intermediate);

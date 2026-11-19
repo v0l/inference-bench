@@ -1,0 +1,50 @@
+{
+  "name": "glm4_moe",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 256,
+    "intermediate": 512,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 64,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "rotary_dim": 32
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 8,
+    "active": 2,
+    "expert_intermediate": 256,
+    "shared_intermediate": 256,
+    "dense_layers": [
+      0
+    ],
+    "shared_gate": true,
+    "routed_scale": 1.5,
+    "groups": 2,
+    "topk_group": 1
+  }
+}

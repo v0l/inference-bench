@@ -1,0 +1,57 @@
+kind = "kir-kernel"
+family = "index_topk"
+name = "dsa_index_topk"
+threads = 256
+
+[args]
+heads = "index_heads"
+dim = "index_head_dim"
+topk = "index_topk"
+max_keys = "max_context"
+q_row = "index_q_row"
+q_offset = 0
+w_row = "index_w_row"
+w_offset = 0
+out_row = "index_topk"
+
+[[param]]
+name = "q"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "keys"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "idx"
+type = "i32"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"

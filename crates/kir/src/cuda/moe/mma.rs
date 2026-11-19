@@ -213,8 +213,8 @@ fn epilogue() -> &'static str {
                 int col = n0 + wn * TN + j * 8 + 2 * t;
                 float2 v;
                 if (NW == 2) {
-                    v.x = activation(acc[0][i][j][2 * h] * alpha0) * (acc[NW - 1][i][j][2 * h] * alpha1);
-                    v.y = activation(acc[0][i][j][2 * h + 1] * alpha0) * (acc[NW - 1][i][j][2 * h + 1] * alpha1);
+                    v.x = gated_act(acc[0][i][j][2 * h] * alpha0, acc[NW - 1][i][j][2 * h] * alpha1);
+                    v.y = gated_act(acc[0][i][j][2 * h + 1] * alpha0, acc[NW - 1][i][j][2 * h + 1] * alpha1);
                 } else {
                     v.x = acc[0][i][j][2 * h] * alpha0;
                     v.y = acc[0][i][j][2 * h + 1] * alpha0;

@@ -2,10 +2,14 @@ use crate::ops::{OpsShape, f32_literal};
 
 const PRELUDE: &str = include_str!("prelude.cu");
 
-pub fn emit_ops(s: &OpsShape) -> String {
+pub fn emit_ops(s: &OpsShape) -> Result<String, String> {
+    let gated = match &s.gated {
+        Some(g) => g.lower_cuda().map_err(|e| format!("gated activation {:?}: {e}", g.expr))?,
+        None => "activation(g) * u".to_string(),
+    };
     let group = s.heads / s.kv_heads;
     let act = if s.gated_gelu { 1 } else { 0 };
-    format!(
+    Ok(format!(
         "typedef unsigned short bf16_t;
 typedef signed char i8_t;
 
@@ -26,6 +30,7 @@ constexpr float EMBED_SCALE = {embed_scale};
 constexpr int ACT_KIND = {act};
 constexpr int Q8_GROUP = {q8_group};
 constexpr int FP8_BLOCK = {fp8_block};
+#define GATED_BODY(g, u) ({gated})
 {PRELUDE}",
         hidden = s.hidden,
         inter = s.inter,
@@ -39,5 +44,5 @@ constexpr int FP8_BLOCK = {fp8_block};
         embed_scale = f32_literal(s.embed_scale),
         q8_group = s.q8_group,
         fp8_block = s.fp8_block,
-    )
+    ))
 }

@@ -514,6 +514,26 @@ pub struct Moe {
     pub shared_module: String,
     #[serde(default = "default_routed_scale", skip_serializing_if = "is_default_routed_scale")]
     pub routed_scale: f64,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub groups: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub topk_group: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub score_bias: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_block: Option<crate::dequant::BlockFormat>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gate_up_interleaved: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub router_bias: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expert_bias: bool,
+    #[serde(default = "default_router_module", skip_serializing_if = "is_default_router_module")]
+    pub router_module: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub hash_layers: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_table: Option<String>,
     #[serde(default, skip_serializing_if = "TpSplit::is_auto")]
     pub tp_split: TpSplit,
     #[serde(skip)]
@@ -553,6 +573,14 @@ impl RouterAct {
     fn is_softmax(&self) -> bool {
         *self == RouterAct::Softmax
     }
+}
+
+fn default_router_module() -> String {
+    "gate".to_string()
+}
+
+fn is_default_router_module(s: &String) -> bool {
+    s == "gate"
 }
 
 fn is_true(b: &bool) -> bool {
@@ -602,6 +630,10 @@ impl Moe {
         self.local.map_or(0, |r| r.first)
     }
 
+    pub fn is_hashed(&self, layer: usize) -> bool {
+        self.hash_table.is_some() && layer < self.hash_layers
+    }
+
     pub fn top_k(&self) -> usize {
         self.active.unwrap_or(1)
     }
@@ -647,6 +679,8 @@ pub struct Attention {
     pub kv_heads: usize,
     pub head_dim: usize,
     pub qkv_bias: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub o_bias: bool,
     pub qk_norm: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub output_gate: bool,
@@ -724,6 +758,16 @@ pub struct Mlp {
     pub act_quant: ActQuant,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fused_gate_up: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gated: Option<GatedAct>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatedAct {
+    pub expr: String,
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -804,7 +848,7 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "model_type", "hidden_size", "intermediate_size", "moe_intermediate_size", "shared_expert_intermediate_size", "num_experts",
     "num_experts_per_tok", "mlp_only_layers", "decoder_sparse_step", "norm_topk_prob", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
     "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
-    "n_shared_experts", "routed_scaling_factor", "first_k_dense_replace", "n_routed_experts", "num_nextn_predict_layers", "linear_attn_config",
+    "n_shared_experts", "routed_scaling_factor", "n_group", "topk_group", "num_hash_layers", "swiglu_alpha", "swiglu_limit", "first_k_dense_replace", "n_routed_experts", "num_nextn_predict_layers", "linear_attn_config",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
     "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "embedding_multiplier", "attention_multiplier", "residual_multiplier", "logits_scaling", "no_rope_layers", "no_rope_layer_interval", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config",
@@ -837,6 +881,9 @@ struct HfConfig {
     n_shared_experts: Option<usize>,
     first_k_dense_replace: Option<usize>,
     routed_scaling_factor: Option<f64>,
+    n_group: Option<usize>,
+    num_hash_layers: Option<usize>,
+    topk_group: Option<usize>,
     #[serde(default)]
     mlp_only_layers: Vec<usize>,
     decoder_sparse_step: Option<usize>,
@@ -1241,6 +1288,11 @@ impl Spec {
         Ok(())
     }
 
+    pub fn expert_tensors(&self) -> Vec<String> {
+        let shared = self.moe.as_ref().map_or(DEFAULT_SHARED_MODULE, |m| &m.shared_module);
+        vec!["mlp.experts".into(), format!("mlp.{shared}")]
+    }
+
     pub fn check_moe_runnable(&self) -> Result<()> {
         let Some(m) = &self.moe else { return Ok(()) };
         ensure!(self.linear_attention.is_some() || self.attention_layers() > 0, "mixture-of-experts needs attention layers");
@@ -1312,6 +1364,7 @@ impl Spec {
         };
         let attn_flags = (
             family.attention.qkv_bias.read(&value),
+            family.attention.o_bias.read(&value),
             family.attention.qk_norm.read(&value),
             family.attention.output_gate.read(&value),
         );
@@ -1383,7 +1436,7 @@ impl Spec {
             crate::family::BlockKind::Dense => false,
             crate::family::BlockKind::FromConfig => config_hybrid,
         };
-        let (qkv_bias, qk_norm, output_gate) = attn_flags;
+        let (qkv_bias, o_bias, qk_norm, output_gate) = attn_flags;
         let multiplier = |key: &Option<String>| key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_f64());
         let head_dim = hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads);
         let rotary_dim = hf
@@ -1440,11 +1493,21 @@ impl Spec {
                     shared_intermediate: shared,
                     dense_layers: dense,
                     sparse_step: hf.decoder_sparse_step.unwrap_or(1),
-                    router: RouterAct::Softmax,
-                    norm_topk: hf.norm_topk_prob.unwrap_or(hybrid),
+                    router: family.moe.router.unwrap_or_default(),
+                    norm_topk: hf.norm_topk_prob.or(family.moe.norm_topk).unwrap_or(hybrid),
                     shared_gate: family.moe.shared_gate.unwrap_or(hf.n_shared_experts.is_some_and(|n| n > 0) || shared > 0),
                     shared_module: family.moe.shared_module.clone().unwrap_or_else(default_shared_module),
                     routed_scale: hf.routed_scaling_factor.unwrap_or(1.0),
+                    groups: hf.n_group.filter(|g| *g > 1).unwrap_or(0),
+                    topk_group: if hf.n_group.is_some_and(|g| g > 1) { hf.topk_group.unwrap_or(1) } else { 0 },
+                    score_bias: family.moe.score_bias,
+                    expert_block: family.moe.expert_block,
+                    gate_up_interleaved: family.moe.gate_up_interleaved,
+                    router_bias: family.moe.router_bias,
+                    expert_bias: family.moe.expert_bias,
+                    router_module: family.moe.router_module.clone().unwrap_or_else(default_router_module),
+                    hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
+                    hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,
                     local: None,
                 })
@@ -1490,6 +1553,7 @@ impl Spec {
                 kv_heads: hf.num_key_value_heads.unwrap_or(hf.num_attention_heads),
                 head_dim,
                 qkv_bias,
+                o_bias,
                 qk_norm,
                 output_gate,
                 rotary_dim,
@@ -1510,6 +1574,10 @@ impl Spec {
                 quant_until: mlp_quant.and_then(|m| m.1),
                 act_quant: mlp_act,
                 fused_gate_up: family.mlp.fused_gate_up,
+                gated: match &family.mlp.gated {
+                    Some(g) => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
+                    None => None,
+                },
             },
             moe,
             mtp: (family.mtp && hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),

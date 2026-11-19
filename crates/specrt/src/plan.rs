@@ -115,7 +115,13 @@ impl Weight {
                 }
                 t
             }
-            Weight::O => vec![w("self_attn.o_proj")],
+            Weight::O => {
+                let mut t = vec![w("self_attn.o_proj")];
+                if spec.attention.o_bias {
+                    t.push("self_attn.o_proj.bias".into());
+                }
+                t
+            }
             Weight::GateUp if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
             Weight::GateUp => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
             Weight::Down => vec![w("mlp.down_proj")],
@@ -303,7 +309,7 @@ impl Op {
                 .collect(),
             Op::GdnPrefill | Op::GdnDecode => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
             Op::MoeRoute => vec!["mlp.gate.weight".into(), "mlp.shared_expert_gate.weight".into()],
-            Op::MoeExperts => vec!["mlp.experts".into(), format!("mlp.{}", spec.moe.as_ref().map_or(crate::spec::DEFAULT_SHARED_MODULE, |m| &m.shared_module))],
+            Op::MoeExperts => spec.expert_tensors(),
             _ => Vec::new(),
         }
     }
