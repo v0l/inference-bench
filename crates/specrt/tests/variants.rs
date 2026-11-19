@@ -258,6 +258,9 @@ fn gpt_oss_block_scaled_mma_experts_match_the_packed_gemv_experts() {
     gemv.mlp.act_quant = specrt::spec::ActQuant::None;
     let a = Runtime::load_batched(&mma, 256, 1).unwrap().prompt_logits(&tokens).unwrap();
     let b = Runtime::load_batched(&gemv, 256, 1).unwrap().prompt_logits(&tokens).unwrap();
+    let (_, _, _, want) = reference(OSS);
+    let err = |x: &[f32]| x.iter().zip(&want).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+    eprintln!("vs transformers: mma {} gemv {}", err(&a), err(&b));
     let scale = b.iter().fold(0f32, |m, v| m.max(v.abs()));
     let diff = a.iter().zip(&b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
     eprintln!("gpt-oss mma vs gemv max diff {diff} of {scale} over {} rows of {vocab}", tokens.len());

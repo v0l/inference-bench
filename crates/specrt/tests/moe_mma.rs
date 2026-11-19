@@ -127,7 +127,9 @@ fn run(tokens: usize, expected_bm: usize) {
 fn run_with(tokens: usize, expected_bm: usize, mx: bool) {
     let mut spec = spec();
     if mx {
-        spec.moe.as_mut().unwrap().expert_block = Some(specrt::dequant::MXFP4);
+        let m = spec.moe.as_mut().unwrap();
+        m.expert_block = Some(specrt::dequant::MXFP4);
+        m.expert_bias = true;
     }
     let ctx = CudaContext::new(0).unwrap();
     let target = cuda_target(&ctx).unwrap();
@@ -166,6 +168,9 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool) {
         idx[t * PAIRS + TOP_K] = EXPERTS as i32;
     }
     let pairs = tokens * PAIRS;
+    let bias_up: Vec<f32> = (0..EXPERTS * 2 * INTER).map(|_| if mx { rng.float() } else { 0.0 }).collect();
+    let bias_down: Vec<f32> = (0..EXPERTS * HIDDEN).map(|_| if mx { rng.float() } else { 0.0 }).collect();
+    let eb = |v: &[f32], e: usize, which: usize, r: usize, width: usize| if e < EXPERTS { v[(e * 2 + which) * width + r] } else { 0.0 };
     let igs_up = 300.0f32;
     let igs_down = 120.0f32;
     let qd = |v: &[f32], igs: f32| -> Vec<f32> { if mx { v.chunks(32).flat_map(|c| mx_quantize(c).2).collect() } else { quant_dequant(v, igs) } };
@@ -177,12 +182,12 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool) {
         let act: Vec<f32> = (0..INTER)
             .map(|r| {
                 let dot = |w: &Stack| -> f32 { (0..HIDDEN).map(|c| w.dequant[(e * INTER + r) * HIDDEN + c] * xin[c]).sum() };
-                silu(dot(&gate)) * dot(&up)
+                silu(dot(&gate) + eb(&bias_up, e, 0, r, INTER)) * (dot(&up) + eb(&bias_up, e, 1, r, INTER))
             })
             .collect();
         let mid = qd(&act, igs_down);
         for r in 0..HIDDEN {
-            expected[p * HIDDEN + r] = (0..INTER).map(|c| down.dequant[(e * HIDDEN + r) * INTER + c] * mid[c]).sum();
+            expected[p * HIDDEN + r] = (0..INTER).map(|c| down.dequant[(e * HIDDEN + r) * INTER + c] * mid[c]).sum::<f32>() + if e < EXPERTS { bias_down[e * HIDDEN + r] } else { 0.0 };
         }
     }
     let d = |v: &[u8]| stream.clone_htod(v).unwrap();
@@ -191,7 +196,8 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool) {
     let (gw, gs, gg) = (d(&gate.packed), d(&gate.scales), one(&gate));
     let (uw, us, ug) = (d(&up.packed), d(&up.scales), one(&up));
     let (dw, ds, dg) = (d(&down.packed), d(&down.scales), one(&down));
-    let bias = df(&[0.0]);
+    let bias_u = if mx { df(&bias_up) } else { df(&[0.0]) };
+    let bias_d = if mx { df(&bias_down) } else { df(&[0.0]) };
     let stem = if mx { "moe_mma_mx" } else { "moe_mma" };
     let quant_name = if mx { "moe_quant_mx" } else { "moe_quant_f32" };
     let xd = df(&x);
@@ -229,7 +235,7 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool) {
     let small = expected_bm == MOE_MMA_BM_SMALL;
     let kernel = f(&format!("{stem}_up{}", if small { "_s" } else { "" }));
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&gw).arg(&gs).arg(&gg).arg(&uw).arg(&us).arg(&ug).arg(&bias).arg(&inv_up).arg(&xq).arg(&xs).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut act);
+    b.arg(&gw).arg(&gs).arg(&gg).arg(&uw).arg(&us).arg(&ug).arg(&bias_u).arg(&inv_up).arg(&xq).arg(&xs).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut act);
     let config = LaunchConfig { grid_dim: ((INTER / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(expected_bm, 2) };
     unsafe { b.launch(config) }.unwrap();
     let w = INTER as i32;
@@ -243,7 +249,7 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool) {
     let inv_down = 1.0 / igs_down;
     let kernel = f(&format!("{stem}_down{}", if small { "_s" } else { "" }));
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&dw).arg(&ds).arg(&dg).arg(&dw).arg(&ds).arg(&dg).arg(&bias).arg(&inv_down).arg(&aq).arg(&asc).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut out);
+    b.arg(&dw).arg(&ds).arg(&dg).arg(&dw).arg(&ds).arg(&dg).arg(&bias_d).arg(&inv_down).arg(&aq).arg(&asc).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut out);
     let config = LaunchConfig { grid_dim: ((HIDDEN / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(expected_bm, 1) };
     unsafe { b.launch(config) }.unwrap();
     stream.synchronize().unwrap();
