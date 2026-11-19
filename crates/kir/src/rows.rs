@@ -178,7 +178,7 @@ impl RowBody {
     const float* qr = q + (size_t)row * {q_row} + {q_offset};
     const float* wr = w + (size_t)row * {w_row} + {w_offset};
     for (int t = threadIdx.x; t < MAX_KEYS; t += blockDim.x) {{
-        float s = NEG_INF;
+        float s = -3.0e30f;
         if (t < n) {{
             s = 0.0f;
             for (int h = 0; h < HEADS; h++) {{
@@ -194,7 +194,7 @@ impl RowBody {
     const int warp = threadIdx.x >> 5;
     const int warps = (blockDim.x + 31) >> 5;
     for (int r = 0; r < TOPK; r++) {{
-        float bv = NEG_INF;
+        float bv = -3.0e30f;
         int bi = MAX_KEYS;
         for (int t = threadIdx.x; t < MAX_KEYS; t += blockDim.x) {{
             if (score[t] > bv) {{ bv = score[t]; bi = t; }}
@@ -214,7 +214,7 @@ impl RowBody {
             }}
             bool live = r < n && at < MAX_KEYS;
             idx[(size_t)row * {out_row} + r] = live ? at : -1;
-            if (live) score[at] = NEG_INF;
+            if (live) score[at] = -3.0e30f;
         }}
         __syncthreads();
     }}
