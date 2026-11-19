@@ -120,3 +120,82 @@ pub fn swizzle(name: &str, row_bytes: &str) -> String {
 pub fn warp_ids() -> &'static str {
     "    int warp = threadIdx.x >> 5;\n    int lane = threadIdx.x & 31;\n"
 }
+
+pub fn mainloop_head() -> String {
+    "    for (int kt = 0; kt < KT; kt++) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        int next = kt + STAGES - 1;
+        if (next < KT) load_stage(next % STAGES, next);
+        cp_async_commit();
+"
+    .to_string()
+}
+
+pub fn batch_loop_head() -> String {
+    "    for (int it = 0; it < nc; it++) {
+        cp_async_wait<STAGES - 2>();
+        __syncthreads();
+        if (it + STAGES - 1 < nc) stage((it + STAGES - 1) % STAGES, c_begin + it + STAGES - 1);
+        cp_async_commit();
+"
+    .to_string()
+}
+
+pub fn batch_epilogue(p: &str, value: &str, stored: &str) -> String {
+    format!(
+        "    cp_async_wait<0>();
+{pre}#pragma unroll
+    for (int i = 0; i < MJ; i++)
+#pragma unroll
+        for (int n = 0; n < NT; n++)
+#pragma unroll
+            for (int e = 0; e < 4; e++) {{
+                int r = row0 + i * 16 + g + 8 * (e >> 1);
+                int m = n * 8 + 2 * t + (e & 1);
+                float v = {value};
+                float u = __shfl_down_sync(0xffffffff, v, 4);
+                if (r >= N || m >= tokens) continue;
+                if (splits > 1) part[((size_t)split * tokens + m) * N + r] = v;
+                else if (EPI != EPI_ACT || (g & 1) == 0) {p}_store<N, EPI>(m, r, {stored}, u, out, out_hi, out_lo);
+            }}
+}}
+",
+        pre = if value.contains("inv") { "    float inv = fp4_inv_global(scales);\n" } else { "" },
+    )
+}
+
+pub fn batch_reduce(p: &str, bias: bool) -> String {
+    let (sig, add) = if bias {
+        (
+            "template <int N, int EPI, bool BIAS>\n__device__ __forceinline__ void P_reduce(const float* part, const float* bias, float* out, bf16_t* out_hi, bf16_t* out_lo,\n                                           int tokens, int splits) {",
+            "    if (BIAS) v += bias[r];\n",
+        )
+    } else {
+        (
+            "template <int N, int EPI>\n__device__ __forceinline__ void P_reduce(const float* part, float* out, bf16_t* out_hi, bf16_t* out_lo, int tokens, int splits) {",
+            "",
+        )
+    };
+    format!(
+        "{sig}
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    constexpr int OUT = EPI == EPI_ACT ? N / 2 : N;
+    if (i >= tokens * OUT) return;
+    int m = i / OUT;
+    int r = EPI == EPI_ACT ? 2 * (i % OUT) : i % OUT;
+    float v = 0.0f, u = 0.0f;
+    for (int sp = 0; sp < splits; sp++) {{
+        const float* p = part + ((size_t)sp * tokens + m) * N + r;
+        v += p[0];
+        if (EPI == EPI_ACT) u += p[1];
+    }}
+{add}    P_store<N, EPI>(m, r, v, u, out, out_hi, out_lo);
+}}
+
+",
+        sig = sig.replace("P_reduce", &format!("{p}_reduce")),
+        add = add,
+    )
+    .replace("P_store", &format!("{p}_store"))
+}

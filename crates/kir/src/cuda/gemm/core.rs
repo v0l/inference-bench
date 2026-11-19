@@ -86,13 +86,8 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
     };
 "##.to_string(),
         prim::pipeline_prologue("KT", "load_stage(st, st)"),
-        r##"    for (int kt = 0; kt < KT; kt++) {
-        cp_async_wait<STAGES - 2>();
-        __syncthreads();
-        int next = kt + STAGES - 1;
-        if (next < KT) load_stage(next % STAGES, next);
-        cp_async_commit();
-        const unsigned char* base = gemm_smem + (kt % STAGES) * STAGE_BYTES;
+        prim::mainloop_head(),
+        r##"        const unsigned char* base = gemm_smem + (kt % STAGES) * STAGE_BYTES;
         const bf16_t* a_hi = (const bf16_t*)base;
         const bf16_t* a_lo = a_hi + A_TILE;
         const unsigned char* ws = base + A_BYTES;

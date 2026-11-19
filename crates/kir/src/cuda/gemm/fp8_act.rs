@@ -68,13 +68,8 @@ __device__ __forceinline__ void gemm_fp8(const void* w, const float* wscale, con
     };
 "##.to_string(),
         prim::pipeline_prologue("KT", "load_stage(st, st)"),
-        r##"    for (int kt = 0; kt < KT; kt++) {
-        cp_async_wait<STAGES - 2>();
-        __syncthreads();
-        int next = kt + STAGES - 1;
-        if (next < KT) load_stage(next % STAGES, next);
-        cp_async_commit();
-        const unsigned char* as = gemm_smem + (kt % STAGES) * STAGE_BYTES;
+        prim::mainloop_head(),
+        r##"        const unsigned char* as = gemm_smem + (kt % STAGES) * STAGE_BYTES;
         const unsigned char* ws = as + BM * ROW;
         float sw0[NJ], sw1[NJ], sa[MI][2];
         if (!PER_TOKEN) {

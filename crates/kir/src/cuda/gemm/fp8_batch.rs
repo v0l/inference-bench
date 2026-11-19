@@ -76,12 +76,9 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
         r##"    uint4 q[MJ][2][2];
     float s[MJ][2];
     if (nc > 0) load_w(c_begin, q, s);
-    for (int it = 0; it < nc; it++) {
-        cp_async_wait<STAGES - 2>();
-        __syncthreads();
-        if (it + STAGES - 1 < nc) stage((it + STAGES - 1) % STAGES, c_begin + it + STAGES - 1);
-        cp_async_commit();
-        uint4 nq[MJ][2][2];
+"##.to_string(),
+        prim::batch_loop_head(),
+        r##"        uint4 nq[MJ][2][2];
         float ns[MJ][2];
         if (it + 1 < nc) load_w(c_begin + it + 1, nq, ns);
         const bf16_t* xh = xs + (it % STAGES) * STAGE;
@@ -129,42 +126,9 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
                 }
         }
     }
-    cp_async_wait<0>();
-#pragma unroll
-    for (int i = 0; i < MJ; i++)
-#pragma unroll
-        for (int n = 0; n < NT; n++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                int r = row0 + i * 16 + g + 8 * (e >> 1);
-                int m = n * 8 + 2 * t + (e & 1);
-                float v = acc[i][n][e];
-                float u = __shfl_down_sync(0xffffffff, v, 4);
-                if (r >= N || m >= tokens) continue;
-                if (splits > 1) part[((size_t)split * tokens + m) * N + r] = v;
-                else if (EPI != EPI_ACT || (g & 1) == 0) f8b_store<N, EPI>(m, r, BIAS ? v + bias[r] : v, u, out, out_hi, out_lo);
-            }
-}
-
-template <int N, int EPI, bool BIAS>
-__device__ __forceinline__ void f8b_reduce(const float* part, const float* bias, float* out, bf16_t* out_hi, bf16_t* out_lo,
-                                           int tokens, int splits) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    constexpr int OUT = EPI == EPI_ACT ? N / 2 : N;
-    if (i >= tokens * OUT) return;
-    int m = i / OUT;
-    int r = EPI == EPI_ACT ? 2 * (i % OUT) : i % OUT;
-    float v = 0.0f, u = 0.0f;
-    for (int sp = 0; sp < splits; sp++) {
-        const float* p = part + ((size_t)sp * tokens + m) * N + r;
-        v += p[0];
-        if (EPI == EPI_ACT) u += p[1];
-    }
-    if (BIAS) v += bias[r];
-    f8b_store<N, EPI>(m, r, v, u, out, out_hi, out_lo);
-}
-
 "##.to_string(),
+        prim::batch_epilogue("f8b", "acc[i][n][e]", "BIAS ? v + bias[r] : v"),
+        prim::batch_reduce("f8b", true),
     ]
     .concat()
 }
