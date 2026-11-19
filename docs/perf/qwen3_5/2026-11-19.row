@@ -1,0 +1,1 @@
+| qwen3_5 | `Qwen3.5-9B` | 12.8 | 1404.4 | 176.1 | llama.cpp | 13.0 | 2580.1 | 72.0 | 0.99 | 0.54 | 2.45 | 2026-11-19 | 0338df9 | `crates/specrt/scripts/perfpass.sh qwen3_5 --model /home/kieran/models/Qwen3.5-9B --host spark` |

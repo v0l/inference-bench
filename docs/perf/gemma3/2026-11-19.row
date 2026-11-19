@@ -1,0 +1,1 @@
+| gemma3 | `gemma-3-1b-it` | 95.7 | 11336.0 | 646.9 | llama.cpp/vllm | 93.8 | 25413.1 | 680.9 | 1.02 | 0.45 | 0.95 | 2026-11-19 | 82ce823 | `crates/specrt/scripts/perfpass.sh gemma3 --model /home/kieran/ib-gates/803/models/gemma-3-1b-it --host spark` |

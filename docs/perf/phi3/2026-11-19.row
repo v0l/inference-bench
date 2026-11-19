@@ -1,0 +1,1 @@
+| phi3 | `Phi-3-mini-4k-instruct` | 23.3 | 2937.3 | 198.5 | llama.cpp | 27.7 | 5786.9 | 185.9 | 0.84 | 0.51 | 1.07 | 2026-11-19 | 82ce823 | `crates/specrt/scripts/perfpass.sh phi3 --model /home/kieran/ib-gates/803/models/Phi-3-mini-4k-instruct --host spark` |

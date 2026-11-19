@@ -258,3 +258,7 @@ flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -q \
 | Test | Issue | Note |
 |---|---|---|
 | Real 27B tests with vLLM resident | none | OOM, not a bug. Rerun alone when quiet. |
+
+## Perf passes
+
+Speed per architecture, with nsys tables and llama.cpp and vLLM side by side, is `docs/perf-pass.md` and `crates/specrt/scripts/perfpass.sh`. The scoreboard is `docs/perf/scoreboard.md`.

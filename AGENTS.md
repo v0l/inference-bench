@@ -21,6 +21,10 @@ cargo test -p inference-bench-specrt
 
 Read `docs/testing.md`. It has the tiers, every test file, the exact commands, reference data and speed measurement rules.
 
+## Perf passes
+
+The standard per-architecture speed loop is `docs/perf-pass.md` (`crates/specrt/scripts/perfpass.sh <family> --host spark`); results land in `docs/perf/scoreboard.md`.
+
 ## Do not block on the 27B
 
 Never wait for a 27B GPU window. Run the cheapest tier that can fail because of your change (CPU, then tiny fixtures on GPU, then a synthetic 27B-shaped layer), paste the `test result:` lines, and give the exact real-27B command in your report. The supervisor runs it in a window.
