@@ -58,11 +58,13 @@ fn route(hash: bool) -> (Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>) {
     let pairs = tokens * (k + 1);
     let mut idx: CudaSlice<i32> = stream.alloc_zeros(pairs).unwrap();
     let mut coef: CudaSlice<f32> = stream.alloc_zeros(pairs).unwrap();
-    let mut b = stream.launch_builder(&loaded.function("moe_route_logits").unwrap());
+    let logits_kernel = loaded.function("moe_route_logits").unwrap();
+    let mut b = stream.launch_builder(&logits_kernel);
     b.arg(&xd).arg(&lnd).arg(&rd).arg(&gate).arg(&gate).arg(&mut xn).arg(&mut logits);
     unsafe { b.launch(LaunchConfig { grid_dim: ((e + 1).div_ceil(8) as u32, tokens as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
     let (first, hashed) = (0i32, i32::from(hash));
-    let mut b = stream.launch_builder(&loaded.function("moe_route").unwrap());
+    let route_kernel = loaded.function("moe_route").unwrap();
+    let mut b = stream.launch_builder(&route_kernel);
     b.arg(&logits).arg(&bd).arg(&td).arg(&idsd).arg(&hashed).arg(&mut idx).arg(&mut coef).arg(&first);
     unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
     stream.synchronize().unwrap();

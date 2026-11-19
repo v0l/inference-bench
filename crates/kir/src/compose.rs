@@ -50,6 +50,9 @@ pub enum Stage {
     Epilogue { dst: String, expr: Expr, mat: Mat },
     BlockSum { dst: String, expr: Expr },
     TileStore { dst: String, value: String, tile: Option<Tile> },
+    Gather { dst: String, src: String, index: String },
+    Lookup { dst: String, src: String, index: String },
+    Scatter { dst: String, value: String, index: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -202,6 +205,29 @@ impl Compose {
         })
     }
 
+    fn row_index(&self, d: Dialect, params: &[Param], table: &str, index: &str, wide: bool) -> Result<String, String> {
+        if d != Dialect::Cuda {
+            return Err("gather, lookup and scatter have no WGSL lowering".into());
+        }
+        let table_param = params.iter().find(|p| p.name == table).ok_or_else(|| format!("indexed access to unknown param {table:?}"))?;
+        let index_param = params.iter().find(|p| p.name == index).ok_or_else(|| format!("index param {index:?} is unknown"))?;
+        if index_param.ty != crate::Scalar::I32 || index_param.access != Access::Read {
+            return Err(format!("index param {index:?} must be a read i32 buffer"));
+        }
+        if table_param.ty != crate::Scalar::F32 {
+            return Err(format!("indexed param {table:?} must be f32"));
+        }
+        if self.rows.per_row.iter().any(|(n, _)| n == table || n == index) {
+            return Err(format!("{table:?} and {index:?} are indexed, so they cannot also advance per row"));
+        }
+        let _ = wide;
+        let row = match self.rows.iter {
+            Iter::Block => "x",
+            Iter::Grid => "y",
+        };
+        Ok(format!("(size_t){index}[blockIdx.{row}]"))
+    }
+
     fn plan(&self, d: Dialect, params: &[Param]) -> Result<Plan, String> {
         let named = self.named();
         let flags = scalar_flags(&self.stages, &self.consts);
@@ -275,6 +301,25 @@ impl Compose {
                     }
                     after = true;
                 }
+                Stage::Gather { dst, src, index } | Stage::Lookup { dst, src, index } => {
+                    define(dst)?;
+                    let row = self.row_index(d, params, src, index, matches!(st, Stage::Gather { .. }))?;
+                    let wide = matches!(st, Stage::Gather { .. });
+                    let at = if wide { format!("{row} * WIDTH + i") } else { row };
+                    let line = format!("float {dst} = {src}[{at}];");
+                    if main_pass { plan.pass2.push(line) } else { plan.pass1.push(line) }
+                    env.push((dst.clone(), Expr::Raw(dst.clone())));
+                }
+                Stage::Scatter { dst, value, index } => {
+                    match params.iter().find(|p| p.name == dst) {
+                        Some(p) if p.access == Access::Write => {}
+                        _ => return Err(format!("scatter to {dst:?}, which is not a written param")),
+                    }
+                    let row = self.row_index(d, params, dst, index, true)?;
+                    let e = env.iter().find(|(k, _)| k == value).map(|(_, x)| x.clone()).ok_or_else(|| format!("scatter of unknown value {value:?}"))?;
+                    let line = format!("{dst}[{row} * WIDTH + i] = {};", e.lower(d, &named)?);
+                    if main_pass { plan.pass2.push(line) } else { plan.pass1.push(line) }
+                }
                 Stage::TileStore { dst, value, tile } => {
                     match params.iter().find(|p| p.name == dst) {
                         Some(p) if p.access == Access::Write => {}
@@ -286,7 +331,7 @@ impl Compose {
                 }
             }
         }
-        if !self.stages.iter().any(|s| matches!(s, Stage::TileStore { .. })) {
+        if !self.stages.iter().any(|s| matches!(s, Stage::TileStore { .. } | Stage::Scatter { .. })) {
             return Err("compose has no tile_store".into());
         }
         Ok(plan)
@@ -294,7 +339,11 @@ impl Compose {
 
     pub fn emit_cuda(&self, k: &Kernel) -> Result<String, String> {
         let plan = self.plan(Dialect::Cuda, &k.params)?;
-        let sig: Vec<String> = k.params.iter().map(|p| format!("{}float* {}", if p.access == Access::Write { "" } else { "const " }, p.name)).collect();
+        let sig: Vec<String> = k
+            .params
+            .iter()
+            .map(|p| format!("{}{}* {}", if p.access == Access::Write { "" } else { "const " }, if p.ty == crate::Scalar::I32 { "int" } else { "float" }, p.name))
+            .collect();
         let (row, loop_head) = match self.rows.iter {
             Iter::Block => ("x", "for (int i = threadIdx.x; i < WIDTH; i += blockDim.x)"),
             Iter::Grid => ("y", "for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < WIDTH; i += gridDim.x * blockDim.x)"),
