@@ -166,6 +166,11 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
                         mma_bf16(part[i][j], al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
                         mma_bf16(part[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
                     }
+            } else if (!SCALED) {
+#pragma unroll
+                for (int i = 0; i < MI; i++)
+#pragma unroll
+                    for (int j = 0; j < NJ; j++) mma_bf16(acc[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
             } else {
 #pragma unroll
                 for (int i = 0; i < MI; i++)

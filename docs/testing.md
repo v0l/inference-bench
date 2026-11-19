@@ -133,6 +133,7 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 - Do not point `tiny-fp8` at the hd256 fixture dir. It writes FP8 shards into the fixture you pass.
 - The 27B ones: `reference.py real-full | real-prompts | real-slice | real-mtp | nvfp4-dequant`, `vllm_logprobs.py`, `vllm_mtp_dump.py` (needs the vLLM server on :8001, read only), `vllm_vision.py`. These are slow and rarely need redoing. Copy from `~/.cache/specrt-ref-375` first.
 - `yarn_reference.json` in the fixtures dir serves `yarn.rs` and is checked in.
+- bf16 activation envelope: `scripts/envelope.sh` measures vLLM, llama.cpp and specrt against fp32 transformers; the table is in [perf/bf16-activation-envelope.md](perf/bf16-activation-envelope.md). The 1e-3 fp32 tests (`logits.rs`, `families.rs`, `gemma3.rs`, `sliding.rs`) set `split_activations = true` so the exact path stays proven; the serving default for the measured families is single plane.
 - GGUF: `scripts/gguf_reference.c` builds the llama.cpp logit reference, `gguf_kl.py` and `dumpall.sh` compare.
 - Never build, modify or rebuild vLLM, FlashInfer or anything in `~/.venv-vllm`, `~/.cache/flashinfer`, `~/.cache/vllm`. Read only.
 
@@ -165,6 +166,7 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `fp8_gemm.rs`, `fp8_batch.rs`, `fp4_batch.rs` | block-scaled GEMMs at 27B shapes, random weights | 3 | all | sm_120 GPU | 2 to 4 GB, seconds |
 | `mtp.rs` | MTP drafting, acceptance, greedy identity, chi-square sampling | 2 | 15 | `SPECRT_REF_DIR` with `tiny-mtp` | 3 GB, 90 s |
 | `head_quant.rs` | `head_quant` fp8 and nvfp4 lm_head | 2 | 8 | Qwen3-0.6B HF weights | 3 GB, 90 s |
+| `envelope.rs` | single plane bf16 activations against vLLM's recorded KL from fp32 for llama, gemma3, granite, smollm3, phi3 (#821); the exact `split_activations = true` path at fp32 distance | CPU (2), 2 (2) | 4 | `SPECRT_ENVELOPE_DIR` (`scripts/envelope.sh` output), `SPECRT_ENVELOPE_MODELS` | 6 GB, 85 s |
 | `logits.rs` | logit KL against transformers for all small models | 2 | 9 | `SPECRT_REF_DIR`; HF weights | 3 GB, 3 s |
 | `generate.rs` | seeded sampling, greedy | 2 | 6 | HF weights | 2 GB, 3 s |
 | `pipeline.rs` | prefill/decode pipeline, one prints a speed table | 2 | 7 | HF weights | 3 GB |
