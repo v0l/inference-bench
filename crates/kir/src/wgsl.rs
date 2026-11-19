@@ -519,6 +519,22 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                     w1 = bitcast<f32>(wa & 0xffff0000u);
                     w2 = bitcast<f32>(wb << 16u);
                     w3 = bitcast<f32>(wb & 0xffff0000u);
+                }} else if (code == 0u) {{
+                    let sb = base + (c / 256u) * 144u;
+                    let i = c % 256u;
+                    let j = i / 64u;
+                    let hi = (i % 64u) >= 32u;
+                    let sm = scale_min_k4(2u * j + select(0u, 1u, hi), sb);
+                    let d1 = wf16(sb) * f32(sm.x);
+                    let mm = wf16(sb + 2u) * f32(sm.y);
+                    var q = wdata[(sb + 16u + 32u * j + (i % 32u)) >> 2u];
+                    if (hi) {{
+                        q = q >> 4u;
+                    }}
+                    w0 = d1 * f32(q & 0xfu) - mm;
+                    w1 = d1 * f32((q >> 8u) & 0xfu) - mm;
+                    w2 = d1 * f32((q >> 16u) & 0xfu) - mm;
+                    w3 = d1 * f32((q >> 24u) & 0xfu) - mm;
                 }} else {{
                     w0 = dequant_at(base, code, c);
                     w1 = dequant_at(base, code, c + 1u);
