@@ -44,6 +44,7 @@ impl DeviceMtp {
             mixer: DeviceMixer::Attention(DeviceAttn {
                 qkv: DeviceMatrix::upload(stream, &a.qkv)?,
                 qkv_bias: up(&a.qkv_bias)?,
+                o_bias: up(&a.o_bias)?,
                 q_norm: up(&a.q_norm)?,
                 k_norm: up(&a.k_norm)?,
                 o: DeviceMatrix::upload(stream, &a.o)?,

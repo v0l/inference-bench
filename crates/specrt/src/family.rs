@@ -95,6 +95,7 @@ pub struct FamilyAttention {
     pub o_cols: Option<String>,
     pub scratch: std::collections::BTreeMap<String, String>,
     pub qkv_bias: Flag,
+    pub o_bias: Flag,
     pub qk_norm: Flag,
     pub output_gate: Flag,
     pub qk_norm_full: bool,
@@ -110,6 +111,7 @@ impl Default for FamilyAttention {
             o_cols: None,
             scratch: Default::default(),
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
+            o_bias: Flag::Fixed(false),
             qk_norm: Flag::Fixed(false),
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },
             qk_norm_full: false,
@@ -162,9 +164,14 @@ pub struct FamilyMoe {
     pub shared_module: Option<String>,
     pub shared_gate: Option<bool>,
     pub router: Option<crate::spec::RouterAct>,
+    pub norm_topk: Option<bool>,
     pub score_bias: bool,
     pub expert_block: Option<crate::dequant::BlockFormat>,
     pub gate_up_interleaved: bool,
+    pub router_bias: bool,
+    pub expert_bias: bool,
+    pub router_module: Option<String>,
+    pub hash_table: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

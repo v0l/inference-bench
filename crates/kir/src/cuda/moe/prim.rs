@@ -13,8 +13,8 @@ pub fn delegate(threads: u32, name: &str, args: &str, target: &str, call: &str) 
 
 pub fn constants(m: &crate::ops::MoeShape) -> String {
     format!(
-        "constexpr int MOE_E = {};\nconstexpr int MOE_LOCAL = {};\nconstexpr int MOE_K = {};\nconstexpr int MOE_PAIRS = {};\nconstexpr int MOE_INTER = {};\nconstexpr int MOE_SHARED = {};\nconstexpr bool MOE_NORM_TOPK = {};\nconstexpr float MOE_ROUTED_SCALE = {};\nconstexpr bool MOE_SHARED_GATE = {};\nconstexpr bool MOE_SIGMOID = {};\nconstexpr int MOE_GROUPS = {};\nconstexpr int MOE_TOPK_GROUP = {};\nconstexpr bool MOE_BIAS = {};\n",
-        m.experts, m.local, m.top_k, m.pairs, m.inter, m.shared, m.norm_topk, crate::ops::f32_literal(m.routed_scale), m.shared_gate, m.sigmoid, m.groups.max(1), m.topk_group.max(1), m.score_bias
+        "constexpr int MOE_E = {};\nconstexpr int MOE_LOCAL = {};\nconstexpr int MOE_K = {};\nconstexpr int MOE_PAIRS = {};\nconstexpr int MOE_INTER = {};\nconstexpr int MOE_SHARED = {};\nconstexpr bool MOE_NORM_TOPK = {};\nconstexpr float MOE_ROUTED_SCALE = {};\nconstexpr bool MOE_SHARED_GATE = {};\nconstexpr bool MOE_SIGMOID = {};\nconstexpr int MOE_GROUPS = {};\nconstexpr int MOE_TOPK_GROUP = {};\nconstexpr bool MOE_BIAS = {};\nconstexpr bool MOE_ROUTER_BIAS = {};\nconstexpr bool MOE_EBIAS = {};\nconstexpr bool MOE_HASH = {};\n",
+        m.experts, m.local, m.top_k, m.pairs, m.inter, m.shared, m.norm_topk, crate::ops::f32_literal(m.routed_scale), m.shared_gate, m.sigmoid, m.groups.max(1), m.topk_group.max(1), m.score_bias, m.router_bias, m.expert_bias, m.hash
     )
 }
 

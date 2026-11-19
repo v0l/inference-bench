@@ -22,6 +22,7 @@ pub enum Matrix<'a> {
 pub struct Attn<'a> {
     pub qkv: Matrix<'a>,
     pub qkv_bias: Option<Vec<f32>>,
+    pub o_bias: Option<Vec<f32>>,
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
     pub o: Matrix<'a>,
@@ -60,6 +61,10 @@ pub struct MoeWeights {
     pub router: Vec<u16>,
     pub shared_gate: Option<Vec<f32>>,
     pub score_bias: Option<Vec<f32>>,
+    pub router_bias: Option<Vec<f32>>,
+    pub gate_up_bias: Option<Vec<f32>>,
+    pub down_bias: Option<Vec<f32>>,
+    pub hash_table: Option<Vec<i32>>,
     pub gate: Stacked,
     pub up: Stacked,
     pub down: Stacked,
@@ -912,6 +917,7 @@ impl Checkpoint {
             extra,
             qkv: Raw::concat(parts)?.into_matrix(quant, &format!("{attn}.qkv"))?,
             qkv_bias,
+            o_bias: if a.o_bias { Some(self.f32(&format!("{attn}.o_proj.bias"), h)?) } else { None },
             q_norm,
             k_norm,
             o: w("o_proj", h, spec.o_dim())?.into_matrix(quant, &format!("{attn}.o_proj"))?,
@@ -1050,7 +1056,7 @@ impl Checkpoint {
         } else {
             None
         };
-        Ok(MoeWeights { router, shared_gate, score_bias: None, gate: stack("gate", inter, h)?, up: stack("up", inter, h)?, down: stack("down", h, inter)? })
+        Ok(MoeWeights { router, shared_gate, score_bias: None, router_bias: None, gate_up_bias: None, down_bias: None, hash_table: None, gate: stack("gate", inter, h)?, up: stack("up", inter, h)?, down: stack("down", h, inter)? })
     }
 
     fn moe_layer(&self, spec: &Spec, p: &str, quant: Quant) -> Result<MoeWeights> {
@@ -1128,13 +1134,42 @@ impl Checkpoint {
             None => (stack("gate", inter, h)?, stack("up", inter, h)?, stack("down", h, inter)?),
         };
         Ok(MoeWeights {
-            router: self.bf16(&format!("{p}.mlp.gate.weight"), &[e, h])?.into_owned(),
+            router: self.bf16(&format!("{p}.mlp.{}.weight", m.router_module), &[e, h])?.into_owned(),
             shared_gate,
-            score_bias: if m.score_bias { Some(self.floats(&format!("{p}.mlp.gate.e_score_correction_bias"), &[e])?) } else { None },
+            score_bias: if m.score_bias { Some(self.floats(&format!("{p}.mlp.{}.e_score_correction_bias", m.router_module), &[e])?) } else { None },
+            router_bias: if m.router_bias { Some(self.floats(&format!("{p}.mlp.{}.bias", m.router_module), &[e])?) } else { None },
+            gate_up_bias: if m.expert_bias { Some(self.expert_gate_up_bias(&format!("{p}.mlp.experts.gate_up_proj_bias"), e, inter, m.gate_up_interleaved)?) } else { None },
+            down_bias: if m.expert_bias { Some(self.floats(&format!("{p}.mlp.experts.down_proj_bias"), &[e, h])?) } else { None },
+            hash_table: match (&m.hash_table, m.is_hashed(layer_index(p))) {
+                (Some(t), true) => Some(self.int_table(&format!("{p}.mlp.{}.{t}", m.router_module), m.top_k())?),
+                _ => None,
+            },
             gate,
             up,
             down,
         })
+    }
+
+    fn expert_gate_up_bias(&self, name: &str, experts: usize, inter: usize, interleaved: bool) -> Result<Vec<f32>> {
+        let fused = self.floats(name, &[experts, 2 * inter])?;
+        let mut out = Vec::with_capacity(fused.len());
+        for e in 0..experts {
+            let row = &fused[e * 2 * inter..(e + 1) * 2 * inter];
+            let part = |which: usize| (0..inter).map(move |r| row[if interleaved { 2 * r + which } else { which * inter + r }]);
+            out.extend(part(0));
+            out.extend(part(1));
+        }
+        Ok(out)
+    }
+
+    fn int_table(&self, name: &str, width: usize) -> Result<Vec<i32>> {
+        let v = self.view(name)?;
+        ensure!(v.shape.len() == 2 && v.shape[1] == width, "{name} has shape {:?}, expected [vocab, {width}]", v.shape);
+        match v.dtype {
+            Dtype::I64 => Ok(v.data.as_chunks::<8>().0.iter().map(|b| i64::from_le_bytes(*b) as i32).collect()),
+            Dtype::I32 => Ok(v.data.as_chunks::<4>().0.iter().map(|b| i32::from_le_bytes(*b)).collect()),
+            other => bail!("{name} is {other:?}, expected an integer table"),
+        }
     }
 
     fn block_stack(&self, format: &crate::dequant::BlockFormat, name: &str, experts: usize, rows: usize, cols: usize) -> Result<Stacked> {
@@ -1635,4 +1670,8 @@ mod block_expert_tests {
         assert!(ck.block_stack(&MXFP4, "model.layers.0.mlp.experts.gate_up_proj", 2, 32, 64).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+fn layer_index(prefix: &str) -> usize {
+    prefix.rsplit('.').next().and_then(|n| n.parse().ok()).unwrap_or(usize::MAX)
 }

@@ -10,6 +10,7 @@ pub struct OpsShape {
     pub q_dim: usize,
     pub output_gate: bool,
     pub qkv_bias: bool,
+    pub o_bias: bool,
     pub eps: f64,
     pub embed_scale: f64,
     pub gated_gelu: bool,
@@ -52,6 +53,9 @@ pub struct MoeShape {
     pub groups: usize,
     pub topk_group: usize,
     pub score_bias: bool,
+    pub router_bias: bool,
+    pub expert_bias: bool,
+    pub hash: bool,
 }
 
 pub(crate) fn f32_literal(v: f64) -> String {

@@ -126,8 +126,8 @@ fn dot2() -> String {
     )
 }
 
-const UP_ARGS: &str = "const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug";
-const UP_CALL: &str = "gw, gs, gg, uw, us, ug";
+const UP_ARGS: &str = "const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug, const float* eb";
+const UP_CALL: &str = "gw, gs, gg, uw, us, ug, eb";
 
 fn up_impl() -> String {
     format!(
@@ -148,6 +148,10 @@ fn up_impl() -> String {
     if (row >= MOE_INTER) return;
     float g = moe_dot<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
     float u = moe_dot<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane);
+    if (MOE_EBIAS) {{
+        g += eb[(size_t)expert * 2 * MOE_INTER + row];
+        u += eb[((size_t)expert * 2 + 1) * MOE_INTER + row];
+    }}
     if (lane == 0) act[(size_t)pair * MOE_INTER + row] = gated_act(g, u);
 "##,
                 prim::warp_ids()
@@ -162,7 +166,7 @@ fn down_impl() -> String {
         prim::device(
             "void",
             "moe_down_impl",
-            "const void* w, const unsigned char* s, const float* g, const float* act, const int* idx, float* out",
+            "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* idx, float* out",
             &format!(
                 r##"    __shared__ __align__(16) float xs[MOE_INTER];
     int pair = blockIdx.x;
@@ -173,6 +177,7 @@ fn down_impl() -> String {
 {}    int row = blockIdx.y * MOE_WARPS + warp;
     if (row >= HIDDEN) return;
     float v = moe_dot<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane);
+    if (MOE_EBIAS) v += db[(size_t)expert * HIDDEN + row];
     if (lane == 0) out[(size_t)pair * HIDDEN + row] = v;
 "##,
                 prim::warp_ids()
@@ -206,6 +211,12 @@ fn group_up_impl() -> String {
             float gv[MOE_TJ], uv[MOE_TJ];
             moe_dot2<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
             moe_dot2<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane, live, uv);
+            if (MOE_EBIAS) {{
+                for (int j = 0; j < live; j++) {{
+                    gv[j] += eb[(size_t)expert * 2 * MOE_INTER + row];
+                    uv[j] += eb[((size_t)expert * 2 + 1) * MOE_INTER + row];
+                }}
+            }}
             if (lane == 0) {{
                 for (int j = 0; j < live; j++) act[(size_t)sorted[base + j] * MOE_INTER + row] = gated_act(gv[j], uv[j]);
             }}
@@ -224,7 +235,7 @@ fn group_down_impl() -> String {
         prim::device(
             "void",
             "moe_group_down_impl",
-            "const void* w, const unsigned char* s, const float* g, const float* act, const int* offsets, const int* sorted, float* out",
+            "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* offsets, const int* sorted, float* out",
             &format!(
                 r##"    __shared__ __align__(16) float xs[MOE_TJ * MOE_INTER];
     int expert = blockIdx.x;
@@ -242,6 +253,9 @@ fn group_down_impl() -> String {
         if (row < HIDDEN) {{
             float v[MOE_TJ];
             moe_dot2<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane, live, v);
+            if (MOE_EBIAS) {{
+                for (int j = 0; j < live; j++) v[j] += db[(size_t)expert * HIDDEN + row];
+            }}
             if (lane == 0) {{
                 for (int j = 0; j < live; j++) out[(size_t)sorted[base + j] * HIDDEN + row] = v[j];
             }}
@@ -273,7 +287,7 @@ pub fn gemv() -> String {
 pub fn pair_entries() -> String {
     let mut out = String::new();
     entries(&mut out, "moe_up", &format!("{UP_ARGS}, const float* xn, const int* idx, float* act"), "moe_up_impl", &format!("{UP_CALL}, xn, idx, act"));
-    entries(&mut out, "moe_down", "const void* w, const unsigned char* s, const float* g, const float* act, const int* idx, float* out", "moe_down_impl", "w, s, g, act, idx, out");
+    entries(&mut out, "moe_down", "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* idx, float* out", "moe_down_impl", "w, s, g, db, act, idx, out");
     out
 }
 
@@ -290,9 +304,9 @@ pub fn group_entries() -> String {
     entries(
         &mut out,
         "moe_group_down",
-        "const void* w, const unsigned char* s, const float* g, const float* act, const int* offsets, const int* sorted, float* out",
+        "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* offsets, const int* sorted, float* out",
         "moe_group_down_impl",
-        "w, s, g, act, offsets, sorted, out",
+        "w, s, g, db, act, offsets, sorted, out",
     );
     out
 }
