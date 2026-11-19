@@ -19,6 +19,26 @@ impl Flag {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ParamSource {
+    Number(f64),
+    Config { config: String, #[serde(default)] default: Option<f64> },
+}
+
+impl ParamSource {
+    pub fn read(&self, name: &str, config: &serde_json::Value) -> Result<f64> {
+        match self {
+            ParamSource::Number(v) => Ok(*v),
+            ParamSource::Config { config: key, default } => config
+                .get(key)
+                .and_then(|v| v.as_f64().or_else(|| v.as_bool().map(f64::from)))
+                .or(*default)
+                .with_context(|| format!("attention param {name} reads config.json key {key}, which is missing")),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockKind {
@@ -39,6 +59,8 @@ pub struct Match {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyAttention {
+    pub node: Vec<crate::graph::Node>,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
     pub qkv_bias: Flag,
     pub qk_norm: Flag,
     pub output_gate: Flag,
@@ -49,6 +71,8 @@ pub struct FamilyAttention {
 impl Default for FamilyAttention {
     fn default() -> Self {
         FamilyAttention {
+            node: Vec::new(),
+            params: Default::default(),
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
             qk_norm: Flag::Fixed(false),
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },

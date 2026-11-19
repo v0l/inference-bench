@@ -1,8 +1,9 @@
 use super::{BatchBuffers, DeviceAttn, DeviceLayer, DeviceMatrix, DeviceMixer, GemmOut, Planes, Runtime, grid};
 use crate::executor::PlanBackend;
 use crate::plan::{Buf, NormKind, Op, Phase, Plan, Weight};
+use crate::graph::Bind;
 use crate::spec::{Block, Spec};
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 use std::ops::Range;
 
@@ -92,6 +93,8 @@ impl Runtime {
             Op::Flash => self.attn_flash_rows(self.attn_of(layer), n, 0),
             Op::FlashLegacy => self.flash_legacy(self.attn_of(layer), n),
             Op::DecodeAttention => self.attn_decode_rows(self.attn_of(layer), run.bb.expect("decode runs carry batch buffers"), n, run.qlen),
+            Op::DecodeRope => self.decode_rope_rows(self.attn_of(layer), run.bb.expect("decode runs carry batch buffers"), n),
+            Op::Kernel { node } => self.kernel_op(node, self.attn_of(layer), run),
             Op::Swiglu => self.swiglu_legacy(n),
             Op::GdnPrefill => self.gdn_prefill_rows(self.gdn_of(layer), n, 0),
             Op::GdnDecode => self.gdn_decode_rows(self.gdn_of(layer), &run.bb.expect("decode runs carry batch buffers").slots, n),
@@ -103,6 +106,74 @@ impl Runtime {
             Op::AllReduce => self.allreduce_op(n),
             Op::AllReduceNorm { which } => self.allreduce_norm_op(which, layer, n),
         }
+    }
+
+    fn kernel_op(&self, node: u8, l: &DeviceAttn, run: &Run) -> Result<()> {
+        let launch = self.described.get(node as usize).and_then(Option::as_ref).context("attention node has no described kernel")?;
+        let spec_node = &self.spec.attention.node[node as usize];
+        let (table, slots, pos, pos_step, row_step) = match run.bb {
+            Some(bb) => (self.buf.block_table.as_view(), &bb.slots, &bb.pos, 1i32, 0i32),
+            None => (self.slot_table(self.seq as usize), &self.buf.zero_slots, &self.buf.pos, 0, 1),
+        };
+        let numbers = |bind: &Bind| -> Result<f64> {
+            Ok(match bind {
+                Bind::Number(v) => *v,
+                Bind::Name(n) => match n.as_str() {
+                    "window" => l.window as f64,
+                    "nope" => f64::from(u8::from(l.nope)),
+                    other => *self.spec.attention.params.get(other).with_context(|| format!("{other:?} is not window, nope or an [attention.params] entry"))?,
+                },
+                Bind::Weight { .. } => bail!("a weight binding is not a number"),
+            })
+        };
+        let mut ints = vec![0i32; launch.params.len()];
+        let mut floats = vec![0f32; launch.params.len()];
+        for (i, p) in launch.params.iter().enumerate().filter(|(_, p)| p.role == kir::Role::Value) {
+            let v = match p.name {
+                "layer" => f64::from(l.kv),
+                "pages" => self.pages as f64,
+                "pos_step" => f64::from(pos_step),
+                "row_step" => f64::from(row_step),
+                name => numbers(spec_node.bind.get(name).with_context(|| format!("param {name:?} is not bound"))?)?,
+            };
+            ints[i] = v as i32;
+            floats[i] = v as f32;
+        }
+        let mut b = self.stream.launch_builder(self.kernel(launch.name));
+        for (i, p) in launch.params.iter().enumerate() {
+            match (p.role, p.name) {
+                (kir::Role::Value, _) => match p.ty {
+                    kir::Scalar::F32 => b.arg(&floats[i]),
+                    _ => b.arg(&ints[i]),
+                },
+                (kir::Role::Weight, name) => match spec_node.bind.get(name) {
+                    Some(Bind::Weight { weight, .. }) => b.arg(l.extra.get(weight).with_context(|| format!("layer has no {weight} tensor"))?),
+                    _ => bail!("param {name:?} is not bound to a weight"),
+                },
+                (_, "qkv") => b.arg(&self.pre.qkv),
+                (_, "k_cache") => b.arg(&self.buf.k_cache),
+                (_, "v_cache") => b.arg(&self.buf.v_cache),
+                (_, "block_table") => b.arg(&table),
+                (_, "pos") => b.arg(pos),
+                (_, "slots") => b.arg(slots),
+                (_, "out_hi") => b.arg(&self.pre.attn_planes.hi),
+                (_, "out_lo") => b.arg(&self.pre.attn_planes.lo),
+                (_, name) => bail!("kernel {} has an unknown buffer param {name:?}", launch.name),
+            };
+        }
+        let dim = |symbol: &String| -> Result<u32> {
+            let a = &self.spec.attention;
+            Ok(match symbol.as_str() {
+                "heads" => a.heads as u32,
+                "kv_heads" => a.kv_heads as u32,
+                "rows" => run.n as u32,
+                number => number.parse()?,
+            })
+        };
+        let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
+        let config = LaunchConfig { grid_dim: (dims[0], dims.get(1).copied().unwrap_or(1), dims.get(2).copied().unwrap_or(1)), block_dim: (launch.threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
     }
 
     fn comm(&self) -> &crate::allreduce::Comm {

@@ -49,6 +49,8 @@ impl DeviceMtp {
                 o: DeviceMatrix::upload(stream, &a.o)?,
                 kv: spec.attention_layers() as i32,
                 window: 0,
+                nope: false,
+                extra: Default::default(),
             }),
             gate_up: DeviceMatrix::upload(stream, &w.layer.gate_up)?,
             down: DeviceMatrix::upload(stream, &w.layer.down)?,

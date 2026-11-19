@@ -165,6 +165,38 @@ pub fn attention_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
         .collect()
 }
 
+pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: &kir::Target) -> Result<Vec<Option<kir::Kernel>>> {
+    let symbols = attention_symbols(spec, kv_planes, max_ctx);
+    let registry = crate::kir_kernel::Registry::active();
+    let mut built: BTreeMap<String, kir::Kernel> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (i, node) in spec.attention.node.iter().enumerate() {
+        let Some(name) = node.kernel.as_deref() else {
+            out.push(None);
+            continue;
+        };
+        if !built.contains_key(name) {
+            let d = registry.get(name).ok_or_else(|| anyhow::anyhow!("[[attention.node]] {i} names kernel {name:?}, which no kernel description provides"))?;
+            built.insert(name.to_string(), d.build(target, &symbols).map_err(anyhow::Error::msg)?);
+        }
+        let kernel = &built[name];
+        for p in kernel.params.iter().filter(|p| p.role == kir::Role::Value && !kir::scan::LAUNCH.contains(&p.name)) {
+            anyhow::ensure!(node.bind.contains_key(p.name), "[[attention.node]] {i} does not bind {name} param {:?}", p.name);
+        }
+        for (b, v) in &node.bind {
+            let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[attention.node]] {i} binds {b:?}, which {name} has no param for"))?;
+            match (param.role, v) {
+                (kir::Role::Weight, crate::graph::Bind::Weight { .. }) => {}
+                (kir::Role::Value, crate::graph::Bind::Weight { .. }) | (kir::Role::Weight, _) => anyhow::bail!("[[attention.node]] {i} binds {b:?} to the wrong kind of value"),
+                (_, crate::graph::Bind::Name(n)) => anyhow::ensure!(matches!(n.as_str(), "window" | "nope") || spec.attention.params.contains_key(n), "[[attention.node]] {i} binds {b:?} to {n:?}, which is not window, nope or an [attention.params] entry"),
+                _ => {}
+            }
+        }
+        out.push(Some(kernel.clone()));
+    }
+    Ok(out)
+}
+
 pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::LinearShape {
     kir::linear::LinearShape { key_heads: la.key_heads, value_heads: la.value_heads, head_dim: la.key_head_dim, conv_kernel: la.conv_kernel, tiled_value_heads: la.v_heads == crate::spec::VHeadOrder::Tiled }
 }
@@ -354,12 +386,20 @@ impl Module {
         };
         let kir_kernels = kir_kernels(spec, target)?;
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
-        let kir_source = kir::cuda::emit_module(&kir_kernels).map_err(anyhow::Error::msg)?;
+        let described = described_kernels(spec, kv_planes, max_ctx, target)?;
+        let mut distinct: Vec<kir::Kernel> = Vec::new();
+        for k in described.into_iter().flatten() {
+            if !distinct.iter().any(|d| d.name == k.name) {
+                distinct.push(k);
+            }
+        }
+        let mut kir_source = kir::cuda::emit_module(&kir_kernels).map_err(anyhow::Error::msg)?;
+        kir_source.push_str(&kir::cuda::emit_module(&distinct).map_err(anyhow::Error::msg)?);
         let attn_source = kir::cuda::emit_attention(&attn).map_err(anyhow::Error::msg)?;
         let gemm_source = kir::cuda::emit_gemms(&gemms.kernels).map_err(anyhow::Error::msg)?;
         let linear_source = kir::cuda::emit_linear(&linear).map_err(anyhow::Error::msg)?;
         let kir_hash = kir::fold_hashes([
-            kir::module_hash(&kir_kernels),
+            if distinct.is_empty() { kir::module_hash(&kir_kernels) } else { kir::fold_hashes([kir::module_hash(&kir_kernels), kir::module_hash(&distinct)]) },
             kir::gemm::instances_hash(&gemms.kernels),
             kir::attention::attention_hash(&attn),
             kir::linear::linear_hash(&linear),
@@ -379,7 +419,7 @@ impl Module {
             kir_source
         );
         let mut kernels = KERNELS.to_vec();
-        for k in &kir_kernels {
+        for k in kir_kernels.iter().chain(&distinct) {
             if !kernels.contains(&k.name) {
                 kernels.push(k.name);
             }

@@ -184,6 +184,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
         Body::AddRmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
         Body::RmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
         Body::Compose(c) => c.emit_cuda(k)?,
+        Body::Scan(c) => c.emit_cuda(k)?,
         Body::GatedActivation { width, act } => {
             let a = match act {
                 Activation::Silu => "g / (1.0f + expf(-g))",

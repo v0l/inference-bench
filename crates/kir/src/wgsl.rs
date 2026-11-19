@@ -100,6 +100,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
     }
     Ok(match &k.body {
         Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. } | Body::Pointwise { .. } | Body::Add { .. } => return Err(format!("{}: no WGSL emitter for this body yet", k.name)),
+        Body::Scan(_) => return Err(format!("{}: a scan body has no WGSL lowering yet", k.name)),
         Body::Compose(c) => c.emit_wgsl(k, &header(k, ""))?,
         Body::RmsNorm { width, eps, sum, offset } => {
             if *sum == BlockSum::WarpShuffle {

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 8;
+pub const SPEC_FORMAT: u32 = 9;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -613,6 +613,10 @@ pub struct Attention {
     pub qk_norm_full: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fused_qkv: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node: Vec<crate::graph::Node>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1400,6 +1404,8 @@ impl Spec {
                 query_scalar: hf.query_pre_attn_scalar.or(multiplier(&family.multipliers.attention).filter(|m| *m > 0.0).map(|m| 1.0 / (m * m))),
                 qk_norm_full: qk_norm && family.attention.qk_norm_full,
                 fused_qkv: family.attention.fused_qkv,
+                node: family.attention.node.clone(),
+                params: family.attention.params.iter().map(|(n, p)| Ok((n.clone(), p.read(n, &value)?))).collect::<Result<_>>()?,
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value) },
             mlp: Mlp {
@@ -1421,6 +1427,7 @@ impl Spec {
     pub fn validate(&self) -> Result<()> {
         self.runtime.validate()?;
         ensure!(!self.layers.pattern.contains(&Block::Sliding) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
+        self.validate_attention_nodes()?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
             Some(Quant::Fp8Channel) => {
@@ -1589,6 +1596,49 @@ impl Spec {
 
     pub fn uses_branch(&self) -> bool {
         self.norm.sandwich || self.norm.residual_scale.is_some()
+    }
+
+    pub fn weight_len(&self, symbol: &str) -> Result<usize> {
+        let a = &self.attention;
+        Ok(match symbol {
+            "heads" => a.heads,
+            "kv_heads" => a.kv_heads,
+            "head_dim" => a.head_dim,
+            "q_dim" => self.q_dim(),
+            "kv_dim" => self.kv_dim(),
+            other => other.parse().with_context(|| format!("weight length {other:?} is not heads, kv_heads, head_dim, q_dim, kv_dim or a number"))?,
+        })
+    }
+
+    fn validate_attention_nodes(&self) -> Result<()> {
+        let nodes = &self.attention.node;
+        if nodes.is_empty() {
+            return Ok(());
+        }
+        ensure!(nodes.len() <= 256, "[[attention.node]] has more than 256 nodes");
+        let mut launches = 0;
+        for (i, n) in nodes.iter().enumerate() {
+            match n.op.as_str() {
+                "kv_rope" | "decode_rope" => {}
+                "kernel" => {
+                    launches += 1;
+                    ensure!(n.kernel.is_some(), "[[attention.node]] {i} is a kernel node without `kernel`");
+                    ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[attention.node]] {i} needs a grid of one to three symbols");
+                    for g in &n.grid {
+                        ensure!(matches!(g.as_str(), "heads" | "kv_heads" | "rows") || g.parse::<u32>().is_ok(), "[[attention.node]] {i} grid symbol {g:?} is not heads, kv_heads, rows or a number");
+                    }
+                    for b in n.bind.values() {
+                        if let crate::graph::Bind::Weight { len, .. } = b {
+                            self.weight_len(len)?;
+                        }
+                    }
+                }
+                other => bail!("[[attention.node]] {i} has op {other:?}, not kv_rope, decode_rope or kernel"),
+            }
+        }
+        ensure!(launches > 0, "[[attention.node]] declares no kernel node");
+        ensure!(self.speculative().is_none(), "[[attention.node]] cannot be combined with [mtp] yet");
+        Ok(())
     }
 
     pub fn nope(&self, layer: usize) -> bool {

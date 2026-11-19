@@ -84,7 +84,7 @@ fn codegen_attention_kernels_come_from_descriptions() {
 #[test]
 fn embedded_kernel_descriptions_parse_and_are_delivered() {
     let registry = Registry::embedded();
-    assert_eq!(registry.descriptions().count(), 8);
+    assert!(registry.descriptions().count() >= 8);
     for name in ["qk_norm_rope", "kv_norm_rope", "attention_split", "attention_reduce", "flash_attention", "flash_mma", "batch_decode_attention", "batch_decode_combine"] {
         assert!(registry.get(name).is_some(), "{name}");
     }

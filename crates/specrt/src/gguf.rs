@@ -492,6 +492,8 @@ impl Gguf {
                 query_scalar: None,
                 qk_norm_full: false,
                 fused_qkv: false,
+                node: Vec::new(),
+                params: Default::default(),
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(family, head_dim)?, mrope, local_theta: None, nope_layers: Vec::new() },
             mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, fused_gate_up: false },

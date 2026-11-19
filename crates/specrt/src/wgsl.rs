@@ -40,8 +40,10 @@ pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static s
             k
         }
         Op::KvRope | Op::QkRope => vec!["rope"],
+        Op::DecodeRope => anyhow::bail!("described kernels are not yet on wgpu"),
         Op::Flash | Op::FlashLegacy | Op::DecodeAttention => vec!["attention"],
         Op::Swiglu => vec!["swiglu"],
+        Op::Kernel { .. } => anyhow::bail!("described kernels are not yet on wgpu"),
         Op::NormAdd { .. } | Op::LogitSoftcap | Op::LogitScale | Op::Split { .. } | Op::QkNorm | Op::ScaledAdd { .. } | Op::Clear { .. } => anyhow::bail!("this op is not yet on wgpu"),
         Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => anyhow::bail!("delta-net is not yet on wgpu"),
         Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => anyhow::bail!("MTP is not yet on wgpu"),
@@ -60,6 +62,9 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
     }
     if spec.speculative().is_some() {
         return Some("MTP is not yet on wgpu".into());
+    }
+    if !spec.attention.node.is_empty() {
+        return Some("described attention kernels are not yet on wgpu".into());
     }
     if spec.attention.output_gate {
         return Some("output-gated attention is not yet on wgpu".into());

@@ -110,6 +110,8 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             o: up_m(&a.o)?,
             kv: before(false),
             window: if spec.block(i) == Block::Sliding { spec.layers.window.unwrap_or(0) as i32 } else { 0 },
+            nope: spec.nope(i),
+            extra: a.extra.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,
         }),
         Mixer::Linear(g) => DeviceMixer::Linear(DeviceGdn {
             in_proj: up_m(&g.in_proj)?,
@@ -335,6 +337,12 @@ impl DeviceMatrix {
     }
 }
 
+struct DescribedLaunch {
+    name: &'static str,
+    threads: u32,
+    params: Vec<kir::Param>,
+}
+
 struct DeviceAttn {
     qkv: DeviceMatrix,
     qkv_bias: Option<CudaSlice<f32>>,
@@ -343,6 +351,8 @@ struct DeviceAttn {
     o: DeviceMatrix,
     kv: i32,
     window: i32,
+    nope: bool,
+    extra: std::collections::BTreeMap<String, CudaSlice<f32>>,
 }
 
 struct DeviceGdn {
@@ -629,6 +639,7 @@ pub struct Runtime {
     norm: CudaSlice<f32>,
     lm_head: DeviceMatrix,
     layers: Vec<DeviceLayer>,
+    described: Vec<Option<DescribedLaunch>>,
     buf: Buffers,
     pre: PrefillBuffers,
     gdn: Option<GdnBuffers>,
@@ -855,6 +866,10 @@ impl Runtime {
             kernels.insert(name, f);
         }
         let smem = module.smem.clone();
+        let described: Vec<Option<DescribedLaunch>> = crate::codegen::described_kernels(spec, layout.kv_planes, max_ctx, &target)?
+            .into_iter()
+            .map(|k| k.map(|k| DescribedLaunch { name: k.name, threads: k.threads, params: k.params }))
+            .collect();
         let linear_tuning = LinearTuning::for_target(&target);
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
         let checkpoint = match tp {
@@ -875,6 +890,7 @@ impl Runtime {
         let prefill_limit = max_ctx.min(layout.prefill_chunk).max(layout.slots);
         let chunk = prefill_limit + crate::runtime::step::row_capacity(layout.slots);
         let use_mma = ctx.compute_capability()?.0 >= 8 && !spec.runtime.gemm_fp32;
+        ensure!(described.iter().all(Option::is_none) || use_mma, "described attention needs the tensor core path (sm_80 or newer)");
         ensure!(
             use_mma || (spec.lm_head_quant() != crate::spec::Quant::Nvfp4G16 && spec.draft_head_quant() != Some(crate::spec::Quant::Nvfp4G16)),
             "head_quant = \"nvfp4_g16\" needs the tensor-core prefill path (an Ampere or newer GPU and [runtime] gemm_fp32 = false)"
@@ -996,6 +1012,7 @@ impl Runtime {
             norm,
             lm_head,
             layers,
+            described,
             buf,
             kernels,
             stream,
@@ -1307,6 +1324,7 @@ impl Runtime {
     }
 
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
+        ensure!(self.spec.attention.node.is_empty(), "described attention runs on the batched decode path (generate_batch and the scheduler), not the single stream step");
         let s = &self.spec;
         let a = &s.attention;
         let buf = &self.buf;
@@ -2277,12 +2295,9 @@ impl Runtime {
         Ok(())
     }
 
-    fn attn_decode_rows(&self, l: &DeviceAttn, bb: &BatchBuffers, n: usize, qlen: usize) -> Result<()> {
+    fn decode_rope_rows(&self, l: &DeviceAttn, bb: &BatchBuffers, n: usize) -> Result<()> {
         let a = &self.spec.attention;
-        debug_assert!(n.is_multiple_of(qlen) && qlen <= crate::codegen::DECODE_MAX_QLEN);
-        let qlen_i = qlen as i32;
         let (pages, mm_stride) = (self.pages as i32, self.max_ctx as i32);
-        let splits_i = crate::codegen::decode_splits(self.max_ctx) as i32;
         let pre = &self.pre;
         let buf = &self.buf;
         let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
@@ -2307,6 +2322,18 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn attn_decode_rows(&self, l: &DeviceAttn, bb: &BatchBuffers, n: usize, qlen: usize) -> Result<()> {
+        let a = &self.spec.attention;
+        debug_assert!(n.is_multiple_of(qlen) && qlen <= crate::codegen::DECODE_MAX_QLEN);
+        let qlen_i = qlen as i32;
+        let (pages, _) = (self.pages as i32, self.max_ctx as i32);
+        let splits_i = crate::codegen::decode_splits(self.max_ctx) as i32;
+        let pre = &self.pre;
+        let buf = &self.buf;
+        self.decode_rope_rows(l, bb, n)?;
         let mut b = self.stream.launch_builder(self.kernel("batch_decode_attention"));
         b.arg(&pre.qkv)
             .arg(&buf.k_cache)

@@ -188,6 +188,8 @@ pub enum Op {
     Flash,
     FlashLegacy,
     DecodeAttention,
+    DecodeRope,
+    Kernel { node: u8 },
     Swiglu,
     GdnPrefill,
     GdnDecode,
@@ -233,9 +235,10 @@ impl Op {
             Op::QkNorm => "qk norm".into(),
             Op::ScaledAdd { .. } => "scaled add".into(),
             Op::Linear { weight, .. } => weight.name().into(),
-            Op::KvRope | Op::QkRope => "norm and rope".into(),
+            Op::KvRope | Op::QkRope | Op::DecodeRope => "norm and rope".into(),
             Op::Flash | Op::FlashLegacy => "attention".into(),
             Op::DecodeAttention => "decode attention".into(),
+            Op::Kernel { .. } => "described kernel".into(),
             Op::Swiglu => "swiglu".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "delta rule".into(),
             Op::MtpIn => "draft input".into(),
@@ -262,8 +265,8 @@ impl Op {
             Op::QkNorm => "qkv to qkv".into(),
             Op::ScaledAdd { from } => format!("{} scaled and added to x", from.label()),
             Op::Linear { input, output, .. } => format!("{} to {}", input.label(), output.label()),
-            Op::KvRope | Op::QkRope => "qkv to kv cache".into(),
-            Op::Flash | Op::FlashLegacy | Op::DecodeAttention => "qkv and kv cache to attn".into(),
+            Op::KvRope | Op::QkRope | Op::DecodeRope => "qkv to kv cache".into(),
+            Op::Flash | Op::FlashLegacy | Op::DecodeAttention | Op::Kernel { .. } => "qkv and kv cache to attn".into(),
             Op::Swiglu => "gate_up to act".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "lin, ba and state to gdn".into(),
             Op::MtpIn => "tokens and hidden to fc planes".into(),
@@ -283,9 +286,20 @@ impl Op {
             Op::Embed => vec!["embed_tokens.weight".into()],
             Op::Norm { which, .. } | Op::NormAdd { which, .. } => vec![which.tensor().into()],
             Op::Linear { weight, .. } => weight.tensors(spec),
-            Op::KvRope | Op::QkRope | Op::Flash | Op::DecodeAttention | Op::QkNorm if spec.attention.qk_norm => {
+            Op::KvRope | Op::QkRope | Op::DecodeRope | Op::Flash | Op::DecodeAttention | Op::QkNorm if spec.attention.qk_norm => {
                 vec!["self_attn.q_norm.weight".into(), "self_attn.k_norm.weight".into()]
             }
+            Op::Kernel { node } => spec
+                .attention
+                .node
+                .get(*node as usize)
+                .into_iter()
+                .flat_map(|n| n.bind.values())
+                .filter_map(|b| match b {
+                    crate::graph::Bind::Weight { weight, .. } => Some(format!("self_attn.{weight}")),
+                    crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_) => None,
+                })
+                .collect(),
             Op::GdnPrefill | Op::GdnDecode => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
             Op::MoeRoute => vec!["mlp.gate.weight".into(), "mlp.shared_expert_gate.weight".into()],
             Op::MoeExperts => vec!["mlp.experts".into(), "mlp.shared_expert".into()],
@@ -349,10 +363,11 @@ impl Op {
                 out
             }
             Op::KvRope => names(&["kv_norm_rope"]),
-            Op::QkRope => names(&["qk_norm_rope"]),
+            Op::QkRope | Op::DecodeRope => names(&["qk_norm_rope"]),
             Op::Flash => names(&["flash_mma"]),
             Op::FlashLegacy => names(&["flash_attention"]),
             Op::DecodeAttention => names(&["qk_norm_rope", "batch_decode_attention", "batch_decode_combine"]),
+            Op::Kernel { node } => spec.attention.node.get(*node as usize).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::Swiglu => names(&["swiglu"]),
             Op::GdnPrefill => names(&[
                 "gdn_conv_prefill",
