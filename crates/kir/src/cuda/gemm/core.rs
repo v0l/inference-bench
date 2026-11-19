@@ -236,7 +236,7 @@ for (int h = 0; h < 2; h++) {
 }
 "##),
         "}\n\n".to_string(),
-        super::prim::mma_e4m3("mma_e4m3"),
+        super::prim::mma_e4m3("mma_e4m3", false),
     ]
     .concat()
 }

@@ -172,7 +172,7 @@ fn variant(name: &str, tile: &str) -> String {
 pub fn grouped() -> String {
     let mut out = String::new();
     out.push_str(constants());
-    out.push_str(&prim::mma_e4m3("moe_mma_e4m3"));
+    out.push_str(&prim::mma_e4m3("moe_mma_e4m3", true));
     out.push_str(&crate::cuda::quant::quant_fp8_f32_groups("moe_quant_f8", 128));
     out.push_str(&mma::tiles("moe_tiles_f8"));
     out.push_str(&gemm());
