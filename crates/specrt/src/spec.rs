@@ -1263,6 +1263,11 @@ impl Spec {
         Ok(())
     }
 
+    pub fn expert_tensors(&self) -> Vec<String> {
+        let shared = self.moe.as_ref().map_or(DEFAULT_SHARED_MODULE, |m| &m.shared_module);
+        vec!["mlp.experts".into(), format!("mlp.{shared}")]
+    }
+
     pub fn complete_from_checkpoint_config(&mut self, json: &str) -> Result<()> {
         if self.vision.is_none() {
             self.vision = crate::vision::Vision::from_hf_config(json)?;
