@@ -1195,7 +1195,10 @@ impl Checkpoint {
         if format.device_packed() {
             ensure!(cols.is_multiple_of(format.group), "{name} has {cols} columns, not a whole number of groups of {}", format.group);
             ensure!(scales.data.len() == experts * rows * cols / format.group, "{name}_scales holds {} bytes, expected {}", scales.data.len(), experts * rows * cols / format.group);
-            return Ok(Stacked::Block { packed: blocks.data.to_vec(), scales: scales.data.to_vec() });
+            let padded = format.padded_cols(cols);
+            let packed = format.pad_rows(blocks.data, cols / 2, padded / 2);
+            let scales = format.pad_rows(scales.data, cols / format.group, padded / format.group);
+            return Ok(Stacked::Block { packed, scales });
         }
         Ok(Stacked::Bf16(format.decode_bf16(blocks.data, scales.data).with_context(|| name.to_string())?))
     }
@@ -1203,8 +1206,9 @@ impl Checkpoint {
     fn block_gate_up(&self, format: &crate::dequant::BlockFormat, name: &str, experts: usize, inter: usize, h: usize, interleaved: bool) -> Result<(Stacked, Stacked)> {
         Ok(match self.block_stack(format, name, experts, 2 * inter, h)? {
             Stacked::Block { packed, scales } => {
-                let (gp, up) = split_gate_up(&packed, h / 2, experts, inter, interleaved);
-                let (gs, us) = split_gate_up(&scales, h / format.group, experts, inter, interleaved);
+                let padded = format.padded_cols(h);
+                let (gp, up) = split_gate_up(&packed, padded / 2, experts, inter, interleaved);
+                let (gs, us) = split_gate_up(&scales, padded / format.group, experts, inter, interleaved);
                 (Stacked::Block { packed: gp, scales: gs }, Stacked::Block { packed: up, scales: us })
             }
             Stacked::Bf16(fused) => {
@@ -1660,7 +1664,7 @@ mod block_expert_tests {
 
     #[test]
     fn mxfp4_expert_blocks_decode_into_gate_and_up_with_the_declared_row_order() {
-        let (experts, inter, h) = (2usize, 32usize, 64usize);
+        let (experts, inter, h) = (2usize, 32usize, 160usize);
         let dir = std::env::temp_dir().join(format!("mxfp4-experts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let (blocks, scales) = checkpoint(&dir, experts, inter, h);
@@ -1672,7 +1676,9 @@ mod block_expert_tests {
         let row = |s: &Stacked, r: usize| -> Vec<u16> {
             let Stacked::Block { packed, scales } = s else { panic!("packed") };
             let mut f = Vec::new();
-            MXFP4.decode(&packed[r * h / 2..(r + 1) * h / 2], &scales[r * h / 32..(r + 1) * h / 32], &mut f).unwrap();
+            let ph = MXFP4.padded_cols(h);
+            MXFP4.decode(&packed[r * ph / 2..r * ph / 2 + h / 2], &scales[r * ph / 32..r * ph / 32 + h / 32], &mut f).unwrap();
+            assert!(packed[r * ph / 2 + h / 2..(r + 1) * ph / 2].iter().all(|b| *b == 0) && scales[r * ph / 32 + h / 32..(r + 1) * ph / 32].iter().all(|b| *b == 0));
             f.into_iter().map(f32_to_bf16).collect()
         };
         let (g, u) = ck.block_gate_up(&MXFP4, name, experts, inter, h, true).unwrap();
@@ -1683,8 +1689,10 @@ mod block_expert_tests {
         assert_eq!(row(&g, 3), want(3, 0));
         assert_eq!(row(&u, 3), want(inter + 3, 0));
         let Stacked::Block { packed, scales } = ck.block_stack(&MXFP4, "model.layers.0.mlp.experts.down_proj", experts, h, inter).unwrap() else { panic!("packed") };
-        assert_eq!((packed.len(), scales.len()), (experts * h * inter / 2, experts * h * inter / 32));
-        assert!(packed.iter().all(|b| *b == 0x22) && scales.iter().all(|s| *s == 127));
+        let pi = MXFP4.padded_cols(inter);
+        assert_eq!((packed.len(), scales.len()), (experts * h * pi / 2, experts * h * pi / 32));
+        assert!(packed.chunks(pi / 2).all(|r| r[..inter / 2].iter().all(|b| *b == 0x22) && r[inter / 2..].iter().all(|b| *b == 0)));
+        assert!(scales.chunks(pi / 32).all(|r| r[..inter / 32].iter().all(|s| *s == 127) && r[inter / 32..].iter().all(|s| *s == 0)));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1692,9 +1700,9 @@ mod block_expert_tests {
     fn a_blocks_tensor_of_the_wrong_size_is_an_error() {
         let dir = std::env::temp_dir().join(format!("mxfp4-bad-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        checkpoint(&dir, 2, 32, 64);
+        checkpoint(&dir, 2, 32, 160);
         let ck = Checkpoint::open(&dir).unwrap();
-        assert!(ck.block_stack(&MXFP4, "model.layers.0.mlp.experts.gate_up_proj", 2, 32, 64).is_err());
+        assert!(ck.block_stack(&MXFP4, "model.layers.0.mlp.experts.gate_up_proj", 2, 32, 160).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

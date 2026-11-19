@@ -47,8 +47,16 @@ pub fn quant_mx() -> String {
         "moe_quant_mx",
         "const float* x, unsigned char* q, unsigned char* qs, int width",
         r##"  int groups = width / 32;
+  int stride = (width + 127) / 128 * 128;
+  int padded = stride / 32;
   size_t row = blockIdx.x;
-  for (int grp = threadIdx.x; grp < groups; grp += 256) {
+  for (int grp = threadIdx.x; grp < padded; grp += 256) {
+    size_t out_at = row * stride + (size_t)grp * 32;
+    if (grp >= groups) {
+        *(uint4*)(q + out_at / 2) = make_uint4(0u, 0u, 0u, 0u);
+        qs[row * padded + grp] = 0;
+        continue;
+    }
     size_t at = row * width + (size_t)grp * 32;
     float v[32];
     float amax = 0.0f;
@@ -69,8 +77,8 @@ pub fn quant_mx() -> String {
     unsigned w[4] = {0u, 0u, 0u, 0u};
 #pragma unroll
     for (int i = 0; i < 32; i += 2) w[i / 8] |= moe_e2m1x2(v[i] * mul, v[i + 1] * mul) << (4 * (i % 8));
-    *(uint4*)(q + at / 2) = make_uint4(w[0], w[1], w[2], w[3]);
-    qs[row * groups + grp] = (unsigned char)e;
+    *(uint4*)(q + out_at / 2) = make_uint4(w[0], w[1], w[2], w[3]);
+    qs[row * padded + grp] = (unsigned char)e;
   }
 "##,
     )
@@ -109,11 +117,13 @@ fn geometry() -> &'static str {
     constexpr int ROWS = BM + NW * BN;
     constexpr int SCALE_OFF = ROWS * MMA_DATA;
     constexpr int STAGE_BYTES = ROWS * (MMA_DATA + SB);
-    constexpr int KT = K / 128;
-    constexpr int KG = MX ? K / 32 : K / 16;
+    constexpr int KP = (K + 127) / 128 * 128;
+    constexpr int KT = KP / 128;
+    constexpr int KG = MX ? KP / 32 : KP / 16;
     constexpr int A_ITERS = (BM * 5 + THREADS - 1) / THREADS;
     constexpr int W_ITERS = (BN * 5 + THREADS - 1) / THREADS;
-    static_assert(K % 128 == 0, "K must be a multiple of 128");
+    static_assert(MX || K % 128 == 0, "K must be a multiple of 128 unless the weights are block scaled");
+    static_assert(K % 32 == 0, "K must be a multiple of the block");
     static_assert(N % BN == 0, "N must be a multiple of the tile");
     static_assert(NJ % 2 == 0, "B fragments come two n tiles per ldmatrix");
 "##
@@ -173,7 +183,7 @@ fn load_stage() -> &'static str {
             int c = idx % 5;
             int s = src[r];
             size_t row = (size_t)max(s, 0);
-            if (c < 4) cp_async16_zfill(st + mma_chunk(r, c), aq + row * (K / 2) + kt * 64 + c * 16, s >= 0);
+            if (c < 4) cp_async16_zfill(st + mma_chunk(r, c), aq + row * (KP / 2) + kt * 64 + c * 16, s >= 0);
             else moe_cp_scale<MX>(st + SCALE_OFF + r * SB, as + row * KG + kt * SB, s >= 0);
         }
 #pragma unroll
@@ -187,7 +197,7 @@ fn load_stage() -> &'static str {
                 int r = idx / 5;
                 int c = idx % 5;
                 size_t row = (size_t)e * N + n0 + r;
-                if (c < 4) cp_async16(st + (BM + w * BN) * MMA_DATA + mma_chunk(r, c), wp + row * (K / 2) + kt * 64 + c * 16);
+                if (c < 4) cp_async16(st + (BM + w * BN) * MMA_DATA + mma_chunk(r, c), wp + row * (KP / 2) + kt * 64 + c * 16);
                 else moe_cp_scale<MX>(st + SCALE_OFF + (BM + w * BN + r) * SB, sp + row * KG + kt * SB, true);
             }
         }

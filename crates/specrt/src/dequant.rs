@@ -25,6 +25,8 @@ pub struct BlockFormat {
     pub group: usize,
 }
 
+pub const DEVICE_TILE: usize = 128;
+
 pub const MXFP4: BlockFormat = BlockFormat { elem: Elem::E2m1, scale: ScaleKind::E8m0, group: 32 };
 
 impl Elem {
@@ -69,6 +71,21 @@ impl BlockFormat {
 
     pub fn native_mma(&self) -> bool {
         self.device_packed() && self.group == 32
+    }
+
+    pub fn padded_cols(&self, cols: usize) -> usize {
+        cols.next_multiple_of(DEVICE_TILE)
+    }
+
+    pub fn pad_rows(&self, data: &[u8], row_bytes: usize, padded_row_bytes: usize) -> Vec<u8> {
+        if row_bytes == padded_row_bytes {
+            return data.to_vec();
+        }
+        let mut out = vec![0u8; data.len() / row_bytes * padded_row_bytes];
+        for (src, dst) in data.chunks(row_bytes).zip(out.chunks_mut(padded_row_bytes)) {
+            dst[..row_bytes].copy_from_slice(src);
+        }
+        out
     }
 
     pub fn packed_len(&self, values: usize) -> usize {
@@ -131,6 +148,14 @@ mod tests {
     fn a_length_mismatch_is_an_error() {
         assert!(MXFP4.decode(&[0; 15], &[127], &mut Vec::new()).is_err());
         assert!(BlockFormat { elem: Elem::E2m1, scale: ScaleKind::E8m0, group: 3 }.check().is_err());
+    }
+
+    #[test]
+    fn rows_pad_to_the_device_tile_with_zeros() {
+        assert_eq!(MXFP4.padded_cols(2880), 2944);
+        assert_eq!(MXFP4.padded_cols(256), 256);
+        assert_eq!(MXFP4.pad_rows(&[1, 2, 3, 4], 2, 4), vec![1, 2, 0, 0, 3, 4, 0, 0]);
+        assert_eq!(MXFP4.pad_rows(&[1, 2, 3, 4], 2, 2), vec![1, 2, 3, 4]);
     }
 
     #[test]
