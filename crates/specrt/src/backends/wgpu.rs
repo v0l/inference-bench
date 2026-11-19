@@ -11,12 +11,19 @@ const UPLOAD_FLUSH: u64 = 128 << 20;
 pub struct Buffer {
     pub raw: wgpu::Buffer,
     pub bytes: u64,
+    id: u64,
+}
+
+fn next_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 struct Pipeline {
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     bindings: Vec<Access>,
+    index: u64,
 }
 
 pub struct Wgpu {
@@ -27,6 +34,10 @@ pub struct Wgpu {
     pipelines: HashMap<&'static str, Pipeline>,
     params: wgpu::Buffer,
     slot: u64,
+    staged: Vec<u8>,
+    groups: HashMap<Vec<u64>, wgpu::BindGroup>,
+    dispatched: u64,
+    counts: std::collections::BTreeMap<String, u64>,
     pending_upload: std::cell::Cell<u64>,
     encoder: Option<wgpu::CommandEncoder>,
     pass: Option<wgpu::ComputePass<'static>>,
@@ -117,7 +128,7 @@ impl Wgpu {
             }
             _ => (None, None),
         };
-        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, pending_upload: Default::default(), encoder: None, pass: None, cache_dir, cache, cache_path })
+        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, staged: Vec::new(), groups: HashMap::new(), dispatched: 0, counts: Default::default(), pending_upload: Default::default(), encoder: None, pass: None, cache_dir, cache, cache_path })
     }
 
     pub fn info(&self) -> &wgpu::AdapterInfo {
@@ -145,6 +156,9 @@ impl Wgpu {
 
 impl Drop for Wgpu {
     fn drop(&mut self) {
+        if std::env::var_os("SPECRT_COUNT").is_some() {
+            eprintln!("dispatches {} {:?} groups {}", self.dispatched, self.counts, self.groups.len());
+        }
         self.save_cache();
     }
 }
@@ -180,7 +194,7 @@ impl Backend for Wgpu {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Ok(Buffer { raw, bytes: padded })
+        Ok(Buffer { raw, bytes: padded, id: next_id() })
     }
 
     fn alloc_filled(&self, parts: &[&[u8]]) -> Result<Buffer> {
@@ -225,7 +239,7 @@ impl Backend for Wgpu {
         raw.unmap();
         self.queue.submit([]);
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
-        Ok(Buffer { raw, bytes: padded })
+        Ok(Buffer { raw, bytes: padded, id: next_id() })
     }
 
     fn upload(&self, buffer: &Buffer, offset: u64, data: &[u8]) {
@@ -299,7 +313,7 @@ impl Backend for Wgpu {
                             Access::Write => wgpu::BufferBindingType::Storage { read_only: false },
                             Access::Uniform => wgpu::BufferBindingType::Uniform,
                         },
-                        has_dynamic_offset: false,
+                        has_dynamic_offset: *a == Access::Uniform,
                         min_binding_size: None,
                     },
                     count: None,
@@ -332,7 +346,7 @@ impl Backend for Wgpu {
             if let Some(e) = pollster::block_on(scope.pop()) {
                 bail!("kernel {} failed to compile on {}: {e}", k.name, self.info.name);
             }
-            self.pipelines.insert(k.name, Pipeline { pipeline, layout, bindings: k.bindings.clone() });
+            self.pipelines.insert(k.name, Pipeline { pipeline, layout, bindings: k.bindings.clone(), index: self.pipelines.len() as u64 });
         }
         self.save_cache();
         Ok(())
@@ -344,37 +358,39 @@ impl Backend for Wgpu {
         }
         let slot = self.slot;
         self.slot += 1;
-        let bytes: Vec<u8> = params.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.queue.write_buffer(&self.params, slot * PARAM_SLOT, &bytes);
+        self.dispatched += 1;
+        *self.counts.entry(kernel.to_string()).or_insert(0) += 1;
+        self.staged.extend(params.iter().flat_map(|v| v.to_le_bytes()));
+        self.staged.resize((slot + 1) as usize * PARAM_SLOT as usize, 0);
         let p = self.pipelines.get(kernel).with_context(|| format!("kernel {kernel} was not compiled"))?;
-        let mut data = buffers.iter();
-        let entries: Vec<wgpu::BindGroupEntry> = p
-            .bindings
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                let resource = if *a == Access::Uniform {
-                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.params,
-                        offset: slot * PARAM_SLOT,
-                        size: std::num::NonZeroU64::new(32),
-                    })
-                } else {
-                    data.next().expect("a buffer for each storage binding").raw.as_entire_binding()
-                };
-                wgpu::BindGroupEntry { binding: i as u32, resource }
-            })
-            .collect();
-        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.layout, entries: &entries });
-        let pipeline = p.pipeline.clone();
+        let mut key = Vec::with_capacity(buffers.len() + 1);
+        key.push(p.index);
+        key.extend(buffers.iter().map(|b| b.id));
+        let group = self.groups.entry(key).or_insert_with(|| {
+            let mut data = buffers.iter();
+            let entries: Vec<wgpu::BindGroupEntry> = p
+                .bindings
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let resource = if *a == Access::Uniform {
+                        wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &self.params, offset: 0, size: std::num::NonZeroU64::new(32) })
+                    } else {
+                        data.next().expect("a buffer for each storage binding").raw.as_entire_binding()
+                    };
+                    wgpu::BindGroupEntry { binding: i as u32, resource }
+                })
+                .collect();
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.layout, entries: &entries })
+        });
         if self.pass.is_none() {
             let device = &self.device;
             let encoder = self.encoder.get_or_insert_with(|| device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("specrt") }));
             self.pass = Some(encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("specrt"), timestamp_writes: None }).forget_lifetime());
         }
         let pass = self.pass.as_mut().expect("a compute pass is open");
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &group, &[]);
+        pass.set_pipeline(&p.pipeline);
+        pass.set_bind_group(0, &*group, &[(slot * PARAM_SLOT) as u32]);
         pass.dispatch_workgroups(grid[0], grid[1], grid[2]);
         Ok(())
     }
@@ -382,6 +398,10 @@ impl Backend for Wgpu {
     fn submit(&mut self) -> Result<()> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         self.pass = None;
+        if !self.staged.is_empty() {
+            self.queue.write_buffer(&self.params, 0, &self.staged);
+            self.staged.clear();
+        }
         if let Some(e) = self.encoder.take() {
             self.queue.submit([e.finish()]);
         }
