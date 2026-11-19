@@ -113,8 +113,12 @@ struct Mma8Buffers {
 struct MmaBuffers {
     xq: CudaSlice<u8>,
     xs: CudaSlice<u8>,
+    xq2: CudaSlice<u8>,
+    xs2: CudaSlice<u8>,
     aq: CudaSlice<u8>,
     as_: CudaSlice<u8>,
+    aq2: CudaSlice<u8>,
+    as2: CudaSlice<u8>,
     tiles: CudaSlice<i32>,
 }
 
@@ -142,8 +146,12 @@ impl MoeBuffers {
                 Some(MmaBuffers {
                     xq: stream.alloc_zeros(rows * h / 2)?,
                     xs: stream.alloc_zeros(rows * h / 16)?,
+                    xq2: stream.alloc_zeros(rows * h / 2)?,
+                    xs2: stream.alloc_zeros(rows * h / 16)?,
                     aq: stream.alloc_zeros(pairs * i / 2)?,
                     as_: stream.alloc_zeros(pairs * i / 16)?,
+                    aq2: stream.alloc_zeros(pairs * i / 2)?,
+                    as2: stream.alloc_zeros(pairs * i / 16)?,
                     tiles: stream.alloc_zeros(2 * tiles)?,
                 })
             } else {
@@ -276,28 +284,47 @@ impl Runtime {
         b.arg(&mb.offsets).arg(&mma.tiles).arg(&bm_i).arg(&max_i);
         unsafe { b.launch(cfg(1, 32)) }?;
         let igs_up = gi.min(ui);
-        let quant = |x: &CudaSlice<f32>, q: &CudaSlice<u8>, s: &CudaSlice<u8>, rows: usize, width: usize, igs: f32| -> Result<()> {
+        let (up_planes, down_planes) = (self.spec.mlp.up_act_planes, self.spec.mlp.down_act_planes);
+        let quant = |x: &CudaSlice<f32>, q: &CudaSlice<u8>, s: &CudaSlice<u8>, q2: &CudaSlice<u8>, s2: &CudaSlice<u8>, planes: u8, rows: usize, width: usize, igs: f32| -> Result<()> {
             let width = width as i32;
+            let none = 0u64;
             let mut b = self.stream.launch_builder(self.kernel(quant_kernel));
-            b.arg(x).arg(q).arg(s).arg(&width);
+            b.arg(x).arg(q).arg(s);
+            if block {
+                if planes == 2 {
+                    b.arg(q2).arg(s2);
+                } else {
+                    b.arg(&none).arg(&none);
+                }
+            }
+            b.arg(&width);
             if !block {
                 b.arg(&igs);
             }
             unsafe { b.launch(cfg(rows as u32, 256)) }?;
             Ok(())
         };
-        quant(&mb.xn, &mma.xq, &mma.xs, n, h, igs_up)?;
+        quant(&mb.xn, &mma.xq, &mma.xs, &mma.xq2, &mma.xs2, up_planes, n, h, igs_up)?;
         let inv_up = 1.0 / igs_up;
-        let name = format!("{stem}_up{}", if small { "_s" } else { "" });
+        let tag = |planes: u8| if planes == 2 { "2" } else { "" };
+        let name = format!("{stem}_up{}{}", tag(up_planes), if small { "_s" } else { "" });
         let mut b = self.stream.launch_builder(self.kernel(&name));
-        b.arg(gw).arg(gs).arg(gg).arg(uw).arg(us).arg(ug).arg(&w.gate_up_bias).arg(&inv_up).arg(&mma.xq).arg(&mma.xs).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.act);
+        b.arg(gw).arg(gs).arg(gg).arg(uw).arg(us).arg(ug).arg(&w.gate_up_bias).arg(&inv_up).arg(&mma.xq).arg(&mma.xs);
+        if block {
+            b.arg(&mma.xq2).arg(&mma.xs2);
+        }
+        b.arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.act);
         let config = LaunchConfig { grid_dim: ((inter / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(bm, 2) };
         unsafe { b.launch(config) }?;
-        quant(&mb.act, &mma.aq, &mma.as_, pairs, inter, di)?;
+        quant(&mb.act, &mma.aq, &mma.as_, &mma.aq2, &mma.as2, down_planes, pairs, inter, di)?;
         let inv_down = 1.0 / di;
-        let name = format!("{stem}_down{}", if small { "_s" } else { "" });
+        let name = format!("{stem}_down{}{}", tag(down_planes), if small { "_s" } else { "" });
         let mut b = self.stream.launch_builder(self.kernel(&name));
-        b.arg(dw).arg(ds).arg(dg).arg(dw).arg(ds).arg(dg).arg(&w.down_bias).arg(&inv_down).arg(&mma.aq).arg(&mma.as_).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.out);
+        b.arg(dw).arg(ds).arg(dg).arg(dw).arg(ds).arg(dg).arg(&w.down_bias).arg(&inv_down).arg(&mma.aq).arg(&mma.as_);
+        if block {
+            b.arg(&mma.aq2).arg(&mma.as2);
+        }
+        b.arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.out);
         let config = LaunchConfig { grid_dim: ((h / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(bm, 1) };
         unsafe { b.launch(config) }?;
         Ok(())

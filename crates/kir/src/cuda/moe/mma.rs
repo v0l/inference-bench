@@ -45,7 +45,7 @@ pub fn quant_mx() -> String {
     prim::global(
         Some(256),
         "moe_quant_mx",
-        "const float* x, unsigned char* q, unsigned char* qs, int width",
+        "const float* x, unsigned char* q, unsigned char* qs, unsigned char* q2, unsigned char* qs2, int width",
         r##"  int groups = width / 32;
   int stride = (width + 127) / 128 * 128;
   int padded = stride / 32;
@@ -55,6 +55,10 @@ pub fn quant_mx() -> String {
     if (grp >= groups) {
         *(uint4*)(q + out_at / 2) = make_uint4(0u, 0u, 0u, 0u);
         qs[row * padded + grp] = 0;
+        if (q2) {
+            *(uint4*)(q2 + out_at / 2) = make_uint4(0u, 0u, 0u, 0u);
+            qs2[row * padded + grp] = 0;
+        }
         continue;
     }
     size_t at = row * width + (size_t)grp * 32;
@@ -79,6 +83,25 @@ pub fn quant_mx() -> String {
     for (int i = 0; i < 32; i += 2) w[i / 8] |= moe_e2m1x2(v[i] * mul, v[i + 1] * mul) << (4 * (i % 8));
     *(uint4*)(q + out_at / 2) = make_uint4(w[0], w[1], w[2], w[3]);
     qs[row * padded + grp] = (unsigned char)e;
+    if (q2) {
+        float back = __uint_as_float(e << 23);
+        float r[32];
+        float ramax = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; i++) {
+            r[i] = v[i] - moe_deq_e2m1((w[i / 8] >> (4 * (i % 8))) & 15u) * back;
+            ramax = fmaxf(ramax, fabsf(r[i]));
+        }
+        unsigned rbits = __float_as_uint(ramax * (1.0f / 6.0f));
+        unsigned re = (rbits >> 23) + ((rbits & 0x7fffffu) != 0u ? 1u : 0u);
+        re = min(max(re, 1u), 253u);
+        float rmul = __uint_as_float((254u - re) << 23);
+        unsigned w2[4] = {0u, 0u, 0u, 0u};
+#pragma unroll
+        for (int i = 0; i < 32; i += 2) w2[i / 8] |= moe_e2m1x2(r[i] * rmul, r[i + 1] * rmul) << (4 * (i % 8));
+        *(uint4*)(q2 + out_at / 2) = make_uint4(w2[0], w2[1], w2[2], w2[3]);
+        qs2[row * padded + grp] = (unsigned char)re;
+    }
   }
 "##,
     )
@@ -169,12 +192,16 @@ pub(super) fn tile_setup() -> String {
 }
 
 fn prologue() -> String {
-    prim::pipeline_prologue("KT", "load_stage(st, st)")
+    prim::pipeline_prologue("KT * PL", "load_stage(st, st)")
 }
 
 fn load_stage() -> &'static str {
-    r##"    auto load_stage = [&](int buf, int kt) {
+    r##"    auto load_stage = [&](int buf, int kt_all) {
         unsigned char* st = gemm_smem + buf * STAGE_BYTES;
+        int plane = kt_all / KT;
+        int kt = kt_all - plane * KT;
+        const unsigned char* aq_p = plane ? aq2 : aq;
+        const unsigned char* as_p = plane ? as2 : as;
 #pragma unroll
         for (int it = 0; it < A_ITERS; it++) {
             int idx = tid + it * THREADS;
@@ -183,8 +210,8 @@ fn load_stage() -> &'static str {
             int c = idx % 5;
             int s = src[r];
             size_t row = (size_t)max(s, 0);
-            if (c < 4) cp_async16_zfill(st + mma_chunk(r, c), aq + row * (KP / 2) + kt * 64 + c * 16, s >= 0);
-            else moe_cp_scale<MX>(st + SCALE_OFF + r * SB, as + row * KG + kt * SB, s >= 0);
+            if (c < 4) cp_async16_zfill(st + mma_chunk(r, c), aq_p + row * (KP / 2) + kt * 64 + c * 16, s >= 0);
+            else moe_cp_scale<MX>(st + SCALE_OFF + r * SB, as_p + row * KG + kt * SB, s >= 0);
         }
 #pragma unroll
         for (int w = 0; w < NW; w++) {
@@ -206,11 +233,11 @@ fn load_stage() -> &'static str {
 }
 
 fn mainloop() -> &'static str {
-    r##"    for (int kt = 0; kt < KT; kt++) {
+    r##"    for (int kt = 0; kt < KT * PL; kt++) {
         cp_async_wait<STAGES - 2>();
         __syncthreads();
         int next = kt + STAGES - 1;
-        if (next < KT) load_stage(next % STAGES, next);
+        if (next < KT * PL) load_stage(next % STAGES, next);
         cp_async_commit();
         const unsigned char* st = gemm_smem + (kt % STAGES) * STAGE_BYTES;
 #pragma unroll
@@ -284,11 +311,11 @@ fn epilogue() -> &'static str {
 
 fn gemm() -> String {
     format!(
-        "template <int N, int K, int NW, int BM, int BN, int WM, int WN, int STAGES, bool DOWN, bool MX>\n{}",
+        "template <int N, int K, int NW, int BM, int BN, int WM, int WN, int STAGES, bool DOWN, bool MX, int PL>\n{}",
         prim::device(
             "void",
             "moe_gemm_f4",
-            "const unsigned char* w0, const unsigned char* s0, const float* g0, const unsigned char* w1, const unsigned char* s1,\n                                            const float* g1, const float* bias, float inv_in, const unsigned char* aq, const unsigned char* as, const int* offsets, const int* sorted,\n                                            const int* tile_map, float* out",
+            "const unsigned char* w0, const unsigned char* s0, const float* g0, const unsigned char* w1, const unsigned char* s1,\n                                            const float* g1, const float* bias, float inv_in, const unsigned char* aq, const unsigned char* as, const unsigned char* aq2, const unsigned char* as2, const int* offsets, const int* sorted,\n                                            const int* tile_map, float* out",
             &format!("{}{}{}{}{}{}", geometry(), tile_setup(), load_stage(), prologue(), mainloop(), epilogue())
         )
     )
@@ -296,22 +323,26 @@ fn gemm() -> String {
 
 const ARGS: &str = "const unsigned char* gw, const unsigned char* gs, const float* gg, const unsigned char* uw, const unsigned char* us, const float* ug, const float* bias, float inv_in,\n    const unsigned char* aq, const unsigned char* as, const int* offsets, const int* sorted, const int* tile_map, float* out";
 
-fn variant(name: &str, tile: &str, mx: bool) -> String {
-    prim::delegate(
-        128,
-        name,
-        ARGS,
-        &format!("moe_gemm_f4<{tile}, {mx}>"),
-        "gw, gs, gg, uw, us, ug, bias, inv_in, aq, as, offsets, sorted, tile_map, out",
-    )
+const ARGS_MX: &str = "const unsigned char* gw, const unsigned char* gs, const float* gg, const unsigned char* uw, const unsigned char* us, const float* ug, const float* bias, float inv_in,\n    const unsigned char* aq, const unsigned char* as, const unsigned char* aq2, const unsigned char* as2, const int* offsets, const int* sorted, const int* tile_map, float* out";
+
+fn variant(name: &str, tile: &str, mx: bool, planes: usize) -> String {
+    let (args, call) = if mx {
+        (ARGS_MX, "gw, gs, gg, uw, us, ug, bias, inv_in, aq, as, aq2, as2, offsets, sorted, tile_map, out")
+    } else {
+        (ARGS, "gw, gs, gg, uw, us, ug, bias, inv_in, aq, as, aq, as, offsets, sorted, tile_map, out")
+    };
+    prim::delegate(128, name, args, &format!("moe_gemm_f4<{tile}, {mx}, {planes}>"), call)
 }
 
 fn variants(out: &mut String, mx: bool) {
     let stem = if mx { "moe_mma_mx" } else { "moe_mma" };
-    out.push_str(&variant(&format!("{stem}_up"), "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false", mx));
-    out.push_str(&variant(&format!("{stem}_up_s"), "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 3, false", mx));
-    out.push_str(&variant(&format!("{stem}_down"), "HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true", mx));
-    out.push_str(&variant(&format!("{stem}_down_s"), "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 3, true", mx));
+    let planes: &[(usize, &str)] = if mx { &[(1, ""), (2, "2")] } else { &[(1, "")] };
+    for &(p, tag) in planes {
+        out.push_str(&variant(&format!("{stem}_up{tag}"), "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false", mx, p));
+        out.push_str(&variant(&format!("{stem}_up{tag}_s"), "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 3, false", mx, p));
+        out.push_str(&variant(&format!("{stem}_down{tag}"), "HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true", mx, p));
+        out.push_str(&variant(&format!("{stem}_down{tag}_s"), "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 3, true", mx, p));
+    }
 }
 
 fn scale_helpers() -> String {
@@ -336,6 +367,9 @@ pub fn grouped(mx: bool) -> String {
     let mut out = String::new();
     out.push_str(constants());
     out.push_str(&prim::e2m1x2("moe_e2m1x2"));
+    if mx {
+        out.push_str(&prim::e2m1_to_f32("moe_deq_e2m1"));
+    }
     out.push_str(&scale_helpers());
     out.push_str(&if mx { quant_mx() } else { quant_f32() });
     out.push_str(&tiles("moe_tiles"));

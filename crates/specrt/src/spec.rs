@@ -786,6 +786,10 @@ pub struct Mlp {
     pub quant_until: Option<usize>,
     #[serde(default, skip_serializing_if = "ActQuant::is_none")]
     pub act_quant: ActQuant,
+    #[serde(default = "one_plane", skip_serializing_if = "is_one_plane")]
+    pub up_act_planes: u8,
+    #[serde(default = "one_plane", skip_serializing_if = "is_one_plane")]
+    pub down_act_planes: u8,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fused_gate_up: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -868,6 +872,14 @@ impl Mtp {
     pub fn new(layers: usize) -> Mtp {
         Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None, graph: false, head_quant: None }
     }
+}
+
+fn one_plane() -> u8 {
+    1
+}
+
+fn is_one_plane(n: &u8) -> bool {
+    *n == 1
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -1622,6 +1634,8 @@ impl Spec {
                 quant: mlp_quant.map(|m| m.0),
                 quant_until: mlp_quant.and_then(|m| m.1),
                 act_quant: mlp_act,
+                up_act_planes: 1,
+                down_act_planes: 1,
                 fused_gate_up: family.mlp.fused_gate_up,
                 gated: match &family.mlp.gated {
                     Some(g) => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
@@ -1698,6 +1712,14 @@ impl Spec {
                 "[mlp] act_quant = \"fp8\" is for mixture-of-experts with fp8_block128 experts; dense FP8 MLP inputs follow the top-level act_quant"
             ),
         }
+        ensure!(
+            (1..=2).contains(&self.mlp.up_act_planes) && (1..=2).contains(&self.mlp.down_act_planes),
+            "[mlp] up_act_planes and down_act_planes are 1 or 2"
+        );
+        ensure!(
+            (self.mlp.up_act_planes == 1 && self.mlp.down_act_planes == 1) || self.moe.as_ref().and_then(|m| m.expert_block).is_some_and(|b| b.native_mma()),
+            "[mlp] up_act_planes and down_act_planes = 2 need a 32 wide e2m1 e8m0 [moe] expert_block"
+        );
         if let Some(m) = &self.rope.mrope {
             ensure!(
                 m.section.iter().sum::<usize>() == self.rotary_dim() / 2,
