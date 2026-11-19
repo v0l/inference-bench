@@ -68,7 +68,7 @@ fn probabilities() -> &'static str {
     } else {
         float m = NEG_INF;
         for (int e = lane; e < MOE_E; e += 32) m = fmaxf(m, lg[e]);
-        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+        m = warp_max(m);
         float s = 0.0f;
         for (int e = lane; e < MOE_E; e += 32) {
             float p = expf(lg[e] - m);
