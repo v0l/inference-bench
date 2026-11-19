@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 const SINKS: &str = "tiny-sinks";
 const CHUNKED: &str = "tiny-chunked";
+const MLA: &str = "tiny-deepseek-v2";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -87,6 +88,41 @@ fn close(name: &str, tolerance: f32) {
     let got = rt.generate_batch(std::slice::from_ref(&tokens), greedy.len()).unwrap();
     assert_eq!(got.tokens[0], greedy, "{name} decode greedy");
     let _ = Sampling::GREEDY;
+}
+
+#[test]
+fn the_deepseek_config_becomes_a_latent_cache_and_mla_nodes_from_the_family_toml() {
+    let spec = spec(MLA);
+    assert_eq!(spec.state.len(), 1);
+    let latent = specrt::state::named(&spec, "latent").unwrap();
+    assert_eq!(latent.dims(&spec).unwrap(), vec![1, 96 + 32]);
+    assert_eq!(specrt::runtime::kv_block_bytes(&spec, 1), 4 * 128 * 2 * 16);
+    assert_eq!(specrt::anatomy::ModelAnatomy::new(&spec, 0, None).kv_bytes_per_token, 4 * 128 * 2);
+    assert_eq!(spec.qkv_rows(), 4 * 64 + 96 + 32);
+    assert_eq!(spec.o_dim(), 4 * 64);
+    assert!((spec.attention.params["softmax_scale"] - 1.0 / 64f64.sqrt()).abs() < 1e-12);
+    let prefill = Plan::build(&spec, Phase::Prefill, true);
+    assert!(!prefill.layer(Block::Dense).contains(&Op::Flash));
+    assert!(!kernel_nodes(&spec, Phase::Decode).is_empty());
+    let ops = Plan::build(&spec, Phase::Decode, true);
+    assert_eq!(ops.layer(Block::Dense).iter().filter(|o| matches!(o, Op::Kernel { .. })).count(), 7);
+}
+
+#[test]
+fn the_mla_module_builds_with_no_binary_support() {
+    let module = specrt::codegen::Module::generate_kv(&spec(MLA), 256, 1, &kir::Target::sm_120()).unwrap();
+    for k in ["mla_latent_norm", "mla_rope_q", "mla_rope_k", "mla_latent_write", "mla_absorb_q", "mla_attention", "mla_expand_v"] {
+        assert!(module.kernels.contains(&k), "{k}");
+        assert!(module.source.contains(&format!("{k}(")), "{k}");
+    }
+    assert!(module.source.contains("float a = v[2 * i];"), "the rope is pair style");
+    assert!(module.source.contains("constexpr int QK = 128;") && module.source.contains("constexpr int VD = 96;"), "split QK and V widths");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn mla_absorbed_over_the_latent_cache_matches_transformers() {
+    close(MLA, 5e-2);
 }
 
 #[test]

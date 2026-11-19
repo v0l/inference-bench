@@ -1,0 +1,110 @@
+name = "deepseek_v2"
+kind = "family"
+min_engine = 10
+extends = "base"
+
+[match]
+model_types = ["deepseek_v2"]
+architectures = ["DeepseekV2ForCausalLM"]
+
+[norm]
+unit_offset = false
+
+[attention]
+o_cols = "heads * v_head_dim"
+
+[[attention.projection]]
+tensor = "q_proj"
+rows = "heads * (qk_nope_head_dim + qk_rope_head_dim)"
+
+[[attention.projection]]
+tensor = "kv_a_proj_with_mqa"
+rows = "kv_lora_rank + qk_rope_head_dim"
+
+[attention.scratch]
+q_latent = "heads * kv_lora_rank"
+o_latent = "heads * kv_lora_rank"
+
+[attention.params]
+kv_lora_rank = { config = "kv_lora_rank" }
+qk_nope_head_dim = { config = "qk_nope_head_dim" }
+qk_rope_head_dim = { config = "qk_rope_head_dim" }
+v_head_dim = { config = "v_head_dim" }
+yarn_factor = { config = "rope_parameters.factor", default = 1.0 }
+mscale_all_dim = { config = "rope_parameters.mscale_all_dim", default = 0.0 }
+yarn_mscale = { expr = "select(yarn_factor > 1.0 && mscale_all_dim > 0.0, 0.1 * mscale_all_dim * log(yarn_factor) + 1.0, 1.0)" }
+softmax_scale = { expr = "yarn_mscale * yarn_mscale * rsqrt(qk_nope_head_dim + qk_rope_head_dim)" }
+
+[[state]]
+name = "latent"
+per = "token"
+layers = "attention"
+shape = ["1", "kv_lora_rank + qk_rope_head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_latent_norm"
+grid = ["rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+out = { buffer = "qkv" }
+weight = { weight = "kv_a_layernorm.weight", len = "kv_lora_rank" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_rope_q"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_rope_k"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_latent_write"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+src = { buffer = "qkv" }
+dst = { state = "latent" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_absorb_q"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+w = { weight = "kv_b_proj.weight", len = "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank" }
+y = { buffer = "q_latent" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_attention"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+k_cache = { state = "latent" }
+v_cache = { state = "latent" }
+q_latent = { buffer = "q_latent" }
+out = { buffer = "o_latent" }
+softmax_scale = "softmax_scale"
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_expand_v"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "o_latent" }
+w = { weight = "kv_b_proj.weight", len = "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank" }

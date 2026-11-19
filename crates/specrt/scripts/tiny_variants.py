@@ -13,6 +13,7 @@ FIXTURES = Path(__file__).parent.parent / "tests/fixtures"
 
 SINKS = "tiny-sinks"
 CHUNKED = "tiny-chunked"
+MLA = "tiny-deepseek-v2"
 WINDOW = 16
 SOFTCAP = 8.0
 CHUNK = 16
@@ -107,6 +108,38 @@ def build_chunked_config():
     )
 
 
+def build_mla_config():
+    from transformers import DeepseekV2Config
+
+    return DeepseekV2Config(
+        vocab_size=512,
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        q_lora_rank=None,
+        kv_lora_rank=96,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        first_k_dense_replace=4,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        n_shared_experts=2,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        eos_token_id=None,
+        bos_token_id=None,
+        pad_token_id=None,
+        attn_implementation="eager",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+
+
 def weights(model):
     g = torch.Generator().manual_seed(SEED)
     out = {}
@@ -126,7 +159,12 @@ def weights(model):
 def make(name):
     from safetensors.torch import load_file, save_file
 
-    if name == SINKS:
+    if name == MLA:
+        from transformers import DeepseekV2ForCausalLM as Model
+
+        cfg = build_mla_config()
+        extra = {}
+    elif name == SINKS:
         import transformers.models.qwen3.modeling_qwen3 as modeling
         from transformers import Qwen3ForCausalLM as Model
 
@@ -166,7 +204,7 @@ def make(name):
 def main(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    for name in (SINKS, CHUNKED):
+    for name in (SINKS, CHUNKED, MLA):
         model = make(name)
         g = torch.Generator().manual_seed(SEED + 3)
         ids = torch.randint(0, 512, (PROMPT,), generator=g)

@@ -1,0 +1,50 @@
+{
+  "name": "deepseek_v2",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 256,
+    "intermediate": 512,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 4,
+    "head_dim": 32,
+    "qkv_bias": false,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 8,
+    "active": 2,
+    "expert_intermediate": 256,
+    "shared_intermediate": 512,
+    "dense_layers": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "norm_topk": false,
+    "shared_gate": true
+  }
+}
