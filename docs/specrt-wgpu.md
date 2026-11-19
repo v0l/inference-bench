@@ -455,3 +455,25 @@ The script now runs `sudo purge` before every specrt and llama.cpp run (`PURGE=0
 | Qwen2.5-7B Q4_K_M | 161.0 / 274.0 = 0.588 | 156.3 / 269.2 = 0.581 | 20.4 / 28.0 = 0.729 |
 
 Decode is at 0.7 or better on every cell. Prefill is unchanged at 0.50 to 0.61 and misses 0.7 everywhere. Script 7B load 5.48 s.
+
+## Mac speed work 8 (#829)
+
+### 1. Hand MSL against naga's MSL for `linear_coop_q4k`
+
+Harness: `~/git/msl825` on the Mac (`msl825` runs naga 30.0.2 over a WGSL file, `run2` times the result at m=4096 n=512 k=14336 with Q4_K rows, `mb2` times the hand kernels). The WGSL comes from `KIR_DUMP_COOP=f.wgsl KIR_DUMP_VARIANT=q4k cargo test -p inference-bench-kir --test prims dump_linear_coop -- --ignored`. The naga run is made with the same options the engine uses (unchecked bounds, no workgroup zero-fill, no loop bounding); with the wgpu defaults it is 1.47 TFLOP/s, with the engine options 2.16. Hand MSL (`mb2`, dense half A, f32 B, no dequant) on the same quiet Mac: f32 64x32 tile 3.25, f32 64x32 with transposed B load 3.08, half 64x32 3.56, half 64x64 3.77. naga `linear_coop_bf16` (dense, closest to the hand kernel) 2.38 to 2.47, `q4k` 2.16, `q6k` 2.30.
+
+| # | Hand MSL (`kernel_mul_mm` shape) | naga MSL for `linear_coop_q4k` | Cost or note |
+|---|---|---|---|
+| 1 | tile 64 rows x 32 tokens, 8 accumulators (2x4 of 8x8) per simdgroup, a 64x64 f32 tile spills (394 ms) | tile 64x64, 16 accumulators per simdgroup (`acc0_..acc15_`) | naga tile is twice the work per barrier but half the occupancy; the 64x32 hand tile is the fast f32 shape |
+| 2 | one barrier before the loads and one after them, per k step of 32 | `threadgroup_barrier` after the load phase and again after the mma phase: 2 per k step, plus 1 before the epilogue | same count |
+| 3 | `float4` load of 4 x values, 4 scalar stores into the block layout | `float4` load from `x` (one `metal::float4` read), 4 scalar `sh.inner[so+i]` stores | same |
+| 4 | tile offset `so` computed with shifts and masks from constants | `so` built with `naga_div(m, 8u)`, `naga_mod(m, 8u)`, `naga_div(kq*4u, 8u)`, `naga_mod(kq*4u, 8u)`: 29 `naga_div`/`naga_mod` calls in the file, each `lhs / select(rhs, 1u, rhs == 0u)`; the divisors are literals so the compiler folds the select, the cost is not measurable | none after folding |
+| 5 | A and B fragments loaded with `simdgroup_load(m, ptr, 8, 0, false)` at pointer offsets that are compile time multiples of 64 | `NagaCooperativeLoad(&sh.inner[((naga_div(sm + 8u, 8u) * 4u) + naga_div(kk, 8u)) * 64u], 8u, flag)` where `sm` is a runtime value and `kk` the loop variable | address maths is per fragment, 8 loads per kk step, not hoisted unless Metal proves `sm` is a multiple of 8 (it is a runtime `sg` shift) |
+| 6 | the B tile is read with `is_row_major=false`; the hand variant with the transposed flag measured 3.08 against 3.25 | B is loaded `coopLoad` with `true` (transposed), A with `false` | -5% in the hand harness; the flags follow from the WGSL `coopLoad` vs `coopLoadT` on the two sides |
+| 7 | weights widened with `(S)ap[k0+i]` straight from a `half*` | Q4_K dequant per 4-weight quad: `scale_min_k4_` (3 `wbyte` calls, each a `wdata[i>>2]` load and shift, called as a function with `device` refs), 2 `wf16_` (each `whalf` load plus `half2` cast), then 4 `fma`-style scalar ops | the real cost; the bf16 kernel (no scale decode) reaches 2.4 against 2.16 for q4k, so the dequant is 10% |
+| 8 | no bounds guards | `if (t < tokens)` then `local = c < cols`, `if (c < cols)`, and a clamped (`min`) `rows[]` read per quad | ablated in #825, 2% |
+| 9 | stores `simdgroup_store` straight to `C` | same direct store when the tile is full, else a store to `sh`, a barrier and a guarded scalar copy loop | the full-tile path is identical |
+| 10 | no loop counters | `while(true)` with `loop_bound` (when `force_loop_bounding`), 5 loops; off in the engine | off |
+| 11 | `half` tiles for A and B: a 64x64 tile fits and gives 3.77 | f32 tiles only | the largest hand win; naga needs `f16` workgroup memory and f16 `coop_mat8x8`, see step 3 |
+
+Instruction-by-instruction, the naga kernel has the same operations as the hand one in the matrix phase (8 `simdgroup_load`, 16 `simdgroup_multiply_accumulate` per kk step against 4+2 loads and 8 mma). The gap is therefore explained by the tile shape (row 1), the f32 against half storage (row 11), and the dequant (row 7). Rows 4, 8 and 10 are folded or off. The WGSL experiments in the next section follow this order.
