@@ -248,7 +248,9 @@ impl Gguf {
         let file = std::fs::File::open(path).with_context(|| path.display().to_string())?;
         let map = unsafe { Mmap::map(&file)? };
         #[cfg(unix)]
-        let _ = map.advise(memmap2::Advice::WillNeed);
+        if std::env::var_os("SPECRT_NO_MADVISE").is_none() {
+            let _ = map.advise(memmap2::Advice::WillNeed);
+        }
         Self::parse(Backing::Map(map), false).with_context(|| path.display().to_string())
     }
 

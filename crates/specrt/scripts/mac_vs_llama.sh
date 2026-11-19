@@ -43,12 +43,20 @@ load_note() {
   echo "swap: $(sysctl -n vm.swapusage)"
 }
 
+cold() {
+  if [ "${PURGE:-1}" = 1 ]; then
+    sudo -n purge 2>/dev/null || true
+  fi
+}
+
 run_specrt() {
+  cold
   local m=$1 tag=$2 runs=$3 lens=$4
   SPECRT_BENCH_RUNS=$runs /usr/bin/time -l "$SRC/target/release/bench" --wgpu "$HOME/models/$m.gguf" "$lens" 128 > "$OUT/$tag.specrt.txt" 2>&1
 }
 
 run_llama() {
+  cold
   local m=$1 tag=$2 lens=$3
   /usr/bin/time -l "$LLAMA/build/bin/llama-bench" -m "$HOME/models/$m.gguf" -ngl 99 -p "$lens" -n 128 -r 3 -o json > "$OUT/$tag.llama.txt" 2>&1
   /usr/bin/time -l "$LLAMA/build/bin/llama-bench" -m "$HOME/models/$m.gguf" -ngl 99 -p 1 -n 0 -r 1 -o json > "$OUT/$tag.llama-load.txt" 2>&1
