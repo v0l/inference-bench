@@ -31,6 +31,7 @@ const REQUIRED: [(&str, Scalar, Role, Access); 12] = [
 pub enum Stage {
     Epilogue { dst: String, expr: Expr },
     Mask { expr: Expr },
+    Select { index: String, row: u32 },
     Softmax { value: String, sink: Option<String> },
 }
 
@@ -141,6 +142,17 @@ impl Scan {
                 return Err(format!("scan constant {:?} is not usable", c.name));
             }
         }
+        for st in &self.stages {
+            if let Stage::Select { index, row } = st {
+                match params.iter().find(|p| p.name == index) {
+                    Some(p) if p.ty == Scalar::I32 && p.role == Role::Activation && p.access == Access::Read => {}
+                    _ => return Err(format!("select_from index {index:?} must be an i32 activation read param")),
+                }
+                if *row == 0 {
+                    return Err("select_from needs a positive row width".into());
+                }
+            }
+        }
         let softmaxes = self.stages.iter().filter(|s| matches!(s, Stage::Softmax { .. })).count();
         if softmaxes != 1 || !matches!(self.stages.last(), Some(Stage::Softmax { .. })) {
             return Err("a scan needs exactly one online_softmax, as its last stage".into());
@@ -230,6 +242,9 @@ impl Scan {
                         lines.push(format!("if (!({text})) continue;"));
                     }
                 }
+                Stage::Select { index, row } => lines.push(format!(
+                    "{{ bool sel_hit = false; for (int sel_j = lane; sel_j < {row}; sel_j += 32) sel_hit |= {index}[(size_t)row * {row} + sel_j] == t; if (!__any_sync(0xffffffff, sel_hit)) continue; }}"
+                )),
                 Stage::Softmax { value: v, .. } => {
                     if !env.iter().any(|(k, _)| k == v) {
                         return Err(format!("online_softmax of unknown value {v:?}"));

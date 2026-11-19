@@ -1,0 +1,224 @@
+name = "glm_moe_dsa"
+kind = "family"
+min_engine = 12
+extends = "deepseek_v2"
+
+[match]
+model_types = ["glm_moe_dsa"]
+architectures = ["GlmMoeDsaForCausalLM"]
+
+[blocks]
+types_key = "indexer_types"
+
+[blocks.layer_types]
+full = "full"
+shared = "shared"
+
+[moe]
+router = "sigmoid"
+score_bias = true
+
+[[attention.projection]]
+tensor = "q_a_proj"
+rows = "q_lora_rank"
+
+[[attention.projection]]
+tensor = "kv_a_proj_with_mqa"
+rows = "kv_lora_rank + qk_rope_head_dim"
+
+[[attention.projection]]
+tensor = "indexer.wk"
+rows = "index_head_dim"
+layers = ["full"]
+
+[[attention.projection]]
+tensor = "indexer.weights_proj"
+rows = "index_heads"
+layers = ["full"]
+
+[attention.scratch]
+q_latent = "heads * kv_lora_rank"
+o_latent = "heads * kv_lora_rank"
+qr = "heads * (qk_nope_head_dim + qk_rope_head_dim)"
+index_q = "index_q_row"
+
+[attention.int_scratch]
+index_buf = "index_topk"
+
+[attention.params]
+q_lora_rank = { config = "q_lora_rank" }
+index_heads = { config = "index_n_heads" }
+index_head_dim = { config = "index_head_dim" }
+index_topk = { config = "index_topk" }
+index_q_row = { expr = "index_heads * index_head_dim" }
+index_w_offset = { expr = "q_lora_rank + kv_lora_rank + qk_rope_head_dim + index_head_dim" }
+index_scale = { expr = "rsqrt(index_head_dim)" }
+index_w_scale = { expr = "rsqrt(index_heads)" }
+
+[[state]]
+name = "latent"
+per = "token"
+layers = "attention"
+shape = ["1", "kv_lora_rank + qk_rope_head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "index_key"
+per = "token"
+layers = "attention"
+shape = ["1", "index_head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_q_norm"
+grid = ["rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+out = { buffer = "qkv" }
+weight = { weight = "q_a_layernorm.weight", len = "q_lora_rank" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_latent_norm"
+grid = ["rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+out = { buffer = "qkv" }
+weight = { weight = "kv_a_layernorm.weight", len = "kv_lora_rank" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_q_b"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+w = { weight = "q_b_proj.weight", len = "q_lora_rank * heads * (qk_nope_head_dim + qk_rope_head_dim)" }
+y = { buffer = "qr" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_rope_q"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qr" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_rope_k"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_latent_write"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+src = { buffer = "qkv" }
+dst = { state = "latent" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_absorb_q"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qr" }
+w = { weight = "kv_b_proj.weight", len = "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank" }
+y = { buffer = "q_latent" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_index_q"
+grid = ["1", "rows"]
+layers = ["full"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+w = { weight = "indexer.wq_b.weight", len = "q_lora_rank * index_q_row" }
+y = { buffer = "index_q" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_index_rope_q"
+grid = ["index_heads", "rows"]
+layers = ["full"]
+
+[attention.node.bind]
+x = { buffer = "index_q" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_index_k_norm"
+grid = ["1", "rows"]
+layers = ["full"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+w = { weight = "indexer.k_norm.weight", len = "index_head_dim" }
+b = { weight = "indexer.k_norm.bias", len = "index_head_dim" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_index_rope_k"
+grid = ["1", "rows"]
+layers = ["full"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_index_write"
+grid = ["1", "rows"]
+layers = ["full"]
+
+[attention.node.bind]
+src = { buffer = "qkv" }
+dst = { state = "index_key" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_index_topk"
+grid = ["1", "rows"]
+layers = ["full"]
+
+[attention.node.bind]
+q = { buffer = "index_q" }
+w = { buffer = "qkv" }
+keys = { state = "index_key" }
+idx = { buffer = "index_buf" }
+scale = "index_scale"
+w_scale = "index_w_scale"
+
+[[attention.node]]
+op = "kernel"
+kernel = "dsa_attention"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+qr = { buffer = "qr" }
+q_latent = { buffer = "q_latent" }
+idx = { buffer = "index_buf" }
+k_cache = { state = "latent" }
+v_cache = { state = "latent" }
+out = { buffer = "o_latent" }
+softmax_scale = "softmax_scale"
+
+[[attention.node]]
+op = "kernel"
+kernel = "mla_expand_v"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "o_latent" }
+w = { weight = "kv_b_proj.weight", len = "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank" }

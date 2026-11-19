@@ -1,0 +1,1 @@
+| gguf-q8 | `Qwen3-0.6B-Q8_0.gguf` | 204.2 | 23534.0 | 882.4 | llama.cpp | 236.5 | 20147.6 | 1252.9 | 0.86 | 1.17 | 0.70 | 2026-11-19 | d29bb13 | `crates/specrt/scripts/perfpass.sh gguf-q8 --model /home/kieran/ib-gates/803/models/Qwen3-0.6B-Q8_0.gguf --host spark` |

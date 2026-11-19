@@ -215,7 +215,29 @@ tiny-deepseek-v2 prefill max_abs 0.00039076805, greedy decode tokens equal
 
 Not covered: the fixture's MLP is dense, because V2 MoE (two shared experts wider than the routed ones) does not load yet (#830); the real DeepSeek-V2-Lite is about 31 GB in bf16, over the Spark budget. The MLA kernels are scalar, correct rather than fast.
 
-## 10. Status of slice (e)
+## 10. Status of slice (d)
+
+Plumbing, variant free:
+
+- `kir::recur`, family `recurrence`: a per-head state matrix `[keys][values]` kept in registers across the rows of one sequence (`ksplit` threads share a value column). `[[input]]` reads a key vector, a value vector or a scalar per row (with `per` for grouped heads). Stages: `key` (per key channel), `key_sum` (a reduction over keys), `scalar`, `value`, `decay` (state times a key expression, per channel or scalar), `update` (rank one `key x value`), `read` (`state^T key`), `store`. The state is a spec `[[state]]` binding, indexed by sequence slot and linear layer. One kernel serves prefill (`rows_per_seq` = chunk) and batched decode (one row per slot).
+- `seq_conv` (causal depthwise conv with the tail kept in a per sequence state, activation as an expression) and `group_norm` (grouped RMS norm with input and output expressions, written as split planes).
+- Expressions gain `softplus`.
+- `[mixer]` in a family or model spec: `module`, `[[mixer.projection]]` (the fused in projection), `out_tensor`, `out_cols`, `[mixer.params]` (from `config.json`, `expr` allowed), `[mixer.scratch]` and `[[mixer.node]]` kernel nodes. Nodes bind `{ buffer = "mix" | scratch }`, `{ state = name }`, weights under the module and params; grids take `rows`, `seqs`, numbers or params. `graphs/decoder.toml` has a `mixer` block (norm, `mix_in`, the nodes, `mix_out`, MLP) and the delta-net blocks run only without a mixer.
+- State kind: per sequence `[[state]]` tables on the linear layers become one `StatePool` each with the `checkpoint` rule. Acquire, release, reset, snapshot (prefix cache and session park) and restore walk the declared states, so prefix caching and swap work for any described recurrence.
+- `[blocks] attention_indices_key` builds the layer pattern from a list of attention layer indices, and `[tensors]` renames checkpoint tensor name fragments (`.feed_forward.` to `.mlp.`). `SPEC_FORMAT` 11.
+
+The variants (no Rust): `specs/family-bamba.toml` with `mamba2_conv`, `mamba2_scan` (`h = exp(-exp(A_log) dt) h + dt x B`, `y = C h + D x`, grouped B and C) and `mamba2_gated_norm`; `specs/kda_recurrence.toml`, the glm5_next KDA delta rule with a per key channel lower bounded forget gate and L2 normalised q and k.
+
+Proof (`tests/mamba.rs`, fixture `tiny-bamba`, reference `scripts/tiny_mamba.py`, transformers `BambaForCausalLM` with random weights), Spark GB10, release:
+
+```text
+tiny-bamba prefill max_abs 0.0005235672, argmax agree 96/96, greedy decode tokens equal
+kda_recurrence vs host delta rule: out max_abs 7.5e-9, state max_abs 4.5e-8
+```
+
+Not covered: the scan is the recurrent form for prefill as well (no intra chunk mma, so long prefill is serial per head); the fused decode and prefill step, MTP, tensor parallel and wgpu refuse a mixer; glm5_next as a whole also needs MLA, the DSA indexer and hyper connections (slices c and e).
+
+## 11. Status of slice (e)
 
 Done, variant free:
 
@@ -234,7 +256,7 @@ Second pass (same slice):
 - **Biases.** `[attention] o_bias`, `[moe] router_bias` and `expert_bias` (router module name via `router_module`). The expert biases enter the gemv and grouped kernels before the gated expression; the router bias is added to the logits in `moe_route_logits`. The mma path is NVFP4 only and does not take expert biases.
 - **Hash layers.** `[moe] hash_table = "tid2eid"` with `num_hash_layers` from `config.json`: the first N sparse layers read experts from an `[vocab, top_k]` table indexed by the token id (`lookup`), and weight them by the router scores. `MoeShape.hash` selects the code; the table is a per layer checkpoint tensor. `tests/moe_route.rs` runs the real kernel on the GPU against a host reference.
 - **gather, scatter, lookup stages** in `family = "compose"`: `index` names a read i32 param; rows are addressed by the index buffer instead of the block id. CUDA only, errors name the param. `crates/kir/tests/compose.rs`.
-- **DSA indexer.** `family = "index_topk"` (`specs/dsa_index_topk.toml`): relu index scores weighted per head, then top-k per query row into an i32 buffer (`-1` for unused slots). A later layer shares the selection by binding the same buffer. `tests/index_topk.rs` checks the order against a host reference. Wiring it in front of the MLA scan (indexer projections, key cache, masked scan) is the part of GLM-5 left.
+- **DSA indexer.** `family = "index_topk"` (`specs/dsa_index_topk.toml`): relu index scores weighted per head, then top-k per query row into an i32 buffer (`-1` for unused slots). A later layer shares the selection by binding the same buffer. `tests/index_topk.rs` checks the order against a host reference. Wired into MLA in the next section.
 - **tiny gpt-oss** (`tests/fixtures/tiny-gpt-oss`, `specs/family-gpt_oss.toml`): sinks with sliding window, biased attention, router bias, top-2 softmax weights, clamped SwiGLU with alpha, MXFP4 experts. Transformers `GptOssForCausalLM` is the reference; its experts are dequantised from the same blocks.
 
 ```text
@@ -244,3 +266,21 @@ gpt_oss_sinks_clamped_swiglu_and_mxfp4_experts_match_transformers ... ok   (Spar
 `plan.rs` now asks the spec for the expert tensors (`Spec::expert_tensors`), so `plan_rs_has_no_architecture_or_op_sequence_knowledge` passes unchanged.
 
 Not done, filed separately: V4 compressed sparse attention and native block-scaled mma for MXFP4 experts.
+
+## 12. DSA indexer in MLA (#875)
+
+`specs/family-glm_moe_dsa.toml` (`SPEC_FORMAT` 12) extends `deepseek_v2` with q_lora_rank MLA and the sparse indexer, all as spec plus kir:
+
+- `[blocks] types_key = "indexer_types"` builds the layer pattern from a config list; `shared` is a block kind beside `full`. `[[attention.node]]` and `[[attention.projection]]` take `layers = [...]`, so the indexer nodes and its `wk` and `weights_proj` rows exist only on `full` layers (the shared layer's rows are zero). The plan is built per layer kind when any node declares `layers`.
+- Indexer nodes: `dsa_index_q` (`wq_b` on the q residual), `dsa_index_rope_q` and `dsa_index_rope_k` (interleaved rope on the rope slice), `dsa_index_k_norm` (new row family `layernorm_segment`, mean and variance with weight and bias), `dsa_index_write` (a per layer key `[[state]]` `index_key`, `dim = index_head_dim`, written with `state_write`), `dsa_index_topk`.
+- `index_topk` reads the paged `index_key` state (bf16 planes) and takes `scale` (`index_head_dim^-0.5`) and `w_scale` (`index_n_heads^-0.5`) as per node values.
+- The shared index buffer is `[attention.int_scratch] index_buf`: one i32 buffer per row, written only by `full` layers and read by every layer's scan, so a `shared` layer reuses the last `full` layer's selection.
+- The scan stage `select_from` (`index`, `row`) keeps a key only if its position is in the row's index buffer. `dsa_attention` is the MLA latent scan with that stage; `-1` slots never match.
+- `[attention.params]` entries can be grid symbols.
+
+Proof (Spark GB10, release, `tests/variants.rs`, fixture `tiny-glm-dsa` from `scripts/tiny_variants.py`: 2 layers, one full and one shared, top-k 8 over a 64 token prompt, dense MLP, transformers `GlmMoeDsaForCausalLM`):
+
+```text
+tiny-glm-dsa prefill max_abs 0.00038290024, greedy decode tokens equal
+the_indexer_selects_the_reference_top_k_per_row_from_the_paged_key_cache ... ok
+```

@@ -7,6 +7,7 @@ struct Flags {
     runs: usize,
     serve: bool,
     profile: bool,
+    fp8_act: bool,
     kv_gb: Option<f64>,
 }
 
@@ -21,12 +22,13 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, profile: false, kv_gb: None };
+    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--serve" => f.serve = true,
             "--profile" => f.profile = true,
+            "--fp8-act" => f.fp8_act = true,
             "--runs" | "--kv-gb" => {
                 let name = args.remove(i);
                 anyhow::ensure!(i < args.len(), "{name} needs a value");
@@ -52,9 +54,12 @@ fn load_spec(path: &Path) -> Result<Spec> {
     }
     if path.is_dir() {
         let config = std::fs::read_to_string(path.join("config.json")).with_context(|| path.display().to_string())?;
-        let mut spec = Spec::from_hf_config(&config)?;
+        let mut spec = Spec::from_hf_config_serving(&config)?;
         spec.name = path.file_name().and_then(|n| n.to_str()).unwrap_or("checkpoint").to_string();
         spec.repo = path.display().to_string();
+        if flags().fp8_act {
+            spec.mlp.act_quant = specrt::spec::ActQuant::Fp8;
+        }
         return Ok(spec);
     }
     Spec::load(path)

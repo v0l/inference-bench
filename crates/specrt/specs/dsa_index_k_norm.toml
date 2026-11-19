@@ -1,0 +1,29 @@
+kind = "kir-kernel"
+family = "layernorm_segment"
+name = "dsa_index_k_norm"
+threads = 64
+
+[args]
+width = "index_head_dim"
+row = "qkv_row"
+head = 0
+offset = "q_lora_rank + kv_lora_rank + qk_rope_head_dim"
+eps = 1e-6
+
+[[param]]
+name = "x"
+type = "f32"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "w"
+type = "f32"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "b"
+type = "f32"
+role = "weight"
+access = "read"

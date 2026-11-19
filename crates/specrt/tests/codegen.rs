@@ -27,14 +27,13 @@ const PRIM_LIBRARY_ATTENTION: &[(&str, &str)] = &[
 ];
 
 const VERBATIM_QUANT: &[(&str, &str)] = &[
-    ("cuda/gemm/fp4.rs", "DecFp4 struct shell and trait constants stay text; load, frag, rows, finish, cp_async4 and fp4_pair_bf16 are prim built (#867, rest #887)"),
-    ("cuda/ggml/decode.rs", "gg_f16 and byte readers stay text; dequant8, row dot, rows and the format math are generated in ggml/dequant.rs and ggml/rowmath.rs (#867, rest #887)"),
     ("cuda/gemm/prim.rs", "the prim library itself"),
 ];
 
 const VERBATIM_MOE: &[(&str, &str)] = &[
     ("cuda/moe/route.rs", "top-k routing, permute, combine are MoE-specific; the logits block sum keeps its warp-sum plus smem loop because block_reduce adds a __syncthreads and changes the PTX"),
     ("cuda/moe/gemv.rs", "expert row dots read per-expert fp4/fp8/bf16 rows; porting onto the shared row dots changes the PTX (#793)"),
+    ("cuda/moe/mma8.rs", "FP8 e4m3 mma wrapper and per-32 activation quantise are single-use text; shared tile setup, tiles and pipeline prims are reused (#899)"),
     ("cuda/moe/prim.rs", "re-exports the shared gemm prims plus MoE constants and launch wrappers"),
 ];
 

@@ -9,6 +9,7 @@ from torch import nn
 
 SEED = 0
 PROMPT = 96
+DSA_PROMPT = 64
 GREEDY = 32
 FIXTURES = Path(__file__).parent.parent / "tests/fixtures"
 
@@ -18,6 +19,7 @@ MLA = "tiny-deepseek-v2"
 MLA_MOE = "tiny-deepseek-v2-moe"
 GLM = "tiny-glm4-moe"
 OSS = "tiny-gpt-oss"
+DSA = "tiny-glm-dsa"
 HASH = "tiny-hash-glm4-moe"
 V4 = "tiny-deepseek-v4-attention"
 WINDOW = 16
@@ -179,6 +181,42 @@ def build_glm_config():
     )
 
 
+def build_dsa_config():
+    from transformers import GlmMoeDsaConfig
+
+    return GlmMoeDsaConfig(
+        vocab_size=512,
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        q_lora_rank=64,
+        kv_lora_rank=96,
+        qk_nope_head_dim=32,
+        qk_rope_head_dim=32,
+        v_head_dim=64,
+        index_n_heads=8,
+        index_head_dim=64,
+        index_topk=8,
+        indexer_types=["full", "shared"],
+        first_k_dense_replace=2,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        eos_token_id=None,
+        bos_token_id=None,
+        pad_token_id=None,
+        attn_implementation="eager",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+
+
 def build_oss_config():
     from transformers import GptOssConfig
 
@@ -248,6 +286,8 @@ def weights(model):
             v = 0.3 * torch.randn(p.shape, generator=g)
         elif name.endswith("e_score_correction_bias"):
             v = 0.2 * torch.randn(p.shape, generator=g)
+        elif name.endswith("k_norm.bias"):
+            v = 0.1 * torch.randn(p.shape, generator=g)
         elif name.endswith(".sinks"):
             v = 2.0 * torch.randn(p.shape, generator=g)
         elif p.dim() == 1:
@@ -301,6 +341,11 @@ def make(name):
         from transformers import DeepseekV2ForCausalLM as Model
 
         cfg = build_mla_config(4 if name == MLA else 1)
+        extra = {}
+    elif name == DSA:
+        from transformers import GlmMoeDsaForCausalLM as Model
+
+        cfg = build_dsa_config()
         extra = {}
     elif name == GLM:
         from transformers import Glm4MoeForCausalLM as Model
@@ -495,17 +540,18 @@ def make_v4():
 def main(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    for name in (SINKS, CHUNKED, MLA, MLA_MOE, GLM, OSS, V4):
+    for name in (SINKS, CHUNKED, MLA, MLA_MOE, GLM, OSS, DSA, V4):
         model = make_v4() if name == V4 else make(name)
         g = torch.Generator().manual_seed(SEED + 3)
-        ids = torch.randint(0, 512, (PROMPT,), generator=g)
+        prompt = DSA_PROMPT if name == DSA else PROMPT
+        ids = torch.randint(0, 512, (prompt,), generator=g)
         with torch.inference_mode():
             logits = model(ids[None]).logits[0]
             seq = ids.tolist()
             for _ in range(GREEDY):
                 step = model(torch.tensor(seq)[None]).logits[0, -1]
                 seq.append(int(step.argmax()))
-            greedy = seq[PROMPT:]
+            greedy = seq[prompt:]
         logits.float().numpy().astype(np.float32).tofile(out / f"{name}.ref.bin")
         (out / f"{name}.ref.json").write_text(json.dumps({"tokens": ids.tolist(), "greedy": greedy, "vocab": 512}))
         print(name, "->", out)

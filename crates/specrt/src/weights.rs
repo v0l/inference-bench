@@ -1,6 +1,6 @@
 use crate::codegen::{FP8_BLOCK, Q8_GROUP};
 use crate::gguf::{DeviceRows, GgmlType, Gguf};
-use crate::spec::{Quant, Spec};
+use crate::spec::{Block, Quant, Spec};
 use anyhow::{Context, Result, bail, ensure};
 use memmap2::Mmap;
 #[cfg(unix)]
@@ -39,15 +39,35 @@ pub struct Gdn<'a> {
     pub out: Matrix<'a>,
 }
 
+pub struct Described<'a> {
+    pub in_proj: Matrix<'a>,
+    pub out: Matrix<'a>,
+    pub extra: Vec<(String, Vec<f32>)>,
+}
+
 pub enum Mixer<'a> {
     Attention(Attn<'a>),
     Linear(Gdn<'a>),
+    Described(Described<'a>),
+}
+
+fn split_gate_up<T: Copy>(fused: &[T], row_len: usize, experts: usize, inter: usize, interleaved: bool) -> (Vec<T>, Vec<T>) {
+    let (mut gate, mut up) = (Vec::with_capacity(fused.len() / 2), Vec::with_capacity(fused.len() / 2));
+    for e in 0..experts {
+        let rows = &fused[e * 2 * inter * row_len..(e + 1) * 2 * inter * row_len];
+        for r in 0..2 * inter {
+            let into = if interleaved { if r % 2 == 0 { &mut gate } else { &mut up } } else if r < inter { &mut gate } else { &mut up };
+            into.extend_from_slice(&rows[r * row_len..(r + 1) * row_len]);
+        }
+    }
+    (gate, up)
 }
 
 pub enum Stacked {
     Bf16(Vec<u16>),
     Fp4 { packed: Vec<u8>, scales: Vec<u8>, inv_global: Vec<f32>, input_global: f32 },
     Fp8 { values: Vec<u8>, grid: Vec<f32> },
+    Block { packed: Vec<u8>, scales: Vec<u8> },
 }
 
 pub struct MoeWeights {
@@ -128,7 +148,7 @@ struct Shard {
 pub struct Checkpoint {
     gguf: Option<std::sync::Arc<Gguf>>,
     shards: std::sync::Arc<Vec<Shard>>,
-    names: std::sync::Arc<HashMap<String, usize>>,
+    names: std::sync::Arc<HashMap<String, (usize, String)>>,
     staged: Option<crate::loader::Batch>,
     cut: Option<std::sync::Arc<crate::tp::RankCut>>,
     owned: std::sync::Arc<std::sync::Mutex<Vec<Box<[u8]>>>>,
@@ -170,7 +190,7 @@ impl Checkpoint {
             let (header, meta) =
                 SafeTensors::read_metadata(&map).with_context(|| path.display().to_string())?;
             for name in meta.tensors().into_keys() {
-                if let Some(prev) = names.insert(name.clone(), i) {
+                if let Some((prev, _)) = names.insert(name.clone(), (i, name.clone())) {
                     bail!("{name} is in both {} and {}", files[prev].display(), path.display());
                 }
             }
@@ -202,6 +222,22 @@ impl Checkpoint {
         Self::open(&find_checkpoint(repo)?)
     }
 
+    pub fn renamed(mut self, rules: &std::collections::BTreeMap<String, String>) -> Checkpoint {
+        if rules.is_empty() || self.gguf.is_some() {
+            return self;
+        }
+        let mut names = HashMap::new();
+        for (name, at) in self.names.iter() {
+            let mut public = name.clone();
+            for (from, to) in rules {
+                public = public.replace(from.as_str(), to);
+            }
+            names.insert(public, at.clone());
+        }
+        self.names = std::sync::Arc::new(names);
+        self
+    }
+
     pub fn has(&self, name: &str) -> bool {
         match &self.gguf {
             Some(g) => g.tensor_for_hf(name).is_some_and(|n| g.tensors.contains_key(&n)),
@@ -219,14 +255,14 @@ impl Checkpoint {
     }
 
     pub fn shape_of(&self, name: &str) -> Result<Vec<usize>> {
-        let &i = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
-        Ok(self.shards[i].meta.info(name).context("tensor info")?.shape.clone())
+        let (i, stored) = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+        Ok(self.shards[*i].meta.info(stored).context("tensor info")?.shape.clone())
     }
 
     fn full_view(&self, name: &str) -> Result<View<'_>> {
-        let &i = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
-        let shard = &self.shards[i];
-        let info = shard.meta.info(name).context("tensor info")?;
+        let (i, stored) = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+        let shard = &self.shards[*i];
+        let info = shard.meta.info(stored).context("tensor info")?;
         let (from, to) = info.data_offsets;
         let data = match self.staged.as_ref().and_then(|b| b.get(name)) {
             Some(staged) => staged,
@@ -238,9 +274,10 @@ impl Checkpoint {
     pub fn extents(&self, names: &[String]) -> Result<Vec<crate::loader::Item>> {
         let mut items = Vec::with_capacity(names.len());
         for name in names {
-            let &file = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+            let (file, stored) = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+            let file = *file;
             let shard = &self.shards[file];
-            let (from, to) = shard.meta.info(name).context("tensor info")?.data_offsets;
+            let (from, to) = shard.meta.info(stored).context("tensor info")?.data_offsets;
             items.push(crate::loader::Item { name: name.clone(), file, offset: (shard.data_start + from) as u64, len: (to - from) as u64 });
         }
         items.sort_by_key(|i| (i.file, i.offset));
@@ -266,9 +303,9 @@ impl Checkpoint {
     pub fn release_names(&self, names: &[String]) {
         let page = 4096usize;
         for name in names {
-            let Some(&i) = self.names.get(name) else { continue };
-            let sh = &self.shards[i];
-            let Ok(info) = sh.meta.info(name).context("tensor info") else { continue };
+            let Some((i, stored)) = self.names.get(name) else { continue };
+            let sh = &self.shards[*i];
+            let Ok(info) = sh.meta.info(stored).context("tensor info") else { continue };
             let (from, to) = info.data_offsets;
             let start = (sh.data_start + from).div_ceil(page) * page;
             let end = (sh.data_start + to) / page * page;
@@ -828,11 +865,11 @@ impl Checkpoint {
         Ok(self.f32(name, len)?.into_iter().map(|w| w + offset).collect())
     }
 
-    fn attention(&self, spec: &Spec, attn: &str, layer: usize) -> Result<Attn<'_>> {
-        self.attention_as(spec, attn, layer, false)
+    fn attention(&self, spec: &Spec, attn: &str, block: Block) -> Result<Attn<'_>> {
+        self.attention_as(spec, attn, false, block)
     }
 
-    fn attention_as(&self, spec: &Spec, attn: &str, layer: usize, bf16: bool) -> Result<Attn<'_>> {
+    fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool, block: Block) -> Result<Attn<'_>> {
         let a = &spec.attention;
         let quant = if bf16 { Quant::Bf16 } else { spec.quant };
         let (h, q, kv) = (spec.dims.hidden, spec.q_dim(), spec.kv_dim());
@@ -844,11 +881,7 @@ impl Checkpoint {
         if !a.projection.is_empty() {
             for p in &a.projection {
                 let rows = crate::state::dim(spec, &p.rows)?;
-                if spec.projection_applies(p, layer) {
-                    parts.push(w(&p.tensor, rows, h)?);
-                } else {
-                    parts.push(Raw::Bf16 { w: Cow::Owned(vec![0; rows * h]), cols: h });
-                }
+                parts.push(if p.present_in(block) { w(&p.tensor, rows, h)? } else { Raw::Bf16 { w: Cow::Owned(vec![0; rows * h]), cols: h } });
             }
         } else if a.fused_qkv {
             ensure!(!a.output_gate, "fused qkv with an output gate is not supported");
@@ -887,7 +920,7 @@ impl Checkpoint {
             (None, None)
         };
         let mut extra = Vec::new();
-        for bind in spec.attention.node.iter().filter(|n| spec.node_applies(n, layer)).flat_map(|n| n.bind.values()) {
+        for bind in spec.attention.node.iter().filter(|n| n.present_in(block)).flat_map(|n| n.bind.values()) {
             if let crate::graph::Bind::Weight { weight, len } = bind
                 && !extra.iter().any(|(n, _): &(String, Vec<f32>)| n == weight)
             {
@@ -930,6 +963,29 @@ impl Checkpoint {
         })
     }
 
+    fn described_mixer(&self, spec: &Spec, p: &str) -> Result<Described<'_>> {
+        let m = spec.mixer.as_ref().context("no [mixer]")?;
+        let h = spec.dims.hidden;
+        let module = format!("{p}.{}", m.module);
+        let mut parts = Vec::new();
+        for proj in &m.projection {
+            parts.push(self.raw(&format!("{module}.{}.weight", proj.tensor), crate::state::dim(spec, &proj.rows)?, h)?);
+        }
+        let mut extra: Vec<(String, Vec<f32>)> = Vec::new();
+        for bind in m.node.iter().flat_map(|n| n.bind.values()) {
+            if let crate::graph::Bind::Weight { weight, len } = bind
+                && !extra.iter().any(|(n, _)| n == weight)
+            {
+                extra.push((weight.clone(), self.flat(&format!("{module}.{weight}"), spec.weight_len(len)?)?));
+            }
+        }
+        Ok(Described {
+            in_proj: Raw::concat(parts)?.into_matrix(spec.quant, &format!("{module}.in_proj"))?,
+            out: self.raw(&format!("{module}.{}.weight", m.out_tensor), h, spec.mix_out_cols())?.into_matrix(spec.quant, &format!("{module}.out_proj"))?,
+            extra,
+        })
+    }
+
     pub fn layer(&self, spec: &Spec, i: usize) -> Result<Layer<'_>> {
         self.layer_at(spec, i, i)
     }
@@ -938,10 +994,12 @@ impl Checkpoint {
         let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
         let p = format!("{}.layers.{global}", self.root());
         self.require_activation_scales(spec, i, global, &p)?;
-        let mixer = if spec.block(i).is_linear() {
+        let mixer = if spec.block(i).is_linear() && spec.mixer.is_some() {
+            Mixer::Described(self.described_mixer(spec, &p)?)
+        } else if spec.block(i).is_linear() {
             Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"))?)
         } else {
-            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), i)?)
+            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), spec.block(i))?)
         };
         let mlp = spec.mlp_quant(i);
         let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(global));
@@ -1134,20 +1192,27 @@ impl Checkpoint {
         ensure!(blocks.dtype == Dtype::U8 && scales.dtype == Dtype::U8, "{name} blocks and scales must be U8");
         ensure!(blocks.shape.first() == Some(&experts) && scales.shape.first() == Some(&experts), "{name} is not stacked over {experts} experts");
         ensure!(blocks.data.len() == format.packed_len(experts * rows * cols), "{name}_blocks holds {} bytes, expected {} for {experts}x{rows}x{cols}", blocks.data.len(), format.packed_len(experts * rows * cols));
+        if format.device_packed() {
+            ensure!(cols.is_multiple_of(format.group), "{name} has {cols} columns, not a whole number of groups of {}", format.group);
+            ensure!(scales.data.len() == experts * rows * cols / format.group, "{name}_scales holds {} bytes, expected {}", scales.data.len(), experts * rows * cols / format.group);
+            return Ok(Stacked::Block { packed: blocks.data.to_vec(), scales: scales.data.to_vec() });
+        }
         Ok(Stacked::Bf16(format.decode_bf16(blocks.data, scales.data).with_context(|| name.to_string())?))
     }
 
     fn block_gate_up(&self, format: &crate::dequant::BlockFormat, name: &str, experts: usize, inter: usize, h: usize, interleaved: bool) -> Result<(Stacked, Stacked)> {
-        let Stacked::Bf16(fused) = self.block_stack(format, name, experts, 2 * inter, h)? else { unreachable!("block stacks decode to bf16") };
-        let (mut gate, mut up) = (Vec::with_capacity(fused.len() / 2), Vec::with_capacity(fused.len() / 2));
-        for e in 0..experts {
-            let rows = &fused[e * 2 * inter * h..(e + 1) * 2 * inter * h];
-            for r in 0..2 * inter {
-                let into = if interleaved { if r % 2 == 0 { &mut gate } else { &mut up } } else if r < inter { &mut gate } else { &mut up };
-                into.extend_from_slice(&rows[r * h..(r + 1) * h]);
+        Ok(match self.block_stack(format, name, experts, 2 * inter, h)? {
+            Stacked::Block { packed, scales } => {
+                let (gp, up) = split_gate_up(&packed, h / 2, experts, inter, interleaved);
+                let (gs, us) = split_gate_up(&scales, h / format.group, experts, inter, interleaved);
+                (Stacked::Block { packed: gp, scales: gs }, Stacked::Block { packed: up, scales: us })
             }
-        }
-        Ok((Stacked::Bf16(gate), Stacked::Bf16(up)))
+            Stacked::Bf16(fused) => {
+                let (gate, up) = split_gate_up(&fused, h, experts, inter, interleaved);
+                (Stacked::Bf16(gate), Stacked::Bf16(up))
+            }
+            _ => unreachable!("block stacks are packed or bf16"),
+        })
     }
 
     fn has_input_scale(&self, module: &str) -> bool {
@@ -1205,7 +1270,7 @@ impl Checkpoint {
         ensure!(self.has("mtp.fc.weight"), "the checkpoint has no mtp.* tensors");
         let bf16 = |r: Raw<'a>, what: &str| -> Result<Matrix<'a>> { r.dequantized().into_matrix(Quant::Bf16, what) };
         let p = "mtp.layers.0";
-        let attn = self.attention_as(spec, &format!("{p}.self_attn"), 0, true)?;
+        let attn = self.attention_as(spec, &format!("{p}.self_attn"), true, Block::Full)?;
         let sparse = spec.moe.is_some();
         let (gate_up, down, moe) = if sparse {
             let dummy = || Matrix::Bf16(Cow::Owned(vec![0; 8]));
@@ -1604,16 +1669,22 @@ mod block_expert_tests {
         let mut all = Vec::new();
         MXFP4.decode(&blocks, &scales, &mut all).unwrap();
         let want = |r: usize, e: usize| -> Vec<u16> { all[(e * 2 * inter + r) * h..(e * 2 * inter + r + 1) * h].iter().map(|v| f32_to_bf16(*v)).collect() };
-        let (Stacked::Bf16(g), Stacked::Bf16(u)) = ck.block_gate_up(&MXFP4, name, experts, inter, h, true).unwrap() else { panic!("bf16") };
-        assert_eq!(&g[3 * h..4 * h], want(6, 0).as_slice());
-        assert_eq!(&u[3 * h..4 * h], want(7, 0).as_slice());
-        assert_eq!(&g[(inter + 1) * h..(inter + 2) * h], want(2, 1).as_slice());
-        let (Stacked::Bf16(g), Stacked::Bf16(u)) = ck.block_gate_up(&MXFP4, name, experts, inter, h, false).unwrap() else { panic!("bf16") };
-        assert_eq!(&g[3 * h..4 * h], want(3, 0).as_slice());
-        assert_eq!(&u[3 * h..4 * h], want(inter + 3, 0).as_slice());
-        let Stacked::Bf16(d) = ck.block_stack(&MXFP4, "model.layers.0.mlp.experts.down_proj", experts, h, inter).unwrap() else { panic!("bf16") };
-        assert_eq!(d.len(), experts * h * inter);
-        assert!(d.iter().all(|v| *v == f32_to_bf16(1.0)));
+        let row = |s: &Stacked, r: usize| -> Vec<u16> {
+            let Stacked::Block { packed, scales } = s else { panic!("packed") };
+            let mut f = Vec::new();
+            MXFP4.decode(&packed[r * h / 2..(r + 1) * h / 2], &scales[r * h / 32..(r + 1) * h / 32], &mut f).unwrap();
+            f.into_iter().map(f32_to_bf16).collect()
+        };
+        let (g, u) = ck.block_gate_up(&MXFP4, name, experts, inter, h, true).unwrap();
+        assert_eq!(row(&g, 3), want(6, 0));
+        assert_eq!(row(&u, 3), want(7, 0));
+        assert_eq!(row(&g, inter + 1), want(2, 1));
+        let (g, u) = ck.block_gate_up(&MXFP4, name, experts, inter, h, false).unwrap();
+        assert_eq!(row(&g, 3), want(3, 0));
+        assert_eq!(row(&u, 3), want(inter + 3, 0));
+        let Stacked::Block { packed, scales } = ck.block_stack(&MXFP4, "model.layers.0.mlp.experts.down_proj", experts, h, inter).unwrap() else { panic!("packed") };
+        assert_eq!((packed.len(), scales.len()), (experts * h * inter / 2, experts * h * inter / 32));
+        assert!(packed.iter().all(|b| *b == 0x22) && scales.iter().all(|s| *s == 127));
         std::fs::remove_dir_all(&dir).ok();
     }
 

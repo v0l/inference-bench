@@ -10,9 +10,10 @@ topk = "index_topk"
 max_keys = "max_context"
 q_row = "index_q_row"
 q_offset = 0
-w_row = "index_w_row"
-w_offset = 0
+w_row = "qkv_row"
+w_offset = "index_w_offset"
 out_row = "index_topk"
+layers = "index_key_layers"
 
 [[param]]
 name = "q"
@@ -28,7 +29,7 @@ access = "read"
 
 [[param]]
 name = "keys"
-type = "f32"
+type = "bf16"
 role = "activation"
 access = "read"
 
@@ -45,6 +46,12 @@ role = "activation"
 access = "read"
 
 [[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
 name = "pos_step"
 type = "i32"
 role = "value"
@@ -53,5 +60,35 @@ access = "read"
 [[param]]
 name = "row_step"
 type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "scale"
+type = "f32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "w_scale"
+type = "f32"
 role = "value"
 access = "read"

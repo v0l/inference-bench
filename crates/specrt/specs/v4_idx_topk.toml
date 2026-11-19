@@ -13,7 +13,7 @@ q_offset = 0
 w_row = "qkv_row"
 w_offset = "q_lora_rank + 7 * head_dim + 4 * index_head_dim"
 out_row = "index_topk"
-keys_layers = "comp_i_layers"
+layers = "comp_i_layers"
 
 [[param]]
 name = "q"
@@ -78,6 +78,18 @@ access = "read"
 [[param]]
 name = "pages"
 type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "scale"
+type = "f32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "w_scale"
+type = "f32"
 role = "value"
 access = "read"
 

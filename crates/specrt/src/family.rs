@@ -94,7 +94,7 @@ pub struct FamilyAttention {
     pub projection: Vec<crate::spec::Projection>,
     pub o_cols: Option<String>,
     pub scratch: std::collections::BTreeMap<String, String>,
-    pub scratch_i32: std::collections::BTreeMap<String, String>,
+    pub int_scratch: std::collections::BTreeMap<String, String>,
     pub qkv_bias: Flag,
     pub o_bias: Flag,
     pub qk_norm: Flag,
@@ -112,7 +112,7 @@ impl Default for FamilyAttention {
             projection: Vec::new(),
             o_cols: None,
             scratch: Default::default(),
-            scratch_i32: Default::default(),
+            int_scratch: Default::default(),
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
             o_bias: Flag::Fixed(false),
             qk_norm: Flag::Fixed(false),
@@ -171,6 +171,7 @@ pub struct FamilyMoe {
     pub norm_topk: Option<bool>,
     pub score_bias: bool,
     pub expert_block: Option<crate::dequant::BlockFormat>,
+    pub act_quant: Option<crate::spec::ActQuant>,
     pub gate_up_interleaved: bool,
     pub router_bias: bool,
     pub expert_bias: bool,
@@ -232,8 +233,38 @@ pub struct FamilyBlocks {
     pub layer_types: std::collections::BTreeMap<String, crate::spec::Block>,
     pub other_layer_type: Option<crate::spec::Block>,
     pub from_layer_types: bool,
-    pub types_key: Option<String>,
     pub sliding_period_key: Option<String>,
+    pub attention_indices_key: Option<String>,
+    pub types_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyMixer {
+    pub module: String,
+    pub projection: Vec<crate::spec::Projection>,
+    pub out_tensor: String,
+    pub out_cols: String,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl FamilyMixer {
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::Mixer>> {
+        if self.node.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::spec::Mixer {
+            module: self.module.clone(),
+            projection: self.projection.clone(),
+            out_tensor: self.out_tensor.clone(),
+            out_cols: self.out_cols.clone(),
+            params: read_params(&self.params, config)?,
+            scratch: self.scratch.clone(),
+            node: self.node.clone(),
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -304,6 +335,17 @@ pub struct FamilyQuant {
 
 fn json_at<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
     path.split('.').try_fold(v, |cur, key| cur.get(key))
+}
+
+fn expr_keys(text: &str, out: &mut Vec<String>) {
+    let Ok(e) = kir::expr::Expr::parse(text) else { return };
+    let mut names = Vec::new();
+    e.names(&mut names);
+    for n in names {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
 }
 
 fn value_matches(want: &toml::Value, got: &serde_json::Value) -> bool {
@@ -441,17 +483,79 @@ pub struct Family {
     pub fields: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub state: Vec<crate::state::State>,
+    #[serde(default)]
+    pub mixer: FamilyMixer,
+    #[serde(default)]
+    pub tensors: std::collections::BTreeMap<String, String>,
 }
 
 impl Family {
-    pub fn normalise(&self, config: &mut serde_json::Value) {
-        if let Some(key) = self.blocks.types_key.as_deref()
-            && config.get("layer_types").is_none()
-            && let Some(items) = config.get(key).and_then(|v| v.as_array())
-        {
-            let types: Vec<serde_json::Value> = items.iter().map(|v| serde_json::Value::String(v.as_u64().map_or_else(|| v.to_string(), |n| n.to_string()))).collect();
-            config["layer_types"] = serde_json::Value::Array(types);
+    pub fn config_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let push = |k: &str, out: &mut Vec<String>| {
+            let top = k.split('.').next().unwrap_or(k);
+            if !top.is_empty() && !out.iter().any(|o| o == top) {
+                out.push(top.to_string());
+            }
+        };
+        for (canonical, alternatives) in &self.fields {
+            push(canonical, &mut out);
+            for a in alternatives {
+                push(a, &mut out);
+            }
         }
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()) {
+            match key {
+                ParamSource::Config { config, .. } => push(config, &mut out),
+                ParamSource::Expr { expr } => expr_keys(expr, &mut out),
+                ParamSource::Number(_) => {}
+            }
+        }
+        if let Some(k) = self.attention.o_cols.as_deref() {
+            expr_keys(k, &mut out);
+        }
+        for s in self.attention.scratch.values().chain(self.mixer.scratch.values()) {
+            expr_keys(s, &mut out);
+        }
+        if let Some(k) = self.blocks.attention_indices_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.blocks.sliding_period_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.rope.local_theta_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.rope.nope_flags.as_deref() {
+            push(k, &mut out);
+        }
+        for k in &self.rope.type_keys {
+            push(k, &mut out);
+        }
+        for k in &self.dtypes.keys {
+            push(k, &mut out);
+        }
+        for k in self.rope.keys.values() {
+            push(k, &mut out);
+        }
+        let k = self.vision.soft_tokens_key.as_str();
+        if !k.is_empty() {
+            push(k, &mut out);
+        }
+        push(&self.vision.token_keys.image, &mut out);
+        push(&self.vision.token_keys.video, &mut out);
+        push(&self.vision.token_keys.start, &mut out);
+        push(&self.vision.token_keys.end, &mut out);
+        for m in [&self.multipliers.embedding, &self.multipliers.attention, &self.multipliers.residual, &self.multipliers.logits_divisor].into_iter().flatten() {
+            push(m, &mut out);
+        }
+        if let Some(k) = self.embedding.scale.as_deref().filter(|k| *k != "sqrt_hidden") {
+            push(k, &mut out);
+        }
+        out
+    }
+
+    pub fn normalise(&self, config: &mut serde_json::Value) {
         for (canonical, alternatives) in &self.fields {
             if dotted(config, canonical).is_some() {
                 continue;
@@ -577,6 +681,18 @@ impl Registry {
     pub fn describing(&self) -> Result<&Family> {
         self.named("generic").context("no generic family spec")
     }
+
+    pub fn config_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for f in &self.families {
+            for k in f.config_keys() {
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        out
+    }
 }
 
 fn resolve(table: &toml::Table, all: &[toml::Table], depth: usize) -> Result<toml::Table> {
@@ -637,5 +753,16 @@ mod tests {
         assert!(f.read(&serde_json::json!({})));
         assert!(!f.read(&serde_json::json!({"k": false})));
         assert!(Flag::Fixed(true).read(&serde_json::json!({"k": false})));
+    }
+
+    #[test]
+    fn config_keys_follow_the_family_declarations() {
+        let family = "name = \"k\"\nkind = \"family\"\n[match]\nmodel_types = [\"k\"]\n[fields]\nhidden_size = [\"n_embd\"]\n[mixer]\nmodule = \"m\"\nout_tensor = \"o\"\nout_cols = \"c\"\n[mixer.params]\nheads = { config = \"ssm_n_heads\" }\ninner = { expr = \"ssm_expand * hidden_size\" }\n[attention.params]\nkv = { config = \"kv_lora_rank\" }\nrope = { config = \"rope_parameters.factor\", default = 1.0 }\n";
+        let r = Registry::from_texts([family]).unwrap();
+        let keys = r.config_keys();
+        for k in ["hidden_size", "n_embd", "ssm_n_heads", "ssm_expand", "hidden_size", "kv_lora_rank", "rope_parameters"] {
+            assert!(keys.contains(&k.to_string()), "{k} not in {keys:?}");
+        }
+        assert!(!keys.iter().any(|k| k == "model_type"));
     }
 }

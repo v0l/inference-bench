@@ -12,7 +12,7 @@ when = "vision+tensor_core"
 [[block]]
 name = "attention_branch"
 when = "branch+tensor_core"
-layers = ["dense", "full", "sliding", "compressed", "indexed"]
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "dense"
 
 [[block.node]]
@@ -168,7 +168,7 @@ in = "xn_planes"
 [[block]]
 name = "attention"
 when = "plain"
-layers = ["dense", "full", "sliding", "compressed", "indexed"]
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "dense"
 
 [[block.node]]
@@ -304,7 +304,7 @@ in = "act_planes"
 
 [[block]]
 name = "linear"
-when = "plain"
+when = "plain+gdn"
 layers = ["linear"]
 mlp = "dense"
 
@@ -383,9 +383,69 @@ when = "tensor_core"
 in = "act_planes"
 
 [[block]]
+name = "mixer"
+when = "plain+mixer"
+layers = ["linear"]
+mlp = "dense"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+when = "tensor_core"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "mix_in"
+shard = "column"
+quant = "attn"
+out = "mix"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "mixer_nodes"
+when = "tensor_core"
+
+[[block.node]]
+op = "linear"
+weight = "mix_out"
+shard = "row"
+quant = "attn"
+out = "x"
+when = "tensor_core"
+in = "mix_planes"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+when = "tensor_core"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+shard = "column"
+quant = "mlp"
+out = "act_planes"
+when = "tensor_core"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+shard = "row"
+quant = "mlp"
+out = "x"
+when = "tensor_core"
+in = "act_planes"
+
+[[block]]
 name = "attention_moe"
 when = "plain"
-layers = ["dense", "full", "sliding", "compressed", "indexed"]
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "sparse"
 
 [[block.node]]
@@ -476,7 +536,7 @@ op = "moe_combine"
 
 [[block]]
 name = "linear_moe"
-when = "plain"
+when = "plain+gdn"
 layers = ["linear"]
 mlp = "sparse"
 

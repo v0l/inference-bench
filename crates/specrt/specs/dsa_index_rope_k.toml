@@ -1,0 +1,41 @@
+kind = "kir-kernel"
+family = "span_rope"
+name = "dsa_index_rope_k"
+threads = 32
+
+[args]
+row = "qkv_row"
+head = "index_head_dim"
+offset = "q_lora_rank + kv_lora_rank + qk_rope_head_dim"
+rot = "qk_rope_head_dim"
+style = "pairs"
+
+[[param]]
+name = "x"
+type = "f32"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"

@@ -124,6 +124,12 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             out: up_m(&g.out)?,
             slot: before(true),
         }),
+        Mixer::Described(d) => DeviceMixer::Described(DeviceDescribed {
+            in_proj: up_m(&d.in_proj)?,
+            out: up_m(&d.out)?,
+            extra: d.extra.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,
+            slot: before(true),
+        }),
     };
     let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m)).transpose()? };
     copied(stream)?;
@@ -371,6 +377,50 @@ struct DeviceGdn {
 enum DeviceMixer {
     Attention(DeviceAttn),
     Linear(DeviceGdn),
+    Described(DeviceDescribed),
+}
+
+struct DeviceDescribed {
+    in_proj: DeviceMatrix,
+    out: DeviceMatrix,
+    extra: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    slot: i32,
+}
+
+struct SeqState {
+    name: String,
+    pool: StatePool,
+    slice: ManuallyDrop<CudaSlice<f32>>,
+}
+
+struct MixBuffers {
+    states: Vec<SeqState>,
+    mix: CudaSlice<f32>,
+    planes: Planes,
+    scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+}
+
+impl MixBuffers {
+    fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec, slots: usize, chunk: usize) -> Result<Self> {
+        let mut states = Vec::new();
+        for s in crate::state::sequence(spec).filter(|s| s.layers == crate::state::Layers::Linear) {
+            ensure!(s.dtype == crate::state::Dtype::F32, "[[state]] {} on a mixer is not f32", s.name);
+            let pool = StatePool::new(ctx, s.sequence_bytes(spec), slots)?;
+            let slice = ManuallyDrop::new(pool.slice(stream));
+            states.push(SeqState { name: s.name.clone(), pool, slice });
+        }
+        let m = spec.mixer.as_ref().context("no [mixer]")?;
+        let scratch = m.scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?;
+        Ok(MixBuffers { states, mix: stream.alloc_zeros(chunk * spec.mix_in_rows())?, planes: Planes::new(stream, chunk * spec.mix_out_cols())?, scratch })
+    }
+}
+
+impl Drop for MixBuffers {
+    fn drop(&mut self) {
+        for s in &mut self.states {
+            unsafe { ManuallyDrop::take(&mut s.slice) }.leak();
+        }
+    }
 }
 
 struct DeviceLayer {
@@ -405,6 +455,7 @@ impl DeviceLayer {
                     + g.out.bytes()
                     + (g.conv.num_bytes() + g.neg_a.num_bytes() + g.dt_bias.num_bytes() + g.norm.num_bytes()) as u64
             }
+            DeviceMixer::Described(d) => d.in_proj.bytes() + d.out.bytes() + d.extra.values().map(|v| v.num_bytes() as u64).sum::<u64>(),
         };
         mixer
             + self.gate_up.bytes()
@@ -653,10 +704,12 @@ pub struct Runtime {
     layers: Vec<DeviceLayer>,
     described: Vec<Option<DescribedLaunch>>,
     scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
-    scratch_i32: std::collections::BTreeMap<String, CudaSlice<i32>>,
+    int_scratch: std::collections::BTreeMap<String, CudaSlice<i32>>,
     buf: Buffers,
     pre: PrefillBuffers,
     gdn: Option<GdnBuffers>,
+    mixer: Option<MixBuffers>,
+    mixer_launch: Vec<DescribedLaunch>,
     moe: Option<moe::MoeBuffers>,
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
@@ -731,7 +784,7 @@ fn gemv_cfg(name: &str, rows: usize, w: &DeviceMatrix, sms: u32) -> LaunchConfig
     }
 }
 
-const GEMV_BLOCKS_PER_SM: u32 = 2;
+const GEMV_BLOCKS_PER_SM: u32 = 8;
 const PREFILL_CHUNK: usize = 2048;
 const STATE_FREE_MARGIN: usize = 256 << 20;
 const ATTN_SPLITS: usize = 64;
@@ -882,8 +935,8 @@ impl Runtime {
         let linear_tuning = LinearTuning::for_target(&target);
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
         let checkpoint = match tp {
-            Some((n, rank, _)) => Checkpoint::for_repo(&spec.repo)?.for_rank(crate::tp::RankCut::new(&full, crate::graph::Graph::decoder(), n, rank)?)?,
-            None => Checkpoint::for_repo(&spec.repo)?,
+            Some((n, rank, _)) => Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors).for_rank(crate::tp::RankCut::new(&full, crate::graph::Graph::decoder(), n, rank)?)?,
+            None => Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors),
         };
         let weights_started = Instant::now();
         let Weights { layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct } =
@@ -943,6 +996,13 @@ impl Runtime {
             None => None,
         };
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
+        let mixer = match &spec.mixer {
+            Some(_) => Some(MixBuffers::new(&ctx, &stream, spec, layout.slots + 1, chunk)?),
+            None => None,
+        };
+        ensure!(use_mma || mixer.is_none(), "a described mixer needs the tensor core path (sm_80 or newer)");
+        let mixer_launch: Vec<DescribedLaunch> =
+            crate::codegen::mixer_kernels(spec, layout.kv_planes, max_ctx, &target)?.into_iter().map(|k| DescribedLaunch { name: k.name, threads: k.threads, params: k.params }).collect();
         let widest = [d.hidden, d.intermediate, spec.q_dim()]
             .into_iter()
             .chain(spec.linear_attention.as_ref().map(|l| l.value_dim()))
@@ -973,7 +1033,9 @@ impl Runtime {
         } else {
             stream.alloc_zeros(1)?
         };
-        let f8b_part = if spec.quant.is_fp8() {
+        let f8b_part = if spec.quant == crate::spec::Quant::Gguf {
+            stream.alloc_zeros(crate::gemm::ggml_part_len(spec, &target))?
+        } else if spec.quant.is_fp8() {
             stream.alloc_zeros(crate::gemm::batch_part_len(spec, &target, false))?
         } else {
             stream.alloc_zeros(1)?
@@ -986,8 +1048,10 @@ impl Runtime {
             linear_tuning,
             pre,
             gdn,
+            mixer,
+            mixer_launch,
             moe: match &spec.moe {
-                Some(_) => Some(moe::MoeBuffers::new(&stream, chunk, spec, crate::codegen::moe_mma_enabled(spec, &target))?),
+                Some(_) => Some(moe::MoeBuffers::new(&stream, chunk, spec, crate::codegen::moe_mma_enabled(spec, &target), crate::codegen::moe_mma_fp8_enabled(spec, &target))?),
                 None => None,
             },
             fp8_act,
@@ -1027,9 +1091,9 @@ impl Runtime {
                 .iter()
                 .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
                 .collect::<Result<_>>()?,
-            scratch_i32: spec
+            int_scratch: spec
                 .attention
-                .scratch_i32
+                .int_scratch
                 .iter()
                 .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
                 .collect::<Result<_>>()?,
@@ -1348,7 +1412,7 @@ impl Runtime {
     }
 
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
-        ensure!(self.spec.attention.node.is_empty(), "described attention runs on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        ensure!(self.spec.attention.node.is_empty() && self.spec.mixer.is_none(), "described attention and mixers run on the batched decode path (generate_batch and the scheduler), not the single stream step");
         let s = &self.spec;
         let a = &s.attention;
         let buf = &self.buf;
@@ -1365,6 +1429,7 @@ impl Runtime {
                     continue;
                 }
                 DeviceMixer::Attention(l) => l,
+                DeviceMixer::Described(_) => unreachable!("a described mixer is refused above"),
             };
             let kv_layer = l.kv;
             let window = l.window;
@@ -1471,6 +1536,7 @@ impl Runtime {
             (GemmPath::F8b, _, _) => return self.tc_f8b(&choice, w, bias, x, out, rows, tokens),
             (GemmPath::F4b, _, _) => return self.tc_f4b(&choice, w, x, out, rows, tokens),
             (GemmPath::Rows, _, _) => return self.tc_rows(&choice, w, x, out, rows, tokens),
+            (GemmPath::Ggr, _, _) => return self.tc_ggr(&choice, w, bias, x, out, rows, tokens),
             (GemmPath::Ggb, _, _) => return self.tc_ggb(&choice, w, bias, x, out, rows, tokens),
             _ => {}
         }
@@ -1552,6 +1618,57 @@ impl Runtime {
             shared_mem_bytes: self.smem[kernel],
         };
         unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tc_ggr(
+        &self,
+        choice: &crate::codegen::KernelChoice,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        use crate::codegen::{BATCH_REDUCE_BLOCK as GGR_REDUCE_BLOCK, BatchShape};
+        let DeviceMatrix::Ggml { data, table } = w else { unreachable!("tc_ggr takes GGUF weights") };
+        let linear = choice.name.split("_ggr").next().expect("a ggr kernel");
+        let cols = crate::codegen::linear_dims(&self.spec, linear).1;
+        let shape = BatchShape::for_ggml(tokens);
+        let splits = shape.ggml_splits(&self.target, rows, cols);
+        let (n, s) = (tokens as i32, splits as i32);
+        let mut b = self.stream.launch_builder(self.kernel(&choice.name));
+        b.arg(data).arg(table);
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        b.arg(&self.f8b_part).arg(&n).arg(&s);
+        let config = LaunchConfig {
+            grid_dim: (grid(rows, shape.rows()), splits as u32, 1),
+            block_dim: (shape.threads(), 1, 1),
+            shared_mem_bytes: shape.smem(),
+        };
+        unsafe { b.launch(config) }?;
+        if splits == 1 {
+            return Ok(());
+        }
+        let reduce = choice.reduce.as_deref().expect("ggr has a reduce kernel");
+        let mut b = self.stream.launch_builder(self.kernel(reduce));
+        b.arg(&self.f8b_part).arg(bias.unwrap_or(&self.buf.dummy));
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        let outs = match out {
+            GemmOut::Planes(_) => tokens * rows / 2,
+            GemmOut::F32(_) => tokens * rows,
+        };
+        b.arg(&n).arg(&s);
+        unsafe { b.launch(cfg(grid(outs, GGR_REDUCE_BLOCK), GGR_REDUCE_BLOCK as u32)) }?;
         Ok(())
     }
 
@@ -2137,21 +2254,69 @@ impl Runtime {
     }
 
     pub fn state_slot_bytes(&self) -> usize {
+        if let Some(mb) = &self.mixer {
+            return mb.states.iter().map(|s| s.pool.stride_bytes()).sum();
+        }
         self.gdn.as_ref().map_or(0, |gb| gb.conv_pool.stride_bytes() + gb.ssm_pool.stride_bytes())
     }
 
     pub fn state_mapped_bytes(&self) -> usize {
+        if let Some(mb) = &self.mixer {
+            return mb.states.iter().map(|s| s.pool.mapped_bytes()).sum();
+        }
         self.gdn.as_ref().map_or(0, |gb| gb.conv_pool.mapped_bytes() + gb.ssm_pool.mapped_bytes())
     }
 
     pub fn state_live_slots(&self) -> usize {
+        if let Some(mb) = &self.mixer {
+            return mb.states.first().map_or(0, |s| s.pool.live_slots());
+        }
         self.gdn.as_ref().map_or(0, |gb| gb.ssm_pool.live_slots())
+    }
+
+    fn mixer_state_live(&self, slot: usize) -> bool {
+        self.mixer.as_ref().is_none_or(|mb| mb.states.iter().all(|s| s.pool.is_live(slot)))
+    }
+
+    fn acquire_mixer_state(&mut self, slot: usize, free: usize) -> Result<()> {
+        let need = self.state_slot_bytes();
+        let Some(mb) = self.mixer.as_mut() else { return Ok(()) };
+        if mb.states.iter().all(|s| s.pool.is_live(slot)) {
+            return Ok(());
+        }
+        ensure!(free >= need + STATE_FREE_MARGIN, "{free} bytes of device memory free, a recurrent state slot needs {need} plus a margin");
+        for i in 0..mb.states.len() {
+            if let Err(e) = mb.states[i].pool.acquire(slot) {
+                for s in &mut mb.states[..i] {
+                    s.pool.release(slot);
+                }
+                return Err(e);
+            }
+        }
+        for s in &mut mb.states {
+            let n = s.pool.stride_bytes() / 4;
+            self.stream.memset_zeros(&mut s.slice.slice_mut(slot * n..(slot + 1) * n))?;
+        }
+        Ok(())
+    }
+
+    fn zero_mixer_state(&mut self, slot: usize) -> Result<()> {
+        ensure!(self.mixer_state_live(slot), "recurrent state of slot {slot} is not allocated");
+        let Some(mb) = self.mixer.as_mut() else { return Ok(()) };
+        for s in &mut mb.states {
+            let n = s.pool.stride_bytes() / 4;
+            self.stream.memset_zeros(&mut s.slice.slice_mut(slot * n..(slot + 1) * n))?;
+        }
+        Ok(())
     }
 
     pub fn acquire_state(&mut self, slot: usize) -> Result<()> {
         ensure!(slot <= self.slots, "slot {slot} out of {}", self.slots);
         let need = self.state_slot_bytes();
         let free = self.ctx.mem_get_info().map(|(f, _)| f).unwrap_or(usize::MAX);
+        if self.mixer.is_some() {
+            return self.acquire_mixer_state(slot, free);
+        }
         let Some(gb) = self.gdn.as_mut() else { return Ok(()) };
         if gb.ssm_pool.is_live(slot) {
             return Ok(());
@@ -2181,11 +2346,19 @@ impl Runtime {
             gb.ssm_pool.release(slot);
             gb.conv_pool.release(slot);
         }
+        if let Some(mb) = self.mixer.as_mut() {
+            for s in &mut mb.states {
+                s.pool.release(slot);
+            }
+        }
     }
 
     pub fn reset_slot(&mut self, seq: usize) -> Result<()> {
         ensure!(seq < self.slots, "slot {seq} out of {}", self.slots);
         self.mtp_forget(seq);
+        if self.mixer.is_some() {
+            return self.zero_mixer_state(seq);
+        }
         if let Some(gb) = self.gdn.as_ref() {
             ensure!(gb.ssm_pool.is_live(seq), "recurrent state of slot {seq} is not allocated");
         }
@@ -2266,16 +2439,6 @@ impl Runtime {
             conv: self.stream.clone_dtoh(&gb.conv_state.slice(..conv))?,
             state: self.stream.clone_dtoh(&gb.ssm_state.slice(..ssm))?,
         })
-    }
-
-    pub fn debug_dump(&self) -> Result<(Vec<f32>, std::collections::BTreeMap<String, Vec<f32>>)> {
-        let scratch = self.scratch.iter().map(|(n, b)| Ok((n.clone(), self.stream.clone_dtoh(b)?))).collect::<Result<_>>()?;
-        let mut scratch: std::collections::BTreeMap<String, Vec<f32>> = scratch;
-        let hi = self.stream.clone_dtoh(&self.pre.xn_planes.hi)?;
-        let lo = self.stream.clone_dtoh(&self.pre.xn_planes.lo)?;
-        let f = |b: u16| half_to_f32(b);
-        scratch.insert("xn".into(), hi.iter().zip(&lo).map(|(h, l)| f(*h) + f(*l)).collect());
-        Ok((self.stream.clone_dtoh(&self.pre.qkv)?, scratch))
     }
 
     pub fn trace_prefill(&mut self, tokens: &[u32]) -> Result<Trace> {
@@ -2490,16 +2653,5 @@ mod tests {
         assert_eq!(cut_at_stop(&[5, 6], &[151645]), (2, false));
         assert_eq!(cut_at_stop(&[151643], &[151645, 151643]), (0, true));
         assert_eq!(cut_at_stop(&[1, 2, 3], &[]), (3, false));
-    }
-}
-
-fn half_to_f32(b: u16) -> f32 {
-    let sign = if b & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((b >> 10) & 0x1f) as i32;
-    let frac = (b & 0x3ff) as f32;
-    match exp {
-        0 => sign * frac * 2f32.powi(-24),
-        31 => sign * f32::INFINITY,
-        e => sign * (1.0 + frac / 1024.0) * 2f32.powi(e - 15),
     }
 }

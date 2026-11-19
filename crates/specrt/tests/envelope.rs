@@ -121,3 +121,9 @@ fn split_activations_option_keeps_the_exact_path_at_fp32_distance() {
         assert!(kl < 1e-8, "{name}: {kl:e}");
     }
 }
+
+#[test]
+fn qwen3_5_runs_single_plane_activations_by_default() {
+    let spec = config_spec("qwen3.5-4b-base.config.json");
+    assert!(!spec.split_activations());
+}

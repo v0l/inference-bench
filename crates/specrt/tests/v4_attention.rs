@@ -7,15 +7,12 @@ use std::path::{Path, PathBuf};
 const V4: &str = "tiny-deepseek-v4-attention";
 
 fn fixture(name: &str) -> PathBuf {
-    match std::env::var_os("V4_DIR") {
-        Some(d) => PathBuf::from(d),
-        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name),
-    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)
 }
 
 fn spec() -> Spec {
     let json = std::fs::read_to_string(fixture(V4).join("config.json")).unwrap();
-    let mut spec = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap();
+    let mut spec = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap_or_else(|e| panic!("{e:#}"));
     spec.name = V4.into();
     spec.repo = fixture(V4).display().to_string();
     spec
@@ -60,15 +57,11 @@ fn the_module_builds_every_v4_kernel_from_descriptions() {
     }
 }
 
-fn name() -> String {
-    std::env::var("V4_NAME").unwrap_or_else(|_| V4.to_string())
-}
-
 fn reference() -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
     let dir = std::env::var_os("SPECRT_REF_DIR").map(PathBuf::from).unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("out"));
-    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{}.ref.json", name()))).unwrap()).unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{V4}.ref.json"))).unwrap()).unwrap();
     let ids = |k: &str| -> Vec<u32> { meta[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect() };
-    let bytes = std::fs::read(dir.join(format!("{}.ref.bin", name()))).unwrap();
+    let bytes = std::fs::read(dir.join(format!("{V4}.ref.bin"))).unwrap();
     let logits = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
     (ids("tokens"), ids("greedy"), meta["vocab"].as_u64().unwrap() as usize, logits)
 }
@@ -90,54 +83,4 @@ fn compressed_sparse_attention_matches_transformers() {
     }
     let got = rt.generate_batch(std::slice::from_ref(&tokens), greedy.len()).unwrap();
     assert_eq!(got.tokens[0], greedy, "decode greedy");
-}
-
-#[test]
-#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
-fn debug_layers() {
-    let (tokens, _, _, _) = reference();
-    let dir = std::env::var_os("SPECRT_REF_DIR").map(PathBuf::from).unwrap();
-    let bytes = std::fs::read(dir.join(format!("{}.layers.bin", name()))).unwrap();
-    let want: Vec<f32> = bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
-    let spec = spec();
-    let h = spec.dims.hidden;
-    let mut rt = Runtime::load_batched(&spec, 256, 1).unwrap();
-    let trace = rt.trace_prefill(&tokens).unwrap();
-    let n = tokens.len();
-    for l in 0..spec.layers.count {
-        let a = &trace.layers[l * n * h..(l + 1) * n * h];
-        let b = &want[l * n * h..(l + 1) * n * h];
-        let per_row: Vec<f32> = (0..n).map(|r| (0..h).map(|c| (a[r * h + c] - b[r * h + c]).abs()).fold(0f32, f32::max)).collect();
-        let first_bad = per_row.iter().position(|d| *d > 0.05);
-        eprintln!("layer {l} max {} first bad row {first_bad:?} rows0..8 {:?}", per_row.iter().cloned().fold(0f32, f32::max), &per_row[..8]);
-    }
-}
-
-#[test]
-#[ignore = "debug"]
-fn debug_stages() {
-    let (tokens, _, _, _) = reference();
-    let mut spec = spec();
-    let keep: Vec<String> = std::env::var("V4_KEEP").unwrap().split(',').map(String::from).collect();
-    spec.attention.node.retain(|n| keep.iter().any(|k| n.kernel.as_deref() == Some(k)));
-    spec.layers.count = 1;
-    if let Ok(t) = std::env::var("V4_TILE") {
-        spec.runtime.tile = match t.as_str() {
-            "small" => specrt::spec::TileChoice::Small,
-            "big" => specrt::spec::TileChoice::Big,
-            _ => specrt::spec::TileChoice::Narrow,
-        };
-    }
-    let dir = std::env::var_os("SPECRT_REF_DIR").map(PathBuf::from).unwrap();
-    let mut rt = Runtime::load_batched(&spec, 256, 1).unwrap();
-    rt.trace_prefill(&tokens).unwrap();
-    let (qkv, scratch) = rt.debug_dump().unwrap();
-    let rows = spec.qkv_rows();
-    let write = |n: &str, v: &[f32]| std::fs::write(dir.join(format!("{}.{n}.f32", name())), v.iter().flat_map(|f| f.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
-    write("qkv", &qkv[..tokens.len() * rows]);
-    for (n, v) in &scratch {
-        let width = spec.attention.scratch.get(n).map_or(spec.dims.hidden, |w| specrt::state::dim(&spec, w).unwrap());
-        write(n, &v[..tokens.len() * width]);
-    }
-    eprintln!("qkv rows {rows}");
 }

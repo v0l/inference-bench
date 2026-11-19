@@ -10,13 +10,25 @@ pub use crate::gemm::{
 
 pub const MOE_KERNELS: &[&str] = kir::moe::Family::Experts.kernels();
 pub const MOE_MMA_KERNELS: &[&str] = kir::moe::Family::GroupedMma.kernels();
-pub use kir::moe::{MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
+pub use kir::moe::{mma8_smem as moe_mma8_smem, MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
 
 pub fn moe_mma_enabled(spec: &Spec, target: &kir::Target) -> bool {
-    spec.moe.is_some()
-        && spec.mlp.quant == Some(Quant::Nvfp4G16)
-        && spec.mlp.act_quant == crate::spec::ActQuant::Fp4
-        && target.compute_capability.0 >= 12
+    let Some(m) = &spec.moe else { return false };
+    let weights = match &m.expert_block {
+        Some(block) => block.native_mma(),
+        None => spec.mlp.quant == Some(Quant::Nvfp4G16),
+    };
+    weights && spec.mlp.act_quant == crate::spec::ActQuant::Fp4 && target.compute_capability.0 >= 12
+}
+
+pub fn moe_mma_fp8_enabled(spec: &Spec, target: &kir::Target) -> bool {
+    let Some(m) = &spec.moe else { return false };
+    spec.mlp.quant.unwrap_or(spec.quant) == Quant::Fp8Block128
+        && spec.mlp.act_quant == crate::spec::ActQuant::Fp8
+        && target.compute_capability >= (8, 9)
+        && m.expert_block.is_none()
+        && m.expert_intermediate.is_multiple_of(FP8_BLOCK)
+        && spec.dims.hidden.is_multiple_of(FP8_BLOCK)
 }
 
 pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::MoeKernel>> {
@@ -38,10 +50,15 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         router_bias: m.router_bias,
         expert_bias: m.expert_bias,
         hash: m.hash_table.is_some(),
+        block_group: m.expert_block.map_or(0, |b| b.group),
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if moe_mma_enabled(spec, target) {
-        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::GroupedMma, shape).map_err(anyhow::Error::msg)?);
+        let family = if m.expert_block.is_some() { kir::moe::Family::GroupedMx } else { kir::moe::Family::GroupedMma };
+        out.push(kir::moe::MoeKernel::new(target, family, shape.clone()).map_err(anyhow::Error::msg)?);
+    }
+    if moe_mma_fp8_enabled(spec, target) {
+        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::GroupedMmaFp8, shape).map_err(anyhow::Error::msg)?);
     }
     Ok(out)
 }
@@ -178,6 +195,7 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
     for (n, v) in &spec.attention.params {
         symbols = symbols.num(n, *v);
     }
+    symbols = symbols.num("max_context", max_ctx as f64);
     for s in crate::state::positional(spec) {
         symbols = symbols.num(&format!("{}_layers", s.name), s.layer_count(spec) as f64);
     }
@@ -201,10 +219,10 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
             let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[attention.node]] {i} binds {b:?}, which {name} has no param for"))?;
             match (param.role, v) {
                 (kir::Role::Weight, crate::graph::Bind::Weight { .. }) => {}
-                (kir::Role::Activation, crate::graph::Bind::Buffer { buffer }) => anyhow::ensure!(
-                    param.ty == if spec.attention.scratch_i32.contains_key(buffer) { kir::Scalar::I32 } else { kir::Scalar::F32 },
-                    "[[attention.node]] {i} binds buffer {buffer:?} to {b:?}, which has the wrong element type"
-                ),
+                (kir::Role::Activation, crate::graph::Bind::Buffer { buffer }) => {
+                    let ints = spec.attention.int_scratch.contains_key(buffer);
+                    anyhow::ensure!(param.ty == if ints { kir::Scalar::I32 } else { kir::Scalar::F32 }, "[[attention.node]] {i} binds buffer {buffer:?} to {b:?}, which is not {}", if ints { "i32" } else { "f32" })
+                }
                 (kir::Role::Activation, crate::graph::Bind::State { .. }) => anyhow::ensure!(param.ty == kir::Scalar::Bf16, "[[attention.node]] {i} binds a state to {b:?}, which is not bf16"),
                 (kir::Role::Value, crate::graph::Bind::Weight { .. } | crate::graph::Bind::Buffer { .. } | crate::graph::Bind::State { .. })
                 | (kir::Role::Weight, _)
@@ -216,6 +234,45 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
             }
         }
         out.push(Some(kernel.clone()));
+    }
+    Ok(out)
+}
+
+pub fn mixer_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::desc::Shape {
+    let mut symbols = attention_symbols(spec, kv_planes, max_ctx).num("mix_in", spec.mix_in_rows() as f64).num("mix_out", spec.mix_out_cols() as f64).num("linear_layers", spec.linear_layers() as f64);
+    for (n, v) in spec.mixer.iter().flat_map(|m| m.params.iter()) {
+        symbols = symbols.num(n, *v);
+    }
+    symbols
+}
+
+pub fn mixer_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let Some(m) = &spec.mixer else { return Ok(Vec::new()) };
+    let symbols = mixer_symbols(spec, kv_planes, max_ctx);
+    let registry = crate::kir_kernel::Registry::active();
+    let mut built: BTreeMap<String, kir::Kernel> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (i, node) in m.node.iter().enumerate() {
+        let name = node.kernel.as_deref().ok_or_else(|| anyhow::anyhow!("[[mixer.node]] {i} names no kernel"))?;
+        if !built.contains_key(name) {
+            let d = registry.get(name).ok_or_else(|| anyhow::anyhow!("[[mixer.node]] {i} names kernel {name:?}, which no kernel description provides"))?;
+            built.insert(name.to_string(), d.build(target, &symbols).map_err(|e| anyhow::anyhow!("[[mixer.node]] {i}: {e}"))?);
+        }
+        let kernel = &built[name];
+        for p in kernel.params.iter().filter(|p| !kir::recur::LAUNCH.contains(&p.name) && !matches!(p.name, "out_hi" | "out_lo")) {
+            anyhow::ensure!(node.bind.contains_key(p.name), "[[mixer.node]] {i} does not bind {name} param {:?}", p.name);
+        }
+        for (b, v) in &node.bind {
+            let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[mixer.node]] {i} binds {b:?}, which {name} has no param for"))?;
+            let fits = match v {
+                crate::graph::Bind::Weight { .. } => param.role == kir::Role::Weight,
+                crate::graph::Bind::Buffer { .. } => param.role == kir::Role::Activation && param.ty == kir::Scalar::F32,
+                crate::graph::Bind::State { .. } => param.role == kir::Role::Activation && param.ty == kir::Scalar::F32 && param.access == kir::Access::Write,
+                crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_) => param.role == kir::Role::Value,
+            };
+            anyhow::ensure!(fits, "[[mixer.node]] {i} binds {b:?} to the wrong kind of value");
+        }
+        out.push(kernel.clone());
     }
     Ok(out)
 }
@@ -413,7 +470,7 @@ impl Module {
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let described = described_kernels(spec, kv_planes, max_ctx, target)?;
         let mut distinct: Vec<kir::Kernel> = Vec::new();
-        for k in described.into_iter().flatten() {
+        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?) {
             if !distinct.iter().any(|d| d.name == k.name) {
                 distinct.push(k);
             }

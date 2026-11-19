@@ -61,6 +61,7 @@ fn a_qwen35_gguf_gives_the_same_spec_as_the_safetensors_config() {
     hf.quant = spec.quant;
     hf.runtime = spec.runtime.clone();
     hf.mtp = spec.mtp.clone();
+    hf.plain_activations = spec.plain_activations;
     hf.norm.unit_offset = false;
     hf.norm.eps = spec.norm.eps;
     hf.rope.mrope = spec.rope.mrope.clone();

@@ -30,7 +30,7 @@
     "style": "neox",
     "theta": 500000.0,
     "scaling": {
-      "kind": "llama3",
+      "kind": "banded",
       "factor": 32.0,
       "low_freq_factor": 1.0,
       "high_freq_factor": 4.0,

@@ -4,9 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 11;
-
-const BLOCK_NAMES: [&str; 5] = ["dense", "full", "sliding", "compressed", "indexed"];
+pub const SPEC_FORMAT: u32 = 12;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -301,6 +299,7 @@ pub enum Block {
     Full,
     Sliding,
     Linear,
+    Shared,
     Compressed,
     Indexed,
 }
@@ -314,12 +313,17 @@ impl Block {
         matches!(self, Block::Sliding | Block::Compressed | Block::Indexed)
     }
 
+    pub fn parse(name: &str) -> Result<Block> {
+        [Block::Dense, Block::Full, Block::Sliding, Block::Linear, Block::Shared, Block::Compressed, Block::Indexed].into_iter().find(|b| b.name() == name).with_context(|| format!("{name:?} is not a layer kind"))
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Block::Dense => "dense",
             Block::Full => "full",
             Block::Sliding => "sliding",
             Block::Linear => "linear",
+            Block::Shared => "shared",
             Block::Compressed => "compressed",
             Block::Indexed => "indexed",
         }
@@ -715,9 +719,23 @@ pub struct Attention {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub scratch: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub scratch_i32: std::collections::BTreeMap<String, String>,
+    pub int_scratch: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub o_tensor: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Mixer {
+    pub module: String,
+    pub projection: Vec<Projection>,
+    pub out_tensor: String,
+    pub out_cols: String,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -727,6 +745,12 @@ pub struct Projection {
     pub rows: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<String>,
+}
+
+impl Projection {
+    pub fn present_in(&self, block: Block) -> bool {
+        self.layers.is_empty() || self.layers.iter().any(|l| l == block.name())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -809,11 +833,15 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_attention: Option<LinearAttention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer: Option<Mixer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<crate::vision::Vision>,
     #[serde(default = "crate::state::stock", skip_serializing_if = "crate::state::is_stock")]
     pub state: Vec<crate::state::State>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "RuntimeOptions::is_default")]
     pub runtime: RuntimeOptions,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -867,16 +895,18 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "n_shared_experts", "routed_scaling_factor", "n_group", "topk_group", "num_hash_layers", "swiglu_alpha", "swiglu_limit", "first_k_dense_replace", "n_routed_experts", "num_nextn_predict_layers", "linear_attn_config",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
-    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "embedding_multiplier", "attention_multiplier", "residual_multiplier", "logits_scaling", "no_rope_layers", "no_rope_layer_interval", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config",
+    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "query_pre_attn_scalar", "text_config", "quantization_config",
 ];
 
 pub fn unread_hf_keys(json: &str) -> Vec<(String, String)> {
     let Ok(serde_json::Value::Object(top)) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
+    let mut known: Vec<String> = HF_CONFIG_KEYS.iter().map(|k| k.to_string()).collect();
+    known.extend(crate::family::active().config_keys());
     let mut out = Vec::new();
     let nested = top.get("text_config").and_then(|t| t.as_object());
     for map in std::iter::once(&top).chain(nested) {
         for (k, v) in map {
-            if !HF_CONFIG_KEYS.contains(&k.as_str()) && !out.iter().any(|(o, _): &(String, String)| o == k) {
+            if !known.iter().any(|o| o == k) && !out.iter().any(|(o, _): &(String, String)| o == k) {
                 out.push((k.clone(), v.to_string()));
             }
         }
@@ -1405,9 +1435,12 @@ impl Spec {
             (Err(e), true) => return Err(e),
             (Err(_), false) => Quantization::weights(Quant::Bf16),
         };
+        let block_act = family.moe.expert_block.is_some_and(|b| b.native_mma()) && family.moe.act_quant == Some(ActQuant::Fp4);
+        let mlp_act = if block_act { ActQuant::Fp4 } else { mlp_act };
         let experts_nvfp4 = hf.num_experts.is_some_and(|e| e > 0) && quant == Quant::Nvfp4G16;
         let (quant, mlp_quant, act, mlp_act) =
             if experts_nvfp4 { (Quant::Bf16, Some((Quant::Nvfp4G16, None)), ActQuant::None, moe_act(&family.quantization, quant_config.as_ref())) } else { (quant, mlp_quant, act, mlp_act) };
+        let mlp_act = if strict && hf.num_experts.is_some_and(|e| e > 0) && mlp_quant.map_or(quant, |m| m.0) == Quant::Fp8Block128 { ActQuant::Fp8 } else { mlp_act };
         let nested = hf
             .rope_parameters
             .as_ref()
@@ -1462,8 +1495,16 @@ impl Spec {
         let rotary_dim = keyed_rotary.or_else(|| {
             hf.partial_rotary_factor.or(param("partial_rotary_factor")).filter(|f| *f != 1.0).map(|f| (head_dim as f64 * f).round() as usize)
         });
-        let pattern = match &hf.layer_types {
-            Some(types) if hybrid || !strict || family.blocks.from_layer_types || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
+        let indexed = family.blocks.attention_indices_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| {
+            let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()).collect();
+            (0..hf.num_hidden_layers).map(|i| if full.contains(&(i as u64)) { "full_attention" } else { "linear_attention" }.to_string()).collect::<Vec<_>>()
+        });
+        let keyed: Option<Vec<String>> = family.blocks.types_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| {
+            a.iter().filter_map(|v| v.as_str().map(String::from).or_else(|| v.as_u64().map(|n| n.to_string()))).collect()
+        });
+        let mixer = family.mixer.read(&value)?;
+        let pattern = match keyed.as_ref().or(indexed.as_ref()).or(hf.layer_types.as_ref()) {
+            Some(types) if keyed.is_some() || hybrid || !strict || family.blocks.from_layer_types || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
             None if family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).is_some_and(|n| n > 1) && hf.sliding_window.is_some() => {
                 let n = family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).unwrap_or(2) as usize;
                 let all: Vec<String> = (0..hf.num_hidden_layers).map(|i| if (i + 1) % n == 0 { "full_attention" } else { "sliding_attention" }.to_string()).collect();
@@ -1477,7 +1518,7 @@ impl Spec {
             }
             _ => vec![Block::Dense],
         };
-        let linear_attention = if pattern.iter().any(|b| b.is_linear()) {
+        let linear_attention = if mixer.is_none() && pattern.iter().any(|b| b.is_linear()) {
             let need = |v: Option<usize>, key: &str| v.with_context(|| format!("no {key}"));
             let dims: Result<LinearAttention> = (|| {
                 Ok(LinearAttention {
@@ -1584,7 +1625,7 @@ impl Spec {
                 projection: family.attention.projection.clone(),
                 o_cols: family.attention.o_cols.clone(),
                 scratch: family.attention.scratch.clone(),
-                scratch_i32: family.attention.scratch_i32.clone(),
+                int_scratch: family.attention.int_scratch.clone(),
                 o_tensor: family.attention.o_tensor.clone(),
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value) },
@@ -1602,6 +1643,8 @@ impl Spec {
             moe,
             mtp: (family.mtp && hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
             linear_attention,
+            mixer,
+            tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
             runtime: RuntimeOptions::default(),
@@ -1618,6 +1661,7 @@ impl Spec {
         self.runtime.validate()?;
         ensure!(!self.layers.pattern.iter().any(|b| b.windowed()) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
         self.validate_attention_nodes()?;
+        self.validate_mixer()?;
         crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
@@ -1657,8 +1701,14 @@ impl Spec {
         }
         match self.mlp.act_quant {
             ActQuant::None => {}
-            ActQuant::Fp4 => ensure!(self.mlp.quant == Some(Quant::Nvfp4G16), "[mlp] act_quant = \"fp4\" needs [mlp] quant = \"nvfp4_g16\""),
-            ActQuant::Fp8 => bail!("[mlp] act_quant is \"none\" or \"fp4\"; FP8 MLP inputs follow the top-level act_quant"),
+            ActQuant::Fp4 => ensure!(
+                self.mlp.quant == Some(Quant::Nvfp4G16) || self.moe.as_ref().and_then(|m| m.expert_block).is_some_and(|b| b.native_mma()),
+                "[mlp] act_quant = \"fp4\" needs [mlp] quant = \"nvfp4_g16\" or a 32 wide e2m1 e8m0 [moe] expert_block"
+            ),
+            ActQuant::Fp8 => ensure!(
+                self.moe.is_some() && self.mlp.quant.unwrap_or(self.quant) == Quant::Fp8Block128,
+                "[mlp] act_quant = \"fp8\" is for mixture-of-experts with fp8_block128 experts; dense FP8 MLP inputs follow the top-level act_quant"
+            ),
         }
         if let Some(m) = &self.rope.mrope {
             ensure!(
@@ -1725,6 +1775,7 @@ impl Spec {
         ensure!(self.rope.theta.is_some(), "rope theta is required to run (theta is unknown)");
         let has_linear = self.layers.pattern.iter().any(|b| b.is_linear());
         match (&self.linear_attention, has_linear) {
+            (None, true) if self.mixer.is_some() => {}
             (None, true) => bail!("a linear layer in the pattern needs a [linear_attention] section"),
             (Some(_), false) => bail!("[linear_attention] is set but the pattern has no linear layer"),
             (None, false) => {}
@@ -1794,20 +1845,64 @@ impl Spec {
         crate::state::dim(self, symbol).with_context(|| format!("weight length {symbol:?}"))
     }
 
+    fn validate_mixer(&self) -> Result<()> {
+        let Some(m) = &self.mixer else { return Ok(()) };
+        ensure!(self.linear_attention.is_none(), "[mixer] and [linear_attention] cannot both describe the linear layers");
+        ensure!(self.linear_layers() > 0, "[mixer] is set but the pattern has no linear layer");
+        ensure!(!m.module.is_empty() && !m.projection.is_empty() && !m.out_tensor.is_empty(), "[mixer] needs module, projection and out_tensor");
+        for p in &m.projection {
+            crate::state::dim(self, &p.rows).with_context(|| format!("[[mixer.projection]] {}", p.tensor))?;
+        }
+        ensure!(crate::state::dim(self, &m.out_cols).context("[mixer] out_cols")? > 0, "[mixer] out_cols is zero");
+        for (n, w) in &m.scratch {
+            ensure!(!matches!(n.as_str(), "mix" | "x"), "[mixer.scratch] {n} shadows a built in buffer");
+            crate::state::dim(self, w).with_context(|| format!("[mixer.scratch] {n}"))?;
+        }
+        ensure!(!m.node.is_empty() && m.node.len() <= 256, "[[mixer.node]] needs one to 256 nodes");
+        for (i, n) in m.node.iter().enumerate() {
+            ensure!(n.op == "kernel" && n.kernel.is_some(), "[[mixer.node]] {i} must be a kernel node with `kernel`");
+            ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[mixer.node]] {i} needs a grid of one to three symbols");
+            for g in &n.grid {
+                ensure!(matches!(g.as_str(), "rows" | "seqs") || g.parse::<u32>().is_ok() || m.params.contains_key(g), "[[mixer.node]] {i} grid symbol {g:?} is not rows, seqs, a number or a [mixer.params] entry");
+            }
+            for b in n.bind.values() {
+                match b {
+                    crate::graph::Bind::Weight { len, .. } => {
+                        self.weight_len(len)?;
+                    }
+                    crate::graph::Bind::Buffer { buffer } => {
+                        ensure!(buffer == "mix" || m.scratch.contains_key(buffer), "[[mixer.node]] {i} binds buffer {buffer:?}, which is not mix or a [mixer.scratch] entry")
+                    }
+                    crate::graph::Bind::State { state } => ensure!(
+                        crate::state::named(self, state).is_some_and(|s| s.per == crate::state::Per::Sequence && s.layers == crate::state::Layers::Linear && s.dtype == crate::state::Dtype::F32),
+                        "[[mixer.node]] {i} binds state {state:?}, which is not a per sequence f32 [[state]] on the linear layers"
+                    ),
+                    crate::graph::Bind::Number(_) => {}
+                    crate::graph::Bind::Name(n) => ensure!(m.params.contains_key(n), "[[mixer.node]] {i} binds {n:?}, which is not a [mixer.params] entry"),
+                }
+            }
+        }
+        ensure!(self.speculative().is_none(), "[mixer] cannot be combined with [mtp] yet");
+        ensure!(self.moe.is_none(), "[mixer] layers with mixture of experts are not supported yet");
+        ensure!(!self.uses_branch(), "[mixer] layers with sandwich or scaled residual norms are not supported yet");
+        Ok(())
+    }
+
     fn validate_attention_nodes(&self) -> Result<()> {
         let nodes = &self.attention.node;
         for p in &self.attention.projection {
             crate::state::dim(self, &p.rows).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
             for k in &p.layers {
-                ensure!(BLOCK_NAMES.contains(&k.as_str()), "[[attention.projection]] {} names layer block {k:?}, not dense, full, sliding, compressed or indexed", p.tensor);
+                Block::parse(k).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
             }
         }
         if let Some(c) = &self.attention.o_cols {
             crate::state::dim(self, c).context("[attention] o_cols")?;
         }
-        for (n, w) in self.attention.scratch.iter().chain(&self.attention.scratch_i32) {
+        for (n, w) in self.attention.scratch.iter().chain(&self.attention.int_scratch) {
             crate::state::dim(self, w).with_context(|| format!("[attention.scratch] {n}"))?;
         }
+        ensure!(self.attention.int_scratch.keys().all(|n| !self.attention.scratch.contains_key(n)), "[attention.int_scratch] repeats an [attention.scratch] name");
         if nodes.is_empty() {
             ensure!(self.attention.projection.is_empty() && self.attention.o_cols.is_none(), "[[attention.projection]] and o_cols need [[attention.node]]");
             return Ok(());
@@ -1819,6 +1914,9 @@ impl Spec {
                 "qk_rope" | "decode_rope" => {}
                 "kernel" => {
                     launches += 1;
+                    for l in &n.layers {
+                        Block::parse(l).with_context(|| format!("[[attention.node]] {i} layers"))?;
+                    }
                     ensure!(n.kernel.is_some(), "[[attention.node]] {i} is a kernel node without `kernel`");
                     ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[attention.node]] {i} needs a grid of one to three symbols");
                     for g in &n.grid {
@@ -1827,17 +1925,14 @@ impl Spec {
                             "[[attention.node]] {i} grid symbol {g:?} is not heads, kv_heads, rows, a number or an [attention.params] entry"
                         );
                     }
-                    for k in &n.layers {
-                        ensure!(BLOCK_NAMES.contains(&k.as_str()), "[[attention.node]] {i} names layer block {k:?}, not dense, full, sliding, compressed or indexed");
-                    }
                     for b in n.bind.values() {
                         match b {
                             crate::graph::Bind::Weight { len, .. } => {
                                 self.weight_len(len)?;
                             }
                             crate::graph::Bind::Buffer { buffer } => ensure!(
-                                matches!(buffer.as_str(), "qkv" | "attn") || self.attention.scratch.contains_key(buffer) || self.attention.scratch_i32.contains_key(buffer),
-                                "[[attention.node]] {i} binds buffer {buffer:?}, which is not qkv, attn or an [attention.scratch] entry"
+                                matches!(buffer.as_str(), "qkv" | "attn") || self.attention.scratch.contains_key(buffer) || self.attention.int_scratch.contains_key(buffer),
+                                "[[attention.node]] {i} binds buffer {buffer:?}, which is not qkv, attn or an [attention.scratch] or [attention.int_scratch] entry"
                             ),
                             crate::graph::Bind::State { state } => ensure!(
                                 crate::state::named(self, state).is_some_and(|s| s.positional()),
@@ -1955,6 +2050,14 @@ impl Spec {
         self.attention.rotary_dim.unwrap_or(self.attention.head_dim)
     }
 
+    pub fn mix_in_rows(&self) -> usize {
+        self.mixer.as_ref().map_or(0, |m| m.projection.iter().map(|p| crate::state::dim(self, &p.rows).unwrap_or(0)).sum())
+    }
+
+    pub fn mix_out_cols(&self) -> usize {
+        self.mixer.as_ref().map_or(0, |m| crate::state::dim(self, &m.out_cols).unwrap_or(0))
+    }
+
     pub fn qkv_rows(&self) -> usize {
         if !self.attention.projection.is_empty() {
             return self.attention.projection.iter().map(|p| crate::state::dim(self, &p.rows).unwrap_or(0)).sum();
@@ -1963,13 +2066,6 @@ impl Spec {
         self.q_dim() + 2 * self.kv_dim() + gate
     }
 
-    pub fn node_applies(&self, node: &crate::graph::Node, layer: usize) -> bool {
-        node.layers.is_empty() || node.layers.iter().any(|l| l == self.block(layer).name())
-    }
-
-    pub fn projection_applies(&self, p: &Projection, layer: usize) -> bool {
-        p.layers.is_empty() || p.layers.iter().any(|l| l == self.block(layer).name())
-    }
 
     pub fn o_dim(&self) -> usize {
         self.attention.o_cols.as_deref().map_or_else(|| self.q_dim(), |c| crate::state::dim(self, c).unwrap_or(0))

@@ -1,0 +1,127 @@
+kind = "kir-kernel"
+family = "scan_attention"
+name = "dsa_attention"
+threads = 128
+
+[geometry]
+layers = "latent_layers"
+kv_rows = 1
+k_width = "kv_lora_rank + qk_rope_head_dim"
+v_stride = "kv_lora_rank + qk_rope_head_dim"
+v_offset = 0
+v_width = "kv_lora_rank"
+out_row = "heads * kv_lora_rank"
+out_head = "kv_lora_rank"
+out_offset = 0
+
+[[query]]
+src = "q_latent"
+row = "heads * kv_lora_rank"
+head = "kv_lora_rank"
+offset = 0
+width = "kv_lora_rank"
+
+[[query]]
+src = "qr"
+row = "heads * (qk_nope_head_dim + qk_rope_head_dim)"
+head = "qk_nope_head_dim + qk_rope_head_dim"
+offset = "qk_nope_head_dim"
+width = "qk_rope_head_dim"
+
+[[param]]
+name = "qr"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "q_latent"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "idx"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "k_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "v_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+type = "f32"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "softmax_scale"
+type = "f32"
+role = "value"
+access = "read"
+
+[[stage]]
+op = "select_from"
+index = "idx"
+row = "index_topk"
+
+[[stage]]
+op = "epilogue"
+name = "score"
+expr = "s * softmax_scale"
+
+[[stage]]
+op = "online_softmax"
+value = "score"

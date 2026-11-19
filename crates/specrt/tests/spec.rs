@@ -243,6 +243,7 @@ fn qwen38_27b_config_parses_into_a_hybrid_spec_and_round_trips() {
     spec.name = file.name.clone();
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;
+    spec.plain_activations = file.plain_activations;
     assert_eq!(file, spec);
     assert_eq!(file.min_engine, 7);
     assert_eq!(file.mtp, Some(specrt::spec::Mtp::new(1)));
@@ -271,6 +272,7 @@ fn compressed_tensors_nvfp4_checkpoint_derives_fp8_channel_with_nvfp4_mlps_until
     serving.name = served.name.clone();
     serving.repo = served.repo.clone();
     serving.min_engine = served.min_engine;
+    serving.plain_activations = served.plain_activations;
     serving.runtime = served.runtime.clone();
     assert_eq!(served, serving);
     spec.rope.mrope = None;
@@ -278,6 +280,7 @@ fn compressed_tensors_nvfp4_checkpoint_derives_fp8_channel_with_nvfp4_mlps_until
     spec.name = file.name.clone();
     spec.repo = file.repo.clone();
     spec.min_engine = file.min_engine;
+    spec.plain_activations = file.plain_activations;
     spec.runtime = file.runtime.clone();
     assert_eq!(file, spec);
     assert_eq!(file.min_engine, 7);

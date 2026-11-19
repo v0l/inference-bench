@@ -7,6 +7,7 @@ mod ggml;
 mod vision;
 mod ops;
 mod moe;
+pub(crate) mod topk;
 
 pub use allreduce::{PROBE_STORE, PROBE_WAIT, emit_allreduce, emit_peer_probe};
 pub use attention::emit_attention;
@@ -186,6 +187,8 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
         Body::Compose(c) => c.emit_cuda(k)?,
         Body::Scan(c) => c.emit_cuda(k)?,
         Body::Rows(c) => c.emit_cuda(k)?,
+        Body::Recurrence(c) => c.emit_cuda(k)?,
+        Body::Seq(c) => c.emit_cuda(k)?,
         Body::GatedActivation { width, act } => {
             let a = match act {
                 Activation::Silu => "g / (1.0f + expf(-g))",
@@ -217,7 +220,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
 
 pub fn emit_module(kernels: &[Kernel]) -> Result<String, String> {
     let mut out = String::new();
-    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum())) {
+    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum()) || matches!(&k.body, Body::Rows(crate::rows::RowBody::LayerNorm { .. }))) {
         out.push_str(WARP_SUM);
     }
     for k in kernels {

@@ -95,6 +95,7 @@ impl Runtime {
             Op::DecodeAttention => self.attn_decode_rows(self.attn_of(layer), run.bb.expect("decode runs carry batch buffers"), n, run.qlen),
             Op::DecodeRope => self.decode_rope_rows(self.attn_of(layer), run.bb.expect("decode runs carry batch buffers"), n),
             Op::Kernel { node } => self.kernel_op(node, self.attn_of(layer), run),
+            Op::MixKernel { node } => self.mix_kernel_op(node, layer.expect("mixer ops run inside a layer"), run),
             Op::Swiglu => self.swiglu_legacy(n),
             Op::GdnPrefill => self.gdn_prefill_rows(self.gdn_of(layer), n, 0),
             Op::GdnDecode => self.gdn_decode_rows(self.gdn_of(layer), &run.bb.expect("decode runs carry batch buffers").slots, n),
@@ -154,8 +155,8 @@ impl Runtime {
                     Bind::Buffer { buffer } => match buffer.as_str() {
                         "qkv" => b.arg(&self.pre.qkv),
                         "attn" => b.arg(&self.pre.attn),
-                        other => match self.scratch_i32.get(other) {
-                            Some(s) => b.arg(s),
+                        other => match self.int_scratch.get(other) {
+                            Some(ints) => b.arg(ints),
                             None => b.arg(self.scratch.get(other).with_context(|| format!("no scratch buffer {other:?}"))?),
                         },
                     },
@@ -182,9 +183,74 @@ impl Runtime {
                 "heads" => a.heads as u32,
                 "kv_heads" => a.kv_heads as u32,
                 "rows" => run.n as u32,
-                number => match number.parse() {
-                    Ok(n) => n,
-                    Err(_) => *a.params.get(number).with_context(|| format!("grid symbol {number:?} is not an [attention.params] entry"))? as u32,
+                other => match a.params.get(other) {
+                    Some(v) => *v as u32,
+                    None => other.parse()?,
+                },
+            })
+        };
+        let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
+        let config = LaunchConfig { grid_dim: (dims[0], dims.get(1).copied().unwrap_or(1), dims.get(2).copied().unwrap_or(1)), block_dim: (launch.threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn mix_kernel_op(&self, node: u8, layer: &DeviceLayer, run: &Run) -> Result<()> {
+        let DeviceMixer::Described(d) = &layer.mixer else { unreachable!("mixer op on a layer without a described mixer") };
+        let mb = self.mixer.as_ref().expect("a described mixer has buffers");
+        let m = self.spec.mixer.as_ref().expect("a described mixer has a spec");
+        let launch = &self.mixer_launch[node as usize];
+        let spec_node = &m.node[node as usize];
+        let (seqs, rows_per_seq, slot_base, slot_step, slots) = match run.bb {
+            Some(bb) if run.n > 0 => (run.n / run.qlen.max(1), run.qlen.max(1), 0, 1, &bb.slots),
+            _ => (1, run.n, self.seq, 0, &self.buf.zero_slots),
+        };
+        let number = |b: &Bind| -> Result<f64> {
+            Ok(match b {
+                Bind::Number(v) => *v,
+                Bind::Name(n) => *m.params.get(n).with_context(|| format!("{n:?} is not a [mixer.params] entry"))?,
+                _ => bail!("a weight, buffer or state binding is not a number"),
+            })
+        };
+        let mut ints = vec![0i32; launch.params.len()];
+        let mut floats = vec![0f32; launch.params.len()];
+        for (i, p) in launch.params.iter().enumerate().filter(|(_, p)| p.role == kir::Role::Value) {
+            let v = match p.name {
+                "layer" => f64::from(d.slot),
+                "slot_base" => f64::from(slot_base),
+                "slot_step" => f64::from(slot_step),
+                "rows_per_seq" => rows_per_seq as f64,
+                name => number(spec_node.bind.get(name).with_context(|| format!("param {name:?} is not bound"))?)?,
+            };
+            ints[i] = v as i32;
+            floats[i] = v as f32;
+        }
+        let mut b = self.stream.launch_builder(self.kernel(launch.name));
+        for (i, p) in launch.params.iter().enumerate() {
+            match (p.role, p.name) {
+                (kir::Role::Value, _) => match p.ty {
+                    kir::Scalar::F32 => b.arg(&floats[i]),
+                    _ => b.arg(&ints[i]),
+                },
+                (_, "slots") => b.arg(slots),
+                (_, "out_hi") => b.arg(&mb.planes.hi),
+                (_, "out_lo") => b.arg(&mb.planes.lo),
+                (_, name) => match spec_node.bind.get(name) {
+                    Some(Bind::Weight { weight, .. }) => b.arg(d.extra.get(weight).with_context(|| format!("layer has no {weight} tensor"))?),
+                    Some(Bind::Buffer { buffer }) if buffer == "mix" => b.arg(&mb.mix),
+                    Some(Bind::Buffer { buffer }) => b.arg(mb.scratch.get(buffer).with_context(|| format!("no mixer scratch {buffer:?}"))?),
+                    Some(Bind::State { state }) => b.arg(&*mb.states.iter().find(|s| s.name == *state).with_context(|| format!("no sequence state {state:?}"))?.slice),
+                    _ => bail!("param {name:?} of {} is not bound to a buffer", launch.name),
+                },
+            };
+        }
+        let dim = |symbol: &String| -> Result<u32> {
+            Ok(match symbol.as_str() {
+                "rows" => run.n as u32,
+                "seqs" => seqs as u32,
+                other => match m.params.get(other) {
+                    Some(v) => *v as u32,
+                    None => other.parse()?,
                 },
             })
         };
@@ -213,14 +279,21 @@ impl Runtime {
     fn attn_of<'a>(&self, layer: Option<&'a DeviceLayer>) -> &'a DeviceAttn {
         match &layer.expect("attention ops run inside a layer").mixer {
             DeviceMixer::Attention(a) => a,
-            DeviceMixer::Linear(_) => unreachable!("attention op on a linear layer"),
+            _ => unreachable!("attention op on a linear layer"),
         }
     }
 
     fn gdn_of<'a>(&self, layer: Option<&'a DeviceLayer>) -> &'a super::DeviceGdn {
         match &layer.expect("linear ops run inside a layer").mixer {
             DeviceMixer::Linear(g) => g,
-            DeviceMixer::Attention(_) => unreachable!("linear op on an attention layer"),
+            _ => unreachable!("linear op on an attention layer"),
+        }
+    }
+
+    fn described_of<'a>(&self, layer: Option<&'a DeviceLayer>) -> &'a super::DeviceDescribed {
+        match &layer.expect("mixer ops run inside a layer").mixer {
+            DeviceMixer::Described(d) => d,
+            _ => unreachable!("mixer op on a layer without a described mixer"),
         }
     }
 
@@ -327,6 +400,7 @@ impl Runtime {
             Buf::AttnPlanes => &self.pre.attn_planes,
             Buf::ActPlanes => &self.pre.act_planes,
             Buf::GdnPlanes => &self.gdn.as_ref().expect("linear layers have gdn buffers").planes,
+            Buf::MixPlanes => &self.mixer.as_ref().expect("a described mixer has buffers").planes,
             Buf::FcPlanes => self.mtp_fc_planes(),
             other => unreachable!("{} is not a plane pair", other.label()),
         }
@@ -344,6 +418,7 @@ impl Runtime {
             Buf::Act => &self.pre.act,
             Buf::PreLin => &gdn().pre_lin,
             Buf::PreBa => &gdn().pre_ba,
+            Buf::Mix => &self.mixer.as_ref().expect("a described mixer has buffers").mix,
             Buf::Logits => run.logits,
             Buf::MtpLogits => self.mtp_logits(),
             Buf::Partial => &self.partial,
@@ -352,7 +427,7 @@ impl Runtime {
     }
 
     fn is_planes(b: Buf) -> bool {
-        matches!(b, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::FcPlanes)
+        matches!(b, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes)
     }
 
     fn weight_of<'a>(&'a self, weight: Weight, layer: Option<&'a DeviceLayer>) -> (&'a DeviceMatrix, Option<&'a CudaSlice<f32>>) {
@@ -367,6 +442,8 @@ impl Runtime {
             Weight::LinIn => (&gdn().in_proj, None),
             Weight::LinBa => (&gdn().ba, None),
             Weight::LinOut => (&gdn().out, None),
+            Weight::MixIn => (&self.described_of(layer).in_proj, None),
+            Weight::MixOut => (&self.described_of(layer).out, None),
             Weight::LmHead => (&self.lm_head, None),
             Weight::MtpQkv => (&attn().qkv, None),
             Weight::MtpO => (&attn().o, None),

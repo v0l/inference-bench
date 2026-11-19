@@ -51,9 +51,10 @@ fn kq_combine() -> &'static str {
 fn kq_x_loads(rows_form: bool) -> String {
     let sums = |a: &str, b: &str| format!("slo += {};\nshi += {};\n", sum4(a), sum4(b));
     if rows_form {
+        let loop_body = format!("{}{}{}", prim::load_f4("a[w4]", "xs", "4 * w4"), prim::load_f4("b[w4]", "xs", "32 + 4 * w4"), sums("a[w4]", "b[w4]"));
         format!(
-            "        const float* xs = x + sl * GG_SB + 64 * j + l0;\n        float4 a[4], b[4];\n        float slo = 0.0f, shi = 0.0f;\n#pragma unroll\n        for (int w4 = 0; w4 < 4; w4++) {{\n            a[w4] = *(const float4*)(xs + 4 * w4);\n            b[w4] = *(const float4*)(xs + 32 + 4 * w4);\n{}        }}\n",
-            ind(&sums("a[w4]", "b[w4]"), 12)
+            "        const float* xs = x + sl * GG_SB + 64 * j + l0;\n        float4 a[4], b[4];\n        float slo = 0.0f, shi = 0.0f;\n{}",
+            prim::unroll_nest(8, &[("w4", "4")], true, &loop_body)
         )
     } else {
         String::new()
@@ -130,7 +131,18 @@ fn q6k_rows(f: &Format, qh: usize, scales: usize, d: usize) -> String {
         "qa[r] = load_stream8(sb + 64 * h + l0);\nqb[r] = load_stream8(sb + 64 * h + 32 + l0);\nqc[r] = load_stream8(sb + {qh} + 32 * h + l0);\nunsigned w = __ldg((const unsigned*)(sb + {scales} + 8 * h));\nunsigned w2 = __ldg((const unsigned*)(sb + {} + 8 * h));\nsc[r][0] = w;\nsc[r][1] = w2;\ndh[r] = __ldg((const unsigned short*)(sb + {d}));\n",
         scales + 4
     );
-    let shared = "        const float* xs = x + sl * GG_SB + 128 * h + l0;\n        float xv[4][8];\n#pragma unroll\n        for (int k = 0; k < 4; k++) {\n            float4 u = *(const float4*)(xs + 32 * k);\n            float4 v = *(const float4*)(xs + 32 * k + 4);\n            xv[k][0] = u.x; xv[k][1] = u.y; xv[k][2] = u.z; xv[k][3] = u.w;\n            xv[k][4] = v.x; xv[k][5] = v.y; xv[k][6] = v.z; xv[k][7] = v.w;\n        }\n";
+    let lane_stores = |v: &str, base: usize| (0..4).map(|c| format!("xv[k][{}] = {v}.{}; ", base + c, ["x", "y", "z", "w"][c])).collect::<String>();
+    let x_body = [
+        prim::load_f4("float4 u", "xs", "32 * k"),
+        prim::load_f4("float4 v", "xs", "32 * k + 4"),
+        format!("{}\n", lane_stores("u", 0).trim_end()),
+        format!("{}\n", lane_stores("v", 4).trim_end()),
+    ]
+    .concat();
+    let shared = &format!(
+        "        const float* xs = x + sl * GG_SB + 128 * h + l0;\n        float xv[4][8];\n{}",
+        prim::unroll_nest(8, &[("k", "4")], true, &x_body)
+    );
     rows::dequant_rows(&RowLoop {
         tag: f.tag,
         setup: Q6_LANE_SETUP,

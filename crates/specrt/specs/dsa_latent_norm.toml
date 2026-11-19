@@ -1,0 +1,10 @@
+kind = "kir-kernel"
+family = "rmsnorm_segment"
+name = "dsa_latent_norm"
+threads = 256
+
+[args]
+width = "kv_lora_rank"
+stride = "qkv_row"
+start = "q_lora_rank"
+eps = 1e-6

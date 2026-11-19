@@ -35,3 +35,27 @@ Tiles, 4 runs each: 256x128 (4x2) 15.3-15.6k tok/s, 128x256 11.8k, 128x128 (2x4)
 | phi3 | 4610.8 (3807.3) | 5763.5 llama.cpp | 0.80 (0.67) | 0.87 | 1.06 |
 
 The 0.8x target at 1,024 tokens is reached on phi3 only. phi3's vLLM column did not run on the last pass, so its ratio is against llama.cpp (its earlier vLLM figure was lower than llama.cpp). The rest of the gap is the main loop (the kernel is at about 85% of cuBLAS's 79 TFLOP/s, see docs/perf/llama/2026-11-19.md) and the non-GEMM kernels (flash_mma 6-14%).
+
+## qwen3_5 (#815)
+
+Qwen3.5-9B on the Spark, prefill paired A/B (split vs single plane, 4 rounds): 1024 tokens 1850 to 2040-2190 tok/s (about 1.11x), 4096 tokens 1720 to 2020-2150 (about 1.20x); decode level. Against fp32 transformers (CPU, TF32 off, 312 rows of 8 prompts, same prompts as the other families):
+
+| path | mean KL | max KL | top-1 of 312 |
+|---|---|---|---|
+| vLLM | 2.78e-04 | 1.54e-03 | 306 |
+| specrt split (old default) | 1.1e-10 | 9.9e-10 | 312 |
+| specrt single plane (new default) | 1.07e-05 | 2.09e-04 | 311 |
+
+Single plane is 26x closer to fp32 than vLLM on mean KL, 7x on max, with more top-1 matches. Rerun: `envelope <checkpoint> prompts.json out split plain` then `envelope.py compare`. `family-qwen3_5.toml` now sets `split_activations = false`; `[runtime] split_activations = true` restores the exact path. The remaining gap to llama.cpp is the bf16 GEMM main loop (gate_up_mma_big 45% of prefill) and gdn_chunk_prep/scan (5%).
+
+## qwen3_moe FP8 experts (#885)
+
+Qwen3-30B-A3B-FP8 against an fp32 rebuild (FP8 weights dequantised with their block scales), 8 prompts, 310 rows. vLLM serves this checkpoint with FP8 W8A8.
+
+| path | mean KL | max KL | top-1 of 310 |
+|---|---|---|---|
+| vLLM (FP8 W8A8) | 1.24e-02 | 9.70e-01 | 300 |
+| specrt FP8 grouped mma (32 wide activation scales, new default for FP8 MoE) | 2.94e-03 | 1.09e-01 | 306 |
+| specrt bf16 activations, GEMV experts | 6.97e-07 | 1.70e-04 | 310 |
+
+The FP8 activation path is 4x closer to fp32 than vLLM on mean KL, so it is the serving default for FP8 MoE checkpoints (`[mlp] act_quant = "fp8"`; set `"none"` for the exact path). Rerun: `scripts/envelope_moe_fp8.py` then `envelope.py compare`.

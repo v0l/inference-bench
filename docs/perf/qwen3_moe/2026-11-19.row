@@ -1,0 +1,1 @@
+| qwen3_moe | `Qwen3-30B-A3B-FP8` | 52.6 | 306.5 | 158.7 | vllm | 40.3 | 3959.2 | 133.3 | 1.30 | 0.08 | 1.19 | 2026-11-19 | d29bb13 | `crates/specrt/scripts/perfpass.sh qwen3_moe --model /home/kieran/ib-gates/817/models/Qwen3-30B-A3B-FP8 --host spark` |

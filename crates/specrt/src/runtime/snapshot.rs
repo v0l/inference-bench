@@ -67,8 +67,53 @@ impl Runtime {
 
     fn ensure_snapshot_slot(&self, slot: usize) -> Result<()> {
         ensure!(slot < self.slots, "slot {slot} out of {}", self.slots);
+        if self.mixer.is_some() {
+            ensure!(self.mixer_state_live(slot), "recurrent state of slot {slot} is not allocated");
+            return Ok(());
+        }
         let gb = self.gdn.as_ref().context("no linear layers")?;
         ensure!(gb.ssm_pool.is_live(slot), "recurrent state of slot {slot} is not allocated");
+        Ok(())
+    }
+
+    pub(super) fn has_seq_state(&self) -> bool {
+        self.gdn.is_some() || self.mixer.is_some()
+    }
+
+    fn mixer_lens(&self) -> Vec<usize> {
+        self.mixer.iter().flat_map(|mb| mb.states.iter().map(|s| s.pool.stride_bytes() / 4)).collect()
+    }
+
+    fn mixer_snapshot(&self, slot: usize) -> Result<StateSnapshot> {
+        self.ensure_snapshot_slot(slot)?;
+        let mb = self.mixer.as_ref().context("no mixer")?;
+        self.stream.synchronize()?;
+        let mut parts = Vec::new();
+        for s in &mb.states {
+            let n = s.pool.stride_bytes() / 4;
+            parts.push(self.stream.clone_dtoh(&s.slice.slice(slot * n..(slot + 1) * n))?);
+        }
+        let first = if parts.is_empty() { Vec::new() } else { parts.remove(0) };
+        Ok(StateSnapshot::new(first, parts.concat(), Vec::new()))
+    }
+
+    fn mixer_restore(&mut self, slot: usize, snap: &StateSnapshot) -> Result<()> {
+        let lens = self.mixer_lens();
+        let first = lens.first().copied().unwrap_or(0);
+        let rest: usize = lens.iter().skip(1).sum();
+        ensure!(snap.conv().len() == first && snap.ssm().len() == rest && snap.pending().is_empty(), "snapshot does not match this model's recurrent state");
+        self.acquire_state(slot)?;
+        let mb = self.mixer.as_mut().context("no mixer")?;
+        let mut at = 0;
+        for (i, s) in mb.states.iter_mut().enumerate() {
+            let n = s.pool.stride_bytes() / 4;
+            let src = if i == 0 { snap.conv() } else { &snap.ssm()[at..at + n] };
+            if i > 0 {
+                at += n;
+            }
+            self.stream.memcpy_htod(src, &mut s.slice.slice_mut(slot * n..(slot + 1) * n))?;
+        }
+        self.stream.synchronize()?;
         Ok(())
     }
 
@@ -83,6 +128,9 @@ impl Runtime {
     }
 
     pub fn snapshot_state_blocking(&self, slot: usize) -> Result<StateSnapshot> {
+        if self.mixer.is_some() {
+            return self.mixer_snapshot(slot);
+        }
         self.ensure_snapshot_slot(slot)?;
         let (conv, ssm) = self.state_lens()?;
         let gb = self.gdn.as_ref().context("no linear layers")?;
@@ -96,6 +144,9 @@ impl Runtime {
     }
 
     pub fn snapshot_state_async(&mut self, slot: usize) -> Result<StateSnapshot> {
+        if self.mixer.is_some() {
+            return self.mixer_snapshot(slot);
+        }
         self.ensure_snapshot_slot(slot)?;
         let (conv, ssm) = self.state_lens()?;
         let pending = self.pending_len();
@@ -138,6 +189,9 @@ impl Runtime {
 
     pub fn restore_state(&mut self, slot: usize, snap: &StateSnapshot) -> Result<()> {
         ensure!(slot < self.slots, "slot {slot} out of {}", self.slots);
+        if self.mixer.is_some() {
+            return self.mixer_restore(slot, snap);
+        }
         let (conv, ssm) = self.state_lens()?;
         let pending = self.pending_len();
         ensure!(
@@ -175,7 +229,13 @@ impl Runtime {
     }
 
     pub fn swap_bytes(&self, blocks: usize) -> usize {
-        let state = if self.gdn.is_some() { self.state_lens().map_or(0, |(c, s)| (c + s + self.pending_len()) * 4) } else { 0 };
+        let state = if self.mixer.is_some() {
+            self.mixer_lens().iter().sum::<usize>() * 4
+        } else if self.gdn.is_some() {
+            self.state_lens().map_or(0, |(c, s)| (c + s + self.pending_len()) * 4)
+        } else {
+            0
+        };
         blocks * self.kv_bytes_per_block() + state
     }
 
@@ -213,7 +273,7 @@ impl Runtime {
 
     pub fn park(&mut self, slot: usize, blocks: &[u32]) -> Result<HostSeq> {
         ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
-        let state = if self.gdn.is_some() { Some(self.snapshot_state_blocking(slot)?) } else { None };
+        let state = if self.has_seq_state() { Some(self.snapshot_state_blocking(slot)?) } else { None };
         let total = blocks.len() * self.kv_bytes_per_block();
         let mut host = self.host.alloc(total)?;
         self.blocks_to_host(blocks, host.as_mut_slice()?)?;

@@ -10,6 +10,7 @@ const MLA: &str = "tiny-deepseek-v2";
 const MLA_MOE: &str = "tiny-deepseek-v2-moe";
 const GLM: &str = "tiny-glm4-moe";
 const OSS: &str = "tiny-gpt-oss";
+const DSA: &str = "tiny-glm-dsa";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -235,8 +236,8 @@ fn the_gpt_oss_checkpoint_decodes_mxfp4_experts_and_loads_every_bias() {
     let w = ck.layer(&spec, 0).unwrap();
     let m = w.moe.unwrap();
     let (h, inter, e) = (256, 256, 8);
-    let specrt::weights::Stacked::Bf16(gate) = &m.gate else { panic!("bf16") };
-    assert_eq!(gate.len(), e * inter * h);
+    let specrt::weights::Stacked::Block { packed, scales } = &m.gate else { panic!("packed") };
+    assert_eq!((packed.len(), scales.len()), (e * inter * h / 2, e * inter * h / 32));
     assert_eq!((m.router_bias.unwrap().len(), m.gate_up_bias.unwrap().len(), m.down_bias.unwrap().len()), (e, e * 2 * inter, e * h));
     let specrt::weights::Mixer::Attention(a) = &w.mixer else { panic!("attention") };
     assert_eq!(a.o_bias.as_ref().unwrap().len(), h);
@@ -247,4 +248,61 @@ fn the_gpt_oss_checkpoint_decodes_mxfp4_experts_and_loads_every_bias() {
 #[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
 fn gpt_oss_sinks_clamped_swiglu_and_mxfp4_experts_match_transformers() {
     close(OSS, 5e-2);
+}
+
+#[test]
+fn the_dsa_config_reads_indexer_layers_states_and_nodes_from_the_family_toml() {
+    let spec = spec(DSA);
+    assert_eq!(spec.layers.pattern, vec![Block::Full, Block::Shared]);
+    assert_eq!(spec.state.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["latent", "index_key"]);
+    assert_eq!(specrt::state::named(&spec, "index_key").unwrap().dims(&spec).unwrap(), vec![1, 64]);
+    assert_eq!(spec.attention.params["index_topk"], 8.0);
+    assert!((spec.attention.params["index_scale"] - 0.125).abs() < 1e-12);
+    assert!((spec.attention.params["index_w_scale"] - 0.5f64.sqrt() / 2.0).abs() < 1e-12);
+    assert_eq!(spec.qkv_rows(), 64 + 128 + 64 + 8);
+    let plan = Plan::build(&spec, Phase::Prefill, true);
+    let kernels = |block: Block| plan.layer(block).iter().filter(|o| matches!(o, Op::Kernel { .. })).count();
+    assert_eq!((kernels(Block::Full), kernels(Block::Shared)), (15, 9));
+}
+
+#[test]
+fn the_dsa_module_builds_with_no_binary_support() {
+    let module = specrt::codegen::Module::generate_kv(&spec(DSA), 256, 1, &kir::Target::sm_120()).unwrap();
+    for k in ["dsa_q_norm", "dsa_latent_norm", "dsa_q_b", "dsa_rope_q", "dsa_latent_write", "dsa_absorb_q", "dsa_index_q", "dsa_index_rope_q", "dsa_index_k_norm", "dsa_index_rope_k", "dsa_index_write", "dsa_index_topk", "dsa_attention"] {
+        assert!(module.kernels.contains(&k), "{k}");
+        assert!(module.source.contains(&format!("{k}(")), "{k}");
+    }
+    assert!(module.source.contains("sel_hit"), "the scan keeps only indexed keys");
+    assert!(module.source.contains("rsqrtf(kir_block_sum(sq, scratch)"), "the indexer key uses a layernorm");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn dsa_indexer_with_a_shared_layer_matches_transformers() {
+    close(DSA, 5e-2);
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn gpt_oss_block_scaled_mma_experts_match_the_packed_gemv_experts() {
+    let (tokens, _, vocab, _) = reference(OSS);
+    let mut mma = spec(OSS);
+    mma.mlp.act_quant = specrt::spec::ActQuant::Fp4;
+    let gemv = spec(OSS);
+    let mut rt_mma = Runtime::load_batched(&mma, 256, 1).unwrap();
+    let mut rt_gemv = Runtime::load_batched(&gemv, 256, 1).unwrap();
+    let a = rt_mma.prompt_logits(&tokens).unwrap();
+    let b = rt_gemv.prompt_logits(&tokens).unwrap();
+    let time = |rt: &mut Runtime| {
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            rt.prompt_logits(&tokens).unwrap();
+        }
+        start.elapsed().as_secs_f64() * 20.0
+    };
+    eprintln!("gpt-oss prefill of {} tokens: mma {:.2} ms, gemv {:.2} ms", tokens.len(), time(&mut rt_mma), time(&mut rt_gemv));
+    let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+    let cosine = dot(&a, &b) / (dot(&a, &a).sqrt() * dot(&b, &b).sqrt());
+    eprintln!("gpt-oss mma vs gemv cosine {cosine} over {} rows of {vocab}", tokens.len());
+    assert!(a.iter().all(|v| v.is_finite()) && cosine > 0.8, "cosine {cosine}");
 }

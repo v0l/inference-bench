@@ -15,6 +15,9 @@ qk_norm = true
 [blocks]
 kind = "hybrid"
 
+[runtime]
+split_activations = false
+
 [gguf]
 output_gate = true
 mrope_interleaved = true

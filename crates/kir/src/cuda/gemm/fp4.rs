@@ -49,11 +49,7 @@ acc[r] += part * e4m3_to_f32(sc[r][u]);
 
 pub fn body() -> String {
     [
-        r##"constexpr int FP4_GROUP = 16;
-constexpr int FP4_HEADER = 16;
-constexpr int FP4_GEMV_THREADS = 512;
-
-"##.to_string(),
+        [("FP4_GROUP", "16"), ("FP4_HEADER", "16"), ("FP4_GEMV_THREADS", "512")].iter().map(|(n, v)| prim::constexpr_int(n, v)).collect::<String>() + "\n",
         prim::device("float", "fp4_inv_global", "const unsigned char* scales", "    return __ldg((const float*)scales);\n"),
         r##""##.to_string(),
         prim::e2m1_to_f32("e2m1_to_f32"),
@@ -61,16 +57,14 @@ constexpr int FP4_GEMV_THREADS = 512;
         prim::device_t("int K, int ROWS, int U", "void", "fp4_rows_dot", "const void* w, const unsigned char* scales, int row0, int stride, const float* xt, int lane, float* result", &fp4_rows_dot_body()),
         prim::device("void", "cp_async4", "void* smem, const void* gmem", "    unsigned s = (unsigned)__cvta_generic_to_shared(smem);\n    asm volatile(\"cp.async.ca.shared.global [%0], [%1], 4;\" :: \"r\"(s), \"l\"(gmem));\n"),
         prim::device("unsigned", "fp4_pair_bf16", "unsigned byte, float scale", &format!("{}{}    return (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);\n", "    float lo = e2m1_to_f32(byte & 15u) * scale;\n", "    float hi = e2m1_to_f32(byte >> 4) * scale;\n")),
-        r##"constexpr int F4W_BK = 64;
-constexpr int F4W_ROW = 48;
-
-struct DecFp4 : DecBase<DecFp4> {
-    static constexpr int ACC = ACC_DIRECT;
-    static constexpr bool LDSM = false;
-    static constexpr int WARPS = FP4_GEMV_THREADS / 32;
-    template <int BK> static constexpr int wrow = F4W_ROW;
-    template <int BK> static constexpr int w_chunks = 3;
-    template <int W> static __device__ __forceinline__ int x_at(int i) { return fp4_t(i, W / FP4_GROUP); }
+        [("F4W_BK", "64"), ("F4W_ROW", "48")].iter().map(|(n, v)| prim::constexpr_int(n, v)).collect::<String>() + "\n",
+        prim::dec_struct_open("DecFp4"),
+        prim::static_const("int", "ACC", "ACC_DIRECT"),
+        prim::static_const("bool", "LDSM", "false"),
+        prim::static_const("int", "WARPS", "FP4_GEMV_THREADS / 32"),
+        prim::static_const_t("int BK", "int", "wrow", "F4W_ROW"),
+        prim::static_const_t("int BK", "int", "w_chunks", "3"),
+        r##"    template <int W> static __device__ __forceinline__ int x_at(int i) { return fp4_t(i, W / FP4_GROUP); }
     template <int K, int ROWS>
     static __device__ __forceinline__ void rows(const void* w, const void* s, int row0, int stride, const float* x, int lane, float* out) {
 "##.to_string(),

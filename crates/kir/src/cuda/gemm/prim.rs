@@ -76,6 +76,47 @@ pub fn device(ret: &str, name: &str, args: &str, body: &str) -> String {
     format!("__device__ __forceinline__ {ret} {name}({args}) {{\n{body}}}\n\n")
 }
 
+pub fn constexpr_int(name: &str, value: &str) -> String {
+    format!("constexpr int {name} = {value};\n")
+}
+
+pub fn dec_struct_open(name: &str) -> String {
+    format!("struct {name} : DecBase<{name}> {{\n")
+}
+
+pub fn static_const(ty: &str, name: &str, value: &str) -> String {
+    format!("    static constexpr {ty} {name} = {value};\n")
+}
+
+pub fn static_const_t(template: &str, ty: &str, name: &str, value: &str) -> String {
+    format!("    template <{template}> static constexpr {ty} {name} = {value};\n")
+}
+
+pub fn ldg_reader(name: &str, ptr_ty: &str) -> String {
+    device("unsigned", name, "const unsigned char* p", &format!("    return __ldg((const {ptr_ty}*)p);\n"))
+}
+
+pub fn f16_to_f32(name: &str) -> String {
+    device("float", name, "unsigned short h", "    float r;\n    asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(r) : \"h\"(h));\n    return r;\n")
+}
+
+pub fn byte_of_words(name: &str) -> String {
+    device("unsigned", name, "const unsigned* s, int i", "    return (s[i >> 2] >> (8 * (i & 3))) & 0xffu;\n")
+}
+
+pub fn table_row(name: &str) -> String {
+    device(
+        "const unsigned char*",
+        name,
+        "const void* w, const unsigned* table, int row, int& type",
+        "    unsigned e = __ldg(table + row);\n    type = (int)(e & 7u);\n    return (const unsigned char*)w + (size_t)(e >> 3) * 16;\n",
+    )
+}
+
+pub fn load_f4(dst: &str, base: &str, offset: &str) -> String {
+    format!("{dst} = *(const float4*)({base} + {offset});\n")
+}
+
 pub fn mma_fp4(name: &str) -> String {
     device(
         "void",
@@ -88,6 +129,30 @@ pub fn mma_fp4(name: &str) -> String {
         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(z), "h"(z), "r"(sfb), "h"(z), "h"(z));
 "#,
+    )
+}
+
+pub fn mma_mx(name: &str) -> String {
+    device(
+        "void",
+        name,
+        "float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa, unsigned sfb, unsigned short bid",
+        r#"    unsigned short z = 0;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(bid), "h"(z), "r"(sfb), "h"(bid), "h"(z));
+"#,
+    )
+}
+
+pub fn cp4_zfill(name: &str) -> String {
+    device(
+        "void",
+        name,
+        "void* smem, const void* gmem, bool valid",
+        "    unsigned s = (unsigned)__cvta_generic_to_shared(smem);\n    int n = valid ? 4 : 0;\n    asm volatile(\"cp.async.ca.shared.global [%0], [%1], 4, %2;\" :: \"r\"(s), \"l\"(gmem), \"r\"(n));\n",
     )
 }
 
@@ -293,9 +358,9 @@ pub fn cp_async_call(func: &str, args: &[&str]) -> String {
     format!("{func}({});", args.join(", "))
 }
 
-pub fn cp_async_stage(iters: &str, total: &str, chunks: &str, col: &str, planes: bool, prelude: &str, copy: &str) -> String {
-    let head = if planes {
-        format!("int p = idx / ({total});\nint rem = idx % ({total});\nint r = rem / {chunks};\nint {col} = rem % {chunks};\n")
+pub fn cp_async_stage(iters: &str, total: &str, chunks: &str, col: &str, plane: Option<&str>, prelude: &str, copy: &str) -> String {
+    let head = if let Some(plane) = plane {
+        format!("int p = idx / ({plane});\nint rem = idx % ({plane});\nint r = rem / {chunks};\nint {col} = rem % {chunks};\n")
     } else {
         format!("int r = idx / {chunks};\nint {col} = idx % {chunks};\n")
     };
@@ -347,4 +412,55 @@ pub fn batch_load_w(sig: &str, loads: &[&str]) -> String {
         body.push('\n');
     }
     format!("    auto load_w = [&](int c, {sig}) {{\n{}    }};\n", unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, &body))
+}
+
+pub enum RowFormat<'a> {
+    Bf16,
+    Fp8,
+    Fp4Rows { decode: &'a str },
+}
+
+pub struct RowLoad {
+    pub unroll: u32,
+    pub stream: bool,
+}
+
+pub fn multi_row_dot(name: &str, format: RowFormat, load: RowLoad) -> String {
+    let unroll = if load.unroll == 0 { String::new() } else { format!("#pragma unroll {}\n", load.unroll) };
+    let load16 = |p: &str| if load.stream { format!("load_stream({p})") } else { format!("*(const uint4*)({p})") };
+    let load8 = |p: &str| if load.stream { format!("load_stream8({p})") } else { format!("*(const uint2*)({p})") };
+    let columns = |tail: &str| format!("#pragma unroll\n    for (int j = 0; j < NC; j++) {{\n        if (j < live) {{\n{tail}        }}\n    }}\n");
+    let (args, body) = match format {
+        RowFormat::Bf16 => (
+            "const bf16_t* wr, const float* xs, int lane, int live, float* acc",
+            format!(
+                "{unroll}    for (int k = lane * 8; k < K; k += 256) {{\n        uint4 packed = {};\n{}    }}\n",
+                load16("wr + k"),
+                columns(
+                    "            const float* x = xs + j * K + k;\n            float4 xa = *(const float4*)x;\n            float4 xb = *(const float4*)(x + 4);\n            float part = __uint_as_float(packed.x << 16) * xa.x + __uint_as_float(packed.x & 0xffff0000u) * xa.y;\n            part += __uint_as_float(packed.y << 16) * xa.z + __uint_as_float(packed.y & 0xffff0000u) * xa.w;\n            part += __uint_as_float(packed.z << 16) * xb.x + __uint_as_float(packed.z & 0xffff0000u) * xb.y;\n            part += __uint_as_float(packed.w << 16) * xb.z + __uint_as_float(packed.w & 0xffff0000u) * xb.w;\n            acc[j] += part;\n"
+                )
+            ),
+        ),
+        RowFormat::Fp8 => (
+            "const unsigned char* wr, const float* sr, const float* xs, int lane, int live, float* acc",
+            format!(
+                "{unroll}    for (int k = lane * 16; k < K; k += 512) {{\n        uint4 packed = {};\n        float sc = sr[k / FP8_BLOCK];\n{}    }}\n",
+                load16("wr + k"),
+                columns(
+                    "            const float* x = xs + j * K + k;\n            float part = e4m3_dot4(packed.x, *(const float4*)x) + e4m3_dot4(packed.y, *(const float4*)(x + 4)) +\n                         e4m3_dot4(packed.z, *(const float4*)(x + 8)) + e4m3_dot4(packed.w, *(const float4*)(x + 12));\n            acc[j] += part * sc;\n"
+                )
+            ),
+        ),
+        RowFormat::Fp4Rows { decode } => (
+            "const unsigned char* wr, const unsigned char* sb, const float* xs, int lane, int live, float* acc",
+            format!(
+                "{unroll}    for (int grp = lane; grp < K / 16; grp += 32) {{\n        uint2 q = {};\n        float v[16];\n#pragma unroll\n        for (int i = 0; i < 8; i++) {{\n            unsigned byte = ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xffu;\n            v[2 * i] = {decode}(byte & 0xfu);\n            v[2 * i + 1] = {decode}(byte >> 4);\n        }}\n        float sc = e4m3_to_f32(sb[grp]);\n{}    }}\n",
+                load8("wr + (size_t)grp * 8"),
+                columns(
+                    "            float part = 0.0f;\n#pragma unroll\n            for (int i = 0; i < 16; i++) part += v[i] * xs[j * K + grp * 16 + i];\n            acc[j] += part * sc;\n"
+                )
+            ),
+        ),
+    };
+    format!("template <int K, int NC>\n{}", device("void", name, args, &body))
 }
