@@ -125,11 +125,32 @@ fn dot2_mx() -> &'static str {
 }
 
 fn dot2_fp8() -> &'static str {
-    "        const float* sg = g + (size_t)expert * MOE_FP8_GRID<ROWS, K> + (row / FP8_BLOCK) * MOE_FP8_KB<K>;\n#pragma unroll\n        for (int j = 0; j < MOE_TJ; j++) {\n            if (j < live) result[j] = dot_fp8_scaled<K>((const unsigned char*)w + at * K, sg, xs + j * K, lane);\n        }\n"
+    r##"        const unsigned char* wb = (const unsigned char*)w + at * K;
+        const float* sg = g + (size_t)expert * MOE_FP8_GRID<ROWS, K> + (row / FP8_BLOCK) * MOE_FP8_KB<K>;
+        for (int k = lane * 16; k < K; k += 512) {
+            uint4 q = *(const uint4*)(wb + k);
+            float sc = sg[k / FP8_BLOCK];
+#pragma unroll
+            for (int j = 0; j < MOE_TJ; j++) {
+                if (j < live) {
+                    const float* x = xs + j * K + k;
+                    float part = e4m3_dot4(q.x, *(const float4*)(x)) + e4m3_dot4(q.y, *(const float4*)(x + 4)) +
+                                 e4m3_dot4(q.z, *(const float4*)(x + 8)) + e4m3_dot4(q.w, *(const float4*)(x + 12));
+                    result[j] += part * sc;
+                }
+            }
+        }
+"##
 }
 
 fn dot2_bf16() -> &'static str {
-    "#pragma unroll\n        for (int j = 0; j < MOE_TJ; j++) {\n            if (j < live) result[j] = dot_bf16<K>(w, (int)at, xs + j * K, lane);\n        }\n"
+    r##"        const bf16_t* wb = (const bf16_t*)w + at * K;
+        for (int k = lane; k < K; k += 32) {
+            float wv = bf16_to_f32(wb[k]);
+#pragma unroll
+            for (int j = 0; j < MOE_TJ; j++) if (j < live) result[j] += wv * xs[j * K + k];
+        }
+"##
 }
 
 fn dot2() -> String {
