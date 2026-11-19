@@ -71,7 +71,7 @@ fn stack(rows: usize, cols: usize, rng: &mut Lcg) -> Stack {
 fn quant_dequant(v: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut out = vec![];
     let mut scales = vec![];
-    for blk in v.chunks(BLOCK) {
+    for blk in v.chunks(32) {
         let amax = blk.iter().fold(0f32, |m, x| m.max(x.abs()));
         let s = if amax > 0.0 { amax / 448.0 } else { 1.0 };
         scales.push(s);
@@ -150,10 +150,10 @@ fn run(tokens: usize, expected_bm: usize) {
     let max_tiles = SLOTS + pairs / expected_bm;
     let mut tiles: CudaSlice<i32> = stream.alloc_zeros(2 * max_tiles).unwrap();
     let mut xq: CudaSlice<u8> = stream.alloc_zeros(tokens * HIDDEN).unwrap();
-    let mut xs: CudaSlice<f32> = stream.alloc_zeros(tokens * HIDDEN / BLOCK).unwrap();
+    let mut xs: CudaSlice<f32> = stream.alloc_zeros(tokens * HIDDEN / 32).unwrap();
     let mut act: CudaSlice<f32> = stream.alloc_zeros(pairs * INTER).unwrap();
     let mut aq: CudaSlice<u8> = stream.alloc_zeros(pairs * INTER).unwrap();
-    let mut asc: CudaSlice<f32> = stream.alloc_zeros(pairs * INTER / BLOCK).unwrap();
+    let mut asc: CudaSlice<f32> = stream.alloc_zeros(pairs * INTER / 32).unwrap();
     let mut out: CudaSlice<f32> = stream.alloc_zeros(pairs * HIDDEN).unwrap();
     let cfg = |g: u32, b: u32| LaunchConfig { grid_dim: (g, 1, 1), block_dim: (b, 1, 1), shared_mem_bytes: 0 };
     let count = pairs as i32;

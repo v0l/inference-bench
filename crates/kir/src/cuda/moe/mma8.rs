@@ -21,15 +21,14 @@ pub fn quant_f8() -> String {
         Some(128),
         "moe_quant_f8",
         "const float* x, unsigned char* q, float* scale, int width",
-        r##"    __shared__ float scratch[32];
-    size_t row = blockIdx.x;
+        r##"    size_t row = blockIdx.x;
     int blk = blockIdx.y;
     size_t at = row * width + (size_t)blk * FP8_BLOCK + threadIdx.x;
     float v = x[at];
-    float amax = block_reduce<true>(fabsf(v), scratch);
+    float amax = warp_max(fabsf(v));
     float s = amax > 0.0f ? amax / FP8_MAX : 1.0f;
     q[at] = (unsigned char)(f32x2_to_e4m3x2(v / s, 0.0f) & 0xffu);
-    if (threadIdx.x == 0) scale[row * (width / FP8_BLOCK) + blk] = s;
+    if ((threadIdx.x & 31) == 0) scale[row * (width / 32) + blk * 4 + (threadIdx.x >> 5)] = s;
 "##,
     )
 }
@@ -93,17 +92,20 @@ fn mainloop() -> &'static str {
         if (next < KT) load_stage(next % STAGES, next);
         cp_async_commit();
         const unsigned char* st = gemm_smem + (kt % STAGES) * STAGE_BYTES;
-        float c[NW][MI][NJ][4];
+        float sw[NW];
 #pragma unroll
-        for (int w = 0; w < NW; w++)
-#pragma unroll
-            for (int i = 0; i < MI; i++)
-#pragma unroll
-                for (int j = 0; j < NJ; j++)
-#pragma unroll
-                    for (int q = 0; q < 4; q++) c[w][i][j][q] = 0.0f;
+        for (int w = 0; w < NW; w++) sw[w] = (w == 0 ? wg0 : wg1)[kt];
 #pragma unroll
         for (int ks = 0; ks < KS; ks++) {
+            float c[NW][MI][NJ][4];
+#pragma unroll
+            for (int w = 0; w < NW; w++)
+#pragma unroll
+                for (int i = 0; i < MI; i++)
+#pragma unroll
+                    for (int j = 0; j < NJ; j++)
+#pragma unroll
+                        for (int q = 0; q < 4; q++) c[w][i][j][q] = 0.0f;
             unsigned a[MI][4];
 #pragma unroll
             for (int i = 0; i < MI; i++) {
@@ -127,21 +129,19 @@ fn mainloop() -> &'static str {
                     }
                 }
             }
-        }
-        float sa[MI][2];
-#pragma unroll
-        for (int i = 0; i < MI; i++)
-#pragma unroll
-            for (int h = 0; h < 2; h++) sa[i][h] = xs[(size_t)max(src[wm * TM + i * 16 + g + 8 * h], 0) * KT + kt];
-#pragma unroll
-        for (int w = 0; w < NW; w++) {
-            float sw = (w == 0 ? wg0 : wg1)[kt];
+            float sa[MI][2];
 #pragma unroll
             for (int i = 0; i < MI; i++)
 #pragma unroll
-                for (int j = 0; j < NJ; j++)
+                for (int h = 0; h < 2; h++) sa[i][h] = xs[(size_t)max(src[wm * TM + i * 16 + g + 8 * h], 0) * (K / 32) + kt * KS + ks];
 #pragma unroll
-                    for (int q = 0; q < 4; q++) acc[w][i][j][q] += c[w][i][j][q] * sa[i][q >> 1] * sw;
+            for (int w = 0; w < NW; w++)
+#pragma unroll
+                for (int i = 0; i < MI; i++)
+#pragma unroll
+                    for (int j = 0; j < NJ; j++)
+#pragma unroll
+                        for (int q = 0; q < 4; q++) acc[w][i][j][q] += c[w][i][j][q] * sa[i][q >> 1] * sw[w];
         }
     }
     cp_async_wait<0>();

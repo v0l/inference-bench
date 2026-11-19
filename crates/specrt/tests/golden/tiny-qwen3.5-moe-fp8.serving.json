@@ -36,8 +36,7 @@
     "theta": 10000000.0
   },
   "mlp": {
-    "activation": "swiglu",
-    "act_quant": "fp8"
+    "activation": "swiglu"
   },
   "moe": {
     "experts": 8,

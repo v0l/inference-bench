@@ -134,13 +134,12 @@ impl MoeBuffers {
             },
             mma8: if mma8 {
                 let (h, i) = (spec.dims.hidden, m.expert_intermediate);
-                let block = crate::codegen::FP8_BLOCK;
                 let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_SMALL;
                 Some(Mma8Buffers {
                     xq: stream.alloc_zeros(rows * h)?,
-                    xs: stream.alloc_zeros(rows * h / block)?,
+                    xs: stream.alloc_zeros(rows * h / 32)?,
                     aq: stream.alloc_zeros(pairs * i)?,
-                    as_: stream.alloc_zeros(pairs * i / block)?,
+                    as_: stream.alloc_zeros(pairs * i / 32)?,
                     tiles: stream.alloc_zeros(2 * tiles)?,
                 })
             } else {
@@ -161,9 +160,10 @@ impl Runtime {
         let w = self.moe_of(layer);
         let mb = self.moe.as_ref().expect("moe buffers");
         let experts = self.spec.moe.as_ref().expect("moe spec").experts;
+        let n_arg = n as i32;
         let mut b = self.stream.launch_builder(self.kernel("moe_route_logits"));
-        b.arg(x).arg(&layer.ln2).arg(&w.router).arg(&w.shared_gate).arg(&mb.xn).arg(&mb.logits);
-        let config = LaunchConfig { grid_dim: ((experts + 1).div_ceil(8) as u32, n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        b.arg(x).arg(&layer.ln2).arg(&w.router).arg(&w.shared_gate).arg(&mb.xn).arg(&mb.logits).arg(&n_arg);
+        let config = LaunchConfig { grid_dim: ((experts + 1).div_ceil(8) as u32, n.div_ceil(4) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
         let mut b = self.stream.launch_builder(self.kernel("moe_route"));
         let first = self.spec.moe.as_ref().expect("moe spec").first_expert() as i32;
