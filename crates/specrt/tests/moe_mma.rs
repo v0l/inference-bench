@@ -77,7 +77,7 @@ fn mx_quantize(w: &[f32]) -> (Vec<u8>, Vec<u8>, Vec<f32>) {
     let mut packed = vec![0u8; w.len() / 2];
     let mut scales = Vec::new();
     let mut deq = Vec::new();
-    for (g, group) in w.chunks_exact(32).enumerate() {
+    for (g, group) in w.as_chunks::<32>().0.iter().enumerate() {
         let amax = group.iter().fold(0f32, |m, v| m.max(v.abs()));
         let bits = (amax / 6.0).to_bits();
         let e = (((bits >> 23) + u32::from(bits & 0x7fffff != 0)).clamp(1, 253)) as u8;
