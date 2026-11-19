@@ -2735,7 +2735,8 @@ mod tests {
         for _ in 0..6 {
             s.step(&mut events).unwrap();
         }
-        let mut sent_at: HashMap<SeqId, (Instant, bool)> = HashMap::new();
+        let mut sent_at: HashMap<SeqId, (f64, bool)> = HashMap::new();
+        let mut clock = 0.0f64;
         let mut short_ttft = Vec::new();
         let mut long_ttft = Vec::new();
         let mut steps = Vec::new();
@@ -2744,23 +2745,25 @@ mod tests {
         let mut shorts = 0u32;
         let mut longs = 0u32;
         let id = s.submit(request(20_000, 4, 900)).unwrap();
-        sent_at.insert(id, (Instant::now(), true));
+        sent_at.insert(id, (clock, true));
         longs += 1;
         for n in 0..6000 {
             if n % 10 == 0 && shorts < 8 {
                 let id = s.submit(request(1200, 2, 100 + shorts)).unwrap();
-                sent_at.insert(id, (Instant::now(), false));
+                sent_at.insert(id, (clock, false));
                 shorts += 1;
             }
             if n % 25 == 5 && longs < 4 {
                 let id = s.submit(request(6000 + 2000 * longs as usize, 2, 200 + longs)).unwrap();
-                sent_at.insert(id, (Instant::now(), true));
+                sent_at.insert(id, (clock, true));
                 longs += 1;
             }
             let mut ev = Vec::new();
             let r = s.step(&mut ev).unwrap();
+            let step_cost = (token_cost * r.prefill_tokens as u32 + row_cost * r.decode_rows as u32).as_secs_f64();
+            clock += step_cost * SCALE;
             if r.decode_rows > 0 {
-                steps.push((token_cost * r.prefill_tokens as u32 + row_cost * r.decode_rows as u32).as_secs_f64());
+                steps.push(step_cost);
             }
             if r.prefill_tokens > 0 && sent_at.values().any(|v| v.1) {
                 long_tokens += r.prefill_tokens;
@@ -2769,7 +2772,7 @@ mod tests {
             for e in &ev {
                 if let Event::Token { id, .. } = e
                     && let Some((t, long)) = sent_at.remove(id) {
-                        if long { &mut long_ttft } else { &mut short_ttft }.push(t.elapsed().as_secs_f64() * SCALE);
+                        if long { &mut long_ttft } else { &mut short_ttft }.push(clock - t);
                     }
             }
             if shorts == 8 && longs == 4 && sent_at.is_empty() {

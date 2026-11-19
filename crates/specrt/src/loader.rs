@@ -516,6 +516,9 @@ mod tests {
 
     #[test]
     fn a_filesystem_that_refuses_direct_io_falls_back_to_buffered_reads() {
+        if !std::path::Path::new("/dev/shm").is_dir() {
+            return;
+        }
         let dir = PathBuf::from("/dev/shm").join(format!("specrt-loader-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         check(&dir, true);
