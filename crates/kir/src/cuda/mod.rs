@@ -226,5 +226,6 @@ pub fn emit_module(kernels: &[Kernel]) -> Result<String, String> {
     for k in kernels {
         out.push_str(&emit_kernel(k)?);
     }
+    out.push_str(&linear::chunked_scans(kernels)?);
     Ok(out)
 }

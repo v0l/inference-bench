@@ -62,6 +62,11 @@ fn the_bamba_module_builds_its_mixer_kernels_from_spec_files() {
         assert!(module.source.contains(&format!("{k}(")), "{k}");
     }
     assert!(!module.source.contains("gdn_chunk_scan("));
+    for k in ["mamba2_scan_chunk_state", "mamba2_scan_chunk_carry", "mamba2_scan_chunk_out"] {
+        assert!(module.kernels.contains(&k) && module.source.contains(&format!("{k}(")), "{k}");
+    }
+    assert!(module.smem.contains_key("mamba2_scan_chunk_state") && module.smem.contains_key("mamba2_scan_chunk_out"));
+    assert!(module.source.contains("gdn_mma_planes<"));
 }
 
 #[test]
@@ -70,7 +75,7 @@ fn the_bamba_module_compiles_through_nvrtc() {
     let module = specrt::codegen::Module::generate_kv(&spec(BAMBA), 256, 1, &kir::Target::sm_120()).unwrap();
     let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".into()], ..Default::default() };
     let ptx = cudarc::nvrtc::compile_ptx_with_opts(&module.source, opts).unwrap_or_else(|e| panic!("{e:?}")).to_src();
-    for k in ["mamba2_conv", "mamba2_scan", "mamba2_gated_norm"] {
+    for k in ["mamba2_conv", "mamba2_scan", "mamba2_gated_norm", "mamba2_scan_chunk_state", "mamba2_scan_chunk_carry", "mamba2_scan_chunk_out"] {
         assert!(ptx.contains(&format!(".entry {k}(")), "{k}");
     }
 }
@@ -303,5 +308,157 @@ fn the_tiny_granite_hybrid_checkpoint_loads_through_the_family_tensor_names() {
         assert_eq!(moe.router.len(), 8 * 256);
         let specrt::weights::Stacked::Bf16(down) = &moe.down else { panic!("bf16 experts") };
         assert_eq!(down.len(), (8 + 2) * 256 * 256);
+    }
+}
+
+struct Scan {
+    module: std::sync::Arc<cudarc::driver::CudaModule>,
+    stream: std::sync::Arc<cudarc::driver::CudaStream>,
+    form: kir::recur::ChunkForm,
+    threads: u32,
+    heads: usize,
+    state: usize,
+    hd: usize,
+    groups: usize,
+}
+
+impl Scan {
+    fn new(heads: usize, groups: usize, state: usize, hd: usize) -> Scan {
+        use cudarc::driver::CudaContext;
+        let mut spec = spec(BAMBA);
+        let m = spec.mixer.as_mut().unwrap();
+        let inner = heads * hd;
+        let conv = inner + 2 * groups * state;
+        for (k, v) in [("ssm_heads", heads), ("ssm_groups", groups), ("ssm_state", state), ("ssm_head_dim", hd), ("ssm_inner", inner), ("ssm_conv", conv), ("ssm_in", inner + conv + heads)] {
+            m.params.insert(k.into(), v as f64);
+        }
+        let ctx = CudaContext::new(0).unwrap();
+        let target = specrt::codegen::cuda_target(&ctx).unwrap();
+        let scan = specrt::codegen::mixer_kernels(&spec, 1, 256, &target).unwrap().into_iter().find(|k| k.name == "mamba2_scan").unwrap();
+        let form = scan.chunk_form().expect("the mamba2 scan has a chunked form");
+        let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &target).unwrap();
+        let cc = ctx.compute_capability().unwrap();
+        let opts = cudarc::nvrtc::CompileOptions { arch: Some(Box::leak(format!("compute_{}{}", cc.0, cc.1).into_boxed_str())), options: vec!["--std=c++17".into()], ..Default::default() };
+        let module = ctx.load_module(cudarc::nvrtc::compile_ptx_with_opts(&module.source, opts).unwrap_or_else(|e| panic!("{e:?}"))).unwrap();
+        use cudarc::driver::sys::CUfunction_attribute as A;
+        for (name, bytes) in [(form.state, form.state_smem), (form.out, form.out_smem)] {
+            module.load_function(name).unwrap().set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, bytes as i32).unwrap();
+        }
+        Scan { module, stream: ctx.default_stream(), form, threads: scan.threads, heads, state, hd, groups }
+    }
+
+    fn dims(&self) -> (usize, usize, usize) {
+        let inner = self.heads * self.hd;
+        let conv = inner + 2 * self.groups * self.state;
+        (inner, conv, inner + conv + self.heads)
+    }
+
+    fn inputs(&self, rows: usize, seed: u64) -> [cudarc::driver::CudaSlice<f32>; 5] {
+        let (_, conv, inn) = self.dims();
+        let mut seed = seed;
+        let mut rand = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as u32) as f32 / (1u64 << 31) as f32 * 2.0 - 1.0
+        };
+        let mix: Vec<f32> = (0..rows * inn).map(|_| rand()).collect();
+        let xbc: Vec<f32> = (0..rows * conv).map(|_| rand() * 0.5).collect();
+        let a: Vec<f32> = (0..self.heads).map(|_| rand() * 0.5).collect();
+        let dtb: Vec<f32> = (0..self.heads).map(|_| rand() - 1.0).collect();
+        let skip: Vec<f32> = (0..self.heads).map(|_| rand()).collect();
+        [mix, xbc, a, dtb, skip].map(|v| self.stream.clone_htod(&v).unwrap())
+    }
+
+    fn run(&self, ins: &[cudarc::driver::CudaSlice<f32>; 5], y: &mut cudarc::driver::CudaSlice<f32>, st: &mut cudarc::driver::CudaSlice<f32>, rows: usize, per_launch: usize, chunked: bool) -> Vec<f64> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        let (inner, conv, inn) = self.dims();
+        let f = &self.form;
+        let slots = self.stream.alloc_zeros::<i32>(1).unwrap();
+        let tiles = f.tiles(self.heads, per_launch, 1);
+        let ck_state = self.stream.alloc_zeros::<f32>(tiles * f.state_floats as usize).unwrap();
+        let ck_decay = self.stream.alloc_zeros::<f32>(tiles).unwrap();
+        let funcs: Vec<_> = [f.state, f.carry, f.out, "mamba2_scan"].iter().map(|n| self.module.load_function(n).unwrap()).collect();
+        let mut phases = vec![0f64; 4];
+        for start in (0..rows).step_by(per_launch) {
+            let n = per_launch.min(rows - start);
+            let (mix, xbc) = (ins[0].slice(start * inn..), ins[1].slice(start * conv..));
+            let mut yv = y.slice_mut(start * inner..);
+            let (layer, base, step, per) = (0i32, 0i32, 0i32, n as i32);
+            let mut go = |func: usize, cfg: LaunchConfig, yv: &mut cudarc::driver::CudaViewMut<f32>, st: &mut cudarc::driver::CudaSlice<f32>| {
+                let mut b = self.stream.launch_builder(&funcs[func]);
+                b.arg(&mix).arg(&xbc).arg(&ins[2]).arg(&ins[3]).arg(&ins[4]).arg(yv).arg(st).arg(&slots).arg(&layer).arg(&base).arg(&step).arg(&per);
+                if func < 3 {
+                    b.arg(&ck_state).arg(&ck_decay);
+                }
+                self.stream.synchronize().unwrap();
+                let t = std::time::Instant::now();
+                unsafe { b.launch(cfg) }.unwrap();
+                self.stream.synchronize().unwrap();
+                phases[func] += t.elapsed().as_secs_f64() * 1e3;
+            };
+            if chunked {
+                let block = (f.threads, 1, 1);
+                let t = LaunchConfig { grid_dim: (self.heads as u32, n.div_ceil(f.rows as usize) as u32, 1), block_dim: block, shared_mem_bytes: f.state_smem };
+                go(0, t, &mut yv, st);
+                go(1, LaunchConfig { grid_dim: (self.heads as u32, 1, f.state_floats.div_ceil(f.threads)), block_dim: block, shared_mem_bytes: 0 }, &mut yv, st);
+                go(2, LaunchConfig { grid_dim: (self.heads as u32, t.grid_dim.1 * f.subs, 1), shared_mem_bytes: f.out_smem, ..t }, &mut yv, st);
+            } else {
+                go(3, LaunchConfig { grid_dim: (self.heads as u32, 1, 1), block_dim: (self.threads, 1, 1), shared_mem_bytes: 0 }, &mut yv, st);
+            }
+        }
+        phases
+    }
+
+    fn compare(&self, rows: usize, per_launch: usize) -> (f32, f32) {
+        let (inner, _, _) = self.dims();
+        let ins = self.inputs(rows, 891);
+        let mut out = Vec::new();
+        for chunked in [false, true] {
+            let mut y = self.stream.alloc_zeros::<f32>(rows * inner).unwrap();
+            let mut st = self.stream.alloc_zeros::<f32>(self.heads * self.state * self.hd).unwrap();
+            self.run(&ins, &mut y, &mut st, rows, if chunked { per_launch } else { 1 }, chunked);
+            out.push((self.stream.clone_dtoh(&y).unwrap(), self.stream.clone_dtoh(&st).unwrap()));
+        }
+        let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        assert!(out[0].1.iter().any(|v| v.abs() > 1e-3));
+        (diff(&out[0].0, &out[1].0), diff(&out[0].1, &out[1].1))
+    }
+
+    fn time(&self, rows: usize, chunked: bool) -> Vec<f64> {
+        let (inner, _, _) = self.dims();
+        let ins = self.inputs(rows, 7);
+        let mut y = self.stream.alloc_zeros::<f32>(rows * inner).unwrap();
+        let mut st = self.stream.alloc_zeros::<f32>(self.heads * self.state * self.hd).unwrap();
+        let mut best = vec![f64::MAX; 4];
+        for _ in 0..5 {
+            let p = self.run(&ins, &mut y, &mut st, rows, rows, chunked);
+            for (b, v) in best.iter_mut().zip(p) {
+                *b = b.min(v);
+            }
+        }
+        best
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_chunked_scan_matches_the_recurrent_scan() {
+    for (heads, groups, state, hd) in [(16, 2, 16, 32), (8, 1, 128, 64)] {
+        let scan = Scan::new(heads, groups, state, hd);
+        for (rows, per) in [(200, 200), (300, 100), (64, 64), (700, 700)] {
+            let (y, s) = scan.compare(rows, per);
+            eprintln!("heads {heads} state {state} rows {rows} per {per}: y max_abs {y} state max_abs {s}");
+            assert!(y < 2e-3 && s < 2e-3, "y {y} state {s}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_chunked_scan_prefill_speed() {
+    let scan = Scan::new(64, 8, 128, 64);
+    for rows in [4096, 16384] {
+        let (rec, ck) = (scan.time(rows, false)[3], scan.time(rows, true));
+        let total: f64 = ck[..3].iter().sum();
+        eprintln!("scan {rows} rows: recurrent {rec:.2} ms, chunked {total:.2} ms (state {:.2}, carry {:.2}, out {:.2}), {:.1}x", ck[0], ck[1], ck[2], rec / total);
     }
 }

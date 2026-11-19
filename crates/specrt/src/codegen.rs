@@ -505,6 +505,11 @@ impl Module {
             if !kernels.contains(&k.name) {
                 kernels.push(k.name);
             }
+            if let Some(f) = k.chunk_form() {
+                kernels.extend([f.state, f.carry, f.out]);
+                smem.insert(f.state, f.state_smem);
+                smem.insert(f.out, f.out_smem);
+            }
         }
         if la.is_some() {
             source.push('\n');

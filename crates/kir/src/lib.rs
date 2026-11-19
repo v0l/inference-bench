@@ -293,6 +293,13 @@ impl Kernel {
         Ok(k)
     }
 
+    pub fn chunk_form(&self) -> Option<recur::ChunkForm> {
+        match &self.body {
+            Body::Recurrence(r) => r.chunk_form(self),
+            _ => None,
+        }
+    }
+
     pub fn needs(&self) -> Vec<Feature> {
         match &self.body {
             Body::RmsNorm { sum, .. } | Body::RmsNormSegment { sum, .. } | Body::AddRmsNorm { sum, .. } | Body::NormAdd { sum, .. } => sum.needs().to_vec(),

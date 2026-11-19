@@ -348,6 +348,7 @@ struct DescribedLaunch {
     name: &'static str,
     threads: u32,
     params: Vec<kir::Param>,
+    chunk: Option<kir::recur::ChunkForm>,
 }
 
 struct DeviceAttn {
@@ -398,10 +399,12 @@ struct MixBuffers {
     mix: CudaSlice<f32>,
     planes: Planes,
     scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    chunk_state: CudaSlice<f32>,
+    chunk_decay: CudaSlice<f32>,
 }
 
 impl MixBuffers {
-    fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec, slots: usize, chunk: usize) -> Result<Self> {
+    fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec, slots: usize, chunk: usize, (tiles, tile_floats): (usize, usize)) -> Result<Self> {
         let mut states = Vec::new();
         for s in crate::state::sequence(spec).filter(|s| s.layers == crate::state::Layers::Linear) {
             ensure!(s.dtype == crate::state::Dtype::F32, "[[state]] {} on a mixer is not f32", s.name);
@@ -411,7 +414,14 @@ impl MixBuffers {
         }
         let m = spec.mixer.as_ref().context("no [mixer]")?;
         let scratch = m.scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?;
-        Ok(MixBuffers { states, mix: stream.alloc_zeros(chunk * spec.mix_in_rows())?, planes: Planes::new(stream, chunk * spec.mix_out_cols())?, scratch })
+        Ok(MixBuffers {
+            states,
+            mix: stream.alloc_zeros(chunk * spec.mix_in_rows())?,
+            planes: Planes::new(stream, chunk * spec.mix_out_cols())?,
+            scratch,
+            chunk_state: stream.alloc_zeros(tile_floats.max(1))?,
+            chunk_decay: stream.alloc_zeros(tiles.max(1))?,
+        })
     }
 }
 
@@ -930,7 +940,7 @@ impl Runtime {
         let smem = module.smem.clone();
         let described: Vec<Option<DescribedLaunch>> = crate::codegen::described_kernels(spec, layout.kv_planes, max_ctx, &target)?
             .into_iter()
-            .map(|k| k.map(|k| DescribedLaunch { name: k.name, threads: k.threads, params: k.params }))
+            .map(|k| k.map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, params: k.params }))
             .collect();
         let linear_tuning = LinearTuning::for_target(&target);
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
@@ -996,13 +1006,26 @@ impl Runtime {
             None => None,
         };
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
+        let mixer_launch: Vec<DescribedLaunch> = crate::codegen::mixer_kernels(spec, layout.kv_planes, max_ctx, &target)?
+            .into_iter()
+            .map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: k.chunk_form(), params: k.params })
+            .collect();
+        let chunk_tiles = match &spec.mixer {
+            Some(m) => mixer_launch
+                .iter()
+                .zip(&m.node)
+                .filter_map(|(l, n)| Some((l.chunk.as_ref()?, n)))
+                .map(|(f, n)| Ok((crate::state::dim(spec, &n.grid[0])? * chunk.div_ceil(f.min_rows as usize), f.state_floats as usize)))
+                .collect::<Result<Vec<(usize, usize)>>>()?
+                .into_iter()
+                .fold((0, 0), |a, b| (a.0.max(b.0), a.1.max(b.0 * b.1))),
+            None => (0, 0),
+        };
         let mixer = match &spec.mixer {
-            Some(_) => Some(MixBuffers::new(&ctx, &stream, spec, layout.slots + 1, chunk)?),
+            Some(_) => Some(MixBuffers::new(&ctx, &stream, spec, layout.slots + 1, chunk, chunk_tiles)?),
             None => None,
         };
         ensure!(use_mma || mixer.is_none(), "a described mixer needs the tensor core path (sm_80 or newer)");
-        let mixer_launch: Vec<DescribedLaunch> =
-            crate::codegen::mixer_kernels(spec, layout.kv_planes, max_ctx, &target)?.into_iter().map(|k| DescribedLaunch { name: k.name, threads: k.threads, params: k.params }).collect();
         let widest = [d.hidden, d.intermediate, spec.q_dim()]
             .into_iter()
             .chain(spec.linear_attention.as_ref().map(|l| l.value_dim()))

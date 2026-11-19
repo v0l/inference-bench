@@ -6,11 +6,24 @@ mod common;
 mod conv;
 mod prim;
 mod draft;
+mod ssd;
 mod step;
 mod verify;
 
 use common::common;
 use crate::linear::{Family, LinearError, LinearKernel, constants};
+
+pub(crate) fn chunked_scans(kernels: &[crate::Kernel]) -> Result<String, String> {
+    let mut out = String::new();
+    for k in kernels {
+        if let crate::Body::Recurrence(r) = &k.body
+            && let Some(f) = r.chunk_form(k)
+        {
+            out.push_str(&ssd::emit(r, k, &f)?);
+        }
+    }
+    Ok(if out.is_empty() { out } else { format!("{}\n{}\n{out}", chunk_lib::library(), chunk_lib::planes()) })
+}
 
 
 pub fn emit_linear(kernels: &[LinearKernel]) -> Result<String, LinearError> {

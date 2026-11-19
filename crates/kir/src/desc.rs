@@ -372,7 +372,7 @@ impl Shape {
     }
 }
 
-fn intern(name: &str) -> &'static str {
+pub(crate) fn intern(name: &str) -> &'static str {
     static NAMES: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
     let mut guard = NAMES.lock().unwrap();
     let set = guard.get_or_insert_with(HashSet::new);
