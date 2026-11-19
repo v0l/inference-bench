@@ -261,7 +261,17 @@ impl ServerConfig {
         Ok(config)
     }
 
+    pub fn canonical_parser_ids(&mut self) {
+        let table: toml::Table = toml::from_str(include_str!("../parser_ids.toml")).expect("parser_ids.toml is valid");
+        for (field, value) in [("tool_parser", &mut self.tool_parser), ("reasoning_parser", &mut self.reasoning_parser)] {
+            let Some(new) = value.as_deref().and_then(|old| table.get(field)?.get(old)?.as_str()) else { continue };
+            tracing::warn!(field, old = ?value, new, "this parser id is renamed, update the config");
+            *value = Some(new.to_string());
+        }
+    }
+
     fn migrate(&mut self) {
+        self.canonical_parser_ids();
         match self.default_backend.take().as_ref().map(legacy_native_ctx) {
             Some(Ok(max_ctx)) => self.max_ctx = self.max_ctx.or(max_ctx),
             Some(Err(kind)) => tracing::warn!(%kind, "default_backend is no longer used: the server runs models on the native engine"),
@@ -404,6 +414,16 @@ mod tests {
         assert_eq!(ServerConfig::default().with_tools(ToolFormat::Unparsed).tool_parser, None);
         let explicit = ServerConfig { tool_parser: Some("hermes".into()), ..ServerConfig::default() };
         assert_eq!(explicit.with_tools(ToolFormat::XmlFunction).tool_parser.as_deref(), Some("hermes"));
+    }
+
+    #[test]
+    fn renamed_parser_ids_in_an_old_config_still_load() {
+        let old = ServerConfig::parse("tool_parser = 'qwen3_coder'\nreasoning_parser = 'qwen3'\n").unwrap();
+        let new = ServerConfig::parse("tool_parser = 'xml_function'\nreasoning_parser = 'think_tags'\n").unwrap();
+        assert_eq!(old.tool_parser.as_deref(), Some("xml_function"));
+        assert_eq!(old.reasoning_parser.as_deref(), Some("think_tags"));
+        assert_eq!(old.tool_parser, new.tool_parser);
+        assert!(ServerConfig::parse("tool_parser = 'nope'\n").is_err());
     }
 
     #[test]

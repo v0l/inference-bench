@@ -130,6 +130,15 @@ fn llama3_rope_scaling_is_parsed() {
 }
 
 #[test]
+fn an_old_llama3_rope_scaling_kind_in_a_spec_still_loads_as_banded() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = std::fs::read_to_string(root.join("specs/llama-3.2-1b.toml")).unwrap();
+    assert!(text.contains("kind = \"banded\""));
+    let old = text.replace("kind = \"banded\"", "kind = \"llama3\"");
+    assert_eq!(Spec::parse(&old).unwrap(), Spec::parse(&text).unwrap());
+}
+
+#[test]
 fn linear_rope_scaling_is_parsed() {
     let json = fixture_with(
         "\"rope_scaling\": null",

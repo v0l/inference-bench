@@ -83,6 +83,18 @@ Models load on first request. A model with requests in flight is never evicted; 
 
 Each model runs one request at a time on the GPU; `max_concurrent` above 1 queues the rest.
 
+### Renamed ids
+
+Parser and rope ids are named by format. Old ids still load and log a deprecation warning; the mappings live in `crates/server/parser_ids.toml` and `crates/specrt/spec-aliases.toml`.
+
+| Old | New |
+|---|---|
+| `tool_parser = "qwen3_coder"` or `"qwen3_xml"` | `"xml_function"` |
+| `reasoning_parser = "qwen3"` | `"think_tags"` |
+| spec `[rope.scaling] kind = "llama3"` | `"banded"` |
+
+`/props` reports the new ids. There is no `API_VERSION` in this repo to bump.
+
 ## Metrics
 
 `inference_requests_total{endpoint,status}`, `inference_prompt_tokens_total{model}`, `inference_completion_tokens_total{model}`, `inference_ttft_seconds` (histogram), `inference_decode_tokens_per_second{window="last|mean"}`, `inference_queue_depth`, `inference_in_flight`, `inference_models_loaded`, `inference_model_vram_bytes{model}`, `inference_gpu_memory_used_bytes` (from `nvidia-smi`, falling back to the CUDA driver's free/total memory where nvidia-smi reports N/A, as on the GB10), `inference_requests_cancelled_total`, model load, failure and unload counters, `inference_specs_checks_total{result="updated|unchanged|failed"}` and `inference_specs_last_success_timestamp_seconds`.

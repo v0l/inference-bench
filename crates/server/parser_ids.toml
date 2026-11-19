@@ -1,0 +1,6 @@
+[tool_parser]
+qwen3_coder = "xml_function"
+qwen3_xml = "xml_function"
+
+[reasoning_parser]
+qwen3 = "think_tags"

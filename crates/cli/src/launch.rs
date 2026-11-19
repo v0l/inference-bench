@@ -357,6 +357,7 @@ fn server_config(args: &LaunchArgs, plan: &Plan, model: &LocalModel, key: &Optio
     if let Some(k) = key {
         config.api_keys = vec![k.clone()];
     }
+    config.canonical_parser_ids();
     config.validate()?;
     Ok((config, mc))
 }

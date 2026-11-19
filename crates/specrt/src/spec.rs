@@ -25,8 +25,27 @@ pub fn needs_newer_note(min_engine: u32) -> String {
 }
 
 
+fn rename_old_ids(value: &toml::Table) -> Option<toml::Table> {
+    let aliases: toml::Table = toml::from_str(include_str!("../spec-aliases.toml")).expect("spec-aliases.toml is valid");
+    let old = value.get("rope")?.get("scaling")?.get("kind")?.as_str()?;
+    let new = aliases.get("rope_scaling_kind")?.get(old)?.as_str()?;
+    tracing::warn!(old, new, "this rope scaling kind is renamed, update the spec");
+    let mut table = value.clone();
+    *table.get_mut("rope")?.get_mut("scaling")?.get_mut("kind")? = toml::Value::String(new.to_string());
+    Some(table)
+}
+
 pub fn check(text: &str) -> Result<Checked> {
     let value: toml::Table = toml::from_str(text)?;
+    let renamed = rename_old_ids(&value);
+    let renamed_text;
+    let text = match renamed {
+        Some(table) => {
+            renamed_text = toml::to_string(&table)?;
+            renamed_text.as_str()
+        }
+        None => text,
+    };
     let min_engine = match value.get("min_engine") {
         None => 0,
         Some(v) => v.as_integer().and_then(|n| u32::try_from(n).ok()).context("min_engine must be a whole number")?,

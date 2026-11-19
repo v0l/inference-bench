@@ -34,7 +34,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "core/src/specs/tests.rs", lines: 16, kind: Kind::Permanent, note: "spec catalogue tests" },
     Entry { path: "core/src/store.rs", lines: 2, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "server/src/app.rs", lines: 2, kind: Kind::Permanent, note: "route docs name the llama.cpp dialect" },
-    Entry { path: "server/src/config.rs", lines: 10, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
+    Entry { path: "server/src/config.rs", lines: 11, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "server/src/connect.rs", lines: 4, kind: Kind::Permanent, note: "tests use model ids" },
     Entry { path: "server/src/metrics.rs", lines: 10, kind: Kind::Permanent, note: "tests use model ids" },
     Entry { path: "server/src/serve.rs", lines: 2, kind: Kind::Permanent, note: "tests use model ids" },
