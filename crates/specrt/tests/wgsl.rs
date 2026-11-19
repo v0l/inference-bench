@@ -198,7 +198,7 @@ fn run_linear(w: &mut Wgpu, rows: &DeviceRows, x: &[f32], tokens: usize, accumul
     let yb = f32_buf(w, &accumulate.map_or_else(|| vec![0.0; tokens * nrows], |a| a.to_vec()));
     let (name, grid) = if tokens == 1 {
         if specrt::backends::Backend::limits(w).subgroup_size == 32 {
-            ("linear_sg", [(nrows as u32).div_ceil(wgsl::SG_ROWS), 1, 1])
+            (wgsl::sg_kernel_for(&rows.rows), [(nrows as u32).div_ceil(wgsl::SG_ROWS), 1, 1])
         } else {
             ("linear", [nrows as u32, 1, tokens as u32])
         }
@@ -755,13 +755,13 @@ fn linear_sg_time_per_dispatch() {
             let params = [nrows as u32, cols as u32, 1, 0, 0, 0, 0, 0];
             let grid = [(nrows as u32).div_ceil(wgsl::SG_ROWS), 1, 1];
             for _ in 0..3 {
-                w.dispatch("linear_sg", &[&xb, &yb, &wd, &table], params, grid).unwrap();
+                w.dispatch(wgsl::sg_kernel_for(&packed.rows), &[&xb, &yb, &wd, &table], params, grid).unwrap();
             }
             w.submit().unwrap();
             let reps = 100;
             let t = std::time::Instant::now();
             for _ in 0..reps {
-                w.dispatch("linear_sg", &[&xb, &yb, &wd, &table], params, grid).unwrap();
+                w.dispatch(wgsl::sg_kernel_for(&packed.rows), &[&xb, &yb, &wd, &table], params, grid).unwrap();
             }
             w.submit().unwrap();
             let s = t.elapsed().as_secs_f64() / reps as f64;

@@ -20,6 +20,7 @@ pub const LINEAR_TOKENS: usize = 8;
 pub const LINEAR_WORKGROUP: usize = 64;
 pub const FLASH_TOKENS: u32 = kir::wgsl::FLASH_TOKENS;
 pub const FLASH_COOP_QUERIES: u32 = kir::wgsl::FLASH_COOP_QUERIES;
+pub use kir::wgsl::SgVariant;
 pub const SG_ROWS: u32 = kir::wgsl::SG_ROWS;
 pub const TILE_MIN_TOKENS: usize = 32;
 pub const TILE_TOKENS: usize = kir::wgsl::TILE_TOKENS as usize;
@@ -151,7 +152,9 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
     if target.has(kir::Feature::Subgroups) && target.warp_size == 32 {
         out.push(WgslKernel { name: "flash", source: kir::wgsl::emit_flash_op(&shape), bindings: vec![Read, Read, Read, Write, Uniform] });
         out.push(WgslKernel { name: "flash_decode", source: kir::wgsl::emit_flash_decode_op(&shape), bindings: vec![Read, Read, Read, Write, Uniform] });
-        out.push(WgslKernel { name: "linear_sg", source: kir::wgsl::emit_linear_sg_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
+        for (name, variant) in [("linear_sg", SgVariant::Any), ("linear_sg_bf16", SgVariant::Bf16), ("linear_sg_q4k", SgVariant::Q4K), ("linear_sg_q6k", SgVariant::Q6K)] {
+            out.push(WgslKernel { name, source: kir::wgsl::emit_linear_sg_op(&shape, variant), bindings: vec![Read, Write, Read, Read, Uniform] });
+        }
     }
     if target.has(kir::Feature::CoopMatrix) {
         if spec.attention.head_dim.is_multiple_of(8) && spec.attention.head_dim <= 256 {
@@ -172,4 +175,17 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         out.push(WgslKernel { name: crate::gemm::intern(&k.name), source, bindings });
     }
     Ok(out)
+}
+
+pub fn sg_kernel_for(rows: &[u32]) -> &'static str {
+    let first = rows.first().map_or(0, |r| r & 7);
+    if rows.iter().any(|r| r & 7 != first) {
+        return "linear_sg";
+    }
+    match first {
+        4 => "linear_sg_bf16",
+        0 => "linear_sg_q4k",
+        2 => "linear_sg_q6k",
+        _ => "linear_sg",
+    }
 }
