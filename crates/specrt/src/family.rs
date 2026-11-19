@@ -372,10 +372,10 @@ impl Family {
             if dotted(config, canonical).is_some() {
                 continue;
             }
-            if let Some(v) = alternatives.iter().find_map(|alt| dotted(config, alt)).cloned() {
-                if let Some(map) = config.as_object_mut() {
-                    insert_dotted(map, canonical, v);
-                }
+            if let Some(v) = alternatives.iter().find_map(|alt| dotted(config, alt)).cloned()
+                && let Some(map) = config.as_object_mut()
+            {
+                insert_dotted(map, canonical, v);
             }
         }
     }
