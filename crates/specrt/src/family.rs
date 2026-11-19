@@ -332,7 +332,7 @@ fn expr_keys(text: &str, out: &mut Vec<String>) {
     let mut names = Vec::new();
     e.names(&mut names);
     for n in names {
-        if !out.iter().any(|o| *o == n) {
+        if !out.contains(&n) {
             out.push(n);
         }
     }
