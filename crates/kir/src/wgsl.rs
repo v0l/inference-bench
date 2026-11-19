@@ -608,6 +608,10 @@ pub fn emit_linear_sg_op(s: &crate::ops::WgslShape) -> String {
 fn linear_sg() -> String {
     format!(
         "{bind}
+fn xs(i: u32) -> f32 {{
+    return x[i >> 2u][i & 3u];
+}}
+
 @compute @workgroup_size({threads})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @builtin(subgroup_invocation_id) lane: u32) {{
     let nrows = p.a.x;
@@ -628,7 +632,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
         let b4 = base >> 2u;
         for (var q = lane; q < cols / 2u; q += 32u) {{
             let w = wdata[b4 + q];
-            acc += bitcast<f32>(w << 16u) * x[xo + 2u * q] + bitcast<f32>(w & 0xffff0000u) * x[xo + 2u * q + 1u];
+            acc += bitcast<f32>(w << 16u) * xs(xo + 2u * q) + bitcast<f32>(w & 0xffff0000u) * xs(xo + 2u * q + 1u);
         }}
     }} else if (code == 0u) {{
         let j = lane / 8u;
@@ -640,18 +644,15 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
             let s0 = scale_min_k4(2u * j, b);
             let s1 = scale_min_k4(2u * j + 1u, b);
             let q = wdata[(b + 16u + 32u * j + l4) >> 2u];
-            let xb = xo + sb * 256u + j * 64u + l4;
-            var lo = 0.0;
-            var hi = 0.0;
-            var xl = 0.0;
-            var xh = 0.0;
-            for (var i = 0u; i < 4u; i++) {{
-                let byte = (q >> (8u * i)) & 0xffu;
-                lo += f32(byte & 0xfu) * x[xb + i];
-                hi += f32(byte >> 4u) * x[xb + 32u + i];
-                xl += x[xb + i];
-                xh += x[xb + 32u + i];
-            }}
+            let xb = (xo + sb * 256u + j * 64u + l4) / 4u;
+            let xa = x[xb];
+            let xc = x[xb + 8u];
+            let qa = vec4<f32>(vec4<u32>(q & 0xfu, (q >> 8u) & 0xfu, (q >> 16u) & 0xfu, (q >> 24u) & 0xfu));
+            let qb = vec4<f32>(vec4<u32>((q >> 4u) & 0xfu, (q >> 12u) & 0xfu, (q >> 20u) & 0xfu, (q >> 28u) & 0xfu));
+            let lo = dot(qa, xa);
+            let hi = dot(qb, xc);
+            let xl = xa.x + xa.y + xa.z + xa.w;
+            let xh = xc.x + xc.y + xc.z + xc.w;
             acc += d * (f32(s0.x) * lo + f32(s1.x) * hi) - dmin * (f32(s0.y) * xl + f32(s1.y) * xh);
         }}
     }} else if (code == 2u) {{
@@ -680,7 +681,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
                 }}
                 let q0 = i32(n0 | (((h0 >> (2u * sg4)) & 3u) << 4u)) - 32;
                 let q1 = i32(n1 | (((h1 >> (2u * sg4)) & 3u) << 4u)) - 32;
-                part += wi8(sc + 2u * sg4) * (f32(q0) * x[xb + sg4 * 32u] + f32(q1) * x[xb + sg4 * 32u + 1u]);
+                part += wi8(sc + 2u * sg4) * (f32(q0) * xs(xb + sg4 * 32u) + f32(q1) * xs(xb + sg4 * 32u + 1u));
             }}
             acc += d * part;
         }}
@@ -693,7 +694,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
             let xb = xo + sb * 256u + blk * 32u + off;
             var part = 0.0;
             for (var i = 0u; i < 8u; i++) {{
-                part += wi8(b + 2u + off + i) * x[xb + i];
+                part += wi8(b + 2u + off + i) * xs(xb + i);
             }}
             acc += d * part;
         }}
@@ -703,7 +704,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
             for (var i = 0u; i < {SG_LANE_ELEMS}u; i++) {{
                 let e = e0 + i;
                 if (e < cols) {{
-                    acc += dequant_at(base, code, e) * x[xo + e];
+                    acc += dequant_at(base, code, e) * xs(xo + e);
                 }}
             }}
         }}
@@ -719,7 +720,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
     }}
 }}
 ",
-        bind = storage(&[("x", false, "f32"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
+        bind = storage(&[("x", false, "vec4<f32>"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
         threads = 32 * SG_ROWS,
         span = 32 * SG_LANE_ELEMS,
     )
