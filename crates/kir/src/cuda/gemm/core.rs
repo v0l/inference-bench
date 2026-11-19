@@ -202,7 +202,7 @@ __device__ __forceinline__ void gemm_epilogue_at(float (&acc)[BM / WM / 16][BN /
 #pragma unroll
 for (int h = 0; h < 2; h++) {
     int m = m0 + wm * TM + i * 16 + g + h * 8;
-    float a = activation(acc[i][j][h * 2]) * acc[i][j][h * 2 + 1];
+    float a = gated_act(acc[i][j][h * 2], acc[i][j][h * 2 + 1]);
     float b = __shfl_xor_sync(0xffffffff, a, 1);
     if ((t & 1) == 0 && col < N && m < tokens)
         split_store2(out_hi, out_lo, (size_t)m * (N / 2) + col / 2, a, b);

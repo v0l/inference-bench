@@ -32,6 +32,9 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         routed_scale: m.routed_scale,
         shared_gate: m.shared_gate,
         sigmoid: m.router == crate::spec::RouterAct::Sigmoid,
+        groups: m.groups,
+        topk_group: m.topk_group,
+        score_bias: m.score_bias,
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if moe_mma_enabled(spec, target) {
@@ -433,6 +436,7 @@ impl Module {
             gated_gelu: spec.mlp.activation == Activation::Geglu,
             q8_group: Q8_GROUP,
             fp8_block: FP8_BLOCK,
+            gated: spec.mlp.gated.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
             weight_decoder: wf.decoder().to_string(),
             head_decoder: head_wf.decoder().to_string(),
         };
@@ -461,7 +465,7 @@ impl Module {
         let kir_hash = kir::fold_hashes([kir_hash, ggml.hash(), kir::prims::prims_hash(&prims), kir::gemv::gemv_hash(&gemvs)]);
         let mut source = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}",
-            kir::cuda::emit_ops(&ops),
+            kir::cuda::emit_ops(&ops).map_err(anyhow::Error::msg)?,
             kir::prims::emit_cuda(&prims).map_err(anyhow::Error::msg)?,
             ggml.emit().map_err(anyhow::Error::msg)?,
             attn_source,

@@ -13,6 +13,7 @@ pub(super) enum StackWeights {
 pub(super) struct DeviceMoe {
     router: CudaSlice<u16>,
     shared_gate: CudaSlice<f32>,
+    score_bias: CudaSlice<f32>,
     gate: StackWeights,
     up: StackWeights,
     down: StackWeights,
@@ -58,6 +59,7 @@ impl DeviceMoe {
         Ok(DeviceMoe {
             router: stream.clone_htod(&m.router)?,
             shared_gate: stream.clone_htod(m.shared_gate.as_deref().unwrap_or(&[0.0]))?,
+            score_bias: stream.clone_htod(m.score_bias.as_deref().unwrap_or(&[0.0]))?,
             gate: StackWeights::upload(stream, &m.gate)?,
             up: StackWeights::upload(stream, &m.up)?,
             down: StackWeights::upload(stream, &m.down)?,
@@ -69,7 +71,7 @@ impl DeviceMoe {
     }
 
     pub(super) fn bytes(&self) -> u64 {
-        (self.router.num_bytes() + self.shared_gate.num_bytes()) as u64 + self.gate.bytes() + self.up.bytes() + self.down.bytes()
+        (self.router.num_bytes() + self.shared_gate.num_bytes() + self.score_bias.num_bytes()) as u64 + self.gate.bytes() + self.up.bytes() + self.down.bytes()
     }
 }
 
@@ -144,7 +146,7 @@ impl Runtime {
         unsafe { b.launch(config) }?;
         let mut b = self.stream.launch_builder(self.kernel("moe_route"));
         let first = self.spec.moe.as_ref().expect("moe spec").first_expert() as i32;
-        b.arg(&mb.logits).arg(&mb.idx).arg(&mb.coef).arg(&first);
+        b.arg(&mb.logits).arg(&w.score_bias).arg(&mb.idx).arg(&mb.coef).arg(&first);
         unsafe { b.launch(cfg(n as u32, 32)) }?;
         Ok(())
     }
