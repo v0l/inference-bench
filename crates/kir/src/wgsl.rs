@@ -977,6 +977,110 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     )
 }
 
+pub const DECODE_GROUPS: u32 = 8;
+
+pub fn emit_flash_decode_op(s: &crate::ops::WgslShape) -> String {
+    let mut out = ops_header(s);
+    out.push_str(&flash_decode());
+    out
+}
+
+fn flash_decode() -> String {
+    format!(
+        "{bind}
+const HD4: u32 = HEAD_DIM / 4u;
+const HPL: u32 = HD4 / 4u;
+const NSG: u32 = {DECODE_GROUPS}u;
+var<workgroup> sm_m: array<f32, NSG>;
+var<workgroup> sm_l: array<f32, NSG>;
+var<workgroup> sm_acc: array<f32, {acc}>;
+
+@compute @workgroup_size({threads})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let head = wid.x;
+    let g = li / 32u;
+    let lane = li % 32u;
+    let slot = lane / 4u;
+    let part = lane % 4u;
+    let kvh = head / GROUP;
+    let len = p.a.x + 1u;
+    let head_base4 = kvh * MAX_CTX * HD4;
+    let scale = inverseSqrt(f32(HEAD_DIM));
+    var q: array<vec4<f32>, HPL>;
+    for (var i = 0u; i < HPL; i++) {{
+        let qb = head * HEAD_DIM + (part * HPL + i) * 4u;
+        q[i] = vec4<f32>(qkv[qb], qkv[qb + 1u], qkv[qb + 2u], qkv[qb + 3u]) * scale;
+    }}
+    var acc: array<vec4<f32>, HPL>;
+    var m = NEG_INF;
+    var l = 0.0;
+    for (var key0 = g * 8u; key0 < len; key0 += NSG * 8u) {{
+        let key = key0 + slot;
+        let live = key < len;
+        let kb = head_base4 + select(0u, key, live) * HD4 + part * HPL;
+        var dots = vec4<f32>(0.0);
+        for (var i = 0u; i < HPL; i++) {{
+            dots += q[i] * k_cache[kb + i];
+        }}
+        var s = dots.x + dots.y + dots.z + dots.w;
+        s += subgroupShuffleXor(s, 1u);
+        s += subgroupShuffleXor(s, 2u);
+        if (!live) {{
+            s = NEG_INF;
+        }}
+        let m_new = max(m, subgroupMax(s));
+        let corr = exp(m - m_new);
+        let pr = select(0.0, exp(s - m_new), live);
+        l = l * corr + pr;
+        for (var i = 0u; i < HPL; i++) {{
+            acc[i] = acc[i] * corr + pr * v_cache[kb + i];
+        }}
+        m = m_new;
+    }}
+    for (var i = 0u; i < HPL; i++) {{
+        var a = acc[i];
+        a += subgroupShuffleXor(a, 4u);
+        a += subgroupShuffleXor(a, 8u);
+        a += subgroupShuffleXor(a, 16u);
+        acc[i] = a;
+    }}
+    let l_total = subgroupAdd(l) * 0.25;
+    if (slot == 0u) {{
+        for (var i = 0u; i < HPL; i++) {{
+            let o = g * HEAD_DIM + (part * HPL + i) * 4u;
+            sm_acc[o] = acc[i].x;
+            sm_acc[o + 1u] = acc[i].y;
+            sm_acc[o + 2u] = acc[i].z;
+            sm_acc[o + 3u] = acc[i].w;
+        }}
+    }}
+    if (lane == 0u) {{
+        sm_m[g] = m;
+        sm_l[g] = l_total;
+    }}
+    workgroupBarrier();
+    if (li < HEAD_DIM) {{
+        var big = NEG_INF;
+        for (var j = 0u; j < NSG; j++) {{
+            big = max(big, sm_m[j]);
+        }}
+        var num = 0.0;
+        var den = 0.0;
+        for (var j = 0u; j < NSG; j++) {{
+            let w = exp(sm_m[j] - big);
+            num += w * sm_acc[j * HEAD_DIM + li];
+            den += w * sm_l[j];
+        }}
+        out[head * HEAD_DIM + li] = num / den;
+    }}
+}}
+",
+        bind = storage(&[("qkv", false, "f32"), ("k_cache", false, "vec4<f32>"), ("v_cache", false, "vec4<f32>"), ("out", true, "f32")]),
+        threads = 32 * DECODE_GROUPS,
+        acc = DECODE_GROUPS * 256,
+    )
+}
+
 pub const ROW_SPAN: u32 = 32768;
 
 fn linear_rows(tokens: usize, workgroup: usize) -> String {

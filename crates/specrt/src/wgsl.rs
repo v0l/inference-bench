@@ -149,6 +149,7 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
     out.push(WgslKernel { name: "linear_tile", source: kir::wgsl::emit_linear_tile_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
     if target.has(kir::Feature::Subgroups) && target.warp_size == 32 {
         out.push(WgslKernel { name: "flash", source: kir::wgsl::emit_flash_op(&shape), bindings: vec![Read, Read, Read, Write, Uniform] });
+        out.push(WgslKernel { name: "flash_decode", source: kir::wgsl::emit_flash_decode_op(&shape), bindings: vec![Read, Read, Read, Write, Uniform] });
         out.push(WgslKernel { name: "linear_sg", source: kir::wgsl::emit_linear_sg_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
     }
     if target.has(kir::Feature::CoopMatrix) {
