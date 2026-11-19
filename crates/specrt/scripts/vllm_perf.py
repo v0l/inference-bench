@@ -25,10 +25,11 @@ def main():
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--util", type=float, default=0.12)
+    ap.add_argument("--moe-backend", default=None)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     lens = [int(x) for x in a.lens.split(",")]
-    llm = LLM(a.model, max_model_len=max(lens) + a.new + 8, gpu_memory_utilization=a.util, enable_prefix_caching=False, max_num_seqs=max(a.batch, 8))
+    llm = LLM(a.model, max_model_len=max(lens) + a.new + 8, gpu_memory_utilization=a.util, enable_prefix_caching=False, max_num_seqs=max(a.batch, 8), **({"moe_backend": a.moe_backend} if a.moe_backend else {}))
     timed(llm, 1, 128, 8, 0)
     out = {"engine": "vllm", "version": __import__("vllm").__version__, "prefill": {}, "decode": {}}
     for length in lens:

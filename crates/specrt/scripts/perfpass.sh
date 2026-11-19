@@ -214,7 +214,7 @@ fi
 
 if [ -f "$ckpt/config.json" ] && [ -x "$vllm_py" ] && [ -z "${NO_VLLM:-}" ]; then
     echo "== vllm"
-    run -p MemoryMax=40G --setenv=PATH="$(dirname "$vllm_py"):$PATH" --setenv=VLLM_CACHE_ROOT=$work/vllm-cache --setenv=FLASHINFER_WORKSPACE_BASE=$work/flashinfer --setenv=TORCHINDUCTOR_CACHE_DIR=$work/inductor --setenv=XDG_CACHE_HOME=$work/xdg --setenv=MAX_JOBS=2 --setenv=NVCC_THREADS=2 "$vllm_py" "$here/vllm_perf.py" "$ckpt" --lens "$lens" --new "$new" --batch "$batch" --rounds "$rounds" --util "$vllm_util" --out "$raw/vllm.json" >"$raw/vllm.log" 2>&1 \
+    run -p MemoryMax=40G --setenv=PATH="$(dirname "$vllm_py"):$PATH" --setenv=VLLM_CACHE_ROOT=$work/vllm-cache --setenv=FLASHINFER_WORKSPACE_BASE=$work/flashinfer --setenv=TORCHINDUCTOR_CACHE_DIR=$work/inductor --setenv=XDG_CACHE_HOME=$work/xdg --setenv=MAX_JOBS=2 --setenv=NVCC_THREADS=2 "$vllm_py" "$here/vllm_perf.py" "$ckpt" --lens "$lens" --new "$new" --batch "$batch" --rounds "$rounds" --util "$vllm_util" ${VLLM_MOE_BACKEND:+--moe-backend $VLLM_MOE_BACKEND} --out "$raw/vllm.json" >"$raw/vllm.log" 2>&1 \
         || echo "vllm failed: $(grep -E 'Error|error' "$raw/vllm.log" | tail -1 | cut -c1-200)"
 else
     echo "vllm: not run (not a safetensors checkpoint dir)"

@@ -1173,7 +1173,16 @@ fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, la
 
 fn moe_act(rule: &crate::family::FamilyQuant, q: Option<&serde_json::Value>) -> ActQuant {
     let groups = q.and_then(|q| q["config_groups"].as_object());
-    groups.and_then(|g| g.values().next()).map_or(ActQuant::None, |g| compressed_act(rule, g))
+    let Some(g) = groups.and_then(|g| g.values().next()) else { return ActQuant::None };
+    let mut g = g.clone();
+    for key in ["format", "quant_method", "quant_algo"] {
+        if g.get(key).is_none()
+            && let Some(v) = q.and_then(|q| q.get(key))
+        {
+            g[key] = v.clone();
+        }
+    }
+    compressed_act(rule, &g)
 }
 
 fn parse_quantization(rule: &crate::family::FamilyQuant, value: Option<&serde_json::Value>, layers: usize) -> Result<Quantization> {

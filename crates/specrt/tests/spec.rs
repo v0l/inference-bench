@@ -694,3 +694,18 @@ fn glm5_3_flash_describes_with_its_glm_keys_and_refuses_to_serve() {
     let refusal = Spec::from_hf_config_serving(&json).unwrap_err().to_string();
     assert!(refusal.contains("model_type glm5_next is not supported"), "{refusal}");
 }
+
+#[test]
+fn qwen3_next_nvfp4_config_reads_fp4_experts_and_fused_linear_projections() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3-next-80b-nvfp4.config.json")).unwrap();
+    let spec = Spec::from_hf_config_serving(&json).unwrap();
+    assert_eq!(spec.quant, Quant::Bf16);
+    assert_eq!(spec.mlp.quant, Some(Quant::Nvfp4G16));
+    assert_eq!(spec.mlp.act_quant, specrt::spec::ActQuant::Fp4);
+    let la = spec.linear_attention.as_ref().unwrap();
+    assert!(la.fused_interleaved);
+    assert_eq!((la.key_heads, la.value_heads), (16, 32));
+    let tensors = specrt::plan::Weight::LinIn.tensors(&spec);
+    assert_eq!(tensors, vec!["linear_attn.in_proj_qkvz.weight".to_string()]);
+    assert_eq!(specrt::plan::Weight::LinBa.tensors(&spec), vec!["linear_attn.in_proj_ba.weight".to_string()]);
+}
