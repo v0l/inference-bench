@@ -1,0 +1,42 @@
+kind = "kir-kernel"
+family = "compose"
+name = "logit_scale"
+threads = 256
+
+[args]
+width = "vocab"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["x", "out"]
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "factor"
+value = "logit_scale"
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "x"
+materialize = "cuda"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "v * factor"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"

@@ -158,3 +158,10 @@ Fixtures and GPU runs follow `docs/testing.md`: CPU and tiny tiers first, the Sp
 - `specrt::codegen::kir_kernels` now selects names by spec conditions and builds every kernel from its description through `kir_shape`.
 - `crates/kir/tests/desc.rs`: description equals builder (kernel value and hash) on sm_120, sm_80, wgpu and wgpu with subgroups; error cases; target validation still applies.
 - Emitted CUDA and WGSL are unchanged: the kir goldens and the specrt lib tests pass untouched.
+
+## 6. Status of slice (a3)
+
+- `crates/kir/src/expr.rs`: the expression language (arithmetic, comparisons, `tanh exp log rsqrt sqrt abs min max select`, macros `sigmoid silu gelu_tanh`, shape constants, stage names) lowered to CUDA and WGSL text.
+- `crates/kir/src/compose.rs`: `Body::Compose`, stages `tile_load`, `epilogue`, `block_sum`, `tile_store`, emitted for CUDA and WGSL. `family = "compose"` descriptions take `[rows]`, `[[param]]`, `[[const]]` and `[[stage]]` tables; `${word}` in an expr takes an `args` word such as `mlp_act`.
+- `crates/kir/kernels/compose_*.toml`: rmsnorm, norm_add, add_rmsnorm, swiglu, residual_add, logit_scale, logit_softcap, clear_branch as composed bodies.
+- `crates/kir/tests/compose.rs`: emitted source equals the Rust builders byte for byte. rmsnorm and swiglu on sm_120, sm_80, wgpu and wgpu with subgroups (swiglu for silu and gelu); norm_add, add_rmsnorm and the pointwise kernels on sm_120 and sm_80 (the builders have no WGSL emitter). A new clamped swiglu is built from TOML alone and validated with naga. Goldens are unchanged.

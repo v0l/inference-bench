@@ -183,6 +183,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
         ),
         Body::AddRmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
         Body::RmsNorm { sum, .. } => return Err(format!("{}: block sum {sum:?} has no CUDA snippet", k.name)),
+        Body::Compose(c) => c.emit_cuda(k)?,
         Body::GatedActivation { width, act } => {
             let a = match act {
                 Activation::Silu => "g / (1.0f + expf(-g))",
@@ -214,7 +215,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
 
 pub fn emit_module(kernels: &[Kernel]) -> Result<String, String> {
     let mut out = String::new();
-    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. })) {
+    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum())) {
         out.push_str(WARP_SUM);
     }
     for k in kernels {

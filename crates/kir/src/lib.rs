@@ -2,7 +2,9 @@
 pub mod cuda;
 pub mod allreduce;
 pub mod attention;
+pub mod compose;
 pub mod desc;
+pub mod expr;
 pub mod gemm;
 pub mod gemv;
 pub mod ggml;
@@ -71,6 +73,7 @@ pub enum Body {
     Pointwise { width: u32, op: Pointwise },
     Add { width: u32, scale: f32 },
     GatedActivation { width: u32, act: Activation },
+    Compose(compose::Compose),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -248,9 +251,18 @@ impl Kernel {
         Ok(k)
     }
 
+    pub fn compose(t: &Target, name: &'static str, threads: u32, params: Vec<Param>, body: compose::Compose) -> Result<Kernel, String> {
+        let threads = pick_threads(t, threads);
+        let smem_bytes = body.smem_bytes(threads);
+        let k = Kernel { name, target: *t, params, threads, smem_bytes, body: Body::Compose(body) };
+        k.validate()?;
+        Ok(k)
+    }
+
     pub fn needs(&self) -> Vec<Feature> {
         match &self.body {
             Body::RmsNorm { sum, .. } | Body::RmsNormSegment { sum, .. } | Body::AddRmsNorm { sum, .. } | Body::NormAdd { sum, .. } => sum.needs().to_vec(),
+            Body::Compose(c) => c.sum.map(|s| s.needs().to_vec()).unwrap_or_default(),
             Body::GatedActivation { .. } | Body::Pointwise { .. } | Body::Add { .. } => vec![],
         }
     }
@@ -333,6 +345,10 @@ impl Kernel {
                 }
                 &[(Role::Activation, Access::Read), (Role::Weight, Access::Read), (Role::Activation, Access::Write)]
             }
+            Body::Compose(c) => {
+                c.check(t, &self.params)?;
+                &roles
+            }
             Body::GatedActivation { width, .. } => {
                 if *width == 0 {
                     return Err(format!("{}: width must be positive", self.name));
@@ -379,6 +395,9 @@ impl Kernel {
             }
             Body::Pointwise { width, op } => {
                 let _ = write!(s, "\n  pointwise width={width} op={op:?}");
+            }
+            Body::Compose(c) => {
+                let _ = write!(s, "\n  {}", c.describe());
             }
             Body::GatedActivation { width, act } => {
                 let _ = write!(s, "\n  gated_activation width={width} act={act:?}");

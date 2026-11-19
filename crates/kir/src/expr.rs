@@ -1,0 +1,378 @@
+use crate::layout::Dialect;
+use crate::lit;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Op {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+}
+
+impl Op {
+    fn prec(self) -> u8 {
+        match self {
+            Op::Lt | Op::Gt | Op::Le | Op::Ge => 1,
+            Op::Add | Op::Sub => 2,
+            Op::Mul | Op::Div => 3,
+        }
+    }
+
+    fn text(self) -> &'static str {
+        match self {
+            Op::Add => "+",
+            Op::Sub => "-",
+            Op::Mul => "*",
+            Op::Div => "/",
+            Op::Lt => "<",
+            Op::Gt => ">",
+            Op::Le => "<=",
+            Op::Ge => ">=",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Const {
+    pub name: String,
+    pub value: f32,
+    pub wgsl_const: bool,
+    pub fold: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Expr {
+    Lit(String),
+    Const(String, f32),
+    Raw(String),
+    Name(String),
+    Width,
+    Neg(Box<Expr>),
+    Bin(Op, Box<Expr>, Box<Expr>),
+    Call(&'static str, Vec<Expr>),
+}
+
+const UNARY: [(&str, &str, &str); 6] = [
+    ("tanh", "tanhf", "tanh"),
+    ("exp", "expf", "exp"),
+    ("log", "logf", "log"),
+    ("rsqrt", "rsqrtf", "inverseSqrt"),
+    ("sqrt", "sqrtf", "sqrt"),
+    ("abs", "fabsf", "abs"),
+];
+
+const MACROS: [(&str, &str); 3] = [
+    ("sigmoid", "1.0 / (1.0 + exp(-x))"),
+    ("silu", "x / (1.0 + exp(-x))"),
+    ("gelu_tanh", "0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))"),
+];
+
+const BINARY: [(&str, &str, &str); 2] = [("min", "fminf", "min"), ("max", "fmaxf", "max")];
+
+#[derive(Clone, Debug, PartialEq)]
+enum Tok {
+    Num(String),
+    Id(String),
+    Sym(String),
+}
+
+fn tokens(text: &str) -> Result<Vec<Tok>, String> {
+    let c: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < c.len() {
+        let ch = c[i];
+        if ch.is_whitespace() {
+            i += 1;
+        } else if ch.is_ascii_digit() || ch == '.' {
+            let s = i;
+            while i < c.len() && (c[i].is_ascii_digit() || c[i] == '.') {
+                i += 1;
+            }
+            if i < c.len() && (c[i] == 'e' || c[i] == 'E') {
+                i += 1;
+                if i < c.len() && (c[i] == '-' || c[i] == '+') {
+                    i += 1;
+                }
+                while i < c.len() && c[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            out.push(Tok::Num(c[s..i].iter().collect()));
+        } else if ch.is_ascii_alphabetic() || ch == '_' {
+            let s = i;
+            while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') {
+                i += 1;
+            }
+            out.push(Tok::Id(c[s..i].iter().collect()));
+        } else if (ch == '<' || ch == '>') && c.get(i + 1) == Some(&'=') {
+            out.push(Tok::Sym(format!("{ch}=")));
+            i += 2;
+        } else if "<>+-*/(),".contains(ch) {
+            out.push(Tok::Sym(ch.to_string()));
+            i += 1;
+        } else {
+            return Err(format!("expression {text:?}: unexpected {ch:?}"));
+        }
+    }
+    Ok(out)
+}
+
+struct Parser<'a> {
+    text: &'a str,
+    toks: Vec<Tok>,
+    at: usize,
+}
+
+impl Parser<'_> {
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.at)
+    }
+
+    fn eat(&mut self, s: &str) -> bool {
+        if matches!(self.peek(), Some(Tok::Sym(x)) if x == s) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn err(&self, what: &str) -> String {
+        format!("expression {:?}: {what}", self.text)
+    }
+
+    fn compare(&mut self) -> Result<Expr, String> {
+        let l = self.sum()?;
+        for (s, op) in [("<=", Op::Le), (">=", Op::Ge), ("<", Op::Lt), (">", Op::Gt)] {
+            if self.eat(s) {
+                let r = self.sum()?;
+                return Ok(Expr::Bin(op, Box::new(l), Box::new(r)));
+            }
+        }
+        Ok(l)
+    }
+
+    fn sum(&mut self) -> Result<Expr, String> {
+        let mut l = self.product()?;
+        loop {
+            let op = if self.eat("+") {
+                Op::Add
+            } else if self.eat("-") {
+                Op::Sub
+            } else {
+                return Ok(l);
+            };
+            let r = self.product()?;
+            l = Expr::Bin(op, Box::new(l), Box::new(r));
+        }
+    }
+
+    fn product(&mut self) -> Result<Expr, String> {
+        let mut l = self.unary()?;
+        loop {
+            let op = if self.eat("*") {
+                Op::Mul
+            } else if self.eat("/") {
+                Op::Div
+            } else {
+                return Ok(l);
+            };
+            let r = self.unary()?;
+            l = Expr::Bin(op, Box::new(l), Box::new(r));
+        }
+    }
+
+    fn unary(&mut self) -> Result<Expr, String> {
+        if self.eat("-") {
+            return Ok(Expr::Neg(Box::new(self.unary()?)));
+        }
+        self.atom()
+    }
+
+    fn atom(&mut self) -> Result<Expr, String> {
+        match self.toks.get(self.at).cloned() {
+            Some(Tok::Num(n)) => {
+                self.at += 1;
+                n.parse::<f64>().map_err(|_| self.err(&format!("bad number {n:?}")))?;
+                Ok(Expr::Lit(n))
+            }
+            Some(Tok::Sym(open)) if open == "(" => {
+                self.at += 1;
+                let e = self.compare()?;
+                if !self.eat(")") {
+                    return Err(self.err("missing )"));
+                }
+                Ok(e)
+            }
+            Some(Tok::Id(id)) => {
+                self.at += 1;
+                if self.eat("(") {
+                    let mut args = Vec::new();
+                    if !self.eat(")") {
+                        loop {
+                            args.push(self.compare()?);
+                            if self.eat(")") {
+                                break;
+                            }
+                            if !self.eat(",") {
+                                return Err(self.err("missing , or )"));
+                            }
+                        }
+                    }
+                    return self.call(&id, args);
+                }
+                Ok(if id == "width" { Expr::Width } else { Expr::Name(id) })
+            }
+            _ => Err(self.err("unexpected end or token")),
+        }
+    }
+
+    fn call(&self, id: &str, mut args: Vec<Expr>) -> Result<Expr, String> {
+        let want = |n: usize| if args.len() == n { Ok(()) } else { Err(self.err(&format!("{id} takes {n} arguments"))) };
+        if let Some((_, body)) = MACROS.iter().find(|(n, _)| *n == id) {
+            want(1)?;
+            let x = args.remove(0);
+            let e = Expr::parse(body)?;
+            return e.subst(&|n| (n == "x").then(|| x.clone()));
+        }
+        if id == "select" {
+            want(3)?;
+            return Ok(Expr::Call("select", args));
+        }
+        if let Some((n, _, _)) = UNARY.iter().find(|(n, _, _)| *n == id && *n != "neg") {
+            want(1)?;
+            return Ok(Expr::Call(n, args));
+        }
+        if let Some((n, _, _)) = BINARY.iter().find(|(n, _, _)| *n == id) {
+            want(2)?;
+            return Ok(Expr::Call(n, args));
+        }
+        Err(self.err(&format!("unknown function {id:?}")))
+    }
+}
+
+impl Expr {
+    pub fn parse(text: &str) -> Result<Expr, String> {
+        let toks = tokens(text)?;
+        let mut p = Parser { text, toks, at: 0 };
+        let e = p.compare()?;
+        if p.at != p.toks.len() {
+            return Err(p.err("trailing input"));
+        }
+        Ok(e)
+    }
+
+    pub fn names(&self, out: &mut Vec<String>) {
+        match self {
+            Expr::Name(n) => {
+                if !out.contains(n) {
+                    out.push(n.clone());
+                }
+            }
+            Expr::Lit(_) | Expr::Const(..) | Expr::Raw(_) | Expr::Width => {}
+            Expr::Neg(e) => e.names(out),
+            Expr::Bin(_, a, b) => {
+                a.names(out);
+                b.names(out);
+            }
+            Expr::Call(_, args) => args.iter().for_each(|a| a.names(out)),
+        }
+    }
+
+    pub fn count(&self, name: &str) -> usize {
+        match self {
+            Expr::Name(n) => usize::from(n == name),
+            Expr::Lit(_) | Expr::Const(..) | Expr::Raw(_) | Expr::Width => 0,
+            Expr::Neg(e) => e.count(name),
+            Expr::Bin(_, a, b) => a.count(name) + b.count(name),
+            Expr::Call(_, args) => args.iter().map(|a| a.count(name)).sum(),
+        }
+    }
+
+    pub fn bind(self, consts: &[Const]) -> Expr {
+        match self {
+            Expr::Name(n) => match consts.iter().find(|c| c.name == n) {
+                Some(c) => Expr::Const(c.name.clone(), c.value),
+                None => Expr::Name(n),
+            },
+            Expr::Neg(e) => Expr::Neg(Box::new(e.bind(consts))),
+            Expr::Bin(op, a, b) => fold(op, a.bind(consts), b.bind(consts), consts),
+            Expr::Call(f, args) => Expr::Call(f, args.into_iter().map(|a| a.bind(consts)).collect()),
+            e => e,
+        }
+    }
+
+    pub fn subst(&self, env: &dyn Fn(&str) -> Option<Expr>) -> Result<Expr, String> {
+        Ok(match self {
+            Expr::Name(n) => env(n).ok_or_else(|| format!("name {n:?} is not defined here"))?,
+            Expr::Neg(e) => Expr::Neg(Box::new(e.subst(env)?)),
+            Expr::Bin(op, a, b) => Expr::Bin(*op, Box::new(a.subst(env)?), Box::new(b.subst(env)?)),
+            Expr::Call(f, args) => Expr::Call(f, args.iter().map(|a| a.subst(env)).collect::<Result<_, _>>()?),
+            e => e.clone(),
+        })
+    }
+
+    fn prec(&self) -> u8 {
+        match self {
+            Expr::Bin(op, ..) => op.prec(),
+            Expr::Neg(_) => 4,
+            _ => 5,
+        }
+    }
+
+    pub fn lower(&self, d: Dialect, wgsl_consts: &[String]) -> Result<String, String> {
+        let child = |e: &Expr, paren: bool| -> Result<String, String> {
+            let s = e.lower(d, wgsl_consts)?;
+            Ok(if paren { format!("({s})") } else { s })
+        };
+        Ok(match self {
+            Expr::Lit(t) => {
+                let t = if t.contains(['.', 'e', 'E']) { t.clone() } else { format!("{t}.0") };
+                if d == Dialect::Cuda { format!("{t}f") } else { t }
+            }
+            Expr::Const(n, v) => match d {
+                Dialect::Cuda => format!("{}f", lit(*v)),
+                Dialect::Wgsl if wgsl_consts.contains(n) => n.to_uppercase(),
+                Dialect::Wgsl => lit(*v),
+            },
+            Expr::Name(n) => return Err(format!("name {n:?} is not bound")),
+            Expr::Raw(t) => t.clone(),
+            Expr::Width => match d {
+                Dialect::Cuda => "WIDTH".into(),
+                Dialect::Wgsl => "f32(WIDTH)".into(),
+            },
+            Expr::Neg(e) => format!("-{}", child(e, e.prec() < 4 || matches!(**e, Expr::Neg(_)))?),
+            Expr::Bin(op, a, b) => format!("{} {} {}", child(a, a.prec() < op.prec())?, op.text(), child(b, b.prec() <= op.prec())?),
+            Expr::Call("select", args) => {
+                let (c, a, b) = (child(&args[0], false)?, child(&args[1], false)?, child(&args[2], false)?);
+                match d {
+                    Dialect::Cuda => format!("({c} ? {a} : {b})"),
+                    Dialect::Wgsl => format!("select({b}, {a}, {c})"),
+                }
+            }
+            Expr::Call(f, args) => {
+                let (_, cu, wg) = UNARY.iter().chain(BINARY.iter()).find(|(n, _, _)| n == f).ok_or_else(|| format!("unknown function {f}"))?;
+                let parts: Result<Vec<String>, String> = args.iter().map(|a| child(a, false)).collect();
+                format!("{}({})", if d == Dialect::Cuda { cu } else { wg }, parts?.join(", "))
+            }
+        })
+    }
+}
+
+fn fold(op: Op, a: Expr, b: Expr, consts: &[Const]) -> Expr {
+    let is = |e: &Expr, v: f32| matches!(e, Expr::Const(n, c) if *c == v && consts.iter().any(|k| k.name == *n && k.fold));
+    match op {
+        Op::Add if is(&b, 0.0) => a,
+        Op::Add if is(&a, 0.0) => b,
+        Op::Sub if is(&b, 0.0) => a,
+        Op::Mul if is(&a, 1.0) => b,
+        Op::Mul if is(&b, 1.0) => a,
+        Op::Div if is(&b, 1.0) => a,
+        op => Expr::Bin(op, Box::new(a), Box::new(b)),
+    }
+}

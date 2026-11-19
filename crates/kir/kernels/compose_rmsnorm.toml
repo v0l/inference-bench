@@ -1,0 +1,73 @@
+kind = "kir-kernel"
+family = "compose"
+name = "rmsnorm"
+threads = 1024
+
+[args]
+width = "hidden"
+
+[rows]
+iter = "block"
+address = "advance"
+per_row = ["x", "out"]
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "weight"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "eps"
+value = "norm_eps"
+wgsl_const = true
+
+[[const]]
+name = "offset"
+value = 0
+fold = true
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "x"
+materialize = "wgsl"
+
+[[stage]]
+op = "block_sum"
+name = "total"
+expr = "v * v"
+
+[[stage]]
+op = "epilogue"
+name = "inv"
+expr = "rsqrt(total / width + eps)"
+
+[[stage]]
+op = "tile_load"
+name = "xv"
+src = "x"
+
+[[stage]]
+op = "tile_load"
+name = "w"
+src = "weight"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "(w + offset) * (xv * inv)"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"

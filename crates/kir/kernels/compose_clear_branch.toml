@@ -1,0 +1,42 @@
+kind = "kir-kernel"
+family = "compose"
+name = "clear_branch"
+threads = 256
+
+[args]
+width = "hidden"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["x", "out"]
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "fill"
+value = 0
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "x"
+materialize = "cuda"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "fill"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"

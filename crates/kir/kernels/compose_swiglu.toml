@@ -1,0 +1,54 @@
+kind = "kir-kernel"
+family = "compose"
+name = "swiglu"
+threads = 256
+
+[args]
+width = "inter"
+act = "mlp_act"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["gate_up*2", "out"]
+
+[[param]]
+name = "gate_up"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "tile_load"
+name = "g"
+src = "gate_up"
+layout = "(width,2):(2,1)"
+at = ["i", "0"]
+materialize = "both"
+
+[[stage]]
+op = "epilogue"
+name = "a"
+expr = "${act}(g)"
+materialize = "both"
+
+[[stage]]
+op = "tile_load"
+name = "u"
+src = "gate_up"
+layout = "(width,2):(2,1)"
+at = ["i", "1"]
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "a * u"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"
