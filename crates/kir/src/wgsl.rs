@@ -656,32 +656,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
             acc += d * (f32(s0.x) * lo + f32(s1.x) * hi) - dmin * (f32(s0.y) * xl + f32(s1.y) * xh);
         }}
     }} else if (code == 2u) {{
-        let hr = lane / 16u;
-        let l0 = (lane % 16u) * 2u;
-        let isc = l0 / 16u;
-        for (var sb = 0u; sb < cols / 256u; sb++) {{
+        let hr = (lane / 8u) % 2u;
+        let l = (lane % 8u) * 4u;
+        let isc = l / 16u;
+        for (var sb = lane / 16u; sb < cols / 256u; sb += 2u) {{
             let b = base + sb * 224u;
             let d = wf16(b + 208u);
-            let ql = b + 64u * hr + l0;
-            let qh = b + 128u + 32u * hr + l0;
+            let ql0 = wdata[(b + 64u * hr + l) >> 2u];
+            let ql1 = wdata[(b + 64u * hr + l + 32u) >> 2u];
+            let qh = wdata[(b + 128u + 32u * hr + l) >> 2u];
             let sc = b + 192u + 8u * hr + isc;
-            let xb = xo + sb * 256u + hr * 128u + l0;
-            let h0 = wbyte(qh);
-            let h1 = wbyte(qh + 1u);
+            let xb = (xo + sb * 256u + hr * 128u + l) / 4u;
             var part = 0.0;
-            for (var sg4 = 0u; sg4 < 4u; sg4++) {{
-                let o = (sg4 & 1u) * 32u;
-                let b0 = wbyte(ql + o);
-                let b1 = wbyte(ql + o + 1u);
-                var n0 = b0 & 0xfu;
-                var n1 = b1 & 0xfu;
-                if (sg4 >= 2u) {{
-                    n0 = b0 >> 4u;
-                    n1 = b1 >> 4u;
-                }}
-                let q0 = i32(n0 | (((h0 >> (2u * sg4)) & 3u) << 4u)) - 32;
-                let q1 = i32(n1 | (((h1 >> (2u * sg4)) & 3u) << 4u)) - 32;
-                part += wi8(sc + 2u * sg4) * (f32(q0) * xs(xb + sg4 * 32u) + f32(q1) * xs(xb + sg4 * 32u + 1u));
+            for (var seg = 0u; seg < 4u; seg++) {{
+                let qw = select(ql0, ql1, (seg & 1u) == 1u) >> (4u * (seg >> 1u));
+                let v = (qw & 0x0f0f0f0fu) | (((qh >> (2u * seg)) & 0x03030303u) << 4u);
+                let f = vec4<f32>(vec4<u32>(v & 0xffu, (v >> 8u) & 0xffu, (v >> 16u) & 0xffu, v >> 24u)) - vec4<f32>(32.0);
+                part += wi8(sc + 2u * seg) * dot(f, x[xb + seg * 8u]);
             }}
             acc += d * part;
         }}
