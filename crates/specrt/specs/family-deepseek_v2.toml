@@ -10,6 +10,9 @@ architectures = ["DeepseekV2ForCausalLM"]
 [norm]
 unit_offset = false
 
+[runtime]
+split_activations = true
+
 [attention]
 o_cols = "heads * v_head_dim"
 
