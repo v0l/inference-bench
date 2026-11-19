@@ -1,0 +1,42 @@
+kind = "kir-kernel"
+family = "compose"
+name = "logit_softcap"
+threads = 256
+
+[args]
+width = "vocab"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["x", "out"]
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "cap"
+value = "logit_softcap"
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "x"
+materialize = "cuda"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "cap * tanh(v / cap)"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"

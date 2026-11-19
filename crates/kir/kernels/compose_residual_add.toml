@@ -1,0 +1,52 @@
+kind = "kir-kernel"
+family = "compose"
+name = "residual_add"
+threads = 256
+
+[args]
+width = "hidden"
+
+[rows]
+iter = "grid"
+address = "base"
+per_row = ["x", "delta", "out"]
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "delta"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "scale"
+value = "residual_scale"
+fold = true
+
+[[stage]]
+op = "tile_load"
+name = "a"
+src = "x"
+
+[[stage]]
+op = "tile_load"
+name = "b"
+src = "delta"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "a + scale * b"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"

@@ -1,4 +1,7 @@
-use crate::{Activation, Kernel, Pointwise, Target};
+use crate::compose::{Address, Compose, Iter, Mat, Rows, Stage, Tile};
+use crate::expr::{Const, Expr};
+use crate::layout::Layout;
+use crate::{Access, Activation, BlockSum, Kernel, Param, Pointwise, Role, Scalar, Target};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
 use toml::Value;
@@ -18,6 +21,17 @@ pub const BUILTIN: [(&str, &str); 10] = [
     ("logit_softcap", include_str!("../kernels/logit_softcap.toml")),
 ];
 
+pub const COMPOSED: [(&str, &str); 8] = [
+    ("rmsnorm", include_str!("../kernels/compose_rmsnorm.toml")),
+    ("norm_add", include_str!("../kernels/compose_norm_add.toml")),
+    ("add_rmsnorm", include_str!("../kernels/compose_add_rmsnorm.toml")),
+    ("swiglu", include_str!("../kernels/compose_swiglu.toml")),
+    ("residual_add", include_str!("../kernels/compose_residual_add.toml")),
+    ("logit_softcap", include_str!("../kernels/compose_logit_softcap.toml")),
+    ("logit_scale", include_str!("../kernels/compose_logit_scale.toml")),
+    ("clear_branch", include_str!("../kernels/compose_clear_branch.toml")),
+];
+
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Description {
@@ -27,6 +41,63 @@ pub struct Description {
     pub threads: u32,
     #[serde(default)]
     pub args: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub rows: Option<RowsDesc>,
+    #[serde(default)]
+    pub param: Vec<ParamDesc>,
+    #[serde(default, rename = "const")]
+    pub consts: Vec<ConstDesc>,
+    #[serde(default)]
+    pub stage: Vec<StageDesc>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RowsDesc {
+    pub iter: String,
+    pub address: String,
+    pub per_row: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParamDesc {
+    pub name: String,
+    pub role: String,
+    pub access: String,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConstDesc {
+    pub name: String,
+    pub value: Value,
+    #[serde(default)]
+    pub wgsl_const: bool,
+    #[serde(default)]
+    pub fold: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageDesc {
+    pub op: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub src: Option<String>,
+    #[serde(default)]
+    pub dst: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub expr: Option<String>,
+    #[serde(default)]
+    pub layout: Option<String>,
+    #[serde(default)]
+    pub at: Vec<String>,
+    #[serde(default)]
+    pub materialize: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -78,6 +149,11 @@ impl Description {
         Description::parse(text)
     }
 
+    pub fn composed(name: &str) -> Result<Description, String> {
+        let (_, text) = COMPOSED.iter().find(|(n, _)| *n == name).ok_or_else(|| format!("no composed kernel description {name:?}"))?;
+        Description::parse(text)
+    }
+
     fn arg<'a>(&'a self, shape: &'a Shape, key: &str) -> Result<&'a Value, String> {
         let v = self.args.get(key).ok_or_else(|| format!("{}: missing arg {key:?}", self.name))?;
         match v {
@@ -123,10 +199,135 @@ impl Description {
         }
     }
 
+    fn constant(&self, shape: &Shape, c: &ConstDesc) -> Result<f32, String> {
+        let v = match &c.value {
+            Value::String(sym) => shape.get(sym).ok_or_else(|| format!("{}: const {:?} names {sym:?}, which the model shape does not provide", self.name, c.name))?,
+            v => v,
+        };
+        match v {
+            Value::Integer(i) => Ok(*i as f32),
+            Value::Float(f) => Ok(*f as f32),
+            v => Err(format!("{}: const {:?} is {v}, not a number", self.name, c.name)),
+        }
+    }
+
+    fn words(&self, shape: &Shape) -> Result<Vec<(String, String)>, String> {
+        let mut out = Vec::new();
+        for k in self.args.keys().filter(|k| *k != "width") {
+            let w = self.word(shape, k)?;
+            let w = match w.as_str() {
+                "swiglu" => "silu".to_string(),
+                "geglu" => "gelu_tanh".to_string(),
+                _ => w,
+            };
+            out.push((k.clone(), w));
+        }
+        Ok(out)
+    }
+
+    fn text(&self, words: &[(String, String)], text: &str) -> String {
+        let mut out = text.to_string();
+        for (k, w) in words {
+            out = out.replace(&format!("${{{k}}}"), w);
+        }
+        out
+    }
+
+    fn tile(&self, width: u32, layout: &Option<String>, at: &[String]) -> Result<Option<Tile>, String> {
+        let Some(text) = layout else {
+            return if at.is_empty() { Ok(None) } else { Err(format!("{}: stage has `at` without a layout", self.name)) };
+        };
+        let bad = || format!("{}: layout {text:?} is not (shape):(stride)", self.name);
+        let (shape, stride) = text.split_once(':').ok_or_else(bad)?;
+        let list = |part: &str| -> Result<Vec<u64>, String> {
+            let inner = part.trim().strip_prefix('(').and_then(|p| p.strip_suffix(')')).ok_or_else(bad)?;
+            inner
+                .split(',')
+                .map(|x| match x.trim() {
+                    "width" => Ok(width as u64),
+                    n => n.parse::<u64>().map_err(|_| bad()),
+                })
+                .collect()
+        };
+        let layout = Layout::flat(&list(shape)?, &list(stride)?)?;
+        Ok(Some(Tile { layout, at: at.to_vec() }))
+    }
+
+    fn mat(&self, m: &Option<String>) -> Result<Mat, String> {
+        Ok(match m.as_deref() {
+            None | Some("none") => Mat::default(),
+            Some("both") => Mat { cuda: true, wgsl: true },
+            Some("cuda") => Mat { cuda: true, wgsl: false },
+            Some("wgsl") => Mat { cuda: false, wgsl: true },
+            Some(o) => return Err(format!("{}: materialize {o:?} is not none, cuda, wgsl or both", self.name)),
+        })
+    }
+
+    fn compose(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
+        let width = self.count(shape, "width")?;
+        let words = self.words(shape)?;
+        let rows = self.rows.as_ref().ok_or_else(|| format!("{}: compose needs [rows]", self.name))?;
+        let iter = match rows.iter.as_str() {
+            "block" => Iter::Block,
+            "grid" => Iter::Grid,
+            o => return Err(format!("{}: rows iter {o:?} is not block or grid", self.name)),
+        };
+        let address = match rows.address.as_str() {
+            "advance" => Address::Advance,
+            "base" => Address::Base,
+            o => return Err(format!("{}: rows address {o:?} is not advance or base", self.name)),
+        };
+        let per_row = rows
+            .per_row
+            .iter()
+            .map(|r| match r.split_once('*') {
+                None => Ok((r.clone(), 1)),
+                Some((n, m)) => m.parse::<u32>().map(|m| (n.to_string(), m)).map_err(|_| format!("{}: rows entry {r:?} is not name or name*N", self.name)),
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut params = Vec::new();
+        for p in &self.param {
+            let role = match p.role.as_str() {
+                "weight" => Role::Weight,
+                "activation" => Role::Activation,
+                "scratch" => Role::Scratch,
+                o => return Err(format!("{}: param role {o:?} is unknown", self.name)),
+            };
+            let access = match p.access.as_str() {
+                "read" => Access::Read,
+                "write" => Access::Write,
+                o => return Err(format!("{}: param access {o:?} is unknown", self.name)),
+            };
+            params.push(Param { name: intern(&p.name), ty: Scalar::F32, role, access });
+        }
+        let mut consts = Vec::new();
+        for c in &self.consts {
+            consts.push(Const { name: c.name.clone(), value: self.constant(shape, c)?, wgsl_const: c.wgsl_const, fold: c.fold });
+        }
+        let need = |v: &Option<String>, what: &str, op: &str| v.clone().ok_or_else(|| format!("{}: stage {op} needs {what}", self.name));
+        let mut stages = Vec::new();
+        for s in &self.stage {
+            let expr = |s: &StageDesc| -> Result<Expr, String> { Expr::parse(&self.text(&words, &need(&s.expr, "expr", &s.op)?)).map_err(|e| format!("{}: {e}", self.name)) };
+            stages.push(match s.op.as_str() {
+                "tile_load" => Stage::TileLoad { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, tile: self.tile(width, &s.layout, &s.at)?, mat: self.mat(&s.materialize)? },
+                "epilogue" => Stage::Epilogue { dst: need(&s.name, "name", &s.op)?, expr: expr(s)?, mat: self.mat(&s.materialize)? },
+                "block_sum" => Stage::BlockSum { dst: need(&s.name, "name", &s.op)?, expr: expr(s)? },
+                "tile_store" => Stage::TileStore { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(width, &s.layout, &s.at)? },
+                o => return Err(format!("{}: unknown stage op {o:?}", self.name)),
+            });
+        }
+        let sum = stages.iter().any(|s| matches!(s, Stage::BlockSum { .. })).then(|| BlockSum::for_target(t));
+        Kernel::compose(t, intern(&self.name), self.threads, params, Compose { width, rows: Rows { iter, address, per_row }, consts, sum, stages }).map_err(|e| format!("{}: {e}", self.name))
+    }
+
     pub fn build(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
         let name = intern(&self.name);
         let threads = self.threads;
+        if self.family != "compose" && (self.rows.is_some() || !self.param.is_empty() || !self.consts.is_empty() || !self.stage.is_empty()) {
+            return Err(format!("{}: only family compose takes rows, param, const and stage", self.name));
+        }
         match self.family.as_str() {
+            "compose" => self.compose(t, shape),
             "rmsnorm" => {
                 self.known(&["width", "eps", "offset"])?;
                 Kernel::rmsnorm_offset(t, self.count(shape, "width")?, self.number(shape, "eps")? as f32, self.number(shape, "offset")? as f32, threads)
