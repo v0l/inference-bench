@@ -568,3 +568,8 @@ wgsl 26/26 with `--include-ignored --test-threads=1` and clippy `-D warnings` wi
 | Q6_K per-block scale as one u32 load plus shift, replacing the `wf16`/`wi8` byte loads | Within noise (m=4096 k=14336: 2.16 vs 2.16, k=1024: 2.19 vs 2.13). |
 
 The Q6_K unpack was already vectorised on u32 words (shift and mask on 4 lanes), so there is nothing left to gain there. Base Q4_K and Q6_K sit at 2.2 to 2.5 TFLOP/s against bf16 at 2.5 (1.9 only at k=14336), so dequant is not what separates the kernel from the 3.25 hand kernel. `mac_vs_llama.sh` before and after tables were not run: no change was kept, so they would be identical.
+
+### bf16 gap to the hand kernel
+
+The side-by-side of the #829 hand MSL (3.25) and the emitted `linear_coop` is the table in "Mac speed work 8", section 1: the hand tile is 64 rows x 32 tokens with 8 accumulators per simdgroup and the emitted one is 64x64 with 16, the hand kernel has no bounds guards, and the hand half-tile variant reaches 3.56 to 3.77. The tile shape (1.54 at 32x64), f16 tiles (2.13), address maths, split load loops and the dequant were all measured there and are already at their kept state. New in this pass, A/B against base, back to back, twice: swapping the workgroup order so adjacent workgroups share a token tile instead of a row tile gave bf16 k=14336 1.73 to 1.76 against 1.94 to 1.95 (worse) and Q4_K/Q6_K within +-3%, so it was dropped. Nothing cleared the 5% bar, so no emitter change is kept and `mac_vs_llama.sh` was not re-run. The Mac was at load 70 at the start of the round and settled to normal before the timed runs.
+
