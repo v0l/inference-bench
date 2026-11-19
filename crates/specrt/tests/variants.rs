@@ -248,3 +248,18 @@ fn the_gpt_oss_checkpoint_decodes_mxfp4_experts_and_loads_every_bias() {
 fn gpt_oss_sinks_clamped_swiglu_and_mxfp4_experts_match_transformers() {
     close(OSS, 5e-2);
 }
+
+#[test]
+#[ignore = "needs an sm_120 GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn gpt_oss_block_scaled_mma_experts_match_the_packed_gemv_experts() {
+    let (tokens, _, vocab, _) = reference(OSS);
+    let mma = spec(OSS);
+    let mut gemv = spec(OSS);
+    gemv.mlp.act_quant = specrt::spec::ActQuant::None;
+    let a = Runtime::load_batched(&mma, 256, 1).unwrap().prompt_logits(&tokens).unwrap();
+    let b = Runtime::load_batched(&gemv, 256, 1).unwrap().prompt_logits(&tokens).unwrap();
+    let scale = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let diff = a.iter().zip(&b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+    eprintln!("gpt-oss mma vs gemv max diff {diff} of {scale} over {} rows of {vocab}", tokens.len());
+    assert!(diff < 0.05 * scale, "{diff} of {scale}");
+}
