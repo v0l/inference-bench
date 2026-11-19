@@ -224,7 +224,7 @@ fn read_listed(path: &Path, dir: &SpecDir) -> Option<Listed> {
     let table: toml::Table = toml::from_str(&text).ok()?;
     let name = table.get("name").and_then(|v| v.as_str())?.to_string();
     let problem = match check(&text) {
-        Ok(Checked::Ready(_) | Checked::Family(_)) => None,
+        Ok(Checked::Ready(_) | Checked::Family(_) | Checked::Kernel(_)) => None,
         Ok(Checked::NeedsNewer { min_engine, .. }) => Some(needs_newer_note(min_engine)),
         Err(e) => Some(format!("spec does not parse: {e}")),
     };
@@ -295,11 +295,29 @@ fn family_texts(layers: &[SpecDir]) -> Vec<(String, SpecOrigin)> {
     out
 }
 
+fn kernel_texts(layers: &[SpecDir]) -> Vec<String> {
+    let mut out = Vec::new();
+    for layer in layers {
+        for path in toml_files(&layer.path) {
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            if toml::from_str::<toml::Table>(&text).is_ok_and(|t| specrt::family::is_kernel(&t)) {
+                out.push(text);
+            }
+        }
+    }
+    out
+}
+
 pub fn install_families(layers: &[SpecDir]) {
     let texts = family_texts(layers);
     match specrt::family::Registry::from_texts(texts.iter().map(|(t, _)| t.as_str())) {
         Ok(registry) => specrt::family::install(registry),
         Err(e) => tracing::warn!(error = %e, "family specs do not parse, using the embedded families"),
+    }
+    let kernels = kernel_texts(layers);
+    match specrt::kir_kernel::Registry::from_texts(kernels.iter().map(String::as_str)) {
+        Ok(registry) => specrt::kir_kernel::Registry::install(registry),
+        Err(e) => tracing::warn!(error = %e, "kernel descriptions do not parse, using the embedded ones"),
     }
 }
 

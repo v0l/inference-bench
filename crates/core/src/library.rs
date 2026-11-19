@@ -714,7 +714,7 @@ fn spec_model(listed: &specs::Listed, hub: &Path) -> LocalModel {
 }
 
 pub fn spec_models(layers: &[SpecDir], hub: &Path) -> Vec<LocalModel> {
-    specs::list(layers).iter().filter(|l| !specrt::family::is_family(&l.table)).map(|l| spec_model(l, hub)).collect()
+    specs::list(layers).iter().filter(|l| !specrt::family::is_family(&l.table) && !specrt::family::is_kernel(&l.table)).map(|l| spec_model(l, hub)).collect()
 }
 
 pub fn scan_specs(dir: &Path, hub: &Path) -> Vec<LocalModel> {
@@ -759,7 +759,7 @@ pub fn scan(sources: &Sources) -> Vec<LocalModel> {
     let mut all = scan_hub(&sources.hub);
     let overrides: Vec<(String, String)> = specs::list(&sources.specs)
         .iter()
-        .filter(|l| !specrt::family::is_family(&l.table))
+        .filter(|l| !specrt::family::is_family(&l.table) && !specrt::family::is_kernel(&l.table))
         .map(|l| (l.table.get("repo").and_then(|r| r.as_str()).unwrap_or("").to_string(), l.name.clone()))
         .collect();
     for m in &mut all {

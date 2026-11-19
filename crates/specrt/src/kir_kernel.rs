@@ -19,9 +19,7 @@ impl Registry {
                 continue;
             }
             let d: Description = toml::from_str(text)?;
-            if out.descriptions.insert(d.name.clone(), d).is_some() {
-                anyhow::bail!("kernel description {} appears twice", out.descriptions.keys().last().map(String::as_str).unwrap_or_default());
-            }
+            out.descriptions.entry(d.name.clone()).or_insert(d);
         }
         Ok(out)
     }

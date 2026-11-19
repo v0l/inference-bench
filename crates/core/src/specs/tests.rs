@@ -50,8 +50,7 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 #[test]
-fn an_update_takes_good_specs_and_keeps_the_old_copy_of_a_bad_one() {
-    let r = rig();
+fn an_update_takes_good_specs_and_keeps_the_old_copy_of_a_bad_one() {    let r = rig();
     let store = SpecStore::new(&temp("bad"));
     r.publish(&[file("a.toml", &spec_text("a", 2)), file("c.toml", &spec_text("c", 2))], "v1", "1111111aaaa");
     assert!(matches!(store.update(&r.cfg).unwrap(), Outcome::Updated(_)));
@@ -273,6 +272,29 @@ fn a_check_is_due_after_the_interval_or_when_the_source_changes() {
 fn put(dir: &Path, file: &str, text: &str) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join(file), text).unwrap();
+}
+
+fn kernel_text(name: &str) -> String {
+    EMBEDDED.iter().find(|(n, _)| *n == "attention_split.toml").unwrap().1.replace("name = \"attention_split\"", &format!("name = \"{name}\""))
+}
+
+#[test]
+fn a_downloaded_kernel_description_installs_and_is_listed() {
+    let r = rig();
+    let data = temp("kerneldesc");
+    let store = SpecStore::new(&data);
+    r.publish(&[file("attention_split.toml", &kernel_text("attention_split")), file("my_split.toml", &kernel_text("my_split"))], "v1", "c1");
+    assert!(matches!(store.update(&r.cfg).unwrap(), Outcome::Updated(_)));
+    let all = list(&layers(&store, &[], &[]));
+    assert!(all.iter().any(|l| l.name == "my_split" && l.loadable()), "kernel description listed: {:?}", all.iter().map(|l| l.name.clone()).collect::<Vec<_>>());
+    let texts: Vec<String> = kernel_texts(&layers(&store, &[], &[]));
+    assert!(texts.iter().any(|t| t.contains("my_split")));
+    let registry = specrt::kir_kernel::Registry::from_texts(texts.iter().map(String::as_str)).unwrap();
+    assert!(registry.get("my_split").is_some());
+    assert_eq!(registry.get("attention_split").unwrap().name, "attention_split");
+    assert!(registry.descriptions().count() >= 9);
+    install_families(&layers(&store, &[], &[]));
+    assert!(specrt::kir_kernel::Registry::active().get("my_split").is_some());
 }
 
 #[test]
