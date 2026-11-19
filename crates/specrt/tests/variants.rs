@@ -77,7 +77,10 @@ fn both_variant_modules_build_with_no_binary_support() {
 
 fn close(name: &str, tolerance: f32) {
     let (tokens, greedy, vocab, want) = reference(name);
-    let spec = spec(name);
+    let mut spec = spec(name);
+    spec.mlp.act_quant = specrt::spec::ActQuant::None;
+    spec.mlp.up_act_planes = 1;
+    spec.mlp.down_act_planes = 1;
     let mut rt = Runtime::load_batched(&spec, 256, 1).unwrap();
     let ours = rt.prompt_logits(&tokens).unwrap();
     assert_eq!(ours.len(), want.len());
