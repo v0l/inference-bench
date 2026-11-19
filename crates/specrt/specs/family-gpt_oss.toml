@@ -35,6 +35,8 @@ expert_bias = true
 norm_topk = true
 shared_gate = false
 expert_block = { elem = "e2m1", scale = "e8m0", group = 32 }
+act_quant = "fp4"
+act_planes = 2
 gate_up_interleaved = true
 
 [[attention.node]]

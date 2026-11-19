@@ -1634,8 +1634,8 @@ impl Spec {
                 quant: mlp_quant.map(|m| m.0),
                 quant_until: mlp_quant.and_then(|m| m.1),
                 act_quant: mlp_act,
-                up_act_planes: 1,
-                down_act_planes: 1,
+                up_act_planes: if block_act { family.moe.act_planes.unwrap_or(1) } else { 1 },
+                down_act_planes: if block_act { family.moe.act_planes.unwrap_or(1) } else { 1 },
                 fused_gate_up: family.mlp.fused_gate_up,
                 gated: match &family.mlp.gated {
                     Some(g) => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),

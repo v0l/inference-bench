@@ -170,6 +170,7 @@ pub struct FamilyMoe {
     pub score_bias: bool,
     pub expert_block: Option<crate::dequant::BlockFormat>,
     pub act_quant: Option<crate::spec::ActQuant>,
+    pub act_planes: Option<u8>,
     pub gate_up_interleaved: bool,
     pub router_bias: bool,
     pub expert_bias: bool,

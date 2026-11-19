@@ -236,7 +236,8 @@ fn the_real_gpt_oss_20b_config_loads_as_mxfp4_experts_with_a_k_tail() {
     let moe = spec.moe.as_ref().unwrap();
     assert_eq!((spec.dims.hidden, moe.expert_intermediate, moe.experts, moe.top_k()), (2880, 2880, 32, 4));
     assert_eq!(moe.expert_block, Some(specrt::dequant::MXFP4));
-    assert_eq!(spec.mlp.act_quant, specrt::spec::ActQuant::None);
+    assert_eq!((spec.mlp.act_quant, spec.mlp.up_act_planes, spec.mlp.down_act_planes), (specrt::spec::ActQuant::Fp4, 2, 2));
+    spec.validate().unwrap();
 }
 
 #[test]
@@ -298,7 +299,10 @@ fn gpt_oss_block_scaled_mma_experts_match_the_packed_gemv_experts() {
     let (tokens, _, vocab, _) = reference(OSS);
     let mut mma = spec(OSS);
     mma.mlp.act_quant = specrt::spec::ActQuant::Fp4;
-    let gemv = spec(OSS);
+    let mut gemv = spec(OSS);
+    gemv.mlp.act_quant = specrt::spec::ActQuant::None;
+    gemv.mlp.up_act_planes = 1;
+    gemv.mlp.down_act_planes = 1;
     let mut rt_mma = Runtime::load_batched(&mma, 256, 1).unwrap();
     let mut rt_gemv = Runtime::load_batched(&gemv, 256, 1).unwrap();
     let a = rt_mma.prompt_logits(&tokens).unwrap();
