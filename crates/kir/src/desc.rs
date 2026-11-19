@@ -328,6 +328,7 @@ pub struct StageDesc {
     pub head: Option<Value>,
     #[serde(default)]
     pub offset: Option<Value>,
+    #[serde(default)]
     pub index: Option<String>,
 }
 

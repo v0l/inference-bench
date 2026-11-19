@@ -19,8 +19,8 @@ impl Lcg {
     }
 }
 
-const HIDDEN: usize = 512;
-const INTER: usize = 512;
+const HIDDEN: usize = 256;
+const INTER: usize = 256;
 const EXPERTS: usize = 16;
 const TOP_K: usize = 4;
 const PAIRS: usize = TOP_K + 1;
@@ -73,6 +73,38 @@ fn stack(rows: usize, cols: usize, rng: &mut Lcg) -> Stack {
     s
 }
 
+fn mx_quantize(w: &[f32]) -> (Vec<u8>, Vec<u8>, Vec<f32>) {
+    let mut packed = vec![0u8; w.len() / 2];
+    let mut scales = Vec::new();
+    let mut deq = Vec::new();
+    for (g, group) in w.as_chunks::<32>().0.iter().enumerate() {
+        let amax = group.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let bits = (amax / 6.0).to_bits();
+        let e = (((bits >> 23) + u32::from(bits & 0x7fffff != 0)).clamp(1, 253)) as u8;
+        scales.push(e);
+        let scale = f32::from_bits(u32::from(e) << 23);
+        for (i, v) in group.iter().enumerate() {
+            let q = specrt::nvfp4::f32_to_e2m1(v / scale);
+            let at = g * 32 + i;
+            packed[at / 2] |= if at % 2 == 0 { q } else { q << 4 };
+            deq.push(e2m1_to_f32(q) * scale);
+        }
+    }
+    (packed, scales, deq)
+}
+
+fn mx_stack(rows: usize, cols: usize, rng: &mut Lcg) -> Stack {
+    let mut s = Stack { packed: vec![], scales: vec![], inv_global: vec![], dequant: vec![] };
+    for _ in 0..SLOTS {
+        let w: Vec<f32> = (0..rows * cols).map(|_| rng.float() * 0.5).collect();
+        let (p, sc, d) = mx_quantize(&w);
+        s.packed.extend(p);
+        s.scales.extend(sc);
+        s.dequant.extend(d);
+    }
+    s
+}
+
 fn quant_dequant(v: &[f32], igs: f32) -> Vec<f32> {
     let (packed, scales) = quantize(v, v.len(), igs);
     (0..v.len())
@@ -89,7 +121,16 @@ fn silu(v: f32) -> f32 {
 }
 
 fn run(tokens: usize, expected_bm: usize) {
-    let spec = spec();
+    run_with(tokens, expected_bm, false);
+}
+
+fn run_with(tokens: usize, expected_bm: usize, mx: bool) {
+    let mut spec = spec();
+    if mx {
+        let m = spec.moe.as_mut().unwrap();
+        m.expert_block = Some(specrt::dequant::MXFP4);
+        m.expert_bias = true;
+    }
     let ctx = CudaContext::new(0).unwrap();
     let target = cuda_target(&ctx).unwrap();
     if target.compute_capability.0 < 12 {
@@ -109,9 +150,10 @@ fn run(tokens: usize, expected_bm: usize) {
     };
     let stream = ctx.default_stream();
     let mut rng = Lcg(644);
-    let gate = stack(INTER, HIDDEN, &mut rng);
-    let up = stack(INTER, HIDDEN, &mut rng);
-    let down = stack(HIDDEN, INTER, &mut rng);
+    let make = |rows, cols, rng: &mut Lcg| if mx { mx_stack(rows, cols, rng) } else { stack(rows, cols, rng) };
+    let gate = make(INTER, HIDDEN, &mut rng);
+    let up = make(INTER, HIDDEN, &mut rng);
+    let down = make(HIDDEN, INTER, &mut rng);
     let x: Vec<f32> = (0..tokens * HIDDEN).map(|_| rng.float() * 2.0).collect();
     let mut idx = vec![0i32; tokens * PAIRS];
     for t in 0..tokens {
@@ -126,9 +168,13 @@ fn run(tokens: usize, expected_bm: usize) {
         idx[t * PAIRS + TOP_K] = EXPERTS as i32;
     }
     let pairs = tokens * PAIRS;
+    let bias_up: Vec<f32> = (0..EXPERTS * 2 * INTER).map(|_| if mx { rng.float() } else { 0.0 }).collect();
+    let bias_down: Vec<f32> = (0..EXPERTS * HIDDEN).map(|_| if mx { rng.float() } else { 0.0 }).collect();
+    let eb = |v: &[f32], e: usize, which: usize, r: usize, width: usize| if e < EXPERTS { v[(e * 2 + which) * width + r] } else { 0.0 };
     let igs_up = 300.0f32;
     let igs_down = 120.0f32;
-    let up_in: Vec<Vec<f32>> = (0..tokens).map(|t| quant_dequant(&x[t * HIDDEN..(t + 1) * HIDDEN], igs_up)).collect();
+    let qd = |v: &[f32], igs: f32| -> Vec<f32> { if mx { v.chunks(32).flat_map(|c| mx_quantize(c).2).collect() } else { quant_dequant(v, igs) } };
+    let up_in: Vec<Vec<f32>> = (0..tokens).map(|t| qd(&x[t * HIDDEN..(t + 1) * HIDDEN], igs_up)).collect();
     let mut expected = vec![0f32; pairs * HIDDEN];
     for p in 0..pairs {
         let e = idx[p] as usize;
@@ -136,19 +182,24 @@ fn run(tokens: usize, expected_bm: usize) {
         let act: Vec<f32> = (0..INTER)
             .map(|r| {
                 let dot = |w: &Stack| -> f32 { (0..HIDDEN).map(|c| w.dequant[(e * INTER + r) * HIDDEN + c] * xin[c]).sum() };
-                silu(dot(&gate)) * dot(&up)
+                silu(dot(&gate) + eb(&bias_up, e, 0, r, INTER)) * (dot(&up) + eb(&bias_up, e, 1, r, INTER))
             })
             .collect();
-        let mid = quant_dequant_rows(&act, igs_down);
+        let mid = qd(&act, igs_down);
         for r in 0..HIDDEN {
-            expected[p * HIDDEN + r] = (0..INTER).map(|c| down.dequant[(e * HIDDEN + r) * INTER + c] * mid[c]).sum();
+            expected[p * HIDDEN + r] = (0..INTER).map(|c| down.dequant[(e * HIDDEN + r) * INTER + c] * mid[c]).sum::<f32>() + if e < EXPERTS { bias_down[e * HIDDEN + r] } else { 0.0 };
         }
     }
     let d = |v: &[u8]| stream.clone_htod(v).unwrap();
     let df = |v: &[f32]| stream.clone_htod(v).unwrap();
-    let (gw, gs, gg) = (d(&gate.packed), d(&gate.scales), df(&gate.inv_global));
-    let (uw, us, ug) = (d(&up.packed), d(&up.scales), df(&up.inv_global));
-    let (dw, ds, dg) = (d(&down.packed), d(&down.scales), df(&down.inv_global));
+    let one = |s: &Stack| if mx { df(&[1.0]) } else { df(&s.inv_global) };
+    let (gw, gs, gg) = (d(&gate.packed), d(&gate.scales), one(&gate));
+    let (uw, us, ug) = (d(&up.packed), d(&up.scales), one(&up));
+    let (dw, ds, dg) = (d(&down.packed), d(&down.scales), one(&down));
+    let bias_u = if mx { df(&bias_up) } else { df(&[0.0]) };
+    let bias_d = if mx { df(&bias_down) } else { df(&[0.0]) };
+    let stem = if mx { "moe_mma_mx" } else { "moe_mma" };
+    let quant_name = if mx { "moe_quant_mx" } else { "moe_quant_f32" };
     let xd = df(&x);
     let idx_d = stream.clone_htod(&idx).unwrap();
     let mut offsets: CudaSlice<i32> = stream.alloc_zeros(SLOTS + 2).unwrap();
@@ -173,26 +224,32 @@ fn run(tokens: usize, expected_bm: usize) {
     b.arg(&offsets).arg(&mut tiles).arg(&bm_i).arg(&max_i);
     unsafe { b.launch(cfg(1, 32)) }.unwrap();
     let w = HIDDEN as i32;
-    let kernel = f("moe_quant_f32");
+    let kernel = f(quant_name);
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&xd).arg(&mut xq).arg(&mut xs).arg(&w).arg(&igs_up);
+    b.arg(&xd).arg(&mut xq).arg(&mut xs).arg(&w);
+    if !mx {
+        b.arg(&igs_up);
+    }
     unsafe { b.launch(cfg(tokens as u32, 256)) }.unwrap();
     let inv_up = 1.0 / igs_up;
     let small = expected_bm == MOE_MMA_BM_SMALL;
-    let kernel = f(if small { "moe_mma_up_s" } else { "moe_mma_up" });
+    let kernel = f(&format!("{stem}_up{}", if small { "_s" } else { "" }));
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&gw).arg(&gs).arg(&gg).arg(&uw).arg(&us).arg(&ug).arg(&inv_up).arg(&xq).arg(&xs).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut act);
+    b.arg(&gw).arg(&gs).arg(&gg).arg(&uw).arg(&us).arg(&ug).arg(&bias_u).arg(&inv_up).arg(&xq).arg(&xs).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut act);
     let config = LaunchConfig { grid_dim: ((INTER / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(expected_bm, 2) };
     unsafe { b.launch(config) }.unwrap();
     let w = INTER as i32;
-    let kernel = f("moe_quant_f32");
+    let kernel = f(quant_name);
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&act).arg(&mut aq).arg(&mut asc).arg(&w).arg(&igs_down);
+    b.arg(&act).arg(&mut aq).arg(&mut asc).arg(&w);
+    if !mx {
+        b.arg(&igs_down);
+    }
     unsafe { b.launch(cfg(pairs as u32, 256)) }.unwrap();
     let inv_down = 1.0 / igs_down;
-    let kernel = f(if small { "moe_mma_down_s" } else { "moe_mma_down" });
+    let kernel = f(&format!("{stem}_down{}", if small { "_s" } else { "" }));
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&dw).arg(&ds).arg(&dg).arg(&dw).arg(&ds).arg(&dg).arg(&inv_down).arg(&aq).arg(&asc).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut out);
+    b.arg(&dw).arg(&ds).arg(&dg).arg(&dw).arg(&ds).arg(&dg).arg(&bias_d).arg(&inv_down).arg(&aq).arg(&asc).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut out);
     let config = LaunchConfig { grid_dim: ((HIDDEN / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(expected_bm, 1) };
     unsafe { b.launch(config) }.unwrap();
     stream.synchronize().unwrap();
@@ -202,10 +259,6 @@ fn run(tokens: usize, expected_bm: usize) {
     eprintln!("tokens {tokens} bm {expected_bm}: max err {err:.3e} of {scale:.3}");
     assert!(err <= 0.02 * scale, "{err} of {scale}");
     let _ = bf16_to_f32(0);
-}
-
-fn quant_dequant_rows(v: &[f32], igs: f32) -> Vec<f32> {
-    quant_dequant(v, igs)
 }
 
 #[test]
@@ -224,4 +277,16 @@ fn grouped_mma_matches_cpu_with_small_tiles() {
 #[ignore = "needs an sm_120 GPU"]
 fn grouped_mma_matches_cpu_with_one_token() {
     run(1, MOE_MMA_BM_SMALL);
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
+fn mx_grouped_mma_matches_cpu_with_big_tiles() {
+    run_with(48, MOE_MMA_BM, true);
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
+fn mx_grouped_mma_matches_cpu_with_small_tiles() {
+    run_with(8, MOE_MMA_BM_SMALL, true);
 }

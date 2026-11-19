@@ -8,6 +8,7 @@ pub(super) enum StackWeights {
     Bf16(CudaSlice<u16>),
     Fp4 { packed: CudaSlice<u8>, scales: CudaSlice<u8>, inv_global: CudaSlice<f32>, input_global: f32 },
     Fp8 { values: CudaSlice<u8>, grid: CudaSlice<f32> },
+    Block { packed: CudaSlice<u8>, scales: CudaSlice<u8> },
 }
 
 pub(super) struct DeviceMoe {
@@ -29,6 +30,7 @@ impl StackWeights {
         Ok(match s {
             Stacked::Bf16(w) => StackWeights::Bf16(stream.clone_htod(w)?),
             Stacked::Fp8 { values, grid } => StackWeights::Fp8 { values: stream.clone_htod(values)?, grid: stream.clone_htod(grid)? },
+            Stacked::Block { packed, scales } => StackWeights::Block { packed: stream.clone_htod(packed)?, scales: stream.clone_htod(scales)? },
             Stacked::Fp4 { packed, scales, inv_global, input_global } => StackWeights::Fp4 {
                 input_global: *input_global,
                 packed: stream.clone_htod(packed)?,
@@ -42,12 +44,13 @@ impl StackWeights {
         (match self {
             StackWeights::Bf16(w) => w.num_bytes(),
             StackWeights::Fp8 { values, grid } => values.num_bytes() + grid.num_bytes(),
+            StackWeights::Block { packed, scales } => packed.num_bytes() + scales.num_bytes(),
             StackWeights::Fp4 { packed, scales, inv_global, .. } => packed.num_bytes() + scales.num_bytes() + inv_global.num_bytes(),
         }) as u64
     }
 
-    fn fp4(&self) -> bool {
-        matches!(self, StackWeights::Fp4 { .. })
+    fn mma_ready(&self) -> bool {
+        matches!(self, StackWeights::Fp4 { .. } | StackWeights::Block { .. })
     }
 
     fn suffix(&self) -> &'static str {
@@ -55,6 +58,7 @@ impl StackWeights {
             StackWeights::Bf16(_) => "bf16",
             StackWeights::Fp4 { .. } => "fp4",
             StackWeights::Fp8 { .. } => "fp8",
+            StackWeights::Block { .. } => "mx",
         }
     }
 }
@@ -166,6 +170,7 @@ impl Runtime {
             StackWeights::Bf16(w) => b.arg(w).arg(&self.pre.dummy_u8).arg(&self.buf.dummy),
             StackWeights::Fp8 { values, grid } => b.arg(values).arg(&self.pre.dummy_u8).arg(grid),
             StackWeights::Fp4 { packed, scales, inv_global, .. } => b.arg(packed).arg(scales).arg(inv_global),
+            StackWeights::Block { packed, scales } => b.arg(packed).arg(scales).arg(&self.buf.dummy),
         };
     }
 
@@ -174,8 +179,7 @@ impl Runtime {
         let m = self.spec.moe.as_ref().expect("moe spec");
         let mb = self.moe.as_ref().expect("moe buffers");
         let pairs = (n * m.pairs()) as u32;
-        let fp4 = w.gate.fp4();
-        if mb.mma.is_some() && fp4 && n >= MMA_MIN_TOKENS {
+        if mb.mma.is_some() && w.gate.mma_ready() && n >= MMA_MIN_TOKENS {
             return self.moe_grouped_mma(w, mb, n);
         }
         if n >= GROUP_MIN_TOKENS {
@@ -219,11 +223,20 @@ impl Runtime {
         use crate::codegen::{MOE_MMA_BM, MOE_MMA_BM_SMALL, MOE_MMA_BN, moe_mma_smem};
         let m = self.spec.moe.as_ref().expect("moe spec");
         let mma = mb.mma.as_ref().expect("mma buffers");
-        let (StackWeights::Fp4 { packed: gw, scales: gs, inv_global: gg, input_global: gi }, StackWeights::Fp4 { packed: uw, scales: us, inv_global: ug, input_global: ui }, StackWeights::Fp4 { packed: dw, scales: ds, inv_global: dg, input_global: di }) =
-            (&w.gate, &w.up, &w.down)
-        else {
-            unreachable!("the mma path needs NVFP4 experts")
+        let block = matches!(w.gate, StackWeights::Block { .. });
+        let (gw, gs, gg, gi, uw, us, ug, ui, dw, ds, dg, di) = match (&w.gate, &w.up, &w.down) {
+            (
+                StackWeights::Fp4 { packed: gw, scales: gs, inv_global: gg, input_global: gi },
+                StackWeights::Fp4 { packed: uw, scales: us, inv_global: ug, input_global: ui },
+                StackWeights::Fp4 { packed: dw, scales: ds, inv_global: dg, input_global: di },
+            ) => (gw, gs, gg, *gi, uw, us, ug, *ui, dw, ds, dg, *di),
+            (StackWeights::Block { packed: gw, scales: gs }, StackWeights::Block { packed: uw, scales: us }, StackWeights::Block { packed: dw, scales: ds }) => {
+                (gw, gs, &self.buf.dummy, 1.0, uw, us, &self.buf.dummy, 1.0, dw, ds, &self.buf.dummy, 1.0)
+            }
+            _ => unreachable!("the mma path needs NVFP4 or block scaled experts"),
         };
+        let stem = if block { "moe_mma_mx" } else { "moe_mma" };
+        let quant_kernel = if block { "moe_quant_mx" } else { "moe_quant_f32" };
         let (h, inter) = (self.spec.dims.hidden, m.expert_intermediate);
         let slots = m.local_experts() + m.shared_slots();
         let pairs = n * m.pairs();
@@ -235,26 +248,29 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel("moe_tiles"));
         b.arg(&mb.offsets).arg(&mma.tiles).arg(&bm_i).arg(&max_i);
         unsafe { b.launch(cfg(1, 32)) }?;
-        let igs_up = gi.min(*ui);
+        let igs_up = gi.min(ui);
         let quant = |x: &CudaSlice<f32>, q: &CudaSlice<u8>, s: &CudaSlice<u8>, rows: usize, width: usize, igs: f32| -> Result<()> {
             let width = width as i32;
-            let mut b = self.stream.launch_builder(self.kernel("moe_quant_f32"));
-            b.arg(x).arg(q).arg(s).arg(&width).arg(&igs);
+            let mut b = self.stream.launch_builder(self.kernel(quant_kernel));
+            b.arg(x).arg(q).arg(s).arg(&width);
+            if !block {
+                b.arg(&igs);
+            }
             unsafe { b.launch(cfg(rows as u32, 256)) }?;
             Ok(())
         };
         quant(&mb.xn, &mma.xq, &mma.xs, n, h, igs_up)?;
         let inv_up = 1.0 / igs_up;
-        let name = if small { "moe_mma_up_s" } else { "moe_mma_up" };
-        let mut b = self.stream.launch_builder(self.kernel(name));
-        b.arg(gw).arg(gs).arg(gg).arg(uw).arg(us).arg(ug).arg(&inv_up).arg(&mma.xq).arg(&mma.xs).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.act);
+        let name = format!("{stem}_up{}", if small { "_s" } else { "" });
+        let mut b = self.stream.launch_builder(self.kernel(&name));
+        b.arg(gw).arg(gs).arg(gg).arg(uw).arg(us).arg(ug).arg(&w.gate_up_bias).arg(&inv_up).arg(&mma.xq).arg(&mma.xs).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.act);
         let config = LaunchConfig { grid_dim: ((inter / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(bm, 2) };
         unsafe { b.launch(config) }?;
-        quant(&mb.act, &mma.aq, &mma.as_, pairs, inter, *di)?;
-        let inv_down = 1.0 / *di;
-        let name = if small { "moe_mma_down_s" } else { "moe_mma_down" };
-        let mut b = self.stream.launch_builder(self.kernel(name));
-        b.arg(dw).arg(ds).arg(dg).arg(dw).arg(ds).arg(dg).arg(&inv_down).arg(&mma.aq).arg(&mma.as_).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.out);
+        quant(&mb.act, &mma.aq, &mma.as_, pairs, inter, di)?;
+        let inv_down = 1.0 / di;
+        let name = format!("{stem}_down{}", if small { "_s" } else { "" });
+        let mut b = self.stream.launch_builder(self.kernel(&name));
+        b.arg(dw).arg(ds).arg(dg).arg(dw).arg(ds).arg(dg).arg(&w.down_bias).arg(&inv_down).arg(&mma.aq).arg(&mma.as_).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.out);
         let config = LaunchConfig { grid_dim: ((h / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(bm, 1) };
         unsafe { b.launch(config) }?;
         Ok(())
