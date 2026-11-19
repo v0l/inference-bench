@@ -227,3 +227,97 @@ float acc[NT][4];
 pub fn mma_planes(n: usize, k: &str, acc: &str, frag: &str, hi: &str, lo: &str, pitch: &str) -> String {
     at(n, &format!("gdn_mma_planes<{k}, NT>({acc}, {frag}, {hi}, {lo}, {pitch}, g, t4);\n"))
 }
+
+pub fn kernel(header: &str, body: &str) -> String {
+    format!("{header} {{\n{}}}\n", at(4, body))
+}
+
+pub fn for_stride(var: &str, init: &str, bound: &str, step: &str, body: &str) -> String {
+    let head = format!("for (int {var} = {init}; {var} < {bound}; {var} += {step})");
+    if body.trim_end().contains('\n') {
+        format!("{head} {{\n{}}}\n", at(4, body))
+    } else {
+        format!("{head} {}\n", body.trim())
+    }
+}
+
+pub fn warp_tiles(rows: &str, cols: &str, body: &str) -> String {
+    let head = format!(
+        "for (int tile = warp; tile < ({rows} / 16) * ({cols} / 8); tile += WARPS) {{
+    int m0 = (tile / ({cols} / 8)) * 16;
+    int n0 = (tile % ({cols} / 8)) * 8;
+"
+    );
+    format!("{head}{}}}\n", at(4, body))
+}
+
+pub fn tri_leaf(n: usize) -> String {
+    at(
+        n,
+        "constexpr int LEAF = 16;
+for (int i = 1; i < LEAF; i++) {
+    int b = (tid / LEAF) * LEAF;
+    int j = tid % LEAF;
+    float next = 0.0f;
+    if (tid < C && j < i) {
+        next = A[(b + i) * LA_AS + b + j];
+        for (int m = j + 1; m < i; m++) next += A[(b + i) * LA_AS + b + m] * A[(b + m) * LA_AS + b + j];
+    }
+    __syncthreads();
+    if (tid < C && j < i) A[(b + i) * LA_AS + b + j] = next;
+    __syncthreads();
+}
+",
+    )
+}
+
+fn tri_pass(zero: bool, body: &str) -> String {
+    let init = if zero { "acc[p] = 0.0f;\n" } else { "" };
+    unroll_block(
+        0,
+        "int p = 0; p < PER; p++",
+        &format!(
+            "int e = tid + p * 256;
+{init}if (e < per) {{
+    int blk = e / (sz * sz);
+    int r = (e / sz) % sz;
+    int c2 = e % sz;
+    int base = blk * 2 * sz;
+{}}}
+",
+            at(4, body)
+        ),
+    )
+}
+
+pub fn tri_merge(n: usize) -> String {
+    let corner = "A[(base + sz + r) * LA_AS + base + c2]";
+    let mut o = String::from("constexpr int PER = C * C / 4 / 256;\nint per = sz * sz * (C / (2 * sz));\nfloat acc[PER];\n");
+    o += &tri_pass(
+        true,
+        &format!(
+            "float y = {corner};
+for (int m = c2 + 1; m < sz; m++)
+    y += A[(base + sz + r) * LA_AS + base + m] * A[(base + m) * LA_AS + base + c2];
+acc[p] = y;
+"
+        ),
+    );
+    o += "__syncthreads();\n";
+    o += &tri_pass(false, &format!("{corner} = acc[p];\n"));
+    o += "__syncthreads();\n";
+    o += &tri_pass(
+        false,
+        &format!(
+            "float x = {corner};
+for (int m = 0; m < r; m++)
+    x += A[(base + sz + r) * LA_AS + base + sz + m] * A[(base + sz + m) * LA_AS + base + c2];
+acc[p] = x;
+"
+        ),
+    );
+    o += "__syncthreads();\n";
+    o += &tri_pass(false, &format!("{corner} = acc[p];\n"));
+    o += "__syncthreads();\n";
+    at(n, &format!("for (int sz = LEAF; sz < C; sz *= 2) {{\n{}}}\n", at(4, &o)))
+}

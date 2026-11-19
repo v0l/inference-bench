@@ -20,7 +20,6 @@ const LIBRARY_ONLY: &[&str] = &["cuda/prelude.cu"];
 const VERBATIM_LINEAR: &[(&str, &str)] = &[
     ("cuda/linear/common.rs", "device functions by design, shared by every linear family"),
     ("cuda/linear/chunk_lib.rs", "mma split tile and fragment device functions by design"),
-    ("cuda/linear/chunk_prep.rs", "triangular solve and WY prep is verbatim text, to port onto tile prims (#794)"),
 ];
 
 const VERBATIM_ATTENTION: &[(&str, &str)] = &[];

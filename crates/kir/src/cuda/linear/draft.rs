@@ -1,4 +1,4 @@
-use super::prim::block_argmax_tree;
+use super::prim::{block_argmax_tree, for_stride, kernel};
 use crate::cuda::attention::prim::{Reduce, block_reduce};
 
 pub fn body() -> String {
@@ -129,42 +129,53 @@ extern "C" __global__ void spec_accept(const float* logits, const int* vtok, con
     }
 }
 
-extern "C" __global__ void mtp_fill(const int* drafts, int* vtok, int k) {
-    int s = blockIdx.x;
-    int j = threadIdx.x;
-    if (j < k) vtok[s * (k + 1) + 1 + j] = drafts[s * k + j];
-}
-
-extern "C" __global__ void mtp_round_in(const int* rin, const int* drafts, int n, int k, int* vtok, int* vpos,
-                                        int* vslots) {
-    int s = blockIdx.x;
-    int j = threadIdx.x;
-    int slot = rin[2 * n + s];
-    vtok[s * (k + 1) + j] = j == 0 ? rin[s] : drafts[slot * k + j - 1];
-    vpos[s * (k + 1) + j] = rin[n + s] + j;
-    vslots[s * (k + 1) + j] = slot;
-}
-
-extern "C" __global__ void mtp_chain_rows(const int* rin, int n, const int* accepted, int step, int* vpos,
-                                          int* vslots) {
-    int s = threadIdx.x;
-    if (s < n) {
-        vpos[s] = rin[n + s] + accepted[s] + step;
-        vslots[s] = rin[2 * n + s];
-    }
-}
-
-extern "C" __global__ void mtp_pick_rows(const int* accepted, int k, int* sidx) {
-    int s = threadIdx.x;
-    sidx[s] = s * (k + 1) + accepted[s];
-}
-
-extern "C" __global__ void mtp_copy(const float* src, const int* sidx, float* dst, const int* didx) {
-    int s = blockIdx.y;
-    const float* a = src + (size_t)sidx[s] * HIDDEN;
-    float* b = dst + (size_t)didx[s] * HIDDEN;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < HIDDEN; i += gridDim.x * blockDim.x) b[i] = a[i];
-}
 "##);
+    o.push_str(&small_kernels());
+    o
+}
+
+fn small_kernels() -> String {
+    let mut o = String::new();
+    o += &kernel(
+        "extern \"C\" __global__ void mtp_fill(const int* drafts, int* vtok, int k)",
+        "int s = blockIdx.x;\nint j = threadIdx.x;\nif (j < k) vtok[s * (k + 1) + 1 + j] = drafts[s * k + j];\n",
+    );
+    o.push('\n');
+    o += &kernel(
+        "extern \"C\" __global__ void mtp_round_in(const int* rin, const int* drafts, int n, int k, int* vtok, int* vpos,\n                                        int* vslots)",
+        "int s = blockIdx.x;
+int j = threadIdx.x;
+int slot = rin[2 * n + s];
+vtok[s * (k + 1) + j] = j == 0 ? rin[s] : drafts[slot * k + j - 1];
+vpos[s * (k + 1) + j] = rin[n + s] + j;
+vslots[s * (k + 1) + j] = slot;
+",
+    );
+    o.push('\n');
+    o += &kernel(
+        "extern \"C\" __global__ void mtp_chain_rows(const int* rin, int n, const int* accepted, int step, int* vpos,\n                                          int* vslots)",
+        "int s = threadIdx.x;
+if (s < n) {
+    vpos[s] = rin[n + s] + accepted[s] + step;
+    vslots[s] = rin[2 * n + s];
+}
+",
+    );
+    o.push('\n');
+    o += &kernel(
+        "extern \"C\" __global__ void mtp_pick_rows(const int* accepted, int k, int* sidx)",
+        "int s = threadIdx.x;\nsidx[s] = s * (k + 1) + accepted[s];\n",
+    );
+    o.push('\n');
+    o += &kernel(
+        "extern \"C\" __global__ void mtp_copy(const float* src, const int* sidx, float* dst, const int* didx)",
+        &format!(
+            "int s = blockIdx.y;
+const float* a = src + (size_t)sidx[s] * HIDDEN;
+float* b = dst + (size_t)didx[s] * HIDDEN;
+{}",
+            for_stride("i", "blockIdx.x * blockDim.x + threadIdx.x", "HIDDEN", "gridDim.x * blockDim.x", "b[i] = a[i];")
+        ),
+    );
     o
 }
