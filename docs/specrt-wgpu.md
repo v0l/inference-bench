@@ -146,3 +146,26 @@ Decode, 32 tokens, 2.7 s in total: `linear` 1.54 s, `rmsnorm` 0.39 s, `attention
 Biggest gap: prefill (40-60x). The `linear_t8` GEMM has no threadgroup tiling and no simdgroup matrix instructions, so it sustains about 0.1 TFLOP/s against the M1 Pro's roughly 5 TFLOP/s f16, and the attention kernel is one scalar pass per head and row (llama.cpp uses a flash attention kernel with simdgroup matrices). Decode is second (5-10x): dispatch overhead and untiled GEMV.
 
 Speed fixes filed as follow-ups: tiled GEMM with subgroup matrix ops for prefill, flash attention for prefill, fused element-wise ops and fewer dispatches per decode step, a q4_K/q8 GEMV tuned for Apple GPUs, and releasing the host weight copy after upload (peak memory and load time).
+
+## Mac speed work (#759 steps)
+
+Same method as above (`mac_vs_llama.sh`, 3 alternating rounds, medians, M1 Pro). Each step was measured on Qwen3-0.6B on the Mac and kept only if it helped.
+
+| Step | Change | Result |
+|---|---|---|
+| #768 | `linear_tile` register-tiled GEMM, then `linear_coop` with 8x8 f32 cooperative matrices (wgpu `EXPERIMENTAL_COOPERATIVE_MATRIX`, `Feature::CoopMatrix`), bf16 pairs read as u32, row entries hoisted, workgroup memory zero-init off | prefill 1,024 bf16: 69 to 231 tok/s. Tile only: 197. f16 matrices: not faster and error 3e-3, dropped. Zero-init off was worth 1.5x on its own. |
+| #771 | `linear_sg` simdgroup GEMV (4 rows per workgroup, direct bf16, Q4_K, Q6_K, Q8_0 paths). Metal reports subgroup sizes 4..64 but runs 32, so the adapter check accepts that range on Metal. | decode bf16 27 to 55 tok/s, Q4_K 19 to 42 |
+| #770 | One compute pass per submit instead of one per dispatch. Fusing swiglu, rope or norm was measured by skipping them: under 2% of decode each, so no fusion kernels were written. | decode bf16 55 to 82 tok/s, Q4_K 42 to 60 (short context) |
+| #769 | `flash` kernel, one simdgroup per query token, one key per lane, shuffle-broadcast probabilities. Used for prefill only: for one token it leaves 16 workgroups and decode drops from 36 to 12 tok/s. Four queries per simdgroup was slower (203 vs 377). | prefill 1,024 bf16: 231 to 377 tok/s |
+| #772 | Flush the queue every 128 MB of weight upload so staging copies are released | peak footprint 7B 11.9 to 7.0 GB (9.1 GB in the full run), 0.6B Q4_K_M 3.8 to 2.9 GB. Load time unchanged at 7B (10.5 s): the host dequantised copy is still built, only the staging is bounded. |
+
+After all steps, full `mac_vs_llama.sh` (specrt / llama.cpp, tok/s):
+
+| Model | Prefill 128 | Prefill 1,024 | Decode (128 new) |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 680 / 2,940 = 0.23 (was 0.028) | 377 / 2,969 = 0.13 (was 0.023) | 52.8 / 114.4 = 0.46 (was 0.20) |
+| Qwen3-0.6B Q4_K_M | 502 / 3,008 = 0.17 (0.026) | 316 / 3,033 = 0.10 (0.022) | 41.5 / 183.5 = 0.23 (0.10) |
+| Llama-3.2-1B Q4_K_M | 348 / 1,733 = 0.20 (0.022) | 270 / 1,755 = 0.15 (0.021) | 32.7 / 145.4 = 0.23 (0.095) |
+| Qwen2.5-7B Q4_K_M | 62 / 274 = 0.23 (0.015) | 55 / 269 = 0.20 (0.015) | 6.95 / 28.0 = 0.25 (0.073) |
+
+The 0.5x milestone is met only for Qwen3-0.6B bf16 decode. Where the time goes at 1,024 (0.6B, per-dispatch timing): `linear_coop` about 0.95 ms a dispatch (12,544 dispatches), attention about 6 ms a dispatch before `flash`. Decode attention at long context and the GEMM are the next targets.
