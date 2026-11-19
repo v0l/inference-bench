@@ -1306,11 +1306,6 @@ impl Spec {
         Ok(())
     }
 
-    pub fn expert_tensors(&self) -> Vec<String> {
-        let shared = self.moe.as_ref().map_or(DEFAULT_SHARED_MODULE, |m| &m.shared_module);
-        vec!["mlp.experts".into(), format!("mlp.{shared}")]
-    }
-
     pub fn check_moe_runnable(&self) -> Result<()> {
         let Some(m) = &self.moe else { return Ok(()) };
         ensure!(self.linear_attention.is_some() || self.attention_layers() > 0, "mixture-of-experts needs attention layers");
