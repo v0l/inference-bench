@@ -632,6 +632,14 @@ pub fn emit_linear_sg_op(s: &crate::ops::WgslShape) -> String {
 fn linear_sg() -> String {
     format!(
         "{bind}
+fn nib_lo(w: u32) -> vec4<f32> {{
+    return vec4<f32>(vec4<u32>(w & 0xfu, (w >> 8u) & 0xfu, (w >> 16u) & 0xfu, (w >> 24u) & 0xfu));
+}}
+
+fn nib_hi(w: u32) -> vec4<f32> {{
+    return vec4<f32>(vec4<u32>((w >> 4u) & 0xfu, (w >> 12u) & 0xfu, (w >> 20u) & 0xfu, (w >> 28u) & 0xfu));
+}}
+
 fn xs(i: u32) -> f32 {{
     return x[i >> 2u][i & 3u];
 }}
@@ -659,25 +667,43 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
             acc += bitcast<f32>(w << 16u) * xs(xo + 2u * q) + bitcast<f32>(w & 0xffff0000u) * xs(xo + 2u * q + 1u);
         }}
     }} else if (code == 0u) {{
-        let j = lane / 8u;
-        let l4 = (lane % 8u) * 4u;
-        for (var sb = 0u; sb < cols / 256u; sb++) {{
+        let ix = lane / 8u;
+        let iq = (lane % 8u) / 4u;
+        let ir = lane % 4u;
+        let sh = 16u * iq;
+        for (var sb = ix; sb < cols / 256u; sb += 4u) {{
             let b = base + sb * 144u;
-            let d = wf16(b);
-            let dmin = wf16(b + 2u);
-            let s0 = scale_min_k4(2u * j, b);
-            let s1 = scale_min_k4(2u * j + 1u, b);
-            let q = wdata[(b + 16u + 32u * j + l4) >> 2u];
-            let xb = (xo + sb * 256u + j * 64u + l4) / 4u;
-            let xa = x[xb];
-            let xc = x[xb + 8u];
-            let qa = vec4<f32>(vec4<u32>(q & 0xfu, (q >> 8u) & 0xfu, (q >> 16u) & 0xfu, (q >> 24u) & 0xfu));
-            let qb = vec4<f32>(vec4<u32>((q >> 4u) & 0xfu, (q >> 12u) & 0xfu, (q >> 20u) & 0xfu, (q >> 28u) & 0xfu));
-            let lo = dot(qa, xa);
-            let hi = dot(qb, xc);
-            let xl = xa.x + xa.y + xa.z + xa.w;
-            let xh = xc.x + xc.y + xc.z + xc.w;
-            acc += d * (f32(s0.x) * lo + f32(s1.x) * hi) - dmin * (f32(s0.y) * xl + f32(s1.y) * xh);
+            let b4 = b >> 2u;
+            let xb = (xo + sb * 256u + 64u * iq + 8u * ir) / 4u;
+            let ya0 = x[xb];
+            let ya1 = x[xb + 1u];
+            let yb0 = x[xb + 8u];
+            let yb1 = x[xb + 9u];
+            let yc0 = x[xb + 32u];
+            let yc1 = x[xb + 33u];
+            let yd0 = x[xb + 40u];
+            let yd1 = x[xb + 41u];
+            let sy = vec4<f32>(dot(ya0 + ya1, vec4<f32>(1.0)), dot(yb0 + yb1, vec4<f32>(1.0)), dot(yc0 + yc1, vec4<f32>(1.0)), dot(yd0 + yd1, vec4<f32>(1.0)));
+            let dd = unpack2x16float(wdata[b4]);
+            let s0 = wdata[b4 + 1u];
+            let s1 = wdata[b4 + 2u];
+            let s2 = wdata[b4 + 3u];
+            let scl = (s0 & 0x3f3f3f3fu) >> sh;
+            let mnl = (s1 & 0x3f3f3f3fu) >> sh;
+            let sch = ((s2 & 0x0f0f0f0fu) | (((s0 >> 6u) & 0x03030303u) << 4u)) >> sh;
+            let mnh = (((s2 >> 4u) & 0x0f0f0f0fu) | (((s1 >> 6u) & 0x03030303u) << 4u)) >> sh;
+            let q = (b + 16u + 32u * iq + 8u * ir) >> 2u;
+            let qa = wdata[q];
+            let qb = wdata[q + 1u];
+            let qc = wdata[q + 16u];
+            let qd = wdata[q + 17u];
+            let d0 = dot(nib_lo(qa), ya0) + dot(nib_lo(qb), ya1);
+            let d1 = dot(nib_hi(qa), yb0) + dot(nib_hi(qb), yb1);
+            let d2 = dot(nib_lo(qc), yc0) + dot(nib_lo(qd), yc1);
+            let d3 = dot(nib_hi(qc), yd0) + dot(nib_hi(qd), yd1);
+            let sc = vec4<f32>(f32(scl & 0xffu), f32((scl >> 8u) & 0xffu), f32(sch & 0xffu), f32((sch >> 8u) & 0xffu));
+            let mn = vec4<f32>(f32(mnl & 0xffu), f32((mnl >> 8u) & 0xffu), f32(mnh & 0xffu), f32((mnh >> 8u) & 0xffu));
+            acc += dd.x * dot(sc, vec4<f32>(d0, d1, d2, d3)) - dd.y * dot(mn, sy);
         }}
     }} else if (code == 2u) {{
         let hr = (lane / 8u) % 2u;
