@@ -214,3 +214,19 @@ tiny-deepseek-v2 prefill max_abs 0.00039076805, greedy decode tokens equal
 ```
 
 Not covered: the fixture's MLP is dense, because V2 MoE (two shared experts wider than the routed ones) does not load yet (#830); the real DeepSeek-V2-Lite is about 31 GB in bf16, over the Spark budget. The MLA kernels are scalar, correct rather than fast.
+
+## 10. Status of slice (e)
+
+Done, variant free:
+
+- **Group-limited sigmoid routing with score bias.** `kir::ops::MoeShape` gains `groups`, `topk_group` and `score_bias`. `moe_route` selects on `sigmoid + e_score_correction_bias`, keeps the best `topk_group` groups (a group scores the sum of its two best), takes the top-k inside them, and weights by the unbiased sigmoid, with `norm_topk` and `routed_scale`. With `groups = 0` the kernel computes exactly what it did before. The family spec declares `[moe] router = "sigmoid"` and `score_bias = true`; `n_group` and `topk_group` come from `config.json`; the bias tensor is `mlp.gate.e_score_correction_bias`. `specs/family-glm4_moe.toml` is the first user, so GLM-4.5/4.6/Air load from a family file (absorbs the GLM half of #642).
+- **Gated activation as an expression.** `[mlp.gated]` in a family spec holds an `expr` over `g` (gate), `u` (up) and `params` read from `config.json`. It lowers into one `gated_act(g, u)` device function used by the dense, batched, MoE gemv and MoE mma kernels. A spec without it emits `activation(g) * u`, so stock kernels are unchanged. `tests/fixtures/family-clamped.toml` expresses the gpt-oss clamp and alpha SwiGLU.
+- **Dequant blocks as data.** `specrt::dequant::BlockFormat { elem, scale, group }` (`e2m1 | e4m3 | int8` elements, `e8m0 | e4m3` scales). `MXFP4` is `e2m1`, `e8m0`, 32. `[moe] expert_block` plus `gate_up_interleaved` in a family spec make the loader decode `gate_up_proj_blocks/_scales` and `down_proj_blocks/_scales` into the bf16 expert stacks. gpt-oss rows are interleaved gate/up; the flag picks the order. Decode is exact against the e2m1 table and power-of-two scale.
+
+Proof (Spark GB10, release, `tests/variants.rs`, fixture `tiny-glm4-moe`, reference `scripts/tiny_variants.py` with transformers `Glm4MoeForCausalLM`: 8 experts, 2 groups, topk_group 1, bias, scale 1.5, norm_topk, partial rotary, qk-norm, one shared expert):
+
+```text
+group_limited_sigmoid_routing_with_score_bias_matches_transformers ... ok
+```
+
+Not done, split out: the DSA top-k indexer with a shared index buffer, V4 compressed sparse attention, hash layers (lookup by token id), `gather`/`scatter` as description stages, a tiny gpt-oss fixture (needs expert and router biases and the gpt-oss swiglu on the GPU), and native block-scaled mma for MXFP4 (experts decode to bf16 today).
