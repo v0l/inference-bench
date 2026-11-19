@@ -242,7 +242,7 @@ fn fp8_spec_uses_fp8_projections_and_keeps_lm_head_and_gates_bf16() {
     let tc: Vec<&str> = m.source.lines().filter(|l| l.contains("gemm_tc<")).collect();
     let has = |s: &str| tc.iter().any(|l| l.contains(s));
     assert!(has("gemm_tc<34816, 5120, 128, 128, 2, 4, 64, 2, EPI_ACT, false, DecFp8, true, false>"), "{tc:#?}");
-    assert!(has("gemm_tc<248320, 5120, 128, 128, 2, 4, 32, 2, EPI_STORE, false, DecBf16, true, false>"));
+    assert!(has("gemm_tc<248320, 5120, 256, 128, 4, 2, 32, 2, EPI_STORE, false, DecBf16, true, false>"));
     assert!(has("gemm_tc<96, 5120, 64, 64, 2, 2, 32, 2, EPI_STORE, false, DecBf16, true, false>"));
     assert!(m.kernels.contains(&"lin_ba_mma"));
 }
