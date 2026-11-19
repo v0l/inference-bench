@@ -371,6 +371,15 @@ impl Checkpoint {
         self.floats(name, &[len])
     }
 
+    fn flat(&self, name: &str, len: usize) -> Result<Vec<f32>> {
+        let shape = match &self.gguf {
+            Some(_) => vec![len],
+            None => self.view(name)?.shape.clone(),
+        };
+        ensure!(shape.iter().product::<usize>() == len, "{name} has shape {shape:?}, expected {len} values");
+        self.floats(name, &shape)
+    }
+
     fn raw(&self, weight: &str, rows: usize, cols: usize) -> Result<Raw<'_>> {
         if let Some(g) = &self.gguf {
             return self.gguf_raw(g, weight, rows, cols);
@@ -826,7 +835,11 @@ impl Checkpoint {
         };
         let mut parts = Vec::new();
         let mut gates = Vec::new();
-        if a.fused_qkv {
+        if !a.projection.is_empty() {
+            for p in &a.projection {
+                parts.push(w(&p.tensor, crate::state::dim(spec, &p.rows)?, h)?);
+            }
+        } else if a.fused_qkv {
             ensure!(!a.output_gate, "fused qkv with an output gate is not supported");
             parts.push(w("qkv_proj", q + 2 * kv, h)?);
         } else {
@@ -867,7 +880,7 @@ impl Checkpoint {
             if let crate::graph::Bind::Weight { weight, len } = bind
                 && !extra.iter().any(|(n, _): &(String, Vec<f32>)| n == weight)
             {
-                extra.push((weight.clone(), self.f32(&format!("{attn}.{weight}"), spec.weight_len(len)?)?));
+                extra.push((weight.clone(), self.flat(&format!("{attn}.{weight}"), spec.weight_len(len)?)?));
             }
         }
         Ok(Attn {
@@ -876,7 +889,7 @@ impl Checkpoint {
             qkv_bias,
             q_norm,
             k_norm,
-            o: w("o_proj", h, q)?.into_matrix(quant, &format!("{attn}.o_proj"))?,
+            o: w("o_proj", h, spec.o_dim())?.into_matrix(quant, &format!("{attn}.o_proj"))?,
         })
     }
 

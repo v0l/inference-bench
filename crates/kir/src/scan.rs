@@ -35,9 +35,46 @@ pub enum Stage {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Segment {
+    pub src: String,
+    pub row: u32,
+    pub head: u32,
+    pub offset: u32,
+    pub width: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Geometry {
+    pub query: Vec<Segment>,
+    pub layers: u32,
+    pub kv_rows: u32,
+    pub k_width: u32,
+    pub v_stride: u32,
+    pub v_offset: u32,
+    pub v_width: u32,
+    pub out_row: u32,
+    pub out_head: u32,
+    pub out_offset: u32,
+}
+
+const STATE_REQUIRED: [(&str, Scalar, Role, Access); 10] = [
+    ("k_cache", Scalar::Bf16, Role::Activation, Access::Read),
+    ("v_cache", Scalar::Bf16, Role::Activation, Access::Read),
+    ("block_table", Scalar::I32, Role::Activation, Access::Read),
+    ("pos", Scalar::I32, Role::Activation, Access::Read),
+    ("slots", Scalar::I32, Role::Activation, Access::Read),
+    ("out", Scalar::F32, Role::Activation, Access::Write),
+    ("layer", Scalar::I32, Role::Value, Access::Read),
+    ("pages", Scalar::I32, Role::Value, Access::Read),
+    ("pos_step", Scalar::I32, Role::Value, Access::Read),
+    ("row_step", Scalar::I32, Role::Value, Access::Read),
+];
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Scan {
     pub consts: Vec<Const>,
     pub stages: Vec<Stage>,
+    pub geometry: Option<Geometry>,
 }
 
 fn ident(n: &str) -> bool {
@@ -52,6 +89,9 @@ impl Scan {
         }
         for st in &self.stages {
             s.push_str(&format!("\n    {st:?}"));
+        }
+        if let Some(g) = &self.geometry {
+            s.push_str(&format!("\n    {g:?}"));
         }
         s
     }
@@ -70,7 +110,8 @@ impl Scan {
         if !threads.is_multiple_of(WARP) || threads == 0 {
             return Err(format!("scan threads {threads} must be a multiple of {WARP}"));
         }
-        for (name, ty, role, access) in REQUIRED {
+        let required: &[(&str, Scalar, Role, Access)] = if self.geometry.is_some() { &STATE_REQUIRED } else { &REQUIRED };
+        for &(name, ty, role, access) in required {
             match params.iter().find(|p| p.name == name) {
                 Some(p) if p.ty == ty && p.role == role && p.access == access => {}
                 Some(p) => return Err(format!("scan param {name:?} must be {ty:?} {role:?} {access:?}, not {:?} {:?} {:?}", p.ty, p.role, p.access)),
@@ -98,6 +139,24 @@ impl Scan {
             match params.iter().find(|p| p.name == sink) {
                 Some(p) if p.ty == Scalar::F32 && p.role == Role::Weight && p.access == Access::Read => {}
                 _ => return Err(format!("sink {sink:?} must be an f32 weight param")),
+            }
+        }
+        if let Some(g) = &self.geometry {
+            let width: u32 = g.query.iter().map(|q| q.width).sum();
+            if g.query.is_empty() || width != g.k_width {
+                return Err(format!("the query segments are {width} wide, the key is {}", g.k_width));
+            }
+            for q in &g.query {
+                match params.iter().find(|p| p.name == q.src) {
+                    Some(p) if p.ty == Scalar::F32 && p.role == Role::Activation && p.access == Access::Read => {}
+                    _ => return Err(format!("query source {:?} must be an f32 activation param", q.src)),
+                }
+            }
+            if g.v_offset + g.v_width > g.v_stride || g.k_width == 0 || g.v_width == 0 || g.layers == 0 || g.kv_rows == 0 {
+                return Err("the value span must sit inside its state row".into());
+            }
+            if g.k_width.max(g.v_width) > 1024 {
+                return Err("scan head widths are at most 1024".into());
             }
         }
         self.lines(params)?;
@@ -143,6 +202,9 @@ impl Scan {
     }
 
     pub fn emit_cuda(&self, k: &Kernel) -> Result<String, String> {
+        if let Some(g) = &self.geometry {
+            return self.emit_state_cuda(k, g);
+        }
         let (lines, value) = self.lines(&k.params)?;
         let sink = self.sink();
         let sig: Vec<String> = k
@@ -246,6 +308,135 @@ impl Scan {
             threads = k.threads,
             name = k.name,
             sig = sig.join(", "),
+        ))
+    }
+
+    fn emit_state_cuda(&self, k: &Kernel, g: &Geometry) -> Result<String, String> {
+        let (lines, value) = self.lines(&k.params)?;
+        let sig: Vec<String> = k
+            .params
+            .iter()
+            .map(|p| {
+                let ty = match p.ty {
+                    Scalar::F32 => "float",
+                    Scalar::U32 => "unsigned",
+                    Scalar::Bf16 => "bf16_t",
+                    Scalar::I32 => "int",
+                };
+                match (p.role, p.access) {
+                    (Role::Value, _) => format!("{ty} {}", p.name),
+                    (_, Access::Read) => format!("const {ty}* {}", p.name),
+                    (_, Access::Write) => format!("{ty}* {}", p.name),
+                }
+            })
+            .collect();
+        let warps = k.threads / WARP;
+        let body: String = lines.iter().map(|l| format!("        {l}\n")).collect();
+        let (sink_decl, top_init, sink_denom) = match self.sink() {
+            Some(n) => (format!("    float sink_logit = {n}[head];\n"), "sink_logit", "expf(sink_logit - top)"),
+            None => (String::new(), "NEG_INF", "0.0f"),
+        };
+        let mut at = 0;
+        let mut query = String::new();
+        for q in &g.query {
+            query.push_str(&format!(
+                "    for (int d = threadIdx.x; d < {w}; d += blockDim.x) q_s[{at} + d] = {src}[(size_t)row * {row} + (size_t)head * {head} + {off} + d];\n",
+                w = q.width,
+                src = q.src,
+                row = q.row,
+                head = q.head,
+                off = q.offset,
+            ));
+            at += q.width;
+        }
+        let kv_heads = g.kv_rows;
+        Ok(format!(
+            "extern \"C\" __global__ void __launch_bounds__({threads}) {name}({sig}) {{
+    constexpr int SCAN_WARPS = {warps};
+    constexpr int QK = {qk};
+    constexpr int VD = {vd};
+    constexpr int KV_ROWS = {kv_heads};
+    constexpr int QK_LANES = (QK + 31) / 32;
+    constexpr int V_LANES = (VD + 31) / 32;
+    __shared__ float q_s[QK];
+    __shared__ float acc_s[SCAN_WARPS][VD];
+    __shared__ float m_s[SCAN_WARPS];
+    __shared__ float l_s[SCAN_WARPS];
+    const int head = blockIdx.x;
+    const int row = blockIdx.y;
+    const int kv_head = head / ({heads_per_row});
+    const int q_pos_i = pos[row * pos_step] + row * row_step;
+    const int* table = seq_table(block_table, slots, row, pages);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+{query}    __syncthreads();
+    float q[QK_LANES];
+#pragma unroll
+    for (int j = 0; j < QK_LANES; j++) {{
+        int d = lane + 32 * j;
+        q[j] = d < QK ? q_s[d] : 0.0f;
+    }}
+    float m = NEG_INF;
+    float l = 0.0f;
+    float acc[V_LANES];
+#pragma unroll
+    for (int j = 0; j < V_LANES; j++) acc[j] = 0.0f;
+    for (int t = warp; t <= q_pos_i; t += SCAN_WARPS) {{
+        size_t slot = (((size_t)table[t / PAGE] * {layers} + layer) * KV_ROWS + kv_head) * PAGE + t % PAGE;
+        const bf16_t* kr = k_cache + slot * QK * KV_PLANES;
+        const bf16_t* vr = v_cache + slot * {v_stride} * KV_PLANES;
+        float part = 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_LANES; j++) {{
+            int d = lane + 32 * j;
+            if (d < QK) part += q[j] * (attn_float(kr[d]) + (KV_PLANES == 2 ? attn_float(kr[QK + d]) : 0.0f));
+        }}
+        float dot = warp_sum(part);
+{body}        float m_new = fmaxf(m, {value});
+        float corr = m == NEG_INF ? 0.0f : expf(m - m_new);
+        float p = expf({value} - m_new);
+        l = l * corr + p;
+#pragma unroll
+        for (int j = 0; j < V_LANES; j++) {{
+            int d = lane + 32 * j;
+            if (d < VD) acc[j] = acc[j] * corr + p * (attn_float(vr[{v_offset} + d]) + (KV_PLANES == 2 ? attn_float(vr[{v_stride} + {v_offset} + d]) : 0.0f));
+        }}
+        m = m_new;
+    }}
+    if (lane == 0) {{
+        m_s[warp] = m;
+        l_s[warp] = l;
+    }}
+#pragma unroll
+    for (int j = 0; j < V_LANES; j++) {{
+        int d = lane + 32 * j;
+        if (d < VD) acc_s[warp][d] = acc[j];
+    }}
+    __syncthreads();
+{sink_decl}    float top = {top_init};
+    for (int w = 0; w < SCAN_WARPS; w++) top = fmaxf(top, m_s[w]);
+    float denom = {sink_denom};
+    for (int w = 0; w < SCAN_WARPS; w++) denom += m_s[w] == NEG_INF ? 0.0f : l_s[w] * expf(m_s[w] - top);
+    for (int d = threadIdx.x; d < VD; d += blockDim.x) {{
+        float total = 0.0f;
+        for (int w = 0; w < SCAN_WARPS; w++) total += m_s[w] == NEG_INF ? 0.0f : acc_s[w][d] * expf(m_s[w] - top);
+        out[(size_t)row * {out_row} + (size_t)head * {out_head} + {out_offset} + d] = total / denom;
+    }}
+}}
+
+",
+            threads = k.threads,
+            name = k.name,
+            sig = sig.join(", "),
+            qk = g.k_width,
+            vd = g.v_width,
+            heads_per_row = "gridDim.x / KV_ROWS",
+            layers = g.layers,
+            v_stride = g.v_stride,
+            v_offset = g.v_offset,
+            out_row = g.out_row,
+            out_head = g.out_head,
+            out_offset = g.out_offset,
         ))
     }
 }

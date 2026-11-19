@@ -85,7 +85,7 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
         "key_heads" => la?.key_heads,
         "key_head_dim" => la?.key_head_dim,
         "value_head_dim" => la?.value_head_dim,
-        other => match other.parse() {
+        other => match other.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {
                 let v = *a.params.get(other)?;
@@ -96,16 +96,18 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
 }
 
 pub fn dim(spec: &Spec, text: &str) -> Result<usize> {
-    let mut total = 0usize;
-    for term in text.split('+') {
-        let mut product = 1usize;
-        for factor in term.split('*') {
-            let f = factor.trim();
-            product *= symbol(spec, f).with_context(|| format!("state shape symbol {f:?} is not a size this model provides"))?;
+    let e = kir::expr::Expr::parse(text).map_err(anyhow::Error::msg).with_context(|| format!("size {text:?}"))?;
+    let env = |n: &str| symbol(spec, n).map(|v| v as f64);
+    match e.eval(&env) {
+        Some(v) if v >= 0.0 && v.fract() == 0.0 => Ok(v as usize),
+        Some(v) => bail!("size {text:?} is {v}, not a whole number"),
+        None => {
+            let mut names = Vec::new();
+            e.names(&mut names);
+            let missing: Vec<String> = names.into_iter().filter(|n| symbol(spec, n).is_none()).collect();
+            bail!("size {text:?} names {missing:?}, which this model does not provide")
         }
-        total += product;
     }
-    Ok(total)
 }
 
 impl State {
@@ -199,6 +201,7 @@ pub fn validate(spec: &Spec) -> Result<()> {
         }
     }
     ensure!(positional(spec).count() <= 2, "at most two per token [[state]] caches are supported");
+    ensure!(!spec.runtime.kv_dtype.is_fp8() || is_stock(&spec.state), "fp8 KV needs the stock k and v states");
     for (i, s) in spec.state.iter().enumerate() {
         let at = format!("[[state]] {:?}", s.name);
         ensure!(!s.name.is_empty() && spec.state[..i].iter().all(|o| o.name != s.name), "{at} has an empty or repeated name");

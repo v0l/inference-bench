@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 9;
+pub const SPEC_FORMAT: u32 = 10;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -619,6 +619,19 @@ pub struct Attention {
     pub node: Vec<crate::graph::Node>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub params: std::collections::BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projection: Vec<Projection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub o_cols: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Projection {
+    pub tensor: String,
+    pub rows: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1430,7 +1443,10 @@ impl Spec {
                 qk_norm_full: qk_norm && family.attention.qk_norm_full,
                 fused_qkv: family.attention.fused_qkv,
                 node: family.attention.node.clone(),
-                params: family.attention.params.iter().map(|(n, p)| Ok((n.clone(), p.read(n, &value)?))).collect::<Result<_>>()?,
+                params: crate::family::read_params(&family.attention.params, &value)?,
+                projection: family.attention.projection.clone(),
+                o_cols: family.attention.o_cols.clone(),
+                scratch: family.attention.scratch.clone(),
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value) },
             mlp: Mlp {
@@ -1632,20 +1648,22 @@ impl Spec {
     }
 
     pub fn weight_len(&self, symbol: &str) -> Result<usize> {
-        let a = &self.attention;
-        Ok(match symbol {
-            "heads" => a.heads,
-            "kv_heads" => a.kv_heads,
-            "head_dim" => a.head_dim,
-            "q_dim" => self.q_dim(),
-            "kv_dim" => self.kv_dim(),
-            other => other.parse().with_context(|| format!("weight length {other:?} is not heads, kv_heads, head_dim, q_dim, kv_dim or a number"))?,
-        })
+        crate::state::dim(self, symbol).with_context(|| format!("weight length {symbol:?}"))
     }
 
     fn validate_attention_nodes(&self) -> Result<()> {
         let nodes = &self.attention.node;
+        for p in &self.attention.projection {
+            crate::state::dim(self, &p.rows).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
+        }
+        if let Some(c) = &self.attention.o_cols {
+            crate::state::dim(self, c).context("[attention] o_cols")?;
+        }
+        for (n, w) in &self.attention.scratch {
+            crate::state::dim(self, w).with_context(|| format!("[attention.scratch] {n}"))?;
+        }
         if nodes.is_empty() {
+            ensure!(self.attention.projection.is_empty() && self.attention.o_cols.is_none(), "[[attention.projection]] and o_cols need [[attention.node]]");
             return Ok(());
         }
         ensure!(nodes.len() <= 256, "[[attention.node]] has more than 256 nodes");
@@ -1661,8 +1679,19 @@ impl Spec {
                         ensure!(matches!(g.as_str(), "heads" | "kv_heads" | "rows") || g.parse::<u32>().is_ok(), "[[attention.node]] {i} grid symbol {g:?} is not heads, kv_heads, rows or a number");
                     }
                     for b in n.bind.values() {
-                        if let crate::graph::Bind::Weight { len, .. } = b {
-                            self.weight_len(len)?;
+                        match b {
+                            crate::graph::Bind::Weight { len, .. } => {
+                                self.weight_len(len)?;
+                            }
+                            crate::graph::Bind::Buffer { buffer } => ensure!(
+                                matches!(buffer.as_str(), "qkv" | "attn") || self.attention.scratch.contains_key(buffer),
+                                "[[attention.node]] {i} binds buffer {buffer:?}, which is not qkv, attn or an [attention.scratch] entry"
+                            ),
+                            crate::graph::Bind::State { state } => ensure!(
+                                crate::state::named(self, state).is_some_and(|s| s.positional()),
+                                "[[attention.node]] {i} binds state {state:?}, which is not a per token [[state]]"
+                            ),
+                            crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_) => {}
                         }
                     }
                 }
@@ -1775,8 +1804,15 @@ impl Spec {
     }
 
     pub fn qkv_rows(&self) -> usize {
+        if !self.attention.projection.is_empty() {
+            return self.attention.projection.iter().map(|p| crate::state::dim(self, &p.rows).unwrap_or(0)).sum();
+        }
         let gate = if self.attention.output_gate { self.q_dim() } else { 0 };
         self.q_dim() + 2 * self.kv_dim() + gate
+    }
+
+    pub fn o_dim(&self) -> usize {
+        self.attention.o_cols.as_deref().map_or_else(|| self.q_dim(), |c| crate::state::dim(self, c).unwrap_or(0))
     }
 
     pub fn q_dim(&self) -> usize {

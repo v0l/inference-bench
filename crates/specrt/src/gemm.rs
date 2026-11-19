@@ -114,7 +114,7 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
     let la = spec.linear_attention.as_ref();
     let (n, k, epi, bias) = match linear {
         "qkv" => (spec.qkv_rows(), d.hidden, Epilogue::Store, spec.attention.qkv_bias),
-        "o" => (d.hidden, spec.q_dim(), Epilogue::Residual, false),
+        "o" => (d.hidden, spec.o_dim(), Epilogue::Residual, false),
         "gate_up" => (2 * d.intermediate, d.hidden, Epilogue::Act, false),
         "down" => (d.hidden, d.intermediate, Epilogue::Residual, false),
         "lin_in" => (la.map_or(0, |l| l.in_proj_rows()), d.hidden, Epilogue::Store, false),

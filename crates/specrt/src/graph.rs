@@ -11,6 +11,8 @@ pub enum Bind {
     Number(f64),
     Name(String),
     Weight { weight: String, len: String },
+    Buffer { buffer: String },
+    State { state: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

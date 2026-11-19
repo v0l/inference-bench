@@ -10,6 +10,8 @@ use toml::Value;
 
 pub const KIND: &str = "kir-kernel";
 
+pub const ROW_FAMILIES: [&str; 3] = ["span_rope", "state_write", "head_matvec"];
+
 pub const BUILTIN: [(&str, &str); 10] = [
     ("rmsnorm", include_str!("../kernels/rmsnorm.toml")),
     ("swiglu", include_str!("../kernels/swiglu.toml")),
@@ -65,6 +67,10 @@ pub struct Description {
     pub stage: Vec<StageDesc>,
     #[serde(default)]
     pub shape: Option<AttentionShapeDesc>,
+    #[serde(default)]
+    pub geometry: Option<BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub query: Vec<BTreeMap<String, Value>>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -397,6 +403,12 @@ impl Description {
     }
 
     fn number(&self, shape: &Shape, key: &str) -> Result<f64, String> {
+        if let Some(Value::String(text)) = self.args.get(key)
+            && self.is_symbol(key)
+            && shape.get(text).is_none()
+        {
+            return self.size(shape, &Value::String(text.clone()), key).map(f64::from);
+        }
         match self.arg(shape, key)? {
             Value::Integer(i) => Ok(*i as f64),
             Value::Float(f) => Ok(*f),
@@ -535,7 +547,118 @@ impl Description {
                 o => return Err(format!("{}: scan stage op {o:?} is not epilogue, mask or online_softmax", self.name)),
             });
         }
-        Kernel::scan(t, intern(&self.name), self.threads(shape)?, params, Scan { consts, stages }).map_err(|e| format!("{}: {e}", self.name))
+        Kernel::scan(t, intern(&self.name), self.threads(shape)?, params, Scan { consts, stages, geometry: self.scan_geometry(shape)? }).map_err(|e| format!("{}: {e}", self.name))
+    }
+
+    fn size(&self, shape: &Shape, v: &Value, key: &str) -> Result<u32, String> {
+        let n = match v {
+            Value::Integer(i) => *i as f64,
+            Value::Float(f) => *f,
+            Value::String(text) => {
+                let e = Expr::parse(text).map_err(|e| format!("{}: {key}: {e}", self.name))?;
+                let env = |n: &str| match shape.get(n) {
+                    Some(Value::Integer(i)) => Some(*i as f64),
+                    Some(Value::Float(f)) => Some(*f),
+                    _ => None,
+                };
+                e.eval(&env).ok_or_else(|| format!("{}: {key} = {text:?} names a symbol the model shape does not provide", self.name))?
+            }
+            v => return Err(format!("{}: {key} is {v}, not a size", self.name)),
+        };
+        if n < 0.0 || n.fract() != 0.0 || n > u32::MAX as f64 {
+            return Err(format!("{}: {key} is {n}, not a size", self.name));
+        }
+        Ok(n as u32)
+    }
+
+    fn sizes(&self, shape: &Shape, table: &BTreeMap<String, Value>, keys: &[&str], what: &str) -> Result<BTreeMap<String, u32>, String> {
+        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && k.as_str() != "src" && k.as_str() != "style") {
+            return Err(format!("{}: {what} has no key {k:?}", self.name));
+        }
+        let mut out = BTreeMap::new();
+        for k in keys {
+            let v = table.get(*k).ok_or_else(|| format!("{}: {what} needs {k:?}", self.name))?;
+            out.insert(k.to_string(), self.size(shape, v, k)?);
+        }
+        Ok(out)
+    }
+
+    fn scan_geometry(&self, shape: &Shape) -> Result<Option<crate::scan::Geometry>, String> {
+        let Some(g) = &self.geometry else {
+            return if self.query.is_empty() { Ok(None) } else { Err(format!("{}: [[query]] needs a [geometry]", self.name)) };
+        };
+        let s = self.sizes(shape, g, &["layers", "kv_rows", "k_width", "v_stride", "v_offset", "v_width", "out_row", "out_head", "out_offset"], "[geometry]")?;
+        let mut query = Vec::new();
+        for q in &self.query {
+            let src = q.get("src").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: [[query]] needs src", self.name))?;
+            let n = self.sizes(shape, q, &["row", "head", "offset", "width"], "[[query]]")?;
+            query.push(crate::scan::Segment { src: src.to_string(), row: n["row"], head: n["head"], offset: n["offset"], width: n["width"] });
+        }
+        Ok(Some(crate::scan::Geometry {
+            query,
+            layers: s["layers"],
+            kv_rows: s["kv_rows"],
+            k_width: s["k_width"],
+            v_stride: s["v_stride"],
+            v_offset: s["v_offset"],
+            v_width: s["v_width"],
+            out_row: s["out_row"],
+            out_head: s["out_head"],
+            out_offset: s["out_offset"],
+        }))
+    }
+
+    fn row_kernel(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
+        use crate::rows::{RopeStyle, RowBody};
+        let mut params = Vec::new();
+        for p in &self.param {
+            let role = match p.role.as_str() {
+                "weight" => Role::Weight,
+                "activation" => Role::Activation,
+                "value" => Role::Value,
+                o => return Err(format!("{}: param role {o:?} is not weight, activation or value", self.name)),
+            };
+            let access = match p.access.as_str() {
+                "read" => Access::Read,
+                "write" => Access::Write,
+                o => return Err(format!("{}: param access {o:?} is unknown", self.name)),
+            };
+            params.push(Param { name: intern(&p.name), ty: self.scalar(p)?, role, access });
+        }
+        let body = match self.family.as_str() {
+            "span_rope" => {
+                let n = self.sizes(shape, &self.args, &["row", "head", "offset", "rot"], "[args]")?;
+                let style = match self.args.get("style").and_then(|v| v.as_str()) {
+                    None | Some("halves") => RopeStyle::Halves,
+                    Some("pairs") => RopeStyle::Pairs,
+                    Some(o) => return Err(format!("{}: rope style {o:?} is not halves or pairs", self.name)),
+                };
+                RowBody::SpanRope { row: n["row"], head: n["head"], offset: n["offset"], rot: n["rot"], style }
+            }
+            "state_write" => {
+                let n = self.sizes(shape, &self.args, &["src_row", "src_offset", "layers", "rows", "width"], "[args]")?;
+                RowBody::StateWrite { src_row: n["src_row"], src_offset: n["src_offset"], layers: n["layers"], rows: n["rows"], width: n["width"] }
+            }
+            "head_matvec" => {
+                let n = self.sizes(shape, &self.args, &["x_row", "x_head", "x_offset", "inner", "w_head", "w_inner", "w_out", "w_offset", "out", "y_row", "y_head", "y_offset"], "[args]")?;
+                RowBody::HeadMatvec {
+                    x_row: n["x_row"],
+                    x_head: n["x_head"],
+                    x_offset: n["x_offset"],
+                    inner: n["inner"],
+                    w_head: n["w_head"],
+                    w_inner: n["w_inner"],
+                    w_out: n["w_out"],
+                    w_offset: n["w_offset"],
+                    out: n["out"],
+                    y_row: n["y_row"],
+                    y_head: n["y_head"],
+                    y_offset: n["y_offset"],
+                }
+            }
+            f => return Err(format!("{}: unknown row family {f:?}", self.name)),
+        };
+        Kernel::rows(t, intern(&self.name), self.threads(shape)?, params, body).map_err(|e| format!("{}: {e}", self.name))
     }
 
     fn compose(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
@@ -613,12 +736,16 @@ impl Description {
         if self.shape.is_some() {
             return Err(format!("{}: family {} takes no [shape]", self.name, self.family));
         }
-        if self.family != "compose" && self.family != "scan_attention" && (self.rows.is_some() || !self.param.is_empty() || !self.consts.is_empty() || !self.stage.is_empty()) {
+        if self.family != "compose" && self.family != "scan_attention" && !ROW_FAMILIES.contains(&self.family.as_str()) && (self.rows.is_some() || !self.param.is_empty() || !self.consts.is_empty() || !self.stage.is_empty()) {
             return Err(format!("{}: only family compose takes rows, param, const and stage", self.name));
+        }
+        if self.family != "scan_attention" && (self.geometry.is_some() || !self.query.is_empty()) {
+            return Err(format!("{}: only family scan_attention takes [geometry] and [[query]]", self.name));
         }
         match self.family.as_str() {
             "compose" => self.compose(t, shape),
             "scan_attention" => self.scan(t, shape),
+            f if ROW_FAMILIES.contains(&f) => self.row_kernel(t, shape),
             "rmsnorm" => {
                 self.known(&["width", "eps", "offset"])?;
                 Kernel::rmsnorm_offset(t, self.count(shape, "width")?, self.number(shape, "eps")? as f32, self.number(shape, "offset")? as f32, threads)

@@ -649,6 +649,7 @@ pub struct Runtime {
     lm_head: DeviceMatrix,
     layers: Vec<DeviceLayer>,
     described: Vec<Option<DescribedLaunch>>,
+    scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
     buf: Buffers,
     pre: PrefillBuffers,
     gdn: Option<GdnBuffers>,
@@ -924,11 +925,11 @@ impl Runtime {
             xn: stream.alloc_zeros(mma_only(chunk * d.hidden))?,
             branch: stream.alloc_zeros(if spec.uses_branch() { chunk * d.hidden } else { 1 })?,
             qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
-            attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim()))?,
+            attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim().max(spec.o_dim())))?,
             gate_up: stream.alloc_zeros(mma_only(chunk * 2 * d.intermediate))?,
             act: stream.alloc_zeros(mma_only(chunk * d.intermediate))?,
             xn_planes: Planes::new(&stream, chunk * d.hidden)?,
-            attn_planes: Planes::new(&stream, chunk * spec.q_dim())?,
+            attn_planes: Planes::new(&stream, chunk * spec.q_dim().max(spec.o_dim()))?,
             act_planes: Planes::new(&stream, chunk * d.intermediate)?,
             dummy_u16: stream.alloc_zeros(8)?,
             dummy_u8: stream.alloc_zeros(8)?,
@@ -1016,6 +1017,12 @@ impl Runtime {
             lm_head,
             layers,
             described,
+            scratch: spec
+                .attention
+                .scratch
+                .iter()
+                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
+                .collect::<Result<_>>()?,
             buf,
             kernels,
             stream,

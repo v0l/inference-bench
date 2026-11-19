@@ -166,7 +166,13 @@ pub fn attention_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
 }
 
 pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: &kir::Target) -> Result<Vec<Option<kir::Kernel>>> {
-    let symbols = attention_symbols(spec, kv_planes, max_ctx);
+    let mut symbols = attention_symbols(spec, kv_planes, max_ctx).num("o_dim", spec.o_dim() as f64);
+    for (n, v) in &spec.attention.params {
+        symbols = symbols.num(n, *v);
+    }
+    for s in crate::state::positional(spec) {
+        symbols = symbols.num(&format!("{}_layers", s.name), s.layer_count(spec) as f64);
+    }
     let registry = crate::kir_kernel::Registry::active();
     let mut built: BTreeMap<String, kir::Kernel> = BTreeMap::new();
     let mut out = Vec::new();
@@ -180,14 +186,20 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
             built.insert(name.to_string(), d.build(target, &symbols).map_err(anyhow::Error::msg)?);
         }
         let kernel = &built[name];
-        for p in kernel.params.iter().filter(|p| p.role == kir::Role::Value && !kir::scan::LAUNCH.contains(&p.name)) {
+        for p in kernel.params.iter().filter(|p| !kir::scan::LAUNCH.contains(&p.name)) {
             anyhow::ensure!(node.bind.contains_key(p.name), "[[attention.node]] {i} does not bind {name} param {:?}", p.name);
         }
         for (b, v) in &node.bind {
             let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[attention.node]] {i} binds {b:?}, which {name} has no param for"))?;
             match (param.role, v) {
                 (kir::Role::Weight, crate::graph::Bind::Weight { .. }) => {}
-                (kir::Role::Value, crate::graph::Bind::Weight { .. }) | (kir::Role::Weight, _) => anyhow::bail!("[[attention.node]] {i} binds {b:?} to the wrong kind of value"),
+                (kir::Role::Activation, crate::graph::Bind::Buffer { .. }) => anyhow::ensure!(param.ty == kir::Scalar::F32, "[[attention.node]] {i} binds buffer to {b:?}, which is not f32"),
+                (kir::Role::Activation, crate::graph::Bind::State { .. }) => anyhow::ensure!(param.ty == kir::Scalar::Bf16, "[[attention.node]] {i} binds a state to {b:?}, which is not bf16"),
+                (kir::Role::Value, crate::graph::Bind::Weight { .. } | crate::graph::Bind::Buffer { .. } | crate::graph::Bind::State { .. })
+                | (kir::Role::Weight, _)
+                | (kir::Role::Activation | kir::Role::Scratch, crate::graph::Bind::Weight { .. } | crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_)) => {
+                    anyhow::bail!("[[attention.node]] {i} binds {b:?} to the wrong kind of value")
+                }
                 (_, crate::graph::Bind::Name(n)) => anyhow::ensure!(matches!(n.as_str(), "window" | "nope") || spec.attention.params.contains_key(n), "[[attention.node]] {i} binds {b:?} to {n:?}, which is not window, nope or an [attention.params] entry"),
                 _ => {}
             }
@@ -393,8 +405,7 @@ impl Module {
                 distinct.push(k);
             }
         }
-        let mut kir_source = kir::cuda::emit_module(&kir_kernels).map_err(anyhow::Error::msg)?;
-        kir_source.push_str(&kir::cuda::emit_module(&distinct).map_err(anyhow::Error::msg)?);
+        let kir_source = kir::cuda::emit_module(&kir_kernels.iter().chain(&distinct).cloned().collect::<Vec<_>>()).map_err(anyhow::Error::msg)?;
         let attn_source = kir::cuda::emit_attention(&attn).map_err(anyhow::Error::msg)?;
         let gemm_source = kir::cuda::emit_gemms(&gemms.kernels).map_err(anyhow::Error::msg)?;
         let linear_source = kir::cuda::emit_linear(&linear).map_err(anyhow::Error::msg)?;

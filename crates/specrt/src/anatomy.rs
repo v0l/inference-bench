@@ -141,7 +141,16 @@ fn attention_counts(spec: &Spec) -> Counts {
         (true, false) => 2 * a.head_dim as u64,
         _ => 0,
     };
-    Counts { quantised: spec.qkv_rows() as u64 * h + h * spec.q_dim() as u64, plain: bias + norms }
+    let mut extra = Vec::new();
+    for b in a.node.iter().flat_map(|n| n.bind.values()) {
+        if let crate::graph::Bind::Weight { weight, len } = b
+            && !extra.iter().any(|(w, _)| w == weight)
+        {
+            extra.push((weight.clone(), spec.weight_len(len).unwrap_or(0) as u64));
+        }
+    }
+    let extra: u64 = extra.iter().map(|(_, n)| n).sum();
+    Counts { quantised: spec.qkv_rows() as u64 * h + h * spec.o_dim() as u64, plain: bias + norms + extra }
 }
 
 fn delta_counts(spec: &Spec) -> Counts {

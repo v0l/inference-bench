@@ -106,6 +106,7 @@ impl Weight {
     pub fn tensors(self, spec: &Spec) -> Vec<String> {
         let w = |m: &str| format!("{m}.weight");
         match self {
+            Weight::Qkv if !spec.attention.projection.is_empty() => spec.attention.projection.iter().map(|p| format!("self_attn.{}.weight", p.tensor)).collect(),
             Weight::Qkv => {
                 let names: &[&str] = if spec.attention.fused_qkv { &["self_attn.qkv_proj"] } else { &["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] };
                 let mut t: Vec<String> = names.iter().map(|m| w(m)).collect();
@@ -297,7 +298,7 @@ impl Op {
                 .flat_map(|n| n.bind.values())
                 .filter_map(|b| match b {
                     crate::graph::Bind::Weight { weight, .. } => Some(format!("self_attn.{weight}")),
-                    crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_) => None,
+                    crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_) | crate::graph::Bind::Buffer { .. } | crate::graph::Bind::State { .. } => None,
                 })
                 .collect(),
             Op::GdnPrefill | Op::GdnDecode => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),

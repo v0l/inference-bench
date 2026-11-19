@@ -123,7 +123,7 @@ impl Runtime {
                     "nope" => f64::from(u8::from(l.nope)),
                     other => *self.spec.attention.params.get(other).with_context(|| format!("{other:?} is not window, nope or an [attention.params] entry"))?,
                 },
-                Bind::Weight { .. } => bail!("a weight binding is not a number"),
+                Bind::Weight { .. } | Bind::Buffer { .. } | Bind::State { .. } => bail!("a weight, buffer or state binding is not a number"),
             })
         };
         let mut ints = vec![0i32; launch.params.len()];
@@ -149,6 +149,18 @@ impl Runtime {
                 (kir::Role::Weight, name) => match spec_node.bind.get(name) {
                     Some(Bind::Weight { weight, .. }) => b.arg(l.extra.get(weight).with_context(|| format!("layer has no {weight} tensor"))?),
                     _ => bail!("param {name:?} is not bound to a weight"),
+                },
+                (_, name) if spec_node.bind.contains_key(name) => match &spec_node.bind[name] {
+                    Bind::Buffer { buffer } => match buffer.as_str() {
+                        "qkv" => b.arg(&self.pre.qkv),
+                        "attn" => b.arg(&self.pre.attn),
+                        other => b.arg(self.scratch.get(other).with_context(|| format!("no scratch buffer {other:?}"))?),
+                    },
+                    Bind::State { state } => {
+                        let at = crate::state::positional(&self.spec).position(|s| s.name == *state).with_context(|| format!("no per token state {state:?}"))?;
+                        b.arg(&self.buf.caches[at])
+                    }
+                    _ => bail!("param {name:?} of {} is bound to a number", launch.name),
                 },
                 (_, "qkv") => b.arg(&self.pre.qkv),
                 (_, "k_cache") => b.arg(self.buf.k_cache()),

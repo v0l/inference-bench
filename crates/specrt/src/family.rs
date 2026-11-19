@@ -24,14 +24,44 @@ impl Flag {
 pub enum ParamSource {
     Number(f64),
     Config { config: String, #[serde(default)] default: Option<f64> },
+    Expr { expr: String },
+}
+
+pub fn read_params(params: &std::collections::BTreeMap<String, ParamSource>, config: &serde_json::Value) -> Result<std::collections::BTreeMap<String, f64>> {
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..=params.len() {
+        for (n, p) in params {
+            if out.contains_key(n) {
+                continue;
+            }
+            let v = match p {
+                ParamSource::Expr { expr } => {
+                    let e = kir::expr::Expr::parse(expr).map_err(anyhow::Error::msg).with_context(|| format!("attention param {n}"))?;
+                    let env = |k: &str| out.get(k).copied().or_else(|| config.get(k).and_then(|v| v.as_f64().or_else(|| v.as_bool().map(f64::from))));
+                    match e.eval(&env) {
+                        Some(v) => v,
+                        None => continue,
+                    }
+                }
+                other => other.read(n, config)?,
+            };
+            out.insert(n.clone(), v);
+        }
+    }
+    if let Some((n, p)) = params.iter().find(|(n, _)| !out.contains_key(*n)) {
+        bail!("attention param {n} = {p:?} reads a config.json key or param that is missing");
+    }
+    Ok(out)
 }
 
 impl ParamSource {
     pub fn read(&self, name: &str, config: &serde_json::Value) -> Result<f64> {
         match self {
             ParamSource::Number(v) => Ok(*v),
-            ParamSource::Config { config: key, default } => config
-                .get(key)
+            ParamSource::Expr { .. } => read_params(&[(name.to_string(), self.clone())].into_iter().collect(), config).map(|m| m[name]),
+            ParamSource::Config { config: key, default } => key
+                .split('.')
+                .try_fold(config, |v, k| v.get(k))
                 .and_then(|v| v.as_f64().or_else(|| v.as_bool().map(f64::from)))
                 .or(*default)
                 .with_context(|| format!("attention param {name} reads config.json key {key}, which is missing")),
@@ -61,6 +91,9 @@ pub struct Match {
 pub struct FamilyAttention {
     pub node: Vec<crate::graph::Node>,
     pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub projection: Vec<crate::spec::Projection>,
+    pub o_cols: Option<String>,
+    pub scratch: std::collections::BTreeMap<String, String>,
     pub qkv_bias: Flag,
     pub qk_norm: Flag,
     pub output_gate: Flag,
@@ -73,6 +106,9 @@ impl Default for FamilyAttention {
         FamilyAttention {
             node: Vec::new(),
             params: Default::default(),
+            projection: Vec::new(),
+            o_cols: None,
+            scratch: Default::default(),
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
             qk_norm: Flag::Fixed(false),
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },

@@ -313,6 +313,50 @@ impl Expr {
         }
     }
 
+    pub fn eval(&self, env: &dyn Fn(&str) -> Option<f64>) -> Option<f64> {
+        Some(match self {
+            Expr::Lit(t) => t.parse().ok()?,
+            Expr::Const(_, v) => f64::from(*v),
+            Expr::Name(n) => env(n)?,
+            Expr::Neg(e) => -e.eval(env)?,
+            Expr::Bin(op, a, b) => {
+                let (a, b) = (a.eval(env)?, b.eval(env)?);
+                let truth = |c: bool| if c { 1.0 } else { 0.0 };
+                match op {
+                    Op::Add => a + b,
+                    Op::Sub => a - b,
+                    Op::Mul => a * b,
+                    Op::Div => a / b,
+                    Op::Lt => truth(a < b),
+                    Op::Gt => truth(a > b),
+                    Op::Le => truth(a <= b),
+                    Op::Ge => truth(a >= b),
+                    Op::Eq => truth(a == b),
+                    Op::Ne => truth(a != b),
+                    Op::And => truth(a != 0.0 && b != 0.0),
+                    Op::Or => truth(a != 0.0 || b != 0.0),
+                }
+            }
+            Expr::Call(f, args) => {
+                let v: Vec<f64> = args.iter().map(|a| a.eval(env)).collect::<Option<_>>()?;
+                match (*f, v.as_slice()) {
+                    ("select", [c, a, b]) => if *c != 0.0 { *a } else { *b },
+                    ("min", [a, b]) => a.min(*b),
+                    ("max", [a, b]) => a.max(*b),
+                    ("floor", [a]) => a.floor(),
+                    ("tanh", [a]) => a.tanh(),
+                    ("exp", [a]) => a.exp(),
+                    ("log", [a]) => a.ln(),
+                    ("rsqrt", [a]) => 1.0 / a.sqrt(),
+                    ("sqrt", [a]) => a.sqrt(),
+                    ("abs", [a]) => a.abs(),
+                    _ => return None,
+                }
+            }
+            Expr::Raw(_) | Expr::Width => return None,
+        })
+    }
+
     pub fn count(&self, name: &str) -> usize {
         match self {
             Expr::Name(n) => usize::from(n == name),
