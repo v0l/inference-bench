@@ -435,7 +435,7 @@ Now bind groups are cached by (pipeline, buffer ids) and the uniform binding use
 
 Rope fused into `flash_decode` (norm, rope, KV write and attention in one dispatch) was built and measured: 145.5 against 145.1 tok/s, and greedy text diverged from CUDA after 2 tokens in the wgsl suite. Dropped.
 
-Dispatches per token after: about 177 in total per 128-token generation count basis, 28 swiglu dispatches removed. The remaining 57 rmsnorm are the next lever and were not fused: the norm output is the GEMV input, which was shown slower to fold in #827.
+Dispatches per token after: about 177 (28 swiglu dispatches removed). The remaining 57 rmsnorm are the next lever and were not fused: the norm output is the GEMV input, which was shown slower to fold in #827.
 
 ### Prefill GEMM
 
