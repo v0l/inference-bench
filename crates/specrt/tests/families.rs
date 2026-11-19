@@ -216,6 +216,7 @@ fn real(name: &str, repo: &str) {
     let mut spec = Spec::from_hf_config(&json).unwrap();
     spec.name = name.into();
     spec.repo = snapshot.display().to_string();
+    spec.runtime.split_activations = Some(true);
     let want = reference(name);
     let rows = want.logits.len() / want.vocab;
     let mut rt = Runtime::load(&spec, 512).unwrap();
