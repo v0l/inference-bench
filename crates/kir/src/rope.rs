@@ -25,15 +25,14 @@ pub fn mrope_axis_fn() -> String {
 }
 
 pub fn position_fn() -> String {
-    format!(
-        "__device__ __forceinline__ float rope_position(const int* mm_meta, const int* mm_table, int mm_stride, int slot, int idx, int i) {{
+    "__device__ __forceinline__ float rope_position(const int* mm_meta, const int* mm_table, int mm_stride, int slot, int idx, int i) {
     if (!MROPE) return (float)idx;
     if (idx < mm_meta[2 * slot]) return (float)mm_table[((size_t)slot * mm_stride + idx) * 3 + mrope_axis(i)];
     return (float)(idx + mm_meta[2 * slot + 1]);
-}}
+}
 
 "
-    )
+    .to_string()
 }
 
 pub fn rotate_head() -> String {

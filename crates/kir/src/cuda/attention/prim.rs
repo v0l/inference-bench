@@ -206,17 +206,7 @@ use std::fmt::Write as _;
 
 use crate::layout::{self, Dialect};
 
-pub struct KvShape {
-    pub kv_heads: usize,
-    pub page: usize,
-    pub head_dim: usize,
-    pub planes: usize,
-    pub layers: usize,
-    pub f16_layers: usize,
-    pub fp8: bool,
-}
-
-pub fn kv_addr(s: &KvShape) -> String {
+pub fn kv_addr() -> String {
     let d = Dialect::Cuda;
     let page = layout::offset(d, &[layout::Term::one("block_table[pos / PAGE]")]);
     let slot = layout::addr_chain(d, &page, &[("ATTN_LAYERS", "layer"), ("KV_HEADS", "kv_head")]);

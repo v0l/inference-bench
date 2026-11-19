@@ -113,11 +113,7 @@ extern "C" __global__ void vis_split(const float* x, bf16_t* hi, bf16_t* lo, int
 extern "C" __global__ void vis_layernorm(const float* x, const bf16_t* w, const bf16_t* b, bf16_t* hi, bf16_t* lo, int width, float eps) {{
     __shared__ float red[2][32];
     const float* row = x + (size_t)blockIdx.x * width;
-{moments}    for (int o = 16; o > 0; o >>= 1) {{
-        s += __shfl_xor_sync(0xffffffff, s, o);
-        s2 += __shfl_xor_sync(0xffffffff, s2, o);
-    }}
-{share}    float mean = s / width;
+{moments}{warp}{share}    float mean = s / width;
     float var = s2 / width - mean * mean;
     float inv = rsqrtf(fmaxf(var, 0.0f) + eps);
     size_t base = (size_t)blockIdx.x * width;
@@ -125,6 +121,7 @@ extern "C" __global__ void vis_layernorm(const float* x, const bf16_t* w, const 
 
 "#,
             moments = prim::row_moments("s", "row", "width", "blockDim.x"),
+            warp = prim::warp_pair("s"),
             share = prim::lane_share("s", "red"),
             apply = prim::layernorm_apply("row", "width", "blockDim.x", "mean", "inv"),
     )

@@ -67,15 +67,17 @@ pub fn row_moments(var: &str, row: &str, width: &str, threads: &str) -> String {
 }
 
 pub fn warp_pair(var: &str) -> String {
-    let mut s = String::new();
-    for o in [16, 8, 4, 2, 1] {
-        s += &format!("    {var} += __shfl_xor_sync(0xffffffff, {var}, {o});\n    {var}2 += __shfl_xor_sync(0xffffffff, {var}2, {o});\n");
-    }
-    s
+    format!(
+        "    for (int o = 16; o > 0; o >>= 1) {{
+        {var} += __shfl_xor_sync(0xffffffff, {var}, o);
+        {var}2 += __shfl_xor_sync(0xffffffff, {var}2, o);
+    }}
+"
+    )
 }
 
 pub fn lane_share(var: &str, red: &str) -> String {
-    let mut s = format!("    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n");
+    let mut s = String::from("    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n");
     s += &format!("    if (lane == 0) {{\n        {red}[0][warp] = {var};\n        {red}[1][warp] = {var}2;\n    }}\n");
     s += &format!("    __syncthreads();\n    {var} = 0.0f;\n    {var}2 = 0.0f;\n    for (int i = 0; i < blockDim.x / 32; i++) {{\n        {var} += {red}[0][i];\n        {var}2 += {red}[1][i];\n    }}\n");
     s

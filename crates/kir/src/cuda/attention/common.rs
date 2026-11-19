@@ -2,17 +2,7 @@ use super::prim::{self, Reduce};
 use crate::attention::AttentionShape;
 use crate::rope;
 
-pub fn body(s: &AttentionShape) -> String {
-    let kv = prim::KvShape {
-        kv_heads: s.kv_heads,
-        page: crate::attention::PAGE,
-        head_dim: s.head_dim,
-        planes: s.kv_planes,
-        layers: s.kv_layers.max(1),
-        f16_layers: if s.kv_fp8 { s.kv_f16_layers.min(s.kv_layers) } else { 0 },
-        fp8: s.kv_fp8,
-    };
-    let m = s.rope.mrope;
+pub fn body(_s: &AttentionShape) -> String {
     [
         r##"__device__ __forceinline__ float cap_score(float s) {
     return SOFTCAP > 0.0f ? SOFTCAP * tanhf(s / SOFTCAP) : s;
@@ -48,7 +38,7 @@ __device__ __forceinline__ void attn_split(float v, unsigned& hi, unsigned& lo) 
 }
 
 "##.to_string(),
-        prim::kv_addr(&kv),
+        prim::kv_addr(),
         rope::mrope_axis_fn(),
         rope::position_fn(),
         r##"__device__ __forceinline__ int span_end(const int* mm_meta, const int* bidi, int mm_stride, int slot, int idx) {
