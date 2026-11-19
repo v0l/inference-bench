@@ -393,3 +393,30 @@ Q4_K_M 0.6B decode dispatches (counted with a trace), per token: 57 rmsnorm, 28 
 | Qwen2.5-7B Q4_K_M | 147.5 / 273.9 = 0.539 | 143.4 / 269.2 = 0.533 | 17.60 / 27.97 = 0.629 |
 
 7B load median 5.12 s. 0.7x is not reached on any prefill cell.
+
+### Follow-up pass (#827)
+
+**Per-quant `linear_coop`.** `linear_coop_bf16`, `_q4k` and `_q6k` (plus the generic one for mixed weights) replace the runtime type branch in the tile load; `dense.rs` picks one per weight like `sg_kernel`. Paired A/B on Qwen3-0.6B Q4_K_M, 3 alternating rounds, identical each round: prefill 128 1,599 to 1,719 tok/s, prefill 1,024 1,425 to 1,499 tok/s, decode unchanged. This moves the one-miss cell from 0.470 to 0.494.
+
+**Decode fusion, each tried alone (3 paired rounds, decode tok/s) and dropped:**
+
+| Fusion | Qwen3-0.6B Q4_K_M | Llama-3.2-1B Q4_K_M | Qwen3-0.6B bf16 |
+|---|---|---|---|
+| rmsnorm into the following GEMV input (each workgroup re-reads x and reduces it, then stages `x * inv * w` in workgroup memory) | 117 to 115 | 91.5 to 83.0 | 94.7 to 88.8 |
+| swiglu into the down GEMV input (`silu(g) * u` computed on every x load) | 116.7 to 113.1 | not run | not run |
+| rope plus KV write | already one kernel (`rope` writes q, k_cache and v_cache) | | |
+
+Each fused GEMV workgroup (4 rows) redoes the norm or activation over the whole hidden or intermediate vector, so with 3,000 to 9,000 workgroups per dispatch the redundant reads cost more than the saved dispatch. The skipped-kernel upper bound (140 tok/s) is the cost of the dispatches themselves, not of their arithmetic, so the lever is fewer dispatches per token (for example a persistent per-layer kernel), not folding the work into the GEMV. The fusion code was dropped. Prefill rows in those runs are the coop gain above.
+
+**Tests.** `cargo test --release -p inference-bench-specrt --features wgpu --test wgsl -- --include-ignored --test-threads=1` on the Mac: 26 passed, 0 failed (the linear test now dispatches the per-quant coop kernels). `cargo clippy -p inference-bench-specrt --features wgpu --all-targets` clean on the Mac and on Linux; `cargo test -p inference-bench-kir` passes.
+
+**`mac_vs_llama.sh`, 3 alternating rounds, medians (specrt / llama.cpp):**
+
+| Model | Prefill 128 | Prefill 1,024 | Decode |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 1,809 / 2,943 = 0.615 | 1,638 / 2,964 = 0.553 | 86.8 / 115.3 = 0.752 |
+| Qwen3-0.6B Q4_K_M | 1,719 / 3,000 = 0.573 | 1,497 / 3,030 = 0.494 | 105.3 / 184.4 = 0.571 |
+| Llama-3.2-1B Q4_K_M | 1,021 / 1,733 = 0.589 | 974 / 1,755 = 0.555 | 87.5 / 144.7 = 0.604 |
+| Qwen2.5-7B Q4_K_M | 161.4 / 274.0 = 0.589 | 156.2 / 269.1 = 0.580 | 17.65 / 28.0 = 0.630 |
+
+7B load median in the full script is 5.13 s (5.49, 4.29, 5.13). The `madvise` win showed in back-to-back runs (3.8 to 3.0 s) but not in this script, where each 7B run follows a llama.cpp run that has evicted the page cache; the cold-cache load is the 4.3 to 5.5 s here. 0.5x now holds on every cell; 0.7x holds on none of the prefill cells and on bf16 decode only.
