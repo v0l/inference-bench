@@ -3,6 +3,7 @@
 pub mod allreduce;
 pub mod anatomy;
 pub mod backends;
+pub mod kir_kernel;
 pub mod wgsl;
 pub mod structure;
 pub mod chat;

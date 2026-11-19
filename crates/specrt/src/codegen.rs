@@ -52,6 +52,32 @@ pub fn flash_rows(_head_dim: usize) -> usize {
     kir::attention::FLASH_ROWS
 }
 
+pub fn kir_shape(spec: &Spec) -> kir::desc::Shape {
+    let act = match spec.mlp.activation {
+        Activation::Swiglu => "silu",
+        Activation::Geglu => "gelu_tanh",
+    };
+    let mut shape = kir::desc::Shape::new()
+        .num("hidden", spec.dims.hidden as f64)
+        .num("inter", spec.dims.intermediate as f64)
+        .num("vocab", spec.dims.vocab as f64)
+        .num("norm_eps", spec.norm.eps)
+        .num("q_dim", spec.q_dim() as f64)
+        .num("kv_dim", spec.kv_dim() as f64)
+        .num("qkv_row", spec.qkv_rows() as f64)
+        .word("mlp_act", act);
+    if let Some(v) = spec.norm.residual_scale {
+        shape = shape.num("residual_scale", v);
+    }
+    if let Some(v) = spec.dims.logit_scale {
+        shape = shape.num("logit_scale", v);
+    }
+    if let Some(v) = spec.dims.logit_softcap {
+        shape = shape.num("logit_softcap", v);
+    }
+    shape
+}
+
 pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::attention::AttentionShape {
     let a = &spec.attention;
     let rope = spec.rope_constants();
@@ -92,8 +118,51 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::at
     }
 }
 
+pub fn attention_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::desc::Shape {
+    let a = &spec.attention;
+    let rope = spec.rope_constants();
+    let shape = attention_shape(spec, kv_planes, max_ctx);
+    let mut symbols = kir_shape(spec)
+        .num("heads", a.heads as f64)
+        .num("kv_heads", a.kv_heads as f64)
+        .num("head_dim", a.head_dim as f64)
+        .num("qkv_row", spec.qkv_rows() as f64)
+        .flag("output_gate", a.output_gate)
+        .flag("qk_norm", a.qk_norm && !a.qk_norm_full)
+        .num("norm_eps", spec.norm.eps)
+        .num("rotary_dim", spec.rotary_dim() as f64)
+        .num("rope_theta", spec.rope.theta)
+        .num("rope_kind", rope.kind as f64)
+        .num("rope_factor", rope.factor)
+        .num("rope_low", rope.low)
+        .num("rope_high", rope.high)
+        .num("rope_original", rope.original)
+        .num("rope_mscale", rope.mscale)
+        .nums("rope_freq_factors", &shape.rope.freq_factors)
+        .num("kv_layers", spec.kv_layers() as f64)
+        .num("kv_planes", kv_planes as f64)
+        .flag("kv_fp8", shape.kv_fp8)
+        .num("kv_f16_layers", shape.kv_f16_layers as f64)
+        .num("query_scale", shape.query_scale)
+        .num("softcap", shape.softcap)
+        .num("local_theta", shape.local_theta)
+        .flag("bidirectional", shape.bidirectional)
+        .flags("nope", &shape.nope)
+        .flags("local_rope", &shape.local_rope);
+    if let Some(m) = &shape.rope.mrope {
+        symbols = symbols
+            .nums("mrope_section", &m.section.iter().map(|s| *s as f64).collect::<Vec<_>>())
+            .flag("mrope_interleaved", m.interleaved);
+    }
+    symbols
+}
+
 pub fn attention_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: &kir::Target) -> Result<Vec<kir::attention::AttentionKernel>> {
-    kir::attention::AttentionKernel::set(target, attention_shape(spec, kv_planes, max_ctx)).map_err(anyhow::Error::msg)
+    let symbols = attention_symbols(spec, kv_planes, max_ctx);
+    kir::desc::ATTENTION
+        .iter()
+        .map(|(n, _)| kir::desc::build_attention(n, target, &symbols).map_err(anyhow::Error::msg))
+        .collect()
 }
 
 pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::LinearShape {
@@ -164,32 +233,6 @@ pub struct Module {
     pub smem: BTreeMap<&'static str, u32>,
     pub arch_features: bool,
     pub kir_hash: String,
-}
-
-pub fn kir_shape(spec: &Spec) -> kir::desc::Shape {
-    let act = match spec.mlp.activation {
-        Activation::Swiglu => "silu",
-        Activation::Geglu => "gelu_tanh",
-    };
-    let mut shape = kir::desc::Shape::new()
-        .num("hidden", spec.dims.hidden as f64)
-        .num("inter", spec.dims.intermediate as f64)
-        .num("vocab", spec.dims.vocab as f64)
-        .num("norm_eps", spec.norm.eps)
-        .num("q_dim", spec.q_dim() as f64)
-        .num("kv_dim", spec.kv_dim() as f64)
-        .num("qkv_row", spec.qkv_rows() as f64)
-        .word("mlp_act", act);
-    if let Some(v) = spec.norm.residual_scale {
-        shape = shape.num("residual_scale", v);
-    }
-    if let Some(v) = spec.dims.logit_scale {
-        shape = shape.num("logit_scale", v);
-    }
-    if let Some(v) = spec.dims.logit_softcap {
-        shape = shape.num("logit_softcap", v);
-    }
-    shape
 }
 
 pub fn kir_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>> {

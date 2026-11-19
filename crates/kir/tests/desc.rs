@@ -1,4 +1,5 @@
-use kir::desc::{BUILTIN, Description, Shape, build_builtin};
+use kir::attention::{AttentionShape, Family, MropeShape, RopeShape};
+use kir::desc::{ATTENTION, BUILTIN, Description, Shape, build_attention, build_builtin};
 use kir::{Activation, Kernel, Pointwise, Target};
 
 fn shape() -> Shape {
@@ -82,4 +83,127 @@ fn target_checks_still_run_on_description_kernels() {
     let tiny = Target::wgpu(1024, 1024);
     let e = build_builtin("rmsnorm", &tiny, &shape()).unwrap_err();
     assert!(e.contains("shared memory"), "{e}");
+}
+
+fn attention_shape() -> (Shape, AttentionShape) {
+    let rust = AttentionShape {
+        heads: 24,
+        kv_heads: 4,
+        head_dim: 256,
+        qkv_row: 14336,
+        output_gate: true,
+        qk_norm: true,
+        eps: 1e-6,
+        rope: RopeShape {
+            rotary_dim: 64,
+            theta: 10000000.0,
+            kind: 3,
+            factor: 16.0,
+            low: 1.0,
+            high: 4.0,
+            original: 8192.0,
+            mscale: 0.7,
+            freq_factors: vec![2.0, 3.0],
+            mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }),
+        },
+        kv_layers: 16,
+        kv_planes: 1,
+        kv_fp8: true,
+        kv_f16_layers: 8,
+        query_scale: 0.0625,
+        softcap: 30.0,
+        local_theta: 10000.0,
+        local_rope: vec![false, true, false, false],
+        bidirectional: false,
+        nope: vec![false, false, true, false],
+    };
+    let s = Shape::new()
+        .num("heads", 24.0)
+        .num("kv_heads", 4.0)
+        .num("head_dim", 256.0)
+        .num("qkv_row", 14336.0)
+        .num("norm_eps", 1e-6)
+        .num("rotary_dim", 64.0)
+        .num("rope_theta", 10000000.0)
+        .num("rope_kind", 3.0)
+        .num("rope_factor", 16.0)
+        .num("rope_low", 1.0)
+        .num("rope_high", 4.0)
+        .num("rope_original", 8192.0)
+        .num("rope_mscale", 0.7)
+        .nums("rope_freq_factors", &[2.0, 3.0])
+        .nums("mrope_section", &[11.0, 11.0, 10.0])
+        .flag("mrope_interleaved", true)
+        .num("kv_layers", 16.0)        .num("kv_planes", 1.0)
+        .num("kv_f16_layers", 8.0)
+        .num("query_scale", 0.0625)
+        .num("softcap", 30.0)
+        .num("local_theta", 10000.0)
+        .flag("output_gate", true)
+        .flag("qk_norm", true)
+        .flag("kv_fp8", true)
+        .flag("bidirectional", false)
+        .flags("nope", &[false, false, true, false])
+        .flags("local_rope", &[false, true, false, false]);
+    (s, rust)
+}
+
+#[test]
+fn attention_descriptions_build_the_same_kernels_as_the_rust_builders() {
+    let (s, want_shape) = attention_shape();
+    for t in [Target::sm_120(), Target::sm_80()] {
+        let want = [
+            ("qk_norm_rope", Family::RopeKv),
+            ("kv_norm_rope", Family::RopeKv),
+            ("attention_split", Family::SplitDecode),
+            ("attention_reduce", Family::SplitDecode),
+            ("flash_attention", Family::FlashLegacy),
+            ("flash_mma", Family::FlashMma),
+            ("batch_decode_attention", Family::GroupedDecode),
+            ("batch_decode_combine", Family::GroupedDecode),
+        ];
+        assert_eq!(want.len(), ATTENTION.len());
+        for (name, family) in want {
+            let rust = kir::attention::AttentionKernel::new(&t, family, want_shape.clone()).unwrap();
+            let data = build_attention(name, &t, &s).unwrap();
+            assert_eq!(data, rust, "{name}");
+            assert_eq!(data.hash(), rust.hash(), "{name}");
+        }
+    }
+}
+
+#[test]
+fn attention_descriptions_refuse_bad_shapes_and_families() {
+    let (s, _) = attention_shape();
+    let e = Description::attention("attention_split").unwrap().build_attention(&Target::sm_120(), &Shape::new()).unwrap_err();
+    assert!(e.contains("which the model shape does not provide"), "{e}");
+    let mut bad = Description::attention("attention_split").unwrap();
+    bad.family = "mystery".into();
+    let e = bad.build_attention(&Target::sm_120(), &s).unwrap_err();
+    assert!(e.contains("unknown attention family"), "{e}");
+    let mut no_shape = Description::attention("attention_split").unwrap();
+    no_shape.shape = None;
+    let e = no_shape.build_attention(&Target::sm_120(), &s).unwrap_err();
+    assert!(e.contains("needs a [shape]"), "{e}");
+    let mut wrong = Description::attention("attention_split").unwrap();
+    wrong.shape.as_mut().unwrap().kv_planes = 3.into();
+    let e = wrong.build_attention(&Target::sm_120(), &s).unwrap_err();
+    assert!(e.contains("kv planes"), "{e}");
+    let mut staged = Description::attention("attention_split").unwrap();
+    staged.threads = kir::desc::Threads::Fixed(64);
+    let e = staged.build_attention(&Target::sm_120(), &s).unwrap_err();
+    assert!(e.contains("takes only [shape]"), "{e}");
+}
+
+#[test]
+fn attention_descriptions_resolve_every_shape_symbol_from_the_model_shape() {
+    let (s, want_shape) = attention_shape();
+    let d = Description::attention("batch_decode_attention").unwrap();
+    let k = d.build_attention(&Target::sm_120(), &s).unwrap();
+    assert_eq!(k.shape, want_shape);
+    assert!(k.shape.rope.mrope.as_ref().unwrap().interleaved);
+    assert_eq!(k.shape.rope.freq_factors, vec![2.0, 3.0]);
+    let missing = Shape::new();
+    let e = d.build_attention(&Target::sm_120(), &missing).unwrap_err();
+    assert!(e.contains("which the model shape does not provide"), "{e}");
 }

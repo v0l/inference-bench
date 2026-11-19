@@ -2,6 +2,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use kir as kir;
+
 pub const SPEC_FORMAT: u32 = 8;
 
 pub fn modelopt_verified() -> bool {
@@ -14,6 +16,7 @@ pub const EMBEDDED: &[(&str, &str)] = include!(concat!(env!("OUT_DIR"), "/embedd
 pub enum Checked {
     Ready(Box<Spec>),
     Family(String),
+    Kernel(String),
     NeedsNewer { name: String, min_engine: u32 },
 }
 
@@ -35,6 +38,10 @@ pub fn check(text: &str) -> Result<Checked> {
     if crate::family::is_family(&value) {
         let family: crate::family::Family = toml::from_str(text)?;
         return Ok(Checked::Family(family.name));
+    }
+    if kir::desc::KIND == value.get("kind").and_then(|k| k.as_str()).unwrap_or_default() {
+        let d: kir::desc::Description = toml::from_str(text).map_err(|e| anyhow::anyhow!("kernel description: {e}"))?;
+        return Ok(Checked::Kernel(d.name));
     }
     let spec: Spec = toml::from_str(text)?;
     spec.validate()?;
@@ -1119,6 +1126,7 @@ impl Spec {
         match check(text)? {
             Checked::Ready(spec) => Ok(*spec),
             Checked::Family(name) => bail!("{name} is a family spec, not a model spec"),
+            Checked::Kernel(name) => bail!("{name} is a kernel description, not a model spec"),
             Checked::NeedsNewer { name, min_engine } => bail!("spec {name} {}", needs_newer_note(min_engine)),
         }
     }
