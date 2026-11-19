@@ -1,0 +1,1 @@
+| granite | `granite-3.3-2b-base` | 17.4 | 2011.1 | 298.4 | llama.cpp/vllm | 39.9 | 11437.3 | 295.5 | 0.44 | 0.18 | 1.01 | 2026-11-19 | 0338df9 | `crates/specrt/scripts/perfpass.sh granite --model /home/kieran/ib-gates/803/models/granite-3.3-2b-base --host spark` |
