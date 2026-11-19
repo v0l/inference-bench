@@ -489,42 +489,68 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let sg = li / 32u;
     let sm = (sg / 2u) * 32u;
     let sn = (sg % 2u) * 32u;
-{acc_init}    var ents: array<u32, {pairs}>;
-    for (var n = 0u; n < {pairs}u; n++) {{
-        ents[n] = rows[min(r0 + (li + n * {COOP_THREADS}u) / (BK / 2u), nrows - 1u)];
+{acc_init}    var ents: array<u32, {quads}>;
+    for (var n = 0u; n < {quads}u; n++) {{
+        ents[n] = rows[min(r0 + (li + n * {COOP_THREADS}u) / (BK / 4u), nrows - 1u)];
     }}
+    let cols4 = cols / 4u;
     for (var k0 = 0u; k0 < cols; k0 += BK) {{
-        for (var n = 0u; n < {pairs}u; n++) {{
+        for (var n = 0u; n < {quads}u; n++) {{
             let idx = li + n * {COOP_THREADS}u;
-            let kp = idx % (BK / 2u);
-            let m = idx / (BK / 2u);
-            let c = k0 + kp * 2u;
+            let kq = idx % (BK / 4u);
+            let m = idx / (BK / 4u);
+            let c = k0 + kq * 4u;
             let t = t0 + m;
-            var x0 = 0.0;
-            var x1 = 0.0;
-            if (t < tokens && c < cols) {{
-                x0 = x[(x_row0 + t) * cols + c];
-                x1 = x[(x_row0 + t) * cols + c + 1u];
-            }}
-            sh[m * BK + kp * 2u] = x0;
-            sh[m * BK + kp * 2u + 1u] = x1;
+            var xv = vec4<f32>(0.0);
             var w0 = 0.0;
             var w1 = 0.0;
+            var w2 = 0.0;
+            var w3 = 0.0;
+            if (t < tokens && c < cols) {{
+                xv = x[(x_row0 + t) * cols4 + c / 4u];
+            }}
             if (c < cols) {{
                 let entry = ents[n];
                 let base = (entry >> 3u) * 16u;
                 let code = entry & 7u;
                 if (code == 4u) {{
-                    let w = wdata[(base + 2u * c) >> 2u];
-                    w0 = bitcast<f32>(w << 16u);
-                    w1 = bitcast<f32>(w & 0xffff0000u);
+                    let wa = wdata[(base + 2u * c) >> 2u];
+                    let wb = wdata[((base + 2u * c) >> 2u) + 1u];
+                    w0 = bitcast<f32>(wa << 16u);
+                    w1 = bitcast<f32>(wa & 0xffff0000u);
+                    w2 = bitcast<f32>(wb << 16u);
+                    w3 = bitcast<f32>(wb & 0xffff0000u);
+                }} else if (code == 0u) {{
+                    let sb = base + (c / 256u) * 144u;
+                    let i = c % 256u;
+                    let j = i / 64u;
+                    let hi = (i % 64u) >= 32u;
+                    let sm = scale_min_k4(2u * j + select(0u, 1u, hi), sb);
+                    let d1 = wf16(sb) * f32(sm.x);
+                    let mm = wf16(sb + 2u) * f32(sm.y);
+                    var q = wdata[(sb + 16u + 32u * j + (i % 32u)) >> 2u];
+                    if (hi) {{
+                        q = q >> 4u;
+                    }}
+                    w0 = d1 * f32(q & 0xfu) - mm;
+                    w1 = d1 * f32((q >> 8u) & 0xfu) - mm;
+                    w2 = d1 * f32((q >> 16u) & 0xfu) - mm;
+                    w3 = d1 * f32((q >> 24u) & 0xfu) - mm;
                 }} else {{
                     w0 = dequant_at(base, code, c);
                     w1 = dequant_at(base, code, c + 1u);
+                    w2 = dequant_at(base, code, c + 2u);
+                    w3 = dequant_at(base, code, c + 3u);
                 }}
             }}
-            sh[WOFF + m * BK + kp * 2u] = w0;
-            sh[WOFF + m * BK + kp * 2u + 1u] = w1;
+            sh[m * BK + kq * 4u] = xv.x;
+            sh[m * BK + kq * 4u + 1u] = xv.y;
+            sh[m * BK + kq * 4u + 2u] = xv.z;
+            sh[m * BK + kq * 4u + 3u] = xv.w;
+            sh[WOFF + m * BK + kq * 4u] = w0;
+            sh[WOFF + m * BK + kq * 4u + 1u] = w1;
+            sh[WOFF + m * BK + kq * 4u + 2u] = w2;
+            sh[WOFF + m * BK + kq * 4u + 3u] = w3;
         }}
         workgroupBarrier();
         for (var kk = 0u; kk < BK; kk += 8u) {{
@@ -548,10 +574,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     }}
 }}
 ",
-        bind = storage(&[("x", false, "f32"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
+        bind = storage(&[("x", false, "vec4<f32>"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
         woff = COOP_K * COOP_TOKENS,
         os = COOP_TOKENS * COOP_ROWS,
-        pairs = COOP_K * COOP_TOKENS / 2 / COOP_THREADS,
+        quads = COOP_K * COOP_TOKENS / 4 / COOP_THREADS,
         acc_init = (0..16).map(|n| format!("    var acc{n} = coop_mat8x8<f32, C>();\n")).collect::<String>(),
         mma = coop_mma(),
         store = (0..16).map(|n| format!("    coopStoreT(acc{n}, &sh[(sm + {}u) * BN + sn + {}u], BN);\n", (n / 4) * 8, (n % 4) * 8)).collect::<String>(),
@@ -583,6 +609,10 @@ pub fn emit_linear_sg_op(s: &crate::ops::WgslShape) -> String {
 fn linear_sg() -> String {
     format!(
         "{bind}
+fn xs(i: u32) -> f32 {{
+    return x[i >> 2u][i & 3u];
+}}
+
 @compute @workgroup_size({threads})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @builtin(subgroup_invocation_id) lane: u32) {{
     let nrows = p.a.x;
@@ -603,7 +633,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
         let b4 = base >> 2u;
         for (var q = lane; q < cols / 2u; q += 32u) {{
             let w = wdata[b4 + q];
-            acc += bitcast<f32>(w << 16u) * x[xo + 2u * q] + bitcast<f32>(w & 0xffff0000u) * x[xo + 2u * q + 1u];
+            acc += bitcast<f32>(w << 16u) * xs(xo + 2u * q) + bitcast<f32>(w & 0xffff0000u) * xs(xo + 2u * q + 1u);
         }}
     }} else if (code == 0u) {{
         let j = lane / 8u;
@@ -615,47 +645,35 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
             let s0 = scale_min_k4(2u * j, b);
             let s1 = scale_min_k4(2u * j + 1u, b);
             let q = wdata[(b + 16u + 32u * j + l4) >> 2u];
-            let xb = xo + sb * 256u + j * 64u + l4;
-            var lo = 0.0;
-            var hi = 0.0;
-            var xl = 0.0;
-            var xh = 0.0;
-            for (var i = 0u; i < 4u; i++) {{
-                let byte = (q >> (8u * i)) & 0xffu;
-                lo += f32(byte & 0xfu) * x[xb + i];
-                hi += f32(byte >> 4u) * x[xb + 32u + i];
-                xl += x[xb + i];
-                xh += x[xb + 32u + i];
-            }}
+            let xb = (xo + sb * 256u + j * 64u + l4) / 4u;
+            let xa = x[xb];
+            let xc = x[xb + 8u];
+            let qa = vec4<f32>(vec4<u32>(q & 0xfu, (q >> 8u) & 0xfu, (q >> 16u) & 0xfu, (q >> 24u) & 0xfu));
+            let qb = vec4<f32>(vec4<u32>((q >> 4u) & 0xfu, (q >> 12u) & 0xfu, (q >> 20u) & 0xfu, (q >> 28u) & 0xfu));
+            let lo = dot(qa, xa);
+            let hi = dot(qb, xc);
+            let xl = xa.x + xa.y + xa.z + xa.w;
+            let xh = xc.x + xc.y + xc.z + xc.w;
             acc += d * (f32(s0.x) * lo + f32(s1.x) * hi) - dmin * (f32(s0.y) * xl + f32(s1.y) * xh);
         }}
     }} else if (code == 2u) {{
-        let hr = lane / 16u;
-        let l0 = (lane % 16u) * 2u;
-        let isc = l0 / 16u;
-        for (var sb = 0u; sb < cols / 256u; sb++) {{
+        let hr = (lane / 8u) % 2u;
+        let l = (lane % 8u) * 4u;
+        let isc = l / 16u;
+        for (var sb = lane / 16u; sb < cols / 256u; sb += 2u) {{
             let b = base + sb * 224u;
             let d = wf16(b + 208u);
-            let ql = b + 64u * hr + l0;
-            let qh = b + 128u + 32u * hr + l0;
+            let ql0 = wdata[(b + 64u * hr + l) >> 2u];
+            let ql1 = wdata[(b + 64u * hr + l + 32u) >> 2u];
+            let qh = wdata[(b + 128u + 32u * hr + l) >> 2u];
             let sc = b + 192u + 8u * hr + isc;
-            let xb = xo + sb * 256u + hr * 128u + l0;
-            let h0 = wbyte(qh);
-            let h1 = wbyte(qh + 1u);
+            let xb = (xo + sb * 256u + hr * 128u + l) / 4u;
             var part = 0.0;
-            for (var sg4 = 0u; sg4 < 4u; sg4++) {{
-                let o = (sg4 & 1u) * 32u;
-                let b0 = wbyte(ql + o);
-                let b1 = wbyte(ql + o + 1u);
-                var n0 = b0 & 0xfu;
-                var n1 = b1 & 0xfu;
-                if (sg4 >= 2u) {{
-                    n0 = b0 >> 4u;
-                    n1 = b1 >> 4u;
-                }}
-                let q0 = i32(n0 | (((h0 >> (2u * sg4)) & 3u) << 4u)) - 32;
-                let q1 = i32(n1 | (((h1 >> (2u * sg4)) & 3u) << 4u)) - 32;
-                part += wi8(sc + 2u * sg4) * (f32(q0) * x[xb + sg4 * 32u] + f32(q1) * x[xb + sg4 * 32u + 1u]);
+            for (var seg = 0u; seg < 4u; seg++) {{
+                let qw = select(ql0, ql1, (seg & 1u) == 1u) >> (4u * (seg >> 1u));
+                let v = (qw & 0x0f0f0f0fu) | (((qh >> (2u * seg)) & 0x03030303u) << 4u);
+                let f = vec4<f32>(vec4<u32>(v & 0xffu, (v >> 8u) & 0xffu, (v >> 16u) & 0xffu, v >> 24u)) - vec4<f32>(32.0);
+                part += wi8(sc + 2u * seg) * dot(f, x[xb + seg * 8u]);
             }}
             acc += d * part;
         }}
@@ -668,7 +686,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
             let xb = xo + sb * 256u + blk * 32u + off;
             var part = 0.0;
             for (var i = 0u; i < 8u; i++) {{
-                part += wi8(b + 2u + off + i) * x[xb + i];
+                part += wi8(b + 2u + off + i) * xs(xb + i);
             }}
             acc += d * part;
         }}
@@ -678,7 +696,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
             for (var i = 0u; i < {SG_LANE_ELEMS}u; i++) {{
                 let e = e0 + i;
                 if (e < cols) {{
-                    acc += dequant_at(base, code, e) * x[xo + e];
+                    acc += dequant_at(base, code, e) * xs(xo + e);
                 }}
             }}
         }}
@@ -694,7 +712,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
     }}
 }}
 ",
-        bind = storage(&[("x", false, "f32"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
+        bind = storage(&[("x", false, "vec4<f32>"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
         threads = 32 * SG_ROWS,
         span = 32 * SG_LANE_ELEMS,
     )
@@ -884,8 +902,9 @@ pub fn emit_flash_op(s: &crate::ops::WgslShape) -> String {
 fn flash() -> String {
     format!(
         "{bind}
-const EPL: u32 = (HEAD_DIM + 31u) / 32u;
-var<workgroup> qs: array<f32, {qs}>;
+const HD4: u32 = HEAD_DIM / 4u;
+const EPL: u32 = (HD4 + 31u) / 32u;
+var<workgroup> qs: array<vec4<f32>, {qs}>;
 
 @compute @workgroup_size({threads})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
@@ -899,23 +918,24 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let len = p.a.x + tt + 1u;
     let head_base = kvh * MAX_CTX * HEAD_DIM;
     let scale = inverseSqrt(f32(HEAD_DIM));
-    for (var d = lane; d < HEAD_DIM; d += 32u) {{
-        qs[g * HEAD_DIM + d] = qkv[tt * QKV_ROW + head * HEAD_DIM + d] * scale;
+    for (var d = lane; d < HD4; d += 32u) {{
+        let qb = tt * QKV_ROW + head * HEAD_DIM + d * 4u;
+        qs[g * HD4 + d] = vec4<f32>(qkv[qb], qkv[qb + 1u], qkv[qb + 2u], qkv[qb + 3u]) * scale;
     }}
     workgroupBarrier();
-    var acc: array<f32, EPL>;
+    var acc: array<vec4<f32>, EPL>;
     var m = NEG_INF;
     var l = 0.0;
     for (var key0 = 0u; key0 < len; key0 += 32u) {{
         let key = key0 + lane;
         var s = NEG_INF;
         if (key < len) {{
-            let kb = head_base + key * HEAD_DIM;
-            var dot = 0.0;
-            for (var d = 0u; d < HEAD_DIM; d++) {{
-                dot += qs[g * HEAD_DIM + d] * k_cache[kb + d];
+            let kb = (head_base + key * HEAD_DIM) / 4u;
+            var dot = vec4<f32>(0.0);
+            for (var d = 0u; d < HD4; d++) {{
+                dot += qs[g * HD4 + d] * k_cache[kb + d];
             }}
-            s = dot;
+            s = dot.x + dot.y + dot.z + dot.w;
         }}
         let m_new = max(m, subgroupMax(s));
         let corr = exp(m - m_new);
@@ -927,10 +947,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         let n = min(32u, len - key0);
         for (var j = 0u; j < n; j++) {{
             let pj = subgroupShuffle(pr, j);
-            let vb = head_base + (key0 + j) * HEAD_DIM;
+            let vb = (head_base + (key0 + j) * HEAD_DIM) / 4u;
             for (var i = 0u; i < EPL; i++) {{
                 let d = lane + 32u * i;
-                if (d < HEAD_DIM) {{
+                if (d < HD4) {{
                     acc[i] += pj * v_cache[vb + d];
                 }}
             }}
@@ -941,16 +961,124 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         let ob = t * HEADS * HEAD_DIM + head * HEAD_DIM;
         for (var i = 0u; i < EPL; i++) {{
             let d = lane + 32u * i;
-            if (d < HEAD_DIM) {{
-                out[ob + d] = acc[i] / l;
+            if (d < HD4) {{
+                let o = acc[i] / l;
+                out[ob + d * 4u] = o.x;
+                out[ob + d * 4u + 1u] = o.y;
+                out[ob + d * 4u + 2u] = o.z;
+                out[ob + d * 4u + 3u] = o.w;
             }}
         }}
     }}
 }}
 ",
-        bind = storage(&[("qkv", false, "f32"), ("k_cache", false, "f32"), ("v_cache", false, "f32"), ("out", true, "f32")]),
+        bind = storage(&[("qkv", false, "f32"), ("k_cache", false, "vec4<f32>"), ("v_cache", false, "vec4<f32>"), ("out", true, "f32")]),
         threads = 32 * FLASH_GROUPS,
-        qs = FLASH_GROUPS * 256,
+        qs = FLASH_GROUPS * 64,
+    )
+}
+
+pub const DECODE_GROUPS: u32 = 8;
+
+pub fn emit_flash_decode_op(s: &crate::ops::WgslShape) -> String {
+    let mut out = ops_header(s);
+    out.push_str(&flash_decode());
+    out
+}
+
+fn flash_decode() -> String {
+    format!(
+        "{bind}
+const HD4: u32 = HEAD_DIM / 4u;
+const HPL: u32 = HD4 / 4u;
+const NSG: u32 = {DECODE_GROUPS}u;
+var<workgroup> sm_m: array<f32, NSG>;
+var<workgroup> sm_l: array<f32, NSG>;
+var<workgroup> sm_acc: array<f32, {acc}>;
+
+@compute @workgroup_size({threads})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let head = wid.x;
+    let g = li / 32u;
+    let lane = li % 32u;
+    let slot = lane / 4u;
+    let part = lane % 4u;
+    let kvh = head / GROUP;
+    let len = p.a.x + 1u;
+    let head_base4 = kvh * MAX_CTX * HD4;
+    let scale = inverseSqrt(f32(HEAD_DIM));
+    var q: array<vec4<f32>, HPL>;
+    for (var i = 0u; i < HPL; i++) {{
+        let qb = head * HEAD_DIM + (part * HPL + i) * 4u;
+        q[i] = vec4<f32>(qkv[qb], qkv[qb + 1u], qkv[qb + 2u], qkv[qb + 3u]) * scale;
+    }}
+    var acc: array<vec4<f32>, HPL>;
+    var m = NEG_INF;
+    var l = 0.0;
+    for (var key0 = g * 8u; key0 < len; key0 += NSG * 8u) {{
+        let key = key0 + slot;
+        let live = key < len;
+        let kb = head_base4 + select(0u, key, live) * HD4 + part * HPL;
+        var dots = vec4<f32>(0.0);
+        for (var i = 0u; i < HPL; i++) {{
+            dots += q[i] * k_cache[kb + i];
+        }}
+        var s = dots.x + dots.y + dots.z + dots.w;
+        s += subgroupShuffleXor(s, 1u);
+        s += subgroupShuffleXor(s, 2u);
+        if (!live) {{
+            s = NEG_INF;
+        }}
+        let m_new = max(m, subgroupMax(s));
+        let corr = exp(m - m_new);
+        let pr = select(0.0, exp(s - m_new), live);
+        l = l * corr + pr;
+        for (var i = 0u; i < HPL; i++) {{
+            acc[i] = acc[i] * corr + pr * v_cache[kb + i];
+        }}
+        m = m_new;
+    }}
+    for (var i = 0u; i < HPL; i++) {{
+        var a = acc[i];
+        a += subgroupShuffleXor(a, 4u);
+        a += subgroupShuffleXor(a, 8u);
+        a += subgroupShuffleXor(a, 16u);
+        acc[i] = a;
+    }}
+    let l_total = subgroupAdd(l) * 0.25;
+    if (slot == 0u) {{
+        for (var i = 0u; i < HPL; i++) {{
+            let o = g * HEAD_DIM + (part * HPL + i) * 4u;
+            sm_acc[o] = acc[i].x;
+            sm_acc[o + 1u] = acc[i].y;
+            sm_acc[o + 2u] = acc[i].z;
+            sm_acc[o + 3u] = acc[i].w;
+        }}
+    }}
+    if (lane == 0u) {{
+        sm_m[g] = m;
+        sm_l[g] = l_total;
+    }}
+    workgroupBarrier();
+    if (li < HEAD_DIM) {{
+        var big = NEG_INF;
+        for (var j = 0u; j < NSG; j++) {{
+            big = max(big, sm_m[j]);
+        }}
+        var num = 0.0;
+        var den = 0.0;
+        for (var j = 0u; j < NSG; j++) {{
+            let w = exp(sm_m[j] - big);
+            num += w * sm_acc[j * HEAD_DIM + li];
+            den += w * sm_l[j];
+        }}
+        out[head * HEAD_DIM + li] = num / den;
+    }}
+}}
+",
+        bind = storage(&[("qkv", false, "f32"), ("k_cache", false, "vec4<f32>"), ("v_cache", false, "vec4<f32>"), ("out", true, "f32")]),
+        threads = 32 * DECODE_GROUPS,
+        acc = DECODE_GROUPS * 256,
     )
 }
 
