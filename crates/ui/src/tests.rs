@@ -1,6 +1,8 @@
 use super::*;
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
+use inference_bench_core::chat::{ChatRequest, Message, Role, Sampling};
+use inference_bench_core::engine::ChatEvent;
 use inference_bench_core::fake::{FakeServer, Script, ScriptedModel};
 use inference_bench_core::library::{Format, Support};
 
@@ -2833,4 +2835,58 @@ fn the_chat_follows_the_model_picked_among_the_loaded() {
     h.run();
     assert_eq!(h.state().loaded().unwrap().display, "Other-1B");
     assert_eq!(h.state().chat.agent.chat.config.model, "Other-1B");
+}
+
+fn strip_requests(h: &Harness<'static, App>) -> u64 {
+    crate::serving::snapshot(h.state(), h.state().server.span).reading.map_or(0, |r| r.requests)
+}
+
+fn pick_in_bar(h: &mut Harness<'static, App>, display: &str) {
+    h.get_all_by_label(display).next().unwrap().click();
+    h.run();
+}
+
+#[test]
+fn the_stats_strip_follows_the_model_picked_in_the_bar_and_names_it() {
+    let mut h = harness("strip-per-model", Tab::Server);
+    load_both(&mut h);
+    let handle = h.state().engine.handle();
+    for _ in 0..2 {
+        let rx = handle.chat_on(Some("Qwen3-0.6B"), ChatRequest::new(vec![Message::new(Role::User, "hi")], Sampling::default()));
+        while !matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), ChatEvent::Done(_) | ChatEvent::Failed(_)) {}
+    }
+    let rx = handle.chat_on(Some("Other-1B"), ChatRequest::new(vec![Message::new(Role::User, "hi")], Sampling::default()));
+    while !matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), ChatEvent::Done(_) | ChatEvent::Failed(_)) {}
+    h.state_mut().server.running = None;
+    pump_until(&mut h, 10, "samples", |a| {
+        let seen = |m: &str| a.engine.handle().history_of(Some(m)).lock().unwrap().latest().map_or(0, |r| r.requests);
+        seen("Qwen3-0.6B") == 2 && seen("Other-1B") == 1
+    });
+    h.state_mut().chat_model = Some("Qwen3-0.6B".into());
+    h.run();
+    h.get_by_label_contains("stats for Qwen3-0.6B");
+    assert!(h.query_all_by_label_contains("stats for Other-1B").next().is_none());
+    assert_eq!(strip_requests(&h), 2);
+    pick_in_bar(&mut h, "Other-1B");
+    h.get_by_label_contains("stats for Other-1B");
+    assert!(h.query_all_by_label_contains("stats for Qwen3-0.6B").next().is_none());
+    assert_eq!(strip_requests(&h), 1);
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=docs/gui"]
+fn screenshot_of_the_server_tab_with_two_models_loaded() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness_sized("shot-two-models", Tab::Server, 1300.0);
+    load_both(&mut h);
+    let handle = h.state().engine.handle();
+    for m in ["Qwen3-0.6B", "Other-1B"] {
+        let rx = handle.chat_on(Some(m), ChatRequest::new(vec![Message::new(Role::User, "hi")], Sampling::default()));
+        while !matches!(rx.recv_timeout(Duration::from_secs(10)).unwrap(), ChatEvent::Done(_) | ChatEvent::Failed(_)) {}
+    }
+    h.state_mut().chat_model = Some("Qwen3-0.6B".into());
+    pump_until(&mut h, 10, "samples", |a| a.engine.handle().history_of(Some("Other-1B")).lock().unwrap().latest().is_some_and(|r| r.requests == 1));
+    h.run();
+    h.render().unwrap().save(out.join("server-two-models.png")).unwrap();
 }

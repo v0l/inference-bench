@@ -22,6 +22,20 @@ pub fn specrt_serving_factory() -> ServingFactory {
 
 type StatsSource = Arc<Mutex<Vec<(String, Box<dyn Target>)>>>;
 type LoadedList = Arc<Mutex<Vec<Loaded>>>;
+type LiveList = Arc<Mutex<Vec<Live>>>;
+
+#[derive(Clone)]
+pub struct Live {
+    pub model_id: String,
+    pub meter: Arc<Meter>,
+    pub history: Arc<Mutex<History>>,
+}
+
+impl Live {
+    fn new(model_id: &str) -> Self {
+        Self { model_id: model_id.to_string(), meter: Arc::default(), history: Arc::new(Mutex::new(History::new(HISTORY_SAMPLES))) }
+    }
+}
 
 pub const DEFAULT_MAX_LOADED: usize = 1;
 
@@ -56,7 +70,7 @@ pub enum Command {
     Unload { model: Option<String> },
     Suspend { model: Option<String>, done: Sender<bool> },
     Resume { model: Option<String>, done: Sender<Result<(), BackendError>> },
-    Chat { model: Option<String>, request: ChatRequest, events: Sender<ChatEvent>, queued: Instant },
+    Chat { model: Option<String>, request: ChatRequest, events: Sender<ChatEvent>, queued: Instant, meter: Arc<Meter> },
     Shutdown,
 }
 
@@ -83,9 +97,9 @@ pub struct Engine {
     pub events: Receiver<EngineEvent>,
     loaded: LoadedList,
     suspended: LoadedList,
-    meter: Arc<Meter>,
+    lives: LiveList,
+    idle: Live,
     stats: StatsSource,
-    history: Arc<Mutex<History>>,
     watching: Arc<AtomicBool>,
     stop_sampler: Arc<AtomicBool>,
     max_loaded: Arc<AtomicUsize>,
@@ -96,9 +110,9 @@ pub struct Handle {
     commands: Sender<Command>,
     loaded: LoadedList,
     suspended: LoadedList,
-    meter: Arc<Meter>,
+    lives: LiveList,
+    idle: Live,
     stats: StatsSource,
-    history: Arc<Mutex<History>>,
     watching: Arc<AtomicBool>,
 }
 
@@ -160,9 +174,10 @@ impl Handle {
 
     pub fn chat_on(&self, model: Option<&str>, request: ChatRequest) -> Receiver<ChatEvent> {
         let (tx, rx) = channel();
-        let queued = self.meter.submitted();
-        if self.commands.send(Command::Chat { model: model.map(str::to_string), request, events: tx.clone(), queued }).is_err() {
-            self.meter.withdrawn();
+        let meter = self.live_of(model).map_or_else(|| self.idle.meter.clone(), |l| l.meter);
+        let queued = meter.submitted();
+        if self.commands.send(Command::Chat { model: model.map(str::to_string), request, events: tx.clone(), queued, meter: meter.clone() }).is_err() {
+            meter.withdrawn();
             let _ = tx.send(ChatEvent::Failed(BackendError::failed("the engine has stopped")));
         }
         rx
@@ -209,17 +224,47 @@ impl Handle {
         self.with_target(Some(model), |t| t.failure())
     }
 
+    pub fn live_of(&self, model: Option<&str>) -> Option<Live> {
+        let id = match model {
+            Some(name) => self.loaded_named(name)?.model_id,
+            None => self.loaded()?.model_id,
+        };
+        self.lives.lock().unwrap().iter().find(|l| l.model_id == id).cloned()
+    }
+
     pub fn reading(&self) -> Reading {
-        let max = self.loaded().map_or(1, |l| l.max_num_seqs);
-        self.meter.read(max, self.serving_stats())
+        self.reading_of(None)
+    }
+
+    pub fn reading_of(&self, model: Option<&str>) -> Reading {
+        let loaded = match model {
+            Some(name) => self.loaded_named(name),
+            None => self.loaded(),
+        };
+        let max = loaded.as_ref().map_or(1, |l| l.max_num_seqs);
+        let meter = self.live_of(model).map_or_else(|| self.idle.meter.clone(), |l| l.meter);
+        let stats = loaded.and_then(|l| self.serving_stats_of(&l.model_id));
+        meter.read(max, stats)
     }
 
     pub fn recent_requests(&self) -> Vec<RequestRecord> {
-        self.meter.recent()
+        self.recent_requests_of(None)
+    }
+
+    pub fn recent_requests_of(&self, model: Option<&str>) -> Vec<RequestRecord> {
+        self.live_of(model).map_or_else(Vec::new, |l| l.meter.recent())
     }
 
     pub fn history(&self) -> Arc<Mutex<History>> {
-        self.history.clone()
+        self.history_of(None)
+    }
+
+    pub fn history_of(&self, model: Option<&str>) -> Arc<Mutex<History>> {
+        self.live_of(model).map_or_else(|| self.idle.history.clone(), |l| l.history)
+    }
+
+    pub fn sessions_of(&self, model: &str) -> Option<Arc<specrt::sessions::Shared>> {
+        self.with_target(Some(model), |t| t.sessions())
     }
 
     pub fn watch(&self, on: bool) {
@@ -241,14 +286,14 @@ impl Engine {
         let (events_tx, events) = channel();
         let loaded: LoadedList = Arc::default();
         let suspended: LoadedList = Arc::default();
-        let meter = Arc::new(Meter::default());
+        let lives: LiveList = Arc::default();
+        let idle = Live::new("");
         let stats: StatsSource = Arc::default();
         let max_loaded = Arc::new(AtomicUsize::new(DEFAULT_MAX_LOADED));
-        let history = Arc::new(Mutex::new(History::new(HISTORY_SAMPLES)));
         let watching = Arc::new(AtomicBool::new(false));
         let stop_sampler = Arc::new(AtomicBool::new(false));
-        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), meter: meter.clone(), stats: stats.clone(), history: history.clone(), max_loaded: max_loaded.clone() };
-        let this = Self { commands, events, loaded, suspended, meter, stats, history, watching, stop_sampler, max_loaded };
+        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), lives: lives.clone(), stats: stats.clone(), max_loaded: max_loaded.clone() };
+        let this = Self { commands, events, loaded, suspended, lives, idle, stats, watching, stop_sampler, max_loaded };
         let handle = this.handle();
         let (stop, wake_sampler) = (this.stop_sampler.clone(), wake.clone());
         std::thread::spawn(move || run(inbox, events_tx, shared, wake, factory, serving));
@@ -261,9 +306,9 @@ impl Engine {
             commands: self.commands.clone(),
             loaded: self.loaded.clone(),
             suspended: self.suspended.clone(),
-            meter: self.meter.clone(),
+            lives: self.lives.clone(),
+            idle: self.idle.clone(),
             stats: self.stats.clone(),
-            history: self.history.clone(),
             watching: self.watching.clone(),
         }
     }
@@ -319,9 +364,8 @@ impl Drop for Engine {
 struct Shared {
     loaded: LoadedList,
     suspended: LoadedList,
-    meter: Arc<Meter>,
+    lives: LiveList,
     stats: StatsSource,
-    history: Arc<Mutex<History>>,
     max_loaded: Arc<AtomicUsize>,
 }
 
@@ -337,12 +381,16 @@ fn sample(handle: Handle, stop: Arc<AtomicBool>, wake: Wake) {
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(slice);
         since += slice;
-        let baseline = handle.loaded().is_some() && handle.history.lock().unwrap().is_empty();
-        if since < SAMPLE_EVERY && !baseline {
+        let lives: Vec<Live> = handle.lives.lock().unwrap().clone();
+        let fresh = lives.iter().any(|l| l.history.lock().unwrap().is_empty());
+        if since < SAMPLE_EVERY && !fresh {
             continue;
         }
         since = Duration::ZERO;
-        handle.history.lock().unwrap().push(Instant::now(), handle.reading());
+        for live in &lives {
+            let reading = handle.reading_of(Some(&live.model_id));
+            live.history.lock().unwrap().push(Instant::now(), reading);
+        }
         if handle.watching.load(Ordering::Relaxed) {
             wake();
         }
@@ -452,13 +500,11 @@ fn slot_index(slots: &[Slot], model: Option<&str>) -> Option<usize> {
 fn publish(shared: &Shared, slots: &[Slot], parked: &[Parked]) {
     *shared.loaded.lock().unwrap() = slots.iter().map(|s| s.info.clone()).collect();
     *shared.suspended.lock().unwrap() = parked.iter().map(|p| p.info.clone()).collect();
-    if slots.is_empty() {
-        shared.history.lock().unwrap().clear();
-    }
 }
 
 fn drop_stats(shared: &Shared, model_id: &str) {
     shared.stats.lock().unwrap().retain(|(id, _)| id != model_id);
+    shared.lives.lock().unwrap().retain(|l| l.model_id != model_id);
 }
 
 fn run(
@@ -611,8 +657,9 @@ fn run(
                             vram_bytes,
                         };
                         if let Some(share) = o.share {
-                            shared.stats.lock().unwrap().push((model_id, share));
+                            shared.stats.lock().unwrap().push((model_id.clone(), share));
                         }
+                        shared.lives.lock().unwrap().push(Live::new(&model_id));
                         slots.push(Slot { info: info.clone(), backend: o.backend, reload });
                         publish(&shared, &slots, &parked);
                         if let Some(done) = resume_reply.take() {
@@ -623,7 +670,7 @@ fn run(
                     Err(e) => reply_failure(e, &mut resume_reply),
                 }
             }
-            Command::Chat { model, mut request, events: out, queued } => {
+            Command::Chat { model, mut request, events: out, queued, meter } => {
                 let send = {
                     let wake = wake.clone();
                     move |out: &Sender<ChatEvent>, e: ChatEvent| {
@@ -632,7 +679,7 @@ fn run(
                     }
                 };
                 let Some(at) = slot_index(&slots, model.as_deref()) else {
-                    shared.meter.withdrawn();
+                    meter.withdrawn();
                     let message = match &model {
                         Some(name) => format!("model {name} is not loaded"),
                         None => "no model is loaded".to_string(),
@@ -642,7 +689,7 @@ fn run(
                 };
                 match &mut slots[at].backend {
                     Backend::Single(b) => {
-                        let mut tracked = shared.meter.begin(queued);
+                        let mut tracked = meter.begin(queued);
                         let result = b.chat(&request, &mut |t| {
                             tracked.piece();
                             send(&out, ChatEvent::Text(t.to_string()));
@@ -660,19 +707,19 @@ fn run(
                     }
                     Backend::Batched { target, running } => {
                         if let Some(reason) = target.failure() {
-                            shared.meter.withdrawn();
+                            meter.withdrawn();
                             send(&out, ChatEvent::Failed(BackendError::new(ErrorKind::Unavailable, format!("the model failed: {reason}. Load it again from the model bar"))));
                             continue;
                         }
                         running.retain(|r| !r.thread.is_finished());
                         let Some(mut shared_target) = target.share() else {
-                            shared.meter.withdrawn();
+                            meter.withdrawn();
                             send(&out, ChatEvent::Failed(BackendError::failed("the batched engine has stopped")));
                             continue;
                         };
                         let cancel = request.cancel.clone().unwrap_or_default();
                         request.cancel = Some(cancel.clone());
-                        let mut tracked = shared.meter.begin(queued);
+                        let mut tracked = meter.begin(queued);
                         let send = send.clone();
                         let thread = std::thread::spawn(move || {
                             let result = shared_target.chat(&request, &mut |t| {
@@ -700,6 +747,7 @@ fn run(
         s.backend.stop();
     }
     shared.stats.lock().unwrap().clear();
+    shared.lives.lock().unwrap().clear();
     publish(&shared, &[], &[]);
 }
 
@@ -1092,5 +1140,27 @@ mod tests {
         h.resume_model(Some("A")).unwrap();
         assert_eq!(h.loaded_all().len(), 2);
         assert!(h.suspended_all().is_empty());
+    }
+
+    #[test]
+    fn each_loaded_model_keeps_its_own_request_counts_and_history() {
+        let e = two_models();
+        e.send(alongside("a", "A"));
+        loaded_ok(&e);
+        e.send(alongside("b", "B"));
+        loaded_ok(&e);
+        let h = e.handle();
+        ask_model(&h, "A").unwrap();
+        ask_model(&h, "A").unwrap();
+        ask_model(&h, "B").unwrap();
+        assert_eq!(h.recent_requests_of(Some("A")).len(), 2);
+        assert_eq!(h.recent_requests_of(Some("B")).len(), 1);
+        assert_eq!(h.reading_of(Some("A")).requests, 2);
+        assert_eq!(h.reading_of(Some("B")).requests, 1);
+        assert!(!Arc::ptr_eq(&h.history_of(Some("A")), &h.history_of(Some("B"))));
+        e.send(Command::Unload { model: Some("A".into()) });
+        assert_eq!(wait_event(&e), EngineEvent::Unloaded);
+        assert!(h.recent_requests_of(Some("A")).is_empty());
+        assert_eq!(h.recent_requests_of(Some("B")).len(), 1);
     }
 }

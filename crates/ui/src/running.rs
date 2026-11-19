@@ -35,8 +35,9 @@ pub fn parser_rows(loaded: &Loaded) -> Vec<(String, String)> {
     vec![("tool parser".to_string(), tools), ("reasoning parser".to_string(), reasoning)]
 }
 
-pub fn draw(ui: &mut egui::Ui, loaded: &Loaded) {
-    section(ui, "running options", "what the loaded model is using now", |ui| {
+pub fn draw(ui: &mut egui::Ui, loaded: &Loaded, several: bool) {
+    let sub = if several { format!("what {} is using now", loaded.display) } else { "what the loaded model is using now".to_string() };
+    section(ui, "running options", &sub, |ui| {
         let mut rows = rows(loaded);
         let defaults_only = rows.len() <= 4 && loaded.parallel_note.is_none();
         rows.extend(parser_rows(loaded));

@@ -92,7 +92,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mu
                 chip(ui, &l.display, READOUT, true);
                 chip(ui, &format!("{} ctx", l.ctx), READOUT, false);
                 for other in app.loaded_all().into_iter().filter(|o| o.display != l.display) {
-                    if ui.add(Key::new(other.display.clone()).outline(VALUE).id_salt(("switch", other.model_id.clone()))).clicked() {
+                    let key = ui.add(Key::new(other.display.clone()).outline(VALUE).id_salt(("switch", other.model_id.clone())));
+                    let key = key.on_hover_text(format!("chat with {} and show its stats", other.display));
+                    if key.clicked() {
                         app.chat_model = Some(other.display);
                     }
                 }

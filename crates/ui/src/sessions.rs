@@ -39,7 +39,7 @@ pub fn size(bytes: u64) -> String {
 }
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
-    let Some(shared) = app.engine.handle().sessions() else { return };
+    let Some(shared) = app.loaded().and_then(|l| app.engine.handle().sessions_of(&l.display)) else { return };
     let list = rows(&shared, now_seconds());
     let stats = shared.stats();
     section(ui, "sessions", "idle conversations saved to disk, restored by the next request that continues them", |ui| {

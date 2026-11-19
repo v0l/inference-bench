@@ -144,6 +144,10 @@ pub fn request_lines(logs: &LogBuffer) -> Vec<RequestLine> {
         .collect()
 }
 
+fn served_names(app: &App) -> String {
+    app.loaded_all().into_iter().map(|l| l.display).collect::<Vec<_>>().join(", ")
+}
+
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     app.server.refresh_placement(&app.dir.clone());
     page(ui, "server", |ui| {
@@ -169,7 +173,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         ui.horizontal(|ui| {
                             let line = Line::new().legend("address").measured(base.clone());
                             let line = match l {
-                                Some(l) => line.gap(14.0).legend("model").value(l.display.clone()),
+                                Some(_) => line.gap(14.0).legend("model").value(served_names(app)),
                                 None => line.gap(14.0).note("nothing loaded: select a model in the bar above"),
                             };
                             ui.allocate_ui(egui::vec2((ui.available_width() - 90.0).max(120.0), 0.0), |ui| {
@@ -183,7 +187,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     (None, l) => {
                         Line::new().legend("address").note("not listening").show(ui);
                         match l {
-                            Some(l) => Line::new().legend("serving").value(l.display.clone()).show(ui),
+                            Some(_) => Line::new().legend("serving").value(served_names(app)).show(ui),
                             None => Line::new().legend("serving").note("nothing loaded: select a model in the bar above").show(ui),
                         };
                     }
@@ -206,7 +210,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 if let Some(e) = &app.server.error {
                     status(ui, false, e);
                 }
-                if let Some(f) = app.engine.handle().failure() {
+                if let Some(f) = loaded.as_ref().and_then(|l| app.engine.handle().failure_of(&l.display)) {
                     status(ui, false, &format!("model failed: {f}. Load it again from the model bar"));
                 }
             },
@@ -239,7 +243,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
         crate::loadedlist::draw(app, ui);
         if let Some(l) = &loaded {
-            crate::running::draw(ui, l);
+            crate::running::draw(ui, l, app.loaded_all().len() > 1);
         }
         crate::hardware::pipeline_section(app, ui);
         crate::serving::draw(app, ui);

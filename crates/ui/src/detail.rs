@@ -322,7 +322,7 @@ fn body(detail: &mut Detail, library: &[LocalModel], ui: &mut egui::Ui, free: Op
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
         if let Some(l) = running {
-            crate::running::draw(ui, l);
+            crate::running::draw(ui, l, false);
         }
         tree_section(detail, library, ui, act);
         content(detail, ui, free);

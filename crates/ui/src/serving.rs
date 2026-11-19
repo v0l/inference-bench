@@ -35,7 +35,8 @@ pub struct Snapshot {
 
 pub fn snapshot(app: &App, span: Span) -> Snapshot {
     let handle = app.engine.handle();
-    let history = handle.history();
+    let model = app.loaded().map(|l| l.display);
+    let history = handle.history_of(model.as_deref());
     let h = history.lock().unwrap();
     let take = span.samples();
     let ms = |f: fn(&Point) -> f64| move |p: &Point| f(p) * 1000.0;
@@ -53,7 +54,7 @@ pub fn snapshot(app: &App, span: Span) -> Snapshot {
         kv: h.series(take, |p| p.kv_used_bytes / (1u64 << 30) as f64),
         recent: {
             drop(h);
-            handle.recent_requests()
+            handle.recent_requests_of(model.as_deref())
         },
     }
 }
@@ -192,9 +193,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         None if loaded.max_num_seqs > 1 => format!("{} requests at once, chat and API clients share the engine", loaded.max_num_seqs),
         None => "one request at a time: raise parallel requests in the load dialog".to_string(),
     };
+    let several = app.loaded_all().len() > 1;
     section(ui, "serving", &note_text, |ui| match &snap.reading {
         None => note(ui, "waiting for the first sample", LEGEND),
         Some(r) => {
+            if several {
+                let label = format!("stats for {}", loaded.display);
+                let line = Line::new().legend("showing").column(ui, 120.0).value(loaded.display.clone()).show(ui);
+                line.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
+            }
             readouts(ui, &readings(r, snap.per_minute));
             segments(ui, &mut span, &[(Span::Five, "last 5 minutes", None), (Span::Fifteen, "last 15 minutes", None)]);
             charts(ui, &snap, r.max_seqs, r.serving.is_some());

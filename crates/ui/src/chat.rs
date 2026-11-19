@@ -88,7 +88,7 @@ pub fn follow(config: &mut Config, endpoint: &str, loaded: Option<&Loaded>) {
 }
 
 pub fn last_request(app: &App) -> Option<RequestRecord> {
-    app.engine.handle().recent_requests().last().cloned()
+    app.engine.handle().recent_requests_of(app.loaded().map(|l| l.display).as_deref()).last().cloned()
 }
 
 impl Host for App {

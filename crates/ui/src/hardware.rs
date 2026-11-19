@@ -213,7 +213,7 @@ pub fn pipeline_rows(stats: &specrt::serve::Stats) -> Vec<String> {
 }
 
 pub fn pipeline_section(app: &App, ui: &mut egui::Ui) {
-    let Some(stats) = app.engine.handle().serving_stats() else { return };
+    let Some(stats) = app.loaded().and_then(|l| app.engine.handle().serving_stats_of(&l.display)) else { return };
     let rows = pipeline_rows(&stats);
     if rows.is_empty() {
         return;
