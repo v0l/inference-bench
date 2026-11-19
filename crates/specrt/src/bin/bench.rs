@@ -10,6 +10,7 @@ struct Flags {
     fp8_act: bool,
     kv_gb: Option<f64>,
     mlp_act_fp4: bool,
+    mlp_planes: u8,
 }
 
 static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
@@ -23,7 +24,7 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false };
+    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1 };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -31,6 +32,7 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
             "--profile" => f.profile = true,
             "--fp8-act" => f.fp8_act = true,
             "--mlp-act-fp4" => f.mlp_act_fp4 = true,
+            "--mlp-act-planes" => f.mlp_planes = 2,
             "--runs" | "--kv-gb" => {
                 let name = args.remove(i);
                 anyhow::ensure!(i < args.len(), "{name} needs a value");
@@ -64,6 +66,8 @@ fn load_spec(path: &Path) -> Result<Spec> {
         }
         if flags().mlp_act_fp4 {
             spec.mlp.act_quant = specrt::spec::ActQuant::Fp4;
+            spec.mlp.up_act_planes = flags().mlp_planes;
+            spec.mlp.down_act_planes = flags().mlp_planes;
             spec.validate()?;
         }
         return Ok(spec);
