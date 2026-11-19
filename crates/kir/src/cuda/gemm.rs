@@ -135,7 +135,7 @@ pub fn emit_gemm(k: &KernelInstance) -> Result<String, GemmError> {
             mj = batch.mj,
         ),
         Kind::GgmlBatch { shape, batch, blocks_per_sm, split } => format!(
-            "extern \"C\" __global__ void __launch_bounds__({threads}, {blocks_per_sm}) {name}(const void* w, const unsigned* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, float* part, int tokens, int splits) {{\n    gemv_ggr<{n}, {kk}, {epi}, {bias}, {split}, {nt}, {warps}, {stages}>(w, s, b, xh, xl, out, oh, ol, part, tokens, splits);\n}}\n\n",
+            "extern \"C\" __global__ void __launch_bounds__({threads}, {blocks_per_sm}) {name}(const void* w, const unsigned* s, const float* b, const bf16_t* xh, const bf16_t* xl, float* out, bf16_t* oh, bf16_t* ol, float* part, int tokens, int splits) {{\n    gemv_ggr<{n}, {kk}, {epi}, {bias}, {split}, {nt}, {warps}, {stages}, {mj}>(w, s, b, xh, xl, out, oh, ol, part, tokens, splits);\n}}\n\n",
             n = shape.n,
             kk = shape.k,
             epi = shape.epi.cuda(),
@@ -143,6 +143,7 @@ pub fn emit_gemm(k: &KernelInstance) -> Result<String, GemmError> {
             nt = batch.tokens / 8,
             warps = batch.warps,
             stages = batch.stages,
+            mj = batch.mj,
         ),
         Kind::BatchReduce { shape, wf: WeightFormat::Ggml } => format!(
             "extern \"C\" __global__ void {name}(const float* part, const float* b, float* out, bf16_t* oh, bf16_t* ol, int tokens, int splits) {{\n    ggr_reduce<{n}, {epi}, {bias}>(part, b, out, oh, ol, tokens, splits);\n}}\n\n",
