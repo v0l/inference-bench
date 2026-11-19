@@ -20,6 +20,7 @@ pub struct WMat<B: Backend> {
     nrows: u32,
     cols: u32,
     bytes: u64,
+    sg_kernel: &'static str,
 }
 
 struct LayerBuffers<B: Backend> {
@@ -95,7 +96,8 @@ fn upload_rows<B: Backend>(be: &B, rows: DeviceRows, nrows: usize, what: &str) -
     let data = be.alloc_filled(&parts).with_context(|| format!("{what} weights"))?;
     let table = be.alloc(rows.rows.len() as u64 * 4)?;
     be.upload(&table, 0, &words(&rows.rows));
-    Ok(WMat { bytes: rows.len_bytes() as u64 + rows.rows.len() as u64 * 4, data, rows: table, nrows: nrows as u32, cols: rows.cols as u32 })
+    let sg_kernel = wgsl::sg_kernel_for(&rows.rows);
+    Ok(WMat { bytes: rows.len_bytes() as u64 + rows.rows.len() as u64 * 4, sg_kernel, data, rows: table, nrows: nrows as u32, cols: rows.cols as u32 })
 }
 
 fn upload_floats<B: Backend>(be: &B, v: &[f32]) -> Result<B::Buffer> {
@@ -178,7 +180,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
                 let w = self.weight(weight, l);
                 let coop = kernels[0] == "linear_tile" && be.limits().coop_matrix;
                 let sg = rows == 1 && be.limits().subgroup_size == 32;
-                let kernel = if coop { "linear_coop" } else if sg { "linear_sg" } else { kernels[0] };
+                let kernel = if coop { "linear_coop" } else if sg { w.sg_kernel } else { kernels[0] };
                 let grid = if sg {
                     let groups = w.nrows.div_ceil(wgsl::SG_ROWS);
                     [groups.min(ROW_SPAN), groups.div_ceil(ROW_SPAN), 1]

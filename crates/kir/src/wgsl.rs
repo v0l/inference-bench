@@ -458,7 +458,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 pub const COOP_THREADS: u32 = 128;
 pub const COOP_TOKENS: u32 = 64;
 pub const COOP_ROWS: u32 = 64;
-pub const COOP_K: u32 = 16;
+pub const COOP_K: u32 = 32;
 
 pub fn emit_linear_coop_op(s: &crate::ops::WgslShape) -> String {
     let mut out = String::from("enable wgpu_cooperative_matrix;\n");
@@ -485,8 +485,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let x_row0 = p.a.w;
     let y_row0 = p.b.x;
     let accumulate = p.b.y;
-    let r0 = wid.x * BN;
-    let t0 = wid.z * BM;
+    let ntt = (tokens + BM - 1u) / BM;
+    let nrt = (nrows + BN - 1u) / BN;
+    let lin = wid.x + wid.z * nrt;
+    let r0 = (lin / ntt) * BN;
+    let t0 = (lin % ntt) * BM;
     let sg = li / 32u;
     let sm = (sg / 2u) * 32u;
     let sn = (sg % 2u) * 32u;
@@ -537,6 +540,21 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                     w1 = d1 * f32((q >> 8u) & 0xfu) - mm;
                     w2 = d1 * f32((q >> 16u) & 0xfu) - mm;
                     w3 = d1 * f32((q >> 24u) & 0xfu) - mm;
+                }} else if (code == 2u) {{
+                    let sb = base + (c / 256u) * 224u;
+                    let i = c % 256u;
+                    let hr = i / 128u;
+                    let r = i % 128u;
+                    let seg = r / 32u;
+                    let l = r % 32u;
+                    let ql = wdata[(sb + 64u * hr + (seg & 1u) * 32u + l) >> 2u] >> (4u * (seg >> 1u));
+                    let qh = wdata[(sb + 128u + 32u * hr + l) >> 2u] >> (2u * seg);
+                    let v = (ql & 0x0f0f0f0fu) | ((qh & 0x03030303u) << 4u);
+                    let dd = wf16(sb + 208u) * wi8(sb + 192u + 8u * hr + r / 16u);
+                    w0 = dd * (f32(v & 0xffu) - 32.0);
+                    w1 = dd * (f32((v >> 8u) & 0xffu) - 32.0);
+                    w2 = dd * (f32((v >> 16u) & 0xffu) - 32.0);
+                    w3 = dd * (f32(v >> 24u) - 32.0);
                 }} else {{
                     w0 = dequant_at(base, code, c);
                     w1 = dequant_at(base, code, c + 1u);
@@ -544,19 +562,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                     w3 = dequant_at(base, code, c + 3u);
                 }}
             }}
-            sh[m * BK + kq * 4u] = xv.x;
-            sh[m * BK + kq * 4u + 1u] = xv.y;
-            sh[m * BK + kq * 4u + 2u] = xv.z;
-            sh[m * BK + kq * 4u + 3u] = xv.w;
-            sh[WOFF + m * BK + kq * 4u] = w0;
-            sh[WOFF + m * BK + kq * 4u + 1u] = w1;
-            sh[WOFF + m * BK + kq * 4u + 2u] = w2;
-            sh[WOFF + m * BK + kq * 4u + 3u] = w3;
+            let so = ((m / 8u) * (BK / 8u) + (kq * 4u) / 8u) * 64u + (m % 8u) * 8u + (kq * 4u) % 8u;
+            sh[so] = xv.x;
+            sh[so + 1u] = xv.y;
+            sh[so + 2u] = xv.z;
+            sh[so + 3u] = xv.w;
+            sh[WOFF + so] = w0;
+            sh[WOFF + so + 1u] = w1;
+            sh[WOFF + so + 2u] = w2;
+            sh[WOFF + so + 3u] = w3;
         }}
         workgroupBarrier();
         for (var kk = 0u; kk < BK; kk += 8u) {{
 {mma}        }}
         workgroupBarrier();
+    }}
+    if (accumulate == 0u && r0 + BN <= nrows && t0 + BM <= tokens) {{
+{direct}        return;
     }}
 {store}    workgroupBarrier();
     for (var e = li; e < BM * BN; e += {COOP_THREADS}u) {{
@@ -577,10 +599,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 ",
         bind = storage(&[("x", false, "vec4<f32>"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
         woff = COOP_K * COOP_TOKENS,
-        os = COOP_TOKENS * COOP_ROWS,
+        os = (COOP_TOKENS * COOP_ROWS).max(COOP_K * (COOP_TOKENS + COOP_ROWS)),
         quads = COOP_K * COOP_TOKENS / 4 / COOP_THREADS,
         acc_init = (0..16).map(|n| format!("    var acc{n} = coop_mat8x8<f32, C>();\n")).collect::<String>(),
         mma = coop_mma(),
+        direct = (0..16).map(|n| format!("        coopStoreT(acc{n}, &y[(y_row0 + t0 + sm + {}u) * nrows + r0 + sn + {}u], nrows);\n", (n / 4) * 8, (n % 4) * 8)).collect::<String>(),
         store = (0..16).map(|n| format!("    coopStoreT(acc{n}, &sh[(sm + {}u) * BN + sn + {}u], BN);\n", (n / 4) * 8, (n % 4) * 8)).collect::<String>(),
     )
 }
@@ -588,8 +611,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 fn coop_mma() -> String {
     let mut s = String::new();
     for i in 0..4 {
-        s.push_str(&format!("            let a{i} = coopLoadT<coop_mat8x8<f32, A>>(&sh[(sm + {}u) * BK + kk], BK);\n", i * 8));
-        s.push_str(&format!("            let b{i} = coopLoad<coop_mat8x8<f32, B>>(&sh[WOFF + (sn + {}u) * BK + kk], BK);\n", i * 8));
+        s.push_str(&format!("            let a{i} = coopLoadT<coop_mat8x8<f32, A>>(&sh[((sm + {}u) / 8u * (BK / 8u) + kk / 8u) * 64u], 8u);\n", i * 8));
+        s.push_str(&format!("            let b{i} = coopLoad<coop_mat8x8<f32, B>>(&sh[WOFF + ((sn + {}u) / 8u * (BK / 8u) + kk / 8u) * 64u], 8u);\n", i * 8));
     }
     for n in 0..16 {
         s.push_str(&format!("            acc{n} = coopMultiplyAdd(a{}, b{}, acc{n});\n", n / 4, n % 4));
@@ -600,16 +623,207 @@ fn coop_mma() -> String {
 pub const SG_ROWS: u32 = 4;
 pub const SG_LANE_ELEMS: u32 = 8;
 
-pub fn emit_linear_sg_op(s: &crate::ops::WgslShape) -> String {
+#[derive(Clone, Copy)]
+pub enum SgVariant {
+    Any,
+    Bf16,
+    Q4K,
+    Q6K,
+}
+
+pub fn emit_linear_sg_op(s: &crate::ops::WgslShape, variant: SgVariant) -> String {
     let mut out = ops_header(s);
-    out.push_str(&linear_sg());
+    out.push_str(&linear_sg(variant));
     out.push_str(&ggml_decode());
     out
 }
 
-fn linear_sg() -> String {
+const Q4K_BRANCH: &str = r####"    if (code == 0u) {
+        let ix = lane / 8u;
+        let iq = (lane % 8u) / 4u;
+        let ir = lane % 4u;
+        let sh = 16u * iq;
+        for (var sb = ix; sb < cols / 256u; sb += 4u) {
+            let b = base + sb * 144u;
+            let b4 = b >> 2u;
+            let xb = (xo + sb * 256u + 64u * iq + 8u * ir) / 4u;
+            let ya0 = x[xb];
+            let ya1 = x[xb + 1u];
+            let yb0 = x[xb + 8u];
+            let yb1 = x[xb + 9u];
+            let yc0 = x[xb + 32u];
+            let yc1 = x[xb + 33u];
+            let yd0 = x[xb + 40u];
+            let yd1 = x[xb + 41u];
+            let sy = vec4<f32>(dot(ya0 + ya1, vec4<f32>(1.0)), dot(yb0 + yb1, vec4<f32>(1.0)), dot(yc0 + yc1, vec4<f32>(1.0)), dot(yd0 + yd1, vec4<f32>(1.0)));
+            let dd = unpack2x16float(wdata[b4]);
+            let s0 = wdata[b4 + 1u];
+            let s1 = wdata[b4 + 2u];
+            let s2 = wdata[b4 + 3u];
+            let scl = (s0 & 0x3f3f3f3fu) >> sh;
+            let mnl = (s1 & 0x3f3f3f3fu) >> sh;
+            let sch = ((s2 & 0x0f0f0f0fu) | (((s0 >> 6u) & 0x03030303u) << 4u)) >> sh;
+            let mnh = (((s2 >> 4u) & 0x0f0f0f0fu) | (((s1 >> 6u) & 0x03030303u) << 4u)) >> sh;
+            let q = (b + 16u + 32u * iq + 8u * ir) >> 2u;
+            let qa = wdata[q];
+            let qb = wdata[q + 1u];
+            let qc = wdata[q + 16u];
+            let qd = wdata[q + 17u];
+            let d0 = dot(nib_lo(qa), ya0) + dot(nib_lo(qb), ya1);
+            let d1 = dot(nib_hi(qa), yb0) + dot(nib_hi(qb), yb1);
+            let d2 = dot(nib_lo(qc), yc0) + dot(nib_lo(qd), yc1);
+            let d3 = dot(nib_hi(qc), yd0) + dot(nib_hi(qd), yd1);
+            let sc = vec4<f32>(f32(scl & 0xffu), f32((scl >> 8u) & 0xffu), f32(sch & 0xffu), f32((sch >> 8u) & 0xffu));
+            let mn = vec4<f32>(f32(mnl & 0xffu), f32((mnl >> 8u) & 0xffu), f32(mnh & 0xffu), f32((mnh >> 8u) & 0xffu));
+            acc += dd.x * dot(sc, vec4<f32>(d0, d1, d2, d3)) - dd.y * dot(mn, sy);
+        }
+    }
+"####;
+
+const Q6K_BRANCH: &str = r####"    if (code == 2u) {
+        let hr = (lane / 8u) % 2u;
+        let l = (lane % 8u) * 4u;
+        let isc = l / 16u;
+        for (var sb = lane / 16u; sb < cols / 256u; sb += 2u) {
+            let b = base + sb * 224u;
+            let d = wf16(b + 208u);
+            let ql0 = wdata[(b + 64u * hr + l) >> 2u];
+            let ql1 = wdata[(b + 64u * hr + l + 32u) >> 2u];
+            let qh = wdata[(b + 128u + 32u * hr + l) >> 2u];
+            let sw = (b + 192u + 8u * hr) >> 2u;
+            let sc = vec4<f32>(vec4<i32>(bitcast<i32>(wdata[sw] << (24u - 8u * isc)) >> 24u, bitcast<i32>(wdata[sw] << (8u - 8u * isc)) >> 24u, bitcast<i32>(wdata[sw + 1u] << (24u - 8u * isc)) >> 24u, bitcast<i32>(wdata[sw + 1u] << (8u - 8u * isc)) >> 24u));
+            let xb = (xo + sb * 256u + hr * 128u + l) / 4u;
+            var part = 0.0;
+            for (var seg = 0u; seg < 4u; seg++) {
+                let qw = select(ql0, ql1, (seg & 1u) == 1u) >> (4u * (seg >> 1u));
+                let v = (qw & 0x0f0f0f0fu) | (((qh >> (2u * seg)) & 0x03030303u) << 4u);
+                let f = vec4<f32>(vec4<u32>(v & 0xffu, (v >> 8u) & 0xffu, (v >> 16u) & 0xffu, v >> 24u)) - vec4<f32>(32.0);
+                part += sc[seg] * dot(f, x[xb + seg * 8u]);
+            }
+            acc += d * part;
+        }
+    }
+"####;
+
+const DENSE_BRANCH: &str = r####"    if (code == 4u) {
+        let b4 = base >> 2u;
+        for (var q = lane; q < cols / 2u; q += 32u) {
+            let w = wdata[b4 + q];
+            acc += bitcast<f32>(w << 16u) * xs(xo + 2u * q) + bitcast<f32>(w & 0xffff0000u) * xs(xo + 2u * q + 1u);
+        }
+    }
+"####;
+
+const FULL_BRANCH: &str = r####"    if (code == 4u) {
+        let b4 = base >> 2u;
+        for (var q = lane; q < cols / 2u; q += 32u) {
+            let w = wdata[b4 + q];
+            acc += bitcast<f32>(w << 16u) * xs(xo + 2u * q) + bitcast<f32>(w & 0xffff0000u) * xs(xo + 2u * q + 1u);
+        }
+    } else if (code == 0u) {
+        let ix = lane / 8u;
+        let iq = (lane % 8u) / 4u;
+        let ir = lane % 4u;
+        let sh = 16u * iq;
+        for (var sb = ix; sb < cols / 256u; sb += 4u) {
+            let b = base + sb * 144u;
+            let b4 = b >> 2u;
+            let xb = (xo + sb * 256u + 64u * iq + 8u * ir) / 4u;
+            let ya0 = x[xb];
+            let ya1 = x[xb + 1u];
+            let yb0 = x[xb + 8u];
+            let yb1 = x[xb + 9u];
+            let yc0 = x[xb + 32u];
+            let yc1 = x[xb + 33u];
+            let yd0 = x[xb + 40u];
+            let yd1 = x[xb + 41u];
+            let sy = vec4<f32>(dot(ya0 + ya1, vec4<f32>(1.0)), dot(yb0 + yb1, vec4<f32>(1.0)), dot(yc0 + yc1, vec4<f32>(1.0)), dot(yd0 + yd1, vec4<f32>(1.0)));
+            let dd = unpack2x16float(wdata[b4]);
+            let s0 = wdata[b4 + 1u];
+            let s1 = wdata[b4 + 2u];
+            let s2 = wdata[b4 + 3u];
+            let scl = (s0 & 0x3f3f3f3fu) >> sh;
+            let mnl = (s1 & 0x3f3f3f3fu) >> sh;
+            let sch = ((s2 & 0x0f0f0f0fu) | (((s0 >> 6u) & 0x03030303u) << 4u)) >> sh;
+            let mnh = (((s2 >> 4u) & 0x0f0f0f0fu) | (((s1 >> 6u) & 0x03030303u) << 4u)) >> sh;
+            let q = (b + 16u + 32u * iq + 8u * ir) >> 2u;
+            let qa = wdata[q];
+            let qb = wdata[q + 1u];
+            let qc = wdata[q + 16u];
+            let qd = wdata[q + 17u];
+            let d0 = dot(nib_lo(qa), ya0) + dot(nib_lo(qb), ya1);
+            let d1 = dot(nib_hi(qa), yb0) + dot(nib_hi(qb), yb1);
+            let d2 = dot(nib_lo(qc), yc0) + dot(nib_lo(qd), yc1);
+            let d3 = dot(nib_hi(qc), yd0) + dot(nib_hi(qd), yd1);
+            let sc = vec4<f32>(f32(scl & 0xffu), f32((scl >> 8u) & 0xffu), f32(sch & 0xffu), f32((sch >> 8u) & 0xffu));
+            let mn = vec4<f32>(f32(mnl & 0xffu), f32((mnl >> 8u) & 0xffu), f32(mnh & 0xffu), f32((mnh >> 8u) & 0xffu));
+            acc += dd.x * dot(sc, vec4<f32>(d0, d1, d2, d3)) - dd.y * dot(mn, sy);
+        }
+    } else if (code == 2u) {
+        let hr = (lane / 8u) % 2u;
+        let l = (lane % 8u) * 4u;
+        let isc = l / 16u;
+        for (var sb = lane / 16u; sb < cols / 256u; sb += 2u) {
+            let b = base + sb * 224u;
+            let d = wf16(b + 208u);
+            let ql0 = wdata[(b + 64u * hr + l) >> 2u];
+            let ql1 = wdata[(b + 64u * hr + l + 32u) >> 2u];
+            let qh = wdata[(b + 128u + 32u * hr + l) >> 2u];
+            let sw = (b + 192u + 8u * hr) >> 2u;
+            let sc = vec4<f32>(vec4<i32>(bitcast<i32>(wdata[sw] << (24u - 8u * isc)) >> 24u, bitcast<i32>(wdata[sw] << (8u - 8u * isc)) >> 24u, bitcast<i32>(wdata[sw + 1u] << (24u - 8u * isc)) >> 24u, bitcast<i32>(wdata[sw + 1u] << (8u - 8u * isc)) >> 24u));
+            let xb = (xo + sb * 256u + hr * 128u + l) / 4u;
+            var part = 0.0;
+            for (var seg = 0u; seg < 4u; seg++) {
+                let qw = select(ql0, ql1, (seg & 1u) == 1u) >> (4u * (seg >> 1u));
+                let v = (qw & 0x0f0f0f0fu) | (((qh >> (2u * seg)) & 0x03030303u) << 4u);
+                let f = vec4<f32>(vec4<u32>(v & 0xffu, (v >> 8u) & 0xffu, (v >> 16u) & 0xffu, v >> 24u)) - vec4<f32>(32.0);
+                part += sc[seg] * dot(f, x[xb + seg * 8u]);
+            }
+            acc += d * part;
+        }
+    } else if (code == 3u) {
+        let blk = lane / 4u;
+        let off = (lane % 4u) * 8u;
+        for (var sb = 0u; sb < cols / 256u; sb++) {
+            let b = base + sb * 272u + blk * 34u;
+            let d = wf16(b);
+            let xb = xo + sb * 256u + blk * 32u + off;
+            var part = 0.0;
+            for (var i = 0u; i < 8u; i++) {
+                part += wi8(b + 2u + off + i) * xs(xb + i);
+            }
+            acc += d * part;
+        }
+    } else {
+        for (var c0 = 0u; c0 < cols; c0 += 256u) {
+            let e0 = c0 + lane * 8u;
+            for (var i = 0u; i < 8u; i++) {
+                let e = e0 + i;
+                if (e < cols) {
+                    acc += dequant_at(base, code, e) * xs(xo + e);
+                }
+            }
+        }
+    }
+"####;
+
+fn linear_sg(variant: SgVariant) -> String {
+    let branches = match variant {
+        SgVariant::Bf16 => DENSE_BRANCH,
+        SgVariant::Q4K => Q4K_BRANCH,
+        SgVariant::Q6K => Q6K_BRANCH,
+        SgVariant::Any => FULL_BRANCH,
+    };
     format!(
         "{bind}
+fn nib_lo(w: u32) -> vec4<f32> {{
+    return vec4<f32>(vec4<u32>(w & 0xfu, (w >> 8u) & 0xfu, (w >> 16u) & 0xfu, (w >> 24u) & 0xfu));
+}}
+
+fn nib_hi(w: u32) -> vec4<f32> {{
+    return vec4<f32>(vec4<u32>((w >> 4u) & 0xfu, (w >> 12u) & 0xfu, (w >> 20u) & 0xfu, (w >> 28u) & 0xfu));
+}}
+
 fn xs(i: u32) -> f32 {{
     return x[i >> 2u][i & 3u];
 }}
@@ -630,79 +844,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
     let code = entry & 7u;
     var acc = 0.0;
     let xo = x_row0 * cols;
-    if (code == 4u) {{
-        let b4 = base >> 2u;
-        for (var q = lane; q < cols / 2u; q += 32u) {{
-            let w = wdata[b4 + q];
-            acc += bitcast<f32>(w << 16u) * xs(xo + 2u * q) + bitcast<f32>(w & 0xffff0000u) * xs(xo + 2u * q + 1u);
-        }}
-    }} else if (code == 0u) {{
-        let j = lane / 8u;
-        let l4 = (lane % 8u) * 4u;
-        for (var sb = 0u; sb < cols / 256u; sb++) {{
-            let b = base + sb * 144u;
-            let d = wf16(b);
-            let dmin = wf16(b + 2u);
-            let s0 = scale_min_k4(2u * j, b);
-            let s1 = scale_min_k4(2u * j + 1u, b);
-            let q = wdata[(b + 16u + 32u * j + l4) >> 2u];
-            let xb = (xo + sb * 256u + j * 64u + l4) / 4u;
-            let xa = x[xb];
-            let xc = x[xb + 8u];
-            let qa = vec4<f32>(vec4<u32>(q & 0xfu, (q >> 8u) & 0xfu, (q >> 16u) & 0xfu, (q >> 24u) & 0xfu));
-            let qb = vec4<f32>(vec4<u32>((q >> 4u) & 0xfu, (q >> 12u) & 0xfu, (q >> 20u) & 0xfu, (q >> 28u) & 0xfu));
-            let lo = dot(qa, xa);
-            let hi = dot(qb, xc);
-            let xl = xa.x + xa.y + xa.z + xa.w;
-            let xh = xc.x + xc.y + xc.z + xc.w;
-            acc += d * (f32(s0.x) * lo + f32(s1.x) * hi) - dmin * (f32(s0.y) * xl + f32(s1.y) * xh);
-        }}
-    }} else if (code == 2u) {{
-        let hr = (lane / 8u) % 2u;
-        let l = (lane % 8u) * 4u;
-        let isc = l / 16u;
-        for (var sb = lane / 16u; sb < cols / 256u; sb += 2u) {{
-            let b = base + sb * 224u;
-            let d = wf16(b + 208u);
-            let ql0 = wdata[(b + 64u * hr + l) >> 2u];
-            let ql1 = wdata[(b + 64u * hr + l + 32u) >> 2u];
-            let qh = wdata[(b + 128u + 32u * hr + l) >> 2u];
-            let sc = b + 192u + 8u * hr + isc;
-            let xb = (xo + sb * 256u + hr * 128u + l) / 4u;
-            var part = 0.0;
-            for (var seg = 0u; seg < 4u; seg++) {{
-                let qw = select(ql0, ql1, (seg & 1u) == 1u) >> (4u * (seg >> 1u));
-                let v = (qw & 0x0f0f0f0fu) | (((qh >> (2u * seg)) & 0x03030303u) << 4u);
-                let f = vec4<f32>(vec4<u32>(v & 0xffu, (v >> 8u) & 0xffu, (v >> 16u) & 0xffu, v >> 24u)) - vec4<f32>(32.0);
-                part += wi8(sc + 2u * seg) * dot(f, x[xb + seg * 8u]);
-            }}
-            acc += d * part;
-        }}
-    }} else if (code == 3u) {{
-        let blk = lane / 4u;
-        let off = (lane % 4u) * 8u;
-        for (var sb = 0u; sb < cols / 256u; sb++) {{
-            let b = base + sb * 272u + blk * 34u;
-            let d = wf16(b);
-            let xb = xo + sb * 256u + blk * 32u + off;
-            var part = 0.0;
-            for (var i = 0u; i < 8u; i++) {{
-                part += wi8(b + 2u + off + i) * xs(xb + i);
-            }}
-            acc += d * part;
-        }}
-    }} else {{
-        for (var c0 = 0u; c0 < cols; c0 += {span}u) {{
-            let e0 = c0 + lane * {SG_LANE_ELEMS}u;
-            for (var i = 0u; i < {SG_LANE_ELEMS}u; i++) {{
-                let e = e0 + i;
-                if (e < cols) {{
-                    acc += dequant_at(base, code, e) * xs(xo + e);
-                }}
-            }}
-        }}
-    }}
-    let total = subgroupAdd(acc);
+{branches}    let total = subgroupAdd(acc);
     if (lane == 0u) {{
         let at = y_row0 * nrows + r;
         if (accumulate == 1u) {{
@@ -715,7 +857,6 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
 ",
         bind = storage(&[("x", false, "vec4<f32>"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
         threads = 32 * SG_ROWS,
-        span = 32 * SG_LANE_ELEMS,
     )
 }
 

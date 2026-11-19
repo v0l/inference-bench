@@ -240,3 +240,73 @@ Ceilings measured by skipping the op in decode (Qwen3-0.6B bf16 / Q4_K_M, contex
 | Qwen2.5-7B Q4_K_M | 107.7 / 273.9 = 0.39 (0.37) | 108.1 / 268.9 = 0.40 (0.35) | 12.1 / 28.0 = 0.43 (0.43) |
 
 7B load 8.2 s in this run (3.5 to 7.2 s in the isolated runs), peak 5.95 GB (was 9.1). The 0.5x milestone is met for Qwen3-0.6B bf16 decode only; bf16 prefill is at 0.45 to 0.48. The remaining gap is the GEMM at about 2x off `kernel_mul_mm` (1.7 to 1.9 against 3.5 to 4.2 TFLOP/s) and decode on the quantised models.
+
+## Mac speed work 4 (#823 steps)
+
+### `kernel_mul_mm` against our `linear_coop`
+
+| | llama.cpp `kernel_mul_mm` | ours before |
+|---|---|---|
+| output tile | 64 rows x 32 tokens, 128 threads, each simdgroup holds 8 accumulators (4 weight x 2 token matrices) | 64 x 64, 16 accumulators per simdgroup |
+| k step | 32 per barrier pair | 16 |
+| tile layout | 8x8 blocks stored contiguously (64 elements, stride 8), so each `simdgroup_load` reads one contiguous 128 B block | row-major, stride BK, so each 8x8 load strides across rows |
+| tile type | half | f32 |
+| barriers per k step | 2 | 2 |
+| Q4_K/Q6_K | dequantised 16 values per thread into registers, written to the tile | Q4_K inline, Q6_K through the per-element `dequant_at` |
+| output | `simdgroup_store` straight to device memory when the tile is in bounds | always through workgroup memory |
+| GEMV (`kernel_mul_mv_q4_K_f32`) | 2 simdgroups x 2 rows each, x held in registers (yl, yh) and reused across the rows, nibbles masked in place (no shifts) and the scale applied after the dot | 4 rows per workgroup, one row per simdgroup |
+
+### `linear_coop` steps (M1 Pro, `linear_coop_time_per_dispatch`, m=4096 n=512 k=14336, TFLOP/s)
+
+| Step | bf16 | Q4_K | Q6_K | Kept |
+|---|---|---|---|---|
+| base | 1.83 | 1.68 | 0.96 | |
+| 8x8 block-contiguous tiles | 1.75 | 1.60 | 0.93 | needed for the next step |
+| + k step 32 | 1.88 | 1.73 | 1.00 | yes |
+| + 2D swizzle of the workgroup order (L2 reuse) | 1.95 | 1.76 | 1.00 | yes |
+| + Q6_K decoded four weights at a time | 1.89 | 1.75 | 1.78 | yes |
+| + direct `coopStore` to `y` for full tiles | 1.89 | 1.77 | 1.79 | yes |
+| f16 tiles with f16 matrices | 1.47 | 1.39 | 0.79 | no, and error 3e-3 |
+| k step 64 | 1.12 | 1.10 | 1.16 | no |
+| 64x32 tile (8 accumulators per simdgroup, as `kernel_mul_mm`) | 1.40 | 1.29 | 1.31 | no |
+| weight and x tile loads in separate loops (Q4_K quad-style) | 1.77 | 1.65 | 1.68 | no |
+
+k step 64 first gave wrong results: the workgroup array was sized for the 64x64 output tile (4,096 floats) while the two k=64 tiles need 8,192. It is now sized for the larger of the two, and k=64 is correct but slower. The Q4_K path was already decoding four weights at a time; splitting it from the x load made it slower. The 3 TFLOP/s target was not reached: every tile shape and k step tried lands at or below 1.9 TFLOP/s, and f16 matrices are slower, so the half tile and half matrix path that gives `kernel_mul_mm` 4.2 TFLOP/s was not reproduced through wgpu's cooperative matrix. The cause is not established.
+
+### GEMV (`linear_sg_time_per_dispatch`, 7B shapes, GB/s of weights)
+
+| Step | bf16 | Q4_K | Q6_K | Kept |
+|---|---|---|---|---|
+| base (m=18944 k=3584) | 170 | 51 | 89 | |
+| Q4_K after `kernel_mul_mv_q4_K_f32`: lanes split 4 superblocks x 2 halves x 4 groups, scales and mins unpacked from the 12 scale bytes with word masks, nibbles taken without shifts, x summed once for the min term | 170 | 79 | 89 | yes |
+| 2 rows per simdgroup so x is loaded once (`N_R0`=2) | 94 | 82 | 67 | no, bf16 and Q6_K lose 30-45% for 8% on Q4_K |
+| 2 and 8 rows per workgroup | 170 | 77-79 | 85-89 | no |
+| Q6_K scales read as packed words | 170 | 79 | 88 | neutral (89 to 88), kept with the per-quant split |
+| one kernel per quant type (`linear_sg_bf16`, `linear_sg_q4k`, `linear_sg_q6k`) | 177 | 77 | 96 | yes |
+
+Step 1 alone made the shared GEMV slower for bf16 (decode 81.7 to 68 tok/s on Qwen3-0.6B): one kernel holding every quant branch has the register pressure of the widest one. A paired A/B on the 0.6B and 1B models caught it, and the kernels are now selected per matrix from its row type (`wgsl::sg_kernel_for`). Q4_K decode on the 0.6B model went 88 to 99 tok/s and Llama-3.2-1B 63 to 81 against the pass 3 binary, paired in the same run.
+
+### Load, 7B (`Dense::load` timing)
+
+Per-layer timing (7B Q4_K_M): `layer_at` 0.9-1.1 s, tensor upload 5.0-6.2 s of a 7.1-9.2 s load. Inside the upload, creating the buffers is 0.6 s, the `mapped_at_creation` copy is 5.4 s (0.9 GB/s: the page-fault cost of first touch on the shared-memory buffer, single threaded) and unmap plus poll 0.65 s. 114 buffers of up to 292 MB; fewer, larger buffers would not help because create and unmap are already 1.3 s together. The copy is now split in 8 MB pieces over up to 8 threads (`Wgpu::alloc_filled`). Load, alternating runs of the two binaries: 7.9, 6.2, 6.9, 6.9 s before and 6.0, 5.6, 6.1, 5.3 s after (median 6.9 to 5.8 s). The target of 3 s is not reached; the remaining cost is the page faults on the mapped allocation plus the GGUF being read from disk on the first touch of each mmap page.
+
+### Failing `--lib` tests
+
+Both pass on Linux master (CPU). On macOS: `a_filesystem_that_refuses_direct_io_falls_back_to_buffered_reads` used `/dev/shm`, which does not exist there (it now skips when the directory is missing); `prompts_stay_bounded_behind_each_other_with_full_decoders` measured ttft with wall clock `Instant`s over `thread::sleep`, and macOS sleeps overshoot a 20 us sleep by several times, so ttft was 2-10 s too high. It now measures ttft on the simulated clock (the sum of the step costs), which is deterministic. 259 passed on the Mac in 3 consecutive runs.
+
+### Checks
+
+wgsl tests 26/26 and `--lib` 259/259 on the Mac, `--lib` 259/259 on Linux, clippy clean with and without the wgpu feature. Greedy text for "The capital of France is" (32 tokens) is identical to `llama-completion --temp 0` on Qwen3-0.6B bf16, Qwen3-0.6B Q4_K_M and Qwen2.5-7B Q4_K_M, checked with the final kernels.
+
+### `mac_vs_llama.sh` result (specrt / llama.cpp tok/s = ratio, 3 alternating rounds, medians)
+
+Quiet Mac: no gcad job in any round, load average 1.1-2.9 during the runs (one 11.6 spike at the start of round 1 from a Simulator process), 5 of the 6 round starts below 3. Pass 3 ratio in brackets.
+
+| Model | Prefill 128 | Prefill 1,024 | Decode (128 new) |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 1,408 / 2,963 = 0.475 (0.48) | 1,333 / 2,973 = 0.448 (0.45) | 78.5 / 115.1 = 0.68 (0.64) |
+| Qwen3-0.6B Q4_K_M | 1,390 / 3,003 = 0.463 (0.39) | 1,270 / 3,028 = 0.419 (0.38) | 87.8 / 211.0 = 0.416 (0.40) |
+| Llama-3.2-1B Q4_K_M | 825 / 1,732 = 0.476 (0.40) | 788 / 1,755 = 0.449 (0.39) | 76.3 / 145.4 = 0.525 (0.41) |
+| Qwen2.5-7B Q4_K_M | 129.8 / 273.8 = 0.474 (0.39) | 127.0 / 269.1 = 0.472 (0.40) | 16.45 / 28.0 = 0.587 (0.43) |
+
+7B load 6.1 s, peak footprint 5.96 GB. The 0.5x milestone is now met for decode on bf16, Llama-1B and the 7B, and missed by 0.02-0.08 on prefill everywhere (0.42-0.48) and by 0.08 on Qwen3-0.6B Q4_K_M decode (0.416).

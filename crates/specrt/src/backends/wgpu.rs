@@ -149,6 +149,12 @@ impl Drop for Wgpu {
     }
 }
 
+const COPY_PIECE: usize = 8 << 20;
+
+struct Dst(*mut u8);
+
+unsafe impl Sync for Dst {}
+
 impl Backend for Wgpu {
     type Buffer = Buffer;
 
@@ -191,11 +197,30 @@ impl Backend for Wgpu {
         });
         {
             let mut view = raw.slice(..).get_mapped_range_mut().map_err(|e| anyhow!("map: {e:?}"))?;
+            let mut whole = view.slice(..);
+            let dst = Dst(whole.as_raw_ptr().as_ptr().cast::<u8>());
+            let mut jobs: Vec<(usize, &[u8])> = Vec::new();
             let mut at = 0usize;
             for part in parts {
-                view.slice(at..at + part.len()).copy_from_slice(part);
+                for (i, piece) in part.chunks(COPY_PIECE).enumerate() {
+                    jobs.push((at + i * COPY_PIECE, piece));
+                }
                 at += part.len();
             }
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(8);
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        let dst = &dst;
+                        loop {
+                            let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some((offset, piece)) = jobs.get(j) else { break };
+                            unsafe { std::ptr::copy_nonoverlapping(piece.as_ptr(), dst.0.add(*offset), piece.len()) };
+                        }
+                    });
+                }
+            });
         }
         raw.unmap();
         self.queue.submit([]);

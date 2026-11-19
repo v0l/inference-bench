@@ -198,7 +198,7 @@ fn run_linear(w: &mut Wgpu, rows: &DeviceRows, x: &[f32], tokens: usize, accumul
     let yb = f32_buf(w, &accumulate.map_or_else(|| vec![0.0; tokens * nrows], |a| a.to_vec()));
     let (name, grid) = if tokens == 1 {
         if specrt::backends::Backend::limits(w).subgroup_size == 32 {
-            ("linear_sg", [(nrows as u32).div_ceil(wgsl::SG_ROWS), 1, 1])
+            (wgsl::sg_kernel_for(&rows.rows), [(nrows as u32).div_ceil(wgsl::SG_ROWS), 1, 1])
         } else {
             ("linear", [nrows as u32, 1, tokens as u32])
         }
@@ -726,6 +726,46 @@ fn linear_coop_time_per_dispatch() {
             let s = t.elapsed().as_secs_f64() / reps as f64;
             let flops = 2.0 * tokens as f64 * nrows as f64 * cols as f64;
             println!("coop {:5} m={nrows} n={tokens} k={cols}: {:.3} ms {:.2} TFLOP/s {:.1} GB/s weights", kind.name(), s * 1e3, flops / s / 1e12, bytes / s / 1e9);
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter; prints linear_sg time per dispatch"]
+fn linear_sg_time_per_dispatch() {
+    let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    let mut w = setup(&spec(), 64);
+    let mut rng = Lcg(7);
+    for kind in [GgmlType::Bf16, GgmlType::Q4K, GgmlType::Q6K] {
+        for (nrows, cols) in [(4608usize, 3584usize), (18944, 3584), (3584, 18944)] {
+            let data = if kind == GgmlType::Bf16 { Vec::new() } else { random_blocks(kind, nrows, cols, &mut rng) };
+            let packed = if kind == GgmlType::Bf16 {
+                let v: Vec<u16> = (0..nrows * cols).map(|_| specrt::weights::f32_to_bf16(rng.unit())).collect();
+                DeviceRows::from_bf16(&v, cols).unwrap()
+            } else {
+                DeviceRows::pack(kind, &data, nrows, cols).unwrap()
+            };
+            let bytes = packed.len_bytes() as f64;
+            let wd = w.alloc(packed.len_bytes() as u64).unwrap();
+            w.upload(&wd, 0, packed.data().as_ref());
+            let table = u32_buf(&w, &packed.rows);
+            let x: Vec<f32> = (0..cols).map(|_| rng.unit()).collect();
+            let xb = f32_buf(&w, &x);
+            let yb = f32_buf(&w, &vec![0.0; nrows]);
+            let params = [nrows as u32, cols as u32, 1, 0, 0, 0, 0, 0];
+            let grid = [(nrows as u32).div_ceil(wgsl::SG_ROWS), 1, 1];
+            for _ in 0..3 {
+                w.dispatch(wgsl::sg_kernel_for(&packed.rows), &[&xb, &yb, &wd, &table], params, grid).unwrap();
+            }
+            w.submit().unwrap();
+            let reps = 100;
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                w.dispatch(wgsl::sg_kernel_for(&packed.rows), &[&xb, &yb, &wd, &table], params, grid).unwrap();
+            }
+            w.submit().unwrap();
+            let s = t.elapsed().as_secs_f64() / reps as f64;
+            println!("sg {:5} m={nrows} k={cols}: {:.3} ms {:.1} GB/s weights", kind.name(), s * 1e3, bytes / s / 1e9);
         }
     }
 }
