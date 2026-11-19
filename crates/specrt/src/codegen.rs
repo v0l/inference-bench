@@ -32,6 +32,12 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         routed_scale: m.routed_scale,
         shared_gate: m.shared_gate,
         sigmoid: m.router == crate::spec::RouterAct::Sigmoid,
+        groups: m.groups,
+        topk_group: m.topk_group,
+        score_bias: m.score_bias,
+        router_bias: m.router_bias,
+        expert_bias: m.expert_bias,
+        hash: m.hash_table.is_some(),
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if moe_mma_enabled(spec, target) {
@@ -362,12 +368,12 @@ pub fn gemv_kernels(spec: &Spec, target: &kir::Target, ops: &kir::ops::OpsShape)
     let tiled = |d: &str, n, k, bias, residual| Gemv::Tiled { decoder: d.to_string(), n, k, bias, residual };
     let mut ops_list = vec![
         ("qkv_proj", lin(&wf, n, h, bias, false)),
-        ("o_proj", lin(&wf, h, q, false, true)),
+        ("o_proj", lin(&wf, h, q, ops.o_bias, true)),
         ("gate_up_proj", lin(&wf, gu, h, false, false)),
         ("down_proj", lin(&wf, h, i, false, true)),
         ("lm_head", lin(&hwf, v, h, false, false)),
         ("qkv_gemm", tiled(&wf, n, h, bias, false)),
-        ("o_gemm", tiled(&wf, h, q, false, true)),
+        ("o_gemm", tiled(&wf, h, q, ops.o_bias, true)),
         ("gate_up_gemm", tiled(&wf, gu, h, false, false)),
         ("down_gemm", tiled(&wf, h, i, false, true)),
         ("lm_head_gemm", tiled(&hwf, v, h, false, false)),
@@ -428,11 +434,13 @@ impl Module {
             q_dim: spec.q_dim(),
             output_gate: a.output_gate,
             qkv_bias: a.qkv_bias,
+            o_bias: a.o_bias,
             eps: spec.norm.eps,
             embed_scale: spec.dims.embed_scale.unwrap_or(1.0),
             gated_gelu: spec.mlp.activation == Activation::Geglu,
             q8_group: Q8_GROUP,
             fp8_block: FP8_BLOCK,
+            gated: spec.mlp.gated.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
             weight_decoder: wf.decoder().to_string(),
             head_decoder: head_wf.decoder().to_string(),
         };
@@ -461,7 +469,7 @@ impl Module {
         let kir_hash = kir::fold_hashes([kir_hash, ggml.hash(), kir::prims::prims_hash(&prims), kir::gemv::gemv_hash(&gemvs)]);
         let mut source = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}",
-            kir::cuda::emit_ops(&ops),
+            kir::cuda::emit_ops(&ops).map_err(anyhow::Error::msg)?,
             kir::prims::emit_cuda(&prims).map_err(anyhow::Error::msg)?,
             ggml.emit().map_err(anyhow::Error::msg)?,
             attn_source,

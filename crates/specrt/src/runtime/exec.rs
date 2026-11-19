@@ -101,7 +101,7 @@ impl Runtime {
             Op::GdnDecode => self.gdn_decode_rows(self.gdn_of(layer), &run.bb.expect("decode runs carry batch buffers").slots, n),
             Op::GdnVerify => self.gdn_verify_op(self.gdn_of(layer), run),
             Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => self.mtp_op(op, run),
-            Op::MoeRoute => self.moe_route(layer.expect("moe runs inside a layer"), &self.pre.x, n),
+            Op::MoeRoute => self.moe_route(layer.expect("moe runs inside a layer"), &self.pre.x, run.tokens, n),
             Op::MoeExperts => self.moe_experts(layer.expect("moe runs inside a layer"), n),
             Op::MoeCombine => self.moe_combine(if self.comm.is_some() { &self.partial } else { &self.pre.x }, n),
             Op::AllReduce => self.allreduce_op(n),
@@ -430,7 +430,7 @@ impl Runtime {
         let layer_of = || layer.expect("layer weights need a layer");
         match weight {
             Weight::Qkv => (&attn().qkv, attn().qkv_bias.as_ref()),
-            Weight::O => (&attn().o, None),
+            Weight::O => (&attn().o, attn().o_bias.as_ref()),
             Weight::GateUp => (&layer_of().gate_up, None),
             Weight::Down => (&layer_of().down, None),
             Weight::LinIn => (&gdn().in_proj, None),

@@ -51,7 +51,7 @@ pub fn batch_store(p: &str) -> String {
 __device__ __forceinline__ void {p}_store(int m, int r, float v, float u, float* out, bf16_t* out_hi, bf16_t* out_lo) {{
     if (EPI == EPI_ACT) {{
         unsigned hi, lo;
-        split_hi_lo(activation(v) * u, hi, lo);
+        split_hi_lo(gated_act(v, u), hi, lo);
         size_t at = (size_t)m * (N / 2) + r / 2;
         out_hi[at] = (bf16_t)hi;
         out_lo[at] = (bf16_t)lo;

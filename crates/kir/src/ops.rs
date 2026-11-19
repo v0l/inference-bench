@@ -10,6 +10,7 @@ pub struct OpsShape {
     pub q_dim: usize,
     pub output_gate: bool,
     pub qkv_bias: bool,
+    pub o_bias: bool,
     pub eps: f64,
     pub embed_scale: f64,
     pub gated_gelu: bool,
@@ -17,6 +18,24 @@ pub struct OpsShape {
     pub fp8_block: usize,
     pub weight_decoder: String,
     pub head_decoder: String,
+    pub gated: Option<GatedExpr>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GatedExpr {
+    pub expr: String,
+    pub params: Vec<(String, f64)>,
+}
+
+impl GatedExpr {
+    pub fn lower_cuda(&self) -> Result<String, String> {
+        let e = crate::expr::Expr::parse(&self.expr)?;
+        let e = e.subst(&|n| match n {
+            "g" | "u" => Some(crate::expr::Expr::Raw(n.to_string())),
+            other => self.params.iter().find(|(k, _)| k == other).map(|(k, v)| crate::expr::Expr::Const(k.clone(), *v as f32)),
+        })?;
+        e.lower(crate::layout::Dialect::Cuda, &[])
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,6 +50,12 @@ pub struct MoeShape {
     pub routed_scale: f64,
     pub shared_gate: bool,
     pub sigmoid: bool,
+    pub groups: usize,
+    pub topk_group: usize,
+    pub score_bias: bool,
+    pub router_bias: bool,
+    pub expert_bias: bool,
+    pub hash: bool,
 }
 
 pub(crate) fn f32_literal(v: f64) -> String {
