@@ -45,7 +45,8 @@
     }
   },
   "mlp": {
-    "activation": "swiglu"
+    "activation": "swiglu",
+    "act_quant": "fp8"
   },
   "moe": {
     "experts": 256,

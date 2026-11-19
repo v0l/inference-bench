@@ -41,10 +41,10 @@ pub fn quant_f32() -> String {
     )
 }
 
-pub fn tiles() -> String {
+pub fn tiles(name: &str) -> String {
     prim::global(
         None,
-        "moe_tiles",
+        name,
         "const int* offsets, int* tile_map, int bm, int max_tiles",
         r##"    if (threadIdx.x != 0) return;
     int t = 0;
@@ -118,7 +118,7 @@ fn zero_acc() -> String {
     prim::zero_frag("acc[w]", ("i", "MI"), ("j", "NJ"), 8)
 }
 
-fn tile_setup() -> String {
+pub(super) fn tile_setup() -> String {
     format!("{}{}", tile_setup_head(), zero_acc())
 }
 
@@ -255,7 +255,7 @@ pub fn grouped() -> String {
     out.push_str(&prim::e2m1x2("moe_e2m1x2"));
     out.push_str(&prim::cp8_zfill("moe_cp8"));
     out.push_str(&quant_f32());
-    out.push_str(&tiles());
+    out.push_str(&tiles("moe_tiles"));
     out.push_str(&prim::swizzle("mma_chunk", "MMA_DATA"));
     out.push_str(&gemm());
     out.push_str(&variant("moe_mma_up", "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false"));

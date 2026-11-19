@@ -10,13 +10,22 @@ pub use crate::gemm::{
 
 pub const MOE_KERNELS: &[&str] = kir::moe::Family::Experts.kernels();
 pub const MOE_MMA_KERNELS: &[&str] = kir::moe::Family::GroupedMma.kernels();
-pub use kir::moe::{MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
+pub use kir::moe::{mma8_smem as moe_mma8_smem, MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
 
 pub fn moe_mma_enabled(spec: &Spec, target: &kir::Target) -> bool {
     spec.moe.is_some()
         && spec.mlp.quant == Some(Quant::Nvfp4G16)
         && spec.mlp.act_quant == crate::spec::ActQuant::Fp4
         && target.compute_capability.0 >= 12
+}
+
+pub fn moe_mma_fp8_enabled(spec: &Spec, target: &kir::Target) -> bool {
+    let Some(m) = &spec.moe else { return false };
+    spec.mlp.quant.unwrap_or(spec.quant) == Quant::Fp8Block128
+        && spec.mlp.act_quant == crate::spec::ActQuant::Fp8
+        && target.compute_capability >= (8, 9)
+        && m.expert_intermediate.is_multiple_of(FP8_BLOCK)
+        && spec.dims.hidden.is_multiple_of(FP8_BLOCK)
 }
 
 pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::MoeKernel>> {
@@ -35,7 +44,10 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if moe_mma_enabled(spec, target) {
-        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::GroupedMma, shape).map_err(anyhow::Error::msg)?);
+        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::GroupedMma, shape.clone()).map_err(anyhow::Error::msg)?);
+    }
+    if moe_mma_fp8_enabled(spec, target) {
+        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::GroupedMmaFp8, shape).map_err(anyhow::Error::msg)?);
     }
     Ok(out)
 }

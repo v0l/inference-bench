@@ -52,7 +52,7 @@ fn load_spec(path: &Path) -> Result<Spec> {
     }
     if path.is_dir() {
         let config = std::fs::read_to_string(path.join("config.json")).with_context(|| path.display().to_string())?;
-        let mut spec = Spec::from_hf_config(&config)?;
+        let mut spec = Spec::from_hf_config_serving(&config)?;
         spec.name = path.file_name().and_then(|n| n.to_str()).unwrap_or("checkpoint").to_string();
         spec.repo = path.display().to_string();
         return Ok(spec);
