@@ -19,6 +19,7 @@ pub struct OpsShape {
     pub weight_decoder: String,
     pub head_decoder: String,
     pub gated: Option<GatedExpr>,
+    pub mapped: Option<GatedExpr>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,7 +32,7 @@ impl GatedExpr {
     pub fn lower_cuda(&self) -> Result<String, String> {
         let e = crate::expr::Expr::parse(&self.expr)?;
         let e = e.subst(&|n| match n {
-            "g" | "u" => Some(crate::expr::Expr::Raw(n.to_string())),
+            "g" | "u" | "x" => Some(crate::expr::Expr::Raw(n.to_string())),
             other => self.params.iter().find(|(k, _)| k == other).map(|(k, v)| crate::expr::Expr::Const(k.clone(), *v as f32)),
         })?;
         e.lower(crate::layout::Dialect::Cuda, &[])

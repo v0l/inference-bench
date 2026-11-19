@@ -27,6 +27,24 @@ fn qkv() -> GemmShape {
     GemmShape::new(14336, 5120, Epilogue::Store, true)
 }
 
+fn up_map() -> GemmShape {
+    GemmShape::new(15680, 4480, Epilogue::Map, false)
+}
+
+#[test]
+fn the_mapped_epilogue_stores_one_activation_per_column_into_planes() {
+    let t = Target::sm_120();
+    let lib = kir::cuda::emit_gemms(&[
+        KernelInstance::gemm(&t, "up_map_mma", up_map(), WeightFormat::Bf16, Tuning::default().tile(Variant::Small), true, false).unwrap(),
+        KernelInstance::batch(&t, "up_map_f8b16", up_map(), WeightFormat::Fp8, 16).unwrap(),
+    ])
+    .unwrap();
+    assert!(lib.contains("constexpr int EPI_MAP = 3;"));
+    assert!(lib.contains("mapped_act(acc[i][j][h * 2])"), "the mma epilogue maps each column");
+    assert!(lib.contains("split_hi_lo(mapped_act(v), hi, lo);"), "the batch store maps each column");
+    assert!(KernelInstance::gemm(&Target::sm_120(), "odd", GemmShape::new(15, 4480, Epilogue::Map, false), WeightFormat::Bf16, Tile::SMALL, true, false).is_err());
+}
+
 fn cuda(k: &KernelInstance) -> String {
     format!("// {}\n{}", k.describe().replace('\n', "\n// "), kir::cuda::emit_gemm(k).unwrap())
 }
@@ -40,6 +58,8 @@ fn families(t: &Target) -> Vec<KernelInstance> {
     let mut out = vec![
         KernelInstance::gemm(t, "qkv_mma_big", qkv(), WeightFormat::Bf16, tuning.tile(Variant::Big), true, false).unwrap(),
         KernelInstance::gemm(t, "gate_up_mma", gate_up(), WeightFormat::Fp8, tuning.tile(Variant::Small), true, false).unwrap(),
+        KernelInstance::gemm(t, "up_map_mma", up_map(), WeightFormat::Bf16, tuning.tile(Variant::Small), true, false).unwrap(),
+        KernelInstance::batch(t, "up_map_f8b16", up_map(), WeightFormat::Fp8, 16).unwrap(),
         KernelInstance::gemm(t, "down_mma_tiny", down(), WeightFormat::Q8, tuning.tile(Variant::Tiny), false, false).unwrap(),
         KernelInstance::gemm(t, "qkv_ggb_narrow", qkv(), WeightFormat::Bf16, tuning.tile(Variant::Narrow), true, true).unwrap(),
         KernelInstance::gemm(t, "gate_up_f4w_big", gate_up(), WeightFormat::Fp4, tuning.tile(Variant::Big), true, false).unwrap(),

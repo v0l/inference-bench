@@ -55,6 +55,12 @@ __device__ __forceinline__ void {p}_store(int m, int r, float v, float u, float*
         size_t at = (size_t)m * (N / 2) + r / 2;
         out_hi[at] = (bf16_t)hi;
         out_lo[at] = (bf16_t)lo;
+    }} else if (EPI == EPI_MAP) {{
+        unsigned hi, lo;
+        split_hi_lo(mapped_act(v), hi, lo);
+        size_t at = (size_t)m * N + r;
+        out_hi[at] = (bf16_t)hi;
+        out_lo[at] = (bf16_t)lo;
     }} else {{
         float* o = out + (size_t)m * N + r;
         *o = EPI == EPI_RESIDUAL ? *o + v : v;

@@ -7,6 +7,10 @@ pub fn emit_ops(s: &OpsShape) -> Result<String, String> {
         Some(g) => g.lower_cuda().map_err(|e| format!("gated activation {:?}: {e}", g.expr))?,
         None => "activation(g) * u".to_string(),
     };
+    let mapped = match &s.mapped {
+        Some(m) => m.lower_cuda().map_err(|e| format!("mapped activation {:?}: {e}", m.expr))?,
+        None => "activation(x)".to_string(),
+    };
     let group = s.heads / s.kv_heads;
     let act = if s.gated_gelu { 1 } else { 0 };
     Ok(format!(
@@ -31,6 +35,7 @@ constexpr int ACT_KIND = {act};
 constexpr int Q8_GROUP = {q8_group};
 constexpr int FP8_BLOCK = {fp8_block};
 #define GATED_BODY(g, u) ({gated})
+#define MAPPED_BODY(x) ({mapped})
 {PRELUDE}",
         hidden = s.hidden,
         inter = s.inter,

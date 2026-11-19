@@ -132,6 +132,10 @@ __device__ __forceinline__ float gated_act(float g, float u) {
     return GATED_BODY(g, u);
 }
 
+__device__ __forceinline__ float mapped_act(float x) {
+    return MAPPED_BODY(x);
+}
+
 template <typename D>
 __device__ __forceinline__ void load_normed(const float* x, const float* nw, float* xs) {
     __shared__ float scratch[32];

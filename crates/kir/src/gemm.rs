@@ -88,6 +88,7 @@ pub enum Epilogue {
     Store,
     Residual,
     Act,
+    Map,
 }
 
 impl Epilogue {
@@ -96,6 +97,7 @@ impl Epilogue {
             Epilogue::Store => "EPI_STORE",
             Epilogue::Residual => "EPI_RESIDUAL",
             Epilogue::Act => "EPI_ACT",
+            Epilogue::Map => "EPI_MAP",
         }
     }
 }
@@ -561,6 +563,9 @@ impl KernelInstance {
             }
             if s.epi == Epilogue::Act && !s.n.is_multiple_of(4) {
                 return bad("gate/up epilogue needs n a multiple of 4".into());
+            }
+            if s.epi == Epilogue::Map && !s.n.is_multiple_of(2) {
+                return bad("the mapped epilogue needs n a multiple of 2".into());
             }
             Ok(())
         };

@@ -5,6 +5,7 @@ pub fn body() -> String {
         r##"constexpr int EPI_STORE = 0;
 constexpr int EPI_RESIDUAL = 1;
 constexpr int EPI_ACT = 2;
+constexpr int EPI_MAP = 3;
 
 template <int N, int BM, int BN, int WM, int WN, int EPI, bool BIAS, bool MFAST = false>
 __device__ __forceinline__ void gemm_epilogue(float (&acc)[BM / WM / 16][BN / WN / 8][4], const float* bias, float* out,
@@ -206,6 +207,18 @@ for (int h = 0; h < 2; h++) {
     float b = __shfl_xor_sync(0xffffffff, a, 1);
     if ((t & 1) == 0 && col < N && m < tokens)
         split_store2(out_hi, out_lo, (size_t)m * (N / 2) + col / 2, a, b);
+}
+"##),
+        r##"        return;
+    }
+    if (EPI == EPI_MAP) {
+"##.to_string(),
+        prim::unroll_nest(8, &[("i", "MI"), ("j", "NJ")], true, r##"int col = n0 + wn * TN + j * 8 + 2 * t;
+#pragma unroll
+for (int h = 0; h < 2; h++) {
+    int m = m0 + wm * TM + i * 16 + g + h * 8;
+    if (col < N && m < tokens)
+        split_store2(out_hi, out_lo, (size_t)m * N + col, mapped_act(acc[i][j][h * 2]), mapped_act(acc[i][j][h * 2 + 1]));
 }
 "##),
         r##"        return;

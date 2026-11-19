@@ -464,6 +464,7 @@ impl Module {
             q8_group: Q8_GROUP,
             fp8_block: FP8_BLOCK,
             gated: spec.mlp.gated.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
+            mapped: spec.mlp.ungated.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
             weight_decoder: wf.decoder().to_string(),
             head_decoder: head_wf.decoder().to_string(),
         };

@@ -224,6 +224,7 @@ pub fn emit_gemm(k: &crate::gemm::KernelInstance) -> Result<String, String> {
             bias = if shape.bias { " + bias[col]" } else { "" },
             res = if shape.epi == Epilogue::Residual { "v += out[at];\n        " } else { "" },
         ),
+        Epilogue::Map => return Err(format!("{}: the mapped epilogue has no WGSL lowering yet", k.name)),
         Epilogue::Act => format!(
             "    res[ly][lx] = acc;
     workgroupBarrier();
