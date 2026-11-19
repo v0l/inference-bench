@@ -60,7 +60,7 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
             "BM * CHUNKS",
             "CHUNKS",
             "c",
-            false,
+            None,
             "int m = m0 + r;\nsize_t row = (size_t)min(m, last_row);\n",
             &prim::split_copy(
                 "c < 4",
@@ -74,7 +74,7 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
             "BN * CHUNKS",
             "CHUNKS",
             "c",
-            false,
+            None,
             "size_t n = (size_t)min(n0 + r, N - 1);\n",
             &prim::split_copy(
                 "c < 4",
