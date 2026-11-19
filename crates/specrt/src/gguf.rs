@@ -469,6 +469,9 @@ impl Gguf {
                     shared_gate: shared > 0 && self.tensors.contains_key("blk.0.ffn_gate_inp_shexp.weight"),
                     shared_module: crate::spec::DEFAULT_SHARED_MODULE.to_string(),
                     routed_scale: 1.0,
+                    groups: 0,
+                    topk_group: 0,
+                    score_bias: false,
                     tp_split: crate::spec::TpSplit::Auto,
                     local: None,
                 })
@@ -505,7 +508,7 @@ impl Gguf {
                 scratch: Default::default(),
             },
             rope: Rope { style: RopeStyle::Neox, theta: Some(theta), scaling: self.rope_scaling(family, head_dim)?, mrope, local_theta: None, nope_layers: Vec::new() },
-            mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, fused_gate_up: false },
+            mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, fused_gate_up: false, gated: None },
             moe,
             linear_attention,
             mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),

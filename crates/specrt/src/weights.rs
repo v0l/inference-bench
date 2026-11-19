@@ -52,6 +52,7 @@ pub enum Stacked {
 pub struct MoeWeights {
     pub router: Vec<u16>,
     pub shared_gate: Option<Vec<f32>>,
+    pub score_bias: Option<Vec<f32>>,
     pub gate: Stacked,
     pub up: Stacked,
     pub down: Stacked,
@@ -1000,7 +1001,7 @@ impl Checkpoint {
         } else {
             None
         };
-        Ok(MoeWeights { router, shared_gate, gate: stack("gate", inter, h)?, up: stack("up", inter, h)?, down: stack("down", h, inter)? })
+        Ok(MoeWeights { router, shared_gate, score_bias: None, gate: stack("gate", inter, h)?, up: stack("up", inter, h)?, down: stack("down", h, inter)? })
     }
 
     fn moe_layer(&self, spec: &Spec, p: &str, quant: Quant) -> Result<MoeWeights> {
@@ -1072,6 +1073,7 @@ impl Checkpoint {
         Ok(MoeWeights {
             router: self.bf16(&format!("{p}.mlp.gate.weight"), &[e, h])?.into_owned(),
             shared_gate,
+            score_bias: if m.score_bias { Some(self.floats(&format!("{p}.mlp.gate.e_score_correction_bias"), &[e])?) } else { None },
             gate: stack("gate", inter, h)?,
             up: stack("up", inter, h)?,
             down: stack("down", h, inter)?,

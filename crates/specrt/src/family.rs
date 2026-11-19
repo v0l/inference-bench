@@ -145,6 +145,15 @@ pub struct FamilyMultipliers {
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyMlp {
     pub fused_gate_up: bool,
+    pub gated: Option<FamilyGated>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyGated {
+    pub expr: String,
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, ParamSource>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -152,6 +161,8 @@ pub struct FamilyMlp {
 pub struct FamilyMoe {
     pub shared_module: Option<String>,
     pub shared_gate: Option<bool>,
+    pub router: Option<crate::spec::RouterAct>,
+    pub score_bias: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

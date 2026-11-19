@@ -125,6 +125,10 @@ __device__ __forceinline__ float activation(float g) {
         : g / (1.0f + expf(-g));
 }
 
+__device__ __forceinline__ float gated_act(float g, float u) {
+    return GATED_BODY(g, u);
+}
+
 template <typename D>
 __device__ __forceinline__ void load_normed(const float* x, const float* nw, float* xs) {
     __shared__ float scratch[32];
@@ -194,7 +198,7 @@ __device__ void gate_up_act_norm(const void* w, const void* s, const float* x, c
         if (row >= INTER) return;
         float gu[2];
         D::template rows<HIDDEN, 2>(w, s, 2 * row, 1, xs, lane, gu);
-        if (lane == 0) out[D::template x_at<INTER>(row)] = activation(gu[0]) * gu[1];
+        if (lane == 0) out[D::template x_at<INTER>(row)] = gated_act(gu[0], gu[1]);
         row += gridDim.x * D::WARPS;
     } while (D::STRIDE);
 }

@@ -148,7 +148,7 @@ fn up_impl() -> String {
     if (row >= MOE_INTER) return;
     float g = moe_dot<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
     float u = moe_dot<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane);
-    if (lane == 0) act[(size_t)pair * MOE_INTER + row] = activation(g) * u;
+    if (lane == 0) act[(size_t)pair * MOE_INTER + row] = gated_act(g, u);
 "##,
                 prim::warp_ids()
             )
@@ -207,7 +207,7 @@ fn group_up_impl() -> String {
             moe_dot2<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
             moe_dot2<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane, live, uv);
             if (lane == 0) {{
-                for (int j = 0; j < live; j++) act[(size_t)sorted[base + j] * MOE_INTER + row] = activation(gv[j]) * uv[j];
+                for (int j = 0; j < live; j++) act[(size_t)sorted[base + j] * MOE_INTER + row] = gated_act(gv[j], uv[j]);
             }}
         }}
     }}
