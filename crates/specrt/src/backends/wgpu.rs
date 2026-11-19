@@ -312,10 +312,15 @@ impl Backend for Wgpu {
                 immediate_size: 0,
             });
             let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            let descriptor = wgpu::ShaderModuleDescriptor {
                 label: Some(k.name),
                 source: wgpu::ShaderSource::Wgsl(k.source.as_str().into()),
-            });
+            };
+            let module = if std::env::var_os("SPECRT_CHECKED").is_some() {
+                self.device.create_shader_module(descriptor)
+            } else {
+                unsafe { self.device.create_shader_module_trusted(descriptor, wgpu::ShaderRuntimeChecks::unchecked()) }
+            };
             let pipeline = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(k.name),
                 layout: Some(&pl),

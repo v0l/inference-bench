@@ -140,3 +140,10 @@ fn gemv_wrappers_golden_and_refusals() {
     assert!(GemvKernel::new(&Target::wgpu_baseline(), "x", Gemv::GateUpAct { decoder: "DecBf16".into() }).is_err());
     assert_ne!(ks[0].hash(), GemvKernel::new(&t, "qkv_proj", Gemv::Linear { decoder: "DecBf16".into(), n: 4096, k: 1024, bias: true, residual: false }).unwrap().hash());
 }
+
+#[test]
+#[ignore = "writes the linear_coop WGSL to KIR_DUMP_COOP"]
+fn dump_linear_coop_wgsl() {
+    let Some(path) = std::env::var_os("KIR_DUMP_COOP") else { return };
+    std::fs::write(path, kir::wgsl::emit_linear_coop_op(&shape(0, 128))).unwrap();
+}
