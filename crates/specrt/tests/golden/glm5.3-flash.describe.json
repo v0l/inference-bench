@@ -87,7 +87,8 @@
       1,
       2
     ],
-    "shared_gate": true
+    "shared_gate": true,
+    "routed_scale": 2.5
   },
   "linear_attention": {
     "kind": "gated_delta_net",

@@ -181,6 +181,20 @@
   "mlp": {
     "activation": "swiglu"
   },
+  "moe": {
+    "experts": 8,
+    "active": 2,
+    "expert_intermediate": 256,
+    "shared_intermediate": 512,
+    "dense_layers": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "norm_topk": false,
+    "shared_module": "shared_experts"
+  },
   "state": [
     {
       "name": "latent",

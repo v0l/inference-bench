@@ -13,6 +13,13 @@ unit_offset = false
 [runtime]
 split_activations = true
 
+[fields]
+num_experts = ["n_routed_experts"]
+
+[moe]
+shared_module = "shared_experts"
+shared_gate = false
+
 [attention]
 o_cols = "heads * v_head_dim"
 

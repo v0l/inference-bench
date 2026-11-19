@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 const SINKS: &str = "tiny-sinks";
 const CHUNKED: &str = "tiny-chunked";
 const MLA: &str = "tiny-deepseek-v2";
+const MLA_MOE: &str = "tiny-deepseek-v2-moe";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -109,6 +110,35 @@ fn the_deepseek_config_becomes_a_latent_cache_and_mla_nodes_from_the_family_toml
 }
 
 #[test]
+fn the_deepseek_moe_config_reads_wide_shared_experts_and_the_routed_scale_from_the_family_toml() {
+    let spec = spec(MLA_MOE);
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.top_k(), moe.expert_intermediate, moe.shared_intermediate), (8, 2, 256, 512));
+    assert_eq!((moe.shared_slots(), moe.pairs(), moe.shared_gate, moe.norm_topk, moe.routed_scale), (2, 4, false, false, 1.0));
+    assert_eq!(moe.shared_module, "shared_experts");
+    assert_eq!(moe.dense_layers, vec![0]);
+    spec.runnable().unwrap();
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+    assert!(module.source.contains("constexpr int MOE_SHARED = 2;") && module.source.contains("constexpr int MOE_PAIRS = 4;"));
+}
+
+#[test]
+fn the_deepseek_moe_checkpoint_loads_the_wide_shared_mlp_as_slots() {
+    let spec = spec(MLA_MOE);
+    let ck = specrt::weights::Checkpoint::open(&fixture(MLA_MOE)).unwrap();
+    let w = ck.layer(&spec, 1).unwrap().moe.unwrap();
+    let (h, inter) = (spec.dims.hidden, 256);
+    let specrt::weights::Stacked::Bf16(gate) = &w.gate else { panic!("bf16") };
+    let specrt::weights::Stacked::Bf16(down) = &w.down else { panic!("bf16") };
+    assert_eq!((gate.len(), down.len()), (10 * inter * h, 10 * h * inter));
+    assert!(w.shared_gate.is_none());
+    let whole = ck.bf16("model.layers.1.mlp.shared_experts.down_proj.weight", &[h, 2 * inter]).unwrap();
+    let second = &down[9 * h * inter..];
+    assert_eq!(second[0], whole[inter]);
+    assert_eq!(second[inter], whole[2 * inter + inter]);
+}
+
+#[test]
 fn the_mla_module_builds_with_no_binary_support() {
     let module = specrt::codegen::Module::generate_kv(&spec(MLA), 256, 1, &kir::Target::sm_120()).unwrap();
     for k in ["mla_latent_norm", "mla_rope_q", "mla_rope_k", "mla_latent_write", "mla_absorb_q", "mla_attention", "mla_expand_v"] {
@@ -123,6 +153,12 @@ fn the_mla_module_builds_with_no_binary_support() {
 #[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
 fn mla_absorbed_over_the_latent_cache_matches_transformers() {
     close(MLA, 5e-2);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn deepseek_moe_with_wide_shared_experts_matches_transformers() {
+    close(MLA_MOE, 5e-2);
 }
 
 #[test]

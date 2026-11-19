@@ -472,7 +472,7 @@ pub struct Dims {
     pub logit_scale: Option<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Moe {
     pub experts: usize,
@@ -491,6 +491,10 @@ pub struct Moe {
     pub norm_topk: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub shared_gate: bool,
+    #[serde(default = "default_shared_module", skip_serializing_if = "is_default_shared_module")]
+    pub shared_module: String,
+    #[serde(default = "default_routed_scale", skip_serializing_if = "is_default_routed_scale")]
+    pub routed_scale: f64,
     #[serde(default, skip_serializing_if = "TpSplit::is_auto")]
     pub tp_split: TpSplit,
     #[serde(skip)]
@@ -536,6 +540,24 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+pub const DEFAULT_SHARED_MODULE: &str = "shared_expert";
+
+fn default_shared_module() -> String {
+    DEFAULT_SHARED_MODULE.to_string()
+}
+
+fn is_default_shared_module(s: &String) -> bool {
+    s == DEFAULT_SHARED_MODULE
+}
+
+fn default_routed_scale() -> f64 {
+    1.0
+}
+
+fn is_default_routed_scale(v: &f64) -> bool {
+    *v == 1.0
+}
+
 fn default_sparse_step() -> usize {
     1
 }
@@ -565,8 +587,12 @@ impl Moe {
         self.active.unwrap_or(1)
     }
 
+    pub fn shared_slots(&self) -> usize {
+        if self.shared_intermediate == 0 { 0 } else { (self.shared_intermediate / self.expert_intermediate.max(1)).max(1) }
+    }
+
     pub fn pairs(&self) -> usize {
-        self.top_k() + usize::from(self.shared_intermediate > 0)
+        self.top_k() + self.shared_slots()
     }
 }
 
@@ -759,7 +785,7 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "model_type", "hidden_size", "intermediate_size", "moe_intermediate_size", "shared_expert_intermediate_size", "num_experts",
     "num_experts_per_tok", "mlp_only_layers", "decoder_sparse_step", "norm_topk_prob", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
     "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
-    "n_shared_experts", "first_k_dense_replace", "n_routed_experts", "num_nextn_predict_layers", "linear_attn_config",
+    "n_shared_experts", "routed_scaling_factor", "first_k_dense_replace", "n_routed_experts", "num_nextn_predict_layers", "linear_attn_config",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
     "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "embedding_multiplier", "attention_multiplier", "residual_multiplier", "logits_scaling", "no_rope_layers", "no_rope_layer_interval", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config",
@@ -791,6 +817,7 @@ struct HfConfig {
     #[serde(default)]
     n_shared_experts: Option<usize>,
     first_k_dense_replace: Option<usize>,
+    routed_scaling_factor: Option<f64>,
     #[serde(default)]
     mlp_only_layers: Vec<usize>,
     decoder_sparse_step: Option<usize>,
@@ -1206,6 +1233,13 @@ impl Spec {
         ensure!(m.active.is_some_and(|k| k >= 1 && k <= m.experts), "mixture-of-experts needs num_experts_per_tok between 1 and the expert count");
         ensure!(m.expert_intermediate.is_multiple_of(256) || experts_quant == Quant::Bf16, "nvfp4 experts need an intermediate size that is a multiple of 256");
         ensure!(m.expert_intermediate.is_multiple_of(16) && m.shared_intermediate.is_multiple_of(16), "expert intermediate sizes must be multiples of 16");
+        ensure!(
+            m.shared_intermediate == 0 || m.shared_intermediate.is_multiple_of(m.expert_intermediate),
+            "the shared experts ({} wide) must be a whole number of routed expert widths ({})",
+            m.shared_intermediate,
+            m.expert_intermediate
+        );
+        ensure!(m.shared_slots() <= 1 || experts_quant == Quant::Bf16, "shared experts wider than the routed experts are only supported with bf16 weights");
         ensure!(self.dims.hidden.is_multiple_of(256), "mixture-of-experts needs hidden to be a multiple of 256");
         Ok(())
     }
@@ -1389,7 +1423,9 @@ impl Spec {
                     sparse_step: hf.decoder_sparse_step.unwrap_or(1),
                     router: RouterAct::Softmax,
                     norm_topk: hf.norm_topk_prob.unwrap_or(hybrid),
-                    shared_gate: hf.n_shared_experts.is_some_and(|n| n > 0) || shared > 0,
+                    shared_gate: family.moe.shared_gate.unwrap_or(hf.n_shared_experts.is_some_and(|n| n > 0) || shared > 0),
+                    shared_module: family.moe.shared_module.clone().unwrap_or_else(default_shared_module),
+                    routed_scale: hf.routed_scaling_factor.unwrap_or(1.0),
                     tp_split: TpSplit::Auto,
                     local: None,
                 })

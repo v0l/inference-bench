@@ -107,12 +107,12 @@ fn emit_pairs() -> &'static str {
         int local = top_i[k] - first;
         bool mine = local >= 0 && local < MOE_LOCAL;
         idx[t * MOE_PAIRS + k] = mine ? local : -1;
-        coef[t * MOE_PAIRS + k] = mine ? (MOE_NORM_TOPK ? top_v[k] / picked : top_v[k]) : 0.0f;
+        coef[t * MOE_PAIRS + k] = mine ? (MOE_NORM_TOPK ? top_v[k] / picked : top_v[k]) * MOE_ROUTED_SCALE : 0.0f;
     }
-    if (MOE_SHARED && lane == 0) {
+    for (int s = lane; s < MOE_SHARED; s += 32) {
         bool mine = !MOE_PARALLEL || first == 0;
-        idx[t * MOE_PAIRS + MOE_K] = mine ? MOE_LOCAL : -1;
-        coef[t * MOE_PAIRS + MOE_K] = !mine ? 0.0f : MOE_SHARED_GATE ? 1.0f / (1.0f + expf(-gate_logit)) : 1.0f;
+        idx[t * MOE_PAIRS + MOE_K + s] = mine ? MOE_LOCAL + s : -1;
+        coef[t * MOE_PAIRS + MOE_K + s] = !mine ? 0.0f : MOE_SHARED_GATE ? 1.0f / (1.0f + expf(-gate_logit)) : 1.0f;
     }
 "##
 }
@@ -144,7 +144,7 @@ pub fn combine() -> String {
 
 pub fn permute() -> String {
     format!(
-        "constexpr int MOE_TJ = 2;\nconstexpr int MOE_SLOTS = MOE_LOCAL + (MOE_SHARED ? 1 : 0);\n\n{}",
+        "constexpr int MOE_TJ = 2;\nconstexpr int MOE_SLOTS = MOE_LOCAL + MOE_SHARED;\n\n{}",
         prim::global(
             Some(1024),
             "moe_permute",

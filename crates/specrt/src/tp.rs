@@ -188,6 +188,7 @@ fn columns_fit(spec: &Spec, m: &crate::spec::Moe, tp: usize) -> Result<()> {
         ensure!(n % tp == 0, "tp {tp} does not divide the {what} {n} of {}", spec.name);
         ensure!((n / tp).is_multiple_of(16), "tp {tp} leaves {} {what} columns per rank in {}, which is not a multiple of 16", n / tp, spec.name);
     }
+    ensure!(m.shared_slots() <= 1, "the {} shared experts of {} are wider than a routed expert, so a column split is not supported", m.shared_slots(), spec.name);
     let per_rank = m.expert_intermediate / tp;
     match spec.mlp.quant.unwrap_or(spec.quant) {
         crate::spec::Quant::Nvfp4G16 => ensure!(per_rank.is_multiple_of(256), "tp {tp} leaves {per_rank} nvfp4 expert columns per rank in {}, which must be a multiple of 256", spec.name),
@@ -339,7 +340,7 @@ impl RankCut {
             && plan_moe(spec, m, tp)?.split == MoeSplit::Columns
         {
             let inter = m.expert_intermediate;
-            for expert in ["mlp.experts.*", "mlp.shared_expert"] {
+            for expert in ["mlp.experts.*".to_string(), format!("mlp.{}", m.shared_module)] {
                 add(&format!("{expert}.gate_proj"), rowcut(inter));
                 add(&format!("{expert}.up_proj"), rowcut(inter));
                 add(&format!("{expert}.down_proj"), colcut(inter));

@@ -201,7 +201,7 @@ fn mlp_parts(spec: &Spec, index: usize, force_moe: bool) -> MlpParts {
                 dense: 0,
                 routed,
                 shared: 3 * h * m.shared_intermediate as u64,
-                router: h * m.experts as u64 + if m.shared_intermediate > 0 { h } else { 0 },
+                router: h * m.experts as u64 + if m.shared_intermediate > 0 && m.shared_gate { h } else { 0 },
                 active_routed: routed / m.experts.max(1) as u64 * per_token,
             }
         }

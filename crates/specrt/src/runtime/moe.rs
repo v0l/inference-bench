@@ -213,7 +213,7 @@ impl Runtime {
             unreachable!("the mma path needs NVFP4 experts")
         };
         let (h, inter) = (self.spec.dims.hidden, m.expert_intermediate);
-        let slots = m.local_experts() + usize::from(m.shared_intermediate > 0);
+        let slots = m.local_experts() + m.shared_slots();
         let pairs = n * m.pairs();
         let small = pairs / slots < MOE_MMA_BM / 2;
         let bm = if small { MOE_MMA_BM_SMALL } else { MOE_MMA_BM };
@@ -250,7 +250,7 @@ impl Runtime {
 
     fn moe_grouped(&self, w: &DeviceMoe, mb: &MoeBuffers, n: usize) -> Result<()> {
         let m = self.spec.moe.as_ref().expect("moe spec");
-        let slots = (m.local_experts() + usize::from(m.shared_intermediate > 0)) as u32;
+        let slots = (m.local_experts() + m.shared_slots()) as u32;
         let count = (n * m.pairs()) as i32;
         let mut b = self.stream.launch_builder(self.kernel("moe_permute"));
         b.arg(&mb.idx).arg(&mb.offsets).arg(&mb.sorted).arg(&count);

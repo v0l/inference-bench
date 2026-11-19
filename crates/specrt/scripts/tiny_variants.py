@@ -14,6 +14,7 @@ FIXTURES = Path(__file__).parent.parent / "tests/fixtures"
 SINKS = "tiny-sinks"
 CHUNKED = "tiny-chunked"
 MLA = "tiny-deepseek-v2"
+MLA_MOE = "tiny-deepseek-v2-moe"
 WINDOW = 16
 SOFTCAP = 8.0
 CHUNK = 16
@@ -108,7 +109,7 @@ def build_chunked_config():
     )
 
 
-def build_mla_config():
+def build_mla_config(dense_layers=4):
     from transformers import DeepseekV2Config
 
     return DeepseekV2Config(
@@ -124,7 +125,7 @@ def build_mla_config():
         qk_nope_head_dim=32,
         qk_rope_head_dim=32,
         v_head_dim=64,
-        first_k_dense_replace=4,
+        first_k_dense_replace=dense_layers,
         n_routed_experts=8,
         num_experts_per_tok=2,
         n_shared_experts=2,
@@ -151,18 +152,52 @@ def weights(model):
         elif "embed_tokens" in name or name == "lm_head.weight":
             v = torch.randn(p.shape, generator=g)
         else:
-            v = torch.randn(p.shape, generator=g) / p.shape[1] ** 0.5
+            v = torch.randn(p.shape, generator=g) / p.shape[-1] ** 0.5
         out[name] = v.to(torch.bfloat16).contiguous()
+    return out
+
+
+def split_experts(tensors):
+    out = {}
+    for name, v in tensors.items():
+        if name.endswith(".mlp.experts.gate_up_proj"):
+            base = name[: -len("gate_up_proj")]
+            half = v.shape[1] // 2
+            for e in range(v.shape[0]):
+                out[f"{base}{e}.gate_proj.weight"] = v[e, :half].contiguous()
+                out[f"{base}{e}.up_proj.weight"] = v[e, half:].contiguous()
+        elif name.endswith(".mlp.experts.down_proj"):
+            base = name[: -len("down_proj")]
+            for e in range(v.shape[0]):
+                out[f"{base}{e}.down_proj.weight"] = v[e].contiguous()
+        else:
+            out[name] = v
+    return out
+
+
+def fuse_experts(tensors):
+    out = {}
+    experts = {}
+    for name, v in tensors.items():
+        parts = name.split(".")
+        if ".mlp.experts." in name and parts[-3].isdigit():
+            experts.setdefault(".".join(parts[:-3]), {})[(int(parts[-3]), parts[-2])] = v
+        else:
+            out[name] = v
+    for base, items in experts.items():
+        n = 1 + max(e for e, _ in items)
+        out[f"{base}.gate_up_proj"] = torch.stack([torch.cat([items[(e, "gate_proj")], items[(e, "up_proj")]]) for e in range(n)])
+        out[f"{base}.down_proj"] = torch.stack([items[(e, "down_proj")] for e in range(n)])
     return out
 
 
 def make(name):
     from safetensors.torch import load_file, save_file
 
-    if name == MLA:
+    if name in (MLA, MLA_MOE):
         from transformers import DeepseekV2ForCausalLM as Model
 
-        cfg = build_mla_config()
+        cfg = build_mla_config(4 if name == MLA else 1)
         extra = {}
     elif name == SINKS:
         import transformers.models.qwen3.modeling_qwen3 as modeling
@@ -193,18 +228,18 @@ def make(name):
     path = folder / "model.safetensors"
     if not path.exists():
         folder.mkdir(parents=True, exist_ok=True)
-        save_file(weights(model), path)
+        save_file(split_experts(weights(model)), path)
         raw = json.loads(cfg.to_json_string())
         raw.update(extra)
         (folder / "config.json").write_text(json.dumps(raw, indent=2) + "\n")
-    model.load_state_dict({k: v.float() for k, v in load_file(path).items()}, strict=True)
+    model.load_state_dict({k: v.float() for k, v in fuse_experts(load_file(path)).items()}, strict=True)
     return model
 
 
 def main(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    for name in (SINKS, CHUNKED, MLA):
+    for name in (SINKS, CHUNKED, MLA, MLA_MOE):
         model = make(name)
         g = torch.Generator().manual_seed(SEED + 3)
         ids = torch.randint(0, 512, (PROMPT,), generator=g)

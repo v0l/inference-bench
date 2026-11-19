@@ -303,7 +303,7 @@ impl Op {
                 .collect(),
             Op::GdnPrefill | Op::GdnDecode => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
             Op::MoeRoute => vec!["mlp.gate.weight".into(), "mlp.shared_expert_gate.weight".into()],
-            Op::MoeExperts => vec!["mlp.experts".into(), "mlp.shared_expert".into()],
+            Op::MoeExperts => vec!["mlp.experts".into(), format!("mlp.{}", spec.moe.as_ref().map_or(crate::spec::DEFAULT_SHARED_MODULE, |m| &m.shared_module))],
             _ => Vec::new(),
         }
     }

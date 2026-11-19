@@ -81,8 +81,8 @@ impl MoeKernel {
         if s.experts == 0 || s.top_k == 0 || s.top_k > s.experts || s.top_k > 32 {
             return bad(format!("top_k {} of {} experts is out of range", s.top_k, s.experts));
         }
-        if s.pairs != s.top_k + usize::from(s.shared) {
-            return bad("pairs must be top_k plus the shared expert".into());
+        if s.pairs != s.top_k + s.shared {
+            return bad("pairs must be top_k plus the shared experts".into());
         }
         if s.inter == 0 {
             return bad("expert intermediate must be positive".into());

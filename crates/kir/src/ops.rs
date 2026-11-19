@@ -26,8 +26,9 @@ pub struct MoeShape {
     pub top_k: usize,
     pub pairs: usize,
     pub inter: usize,
-    pub shared: bool,
+    pub shared: usize,
     pub norm_topk: bool,
+    pub routed_scale: f64,
     pub shared_gate: bool,
     pub sigmoid: bool,
 }

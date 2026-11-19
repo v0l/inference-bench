@@ -1011,11 +1011,11 @@ impl Checkpoint {
         let m = spec.moe.as_ref().context("no [moe]")?;
         let (h, inter, e) = (spec.dims.hidden, m.expert_intermediate, m.experts);
         let (local, first) = (m.local_experts(), m.first_expert());
-        let shared = m.shared_intermediate > 0;
-        ensure!(!shared || m.shared_intermediate == inter, "the shared expert must be as wide as the routed experts");
-        let total = local + usize::from(shared);
+        let shared_slots = m.shared_slots();
+        let total = local + shared_slots;
+        let shared_module = format!("{p}.mlp.{}", m.shared_module);
         let module = |i: usize, which: &str| {
-            if i < local { format!("{p}.mlp.experts.{}.{which}_proj", first + i) } else { format!("{p}.mlp.shared_expert.{which}_proj") }
+            if i < local { format!("{p}.mlp.experts.{}.{which}_proj", first + i) } else { format!("{shared_module}.{which}_proj") }
         };
         let stack = |which: &str, rows: usize, cols: usize| -> Result<Stacked> {
             if quant == Quant::Fp8Block128 {
@@ -1046,13 +1046,29 @@ impl Checkpoint {
                 Ok(Stacked::Fp4 { packed, scales, inv_global, input_global })
             } else {
                 let mut w = Vec::with_capacity(total * rows * cols);
-                for i in 0..total {
+                for i in 0..local {
                     w.extend_from_slice(&self.bf16(&format!("{}.weight", module(i, which)), &[rows, cols])?);
+                }
+                if shared_slots == 1 {
+                    w.extend_from_slice(&self.bf16(&format!("{}.weight", module(local, which)), &[rows, cols])?);
+                } else if shared_slots > 1 {
+                    let name = format!("{}.weight", module(local, which));
+                    if which == "down" {
+                        let all = self.bf16(&name, &[rows, cols * shared_slots])?;
+                        for s in 0..shared_slots {
+                            for r in 0..rows {
+                                let start = r * cols * shared_slots + s * cols;
+                                w.extend_from_slice(&all[start..start + cols]);
+                            }
+                        }
+                    } else {
+                        w.extend_from_slice(&self.bf16(&name, &[rows * shared_slots, cols])?);
+                    }
                 }
                 Ok(Stacked::Bf16(w))
             }
         };
-        let shared_gate = if m.shared_gate { Some(self.floats(&format!("{p}.mlp.shared_expert_gate.weight"), &[1, h])?) } else { None };
+        let shared_gate = if m.shared_gate { Some(self.floats(&format!("{shared_module}_gate.weight"), &[1, h])?) } else { None };
         Ok(MoeWeights {
             router: self.bf16(&format!("{p}.mlp.gate.weight"), &[e, h])?.into_owned(),
             shared_gate,

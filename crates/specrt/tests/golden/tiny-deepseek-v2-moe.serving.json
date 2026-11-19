@@ -1,0 +1,210 @@
+{
+  "name": "deepseek_v2",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 256,
+    "intermediate": 512,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 4,
+    "head_dim": 32,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "mla_latent_norm",
+        "grid": [
+          "rows"
+        ],
+        "bind": {
+          "out": {
+            "buffer": "qkv"
+          },
+          "weight": {
+            "weight": "kv_a_layernorm.weight",
+            "len": "kv_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_rope_q",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_rope_k",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_latent_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "latent"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_absorb_q",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "kv_b_proj.weight",
+            "len": "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          },
+          "y": {
+            "buffer": "q_latent"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_attention",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "k_cache": {
+            "state": "latent"
+          },
+          "out": {
+            "buffer": "o_latent"
+          },
+          "q_latent": {
+            "buffer": "q_latent"
+          },
+          "softmax_scale": "softmax_scale",
+          "v_cache": {
+            "state": "latent"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_expand_v",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "kv_b_proj.weight",
+            "len": "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank"
+          },
+          "x": {
+            "buffer": "o_latent"
+          }
+        }
+      }
+    ],
+    "params": {
+      "kv_lora_rank": 96.0,
+      "mscale_all_dim": 0.0,
+      "qk_nope_head_dim": 32.0,
+      "qk_rope_head_dim": 32.0,
+      "softmax_scale": 0.125,
+      "v_head_dim": 64.0,
+      "yarn_factor": 1.0,
+      "yarn_mscale": 1.0
+    },
+    "projection": [
+      {
+        "tensor": "q_proj",
+        "rows": "heads * (qk_nope_head_dim + qk_rope_head_dim)"
+      },
+      {
+        "tensor": "kv_a_proj_with_mqa",
+        "rows": "kv_lora_rank + qk_rope_head_dim"
+      }
+    ],
+    "o_cols": "heads * v_head_dim",
+    "scratch": {
+      "o_latent": "heads * kv_lora_rank",
+      "q_latent": "heads * kv_lora_rank"
+    }
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 8,
+    "active": 2,
+    "expert_intermediate": 256,
+    "shared_intermediate": 512,
+    "dense_layers": [
+      0
+    ],
+    "norm_topk": false,
+    "shared_module": "shared_experts"
+  },
+  "state": [
+    {
+      "name": "latent",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "kv_lora_rank + qk_rope_head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    }
+  ]
+}
