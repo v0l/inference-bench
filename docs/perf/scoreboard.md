@@ -15,11 +15,12 @@ Ratios are specrt / best competitor, above 1.00 means we are faster. Rows are re
 
 
 
+
 | family | model | ours decode b1 | ours prefill | ours decode b8 | best competitor | their decode b1 | their prefill | their decode b8 | decode ratio | prefill ratio | b8 ratio | date | commit | command |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | gemma3 | `gemma-3-1b-it` | 95.7 | 11336.0 | 646.9 | llama.cpp/vllm | 93.8 | 25413.1 | 680.9 | 1.02 | 0.45 | 0.95 | 2026-11-19 | 82ce823 | `crates/specrt/scripts/perfpass.sh gemma3 --model /home/kieran/ib-gates/803/models/gemma-3-1b-it --host spark` |
 | gguf-q4 | `unsloth/Qwen3-0.6B-GGUF` | 226.4 | 18590.0 | 651.6 | llama.cpp | 320.4 | 20086.0 | 1400.3 | 0.71 | 0.93 | 0.47 | 2026-11-19 | 0338df9 | `crates/specrt/scripts/perfpass.sh gguf-q4 --model /home/kieran/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf --host spark` |
-| granite | `granite-3.3-2b-base` | 17.4 | 2011.1 | 298.4 | llama.cpp/vllm | 39.9 | 11437.3 | 295.5 | 0.44 | 0.18 | 1.01 | 2026-11-19 | 0338df9 | `crates/specrt/scripts/perfpass.sh granite --model /home/kieran/ib-gates/803/models/granite-3.3-2b-base --host spark` |
+| granite | `granite-3.3-2b-base` | 38.2 | 4504.5 | 301.3 | llama.cpp/vllm | 41.1 | 10134.2 | 299.6 | 0.93 | 0.44 | 1.01 | 2026-11-19 | 4c1116e | `crates/specrt/scripts/perfpass.sh granite --model /home/kieran/ib-gates/803/models/granite-3.3-2b-base --host spark` |
 | llama | `9535bd9b1d1dea6acafbdc4813b728796aeb28da` | 80.2 | 11183.1 | 634.4 | llama.cpp/vllm | 82.1 | 23607.8 | 615.3 | 0.98 | 0.47 | 1.03 | 2026-11-19 | 82ce823 | `crates/specrt/scripts/perfpass.sh llama --model /home/kieran/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B/snapshots/9535bd9b1d1dea6acafbdc4813b728796aeb28da --host spark` |
 | mistral | `Locutusque/TinyMistral-248M` | 421.9 | 63961.4 | 3015.6 | vllm | 307.5 | 71475.5 | 2955.5 | 1.37 | 0.89 | 1.02 | 2026-11-19 | 82ce823 | `crates/specrt/scripts/perfpass.sh mistral --model /home/kieran/.cache/huggingface/hub/models--Locutusque--TinyMistral-248M/snapshots/e84fb52945d42de4f2361b6047decdc65426dc2b --host spark` |
 | olmo2 | `OLMo-2-0425-1B` | 70.0 | 9803.5 | 566.5 | llama.cpp | 42.2 | 6858.1 | 409.2 | 1.66 | 1.43 | 1.38 | 2026-11-19 | 82ce823 | `crates/specrt/scripts/perfpass.sh olmo2 --model /home/kieran/ib-gates/803/models/OLMo-2-0425-1B --host spark` |
