@@ -68,8 +68,8 @@ def llama(raw):
     return out
 
 
-def vllm(raw):
-    p = raw / "vllm.json"
+def vllm(raw, name="vllm.json"):
+    p = raw / name
     if not p.exists():
         return None
     return json.loads(p.read_text())
@@ -97,6 +97,7 @@ def family_report(family, model, raw, out, commit, roof, batch, lens, command):
     b8, step_ms = ours_batch(raw / "ours-batch.log")
     ll = llama(raw)
     vl = vllm(raw)
+    sg = vllm(raw, "sglang.json")
     first = lens[0]
     ours_p = single.get(first, (None, None))[0]
     ours_d = single.get(first, (None, None))[1]
@@ -105,6 +106,8 @@ def family_report(family, model, raw, out, commit, roof, batch, lens, command):
         comp["llama.cpp"] = (ll["decode"], ll["prefill"].get(first), ll["batch"])
     if vl:
         comp["vllm"] = (vl["decode"].get("1"), vl["prefill"].get(str(first)), vl["decode"].get(str(batch)))
+    if sg:
+        comp["sglang"] = (sg["decode"].get("1"), sg["prefill"].get(str(first)), sg["decode"].get(str(batch)))
     def top(i):
         ranked = [(v[i], k) for k, v in comp.items() if v[i]]
         return max(ranked) if ranked else (None, None)
@@ -123,6 +126,10 @@ def family_report(family, model, raw, out, commit, roof, batch, lens, command):
         lines.append("| vllm | " + " | ".join(fnum(vl["prefill"].get(str(n))) for n in lens) + f" | {fnum(vl['decode'].get('1'))} | {fnum(vl['decode'].get(str(batch)))} |")
     else:
         lines.append("| vllm | " + " | ".join("not run" for _ in lens) + " | not run | not run |")
+    if sg:
+        lines.append("| sglang | " + " | ".join(fnum(sg["prefill"].get(str(n))) for n in lens) + f" | {fnum(sg['decode'].get('1'))} | {fnum(sg['decode'].get(str(batch)))} |")
+    else:
+        lines.append("| sglang | " + " | ".join("not run" for _ in lens) + " | not run | not run |")
     lines.append("")
     if weights_gb and ours_d:
         lines += [

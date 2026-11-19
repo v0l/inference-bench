@@ -78,6 +78,7 @@ roof=${ROOF_GBS:-273}
 batch=${BATCH:-8}
 new=${NEW:-128}
 vllm_util=${VLLM_UTIL:-0.12}
+sglang_py=${SGLANG_PY:-$HOME/.venv-sglang/bin/python}
 date=$(date +%F)
 out=$repo/docs/perf/$family
 raw=$work/raw/$family-$date
@@ -196,6 +197,14 @@ if [ -f "$ckpt/config.json" ] && [ -x "$vllm_py" ] && [ -z "${NO_VLLM:-}" ]; the
         || echo "vllm failed: $(grep -E 'Error|error' "$raw/vllm.log" | tail -1 | cut -c1-200)"
 else
     echo "vllm: not run (not a safetensors checkpoint dir)"
+fi
+
+if [ -f "$ckpt/config.json" ] && [ -x "$sglang_py" ] && [ -z "${NO_SGLANG:-}" ]; then
+    echo "== sglang"
+    run -p MemoryMax=40G --setenv=PATH="$(dirname "$sglang_py"):/usr/local/cuda/bin:/usr/bin:/bin" --setenv=XDG_CACHE_HOME=$work/xdg "$sglang_py" "$here/sglang_perf.py" "$ckpt" --lens "$lens" --new "$new" --batch "$batch" --rounds "$rounds" --util "$vllm_util" --out "$raw/sglang.json" >"$raw/sglang.log" 2>&1 \
+        || echo "sglang failed: $(grep -E 'Error|error' "$raw/sglang.log" | tail -1 | cut -c1-200)"
+else
+    echo "sglang: not run (no venv or not a safetensors checkpoint dir)"
 fi
 
 python3 "$here/perfpass_report.py" family "$family" "$model" "$raw" "$out" "$commit" "$roof" "$batch" "$lens" \

@@ -32,7 +32,7 @@ Same model, same hardware, same lengths, same concurrency:
 
 - llama.cpp: the checkpoint is converted to a bf16 GGUF (`convert_hf_to_gguf.py`, in a throwaway venv under `~/ib-gates/803/venv`), then `llama-bench -p <lens> -n 0`, `llama-bench -n 128` and `llama-batched-bench -npl 8`, flash attention on.
 - vLLM: `vllm_perf.py` from `~/.venv-vllm`, read only, `gpu_memory_utilization 0.12`, prefix caching off, caches redirected to `~/ib-gates/803` so nothing under `~/.cache/vllm` or `~/.cache/flashinfer` is written. Prefill is the time to one token, decode is the slope between 1 and 128 new tokens.
-- SGLang: not installed on the Spark. Install it only in a throwaway venv, and say "not run" otherwise.
+- SGLang: `sglang_perf.py` from `~/.venv-sglang` (sglang 0.5.23, installed on the Spark), radix cache off, same lengths. `perfpass.sh` runs it when the venv exists; otherwise the column says `not run`.
 - A column that cannot run says `not run` with the reason in the family report.
 
 Prefill and decode of competitors are timed differently (HTTP-free in all three here, but vLLM's scheduler adds a few ms per request), so compare ratios within a few percent only.
@@ -77,3 +77,10 @@ crates/specrt/scripts/vllm27b-nsys.sh
 ```
 
 and the nsys tables for the 27B with `crates/specrt/scripts/nsys617.sh` (`SEQS=1` and `SEQS=8`). Put the numbers in `docs/perf/qwen3_5/<date>.md` with `desktop` in the title and add the row by hand with `perfpass_report.py merge`.
+
+## Gaps from the first pass (#817)
+
+- qwen3_moe: measured on `Qwen/Qwen3-30B-A3B-FP8` (31 GB, fits the Spark gate), not the 61 GB bf16 checkpoint. specrt decode is ahead of vLLM (52.6 vs 40.3 tok/s b1, 158.7 vs 133.3 b8) but prefill is 306 tok/s against vLLM's 3959 (ratio 0.08). SGLang did not fit beside the resident Spark load at 0.45 memory fraction (needs above 0.533): not run.
+- qwen3_next: not run. The only checkpoints on the Spark are 89 GB (Qwen3-Coder-Next FP8) and 99 GB (Qwen3.8-Flash-Next NVFP4), over the 60 GB gate. Needs a desktop window opened by the supervisor.
+- gguf-q8: `Qwen3-0.6B-Q8_0.gguf` made with `convert_hf_to_gguf.py --outtype q8_0`; measured.
+- SGLang 0.5.23 installs and runs on the Spark (aarch64, sm_121) in `~/.venv-sglang`. Qwen3-0.6B: prefill 37118 (1024) and 27087 (8192) tok/s, decode 109.4 b1 and 1012.0 b8, against specrt qwen3 21998 / 140.0 / 1081.9. `perfpass.sh` now runs `sglang_perf.py` for every safetensors family.
