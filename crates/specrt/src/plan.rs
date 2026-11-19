@@ -22,6 +22,8 @@ pub enum Buf {
     PreLin,
     PreBa,
     GdnPlanes,
+    Mix,
+    MixPlanes,
     Branch,
     Logits,
     FcPlanes,
@@ -44,6 +46,8 @@ impl Buf {
             Buf::PreLin => "lin",
             Buf::PreBa => "ba",
             Buf::GdnPlanes => "gdn planes",
+            Buf::Mix => "mix",
+            Buf::MixPlanes => "mix planes",
             Buf::Branch => "branch",
             Buf::Logits => "logits",
             Buf::FcPlanes => "fc planes",
@@ -62,6 +66,8 @@ pub enum Weight {
     LinIn,
     LinBa,
     LinOut,
+    MixIn,
+    MixOut,
     LmHead,
     MtpFc,
     MtpQkv,
@@ -81,6 +87,8 @@ impl Weight {
             Weight::LinIn => "lin_in",
             Weight::LinBa => "lin_ba",
             Weight::LinOut => "lin_out",
+            Weight::MixIn => "mix_in",
+            Weight::MixOut => "mix_out",
             Weight::LmHead => "lm_head",
             Weight::MtpFc => "mtp_fc",
             Weight::MtpQkv => "mtp_qkv",
@@ -99,6 +107,8 @@ impl Weight {
             Weight::O | Weight::Down | Weight::LinOut | Weight::MtpFc | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
             Weight::LinIn => la.map_or(0, |l| l.in_proj_rows()),
             Weight::LinBa => la.map_or(0, |l| l.ba_rows()),
+            Weight::MixIn => spec.mix_in_rows(),
+            Weight::MixOut => spec.dims.hidden,
             Weight::LmHead | Weight::MtpHead => spec.dims.vocab,
         }
     }
@@ -122,6 +132,8 @@ impl Weight {
             Weight::LinIn => vec![w("linear_attn.in_proj_qkv"), w("linear_attn.in_proj_z")],
             Weight::LinBa => vec![w("linear_attn.in_proj_b"), w("linear_attn.in_proj_a")],
             Weight::LinOut => vec![w("linear_attn.out_proj")],
+            Weight::MixIn => spec.mixer.iter().flat_map(|m| m.projection.iter().map(move |p| format!("{}.{}.weight", m.module, p.tensor))).collect(),
+            Weight::MixOut => spec.mixer.iter().map(|m| format!("{}.{}.weight", m.module, m.out_tensor)).collect(),
             Weight::LmHead if spec.dims.tie_embeddings => vec![w("embed_tokens")],
             Weight::LmHead => vec![w("lm_head")],
             Weight::MtpFc | Weight::MtpQkv | Weight::MtpO | Weight::MtpGateUp | Weight::MtpDown | Weight::MtpHead => Vec::new(),
@@ -191,6 +203,7 @@ pub enum Op {
     DecodeAttention,
     DecodeRope,
     Kernel { node: u8 },
+    MixKernel { node: u8 },
     Swiglu,
     GdnPrefill,
     GdnDecode,
@@ -240,6 +253,7 @@ impl Op {
             Op::Flash | Op::FlashLegacy => "attention".into(),
             Op::DecodeAttention => "decode attention".into(),
             Op::Kernel { .. } => "described kernel".into(),
+            Op::MixKernel { .. } => "described mixer kernel".into(),
             Op::Swiglu => "swiglu".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "delta rule".into(),
             Op::MtpIn => "draft input".into(),
@@ -268,6 +282,7 @@ impl Op {
             Op::Linear { input, output, .. } => format!("{} to {}", input.label(), output.label()),
             Op::KvRope | Op::QkRope | Op::DecodeRope => "qkv to kv cache".into(),
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention | Op::Kernel { .. } => "qkv and kv cache to attn".into(),
+            Op::MixKernel { .. } => "mix and sequence state to mix planes".into(),
             Op::Swiglu => "gate_up to act".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "lin, ba and state to gdn".into(),
             Op::MtpIn => "tokens and hidden to fc planes".into(),
@@ -299,6 +314,17 @@ impl Op {
                 .filter_map(|b| match b {
                     crate::graph::Bind::Weight { weight, .. } => Some(format!("self_attn.{weight}")),
                     crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_) | crate::graph::Bind::Buffer { .. } | crate::graph::Bind::State { .. } => None,
+                })
+                .collect(),
+            Op::MixKernel { node } => spec
+                .mixer
+                .iter()
+                .filter_map(|m| m.node.get(*node as usize).map(|n| (m, n)))
+                .flat_map(|(m, n)| {
+                    n.bind.values().filter_map(move |b| match b {
+                        crate::graph::Bind::Weight { weight, .. } => Some(format!("{}.{weight}", m.module)),
+                        _ => None,
+                    })
                 })
                 .collect(),
             Op::GdnPrefill | Op::GdnDecode => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
@@ -369,6 +395,7 @@ impl Op {
             Op::FlashLegacy => names(&["flash_attention"]),
             Op::DecodeAttention => names(&["qk_norm_rope", "batch_decode_attention", "batch_decode_combine"]),
             Op::Kernel { node } => spec.attention.node.get(*node as usize).and_then(|n| n.kernel.clone()).into_iter().collect(),
+            Op::MixKernel { node } => spec.mixer.as_ref().and_then(|m| m.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::Swiglu => names(&["swiglu"]),
             Op::GdnPrefill => names(&[
                 "gdn_conv_prefill",

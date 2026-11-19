@@ -8,6 +8,7 @@ pub use kg::{BATCH_MAX_TOKENS, BATCH_REDUCE_BLOCK, BATCH_VARIANTS, FP4_GEMV_THRE
 
 pub const MMA_LINEARS: [&str; 5] = ["qkv", "o", "gate_up", "down", "lm_head"];
 pub const GDN_LINEARS: [&str; 3] = ["lin_in", "lin_out", "lin_ba"];
+pub const MIX_LINEARS: [&str; 2] = ["mix_in", "mix_out"];
 pub const FP8_ACT_LINEARS: [&str; 6] = ["qkv", "o", "gate_up", "down", "lin_in", "lin_out"];
 pub const FP4_LINEARS: [&str; 2] = ["gate_up", "down"];
 
@@ -120,6 +121,8 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
         "lin_in" => (la.map_or(0, |l| l.in_proj_rows()), d.hidden, Epilogue::Store, false),
         "lin_ba" => (la.map_or(0, |l| l.ba_rows()), d.hidden, Epilogue::Store, false),
         "lin_out" => (d.hidden, la.map_or(0, |l| l.value_dim()), Epilogue::Residual, false),
+        "mix_in" => (spec.mix_in_rows(), d.hidden, Epilogue::Store, false),
+        "mix_out" => (d.hidden, spec.mix_out_cols(), Epilogue::Residual, false),
         "mtp_fc" => (d.hidden, 2 * d.hidden, Epilogue::Store, false),
         "mtp_qkv" => (spec.qkv_rows(), d.hidden, Epilogue::Store, false),
         "mtp_o" => (d.hidden, spec.q_dim(), Epilogue::Residual, false),
@@ -227,7 +230,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
     let la = spec.linear_attention.is_some();
     let dequant = t.language == kir::Language::Wgsl;
     let mut set = GemmSet { kernels: Vec::new(), refused: Vec::new(), lenient: dequant };
-    let gdn: &[&str] = if la { &GDN_LINEARS } else { &[] };
+    let gdn: &[&str] = if la { &GDN_LINEARS } else if spec.mixer.is_some() { &MIX_LINEARS } else { &[] };
     let mma = t.has(kir::Feature::Mma16816);
     if !mma && !dequant {
         return Ok(set);

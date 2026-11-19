@@ -12,6 +12,8 @@ pub const KIND: &str = "kir-kernel";
 
 pub const ROW_FAMILIES: [&str; 3] = ["span_rope", "state_write", "head_matvec"];
 
+pub const SEQ_FAMILIES: [&str; 3] = ["recurrence", "seq_conv", "group_norm"];
+
 pub const BUILTIN: [(&str, &str); 10] = [
     ("rmsnorm", include_str!("../kernels/rmsnorm.toml")),
     ("swiglu", include_str!("../kernels/swiglu.toml")),
@@ -71,6 +73,10 @@ pub struct Description {
     pub geometry: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     pub query: Vec<BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub recurrence: Option<BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub input: Vec<BTreeMap<String, Value>>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -314,6 +320,14 @@ pub struct StageDesc {
     pub materialize: Option<String>,
     #[serde(default)]
     pub sink: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub row: Option<Value>,
+    #[serde(default)]
+    pub head: Option<Value>,
+    #[serde(default)]
+    pub offset: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -572,7 +586,7 @@ impl Description {
     }
 
     fn sizes(&self, shape: &Shape, table: &BTreeMap<String, Value>, keys: &[&str], what: &str) -> Result<BTreeMap<String, u32>, String> {
-        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && k.as_str() != "src" && k.as_str() != "style") {
+        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !matches!(k.as_str(), "src" | "style" | "name" | "space" | "act" | "input" | "output" | "eps")) {
             return Err(format!("{}: {what} has no key {k:?}", self.name));
         }
         let mut out = BTreeMap::new();
@@ -606,6 +620,107 @@ impl Description {
             out_head: s["out_head"],
             out_offset: s["out_offset"],
         }))
+    }
+
+    fn params(&self) -> Result<Vec<Param>, String> {
+        let mut params = Vec::new();
+        for p in &self.param {
+            let role = match p.role.as_str() {
+                "weight" => Role::Weight,
+                "activation" => Role::Activation,
+                "value" => Role::Value,
+                o => return Err(format!("{}: param role {o:?} is not weight, activation or value", self.name)),
+            };
+            let access = match p.access.as_str() {
+                "read" => Access::Read,
+                "write" => Access::Write,
+                o => return Err(format!("{}: param access {o:?} is unknown", self.name)),
+            };
+            params.push(Param { name: intern(&p.name), ty: self.scalar(p)?, role, access });
+        }
+        Ok(params)
+    }
+
+    fn expr_arg(&self, words: &[(String, String)], table: &BTreeMap<String, Value>, key: &str, default: &str) -> Result<Expr, String> {
+        let text = match table.get(key) {
+            None => default.to_string(),
+            Some(Value::String(s)) => s.clone(),
+            Some(v) => return Err(format!("{}: {key} is {v}, not an expression", self.name)),
+        };
+        Expr::parse(&self.text(words, &text)).map_err(|e| format!("{}: {key}: {e}", self.name))
+    }
+
+    fn seq_kernel(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
+        use crate::recur::{Input, Recurrence, SeqBody, Space, Stage as RStage};
+        let params = self.params()?;
+        let words: Vec<(String, String)> = self.args.iter().filter_map(|(k, v)| v.as_str().filter(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).map(|s| (k.clone(), s.to_string()))).collect();
+        let fail = |e: String| if e.starts_with(&format!("{}:", self.name)) { e } else { format!("{}: {e}", self.name) };
+        match self.family.as_str() {
+            "seq_conv" => {
+                let n = self.sizes(shape, &self.args, &["x_row", "x_offset", "channels", "taps", "y_row", "y_offset", "layers"], "[args]")?;
+                let expr = self.expr_arg(&words, &self.args, "act", "v")?;
+                let body = SeqBody::Conv { x_row: n["x_row"], x_offset: n["x_offset"], channels: n["channels"], taps: n["taps"], y_row: n["y_row"], y_offset: n["y_offset"], layers: n["layers"], expr };
+                Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
+            }
+            "group_norm" => {
+                let n = self.sizes(shape, &self.args, &["x_row", "x_offset", "g_row", "g_offset", "width", "w_group", "out_row"], "[args]")?;
+                let eps = self.number(shape, "eps")? as f32;
+                let input = self.expr_arg(&words, &self.args, "input", "x")?;
+                let output = self.expr_arg(&words, &self.args, "output", "w * n")?;
+                let body = SeqBody::GroupNorm { x_row: n["x_row"], x_offset: n["x_offset"], g_row: n["g_row"], g_offset: n["g_offset"], width: n["width"], w_group: n["w_group"], out_row: n["out_row"], eps, input, output };
+                Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
+            }
+            _ => {
+                let r = self.recurrence.as_ref().ok_or_else(|| format!("{}: family recurrence needs a [recurrence] table", self.name))?;
+                let state = r.get("state").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: [recurrence] needs state", self.name))?.to_string();
+                let mut table = r.clone();
+                table.remove("state");
+                let n = self.sizes(shape, &table, &["keys", "values", "ksplit", "layers"], "[recurrence]")?;
+                if !n["ksplit"].is_power_of_two() || n["ksplit"] > 32 {
+                    return Err(format!("{}: ksplit {} must be a power of two up to 32", self.name, n["ksplit"]));
+                }
+                let mut inputs = Vec::new();
+                for i in &self.input {
+                    let name = i.get("name").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: [[input]] needs name", self.name))?;
+                    let src = i.get("src").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: [[input]] {name} needs src", self.name))?;
+                    let space = match i.get("space").and_then(|v| v.as_str()) {
+                        Some("key") => Space::Key,
+                        Some("value") => Space::Value,
+                        Some("scalar") => Space::Scalar,
+                        o => return Err(format!("{}: [[input]] {name} space {o:?} is not key, value or scalar", self.name)),
+                    };
+                    let mut sized = i.clone();
+                    sized.entry("per".into()).or_insert(Value::Integer(1));
+                    let s = self.sizes(shape, &sized, &["row", "head", "per", "offset"], "[[input]]")?;
+                    inputs.push(Input { name: name.to_string(), src: src.to_string(), space, row: s["row"], head: s["head"], per: s["per"], offset: s["offset"] });
+                }
+                let mut consts = Vec::new();
+                for c in &self.consts {
+                    consts.push(Const { name: c.name.clone(), value: self.constant(shape, c)?, wgsl_const: false, fold: c.fold });
+                }
+                let need = |v: &Option<String>, what: &str, op: &str| v.clone().ok_or_else(|| format!("{}: stage {op} needs {what}", self.name));
+                let parse = |text: String| Expr::parse(&self.text(&words, &text)).map_err(|e| format!("{}: {e}", self.name));
+                let size = |v: &Option<Value>, key: &str| -> Result<u32, String> { v.as_ref().map_or(Ok(0), |v| self.size(shape, v, key)) };
+                let mut stages = Vec::new();
+                for s in &self.stage {
+                    let e = || parse(need(&s.expr, "expr", &s.op)?);
+                    let dst = || need(&s.name, "name", &s.op);
+                    stages.push(match s.op.as_str() {
+                        "key" => RStage::Key { dst: dst()?, expr: e()? },
+                        "key_sum" => RStage::KeySum { dst: dst()?, expr: e()? },
+                        "scalar" => RStage::Scalar { dst: dst()?, expr: e()? },
+                        "value" => RStage::Value { dst: dst()?, expr: e()? },
+                        "decay" => RStage::Decay { expr: e()? },
+                        "update" => RStage::Update { key: parse(need(&s.key, "key", &s.op)?)?, value: parse(need(&s.value, "value", &s.op)?)? },
+                        "read" => RStage::Read { dst: dst()?, key: parse(need(&s.key, "key", &s.op)?)? },
+                        "store" => RStage::Store { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row: size(&s.row, "row")?, head: size(&s.head, "head")?, offset: size(&s.offset, "offset")? },
+                        o => return Err(format!("{}: recurrence stage op {o:?} is not key, key_sum, scalar, value, decay, update, read or store", self.name)),
+                    });
+                }
+                let body = Recurrence { state, keys: n["keys"], values: n["values"], ksplit: n["ksplit"], layers: n["layers"], consts, inputs, stages };
+                Kernel::recurrence(t, intern(&self.name), n["values"] * n["ksplit"], params, body).map_err(fail)
+            }
+        }
     }
 
     fn row_kernel(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
@@ -736,16 +851,20 @@ impl Description {
         if self.shape.is_some() {
             return Err(format!("{}: family {} takes no [shape]", self.name, self.family));
         }
-        if self.family != "compose" && self.family != "scan_attention" && !ROW_FAMILIES.contains(&self.family.as_str()) && (self.rows.is_some() || !self.param.is_empty() || !self.consts.is_empty() || !self.stage.is_empty()) {
+        if self.family != "compose" && self.family != "scan_attention" && !ROW_FAMILIES.contains(&self.family.as_str()) && !SEQ_FAMILIES.contains(&self.family.as_str()) && (self.rows.is_some() || !self.param.is_empty() || !self.consts.is_empty() || !self.stage.is_empty()) {
             return Err(format!("{}: only family compose takes rows, param, const and stage", self.name));
         }
         if self.family != "scan_attention" && (self.geometry.is_some() || !self.query.is_empty()) {
             return Err(format!("{}: only family scan_attention takes [geometry] and [[query]]", self.name));
         }
+        if self.family != "recurrence" && (self.recurrence.is_some() || !self.input.is_empty()) {
+            return Err(format!("{}: only family recurrence takes [recurrence] and [[input]]", self.name));
+        }
         match self.family.as_str() {
             "compose" => self.compose(t, shape),
             "scan_attention" => self.scan(t, shape),
             f if ROW_FAMILIES.contains(&f) => self.row_kernel(t, shape),
+            f if SEQ_FAMILIES.contains(&f) => self.seq_kernel(t, shape),
             "rmsnorm" => {
                 self.known(&["width", "eps", "offset"])?;
                 Kernel::rmsnorm_offset(t, self.count(shape, "width")?, self.number(shape, "eps")? as f32, self.number(shape, "offset")? as f32, threads)

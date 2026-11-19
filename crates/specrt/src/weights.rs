@@ -38,9 +38,16 @@ pub struct Gdn<'a> {
     pub out: Matrix<'a>,
 }
 
+pub struct Described<'a> {
+    pub in_proj: Matrix<'a>,
+    pub out: Matrix<'a>,
+    pub extra: Vec<(String, Vec<f32>)>,
+}
+
 pub enum Mixer<'a> {
     Attention(Attn<'a>),
     Linear(Gdn<'a>),
+    Described(Described<'a>),
 }
 
 pub enum Stacked {
@@ -122,7 +129,7 @@ struct Shard {
 pub struct Checkpoint {
     gguf: Option<std::sync::Arc<Gguf>>,
     shards: std::sync::Arc<Vec<Shard>>,
-    names: std::sync::Arc<HashMap<String, usize>>,
+    names: std::sync::Arc<HashMap<String, (usize, String)>>,
     staged: Option<crate::loader::Batch>,
     cut: Option<std::sync::Arc<crate::tp::RankCut>>,
     owned: std::sync::Arc<std::sync::Mutex<Vec<Box<[u8]>>>>,
@@ -164,7 +171,7 @@ impl Checkpoint {
             let (header, meta) =
                 SafeTensors::read_metadata(&map).with_context(|| path.display().to_string())?;
             for name in meta.tensors().into_keys() {
-                if let Some(prev) = names.insert(name.clone(), i) {
+                if let Some((prev, _)) = names.insert(name.clone(), (i, name.clone())) {
                     bail!("{name} is in both {} and {}", files[prev].display(), path.display());
                 }
             }
@@ -196,6 +203,22 @@ impl Checkpoint {
         Self::open(&find_checkpoint(repo)?)
     }
 
+    pub fn renamed(mut self, rules: &std::collections::BTreeMap<String, String>) -> Checkpoint {
+        if rules.is_empty() || self.gguf.is_some() {
+            return self;
+        }
+        let mut names = HashMap::new();
+        for (name, at) in self.names.iter() {
+            let mut public = name.clone();
+            for (from, to) in rules {
+                public = public.replace(from.as_str(), to);
+            }
+            names.insert(public, at.clone());
+        }
+        self.names = std::sync::Arc::new(names);
+        self
+    }
+
     pub fn has(&self, name: &str) -> bool {
         match &self.gguf {
             Some(g) => g.tensor_for_hf(name).is_some_and(|n| g.tensors.contains_key(&n)),
@@ -213,14 +236,14 @@ impl Checkpoint {
     }
 
     pub fn shape_of(&self, name: &str) -> Result<Vec<usize>> {
-        let &i = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
-        Ok(self.shards[i].meta.info(name).context("tensor info")?.shape.clone())
+        let (i, stored) = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+        Ok(self.shards[*i].meta.info(stored).context("tensor info")?.shape.clone())
     }
 
     fn full_view(&self, name: &str) -> Result<View<'_>> {
-        let &i = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
-        let shard = &self.shards[i];
-        let info = shard.meta.info(name).context("tensor info")?;
+        let (i, stored) = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+        let shard = &self.shards[*i];
+        let info = shard.meta.info(stored).context("tensor info")?;
         let (from, to) = info.data_offsets;
         let data = match self.staged.as_ref().and_then(|b| b.get(name)) {
             Some(staged) => staged,
@@ -232,9 +255,10 @@ impl Checkpoint {
     pub fn extents(&self, names: &[String]) -> Result<Vec<crate::loader::Item>> {
         let mut items = Vec::with_capacity(names.len());
         for name in names {
-            let &file = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+            let (file, stored) = self.names.get(name).with_context(|| format!("{name} is not in the checkpoint"))?;
+            let file = *file;
             let shard = &self.shards[file];
-            let (from, to) = shard.meta.info(name).context("tensor info")?.data_offsets;
+            let (from, to) = shard.meta.info(stored).context("tensor info")?.data_offsets;
             items.push(crate::loader::Item { name: name.clone(), file, offset: (shard.data_start + from) as u64, len: (to - from) as u64 });
         }
         items.sort_by_key(|i| (i.file, i.offset));
@@ -260,9 +284,9 @@ impl Checkpoint {
     pub fn release_names(&self, names: &[String]) {
         let page = 4096usize;
         for name in names {
-            let Some(&i) = self.names.get(name) else { continue };
-            let sh = &self.shards[i];
-            let Ok(info) = sh.meta.info(name).context("tensor info") else { continue };
+            let Some((i, stored)) = self.names.get(name) else { continue };
+            let sh = &self.shards[*i];
+            let Ok(info) = sh.meta.info(stored).context("tensor info") else { continue };
             let (from, to) = info.data_offsets;
             let start = (sh.data_start + from).div_ceil(page) * page;
             let end = (sh.data_start + to) / page * page;
@@ -918,6 +942,29 @@ impl Checkpoint {
         })
     }
 
+    fn described_mixer(&self, spec: &Spec, p: &str) -> Result<Described<'_>> {
+        let m = spec.mixer.as_ref().context("no [mixer]")?;
+        let h = spec.dims.hidden;
+        let module = format!("{p}.{}", m.module);
+        let mut parts = Vec::new();
+        for proj in &m.projection {
+            parts.push(self.raw(&format!("{module}.{}.weight", proj.tensor), crate::state::dim(spec, &proj.rows)?, h)?);
+        }
+        let mut extra: Vec<(String, Vec<f32>)> = Vec::new();
+        for bind in m.node.iter().flat_map(|n| n.bind.values()) {
+            if let crate::graph::Bind::Weight { weight, len } = bind
+                && !extra.iter().any(|(n, _)| n == weight)
+            {
+                extra.push((weight.clone(), self.flat(&format!("{module}.{weight}"), spec.weight_len(len)?)?));
+            }
+        }
+        Ok(Described {
+            in_proj: Raw::concat(parts)?.into_matrix(spec.quant, &format!("{module}.in_proj"))?,
+            out: self.raw(&format!("{module}.{}.weight", m.out_tensor), h, spec.mix_out_cols())?.into_matrix(spec.quant, &format!("{module}.out_proj"))?,
+            extra,
+        })
+    }
+
     pub fn layer(&self, spec: &Spec, i: usize) -> Result<Layer<'_>> {
         self.layer_at(spec, i, i)
     }
@@ -926,7 +973,9 @@ impl Checkpoint {
         let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
         let p = format!("{}.layers.{global}", self.root());
         self.require_activation_scales(spec, i, global, &p)?;
-        let mixer = if spec.block(i).is_linear() {
+        let mixer = if spec.block(i).is_linear() && spec.mixer.is_some() {
+            Mixer::Described(self.described_mixer(spec, &p)?)
+        } else if spec.block(i).is_linear() {
             Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"))?)
         } else {
             Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"))?)

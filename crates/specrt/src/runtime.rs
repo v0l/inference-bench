@@ -123,6 +123,12 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             out: up_m(&g.out)?,
             slot: before(true),
         }),
+        Mixer::Described(d) => DeviceMixer::Described(DeviceDescribed {
+            in_proj: up_m(&d.in_proj)?,
+            out: up_m(&d.out)?,
+            extra: d.extra.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,
+            slot: before(true),
+        }),
     };
     let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m)).transpose()? };
     copied(stream)?;
@@ -369,6 +375,50 @@ struct DeviceGdn {
 enum DeviceMixer {
     Attention(DeviceAttn),
     Linear(DeviceGdn),
+    Described(DeviceDescribed),
+}
+
+struct DeviceDescribed {
+    in_proj: DeviceMatrix,
+    out: DeviceMatrix,
+    extra: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    slot: i32,
+}
+
+struct SeqState {
+    name: String,
+    pool: StatePool,
+    slice: ManuallyDrop<CudaSlice<f32>>,
+}
+
+struct MixBuffers {
+    states: Vec<SeqState>,
+    mix: CudaSlice<f32>,
+    planes: Planes,
+    scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+}
+
+impl MixBuffers {
+    fn new(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec, slots: usize, chunk: usize) -> Result<Self> {
+        let mut states = Vec::new();
+        for s in crate::state::sequence(spec).filter(|s| s.layers == crate::state::Layers::Linear) {
+            ensure!(s.dtype == crate::state::Dtype::F32, "[[state]] {} on a mixer is not f32", s.name);
+            let pool = StatePool::new(ctx, s.sequence_bytes(spec), slots)?;
+            let slice = ManuallyDrop::new(pool.slice(stream));
+            states.push(SeqState { name: s.name.clone(), pool, slice });
+        }
+        let m = spec.mixer.as_ref().context("no [mixer]")?;
+        let scratch = m.scratch.iter().map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?))).collect::<Result<_>>()?;
+        Ok(MixBuffers { states, mix: stream.alloc_zeros(chunk * spec.mix_in_rows())?, planes: Planes::new(stream, chunk * spec.mix_out_cols())?, scratch })
+    }
+}
+
+impl Drop for MixBuffers {
+    fn drop(&mut self) {
+        for s in &mut self.states {
+            unsafe { ManuallyDrop::take(&mut s.slice) }.leak();
+        }
+    }
 }
 
 struct DeviceLayer {
@@ -402,6 +452,7 @@ impl DeviceLayer {
                     + g.out.bytes()
                     + (g.conv.num_bytes() + g.neg_a.num_bytes() + g.dt_bias.num_bytes() + g.norm.num_bytes()) as u64
             }
+            DeviceMixer::Described(d) => d.in_proj.bytes() + d.out.bytes() + d.extra.values().map(|v| v.num_bytes() as u64).sum::<u64>(),
         };
         mixer
             + self.gate_up.bytes()
@@ -653,6 +704,8 @@ pub struct Runtime {
     buf: Buffers,
     pre: PrefillBuffers,
     gdn: Option<GdnBuffers>,
+    mixer: Option<MixBuffers>,
+    mixer_launch: Vec<DescribedLaunch>,
     moe: Option<moe::MoeBuffers>,
     fp8_act: Option<Fp8Act>,
     fp4_act: Option<Fp4Act>,
@@ -878,8 +931,8 @@ impl Runtime {
         let linear_tuning = LinearTuning::for_target(&target);
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
         let checkpoint = match tp {
-            Some((n, rank, _)) => Checkpoint::for_repo(&spec.repo)?.for_rank(crate::tp::RankCut::new(&full, crate::graph::Graph::decoder(), n, rank)?)?,
-            None => Checkpoint::for_repo(&spec.repo)?,
+            Some((n, rank, _)) => Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors).for_rank(crate::tp::RankCut::new(&full, crate::graph::Graph::decoder(), n, rank)?)?,
+            None => Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors),
         };
         let weights_started = Instant::now();
         let Weights { layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct } =
@@ -939,6 +992,13 @@ impl Runtime {
             None => None,
         };
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
+        let mixer = match &spec.mixer {
+            Some(_) => Some(MixBuffers::new(&ctx, &stream, spec, layout.slots + 1, chunk)?),
+            None => None,
+        };
+        ensure!(use_mma || mixer.is_none(), "a described mixer needs the tensor core path (sm_80 or newer)");
+        let mixer_launch: Vec<DescribedLaunch> =
+            crate::codegen::mixer_kernels(spec, layout.kv_planes, max_ctx, &target)?.into_iter().map(|k| DescribedLaunch { name: k.name, threads: k.threads, params: k.params }).collect();
         let widest = [d.hidden, d.intermediate, spec.q_dim()]
             .into_iter()
             .chain(spec.linear_attention.as_ref().map(|l| l.value_dim()))
@@ -984,6 +1044,8 @@ impl Runtime {
             linear_tuning,
             pre,
             gdn,
+            mixer,
+            mixer_launch,
             moe: match &spec.moe {
                 Some(_) => Some(moe::MoeBuffers::new(&stream, chunk, spec, crate::codegen::moe_mma_enabled(spec, &target))?),
                 None => None,
@@ -1340,7 +1402,7 @@ impl Runtime {
     }
 
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
-        ensure!(self.spec.attention.node.is_empty(), "described attention runs on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        ensure!(self.spec.attention.node.is_empty() && self.spec.mixer.is_none(), "described attention and mixers run on the batched decode path (generate_batch and the scheduler), not the single stream step");
         let s = &self.spec;
         let a = &s.attention;
         let buf = &self.buf;
@@ -1357,6 +1419,7 @@ impl Runtime {
                     continue;
                 }
                 DeviceMixer::Attention(l) => l,
+                DeviceMixer::Described(_) => unreachable!("a described mixer is refused above"),
             };
             let kv_layer = l.kv;
             let window = l.window;
@@ -2181,21 +2244,69 @@ impl Runtime {
     }
 
     pub fn state_slot_bytes(&self) -> usize {
+        if let Some(mb) = &self.mixer {
+            return mb.states.iter().map(|s| s.pool.stride_bytes()).sum();
+        }
         self.gdn.as_ref().map_or(0, |gb| gb.conv_pool.stride_bytes() + gb.ssm_pool.stride_bytes())
     }
 
     pub fn state_mapped_bytes(&self) -> usize {
+        if let Some(mb) = &self.mixer {
+            return mb.states.iter().map(|s| s.pool.mapped_bytes()).sum();
+        }
         self.gdn.as_ref().map_or(0, |gb| gb.conv_pool.mapped_bytes() + gb.ssm_pool.mapped_bytes())
     }
 
     pub fn state_live_slots(&self) -> usize {
+        if let Some(mb) = &self.mixer {
+            return mb.states.first().map_or(0, |s| s.pool.live_slots());
+        }
         self.gdn.as_ref().map_or(0, |gb| gb.ssm_pool.live_slots())
+    }
+
+    fn mixer_state_live(&self, slot: usize) -> bool {
+        self.mixer.as_ref().is_none_or(|mb| mb.states.iter().all(|s| s.pool.is_live(slot)))
+    }
+
+    fn acquire_mixer_state(&mut self, slot: usize, free: usize) -> Result<()> {
+        let need = self.state_slot_bytes();
+        let Some(mb) = self.mixer.as_mut() else { return Ok(()) };
+        if mb.states.iter().all(|s| s.pool.is_live(slot)) {
+            return Ok(());
+        }
+        ensure!(free >= need + STATE_FREE_MARGIN, "{free} bytes of device memory free, a recurrent state slot needs {need} plus a margin");
+        for i in 0..mb.states.len() {
+            if let Err(e) = mb.states[i].pool.acquire(slot) {
+                for s in &mut mb.states[..i] {
+                    s.pool.release(slot);
+                }
+                return Err(e);
+            }
+        }
+        for s in &mut mb.states {
+            let n = s.pool.stride_bytes() / 4;
+            self.stream.memset_zeros(&mut s.slice.slice_mut(slot * n..(slot + 1) * n))?;
+        }
+        Ok(())
+    }
+
+    fn zero_mixer_state(&mut self, slot: usize) -> Result<()> {
+        ensure!(self.mixer_state_live(slot), "recurrent state of slot {slot} is not allocated");
+        let Some(mb) = self.mixer.as_mut() else { return Ok(()) };
+        for s in &mut mb.states {
+            let n = s.pool.stride_bytes() / 4;
+            self.stream.memset_zeros(&mut s.slice.slice_mut(slot * n..(slot + 1) * n))?;
+        }
+        Ok(())
     }
 
     pub fn acquire_state(&mut self, slot: usize) -> Result<()> {
         ensure!(slot <= self.slots, "slot {slot} out of {}", self.slots);
         let need = self.state_slot_bytes();
         let free = self.ctx.mem_get_info().map(|(f, _)| f).unwrap_or(usize::MAX);
+        if self.mixer.is_some() {
+            return self.acquire_mixer_state(slot, free);
+        }
         let Some(gb) = self.gdn.as_mut() else { return Ok(()) };
         if gb.ssm_pool.is_live(slot) {
             return Ok(());
@@ -2225,11 +2336,19 @@ impl Runtime {
             gb.ssm_pool.release(slot);
             gb.conv_pool.release(slot);
         }
+        if let Some(mb) = self.mixer.as_mut() {
+            for s in &mut mb.states {
+                s.pool.release(slot);
+            }
+        }
     }
 
     pub fn reset_slot(&mut self, seq: usize) -> Result<()> {
         ensure!(seq < self.slots, "slot {seq} out of {}", self.slots);
         self.mtp_forget(seq);
+        if self.mixer.is_some() {
+            return self.zero_mixer_state(seq);
+        }
         if let Some(gb) = self.gdn.as_ref() {
             ensure!(gb.ssm_pool.is_live(seq), "recurrent state of slot {seq} is not allocated");
         }

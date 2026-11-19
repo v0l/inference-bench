@@ -94,6 +94,8 @@ fn buffer(name: &str) -> Result<Buf> {
         "lin" => Buf::PreLin,
         "ba" => Buf::PreBa,
         "gdn_planes" => Buf::GdnPlanes,
+        "mix" => Buf::Mix,
+        "mix_planes" => Buf::MixPlanes,
         "branch" => Buf::Branch,
         "fc_planes" => Buf::FcPlanes,
         "mtp_logits" => Buf::MtpLogits,
@@ -110,6 +112,8 @@ fn weight(name: &str) -> Result<Weight> {
         "lin_in" => Weight::LinIn,
         "lin_ba" => Weight::LinBa,
         "lin_out" => Weight::LinOut,
+        "mix_in" => Weight::MixIn,
+        "mix_out" => Weight::MixOut,
         "lm_head" => Weight::LmHead,
         "mtp_fc" => Weight::MtpFc,
         "mtp_qkv" => Weight::MtpQkv,
@@ -223,6 +227,8 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
             "vision" => spec.vision.is_some(),
             "moe" => spec.moe.is_some(),
             "described" => !spec.attention.node.is_empty(),
+            "mixer" => spec.mixer.is_some(),
+            "gdn" => spec.mixer.is_none(),
             "stock" => spec.attention.node.is_empty(),
             "dense" => spec.moe.is_none(),
             _ => false,
@@ -233,7 +239,15 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
 fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec) -> Result<Vec<Op>> {
     let mut ops = Vec::new();
     for n in nodes.iter().filter(|n| n.runs_in(phase, tensor_core, spec)) {
-        if n.op == "attention_nodes" {
+        if n.op == "mixer_nodes" {
+            let count = spec.mixer.as_ref().map_or(0, |m| m.node.len());
+            ensure!(count <= 256, "a mixer has at most 256 nodes");
+            for (i, d) in spec.mixer.iter().flat_map(|m| m.node.iter()).enumerate() {
+                if d.runs_in(phase, tensor_core, spec) {
+                    ops.push(Op::MixKernel { node: i as u8 });
+                }
+            }
+        } else if n.op == "attention_nodes" {
             for (i, d) in spec.attention.node.iter().enumerate().filter(|(_, d)| d.runs_in(phase, tensor_core, spec)) {
                 ops.push(d.lower_described(i)?);
             }

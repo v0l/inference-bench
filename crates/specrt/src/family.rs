@@ -208,6 +208,36 @@ pub struct FamilyBlocks {
     pub layer_types: std::collections::BTreeMap<String, crate::spec::Block>,
     pub other_layer_type: Option<crate::spec::Block>,
     pub sliding_period_key: Option<String>,
+    pub attention_indices_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyMixer {
+    pub module: String,
+    pub projection: Vec<crate::spec::Projection>,
+    pub out_tensor: String,
+    pub out_cols: String,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl FamilyMixer {
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::Mixer>> {
+        if self.node.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(crate::spec::Mixer {
+            module: self.module.clone(),
+            projection: self.projection.clone(),
+            out_tensor: self.out_tensor.clone(),
+            out_cols: self.out_cols.clone(),
+            params: read_params(&self.params, config)?,
+            scratch: self.scratch.clone(),
+            node: self.node.clone(),
+        }))
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -411,6 +441,10 @@ pub struct Family {
     pub fields: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub state: Vec<crate::state::State>,
+    #[serde(default)]
+    pub mixer: FamilyMixer,
+    #[serde(default)]
+    pub tensors: std::collections::BTreeMap<String, String>,
 }
 
 impl Family {

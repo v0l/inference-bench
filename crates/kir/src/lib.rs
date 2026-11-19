@@ -13,6 +13,7 @@ pub mod linear;
 pub mod moe;
 pub mod ops;
 pub mod prims;
+pub mod recur;
 pub mod rope;
 pub mod rows;
 pub mod scan;
@@ -81,6 +82,8 @@ pub enum Body {
     Compose(compose::Compose),
     Scan(scan::Scan),
     Rows(rows::RowBody),
+    Recurrence(recur::Recurrence),
+    Seq(recur::SeqBody),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -278,12 +281,25 @@ impl Kernel {
         Ok(k)
     }
 
+    pub fn recurrence(t: &Target, name: &'static str, threads: u32, params: Vec<Param>, body: recur::Recurrence) -> Result<Kernel, String> {
+        let k = Kernel { name, target: *t, params, threads, smem_bytes: 0, body: Body::Recurrence(body) };
+        k.validate()?;
+        Ok(k)
+    }
+
+    pub fn seq(t: &Target, name: &'static str, threads: u32, params: Vec<Param>, body: recur::SeqBody) -> Result<Kernel, String> {
+        let k = Kernel { name, target: *t, params, threads: pick_threads(t, threads), smem_bytes: 0, body: Body::Seq(body) };
+        k.validate()?;
+        Ok(k)
+    }
+
     pub fn needs(&self) -> Vec<Feature> {
         match &self.body {
             Body::RmsNorm { sum, .. } | Body::RmsNormSegment { sum, .. } | Body::AddRmsNorm { sum, .. } | Body::NormAdd { sum, .. } => sum.needs().to_vec(),
             Body::Compose(c) => c.sum.map(|s| s.needs().to_vec()).unwrap_or_default(),
             Body::Scan(_) => vec![Feature::WarpShuffle],
             Body::Rows(_) => vec![],
+            Body::Recurrence(_) | Body::Seq(_) => vec![Feature::WarpShuffle],
             Body::GatedActivation { .. } | Body::Pointwise { .. } | Body::Add { .. } => vec![],
         }
     }
@@ -378,6 +394,14 @@ impl Kernel {
                 c.check(t, &self.params)?;
                 &roles
             }
+            Body::Recurrence(c) => {
+                c.check(t, self.threads, &self.params)?;
+                &roles
+            }
+            Body::Seq(c) => {
+                c.check(t, &self.params)?;
+                &roles
+            }
             Body::GatedActivation { width, .. } => {
                 if *width == 0 {
                     return Err(format!("{}: width must be positive", self.name));
@@ -388,7 +412,7 @@ impl Kernel {
         if roles != expected {
             return Err(format!("{}: params {roles:?} do not match the body, want {expected:?}", self.name));
         }
-        if !matches!(self.body, Body::Scan(_) | Body::Rows(_)) && self.params.iter().any(|p| p.ty != Scalar::F32) {
+        if !matches!(self.body, Body::Scan(_) | Body::Rows(_) | Body::Recurrence(_) | Body::Seq(_)) && self.params.iter().any(|p| p.ty != Scalar::F32) {
             return Err(format!("{}: only f32 params are supported", self.name));
         }
         Ok(())
@@ -432,6 +456,12 @@ impl Kernel {
                 let _ = write!(s, "\n  {}", c.describe());
             }
             Body::Rows(c) => {
+                let _ = write!(s, "\n  {}", c.describe());
+            }
+            Body::Recurrence(c) => {
+                let _ = write!(s, "\n  {}", c.describe());
+            }
+            Body::Seq(c) => {
                 let _ = write!(s, "\n  {}", c.describe());
             }
             Body::GatedActivation { width, act } => {

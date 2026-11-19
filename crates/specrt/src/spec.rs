@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 10;
+pub const SPEC_FORMAT: u32 = 11;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -672,6 +672,20 @@ pub struct Attention {
     pub scratch: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Mixer {
+    pub module: String,
+    pub projection: Vec<Projection>,
+    pub out_tensor: String,
+    pub out_cols: String,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Projection {
@@ -749,11 +763,15 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_attention: Option<LinearAttention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixer: Option<Mixer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<crate::vision::Vision>,
     #[serde(default = "crate::state::stock", skip_serializing_if = "crate::state::is_stock")]
     pub state: Vec<crate::state::State>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "RuntimeOptions::is_default")]
     pub runtime: RuntimeOptions,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -807,7 +825,7 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "n_shared_experts", "routed_scaling_factor", "first_k_dense_replace", "n_routed_experts", "num_nextn_predict_layers", "linear_attn_config",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
-    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "embedding_multiplier", "attention_multiplier", "residual_multiplier", "logits_scaling", "no_rope_layers", "no_rope_layer_interval", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config",
+    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "embedding_multiplier", "attention_multiplier", "residual_multiplier", "logits_scaling", "no_rope_layers", "no_rope_layer_interval", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config", "attn_layer_indices", "mamba_n_heads", "mamba_d_head", "mamba_d_state", "mamba_n_groups", "mamba_d_conv", "mamba_expand",
 ];
 
 pub fn unread_hf_keys(json: &str) -> Vec<(String, String)> {
@@ -1396,7 +1414,12 @@ impl Spec {
             .or(param("partial_rotary_factor"))
             .filter(|f| *f != 1.0)
             .map(|f| (head_dim as f64 * f).round() as usize);
-        let pattern = match &hf.layer_types {
+        let indexed = family.blocks.attention_indices_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| {
+            let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()).collect();
+            (0..hf.num_hidden_layers).map(|i| if full.contains(&(i as u64)) { "full_attention" } else { "linear_attention" }.to_string()).collect::<Vec<_>>()
+        });
+        let mixer = family.mixer.read(&value)?;
+        let pattern = match indexed.as_ref().or(hf.layer_types.as_ref()) {
             Some(types) if hybrid || !strict || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
             None if family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).is_some_and(|n| n > 1) && hf.sliding_window.is_some() => {
                 let n = family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).unwrap_or(2) as usize;
@@ -1411,7 +1434,7 @@ impl Spec {
             }
             _ => vec![Block::Dense],
         };
-        let linear_attention = if pattern.iter().any(|b| b.is_linear()) {
+        let linear_attention = if mixer.is_none() && pattern.iter().any(|b| b.is_linear()) {
             let need = |v: Option<usize>, key: &str| v.with_context(|| format!("no {key}"));
             let dims: Result<LinearAttention> = (|| {
                 Ok(LinearAttention {
@@ -1519,6 +1542,8 @@ impl Spec {
             moe,
             mtp: (family.mtp && hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
             linear_attention,
+            mixer,
+            tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
             runtime: RuntimeOptions::default(),
@@ -1535,6 +1560,7 @@ impl Spec {
         self.runtime.validate()?;
         ensure!(!self.layers.pattern.contains(&Block::Sliding) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
         self.validate_attention_nodes()?;
+        self.validate_mixer()?;
         crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
@@ -1642,6 +1668,7 @@ impl Spec {
         ensure!(self.rope.theta.is_some(), "rope theta is required to run (theta is unknown)");
         let has_linear = self.layers.pattern.iter().any(|b| b.is_linear());
         match (&self.linear_attention, has_linear) {
+            (None, true) if self.mixer.is_some() => {}
             (None, true) => bail!("a linear layer in the pattern needs a [linear_attention] section"),
             (Some(_), false) => bail!("[linear_attention] is set but the pattern has no linear layer"),
             (None, false) => {}
@@ -1709,6 +1736,49 @@ impl Spec {
 
     pub fn weight_len(&self, symbol: &str) -> Result<usize> {
         crate::state::dim(self, symbol).with_context(|| format!("weight length {symbol:?}"))
+    }
+
+    fn validate_mixer(&self) -> Result<()> {
+        let Some(m) = &self.mixer else { return Ok(()) };
+        ensure!(self.linear_attention.is_none(), "[mixer] and [linear_attention] cannot both describe the linear layers");
+        ensure!(self.linear_layers() > 0, "[mixer] is set but the pattern has no linear layer");
+        ensure!(!m.module.is_empty() && !m.projection.is_empty() && !m.out_tensor.is_empty(), "[mixer] needs module, projection and out_tensor");
+        for p in &m.projection {
+            crate::state::dim(self, &p.rows).with_context(|| format!("[[mixer.projection]] {}", p.tensor))?;
+        }
+        ensure!(crate::state::dim(self, &m.out_cols).context("[mixer] out_cols")? > 0, "[mixer] out_cols is zero");
+        for (n, w) in &m.scratch {
+            ensure!(!matches!(n.as_str(), "mix" | "x"), "[mixer.scratch] {n} shadows a built in buffer");
+            crate::state::dim(self, w).with_context(|| format!("[mixer.scratch] {n}"))?;
+        }
+        ensure!(!m.node.is_empty() && m.node.len() <= 256, "[[mixer.node]] needs one to 256 nodes");
+        for (i, n) in m.node.iter().enumerate() {
+            ensure!(n.op == "kernel" && n.kernel.is_some(), "[[mixer.node]] {i} must be a kernel node with `kernel`");
+            ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[mixer.node]] {i} needs a grid of one to three symbols");
+            for g in &n.grid {
+                ensure!(matches!(g.as_str(), "rows" | "seqs") || g.parse::<u32>().is_ok() || m.params.contains_key(g), "[[mixer.node]] {i} grid symbol {g:?} is not rows, seqs, a number or a [mixer.params] entry");
+            }
+            for b in n.bind.values() {
+                match b {
+                    crate::graph::Bind::Weight { len, .. } => {
+                        self.weight_len(len)?;
+                    }
+                    crate::graph::Bind::Buffer { buffer } => {
+                        ensure!(buffer == "mix" || m.scratch.contains_key(buffer), "[[mixer.node]] {i} binds buffer {buffer:?}, which is not mix or a [mixer.scratch] entry")
+                    }
+                    crate::graph::Bind::State { state } => ensure!(
+                        crate::state::named(self, state).is_some_and(|s| s.per == crate::state::Per::Sequence && s.layers == crate::state::Layers::Linear && s.dtype == crate::state::Dtype::F32),
+                        "[[mixer.node]] {i} binds state {state:?}, which is not a per sequence f32 [[state]] on the linear layers"
+                    ),
+                    crate::graph::Bind::Number(_) => {}
+                    crate::graph::Bind::Name(n) => ensure!(m.params.contains_key(n), "[[mixer.node]] {i} binds {n:?}, which is not a [mixer.params] entry"),
+                }
+            }
+        }
+        ensure!(self.speculative().is_none(), "[mixer] cannot be combined with [mtp] yet");
+        ensure!(self.moe.is_none(), "[mixer] layers with mixture of experts are not supported yet");
+        ensure!(!self.uses_branch(), "[mixer] layers with sandwich or scaled residual norms are not supported yet");
+        Ok(())
     }
 
     fn validate_attention_nodes(&self) -> Result<()> {
@@ -1861,6 +1931,14 @@ impl Spec {
 
     pub fn rotary_dim(&self) -> usize {
         self.attention.rotary_dim.unwrap_or(self.attention.head_dim)
+    }
+
+    pub fn mix_in_rows(&self) -> usize {
+        self.mixer.as_ref().map_or(0, |m| m.projection.iter().map(|p| crate::state::dim(self, &p.rows).unwrap_or(0)).sum())
+    }
+
+    pub fn mix_out_cols(&self) -> usize {
+        self.mixer.as_ref().map_or(0, |m| crate::state::dim(self, &m.out_cols).unwrap_or(0))
     }
 
     pub fn qkv_rows(&self) -> usize {
