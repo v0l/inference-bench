@@ -1,1 +1,1 @@
-| qwen3 | `qwen3-0.6b.toml` | 140.0 | 21997.5 | 1081.9 | llama.cpp | 158.9 | 23136.2 | 994.4 | 0.88 | 0.95 | 1.09 | 2026-11-19 | 5c53f27 | `crates/specrt/scripts/perfpass.sh qwen3 --model /home/kieran/ib-gates/803/src/crates/specrt/specs/qwen3-0.6b.toml --host spark` |
+| qwen3 | `qwen3-0.6b.toml` | 145.9 | 21666.5 | 1107.0 | vllm | 113.7 | 32261.0 | 1038.3 | 1.28 | 0.67 | 1.07 | 2026-11-19 | f650fdb | `crates/specrt/scripts/perfpass.sh qwen3 --model /home/kieran/ib-gates/816/src/crates/specrt/specs/qwen3-0.6b.toml --host spark` |
