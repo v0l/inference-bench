@@ -25,6 +25,7 @@ def main():
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--util", type=float, default=0.12)
+    ap.add_argument("--attn", default=None)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     lens = [int(x) for x in a.lens.split(",")]
@@ -34,6 +35,7 @@ def main():
         mem_fraction_static=a.util,
         disable_radix_cache=True,
         max_running_requests=max(a.batch, 8),
+        **({"attention_backend": a.attn} if a.attn else {}),
     )
     timed(engine, 1, 128, 8, 0)
     out = {"engine": "sglang", "version": sgl.__version__, "prefill": {}, "decode": {}}
