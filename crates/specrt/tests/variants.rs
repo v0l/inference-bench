@@ -258,8 +258,8 @@ fn the_dsa_config_reads_indexer_layers_states_and_nodes_from_the_family_toml() {
     assert_eq!(specrt::state::named(&spec, "index_key").unwrap().dims(&spec).unwrap(), vec![1, 64]);
     assert_eq!(spec.attention.params["index_topk"], 8.0);
     assert!((spec.attention.params["index_scale"] - 0.125).abs() < 1e-12);
-    assert!((spec.attention.params["index_w_scale"] - 0.5).abs() < 1e-12);
-    assert_eq!(spec.qkv_rows(), 64 + 128 + 64 + 4);
+    assert!((spec.attention.params["index_w_scale"] - 0.5f64.sqrt() / 2.0).abs() < 1e-12);
+    assert_eq!(spec.qkv_rows(), 64 + 128 + 64 + 8);
     let plan = Plan::build(&spec, Phase::Prefill, true);
     let kernels = |block: Block| plan.layer(block).iter().filter(|o| matches!(o, Op::Kernel { .. })).count();
     assert_eq!((kernels(Block::Full), kernels(Block::Shared)), (15, 9));

@@ -5,7 +5,7 @@ use specrt::jit::Jit;
 use specrt::spec::Spec;
 use std::path::Path;
 
-const HEADS: usize = 4;
+const HEADS: usize = 8;
 const DIM: usize = 64;
 const TOPK: usize = 8;
 const KEYS: usize = 96;
@@ -67,7 +67,7 @@ fn the_indexer_selects_the_reference_top_k_per_row_from_the_paged_key_cache() {
     let positions = [40i32, 5, 95];
     let (scale, w_scale) = (0.125f32, 0.5f32);
     let q_row = HEADS * DIM;
-    let (w_row, w_offset) = (260usize, 256usize);
+    let (w_row, w_offset) = (264usize, 256usize);
     let q: Vec<f32> = (0..rows * q_row).map(|_| rng.float()).collect();
     let w: Vec<f32> = (0..rows * w_row).map(|_| rng.float().abs()).collect();
     let weights = |r: usize| w[r * w_row + w_offset..r * w_row + w_offset + HEADS].to_vec();

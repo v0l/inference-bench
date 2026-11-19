@@ -195,7 +195,7 @@ def build_dsa_config():
         qk_nope_head_dim=32,
         qk_rope_head_dim=32,
         v_head_dim=64,
-        index_n_heads=4,
+        index_n_heads=8,
         index_head_dim=64,
         index_topk=8,
         indexer_types=["full", "shared"],
@@ -284,6 +284,8 @@ def weights(model):
             v = 0.3 * torch.randn(p.shape, generator=g)
         elif name.endswith("e_score_correction_bias"):
             v = 0.2 * torch.randn(p.shape, generator=g)
+        elif name.endswith("k_norm.bias"):
+            v = 0.1 * torch.randn(p.shape, generator=g)
         elif name.endswith(".sinks"):
             v = 2.0 * torch.randn(p.shape, generator=g)
         elif p.dim() == 1:
