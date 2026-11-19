@@ -45,7 +45,7 @@ def cmd_fp32(model, out):
         from transformers import Mxfp4Config
 
         kwargs["quantization_config"] = Mxfp4Config(dequantize=True)
-    m = AutoModelForCausalLM.from_pretrained(model, torch_dtype=dtype, attn_implementation="eager", device_map=os.environ.get("FP32_DEVICE", "cuda"), **kwargs).eval()
+    m = AutoModelForCausalLM.from_pretrained(model, torch_dtype=dtype, attn_implementation="eager", **kwargs).to(os.environ.get("FP32_DEVICE", "cuda")).eval()
     rows = []
     with torch.inference_mode():
         for p in load_prompts(out):
