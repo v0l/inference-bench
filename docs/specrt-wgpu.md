@@ -477,3 +477,66 @@ Harness: `~/git/msl825` on the Mac (`msl825` runs naga 30.0.2 over a WGSL file, 
 | 11 | `half` tiles for A and B: a 64x64 tile fits and gives 3.77 | f32 tiles only | the largest hand win; naga needs `f16` workgroup memory and f16 `coop_mat8x8`, see step 3 |
 
 Instruction-by-instruction, the naga kernel has the same operations as the hand one in the matrix phase (8 `simdgroup_load`, 16 `simdgroup_multiply_accumulate` per kk step against 4+2 loads and 8 mma). The gap is therefore explained by the tile shape (row 1), the f32 against half storage (row 11), and the dequant (row 7). Rows 4, 8 and 10 are folded or off. The WGSL experiments in the next section follow this order.
+
+### 2. WGSL experiments (standalone `linear_coop_q4k`, m=4096 n=512 k=14336, quiet Mac, 2 runs identical)
+
+Baseline naga MSL with the engine options: 2.16 TFLOP/s.
+
+| Experiment | TFLOP/s | Kept |
+|---|---|---|
+| tile 32 tokens x 64 rows (hand 64x32 shape), 8 accumulators | 1.54 | no |
+| tile 128 tokens x 64 rows, 256 threads | 2.37 | no (superseded) |
+| separate x and weight load loops | 2.14 | no |
+| address maths with shifts and masks (`idx >> 3u`, `idx & 7u`) | 2.18 | no (Metal already folds it) |
+| f16 workgroup tiles and `coop_mat8x8<f16>` | 2.13 | no |
+| kk loop unrolled x4 (the `simdgroup_load` offsets become compile time) | 2.39 | yes |
+| no dequant at all (ceiling for the load phase) | 3.17 with unroll | |
+| no dequant and no x load | 3.70 | |
+| unroll plus word-wise Q4_K scales (see below) | 2.74 | yes |
+
+The Q4_K tile load called `scale_min_k4` (3 `wbyte`, each a `wdata[i>>2]` read, shift and mask) and 2 `wf16` (each a word read plus select) per quad: 5 loads of the same 4 words. It now reads `d, dmin` as one word via `unpack2x16float` and the 12 scale bytes as 3 words, extracts the 6-bit scale and min with shifts, and keeps the nibble load as is. Bf16 2.4 to 2.81, Q6_K 2.30 to 2.63, Q4_K 2.16 to 2.74 TFLOP/s. The remaining gap to the 3.25 hand kernel is the load phase (3.17 without the dequant against 2.74 with it) and the f32 64x64 tile; the Q6_K decode was not reworked.
+
+### 3. Why naga's half path was not faster
+
+`linear_coop` with `array<f16>` workgroup memory and `coop_mat8x8<f16>` (`n_half.wgsl` against `n_q4k.wgsl` on the new kernel): 2.74 and 2.74 TFLOP/s. The emitted MSL has `threadgroup half` storage, `simdgroup_half8x8` loads and exactly 8 `static_cast<half>` (one per tile store), `simdgroup_multiply_accumulate` of half inputs into a float accumulator. There are no per-element conversions or `f16` emulation in the loop; naga's earlier 1.25 (#825) was the old 64x64 half variant with the unrolled-free kk loop and the `naga_div` address maths, and the same kernel with the engine options and the unroll is now at parity with f32 tiles. The hand kernel's half win (3.77) comes from the 64x64 half tile fitting at 704 registers per thread where the f32 one spills; naga's f32 64x64 does not spill (the accumulator count is 16 either way), so the half path has nothing to win here. Dropped, nothing to emit differently.
+
+### 4. Prefill attention share
+
+`SPECRT_SKIP=<kernel prefix>` (a throwaway switch, not committed) skips a kernel's dispatches. Prefill tok/s with a kernel skipped against none, quiet Mac, Q4_K_M models, the time share is `1 - none / skipped`:
+
+| Model | prompt | none | no `flash_coop` | no `linear_coop` | attention share | GEMM share |
+|---|---|---|---|---|---|---|
+| Qwen3-0.6B | 1,024 | 1,692 | 2,775 | 3,924 | 39% | 57% |
+| Qwen3-0.6B | 4,096 | 596 | 2,779 | 996 | 79% | 40% |
+| Llama-3.2-1B | 1,024 | 1,156 | 1,348 | 6,825 | 14% | 83% |
+| Llama-3.2-1B | 4,096 | 833 | 1,251 | 1,383 | 33% | 40% |
+
+Attention is the main cost at 4,096 and for the 0.6B at 1,024 (head_dim 128, 16 heads, 8 KV heads). `flash_coop` loads K and V fragments straight from the device cache per 8 queries, so each K/V fragment is fetched once per 8 queries, not once per 32. Filed as a follow-up.
+
+### 5. naga limitations
+
+None blocking: the load-phase cost is in our own dequant, the coop load and multiply-add lower one to one, and half tiles give nothing. No upstream issue to file.
+
+### Paired A/B (`ib-829a` baseline against `ib-829b`, 3 alternating rounds, load average 0.9 to 1.8 at round starts, 3 runs each, medians; every round gave the same value within 1% except where noted)
+
+| model | prefill 128 | prefill 1,024 |
+|---|---|---|
+| Qwen3-0.6B bf16 | 1,814 to 1,964 | 1,642 to 1,770 |
+| Qwen3-0.6B Q4_K_M | 1,729 to 2,018 | 1,500 to 1,691 |
+| Llama-3.2-1B Q4_K_M | 1,026 to 1,250 | 975 to 1,158 |
+| Qwen2.5-7B Q4_K_M | 161 to 196 | 156 to 183 |
+
+One run in round 1 of each of two cells came in 15% low (a load spike, 48 at the start of the first test run); the medians are not affected.
+
+### `mac_vs_llama.sh` (3 alternating rounds, medians, load average 2.5 to 9.4 at round starts, no gcad job; ratio specrt / llama.cpp, #828 ratio in brackets)
+
+| Model | Prefill 128 | Prefill 1,024 | Decode (128 new) |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 1,958 / 2,968 = 0.660 (0.610) | 1,773 / 2,975 = 0.596 (0.552) | 93.1 / 112.3 = 0.829 |
+| Qwen3-0.6B Q4_K_M | 2,009 / 3,012 = 0.667 (0.573) | 1,694 / 3,032 = 0.559 (0.495) | 129.3 / 183.9 = 0.703 |
+| Llama-3.2-1B Q4_K_M | 1,250 / 1,732 = 0.722 (0.592) | 1,157 / 1,752 = 0.661 (0.502) | 108.3 / 144.5 = 0.749 |
+| Qwen2.5-7B Q4_K_M | 195.6 / 273.9 = 0.714 (0.588) | 183.0 / 268.9 = 0.681 (0.581) | 20.4 / 27.9 = 0.732 |
+
+Target not met: `linear_coop` reaches 2.74 TFLOP/s (target 3) and prefill is at 0.56 to 0.72 (target 0.7 on every row). Prefill 128 is at 0.7 on 2 of 4 rows. The 7B and Llama-1B at 1,024 are 0.68 and 0.66.
+
+Tests: wgsl 26/26 on the Mac (`--include-ignored --test-threads=1`), `cargo clippy -p inference-bench-specrt --features wgpu --all-targets` clean on the Mac, `cargo test -p inference-bench-kir` passes.
