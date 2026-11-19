@@ -27,12 +27,9 @@ pub fn body() -> String {
         for (int r = 0; r < ROWS; r++) {
             base[r] = gg_row(w, (const unsigned*)s, row0 + r * stride, type[r]);            same = same && type[r] == type[0];
         }
-        if (same && type[0] == GG_Q4K) {
-            gg_q4k_rows<K, ROWS>(base, x, lane, out);
-        } else if (same && type[0] == GG_Q6K) {
-            gg_q6k_rows<K, ROWS>(base, x, lane, out);
-        } else {
-#pragma unroll
+"##.to_string(),
+        super::dequant::rows_dispatch(),
+        r##"#pragma unroll
             for (int r = 0; r < ROWS; r++) out[r] = dot<K>(w, s, row0 + r * stride, x, lane);
         }
 #pragma unroll

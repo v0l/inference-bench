@@ -1,3 +1,4 @@
+use super::dequant;
 use super::rows::{self, RowLoop};
 
 pub fn body() -> String {
@@ -23,89 +24,10 @@ __device__ __forceinline__ unsigned gg_u32(const unsigned char* p) {
     return (s[i >> 2] >> (8 * (i & 3))) & 0xffu;
 }
 
-__device__ __forceinline__ void gg_scale_min(const unsigned* s, int j, float& sc, float& m) {
-    unsigned a, b;
-    if (j < 4) {
-        a = gg_byte(s, j) & 63u;
-        b = gg_byte(s, j + 4) & 63u;
-    } else {
-        a = (gg_byte(s, j + 4) & 0xfu) | ((gg_byte(s, j - 4) >> 6) << 4);
-        b = (gg_byte(s, j + 4) >> 4) | ((gg_byte(s, j) >> 6) << 4);
-    }
-    sc = (float)a;
-    m = (float)b;
-}
-
-__device__ __forceinline__ void gg_dequant8(const unsigned char* sb, int type, int c, float* w) {
-    if (type == GG_Q4K || type == GG_Q5K) {
-        float d = gg_f16(gg_u16(sb));
-        float dmin = gg_f16(gg_u16(sb + 2));
-        unsigned s[3] = {gg_u32(sb + 4), gg_u32(sb + 8), gg_u32(sb + 12)};
-        int j = c >> 3;
-        int half = (c >> 2) & 1;
-        int l = (c & 3) * 8;
-        float sc, m;
-        gg_scale_min(s, 2 * j + half, sc, m);
-        float dl = __fmul_rn(d, sc), ml = __fmul_rn(dmin, m);
-        const unsigned char* qp = sb + (type == GG_Q4K ? 16 : 48) + 32 * j + l;
-        unsigned q[2] = {gg_u32(qp), gg_u32(qp + 4)};
-        unsigned qh[2] = {0u, 0u};
-        if (type == GG_Q5K) {
-            qh[0] = gg_u32(sb + 16 + l);
-            qh[1] = gg_u32(sb + 20 + l);
-        }
-        int bit = 2 * j + half;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            unsigned byte = (q[i >> 2] >> (8 * (i & 3))) & 0xffu;
-            unsigned nib = half ? byte >> 4 : byte & 15u;
-            unsigned hb = ((qh[i >> 2] >> (8 * (i & 3))) >> bit) & 1u;
-            w[i] = __fsub_rn(__fmul_rn(dl, (float)(nib + 16u * hb)), ml);
-        }
-    } else if (type == GG_Q6K) {
-        int h = c >> 4;
-        int k = (c >> 2) & 3;
-        int l = (c & 3) * 8;
-        float d = gg_f16(gg_u16(sb + 208));
-        float ds = __fmul_rn(d, (float)(signed char)__ldg(sb + 192 + 8 * h + l / 16 + 2 * k));
-        const unsigned char* qlp = sb + 64 * h + (k & 1) * 32 + l;
-        const unsigned char* qhp = sb + 128 + 32 * h + l;
-        unsigned ql[2] = {gg_u32(qlp), gg_u32(qlp + 4)};
-        unsigned qh[2] = {gg_u32(qhp), gg_u32(qhp + 4)};
-        int ls = (k >> 1) * 4;
-#pragma unroll
-        for (int i = 0; i < 8; i++) {
-            unsigned lo = ((ql[i >> 2] >> (8 * (i & 3) + ls)) & 15u);
-            unsigned hi = ((qh[i >> 2] >> (8 * (i & 3) + 2 * k)) & 3u);
-            w[i] = __fmul_rn(ds, (float)((int)(lo | (hi << 4)) - 32));
-        }
-    } else if (type == GG_Q8) {
-        const unsigned char* bp = sb + 34 * (c >> 2);
-        float d = gg_f16(gg_u16(bp));
-        int e = (c & 3) * 8;
-#pragma unroll
-        for (int k = 0; k < 4; k++) {
-            unsigned two = gg_u16(bp + 2 + e + 2 * k);
-            w[2 * k] = __fmul_rn((float)(signed char)(two & 0xffu), d);
-            w[2 * k + 1] = __fmul_rn((float)(signed char)(two >> 8), d);
-        }
-    } else {
-        uint4 v = __ldg((const uint4*)(sb + 16 * c));
-        unsigned words[4] = {v.x, v.y, v.z, v.w};
-#pragma unroll
-        for (int k = 0; k < 4; k++) {
-            if (type == GG_BF16) {
-                w[2 * k] = __uint_as_float(words[k] << 16);
-                w[2 * k + 1] = __uint_as_float(words[k] & 0xffff0000u);
-            } else {
-                w[2 * k] = gg_f16((unsigned short)(words[k] & 0xffffu));
-                w[2 * k + 1] = gg_f16((unsigned short)(words[k] >> 16));
-            }
-        }
-    }
-}
-
-__device__ __forceinline__ const unsigned char* gg_row(const void* w, const unsigned* table, int row, int& type) {
+"##.to_string(),
+        dequant::scale_min(),
+        dequant::dequant8(),
+        r##"__device__ __forceinline__ const unsigned char* gg_row(const void* w, const unsigned* table, int row, int& type) {
     unsigned e = __ldg(table + row);
     type = (int)(e & 7u);
     return (const unsigned char*)w + (size_t)(e >> 3) * 16;
@@ -258,44 +180,8 @@ acc[r] += valid ? d * sum : 0.0f;
         for (int k = 0; k < 4; k++) sum += (float)(signed char)__ldg(sc + 2 * k) * part[k];
         acc += d * sum;
 "##),
-        r##"template <int K>
-__device__ __forceinline__ float gg_row_dot(const void* w, const unsigned* table, int row, const float* x, int lane) {
-    int type;
-    const unsigned char* base = gg_row(w, table, row, type);
-    if (type == GG_Q4K) return gg_q4k_dot<K>(base, x, lane);
-    if (type == GG_Q6K) return gg_q6k_dot<K>(base, x, lane);
-    int bytes = gg_bytes(type);
-    float acc = 0.0f;
-    int c0 = (lane & 7) * 4;
-#pragma unroll 4
-    for (int s0 = 0; s0 < K / GG_SB; s0 += 4) {
-        int s = s0 + (lane >> 3);
-        if (s >= K / GG_SB) break;
-        const unsigned char* sb = base + (size_t)s * bytes;
-#pragma unroll
-        for (int c = c0; c < c0 + 4; c++) {
-            float wv[8];
-            gg_dequant8(sb, type, c, wv);
-            float4 xa = *(const float4*)(x + s * GG_SB + 8 * c);
-            float4 xb = *(const float4*)(x + s * GG_SB + 8 * c + 4);
-            acc += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w + wv[4] * xb.x + wv[5] * xb.y + wv[6] * xb.z + wv[7] * xb.w;
-        }
-    }
-    return acc;
-}
-
-extern "C" __global__ void gg_dequant_rows(const void* w, const unsigned* table, float* out, int rows, int cols) {
-    int chunk = blockIdx.x * blockDim.x + threadIdx.x;
-    int per_row = cols / 8;
-    if (chunk >= rows * per_row) return;
-    int row = chunk / per_row;
-    int k = (chunk % per_row) * 8;
-    float v[8];
-    gg_load8(w, table, row, k, v);
-#pragma unroll
-    for (int i = 0; i < 8; i++) out[(size_t)row * cols + k + i] = v[i];
-}
-"##.to_string(),
+        dequant::row_dot(),
+        dequant::dequant_rows_kernel(),
     ]
     .concat()
 }

@@ -1,5 +1,6 @@
 mod dec;
 mod decode;
+mod dequant;
 mod rows;
 
 pub fn emit_ggml() -> String {

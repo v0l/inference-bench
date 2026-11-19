@@ -59,18 +59,9 @@ constexpr int FP4_GEMV_THREADS = 512;
         prim::e2m1_to_f32("e2m1_to_f32"),
         prim::device("int", "fp4_t", "int k, int kg", "    return (k & (FP4_GROUP - 1)) * kg + (k >> 4);\n"),
         prim::device_t("int K, int ROWS, int U", "void", "fp4_rows_dot", "const void* w, const unsigned char* scales, int row0, int stride, const float* xt, int lane, float* result", &fp4_rows_dot_body()),
-        r##"__device__ __forceinline__ void cp_async4(void* smem, const void* gmem) {
-    unsigned s = (unsigned)__cvta_generic_to_shared(smem);
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(gmem));
-}
-
-__device__ __forceinline__ unsigned fp4_pair_bf16(unsigned byte, float scale) {
-    float lo = e2m1_to_f32(byte & 15u) * scale;
-    float hi = e2m1_to_f32(byte >> 4) * scale;
-    return (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);
-}
-
-constexpr int F4W_BK = 64;
+        prim::device("void", "cp_async4", "void* smem, const void* gmem", "    unsigned s = (unsigned)__cvta_generic_to_shared(smem);\n    asm volatile(\"cp.async.ca.shared.global [%0], [%1], 4;\" :: \"r\"(s), \"l\"(gmem));\n"),
+        prim::device("unsigned", "fp4_pair_bf16", "unsigned byte, float scale", &format!("{}{}    return (__float_as_uint(lo) >> 16) | (__float_as_uint(hi) & 0xffff0000u);\n", "    float lo = e2m1_to_f32(byte & 15u) * scale;\n", "    float hi = e2m1_to_f32(byte >> 4) * scale;\n")),
+        r##"constexpr int F4W_BK = 64;
 constexpr int F4W_ROW = 48;
 
 struct DecFp4 : DecBase<DecFp4> {
@@ -100,13 +91,9 @@ struct DecFp4 : DecBase<DecFp4> {
     }
     template <int MI, int NJ> static __device__ __forceinline__ void finish(float (&acc)[MI][NJ][4], const void* s) {
         float inv = fp4_inv_global((const unsigned char*)s);
-#pragma unroll
-        for (int i = 0; i < MI; i++)
-#pragma unroll
-            for (int j = 0; j < NJ; j++)
-#pragma unroll
-                for (int e = 0; e < 4; e++) acc[i][j][e] *= inv;
-    }
+"##.to_string(),
+        prim::unroll_nest(8, &[("i", "MI"), ("j", "NJ"), ("e", "4")], false, "acc[i][j][e] *= inv;"),
+        r##"    }
 };
 
 __device__ __forceinline__ void load_normed_t(const float* x, const float* nw, float* xt) {

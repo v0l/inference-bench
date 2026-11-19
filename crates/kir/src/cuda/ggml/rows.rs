@@ -1,15 +1,23 @@
 use crate::cuda::gemm::prim;
 
+pub enum Layout {
+    KQuant { qs: usize, qh: Option<usize> },
+    Q6K { qh: usize, scales: usize, d: usize },
+    Blocks { block: usize },
+}
+
 pub struct Format {
     pub tag: &'static str,
     pub bytes: usize,
+    pub layout: Layout,
+    pub fused_rows: bool,
 }
 
 pub const FORMATS: [Format; 4] = [
-    Format { tag: "Q4K", bytes: 144 },
-    Format { tag: "Q5K", bytes: 176 },
-    Format { tag: "Q6K", bytes: 224 },
-    Format { tag: "Q8", bytes: 272 },
+    Format { tag: "Q4K", bytes: 144, layout: Layout::KQuant { qs: 16, qh: None }, fused_rows: true },
+    Format { tag: "Q5K", bytes: 176, layout: Layout::KQuant { qs: 48, qh: Some(16) }, fused_rows: false },
+    Format { tag: "Q6K", bytes: 224, layout: Layout::Q6K { qh: 128, scales: 192, d: 208 }, fused_rows: true },
+    Format { tag: "Q8", bytes: 272, layout: Layout::Blocks { block: 34 }, fused_rows: false },
 ];
 pub const DEFAULT_BYTES: usize = 512;
 
