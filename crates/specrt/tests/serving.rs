@@ -131,6 +131,29 @@ fn stepped_spec_matches_single(s: &Spec) {
     assert_eq!(stepped_greedy(s, &prompts, 24, 128), expected);
 }
 
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn tiny_single_plane_default_step_decode_diverges_from_single_only_at_near_ties() {
+    let mut s = spec_for("tiny-qwen3.5");
+    s.runtime.split_activations = None;
+    assert!(!s.split_activations());
+    let prompts = mixed_prompts();
+    let want = single_greedy(&s, &prompts, 24);
+    let mut rt = Runtime::load(&s, 512).unwrap();
+    let vocab = s.dims.vocab;
+    for chunk in [37, 128] {
+        let got = stepped_greedy(&s, &prompts, 24, chunk);
+        for (i, p) in prompts.iter().enumerate() {
+            let Some(d) = got[i].iter().zip(&want[i]).position(|(a, b)| a != b) else { continue };
+            let ctx: Vec<u32> = p.iter().chain(&want[i][..d]).copied().collect();
+            let logits = rt.prompt_logits(&ctx).unwrap();
+            let row = &logits[logits.len() - vocab..];
+            let gap = (row[want[i][d] as usize] - row[got[i][d] as usize]).abs();
+            assert!(gap < 0.05, "prompt {i} chunk {chunk} diverged at {d} with a top-2 gap of {gap}");
+        }
+    }
+}
+
 fn head_quant_spec(dir: &str, head: specrt::spec::Quant) -> Spec {
     let mut s = spec_for(dir);
     s.head_quant = Some(head);
