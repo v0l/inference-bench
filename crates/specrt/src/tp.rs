@@ -150,6 +150,7 @@ pub fn supports(spec: &Spec, tp: usize) -> Result<()> {
             moe_split(spec, m, tp)?;
         }
         ensure!(spec.runtime.backend != crate::spec::BackendChoice::Wgpu, "tp runs on CUDA only");
+        ensure!(spec.mixer.is_none(), "tp does not split described mixer layers yet ({})", spec.name);
         ensure!(spec.quant != crate::spec::Quant::Gguf, "tp does not slice GGUF weights yet ({})", spec.name);
         ensure!(!spec.uses_branch(), "tp does not cover sandwich or scaled residual norms yet ({})", spec.name);
         ensure!(!spec.attention.qk_norm_full, "tp does not split full-width qk norms yet ({})", spec.name);

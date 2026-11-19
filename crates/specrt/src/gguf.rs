@@ -508,6 +508,8 @@ impl Gguf {
             mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, fused_gate_up: false },
             moe,
             linear_attention,
+            mixer: None,
+            tensors: Default::default(),
             mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),
             vision: None,
             plain_activations: false,

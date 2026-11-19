@@ -186,6 +186,8 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
         Body::Compose(c) => c.emit_cuda(k)?,
         Body::Scan(c) => c.emit_cuda(k)?,
         Body::Rows(c) => c.emit_cuda(k)?,
+        Body::Recurrence(c) => c.emit_cuda(k)?,
+        Body::Seq(c) => c.emit_cuda(k)?,
         Body::GatedActivation { width, act } => {
             let a = match act {
                 Activation::Silu => "g / (1.0f + expf(-g))",

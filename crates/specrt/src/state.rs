@@ -88,6 +88,9 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
         other => match other.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {
+                if let Some(v) = spec.mixer.as_ref().and_then(|m| m.params.get(other)) {
+                    return (*v >= 0.0 && v.fract() == 0.0).then_some(*v as usize);
+                }
                 let v = *a.params.get(other)?;
                 (v >= 0.0 && v.fract() == 0.0).then_some(v as usize)?
             }
@@ -195,7 +198,7 @@ pub fn validate(spec: &Spec) -> Result<()> {
             ensure!(named(spec, want).is_some_and(|s| s.positional() && s.layers == Layers::Attention), "stock attention needs a per token [[state]] named {want:?}");
         }
     }
-    if spec.linear_layers() > 0 {
+    if spec.linear_layers() > 0 && spec.mixer.is_none() {
         for want in ["conv", "ssm"] {
             ensure!(named(spec, want).is_some_and(|s| s.per == Per::Sequence && s.layers == Layers::Linear), "delta-net layers need a per sequence [[state]] named {want:?}");
         }

@@ -76,10 +76,11 @@ const UNARY: [(&str, &str, &str); 7] = [
     ("abs", "fabsf", "abs"),
 ];
 
-const MACROS: [(&str, &str); 3] = [
+const MACROS: [(&str, &str); 4] = [
     ("sigmoid", "1.0 / (1.0 + exp(-x))"),
     ("silu", "x / (1.0 + exp(-x))"),
     ("gelu_tanh", "0.5 * x * (1.0 + tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)))"),
+    ("softplus", "select(x > 20.0, x, log(1.0 + exp(x)))"),
 ];
 
 const BINARY: [(&str, &str, &str); 2] = [("min", "fminf", "min"), ("max", "fmaxf", "max")];

@@ -210,6 +210,45 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
     Ok(out)
 }
 
+pub fn mixer_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::desc::Shape {
+    let mut symbols = attention_symbols(spec, kv_planes, max_ctx).num("mix_in", spec.mix_in_rows() as f64).num("mix_out", spec.mix_out_cols() as f64).num("linear_layers", spec.linear_layers() as f64);
+    for (n, v) in spec.mixer.iter().flat_map(|m| m.params.iter()) {
+        symbols = symbols.num(n, *v);
+    }
+    symbols
+}
+
+pub fn mixer_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let Some(m) = &spec.mixer else { return Ok(Vec::new()) };
+    let symbols = mixer_symbols(spec, kv_planes, max_ctx);
+    let registry = crate::kir_kernel::Registry::active();
+    let mut built: BTreeMap<String, kir::Kernel> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (i, node) in m.node.iter().enumerate() {
+        let name = node.kernel.as_deref().ok_or_else(|| anyhow::anyhow!("[[mixer.node]] {i} names no kernel"))?;
+        if !built.contains_key(name) {
+            let d = registry.get(name).ok_or_else(|| anyhow::anyhow!("[[mixer.node]] {i} names kernel {name:?}, which no kernel description provides"))?;
+            built.insert(name.to_string(), d.build(target, &symbols).map_err(|e| anyhow::anyhow!("[[mixer.node]] {i}: {e}"))?);
+        }
+        let kernel = &built[name];
+        for p in kernel.params.iter().filter(|p| !kir::recur::LAUNCH.contains(&p.name) && !matches!(p.name, "out_hi" | "out_lo")) {
+            anyhow::ensure!(node.bind.contains_key(p.name), "[[mixer.node]] {i} does not bind {name} param {:?}", p.name);
+        }
+        for (b, v) in &node.bind {
+            let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[mixer.node]] {i} binds {b:?}, which {name} has no param for"))?;
+            let fits = match v {
+                crate::graph::Bind::Weight { .. } => param.role == kir::Role::Weight,
+                crate::graph::Bind::Buffer { .. } => param.role == kir::Role::Activation && param.ty == kir::Scalar::F32,
+                crate::graph::Bind::State { .. } => param.role == kir::Role::Activation && param.ty == kir::Scalar::F32 && param.access == kir::Access::Write,
+                crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_) => param.role == kir::Role::Value,
+            };
+            anyhow::ensure!(fits, "[[mixer.node]] {i} binds {b:?} to the wrong kind of value");
+        }
+        out.push(kernel.clone());
+    }
+    Ok(out)
+}
+
 pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::LinearShape {
     kir::linear::LinearShape { key_heads: la.key_heads, value_heads: la.value_heads, head_dim: la.key_head_dim, conv_kernel: la.conv_kernel, tiled_value_heads: la.v_heads == crate::spec::VHeadOrder::Tiled }
 }
@@ -401,7 +440,7 @@ impl Module {
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let described = described_kernels(spec, kv_planes, max_ctx, target)?;
         let mut distinct: Vec<kir::Kernel> = Vec::new();
-        for k in described.into_iter().flatten() {
+        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?) {
             if !distinct.iter().any(|d| d.name == k.name) {
                 distinct.push(k);
             }
