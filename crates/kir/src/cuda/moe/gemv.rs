@@ -263,7 +263,7 @@ pub fn gemv() -> String {
     let mut out = String::new();
     out.push_str(prim::fp8_grid());
     out.push_str(&prim::e2m1_to_f32("moe_e2m1"));
-    out.push_str(&prim::multi_row_dot("moe_rows_fp4", prim::RowFormat::Fp4Rows { decode: "moe_e2m1" }, 2));
+    out.push_str(&prim::multi_row_dot("moe_rows_fp4", prim::RowFormat::Fp4Rows { decode: "moe_e2m1" }, prim::RowLoad { unroll: 0, stream: false }));
     out.push_str(&dot());
     out.push_str(&up_impl());
     out.push_str(&down_impl());
@@ -278,8 +278,8 @@ pub fn pair_entries() -> String {
 }
 
 pub fn grouped() -> String {
-    let mut out = prim::multi_row_dot("moe_rows_fp8", prim::RowFormat::Fp8, 2);
-    out.push_str(&prim::multi_row_dot("moe_rows_bf16", prim::RowFormat::Bf16, 8));
+    let mut out = prim::multi_row_dot("moe_rows_fp8", prim::RowFormat::Fp8, prim::RowLoad { unroll: 0, stream: false });
+    out.push_str(&prim::multi_row_dot("moe_rows_bf16", prim::RowFormat::Bf16, prim::RowLoad { unroll: 8, stream: true }));
     out.push_str(&dot2());
     out.push_str(&group_up_impl());
     out.push_str(&group_down_impl());

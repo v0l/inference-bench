@@ -1,4 +1,4 @@
-pub use crate::cuda::gemm::prim::{cp4_zfill, cp8_zfill, device, e2m1_to_f32, e2m1x2, multi_row_dot, RowFormat, mma_fp4, mma_mx, swizzle, warp_ids, zero_frag, pipeline_prologue};
+pub use crate::cuda::gemm::prim::{cp4_zfill, cp8_zfill, device, e2m1_to_f32, e2m1x2, multi_row_dot, RowFormat, RowLoad, mma_fp4, mma_mx, swizzle, warp_ids, zero_frag, pipeline_prologue};
 
 pub const QUANTS: [(u8, &str); 4] = [(0, "bf16"), (1, "fp4"), (2, "fp8"), (3, "mx")];
 
