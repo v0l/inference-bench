@@ -251,4 +251,18 @@ Proof (Spark GB10, release, `tests/variants.rs`, fixture `tiny-glm4-moe`, refere
 group_limited_sigmoid_routing_with_score_bias_matches_transformers ... ok
 ```
 
-Not done, split out: the DSA top-k indexer with a shared index buffer, V4 compressed sparse attention, hash layers (lookup by token id), `gather`/`scatter` as description stages, a tiny gpt-oss fixture (needs expert and router biases and the gpt-oss swiglu on the GPU), and native block-scaled mma for MXFP4 (experts decode to bf16 today).
+Second pass (same slice):
+
+- **Biases.** `[attention] o_bias`, `[moe] router_bias` and `expert_bias` (router module name via `router_module`). The expert biases enter the gemv and grouped kernels before the gated expression; the router bias is added to the logits in `moe_route_logits`. The mma path is NVFP4 only and does not take expert biases.
+- **Hash layers.** `[moe] hash_table = "tid2eid"` with `num_hash_layers` from `config.json`: the first N sparse layers read experts from an `[vocab, top_k]` table indexed by the token id (`lookup`), and weight them by the router scores. `MoeShape.hash` selects the code; the table is a per layer checkpoint tensor. `tests/moe_route.rs` runs the real kernel on the GPU against a host reference.
+- **gather, scatter, lookup stages** in `family = "compose"`: `index` names a read i32 param; rows are addressed by the index buffer instead of the block id. CUDA only, errors name the param. `crates/kir/tests/compose.rs`.
+- **DSA indexer.** `family = "index_topk"` (`specs/dsa_index_topk.toml`): relu index scores weighted per head, then top-k per query row into an i32 buffer (`-1` for unused slots). A later layer shares the selection by binding the same buffer. `tests/index_topk.rs` checks the order against a host reference. Wiring it in front of the MLA scan (indexer projections, key cache, masked scan) is the part of GLM-5 left.
+- **tiny gpt-oss** (`tests/fixtures/tiny-gpt-oss`, `specs/family-gpt_oss.toml`): sinks with sliding window, biased attention, router bias, top-2 softmax weights, clamped SwiGLU with alpha, MXFP4 experts. Transformers `GptOssForCausalLM` is the reference; its experts are dequantised from the same blocks.
+
+```text
+gpt_oss_sinks_clamped_swiglu_and_mxfp4_experts_match_transformers ... ok   (Spark GB10)
+```
+
+`plan.rs` now asks the spec for the expert tensors (`Spec::expert_tensors`), so `plan_rs_has_no_architecture_or_op_sequence_knowledge` passes unchanged.
+
+Not done, filed separately: V4 compressed sparse attention and native block-scaled mma for MXFP4 experts.
