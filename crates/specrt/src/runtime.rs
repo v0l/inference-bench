@@ -727,7 +727,7 @@ fn gemv_cfg(name: &str, rows: usize, w: &DeviceMatrix, sms: u32) -> LaunchConfig
     }
 }
 
-const GEMV_BLOCKS_PER_SM: u32 = 2;
+const GEMV_BLOCKS_PER_SM: u32 = 8;
 const PREFILL_CHUNK: usize = 2048;
 const STATE_FREE_MARGIN: usize = 256 << 20;
 const ATTN_SPLITS: usize = 64;
@@ -969,7 +969,9 @@ impl Runtime {
         } else {
             stream.alloc_zeros(1)?
         };
-        let f8b_part = if spec.quant.is_fp8() {
+        let f8b_part = if spec.quant == crate::spec::Quant::Gguf {
+            stream.alloc_zeros(crate::gemm::ggml_part_len(spec, &target))?
+        } else if spec.quant.is_fp8() {
             stream.alloc_zeros(crate::gemm::batch_part_len(spec, &target, false))?
         } else {
             stream.alloc_zeros(1)?
@@ -1461,6 +1463,7 @@ impl Runtime {
             (GemmPath::F8b, _, _) => return self.tc_f8b(&choice, w, bias, x, out, rows, tokens),
             (GemmPath::F4b, _, _) => return self.tc_f4b(&choice, w, x, out, rows, tokens),
             (GemmPath::Rows, _, _) => return self.tc_rows(&choice, w, x, out, rows, tokens),
+            (GemmPath::Ggr, _, _) => return self.tc_ggr(&choice, w, bias, x, out, rows, tokens),
             (GemmPath::Ggb, _, _) => return self.tc_ggb(&choice, w, bias, x, out, rows, tokens),
             _ => {}
         }
@@ -1542,6 +1545,57 @@ impl Runtime {
             shared_mem_bytes: self.smem[kernel],
         };
         unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn tc_ggr(
+        &self,
+        choice: &crate::codegen::KernelChoice,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        use crate::codegen::{BATCH_REDUCE_BLOCK as GGR_REDUCE_BLOCK, BatchShape};
+        let DeviceMatrix::Ggml { data, table } = w else { unreachable!("tc_ggr takes GGUF weights") };
+        let linear = choice.name.split("_ggr").next().expect("a ggr kernel");
+        let cols = crate::codegen::linear_dims(&self.spec, linear).1;
+        let shape = BatchShape::for_ggml(tokens);
+        let splits = shape.ggml_splits(&self.target, rows, cols);
+        let (n, s) = (tokens as i32, splits as i32);
+        let mut b = self.stream.launch_builder(self.kernel(&choice.name));
+        b.arg(data).arg(table);
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        b.arg(&self.f8b_part).arg(&n).arg(&s);
+        let config = LaunchConfig {
+            grid_dim: (grid(rows, shape.rows()), splits as u32, 1),
+            block_dim: (shape.threads(), 1, 1),
+            shared_mem_bytes: shape.smem(),
+        };
+        unsafe { b.launch(config) }?;
+        if splits == 1 {
+            return Ok(());
+        }
+        let reduce = choice.reduce.as_deref().expect("ggr has a reduce kernel");
+        let mut b = self.stream.launch_builder(self.kernel(reduce));
+        b.arg(&self.f8b_part).arg(bias.unwrap_or(&self.buf.dummy));
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        let outs = match out {
+            GemmOut::Planes(_) => tokens * rows / 2,
+            GemmOut::F32(_) => tokens * rows,
+        };
+        b.arg(&n).arg(&s);
+        unsafe { b.launch(cfg(grid(outs, GGR_REDUCE_BLOCK), GGR_REDUCE_BLOCK as u32)) }?;
         Ok(())
     }
 

@@ -166,6 +166,10 @@ pub fn batch_part_len(spec: &Spec, target: &kir::Target, fp4: bool) -> usize {
     most.max(BATCH_MAX_TOKENS)
 }
 
+pub fn ggml_part_len(spec: &Spec, target: &kir::Target) -> usize {
+    GGB_LINEARS.iter().copied().chain(["lm_head"]).map(|l| linear_shape(spec, l)).map(|s| kg::ggml_part_len(target, s.n, s.k)).max().unwrap_or(1).max(1)
+}
+
 pub struct GemmSet {
     pub kernels: Vec<KernelInstance>,
     pub refused: Vec<String>,
@@ -257,6 +261,15 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
     if spec.quant == Quant::Gguf {
         for linear in GGB_LINEARS {
             set.tiles(t, &format!("{linear}_ggb"), linear_shape(spec, linear), WeightFormat::Bf16, split(spec, linear, WeightFormat::Bf16), true, &tuning)?;
+        }
+        if mma {
+            for linear in GGB_LINEARS.iter().copied().chain(["lm_head"]) {
+                let shape = linear_shape(spec, linear);
+                for tokens in kg::GGML_VARIANTS {
+                    set.push(KernelInstance::ggml_batch(t, &format!("{linear}_ggr{tokens}"), shape, tokens, split(spec, linear, WeightFormat::Ggml)))?;
+                }
+                set.push(KernelInstance::batch_reduce(t, &format!("{linear}_ggr_reduce"), shape, WeightFormat::Ggml))?;
+            }
         }
     }
     if la && spec.speculative().is_some() {
