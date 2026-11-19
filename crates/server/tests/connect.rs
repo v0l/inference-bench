@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use inference_bench_server::connect::{self, App, Endpoint};
 
-const AGENT: &str = "tool_parser = 'qwen3_coder'\nreasoning_parser = 'qwen3'\n[[models]]\nid='m'\n";
+const AGENT: &str = "tool_parser = 'xml_function'\nreasoning_parser = 'think_tags'\n[[models]]\nid='m'\n";
 
 const CALL: [&str; 6] = [
     "Let me look.",
@@ -40,7 +40,7 @@ fn check_passes_for_every_app_against_a_running_server() {
 #[test]
 fn check_fails_when_the_model_never_calls_the_tool() {
     let shape = Shape { pieces: vec!["Sunny".into(), "".into()], token_delay_ms: 0, ..Shape::default() };
-    let rig = start(config("tool_parser = 'qwen3_coder'\n[[models]]\nid='m'\n"), shape);
+    let rig = start(config("tool_parser = 'xml_function'\n[[models]]\nid='m'\n"), shape);
     let report = connect::check(App::Codex, &endpoint(&rig));
     assert!(!report.passed);
     assert!(report.steps[0].passed);

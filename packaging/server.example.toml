@@ -13,8 +13,8 @@ default_model = "qwen3-0.6b"
 access_log = "/var/log/inference-bench/access.log"
 
 max_ctx = 4096
-tool_parser = "qwen3_coder"
-reasoning_parser = "qwen3"
+tool_parser = "xml_function"
+reasoning_parser = "think_tags"
 
 [chat_template_kwargs]
 reasoning_effort = "medium"

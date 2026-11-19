@@ -164,7 +164,7 @@ A field the server does not handle returns 400 naming it: `response_format` othe
 
 ## Tool loop parity with vLLM (Qwen3.8-27B)
 
-`crates/server/scripts/tool_parity.py URL MODEL OUT` sends 20 temperature 0 turns (one prior tool exchange, then a user turn, with `get_weather` and `add`) through the `openai` client, plus a 3 turn loop with canned tool results. specrt ran with `tool_parser = "qwen3_coder"`, `reasoning_parser = "qwen3"`, `reasoning_effort = "medium"`; the reference was the vLLM server on port 8001.
+`crates/server/scripts/tool_parity.py URL MODEL OUT` sends 20 temperature 0 turns (one prior tool exchange, then a user turn, with `get_weather` and `add`) through the `openai` client, plus a 3 turn loop with canned tool results. specrt ran with `tool_parser = "xml_function"`, `reasoning_parser = "think_tags"`, `reasoning_effort = "medium"`; the reference was the vLLM server on port 8001.
 
 | Check | Result |
 |---|---|
@@ -184,7 +184,7 @@ The tool parser only emits declared tools. It also recovers `<parameter=...>` wi
 
 ## Real client check (Qwen3-0.6B, specrt, hermes parser)
 
-Server: `tool_parser = "hermes"`, `reasoning_parser = "qwen3"`, one model on `crates/specrt/specs/qwen3-0.6b.toml`.
+Server: `tool_parser = "hermes"`, `reasoning_parser = "think_tags"`, one model on `crates/specrt/specs/qwen3-0.6b.toml`.
 
 Claude Code (`ANTHROPIC_BASE_URL=http://127.0.0.1:18629 claude -p "Read the file note.txt with the Read tool and tell me what it says." --allowedTools Read`):
 

@@ -14,7 +14,7 @@ pub enum Thinking {
 pub enum ToolFormat {
     #[default]
     None,
-    Qwen3Coder,
+    XmlFunction,
     Hermes,
     Unparsed,
 }
@@ -22,7 +22,7 @@ pub enum ToolFormat {
 impl ToolFormat {
     pub fn parser(self) -> Option<&'static str> {
         match self {
-            ToolFormat::Qwen3Coder => Some("qwen3_coder"),
+            ToolFormat::XmlFunction => Some("xml_function"),
             ToolFormat::Hermes => Some("hermes"),
             ToolFormat::None | ToolFormat::Unparsed => None,
         }
@@ -130,7 +130,7 @@ impl ChatTemplate {
     pub fn tool_format(&self) -> ToolFormat {
         let s = &self.source;
         if s.contains("<function=") && s.contains("<parameter=") {
-            ToolFormat::Qwen3Coder
+            ToolFormat::XmlFunction
         } else if s.contains("<tool_call>") {
             ToolFormat::Hermes
         } else if s.contains("tools") || s.contains("tool_calls") {

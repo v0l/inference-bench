@@ -123,7 +123,7 @@ fn llama3_rope_scaling_is_parsed() {
     );
     let spec = Spec::from_hf_config(&json).unwrap();
     let s = spec.rope.scaling.clone().unwrap();
-    assert_eq!(s.kind, specrt::spec::RopeScalingKind::Llama3);
+    assert_eq!(s.kind, specrt::spec::RopeScalingKind::Banded);
     assert_eq!(s.factor, 8.0);
     assert_eq!(s.original_max_positions, Some(8192.0));
     assert_eq!(Spec::parse(&spec.to_toml().unwrap()).unwrap(), spec);

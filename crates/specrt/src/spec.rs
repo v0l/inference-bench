@@ -377,7 +377,7 @@ pub enum Activation {
 #[serde(rename_all = "lowercase")]
 pub enum RopeScalingKind {
     Linear,
-    Llama3,
+    Banded,
     Yarn,
     Longrope,
 }
@@ -1135,7 +1135,7 @@ fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_jso
             yarn: None,
             longrope: None,
         })),
-        RopeScalingKind::Llama3 => Ok(Some(RopeScaling {
+        RopeScalingKind::Banded => Ok(Some(RopeScaling {
             kind: scaling_kind,
             factor,
             low_freq_factor: Some(num("low_freq_factor").context("no low_freq_factor")?),
@@ -1812,7 +1812,7 @@ impl Spec {
         let original = s.original_max_positions.unwrap_or(1.0);
         match (s.kind, s.yarn.as_ref()) {
             (RopeScalingKind::Linear, _) => RopeConstants { kind: 1, factor: s.factor, low: 1.0, high: 1.0, original, mscale: 1.0 },
-            (RopeScalingKind::Llama3, _) => RopeConstants {
+            (RopeScalingKind::Banded, _) => RopeConstants {
                 kind: 2,
                 factor: s.factor,
                 low: s.low_freq_factor.unwrap_or(1.0),

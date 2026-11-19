@@ -73,7 +73,7 @@ fn concurrent_requests_are_batched_and_match_their_solo_output() {
 #[test]
 #[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
 fn qwen3_0_6b_answers_a_tool_turn_with_a_parsed_call() {
-    let rig = serving_rig("tool_parser = 'hermes'\nreasoning_parser = 'qwen3'\n[chat_template_kwargs]\nenable_thinking = true\n");
+    let rig = serving_rig("tool_parser = 'hermes'\nreasoning_parser = 'think_tags'\n[chat_template_kwargs]\nenable_thinking = true\n");
     let tools = json!([{"type": "function", "function": {"name": "get_weather", "description": "Get the weather for a city",
         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]);
     let body = json!({"model": "q", "temperature": 0, "max_tokens": 400, "tools": tools,
@@ -137,7 +137,7 @@ fn a_request_longer_than_the_model_length_is_a_400_not_a_crash() {
 #[test]
 #[ignore = "needs a CUDA GPU and Qwen/Qwen3-0.6B"]
 fn qwen3_0_6b_serves_a_tool_turn_over_messages_and_responses() {
-    let rig = serving_rig("tool_parser = 'hermes'\nreasoning_parser = 'qwen3'\n");
+    let rig = serving_rig("tool_parser = 'hermes'\nreasoning_parser = 'think_tags'\n");
     let (s, text, _) = rig.post(
         "/v1/messages",
         None,

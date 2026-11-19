@@ -232,7 +232,7 @@ impl Default for ServerConfig {
 impl ServerConfig {
     pub fn with_thinking(mut self, thinking: inference_bench_core::specrt_chat::Thinking) -> Self {
         if self.reasoning_parser.is_none() && thinking == inference_bench_core::specrt_chat::Thinking::OpensInPrompt {
-            self.reasoning_parser = Some("qwen3".into());
+            self.reasoning_parser = Some("think_tags".into());
         }
         self
     }
@@ -324,10 +324,10 @@ impl ServerConfig {
         anyhow::ensure!(self.kv_cache_gb.is_none_or(|g| g > 0.0), "kv_cache_gb must be positive");
         anyhow::ensure!(self.max_loaded_models >= 1, "max_loaded_models must be at least 1");
         if let Some(p) = &self.tool_parser {
-            anyhow::ensure!(matches!(p.as_str(), "qwen3_coder" | "qwen3_xml" | "hermes"), "tool_parser {p} is not supported: use qwen3_coder or hermes");
+            anyhow::ensure!(matches!(p.as_str(), "xml_function" | "qwen3_xml" | "hermes"), "tool_parser {p} is not supported: use xml_function or hermes");
         }
         if let Some(p) = &self.reasoning_parser {
-            anyhow::ensure!(p == "qwen3", "reasoning_parser {p} is not supported: use qwen3");
+            anyhow::ensure!(p == "think_tags", "reasoning_parser {p} is not supported: use think_tags");
         }
         let mut seen = std::collections::HashSet::new();
         for m in &self.models {
@@ -398,12 +398,12 @@ mod tests {
     #[test]
     fn a_tool_parser_is_inferred_from_the_template_unless_configured() {
         use inference_bench_core::specrt_chat::ToolFormat;
-        let inferred = ServerConfig::default().with_tools(ToolFormat::Qwen3Coder);
-        assert_eq!(inferred.tool_parser.as_deref(), Some("qwen3_coder"));
+        let inferred = ServerConfig::default().with_tools(ToolFormat::XmlFunction);
+        assert_eq!(inferred.tool_parser.as_deref(), Some("xml_function"));
         assert_eq!(ServerConfig::default().with_tools(ToolFormat::Hermes).tool_parser.as_deref(), Some("hermes"));
         assert_eq!(ServerConfig::default().with_tools(ToolFormat::Unparsed).tool_parser, None);
         let explicit = ServerConfig { tool_parser: Some("hermes".into()), ..ServerConfig::default() };
-        assert_eq!(explicit.with_tools(ToolFormat::Qwen3Coder).tool_parser.as_deref(), Some("hermes"));
+        assert_eq!(explicit.with_tools(ToolFormat::XmlFunction).tool_parser.as_deref(), Some("hermes"));
     }
 
     #[test]

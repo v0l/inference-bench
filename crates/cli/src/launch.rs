@@ -55,7 +55,7 @@ pub struct LaunchArgs {
     pub kv_gb: Option<f64>,
     #[arg(long, help = "A file inside a Hugging Face repo, for repos with several GGUF quants")]
     pub file: Option<String>,
-    #[arg(long, default_value = "qwen3_coder", help = "Tool call format the model writes: qwen3_coder or hermes")]
+    #[arg(long, default_value = "xml_function", help = "Tool call format the model writes: xml_function or hermes")]
     pub tool_parser: String,
     #[arg(long, help = "Serve even when the estimate says it does not fit")]
     pub force: bool,
@@ -596,7 +596,7 @@ mod tests {
             seqs: None,
             kv_gb: None,
             file: None,
-            tool_parser: "qwen3_coder".into(),
+            tool_parser: "xml_function".into(),
             force: false,
             hf_base: hf::HF_BASE.into(),
             assume_free_mib: Some(24 * 1024),

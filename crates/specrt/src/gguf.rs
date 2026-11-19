@@ -590,7 +590,7 @@ impl Gguf {
         let factor = self.number(&names.key("rope_scaling_factor", arch)?);
         if kind.is_empty() || names.unscaled.iter().any(|u| u == kind) {
             return match self.tensor(names.tensor("rope_freqs")?).filter(|_| !self.header_only) {
-                Some(t) => Ok(Some(self.llama3_scaling(family, t, head_dim)?)),
+                Some(t) => Ok(Some(self.banded_scaling(family, t, head_dim)?)),
                 None => Ok(None),
             };
         }
@@ -608,7 +608,7 @@ impl Gguf {
         }
     }
 
-    fn llama3_scaling(&self, family: &crate::family::Family, t: &TensorInfo, head_dim: usize) -> Result<RopeScaling> {
+    fn banded_scaling(&self, family: &crate::family::Family, t: &TensorInfo, head_dim: usize) -> Result<RopeScaling> {
         let names = &family.gguf;
         let arch = self.architecture()?;
         let freqs_name = names.tensor("rope_freqs")?;
@@ -616,7 +616,7 @@ impl Gguf {
         let freqs: Vec<f32> = self.data(t).chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes"))).collect();
         let factor = freqs.iter().copied().fold(1.0f32, f32::max) as f64;
         let scaling = RopeScaling {
-            kind: RopeScalingKind::Llama3,
+            kind: RopeScalingKind::Banded,
             factor,
             low_freq_factor: Some(1.0),
             high_freq_factor: Some(4.0),
@@ -627,11 +627,11 @@ impl Gguf {
             longrope: None,
         };
         let theta = self.number(&names.key("rope_freq_base", arch)?).unwrap_or(10000.0);
-        let expected = llama3_factors(theta, head_dim, &scaling);
+        let expected = banded_factors(theta, head_dim, &scaling);
         for (i, (a, b)) in freqs.iter().zip(&expected).enumerate() {
             ensure!(
                 (*a as f64 - b).abs() <= 1e-5 * b.abs().max(1.0),
-                "{freqs_name}[{i}] is {a} but llama3 scaling with factor {factor} gives {b}; this rope scaling is not supported"
+                "{freqs_name}[{i}] is {a} but banded scaling with factor {factor} gives {b}; this rope scaling is not supported"
             );
         }
         Ok(scaling)
@@ -718,7 +718,7 @@ pub fn quant_label_supported(label: &str) -> bool {
     ["Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "BF16", "F16", "F32"].iter().any(|q| upper.starts_with(q))
 }
 
-pub fn llama3_factors(theta: f64, head_dim: usize, s: &RopeScaling) -> Vec<f64> {
+pub fn banded_factors(theta: f64, head_dim: usize, s: &RopeScaling) -> Vec<f64> {
     let (low, high, orig) = (s.low_freq_factor.unwrap_or(1.0), s.high_freq_factor.unwrap_or(4.0), s.original_max_positions.unwrap_or(8192.0));
     let (low_wavelen, high_wavelen) = (orig / low, orig / high);
     (0..head_dim / 2)
@@ -1310,8 +1310,8 @@ mod tests {
 
     #[test]
     fn the_llama3_scale_factors_match_the_converter_for_llama_3_2_1b() {
-        let s = RopeScaling { kind: RopeScalingKind::Llama3, factor: 32.0, low_freq_factor: Some(1.0), high_freq_factor: Some(4.0), original_max_positions: Some(8192.0), yarn: None, longrope: None };
-        let f = llama3_factors(500000.0, 64, &s);
+        let s = RopeScaling { kind: RopeScalingKind::Banded, factor: 32.0, low_freq_factor: Some(1.0), high_freq_factor: Some(4.0), original_max_positions: Some(8192.0), yarn: None, longrope: None };
+        let f = banded_factors(500000.0, 64, &s);
         assert_eq!(f.len(), 32);
         assert_eq!(f[0], 1.0);
         assert_eq!(f[31], 32.0);

@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use serde_json::{Value, json};
 
-const AGENT: &str = "tool_parser = 'qwen3_coder'\nreasoning_parser = 'qwen3'\n[chat_template_kwargs]\nreasoning_effort = 'medium'\n[[models]]\nid='m'\n";
+const AGENT: &str = "tool_parser = 'xml_function'\nreasoning_parser = 'think_tags'\n[chat_template_kwargs]\nreasoning_effort = 'medium'\n[[models]]\nid='m'\n";
 
 fn pieces(text: &[&str]) -> Shape {
     Shape { pieces: text.iter().map(|s| s.to_string()).collect(), token_delay_ms: 0, ..Shape::default() }

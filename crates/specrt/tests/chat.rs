@@ -103,9 +103,9 @@ fn every_family_template_gets_its_tool_parser_or_an_explicit_none() {
         ("phi3", ToolFormat::None),
         ("phi4", ToolFormat::Unparsed),
         ("qwen3", ToolFormat::Hermes),
-        ("qwen3.5", ToolFormat::Qwen3Coder),
-        ("qwen3.5-moe", ToolFormat::Qwen3Coder),
-        ("qwen3.8", ToolFormat::Qwen3Coder),
+        ("qwen3.5", ToolFormat::XmlFunction),
+        ("qwen3.5-moe", ToolFormat::XmlFunction),
+        ("qwen3.8", ToolFormat::XmlFunction),
     ];
     for (family, want) in table {
         let got = family_template(family).tool_format();
@@ -120,7 +120,7 @@ fn the_tool_format_comes_from_the_template_text() {
     let format = |t: &str| ChatTemplate::from_tokenizer_config(&json(t)).unwrap().unwrap().tool_format();
     assert_eq!(format("{{ messages }}"), ToolFormat::None);
     assert_eq!(format("{% if tools %}<tool_call>{\"name\": \"x\"}</tool_call>{% endif %}"), ToolFormat::Hermes);
-    assert_eq!(format("{% if tools %}<tool_call>\n<function=x>\n<parameter=a>{% endif %}"), ToolFormat::Qwen3Coder);
+    assert_eq!(format("{% if tools %}<tool_call>\n<function=x>\n<parameter=a>{% endif %}"), ToolFormat::XmlFunction);
     assert_eq!(format("{% if tools %}[AVAILABLE_TOOLS]{% endif %}"), ToolFormat::Unparsed);
     assert_eq!(ToolFormat::Hermes.parser(), Some("hermes"));
     assert_eq!(ToolFormat::Unparsed.parser(), None);

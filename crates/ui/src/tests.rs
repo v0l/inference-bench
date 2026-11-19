@@ -477,7 +477,7 @@ fn tool_server(h: &mut Harness<'static, App>, tools: inference_bench_core::specr
 fn the_app_server_parses_tool_calls_for_a_qwen_template() {
     use inference_bench_core::specrt_chat::ToolFormat;
     let mut h = harness("toolcalls", Tab::Server);
-    let url = tool_server(&mut h, ToolFormat::Qwen3Coder);
+    let url = tool_server(&mut h, ToolFormat::XmlFunction);
     let body = |stream: bool| serde_json::json!({"messages":[{"role":"user","content":"weather?"}],"tools":weather_tools(),"stream":stream,"max_tokens":64});
     let mut resp = ureq::post(format!("{url}/v1/chat/completions")).send_json(body(false)).unwrap();
     let v: serde_json::Value = resp.body_mut().read_json().unwrap();
@@ -494,7 +494,7 @@ fn the_app_server_parses_tool_calls_for_a_qwen_template() {
     assert!(!text.contains("<function="), "{text}");
     let mut resp = ureq::get(format!("{url}/props")).call().unwrap();
     let props: serde_json::Value = resp.body_mut().read_json().unwrap();
-    assert_eq!(props["tool_parser"], "qwen3_coder");
+    assert_eq!(props["tool_parser"], "xml_function");
     h.state_mut().server.stop();
 }
 
@@ -528,7 +528,7 @@ impl inference_bench_core::native::Model for XmlThenAnswer {
     }
 
     fn tool_format(&self) -> specrt::chat::ToolFormat {
-        specrt::chat::ToolFormat::Qwen3Coder
+        specrt::chat::ToolFormat::XmlFunction
     }
 
     fn thinking(&self) -> specrt::chat::Thinking {
