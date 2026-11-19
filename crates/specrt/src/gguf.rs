@@ -931,48 +931,74 @@ impl DeviceRow {
     }
 }
 
-pub struct DeviceRows {
-    pub data: Vec<u8>,
+pub struct DeviceRows<'a> {
+    pub parts: Vec<std::borrow::Cow<'a, [u8]>>,
     pub rows: Vec<u32>,
     pub cols: usize,
 }
 
-impl DeviceRows {
-    pub fn pack(kind: GgmlType, data: &[u8], rows: usize, cols: usize) -> Result<DeviceRows> {
+impl<'a> DeviceRows<'a> {
+    pub fn pack(kind: GgmlType, data: &'a [u8], rows: usize, cols: usize) -> Result<DeviceRows<'a>> {
         let row = DeviceRow::of(kind)?;
         ensure!(cols.is_multiple_of(DEVICE_SUPERBLOCK), "a {} row of {cols} is not a whole number of 256-element blocks", kind.name());
         let src_row = kind.row_bytes(cols)?;
         ensure!(data.len() == src_row * rows, "{} data of {} bytes is not {rows} rows of {cols}", kind.name(), data.len());
         if let Some(q8) = as_q8_0(kind, data) {
-            return DeviceRows::pack(GgmlType::Q8_0, &q8, rows, cols);
+            let packed = DeviceRows::pack(GgmlType::Q8_0, &q8, rows, cols)?;
+            return Ok(DeviceRows { parts: packed.parts.into_iter().map(|p| std::borrow::Cow::Owned(p.into_owned())).collect(), rows: packed.rows, cols });
         }
         let per_row = cols / DEVICE_SUPERBLOCK * row.bytes();
-        let mut out = Vec::with_capacity(per_row * rows);
-        for src in data.chunks_exact(src_row) {
-            match kind {
-                GgmlType::Q6K => {
-                    for b in src.chunks_exact(210) {
-                        out.extend_from_slice(b);
-                        out.extend_from_slice(&[0u8; 14]);
-                    }
+        let part = match kind {
+            GgmlType::Q6K => {
+                let mut out = Vec::with_capacity(per_row * rows);
+                for b in data.chunks_exact(210) {
+                    out.extend_from_slice(b);
+                    out.extend_from_slice(&[0u8; 14]);
                 }
-                GgmlType::F32 => out.extend(src.chunks_exact(4).flat_map(|b| crate::weights::f32_to_bf16(f32::from_le_bytes(b.try_into().expect("4 bytes"))).to_le_bytes())),
-                _ => out.extend_from_slice(src),
+                std::borrow::Cow::Owned(out)
             }
-        }
+            GgmlType::F32 => std::borrow::Cow::Owned(data.chunks_exact(4).flat_map(|b| crate::weights::f32_to_bf16(f32::from_le_bytes(b.try_into().expect("4 bytes"))).to_le_bytes()).collect()),
+            _ => std::borrow::Cow::Borrowed(data),
+        };
         let table = (0..rows).map(|r| ((r * per_row / 16) as u32) << 3 | row as u32).collect();
-        ensure!(out.len() / 16 < 1 << 29, "a GGUF matrix of {} bytes is too large for the row table", out.len());
-        Ok(DeviceRows { data: out, rows: table, cols })
+        ensure!(part.len() / 16 < 1 << 29, "a GGUF matrix of {} bytes is too large for the row table", part.len());
+        Ok(DeviceRows { parts: vec![part], rows: table, cols })
     }
 
-    pub fn from_bf16(w: &[u16], cols: usize) -> Result<DeviceRows> {
+    pub fn from_bf16(w: &[u16], cols: usize) -> Result<DeviceRows<'static>> {
+        ensure!(cols.is_multiple_of(DEVICE_SUPERBLOCK), "a bf16 row of {cols} is not a whole number of 256-element blocks");
         let bytes: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
-        DeviceRows::pack(GgmlType::Bf16, &bytes, w.len() / cols, cols)
+        let rows = w.len() / cols;
+        let per_row = cols / DEVICE_SUPERBLOCK * DeviceRow::Bf16.bytes();
+        let table = (0..rows).map(|r| ((r * per_row / 16) as u32) << 3 | DeviceRow::Bf16 as u32).collect();
+        Ok(DeviceRows { parts: vec![std::borrow::Cow::Owned(bytes)], rows: table, cols })
     }
 
-    pub fn append(&mut self, other: DeviceRows) -> Vec<u32> {
-        let base = (self.data.len() / 16) as u32;
-        self.data.extend(other.data);
+    pub fn len_bytes(&self) -> usize {
+        self.parts.iter().map(|p| p.len()).sum()
+    }
+
+    pub fn data(&self) -> std::borrow::Cow<'_, [u8]> {
+        match self.parts.as_slice() {
+            [one] => std::borrow::Cow::Borrowed(one),
+            parts => std::borrow::Cow::Owned(parts.concat()),
+        }
+    }
+
+    pub fn slice(&self, from: usize, len: usize) -> &[u8] {
+        let mut start = 0;
+        for p in &self.parts {
+            if from < start + p.len() {
+                return &p[from - start..from - start + len];
+            }
+            start += p.len();
+        }
+        &[]
+    }
+
+    pub fn append(&mut self, other: DeviceRows<'a>) -> Vec<u32> {
+        let base = (self.len_bytes() / 16) as u32;
+        self.parts.extend(other.parts);
         other.rows.into_iter().map(|e| e + (base << 3)).collect()
     }
 
@@ -983,7 +1009,7 @@ impl DeviceRows {
         let blocks = self.cols / DEVICE_SUPERBLOCK;
         let mut out = vec![0f32; self.cols];
         for (b, y) in out.chunks_exact_mut(DEVICE_SUPERBLOCK).enumerate().take(blocks) {
-            let sb = &self.data[start + b * row.bytes()..start + (b + 1) * row.bytes()];
+            let sb = self.slice(start + b * row.bytes(), row.bytes());
             match row {
                 DeviceRow::Q4K => dequantize_q4_k(sb, y),
                 DeviceRow::Q5K => dequantize_q5_k(sb, y),

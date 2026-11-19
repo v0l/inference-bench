@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::ops::Range;
 use std::time::Instant;
 
-const PREFILL_CHUNK: usize = 64;
+const PREFILL_CHUNK: usize = 512;
 const DECODE_STEPS_PER_SUBMIT: usize = 4;
 
 pub struct WMat<B: Backend> {
@@ -68,7 +68,7 @@ pub struct Dense<B: Backend> {
     m: Model<B>,
 }
 
-fn rows_of(m: &Matrix, nrows: usize, cols: usize, what: &str) -> Result<DeviceRows> {
+fn rows_of<'a>(m: &'a Matrix, nrows: usize, cols: usize, what: &str) -> Result<DeviceRows<'a>> {
     match m {
         Matrix::Bf16(w) => {
             ensure!(w.len() == nrows * cols, "{what} has {} values, expected {}", w.len(), nrows * cols);
@@ -76,7 +76,7 @@ fn rows_of(m: &Matrix, nrows: usize, cols: usize, what: &str) -> Result<DeviceRo
         }
         Matrix::Ggml(g) => {
             ensure!(g.rows.len() == nrows && g.cols == cols, "{what} is {}x{}, expected {nrows}x{cols}", g.rows.len(), g.cols);
-            Ok(DeviceRows { data: g.data.clone(), rows: g.rows.clone(), cols })
+            Ok(DeviceRows { parts: g.parts.iter().map(|p| std::borrow::Cow::Borrowed(p.as_ref())).collect(), rows: g.rows.clone(), cols })
         }
         _ => bail!("{what} uses weights that are not yet on wgpu"),
     }
@@ -91,11 +91,11 @@ fn floats(v: &[f32]) -> Vec<u8> {
 }
 
 fn upload_rows<B: Backend>(be: &B, rows: DeviceRows, nrows: usize, what: &str) -> Result<WMat<B>> {
-    let data = be.alloc(rows.data.len() as u64).with_context(|| format!("{what} weights"))?;
-    be.upload(&data, 0, &rows.data);
+    let parts: Vec<&[u8]> = rows.parts.iter().map(|p| p.as_ref()).collect();
+    let data = be.alloc_filled(&parts).with_context(|| format!("{what} weights"))?;
     let table = be.alloc(rows.rows.len() as u64 * 4)?;
     be.upload(&table, 0, &words(&rows.rows));
-    Ok(WMat { bytes: rows.data.len() as u64 + rows.rows.len() as u64 * 4, data, rows: table, nrows: nrows as u32, cols: rows.cols as u32 })
+    Ok(WMat { bytes: rows.len_bytes() as u64 + rows.rows.len() as u64 * 4, data, rows: table, nrows: nrows as u32, cols: rows.cols as u32 })
 }
 
 fn upload_floats<B: Backend>(be: &B, v: &[f32]) -> Result<B::Buffer> {
@@ -202,6 +202,9 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             }
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention => {
                 let l = l.expect("attention needs a layer");
+                if rows > 1 && be.limits().coop_matrix && spec.attention.head_dim.is_multiple_of(8) && spec.attention.head_dim <= 256 {
+                    return be.dispatch("flash_coop", &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, r, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r.div_ceil(wgsl::FLASH_COOP_QUERIES), 1]);
+                }
                 if rows > 1 && be.limits().subgroup_size == 32 {
                     return be.dispatch("flash", &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, r, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r.div_ceil(wgsl::FLASH_TOKENS), 1]);
                 }
@@ -276,17 +279,17 @@ impl<B: Backend> Dense<B> {
         let a = &spec.attention;
         let (mut embed, mut head, mut final_norm, mut weight_bytes) = (None, None, None, 0);
         if first || last {
-            let out = checkpoint.outside(spec)?;
             if first {
-                let e = upload_rows(&be, DeviceRows::from_bf16(&out.embed, d.hidden)?, d.vocab, "embed")?;
+                let e = upload_rows(&be, checkpoint.embedding_rows(spec)?, d.vocab, "embed")?;
                 weight_bytes += e.bytes;
                 embed = Some(e);
             }
             if last {
-                let h = mat(&be, &out.lm_head, d.vocab, d.hidden, "lm_head")?;
+                let (norm, lm_head) = checkpoint.head(spec)?;
+                let h = mat(&be, &lm_head, d.vocab, d.hidden, "lm_head")?;
                 weight_bytes += h.bytes;
                 head = Some(h);
-                final_norm = Some(upload_floats(&be, &out.norm)?);
+                final_norm = Some(upload_floats(&be, &norm)?);
             }
         }
         let kv_floats = a.kv_heads * max_ctx * a.head_dim;

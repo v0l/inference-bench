@@ -295,7 +295,7 @@ impl DeviceMatrix {
             Matrix::Fp8 { values, scales } => {
                 DeviceMatrix::Fp8 { values: stream.clone_htod(values.as_ref())?, scales: stream.clone_htod(scales)? }
             }
-            Matrix::Ggml(m) => DeviceMatrix::Ggml { data: stream.clone_htod(&m.data)?, table: stream.clone_htod(&m.rows)? },
+            Matrix::Ggml(m) => DeviceMatrix::Ggml { data: stream.clone_htod(m.data().as_ref())?, table: stream.clone_htod(&m.rows)? },
             Matrix::Fp4(m) => DeviceMatrix::Fp4 {
                 packed: stream.clone_htod(m.packed.as_ref())?,
                 scales: stream.clone_htod(&m.device_scales())?,

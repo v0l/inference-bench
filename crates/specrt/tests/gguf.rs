@@ -117,6 +117,19 @@ fn device_rows_keep_every_type_bit_exact_and_mix_types_by_row() {
 }
 
 #[test]
+fn packing_q4_k_and_bf16_rows_borrows_the_source_bytes_and_q6_k_pads_a_copy() {
+    use std::borrow::Cow;
+    let all = golden();
+    let cols = all[0].want.len() / ROWS;
+    for g in &all {
+        let rows = DeviceRows::pack(g.kind, g.quant, ROWS, cols).unwrap();
+        let borrowed = matches!(rows.parts[0], Cow::Borrowed(_));
+        let wants_borrow = matches!(g.kind, GgmlType::Q4K | GgmlType::Q5K | GgmlType::Q8_0 | GgmlType::F16 | GgmlType::Bf16);
+        assert_eq!(borrowed, wants_borrow, "{}", g.kind.name());
+    }
+}
+
+#[test]
 #[ignore = "needs a CUDA GPU"]
 fn the_gpu_dequantises_mixed_rows_bit_exact_against_ggml() {
     use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
@@ -142,7 +155,7 @@ fn the_gpu_dequantises_mixed_rows_bit_exact_against_ggml() {
     let module = specrt::codegen::Module::generate(&spec, 256).unwrap();
     let loaded = specrt::jit::Jit::new(ctx.clone(), dir).unwrap().load(&module).unwrap();
     let stream = ctx.default_stream();
-    let data = stream.clone_htod(&mixed.data).unwrap();
+    let data = stream.clone_htod(mixed.data().as_ref()).unwrap();
     let table = stream.clone_htod(&mixed.rows).unwrap();
     let rows = mixed.rows.len();
     let out = stream.alloc_zeros::<f32>(rows * cols).unwrap();
