@@ -76,6 +76,51 @@ pub fn device(ret: &str, name: &str, args: &str, body: &str) -> String {
     format!("__device__ __forceinline__ {ret} {name}({args}) {{\n{body}}}\n\n")
 }
 
+pub fn constexpr_int(name: &str, value: &str) -> String {
+    format!("constexpr int {name} = {value};\n")
+}
+
+pub fn dec_struct_open(name: &str) -> String {
+    format!("struct {name} : DecBase<{name}> {{\n")
+}
+
+pub fn static_const(ty: &str, name: &str, value: &str) -> String {
+    format!("    static constexpr {ty} {name} = {value};\n")
+}
+
+pub fn static_const_t(template: &str, ty: &str, name: &str, value: &str) -> String {
+    format!("    template <{template}> static constexpr {ty} {name} = {value};\n")
+}
+
+pub fn static_fn(template: &str, ret: &str, name: &str, args: &str, body: &str) -> String {
+    format!("    template <{template}> static __device__ __forceinline__ {ret} {name}({args}) {{{body}}}\n")
+}
+
+pub fn ldg_reader(name: &str, ptr_ty: &str) -> String {
+    device("unsigned", name, "const unsigned char* p", &format!("    return __ldg((const {ptr_ty}*)p);\n"))
+}
+
+pub fn f16_to_f32(name: &str) -> String {
+    device("float", name, "unsigned short h", "    float r;\n    asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(r) : \"h\"(h));\n    return r;\n")
+}
+
+pub fn byte_of_words(name: &str) -> String {
+    device("unsigned", name, "const unsigned* s, int i", "    return (s[i >> 2] >> (8 * (i & 3))) & 0xffu;\n")
+}
+
+pub fn table_row(name: &str) -> String {
+    device(
+        "const unsigned char*",
+        name,
+        "const void* w, const unsigned* table, int row, int& type",
+        "    unsigned e = __ldg(table + row);\n    type = (int)(e & 7u);\n    return (const unsigned char*)w + (size_t)(e >> 3) * 16;\n",
+    )
+}
+
+pub fn load_f4(dst: &str, base: &str, offset: &str) -> String {
+    format!("{dst} = *(const float4*)({base} + {offset});\n")
+}
+
 pub fn mma_fp4(name: &str) -> String {
     device(
         "void",
