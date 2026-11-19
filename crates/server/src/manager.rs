@@ -67,15 +67,18 @@ pub trait ModelSource: Send + Sync + 'static {
         Vec::new()
     }
 
-    fn tool_format(&self) -> inference_bench_core::specrt_chat::ToolFormat {
+    fn tool_format(&self, id: &str) -> inference_bench_core::specrt_chat::ToolFormat {
+        let _ = id;
         Default::default()
     }
 
-    fn suspend(&self) -> bool {
+    fn suspend(&self, id: &str) -> bool {
+        let _ = id;
         false
     }
 
-    fn resume(&self) -> Result<(), BackendError> {
+    fn resume(&self, id: &str) -> Result<(), BackendError> {
+        let _ = id;
         Ok(())
     }
 }
@@ -365,7 +368,7 @@ impl Manager {
 
     pub fn tool_format(&self, id: &str) -> inference_bench_core::specrt_chat::ToolFormat {
         if let Some(source) = &self.source {
-            return source.tool_format();
+            return source.tool_format(id);
         }
         self.loaded.lock().unwrap().get(id).map(|m| m.tools).unwrap_or_default()
     }
@@ -503,17 +506,18 @@ impl Manager {
 
     async fn resume_source(&self, id: &str) -> Result<(), ApiError> {
         let Some(source) = self.source.clone() else { return Ok(()) };
-        if !source.suspended().iter().any(|m| m.id == id || m.aliases.iter().any(|a| a == id)) {
+        let Some(parked) = source.suspended().into_iter().find(|m| m.id == id || m.aliases.iter().any(|a| a == id)) else {
             return Ok(());
-        }
+        };
         let _guard = self.load_lock.lock().await;
-        if source.suspended().is_empty() {
+        if source.suspended().iter().all(|m| m.id != parked.id) {
             return Ok(());
         }
         self.gate_load(id).await?;
         let started = Instant::now();
         let source_in = source.clone();
-        tokio::task::spawn_blocking(move || source_in.resume())
+        let parked_id = parked.id.clone();
+        tokio::task::spawn_blocking(move || source_in.resume(&parked_id))
             .await
             .map_err(|e| ApiError::internal(format!("resume task failed: {e}")))??;
         tracing::info!(model = %id, load_secs = started.elapsed().as_secs_f64(), "model resumed");
@@ -542,11 +546,16 @@ impl Manager {
         if self.source.is_none() {
             self.gate_load(&cfg.id).await?;
         }
-        self.make_room(cfg)?;
+        if self.source.is_none() {
+            self.make_room(cfg)?;
+        }
         let max_ctx = self.config.max_ctx_for(cfg);
         let serving = self.config.serve_options(cfg);
         let runtime = self.config.runtime.clone();
-        let name = self.config.specs.resolve(cfg.upstream_name());
+        let name = match &self.source {
+            Some(_) => cfg.id.clone(),
+            None => self.config.specs.resolve(cfg.upstream_name()),
+        };
         let spec_hash = crate::config::spec_hash_of(&name);
         let vram_before = (self.probe)();
         let started = Instant::now();
@@ -710,7 +719,7 @@ impl Manager {
         let freed = self.unload(id);
         match &self.source {
             Some(source) if !self.is_busy(id) => {
-                let had = source.suspend();
+                let had = source.suspend(id);
                 self.loaded.lock().unwrap().remove(id);
                 had || freed
             }

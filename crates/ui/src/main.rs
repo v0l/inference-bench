@@ -12,6 +12,7 @@ mod hardware;
 mod strip;
 mod job;
 mod load;
+mod loadedlist;
 mod running;
 mod modelbar;
 mod models;
@@ -75,6 +76,7 @@ pub struct App {
     pub specs: specs::SpecsUpdater,
     pub load: Option<load::LoadDialog>,
     pub picker_query: String,
+    pub chat_model: Option<String>,
 }
 
 impl App {
@@ -114,6 +116,7 @@ impl App {
             },
             load: None,
             picker_query: String::new(),
+            chat_model: None,
             settings,
             wake,
             dir,
@@ -126,7 +129,22 @@ impl App {
     }
 
     pub fn loaded(&self) -> Option<inference_bench_core::engine::Loaded> {
-        self.engine.loaded()
+        let all = self.engine.loaded_all();
+        let chosen = self.chat_model.as_ref().and_then(|m| all.iter().find(|l| &l.display == m).cloned());
+        chosen.or_else(|| all.into_iter().next())
+    }
+
+    pub fn loaded_all(&self) -> Vec<inference_bench_core::engine::Loaded> {
+        self.engine.loaded_all()
+    }
+
+    pub fn max_loaded(&self) -> usize {
+        self.settings.server.max_loaded_models.max(1)
+    }
+
+    pub fn alongside_blocked(&self) -> Option<String> {
+        let n = self.engine.loaded_all().len();
+        (n >= self.max_loaded()).then(|| format!("{n} of {} allowed models are loaded: unload one, or raise the limit on the Server tab", self.max_loaded()))
     }
 
     pub fn gpu_enabled(&self, ordinal: usize) -> bool {
@@ -165,8 +183,15 @@ impl App {
     }
 
     pub fn load_model_named(&mut self, model: &LocalModel, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice) {
+        self.load_model_placed(model, ctx, seqs, kv_cache_bytes, served_names, engine, false);
+    }
+
+    pub fn load_model_placed(&mut self, model: &LocalModel, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice, alongside: bool) {
         self.hardware.release();
+        self.chat_model = Some(model.name.clone());
+        self.engine.set_max_loaded(self.max_loaded());
         self.engine.send(Command::Load {
+            alongside,
             model_id: model.model_id(inference_bench_core::target::NATIVE),
             display: model.name.clone(),
             max_ctx: Some(ctx),
@@ -179,7 +204,12 @@ impl App {
 
     pub fn unload(&mut self) {
         self.hardware.release();
-        self.engine.send(Command::Unload);
+        self.engine.send(Command::Unload { model: None });
+    }
+
+    pub fn unload_model(&mut self, display: &str) {
+        self.hardware.release();
+        self.engine.send(Command::Unload { model: Some(display.to_string()) });
     }
 
     fn pump(&mut self) {

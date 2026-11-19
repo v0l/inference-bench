@@ -335,7 +335,9 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
     dialog.sync();
     let est = dialog.estimate(free);
     let spread = dialog.plan(&crate::hardware::load_devices(app), app.settings.cluster.objective);
-    let (mut go, mut close) = (false, false);
+    let (mut go, mut close, mut alongside) = (false, false, false);
+    let loaded_now = app.loaded_all();
+    let alongside_block = (!loaded_now.is_empty()).then(|| app.alongside_blocked().or_else(|| est.as_ref().filter(|e| e.fits() == Some(false)).map(|e| format!("{} more than the free memory: unload a model first", human_size(e.total() - e.free.unwrap_or(0)))))).flatten();
     let r = egui::Modal::new(egui::Id::new("load-model"))
         .backdrop_color(egui::Color32::from_black_alpha(150))
         .show(ctx, |ui| {
@@ -484,9 +486,23 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
             ui.add_space(8.0);
             switch(ui, "remember for this model", &mut dialog.remember, "use this context and parallel requests next time", "Saved with the app settings, per model.");
             });
+            if let Some(why) = &alongside_block {
+                status(ui, false, &format!("cannot load alongside: {why}"));
+            }
             footer(ui, |ui| {
-                if ui.add(Key::new("load").solid(READOUT).min_width(100.0)).clicked() {
+                let label = if loaded_now.is_empty() { "load" } else { "replace current" };
+                if ui.add(Key::new(label).solid(READOUT).min_width(100.0).id_salt("load-replace")).clicked() {
                     go = true;
+                }
+                if !loaded_now.is_empty() {
+                    let key = ui.add(Key::new("load alongside").outline(READOUT).enabled(alongside_block.is_none()).min_width(100.0).id_salt("load-alongside"));
+                    if key.clicked() {
+                        go = true;
+                        alongside = true;
+                    }
+                    if let Some(why) = &alongside_block {
+                        key.on_hover_text(why.clone());
+                    }
                 }
                 if ui.add(Key::new("cancel").outline(VALUE).min_width(100.0)).clicked() {
                     close = true;
@@ -515,10 +531,12 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
         let too_big_for_one = est.as_ref().is_some_and(|e| e.total() > largest);
         let outcome = if let Some(Err(why)) = spread.as_ref().filter(|_| too_big_for_one) {
             Err(format!("not loaded: the plan across {} gpus does not fit: {why}", gpus.len()))
+        } else if alongside && spread.as_ref().is_some_and(|r| r.as_ref().is_ok_and(Planned::spans)) {
+            Err("not loaded alongside: this model spans several gpus and needs them all".to_string())
         } else if let Some(Ok(planned)) = spread.filter(|r| r.as_ref().is_ok_and(Planned::spans)) {
             crate::hardware::load_spanning(app, &model, planned, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone())
         } else {
-            app.load_model_named(&model, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone());
+            app.load_model_placed(&model, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone(), alongside);
             Ok(())
         };
         if let Err(e) = outcome {

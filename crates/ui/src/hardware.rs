@@ -265,7 +265,7 @@ pub fn load_spanning(app: &mut App, model: &inference_bench_core::library::Local
     *app.hardware.slot.lock().unwrap() = Some(prepared.placement.clone());
     app.hardware.run_label = Some(format!("{} on {} stages", model.name, prepared.placement.stages.len()));
     app.hardware.run = Some(prepared);
-    app.engine.send(Command::Load { model_id: id, display: model.name.clone(), max_ctx: Some(ctx), max_num_seqs: Some(seqs), kv_cache_bytes, served_names, engine });
+    app.engine.send(Command::Load { alongside: false, model_id: id, display: model.name.clone(), max_ctx: Some(ctx), max_num_seqs: Some(seqs), kv_cache_bytes, served_names, engine });
     Ok(())
 }
 

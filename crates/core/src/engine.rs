@@ -4,7 +4,7 @@ use crate::native::{Factory, Native, specrt_factory};
 use crate::result::{BackendError, ErrorKind, Generation};
 use crate::target::Target;
 use specrt::serve::{ServeOptions, Stats};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,10 @@ pub fn specrt_serving_factory() -> ServingFactory {
     Arc::new(|opts| Some(Box::new(crate::serving::ServingTarget::new(opts)) as Box<dyn Target>))
 }
 
-type StatsSource = Arc<Mutex<Option<Box<dyn Target>>>>;
+type StatsSource = Arc<Mutex<Vec<(String, Box<dyn Target>)>>>;
+type LoadedList = Arc<Mutex<Vec<Loaded>>>;
+
+pub const DEFAULT_MAX_LOADED: usize = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Loaded {
@@ -36,14 +39,24 @@ pub struct Loaded {
     pub speculation: Option<String>,
     pub thinking: specrt::chat::Thinking,
     pub tools: specrt::chat::ToolFormat,
+    pub vram_bytes: Option<u64>,
+}
+
+impl Loaded {
+    pub fn answers_to(&self, name: &str) -> bool {
+        self.model_id == name
+            || self.display == name
+            || self.served_names.iter().any(|n| n == name)
+            || crate::library::short_alias(&self.display).is_some_and(|a| a == name)
+    }
 }
 
 pub enum Command {
-    Load { model_id: String, display: String, max_ctx: Option<usize>, max_num_seqs: Option<usize>, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice },
-    Unload,
-    Suspend { done: Sender<bool> },
-    Resume { done: Sender<Result<(), BackendError>> },
-    Chat { request: ChatRequest, events: Sender<ChatEvent>, queued: Instant },
+    Load { model_id: String, display: String, max_ctx: Option<usize>, max_num_seqs: Option<usize>, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice, alongside: bool },
+    Unload { model: Option<String> },
+    Suspend { model: Option<String>, done: Sender<bool> },
+    Resume { model: Option<String>, done: Sender<Result<(), BackendError>> },
+    Chat { model: Option<String>, request: ChatRequest, events: Sender<ChatEvent>, queued: Instant },
     Shutdown,
 }
 
@@ -68,20 +81,21 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 pub struct Engine {
     commands: Sender<Command>,
     pub events: Receiver<EngineEvent>,
-    loaded: Arc<Mutex<Option<Loaded>>>,
-    suspended: Arc<Mutex<Option<Loaded>>>,
+    loaded: LoadedList,
+    suspended: LoadedList,
     meter: Arc<Meter>,
     stats: StatsSource,
     history: Arc<Mutex<History>>,
     watching: Arc<AtomicBool>,
     stop_sampler: Arc<AtomicBool>,
+    max_loaded: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
 pub struct Handle {
     commands: Sender<Command>,
-    loaded: Arc<Mutex<Option<Loaded>>>,
-    suspended: Arc<Mutex<Option<Loaded>>>,
+    loaded: LoadedList,
+    suspended: LoadedList,
     meter: Arc<Meter>,
     stats: StatsSource,
     history: Arc<Mutex<History>>,
@@ -90,7 +104,15 @@ pub struct Handle {
 
 impl Handle {
     pub fn loaded(&self) -> Option<Loaded> {
+        self.loaded.lock().unwrap().first().cloned()
+    }
+
+    pub fn loaded_all(&self) -> Vec<Loaded> {
         self.loaded.lock().unwrap().clone()
+    }
+
+    pub fn loaded_named(&self, name: &str) -> Option<Loaded> {
+        self.loaded.lock().unwrap().iter().find(|l| l.answers_to(name)).cloned()
     }
 
     pub fn thinking(&self) -> specrt::chat::Thinking {
@@ -101,45 +123,90 @@ impl Handle {
         self.loaded().map(|l| l.tools).unwrap_or_default()
     }
 
+    pub fn tools_of(&self, model: &str) -> specrt::chat::ToolFormat {
+        self.loaded_named(model).map(|l| l.tools).unwrap_or_default()
+    }
+
     pub fn suspended(&self) -> Option<Loaded> {
+        self.suspended.lock().unwrap().first().cloned()
+    }
+
+    pub fn suspended_all(&self) -> Vec<Loaded> {
         self.suspended.lock().unwrap().clone()
     }
 
     pub fn suspend(&self) -> bool {
+        self.suspend_model(None)
+    }
+
+    pub fn suspend_model(&self, model: Option<&str>) -> bool {
         let (done, rx) = channel();
-        self.commands.send(Command::Suspend { done }).is_ok() && rx.recv().unwrap_or(false)
+        self.commands.send(Command::Suspend { model: model.map(str::to_string), done }).is_ok() && rx.recv().unwrap_or(false)
     }
 
     pub fn resume(&self) -> Result<(), BackendError> {
+        self.resume_model(None)
+    }
+
+    pub fn resume_model(&self, model: Option<&str>) -> Result<(), BackendError> {
         let (done, rx) = channel();
-        self.commands.send(Command::Resume { done }).map_err(|_| BackendError::failed("the engine has stopped"))?;
+        self.commands.send(Command::Resume { model: model.map(str::to_string), done }).map_err(|_| BackendError::failed("the engine has stopped"))?;
         rx.recv().unwrap_or_else(|_| Err(BackendError::failed("the engine has stopped")))
     }
 
     pub fn chat(&self, request: ChatRequest) -> Receiver<ChatEvent> {
+        self.chat_on(None, request)
+    }
+
+    pub fn chat_on(&self, model: Option<&str>, request: ChatRequest) -> Receiver<ChatEvent> {
         let (tx, rx) = channel();
         let queued = self.meter.submitted();
-        if self.commands.send(Command::Chat { request, events: tx.clone(), queued }).is_err() {
+        if self.commands.send(Command::Chat { model: model.map(str::to_string), request, events: tx.clone(), queued }).is_err() {
             self.meter.withdrawn();
             let _ = tx.send(ChatEvent::Failed(BackendError::failed("the engine has stopped")));
         }
         rx
     }
 
+    fn with_target<R>(&self, model: Option<&str>, f: impl FnOnce(&dyn Target) -> Option<R>) -> Option<R> {
+        let id = match model {
+            Some(name) => Some(self.loaded_named(name)?.model_id),
+            None => None,
+        };
+        let stats = self.stats.lock().unwrap();
+        let (_, target) = match &id {
+            Some(id) => stats.iter().find(|(m, _)| m == id)?,
+            None => stats.first()?,
+        };
+        f(target.as_ref())
+    }
+
     pub fn serving_stats(&self) -> Option<Stats> {
-        self.stats.lock().unwrap().as_ref().and_then(|t| t.stats())
+        self.with_target(None, |t| t.stats())
+    }
+
+    pub fn serving_stats_of(&self, model: &str) -> Option<Stats> {
+        self.with_target(Some(model), |t| t.stats())
     }
 
     pub fn sessions(&self) -> Option<Arc<specrt::sessions::Shared>> {
-        self.stats.lock().unwrap().as_ref().and_then(|t| t.sessions())
+        self.with_target(None, |t| t.sessions())
     }
 
     pub fn serving_metrics(&self) -> Option<String> {
-        self.stats.lock().unwrap().as_ref().and_then(|t| t.metrics())
+        self.with_target(None, |t| t.metrics())
+    }
+
+    pub fn serving_metrics_of(&self, model: &str) -> Option<String> {
+        self.with_target(Some(model), |t| t.metrics())
     }
 
     pub fn failure(&self) -> Option<String> {
-        self.stats.lock().unwrap().as_ref().and_then(|t| t.failure())
+        self.with_target(None, |t| t.failure())
+    }
+
+    pub fn failure_of(&self, model: &str) -> Option<String> {
+        self.with_target(Some(model), |t| t.failure())
     }
 
     pub fn reading(&self) -> Reading {
@@ -172,15 +239,16 @@ impl Engine {
     pub fn with_factories(wake: Wake, factory: Factory, serving: ServingFactory) -> Self {
         let (commands, inbox) = channel();
         let (events_tx, events) = channel();
-        let loaded = Arc::new(Mutex::new(None));
-        let suspended = Arc::new(Mutex::new(None));
+        let loaded: LoadedList = Arc::default();
+        let suspended: LoadedList = Arc::default();
         let meter = Arc::new(Meter::default());
-        let stats: StatsSource = Arc::new(Mutex::new(None));
+        let stats: StatsSource = Arc::default();
+        let max_loaded = Arc::new(AtomicUsize::new(DEFAULT_MAX_LOADED));
         let history = Arc::new(Mutex::new(History::new(HISTORY_SAMPLES)));
         let watching = Arc::new(AtomicBool::new(false));
         let stop_sampler = Arc::new(AtomicBool::new(false));
-        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), meter: meter.clone(), stats: stats.clone(), history: history.clone() };
-        let this = Self { commands, events, loaded, suspended, meter, stats, history, watching, stop_sampler };
+        let shared = Shared { loaded: loaded.clone(), suspended: suspended.clone(), meter: meter.clone(), stats: stats.clone(), history: history.clone(), max_loaded: max_loaded.clone() };
+        let this = Self { commands, events, loaded, suspended, meter, stats, history, watching, stop_sampler, max_loaded };
         let handle = this.handle();
         let (stop, wake_sampler) = (this.stop_sampler.clone(), wake.clone());
         std::thread::spawn(move || run(inbox, events_tx, shared, wake, factory, serving));
@@ -212,7 +280,19 @@ impl Engine {
         let _ = self.commands.send(command);
     }
 
+    pub fn set_max_loaded(&self, n: usize) {
+        self.max_loaded.store(n.max(1), Ordering::Relaxed);
+    }
+
+    pub fn max_loaded(&self) -> usize {
+        self.max_loaded.load(Ordering::Relaxed)
+    }
+
     pub fn loaded(&self) -> Option<Loaded> {
+        self.loaded.lock().unwrap().first().cloned()
+    }
+
+    pub fn loaded_all(&self) -> Vec<Loaded> {
         self.loaded.lock().unwrap().clone()
     }
 
@@ -237,11 +317,18 @@ impl Drop for Engine {
 }
 
 struct Shared {
-    loaded: Arc<Mutex<Option<Loaded>>>,
-    suspended: Arc<Mutex<Option<Loaded>>>,
+    loaded: LoadedList,
+    suspended: LoadedList,
     meter: Arc<Meter>,
     stats: StatsSource,
     history: Arc<Mutex<History>>,
+    max_loaded: Arc<AtomicUsize>,
+}
+
+struct Slot {
+    info: Loaded,
+    backend: Backend,
+    reload: Command,
 }
 
 fn sample(handle: Handle, stop: Arc<AtomicBool>, wake: Wake) {
@@ -304,6 +391,7 @@ struct Opened {
     seqs: usize,
     note: Option<String>,
     speculation: Option<String>,
+    share: Option<Box<dyn Target>>,
 }
 
 fn open(
@@ -314,7 +402,6 @@ fn open(
     engine: &specrt::options::EngineChoice,
     factory: &Factory,
     serving: &ServingFactory,
-    stats: &StatsSource,
     progress: &specrt::progress::Sink,
 ) -> Result<Opened, BackendError> {
     serve_options(max_ctx, seqs, kv_cache_bytes, engine)?;
@@ -328,9 +415,9 @@ fn open(
         match target.load(model_id) {
             Ok(()) => {
                 let caps = target.capabilities();
-                *stats.lock().unwrap() = target.share();
+                let share = target.share();
                 let speculation = target.speculation();
-                return Ok(Opened { backend: Backend::Batched { target, running: Vec::new() }, vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: attempt, note, speculation });
+                return Ok(Opened { backend: Backend::Batched { target, running: Vec::new() }, vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: attempt, note, speculation, share });
             }
             Err(e) => {
                 tracing::warn!(model = model_id, seqs = attempt, error = %e, "the serving engine could not load");
@@ -347,7 +434,31 @@ fn open(
     native.set_progress(Some(progress.clone()));
     native.load(model_id)?;
     let caps = native.capabilities();
-    Ok(Opened { backend: Backend::Single(native), vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: 1, note, speculation: None })
+    Ok(Opened { backend: Backend::Single(native), vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: 1, note, speculation: None, share: None })
+}
+
+struct Parked {
+    info: Loaded,
+    load: Command,
+}
+
+fn slot_index(slots: &[Slot], model: Option<&str>) -> Option<usize> {
+    match model {
+        Some(name) => slots.iter().position(|s| s.info.answers_to(name)),
+        None => (!slots.is_empty()).then_some(0),
+    }
+}
+
+fn publish(shared: &Shared, slots: &[Slot], parked: &[Parked]) {
+    *shared.loaded.lock().unwrap() = slots.iter().map(|s| s.info.clone()).collect();
+    *shared.suspended.lock().unwrap() = parked.iter().map(|p| p.info.clone()).collect();
+    if slots.is_empty() {
+        shared.history.lock().unwrap().clear();
+    }
+}
+
+fn drop_stats(shared: &Shared, model_id: &str) {
+    shared.stats.lock().unwrap().retain(|(id, _)| id != model_id);
 }
 
 fn run(
@@ -358,21 +469,12 @@ fn run(
     factory: Factory,
     serving: ServingFactory,
 ) {
-    let mut backend: Option<Backend> = None;
+    let mut slots: Vec<Slot> = Vec::new();
+    let mut parked: Vec<Parked> = Vec::new();
     let emit = |e: EngineEvent| {
         let _ = events.send(e);
         wake();
     };
-    let release = |backend: &mut Option<Backend>| {
-        if let Some(b) = backend.take() {
-            b.stop();
-        }
-        *shared.stats.lock().unwrap() = None;
-        *shared.loaded.lock().unwrap() = None;
-        shared.history.lock().unwrap().clear();
-    };
-    let mut last_load: Option<Command> = None;
-    let mut parked: Option<Command> = None;
     let mut resume_reply: Option<Sender<Result<(), BackendError>>> = None;
     let mut next: Option<Command> = None;
     loop {
@@ -385,43 +487,102 @@ fn run(
         };
         match command {
             Command::Shutdown => break,
-            Command::Unload => {
-                release(&mut backend);
-                last_load = None;
-                parked = None;
-                *shared.suspended.lock().unwrap() = None;
+            Command::Unload { model } => {
+                match model.as_deref() {
+                    None => {
+                        for s in slots.drain(..) {
+                            drop_stats(&shared, &s.info.model_id);
+                            s.backend.stop();
+                        }
+                        parked.clear();
+                    }
+                    Some(name) => {
+                        if let Some(i) = slot_index(&slots, Some(name)) {
+                            let s = slots.remove(i);
+                            drop_stats(&shared, &s.info.model_id);
+                            s.backend.stop();
+                        }
+                        parked.retain(|p| !p.info.answers_to(name));
+                    }
+                }
+                publish(&shared, &slots, &parked);
                 emit(EngineEvent::Unloaded);
             }
-            Command::Suspend { done } => {
-                let was_loaded = backend.is_some();
-                if was_loaded {
-                    let info = shared.loaded.lock().unwrap().clone();
-                    release(&mut backend);
-                    parked = last_load.take();
-                    *shared.suspended.lock().unwrap() = info;
+            Command::Suspend { model, done } => {
+                let targets: Vec<usize> = match model.as_deref() {
+                    None => (0..slots.len()).collect(),
+                    Some(name) => slot_index(&slots, Some(name)).into_iter().collect(),
+                };
+                let any = !targets.is_empty();
+                for i in targets.into_iter().rev() {
+                    let s = slots.remove(i);
+                    drop_stats(&shared, &s.info.model_id);
+                    s.backend.stop();
+                    parked.push(Parked { info: s.info, load: s.reload });
+                }
+                if any {
+                    publish(&shared, &slots, &parked);
                     emit(EngineEvent::Unloaded);
                 }
-                let _ = done.send(was_loaded);
+                let _ = done.send(any);
             }
-            Command::Resume { done } => match parked.take() {
-                Some(load) => {
-                    resume_reply = Some(done);
-                    next = Some(load);
+            Command::Resume { model, done } => {
+                let at = match model.as_deref() {
+                    Some(name) => parked.iter().position(|p| p.info.answers_to(name)),
+                    None => (!parked.is_empty()).then_some(0),
+                };
+                match at {
+                    Some(i) => {
+                        resume_reply = Some(done);
+                        next = Some(parked.remove(i).load);
+                    }
+                    None => {
+                        let loaded = match model.as_deref() {
+                            Some(name) => slot_index(&slots, Some(name)).is_some(),
+                            None => !slots.is_empty(),
+                        };
+                        let _ = done.send(match loaded {
+                            true => Ok(()),
+                            false => Err(BackendError::new(ErrorKind::ModelNotFound, "no model is loaded in the app")),
+                        });
+                    }
                 }
-                None => {
-                    let _ = done.send(match backend.is_some() {
-                        true => Ok(()),
-                        false => Err(BackendError::new(ErrorKind::ModelNotFound, "no model is loaded in the app")),
-                    });
+            }
+            Command::Load { model_id, display, max_ctx, max_num_seqs, kv_cache_bytes, served_names, engine, alongside } => {
+                let reload = Command::Load { model_id: model_id.clone(), display: display.clone(), max_ctx, max_num_seqs, kv_cache_bytes, served_names: served_names.clone(), engine: engine.clone(), alongside: true };
+                let reply_failure = |e: BackendError, resume_reply: &mut Option<Sender<Result<(), BackendError>>>| {
+                    if let Some(done) = resume_reply.take() {
+                        let _ = done.send(Err(e.clone()));
+                    }
+                    emit(EngineEvent::LoadFailed(e));
+                };
+                if alongside {
+                    if let Some(i) = slots.iter().position(|s| s.info.model_id == model_id) {
+                        let s = slots.remove(i);
+                        drop_stats(&shared, &s.info.model_id);
+                        s.backend.stop();
+                    }
+                    parked.retain(|p| !matches!(&p.load, Command::Load { model_id: m, .. } if *m == model_id));
+                    let limit = shared.max_loaded.load(Ordering::Relaxed).max(1);
+                    if slots.len() >= limit {
+                        publish(&shared, &slots, &parked);
+                        reply_failure(
+                            BackendError::new(ErrorKind::Unavailable, format!("{display} was not loaded: {} model(s) are loaded and the limit is {limit}. Unload one first", slots.len())),
+                            &mut resume_reply,
+                        );
+                        continue;
+                    }
+                } else {
+                    for s in slots.drain(..) {
+                        drop_stats(&shared, &s.info.model_id);
+                        s.backend.stop();
+                    }
+                    parked.clear();
                 }
-            },
-            Command::Load { model_id, display, max_ctx, max_num_seqs, kv_cache_bytes, served_names, engine } => {
-                release(&mut backend);
-                *shared.suspended.lock().unwrap() = None;
-                last_load = None;
-                let again = Command::Load { model_id: model_id.clone(), display: display.clone(), max_ctx, max_num_seqs, kv_cache_bytes, served_names: served_names.clone(), engine: engine.clone() };
+                publish(&shared, &slots, &parked);
                 emit(EngineEvent::Loading(display.clone()));
                 let started = Instant::now();
+                let vram_before = crate::gpu::used_total(&crate::gpu::sample()).map(|(used, _)| used);
                 let seqs = max_num_seqs.unwrap_or(1).max(1);
                 let sink = {
                     let (events, wake) = (events.clone(), wake.clone());
@@ -430,12 +591,12 @@ fn run(
                         wake();
                     })
                 };
-                match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &shared.stats, &sink) {
+                match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &sink) {
                     Ok(o) => {
-                        backend = Some(o.backend);
                         let ctx = max_ctx.unwrap_or(specrt::engine::DEFAULT_CTX);
+                        let vram_bytes = vram_before.zip(crate::gpu::used_total(&crate::gpu::sample()).map(|(used, _)| used)).map(|(b, a)| a.saturating_sub(b)).filter(|v| *v > 0);
                         let info = Loaded {
-                            model_id,
+                            model_id: model_id.clone(),
                             display,
                             load_secs: started.elapsed().as_secs_f64(),
                             vision: o.vision,
@@ -447,23 +608,22 @@ fn run(
                             speculation: o.speculation,
                             thinking: o.thinking,
                             tools: o.tools,
+                            vram_bytes,
                         };
-                        *shared.loaded.lock().unwrap() = Some(info.clone());
-                        last_load = Some(again);
+                        if let Some(share) = o.share {
+                            shared.stats.lock().unwrap().push((model_id, share));
+                        }
+                        slots.push(Slot { info: info.clone(), backend: o.backend, reload });
+                        publish(&shared, &slots, &parked);
                         if let Some(done) = resume_reply.take() {
                             let _ = done.send(Ok(()));
                         }
                         emit(EngineEvent::Loaded(info));
                     }
-                    Err(e) => {
-                        if let Some(done) = resume_reply.take() {
-                            let _ = done.send(Err(e.clone()));
-                        }
-                        emit(EngineEvent::LoadFailed(e))
-                    }
+                    Err(e) => reply_failure(e, &mut resume_reply),
                 }
             }
-            Command::Chat { mut request, events: out, queued } => {
+            Command::Chat { model, mut request, events: out, queued } => {
                 let send = {
                     let wake = wake.clone();
                     move |out: &Sender<ChatEvent>, e: ChatEvent| {
@@ -471,12 +631,17 @@ fn run(
                         wake();
                     }
                 };
-                match backend.as_mut() {
-                    None => {
-                        shared.meter.withdrawn();
-                        send(&out, ChatEvent::Failed(BackendError::failed("no model is loaded")));
-                    }
-                    Some(Backend::Single(b)) => {
+                let Some(at) = slot_index(&slots, model.as_deref()) else {
+                    shared.meter.withdrawn();
+                    let message = match &model {
+                        Some(name) => format!("model {name} is not loaded"),
+                        None => "no model is loaded".to_string(),
+                    };
+                    send(&out, ChatEvent::Failed(BackendError::failed(message)));
+                    continue;
+                };
+                match &mut slots[at].backend {
+                    Backend::Single(b) => {
                         let mut tracked = shared.meter.begin(queued);
                         let result = b.chat(&request, &mut |t| {
                             tracked.piece();
@@ -493,7 +658,7 @@ fn run(
                             },
                         );
                     }
-                    Some(Backend::Batched { target, running }) => {
+                    Backend::Batched { target, running } => {
                         if let Some(reason) = target.failure() {
                             shared.meter.withdrawn();
                             send(&out, ChatEvent::Failed(BackendError::new(ErrorKind::Unavailable, format!("the model failed: {reason}. Load it again from the model bar"))));
@@ -531,7 +696,11 @@ fn run(
             }
         }
     }
-    release(&mut backend);
+    for s in slots.drain(..) {
+        s.backend.stop();
+    }
+    shared.stats.lock().unwrap().clear();
+    publish(&shared, &[], &[]);
 }
 
 #[cfg(test)]
@@ -557,7 +726,7 @@ mod tests {
     }
 
     fn load(model: &str, display: &str) -> Command {
-        Command::Load { model_id: model.into(), display: display.into(), max_ctx: None, max_num_seqs: None, kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default() }
+        Command::Load { model_id: model.into(), display: display.into(), max_ctx: None, max_num_seqs: None, kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default(), alongside: false }
     }
 
     fn engine() -> Engine {
@@ -609,7 +778,7 @@ mod tests {
         e.send(load("m", "M"));
         wait_event(&e);
         wait_event(&e);
-        e.send(Command::Unload);
+        e.send(Command::Unload { model: None });
         assert_eq!(wait_event(&e), EngineEvent::Unloaded);
         assert!(e.loaded().is_none());
     }
@@ -632,7 +801,7 @@ mod tests {
 
     fn batched(seqs: Option<usize>) -> Engine {
         let e = crate::fake::engine(Arc::new(|| {}), slow_script());
-        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: seqs, kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default() });
+        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: seqs, kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default(), alongside: false });
         wait_event(&e);
         assert!(matches!(wait_event(&e), EngineEvent::Loaded(_)));
         e
@@ -717,7 +886,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(waited);
-        e.send(Command::Unload);
+        e.send(Command::Unload { model: None });
         assert_eq!(wait_event(&e), EngineEvent::Unloaded);
         assert!(e.loaded().is_none());
         assert!(h.serving_stats().is_none());
@@ -754,7 +923,7 @@ mod tests {
             if opts.max_num_seqs > 1 { Some(Box::new(NoParallel) as Box<dyn Target>) } else { inner(opts) }
         });
         let e = Engine::with_factories(Arc::new(|| {}), ScriptedModel::factory(slow_script()), serving);
-        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: Some(4), kv_cache_bytes: Some(1 << 30), served_names: Vec::new(), engine: Default::default() });
+        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: Some(4), kv_cache_bytes: Some(1 << 30), served_names: Vec::new(), engine: Default::default(), alongside: false });
         wait_event(&e);
         let EngineEvent::Loaded(l) = wait_event(&e) else { panic!("not loaded") };
         assert_eq!(l.max_num_seqs, 1);
@@ -796,7 +965,7 @@ mod tests {
             Some(Box::new(StageOom) as Box<dyn Target>)
         });
         let e = Engine::with_factories(Arc::new(|| {}), ScriptedModel::factory(slow_script()), serving);
-        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: Some(21), kv_cache_bytes: Some(1 << 30), served_names: Vec::new(), engine: Default::default() });
+        e.send(Command::Load { model_id: "m".into(), display: "M".into(), max_ctx: Some(4096), max_num_seqs: Some(21), kv_cache_bytes: Some(1 << 30), served_names: Vec::new(), engine: Default::default(), alongside: false });
         wait_event(&e);
         match wait_event(&e) {
             EngineEvent::LoadFailed(err) => assert!(err.message.contains("stage 1 (layers 36..64) on GPU 1"), "{}", err.message),
@@ -809,12 +978,119 @@ mod tests {
     #[test]
     fn the_scripted_fake_cannot_load_unknown_models_batched_either() {
         let e = crate::fake::engine(Arc::new(|| {}), slow_script());
-        e.send(Command::Load { model_id: "other".into(), display: "O".into(), max_ctx: None, max_num_seqs: Some(4), kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default() });
+        e.send(Command::Load { model_id: "other".into(), display: "O".into(), max_ctx: None, max_num_seqs: Some(4), kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default(), alongside: false });
         wait_event(&e);
         match wait_event(&e) {
             EngineEvent::Loaded(l) => panic!("{l:?}"),
             EngineEvent::LoadFailed(_) => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    fn two_models() -> Engine {
+        let e = Engine::with_factory(Arc::new(|| {}), ScriptedModel::factory(Script { models: vec!["a".into(), "b".into()], ..script() }));
+        e.set_max_loaded(2);
+        e
+    }
+
+    fn alongside(model: &str, display: &str) -> Command {
+        match load(model, display) {
+            Command::Load { model_id, display, max_ctx, max_num_seqs, kv_cache_bytes, served_names, engine, .. } => Command::Load { model_id, display, max_ctx, max_num_seqs, kv_cache_bytes, served_names, engine, alongside: true },
+            other => other,
+        }
+    }
+
+    fn loaded_ok(e: &Engine) {
+        loop {
+            match wait_event(e) {
+                EngineEvent::Loaded(_) => return,
+                EngineEvent::LoadFailed(err) => panic!("{err}"),
+                _ => {}
+            }
+        }
+    }
+
+    fn ask_model(h: &Handle, model: &str) -> Result<String, BackendError> {
+        let rx = h.chat_on(Some(model), ChatRequest::new(vec![Message::new(Role::User, "hi")], Sampling::default()));
+        let mut text = String::new();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                ChatEvent::Text(t) => text.push_str(&t),
+                ChatEvent::Done(_) => return Ok(text),
+                ChatEvent::Failed(e) => return Err(e),
+            }
+        }
+    }
+
+    #[test]
+    fn a_model_loaded_alongside_keeps_the_first_and_both_answer_by_name() {
+        let e = two_models();
+        e.send(alongside("a", "A"));
+        loaded_ok(&e);
+        e.send(alongside("b", "B"));
+        loaded_ok(&e);
+        let h = e.handle();
+        assert_eq!(h.loaded_all().iter().map(|l| l.display.as_str()).collect::<Vec<_>>(), ["A", "B"]);
+        assert_eq!(ask_model(&h, "A").unwrap(), "Hello there");
+        assert_eq!(ask_model(&h, "b").unwrap(), "Hello there");
+        assert_eq!(ask_model(&h, "B").unwrap(), "Hello there");
+        assert!(ask_model(&h, "C").unwrap_err().message.contains("not loaded"));
+    }
+
+    #[test]
+    fn unloading_one_model_leaves_the_other_serving() {
+        let e = two_models();
+        e.send(alongside("a", "A"));
+        loaded_ok(&e);
+        e.send(alongside("b", "B"));
+        loaded_ok(&e);
+        e.send(Command::Unload { model: Some("A".into()) });
+        assert_eq!(wait_event(&e), EngineEvent::Unloaded);
+        let h = e.handle();
+        assert_eq!(h.loaded_all().len(), 1);
+        assert!(ask_model(&h, "A").is_err());
+        assert_eq!(ask_model(&h, "B").unwrap(), "Hello there");
+    }
+
+    #[test]
+    fn a_load_past_the_limit_evicts_nothing() {
+        let e = engine();
+        e.send(alongside("m", "M"));
+        loaded_ok(&e);
+        e.send(alongside("other", "O"));
+        match wait_event(&e) {
+            EngineEvent::LoadFailed(err) => assert!(err.message.contains("limit is 1"), "{}", err.message),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(e.handle().loaded_all().len(), 1);
+        assert_eq!(ask_model(&e.handle(), "M").unwrap(), "Hello there");
+    }
+
+    #[test]
+    fn a_plain_load_replaces_every_loaded_model() {
+        let e = two_models();
+        e.send(alongside("a", "A"));
+        loaded_ok(&e);
+        e.send(alongside("b", "B"));
+        loaded_ok(&e);
+        e.send(load("a", "A"));
+        loaded_ok(&e);
+        assert_eq!(e.handle().loaded_all().len(), 1);
+    }
+
+    #[test]
+    fn suspending_one_model_parks_it_and_resume_brings_it_back() {
+        let e = two_models();
+        e.send(alongside("a", "A"));
+        loaded_ok(&e);
+        e.send(alongside("b", "B"));
+        loaded_ok(&e);
+        let h = e.handle();
+        assert!(h.suspend_model(Some("A")));
+        assert_eq!(h.suspended_all().len(), 1);
+        assert_eq!(h.loaded_all().len(), 1);
+        h.resume_model(Some("A")).unwrap();
+        assert_eq!(h.loaded_all().len(), 2);
+        assert!(h.suspended_all().is_empty());
     }
 }

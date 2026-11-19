@@ -5,65 +5,74 @@ use inference_bench_core::result::{BackendError, ErrorKind, Generation};
 
 use crate::manager::{ModelSource, SourceModel};
 
+fn source_model(l: inference_bench_core::engine::Loaded) -> SourceModel {
+    let mut aliases = vec![l.model_id];
+    aliases.extend(inference_bench_core::library::short_alias(&l.display));
+    aliases.extend(l.served_names);
+    SourceModel { id: l.display, aliases, slots: Some(l.max_num_seqs) }
+}
+
 impl ModelSource for Handle {
     fn loaded(&self) -> Vec<SourceModel> {
-        Handle::loaded(self)
-            .map(|l| {
-                let mut aliases = vec![l.model_id];
-                aliases.extend(inference_bench_core::library::short_alias(&l.display));
-                aliases.extend(l.served_names);
-                SourceModel { id: l.display, aliases, slots: Some(l.max_num_seqs) }
-            })
-            .into_iter()
-            .collect()
+        Handle::loaded_all(self).into_iter().map(source_model).collect()
     }
 
-    fn tool_format(&self) -> inference_bench_core::specrt_chat::ToolFormat {
-        Handle::tools(self)
+    fn tool_format(&self, id: &str) -> inference_bench_core::specrt_chat::ToolFormat {
+        Handle::tools_of(self, id)
     }
 
     fn suspended(&self) -> Vec<SourceModel> {
-        Handle::suspended(self)
-            .map(|l| {
-                let mut aliases = vec![l.model_id];
-                aliases.extend(inference_bench_core::library::short_alias(&l.display));
-                aliases.extend(l.served_names);
-                SourceModel { id: l.display, aliases, slots: Some(l.max_num_seqs) }
-            })
-            .into_iter()
-            .collect()
+        Handle::suspended_all(self).into_iter().map(source_model).collect()
     }
 
-    fn suspend(&self) -> bool {
-        Handle::suspend(self)
+    fn suspend(&self, id: &str) -> bool {
+        Handle::suspend_model(self, Some(id))
     }
 
-    fn resume(&self) -> Result<(), BackendError> {
-        Handle::resume(self)
+    fn resume(&self, id: &str) -> Result<(), BackendError> {
+        Handle::resume_model(self, Some(id))
     }
 }
 
 pub struct EngineBackend {
     handle: Handle,
+    model: Option<String>,
 }
 
 impl EngineBackend {
     pub fn new(handle: Handle) -> Self {
-        Self { handle }
+        Self { handle, model: None }
+    }
+
+    pub fn bound(handle: Handle, model: &str) -> Self {
+        Self { handle, model: Some(model.to_string()) }
+    }
+
+    fn loaded(&self) -> Option<inference_bench_core::engine::Loaded> {
+        match &self.model {
+            Some(m) => self.handle.loaded_named(m),
+            None => self.handle.loaded(),
+        }
     }
 }
 
 impl Target for EngineBackend {
     fn share(&self) -> Option<Box<dyn Target>> {
-        Some(Box::new(EngineBackend::new(self.handle.clone())))
+        Some(Box::new(EngineBackend { handle: self.handle.clone(), model: self.model.clone() }))
     }
 
     fn metrics(&self) -> Option<String> {
-        self.handle.serving_metrics()
+        match &self.model {
+            Some(m) => self.handle.serving_metrics_of(m),
+            None => self.handle.serving_metrics(),
+        }
     }
 
     fn failure(&self) -> Option<String> {
-        self.handle.failure()
+        match &self.model {
+            Some(m) => self.handle.failure_of(m),
+            None => self.handle.failure(),
+        }
     }
 
     fn name(&self) -> &str {
@@ -71,22 +80,25 @@ impl Target for EngineBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        let loaded = self.handle.loaded();
+        let loaded = self.loaded();
         let batched = loaded.as_ref().is_some_and(|l| l.max_num_seqs > 1);
         Capabilities {
             streaming: true,
             vision: loaded.as_ref().is_some_and(|l| l.vision),
-            thinking: self.handle.thinking(),
-            tools: self.handle.tools(),
+            thinking: loaded.as_ref().map(|l| l.thinking).unwrap_or_default(),
+            tools: loaded.as_ref().map(|l| l.tools).unwrap_or_default(),
             logprobs: batched,
             batched,
             ..Capabilities::default()
         }
     }
 
-    fn load(&mut self, _model: &str) -> Result<(), BackendError> {
-        match self.handle.loaded() {
-            Some(_) => Ok(()),
+    fn load(&mut self, model: &str) -> Result<(), BackendError> {
+        match self.handle.loaded_named(model).or_else(|| self.handle.loaded()) {
+            Some(l) => {
+                self.model = Some(l.model_id);
+                Ok(())
+            }
             None => Err(BackendError::new(ErrorKind::ModelNotFound, "no model is loaded in the app")),
         }
     }
@@ -99,7 +111,7 @@ impl Target for EngineBackend {
     }
 
     fn chat(&mut self, request: &ChatRequest, on_text: &mut dyn FnMut(&str)) -> Result<Generation, BackendError> {
-        let events = self.handle.chat(request.clone());
+        let events = self.handle.chat_on(self.model.as_deref(), request.clone());
         loop {
             match events.recv() {
                 Ok(ChatEvent::Text(t)) => on_text(&t),

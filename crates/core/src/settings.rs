@@ -9,11 +9,17 @@ pub struct ServerSettings {
     pub lan: bool,
     #[serde(default)]
     pub any_model_name: bool,
+    #[serde(default = "default_max_loaded")]
+    pub max_loaded_models: usize,
+}
+
+fn default_max_loaded() -> usize {
+    1
 }
 
 impl Default for ServerSettings {
     fn default() -> Self {
-        Self { port: 1234, api_key: String::new(), lan: false, any_model_name: false }
+        Self { port: 1234, api_key: String::new(), lan: false, any_model_name: false, max_loaded_models: 1 }
     }
 }
 

@@ -219,6 +219,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 secret(ui, &mut app.settings.server.api_key);
             });
             switch(ui, "allow other machines", &mut app.settings.server.lan, "listen on all interfaces", "Off keeps it on 127.0.0.1.");
+            row(ui, "max loaded models", |ui| {
+                let mut n = app.settings.server.max_loaded_models;
+                if ui.add(egui::DragValue::new(&mut n).range(1..=8)).changed() {
+                    app.settings.server.max_loaded_models = n.max(1);
+                    app.engine.set_max_loaded(n);
+                    app.save_settings();
+                }
+                hint(ui, "1 swaps models on load. Higher keeps several loaded if they fit in memory.");
+            });
             let mut any = app.settings.server.any_model_name;
             if switch(ui, "answer to any model name", &mut any, "Answer to any model name when one model is loaded", "Callers keep working when you switch models. With none or several loaded, unknown names still fail.") {
                 app.settings.server.any_model_name = any;
@@ -228,6 +237,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         if let Some(p) = app.server.placement.clone() {
             placement_section(ui, &p);
         }
+        crate::loadedlist::draw(app, ui);
         if let Some(l) = &loaded {
             crate::running::draw(ui, l);
         }

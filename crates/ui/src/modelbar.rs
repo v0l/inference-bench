@@ -91,6 +91,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mu
                 lamp(ui, if busy { "generating" } else { "ready" }, true, false);
                 chip(ui, &l.display, READOUT, true);
                 chip(ui, &format!("{} ctx", l.ctx), READOUT, false);
+                for other in app.loaded_all().into_iter().filter(|o| o.display != l.display) {
+                    if ui.add(Key::new(other.display.clone()).outline(VALUE).id_salt(("switch", other.model_id.clone()))).clicked() {
+                        app.chat_model = Some(other.display);
+                    }
+                }
             }
             (None, None, Some(name)) => {
                 lamp(ui, "failed", false, true);
@@ -105,7 +110,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mu
         if loading.is_some() {
             ui.add(Key::new("loading").outline(READOUT).enabled(false).min_width(100.0));
         } else if loaded.is_some() && ui.add(Key::new("unload").outline(FAULT).min_width(100.0)).clicked() {
-            app.unload();
+            match app.loaded_all().len() {
+                0 | 1 => app.unload(),
+                _ => app.unload_model(&loaded.as_ref().map(|l| l.display.clone()).unwrap_or_default()),
+            }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             right(ui);

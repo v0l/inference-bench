@@ -120,6 +120,14 @@ inference-bench connect --check                                # one prompt and 
 
 In the desktop app the load dialog has a parallel requests slider (1 to 64, default 4, remembered per model). With more than one, the app engine loads through `specrt::serve` (the batched scheduler, `ServeOptions.max_num_seqs`), so chat and the app's OpenAI server share one engine and API requests run alongside chat. With 1 it is the plain single-request engine. The memory estimate counts the KV cache for that many sequences at the chosen context, plus the recurrent state per sequence on hybrid models. If the batched engine cannot load, the app falls back to one sequence and says so on the server tab.
 
+### Several models at once
+
+The app keeps one model loaded by default, so loading a model replaces the current one. Raise `max loaded models` on the Server tab (saved as `server.max_loaded_models` in the app settings, the same name as the server config key) and the load dialog offers "load alongside" next to "replace current". Alongside is disabled, with the reason shown, when the limit is reached or the memory estimate says the model does not fit in free VRAM. Nothing is ever unloaded to make room: unload one first. Each loaded model has its own scheduler, its own KV pool and its own stats.
+
+The app's OpenAI server routes by model id, display name, short alias or served name, and `/v1/models` and `/health` list every loaded model. A request with no `model` goes to the first loaded one. `any_model_name` still applies only while exactly one model is loaded; with two loaded an unknown name is a 404. The Models and Server tabs list every loaded model with its VRAM, context, parallel slots and live load, and an unload button per model. The model bar on the Chat tab switches which loaded model the chat talks to. Idle unload and the `/unload` endpoint park one model without touching the others.
+
+Checked on the Spark with `cargo test --release -p inference-bench-server --test app_mode two_real_models -- --ignored` (Qwen3-0.6B and Qwen2.5-0.5B loaded together, both answering by name).
+
 The server tab samples the engine once a second off the UI thread (`inference_bench_core::live`, 15 minutes kept) and shows requests per minute, running and waiting sequences, KV use, prefix hit rate, draft acceptance, preemptions, charts of generation and prompt tok/s, TTFT and inter-token p50 and p95, running sequences and KV, and a per-request table. Measured on Qwen3-0.6B (RTX PRO 6000, 4 concurrent requests of 400 tokens): 843 tok/s aggregate at 1 sequence, 2124 tok/s at 4 (`docs/gui/server-live.png`).
 
 ## Logging

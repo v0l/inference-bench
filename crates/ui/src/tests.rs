@@ -677,7 +677,7 @@ fn serving_harness(name: &str, seqs: usize) -> Harness<'static, App> {
         let app = h.state_mut();
         app.engine = inference_bench_core::fake::engine(app.wake.clone(), slow_script());
         let m = app.library[0].clone();
-        app.engine.send(Command::Load { model_id: m.model_id(inference_bench_core::target::NATIVE), display: m.name.clone(), max_ctx: Some(4096), max_num_seqs: Some(seqs), kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default() });
+        app.engine.send(Command::Load { alongside: false, model_id: m.model_id(inference_bench_core::target::NATIVE), display: m.name.clone(), max_ctx: Some(4096), max_num_seqs: Some(seqs), kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default() });
     }
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     let handle = h.state().engine.handle();
@@ -2764,4 +2764,73 @@ fn loading_the_user_settings_hands_the_engine_the_plan_the_dialog_showed() {
     }
     let per_device: Vec<u64> = engine_plan.stages.iter().map(|s| s.used_bytes()).collect();
     assert!(per_device.iter().all(|b| *b <= 96 << 30), "{per_device:?}");
+}
+
+fn two_model_script() -> Script {
+    Script { models: vec!["acme/Qwen3-0.6B".into(), "acme/Other-1B".into()], ..script() }
+}
+
+fn load_both(h: &mut Harness<'static, App>) -> (LocalModel, LocalModel) {
+    with_gpu(h, 0, 96 << 30);
+    scripted(h.state_mut(), two_model_script());
+    h.state_mut().settings.server.max_loaded_models = 2;
+    let (a, b) = (real_model("Qwen3-0.6B"), real_model("Other-1B"));
+    h.state_mut().library = vec![a.clone(), b.clone()];
+    h.state_mut().load_model_placed(&a, 4096, 1, None, Vec::new(), Default::default(), true);
+    pump_until(h, 10, "first load", |app| app.loaded_all().len() == 1);
+    h.state_mut().load_model_placed(&b, 4096, 1, None, Vec::new(), Default::default(), true);
+    pump_until(h, 10, "second load", |app| app.loaded_all().len() == 2);
+    (a, b)
+}
+
+#[test]
+fn the_dialog_offers_load_alongside_and_both_models_stay_loaded() {
+    let mut h = harness("alongside", Tab::Models);
+    let (a, _) = load_both(&mut h);
+    assert_eq!(h.state().loaded_all().len(), 2);
+    h.state_mut().engine.send(Command::Unload { model: Some("Other-1B".into()) });
+    pump_until(&mut h, 10, "unload one", |app| app.loaded_all().len() == 1);
+    h.state_mut().open_load_dialog(&a);
+    h.run();
+    h.get_by_label("replace current");
+    assert!(!h.get_by_label("load alongside").accesskit_node().is_disabled());
+}
+
+#[test]
+fn load_alongside_is_disabled_with_a_reason_at_the_model_limit() {
+    let mut h = harness("alongside-limit", Tab::Models);
+    with_gpu(&mut h, 0, 96 << 30);
+    scripted(h.state_mut(), two_model_script());
+    let a = real_model("Qwen3-0.6B");
+    h.state_mut().library = vec![a.clone()];
+    h.state_mut().load_model(&a);
+    pump_until(&mut h, 10, "load", |app| app.loaded().is_some());
+    h.state_mut().open_load_dialog(&a);
+    h.run();
+    assert!(h.get_by_label("load alongside").accesskit_node().is_disabled());
+    assert!(h.query_all_by_label_contains("cannot load alongside").count() >= 1);
+}
+
+#[test]
+fn the_server_tab_lists_every_loaded_model_and_unloads_one() {
+    let mut h = harness("loaded-list", Tab::Server);
+    load_both(&mut h);
+    h.run();
+    assert_eq!(h.get_all_by_label("unload").count(), 3);
+    h.get_all_by_label("unload").nth(1).unwrap().click();
+    pump_until(&mut h, 10, "unload one", |app| app.loaded_all().len() == 1);
+    assert_eq!(h.state().loaded_all()[0].display, "Other-1B");
+}
+
+#[test]
+fn the_chat_follows_the_model_picked_among_the_loaded() {
+    let mut h = harness("chat-pick", Tab::Chat);
+    load_both(&mut h);
+    h.state_mut().chat_model = Some("Qwen3-0.6B".into());
+    h.run();
+    assert_eq!(h.state().loaded().unwrap().display, "Qwen3-0.6B");
+    h.state_mut().chat_model = Some("Other-1B".into());
+    h.run();
+    assert_eq!(h.state().loaded().unwrap().display, "Other-1B");
+    assert_eq!(h.state().chat.agent.chat.config.model, "Other-1B");
 }

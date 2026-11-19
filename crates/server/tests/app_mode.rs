@@ -58,7 +58,12 @@ impl AppRig {
     }
 
     fn load_named(&self, model: &str, display: &str, served: &[&str]) {
+        self.load_with(model, display, served, false);
+    }
+
+    fn load_with(&self, model: &str, display: &str, served: &[&str], alongside: bool) {
         self.engine.send(Command::Load {
+            alongside,
             model_id: model.into(),
             display: display.into(),
             max_ctx: None,
@@ -77,7 +82,7 @@ impl AppRig {
     }
 
     fn unload(&self) {
-        self.engine.send(Command::Unload);
+        self.engine.send(Command::Unload { model: None });
         loop {
             if let EngineEvent::Unloaded = self.engine.events.recv_timeout(Duration::from_secs(10)).unwrap() {
                 return;
@@ -254,7 +259,7 @@ fn four_api_requests_run_together_on_an_engine_loaded_with_four_sequences() {
     let slow = Script { chunks: (0..30).map(|i| format!("t{i} ")).collect(), chunk_delay_ms: 10, first_delay_ms: 20, ..script() };
     let engine = inference_bench_core::fake::engine(Arc::new(|| {}), slow);
     let app = app_rig_with("max_num_seqs = 64\n", engine);
-    app.engine.send(Command::Load { model_id: "org/one".into(), display: "One".into(), max_ctx: Some(4096), max_num_seqs: Some(4), kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default() });
+    app.engine.send(Command::Load { model_id: "org/one".into(), display: "One".into(), max_ctx: Some(4096), max_num_seqs: Some(4), kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default(), alongside: false });
     loop {
         match app.engine.events.recv_timeout(Duration::from_secs(10)).unwrap() {
             EngineEvent::Loaded(_) => break,
@@ -315,5 +320,93 @@ fn app_mode_unload_and_load_endpoints_suspend_and_resume() {
     assert!(app.engine.loaded().is_none());
     assert_eq!(app.rig.post("/load", None, json!({})).0, 200);
     assert_eq!(app.engine.loaded().unwrap().display, "One");
+    app.rig.stop();
+}
+
+fn two_app() -> AppRig {
+    let engine = Engine::with_factory(Arc::new(|| {}), ScriptedModel::factory(script()));
+    engine.set_max_loaded(2);
+    app_rig_with("", engine)
+}
+
+#[test]
+fn two_models_loaded_alongside_both_answer_by_name_and_are_listed() {
+    let app = two_app();
+    app.load_with("org/one", "One", &[], true);
+    app.load_with("org/two", "Two", &[], true);
+    assert_eq!(app.model_ids(), ["One", "Two"]);
+    for named in ["One", "Two", "org/two"] {
+        let (status, body) = app.chat(say(Some(named)));
+        assert_eq!(status, 200, "{named}: {body}");
+    }
+    assert_eq!(app.chat(say(Some("Two"))).1["model"], "Two");
+    app.rig.stop();
+}
+
+#[test]
+fn unloading_one_of_two_models_leaves_the_other_serving() {
+    let app = two_app();
+    app.load_with("org/one", "One", &[], true);
+    app.load_with("org/two", "Two", &[], true);
+    app.engine.send(Command::Unload { model: Some("One".into()) });
+    loop {
+        if let EngineEvent::Unloaded = app.engine.events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            break;
+        }
+    }
+    assert_eq!(app.model_ids(), ["Two"]);
+    assert_eq!(app.chat(say(Some("One"))).0, 404);
+    assert_eq!(app.chat(say(Some("Two"))).0, 200);
+    app.rig.stop();
+}
+
+#[test]
+fn any_model_name_is_a_404_while_two_models_are_loaded() {
+    let engine = Engine::with_factory(Arc::new(|| {}), ScriptedModel::factory(script()));
+    engine.set_max_loaded(2);
+    let app = app_rig_with("any_model_name = true", engine);
+    app.load_with("org/one", "One", &[], true);
+    assert_eq!(app.chat(say(Some("x"))).0, 200);
+    app.load_with("org/two", "Two", &[], true);
+    assert_eq!(app.chat(say(Some("x"))).0, 404);
+    app.rig.stop();
+}
+
+#[test]
+fn a_third_load_past_the_limit_fails_and_evicts_nothing() {
+    let app = two_app();
+    app.engine.set_max_loaded(1);
+    app.load_with("org/one", "One", &[], true);
+    app.engine.send(Command::Load { model_id: "org/two".into(), display: "Two".into(), max_ctx: None, max_num_seqs: None, kv_cache_bytes: None, served_names: Vec::new(), engine: Default::default(), alongside: true });
+    loop {
+        match app.engine.events.recv_timeout(Duration::from_secs(10)).unwrap() {
+            EngineEvent::LoadFailed(e) => {
+                assert!(e.message.contains("limit is 1"), "{}", e.message);
+                break;
+            }
+            EngineEvent::Loaded(_) => panic!("loaded past the limit"),
+            _ => {}
+        }
+    }
+    assert_eq!(app.model_ids(), ["One"]);
+    assert_eq!(app.chat(say(Some("One"))).0, 200);
+    app.rig.stop();
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, Qwen/Qwen3-0.6B and Qwen/Qwen2.5-0.5B in the HF cache"]
+fn two_real_models_load_together_and_both_answer() {
+    let engine = Engine::spawn(Arc::new(|| {}));
+    engine.set_max_loaded(2);
+    let app = app_rig_with("", engine);
+    app.load_with("Qwen/Qwen3-0.6B", "Qwen3-0.6B", &[], true);
+    app.load_with("Qwen/Qwen2.5-0.5B", "Qwen2.5-0.5B", &[], true);
+    assert_eq!(app.model_ids(), ["Qwen3-0.6B", "Qwen2.5-0.5B"]);
+    for named in ["Qwen3-0.6B", "Qwen2.5-0.5B"] {
+        let (status, body) = app.chat(json!({"model": named, "messages": [{"role": "user", "content": "The capital of France is"}], "max_tokens": 8, "temperature": 0}));
+        assert_eq!(status, 200, "{named}: {body}");
+        assert_eq!(body["model"], named);
+        assert!(body["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+    }
     app.rig.stop();
 }

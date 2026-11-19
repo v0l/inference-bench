@@ -693,6 +693,9 @@ fn downloads_section(app: &mut App, ui: &mut egui::Ui) {
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     page(ui, "models", |ui| {
+        if app.models.detail.is_none() {
+            crate::loadedlist::draw(app, ui);
+        }
         if app.models.detail.is_some() {
             crate::detail::draw(app, ui);
             return;
