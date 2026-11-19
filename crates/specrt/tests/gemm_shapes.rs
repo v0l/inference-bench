@@ -16,15 +16,23 @@ fn f(b: u16) -> f32 {
 fn run(linear: &str, tokens: usize) -> f64 {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.5-122b-a10b-nvfp4.config.json");
     let spec = Spec::from_hf_config_serving(&std::fs::read_to_string(path).unwrap()).unwrap();
+    run_spec(&spec, linear, tokens)
+}
+
+fn run_spec(spec: &Spec, linear: &str, tokens: usize) -> f64 {
+    run_n(spec, linear, tokens, None)
+}
+
+fn run_n(spec: &Spec, linear: &str, tokens: usize, rows: Option<usize>) -> f64 {
     let ctx = CudaContext::new(0).unwrap();
     let target = cuda_target(&ctx).unwrap();
-    let module = Module::generate_kv(&spec, 256, 2, &target).unwrap();
+    let module = Module::generate_kv(spec, 256, 2, &target).unwrap();
     let jit = Jit::new(ctx.clone(), std::env::temp_dir().join(format!("specrt-gemm-shapes-{}", std::process::id()))).unwrap();
     let loaded = jit.load(&module).unwrap();
     let stream = ctx.default_stream();
-    let choice = select(&spec, &target, linear, tokens, WeightKind::Bf16).unwrap();
-    let shape = specrt::codegen::linear_shape(&spec, linear);
-    let (n, k) = (shape.n, shape.k);
+    let choice = select(spec, &target, linear, tokens, WeightKind::Bf16).unwrap();
+    let shape = specrt::codegen::linear_shape(spec, linear);
+    let (n, k) = (rows.unwrap_or(shape.n), shape.k);
     let kernel = loaded.function(&choice.name).unwrap();
     use cudarc::driver::sys::CUfunction_attribute as A;
     let smem = module.smem.get(choice.name.as_str()).copied().unwrap_or(0);
@@ -71,5 +79,47 @@ fn attention_linears_match_a_cpu_reference_at_122b_shapes() {
             let e = run(linear, tokens);
             assert!(e < 1e-4, "{linear} tokens {tokens}: {e}");
         }
+    }
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
+fn the_fused_v4_projection_matches_a_cpu_reference_on_every_tile() {
+    use specrt::family::Registry as Families;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-deepseek-v4-attention");
+    for tile in [specrt::spec::TileChoice::Auto, specrt::spec::TileChoice::Small, specrt::spec::TileChoice::Narrow, specrt::spec::TileChoice::Big] {
+        let mut spec = Spec::from_hf_config_serving_in(Families::embedded(), &std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        spec.runtime.tile = tile;
+        let e = run_spec(&spec, "qkv", 96);
+        assert!(e < 1e-4, "{tile:?}: {e}");
+    }
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
+fn sweep_k() {
+    use specrt::family::Registry as Families;
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-deepseek-v4-attention");
+    for hidden in [128, 256, 512, 1024, 2048] {
+        let mut json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+        json["hidden_size"] = hidden.into();
+        let mut spec = Spec::from_hf_config_serving_in(Families::embedded(), &json.to_string()).unwrap();
+        spec.runtime.tile = specrt::spec::TileChoice::Small;
+        for tokens in [32, 64, 96] {
+            let e = run_n(&spec, "qkv", tokens, None);
+            eprintln!("K={hidden} tokens={tokens} err {e:.2e}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
+fn small_tile_partial_m() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3-0.6b.config.json");
+    let mut spec = Spec::from_hf_config_serving(&std::fs::read_to_string(path).unwrap()).unwrap();
+    spec.runtime.tile = specrt::spec::TileChoice::Small;
+    for tokens in [64, 80, 96, 100, 128, 160] {
+        let e = run_n(&spec, "qkv", tokens, None);
+        eprintln!("tokens={tokens} err {e:.2e}");
     }
 }

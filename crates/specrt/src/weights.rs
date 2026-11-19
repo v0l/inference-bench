@@ -828,11 +828,11 @@ impl Checkpoint {
         Ok(self.f32(name, len)?.into_iter().map(|w| w + offset).collect())
     }
 
-    fn attention(&self, spec: &Spec, attn: &str) -> Result<Attn<'_>> {
-        self.attention_as(spec, attn, false)
+    fn attention(&self, spec: &Spec, attn: &str, layer: usize) -> Result<Attn<'_>> {
+        self.attention_as(spec, attn, layer, false)
     }
 
-    fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool) -> Result<Attn<'_>> {
+    fn attention_as(&self, spec: &Spec, attn: &str, layer: usize, bf16: bool) -> Result<Attn<'_>> {
         let a = &spec.attention;
         let quant = if bf16 { Quant::Bf16 } else { spec.quant };
         let (h, q, kv) = (spec.dims.hidden, spec.q_dim(), spec.kv_dim());
@@ -843,7 +843,12 @@ impl Checkpoint {
         let mut gates = Vec::new();
         if !a.projection.is_empty() {
             for p in &a.projection {
-                parts.push(w(&p.tensor, crate::state::dim(spec, &p.rows)?, h)?);
+                let rows = crate::state::dim(spec, &p.rows)?;
+                if spec.projection_applies(p, layer) {
+                    parts.push(w(&p.tensor, rows, h)?);
+                } else {
+                    parts.push(Raw::Bf16 { w: Cow::Owned(vec![0; rows * h]), cols: h });
+                }
             }
         } else if a.fused_qkv {
             ensure!(!a.output_gate, "fused qkv with an output gate is not supported");
@@ -882,7 +887,7 @@ impl Checkpoint {
             (None, None)
         };
         let mut extra = Vec::new();
-        for bind in spec.attention.node.iter().flat_map(|n| n.bind.values()) {
+        for bind in spec.attention.node.iter().filter(|n| spec.node_applies(n, layer)).flat_map(|n| n.bind.values()) {
             if let crate::graph::Bind::Weight { weight, len } = bind
                 && !extra.iter().any(|(n, _): &(String, Vec<f32>)| n == weight)
             {
@@ -896,7 +901,7 @@ impl Checkpoint {
             o_bias: if a.o_bias { Some(self.f32(&format!("{attn}.o_proj.bias"), h)?) } else { None },
             q_norm,
             k_norm,
-            o: w("o_proj", h, spec.o_dim())?.into_matrix(quant, &format!("{attn}.o_proj"))?,
+            o: w(a.o_tensor.as_deref().unwrap_or("o_proj"), h, spec.o_dim())?.into_matrix(quant, &format!("{attn}.{}", a.o_tensor.as_deref().unwrap_or("o_proj")))?,
         })
     }
 
@@ -936,7 +941,7 @@ impl Checkpoint {
         let mixer = if spec.block(i).is_linear() {
             Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"))?)
         } else {
-            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"))?)
+            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), i)?)
         };
         let mlp = spec.mlp_quant(i);
         let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(global));
@@ -1200,7 +1205,7 @@ impl Checkpoint {
         ensure!(self.has("mtp.fc.weight"), "the checkpoint has no mtp.* tensors");
         let bf16 = |r: Raw<'a>, what: &str| -> Result<Matrix<'a>> { r.dequantized().into_matrix(Quant::Bf16, what) };
         let p = "mtp.layers.0";
-        let attn = self.attention_as(spec, &format!("{p}.self_attn"), true)?;
+        let attn = self.attention_as(spec, &format!("{p}.self_attn"), 0, true)?;
         let sparse = spec.moe.is_some();
         let (gate_up, down, moe) = if sparse {
             let dummy = || Matrix::Bf16(Cow::Owned(vec![0; 8]));

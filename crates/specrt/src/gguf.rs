@@ -514,6 +514,8 @@ impl Gguf {
                 projection: Vec::new(),
                 o_cols: None,
                 scratch: Default::default(),
+                scratch_i32: Default::default(),
+                o_tensor: None,
             },
             rope: Rope { style: RopeStyle::Neox, theta: Some(theta), scaling: self.rope_scaling(family, head_dim)?, mrope, local_theta: None, nope_layers: Vec::new() },
             mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, fused_gate_up: false, gated: None },

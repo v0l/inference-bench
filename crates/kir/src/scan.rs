@@ -6,8 +6,8 @@ pub const WARP: u32 = 32;
 
 pub const BUILTINS: [&str; 6] = ["s", "scale", "q_pos", "k_pos", "head", "kv_head"];
 
-const GENERATED: [&str; 30] = [
-    "dot", "m", "l", "m_new", "corr", "p", "t", "q", "acc", "lane", "warp", "row", "table", "top", "denom", "total", "kr", "vr", "ksc", "vsc", "part", "d", "j", "at", "hi", "lo", "v", "w", "q_pos_i", "sink_logit",
+const GENERATED: [&str; 34] = [
+    "dot", "m", "l", "m_new", "corr", "p", "t", "q", "acc", "lane", "warp", "row", "table", "top", "denom", "total", "kr", "vr", "ksc", "vsc", "part", "d", "j", "at", "hi", "lo", "v", "w", "q_pos_i", "sink_logit", "visible", "e", "r", "slot",
 ];
 
 pub const LAUNCH: [&str; 12] = ["qkv", "k_cache", "v_cache", "block_table", "pos", "slots", "out_hi", "out_lo", "layer", "pages", "pos_step", "row_step"];
@@ -44,7 +44,17 @@ pub struct Segment {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Blocks {
+    pub cache: String,
+    pub layers: u32,
+    pub ratio: String,
+    pub topk: u32,
+    pub index: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Geometry {
+    pub blocks: Option<Blocks>,
     pub query: Vec<Segment>,
     pub layers: u32,
     pub kv_rows: u32,
@@ -159,11 +169,36 @@ impl Scan {
                 return Err("scan head widths are at most 1024".into());
             }
         }
-        self.lines(params)?;
+        if let Some(g) = &self.geometry
+            && let Some(b) = &g.blocks
+        {
+            match params.iter().find(|p| p.name == b.cache) {
+                Some(p) if p.ty == Scalar::Bf16 && p.role == Role::Activation && p.access == Access::Read => {}
+                _ => return Err(format!("block cache {:?} must be a bf16 activation param", b.cache)),
+            }
+            if let Some(ix) = &b.index {
+                match params.iter().find(|p| p.name == *ix) {
+                    Some(p) if p.ty == Scalar::I32 && p.role == Role::Activation && p.access == Access::Read => {}
+                    _ => return Err(format!("block index {ix:?} must be a read i32 activation param")),
+                }
+                if b.topk == 0 {
+                    return Err("an indexed block source needs a positive topk".into());
+                }
+            }
+            match params.iter().find(|p| p.name == b.ratio) {
+                Some(p) if p.ty == Scalar::I32 && p.role == Role::Value && p.access == Access::Read => {}
+                _ => return Err(format!("block ratio {:?} must be an i32 value param", b.ratio)),
+            }
+            if b.layers == 0 || g.v_width != g.k_width || g.v_offset != 0 || g.v_stride != g.k_width {
+                return Err("a block source needs positive layers and keys equal to values".into());
+            }
+        }
+        self.lines(params, true)?;
+        self.lines(params, false)?;
         Ok(())
     }
 
-    fn lines(&self, params: &[Param]) -> Result<(Vec<String>, String), String> {
+    fn lines(&self, params: &[Param], masks: bool) -> Result<(Vec<String>, String), String> {
         let mut env: Vec<(String, Expr)> = vec![
             ("s".into(), Expr::Raw("dot".into())),
             ("scale".into(), Expr::Raw("QUERY_SCALE".into())),
@@ -189,7 +224,12 @@ impl Scan {
                     lines.push(format!("float {dst} = {};", lower(expr, &env)?));
                     env.push((dst.clone(), Expr::Raw(dst.clone())));
                 }
-                Stage::Mask { expr } => lines.push(format!("if (!({})) continue;", lower(expr, &env)?)),
+                Stage::Mask { expr } => {
+                    let text = lower(expr, &env)?;
+                    if masks {
+                        lines.push(format!("if (!({text})) continue;"));
+                    }
+                }
                 Stage::Softmax { value: v, .. } => {
                     if !env.iter().any(|(k, _)| k == v) {
                         return Err(format!("online_softmax of unknown value {v:?}"));
@@ -205,7 +245,7 @@ impl Scan {
         if let Some(g) = &self.geometry {
             return self.emit_state_cuda(k, g);
         }
-        let (lines, value) = self.lines(&k.params)?;
+        let (lines, value) = self.lines(&k.params, true)?;
         let sink = self.sink();
         let sig: Vec<String> = k
             .params
@@ -312,7 +352,8 @@ impl Scan {
     }
 
     fn emit_state_cuda(&self, k: &Kernel, g: &Geometry) -> Result<String, String> {
-        let (lines, value) = self.lines(&k.params)?;
+        let (lines, value) = self.lines(&k.params, true)?;
+        let (block_lines, _) = self.lines(&k.params, false)?;
         let sig: Vec<String> = k
             .params
             .iter()
@@ -332,6 +373,50 @@ impl Scan {
             .collect();
         let warps = k.threads / WARP;
         let body: String = lines.iter().map(|l| format!("        {l}\n")).collect();
+        let block_body: String = block_lines.iter().map(|l| format!("            {l}\n")).collect();
+        let blocks = match &g.blocks {
+            None => String::new(),
+            Some(b) => {
+                let (count, entry) = match &b.index {
+                    Some(ix) => (format!("{}", b.topk), format!("{ix}[(size_t)row * {} + r]", b.topk)),
+                    None => ("visible".to_string(), "r".to_string()),
+                };
+                format!(
+                    "    {{
+        const int visible = {ratio} > 0 ? (q_pos_i + 1) / {ratio} : 0;
+        for (int r = warp; r < {count}; r += SCAN_WARPS) {{
+            const int e = {entry};
+            if (e < 0 || e >= visible) continue;
+            const int t = e * {ratio} + {ratio} - 1;
+            size_t slot = (((size_t)table[t / PAGE] * {layers} + layer) * KV_ROWS + 0) * PAGE + t % PAGE;
+            const bf16_t* kr = {cache} + slot * QK * KV_PLANES;
+            float part = 0.0f;
+#pragma unroll
+            for (int j = 0; j < QK_LANES; j++) {{
+                int d = lane + 32 * j;
+                if (d < QK) part += q[j] * (attn_float(kr[d]) + (KV_PLANES == 2 ? attn_float(kr[QK + d]) : 0.0f));
+            }}
+            float dot = warp_sum(part);
+{block_body}            float m_new = fmaxf(m, {value});
+            float corr = m == NEG_INF ? 0.0f : expf(m - m_new);
+            float p = expf({value} - m_new);
+            l = l * corr + p;
+#pragma unroll
+            for (int j = 0; j < V_LANES; j++) {{
+                int d = lane + 32 * j;
+                if (d < VD) acc[j] = acc[j] * corr + p * (attn_float(kr[d]) + (KV_PLANES == 2 ? attn_float(kr[QK + d]) : 0.0f));
+            }}
+            m = m_new;
+        }}
+    }}
+",
+                    ratio = b.ratio,
+                    layers = b.layers,
+                    cache = b.cache,
+                    value = value,
+                )
+            }
+        };
         let (sink_decl, top_init, sink_denom) = match self.sink() {
             Some(n) => (format!("    float sink_logit = {n}[head];\n"), "sink_logit", "expf(sink_logit - top)"),
             None => (String::new(), "NEG_INF", "0.0f"),
@@ -403,7 +488,7 @@ impl Scan {
         }}
         m = m_new;
     }}
-    if (lane == 0) {{
+{blocks}    if (lane == 0) {{
         m_s[warp] = m;
         l_s[warp] = l;
     }}

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 10;
+pub const SPEC_FORMAT: u32 = 11;
+
+const BLOCK_NAMES: [&str; 5] = ["dense", "full", "sliding", "compressed", "indexed"];
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -299,11 +301,17 @@ pub enum Block {
     Full,
     Sliding,
     Linear,
+    Compressed,
+    Indexed,
 }
 
 impl Block {
     pub fn is_linear(self) -> bool {
         self == Block::Linear
+    }
+
+    pub fn windowed(self) -> bool {
+        matches!(self, Block::Sliding | Block::Compressed | Block::Indexed)
     }
 
     pub fn name(self) -> &'static str {
@@ -312,6 +320,8 @@ impl Block {
             Block::Full => "full",
             Block::Sliding => "sliding",
             Block::Linear => "linear",
+            Block::Compressed => "compressed",
+            Block::Indexed => "indexed",
         }
     }
 }
@@ -704,6 +714,10 @@ pub struct Attention {
     pub o_cols: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub scratch: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch_i32: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub o_tensor: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -711,6 +725,8 @@ pub struct Attention {
 pub struct Projection {
     pub tensor: String,
     pub rows: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1218,6 +1234,7 @@ fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_jso
             ensure!(original > 0.0, "original_max_position_embeddings must be positive");
             let attention_factor = match (num("attention_factor"), num("mscale"), num("mscale_all_dim")) {
                 (Some(a), _, _) => a,
+                (None, None, None) if rope.yarn_attention_factor.is_some() => rope.yarn_attention_factor.unwrap_or(1.0),
                 (None, Some(m), Some(d)) if m != 0.0 && d != 0.0 => yarn_mscale(factor, m) / yarn_mscale(factor, d),
                 _ => yarn_mscale(factor, 1.0),
             };
@@ -1400,7 +1417,8 @@ impl Spec {
         let params = hf.rope_parameters.as_ref();
         let param = |key: &str| params.and_then(|p| p.get(key)).or(nested.and_then(|n| n.get(key))).and_then(|v| v.as_f64());
         let full_params = params.and_then(|p| p.get("full_attention")).filter(|_| family.blocks.layer_types.values().any(|b| *b == Block::Full));
-        let scaling = match parse_rope_scaling(&family.rope, hf.rope_scaling.as_ref().or(full_params).or(params), &value) {
+        let scaling_source = family.rope.scaling_path.as_deref().and_then(|p| p.split('.').try_fold(&value, |v, k| v.get(k)));
+        let scaling = match parse_rope_scaling(&family.rope, hf.rope_scaling.as_ref().or(scaling_source).or(full_params).or(params), &value) {
             Ok(s) => s,
             Err(e) if strict => return Err(e),
             Err(_) => None,
@@ -1411,8 +1429,9 @@ impl Spec {
                 .find(|(k, v)| family.blocks.layer_types.get(*k) == Some(&block) && v.get("rope_theta").is_some())
                 .and_then(|(_, v)| v.get("rope_theta")?.as_f64())
         };
-        let local_theta = by_block(Block::Sliding).or_else(|| family.rope.local_theta_key.as_deref().and_then(|k| value.get(k)?.as_f64()));
-        let theta = hf.rope_theta.or(param("rope_theta")).or(by_block(Block::Full));
+        let local_theta = by_block(Block::Sliding).or_else(|| family.rope.local_theta_key.as_deref().and_then(|k| k.split('.').try_fold(&value, |v, p| v.get(p)).and_then(|v| v.as_f64())));
+        let dotted = |path: &str| path.split('.').try_fold(&value, |v, k| v.get(k)).and_then(|v| v.as_f64());
+        let theta = family.rope.theta_key.as_deref().and_then(dotted).or(hf.rope_theta).or(param("rope_theta")).or(by_block(Block::Full));
         let theta = if strict { Some(theta.context("no rope_theta")?) } else { theta };
         let mapped = hf.hidden_act.as_deref().and_then(|a| family.activation.map.get(a).copied());
         let activation = match (mapped, hf.hidden_act.as_deref(), strict) {
@@ -1439,13 +1458,12 @@ impl Spec {
         let (qkv_bias, o_bias, qk_norm, output_gate) = attn_flags;
         let multiplier = |key: &Option<String>| key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_f64());
         let head_dim = hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads);
-        let rotary_dim = hf
-            .partial_rotary_factor
-            .or(param("partial_rotary_factor"))
-            .filter(|f| *f != 1.0)
-            .map(|f| (head_dim as f64 * f).round() as usize);
+        let keyed_rotary = family.rope.rotary_dim_key.as_deref().and_then(|k| value.get(k)?.as_u64()).map(|d| d as usize);
+        let rotary_dim = keyed_rotary.or_else(|| {
+            hf.partial_rotary_factor.or(param("partial_rotary_factor")).filter(|f| *f != 1.0).map(|f| (head_dim as f64 * f).round() as usize)
+        });
         let pattern = match &hf.layer_types {
-            Some(types) if hybrid || !strict || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
+            Some(types) if hybrid || !strict || family.blocks.from_layer_types || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
             None if family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).is_some_and(|n| n > 1) && hf.sliding_window.is_some() => {
                 let n = family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).unwrap_or(2) as usize;
                 let all: Vec<String> = (0..hf.num_hidden_layers).map(|i| if (i + 1) % n == 0 { "full_attention" } else { "sliding_attention" }.to_string()).collect();
@@ -1538,7 +1556,7 @@ impl Spec {
                 logit_softcap: hf.final_logit_softcapping,
                 logit_scale: multiplier(&family.multipliers.logits_divisor).filter(|d| *d > 0.0).map(|d| 1.0 / d),
             },
-            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.contains(&Block::Sliding)), pattern },
+            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern },
             norm: Norm {
                 kind: NormKind::Rmsnorm,
                 eps: hf.rms_norm_eps,
@@ -1566,6 +1584,8 @@ impl Spec {
                 projection: family.attention.projection.clone(),
                 o_cols: family.attention.o_cols.clone(),
                 scratch: family.attention.scratch.clone(),
+                scratch_i32: family.attention.scratch_i32.clone(),
+                o_tensor: family.attention.o_tensor.clone(),
             },
             rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value) },
             mlp: Mlp {
@@ -1596,7 +1616,7 @@ impl Spec {
 
     pub fn validate(&self) -> Result<()> {
         self.runtime.validate()?;
-        ensure!(!self.layers.pattern.contains(&Block::Sliding) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
+        ensure!(!self.layers.pattern.iter().any(|b| b.windowed()) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
         self.validate_attention_nodes()?;
         crate::state::validate(self)?;
         match self.head_quant {
@@ -1778,11 +1798,14 @@ impl Spec {
         let nodes = &self.attention.node;
         for p in &self.attention.projection {
             crate::state::dim(self, &p.rows).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
+            for k in &p.layers {
+                ensure!(BLOCK_NAMES.contains(&k.as_str()), "[[attention.projection]] {} names layer block {k:?}, not dense, full, sliding, compressed or indexed", p.tensor);
+            }
         }
         if let Some(c) = &self.attention.o_cols {
             crate::state::dim(self, c).context("[attention] o_cols")?;
         }
-        for (n, w) in &self.attention.scratch {
+        for (n, w) in self.attention.scratch.iter().chain(&self.attention.scratch_i32) {
             crate::state::dim(self, w).with_context(|| format!("[attention.scratch] {n}"))?;
         }
         if nodes.is_empty() {
@@ -1799,7 +1822,13 @@ impl Spec {
                     ensure!(n.kernel.is_some(), "[[attention.node]] {i} is a kernel node without `kernel`");
                     ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[attention.node]] {i} needs a grid of one to three symbols");
                     for g in &n.grid {
-                        ensure!(matches!(g.as_str(), "heads" | "kv_heads" | "rows") || g.parse::<u32>().is_ok(), "[[attention.node]] {i} grid symbol {g:?} is not heads, kv_heads, rows or a number");
+                        ensure!(
+                            matches!(g.as_str(), "heads" | "kv_heads" | "rows") || g.parse::<u32>().is_ok() || self.attention.params.contains_key(g),
+                            "[[attention.node]] {i} grid symbol {g:?} is not heads, kv_heads, rows, a number or an [attention.params] entry"
+                        );
+                    }
+                    for k in &n.layers {
+                        ensure!(BLOCK_NAMES.contains(&k.as_str()), "[[attention.node]] {i} names layer block {k:?}, not dense, full, sliding, compressed or indexed");
                     }
                     for b in n.bind.values() {
                         match b {
@@ -1807,7 +1836,7 @@ impl Spec {
                                 self.weight_len(len)?;
                             }
                             crate::graph::Bind::Buffer { buffer } => ensure!(
-                                matches!(buffer.as_str(), "qkv" | "attn") || self.attention.scratch.contains_key(buffer),
+                                matches!(buffer.as_str(), "qkv" | "attn") || self.attention.scratch.contains_key(buffer) || self.attention.scratch_i32.contains_key(buffer),
                                 "[[attention.node]] {i} binds buffer {buffer:?}, which is not qkv, attn or an [attention.scratch] entry"
                             ),
                             crate::graph::Bind::State { state } => ensure!(
@@ -1932,6 +1961,14 @@ impl Spec {
         }
         let gate = if self.attention.output_gate { self.q_dim() } else { 0 };
         self.q_dim() + 2 * self.kv_dim() + gate
+    }
+
+    pub fn node_applies(&self, node: &crate::graph::Node, layer: usize) -> bool {
+        node.layers.is_empty() || node.layers.iter().any(|l| l == self.block(layer).name())
+    }
+
+    pub fn projection_applies(&self, p: &Projection, layer: usize) -> bool {
+        p.layers.is_empty() || p.layers.iter().any(|l| l == self.block(layer).name())
     }
 
     pub fn o_dim(&self) -> usize {

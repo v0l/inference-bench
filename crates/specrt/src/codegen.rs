@@ -146,6 +146,7 @@ pub fn attention_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::
         .num("rope_original", rope.original)
         .num("rope_mscale", rope.mscale)
         .nums("rope_freq_factors", &shape.rope.freq_factors)
+        .num("max_context", max_ctx as f64)
         .num("kv_layers", spec.kv_layers() as f64)
         .num("kv_planes", kv_planes as f64)
         .flag("kv_fp8", shape.kv_fp8)
@@ -200,7 +201,10 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
             let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[attention.node]] {i} binds {b:?}, which {name} has no param for"))?;
             match (param.role, v) {
                 (kir::Role::Weight, crate::graph::Bind::Weight { .. }) => {}
-                (kir::Role::Activation, crate::graph::Bind::Buffer { .. }) => anyhow::ensure!(param.ty == kir::Scalar::F32, "[[attention.node]] {i} binds buffer to {b:?}, which is not f32"),
+                (kir::Role::Activation, crate::graph::Bind::Buffer { buffer }) => anyhow::ensure!(
+                    param.ty == if spec.attention.scratch_i32.contains_key(buffer) { kir::Scalar::I32 } else { kir::Scalar::F32 },
+                    "[[attention.node]] {i} binds buffer {buffer:?} to {b:?}, which has the wrong element type"
+                ),
                 (kir::Role::Activation, crate::graph::Bind::State { .. }) => anyhow::ensure!(param.ty == kir::Scalar::Bf16, "[[attention.node]] {i} binds a state to {b:?}, which is not bf16"),
                 (kir::Role::Value, crate::graph::Bind::Weight { .. } | crate::graph::Bind::Buffer { .. } | crate::graph::Bind::State { .. })
                 | (kir::Role::Weight, _)

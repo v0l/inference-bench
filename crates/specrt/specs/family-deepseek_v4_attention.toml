@@ -1,0 +1,375 @@
+name = "deepseek_v4_attention"
+kind = "family"
+min_engine = 11
+extends = "base"
+
+[match]
+model_types = ["deepseek_v4_attention"]
+architectures = ["DeepseekV4AttentionForCausalLM"]
+
+[norm]
+unit_offset = false
+
+[fields]
+"compress_rates.compressed_sparse_attention" = ["compress_rate_csa"]
+"compress_rates.heavily_compressed_attention" = ["compress_rate_hca"]
+
+[blocks]
+from_layer_types = true
+types_key = "compress_ratios"
+
+[blocks.layer_types]
+sliding_attention = "sliding"
+compressed_sparse_attention = "indexed"
+heavily_compressed_attention = "compressed"
+"0" = "sliding"
+"4" = "indexed"
+"128" = "compressed"
+
+[rope]
+theta_key = "compress_rope_theta"
+local_theta_key = "rope_theta"
+scaling_path = "rope_parameters.compress"
+rotary_dim_key = "qk_rope_head_dim"
+yarn_attention_factor = 1.0
+
+[attention]
+o_cols = "o_groups * o_lora_rank"
+o_tensor = "o_b_proj"
+
+[attention.params]
+q_lora_rank = { config = "q_lora_rank" }
+o_groups = { config = "o_groups" }
+o_lora_rank = { config = "o_lora_rank" }
+index_heads = { config = "index_n_heads" }
+index_head_dim = { config = "index_head_dim" }
+index_topk = { config = "index_topk" }
+csa_ratio = { config = "compress_rates.compressed_sparse_attention", default = 4.0 }
+hca_ratio = { config = "compress_rates.heavily_compressed_attention", default = 128.0 }
+softmax_scale = { expr = "rsqrt(head_dim)" }
+
+[attention.scratch]
+q_heads = "heads * head_dim"
+o_heads = "heads * head_dim"
+iq = "index_heads * index_head_dim"
+
+[attention.scratch_i32]
+idx = "index_topk"
+
+[[attention.projection]]
+tensor = "q_a_proj"
+rows = "q_lora_rank"
+
+[[attention.projection]]
+tensor = "kv_proj"
+rows = "head_dim"
+
+[[attention.projection]]
+tensor = "compressor.kv_proj"
+rows = "head_dim"
+layers = ["compressed"]
+
+[[attention.projection]]
+tensor = "compressor.gate_proj"
+rows = "head_dim"
+layers = ["compressed"]
+
+[[attention.projection]]
+tensor = "compressor.kv_proj"
+rows = "2 * head_dim"
+layers = ["indexed"]
+
+[[attention.projection]]
+tensor = "compressor.gate_proj"
+rows = "2 * head_dim"
+layers = ["indexed"]
+
+[[attention.projection]]
+tensor = "compressor.indexer.kv_proj"
+rows = "2 * index_head_dim"
+layers = ["indexed"]
+
+[[attention.projection]]
+tensor = "compressor.indexer.gate_proj"
+rows = "2 * index_head_dim"
+layers = ["indexed"]
+
+[[attention.projection]]
+tensor = "compressor.indexer.scorer.weights_proj"
+rows = "index_heads"
+layers = ["indexed"]
+
+[[state]]
+name = "kv"
+per = "token"
+layers = "attention"
+shape = ["1", "head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "raw"
+per = "token"
+layers = "attention"
+shape = ["1", "4 * head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "comp"
+per = "token"
+layers = "attention"
+shape = ["1", "head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "raw_i"
+per = "token"
+layers = "attention"
+shape = ["1", "4 * index_head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "comp_i"
+per = "token"
+layers = "attention"
+shape = ["1", "index_head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_q_a_norm"
+grid = ["rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+out = { buffer = "qkv" }
+weight = { weight = "q_a_norm.weight", len = "q_lora_rank" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_kv_norm"
+grid = ["rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+out = { buffer = "qkv" }
+weight = { weight = "kv_norm.weight", len = "head_dim" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_q_matvec"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+w = { weight = "q_b_proj.weight", len = "heads * head_dim * q_lora_rank" }
+y = { buffer = "q_heads" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_q_rms"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "q_heads" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_q_rope"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "q_heads" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_kv_rope"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_kv_write"
+grid = ["1", "rows"]
+
+[attention.node.bind]
+src = { buffer = "qkv" }
+dst = { state = "kv" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_hca_raw_write"
+layers = ["compressed"]
+grid = ["1", "rows"]
+
+[attention.node.bind]
+src = { buffer = "qkv" }
+dst = { state = "raw" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_hca_pool"
+layers = ["compressed"]
+grid = ["1", "rows"]
+
+[attention.node.bind]
+raw = { state = "raw" }
+bias = { weight = "compressor.position_bias", len = "hca_ratio * head_dim" }
+norm = { weight = "compressor.kv_norm.weight", len = "head_dim" }
+dst = { state = "comp" }
+ratio = "hca_ratio"
+overlap = 0
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_hca_attn"
+layers = ["compressed"]
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+qh = { buffer = "q_heads" }
+k_cache = { state = "kv" }
+v_cache = { state = "kv" }
+out = { buffer = "o_heads" }
+sinks = { weight = "sinks", len = "heads" }
+window = "window"
+softmax_scale = "softmax_scale"
+comp = { state = "comp" }
+ratio = "hca_ratio"
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_csa_raw_write"
+layers = ["indexed"]
+grid = ["1", "rows"]
+
+[attention.node.bind]
+src = { buffer = "qkv" }
+dst = { state = "raw" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_csa_pool"
+layers = ["indexed"]
+grid = ["1", "rows"]
+
+[attention.node.bind]
+raw = { state = "raw" }
+bias = { weight = "compressor.position_bias", len = "csa_ratio * 2 * head_dim" }
+norm = { weight = "compressor.kv_norm.weight", len = "head_dim" }
+dst = { state = "comp" }
+ratio = "csa_ratio"
+overlap = 1
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_idx_raw_write"
+layers = ["indexed"]
+grid = ["1", "rows"]
+
+[attention.node.bind]
+src = { buffer = "qkv" }
+dst = { state = "raw_i" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_idx_pool"
+layers = ["indexed"]
+grid = ["1", "rows"]
+
+[attention.node.bind]
+raw = { state = "raw_i" }
+bias = { weight = "compressor.indexer.position_bias", len = "csa_ratio * 2 * index_head_dim" }
+norm = { weight = "compressor.indexer.kv_norm.weight", len = "index_head_dim" }
+dst = { state = "comp_i" }
+ratio = "csa_ratio"
+overlap = 1
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_iq_matvec"
+layers = ["indexed"]
+grid = ["index_heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "qkv" }
+w = { weight = "compressor.indexer.q_b_proj.weight", len = "index_heads * index_head_dim * q_lora_rank" }
+y = { buffer = "iq" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_iq_rope"
+layers = ["indexed"]
+grid = ["index_heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "iq" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_idx_topk"
+layers = ["indexed"]
+grid = ["1", "rows"]
+
+[attention.node.bind]
+q = { buffer = "iq" }
+w = { buffer = "qkv" }
+keys = { state = "comp_i" }
+idx = { buffer = "idx" }
+ratio = "csa_ratio"
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_csa_attn"
+layers = ["indexed"]
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+qh = { buffer = "q_heads" }
+k_cache = { state = "kv" }
+v_cache = { state = "kv" }
+out = { buffer = "o_heads" }
+sinks = { weight = "sinks", len = "heads" }
+window = "window"
+softmax_scale = "softmax_scale"
+comp = { state = "comp" }
+ratio = "csa_ratio"
+idx = { buffer = "idx" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_swa_attn"
+layers = ["sliding"]
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+qh = { buffer = "q_heads" }
+k_cache = { state = "kv" }
+v_cache = { state = "kv" }
+out = { buffer = "o_heads" }
+sinks = { weight = "sinks", len = "heads" }
+window = "window"
+softmax_scale = "softmax_scale"
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_o_rope"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+x = { buffer = "o_heads" }
+
+[[attention.node]]
+op = "kernel"
+kernel = "v4_o_group"
+grid = ["o_groups", "rows"]
+
+[attention.node.bind]
+x = { buffer = "o_heads" }
+w = { weight = "o_a_proj.weight", len = "o_lora_rank * heads * head_dim" }

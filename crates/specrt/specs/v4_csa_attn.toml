@@ -1,0 +1,145 @@
+kind = "kir-kernel"
+family = "scan_attention"
+name = "v4_csa_attn"
+threads = 128
+
+[geometry]
+layers = "kv_layers"
+kv_rows = 1
+k_width = "head_dim"
+v_stride = "head_dim"
+v_offset = 0
+v_width = "head_dim"
+out_row = "heads * head_dim"
+out_head = "head_dim"
+out_offset = 0
+
+[[query]]
+src = "qh"
+row = "heads * head_dim"
+head = "head_dim"
+offset = 0
+width = "head_dim"
+
+[blocks]
+cache = "comp"
+layers = "comp_layers"
+ratio = "ratio"
+topk = "index_topk"
+index = "idx"
+
+[[param]]
+name = "qh"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "k_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "v_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+type = "f32"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "sinks"
+type = "f32"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "window"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "softmax_scale"
+type = "f32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "comp"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "ratio"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "idx"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[stage]]
+op = "epilogue"
+name = "score"
+expr = "s * softmax_scale"
+
+[[stage]]
+op = "mask"
+expr = "window <= 0 || k_pos > q_pos - window"
+
+[[stage]]
+op = "online_softmax"
+value = "score"
+sink = "sinks"

@@ -1,7 +1,7 @@
 use crate::codegen::{Module, PAGE};
 use kir::linear::LinearTuning;
 use crate::jit::{Jit, default_cache_dir};
-use crate::spec::{Block, LinearAttention, Spec};
+use crate::spec::{LinearAttention, Spec};
 use crate::statepool::StatePool;
 use crate::weights::{Checkpoint, Feed, Matrix, Mixer, peak_rss_bytes};
 use anyhow::{Context, Result, ensure};
@@ -110,7 +110,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             k_norm: up_opt(&a.k_norm)?,
             o: up_m(&a.o)?,
             kv: before(false),
-            window: if spec.block(i) == Block::Sliding { spec.layers.window.unwrap_or(0) as i32 } else { 0 },
+            window: if spec.block(i).windowed() { spec.layers.window.unwrap_or(0) as i32 } else { 0 },
             nope: spec.nope(i),
             extra: a.extra.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,
         }),
@@ -653,6 +653,7 @@ pub struct Runtime {
     layers: Vec<DeviceLayer>,
     described: Vec<Option<DescribedLaunch>>,
     scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    scratch_i32: std::collections::BTreeMap<String, CudaSlice<i32>>,
     buf: Buffers,
     pre: PrefillBuffers,
     gdn: Option<GdnBuffers>,
@@ -1023,6 +1024,12 @@ impl Runtime {
             scratch: spec
                 .attention
                 .scratch
+                .iter()
+                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
+                .collect::<Result<_>>()?,
+            scratch_i32: spec
+                .attention
+                .scratch_i32
                 .iter()
                 .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
                 .collect::<Result<_>>()?,
@@ -2261,6 +2268,16 @@ impl Runtime {
         })
     }
 
+    pub fn debug_dump(&self) -> Result<(Vec<f32>, std::collections::BTreeMap<String, Vec<f32>>)> {
+        let scratch = self.scratch.iter().map(|(n, b)| Ok((n.clone(), self.stream.clone_dtoh(b)?))).collect::<Result<_>>()?;
+        let mut scratch: std::collections::BTreeMap<String, Vec<f32>> = scratch;
+        let hi = self.stream.clone_dtoh(&self.pre.xn_planes.hi)?;
+        let lo = self.stream.clone_dtoh(&self.pre.xn_planes.lo)?;
+        let f = |b: u16| half_to_f32(b);
+        scratch.insert("xn".into(), hi.iter().zip(&lo).map(|(h, l)| f(*h) + f(*l)).collect());
+        Ok((self.stream.clone_dtoh(&self.pre.qkv)?, scratch))
+    }
+
     pub fn trace_prefill(&mut self, tokens: &[u32]) -> Result<Trace> {
         ensure!(tokens.len() <= self.prefill_limit, "trace prefill fits one chunk");
         let s = &self.spec;
@@ -2473,5 +2490,16 @@ mod tests {
         assert_eq!(cut_at_stop(&[5, 6], &[151645]), (2, false));
         assert_eq!(cut_at_stop(&[151643], &[151645, 151643]), (0, true));
         assert_eq!(cut_at_stop(&[1, 2, 3], &[]), (3, false));
+    }
+}
+
+fn half_to_f32(b: u16) -> f32 {
+    let sign = if b & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((b >> 10) & 0x1f) as i32;
+    let frac = (b & 0x3ff) as f32;
+    match exp {
+        0 => sign * frac * 2f32.powi(-24),
+        31 => sign * f32::INFINITY,
+        e => sign * (1.0 + frac / 1024.0) * 2f32.powi(e - 15),
     }
 }

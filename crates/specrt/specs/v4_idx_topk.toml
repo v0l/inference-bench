@@ -1,0 +1,88 @@
+kind = "kir-kernel"
+family = "index_topk"
+name = "v4_idx_topk"
+threads = 256
+
+[args]
+heads = "index_heads"
+dim = "index_head_dim"
+topk = "index_topk"
+max_keys = "floor(max_context / csa_ratio) + 1"
+q_row = "index_heads * index_head_dim"
+q_offset = 0
+w_row = "qkv_row"
+w_offset = "q_lora_rank + 7 * head_dim + 4 * index_head_dim"
+out_row = "index_topk"
+keys_layers = "comp_i_layers"
+
+[[param]]
+name = "q"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "keys"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "idx"
+type = "i32"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "ratio"
+type = "i32"
+role = "value"
+access = "read"

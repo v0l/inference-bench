@@ -8,9 +8,11 @@ pub enum RopeStyle {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowBody {
-    SpanRope { row: u32, head: u32, offset: u32, rot: u32, style: RopeStyle },
-    StateWrite { src_row: u32, src_offset: u32, layers: u32, rows: u32, width: u32 },
-    IndexTopk { heads: u32, dim: u32, topk: u32, max_keys: u32, q_row: u32, q_offset: u32, w_row: u32, w_offset: u32, out_row: u32 },
+    SpanRope { row: u32, head: u32, offset: u32, rot: u32, style: RopeStyle, invert: bool },
+    HeadRms { row: u32, head: u32, offset: u32, width: u32, eps: f32 },
+    BlockPool { dim: u32, rot: u32, layers: u32, raw_width: u32, gate_offset: u32, eps: f32 },
+    StateWrite { src_row: u32, src_offset: u32, layers: u32, rows: u32, width: u32, stride: u32 },
+    IndexTopk { heads: u32, dim: u32, topk: u32, max_keys: u32, q_row: u32, q_offset: u32, w_row: u32, w_offset: u32, out_row: u32, keys_layers: u32 },
     HeadMatvec { x_row: u32, x_head: u32, x_offset: u32, inner: u32, w_head: u32, w_inner: u32, w_out: u32, w_offset: u32, out: u32, y_row: u32, y_head: u32, y_offset: u32 },
 }
 
@@ -34,11 +36,17 @@ impl RowBody {
             RowBody::StateWrite { .. } => "state_write",
             RowBody::HeadMatvec { .. } => "head_matvec",
             RowBody::IndexTopk { .. } => "index_topk",
+            RowBody::HeadRms { .. } => "head_rms",
+            RowBody::BlockPool { .. } => "block_pool",
         }
     }
 
     pub fn describe(&self) -> String {
         format!("{self:?}")
+    }
+
+    fn paged_keys(params: &[Param]) -> bool {
+        params.iter().any(|p| p.name == "keys" && p.ty == Scalar::Bf16)
     }
 
     fn planes(params: &[Param]) -> bool {
@@ -61,11 +69,32 @@ impl RowBody {
             RowBody::IndexTopk { .. } => {
                 out.push(("q", Scalar::F32, Role::Activation, Access::Read));
                 out.push(("w", Scalar::F32, Role::Activation, Access::Read));
-                out.push(("keys", Scalar::F32, Role::Activation, Access::Read));
-                out.push(("idx", Scalar::I32, Role::Activation, Access::Write));
-                out.push(("pos", Scalar::I32, Role::Activation, Access::Read));
-                out.push(("pos_step", Scalar::I32, Role::Value, Access::Read));
-                out.push(("row_step", Scalar::I32, Role::Value, Access::Read));
+                if Self::paged_keys(params) {
+                    out.push(("keys", Scalar::Bf16, Role::Activation, Access::Read));
+                    out.push(("idx", Scalar::I32, Role::Activation, Access::Write));
+                    out.extend(POSITION);
+                    out.extend(PAGED);
+                    out.push(("ratio", Scalar::I32, Role::Value, Access::Read));
+                } else {
+                    out.push(("keys", Scalar::F32, Role::Activation, Access::Read));
+                    out.push(("idx", Scalar::I32, Role::Activation, Access::Write));
+                    out.push(("pos", Scalar::I32, Role::Activation, Access::Read));
+                    out.push(("pos_step", Scalar::I32, Role::Value, Access::Read));
+                    out.push(("row_step", Scalar::I32, Role::Value, Access::Read));
+                }
+            }
+            RowBody::HeadRms { .. } => {
+                out.push(("x", Scalar::F32, Role::Activation, Access::Write));
+            }
+            RowBody::BlockPool { .. } => {
+                out.push(("raw", Scalar::Bf16, Role::Activation, Access::Read));
+                out.push(("bias", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("norm", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("dst", Scalar::Bf16, Role::Activation, Access::Write));
+                out.extend(POSITION);
+                out.extend(PAGED);
+                out.push(("ratio", Scalar::I32, Role::Value, Access::Read));
+                out.push(("overlap", Scalar::I32, Role::Value, Access::Read));
             }
             RowBody::HeadMatvec { .. } => {
                 out.push(("x", Scalar::F32, Role::Activation, Access::Read));
@@ -98,10 +127,15 @@ impl RowBody {
         }
         match self {
             RowBody::SpanRope { rot, head, .. } if *rot == 0 || !rot.is_multiple_of(2) || rot > head => Err("span_rope needs an even rot no wider than the head".into()),
-            RowBody::StateWrite { width, rows, layers, .. } if *width == 0 || *rows == 0 || *layers == 0 => Err("state_write needs a positive width, rows and layers".into()),
+            RowBody::StateWrite { width, rows, layers, stride, .. } if *width == 0 || *rows == 0 || *layers == 0 || stride < width => Err("state_write needs a positive width, rows and layers and a stride of at least the width".into()),
             RowBody::IndexTopk { heads, dim, topk, max_keys, .. } if *heads == 0 || *dim == 0 || *topk == 0 || *max_keys == 0 => Err("index_topk needs positive heads, dim, topk and max_keys".into()),
             RowBody::IndexTopk { topk, max_keys, .. } if topk > max_keys => Err("index_topk cannot select more keys than it scores".into()),
             RowBody::IndexTopk { max_keys, .. } if *max_keys > 12288 => Err("index_topk scores live in shared memory, at most 12288 keys".into()),
+            RowBody::HeadRms { width, eps, .. } if *width == 0 || !eps.is_finite() || *eps < 0.0 => Err("head_rms needs a positive width and a finite eps".into()),
+            RowBody::BlockPool { dim, rot, layers, eps, .. } if *dim == 0 || *layers == 0 || *rot == 0 || !rot.is_multiple_of(2) || rot > dim || !eps.is_finite() || *eps < 0.0 => {
+                Err("block_pool needs a positive dim and layers, an even rot no wider than dim and a finite eps".into())
+            }
+            RowBody::BlockPool { dim, .. } if *dim > 1024 => Err("block_pool rows live in shared memory, at most 1024 wide".into()),
             RowBody::HeadMatvec { inner, out, .. } if *inner == 0 || *out == 0 => Err("head_matvec needs positive inner and out sizes".into()),
             _ => Ok(()),
         }
@@ -127,7 +161,7 @@ impl RowBody {
             .collect();
         let head = format!("extern \"C\" __global__ void __launch_bounds__({}) {}({}) {{\n", k.threads, k.name, sig.join(", "));
         let body = match self {
-            RowBody::SpanRope { row, head: stride, offset, rot, style } => {
+            RowBody::SpanRope { row, head: stride, offset, rot, style, invert } => {
                 let (a, b) = match style {
                     RopeStyle::Halves => ("i", "i + ROT_SPAN / 2"),
                     RopeStyle::Pairs => ("2 * i", "2 * i + 1"),
@@ -140,33 +174,50 @@ impl RowBody {
     for (int i = threadIdx.x; i < ROT_SPAN / 2; i += blockDim.x) {{
         float angle = (float)p * rope_inv_freq(i, layer);
         float c = cosf(angle) * ROPE_MSCALE;
-        float s = sinf(angle) * ROPE_MSCALE;
+        float s = {sign}sinf(angle) * ROPE_MSCALE;
         float a = v[{a}];
         float b = v[{b}];
         v[{a}] = a * c - b * s;
         v[{b}] = b * c + a * s;
     }}
-"
+",
+                    sign = if *invert { "-" } else { "" }
                 )
             }
-            RowBody::StateWrite { src_row, src_offset, layers, rows, width } => format!(
+            RowBody::StateWrite { src_row, src_offset, layers, rows, width, stride } => format!(
                 "    const int row = blockIdx.y;
     const int r = blockIdx.x;
     const int p = pos[row * pos_step] + row * row_step;
     const int* table = seq_table(block_table, slots, row, pages);
     size_t slot = (((size_t)table[p / PAGE] * {layers} + layer) * {rows} + r) * PAGE + p % PAGE;
-    bf16_t* out = dst + slot * {width} * KV_PLANES;
+    bf16_t* out = dst + slot * {stride} * KV_PLANES;
     const float* in = src + (size_t)row * {src_row} + {src_offset} + (size_t)r * {width};
     for (int d = threadIdx.x; d < {width}; d += blockDim.x) {{
         unsigned hi, lo;
         attn_split(in[d], hi, lo);
         out[d] = (bf16_t)hi;
-        if (KV_PLANES == 2) out[{width} + d] = (bf16_t)lo;
+        if (KV_PLANES == 2) out[{stride} + d] = (bf16_t)lo;
     }}
 "
             ),
-            RowBody::IndexTopk { heads, dim, topk, max_keys, q_row, q_offset, w_row, w_offset, out_row } => format!(
-                "    constexpr int HEADS = {heads};
+            RowBody::IndexTopk { heads, dim, topk, max_keys, q_row, q_offset, w_row, w_offset, out_row, keys_layers } => {
+                let paged = Self::paged_keys(&k.params);
+                let (count, key) = if paged {
+                    (
+                        "min(ratio > 0 ? (pos[row * pos_step] + row * row_step + 1) / ratio : 0, MAX_KEYS)".to_string(),
+                        "attn_float(krow[j]) + (KV_PLANES == 2 ? attn_float(krow[DIM + j]) : 0.0f)".to_string(),
+                    )
+                } else {
+                    ("min(pos[row * pos_step] + row * row_step + 1, MAX_KEYS)".to_string(), "keys[(size_t)t * DIM + j]".to_string())
+                };
+                let table = if paged { "    const int* table = seq_table(block_table, slots, row, pages);\n" } else { "" };
+                let krow = if paged {
+                    format!("            const int tp = t * ratio + ratio - 1;\n            const bf16_t* krow = keys + (((size_t)table[tp / PAGE] * {keys_layers} + layer) * PAGE + tp % PAGE) * DIM * KV_PLANES;\n")
+                } else {
+                    String::new()
+                };
+                format!(
+                    "    constexpr int HEADS = {heads};
     constexpr int DIM = {dim};
     constexpr int TOPK = {topk};
     constexpr int MAX_KEYS = {max_keys};
@@ -174,16 +225,16 @@ impl RowBody {
     __shared__ float best_v[32];
     __shared__ int best_i[32];
     const int row = blockIdx.y;
-    const int n = min(pos[row * pos_step] + row * row_step + 1, MAX_KEYS);
+{table}    const int n = {count};
     const float* qr = q + (size_t)row * {q_row} + {q_offset};
     const float* wr = w + (size_t)row * {w_row} + {w_offset};
     for (int t = threadIdx.x; t < MAX_KEYS; t += blockDim.x) {{
         float s = -3.0e30f;
         if (t < n) {{
             s = 0.0f;
-            for (int h = 0; h < HEADS; h++) {{
+{krow}            for (int h = 0; h < HEADS; h++) {{
                 float d = 0.0f;
-                for (int j = 0; j < DIM; j++) d += qr[h * DIM + j] * keys[(size_t)t * DIM + j];
+                for (int j = 0; j < DIM; j++) d += qr[h * DIM + j] * ({key});
                 s += wr[h] * fmaxf(d, 0.0f);
             }}
         }}
@@ -219,6 +270,102 @@ impl RowBody {
         __syncthreads();
     }}
 "
+                )
+            }
+            RowBody::HeadRms { row, head, offset, width, eps } => format!(
+                "    __shared__ float part[32];
+    const int r = blockIdx.y;
+    float* v = x + (size_t)r * {row} + (size_t)blockIdx.x * {head} + {offset};
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < {width}; i += blockDim.x) ss += v[i] * v[i];
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    float total = 0.0f;
+    for (int w = 0; w < ((int)blockDim.x + 31) / 32; w++) total += part[w];
+    const float inv = rsqrtf(total / {width}.0f + {eps}f);
+    for (int i = threadIdx.x; i < {width}; i += blockDim.x) v[i] *= inv;
+",
+                eps = crate::lit(*eps),
+            ),
+            RowBody::BlockPool { dim, rot, layers, raw_width, gate_offset, eps } => format!(
+                "    constexpr int DIM = {dim};
+    constexpr int ROT = {rot};
+    constexpr int RAW = {raw_width};
+    __shared__ float pooled[DIM];
+    __shared__ float part[32];
+    const int row = blockIdx.y;
+    const int p = pos[row * pos_step] + row * row_step;
+    if (ratio <= 0 || (p + 1) % ratio != 0) return;
+    const int e = p / ratio;
+    const int* table = seq_table(block_table, slots, row, pages);
+    const int coff = overlap ? 2 : 1;
+    const int stride = coff * DIM;
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < DIM; d += blockDim.x) {{
+        float top = -3.0e30f;
+        for (int k = 0; k < coff * ratio; k++) {{
+            const bool previous = overlap && k < ratio;
+            if (previous && e == 0) continue;
+            const int s = previous ? (e - 1) * ratio + k : e * ratio + (k - (overlap ? ratio : 0));
+            const int col = (overlap && !previous ? DIM : 0) + d;
+            const int j = previous ? k : k - (overlap ? ratio : 0);
+            const bf16_t* rr = raw + (((size_t)table[s / PAGE] * {layers} + layer) * PAGE + s % PAGE) * RAW * KV_PLANES;
+            float g = attn_float(rr[{gate_offset} + col]) + (KV_PLANES == 2 ? attn_float(rr[RAW + {gate_offset} + col]) : 0.0f) + bias[(size_t)j * stride + col];
+            top = fmaxf(top, g);
+        }}
+        float denom = 0.0f;
+        float acc = 0.0f;
+        for (int k = 0; k < coff * ratio; k++) {{
+            const bool previous = overlap && k < ratio;
+            if (previous && e == 0) continue;
+            const int s = previous ? (e - 1) * ratio + k : e * ratio + (k - (overlap ? ratio : 0));
+            const int col = (overlap && !previous ? DIM : 0) + d;
+            const int j = previous ? k : k - (overlap ? ratio : 0);
+            const bf16_t* rr = raw + (((size_t)table[s / PAGE] * {layers} + layer) * PAGE + s % PAGE) * RAW * KV_PLANES;
+            float g = attn_float(rr[{gate_offset} + col]) + (KV_PLANES == 2 ? attn_float(rr[RAW + {gate_offset} + col]) : 0.0f) + bias[(size_t)j * stride + col];
+            float w = expf(g - top);
+            float v = attn_float(rr[col]) + (KV_PLANES == 2 ? attn_float(rr[RAW + col]) : 0.0f);
+            denom += w;
+            acc += w * v;
+        }}
+        float v = acc / denom;
+        pooled[d] = v;
+        ss += v * v;
+    }}
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    float total = 0.0f;
+    for (int w = 0; w < ((int)blockDim.x + 31) / 32; w++) total += part[w];
+    const float inv = rsqrtf(total / (float)DIM + {eps}f);
+    for (int d = threadIdx.x; d < DIM; d += blockDim.x) pooled[d] = norm[d] * (pooled[d] * inv);
+    __syncthreads();
+    bf16_t* out = dst + (((size_t)table[p / PAGE] * {layers} + layer) * PAGE + p % PAGE) * DIM * KV_PLANES;
+    for (int d = threadIdx.x; d < DIM - ROT; d += blockDim.x) {{
+        unsigned hi, lo;
+        attn_split(pooled[d], hi, lo);
+        out[d] = (bf16_t)hi;
+        if (KV_PLANES == 2) out[DIM + d] = (bf16_t)lo;
+    }}
+    for (int i = threadIdx.x; i < ROT / 2; i += blockDim.x) {{
+        float angle = (float)(e * ratio) * rope_inv_freq(i, layer);
+        float c = cosf(angle) * ROPE_MSCALE;
+        float s = sinf(angle) * ROPE_MSCALE;
+        float a = pooled[DIM - ROT + 2 * i];
+        float b = pooled[DIM - ROT + 2 * i + 1];
+        float ra = a * c - b * s;
+        float rb = b * c + a * s;
+        unsigned hi, lo;
+        attn_split(ra, hi, lo);
+        out[DIM - ROT + 2 * i] = (bf16_t)hi;
+        if (KV_PLANES == 2) out[DIM + DIM - ROT + 2 * i] = (bf16_t)lo;
+        attn_split(rb, hi, lo);
+        out[DIM - ROT + 2 * i + 1] = (bf16_t)hi;
+        if (KV_PLANES == 2) out[DIM + DIM - ROT + 2 * i + 1] = (bf16_t)lo;
+    }}
+",
+                eps = crate::lit(*eps),
             ),
             RowBody::HeadMatvec { x_row, x_head, x_offset, inner, w_head, w_inner, w_out, w_offset, out, y_row, y_head, y_offset } => {
                 let store = if Self::planes(&k.params) {

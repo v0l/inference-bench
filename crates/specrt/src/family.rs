@@ -94,12 +94,14 @@ pub struct FamilyAttention {
     pub projection: Vec<crate::spec::Projection>,
     pub o_cols: Option<String>,
     pub scratch: std::collections::BTreeMap<String, String>,
+    pub scratch_i32: std::collections::BTreeMap<String, String>,
     pub qkv_bias: Flag,
     pub o_bias: Flag,
     pub qk_norm: Flag,
     pub output_gate: Flag,
     pub qk_norm_full: bool,
     pub fused_qkv: bool,
+    pub o_tensor: Option<String>,
 }
 
 impl Default for FamilyAttention {
@@ -110,12 +112,14 @@ impl Default for FamilyAttention {
             projection: Vec::new(),
             o_cols: None,
             scratch: Default::default(),
+            scratch_i32: Default::default(),
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
             o_bias: Flag::Fixed(false),
             qk_norm: Flag::Fixed(false),
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },
             qk_norm_full: false,
             fused_qkv: false,
+            o_tensor: None,
         }
     }
 }
@@ -227,6 +231,8 @@ pub struct FamilyBlocks {
     pub kind: BlockKind,
     pub layer_types: std::collections::BTreeMap<String, crate::spec::Block>,
     pub other_layer_type: Option<crate::spec::Block>,
+    pub from_layer_types: bool,
+    pub types_key: Option<String>,
     pub sliding_period_key: Option<String>,
 }
 
@@ -253,6 +259,10 @@ pub struct FamilyRope {
     pub keys: std::collections::BTreeMap<String, String>,
     pub local_theta_key: Option<String>,
     pub nope_flags: Option<String>,
+    pub theta_key: Option<String>,
+    pub scaling_path: Option<String>,
+    pub rotary_dim_key: Option<String>,
+    pub yarn_attention_factor: Option<f64>,
 }
 
 impl FamilyRope {
@@ -435,6 +445,13 @@ pub struct Family {
 
 impl Family {
     pub fn normalise(&self, config: &mut serde_json::Value) {
+        if let Some(key) = self.blocks.types_key.as_deref()
+            && config.get("layer_types").is_none()
+            && let Some(items) = config.get(key).and_then(|v| v.as_array())
+        {
+            let types: Vec<serde_json::Value> = items.iter().map(|v| serde_json::Value::String(v.as_u64().map_or_else(|| v.to_string(), |n| n.to_string()))).collect();
+            config["layer_types"] = serde_json::Value::Array(types);
+        }
         for (canonical, alternatives) in &self.fields {
             if dotted(config, canonical).is_some() {
                 continue;

@@ -39,6 +39,8 @@ pub struct Node {
     pub phase: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -230,11 +232,12 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
     })
 }
 
-fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec) -> Result<Vec<Op>> {
+fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, block: Option<&str>) -> Result<Vec<Op>> {
     let mut ops = Vec::new();
     for n in nodes.iter().filter(|n| n.runs_in(phase, tensor_core, spec)) {
         if n.op == "attention_nodes" {
-            for (i, d) in spec.attention.node.iter().enumerate().filter(|(_, d)| d.runs_in(phase, tensor_core, spec)) {
+            let here = |d: &Node| d.layers.is_empty() || block.is_none_or(|b| d.layers.iter().any(|l| l == b));
+            for (i, d) in spec.attention.node.iter().enumerate().filter(|(_, d)| here(d) && d.runs_in(phase, tensor_core, spec)) {
                 ops.push(d.lower_described(i)?);
             }
         } else {
@@ -331,9 +334,24 @@ impl Graph {
                 Some("sparse") => true,
                 Some(other) => bail!("block {} has unknown mlp {other}", b.name),
             };
-            blocks.push(PlanBlock { layers: b.layers.clone(), sparse, ops: lower(&b.node, phase, tensor_core, spec)? });
+            let filtered = spec.attention.node.iter().any(|n| !n.layers.is_empty()) && b.node.iter().any(|n| n.op == "attention_nodes");
+            if filtered {
+                for name in &b.layers {
+                    blocks.push(PlanBlock { layers: vec![name.clone()], sparse, ops: lower(&b.node, phase, tensor_core, spec, Some(name))? });
+                }
+            } else {
+                blocks.push(PlanBlock { layers: b.layers.clone(), sparse, ops: lower(&b.node, phase, tensor_core, spec, None)? });
+            }
         }
-        Ok(Plan { phase, tensor_core, head: lower(&self.head, phase, tensor_core, spec)?, blocks, tail: lower(&self.tail, phase, tensor_core, spec)?, mtp: lower(&self.mtp, phase, tensor_core, spec)?, mtp_head: lower(&self.mtp_head, phase, tensor_core, spec)? })
+        Ok(Plan {
+            phase,
+            tensor_core,
+            head: lower(&self.head, phase, tensor_core, spec, None)?,
+            blocks,
+            tail: lower(&self.tail, phase, tensor_core, spec, None)?,
+            mtp: lower(&self.mtp, phase, tensor_core, spec, None)?,
+            mtp_head: lower(&self.mtp_head, phase, tensor_core, spec, None)?,
+        })
     }
 }
 

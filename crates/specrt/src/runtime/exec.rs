@@ -154,7 +154,10 @@ impl Runtime {
                     Bind::Buffer { buffer } => match buffer.as_str() {
                         "qkv" => b.arg(&self.pre.qkv),
                         "attn" => b.arg(&self.pre.attn),
-                        other => b.arg(self.scratch.get(other).with_context(|| format!("no scratch buffer {other:?}"))?),
+                        other => match self.scratch_i32.get(other) {
+                            Some(s) => b.arg(s),
+                            None => b.arg(self.scratch.get(other).with_context(|| format!("no scratch buffer {other:?}"))?),
+                        },
                     },
                     Bind::State { state } => {
                         let at = crate::state::positional(&self.spec).position(|s| s.name == *state).with_context(|| format!("no per token state {state:?}"))?;
@@ -179,7 +182,10 @@ impl Runtime {
                 "heads" => a.heads as u32,
                 "kv_heads" => a.kv_heads as u32,
                 "rows" => run.n as u32,
-                number => number.parse()?,
+                number => match number.parse() {
+                    Ok(n) => n,
+                    Err(_) => *a.params.get(number).with_context(|| format!("grid symbol {number:?} is not an [attention.params] entry"))? as u32,
+                },
             })
         };
         let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
