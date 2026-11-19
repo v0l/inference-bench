@@ -131,3 +131,43 @@ fn a_gguf_architecture_needs_only_a_family_toml() {
     assert_eq!(f.gguf.key("block_count", "acmelm").unwrap(), "acmelm.block_count");
     assert_eq!(f.gguf.tensor("embedding").unwrap(), "token_embd.weight");
 }
+
+fn clamped_config() -> String {
+    let base = std::fs::read_to_string(fixtures().join("qwen3-0.6b.config.json")).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&base).unwrap();
+    v["model_type"] = "clampedlm".into();
+    v["swiglu_limit"] = 6.0.into();
+    v["swiglu_alpha"] = 1.5.into();
+    v.to_string()
+}
+
+#[test]
+fn a_clamped_swiglu_with_alpha_comes_from_the_family_toml_into_every_gated_kernel() {
+    let clamped = std::fs::read_to_string(fixtures().join("family-clamped.toml")).unwrap();
+    let spec = Spec::from_hf_config_serving_in(&registry_with(&[&clamped]), &clamped_config()).unwrap();
+    let gated = spec.mlp.gated.as_ref().unwrap();
+    assert_eq!((gated.params["alpha"], gated.params["limit"]), (1.5, 6.0));
+    let plain = Spec::from_hf_config_serving_in(&registry_with(&[]), &std::fs::read_to_string(fixtures().join("qwen3-0.6b.config.json")).unwrap()).unwrap();
+    assert!(plain.mlp.gated.is_none());
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+    assert!(module.source.contains("#define GATED_BODY(g, u) (") && module.source.contains("fminf(g, 6e0f)") && module.source.contains("1.5e0f"), "clamp and alpha are lowered into the gated body");
+    let stock = specrt::codegen::Module::generate_kv(&plain, 256, 1, &kir::Target::sm_120()).unwrap();
+    assert!(stock.source.contains("#define GATED_BODY(g, u) (activation(g) * u)"));
+}
+
+#[test]
+fn a_gated_expression_with_an_unknown_name_is_a_load_error_naming_it() {
+    let clamped = std::fs::read_to_string(fixtures().join("family-clamped.toml")).unwrap().replace("* alpha", "* beta");
+    let spec = Spec::from_hf_config_serving_in(&registry_with(&[&clamped]), &clamped_config()).unwrap();
+    let err = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap_err().to_string();
+    assert!(err.contains("beta"), "{err}");
+}
+
+#[test]
+fn block_quantised_experts_are_declared_in_the_family_toml() {
+    let clamped = std::fs::read_to_string(fixtures().join("family-clamped.toml")).unwrap();
+    let fam = registry_with(&[&clamped]);
+    let f = fam.for_model_type("clampedlm").unwrap();
+    assert_eq!(f.moe.expert_block, Some(specrt::dequant::MXFP4));
+    assert!(f.moe.gate_up_interleaved);
+}

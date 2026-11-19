@@ -236,3 +236,33 @@ kda_recurrence vs host delta rule: out max_abs 7.5e-9, state max_abs 4.5e-8
 ```
 
 Not covered: the scan is the recurrent form for prefill as well (no intra chunk mma, so long prefill is serial per head); the fused decode and prefill step, MTP, tensor parallel and wgpu refuse a mixer; glm5_next as a whole also needs MLA, the DSA indexer and hyper connections (slices c and e).
+
+## 11. Status of slice (e)
+
+Done, variant free:
+
+- **Group-limited sigmoid routing with score bias.** `kir::ops::MoeShape` gains `groups`, `topk_group` and `score_bias`. `moe_route` selects on `sigmoid + e_score_correction_bias`, keeps the best `topk_group` groups (a group scores the sum of its two best), takes the top-k inside them, and weights by the unbiased sigmoid, with `norm_topk` and `routed_scale`. With `groups = 0` the kernel computes exactly what it did before. The family spec declares `[moe] router = "sigmoid"` and `score_bias = true`; `n_group` and `topk_group` come from `config.json`; the bias tensor is `mlp.gate.e_score_correction_bias`. `specs/family-glm4_moe.toml` is the first user, so GLM-4.5/4.6/Air load from a family file (absorbs the GLM half of #642).
+- **Gated activation as an expression.** `[mlp.gated]` in a family spec holds an `expr` over `g` (gate), `u` (up) and `params` read from `config.json`. It lowers into one `gated_act(g, u)` device function used by the dense, batched, MoE gemv and MoE mma kernels. A spec without it emits `activation(g) * u`, so stock kernels are unchanged. `tests/fixtures/family-clamped.toml` expresses the gpt-oss clamp and alpha SwiGLU.
+- **Dequant blocks as data.** `specrt::dequant::BlockFormat { elem, scale, group }` (`e2m1 | e4m3 | int8` elements, `e8m0 | e4m3` scales). `MXFP4` is `e2m1`, `e8m0`, 32. `[moe] expert_block` plus `gate_up_interleaved` in a family spec make the loader decode `gate_up_proj_blocks/_scales` and `down_proj_blocks/_scales` into the bf16 expert stacks. gpt-oss rows are interleaved gate/up; the flag picks the order. Decode is exact against the e2m1 table and power-of-two scale.
+
+Proof (Spark GB10, release, `tests/variants.rs`, fixture `tiny-glm4-moe`, reference `scripts/tiny_variants.py` with transformers `Glm4MoeForCausalLM`: 8 experts, 2 groups, topk_group 1, bias, scale 1.5, norm_topk, partial rotary, qk-norm, one shared expert):
+
+```text
+group_limited_sigmoid_routing_with_score_bias_matches_transformers ... ok
+```
+
+Second pass (same slice):
+
+- **Biases.** `[attention] o_bias`, `[moe] router_bias` and `expert_bias` (router module name via `router_module`). The expert biases enter the gemv and grouped kernels before the gated expression; the router bias is added to the logits in `moe_route_logits`. The mma path is NVFP4 only and does not take expert biases.
+- **Hash layers.** `[moe] hash_table = "tid2eid"` with `num_hash_layers` from `config.json`: the first N sparse layers read experts from an `[vocab, top_k]` table indexed by the token id (`lookup`), and weight them by the router scores. `MoeShape.hash` selects the code; the table is a per layer checkpoint tensor. `tests/moe_route.rs` runs the real kernel on the GPU against a host reference.
+- **gather, scatter, lookup stages** in `family = "compose"`: `index` names a read i32 param; rows are addressed by the index buffer instead of the block id. CUDA only, errors name the param. `crates/kir/tests/compose.rs`.
+- **DSA indexer.** `family = "index_topk"` (`specs/dsa_index_topk.toml`): relu index scores weighted per head, then top-k per query row into an i32 buffer (`-1` for unused slots). A later layer shares the selection by binding the same buffer. `tests/index_topk.rs` checks the order against a host reference. Wiring it in front of the MLA scan (indexer projections, key cache, masked scan) is the part of GLM-5 left.
+- **tiny gpt-oss** (`tests/fixtures/tiny-gpt-oss`, `specs/family-gpt_oss.toml`): sinks with sliding window, biased attention, router bias, top-2 softmax weights, clamped SwiGLU with alpha, MXFP4 experts. Transformers `GptOssForCausalLM` is the reference; its experts are dequantised from the same blocks.
+
+```text
+gpt_oss_sinks_clamped_swiglu_and_mxfp4_experts_match_transformers ... ok   (Spark GB10)
+```
+
+`plan.rs` now asks the spec for the expert tensors (`Spec::expert_tensors`), so `plan_rs_has_no_architecture_or_op_sequence_knowledge` passes unchanged.
+
+Not done, filed separately: V4 compressed sparse attention and native block-scaled mma for MXFP4 experts.

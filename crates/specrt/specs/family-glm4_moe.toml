@@ -1,0 +1,23 @@
+name = "glm4_moe"
+kind = "family"
+min_engine = 10
+extends = "base"
+
+[match]
+model_types = ["glm4_moe"]
+architectures = ["Glm4MoeForCausalLM"]
+
+[norm]
+unit_offset = false
+
+[fields]
+num_experts = ["n_routed_experts"]
+
+[attention]
+qk_norm = { config = "use_qk_norm", default = false }
+
+[moe]
+router = "sigmoid"
+score_bias = true
+shared_module = "shared_experts"
+shared_gate = false

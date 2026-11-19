@@ -13,6 +13,12 @@ pub(super) enum StackWeights {
 pub(super) struct DeviceMoe {
     router: CudaSlice<u16>,
     shared_gate: CudaSlice<f32>,
+    score_bias: CudaSlice<f32>,
+    router_bias: CudaSlice<f32>,
+    gate_up_bias: CudaSlice<f32>,
+    down_bias: CudaSlice<f32>,
+    hash_table: CudaSlice<i32>,
+    hashed: i32,
     gate: StackWeights,
     up: StackWeights,
     down: StackWeights,
@@ -58,6 +64,12 @@ impl DeviceMoe {
         Ok(DeviceMoe {
             router: stream.clone_htod(&m.router)?,
             shared_gate: stream.clone_htod(m.shared_gate.as_deref().unwrap_or(&[0.0]))?,
+            score_bias: stream.clone_htod(m.score_bias.as_deref().unwrap_or(&[0.0]))?,
+            router_bias: stream.clone_htod(m.router_bias.as_deref().unwrap_or(&[0.0]))?,
+            gate_up_bias: stream.clone_htod(m.gate_up_bias.as_deref().unwrap_or(&[0.0]))?,
+            down_bias: stream.clone_htod(m.down_bias.as_deref().unwrap_or(&[0.0]))?,
+            hash_table: stream.clone_htod(m.hash_table.as_deref().unwrap_or(&[0]))?,
+            hashed: i32::from(m.hash_table.is_some()),
             gate: StackWeights::upload(stream, &m.gate)?,
             up: StackWeights::upload(stream, &m.up)?,
             down: StackWeights::upload(stream, &m.down)?,
@@ -69,7 +81,7 @@ impl DeviceMoe {
     }
 
     pub(super) fn bytes(&self) -> u64 {
-        (self.router.num_bytes() + self.shared_gate.num_bytes()) as u64 + self.gate.bytes() + self.up.bytes() + self.down.bytes()
+        (self.router.num_bytes() + self.shared_gate.num_bytes() + self.score_bias.num_bytes() + self.router_bias.num_bytes() + self.gate_up_bias.num_bytes() + self.down_bias.num_bytes() + self.hash_table.num_bytes()) as u64 + self.gate.bytes() + self.up.bytes() + self.down.bytes()
     }
 }
 
@@ -134,17 +146,17 @@ impl Runtime {
         layer.moe.as_ref().expect("moe op on a dense layer")
     }
 
-    pub(super) fn moe_route(&self, layer: &DeviceLayer, x: &CudaSlice<f32>, n: usize) -> Result<()> {
+    pub(super) fn moe_route(&self, layer: &DeviceLayer, x: &CudaSlice<f32>, tokens: &CudaSlice<i32>, n: usize) -> Result<()> {
         let w = self.moe_of(layer);
         let mb = self.moe.as_ref().expect("moe buffers");
         let experts = self.spec.moe.as_ref().expect("moe spec").experts;
         let mut b = self.stream.launch_builder(self.kernel("moe_route_logits"));
-        b.arg(x).arg(&layer.ln2).arg(&w.router).arg(&w.shared_gate).arg(&mb.xn).arg(&mb.logits);
+        b.arg(x).arg(&layer.ln2).arg(&w.router).arg(&w.shared_gate).arg(&w.router_bias).arg(&mb.xn).arg(&mb.logits);
         let config = LaunchConfig { grid_dim: ((experts + 1).div_ceil(8) as u32, n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
         let mut b = self.stream.launch_builder(self.kernel("moe_route"));
         let first = self.spec.moe.as_ref().expect("moe spec").first_expert() as i32;
-        b.arg(&mb.logits).arg(&mb.idx).arg(&mb.coef).arg(&first);
+        b.arg(&mb.logits).arg(&w.score_bias).arg(&w.hash_table).arg(tokens).arg(&w.hashed).arg(&mb.idx).arg(&mb.coef).arg(&first);
         unsafe { b.launch(cfg(n as u32, 32)) }?;
         Ok(())
     }
@@ -175,7 +187,7 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel(&up));
         self.stack_args(&mut b, &w.gate);
         self.stack_args(&mut b, &w.up);
-        b.arg(&mb.xn).arg(&mb.idx).arg(&mb.act);
+        b.arg(&w.gate_up_bias).arg(&mb.xn).arg(&mb.idx).arg(&mb.act);
         let config = LaunchConfig {
             grid_dim: (pairs, m.expert_intermediate.div_ceil(ROWS_PER_BLOCK) as u32, 1),
             block_dim: (256, 1, 1),
@@ -184,7 +196,7 @@ impl Runtime {
         unsafe { b.launch(config) }?;
         let mut b = self.stream.launch_builder(self.kernel(&down));
         self.stack_args(&mut b, &w.down);
-        b.arg(&mb.act).arg(&mb.idx).arg(&mb.out);
+        b.arg(&w.down_bias).arg(&mb.act).arg(&mb.idx).arg(&mb.out);
         let config = LaunchConfig {
             grid_dim: (pairs, self.spec.dims.hidden.div_ceil(ROWS_PER_BLOCK) as u32, 1),
             block_dim: (256, 1, 1),
@@ -260,7 +272,7 @@ impl Runtime {
         let mut b = self.stream.launch_builder(self.kernel(&up));
         self.stack_args(&mut b, &w.gate);
         self.stack_args(&mut b, &w.up);
-        b.arg(&mb.xn).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.act);
+        b.arg(&w.gate_up_bias).arg(&mb.xn).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.act);
         let config = LaunchConfig {
             grid_dim: (slots, m.expert_intermediate.div_ceil(ROWS_PER_BLOCK) as u32, 1),
             block_dim: (256, 1, 1),
@@ -269,7 +281,7 @@ impl Runtime {
         unsafe { b.launch(config) }?;
         let mut b = self.stream.launch_builder(self.kernel(&down));
         self.stack_args(&mut b, &w.down);
-        b.arg(&mb.act).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.out);
+        b.arg(&w.down_bias).arg(&mb.act).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.out);
         let config = LaunchConfig {
             grid_dim: (slots, self.spec.dims.hidden.div_ceil(ROWS_PER_BLOCK) as u32, 1),
             block_dim: (256, 1, 1),
@@ -292,13 +304,13 @@ impl Runtime {
         Ok(())
     }
 
-    pub(super) fn moe_block(&self, layer: &DeviceLayer, x: &CudaSlice<f32>, n: usize) -> Result<()> {
-        self.moe_route(layer, x, n)?;
+    pub(super) fn moe_block(&self, layer: &DeviceLayer, x: &CudaSlice<f32>, tokens: &CudaSlice<i32>, n: usize) -> Result<()> {
+        self.moe_route(layer, x, tokens, n)?;
         self.moe_experts(layer, n)?;
         self.moe_combine(x, n)
     }
 
     pub(super) fn mlp_rows(&self, layer: &DeviceLayer, n: usize) -> Result<()> {
-        if layer.moe.is_some() { self.moe_block(layer, &self.pre.x, n) } else { self.mlp_prefill(layer, n) }
+        if layer.moe.is_some() { self.moe_block(layer, &self.pre.x, &self.pre.tokens, n) } else { self.mlp_prefill(layer, n) }
     }
 }

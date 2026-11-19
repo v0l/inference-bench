@@ -412,7 +412,12 @@ impl Kernel {
         if roles != expected {
             return Err(format!("{}: params {roles:?} do not match the body, want {expected:?}", self.name));
         }
-        if !matches!(self.body, Body::Scan(_) | Body::Rows(_) | Body::Recurrence(_) | Body::Seq(_)) && self.params.iter().any(|p| p.ty != Scalar::F32) {
+        let wide = |p: &Param| match &self.body {
+            Body::Scan(_) | Body::Rows(_) | Body::Recurrence(_) | Body::Seq(_) => true,
+            Body::Compose(_) => p.ty == Scalar::I32,
+            _ => false,
+        };
+        if self.params.iter().any(|p| p.ty != Scalar::F32 && !wide(p)) {
             return Err(format!("{}: only f32 params are supported", self.name));
         }
         Ok(())

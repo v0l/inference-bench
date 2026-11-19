@@ -10,7 +10,7 @@ use toml::Value;
 
 pub const KIND: &str = "kir-kernel";
 
-pub const ROW_FAMILIES: [&str; 3] = ["span_rope", "state_write", "head_matvec"];
+pub const ROW_FAMILIES: [&str; 4] = ["span_rope", "state_write", "head_matvec", "index_topk"];
 
 pub const SEQ_FAMILIES: [&str; 3] = ["recurrence", "seq_conv", "group_norm"];
 
@@ -328,6 +328,7 @@ pub struct StageDesc {
     pub head: Option<Value>,
     #[serde(default)]
     pub offset: Option<Value>,
+    pub index: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -754,6 +755,10 @@ impl Description {
                 let n = self.sizes(shape, &self.args, &["src_row", "src_offset", "layers", "rows", "width"], "[args]")?;
                 RowBody::StateWrite { src_row: n["src_row"], src_offset: n["src_offset"], layers: n["layers"], rows: n["rows"], width: n["width"] }
             }
+            "index_topk" => {
+                let n = self.sizes(shape, &self.args, &["heads", "dim", "topk", "max_keys", "q_row", "q_offset", "w_row", "w_offset", "out_row"], "[args]")?;
+                RowBody::IndexTopk { heads: n["heads"], dim: n["dim"], topk: n["topk"], max_keys: n["max_keys"], q_row: n["q_row"], q_offset: n["q_offset"], w_row: n["w_row"], w_offset: n["w_offset"], out_row: n["out_row"] }
+            }
             "head_matvec" => {
                 let n = self.sizes(shape, &self.args, &["x_row", "x_head", "x_offset", "inner", "w_head", "w_inner", "w_out", "w_offset", "out", "y_row", "y_head", "y_offset"], "[args]")?;
                 RowBody::HeadMatvec {
@@ -826,6 +831,9 @@ impl Description {
                 "tile_load" => Stage::TileLoad { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, tile: self.tile(width, &s.layout, &s.at)?, mat: self.mat(&s.materialize)? },
                 "epilogue" => Stage::Epilogue { dst: need(&s.name, "name", &s.op)?, expr: expr(s)?, mat: self.mat(&s.materialize)? },
                 "block_sum" => Stage::BlockSum { dst: need(&s.name, "name", &s.op)?, expr: expr(s)? },
+                "gather" => Stage::Gather { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, index: need(&s.index, "index", &s.op)? },
+                "lookup" => Stage::Lookup { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, index: need(&s.index, "index", &s.op)? },
+                "scatter" => Stage::Scatter { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, index: need(&s.index, "index", &s.op)? },
                 "tile_store" => Stage::TileStore { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(width, &s.layout, &s.at)? },
                 o => return Err(format!("{}: unknown stage op {o:?}", self.name)),
             });
