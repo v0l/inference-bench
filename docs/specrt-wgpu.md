@@ -228,3 +228,15 @@ Other shapes (n=512): bf16 1.88 TFLOP/s at m=4096/k=1024 and 1.94 at m=18944/k=3
 
 Ceilings measured by skipping the op in decode (Qwen3-0.6B bf16 / Q4_K_M, context 128, tok/s): baseline 81.3/87.5; swiglu skipped 83.0/89.5 (+2%); rope skipped 84.2/90.6 (+3%); rmsnorm skipped 87.3/95.3 (+7 to 9%); all three 93.6/101.7. At 1,024 context the same: +2%, +3%, +6 to 7%. Built the biggest one, rmsnorm into the decode GEMV (the workgroup normalises the row into workgroup memory, then runs the same dot products): decode 81.5 to 75.0 (bf16), 87.8 to 81.3 (Q4_K), slower, because each of the 4-row workgroups recomputes the norm over the whole hidden vector. Dropped. rope plus KV write and swiglu into the down input are bounded by 3% and 2%, so they were not built.
 
+### Result
+
+`mac_vs_llama.sh`, 3 alternating rounds, medians (specrt / llama.cpp tok/s = ratio, pass 2 ratio in brackets):
+
+| Model | Prefill 128 | Prefill 1,024 | Decode (128 new) |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 1,412 / 2,941 = 0.48 (0.34) | 1,320 / 2,965 = 0.45 (0.25) | 73.7 / 115.8 = 0.64 (0.64) |
+| Qwen3-0.6B Q4_K_M | 1,170 / 3,006 = 0.39 (0.28) | 1,143 / 3,033 = 0.38 (0.21) | 78.8 / 196.5 = 0.40 (0.43) |
+| Llama-3.2-1B Q4_K_M | 694 / 1,733 = 0.40 (0.33) | 677 / 1,755 = 0.39 (0.27) | 60.3 / 146.9 = 0.41 (0.41) |
+| Qwen2.5-7B Q4_K_M | 107.7 / 273.9 = 0.39 (0.37) | 108.1 / 268.9 = 0.40 (0.35) | 12.1 / 28.0 = 0.43 (0.43) |
+
+7B load 8.2 s in this run (3.5 to 7.2 s in the isolated runs), peak 5.95 GB (was 9.1). The 0.5x milestone is met for Qwen3-0.6B bf16 decode only; bf16 prefill is at 0.45 to 0.48. The remaining gap is the GEMM at about 2x off `kernel_mul_mm` (1.7 to 1.9 against 3.5 to 4.2 TFLOP/s) and decode on the quantised models.
