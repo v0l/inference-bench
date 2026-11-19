@@ -1,7 +1,7 @@
 use specrt::family::Registry as Families;
 use specrt::plan::{Op, Phase, Plan};
 use specrt::runtime::{Runtime, Sampling};
-use specrt::spec::{Block, EMBEDDED, Spec};
+use specrt::spec::{Block, Spec};
 use std::path::{Path, PathBuf};
 
 const SINKS: &str = "tiny-sinks";
@@ -16,13 +16,8 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn spec(name: &str) -> Spec {
-    let family = match name {
-        SINKS => include_str!("fixtures/family-sinks-qwen3.toml"),
-        _ => include_str!("fixtures/family-chunked-smollm3.toml"),
-    };
-    let registry = Families::from_texts(EMBEDDED.iter().map(|(_, t)| *t).chain([family])).unwrap();
     let json = std::fs::read_to_string(fixture(name).join("config.json")).unwrap();
-    let mut spec = Spec::from_hf_config_serving_in(&registry, &json).unwrap();
+    let mut spec = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap();
     spec.name = name.into();
     spec.repo = fixture(name).display().to_string();
     spec

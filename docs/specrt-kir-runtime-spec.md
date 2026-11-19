@@ -185,7 +185,7 @@ Plumbing (commit "Scan attention bodies and kernel graph nodes"), generic and va
 - `graphs/decoder.toml`: `attention_nodes` expands to the spec nodes, and the stock attention ops carry `when = "stock"`. A spec with no nodes lowers exactly as before.
 - specrt: `Op::Kernel`, `Op::DecodeRope`, `codegen::described_kernels`, per-layer extra weights (`self_attn.<weight>`), the executor launch of a described kernel from its bindings. Load-time errors name the node and kernel.
 
-The variant (no Rust): `specs/attn_sinks.toml` (per-head sink in the softmax denominator, window mask, soft-cap), `specs/attn_chunked.toml` (chunked mask, NoPE temperature `1 + attn_scale * ln(1 + floor((pos + 1) / floor_scale))`), and the family files `tests/fixtures/family-sinks-qwen3.toml` and `family-chunked-smollm3.toml`.
+The variant (no Rust): `specs/attn_sinks.toml` (per-head sink in the softmax denominator, window mask, soft-cap), `specs/attn_chunked.toml` (chunked mask, NoPE temperature `1 + attn_scale * ln(1 + floor((pos + 1) / floor_scale))`), and the family files `specs/family-sinks-qwen3.toml` and `specs/family-chunked-smollm3.toml`.
 
 Proof (`tests/variants.rs`, fixtures `tiny-sinks` and `tiny-chunked`, reference `scripts/tiny_variants.py`, transformers with the eager attention swapped for the gpt-oss sink softmax and the Llama 4 chunked mask with temperature tuning), Spark GB10, release:
 
