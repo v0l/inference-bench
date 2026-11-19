@@ -41,47 +41,23 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
     const unsigned char* wb = (const unsigned char*)w;
     const unsigned char* wrow[MJ][2];
     const float* srow[MJ][2];
-#pragma unroll
-    for (int i = 0; i < MJ; i++)
-#pragma unroll
-        for (int h = 0; h < 2; h++) {
-            int r = min(row0 + i * 16 + g + 8 * h, N - 1);
-            wrow[i][h] = wb + (size_t)r * K + t * 32;
-            srow[i][h] = fp8_row_scales(scales, r);
-        }
-    auto stage = [&](int buf, int c) {
-        bf16_t* base = xs + buf * STAGE;
-        for (int i = tid; i < LOADS; i += WARPS * 32) {
-            int p = i / (M * PIECES);
-            int m = (i / PIECES) % M;
-            int piece = i % PIECES;
-            const bf16_t* src = (p ? x_lo : x_hi) + (size_t)min(m, last) * K + c * F8B_KC + piece * 4;
-            f8b_cp_async8(base + p * PLANE + (((piece & 7) * M + m) * 4 + (piece >> 3)) * 4, src, m < tokens);
-        }
-    };
-    auto load_w = [&](int c, uint4 (&q)[MJ][2][2], float (&s)[MJ][2]) {
-#pragma unroll
-        for (int i = 0; i < MJ; i++)
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                q[i][h][0] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC);
-                q[i][h][1] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC + 16);
-                s[i][h] = __ldg(srow[i][h] + c);
-            }
-    };
-    float acc[MJ][NT][4];
+"##.to_string(),
+        prim::batch_row_ptrs(4, &["wrow[i][h] = wb + (size_t)r * K + t * 32;".to_string(), "srow[i][h] = fp8_row_scales(scales, r);".to_string()]),
+        prim::batch_stage("F8B_KC", "cp_async8", "f8b"),
+        prim::batch_load_w(
+            "uint4 (&q)[MJ][2][2], float (&s)[MJ][2]",
+            &["q[i][h][0] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC);", "q[i][h][1] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC + 16);", "s[i][h] = __ldg(srow[i][h] + c);"],
+        ),
+        r##"    float acc[MJ][NT][4];
 "##.to_string(),
         prim::zero_frag("acc", ("i", "MJ"), ("n", "NT"), 4),
         prim::pipeline_prologue("nc", "stage(st, c_begin + st)"),
         r##"    uint4 q[MJ][2][2];
     float s[MJ][2];
     if (nc > 0) load_w(c_begin, q, s);
-    for (int it = 0; it < nc; it++) {
-        cp_async_wait<STAGES - 2>();
-        __syncthreads();
-        if (it + STAGES - 1 < nc) stage((it + STAGES - 1) % STAGES, c_begin + it + STAGES - 1);
-        cp_async_commit();
-        uint4 nq[MJ][2][2];
+"##.to_string(),
+        prim::batch_loop_head(),
+        r##"        uint4 nq[MJ][2][2];
         float ns[MJ][2];
         if (it + 1 < nc) load_w(c_begin + it + 1, nq, ns);
         const bf16_t* xh = xs + (it % STAGES) * STAGE;
@@ -112,59 +88,19 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
                 }
             }
         }
-#pragma unroll
-        for (int i = 0; i < MJ; i++)
-#pragma unroll
-            for (int n = 0; n < NT; n++)
-#pragma unroll
-                for (int e = 0; e < 4; e++) acc[i][n][e] += c[i][n][e] * s[i][e >> 1];
-        if (it + 1 < nc) {
-#pragma unroll
-            for (int i = 0; i < MJ; i++)
-#pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    q[i][h][0] = nq[i][h][0];
-                    q[i][h][1] = nq[i][h][1];
-                    s[i][h] = ns[i][h];
-                }
-        }
-    }
-    cp_async_wait<0>();
-#pragma unroll
-    for (int i = 0; i < MJ; i++)
-#pragma unroll
-        for (int n = 0; n < NT; n++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) {
-                int r = row0 + i * 16 + g + 8 * (e >> 1);
-                int m = n * 8 + 2 * t + (e & 1);
-                float v = acc[i][n][e];
-                float u = __shfl_down_sync(0xffffffff, v, 4);
-                if (r >= N || m >= tokens) continue;
-                if (splits > 1) part[((size_t)split * tokens + m) * N + r] = v;
-                else if (EPI != EPI_ACT || (g & 1) == 0) f8b_store<N, EPI>(m, r, BIAS ? v + bias[r] : v, u, out, out_hi, out_lo);
-            }
-}
-
-template <int N, int EPI, bool BIAS>
-__device__ __forceinline__ void f8b_reduce(const float* part, const float* bias, float* out, bf16_t* out_hi, bf16_t* out_lo,
-                                           int tokens, int splits) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    constexpr int OUT = EPI == EPI_ACT ? N / 2 : N;
-    if (i >= tokens * OUT) return;
-    int m = i / OUT;
-    int r = EPI == EPI_ACT ? 2 * (i % OUT) : i % OUT;
-    float v = 0.0f, u = 0.0f;
-    for (int sp = 0; sp < splits; sp++) {
-        const float* p = part + ((size_t)sp * tokens + m) * N + r;
-        v += p[0];
-        if (EPI == EPI_ACT) u += p[1];
-    }
-    if (BIAS) v += bias[r];
-    f8b_store<N, EPI>(m, r, v, u, out, out_hi, out_lo);
-}
-
 "##.to_string(),
+        prim::unroll_nest(8, &[("i", "MJ"), ("n", "NT"), ("e", "4")], false, "acc[i][n][e] += c[i][n][e] * s[i][e >> 1];"),
+        r##"        if (it + 1 < nc) {
+"##.to_string(),
+        prim::unroll_nest(12, &[("i", "MJ"), ("h", "2")], true, r##"q[i][h][0] = nq[i][h][0];
+q[i][h][1] = nq[i][h][1];
+s[i][h] = ns[i][h];
+"##),
+        r##"        }
+    }
+"##.to_string(),
+        prim::batch_epilogue("f8b", "acc[i][n][e]", "BIAS ? v + bias[r] : v"),
+        prim::batch_reduce("f8b", true),
     ]
     .concat()
 }

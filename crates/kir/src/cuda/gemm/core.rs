@@ -37,14 +37,9 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
     static_assert(NJ % 2 == 0, "warp n tile");
     static_assert(STAGES >= 2, "pipeline depth");
     extern __shared__ __align__(16) unsigned char gemm_smem[];
-    int tid = threadIdx.x;
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    int g = lane >> 2;
-    int t = lane & 3;
-    int wm = warp / WN;
-    int wn = warp % WN;
-    int m0 = (MFAST ? blockIdx.x : blockIdx.y) * BM;
+"##.to_string(),
+        prim::thread_ids(true),
+        r##"    int m0 = (MFAST ? blockIdx.x : blockIdx.y) * BM;
     int n0 = (MFAST ? blockIdx.y : blockIdx.x) * BN;
     float acc[MI][NJ][4];
 "##.to_string(),
@@ -61,38 +56,32 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
     }
     auto load_stage = [&](int buf, int kt) {
         unsigned char* base = gemm_smem + buf * STAGE_BYTES;
-#pragma unroll
-        for (int i = 0; i < A_ITERS; i++) {
-            int idx = tid + i * THREADS;
-            if (A_ITERS * THREADS != A_TOTAL && idx >= A_TOTAL) break;
-            int p = idx / (BM * A_CHUNKS);
-            int rem = idx % (BM * A_CHUNKS);
-            int r = rem / A_CHUNKS;
-            int c = rem % A_CHUNKS;
-            int m = m0 + r;
-            const bf16_t* src = (p ? x_lo : x_hi) + (size_t)min(m, last_row) * K + kt * BK + c * 8;
-            cp_async16_zfill(base + p * A_TILE * 2 + swz<CPR>(r, c) * 16, src, m < tokens);
-        }
-        unsigned char* ws = base + A_BYTES;
-#pragma unroll
-        for (int i = 0; i < W_ITERS; i++) {
-            int idx = tid + i * THREADS;
-            if (W_ITERS * THREADS != BN * W_CHUNKS && idx >= BN * W_CHUNKS) break;
-            int r = idx / W_CHUNKS;
-            int ck = idx % W_CHUNKS;
-            int n = min(n0 + r, N - 1);
-            D::template load<K, BK, CPR, WROW>(ws, w, scales, r, n, kt, ck);
-        }
-    };
+"##.to_string(),
+        prim::cp_async_stage(
+            "A_ITERS",
+            "A_TOTAL",
+            "A_CHUNKS",
+            "c",
+            true,
+            "int m = m0 + r;\nconst bf16_t* src = (p ? x_lo : x_hi) + (size_t)min(m, last_row) * K + kt * BK + c * 8;\n",
+            &prim::cp_async_call("cp_async16_zfill", &["base + p * A_TILE * 2 + swz<CPR>(r, c) * 16", "src", "m < tokens"]),
+        ),
+        r##"        unsigned char* ws = base + A_BYTES;
+"##.to_string(),
+        prim::cp_async_stage(
+            "W_ITERS",
+            "BN * W_CHUNKS",
+            "W_CHUNKS",
+            "ck",
+            false,
+            "int n = min(n0 + r, N - 1);\n",
+            &prim::cp_async_call("D::template load<K, BK, CPR, WROW>", &["ws", "w", "scales", "r", "n", "kt", "ck"]),
+        ),
+        r##"    };
 "##.to_string(),
         prim::pipeline_prologue("KT", "load_stage(st, st)"),
-        r##"    for (int kt = 0; kt < KT; kt++) {
-        cp_async_wait<STAGES - 2>();
-        __syncthreads();
-        int next = kt + STAGES - 1;
-        if (next < KT) load_stage(next % STAGES, next);
-        cp_async_commit();
-        const unsigned char* base = gemm_smem + (kt % STAGES) * STAGE_BYTES;
+        prim::mainloop_head(),
+        r##"        const unsigned char* base = gemm_smem + (kt % STAGES) * STAGE_BYTES;
         const bf16_t* a_hi = (const bf16_t*)base;
         const bf16_t* a_lo = a_hi + A_TILE;
         const unsigned char* ws = base + A_BYTES;
@@ -138,61 +127,26 @@ __device__ __forceinline__ void gemm_tc(const void* w, const void* scales, const
                 if (SPLIT) ldsm_x4(al[i], &a_lo[at]);
             }
             if (DIRECT) {
-#pragma unroll
-                for (int i = 0; i < MI; i++)
-#pragma unroll
-                    for (int j = 0; j < NJ; j++) {
-                        if (SPLIT) mma_bf16(acc[i][j], al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
-                        mma_bf16(acc[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-                    }
-            } else if (SPLIT && SCALED) {
-#pragma unroll
-                for (int i = 0; i < MI; i++)
-#pragma unroll
-                    for (int j = 0; j < NJ; j++) {
-                        float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        mma_bf16(c, al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
-                        mma_bf16(c, ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-                        acc[i][j][0] += c[0] * s0[j];
-                        acc[i][j][1] += c[1] * s1[j];
-                        acc[i][j][2] += c[2] * s0[j];
-                        acc[i][j][3] += c[3] * s1[j];
-                    }
-            } else if (SPLIT) {
-#pragma unroll
-                for (int i = 0; i < MI; i++)
-#pragma unroll
-                    for (int j = 0; j < NJ; j++) {
-                        mma_bf16(part[i][j], al[i][0], al[i][1], al[i][2], al[i][3], bw[j][0], bw[j][1]);
-                        mma_bf16(part[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-                    }
-            } else if (!SCALED) {
-#pragma unroll
-                for (int i = 0; i < MI; i++)
-#pragma unroll
-                    for (int j = 0; j < NJ; j++) mma_bf16(acc[i][j], ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-            } else {
-#pragma unroll
-                for (int i = 0; i < MI; i++)
-#pragma unroll
-                    for (int j = 0; j < NJ; j++) {
-                        float c[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-                        mma_bf16(c, ah[i][0], ah[i][1], ah[i][2], ah[i][3], bw[j][0], bw[j][1]);
-                        acc[i][j][0] += c[0] * s0[j];
-                        acc[i][j][1] += c[1] * s1[j];
-                        acc[i][j][2] += c[2] * s0[j];
-                        acc[i][j][3] += c[3] * s1[j];
-                    }
-            }
+"##.to_string(),
+        prim::mma_tile(16, "acc[i][j]", prim::Lo::IfSplit, false),
+        r##"            } else if (SPLIT && SCALED) {
+"##.to_string(),
+        prim::mma_tile(16, "acc[i][j]", prim::Lo::Always, true),
+        r##"            } else if (SPLIT) {
+"##.to_string(),
+        prim::mma_tile(16, "part[i][j]", prim::Lo::Always, false),
+        r##"            } else if (!SCALED) {
+"##.to_string(),
+        prim::mma_tile(16, "acc[i][j]", prim::Lo::No, false),
+        r##"            } else {
+"##.to_string(),
+        prim::mma_tile(16, "acc[i][j]", prim::Lo::No, true),
+        r##"            }
         }
         if (SPLIT && !SCALED && !DIRECT) {
-#pragma unroll
-            for (int i = 0; i < MI; i++)
-#pragma unroll
-                for (int j = 0; j < NJ; j++)
-#pragma unroll
-                    for (int e = 0; e < 4; e++) acc[i][j][e] += part[i][j][e];
-        }
+"##.to_string(),
+        prim::unroll_nest(12, &[("i", "MI"), ("j", "NJ"), ("e", "4")], false, "acc[i][j][e] += part[i][j][e];"),
+        r##"        }
     }
     cp_async_wait<0>();
     D::finish(acc, scales);
@@ -243,51 +197,45 @@ __device__ __forceinline__ void gemm_epilogue_at(float (&acc)[BM / WM / 16][BN /
     int wn = warp % WN;
     if (EPI == EPI_ACT) {
         static_assert(EPI != EPI_ACT || N % 4 == 0, "gate/up pairs");
+"##.to_string(),
+        prim::unroll_nest(8, &[("i", "MI"), ("j", "NJ")], true, r##"int col = n0 + wn * TN + j * 8 + 2 * t;
 #pragma unroll
-        for (int i = 0; i < MI; i++)
-#pragma unroll
-            for (int j = 0; j < NJ; j++) {
-                int col = n0 + wn * TN + j * 8 + 2 * t;
-#pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    int m = m0 + wm * TM + i * 16 + g + h * 8;
-                    float a = activation(acc[i][j][h * 2]) * acc[i][j][h * 2 + 1];
-                    float b = __shfl_xor_sync(0xffffffff, a, 1);
-                    if ((t & 1) == 0 && col < N && m < tokens)
-                        split_store2(out_hi, out_lo, (size_t)m * (N / 2) + col / 2, a, b);
-                }
-            }
-        return;
-    }
-#pragma unroll
-    for (int i = 0; i < MI; i++)
-#pragma unroll
-        for (int j = 0; j < NJ; j++) {
-            int col = n0 + wn * TN + j * 8 + 2 * t;
-            if (col >= N) continue;
-            float b0 = 0.0f, b1 = 0.0f;
-            if (BIAS) {
-                b0 = bias[col];
-                b1 = col + 1 < N ? bias[col + 1] : 0.0f;
-            }
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                int m = m0 + wm * TM + i * 16 + g + h * 8;
-                if (m >= tokens) continue;
-                float v0 = acc[i][j][h * 2] + b0;
-                float v1 = acc[i][j][h * 2 + 1] + b1;
-                {
-                    float* o = out + (size_t)m * N + col;
-                    if (EPI == EPI_RESIDUAL) {
-                        v0 += o[0];
-                        if (col + 1 < N) v1 += o[1];
-                    }
-                    o[0] = v0;
-                    if (col + 1 < N) o[1] = v1;
-                }
-            }
-        }
+for (int h = 0; h < 2; h++) {
+    int m = m0 + wm * TM + i * 16 + g + h * 8;
+    float a = activation(acc[i][j][h * 2]) * acc[i][j][h * 2 + 1];
+    float b = __shfl_xor_sync(0xffffffff, a, 1);
+    if ((t & 1) == 0 && col < N && m < tokens)
+        split_store2(out_hi, out_lo, (size_t)m * (N / 2) + col / 2, a, b);
 }
+"##),
+        r##"        return;
+    }
+"##.to_string(),
+        prim::unroll_nest(4, &[("i", "MI"), ("j", "NJ")], true, r##"int col = n0 + wn * TN + j * 8 + 2 * t;
+if (col >= N) continue;
+float b0 = 0.0f, b1 = 0.0f;
+if (BIAS) {
+    b0 = bias[col];
+    b1 = col + 1 < N ? bias[col + 1] : 0.0f;
+}
+#pragma unroll
+for (int h = 0; h < 2; h++) {
+    int m = m0 + wm * TM + i * 16 + g + h * 8;
+    if (m >= tokens) continue;
+    float v0 = acc[i][j][h * 2] + b0;
+    float v1 = acc[i][j][h * 2 + 1] + b1;
+    {
+        float* o = out + (size_t)m * N + col;
+        if (EPI == EPI_RESIDUAL) {
+            v0 += o[0];
+            if (col + 1 < N) v1 += o[1];
+        }
+        o[0] = v0;
+        if (col + 1 < N) o[1] = v1;
+    }
+}
+"##),
+        r##"}
 
 __device__ __forceinline__ void mma_e4m3(float* c, const unsigned* a, unsigned b0, unsigned b1) {
 #if __CUDA_ARCH__ >= 890
