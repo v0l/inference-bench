@@ -35,7 +35,7 @@ fn yarn_tables_match_transformers_for_qwen3_8_at_the_context_boundaries() {
         let rot = spec.rotary_dim();
         assert_eq!(rot, 64, "{name}");
         let scaling = spec.rope.scaling.as_ref().unwrap();
-        let ours = yarn_inv_freq(spec.rope.theta, rot, scaling);
+        let ours = yarn_inv_freq(spec.theta(), rot, scaling);
         let want = floats(&case["inv_freq"]);
         assert_eq!(ours.len(), want.len(), "{name}");
         for (i, (a, b)) in ours.iter().zip(&want).enumerate() {
@@ -62,8 +62,8 @@ fn yarn_tables_match_transformers_for_qwen3_8_at_the_context_boundaries() {
 fn yarn_leaves_the_fast_dimensions_alone_and_stretches_the_slow_ones_by_the_factor() {
     let case = &reference()["cases"][0];
     let spec = spec_for(&case["rope_parameters"]);
-    let f = yarn_inv_freq(spec.rope.theta, spec.rotary_dim(), spec.rope.scaling.as_ref().unwrap());
-    let plain = |i: usize| 1.0 / spec.rope.theta.powf(2.0 * i as f64 / spec.rotary_dim() as f64);
+    let f = yarn_inv_freq(spec.theta(), spec.rotary_dim(), spec.rope.scaling.as_ref().unwrap());
+    let plain = |i: usize| 1.0 / spec.theta().powf(2.0 * i as f64 / spec.rotary_dim() as f64);
     assert_eq!(f[0], plain(0));
     let last = f.len() - 1;
     assert!((f[last] * 4.0 - plain(last)).abs() < 1e-12 * plain(last));

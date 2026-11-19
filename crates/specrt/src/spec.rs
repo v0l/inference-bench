@@ -619,7 +619,8 @@ pub struct Attention {
 #[serde(deny_unknown_fields)]
 pub struct Rope {
     pub style: RopeStyle,
-    pub theta: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theta: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaling: Option<RopeScaling>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -735,6 +736,7 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "model_type", "hidden_size", "intermediate_size", "moe_intermediate_size", "shared_expert_intermediate_size", "num_experts",
     "num_experts_per_tok", "mlp_only_layers", "decoder_sparse_step", "norm_topk_prob", "num_hidden_layers", "num_attention_heads", "num_key_value_heads",
     "head_dim", "vocab_size", "rms_norm_eps", "rope_theta", "hidden_act", "hidden_activation", "tie_word_embeddings", "attention_bias",
+    "n_shared_experts", "first_k_dense_replace", "n_routed_experts", "num_nextn_predict_layers", "linear_attn_config",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
     "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "embedding_multiplier", "attention_multiplier", "residual_multiplier", "logits_scaling", "no_rope_layers", "no_rope_layer_interval", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config",
@@ -763,6 +765,9 @@ struct HfConfig {
     shared_expert_intermediate_size: Option<usize>,
     num_experts: Option<usize>,
     num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    n_shared_experts: Option<usize>,
+    first_k_dense_replace: Option<usize>,
     #[serde(default)]
     mlp_only_layers: Vec<usize>,
     decoder_sparse_step: Option<usize>,
@@ -1278,7 +1283,8 @@ impl Spec {
                 .and_then(|(_, v)| v.get("rope_theta")?.as_f64())
         };
         let local_theta = by_block(Block::Sliding).or_else(|| family.rope.local_theta_key.as_deref().and_then(|k| value.get(k)?.as_f64()));
-        let theta = hf.rope_theta.or(param("rope_theta")).or(by_block(Block::Full)).context("no rope_theta")?;
+        let theta = hf.rope_theta.or(param("rope_theta")).or(by_block(Block::Full));
+        let theta = if strict { Some(theta.context("no rope_theta")?) } else { theta };
         let mapped = hf.hidden_act.as_deref().and_then(|a| family.activation.map.get(a).copied());
         let activation = match (mapped, hf.hidden_act.as_deref(), strict) {
             (Some(a), _, _) => a,
@@ -1303,7 +1309,7 @@ impl Spec {
         };
         let (qkv_bias, qk_norm, output_gate) = attn_flags;
         let multiplier = |key: &Option<String>| key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_f64());
-        let head_dim = hf.head_dim.unwrap_or(hf.hidden_size / hf.num_attention_heads);
+        let head_dim = hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads);
         let rotary_dim = hf
             .partial_rotary_factor
             .or(param("partial_rotary_factor"))
@@ -1326,32 +1332,45 @@ impl Spec {
         };
         let linear_attention = if pattern.iter().any(|b| b.is_linear()) {
             let need = |v: Option<usize>, key: &str| v.with_context(|| format!("no {key}"));
-            Some(LinearAttention {
-                kind: LinearKind::GatedDeltaNet,
-                key_heads: need(hf.linear_num_key_heads, "linear_num_key_heads")?,
-                value_heads: need(hf.linear_num_value_heads, "linear_num_value_heads")?,
-                key_head_dim: need(hf.linear_key_head_dim, "linear_key_head_dim")?,
-                value_head_dim: need(hf.linear_value_head_dim, "linear_value_head_dim")?,
-                conv_kernel: need(hf.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
-                v_heads: VHeadOrder::Grouped,
-            })
+            let dims: Result<LinearAttention> = (|| {
+                Ok(LinearAttention {
+                    kind: LinearKind::GatedDeltaNet,
+                    key_heads: need(hf.linear_num_key_heads, "linear_num_key_heads")?,
+                    value_heads: need(hf.linear_num_value_heads, "linear_num_value_heads")?,
+                    key_head_dim: need(hf.linear_key_head_dim, "linear_key_head_dim")?,
+                    value_head_dim: need(hf.linear_value_head_dim, "linear_value_head_dim")?,
+                    conv_kernel: need(hf.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
+                    v_heads: VHeadOrder::Grouped,
+                })
+            })();
+            if strict { Some(dims?) } else { dims.ok() }
         } else {
             None
         };
         let moe = match (hf.num_experts, hf.moe_intermediate_size) {
-            (Some(experts), Some(expert_intermediate)) if experts > 0 => Some(Moe {
-                experts,
-                active: hf.num_experts_per_tok,
-                expert_intermediate,
-                shared_intermediate: hf.shared_expert_intermediate_size.unwrap_or(0),
-                dense_layers: hf.mlp_only_layers.clone(),
-                sparse_step: hf.decoder_sparse_step.unwrap_or(1),
-                router: RouterAct::Softmax,
-                norm_topk: hf.norm_topk_prob.unwrap_or(hybrid),
-                shared_gate: hf.shared_expert_intermediate_size.unwrap_or(0) > 0,
-                tp_split: TpSplit::Auto,
-                local: None,
-            }),
+            (Some(experts), Some(expert_intermediate)) if experts > 0 => {
+                let shared = hf
+                    .shared_expert_intermediate_size
+                    .or_else(|| hf.n_shared_experts.filter(|n| *n > 0).map(|n| n * expert_intermediate))
+                    .unwrap_or(0);
+                let mut dense = hf.mlp_only_layers.clone();
+                dense.extend(0..hf.first_k_dense_replace.unwrap_or(0));
+                dense.sort_unstable();
+                dense.dedup();
+                Some(Moe {
+                    experts,
+                    active: hf.num_experts_per_tok,
+                    expert_intermediate,
+                    shared_intermediate: shared,
+                    dense_layers: dense,
+                    sparse_step: hf.decoder_sparse_step.unwrap_or(1),
+                    router: RouterAct::Softmax,
+                    norm_topk: hf.norm_topk_prob.unwrap_or(hybrid),
+                    shared_gate: hf.n_shared_experts.is_some_and(|n| n > 0) || shared > 0,
+                    tp_split: TpSplit::Auto,
+                    local: None,
+                })
+            }
             _ => None,
         };
         let spec = Spec {
@@ -1524,6 +1543,7 @@ impl Spec {
             );
         }
         ensure!(rot > 0 && rot.is_multiple_of(2) && rot <= a.head_dim, "rotary_dim must be even and at most head_dim");
+        ensure!(self.rope.theta.is_some(), "rope theta is required to run (theta is unknown)");
         let has_linear = self.layers.pattern.iter().any(|b| b.is_linear());
         match (&self.linear_attention, has_linear) {
             (None, true) => bail!("a linear layer in the pattern needs a [linear_attention] section"),
@@ -1593,6 +1613,10 @@ impl Spec {
 
     pub fn nope(&self, layer: usize) -> bool {
         self.rope.nope_layers.contains(&layer)
+    }
+
+    pub fn theta(&self) -> f64 {
+        self.rope.theta.unwrap_or(10_000.0)
     }
 
     pub fn block(&self, layer: usize) -> Block {
@@ -1669,7 +1693,7 @@ impl Spec {
                 mscale: 1.0,
             },
             (RopeScalingKind::Yarn, Some(y)) => {
-                let (low, high) = yarn_correction_range(self.rope.theta, self.rotary_dim(), original, y);
+                let (low, high) = yarn_correction_range(self.theta(), self.rotary_dim(), original, y);
                 RopeConstants { kind: 3, factor: s.factor, low, high, original, mscale: y.attention_factor }
             }
             (RopeScalingKind::Longrope, _) => RopeConstants { kind: 4, factor: s.factor, low: 1.0, high: 1.0, original, mscale: s.longrope.as_ref().map_or(1.0, |l| l.attention_factor) },

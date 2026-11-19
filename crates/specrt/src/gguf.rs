@@ -493,7 +493,7 @@ impl Gguf {
                 qk_norm_full: false,
                 fused_qkv: false,
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling: self.rope_scaling(family, head_dim)?, mrope, local_theta: None, nope_layers: Vec::new() },
+            rope: Rope { style: RopeStyle::Neox, theta: Some(theta), scaling: self.rope_scaling(family, head_dim)?, mrope, local_theta: None, nope_layers: Vec::new() },
             mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, fused_gate_up: false },
             moe,
             linear_attention,
@@ -1291,7 +1291,7 @@ mod tests {
         assert_eq!((s.dims.hidden, s.dims.intermediate, s.dims.vocab, s.dims.tie_embeddings), (8, 16, 16, true));
         assert_eq!((s.layers.count, s.attention.heads, s.attention.kv_heads, s.attention.head_dim), (2, 4, 2, 4));
         assert!(s.attention.qk_norm && !s.attention.qkv_bias);
-        assert_eq!((s.rope.theta, s.norm.eps as f32, s.quant), (1000000.0, 1e-6, Quant::Bf16));
+        assert_eq!((s.rope.theta, s.norm.eps as f32, s.quant), (Some(1000000.0), 1e-6, Quant::Bf16));
         assert!(s.rope.scaling.is_none() && s.attention.rotary_dim.is_none());
     }
 

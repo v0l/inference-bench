@@ -91,7 +91,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::at
         eps: spec.norm.eps,
         rope: kir::attention::RopeShape {
             rotary_dim: spec.rotary_dim(),
-            theta: spec.rope.theta,
+            theta: spec.theta(),
             kind: rope.kind,
             factor: rope.factor,
             low: rope.low,
@@ -108,7 +108,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::at
         query_scale: spec.attention.query_scalar.map_or(1.0 / (a.head_dim as f64).sqrt(), |q| 1.0 / q.sqrt()),
         softcap: spec.attention.softcap.unwrap_or(0.0),
         bidirectional: spec.vision.as_ref().is_some_and(|v| v.config.bidirectional),
-        local_theta: spec.rope.local_theta.unwrap_or(spec.rope.theta),
+        local_theta: spec.rope.local_theta.unwrap_or_else(|| spec.theta()),
         nope: (0..spec.layers.count).filter(|&i| !spec.block(i).is_linear()).map(|i| spec.nope(i)).chain(std::iter::repeat_n(false, spec.speculative().map_or(0, |m| m.layers) + 1)).collect(),
         local_rope: (0..spec.layers.count)
             .filter(|&i| !spec.block(i).is_linear())
@@ -131,7 +131,7 @@ pub fn attention_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::
         .flag("qk_norm", a.qk_norm && !a.qk_norm_full)
         .num("norm_eps", spec.norm.eps)
         .num("rotary_dim", spec.rotary_dim() as f64)
-        .num("rope_theta", spec.rope.theta)
+        .num("rope_theta", spec.theta())
         .num("rope_kind", rope.kind as f64)
         .num("rope_factor", rope.factor)
         .num("rope_low", rope.low)

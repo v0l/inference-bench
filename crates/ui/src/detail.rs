@@ -585,6 +585,39 @@ mod tests {
         let entries = crate::table::entries(&view);
         assert!(entries.iter().any(|e| e.field == "intermediate" && e.value == "unknown"));
     }
+
+    #[test]
+    fn the_glm5_3_flash_config_opens_with_what_the_config_states_and_unknown_where_it_is_silent() {
+        let models = fixture_models();
+        let m = models.iter().find(|m| m.name == "glm5.3-flash").unwrap();
+        let view = Detail::open(m).view.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(view.spec.rope.theta, None);
+        assert_eq!(view.anatomy.count(LayerKind::DeltaNet), 34, "every linear_attention layer");
+        assert_eq!(view.anatomy.count(LayerKind::Attention), 11, "every deepseek_sparse_attention layer");
+        let entries = crate::table::entries(&view);
+        let at = |f: &str| entries.iter().find(|e| e.field == f).map(|e| e.value.clone());
+        assert_eq!(at("theta").as_deref(), Some("unknown"));
+        assert_eq!(at("head_dim").as_deref(), Some("64"));
+        assert_eq!(at("conv_kernel").as_deref(), Some("4"), "read from linear_attn_config");
+        assert_eq!(at("experts").as_deref(), Some("288"), "read from n_routed_experts");
+        assert_eq!(at("mtp").as_deref().map(|v| v.starts_with("1 layer")), Some(true), "num_nextn_predict_layers");
+        let view = with_config_field(m, "max_position_embeddings", serde_json::json!(8192));
+        assert_eq!(view.anatomy.max_context, 8192);
+    }
+
+    fn with_config_field(m: &LocalModel, key: &str, value: Value) -> View {
+        let json = std::fs::read_to_string(m.path.join("config.json")).unwrap();
+        let mut v: Value = serde_json::from_str(&json).unwrap();
+        if v.get("text_config").is_some_and(|t| t.is_object()) {
+            v["text_config"][key] = value;
+        } else {
+            v.as_object_mut().unwrap().insert(key.to_string(), value);
+        }
+        let dir = std::env::temp_dir().join(format!("ib-detail-glmfield-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), v.to_string()).unwrap();
+        Detail::open(&local("glm5.3-flash", &dir)).view.unwrap_or_else(|e| panic!("{e}"))
+    }
 }
 
 fn block_section(ui: &mut egui::Ui, view: &View, _kind: LayerKind, layer: Option<usize>, layer_for_block: usize, diagram: &mut Diagram) {

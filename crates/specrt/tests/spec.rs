@@ -656,3 +656,28 @@ fn modelopt_mixed_config_maps_quant_algos_to_the_same_kernels() {
     let nvfp4 = Spec::from_hf_config_serving(&core_fixture("nvfp4-qwen3.8-27b-config.json")).unwrap();
     assert_eq!((nvfp4.quant, nvfp4.mlp.quant), (Quant::Fp8Channel, Some(Quant::Nvfp4G16)));
 }
+
+#[test]
+fn glm5_3_flash_describes_with_its_glm_keys_and_refuses_to_serve() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/glm5.3-flash.config.json")).unwrap();
+    let spec = Spec::describe_hf_config(&json).unwrap();
+    assert_eq!(spec.rope.theta, None, "glm5.3 has no rope_theta");
+    assert_eq!(spec.theta(), 10_000.0);
+    assert_eq!(spec.attention.head_dim, 4096 / 64, "head_dim 0 falls back to hidden / heads");
+    assert_eq!(spec.layers.pattern.len(), 45, "the 3-then-1 rhythm has no period that divides 45");
+    assert!(spec.layers.pattern.iter().enumerate().all(|(i, b)| if i % 4 == 3 { *b == Block::Full } else { b.is_linear() }), "deepseek_sparse_attention is full, linear_attention is linear");
+    let la = spec.linear_attention.as_ref().unwrap();
+    assert_eq!((la.key_heads, la.value_heads, la.key_head_dim, la.conv_kernel), (64, 64, 128, 4), "read from linear_attn_config");
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.active, moe.expert_intermediate), (288, Some(8), 2048));
+    assert_eq!(moe.shared_intermediate, 1 * 2048, "n_shared_experts x moe_intermediate_size");
+    assert_eq!(moe.dense_layers, vec![0, 1, 2], "first_k_dense_replace");
+    assert!(moe.shared_gate);
+    assert_eq!(spec.speculative().map(|m| m.layers), Some(1), "num_nextn_predict_layers");
+    assert!(spec.runnable().is_err(), "glm5.3 cannot run yet (no family spec, no rope theta)");
+    let mut no_theta = derived("qwen3-0.6b.config.json");
+    no_theta.rope.theta = None;
+    assert!(no_theta.runnable().unwrap_err().to_string().contains("rope theta is required to run"));
+    let refusal = Spec::from_hf_config_serving(&json).unwrap_err().to_string();
+    assert!(refusal.contains("model_type glm5_next is not supported"), "{refusal}");
+}

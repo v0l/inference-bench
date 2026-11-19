@@ -40,7 +40,7 @@ fn the_gemma3_config_maps_by_spec_alone() {
     assert_eq!(spec.dims.logit_softcap, Some(30.0));
     assert_eq!(spec.attention.softcap, Some(50.0));
     assert_eq!(spec.rope.local_theta, Some(10000.0));
-    assert_eq!(spec.rope.theta, 1000000.0);
+    assert_eq!(spec.rope.theta, Some(1000000.0));
     assert_eq!(spec.dims.embed_scale, Some((128f64).sqrt()));
     assert_eq!(spec.layers.pattern.len(), 3);
     assert!(spec.layers.pattern.contains(&Block::Sliding));
@@ -140,7 +140,7 @@ fn the_gemma3_1b_config_without_layer_types_gets_the_five_to_one_pattern() {
     assert_eq!(spec.layers.pattern.iter().filter(|b| **b == Block::Full).count(), 4);
     assert_eq!(spec.layers.window, Some(512));
     assert_eq!(spec.rope.local_theta, Some(10000.0));
-    assert_eq!(spec.rope.theta, 1000000.0);
+    assert_eq!(spec.rope.theta, Some(1000000.0));
     assert!(spec.dims.tie_embeddings);
     assert_eq!(spec.block(25), Block::Sliding);
     assert_eq!(spec.block(5), Block::Full);
