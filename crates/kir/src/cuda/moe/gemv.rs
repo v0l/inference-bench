@@ -19,6 +19,27 @@ fn dot_fp4(k: &str) -> String {
     )
 }
 
+fn dot_mx() -> &'static str {
+    r##"        const unsigned char* wb = (const unsigned char*)w + at * (K / 2);
+        const unsigned char* sb = s + at * (K / MOE_BLOCK);
+        for (int grp = lane; grp < K / MOE_BLOCK; grp += 32) {
+            float part = 0.0f;
+#pragma unroll
+            for (int c = 0; c < MOE_BLOCK / 32; c++) {
+                uint4 q = *(const uint4*)(wb + (size_t)grp * (MOE_BLOCK / 2) + c * 16);
+                const float* x = xs + grp * MOE_BLOCK + c * 32;
+#pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    unsigned word = j < 4 ? q.x : j < 8 ? q.y : j < 12 ? q.z : q.w;
+                    unsigned byte = (word >> (8 * (j & 3))) & 0xffu;
+                    part += moe_e2m1(byte & 0xfu) * x[2 * j] + moe_e2m1(byte >> 4) * x[2 * j + 1];
+                }
+            }
+            acc += part * __uint_as_float((unsigned)sb[grp] << 23);
+        }
+"##
+}
+
 fn dot_fp8() -> &'static str {
     r##"        const unsigned char* wb = (const unsigned char*)w + at * K;
         const float* sg = g + (size_t)expert * MOE_FP8_GRID<ROWS, K> + (row / FP8_BLOCK) * MOE_FP8_KB<K>;
@@ -43,8 +64,9 @@ fn dot() -> String {
             "moe_dot",
             "const void* w, const unsigned char* s, const float* g, int expert, int row, const float* xs, int lane",
             &format!(
-                "    size_t at = (size_t)expert * ROWS + row;\n    float acc = 0.0f;\n    if (Q == 1) {{\n{}    }} else if (Q == 2) {{\n{}    }} else {{\n{}    }}\n    return warp_sum(acc);\n",
+                "    size_t at = (size_t)expert * ROWS + row;\n    float acc = 0.0f;\n    if (Q == 1) {{\n{}    }} else if (Q == 3) {{\n{}    }} else if (Q == 2) {{\n{}    }} else {{\n{}    }}\n    return warp_sum(acc);\n",
                 dot_fp4("K"),
+                dot_mx(),
                 dot_fp8(),
                 dot_bf16()
             )
@@ -77,6 +99,36 @@ fn dot2_fp4() -> &'static str {
         }
 #pragma unroll
         for (int j = 0; j < MOE_TJ; j++) result[j] *= g[expert];
+"##
+}
+
+fn dot2_mx() -> &'static str {
+    r##"        const unsigned char* wb = (const unsigned char*)w + at * (K / 2);
+        const unsigned char* sb = s + at * (K / MOE_BLOCK);
+        for (int grp = lane; grp < K / MOE_BLOCK; grp += 32) {
+            float sc = __uint_as_float((unsigned)sb[grp] << 23);
+#pragma unroll
+            for (int c = 0; c < MOE_BLOCK / 32; c++) {
+                uint4 q = *(const uint4*)(wb + (size_t)grp * (MOE_BLOCK / 2) + c * 16);
+                float v[32];
+#pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    unsigned word = j < 4 ? q.x : j < 8 ? q.y : j < 12 ? q.z : q.w;
+                    unsigned byte = (word >> (8 * (j & 3))) & 0xffu;
+                    v[2 * j] = moe_e2m1(byte & 0xfu);
+                    v[2 * j + 1] = moe_e2m1(byte >> 4);
+                }
+#pragma unroll
+                for (int j = 0; j < MOE_TJ; j++) {
+                    if (j < live) {
+                        float part = 0.0f;
+#pragma unroll
+                        for (int i = 0; i < 32; i++) part += v[i] * xs[j * K + grp * MOE_BLOCK + c * 32 + i];
+                        result[j] += part * sc;
+                    }
+                }
+            }
+        }
 "##
 }
 
@@ -117,8 +169,9 @@ fn dot2() -> String {
             "moe_dot2",
             "const void* w, const unsigned char* s, const float* g, int expert, int row, const float* xs, int lane, int live, float* result",
             &format!(
-                "    size_t at = (size_t)expert * ROWS + row;\n#pragma unroll\n    for (int j = 0; j < MOE_TJ; j++) result[j] = 0.0f;\n    if (Q == 1) {{\n{}    }} else if (Q == 2) {{\n{}    }} else {{\n{}    }}\n#pragma unroll\n    for (int j = 0; j < MOE_TJ; j++) result[j] = warp_sum(result[j]);\n",
+                "    size_t at = (size_t)expert * ROWS + row;\n#pragma unroll\n    for (int j = 0; j < MOE_TJ; j++) result[j] = 0.0f;\n    if (Q == 1) {{\n{}    }} else if (Q == 3) {{\n{}    }} else if (Q == 2) {{\n{}    }} else {{\n{}    }}\n#pragma unroll\n    for (int j = 0; j < MOE_TJ; j++) result[j] = warp_sum(result[j]);\n",
                 dot2_fp4(),
+                dot2_mx(),
                 dot2_fp8(),
                 dot2_bf16()
             )

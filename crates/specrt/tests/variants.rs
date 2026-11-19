@@ -235,8 +235,8 @@ fn the_gpt_oss_checkpoint_decodes_mxfp4_experts_and_loads_every_bias() {
     let w = ck.layer(&spec, 0).unwrap();
     let m = w.moe.unwrap();
     let (h, inter, e) = (256, 256, 8);
-    let specrt::weights::Stacked::Bf16(gate) = &m.gate else { panic!("bf16") };
-    assert_eq!(gate.len(), e * inter * h);
+    let specrt::weights::Stacked::Block { packed, scales } = &m.gate else { panic!("packed") };
+    assert_eq!((packed.len(), scales.len()), (e * inter * h / 2, e * inter * h / 32));
     assert_eq!((m.router_bias.unwrap().len(), m.gate_up_bias.unwrap().len(), m.down_bias.unwrap().len()), (e, e * 2 * inter, e * h));
     let specrt::weights::Mixer::Attention(a) = &w.mixer else { panic!("attention") };
     assert_eq!(a.o_bias.as_ref().unwrap().len(), h);

@@ -63,6 +63,14 @@ impl BlockFormat {
         Ok(())
     }
 
+    pub fn device_packed(&self) -> bool {
+        self.elem == Elem::E2m1 && self.scale == ScaleKind::E8m0 && self.group.is_multiple_of(32)
+    }
+
+    pub fn native_mma(&self) -> bool {
+        self.device_packed() && self.group == 32
+    }
+
     pub fn packed_len(&self, values: usize) -> usize {
         values * self.elem.bits() / 8
     }

@@ -1,6 +1,6 @@
-pub use crate::cuda::gemm::prim::{cp8_zfill, device, e2m1_to_f32, e2m1x2, mma_fp4, swizzle, warp_ids, zero_frag, pipeline_prologue};
+pub use crate::cuda::gemm::prim::{cp4_zfill, cp8_zfill, device, e2m1_to_f32, e2m1x2, mma_fp4, mma_mx, swizzle, warp_ids, zero_frag, pipeline_prologue};
 
-pub const QUANTS: [(u8, &str); 3] = [(0, "bf16"), (1, "fp4"), (2, "fp8")];
+pub const QUANTS: [(u8, &str); 4] = [(0, "bf16"), (1, "fp4"), (2, "fp8"), (3, "mx")];
 
 pub fn global(threads: Option<u32>, name: &str, args: &str, body: &str) -> String {
     let bounds = threads.map(|t| format!(" __launch_bounds__({t})")).unwrap_or_default();
@@ -13,8 +13,8 @@ pub fn delegate(threads: u32, name: &str, args: &str, target: &str, call: &str) 
 
 pub fn constants(m: &crate::ops::MoeShape) -> String {
     format!(
-        "constexpr int MOE_E = {};\nconstexpr int MOE_LOCAL = {};\nconstexpr int MOE_K = {};\nconstexpr int MOE_PAIRS = {};\nconstexpr int MOE_INTER = {};\nconstexpr int MOE_SHARED = {};\nconstexpr bool MOE_NORM_TOPK = {};\nconstexpr float MOE_ROUTED_SCALE = {};\nconstexpr bool MOE_SHARED_GATE = {};\nconstexpr bool MOE_SIGMOID = {};\nconstexpr int MOE_GROUPS = {};\nconstexpr int MOE_TOPK_GROUP = {};\nconstexpr bool MOE_BIAS = {};\nconstexpr bool MOE_ROUTER_BIAS = {};\nconstexpr bool MOE_EBIAS = {};\nconstexpr bool MOE_HASH = {};\n",
-        m.experts, m.local, m.top_k, m.pairs, m.inter, m.shared, m.norm_topk, crate::ops::f32_literal(m.routed_scale), m.shared_gate, m.sigmoid, m.groups.max(1), m.topk_group.max(1), m.score_bias, m.router_bias, m.expert_bias, m.hash
+        "constexpr int MOE_E = {};\nconstexpr int MOE_LOCAL = {};\nconstexpr int MOE_K = {};\nconstexpr int MOE_PAIRS = {};\nconstexpr int MOE_INTER = {};\nconstexpr int MOE_SHARED = {};\nconstexpr bool MOE_NORM_TOPK = {};\nconstexpr float MOE_ROUTED_SCALE = {};\nconstexpr bool MOE_SHARED_GATE = {};\nconstexpr bool MOE_SIGMOID = {};\nconstexpr int MOE_GROUPS = {};\nconstexpr int MOE_TOPK_GROUP = {};\nconstexpr bool MOE_BIAS = {};\nconstexpr bool MOE_ROUTER_BIAS = {};\nconstexpr bool MOE_EBIAS = {};\nconstexpr bool MOE_HASH = {};\nconstexpr int MOE_BLOCK = {};\n",
+        m.experts, m.local, m.top_k, m.pairs, m.inter, m.shared, m.norm_topk, crate::ops::f32_literal(m.routed_scale), m.shared_gate, m.sigmoid, m.groups.max(1), m.topk_group.max(1), m.score_bias, m.router_bias, m.expert_bias, m.hash, if m.block_group == 0 { 32 } else { m.block_group }
     )
 }
 

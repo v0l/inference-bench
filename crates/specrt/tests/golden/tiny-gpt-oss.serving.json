@@ -82,6 +82,7 @@
   },
   "mlp": {
     "activation": "swiglu",
+    "act_quant": "fp4",
     "gated": {
       "expr": "(max(min(u, limit), -limit) + 1.0) * (min(g, limit) * sigmoid(min(g, limit) * alpha))",
       "params": {

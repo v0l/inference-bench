@@ -26,7 +26,11 @@ pub fn emit_moe(kernels: &[MoeKernel]) -> Result<String, String> {
             Family::Experts => out.push_str(&experts(k)),
             Family::GroupedMma => {
                 out.push('\n');
-                out.push_str(&mma::grouped());
+                out.push_str(&mma::grouped(false));
+            }
+            Family::GroupedMx => {
+                out.push('\n');
+                out.push_str(&mma::grouped(true));
             }
         }
     }

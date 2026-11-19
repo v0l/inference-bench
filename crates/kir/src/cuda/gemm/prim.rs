@@ -91,6 +91,30 @@ pub fn mma_fp4(name: &str) -> String {
     )
 }
 
+pub fn mma_mx(name: &str) -> String {
+    device(
+        "void",
+        name,
+        "float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa, unsigned sfb, unsigned short bid",
+        r#"    unsigned short z = 0;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%13}, {%14,%15};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(sfa), "h"(bid), "h"(z), "r"(sfb), "h"(bid), "h"(z));
+"#,
+    )
+}
+
+pub fn cp4_zfill(name: &str) -> String {
+    device(
+        "void",
+        name,
+        "void* smem, const void* gmem, bool valid",
+        "    unsigned s = (unsigned)__cvta_generic_to_shared(smem);\n    int n = valid ? 4 : 0;\n    asm volatile(\"cp.async.ca.shared.global [%0], [%1], 4, %2;\" :: \"r\"(s), \"l\"(gmem), \"r\"(n));\n",
+    )
+}
+
 pub fn e2m1x2(name: &str) -> String {
     device(
         "unsigned",

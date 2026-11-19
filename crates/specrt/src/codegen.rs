@@ -13,10 +13,12 @@ pub const MOE_MMA_KERNELS: &[&str] = kir::moe::Family::GroupedMma.kernels();
 pub use kir::moe::{MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
 
 pub fn moe_mma_enabled(spec: &Spec, target: &kir::Target) -> bool {
-    spec.moe.is_some()
-        && spec.mlp.quant == Some(Quant::Nvfp4G16)
-        && spec.mlp.act_quant == crate::spec::ActQuant::Fp4
-        && target.compute_capability.0 >= 12
+    let Some(m) = &spec.moe else { return false };
+    let weights = match &m.expert_block {
+        Some(block) => block.native_mma(),
+        None => spec.mlp.quant == Some(Quant::Nvfp4G16),
+    };
+    weights && spec.mlp.act_quant == crate::spec::ActQuant::Fp4 && target.compute_capability.0 >= 12
 }
 
 pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::MoeKernel>> {
@@ -38,10 +40,12 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         router_bias: m.router_bias,
         expert_bias: m.expert_bias,
         hash: m.hash_table.is_some(),
+        block_group: m.expert_block.map_or(0, |b| b.group),
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if moe_mma_enabled(spec, target) {
-        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::GroupedMma, shape).map_err(anyhow::Error::msg)?);
+        let family = if m.expert_block.is_some() { kir::moe::Family::GroupedMx } else { kir::moe::Family::GroupedMma };
+        out.push(kir::moe::MoeKernel::new(target, family, shape).map_err(anyhow::Error::msg)?);
     }
     Ok(out)
 }

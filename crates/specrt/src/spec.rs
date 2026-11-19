@@ -1328,11 +1328,6 @@ impl Spec {
         Ok(())
     }
 
-    pub fn expert_tensors(&self) -> Vec<String> {
-        let shared = self.moe.as_ref().map_or(DEFAULT_SHARED_MODULE, |m| &m.shared_module);
-        vec!["mlp.experts".into(), format!("mlp.{shared}")]
-    }
-
     pub fn complete_from_checkpoint_config(&mut self, json: &str) -> Result<()> {
         if self.vision.is_none() {
             self.vision = crate::vision::Vision::from_hf_config(json)?;
@@ -1406,6 +1401,8 @@ impl Spec {
             (Err(e), true) => return Err(e),
             (Err(_), false) => Quantization::weights(Quant::Bf16),
         };
+        let block_act = family.moe.expert_block.is_some_and(|b| b.native_mma()) && family.moe.act_quant == Some(ActQuant::Fp4);
+        let mlp_act = if block_act { ActQuant::Fp4 } else { mlp_act };
         let experts_nvfp4 = hf.num_experts.is_some_and(|e| e > 0) && quant == Quant::Nvfp4G16;
         let (quant, mlp_quant, act, mlp_act) =
             if experts_nvfp4 { (Quant::Bf16, Some((Quant::Nvfp4G16, None)), ActQuant::None, moe_act(&family.quantization, quant_config.as_ref())) } else { (quant, mlp_quant, act, mlp_act) };
@@ -1663,7 +1660,10 @@ impl Spec {
         }
         match self.mlp.act_quant {
             ActQuant::None => {}
-            ActQuant::Fp4 => ensure!(self.mlp.quant == Some(Quant::Nvfp4G16), "[mlp] act_quant = \"fp4\" needs [mlp] quant = \"nvfp4_g16\""),
+            ActQuant::Fp4 => ensure!(
+                self.mlp.quant == Some(Quant::Nvfp4G16) || self.moe.as_ref().and_then(|m| m.expert_block).is_some_and(|b| b.native_mma()),
+                "[mlp] act_quant = \"fp4\" needs [mlp] quant = \"nvfp4_g16\" or a 32 wide e2m1 e8m0 [moe] expert_block"
+            ),
             ActQuant::Fp8 => bail!("[mlp] act_quant is \"none\" or \"fp4\"; FP8 MLP inputs follow the top-level act_quant"),
         }
         if let Some(m) = &self.rope.mrope {
