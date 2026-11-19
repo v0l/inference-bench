@@ -457,7 +457,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 pub const COOP_THREADS: u32 = 128;
 pub const COOP_TOKENS: u32 = 64;
 pub const COOP_ROWS: u32 = 64;
-pub const COOP_K: u32 = 16;
+pub const COOP_K: u32 = 32;
 
 pub fn emit_linear_coop_op(s: &crate::ops::WgslShape) -> String {
     let mut out = String::from("enable wgpu_cooperative_matrix;\n");
@@ -484,8 +484,11 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let x_row0 = p.a.w;
     let y_row0 = p.b.x;
     let accumulate = p.b.y;
-    let r0 = wid.x * BN;
-    let t0 = wid.z * BM;
+    let ntt = (tokens + BM - 1u) / BM;
+    let nrt = (nrows + BN - 1u) / BN;
+    let lin = wid.x + wid.z * nrt;
+    let r0 = (lin / ntt) * BN;
+    let t0 = (lin % ntt) * BM;
     let sg = li / 32u;
     let sm = (sg / 2u) * 32u;
     let sn = (sg % 2u) * 32u;
@@ -536,6 +539,21 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                     w1 = d1 * f32((q >> 8u) & 0xfu) - mm;
                     w2 = d1 * f32((q >> 16u) & 0xfu) - mm;
                     w3 = d1 * f32((q >> 24u) & 0xfu) - mm;
+                }} else if (code == 2u) {{
+                    let sb = base + (c / 256u) * 224u;
+                    let i = c % 256u;
+                    let hr = i / 128u;
+                    let r = i % 128u;
+                    let seg = r / 32u;
+                    let l = r % 32u;
+                    let ql = wdata[(sb + 64u * hr + (seg & 1u) * 32u + l) >> 2u] >> (4u * (seg >> 1u));
+                    let qh = wdata[(sb + 128u + 32u * hr + l) >> 2u] >> (2u * seg);
+                    let v = (ql & 0x0f0f0f0fu) | ((qh & 0x03030303u) << 4u);
+                    let dd = wf16(sb + 208u) * wi8(sb + 192u + 8u * hr + r / 16u);
+                    w0 = dd * (f32(v & 0xffu) - 32.0);
+                    w1 = dd * (f32((v >> 8u) & 0xffu) - 32.0);
+                    w2 = dd * (f32((v >> 16u) & 0xffu) - 32.0);
+                    w3 = dd * (f32(v >> 24u) - 32.0);
                 }} else {{
                     w0 = dequant_at(base, code, c);
                     w1 = dequant_at(base, code, c + 1u);
@@ -543,19 +561,23 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
                     w3 = dequant_at(base, code, c + 3u);
                 }}
             }}
-            sh[m * BK + kq * 4u] = xv.x;
-            sh[m * BK + kq * 4u + 1u] = xv.y;
-            sh[m * BK + kq * 4u + 2u] = xv.z;
-            sh[m * BK + kq * 4u + 3u] = xv.w;
-            sh[WOFF + m * BK + kq * 4u] = w0;
-            sh[WOFF + m * BK + kq * 4u + 1u] = w1;
-            sh[WOFF + m * BK + kq * 4u + 2u] = w2;
-            sh[WOFF + m * BK + kq * 4u + 3u] = w3;
+            let so = ((m / 8u) * (BK / 8u) + (kq * 4u) / 8u) * 64u + (m % 8u) * 8u + (kq * 4u) % 8u;
+            sh[so] = xv.x;
+            sh[so + 1u] = xv.y;
+            sh[so + 2u] = xv.z;
+            sh[so + 3u] = xv.w;
+            sh[WOFF + so] = w0;
+            sh[WOFF + so + 1u] = w1;
+            sh[WOFF + so + 2u] = w2;
+            sh[WOFF + so + 3u] = w3;
         }}
         workgroupBarrier();
         for (var kk = 0u; kk < BK; kk += 8u) {{
 {mma}        }}
         workgroupBarrier();
+    }}
+    if (accumulate == 0u && r0 + BN <= nrows && t0 + BM <= tokens) {{
+{direct}        return;
     }}
 {store}    workgroupBarrier();
     for (var e = li; e < BM * BN; e += {COOP_THREADS}u) {{
@@ -580,6 +602,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         quads = COOP_K * COOP_TOKENS / 4 / COOP_THREADS,
         acc_init = (0..16).map(|n| format!("    var acc{n} = coop_mat8x8<f32, C>();\n")).collect::<String>(),
         mma = coop_mma(),
+        direct = (0..16).map(|n| format!("        coopStoreT(acc{n}, &y[(y_row0 + t0 + sm + {}u) * nrows + r0 + sn + {}u], nrows);\n", (n / 4) * 8, (n % 4) * 8)).collect::<String>(),
         store = (0..16).map(|n| format!("    coopStoreT(acc{n}, &sh[(sm + {}u) * BN + sn + {}u], BN);\n", (n / 4) * 8, (n % 4) * 8)).collect::<String>(),
     )
 }
@@ -587,8 +610,8 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 fn coop_mma() -> String {
     let mut s = String::new();
     for i in 0..4 {
-        s.push_str(&format!("            let a{i} = coopLoadT<coop_mat8x8<f32, A>>(&sh[(sm + {}u) * BK + kk], BK);\n", i * 8));
-        s.push_str(&format!("            let b{i} = coopLoad<coop_mat8x8<f32, B>>(&sh[WOFF + (sn + {}u) * BK + kk], BK);\n", i * 8));
+        s.push_str(&format!("            let a{i} = coopLoadT<coop_mat8x8<f32, A>>(&sh[((sm + {}u) / 8u * (BK / 8u) + kk / 8u) * 64u], 8u);\n", i * 8));
+        s.push_str(&format!("            let b{i} = coopLoad<coop_mat8x8<f32, B>>(&sh[WOFF + ((sn + {}u) / 8u * (BK / 8u) + kk / 8u) * 64u], 8u);\n", i * 8));
     }
     for n in 0..16 {
         s.push_str(&format!("            acc{n} = coopMultiplyAdd(a{}, b{}, acc{n});\n", n / 4, n % 4));

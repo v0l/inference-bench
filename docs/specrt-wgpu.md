@@ -240,3 +240,44 @@ Ceilings measured by skipping the op in decode (Qwen3-0.6B bf16 / Q4_K_M, contex
 | Qwen2.5-7B Q4_K_M | 107.7 / 273.9 = 0.39 (0.37) | 108.1 / 268.9 = 0.40 (0.35) | 12.1 / 28.0 = 0.43 (0.43) |
 
 7B load 8.2 s in this run (3.5 to 7.2 s in the isolated runs), peak 5.95 GB (was 9.1). The 0.5x milestone is met for Qwen3-0.6B bf16 decode only; bf16 prefill is at 0.45 to 0.48. The remaining gap is the GEMM at about 2x off `kernel_mul_mm` (1.7 to 1.9 against 3.5 to 4.2 TFLOP/s) and decode on the quantised models.
+
+## Mac speed work 4 (#823 steps)
+
+### `kernel_mul_mm` against our `linear_coop`
+
+| | llama.cpp `kernel_mul_mm` | ours before |
+|---|---|---|
+| output tile | 64 rows x 32 tokens, 128 threads, each simdgroup holds 8 accumulators (4 weight x 2 token matrices) | 64 x 64, 16 accumulators per simdgroup |
+| k step | 32 per barrier pair | 16 |
+| tile layout | 8x8 blocks stored contiguously (64 elements, stride 8), so each `simdgroup_load` reads one contiguous 128 B block | row-major, stride BK, so each 8x8 load strides across rows |
+| tile type | half | f32 |
+| barriers per k step | 2 | 2 |
+| Q4_K/Q6_K | dequantised 16 values per thread into registers, written to the tile | Q4_K inline, Q6_K through the per-element `dequant_at` |
+| output | `simdgroup_store` straight to device memory when the tile is in bounds | always through workgroup memory |
+| GEMV (`kernel_mul_mv_q4_K_f32`) | 2 simdgroups x 2 rows each, x held in registers (yl, yh) and reused across the rows, nibbles masked in place (no shifts) and the scale applied after the dot | 4 rows per workgroup, one row per simdgroup |
+
+### Steps (M1 Pro, `linear_coop_time_per_dispatch`, m=4096 n=512 k=14336, TFLOP/s)
+
+| Step | bf16 | Q4_K | Q6_K | Kept |
+|---|---|---|---|---|
+| base | 1.83 | 1.68 | 0.96 | |
+| A: 8x8 block-contiguous tiles | 1.75 | 1.60 | 0.93 | alone no, needed for B |
+| A + k step 32 | 1.88 | 1.73 | 1.00 | yes |
+| + 2D swizzle of the workgroup order (L2 reuse) | 1.95 | 1.76 | 1.00 | yes |
+| + Q6_K decoded four weights at a time | 1.89 | 1.75 | 1.78 | yes |
+| + direct `coopStore` to `y` for full tiles | 1.89 | 1.77 | 1.79 | yes |
+| f16 tiles (f16 matrices) | 1.47 | 1.39 | 0.79 | no, and error 3e-3 |
+| k step 64 | wrong results (workgroup memory over the limit) | | | no |
+
+The 3 TFLOP/s target was not reached: the kernel is still bound by workgroup-memory traffic and issue, and the 64x32 tile was not retried on top of the new layout. The GEMV rewrite and the 7B load profile were not started. wgsl tests 25/25 on the Mac, clippy clean with the wgpu feature.
+
+### `mac_vs_llama.sh` (specrt / llama.cpp tok/s = ratio)
+
+The Mac was loaded by other jobs during this run (llama.cpp decode was far below its usual rate), so decode ratios are not comparable with pass 3.
+
+| Model | Prefill 128 | Prefill 1,024 | Decode |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 880 / 1,376 = 0.64 | 819 / 1,510 = 0.54 | 39.4 / 43.7 = 0.90 (noisy) |
+| Qwen3-0.6B Q4_K_M | 907 / 1,682 = 0.54 | 643 / 1,579 = 0.41 | 44.3 / 47.0 = 0.94 (noisy) |
+| Llama-3.2-1B Q4_K_M | 517 / 879 = 0.59 | 534 / 886 = 0.60 | 35.0 / 62.7 = 0.56 (noisy) |
+| Qwen2.5-7B Q4_K_M | 130 / 274 = 0.47 | 127 / 269 = 0.47 | 12.1 / 28.0 = 0.43 |
