@@ -7,11 +7,13 @@ pub struct ServerSettings {
     pub port: u16,
     pub api_key: String,
     pub lan: bool,
+    #[serde(default)]
+    pub any_model_name: bool,
 }
 
 impl Default for ServerSettings {
     fn default() -> Self {
-        Self { port: 1234, api_key: String::new(), lan: false }
+        Self { port: 1234, api_key: String::new(), lan: false, any_model_name: false }
     }
 }
 

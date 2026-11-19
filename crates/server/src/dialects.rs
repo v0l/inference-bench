@@ -420,7 +420,7 @@ async fn run_messages(state: Arc<AppState>, headers: HeaderMap, body: Value) -> 
     let salt = cache_salt(&headers, "", state_shares_keys(&state));
     let Prepared { p, mut receivers, guard, max_tokens } = prepare(state, chat, true, salt).await?;
     let rx = receivers.remove(0);
-    let mut events = MessageEvents { id: new_id("msg"), model: p.model.clone(), index: 0, open: Open::None, stops: p.stop.clone() };
+    let mut events = MessageEvents { id: new_id("msg"), model: p.shown_model.clone(), index: 0, open: Open::None, stops: p.stop.clone() };
     if p.stream {
         let parser = p.output.parses().then(|| p.output.parser());
         let opening = events.start();
@@ -449,7 +449,7 @@ async fn run_messages(state: Arc<AppState>, headers: HeaderMap, body: Value) -> 
     let stop = anthropic_stop_reason(reason, done.stopped);
     let sequence = if stop == "stop_sequence" { only_stop(&p.stop) } else { Value::Null };
     Ok(Json(json!({
-        "id": events.id, "type": "message", "role": "assistant", "model": p.model, "content": content,
+        "id": events.id, "type": "message", "role": "assistant", "model": p.shown_model, "content": content,
         "stop_reason": stop, "stop_sequence": sequence, "usage": anthropic_usage(&done.generation),
     }))
     .into_response())
@@ -779,7 +779,7 @@ pub(crate) async fn responses(State(state): State<Arc<AppState>>, headers: Heade
     let salt = cache_salt(&headers, "", state_shares_keys(&state));
     let Prepared { p, mut receivers, guard, max_tokens } = prepare(state, chat, true, salt).await?;
     let rx = receivers.remove(0);
-    let mut events = ResponseEvents { id: new_id("resp"), model: p.model.clone(), created: now(), sequence: 0, current: Current::None, output: Vec::new() };
+    let mut events = ResponseEvents { id: new_id("resp"), model: p.shown_model.clone(), created: now(), sequence: 0, current: Current::None, output: Vec::new() };
     if p.stream {
         let parser = p.output.parses().then(|| p.output.parser());
         let head = stream::iter(events.start().into_iter().map(|(n, v)| sse(&n, &v)));
@@ -804,7 +804,7 @@ pub(crate) async fn responses(State(state): State<Arc<AppState>>, headers: Heade
         output.push(call_item(&new_id("fc"), &c.id, &c.name, &c.arguments, "completed"));
     }
     let (status, why) = responses_status(reason);
-    Ok(Json(response_object(&events.id, &p.model, events.created, status, output, response_usage(&done.generation), why)).into_response())
+    Ok(Json(response_object(&events.id, &p.shown_model, events.created, status, output, response_usage(&done.generation), why)).into_response())
 }
 
 fn slot_model(state: &AppState, query: &HashMap<String, String>) -> Option<String> {

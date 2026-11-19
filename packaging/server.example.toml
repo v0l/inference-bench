@@ -5,6 +5,7 @@ queue_depth = 16
 retry_after_secs = 1
 idle_unload_secs = 900
 # lazy_load = true
+# any_model_name = true
 # min_free_vram_mib = 8000
 # before_load = "systemctl stop other-gpu-job"
 max_loaded_models = 1

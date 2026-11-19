@@ -426,13 +426,19 @@ fn the_server_tab_starts_and_serves_the_loaded_model() {
     {
         let app = h.state_mut();
         let handle = app.engine.handle();
-        app.server.start(handle, 0, "", false);
+        app.server.start(handle, 0, "", false, true);
     }
     h.run();
     let url = h.state().server.running.as_ref().expect("server running").url();
     let mut resp = ureq::get(format!("{url}/v1/models")).call().unwrap();
     let v: serde_json::Value = resp.body_mut().read_json().unwrap();
     assert_eq!(v["data"][0]["id"], "Qwen3-0.6B");
+    h.run();
+    let mut resp = ureq::post(format!("{url}/v1/chat/completions"))
+        .send_json(serde_json::json!({"model":"yesterdays-model","messages":[{"role":"user","content":"hi"}],"max_tokens":8}))
+        .unwrap();
+    let v: serde_json::Value = resp.body_mut().read_json().unwrap();
+    assert_eq!(v["model"], "yesterdays-model");
     h.run();
     let logged = h.state().logs.snapshot(tracing::Level::INFO, "request finished");
     assert!(logged.iter().any(|e| e.field("path") == Some("/v1/models") && e.field("status") == Some("200")), "{logged:?}");
@@ -461,7 +467,7 @@ fn tool_server(h: &mut Harness<'static, App>, tools: inference_bench_core::specr
     }
     pump_until(h, 20, "load", |a| a.loaded().is_some());
     let handle = h.state().engine.handle();
-    h.state_mut().server.start(handle, 0, "", false);
+    h.state_mut().server.start(handle, 0, "", false, false);
     h.state().server.running.as_ref().expect("server running").url()
 }
 
@@ -675,7 +681,7 @@ fn serving_harness(name: &str, seqs: usize) -> Harness<'static, App> {
     }
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     let handle = h.state().engine.handle();
-    h.state_mut().server.start(handle, 0, "", false);
+    h.state_mut().server.start(handle, 0, "", false, false);
     h
 }
 
@@ -946,7 +952,7 @@ fn parallel_requests_with_a_real_model_run_together_and_aggregate_faster() {
         pump_until(&mut h, 180, "load", |a| a.loaded().is_some_and(|l| l.max_num_seqs == seqs));
         if h.state().server.running.is_none() {
             let handle = h.state().engine.handle();
-            h.state_mut().server.start(handle, 0, "", false);
+            h.state_mut().server.start(handle, 0, "", false, false);
         }
         let url = h.state().server.running.as_ref().unwrap().url();
         let _ = burst(&url, 1, 8);
@@ -1334,7 +1340,7 @@ fn screenshots_of_the_server_and_logs_tabs() {
         let handle = h.state().engine.handle();
         let url = {
             let app = h.state_mut();
-            app.server.start(handle, 0, "", false);
+            app.server.start(handle, 0, "", false, false);
             let url = app.server.running.as_ref().unwrap().url();
             let _ = ureq::get(format!("{url}/v1/models")).call();
             let _ = ureq::get(format!("{url}/health")).call();

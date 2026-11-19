@@ -97,6 +97,7 @@ For running beside vLLM or other GPU jobs, in the server config:
 | --- | --- |
 | `idle_unload_secs` | Unload a model after this many idle seconds. Works in the app too: the app engine is released (`suspended`) and the next request reloads it with the same settings |
 | `lazy_load = true` | Ignore `preload`: load on the first request |
+| `any_model_name = true` | When exactly one model is loaded, answer to any requested model name and echo that name in the response (all endpoints, including `/v1/messages` and `/v1/responses`). With none or several loaded, unknown names still get 404. Default false; in the app it is the server tab switch |
 | `min_free_vram_mib` | Refuse a load with 503 and `Retry-After` (`retry_after_secs`) while the GPU has less free than this. A loaded model keeps serving |
 | `before_load` | Shell command run before every load (`INFERENCE_BENCH_MODEL` is set); a non-zero exit refuses the load with 503. Use it to stop or wait for another job |
 
