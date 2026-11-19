@@ -251,8 +251,8 @@ fn real_smollm3_3b_matches_transformers() {
 }
 
 #[test]
-#[ignore = "needs a CUDA GPU, the cached HF checkpoint and scripts/families_real.py output in SPECRT_REF_DIR"]
-fn real_granite_3_3_2b_matches_transformers() {
+#[ignore = "needs a CUDA GPU, the cached HF checkpoint and scripts/families_real.py f32 output in SPECRT_REF_DIR (a bf16 reference flips a near-tie at token 2)"]
+fn real_granite_3_3_2b_matches_transformers_f32() {
     real("granite-3.3-2b", "ibm-granite/granite-3.3-2b-base");
 }
 
