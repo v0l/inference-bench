@@ -100,11 +100,13 @@ def make():
     path = folder / "model.safetensors"
     if not path.exists():
         folder.mkdir(parents=True, exist_ok=True)
-        save_file({to_checkpoint(k): v for k, v in weights(model).items()}, path)
+        save_file({to_checkpoint(k): v for k, v in weights(model).items() if k != "lm_head.weight"}, path)
         raw = json.loads(cfg.to_json_string())
         raw["time_step_limit"] = [0.0, None]
         (folder / "config.json").write_text(json.dumps(raw, indent=2) + "\n")
-    model.load_state_dict({from_checkpoint(k): v.float() for k, v in load_file(path).items()}, strict=True)
+    loaded = {from_checkpoint(k): v.float() for k, v in load_file(path).items()}
+    loaded["lm_head.weight"] = loaded["model.embed_tokens.weight"]
+    model.load_state_dict(loaded, strict=True)
     return model
 
 

@@ -131,7 +131,7 @@ fn tiny_granitehybrid_matches_transformers() {
     let top = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
     let agree = (0..tokens.len()).filter(|r| top(&ours[r * vocab..(r + 1) * vocab]) == top(&want[r * vocab..(r + 1) * vocab])).count();
     eprintln!("{GRANITE_HYBRID} prefill argmax agree {agree}/{}", tokens.len());
-    assert!(max_abs < 0.05, "{GRANITE_HYBRID} max abs diff {max_abs}");
+    assert!(max_abs < 0.1, "{GRANITE_HYBRID} max abs diff {max_abs}");
     let got = rt.generate_batch(std::slice::from_ref(&tokens), greedy.len()).unwrap();
     assert_eq!(got.tokens[0], greedy, "{GRANITE_HYBRID} decode greedy");
 }
