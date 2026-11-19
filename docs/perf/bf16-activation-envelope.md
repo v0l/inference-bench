@@ -47,3 +47,15 @@ Qwen3.5-9B on the Spark, prefill paired A/B (split vs single plane, 4 rounds): 1
 | specrt single plane (new default) | 1.07e-05 | 2.09e-04 | 311 |
 
 Single plane is 26x closer to fp32 than vLLM on mean KL, 7x on max, with more top-1 matches. Rerun: `envelope <checkpoint> prompts.json out split plain` then `envelope.py compare`. `family-qwen3_5.toml` now sets `split_activations = false`; `[runtime] split_activations = true` restores the exact path. The remaining gap to llama.cpp is the bf16 GEMM main loop (gate_up_mma_big 45% of prefill) and gdn_chunk_prep/scan (5%).
+
+## qwen3_moe FP8 experts (#885)
+
+Qwen3-30B-A3B-FP8 against an fp32 rebuild (FP8 weights dequantised with their block scales), 8 prompts, 310 rows. vLLM serves this checkpoint with FP8 W8A8.
+
+| path | mean KL | max KL | top-1 of 310 |
+|---|---|---|---|
+| vLLM (FP8 W8A8) | 1.24e-02 | 9.70e-01 | 300 |
+| specrt FP8 grouped mma (32 wide activation scales, new default for FP8 MoE) | 2.94e-03 | 1.09e-01 | 306 |
+| specrt bf16 activations, GEMV experts | 6.97e-07 | 1.70e-04 | 310 |
+
+The FP8 activation path is 4x closer to fp32 than vLLM on mean KL, so it is the serving default for FP8 MoE checkpoints (`[mlp] act_quant = "fp8"`; set `"none"` for the exact path). Rerun: `scripts/envelope_moe_fp8.py` then `envelope.py compare`.
