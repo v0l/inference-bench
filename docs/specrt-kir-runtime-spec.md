@@ -226,7 +226,7 @@ Plumbing, variant free:
 - State kind: per sequence `[[state]]` tables on the linear layers become one `StatePool` each with the `checkpoint` rule. Acquire, release, reset, snapshot (prefix cache and session park) and restore walk the declared states, so prefix caching and swap work for any described recurrence.
 - `[blocks] attention_indices_key` builds the layer pattern from a list of attention layer indices, and `[tensors]` renames checkpoint tensor name fragments (`.feed_forward.` to `.mlp.`). `SPEC_FORMAT` 11.
 
-The variants (no Rust): `specs/family-bamba.toml` with `mamba2_conv`, `mamba2_scan` (`h = exp(-exp(A_log) dt) h + dt x B`, `y = C h + D x`, grouped B and C) and `mamba2_gated_norm`; `specs/kda_recurrence.toml`, the glm5_next KDA delta rule with a per key channel lower bounded forget gate and L2 normalised q and k.
+The variants (no Rust): `specs/family-bamba.toml` and `specs/family-granitemoehybrid.toml` (layer_types, fused expert tensors, shared_mlp, NoPE, residual multiplier on the combine) with `mamba2_conv`, `mamba2_scan` (`h = exp(-exp(A_log) dt) h + dt x B`, `y = C h + D x`, grouped B and C) and `mamba2_gated_norm`; `specs/kda_recurrence.toml`, the glm5_next KDA delta rule with a per key channel lower bounded forget gate and L2 normalised q and k.
 
 Proof (`tests/mamba.rs`, fixture `tiny-bamba`, reference `scripts/tiny_mamba.py`, transformers `BambaForCausalLM` with random weights), Spark GB10, release:
 
