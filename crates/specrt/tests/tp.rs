@@ -79,7 +79,12 @@ fn compare(dir: &str, serving: bool, tp: usize, force: Option<Transport>, graphs
 }
 
 fn compare_split(dir: &str, serving: bool, tp: usize, force: Option<Transport>, graphs: bool, split: specrt::spec::TpSplit) -> Outcome {
+    compare_acts(dir, serving, tp, force, graphs, split, Some(true))
+}
+
+fn compare_acts(dir: &str, serving: bool, tp: usize, force: Option<Transport>, graphs: bool, split: specrt::spec::TpSplit, split_activations: Option<bool>) -> Outcome {
     let mut s = spec_for(dir, serving);
+    s.runtime.split_activations = split_activations;
     if let Some(m) = s.moe.as_mut() {
         m.tp_split = split;
     }
@@ -147,6 +152,16 @@ fn check(dir: &str, serving: bool, tps: &[usize]) {
 fn dense_tp_matches_tp1_on_virtual_ranks() {
     check("tiny-mistral", false, &[2]);
     check("tiny-smollm3", false, &[2]);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn single_plane_dense_tp_stays_close_to_single_plane_tp1() {
+    for dir in ["tiny-mistral", "tiny-phi3", "tiny-smollm3"] {
+        let o = compare_acts(dir, false, 2, None, false, specrt::spec::TpSplit::Auto, Some(false));
+        assert!(o.logit_err <= 5e-3 * o.logit_scale.max(1.0), "{dir}: single-plane logits drift by {}", o.logit_err);
+        assert!(o.tokens_equal * 2 >= o.streams, "{dir}: only {}/{} greedy streams match", o.tokens_equal, o.streams);
+    }
 }
 
 #[test]
