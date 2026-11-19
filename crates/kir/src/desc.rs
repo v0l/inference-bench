@@ -2,6 +2,7 @@ use crate::attention::{AttentionKernel, AttentionShape, Family, MropeShape, Rope
 use crate::compose::{Address, Compose, Iter, Mat, Rows, Stage, Tile};
 use crate::expr::{Const, Expr};
 use crate::layout::Layout;
+use crate::scan::{Scan, Stage as ScanStage};
 use crate::{Access, Activation, BlockSum, Kernel, Param, Pointwise, Role, Scalar, Target};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
@@ -270,6 +271,8 @@ pub struct ParamDesc {
     pub name: String,
     pub role: String,
     pub access: String,
+    #[serde(default, rename = "type")]
+    pub ty: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -303,6 +306,8 @@ pub struct StageDesc {
     pub at: Vec<String>,
     #[serde(default)]
     pub materialize: Option<String>,
+    #[serde(default)]
+    pub sink: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -488,6 +493,51 @@ impl Description {
         })
     }
 
+    fn scalar(&self, p: &ParamDesc) -> Result<Scalar, String> {
+        Ok(match p.ty.as_deref() {
+            None | Some("f32") => Scalar::F32,
+            Some("u32") => Scalar::U32,
+            Some("bf16") => Scalar::Bf16,
+            Some("i32") => Scalar::I32,
+            Some(o) => return Err(format!("{}: param type {o:?} is not f32, u32, bf16 or i32", self.name)),
+        })
+    }
+
+    fn scan(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
+        let words = self.words(shape)?;
+        let mut params = Vec::new();
+        for p in &self.param {
+            let role = match p.role.as_str() {
+                "weight" => Role::Weight,
+                "activation" => Role::Activation,
+                "value" => Role::Value,
+                o => return Err(format!("{}: scan param role {o:?} is not weight, activation or value", self.name)),
+            };
+            let access = match p.access.as_str() {
+                "read" => Access::Read,
+                "write" => Access::Write,
+                o => return Err(format!("{}: param access {o:?} is unknown", self.name)),
+            };
+            params.push(Param { name: intern(&p.name), ty: self.scalar(p)?, role, access });
+        }
+        let mut consts = Vec::new();
+        for c in &self.consts {
+            consts.push(Const { name: c.name.clone(), value: self.constant(shape, c)?, wgsl_const: false, fold: c.fold });
+        }
+        let need = |v: &Option<String>, what: &str, op: &str| v.clone().ok_or_else(|| format!("{}: stage {op} needs {what}", self.name));
+        let expr = |s: &StageDesc| -> Result<Expr, String> { Expr::parse(&self.text(&words, &need(&s.expr, "expr", &s.op)?)).map_err(|e| format!("{}: {e}", self.name)) };
+        let mut stages = Vec::new();
+        for s in &self.stage {
+            stages.push(match s.op.as_str() {
+                "epilogue" => ScanStage::Epilogue { dst: need(&s.name, "name", &s.op)?, expr: expr(s)? },
+                "mask" => ScanStage::Mask { expr: expr(s)? },
+                "online_softmax" => ScanStage::Softmax { value: need(&s.value, "value", &s.op)?, sink: s.sink.clone() },
+                o => return Err(format!("{}: scan stage op {o:?} is not epilogue, mask or online_softmax", self.name)),
+            });
+        }
+        Kernel::scan(t, intern(&self.name), self.threads(shape)?, params, Scan { consts, stages }).map_err(|e| format!("{}: {e}", self.name))
+    }
+
     fn compose(&self, t: &Target, shape: &Shape) -> Result<Kernel, String> {
         let width = self.count(shape, "width")?;
         let words = self.words(shape)?;
@@ -516,6 +566,7 @@ impl Description {
                 "weight" => Role::Weight,
                 "activation" => Role::Activation,
                 "scratch" => Role::Scratch,
+                "value" => Role::Value,
                 o => return Err(format!("{}: param role {o:?} is unknown", self.name)),
             };
             let access = match p.access.as_str() {
@@ -523,7 +574,7 @@ impl Description {
                 "write" => Access::Write,
                 o => return Err(format!("{}: param access {o:?} is unknown", self.name)),
             };
-            params.push(Param { name: intern(&p.name), ty: Scalar::F32, role, access });
+            params.push(Param { name: intern(&p.name), ty: self.scalar(p)?, role, access });
         }
         let mut consts = Vec::new();
         for c in &self.consts {
@@ -562,11 +613,12 @@ impl Description {
         if self.shape.is_some() {
             return Err(format!("{}: family {} takes no [shape]", self.name, self.family));
         }
-        if self.family != "compose" && (self.rows.is_some() || !self.param.is_empty() || !self.consts.is_empty() || !self.stage.is_empty()) {
+        if self.family != "compose" && self.family != "scan_attention" && (self.rows.is_some() || !self.param.is_empty() || !self.consts.is_empty() || !self.stage.is_empty()) {
             return Err(format!("{}: only family compose takes rows, param, const and stage", self.name));
         }
         match self.family.as_str() {
             "compose" => self.compose(t, shape),
+            "scan_attention" => self.scan(t, shape),
             "rmsnorm" => {
                 self.known(&["width", "eps", "offset"])?;
                 Kernel::rmsnorm_offset(t, self.count(shape, "width")?, self.number(shape, "eps")? as f32, self.number(shape, "offset")? as f32, threads)

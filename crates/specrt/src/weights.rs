@@ -25,6 +25,7 @@ pub struct Attn<'a> {
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
     pub o: Matrix<'a>,
+    pub extra: Vec<(String, Vec<f32>)>,
 }
 
 pub struct Gdn<'a> {
@@ -861,7 +862,16 @@ impl Checkpoint {
         } else {
             (None, None)
         };
+        let mut extra = Vec::new();
+        for bind in spec.attention.node.iter().flat_map(|n| n.bind.values()) {
+            if let crate::graph::Bind::Weight { weight, len } = bind
+                && !extra.iter().any(|(n, _): &(String, Vec<f32>)| n == weight)
+            {
+                extra.push((weight.clone(), self.f32(&format!("{attn}.{weight}"), spec.weight_len(len)?)?));
+            }
+        }
         Ok(Attn {
+            extra,
             qkv: Raw::concat(parts)?.into_matrix(quant, &format!("{attn}.qkv"))?,
             qkv_bias,
             q_norm,

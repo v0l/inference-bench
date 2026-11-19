@@ -14,6 +14,7 @@ pub mod moe;
 pub mod ops;
 pub mod prims;
 pub mod rope;
+pub mod scan;
 pub mod target;
 pub mod vision;
 #[cfg(feature = "wgsl")]
@@ -28,6 +29,8 @@ use std::fmt::{self, Write as _};
 pub enum Scalar {
     F32,
     U32,
+    Bf16,
+    I32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +38,7 @@ pub enum Role {
     Weight,
     Activation,
     Scratch,
+    Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +78,7 @@ pub enum Body {
     Add { width: u32, scale: f32 },
     GatedActivation { width: u32, act: Activation },
     Compose(compose::Compose),
+    Scan(scan::Scan),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -259,10 +264,17 @@ impl Kernel {
         Ok(k)
     }
 
+    pub fn scan(t: &Target, name: &'static str, threads: u32, params: Vec<Param>, body: scan::Scan) -> Result<Kernel, String> {
+        let k = Kernel { name, target: *t, params, threads: pick_threads(t, threads), smem_bytes: 0, body: Body::Scan(body) };
+        k.validate()?;
+        Ok(k)
+    }
+
     pub fn needs(&self) -> Vec<Feature> {
         match &self.body {
             Body::RmsNorm { sum, .. } | Body::RmsNormSegment { sum, .. } | Body::AddRmsNorm { sum, .. } | Body::NormAdd { sum, .. } => sum.needs().to_vec(),
             Body::Compose(c) => c.sum.map(|s| s.needs().to_vec()).unwrap_or_default(),
+            Body::Scan(_) => vec![Feature::WarpShuffle],
             Body::GatedActivation { .. } | Body::Pointwise { .. } | Body::Add { .. } => vec![],
         }
     }
@@ -349,6 +361,10 @@ impl Kernel {
                 c.check(t, &self.params)?;
                 &roles
             }
+            Body::Scan(c) => {
+                c.check(t, self.threads, &self.params)?;
+                &roles
+            }
             Body::GatedActivation { width, .. } => {
                 if *width == 0 {
                     return Err(format!("{}: width must be positive", self.name));
@@ -359,7 +375,7 @@ impl Kernel {
         if roles != expected {
             return Err(format!("{}: params {roles:?} do not match the body, want {expected:?}", self.name));
         }
-        if self.params.iter().any(|p| p.ty != Scalar::F32) {
+        if !matches!(self.body, Body::Scan(_)) && self.params.iter().any(|p| p.ty != Scalar::F32) {
             return Err(format!("{}: only f32 params are supported", self.name));
         }
         Ok(())
@@ -397,6 +413,9 @@ impl Kernel {
                 let _ = write!(s, "\n  pointwise width={width} op={op:?}");
             }
             Body::Compose(c) => {
+                let _ = write!(s, "\n  {}", c.describe());
+            }
+            Body::Scan(c) => {
                 let _ = write!(s, "\n  {}", c.describe());
             }
             Body::GatedActivation { width, act } => {

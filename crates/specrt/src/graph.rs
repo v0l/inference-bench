@@ -3,25 +3,39 @@ use crate::vision::VisionConfig;
 use crate::vision_encoder::VisionOp;
 use crate::plan::{Buf, QuantSource, NormKind, Op, Phase, Plan, PlanBlock, Weight};
 use anyhow::{Context, Result, bail, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Bind {
+    Number(f64),
+    Name(String),
+    Weight { weight: String, len: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
     pub op: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grid: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub bind: std::collections::BTreeMap<String, Bind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quant: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard: Option<String>,
-    #[serde(default, rename = "in")]
+    #[serde(default, rename = "in", skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub out: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
 }
 
@@ -32,7 +46,7 @@ pub struct BlockGraph {
     pub layers: Vec<String>,
     #[serde(default)]
     pub mlp: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<String>,
     #[serde(default)]
     pub node: Vec<Node>,
@@ -139,6 +153,16 @@ impl Node {
         }
     }
 
+    fn lower_described(&self, index: usize) -> Result<Op> {
+        ensure!(index < 256, "an attention spec has at most 256 nodes");
+        Ok(match self.op.as_str() {
+            "qk_rope" => Op::QkRope,
+            "decode_rope" => Op::DecodeRope,
+            "kernel" => Op::Kernel { node: index as u8 },
+            other => bail!("attention node op {other:?} is not qk_rope, decode_rope or kernel"),
+        })
+    }
+
     fn lower(&self) -> Result<Op> {
         let field = |v: &Option<String>, what: &str| v.clone().with_context(|| format!("{} needs {what}", self.op));
         Ok(match self.op.as_str() {
@@ -196,6 +220,8 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
             "speculative" => spec.speculative().is_some(),
             "vision" => spec.vision.is_some(),
             "moe" => spec.moe.is_some(),
+            "described" => !spec.attention.node.is_empty(),
+            "stock" => spec.attention.node.is_empty(),
             "dense" => spec.moe.is_none(),
             _ => false,
         })
@@ -203,7 +229,17 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
 }
 
 fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec) -> Result<Vec<Op>> {
-    nodes.iter().filter(|n| n.runs_in(phase, tensor_core, spec)).map(Node::lower).collect()
+    let mut ops = Vec::new();
+    for n in nodes.iter().filter(|n| n.runs_in(phase, tensor_core, spec)) {
+        if n.op == "attention_nodes" {
+            for (i, d) in spec.attention.node.iter().enumerate().filter(|(_, d)| d.runs_in(phase, tensor_core, spec)) {
+                ops.push(d.lower_described(i)?);
+            }
+        } else {
+            ops.push(n.lower()?);
+        }
+    }
+    Ok(ops)
 }
 
 fn vision_op(node: &Node, block: usize, deepstack: Option<usize>) -> Result<VisionOp> {

@@ -11,14 +11,20 @@ pub enum Op {
     Gt,
     Le,
     Ge,
+    Eq,
+    Ne,
+    And,
+    Or,
 }
 
 impl Op {
     fn prec(self) -> u8 {
         match self {
-            Op::Lt | Op::Gt | Op::Le | Op::Ge => 1,
-            Op::Add | Op::Sub => 2,
-            Op::Mul | Op::Div => 3,
+            Op::Or => 1,
+            Op::And => 2,
+            Op::Lt | Op::Gt | Op::Le | Op::Ge | Op::Eq | Op::Ne => 3,
+            Op::Add | Op::Sub => 4,
+            Op::Mul | Op::Div => 5,
         }
     }
 
@@ -32,6 +38,10 @@ impl Op {
             Op::Gt => ">",
             Op::Le => "<=",
             Op::Ge => ">=",
+            Op::Eq => "==",
+            Op::Ne => "!=",
+            Op::And => "&&",
+            Op::Or => "||",
         }
     }
 }
@@ -56,7 +66,8 @@ pub enum Expr {
     Call(&'static str, Vec<Expr>),
 }
 
-const UNARY: [(&str, &str, &str); 6] = [
+const UNARY: [(&str, &str, &str); 7] = [
+    ("floor", "floorf", "floor"),
     ("tanh", "tanhf", "tanh"),
     ("exp", "expf", "exp"),
     ("log", "logf", "log"),
@@ -109,8 +120,8 @@ fn tokens(text: &str) -> Result<Vec<Tok>, String> {
                 i += 1;
             }
             out.push(Tok::Id(c[s..i].iter().collect()));
-        } else if (ch == '<' || ch == '>') && c.get(i + 1) == Some(&'=') {
-            out.push(Tok::Sym(format!("{ch}=")));
+        } else if ((ch == '<' || ch == '>' || ch == '=' || ch == '!') && c.get(i + 1) == Some(&'=')) || (ch == '&' && c.get(i + 1) == Some(&'&')) || (ch == '|' && c.get(i + 1) == Some(&'|')) {
+            out.push(Tok::Sym(format!("{ch}{}", c[i + 1])));
             i += 2;
         } else if "<>+-*/(),".contains(ch) {
             out.push(Tok::Sym(ch.to_string()));
@@ -146,9 +157,27 @@ impl Parser<'_> {
         format!("expression {:?}: {what}", self.text)
     }
 
+    fn logic_or(&mut self) -> Result<Expr, String> {
+        let mut l = self.logic_and()?;
+        while self.eat("||") {
+            let r = self.logic_and()?;
+            l = Expr::Bin(Op::Or, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
+    fn logic_and(&mut self) -> Result<Expr, String> {
+        let mut l = self.compare()?;
+        while self.eat("&&") {
+            let r = self.compare()?;
+            l = Expr::Bin(Op::And, Box::new(l), Box::new(r));
+        }
+        Ok(l)
+    }
+
     fn compare(&mut self) -> Result<Expr, String> {
         let l = self.sum()?;
-        for (s, op) in [("<=", Op::Le), (">=", Op::Ge), ("<", Op::Lt), (">", Op::Gt)] {
+        for (s, op) in [("<=", Op::Le), (">=", Op::Ge), ("==", Op::Eq), ("!=", Op::Ne), ("<", Op::Lt), (">", Op::Gt)] {
             if self.eat(s) {
                 let r = self.sum()?;
                 return Ok(Expr::Bin(op, Box::new(l), Box::new(r)));
@@ -203,7 +232,7 @@ impl Parser<'_> {
             }
             Some(Tok::Sym(open)) if open == "(" => {
                 self.at += 1;
-                let e = self.compare()?;
+                let e = self.logic_or()?;
                 if !self.eat(")") {
                     return Err(self.err("missing )"));
                 }
@@ -215,7 +244,7 @@ impl Parser<'_> {
                     let mut args = Vec::new();
                     if !self.eat(")") {
                         loop {
-                            args.push(self.compare()?);
+                            args.push(self.logic_or()?);
                             if self.eat(")") {
                                 break;
                             }
@@ -260,7 +289,7 @@ impl Expr {
     pub fn parse(text: &str) -> Result<Expr, String> {
         let toks = tokens(text)?;
         let mut p = Parser { text, toks, at: 0 };
-        let e = p.compare()?;
+        let e = p.logic_or()?;
         if p.at != p.toks.len() {
             return Err(p.err("trailing input"));
         }
@@ -320,8 +349,8 @@ impl Expr {
     fn prec(&self) -> u8 {
         match self {
             Expr::Bin(op, ..) => op.prec(),
-            Expr::Neg(_) => 4,
-            _ => 5,
+            Expr::Neg(_) => 6,
+            _ => 7,
         }
     }
 
@@ -346,7 +375,7 @@ impl Expr {
                 Dialect::Cuda => "WIDTH".into(),
                 Dialect::Wgsl => "f32(WIDTH)".into(),
             },
-            Expr::Neg(e) => format!("-{}", child(e, e.prec() < 4 || matches!(**e, Expr::Neg(_)))?),
+            Expr::Neg(e) => format!("-{}", child(e, e.prec() < 6 || matches!(**e, Expr::Neg(_)))?),
             Expr::Bin(op, a, b) => format!("{} {} {}", child(a, a.prec() < op.prec())?, op.text(), child(b, b.prec() <= op.prec())?),
             Expr::Call("select", args) => {
                 let (c, a, b) = (child(&args[0], false)?, child(&args[1], false)?, child(&args[2], false)?);

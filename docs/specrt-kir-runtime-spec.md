@@ -141,7 +141,7 @@ Each slice is its own issue under goal g4 (backlog, no goal set). The order is a
 | a | Level 1 descriptions: `kir::desc`, the embedded `kernels/*.toml` for rmsnorm and its light family, `codegen::kir_kernels` driven by them. | goldens byte-identical, description equals builder for every target. **Done in #802.** |
 | a2 | Decode attention and the rope/KV-write family as level 1 descriptions (`attention.rs` families `SplitDecode`, `GroupedDecodeMma`, `RopeKvWrite`). Auto-update delivery of `kind = "kir-kernel"` files next to family specs. | attention goldens byte-identical |
 | a3 | Expression language (section 2.3) and `compose` with `epilogue`, `block_sum`, `tile_load`, `tile_store`: express rmsnorm, norm_add, pointwise and swiglu as composed bodies, builders become the reference. | goldens byte-identical |
-| b | New attention variant from spec only: sinks, chunked mask, soft-cap plus window, as `compose` attention bodies. Runtime op kind `kernel`. | tiny fixture against transformers, no Rust change |
+| b | New attention variant from spec only: sinks, chunked mask, soft-cap plus window, as attention bodies. Runtime op kind `kernel`. | tiny fixture against transformers, no Rust change. **Done in #806.** |
 | c | State kinds from the spec (section 3), split QK/V dims, MLA absorbed decode and latent cache as spec only. Absorbs #641. | DeepSeek-V2-Lite tiny fixture against transformers |
 | d | Scan and recurrence primitives, state checkpoint rule: Mamba2 SSD, KDA. Absorbs #643. | tiny Mamba2 hybrid fixture |
 | e | `topk` with groups, `gather`/`scatter`, `lookup`, dequant blocks as data (MXFP4): group-limited sigmoid MoE, gpt-oss, hash layers, DSA indexer. Absorbs #640 and #642. | tiny gpt-oss and GLM MoE fixtures |
@@ -173,3 +173,25 @@ Fixtures and GPU runs follow `docs/testing.md`: CPU and tiny tiers first, the Sp
 - `specrt::codegen::attention_kernels` now builds all eight from descriptions through `attention_symbols`, which turns the spec, kv planes and max context into the symbol table. FlashScalar and FlashMma are included so the legacy plan path keeps `flash_attention`.
 - Delivery: the eight files ship in `crates/specrt/specs/` (embedded copy, auto-updated copy wins). `Spec::check` returns `Checked::Kernel(name)` for them, `family::is_kernel` identifies them, `crates/core::specs::install_families` also installs a `specrt::kir_kernel::Registry` from the spec layers (first text for a name wins, layers in priority order), and the registry falls back to the embedded set.
 - `crates/kir/tests/desc.rs` and `crates/specrt/tests/kernel_desc.rs`: description equals builder per target (sm_120, sm_80) for every kernel, error cases named, and the delivered files parse. The attention goldens in `crates/kir/tests/golden/attention` are byte-identical.
+
+## 8. Status of slice (b)
+
+Plumbing (commit "Scan attention bodies and kernel graph nodes"), generic and variant free:
+
+- `kir::expr`: `==`, `!=`, `&&`, `||` and `floor`.
+- `kir::Scalar` gains `Bf16` and `I32`, `kir::Role` gains `Value` (a launch scalar), and `param` tables take `type`.
+- `kir::scan` and `family = "scan_attention"`: a query-row scan over the paged KV cache. Stages `epilogue`, `mask` and `online_softmax` (optional `sink`). Built-in names in expressions: `s` (raw dot), `scale`, `q_pos`, `k_pos`, `head`, `kv_head`, plus every `value` param. CUDA only. A mask is an expression, so `window(n)` and `chunked(n)` are one line each.
+- `[[attention.node]]` and `[attention.params]` in a model spec or family spec (`SPEC_FORMAT` 9). Nodes are `qk_rope`, `decode_rope` and `kernel`; a `kernel` node names a description, a launch `grid` (`heads`, `kv_heads`, `rows` or numbers) and `bind`s each extra param to a weight (`{ weight, len }`), a number, `window`, `nope` or an `[attention.params]` entry. `[attention.params]` values come from `config.json` keys in a family spec.
+- `graphs/decoder.toml`: `attention_nodes` expands to the spec nodes, and the stock attention ops carry `when = "stock"`. A spec with no nodes lowers exactly as before.
+- specrt: `Op::Kernel`, `Op::DecodeRope`, `codegen::described_kernels`, per-layer extra weights (`self_attn.<weight>`), the executor launch of a described kernel from its bindings. Load-time errors name the node and kernel.
+
+The variant (no Rust): `specs/attn_sinks.toml` (per-head sink in the softmax denominator, window mask, soft-cap), `specs/attn_chunked.toml` (chunked mask, NoPE temperature `1 + attn_scale * ln(1 + floor((pos + 1) / floor_scale))`), and the family files `specs/family-sinks-qwen3.toml` and `specs/family-chunked-smollm3.toml`.
+
+Proof (`tests/variants.rs`, fixtures `tiny-sinks` and `tiny-chunked`, reference `scripts/tiny_variants.py`, transformers with the eager attention swapped for the gpt-oss sink softmax and the Llama 4 chunked mask with temperature tuning), Spark GB10, release:
+
+```text
+tiny-chunked prefill max_abs 0.00037956238, greedy decode tokens equal
+tiny-sinks   prefill max_abs 0.00030136108, greedy decode tokens equal
+```
+
+Not covered: WGSL for scan bodies, the single stream `step` path (a spec with nodes runs through prefill, `generate_batch` and the scheduler), MTP together with nodes, and tensor core (mma) scan bodies. The scan is a scalar warp kernel, so these descriptions are correct, not fast.

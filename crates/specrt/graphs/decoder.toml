@@ -43,14 +43,21 @@ when = "qk_norm_full"
 [[block.node]]
 op = "kv_rope"
 phase = "prefill"
+when = "stock"
 
 [[block.node]]
 op = "flash"
 phase = "prefill"
+when = "stock"
 
 [[block.node]]
 op = "decode_attention"
 phase = "rows"
+when = "stock"
+
+[[block.node]]
+op = "attention_nodes"
+when = "tensor_core+described"
 
 [[block.node]]
 op = "clear"
@@ -215,18 +222,22 @@ in = "xn_planes"
 
 [[block.node]]
 op = "kv_rope"
-when = "tensor_core"
+when = "tensor_core+stock"
 phase = "prefill"
 
 [[block.node]]
 op = "flash"
-when = "tensor_core"
+when = "tensor_core+stock"
 phase = "prefill"
 
 [[block.node]]
 op = "decode_attention"
-when = "tensor_core"
+when = "tensor_core+stock"
 phase = "rows"
+
+[[block.node]]
+op = "attention_nodes"
+when = "tensor_core+described"
 
 [[block.node]]
 op = "linear"
@@ -428,18 +439,22 @@ in = "xn_planes"
 
 [[block.node]]
 op = "kv_rope"
-when = "tensor_core"
+when = "tensor_core+stock"
 phase = "prefill"
 
 [[block.node]]
 op = "flash"
-when = "tensor_core"
+when = "tensor_core+stock"
 phase = "prefill"
 
 [[block.node]]
 op = "decode_attention"
-when = "tensor_core"
+when = "tensor_core+stock"
 phase = "rows"
+
+[[block.node]]
+op = "attention_nodes"
+when = "tensor_core+described"
 
 [[block.node]]
 op = "linear"
