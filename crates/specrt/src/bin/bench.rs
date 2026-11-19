@@ -304,15 +304,11 @@ fn bench_batch(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize) 
         .map(|s| (0..prompt_len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect())
         .collect();
     rt.generate_batch(&prompts, 8.min(new_tokens))?;
-    let rates: Vec<f64> = (0..runs())
-        .map(|_| {
-            rt.generate_batch(&prompts, new_tokens)
-                .map(|g| (batch * (new_tokens - 1)) as f64 / g.decode_secs)
-        })
-        .collect::<Result<_>>()?;
-    let rate = median(rates);
+    let gens: Vec<_> = (0..runs()).map(|_| rt.generate_batch(&prompts, new_tokens)).collect::<Result<_>>()?;
+    let rate = median(gens.iter().map(|g| (batch * (new_tokens - 1)) as f64 / g.decode_secs).collect());
+    let prefill = median(gens.iter().map(|g| (batch * prompt_len) as f64 / g.prefill_secs).collect());
     println!(
-        "{} batch={} prompt={} new={} decode={:.1} tok/s aggregate, {:.1} per sequence (median of {})",
+        "{} prefill={prefill:.1} tok/s batch={} prompt={} new={} decode={:.1} tok/s aggregate, {:.1} per sequence (median of {})",
         spec.name,
         batch,
         prompt_len,

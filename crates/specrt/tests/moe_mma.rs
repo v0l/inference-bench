@@ -131,6 +131,7 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter: u
         let m = spec.moe.as_mut().unwrap();
         m.expert_block = Some(specrt::dequant::MXFP4);
         m.expert_bias = true;
+        spec.mlp.quant = None;
     }
     let ctx = CudaContext::new(0).unwrap();
     let target = cuda_target(&ctx).unwrap();
