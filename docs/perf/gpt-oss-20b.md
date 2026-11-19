@@ -30,3 +30,16 @@ The mma path is about 17x faster at prefill and about 2x at b8 decode, level at 
 ## Suites
 
 Spark `variants` (13 pass, plus 7 GPU tests with the reference) and `moe_mma` (7 pass), CPU kir and specrt suites, clippy `-D warnings`.
+
+## Activation precision sweep (#901)
+
+`[mlp] up_act_planes` and `[mlp] down_act_planes` (1 or 2, default 1) pick how many mxfp4 planes the grouped mma uses for the expert up (hidden input) and down (intermediate input) activations. Two planes quantise the activation, then quantise the residual with its own block scale, and the mma accumulates both planes (`moe_mma_mx_{up,down}2*`). It is about 4 bits of mantissa more at twice the mma work for that GEMM. Defaults are unchanged until the sweep below is run.
+
+Run on the Spark under `flock /tmp/gpu27.lock` once MemAvailable is above 40 GB:
+
+```bash
+envelope <ckpt> prompts.json out plain mma mma_up2 mma_down2 mma_both2
+envelope.py compare
+```
+
+GPU tests: `cargo test -p inference-bench-specrt --test moe_mma -- --ignored mx_grouped`.
