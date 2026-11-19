@@ -9,7 +9,7 @@ mod draft;
 mod step;
 mod verify;
 
-use common::COMMON;
+use common::common;
 use crate::linear::{Family, LinearError, LinearKernel, constants};
 
 
@@ -31,7 +31,7 @@ pub fn emit_linear(kernels: &[LinearKernel]) -> Result<String, LinearError> {
     };
     if kernels.iter().any(|k| k.family.uses_shape()) {
         push(&constants(&first.shape, &first.tuning));
-        push(COMMON);
+        push(&common());
     }
     if has(Family::Conv) {
         push(&conv::body());

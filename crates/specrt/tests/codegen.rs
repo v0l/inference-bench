@@ -17,10 +17,7 @@ const KIR_SNIPPETS: &[&str] = &[
 
 const LIBRARY_ONLY: &[&str] = &["cuda/prelude.cu"];
 
-const VERBATIM_LINEAR: &[(&str, &str)] = &[
-    ("cuda/linear/common.rs", "device functions by design, shared by every linear family"),
-    ("cuda/linear/chunk_lib.rs", "mma split tile and fragment device functions by design"),
-];
+const VERBATIM_LINEAR: &[(&str, &str)] = &[];
 
 const VERBATIM_ATTENTION: &[(&str, &str)] = &[];
 

@@ -1,11 +1,11 @@
 use super::{chunk_lib, chunk_prep, chunk_scan};
 
 pub fn body() -> String {
-    let mut o = String::from(chunk_lib::LIBRARY);
+    let mut o = chunk_lib::library();
     o.push('\n');
     o.push_str(&chunk_prep::body());
     o.push_str("\n\n");
-    o.push_str(chunk_lib::PLANES);
+    o.push_str(&chunk_lib::planes());
     o.push('\n');
     o.push_str(&chunk_scan::body());
     o.push_str("\n\n");

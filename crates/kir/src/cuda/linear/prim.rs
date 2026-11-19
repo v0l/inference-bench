@@ -321,3 +321,8 @@ acc[p] = x;
     o += "__syncthreads();\n";
     at(n, &format!("for (int sz = LEAF; sz < C; sz *= 2) {{\n{}}}\n", at(4, &o)))
 }
+
+pub fn device_fn(template: &str, sig: &str, body: &str) -> String {
+    let head = if template.is_empty() { String::new() } else { format!("template <{template}>\n") };
+    format!("{head}__device__ __forceinline__ {sig} {{\n{}}}\n", at(4, body))
+}
