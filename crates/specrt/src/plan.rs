@@ -125,7 +125,13 @@ impl Weight {
                 }
                 t
             }
-            Weight::O => vec![w("self_attn.o_proj")],
+            Weight::O => {
+                let mut t = vec![w("self_attn.o_proj")];
+                if spec.attention.o_bias {
+                    t.push("self_attn.o_proj.bias".into());
+                }
+                t
+            }
             Weight::GateUp if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
             Weight::GateUp => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
             Weight::Down => vec![w("mlp.down_proj")],

@@ -104,10 +104,8 @@ __device__ __forceinline__ const float* fp8_row_scales(const float* scales, int 
 
 
 template <int K>
-__device__ __forceinline__ float dot_fp8(const void* w, const float* scales, int row, const float* x, int lane) {
+__device__ __forceinline__ float dot_fp8_scaled(const unsigned char* wr, const float* sr, const float* x, int lane) {
     static_assert(K % 16 == 0, "fp8 rows load 16 bytes per lane");
-    const unsigned char* wr = (const unsigned char*)w + (size_t)row * K;
-    const float* sr = fp8_row_scales(scales, row);
     float acc = 0.0f;
 #pragma unroll 2
     for (int k = lane * 16; k < K; k += 512) {
@@ -119,10 +117,19 @@ __device__ __forceinline__ float dot_fp8(const void* w, const float* scales, int
     return acc;
 }
 
+template <int K>
+__device__ __forceinline__ float dot_fp8(const void* w, const float* scales, int row, const float* x, int lane) {
+    return dot_fp8_scaled<K>((const unsigned char*)w + (size_t)row * K, fp8_row_scales(scales, row), x, lane);
+}
+
 __device__ __forceinline__ float activation(float g) {
     return ACT_KIND == 1
         ? 0.5f * g * (1.0f + tanhf(0.7978845608028654f * (g + 0.044715f * g * g * g)))
         : g / (1.0f + expf(-g));
+}
+
+__device__ __forceinline__ float gated_act(float g, float u) {
+    return GATED_BODY(g, u);
 }
 
 template <typename D>
@@ -194,7 +201,7 @@ __device__ void gate_up_act_norm(const void* w, const void* s, const float* x, c
         if (row >= INTER) return;
         float gu[2];
         D::template rows<HIDDEN, 2>(w, s, 2 * row, 1, xs, lane, gu);
-        if (lane == 0) out[D::template x_at<INTER>(row)] = activation(gu[0]) * gu[1];
+        if (lane == 0) out[D::template x_at<INTER>(row)] = gated_act(gu[0], gu[1]);
         row += gridDim.x * D::WARPS;
     } while (D::STRIDE);
 }

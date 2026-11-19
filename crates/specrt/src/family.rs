@@ -95,6 +95,7 @@ pub struct FamilyAttention {
     pub o_cols: Option<String>,
     pub scratch: std::collections::BTreeMap<String, String>,
     pub qkv_bias: Flag,
+    pub o_bias: Flag,
     pub qk_norm: Flag,
     pub output_gate: Flag,
     pub qk_norm_full: bool,
@@ -110,6 +111,7 @@ impl Default for FamilyAttention {
             o_cols: None,
             scratch: Default::default(),
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
+            o_bias: Flag::Fixed(false),
             qk_norm: Flag::Fixed(false),
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },
             qk_norm_full: false,
@@ -145,6 +147,15 @@ pub struct FamilyMultipliers {
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyMlp {
     pub fused_gate_up: bool,
+    pub gated: Option<FamilyGated>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyGated {
+    pub expr: String,
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, ParamSource>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -152,6 +163,16 @@ pub struct FamilyMlp {
 pub struct FamilyMoe {
     pub shared_module: Option<String>,
     pub shared_gate: Option<bool>,
+    pub router: Option<crate::spec::RouterAct>,
+    pub norm_topk: Option<bool>,
+    pub score_bias: bool,
+    pub expert_block: Option<crate::dequant::BlockFormat>,
+    pub act_quant: Option<crate::spec::ActQuant>,
+    pub gate_up_interleaved: bool,
+    pub router_bias: bool,
+    pub expert_bias: bool,
+    pub router_module: Option<String>,
+    pub hash_table: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -306,6 +327,17 @@ fn json_at<'a>(v: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::V
     path.split('.').try_fold(v, |cur, key| cur.get(key))
 }
 
+fn expr_keys(text: &str, out: &mut Vec<String>) {
+    let Ok(e) = kir::expr::Expr::parse(text) else { return };
+    let mut names = Vec::new();
+    e.names(&mut names);
+    for n in names {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+}
+
 fn value_matches(want: &toml::Value, got: &serde_json::Value) -> bool {
     match (want, got) {
         (toml::Value::Table(t), got) => t.get("any").and_then(|a| a.as_array()).is_some_and(|alts| alts.iter().any(|a| value_matches(a, got))),
@@ -448,6 +480,71 @@ pub struct Family {
 }
 
 impl Family {
+    pub fn config_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let push = |k: &str, out: &mut Vec<String>| {
+            let top = k.split('.').next().unwrap_or(k);
+            if !top.is_empty() && !out.iter().any(|o| o == top) {
+                out.push(top.to_string());
+            }
+        };
+        for (canonical, alternatives) in &self.fields {
+            push(canonical, &mut out);
+            for a in alternatives {
+                push(a, &mut out);
+            }
+        }
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()) {
+            match key {
+                ParamSource::Config { config, .. } => push(config, &mut out),
+                ParamSource::Expr { expr } => expr_keys(expr, &mut out),
+                ParamSource::Number(_) => {}
+            }
+        }
+        if let Some(k) = self.attention.o_cols.as_deref() {
+            expr_keys(k, &mut out);
+        }
+        for s in self.attention.scratch.values().chain(self.mixer.scratch.values()) {
+            expr_keys(s, &mut out);
+        }
+        if let Some(k) = self.blocks.attention_indices_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.blocks.sliding_period_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.rope.local_theta_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.rope.nope_flags.as_deref() {
+            push(k, &mut out);
+        }
+        for k in &self.rope.type_keys {
+            push(k, &mut out);
+        }
+        for k in &self.dtypes.keys {
+            push(k, &mut out);
+        }
+        for k in self.rope.keys.values() {
+            push(k, &mut out);
+        }
+        let k = self.vision.soft_tokens_key.as_str();
+        if !k.is_empty() {
+            push(k, &mut out);
+        }
+        push(&self.vision.token_keys.image, &mut out);
+        push(&self.vision.token_keys.video, &mut out);
+        push(&self.vision.token_keys.start, &mut out);
+        push(&self.vision.token_keys.end, &mut out);
+        for m in [&self.multipliers.embedding, &self.multipliers.attention, &self.multipliers.residual, &self.multipliers.logits_divisor].into_iter().flatten() {
+            push(m, &mut out);
+        }
+        if let Some(k) = self.embedding.scale.as_deref().filter(|k| *k != "sqrt_hidden") {
+            push(k, &mut out);
+        }
+        out
+    }
+
     pub fn normalise(&self, config: &mut serde_json::Value) {
         for (canonical, alternatives) in &self.fields {
             if dotted(config, canonical).is_some() {
@@ -574,6 +671,18 @@ impl Registry {
     pub fn describing(&self) -> Result<&Family> {
         self.named("generic").context("no generic family spec")
     }
+
+    pub fn config_keys(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for f in &self.families {
+            for k in f.config_keys() {
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        out
+    }
 }
 
 fn resolve(table: &toml::Table, all: &[toml::Table], depth: usize) -> Result<toml::Table> {
@@ -634,5 +743,16 @@ mod tests {
         assert!(f.read(&serde_json::json!({})));
         assert!(!f.read(&serde_json::json!({"k": false})));
         assert!(Flag::Fixed(true).read(&serde_json::json!({"k": false})));
+    }
+
+    #[test]
+    fn config_keys_follow_the_family_declarations() {
+        let family = "name = \"k\"\nkind = \"family\"\n[match]\nmodel_types = [\"k\"]\n[fields]\nhidden_size = [\"n_embd\"]\n[mixer]\nmodule = \"m\"\nout_tensor = \"o\"\nout_cols = \"c\"\n[mixer.params]\nheads = { config = \"ssm_n_heads\" }\ninner = { expr = \"ssm_expand * hidden_size\" }\n[attention.params]\nkv = { config = \"kv_lora_rank\" }\nrope = { config = \"rope_parameters.factor\", default = 1.0 }\n";
+        let r = Registry::from_texts([family]).unwrap();
+        let keys = r.config_keys();
+        for k in ["hidden_size", "n_embd", "ssm_n_heads", "ssm_expand", "hidden_size", "kv_lora_rank", "rope_parameters"] {
+            assert!(keys.contains(&k.to_string()), "{k} not in {keys:?}");
+        }
+        assert!(!keys.iter().any(|k| k == "model_type"));
     }
 }

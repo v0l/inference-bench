@@ -261,3 +261,71 @@ fn stages_are_data() {
     assert_eq!(c.stages.iter().filter(|s| matches!(s, Stage::BlockSum { .. })).count(), 1);
     assert!(c.has_sum());
 }
+
+const GATHER: &str = r#"
+kind = "kir-kernel"
+family = "compose"
+name = "embed_rows"
+threads = 256
+[args]
+width = 64
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["out"]
+[[param]]
+name = "ids"
+type = "i32"
+role = "activation"
+access = "read"
+[[param]]
+name = "table"
+role = "weight"
+access = "read"
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+[[stage]]
+op = "gather"
+name = "row"
+src = "table"
+index = "ids"
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "row * 2.0"
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"
+"#;
+
+#[test]
+fn a_gather_stage_reads_table_rows_by_an_index_buffer_from_toml_alone() {
+    let d = Description::parse(GATHER).unwrap();
+    let cuda = emit(&d.build(&Target::sm_120(), &Shape::new()).unwrap());
+    assert!(cuda.contains("const int* ids"), "{cuda}");
+    assert!(cuda.contains("float row = table[(size_t)ids[blockIdx.y] * WIDTH + i];"), "{cuda}");
+}
+
+#[test]
+fn a_scatter_stage_writes_rows_by_an_index_buffer() {
+    let text = GATHER
+        .replace("name = \"embed_rows\"", "name = \"scatter_rows\"")
+        .replace("per_row = [\"out\"]", "per_row = [\"rows\"]")
+        .replace("name = \"table\"\nrole = \"weight\"", "name = \"rows\"\nrole = \"activation\"")
+        .replace("op = \"gather\"\nname = \"row\"\nsrc = \"table\"\nindex = \"ids\"", "op = \"tile_load\"\nname = \"row\"\nsrc = \"rows\"")
+        .replace("op = \"tile_store\"\ndst = \"out\"\nvalue = \"y\"", "op = \"scatter\"\ndst = \"out\"\nvalue = \"y\"\nindex = \"ids\"");
+    let d = Description::parse(&text).unwrap();
+    let cuda = emit(&d.build(&Target::sm_120(), &Shape::new()).unwrap());
+    assert!(cuda.contains("out[(size_t)ids[blockIdx.y] * WIDTH + i] = "), "{cuda}");
+}
+
+#[test]
+fn indexed_access_checks_the_index_buffer_and_has_no_wgsl_lowering() {
+    let bad = GATHER.replace("name = \"ids\"\ntype = \"i32\"", "name = \"ids\"\ntype = \"f32\"");
+    assert!(Description::parse(&bad).unwrap().build(&Target::sm_120(), &Shape::new()).unwrap_err().contains("i32"));
+    let wgsl = Description::parse(GATHER).unwrap().build(&Target::wgpu_baseline(), &Shape::new());
+    assert!(wgsl.is_err(), "{wgsl:?}");
+}

@@ -8,6 +8,8 @@ const SINKS: &str = "tiny-sinks";
 const CHUNKED: &str = "tiny-chunked";
 const MLA: &str = "tiny-deepseek-v2";
 const MLA_MOE: &str = "tiny-deepseek-v2-moe";
+const GLM: &str = "tiny-glm4-moe";
+const OSS: &str = "tiny-gpt-oss";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -171,4 +173,103 @@ fn sinks_with_soft_cap_and_window_match_transformers() {
 #[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
 fn chunked_nope_with_temperature_matches_transformers() {
     close(CHUNKED, 5e-2);
+}
+
+#[test]
+fn the_glm_config_reads_groups_scaling_bias_and_sigmoid_from_the_family_toml() {
+    let spec = spec(GLM);
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.top_k(), moe.groups, moe.topk_group), (8, 2, 2, 1));
+    assert_eq!((moe.router, moe.score_bias, moe.norm_topk, moe.routed_scale), (specrt::spec::RouterAct::Sigmoid, true, true, 1.5));
+    assert_eq!((moe.shared_slots(), moe.shared_gate, moe.dense_layers.clone()), (1, false, vec![0]));
+    assert!(spec.attention.qk_norm);
+    spec.runnable().unwrap();
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+    for c in ["constexpr int MOE_GROUPS = 2;", "constexpr int MOE_TOPK_GROUP = 1;", "constexpr bool MOE_BIAS = true;", "constexpr bool MOE_SIGMOID = true;"] {
+        assert!(module.source.contains(c), "{c}");
+    }
+}
+
+#[test]
+fn the_glm_checkpoint_loads_the_score_bias() {
+    let spec = spec(GLM);
+    let ck = specrt::weights::Checkpoint::open(&fixture(GLM)).unwrap();
+    let w = ck.layer(&spec, 1).unwrap().moe.unwrap();
+    assert_eq!(w.score_bias.unwrap().len(), 8);
+}
+
+#[test]
+fn a_dense_moe_config_has_no_groups_or_bias() {
+    let spec = spec(MLA_MOE);
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.groups, moe.topk_group, moe.score_bias), (0, 0, false));
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn group_limited_sigmoid_routing_with_score_bias_matches_transformers() {
+    close(GLM, 5e-2);
+}
+
+#[test]
+fn the_gpt_oss_config_reads_biases_clamp_and_mxfp4_experts_from_the_family_toml() {
+    let spec = spec(OSS);
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.top_k(), moe.router_bias, moe.expert_bias, moe.norm_topk), (8, 2, true, true, true));
+    assert_eq!((moe.router_module.as_str(), moe.expert_block, moe.shared_slots()), ("router", Some(specrt::dequant::MXFP4), 0));
+    assert!(spec.attention.qkv_bias && spec.attention.o_bias);
+    let gated = spec.mlp.gated.as_ref().unwrap();
+    assert_eq!((gated.params["alpha"], gated.params["limit"]), (1.702, 2.5));
+    assert_eq!(spec.layers.window, Some(16));
+    spec.runnable().unwrap();
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+    for c in ["constexpr bool MOE_ROUTER_BIAS = true;", "constexpr bool MOE_EBIAS = true;", "fminf(g, 2.5e0f)"] {
+        assert!(module.source.contains(c), "{c}");
+    }
+}
+
+#[test]
+fn the_gpt_oss_checkpoint_decodes_mxfp4_experts_and_loads_every_bias() {
+    let spec = spec(OSS);
+    let ck = specrt::weights::Checkpoint::open(&fixture(OSS)).unwrap();
+    let w = ck.layer(&spec, 0).unwrap();
+    let m = w.moe.unwrap();
+    let (h, inter, e) = (256, 256, 8);
+    let specrt::weights::Stacked::Block { packed, scales } = &m.gate else { panic!("packed") };
+    assert_eq!((packed.len(), scales.len()), (e * inter * h / 2, e * inter * h / 32));
+    assert_eq!((m.router_bias.unwrap().len(), m.gate_up_bias.unwrap().len(), m.down_bias.unwrap().len()), (e, e * 2 * inter, e * h));
+    let specrt::weights::Mixer::Attention(a) = &w.mixer else { panic!("attention") };
+    assert_eq!(a.o_bias.as_ref().unwrap().len(), h);
+    assert!(a.extra.iter().any(|(n, v)| n == "sinks" && v.len() == 4));
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn gpt_oss_sinks_clamped_swiglu_and_mxfp4_experts_match_transformers() {
+    close(OSS, 5e-2);
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn gpt_oss_block_scaled_mma_experts_match_the_packed_gemv_experts() {
+    let (tokens, _, vocab, _) = reference(OSS);
+    let mut mma = spec(OSS);
+    mma.mlp.act_quant = specrt::spec::ActQuant::Fp4;
+    let gemv = spec(OSS);
+    let mut rt_mma = Runtime::load_batched(&mma, 256, 1).unwrap();
+    let mut rt_gemv = Runtime::load_batched(&gemv, 256, 1).unwrap();
+    let a = rt_mma.prompt_logits(&tokens).unwrap();
+    let b = rt_gemv.prompt_logits(&tokens).unwrap();
+    let time = |rt: &mut Runtime| {
+        let start = std::time::Instant::now();
+        for _ in 0..50 {
+            rt.prompt_logits(&tokens).unwrap();
+        }
+        start.elapsed().as_secs_f64() * 20.0
+    };
+    eprintln!("gpt-oss prefill of {} tokens: mma {:.2} ms, gemv {:.2} ms", tokens.len(), time(&mut rt_mma), time(&mut rt_gemv));
+    let dot = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| p * q).sum::<f32>();
+    let cosine = dot(&a, &b) / (dot(&a, &a).sqrt() * dot(&b, &b).sqrt());
+    eprintln!("gpt-oss mma vs gemv cosine {cosine} over {} rows of {vocab}", tokens.len());
+    assert!(a.iter().all(|v| v.is_finite()) && cosine > 0.8, "cosine {cosine}");
 }

@@ -1,0 +1,18 @@
+name = "clamped"
+kind = "family"
+extends = "base"
+
+[match]
+model_types = ["clampedlm"]
+architectures = ["ClampedForCausalLM"]
+
+[mlp.gated]
+expr = "(max(min(u, limit), -limit) + 1.0) * (min(g, limit) * sigmoid(min(g, limit) * alpha))"
+
+[mlp.gated.params]
+alpha = { config = "swiglu_alpha", default = 1.702 }
+limit = { config = "swiglu_limit", default = 7.0 }
+
+[moe]
+expert_block = { elem = "e2m1", scale = "e8m0", group = 32 }
+gate_up_interleaved = true

@@ -1,38 +1,36 @@
 use super::prim;
 
-fn dot_fp4(k: &str) -> String {
-    format!(
-        r##"        const unsigned char* wb = (const unsigned char*)w + at * ({k} / 2);
-        const unsigned char* sb = s + at * ({k} / 16);
-        for (int grp = lane; grp < {k} / 16; grp += 32) {{
-            uint2 q = *(const uint2*)(wb + (size_t)grp * 8);
-            float part = 0.0f;
-#pragma unroll
-            for (int j = 0; j < 8; j++) {{
-                unsigned byte = ((j < 4 ? q.x : q.y) >> (8 * (j & 3))) & 0xffu;
-                part += moe_e2m1(byte & 0xfu) * xs[grp * 16 + 2 * j] + moe_e2m1(byte >> 4) * xs[grp * 16 + 2 * j + 1];
-            }}
-            acc += part * e4m3_to_f32(sb[grp]);
-        }}
-        acc *= g[expert];
-"##
-    )
+fn dot_fp4() -> &'static str {
+    "        const unsigned char* wb = (const unsigned char*)w + at * (K / 2);\n        const unsigned char* sb = s + at * (K / 16);\n        float col[1] = {0.0f};\n        moe_rows_fp4<K, 1>(wb, sb, xs, lane, 1, col);\n        acc = col[0] * g[expert];\n"
 }
 
-fn dot_fp8() -> &'static str {
-    r##"        const unsigned char* wb = (const unsigned char*)w + at * K;
-        const float* sg = g + (size_t)expert * MOE_FP8_GRID<ROWS, K> + (row / FP8_BLOCK) * MOE_FP8_KB<K>;
-        for (int k = lane * 16; k < K; k += 512) {
-            uint4 q = *(const uint4*)(wb + k);
-            float part = e4m3_dot4(q.x, *(const float4*)(xs + k)) + e4m3_dot4(q.y, *(const float4*)(xs + k + 4)) +
-                         e4m3_dot4(q.z, *(const float4*)(xs + k + 8)) + e4m3_dot4(q.w, *(const float4*)(xs + k + 12));
-            acc += part * sg[k / FP8_BLOCK];
+fn dot_mx() -> &'static str {
+    r##"        const unsigned char* wb = (const unsigned char*)w + at * (K / 2);
+        const unsigned char* sb = s + at * (K / MOE_BLOCK);
+        for (int grp = lane; grp < K / MOE_BLOCK; grp += 32) {
+            float part = 0.0f;
+#pragma unroll
+            for (int c = 0; c < MOE_BLOCK / 32; c++) {
+                uint4 q = *(const uint4*)(wb + (size_t)grp * (MOE_BLOCK / 2) + c * 16);
+                const float* x = xs + grp * MOE_BLOCK + c * 32;
+#pragma unroll
+                for (int j = 0; j < 16; j++) {
+                    unsigned word = j < 4 ? q.x : j < 8 ? q.y : j < 12 ? q.z : q.w;
+                    unsigned byte = (word >> (8 * (j & 3))) & 0xffu;
+                    part += moe_e2m1(byte & 0xfu) * x[2 * j] + moe_e2m1(byte >> 4) * x[2 * j + 1];
+                }
+            }
+            acc += part * __uint_as_float((unsigned)sb[grp] << 23);
         }
 "##
 }
 
+fn dot_fp8() -> &'static str {
+    "        const float* sg = g + (size_t)expert * MOE_FP8_GRID<ROWS, K> + (row / FP8_BLOCK) * MOE_FP8_KB<K>;\n        acc = dot_fp8_scaled<K>((const unsigned char*)w + at * K, sg, xs, lane);\n"
+}
+
 fn dot_bf16() -> &'static str {
-    "        const bf16_t* wb = (const bf16_t*)w + at * K;\n        for (int k = lane; k < K; k += 32) acc += bf16_to_f32(wb[k]) * xs[k];\n"
+    "        acc = dot_bf16<K>(w, (int)at, xs, lane);\n"
 }
 
 fn dot() -> String {
@@ -43,8 +41,9 @@ fn dot() -> String {
             "moe_dot",
             "const void* w, const unsigned char* s, const float* g, int expert, int row, const float* xs, int lane",
             &format!(
-                "    size_t at = (size_t)expert * ROWS + row;\n    float acc = 0.0f;\n    if (Q == 1) {{\n{}    }} else if (Q == 2) {{\n{}    }} else {{\n{}    }}\n    return warp_sum(acc);\n",
-                dot_fp4("K"),
+                "    size_t at = (size_t)expert * ROWS + row;\n    float acc = 0.0f;\n    if (Q == 1) {{\n{}    }} else if (Q == 3) {{\n{}    }} else if (Q == 2) {{\n{}    }} else {{\n{}    }}\n    return warp_sum(acc);\n",
+                dot_fp4(),
+                dot_mx(),
                 dot_fp8(),
                 dot_bf16()
             )
@@ -53,60 +52,45 @@ fn dot() -> String {
 }
 
 fn dot2_fp4() -> &'static str {
+    "        moe_rows_fp4<K, MOE_TJ>((const unsigned char*)w + at * (K / 2), s + at * (K / 16), xs, lane, live, result);\n#pragma unroll\n        for (int j = 0; j < MOE_TJ; j++) result[j] *= g[expert];\n"
+}
+
+fn dot2_mx() -> &'static str {
     r##"        const unsigned char* wb = (const unsigned char*)w + at * (K / 2);
-        const unsigned char* sb = s + at * (K / 16);
-        for (int grp = lane; grp < K / 16; grp += 32) {
-            uint2 q = *(const uint2*)(wb + (size_t)grp * 8);
-            float v[16];
+        const unsigned char* sb = s + at * (K / MOE_BLOCK);
+        for (int grp = lane; grp < K / MOE_BLOCK; grp += 32) {
+            float sc = __uint_as_float((unsigned)sb[grp] << 23);
 #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                unsigned byte = ((j < 4 ? q.x : q.y) >> (8 * (j & 3))) & 0xffu;
-                v[2 * j] = moe_e2m1(byte & 0xfu);
-                v[2 * j + 1] = moe_e2m1(byte >> 4);
-            }
-            float sc = e4m3_to_f32(sb[grp]);
+            for (int c = 0; c < MOE_BLOCK / 32; c++) {
+                uint4 q = *(const uint4*)(wb + (size_t)grp * (MOE_BLOCK / 2) + c * 16);
+                float v[32];
 #pragma unroll
-            for (int j = 0; j < MOE_TJ; j++) {
-                if (j < live) {
-                    float part = 0.0f;
+                for (int j = 0; j < 16; j++) {
+                    unsigned word = j < 4 ? q.x : j < 8 ? q.y : j < 12 ? q.z : q.w;
+                    unsigned byte = (word >> (8 * (j & 3))) & 0xffu;
+                    v[2 * j] = moe_e2m1(byte & 0xfu);
+                    v[2 * j + 1] = moe_e2m1(byte >> 4);
+                }
 #pragma unroll
-                    for (int i = 0; i < 16; i++) part += v[i] * xs[j * K + grp * 16 + i];
-                    result[j] += part * sc;
+                for (int j = 0; j < MOE_TJ; j++) {
+                    if (j < live) {
+                        float part = 0.0f;
+#pragma unroll
+                        for (int i = 0; i < 32; i++) part += v[i] * xs[j * K + grp * MOE_BLOCK + c * 32 + i];
+                        result[j] += part * sc;
+                    }
                 }
             }
         }
-#pragma unroll
-        for (int j = 0; j < MOE_TJ; j++) result[j] *= g[expert];
 "##
 }
 
 fn dot2_fp8() -> &'static str {
-    r##"        const unsigned char* wb = (const unsigned char*)w + at * K;
-        const float* sg = g + (size_t)expert * MOE_FP8_GRID<ROWS, K> + (row / FP8_BLOCK) * MOE_FP8_KB<K>;
-        for (int k = lane * 16; k < K; k += 512) {
-            uint4 q = *(const uint4*)(wb + k);
-            float sc = sg[k / FP8_BLOCK];
-#pragma unroll
-            for (int j = 0; j < MOE_TJ; j++) {
-                if (j < live) {
-                    const float* x = xs + j * K + k;
-                    float part = e4m3_dot4(q.x, *(const float4*)(x)) + e4m3_dot4(q.y, *(const float4*)(x + 4)) +
-                                 e4m3_dot4(q.z, *(const float4*)(x + 8)) + e4m3_dot4(q.w, *(const float4*)(x + 12));
-                    result[j] += part * sc;
-                }
-            }
-        }
-"##
+    "        const float* sg = g + (size_t)expert * MOE_FP8_GRID<ROWS, K> + (row / FP8_BLOCK) * MOE_FP8_KB<K>;\n        moe_rows_fp8<K, MOE_TJ>((const unsigned char*)w + at * K, sg, xs, lane, live, result);\n"
 }
 
 fn dot2_bf16() -> &'static str {
-    r##"        const bf16_t* wb = (const bf16_t*)w + at * K;
-        for (int k = lane; k < K; k += 32) {
-            float wv = bf16_to_f32(wb[k]);
-#pragma unroll
-            for (int j = 0; j < MOE_TJ; j++) if (j < live) result[j] += wv * xs[j * K + k];
-        }
-"##
+    "        moe_rows_bf16<K, MOE_TJ>((const bf16_t*)w + at * K, xs, lane, live, result);\n"
 }
 
 fn dot2() -> String {
@@ -117,8 +101,9 @@ fn dot2() -> String {
             "moe_dot2",
             "const void* w, const unsigned char* s, const float* g, int expert, int row, const float* xs, int lane, int live, float* result",
             &format!(
-                "    size_t at = (size_t)expert * ROWS + row;\n#pragma unroll\n    for (int j = 0; j < MOE_TJ; j++) result[j] = 0.0f;\n    if (Q == 1) {{\n{}    }} else if (Q == 2) {{\n{}    }} else {{\n{}    }}\n#pragma unroll\n    for (int j = 0; j < MOE_TJ; j++) result[j] = warp_sum(result[j]);\n",
+                "    size_t at = (size_t)expert * ROWS + row;\n#pragma unroll\n    for (int j = 0; j < MOE_TJ; j++) result[j] = 0.0f;\n    if (Q == 1) {{\n{}    }} else if (Q == 3) {{\n{}    }} else if (Q == 2) {{\n{}    }} else {{\n{}    }}\n#pragma unroll\n    for (int j = 0; j < MOE_TJ; j++) result[j] = warp_sum(result[j]);\n",
                 dot2_fp4(),
+                dot2_mx(),
                 dot2_fp8(),
                 dot2_bf16()
             )
@@ -126,8 +111,8 @@ fn dot2() -> String {
     )
 }
 
-const UP_ARGS: &str = "const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug";
-const UP_CALL: &str = "gw, gs, gg, uw, us, ug";
+const UP_ARGS: &str = "const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug, const float* eb";
+const UP_CALL: &str = "gw, gs, gg, uw, us, ug, eb";
 
 fn up_impl() -> String {
     format!(
@@ -148,7 +133,11 @@ fn up_impl() -> String {
     if (row >= MOE_INTER) return;
     float g = moe_dot<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
     float u = moe_dot<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane);
-    if (lane == 0) act[(size_t)pair * MOE_INTER + row] = activation(g) * u;
+    if (MOE_EBIAS) {{
+        g += eb[(size_t)expert * 2 * MOE_INTER + row];
+        u += eb[((size_t)expert * 2 + 1) * MOE_INTER + row];
+    }}
+    if (lane == 0) act[(size_t)pair * MOE_INTER + row] = gated_act(g, u);
 "##,
                 prim::warp_ids()
             )
@@ -162,7 +151,7 @@ fn down_impl() -> String {
         prim::device(
             "void",
             "moe_down_impl",
-            "const void* w, const unsigned char* s, const float* g, const float* act, const int* idx, float* out",
+            "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* idx, float* out",
             &format!(
                 r##"    __shared__ __align__(16) float xs[MOE_INTER];
     int pair = blockIdx.x;
@@ -173,6 +162,7 @@ fn down_impl() -> String {
 {}    int row = blockIdx.y * MOE_WARPS + warp;
     if (row >= HIDDEN) return;
     float v = moe_dot<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane);
+    if (MOE_EBIAS) v += db[(size_t)expert * HIDDEN + row];
     if (lane == 0) out[(size_t)pair * HIDDEN + row] = v;
 "##,
                 prim::warp_ids()
@@ -206,8 +196,14 @@ fn group_up_impl() -> String {
             float gv[MOE_TJ], uv[MOE_TJ];
             moe_dot2<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
             moe_dot2<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane, live, uv);
+            if (MOE_EBIAS) {{
+                for (int j = 0; j < live; j++) {{
+                    gv[j] += eb[(size_t)expert * 2 * MOE_INTER + row];
+                    uv[j] += eb[((size_t)expert * 2 + 1) * MOE_INTER + row];
+                }}
+            }}
             if (lane == 0) {{
-                for (int j = 0; j < live; j++) act[(size_t)sorted[base + j] * MOE_INTER + row] = activation(gv[j]) * uv[j];
+                for (int j = 0; j < live; j++) act[(size_t)sorted[base + j] * MOE_INTER + row] = gated_act(gv[j], uv[j]);
             }}
         }}
     }}
@@ -224,7 +220,7 @@ fn group_down_impl() -> String {
         prim::device(
             "void",
             "moe_group_down_impl",
-            "const void* w, const unsigned char* s, const float* g, const float* act, const int* offsets, const int* sorted, float* out",
+            "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* offsets, const int* sorted, float* out",
             &format!(
                 r##"    __shared__ __align__(16) float xs[MOE_TJ * MOE_INTER];
     int expert = blockIdx.x;
@@ -242,6 +238,9 @@ fn group_down_impl() -> String {
         if (row < HIDDEN) {{
             float v[MOE_TJ];
             moe_dot2<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane, live, v);
+            if (MOE_EBIAS) {{
+                for (int j = 0; j < live; j++) v[j] += db[(size_t)expert * HIDDEN + row];
+            }}
             if (lane == 0) {{
                 for (int j = 0; j < live; j++) out[(size_t)sorted[base + j] * HIDDEN + row] = v[j];
             }}
@@ -264,6 +263,7 @@ pub fn gemv() -> String {
     let mut out = String::new();
     out.push_str(prim::fp8_grid());
     out.push_str(&prim::e2m1_to_f32("moe_e2m1"));
+    out.push_str(&prim::multi_row_dot("moe_rows_fp4", prim::RowFormat::Fp4Rows { decode: "moe_e2m1" }, prim::RowLoad { unroll: 0, stream: false }));
     out.push_str(&dot());
     out.push_str(&up_impl());
     out.push_str(&down_impl());
@@ -273,12 +273,14 @@ pub fn gemv() -> String {
 pub fn pair_entries() -> String {
     let mut out = String::new();
     entries(&mut out, "moe_up", &format!("{UP_ARGS}, const float* xn, const int* idx, float* act"), "moe_up_impl", &format!("{UP_CALL}, xn, idx, act"));
-    entries(&mut out, "moe_down", "const void* w, const unsigned char* s, const float* g, const float* act, const int* idx, float* out", "moe_down_impl", "w, s, g, act, idx, out");
+    entries(&mut out, "moe_down", "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* idx, float* out", "moe_down_impl", "w, s, g, db, act, idx, out");
     out
 }
 
 pub fn grouped() -> String {
-    let mut out = dot2();
+    let mut out = prim::multi_row_dot("moe_rows_fp8", prim::RowFormat::Fp8, prim::RowLoad { unroll: 0, stream: false });
+    out.push_str(&prim::multi_row_dot("moe_rows_bf16", prim::RowFormat::Bf16, prim::RowLoad { unroll: 8, stream: true }));
+    out.push_str(&dot2());
     out.push_str(&group_up_impl());
     out.push_str(&group_down_impl());
     out
@@ -290,9 +292,9 @@ pub fn group_entries() -> String {
     entries(
         &mut out,
         "moe_group_down",
-        "const void* w, const unsigned char* s, const float* g, const float* act, const int* offsets, const int* sorted, float* out",
+        "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* offsets, const int* sorted, float* out",
         "moe_group_down_impl",
-        "w, s, g, act, offsets, sorted, out",
+        "w, s, g, db, act, offsets, sorted, out",
     );
     out
 }

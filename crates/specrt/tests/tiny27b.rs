@@ -41,7 +41,15 @@ fn load_spec(serving: bool) -> Spec {
 }
 
 fn weight_spec() -> Spec {
-    load_spec(false)
+    let mut s = load_spec(false);
+    s.runtime.split_activations = Some(true);
+    s
+}
+
+fn plain_weight_spec() -> Spec {
+    let mut s = load_spec(false);
+    s.runtime.split_activations = Some(false);
+    s
 }
 
 fn act_spec() -> Spec {
@@ -136,6 +144,23 @@ fn weight_only_logits_kl_and_greedy_match_transformers() {
     assert!(err <= 5e-3, "{err}");
     let g = rt.generate(&prompt, greedy.len(), Sampling::GREEDY).unwrap();
     assert_eq!(g.tokens, greedy);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn single_plane_logits_stay_near_the_reference() {
+    let s = plain_weight_spec();
+    let m = meta("tiny27b-text.json");
+    let seq = ids(&m["tokens"]);
+    let want = floats("tiny27b-text.logits.bin");
+    let mut rt = Runtime::load(&s, 256).unwrap();
+    let ours = rt.prompt_logits(&seq).unwrap();
+    let vocab = s.dims.vocab;
+    let (kl, agree, err) = (mean_kl(&want, &ours, vocab), top1(&want, &ours, vocab), relative(&ours, &want));
+    eprintln!("single-plane: KL {kl:e}, top-1 {agree}, max relative {err:e}");
+    assert!(kl <= 1e-4, "KL {kl}");
+    assert!(agree >= 0.9, "top-1 {agree}");
+    assert!(err <= 2e-2, "{err}");
 }
 
 #[test]

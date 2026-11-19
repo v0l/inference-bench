@@ -10,6 +10,7 @@ pub enum RopeStyle {
 pub enum RowBody {
     SpanRope { row: u32, head: u32, offset: u32, rot: u32, style: RopeStyle },
     StateWrite { src_row: u32, src_offset: u32, layers: u32, rows: u32, width: u32 },
+    IndexTopk { heads: u32, dim: u32, topk: u32, max_keys: u32, q_row: u32, q_offset: u32, w_row: u32, w_offset: u32, out_row: u32 },
     HeadMatvec { x_row: u32, x_head: u32, x_offset: u32, inner: u32, w_head: u32, w_inner: u32, w_out: u32, w_offset: u32, out: u32, y_row: u32, y_head: u32, y_offset: u32 },
 }
 
@@ -32,6 +33,7 @@ impl RowBody {
             RowBody::SpanRope { .. } => "span_rope",
             RowBody::StateWrite { .. } => "state_write",
             RowBody::HeadMatvec { .. } => "head_matvec",
+            RowBody::IndexTopk { .. } => "index_topk",
         }
     }
 
@@ -55,6 +57,15 @@ impl RowBody {
                 out.push(("dst", Scalar::Bf16, Role::Activation, Access::Write));
                 out.extend(POSITION);
                 out.extend(PAGED);
+            }
+            RowBody::IndexTopk { .. } => {
+                out.push(("q", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("w", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("keys", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("idx", Scalar::I32, Role::Activation, Access::Write));
+                out.push(("pos", Scalar::I32, Role::Activation, Access::Read));
+                out.push(("pos_step", Scalar::I32, Role::Value, Access::Read));
+                out.push(("row_step", Scalar::I32, Role::Value, Access::Read));
             }
             RowBody::HeadMatvec { .. } => {
                 out.push(("x", Scalar::F32, Role::Activation, Access::Read));
@@ -88,6 +99,9 @@ impl RowBody {
         match self {
             RowBody::SpanRope { rot, head, .. } if *rot == 0 || !rot.is_multiple_of(2) || rot > head => Err("span_rope needs an even rot no wider than the head".into()),
             RowBody::StateWrite { width, rows, layers, .. } if *width == 0 || *rows == 0 || *layers == 0 => Err("state_write needs a positive width, rows and layers".into()),
+            RowBody::IndexTopk { heads, dim, topk, max_keys, .. } if *heads == 0 || *dim == 0 || *topk == 0 || *max_keys == 0 => Err("index_topk needs positive heads, dim, topk and max_keys".into()),
+            RowBody::IndexTopk { topk, max_keys, .. } if topk > max_keys => Err("index_topk cannot select more keys than it scores".into()),
+            RowBody::IndexTopk { max_keys, .. } if *max_keys > 12288 => Err("index_topk scores live in shared memory, at most 12288 keys".into()),
             RowBody::HeadMatvec { inner, out, .. } if *inner == 0 || *out == 0 => Err("head_matvec needs positive inner and out sizes".into()),
             _ => Ok(()),
         }
@@ -148,6 +162,61 @@ impl RowBody {
         attn_split(in[d], hi, lo);
         out[d] = (bf16_t)hi;
         if (KV_PLANES == 2) out[{width} + d] = (bf16_t)lo;
+    }}
+"
+            ),
+            RowBody::IndexTopk { heads, dim, topk, max_keys, q_row, q_offset, w_row, w_offset, out_row } => format!(
+                "    constexpr int HEADS = {heads};
+    constexpr int DIM = {dim};
+    constexpr int TOPK = {topk};
+    constexpr int MAX_KEYS = {max_keys};
+    __shared__ float score[MAX_KEYS];
+    __shared__ float best_v[32];
+    __shared__ int best_i[32];
+    const int row = blockIdx.y;
+    const int n = min(pos[row * pos_step] + row * row_step + 1, MAX_KEYS);
+    const float* qr = q + (size_t)row * {q_row} + {q_offset};
+    const float* wr = w + (size_t)row * {w_row} + {w_offset};
+    for (int t = threadIdx.x; t < MAX_KEYS; t += blockDim.x) {{
+        float s = -3.0e30f;
+        if (t < n) {{
+            s = 0.0f;
+            for (int h = 0; h < HEADS; h++) {{
+                float d = 0.0f;
+                for (int j = 0; j < DIM; j++) d += qr[h * DIM + j] * keys[(size_t)t * DIM + j];
+                s += wr[h] * fmaxf(d, 0.0f);
+            }}
+        }}
+        score[t] = s;
+    }}
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (blockDim.x + 31) >> 5;
+    for (int r = 0; r < TOPK; r++) {{
+        float bv = -3.0e30f;
+        int bi = MAX_KEYS;
+        for (int t = threadIdx.x; t < MAX_KEYS; t += blockDim.x) {{
+            if (score[t] > bv) {{ bv = score[t]; bi = t; }}
+        }}
+        for (int o = 16; o > 0; o >>= 1) {{
+            float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) {{ bv = ov; bi = oi; }}
+        }}
+        if (lane == 0) {{ best_v[warp] = bv; best_i[warp] = bi; }}
+        __syncthreads();
+        if (threadIdx.x == 0) {{
+            float v = best_v[0];
+            int at = best_i[0];
+            for (int i = 1; i < warps; i++) {{
+                if (best_v[i] > v || (best_v[i] == v && best_i[i] < at)) {{ v = best_v[i]; at = best_i[i]; }}
+            }}
+            bool live = r < n && at < MAX_KEYS;
+            idx[(size_t)row * {out_row} + r] = live ? at : -1;
+            if (live) score[at] = -3.0e30f;
+        }}
+        __syncthreads();
     }}
 "
             ),

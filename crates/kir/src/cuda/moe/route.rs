@@ -16,12 +16,7 @@ fn logits_norm() -> &'static str {
             float4 v = *(const float4*)(xr + i);
             ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
         }
-        ss = warp_sum(ss);
-        __syncthreads();
-        if (lane == 0) red[warp] = ss;
-        __syncthreads();
-        float total = 0.0f;
-        for (int w = 0; w < MOE_WARPS; w++) total += red[w];
+        float total = block_reduce<false>(ss, red);
         float inv = rsqrtf(total / HIDDEN + EPS);
         for (int i = tid; i < HIDDEN; i += 256) {
             float v = xr[i] * inv * ln[i];
@@ -60,6 +55,7 @@ fn logits_dot() -> &'static str {
 #pragma unroll
     for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {
         float v = warp_sum(a[j]);
+        if (MOE_ROUTER_BIAS && e < MOE_E) v += router_bias[e];
         if (lane == 0 && j < live) logits[(size_t)(t0 + j) * (MOE_E + 1) + e] = v;
     }
 "##
@@ -71,7 +67,7 @@ pub fn route_logits() -> String {
         prim::global(
             Some(256),
             "moe_route_logits",
-            "const float* x, const float* ln, const bf16_t* router, const float* shared_gate, float* xn, float* logits, int n",
+            "const float* x, const float* ln, const bf16_t* router, const float* shared_gate, const float* router_bias, float* xn, float* logits, int n",
             &format!("{}{}", logits_norm(), logits_dot())
         )
     )
@@ -79,6 +75,9 @@ pub fn route_logits() -> String {
 
 fn probabilities() -> &'static str {
     r##"    __shared__ float probs[MOE_E];
+    __shared__ float sel[MOE_E];
+    __shared__ float group_score[MOE_GROUPS];
+    __shared__ bool group_kept[MOE_GROUPS];
     __shared__ float top_v[MOE_K];
     __shared__ int top_i[MOE_K];
     int t = blockIdx.x;
@@ -90,7 +89,7 @@ fn probabilities() -> &'static str {
     } else {
         float m = NEG_INF;
         for (int e = lane; e < MOE_E; e += 32) m = fmaxf(m, lg[e]);
-        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+        m = warp_max(m);
         float s = 0.0f;
         for (int e = lane; e < MOE_E; e += 32) {
             float p = expf(lg[e] - m);
@@ -101,27 +100,49 @@ fn probabilities() -> &'static str {
         for (int e = lane; e < MOE_E; e += 32) probs[e] /= s;
     }
     __syncwarp();
+    if (MOE_HASH && hashed) {
+        for (int e = lane; e < MOE_E; e += 32) sel[e] = -3.0e30f;
+        __syncwarp();
+        if (lane == 0) {
+            for (int k = 0; k < MOE_K; k++) sel[table[(size_t)tokens[t] * MOE_K + k]] = 1.0f - 1.0e-3f * k;
+        }
+        __syncwarp();
+    } else {
+    for (int e = lane; e < MOE_E; e += 32) sel[e] = MOE_BIAS ? probs[e] + bias[e] : probs[e];
+    __syncwarp();
+    if (MOE_GROUPS > 1) {
+        constexpr int PER = MOE_E / MOE_GROUPS;
+        for (int g = lane; g < MOE_GROUPS; g += 32) {
+            float a = -3.0e30f, b = -3.0e30f;
+            for (int j = 0; j < PER; j++) {
+                float v = sel[g * PER + j];
+                if (v > a) { b = a; a = v; } else if (v > b) { b = v; }
+            }
+            group_score[g] = a + b;
+            group_kept[g] = false;
+        }
+        __syncwarp();
+        if (lane == 0) {
+            for (int r = 0; r < MOE_TOPK_GROUP; r++) {
+                int best = -1;
+                for (int g = 0; g < MOE_GROUPS; g++) {
+                    if (!group_kept[g] && (best < 0 || group_score[g] > group_score[best])) best = g;
+                }
+                group_kept[best] = true;
+            }
+        }
+        __syncwarp();
+        for (int e = lane; e < MOE_E; e += 32) {
+            if (!group_kept[e / PER]) sel[e] = -1.0e30f;
+        }
+        __syncwarp();
+    }
+    }
 "##
 }
 
-fn top_k() -> &'static str {
-    r##"    float picked = 0.0f;
-    for (int k = 0; k < MOE_K; k++) {
-        float bv = -1.0f;
-        int bi = MOE_E;
-        for (int e = lane; e < MOE_E; e += 32) {
-            if (probs[e] > bv) { bv = probs[e]; bi = e; }
-        }
-        for (int o = 16; o > 0; o >>= 1) {
-            float ov = __shfl_xor_sync(0xffffffff, bv, o);
-            int oi = __shfl_xor_sync(0xffffffff, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        }
-        if (lane == 0) { top_v[k] = bv; top_i[k] = bi; probs[bi] = -2.0f; }
-        picked += bv;
-        __syncwarp();
-    }
-"##
+fn top_k() -> String {
+    crate::cuda::topk::warp_top_k(&crate::cuda::topk::TopK { sel: "sel", vals: "probs", count: "MOE_E", k: "MOE_K", out_v: "top_v", out_i: "top_i", sum: "picked", floor: "-3.0e30f", taken: "-2.0e30f" })
 }
 
 fn emit_pairs() -> &'static str {
@@ -149,7 +170,7 @@ fn emit_pairs() -> &'static str {
 pub fn route() -> String {
     format!(
         "constexpr bool MOE_PARALLEL = MOE_LOCAL != MOE_E;\n\n{}",
-        prim::global(Some(32), "moe_route", "const float* logits, int* idx, float* coef, int first", &format!("{}{}{}", probabilities(), top_k(), emit_pairs()))
+        prim::global(Some(32), "moe_route", "const float* logits, const float* bias, const int* table, const int* tokens, int hashed, int* idx, float* coef, int first", &format!("{}{}{}", probabilities(), top_k(), emit_pairs()))
     )
 }
 
