@@ -35,3 +35,7 @@ Tiles, 4 runs each: 256x128 (4x2) 15.3-15.6k tok/s, 128x256 11.8k, 128x128 (2x4)
 | phi3 | 4610.8 (3807.3) | 5763.5 llama.cpp | 0.80 (0.67) | 0.87 | 1.06 |
 
 The 0.8x target at 1,024 tokens is reached on phi3 only. phi3's vLLM column did not run on the last pass, so its ratio is against llama.cpp (its earlier vLLM figure was lower than llama.cpp). The rest of the gap is the main loop (the kernel is at about 85% of cuBLAS's 79 TFLOP/s, see docs/perf/llama/2026-11-19.md) and the non-GEMM kernels (flash_mma 6-14%).
+
+## qwen3_5 (#815)
+
+Qwen3.5-9B on the Spark, prefill paired A/B (split vs single plane, 4 rounds): 1024 tokens 1850 to 2040-2190 tok/s (about 1.11x), 4096 tokens 1720 to 2020-2150 (about 1.20x); decode level. Distance between the two paths on 235 prompt rows: mean KL 1.1e-5, max 2.1e-4, top-1 234 of 235 identical. `family-qwen3_5.toml` now sets `split_activations = false`; `[runtime] split_activations = true` restores the exact path. The remaining gap to llama.cpp is the bf16 GEMM main loop (gate_up_mma_big 45% of prefill) and gdn_chunk_prep/scan (5%).

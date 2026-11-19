@@ -274,7 +274,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
     }
     if la && spec.speculative().is_some() {
         for linear in crate::mtp::MTP_LINEARS {
-            set.tiles(t, &format!("{linear}_mma"), linear_shape(spec, linear), WeightFormat::Bf16, true, false, &tuning)?;
+            set.tiles(t, &format!("{linear}_mma"), linear_shape(spec, linear), WeightFormat::Bf16, split(spec, linear, WeightFormat::Bf16), false, &tuning)?;
         }
     }
     if let Some(scale) = fp8_scale(spec) {

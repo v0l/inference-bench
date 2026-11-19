@@ -82,5 +82,6 @@
       "start": 998,
       "end": 999
     }
-  }
+  },
+  "plain_activations": true
 }
