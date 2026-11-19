@@ -293,9 +293,9 @@ pub fn cp_async_call(func: &str, args: &[&str]) -> String {
     format!("{func}({});", args.join(", "))
 }
 
-pub fn cp_async_stage(iters: &str, total: &str, chunks: &str, col: &str, planes: bool, prelude: &str, copy: &str) -> String {
-    let head = if planes {
-        format!("int p = idx / ({total});\nint rem = idx % ({total});\nint r = rem / {chunks};\nint {col} = rem % {chunks};\n")
+pub fn cp_async_stage(iters: &str, total: &str, chunks: &str, col: &str, plane: Option<&str>, prelude: &str, copy: &str) -> String {
+    let head = if let Some(plane) = plane {
+        format!("int p = idx / ({plane});\nint rem = idx % ({plane});\nint r = rem / {chunks};\nint {col} = rem % {chunks};\n")
     } else {
         format!("int r = idx / {chunks};\nint {col} = idx % {chunks};\n")
     };

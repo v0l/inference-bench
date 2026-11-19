@@ -90,6 +90,16 @@ fn wgsl_dequant_goldens_per_format() {
 }
 
 #[test]
+fn the_bf16_activation_stage_splits_hi_and_lo_planes_by_tile_size_not_by_total() {
+    let t = Target::sm_120();
+    let k = KernelInstance::gemm(&t, "qkv_mma", qkv(), WeightFormat::Bf16, Tuning::default().tile(Variant::Small), true, false).unwrap();
+    let src = kir::cuda::emit_gemms(&[k]).unwrap();
+    assert!(src.contains("int p = idx / (BM * A_CHUNKS);"), "plane index must divide by one plane's chunk count");
+    assert!(src.contains("int rem = idx % (BM * A_CHUNKS);"));
+    assert!(!src.contains("idx / (A_TOTAL)"));
+}
+
+#[test]
 fn sm120_gets_the_block_scaled_fp4_mma_and_sm80_does_not() {
     let k = KernelInstance::fp4_act(&Target::sm_120(), "down_f4a", down(), Tile::SMALL, &Tuning::default()).unwrap();
     assert!(kir::cuda::emit_gemms(&[k]).unwrap().contains("kind::mxf4nvf4.block_scale"));
