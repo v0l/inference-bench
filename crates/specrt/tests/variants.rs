@@ -10,6 +10,7 @@ const MLA: &str = "tiny-deepseek-v2";
 const MLA_MOE: &str = "tiny-deepseek-v2-moe";
 const GLM: &str = "tiny-glm4-moe";
 const OSS: &str = "tiny-gpt-oss";
+const DSA: &str = "tiny-glm-dsa";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -247,4 +248,36 @@ fn the_gpt_oss_checkpoint_decodes_mxfp4_experts_and_loads_every_bias() {
 #[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
 fn gpt_oss_sinks_clamped_swiglu_and_mxfp4_experts_match_transformers() {
     close(OSS, 5e-2);
+}
+
+#[test]
+fn the_dsa_config_reads_indexer_layers_states_and_nodes_from_the_family_toml() {
+    let spec = spec(DSA);
+    assert_eq!(spec.layers.pattern, vec![Block::Full, Block::Shared]);
+    assert_eq!(spec.state.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["latent", "index_key"]);
+    assert_eq!(specrt::state::named(&spec, "index_key").unwrap().dims(&spec).unwrap(), vec![1, 64]);
+    assert_eq!(spec.attention.params["index_topk"], 8.0);
+    assert!((spec.attention.params["index_scale"] - 0.125).abs() < 1e-12);
+    assert!((spec.attention.params["index_w_scale"] - 0.5).abs() < 1e-12);
+    assert_eq!(spec.qkv_rows(), 64 + 128 + 64 + 4);
+    let plan = Plan::build(&spec, Phase::Prefill, true);
+    let kernels = |block: Block| plan.layer(block).iter().filter(|o| matches!(o, Op::Kernel { .. })).count();
+    assert_eq!((kernels(Block::Full), kernels(Block::Shared)), (15, 9));
+}
+
+#[test]
+fn the_dsa_module_builds_with_no_binary_support() {
+    let module = specrt::codegen::Module::generate_kv(&spec(DSA), 256, 1, &kir::Target::sm_120()).unwrap();
+    for k in ["dsa_q_norm", "dsa_latent_norm", "dsa_q_b", "dsa_rope_q", "dsa_latent_write", "dsa_absorb_q", "dsa_index_q", "dsa_index_rope_q", "dsa_index_k_norm", "dsa_index_rope_k", "dsa_index_write", "dsa_index_topk", "dsa_attention"] {
+        assert!(module.kernels.contains(&k), "{k}");
+        assert!(module.source.contains(&format!("{k}(")), "{k}");
+    }
+    assert!(module.source.contains("sel_hit"), "the scan keeps only indexed keys");
+    assert!(module.source.contains("rsqrtf(kir_block_sum(sq, scratch)"), "the indexer key uses a layernorm");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn dsa_indexer_with_a_shared_layer_matches_transformers() {
+    close(DSA, 5e-2);
 }

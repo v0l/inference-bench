@@ -704,6 +704,7 @@ pub struct Runtime {
     layers: Vec<DeviceLayer>,
     described: Vec<Option<DescribedLaunch>>,
     scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
+    int_scratch: std::collections::BTreeMap<String, CudaSlice<i32>>,
     buf: Buffers,
     pre: PrefillBuffers,
     gdn: Option<GdnBuffers>,
@@ -1087,6 +1088,12 @@ impl Runtime {
             scratch: spec
                 .attention
                 .scratch
+                .iter()
+                .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
+                .collect::<Result<_>>()?,
+            int_scratch: spec
+                .attention
+                .int_scratch
                 .iter()
                 .map(|(n, w)| Ok((n.clone(), stream.alloc_zeros(chunk * crate::state::dim(spec, w)?)?)))
                 .collect::<Result<_>>()?,

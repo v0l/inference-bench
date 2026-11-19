@@ -10,7 +10,7 @@ use toml::Value;
 
 pub const KIND: &str = "kir-kernel";
 
-pub const ROW_FAMILIES: [&str; 4] = ["span_rope", "state_write", "head_matvec", "index_topk"];
+pub const ROW_FAMILIES: [&str; 5] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment"];
 
 pub const SEQ_FAMILIES: [&str; 3] = ["recurrence", "seq_conv", "group_norm"];
 
@@ -558,8 +558,9 @@ impl Description {
             stages.push(match s.op.as_str() {
                 "epilogue" => ScanStage::Epilogue { dst: need(&s.name, "name", &s.op)?, expr: expr(s)? },
                 "mask" => ScanStage::Mask { expr: expr(s)? },
+                "select_from" => ScanStage::Select { index: need(&s.index, "index", &s.op)?, row: self.size(shape, s.row.as_ref().ok_or_else(|| format!("{}: stage select_from needs row", self.name))?, "row")? },
                 "online_softmax" => ScanStage::Softmax { value: need(&s.value, "value", &s.op)?, sink: s.sink.clone() },
-                o => return Err(format!("{}: scan stage op {o:?} is not epilogue, mask or online_softmax", self.name)),
+                o => return Err(format!("{}: scan stage op {o:?} is not epilogue, mask, select_from or online_softmax", self.name)),
             });
         }
         Kernel::scan(t, intern(&self.name), self.threads(shape)?, params, Scan { consts, stages, geometry: self.scan_geometry(shape)? }).map_err(|e| format!("{}: {e}", self.name))
@@ -756,8 +757,12 @@ impl Description {
                 RowBody::StateWrite { src_row: n["src_row"], src_offset: n["src_offset"], layers: n["layers"], rows: n["rows"], width: n["width"] }
             }
             "index_topk" => {
-                let n = self.sizes(shape, &self.args, &["heads", "dim", "topk", "max_keys", "q_row", "q_offset", "w_row", "w_offset", "out_row"], "[args]")?;
-                RowBody::IndexTopk { heads: n["heads"], dim: n["dim"], topk: n["topk"], max_keys: n["max_keys"], q_row: n["q_row"], q_offset: n["q_offset"], w_row: n["w_row"], w_offset: n["w_offset"], out_row: n["out_row"] }
+                let n = self.sizes(shape, &self.args, &["heads", "dim", "topk", "max_keys", "q_row", "q_offset", "w_row", "w_offset", "out_row", "layers"], "[args]")?;
+                RowBody::IndexTopk { heads: n["heads"], dim: n["dim"], topk: n["topk"], max_keys: n["max_keys"], q_row: n["q_row"], q_offset: n["q_offset"], w_row: n["w_row"], w_offset: n["w_offset"], out_row: n["out_row"], layers: n["layers"] }
+            }
+            "layernorm_segment" => {
+                let n = self.sizes(shape, &self.args, &["width", "row", "head", "offset"], "[args]")?;
+                RowBody::LayerNorm { width: n["width"], row: n["row"], head: n["head"], offset: n["offset"], eps: self.number(shape, "eps")? as f32 }
             }
             "head_matvec" => {
                 let n = self.sizes(shape, &self.args, &["x_row", "x_head", "x_offset", "inner", "w_head", "w_inner", "w_out", "w_offset", "out", "y_row", "y_head", "y_offset"], "[args]")?;

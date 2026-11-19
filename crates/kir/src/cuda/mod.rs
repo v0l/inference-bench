@@ -219,7 +219,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
 
 pub fn emit_module(kernels: &[Kernel]) -> Result<String, String> {
     let mut out = String::new();
-    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum())) {
+    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum()) || matches!(&k.body, Body::Rows(crate::rows::RowBody::LayerNorm { .. }))) {
         out.push_str(WARP_SUM);
     }
     for k in kernels {

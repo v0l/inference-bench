@@ -94,6 +94,7 @@ pub struct FamilyAttention {
     pub projection: Vec<crate::spec::Projection>,
     pub o_cols: Option<String>,
     pub scratch: std::collections::BTreeMap<String, String>,
+    pub int_scratch: std::collections::BTreeMap<String, String>,
     pub qkv_bias: Flag,
     pub o_bias: Flag,
     pub qk_norm: Flag,
@@ -110,6 +111,7 @@ impl Default for FamilyAttention {
             projection: Vec::new(),
             o_cols: None,
             scratch: Default::default(),
+            int_scratch: Default::default(),
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
             o_bias: Flag::Fixed(false),
             qk_norm: Flag::Fixed(false),
@@ -229,6 +231,7 @@ pub struct FamilyBlocks {
     pub other_layer_type: Option<crate::spec::Block>,
     pub sliding_period_key: Option<String>,
     pub attention_indices_key: Option<String>,
+    pub types_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

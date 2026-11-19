@@ -12,7 +12,7 @@ when = "vision+tensor_core"
 [[block]]
 name = "attention_branch"
 when = "branch+tensor_core"
-layers = ["dense", "full", "sliding"]
+layers = ["dense", "full", "sliding", "shared"]
 mlp = "dense"
 
 [[block.node]]
@@ -168,7 +168,7 @@ in = "xn_planes"
 [[block]]
 name = "attention"
 when = "plain"
-layers = ["dense", "full", "sliding"]
+layers = ["dense", "full", "sliding", "shared"]
 mlp = "dense"
 
 [[block.node]]
@@ -445,7 +445,7 @@ in = "act_planes"
 [[block]]
 name = "attention_moe"
 when = "plain"
-layers = ["dense", "full", "sliding"]
+layers = ["dense", "full", "sliding", "shared"]
 mlp = "sparse"
 
 [[block.node]]

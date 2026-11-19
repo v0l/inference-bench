@@ -177,6 +177,7 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
     for (n, v) in &spec.attention.params {
         symbols = symbols.num(n, *v);
     }
+    symbols = symbols.num("max_context", max_ctx as f64);
     for s in crate::state::positional(spec) {
         symbols = symbols.num(&format!("{}_layers", s.name), s.layer_count(spec) as f64);
     }
@@ -200,7 +201,10 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
             let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[attention.node]] {i} binds {b:?}, which {name} has no param for"))?;
             match (param.role, v) {
                 (kir::Role::Weight, crate::graph::Bind::Weight { .. }) => {}
-                (kir::Role::Activation, crate::graph::Bind::Buffer { .. }) => anyhow::ensure!(param.ty == kir::Scalar::F32, "[[attention.node]] {i} binds buffer to {b:?}, which is not f32"),
+                (kir::Role::Activation, crate::graph::Bind::Buffer { buffer }) => {
+                    let ints = spec.attention.int_scratch.contains_key(buffer);
+                    anyhow::ensure!(param.ty == if ints { kir::Scalar::I32 } else { kir::Scalar::F32 }, "[[attention.node]] {i} binds buffer {buffer:?} to {b:?}, which is not {}", if ints { "i32" } else { "f32" })
+                }
                 (kir::Role::Activation, crate::graph::Bind::State { .. }) => anyhow::ensure!(param.ty == kir::Scalar::Bf16, "[[attention.node]] {i} binds a state to {b:?}, which is not bf16"),
                 (kir::Role::Value, crate::graph::Bind::Weight { .. } | crate::graph::Bind::Buffer { .. } | crate::graph::Bind::State { .. })
                 | (kir::Role::Weight, _)
