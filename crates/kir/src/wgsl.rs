@@ -488,42 +488,52 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let sg = li / 32u;
     let sm = (sg / 2u) * 32u;
     let sn = (sg % 2u) * 32u;
-{acc_init}    var ents: array<u32, {pairs}>;
-    for (var n = 0u; n < {pairs}u; n++) {{
-        ents[n] = rows[min(r0 + (li + n * {COOP_THREADS}u) / (BK / 2u), nrows - 1u)];
+{acc_init}    var ents: array<u32, {quads}>;
+    for (var n = 0u; n < {quads}u; n++) {{
+        ents[n] = rows[min(r0 + (li + n * {COOP_THREADS}u) / (BK / 4u), nrows - 1u)];
     }}
+    let cols4 = cols / 4u;
     for (var k0 = 0u; k0 < cols; k0 += BK) {{
-        for (var n = 0u; n < {pairs}u; n++) {{
+        for (var n = 0u; n < {quads}u; n++) {{
             let idx = li + n * {COOP_THREADS}u;
-            let kp = idx % (BK / 2u);
-            let m = idx / (BK / 2u);
-            let c = k0 + kp * 2u;
+            let kq = idx % (BK / 4u);
+            let m = idx / (BK / 4u);
+            let c = k0 + kq * 4u;
             let t = t0 + m;
-            var x0 = 0.0;
-            var x1 = 0.0;
-            if (t < tokens && c < cols) {{
-                x0 = x[(x_row0 + t) * cols + c];
-                x1 = x[(x_row0 + t) * cols + c + 1u];
-            }}
-            sh[m * BK + kp * 2u] = x0;
-            sh[m * BK + kp * 2u + 1u] = x1;
+            var xv = vec4<f32>(0.0);
             var w0 = 0.0;
             var w1 = 0.0;
+            var w2 = 0.0;
+            var w3 = 0.0;
+            if (t < tokens && c < cols) {{
+                xv = x[(x_row0 + t) * cols4 + c / 4u];
+            }}
             if (c < cols) {{
                 let entry = ents[n];
                 let base = (entry >> 3u) * 16u;
                 let code = entry & 7u;
                 if (code == 4u) {{
-                    let w = wdata[(base + 2u * c) >> 2u];
-                    w0 = bitcast<f32>(w << 16u);
-                    w1 = bitcast<f32>(w & 0xffff0000u);
+                    let wa = wdata[(base + 2u * c) >> 2u];
+                    let wb = wdata[((base + 2u * c) >> 2u) + 1u];
+                    w0 = bitcast<f32>(wa << 16u);
+                    w1 = bitcast<f32>(wa & 0xffff0000u);
+                    w2 = bitcast<f32>(wb << 16u);
+                    w3 = bitcast<f32>(wb & 0xffff0000u);
                 }} else {{
                     w0 = dequant_at(base, code, c);
                     w1 = dequant_at(base, code, c + 1u);
+                    w2 = dequant_at(base, code, c + 2u);
+                    w3 = dequant_at(base, code, c + 3u);
                 }}
             }}
-            sh[WOFF + m * BK + kp * 2u] = w0;
-            sh[WOFF + m * BK + kp * 2u + 1u] = w1;
+            sh[m * BK + kq * 4u] = xv.x;
+            sh[m * BK + kq * 4u + 1u] = xv.y;
+            sh[m * BK + kq * 4u + 2u] = xv.z;
+            sh[m * BK + kq * 4u + 3u] = xv.w;
+            sh[WOFF + m * BK + kq * 4u] = w0;
+            sh[WOFF + m * BK + kq * 4u + 1u] = w1;
+            sh[WOFF + m * BK + kq * 4u + 2u] = w2;
+            sh[WOFF + m * BK + kq * 4u + 3u] = w3;
         }}
         workgroupBarrier();
         for (var kk = 0u; kk < BK; kk += 8u) {{
@@ -547,10 +557,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     }}
 }}
 ",
-        bind = storage(&[("x", false, "f32"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
+        bind = storage(&[("x", false, "vec4<f32>"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
         woff = COOP_K * COOP_TOKENS,
         os = COOP_TOKENS * COOP_ROWS,
-        pairs = COOP_K * COOP_TOKENS / 2 / COOP_THREADS,
+        quads = COOP_K * COOP_TOKENS / 4 / COOP_THREADS,
         acc_init = (0..16).map(|n| format!("    var acc{n} = coop_mat8x8<f32, C>();\n")).collect::<String>(),
         mma = coop_mma(),
         store = (0..16).map(|n| format!("    coopStoreT(acc{n}, &sh[(sm + {}u) * BN + sn + {}u], BN);\n", (n / 4) * 8, (n % 4) * 8)).collect::<String>(),
