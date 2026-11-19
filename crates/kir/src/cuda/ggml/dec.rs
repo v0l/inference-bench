@@ -3,10 +3,10 @@ use super::super::gemm::prim;
 
 pub fn body() -> String {
     [
-        r##"struct DecGgml : DecBase<DecGgml> {
-    static constexpr int PAIR = 2;
-    static constexpr bool STRIDE = true;
-    template <int K, int BK, int CPR, int WROW>
+        prim::dec_struct_open("DecGgml"),
+        prim::static_const("int", "PAIR", "2"),
+        prim::static_const("bool", "STRIDE", "true"),
+        r##"    template <int K, int BK, int CPR, int WROW>
     static __device__ __forceinline__ void load(unsigned char* ws, const void* w, const void* s, int r, int n, int kt, int ck) {
         float v[8];
         gg_load8(w, (const unsigned*)s, n, kt * BK + ck * 8, v);
@@ -15,10 +15,12 @@ pub fn body() -> String {
         r##";
         *(uint4*)(ws + swz<CPR>(r, ck) * 16) = packed;
     }
-    template <int K> static __device__ __forceinline__ float dot(const void* w, const void* s, int row, const float* x, int lane) {
+"##.to_string(),
+        r##"    template <int K> static __device__ __forceinline__ float dot(const void* w, const void* s, int row, const float* x, int lane) {
         return gg_row_dot<K>(w, (const unsigned*)s, row, x, lane);
     }
-    template <int K, int ROWS>
+"##.to_string(),
+        r##"    template <int K, int ROWS>
     static __device__ __forceinline__ void rows(const void* w, const void* s, int row0, int stride, const float* x, int lane, float* out) {
         const unsigned char* base[ROWS];
         int type[ROWS];

@@ -92,10 +92,6 @@ pub fn static_const_t(template: &str, ty: &str, name: &str, value: &str) -> Stri
     format!("    template <{template}> static constexpr {ty} {name} = {value};\n")
 }
 
-pub fn static_fn(template: &str, ret: &str, name: &str, args: &str, body: &str) -> String {
-    format!("    template <{template}> static __device__ __forceinline__ {ret} {name}({args}) {{{body}}}\n")
-}
-
 pub fn ldg_reader(name: &str, ptr_ty: &str) -> String {
     device("unsigned", name, "const unsigned char* p", &format!("    return __ldg((const {ptr_ty}*)p);\n"))
 }

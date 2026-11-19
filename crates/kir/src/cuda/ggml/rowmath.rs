@@ -132,13 +132,13 @@ fn q6k_rows(f: &Format, qh: usize, scales: usize, d: usize) -> String {
         scales + 4
     );
     let lane_stores = |v: &str, base: usize| (0..4).map(|c| format!("xv[k][{}] = {v}.{}; ", base + c, ["x", "y", "z", "w"][c])).collect::<String>();
-    let x_body = format!(
-        "{}{}{}{}",
+    let x_body = [
         prim::load_f4("float4 u", "xs", "32 * k"),
         prim::load_f4("float4 v", "xs", "32 * k + 4"),
         format!("{}\n", lane_stores("u", 0).trim_end()),
         format!("{}\n", lane_stores("v", 4).trim_end()),
-    );
+    ]
+    .concat();
     let shared = &format!(
         "        const float* xs = x + sl * GG_SB + 128 * h + l0;\n        float xv[4][8];\n{}",
         prim::unroll_nest(8, &[("k", "4")], true, &x_body)
