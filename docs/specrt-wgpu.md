@@ -557,3 +557,14 @@ The result is the paired round-3 A/B (quiet Mac, base = master before this issue
 Prefill at 4,096 improves 20 to 40%; 1,024 is flat within noise (16-key and 32-key are the same there, so barrier cost is not the reason: attention is a small share of prefill at 1,024). Rounds 1 and 2 of the A/B were disturbed by background load (base itself swung 630 to 1,503 at 1,024) and are not used. The full `mac_vs_llama.sh` before and after tables were run about 30 minutes apart on a loaded machine and are noisy (Qwen3-0.6B Q4_K_M at 4,096 reads 730 before and 696 after, against 590 and 827 in the paired A/B), so they are not a result. The after run against llama.cpp: pp4096 ratios 0.42 (0.6B bf16), 0.33 (0.6B Q4_K_M), 0.58 (Llama-1B), 0.54 (7B).
 
 wgsl 26/26 with `--include-ignored --test-threads=1` and clippy `-D warnings` with the wgpu feature are clean. f16 K/V tiles are dropped (the cache is f32 and f16 cooperative matrices were slower in #768 and #823). The `linear_coop` dequant tile-load phase and Q6_K decode are #862.
+
+## Mac speed work 10 (#862)
+
+`linear_coop` dequant tile-load and Q6_K decode. No kernel change kept. Paired A/B on the M1 Pro with `linear_coop_time_per_dispatch` (tokens 512), base and candidate built side by side and run back to back.
+
+| Candidate | Result vs base |
+|---|---|
+| Double-buffered workgroup tiles (load the next K tile while the simdgroups multiply the current one, one barrier per K step) | 30% slower on every shape (bf16 2.5 to 1.6, Q4_K 2.4 to 1.6, Q6_K 2.3 to 1.5 TFLOP/s). Doubling the 24 KB tile to 48 KB cuts workgroup occupancy more than the overlap gains. |
+| Q6_K per-block scale as one u32 load plus shift, replacing the `wf16`/`wi8` byte loads | Within noise (m=4096 k=14336: 2.16 vs 2.16, k=1024: 2.19 vs 2.13). |
+
+The Q6_K unpack was already vectorised on u32 words (shift and mask on 4 lanes), so there is nothing left to gain there. Base Q4_K and Q6_K sit at 2.2 to 2.5 TFLOP/s against bf16 at 2.5 (1.9 only at k=14336), so dequant is not what separates the kernel from the 3.25 hand kernel. `mac_vs_llama.sh` before and after tables were not run: no change was kept, so they would be identical.
