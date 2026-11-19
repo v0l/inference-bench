@@ -478,11 +478,23 @@ w3 = bitcast<f32>(wb & 0xffff0000u);
 
 const COOP_Q4K: &str = r####"let sb = base + (c / 256u) * 144u;
 let i = c % 256u;
-let j = i / 64u;
-let hi = (i % 64u) >= 32u;
-let sm = scale_min_k4(2u * j + select(0u, 1u, hi), sb);
-let d1 = wf16(sb) * f32(sm.x);
-let mm = wf16(sb + 2u) * f32(sm.y);
+let g = i / 32u;
+let j = g / 2u;
+let hi = (g & 1u) == 1u;
+let sw = sb >> 2u;
+let dm = unpack2x16float(wdata[sw]);
+let s0 = wdata[sw + 1u];
+let s1 = wdata[sw + 2u];
+let s2 = wdata[sw + 3u];
+let sh8 = (g & 3u) * 8u;
+let lo_sc = (s0 >> sh8) & 63u;
+let lo_mn = (s1 >> sh8) & 63u;
+let a8 = (s2 >> sh8) & 255u;
+let hi_sc = (a8 & 15u) | ((((s0 >> sh8) >> 6u) & 3u) << 4u);
+let hi_mn = (a8 >> 4u) | ((((s1 >> sh8) >> 6u) & 3u) << 4u);
+let big = g >= 4u;
+let d1 = dm.x * f32(select(lo_sc, hi_sc, big));
+let mm = dm.y * f32(select(lo_mn, hi_mn, big));
 var q = wdata[(sb + 16u + 32u * j + (i % 32u)) >> 2u];
 if (hi) {
     q = q >> 4u;
@@ -599,9 +611,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
             sh[WOFF + so + 3u] = w3;
         }}
         workgroupBarrier();
-        for (var kk = 0u; kk < BK; kk += 8u) {{
-{mma}        }}
-        workgroupBarrier();
+{mma}        workgroupBarrier();
     }}
     if (accumulate == 0u && r0 + BN <= nrows && t0 + BM <= tokens) {{
 {direct}        return;
@@ -637,12 +647,14 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 
 fn coop_mma() -> String {
     let mut s = String::new();
-    for i in 0..4 {
-        s.push_str(&format!("            let a{i} = coopLoadT<coop_mat8x8<f32, A>>(&sh[((sm + {}u) / 8u * (BK / 8u) + kk / 8u) * 64u], 8u);\n", i * 8));
-        s.push_str(&format!("            let b{i} = coopLoad<coop_mat8x8<f32, B>>(&sh[WOFF + ((sn + {}u) / 8u * (BK / 8u) + kk / 8u) * 64u], 8u);\n", i * 8));
-    }
-    for n in 0..16 {
-        s.push_str(&format!("            acc{n} = coopMultiplyAdd(a{}, b{}, acc{n});\n", n / 4, n % 4));
+    for k in 0..COOP_K / 8 {
+        for i in 0..4 {
+            s.push_str(&format!("            let a{i}_{k} = coopLoadT<coop_mat8x8<f32, A>>(&sh[((sm + {}u) / 8u * (BK / 8u) + {k}u) * 64u], 8u);\n", i * 8));
+            s.push_str(&format!("            let b{i}_{k} = coopLoad<coop_mat8x8<f32, B>>(&sh[WOFF + ((sn + {}u) / 8u * (BK / 8u) + {k}u) * 64u], 8u);\n", i * 8));
+        }
+        for n in 0..16 {
+            s.push_str(&format!("            acc{n} = coopMultiplyAdd(a{}_{k}, b{}_{k}, acc{n});\n", n / 4, n % 4));
+        }
     }
     s
 }
