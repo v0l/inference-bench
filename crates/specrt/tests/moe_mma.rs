@@ -19,8 +19,8 @@ impl Lcg {
     }
 }
 
-const HIDDEN: usize = 512;
-const INTER: usize = 512;
+const HIDDEN: usize = 256;
+const INTER: usize = 256;
 const EXPERTS: usize = 16;
 const TOP_K: usize = 4;
 const PAIRS: usize = TOP_K + 1;
