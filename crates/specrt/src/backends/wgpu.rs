@@ -177,6 +177,32 @@ impl Backend for Wgpu {
         Ok(Buffer { raw, bytes: padded })
     }
 
+    fn alloc_filled(&self, parts: &[&[u8]]) -> Result<Buffer> {
+        let bytes: u64 = parts.iter().map(|p| p.len() as u64).sum();
+        let padded = bytes.max(16).next_multiple_of(4);
+        if padded > self.limits.max_buffer_bytes || padded > self.limits.max_binding_bytes {
+            bail!("a {padded} byte buffer exceeds this adapter's buffer limits on {}", self.info.name);
+        }
+        let raw = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: padded,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        {
+            let mut view = raw.slice(..).get_mapped_range_mut().map_err(|e| anyhow!("map: {e:?}"))?;
+            let mut at = 0usize;
+            for part in parts {
+                view.slice(at..at + part.len()).copy_from_slice(part);
+                at += part.len();
+            }
+        }
+        raw.unmap();
+        self.queue.submit([]);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        Ok(Buffer { raw, bytes: padded })
+    }
+
     fn upload(&self, buffer: &Buffer, offset: u64, data: &[u8]) {
         let pending = self.pending_upload.get() + data.len() as u64;
         if pending >= UPLOAD_FLUSH {

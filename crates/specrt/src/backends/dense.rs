@@ -68,7 +68,7 @@ pub struct Dense<B: Backend> {
     m: Model<B>,
 }
 
-fn rows_of(m: &Matrix, nrows: usize, cols: usize, what: &str) -> Result<DeviceRows> {
+fn rows_of<'a>(m: &'a Matrix, nrows: usize, cols: usize, what: &str) -> Result<DeviceRows<'a>> {
     match m {
         Matrix::Bf16(w) => {
             ensure!(w.len() == nrows * cols, "{what} has {} values, expected {}", w.len(), nrows * cols);
@@ -76,7 +76,7 @@ fn rows_of(m: &Matrix, nrows: usize, cols: usize, what: &str) -> Result<DeviceRo
         }
         Matrix::Ggml(g) => {
             ensure!(g.rows.len() == nrows && g.cols == cols, "{what} is {}x{}, expected {nrows}x{cols}", g.rows.len(), g.cols);
-            Ok(DeviceRows { data: g.data.clone(), rows: g.rows.clone(), cols })
+            Ok(DeviceRows { parts: g.parts.iter().map(|p| std::borrow::Cow::Borrowed(p.as_ref())).collect(), rows: g.rows.clone(), cols })
         }
         _ => bail!("{what} uses weights that are not yet on wgpu"),
     }
@@ -91,11 +91,11 @@ fn floats(v: &[f32]) -> Vec<u8> {
 }
 
 fn upload_rows<B: Backend>(be: &B, rows: DeviceRows, nrows: usize, what: &str) -> Result<WMat<B>> {
-    let data = be.alloc(rows.data.len() as u64).with_context(|| format!("{what} weights"))?;
-    be.upload(&data, 0, &rows.data);
+    let parts: Vec<&[u8]> = rows.parts.iter().map(|p| p.as_ref()).collect();
+    let data = be.alloc_filled(&parts).with_context(|| format!("{what} weights"))?;
     let table = be.alloc(rows.rows.len() as u64 * 4)?;
     be.upload(&table, 0, &words(&rows.rows));
-    Ok(WMat { bytes: rows.data.len() as u64 + rows.rows.len() as u64 * 4, data, rows: table, nrows: nrows as u32, cols: rows.cols as u32 })
+    Ok(WMat { bytes: rows.len_bytes() as u64 + rows.rows.len() as u64 * 4, data, rows: table, nrows: nrows as u32, cols: rows.cols as u32 })
 }
 
 fn upload_floats<B: Backend>(be: &B, v: &[f32]) -> Result<B::Buffer> {
@@ -276,17 +276,17 @@ impl<B: Backend> Dense<B> {
         let a = &spec.attention;
         let (mut embed, mut head, mut final_norm, mut weight_bytes) = (None, None, None, 0);
         if first || last {
-            let out = checkpoint.outside(spec)?;
             if first {
-                let e = upload_rows(&be, DeviceRows::from_bf16(&out.embed, d.hidden)?, d.vocab, "embed")?;
+                let e = upload_rows(&be, checkpoint.embedding_rows(spec)?, d.vocab, "embed")?;
                 weight_bytes += e.bytes;
                 embed = Some(e);
             }
             if last {
-                let h = mat(&be, &out.lm_head, d.vocab, d.hidden, "lm_head")?;
+                let (norm, lm_head) = checkpoint.head(spec)?;
+                let h = mat(&be, &lm_head, d.vocab, d.hidden, "lm_head")?;
                 weight_bytes += h.bytes;
                 head = Some(h);
-                final_norm = Some(upload_floats(&be, &out.norm)?);
+                final_norm = Some(upload_floats(&be, &norm)?);
             }
         }
         let kv_floats = a.kv_heads * max_ctx * a.head_dim;

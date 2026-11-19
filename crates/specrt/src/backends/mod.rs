@@ -34,6 +34,16 @@ pub trait Backend {
     fn limits(&self) -> DeviceLimits;
     fn alloc(&self, bytes: u64) -> Result<Self::Buffer>;
     fn upload(&self, buffer: &Self::Buffer, offset: u64, data: &[u8]);
+    fn alloc_filled(&self, parts: &[&[u8]]) -> Result<Self::Buffer> {
+        let bytes = parts.iter().map(|p| p.len() as u64).sum();
+        let buffer = self.alloc(bytes)?;
+        let mut at = 0u64;
+        for part in parts {
+            self.upload(&buffer, at, part);
+            at += part.len() as u64;
+        }
+        Ok(buffer)
+    }
     fn download(&self, buffer: &Self::Buffer, offset: u64, len: u64) -> Result<Vec<u8>>;
     fn compile(&mut self, kernels: &[WgslKernel]) -> Result<()>;
     fn dispatch(&mut self, kernel: &str, buffers: &[&Self::Buffer], params: [u32; 8], grid: [u32; 3]) -> Result<()>;

@@ -16,7 +16,7 @@ pub enum Matrix<'a> {
     Q8 { values: Vec<i8>, scales: Vec<f32> },
     Fp8 { values: Cow<'a, [u8]>, scales: Vec<f32> },
     Fp4(crate::nvfp4::Fp4<'a>),
-    Ggml(DeviceRows),
+    Ggml(DeviceRows<'a>),
 }
 
 pub struct Attn<'a> {
@@ -447,10 +447,14 @@ impl Checkpoint {
         Ok(out)
     }
 
-    fn gguf_raw(&self, g: &Gguf, weight: &str, rows: usize, cols: usize) -> Result<Raw<'_>> {
+    fn gguf_raw<'s>(&'s self, g: &'s Gguf, weight: &str, rows: usize, cols: usize) -> Result<Raw<'s>> {
         let (info, data) = self.gguf_tensor(g, weight, &[rows, cols])?;
         if g.weight_quant() == Quant::Gguf {
-            return Ok(Raw::Ggml(DeviceRows::pack(info.kind, &data, rows, cols).with_context(|| weight.to_string())?));
+            let packed = match data {
+                Cow::Borrowed(d) => DeviceRows::pack(info.kind, d, rows, cols),
+                Cow::Owned(d) => DeviceRows::pack(info.kind, &d, rows, cols).map(|p| DeviceRows { parts: p.parts.into_iter().map(|c| Cow::Owned(c.into_owned())).collect(), rows: p.rows, cols: p.cols }),
+            };
+            return Ok(Raw::Ggml(packed.with_context(|| weight.to_string())?));
         }
         if info.kind == GgmlType::Q8_0 {
             let (values, scales) = crate::gguf::q8_0_split(&data);
@@ -472,7 +476,7 @@ pub fn peak_rss_bytes() -> Option<u64> {
 enum Raw<'a> {
     Bf16 { w: Cow<'a, [u16]>, cols: usize },
     Q8 { values: Vec<i8>, scales: Vec<f32>, cols: usize },
-    Ggml(DeviceRows),
+    Ggml(DeviceRows<'a>),
     Fp8 { w: Cow<'a, [u8]>, grid: Vec<f32>, map: Vec<u32>, cols: usize },
 }
 
@@ -505,7 +509,7 @@ impl<'a> Raw<'a> {
                 let groups = cols / Q8_GROUP;
                 Raw::Q8 { values: values[from * cols..to * cols].to_vec(), scales: scales[from * groups..to * groups].to_vec(), cols: *cols }
             }
-            Raw::Ggml(d) => Raw::Ggml(DeviceRows { data: d.data.clone(), rows: d.rows[from..to].to_vec(), cols: d.cols }),
+            Raw::Ggml(d) => Raw::Ggml(DeviceRows { parts: d.parts.clone(), rows: d.rows[from..to].to_vec(), cols: d.cols }),
             Raw::Fp8 { w, grid, map, cols } => {
                 let kb = cols.div_ceil(FP8_BLOCK) as u32;
                 let map = &map[from..to];
@@ -551,7 +555,7 @@ impl<'a> Raw<'a> {
         }
     }
 
-    fn into_ggml(self) -> Result<DeviceRows> {
+    fn into_ggml(self) -> Result<DeviceRows<'a>> {
         match self {
             Raw::Ggml(d) => Ok(d),
             Raw::Bf16 { w, cols } => DeviceRows::from_bf16(&w, cols),
@@ -1131,8 +1135,18 @@ impl Checkpoint {
     }
 
     pub fn head(&self, spec: &Spec) -> Result<(Vec<f32>, Matrix<'_>)> {
-        let embed = self.embedding(spec)?;
+        let embed = if self.gguf.is_some() || !spec.dims.tie_embeddings { Cow::Borrowed(&[][..]) } else { self.embedding(spec)? };
         self.head_from(spec, &embed)
+    }
+
+    pub fn embedding_rows(&self, spec: &Spec) -> Result<DeviceRows<'_>> {
+        let d = &spec.dims;
+        if self.gguf.is_some()
+            && let Raw::Ggml(rows) = self.raw(&format!("{}.embed_tokens.weight", self.root()), d.vocab, d.hidden)?
+        {
+            return Ok(rows);
+        }
+        DeviceRows::from_bf16(&self.embedding(spec)?, d.hidden)
     }
 
     fn head_from<'s>(&'s self, spec: &Spec, embed: &Cow<'s, [u16]>) -> Result<(Vec<f32>, Matrix<'s>)> {

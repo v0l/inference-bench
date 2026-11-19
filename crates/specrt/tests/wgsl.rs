@@ -96,8 +96,8 @@ fn random_blocks(kind: GgmlType, rows: usize, cols: usize, rng: &mut Lcg) -> Vec
 
 fn dequant_on_gpu(w: &mut Wgpu, rows: &DeviceRows) -> Vec<f32> {
     let nrows = rows.rows.len();
-    let data = w.alloc(rows.data.len() as u64).unwrap();
-    w.upload(&data, 0, &rows.data);
+    let data = w.alloc(rows.len_bytes() as u64).unwrap();
+    w.upload(&data, 0, rows.data().as_ref());
     let table = u32_buf(w, &rows.rows);
     let out = w.alloc((nrows * rows.cols * 4) as u64).unwrap();
     let items = nrows * rows.cols;
@@ -191,8 +191,8 @@ fn close(got: &[f32], want: &[f32], tol: f32, what: &str) {
 
 fn run_linear(w: &mut Wgpu, rows: &DeviceRows, x: &[f32], tokens: usize, accumulate: Option<&[f32]>) -> Vec<f32> {
     let nrows = rows.rows.len();
-    let data = w.alloc(rows.data.len() as u64).unwrap();
-    w.upload(&data, 0, &rows.data);
+    let data = w.alloc(rows.len_bytes() as u64).unwrap();
+    w.upload(&data, 0, rows.data().as_ref());
     let table = u32_buf(w, &rows.rows);
     let xb = f32_buf(w, x);
     let yb = f32_buf(w, &accumulate.map_or_else(|| vec![0.0; tokens * nrows], |a| a.to_vec()));
@@ -217,11 +217,11 @@ fn linear_case(kind: GgmlType, tokens: usize) {
     let mut w = setup(&spec(), 64);
     let (nrows, cols) = (37, 512);
     let mut rng = Lcg(11);
+    let data = if kind == GgmlType::Bf16 { Vec::new() } else { random_blocks(kind, nrows, cols, &mut rng) };
     let packed = if kind == GgmlType::Bf16 {
         let v: Vec<u16> = (0..nrows * cols).map(|_| specrt::weights::f32_to_bf16(rng.unit())).collect();
         DeviceRows::from_bf16(&v, cols).unwrap()
     } else {
-        let data = random_blocks(kind, nrows, cols, &mut rng);
         DeviceRows::pack(kind, &data, nrows, cols).unwrap()
     };
     let x: Vec<f32> = (0..tokens * cols).map(|_| rng.unit()).collect();
