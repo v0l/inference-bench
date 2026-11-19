@@ -13,11 +13,7 @@ fn logits_norm() -> &'static str {
         float4 v = *(const float4*)(xr + i);
         ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
-    ss = warp_sum(ss);
-    if (lane == 0) red[warp] = ss;
-    __syncthreads();
-    float total = 0.0f;
-    for (int w = 0; w < MOE_WARPS; w++) total += red[w];
+    float total = block_reduce<false>(ss, red);
     float inv = rsqrtf(total / HIDDEN + EPS);
     for (int i = tid; i < HIDDEN; i += 256) {
         float v = xr[i] * inv * ln[i];
@@ -72,7 +68,7 @@ fn probabilities() -> &'static str {
     } else {
         float m = NEG_INF;
         for (int e = lane; e < MOE_E; e += 32) m = fmaxf(m, lg[e]);
-        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, o));
+        m = warp_max(m);
         float s = 0.0f;
         for (int e = lane; e < MOE_E; e += 32) {
             float p = expf(lg[e] - m);
@@ -124,24 +120,8 @@ fn probabilities() -> &'static str {
 "##
 }
 
-fn top_k() -> &'static str {
-    r##"    float picked = 0.0f;
-    for (int k = 0; k < MOE_K; k++) {
-        float bv = -3.0e30f;
-        int bi = MOE_E;
-        for (int e = lane; e < MOE_E; e += 32) {
-            if (sel[e] > bv) { bv = sel[e]; bi = e; }
-        }
-        for (int o = 16; o > 0; o >>= 1) {
-            float ov = __shfl_xor_sync(0xffffffff, bv, o);
-            int oi = __shfl_xor_sync(0xffffffff, bi, o);
-            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
-        }
-        if (lane == 0) { top_v[k] = probs[bi]; top_i[k] = bi; sel[bi] = -2.0e30f; }
-        picked += probs[bi];
-        __syncwarp();
-    }
-"##
+fn top_k() -> String {
+    crate::cuda::topk::warp_top_k(&crate::cuda::topk::TopK { sel: "sel", vals: "probs", count: "MOE_E", k: "MOE_K", out_v: "top_v", out_i: "top_i", sum: "picked", floor: "-3.0e30f", taken: "-2.0e30f" })
 }
 
 fn emit_pairs() -> &'static str {

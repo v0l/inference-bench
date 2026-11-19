@@ -372,3 +372,54 @@ pub fn batch_load_w(sig: &str, loads: &[&str]) -> String {
     }
     format!("    auto load_w = [&](int c, {sig}) {{\n{}    }};\n", unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, &body))
 }
+
+pub enum RowFormat<'a> {
+    Bf16,
+    Fp8,
+    Fp4Rows { decode: &'a str },
+}
+
+pub struct RowLoad {
+    pub unroll: u32,
+    pub stream: bool,
+}
+
+pub fn multi_row_dot(name: &str, format: RowFormat, load: RowLoad) -> String {
+    let unroll = if load.unroll == 0 { String::new() } else { format!("#pragma unroll {}\n", load.unroll) };
+    let load16 = |p: &str| if load.stream { format!("load_stream({p})") } else { format!("*(const uint4*)({p})") };
+    let load8 = |p: &str| if load.stream { format!("load_stream8({p})") } else { format!("*(const uint2*)({p})") };
+    let columns = |tail: &str| format!("#pragma unroll\n    for (int j = 0; j < NC; j++) {{\n        if (j < live) {{\n{tail}        }}\n    }}\n");
+    let (args, body) = match format {
+        RowFormat::Bf16 => (
+            "const bf16_t* wr, const float* xs, int lane, int live, float* acc",
+            format!(
+                "{unroll}    for (int k = lane * 8; k < K; k += 256) {{\n        uint4 packed = {};\n{}    }}\n",
+                load16("wr + k"),
+                columns(
+                    "            const float* x = xs + j * K + k;\n            float4 xa = *(const float4*)x;\n            float4 xb = *(const float4*)(x + 4);\n            float part = __uint_as_float(packed.x << 16) * xa.x + __uint_as_float(packed.x & 0xffff0000u) * xa.y;\n            part += __uint_as_float(packed.y << 16) * xa.z + __uint_as_float(packed.y & 0xffff0000u) * xa.w;\n            part += __uint_as_float(packed.z << 16) * xb.x + __uint_as_float(packed.z & 0xffff0000u) * xb.y;\n            part += __uint_as_float(packed.w << 16) * xb.z + __uint_as_float(packed.w & 0xffff0000u) * xb.w;\n            acc[j] += part;\n"
+                )
+            ),
+        ),
+        RowFormat::Fp8 => (
+            "const unsigned char* wr, const float* sr, const float* xs, int lane, int live, float* acc",
+            format!(
+                "{unroll}    for (int k = lane * 16; k < K; k += 512) {{\n        uint4 packed = {};\n        float sc = sr[k / FP8_BLOCK];\n{}    }}\n",
+                load16("wr + k"),
+                columns(
+                    "            const float* x = xs + j * K + k;\n            float part = e4m3_dot4(packed.x, *(const float4*)x) + e4m3_dot4(packed.y, *(const float4*)(x + 4)) +\n                         e4m3_dot4(packed.z, *(const float4*)(x + 8)) + e4m3_dot4(packed.w, *(const float4*)(x + 12));\n            acc[j] += part * sc;\n"
+                )
+            ),
+        ),
+        RowFormat::Fp4Rows { decode } => (
+            "const unsigned char* wr, const unsigned char* sb, const float* xs, int lane, int live, float* acc",
+            format!(
+                "{unroll}    for (int grp = lane; grp < K / 16; grp += 32) {{\n        uint2 q = {};\n        float v[16];\n#pragma unroll\n        for (int i = 0; i < 8; i++) {{\n            unsigned byte = ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xffu;\n            v[2 * i] = {decode}(byte & 0xfu);\n            v[2 * i + 1] = {decode}(byte >> 4);\n        }}\n        float sc = e4m3_to_f32(sb[grp]);\n{}    }}\n",
+                load8("wr + (size_t)grp * 8"),
+                columns(
+                    "            float part = 0.0f;\n#pragma unroll\n            for (int i = 0; i < 16; i++) part += v[i] * xs[j * K + grp * 16 + i];\n            acc[j] += part * sc;\n"
+                )
+            ),
+        ),
+    };
+    format!("template <int K, int NC>\n{}", device("void", name, args, &body))
+}
