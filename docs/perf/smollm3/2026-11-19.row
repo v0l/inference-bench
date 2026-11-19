@@ -1,1 +1,1 @@
-| smollm3 | `SmolLM3-3B` | 31.9 | 4068.0 | 249.0 | llama.cpp/vllm | 33.9 | 9869.3 | 249.8 | 0.94 | 0.41 | 1.00 | 2026-11-19 | 82ce823 | `crates/specrt/scripts/perfpass.sh smollm3 --model /home/kieran/ib-gates/803/models/SmolLM3-3B --host spark` |
+| smollm3 | `SmolLM3-3B` | 31.8 | 4825.7 | 250.9 | llama.cpp/vllm | 33.9 | 9116.6 | 250.8 | 0.94 | 0.53 | 1.00 | 2026-11-19 | 811f24f | `crates/specrt/scripts/perfpass.sh smollm3 --model /home/kieran/ib-gates/813/models/SmolLM3-3B --host spark` |
