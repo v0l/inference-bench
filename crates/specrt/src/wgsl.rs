@@ -19,6 +19,7 @@ pub struct WgslKernel {
 pub const LINEAR_TOKENS: usize = 8;
 pub const LINEAR_WORKGROUP: usize = 64;
 pub const FLASH_TOKENS: u32 = kir::wgsl::FLASH_TOKENS;
+pub const FLASH_COOP_QUERIES: u32 = kir::wgsl::FLASH_COOP_QUERIES;
 pub const SG_ROWS: u32 = kir::wgsl::SG_ROWS;
 pub const TILE_MIN_TOKENS: usize = 32;
 pub const TILE_TOKENS: usize = kir::wgsl::TILE_TOKENS as usize;
@@ -153,6 +154,9 @@ pub fn generate(spec: &Spec, max_ctx: usize, target: &kir::Target) -> Result<Vec
         out.push(WgslKernel { name: "linear_sg", source: kir::wgsl::emit_linear_sg_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
     }
     if target.has(kir::Feature::CoopMatrix) {
+        if spec.attention.head_dim.is_multiple_of(8) && spec.attention.head_dim <= 256 {
+            out.push(WgslKernel { name: "flash_coop", source: kir::wgsl::emit_flash_coop_op(&shape), bindings: vec![Read, Read, Read, Write, Uniform] });
+        }
         out.push(WgslKernel { name: "linear_coop", source: kir::wgsl::emit_linear_coop_op(&shape), bindings: vec![Read, Write, Read, Read, Uniform] });
     }
     for k in crate::gemm::gemm_kernels(spec, target)?.kernels {

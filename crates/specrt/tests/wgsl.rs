@@ -363,13 +363,22 @@ fn rope_with_qk_norm_and_the_kv_write_match_a_cpu_reference() {
 #[test]
 #[ignore = "needs a GPU adapter"]
 fn causal_attention_matches_a_cpu_softmax_reference() {
+    causal_attention_case(200, 3);
+}
+
+#[test]
+#[ignore = "needs a GPU adapter"]
+fn causal_attention_matches_a_cpu_reference_over_several_query_blocks_and_partial_key_tiles() {
+    causal_attention_case(37, 83);
+}
+
+fn causal_attention_case(pos0: usize, rows: usize) {
     let _g = GPU.lock().unwrap_or_else(|e| e.into_inner());
     let s = spec();
     let ctx = 300;
     let mut w = setup(&s, ctx);
     let a = &s.attention;
     let hd = a.head_dim;
-    let (pos0, rows) = (200, 3);
     let row_len = s.qkv_rows();
     let mut rng = Lcg(33);
     let qkv: Vec<f32> = (0..rows * row_len).map(|_| rng.unit()).collect();
@@ -378,7 +387,9 @@ fn causal_attention_matches_a_cpu_softmax_reference() {
     let vcache: Vec<f32> = (0..kv_len).map(|_| rng.unit()).collect();
     let (qb, kc, vc) = (f32_buf(&w, &qkv), f32_buf(&w, &kcache), f32_buf(&w, &vcache));
     let ob = f32_buf(&w, &vec![0.0; rows * a.heads * hd]);
-    if specrt::backends::Backend::limits(&w).subgroup_size == 32 {
+    if specrt::backends::Backend::limits(&w).coop_matrix {
+        go(&mut w, "flash_coop", &[&qb, &kc, &vc, &ob], [pos0 as u32, rows as u32, 0, 0, 0, 0, 0, 0], [a.heads as u32, (rows as u32).div_ceil(wgsl::FLASH_COOP_QUERIES), 1]);
+    } else if specrt::backends::Backend::limits(&w).subgroup_size == 32 {
         go(&mut w, "flash", &[&qb, &kc, &vc, &ob], [pos0 as u32, rows as u32, 0, 0, 0, 0, 0, 0], [a.heads as u32, (rows as u32).div_ceil(wgsl::FLASH_TOKENS), 1]);
     } else {
         go(&mut w, "attention", &[&qb, &kc, &vc, &ob], [pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [a.heads as u32, rows as u32, 1]);

@@ -978,6 +978,152 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     )
 }
 
+pub const FLASH_COOP_THREADS: u32 = 128;
+pub const FLASH_COOP_QUERIES: u32 = 32;
+
+pub fn emit_flash_coop_op(s: &crate::ops::WgslShape) -> String {
+    let mut out = String::from("enable wgpu_cooperative_matrix;\n");
+    out.push_str(&ops_header(s));
+    out.push_str(&flash_coop(s.head_dim as u32 / 8));
+    out
+}
+
+fn flash_coop(nd: u32) -> String {
+    let q_frags: String = (0..nd).map(|i| format!("    let qa{i} = coopLoadT<coop_mat8x8<f32, A>>(&qkv[qb0 * QKV_ROW + head * HEAD_DIM + {}u], QKV_ROW);\n", i * 8)).collect();
+    let o_init: String = (0..nd).map(|i| format!("    var o{i} = coop_mat8x8<f32, C>();\n")).collect();
+    let s_init: String = (0..4).map(|k| format!("        var s{k} = coop_mat8x8<f32, C>();\n")).collect();
+    let s_mma: String = (0..4)
+        .flat_map(|k| (0..nd).map(move |i| format!("        s{k} = coopMultiplyAdd(qa{i}, coopLoad<coop_mat8x8<f32, B>>(&k_cache[head_base + (key0 + {}u) * HEAD_DIM + {}u], HEAD_DIM), s{k});\n", k * 8, i * 8)))
+        .collect();
+    let s_store: String = (0..4).map(|k| format!("        coopStoreT(s{k}, &sbuf[g * 256u + {}u], 32u);\n", k * 8)).collect();
+    let o_mma: String = (0..4)
+        .map(|ks| {
+            let mut b = format!("        let pa{ks} = coopLoadT<coop_mat8x8<f32, A>>(&sbuf[g * 256u + {}u], 32u);\n", ks * 8);
+            for i in 0..nd {
+                b.push_str(&format!("        o{i} = coopMultiplyAdd(pa{ks}, coopLoadT<coop_mat8x8<f32, B>>(&v_cache[head_base + (key0 + {}u) * HEAD_DIM + {}u], HEAD_DIM), o{i});\n", ks * 8, i * 8));
+            }
+            b
+        })
+        .collect();
+    let o_store: String = (0..nd).map(|i| format!("{{pad}}coopStoreT(o{i}, &opart[g * 8u * HEAD_DIM + {}u], HEAD_DIM);\n", i * 8)).collect();
+    let o_load: String = (0..nd).map(|i| format!("{{pad}}o{i} = coopLoadT<coop_mat8x8<f32, C>>(&opart[g * 8u * HEAD_DIM + {}u], HEAD_DIM);\n", i * 8)).collect();
+    let store_inner = o_store.replace("{pad}", "            ");
+    let load_inner = o_load.replace("{pad}", "            ");
+    let store_final = o_store.replace("{pad}", "    ");
+    format!(
+        "{bind}
+const HD4: u32 = HEAD_DIM / 4u;
+const EPL: u32 = (HD4 + 31u) / 32u;
+const LAZY: f32 = 6.0;
+var<workgroup> sbuf: array<f32, 1024>;
+var<workgroup> opart: array<f32, {opart}>;
+var<workgroup> flags: array<u32, 4>;
+
+@compute @workgroup_size({FLASH_COOP_THREADS})
+fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
+    let head = wid.x;
+    let g = li / 32u;
+    let lane = li % 32u;
+    let kvh = head / GROUP;
+    let head_base = kvh * MAX_CTX * HEAD_DIM;
+    let pos0 = p.a.x;
+    let rows = p.a.y;
+    let q0 = wid.y * {FLASH_COOP_QUERIES}u;
+    let wg_len = pos0 + min(q0 + {FLASH_COOP_QUERIES}u - 1u, rows - 1u) + 1u;
+    let qrow0 = q0 + g * 8u;
+    let qb0 = min(qrow0, rows - 1u);
+    let scale = inverseSqrt(f32(HEAD_DIM));
+{q_frags}{o_init}    var m: array<f32, 8>;
+    var l: array<f32, 8>;
+    var lens: array<u32, 8>;
+    for (var r = 0u; r < 8u; r++) {{
+        m[r] = NEG_INF;
+        l[r] = 0.0;
+        lens[r] = pos0 + min(qrow0 + r, rows - 1u) + 1u;
+    }}
+    for (var key0 = 0u; key0 < wg_len; key0 += 32u) {{
+{s_init}{s_mma}{s_store}        workgroupBarrier();
+        var smax: array<f32, 8>;
+        var stale = 0.0;
+        for (var r = 0u; r < 8u; r++) {{
+            var s = NEG_INF;
+            if (key0 + lane < lens[r]) {{
+                s = sbuf[g * 256u + r * 32u + lane] * scale;
+            }}
+            smax[r] = subgroupMax(s);
+            if (smax[r] > m[r] + LAZY) {{
+                stale = 1.0;
+            }}
+        }}
+        if (lane == 0u) {{
+            flags[g] = select(0u, 1u, stale > 0.0);
+        }}
+        workgroupBarrier();
+        if ((flags[0] | flags[1] | flags[2] | flags[3]) != 0u) {{
+            if (stale > 0.0) {{
+                for (var r = 0u; r < 8u; r++) {{
+                    let m_new = max(m[r], smax[r]);
+                    let c = exp(m[r] - m_new);
+                    l[r] *= c;
+                    m[r] = m_new;
+                    smax[r] = c;
+                }}
+            }} else {{
+                for (var r = 0u; r < 8u; r++) {{
+                    smax[r] = 1.0;
+                }}
+            }}
+{store_inner}            workgroupBarrier();
+            for (var r = 0u; r < 8u; r++) {{
+                for (var e = 0u; e < EPL; e++) {{
+                    let d = lane + 32u * e;
+                    if (d < HD4) {{
+                        let at = g * 8u * HEAD_DIM + r * HEAD_DIM + d * 4u;
+                        opart[at] *= smax[r];
+                        opart[at + 1u] *= smax[r];
+                        opart[at + 2u] *= smax[r];
+                        opart[at + 3u] *= smax[r];
+                    }}
+                }}
+            }}
+            workgroupBarrier();
+{load_inner}        }}
+        for (var r = 0u; r < 8u; r++) {{
+            var pr = 0.0;
+            if (key0 + lane < lens[r]) {{
+                pr = exp(sbuf[g * 256u + r * 32u + lane] * scale - m[r]);
+            }}
+            l[r] += subgroupAdd(pr);
+            sbuf[g * 256u + r * 32u + lane] = pr;
+        }}
+        workgroupBarrier();
+{o_mma}        workgroupBarrier();
+    }}
+{store_final}    workgroupBarrier();
+    for (var r = 0u; r < 8u; r++) {{
+        let t = qrow0 + r;
+        if (t < rows) {{
+            let ob = t * HEADS * HEAD_DIM + head * HEAD_DIM;
+            for (var e = 0u; e < EPL; e++) {{
+                let d = lane + 32u * e;
+                if (d < HD4) {{
+                    let at = g * 8u * HEAD_DIM + r * HEAD_DIM + d * 4u;
+                    let o = vec4<f32>(opart[at], opart[at + 1u], opart[at + 2u], opart[at + 3u]) / l[r];
+                    out[ob + d * 4u] = o.x;
+                    out[ob + d * 4u + 1u] = o.y;
+                    out[ob + d * 4u + 2u] = o.z;
+                    out[ob + d * 4u + 3u] = o.w;
+                }}
+            }}
+        }}
+    }}
+}}
+",
+        bind = storage(&[("qkv", false, "f32"), ("k_cache", false, "f32"), ("v_cache", false, "f32"), ("out", true, "f32")]),
+        opart = 4 * 8 * nd * 8,
+    )
+}
+
 pub const DECODE_GROUPS: u32 = 8;
 
 pub fn emit_flash_decode_op(s: &crate::ops::WgslShape) -> String {

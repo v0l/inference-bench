@@ -202,6 +202,9 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             }
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention => {
                 let l = l.expect("attention needs a layer");
+                if rows > 1 && be.limits().coop_matrix && spec.attention.head_dim.is_multiple_of(8) && spec.attention.head_dim <= 256 {
+                    return be.dispatch("flash_coop", &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, r, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r.div_ceil(wgsl::FLASH_COOP_QUERIES), 1]);
+                }
                 if rows > 1 && be.limits().subgroup_size == 32 {
                     return be.dispatch("flash", &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, r, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r.div_ceil(wgsl::FLASH_TOKENS), 1]);
                 }
