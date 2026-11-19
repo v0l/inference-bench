@@ -41,15 +41,12 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
     const unsigned char* wb = (const unsigned char*)w;
     const unsigned char* wrow[MJ][2];
     const float* srow[MJ][2];
-#pragma unroll
-    for (int i = 0; i < MJ; i++)
-#pragma unroll
-        for (int h = 0; h < 2; h++) {
-            int r = min(row0 + i * 16 + g + 8 * h, N - 1);
-            wrow[i][h] = wb + (size_t)r * K + t * 32;
-            srow[i][h] = fp8_row_scales(scales, r);
-        }
-    auto stage = [&](int buf, int c) {
+"##.to_string(),
+        prim::unroll_nest(4, &[("i", "MJ"), ("h", "2")], true, r##"int r = min(row0 + i * 16 + g + 8 * h, N - 1);
+wrow[i][h] = wb + (size_t)r * K + t * 32;
+srow[i][h] = fp8_row_scales(scales, r);
+"##),
+        r##"    auto stage = [&](int buf, int c) {
         bf16_t* base = xs + buf * STAGE;
         for (int i = tid; i < LOADS; i += WARPS * 32) {
             int p = i / (M * PIECES);
@@ -60,15 +57,12 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
         }
     };
     auto load_w = [&](int c, uint4 (&q)[MJ][2][2], float (&s)[MJ][2]) {
-#pragma unroll
-        for (int i = 0; i < MJ; i++)
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                q[i][h][0] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC);
-                q[i][h][1] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC + 16);
-                s[i][h] = __ldg(srow[i][h] + c);
-            }
-    };
+"##.to_string(),
+        prim::unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, r##"q[i][h][0] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC);
+q[i][h][1] = f8b_load16(wrow[i][h] + (size_t)c * F8B_KC + 16);
+s[i][h] = __ldg(srow[i][h] + c);
+"##),
+        r##"    };
     float acc[MJ][NT][4];
 "##.to_string(),
         prim::zero_frag("acc", ("i", "MJ"), ("n", "NT"), 4),
@@ -109,22 +103,15 @@ __device__ __forceinline__ void gemv_f8b(const void* w, const float* scales, con
                 }
             }
         }
-#pragma unroll
-        for (int i = 0; i < MJ; i++)
-#pragma unroll
-            for (int n = 0; n < NT; n++)
-#pragma unroll
-                for (int e = 0; e < 4; e++) acc[i][n][e] += c[i][n][e] * s[i][e >> 1];
-        if (it + 1 < nc) {
-#pragma unroll
-            for (int i = 0; i < MJ; i++)
-#pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    q[i][h][0] = nq[i][h][0];
-                    q[i][h][1] = nq[i][h][1];
-                    s[i][h] = ns[i][h];
-                }
-        }
+"##.to_string(),
+        prim::unroll_nest(8, &[("i", "MJ"), ("n", "NT"), ("e", "4")], false, "acc[i][n][e] += c[i][n][e] * s[i][e >> 1];"),
+        r##"        if (it + 1 < nc) {
+"##.to_string(),
+        prim::unroll_nest(12, &[("i", "MJ"), ("h", "2")], true, r##"q[i][h][0] = nq[i][h][0];
+q[i][h][1] = nq[i][h][1];
+s[i][h] = ns[i][h];
+"##),
+        r##"        }
     }
 "##.to_string(),
         prim::batch_epilogue("f8b", "acc[i][n][e]", "BIAS ? v + bias[r] : v"),

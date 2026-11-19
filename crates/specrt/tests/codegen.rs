@@ -31,9 +31,6 @@ const PRIM_LIBRARY_ATTENTION: &[(&str, &str)] = &[
 ];
 
 const VERBATIM_QUANT: &[(&str, &str)] = &[
-    ("cuda/gemm/fp4.rs", "fp4 gemv and dequant text, to port onto prims (#793)"),
-    ("cuda/gemm/fp4_head.rs", "head norm gemv text, to port onto prims (#793)"),
-    ("cuda/ggml/decode.rs", "ggml Q4_K, Q5_K, Q6_K, Q8_0 row decoders, to port onto prims (#793)"),
     ("cuda/gemm/prim.rs", "the prim library itself"),
 ];
 

@@ -1,41 +1,34 @@
+use crate::cuda::gemm::prim;
+
 pub fn body() -> String {
-    r##"constexpr int GG_Q4K = 0;
+    [
+        r##"constexpr int GG_Q4K = 0;
 constexpr int GG_Q5K = 1;
 constexpr int GG_Q6K = 2;
 constexpr int GG_Q8 = 3;
 constexpr int GG_BF16 = 4;
 constexpr int GG_SB = 256;
 
-__device__ __forceinline__ float gg_f16(unsigned short h) {
-    float r;
+"##.to_string(),
+        prim::device("float", "gg_f16", r#"unsigned short h"#, r##"    float r;
     asm("cvt.f32.f16 %0, %1;" : "=f"(r) : "h"(h));
     return r;
-}
-
-__device__ __forceinline__ unsigned gg_u16(const unsigned char* p) {
-    return __ldg((const unsigned short*)p);
-}
-
-__device__ __forceinline__ unsigned gg_u32(const unsigned char* p) {
-    return __ldg((const unsigned*)p);
-}
-
-__device__ __forceinline__ int gg_bytes(int type) {
-    switch (type) {
+"##),
+        prim::device("unsigned", "gg_u16", r#"const unsigned char* p"#, r##"    return __ldg((const unsigned short*)p);
+"##),
+        prim::device("unsigned", "gg_u32", r#"const unsigned char* p"#, r##"    return __ldg((const unsigned*)p);
+"##),
+        prim::device("int", "gg_bytes", r#"int type"#, r##"    switch (type) {
         case GG_Q4K: return 144;
         case GG_Q5K: return 176;
         case GG_Q6K: return 224;
         case GG_Q8: return 272;
         default: return 512;
     }
-}
-
-__device__ __forceinline__ unsigned gg_byte(const unsigned* s, int i) {
-    return (s[i >> 2] >> (8 * (i & 3))) & 0xffu;
-}
-
-__device__ __forceinline__ void gg_scale_min(const unsigned* s, int j, float& sc, float& m) {
-    unsigned a, b;
+"##),
+        prim::device("unsigned", "gg_byte", r#"const unsigned* s, int i"#, r##"    return (s[i >> 2] >> (8 * (i & 3))) & 0xffu;
+"##),
+        prim::device("void", "gg_scale_min", r#"const unsigned* s, int j, float& sc, float& m"#, r##"    unsigned a, b;
     if (j < 4) {
         a = gg_byte(s, j) & 63u;
         b = gg_byte(s, j + 4) & 63u;
@@ -45,10 +38,8 @@ __device__ __forceinline__ void gg_scale_min(const unsigned* s, int j, float& sc
     }
     sc = (float)a;
     m = (float)b;
-}
-
-__device__ __forceinline__ void gg_dequant8(const unsigned char* sb, int type, int c, float* w) {
-    if (type == GG_Q4K || type == GG_Q5K) {
+"##),
+        prim::device("void", "gg_dequant8", r#"const unsigned char* sb, int type, int c, float* w"#, r##"    if (type == GG_Q4K || type == GG_Q5K) {
         float d = gg_f16(gg_u16(sb));
         float dmin = gg_f16(gg_u16(sb + 2));
         unsigned s[3] = {gg_u32(sb + 4), gg_u32(sb + 8), gg_u32(sb + 12)};
@@ -114,23 +105,16 @@ __device__ __forceinline__ void gg_dequant8(const unsigned char* sb, int type, i
             }
         }
     }
-}
-
-__device__ __forceinline__ const unsigned char* gg_row(const void* w, const unsigned* table, int row, int& type) {
-    unsigned e = __ldg(table + row);
+"##),
+        prim::device("const unsigned char*", "gg_row", r#"const void* w, const unsigned* table, int row, int& type"#, r##"    unsigned e = __ldg(table + row);
     type = (int)(e & 7u);
     return (const unsigned char*)w + (size_t)(e >> 3) * 16;
-}
-
-__device__ __forceinline__ void gg_load8(const void* w, const unsigned* table, int row, int k, float* out) {
-    int type;
+"##),
+        prim::device("void", "gg_load8", r#"const void* w, const unsigned* table, int row, int k, float* out"#, r##"    int type;
     const unsigned char* base = gg_row(w, table, row, type);
     gg_dequant8(base + (size_t)(k / GG_SB) * gg_bytes(type), type, (k % GG_SB) / 8, out);
-}
-
-template <int K, int R>
-__device__ __forceinline__ void gg_q4k_rows(const unsigned char* const* base, const float* x, int lane, float* out) {
-    constexpr int NSB = K / GG_SB;
+"##),
+        prim::device_t(r#"int K, int R"#, "void", "gg_q4k_rows", r#"const unsigned char* const* base, const float* x, int lane, float* out"#, r##"    constexpr int NSB = K / GG_SB;
     int j = (lane & 7) >> 1;
     int l0 = (lane & 1) * 16;
     float acc[R];
@@ -180,11 +164,8 @@ __device__ __forceinline__ void gg_q4k_rows(const unsigned char* const* base, co
     }
 #pragma unroll
     for (int r = 0; r < R; r++) out[r] = acc[r];
-}
-
-template <int K, int R>
-__device__ __forceinline__ void gg_q6k_rows(const unsigned char* const* base, const float* x, int lane, float* out) {
-    constexpr int NSB = K / GG_SB;
+"##),
+        prim::device_t(r#"int K, int R"#, "void", "gg_q6k_rows", r#"const unsigned char* const* base, const float* x, int lane, float* out"#, r##"    constexpr int NSB = K / GG_SB;
     int h = (lane & 7) >> 2;
     int l0 = (lane & 3) * 8;
     float acc[R];
@@ -246,11 +227,8 @@ __device__ __forceinline__ void gg_q6k_rows(const unsigned char* const* base, co
     }
 #pragma unroll
     for (int r = 0; r < R; r++) out[r] = acc[r];
-}
-
-template <int K>
-__device__ __forceinline__ float gg_q4k_dot(const unsigned char* base, const float* x, int lane) {
-    int j = (lane & 7) >> 1;
+"##),
+        prim::device_t(r#"int K"#, "float", "gg_q4k_dot", r#"const unsigned char* base, const float* x, int lane"#, r##"    int j = (lane & 7) >> 1;
     int l0 = (lane & 1) * 16;
     float acc = 0.0f;
 #pragma unroll 4
@@ -282,11 +260,8 @@ __device__ __forceinline__ float gg_q4k_dot(const unsigned char* base, const flo
         acc += d * (sc1 * lo + sc2 * hi) - dmin * (m1 * slo + m2 * shi);
     }
     return acc;
-}
-
-template <int K>
-__device__ __forceinline__ float gg_q6k_dot(const unsigned char* base, const float* x, int lane) {
-    int h = (lane & 7) >> 2;
+"##),
+        prim::device_t(r#"int K"#, "float", "gg_q6k_dot", r#"const unsigned char* base, const float* x, int lane"#, r##"    int h = (lane & 7) >> 2;
     int l0 = (lane & 3) * 8;
     float acc = 0.0f;
 #pragma unroll 4
@@ -318,11 +293,8 @@ __device__ __forceinline__ float gg_q6k_dot(const unsigned char* base, const flo
         acc += d * sum;
     }
     return acc;
-}
-
-template <int K>
-__device__ __forceinline__ float gg_row_dot(const void* w, const unsigned* table, int row, const float* x, int lane) {
-    int type;
+"##),
+        prim::device_t(r#"int K"#, "float", "gg_row_dot", r#"const void* w, const unsigned* table, int row, const float* x, int lane"#, r##"    int type;
     const unsigned char* base = gg_row(w, table, row, type);
     if (type == GG_Q4K) return gg_q4k_dot<K>(base, x, lane);
     if (type == GG_Q6K) return gg_q6k_dot<K>(base, x, lane);
@@ -344,9 +316,8 @@ __device__ __forceinline__ float gg_row_dot(const void* w, const unsigned* table
         }
     }
     return acc;
-}
-
-extern "C" __global__ void gg_dequant_rows(const void* w, const unsigned* table, float* out, int rows, int cols) {
+"##),
+        r##"extern "C" __global__ void gg_dequant_rows(const void* w, const unsigned* table, float* out, int rows, int cols) {
     int chunk = blockIdx.x * blockDim.x + threadIdx.x;
     int per_row = cols / 8;
     if (chunk >= rows * per_row) return;
@@ -357,5 +328,7 @@ extern "C" __global__ void gg_dequant_rows(const void* w, const unsigned* table,
 #pragma unroll
     for (int i = 0; i < 8; i++) out[(size_t)row * cols + k + i] = v[i];
 }
-"##.to_string()
+"##.to_string(),
+    ]
+    .concat()
 }

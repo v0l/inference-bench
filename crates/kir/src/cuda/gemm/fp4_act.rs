@@ -39,13 +39,9 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
     static_assert(KG % 8 == 0, "scale rows are copied 8 bytes at a time");
     static_assert(NJ % 2 == 0, "B fragments come two n tiles per ldmatrix");
     extern __shared__ __align__(16) unsigned char gemm_smem[];
-    int tid = threadIdx.x;
-    int lane = tid & 31;
-    int warp = tid >> 5;
-    int g = lane >> 2;
-    int wm = warp / WN;
-    int wn = warp % WN;
-    int2 tile = grouped_tile<N, BN>();
+"##.to_string(),
+        prim::thread_ids(false),
+        r##"    int2 tile = grouped_tile<N, BN>();
     int m0 = tile.x * BM;
     int n0 = tile.y * BN;
     float acc[MI][NJ][4];
@@ -58,34 +54,28 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
         unsigned char* ws = as + BM * F4A_DATA;
         unsigned char* ass = as + SCALE_OFF;
         unsigned char* wss = ass + BM * F4A_SCALES;
-#pragma unroll
-        for (int i = 0; i < A_ITERS; i++) {
-            int idx = tid + i * THREADS;
-            if (A_ITERS * THREADS != BM * CHUNKS && idx >= BM * CHUNKS) break;
-            int r = idx / CHUNKS;
-            int c = idx % CHUNKS;
-            int m = m0 + r;
-            size_t row = (size_t)min(m, last_row);
-            if (c < 4) {
-                cp_async16_zfill(as + f4a_chunk(r, c), xq + row * (K / 2) + kt * (BK / 2) + c * 16, m < tokens);
-            } else {
-                cp_async8_zfill(ass + r * F4A_SCALES, xs + row * KG + kt * (BK / FP4_GROUP), m < tokens);
-            }
-        }
-#pragma unroll
-        for (int i = 0; i < W_ITERS; i++) {
-            int idx = tid + i * THREADS;
-            if (W_ITERS * THREADS != BN * CHUNKS && idx >= BN * CHUNKS) break;
-            int r = idx / CHUNKS;
-            int c = idx % CHUNKS;
-            size_t n = (size_t)min(n0 + r, N - 1);
-            if (c < 4) {
-                cp_async16(ws + f4a_chunk(r, c), (const unsigned char*)w + n * (K / 2) + kt * (BK / 2) + c * 16);
-            } else {
-                cp_async8_zfill(wss + r * F4A_SCALES, wsc + n * KG + kt * (BK / FP4_GROUP), true);
-            }
-        }
-    };
+"##.to_string(),
+        prim::load_iters("A_ITERS", "BM * CHUNKS", r##"int r = idx / CHUNKS;
+int c = idx % CHUNKS;
+int m = m0 + r;
+size_t row = (size_t)min(m, last_row);
+if (c < 4) {
+    cp_async16_zfill(as + f4a_chunk(r, c), xq + row * (K / 2) + kt * (BK / 2) + c * 16, m < tokens);
+} else {
+    cp_async8_zfill(ass + r * F4A_SCALES, xs + row * KG + kt * (BK / FP4_GROUP), m < tokens);
+}
+"##),
+        r##""##.to_string(),
+        prim::load_iters("W_ITERS", "BN * CHUNKS", r##"int r = idx / CHUNKS;
+int c = idx % CHUNKS;
+size_t n = (size_t)min(n0 + r, N - 1);
+if (c < 4) {
+    cp_async16(ws + f4a_chunk(r, c), (const unsigned char*)w + n * (K / 2) + kt * (BK / 2) + c * 16);
+} else {
+    cp_async8_zfill(wss + r * F4A_SCALES, wsc + n * KG + kt * (BK / FP4_GROUP), true);
+}
+"##),
+        r##"    };
 "##.to_string(),
         prim::pipeline_prologue("KT", "load_stage(st, st)"),
         prim::mainloop_head(),
@@ -118,13 +108,9 @@ __device__ __forceinline__ void gemm_f4a(const void* w, const unsigned char* wsc
     }
     cp_async_wait<0>();
     float alpha = fp4_inv_global(wscales) / __ldg((const float*)wscales + 1);
-#pragma unroll
-    for (int i = 0; i < MI; i++)
-#pragma unroll
-        for (int j = 0; j < NJ; j++)
-#pragma unroll
-            for (int e = 0; e < 4; e++) acc[i][j][e] *= alpha;
-    gemm_epilogue_at<N, BM, BN, WM, WN, EPI, false>(acc, nullptr, out, out_hi, out_lo, tokens, m0, n0);
+"##.to_string(),
+        prim::unroll_nest(4, &[("i", "MI"), ("j", "NJ"), ("e", "4")], false, "acc[i][j][e] *= alpha;"),
+        r##"    gemm_epilogue_at<N, BM, BN, WM, WN, EPI, false>(acc, nullptr, out, out_hi, out_lo, tokens, m0, n0);
 }
 
 "##.to_string(),

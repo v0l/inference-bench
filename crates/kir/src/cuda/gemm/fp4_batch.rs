@@ -41,15 +41,12 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
     const unsigned char* sb = scales + FP4_HEADER;
     const unsigned char* wrow[MJ][2];
     const unsigned char* srow[MJ][2];
-#pragma unroll
-    for (int i = 0; i < MJ; i++)
-#pragma unroll
-        for (int h = 0; h < 2; h++) {
-            int r = min(row0 + i * 16 + g + 8 * h, N - 1);
-            wrow[i][h] = wb + (size_t)r * (K / 2) + t * 16;
-            srow[i][h] = sb + (size_t)r * KG + 2 * t;
-        }
-    auto stage = [&](int buf, int c) {
+"##.to_string(),
+        prim::unroll_nest(4, &[("i", "MJ"), ("h", "2")], true, r##"int r = min(row0 + i * 16 + g + 8 * h, N - 1);
+wrow[i][h] = wb + (size_t)r * (K / 2) + t * 16;
+srow[i][h] = sb + (size_t)r * KG + 2 * t;
+"##),
+        r##"    auto stage = [&](int buf, int c) {
         bf16_t* base = xs + buf * STAGE;
         for (int i = tid; i < LOADS; i += WARPS * 32) {
             int p = i / (M * PIECES);
@@ -60,14 +57,11 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
         }
     };
     auto load_w = [&](int c, uint4 (&q)[MJ][2], unsigned (&s)[MJ][2]) {
-#pragma unroll
-        for (int i = 0; i < MJ; i++)
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                q[i][h] = f4b_load16(wrow[i][h] + (size_t)c * (F4B_KC / 2));
-                s[i][h] = __ldg((const unsigned short*)(srow[i][h] + c * (F4B_KC / FP4_GROUP)));
-            }
-    };
+"##.to_string(),
+        prim::unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, r##"q[i][h] = f4b_load16(wrow[i][h] + (size_t)c * (F4B_KC / 2));
+s[i][h] = __ldg((const unsigned short*)(srow[i][h] + c * (F4B_KC / FP4_GROUP)));
+"##),
+        r##"    };
     float acc[MJ][NT][4];
 "##.to_string(),
         prim::zero_frag("acc", ("i", "MJ"), ("n", "NT"), 4),
@@ -83,14 +77,11 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
         const bf16_t* xh = xs + (it % STAGES) * STAGE;
         const bf16_t* xl = xh + PLANE;
         float sc[MJ][2][2];
-#pragma unroll
-        for (int i = 0; i < MJ; i++)
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                sc[i][h][0] = e4m3_to_f32(s[i][h] & 0xffu);
-                sc[i][h][1] = e4m3_to_f32((s[i][h] >> 8) & 0xffu);
-            }
-#pragma unroll
+"##.to_string(),
+        prim::unroll_nest(8, &[("i", "MJ"), ("h", "2")], true, r##"sc[i][h][0] = e4m3_to_f32(s[i][h] & 0xffu);
+sc[i][h][1] = e4m3_to_f32((s[i][h] >> 8) & 0xffu);
+"##),
+        r##"#pragma unroll
         for (int k = 0; k < 8; k++) {
             uint2 bh[NT], bl[NT];
 #pragma unroll
@@ -114,14 +105,11 @@ __device__ __forceinline__ void gemv_f4b(const void* w, const unsigned char* sca
             }
         }
         if (it + 1 < nc) {
-#pragma unroll
-            for (int i = 0; i < MJ; i++)
-#pragma unroll
-                for (int h = 0; h < 2; h++) {
-                    q[i][h] = nq[i][h];
-                    s[i][h] = ns[i][h];
-                }
-        }
+"##.to_string(),
+        prim::unroll_nest(12, &[("i", "MJ"), ("h", "2")], true, r##"q[i][h] = nq[i][h];
+s[i][h] = ns[i][h];
+"##),
+        r##"        }
     }
 "##.to_string(),
         prim::batch_epilogue("f4b", "acc[i][n][e] * inv", "v"),

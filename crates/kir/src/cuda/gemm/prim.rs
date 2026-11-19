@@ -199,3 +199,57 @@ pub fn batch_reduce(p: &str, bias: bool) -> String {
     )
     .replace("P_store", &format!("{p}_store"))
 }
+
+pub fn device_t(template: &str, ret: &str, name: &str, args: &str, body: &str) -> String {
+    format!("template <{template}>\n__device__ __forceinline__ {ret} {name}({args}) {{\n{body}}}\n\n")
+}
+
+pub fn thread_ids(with_t: bool) -> String {
+    format!(
+        "    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int warp = tid >> 5;
+    int g = lane >> 2;
+{t}    int wm = warp / WN;
+    int wn = warp % WN;
+",
+        t = if with_t { "    int t = lane & 3;\n" } else { "" }
+    )
+}
+
+pub fn load_iters(iters: &str, total: &str, body: &str) -> String {
+    let lines: String = body.lines().map(|l| if l.is_empty() { "\n".to_string() } else { format!("            {l}\n") }).collect();
+    format!(
+        "#pragma unroll
+        for (int i = 0; i < {iters}; i++) {{
+            int idx = tid + i * THREADS;
+            if ({iters} * THREADS != {total} && idx >= {total}) break;
+{lines}        }}
+"
+    )
+}
+
+pub fn unroll_nest(indent: usize, levels: &[(&str, &str)], block: bool, body: &str) -> String {
+    let mut out = String::new();
+    for (k, (v, b)) in levels.iter().enumerate() {
+        out.push_str(&format!("#pragma unroll\n{}for (int {v} = 0; {v} < {b}; {v}++)", " ".repeat(indent + 4 * k)));
+        if k + 1 < levels.len() {
+            out.push('\n');
+        }
+    }
+    if !block {
+        out.push_str(&format!(" {body}\n"));
+        return out;
+    }
+    out.push_str(" {\n");
+    let pad = " ".repeat(indent + 4 * levels.len());
+    for l in body.lines() {
+        if l.is_empty() {
+            out.push('\n');
+        } else {
+            out.push_str(&format!("{pad}{l}\n"));
+        }
+    }
+    out.push_str(&format!("{}}}\n", " ".repeat(indent + 4 * (levels.len() - 1))));
+    out
+}
