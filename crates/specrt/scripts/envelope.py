@@ -52,7 +52,7 @@ def cmd_vllm(model, out):
     from vllm import LLM, SamplingParams
 
     vocab = np.load(out / "fp32.npy", mmap_mode="r").shape[1]
-    llm = LLM(model, max_model_len=256, gpu_memory_utilization=0.12, enable_prefix_caching=False, enforce_eager=False, max_logprobs=-1)
+    llm = LLM(model, max_model_len=256, gpu_memory_utilization=float(os.environ.get("VLLM_UTIL", "0.12")), enable_prefix_caching=False, enforce_eager=False, max_logprobs=-1)
     rows = []
     for p in load_prompts(out):
         o = llm.generate([{"prompt_token_ids": p}], SamplingParams(temperature=0, max_tokens=1, prompt_logprobs=-1, logprobs=-1), use_tqdm=False)[0]

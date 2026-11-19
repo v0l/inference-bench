@@ -35,6 +35,7 @@ const VERBATIM_QUANT: &[(&str, &str)] = &[
 const VERBATIM_MOE: &[(&str, &str)] = &[
     ("cuda/moe/route.rs", "top-k routing, permute, combine are MoE-specific; the logits block sum keeps its warp-sum plus smem loop because block_reduce adds a __syncthreads and changes the PTX"),
     ("cuda/moe/gemv.rs", "expert row dots read per-expert fp4/fp8/bf16 rows; porting onto the shared row dots changes the PTX (#793)"),
+    ("cuda/moe/mma8.rs", "FP8 e4m3 mma wrapper and per-32 activation quantise are single-use text; shared tile setup, tiles and pipeline prims are reused (#899)"),
     ("cuda/moe/prim.rs", "re-exports the shared gemm prims plus MoE constants and launch wrappers"),
 ];
 

@@ -1413,6 +1413,7 @@ impl Spec {
         let experts_nvfp4 = hf.num_experts.is_some_and(|e| e > 0) && quant == Quant::Nvfp4G16;
         let (quant, mlp_quant, act, mlp_act) =
             if experts_nvfp4 { (Quant::Bf16, Some((Quant::Nvfp4G16, None)), ActQuant::None, moe_act(&family.quantization, quant_config.as_ref())) } else { (quant, mlp_quant, act, mlp_act) };
+        let mlp_act = if strict && hf.num_experts.is_some_and(|e| e > 0) && mlp_quant.map_or(quant, |m| m.0) == Quant::Fp8Block128 { ActQuant::Fp8 } else { mlp_act };
         let nested = hf
             .rope_parameters
             .as_ref()
