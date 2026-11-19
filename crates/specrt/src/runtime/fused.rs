@@ -98,7 +98,7 @@ impl Runtime {
                     )?;
                     self.attn_decode_rows(l, bb, nd, 1)?;
                     self.attn_prefill_rows(l, np, nd)?;
-                    self.tc("o", &l.o, None, pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
+                    self.tc("o", &l.o, l.o_bias.as_ref(), pre.attn_planes.all(), GemmOut::F32(&pre.x), hidden, n)?;
                 }
             }
             self.mlp_rows(layer, n)?;

@@ -16,6 +16,8 @@ CHUNKED = "tiny-chunked"
 MLA = "tiny-deepseek-v2"
 MLA_MOE = "tiny-deepseek-v2-moe"
 GLM = "tiny-glm4-moe"
+OSS = "tiny-gpt-oss"
+HASH = "tiny-hash-glm4-moe"
 WINDOW = 16
 SOFTCAP = 8.0
 CHUNK = 16
@@ -175,11 +177,74 @@ def build_glm_config():
     )
 
 
+def build_oss_config():
+    from transformers import GptOssConfig
+
+    return GptOssConfig(
+        vocab_size=512,
+        hidden_size=256,
+        intermediate_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_local_experts=8,
+        num_experts_per_tok=2,
+        sliding_window=16,
+        swiglu_alpha=1.702,
+        swiglu_limit=2.5,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+        eos_token_id=None,
+        bos_token_id=None,
+        pad_token_id=None,
+        attn_implementation="eager",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+
+
+E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+
+
+def mxfp4_dequant(blocks, scales):
+    lut = torch.tensor(E2M1 + [-v for v in E2M1])
+    lo = lut[(blocks & 0xF).long()]
+    hi = lut[(blocks >> 4).long()]
+    vals = torch.stack([lo, hi], dim=-1).flatten(-2)
+    out = vals * torch.pow(2.0, scales.float() - 127.0).unsqueeze(-1)
+    return out.flatten(-2).to(torch.bfloat16)
+
+
+def oss_experts(model):
+    g = torch.Generator().manual_seed(SEED + 9)
+    tensors, dequant = {}, {}
+    for i, layer in enumerate(model.model.layers):
+        e = layer.mlp.experts
+        base = f"model.layers.{i}.mlp.experts"
+        for name, rows, cols in [("gate_up_proj", 2 * e.intermediate_size, e.hidden_size), ("down_proj", e.hidden_size, e.intermediate_size)]:
+            blocks = torch.randint(0, 256, (e.num_experts, rows, cols // 32, 16), generator=g, dtype=torch.uint8)
+            scales = torch.randint(121, 124, (e.num_experts, rows, cols // 32), generator=g, dtype=torch.uint8)
+            tensors[f"{base}.{name}_blocks"] = blocks
+            tensors[f"{base}.{name}_scales"] = scales
+            dequant[f"{base}.{name}"] = mxfp4_dequant(blocks, scales).transpose(1, 2).contiguous()
+        for name in ("gate_up_proj_bias", "down_proj_bias"):
+            shape = getattr(e, name).shape
+            v = (0.1 * torch.randn(shape, generator=g)).to(torch.bfloat16)
+            tensors[f"{base}.{name}"] = v
+            dequant[f"{base}.{name}"] = v
+    return tensors, dequant
+
+
 def weights(model):
     g = torch.Generator().manual_seed(SEED)
     out = {}
     for name, p in sorted(model.state_dict().items()):
-        if name.endswith("e_score_correction_bias"):
+        if ".mlp.experts." in name and "bias" not in name:
+            continue
+        if name.endswith("router.bias"):
+            v = 0.3 * torch.randn(p.shape, generator=g)
+        elif name.endswith("e_score_correction_bias"):
             v = 0.2 * torch.randn(p.shape, generator=g)
         elif name.endswith(".sinks"):
             v = 2.0 * torch.randn(p.shape, generator=g)
@@ -240,6 +305,11 @@ def make(name):
 
         cfg = build_glm_config()
         extra = {}
+    elif name == OSS:
+        from transformers import GptOssForCausalLM as Model
+
+        cfg = build_oss_config()
+        extra = {}
     elif name == SINKS:
         import transformers.models.qwen3.modeling_qwen3 as modeling
         from transformers import Qwen3ForCausalLM as Model
@@ -267,6 +337,18 @@ def make(name):
             layer.self_attn.sinks = nn.Parameter(torch.zeros(cfg.num_attention_heads))
     folder = FIXTURES / name
     path = folder / "model.safetensors"
+    if name == OSS:
+        tensors, dequant = oss_experts(model)
+        if not path.exists():
+            folder.mkdir(parents=True, exist_ok=True)
+            save_file({**weights(model), **tensors}, path)
+            raw = json.loads(cfg.to_json_string())
+            raw.update(extra)
+            (folder / "config.json").write_text(json.dumps(raw, indent=2) + "\n")
+        loaded = {k: v.float() for k, v in load_file(path).items() if "_blocks" not in k and "_scales" not in k}
+        loaded.update({k: v.float() for k, v in dequant.items()})
+        model.load_state_dict(loaded, strict=True)
+        return model
     if not path.exists():
         folder.mkdir(parents=True, exist_ok=True)
         save_file(split_experts(weights(model)), path)
@@ -280,7 +362,7 @@ def make(name):
 def main(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    for name in (SINKS, CHUNKED, MLA, MLA_MOE, GLM):
+    for name in (SINKS, CHUNKED, MLA, MLA_MOE, GLM, OSS):
         model = make(name)
         g = torch.Generator().manual_seed(SEED + 3)
         ids = torch.randint(0, 512, (PROMPT,), generator=g)

@@ -1,0 +1,68 @@
+name = "gpt_oss"
+kind = "family"
+min_engine = 10
+extends = "base"
+
+[match]
+model_types = ["gpt_oss"]
+architectures = ["GptOssForCausalLM"]
+
+[norm]
+unit_offset = false
+
+[fields]
+num_experts = ["num_local_experts"]
+moe_intermediate_size = ["intermediate_size"]
+
+[attention]
+qkv_bias = { config = "attention_bias", default = false }
+o_bias = { config = "attention_bias", default = false }
+
+[attention.params]
+softcap = 0.0
+
+[mlp.gated]
+expr = "(max(min(u, limit), -limit) + 1.0) * (min(g, limit) * sigmoid(min(g, limit) * alpha))"
+
+[mlp.gated.params]
+alpha = { config = "swiglu_alpha", default = 1.702 }
+limit = { config = "swiglu_limit", default = 7.0 }
+
+[moe]
+router_module = "router"
+router_bias = true
+expert_bias = true
+norm_topk = true
+shared_gate = false
+expert_block = { elem = "e2m1", scale = "e8m0", group = 32 }
+gate_up_interleaved = true
+
+[[attention.node]]
+op = "qk_rope"
+phase = "prefill"
+
+[[attention.node]]
+op = "kernel"
+kernel = "attn_sinks"
+phase = "prefill"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+sinks = { weight = "sinks", len = "heads" }
+window = "window"
+softcap = "softcap"
+
+[[attention.node]]
+op = "decode_rope"
+phase = "rows"
+
+[[attention.node]]
+op = "kernel"
+kernel = "attn_sinks"
+phase = "rows"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+sinks = { weight = "sinks", len = "heads" }
+window = "window"
+softcap = "softcap"

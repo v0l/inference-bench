@@ -9,6 +9,7 @@ const CHUNKED: &str = "tiny-chunked";
 const MLA: &str = "tiny-deepseek-v2";
 const MLA_MOE: &str = "tiny-deepseek-v2-moe";
 const GLM: &str = "tiny-glm4-moe";
+const OSS: &str = "tiny-gpt-oss";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -208,4 +209,42 @@ fn a_dense_moe_config_has_no_groups_or_bias() {
 #[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
 fn group_limited_sigmoid_routing_with_score_bias_matches_transformers() {
     close(GLM, 5e-2);
+}
+
+#[test]
+fn the_gpt_oss_config_reads_biases_clamp_and_mxfp4_experts_from_the_family_toml() {
+    let spec = spec(OSS);
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.top_k(), moe.router_bias, moe.expert_bias, moe.norm_topk), (8, 2, true, true, true));
+    assert_eq!((moe.router_module.as_str(), moe.expert_block, moe.shared_slots()), ("router", Some(specrt::dequant::MXFP4), 0));
+    assert!(spec.attention.qkv_bias && spec.attention.o_bias);
+    let gated = spec.mlp.gated.as_ref().unwrap();
+    assert_eq!((gated.params["alpha"], gated.params["limit"]), (1.702, 2.5));
+    assert_eq!(spec.layers.window, Some(16));
+    spec.runnable().unwrap();
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+    for c in ["constexpr bool MOE_ROUTER_BIAS = true;", "constexpr bool MOE_EBIAS = true;", "fminf(g, 2.5e0f)"] {
+        assert!(module.source.contains(c), "{c}");
+    }
+}
+
+#[test]
+fn the_gpt_oss_checkpoint_decodes_mxfp4_experts_and_loads_every_bias() {
+    let spec = spec(OSS);
+    let ck = specrt::weights::Checkpoint::open(&fixture(OSS)).unwrap();
+    let w = ck.layer(&spec, 0).unwrap();
+    let m = w.moe.unwrap();
+    let (h, inter, e) = (256, 256, 8);
+    let specrt::weights::Stacked::Bf16(gate) = &m.gate else { panic!("bf16") };
+    assert_eq!(gate.len(), e * inter * h);
+    assert_eq!((m.router_bias.unwrap().len(), m.gate_up_bias.unwrap().len(), m.down_bias.unwrap().len()), (e, e * 2 * inter, e * h));
+    let specrt::weights::Mixer::Attention(a) = &w.mixer else { panic!("attention") };
+    assert_eq!(a.o_bias.as_ref().unwrap().len(), h);
+    assert!(a.extra.iter().any(|(n, v)| n == "sinks" && v.len() == 4));
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn gpt_oss_sinks_clamped_swiglu_and_mxfp4_experts_match_transformers() {
+    close(OSS, 5e-2);
 }

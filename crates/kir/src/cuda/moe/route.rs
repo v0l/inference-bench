@@ -44,6 +44,7 @@ fn logits_dot() -> &'static str {
         for (int i = lane; i < HIDDEN; i += 32) a += shared_gate[i] * xs[i];
     }
     a = warp_sum(a);
+    if (MOE_ROUTER_BIAS && e < MOE_E) a += router_bias[e];
     if (lane == 0) logits[(size_t)t * (MOE_E + 1) + e] = a;
 "##
 }
@@ -51,7 +52,7 @@ fn logits_dot() -> &'static str {
 pub fn route_logits() -> String {
     format!(
         "constexpr int MOE_LOGIT_ROWS = 8;\n\n{}",
-        prim::global(Some(256), "moe_route_logits", "const float* x, const float* ln, const bf16_t* router, const float* shared_gate, float* xn, float* logits", &format!("{}{}", logits_norm(), logits_dot()))
+        prim::global(Some(256), "moe_route_logits", "const float* x, const float* ln, const bf16_t* router, const float* shared_gate, const float* router_bias, float* xn, float* logits", &format!("{}{}", logits_norm(), logits_dot()))
     )
 }
 
@@ -82,6 +83,14 @@ fn probabilities() -> &'static str {
         for (int e = lane; e < MOE_E; e += 32) probs[e] /= s;
     }
     __syncwarp();
+    if (MOE_HASH && hashed) {
+        for (int e = lane; e < MOE_E; e += 32) sel[e] = -3.0e30f;
+        __syncwarp();
+        if (lane == 0) {
+            for (int k = 0; k < MOE_K; k++) sel[table[(size_t)tokens[t] * MOE_K + k]] = 1.0f - 1.0e-3f * k;
+        }
+        __syncwarp();
+    } else {
     for (int e = lane; e < MOE_E; e += 32) sel[e] = MOE_BIAS ? probs[e] + bias[e] : probs[e];
     __syncwarp();
     if (MOE_GROUPS > 1) {
@@ -110,6 +119,7 @@ fn probabilities() -> &'static str {
             if (!group_kept[e / PER]) sel[e] = -1.0e30f;
         }
         __syncwarp();
+    }
     }
 "##
 }
@@ -159,7 +169,7 @@ fn emit_pairs() -> &'static str {
 pub fn route() -> String {
     format!(
         "constexpr bool MOE_PARALLEL = MOE_LOCAL != MOE_E;\n\n{}",
-        prim::global(Some(32), "moe_route", "const float* logits, const float* bias, int* idx, float* coef, int first", &format!("{}{}{}", probabilities(), top_k(), emit_pairs()))
+        prim::global(Some(32), "moe_route", "const float* logits, const float* bias, const int* table, const int* tokens, int hashed, int* idx, float* coef, int first", &format!("{}{}{}", probabilities(), top_k(), emit_pairs()))
     )
 }
 
