@@ -196,8 +196,17 @@ fn run_linear(w: &mut Wgpu, rows: &DeviceRows, x: &[f32], tokens: usize, accumul
     let table = u32_buf(w, &rows.rows);
     let xb = f32_buf(w, x);
     let yb = f32_buf(w, &accumulate.map_or_else(|| vec![0.0; tokens * nrows], |a| a.to_vec()));
-    let (name, tt) = if tokens == 1 { ("linear", 1) } else { ("linear_t8", wgsl::LINEAR_TOKENS) };
-    let grid = [nrows as u32, 1, tokens.div_ceil(tt) as u32];
+    let (name, grid) = if tokens == 1 {
+        if specrt::backends::Backend::limits(w).subgroup_size == 32 {
+            ("linear_sg", [(nrows as u32).div_ceil(wgsl::SG_ROWS), 1, 1])
+        } else {
+            ("linear", [nrows as u32, 1, tokens as u32])
+        }
+    } else if tokens >= wgsl::TILE_MIN_TOKENS {
+        (if specrt::backends::Backend::limits(w).coop_matrix { "linear_coop" } else { "linear_tile" }, [nrows.div_ceil(wgsl::TILE_ROWS) as u32, 1, tokens.div_ceil(wgsl::TILE_TOKENS) as u32])
+    } else {
+        ("linear_t8", [nrows as u32, 1, tokens.div_ceil(wgsl::LINEAR_TOKENS) as u32])
+    };
     let params = [nrows as u32, rows.cols as u32, tokens as u32, 0, 0, accumulate.is_some() as u32, 0, 0];
     go(w, name, &[&xb, &yb, &data, &table], params, grid);
     read_f32(w, &yb, tokens * nrows)
@@ -223,10 +232,10 @@ fn linear_case(kind: GgmlType, tokens: usize) {
             want[t * nrows + r] = (0..cols).map(|c| weights[r][c] as f64 * x[t * cols + c] as f64).sum::<f64>() as f32;
         }
     }
-    close(&run_linear(&mut w, &packed, &x, tokens, None), &want, 2e-4, "linear");
+    close(&run_linear(&mut w, &packed, &x, tokens, None), &want, 2e-4, &format!("linear {tokens}"));
     let base: Vec<f32> = (0..tokens * nrows).map(|_| rng.unit()).collect();
     let plus: Vec<f32> = want.iter().zip(&base).map(|(a, b)| a + b).collect();
-    close(&run_linear(&mut w, &packed, &x, tokens, Some(&base)), &plus, 2e-4, "linear accumulate");
+    close(&run_linear(&mut w, &packed, &x, tokens, Some(&base)), &plus, 2e-4, &format!("linear accumulate {tokens}"));
 }
 
 #[test]
@@ -234,6 +243,7 @@ fn linear_case(kind: GgmlType, tokens: usize) {
 fn linear_matches_a_cpu_matmul_for_bf16_at_one_and_many_tokens() {
     linear_case(GgmlType::Bf16, 1);
     linear_case(GgmlType::Bf16, 11);
+    linear_case(GgmlType::Bf16, 70);
 }
 
 #[test]
@@ -243,6 +253,11 @@ fn linear_matches_a_cpu_matmul_for_q8_0_and_q4_k() {
     linear_case(GgmlType::Q8_0, 9);
     linear_case(GgmlType::Q4K, 1);
     linear_case(GgmlType::Q4K, 9);
+    linear_case(GgmlType::Q6K, 1);
+    linear_case(GgmlType::Q6K, 9);
+    linear_case(GgmlType::Q5K, 1);
+    linear_case(GgmlType::Q4K, 100);
+    linear_case(GgmlType::Q8_0, 33);
 }
 
 #[test]
@@ -363,7 +378,11 @@ fn causal_attention_matches_a_cpu_softmax_reference() {
     let vcache: Vec<f32> = (0..kv_len).map(|_| rng.unit()).collect();
     let (qb, kc, vc) = (f32_buf(&w, &qkv), f32_buf(&w, &kcache), f32_buf(&w, &vcache));
     let ob = f32_buf(&w, &vec![0.0; rows * a.heads * hd]);
-    go(&mut w, "attention", &[&qb, &kc, &vc, &ob], [pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [a.heads as u32, rows as u32, 1]);
+    if specrt::backends::Backend::limits(&w).subgroup_size == 32 {
+        go(&mut w, "flash", &[&qb, &kc, &vc, &ob], [pos0 as u32, rows as u32, 0, 0, 0, 0, 0, 0], [a.heads as u32, (rows as u32).div_ceil(wgsl::FLASH_TOKENS), 1]);
+    } else {
+        go(&mut w, "attention", &[&qb, &kc, &vc, &ob], [pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [a.heads as u32, rows as u32, 1]);
+    }
     let got = read_f32(&w, &ob, rows * a.heads * hd);
     let mut want = vec![0f32; rows * a.heads * hd];
     for t in 0..rows {
@@ -614,11 +633,11 @@ fn the_live_target_matches_the_adapter_features() {
     let w = device();
     let info = w.info();
     let target = specrt::backends::Backend::limits(&w).target();
-    let adapter_has = info.subgroup_min_size > 0 && info.subgroup_min_size == info.subgroup_max_size;
+    let adapter_has = info.subgroup_min_size > 0 && (info.subgroup_min_size == info.subgroup_max_size || (info.subgroup_min_size <= 32 && info.subgroup_max_size >= 32));
     eprintln!("subgroup size {}..{} target subgroups {}", info.subgroup_min_size, info.subgroup_max_size, target.has(kir::Feature::Subgroups));
     if target.has(kir::Feature::Subgroups) {
         assert!(adapter_has);
-        assert_eq!(target.warp_size, info.subgroup_min_size);
+        assert!(target.warp_size == info.subgroup_min_size || target.warp_size == 32);
     } else {
         assert_eq!(target.warp_size, 1);
     }

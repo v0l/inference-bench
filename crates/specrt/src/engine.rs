@@ -480,7 +480,7 @@ impl Engine {
         self.max_ctx
     }
 
-    fn tokens(&self, text: &str) -> Result<Vec<u32>> {
+    pub fn tokens(&self, text: &str) -> Result<Vec<u32>> {
         let enc =
             self.tokenizer.encode(text, false).map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
         Ok(enc.get_ids().to_vec())

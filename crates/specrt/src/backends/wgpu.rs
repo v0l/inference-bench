@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 const PARAM_SLOT: u64 = 256;
 const PARAM_SLOTS: u64 = 8192;
+const UPLOAD_FLUSH: u64 = 128 << 20;
 
 pub struct Buffer {
     pub raw: wgpu::Buffer,
@@ -26,7 +27,9 @@ pub struct Wgpu {
     pipelines: HashMap<&'static str, Pipeline>,
     params: wgpu::Buffer,
     slot: u64,
+    pending_upload: std::cell::Cell<u64>,
     encoder: Option<wgpu::CommandEncoder>,
+    pass: Option<wgpu::ComputePass<'static>>,
     cache_dir: Option<PathBuf>,
     cache: Option<wgpu::PipelineCache>,
     cache_path: Option<PathBuf>,
@@ -68,12 +71,19 @@ impl Wgpu {
         required.max_compute_workgroups_per_dimension = have.max_compute_workgroups_per_dimension;
         let wanted_cache = adapter.features() & wgpu::Features::PIPELINE_CACHE;
         let wanted_subgroups = adapter.features() & wgpu::Features::SUBGROUP;
-        let subgroups = !wanted_subgroups.is_empty() && info.subgroup_min_size > 0 && info.subgroup_min_size == info.subgroup_max_size;
+        let apple = info.backend == wgpu::Backend::Metal && info.subgroup_min_size <= 32 && info.subgroup_max_size >= 32;
+        let subgroups = !wanted_subgroups.is_empty() && info.subgroup_min_size > 0 && (info.subgroup_min_size == info.subgroup_max_size || apple);
         let f16 = adapter.features() & wgpu::Features::SHADER_F16;
+        let coop = adapter.features().contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+            && adapter.cooperative_matrix_properties().iter().any(|c| {
+                c.m_size == 8 && c.n_size == 8 && c.k_size == 8 && c.ab_type == wgpu::CooperativeScalarType::F32 && c.cr_type == wgpu::CooperativeScalarType::F32
+            });
+        let coop = coop && std::env::var_os("SPECRT_NO_COOP").is_none();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("specrt"),
-            required_features: wanted_cache | f16 | if subgroups { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() },
+            required_features: wanted_cache | f16 | if coop { wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX } else { wgpu::Features::empty() } | if subgroups { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() },
             required_limits: required.clone(),
+            experimental_features: if coop { unsafe { wgpu::ExperimentalFeatures::enabled() } } else { wgpu::ExperimentalFeatures::disabled() },
             ..Default::default()
         }))
         .with_context(|| format!("wgpu device on {}", info.name))?;
@@ -85,8 +95,9 @@ impl Wgpu {
             max_storage_buffers: required.max_storage_buffers_per_shader_stage,
             max_workgroup_invocations: required.max_compute_invocations_per_workgroup,
             max_workgroup_storage: required.max_compute_workgroup_storage_size,
-            subgroup_size: if subgroups { info.subgroup_min_size } else { 0 },
+            subgroup_size: if !subgroups { 0 } else if apple { 32 } else { info.subgroup_min_size },
             shader_f16: !f16.is_empty(),
+            coop_matrix: coop,
         };
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params"),
@@ -106,7 +117,7 @@ impl Wgpu {
             }
             _ => (None, None),
         };
-        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, encoder: None, cache_dir, cache, cache_path })
+        Ok(Wgpu { info, device, queue, limits, pipelines: HashMap::new(), params, slot: 0, pending_upload: Default::default(), encoder: None, pass: None, cache_dir, cache, cache_path })
     }
 
     pub fn info(&self) -> &wgpu::AdapterInfo {
@@ -167,6 +178,14 @@ impl Backend for Wgpu {
     }
 
     fn upload(&self, buffer: &Buffer, offset: u64, data: &[u8]) {
+        let pending = self.pending_upload.get() + data.len() as u64;
+        if pending >= UPLOAD_FLUSH {
+            self.queue.submit([]);
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            self.pending_upload.set(0);
+        } else {
+            self.pending_upload.set(pending);
+        }
         if data.len().is_multiple_of(4) {
             self.queue.write_buffer(&buffer.raw, offset, data);
         } else {
@@ -251,7 +270,7 @@ impl Backend for Wgpu {
                 layout: Some(&pl),
                 module: &module,
                 entry_point: Some("main"),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: false, ..Default::default() },
                 cache: self.cache.as_ref(),
             });
             if let Some(e) = pollster::block_on(scope.pop()) {
@@ -292,9 +311,12 @@ impl Backend for Wgpu {
             .collect();
         let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &p.layout, entries: &entries });
         let pipeline = p.pipeline.clone();
-        let device = &self.device;
-        let encoder = self.encoder.get_or_insert_with(|| device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("specrt") }));
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("specrt"), timestamp_writes: None });
+        if self.pass.is_none() {
+            let device = &self.device;
+            let encoder = self.encoder.get_or_insert_with(|| device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("specrt") }));
+            self.pass = Some(encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("specrt"), timestamp_writes: None }).forget_lifetime());
+        }
+        let pass = self.pass.as_mut().expect("a compute pass is open");
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(grid[0], grid[1], grid[2]);
@@ -303,6 +325,7 @@ impl Backend for Wgpu {
 
     fn submit(&mut self) -> Result<()> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        self.pass = None;
         if let Some(e) = self.encoder.take() {
             self.queue.submit([e.finish()]);
         }

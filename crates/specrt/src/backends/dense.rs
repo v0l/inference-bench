@@ -176,9 +176,19 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             }
             Op::Linear { weight, input, output, .. } => {
                 let w = self.weight(weight, l);
-                let grid = [w.nrows.min(ROW_SPAN), w.nrows.div_ceil(ROW_SPAN), rows.div_ceil(if rows == 1 { 1 } else { LINEAR_TOKENS }) as u32];
+                let coop = kernels[0] == "linear_tile" && be.limits().coop_matrix;
+                let sg = rows == 1 && be.limits().subgroup_size == 32;
+                let kernel = if coop { "linear_coop" } else if sg { "linear_sg" } else { kernels[0] };
+                let grid = if sg {
+                    let groups = w.nrows.div_ceil(wgsl::SG_ROWS);
+                    [groups.min(ROW_SPAN), groups.div_ceil(ROW_SPAN), 1]
+                } else if kernels[0] == "linear_tile" {
+                    [w.nrows.div_ceil(wgsl::TILE_ROWS as u32), 1, rows.div_ceil(wgsl::TILE_TOKENS) as u32]
+                } else {
+                    [w.nrows.min(ROW_SPAN), w.nrows.div_ceil(ROW_SPAN), rows.div_ceil(if rows == 1 { 1 } else { LINEAR_TOKENS }) as u32]
+                };
                 let accumulate = output == Buf::X;
-                be.dispatch(kernels[0], &[self.buf(input), self.buf(output), &w.data, &w.rows], [w.nrows, w.cols, r, 0, 0, accumulate as u32, 0, 0], grid)?;
+                be.dispatch(kernel, &[self.buf(input), self.buf(output), &w.data, &w.rows], [w.nrows, w.cols, r, 0, 0, accumulate as u32, 0, 0], grid)?;
                 if let (Weight::Qkv, Some(b)) = (weight, l.and_then(|l| l.bias.as_ref())) {
                     let width = spec.qkv_rows();
                     be.dispatch(kernels[1], &[self.buf(output), b], [r, width as u32, 0, 0, 0, 0, 0, 0], grid_1d(rows * width))?;
@@ -192,6 +202,9 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             }
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention => {
                 let l = l.expect("attention needs a layer");
+                if rows > 1 && be.limits().subgroup_size == 32 {
+                    return be.dispatch("flash", &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, r, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r.div_ceil(wgsl::FLASH_TOKENS), 1]);
+                }
                 be.dispatch(kernels[0], &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r, 1])
             }
             Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),
