@@ -29,8 +29,12 @@ fn main() -> Result<()> {
             "split" | "plain" => Vec::new(),
             "unsplit4" => ["qkv", "o", "gate_up", "down"].map(String::from).to_vec(),
             "unsplit" => ["qkv", "o", "gate_up", "down", "lm_head"].map(String::from).to_vec(),
+            "moe_fp8act" => Vec::new(),
             other => anyhow::bail!("mode {other}"),
         };
+        if mode == "moe_fp8act" {
+            spec.mlp.act_quant = specrt::spec::ActQuant::Fp8;
+        }
         if mode == "split" {
             spec.runtime.split_activations = Some(true);
         }

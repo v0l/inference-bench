@@ -76,10 +76,10 @@ pub fn quant_mx() -> String {
     )
 }
 
-pub fn tiles() -> String {
+pub fn tiles(name: &str) -> String {
     prim::global(
         None,
-        "moe_tiles",
+        name,
         "const int* offsets, int* tile_map, int bm, int max_tiles",
         r##"    if (threadIdx.x != 0) return;
     int t = 0;
@@ -154,7 +154,7 @@ fn zero_acc() -> String {
     prim::zero_frag("acc[w]", ("i", "MI"), ("j", "NJ"), 8)
 }
 
-fn tile_setup() -> String {
+pub(super) fn tile_setup() -> String {
     format!("{}{}", tile_setup_head(), zero_acc())
 }
 
@@ -328,7 +328,7 @@ pub fn grouped(mx: bool) -> String {
     out.push_str(&prim::e2m1x2("moe_e2m1x2"));
     out.push_str(&scale_helpers());
     out.push_str(&if mx { quant_mx() } else { quant_f32() });
-    out.push_str(&tiles());
+    out.push_str(&tiles("moe_tiles"));
     out.push_str(&prim::swizzle("mma_chunk", "MMA_DATA"));
     out.push_str(&gemm());
     variants(&mut out, mx);
