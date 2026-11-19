@@ -727,7 +727,7 @@ fn gemv_cfg(name: &str, rows: usize, w: &DeviceMatrix, sms: u32) -> LaunchConfig
     }
 }
 
-const GEMV_BLOCKS_PER_SM: u32 = 2;
+const GEMV_BLOCKS_PER_SM: u32 = 8;
 const PREFILL_CHUNK: usize = 2048;
 const STATE_FREE_MARGIN: usize = 256 << 20;
 const ATTN_SPLITS: usize = 64;
