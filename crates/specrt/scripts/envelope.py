@@ -6,7 +6,8 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).parent
-MAXLEN = 48
+MAXLEN = int(os.environ.get("ENVELOPE_MAXLEN", 48))
+PROMPTS = int(os.environ.get("ENVELOPE_PROMPTS", 0))
 
 
 def prompts_text():
@@ -14,7 +15,8 @@ def prompts_text():
     from reference import REAL_PROMPTS
     from vllm_logprobs import EXTRA
 
-    return REAL_PROMPTS + EXTRA[:3]
+    texts = REAL_PROMPTS + EXTRA[:3]
+    return texts[:PROMPTS] if PROMPTS else texts
 
 
 def cmd_prompts(model, out):
@@ -37,7 +39,13 @@ def cmd_fp32(model, out):
 
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    m = AutoModelForCausalLM.from_pretrained(model, torch_dtype=torch.float32, attn_implementation="eager").to(os.environ.get("FP32_DEVICE", "cuda")).eval()
+    kwargs = {}
+    dtype = getattr(torch, os.environ.get("FP32_DTYPE", "float32"))
+    if os.environ.get("MXFP4_DEQUANT"):
+        from transformers import Mxfp4Config
+
+        kwargs["quantization_config"] = Mxfp4Config(dequantize=True)
+    m = AutoModelForCausalLM.from_pretrained(model, torch_dtype=dtype, attn_implementation="eager", **kwargs).to(os.environ.get("FP32_DEVICE", "cuda")).eval()
     rows = []
     with torch.inference_mode():
         for p in load_prompts(out):

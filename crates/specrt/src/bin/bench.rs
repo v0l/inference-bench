@@ -9,6 +9,7 @@ struct Flags {
     profile: bool,
     fp8_act: bool,
     kv_gb: Option<f64>,
+    mlp_act_fp4: bool,
 }
 
 static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
@@ -22,13 +23,14 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None };
+    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--serve" => f.serve = true,
             "--profile" => f.profile = true,
             "--fp8-act" => f.fp8_act = true,
+            "--mlp-act-fp4" => f.mlp_act_fp4 = true,
             "--runs" | "--kv-gb" => {
                 let name = args.remove(i);
                 anyhow::ensure!(i < args.len(), "{name} needs a value");
@@ -59,6 +61,10 @@ fn load_spec(path: &Path) -> Result<Spec> {
         spec.repo = path.display().to_string();
         if flags().fp8_act {
             spec.mlp.act_quant = specrt::spec::ActQuant::Fp8;
+        }
+        if flags().mlp_act_fp4 {
+            spec.mlp.act_quant = specrt::spec::ActQuant::Fp4;
+            spec.validate()?;
         }
         return Ok(spec);
     }
@@ -298,15 +304,11 @@ fn bench_batch(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize) 
         .map(|s| (0..prompt_len as u32).map(|i| 1000 + (i * 7 + s * 131) % 5000).collect())
         .collect();
     rt.generate_batch(&prompts, 8.min(new_tokens))?;
-    let rates: Vec<f64> = (0..runs())
-        .map(|_| {
-            rt.generate_batch(&prompts, new_tokens)
-                .map(|g| (batch * (new_tokens - 1)) as f64 / g.decode_secs)
-        })
-        .collect::<Result<_>>()?;
-    let rate = median(rates);
+    let gens: Vec<_> = (0..runs()).map(|_| rt.generate_batch(&prompts, new_tokens)).collect::<Result<_>>()?;
+    let rate = median(gens.iter().map(|g| (batch * (new_tokens - 1)) as f64 / g.decode_secs).collect());
+    let prefill = median(gens.iter().map(|g| (batch * prompt_len) as f64 / g.prefill_secs).collect());
     println!(
-        "{} batch={} prompt={} new={} decode={:.1} tok/s aggregate, {:.1} per sequence (median of {})",
+        "{} prefill={prefill:.1} tok/s batch={} prompt={} new={} decode={:.1} tok/s aggregate, {:.1} per sequence (median of {})",
         spec.name,
         batch,
         prompt_len,

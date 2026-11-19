@@ -1358,7 +1358,10 @@ impl Spec {
             m.expert_intermediate
         );
         ensure!(m.shared_slots() <= 1 || experts_quant == Quant::Bf16, "shared experts wider than the routed experts are only supported with bf16 weights");
-        ensure!(self.dims.hidden.is_multiple_of(256), "mixture-of-experts needs hidden to be a multiple of 256");
+        ensure!(
+            self.dims.hidden.is_multiple_of(256) || (m.expert_block.is_some_and(|b| b.device_packed()) && self.dims.hidden.is_multiple_of(64)),
+            "mixture-of-experts needs hidden to be a multiple of 256 (64 with block scaled experts)"
+        );
         Ok(())
     }
 

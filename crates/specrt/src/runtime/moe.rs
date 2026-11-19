@@ -136,7 +136,8 @@ impl MoeBuffers {
             offsets: stream.alloc_zeros(m.experts + 2)?,
             sorted: stream.alloc_zeros(pairs)?,
             mma: if mma {
-                let (h, i) = (spec.dims.hidden, m.expert_intermediate);
+                let pad = crate::dequant::DEVICE_TILE;
+                let (h, i) = (spec.dims.hidden.next_multiple_of(pad), m.expert_intermediate.next_multiple_of(pad));
                 let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_SMALL;
                 Some(MmaBuffers {
                     xq: stream.alloc_zeros(rows * h / 2)?,

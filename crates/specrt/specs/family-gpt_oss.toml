@@ -66,3 +66,7 @@ grid = ["heads", "rows"]
 sinks = { weight = "sinks", len = "heads" }
 window = "window"
 softcap = "softcap"
+
+[[quantization.flat_rules]]
+quant = "bf16"
+when = { quant_method = "mxfp4" }

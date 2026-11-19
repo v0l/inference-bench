@@ -230,6 +230,16 @@ fn the_gpt_oss_config_reads_biases_clamp_and_mxfp4_experts_from_the_family_toml(
 }
 
 #[test]
+fn the_real_gpt_oss_20b_config_loads_as_mxfp4_experts_with_a_k_tail() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/gpt-oss-20b.config.json")).unwrap();
+    let spec = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap();
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((spec.dims.hidden, moe.expert_intermediate, moe.experts, moe.top_k()), (2880, 2880, 32, 4));
+    assert_eq!(moe.expert_block, Some(specrt::dequant::MXFP4));
+    assert_eq!(spec.mlp.act_quant, specrt::spec::ActQuant::None);
+}
+
+#[test]
 fn the_gpt_oss_checkpoint_decodes_mxfp4_experts_and_loads_every_bias() {
     let spec = spec(OSS);
     let ck = specrt::weights::Checkpoint::open(&fixture(OSS)).unwrap();

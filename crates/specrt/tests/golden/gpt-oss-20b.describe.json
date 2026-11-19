@@ -1,0 +1,49 @@
+{
+  "name": "gpt_oss",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 2880,
+    "intermediate": 2880,
+    "vocab": 201088,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 24,
+    "pattern": [
+      "sliding",
+      "full"
+    ],
+    "window": 128
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 64,
+    "kv_heads": 8,
+    "head_dim": 64,
+    "qkv_bias": true,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 150000.0,
+    "scaling": {
+      "kind": "yarn",
+      "factor": 32.0,
+      "original_max_positions": 4096.0,
+      "yarn": {
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "attention_factor": 1.3465735902799727,
+        "truncate": false
+      }
+    }
+  },
+  "mlp": {
+    "activation": "swiglu"
+  }
+}

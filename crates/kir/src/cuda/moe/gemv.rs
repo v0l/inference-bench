@@ -5,8 +5,9 @@ fn dot_fp4() -> &'static str {
 }
 
 fn dot_mx() -> &'static str {
-    r##"        const unsigned char* wb = (const unsigned char*)w + at * (K / 2);
-        const unsigned char* sb = s + at * (K / MOE_BLOCK);
+    r##"        constexpr int KP = (K + 127) / 128 * 128;
+        const unsigned char* wb = (const unsigned char*)w + at * (KP / 2);
+        const unsigned char* sb = s + at * (KP / MOE_BLOCK);
         for (int grp = lane; grp < K / MOE_BLOCK; grp += 32) {
             float part = 0.0f;
 #pragma unroll
@@ -56,8 +57,9 @@ fn dot2_fp4() -> &'static str {
 }
 
 fn dot2_mx() -> &'static str {
-    r##"        const unsigned char* wb = (const unsigned char*)w + at * (K / 2);
-        const unsigned char* sb = s + at * (K / MOE_BLOCK);
+    r##"        constexpr int KP = (K + 127) / 128 * 128;
+        const unsigned char* wb = (const unsigned char*)w + at * (KP / 2);
+        const unsigned char* sb = s + at * (KP / MOE_BLOCK);
         for (int grp = lane; grp < K / MOE_BLOCK; grp += 32) {
             float sc = __uint_as_float((unsigned)sb[grp] << 23);
 #pragma unroll
