@@ -166,17 +166,63 @@ def family_report(family, model, raw, out, commit, roof, batch, lens, command):
     merge(Path(out).parent / "scoreboard.md", out / f"{today}.row")
 
 
+SG_MARK = "## SGLang"
+SG_HEADER = [
+    "| family | sglang prefill | sglang decode b1 | sglang decode b8 | prefill ratio | decode ratio | b8 ratio | backend | date |",
+    "|---|---|---|---|---|---|---|---|---|",
+]
+SG_NOTE = (
+    "Indicative only: SGLang ran with the radix cache off at batch 8, median of 3, while another job shared the Spark GPU. "
+    "Ratios are specrt / SGLang against the row above. `triton` marks runs where the default flashinfer backend failed."
+)
+PREFIX = ["# Perf scoreboard", "", "Ratios are specrt / best competitor, above 1.00 means we are faster. Rows are replaced in place; the command is beside each row.", ""]
+
+
+def split_board(board):
+    text = Path(board).read_text() if Path(board).exists() else ""
+    main, _, sg = text.partition(SG_MARK)
+    rows = [l for l in main.splitlines() if l.startswith("| ") and not l.startswith("| family")]
+    sg_rows = [l for l in sg.splitlines() if l.startswith("| ") and not l.startswith("| family")]
+    prefix = [l for l in main.splitlines() if not l.startswith("|")]
+    while prefix and not prefix[-1].strip():
+        prefix.pop()
+    return (prefix or PREFIX[:-1]), rows, sg_rows
+
+
+def write_board(board, prefix, rows, sg_rows):
+    key = lambda l: l.split("|")[1].strip()
+    out = prefix + [""] + HEADER.rstrip("\n").splitlines() + sorted(rows, key=key)
+    if sg_rows:
+        out += ["", SG_MARK, "", SG_NOTE, ""] + SG_HEADER + sorted(sg_rows, key=key)
+    Path(board).write_text("\n".join(out) + "\n")
+
+
 def merge(board, row_path):
     row = Path(row_path).read_text().strip()
     key = row.split("|")[1].strip()
-    board = Path(board)
-    lines = board.read_text().splitlines() if board.exists() else []
-    head = HEADER.rstrip("\n").splitlines()
-    body = [l for l in lines if l.startswith("| ") and not l.startswith("| family") and l.split("|")[1].strip() != key]
-    body.append(row)
-    body.sort(key=lambda l: l.split("|")[1].strip())
-    prefix = [l for l in lines if not l.startswith("|")] or ["# Perf scoreboard", "", "Ratios are specrt / best competitor, above 1.00 means we are faster. Rows are replaced in place; the command is beside each row.", ""]
-    board.write_text("\n".join(prefix + [""] + head + body) + "\n")
+    prefix, rows, sg_rows = split_board(board)
+    rows = [l for l in rows if l.split("|")[1].strip() != key]
+    rows.append(row)
+    write_board(board, prefix, rows, sg_rows)
+
+
+def merge_sglang(board, family, json_path, backend="flashinfer"):
+    prefix, rows, sg_rows = split_board(board)
+    sg = json.loads(Path(json_path).read_text())
+    mine = next((l for l in rows if l.split("|")[1].strip() == family), None)
+    ours = [None, None, None]
+    if mine:
+        cells = [c.strip() for c in mine.split("|")]
+        ours = [float(cells[i]) if re.fullmatch(r"[0-9.]+", cells[i]) else None for i in (3, 4, 5)]
+    first = sorted(int(k) for k in sg["prefill"])[0]
+    batch = max(int(k) for k in sg["decode"])
+    p, d1, d8 = sg["prefill"].get(str(first)), sg["decode"].get("1"), sg["decode"].get(str(batch))
+    row = (
+        f"| {family} | {fnum(p)} | {fnum(d1)} | {fnum(d8)} | {fratio(ratio(ours[1], p))} | {fratio(ratio(ours[0], d1))} | {fratio(ratio(ours[2], d8))} "
+        f"| {backend} | {date.today().isoformat()} |"
+    )
+    sg_rows = [l for l in sg_rows if l.split("|")[1].strip() != family] + [row]
+    write_board(board, prefix, rows, sg_rows)
 
 
 def ab(log):
@@ -205,5 +251,7 @@ if __name__ == "__main__":
         family_report(*sys.argv[2:11])
     elif cmd == "merge":
         merge(sys.argv[2], sys.argv[3])
+    elif cmd == "sglang":
+        merge_sglang(*sys.argv[2:6])
     elif cmd == "ab":
         ab(sys.argv[2])

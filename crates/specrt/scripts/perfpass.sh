@@ -27,12 +27,14 @@ fi
 host=local
 rounds=${ROUNDS:-3}
 lens=${LENS:-1024,8192}
+only=
 while [ $# -gt 0 ]; do
     case $1 in
         --model) model=$2; shift 2 ;;
         --host) host=$2; shift 2 ;;
         --rounds) rounds=$2; shift 2 ;;
         --lens) lens=$2; shift 2 ;;
+        --only) only=$2; shift 2 ;;
         *) usage ;;
     esac
 done
@@ -44,11 +46,16 @@ case $host in
         ssh spark "mkdir -p ~/ib-gates/$issue/src"
         rsync -az --delete --exclude target --exclude .git --exclude out --exclude docs/perf "$repo/" spark:ib-gates/$issue/src/
         args="$family --rounds $rounds --lens $lens"
+        [ -n "$only" ] && args="$args --only $only"
         [ -n "$model" ] && args="$args --model $model"
         ssh spark "cd ~/ib-gates/$issue/src && ISSUE=$issue COMMIT=$(git -C "$repo" rev-parse --short HEAD) HOST_LABEL=spark ./crates/specrt/scripts/perfpass.sh $args"
         rc=$?
         mkdir -p "$repo/docs/perf"
         rsync -az --exclude scoreboard.md spark:ib-gates/$issue/src/docs/perf/ "$repo/docs/perf/"
+        if [ "$only" = sglang ]; then
+            rsync -az spark:ib-gates/$issue/raw/sglang-$family.json "$repo/docs/perf/$family/sglang.json" && python3 "$here/perfpass_report.py" sglang "$repo/docs/perf/scoreboard.md" "$family" "$repo/docs/perf/$family/sglang.json" "${ATTN:-flashinfer}"
+            exit "$rc"
+        fi
         for row in "$repo"/docs/perf/"$family"/*.row; do
             [ -f "$row" ] && python3 "$here/perfpass_report.py" merge "$repo/docs/perf/scoreboard.md" "$row"
         done
@@ -120,6 +127,20 @@ run() {
     systemd-run --user --wait --collect -P -q -p MemoryMax=60G -p MemorySwapMax=0 \
         --setenv=PATH="$PATH" --setenv=HOME="$HOME" "$@"
 }
+
+if [ "$only" = sglang ]; then
+    exec 9>/tmp/gpu27.lock
+    flock 9
+    mkdir -p "$work/raw"
+    ckpt=$model
+    case $model in
+        *.toml) ckpt=$(snap "$(sed -n 's/^repo = "\(.*\)"/\1/p' "$model" | head -1 | sed 's#/#--#')") ;;
+    esac
+    sg_util=${SGLANG_UTIL:-$vllm_util}
+    run -p MemoryMax=40G --setenv=PATH="$(dirname "$sglang_py"):/usr/local/cuda/bin:/usr/bin:/bin" --setenv=XDG_CACHE_HOME=$work/xdg "$sglang_py" "$here/sglang_perf.py" "$ckpt" --lens "$lens" --new "$new" --batch "$batch" --rounds "$rounds" --util "$sg_util" ${ATTN:+--attn $ATTN} --out "$work/raw/sglang-$family.json" || exit 1
+    python3 "$here/perfpass_report.py" sglang "$repo/docs/perf/scoreboard.md" "$family" "$work/raw/sglang-$family.json" "${ATTN:-flashinfer}"
+    exit 0
+fi
 
 if [ "$mode" = family ]; then
     systemd-run --user --wait --collect -P -q -p MemoryMax=20G -p "WorkingDirectory=$repo" \
