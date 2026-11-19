@@ -1619,7 +1619,7 @@ impl Spec {
         let mut launches = 0;
         for (i, n) in nodes.iter().enumerate() {
             match n.op.as_str() {
-                "kv_rope" | "decode_rope" => {}
+                "qk_rope" | "decode_rope" => {}
                 "kernel" => {
                     launches += 1;
                     ensure!(n.kernel.is_some(), "[[attention.node]] {i} is a kernel node without `kernel`");
@@ -1633,7 +1633,7 @@ impl Spec {
                         }
                     }
                 }
-                other => bail!("[[attention.node]] {i} has op {other:?}, not kv_rope, decode_rope or kernel"),
+                other => bail!("[[attention.node]] {i} has op {other:?}, not qk_rope, decode_rope or kernel"),
             }
         }
         ensure!(launches > 0, "[[attention.node]] declares no kernel node");

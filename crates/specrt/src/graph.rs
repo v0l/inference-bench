@@ -156,10 +156,10 @@ impl Node {
     fn lower_described(&self, index: usize) -> Result<Op> {
         ensure!(index < 256, "an attention spec has at most 256 nodes");
         Ok(match self.op.as_str() {
-            "kv_rope" => Op::KvRope,
+            "qk_rope" => Op::QkRope,
             "decode_rope" => Op::DecodeRope,
             "kernel" => Op::Kernel { node: index as u8 },
-            other => bail!("attention node op {other:?} is not kv_rope, decode_rope or kernel"),
+            other => bail!("attention node op {other:?} is not qk_rope, decode_rope or kernel"),
         })
     }
 

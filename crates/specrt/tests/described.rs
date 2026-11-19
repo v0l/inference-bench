@@ -46,7 +46,7 @@ fn spec_with(nodes: &str) -> Spec {
 
 const NODES: &str = r#"
 [[attention.node]]
-op = "kv_rope"
+op = "qk_rope"
 phase = "prefill"
 
 [[attention.node]]
@@ -77,12 +77,12 @@ fn attention_nodes_replace_the_stock_attention_ops_in_every_phase() {
     let spec = spec_with(NODES);
     let prefill = Plan::build(&spec, Phase::Prefill, true);
     let ops = prefill.layer(Block::Dense);
-    assert!(ops.contains(&Op::KvRope) && ops.contains(&Op::Kernel { node: 1 }), "{ops:?}");
+    assert!(ops.contains(&Op::QkRope) && ops.contains(&Op::Kernel { node: 1 }), "{ops:?}");
     assert!(!ops.contains(&Op::Flash) && !ops.contains(&Op::DecodeAttention) && !ops.contains(&Op::DecodeRope), "{ops:?}");
     let decode = Plan::build(&spec, Phase::Decode, true);
     let ops = decode.layer(Block::Dense);
     assert!(ops.contains(&Op::DecodeRope) && ops.contains(&Op::Kernel { node: 3 }), "{ops:?}");
-    assert!(!ops.contains(&Op::Flash) && !ops.contains(&Op::KvRope) && !ops.contains(&Op::DecodeAttention), "{ops:?}");
+    assert!(!ops.contains(&Op::Flash) && !ops.contains(&Op::QkRope) && !ops.contains(&Op::DecodeAttention), "{ops:?}");
 }
 
 #[test]
@@ -119,8 +119,8 @@ fn bad_nodes_are_refused_when_the_spec_loads_or_the_module_builds() {
     install();
     let base = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/qwen3-0.6b.toml")).unwrap();
     let parse = |nodes: &str| Spec::parse(&format!("{base}\n{nodes}")).map(|_| ()).unwrap_err().to_string();
-    assert!(parse("[[attention.node]]\nop = \"flash\"\n").contains("not kv_rope"));
-    assert!(parse("[[attention.node]]\nop = \"kv_rope\"\n").contains("no kernel node"));
+    assert!(parse("[[attention.node]]\nop = \"flash\"\n").contains("not qk_rope"));
+    assert!(parse("[[attention.node]]\nop = \"qk_rope\"\n").contains("no kernel node"));
     assert!(parse("[[attention.node]]\nop = \"kernel\"\ngrid = [\"heads\"]\n").contains("without `kernel`"));
     assert!(parse("[[attention.node]]\nop = \"kernel\"\nkernel = \"k\"\ngrid = [\"bogus\"]\n").contains("grid symbol"));
     let target = kir::Target::sm_120();
