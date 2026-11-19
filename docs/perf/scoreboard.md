@@ -42,10 +42,11 @@ Ratios are specrt / best competitor, above 1.00 means we are faster. Rows are re
 
 
 
+
 | family | model | ours decode b1 | ours prefill | ours decode b8 | best competitor | their decode b1 | their prefill | their decode b8 | decode ratio | prefill ratio | b8 ratio | date | commit | command |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | gemma3 | `gemma-3-1b-it` | 100.4 | 18408.3 | 670.5 | llama.cpp/vllm | 101.5 | 26430.8 | 743.6 | 0.99 | 0.70 | 0.90 | 2026-11-19 | 9f648cd | `crates/specrt/scripts/perfpass.sh gemma3 --model /home/kieran/ib-gates/821/models/gemma-3-1b-it --host spark` |
-| gguf-q4 | `unsloth/Qwen3-0.6B-GGUF` | 226.4 | 18590.0 | 651.6 | llama.cpp | 320.4 | 20086.0 | 1400.3 | 0.71 | 0.93 | 0.47 | 2026-11-19 | 0338df9 | `crates/specrt/scripts/perfpass.sh gguf-q4 --model /home/kieran/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf --host spark` |
+| gguf-q4 | `unsloth/Qwen3-0.6B-GGUF` | 233.2 | 22223.3 | 1544.3 | llama.cpp | 331.6 | 21276.5 | 1462.5 | 0.70 | 1.04 | 1.06 | 2026-11-19 | 3f76803 | `crates/specrt/scripts/perfpass.sh gguf-q4 --model /home/kieran/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-Q4_K_M.gguf --host spark` |
 | granite | `granite-3.3-2b-base` | 39.1 | 6684.0 | 312.2 | llama.cpp/vllm | 41.0 | 9461.6 | 299.7 | 0.95 | 0.71 | 1.04 | 2026-11-19 | 9f648cd | `crates/specrt/scripts/perfpass.sh granite --model /home/kieran/ib-gates/821/models/granite-3.3-2b-base --host spark` |
 | llama | `unsloth/Llama-3.2-1B` | 82.1 | 16615.7 | 649.7 | llama.cpp/vllm | 84.2 | 24239.2 | 609.6 | 0.97 | 0.69 | 1.07 | 2026-11-19 | 9f648cd | `crates/specrt/scripts/perfpass.sh llama --model /home/kieran/.cache/huggingface/hub/models--unsloth--Llama-3.2-1B/snapshots/9535bd9b1d1dea6acafbdc4813b728796aeb28da --host spark` |
 | mistral | `Locutusque/TinyMistral-248M` | 421.9 | 63961.4 | 3015.6 | vllm | 307.5 | 71475.5 | 2955.5 | 1.37 | 0.89 | 1.02 | 2026-11-19 | 82ce823 | `crates/specrt/scripts/perfpass.sh mistral --model /home/kieran/.cache/huggingface/hub/models--Locutusque--TinyMistral-248M/snapshots/e84fb52945d42de4f2361b6047decdc65426dc2b --host spark` |
