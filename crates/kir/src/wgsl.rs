@@ -883,8 +883,9 @@ pub fn emit_flash_op(s: &crate::ops::WgslShape) -> String {
 fn flash() -> String {
     format!(
         "{bind}
-const EPL: u32 = (HEAD_DIM + 31u) / 32u;
-var<workgroup> qs: array<f32, {qs}>;
+const HD4: u32 = HEAD_DIM / 4u;
+const EPL: u32 = (HD4 + 31u) / 32u;
+var<workgroup> qs: array<vec4<f32>, {qs}>;
 
 @compute @workgroup_size({threads})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) li: u32) {{
@@ -898,23 +899,24 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
     let len = p.a.x + tt + 1u;
     let head_base = kvh * MAX_CTX * HEAD_DIM;
     let scale = inverseSqrt(f32(HEAD_DIM));
-    for (var d = lane; d < HEAD_DIM; d += 32u) {{
-        qs[g * HEAD_DIM + d] = qkv[tt * QKV_ROW + head * HEAD_DIM + d] * scale;
+    for (var d = lane; d < HD4; d += 32u) {{
+        let qb = tt * QKV_ROW + head * HEAD_DIM + d * 4u;
+        qs[g * HD4 + d] = vec4<f32>(qkv[qb], qkv[qb + 1u], qkv[qb + 2u], qkv[qb + 3u]) * scale;
     }}
     workgroupBarrier();
-    var acc: array<f32, EPL>;
+    var acc: array<vec4<f32>, EPL>;
     var m = NEG_INF;
     var l = 0.0;
     for (var key0 = 0u; key0 < len; key0 += 32u) {{
         let key = key0 + lane;
         var s = NEG_INF;
         if (key < len) {{
-            let kb = head_base + key * HEAD_DIM;
-            var dot = 0.0;
-            for (var d = 0u; d < HEAD_DIM; d++) {{
-                dot += qs[g * HEAD_DIM + d] * k_cache[kb + d];
+            let kb = (head_base + key * HEAD_DIM) / 4u;
+            var dot = vec4<f32>(0.0);
+            for (var d = 0u; d < HD4; d++) {{
+                dot += qs[g * HD4 + d] * k_cache[kb + d];
             }}
-            s = dot;
+            s = dot.x + dot.y + dot.z + dot.w;
         }}
         let m_new = max(m, subgroupMax(s));
         let corr = exp(m - m_new);
@@ -926,10 +928,10 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         let n = min(32u, len - key0);
         for (var j = 0u; j < n; j++) {{
             let pj = subgroupShuffle(pr, j);
-            let vb = head_base + (key0 + j) * HEAD_DIM;
+            let vb = (head_base + (key0 + j) * HEAD_DIM) / 4u;
             for (var i = 0u; i < EPL; i++) {{
                 let d = lane + 32u * i;
-                if (d < HEAD_DIM) {{
+                if (d < HD4) {{
                     acc[i] += pj * v_cache[vb + d];
                 }}
             }}
@@ -940,16 +942,20 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
         let ob = t * HEADS * HEAD_DIM + head * HEAD_DIM;
         for (var i = 0u; i < EPL; i++) {{
             let d = lane + 32u * i;
-            if (d < HEAD_DIM) {{
-                out[ob + d] = acc[i] / l;
+            if (d < HD4) {{
+                let o = acc[i] / l;
+                out[ob + d * 4u] = o.x;
+                out[ob + d * 4u + 1u] = o.y;
+                out[ob + d * 4u + 2u] = o.z;
+                out[ob + d * 4u + 3u] = o.w;
             }}
         }}
     }}
 }}
 ",
-        bind = storage(&[("qkv", false, "f32"), ("k_cache", false, "f32"), ("v_cache", false, "f32"), ("out", true, "f32")]),
+        bind = storage(&[("qkv", false, "f32"), ("k_cache", false, "vec4<f32>"), ("v_cache", false, "vec4<f32>"), ("out", true, "f32")]),
         threads = 32 * FLASH_GROUPS,
-        qs = FLASH_GROUPS * 256,
+        qs = FLASH_GROUPS * 64,
     )
 }
 
