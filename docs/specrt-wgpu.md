@@ -420,3 +420,38 @@ Each fused GEMV workgroup (4 rows) redoes the norm or activation over the whole 
 | Qwen2.5-7B Q4_K_M | 161.4 / 274.0 = 0.589 | 156.2 / 269.1 = 0.580 | 17.65 / 28.0 = 0.630 |
 
 7B load median in the full script is 5.13 s (5.49, 4.29, 5.13). The `madvise` win showed in back-to-back runs (3.8 to 3.0 s) but not in this script, where each 7B run follows a llama.cpp run (page cache state not controlled), giving 4.3 to 5.5 s. 0.5x now holds on every cell; 0.7x holds on none of the prefill cells and on bf16 decode only.
+
+## Mac speed work 7 (#828)
+
+### Dispatch count and per-token rebuilds
+
+Every `dispatch` built a bind group and wrote its params with its own `queue.write_buffer`. Per token on Qwen3-0.6B Q4_K_M (`SPECRT_COUNT=1` prints the totals on drop): 57 rmsnorm, 28 rope, 28 swiglu, 28 flash_decode, 63 `linear_sg*`, 1 argmax, about 205. Pipelines were never rebuilt (compiled once in `compile`), but the 205 bind groups per token were.
+
+Now bind groups are cached by (pipeline, buffer ids) and the uniform binding uses a dynamic offset into one params buffer, so the 369 distinct groups are built once. Params are staged in a host vector and written once per submit. Qwen3-0.6B Q4_K_M decode, 3 paired rounds: 115.5, 116.2, 116.4 to 142.7, 144.0, 143.3 tok/s (+24%). Prefill about +1%.
+
+### Glue kernels
+
+`swiglu` is folded into the gate_up GEMV on decode (`linear_sg*` with `p.b.z == 1`): each 4-row workgroup holds interleaved gate/up rows, so it computes `silu(g) * u` from the two subgroup sums and writes `act` directly. This is not the rejected GEMV fusion: nothing is recomputed per workgroup. 28 fewer dispatches per token, decode 143.3 to 144.6 to 145.3 tok/s (3 rounds, within 1%).
+
+Rope fused into `flash_decode` (norm, rope, KV write and attention in one dispatch) was built and measured: 145.5 against 145.1 tok/s, and greedy text diverged from CUDA after 2 tokens in the wgsl suite. Dropped.
+
+Dispatches per token after: about 177 in total per 128-token generation count basis, 28 swiglu dispatches removed. The remaining 57 rmsnorm are the next lever and were not fused: the norm output is the GEMV input, which was shown slower to fold in #827.
+
+### Prefill GEMM
+
+`COOP_K` 64 gave 1,223 tok/s prefill 128 against 1,728 at 32 (tile exceeds threadgroup memory budget), 16 gave 1,712. 32 stays. No half-precision tiles retried: #825 measured them slower through naga and nothing changed in that path.
+
+### 7B load
+
+The script now runs `sudo purge` before every specrt and llama.cpp run (`PURGE=0` disables), and `SPECRT_NO_MADVISE=1` turns the `madvise(WILLNEED)` off. Cold cache, 3 paired rounds, load seconds madvise against none: 6.13 / 5.77, 2.70 / 5.87, 2.50 / 6.14. The first madvise run followed a long idle period; after that madvise is 2.5 to 2.7 s against about 6 s, so it stays.
+
+### `mac_vs_llama.sh` (3 alternating rounds, medians, load average 3 to 8 at round starts)
+
+| Model | Prefill 128 | Prefill 1,024 | Decode |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 1,806 / 2,960 = 0.610 | 1,640 / 2,973 = 0.552 | 93.1 / 113.7 = 0.819 |
+| Qwen3-0.6B Q4_K_M | 1,730 / 3,017 = 0.573 | 1,501 / 3,031 = 0.495 | 128.8 / 184.9 = 0.696 |
+| Llama-3.2-1B Q4_K_M | 1,025 / 1,733 = 0.592 | 881 / 1,755 = 0.502 | 107.6 / 144.7 = 0.743 |
+| Qwen2.5-7B Q4_K_M | 161.0 / 274.0 = 0.588 | 156.3 / 269.2 = 0.581 | 20.4 / 28.0 = 0.729 |
+
+Decode is at 0.7 or better on every cell. Prefill is unchanged at 0.50 to 0.61 and misses 0.7 everywhere. Script 7B load 5.48 s.
