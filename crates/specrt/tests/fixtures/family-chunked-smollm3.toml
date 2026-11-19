@@ -1,0 +1,46 @@
+name = "chunked_smollm3"
+kind = "family"
+extends = "smollm3"
+
+[match]
+model_types = ["chunked_smollm3"]
+architectures = ["ChunkedSmolLM3ForCausalLM"]
+
+[attention.params]
+attn_scale = { config = "attn_scale" }
+floor_scale = { config = "floor_scale" }
+tuning = { config = "attn_temperature_tuning" }
+
+[[attention.node]]
+op = "qk_rope"
+phase = "prefill"
+
+[[attention.node]]
+op = "kernel"
+kernel = "attn_chunked"
+phase = "prefill"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+chunk = "window"
+nope = "nope"
+attn_scale = "attn_scale"
+floor_scale = "floor_scale"
+tuning = "tuning"
+
+[[attention.node]]
+op = "decode_rope"
+phase = "rows"
+
+[[attention.node]]
+op = "kernel"
+kernel = "attn_chunked"
+phase = "rows"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+chunk = "window"
+nope = "nope"
+attn_scale = "attn_scale"
+floor_scale = "floor_scale"
+tuning = "tuning"

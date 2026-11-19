@@ -1,0 +1,124 @@
+kind = "kir-kernel"
+family = "scan_attention"
+name = "attn_chunked"
+threads = 128
+
+[[param]]
+name = "qkv"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "k_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "v_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "chunk"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "nope"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "attn_scale"
+type = "f32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "floor_scale"
+type = "f32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "tuning"
+type = "i32"
+role = "value"
+access = "read"
+
+[[stage]]
+op = "epilogue"
+name = "temperature"
+expr = "select(nope > 0 && tuning > 0, 1.0 + attn_scale * log(1.0 + floor((q_pos + 1.0) / floor_scale)), 1.0)"
+
+[[stage]]
+op = "epilogue"
+name = "score"
+expr = "s * scale * temperature"
+
+[[stage]]
+op = "mask"
+expr = "chunk <= 0 || floor(k_pos / chunk) == floor(q_pos / chunk)"
+
+[[stage]]
+op = "online_softmax"
+value = "score"

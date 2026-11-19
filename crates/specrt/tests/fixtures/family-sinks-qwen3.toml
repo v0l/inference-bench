@@ -1,0 +1,40 @@
+name = "sinks_qwen3"
+kind = "family"
+extends = "qwen3"
+
+[match]
+model_types = ["sinks_qwen3"]
+architectures = ["SinksQwen3ForCausalLM"]
+
+[attention.params]
+softcap = { config = "attn_logit_softcapping", default = 0.0 }
+
+[[attention.node]]
+op = "qk_rope"
+phase = "prefill"
+
+[[attention.node]]
+op = "kernel"
+kernel = "attn_sinks"
+phase = "prefill"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+sinks = { weight = "sinks", len = "heads" }
+window = "window"
+softcap = "softcap"
+
+[[attention.node]]
+op = "decode_rope"
+phase = "rows"
+
+[[attention.node]]
+op = "kernel"
+kernel = "attn_sinks"
+phase = "rows"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+sinks = { weight = "sinks", len = "heads" }
+window = "window"
+softcap = "softcap"
