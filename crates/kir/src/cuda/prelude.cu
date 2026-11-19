@@ -104,10 +104,8 @@ __device__ __forceinline__ const float* fp8_row_scales(const float* scales, int 
 
 
 template <int K>
-__device__ __forceinline__ float dot_fp8(const void* w, const float* scales, int row, const float* x, int lane) {
+__device__ __forceinline__ float dot_fp8_scaled(const unsigned char* wr, const float* sr, const float* x, int lane) {
     static_assert(K % 16 == 0, "fp8 rows load 16 bytes per lane");
-    const unsigned char* wr = (const unsigned char*)w + (size_t)row * K;
-    const float* sr = fp8_row_scales(scales, row);
     float acc = 0.0f;
 #pragma unroll 2
     for (int k = lane * 16; k < K; k += 512) {
@@ -117,6 +115,11 @@ __device__ __forceinline__ float dot_fp8(const void* w, const float* scales, int
         acc += part * sr[k / FP8_BLOCK];
     }
     return acc;
+}
+
+template <int K>
+__device__ __forceinline__ float dot_fp8(const void* w, const float* scales, int row, const float* x, int lane) {
+    return dot_fp8_scaled<K>((const unsigned char*)w + (size_t)row * K, fp8_row_scales(scales, row), x, lane);
 }
 
 __device__ __forceinline__ float activation(float g) {

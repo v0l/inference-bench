@@ -41,19 +41,11 @@ fn dot_mx() -> &'static str {
 }
 
 fn dot_fp8() -> &'static str {
-    r##"        const unsigned char* wb = (const unsigned char*)w + at * K;
-        const float* sg = g + (size_t)expert * MOE_FP8_GRID<ROWS, K> + (row / FP8_BLOCK) * MOE_FP8_KB<K>;
-        for (int k = lane * 16; k < K; k += 512) {
-            uint4 q = *(const uint4*)(wb + k);
-            float part = e4m3_dot4(q.x, *(const float4*)(xs + k)) + e4m3_dot4(q.y, *(const float4*)(xs + k + 4)) +
-                         e4m3_dot4(q.z, *(const float4*)(xs + k + 8)) + e4m3_dot4(q.w, *(const float4*)(xs + k + 12));
-            acc += part * sg[k / FP8_BLOCK];
-        }
-"##
+    "        const float* sg = g + (size_t)expert * MOE_FP8_GRID<ROWS, K> + (row / FP8_BLOCK) * MOE_FP8_KB<K>;\n        acc = dot_fp8_scaled<K>((const unsigned char*)w + at * K, sg, xs, lane);\n"
 }
 
 fn dot_bf16() -> &'static str {
-    "        const bf16_t* wb = (const bf16_t*)w + at * K;\n        for (int k = lane; k < K; k += 32) acc += bf16_to_f32(wb[k]) * xs[k];\n"
+    "        acc = dot_bf16<K>(w, (int)at, xs, lane);\n"
 }
 
 fn dot() -> String {

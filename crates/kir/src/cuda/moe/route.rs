@@ -13,11 +13,7 @@ fn logits_norm() -> &'static str {
         float4 v = *(const float4*)(xr + i);
         ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
-    ss = warp_sum(ss);
-    if (lane == 0) red[warp] = ss;
-    __syncthreads();
-    float total = 0.0f;
-    for (int w = 0; w < MOE_WARPS; w++) total += red[w];
+    float total = block_reduce<false>(ss, red);
     float inv = rsqrtf(total / HIDDEN + EPS);
     for (int i = tid; i < HIDDEN; i += 256) {
         float v = xr[i] * inv * ln[i];
