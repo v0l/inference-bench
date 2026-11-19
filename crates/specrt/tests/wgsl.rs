@@ -53,11 +53,11 @@ fn u32_buf(w: &Wgpu, v: &[u32]) -> Buffer {
 }
 
 fn read_f32(w: &Wgpu, b: &Buffer, n: usize) -> Vec<f32> {
-    w.download(b, 0, n as u64 * 4).unwrap().chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+    w.download(b, 0, n as u64 * 4).unwrap().as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 fn read_u32(w: &Wgpu, b: &Buffer, n: usize) -> Vec<u32> {
-    w.download(b, 0, n as u64 * 4).unwrap().chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect()
+    w.download(b, 0, n as u64 * 4).unwrap().as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect()
 }
 
 fn half(v: f32) -> [u8; 2] {
@@ -85,7 +85,7 @@ fn random_blocks(kind: GgmlType, rows: usize, cols: usize, rng: &mut Lcg) -> Vec
             b[at..at + 2].copy_from_slice(&d);
         }
         if matches!(kind, GgmlType::Q8_0) {
-            for chunk in b.chunks_exact_mut(34) {
+            for chunk in b.as_chunks_mut::<34>().0.iter_mut() {
                 chunk[..2].copy_from_slice(&half(rng.unit() * 0.1 + 0.11));
             }
         }
@@ -529,7 +529,7 @@ fn cuda_reference(spec: &Spec, greedy: usize) -> (Vec<f32>, Vec<u32>) {
     let logits_path = dir.join(format!("{id}.{}.logits.bin", spec.name));
     let tokens_path = dir.join(format!("{id}.{}.tokens.txt", spec.name));
     if let (Ok(l), Ok(t)) = (std::fs::read(&logits_path), std::fs::read_to_string(&tokens_path)) {
-        let logits = l.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+        let logits = l.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
         let tokens: Vec<u32> = t.lines().map(|x| x.parse().unwrap()).collect();
         if tokens.len() >= greedy {
             return (logits, tokens);

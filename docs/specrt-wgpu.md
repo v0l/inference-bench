@@ -195,3 +195,16 @@ Result (specrt / llama.cpp, tok/s), before and after:
 | Qwen2.5-7B Q4_K_M | 0.23 to 0.37 | 0.20 to 0.35 | 0.25 to 0.43 |
 
 The 0.5x milestone is met only for Qwen3-0.6B bf16 decode. Load (7B 11.2 s, peak 9.1 GB, #772) and fusion (#770) were not changed. wgsl tests 23/23 on the Mac.
+
+## Mac speed work 3 (#818 steps)
+
+Same method (3 alternating rounds of base and candidate binaries, `bench --wgpu`, M1 Pro). wgsl tests 23/23 after each candidate.
+
+| Step | Change | Result (prefill tok/s, base to candidate) | Kept |
+|---|---|---|---|
+| coop register prefetch | `linear_coop` loads tile k+1 into registers while computing k, one workgroup barrier less | Qwen3-0.6B bf16 128/1,024: 1,010 to 891, 741 to 674; Q4_K 844 to 757, 646 to 594; Llama-1B 565 to 504, 480 to 435 | no |
+| coop workgroup double buffer | two tile buffers in workgroup memory, stage k+1 while multiplying k, one barrier per step | bf16 1,010 to 1,014, 741 to 743; Q4_K 843 to 843, 645 to 645; Llama-1B 565 to 563, 480 to 478 (within noise) | no |
+| coop 128x64 output tile | 256 threads, 8 simdgroups, 128 tokens per workgroup | bf16 1,012 to 850, 742 to 651; Q4_K 844 to 775, 646 to 605; Llama-1B 565 to 447, 480 to 392 | no |
+| clippy | `as_chunks` in `tests/wgsl.rs` (4 lints) | `cargo clippy --all-targets --features inference-bench-specrt/wgpu -- -D warnings` clean | yes |
+
+The load pipeline is not the limit once the tile loads are vec4: overlapping them with the multiply gives nothing, and larger tiles lose to occupancy (more workgroup memory and registers per workgroup). Prefill attention, fusion and the host weight copy were not started.
