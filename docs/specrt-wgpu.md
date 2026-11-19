@@ -198,13 +198,33 @@ The 0.5x milestone is met only for Qwen3-0.6B bf16 decode. Load (7B 11.2 s, peak
 
 ## Mac speed work 3 (#818 steps)
 
-Same method (3 alternating rounds of base and candidate binaries, `bench --wgpu`, M1 Pro). wgsl tests 23/23 after each candidate.
+Same method (3 alternating rounds of base and candidate binaries, `bench --wgpu`, M1 Pro). wgsl tests green after every kept step, greedy text for "The capital of France is" (32 tokens) identical to `llama-completion --temp 0` on Qwen3-0.6B bf16, Qwen3-0.6B Q4_K_M and Qwen2.5-7B Q4_K_M.
 
-| Step | Change | Result (prefill tok/s, base to candidate) | Kept |
+### Per-dispatch `linear_coop` against llama.cpp `kernel_mul_mm`
+
+`cargo test --release --features wgpu --test wgsl linear_coop_time_per_dispatch -- --ignored --nocapture` times `linear_coop` with 30 back-to-back dispatches; llama.cpp side is `test-backend-ops perf -o MUL_MAT -b MTL0`. Same shape m=4096, n=512, k=14336:
+
+| | time | TFLOP/s | weight GB/s |
 |---|---|---|---|
-| coop register prefetch | `linear_coop` loads tile k+1 into registers while computing k, one workgroup barrier less | Qwen3-0.6B bf16 128/1,024: 1,010 to 891, 741 to 674; Q4_K 844 to 757, 646 to 594; Llama-1B 565 to 504, 480 to 435 | no |
-| coop workgroup double buffer | two tile buffers in workgroup memory, stage k+1 while multiplying k, one barrier per step | bf16 1,010 to 1,014, 741 to 743; Q4_K 843 to 843, 645 to 645; Llama-1B 565 to 563, 480 to 478 (within noise) | no |
-| coop 128x64 output tile | 256 threads, 8 simdgroups, 128 tokens per workgroup | bf16 1,012 to 850, 742 to 651; Q4_K 844 to 775, 646 to 605; Llama-1B 565 to 447, 480 to 392 | no |
-| clippy | `as_chunks` in `tests/wgsl.rs` (4 lints) | `cargo clippy --all-targets --features inference-bench-specrt/wgpu -- -D warnings` clean | yes |
+| llama.cpp f16 | 14.3 ms | 4.19 | 8.2 |
+| llama.cpp bf16 | 17.0 ms | 3.53 | 6.9 |
+| llama.cpp q4_K | 16.9 ms | 3.56 | 1.9 |
+| llama.cpp q6_K | 17.3 ms | 3.48 | 2.2 |
+| specrt bf16 | 32.8 ms | 1.83 | 3.6 |
+| specrt Q4_K | 35.9 ms | 1.67 | 0.9 |
+| specrt Q6_K | 64.1 ms | 0.94 | 0.8 |
 
-The load pipeline is not the limit once the tile loads are vec4: overlapping them with the multiply gives nothing, and larger tiles lose to occupancy (more workgroup memory and registers per workgroup). Prefill attention, fusion and the host weight copy were not started.
+Other shapes (n=512): bf16 1.88 TFLOP/s at m=4096/k=1024 and 1.94 at m=18944/k=3584; Q4_K 1.65 to 1.70; Q6_K 0.95 to 0.98. The GEMM is about 2x off llama.cpp, and it is compute-flat with k, so it is not a bandwidth limit (weights stream at under 4 GB/s against about 200 GB/s). Ablations on the same shapes: skipping the multiply-adds gives 2.3 TFLOP/s (bf16), skipping the tile loads after the first gives 2.9 TFLOP/s. So loads cost about 40% and the 8x8 f32 matrix multiplies about 20%, and the kernel is bound by issue and workgroup-memory traffic, not by DRAM. Tried and dropped, each paired A/B on prefill tok/s: register prefetch of tile k+1 (bf16 1,010 to 891, 741 to 674), workgroup-memory double buffer (neutral, within 0.5%), 128x64 output tile with 256 threads (1,012 to 850), f16 tiles with f32 accumulate (the adapter offers 8x8 f16 inputs; 1.9 to 1.6 TFLOP/s, slower), 32x64 tile (1.9 to 1.6). Overlapping the Q4_K dequant with the load therefore has no lever left in this kernel shape: the two overlap experiments gave nothing.
+
+### Kept steps
+
+| Step | Change | Result (tok/s, base to candidate) |
+|---|---|---|
+| host copy (#772) | `DeviceRows` borrows the mmap (`Cow` parts), the head and embedding are read from the GGUF directly, wgpu allocates the buffer `mapped_at_creation` and copies the mmap straight in (`Backend::alloc_filled`) | Qwen2.5-7B Q4_K_M: peak footprint 9.1 to 5.5 GB; load 10.1-11.4 s to 3.5-7.2 s (median of 5: 5.3 s). The load varies with the page cache; the target of under 3 s was not reached on every run |
+| prefill chunk | `PREFILL_CHUNK` 64 to 512 tokens per pass (the GEMM tile is 64 tokens wide and each pass re-read every weight) | prefill 128/1,024: Qwen3-0.6B bf16 1,011/742 to 1,407/1,121; Q4_K_M 844/645 to 1,169/992; Llama-3.2-1B Q4_K_M 565/479 to 690/603. 7B at 512 prompt: 98 to 109, peak 8.1 to 5.9 GB |
+| flash_coop | prefill attention on 8x8 cooperative matrices: 4 simdgroups, 32 queries per workgroup, QK and PV as matrix multiplies, lazy rescale of the output (only when a row max rises by more than 6) | prefill 1,024/4,096: bf16 1,120/501 to 1,322/679; Q4_K_M 990/474 to 1,143/632; Llama-1B 601/368 to 676/480; 128 unchanged. Attention was 42% of prefill at 1,024 and 74% at 4,096 before |
+
+### Fusion (#770)
+
+Ceilings measured by skipping the op in decode (Qwen3-0.6B bf16 / Q4_K_M, context 128, tok/s): baseline 81.3/87.5; swiglu skipped 83.0/89.5 (+2%); rope skipped 84.2/90.6 (+3%); rmsnorm skipped 87.3/95.3 (+7 to 9%); all three 93.6/101.7. At 1,024 context the same: +2%, +3%, +6 to 7%. Built the biggest one, rmsnorm into the decode GEMV (the workgroup normalises the row into workgroup memory, then runs the same dot products): decode 81.5 to 75.0 (bf16), 87.8 to 81.3 (Q4_K), slower, because each of the 4-row workgroups recomputes the norm over the whole hidden vector. Dropped. rope plus KV write and swiglu into the down input are bounded by 3% and 2%, so they were not built.
+
