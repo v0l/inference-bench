@@ -1008,7 +1008,7 @@ impl Runtime {
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
         let mixer_launch: Vec<DescribedLaunch> = crate::codegen::mixer_kernels(spec, layout.kv_planes, max_ctx, &target)?
             .into_iter()
-            .map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: k.chunk_form(), params: k.params })
+            .map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: k.chunk_form().filter(|_| spec.runtime.chunked_scan), params: k.params })
             .collect();
         let chunk_tiles = match &spec.mixer {
             Some(m) => mixer_launch
