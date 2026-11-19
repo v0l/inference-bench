@@ -91,7 +91,7 @@ impl Wgpu {
         device.on_uncaptured_error(std::sync::Arc::new(|e| tracing::error!("wgpu: {e}")));
         let limits = DeviceLimits {
             max_buffer_bytes: required.max_buffer_size,
-            max_binding_bytes: required.max_storage_buffer_binding_size as u64,
+            max_binding_bytes: required.max_storage_buffer_binding_size,
             max_storage_buffers: required.max_storage_buffers_per_shader_stage,
             max_workgroup_invocations: required.max_compute_invocations_per_workgroup,
             max_workgroup_storage: required.max_compute_workgroup_storage_size,

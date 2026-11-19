@@ -169,3 +169,29 @@ After all steps, full `mac_vs_llama.sh` (specrt / llama.cpp, tok/s):
 | Qwen2.5-7B Q4_K_M | 62 / 274 = 0.23 (0.015) | 55 / 269 = 0.20 (0.015) | 6.95 / 28.0 = 0.25 (0.073) |
 
 The 0.5x milestone is met only for Qwen3-0.6B bf16 decode. Where the time goes at 1,024 (0.6B, per-dispatch timing): `linear_coop` about 0.95 ms a dispatch (12,544 dispatches), attention about 6 ms a dispatch before `flash`. Decode attention at long context and the GEMM are the next targets.
+
+## Mac speed work 2 (#812 steps)
+
+Same method (`mac_vs_llama.sh`, 3 alternating rounds, medians, M1 Pro). Each step was A/B'd on the Mac and kept only if it helped. Ablations (skipping a stage to see its cost) showed the prefill GEMM cost was dominated by the global-to-workgroup tile loads, not the matrix multiplies.
+
+| Step | Change | Result |
+|---|---|---|
+| flash | `flash` kernel reads K and V as `vec4` | prefill 1,024 bf16: 377 to 582 tok/s |
+| coop loads | `linear_coop` loads x as `vec4` and weights four at a time | prefill 1,024 bf16: 582 to 759, Q4_K 316 to 427 |
+| coop Q4_K | Q4_K dequantised straight into the tile with one scale lookup per four weights | prefill 1,024 Q4_K: 427 to 645 |
+| sg Q4_K | `linear_sg` reads x as `vec4`, nibbles unpacked into vec4 dots | decode Q4_K 53 to 58 |
+| sg Q6_K | Q6_K GEMV reads words, two superblocks per pass | decode Q4_K_M (Q6_K lm head and layers) 58 to 73 |
+| decode attention | `flash_decode`: 8 simdgroups split the keys, 8 keys per simdgroup step, partials merged in workgroup memory | decode at 1,024 context: 35 to 70 (Q4_K), 36 to 66 (bf16) |
+
+Tried and dropped: `COOP_K` 32 (no gain), padded tile stride (no gain), two Q4_K superblocks per lane pass (no gain), 8 rows per workgroup in the GEMV (no gain).
+
+Result (specrt / llama.cpp, tok/s), before and after:
+
+| Model | Prefill 128 | Prefill 1,024 | Decode (128 new) |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 0.23 to 0.34 | 0.13 to 0.25 | 0.46 to 0.64 |
+| Qwen3-0.6B Q4_K_M | 0.17 to 0.28 | 0.10 to 0.21 | 0.23 to 0.43 |
+| Llama-3.2-1B Q4_K_M | 0.20 to 0.33 | 0.15 to 0.27 | 0.23 to 0.41 |
+| Qwen2.5-7B Q4_K_M | 0.23 to 0.37 | 0.20 to 0.35 | 0.25 to 0.43 |
+
+The 0.5x milestone is met only for Qwen3-0.6B bf16 decode. Load (7B 11.2 s, peak 9.1 GB, #772) and fusion (#770) were not changed. wgsl tests 23/23 on the Mac.
