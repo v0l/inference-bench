@@ -201,3 +201,139 @@ pub fn max_over(indent: usize, var: &str, idx: &str, count: &str, expr: &str) ->
     let pad = " ".repeat(indent);
     format!("{pad}float {var} = NEG_INF;\n{pad}for (int {idx} = 0; {idx} < {count}; {idx}++) {var} = fmaxf({var}, {expr});\n")
 }
+
+use std::fmt::Write as _;
+
+use crate::layout::{self, Dialect};
+
+pub struct KvShape {
+    pub kv_heads: usize,
+    pub page: usize,
+    pub head_dim: usize,
+    pub planes: usize,
+    pub layers: usize,
+    pub f16_layers: usize,
+    pub fp8: bool,
+}
+
+pub fn kv_addr(s: &KvShape) -> String {
+    let d = Dialect::Cuda;
+    let page = layout::offset(d, &[layout::Term::one("block_table[pos / PAGE]")]);
+    let slot = layout::addr_chain(d, &page, &[("ATTN_LAYERS", "layer"), ("KV_HEADS", "kv_head")]);
+    let within = layout::addr_regions(d, "KV_F16_LAYERS", "KV_RAW_LAYER_BYTES", "KV_Q_LAYER_BYTES", "layer", 42);
+    let mut o = String::new();
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ size_t kv_slot(const int* block_table, int layer, int kv_head, int pos) {{
+    return {slot} * PAGE + pos % PAGE;
+}}
+"
+    );
+    let _ = writeln!(
+        o,
+        "constexpr size_t KV_ROWS_PER_LAYER = (size_t)KV_HEADS * PAGE;
+constexpr size_t KV_RAW_LAYER_BYTES = KV_ROWS_PER_LAYER * HEAD_DIM * 2 * KV_PLANES;
+constexpr size_t KV_Q_LAYER_BYTES = KV_ROWS_PER_LAYER * (HEAD_DIM + 4);
+constexpr size_t KV_BLOCK_BYTES = KV_F16_LAYERS * KV_RAW_LAYER_BYTES + (ATTN_LAYERS - KV_F16_LAYERS) * KV_Q_LAYER_BYTES;
+"
+    );
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ bool kv_q(int layer) {{
+    return KV_FP8 && layer >= KV_F16_LAYERS;
+}}
+"
+    );
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ size_t kv_layer_base(const int* block_table, int layer, int pos) {{
+    size_t within = {within};
+    return (size_t){page} * KV_BLOCK_BYTES + within;
+}}
+"
+    );
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ bf16_t* kv_row(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {{
+    if (KV_FP8) {{
+        size_t row = (size_t)kv_head * PAGE + pos % PAGE;
+        size_t base = kv_layer_base(block_table, layer, pos);
+        return (bf16_t*)((unsigned char*)cache + base + row * (kv_q(layer) ? HEAD_DIM : HEAD_DIM * 2 * KV_PLANES));
+    }}
+    return cache + kv_slot(block_table, layer, kv_head, pos) * KV_PLANES * HEAD_DIM;
+}}
+"
+    );
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ const bf16_t* kv_row(const bf16_t* cache, const int* block_table, int layer, int kv_head,
+                                                int pos) {{
+    return kv_row(const_cast<bf16_t*>(cache), block_table, layer, kv_head, pos);
+}}
+"
+    );
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ float* kv_scale_ptr(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {{
+    size_t row = (size_t)kv_head * PAGE + pos % PAGE;
+    return (float*)((unsigned char*)cache + kv_layer_base(block_table, layer, pos) + KV_ROWS_PER_LAYER * HEAD_DIM + row * 4);
+}}
+"
+    );
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ float kv_scale(const bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {{
+    if (!kv_q(layer)) return 1.0f;
+    return *kv_scale_ptr(const_cast<bf16_t*>(cache), block_table, layer, kv_head, pos);
+}}
+"
+    );
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ const int* seq_table(const int* block_table, const int* slots, int row, int pages) {{
+    return block_table + (size_t)slots[row] * pages;
+}}
+"
+    );
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ float kv_at(const bf16_t* row, int d, float sc, bool q) {{
+    if (q) return e4m3_to_f32(((const unsigned char*)row)[d]) * sc;
+    float v = attn_float(row[d]);
+    return KV_PLANES == 2 ? v + attn_float(row[HEAD_DIM + d]) : v;
+}}
+"
+    );
+    let _ = writeln!(
+        o,
+        "__device__ __forceinline__ float4 kv_at4(const bf16_t* row, int d, float sc, bool q) {{
+    if (q) {{
+        unsigned w = *(const unsigned*)((const unsigned char*)row + d);
+        return make_float4(e4m3_to_f32(w & 0xffu) * sc, e4m3_to_f32((w >> 8) & 0xffu) * sc,
+                           e4m3_to_f32((w >> 16) & 0xffu) * sc, e4m3_to_f32(w >> 24) * sc);
+    }}
+    uint2 h = *(const uint2*)(row + d);
+    float4 v = make_float4(attn_float(h.x), attn_float(h.x >> 16), attn_float(h.y), attn_float(h.y >> 16));
+    if (KV_PLANES == 2) {{
+        uint2 l = *(const uint2*)(row + HEAD_DIM + d);
+        v.x += attn_float(l.x);
+        v.y += attn_float(l.x >> 16);
+        v.z += attn_float(l.y);
+        v.w += attn_float(l.y >> 16);
+    }}
+    return v;
+}}
+"
+    );
+    o
+}
+
+pub fn norm_rope_call(args: &[&str], slot: &str) -> String {
+    let mut s = format!("norm_rope_head({}", args[0]);
+    for a in &args[1..] {
+        s.push_str(&format!("\n{slot}{a}"));
+    }
+    s.push_str(");");
+    s
+}
+

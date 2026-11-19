@@ -8,6 +8,58 @@ struct Syntax {
     clamp: fn(&str) -> String,
 }
 
+pub fn mrope_axis_fn() -> String {
+    "__device__ __forceinline__ int mrope_axis(int i) {
+    if (MROPE_INTERLEAVED) {
+        if (i % 3 == 1 && i < 3 * MROPE_S1) return 1;
+        if (i % 3 == 2 && i < 3 * MROPE_S2) return 2;
+        return 0;
+    }
+    if (i < MROPE_S0) return 0;
+    if (i < MROPE_S0 + MROPE_S1) return 1;
+    return 2;
+}
+
+"
+    .to_string()
+}
+
+pub fn position_fn() -> String {
+    format!(
+        "__device__ __forceinline__ float rope_position(const int* mm_meta, const int* mm_table, int mm_stride, int slot, int idx, int i) {{
+    if (!MROPE) return (float)idx;
+    if (idx < mm_meta[2 * slot]) return (float)mm_table[((size_t)slot * mm_stride + idx) * 3 + mrope_axis(i)];
+    return (float)(idx + mm_meta[2 * slot + 1]);
+}}
+
+"
+    )
+}
+
+pub fn rotate_head() -> String {
+    "        int fi = d < ROT_HALF ? d : d - ROT_HALF;
+        float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi, layer);
+        float c = cosf(angle) * ROPE_MSCALE;
+        float s = sinf(angle) * ROPE_MSCALE;
+        v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
+"
+    .to_string()
+}
+
+pub fn tap_rotate(half: &str, quarter: &str, tap: &str) -> String {
+    format!(
+        "                    int i = d < {half} ? d : d - {half};
+                    int fi = i < {quarter} ? i : i - {quarter};
+                    float inv = exp2f(-(2.0f * fi / (float){half}) * log2f(theta));
+                    float angle = (float)(i < {quarter} ? {tap} : {tap} + 1) * inv;
+                    float s, c;
+                    sincosf(angle, &s, &c);
+                    float other = d < {half} ? src[d + {half}] : src[d - {half}];
+                    v = d < {half} ? v * c - other * s : v * c + other * s;
+"
+    )
+}
+
 fn cuda_lit(v: f64) -> String {
     format!("{v:?}f")
 }
