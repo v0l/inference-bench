@@ -5,6 +5,7 @@ use specrt::spec::{Block, Spec};
 use std::path::{Path, PathBuf};
 
 const BAMBA: &str = "tiny-bamba";
+const GRANITE_HYBRID: &str = "tiny-granitehybrid";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -117,6 +118,24 @@ fn tiny_bamba_matches_transformers() {
     assert_eq!(got.tokens[0], greedy, "{BAMBA} decode greedy");
 }
 
+#[test]
+#[ignore = "needs a CUDA GPU and SPECRT_REF_DIR from scripts/tiny_granitehybrid.py"]
+fn tiny_granitehybrid_matches_transformers() {
+    let (tokens, greedy, vocab, want) = reference(GRANITE_HYBRID);
+    let spec = spec(GRANITE_HYBRID);
+    let mut rt = Runtime::load_batched(&spec, 256, 1).unwrap();
+    let ours = rt.prompt_logits(&tokens).unwrap();
+    assert_eq!(ours.len(), want.len());
+    let max_abs = ours.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    eprintln!("{GRANITE_HYBRID} prefill max_abs {max_abs}");
+    let top = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let agree = (0..tokens.len()).filter(|r| top(&ours[r * vocab..(r + 1) * vocab]) == top(&want[r * vocab..(r + 1) * vocab])).count();
+    eprintln!("{GRANITE_HYBRID} prefill argmax agree {agree}/{}", tokens.len());
+    assert!(max_abs < 0.05, "{GRANITE_HYBRID} max abs diff {max_abs}");
+    let got = rt.generate_batch(std::slice::from_ref(&tokens), greedy.len()).unwrap();
+    assert_eq!(got.tokens[0], greedy, "{GRANITE_HYBRID} decode greedy");
+}
+
 fn kda_reference(mix: &[f32], dtb: &[f32], a_log: &[f32], heads: usize, d: usize, rows: usize, lower: f32) -> (Vec<f32>, Vec<f32>) {
     let row = 4 * heads * d + heads;
     let mut state = vec![0f32; heads * d * d];
@@ -208,4 +227,81 @@ fn a_checkpointed_state_survives_a_reset_and_restore() {
     rt.restore_state(0, &snap).unwrap();
     let back = rt.snapshot_state_blocking(0).unwrap();
     assert_eq!((back.conv(), back.ssm()), (snap.conv(), snap.ssm()));
+}
+
+fn tiny_config(name: &str) -> String {
+    std::fs::read_to_string(fixture(name)).unwrap()
+}
+
+#[test]
+fn granite_h_tiny_is_a_mamba_hybrid_with_moe_and_scaled_residuals_from_its_family_toml() {
+    let json = tiny_config("granite-4.0-h-tiny.config.json");
+    let spec = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(spec.layers.count, 40);
+    assert_eq!(spec.linear_layers(), 36);
+    assert_eq!(spec.block(5), Block::Full);
+    assert_eq!(spec.block(4), Block::Linear);
+    let m = spec.moe.as_ref().unwrap();
+    assert_eq!((m.experts, m.top_k(), m.expert_intermediate, m.shared_intermediate, m.shared_slots()), (64, 6, 512, 1024, 2));
+    assert!(m.fused_experts && !m.shared_gate && m.norm_topk);
+    assert_eq!((m.router_module.as_str(), m.shared_module.as_str()), ("router", "shared_mlp"));
+    assert_eq!(m.out_scale, 0.22);
+    assert_eq!(spec.norm.residual_scale, Some(0.22));
+    assert!(spec.rope.nope_layers.len() == 40);
+    assert_eq!(spec.dims.embed_scale, Some(12.0));
+    assert_eq!(spec.dims.logit_scale, Some(1.0 / 6.0));
+    assert_eq!(spec.attention.query_scalar, Some(1.0 / (0.0078125f64 * 0.0078125)));
+    let mixer = spec.mixer.as_ref().unwrap();
+    assert_eq!((mixer.params["ssm_inner"], mixer.params["ssm_conv"], mixer.params["ssm_in"]), (3072.0, 3328.0, 6448.0));
+    spec.validate().unwrap();
+}
+
+#[test]
+fn granite_h_tiny_plans_scaled_mixer_and_attention_blocks_with_experts() {
+    let json = tiny_config("granite-4.0-h-tiny.config.json");
+    let spec = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap();
+    for phase in [Phase::Prefill, Phase::Decode] {
+        let plan = Plan::build(&spec, phase, true);
+        for block in [Block::Linear, Block::Full] {
+            let ops = plan.layer_of(block, true);
+            assert!(ops.contains(&Op::MoeRoute) && ops.contains(&Op::MoeExperts) && ops.contains(&Op::MoeCombine), "{block:?} {phase:?}");
+            assert!(ops.iter().any(|o| matches!(o, Op::ScaledAdd { .. })), "{block:?} {phase:?}");
+        }
+        assert_eq!(plan.layer_of(Block::Linear, true).iter().filter(|o| matches!(o, Op::MixKernel { .. })).count(), 3);
+    }
+}
+
+#[test]
+fn granite_h_tiny_module_builds_the_scaled_moe_combine_and_mixer_kernels() {
+    let json = tiny_config("granite-4.0-h-tiny.config.json");
+    let spec = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap();
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+    assert!(module.source.contains("MOE_OUT_SCALE = 2.2e-1f"), "the combine kernel carries the residual multiplier");
+    for k in ["mamba2_conv", "mamba2_scan", "mamba2_gated_norm", "moe_combine", "residual_add"] {
+        assert!(module.kernels.contains(&k), "{k}");
+    }
+}
+
+#[test]
+fn the_tiny_granite_hybrid_config_reads_experts_scales_and_nope_from_its_family_toml() {
+    let spec = spec(GRANITE_HYBRID);
+    assert_eq!(spec.layers.pattern, vec![Block::Linear, Block::Full]);
+    let m = spec.moe.as_ref().unwrap();
+    assert_eq!((m.experts, m.top_k(), m.expert_intermediate, m.shared_slots(), m.out_scale), (8, 2, 256, 2, 0.22));
+    assert_eq!(spec.rope.nope_layers, vec![0, 1, 2, 3]);
+    assert!(spec.dims.tie_embeddings);
+    spec.runnable().unwrap();
+}
+
+#[test]
+fn the_tiny_granite_hybrid_checkpoint_loads_through_the_family_tensor_names() {
+    let spec = spec(GRANITE_HYBRID);
+    let ck = specrt::weights::Checkpoint::for_repo(&spec.repo).unwrap().renamed(&spec.tensors);
+    for i in 0..4 {
+        let layer = ck.layer(&spec, i).unwrap_or_else(|e| panic!("layer {i}: {e:#}"));
+        let moe = layer.moe.as_ref().unwrap();
+        assert_eq!(moe.router.len(), 8 * 256);
+        let specrt::weights::Stacked::Bf16(down) = &moe.down else { panic!("bf16 experts") };
+        assert_eq!(down.len(), (8 + 2) * 256 * 256);
+    }
 }
