@@ -44,3 +44,6 @@ nope = "nope"
 attn_scale = "attn_scale"
 floor_scale = "floor_scale"
 tuning = "tuning"
+
+[runtime]
+split_activations = true
