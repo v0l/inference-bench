@@ -17,12 +17,12 @@ GREEDY = 16
 NAME = "granite-4.0-h-tiny"
 
 
-def main(checkpoint, out_dir):
+def main(checkpoint, out_dir, dtype="bfloat16"):
     from transformers import AutoModelForCausalLM
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    model = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.bfloat16, low_cpu_mem_usage=True).eval()
+    model = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=getattr(torch, dtype), low_cpu_mem_usage=True).eval()
     vocab = model.config.vocab_size
     from transformers import AutoTokenizer
 
@@ -39,4 +39,4 @@ def main(checkpoint, out_dir):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    main(*sys.argv[1:4])

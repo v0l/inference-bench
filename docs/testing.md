@@ -163,7 +163,7 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `truncation.rs` | context truncation and shifting | 2 | 5 | none | 3 GB, 45 s |
 | `linear.rs` | every linear path (bf16, fp8, nvfp4, act-quant) vs references | 2 | 20 | `SPECRT_REF_DIR` with tiny, tiny-fp8, tiny-nvfp4 | 2 GB, 30 s |
 | `mamba.rs` | described mixers (#808): tiny Bamba and tiny granitemoehybrid (`scripts/tiny_granitehybrid.py`) from spec files vs transformers, the KDA recurrence vs a host reference, checkpoint state reset and restore, NVRTC compile of the module | CPU (4), 2 (4) | 4 | `SPECRT_REF_DIR` from `scripts/tiny_mamba.py` (CPU only, seconds) | 1 GB, 8 s |
-| `granite_h_tiny.rs` | real Granite 4.0 H-Tiny (Mamba2 hybrid with MoE, scaled residuals) vs transformers: prefill argmax agreement and greedy decode | 2 (1) | 1 | `GRANITE_H_TINY_DIR` snapshot and `SPECRT_REF_DIR` from `scripts/granite_h_tiny_ref.py` (CPU, 14 GB) | 14 GB, 80 s |
+| `granite_h_tiny.rs` | real Granite 4.0 H-Tiny (Mamba2 hybrid with MoE, scaled residuals) vs transformers: prefill argmax agreement and greedy decode | 2 (1) | 1 | `GRANITE_H_TINY_DIR` snapshot and `SPECRT_REF_DIR` from `scripts/granite_h_tiny_ref.py ... float32` (CPU, 28 GB; the bf16 reference is itself noisy at 40 layers) | 14 GB, 80 s |
 | `fp8_act.rs`, `fp4_act.rs` | act-quant GEMM end to end | 2 | 2, 1 | `SPECRT_REF_DIR` with `tiny-fp8`, `tiny-nvfp4` | 2 GB, 15 s |
 | `fp8_gemm.rs`, `fp8_batch.rs`, `fp4_batch.rs` | block-scaled GEMMs at 27B shapes, random weights | 3 | all | sm_120 GPU | 2 to 4 GB, seconds |
 | `mtp.rs` | MTP drafting, acceptance, greedy identity, chi-square sampling | 2 | 15 | `SPECRT_REF_DIR` with `tiny-mtp` | 3 GB, 90 s |
