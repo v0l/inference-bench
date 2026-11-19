@@ -203,7 +203,7 @@ pub fn validate(spec: &Spec) -> Result<()> {
             ensure!(named(spec, want).is_some_and(|s| s.per == Per::Sequence && s.layers == Layers::Linear), "delta-net layers need a per sequence [[state]] named {want:?}");
         }
     }
-    ensure!(positional(spec).count() <= 2, "at most two per token [[state]] caches are supported");
+    ensure!(positional(spec).count() <= 8, "at most eight per token [[state]] caches are supported");
     ensure!(!spec.runtime.kv_dtype.is_fp8() || is_stock(&spec.state), "fp8 KV needs the stock k and v states");
     for (i, s) in spec.state.iter().enumerate() {
         let at = format!("[[state]] {:?}", s.name);

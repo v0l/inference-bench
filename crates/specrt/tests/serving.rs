@@ -354,12 +354,17 @@ fn prefix_cached_scheduler_matches_single(dir: &str) {
     use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
     use specrt::spec::PrefixCacheOptions;
     let s = spec_for(dir);
-    let shared: Vec<u32> = (0..160u32).map(|i| (i * 29 + 7) % 1024).collect();
+    let vocab = s.dims.vocab as u32;
+    let shared: Vec<u32> = (0..160u32).map(|i| (i * 29 + 7) % vocab).collect();
     let prompts: Vec<Vec<u32>> = (0..24u32)
-        .map(|q| [shared.clone(), (0..(5 + q * 11 % 90)).map(|i| (i * 13 + q * 97 + 1) % 1024).collect::<Vec<u32>>()].concat())
+        .map(|q| [shared.clone(), (0..(5 + q * 11 % 90)).map(|i| (i * 13 + q * 97 + 1) % vocab).collect::<Vec<u32>>()].concat())
         .collect();
     let mut single = Runtime::load(&s, 512).unwrap();
-    let want: Vec<Vec<u32>> = prompts.iter().map(|p| single.generate(p, 20, Sampling::GREEDY).unwrap().tokens).collect();
+    let want: Vec<Vec<u32>> = if s.mixer.is_some() {
+        prompts.iter().map(|p| single.generate_batch(std::slice::from_ref(p), 20).unwrap().tokens.remove(0)).collect()
+    } else {
+        prompts.iter().map(|p| single.generate(p, 20, Sampling::GREEDY).unwrap().tokens).collect()
+    };
     drop(single);
     let layout = Layout { max_ctx: 512, slots: 6, kv_blocks: 90, prefill_chunk: 256, kv_planes: 1, kv_headroom: 0, state_on_demand: true };
     let exec = GpuExecutor::new(Runtime::load_layout(&s, layout).unwrap()).unwrap();
@@ -394,6 +399,12 @@ fn prefix_cached_scheduler_matches_single(dir: &str) {
 #[ignore = "needs a CUDA GPU"]
 fn tiny_prefix_cached_scheduling_matches_single_sequence_greedy() {
     prefix_cached_scheduler_matches_single("tiny-qwen3.5");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn tiny_granite_hybrid_prefix_cache_hits_reuse_the_checkpointed_mamba_states() {
+    prefix_cached_scheduler_matches_single("tiny-granitehybrid");
 }
 
 #[test]

@@ -226,7 +226,7 @@ Plumbing, variant free:
 - State kind: per sequence `[[state]]` tables on the linear layers become one `StatePool` each with the `checkpoint` rule. Acquire, release, reset, snapshot (prefix cache and session park) and restore walk the declared states, so prefix caching and swap work for any described recurrence.
 - `[blocks] attention_indices_key` builds the layer pattern from a list of attention layer indices, and `[tensors]` renames checkpoint tensor name fragments (`.feed_forward.` to `.mlp.`). `SPEC_FORMAT` 11.
 
-The variants (no Rust): `specs/family-bamba.toml` with `mamba2_conv`, `mamba2_scan` (`h = exp(-exp(A_log) dt) h + dt x B`, `y = C h + D x`, grouped B and C) and `mamba2_gated_norm`; `specs/kda_recurrence.toml`, the glm5_next KDA delta rule with a per key channel lower bounded forget gate and L2 normalised q and k.
+The variants (no Rust): `specs/family-bamba.toml` and `specs/family-granitemoehybrid.toml` (layer_types, fused expert tensors, shared_mlp, NoPE, residual multiplier on the combine) with `mamba2_conv`, `mamba2_scan` (`h = exp(-exp(A_log) dt) h + dt x B`, `y = C h + D x`, grouped B and C) and `mamba2_gated_norm`; `specs/kda_recurrence.toml`, the glm5_next KDA delta rule with a per key channel lower bounded forget gate and L2 normalised q and k.
 
 Proof (`tests/mamba.rs`, fixture `tiny-bamba`, reference `scripts/tiny_mamba.py`, transformers `BambaForCausalLM` with random weights), Spark GB10, release:
 
@@ -284,3 +284,21 @@ Proof (Spark GB10, release, `tests/variants.rs`, fixture `tiny-glm-dsa` from `sc
 tiny-glm-dsa prefill max_abs 0.00038290024, greedy decode tokens equal
 the_indexer_selects_the_reference_top_k_per_row_from_the_paged_key_cache ... ok
 ```
+
+## 13. DeepSeek V4 compressed sparse attention (#873)
+
+`specs/family-deepseek_v4_attention.toml` (`SPEC_FORMAT` 12) maps `layer_types` / `compress_ratios` to block kinds `sliding`, `indexed` (CSA) and `compressed` (HCA), with the compress ratios, index head count, index top-k, grouped output and rotary width read from `config.json`. The attention is spec plus kir only; mHC hyper-connections and the V4 MoE are not part of it.
+
+- New row families: `block_pool` (softmax-gated mean over a window of `ratio` raw rows, the CSA overlap of the previous window's first half, rms norm, then pair rope at the window start, written into the compressed state when `(pos + 1) % ratio == 0`), `head_rms` (unweighted rms norm per head) and a `stride` on `state_write` so a narrow write lands in a wider raw row. `span_rope` takes `invert = true` for the conjugate rotation of the attention output.
+- `index_topk` takes an optional `ratio` value param: scores are taken over the compressed entries, the visible count is `(pos + 1) / ratio`, and key `t` is the state row at position `t * ratio + ratio - 1`.
+- `scan_attention` takes a `[blocks]` table: after the windowed scan over the uncompressed tail (the stage `mask` applies to those only), the scan folds in compressed entries from the same online softmax, either every visible entry or the `topk` entries named by an i32 `index` buffer (`-1` and not yet complete entries are skipped). The sink joins the denominator once.
+- The raw projections of the compressors (`kv_proj`, `gate_proj`, indexer `kv_proj`, `gate_proj`, `weights_proj`) are fused into the single input linear of each layer kind through `[[attention.projection]] layers = [...]`; other kinds see zero rows. Five per token `[[state]]` tables (`kv`, `raw`, `comp`, `raw_i`, `comp_i`) carry the window cache, the raw compressor inputs and the compressed rows; the per token state cap is now eight.
+- `[rope] theta_key`, `scaling_path`, `rotary_dim_key` and `yarn_attention_factor` select the compress rope; `[attention] o_tensor` names the output projection (`o_b_proj`) behind the grouped `o_a_proj` matvec (`head_matvec`).
+
+Proof (Spark GB10, release, `tests/v4_attention.rs`, fixture `tiny-deepseek-v4-attention` from `scripts/tiny_variants.py`: three layers HCA, CSA and sliding, ratios 8 and 4, top-k 3, grouped output, dense MLP, real transformers `DeepseekV4Attention` modules with random weights):
+
+```text
+tiny-deepseek-v4-attention prefill max_abs 0.0003566742, greedy decode tokens equal
+```
+
+CPU tests: `tests/v4_attention.rs` (blocks, per kind kernels, module build), `kir/tests/scan.rs` (block source emission and errors), `kir/tests/v4_rows.rs` (pool emission and refusals).

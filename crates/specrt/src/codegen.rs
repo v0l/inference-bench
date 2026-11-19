@@ -42,6 +42,7 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         shared: m.shared_slots(),
         norm_topk: m.norm_topk,
         routed_scale: m.routed_scale,
+        out_scale: m.out_scale,
         shared_gate: m.shared_gate,
         sigmoid: m.router == crate::spec::RouterAct::Sigmoid,
         groups: m.groups,
@@ -163,6 +164,7 @@ pub fn attention_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::
         .num("rope_original", rope.original)
         .num("rope_mscale", rope.mscale)
         .nums("rope_freq_factors", &shape.rope.freq_factors)
+        .num("max_context", max_ctx as f64)
         .num("kv_layers", spec.kv_layers() as f64)
         .num("kv_planes", kv_planes as f64)
         .flag("kv_fp8", shape.kv_fp8)

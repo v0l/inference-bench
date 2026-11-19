@@ -1,7 +1,7 @@
 use crate::codegen::{Module, PAGE};
 use kir::linear::LinearTuning;
 use crate::jit::{Jit, default_cache_dir};
-use crate::spec::{Block, LinearAttention, Spec};
+use crate::spec::{LinearAttention, Spec};
 use crate::statepool::StatePool;
 use crate::weights::{Checkpoint, Feed, Matrix, Mixer, peak_rss_bytes};
 use anyhow::{Context, Result, ensure};
@@ -110,7 +110,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             k_norm: up_opt(&a.k_norm)?,
             o: up_m(&a.o)?,
             kv: before(false),
-            window: if spec.block(i) == Block::Sliding { spec.layers.window.unwrap_or(0) as i32 } else { 0 },
+            window: if spec.block(i).windowed() { spec.layers.window.unwrap_or(0) as i32 } else { 0 },
             nope: spec.nope(i),
             extra: a.extra.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,
         }),

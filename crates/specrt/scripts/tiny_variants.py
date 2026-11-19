@@ -1,5 +1,6 @@
 import json
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ GLM = "tiny-glm4-moe"
 OSS = "tiny-gpt-oss"
 DSA = "tiny-glm-dsa"
 HASH = "tiny-hash-glm4-moe"
+V4 = "tiny-deepseek-v4-attention"
 WINDOW = 16
 SOFTCAP = 8.0
 CHUNK = 16
@@ -404,11 +406,142 @@ def make(name):
     return model
 
 
+def build_v4_config():
+    from transformers import DeepseekV4Config
+
+    return DeepseekV4Config(
+        vocab_size=512,
+        hidden_size=256,
+        moe_intermediate_size=512,
+        num_hidden_layers=3,
+        num_attention_heads=4,
+        head_dim=64,
+        q_lora_rank=64,
+        partial_rotary_factor=0.25,
+        layer_types=["heavily_compressed_attention", "compressed_sparse_attention", "sliding_attention"],
+        compress_rates={"compressed_sparse_attention": 4, "heavily_compressed_attention": 8},
+        compress_rope_theta=160000.0,
+        rope_theta=10000.0,
+        sliding_window=16,
+        o_groups=2,
+        o_lora_rank=32,
+        index_n_heads=16,
+        index_head_dim=32,
+        index_topk=3,
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        hc_mult=2,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=False,
+        eos_token_id=None,
+        bos_token_id=None,
+        pad_token_id=None,
+        attn_implementation="eager",
+    )
+
+
+class V4Attention(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Attention, DeepseekV4RMSNorm, DeepseekV4RotaryEmbedding
+
+        self.cfg = cfg
+        self.rotary = DeepseekV4RotaryEmbedding(cfg)
+        self.embed = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
+        self.layers = nn.ModuleList()
+        for i in range(cfg.num_hidden_layers):
+            layer = nn.Module()
+            layer.self_attn = DeepseekV4Attention(cfg, i)
+            layer.input_layernorm = DeepseekV4RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+            layer.post_attention_layernorm = DeepseekV4RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+            layer.mlp = nn.Module()
+            layer.mlp.gate_proj = nn.Linear(cfg.hidden_size, 512, bias=False)
+            layer.mlp.up_proj = nn.Linear(cfg.hidden_size, 512, bias=False)
+            layer.mlp.down_proj = nn.Linear(512, cfg.hidden_size, bias=False)
+            self.layers.append(layer)
+        self.norm = DeepseekV4RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
+        self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+
+    def forward(self, ids, trace=None):
+        cfg = self.cfg
+        t = ids.shape[1]
+        pos = torch.arange(t)[None]
+        h = self.embed(ids)
+        emb = {k: self.rotary(h, position_ids=pos, layer_type=k) for k in ("main", "compress")}
+        q = torch.arange(t)[:, None]
+        k = torch.arange(t)[None, :]
+        visible = (k <= q) & (q - k < cfg.sliding_window)
+        mask = torch.zeros(1, 1, t, t).masked_fill(~visible, float("-inf"))
+        for layer in self.layers:
+            a, _ = layer.self_attn(layer.input_layernorm(h), emb, pos, mask)
+            h = h + a
+            x = layer.post_attention_layernorm(h)
+            h = h + layer.mlp.down_proj(torch.nn.functional.silu(layer.mlp.gate_proj(x)) * layer.mlp.up_proj(x))
+            if trace is not None:
+                trace.append(h[0].clone())
+        return SimpleNamespace(logits=self.lm_head(self.norm(h)))
+
+
+def v4_weights(model):
+    g = torch.Generator().manual_seed(SEED)
+    out = {}
+    for name, p in sorted(model.state_dict().items()):
+        key = name
+        if name.startswith("embed."):
+            key = "model.embed_tokens.weight"
+        elif name.startswith("norm."):
+            key = "model." + name
+        elif name.startswith("layers."):
+            key = "model." + name
+        elif name == "lm_head.weight":
+            key = name
+        elif name.startswith("rotary"):
+            continue
+        if name.endswith(".sinks"):
+            v = 2.0 * torch.randn(p.shape, generator=g)
+        elif name.endswith("position_bias"):
+            v = 0.5 * torch.randn(p.shape, generator=g)
+        elif p.dim() == 1:
+            v = 1.0 + 0.1 * torch.randn(p.shape, generator=g)
+        elif "embed" in name or name == "lm_head.weight":
+            v = torch.randn(p.shape, generator=g)
+        else:
+            v = torch.randn(p.shape, generator=g) / p.shape[-1] ** 0.5
+        out[key] = v.to(torch.bfloat16).contiguous()
+    return out
+
+
+def make_v4():
+    from safetensors.torch import load_file, save_file
+
+    cfg = build_v4_config()
+    torch.manual_seed(SEED)
+    model = V4Attention(cfg).float().eval()
+    folder = FIXTURES / V4
+    path = folder / "model.safetensors"
+    if not path.exists():
+        folder.mkdir(parents=True, exist_ok=True)
+        save_file(v4_weights(model), path)
+        raw = json.loads(cfg.to_json_string())
+        raw.update({"model_type": "deepseek_v4_attention", "architectures": ["DeepseekV4AttentionForCausalLM"], "intermediate_size": 512})
+        (folder / "config.json").write_text(json.dumps(raw, indent=2) + "\n")
+    loaded = {}
+    for k, v in load_file(path).items():
+        if k == "model.embed_tokens.weight":
+            k = "embed.weight"
+        elif k.startswith("model."):
+            k = k[len("model."):]
+        loaded[k] = v.float()
+    model.load_state_dict(loaded, strict=False)
+    return model
+
+
 def main(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    for name in (SINKS, CHUNKED, MLA, MLA_MOE, GLM, OSS, DSA):
-        model = make(name)
+    for name in (SINKS, CHUNKED, MLA, MLA_MOE, GLM, OSS, DSA, V4):
+        model = make_v4() if name == V4 else make(name)
         g = torch.Generator().manual_seed(SEED + 3)
         prompt = DSA_PROMPT if name == DSA else PROMPT
         ids = torch.randint(0, 512, (prompt,), generator=g)

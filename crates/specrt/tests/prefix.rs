@@ -394,9 +394,21 @@ fn max_ctx() -> usize {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn prefill_a_then_b_equals_prefill_a_snapshot_then_b_from_the_snapshot() {
-    let s = spec_for("tiny-qwen3.5");
-    let a = tokens(3 * PAGE, 0);
-    let b = tokens(37, 4);
+    snapshot_resume_is_bit_identical("tiny-qwen3.5");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_granite_hybrid_snapshot_resumes_bit_identically() {
+    snapshot_resume_is_bit_identical("tiny-granitehybrid");
+}
+
+fn snapshot_resume_is_bit_identical(dir: &str) {
+    let s = spec_for(dir);
+    let vocab = s.dims.vocab as u32;
+    let wrap = |v: Vec<u32>| v.into_iter().map(|t| t % vocab).collect::<Vec<u32>>();
+    let a = wrap(tokens(3 * PAGE, 0));
+    let b = wrap(tokens(37, 4));
     let whole = [a.clone(), b.clone()].concat();
     let pages = max_ctx().div_ceil(PAGE);
     let layout = Layout { max_ctx: max_ctx(), slots: 4, kv_blocks: 4 * pages, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: false };

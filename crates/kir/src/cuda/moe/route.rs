@@ -187,7 +187,7 @@ pub fn combine() -> String {
         float c = coef[t * MOE_PAIRS + s];
         if (c != 0.0f) acc += c * out[((size_t)t * MOE_PAIRS + s) * HIDDEN + i];
     }
-    x[(size_t)t * HIDDEN + i] += acc;
+    x[(size_t)t * HIDDEN + i] += MOE_OUT_SCALE * acc;
 "##,
     )
 }

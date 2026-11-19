@@ -300,6 +300,8 @@ pub enum Block {
     Sliding,
     Linear,
     Shared,
+    Compressed,
+    Indexed,
 }
 
 impl Block {
@@ -307,8 +309,12 @@ impl Block {
         self == Block::Linear
     }
 
+    pub fn windowed(self) -> bool {
+        matches!(self, Block::Sliding | Block::Compressed | Block::Indexed)
+    }
+
     pub fn parse(name: &str) -> Result<Block> {
-        [Block::Dense, Block::Full, Block::Sliding, Block::Linear, Block::Shared].into_iter().find(|b| b.name() == name).with_context(|| format!("{name:?} is not a layer kind"))
+        [Block::Dense, Block::Full, Block::Sliding, Block::Linear, Block::Shared, Block::Compressed, Block::Indexed].into_iter().find(|b| b.name() == name).with_context(|| format!("{name:?} is not a layer kind"))
     }
 
     pub fn name(self) -> &'static str {
@@ -318,6 +324,8 @@ impl Block {
             Block::Sliding => "sliding",
             Block::Linear => "linear",
             Block::Shared => "shared",
+            Block::Compressed => "compressed",
+            Block::Indexed => "indexed",
         }
     }
 }
@@ -536,6 +544,10 @@ pub struct Moe {
     pub expert_bias: bool,
     #[serde(default = "default_router_module", skip_serializing_if = "is_default_router_module")]
     pub router_module: String,
+    #[serde(default = "default_routed_scale", skip_serializing_if = "is_default_routed_scale")]
+    pub out_scale: f64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fused_experts: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub hash_layers: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -712,6 +724,8 @@ pub struct Attention {
     pub scratch: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub int_scratch: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub o_tensor: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -963,7 +977,12 @@ struct HfConfig {
     query_pre_attn_scalar: Option<f64>,
 }
 
-fn nope_layers(rope: &crate::family::FamilyRope, config: &serde_json::Value) -> Vec<usize> {
+fn nope_layers(rope: &crate::family::FamilyRope, config: &serde_json::Value, layers: usize) -> Vec<usize> {
+    if let (Some(key), Some(value)) = (rope.nope_key.as_deref(), rope.nope_value.as_deref())
+        && config.get(key).and_then(|v| v.as_str()) == Some(value)
+    {
+        return (0..layers).collect();
+    }
     let Some(flags) = rope.nope_flags.as_deref().and_then(|k| config.get(k)).and_then(|v| v.as_array()) else { return Vec::new() };
     flags
         .iter()
@@ -1266,6 +1285,7 @@ fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_jso
             ensure!(original > 0.0, "original_max_position_embeddings must be positive");
             let attention_factor = match (num("attention_factor"), num("mscale"), num("mscale_all_dim")) {
                 (Some(a), _, _) => a,
+                (None, None, None) if rope.yarn_attention_factor.is_some() => rope.yarn_attention_factor.unwrap_or(1.0),
                 (None, Some(m), Some(d)) if m != 0.0 && d != 0.0 => yarn_mscale(factor, m) / yarn_mscale(factor, d),
                 _ => yarn_mscale(factor, 1.0),
             };
@@ -1454,7 +1474,8 @@ impl Spec {
         let params = hf.rope_parameters.as_ref();
         let param = |key: &str| params.and_then(|p| p.get(key)).or(nested.and_then(|n| n.get(key))).and_then(|v| v.as_f64());
         let full_params = params.and_then(|p| p.get("full_attention")).filter(|_| family.blocks.layer_types.values().any(|b| *b == Block::Full));
-        let scaling = match parse_rope_scaling(&family.rope, hf.rope_scaling.as_ref().or(full_params).or(params), &value) {
+        let scaling_source = family.rope.scaling_path.as_deref().and_then(|p| p.split('.').try_fold(&value, |v, k| v.get(k)));
+        let scaling = match parse_rope_scaling(&family.rope, hf.rope_scaling.as_ref().or(scaling_source).or(full_params).or(params), &value) {
             Ok(s) => s,
             Err(e) if strict => return Err(e),
             Err(_) => None,
@@ -1465,8 +1486,9 @@ impl Spec {
                 .find(|(k, v)| family.blocks.layer_types.get(*k) == Some(&block) && v.get("rope_theta").is_some())
                 .and_then(|(_, v)| v.get("rope_theta")?.as_f64())
         };
-        let local_theta = by_block(Block::Sliding).or_else(|| family.rope.local_theta_key.as_deref().and_then(|k| value.get(k)?.as_f64()));
-        let theta = hf.rope_theta.or(param("rope_theta")).or(by_block(Block::Full));
+        let local_theta = by_block(Block::Sliding).or_else(|| family.rope.local_theta_key.as_deref().and_then(|k| k.split('.').try_fold(&value, |v, p| v.get(p)).and_then(|v| v.as_f64())));
+        let dotted = |path: &str| path.split('.').try_fold(&value, |v, k| v.get(k)).and_then(|v| v.as_f64());
+        let theta = family.rope.theta_key.as_deref().and_then(dotted).or(hf.rope_theta).or(param("rope_theta")).or(by_block(Block::Full));
         let theta = if strict { Some(theta.context("no rope_theta")?) } else { theta };
         let mapped = hf.hidden_act.as_deref().and_then(|a| family.activation.map.get(a).copied());
         let activation = match (mapped, hf.hidden_act.as_deref(), strict) {
@@ -1493,19 +1515,20 @@ impl Spec {
         let (qkv_bias, o_bias, qk_norm, output_gate) = attn_flags;
         let multiplier = |key: &Option<String>| key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_f64());
         let head_dim = hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads);
-        let rotary_dim = hf
-            .partial_rotary_factor
-            .or(param("partial_rotary_factor"))
-            .filter(|f| *f != 1.0)
-            .map(|f| (head_dim as f64 * f).round() as usize);
+        let keyed_rotary = family.rope.rotary_dim_key.as_deref().and_then(|k| value.get(k)?.as_u64()).map(|d| d as usize);
+        let rotary_dim = keyed_rotary.or_else(|| {
+            hf.partial_rotary_factor.or(param("partial_rotary_factor")).filter(|f| *f != 1.0).map(|f| (head_dim as f64 * f).round() as usize)
+        });
         let indexed = family.blocks.attention_indices_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| {
             let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()).collect();
             (0..hf.num_hidden_layers).map(|i| if full.contains(&(i as u64)) { "full_attention" } else { "linear_attention" }.to_string()).collect::<Vec<_>>()
         });
-        let keyed: Option<Vec<String>> = family.blocks.types_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+        let keyed: Option<Vec<String>> = family.blocks.types_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| {
+            a.iter().filter_map(|v| v.as_str().map(String::from).or_else(|| v.as_u64().map(|n| n.to_string()))).collect()
+        });
         let mixer = family.mixer.read(&value)?;
         let pattern = match keyed.as_ref().or(indexed.as_ref()).or(hf.layer_types.as_ref()) {
-            Some(types) if keyed.is_some() || hybrid || !strict || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
+            Some(types) if keyed.is_some() || hybrid || !strict || family.blocks.from_layer_types || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
             None if family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).is_some_and(|n| n > 1) && hf.sliding_window.is_some() => {
                 let n = family.blocks.sliding_period_key.as_deref().and_then(|k| value.get(k)?.as_u64()).unwrap_or(2) as usize;
                 let all: Vec<String> = (0..hf.num_hidden_layers).map(|i| if (i + 1) % n == 0 { "full_attention" } else { "sliding_attention" }.to_string()).collect();
@@ -1566,6 +1589,8 @@ impl Spec {
                     router_bias: family.moe.router_bias,
                     expert_bias: family.moe.expert_bias,
                     router_module: family.moe.router_module.clone().unwrap_or_else(default_router_module),
+                    out_scale: multiplier(&family.multipliers.residual).unwrap_or(1.0),
+                    fused_experts: family.moe.fused_experts,
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,
@@ -1598,7 +1623,7 @@ impl Spec {
                 logit_softcap: hf.final_logit_softcapping,
                 logit_scale: multiplier(&family.multipliers.logits_divisor).filter(|d| *d > 0.0).map(|d| 1.0 / d),
             },
-            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.contains(&Block::Sliding)), pattern },
+            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern },
             norm: Norm {
                 kind: NormKind::Rmsnorm,
                 eps: hf.rms_norm_eps,
@@ -1627,8 +1652,9 @@ impl Spec {
                 o_cols: family.attention.o_cols.clone(),
                 scratch: family.attention.scratch.clone(),
                 int_scratch: family.attention.int_scratch.clone(),
+                o_tensor: family.attention.o_tensor.clone(),
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value) },
+            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value, hf.num_hidden_layers) },
             mlp: Mlp {
                 activation,
                 quant: mlp_quant.map(|m| m.0),
@@ -1661,7 +1687,7 @@ impl Spec {
 
     pub fn validate(&self) -> Result<()> {
         self.runtime.validate()?;
-        ensure!(!self.layers.pattern.contains(&Block::Sliding) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
+        ensure!(!self.layers.pattern.iter().any(|b| b.windowed()) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
         self.validate_attention_nodes()?;
         self.validate_mixer()?;
         crate::state::validate(self)?;
@@ -1893,8 +1919,7 @@ impl Spec {
             }
         }
         ensure!(self.speculative().is_none(), "[mixer] cannot be combined with [mtp] yet");
-        ensure!(self.moe.is_none(), "[mixer] layers with mixture of experts are not supported yet");
-        ensure!(!self.uses_branch(), "[mixer] layers with sandwich or scaled residual norms are not supported yet");
+        ensure!(!self.norm.sandwich, "[mixer] layers with sandwich norms are not supported yet");
         Ok(())
     }
 
@@ -1902,6 +1927,9 @@ impl Spec {
         let nodes = &self.attention.node;
         for p in &self.attention.projection {
             crate::state::dim(self, &p.rows).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
+            for k in &p.layers {
+                Block::parse(k).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
+            }
         }
         if let Some(c) = &self.attention.o_cols {
             crate::state::dim(self, c).context("[attention] o_cols")?;
@@ -2072,6 +2100,7 @@ impl Spec {
         let gate = if self.attention.output_gate { self.q_dim() } else { 0 };
         self.q_dim() + 2 * self.kv_dim() + gate
     }
+
 
     pub fn o_dim(&self) -> usize {
         self.attention.o_cols.as_deref().map_or_else(|| self.q_dim(), |c| crate::state::dim(self, c).unwrap_or(0))

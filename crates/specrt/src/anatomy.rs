@@ -212,7 +212,7 @@ fn mlp_parts(spec: &Spec, index: usize, force_moe: bool) -> MlpParts {
 fn layer(spec: &Spec, index: usize) -> LayerInfo {
     let kind = match spec.block(index) {
         Block::Linear => LayerKind::DeltaNet,
-        Block::Sliding => LayerKind::SlidingAttention,
+        Block::Sliding | Block::Compressed | Block::Indexed => LayerKind::SlidingAttention,
         _ => LayerKind::Attention,
     };
     let mixer = match kind {

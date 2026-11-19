@@ -126,7 +126,7 @@ impl Weight {
                 t
             }
             Weight::O => {
-                let mut t = vec![w("self_attn.o_proj")];
+                let mut t = vec![w(&format!("self_attn.{}", spec.attention.o_tensor.as_deref().unwrap_or("o_proj")))];
                 if spec.attention.o_bias {
                     t.push("self_attn.o_proj.bias".into());
                 }

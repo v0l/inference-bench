@@ -11,8 +11,8 @@ when = "vision+tensor_core"
 
 [[block]]
 name = "attention_branch"
-when = "branch+tensor_core"
-layers = ["dense", "full", "sliding", "shared"]
+when = "branch+tensor_core+dense"
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "dense"
 
 [[block.node]]
@@ -168,7 +168,7 @@ in = "xn_planes"
 [[block]]
 name = "attention"
 when = "plain"
-layers = ["dense", "full", "sliding", "shared"]
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "dense"
 
 [[block.node]]
@@ -443,9 +443,208 @@ when = "tensor_core"
 in = "act_planes"
 
 [[block]]
+name = "mixer_branch"
+when = "scaled+mixer+tensor_core+dense"
+layers = ["linear"]
+mlp = "dense"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "mix_in"
+shard = "column"
+quant = "attn"
+out = "mix"
+in = "xn_planes"
+
+[[block.node]]
+op = "mixer_nodes"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "mix_out"
+shard = "row"
+quant = "attn"
+out = "branch"
+in = "mix_planes"
+
+[[block.node]]
+op = "add_scaled"
+in = "branch"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "post_attention_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+shard = "column"
+quant = "mlp"
+out = "act_planes"
+in = "xn_planes"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+shard = "row"
+quant = "mlp"
+out = "branch"
+in = "act_planes"
+
+[[block.node]]
+op = "add_scaled"
+in = "branch"
+
+[[block]]
+name = "mixer_branch_moe"
+when = "scaled+mixer+tensor_core+moe"
+layers = ["linear"]
+mlp = "sparse"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "mix_in"
+shard = "column"
+quant = "attn"
+out = "mix"
+in = "xn_planes"
+
+[[block.node]]
+op = "mixer_nodes"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "mix_out"
+shard = "row"
+quant = "attn"
+out = "branch"
+in = "mix_planes"
+
+[[block.node]]
+op = "add_scaled"
+in = "branch"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "moe_combine"
+
+[[block]]
+name = "attention_branch_moe"
+when = "scaled+tensor_core+moe"
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
+mlp = "sparse"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+in = "x"
+out = "xn_planes"
+when = "pre"
+
+[[block.node]]
+op = "split"
+in = "x"
+out = "xn_planes"
+when = "nopre"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+shard = "column"
+quant = "attn"
+in = "xn_planes"
+out = "qkv"
+
+[[block.node]]
+op = "qk_norm"
+when = "qk_norm_full"
+
+[[block.node]]
+op = "kv_rope"
+phase = "prefill"
+when = "stock"
+
+[[block.node]]
+op = "flash"
+phase = "prefill"
+when = "stock"
+
+[[block.node]]
+op = "decode_attention"
+phase = "rows"
+when = "stock"
+
+[[block.node]]
+op = "attention_nodes"
+when = "tensor_core+described"
+
+[[block.node]]
+op = "clear"
+out = "branch"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+shard = "row"
+quant = "attn"
+in = "attn_planes"
+out = "branch"
+
+[[block.node]]
+op = "norm_add"
+weight = "post_attention_layernorm.weight"
+in = "branch"
+when = "sandwich"
+
+[[block.node]]
+op = "add_scaled"
+in = "branch"
+when = "scaled"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "moe_combine"
+
+[[block]]
 name = "attention_moe"
 when = "plain"
-layers = ["dense", "full", "sliding", "shared"]
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "sparse"
 
 [[block.node]]

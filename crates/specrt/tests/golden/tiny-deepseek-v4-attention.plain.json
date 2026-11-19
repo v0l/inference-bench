@@ -1,0 +1,650 @@
+{
+  "name": "deepseek_v4_attention",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 256,
+    "intermediate": 512,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 3,
+    "pattern": [
+      "compressed",
+      "indexed",
+      "sliding"
+    ],
+    "window": 16
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 1,
+    "head_dim": 64,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "rotary_dim": 16,
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "v4_q_a_norm",
+        "grid": [
+          "rows"
+        ],
+        "bind": {
+          "out": {
+            "buffer": "qkv"
+          },
+          "weight": {
+            "weight": "q_a_norm.weight",
+            "len": "q_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_kv_norm",
+        "grid": [
+          "rows"
+        ],
+        "bind": {
+          "out": {
+            "buffer": "qkv"
+          },
+          "weight": {
+            "weight": "kv_norm.weight",
+            "len": "head_dim"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_q_matvec",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "q_b_proj.weight",
+            "len": "heads * head_dim * q_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          },
+          "y": {
+            "buffer": "q_heads"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_q_rms",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "q_heads"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_q_rope",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "q_heads"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_kv_rope",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_kv_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "kv"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_hca_raw_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "raw"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "compressed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_hca_pool",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "bias": {
+            "weight": "compressor.position_bias",
+            "len": "hca_ratio * head_dim"
+          },
+          "dst": {
+            "state": "comp"
+          },
+          "norm": {
+            "weight": "compressor.kv_norm.weight",
+            "len": "head_dim"
+          },
+          "overlap": 0.0,
+          "ratio": "hca_ratio",
+          "raw": {
+            "state": "raw"
+          }
+        },
+        "layers": [
+          "compressed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_hca_attn",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "comp": {
+            "state": "comp"
+          },
+          "k_cache": {
+            "state": "kv"
+          },
+          "out": {
+            "buffer": "o_heads"
+          },
+          "qh": {
+            "buffer": "q_heads"
+          },
+          "ratio": "hca_ratio",
+          "sinks": {
+            "weight": "sinks",
+            "len": "heads"
+          },
+          "softmax_scale": "softmax_scale",
+          "v_cache": {
+            "state": "kv"
+          },
+          "window": "window"
+        },
+        "layers": [
+          "compressed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_csa_raw_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "raw"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_csa_pool",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "bias": {
+            "weight": "compressor.position_bias",
+            "len": "csa_ratio * 2 * head_dim"
+          },
+          "dst": {
+            "state": "comp"
+          },
+          "norm": {
+            "weight": "compressor.kv_norm.weight",
+            "len": "head_dim"
+          },
+          "overlap": 1.0,
+          "ratio": "csa_ratio",
+          "raw": {
+            "state": "raw"
+          }
+        },
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_idx_raw_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "raw_i"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_idx_pool",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "bias": {
+            "weight": "compressor.indexer.position_bias",
+            "len": "csa_ratio * 2 * index_head_dim"
+          },
+          "dst": {
+            "state": "comp_i"
+          },
+          "norm": {
+            "weight": "compressor.indexer.kv_norm.weight",
+            "len": "index_head_dim"
+          },
+          "overlap": 1.0,
+          "ratio": "csa_ratio",
+          "raw": {
+            "state": "raw_i"
+          }
+        },
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_iq_matvec",
+        "grid": [
+          "index_heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "compressor.indexer.q_b_proj.weight",
+            "len": "index_heads * index_head_dim * q_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          },
+          "y": {
+            "buffer": "iq"
+          }
+        },
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_iq_rope",
+        "grid": [
+          "index_heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "iq"
+          }
+        },
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_idx_topk",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "idx": {
+            "buffer": "idx"
+          },
+          "keys": {
+            "state": "comp_i"
+          },
+          "q": {
+            "buffer": "iq"
+          },
+          "ratio": "csa_ratio",
+          "scale": "index_scale",
+          "w": {
+            "buffer": "qkv"
+          },
+          "w_scale": "index_w_scale"
+        },
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_csa_attn",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "comp": {
+            "state": "comp"
+          },
+          "idx": {
+            "buffer": "idx"
+          },
+          "k_cache": {
+            "state": "kv"
+          },
+          "out": {
+            "buffer": "o_heads"
+          },
+          "qh": {
+            "buffer": "q_heads"
+          },
+          "ratio": "csa_ratio",
+          "sinks": {
+            "weight": "sinks",
+            "len": "heads"
+          },
+          "softmax_scale": "softmax_scale",
+          "v_cache": {
+            "state": "kv"
+          },
+          "window": "window"
+        },
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_swa_attn",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "k_cache": {
+            "state": "kv"
+          },
+          "out": {
+            "buffer": "o_heads"
+          },
+          "qh": {
+            "buffer": "q_heads"
+          },
+          "sinks": {
+            "weight": "sinks",
+            "len": "heads"
+          },
+          "softmax_scale": "softmax_scale",
+          "v_cache": {
+            "state": "kv"
+          },
+          "window": "window"
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_o_rope",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "o_heads"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "v4_o_group",
+        "grid": [
+          "o_groups",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "o_a_proj.weight",
+            "len": "o_lora_rank * heads * head_dim"
+          },
+          "x": {
+            "buffer": "o_heads"
+          }
+        }
+      }
+    ],
+    "params": {
+      "csa_ratio": 4.0,
+      "hca_ratio": 8.0,
+      "index_head_dim": 32.0,
+      "index_heads": 16.0,
+      "index_scale": 0.17677669529663687,
+      "index_topk": 3.0,
+      "index_w_scale": 0.25,
+      "o_groups": 2.0,
+      "o_lora_rank": 32.0,
+      "q_lora_rank": 64.0,
+      "softmax_scale": 0.125
+    },
+    "projection": [
+      {
+        "tensor": "q_a_proj",
+        "rows": "q_lora_rank"
+      },
+      {
+        "tensor": "kv_proj",
+        "rows": "head_dim"
+      },
+      {
+        "tensor": "compressor.kv_proj",
+        "rows": "head_dim",
+        "layers": [
+          "compressed"
+        ]
+      },
+      {
+        "tensor": "compressor.gate_proj",
+        "rows": "head_dim",
+        "layers": [
+          "compressed"
+        ]
+      },
+      {
+        "tensor": "compressor.kv_proj",
+        "rows": "2 * head_dim",
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "tensor": "compressor.gate_proj",
+        "rows": "2 * head_dim",
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "tensor": "compressor.indexer.kv_proj",
+        "rows": "2 * index_head_dim",
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "tensor": "compressor.indexer.gate_proj",
+        "rows": "2 * index_head_dim",
+        "layers": [
+          "indexed"
+        ]
+      },
+      {
+        "tensor": "compressor.indexer.scorer.weights_proj",
+        "rows": "index_heads",
+        "layers": [
+          "indexed"
+        ]
+      }
+    ],
+    "o_cols": "o_groups * o_lora_rank",
+    "scratch": {
+      "iq": "index_heads * index_head_dim",
+      "o_heads": "heads * head_dim",
+      "q_heads": "heads * head_dim"
+    },
+    "int_scratch": {
+      "idx": "index_topk"
+    },
+    "o_tensor": "o_b_proj"
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 160000.0,
+    "local_theta": 10000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "state": [
+    {
+      "name": "kv",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "raw",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "4 * head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "comp",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "raw_i",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "4 * index_head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "comp_i",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "index_head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    }
+  ]
+}

@@ -101,6 +101,7 @@ pub struct FamilyAttention {
     pub output_gate: Flag,
     pub qk_norm_full: bool,
     pub fused_qkv: bool,
+    pub o_tensor: Option<String>,
 }
 
 impl Default for FamilyAttention {
@@ -118,6 +119,7 @@ impl Default for FamilyAttention {
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },
             qk_norm_full: false,
             fused_qkv: false,
+            o_tensor: None,
         }
     }
 }
@@ -175,6 +177,7 @@ pub struct FamilyMoe {
     pub router_bias: bool,
     pub expert_bias: bool,
     pub router_module: Option<String>,
+    pub fused_experts: bool,
     pub hash_table: Option<String>,
 }
 
@@ -231,6 +234,7 @@ pub struct FamilyBlocks {
     pub kind: BlockKind,
     pub layer_types: std::collections::BTreeMap<String, crate::spec::Block>,
     pub other_layer_type: Option<crate::spec::Block>,
+    pub from_layer_types: bool,
     pub sliding_period_key: Option<String>,
     pub attention_indices_key: Option<String>,
     pub types_key: Option<String>,
@@ -288,6 +292,12 @@ pub struct FamilyRope {
     pub keys: std::collections::BTreeMap<String, String>,
     pub local_theta_key: Option<String>,
     pub nope_flags: Option<String>,
+    pub theta_key: Option<String>,
+    pub scaling_path: Option<String>,
+    pub rotary_dim_key: Option<String>,
+    pub yarn_attention_factor: Option<f64>,
+    pub nope_key: Option<String>,
+    pub nope_value: Option<String>,
 }
 
 impl FamilyRope {
@@ -521,6 +531,9 @@ impl Family {
             push(k, &mut out);
         }
         if let Some(k) = self.rope.nope_flags.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.rope.nope_key.as_deref() {
             push(k, &mut out);
         }
         for k in &self.rope.type_keys {

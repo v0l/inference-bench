@@ -10,7 +10,7 @@ use toml::Value;
 
 pub const KIND: &str = "kir-kernel";
 
-pub const ROW_FAMILIES: [&str; 5] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment"];
+pub const ROW_FAMILIES: [&str; 7] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool"];
 
 pub const SEQ_FAMILIES: [&str; 3] = ["recurrence", "seq_conv", "group_norm"];
 
@@ -73,6 +73,8 @@ pub struct Description {
     pub geometry: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     pub query: Vec<BTreeMap<String, Value>>,
+    #[serde(default)]
+    pub blocks: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     pub recurrence: Option<BTreeMap<String, Value>>,
     #[serde(default)]
@@ -589,7 +591,19 @@ impl Description {
     }
 
     fn sizes(&self, shape: &Shape, table: &BTreeMap<String, Value>, keys: &[&str], what: &str) -> Result<BTreeMap<String, u32>, String> {
-        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !matches!(k.as_str(), "src" | "style" | "name" | "space" | "act" | "input" | "output" | "eps")) {
+        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !matches!(k.as_str(), "src" | "style" | "name" | "space" | "act" | "input" | "output" | "eps" | "invert" | "stride")) {
+            return Err(format!("{}: {what} has no key {k:?}", self.name));
+        }
+        let mut out = BTreeMap::new();
+        for k in keys {
+            let v = table.get(*k).ok_or_else(|| format!("{}: {what} needs {k:?}", self.name))?;
+            out.insert(k.to_string(), self.size(shape, v, k)?);
+        }
+        Ok(out)
+    }
+
+    fn sizes_except(&self, shape: &Shape, table: &BTreeMap<String, Value>, keys: &[&str], words: &[&str], what: &str) -> Result<BTreeMap<String, u32>, String> {
+        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !words.contains(&k.as_str())) {
             return Err(format!("{}: {what} has no key {k:?}", self.name));
         }
         let mut out = BTreeMap::new();
@@ -611,7 +625,22 @@ impl Description {
             let n = self.sizes(shape, q, &["row", "head", "offset", "width"], "[[query]]")?;
             query.push(crate::scan::Segment { src: src.to_string(), row: n["row"], head: n["head"], offset: n["offset"], width: n["width"] });
         }
+        let blocks = match &self.blocks {
+            None => None,
+            Some(b) => {
+                let n = self.sizes_except(shape, b, &["layers", "topk"], &["cache", "index", "ratio"], "[blocks]")?;
+                let word = |k: &str| b.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                Some(crate::scan::Blocks {
+                    cache: word("cache").ok_or_else(|| format!("{}: [blocks] needs cache", self.name))?,
+                    layers: n["layers"],
+                    ratio: word("ratio").ok_or_else(|| format!("{}: [blocks] needs ratio", self.name))?,
+                    topk: n["topk"],
+                    index: word("index"),
+                })
+            }
+        };
         Ok(Some(crate::scan::Geometry {
+            blocks,
             query,
             layers: s["layers"],
             kv_rows: s["kv_rows"],
@@ -751,15 +780,32 @@ impl Description {
                     Some("pairs") => RopeStyle::Pairs,
                     Some(o) => return Err(format!("{}: rope style {o:?} is not halves or pairs", self.name)),
                 };
-                RowBody::SpanRope { row: n["row"], head: n["head"], offset: n["offset"], rot: n["rot"], style }
+                let invert = match self.args.get("invert") {
+                    None => false,
+                    Some(Value::Boolean(b)) => *b,
+                    Some(o) => return Err(format!("{}: invert is {o}, not a boolean", self.name)),
+                };
+                RowBody::SpanRope { row: n["row"], head: n["head"], offset: n["offset"], rot: n["rot"], style, invert }
             }
             "state_write" => {
                 let n = self.sizes(shape, &self.args, &["src_row", "src_offset", "layers", "rows", "width"], "[args]")?;
-                RowBody::StateWrite { src_row: n["src_row"], src_offset: n["src_offset"], layers: n["layers"], rows: n["rows"], width: n["width"] }
+                let stride = match self.args.get("stride") {
+                    None => n["width"],
+                    Some(v) => self.size(shape, v, "stride")?,
+                };
+                RowBody::StateWrite { src_row: n["src_row"], src_offset: n["src_offset"], layers: n["layers"], rows: n["rows"], width: n["width"], stride }
             }
             "index_topk" => {
                 let n = self.sizes(shape, &self.args, &["heads", "dim", "topk", "max_keys", "q_row", "q_offset", "w_row", "w_offset", "out_row", "layers"], "[args]")?;
                 RowBody::IndexTopk { heads: n["heads"], dim: n["dim"], topk: n["topk"], max_keys: n["max_keys"], q_row: n["q_row"], q_offset: n["q_offset"], w_row: n["w_row"], w_offset: n["w_offset"], out_row: n["out_row"], layers: n["layers"] }
+            }
+            "head_rms" => {
+                let n = self.sizes(shape, &self.args, &["row", "head", "offset", "width"], "[args]")?;
+                RowBody::HeadRms { row: n["row"], head: n["head"], offset: n["offset"], width: n["width"], eps: self.number(shape, "eps")? as f32 }
+            }
+            "block_pool" => {
+                let n = self.sizes(shape, &self.args, &["dim", "rot", "layers", "raw_width", "gate_offset"], "[args]")?;
+                RowBody::BlockPool { dim: n["dim"], rot: n["rot"], layers: n["layers"], raw_width: n["raw_width"], gate_offset: n["gate_offset"], eps: self.number(shape, "eps")? as f32 }
             }
             "layernorm_segment" => {
                 let n = self.sizes(shape, &self.args, &["width", "row", "head", "offset"], "[args]")?;
@@ -868,7 +914,7 @@ impl Description {
         if self.family != "compose" && self.family != "scan_attention" && !ROW_FAMILIES.contains(&self.family.as_str()) && !SEQ_FAMILIES.contains(&self.family.as_str()) && (self.rows.is_some() || !self.param.is_empty() || !self.consts.is_empty() || !self.stage.is_empty()) {
             return Err(format!("{}: only family compose takes rows, param, const and stage", self.name));
         }
-        if self.family != "scan_attention" && (self.geometry.is_some() || !self.query.is_empty()) {
+        if self.family != "scan_attention" && (self.geometry.is_some() || !self.query.is_empty() || self.blocks.is_some()) {
             return Err(format!("{}: only family scan_attention takes [geometry] and [[query]]", self.name));
         }
         if self.family != "recurrence" && (self.recurrence.is_some() || !self.input.is_empty()) {
