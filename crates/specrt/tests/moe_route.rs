@@ -35,7 +35,15 @@ fn bf16(v: f32) -> u16 {
     (v.to_bits() >> 16) as u16
 }
 
-fn route(hash: bool) -> (Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>) {
+struct Routed {
+    idx: Vec<i32>,
+    coef: Vec<f32>,
+    ids: Vec<i32>,
+    table: Vec<f32>,
+    logits: Vec<f32>,
+}
+
+fn route(hash: bool) -> Routed {
     let spec = spec(hash);
     let (h, e, k, tokens) = (spec.dims.hidden, 8usize, 2usize, 5usize);
     let ctx = CudaContext::new(0).unwrap();
@@ -68,7 +76,7 @@ fn route(hash: bool) -> (Vec<i32>, Vec<f32>, Vec<i32>, Vec<f32>, Vec<f32>) {
     b.arg(&logits).arg(&bd).arg(&td).arg(&idsd).arg(&hashed).arg(&mut idx).arg(&mut coef).arg(&first);
     unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (32, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
     stream.synchronize().unwrap();
-    (stream.clone_dtoh(&idx).unwrap(), stream.clone_dtoh(&coef).unwrap(), ids, table.iter().map(|v| *v as f32).collect(), stream.clone_dtoh(&logits).unwrap().into_iter().collect())
+    Routed { idx: stream.clone_dtoh(&idx).unwrap(), coef: stream.clone_dtoh(&coef).unwrap(), ids, table: table.iter().map(|v| *v as f32).collect(), logits: stream.clone_dtoh(&logits).unwrap() }
 }
 
 fn sigmoid(v: f32) -> f32 {
@@ -78,7 +86,7 @@ fn sigmoid(v: f32) -> f32 {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn hash_layers_take_the_experts_from_the_token_table_and_weight_them_by_the_scores() {
-    let (idx, coef, ids, table, logits) = route(true);
+    let Routed { idx, coef, ids, table, logits } = route(true);
     let (e, k, scale) = (8usize, 2usize, 1.5f32);
     for (t, id) in ids.iter().enumerate() {
         let want: Vec<i32> = (0..k).map(|j| table[*id as usize * k + j] as i32).collect();
@@ -96,7 +104,7 @@ fn hash_layers_take_the_experts_from_the_token_table_and_weight_them_by_the_scor
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn without_a_hash_table_the_same_kernel_selects_by_score_plus_bias() {
-    let (idx, _, ids, table, logits) = route(false);
+    let Routed { idx, ids, table, logits, .. } = route(false);
     let (e, k) = (8usize, 2usize);
     let differs = ids.iter().enumerate().any(|(t, id)| (0..k).any(|j| idx[t * (k + 1) + j] != table[*id as usize * k + j] as i32));
     assert!(differs, "learned routing should not equal the table for every token");
