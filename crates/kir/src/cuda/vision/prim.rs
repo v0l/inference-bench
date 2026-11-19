@@ -54,6 +54,84 @@ pub fn to_f16_kernel() -> String {
     "extern \"C\" __global__ void vis_to_f16(bf16_t* w, int n) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i < n) w[i] = (bf16_t)f16_bits(bf(w[i]));\n}\n\n".to_string()
 }
 
+pub fn row_moments(var: &str, row: &str, width: &str, threads: &str) -> String {
+    format!(
+        "    float {var} = 0.0f, {var}2 = 0.0f;
+    for (int i = threadIdx.x; i < {width}; i += {threads}) {{
+        float v = {row}[i];
+        {var} += v;
+        {var}2 += v * v;
+    }}
+"
+    )
+}
+
+pub fn warp_pair(var: &str) -> String {
+    format!(
+        "    for (int o = 16; o > 0; o >>= 1) {{
+        {var} += __shfl_xor_sync(0xffffffff, {var}, o);
+        {var}2 += __shfl_xor_sync(0xffffffff, {var}2, o);
+    }}
+"
+    )
+}
+
+pub fn lane_share(var: &str, red: &str) -> String {
+    let mut s = String::from("    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;\n");
+    s += &format!("    if (lane == 0) {{\n        {red}[0][warp] = {var};\n        {red}[1][warp] = {var}2;\n    }}\n");
+    s += &format!("    __syncthreads();\n    {var} = 0.0f;\n    {var}2 = 0.0f;\n    for (int i = 0; i < blockDim.x / 32; i++) {{\n        {var} += {red}[0][i];\n        {var}2 += {red}[1][i];\n    }}\n");
+    s
+}
+
+pub fn gather4(var: &str, table: &str, taps: &str, weights: &str, hidden: &str, threads: &str) -> String {
+    format!(
+        "    for (int d = threadIdx.x; d < {hidden}; d += {threads}) {{
+        float {var} = 0.0f;
+        for (int k = 0; k < 4; k++) {var} += {weights}[k] * {table}[(size_t){taps}[k] * {hidden} + d];
+"
+    )
+}
+
+pub fn tap_rotate(half: &str, quarter: &str, tap_true: &str, tap_false: &str) -> String {
+    format!(
+        "                    int i = d < {half} ? d : d - {half};
+                    int fi = i < {quarter} ? i : i - {quarter};
+                    float inv = exp2f(-(2.0f * fi / (float){half}) * log2f(theta));
+                    float angle = (float)(i < {quarter} ? {tap_true} : {tap_false}) * inv;
+                    float s, c;
+                    sincosf(angle, &s, &c);
+                    float other = d < {half} ? src[d + {half}] : src[d - {half}];
+                    v = d < {half} ? v * c - other * s : v * c + other * s;
+"
+    )
+}
+
+pub fn layernorm_apply(row: &str, width: &str, threads: &str, mean: &str, inv: &str) -> String {
+    format!(
+        "    for (int i = threadIdx.x * 2; i < {width}; i += {threads} * 2) {{
+        float a = ({row}[i] - {mean}) * {inv} * bf(w[i]) + bf(b[i]);
+        float c = ({row}[i + 1] - {mean}) * {inv} * bf(w[i + 1]) + bf(b[i + 1]);
+        store_act2(hi, lo, base + i, a, c);
+    }}
+"
+    )
+}
+
+pub fn pool_stats(var: &str, row: &str, width: &str, threads: &str, red: &str, mean: &str, inv: &str) -> String {
+    format!(
+        "            float {var} = 0.0f;
+            for (int i = threadIdx.x; i < {width}; i += {threads}) {var} += {row}[i];
+            float {mean} = block_sum({var}, {red}) / {width};
+            float {var}2 = 0.0f;
+            for (int i = threadIdx.x; i < {width}; i += {threads}) {{
+                float d = {row}[i] - {mean};
+                {var}2 += d * d;
+            }}
+            float {inv} = rsqrtf(block_sum({var}2, {red}) / {width} + eps);
+"
+    )
+}
+
 pub fn cp_async() -> String {
     let mut s = forceinline(
         "void",

@@ -1,6 +1,8 @@
 use super::prim::{self, Reduce};
+use crate::attention::AttentionShape;
+use crate::rope;
 
-pub fn body() -> String {
+pub fn body(_s: &AttentionShape) -> String {
     [
         r##"__device__ __forceinline__ float cap_score(float s) {
     return SOFTCAP > 0.0f ? SOFTCAP * tanhf(s / SOFTCAP) : s;
@@ -35,95 +37,11 @@ __device__ __forceinline__ void attn_split(float v, unsigned& hi, unsigned& lo) 
     lo = attn_bits(v - attn_float(hi));
 }
 
-__device__ __forceinline__ size_t kv_slot(const int* block_table, int layer, int kv_head, int pos) {
-    return (((size_t)block_table[pos / PAGE] * ATTN_LAYERS + layer) * KV_HEADS + kv_head) * PAGE + pos % PAGE;
-}
-
-constexpr size_t KV_ROWS_PER_LAYER = (size_t)KV_HEADS * PAGE;
-constexpr size_t KV_RAW_LAYER_BYTES = KV_ROWS_PER_LAYER * HEAD_DIM * 2 * KV_PLANES;
-constexpr size_t KV_Q_LAYER_BYTES = KV_ROWS_PER_LAYER * (HEAD_DIM + 4);
-constexpr size_t KV_BLOCK_BYTES = KV_F16_LAYERS * KV_RAW_LAYER_BYTES + (ATTN_LAYERS - KV_F16_LAYERS) * KV_Q_LAYER_BYTES;
-
-__device__ __forceinline__ bool kv_q(int layer) {
-    return KV_FP8 && layer >= KV_F16_LAYERS;
-}
-
-__device__ __forceinline__ size_t kv_layer_base(const int* block_table, int layer, int pos) {
-    size_t within = layer < KV_F16_LAYERS ? (size_t)layer * KV_RAW_LAYER_BYTES
-                                          : KV_F16_LAYERS * KV_RAW_LAYER_BYTES + (size_t)(layer - KV_F16_LAYERS) * KV_Q_LAYER_BYTES;
-    return (size_t)block_table[pos / PAGE] * KV_BLOCK_BYTES + within;
-}
-
-__device__ __forceinline__ bf16_t* kv_row(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
-    if (KV_FP8) {
-        size_t row = (size_t)kv_head * PAGE + pos % PAGE;
-        size_t base = kv_layer_base(block_table, layer, pos);
-        return (bf16_t*)((unsigned char*)cache + base + row * (kv_q(layer) ? HEAD_DIM : HEAD_DIM * 2 * KV_PLANES));
-    }
-    return cache + kv_slot(block_table, layer, kv_head, pos) * KV_PLANES * HEAD_DIM;
-}
-
-__device__ __forceinline__ const bf16_t* kv_row(const bf16_t* cache, const int* block_table, int layer, int kv_head,
-                                                int pos) {
-    return kv_row(const_cast<bf16_t*>(cache), block_table, layer, kv_head, pos);
-}
-
-__device__ __forceinline__ float* kv_scale_ptr(bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
-    size_t row = (size_t)kv_head * PAGE + pos % PAGE;
-    return (float*)((unsigned char*)cache + kv_layer_base(block_table, layer, pos) + KV_ROWS_PER_LAYER * HEAD_DIM + row * 4);
-}
-
-__device__ __forceinline__ float kv_scale(const bf16_t* cache, const int* block_table, int layer, int kv_head, int pos) {
-    if (!kv_q(layer)) return 1.0f;
-    return *kv_scale_ptr(const_cast<bf16_t*>(cache), block_table, layer, kv_head, pos);
-}
-
-__device__ __forceinline__ const int* seq_table(const int* block_table, const int* slots, int row, int pages) {
-    return block_table + (size_t)slots[row] * pages;
-}
-
-__device__ __forceinline__ float kv_at(const bf16_t* row, int d, float sc, bool q) {
-    if (q) return e4m3_to_f32(((const unsigned char*)row)[d]) * sc;
-    float v = attn_float(row[d]);
-    return KV_PLANES == 2 ? v + attn_float(row[HEAD_DIM + d]) : v;
-}
-
-__device__ __forceinline__ float4 kv_at4(const bf16_t* row, int d, float sc, bool q) {
-    if (q) {
-        unsigned w = *(const unsigned*)((const unsigned char*)row + d);
-        return make_float4(e4m3_to_f32(w & 0xffu) * sc, e4m3_to_f32((w >> 8) & 0xffu) * sc,
-                           e4m3_to_f32((w >> 16) & 0xffu) * sc, e4m3_to_f32(w >> 24) * sc);
-    }
-    uint2 h = *(const uint2*)(row + d);
-    float4 v = make_float4(attn_float(h.x), attn_float(h.x >> 16), attn_float(h.y), attn_float(h.y >> 16));
-    if (KV_PLANES == 2) {
-        uint2 l = *(const uint2*)(row + HEAD_DIM + d);
-        v.x += attn_float(l.x);
-        v.y += attn_float(l.x >> 16);
-        v.z += attn_float(l.y);
-        v.w += attn_float(l.y >> 16);
-    }
-    return v;
-}
-
-__device__ __forceinline__ int mrope_axis(int i) {
-    if (MROPE_INTERLEAVED) {
-        if (i % 3 == 1 && i < 3 * MROPE_S1) return 1;
-        if (i % 3 == 2 && i < 3 * MROPE_S2) return 2;
-        return 0;
-    }
-    if (i < MROPE_S0) return 0;
-    if (i < MROPE_S0 + MROPE_S1) return 1;
-    return 2;
-}
-
-__device__ __forceinline__ float rope_position(const int* mm_meta, const int* mm_table, int mm_stride, int slot, int idx, int i) {
-    if (!MROPE) return (float)idx;
-    if (idx < mm_meta[2 * slot]) return (float)mm_table[((size_t)slot * mm_stride + idx) * 3 + mrope_axis(i)];
-    return (float)(idx + mm_meta[2 * slot + 1]);
-}
-
-__device__ __forceinline__ int span_end(const int* mm_meta, const int* bidi, int mm_stride, int slot, int idx) {
+"##.to_string(),
+        prim::kv_addr(),
+        rope::mrope_axis_fn(),
+        rope::position_fn(),
+        r##"__device__ __forceinline__ int span_end(const int* mm_meta, const int* bidi, int mm_stride, int slot, int idx) {
     if (!BIDI) return idx;
     return idx < mm_meta[2 * slot] ? max(idx, bidi[(size_t)slot * mm_stride + idx]) : idx;
 }
@@ -149,12 +67,9 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     if (d < HEAD_DIM) vec[d] = v;
     __syncthreads();
     if (!NOPE[layer] && (is_q || is_k) && d < ROT) {
-        int fi = d < ROT_HALF ? d : d - ROT_HALF;
-        float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi, layer);
-        float c = cosf(angle) * ROPE_MSCALE;
-        float s = sinf(angle) * ROPE_MSCALE;
-        v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
-    }
+"##.to_string(),
+        rope::rotate_head(),
+        r##"    }
     float row_scale = 1.0f;
     if (kv_q(layer) && !is_q) {
         float amax = "##.to_string(),

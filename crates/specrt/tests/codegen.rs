@@ -23,10 +23,7 @@ const VERBATIM_LINEAR: &[(&str, &str)] = &[
     ("cuda/linear/chunk_prep.rs", "triangular solve and WY prep is verbatim text, to port onto tile prims (#794)"),
 ];
 
-const VERBATIM_ATTENTION: &[(&str, &str)] = &[
-    ("cuda/attention/rope.rs", "verbatim text, to port onto kir::rope (#791)"),
-    ("cuda/attention/common.rs", "norm_rope_head and KV address helpers are verbatim text, to port onto kir::rope and a layout address prim (#791)"),
-];
+const VERBATIM_ATTENTION: &[(&str, &str)] = &[];
 
 const PRIM_LIBRARY_ATTENTION: &[(&str, &str)] = &[
     ("cuda/attention/mma.rs", "mma fragment and exp2 prims, device functions by design"),
@@ -495,26 +492,14 @@ fn kir_kernels_follow_the_target() {
     assert_ne!(kir::module_hash(&tree), kir::module_hash(&sub));
 }
 
-const VERBATIM_VISION: &[(&str, &str)] = &[
-    ("vis_rope_pack", "verbatim text, to port onto kir::rope (#792)"),
-    ("vis_layernorm", "verbatim text, to port onto the block reduction prims (#792)"),
-    ("vis_pool", "verbatim text, to port onto the block reduction prims (#792)"),
-    ("vis_pos", "verbatim text, to port onto a gather prim (#792)"),
-    ("vis_split", "verbatim text, to port onto the split store prim (#792)"),
-    ("vis_to_f16", "one-line elementwise kernel in prim.rs (#792)"),
-];
-
-const PRIM_VISION: &[(&str, &[&str])] = &[("vis_mma", &["@LOAD_STAGE@", "@MAINLOOP@"]), ("vis_flash", &["@QK@", "@SOFTMAX@", "@PV@", "@PACK_PROBS@"])];
-
 #[test]
-fn vision_builders_use_prims_unless_listed() {
+fn vision_builders_use_prims() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../kir/src/cuda/vision");
     let text = std::fs::read_to_string(dir.join("kernels.rs")).unwrap();
     let prim = std::fs::read_to_string(dir.join("prim.rs")).unwrap();
     assert!(text.contains("attn::zero_scores") && text.contains("attn::rescale_acc") && text.contains("attn::pack_rows") && text.contains("attn::online_softmax_with"), "vision builders must call the shared attention prims");
-    let all = format!("{text}{prim}");
     let mut found = Vec::new();
-    for line in all.lines() {
+    for line in text.lines().chain(prim.lines()) {
         if let Some(rest) = line.split("__global__ void ").nth(1) {
             let rest = rest.strip_prefix("__launch_bounds__(GM_THREADS) ").or_else(|| rest.strip_prefix("__launch_bounds__(32 * AT_WARPS) ")).unwrap_or(rest);
             found.push(rest.split('(').next().unwrap().to_string());
@@ -522,11 +507,12 @@ fn vision_builders_use_prims_unless_listed() {
     }
     assert!(found.len() >= 8, "{found:?}");
     for name in &found {
-        let listed = VERBATIM_VISION.iter().any(|(n, _)| n == name);
-        let prim_built = PRIM_VISION.iter().find(|(n, _)| n == name).is_some_and(|(_, slots)| slots.iter().all(|s| text.contains(s)));
-        assert!(listed || prim_built, "{name} is verbatim kernel text: build it from prims or list it with a reason and issue");
-    }
-    for (n, why) in VERBATIM_VISION {
-        assert!(found.iter().any(|f| f == n) && why.contains('#'), "stale allowlist entry {n}");
+        let section: String = text.split("extern \"C\" __global__ void").skip(1).find(|s| s.split('\n').next().is_some_and(|l| l.contains(&format!(" {name}(")))).unwrap_or("").to_string();
+        if section.is_empty() {
+            assert!(prim.contains(&format!("void {name}(")), "{name} is not a builder in kernels.rs or a prim in prim.rs");
+            continue;
+        }
+        let templated = section.contains("@") || section.contains("{{") || section.contains("prim::");
+        assert!(templated, "{name} is verbatim kernel text: build it from prims");
     }
 }

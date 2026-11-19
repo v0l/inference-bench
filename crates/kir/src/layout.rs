@@ -56,6 +56,72 @@ pub fn tuple(v: Vec<Nest>) -> Nest {
     Nest::Tuple(v)
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Term {
+    pub coeff: u64,
+    pub coord: String,
+}
+
+impl Term {
+    pub fn one(coord: &str) -> Term {
+        Term { coeff: 1, coord: coord.to_string() }
+    }
+
+    pub fn by(coeff: u64, coord: &str) -> Term {
+        Term { coeff, coord: coord.to_string() }
+    }
+
+    pub fn times(coord: &str, coeff: u64) -> Term {
+        Term { coeff, coord: format!("{coord} * {coeff}") }
+    }
+
+    fn render(&self, dialect: Dialect) -> String {
+        let u = if dialect == Dialect::Wgsl { "u" } else { "" };
+        if self.coeff == 1 {
+            return format!("{}{u}", self.coord);
+        }
+        if self.coord.contains(" * ") {
+            return self.coord.clone();
+        }
+        format!("{}{u} * {}{u}", self.coeff, self.coord)
+    }
+}
+
+pub fn offset(dialect: Dialect, terms: &[Term]) -> String {
+    let parts: Vec<String> = terms.iter().map(|t| t.render(dialect)).collect();
+    parts.join(" + ")
+}
+
+pub fn named(v: u64, names: &[(u64, &str)]) -> String {
+    names
+        .iter()
+        .find(|(n, _)| *n == v)
+        .map(|(_, s)| s.to_string())
+        .unwrap_or_else(|| v.to_string())
+}
+
+pub fn addr_chain(dialect: Dialect, base: &str, steps: &[(&str, &str)]) -> String {
+    let (cast, suf) = match dialect {
+        Dialect::Cuda => ("(size_t)", ""),
+        Dialect::Wgsl => ("", "u"),
+    };
+    let mut cur = format!("{cast}{base} * {}{suf} + {}{suf}", steps[0].0, steps[0].1);
+    for (f, t) in &steps[1..] {
+        cur = format!("({cur}) * {f}{suf} + {t}{suf}");
+    }
+    format!("({cur})")
+}
+
+pub fn addr_regions(dialect: Dialect, count: &str, first: &str, second: &str, coord: &str, indent: usize) -> String {
+    let (cast, pad) = match dialect {
+        Dialect::Cuda => ("(size_t)", " ".repeat(indent)),
+        Dialect::Wgsl => ("", "\n".to_string()),
+    };
+    format!(
+        "{coord} < {count} ? {cast}{coord} * {first}\n{pad}: {count} * {first} + {cast}({coord} - {count}) * {second}"
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     Cuda,

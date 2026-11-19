@@ -23,6 +23,7 @@ fn slots(k: &VisionKernel) -> Vec<(&'static str, String)> {
         ("PACK_PROBS", format!("{}{}", attn::pack_rows("            ", "ph", "pack_f16_hi"), attn::pack_rows("            ", "pl", "pack_f16_lo"))),
         ("PV", prim::pv_accumulate()),
         ("INV_L", prim::inv_l()),
+        ("TAP_ROTATE", prim::tap_rotate("half", "quarter", "ph", "pw")),
     ]
 }
 
@@ -99,72 +100,45 @@ extern "C" __global__ void __launch_bounds__(GM_THREADS) vis_mma(const bf16_t* a
     )
 }
 
-pub fn norm_kernels(k: &VisionKernel) -> String {
-    fill(
-        r##"
-extern "C" __global__ void vis_split(const float* x, bf16_t* hi, bf16_t* lo, int n) {
+pub fn norm_kernels() -> String {
+    format!(
+            r#"
+extern "C" __global__ void vis_split(const float* x, bf16_t* hi, bf16_t* lo, int n) {{
     int i = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     if (i >= n) return;
     float2 v = *(const float2*)(x + i);
     store_act2(hi, lo, i, v.x, v.y);
-}
+}}
 
-extern "C" __global__ void vis_layernorm(const float* x, const bf16_t* w, const bf16_t* b, bf16_t* hi, bf16_t* lo, int width, float eps) {
+extern "C" __global__ void vis_layernorm(const float* x, const bf16_t* w, const bf16_t* b, bf16_t* hi, bf16_t* lo, int width, float eps) {{
     __shared__ float red[2][32];
     const float* row = x + (size_t)blockIdx.x * width;
-    float s = 0.0f, s2 = 0.0f;
-    for (int i = threadIdx.x; i < width; i += blockDim.x) {
-        float v = row[i];
-        s += v;
-        s2 += v * v;
-    }
-    for (int o = 16; o > 0; o >>= 1) {
-        s += __shfl_xor_sync(0xffffffff, s, o);
-        s2 += __shfl_xor_sync(0xffffffff, s2, o);
-    }
-    int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
-    if (lane == 0) {
-        red[0][warp] = s;
-        red[1][warp] = s2;
-    }
-    __syncthreads();
-    s = 0.0f;
-    s2 = 0.0f;
-    for (int i = 0; i < blockDim.x / 32; i++) {
-        s += red[0][i];
-        s2 += red[1][i];
-    }
-    float mean = s / width;
+{moments}{warp}{share}    float mean = s / width;
     float var = s2 / width - mean * mean;
     float inv = rsqrtf(fmaxf(var, 0.0f) + eps);
     size_t base = (size_t)blockIdx.x * width;
-    for (int i = threadIdx.x * 2; i < width; i += blockDim.x * 2) {
-        float a = (row[i] - mean) * inv * bf(w[i]) + bf(b[i]);
-        float c = (row[i + 1] - mean) * inv * bf(w[i + 1]) + bf(b[i + 1]);
-        store_act2(hi, lo, base + i, a, c);
-    }
-}
+{apply}}}
 
-"##,
-        &slots(k),
+"#,
+            moments = prim::row_moments("s", "row", "width", "blockDim.x"),
+            warp = prim::warp_pair("s"),
+            share = prim::lane_share("s", "red"),
+            apply = prim::layernorm_apply("row", "width", "blockDim.x", "mean", "inv"),
     )
 }
 
-pub fn pos_kernel(k: &VisionKernel) -> String {
-    fill(
-        r##"extern "C" __global__ void vis_pos(const float* table, const int* taps, const float* weights, float* out, int hidden) {
+pub fn pos_kernel() -> String {
+    format!(
+            r#"extern "C" __global__ void vis_pos(const float* table, const int* taps, const float* weights, float* out, int hidden) {{
     int tok = blockIdx.x;
     const int* ti = taps + tok * 4;
     const float* tw = weights + tok * 4;
-    for (int d = threadIdx.x; d < hidden; d += blockDim.x) {
-        float v = 0.0f;
-        for (int k = 0; k < 4; k++) v += tw[k] * table[(size_t)ti[k] * hidden + d];
-        out[(size_t)tok * hidden + d] = v;
-    }
-}
+{gather}        out[(size_t)tok * hidden + d] = v;
+    }}
+}}
 
-"##,
-        &slots(k),
+"#,
+            gather = prim::gather4("v", "table", "ti", "tw", "hidden", "blockDim.x"),
     )
 }
 
@@ -189,15 +163,7 @@ extern "C" __global__ void vis_rope_pack(const float* qkv, const int* hw, bf16_t
             if (d < head_dim) {
                 v = src[d];
                 if (part < 2 && theta > 0.0f) {
-                    int i = d < half ? d : d - half;
-                    int fi = i < quarter ? i : i - quarter;
-                    float inv = exp2f(-(2.0f * fi / (float)half) * log2f(theta));
-                    float angle = (float)(i < quarter ? ph : pw) * inv;
-                    float s, c;
-                    sincosf(angle, &s, &c);
-                    float other = d < half ? src[d + half] : src[d - half];
-                    v = d < half ? v * c - other * s : v * c + other * s;
-                }
+@TAP_ROTATE@                }
             }
             unsigned b = f16_bits(v);
             hi[d] = (bf16_t)b;
@@ -300,10 +266,10 @@ extern "C" __global__ void __launch_bounds__(32 * AT_WARPS) vis_flash(const bf16
     )
 }
 
-pub fn pool_kernel(k: &VisionKernel) -> String {
-    fill(
-        r##"extern "C" __global__ void vis_pool(const float* x, const bf16_t* w, const bf16_t* b, const float* soft, bf16_t* hi, bf16_t* lo,
-                                    int hidden, int side, int kernel, int out_side, float eps, float soft_eps) {
+pub fn pool_kernel() -> String {
+    format!(
+            r#"extern "C" __global__ void vis_pool(const float* x, const bf16_t* w, const bf16_t* b, const float* soft, bf16_t* hi, bf16_t* lo,
+                                    int hidden, int side, int kernel, int out_side, float eps, float soft_eps) {{
     extern __shared__ float acc[];
     __shared__ float red[32];
     int o = blockIdx.x;
@@ -313,34 +279,25 @@ pub fn pool_kernel(k: &VisionKernel) -> String {
     int oy = local / out_side, ox = local % out_side;
     for (int i = threadIdx.x; i < hidden; i += blockDim.x) acc[i] = 0.0f;
     __syncthreads();
-    for (int dy = 0; dy < kernel; dy++) {
-        for (int dx = 0; dx < kernel; dx++) {
+    for (int dy = 0; dy < kernel; dy++) {{
+        for (int dx = 0; dx < kernel; dx++) {{
             const float* row = x + (size_t)(base + (oy * kernel + dy) * side + ox * kernel + dx) * hidden;
-            float s = 0.0f;
-            for (int i = threadIdx.x; i < hidden; i += blockDim.x) s += row[i];
-            float mean = block_sum(s, red) / hidden;
-            float s2 = 0.0f;
-            for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-                float d = row[i] - mean;
-                s2 += d * d;
-            }
-            float inv = rsqrtf(block_sum(s2, red) / hidden + eps);
-            for (int i = threadIdx.x; i < hidden; i += blockDim.x) acc[i] += (row[i] - mean) * inv * bf(w[i]) + bf(b[i]);
-        }
-    }
+{stats}            for (int i = threadIdx.x; i < hidden; i += blockDim.x) acc[i] += (row[i] - mean) * inv * bf(w[i]) + bf(b[i]);
+        }}
+    }}
     float scale = 1.0f / (kernel * kernel);
     float ss = 0.0f;
-    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {{
         acc[i] *= scale;
         ss += acc[i] * acc[i];
-    }
+    }}
     float rinv = rsqrtf(block_sum(ss, red) / hidden + soft_eps);
     __syncthreads();
     size_t at = (size_t)o * hidden;
     for (int i = threadIdx.x * 2; i < hidden; i += blockDim.x * 2) store_act2(hi, lo, at + i, acc[i] * rinv * soft[i], acc[i + 1] * rinv * soft[i + 1]);
-}
-"##,
-        &slots(k),
+}}
+"#,
+            stats = prim::pool_stats("s", "row", "hidden", "blockDim.x", "red", "mean", "inv"),
     )
 }
 

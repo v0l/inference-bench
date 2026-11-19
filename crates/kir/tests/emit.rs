@@ -234,6 +234,40 @@ mod layouts {
         let l = Layout::new(tuple(vec![leaf(4), tuple(vec![leaf(2), leaf(3)])]), tuple(vec![leaf(1), tuple(vec![leaf(12), leaf(4)])])).unwrap();
         assert_eq!(l.expr(&["a", "b"], Dialect::Cuda).unwrap(), "a + (b % 2) * 12 + (b / 2) * 4");
     }
+
+    #[test]
+    fn term_offsets_join_and_cast() {
+        let cuda = Dialect::Cuda;
+        let wgsl = Dialect::Wgsl;
+        assert_eq!(kir::layout::offset(cuda, &[kir::layout::Term::one("a")]), "a");
+        assert_eq!(kir::layout::offset(wgsl, &[kir::layout::Term::one("a")]), "au");
+        assert_eq!(kir::layout::offset(cuda, &[kir::layout::Term::by(3, "a"), kir::layout::Term::one("b")]), "3 * a + b");
+        assert_eq!(kir::layout::offset(wgsl, &[kir::layout::Term::by(3, "a"), kir::layout::Term::one("b")]), "3u * au + bu");
+        assert_eq!(kir::layout::offset(cuda, &[kir::layout::Term::times("a", 3)]), "a * 3");
+    }
+
+    #[test]
+    fn named_picks_the_constant_over_the_number() {
+        assert_eq!(kir::layout::named(16, &[(16, "PAGE"), (256, "HEAD_DIM")]), "PAGE");
+        assert_eq!(kir::layout::named(300, &[(16, "PAGE")]), "300");
+    }
+
+    #[test]
+    fn addr_chain_nests_horner_style() {
+        let cuda = Dialect::Cuda;
+        assert_eq!(kir::layout::addr_chain(cuda, "a", &[("2", "b")]), "((size_t)a * 2 + b)");
+        assert_eq!(kir::layout::addr_chain(cuda, "a", &[("2", "b"), ("3", "c")]), "(((size_t)a * 2 + b) * 3 + c)");
+        assert_eq!(kir::layout::addr_chain(Dialect::Wgsl, "a", &[("2", "b")]), "(a * 2u + bu)");
+    }
+
+    #[test]
+    fn addr_regions_split_a_layer_range() {
+        let got = kir::layout::addr_regions(Dialect::Cuda, "KV_F16_LAYERS", "KV_RAW_LAYER_BYTES", "KV_Q_LAYER_BYTES", "layer", 0);
+        assert_eq!(
+            got,
+            "layer < KV_F16_LAYERS ? (size_t)layer * KV_RAW_LAYER_BYTES\n: KV_F16_LAYERS * KV_RAW_LAYER_BYTES + (size_t)(layer - KV_F16_LAYERS) * KV_Q_LAYER_BYTES"
+        );
+    }
 }
 
 #[test]

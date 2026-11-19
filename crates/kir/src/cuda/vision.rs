@@ -21,11 +21,11 @@ pub fn emit_vision(k: &VisionKernel) -> Result<String, VisionError> {
     out += &prim::fast_exp2();
     out += &prim::swz4();
     out += &kernels::gemm_kernel(k);
-    out += &kernels::norm_kernels(k);
-    out += &kernels::pos_kernel(k);
+    out += &kernels::norm_kernels();
+    out += &kernels::pos_kernel();
     out += &format!("constexpr int AT_HDP = {};\n", k.head_pad());
     out += &kernels::attention_kernels(k);
     out += &prim::block_sum();
-    out += &kernels::pool_kernel(k);
+    out += &kernels::pool_kernel();
     Ok(out)
 }
