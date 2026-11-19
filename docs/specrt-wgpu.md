@@ -419,4 +419,4 @@ Each fused GEMV workgroup (4 rows) redoes the norm or activation over the whole 
 | Llama-3.2-1B Q4_K_M | 1,021 / 1,733 = 0.589 | 974 / 1,755 = 0.555 | 87.5 / 144.7 = 0.604 |
 | Qwen2.5-7B Q4_K_M | 161.4 / 274.0 = 0.589 | 156.2 / 269.1 = 0.580 | 17.65 / 28.0 = 0.630 |
 
-7B load median in the full script is 5.13 s (5.49, 4.29, 5.13). The `madvise` win showed in back-to-back runs (3.8 to 3.0 s) but not in this script, where each 7B run follows a llama.cpp run that has evicted the page cache; the cold-cache load is the 4.3 to 5.5 s here. 0.5x now holds on every cell; 0.7x holds on none of the prefill cells and on bf16 decode only.
+7B load median in the full script is 5.13 s (5.49, 4.29, 5.13). The `madvise` win showed in back-to-back runs (3.8 to 3.0 s) but not in this script, where each 7B run follows a llama.cpp run (page cache state not controlled), giving 4.3 to 5.5 s. 0.5x now holds on every cell; 0.7x holds on none of the prefill cells and on bf16 decode only.
