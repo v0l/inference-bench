@@ -362,3 +362,34 @@ wgsl tests: 21/21 ignored GPU tests plus the 3 normal ones pass on the Mac (gree
 | Qwen2.5-7B Q4_K_M | 147.5 / 273.8 = 0.539 (0.474) | 143.4 / 269.0 = 0.533 (0.472) | 17.65 / 28.0 = 0.630 (0.587) |
 
 Pass 4 ratios in brackets. 0.5x is met on every cell except Qwen3-0.6B Q4_K_M prefill 1,024 (0.470). The decode gain is from unchecked bounds in the GEMV and flash kernels. The 7B load stayed 6.1 s; the Q4_K small-decode dispatch count and the `madvise`/`NoCopy` load idea were not profiled in this pass.
+
+## Mac speed work 6 (#827)
+
+### 1. Workgroup zero-fill
+
+Already off: `PipelineCompilationOptions::zero_initialize_workgroup_memory: false` is passed through wgpu-hal 30 to naga's MSL `Options::zero_initialize_workgroup_memory`, so the `sh = {}` pass is not emitted for specrt kernels. Turning it back on (temporary env switch) on Qwen3-0.6B Q4_K_M, 3 alternating rounds: prefill 128 1,596 to 345 tok/s, prefill 1,024 1,426 to 365 tok/s, decode 116 to 114. The 20% from #825 was measured on a standalone naga MSL without that option. Nothing to file upstream.
+
+### 2. Tile-load code
+
+Rewrote `linear_coop` so the per-quad token row, shared-memory offset, x offset and token guard are computed once before the k loop and read from small private arrays inside it. Measured against the unmodified binary, 2 alternating rounds, Qwen3-0.6B Q4_K_M: prefill 128 1,525 against 1,598, prefill 1,024 1,310 against 1,426 tok/s. Slower (the arrays cost registers), reverted. Metal already hoists the index maths; the load phase is bound by the branchy dequant, as noted in work 5.
+
+### 3. Qwen3-0.6B Q4_K_M prefill 1,024
+
+Unchanged at 0.470. Neither 1 nor 2 moves it.
+
+### 4. Small decode and 7B load
+
+Q4_K_M 0.6B decode dispatches (counted with a trace), per token: 57 rmsnorm, 28 rope, 28 swiglu, 28 flash_decode, 63 `linear_sg*`, 1 argmax, about 205. Skipping kernels (timing only): rmsnorm 116.8 to 128.2 tok/s, rope+swiglu+rmsnorm 140.3. So rmsnorm plus rope plus swiglu are a quarter of the token time, and fusing them into the neighbouring linear or attention kernels is the next lever (not done here).
+
+7B load: `madvise(WILLNEED)` on the GGUF mmap, 3 paired rounds, load seconds without to with: 5.66 to 2.77, 3.82 to 3.31, 3.97 to 2.96. Kept (committed). `newBufferWithBytesNoCopy` over the mmap is not reachable: wgpu 30 exposes no hal path to wrap an external pointer in a Metal buffer on the safe API, and the buffer needs page-aligned `mapped_at_creation` anyway.
+
+### `mac_vs_llama.sh` (3 alternating rounds, medians, load average 2 to 10 at round starts)
+
+| Model | Prefill 128 | Prefill 1,024 | Decode (128 new) |
+|---|---|---|---|
+| Qwen3-0.6B bf16 | 1,615 / 2,941 = 0.549 | 1,506 / 2,966 = 0.508 | 86.7 / 115.3 = 0.752 |
+| Qwen3-0.6B Q4_K_M | 1,597 / 2,998 = 0.533 | 1,425 / 3,032 = 0.470 | 105.5 / 183.4 = 0.575 |
+| Llama-3.2-1B Q4_K_M | 944 / 1,733 = 0.545 | 902 / 1,755 = 0.514 | 87.5 / 138.8 = 0.630 |
+| Qwen2.5-7B Q4_K_M | 147.5 / 273.9 = 0.539 | 143.4 / 269.2 = 0.533 | 17.60 / 27.97 = 0.629 |
+
+7B load median 5.12 s. 0.7x is not reached on any prefill cell.
