@@ -203,7 +203,7 @@ fn run_linear(w: &mut Wgpu, rows: &DeviceRows, x: &[f32], tokens: usize, accumul
             ("linear", [nrows as u32, 1, tokens as u32])
         }
     } else if tokens >= wgsl::TILE_MIN_TOKENS {
-        (if specrt::backends::Backend::limits(w).coop_matrix { "linear_coop" } else { "linear_tile" }, [nrows.div_ceil(wgsl::TILE_ROWS) as u32, 1, tokens.div_ceil(wgsl::TILE_TOKENS) as u32])
+        (if specrt::backends::Backend::limits(w).coop_matrix { wgsl::coop_kernel_for(&rows.rows) } else { "linear_tile" }, [nrows.div_ceil(wgsl::TILE_ROWS) as u32, 1, tokens.div_ceil(wgsl::TILE_TOKENS) as u32])
     } else {
         ("linear_t8", [nrows as u32, 1, tokens.div_ceil(wgsl::LINEAR_TOKENS) as u32])
     };

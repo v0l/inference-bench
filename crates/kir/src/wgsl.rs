@@ -530,11 +530,11 @@ fn coop_load(variant: SgVariant) -> String {
         SgVariant::Q4K => indent(COOP_Q4K, 0),
         SgVariant::Q6K => indent(COOP_Q6K, 0),
         SgVariant::Any => format!(
-            "{}{}{}{}",
-            format!("    if (code == 4u) {{\n{}", indent(COOP_DENSE, 4)),
-            format!("    }} else if (code == 0u) {{\n{}", indent(COOP_Q4K, 4)),
-            format!("    }} else if (code == 2u) {{\n{}", indent(COOP_Q6K, 4)),
-            format!("    }} else {{\n{}    }}\n", indent(COOP_FALLBACK, 4))
+            "    if (code == 4u) {{\n{}    }} else if (code == 0u) {{\n{}    }} else if (code == 2u) {{\n{}    }} else {{\n{}    }}\n",
+            indent(COOP_DENSE, 4),
+            indent(COOP_Q4K, 4),
+            indent(COOP_Q6K, 4),
+            indent(COOP_FALLBACK, 4)
         ),
     };
     format!("{head}{chain}            }}\n")
