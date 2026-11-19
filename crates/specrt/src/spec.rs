@@ -869,16 +869,18 @@ pub const HF_CONFIG_KEYS: &[&str] = &[
     "n_shared_experts", "routed_scaling_factor", "n_group", "topk_group", "num_hash_layers", "swiglu_alpha", "swiglu_limit", "first_k_dense_replace", "n_routed_experts", "num_nextn_predict_layers", "linear_attn_config",
     "rope_scaling", "rope_parameters", "torch_dtype", "dtype", "attn_output_gate", "partial_rotary_factor", "layer_types",
     "full_attention_interval", "sliding_window", "linear_num_key_heads", "linear_num_value_heads", "linear_key_head_dim", "linear_value_head_dim",
-    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "embedding_multiplier", "attention_multiplier", "residual_multiplier", "logits_scaling", "no_rope_layers", "no_rope_layer_interval", "sliding_window_pattern", "rope_local_base_freq", "query_pre_attn_scalar", "text_config", "quantization_config", "attn_layer_indices", "mamba_n_heads", "mamba_d_head", "mamba_d_state", "mamba_n_groups", "mamba_d_conv", "mamba_expand",
+    "linear_conv_kernel_dim", "mtp_num_hidden_layers", "attn_logit_softcapping", "final_logit_softcapping", "query_pre_attn_scalar", "text_config", "quantization_config",
 ];
 
 pub fn unread_hf_keys(json: &str) -> Vec<(String, String)> {
     let Ok(serde_json::Value::Object(top)) = serde_json::from_str::<serde_json::Value>(json) else { return Vec::new() };
+    let mut known: Vec<String> = HF_CONFIG_KEYS.iter().map(|k| k.to_string()).collect();
+    known.extend(crate::family::active().config_keys());
     let mut out = Vec::new();
     let nested = top.get("text_config").and_then(|t| t.as_object());
     for map in std::iter::once(&top).chain(nested) {
         for (k, v) in map {
-            if !HF_CONFIG_KEYS.contains(&k.as_str()) && !out.iter().any(|(o, _): &(String, String)| o == k) {
+            if !known.iter().any(|o| o == k) && !out.iter().any(|(o, _): &(String, String)| o == k) {
                 out.push((k.clone(), v.to_string()));
             }
         }
