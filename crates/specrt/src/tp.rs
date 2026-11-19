@@ -155,6 +155,7 @@ pub fn supports(spec: &Spec, tp: usize) -> Result<()> {
         ensure!(!spec.uses_branch(), "tp does not cover sandwich or scaled residual norms yet ({})", spec.name);
         ensure!(!spec.attention.qk_norm_full, "tp does not split full-width qk norms yet ({})", spec.name);
         if let Some(l) = &spec.linear_attention {
+            ensure!(!l.fused_interleaved, "tp does not split fused interleaved delta-net projections yet ({})", spec.name);
             ensure!(l.v_heads == VHeadOrder::Grouped, "tp needs grouped delta-net value heads, {} has tiled ones", spec.name);
         }
         let (inter, cols) = (spec.dims.intermediate / tp, spec.q_dim() / tp);

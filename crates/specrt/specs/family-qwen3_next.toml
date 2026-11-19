@@ -8,3 +8,6 @@ architectures = ["Qwen3NextForCausalLM"]
 
 [attention]
 output_gate = true
+
+[linear]
+fused_interleaved = true

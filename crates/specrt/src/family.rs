@@ -237,6 +237,12 @@ pub struct FamilyBlocks {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct FamilyLinear {
+    pub fused_interleaved: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FamilyMixer {
     pub module: String,
     pub projection: Vec<crate::spec::Projection>,
@@ -478,6 +484,8 @@ pub struct Family {
     pub state: Vec<crate::state::State>,
     #[serde(default)]
     pub mixer: FamilyMixer,
+    #[serde(default)]
+    pub linear: FamilyLinear,
     #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
 }

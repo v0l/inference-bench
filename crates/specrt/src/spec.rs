@@ -353,6 +353,8 @@ pub struct LinearAttention {
     pub conv_kernel: usize,
     #[serde(default, skip_serializing_if = "VHeadOrder::is_grouped")]
     pub v_heads: VHeadOrder,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fused_interleaved: bool,
 }
 
 impl LinearAttention {
@@ -1515,6 +1517,7 @@ impl Spec {
                     value_head_dim: need(hf.linear_value_head_dim, "linear_value_head_dim")?,
                     conv_kernel: need(hf.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
                     v_heads: VHeadOrder::Grouped,
+                    fused_interleaved: family.linear.fused_interleaved,
                 })
             })();
             if strict { Some(dims?) } else { dims.ok() }

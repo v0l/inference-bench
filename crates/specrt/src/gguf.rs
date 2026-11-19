@@ -585,6 +585,7 @@ impl Gguf {
             value_head_dim: inner / value_heads,
             conv_kernel,
             v_heads: names.v_heads,
+            fused_interleaved: false,
         };
         Ok((Some(la), pattern))
     }
