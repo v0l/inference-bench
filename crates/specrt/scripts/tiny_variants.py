@@ -15,6 +15,7 @@ SINKS = "tiny-sinks"
 CHUNKED = "tiny-chunked"
 MLA = "tiny-deepseek-v2"
 MLA_MOE = "tiny-deepseek-v2-moe"
+GLM = "tiny-glm4-moe"
 WINDOW = 16
 SOFTCAP = 8.0
 CHUNK = 16
@@ -141,11 +142,46 @@ def build_mla_config(dense_layers=4):
     )
 
 
+def build_glm_config():
+    from transformers import Glm4MoeConfig
+
+    return Glm4MoeConfig(
+        vocab_size=512,
+        hidden_size=256,
+        intermediate_size=512,
+        moe_intermediate_size=256,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        n_routed_experts=8,
+        num_experts_per_tok=2,
+        n_shared_experts=1,
+        n_group=2,
+        topk_group=1,
+        routed_scaling_factor=1.5,
+        norm_topk_prob=True,
+        first_k_dense_replace=1,
+        use_qk_norm=True,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        eos_token_id=None,
+        bos_token_id=None,
+        pad_token_id=None,
+        attn_implementation="eager",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5},
+    )
+
+
 def weights(model):
     g = torch.Generator().manual_seed(SEED)
     out = {}
     for name, p in sorted(model.state_dict().items()):
-        if name.endswith(".sinks"):
+        if name.endswith("e_score_correction_bias"):
+            v = 0.2 * torch.randn(p.shape, generator=g)
+        elif name.endswith(".sinks"):
             v = 2.0 * torch.randn(p.shape, generator=g)
         elif p.dim() == 1:
             v = 1.0 + 0.1 * torch.randn(p.shape, generator=g)
@@ -199,6 +235,11 @@ def make(name):
 
         cfg = build_mla_config(4 if name == MLA else 1)
         extra = {}
+    elif name == GLM:
+        from transformers import Glm4MoeForCausalLM as Model
+
+        cfg = build_glm_config()
+        extra = {}
     elif name == SINKS:
         import transformers.models.qwen3.modeling_qwen3 as modeling
         from transformers import Qwen3ForCausalLM as Model
@@ -239,7 +280,7 @@ def make(name):
 def main(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    for name in (SINKS, CHUNKED, MLA, MLA_MOE):
+    for name in (SINKS, CHUNKED, MLA, MLA_MOE, GLM):
         model = make(name)
         g = torch.Generator().manual_seed(SEED + 3)
         ids = torch.randint(0, 512, (PROMPT,), generator=g)

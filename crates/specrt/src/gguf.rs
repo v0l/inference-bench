@@ -472,6 +472,8 @@ impl Gguf {
                     groups: 0,
                     topk_group: 0,
                     score_bias: false,
+                    expert_block: None,
+                    gate_up_interleaved: false,
                     tp_split: crate::spec::TpSplit::Auto,
                     local: None,
                 })

@@ -1070,14 +1070,44 @@ impl Checkpoint {
             }
         };
         let shared_gate = if m.shared_gate { Some(self.floats(&format!("{shared_module}_gate.weight"), &[1, h])?) } else { None };
+        let (gate, up, down) = match &m.expert_block {
+            Some(format) => {
+                ensure!(shared_slots == 0 && local == e, "block quantised experts support neither shared experts nor an expert split yet");
+                let (gate, up) = self.block_gate_up(format, &format!("{p}.mlp.experts.gate_up_proj"), e, inter, h, m.gate_up_interleaved)?;
+                (gate, up, self.block_stack(format, &format!("{p}.mlp.experts.down_proj"), e, h, inter)?)
+            }
+            None => (stack("gate", inter, h)?, stack("up", inter, h)?, stack("down", h, inter)?),
+        };
         Ok(MoeWeights {
             router: self.bf16(&format!("{p}.mlp.gate.weight"), &[e, h])?.into_owned(),
             shared_gate,
             score_bias: if m.score_bias { Some(self.floats(&format!("{p}.mlp.gate.e_score_correction_bias"), &[e])?) } else { None },
-            gate: stack("gate", inter, h)?,
-            up: stack("up", inter, h)?,
-            down: stack("down", h, inter)?,
+            gate,
+            up,
+            down,
         })
+    }
+
+    fn block_stack(&self, format: &crate::dequant::BlockFormat, name: &str, experts: usize, rows: usize, cols: usize) -> Result<Stacked> {
+        let blocks = self.view(&format!("{name}_blocks"))?;
+        let scales = self.view(&format!("{name}_scales"))?;
+        ensure!(blocks.dtype == Dtype::U8 && scales.dtype == Dtype::U8, "{name} blocks and scales must be U8");
+        ensure!(blocks.shape.first() == Some(&experts) && scales.shape.first() == Some(&experts), "{name} is not stacked over {experts} experts");
+        ensure!(blocks.data.len() == format.packed_len(experts * rows * cols), "{name}_blocks holds {} bytes, expected {} for {experts}x{rows}x{cols}", blocks.data.len(), format.packed_len(experts * rows * cols));
+        Ok(Stacked::Bf16(format.decode_bf16(blocks.data, scales.data).with_context(|| name.to_string())?))
+    }
+
+    fn block_gate_up(&self, format: &crate::dequant::BlockFormat, name: &str, experts: usize, inter: usize, h: usize, interleaved: bool) -> Result<(Stacked, Stacked)> {
+        let Stacked::Bf16(fused) = self.block_stack(format, name, experts, 2 * inter, h)? else { unreachable!("block stacks decode to bf16") };
+        let (mut gate, mut up) = (Vec::with_capacity(fused.len() / 2), Vec::with_capacity(fused.len() / 2));
+        for e in 0..experts {
+            let rows = &fused[e * 2 * inter * h..(e + 1) * 2 * inter * h];
+            for r in 0..2 * inter {
+                let into = if interleaved { if r % 2 == 0 { &mut gate } else { &mut up } } else if r < inter { &mut gate } else { &mut up };
+                into.extend_from_slice(&rows[r * h..(r + 1) * h]);
+            }
+        }
+        Ok((Stacked::Bf16(gate), Stacked::Bf16(up)))
     }
 
     fn has_input_scale(&self, module: &str) -> bool {
@@ -1495,5 +1525,65 @@ mod tests {
         assert_eq!(e4m3_to_f32(0x07), 7.0 * 2f32.powi(-9));
         assert_eq!(e4m3_to_f32(0x08), 2f32.powi(-6));
         assert_eq!(e4m3_to_f32(0x80), -0.0);
+    }
+}
+
+#[cfg(test)]
+mod block_expert_tests {
+    use super::*;
+    use crate::dequant::MXFP4;
+    use safetensors::tensor::TensorView;
+
+    fn checkpoint(dir: &Path, experts: usize, inter: usize, h: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut blocks = vec![0u8; experts * 2 * inter * h / 2];
+        let mut scales = vec![127u8; experts * 2 * inter * h / 32];
+        for (i, b) in blocks.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        scales[1] = 128;
+        let down_blocks = vec![0x22u8; experts * h * inter / 2];
+        let down_scales = vec![127u8; experts * h * inter / 32];
+        let views = vec![
+            ("model.layers.0.mlp.experts.gate_up_proj_blocks".to_string(), TensorView::new(Dtype::U8, vec![experts, 2 * inter, h / 32, 16], &blocks).unwrap()),
+            ("model.layers.0.mlp.experts.gate_up_proj_scales".to_string(), TensorView::new(Dtype::U8, vec![experts, 2 * inter, h / 32], &scales).unwrap()),
+            ("model.layers.0.mlp.experts.down_proj_blocks".to_string(), TensorView::new(Dtype::U8, vec![experts, h, inter / 32, 16], &down_blocks).unwrap()),
+            ("model.layers.0.mlp.experts.down_proj_scales".to_string(), TensorView::new(Dtype::U8, vec![experts, h, inter / 32], &down_scales).unwrap()),
+        ];
+        safetensors::serialize_to_file(views, None, &dir.join("model.safetensors")).unwrap();
+        (blocks, scales)
+    }
+
+    #[test]
+    fn mxfp4_expert_blocks_decode_into_gate_and_up_with_the_declared_row_order() {
+        let (experts, inter, h) = (2usize, 32usize, 64usize);
+        let dir = std::env::temp_dir().join(format!("mxfp4-experts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (blocks, scales) = checkpoint(&dir, experts, inter, h);
+        let ck = Checkpoint::open(&dir).unwrap();
+        let name = "model.layers.0.mlp.experts.gate_up_proj";
+        let mut all = Vec::new();
+        MXFP4.decode(&blocks, &scales, &mut all).unwrap();
+        let want = |r: usize, e: usize| -> Vec<u16> { all[(e * 2 * inter + r) * h..(e * 2 * inter + r + 1) * h].iter().map(|v| f32_to_bf16(*v)).collect() };
+        let (Stacked::Bf16(g), Stacked::Bf16(u)) = ck.block_gate_up(&MXFP4, name, experts, inter, h, true).unwrap() else { panic!("bf16") };
+        assert_eq!(&g[3 * h..4 * h], want(6, 0).as_slice());
+        assert_eq!(&u[3 * h..4 * h], want(7, 0).as_slice());
+        assert_eq!(&g[(inter + 1) * h..(inter + 2) * h], want(2, 1).as_slice());
+        let (Stacked::Bf16(g), Stacked::Bf16(u)) = ck.block_gate_up(&MXFP4, name, experts, inter, h, false).unwrap() else { panic!("bf16") };
+        assert_eq!(&g[3 * h..4 * h], want(3, 0).as_slice());
+        assert_eq!(&u[3 * h..4 * h], want(inter + 3, 0).as_slice());
+        let Stacked::Bf16(d) = ck.block_stack(&MXFP4, "model.layers.0.mlp.experts.down_proj", experts, h, inter).unwrap() else { panic!("bf16") };
+        assert_eq!(d.len(), experts * h * inter);
+        assert!(d.iter().all(|v| *v == f32_to_bf16(1.0)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_blocks_tensor_of_the_wrong_size_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("mxfp4-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        checkpoint(&dir, 2, 32, 64);
+        let ck = Checkpoint::open(&dir).unwrap();
+        assert!(ck.block_stack(&MXFP4, "model.layers.0.mlp.experts.gate_up_proj", 2, 32, 64).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
