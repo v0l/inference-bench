@@ -715,14 +715,15 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
             let ql0 = wdata[(b + 64u * hr + l) >> 2u];
             let ql1 = wdata[(b + 64u * hr + l + 32u) >> 2u];
             let qh = wdata[(b + 128u + 32u * hr + l) >> 2u];
-            let sc = b + 192u + 8u * hr + isc;
+            let sw = (b + 192u + 8u * hr) >> 2u;
+            let sc = vec4<f32>(vec4<i32>(bitcast<i32>(wdata[sw] << (24u - 8u * isc)) >> 24u, bitcast<i32>(wdata[sw] << (8u - 8u * isc)) >> 24u, bitcast<i32>(wdata[sw + 1u] << (24u - 8u * isc)) >> 24u, bitcast<i32>(wdata[sw + 1u] << (8u - 8u * isc)) >> 24u));
             let xb = (xo + sb * 256u + hr * 128u + l) / 4u;
             var part = 0.0;
             for (var seg = 0u; seg < 4u; seg++) {{
                 let qw = select(ql0, ql1, (seg & 1u) == 1u) >> (4u * (seg >> 1u));
                 let v = (qw & 0x0f0f0f0fu) | (((qh >> (2u * seg)) & 0x03030303u) << 4u);
                 let f = vec4<f32>(vec4<u32>(v & 0xffu, (v >> 8u) & 0xffu, (v >> 16u) & 0xffu, v >> 24u)) - vec4<f32>(32.0);
-                part += wi8(sc + 2u * seg) * dot(f, x[xb + seg * 8u]);
+                part += sc[seg] * dot(f, x[xb + seg * 8u]);
             }}
             acc += d * part;
         }}
