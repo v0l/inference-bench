@@ -654,7 +654,7 @@ impl Description {
         use crate::recur::{Input, Recurrence, SeqBody, Space, Stage as RStage};
         let params = self.params()?;
         let words: Vec<(String, String)> = self.args.iter().filter_map(|(k, v)| v.as_str().filter(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')).map(|s| (k.clone(), s.to_string()))).collect();
-        let fail = |e: String| format!("{}: {e}", self.name);
+        let fail = |e: String| if e.starts_with(&format!("{}:", self.name)) { e } else { format!("{}: {e}", self.name) };
         match self.family.as_str() {
             "seq_conv" => {
                 let n = self.sizes(shape, &self.args, &["x_row", "x_offset", "channels", "taps", "y_row", "y_offset", "layers"], "[args]")?;
@@ -676,6 +676,9 @@ impl Description {
                 let mut table = r.clone();
                 table.remove("state");
                 let n = self.sizes(shape, &table, &["keys", "values", "ksplit", "layers"], "[recurrence]")?;
+                if !n["ksplit"].is_power_of_two() || n["ksplit"] > 32 {
+                    return Err(format!("{}: ksplit {} must be a power of two up to 32", self.name, n["ksplit"]));
+                }
                 let mut inputs = Vec::new();
                 for i in &self.input {
                     let name = i.get("name").and_then(|v| v.as_str()).ok_or_else(|| format!("{}: [[input]] needs name", self.name))?;

@@ -214,3 +214,25 @@ tiny-deepseek-v2 prefill max_abs 0.00039076805, greedy decode tokens equal
 ```
 
 Not covered: the fixture's MLP is dense, because V2 MoE (two shared experts wider than the routed ones) does not load yet (#830); the real DeepSeek-V2-Lite is about 31 GB in bf16, over the Spark budget. The MLA kernels are scalar, correct rather than fast.
+
+## 10. Status of slice (d)
+
+Plumbing, variant free:
+
+- `kir::recur`, family `recurrence`: a per-head state matrix `[keys][values]` kept in registers across the rows of one sequence (`ksplit` threads share a value column). `[[input]]` reads a key vector, a value vector or a scalar per row (with `per` for grouped heads). Stages: `key` (per key channel), `key_sum` (a reduction over keys), `scalar`, `value`, `decay` (state times a key expression, per channel or scalar), `update` (rank one `key x value`), `read` (`state^T key`), `store`. The state is a spec `[[state]]` binding, indexed by sequence slot and linear layer. One kernel serves prefill (`rows_per_seq` = chunk) and batched decode (one row per slot).
+- `seq_conv` (causal depthwise conv with the tail kept in a per sequence state, activation as an expression) and `group_norm` (grouped RMS norm with input and output expressions, written as split planes).
+- Expressions gain `softplus`.
+- `[mixer]` in a family or model spec: `module`, `[[mixer.projection]]` (the fused in projection), `out_tensor`, `out_cols`, `[mixer.params]` (from `config.json`, `expr` allowed), `[mixer.scratch]` and `[[mixer.node]]` kernel nodes. Nodes bind `{ buffer = "mix" | scratch }`, `{ state = name }`, weights under the module and params; grids take `rows`, `seqs`, numbers or params. `graphs/decoder.toml` has a `mixer` block (norm, `mix_in`, the nodes, `mix_out`, MLP) and the delta-net blocks run only without a mixer.
+- State kind: per sequence `[[state]]` tables on the linear layers become one `StatePool` each with the `checkpoint` rule. Acquire, release, reset, snapshot (prefix cache and session park) and restore walk the declared states, so prefix caching and swap work for any described recurrence.
+- `[blocks] attention_indices_key` builds the layer pattern from a list of attention layer indices, and `[tensors]` renames checkpoint tensor name fragments (`.feed_forward.` to `.mlp.`). `SPEC_FORMAT` 11.
+
+The variants (no Rust): `specs/family-bamba.toml` with `mamba2_conv`, `mamba2_scan` (`h = exp(-exp(A_log) dt) h + dt x B`, `y = C h + D x`, grouped B and C) and `mamba2_gated_norm`; `specs/kda_recurrence.toml`, the glm5_next KDA delta rule with a per key channel lower bounded forget gate and L2 normalised q and k.
+
+Proof (`tests/mamba.rs`, fixture `tiny-bamba`, reference `scripts/tiny_mamba.py`, transformers `BambaForCausalLM` with random weights), Spark GB10, release:
+
+```text
+tiny-bamba prefill max_abs 0.0005235672, argmax agree 96/96, greedy decode tokens equal
+kda_recurrence vs host delta rule: out max_abs 7.5e-9, state max_abs 4.5e-8
+```
+
+Not covered: the scan is the recurrent form for prefill as well (no intra chunk mma, so long prefill is serial per head); the fused decode and prefill step, MTP, tensor parallel and wgpu refuse a mixer; glm5_next as a whole also needs MLA, the DSA indexer and hyper connections (slices c and e).

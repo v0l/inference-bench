@@ -117,6 +117,83 @@ fn tiny_bamba_matches_transformers() {
     assert_eq!(got.tokens[0], greedy, "{BAMBA} decode greedy");
 }
 
+fn kda_reference(mix: &[f32], dtb: &[f32], a_log: &[f32], heads: usize, d: usize, rows: usize, lower: f32) -> (Vec<f32>, Vec<f32>) {
+    let row = 4 * heads * d + heads;
+    let mut state = vec![0f32; heads * d * d];
+    let mut out = vec![0f32; rows * heads * d];
+    let norm = |v: &[f32]| {
+        let n = (v.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
+        v.iter().map(|x| x / n).collect::<Vec<f32>>()
+    };
+    for t in 0..rows {
+        let r = &mix[t * row..(t + 1) * row];
+        for h in 0..heads {
+            let seg = |o: usize| &r[o * heads * d + h * d..o * heads * d + (h + 1) * d];
+            let q: Vec<f32> = norm(seg(0)).iter().map(|x| x / (d as f32).sqrt()).collect();
+            let k = norm(seg(1));
+            let v = seg(2);
+            let f = seg(3);
+            let beta = 1.0 / (1.0 + (-r[4 * heads * d + h]).exp());
+            let s = &mut state[h * d * d..(h + 1) * d * d];
+            for i in 0..d {
+                let g = (lower / (1.0 + (-(a_log[h].exp() * (f[i] + dtb[h * d + i]))).exp())).exp();
+                for j in 0..d {
+                    s[i * d + j] *= g;
+                }
+            }
+            for j in 0..d {
+                let mem: f32 = (0..d).map(|i| s[i * d + j] * k[i]).sum();
+                let delta = (v[j] - mem) * beta;
+                for i in 0..d {
+                    s[i * d + j] += k[i] * delta;
+                }
+                out[t * heads * d + h * d + j] = (0..d).map(|i| s[i * d + j] * q[i]).sum();
+            }
+        }
+    }
+    (out, state)
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_kda_kernel_matches_the_kimi_delta_rule() {
+    use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
+    let (heads, d, rows, lower) = (4usize, 64usize, 12usize, -5.0f32);
+    let row = 4 * heads * d + heads;
+    let text = std::fs::read_to_string(root().join("specs/kda_recurrence.toml")).unwrap();
+    let shape = kir::desc::Shape::new().num("kda_head_dim", d as f64).num("kda_heads", heads as f64).num("kda_row", row as f64).num("kda_lower_bound", lower as f64).num("linear_layers", 1.0);
+    let ctx = CudaContext::new(0).unwrap();
+    let target = specrt::codegen::cuda_target(&ctx).unwrap();
+    let k = kir::desc::Description::parse(&text).unwrap().build(&target, &shape).unwrap();
+    let opts = cudarc::nvrtc::CompileOptions { arch: Some(Box::leak(format!("compute_{}{}", ctx.compute_capability().unwrap().0, ctx.compute_capability().unwrap().1).into_boxed_str())), options: vec!["--std=c++17".into()], ..Default::default() };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(kir::cuda::emit_module(std::slice::from_ref(&k)).unwrap(), opts).unwrap();
+    let module = ctx.load_module(ptx).unwrap();
+    let f = module.load_function("kda_recurrence").unwrap();
+    let mut seed = 808u64;
+    let mut rand = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as u32) as f32 / (1u64 << 31) as f32 * 2.0 - 1.0
+    };
+    let mix: Vec<f32> = (0..rows * row).map(|_| rand()).collect();
+    let dtb: Vec<f32> = (0..heads * d).map(|_| rand()).collect();
+    let a_log: Vec<f32> = (0..heads).map(|_| rand() * 0.5).collect();
+    let (want, want_state) = kda_reference(&mix, &dtb, &a_log, heads, d, rows, lower);
+    let stream = ctx.default_stream();
+    let (dmix, ddtb, da) = (stream.clone_htod(&mix).unwrap(), stream.clone_htod(&dtb).unwrap(), stream.clone_htod(&a_log).unwrap());
+    let y = stream.alloc_zeros::<f32>(rows * heads * d).unwrap();
+    let st = stream.alloc_zeros::<f32>(heads * d * d).unwrap();
+    let slots = stream.alloc_zeros::<i32>(1).unwrap();
+    let (layer, base, step, per) = (0i32, 0i32, 0i32, rows as i32);
+    let mut b = stream.launch_builder(&f);
+    b.arg(&dmix).arg(&ddtb).arg(&da).arg(&y).arg(&st).arg(&slots).arg(&layer).arg(&base).arg(&step).arg(&per);
+    unsafe { b.launch(LaunchConfig { grid_dim: (heads as u32, 1, 1), block_dim: (k.threads, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
+    let got = stream.clone_dtoh(&y).unwrap();
+    let got_state = stream.clone_dtoh(&st).unwrap();
+    let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    eprintln!("kda out max_abs {} state max_abs {}", diff(&got, &want), diff(&got_state, &want_state));
+    assert!(diff(&got, &want) < 1e-4 && diff(&got_state, &want_state) < 1e-4);
+}
+
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn a_checkpointed_state_survives_a_reset_and_restore() {
