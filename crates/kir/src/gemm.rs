@@ -26,7 +26,7 @@ pub const DEQUANT_TILE: u32 = 16;
 const MAX_BLOCKS_PER_SM: usize = 4;
 const BIG_DEFAULT: Tile = Tile { bm: 128, bn: 128, wm: 2, wn: 4 };
 const BF16_BIG: Tile = Tile { bm: 256, bn: 128, wm: 4, wn: 2 };
-const BF16_BIG_MIN_WAVES: usize = 2;
+const BF16_BIG_MIN_N: usize = 8192;
 const TINY_WN: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -200,9 +200,9 @@ impl Tuning {
         }
     }
 
-    pub fn mma_tile(&self, t: &Target, v: Variant, wf: WeightFormat, n: usize) -> Tile {
+    pub fn mma_tile(&self, v: Variant, wf: WeightFormat, n: usize) -> Tile {
         match (v, wf) {
-            (Variant::Big, WeightFormat::Bf16) if n.div_ceil(BF16_BIG.bn) >= BF16_BIG_MIN_WAVES * t.sm_count as usize => self.big.unwrap_or(BF16_BIG),
+            (Variant::Big, WeightFormat::Bf16) if n >= BF16_BIG_MIN_N => self.big.unwrap_or(BF16_BIG),
             _ => self.tile(v),
         }
     }
@@ -749,7 +749,7 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
         }
         w => {
             let name = format!("{}_mma{suffix}", r.linear);
-            let tile = tuning.mma_tile(t, variant, w, r.shape.n);
+            let tile = tuning.mma_tile(variant, w, r.shape.n);
             let k = KernelInstance::gemm(t, &name, r.shape, w, tile, r.split, false)?;
             plain(name, GemmPath::Mma, tile, Some(k))
         }

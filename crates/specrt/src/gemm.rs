@@ -200,7 +200,7 @@ impl GemmSet {
         let variants: &[Variant] = if t.language == kir::Language::Wgsl { &[Variant::Small] } else { &Variant::MMA };
         for &v in variants {
             let name = format!("{names}{}", v.suffix());
-            self.push(KernelInstance::gemm(t, &name, shape, wf, tuning.mma_tile(t, v, wf, shape.n), split, token_major))?;
+            self.push(KernelInstance::gemm(t, &name, shape, wf, tuning.mma_tile(v, wf, shape.n), split, token_major))?;
         }
         Ok(())
     }
