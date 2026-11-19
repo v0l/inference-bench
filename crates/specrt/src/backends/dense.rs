@@ -192,7 +192,9 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
                     [w.nrows.min(ROW_SPAN), w.nrows.div_ceil(ROW_SPAN), rows.div_ceil(if rows == 1 { 1 } else { LINEAR_TOKENS }) as u32]
                 };
                 let accumulate = output == Buf::X;
-                be.dispatch(kernel, &[self.buf(input), self.buf(output), &w.data, &w.rows], [w.nrows, w.cols, r, 0, 0, accumulate as u32, 0, 0], grid)?;
+                let glue = sg && weight == Weight::GateUp;
+                let target = if glue { Buf::Act } else { output };
+                be.dispatch(kernel, &[self.buf(input), self.buf(target), &w.data, &w.rows], [w.nrows, w.cols, r, 0, 0, accumulate as u32, glue as u32, 0], grid)?;
                 if let (Weight::Qkv, Some(b)) = (weight, l.and_then(|l| l.bias.as_ref())) {
                     let width = spec.qkv_rows();
                     be.dispatch(kernels[1], &[self.buf(output), b], [r, width as u32, 0, 0, 0, 0, 0, 0], grid_1d(rows * width))?;
@@ -217,6 +219,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
                 }
                 be.dispatch(kernels[0], &[&m.scratch.qkv, &l.k_cache[run.slot], &l.v_cache[run.slot], &m.scratch.attn], [run.pos0 as u32, 0, 0, 0, 0, 0, 0, 0], [spec.attention.heads as u32, r, 1])
             }
+            Op::Swiglu if rows == 1 && be.limits().subgroup_size == 32 => Ok(()),
             Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),
             Op::Kernel { .. } | Op::DecodeRope => bail!("described kernels are not yet on wgpu"),
             Op::NormAdd { .. } | Op::Clear { .. } | Op::Split { .. } | Op::QkNorm | Op::ScaledAdd { .. } | Op::LogitScale | Op::LogitSoftcap => bail!("{} is not yet on wgpu", op.label()),

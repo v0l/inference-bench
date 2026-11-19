@@ -855,6 +855,8 @@ fn xs(i: u32) -> f32 {{
     return x[i >> 2u][i & 3u];
 }}
 
+var<workgroup> pair: array<f32, {SG_ROWS}>;
+
 @compute @workgroup_size({threads})
 fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @builtin(subgroup_invocation_id) lane: u32) {{
     let nrows = p.a.x;
@@ -863,16 +865,28 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(subgroup_id) sg: u32, @b
     let y_row0 = p.b.x;
     let accumulate = p.b.y;
     let r = (wid.x + wid.y * {ROW_SPAN}u) * {SG_ROWS}u + sg;
-    if (r >= nrows) {{
-        return;
-    }}
-    let entry = rows[r];
+    let valid = r < nrows;
+    let entry = rows[min(r, nrows - 1u)];
     let base = (entry >> 3u) * 16u;
     let code = entry & 7u;
     var acc = 0.0;
     let xo = x_row0 * cols;
 {branches}    let total = subgroupAdd(acc);
-    if (lane == 0u) {{
+    if (p.b.z == 1u) {{
+        if (lane == 0u) {{
+            pair[sg] = total;
+        }}
+        workgroupBarrier();
+        if (lane == 0u && (sg & 1u) == 0u && valid) {{
+            let g = pair[sg];
+            let u = pair[sg + 1u];
+            var a = g / (1.0 + exp(-g));
+            if (ACT_KIND == 1u) {{
+                a = 0.5 * g * (1.0 + tanh(0.7978845608028654 * (g + 0.044715 * g * g * g)));
+            }}
+            y[p.b.w + (r >> 1u)] = a * u;
+        }}
+    }} else if (lane == 0u && valid) {{
         let at = y_row0 * nrows + r;
         if (accumulate == 1u) {{
             y[at] = y[at] + total;
