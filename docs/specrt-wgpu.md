@@ -540,3 +540,20 @@ One run in round 1 of each of two cells came in 15% low (a load spike, 48 at the
 Target not met: `linear_coop` reaches 2.74 TFLOP/s (target 3) and prefill is at 0.56 to 0.72 (target 0.7 on every row). Prefill 128 is at 0.7 on 2 of 4 rows. The 7B and Llama-1B at 1,024 are 0.68 and 0.66.
 
 Tests: wgsl 26/26 on the Mac (`--include-ignored --test-threads=1`), `cargo clippy -p inference-bench-specrt --features wgpu --all-targets` clean on the Mac, `cargo test -p inference-bench-kir` passes.
+
+## Mac speed work 9 (#835)
+
+### flash_coop K/V tiles in workgroup memory
+
+`flash_coop` stages a 32-key K tile and then a V tile in workgroup memory (reusing `opart`, which is not live between rescales), loaded by all 128 threads and shared by the 4 simdgroups (32 queries). Before, each simdgroup fetched its own K/V fragments from the device cache. `mac_vs_llama.sh` now also runs prefill 4,096 (`LENS`, default 128,1024,4096).
+
+The result is the paired round-3 A/B (quiet Mac, base = master before this issue, 16-key = first version, 32-key = kept; prefill tok/s):
+
+| round 3 | base | 16-key | 32-key |
+|---|---|---|---|
+| Qwen3-0.6B Q4_K_M 1,024 / 4,096 | 1,502 / 590 | 1,650 / 769 | 1,580 / 827 |
+| Llama-1B Q4_K_M 1,024 / 4,096 | 975 / 603 | 1,039 / 888 | 1,028 / 835 |
+
+Prefill at 4,096 improves 20 to 40%; 1,024 is flat within noise (16-key and 32-key are the same there, so barrier cost is not the reason: attention is a small share of prefill at 1,024). Rounds 1 and 2 of the A/B were disturbed by background load (base itself swung 630 to 1,503 at 1,024) and are not used. The full `mac_vs_llama.sh` before and after tables were run about 30 minutes apart on a loaded machine and are noisy (Qwen3-0.6B Q4_K_M at 4,096 reads 730 before and 696 after, against 590 and 827 in the paired A/B), so they are not a result. The after run against llama.cpp: pp4096 ratios 0.42 (0.6B bf16), 0.33 (0.6B Q4_K_M), 0.58 (Llama-1B), 0.54 (7B).
+
+wgsl 26/26 with `--include-ignored --test-threads=1` and clippy `-D warnings` with the wgpu feature are clean. f16 K/V tiles are dropped (the cache is f32 and f16 cooperative matrices were slower in #768 and #823). The `linear_coop` dequant tile-load phase and Q6_K decode are #862.

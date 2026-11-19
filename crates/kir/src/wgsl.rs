@@ -1183,23 +1183,49 @@ pub fn emit_flash_coop_op(s: &crate::ops::WgslShape) -> String {
     out
 }
 
+fn stage(name: &str) -> String {
+    format!(
+        "        for (var i = li; i < 32u * HD4; i += {FLASH_COOP_THREADS}u) {{
+            let row = i / HD4;
+            let c = (i % HD4) * 4u;
+            let src = head_base + (key0 + row) * HEAD_DIM + c;
+            let dst = row * HEAD_DIM + c;
+            opart[dst] = {name}[src];
+            opart[dst + 1u] = {name}[src + 1u];
+            opart[dst + 2u] = {name}[src + 2u];
+            opart[dst + 3u] = {name}[src + 3u];
+        }}
+        workgroupBarrier();
+"
+    )
+}
+
 fn flash_coop(nd: u32) -> String {
     let q_frags: String = (0..nd).map(|i| format!("    let qa{i} = coopLoadT<coop_mat8x8<f32, A>>(&qkv[qb0 * QKV_ROW + head * HEAD_DIM + {}u], QKV_ROW);\n", i * 8)).collect();
     let o_init: String = (0..nd).map(|i| format!("    var o{i} = coop_mat8x8<f32, C>();\n")).collect();
     let s_init: String = (0..4).map(|k| format!("        var s{k} = coop_mat8x8<f32, C>();\n")).collect();
-    let s_mma: String = (0..4)
-        .flat_map(|k| (0..nd).map(move |i| format!("        s{k} = coopMultiplyAdd(qa{i}, coopLoad<coop_mat8x8<f32, B>>(&k_cache[head_base + (key0 + {}u) * HEAD_DIM + {}u], HEAD_DIM), s{k});\n", k * 8, i * 8)))
-        .collect();
-    let s_store: String = (0..4).map(|k| format!("        coopStoreT(s{k}, &sbuf[g * 256u + {}u], 32u);\n", k * 8)).collect();
-    let o_mma: String = (0..4)
-        .map(|ks| {
-            let mut b = format!("        let pa{ks} = coopLoadT<coop_mat8x8<f32, A>>(&sbuf[g * 256u + {}u], 32u);\n", ks * 8);
+    let s_mma: String = {
+        let mut b = stage("k_cache");
+        for k in 0..4 {
             for i in 0..nd {
-                b.push_str(&format!("        o{i} = coopMultiplyAdd(pa{ks}, coopLoadT<coop_mat8x8<f32, B>>(&v_cache[head_base + (key0 + {}u) * HEAD_DIM + {}u], HEAD_DIM), o{i});\n", ks * 8, i * 8));
+                b.push_str(&format!("        s{k} = coopMultiplyAdd(qa{i}, coopLoad<coop_mat8x8<f32, B>>(&opart[{}u * HEAD_DIM + {}u], HEAD_DIM), s{k});\n", k * 8, i * 8));
             }
-            b
-        })
-        .collect();
+        }
+        b.push_str("        workgroupBarrier();\n");
+        b
+    };
+    let s_store: String = (0..4).map(|k| format!("        coopStoreT(s{k}, &sbuf[g * 256u + {}u], 32u);\n", k * 8)).collect();
+    let o_mma: String = {
+        let mut b = stage("v_cache");
+        for ks in 0..4 {
+            b.push_str(&format!("        let pa{ks} = coopLoadT<coop_mat8x8<f32, A>>(&sbuf[g * 256u + {}u], 32u);\n", ks * 8));
+            for i in 0..nd {
+                b.push_str(&format!("        o{i} = coopMultiplyAdd(pa{ks}, coopLoadT<coop_mat8x8<f32, B>>(&opart[{}u * HEAD_DIM + {}u], HEAD_DIM), o{i});\n", ks * 8, i * 8));
+            }
+        }
+        b.push_str("        workgroupBarrier();\n");
+        b
+    };
     let o_store: String = (0..nd).map(|i| format!("{{pad}}coopStoreT(o{i}, &opart[g * 8u * HEAD_DIM + {}u], HEAD_DIM);\n", i * 8)).collect();
     let o_load: String = (0..nd).map(|i| format!("{{pad}}o{i} = coopLoadT<coop_mat8x8<f32, C>>(&opart[g * 8u * HEAD_DIM + {}u], HEAD_DIM);\n", i * 8)).collect();
     let store_inner = o_store.replace("{pad}", "            ");

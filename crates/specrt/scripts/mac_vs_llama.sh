@@ -13,6 +13,7 @@ export PATH=/opt/homebrew/bin:$PATH
 ROUNDS=${ROUNDS:-3}
 RUNS=${SPECRT_BENCH_RUNS:-3}
 MODELS=${MODELS-"Qwen3-0.6B-BF16 Qwen3-0.6B-Q4_K_M Llama-3.2-1B-Instruct-Q4_K_M"}
+LENS=${LENS:-128,1024,4096}
 BIG=${BIG:-Qwen2.5-7B-Instruct-Q4_K_M}
 OUT=${OUT:-$HOME/bench-out/$(date +%Y%m%d-%H%M)}
 SRC=$HOME/git/ib-bench
@@ -67,11 +68,11 @@ for round in $(seq 1 "$ROUNDS"); do
   for m in $MODELS; do
     tag=round$round.$m
     if [ $((round % 2)) -eq 1 ]; then
-      run_specrt "$m" "$tag" "$RUNS" 128,1024
-      run_llama "$m" "$tag" 128,1024
+      run_specrt "$m" "$tag" "$RUNS" $LENS
+      run_llama "$m" "$tag" $LENS
     else
-      run_llama "$m" "$tag" 128,1024
-      run_specrt "$m" "$tag" "$RUNS" 128,1024
+      run_llama "$m" "$tag" $LENS
+      run_specrt "$m" "$tag" "$RUNS" $LENS
     fi
   done
 done
@@ -81,11 +82,11 @@ if [ -n "$BIG" ] && [ -f "$HOME/models/$BIG.gguf" ]; then
     load_note > "$OUT/big$round.load.txt"
     tag=big$round.$BIG
     if [ $((round % 2)) -eq 1 ]; then
-      run_specrt "$BIG" "$tag" 1 128,1024
-      run_llama "$BIG" "$tag" 128,1024
+      run_specrt "$BIG" "$tag" 1 $LENS
+      run_llama "$BIG" "$tag" $LENS
     else
-      run_llama "$BIG" "$tag" 128,1024
-      run_specrt "$BIG" "$tag" 1 128,1024
+      run_llama "$BIG" "$tag" $LENS
+      run_specrt "$BIG" "$tag" 1 $LENS
     fi
   done
 fi
@@ -131,7 +132,7 @@ for (r, name, eng, metric), v in rows.items():
 print(f"{'model':36} {'metric':8} {'specrt':>9} {'llama.cpp':>10} {'ratio':>7}")
 names = sorted({k[0] for k in summary})
 for name in names:
-    for metric in ["pp128", "pp1024", "tg128", "load_s", "peak_gb"]:
+    for metric in ["pp128", "pp1024", "pp4096", "tg128", "load_s", "peak_gb"]:
         a = summary.get((name, "specrt", metric))
         b = summary.get((name, "llama", metric))
         if not a and not b:
