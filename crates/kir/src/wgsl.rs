@@ -598,7 +598,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
 ",
         bind = storage(&[("x", false, "vec4<f32>"), ("y", true, "f32"), ("wdata", false, "u32"), ("rows", false, "u32")]),
         woff = COOP_K * COOP_TOKENS,
-        os = COOP_TOKENS * COOP_ROWS,
+        os = (COOP_TOKENS * COOP_ROWS).max(COOP_K * (COOP_TOKENS + COOP_ROWS)),
         quads = COOP_K * COOP_TOKENS / 4 / COOP_THREADS,
         acc_init = (0..16).map(|n| format!("    var acc{n} = coop_mat8x8<f32, C>();\n")).collect::<String>(),
         mma = coop_mma(),
