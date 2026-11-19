@@ -8,6 +8,7 @@ const SINKS: &str = "tiny-sinks";
 const CHUNKED: &str = "tiny-chunked";
 const MLA: &str = "tiny-deepseek-v2";
 const MLA_MOE: &str = "tiny-deepseek-v2-moe";
+const GLM: &str = "tiny-glm4-moe";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -171,4 +172,40 @@ fn sinks_with_soft_cap_and_window_match_transformers() {
 #[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
 fn chunked_nope_with_temperature_matches_transformers() {
     close(CHUNKED, 5e-2);
+}
+
+#[test]
+fn the_glm_config_reads_groups_scaling_bias_and_sigmoid_from_the_family_toml() {
+    let spec = spec(GLM);
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.top_k(), moe.groups, moe.topk_group), (8, 2, 2, 1));
+    assert_eq!((moe.router, moe.score_bias, moe.norm_topk, moe.routed_scale), (specrt::spec::RouterAct::Sigmoid, true, true, 1.5));
+    assert_eq!((moe.shared_slots(), moe.shared_gate, moe.dense_layers.clone()), (1, false, vec![0]));
+    assert!(spec.attention.qk_norm);
+    spec.runnable().unwrap();
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+    for c in ["constexpr int MOE_GROUPS = 2;", "constexpr int MOE_TOPK_GROUP = 1;", "constexpr bool MOE_BIAS = true;", "constexpr bool MOE_SIGMOID = true;"] {
+        assert!(module.source.contains(c), "{c}");
+    }
+}
+
+#[test]
+fn the_glm_checkpoint_loads_the_score_bias() {
+    let spec = spec(GLM);
+    let ck = specrt::weights::Checkpoint::open(&fixture(GLM)).unwrap();
+    let w = ck.layer(&spec, 1).unwrap().moe.unwrap();
+    assert_eq!(w.score_bias.unwrap().len(), 8);
+}
+
+#[test]
+fn a_dense_moe_config_has_no_groups_or_bias() {
+    let spec = spec(MLA_MOE);
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.groups, moe.topk_group, moe.score_bias), (0, 0, false));
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn group_limited_sigmoid_routing_with_score_bias_matches_transformers() {
+    close(GLM, 5e-2);
 }

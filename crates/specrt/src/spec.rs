@@ -520,6 +520,10 @@ pub struct Moe {
     pub topk_group: usize,
     #[serde(default, skip_serializing_if = "is_false")]
     pub score_bias: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_block: Option<crate::dequant::BlockFormat>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gate_up_interleaved: bool,
     #[serde(default, skip_serializing_if = "TpSplit::is_auto")]
     pub tp_split: TpSplit,
     #[serde(skip)]
@@ -1494,6 +1498,8 @@ impl Spec {
                     groups: hf.n_group.filter(|g| *g > 1).unwrap_or(0),
                     topk_group: if hf.n_group.is_some_and(|g| g > 1) { hf.topk_group.unwrap_or(1) } else { 0 },
                     score_bias: family.moe.score_bias,
+                    expert_block: family.moe.expert_block,
+                    gate_up_interleaved: family.moe.gate_up_interleaved,
                     tp_split: TpSplit::Auto,
                     local: None,
                 })

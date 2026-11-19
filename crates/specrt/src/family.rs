@@ -163,6 +163,8 @@ pub struct FamilyMoe {
     pub shared_gate: Option<bool>,
     pub router: Option<crate::spec::RouterAct>,
     pub score_bias: bool,
+    pub expert_block: Option<crate::dequant::BlockFormat>,
+    pub gate_up_interleaved: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
