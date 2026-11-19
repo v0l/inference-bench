@@ -78,6 +78,24 @@ pub fn quant_fp8(name: &str, scale: Fp8Scale) -> String {
     }
 }
 
+pub fn quant_fp8_f32_groups(name: &str, threads: u32) -> String {
+    format!(
+        r##"extern "C" __global__ void __launch_bounds__({threads}) {name}(const float* x, unsigned char* q, float* scale, int width) {{
+    size_t row = blockIdx.x;
+    int blk = blockIdx.y;
+    size_t at = row * width + (size_t)blk * FP8_BLOCK + threadIdx.x;
+    float v = x[at];
+    float amax = {reduce};
+    float s = amax > 0.0f ? amax / FP8_MAX : 1.0f;
+    q[at] = (unsigned char)(f32x2_to_e4m3x2(v / s, 0.0f) & 0xffu);
+    if ((threadIdx.x & 31) == 0) scale[row * (width / 32) + blk * 4 + (threadIdx.x >> 5)] = s;
+}}
+
+"##,
+        reduce = super::attention::prim::warp_reduce(Reduce::Max, "fabsf(v)")
+    )
+}
+
 pub fn dequant_bf16(name: &str) -> String {
     format!(
         r#"extern "C" __global__ void {name}(const void* w, const unsigned* table, bf16_t* out, int rows, int cols) {{

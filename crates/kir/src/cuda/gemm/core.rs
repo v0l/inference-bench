@@ -235,16 +235,8 @@ for (int h = 0; h < 2; h++) {
     }
 }
 "##),
-        r##"}
-
-__device__ __forceinline__ void mma_e4m3(float* c, const unsigned* a, unsigned b0, unsigned b1) {
-#if __CUDA_ARCH__ >= 890
-    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#endif
-}
-"##.to_string(),
+        "}\n\n".to_string(),
+        super::prim::mma_e4m3("mma_e4m3"),
     ]
     .concat()
 }

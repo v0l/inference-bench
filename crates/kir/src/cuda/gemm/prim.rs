@@ -132,6 +132,20 @@ pub fn mma_fp4(name: &str) -> String {
     )
 }
 
+pub fn mma_e4m3(name: &str) -> String {
+    device(
+        "void",
+        name,
+        "float* c, const unsigned* a, unsigned b0, unsigned b1",
+        r#"#if __CUDA_ARCH__ >= 890
+    asm("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+"#,
+    )
+}
+
 pub fn mma_mx(name: &str) -> String {
     device(
         "void",
