@@ -127,7 +127,11 @@ impl ServeOptions {
     }
 
     pub fn check_pool(&self, spec: &Spec) -> Result<()> {
-        let layout = self.layout(spec);
+        let mut resolved = spec.clone();
+        if let Some(r) = &self.runtime {
+            resolved.runtime = r.clone();
+        }
+        let layout = self.layout(&resolved);
         if layout.kv_blocks == 0 {
             return Ok(());
         }

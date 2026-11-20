@@ -609,6 +609,20 @@ mod tests {
     }
 
     #[test]
+    fn the_solved_pool_passes_the_engines_own_pool_check_in_both_modes() {
+        for mode in [Profile::MaxPerformance, Profile::LowMemory] {
+            for context in [8192, 32768, 262144] {
+                let spec = spec();
+                let s = run(mode, Target { context: Some(context), ..Default::default() }, &[], &pair(), &spec);
+                let opts = crate::serve::ServeOptions::from_solved(&s, Default::default()).unwrap();
+                let len = opts.model_len(&spec).unwrap();
+                let (spec, opts) = opts.for_kv_context(&spec, len);
+                opts.check_pool(&spec).unwrap_or_else(|e| panic!("{mode:?} context {context}: {e} ({})", s.log_line()));
+            }
+        }
+    }
+
+    #[test]
     fn max_performance_at_262144_context_keeps_tp2_and_names_what_it_chose() {
         let s = run(Profile::MaxPerformance, Target { context: Some(262144), ..Default::default() }, &[], &pair(), &spec());
         assert_eq!(s.tp, 2);
