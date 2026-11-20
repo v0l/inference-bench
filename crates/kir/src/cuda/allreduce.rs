@@ -83,10 +83,15 @@ fn quads(n: usize, body: &str) -> String {
     format!("{p}for (int i = threadIdx.x; i < WIDTH / 4; i += blockDim.x) {{\n{body}{p}}}\n")
 }
 
-fn residual_sum() -> String {
+fn peer_loads(threads: u32) -> String {
     format!(
-        "            float4 v = ((const float4*)(x + base))[i];\n            float s[4] = {{v.x, v.y, v.z, v.w}};\n#pragma unroll\n            for (int j = 0; j < 4; j++) {{\n{}                s[j] = s[j] + acc;\n            }}\n            ss += s[0] * s[0] + s[1] * s[1] + s[2] * s[2] + s[3] * s[3];\n            ((float4*)(x + base))[i] = make_float4(s[0], s[1], s[2], s[3]);\n",
-        prim::rank_sum(16, "float", "base + 4 * i + j")
+        "        constexpr int QUADS = (WIDTH / 4 + {threads} - 1) / {threads};\n        float4 pv[QUADS][AR_RANKS];\n#pragma unroll\n        for (int q = 0; q < QUADS; q++) {{\n            int i = threadIdx.x + q * {threads};\n            if (i < WIDTH / 4) {{\n#pragma unroll\n                for (int p = 0; p < AR_RANKS; p++) pv[q][p] = __ldcg((const float4*)((const float*)table[p] + base) + i);\n            }}\n        }}\n"
+    )
+}
+
+fn residual_sum(threads: u32) -> String {
+    format!(
+        "#pragma unroll\n        for (int q = 0; q < QUADS; q++) {{\n            int i = threadIdx.x + q * {threads};\n            if (i < WIDTH / 4) {{\n                float4 v = ((const float4*)(x + base))[i];\n                float s[4] = {{v.x, v.y, v.z, v.w}};\n                float acc[4] = {{0.0f, 0.0f, 0.0f, 0.0f}};\n#pragma unroll\n                for (int p = 0; p < AR_RANKS; p++) {{\n                    acc[0] += pv[q][p].x;\n                    acc[1] += pv[q][p].y;\n                    acc[2] += pv[q][p].z;\n                    acc[3] += pv[q][p].w;\n                }}\n#pragma unroll\n                for (int j = 0; j < 4; j++) s[j] = s[j] + acc[j];\n                ss += s[0] * s[0] + s[1] * s[1] + s[2] * s[2] + s[3] * s[3];\n                ((float4*)(x + base))[i] = make_float4(s[0], s[1], s[2], s[3]);\n            }}\n        }}\n"
     )
 }
 
@@ -100,8 +105,9 @@ fn add_rmsnorm(k: &AllReduceKernel, width: u32, eps: f32) -> String {
     s += "    for (int r = blockIdx.x; r < rows; r += gridDim.x)\n        for (int i = threadIdx.x; i < WIDTH; i += blockDim.x) {\n            mine[(size_t)r * WIDTH + i] = in[(size_t)r * WIDTH + i];\n            in[(size_t)r * WIDTH + i] = 0.0f;\n        }\n";
     s += &prim::sync_point(1);
     let body = format!(
-        "        size_t base = (size_t)r * WIDTH;\n        float ss = 0.0f;\n{}        float inv = rsqrtf(ar_block_sum(ss, scratch) / WIDTH + {}f);\n{}        __syncthreads();\n",
-        quads(8, &residual_sum()),
+        "        size_t base = (size_t)r * WIDTH;\n        float ss = 0.0f;\n{}{}        float inv = rsqrtf(ar_block_sum(ss, scratch) / WIDTH + {}f);\n{}        __syncthreads();\n",
+        peer_loads(k.threads),
+        residual_sum(k.threads),
         lit(eps),
         quads(8, norm_planes())
     );
