@@ -563,6 +563,21 @@ python = "python3"
     }
 
     #[test]
+    fn server_toml_devices_are_solved_to_tp2_before_the_engine_loads() {
+        let c = ServerConfig::parse(
+            "max_num_seqs = 4\n[[placement.devices]]\nname='box/gpu0'\nhost='box'\nordinal=0\nmemory_gib=96\nbandwidth_gbs=1800\ntflops=1000\npeer={latency_ms=0.01,bandwidth_gbs=50}\n[[placement.devices]]\nname='box/gpu1'\nhost='box'\nordinal=1\nmemory_gib=96\nbandwidth_gbs=1800\ntflops=1000\npeer={latency_ms=0.01,bandwidth_gbs=50}\n[[models]]\nid='m'",
+        )
+        .unwrap();
+        let spec_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../specrt/tests/fixtures/qwen3.8-27b-nvfp4.toml");
+        let spec = inference_bench_core::specrt_spec::Spec::load(&spec_path).unwrap();
+        let opts = c.serve_options(&c.models[0]).unwrap();
+        let solved = inference_bench_core::specrt_solve::for_options(&spec, &opts).unwrap().unwrap();
+        assert_eq!((solved.tp, solved.slots), (2, 4), "{}", solved.strategy);
+        let served = inference_bench_core::specrt_serve::ServeOptions::from_solved(&solved, opts).unwrap();
+        assert_eq!(served.solved.as_deref(), Some(&solved));
+    }
+
+    #[test]
     fn the_runtime_table_reaches_the_serving_options_with_defaults_for_missing_keys() {
         use inference_bench_core::specrt_serve::{RuntimeOptions, TileChoice};
         let c = ServerConfig::parse("max_num_seqs = 4\n[runtime]\ngraphs = false\ntile = \"narrow\"\ncache_dir = \"/tmp/ptx\"\n[[models]]\nid='m'").unwrap();

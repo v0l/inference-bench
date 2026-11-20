@@ -653,7 +653,7 @@ fn run(
                 };
                 match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &sink) {
                     Ok(o) => {
-                        let ctx = max_ctx.unwrap_or(specrt::engine::DEFAULT_CTX);
+                        let ctx = engine.solved.as_ref().map(|s| s.context).or(max_ctx).unwrap_or(specrt::engine::DEFAULT_CTX);
                         let vram_bytes = vram_before.zip(crate::gpu::used_total(&crate::gpu::sample()).map(|(used, _)| used)).map(|(b, a)| a.saturating_sub(b)).filter(|v| *v > 0);
                         let info = Loaded {
                             model_id: model_id.clone(),

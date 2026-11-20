@@ -451,10 +451,11 @@ pub fn for_options(spec: &Spec, opts: &crate::serve::ServeOptions) -> Result<Opt
             return Ok(None);
         }
         let machine = crate::hardware::probe()?;
-        return for_devices(spec, opts, &machine.devices(&[])).map(Some);
+        return for_devices(spec, opts, opts.tp, &machine.devices(&[])).map(Some);
     };
     if config.stages.is_empty() {
-        return for_devices(spec, opts, &config.devices).map(Some);
+        let tp = if config.max_tp == Some(1) { 1 } else { opts.tp };
+        return for_devices(spec, opts, tp, &config.devices).map(Some);
     }
     let mut resolved = spec.clone();
     if let Some(r) = &opts.runtime {
@@ -483,10 +484,13 @@ pub fn for_options(spec: &Spec, opts: &crate::serve::ServeOptions) -> Result<Opt
     }))
 }
 
-fn for_devices(spec: &Spec, opts: &crate::serve::ServeOptions, devices: &[DeviceConfig]) -> Result<Solved> {
+fn for_devices(spec: &Spec, opts: &crate::serve::ServeOptions, tp: usize, devices: &[DeviceConfig]) -> Result<Solved> {
     let mut pins = BTreeMap::new();
     pins.insert(PIN_SLOTS.to_string(), json!(opts.max_num_seqs));
-    pins.insert(PIN_TP.to_string(), json!(opts.tp.max(1)));
+    let capped = opts.placement.as_ref().is_some_and(|p| p.max_tp == Some(1));
+    if tp > 1 || capped {
+        pins.insert(PIN_TP.to_string(), json!(tp.max(1)));
+    }
     if let Some(b) = opts.kv_cache_bytes {
         pins.insert(PIN_POOL.to_string(), json!(b));
     }
@@ -561,6 +565,24 @@ mod tests {
     fn run(mode: Profile, target: Target, pins: &[(&str, Value)], devices: &[DeviceConfig], spec: &Spec) -> Solved {
         let pins = pins.iter().map(|(k, v)| (k.to_string(), v.clone())).collect();
         solve(&PlacementRequest { mode, target, pins, devices, spec }).unwrap()
+    }
+
+    #[test]
+    fn server_options_with_devices_and_no_tp_are_solved_for_max_performance() {
+        let opts = crate::serve::ServeOptions {
+            max_num_seqs: 8,
+            placement: Some(crate::placement::PlacementConfig { devices: pair(), ..Default::default() }),
+            ..Default::default()
+        };
+        let s = for_options(&spec(), &opts).unwrap().unwrap();
+        assert_eq!((s.tp, s.slots), (2, 8), "{}", s.strategy);
+        let one = crate::serve::ServeOptions {
+            placement: Some(crate::placement::PlacementConfig { devices: pair(), max_tp: Some(1), ..Default::default() }),
+            ..opts.clone()
+        };
+        assert_eq!(for_options(&spec(), &one).unwrap().unwrap().tp, 1);
+        let plain = crate::serve::ServeOptions::default();
+        assert!(for_options(&spec(), &plain).unwrap().is_none());
     }
 
     #[test]
