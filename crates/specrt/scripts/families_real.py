@@ -15,13 +15,14 @@ REPOS = {
     "granite-3.3-2b": "ibm-granite/granite-3.3-2b-base",
     "phi3-mini": "microsoft/Phi-3-mini-4k-instruct",
     "phi4-mini": "microsoft/Phi-4-mini-instruct",
+    "deepseek-v2-lite": "deepseek-ai/DeepSeek-V2-Lite",
 }
 
 
 def reference(name, out, dtype=torch.bfloat16):
     from transformers import AutoModelForCausalLM
 
-    model = AutoModelForCausalLM.from_pretrained(REPOS[name], torch_dtype=dtype, attn_implementation="eager").cuda().eval()
+    model = AutoModelForCausalLM.from_pretrained(REPOS[name], torch_dtype=dtype, attn_implementation="eager", device_map="cuda:0").eval()
     g = torch.Generator().manual_seed(11)
     ids = torch.randint(1000, 30000, (PROMPT,), generator=g)
     with torch.inference_mode():

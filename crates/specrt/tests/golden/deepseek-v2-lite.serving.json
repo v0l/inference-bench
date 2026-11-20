@@ -1,0 +1,222 @@
+{
+  "name": "deepseek_v2",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 2048,
+    "intermediate": 10944,
+    "vocab": 102400,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 27,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 16,
+    "kv_heads": 16,
+    "head_dim": 128,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "rotary_dim": 64,
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "mla_latent_norm",
+        "grid": [
+          "rows"
+        ],
+        "bind": {
+          "out": {
+            "buffer": "qkv"
+          },
+          "weight": {
+            "weight": "kv_a_layernorm.weight",
+            "len": "kv_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_rope_q",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_rope_k",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_latent_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "latent"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_absorb_q",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "kv_b_proj.weight",
+            "len": "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          },
+          "y": {
+            "buffer": "q_latent"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_attention",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "k_cache": {
+            "state": "latent"
+          },
+          "out": {
+            "buffer": "o_latent"
+          },
+          "q_latent": {
+            "buffer": "q_latent"
+          },
+          "softmax_scale": "softmax_scale",
+          "v_cache": {
+            "state": "latent"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_expand_v",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "kv_b_proj.weight",
+            "len": "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank"
+          },
+          "x": {
+            "buffer": "o_latent"
+          }
+        }
+      }
+    ],
+    "params": {
+      "kv_lora_rank": 512.0,
+      "mscale_all_dim": 0.707,
+      "qk_nope_head_dim": 128.0,
+      "qk_rope_head_dim": 64.0,
+      "softmax_scale": 0.11472138679292612,
+      "v_head_dim": 128.0,
+      "yarn_factor": 40.0,
+      "yarn_mscale": 1.2608037774058554
+    },
+    "projection": [
+      {
+        "tensor": "q_proj",
+        "rows": "heads * (qk_nope_head_dim + qk_rope_head_dim)"
+      },
+      {
+        "tensor": "kv_a_proj_with_mqa",
+        "rows": "kv_lora_rank + qk_rope_head_dim"
+      }
+    ],
+    "o_cols": "heads * v_head_dim",
+    "scratch": {
+      "o_latent": "heads * kv_lora_rank",
+      "q_latent": "heads * kv_lora_rank"
+    }
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0,
+    "scaling": {
+      "kind": "yarn",
+      "factor": 40.0,
+      "original_max_positions": 4096.0,
+      "yarn": {
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "attention_factor": 1.0,
+        "truncate": true
+      }
+    }
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 64,
+    "active": 6,
+    "expert_intermediate": 1408,
+    "shared_intermediate": 2816,
+    "dense_layers": [
+      0
+    ],
+    "norm_topk": false,
+    "shared_module": "shared_experts"
+  },
+  "state": [
+    {
+      "name": "latent",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "kv_lora_rank + qk_rope_head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    }
+  ]
+}

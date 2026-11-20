@@ -25,6 +25,7 @@
     "head_dim": 32,
     "qkv_bias": false,
     "qk_norm": false,
+    "rotary_dim": 32,
     "node": [
       {
         "op": "kernel",

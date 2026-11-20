@@ -16,6 +16,9 @@ split_activations = true
 [fields]
 num_experts = ["n_routed_experts"]
 
+[rope]
+rotary_dim_key = "qk_rope_head_dim"
+
 [moe]
 shared_module = "shared_experts"
 shared_gate = false
@@ -40,8 +43,8 @@ kv_lora_rank = { config = "kv_lora_rank" }
 qk_nope_head_dim = { config = "qk_nope_head_dim" }
 qk_rope_head_dim = { config = "qk_rope_head_dim" }
 v_head_dim = { config = "v_head_dim" }
-yarn_factor = { config = "rope_parameters.factor", default = 1.0 }
-mscale_all_dim = { config = "rope_parameters.mscale_all_dim", default = 0.0 }
+yarn_factor = { config = "rope_parameters.factor", alt = "rope_scaling.factor", default = 1.0 }
+mscale_all_dim = { config = "rope_parameters.mscale_all_dim", alt = "rope_scaling.mscale_all_dim", default = 0.0 }
 yarn_mscale = { expr = "select(yarn_factor > 1.0 && mscale_all_dim > 0.0, 0.1 * mscale_all_dim * log(yarn_factor) + 1.0, 1.0)" }
 softmax_scale = { expr = "yarn_mscale * yarn_mscale * rsqrt(qk_nope_head_dim + qk_rope_head_dim)" }
 

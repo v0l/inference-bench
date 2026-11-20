@@ -116,6 +116,15 @@ fn the_deepseek_config_becomes_a_latent_cache_and_mla_nodes_from_the_family_toml
 }
 
 #[test]
+fn the_real_deepseek_v2_lite_config_reads_the_yarn_mscale_from_rope_scaling() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/deepseek-v2-lite.config.json")).unwrap();
+    let spec = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap();
+    let mscale = 0.1 * 0.707 * 40f64.ln() + 1.0;
+    assert!((spec.attention.params["softmax_scale"] - mscale * mscale / 192f64.sqrt()).abs() < 1e-9);
+    assert_eq!(spec.rotary_dim(), 64);
+}
+
+#[test]
 fn the_deepseek_moe_config_reads_wide_shared_experts_and_the_routed_scale_from_the_family_toml() {
     let spec = spec(MLA_MOE);
     let moe = spec.moe.as_ref().unwrap();
@@ -165,6 +174,49 @@ fn mla_absorbed_over_the_latent_cache_matches_transformers() {
 #[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
 fn deepseek_moe_with_wide_shared_experts_matches_transformers() {
     close(MLA_MOE, 5e-2);
+}
+
+fn log_softmax(row: &[f32]) -> Vec<f64> {
+    let max = row.iter().cloned().fold(f32::MIN, f32::max) as f64;
+    let sum: f64 = row.iter().map(|&v| (v as f64 - max).exp()).sum();
+    row.iter().map(|&v| v as f64 - max - sum.ln()).collect()
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the cached deepseek-ai/DeepSeek-V2-Lite checkpoint and scripts/families_real.py f32 output in SPECRT_REF_DIR"]
+fn real_deepseek_v2_lite_matches_transformers_f32() {
+    let name = "deepseek-v2-lite";
+    let home = std::env::var_os("HF_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".cache/huggingface"));
+    let snapshots = home.join("hub/models--deepseek-ai--DeepSeek-V2-Lite/snapshots");
+    let snapshot = std::fs::read_dir(&snapshots).unwrap().flatten().map(|e| e.path()).find(|p| p.join("config.json").exists()).unwrap();
+    let json = std::fs::read_to_string(snapshot.join("config.json")).unwrap();
+    let mut spec = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap();
+    spec.name = name.into();
+    spec.repo = snapshot.display().to_string();
+    let (tokens, greedy, vocab, logits) = reference(name);
+    let rows = logits.len() / vocab;
+    spec.mlp.act_quant = specrt::spec::ActQuant::None;
+    spec.mlp.up_act_planes = 1;
+    spec.mlp.down_act_planes = 1;
+    let mut rt = Runtime::load_batched(&spec, 512, 1).unwrap();
+    let ours = rt.prompt_logits(&tokens).unwrap();
+    let first = tokens.len() - rows;
+    let top = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0;
+    let mut worst_kl = 0f64;
+    for r in 0..rows {
+        let a = &ours[(first + r) * vocab..(first + r + 1) * vocab];
+        let b = &logits[r * vocab..(r + 1) * vocab];
+        let (la, lb) = (log_softmax(a), log_softmax(b));
+        let kl: f64 = lb.iter().zip(&la).map(|(q, p)| q.exp() * (q - p)).sum();
+        eprintln!("{name} row {r} kl {kl}");
+        worst_kl = worst_kl.max(kl);
+        assert_eq!(top(a), top(b), "{name} row {r} top-1");
+    }
+    assert!(worst_kl < 0.02, "{name} kl {worst_kl}");
+    let got = rt.generate_batch(std::slice::from_ref(&tokens), greedy.len()).unwrap();
+    let same = got.tokens[0].iter().zip(&greedy).take_while(|(a, b)| a == b).count();
+    eprintln!("{name} greedy prefix {same}/{}", greedy.len());
+    assert_eq!(same, greedy.len(), "{name} greedy diverged after {same}");
 }
 
 #[test]

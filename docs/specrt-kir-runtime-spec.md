@@ -215,6 +215,8 @@ tiny-deepseek-v2 prefill max_abs 0.00039076805, greedy decode tokens equal
 
 Not covered: the fixture's MLP is dense, because V2 MoE (two shared experts wider than the routed ones) does not load yet (#830); the real DeepSeek-V2-Lite is about 31 GB in bf16, over the Spark budget. The MLA kernels are scalar, correct rather than fast.
 
+Real DeepSeek-V2-Lite (#834, `deepseek-ai/DeepSeek-V2-Lite`, 27 layers, 64 routed experts, YaRN), desktop GPU1, f32 transformers reference (`scripts/families_real.py f32 deepseek-v2-lite`, 300 token prompt), `tests/variants.rs real_deepseek_v2_lite_matches_transformers_f32`: KL per last row 1.4e-10 to 3.7e-10, top-1 equal on 4 of 4 rows, greedy 32/32. Two config gaps found by the real checkpoint: the YaRN factor and `mscale_all_dim` sit under `rope_scaling` in the original config (param `alt` key in the family TOML), and the rope rotates only `qk_rope_head_dim` of the head (`rotary_dim_key`). No vLLM speed line: not run, out of the window.
+
 ## 10. Status of slice (d)
 
 Plumbing, variant free:

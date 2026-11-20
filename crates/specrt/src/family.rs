@@ -23,7 +23,7 @@ impl Flag {
 #[serde(untagged)]
 pub enum ParamSource {
     Number(f64),
-    Config { config: String, #[serde(default)] default: Option<f64> },
+    Config { config: String, #[serde(default)] default: Option<f64>, #[serde(default)] alt: Option<String> },
     Expr { expr: String },
 }
 
@@ -59,10 +59,8 @@ impl ParamSource {
         match self {
             ParamSource::Number(v) => Ok(*v),
             ParamSource::Expr { .. } => read_params(&[(name.to_string(), self.clone())].into_iter().collect(), config).map(|m| m[name]),
-            ParamSource::Config { config: key, default } => key
-                .split('.')
-                .try_fold(config, |v, k| v.get(k))
-                .and_then(|v| v.as_f64().or_else(|| v.as_bool().map(f64::from)))
+            ParamSource::Config { config: key, default, alt } => std::iter::once(key).chain(alt.as_ref())
+                .find_map(|key| key.split('.').try_fold(config, |v, k| v.get(k)).and_then(|v| v.as_f64().or_else(|| v.as_bool().map(f64::from))))
                 .or(*default)
                 .with_context(|| format!("attention param {name} reads config.json key {key}, which is missing")),
         }
@@ -522,7 +520,12 @@ impl Family {
         }
         for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()) {
             match key {
-                ParamSource::Config { config, .. } => push(config, &mut out),
+                ParamSource::Config { config, alt, .. } => {
+                    push(config, &mut out);
+                    if let Some(alt) = alt {
+                        push(alt, &mut out);
+                    }
+                }
                 ParamSource::Expr { expr } => expr_keys(expr, &mut out),
                 ParamSource::Number(_) => {}
             }

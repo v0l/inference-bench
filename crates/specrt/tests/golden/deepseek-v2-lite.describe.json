@@ -1,0 +1,58 @@
+{
+  "name": "deepseek_v2",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 2048,
+    "intermediate": 10944,
+    "vocab": 102400,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 27,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 16,
+    "kv_heads": 16,
+    "head_dim": 128,
+    "qkv_bias": false,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0,
+    "scaling": {
+      "kind": "yarn",
+      "factor": 40.0,
+      "original_max_positions": 4096.0,
+      "yarn": {
+        "beta_fast": 32.0,
+        "beta_slow": 1.0,
+        "attention_factor": 1.0,
+        "truncate": true
+      }
+    }
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 64,
+    "active": 6,
+    "expert_intermediate": 1408,
+    "shared_intermediate": 2816,
+    "dense_layers": [
+      0
+    ],
+    "norm_topk": false,
+    "shared_gate": true
+  }
+}
