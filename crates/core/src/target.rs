@@ -105,6 +105,10 @@ pub trait Target: Send {
         None
     }
 
+    fn media_refusal(&self) -> Option<String> {
+        None
+    }
+
     fn requires_serving(&self) -> bool {
         false
     }

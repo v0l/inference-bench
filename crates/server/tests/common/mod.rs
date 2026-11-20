@@ -18,6 +18,7 @@ pub struct Stats {
     pub requests: Mutex<Vec<ChatRequest>>,
     pub loaded_names: Mutex<Vec<String>>,
     pub hung: AtomicBool,
+    pub refusal: Mutex<Option<String>>,
     pub consumed: AtomicUsize,
     pub sessions: Mutex<Option<Arc<inference_bench_core::specrt_sessions::Shared>>>,
 }
@@ -65,6 +66,10 @@ impl Target for Fake {
 
     fn sessions(&self) -> Option<Arc<inference_bench_core::specrt_sessions::Shared>> {
         self.stats.sessions.lock().unwrap().clone()
+    }
+
+    fn media_refusal(&self) -> Option<String> {
+        self.stats.refusal.lock().unwrap().clone()
     }
 
     fn failure(&self) -> Option<String> {

@@ -451,6 +451,18 @@ impl Executor for PipelineExecutor {
         self.pipe.release_state(slot)
     }
 
+    fn plan_media(&mut self, prompt: &[u32], media: &[MediaInput]) -> Result<Arc<crate::vision::MediaPlan>> {
+        self.pipe.plan_media(prompt, media)
+    }
+
+    fn media_encoder(&self) -> Option<Arc<crate::media_encode::MediaEncoder>> {
+        self.pipe.media_encoder()
+    }
+
+    fn set_media(&mut self, slot: usize, plan: Option<&crate::vision::MediaPlan>) -> Result<()> {
+        self.pipe.set_media(slot, plan)
+    }
+
     fn prefill(&mut self, slot: usize, tokens: &[u32], start: usize, sample: Option<(Sampling, u32)>) -> Result<Option<u32>> {
         self.pipe.prefill(slot, tokens, start, sample)
     }

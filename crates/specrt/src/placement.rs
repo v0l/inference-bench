@@ -305,6 +305,7 @@ pub struct CostModel {
     layers: Vec<LayerCost>,
     pub wgpu_blocker: Option<String>,
     embedding_bytes: u64,
+    pub vision_bytes: u64,
     head_bytes: u64,
     head_flops: f64,
     norm_bytes: u64,
@@ -355,6 +356,7 @@ impl CostModel {
             layers,
             wgpu_blocker: crate::wgsl::unsupported(&Spec { mtp: None, ..spec.clone() }),
             embedding_bytes: 2 * matrix,
+            vision_bytes: spec.vision.as_ref().map_or(0, |v| 2 * crate::vision_encoder::tower_params(&v.config)),
             head_bytes: quant_bytes(matrix, anatomy.head_quant),
             head_flops: FLOPS_PER_PARAM * matrix as f64 * rows,
             norm_bytes: 2 * spec.dims.hidden as u64,
@@ -373,13 +375,14 @@ impl CostModel {
     }
 
     pub fn rescale_weights(&mut self, weight_bytes: u64) {
-        let own: u64 = self.layers.iter().map(|l| l.weight_bytes).sum::<u64>() + self.embedding_bytes + self.head_bytes + self.norm_bytes;
+        let own: u64 = self.layers.iter().map(|l| l.weight_bytes).sum::<u64>() + self.embedding_bytes + self.vision_bytes + self.head_bytes + self.norm_bytes;
         let factor = if own == 0 { 1.0 } else { weight_bytes as f64 / own as f64 };
         let scale = |b: u64| (b as f64 * factor) as u64;
         for l in &mut self.layers {
             l.weight_bytes = scale(l.weight_bytes);
         }
         self.embedding_bytes = scale(self.embedding_bytes);
+        self.vision_bytes = scale(self.vision_bytes);
         self.head_bytes = scale(self.head_bytes);
     }
 
@@ -408,7 +411,7 @@ impl CostModel {
         let slice = &self.layers[start.min(self.layers.len())..end.min(self.layers.len())];
         let mut bytes: u64 = slice.iter().map(|l| l.weight_bytes).sum();
         if start == 0 {
-            bytes += self.embedding_bytes;
+            bytes += self.embedding_bytes + self.vision_bytes;
         }
         if end >= self.layers.len() {
             bytes += self.head_bytes + self.norm_bytes;
@@ -625,7 +628,7 @@ fn fit_stage(model: &CostModel, device_index: usize, device: &Device, start: usi
     if end == n {
         weights += model.head_bytes + model.norm_bytes;
     }
-    let weights = share(weights);
+    let weights = share(weights) + if start == 0 { model.vision_bytes } else { 0 };
     let kv: u64 = share(slice.iter().map(|l| l.kv_bytes).sum::<u64>() * model.slots as u64);
     let state: u64 = share(slice.iter().map(|l| l.state_bytes).sum::<u64>() * model.slots as u64);
     let available = device.memory_bytes.saturating_sub(device.reserve_bytes);
@@ -967,6 +970,19 @@ mod tests {
 
     fn qwen3() -> Spec {
         Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("specs/qwen3-0.6b.toml")).unwrap()
+    }
+
+    #[test]
+    fn the_stage_that_hosts_the_vision_tower_is_charged_for_it() {
+        let mut s = qwen27();
+        s.complete_from_checkpoint_config(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-fp8.config.json")).unwrap()).unwrap();
+        assert!(s.vision.is_some());
+        let with = CostModel::new(&s, 2048, 1);
+        let without = CostModel::new(&Spec { vision: None, ..s.clone() }, 2048, 1);
+        let n = with.layer_count();
+        assert!(with.vision_bytes > 0 && without.vision_bytes == 0);
+        assert_eq!(with.stage_bytes(0, n / 2) - without.stage_bytes(0, n / 2), with.vision_bytes);
+        assert_eq!(with.stage_bytes(n / 2, n), without.stage_bytes(n / 2, n));
     }
 
     #[test]

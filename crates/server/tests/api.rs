@@ -504,6 +504,17 @@ fn image_chat(url: &str) -> Value {
 const PIXEL: &str = "data:image/png;base64,iVBORw0KGgo=";
 
 #[test]
+fn the_image_refusal_names_the_reason_the_engine_gives_not_the_config() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    *rig.stats.refusal.lock().unwrap() = Some("the engine did not load a vision encoder (no GPU had room for it)".into());
+    let (status, body, _) = rig.post("/v1/chat/completions", None, image_chat(PIXEL));
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("no GPU had room for it"), "{body}");
+    assert!(!body.contains("vision_config"), "{body}");
+    rig.stop();
+}
+
+#[test]
 fn image_input_to_a_model_without_vision_is_a_400() {
     let rig = start(config("[[models]]\nid='m'"), Shape::default());
     let (status, body, _) = rig.post("/v1/chat/completions", None, image_chat(PIXEL));

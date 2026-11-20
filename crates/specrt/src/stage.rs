@@ -175,6 +175,7 @@ fn load_range(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize, dev
     let pages = max_ctx.div_ceil(crate::codegen::PAGE);
     let layout = Layout { kv_planes: 1, ..Layout::contiguous(max_ctx, slots) };
     let range = StageRange { device, start: layers[0], end: layers[1] };
+    let spec = &Spec { vision: None, ..spec.clone() };
     let mut rt = Runtime::load_stage(spec, layout, range)?;
     for slot in 0..slots {
         let blocks: Vec<u32> = (0..pages as u32).map(|p| (slot * pages) as u32 + p).collect();

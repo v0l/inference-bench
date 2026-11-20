@@ -116,6 +116,21 @@ impl Pipeline {
         self.stages.iter().map(|s| s.prefill_chunk_limit()).min().unwrap_or(0)
     }
 
+    pub fn media_encoder(&self) -> Option<std::sync::Arc<crate::media_encode::MediaEncoder>> {
+        self.stages.first().and_then(|s| s.media_encoder())
+    }
+
+    pub fn plan_media(&mut self, prompt: &[u32], media: &[crate::sched::MediaInput]) -> Result<std::sync::Arc<crate::vision::MediaPlan>> {
+        self.stages.first_mut().context("a pipeline needs at least one stage")?.plan_media(prompt, media)
+    }
+
+    pub fn set_media(&mut self, slot: usize, plan: Option<&crate::vision::MediaPlan>) -> Result<()> {
+        for rt in &mut self.stages {
+            rt.set_media(slot, plan)?;
+        }
+        Ok(())
+    }
+
     pub fn acquire_state(&mut self, slot: usize) -> Result<()> {
         for rt in &mut self.stages {
             rt.acquire_state(slot)?;

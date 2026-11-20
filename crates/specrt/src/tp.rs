@@ -267,7 +267,6 @@ pub fn rank_spec_of(spec: &Spec, tp: usize, rank: usize) -> Result<Spec> {
         l.key_heads = h.key;
         l.value_heads = h.value;
     }
-    s.vision = None;
     Ok(s)
 }
 

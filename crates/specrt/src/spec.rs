@@ -1923,7 +1923,6 @@ impl Spec {
             s.linear_attention = None;
         }
         s.mtp = None;
-        s.vision = None;
         if self.runtime.kv_dtype.is_fp8() {
             let attention = |range: std::ops::Range<usize>| range.filter(|&i| self.block(i).is_attention()).count();
             s.runtime.kv_f16_layers = Some(self.kv_f16_layers().saturating_sub(attention(0..start)).min(attention(start..end)));

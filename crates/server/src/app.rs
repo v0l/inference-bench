@@ -881,7 +881,8 @@ fn start_generation(
             admission.start();
             let caps = lease.backend().capabilities();
             let refusal = if !request.media.is_empty() && !caps.vision {
-                Some(format!("model {model} does not accept image or video input: its config has no vision_config"))
+                let why = lease.backend().media_refusal().unwrap_or_else(|| "this model's config has no vision_config".to_string());
+                Some(format!("model {model} does not accept image or video input: {why}"))
             } else if needs_batched && !caps.batched {
                 Some(format!("n > 1 needs the batched engine: load {model} with more than one parallel request (max_num_seqs above 1)"))
             } else if request.logprobs.is_some() && !caps.logprobs {

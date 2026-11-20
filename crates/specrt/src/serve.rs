@@ -527,7 +527,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
         }
         match build_tp(spec, &opts) {
             Ok(mut sched) => {
-                let _ = ready.send(Ok(false));
+                let _ = ready.send(Ok(sched.exec.media_encoder().is_some()));
                 run(&mut sched, inbox, stats, pulse);
             }
             Err(e) => {
@@ -539,7 +539,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
     match pipelined {
         Some((placement, micro_batch)) => match build_pipeline(spec, &opts, &placement, micro_batch) {
             Ok(mut sched) => {
-                let _ = ready.send(Ok(false));
+                let _ = ready.send(Ok(sched.exec.media_encoder().is_some()));
                 run(&mut sched, inbox, stats, pulse);
             }
             Err(e) => {
@@ -1055,6 +1055,17 @@ impl Serving {
 
     pub fn tokens(&self, text: &str) -> Result<Vec<u32>> {
         self.assets.tokens(text)
+    }
+
+    pub fn media_refusal(&self) -> Option<String> {
+        if self.accepts_media() {
+            return None;
+        }
+        Some(match (&self.assets.spec.vision, &self.assets.media) {
+            (None, _) => "this model's config has no vision_config".to_string(),
+            (Some(_), None) => "the engine did not load the image preprocessing assets (the preprocessor configs are missing)".to_string(),
+            (Some(_), Some(_)) => "the engine did not load a vision encoder (the checkpoint has no vision tensors)".to_string(),
+        })
     }
 
     pub fn accepts_media(&self) -> bool {

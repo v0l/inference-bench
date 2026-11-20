@@ -278,7 +278,7 @@ impl<B: Backend> Dense<B> {
         }
         ensure!(start < end && end <= spec.layers.count && slots >= 1, "stage layers {start}..{end} with {slots} slots do not fit the {} layers of {}", spec.layers.count, spec.name);
         let (first, last) = (start == 0, end == spec.layers.count);
-        let staged = if first && last { spec.clone() } else { spec.stage(start, end) };
+        let staged = if first && last { spec.clone() } else { Spec { vision: None, ..spec.stage(start, end) } };
         let limits = be.limits();
         ensure!(limits.max_storage_buffers >= 5, "this adapter allows {} storage buffers per stage, specrt needs 5", limits.max_storage_buffers);
         be.compile(&wgsl::generate(&staged, max_ctx, &limits.target())?)?;

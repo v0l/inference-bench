@@ -1149,7 +1149,8 @@ impl Runtime {
         if let Some(w) = mtp_weights {
             rt.mtp = Some(mtp::MtpState::new(&rt, w)?);
         }
-        if let Some(v) = &spec.vision
+        let hosts_vision = role.first && tp.is_none_or(|(_, rank, _)| rank == 0);
+        if let Some(v) = spec.vision.as_ref().filter(|_| hosts_vision)
             && crate::vision_encoder::has_tower(&checkpoint, &v.config) {
                 let opts = spec.runtime.vision;
                 let stream = rt.ctx.new_stream()?;
@@ -2433,12 +2434,15 @@ impl Runtime {
             self.stream.memcpy_htod(&plan.spans, &mut self.mm_bidi.slice_mut(slot * self.max_ctx..slot * self.max_ctx + n))?;
         }
         let rows: Vec<i32> = plan.positions.iter().map(|p| p[3]).collect();
-        let embeds = self.stream.clone_htod(plan.embeds.as_slice())?;
+        let embeds = if self.role.first { self.stream.clone_htod(plan.embeds.as_slice())? } else { self.stream.alloc_zeros(1)? };
         self.media[slot] = Some(MediaDevice { embeds, rows });
         Ok(())
     }
 
     pub(super) fn splice_media(&self, slot: usize, start: usize, n: usize, row_offset: usize) -> Result<()> {
+        if !self.role.first {
+            return Ok(());
+        }
         let Some(m) = self.media.get(slot).and_then(|m| m.as_ref()) else { return Ok(()) };
         let rows: Vec<i32> = (0..n).map(|i| m.rows.get(start + i).copied().unwrap_or(-1)).collect();
         if rows.iter().all(|&r| r < 0) {

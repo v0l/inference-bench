@@ -19,6 +19,7 @@ pub enum Reply {
     Spec(Vec<Vec<u32>>),
     Logits(Vec<f32>),
     Snapshot(StateSnapshot),
+    Encoder(Option<std::sync::Arc<crate::media_encode::MediaEncoder>>),
 }
 
 pub struct Rank {
@@ -45,6 +46,7 @@ pub struct TpExecutor {
     spec: Spec,
     fuse: bool,
     fused_prefill: Option<usize>,
+    encoder: Option<std::sync::Arc<crate::media_encode::MediaEncoder>>,
     _fabric: std::sync::Arc<Fabric>,
 }
 
@@ -130,6 +132,7 @@ impl TpExecutor {
             spec: spec.clone(),
             fuse: false,
             fused_prefill: None,
+            encoder: None,
             _fabric: fabric,
         };
         if let Some(e) = failed {
@@ -153,6 +156,10 @@ impl TpExecutor {
         exec.draft_tokens = first[4] as usize;
         exec.speculation_cap = first[5] as usize;
         exec.fuse = false;
+        exec.encoder = match exec.lead(|r| Ok(Reply::Encoder(r.rt.media_encoder())))? {
+            Reply::Encoder(e) => e,
+            _ => unreachable!(),
+        };
         Ok(exec)
     }
 
@@ -288,6 +295,21 @@ impl Executor for TpExecutor {
             other => other,
         }).collect())?;
         Ok(tokens.first().copied())
+    }
+
+    fn plan_media(&mut self, prompt: &[u32], media: &[crate::sched::MediaInput]) -> Result<std::sync::Arc<crate::vision::MediaPlan>> {
+        let enc = self.encoder.as_ref().context("this model was loaded without a vision encoder")?;
+        Ok(std::sync::Arc::new(enc.plan(prompt, media)?))
+    }
+
+    fn media_encoder(&self) -> Option<std::sync::Arc<crate::media_encode::MediaEncoder>> {
+        self.encoder.clone()
+    }
+
+    fn set_media(&mut self, slot: usize, plan: Option<&crate::vision::MediaPlan>) -> Result<()> {
+        let plan = plan.cloned().map(std::sync::Arc::new);
+        self.all(move |r| r.rt.set_media(slot, plan.as_deref()).map(|_| Reply::Unit))?;
+        Ok(())
     }
 
     fn decode(&mut self, rows: &[DecodeRow]) -> Result<Vec<u32>> {
