@@ -378,6 +378,7 @@ fn defaults() -> BTreeMap<String, Value> {
     d.extend(flat("runtime.prefix_cache", PrefixCacheOptions::default()));
     d.extend(flat("runtime.loader", LoaderOptions::default()));
     d.insert("speculative.enabled".into(), json!(true));
+    d.insert("runtime.pdl".into(), json!(false));
     d
 }
 

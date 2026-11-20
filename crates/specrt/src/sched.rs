@@ -2414,18 +2414,21 @@ mod tests {
 
     #[test]
     fn many_concurrent_chats_each_hit_their_previous_turn_with_the_default_snapshot_budget() {
-        let mut fake = Fake::new(2048, 4, 2000, 256);
+        let chats = 37;
+        let mut fake = Fake::new(2048, 4, 6000, 256);
         fake.hybrid = true;
-        let cfg = Config { prefix_cache: PrefixCacheOptions { enabled: true, ..PrefixCacheOptions::default() }, ..Config::default() };
+        let mut prefix_cache = PrefixCacheOptions { enabled: true, ..PrefixCacheOptions::default() };
+        prefix_cache.max_snapshots = crate::serve::auto_snapshots(prefix_cache.max_snapshots, chats, 157 << 20, 100 << 30);
+        assert_eq!(prefix_cache.max_snapshots, 148);
+        let cfg = Config { prefix_cache, ..Config::default() };
         let mut s = Scheduler::new(fake, cfg);
-        let chats = 8;
         let mut turns = Vec::new();
         for c in 0..chats {
-            let first = request(150, 40, 10 + c);
+            let first = request(150, 40, 10 + c as u32);
             let (out, _, _) = run_one(&mut s, first.clone());
             let mut next = first;
             next.prompt.extend(&out);
-            next.prompt.extend((0..30u32).map(|i| (i * 7 + c) % VOCAB));
+            next.prompt.extend((0..30u32).map(|i| (i * 7 + c as u32) % VOCAB));
             turns.push(next);
         }
         for (c, turn) in turns.into_iter().enumerate() {

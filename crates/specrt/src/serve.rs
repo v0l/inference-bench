@@ -1,7 +1,7 @@
 use crate::engine::Assets;
 use crate::runtime::{Layout, Runtime, Sampling, kv_block_bytes};
 use crate::sched::{self, ChainMetrics, Config, Event, Executor, Finish, GpuExecutor, PipelineExecutor, Scheduler, SeqId};
-use crate::spec::Spec;
+use crate::spec::{PrefixCacheOptions, Spec};
 pub use crate::spec::{RuntimeOptions, TileChoice};
 pub use crate::sessions::SessionOptions;
 
@@ -563,6 +563,12 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
 }
 
 fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
+    let mut prefix_cache = spec.runtime.prefix_cache;
+    if prefix_cache.enabled {
+        let mem_available = std::fs::read_to_string("/proc/meminfo").map_or(0, |t| crate::hardware::parse_meminfo(&t).1);
+        prefix_cache.max_snapshots = auto_snapshots(prefix_cache.max_snapshots, opts.max_num_seqs, slot_state_bytes(spec), mem_available);
+        tracing::info!(spec = %spec.name, max_snapshots = prefix_cache.max_snapshots, max_num_seqs = opts.max_num_seqs, "prefix cache snapshot budget");
+    }
     Config {
         max_num_seqs: opts.max_num_seqs,
         max_batched_tokens: opts.max_batched_tokens,
@@ -571,9 +577,21 @@ fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
         min_prefill_tokens: opts.min_prefill_tokens,
         swap_space_bytes: (opts.swap_space_gb * (1u64 << 30) as f64) as u64,
         admit_lookahead: opts.admit_lookahead,
-        prefix_cache: spec.runtime.prefix_cache,
+        prefix_cache,
         ..Config::default()
     }
+}
+
+pub fn auto_snapshots(configured: usize, seqs: usize, snapshot_bytes: u64, mem_available: u64) -> usize {
+    if configured != PrefixCacheOptions::default().max_snapshots || snapshot_bytes == 0 {
+        return configured;
+    }
+    let wanted = configured.max(seqs * 4);
+    if mem_available == 0 {
+        return wanted;
+    }
+    let affordable = (mem_available / 4 / snapshot_bytes) as usize;
+    wanted.min(affordable)
 }
 
 fn build_pipeline(spec: &Spec, opts: &ServeOptions, placement: &crate::placement::Placement, micro_batch: usize) -> Result<Scheduler<PipelineExecutor>> {
@@ -1205,6 +1223,24 @@ impl Serving {
         out.ttft_secs = first.duration_since(started).as_secs_f64();
         out.decode_secs = first.elapsed().as_secs_f64();
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod snapshot_budget_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_scales_with_seqs_and_is_capped_by_host_memory_and_an_explicit_value_wins() {
+        let snap = 157u64 << 20;
+        let gb = 1u64 << 30;
+        assert_eq!(auto_snapshots(32, 8, snap, 60 * gb), 32);
+        assert_eq!(auto_snapshots(32, 37, snap, 100 * gb), 148);
+        assert_eq!(auto_snapshots(32, 37, snap, 60 * gb), 97);
+        assert_eq!(auto_snapshots(32, 37, snap, 8 * gb), 13);
+        assert_eq!(auto_snapshots(32, 37, snap, 0), 148);
+        assert_eq!(auto_snapshots(7, 37, snap, 60 * gb), 7);
+        assert_eq!(auto_snapshots(0, 37, snap, 60 * gb), 0);
     }
 }
 
