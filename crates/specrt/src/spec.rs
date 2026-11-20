@@ -148,6 +148,7 @@ pub enum BackendChoice {
 pub struct RuntimeOptions {
     pub backend: BackendChoice,
     pub graphs: bool,
+    #[serde(skip_serializing_if = "is_false")]
     pub pdl: bool,
     pub fuse: bool,
     pub tile: TileChoice,
