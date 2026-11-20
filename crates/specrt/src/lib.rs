@@ -21,6 +21,7 @@ pub mod host;
 pub mod graph;
 pub mod grammar;
 pub mod jit;
+pub mod launch;
 pub mod link;
 pub mod loops;
 pub mod loader;

@@ -1,7 +1,7 @@
 use super::{DeviceLayer, Runtime, cfg};
 use crate::weights::{MoeWeights, Stacked};
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, LaunchConfig};
 use std::sync::Arc;
 
 pub(super) enum StackWeights {
@@ -208,18 +208,18 @@ impl Runtime {
         let mb = self.moe.as_ref().expect("moe buffers");
         let experts = self.spec.moe.as_ref().expect("moe spec").experts;
         let n_arg = n as i32;
-        let mut b = self.stream.launch_builder(self.kernel("moe_route_logits"));
+        let mut b = self.launcher(self.kernel("moe_route_logits"));
         b.arg(x).arg(&layer.ln2).arg(&w.router).arg(&w.shared_gate).arg(&w.router_bias).arg(&mb.xn).arg(&mb.logits).arg(&n_arg);
         let config = LaunchConfig { grid_dim: ((experts + 1).div_ceil(8) as u32, n.div_ceil(4) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
-        let mut b = self.stream.launch_builder(self.kernel("moe_route"));
+        let mut b = self.launcher(self.kernel("moe_route"));
         let first = self.spec.moe.as_ref().expect("moe spec").first_expert() as i32;
         b.arg(&mb.logits).arg(&w.score_bias).arg(&w.hash_table).arg(tokens).arg(&w.hashed).arg(&mb.idx).arg(&mb.coef).arg(&first);
         unsafe { b.launch(cfg(n as u32, 32)) }?;
         Ok(())
     }
 
-    fn stack_args<'a>(&'a self, b: &mut cudarc::driver::LaunchArgs<'a>, s: &'a StackWeights) {
+    fn stack_args<'a>(&'a self, b: &mut crate::launch::Launch<'a>, s: &'a StackWeights) {
         match s {
             StackWeights::Bf16(w) => b.arg(w).arg(&self.pre.dummy_u8).arg(&self.buf.dummy),
             StackWeights::Fp8 { values, grid } => b.arg(values).arg(&self.pre.dummy_u8).arg(grid),
@@ -248,7 +248,7 @@ impl Runtime {
         let kind = w.gate.suffix();
         let up = format!("moe_up_{kind}");
         let down = format!("moe_down_{kind}");
-        let mut b = self.stream.launch_builder(self.kernel(&up));
+        let mut b = self.launcher(self.kernel(&up));
         self.stack_args(&mut b, &w.gate);
         self.stack_args(&mut b, &w.up);
         b.arg(&w.gate_up_bias).arg(&mb.xn).arg(&mb.idx).arg(&mb.act);
@@ -258,7 +258,7 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        let mut b = self.stream.launch_builder(self.kernel(&down));
+        let mut b = self.launcher(self.kernel(&down));
         self.stack_args(&mut b, &w.down);
         b.arg(&w.down_bias).arg(&mb.act).arg(&mb.idx).arg(&mb.out);
         let config = LaunchConfig {
@@ -273,7 +273,7 @@ impl Runtime {
     fn moe_permute(&self, mb: &MoeBuffers, n: usize) -> Result<()> {
         let m = self.spec.moe.as_ref().expect("moe spec");
         let count = (n * m.pairs()) as i32;
-        let mut b = self.stream.launch_builder(self.kernel("moe_permute"));
+        let mut b = self.launcher(self.kernel("moe_permute"));
         b.arg(&mb.idx).arg(&mb.offsets).arg(&mb.sorted).arg(&count);
         unsafe { b.launch(cfg(1, 1024)) }?;
         Ok(())
@@ -305,7 +305,7 @@ impl Runtime {
         let max_tiles = slots + pairs / bm;
         self.moe_permute(mb, n)?;
         let (bm_i, max_i) = (bm as i32, max_tiles as i32);
-        let mut b = self.stream.launch_builder(self.kernel("moe_tiles"));
+        let mut b = self.launcher(self.kernel("moe_tiles"));
         b.arg(&mb.offsets).arg(&mma.tiles).arg(&bm_i).arg(&max_i);
         unsafe { b.launch(cfg(1, 32)) }?;
         let igs_up = gi.min(ui);
@@ -313,7 +313,7 @@ impl Runtime {
         let quant = |x: &CudaSlice<f32>, q: &CudaSlice<u8>, s: &CudaSlice<u8>, q2: &CudaSlice<u8>, s2: &CudaSlice<u8>, planes: u8, rows: usize, width: usize, igs: f32| -> Result<()> {
             let width = width as i32;
             let none = 0u64;
-            let mut b = self.stream.launch_builder(self.kernel(quant_kernel));
+            let mut b = self.launcher(self.kernel(quant_kernel));
             b.arg(x).arg(q).arg(s);
             if block {
                 if planes == 2 {
@@ -333,7 +333,7 @@ impl Runtime {
         let inv_up = 1.0 / igs_up;
         let tag = |planes: u8| if planes == 2 { "2" } else { "" };
         let name = format!("{stem}_up{}{}", tag(up_planes), if small { "_s" } else { "" });
-        let mut b = self.stream.launch_builder(self.kernel(&name));
+        let mut b = self.launcher(self.kernel(&name));
         b.arg(gw).arg(gs).arg(gg).arg(uw).arg(us).arg(ug).arg(&w.gate_up_bias).arg(&inv_up).arg(&mma.xq).arg(&mma.xs);
         if block {
             b.arg(&mma.xq2).arg(&mma.xs2);
@@ -344,7 +344,7 @@ impl Runtime {
         quant(&mb.act, &mma.aq, &mma.as_, &mma.aq2, &mma.as2, down_planes, pairs, inter, di)?;
         let inv_down = 1.0 / di;
         let name = format!("{stem}_down{}{}", tag(down_planes), if small { "_s" } else { "" });
-        let mut b = self.stream.launch_builder(self.kernel(&name));
+        let mut b = self.launcher(self.kernel(&name));
         b.arg(dw).arg(ds).arg(dg).arg(dw).arg(ds).arg(dg).arg(&w.down_bias).arg(&inv_down).arg(&mma.aq).arg(&mma.as_);
         if block {
             b.arg(&mma.aq2).arg(&mma.as2);
@@ -373,24 +373,24 @@ impl Runtime {
         let max_tiles = slots + pairs / bm;
         self.moe_permute(mb, n)?;
         let (bm_i, max_i) = (bm as i32, max_tiles as i32);
-        let mut b = self.stream.launch_builder(self.kernel("moe_tiles_b16"));
+        let mut b = self.launcher(self.kernel("moe_tiles_b16"));
         b.arg(&mb.offsets).arg(&mma.tiles).arg(&bm_i).arg(&max_i);
         unsafe { b.launch(cfg(1, 32)) }?;
         let split = |x: &CudaSlice<f32>, hi: &CudaSlice<u16>, lo: &CudaSlice<u16>, rows: usize, width: usize| -> Result<()> {
             let width = width as i32;
-            let mut b = self.stream.launch_builder(self.kernel("moe_split_bf16"));
+            let mut b = self.launcher(self.kernel("moe_split_bf16"));
             b.arg(x).arg(hi).arg(lo).arg(&width);
             unsafe { b.launch(cfg(rows as u32, 256)) }?;
             Ok(())
         };
         split(&mb.xn, &mma.xh, &mma.xl, n, h)?;
         let tag = if small { "_s" } else { "" };
-        let mut b = self.stream.launch_builder(self.kernel(&format!("moe_mma_up_b16{tag}")));
+        let mut b = self.launcher(self.kernel(&format!("moe_mma_up_b16{tag}")));
         b.arg(gw).arg(uw).arg(&w.gate_up_bias).arg(&mma.xh).arg(&mma.xl).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.act);
         let config = LaunchConfig { grid_dim: ((inter / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_bf16_smem(bm, up_weights) };
         unsafe { b.launch(config) }?;
         split(&mb.act, &mma.ah, &mma.al, pairs, inter)?;
-        let mut b = self.stream.launch_builder(self.kernel(&format!("moe_mma_down_b16{tag}")));
+        let mut b = self.launcher(self.kernel(&format!("moe_mma_down_b16{tag}")));
         b.arg(dw).arg(dw).arg(&w.down_bias).arg(&mma.ah).arg(&mma.al).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.out);
         let config = LaunchConfig { grid_dim: ((h / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_bf16_smem(bm, 1) };
         unsafe { b.launch(config) }?;
@@ -412,12 +412,12 @@ impl Runtime {
         let max_tiles = slots + pairs / bm;
         self.moe_permute(mb, n)?;
         let (bm_i, max_i) = (bm as i32, max_tiles as i32);
-        let mut b = self.stream.launch_builder(self.kernel("moe_tiles_f8"));
+        let mut b = self.launcher(self.kernel("moe_tiles_f8"));
         b.arg(&mb.offsets).arg(&mma.tiles).arg(&bm_i).arg(&max_i);
         unsafe { b.launch(cfg(1, 32)) }?;
         let quant = |x: &CudaSlice<f32>, q: &CudaSlice<u8>, s: &CudaSlice<f32>, rows: usize, width: usize| -> Result<()> {
             let w = width as i32;
-            let mut b = self.stream.launch_builder(self.kernel("moe_quant_f8"));
+            let mut b = self.launcher(self.kernel("moe_quant_f8"));
             b.arg(x).arg(q).arg(s).arg(&w);
             let config = LaunchConfig { grid_dim: (rows as u32, (width / FP8_BLOCK) as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
             unsafe { b.launch(config) }?;
@@ -425,13 +425,13 @@ impl Runtime {
         };
         quant(&mb.xn, &mma.xq, &mma.xs, n, h)?;
         let name = if small { "moe_mma_up_f8_s" } else { "moe_mma_up_f8" };
-        let mut b = self.stream.launch_builder(self.kernel(name));
+        let mut b = self.launcher(self.kernel(name));
         b.arg(gw).arg(gg).arg(uw).arg(ug).arg(&mma.xq).arg(&mma.xs).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.act);
         let config = LaunchConfig { grid_dim: ((inter / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma8_smem(bm, 2) };
         unsafe { b.launch(config) }?;
         quant(&mb.act, &mma.aq, &mma.as_, pairs, inter)?;
         let name = if small { "moe_mma_down_f8_s" } else { "moe_mma_down_f8" };
-        let mut b = self.stream.launch_builder(self.kernel(name));
+        let mut b = self.launcher(self.kernel(name));
         b.arg(dw).arg(dg).arg(dw).arg(dg).arg(&mma.aq).arg(&mma.as_).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.out);
         let config = LaunchConfig { grid_dim: ((h / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma8_smem(bm, 1) };
         unsafe { b.launch(config) }?;
@@ -442,12 +442,12 @@ impl Runtime {
         let m = self.spec.moe.as_ref().expect("moe spec");
         let slots = (m.local_experts() + m.shared_slots()) as u32;
         let count = (n * m.pairs()) as i32;
-        let mut b = self.stream.launch_builder(self.kernel("moe_permute"));
+        let mut b = self.launcher(self.kernel("moe_permute"));
         b.arg(&mb.idx).arg(&mb.offsets).arg(&mb.sorted).arg(&count);
         unsafe { b.launch(cfg(1, 1024)) }?;
         let kind = w.gate.suffix();
         let (up, down) = (format!("moe_group_up_{kind}"), format!("moe_group_down_{kind}"));
-        let mut b = self.stream.launch_builder(self.kernel(&up));
+        let mut b = self.launcher(self.kernel(&up));
         self.stack_args(&mut b, &w.gate);
         self.stack_args(&mut b, &w.up);
         b.arg(&w.gate_up_bias).arg(&mb.xn).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.act);
@@ -457,7 +457,7 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        let mut b = self.stream.launch_builder(self.kernel(&down));
+        let mut b = self.launcher(self.kernel(&down));
         self.stack_args(&mut b, &w.down);
         b.arg(&w.down_bias).arg(&mb.act).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.out);
         let config = LaunchConfig {
@@ -471,7 +471,7 @@ impl Runtime {
 
     pub(super) fn moe_combine(&self, x: &CudaSlice<f32>, n: usize) -> Result<()> {
         let mb = self.moe.as_ref().expect("moe buffers");
-        let mut b = self.stream.launch_builder(self.kernel("moe_combine"));
+        let mut b = self.launcher(self.kernel("moe_combine"));
         b.arg(x).arg(&mb.out).arg(&mb.coef);
         let config = LaunchConfig {
             grid_dim: (self.spec.dims.hidden.div_ceil(256) as u32, n as u32, 1),

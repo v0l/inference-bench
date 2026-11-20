@@ -4,7 +4,7 @@ use crate::plan::{Buf, NormKind, Op, Phase, Plan, Weight};
 use crate::graph::Bind;
 use crate::spec::{Block, Spec};
 use anyhow::{Context, Result, bail};
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, LaunchConfig};
 use std::ops::Range;
 
 pub(super) struct Plans {
@@ -140,7 +140,7 @@ impl Runtime {
             ints[i] = v as i32;
             floats[i] = v as f32;
         }
-        let mut b = self.stream.launch_builder(self.kernel(launch.name));
+        let mut b = self.launcher(self.kernel(launch.name));
         for (i, p) in launch.params.iter().enumerate() {
             match (p.role, p.name) {
                 (kir::Role::Value, _) => match p.ty {
@@ -226,7 +226,7 @@ impl Runtime {
             floats[i] = v as f32;
         }
         let launch_one = |name: &str, config: LaunchConfig, chunked: bool| -> Result<()> {
-            let mut b = self.stream.launch_builder(self.kernel(name));
+            let mut b = self.launcher(self.kernel(name));
             for (i, p) in launch.params.iter().enumerate() {
                 match (p.role, p.name) {
                     (kir::Role::Value, _) => match p.ty {
@@ -312,7 +312,7 @@ impl Runtime {
 
     fn embed_rows(&self, run: &Run) -> Result<()> {
         let hidden = self.spec.dims.hidden;
-        let mut b = self.stream.launch_builder(self.kernel("embed"));
+        let mut b = self.launcher(self.kernel("embed"));
         b.arg(&self.embed).arg(run.tokens).arg(&self.pre.x);
         let config = LaunchConfig {
             grid_dim: (grid(hidden, 256), run.n as u32, 1),
@@ -351,7 +351,7 @@ impl Runtime {
 
     fn norm_add_op(&self, which: NormKind, from: Buf, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
         let weight = self.norm_weight(which, layer);
-        let mut b = self.stream.launch_builder(self.kernel("norm_add"));
+        let mut b = self.launcher(self.kernel("norm_add"));
         let delta = self.f32_buf(from, run);
         b.arg(delta).arg(weight).arg(&self.pre.x).arg(&self.pre.x);
         unsafe { b.launch(super::cfg(run.n as u32, 1024)) }?;
@@ -361,7 +361,7 @@ impl Runtime {
     fn clear_op(&self, buf: Buf, run: &Run) -> Result<()> {
         let hidden = self.spec.dims.hidden;
         let target = self.f32_buf(buf, run);
-        let mut b = self.stream.launch_builder(self.kernel("clear_branch"));
+        let mut b = self.launcher(self.kernel("clear_branch"));
         b.arg(target).arg(target);
         let config = LaunchConfig { grid_dim: (grid(hidden, 256), run.n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
@@ -372,7 +372,7 @@ impl Runtime {
         let planes = self.planes(into);
         let source = self.f32_buf(from, run);
         let count = (run.n * self.spec.dims.hidden) as i32;
-        let mut b = self.stream.launch_builder(self.kernel("split_rows"));
+        let mut b = self.launcher(self.kernel("split_rows"));
         b.arg(source).arg(&planes.hi).arg(&planes.lo).arg(&count);
         unsafe { b.launch(super::cfg(super::grid(count as usize, 512), 256)) }?;
         Ok(())
@@ -381,7 +381,7 @@ impl Runtime {
     fn qk_norm_op(&self, l: &DeviceAttn, n: usize) -> Result<()> {
         let (q, k) = (l.q_norm.as_ref().expect("full-width qk norm has weights"), l.k_norm.as_ref().expect("full-width qk norm has weights"));
         for (name, w) in [("q_norm_rows", q), ("k_norm_rows", k)] {
-            let mut b = self.stream.launch_builder(self.kernel(name));
+            let mut b = self.launcher(self.kernel(name));
             b.arg(&self.pre.qkv).arg(w).arg(&self.pre.qkv);
             unsafe { b.launch(super::cfg(n as u32, 1024)) }?;
         }
@@ -391,7 +391,7 @@ impl Runtime {
     fn scaled_add_op(&self, from: Buf, run: &Run) -> Result<()> {
         let hidden = self.spec.dims.hidden;
         let delta = self.f32_buf(from, run);
-        let mut b = self.stream.launch_builder(self.kernel("residual_add"));
+        let mut b = self.launcher(self.kernel("residual_add"));
         b.arg(&self.pre.x).arg(delta).arg(&self.pre.x);
         let config = LaunchConfig { grid_dim: (grid(hidden, 256), run.n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
@@ -400,7 +400,7 @@ impl Runtime {
 
     fn softcap_op(&self, run: &Run, name: &str) -> Result<()> {
         let vocab = self.spec.dims.vocab;
-        let mut b = self.stream.launch_builder(self.kernel(name));
+        let mut b = self.launcher(self.kernel(name));
         b.arg(run.logits).arg(run.logits);
         let config = LaunchConfig { grid_dim: (grid(vocab, 256), run.rows.len() as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
@@ -498,7 +498,7 @@ impl Runtime {
         let buf = &self.buf;
         let table = self.slot_table(self.seq as usize);
         let (pages, mm_stride) = (self.pages as i32, self.max_ctx as i32);
-        let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
+        let mut b = self.launcher(self.kernel("qk_norm_rope"));
         b.arg(&pre.qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
             .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
@@ -529,7 +529,7 @@ impl Runtime {
         let buf = &self.buf;
         let table = self.slot_table(self.seq as usize);
         let ntok = n as i32;
-        let mut b = self.stream.launch_builder(self.kernel("flash_attention"));
+        let mut b = self.launcher(self.kernel("flash_attention"));
         b.arg(&pre.qkv)
             .arg(buf.k_cache())
             .arg(buf.v_cache())
@@ -551,7 +551,7 @@ impl Runtime {
     fn swiglu_legacy(&self, n: usize) -> Result<()> {
         let inter = self.spec.dims.intermediate;
         let pre = &self.pre;
-        let mut b = self.stream.launch_builder(self.kernel("swiglu"));
+        let mut b = self.launcher(self.kernel("swiglu"));
         b.arg(&pre.gate_up).arg(&pre.act);
         let config = LaunchConfig {
             grid_dim: (grid(inter, 256), n as u32, 1),
