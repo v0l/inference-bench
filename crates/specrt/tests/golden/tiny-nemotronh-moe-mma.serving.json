@@ -1,0 +1,257 @@
+{
+  "name": "nemotron_h",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 320,
+    "intermediate": 512,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 9,
+    "pattern": [
+      "linear",
+      "mlp",
+      "full",
+      "mlp",
+      "linear",
+      "mlp",
+      "linear",
+      "full",
+      "mlp"
+    ],
+    "split": true
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 64,
+    "qkv_bias": false,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0,
+    "nope_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ]
+  },
+  "mlp": {
+    "activation": "mapped",
+    "mapped": {
+      "expr": "max(x, 0.0) * max(x, 0.0)",
+      "params": {}
+    }
+  },
+  "moe": {
+    "experts": 8,
+    "active": 3,
+    "expert_intermediate": 128,
+    "shared_intermediate": 256,
+    "dense_layers": [
+      0,
+      2,
+      4,
+      6,
+      7
+    ],
+    "router": "sigmoid",
+    "shared_module": "shared_experts",
+    "routed_scale": 2.5,
+    "score_bias": true
+  },
+  "mixer": {
+    "module": "mixer",
+    "projection": [
+      {
+        "tensor": "in_proj",
+        "rows": "ssm_in"
+      }
+    ],
+    "out_tensor": "out_proj",
+    "out_cols": "ssm_inner",
+    "params": {
+      "ssm_conv": 576.0,
+      "ssm_conv_blocks": 5.0,
+      "ssm_groups": 2.0,
+      "ssm_head_dim": 32.0,
+      "ssm_heads": 16.0,
+      "ssm_in": 1104.0,
+      "ssm_inner": 512.0,
+      "ssm_state": 16.0,
+      "ssm_taps": 4.0
+    },
+    "scratch": {
+      "ssm_y": "ssm_inner",
+      "xbc": "ssm_conv"
+    },
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "mamba2_conv",
+        "grid": [
+          "ssm_conv_blocks",
+          "seqs"
+        ],
+        "bind": {
+          "bias": {
+            "weight": "conv1d.bias",
+            "len": "ssm_conv"
+          },
+          "state": {
+            "state": "conv"
+          },
+          "w": {
+            "weight": "conv1d.weight",
+            "len": "ssm_conv * ssm_taps"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "xbc"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mamba2_scan",
+        "grid": [
+          "ssm_heads",
+          "seqs"
+        ],
+        "bind": {
+          "a_log": {
+            "weight": "A_log",
+            "len": "ssm_heads"
+          },
+          "dt_bias": {
+            "weight": "dt_bias",
+            "len": "ssm_heads"
+          },
+          "mix": {
+            "buffer": "mix"
+          },
+          "skip": {
+            "weight": "D",
+            "len": "ssm_heads"
+          },
+          "ssm": {
+            "state": "ssm"
+          },
+          "xbc": {
+            "buffer": "xbc"
+          },
+          "y": {
+            "buffer": "ssm_y"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mamba2_gated_norm",
+        "grid": [
+          "ssm_groups",
+          "rows"
+        ],
+        "bind": {
+          "g": {
+            "buffer": "mix"
+          },
+          "w": {
+            "weight": "gnorm.weight",
+            "len": "ssm_inner"
+          },
+          "x": {
+            "buffer": "ssm_y"
+          }
+        }
+      }
+    ]
+  },
+  "state": [
+    {
+      "name": "conv",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "ssm_conv",
+        "ssm_taps - 1"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "ssm",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "ssm_heads",
+        "ssm_state",
+        "ssm_head_dim"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "k",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "v",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    }
+  ],
+  "tensors": {
+    ".mixer.down_proj.": ".mlp.down_proj.",
+    ".mixer.experts.": ".mlp.experts.",
+    ".mixer.gate.": ".mlp.gate.",
+    ".mixer.k_proj.": ".self_attn.k_proj.",
+    ".mixer.norm.": ".mixer.gnorm.",
+    ".mixer.o_proj.": ".self_attn.o_proj.",
+    ".mixer.q_proj.": ".self_attn.q_proj.",
+    ".mixer.shared_experts.": ".mlp.shared_experts.",
+    ".mixer.up_proj.": ".mlp.up_proj.",
+    ".mixer.v_proj.": ".self_attn.v_proj.",
+    ".norm.weight": ".input_layernorm.weight",
+    "backbone.embeddings.": "model.embed_tokens.",
+    "backbone.layers.": "model.layers.",
+    "backbone.norm_f.": "model.norm."
+  }
+}
