@@ -42,6 +42,7 @@ pub mod remote;
 pub mod runtime;
 pub mod sched;
 pub mod serve;
+pub mod solve;
 pub mod sessions;
 pub mod tp;
 pub mod tp_exec;
