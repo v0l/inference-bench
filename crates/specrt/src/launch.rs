@@ -6,13 +6,15 @@ pub struct Launch<'a> {
     stream: &'a CudaStream,
     func: &'a CudaFunction,
     args: Vec<*mut c_void>,
+    #[allow(clippy::vec_box)]
     ptrs: Vec<Box<CUdeviceptr>>,
     pdl: bool,
+    small_grid: u32,
 }
 
 impl<'a> Launch<'a> {
-    pub fn new(stream: &'a CudaStream, func: &'a CudaFunction, pdl: bool) -> Self {
-        Launch { stream, func, args: Vec::new(), ptrs: Vec::new(), pdl }
+    pub fn new(stream: &'a CudaStream, func: &'a CudaFunction, pdl: bool, small_grid: u32) -> Self {
+        Launch { stream, func, args: Vec::new(), ptrs: Vec::new(), pdl, small_grid }
     }
 
     fn push_ptr(&mut self, ptr: CUdeviceptr) {
@@ -28,6 +30,7 @@ impl<'a> Launch<'a> {
         let mut attr: sys::CUlaunchAttribute = unsafe { std::mem::zeroed() };
         attr.id = sys::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
         attr.value.programmaticStreamSerializationAllowed = 1;
+        let programmatic = self.pdl && cfg.grid_dim.0 * cfg.grid_dim.1 * cfg.grid_dim.2 <= self.small_grid;
         let config = sys::CUlaunchConfig {
             gridDimX: cfg.grid_dim.0,
             gridDimY: cfg.grid_dim.1,
@@ -37,8 +40,8 @@ impl<'a> Launch<'a> {
             blockDimZ: cfg.block_dim.2,
             sharedMemBytes: cfg.shared_mem_bytes,
             hStream: self.stream.cu_stream(),
-            attrs: if self.pdl { &mut attr } else { std::ptr::null_mut() },
-            numAttrs: self.pdl as u32,
+            attrs: if programmatic { &mut attr } else { std::ptr::null_mut() },
+            numAttrs: programmatic as u32,
         };
         unsafe { sys::cuLaunchKernelEx(&config, self.func.cu_function(), self.args.as_mut_ptr(), std::ptr::null_mut()) }.result()
     }

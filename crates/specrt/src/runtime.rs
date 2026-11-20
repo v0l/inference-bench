@@ -1217,7 +1217,7 @@ impl Runtime {
     }
 
     fn launcher<'a>(&'a self, f: &'a CudaFunction) -> crate::launch::Launch<'a> {
-        crate::launch::Launch::new(&self.stream, f, self.pdl)
+        crate::launch::Launch::new(&self.stream, f, self.pdl, self.sms * 8)
     }
 
     fn kernel(&self, name: &str) -> &CudaFunction {
