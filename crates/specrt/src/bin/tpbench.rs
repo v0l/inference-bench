@@ -128,9 +128,20 @@ fn compare(spec: &Spec, a: &Args, tps: &[usize]) -> Result<()> {
     Ok(())
 }
 
+fn load_spec(path: &str) -> Result<Spec> {
+    let p = std::path::Path::new(path);
+    if !p.is_dir() {
+        return Spec::load(p);
+    }
+    let mut spec = Spec::from_hf_config_serving(&std::fs::read_to_string(p.join("config.json"))?)?;
+    spec.repo = path.to_string();
+    spec.name = p.file_name().map_or("model".into(), |n| n.to_string_lossy().into_owned());
+    Ok(spec)
+}
+
 fn main() -> Result<()> {
     let a = parse()?;
-    let spec = Spec::load(std::path::Path::new(&a.spec))?;
+    let spec = load_spec(&a.spec)?;
     if let Some(tps) = a.compare.clone() {
         return compare(&spec, &a, &tps);
     }
