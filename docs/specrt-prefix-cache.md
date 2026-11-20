@@ -105,7 +105,7 @@ idle session disk snapshot issue needs to persist.
 [runtime.prefix_cache]
 enabled = false
 snapshot_interval = 2048
-max_snapshots = 4
+max_snapshots = 32
 max_blocks = 0
 ```
 
@@ -200,7 +200,7 @@ as each chunk completes, so requests admitted in later steps already hit (hit ra
 prompt tokens before any wave finished).
 
 Snapshot memory on the 27B: 8 snapshots held 1255 MB of host memory, 157 MB each (conv plus ssm
-state, f32). `max_snapshots` is the budget: the default of 4 is 0.63 GB. Snapshots live in host
+state, f32). `max_snapshots` is the budget: the default of 32 is 5 GB, enough for the tail states of many conversations plus their interval points (the old default of 4 evicted a chat's end state before its next turn, so agent traffic missed the cache). Snapshots live in host
 memory, not in the KV pool, so they do not reduce KV blocks. Eviction under pressure is covered by
 `cached_blocks_are_evicted_when_new_requests_need_the_pool_and_output_stays_exact` and the GPU test
 `tiny_prefix_cached_scheduling_matches_single_sequence_greedy` (90 blocks, 6 slots, 24 requests with

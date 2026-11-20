@@ -2413,6 +2413,28 @@ mod tests {
     }
 
     #[test]
+    fn many_concurrent_chats_each_hit_their_previous_turn_with_the_default_snapshot_budget() {
+        let mut fake = Fake::new(2048, 4, 2000, 256);
+        fake.hybrid = true;
+        let cfg = Config { prefix_cache: PrefixCacheOptions { enabled: true, ..PrefixCacheOptions::default() }, ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        let chats = 8;
+        let mut turns = Vec::new();
+        for c in 0..chats {
+            let first = request(150, 40, 10 + c);
+            let (out, _, _) = run_one(&mut s, first.clone());
+            let mut next = first;
+            next.prompt.extend(&out);
+            next.prompt.extend((0..30u32).map(|i| (i * 7 + c) % VOCAB));
+            turns.push(next);
+        }
+        for (c, turn) in turns.into_iter().enumerate() {
+            let (_, cached, _) = run_one(&mut s, turn);
+            assert_eq!(cached, 189, "chat {c} lost its previous turn");
+        }
+    }
+
+    #[test]
     fn a_hybrid_hit_restores_the_snapshot_and_a_plain_model_needs_none() {
         let mut s = Scheduler::new(Fake::new(2048, 4, 200, 256), cached_config(128, 4));
         run_one(&mut s, request(300, 4, 2));
