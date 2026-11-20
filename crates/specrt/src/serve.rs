@@ -542,7 +542,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
     if solved.tp > 1 {
         match build_tp(spec, &opts, &solved) {
             Ok(mut sched) => {
-                let _ = ready.send(Ok(false));
+                let _ = ready.send(Ok(sched.exec.media_encoder().is_some()));
                 run(&mut sched, inbox, stats, pulse);
             }
             Err(e) => {
@@ -555,7 +555,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
         let micro_batch = opts.placement.as_ref().map_or(0, |p| p.micro_batch_in_process());
         match build_pipeline(spec, &opts, &solved.placement, micro_batch) {
             Ok(mut sched) => {
-                let _ = ready.send(Ok(false));
+                let _ = ready.send(Ok(sched.exec.media_encoder().is_some()));
                 run(&mut sched, inbox, stats, pulse);
             }
             Err(e) => {
