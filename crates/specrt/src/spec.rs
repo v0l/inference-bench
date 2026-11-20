@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 12;
+pub const SPEC_FORMAT: u32 = 13;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -302,6 +302,7 @@ pub enum Block {
     Shared,
     Compressed,
     Indexed,
+    Mlp,
 }
 
 impl Block {
@@ -309,12 +310,16 @@ impl Block {
         self == Block::Linear
     }
 
+    pub fn is_attention(self) -> bool {
+        !matches!(self, Block::Linear | Block::Mlp)
+    }
+
     pub fn windowed(self) -> bool {
         matches!(self, Block::Sliding | Block::Compressed | Block::Indexed)
     }
 
     pub fn parse(name: &str) -> Result<Block> {
-        [Block::Dense, Block::Full, Block::Sliding, Block::Linear, Block::Shared, Block::Compressed, Block::Indexed].into_iter().find(|b| b.name() == name).with_context(|| format!("{name:?} is not a layer kind"))
+        [Block::Dense, Block::Full, Block::Sliding, Block::Linear, Block::Shared, Block::Compressed, Block::Indexed, Block::Mlp].into_iter().find(|b| b.name() == name).with_context(|| format!("{name:?} is not a layer kind"))
     }
 
     pub fn name(self) -> &'static str {
@@ -326,6 +331,7 @@ impl Block {
             Block::Shared => "shared",
             Block::Compressed => "compressed",
             Block::Indexed => "indexed",
+            Block::Mlp => "mlp",
         }
     }
 }
@@ -404,6 +410,7 @@ pub enum RopeStyle {
 pub enum Activation {
     Swiglu,
     Geglu,
+    Mapped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -672,6 +679,8 @@ pub struct Layers {
     pub pattern: Vec<Block>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub split: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -804,6 +813,8 @@ pub struct Mlp {
     pub fused_gate_up: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated: Option<GatedAct>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapped: Option<GatedAct>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -966,6 +977,9 @@ struct HfConfig {
 }
 
 fn nope_layers(rope: &crate::family::FamilyRope, config: &serde_json::Value, layers: usize) -> Vec<usize> {
+    if rope.nope_all {
+        return (0..layers).collect();
+    }
     if let (Some(key), Some(value)) = (rope.nope_key.as_deref(), rope.nope_value.as_deref())
         && config.get(key).and_then(|v| v.as_str()) == Some(value)
     {
@@ -1352,6 +1366,7 @@ impl Spec {
     pub fn check_moe_runnable(&self) -> Result<()> {
         let Some(m) = &self.moe else { return Ok(()) };
         ensure!(self.linear_attention.is_some() || self.attention_layers() > 0, "mixture-of-experts needs attention layers");
+        ensure!(self.mlp.mapped.is_none(), "mixture-of-experts with non-gated ([mlp.mapped]) experts is not supported yet");
         let experts_quant = self.mlp.quant.unwrap_or(self.quant);
         ensure!(
             matches!(experts_quant, Quant::Bf16 | Quant::Nvfp4G16 | Quant::Fp8Block128 | Quant::Gguf | Quant::Q8),
@@ -1477,6 +1492,7 @@ impl Spec {
         let local_theta = by_block(Block::Sliding).or_else(|| family.rope.local_theta_key.as_deref().and_then(|k| k.split('.').try_fold(&value, |v, p| v.get(p)).and_then(|v| v.as_f64())));
         let dotted = |path: &str| path.split('.').try_fold(&value, |v, k| v.get(k)).and_then(|v| v.as_f64());
         let theta = family.rope.theta_key.as_deref().and_then(dotted).or(hf.rope_theta).or(param("rope_theta")).or(by_block(Block::Full));
+        let theta = theta.or(family.rope.nope_all.then_some(10_000.0));
         let theta = if strict { Some(theta.context("no rope_theta")?) } else { theta };
         let mapped = hf.hidden_act.as_deref().and_then(|a| family.activation.map.get(a).copied());
         let activation = match (mapped, hf.hidden_act.as_deref(), strict) {
@@ -1511,9 +1527,18 @@ impl Spec {
             let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()).collect();
             (0..hf.num_hidden_layers).map(|i| if full.contains(&(i as u64)) { "full_attention" } else { "linear_attention" }.to_string()).collect::<Vec<_>>()
         });
-        let keyed: Option<Vec<String>> = family.blocks.types_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| {
-            a.iter().filter_map(|v| v.as_str().map(String::from).or_else(|| v.as_u64().map(|n| n.to_string()))).collect()
+        let keyed: Option<Vec<String>> = family.blocks.types_key.as_deref().and_then(|k| value.get(k)).and_then(|v| match v {
+            serde_json::Value::String(s) => Some(s.chars().map(String::from).collect()),
+            serde_json::Value::Array(a) => Some(a.iter().filter_map(|v| v.as_str().map(String::from).or_else(|| v.as_u64().map(|n| n.to_string()))).collect()),
+            _ => None,
         });
+        if strict && let Some(types) = keyed.as_ref() {
+            ensure!(types.len() == hf.num_hidden_layers, "{} names {} layers but num_hidden_layers is {}", family.blocks.types_key.as_deref().unwrap_or_default(), types.len(), hf.num_hidden_layers);
+        }
+        let dense_types: Vec<usize> = match keyed.as_ref() {
+            Some(types) if !family.blocks.sparse_types.is_empty() => types.iter().enumerate().filter(|(_, t)| !family.blocks.sparse_types.contains(t)).map(|(i, _)| i).collect(),
+            _ => Vec::new(),
+        };
         let mixer = family.mixer.read(&value)?;
         let pattern = match keyed.as_ref().or(indexed.as_ref()).or(hf.layer_types.as_ref()) {
             Some(types) if keyed.is_some() || hybrid || !strict || family.blocks.from_layer_types || types.iter().any(|t| family.blocks.layer_types.get(t) == Some(&Block::Sliding)) => layer_pattern(&family.blocks, types, strict)?,
@@ -1554,6 +1579,7 @@ impl Spec {
                     .or_else(|| hf.n_shared_experts.filter(|n| *n > 0).map(|n| n * expert_intermediate))
                     .unwrap_or(0);
                 let mut dense = hf.mlp_only_layers.clone();
+                dense.extend(dense_types.iter().copied());
                 dense.extend(0..hf.first_k_dense_replace.unwrap_or(0));
                 dense.sort_unstable();
                 dense.dedup();
@@ -1611,7 +1637,7 @@ impl Spec {
                 logit_softcap: hf.final_logit_softcapping,
                 logit_scale: multiplier(&family.multipliers.logits_divisor).filter(|d| *d > 0.0).map(|d| 1.0 / d),
             },
-            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern },
+            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern, split: family.blocks.split },
             norm: Norm {
                 kind: NormKind::Rmsnorm,
                 eps: hf.rms_norm_eps,
@@ -1653,6 +1679,10 @@ impl Spec {
                     Some(g) => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
                     None => None,
                 },
+                mapped: match &family.mlp.mapped {
+                    Some(g) if activation == Activation::Mapped => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
+                    _ => None,
+                },
             },
             moe,
             mtp: (family.mtp && hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
@@ -1674,6 +1704,10 @@ impl Spec {
     pub fn validate(&self) -> Result<()> {
         self.runtime.validate()?;
         ensure!(!self.layers.pattern.iter().any(|b| b.windowed()) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
+        ensure!(self.layers.split || !self.layers.pattern.contains(&Block::Mlp), "mlp layers need [layers] split = true");
+        ensure!((self.mlp.activation == Activation::Mapped) == self.mlp.mapped.is_some(), "activation = \"mapped\" and [mlp.mapped] go together");
+        ensure!(self.mlp.mapped.is_none() || self.mlp.gated.is_none(), "[mlp] cannot be both gated and mapped");
+        ensure!(self.mlp.mapped.is_none() || self.mlp.quant.is_none(), "a non-gated ([mlp.mapped]) mlp runs on bf16, fp8 and q8 weights only");
         self.validate_attention_nodes()?;
         self.validate_mixer()?;
         crate::state::validate(self)?;
@@ -1845,7 +1879,7 @@ impl Spec {
         s.mtp = None;
         s.vision = None;
         if self.runtime.kv_dtype.is_fp8() {
-            let attention = |range: std::ops::Range<usize>| range.filter(|&i| !self.block(i).is_linear()).count();
+            let attention = |range: std::ops::Range<usize>| range.filter(|&i| self.block(i).is_attention()).count();
             s.runtime.kv_f16_layers = Some(self.kv_f16_layers().saturating_sub(attention(0..start)).min(attention(start..end)));
         }
         s
@@ -1980,7 +2014,27 @@ impl Spec {
     }
 
     pub fn attention_layers(&self) -> usize {
-        self.layers.count - self.linear_layers()
+        (0..self.layers.count).filter(|&i| self.block(i).is_attention()).count()
+    }
+
+    pub fn attention_before(&self, layer: usize) -> usize {
+        (0..layer).filter(|&i| self.block(i).is_attention()).count()
+    }
+
+    pub fn gate_up_rows(&self) -> usize {
+        if self.mlp.mapped.is_some() { self.dims.intermediate } else { 2 * self.dims.intermediate }
+    }
+
+    pub fn gate_up_out(&self, rows: usize) -> usize {
+        if self.mlp.mapped.is_some() { rows } else { rows / 2 }
+    }
+
+    pub fn has_mlp(&self, layer: usize) -> bool {
+        !self.layers.split || self.block(layer) == Block::Mlp
+    }
+
+    pub fn has_mixer(&self, layer: usize) -> bool {
+        !self.layers.split || self.block(layer) != Block::Mlp
     }
 
     pub fn speculative(&self) -> Option<&Mtp> {

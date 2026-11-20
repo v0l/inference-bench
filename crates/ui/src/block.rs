@@ -139,6 +139,7 @@ fn mlp_rows(layer: &Layer, module: &str, spec: &Spec) -> Vec<Row> {
     let act = match spec.mlp.activation {
         Activation::Swiglu => "swiglu",
         Activation::Geglu => "geglu",
+        Activation::Mapped => "mapped",
     };
     if routed {
         let shared: Vec<&Group> = groups.iter().copied().filter(|g| g.path.contains("shared")).collect();

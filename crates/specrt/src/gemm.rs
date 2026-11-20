@@ -105,9 +105,13 @@ pub fn policy(spec: &Spec) -> Policy {
 
 fn act(spec: &Spec) -> kir::Activation {
     match spec.mlp.activation {
-        Activation::Swiglu => kir::Activation::Silu,
+        Activation::Swiglu | Activation::Mapped => kir::Activation::Silu,
         Activation::Geglu => kir::Activation::GeluTanh,
     }
+}
+
+fn gate_up_epilogue(spec: &Spec) -> Epilogue {
+    if spec.mlp.mapped.is_some() { Epilogue::Map } else { Epilogue::Act }
 }
 
 pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
@@ -116,7 +120,7 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
     let (n, k, epi, bias) = match linear {
         "qkv" => (spec.qkv_rows(), d.hidden, Epilogue::Store, spec.attention.qkv_bias),
         "o" => (d.hidden, spec.o_dim(), Epilogue::Residual, spec.attention.o_bias),
-        "gate_up" => (2 * d.intermediate, d.hidden, Epilogue::Act, false),
+        "gate_up" => (spec.gate_up_rows(), d.hidden, gate_up_epilogue(spec), false),
         "down" => (d.hidden, d.intermediate, Epilogue::Residual, false),
         "lin_in" => (la.map_or(0, |l| l.in_proj_rows()), d.hidden, Epilogue::Store, false),
         "lin_ba" => (la.map_or(0, |l| l.ba_rows()), d.hidden, Epilogue::Store, false),

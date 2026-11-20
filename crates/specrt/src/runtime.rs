@@ -102,6 +102,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
     };
     let before = |linear: bool| (0..i).filter(|&j| spec.block(j).is_linear() == linear).count() as i32;
     let mixer = match &l.mixer {
+        Mixer::None => DeviceMixer::None,
         Mixer::Attention(a) => DeviceMixer::Attention(DeviceAttn {
             qkv: up_m(&a.qkv)?,
             qkv_bias: up_opt(&a.qkv_bias)?,
@@ -109,7 +110,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             q_norm: up_opt(&a.q_norm)?,
             k_norm: up_opt(&a.k_norm)?,
             o: up_m(&a.o)?,
-            kv: before(false),
+            kv: spec.attention_before(i) as i32,
             window: if spec.block(i).windowed() { spec.layers.window.unwrap_or(0) as i32 } else { 0 },
             nope: spec.nope(i),
             extra: a.extra.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,
@@ -378,6 +379,7 @@ enum DeviceMixer {
     Attention(DeviceAttn),
     Linear(DeviceGdn),
     Described(DeviceDescribed),
+    None,
 }
 
 struct DeviceDescribed {
@@ -456,6 +458,7 @@ impl DeviceLayer {
                     + (g.conv.num_bytes() + g.neg_a.num_bytes() + g.dt_bias.num_bytes() + g.norm.num_bytes()) as u64
             }
             DeviceMixer::Described(d) => d.in_proj.bytes() + d.out.bytes() + d.extra.values().map(|v| v.num_bytes() as u64).sum::<u64>(),
+            DeviceMixer::None => 0,
         };
         mixer
             + self.gate_up.bytes()
@@ -1001,6 +1004,7 @@ impl Runtime {
             None => None,
         };
         ensure!(use_mma || mixer.is_none(), "a described mixer needs the tensor core path (sm_80 or newer)");
+        ensure!(use_mma || (!spec.layers.split && spec.mlp.mapped.is_none()), "mlp-only layers and non-gated mlps need the tensor core path (sm_80 or newer)");
         let mixer_launch: Vec<DescribedLaunch> =
             crate::codegen::mixer_kernels(spec, layout.kv_planes, max_ctx, &target)?.into_iter().map(|k| DescribedLaunch { name: k.name, threads: k.threads, params: k.params }).collect();
         let widest = [d.hidden, d.intermediate, spec.q_dim()]
@@ -1412,7 +1416,7 @@ impl Runtime {
     }
 
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
-        ensure!(self.spec.attention.node.is_empty() && self.spec.mixer.is_none(), "described attention and mixers run on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        ensure!(self.spec.attention.node.is_empty() && self.spec.mixer.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "described attention, mixers, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
         let s = &self.spec;
         let a = &s.attention;
         let buf = &self.buf;
@@ -1429,7 +1433,7 @@ impl Runtime {
                     continue;
                 }
                 DeviceMixer::Attention(l) => l,
-                DeviceMixer::Described(_) => unreachable!("a described mixer is refused above"),
+                DeviceMixer::Described(_) | DeviceMixer::None => unreachable!("a described mixer is refused above"),
             };
             let kv_layer = l.kv;
             let window = l.window;
@@ -1664,7 +1668,7 @@ impl Runtime {
             GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
         };
         let outs = match out {
-            GemmOut::Planes(_) => tokens * rows / 2,
+            GemmOut::Planes(_) => tokens * self.spec.gate_up_out(rows),
             GemmOut::F32(_) => tokens * rows,
         };
         b.arg(&n).arg(&s);
@@ -1719,7 +1723,7 @@ impl Runtime {
             GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
         };
         let outs = match out {
-            GemmOut::Planes(_) => tokens * rows / 2,
+            GemmOut::Planes(_) => tokens * self.spec.gate_up_out(rows),
             GemmOut::F32(_) => tokens * rows,
         };
         b.arg(&n).arg(&s);
@@ -1767,7 +1771,7 @@ impl Runtime {
             GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
         };
         let outs = match out {
-            GemmOut::Planes(_) => tokens * rows / 2,
+            GemmOut::Planes(_) => tokens * self.spec.gate_up_out(rows),
             GemmOut::F32(_) => tokens * rows,
         };
         b.arg(&n).arg(&s);

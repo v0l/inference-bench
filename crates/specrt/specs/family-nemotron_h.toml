@@ -1,0 +1,153 @@
+name = "nemotron_h"
+kind = "family"
+min_engine = 13
+extends = "base"
+
+[match]
+model_types = ["nemotron_h"]
+architectures = ["NemotronHForCausalLM"]
+
+[blocks]
+kind = "hybrid"
+types_key = "hybrid_override_pattern"
+sparse_types = ["E"]
+split = true
+
+[blocks.layer_types]
+M = "linear"
+"*" = "full"
+"-" = "mlp"
+E = "mlp"
+
+[norm]
+unit_offset = false
+
+[fields]
+hidden_act = ["mlp_hidden_act"]
+rms_norm_eps = ["layer_norm_epsilon"]
+num_experts = ["n_routed_experts"]
+shared_expert_intermediate_size = ["moe_shared_expert_intermediate_size"]
+
+[activation.map]
+relu2 = "mapped"
+
+[mlp.mapped]
+expr = "max(x, 0.0) * max(x, 0.0)"
+
+[rope]
+nope_all = true
+
+[moe]
+router = "sigmoid"
+router_module = "gate"
+score_bias = true
+shared_module = "shared_experts"
+shared_gate = false
+
+[tensors]
+"backbone.embeddings." = "model.embed_tokens."
+"backbone.norm_f." = "model.norm."
+"backbone.layers." = "model.layers."
+".mixer.norm." = ".mixer.gnorm."
+".norm.weight" = ".input_layernorm.weight"
+".mixer.q_proj." = ".self_attn.q_proj."
+".mixer.k_proj." = ".self_attn.k_proj."
+".mixer.v_proj." = ".self_attn.v_proj."
+".mixer.o_proj." = ".self_attn.o_proj."
+".mixer.up_proj." = ".mlp.up_proj."
+".mixer.down_proj." = ".mlp.down_proj."
+".mixer.gate." = ".mlp.gate."
+".mixer.experts." = ".mlp.experts."
+".mixer.shared_experts." = ".mlp.shared_experts."
+
+[[state]]
+name = "conv"
+per = "sequence"
+layers = "linear"
+shape = ["ssm_conv", "ssm_taps - 1"]
+dtype = "f32"
+rollback = "checkpoint"
+
+[[state]]
+name = "ssm"
+per = "sequence"
+layers = "linear"
+shape = ["ssm_heads", "ssm_state", "ssm_head_dim"]
+dtype = "f32"
+rollback = "checkpoint"
+
+[[state]]
+name = "k"
+per = "token"
+layers = "attention"
+shape = ["kv_heads", "head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[[state]]
+name = "v"
+per = "token"
+layers = "attention"
+shape = ["kv_heads", "head_dim"]
+dtype = "bf16"
+rollback = "positional"
+
+[mixer]
+module = "mixer"
+out_tensor = "out_proj"
+out_cols = "ssm_inner"
+
+[[mixer.projection]]
+tensor = "in_proj"
+rows = "ssm_in"
+
+[mixer.params]
+ssm_heads = { config = "mamba_num_heads" }
+ssm_head_dim = { config = "mamba_head_dim" }
+ssm_state = { config = "ssm_state_size" }
+ssm_groups = { config = "n_groups" }
+ssm_taps = { config = "conv_kernel" }
+ssm_inner = { expr = "mamba_num_heads * mamba_head_dim" }
+ssm_conv = { expr = "ssm_inner + 2 * ssm_groups * ssm_state" }
+ssm_in = { expr = "ssm_inner + ssm_conv + ssm_heads" }
+ssm_conv_blocks = { expr = "floor((ssm_conv + 127) / 128)" }
+
+[mixer.scratch]
+xbc = "ssm_conv"
+ssm_y = "ssm_inner"
+
+[[mixer.node]]
+op = "kernel"
+kernel = "mamba2_conv"
+grid = ["ssm_conv_blocks", "seqs"]
+
+[mixer.node.bind]
+x = { buffer = "mix" }
+w = { weight = "conv1d.weight", len = "ssm_conv * ssm_taps" }
+bias = { weight = "conv1d.bias", len = "ssm_conv" }
+y = { buffer = "xbc" }
+state = { state = "conv" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "mamba2_scan"
+grid = ["ssm_heads", "seqs"]
+
+[mixer.node.bind]
+mix = { buffer = "mix" }
+xbc = { buffer = "xbc" }
+a_log = { weight = "A_log", len = "ssm_heads" }
+dt_bias = { weight = "dt_bias", len = "ssm_heads" }
+skip = { weight = "D", len = "ssm_heads" }
+y = { buffer = "ssm_y" }
+ssm = { state = "ssm" }
+
+[[mixer.node]]
+op = "kernel"
+kernel = "mamba2_gated_norm"
+grid = ["ssm_groups", "rows"]
+
+[mixer.node.bind]
+x = { buffer = "ssm_y" }
+g = { buffer = "mix" }
+w = { weight = "gnorm.weight", len = "ssm_inner" }

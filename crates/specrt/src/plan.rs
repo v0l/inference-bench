@@ -103,7 +103,8 @@ impl Weight {
         let la = spec.linear_attention.as_ref();
         match self {
             Weight::Qkv | Weight::MtpQkv => spec.qkv_rows(),
-            Weight::GateUp | Weight::MtpGateUp => 2 * spec.dims.intermediate,
+            Weight::GateUp => spec.gate_up_rows(),
+            Weight::MtpGateUp => 2 * spec.dims.intermediate,
             Weight::O | Weight::Down | Weight::LinOut | Weight::MtpFc | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
             Weight::LinIn => la.map_or(0, |l| l.in_proj_rows()),
             Weight::LinBa => la.map_or(0, |l| l.ba_rows()),
@@ -132,6 +133,7 @@ impl Weight {
                 }
                 t
             }
+            Weight::GateUp if spec.mlp.mapped.is_some() => vec![w("mlp.up_proj")],
             Weight::GateUp if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
             Weight::GateUp => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
             Weight::Down => vec![w("mlp.down_proj")],

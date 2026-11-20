@@ -11,6 +11,7 @@ pub fn kind_tint(kind: LayerKind) -> Color32 {
         LayerKind::Attention => READOUT,
         LayerKind::SlidingAttention => OK,
         LayerKind::DeltaNet => TRACE,
+        LayerKind::Mlp => LEGEND,
     }
 }
 

@@ -495,7 +495,7 @@ impl Gguf {
             head_quant: None,
             act_quant: ActQuant::None,
             dims: Dims { hidden, intermediate, vocab, tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None },
-            layers: Layers { count: layers, pattern, window: None },
+            layers: Layers { count: layers, pattern, window: None, split: false },
             norm: Norm { kind: NormKind::Rmsnorm, eps, unit_offset: false, sandwich: false, pre: true, residual_scale: None },
             attention: Attention {
                 kind: AttentionKind::Gqa,
@@ -520,7 +520,7 @@ impl Gguf {
                 o_tensor: None,
             },
             rope: Rope { style: RopeStyle::Neox, theta: Some(theta), scaling: self.rope_scaling(family, head_dim)?, mrope, local_theta: None, nope_layers: Vec::new() },
-            mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, fused_gate_up: false, gated: None },
+            mlp: Mlp { activation: Activation::Swiglu, quant: None, quant_until: None, act_quant: ActQuant::None, fused_gate_up: false, gated: None, mapped: None },
             moe,
             linear_attention,
             mixer: None,

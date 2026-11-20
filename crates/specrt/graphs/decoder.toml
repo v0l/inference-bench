@@ -797,6 +797,128 @@ op = "moe_experts"
 [[block.node]]
 op = "moe_combine"
 
+[[block]]
+name = "split_mixer"
+when = "split+mixer+tensor_core"
+layers = ["linear"]
+mlp = "dense"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "mix_in"
+shard = "column"
+quant = "attn"
+out = "mix"
+in = "xn_planes"
+
+[[block.node]]
+op = "mixer_nodes"
+
+[[block.node]]
+op = "linear"
+weight = "mix_out"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "mix_planes"
+
+[[block]]
+name = "split_attention"
+when = "split+tensor_core"
+layers = ["dense", "full", "sliding", "shared"]
+mlp = "dense"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+shard = "column"
+quant = "attn"
+out = "qkv"
+in = "xn_planes"
+
+[[block.node]]
+op = "kv_rope"
+when = "stock"
+phase = "prefill"
+
+[[block.node]]
+op = "flash"
+when = "stock"
+phase = "prefill"
+
+[[block.node]]
+op = "decode_attention"
+when = "stock"
+phase = "rows"
+
+[[block.node]]
+op = "attention_nodes"
+when = "described"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "attn_planes"
+
+[[block]]
+name = "split_mlp"
+when = "split+tensor_core"
+layers = ["mlp"]
+mlp = "dense"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "gate_up"
+shard = "column"
+quant = "mlp"
+out = "act_planes"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "down"
+shard = "row"
+quant = "mlp"
+out = "x"
+in = "act_planes"
+
+
+[[block]]
+name = "split_moe"
+when = "split+tensor_core+moe"
+layers = ["mlp"]
+mlp = "sparse"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "moe_combine"
+
 [[tail]]
 op = "logit_scale"
 when = "tensor_core+logit_scale"

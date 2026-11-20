@@ -32,7 +32,7 @@ pub fn entries(view: &View) -> Vec<Entry> {
     add("dims", "vocab", s.dims.vocab.to_string(), src);
     add("dims", "tie_embeddings", yes(s.dims.tie_embeddings), src);
     add("dims", "layers", s.layers.count.to_string(), src);
-    let pattern: Vec<&str> = s.layers.pattern.iter().map(|b| match b { Block::Dense => "dense", Block::Full => "full", Block::Sliding => "sliding", Block::Linear => "linear", Block::Shared => "shared", Block::Compressed => "compressed", Block::Indexed => "indexed" }).collect();
+    let pattern: Vec<&str> = s.layers.pattern.iter().map(|b| match b { Block::Dense => "dense", Block::Full => "full", Block::Sliding => "sliding", Block::Linear => "linear", Block::Shared => "shared", Block::Compressed => "compressed", Block::Indexed => "indexed", Block::Mlp => "mlp" }).collect();
     add("dims", "pattern", pattern.join(", "), src);
     add("attention", "heads", s.attention.heads.to_string(), src);
     add("attention", "kv_heads", s.attention.kv_heads.to_string(), src);
@@ -51,6 +51,7 @@ pub fn entries(view: &View) -> Vec<Entry> {
     let act = match s.mlp.activation {
         Activation::Swiglu => "swiglu",
         Activation::Geglu => "geglu",
+        Activation::Mapped => "mapped",
     };
     add("mlp", "activation", act.into(), src);
     match &s.moe {

@@ -79,7 +79,7 @@ pub fn flash_rows(_head_dim: usize) -> usize {
 
 pub fn kir_shape(spec: &Spec) -> kir::desc::Shape {
     let act = match spec.mlp.activation {
-        Activation::Swiglu => "silu",
+        Activation::Swiglu | Activation::Mapped => "silu",
         Activation::Geglu => "gelu_tanh",
     };
     let mut shape = kir::desc::Shape::new()
@@ -134,9 +134,9 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::at
         softcap: spec.attention.softcap.unwrap_or(0.0),
         bidirectional: spec.vision.as_ref().is_some_and(|v| v.config.bidirectional),
         local_theta: spec.rope.local_theta.unwrap_or_else(|| spec.theta()),
-        nope: (0..spec.layers.count).filter(|&i| !spec.block(i).is_linear()).map(|i| spec.nope(i)).chain(std::iter::repeat_n(false, spec.speculative().map_or(0, |m| m.layers) + 1)).collect(),
+        nope: (0..spec.layers.count).filter(|&i| spec.block(i).is_attention()).map(|i| spec.nope(i)).chain(std::iter::repeat_n(false, spec.speculative().map_or(0, |m| m.layers) + 1)).collect(),
         local_rope: (0..spec.layers.count)
-            .filter(|&i| !spec.block(i).is_linear())
+            .filter(|&i| spec.block(i).is_attention())
             .map(|i| spec.block(i) == crate::spec::Block::Sliding && spec.rope.local_theta.is_some())
             .chain(std::iter::repeat_n(false, spec.speculative().map_or(0, |m| m.layers) + 1))
             .collect(),
@@ -386,7 +386,7 @@ pub fn gemv_kernels(spec: &Spec, target: &kir::Target, ops: &kir::ops::OpsShape)
     let (wf, hwf) = (ops.weight_decoder.clone(), ops.head_decoder.clone());
     let (n, h, i, v, q) = (ops.qkv_row, ops.hidden, ops.inter, ops.vocab, ops.q_dim);
     let bias = ops.qkv_bias;
-    let gu = 2 * ops.inter;
+    let gu = if ops.mapped.is_some() { ops.inter } else { 2 * ops.inter };
     let lin = |d: &str, n, k, bias, residual| Gemv::Linear { decoder: d.to_string(), n, k, bias, residual };
     let tiled = |d: &str, n, k, bias, residual| Gemv::Tiled { decoder: d.to_string(), n, k, bias, residual };
     let mut ops_list = vec![
@@ -464,7 +464,7 @@ impl Module {
             q8_group: Q8_GROUP,
             fp8_block: FP8_BLOCK,
             gated: spec.mlp.gated.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
-            mapped: spec.mlp.ungated.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
+            mapped: spec.mlp.mapped.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
             weight_decoder: wf.decoder().to_string(),
             head_decoder: head_wf.decoder().to_string(),
         };

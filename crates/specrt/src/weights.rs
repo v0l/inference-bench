@@ -49,6 +49,7 @@ pub enum Mixer<'a> {
     Attention(Attn<'a>),
     Linear(Gdn<'a>),
     Described(Described<'a>),
+    None,
 }
 
 fn split_gate_up<T: Copy>(fused: &[T], row_len: usize, experts: usize, inter: usize, interleaved: bool) -> (Vec<T>, Vec<T>) {
@@ -994,7 +995,9 @@ impl Checkpoint {
         let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
         let p = format!("{}.layers.{global}", self.root());
         self.require_activation_scales(spec, i, global, &p)?;
-        let mixer = if spec.block(i).is_linear() && spec.mixer.is_some() {
+        let mixer = if !spec.has_mixer(i) {
+            Mixer::None
+        } else if spec.block(i).is_linear() && spec.mixer.is_some() {
             Mixer::Described(self.described_mixer(spec, &p)?)
         } else if spec.block(i).is_linear() {
             Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"))?)
@@ -1002,10 +1005,15 @@ impl Checkpoint {
             Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), spec.block(i))?)
         };
         let mlp = spec.mlp_quant(i);
-        let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(global));
+        let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(global)) && spec.has_mlp(i);
         let moe = if sparse { Some(self.moe_layer(spec, &p, mlp)?) } else { None };
-        let (gate_up, down) = if sparse {
-            (Matrix::Bf16(Cow::Owned(vec![0; 8])), Matrix::Bf16(Cow::Owned(vec![0; 8])))
+        let none = || (Matrix::Bf16(Cow::Owned(vec![0; 8])), Matrix::Bf16(Cow::Owned(vec![0; 8])));
+        let (gate_up, down) = if sparse || !spec.has_mlp(i) {
+            none()
+        } else if spec.mlp.mapped.is_some() {
+            let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?;
+            let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
+            (up.into_matrix(mlp, &format!("{p}.mlp.up_proj"))?, down.into_matrix(mlp, &format!("{p}.mlp.down_proj"))?)
         } else if mlp == Quant::Nvfp4G16 {
             let gate = self.fp4(&format!("{p}.mlp.gate_proj"), inter, h)?;
             let up = self.fp4(&format!("{p}.mlp.up_proj"), inter, h)?;
@@ -1023,9 +1031,11 @@ impl Checkpoint {
                 down.into_matrix(mlp, &format!("{p}.mlp.down_proj"))?,
             )
         };
+        let ln1 = if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] };
+        let ln2 = if spec.layers.split { ln1.clone() } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? };
         Ok(Layer {
-            ln1: if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] },
-            ln2: self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
+            ln1,
+            ln2,
             ln_pre_mlp: if spec.norm.sandwich && spec.norm.pre { Some(self.norm(spec, &format!("{p}.pre_feedforward_layernorm.weight"), h)?) } else { None },
             ln_post_mlp: if spec.norm.sandwich { Some(self.norm(spec, &format!("{p}.post_feedforward_layernorm.weight"), h)?) } else { None },
             mixer,

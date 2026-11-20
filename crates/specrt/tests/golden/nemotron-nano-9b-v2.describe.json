@@ -1,0 +1,35 @@
+{
+  "name": "nemotron_h",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 4480,
+    "intermediate": 15680,
+    "vocab": 131072,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 56,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 40,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "qkv_bias": false,
+    "qk_norm": false
+  },
+  "rope": {
+    "style": "neox"
+  },
+  "mlp": {
+    "activation": "swiglu"
+  }
+}

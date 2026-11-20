@@ -65,6 +65,9 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
     if spec.mixer.is_some() {
         return Some("described mixers are not yet on wgpu".into());
     }
+    if spec.layers.split || spec.mlp.mapped.is_some() {
+        return Some("mlp-only layers and non-gated mlps are not yet on wgpu".into());
+    }
     if spec.speculative().is_some() {
         return Some("MTP is not yet on wgpu".into());
     }

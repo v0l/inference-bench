@@ -152,6 +152,7 @@ pub struct FamilyMultipliers {
 pub struct FamilyMlp {
     pub fused_gate_up: bool,
     pub gated: Option<FamilyGated>,
+    pub mapped: Option<FamilyGated>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -237,6 +238,8 @@ pub struct FamilyBlocks {
     pub sliding_period_key: Option<String>,
     pub attention_indices_key: Option<String>,
     pub types_key: Option<String>,
+    pub sparse_types: Vec<String>,
+    pub split: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -297,6 +300,7 @@ pub struct FamilyRope {
     pub yarn_attention_factor: Option<f64>,
     pub nope_key: Option<String>,
     pub nope_value: Option<String>,
+    pub nope_all: bool,
 }
 
 impl FamilyRope {
@@ -521,6 +525,9 @@ impl Family {
             expr_keys(s, &mut out);
         }
         if let Some(k) = self.blocks.attention_indices_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.blocks.types_key.as_deref() {
             push(k, &mut out);
         }
         if let Some(k) = self.blocks.sliding_period_key.as_deref() {

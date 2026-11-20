@@ -309,7 +309,8 @@ impl Kernel {
         if self.name.is_empty() || !self.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(format!("kernel name {:?} is not an identifier", self.name));
         }
-        if self.threads == 0 || !self.threads.is_power_of_two() || self.threads > t.max_threads {
+        let warp_multiple = matches!(self.body, Body::Recurrence(_)) && self.threads.is_multiple_of(32);
+        if self.threads == 0 || !(self.threads.is_power_of_two() || warp_multiple) || self.threads > t.max_threads {
             return Err(format!(
                 "{}: threads {} must be a power of two up to the target limit {}",
                 self.name, self.threads, t.max_threads

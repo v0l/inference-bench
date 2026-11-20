@@ -46,7 +46,7 @@ pub fn layout(spec: &Spec, weight: &str) -> Result<Layout> {
             Layout { rows, cols: d.hidden }
         }
         "o" => Layout { rows: vec![d.hidden], cols: spec.q_dim() },
-        "gate_up" => Layout { rows: vec![2 * d.intermediate], cols: d.hidden },
+        "gate_up" => Layout { rows: vec![spec.gate_up_rows()], cols: d.hidden },
         "down" => Layout { rows: vec![d.hidden], cols: d.intermediate },
         "lin_in" => {
             let l = need_la()?;
@@ -151,6 +151,7 @@ pub fn supports(spec: &Spec, tp: usize) -> Result<()> {
         }
         ensure!(spec.runtime.backend != crate::spec::BackendChoice::Wgpu, "tp runs on CUDA only");
         ensure!(spec.mixer.is_none(), "tp does not split described mixer layers yet ({})", spec.name);
+        ensure!(!spec.layers.split && spec.mlp.mapped.is_none(), "tp does not split mlp-only layers or non-gated mlps yet ({})", spec.name);
         ensure!(spec.quant != crate::spec::Quant::Gguf, "tp does not slice GGUF weights yet ({})", spec.name);
         ensure!(!spec.uses_branch(), "tp does not cover sandwich or scaled residual norms yet ({})", spec.name);
         ensure!(!spec.attention.qk_norm_full, "tp does not split full-width qk norms yet ({})", spec.name);

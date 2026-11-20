@@ -109,7 +109,7 @@ fn the_graph_lowers_to_the_reference_plan_for_every_config() {
             checked += 1;
             continue;
         }
-        if spec.uses_branch() || !spec.norm.pre {
+        if spec.uses_branch() || !spec.norm.pre || spec.layers.split {
             checked += 1;
             continue;
         }

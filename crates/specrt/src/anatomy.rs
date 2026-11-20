@@ -7,6 +7,7 @@ pub enum LayerKind {
     Attention,
     SlidingAttention,
     DeltaNet,
+    Mlp,
 }
 
 impl LayerKind {
@@ -15,6 +16,7 @@ impl LayerKind {
             LayerKind::Attention => "full attention",
             LayerKind::SlidingAttention => "sliding attention",
             LayerKind::DeltaNet => "gated delta-net",
+            LayerKind::Mlp => "mlp only",
         }
     }
 }
@@ -205,25 +207,28 @@ fn mlp_parts(spec: &Spec, index: usize, force_moe: bool) -> MlpParts {
                 active_routed: routed / m.experts.max(1) as u64 * per_token,
             }
         }
-        _ => MlpParts { dense: 3 * h * spec.dims.intermediate as u64, routed: 0, shared: 0, router: 0, active_routed: 0 },
+        _ => MlpParts { dense: (spec.gate_up_rows() + spec.dims.intermediate) as u64 * h, routed: 0, shared: 0, router: 0, active_routed: 0 },
     }
 }
 
 fn layer(spec: &Spec, index: usize) -> LayerInfo {
     let kind = match spec.block(index) {
         Block::Linear => LayerKind::DeltaNet,
+        Block::Mlp => LayerKind::Mlp,
         Block::Sliding | Block::Compressed | Block::Indexed => LayerKind::SlidingAttention,
         _ => LayerKind::Attention,
     };
     let mixer = match kind {
+        _ if !spec.has_mixer(index) => Counts { quantised: 0, plain: 0 },
         LayerKind::Attention | LayerKind::SlidingAttention => attention_counts(spec),
         LayerKind::DeltaNet => delta_counts(spec),
+        LayerKind::Mlp => Counts { quantised: 0, plain: 0 },
     };
     let mixer_quant = spec.quant;
     let mlp_quant = spec.mlp_quant(index);
-    let parts = mlp_parts(spec, index, false);
+    let parts = if spec.has_mlp(index) { mlp_parts(spec, index, false) } else { MlpParts { dense: 0, routed: 0, shared: 0, router: 0, active_routed: 0 } };
     let mlp = parts.total();
-    let norm_params = 2 * spec.dims.hidden as u64;
+    let norm_params = if spec.layers.split { 1 } else { 2 } * spec.dims.hidden as u64;
     let mixer_params = mixer.quantised + mixer.plain;
     let fixed = quant_bytes(mixer.quantised, mixer_quant) + 2 * mixer.plain + 2 * norm_params;
     LayerInfo {
@@ -284,7 +289,7 @@ impl ModelAnatomy {
         let mixer_bytes = |delta: bool| -> u64 {
             layers
                 .iter()
-                .filter(|l| (l.kind == LayerKind::DeltaNet) == delta)
+                .filter(|l| (l.kind == LayerKind::DeltaNet) == delta && l.mixer_params > 0)
                 .map(|l| {
                     let c = if delta { delta_counts(spec) } else { attention_counts(spec) };
                     quant_bytes(c.quantised, l.mixer_quant) + 2 * c.plain
@@ -395,6 +400,7 @@ impl ModelAnatomy {
                 LayerKind::Attention => 'A',
                 LayerKind::SlidingAttention => 'S',
                 LayerKind::DeltaNet => 'D',
+                LayerKind::Mlp => 'M',
             })
             .collect()
     }
