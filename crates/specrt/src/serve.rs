@@ -511,7 +511,14 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
         }
         return Ok(());
     }
-    let Some(solved) = opts.solved.clone() else {
+    let solved = match crate::solve::for_options(spec, &opts) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ready.send(Err(e.context("[placement]")));
+            return Ok(());
+        }
+    };
+    let Some(solved) = solved.map(Box::new) else {
         match build(spec, opts, 0) {
             Ok(mut sched) => {
                 if let Some(shared) = sessions {

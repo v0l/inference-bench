@@ -55,6 +55,8 @@ impl Profile {
 pub struct EngineChoice {
     pub profile: Profile,
     pub overrides: BTreeMap<String, Value>,
+    #[serde(skip)]
+    pub solved: Option<Box<crate::solve::Solved>>,
 }
 
 impl EngineChoice {

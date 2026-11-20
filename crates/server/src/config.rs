@@ -384,6 +384,7 @@ impl ServerConfig {
             watchdog: (self.watchdog_secs > 0).then(|| std::time::Duration::from_secs(self.watchdog_secs)),
             sessions: Some(self.sessions.clone()),
             tp: self.tp.unwrap_or(d.tp),
+            solved: None,
         })
     }
 

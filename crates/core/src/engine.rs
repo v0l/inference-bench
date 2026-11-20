@@ -421,6 +421,10 @@ impl Backend {
 }
 
 pub fn serve_options(max_ctx: Option<usize>, seqs: usize, kv_cache_bytes: Option<u64>, engine: &specrt::options::EngineChoice) -> Result<ServeOptions, BackendError> {
+    if let Some(solved) = &engine.solved {
+        let base = engine.apply_overrides(ServeOptions::default()).map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("engine options: {e:#}")))?;
+        return ServeOptions::from_solved(solved, base).map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("solved placement: {e:#}")));
+    }
     let base = ServeOptions {
         max_model_len: max_ctx,
         max_num_seqs: seqs,
@@ -453,6 +457,15 @@ fn open(
     progress: &specrt::progress::Sink,
 ) -> Result<Opened, BackendError> {
     serve_options(max_ctx, seqs, kv_cache_bytes, engine)?;
+    if let Some(solved) = &engine.solved {
+        let mut target = serving(serve_options(max_ctx, solved.slots, None, engine)?).ok_or_else(|| BackendError::failed("the serving engine is not available for a solved placement"))?;
+        target.set_progress(Some(progress.clone()));
+        target.load(model_id)?;
+        let caps = target.capabilities();
+        let share = target.share();
+        let speculation = target.speculation();
+        return Ok(Opened { backend: Backend::Batched { target, running: Vec::new() }, vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: solved.slots, note: None, speculation, share });
+    }
     let mut note = None;
     let placed = seqs <= 1 && serving(serve_options(max_ctx, 1, kv_cache_bytes, engine)?).is_some_and(|t| t.requires_serving());
     let attempts = if seqs > 1 { vec![seqs, 1] } else if placed { vec![1] } else { Vec::new() };

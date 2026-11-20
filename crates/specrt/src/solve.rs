@@ -19,6 +19,7 @@ pub const PIN_KV_F16_LAYERS: &str = "runtime.kv_f16_layers";
 pub const PIN_SLOTS: &str = "serve.max_num_seqs";
 pub const PIN_MTP: &str = "speculative.enabled";
 pub const PIN_POOL: &str = "serve.kv_cache_bytes";
+pub const PIN_TP: &str = "serve.tp";
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Target {
@@ -147,7 +148,18 @@ impl<'a> Search<'a> {
                 kinds.extend(tp_kinds(req.spec, &devices));
             }
         }
-        Ok(Search { req, devices, native, kinds })
+        let mut search = Search { req, devices, native, kinds };
+        match search.pinned_tp() {
+            Some(1) => search.kinds.retain(|k| !matches!(k, Kind::Tp(..))),
+            Some(n) if n > 1 => {
+                search.kinds.retain(|k| matches!(k, Kind::Tp(_, t) if *t == n));
+                if search.kinds.is_empty() {
+                    bail!("tp {n} is not possible on these devices for {}", req.spec.name);
+                }
+            }
+            _ => {}
+        }
+        Ok(search)
     }
 
     fn pin<T>(&self, key: &str, f: impl Fn(&Value) -> Option<T>) -> Option<T> {
@@ -168,6 +180,10 @@ impl<'a> Search<'a> {
 
     fn pinned_mtp(&self) -> Option<bool> {
         self.pin(PIN_MTP, Value::as_bool)
+    }
+
+    fn pinned_tp(&self) -> Option<usize> {
+        self.pin(PIN_TP, Value::as_u64).map(|n| n as usize)
     }
 
     fn pinned_pool(&self) -> Option<u64> {
@@ -360,7 +376,7 @@ impl<'a> Search<'a> {
         }
         options.insert("serve.tp".into(), json!(tp));
         for (k, v) in &self.req.pins {
-            if k != PIN_POOL {
+            if k != PIN_POOL && k != PIN_TP {
                 options.insert(k.clone(), v.clone());
             }
         }
@@ -424,6 +440,64 @@ impl<'a> Search<'a> {
         }
         best
     }
+}
+
+pub fn for_options(spec: &Spec, opts: &crate::serve::ServeOptions) -> Result<Option<Solved>> {
+    if let Some(s) = &opts.solved {
+        return Ok(Some((**s).clone()));
+    }
+    let Some(config) = opts.placement.as_ref().filter(|p| !p.devices.is_empty()) else {
+        if opts.tp <= 1 {
+            return Ok(None);
+        }
+        let machine = crate::hardware::probe()?;
+        return for_devices(spec, opts, &machine.devices(&[])).map(Some);
+    };
+    if config.stages.is_empty() {
+        return for_devices(spec, opts, &config.devices).map(Some);
+    }
+    let mut resolved = spec.clone();
+    if let Some(r) = &opts.runtime {
+        resolved.runtime = r.clone();
+    }
+    opts.speculative.apply(&mut resolved)?;
+    let mut sized = config.clone();
+    sized.kv_pool_bytes = sized.kv_pool_bytes.or(opts.kv_cache_bytes);
+    let placement = sized.place(&resolved)?;
+    placement.ensure_runnable()?;
+    let context = opts.model_len(spec)?;
+    Ok(Some(Solved {
+        mode: Profile::MaxPerformance,
+        tp: 1,
+        kv_dtype: resolved.runtime.kv_dtype,
+        kv_f16_layers: resolved.runtime.kv_f16_layers,
+        kv_pool_bytes: opts.kv_cache_bytes.unwrap_or(0),
+        slots: opts.max_num_seqs,
+        context,
+        mtp: resolved.speculative().is_some(),
+        options: BTreeMap::new(),
+        strategy: format!("pinned stages: {} stage(s)", placement.stages.len()),
+        reasons: vec!["stages pinned by [[placement.stages]]".into()],
+        shortfall: None,
+        placement,
+    }))
+}
+
+fn for_devices(spec: &Spec, opts: &crate::serve::ServeOptions, devices: &[DeviceConfig]) -> Result<Solved> {
+    let mut pins = BTreeMap::new();
+    pins.insert(PIN_SLOTS.to_string(), json!(opts.max_num_seqs));
+    pins.insert(PIN_TP.to_string(), json!(opts.tp.max(1)));
+    if let Some(b) = opts.kv_cache_bytes {
+        pins.insert(PIN_POOL.to_string(), json!(b));
+    }
+    if let Some(r) = &opts.runtime {
+        pins.insert(PIN_KV_DTYPE.to_string(), json!(if r.kv_dtype.is_fp8() { "fp8" } else { "f16" }));
+    }
+    if let Some(on) = opts.speculative.enabled {
+        pins.insert(PIN_MTP.to_string(), json!(on));
+    }
+    let target = Target { context: opts.max_model_len, memory: None, slots: Some(opts.max_num_seqs) };
+    solve(&PlacementRequest { mode: Profile::MaxPerformance, target, pins, devices, spec })
 }
 
 pub fn solve(req: &PlacementRequest) -> Result<Solved> {
