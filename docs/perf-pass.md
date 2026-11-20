@@ -44,7 +44,7 @@ Prefill and decode of competitors are timed differently (HTTP-free in all three 
 ## Hardware rules
 
 - Spark only unless the supervisor opens a window. The desktop cards serve the user's models: `perfpass.sh --host desktop` refuses.
-- `~/ib-gates/<issue>` is the work dir, `~/ib-gates-target/<issue>` the target dir. MemAvailable must be 40 GB or more. Never touch Frigate, ComfyUI, nmirror, ggml-rpc-server or inference-bench-host.service. Delete the target dir, models and caches when the pass is over.
+- `~/ib-gates/<issue>` is the work dir, `~/ib-gates-target/<issue>` the target dir. MemAvailable must be 40 GB or more. Never touch Frigate, ComfyUI, the media mirror service, ggml-rpc-server or inference-bench-host.service. Delete the target dir, models and caches when the pass is over.
 - Spark clocks run under load at about 2.2 GHz and the card is shared with a resident vLLM and Frigate, so repeat a number before believing it.
 
 ## Families and the model each uses
