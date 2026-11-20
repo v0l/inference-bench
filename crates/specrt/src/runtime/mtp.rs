@@ -5,7 +5,7 @@ use crate::spec::Spec;
 use crate::weights::{Checkpoint, Mixer};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
-use cudarc::driver::{CudaGraph, CudaSlice, CudaStream, CudaView, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaGraph, CudaSlice, CudaStream, CudaView, LaunchConfig};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -301,7 +301,7 @@ impl Runtime {
         let m = self.mtp();
         self.up_i32(sidx, &m.sidx)?;
         self.up_i32(didx, &m.didx)?;
-        let mut b = self.stream.launch_builder(self.kernel("mtp_copy"));
+        let mut b = self.launcher(self.kernel("mtp_copy"));
         b.arg(src).arg(&m.sidx).arg(dst).arg(&m.didx);
         let config = LaunchConfig {
             grid_dim: (grid(self.spec.dims.hidden, 256), sidx.len() as u32, 1),
@@ -368,7 +368,7 @@ impl Runtime {
         let n = run.n;
         match op {
             Op::MtpIn => {
-                let mut b = self.stream.launch_builder(self.kernel("mtp_fc_in"));
+                let mut b = self.launcher(self.kernel("mtp_fc_in"));
                 b.arg(&self.embed)
                     .arg(a.tokens)
                     .arg(a.xsrc)
@@ -386,7 +386,7 @@ impl Runtime {
             Op::MtpNorm => self.rms_split(&m.cg.as_view(), &m.w.norm, &self.pre.xn_planes, n),
             Op::MtpDraft => {
                 let (col, k) = (a.col as i32, m.k as i32);
-                let mut b = self.stream.launch_builder(self.kernel("mtp_draft"));
+                let mut b = self.launcher(self.kernel("mtp_draft"));
                 b.arg(&m.logits).arg(&m.drafts).arg(&col).arg(&k).arg(&m.ctok).arg(a.slots);
                 unsafe { b.launch(cfg(n as u32, 1024)) }?;
                 Ok(())
@@ -406,14 +406,14 @@ impl Runtime {
         let (vd, rows_i, k1_i) = (la.value_dim(), m.rows, k1 as i32);
         let l = g.slot as usize;
         let clog = m.clog.slice(l * rows_i * la.conv_dim()..);
-        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_verify"));
+        let mut b = self.launcher(self.kernel("gdn_conv_verify"));
         b.arg(&gb.pre_lin).arg(&g.conv).arg(&*gb.conv_state).arg(&gb.pre_mix).arg(&clog).arg(&g.slot).arg(&seq_slots).arg(&m.vb.slots).arg(&k1_i);
         let config = LaunchConfig { grid_dim: (grid(la.conv_dim(), 256), nseq as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
         let klog = m.klog.slice(l * rows_i * vd..);
         let dlog = m.dlog.slice(l * rows_i * vd..);
         let glog = m.glog.slice(l * rows_i * la.value_heads..);
-        let mut b = self.stream.launch_builder(self.kernel("gdn_verify"));
+        let mut b = self.launcher(self.kernel("gdn_verify"));
         b.arg(&gb.pre_mix)
             .arg(&gb.pre_lin)
             .arg(&gb.pre_ba)
@@ -435,7 +435,7 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        let mut b = self.stream.launch_builder(self.kernel("split_rows"));
+        let mut b = self.launcher(self.kernel("split_rows"));
         let count = (n * vd) as i32;
         b.arg(&gb.o).arg(&gb.planes.hi).arg(&gb.planes.lo).arg(&count);
         unsafe { b.launch(cfg(grid(n * vd, 512), 256)) }?;
@@ -443,7 +443,7 @@ impl Runtime {
     }
 
     fn copy_rows_by_index(&self, src: &CudaSlice<f32>, sidx: &CudaView<i32>, dst: &CudaSlice<f32>, didx: &CudaView<i32>, n: usize) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel("mtp_copy"));
+        let mut b = self.launcher(self.kernel("mtp_copy"));
         b.arg(src).arg(sidx).arg(dst).arg(didx);
         let config = LaunchConfig {
             grid_dim: (grid(self.spec.dims.hidden, 256), n as u32, 1),
@@ -473,7 +473,7 @@ impl Runtime {
         let n_i = n as i32;
         for i in 1..m.k {
             let step = i as i32;
-            let mut b = self.stream.launch_builder(self.kernel("mtp_chain_rows"));
+            let mut b = self.launcher(self.kernel("mtp_chain_rows"));
             b.arg(rin).arg(&n_i).arg(accepted).arg(&step).arg(&m.vb.pos).arg(&m.vb.slots);
             unsafe { b.launch(cfg(1, n as u32)) }?;
             self.mtp_layer(&m.ctok.slice(..n), &m.iota.slice(..n), &m.cg, &m.w.norm, n, Attn::Rows(1))?;
@@ -568,7 +568,7 @@ impl Runtime {
         let la = &gb.la;
         let layers = self.spec.linear_layers() as u32;
         let (seq_slots, k1, log_rows) = (layers as i32, (m.k + 1) as i32, m.rows as i32);
-        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_commit"));
+        let mut b = self.launcher(self.kernel("gdn_conv_commit"));
         b.arg(&*gb.conv_state).arg(&m.clog).arg(&seq_slots).arg(&m.vb.slots).arg(&k1).arg(&accepted).arg(&log_rows);
         let config = LaunchConfig {
             grid_dim: (grid(la.conv_dim(), 256), nseq as u32, layers),
@@ -576,7 +576,7 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_commit"));
+        let mut b = self.launcher(self.kernel("gdn_commit"));
         b.arg(&*gb.ssm_state)
             .arg(&m.klog)
             .arg(&m.dlog)
@@ -603,18 +603,18 @@ impl Runtime {
         let rin = m.rin.slice(..);
         let accepted = m.res.slice(..n);
         let vout = m.res.slice(m.pcap..m.pcap + n * k1);
-        let mut b = self.stream.launch_builder(self.kernel("mtp_round_in"));
+        let mut b = self.launcher(self.kernel("mtp_round_in"));
         b.arg(&rin).arg(&m.drafts).arg(&n_i).arg(&k_i).arg(&m.vb.tokens).arg(&m.vb.pos).arg(&m.vb.slots);
         unsafe { b.launch(cfg(n as u32, k1 as u32)) }?;
         self.verify_rows(n)?;
         self.copy_rows(&self.pre.x.slice(..n * k1 * h), &m.vx.slice(..n * k1 * h), n * k1 * h)?;
         let maxa = rin.slice(3 * n..4 * n);
         let params = rin.slice(4 * n..10 * n);
-        let mut b = self.stream.launch_builder(self.kernel("spec_accept"));
+        let mut b = self.launcher(self.kernel("spec_accept"));
         b.arg(&m.vb.logits).arg(&m.vb.tokens).arg(&params).arg(&maxa).arg(&k_i).arg(&vout).arg(&accepted);
         unsafe { b.launch(cfg(n as u32, 1024)) }?;
         self.commit(n)?;
-        let mut b = self.stream.launch_builder(self.kernel("mtp_pick_rows"));
+        let mut b = self.launcher(self.kernel("mtp_pick_rows"));
         b.arg(&accepted).arg(&k_i).arg(&m.sidx);
         unsafe { b.launch(cfg(1, n as u32)) }?;
         self.mtp_layer(&vout, &m.iota.slice(..n * k1), &m.vx, &self.norm, n * k1, Attn::Rows(k1))?;

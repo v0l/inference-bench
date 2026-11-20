@@ -268,6 +268,7 @@ const META: &[Meta] = &[
     Meta { key: "runtime.prefix_cache.async_snapshots", label: "async snapshots", group: Group::PrefixCache, help: "Copy snapshots to the host on a side stream instead of stalling the step.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.backend", label: "backend", group: Group::Runtime, help: "Which compute backend runs the model. Auto picks CUDA when there is a card.", choices: &["auto", "cuda", "wgpu"], range: (0, 0) },
     Meta { key: "runtime.graphs", label: "cuda graphs", group: Group::Runtime, help: "Capture decode steps as CUDA graphs to cut launch overhead.", choices: &[], range: (0, 0) },
+    Meta { key: "runtime.pdl", label: "programmatic launch", group: Group::Runtime, help: "Let each kernel of a decode graph start launching while the one before it finishes (Hopper and newer).", choices: &[], range: (0, 0) },
     Meta { key: "runtime.fuse", label: "fused kernels", group: Group::Runtime, help: "Fuse neighbouring operations into single kernels.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.tile", label: "gemm tile", group: Group::Runtime, help: "Tile shape for matrix multiplies. Auto picks per shape.", choices: &["auto", "small", "big", "narrow"], range: (0, 0) },
     Meta { key: "runtime.big_tile", label: "big tile", group: Group::Runtime, help: "Explicit tile [m, n, k, stages] for the big choice. Auto uses the built in one.", choices: &[], range: (0, 0) },
@@ -326,6 +327,7 @@ fn populated_runtime() -> RuntimeOptions {
     RuntimeOptions {
         backend: BackendChoice::Cuda,
         graphs: true,
+        pdl: true,
         fuse: true,
         tile: TileChoice::Big,
         big_tile: Some([1, 1, 1, 1]),
@@ -459,6 +461,7 @@ mod tests {
         assert_eq!(two.apply(ServeOptions::default()).unwrap().tp, 2);
         let rt = RuntimeOptions::default();
         assert_eq!(default_of("runtime.graphs"), Some(json!(rt.graphs)));
+        assert_eq!(default_of("runtime.pdl"), Some(json!(rt.pdl)));
         assert_eq!(default_of("runtime.loader.chunk_mb"), Some(json!(rt.loader.chunk_mb)));
         assert_eq!(default_of("runtime.prefix_cache.snapshot_interval"), Some(json!(rt.prefix_cache.snapshot_interval)));
         assert_eq!(default_of("runtime.big_tile"), Some(Value::Null));

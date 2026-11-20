@@ -92,6 +92,7 @@ pub fn entries(view: &View) -> Vec<Entry> {
     let r = &s.runtime;
     let tile = match r.tile { TileChoice::Auto => "auto", TileChoice::Small => "small", TileChoice::Big => "big", TileChoice::Narrow => "narrow" };
     add("mtp and runtime", "graphs", yes(r.graphs), src);
+    add("mtp and runtime", "pdl", yes(r.pdl), src);
     add("mtp and runtime", "fuse", yes(r.fuse), src);
     add("mtp and runtime", "tile", tile.into(), src);
     add("mtp and runtime", "gemm_fp32", yes(r.gemm_fp32), src);

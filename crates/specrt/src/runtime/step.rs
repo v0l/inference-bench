@@ -1,7 +1,7 @@
 use super::{BatchBuffers, Runtime, Sampling, cfg};
 use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
-use cudarc::driver::{CudaGraph, CudaSlice, PushKernelArg};
+use cudarc::driver::{CudaGraph, CudaSlice};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -141,7 +141,7 @@ impl Runtime {
         let Some((sampling, step)) = sample else { return Ok(None) };
         self.stream.memcpy_htod(&params(sampling, step), &mut st.params.slice_mut(..6))?;
         self.apply_masks(st, 1, 0, MaskTarget::Prefill)?;
-        let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
+        let mut b = self.launcher(self.kernel("sample_rows"));
         b.arg(&self.buf.logits).arg(&st.bb.tokens).arg(&st.params);
         unsafe { b.launch(cfg(1, 1024)) }?;
         let token = self.stream.clone_dtoh(&st.bb.tokens.slice(..1))?;
@@ -169,7 +169,7 @@ impl Runtime {
             flags[row] = 1;
         }
         self.stream.memcpy_htod(&flags, &mut st.mask_flags.slice_mut(..rows))?;
-        let mut b = self.stream.launch_builder(self.kernel("apply_mask"));
+        let mut b = self.launcher(self.kernel("apply_mask"));
         let w = words as i32;
         let logits = if target == MaskTarget::Prefill { &self.buf.logits } else { &st.bb.logits };
         b.arg(logits).arg(&st.mask_bits).arg(&st.mask_flags).arg(&w);
@@ -180,7 +180,7 @@ impl Runtime {
 
     fn decode_and_sample(&self, st: &Stepper, n: usize) -> Result<()> {
         self.decode_rows(&st.bb, n)?;
-        let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
+        let mut b = self.launcher(self.kernel("sample_rows"));
         b.arg(&st.bb.logits).arg(&st.bb.tokens).arg(&st.params);
         unsafe { b.launch(cfg(n as u32, 1024)) }?;
         Ok(())
@@ -213,7 +213,7 @@ impl Runtime {
         if st.has_row_masks() {
             self.decode_rows(&st.bb, n)?;
             self.apply_masks(st, n, 0, MaskTarget::Decode)?;
-            let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
+            let mut b = self.launcher(self.kernel("sample_rows"));
             b.arg(&st.bb.logits).arg(&st.bb.tokens).arg(&st.params);
             unsafe { b.launch(cfg(n as u32, 1024)) }?;
         } else if st.use_graphs {

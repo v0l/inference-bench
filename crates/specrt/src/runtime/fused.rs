@@ -1,7 +1,7 @@
 use super::step::{DecodeRow, MaskTarget, Stepper, params};
 use super::{DeviceMixer, GemmOut, Runtime, Sampling, cfg, grid};
 use anyhow::{Result, ensure};
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::LaunchConfig;
 
 pub struct PrefillPart<'a> {
     pub slot: usize,
@@ -52,7 +52,7 @@ impl Runtime {
         ran?;
         let out_rows = nd + usize::from(sampled);
         self.apply_masks(st, out_rows, nd, MaskTarget::Fused)?;
-        let mut b = self.stream.launch_builder(self.kernel("sample_rows"));
+        let mut b = self.launcher(self.kernel("sample_rows"));
         b.arg(&st.bb.logits).arg(&st.bb.tokens).arg(&st.params);
         unsafe { b.launch(cfg(out_rows as u32, 1024)) }?;
         let out = self.stream.clone_dtoh(&st.bb.tokens.slice(..out_rows))?;
@@ -66,7 +66,7 @@ impl Runtime {
         let n = nd + np;
         let pre = &self.pre;
         let bb = &st.bb;
-        let mut b = self.stream.launch_builder(self.kernel("embed"));
+        let mut b = self.launcher(self.kernel("embed"));
         b.arg(&self.embed).arg(&pre.tokens).arg(&pre.x);
         let config = LaunchConfig {
             grid_dim: (grid(hidden, 256), n as u32, 1),

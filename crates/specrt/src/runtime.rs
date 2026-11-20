@@ -8,7 +8,6 @@ use anyhow::{Context, Result, ensure};
 use cudarc::driver::sys::{CUgraphInstantiate_flags, CUstreamCaptureMode};
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaGraph, CudaSlice, CudaStream, CudaView, LaunchConfig,
-    PushKernelArg,
 };
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
@@ -334,7 +333,7 @@ impl DeviceMatrix {
         }
     }
 
-    fn args<'a>(&'a self, b: &mut cudarc::driver::LaunchArgs<'a>, dummy: &'a CudaSlice<f32>) {
+    fn args<'a>(&'a self, b: &mut crate::launch::Launch<'a>, dummy: &'a CudaSlice<f32>) {
         match self {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(dummy),
             DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
@@ -734,6 +733,7 @@ pub struct Runtime {
     use_mma: bool,
     plans: Plans,
     role: StageRole,
+    pdl: bool,
     sms: u32,
     target: kir::Target,
     seq: i32,
@@ -1095,6 +1095,7 @@ impl Runtime {
             kv_blocks: layout.kv_blocks,
             kv_planes: layout.kv_planes,
             tables: vec![0; (layout.slots + 1) * pages],
+            pdl: spec.runtime.pdl && target.pdl,
             sms,
             target,
             use_mma,
@@ -1215,6 +1216,10 @@ impl Runtime {
         Ok(rt)
     }
 
+    fn launcher<'a>(&'a self, f: &'a CudaFunction) -> crate::launch::Launch<'a> {
+        crate::launch::Launch::new(&self.stream, f, self.pdl, self.sms * 8)
+    }
+
     fn kernel(&self, name: &str) -> &CudaFunction {
         &self.kernels[name]
     }
@@ -1281,7 +1286,7 @@ impl Runtime {
         out: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel(name));
+        let mut b = self.launcher(self.kernel(name));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out);
         unsafe { b.launch(gemv_cfg(name, rows, w, self.sms)) }?;
@@ -1298,7 +1303,7 @@ impl Runtime {
         out: &CudaSlice<f32>,
         rows: usize,
     ) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel(name));
+        let mut b = self.launcher(self.kernel(name));
         w.args(&mut b, &self.buf.dummy);
         if !name.starts_with("gate_up_act") {
             b.arg(bias.unwrap_or(&self.buf.dummy));
@@ -1325,7 +1330,7 @@ impl Runtime {
             self.linear_norm(act, &l.gate_up, None, &buf.x, pre, &buf.act, s.dims.intermediate)?;
         } else {
             self.linear("gate_up_proj", &l.gate_up, None, &buf.x, &buf.gate_up, 2 * s.dims.intermediate)?;
-            let mut b = self.stream.launch_builder(self.kernel("swiglu"));
+            let mut b = self.launcher(self.kernel("swiglu"));
             b.arg(&buf.gate_up).arg(&buf.act);
             unsafe { b.launch(cfg(grid(s.dims.intermediate, 256), 256)) }?;
         }
@@ -1341,7 +1346,7 @@ impl Runtime {
         match post {
             Some(weight) => self.add_normed_branch(weight),
             None => {
-                let mut b = self.stream.launch_builder(self.kernel("residual_add"));
+                let mut b = self.launcher(self.kernel("residual_add"));
                 b.arg(&self.buf.x).arg(&self.pre.branch).arg(&self.buf.x);
                 unsafe { b.launch(cfg(grid(self.spec.dims.hidden, 256), 256)) }?;
                 Ok(())
@@ -1351,14 +1356,14 @@ impl Runtime {
 
     fn clear_branch(&self) -> Result<()> {
         let hidden = self.spec.dims.hidden;
-        let mut b = self.stream.launch_builder(self.kernel("clear_branch"));
+        let mut b = self.launcher(self.kernel("clear_branch"));
         b.arg(&self.pre.branch).arg(&self.pre.branch);
         unsafe { b.launch(cfg(grid(hidden, 256), 256)) }?;
         Ok(())
     }
 
     fn add_normed_branch(&self, weight: &CudaSlice<f32>) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel("norm_add"));
+        let mut b = self.launcher(self.kernel("norm_add"));
         b.arg(&self.pre.branch).arg(weight).arg(&self.buf.x).arg(&self.buf.x);
         unsafe { b.launch(cfg(1, 1024)) }?;
         Ok(())
@@ -1379,7 +1384,7 @@ impl Runtime {
             return Ok(());
         }
         for (name, w) in [("q_norm_rows", &l.q_norm), ("k_norm_rows", &l.k_norm)] {
-            let mut b = self.stream.launch_builder(self.kernel(name));
+            let mut b = self.launcher(self.kernel(name));
             b.arg(&self.buf.qkv).arg(w.as_ref().expect("full-width qk norm has weights")).arg(&self.buf.qkv);
             unsafe { b.launch(cfg(1, 1024)) }?;
         }
@@ -1390,7 +1395,7 @@ impl Runtime {
         let vocab = self.spec.dims.vocab;
         for (present, name) in [(self.spec.dims.logit_scale.is_some(), "logit_scale"), (self.spec.dims.logit_softcap.is_some(), "logit_softcap")] {
             if present {
-                let mut b = self.stream.launch_builder(self.kernel(name));
+                let mut b = self.launcher(self.kernel(name));
                 b.arg(&self.buf.logits).arg(&self.buf.logits);
                 unsafe { b.launch(cfg(grid(vocab, 256), 256)) }?;
             }
@@ -1407,7 +1412,7 @@ impl Runtime {
     }
 
     fn copy_rows(&self, src: &CudaView<f32>, dst: &CudaView<f32>, n: usize) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel("copy_rows"));
+        let mut b = self.launcher(self.kernel("copy_rows"));
         let count = n as i32;
         b.arg(src).arg(dst).arg(&count);
         unsafe { b.launch(cfg(grid(n, 256).min(1024), 256)) }?;
@@ -1420,10 +1425,10 @@ impl Runtime {
         self.linear_norm("lin_in_norm", &g.in_proj, None, x, ln1, &gb.lin, la.in_proj_rows())?;
         self.linear_norm("lin_ba_norm", &g.ba, None, x, ln1, &gb.ba, la.ba_rows())?;
         let zero = 0i32;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
+        let mut b = self.launcher(self.kernel("gdn_conv_step"));
         b.arg(&gb.lin).arg(&g.conv).arg(&*gb.conv_state).arg(&gb.mix).arg(&g.slot).arg(&zero).arg(&self.buf.zero_slots);
         unsafe { b.launch(cfg(grid(la.conv_dim(), 256), 256)) }?;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_step"));
+        let mut b = self.launcher(self.kernel("gdn_step"));
         b.arg(&gb.mix)
             .arg(&gb.lin)
             .arg(&gb.ba)
@@ -1444,7 +1449,7 @@ impl Runtime {
         let s = &self.spec;
         let a = &s.attention;
         let buf = &self.buf;
-        let mut b = self.stream.launch_builder(self.kernel("embed"));
+        let mut b = self.launcher(self.kernel("embed"));
         b.arg(&self.embed).arg(&buf.token).arg(&buf.x);
         unsafe { b.launch(cfg(grid(s.dims.hidden, 256), 256)) }?;
         let qkv_rows = s.qkv_rows();
@@ -1469,7 +1474,7 @@ impl Runtime {
                 self.linear("qkv_proj", &l.qkv, l.qkv_bias.as_ref(), &buf.x, &buf.qkv, qkv_rows)?;
             }
             self.qk_norm_decode(l)?;
-            let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
+            let mut b = self.launcher(self.kernel("qk_norm_rope"));
             b.arg(&buf.qkv)
                 .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
                 .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
@@ -1486,7 +1491,7 @@ impl Runtime {
                 .arg(&self.mm_table)
                 .arg(&self.seq);
             unsafe { b.launch(cfg((a.heads + 2 * a.kv_heads) as u32, a.head_dim.max(32) as u32)) }?;
-            let mut b = self.stream.launch_builder(self.kernel("attention_split"));
+            let mut b = self.launcher(self.kernel("attention_split"));
             b.arg(&buf.qkv)
                 .arg(buf.k_cache())
                 .arg(buf.v_cache())
@@ -1502,7 +1507,7 @@ impl Runtime {
                     shared_mem_bytes: 0,
                 })
             }?;
-            let mut b = self.stream.launch_builder(self.kernel("attention_reduce"));
+            let mut b = self.launcher(self.kernel("attention_reduce"));
             b.arg(&buf.attn_part).arg(&buf.pos).arg(&buf.qkv).arg(&buf.attn).arg(&window);
             unsafe { b.launch(cfg(a.heads as u32, a.head_dim.max(32) as u32)) }?;
             self.attention_out_decode(l, layer)?;
@@ -1532,7 +1537,7 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel(name));
+        let mut b = self.launcher(self.kernel(name));
         w.args(&mut b, &self.buf.dummy);
         let n = tokens as i32;
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out).arg(&n);
@@ -1569,7 +1574,7 @@ impl Runtime {
             _ => {}
         }
         let (kernel, tile) = (choice.name.as_str(), choice.tile);
-        let mut b = self.stream.launch_builder(self.kernel(kernel));
+        let mut b = self.launcher(self.kernel(kernel));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
         match out {
@@ -1598,7 +1603,7 @@ impl Runtime {
     ) -> Result<()> {
         let GemmOut::F32(o) = out else { unreachable!("tc_rows writes f32") };
         let n = tokens as i32;
-        let mut b = self.stream.launch_builder(self.kernel(&choice.name));
+        let mut b = self.launcher(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
         b.arg(&self.buf.dummy).arg(&x.0).arg(&x.1).arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16).arg(&n);
         unsafe {
@@ -1626,12 +1631,12 @@ impl Runtime {
         let cols = self.ggb_cols(choice.name.as_str());
         let chunks = rows * cols / 8;
         let (r, c) = (rows as i32, cols as i32);
-        let mut b = self.stream.launch_builder(self.kernel("gg_dequant_bf16"));
+        let mut b = self.launcher(self.kernel("gg_dequant_bf16"));
         b.arg(data).arg(table).arg(&self.ggb_scratch).arg(&r).arg(&c);
         unsafe { b.launch(cfg(grid(chunks, 256), 256)) }?;
         let tile = choice.tile;
         let kernel = choice.name.as_str();
-        let mut b = self.stream.launch_builder(self.kernel(kernel));
+        let mut b = self.launcher(self.kernel(kernel));
         b.arg(&self.ggb_scratch).arg(&self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
         match out {
@@ -1667,7 +1672,7 @@ impl Runtime {
         let shape = BatchShape::for_ggml(tokens);
         let splits = shape.ggml_splits(&self.target, rows, cols);
         let (n, s) = (tokens as i32, splits as i32);
-        let mut b = self.stream.launch_builder(self.kernel(&choice.name));
+        let mut b = self.launcher(self.kernel(&choice.name));
         b.arg(data).arg(table);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
         match out {
@@ -1685,7 +1690,7 @@ impl Runtime {
             return Ok(());
         }
         let reduce = choice.reduce.as_deref().expect("ggr has a reduce kernel");
-        let mut b = self.stream.launch_builder(self.kernel(reduce));
+        let mut b = self.launcher(self.kernel(reduce));
         b.arg(&self.f8b_part).arg(bias.unwrap_or(&self.buf.dummy));
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
@@ -1722,7 +1727,7 @@ impl Runtime {
         let shape = BatchShape::for_tokens(tokens);
         let splits = shape.splits(&self.target, rows, width);
         let (n, s) = (tokens as i32, splits as i32);
-        let mut b = self.stream.launch_builder(self.kernel(&choice.name));
+        let mut b = self.launcher(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
         match out {
@@ -1740,7 +1745,7 @@ impl Runtime {
             return Ok(());
         }
         let reduce = choice.reduce.as_deref().expect("f8b has a reduce kernel");
-        let mut b = self.stream.launch_builder(self.kernel(reduce));
+        let mut b = self.launcher(self.kernel(reduce));
         b.arg(&self.f8b_part).arg(bias.unwrap_or(&self.buf.dummy));
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
@@ -1770,7 +1775,7 @@ impl Runtime {
         let shape = BatchShape::for_tokens(tokens);
         let splits = shape.splits(&self.target, rows, width);
         let (n, s) = (tokens as i32, splits as i32);
-        let mut b = self.stream.launch_builder(self.kernel(&choice.name));
+        let mut b = self.launcher(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
         b.arg(&x.0).arg(&x.1);
         match out {
@@ -1788,7 +1793,7 @@ impl Runtime {
             return Ok(());
         }
         let reduce = choice.reduce.as_deref().expect("f4b has a reduce kernel");
-        let mut b = self.stream.launch_builder(self.kernel(reduce));
+        let mut b = self.launcher(self.kernel(reduce));
         b.arg(&self.f4b_part);
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
@@ -1818,7 +1823,7 @@ impl Runtime {
         let width = packed.len() * 2 / rows;
         let width_i = width as i32;
         let groups = width / crate::nvfp4::GROUP;
-        let mut b = self.stream.launch_builder(self.kernel(choice.quant.expect("f4a quantises its input")));
+        let mut b = self.launcher(self.kernel(choice.quant.expect("f4a quantises its input")));
         b.arg(&x.0).arg(&x.1).arg(scales).arg(&fa.q).arg(&fa.scales).arg(&width_i);
         let config = LaunchConfig {
             grid_dim: (grid(groups, 128), tokens as u32, 1),
@@ -1827,7 +1832,7 @@ impl Runtime {
         };
         unsafe { b.launch(config) }?;
         let (kernel, tile) = (choice.name.as_str(), choice.tile);
-        let mut b = self.stream.launch_builder(self.kernel(kernel));
+        let mut b = self.launcher(self.kernel(kernel));
         b.arg(packed).arg(scales).arg(&fa.q).arg(&fa.scales);
         match out {
             GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
@@ -1861,7 +1866,7 @@ impl Runtime {
             _ => unreachable!("tc_fp8 takes FP8 weights"),
         };
         let width_i = width as i32;
-        let mut b = self.stream.launch_builder(self.kernel(choice.quant.expect("f8 quantises its input")));
+        let mut b = self.launcher(self.kernel(choice.quant.expect("f8 quantises its input")));
         b.arg(&x.0).arg(&x.1).arg(&fa.q).arg(&fa.scale).arg(&width_i);
         let config = if fa.per_token {
             LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }
@@ -1874,7 +1879,7 @@ impl Runtime {
         };
         unsafe { b.launch(config) }?;
         let (kernel, tile) = (choice.name.as_str(), choice.tile);
-        let mut b = self.stream.launch_builder(self.kernel(kernel));
+        let mut b = self.launcher(self.kernel(kernel));
         w.args(&mut b, &self.buf.dummy);
         b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&fa.q).arg(&fa.scale);
         match out {
@@ -1904,7 +1909,7 @@ impl Runtime {
         lo: &CudaView<u16>,
         tokens: usize,
     ) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel("rms_split"));
+        let mut b = self.launcher(self.kernel("rms_split"));
         b.arg(x).arg(w).arg(hi).arg(lo);
         unsafe { b.launch(cfg(tokens as u32, 256)) }?;
         Ok(())
@@ -1917,7 +1922,7 @@ impl Runtime {
         out: &CudaSlice<f32>,
         tokens: usize,
     ) -> Result<()> {
-        let mut b = self.stream.launch_builder(self.kernel("rmsnorm"));
+        let mut b = self.launcher(self.kernel("rmsnorm"));
         b.arg(x).arg(w).arg(out);
         unsafe { b.launch(cfg(tokens as u32, 1024)) }?;
         Ok(())
@@ -1948,21 +1953,21 @@ impl Runtime {
             block_dim: (block, 1, 1),
             shared_mem_bytes: if name.is_empty() { 0 } else { smem },
         };
-        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_prefill"));
+        let mut b = self.launcher(self.kernel("gdn_conv_prefill"));
         b.arg(&lin).arg(&g.conv).arg(&*gb.conv_state).arg(&mix).arg(&slot);
         unsafe { b.launch(launch("", (grid(la.conv_dim(), 256), n as u32, 1), 256, 0)) }?;
         let ntok = n as i32;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_keep"));
+        let mut b = self.launcher(self.kernel("gdn_conv_keep"));
         b.arg(&lin).arg(&*gb.conv_state).arg(&slot).arg(&ntok);
         unsafe { b.launch(cfg(grid(la.conv_dim(), 256), 256)) }?;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_qk_prep"));
+        let mut b = self.launcher(self.kernel("gdn_qk_prep"));
         b.arg(&mix).arg(&gb.qn).arg(&gb.kn);
         unsafe { b.launch(launch("", (la.key_heads as u32, n as u32, 1), d as u32, 0)) }?;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_gates"));
+        let mut b = self.launcher(self.kernel("gdn_gates"));
         b.arg(&ba).arg(&g.neg_a).arg(&g.dt_bias).arg(&gb.g).arg(&gb.beta);
         unsafe { b.launch(cfg(n as u32, 64)) }?;
         let chunks = n.div_ceil(self.linear_tuning.chunk) as u32;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_chunk_prep"));
+        let mut b = self.launcher(self.kernel("gdn_chunk_prep"));
         b.arg(&gb.qn)
             .arg(&gb.kn)
             .arg(&mix)
@@ -1977,7 +1982,7 @@ impl Runtime {
             .arg(&ntok);
         let smem = self.smem["gdn_chunk_prep"];
         unsafe { b.launch(launch("prep", (la.value_heads as u32, chunks, 1), 256, smem)) }?;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_chunk_scan"));
+        let mut b = self.launcher(self.kernel("gdn_chunk_scan"));
         b.arg(&gb.w)
             .arg(&gb.qe)
             .arg(&gb.kt)
@@ -1989,7 +1994,7 @@ impl Runtime {
             .arg(&slot)
             .arg(&ntok);
         unsafe { b.launch(launch("", (la.value_heads as u32, (d / self.linear_tuning.cols) as u32, 1), self.linear_tuning.chunk_threads(), 0)) }?;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_gated_norm"));
+        let mut b = self.launcher(self.kernel("gdn_gated_norm"));
         b.arg(&o).arg(&lin).arg(&g.norm).arg(&hi).arg(&lo);
         unsafe { b.launch(launch("", (la.value_heads as u32, n as u32, 1), (d / 2) as u32, 0)) }?;
         Ok(())
@@ -2007,7 +2012,7 @@ impl Runtime {
         let table = self.slot_table(self.seq as usize);
         let mm_stride = self.max_ctx as i32;
         let qkv = pre.qkv.slice(at * self.spec.qkv_rows()..);
-        let mut b = self.stream.launch_builder(self.kernel("kv_norm_rope"));
+        let mut b = self.launcher(self.kernel("kv_norm_rope"));
         b.arg(&qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
             .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
@@ -2038,7 +2043,7 @@ impl Runtime {
         let qkv = pre.qkv.slice(at * self.spec.qkv_rows()..);
         let hi = pre.attn_planes.hi.slice(at * self.spec.q_dim()..);
         let lo = pre.attn_planes.lo.slice(at * self.spec.q_dim()..);
-        let mut b = self.stream.launch_builder(self.kernel("flash_mma"));
+        let mut b = self.launcher(self.kernel("flash_mma"));
         let ntok = n as i32;
         b.arg(&qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
@@ -2115,7 +2120,7 @@ impl Runtime {
 
     fn advance(&self, sampling: Sampling) -> Result<()> {
         let buf = &self.buf;
-        let mut b = self.stream.launch_builder(self.kernel("argmax_advance"));
+        let mut b = self.launcher(self.kernel("argmax_advance"));
         b.arg(&buf.logits).arg(&buf.token).arg(&buf.pos).arg(&buf.history).arg(&buf.count);
         let inv_temp = sampling.inverse_temperature();
         let top_k = sampling.top_k as i32;
@@ -2232,7 +2237,7 @@ impl Runtime {
 
     fn first_token(&self, bb: &BatchBuffers, seq: usize) -> Result<()> {
         let stride = self.max_ctx as i32;
-        let mut b = self.stream.launch_builder(self.kernel("argmax_rows"));
+        let mut b = self.launcher(self.kernel("argmax_rows"));
         let tokens = bb.tokens.slice(seq..seq + 1);
         let history = bb.history.slice(seq * self.max_ctx..);
         b.arg(&self.buf.logits).arg(&tokens).arg(&history).arg(&self.buf.count).arg(&stride);
@@ -2244,7 +2249,7 @@ impl Runtime {
         let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
         let la = &gb.la;
         let seq_slots = self.spec.linear_layers() as i32;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_conv_step"));
+        let mut b = self.launcher(self.kernel("gdn_conv_step"));
         b.arg(&gb.pre_lin).arg(&g.conv).arg(&*gb.conv_state).arg(&gb.pre_mix).arg(&g.slot).arg(&seq_slots).arg(slots);
         let config = LaunchConfig {
             grid_dim: (grid(la.conv_dim(), 256), n as u32, 1),
@@ -2252,7 +2257,7 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        let mut b = self.stream.launch_builder(self.kernel("gdn_step"));
+        let mut b = self.launcher(self.kernel("gdn_step"));
         b.arg(&gb.pre_mix)
             .arg(&gb.pre_lin)
             .arg(&gb.pre_ba)
@@ -2270,7 +2275,7 @@ impl Runtime {
             shared_mem_bytes: 0,
         };
         unsafe { b.launch(config) }?;
-        let mut b = self.stream.launch_builder(self.kernel("split_rows"));
+        let mut b = self.launcher(self.kernel("split_rows"));
         let count = (n * la.value_dim()) as i32;
         b.arg(&gb.o).arg(&gb.planes.hi).arg(&gb.planes.lo).arg(&count);
         unsafe { b.launch(cfg(grid(n * la.value_dim(), 512), 256)) }?;
@@ -2451,7 +2456,7 @@ impl Runtime {
         let hidden = self.spec.dims.hidden;
         let rows_dev = self.stream.clone_htod(&rows)?;
         let x = self.pre.x.slice(row_offset * hidden..);
-        let mut b = self.stream.launch_builder(self.kernel("splice_rows"));
+        let mut b = self.launcher(self.kernel("splice_rows"));
         b.arg(&x).arg(&rows_dev).arg(&m.embeds);
         unsafe { b.launch(LaunchConfig { grid_dim: (grid(hidden, 256), n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
         Ok(())
@@ -2514,10 +2519,10 @@ impl Runtime {
     fn batch_step(&self, bb: &BatchBuffers, n: usize) -> Result<()> {
         self.decode_rows(bb, n)?;
         let stride = self.max_ctx as i32;
-        let mut b = self.stream.launch_builder(self.kernel("argmax_rows"));
+        let mut b = self.launcher(self.kernel("argmax_rows"));
         b.arg(&bb.logits).arg(&bb.tokens).arg(&bb.history).arg(&self.buf.count).arg(&stride);
         unsafe { b.launch(cfg(n as u32, 1024)) }?;
-        let mut b = self.stream.launch_builder(self.kernel("bump"));
+        let mut b = self.launcher(self.kernel("bump"));
         b.arg(&bb.pos).arg(&self.buf.count);
         unsafe { b.launch(cfg(1, n as u32)) }?;
         Ok(())
@@ -2528,7 +2533,7 @@ impl Runtime {
         let (pages, mm_stride) = (self.pages as i32, self.max_ctx as i32);
         let pre = &self.pre;
         let buf = &self.buf;
-        let mut b = self.stream.launch_builder(self.kernel("qk_norm_rope"));
+        let mut b = self.launcher(self.kernel("qk_norm_rope"));
         b.arg(&pre.qkv)
             .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
             .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
@@ -2562,7 +2567,7 @@ impl Runtime {
         let pre = &self.pre;
         let buf = &self.buf;
         self.decode_rope_rows(l, bb, n)?;
-        let mut b = self.stream.launch_builder(self.kernel("batch_decode_attention"));
+        let mut b = self.launcher(self.kernel("batch_decode_attention"));
         b.arg(&pre.qkv)
             .arg(buf.k_cache())
             .arg(buf.v_cache())
@@ -2582,7 +2587,7 @@ impl Runtime {
             shared_mem_bytes: self.smem["batch_decode_attention"],
         };
         unsafe { b.launch(config) }?;
-        let mut b = self.stream.launch_builder(self.kernel("batch_decode_combine"));
+        let mut b = self.launcher(self.kernel("batch_decode_combine"));
         b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&pre.qkv).arg(&bb.pos).arg(&qlen_i).arg(&splits_i).arg(&pre.attn_planes.hi).arg(&pre.attn_planes.lo);
         let config = LaunchConfig {
             grid_dim: (a.heads as u32, n as u32, 1),
