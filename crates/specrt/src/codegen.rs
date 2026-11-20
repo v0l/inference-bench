@@ -28,7 +28,7 @@ pub fn moe_mma_bf16_enabled(spec: &Spec, target: &kir::Target) -> bool {
         && target.has(kir::Feature::Mma16816)
         && target.has(kir::Feature::CpAsync)
         && m.expert_intermediate.is_multiple_of(64)
-        && spec.dims.hidden.is_multiple_of(32)
+        && spec.dims.hidden.is_multiple_of(64)
 }
 
 pub fn moe_mma_fp8_enabled(spec: &Spec, target: &kir::Target) -> bool {
@@ -62,6 +62,7 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         expert_bias: m.expert_bias,
         hash: m.hash_table.is_some(),
         block_group: m.expert_block.map_or(0, |b| b.group),
+        mapped: spec.mlp.mapped.is_some(),
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if moe_mma_enabled(spec, target) {

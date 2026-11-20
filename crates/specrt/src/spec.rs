@@ -1401,8 +1401,8 @@ impl Spec {
     pub fn check_moe_runnable(&self) -> Result<()> {
         let Some(m) = &self.moe else { return Ok(()) };
         ensure!(self.linear_attention.is_some() || self.attention_layers() > 0, "mixture-of-experts needs attention layers");
-        ensure!(self.mlp.mapped.is_none(), "mixture-of-experts with non-gated ([mlp.mapped]) experts is not supported yet");
         let experts_quant = self.mlp.quant.unwrap_or(self.quant);
+        ensure!(self.mlp.mapped.is_none() || experts_quant == Quant::Bf16, "non-gated ([mlp.mapped]) experts run on bf16 weights only");
         ensure!(
             matches!(experts_quant, Quant::Bf16 | Quant::Nvfp4G16 | Quant::Fp8Block128 | Quant::Gguf | Quant::Q8),
             "mixture-of-experts with {experts_quant:?} expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are)"
@@ -1418,8 +1418,8 @@ impl Spec {
         );
         ensure!(m.shared_slots() <= 1 || experts_quant == Quant::Bf16, "shared experts wider than the routed experts are only supported with bf16 weights");
         ensure!(
-            self.dims.hidden.is_multiple_of(256) || (m.expert_block.is_some_and(|b| b.device_packed()) && self.dims.hidden.is_multiple_of(64)),
-            "mixture-of-experts needs hidden to be a multiple of 256 (64 with block scaled experts)"
+            self.dims.hidden.is_multiple_of(256) || (m.expert_block.is_some_and(|b| b.device_packed()) && self.dims.hidden.is_multiple_of(64)) || (experts_quant == Quant::Bf16 && self.dims.hidden.is_multiple_of(32)),
+            "mixture-of-experts needs hidden to be a multiple of 256 (64 with block scaled experts, 32 with bf16 experts)"
         );
         Ok(())
     }

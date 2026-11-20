@@ -363,6 +363,9 @@ impl Runtime {
             unreachable!("the bf16 mma path needs bf16 experts")
         };
         let (h, inter) = (self.spec.dims.hidden, m.expert_intermediate);
+        let mapped = self.spec.mlp.mapped.is_some();
+        let up_weights = if mapped { 1 } else { 2 };
+        let (gw, uw) = if mapped { (uw, uw) } else { (gw, uw) };
         let slots = m.local_experts() + m.shared_slots();
         let pairs = n * m.pairs();
         let small = pairs / slots < MOE_MMA_BM / 2;
@@ -384,7 +387,7 @@ impl Runtime {
         let tag = if small { "_s" } else { "" };
         let mut b = self.stream.launch_builder(self.kernel(&format!("moe_mma_up_b16{tag}")));
         b.arg(gw).arg(uw).arg(&w.gate_up_bias).arg(&mma.xh).arg(&mma.xl).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.act);
-        let config = LaunchConfig { grid_dim: ((inter / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_bf16_smem(bm, 2) };
+        let config = LaunchConfig { grid_dim: ((inter / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_bf16_smem(bm, up_weights) };
         unsafe { b.launch(config) }?;
         split(&mb.act, &mma.ah, &mma.al, pairs, inter)?;
         let mut b = self.stream.launch_builder(self.kernel(&format!("moe_mma_down_b16{tag}")));

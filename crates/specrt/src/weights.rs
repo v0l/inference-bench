@@ -1201,6 +1201,7 @@ impl Checkpoint {
                 }
                 (Stacked::Bf16(gate), Stacked::Bf16(up), Stacked::Bf16(down))
             }
+            None if spec.mlp.mapped.is_some() => (Stacked::Bf16(vec![0; 8]), stack("up", inter, h)?, stack("down", h, inter)?),
             None => (stack("gate", inter, h)?, stack("up", inter, h)?, stack("down", h, inter)?),
         };
         Ok(MoeWeights {

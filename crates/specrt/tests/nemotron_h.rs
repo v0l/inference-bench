@@ -5,6 +5,7 @@ use specrt::spec::{Activation, Block, Spec};
 use std::path::{Path, PathBuf};
 
 const TINY: &str = "tiny-nemotronh";
+const TINY_MOE: &str = "tiny-nemotronh-moe";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -22,11 +23,15 @@ fn serving(json: &str) -> anyhow::Result<Spec> {
     Spec::from_hf_config_serving_in(Families::embedded(), json)
 }
 
-fn tiny() -> Spec {
-    let mut spec = serving(&config(&format!("{TINY}/config.json"))).unwrap_or_else(|e| panic!("{e:#}"));
-    spec.name = TINY.into();
-    spec.repo = fixture(TINY).display().to_string();
+fn tiny_named(name: &str) -> Spec {
+    let mut spec = serving(&config(&format!("{name}/config.json"))).unwrap_or_else(|e| panic!("{e:#}"));
+    spec.name = name.into();
+    spec.repo = fixture(name).display().to_string();
     spec
+}
+
+fn tiny() -> Spec {
+    tiny_named(TINY)
 }
 
 #[test]
@@ -88,9 +93,40 @@ fn the_nano_9b_module_builds_a_relu2_mapped_up_projection() {
 }
 
 #[test]
-fn the_nemotron_3_nano_moe_config_is_refused_for_its_non_gated_experts() {
-    let err = serving(&config("nemotron-3-nano-30b-a3b.config.json")).unwrap_err();
-    assert!(format!("{err:#}").contains("non-gated"), "{err:#}");
+fn the_nemotron_3_nano_moe_config_is_supported_with_non_gated_experts() {
+    let spec = serving(&config("nemotron-3-nano-30b-a3b.config.json")).unwrap_or_else(|e| panic!("{e:#}"));
+    let m = spec.moe.as_ref().unwrap();
+    assert_eq!((m.experts, m.top_k(), m.expert_intermediate, m.shared_intermediate, m.routed_scale), (128, 6, 1856, 3712, 2.5));
+    assert!(m.score_bias && !m.shared_gate && m.router == specrt::spec::RouterAct::Sigmoid);
+    assert!(spec.mlp.mapped.is_some());
+    let sparse = (0..spec.layers.count).filter(|&i| spec.block(i) == Block::Mlp).count();
+    assert_eq!(sparse, 23);
+    spec.runnable().unwrap();
+}
+
+#[test]
+fn the_moe_module_runs_one_up_stack_through_the_mapped_activation() {
+    let spec = serving(&config("nemotron-3-nano-30b-a3b.config.json")).unwrap();
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+    assert!(module.source.contains("constexpr bool MOE_MAPPED = true;"));
+    assert!(module.source.contains("constexpr int MOE_UP_WEIGHTS = 1;"));
+    assert!(module.source.contains("mapped_act(u)"));
+}
+
+#[test]
+fn non_gated_experts_on_quantised_weights_are_refused() {
+    let mut spec = serving(&config("nemotron-3-nano-30b-a3b.config.json")).unwrap();
+    spec.mlp.quant = Some(specrt::spec::Quant::Nvfp4G16);
+    assert!(spec.check_moe_runnable().is_err());
+}
+
+#[test]
+fn the_mamba_mixer_layers_count_their_parameters_in_the_anatomy() {
+    let spec = serving(&config("nemotron-nano-9b-v2.config.json")).unwrap();
+    let a = specrt::anatomy::ModelAnatomy::new(&spec, 0, None);
+    let mixer = a.layers.iter().find(|l| l.kind == specrt::anatomy::LayerKind::DeltaNet).unwrap();
+    let h = 4480u64;
+    assert!(mixer.mixer_params >= h * (22656 + 10240), "{}", mixer.mixer_params);
 }
 
 #[test]
@@ -115,27 +151,43 @@ fn the_tiny_nemotron_h_checkpoint_loads_through_the_family_tensor_names() {
     }
 }
 
-fn reference() -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
+fn reference(name: &str) -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
     let dir = PathBuf::from(std::env::var_os("SPECRT_REF_DIR").expect("SPECRT_REF_DIR from scripts/tiny_nemotronh.py"));
-    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{TINY}.ref.json"))).unwrap()).unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{name}.ref.json"))).unwrap()).unwrap();
     let ids = |k: &str| -> Vec<u32> { meta[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect() };
-    let bytes = std::fs::read(dir.join(format!("{TINY}.ref.bin"))).unwrap();
+    let bytes = std::fs::read(dir.join(format!("{name}.ref.bin"))).unwrap();
     (ids("tokens"), ids("greedy"), meta["vocab"].as_u64().unwrap() as usize, bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
 }
 
-#[test]
-#[ignore = "needs a CUDA GPU and SPECRT_REF_DIR from scripts/tiny_nemotronh.py"]
-fn tiny_nemotron_h_matches_transformers() {
-    let (tokens, greedy, vocab, want) = reference();
-    let spec = tiny();
+fn matches_transformers(name: &str) {
+    let (tokens, greedy, vocab, want) = reference(name);
+    let spec = tiny_named(name);
     let mut rt = Runtime::load_batched(&spec, 256, 1).unwrap();
     let ours = rt.prompt_logits(&tokens).unwrap();
     assert_eq!(ours.len(), want.len());
     let max_abs = ours.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
     let top = |row: &[f32]| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
     let agree = (0..tokens.len()).filter(|r| top(&ours[r * vocab..(r + 1) * vocab]) == top(&want[r * vocab..(r + 1) * vocab])).count();
-    eprintln!("{TINY} prefill max_abs {max_abs} argmax agree {agree}/{}", tokens.len());
-    assert!(max_abs < 0.1, "{TINY} max abs diff {max_abs}");
+    eprintln!("{name} prefill max_abs {max_abs} argmax agree {agree}/{}", tokens.len());
+    assert!(max_abs < 0.1, "{name} max abs diff {max_abs}");
     let got = rt.generate_batch(std::slice::from_ref(&tokens), greedy.len()).unwrap();
-    assert_eq!(got.tokens[0], greedy, "{TINY} decode greedy");
+    assert_eq!(got.tokens[0], greedy, "{name} decode greedy");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and SPECRT_REF_DIR from scripts/tiny_nemotronh.py"]
+fn tiny_nemotron_h_matches_transformers() {
+    matches_transformers(TINY);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and SPECRT_REF_DIR from scripts/tiny_nemotronh.py"]
+fn tiny_moe_nemotron_h_matches_transformers() {
+    matches_transformers(TINY_MOE);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and SPECRT_REF_DIR from scripts/tiny_nemotronh.py"]
+fn tiny_moe_nemotron_h_on_tensor_core_tiles_matches_transformers() {
+    matches_transformers("tiny-nemotronh-moe-mma");
 }

@@ -133,13 +133,13 @@ fn up_impl() -> String {
     __syncthreads();
 {}    int row = blockIdx.y * MOE_WARPS + warp;
     if (row >= MOE_INTER) return;
-    float g = moe_dot<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
+    float g = MOE_MAPPED ? 0.0f : moe_dot<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
     float u = moe_dot<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane);
     if (MOE_EBIAS) {{
         g += eb[(size_t)expert * 2 * MOE_INTER + row];
         u += eb[((size_t)expert * 2 + 1) * MOE_INTER + row];
     }}
-    if (lane == 0) act[(size_t)pair * MOE_INTER + row] = gated_act(g, u);
+    if (lane == 0) act[(size_t)pair * MOE_INTER + row] = MOE_MAPPED ? mapped_act(u) : gated_act(g, u);
 "##,
                 prim::warp_ids()
             )
@@ -196,7 +196,7 @@ fn group_up_impl() -> String {
         __syncthreads();
         if (row < MOE_INTER) {{
             float gv[MOE_TJ], uv[MOE_TJ];
-            moe_dot2<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
+            if (!MOE_MAPPED) moe_dot2<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
             moe_dot2<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane, live, uv);
             if (MOE_EBIAS) {{
                 for (int j = 0; j < live; j++) {{
@@ -205,7 +205,7 @@ fn group_up_impl() -> String {
                 }}
             }}
             if (lane == 0) {{
-                for (int j = 0; j < live; j++) act[(size_t)sorted[base + j] * MOE_INTER + row] = gated_act(gv[j], uv[j]);
+                for (int j = 0; j < live; j++) act[(size_t)sorted[base + j] * MOE_INTER + row] = MOE_MAPPED ? mapped_act(uv[j]) : gated_act(gv[j], uv[j]);
             }}
         }}
     }}

@@ -142,6 +142,7 @@ impl MoeKernel {
     }
 
     pub fn smem(&self) -> Vec<(&'static str, u32)> {
+        let up = if self.shape.mapped { 1 } else { 2 };
         match self.family {
             Family::Experts => vec![],
             Family::GroupedMma => vec![
@@ -151,8 +152,8 @@ impl MoeKernel {
                 ("moe_mma_down_s", mma_smem(MMA_BM_SMALL, 1)),
             ],
             Family::GroupedMmaBf16 => vec![
-                ("moe_mma_up_b16", mma_bf16_smem(MMA_BM, 2)),
-                ("moe_mma_up_b16_s", mma_bf16_smem(MMA_BM_SMALL, 2)),
+                ("moe_mma_up_b16", mma_bf16_smem(MMA_BM, up)),
+                ("moe_mma_up_b16_s", mma_bf16_smem(MMA_BM_SMALL, up)),
                 ("moe_mma_down_b16", mma_bf16_smem(MMA_BM, 1)),
                 ("moe_mma_down_b16_s", mma_bf16_smem(MMA_BM_SMALL, 1)),
             ],

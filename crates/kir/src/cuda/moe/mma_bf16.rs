@@ -137,6 +137,9 @@ fn epilogue() -> &'static str {
                 if (NW == 2) {
                     v.x = gated_act(acc[0][i][j][2 * h] + b0.x, acc[NW - 1][i][j][2 * h] + b1.x);
                     v.y = gated_act(acc[0][i][j][2 * h + 1] + b0.y, acc[NW - 1][i][j][2 * h + 1] + b1.y);
+                } else if (MOE_MAPPED && !DOWN) {
+                    v.x = mapped_act(acc[0][i][j][2 * h] + b0.x);
+                    v.y = mapped_act(acc[0][i][j][2 * h + 1] + b0.y);
                 } else {
                     v.x = acc[0][i][j][2 * h] + b0.x;
                     v.y = acc[0][i][j][2 * h + 1] + b0.y;
@@ -179,8 +182,8 @@ pub fn grouped() -> String {
     out.push_str(&mma::tiles("moe_tiles_b16"));
     out.push_str(&prim::swizzle("mmb_chunk", "MMB_ROW"));
     out.push_str(&gemm());
-    out.push_str(&variant("moe_mma_up_b16", "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false"));
-    out.push_str(&variant("moe_mma_up_b16_s", "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 3, false"));
+    out.push_str(&variant("moe_mma_up_b16", "MOE_INTER, HIDDEN, MOE_UP_WEIGHTS, 64, 64, 2, 2, 3, false"));
+    out.push_str(&variant("moe_mma_up_b16_s", "MOE_INTER, HIDDEN, MOE_UP_WEIGHTS, 16, 64, 1, 4, 3, false"));
     out.push_str(&variant("moe_mma_down_b16", "HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true"));
     out.push_str(&variant("moe_mma_down_b16_s", "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 3, true"));
     out

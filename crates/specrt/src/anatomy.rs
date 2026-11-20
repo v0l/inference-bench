@@ -155,8 +155,28 @@ fn attention_counts(spec: &Spec) -> Counts {
     Counts { quantised: spec.qkv_rows() as u64 * h + h * spec.o_dim() as u64, plain: bias + norms + extra }
 }
 
+fn mixer_counts(spec: &Spec, m: &crate::spec::Mixer) -> Counts {
+    let h = spec.dims.hidden as u64;
+    let dim = |s: &str| spec.weight_len(s).unwrap_or(0) as u64;
+    let projections: u64 = m.projection.iter().filter(|p| p.present_in(Block::Linear)).map(|p| dim(&p.rows) * h).sum();
+    let mut seen: Vec<&str> = Vec::new();
+    let mut plain = 0;
+    for b in m.node.iter().flat_map(|n| n.bind.values()) {
+        if let crate::graph::Bind::Weight { weight, len } = b
+            && !seen.contains(&weight.as_str())
+        {
+            seen.push(weight);
+            plain += dim(len);
+        }
+    }
+    Counts { quantised: projections + h * dim(&m.out_cols), plain }
+}
+
 fn delta_counts(spec: &Spec) -> Counts {
     let h = spec.dims.hidden as u64;
+    if let Some(m) = &spec.mixer {
+        return mixer_counts(spec, m);
+    }
     let Some(la) = &spec.linear_attention else { return Counts { quantised: 0, plain: 0 } };
     let value = la.value_dim() as u64;
     let conv = la.conv_dim() as u64;
@@ -197,12 +217,13 @@ fn mlp_parts(spec: &Spec, index: usize, force_moe: bool) -> MlpParts {
     let h = spec.dims.hidden as u64;
     match &spec.moe {
         Some(m) if force_moe || m.is_sparse(index) => {
-            let routed = 3 * h * m.expert_intermediate as u64 * m.experts as u64;
+            let matrices = if spec.mlp.mapped.is_some() { 2 } else { 3 };
+            let routed = matrices * h * m.expert_intermediate as u64 * m.experts as u64;
             let per_token = m.active.unwrap_or(m.experts).min(m.experts) as u64;
             MlpParts {
                 dense: 0,
                 routed,
-                shared: 3 * h * m.shared_intermediate as u64,
+                shared: matrices * h * m.shared_intermediate as u64,
                 router: h * m.experts as u64 + if m.shared_intermediate > 0 && m.shared_gate { h } else { 0 },
                 active_routed: routed / m.experts.max(1) as u64 * per_token,
             }
