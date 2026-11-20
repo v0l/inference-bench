@@ -59,6 +59,10 @@ impl Solved {
         self.placement.stages.len() > 1
     }
 
+    pub fn single_device(&self) -> usize {
+        self.placement.stages.first().map_or(0, |s| s.ordinals.first().copied().unwrap_or(s.ordinal))
+    }
+
     pub fn ordinals(&self) -> Vec<usize> {
         self.placement.stages.iter().flat_map(|s| s.ordinals.clone()).collect()
     }
@@ -617,6 +621,18 @@ mod tests {
         let mixed = vec![gpu(0, 24.0, 936.0), gpu(1, 24.0, 1792.0)];
         let s = run(Profile::MaxPerformance, Target { context: Some(8192), ..Default::default() }, &[], &mixed, &spec());
         assert_eq!(s.tp, 1, "{}", s.strategy);
+    }
+
+    #[test]
+    fn with_gpu0_disabled_a_single_gpu_load_runs_on_device_1() {
+        let only_second = vec![gpu(1, 86.0, 1792.0)];
+        for mode in [Profile::MaxPerformance, Profile::LowMemory] {
+            let s = run(mode, Target::default(), &[], &only_second, &spec());
+            assert_eq!(s.placement.stages.len(), 1);
+            assert_eq!(s.single_device(), 1, "{mode:?}: {}", s.strategy);
+        }
+        let too_small_first = run(Profile::LowMemory, Target::default(), &[], &[gpu(0, 20.0, 900.0), gpu(1, 86.0, 1792.0)], &spec());
+        assert_eq!(too_small_first.single_device(), 1, "{}", too_small_first.strategy);
     }
 
     #[test]

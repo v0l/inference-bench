@@ -564,7 +564,7 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
         }
         return Ok(());
     }
-    let device = solved.placement.stages.first().map_or(0, |s| s.ordinal);
+    let device = solved.single_device();
     match build(spec, opts, device) {
         Ok(mut sched) => {
             if let Some(shared) = sessions {
