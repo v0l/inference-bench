@@ -238,8 +238,8 @@ fn two_gpu_transport_report() {
     for c in &ctxs {
         eprintln!("gpu{} iommu group type: {:?}", c.ordinal(), specrt::allreduce::iommu_mode(c));
     }
-    eprintln!("peer writes: {:?}", peer_writes_land(&ctxs, PROBE_TIMEOUT, true).unwrap());
     let f = Fabric::new(&ctxs, 1 << 20, None).unwrap();
+    eprintln!("peer writes: {:?}", peer_writes_land(&ctxs, PROBE_TIMEOUT, true).unwrap());
     eprintln!("auto transport for gpu0+gpu1: {:?}", f.transport());
 }
 
