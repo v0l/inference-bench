@@ -163,6 +163,8 @@ pub struct RuntimeOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split_activations: Option<bool>,
     pub gemm_fp32: bool,
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub chunked_scan: bool,
     pub kv_dtype: KvDtype,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_f16_layers: Option<usize>,
@@ -176,6 +178,14 @@ pub struct RuntimeOptions {
     pub loader: crate::loader::LoaderOptions,
     #[serde(skip_serializing_if = "VisionOptions::is_default")]
     pub vision: VisionOptions,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(v: &bool) -> bool {
+    *v
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,7 +265,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 
@@ -367,6 +377,8 @@ pub struct LinearAttention {
     pub conv_kernel: usize,
     #[serde(default, skip_serializing_if = "VHeadOrder::is_grouped")]
     pub v_heads: VHeadOrder,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fused_interleaved: bool,
 }
 
 impl LinearAttention {
@@ -809,6 +821,10 @@ pub struct Mlp {
     pub quant_until: Option<usize>,
     #[serde(default, skip_serializing_if = "ActQuant::is_none")]
     pub act_quant: ActQuant,
+    #[serde(default = "one_plane", skip_serializing_if = "is_one_plane")]
+    pub up_act_planes: u8,
+    #[serde(default = "one_plane", skip_serializing_if = "is_one_plane")]
+    pub down_act_planes: u8,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fused_gate_up: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -893,6 +909,14 @@ impl Mtp {
     pub fn new(layers: usize) -> Mtp {
         Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None, graph: false, head_quant: None }
     }
+}
+
+fn one_plane() -> u8 {
+    1
+}
+
+fn is_one_plane(n: &u8) -> bool {
+    *n == 1
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -1204,7 +1228,16 @@ fn parse_compressed(rule: &crate::family::FamilyQuant, q: &serde_json::Value, la
 
 fn moe_act(rule: &crate::family::FamilyQuant, q: Option<&serde_json::Value>) -> ActQuant {
     let groups = q.and_then(|q| q["config_groups"].as_object());
-    groups.and_then(|g| g.values().next()).map_or(ActQuant::None, |g| compressed_act(rule, g))
+    let Some(g) = groups.and_then(|g| g.values().next()) else { return ActQuant::None };
+    let mut g = g.clone();
+    for key in ["format", "quant_method", "quant_algo"] {
+        if g.get(key).is_none()
+            && let Some(v) = q.and_then(|q| q.get(key))
+        {
+            g[key] = v.clone();
+        }
+    }
+    compressed_act(rule, &g)
 }
 
 fn parse_quantization(rule: &crate::family::FamilyQuant, value: Option<&serde_json::Value>, layers: usize) -> Result<Quantization> {
@@ -1336,6 +1369,8 @@ impl Spec {
         let mut spec = Self::from_hf_config_serving(json)?;
         spec.act_quant = ActQuant::None;
         spec.mlp.act_quant = ActQuant::None;
+        spec.mlp.up_act_planes = 1;
+        spec.mlp.down_act_planes = 1;
         Ok(spec)
     }
 
@@ -1566,6 +1601,7 @@ impl Spec {
                     value_head_dim: need(hf.linear_value_head_dim, "linear_value_head_dim")?,
                     conv_kernel: need(hf.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
                     v_heads: VHeadOrder::Grouped,
+                    fused_interleaved: family.linear.fused_interleaved,
                 })
             })();
             if strict { Some(dims?) } else { dims.ok() }
@@ -1674,6 +1710,8 @@ impl Spec {
                 quant: mlp_quant.map(|m| m.0),
                 quant_until: mlp_quant.and_then(|m| m.1),
                 act_quant: mlp_act,
+                up_act_planes: if block_act { family.moe.act_planes.unwrap_or(1) } else { 1 },
+                down_act_planes: if block_act { family.moe.act_planes.unwrap_or(1) } else { 1 },
                 fused_gate_up: family.mlp.fused_gate_up,
                 gated: match &family.mlp.gated {
                     Some(g) => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
@@ -1758,6 +1796,14 @@ impl Spec {
                 "[mlp] act_quant = \"fp8\" is for mixture-of-experts with fp8_block128 experts; dense FP8 MLP inputs follow the top-level act_quant"
             ),
         }
+        ensure!(
+            (1..=2).contains(&self.mlp.up_act_planes) && (1..=2).contains(&self.mlp.down_act_planes),
+            "[mlp] up_act_planes and down_act_planes are 1 or 2"
+        );
+        ensure!(
+            (self.mlp.up_act_planes == 1 && self.mlp.down_act_planes == 1) || self.moe.as_ref().and_then(|m| m.expert_block).is_some_and(|b| b.native_mma()),
+            "[mlp] up_act_planes and down_act_planes = 2 need a 32 wide e2m1 e8m0 [moe] expert_block"
+        );
         if let Some(m) = &self.rope.mrope {
             ensure!(
                 m.section.iter().sum::<usize>() == self.rotary_dim() / 2,

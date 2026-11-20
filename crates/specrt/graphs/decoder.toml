@@ -562,7 +562,7 @@ op = "moe_combine"
 [[block]]
 name = "attention_branch_moe"
 when = "scaled+tensor_core+moe"
-layers = ["dense", "full", "sliding", "shared"]
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
 mlp = "sparse"
 
 [[block.node]]

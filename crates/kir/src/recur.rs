@@ -307,6 +307,9 @@ impl SeqBody {
     }
 }
 
+mod chunk;
+pub use chunk::ChunkForm;
+
 impl Recurrence {
     pub fn describe(&self) -> String {
         let mut s = format!("recurrence state={} keys={} values={} ksplit={} layers={}", self.state, self.keys, self.values, self.ksplit, self.layers);

@@ -225,25 +225,32 @@ impl Runtime {
             ints[i] = v as i32;
             floats[i] = v as f32;
         }
-        let mut b = self.stream.launch_builder(self.kernel(launch.name));
-        for (i, p) in launch.params.iter().enumerate() {
-            match (p.role, p.name) {
-                (kir::Role::Value, _) => match p.ty {
-                    kir::Scalar::F32 => b.arg(&floats[i]),
-                    _ => b.arg(&ints[i]),
-                },
-                (_, "slots") => b.arg(slots),
-                (_, "out_hi") => b.arg(&mb.planes.hi),
-                (_, "out_lo") => b.arg(&mb.planes.lo),
-                (_, name) => match spec_node.bind.get(name) {
-                    Some(Bind::Weight { weight, .. }) => b.arg(d.extra.get(weight).with_context(|| format!("layer has no {weight} tensor"))?),
-                    Some(Bind::Buffer { buffer }) if buffer == "mix" => b.arg(&mb.mix),
-                    Some(Bind::Buffer { buffer }) => b.arg(mb.scratch.get(buffer).with_context(|| format!("no mixer scratch {buffer:?}"))?),
-                    Some(Bind::State { state }) => b.arg(&*mb.states.iter().find(|s| s.name == *state).with_context(|| format!("no sequence state {state:?}"))?.slice),
-                    _ => bail!("param {name:?} of {} is not bound to a buffer", launch.name),
-                },
-            };
-        }
+        let launch_one = |name: &str, config: LaunchConfig, chunked: bool| -> Result<()> {
+            let mut b = self.stream.launch_builder(self.kernel(name));
+            for (i, p) in launch.params.iter().enumerate() {
+                match (p.role, p.name) {
+                    (kir::Role::Value, _) => match p.ty {
+                        kir::Scalar::F32 => b.arg(&floats[i]),
+                        _ => b.arg(&ints[i]),
+                    },
+                    (_, "slots") => b.arg(slots),
+                    (_, "out_hi") => b.arg(&mb.planes.hi),
+                    (_, "out_lo") => b.arg(&mb.planes.lo),
+                    (_, name) => match spec_node.bind.get(name) {
+                        Some(Bind::Weight { weight, .. }) => b.arg(d.extra.get(weight).with_context(|| format!("layer has no {weight} tensor"))?),
+                        Some(Bind::Buffer { buffer }) if buffer == "mix" => b.arg(&mb.mix),
+                        Some(Bind::Buffer { buffer }) => b.arg(mb.scratch.get(buffer).with_context(|| format!("no mixer scratch {buffer:?}"))?),
+                        Some(Bind::State { state }) => b.arg(&*mb.states.iter().find(|s| s.name == *state).with_context(|| format!("no sequence state {state:?}"))?.slice),
+                        _ => bail!("param {name:?} of {} is not bound to a buffer", launch.name),
+                    },
+                };
+            }
+            if chunked {
+                b.arg(&mb.chunk_state).arg(&mb.chunk_decay);
+            }
+            unsafe { b.launch(config) }?;
+            Ok(())
+        };
         let dim = |symbol: &String| -> Result<u32> {
             Ok(match symbol.as_str() {
                 "rows" => run.n as u32,
@@ -255,9 +262,15 @@ impl Runtime {
             })
         };
         let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
+        if let Some(f) = launch.chunk.as_ref().filter(|f| rows_per_seq >= f.min_rows as usize) {
+            let block = (f.threads, 1, 1);
+            let tiles = LaunchConfig { grid_dim: (dims[0], rows_per_seq.div_ceil(f.rows as usize) as u32, seqs as u32), block_dim: block, shared_mem_bytes: f.state_smem };
+            launch_one(f.state, tiles, true)?;
+            launch_one(f.carry, LaunchConfig { grid_dim: (dims[0], seqs as u32, f.state_floats.div_ceil(f.threads)), block_dim: block, shared_mem_bytes: 0 }, true)?;
+            return launch_one(f.out, LaunchConfig { grid_dim: (dims[0], tiles.grid_dim.1 * f.subs, seqs as u32), shared_mem_bytes: f.out_smem, ..tiles }, true);
+        }
         let config = LaunchConfig { grid_dim: (dims[0], dims.get(1).copied().unwrap_or(1), dims.get(2).copied().unwrap_or(1)), block_dim: (launch.threads, 1, 1), shared_mem_bytes: 0 };
-        unsafe { b.launch(config) }?;
-        Ok(())
+        launch_one(launch.name, config, false)
     }
 
     fn comm(&self) -> &crate::allreduce::Comm {

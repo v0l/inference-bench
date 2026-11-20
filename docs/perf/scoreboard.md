@@ -16,6 +16,7 @@ Ratios are specrt / best competitor, above 1.00 means we are faster. Rows are re
 | qwen3 | `qwen3-0.6b.toml` | 140.0 | 21997.5 | 1081.9 | llama.cpp | 158.9 | 23136.2 | 994.4 | 0.88 | 0.95 | 1.09 | 2026-11-19 | 5c53f27 | `crates/specrt/scripts/perfpass.sh qwen3 --model /home/kieran/ib-gates/803/src/crates/specrt/specs/qwen3-0.6b.toml --host spark` |
 | qwen3_5 | `Qwen3.5-9B` | 12.5 | 2180.0 | 180.4 | llama.cpp | 12.9 | 2457.2 | 69.6 | 0.97 | 0.89 | 2.59 | 2026-11-19 | d9d799c | `crates/specrt/scripts/perfpass.sh qwen3_5 --model /home/kieran/models/Qwen3.5-9B --host spark` |
 | qwen3_moe | `Qwen3-30B-A3B-FP8` | 55.3 | 3306.8 | 185.9 | vllm | 40.3 | 3959.2 | 133.3 | 1.30 | 1.37 | 0.84 | 1.39 | 2026-11-20 | issue885 |
+| qwen3_next | `Qwen3-Next-80B-A3B-Instruct-NVFP4` | 38.3 | 2045.0 | 141.9 | vLLM and SGLang: not run, the 80B doesn't fit beside the resident vLLM on the Spark | n/a | n/a | n/a | n/a | n/a | n/a | 2026-11-19 | 895 | `crates/specrt/scripts/perfpass.sh qwen3_next --model /home/kieran/ib-gates/817/models/Qwen3-Next-80B-A3B-Instruct-NVFP4 --host spark` |
 | smollm3 | `SmolLM3-3B` | 33.4 | 5808.3 | 264.3 | llama.cpp/vllm | 35.2 | 9055.0 | 259.4 | 0.95 | 0.64 | 1.02 | 2026-11-19 | 9f648cd | `crates/specrt/scripts/perfpass.sh smollm3 --model /home/kieran/ib-gates/821/models/SmolLM3-3B --host spark` |
 
 ## SGLang

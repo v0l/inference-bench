@@ -29,16 +29,22 @@ fn main() -> Result<()> {
             "split" | "plain" => Vec::new(),
             "unsplit4" => ["qkv", "o", "gate_up", "down"].map(String::from).to_vec(),
             "unsplit" => ["qkv", "o", "gate_up", "down", "lm_head"].map(String::from).to_vec(),
-            "moe_fp8act" | "moe_act=fp8" | "moe_act=fp4" | "mma" => Vec::new(),
+            "moe_fp8act" | "moe_act=fp8" | "moe_act=fp4" | "mma" | "mma_up2" | "mma_down2" | "mma_both2" => Vec::new(),
             other => anyhow::bail!("mode {other}"),
         };
         let act = match mode.as_str() {
             "moe_fp8act" | "moe_act=fp8" => Some(specrt::spec::ActQuant::Fp8),
-            "moe_act=fp4" | "mma" => Some(specrt::spec::ActQuant::Fp4),
+            "moe_act=fp4" | "mma" | "mma_up2" | "mma_down2" | "mma_both2" => Some(specrt::spec::ActQuant::Fp4),
             _ => None,
         };
         if let Some(act) = act {
             spec.mlp.act_quant = act;
+        }
+        if matches!(mode.as_str(), "mma_up2" | "mma_both2") {
+            spec.mlp.up_act_planes = 2;
+        }
+        if matches!(mode.as_str(), "mma_down2" | "mma_both2") {
+            spec.mlp.down_act_planes = 2;
         }
         if mode == "split" {
             spec.runtime.split_activations = Some(true);

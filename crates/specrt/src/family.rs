@@ -173,6 +173,7 @@ pub struct FamilyMoe {
     pub score_bias: bool,
     pub expert_block: Option<crate::dequant::BlockFormat>,
     pub act_quant: Option<crate::spec::ActQuant>,
+    pub act_planes: Option<u8>,
     pub gate_up_interleaved: bool,
     pub router_bias: bool,
     pub expert_bias: bool,
@@ -240,6 +241,12 @@ pub struct FamilyBlocks {
     pub types_key: Option<String>,
     pub sparse_types: Vec<String>,
     pub split: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyLinear {
+    pub fused_interleaved: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -492,6 +499,8 @@ pub struct Family {
     pub state: Vec<crate::state::State>,
     #[serde(default)]
     pub mixer: FamilyMixer,
+    #[serde(default)]
+    pub linear: FamilyLinear,
     #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
 }

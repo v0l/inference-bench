@@ -126,6 +126,16 @@ fn run(tokens: usize, expected_bm: usize) {
 }
 
 fn run_with(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter: usize) {
+    run_planes(tokens, expected_bm, mx, hidden, inter, 1, 1);
+}
+
+fn residual_dequant(c: &[f32]) -> Vec<f32> {
+    let first = mx_quantize(c).2;
+    let rest: Vec<f32> = c.iter().zip(&first).map(|(a, b)| a - b).collect();
+    first.iter().zip(mx_quantize(&rest).2).map(|(a, b)| a + b).collect()
+}
+
+fn run_planes(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter: usize, up_planes: u8, down_planes: u8) {
     let mut spec = spec(hidden, inter);
     if mx {
         let m = spec.moe.as_mut().unwrap();
@@ -176,8 +186,16 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter: u
     let eb = |v: &[f32], e: usize, which: usize, r: usize, width: usize| if e < EXPERTS { v[(e * 2 + which) * width + r] } else { 0.0 };
     let igs_up = 300.0f32;
     let igs_down = 120.0f32;
-    let qd = |v: &[f32], igs: f32| -> Vec<f32> { if mx { v.chunks(32).flat_map(|c| mx_quantize(c).2).collect() } else { quant_dequant(v, igs) } };
-    let up_in: Vec<Vec<f32>> = (0..tokens).map(|t| qd(&x[t * hidden..(t + 1) * hidden], igs_up)).collect();
+    let qd = |v: &[f32], igs: f32, planes: u8| -> Vec<f32> {
+        if mx && planes == 2 {
+            v.chunks(32).flat_map(residual_dequant).collect()
+        } else if mx {
+            v.chunks(32).flat_map(|c| mx_quantize(c).2).collect()
+        } else {
+            quant_dequant(v, igs)
+        }
+    };
+    let up_in: Vec<Vec<f32>> = (0..tokens).map(|t| qd(&x[t * hidden..(t + 1) * hidden], igs_up, up_planes)).collect();
     let mut expected = vec![0f32; pairs * hidden];
     for p in 0..pairs {
         let e = idx[p] as usize;
@@ -188,7 +206,7 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter: u
                 silu(dot(&gate) + eb(&bias_up, e, 0, r, inter)) * (dot(&up) + eb(&bias_up, e, 1, r, inter))
             })
             .collect();
-        let mid = qd(&act, igs_down);
+        let mid = qd(&act, igs_down, down_planes);
         for r in 0..hidden {
             expected[p * hidden + r] = (0..inter).map(|c| down.dequant[(e * hidden + r) * inter + c] * mid[c]).sum::<f32>() + if e < EXPERTS { bias_down[e * hidden + r] } else { 0.0 };
         }
@@ -214,6 +232,12 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter: u
     let mut act: CudaSlice<f32> = stream.alloc_zeros(pairs * inter).unwrap();
     let mut aq: CudaSlice<u8> = stream.alloc_zeros(pairs * pi / 2).unwrap();
     let mut asc: CudaSlice<u8> = stream.alloc_zeros(pairs * pi / 16).unwrap();
+    let mut xq2: CudaSlice<u8> = stream.alloc_zeros(tokens * ph / 2).unwrap();
+    let mut xs2: CudaSlice<u8> = stream.alloc_zeros(tokens * ph / 16).unwrap();
+    let mut aq2: CudaSlice<u8> = stream.alloc_zeros(pairs * pi / 2).unwrap();
+    let mut asc2: CudaSlice<u8> = stream.alloc_zeros(pairs * pi / 16).unwrap();
+    let none = 0u64;
+    let tag = |p: u8| if p == 2 { "2" } else { "" };
     let mut out: CudaSlice<f32> = stream.alloc_zeros(pairs * hidden).unwrap();
     let cfg = |g: u32, b: u32| LaunchConfig { grid_dim: (g, 1, 1), block_dim: (b, 1, 1), shared_mem_bytes: 0 };
     let count = pairs as i32;
@@ -229,30 +253,50 @@ fn run_with(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter: u
     let w = hidden as i32;
     let kernel = f(quant_name);
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&xd).arg(&mut xq).arg(&mut xs).arg(&w);
+    b.arg(&xd).arg(&mut xq).arg(&mut xs);
+    if mx && up_planes == 2 {
+        b.arg(&mut xq2).arg(&mut xs2);
+    } else if mx {
+        b.arg(&none).arg(&none);
+    }
+    b.arg(&w);
     if !mx {
         b.arg(&igs_up);
     }
     unsafe { b.launch(cfg(tokens as u32, 256)) }.unwrap();
     let inv_up = 1.0 / igs_up;
     let small = expected_bm == MOE_MMA_BM_SMALL;
-    let kernel = f(&format!("{stem}_up{}", if small { "_s" } else { "" }));
+    let kernel = f(&format!("{stem}_up{}{}", if mx { tag(up_planes) } else { "" }, if small { "_s" } else { "" }));
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&gw).arg(&gs).arg(&gg).arg(&uw).arg(&us).arg(&ug).arg(&bias_u).arg(&inv_up).arg(&xq).arg(&xs).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut act);
+    b.arg(&gw).arg(&gs).arg(&gg).arg(&uw).arg(&us).arg(&ug).arg(&bias_u).arg(&inv_up).arg(&xq).arg(&xs);
+    if mx {
+        b.arg(&xq2).arg(&xs2);
+    }
+    b.arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut act);
     let config = LaunchConfig { grid_dim: ((inter / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(expected_bm, 2) };
     unsafe { b.launch(config) }.unwrap();
     let w = inter as i32;
     let kernel = f(quant_name);
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&act).arg(&mut aq).arg(&mut asc).arg(&w);
+    b.arg(&act).arg(&mut aq).arg(&mut asc);
+    if mx && down_planes == 2 {
+        b.arg(&mut aq2).arg(&mut asc2);
+    } else if mx {
+        b.arg(&none).arg(&none);
+    }
+    b.arg(&w);
     if !mx {
         b.arg(&igs_down);
     }
     unsafe { b.launch(cfg(pairs as u32, 256)) }.unwrap();
     let inv_down = 1.0 / igs_down;
-    let kernel = f(&format!("{stem}_down{}", if small { "_s" } else { "" }));
+    let kernel = f(&format!("{stem}_down{}{}", if mx { tag(down_planes) } else { "" }, if small { "_s" } else { "" }));
     let mut b = stream.launch_builder(&kernel);
-    b.arg(&dw).arg(&ds).arg(&dg).arg(&dw).arg(&ds).arg(&dg).arg(&bias_d).arg(&inv_down).arg(&aq).arg(&asc).arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut out);
+    b.arg(&dw).arg(&ds).arg(&dg).arg(&dw).arg(&ds).arg(&dg).arg(&bias_d).arg(&inv_down).arg(&aq).arg(&asc);
+    if mx {
+        b.arg(&aq2).arg(&asc2);
+    }
+    b.arg(&offsets).arg(&sorted).arg(&tiles).arg(&mut out);
     let config = LaunchConfig { grid_dim: ((hidden / MOE_MMA_BN) as u32, max_tiles as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: moe_mma_smem(expected_bm, 1) };
     unsafe { b.launch(config) }.unwrap();
     stream.synchronize().unwrap();
@@ -304,4 +348,22 @@ fn mx_grouped_mma_handles_a_k_tail_with_big_tiles() {
 #[ignore = "needs an sm_120 GPU"]
 fn mx_grouped_mma_handles_a_k_tail_with_small_tiles() {
     run_with(8, MOE_MMA_BM_SMALL, true, 2880, 448);
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
+fn mx_grouped_mma_two_plane_up_matches_cpu() {
+    run_planes(48, MOE_MMA_BM, true, 2880, 448, 2, 1);
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
+fn mx_grouped_mma_two_plane_down_matches_cpu() {
+    run_planes(8, MOE_MMA_BM_SMALL, true, 2880, 448, 1, 2);
+}
+
+#[test]
+#[ignore = "needs an sm_120 GPU"]
+fn mx_grouped_mma_two_plane_both_matches_cpu() {
+    run_planes(48, MOE_MMA_BM, true, 2880, 448, 2, 2);
 }

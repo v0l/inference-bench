@@ -4,35 +4,6 @@ pub fn constants() -> &'static str {
     "constexpr int MMA8_ROW = 128;\n\n"
 }
 
-pub fn mma_e4m3() -> String {
-    prim::device(
-        "void",
-        "moe_mma_e4m3",
-        "float* c, const unsigned* a, unsigned b0, unsigned b1",
-        r#"    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-"#,
-    )
-}
-
-pub fn quant_f8() -> String {
-    prim::global(
-        Some(128),
-        "moe_quant_f8",
-        "const float* x, unsigned char* q, float* scale, int width",
-        r##"    size_t row = blockIdx.x;
-    int blk = blockIdx.y;
-    size_t at = row * width + (size_t)blk * FP8_BLOCK + threadIdx.x;
-    float v = x[at];
-    float amax = warp_max(fabsf(v));
-    float s = amax > 0.0f ? amax / FP8_MAX : 1.0f;
-    q[at] = (unsigned char)(f32x2_to_e4m3x2(v / s, 0.0f) & 0xffu);
-    if ((threadIdx.x & 31) == 0) scale[row * (width / 32) + blk * 4 + (threadIdx.x >> 5)] = s;
-"##,
-    )
-}
-
 fn geometry() -> &'static str {
     r##"    constexpr int THREADS = WM * WN * 32;
     constexpr int TM = BM / WM;
@@ -201,8 +172,8 @@ fn variant(name: &str, tile: &str) -> String {
 pub fn grouped() -> String {
     let mut out = String::new();
     out.push_str(constants());
-    out.push_str(&mma_e4m3());
-    out.push_str(&quant_f8());
+    out.push_str(&prim::mma_e4m3("moe_mma_e4m3", true));
+    out.push_str(&crate::cuda::quant::quant_fp8_f32_groups("moe_quant_f8", 128));
     out.push_str(&mma::tiles("moe_tiles_f8"));
     out.push_str(&gemm());
     out.push_str(&variant("moe_mma_up_f8", "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false"));
