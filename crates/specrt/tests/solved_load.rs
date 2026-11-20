@@ -23,6 +23,9 @@ fn the_engine_runs_exactly_the_solved_plan() {
     let spec = specrt::engine::resolve_spec(&model).unwrap();
     let machine = specrt::hardware::probe().unwrap();
     let devices = machine.devices(&[]);
+    for d in &devices {
+        println!("DEVICE {} {:.1} GiB", d.name, d.memory_gib);
+    }
     assert!(devices.len() >= 2, "{} GPUs", devices.len());
     let target = Target { context: Some(context), memory, slots: None };
     let solved = solve(&PlacementRequest { mode, target, pins: Default::default(), devices: &devices, spec: &spec }).unwrap();

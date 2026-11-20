@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 pub const TYPICAL_REQUEST: usize = 4096;
 const SLOT_CHOICES: [usize; 6] = [32, 16, 8, 4, 2, 1];
 const MATCH_TOLERANCE: f64 = 0.05;
+const MEMORY_MATCH_TOLERANCE: f64 = 0.15;
 const GIB: f64 = (1u64 << 30) as f64;
 const MAX_PERFORMANCE_CONTEXT: usize = 32768;
 const LOW_MEMORY_CONTEXT: usize = 8192;
@@ -97,8 +98,8 @@ struct Search<'a> {
 }
 
 fn matched(a: &Device, b: &Device) -> bool {
-    let close = |x: f64, y: f64| (x - y).abs() <= MATCH_TOLERANCE * x.max(y);
-    close(a.memory_bytes as f64, b.memory_bytes as f64) && close(a.bandwidth, b.bandwidth)
+    let close = |x: f64, y: f64, tolerance: f64| (x - y).abs() <= tolerance * x.max(y);
+    close(a.memory_bytes as f64, b.memory_bytes as f64, MEMORY_MATCH_TOLERANCE) && close(a.bandwidth, b.bandwidth, MATCH_TOLERANCE)
 }
 
 fn tp_kinds(spec: &Spec, devices: &[Device]) -> Vec<Kind> {
@@ -606,6 +607,16 @@ mod tests {
         assert_eq!(s.slots, 2);
         assert!(!s.mtp);
         assert!(s.strategy.contains("smallest that fits"), "{}", s.strategy);
+    }
+
+    #[test]
+    fn a_card_that_drives_the_display_still_matches_its_twin_for_tp() {
+        let devices = vec![gpu(0, 88.6, 1792.0), gpu(1, 94.4, 1792.0)];
+        let s = run(Profile::MaxPerformance, Target { context: Some(32768), ..Default::default() }, &[], &devices, &spec());
+        assert_eq!(s.tp, 2, "{}", s.strategy);
+        let mixed = vec![gpu(0, 24.0, 936.0), gpu(1, 24.0, 1792.0)];
+        let s = run(Profile::MaxPerformance, Target { context: Some(8192), ..Default::default() }, &[], &mixed, &spec());
+        assert_eq!(s.tp, 1, "{}", s.strategy);
     }
 
     #[test]
