@@ -168,7 +168,7 @@ After the reboot with `iommu=pt`, NCCL reaches about 35 GB/s busbw over P2P (sup
 
 tp2 against tp1: 1.45x at batch 1 (target 1.6x, not met), 1.48x at batch 8, 1.65x on 4k prefill. Before the fix tp2 was slower than tp1 (88.0 against 119.9 tok/s at batch 1).
 
-The cause, from nsys: `ar_add_rmsnorm_f32` took 68% of GPU time at about 270 us a call. Its residual loop read each rank's partial in a dependent chain per quad, so every load paid the full peer round trip (about 1.5 us over PCIe) one after another. The kernel now issues all `AR_RANKS` loads for a row before any arithmetic. Same bit-exact sums, the call is now short enough to leave the target gap to the remaining per-layer launch and sync cost. The tp2 step is still about 128 allreduce calls of 8 us plus the rank skew, which is what stands between 1.45x and 1.6x.
+The cause, from nsys: `ar_add_rmsnorm_f32` took 68% of GPU time at about 270 us a call. Its residual loop read each rank's partial in a dependent chain per quad, so every load paid the full peer round trip (about 1.5 us over PCIe) one after another. The kernel now issues all `AR_RANKS` loads for a row before any arithmetic. Same bit-exact sums. The remaining gap to 1.6x is not profiled yet.
 
 vLLM 0.x tp2 on the same pair (`vllm serve --tensor-parallel-size 2`, fp8 KV, prefix caching, max-model-len 8192, no MTP and none of the other flags of `~/qwen3.8-27B-NVFP4-tp2.sh`; run under `MemoryMax=40G` because `pair658.sh`'s 24G cap OOM-killed the engine): batch 1 decode 104.5 tok/s, batch 8 669.7 tok/s total (83.7 per stream), 4k prefill 11994 tok/s (342 ms). Our tp2 is ahead of it at batch 1 and 8 on decode and about 4x behind on prefill.
 
