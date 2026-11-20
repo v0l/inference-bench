@@ -73,6 +73,9 @@ impl EngineChoice {
         if let Some(v) = self.overrides.get(key) {
             return v.clone();
         }
+        if let Some(v) = self.solved.as_ref().and_then(|s| s.options.get(key)) {
+            return v.clone();
+        }
         if let Some(v) = self.profile.values().get(key) {
             return v.clone();
         }

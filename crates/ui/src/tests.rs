@@ -290,7 +290,7 @@ fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
     assert!(weights > list[0], "the model must be too big for GPU 0 alone");
     assert_eq!(h.state().free_gpu_bytes(), Some(list.iter().sum()));
     let devices = inference_bench_core::discover::pool_devices(&list);
-    let r = dialog.plan(&devices, Default::default());
+    let r = dialog.planned(&devices);
     assert!(matches!(r, Some(Ok(_))), "{:?} {:?} {:?}", r.map(|r| r.map(|p| p.placement.render())), devices.iter().map(|d| d.memory_gib).collect::<Vec<_>>(), dialog.seqs);
     h.get_by_label_contains("free on 3 gpus");
     h.get_by_label_contains("load plan");
@@ -775,8 +775,8 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
     let m = real_model("Qwen3-0.6B");
     h.state_mut().library[0] = m.clone();
     h.state_mut().open_load_dialog(&m);
-    assert_eq!(h.state().load.as_ref().unwrap().seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
     h.state_mut().load.as_mut().unwrap().seqs = 6;
+    h.state_mut().load.as_mut().unwrap().pin_seqs = true;
     h.run();
     click_load(&mut h);
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
@@ -795,7 +795,9 @@ fn the_server_tab_kv_total_is_the_shared_pool_chosen_in_the_dialog() {
     h.state_mut().open_load_dialog(&m);
     let d = h.state_mut().load.as_mut().unwrap();
     d.seqs = 4;
+    d.pin_seqs = true;
     d.kv_gb = 3.0;
+    d.pin_kv = true;
     let pool = d.kv_bytes().unwrap();
     h.run();
     click_load(&mut h);
@@ -1872,7 +1874,8 @@ fn the_advanced_section_renders_every_option_the_engine_declares() {
 fn the_dialog_defaults_are_the_engine_defaults_and_max_performance() {
     let h = open_dialog("adv-defaults");
     let d = h.state().load.as_ref().unwrap();
-    assert_eq!(d.seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
+    assert!(d.seqs >= specrt::options::DEFAULT_MAX_NUM_SEQS, "{}", d.seqs);
+    assert!(d.solved.as_ref().is_some_and(|s| s.is_ok()));
     assert!(!d.choice.is_custom());
     for f in specrt::options::schema() {
         if f.key == "runtime.prefix_cache.enabled" {
@@ -1930,15 +1933,13 @@ fn changing_a_field_shows_custom_and_its_reset_key_restores_the_default() {
     assert!(h.query_by_label_contains("changed from the profile").is_none());
     assert!(h.query_by_label("reset").is_none());
     let d = h.state_mut().load.as_mut().unwrap();
-    d.seqs = 2;
-    d.choice.set("serve.max_num_seqs", serde_json::json!(2));
+    d.choice.set("serve.max_batched_tokens", serde_json::json!(1024));
     h.run();
     h.get_by_label_contains("1 advanced option(s) changed from the profile");
     h.get_by_label("reset");
-    h.state_mut().load.as_mut().unwrap().reset("serve.max_num_seqs");
+    h.state_mut().load.as_mut().unwrap().reset("serve.max_batched_tokens");
     h.run();
     let d = h.state().load.as_ref().unwrap();
-    assert_eq!(d.seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
     assert!(!d.choice.is_custom());
     assert!(h.query_by_label_contains("changed from the profile").is_none());
 }
@@ -2678,40 +2679,31 @@ fn the_user_settings_on_two_96gb_gpus_plan_across_both() {
         d.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
         d.choice.set("runtime.kv_f16_layers", serde_json::json!(0));
         d.seqs = 21;
+        d.pin_seqs = true;
         d.ctx = 262144;
         d.sync();
-        let base = d.anatomy().unwrap().total_bytes + d.anatomy().unwrap().state_bytes_per_seq * 21;
-        d.kv_gb = ((120.0 - base as f64 / (1u64 << 30) as f64) * 4.0).round() / 4.0;
     }
+    h.run();
     let app = h.state();
     let devices = crate::hardware::load_devices(app);
     let d = app.load.as_ref().unwrap();
-    let planned = d.plan(&devices, app.settings.cluster.objective).unwrap().unwrap();
-    assert_eq!(planned.placement.stages.len(), 2);
-    assert!(planned.placement.stages.iter().all(|s| s.kv_bytes > 20 << 30), "the whole 120 GB request is planned, not one GPU's share");
-    let kv_total: u64 = planned.placement.stages.iter().map(|s| s.kv_bytes).sum();
-    let pool = d.kv_bytes().unwrap();
-    assert!(kv_total <= pool + (1 << 20) && kv_total + (1 << 30) > pool, "{kv_total} against pool {pool}");
+    let planned = d.planned(&devices).unwrap().unwrap();
+    assert_eq!(planned.placement.stages.len(), 1);
+    assert_eq!(planned.placement.stages[0].tp, 2);
     assert_eq!(planned.placement.slots, 21);
-    h.run();
-    h.get_by_label_contains("will span 2 gpus");
-    h.get_by_label_contains("desk/gpu0");
-    h.get_by_label_contains("desk/gpu1");
+    assert_eq!(planned.placement.context.min(262144), planned.placement.context);
+    h.get_by_label_contains("TP 2 across 2");
 }
 
-type Seen = std::sync::Arc<std::sync::Mutex<Vec<(usize, Option<u64>, Option<specrt::placement::PlacementConfig>)>>>;
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<specrt::serve::ServeOptions>>>;
 
 fn recording_engine(app: &mut App) -> Seen {
     let seen: Seen = Default::default();
     let log = seen.clone();
-    let slot = app.hardware.slot.clone();
     let script = Script { models: vec!["acme/Qwen3.8-27B-NVFP4".into()], ..script() };
     let fake = inference_bench_core::fake::ScriptedServing::factory(script.clone());
-    let serving: inference_bench_core::engine::ServingFactory = std::sync::Arc::new(move |mut opts| {
-        if let Some(p) = slot.lock().unwrap().clone() {
-            opts.placement = Some(p);
-        }
-        log.lock().unwrap().push((opts.max_num_seqs, opts.kv_cache_bytes, opts.placement.clone()));
+    let serving: inference_bench_core::engine::ServingFactory = std::sync::Arc::new(move |opts| {
+        log.lock().unwrap().push(opts.clone());
         fake(opts)
     });
     app.engine = inference_bench_core::engine::Engine::with_factories(app.wake.clone(), ScriptedModel::factory(script), serving);
@@ -2719,7 +2711,7 @@ fn recording_engine(app: &mut App) -> Seen {
 }
 
 #[test]
-fn loading_the_user_settings_hands_the_engine_the_plan_the_dialog_showed() {
+fn the_engine_receives_exactly_the_solved_plan_the_dialog_showed() {
     let mut h = two_gpu_27b_dialog("two96load");
     let seen = recording_engine(h.state_mut());
     {
@@ -2727,45 +2719,36 @@ fn loading_the_user_settings_hands_the_engine_the_plan_the_dialog_showed() {
         app.library[0].repo = "acme/Qwen3.8-27B-NVFP4".into();
         let d = app.load.as_mut().unwrap();
         d.model.repo = "acme/Qwen3.8-27B-NVFP4".into();
-        d.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
-        d.choice.set("runtime.kv_f16_layers", serde_json::json!(0));
         d.seqs = 21;
+        d.pin_seqs = true;
         d.ctx = 262144;
         d.sync();
-        let base = d.anatomy().unwrap().total_bytes + d.anatomy().unwrap().state_bytes_per_seq * 21;
-        d.kv_gb = ((120.0 - base as f64 / (1u64 << 30) as f64) * 4.0).round() / 4.0;
     }
-    let (shown, pool, mut spec) = {
-        let app = h.state();
-        let devices = crate::hardware::load_devices(app);
-        let d = app.load.as_ref().unwrap();
-        (d.plan(&devices, app.settings.cluster.objective).unwrap().unwrap(), d.kv_bytes().unwrap(), d.view.as_ref().unwrap().spec.clone())
-    };
-    spec.runtime.kv_dtype = specrt::spec::KvDtype::Fp8;
-    spec.runtime.kv_f16_layers = Some(0);
     h.run();
+    let shown = h.state().load.as_ref().unwrap().solved.clone().unwrap().unwrap();
+    assert_eq!(shown.tp, 2);
     click_load(&mut h);
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     let loaded = h.state().loaded().unwrap();
     assert_eq!(loaded.max_num_seqs, 21);
-    assert!(loaded.parallel_note.is_none(), "{:?}", loaded.parallel_note);
     let calls = seen.lock().unwrap().clone();
-    assert_eq!(calls.len(), 1, "{calls:?}");
-    let (seqs, kv, placement) = calls[0].clone();
-    assert_eq!((seqs, kv), (21, Some(pool)));
-    let placement = placement.expect("the engine is given the placement");
-    assert_eq!(placement, shown.config());
-    assert_eq!(placement.stages.len(), 2);
-    assert_eq!(placement.slots, 21);
-    assert_eq!(placement.weight_bytes, shown.sizing.weight_bytes);
-    assert_eq!(placement.kv_pool_bytes, Some(pool));
-    let engine_plan = placement.place(&spec).unwrap();
-    assert_eq!(engine_plan.ranges(), shown.placement.ranges());
-    for (a, b) in engine_plan.stages.iter().zip(&shown.placement.stages) {
-        assert_eq!((a.kv_bytes, a.weight_bytes, a.state_bytes), (b.kv_bytes, b.weight_bytes, b.state_bytes));
-    }
-    let per_device: Vec<u64> = engine_plan.stages.iter().map(|s| s.used_bytes()).collect();
-    assert!(per_device.iter().all(|b| *b <= 96 << 30), "{per_device:?}");
+    assert_eq!(calls.len(), 1, "{} calls", calls.len());
+    let got = calls[0].solved.as_deref().expect("the engine is given the solved plan");
+    assert_eq!(got, &shown);
+    assert!(calls[0].placement.is_none());
+    assert_eq!((calls[0].tp, calls[0].max_num_seqs, calls[0].kv_cache_bytes), (shown.tp, shown.slots, Some(shown.kv_pool_bytes)));
+}
+
+#[test]
+fn the_dialog_shows_the_placement_strategy_for_each_profile() {
+    let mut h = two_gpu_27b_dialog("strategy-lines");
+    h.get_by_label_contains("placement TP 2 across 2");
+    h.state_mut().load.as_mut().unwrap().choice.select(specrt::options::Profile::LowMemory);
+    h.run();
+    h.get_by_label_contains("smallest that fits");
+    let d = h.state().load.as_ref().unwrap();
+    let s = d.solved.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!((s.tp, s.placement.stages.len(), s.slots), (1, 1, 2));
 }
 
 fn two_model_script() -> Script {

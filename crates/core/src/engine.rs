@@ -457,8 +457,9 @@ fn open(
     progress: &specrt::progress::Sink,
 ) -> Result<Opened, BackendError> {
     serve_options(max_ctx, seqs, kv_cache_bytes, engine)?;
-    if let Some(solved) = &engine.solved {
-        let mut target = serving(serve_options(max_ctx, solved.slots, None, engine)?).ok_or_else(|| BackendError::failed("the serving engine is not available for a solved placement"))?;
+    if let Some(solved) = &engine.solved
+        && let Some(mut target) = serving(serve_options(max_ctx, solved.slots, None, engine)?)
+    {
         target.set_progress(Some(progress.clone()));
         target.load(model_id)?;
         let caps = target.capabilities();

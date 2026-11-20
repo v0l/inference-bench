@@ -385,7 +385,7 @@ impl<'a> Search<'a> {
             tp,
             kv_dtype: o.dtype,
             kv_f16_layers: o.dtype.is_fp8().then(|| spec.kv_f16_layers()),
-            kv_pool_bytes: tokens as u64 * bpt,
+            kv_pool_bytes: self.pinned_pool().unwrap_or(tokens as u64 * bpt),
             slots: o.slots,
             context,
             mtp: o.mtp,
