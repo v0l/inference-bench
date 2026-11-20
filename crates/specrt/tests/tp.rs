@@ -231,6 +231,19 @@ fn moe_tp_matches_tp1_on_virtual_ranks() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU"]
+fn moe_tp_stays_within_a_tight_logit_bound() {
+    use specrt::spec::TpSplit;
+    for dir in ["tiny-qwen3.5-moe", "tiny-qwen3.5-moe-fp8"] {
+        for split in [TpSplit::Columns, TpSplit::Experts] {
+            let o = compare_split(dir, false, 2, None, false, split);
+            assert!(o.logit_err <= 1e-4 * o.logit_scale.max(1.0), "{dir} {split:?}: logits drift by {} of {}", o.logit_err, o.logit_scale);
+            assert_eq!(o.top1, o.rows, "{dir} {split:?}: top-1 changed");
+        }
+    }
+}
+
+#[test]
 fn moe_specs_split_every_expert_and_refuse_widths_that_do_not_divide() {
     let mut s = spec_for("tiny-qwen3.5-moe", false);
     s.moe.as_mut().unwrap().tp_split = specrt::spec::TpSplit::Columns;
