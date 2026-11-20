@@ -22,7 +22,7 @@ untouched. cudarc uses `dynamic-loading`, so building needs no CUDA toolkit. Run
   `~/.cache/specrt/<sha256(source, arch, options)>.ptx` (`[runtime] cache_dir` to move it).
 - Behaviour switches live in the spec, not the environment: `act_quant = "fp8"` (native FP8
   activations for the FP8 projections), `[mlp] act_quant = "fp4"` (native NVFP4 activations), and a
-  `[runtime]` table with `graphs = true`, `fuse = true`, `tile = "auto"` (`small`, `big`, `narrow`),
+  `[runtime]` table with `graphs = true`, `pdl = false` (programmatic dependent launch, cc 90 and up; opt in for small models), `fuse = true`, `tile = "auto"` (`small`, `big`, `narrow`),
   `big_tile = [bm, bn, wm, wn]`, `unsplit = [linear, ...]`, `split_activations = false` (single plane bf16 activations, the default for the llama, gemma3, granite, smollm3 and phi3 families; true is the exact hi/lo path), `gemm_fp32 = false` and `cache_dir`.
   The server config takes the same `[runtime]` table and hands it to every model it loads. The old
   `SPECRT_*` environment variables are gone.

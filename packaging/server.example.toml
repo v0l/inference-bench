@@ -32,6 +32,7 @@ folders = ["/etc/inference-bench/specs"]
 
 [runtime]
 graphs = true
+pdl = false
 fuse = true
 tile = "auto"
 gemm_fp32 = false

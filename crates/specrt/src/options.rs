@@ -461,6 +461,7 @@ mod tests {
         assert_eq!(two.apply(ServeOptions::default()).unwrap().tp, 2);
         let rt = RuntimeOptions::default();
         assert_eq!(default_of("runtime.graphs"), Some(json!(rt.graphs)));
+        assert_eq!(default_of("runtime.pdl"), Some(json!(rt.pdl)));
         assert_eq!(default_of("runtime.loader.chunk_mb"), Some(json!(rt.loader.chunk_mb)));
         assert_eq!(default_of("runtime.prefix_cache.snapshot_interval"), Some(json!(rt.prefix_cache.snapshot_interval)));
         assert_eq!(default_of("runtime.big_tile"), Some(Value::Null));

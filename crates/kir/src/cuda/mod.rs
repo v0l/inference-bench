@@ -230,11 +230,15 @@ pub fn emit_module(kernels: &[Kernel]) -> Result<String, String> {
     Ok(out)
 }
 
-const PDL_MACRO: &str = "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900\n#define PDL_WAIT() asm volatile(\"griddepcontrol.wait;\" ::: \"memory\"); asm volatile(\"griddepcontrol.launch_dependents;\")\n#else\n#define PDL_WAIT()\n#endif\n";
+fn pdl_macro(single_wave_blocks: u32) -> String {
+    format!(
+        "#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900\n#define PDL_WAIT() do {{ asm volatile(\"griddepcontrol.wait;\" ::: \"memory\"); if (gridDim.x * gridDim.y * gridDim.z <= {single_wave_blocks}u) asm volatile(\"griddepcontrol.launch_dependents;\"); }} while (0)\n#else\n#define PDL_WAIT()\n#endif\n"
+    )
+}
 
-pub fn with_pdl_wait(source: &str) -> String {
+pub fn with_pdl_wait(source: &str, single_wave_blocks: u32) -> String {
     let mut out = String::with_capacity(source.len() + 1024);
-    out.push_str(PDL_MACRO);
+    out.push_str(&pdl_macro(single_wave_blocks));
     let mut rest = source;
     while let Some(at) = rest.find("__global__") {
         let (head, tail) = rest.split_at(at);
@@ -257,7 +261,7 @@ mod pdl_tests {
     #[test]
     fn wait_is_first_statement_of_every_kernel() {
         let src = "extern \"C\" __global__ void a(int* x) {\n x[0] = 1;\n}\nextern \"C\" __global__ void __launch_bounds__(32) b(float* y) { y[0] = 0; }\n";
-        let out = with_pdl_wait(src);
+        let out = with_pdl_wait(src, 188);
         assert_eq!(out.matches("PDL_WAIT();").count(), 2);
         assert!(out.contains("void a(int* x) {\n    PDL_WAIT();\n x[0]"));
         assert!(out.contains("b(float* y) {\n    PDL_WAIT(); y[0]"));
