@@ -244,7 +244,7 @@ fn click_settled(h: &mut Harness<'static, App>, label: &str) {
 
 fn with_gpu(h: &mut Harness<'static, App>, used: u64, total: u64) {
     let app = h.state_mut();
-    app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None, uuid: String::new(), own_bytes: 0, display: false }];
+    app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None, uuid: String::new(), own_bytes: 0, display: false, index: None }];
     app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
     app.gpu_poll = Default::default();
 }
@@ -285,7 +285,7 @@ fn the_27b_config_gives_the_load_dialog_a_262144_maximum() {
 #[test]
 fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
     let mut h = harness("load-three-gpus", Tab::Models);
-    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false };
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false, index: None };
     {
         let app = h.state_mut();
         app.gpu = vec![gpu(24), gpu(24), gpu(24)];
@@ -2213,7 +2213,7 @@ fn peers_from_fake_announcements_show_name_gpus_memory_and_busy_state() {
 #[test]
 fn switching_a_gpu_off_in_the_hardware_tab_removes_it_from_every_budget() {
     let mut h = hardware_harness("hwswitch", 2);
-    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false };
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false, index: None };
     {
         let app = h.state_mut();
         app.gpu = vec![gpu(24), gpu(24)];
@@ -2496,7 +2496,7 @@ fn screenshot_of_discover() {
 #[test]
 fn the_budget_excludes_this_apps_own_memory_and_a_model_that_fits_then_shows_as_fitting() {
     use inference_bench_core::gpu::{GpuStats, attribute, parse_compute_apps};
-    let mut gpu = vec![GpuStats { name: "RTX".into(), used_bytes: 87 << 30, total_bytes: 96 << 30, util_percent: None, uuid: "GPU-a".into(), own_bytes: 0, display: false }];
+    let mut gpu = vec![GpuStats { name: "RTX".into(), used_bytes: 87 << 30, total_bytes: 96 << 30, util_percent: None, uuid: "GPU-a".into(), own_bytes: 0, display: false, index: None }];
     attribute(&mut gpu, &parse_compute_apps("GPU-a, 4242, 61440\nGPU-a, 7, 12288\n"), &[4242]);
     let mut h = harness("budget", Tab::Models);
     h.state_mut().gpu = gpu;
@@ -2730,7 +2730,7 @@ fn two_gpu_27b_dialog(name: &str) -> Harness<'static, App> {
 
 fn two_gpu_27b_dialog_at(name: &str, size: egui::Vec2) -> Harness<'static, App> {
     let mut h = harness_at(name, Tab::Models, size);
-    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false };
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false, index: None };
     {
         let app = h.state_mut();
         app.gpu = vec![gpu(96), gpu(96)];

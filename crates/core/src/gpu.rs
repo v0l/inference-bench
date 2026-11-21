@@ -9,6 +9,7 @@ pub struct GpuStats {
     pub uuid: String,
     pub own_bytes: u64,
     pub display: bool,
+    pub index: Option<u32>,
 }
 
 impl GpuStats {
@@ -41,6 +42,23 @@ pub fn parse_compute_apps(output: &str) -> Vec<(String, u32, u64)> {
             Some((f[0].to_string(), f[1].parse().ok()?, f[2].parse::<u64>().ok()? << 20))
         })
         .collect()
+}
+
+const COMPOSITORS: [&str; 14] = ["hyprland", "sway", "xwayland", "xorg", "x", "kwin_wayland", "kwin_x11", "gnome-shell", "mutter", "weston", "labwc", "river", "niri", "wayfire"];
+
+pub fn parse_compositor_gpus(pmon: &str) -> Vec<u32> {
+    let mut gpus: Vec<u32> = pmon
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let (gpu, kind, name) = (f.first()?.parse::<u32>().ok()?, f.get(2)?, f.last()?);
+            (kind.contains('G') && COMPOSITORS.contains(&name.to_ascii_lowercase().as_str())).then_some(gpu)
+        })
+        .collect();
+    gpus.sort_unstable();
+    gpus.dedup();
+    gpus
 }
 
 pub fn attribute(stats: &mut [GpuStats], apps: &[(String, u32, u64)], own_pids: &[u32]) {
@@ -106,6 +124,7 @@ pub fn parse_nvidia_smi(output: &str) -> Vec<GpuStats> {
                 uuid: f.get(4).map(|u| u.to_string()).unwrap_or_default(),
                 own_bytes: 0,
                 display: f.get(5).is_some_and(|d| d.eq_ignore_ascii_case("enabled")),
+                index: f.get(6).and_then(|i| i.parse().ok()),
             })
         })
         .collect()
@@ -114,7 +133,7 @@ pub fn parse_nvidia_smi(output: &str) -> Vec<GpuStats> {
 pub fn sample() -> Vec<GpuStats> {
     let mut stats = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,memory.used,memory.total,utilization.gpu,uuid,display_active",
+            "--query-gpu=name,memory.used,memory.total,utilization.gpu,uuid,display_active,index",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -130,6 +149,16 @@ pub fn sample() -> Vec<GpuStats> {
         .map(|o| parse_compute_apps(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default();
     attribute(&mut stats, &apps, &own_pids());
+    let compositors = Command::new("nvidia-smi")
+        .args(["pmon", "-c", "1"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_compositor_gpus(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default();
+    for g in stats.iter_mut() {
+        g.display |= g.index.is_some_and(|i| compositors.contains(&i));
+    }
     stats
 }
 
@@ -139,7 +168,7 @@ mod tests {
 
     #[test]
     fn landed_names_only_the_gpus_whose_own_memory_grew() {
-        let g = |uuid: &str, own: u64| GpuStats { name: "card".into(), used_bytes: own, total_bytes: 96 << 30, util_percent: None, uuid: uuid.into(), own_bytes: own, display: false };
+        let g = |uuid: &str, own: u64| GpuStats { name: "card".into(), used_bytes: own, total_bytes: 96 << 30, util_percent: None, uuid: uuid.into(), own_bytes: own, display: false, index: None };
         let before = [g("GPU-a", 0), g("GPU-b", 1 << 30)];
         let after = [g("GPU-a", 10 << 20), g("GPU-b", 40 << 30)];
         assert_eq!(landed(&before, &after), vec![("GPU-b".to_string(), 39 << 30)]);
@@ -160,6 +189,15 @@ mod tests {
     fn the_gpu_driving_a_display_is_marked() {
         let g = parse_nvidia_smi("RTX, 1, 96000, 0, GPU-a, Enabled\nRTX, 1, 96000, 0, GPU-b, Disabled\n");
         assert_eq!((g[0].display, g[1].display), (true, false));
+    }
+
+    #[test]
+    fn the_gpu_holding_the_compositor_is_found_when_display_active_is_disabled() {
+        let pmon = "# gpu pid type sm mem enc dec jpg ofa command\n# Idx # C/G % % % % % % name\n    0 451526 G - - - - - - alacritty\n    0 3711476 G - - - - - - Hyprland\n    0 3711554 G - - - - - - Xwayland\n    1 4113726 C 22 9 - - - - kg-trainer\n";
+        assert_eq!(parse_compositor_gpus(pmon), vec![0]);
+        assert!(parse_compositor_gpus("    1 5 C - - - - - - Hyprland\n").is_empty());
+        let g = parse_nvidia_smi("RTX, 1, 96000, 0, GPU-a, Disabled, 0\nRTX, 1, 96000, 0, GPU-b, Disabled, 1\n");
+        assert_eq!((g[0].index, g[1].index), (Some(0), Some(1)));
     }
 
     #[test]
