@@ -8,6 +8,7 @@ pub struct GpuStats {
     pub util_percent: Option<u32>,
     pub uuid: String,
     pub own_bytes: u64,
+    pub display: bool,
 }
 
 impl GpuStats {
@@ -90,6 +91,7 @@ pub fn parse_nvidia_smi(output: &str) -> Vec<GpuStats> {
                 util_percent: f[3].parse().ok(),
                 uuid: f.get(4).map(|u| u.to_string()).unwrap_or_default(),
                 own_bytes: 0,
+                display: f.get(5).is_some_and(|d| d.eq_ignore_ascii_case("enabled")),
             })
         })
         .collect()
@@ -98,7 +100,7 @@ pub fn parse_nvidia_smi(output: &str) -> Vec<GpuStats> {
 pub fn sample() -> Vec<GpuStats> {
     let mut stats = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,memory.used,memory.total,utilization.gpu,uuid",
+            "--query-gpu=name,memory.used,memory.total,utilization.gpu,uuid,display_active",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -128,6 +130,13 @@ mod tests {
         assert_eq!(g.len(), 2);
         assert_eq!((g[0].used_bytes, g[0].total_bytes, g[0].util_percent), (85926 << 20, 97887 << 20, Some(96)));
         assert_eq!(g[1].util_percent, None);
+        assert!(!g[0].display);
+    }
+
+    #[test]
+    fn the_gpu_driving_a_display_is_marked() {
+        let g = parse_nvidia_smi("RTX, 1, 96000, 0, GPU-a, Enabled\nRTX, 1, 96000, 0, GPU-b, Disabled\n");
+        assert_eq!((g[0].display, g[1].display), (true, false));
     }
 
     #[test]

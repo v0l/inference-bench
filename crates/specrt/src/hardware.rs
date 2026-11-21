@@ -67,6 +67,7 @@ pub struct GpuInfo {
     pub free_bytes: u64,
     pub bandwidth_gbs: f64,
     pub tflops: f64,
+    pub uuid: String,
 }
 
 impl GpuInfo {
@@ -289,6 +290,12 @@ pub fn nvrtc_missing_message() -> String {
     }
 }
 
+pub fn format_uuid(bytes: &[std::ffi::c_char; 16]) -> String {
+    let b: Vec<u8> = bytes.iter().map(|&c| c as u8).collect();
+    let hex = |r: std::ops::Range<usize>| b[r].iter().map(|x| format!("{x:02x}")).collect::<String>();
+    format!("GPU-{}-{}-{}-{}-{}", hex(0..4), hex(4..6), hex(6..8), hex(8..10), hex(10..16))
+}
+
 pub fn probe_idle_cuda() -> Result<Machine> {
     if !cuda_present() {
         return Err(anyhow!("no CUDA driver library on this machine"));
@@ -313,6 +320,7 @@ pub fn probe_idle_cuda() -> Result<Machine> {
             free_bytes: total,
             bandwidth_gbs: estimated_bandwidth_gbs(attr(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE), attr(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)),
             tflops: estimated_tflops(sms, attr(A::CU_DEVICE_ATTRIBUTE_CLOCK_RATE)),
+            uuid: result::device::get_uuid(dev).map(|u| format_uuid(&u.bytes)).unwrap_or_default(),
         });
     }
     Ok(machine_with(gpus, Vec::new()))
@@ -342,6 +350,7 @@ pub fn probe_cuda() -> Result<Machine> {
             free_bytes: free as u64,
             bandwidth_gbs: estimated_bandwidth_gbs(attr(A::CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE), attr(A::CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)),
             tflops: estimated_tflops(sms, attr(A::CU_DEVICE_ATTRIBUTE_CLOCK_RATE)),
+            uuid: ctx.uuid().map(|u| format_uuid(&u.bytes)).unwrap_or_default(),
         });
     }
     let mut links = Vec::new();
@@ -455,7 +464,7 @@ pub fn machine_from_adapters(adapters: Vec<(String, GpuBackend)>, memory: Option
         .enumerate()
         .map(|(ordinal, (name, backend))| {
             let (bandwidth_gbs, tflops) = if backend == GpuBackend::Metal { apple_chip_specs(&name) } else { (0.0, 0.0) };
-            GpuInfo { backend, ordinal, name, compute: (0, 0), sms: 0, total_bytes: total, free_bytes: free, bandwidth_gbs, tflops }
+            GpuInfo { backend, ordinal, name, compute: (0, 0), sms: 0, total_bytes: total, free_bytes: free, bandwidth_gbs, tflops, uuid: String::new() }
         })
         .collect();
     Ok(machine_with(gpus, Vec::new()))
@@ -473,7 +482,7 @@ pub fn machine_with(gpus: Vec<GpuInfo>, links: Vec<GpuLink>) -> Machine {
 
 pub fn fake_gpus(host: &str, n: usize, p2p: bool) -> Machine {
     let gpus: Vec<GpuInfo> = (0..n)
-        .map(|i| GpuInfo { backend: GpuBackend::Cuda, ordinal: i, name: "NVIDIA RTX PRO 6000 Blackwell Max-Q".into(), compute: (12, 0), sms: 188, total_bytes: 96 << 30, free_bytes: (90 - i as u64) << 30, bandwidth_gbs: 1792.0, tflops: 500.0 })
+        .map(|i| GpuInfo { backend: GpuBackend::Cuda, ordinal: i, name: "NVIDIA RTX PRO 6000 Blackwell Max-Q".into(), compute: (12, 0), sms: 188, total_bytes: 96 << 30, free_bytes: (90 - i as u64) << 30, bandwidth_gbs: 1792.0, tflops: 500.0, uuid: format!("GPU-fake-{i}") })
         .collect();
     let mut links = Vec::new();
     for a in 0..n {
