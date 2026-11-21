@@ -356,6 +356,16 @@ fn plan_command(data: &Path, spec: &str, config: &Path, context: Option<usize>, 
         placement.objective = objective;
         print!("{}", placement.place(&spec)?.render());
     }
+    if !placement.devices.is_empty() {
+        for mode in [specrt::options::Profile::MaxPerformance, specrt::options::Profile::LowMemory] {
+            let target = specrt::solve::Target { context, memory: None, slots };
+            let request = specrt::solve::PlacementRequest { mode, target, pins: Default::default(), devices: &placement.devices, spec: &spec };
+            match specrt::solve::solve(&request) {
+                Ok(solved) => println!("{mode:?}: {}", solved.log_line()),
+                Err(e) => println!("{mode:?}: {e:#}"),
+            }
+        }
+    }
     Ok(())
 }
 

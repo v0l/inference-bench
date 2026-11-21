@@ -186,14 +186,10 @@ fn load_range(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize, dev
 }
 
 impl RuntimeStage {
-    pub fn load(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize) -> Result<RuntimeStage> {
+    pub fn load(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize, device: usize) -> Result<RuntimeStage> {
         let api = if spec.runtime.backend == crate::spec::BackendChoice::Wgpu { Api::Wgpu } else { Api::Cuda };
-        let loaded = load_range(spec, layers, max_ctx, slots, 0, api)?;
-        Ok(RuntimeStage { spec: spec.clone(), max_ctx, slots, device: 0, api, inner: Mutex::new(Some(loaded)), guard: Mutex::new(None) })
-    }
-
-    pub fn unloaded(spec: &Spec, max_ctx: usize, slots: usize) -> RuntimeStage {
-        Self::unloaded_on(spec, max_ctx, slots, 0)
+        let loaded = load_range(spec, layers, max_ctx, slots, device, api)?;
+        Ok(RuntimeStage { spec: spec.clone(), max_ctx, slots, device, api, inner: Mutex::new(Some(loaded)), guard: Mutex::new(None) })
     }
 
     pub fn unloaded_on(spec: &Spec, max_ctx: usize, slots: usize, device: usize) -> RuntimeStage {
@@ -401,9 +397,10 @@ pub struct ServedStage {
 
 pub fn serve(config: &StageConfig, placement: Option<&PlacementConfig>) -> Result<ServedStage> {
     let spec = Spec::load(&config.spec)?;
+    let device = config.device.as_ref().and_then(|d| d.ordinal).unwrap_or_default();
     let stage = Arc::new(match config.layers {
-        Some(layers) => RuntimeStage::load(&spec, layers, config.max_ctx, config.slots)?,
-        None => RuntimeStage::unloaded(&spec, config.max_ctx, config.slots),
+        Some(layers) => RuntimeStage::load(&spec, layers, config.max_ctx, config.slots, device)?,
+        None => RuntimeStage::unloaded_on(&spec, config.max_ctx, config.slots, device),
     });
     let server = StageServer::start(&config.bind, &config.key()?, stage.clone())?;
     let announcer = match (placement.map(|p| p.discovery), &config.device) {

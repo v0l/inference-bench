@@ -36,7 +36,7 @@ fn cluster(spec: &Spec, cuts: &[usize], max_ctx: usize, slots: usize) -> Cluster
     let mut servers = Vec::new();
     let mut addrs = Vec::new();
     for pair in bounds.windows(2) {
-        let stage = Arc::new(RuntimeStage::load(spec, [pair[0], pair[1]], max_ctx, slots).unwrap());
+        let stage = Arc::new(RuntimeStage::load(spec, [pair[0], pair[1]], max_ctx, slots, 0).unwrap());
         let server = StageServer::start("127.0.0.1:0", KEY, stage).unwrap();
         addrs.push(server.addr().to_string());
         servers.push(server);

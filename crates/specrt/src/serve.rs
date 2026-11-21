@@ -63,6 +63,7 @@ pub struct ServeOptions {
     pub watchdog: Option<Duration>,
     pub sessions: Option<crate::sessions::SessionOptions>,
     pub tp: usize,
+    pub solved: Option<Box<crate::solve::Solved>>,
 }
 
 impl Default for ServeOptions {
@@ -85,11 +86,23 @@ impl Default for ServeOptions {
             watchdog: Some(Duration::from_secs(60)),
             sessions: None,
             tp: 1,
+            solved: None,
         }
     }
 }
 
 impl ServeOptions {
+    pub fn from_solved(solved: &crate::solve::Solved, base: ServeOptions) -> Result<ServeOptions> {
+        let mut opts = crate::options::apply_sparse(&solved.options, base)?;
+        opts.max_model_len = Some(solved.context);
+        opts.max_num_seqs = solved.slots;
+        opts.kv_cache_bytes = Some(solved.kv_pool_bytes);
+        opts.kv_cache_tokens = None;
+        opts.tp = solved.tp;
+        opts.solved = Some(Box::new(solved.clone()));
+        Ok(opts)
+    }
+
     pub fn for_kv_context(&self, spec: &Spec, context: usize) -> (Spec, ServeOptions) {
         let mut opts = self.clone();
         if let Some(r) = opts.runtime.as_mut() {
@@ -114,25 +127,15 @@ impl ServeOptions {
     }
 
     pub fn check_pool(&self, spec: &Spec) -> Result<()> {
-        let layout = self.layout(spec);
-        if layout.kv_blocks == 0 {
-            return Ok(());
-        }
-        check_pool_tokens(layout.kv_blocks * crate::codegen::PAGE, layout.max_ctx)
-    }
-
-    pub fn plan(&self, spec: &Spec) -> Result<Option<(crate::placement::Placement, usize)>> {
-        let Some(p) = self.placement.as_ref().filter(|p| !p.devices.is_empty()) else { return Ok(None) };
         let mut resolved = spec.clone();
         if let Some(r) = &self.runtime {
             resolved.runtime = r.clone();
         }
-        self.speculative.apply(&mut resolved)?;
-        let mut sized = p.clone();
-        sized.kv_pool_bytes = sized.kv_pool_bytes.or(self.kv_cache_bytes);
-        let placed = sized.place(&resolved)?;
-        placed.ensure_runnable()?;
-        Ok((placed.stages.len() > 1).then_some((placed, p.micro_batch_in_process())))
+        let layout = self.layout(&resolved);
+        if layout.kv_blocks == 0 {
+            return Ok(());
+        }
+        check_pool_tokens(layout.kv_blocks * crate::codegen::PAGE, layout.max_ctx)
     }
 
     pub fn stage_kv_bytes(&self, spec: &Spec, placement: &crate::placement::Placement) -> Vec<u64> {
@@ -512,41 +515,15 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
         }
         return Ok(());
     }
-    let planned = opts.plan(spec);
-    let pipelined = match planned {
-        Ok(p) => p,
+    let solved = match crate::solve::for_options(spec, &opts) {
+        Ok(s) => s,
         Err(e) => {
             let _ = ready.send(Err(e.context("[placement]")));
             return Ok(());
         }
     };
-    if opts.tp > 1 {
-        if pipelined.is_some() {
-            let _ = ready.send(Err(anyhow::anyhow!("serve.tp = {} with a multi-stage [placement] is not supported; use one or the other", opts.tp)));
-            return Ok(());
-        }
-        match build_tp(spec, &opts) {
-            Ok(mut sched) => {
-                let _ = ready.send(Ok(sched.exec.media_encoder().is_some()));
-                run(&mut sched, inbox, stats, pulse);
-            }
-            Err(e) => {
-                let _ = ready.send(Err(e));
-            }
-        }
-        return Ok(());
-    }
-    match pipelined {
-        Some((placement, micro_batch)) => match build_pipeline(spec, &opts, &placement, micro_batch) {
-            Ok(mut sched) => {
-                let _ = ready.send(Ok(sched.exec.media_encoder().is_some()));
-                run(&mut sched, inbox, stats, pulse);
-            }
-            Err(e) => {
-                let _ = ready.send(Err(e));
-            }
-        },
-        None => match build(spec, opts) {
+    let Some(solved) = solved.map(Box::new) else {
+        match build(spec, opts, 0) {
             Ok(mut sched) => {
                 if let Some(shared) = sessions {
                     sched.enable_sessions(shared);
@@ -557,7 +534,48 @@ fn start_engine(spec: &Spec, opts: ServeOptions, sessions: Option<Arc<crate::ses
             Err(e) => {
                 let _ = ready.send(Err(e));
             }
-        },
+        }
+        return Ok(());
+    };
+    tracing::info!(plan = %solved.log_line(), "solved placement");
+    tracing::debug!(solved = %serde_json::to_string(&*solved).unwrap_or_default(), "solved placement");
+    if solved.tp > 1 {
+        match build_tp(spec, &opts, &solved) {
+            Ok(mut sched) => {
+                let _ = ready.send(Ok(sched.exec.media_encoder().is_some()));
+                run(&mut sched, inbox, stats, pulse);
+            }
+            Err(e) => {
+                let _ = ready.send(Err(e));
+            }
+        }
+        return Ok(());
+    }
+    if solved.spans() {
+        let micro_batch = opts.placement.as_ref().map_or(0, |p| p.micro_batch_in_process());
+        match build_pipeline(spec, &opts, &solved.placement, micro_batch) {
+            Ok(mut sched) => {
+                let _ = ready.send(Ok(sched.exec.media_encoder().is_some()));
+                run(&mut sched, inbox, stats, pulse);
+            }
+            Err(e) => {
+                let _ = ready.send(Err(e));
+            }
+        }
+        return Ok(());
+    }
+    let device = solved.single_device();
+    match build(spec, opts, device) {
+        Ok(mut sched) => {
+            if let Some(shared) = sessions {
+                sched.enable_sessions(shared);
+            }
+            let _ = ready.send(Ok(sched.exec.rt.has_vision()));
+            run(&mut sched, inbox, stats, pulse);
+        }
+        Err(e) => {
+            let _ = ready.send(Err(e));
+        }
     }
     Ok(())
 }
@@ -640,12 +658,7 @@ fn build_remote(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::rem
     Ok(Scheduler::new(exec, cfg))
 }
 
-pub fn tp_devices(tp: usize, available: usize) -> Result<Vec<usize>> {
-    anyhow::ensure!(tp <= available, "serve.tp = {tp} needs {tp} CUDA devices, {available} are visible");
-    Ok((0..tp).collect())
-}
-
-fn build_tp(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::tp_exec::TpExecutor>> {
+fn build_tp(spec: &Spec, opts: &ServeOptions, solved: &crate::solve::Solved) -> Result<Scheduler<crate::tp_exec::TpExecutor>> {
     let mut spec = spec.clone();
     if let Some(r) = &opts.runtime {
         spec.runtime = r.clone();
@@ -657,8 +670,8 @@ fn build_tp(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::tp_exec
     if let Some(bytes) = opts.kv_cache_bytes {
         layout.kv_blocks = ((bytes as usize / opts.tp) / kv_block_bytes(&rank_spec, 1)).max(1);
     }
-    let count = cudarc::driver::CudaContext::device_count()? as usize;
-    let devices = tp_devices(opts.tp, count)?;
+    let devices = solved.ordinals();
+    anyhow::ensure!(devices.len() == opts.tp, "the solved plan has tp {} on {} devices", opts.tp, devices.len());
     let exec = crate::tp_exec::TpExecutor::load(spec, layout, &devices)?;
     check_pool_tokens(exec.kv_blocks() * crate::codegen::PAGE, layout.max_ctx)?;
     tracing::info!(spec = %spec.name, tp = opts.tp, devices = ?devices, max_model_len = layout.max_ctx, max_num_seqs = layout.slots, kv_blocks = exec.kv_blocks(), "tensor parallel serving layout");
@@ -666,7 +679,7 @@ fn build_tp(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::tp_exec
     Ok(Scheduler::new(exec, cfg))
 }
 
-fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
+fn build(spec: &Spec, opts: ServeOptions, device: usize) -> Result<Scheduler<GpuExecutor>> {
     let mut spec = spec.clone();
     if let Some(r) = &opts.runtime {
         spec.runtime = r.clone();
@@ -674,7 +687,7 @@ fn build(spec: &Spec, opts: ServeOptions) -> Result<Scheduler<GpuExecutor>> {
     opts.speculative.apply(&mut spec)?;
     let spec = &spec;
     let layout = opts.layout(spec);
-    let rt = Runtime::load_layout(spec, layout)?;
+    let rt = Runtime::load_stage(spec, layout, crate::runtime::StageRange { device, ..crate::runtime::StageRange::whole(spec) })?;
     check_pool_tokens(rt.kv_blocks() * crate::codegen::PAGE, layout.max_ctx)?;
     let block = kv_block_bytes(spec, 1) as u64;
     tracing::info!(
@@ -1508,50 +1521,52 @@ mod histogram_tests {
 #[cfg(test)]
 mod placement_tests {
     use super::*;
-    use crate::placement::{DeviceConfig, LinkConfig, PlacementConfig};
+    use crate::options::Profile;
+    use crate::placement::{DeviceConfig, LinkConfig};
+    use crate::solve::{PlacementRequest, Target, solve};
 
     fn spec() -> Spec {
         Spec::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap()
     }
 
-    fn device(i: usize) -> DeviceConfig {
-        DeviceConfig { name: format!("box/gpu{i}"), memory_gib: 86.0, bandwidth_gbs: 1792.0, tflops: 500.0, ordinal: Some(i), address: None, reserve_gib: Some(0.0), link: LinkConfig::default(), offload: None, host: Some("box".into()), peer: None, wgpu: false }
+    fn device(i: usize, gib: f64) -> DeviceConfig {
+        DeviceConfig { name: format!("box/gpu{i}"), memory_gib: gib, bandwidth_gbs: 1792.0, tflops: 500.0, ordinal: Some(i), address: None, reserve_gib: Some(0.0), link: LinkConfig::default(), offload: None, host: Some("box".into()), peer: None, wgpu: false }
     }
 
-    fn two_gpu_options(pool: u64) -> ServeOptions {
-        let runtime = crate::spec::RuntimeOptions { kv_dtype: crate::spec::KvDtype::Fp8, kv_f16_layers: Some(0), ..Default::default() };
-        let placement = PlacementConfig { context: 12484, slots: 21, devices: vec![device(0), device(1)], max_tp: Some(1), ..PlacementConfig::default() };
-        ServeOptions { max_model_len: Some(262144), max_num_seqs: 21, kv_cache_bytes: Some(pool), runtime: Some(runtime), placement: Some(placement), ..Default::default() }
+    fn solved(mode: Profile, devices: &[DeviceConfig]) -> crate::solve::Solved {
+        let spec = spec();
+        solve(&PlacementRequest { mode, target: Target::default(), pins: Default::default(), devices, spec: &spec }).unwrap()
     }
 
     #[test]
-    fn a_two_stage_load_sizes_each_stage_kv_from_its_own_layers_within_the_plan() {
-        let pool = 100u64 << 30;
-        let opts = two_gpu_options(pool);
-        let (placed, _) = opts.plan(&spec()).unwrap().expect("two stages");
-        assert_eq!(placed.stages.len(), 2);
-        let mut resolved = spec();
+    fn serve_options_come_from_a_solved_plan_alone_without_a_placement_config() {
+        let s = solved(Profile::MaxPerformance, &[device(0, 86.0), device(1, 86.0)]);
+        let opts = ServeOptions::from_solved(&s, ServeOptions::default()).unwrap();
+        assert!(opts.placement.is_none());
+        assert_eq!(opts.tp, s.tp);
+        assert_eq!(opts.max_num_seqs, s.slots);
+        assert_eq!(opts.max_model_len, Some(s.context));
+        assert_eq!(opts.kv_cache_bytes, Some(s.kv_pool_bytes));
+        assert_eq!(opts.runtime.as_ref().unwrap().kv_dtype, s.kv_dtype);
+        assert_eq!(opts.solved.as_deref(), Some(&s));
+    }
+
+    #[test]
+    fn a_pipeline_solved_plan_sizes_each_stage_kv_from_its_own_layers_within_the_pool() {
+        let mut s = spec();
+        s.attention.kv_heads = 3;
+        let devices = [device(0, 12.0), device(1, 12.0)];
+        let plan = solve(&PlacementRequest { mode: Profile::MaxPerformance, target: Target::default(), pins: Default::default(), devices: &devices, spec: &s }).unwrap();
+        assert_eq!(plan.placement.stages.len(), 2);
+        let opts = ServeOptions::from_solved(&plan, ServeOptions::default()).unwrap();
+        let mut resolved = s.clone();
         resolved.runtime = opts.runtime.clone().unwrap();
-        let per_stage = opts.stage_kv_bytes(&resolved, &placed);
-        assert_eq!(per_stage.len(), 2);
-        assert!(per_stage.iter().sum::<u64>() <= pool, "{per_stage:?} against a pool of {pool}");
-        for (bytes, stage) in per_stage.iter().zip(&placed.stages) {
+        let per_stage = opts.stage_kv_bytes(&resolved, &plan.placement);
+        assert!(per_stage.iter().sum::<u64>() <= plan.kv_pool_bytes, "{per_stage:?} against {}", plan.kv_pool_bytes);
+        for (bytes, stage) in per_stage.iter().zip(&plan.placement.stages) {
             let block = kv_block_bytes(&resolved.stage(stage.start, stage.end), 1) as u64;
             assert!(*bytes <= stage.kv_bytes + block, "stage {}..{}: {bytes} against planned {}", stage.start, stage.end, stage.kv_bytes);
-            assert!(*bytes < pool, "a stage must not hold the whole pool");
         }
-    }
-
-    #[test]
-    fn the_engine_plan_sizes_the_pool_like_the_dialog_plan_so_the_stages_match() {
-        let opts = two_gpu_options(100u64 << 30);
-        let (from_engine, _) = opts.plan(&spec()).unwrap().unwrap();
-        let mut sized = opts.placement.clone().unwrap();
-        sized.kv_pool_bytes = Some(100u64 << 30);
-        let mut resolved = spec();
-        resolved.runtime = opts.runtime.clone().unwrap();
-        let from_dialog = sized.place(&resolved).unwrap();
-        assert_eq!(from_engine.ranges(), from_dialog.ranges());
     }
 
     #[test]

@@ -54,6 +54,7 @@ pub struct Loaded {
     pub thinking: specrt::chat::Thinking,
     pub tools: specrt::chat::ToolFormat,
     pub vram_bytes: Option<u64>,
+    pub landed: Vec<(String, u64)>,
 }
 
 impl Loaded {
@@ -421,6 +422,10 @@ impl Backend {
 }
 
 pub fn serve_options(max_ctx: Option<usize>, seqs: usize, kv_cache_bytes: Option<u64>, engine: &specrt::options::EngineChoice) -> Result<ServeOptions, BackendError> {
+    if let Some(solved) = &engine.solved {
+        let base = engine.apply_overrides(ServeOptions::default()).map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("engine options: {e:#}")))?;
+        return ServeOptions::from_solved(solved, base).map_err(|e| BackendError::new(crate::result::ErrorKind::InvalidRequest, format!("solved placement: {e:#}")));
+    }
     let base = ServeOptions {
         max_model_len: max_ctx,
         max_num_seqs: seqs,
@@ -453,6 +458,16 @@ fn open(
     progress: &specrt::progress::Sink,
 ) -> Result<Opened, BackendError> {
     serve_options(max_ctx, seqs, kv_cache_bytes, engine)?;
+    if let Some(solved) = &engine.solved
+        && let Some(mut target) = serving(serve_options(max_ctx, solved.slots, None, engine)?)
+    {
+        target.set_progress(Some(progress.clone()));
+        target.load(model_id)?;
+        let caps = target.capabilities();
+        let share = target.share();
+        let speculation = target.speculation();
+        return Ok(Opened { backend: Backend::Batched { target, running: Vec::new() }, vision: caps.vision, thinking: caps.thinking, tools: caps.tools, seqs: solved.slots, note: None, speculation, share });
+    }
     let mut note = None;
     let placed = seqs <= 1 && serving(serve_options(max_ctx, 1, kv_cache_bytes, engine)?).is_some_and(|t| t.requires_serving());
     let attempts = if seqs > 1 { vec![seqs, 1] } else if placed { vec![1] } else { Vec::new() };
@@ -628,7 +643,8 @@ fn run(
                 publish(&shared, &slots, &parked);
                 emit(EngineEvent::Loading(display.clone()));
                 let started = Instant::now();
-                let vram_before = crate::gpu::used_total(&crate::gpu::sample()).map(|(used, _)| used);
+                let before = crate::gpu::sample();
+                let vram_before = crate::gpu::used_total(&before).map(|(used, _)| used);
                 let seqs = max_num_seqs.unwrap_or(1).max(1);
                 let sink = {
                     let (events, wake) = (events.clone(), wake.clone());
@@ -639,8 +655,10 @@ fn run(
                 };
                 match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &sink) {
                     Ok(o) => {
-                        let ctx = max_ctx.unwrap_or(specrt::engine::DEFAULT_CTX);
-                        let vram_bytes = vram_before.zip(crate::gpu::used_total(&crate::gpu::sample()).map(|(used, _)| used)).map(|(b, a)| a.saturating_sub(b)).filter(|v| *v > 0);
+                        let ctx = engine.solved.as_ref().map(|s| s.context).or(max_ctx).unwrap_or(specrt::engine::DEFAULT_CTX);
+                        let after = crate::gpu::sample();
+                        let vram_bytes = vram_before.zip(crate::gpu::used_total(&after).map(|(used, _)| used)).map(|(b, a)| a.saturating_sub(b)).filter(|v| *v > 0);
+                        let landed = crate::gpu::landed(&before, &after);
                         let info = Loaded {
                             model_id: model_id.clone(),
                             display,
@@ -655,6 +673,7 @@ fn run(
                             thinking: o.thinking,
                             tools: o.tools,
                             vram_bytes,
+                            landed,
                         };
                         if let Some(share) = o.share {
                             shared.stats.lock().unwrap().push((model_id.clone(), share));

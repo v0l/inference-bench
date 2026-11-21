@@ -213,6 +213,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 if let Some(f) = loaded.as_ref().and_then(|l| app.engine.handle().failure_of(&l.display)) {
                     status(ui, false, &format!("model failed: {f}. Load it again from the model bar"));
                 }
+                if let Some(w) = loaded.as_ref().and_then(|l| app.landing(l)) {
+                    if w.matches_plan {
+                        Line::new().legend("gpus").value(w.text).show(ui);
+                    } else {
+                        status(ui, false, &format!("{}, not where the load dialog planned it", w.text));
+                    }
+                }
             },
         );
         section(ui, "settings", "applied the next time the server starts", |ui| {

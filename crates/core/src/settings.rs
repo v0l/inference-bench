@@ -170,7 +170,7 @@ impl Settings {
     }
 
     pub fn engine_for(&self, model: &str) -> specrt::options::EngineChoice {
-        self.model_engine.get(model).cloned().unwrap_or_else(|| specrt::options::EngineChoice { profile: self.default_profile, overrides: Default::default() })
+        self.model_engine.get(model).cloned().unwrap_or_else(|| specrt::options::EngineChoice { profile: self.default_profile, overrides: Default::default(), solved: None })
     }
 
     pub fn kv_gb_for(&self, model: &str) -> Option<f64> {

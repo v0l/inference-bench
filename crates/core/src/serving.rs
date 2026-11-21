@@ -121,7 +121,7 @@ impl Target for ServingTarget {
     }
 
     fn requires_serving(&self) -> bool {
-        self.opts.placement.as_ref().is_some_and(|p| !p.devices.is_empty())
+        self.opts.solved.is_some() || self.opts.placement.as_ref().is_some_and(|p| !p.devices.is_empty())
     }
 
     fn failure(&self) -> Option<String> {

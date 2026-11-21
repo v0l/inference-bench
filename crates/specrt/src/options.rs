@@ -55,6 +55,8 @@ impl Profile {
 pub struct EngineChoice {
     pub profile: Profile,
     pub overrides: BTreeMap<String, Value>,
+    #[serde(skip)]
+    pub solved: Option<Box<crate::solve::Solved>>,
 }
 
 impl EngineChoice {
@@ -69,6 +71,9 @@ impl EngineChoice {
 
     pub fn value(&self, key: &str) -> Value {
         if let Some(v) = self.overrides.get(key) {
+            return v.clone();
+        }
+        if let Some(v) = self.solved.as_ref().and_then(|s| s.options.get(key)) {
             return v.clone();
         }
         if let Some(v) = self.profile.values().get(key) {
@@ -101,35 +106,44 @@ impl EngineChoice {
         schema().iter().map(|f| (f.key.clone(), self.value(&f.key))).collect()
     }
 
-    fn validate(&self, opts: &ServeOptions) -> Result<()> {
-        let s = &opts.speculative;
-        if let Some(k) = s.draft_tokens {
-            anyhow::ensure!((1..=crate::spec::MAX_DRAFT_TOKENS).contains(&k), "speculative.draft_tokens (draft tokens) must be 1 to {}, not {k}", crate::spec::MAX_DRAFT_TOKENS);
-        }
-        if let Some(b) = s.max_batch {
-            anyhow::ensure!(b >= 1, "speculative.max_batch (mtp batch limit) must be at least 1");
-            anyhow::ensure!(b <= opts.max_num_seqs, "speculative.max_batch (mtp batch limit) {b} is above parallel requests {}", opts.max_num_seqs);
-        }
-        if let Some(r) = &opts.runtime {
-            r.prefix_cache.validate()?;
-            r.loader.validate()?;
-        }
-        anyhow::ensure!(opts.max_batched_tokens >= 64, "serve.max_batched_tokens (batched tokens) must be at least 64");
-        Ok(())
+    pub fn sparse_values(&self) -> BTreeMap<String, Value> {
+        self.profile.values().into_iter().chain(self.overrides.clone()).collect()
     }
 
-    fn sparse(&self, prefix: &str) -> Map<String, Value> {
-        let mut out = Map::new();
-        for (k, v) in self.profile.values().into_iter().chain(self.overrides.clone()) {
-            if let Some(rest) = k.strip_prefix(prefix) {
-                out.insert(rest.to_string(), v);
-            }
-        }
-        out
+    pub fn apply(&self, opts: ServeOptions) -> Result<ServeOptions> {
+        apply_sparse(&self.sparse_values(), opts)
     }
 
-    pub fn apply(&self, mut opts: ServeOptions) -> Result<ServeOptions> {
-        let values = self.values();
+    pub fn apply_overrides(&self, opts: ServeOptions) -> Result<ServeOptions> {
+        apply_sparse(&self.overrides, opts)
+    }
+}
+
+fn validate(opts: &ServeOptions) -> Result<()> {
+    let s = &opts.speculative;
+    if let Some(k) = s.draft_tokens {
+        anyhow::ensure!((1..=crate::spec::MAX_DRAFT_TOKENS).contains(&k), "speculative.draft_tokens (draft tokens) must be 1 to {}, not {k}", crate::spec::MAX_DRAFT_TOKENS);
+    }
+    if let Some(b) = s.max_batch {
+        anyhow::ensure!(b >= 1, "speculative.max_batch (mtp batch limit) must be at least 1");
+        anyhow::ensure!(b <= opts.max_num_seqs, "speculative.max_batch (mtp batch limit) {b} is above parallel requests {}", opts.max_num_seqs);
+    }
+    if let Some(r) = &opts.runtime {
+        r.prefix_cache.validate()?;
+        r.loader.validate()?;
+    }
+    anyhow::ensure!(opts.max_batched_tokens >= 64, "serve.max_batched_tokens (batched tokens) must be at least 64");
+    Ok(())
+}
+
+pub fn apply_sparse(sparse: &BTreeMap<String, Value>, opts: ServeOptions) -> Result<ServeOptions> {
+    let mut values: BTreeMap<String, Value> = schema().iter().map(|f| (f.key.clone(), f.default.clone())).collect();
+    values.extend(sparse.clone());
+    apply_values(&values, sparse, opts)
+}
+
+fn apply_values(values: &BTreeMap<String, Value>, sparse: &BTreeMap<String, Value>, mut opts: ServeOptions) -> Result<ServeOptions> {
+    {
         if let Some(v) = values.get("serve.max_batched_tokens").and_then(Value::as_u64) {
             opts.max_batched_tokens = v as usize;
         }
@@ -152,15 +166,20 @@ impl EngineChoice {
             opts.tp = v as usize;
         }
         let mut runtime = serde_json::to_value(RuntimeOptions::default())?;
-        for (key, value) in &values {
+        for (key, value) in values {
             if let Some(path) = key.strip_prefix("runtime.").filter(|_| !value.is_null()) {
                 set_path(&mut runtime, path, value.clone());
             }
         }
         opts.runtime = Some(serde_json::from_value(runtime).context("runtime options")?);
-        let spec = Value::Object(self.sparse("speculative."));
-        opts.speculative = serde_json::from_value(spec).context("speculative options")?;
-        self.validate(&opts)?;
+        let mut spec = Map::new();
+        for (k, v) in sparse {
+            if let Some(rest) = k.strip_prefix("speculative.") {
+                spec.insert(rest.to_string(), v.clone());
+            }
+        }
+        opts.speculative = serde_json::from_value(Value::Object(spec)).context("speculative options")?;
+        validate(&opts)?;
         Ok(opts)
     }
 }
@@ -315,7 +334,7 @@ struct ServeKnobs {
 }
 
 fn knobs(o: &ServeOptions) -> ServeKnobs {
-    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp } = o;
+    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp, solved: _ } = o;
     ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead, tp: *tp }
 }
 

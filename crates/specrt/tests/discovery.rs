@@ -247,7 +247,7 @@ struct Node {
 }
 
 fn node(spec: &Spec, name: &str, bind: &str, announce_port: Option<u16>) -> Node {
-    let stage = Arc::new(specrt::stage::RuntimeStage::unloaded(spec, 512, 1));
+    let stage = Arc::new(specrt::stage::RuntimeStage::unloaded_on(spec, 512, 1, 0));
     let server = StageServer::start(bind, KEY, stage).unwrap();
     let announcer = announce_port.map(|p| Announcer::start(&device(name, None), server.addr(), p).unwrap());
     Node { server, _announcer: announcer }

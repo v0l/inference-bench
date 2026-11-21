@@ -159,3 +159,27 @@ The app load dialog and the engine now share one plan. `core::cluster::Planned` 
 A placed load never falls back to one GPU: `engine::open` returns the stage error (`stage 1 (layers 36..64) on GPU 1: ... out of memory`). The dialog says "will span N GPUs" when the memory it sizes is more than the largest GPU and blocks the load when the planner says it does not fit.
 
 Real check (needs both GPUs idle): `crates/specrt/scripts/gate776_two_gpu.sh`, defaults are the user's settings (27B NVFP4, fp8 KV, 21 seqs, ctx 262144, 95 GB KV pool). It checks both cards are empty, prints the plan, loads through `[placement]`, and reports VRAM per GPU and `inference_running_seqs` under 21 parallel requests.
+
+## Profile-driven placement (issue #911)
+
+`specrt::solve::solve(PlacementRequest { mode, target, pins, devices, spec })` returns a `Solved`: the one plan every load uses. `mode` is the profile (`MaxPerformance` or `LowMemory`), `target` is a hard constraint (context, memory budget, slots), `pins` are the user's overrides from the load dialog or server.toml, and `Profile::values()` are the defaults the search starts from. If nothing meets the target, `solve` returns the closest plan and names the miss in `Solved::shortfall`.
+
+`Solved` is the load contract. It holds the placement stages, `tp`, KV dtype and pool bytes, slots, context, MTP and the sparse option map. `ServeOptions::from_solved` turns it into serve options and `Core::start` builds from it with no `PlacementConfig`. The engine does not re-plan and has no fallback: if it cannot honour the plan it fails with the stage error. The plan is logged at load as `solved placement`, with the full JSON at debug level.
+
+Mode preferences:
+
+- Max performance: tensor parallel across matched GPUs on one host even when one GPU would fit, because that is faster. When the model does not fit, a pipeline. On mixed GPUs, a pipeline or the best subset by the throughput cost model. f16 KV and MTP when they fit, then fp8 KV, then MTP off. Slots are the most the pool serves with typical requests.
+- Low memory: the smallest GPU the model fits on (bandwidth breaks ties), fp8 KV, two slots, MTP off. It spans GPUs only when nothing fits alone.
+
+Entry points:
+
+- The load dialog solves on every change and shows the strategy, the reasons and any shortfall. Moving the slots or KV controls pins them. Loading hands the engine exactly the `Solved` the dialog showed (`EngineChoice.solved`).
+- server.toml and CLI loads call `solve::for_options` from `start_engine`. `[placement] devices` without stages is solved for max performance with slots, tp, pool, KV dtype and MTP as pins. Explicit `[[placement.stages]]` become a pinned `Solved`. With no placement and `tp = 1` there is nothing to solve.
+- `inference-bench plan` prints the max performance and low memory `Solved` after the stage tables.
+
+Real check on the desktop pair (2 x RTX PRO 6000, 27B NVFP4, context 32768), `crates/specrt/tests/solved_load.rs`, run with `SOLVE_MODE=max` or `low`, `HF_HUB_OFFLINE=1`, `--ignored`:
+
+| mode | solved | engine | GPU memory |
+|---|---|---|---|
+| max | TP 2 across 2, f16 KV 68 GiB pool, 32 slots, MTP on | `tensor parallel serving layout`, `max_num_seqs=32`, `kv_blocks=65536` | 53 GB and 51 GB |
+| low | one GPU, fp8 KV 1.77 GiB pool, 2 slots, MTP off | `serving layout`, `max_num_seqs=2`, `kv_blocks=2400` | 28 GB and 0 |
