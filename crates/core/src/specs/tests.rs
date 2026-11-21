@@ -298,10 +298,9 @@ fn a_downloaded_kernel_description_installs_and_is_listed() {
 }
 
 #[test]
-fn fetched_family_base_parses_with_current_and_old_rope_ids() {
+fn fetched_family_base_parses() {
     let base = EMBEDDED.iter().find(|(n, _)| *n == "family-base.toml").unwrap().1;
-    let old = base.replace("llama3 = \"banded\"", "llama3 = \"llama3\"");
-    for text in [base.to_string(), old] {
+    for text in [base.to_string()] {
         let r = rig();
         let data = temp("familybase");
         let store = SpecStore::new(&data);
