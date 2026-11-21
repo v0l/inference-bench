@@ -183,3 +183,76 @@ Isolated `_huge` GEMM on GPU1 (RTX PRO 6000), m = 16384, median of 10. The tile 
 | 64x256 2x4 | 194 | 370 | 381 |
 
 Per-channel spec (the NVFP4 model's FP8 layers): 128x128 2x4 gives 484 / 493 / 497, 128x128 4x2 gives 468 / 487 / 491. The best alternative is +3% on gate_up and +4.5% on down for one spec only, so no tile reaches the 5% bar. The default stays and no loadtest was run.
+
+## GPU results (#603) (21 Nov, GPU1 quiet, 27B NVFP4, kv fp8, MTP on, 26 seqs, 22.5 GB KV, max_batched_tokens 16384)
+
+Long shape: `--requests 40 --rate 1 --clients 8 --mix 1:15000-18000 --output 256-512`. Chat control: `--mix 1:500-1500 --output 256-512 --rate 4 --clients 16 --requests 80`.
+
+| arm | prefill tok/s | decode tok/s | TTFT p50 | TTFT p95 | ITL p95 | ITL max |
+|---|---|---|---|---|---|---|
+| 1 default (floor 512, 1 long) | 2,566 | 57 | 24.9 s | 33.8 s | 0.160 s | 6.9 s |
+| 2 `min_prefill_tokens` 4096 | 3,570 | 80 | 3.8 s | 21.6 s | 0.725 s | 5.9 s |
+| 3 `min_prefill_tokens` 16384 | 3,807 | 85 | 3.5 s | 21.3 s | 0.044 s | 7.8 s |
+| 4 burst 8192 + long 4 | 4,391 | 98 | 4.5 s | 16.5 s | 0.045 s | 1.8 s |
+| 5 burst 16384 + long 4 | 4,459 | 99 | 3.4 s | 17.3 s | 0.044 s | 2.9 s |
+| 6 chat, default | 1,773 | 652 | 0.38 s | 1.40 s | 0.143 s | 0.23 s |
+| 6 chat, burst 16384 + long 4 | 1,772 | 652 | 0.38 s | 1.42 s | 0.143 s | 0.24 s |
+
+Burst 16384 + long 4 is the default now: TTFT p50 7.4x better than the default arm, prefill 1.74x, chat control unchanged. Burst 8192 has the lower max stall (1.8 s) and p95. Both are overridable.
+Still open: the 80% target. See the second round below.
+
+## Second round (21 Nov, same GPU1)
+
+Decode, short prompts (512 in, 256 out), old default vs new default:
+
+| clients | old | new |
+|---|---|---|
+| 1 | 103.7 tok/s | 103.9 tok/s |
+| 8 (48 requests, two runs each) | 496.2, 501.3 | 500.4, 496.8 |
+
+No decode loss at batch 1 or 8, and MTP is on in all of them. Repeat of the long shape: default 3,316 prefill tok/s, TTFT p50 19.3 s, p95 26.2 s; burst 16384 + long 4 4,426 tok/s, 3.36 s, 17.8 s. Two runs each: p50 24.9 / 19.3 s old, 3.37 / 3.36 s new, so 5.7x to 7.4x.
+
+vLLM alone on GPU1 (`launch.sh mtp`, `--requests 16 --rate 1 --clients 8 --output 64`) against specrt with the new default, same loadtest:
+
+| prompt | vLLM prefill tok/s | specrt tok/s | ratio |
+|---|---|---|---|
+| 15-18k | 7,816 | 4,029 | 52% |
+| 30-33k | 6,966 | 4,141 | 59% |
+
+Single 16k prompt alone on specrt: 5,370 tok/s, TTFT 3.0 s. Eight co-arriving 16k prompts: 5,299 tok/s, TTFT p50 15.6 s, p95 25.1 s (against 32.8 s in the issue, 2.1x).
+
+nsys of the 1 + 8 co-arriving 16k run (`--cuda-graph-trace=node`), top kernels by GPU time:
+
+| kernel | share | avg |
+|---|---|---|
+| gate_up_f4a_big (NVFP4 MLP) | 19.6% | 1.74 ms |
+| flash_mma | 12.0% | 3.45 ms |
+| lin_in_f8_huge | 11.1% | 1.15 ms |
+| down_f4a_big | 9.8% | 1.38 ms |
+| gdn_chunk_prep | 7.8% | 0.79 ms |
+| gdn_chunk_scan | 5.8% | 0.58 ms |
+
+Prefill is compute bound, so GB/s against the 1,640 GB/s ceiling is not the measure here. The NVFP4 MLP GEMMs and the FP8 projections are about 55% of kernel time and gdn_chunk_prep plus scan another 13.6%. These are the #555 kernel gaps (NVFP4 GEMM 1.4-1.6x CUTLASS, delta-net 4.4x vLLM), which are kernel design work and need a decision on scope before a change. Not started.
+
+Suites on GPU1 with the new default, after merging master (which carries #932's `split_activations` pin):
+
+```
+kv_dtype: test result: ok. 11 passed; 0 failed
+serving:  test result: ok. 27 passed; 0 failed
+mtp:      test result: ok. 18 passed; 0 failed
+real27b --skip needle: 8 passed, 2 failed (first-layer tests), then after the fix below:
+real27b first_layers: test result: ok. 2 passed; 0 failed
+no_arch_names: test result: ok. 3 passed; 0 failed
+```
+
+The two first-layer tests were not stale references: the per-layer errors were 1.7e-6 to 7.9e-6 but the logits error was 2.5e-3 against a 2e-3 bound. They compare against an fp32 transformers reference, so they need `runtime.split_activations = Some(true)` like #932's tiny tests. `first_layers_match` in `tests/real27b.rs` now pins it, and both pass.
+
+Step 4 (one change tried): `prefill_chunk` 4096 (spec default) against 8192 and 16384 under the new default, same long shape, 24 requests:
+
+| chunk | prefill tok/s | TTFT p50 | TTFT p95 | decode tok/s |
+|---|---|---|---|---|
+| 4096 | 4,398 | 3.55 s | 19.3 s | 99.4 |
+| 8192 | 4,326 | 3.57 s | 19.8 s | 97.7 |
+| 16384 | 4,307 | 3.58 s | 20.0 s | 97.3 |
+
+No gain, dropped. The NVFP4 GEMM is already at vLLM's isolated TFLOP/s (`docs/specrt-nvfp4.md`, #441: warp specialisation and TMA tried and dropped, remaining cost is load issue inside the mma warps), so a further kir change there is a design task, filed as #973 (GEMMs) and #972 (delta-net).

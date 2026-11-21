@@ -488,8 +488,8 @@ mod tests {
         assert_eq!(default_of("serve.min_prefill_tokens"), Some(json!(d.min_prefill_tokens)));
         assert_eq!(default_of("serve.swap_space_gb"), Some(json!(d.swap_space_gb)));
         assert_eq!(default_of("serve.admit_lookahead"), Some(json!(d.admit_lookahead)));
-        assert_eq!(default_of("serve.prefill_burst_tokens"), Some(json!(0)));
-        assert_eq!(default_of("serve.max_long_in_flight"), Some(json!(1)));
+        assert_eq!(default_of("serve.prefill_burst_tokens"), Some(json!(16384)));
+        assert_eq!(default_of("serve.max_long_in_flight"), Some(json!(4)));
         let burst = EngineChoice { overrides: [("serve.prefill_burst_tokens".to_string(), json!(16384)), ("serve.max_long_in_flight".to_string(), json!(4))].into(), ..Default::default() };
         let o = burst.apply(ServeOptions::default()).unwrap();
         assert_eq!((o.prefill_burst_tokens, o.max_long_in_flight), (16384, 4));
