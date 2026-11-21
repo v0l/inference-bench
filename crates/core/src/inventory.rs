@@ -77,6 +77,8 @@ pub fn inventory(machine: Option<&Machine>, stats: &[GpuStats], peers: &[Peer], 
             for (i, s) in stats.iter().enumerate() {
                 let mut d = crate::discover::pool_devices_on(&host, &[(i, s.available_bytes())]).remove(0);
                 d.memory_gib = usable(s.available_bytes());
+                d.host = Some(host.clone());
+                d.peer = Some(specrt::hardware::STAGED_LINK);
                 cards.push(Card {
                     selected: !settings.disabled_gpus.contains(&d.name),
                     name: d.name.clone(),
@@ -291,5 +293,13 @@ mod tests {
         let inv = inventory(None, &s, &[], &ClusterSettings::default());
         assert_eq!(inv.free_local(), vec![86 << 30, 96 << 30]);
         assert!(inv.cards[0].display);
+    }
+
+    #[test]
+    fn cards_from_gpu_readings_belong_to_this_host_so_they_can_pair_for_tp() {
+        let s = vec![stats("GPU-a", 50, false), stats("GPU-b", 20, false)];
+        let inv = inventory(None, &s, &[], &ClusterSettings::default());
+        let devices = inv.devices(None, LinkConfig::default());
+        assert!(devices.iter().all(|d| d.host.as_deref() == Some(inv.host.as_str())), "{devices:?}");
     }
 }

@@ -684,6 +684,10 @@ mod tests {
         let s = solve(&pinned).unwrap();
         assert_eq!((s.tp, s.ordinals()), (2, vec![0, 1]), "{}", s.strategy);
         assert!(s.strategy.starts_with("TP 2 across"), "{}", s.strategy);
+        let small = Spec::from_hf_config(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3-0.6b.config.json")).unwrap()).unwrap();
+        let pinned = PlacementRequest { spec: &small, ..pinned };
+        let s = solve(&pinned).unwrap();
+        assert_eq!(s.tp, 2, "{}", s.strategy);
     }
 
     #[test]

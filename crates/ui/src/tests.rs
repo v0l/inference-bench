@@ -311,7 +311,7 @@ fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
     assert!(matches!(r, Some(Ok(_))), "{:?} {:?} {:?}", r.map(|r| r.map(|p| p.placement.render())), devices.iter().map(|d| d.memory_gib).collect::<Vec<_>>(), dialog.seqs);
     h.get_by_label_contains("free on 3 gpus");
     h.get_by_label_contains("load plan");
-    h.get_by_label_contains("layers 0-");
+    assert!(!h.query_all_by_label_contains("layers 0-").collect::<Vec<_>>().is_empty());
 }
 
 #[test]
