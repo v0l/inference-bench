@@ -431,6 +431,7 @@ pub enum Activation {
 #[serde(rename_all = "lowercase")]
 pub enum RopeScalingKind {
     Linear,
+    #[serde(alias = "llama3")]
     Banded,
     Yarn,
     Longrope,
