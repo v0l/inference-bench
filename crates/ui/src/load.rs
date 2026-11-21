@@ -320,46 +320,71 @@ impl LoadDialog {
     }
 }
 
-pub struct PlanRow {
-    pub device: String,
-    pub layers: Option<(usize, usize)>,
-    pub weights: u64,
-    pub kv: u64,
-    pub state: u64,
+pub fn card_line(c: &inference_bench_core::inventory::Card) -> String {
+    let mut text = format!("{}  {}  {} free of {}", c.short(), c.label, human_size(c.free_bytes), human_size(c.total_bytes));
+    if !c.local {
+        text = format!("{}  on {}", text, c.host);
+    }
+    if c.display {
+        text.push_str("  drives a display");
+    }
+    text
 }
 
-pub fn plan_rows(p: &specrt::placement::Placement) -> Vec<PlanRow> {
-    p.stages
-        .iter()
-        .map(|s| PlanRow {
-            device: if s.device_name.is_empty() { format!("gpu {}", s.ordinal) } else { format!("{} #{}", s.device_name, s.ordinal) },
-            layers: Some((s.start, s.end)),
-            weights: s.weight_bytes,
-            kv: s.kv_bytes,
-            state: s.state_bytes,
-        })
-        .collect()
+fn hardware_section(app: &mut App, ui: &mut egui::Ui, inv: &inference_bench_core::inventory::Inventory) {
+    section(ui, "hardware", "the GPUs this model may use, the same switches as the Hardware tab", |ui| {
+        if inv.cards.is_empty() {
+            note(ui, "No GPU found yet.", LEGEND);
+            return;
+        }
+        for c in &inv.cards {
+            let mut on = c.selected;
+            let r = ui.push_id(&c.name, |ui| ui.checkbox(&mut on, card_line(c))).inner;
+            if r.changed() {
+                inference_bench_core::inventory::toggle(&mut app.settings.cluster, inv, &c.name);
+                let _ = app.settings.save(&app.dir);
+            }
+        }
+        if inv.selected().next().is_none() {
+            status(ui, false, "no GPU is ticked: tick one to load the model");
+        }
+    });
 }
 
-fn load_plan(ui: &mut egui::Ui, rows: &[PlanRow]) {
+fn placement_bars(ui: &mut egui::Ui, inv: &inference_bench_core::inventory::Inventory, solved: &Solved) {
     ui.add_space(4.0);
     let head = Line::new().legend("load plan").size(10.5).show(ui);
     head.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "load plan"));
-    for r in rows {
-        let layers = r.layers.map_or(String::new(), |(a, b)| format!("layers {a}-{}  ", b.saturating_sub(1)));
-        let text = format!("{layers}weights {}  kv {}  state {}", human_size(r.weights), human_size(r.kv), human_size(r.state));
-        let line = Line::new().legend(&r.device).column(ui, 120.0).note(text.clone()).size(11.0).show(ui);
-        line.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{} {text}", r.device)));
+    for s in &solved.placement.stages {
+        let bytes = s.weight_bytes + s.kv_bytes + s.state_bytes;
+        for name in s.device_name.split('+') {
+            let card = inv.card(name);
+            let label = card.map_or_else(|| specrt::hardware::display_name(name), |c| if c.local { c.short() } else { specrt::hardware::display_name(&c.name) });
+            let free = card.map_or(0, |c| c.free_bytes);
+            let text = format!("layers {}-{}  {} of {} free", s.start, s.end.saturating_sub(1), human_size(bytes), human_size(free));
+            let r = Line::new().legend(&label).column(ui, 120.0).value(text.clone()).size(11.0).show(ui);
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{label} {text}")));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+            let fraction = if free == 0 { 1.0 } else { bytes as f32 / free as f32 };
+            bar(&ui.painter_at(rect), rect, fraction.min(1.0), if fraction > 1.0 { FAULT } else { TRACE });
+        }
     }
+}
+
+pub fn dialog_size(screen: egui::Vec2, advanced: bool) -> (f32, f32) {
+    let width = (screen.x - 48.0).clamp(280.0, 640.0);
+    let room = (screen.y - 190.0).max(160.0);
+    (width, if advanced { room } else { room.min(900.0) })
 }
 
 pub fn modal(app: &mut App, ctx: &egui::Context) {
     let Some(mut dialog) = app.load.take() else { return };
-    let gpus = app.free_gpu_list();
-    let free = app.free_gpu_bytes();
+    let inv = app.inventory();
+    let gpus = inv.free_local();
+    let free = (!gpus.is_empty()).then(|| gpus.iter().sum::<u64>());
     dialog.sync();
     let est = dialog.estimate(free);
-    let load_devices = crate::hardware::load_devices(app);
+    let load_devices = inv.devices(app.hardware.machine.as_ref(), app.settings.cluster.network_link());
     dialog.resolve(&load_devices);
     let spread = dialog.planned(&load_devices).filter(|_| load_devices.len() > 1);
     let (mut go, mut close, mut alongside) = (false, false, false);
@@ -368,17 +393,18 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
     let r = egui::Modal::new(egui::Id::new("load-model"))
         .backdrop_color(egui::Color32::from_black_alpha(150))
         .show(ctx, |ui| {
-            ui.set_width(520.0);
+            let (width, body_h) = dialog_size(ui.ctx().content_rect().size(), dialog.advanced);
+            ui.set_width(width);
             modal_title(ui, &format!("Load {}", dialog.model.name));
             if let Err(e) = &dialog.view {
                 status(ui, false, e);
                 note(ui, "The engine will read the model itself and report what is wrong.", LEGEND);
             }
             let body_w = ui.available_width();
-            let room = (ui.ctx().content_rect().height() - 200.0).clamp(200.0, 900.0);
-            let body_h = if dialog.advanced { room } else { room.min(560.0) };
             egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(body_h).show(ui, |ui| {
             ui.set_max_width(body_w);
+            hardware_section(app, ui, &inv);
+            ui.add_space(8.0);
             section(ui, "profile", "one switch for the measured best, or for the least memory", |ui| {
                 let mut pick = if dialog.choice.is_custom() { ProfilePick::Custom } else { ProfilePick::Profile(dialog.choice.profile) };
                 let before = pick;
@@ -499,9 +525,6 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                                 Some(Err(why)) => status(ui, false, &format!("the planner says it does not fit across {} gpus: {why}. You can still try to load it.", gpus.len())),
                                 None => {}
                             }
-                            if let Some(Ok(p)) = &spread {
-                                load_plan(ui, &plan_rows(&p.placement));
-                            }
                         }
                         Some(f) => {
                             Line::new().legend("free on the gpu").column(ui, 120.0).measured(human_size(f)).show(ui);
@@ -509,9 +532,11 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                                 Some(false) => status(ui, false, &format!("the planner says it is {} over free memory. You can still try to load it.", human_size(e.total() - f))),
                                 _ => status(ui, true, "fits in free memory"),
                             }
-                            load_plan(ui, &[PlanRow { device: "gpu 0".into(), layers: None, weights: e.weights, kv: e.kv, state: e.state }]);
                         }
                         None => note(ui, "No GPU reading yet, so the estimate cannot be checked against free memory.", LEGEND),
+                    }
+                    if let Some(Ok(s)) = &dialog.solved {
+                        placement_bars(ui, &inv, s);
                     }
                 }
                 None => note(ui, "No estimate: the model's layout could not be read.", LEGEND),

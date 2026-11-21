@@ -66,8 +66,12 @@ fn harness(name: &str, tab: Tab) -> Harness<'static, App> {
 }
 
 fn harness_sized(name: &str, tab: Tab, height: f32) -> Harness<'static, App> {
+    harness_at(name, tab, egui::vec2(1280.0, height))
+}
+
+fn harness_at(name: &str, tab: Tab, size: egui::Vec2) -> Harness<'static, App> {
     let d = dir(name);
-    Harness::builder().with_size(egui::vec2(1280.0, height)).with_max_steps(100).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
+    Harness::builder().with_size(size).with_max_steps(100).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
         let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
         app.tab = tab;
@@ -225,9 +229,22 @@ fn click_load(h: &mut Harness<'static, App>) {
     h.get_all_by_label("load").last().unwrap().click();
 }
 
+fn click_settled(h: &mut Harness<'static, App>, label: &str) {
+    let mut last = None;
+    for _ in 0..30 {
+        h.step();
+        let at = h.get_by_label_contains(label).accesskit_node().bounding_box();
+        if at == last {
+            break;
+        }
+        last = at;
+    }
+    h.get_by_label_contains(label).click();
+}
+
 fn with_gpu(h: &mut Harness<'static, App>, used: u64, total: u64) {
     let app = h.state_mut();
-    app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None, uuid: String::new(), own_bytes: 0 }];
+    app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None, uuid: String::new(), own_bytes: 0, display: false }];
     app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
     app.gpu_poll = Default::default();
 }
@@ -268,7 +285,7 @@ fn the_27b_config_gives_the_load_dialog_a_262144_maximum() {
 #[test]
 fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
     let mut h = harness("load-three-gpus", Tab::Models);
-    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false };
     {
         let app = h.state_mut();
         app.gpu = vec![gpu(24), gpu(24), gpu(24)];
@@ -307,7 +324,7 @@ fn load_stays_available_when_the_planner_says_the_model_will_not_fit() {
     h.state_mut().load.as_mut().unwrap().ctx = 40960;
     h.run();
     assert!(h.query_all_by_label_contains("still try to load").count() >= 1);
-    h.get_by_label_contains("load plan");
+    assert!(h.query_by_label_contains("gpu 0").is_none());
     let load = click_load_node(&mut h);
     assert!(!load, "the load key must not be disabled");
 }
@@ -2134,7 +2151,7 @@ fn peers_from_fake_announcements_show_name_gpus_memory_and_busy_state() {
 #[test]
 fn switching_a_gpu_off_in_the_hardware_tab_removes_it_from_every_budget() {
     let mut h = hardware_harness("hwswitch", 2);
-    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false };
     {
         let app = h.state_mut();
         app.gpu = vec![gpu(24), gpu(24)];
@@ -2417,7 +2434,7 @@ fn screenshot_of_discover() {
 #[test]
 fn the_budget_excludes_this_apps_own_memory_and_a_model_that_fits_then_shows_as_fitting() {
     use inference_bench_core::gpu::{GpuStats, attribute, parse_compute_apps};
-    let mut gpu = vec![GpuStats { name: "RTX".into(), used_bytes: 87 << 30, total_bytes: 96 << 30, util_percent: None, uuid: "GPU-a".into(), own_bytes: 0 }];
+    let mut gpu = vec![GpuStats { name: "RTX".into(), used_bytes: 87 << 30, total_bytes: 96 << 30, util_percent: None, uuid: "GPU-a".into(), own_bytes: 0, display: false }];
     attribute(&mut gpu, &parse_compute_apps("GPU-a, 4242, 61440\nGPU-a, 7, 12288\n"), &[4242]);
     let mut h = harness("budget", Tab::Models);
     h.state_mut().gpu = gpu;
@@ -2646,8 +2663,12 @@ fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
 }
 
 fn two_gpu_27b_dialog(name: &str) -> Harness<'static, App> {
-    let mut h = harness(name, Tab::Models);
-    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
+    two_gpu_27b_dialog_at(name, egui::vec2(1280.0, 800.0))
+}
+
+fn two_gpu_27b_dialog_at(name: &str, size: egui::Vec2) -> Harness<'static, App> {
+    let mut h = harness_at(name, Tab::Models, size);
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false };
     {
         let app = h.state_mut();
         app.gpu = vec![gpu(96), gpu(96)];
@@ -2692,7 +2713,9 @@ fn the_user_settings_on_two_96gb_gpus_plan_across_both() {
     assert_eq!(planned.placement.stages[0].tp, 2);
     assert_eq!(planned.placement.slots, 21);
     assert_eq!(planned.placement.context.min(262144), planned.placement.context);
-    h.get_by_label_contains("TP 2 across 2");
+    h.get_by_label_contains("TP 2 across desk / GPU 0 + desk / GPU 1");
+    h.get_by_label_contains("GPU 0 layers 0-");
+    h.get_by_label_contains("GPU 1 layers 0-");
 }
 
 type Seen = std::sync::Arc<std::sync::Mutex<Vec<specrt::serve::ServeOptions>>>;
@@ -2740,9 +2763,71 @@ fn the_engine_receives_exactly_the_solved_plan_the_dialog_showed() {
 }
 
 #[test]
+fn unticking_gpu_0_in_the_dialog_plans_and_loads_on_gpu_1_only() {
+    let mut h = two_gpu_27b_dialog("untick-gpu0");
+    let seen = recording_engine(h.state_mut());
+    {
+        let app = h.state_mut();
+        app.library[0].repo = "acme/Qwen3.8-27B-NVFP4".into();
+        app.load.as_mut().unwrap().model.repo = "acme/Qwen3.8-27B-NVFP4".into();
+    }
+    h.get_by_label_contains("GPU 0 layers 0-");
+    click_settled(&mut h, "GPU 0  ");
+    h.run();
+    assert!(h.state().settings.cluster.disabled_gpus.contains("desk/gpu0"));
+    let shown = h.state().load.as_ref().unwrap().solved.clone().unwrap().unwrap();
+    assert_eq!(shown.ordinals(), vec![1], "{}", shown.strategy);
+    h.get_by_label_contains("fits on desk / GPU 1");
+    h.get_by_label_contains("GPU 1 layers 0-");
+    assert!(h.query_by_label_contains("GPU 0 layers").is_none());
+    click_load(&mut h);
+    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
+    let calls = seen.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let got = calls[0].solved.as_deref().expect("the engine is given the solved plan");
+    assert_eq!(got.ordinals(), vec![1]);
+    assert_eq!(calls[0].tp, 1);
+}
+
+#[test]
+fn the_dialog_lists_every_gpu_and_marks_the_one_driving_a_display() {
+    let mut h = two_gpu_27b_dialog("display-gpu");
+    h.state_mut().gpu[0].display = true;
+    h.run();
+    let line = h.get_by_label_contains("GPU 0  ").accesskit_node().label().unwrap_or_default().to_string();
+    assert!(line.contains("drives a display"), "{line}");
+    let other = h.get_by_label_contains("GPU 1  ").accesskit_node().label().unwrap_or_default().to_string();
+    assert!(!other.contains("drives a display"), "{other}");
+    assert!(other.contains("free of"), "{other}");
+}
+
+#[test]
+fn low_memory_on_two_gpus_plans_one_gpu_and_shows_one_plan_row() {
+    let mut h = two_gpu_27b_dialog("low-memory-one-gpu");
+    h.state_mut().load.as_mut().unwrap().choice.select(specrt::options::Profile::LowMemory);
+    h.run();
+    let rows = ["GPU 0 layers 0-", "GPU 1 layers 0-"].iter().map(|l| h.query_all_by_label_contains(l).count()).sum::<usize>();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn the_load_dialog_fits_every_window_size() {
+    for (w, hgt) in [(1024.0, 700.0), (1280.0, 800.0), (1920.0, 1080.0), (390.0, 844.0)] {
+        let mut h = two_gpu_27b_dialog_at(&format!("dialog-fit-{w}"), egui::vec2(w, hgt));
+        for key in ["load", "cancel"] {
+            let b = h.get_all_by_label(key).last().unwrap().accesskit_node().bounding_box().unwrap();
+            assert!(b.x0 >= 0.0 && b.x1 <= w as f64 && b.y0 >= 0.0 && b.y1 <= hgt as f64, "{key} at {b:?} outside {w}x{hgt}");
+        }
+        let hw = h.get_by_label_contains("GPU 1  ").accesskit_node().bounding_box().unwrap();
+        assert!(hw.x1 <= w as f64, "hardware row {hw:?} outside {w}");
+        h.state_mut().load.as_mut().unwrap().advanced = false;
+    }
+}
+
+#[test]
 fn the_dialog_shows_the_placement_strategy_for_each_profile() {
     let mut h = two_gpu_27b_dialog("strategy-lines");
-    h.get_by_label_contains("placement TP 2 across 2");
+    h.get_by_label_contains("placement TP 2 across desk / GPU 0 + desk / GPU 1");
     h.state_mut().load.as_mut().unwrap().choice.select(specrt::options::Profile::LowMemory);
     h.run();
     h.get_by_label_contains("smallest that fits");

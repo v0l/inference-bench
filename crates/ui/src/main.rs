@@ -147,14 +147,13 @@ impl App {
         (n >= self.max_loaded()).then(|| format!("{n} of {} allowed models are loaded: unload one, or raise the limit on the Server tab", self.max_loaded()))
     }
 
-    pub fn gpu_enabled(&self, ordinal: usize) -> bool {
-        let host = self.hardware.machine.as_ref().map_or_else(specrt::hardware::host_name, |m| m.host.clone());
-        let name = specrt::hardware::device_name(&host, ordinal);
-        !self.settings.cluster.disabled_gpus.contains(&name)
+    pub fn inventory(&self) -> inference_bench_core::inventory::Inventory {
+        let peers: Vec<specrt::cluster::Peer> = self.hardware.peers.values().cloned().collect();
+        inference_bench_core::inventory::inventory(self.hardware.machine.as_ref(), &self.gpu, &peers, &self.settings.cluster)
     }
 
     pub fn free_gpu_list(&self) -> Vec<u64> {
-        self.gpu.iter().enumerate().filter(|(i, _)| self.gpu_enabled(*i)).map(|(_, g)| g.available_bytes()).collect()
+        self.inventory().free_local()
     }
 
     pub fn free_gpu_bytes(&self) -> Option<u64> {
