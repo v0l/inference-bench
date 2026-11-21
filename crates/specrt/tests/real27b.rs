@@ -418,6 +418,7 @@ fn first_layers_match(fixture: &str, reference: &str, quant: Quant) {
     let dir = out_dir().join(fixture);
     let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     spec.mtp = None;
+    spec.runtime.split_activations = Some(true);
     spec.repo = dir.display().to_string();
     assert_eq!(spec.quant, quant);
     let meta: serde_json::Value =

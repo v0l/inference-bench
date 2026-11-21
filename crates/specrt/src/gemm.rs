@@ -68,6 +68,7 @@ pub fn tuning(opts: &RuntimeOptions) -> Tuning {
         },
         big: opts.big_tile.map(Tile::from_array),
         fp4_big: opts.fp4_tile.map(Tile::from_array),
+        fp8_huge: opts.fp8_tile.map(Tile::from_array),
         fp4_stages: opts.fp4_stages,
     }
 }

@@ -190,6 +190,7 @@ pub struct Tuning {
     pub tile: TileChoice,
     pub big: Option<Tile>,
     pub fp4_big: Option<Tile>,
+    pub fp8_huge: Option<Tile>,
     pub fp4_stages: Option<usize>,
 }
 
@@ -200,7 +201,7 @@ impl Tuning {
             Variant::Big => self.big.unwrap_or(BIG_DEFAULT),
             Variant::Narrow => Tile::NARROW,
             Variant::Tiny => Tile::TINY,
-            Variant::Huge => Tile::FP8_HUGE,
+            Variant::Huge => self.fp8_huge.unwrap_or(Tile::FP8_HUGE),
             Variant::Skinny => Tile::SKINNY,
             Variant::SkinnyWide => Tile::SKINNY_WIDE,
         }
@@ -753,7 +754,7 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
     Ok(match r.weight {
         WeightFormat::Fp8 if act_quant && fp8_act => {
             let scale = policy.fp8_weights.unwrap_or(Fp8Scale::Block);
-            let (name, tile) = if huge { (format!("{}_f8_huge", r.linear), Tile::FP8_HUGE) } else { (format!("{}_f8{suffix}", r.linear), tile) };
+            let (name, tile) = if huge { (format!("{}_f8_huge", r.linear), tuning.tile(Variant::Huge)) } else { (format!("{}_f8{suffix}", r.linear), tile) };
             let k = KernelInstance::fp8_act(t, &name, r.shape, tile, scale)?;
             let quant = match scale {
                 Fp8Scale::Block => "quant_rows_fp8",

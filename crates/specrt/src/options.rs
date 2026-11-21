@@ -301,6 +301,7 @@ const META: &[Meta] = &[
     Meta { key: "runtime.tile", label: "gemm tile", group: Group::Runtime, help: "Tile shape for matrix multiplies. Auto picks per shape.", choices: &["auto", "small", "big", "narrow"], range: (0, 0) },
     Meta { key: "runtime.big_tile", label: "big tile", group: Group::Runtime, help: "Explicit tile [m, n, k, stages] for the big choice. Auto uses the built in one.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.fp4_tile", label: "fp4 tile", group: Group::Runtime, help: "Explicit tile [m, n, k, stages] for the NVFP4 matrix multiply. Auto uses the built in one.", choices: &[], range: (0, 0) },
+    Meta { key: "runtime.fp8_tile", label: "fp8 tile", group: Group::Runtime, help: "Explicit tile [m, n, wm, wn] for the large FP8 prefill matrix multiply. Auto uses the built in one.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.fp4_stages", label: "fp4 stages", group: Group::Runtime, help: "Pipeline stages of the NVFP4 matrix multiply. Auto uses the built in count.", choices: &[], range: (1, 16) },
     Meta { key: "runtime.kv_f16_layers", label: "f16 kv layers", group: Group::Runtime, help: "With fp8 KV, how many of the first attention layers keep f16 KV. The early layers are the most sensitive. Auto keeps the first half up to 32k tokens of context and three quarters above it, where fewer f16 layers drift from f16.", choices: &[], range: (0, 256) },
     Meta { key: "runtime.prefill_chunk", label: "prefill chunk", group: Group::Runtime, help: "Tokens read per prefill pass. Auto sizes it from memory.", choices: &[], range: (16, 1 << 20) },
@@ -362,6 +363,7 @@ fn populated_runtime() -> RuntimeOptions {
         tile: TileChoice::Big,
         big_tile: Some([1, 1, 1, 1]),
         fp4_tile: Some([1, 1, 1, 1]),
+        fp8_tile: Some([1, 1, 1, 1]),
         fp4_stages: Some(1),
         prefill_chunk: Some(1),
         unsplit: vec!["x".into()],
@@ -486,8 +488,8 @@ mod tests {
         assert_eq!(default_of("serve.min_prefill_tokens"), Some(json!(d.min_prefill_tokens)));
         assert_eq!(default_of("serve.swap_space_gb"), Some(json!(d.swap_space_gb)));
         assert_eq!(default_of("serve.admit_lookahead"), Some(json!(d.admit_lookahead)));
-        assert_eq!(default_of("serve.prefill_burst_tokens"), Some(json!(0)));
-        assert_eq!(default_of("serve.max_long_in_flight"), Some(json!(1)));
+        assert_eq!(default_of("serve.prefill_burst_tokens"), Some(json!(16384)));
+        assert_eq!(default_of("serve.max_long_in_flight"), Some(json!(4)));
         let burst = EngineChoice { overrides: [("serve.prefill_burst_tokens".to_string(), json!(16384)), ("serve.max_long_in_flight".to_string(), json!(4))].into(), ..Default::default() };
         let o = burst.apply(ServeOptions::default()).unwrap();
         assert_eq!((o.prefill_burst_tokens, o.max_long_in_flight), (16384, 4));

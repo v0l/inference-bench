@@ -157,6 +157,8 @@ pub struct RuntimeOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fp4_tile: Option<[usize; 4]>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub fp8_tile: Option<[usize; 4]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fp4_stages: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_chunk: Option<usize>,
@@ -267,7 +269,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 
@@ -283,7 +285,7 @@ impl RuntimeOptions {
         ensure!(self.fp4_stages.is_none_or(|n| n >= 2), "[runtime] fp4_stages needs at least 2");
         ensure!(self.prefill_chunk.is_none_or(|n| n >= 64), "[runtime] prefill_chunk needs at least 64 tokens");
         ensure!(self.rope_extension.is_none_or(|e| e.factor >= 1), "[runtime] rope_extension factor must be at least 1");
-        for (key, tile) in [("big_tile", self.big_tile), ("fp4_tile", self.fp4_tile)] {
+        for (key, tile) in [("big_tile", self.big_tile), ("fp4_tile", self.fp4_tile), ("fp8_tile", self.fp8_tile)] {
             if let Some([bm, bn, wm, wn]) = tile {
                 ensure!(
                     wm > 0 && wn > 0 && bm.is_multiple_of(16 * wm) && bn.is_multiple_of(8 * wn),

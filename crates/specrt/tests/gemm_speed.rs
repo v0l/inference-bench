@@ -145,7 +145,12 @@ fn time_fp4(spec_name: &str) {
 }
 
 fn time(spec_name: &str, kernel_of: &dyn Fn(&str) -> (String, Tile), fp4: bool) {
-    let spec = spec(spec_name);
+    let mut spec = spec(spec_name);
+    let f8_tile = std::env::var("SPECRT_F8_TILE").ok().map(|t| {
+        let v: Vec<usize> = t.split('x').map(|x| x.parse().unwrap()).collect();
+        [v[0], v[1], v[2], v[3]]
+    });
+    spec.runtime.fp8_tile = f8_tile;
     let ctx = CudaContext::new(0).unwrap();
     let dir = std::env::temp_dir().join(format!("specrt-gemm-speed-{}", std::process::id()));
     let jit = Jit::new(ctx.clone(), dir).unwrap();
@@ -156,7 +161,10 @@ fn time(spec_name: &str, kernel_of: &dyn Fn(&str) -> (String, Tile), fp4: bool) 
     let linears: &[&str] = if fp4 { &["gate_up", "down"] } else { &["gate_up", "down", "lin_in"] };
     for &linear in linears {
         let (n, k, _, _) = specrt::codegen::linear_dims(&spec, linear);
-        let (kernel, tile) = kernel_of(linear);
+        let (kernel, mut tile) = kernel_of(linear);
+        if let Some(t) = f8_tile.filter(|_| kernel.ends_with("_huge")) {
+            tile = Tile::from_array(t);
+        }
         let smem = module.smem[kernel.as_str()];
         let fs: Vec<CudaFunction> = loaded
             .iter()
