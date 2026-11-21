@@ -133,6 +133,7 @@ fn validate(opts: &ServeOptions) -> Result<()> {
         r.loader.validate()?;
     }
     anyhow::ensure!(opts.max_batched_tokens >= 64, "serve.max_batched_tokens (batched tokens) must be at least 64");
+    anyhow::ensure!(opts.max_long_in_flight >= 1, "serve.max_long_in_flight (long prompts at once) must be at least 1");
     Ok(())
 }
 
@@ -161,6 +162,12 @@ fn apply_values(values: &BTreeMap<String, Value>, sparse: &BTreeMap<String, Valu
         }
         if let Some(v) = values.get("serve.admit_lookahead").and_then(Value::as_u64) {
             opts.admit_lookahead = v as usize;
+        }
+        if let Some(v) = values.get("serve.prefill_burst_tokens").and_then(Value::as_u64) {
+            opts.prefill_burst_tokens = v as usize;
+        }
+        if let Some(v) = values.get("serve.max_long_in_flight").and_then(Value::as_u64) {
+            opts.max_long_in_flight = v as usize;
         }
         if let Some(v) = values.get("serve.tp").and_then(Value::as_u64) {
             opts.tp = v as usize;
@@ -276,6 +283,8 @@ const META: &[Meta] = &[
     Meta { key: "serve.min_prefill_tokens", label: "guaranteed prefill per step", group: Group::Serving, help: "Prompt tokens read every step even when decoders already fill the inter-token target. Keeps time to first token bounded under load. 0 leaves prefill to the target alone.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "serve.swap_space_gb", label: "swap space", group: Group::Serving, help: "Gigabytes of pinned host memory where a preempted request parks its KV cache and state, instead of recomputing its prompt. 0 always recomputes.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "serve.admit_lookahead", label: "admission lookahead", group: Group::Serving, help: "Tokens of generation a new request and each running one reserve KV room for before another request is admitted. Fewer preemptions, later admission. 0 reserves the prompt only.", choices: &[], range: (0, 1 << 20) },
+    Meta { key: "serve.prefill_burst_tokens", label: "long prompt burst", group: Group::Serving, help: "Prompt tokens read per step while a prompt over 2048 tokens is waiting or being read, even when decoders fill the inter-token target. Long prompts start sooner, running streams wait longer between tokens. 0 leaves long prompts to the guaranteed prefill.", choices: &[], range: (0, 1 << 20) },
+    Meta { key: "serve.max_long_in_flight", label: "long prompts at once", group: Group::Serving, help: "Prompts over 2048 tokens read at the same time. More starts long prompts together instead of one after another.", choices: &[], range: (1, 64) },
     Meta { key: "speculative.enabled", label: "mtp", group: Group::Mtp, help: "Draft tokens with the model's own MTP head and verify them in one step. Output is unchanged.", choices: &[], range: (0, 0) },
     Meta { key: "speculative.draft_tokens", label: "draft tokens", group: Group::Mtp, help: "Tokens drafted per step. Auto uses the model spec, 2 on the 27B.", choices: &[], range: (1, crate::spec::MAX_DRAFT_TOKENS as u64) },
     Meta { key: "speculative.max_batch", label: "mtp batch limit", group: Group::Mtp, help: "Largest batch that still drafts. Auto uses the model spec.", choices: &[], range: (1, 64) },
@@ -330,16 +339,18 @@ struct ServeKnobs {
     min_prefill_tokens: usize,
     swap_space_gb: f64,
     admit_lookahead: usize,
+    prefill_burst_tokens: usize,
+    max_long_in_flight: usize,
     tp: usize,
 }
 
 fn knobs(o: &ServeOptions) -> ServeKnobs {
-    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp, solved: _ } = o;
-    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead, tp: *tp }
+    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, prefill_burst_tokens, max_long_in_flight, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp, solved: _ } = o;
+    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead, prefill_burst_tokens: *prefill_burst_tokens, max_long_in_flight: *max_long_in_flight, tp: *tp }
 }
 
 fn populated_knobs() -> ServeKnobs {
-    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, whole_prompt_tokens: 1, min_prefill_tokens: 1, swap_space_gb: 1.0, admit_lookahead: 1, tp: 1 }
+    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, whole_prompt_tokens: 1, min_prefill_tokens: 1, swap_space_gb: 1.0, admit_lookahead: 1, prefill_burst_tokens: 1, max_long_in_flight: 1, tp: 1 }
 }
 
 fn populated_runtime() -> RuntimeOptions {
@@ -475,6 +486,11 @@ mod tests {
         assert_eq!(default_of("serve.min_prefill_tokens"), Some(json!(d.min_prefill_tokens)));
         assert_eq!(default_of("serve.swap_space_gb"), Some(json!(d.swap_space_gb)));
         assert_eq!(default_of("serve.admit_lookahead"), Some(json!(d.admit_lookahead)));
+        assert_eq!(default_of("serve.prefill_burst_tokens"), Some(json!(0)));
+        assert_eq!(default_of("serve.max_long_in_flight"), Some(json!(1)));
+        let burst = EngineChoice { overrides: [("serve.prefill_burst_tokens".to_string(), json!(16384)), ("serve.max_long_in_flight".to_string(), json!(4))].into(), ..Default::default() };
+        let o = burst.apply(ServeOptions::default()).unwrap();
+        assert_eq!((o.prefill_burst_tokens, o.max_long_in_flight), (16384, 4));
         assert_eq!(default_of("serve.max_num_seqs"), Some(json!(d.max_num_seqs)));
         assert_eq!(default_of("serve.tp"), Some(json!(1)));
         let two = EngineChoice { overrides: [("serve.tp".to_string(), json!(2))].into(), ..Default::default() };

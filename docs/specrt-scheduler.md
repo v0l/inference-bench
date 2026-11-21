@@ -238,7 +238,8 @@ What the numbers say:
 
 Defaults: `itl_target_ms` stays 100, `whole_prompt_tokens` 1024 (see #655), `max_batch` unset. Both are in the load dialog
 (serving group) and in the server config (`whole_prompt_tokens`, `itl_target_ms`, `--whole-prompt-tokens`,
-`--itl-target-ms`). `RUST_LOG=inference_bench_specrt=debug` logs rows, MTP or plain, prefill tokens and step ms per step.
+`--itl-target-ms`). `prefill_burst_tokens` (default 0) and `max_long_in_flight` (default 1) set how prompts over 2,048
+tokens are read beside decoders (#603, `docs/perf/603-prefill-suspects.md`). `RUST_LOG=inference_bench_specrt=debug` logs rows, MTP or plain, prefill tokens and step ms per step.
 
 ## Guaranteed prefill share (#655)
 

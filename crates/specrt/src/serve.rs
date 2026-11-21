@@ -56,6 +56,8 @@ pub struct ServeOptions {
     pub min_prefill_tokens: usize,
     pub swap_space_gb: f64,
     pub admit_lookahead: usize,
+    pub prefill_burst_tokens: usize,
+    pub max_long_in_flight: usize,
     pub runtime: Option<RuntimeOptions>,
     pub speculative: SpeculativeOptions,
     pub placement: Option<crate::placement::PlacementConfig>,
@@ -79,6 +81,8 @@ impl Default for ServeOptions {
             min_prefill_tokens: 512,
             swap_space_gb: 0.0,
             admit_lookahead: 0,
+            prefill_burst_tokens: 0,
+            max_long_in_flight: 1,
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,
@@ -595,6 +599,8 @@ fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
         min_prefill_tokens: opts.min_prefill_tokens,
         swap_space_bytes: (opts.swap_space_gb * (1u64 << 30) as f64) as u64,
         admit_lookahead: opts.admit_lookahead,
+        prefill_burst_tokens: opts.prefill_burst_tokens,
+        max_long_in_flight: opts.max_long_in_flight,
         prefix_cache,
         ..Config::default()
     }

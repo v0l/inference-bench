@@ -512,6 +512,8 @@ pub struct Config {
     pub prefix_cache: PrefixCacheOptions,
     pub swap_space_bytes: u64,
     pub admit_lookahead: usize,
+    pub prefill_burst_tokens: usize,
+    pub max_long_in_flight: usize,
 }
 
 impl Default for Config {
@@ -528,6 +530,8 @@ impl Default for Config {
             prefix_cache: PrefixCacheOptions::default(),
             swap_space_bytes: 0,
             admit_lookahead: 0,
+            prefill_burst_tokens: 0,
+            max_long_in_flight: 1,
         }
     }
 }
@@ -1128,13 +1132,14 @@ impl<E: Executor> Scheduler<E> {
     fn admit(&mut self, budget: usize) -> Result<()> {
         let cap = self.cfg.max_num_seqs.min(self.exec.slots());
         let mut planned = 0;
-        let mut long_in_flight = self.cfg.shortest_first && self.running.iter().any(|s| s.prefill_target() - s.computed > LONG_PROMPT);
+        let mut long_in_flight = if self.cfg.shortest_first { self.running.iter().filter(|s| s.prefill_target() - s.computed > LONG_PROMPT).count() } else { 0 };
+        let long_cap = if self.cfg.shortest_first { self.cfg.max_long_in_flight.max(1) } else { usize::MAX };
         while let Some(s) = self.waiting.front() {
             if self.running.len() >= cap || self.free_slots.is_empty() || planned >= budget {
                 break;
             }
             let target = s.prefill_target();
-            if target > LONG_PROMPT && long_in_flight {
+            if target > LONG_PROMPT && long_in_flight >= long_cap {
                 break;
             }
             let need = blocks_for(target + 1);
@@ -1215,7 +1220,7 @@ impl<E: Executor> Scheduler<E> {
             s.admitted = self.admissions;
             let remaining = target - s.computed;
             if remaining > LONG_PROMPT {
-                long_in_flight = true;
+                long_in_flight += 1;
             } else {
                 planned += remaining;
             }
@@ -1365,7 +1370,14 @@ impl<E: Executor> Scheduler<E> {
         let fit = if fit > align { fit / align * align } else { align };
         let fit = fit.max(floor);
         let fit = fit.max(self.whole_prompt_remaining().unwrap_or(0));
+        let fit = if self.long_prompt_pending() { fit.max(self.cfg.prefill_burst_tokens) } else { fit };
         fit.min(full.max(align))
+    }
+
+    fn long_prompt_pending(&self) -> bool {
+        self.cfg.prefill_burst_tokens > 0
+            && (self.running.iter().any(|s| s.prefill_target().saturating_sub(s.computed) > LONG_PROMPT)
+                || self.waiting.iter().any(|s| s.prefill_target() > LONG_PROMPT))
     }
 
     fn whole_prompt_remaining(&self) -> Option<usize> {
@@ -1877,6 +1889,7 @@ mod tests {
             assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
             assert!(rows.len() <= self.spec_cap);
             self.spec_calls.push(rows.len());
+            std::thread::sleep(self.row_cost * rows.len() as u32);
             let mut out = Vec::new();
             for r in rows {
                 let pages = self.tables[r.slot].len() * PAGE;
@@ -2865,6 +2878,176 @@ mod tests {
                     pct(&mut r.short_ttft, 0.5), pct(&mut r.short_ttft, 0.95), pct(&mut r.long_ttft, 0.5), pct(&mut r.long_ttft, 1.0), r.long_tok_per_step, r.step_p95
                 );
             }
+        }
+    }
+
+    const LONG_TOKEN_COST: Duration = Duration::from_micros(20);
+    const LONG_ROW_COST: Duration = Duration::from_micros(1250);
+
+    fn long_fake() -> Fake {
+        let mut fake = Fake::new(20480, 26, 14000, 4096);
+        fake.light = true;
+        fake.token_cost = LONG_TOKEN_COST;
+        fake.row_cost = LONG_ROW_COST;
+        fake.spec_k = 2;
+        fake.spec_cap = 26;
+        fake
+    }
+
+    fn long_cfg(min_prefill_tokens: usize) -> Config {
+        Config { max_num_seqs: 26, max_batched_tokens: 16384, itl_target: Duration::from_millis(10), whole_prompt_tokens: 1024, min_prefill_tokens, ..Config::default() }
+    }
+
+    fn step_cost(r: &StepReport) -> f64 {
+        (LONG_TOKEN_COST * r.prefill_tokens as u32 + LONG_ROW_COST * r.decode_rows as u32).as_secs_f64() * SCALE
+    }
+
+    struct Beside {
+        steps_to_first_token: usize,
+        long_running_max: usize,
+    }
+
+    fn long_prompts_beside_decoders(cfg: Config, longs: usize) -> Beside {
+        let mut s = Scheduler::new(long_fake(), cfg);
+        for q in 0..8u32 {
+            s.submit(request(64, 5000, q)).unwrap();
+        }
+        let mut events = Vec::new();
+        for _ in 0..6 {
+            s.step(&mut events).unwrap();
+        }
+        let ids: Vec<SeqId> = (0..longs).map(|i| s.submit(request(16384, 4, 500 + i as u32)).unwrap()).collect();
+        let mut steps = 0;
+        let mut long_running_max = 0;
+        loop {
+            let mut ev = Vec::new();
+            s.step(&mut ev).unwrap();
+            steps += 1;
+            let long_running = s.running.iter().filter(|q| ids.contains(&q.id) && q.prefill_target() - q.computed > LONG_PROMPT).count();
+            long_running_max = long_running_max.max(long_running);
+            if ev.iter().any(|e| matches!(e, Event::Token { id, .. } if *id == ids[0])) {
+                return Beside { steps_to_first_token: steps, long_running_max };
+            }
+            assert!(steps < 400, "the long prompt never finished");
+        }
+    }
+
+    #[test]
+    fn a_long_prompt_beside_decoders_is_read_in_burst_sized_steps() {
+        let old = long_prompts_beside_decoders(long_cfg(512), 1);
+        assert!(old.steps_to_first_token >= 30, "the 512 floor reads 16k in about 32 steps, got {}", old.steps_to_first_token);
+        let burst = long_prompts_beside_decoders(Config { prefill_burst_tokens: 16384, ..long_cfg(512) }, 1);
+        assert!(burst.steps_to_first_token <= 6, "a 16k prompt took {} steps", burst.steps_to_first_token);
+    }
+
+    #[test]
+    fn several_long_prompts_may_prefill_at_once() {
+        let old = long_prompts_beside_decoders(long_cfg(512), 4);
+        assert_eq!(old.long_running_max, 1, "one long prompt in flight by default");
+        let wide = long_prompts_beside_decoders(Config { max_long_in_flight: 4, ..long_cfg(512) }, 4);
+        assert_eq!(wide.long_running_max, 4);
+    }
+
+    struct LongLoad {
+        ttft: Vec<f64>,
+        gaps: Vec<f64>,
+        stream_tok_s: Vec<f64>,
+        prefill_tok_s: f64,
+        running_mean: f64,
+    }
+
+    fn long_load(cfg: Config, requests: usize) -> LongLoad {
+        let mut s = Scheduler::new(long_fake(), cfg);
+        let mut clock = 0.0f64;
+        let mut queued: VecDeque<(usize, f64)> = VecDeque::new();
+        let mut sent: HashMap<SeqId, f64> = HashMap::new();
+        let mut tokens_at: HashMap<SeqId, Vec<f64>> = HashMap::new();
+        let (mut arrived, mut in_flight, mut done) = (0usize, 0usize, 0usize);
+        let (mut prompt_tokens, mut prefill_time) = (0usize, 0.0f64);
+        let (mut running_sum, mut steps) = (0usize, 0usize);
+        let mut ttft = Vec::new();
+        while done < requests {
+            while arrived < requests && arrived as f64 <= clock {
+                queued.push_back((arrived, clock));
+                arrived += 1;
+            }
+            while in_flight < 8 && let Some((i, _)) = queued.pop_front() {
+                let len = 15000 + (i * 7919) % 3000;
+                let out = 256 + (i * 104729) % 256;
+                let id = s.submit(request(len, out, 1000 + i as u32)).unwrap();
+                sent.insert(id, clock);
+                in_flight += 1;
+            }
+            if s.idle() {
+                clock = clock.max(arrived as f64);
+                continue;
+            }
+            let mut ev = Vec::new();
+            let r = s.step(&mut ev).unwrap();
+            let cost = step_cost(&r);
+            clock += cost;
+            steps += 1;
+            running_sum += s.running();
+            if r.prefill_tokens > 0 {
+                prompt_tokens += r.prefill_tokens;
+                prefill_time += cost;
+            }
+            for e in &ev {
+                match e {
+                    Event::Token { id, .. } => {
+                        let at = tokens_at.entry(*id).or_default();
+                        if at.is_empty() {
+                            ttft.push(clock - sent[id]);
+                        }
+                        at.push(clock);
+                    }
+                    Event::Finished { .. } => {
+                        in_flight -= 1;
+                        done += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(steps < 200_000, "the load never drained");
+        }
+        let mut gaps = Vec::new();
+        let mut stream_tok_s = Vec::new();
+        for at in tokens_at.values() {
+            gaps.extend(at.windows(2).map(|w| w[1] - w[0]).filter(|g| *g > 0.0));
+            if at.len() > 1 {
+                stream_tok_s.push((at.len() - 1) as f64 / (at[at.len() - 1] - at[0]));
+            }
+        }
+        LongLoad { ttft, gaps, stream_tok_s, prefill_tok_s: prompt_tokens as f64 / prefill_time, running_mean: running_sum as f64 / steps as f64 }
+    }
+
+    #[test]
+    #[ignore]
+    fn print_long_prompt_table() {
+        let base = long_cfg(512);
+        for (name, cfg) in [
+            ("default", base),
+            ("min4096", Config { min_prefill_tokens: 4096, ..base }),
+            ("min16384", Config { min_prefill_tokens: 16384, ..base }),
+            ("burst16384", Config { prefill_burst_tokens: 16384, ..base }),
+            ("long4", Config { max_long_in_flight: 4, ..base }),
+            ("burst16384+long4", Config { prefill_burst_tokens: 16384, max_long_in_flight: 4, ..base }),
+            ("burst8192+long4", Config { prefill_burst_tokens: 8192, max_long_in_flight: 4, ..base }),
+        ] {
+            let mut r = long_load(cfg, 24);
+            let n = r.ttft.len();
+            println!(
+                "{name}: ttft p50 {:.1} p95 {:.1} last {:.1} s, prefill {:.0} tok/s, running mean {:.1}, stream decode p50 {:.1} tok/s, step gap p50 {:.0} p99 {:.0} max {:.0} ms",
+                pct(&mut r.ttft.clone(), 0.5),
+                pct(&mut r.ttft.clone(), 0.95),
+                r.ttft[n - 1],
+                r.prefill_tok_s,
+                r.running_mean,
+                pct(&mut r.stream_tok_s, 0.5),
+                pct(&mut r.gaps.clone(), 0.5) * 1e3,
+                pct(&mut r.gaps.clone(), 0.99) * 1e3,
+                pct(&mut r.gaps, 1.0) * 1e3,
+            );
         }
     }
 
