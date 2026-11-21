@@ -20,7 +20,9 @@ fn fixture_spec(name: &str) -> Spec {
         return Spec::load(&root.join(name)).unwrap();
     }
     let dir = root.join(name);
-    Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap()
+    let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    spec.runtime.split_activations = Some(true);
+    spec
 }
 
 fn check(spec: &Spec, label: &str, token_counts: &[usize]) -> Option<()> {

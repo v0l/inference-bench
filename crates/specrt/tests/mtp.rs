@@ -33,6 +33,7 @@ fn spec(k: usize) -> Spec {
     let mut s = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     s.name = "tiny-qwen3.5-mtp".into();
     s.repo = dir.display().to_string();
+    s.runtime.split_activations = Some(true);
     s.mtp.as_mut().unwrap().draft_tokens = k;
     s.mtp.as_mut().unwrap().graph = true;
     s.mtp.as_mut().unwrap().head_quant = Some(Quant::Bf16);
@@ -613,6 +614,7 @@ fn moe_spec(k: usize) -> Spec {
     let mut s = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     s.name = "tiny-qwen3.5-moe-mtp".into();
     s.repo = dir.display().to_string();
+    s.runtime.split_activations = Some(true);
     s.mtp.as_mut().unwrap().draft_tokens = k;
     s.mtp.as_mut().unwrap().graph = true;
     s.mtp.as_mut().unwrap().head_quant = Some(Quant::Bf16);

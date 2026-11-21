@@ -18,6 +18,7 @@ fn spec_for(dir: &str, head: Option<Quant>) -> Spec {
             let mut spec = Spec::from_hf_config(&json).unwrap();
             spec.name = dir.into();
             spec.repo = fixture_dir(dir).display().to_string();
+            spec.runtime.split_activations = Some(true);
             spec
         }
     };
