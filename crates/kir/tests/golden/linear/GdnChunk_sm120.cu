@@ -1,5 +1,5 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
-// linear GdnChunk threads=256 smem=50176 chunk=64 ksplit=4 cols=16
+// linear GdnChunk threads=256 smem=50176 chunk=64 ksplit=4 cols=32
 //   LinearShape { key_heads: 16, value_heads: 48, head_dim: 128, conv_kernel: 4, tiled_value_heads: false }
 constexpr int LA_KH = 16;
 constexpr int LA_VH = 48;
@@ -24,7 +24,7 @@ constexpr int LA_CHUNK = 64;
 constexpr int LA_KSPLIT = 4;
 constexpr int LA_KS = LA_D + 1;
 constexpr int LA_AS = LA_CHUNK + 1;
-constexpr int LA_COLS = 16;
+constexpr int LA_COLS = 32;
 constexpr float LA_L2_EPS = 1e-6f;
 static_assert(LA_D % LA_COLS == 0 && LA_D <= 128, "linear head dim");
 static_assert(LA_VH % LA_KH == 0, "linear head groups");
