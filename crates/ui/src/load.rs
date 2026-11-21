@@ -40,7 +40,11 @@ pub struct LoadDialog {
     pub texts: BTreeMap<String, String>,
     pub anatomy: Option<ModelAnatomy>,
     native_max: usize,
+    auto_extension: bool,
 }
+
+const MAX_EXTENSION: usize = 16;
+const DEFAULT_EXTENSION: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProfilePick {
@@ -186,7 +190,7 @@ impl LoadDialog {
             }
             _ => (ctx, kv_gb),
         };
-        let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, texts: BTreeMap::new(), anatomy: None, native_max: max };
+        let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, texts: BTreeMap::new(), anatomy: None, native_max: max, auto_extension: false };
         dialog.sync();
         if app.settings.kv_gb_for(&model.name).is_none() && fitted.is_none() {
             dialog.shrink_pool_to_plan(&crate::hardware::load_devices(app), app.settings.cluster.objective);
@@ -240,10 +244,33 @@ impl LoadDialog {
         if self.native_max == 0 {
             self.native_max = a.max_context;
         }
-        a.max_context = self.native_max * self.extension_factor();
+        a.max_context = self.native_max * MAX_EXTENSION;
         self.max = max_context(&a);
         self.ctx = self.ctx.min(self.max);
         self.anatomy = Some(a);
+        self.follow_context();
+    }
+
+    fn follow_context(&mut self) {
+        let native = self.native_max.max(1);
+        let yarn = self.choice.value("runtime.rope_extension.type").as_str() == Some("yarn");
+        if yarn && self.choice.value("runtime.rope_extension.factor").as_u64().is_none() {
+            self.choice.set("runtime.rope_extension.factor", json!(DEFAULT_EXTENSION));
+        }
+        if self.ctx > native {
+            let needed = self.ctx.div_ceil(native).min(MAX_EXTENSION);
+            if !yarn {
+                self.choice.set("runtime.rope_extension.type", json!("yarn"));
+                self.auto_extension = true;
+            }
+            if needed > self.extension_factor() || !yarn || self.auto_extension {
+                self.choice.set("runtime.rope_extension.factor", json!(needed));
+            }
+        } else if self.auto_extension {
+            self.choice.reset("runtime.rope_extension.type");
+            self.choice.reset("runtime.rope_extension.factor");
+            self.auto_extension = false;
+        }
     }
 
     pub fn plan_context(&self) -> Option<usize> {
@@ -395,8 +422,9 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                     }
                 });
                 if dialog.view.is_ok() {
-                    let note = if dialog.extension_factor() > 1 { format!("{} tokens, {} trained x {} YaRN", dialog.max, dialog.native_max, dialog.extension_factor()) } else { format!("{} tokens", dialog.max) };
+                    let note = if dialog.max > dialog.native_max { format!("{} tokens trained, up to {} with YaRN", dialog.native_max, dialog.max) } else { format!("{} tokens", dialog.max) };
                     Line::new().legend("model maximum").value(note).size(11.0).show(ui);
+                    Line::new().note("Going past the trained length turns on YaRN, which changes short-context numerics slightly. Keep the context at or under the trained length unless you need more.").size(10.5).show(ui);
                 }
             });
             ui.add_space(8.0);

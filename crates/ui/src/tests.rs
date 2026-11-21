@@ -243,7 +243,7 @@ fn the_context_slider_stops_at_the_models_own_maximum() {
     let dialog = h.state().load.as_ref().unwrap();
     let spec_max = dialog.view.as_ref().unwrap().anatomy.max_context;
     assert_eq!(spec_max, 40960);
-    assert_eq!(dialog.max, spec_max);
+    assert_eq!(dialog.max, spec_max * 16);
     h.get_by_label("LOAD QWEN3-0.6B");
 }
 
@@ -261,7 +261,7 @@ fn the_27b_config_gives_the_load_dialog_a_262144_maximum() {
     h.state_mut().open_load_dialog(&m);
     h.run();
     let dialog = h.state().load.as_ref().unwrap();
-    assert_eq!(dialog.max, 262144);
+    assert_eq!(dialog.max, 262144 * 16);
     assert_eq!(crate::load::max_context(&dialog.view.as_ref().unwrap().anatomy), 262144);
 }
 
@@ -727,7 +727,7 @@ fn the_load_dialog_has_a_parallel_requests_slider_and_the_estimate_grows_with_it
     dialog.kv_gb = 1.0;
     let four = dialog.estimate(free).unwrap();
     assert_eq!(four.kv, 1 << 30);
-    assert_eq!(dialog.max, crate::load::max_context(&dialog.view.as_ref().unwrap().anatomy));
+    assert_eq!(dialog.max, crate::load::max_context(&dialog.view.as_ref().unwrap().anatomy) * 16);
     assert_eq!(four.weights, one.weights);
     let a = detail_view("seqs-27b", Some("qwen3.8-27b-exact.toml")).anatomy;
     let (a1, a4) = (crate::load::estimate(&a, 1 << 30, 1, None), crate::load::estimate(&a, 1 << 30, 4, None));
@@ -762,8 +762,8 @@ fn the_load_dialog_slider_runs_to_the_model_max_with_four_parallel_requests() {
     let d = h.state_mut().load.as_mut().unwrap();
     d.seqs = 4;
     let a = &d.view.as_ref().unwrap().anatomy;
-    assert_eq!(d.max, crate::load::max_context(a));
-    d.ctx = d.max;
+    assert_eq!(d.max, crate::load::max_context(a) * 16);
+    d.ctx = crate::load::max_context(a);
     assert!(d.estimate(Some(96 << 30)).unwrap().kv <= (96u64 << 30));
 }
 
@@ -2024,11 +2024,28 @@ fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_ca
     h.state_mut().open_load_dialog(&m);
     h.run();
     let dialog = h.state_mut().load.as_mut().unwrap();
-    assert_eq!(dialog.max, 262144);
+    assert_eq!(dialog.max, 262144 * 16);
+    assert_eq!(dialog.max, 262144 * 16);
+    dialog.ctx = 1_048_576;
+    dialog.sync();
+    assert_eq!(dialog.choice.value("runtime.rope_extension.type").as_str(), Some("yarn"));
+    assert_eq!(dialog.extension_factor(), 4);
+    dialog.ctx = 262144 * 2 + 1;
+    dialog.sync();
+    assert_eq!(dialog.extension_factor(), 3);
+    dialog.ctx = 262144;
+    dialog.sync();
+    assert_eq!(dialog.choice.value("runtime.rope_extension.type").as_str(), None);
+    assert_eq!(dialog.extension_factor(), 1);
+    dialog.choice.set("runtime.rope_extension.type", serde_json::json!("yarn"));
+    dialog.sync();
+    assert_eq!(dialog.extension_factor(), 4);
+    dialog.choice.reset("runtime.rope_extension.type");
+    dialog.choice.reset("runtime.rope_extension.factor");
     dialog.choice.set("runtime.rope_extension.factor", serde_json::json!(4));
     dialog.sync();
-    assert_eq!(dialog.max, 1_048_576);
-    dialog.ctx = dialog.max;
+    assert_eq!(dialog.max, 262144 * 16);
+    dialog.ctx = 1_048_576;
     dialog.seqs = 1;
     let kv = dialog.estimate(Some(96 << 30)).unwrap().kv;
     let gib = kv as f64 / (1u64 << 30) as f64;
@@ -2043,8 +2060,8 @@ fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_ca
     assert_eq!(dialog.serve_options().unwrap().runtime.unwrap().rope_extension.unwrap().factor, 4);
     dialog.choice.reset("runtime.rope_extension.factor");
     dialog.sync();
-    assert_eq!(dialog.max, 262144);
-    assert_eq!(dialog.ctx, 262144);
+    assert_eq!(dialog.max, 262144 * 16);
+    assert_eq!(dialog.ctx, 262144 * 4);
 }
 
 fn fixture_spec_model() -> LocalModel {
