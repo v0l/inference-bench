@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cli;
+pub mod capabilities;
 pub mod config;
 pub mod connect;
 pub mod dialects;

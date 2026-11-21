@@ -7,6 +7,7 @@ pub mod chat;
 pub mod cluster;
 pub mod conversations;
 pub mod discover;
+pub mod doctor;
 pub mod engine;
 pub mod fit;
 pub mod gpu;
