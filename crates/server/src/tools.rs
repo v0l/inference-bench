@@ -83,6 +83,7 @@ pub struct OutputParser {
     tools: Vec<Value>,
     tool_parsing: bool,
     json_calls: bool,
+    raw: Option<(RawFormat, RawPhase)>,
     state: State,
     buffer: String,
     slots: Vec<Slot>,
@@ -90,6 +91,39 @@ pub struct OutputParser {
     deferred_ws: String,
     content: String,
     reasoning: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RawFormat {
+    TagList,
+    BareJson,
+    NamedList,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RawPhase {
+    Undecided,
+    Collect,
+    Plain,
+}
+
+impl RawFormat {
+    pub fn from_parser(name: &str) -> Option<Self> {
+        match name {
+            "tool_call_list" => Some(Self::TagList),
+            "bare_json" => Some(Self::BareJson),
+            "functools_list" => Some(Self::NamedList),
+            _ => None,
+        }
+    }
+
+    fn markers(self) -> &'static [&'static str] {
+        match self {
+            Self::TagList => &["<|tool_call|>"],
+            Self::BareJson => &["{", "<|python_tag|>"],
+            Self::NamedList => &["functools"],
+        }
+    }
 }
 
 enum Lex {
@@ -103,6 +137,7 @@ impl OutputParser {
             tools: tools.to_vec(),
             tool_parsing,
             json_calls: false,
+            raw: None,
             state: if reasoning { State::Reasoning } else { State::Content },
             buffer: String::new(),
             slots: Vec::new(),
@@ -118,15 +153,85 @@ impl OutputParser {
         self
     }
 
+    pub fn raw_json(mut self, format: RawFormat) -> Self {
+        self.json_calls = true;
+        self.raw = Some((format, RawPhase::Undecided));
+        self
+    }
+
+    pub fn for_parser(self, name: Option<&str>) -> Self {
+        match name {
+            Some("hermes") => self.hermes(),
+            Some(n) => match RawFormat::from_parser(n) {
+                Some(f) if self.tool_parsing => self.raw_json(f),
+                _ => self,
+            },
+            None => self,
+        }
+    }
+
     pub fn feed(&mut self, text: &str) -> Vec<Delta> {
         self.buffer.push_str(text);
         let mut out = Vec::new();
+        if self.raw.is_some() {
+            self.raw_feed(&mut out);
+            return out;
+        }
         self.drain(false, &mut out);
         out
     }
 
+    fn raw_feed(&mut self, out: &mut Vec<Delta>) {
+        let Some((format, phase)) = self.raw else { return };
+        match phase {
+            RawPhase::Collect => {}
+            RawPhase::Plain => {
+                let text = std::mem::take(&mut self.buffer);
+                self.push_content(text, out);
+            }
+            RawPhase::Undecided => {
+                let t = self.buffer.trim_start();
+                if t.is_empty() {
+                    return;
+                }
+                if format.markers().iter().any(|m| t.starts_with(m)) {
+                    self.raw = Some((format, RawPhase::Collect));
+                } else if format.markers().iter().any(|m| m.starts_with(t)) {
+                } else {
+                    self.raw = Some((format, RawPhase::Plain));
+                    let text = std::mem::take(&mut self.buffer);
+                    self.push_content(text, out);
+                }
+            }
+        }
+    }
+
+    fn raw_finish(&mut self, out: &mut Vec<Delta>) {
+        let Some((format, phase)) = self.raw else { return };
+        let whole = std::mem::take(&mut self.buffer);
+        match phase {
+            RawPhase::Plain => {}
+            RawPhase::Undecided => {
+                if !whole.is_empty() {
+                    self.push_content(whole, out);
+                }
+            }
+            RawPhase::Collect => {
+                let t = whole.trim_start();
+                let body = format.markers().iter().find_map(|m| t.strip_prefix(m).filter(|_| *m != "{")).unwrap_or(t);
+                self.slots.push(Slot { raw: whole.clone(), args: body.to_string(), ..Slot::default() });
+                let index = self.slots.len() - 1;
+                self.end_json_call(index, "", out);
+            }
+        }
+        self.raw = Some((format, RawPhase::Plain));
+    }
+
     pub fn finish(&mut self) -> Vec<Delta> {
         let mut out = Vec::new();
+        if self.raw.is_some() {
+            self.raw_finish(&mut out);
+        }
         self.drain(true, &mut out);
         if matches!(self.state, State::Preamble | State::Name | State::Args | State::Between) {
             self.end_call(&mut out, "");
@@ -370,7 +475,13 @@ impl OutputParser {
     fn end_json_call(&mut self, index: usize, closer: &str, out: &mut Vec<Delta>) {
         self.slots[index].ended = true;
         let text = self.slots[index].args.trim().to_string();
-        let calls = self.json_calls_in(&text);
+        let mut calls = self.json_calls_in(&text);
+        if calls.is_empty() && self.raw.is_some_and(|(f, _)| f == RawFormat::BareJson) && text.contains(';') {
+            let parts: Vec<Vec<(String, String)>> = text.split(';').map(|p| self.json_calls_in(p.trim())).collect();
+            if parts.iter().all(|p| !p.is_empty()) {
+                calls = parts.into_iter().flatten().collect();
+            }
+        }
         if calls.is_empty() {
             return self.drop_slot_as_text(index, closer, out);
         }
@@ -407,6 +518,10 @@ impl OutputParser {
                 None => return Vec::new(),
             },
         };
+        let values = values.into_iter().flat_map(|v| match v {
+            Value::Array(items) => items,
+            v => vec![v],
+        });
         let mut calls = Vec::new();
         for v in values {
             let Some(name) = v["name"].as_str().and_then(|n| self.resolve(n)) else { return Vec::new() };

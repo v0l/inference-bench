@@ -1017,3 +1017,55 @@ fn purge_sessions_deletes_every_snapshot_under_the_configured_dir() {
     assert_eq!(args.purge().unwrap(), 2);
     assert!(SessionStore::open(&dir, store.compat().clone()).unwrap().list().is_empty());
 }
+
+#[test]
+fn capabilities_lists_routes_fields_and_models() {
+    let rig = start(config("[[models]]\nid='a'\nmax_ctx=4096\n[[models]]\nid='b'"), Shape::default());
+    let (status, body, _) = rig.get("/v1/capabilities", None);
+    assert_eq!(status, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let routes = v["routes"].as_array().unwrap();
+    let chat = routes.iter().find(|r| r["path"] == "/v1/chat/completions").unwrap();
+    let fields: Vec<&str> = chat["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect();
+    for want in ["model", "messages", "tools", "response_format", "logprobs"] {
+        assert!(fields.contains(&want), "{want} missing from {fields:?}");
+    }
+    assert!(!fields.contains(&"prompt"));
+    assert!(routes.iter().any(|r| r["path"] == "/v1/capabilities"));
+    let ids: Vec<&str> = v["models"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["a", "b"]);
+    assert_eq!(v["models"][0]["max_ctx"], 4096);
+    rig.stop();
+}
+
+#[test]
+fn every_manifest_field_is_accepted_by_the_handler_and_an_unlisted_one_is_refused() {
+    let rig = start(config("[[models]]\nid='m'"), Shape::default());
+    let (_, body, _) = rig.get("/v1/capabilities", None);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let chat_route = v["routes"].as_array().unwrap().iter().find(|r| r["path"] == "/v1/chat/completions").unwrap();
+    let skipped = ["messages", "model", "stream", "tools", "tool_choice", "n", "logprobs", "top_logprobs", "response_format", "reasoning", "stream_options", "stop"];
+    for f in chat_route["fields"].as_array().unwrap() {
+        let name = f["name"].as_str().unwrap();
+        let value = match f["status"].as_str().unwrap() {
+            "zero_only" => json!(0),
+            _ if skipped.contains(&name) => continue,
+            _ => match f["type"].as_str().unwrap() {
+                "integer" => json!(1),
+                "number" => json!(0.5),
+                "boolean" => json!(false),
+                "object" => json!({}),
+                _ => json!("x"),
+            },
+        };
+        let mut body = chat("m", false);
+        body[name] = value;
+        let (status, text, _) = rig.post("/v1/chat/completions", None, body);
+        assert_eq!(status, 200, "{name}: {text}");
+    }
+    let mut body = chat("m", false);
+    body["not_a_field"] = json!(1);
+    let (status, _, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 400);
+    rig.stop();
+}

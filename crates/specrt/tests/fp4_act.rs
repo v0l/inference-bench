@@ -36,11 +36,12 @@ fn native_fp4_prefill_matches_the_activation_quantised_reference() {
     let dir = root().join("tests/fixtures/tiny-qwen3.5-nvfp4");
     let mut spec = Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
     spec.repo = dir.display().to_string();
+    spec.runtime.split_activations = Some(true);
     spec.mlp.act_quant = specrt::spec::ActQuant::Fp4;
     spec.validate().unwrap();
     let ids = tokens("tinynvfp4act-prefill.json");
     let mut rt = Runtime::load(&spec, 2048).unwrap();
-    assert_eq!(rt.arch, "compute_120");
+    assert!(rt.arch.starts_with("compute_12"), "{}", rt.arch);
     let ours = rt.prompt_logits(&ids).unwrap();
     let trace = rt.trace_prefill(&ids).unwrap();
     let theirs = floats("tinynvfp4act-prefill.layers.bin");

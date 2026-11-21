@@ -14,6 +14,8 @@ enum Node {
     Str,
     Num { int: bool },
     Lit(u32),
+    Seq(Vec<(u32, bool)>),
+    Raw(u32),
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +33,8 @@ enum Frame {
     Num { phase: u8, int: bool },
     Obj { node: u32, next: u16, phase: u8 },
     Arr { node: u32, phase: u8 },
+    Seq { node: u32, next: u16 },
+    Raw { lit: u32, matched: u16 },
 }
 
 type Stack = Vec<Frame>;
@@ -182,6 +186,77 @@ impl Compiled {
             None if obj.contains_key("items") => self.typed(root, obj, "array", refs, depth),
             None => Ok(ANY),
         }
+    }
+
+    fn raw_lit(&mut self, text: &str) -> u32 {
+        let id = self.lit_id(text.as_bytes());
+        self.push(Node::Lit(id))
+    }
+
+    fn xml_param(&mut self, params: &Value, key: &str, schema: &Value, refs: &mut HashMap<String, u32>) -> Result<u32, String> {
+        let open = self.raw_lit(&format!("<parameter={key}>\n"));
+        let close_text = "\n</parameter>\n";
+        let strings: Option<Vec<&str>> = schema.get("enum").and_then(|e| e.as_array()).and_then(|e| e.iter().map(|v| v.as_str()).collect());
+        let (value, close) = match (strings, schema.get("type").and_then(|t| t.as_str())) {
+            (Some(list), _) if !list.is_empty() => {
+                let alts: Vec<u32> = list.iter().map(|v| self.raw_lit(v)).collect();
+                (self.push(Node::AnyOf(alts)), self.raw_lit(close_text))
+            }
+            (_, Some("string")) => {
+                let end = self.lit_id(b"\n</parameter>");
+                (self.push(Node::Raw(end)), self.raw_lit("\n"))
+            }
+            _ => (self.schema(params, schema, refs, 1)?, self.raw_lit(close_text)),
+        };
+        Ok(self.push(Node::Seq(vec![(open, false), (value, false), (close, false)])))
+    }
+
+    fn tool_call(&mut self, tool: &Value, xml: bool) -> Result<u32, String> {
+        let function = &tool["function"];
+        let name = function["name"].as_str().ok_or("a tool needs a name")?;
+        let params = &function["parameters"];
+        let mut elems = Vec::new();
+        if xml {
+            elems.push((self.raw_lit(&format!("<tool_call>\n<function={name}>\n")), false));
+            if let Some(props) = params["properties"].as_object() {
+                let required: Vec<&str> = params["required"].as_array().map(|r| r.iter().filter_map(|x| x.as_str()).collect()).unwrap_or_default();
+                for (key, sub) in props {
+                    let mut refs = HashMap::new();
+                    let node = self.xml_param(params, key, sub, &mut refs)?;
+                    elems.push((node, !required.contains(&key.as_str())));
+                }
+            }
+            elems.push((self.raw_lit("</function>\n</tool_call>"), false));
+        } else {
+            let head = format!("<tool_call>\n{{\"name\": {}, \"arguments\": ", Value::String(name.to_string()));
+            elems.push((self.raw_lit(&head), false));
+            let args = match params {
+                Value::Object(_) => self.schema(params, params, &mut HashMap::new(), 1)?,
+                _ => self.raw_lit("{}"),
+            };
+            elems.push((args, false));
+            elems.push((self.raw_lit("}\n</tool_call>"), false));
+        }
+        Ok(self.push(Node::Seq(elems)))
+    }
+
+    fn tools(tools: &[Value], xml: bool, only: Option<&str>) -> Result<(Self, u32), String> {
+        let mut c = Compiled::new();
+        let mut alts = Vec::new();
+        for tool in tools {
+            if only.is_some_and(|n| tool["function"]["name"].as_str() != Some(n)) {
+                continue;
+            }
+            alts.push(c.tool_call(tool, xml)?);
+        }
+        if alts.is_empty() {
+            return Err(match only {
+                Some(n) => format!("tool_choice names {n:?}, which is not in tools"),
+                None => "tool_choice required needs at least one tool".into(),
+            });
+        }
+        let root = if alts.len() == 1 { alts[0] } else { c.push(Node::AnyOf(alts)) };
+        Ok((c, root))
     }
 
     fn values(&mut self, list: &[Value]) -> u32 {
@@ -410,6 +485,37 @@ impl Grammar {
             },
             Frame::Obj { node, next, phase } => self.feed_object(node, next, phase, st, b, out),
             Frame::Arr { node, phase } => self.feed_array(node, phase, st, b, out),
+            Frame::Seq { node, next } => self.begin_seq(node, next as usize, b, st, out),
+            Frame::Raw { lit, matched } => self.feed_raw(lit, matched, st, b, out),
+        }
+    }
+
+    fn begin_seq(&self, n: u32, from: usize, b: u8, st: Stack, out: &mut Vec<Stack>) {
+        let Node::Seq(elems) = self.node(n) else { return };
+        for (j, &(elem, optional)) in elems.iter().enumerate().skip(from) {
+            let mut cand = st.clone();
+            if j + 1 < elems.len() {
+                cand.push(Frame::Seq { node: n, next: (j + 1) as u16 });
+            }
+            self.begin(elem, b, cand, out);
+            if !optional {
+                break;
+            }
+        }
+    }
+
+    fn feed_raw(&self, lit: u32, matched: u16, mut st: Stack, b: u8, out: &mut Vec<Stack>) {
+        let end = &self.compiled.lits[lit as usize];
+        let next = if end[matched as usize] == b {
+            matched + 1
+        } else {
+            u16::from(b == end[0])
+        };
+        if next as usize == end.len() {
+            out.push(st);
+        } else {
+            st.push(Frame::Raw { lit, matched: next });
+            out.push(st);
         }
     }
 
@@ -448,6 +554,8 @@ impl Grammar {
                 st.push(Frame::Num { phase, int: *int });
                 out.push(st);
             }
+            Node::Seq(_) => self.begin_seq(n, 0, b, st, out),
+            Node::Raw(lit) => self.feed_raw(*lit, 0, st, b, out),
             Node::Array { .. } => {
                 if b == b'[' {
                     st.push(Frame::Arr { node: n, phase: 0 });
@@ -564,11 +672,18 @@ impl Grammar {
     }
 
     fn complete(&self, state: &State) -> bool {
-        state.0.iter().any(|s| match s.as_slice() {
-            [] => true,
-            [Frame::Num { phase, .. }] => num_complete(*phase),
+        state.0.iter().any(|s| s.iter().all(|f| self.frame_can_end(f)))
+    }
+
+    fn frame_can_end(&self, f: &Frame) -> bool {
+        match f {
+            Frame::Num { phase, .. } => num_complete(*phase),
+            Frame::Seq { node, next } => match self.node(*node) {
+                Node::Seq(elems) => elems[*next as usize..].iter().all(|e| e.1),
+                _ => false,
+            },
             _ => false,
-        })
+        }
     }
 
     fn walk(&self, state: &State, node: usize, words: &mut [u32]) {
@@ -723,17 +838,42 @@ pub fn parse_response_format(value: &Value) -> Result<Option<Schema>, String> {
 pub enum Schema {
     Object,
     Json(Value),
+    Tools { xml: bool, tools: Vec<Value>, only: Option<String> },
+}
+
+pub fn parse_tool_choice(choice: &Value, tools: &[Value], xml: bool) -> Result<Option<Schema>, String> {
+    let only = match choice {
+        Value::Null => return Ok(None),
+        Value::String(s) if s == "auto" || s == "none" => return Ok(None),
+        Value::String(s) if s == "required" => None,
+        Value::Object(_) if choice["type"] == "function" => Some(choice["function"]["name"].as_str().ok_or("tool_choice function needs a name")?.to_string()),
+        _ => return Err("tool_choice must be auto, none, required or a named function".into()),
+    };
+    let schema = Schema::Tools { xml, tools: tools.to_vec(), only };
+    schema.compile()?;
+    Ok(Some(schema))
 }
 
 impl Schema {
-    pub fn build(&self, table: Arc<TokenTable>, vocab: usize, stop: Vec<u32>) -> Arc<Grammar> {
+    fn compile(&self) -> Result<(Compiled, u32), String> {
         match self {
-            Schema::Object => Grammar::json_object(table, vocab, stop),
-            Schema::Json(schema) => {
-                let (compiled, root) = Compiled::from_schema(schema).expect("schema was validated when parsed");
-                Arc::new(Grammar { compiled, root, table, vocab, stop, cache: Mutex::new(HashMap::new()) })
-            }
+            Schema::Object => Ok((Compiled::new(), ANY_OBJECT)),
+            Schema::Json(schema) => Compiled::from_schema(schema),
+            Schema::Tools { xml, tools, only } => Compiled::tools(tools, *xml, only.as_deref()),
         }
+    }
+
+    pub fn key(&self) -> String {
+        match self {
+            Schema::Object => "object".into(),
+            Schema::Json(v) => format!("json:{v}"),
+            Schema::Tools { xml, tools, only } => format!("tools:{xml}:{only:?}:{}", Value::Array(tools.clone())),
+        }
+    }
+
+    pub fn build(&self, table: Arc<TokenTable>, vocab: usize, stop: Vec<u32>) -> Arc<Grammar> {
+        let (compiled, root) = self.compile().expect("schema was validated when parsed");
+        Arc::new(Grammar { compiled, root, table, vocab, stop, cache: Mutex::new(HashMap::new()) })
     }
 }
 
@@ -980,5 +1120,103 @@ mod tests {
         assert_eq!(parse_response_format(&json!({"type": "text"})), Ok(None));
         assert_eq!(parse_response_format(&Value::Null), Ok(None));
         assert!(parse_response_format(&json!({"type": "nope"})).is_err());
+    }
+
+    fn weather() -> Vec<Value> {
+        vec![
+            serde_json::json!({"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"},"unit":{"type":"string","enum":["c","f"]}},"required":["city"]}}}),
+            serde_json::json!({"type":"function","function":{"name":"ping","parameters":{"type":"object","properties":{}}}}),
+        ]
+    }
+
+    fn tools_grammar(xml: bool, only: Option<&str>) -> Arc<Grammar> {
+        let schema = Schema::Tools { xml, tools: weather(), only: only.map(String::from) };
+        schema.compile().unwrap();
+        schema.build(single_bytes(), 257, vec![EOS])
+    }
+
+    #[test]
+    fn xml_tool_choice_accepts_only_the_wrapper_with_valid_parameters() {
+        let g = tools_grammar(true, None);
+        for ok in [
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nDublin\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nA\nB \"x\"\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=unit>\nc\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=ping>\n</function>\n</tool_call>",
+        ] {
+            assert!(accepts(&g, ok), "{ok}");
+        }
+        for bad in [
+            "Sure",
+            "<tool_call>\n<function=nope>\n",
+            "<tool_call>\n<function=get_weather>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nX\n</parameter>\n<parameter=days>\nx\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=get_weather>\n<parameter=city>\nX\n</parameter>\n<parameter=unit>\nk\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=ping>\n</function>\n</tool_call>x",
+        ] {
+            assert!(!accepts(&g, bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn named_tool_choice_excludes_other_tools() {
+        let g = tools_grammar(true, Some("ping"));
+        assert!(accepts(&g, "<tool_call>\n<function=ping>\n</function>\n</tool_call>"));
+        assert!(!accepts(&g, "<tool_call>\n<function=get_weather>\n<parameter=city>\nX\n</parameter>\n</function>\n</tool_call>"));
+        assert!(parse_tool_choice(&serde_json::json!({"type":"function","function":{"name":"zzz"}}), &weather(), true).is_err());
+    }
+
+    #[test]
+    fn hermes_tool_choice_wraps_the_json_arguments() {
+        let g = tools_grammar(false, Some("get_weather"));
+        assert!(accepts(&g, "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Rome\", \"days\": 2}}\n</tool_call>"));
+        assert!(!accepts(&g, "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"days\": 2}}\n</tool_call>"));
+    }
+
+    #[test]
+    fn a_finished_tool_call_only_allows_stop() {
+        let g = tools_grammar(true, Some("ping"));
+        let mut c = g.cursor();
+        for b in "<tool_call>\n<function=ping>\n</function>\n</tool_call>".bytes() {
+            assert!(c.advance(b as u32 + 1));
+        }
+        assert!(c.finished() || c.complete());
+        let m = c.mask();
+        let allowed: Vec<usize> = (0..257).filter(|&t| m[t / 32] >> (t % 32) & 1 == 1).collect();
+        assert_eq!(allowed, vec![0]);
+    }
+
+    #[test]
+    fn tool_choice_values() {
+        let t = weather();
+        assert_eq!(parse_tool_choice(&serde_json::json!("auto"), &t, true), Ok(None));
+        assert_eq!(parse_tool_choice(&serde_json::json!("none"), &t, true), Ok(None));
+        assert!(parse_tool_choice(&serde_json::json!("required"), &t, true).unwrap().is_some());
+        assert!(parse_tool_choice(&serde_json::json!("required"), &[], true).is_err());
+        assert!(parse_tool_choice(&serde_json::json!("bogus"), &t, true).is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn mask_time_on_a_248k_vocabulary() {
+        let mut tokens = vec![Vec::new()];
+        let mut n = 0u32;
+        while tokens.len() < 248_000 {
+            let len = 1 + (n % 7) as usize;
+            let t: Vec<u8> = (0..len).map(|k| 32 + ((n.wrapping_mul(2654435761).rotate_left(k as u32 * 5) >> 3) % 95) as u8).collect();
+            tokens.push(t);
+            n += 1;
+        }
+        let g = Schema::Tools { xml: true, tools: weather(), only: None }.build(Arc::new(TokenTable::new(tokens)), 248_000, vec![0]);
+        let mut c = g.cursor();
+        let started = std::time::Instant::now();
+        let _ = c.mask();
+        let cold = started.elapsed();
+        for b in "<tool_call>\n<function=get_weather>\n<parameter=city>\nDub".bytes() {
+            c.state = g.step(&c.state, b);
+        }
+        assert!(!c.state.is_dead());
+        let started = std::time::Instant::now();
+        let _ = c.mask();
+        println!("cold mask {cold:?}, string-state mask {:?}", started.elapsed());
     }
 }

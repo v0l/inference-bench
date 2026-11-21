@@ -1,6 +1,9 @@
 [tool_parser]
 qwen3_coder = "xml_function"
 qwen3_xml = "xml_function"
+granite = "tool_call_list"
+llama3_json = "bare_json"
+phi4_mini_json = "functools_list"
 
 [reasoning_parser]
 qwen3 = "think_tags"

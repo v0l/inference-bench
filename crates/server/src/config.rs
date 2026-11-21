@@ -147,6 +147,7 @@ pub struct ServerConfig {
     pub max_num_seqs: Option<usize>,
     pub max_model_len: Option<usize>,
     pub kv_cache_gb: Option<f64>,
+    pub grammar_cache: Option<usize>,
     pub max_batched_tokens: Option<usize>,
     pub itl_target_ms: Option<u64>,
     pub whole_prompt_tokens: Option<usize>,
@@ -208,6 +209,7 @@ impl Default for ServerConfig {
             max_num_seqs: None,
             max_model_len: None,
             kv_cache_gb: None,
+            grammar_cache: None,
             max_batched_tokens: None,
             itl_target_ms: None,
             whole_prompt_tokens: None,
@@ -338,7 +340,7 @@ impl ServerConfig {
         anyhow::ensure!(self.kv_cache_gb.is_none_or(|g| g > 0.0), "kv_cache_gb must be positive");
         anyhow::ensure!(self.max_loaded_models >= 1, "max_loaded_models must be at least 1");
         if let Some(p) = &self.tool_parser {
-            anyhow::ensure!(matches!(p.as_str(), "xml_function" | "qwen3_xml" | "hermes"), "tool_parser {p} is not supported: use xml_function or hermes");
+            anyhow::ensure!(matches!(p.as_str(), "xml_function" | "qwen3_xml" | "hermes" | "tool_call_list" | "bare_json" | "functools_list"), "tool_parser {p} is not supported: use xml_function, hermes, tool_call_list, bare_json or functools_list");
         }
         if let Some(p) = &self.reasoning_parser {
             anyhow::ensure!(p == "think_tags", "reasoning_parser {p} is not supported: use think_tags");
@@ -390,6 +392,7 @@ impl ServerConfig {
             watchdog: (self.watchdog_secs > 0).then(|| std::time::Duration::from_secs(self.watchdog_secs)),
             sessions: Some(self.sessions.clone()),
             tp: self.tp.unwrap_or(d.tp),
+            grammar_cache: self.grammar_cache.unwrap_or(d.grammar_cache),
             solved: None,
         })
     }

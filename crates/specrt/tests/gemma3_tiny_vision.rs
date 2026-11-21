@@ -20,6 +20,7 @@ fn spec() -> Spec {
     let mut spec = Spec::from_hf_config_serving(&std::fs::read_to_string(fixture().join("config.json")).unwrap()).unwrap();
     spec.name = "tiny-gemma3-vision".into();
     spec.repo = fixture().display().to_string();
+    spec.runtime.split_activations = Some(true);
     spec
 }
 

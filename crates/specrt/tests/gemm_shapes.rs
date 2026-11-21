@@ -15,7 +15,8 @@ fn f(b: u16) -> f32 {
 
 fn run(linear: &str, tokens: usize) -> f64 {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.5-122b-a10b-nvfp4.config.json");
-    let spec = Spec::from_hf_config_serving(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut spec = Spec::from_hf_config_serving(&std::fs::read_to_string(path).unwrap()).unwrap();
+    spec.runtime.split_activations = Some(true);
     let ctx = CudaContext::new(0).unwrap();
     let target = cuda_target(&ctx).unwrap();
     let module = Module::generate_kv(&spec, 256, 2, &target).unwrap();
