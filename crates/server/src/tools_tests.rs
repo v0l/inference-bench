@@ -434,3 +434,86 @@ fn repairs_are_counted() {
     let after: u64 = repair_counts().iter().map(|(_, n)| n).sum();
     assert!(after > before);
 }
+
+fn raw_outputs(format: RawFormat, text: &str) -> (Parsed, Streamed) {
+    let run = |chunks: Vec<&str>| {
+        let mut p = OutputParser::new(&weather_tools(), true, false).raw_json(format);
+        let mut s = Streamed::default();
+        let mut deltas = Vec::new();
+        for c in &chunks {
+            deltas.extend(p.feed(c));
+        }
+        deltas.extend(p.finish());
+        for d in deltas {
+            match d {
+                Delta::Content(t) => s.content.push_str(&t),
+                Delta::Reasoning(t) => s.reasoning.push_str(&t),
+                Delta::Call { id, name, .. } => s.calls.push((id, name, String::new())),
+                Delta::Args { index, arguments } => s.calls[index].2.push_str(&arguments),
+            }
+        }
+        (p.result(), s)
+    };
+    let (whole, _) = run(vec![text]);
+    let (chunked, streamed) = run(by_char(text));
+    assert_eq!(calls(&whole), calls(&chunked));
+    (whole, streamed)
+}
+
+#[test]
+fn granite_tool_call_lists_parse() {
+    let text = "<|tool_call|>[{\"name\": \"get_current_weather\", \"arguments\": {\"city\": \"Dallas\", \"state\": \"TX\"}}, {\"name\": \"calculate_area\", \"arguments\": {\"shape\": \"circle\"}}]";
+    let (p, s) = raw_outputs(RawFormat::Granite, text);
+    assert_eq!(calls(&p), [("get_current_weather", r#"{"city": "Dallas", "state": "TX"}"#), ("calculate_area", r#"{"shape": "circle"}"#)]);
+    assert_eq!(p.content, None);
+    assert_eq!(s.calls.len(), 2);
+    assert_eq!(s.content, "");
+}
+
+#[test]
+fn llama3_bare_json_parses_parameters() {
+    let text = "{\"name\": \"get_current_weather\", \"parameters\": {\"city\": \"Dallas\", \"state\": \"TX\"}}";
+    let (p, s) = raw_outputs(RawFormat::Llama3, text);
+    assert_eq!(calls(&p), [("get_current_weather", r#"{"city": "Dallas", "state": "TX"}"#)]);
+    assert_eq!(s.calls.len(), 1);
+    assert_eq!(s.content, "");
+}
+
+#[test]
+fn llama3_semicolon_separated_calls_parse() {
+    let text = "{\"name\": \"get_current_weather\", \"parameters\": {\"city\": \"A\"}}; {\"name\": \"calculate_area\", \"parameters\": {}}";
+    let (p, _) = raw_outputs(RawFormat::Llama3, text);
+    assert_eq!(calls(&p), [("get_current_weather", r#"{"city": "A"}"#), ("calculate_area", "{}")]);
+}
+
+#[test]
+fn llama3_plain_text_streams_as_content() {
+    let (p, s) = raw_outputs(RawFormat::Llama3, "It is sunny in Dallas.");
+    assert!(p.tool_calls.is_empty());
+    assert_eq!(p.content.as_deref(), Some("It is sunny in Dallas."));
+    assert_eq!(s.content, "It is sunny in Dallas.");
+}
+
+#[test]
+fn llama3_invalid_or_unknown_json_stays_text() {
+    for text in ["{\"name\": \"nope\", \"parameters\": {}}", "{not json", "<|python_tag|>brave_search.call(query=\"x\")"] {
+        let (p, s) = raw_outputs(RawFormat::Llama3, text);
+        assert!(p.tool_calls.is_empty(), "{text}");
+        assert_eq!(s.content, text);
+    }
+}
+
+#[test]
+fn phi4_functools_lists_parse() {
+    let text = "functools[{\"name\": \"get_current_weather\", \"arguments\": {\"city\": \"Dallas\", \"state\": \"TX\"}}]";
+    let (p, _) = raw_outputs(RawFormat::Phi4, text);
+    assert_eq!(calls(&p), [("get_current_weather", r#"{"city": "Dallas", "state": "TX"}"#)]);
+}
+
+#[test]
+fn raw_parsers_are_chosen_by_name() {
+    let mut p = OutputParser::new(&weather_tools(), true, false).for_parser(Some("llama3_json"));
+    p.feed("{\"name\": \"calculate_area\", \"parameters\": {}}");
+    p.finish();
+    assert_eq!(calls(&p.result()), [("calculate_area", "{}")]);
+}

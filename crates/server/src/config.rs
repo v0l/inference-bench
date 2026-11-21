@@ -338,7 +338,7 @@ impl ServerConfig {
         anyhow::ensure!(self.kv_cache_gb.is_none_or(|g| g > 0.0), "kv_cache_gb must be positive");
         anyhow::ensure!(self.max_loaded_models >= 1, "max_loaded_models must be at least 1");
         if let Some(p) = &self.tool_parser {
-            anyhow::ensure!(matches!(p.as_str(), "xml_function" | "qwen3_xml" | "hermes"), "tool_parser {p} is not supported: use xml_function or hermes");
+            anyhow::ensure!(matches!(p.as_str(), "xml_function" | "qwen3_xml" | "hermes" | "granite" | "llama3_json" | "phi4_mini_json"), "tool_parser {p} is not supported: use xml_function, hermes, granite, llama3_json or phi4_mini_json");
         }
         if let Some(p) = &self.reasoning_parser {
             anyhow::ensure!(p == "think_tags", "reasoning_parser {p} is not supported: use think_tags");
