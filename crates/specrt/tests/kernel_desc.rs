@@ -82,6 +82,28 @@ fn codegen_attention_kernels_come_from_descriptions() {
 }
 
 #[test]
+fn turing_target_selects_the_scalar_attention_path() {
+    let turing = kir::Target::cuda(7, 5, 30, 64 * 1024);
+    assert!(!turing.has(kir::Feature::Mma16816));
+    for spec in specs().into_iter().filter(|s| s.attention.head_dim <= 128) {
+        let kernels = specrt::codegen::attention_kernels(&spec, 1, 8192, &turing).unwrap();
+        let families: Vec<_> = kernels.iter().map(|k| k.family).collect();
+        assert!(!families.contains(&kir::attention::Family::FlashMma));
+        assert!(!families.contains(&kir::attention::Family::GroupedDecode));
+        assert!(families.contains(&kir::attention::Family::FlashLegacy));
+        assert!(families.contains(&kir::attention::Family::SplitDecode));
+        if spec.linear_attention.is_some() {
+            continue;
+        }
+        let module = specrt::codegen::Module::generate_kv(&spec, 8192, 1, &turing).unwrap();
+        for gone in ["flash_mma", "batch_decode_attention", "batch_decode_combine"] {
+            assert!(!module.kernels.contains(&gone), "{gone}");
+        }
+        assert!(module.kernels.contains(&"flash_attention"));
+    }
+}
+
+#[test]
 fn embedded_kernel_descriptions_parse_and_are_delivered() {
     let registry = Registry::embedded();
     assert!(registry.descriptions().count() >= 8);

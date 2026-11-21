@@ -201,8 +201,18 @@ pub fn attention_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
     let symbols = attention_symbols(spec, kv_planes, max_ctx);
     kir::desc::ATTENTION
         .iter()
+        .filter(|(n, _)| attention_available(n, target))
         .map(|(n, _)| kir::desc::build_attention(n, target, &symbols).map_err(anyhow::Error::msg))
         .collect()
+}
+
+pub fn attention_available(kernel: &str, target: &kir::Target) -> bool {
+    let family = match kernel {
+        "flash_mma" => kir::attention::Family::FlashMma,
+        "batch_decode_attention" | "batch_decode_combine" => kir::attention::Family::GroupedDecode,
+        _ => return true,
+    };
+    family.needs().iter().all(|&f| target.has(f))
 }
 
 pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: &kir::Target) -> Result<Vec<Option<kir::Kernel>>> {
@@ -515,7 +525,7 @@ impl Module {
             kir::gemv::emit_gemvs(&gemvs).map_err(anyhow::Error::msg)?,
             kir_source
         );
-        let mut kernels = KERNELS.to_vec();
+        let mut kernels: Vec<&'static str> = KERNELS.iter().copied().filter(|k| attention_available(k, target)).collect();
         for k in kir_kernels.iter().chain(&distinct) {
             if !kernels.contains(&k.name) {
                 kernels.push(k.name);
