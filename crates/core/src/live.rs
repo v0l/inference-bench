@@ -250,6 +250,9 @@ impl History {
             p.gen_tok_s = r.generated.saturating_sub(prev.generated) as f64 / dt;
             p.prefill_tok_s = r.prefilled.saturating_sub(prev.prefilled) as f64 / dt;
         }
+        if self.marks.is_empty() {
+            self.marks.push_back((now, Histogram::new(&r.ttft.bounds), Histogram::new(&r.itl.bounds)));
+        }
         self.marks.push_back((now, r.ttft.clone(), r.itl.clone()));
         while self.marks.len() > 1 && now.duration_since(self.marks[1].0) >= LATENCY_WINDOW {
             self.marks.pop_front();
@@ -407,6 +410,18 @@ mod tests {
         assert!(p.itl_p50 > 0.0);
         h.push(t0 + Duration::from_secs(2), meter.read(4, None));
         assert_eq!(h.last().unwrap().ttft_p50, p.ttft_p50);
+    }
+
+    #[test]
+    fn a_request_finished_before_the_first_sample_still_reports_ttft() {
+        let meter = Arc::new(Meter::default());
+        let mut t = meter.begin(Instant::now());
+        std::thread::sleep(Duration::from_millis(30));
+        t.piece();
+        t.finish(&Generation { prompt_tokens: 5, completion_tokens: 1, ..Generation::default() });
+        let mut h = History::new(900);
+        h.push(Instant::now(), meter.read(4, None));
+        assert!(h.last().unwrap().ttft_p50 >= 0.025, "{:?}", h.last());
     }
 
     #[test]
