@@ -3,6 +3,7 @@ use crate::{App, Tab};
 use eframe::egui;
 use egui_bench::prelude::*;
 use inference_bench_core::cluster::{Planned, Sizing};
+use specrt::solve::{PIN_POOL, PIN_SLOTS, PlacementRequest, Solved, Target};
 use inference_bench_core::library::{LocalModel, human_size};
 use serde_json::{Value, json};
 use specrt::anatomy::ModelAnatomy;
@@ -11,10 +12,6 @@ use std::collections::BTreeMap;
 
 pub use inference_bench_core::fit::*;
 
-
-fn round_up_quarter(bytes: u64) -> f64 {
-    ((bytes as f64 / GB) * 4.0).ceil() / 4.0
-}
 
 pub fn parse_names(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -39,8 +36,16 @@ pub struct LoadDialog {
     pub advanced: bool,
     pub texts: BTreeMap<String, String>,
     pub anatomy: Option<ModelAnatomy>,
+    pub pin_seqs: bool,
+    pub pin_kv: bool,
+    pub solved: Option<Result<Solved, String>>,
+    solve_key: String,
     native_max: usize,
+    auto_extension: bool,
 }
+
+const MAX_EXTENSION: usize = 16;
+const DEFAULT_EXTENSION: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProfilePick {
@@ -135,13 +140,14 @@ fn advanced_groups(ui: &mut egui::Ui, dialog: &mut LoadDialog) {
                 row_help(ui, f.label, f.help, |ui| {
                     if f.key == "serve.max_num_seqs" {
                         let mut n = dialog.seqs;
-                        ui.add(egui::Slider::new(&mut n, 1..=MAX_SEQS));
-                        dialog.seqs = n;
-                        dialog.choice.set(&f.key, json!(n));
+                        if ui.add(egui::Slider::new(&mut n, 1..=MAX_SEQS)).changed() {
+                            dialog.seqs = n;
+                            dialog.pin_seqs = true;
+                        }
                     } else {
                         edit_field(ui, f, &mut dialog.choice, &mut dialog.texts);
                     }
-                    let at_default = if f.key == "serve.max_num_seqs" { Some(json!(dialog.seqs)) == f.default.as_u64().map(|d| json!(d)) } else { dialog.choice.is_default(&f.key) };
+                    let at_default = if f.key == "serve.max_num_seqs" { !dialog.pin_seqs } else { dialog.choice.is_default(&f.key) };
                     if !at_default
                         && ui.add(Key::new("reset").outline(READOUT)).clicked() {
                             dialog.reset(&f.key);
@@ -171,7 +177,9 @@ impl LoadDialog {
         };
         let served_names = app.settings.served_names_for(&model.name).join(", ");
         let mut choice = app.settings.engine_for(&model.name);
-        choice.set("serve.max_num_seqs", json!(seqs));
+        if remembered_seqs.is_some() {
+            choice.set("serve.max_num_seqs", json!(seqs));
+        }
         let fitted = app.models.preselect.iter().find(|p| p.model == model.name);
         let (ctx, kv_gb) = match (fitted, &view) {
             (Some(p), Ok(v)) => {
@@ -186,20 +194,51 @@ impl LoadDialog {
             }
             _ => (ctx, kv_gb),
         };
-        let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, texts: BTreeMap::new(), anatomy: None, native_max: max };
+        let pin_kv = app.settings.kv_gb_for(&model.name).is_some() || fitted.is_some();
+        let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, texts: BTreeMap::new(), anatomy: None, pin_seqs: remembered_seqs.is_some(), pin_kv, solved: None, solve_key: String::new(), native_max: max, auto_extension: false };
         dialog.sync();
-        if app.settings.kv_gb_for(&model.name).is_none() && fitted.is_none() {
-            dialog.shrink_pool_to_plan(&crate::hardware::load_devices(app), app.settings.cluster.objective);
-        }
+        dialog.resolve(&crate::hardware::load_devices(app));
         dialog
     }
 
-    pub fn shrink_pool_to_plan(&mut self, devices: &[specrt::placement::DeviceConfig], objective: specrt::placement::Objective) {
-        let Some(a) = self.anatomy() else { return };
-        let floor = round_up_quarter(a.kv_bytes_per_token * self.ctx as u64);
-        while self.kv_gb > floor && matches!(self.plan(devices, objective), Some(Err(_))) {
-            self.kv_gb = (self.kv_gb - 0.25).max(floor);
+    pub fn resolve(&mut self, devices: &[specrt::placement::DeviceConfig]) {
+        let key = format!("{:?}|{}|{}|{}|{}|{}|{:?}|{:?}", self.choice.profile, self.ctx, self.seqs, self.kv_gb, self.pin_seqs, self.pin_kv, self.choice.overrides, devices.iter().map(|d| (d.name.clone(), d.memory_gib.to_bits())).collect::<Vec<_>>());
+        if key == self.solve_key {
+            return;
         }
+        self.solve_key = key;
+        self.solved = self.solve(devices);
+        if let Some(Ok(s)) = &self.solved {
+            if !self.pin_seqs {
+                self.seqs = s.slots;
+            }
+            if !self.pin_kv && s.slots > 1 {
+                self.kv_gb = s.kv_pool_bytes as f64 / GB;
+            }
+        }
+    }
+
+    pub fn solve(&self, devices: &[specrt::placement::DeviceConfig]) -> Option<Result<Solved, String>> {
+        if devices.is_empty() {
+            return None;
+        }
+        let spec = self.kv_spec()?;
+        self.anatomy()?;
+        let mut pins = self.choice.overrides.clone();
+        if self.pin_seqs {
+            pins.insert(PIN_SLOTS.into(), json!(self.seqs));
+        }
+        if self.pin_kv && self.seqs > 1 {
+            pins.insert(PIN_POOL.into(), json!(self.kv_bytes()?));
+        }
+        let target = Target { context: Some(self.ctx), memory: None, slots: None };
+        let request = PlacementRequest { mode: self.choice.profile, target, pins, devices, spec: &spec };
+        Some(specrt::solve::solve(&request).map_err(|e| inference_bench_core::cluster::friendly(&format!("{e:#}"))))
+    }
+
+    pub fn planned(&self, devices: &[specrt::placement::DeviceConfig]) -> Option<Result<Planned, String>> {
+        let solved = self.solved.as_ref()?;
+        Some(solved.clone().map(|s| Planned { sizing: Sizing { weight_bytes: self.anatomy().map(|a| a.total_bytes), kv_pool_bytes: Some(s.kv_pool_bytes) }, ctx: s.context, slots: s.slots, objective: specrt::placement::Objective::Throughput, devices: devices.to_vec(), placement: s.placement }))
     }
 
     pub fn anatomy(&self) -> Option<&ModelAnatomy> {
@@ -240,25 +279,38 @@ impl LoadDialog {
         if self.native_max == 0 {
             self.native_max = a.max_context;
         }
-        a.max_context = self.native_max * self.extension_factor();
+        a.max_context = self.native_max * MAX_EXTENSION;
         self.max = max_context(&a);
         self.ctx = self.ctx.min(self.max);
         self.anatomy = Some(a);
+        self.follow_context();
+    }
+
+    fn follow_context(&mut self) {
+        let native = self.native_max.max(1);
+        let yarn = self.choice.value("runtime.rope_extension.type").as_str() == Some("yarn");
+        if yarn && self.choice.value("runtime.rope_extension.factor").as_u64().is_none() {
+            self.choice.set("runtime.rope_extension.factor", json!(DEFAULT_EXTENSION));
+        }
+        if self.ctx > native {
+            let needed = self.ctx.div_ceil(native).min(MAX_EXTENSION);
+            if !yarn {
+                self.choice.set("runtime.rope_extension.type", json!("yarn"));
+                self.auto_extension = true;
+            }
+            if needed > self.extension_factor() || !yarn || self.auto_extension {
+                self.choice.set("runtime.rope_extension.factor", json!(needed));
+            }
+        } else if self.auto_extension {
+            self.choice.reset("runtime.rope_extension.type");
+            self.choice.reset("runtime.rope_extension.factor");
+            self.auto_extension = false;
+        }
     }
 
     pub fn plan_context(&self) -> Option<usize> {
         let a = self.anatomy()?;
         Some(pool_tokens(a, self.kv_bytes()?).min(self.max).div_ceil(self.seqs.max(1)).max(1))
-    }
-
-    pub fn plan(&self, devices: &[specrt::placement::DeviceConfig], objective: specrt::placement::Objective) -> Option<Result<Planned, String>> {
-        if devices.len() < 2 {
-            return None;
-        }
-        let a = self.anatomy()?;
-        let spec = self.kv_spec()?;
-        let sizing = Sizing { weight_bytes: Some(a.total_bytes), kv_pool_bytes: Some(self.kv_bytes()?) };
-        Some(Planned::plan(&spec, devices, self.plan_context()?, self.seqs, sizing, objective))
     }
 
     pub fn kv_bytes(&self) -> Option<u64> {
@@ -295,63 +347,91 @@ impl LoadDialog {
     }
 }
 
-pub struct PlanRow {
-    pub device: String,
-    pub layers: Option<(usize, usize)>,
-    pub weights: u64,
-    pub kv: u64,
-    pub state: u64,
+pub fn card_line(c: &inference_bench_core::inventory::Card) -> String {
+    let mut text = format!("{}  {}  {} free of {}", c.short(), c.label, human_size(c.free_bytes), human_size(c.total_bytes));
+    if !c.local {
+        text = format!("{}  on {}", text, c.host);
+    }
+    if c.display {
+        text.push_str("  drives a display");
+    }
+    text
 }
 
-pub fn plan_rows(p: &specrt::placement::Placement) -> Vec<PlanRow> {
-    p.stages
-        .iter()
-        .map(|s| PlanRow {
-            device: if s.device_name.is_empty() { format!("gpu {}", s.ordinal) } else { format!("{} #{}", s.device_name, s.ordinal) },
-            layers: Some((s.start, s.end)),
-            weights: s.weight_bytes,
-            kv: s.kv_bytes,
-            state: s.state_bytes,
-        })
-        .collect()
+fn hardware_section(app: &mut App, ui: &mut egui::Ui, inv: &inference_bench_core::inventory::Inventory) {
+    section(ui, "hardware", "the GPUs this model may use, the same switches as the Hardware tab", |ui| {
+        if inv.cards.is_empty() {
+            note(ui, "No GPU found yet.", LEGEND);
+            return;
+        }
+        for c in &inv.cards {
+            let mut on = c.selected;
+            let r = ui.push_id(&c.name, |ui| ui.checkbox(&mut on, card_line(c))).inner;
+            if r.changed() {
+                inference_bench_core::inventory::toggle(&mut app.settings.cluster, inv, &c.name);
+                let _ = app.settings.save(&app.dir);
+            }
+        }
+        if inv.selected().next().is_none() {
+            status(ui, false, "no GPU is ticked: tick one to load the model");
+        }
+    });
 }
 
-fn load_plan(ui: &mut egui::Ui, rows: &[PlanRow]) {
+fn placement_bars(ui: &mut egui::Ui, inv: &inference_bench_core::inventory::Inventory, solved: &Solved) {
     ui.add_space(4.0);
     let head = Line::new().legend("load plan").size(10.5).show(ui);
     head.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "load plan"));
-    for r in rows {
-        let layers = r.layers.map_or(String::new(), |(a, b)| format!("layers {a}-{}  ", b.saturating_sub(1)));
-        let text = format!("{layers}weights {}  kv {}  state {}", human_size(r.weights), human_size(r.kv), human_size(r.state));
-        let line = Line::new().legend(&r.device).column(ui, 120.0).note(text.clone()).size(11.0).show(ui);
-        line.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{} {text}", r.device)));
+    for s in &solved.placement.stages {
+        let bytes = s.weight_bytes + s.kv_bytes + s.state_bytes;
+        for name in s.device_name.split('+') {
+            let card = inv.card(name);
+            let label = card.map_or_else(|| specrt::hardware::display_name(name), |c| if c.local { c.short() } else { specrt::hardware::display_name(&c.name) });
+            let free = card.map_or(0, |c| c.free_bytes);
+            let text = format!("layers {}-{}  {} of {} free", s.start, s.end.saturating_sub(1), human_size(bytes), human_size(free));
+            let r = Line::new().legend(&label).column(ui, 120.0).value(text.clone()).size(11.0).show(ui);
+            r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("{label} {text}")));
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+            let fraction = if free == 0 { 1.0 } else { bytes as f32 / free as f32 };
+            bar(&ui.painter_at(rect), rect, fraction.min(1.0), if fraction > 1.0 { FAULT } else { TRACE });
+        }
     }
+}
+
+pub fn dialog_size(screen: egui::Vec2, advanced: bool) -> (f32, f32) {
+    let width = 520.0f32.min(screen.x - 32.0).max(280.0);
+    let room = (screen.y - 190.0).max(160.0);
+    (width, if advanced { room } else { room.min(900.0) })
 }
 
 pub fn modal(app: &mut App, ctx: &egui::Context) {
     let Some(mut dialog) = app.load.take() else { return };
-    let gpus = app.free_gpu_list();
-    let free = app.free_gpu_bytes();
+    let inv = app.inventory();
+    let gpus = inv.free_local();
+    let free = (!gpus.is_empty()).then(|| gpus.iter().sum::<u64>());
     dialog.sync();
     let est = dialog.estimate(free);
-    let spread = dialog.plan(&crate::hardware::load_devices(app), app.settings.cluster.objective);
+    let load_devices = inv.devices(app.hardware.machine.as_ref(), app.settings.cluster.network_link());
+    dialog.resolve(&load_devices);
+    let spread = dialog.planned(&load_devices).filter(|_| load_devices.len() > 1);
     let (mut go, mut close, mut alongside) = (false, false, false);
     let loaded_now = app.loaded_all();
     let alongside_block = (!loaded_now.is_empty()).then(|| app.alongside_blocked().or_else(|| est.as_ref().filter(|e| e.fits() == Some(false)).map(|e| format!("{} more than the free memory: unload a model first", human_size(e.total() - e.free.unwrap_or(0)))))).flatten();
     let r = egui::Modal::new(egui::Id::new("load-model"))
         .backdrop_color(egui::Color32::from_black_alpha(150))
         .show(ctx, |ui| {
-            ui.set_width(520.0);
+            let (width, body_h) = dialog_size(ui.ctx().content_rect().size(), dialog.advanced);
+            ui.set_width(width);
             modal_title(ui, &format!("Load {}", dialog.model.name));
             if let Err(e) = &dialog.view {
                 status(ui, false, e);
                 note(ui, "The engine will read the model itself and report what is wrong.", LEGEND);
             }
             let body_w = ui.available_width();
-            let room = (ui.ctx().content_rect().height() - 200.0).clamp(200.0, 900.0);
-            let body_h = if dialog.advanced { room } else { room.min(560.0) };
             egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(body_h).show(ui, |ui| {
             ui.set_max_width(body_w);
+            hardware_section(app, ui, &inv);
+            ui.add_space(8.0);
             section(ui, "profile", "one switch for the measured best, or for the least memory", |ui| {
                 let mut pick = if dialog.choice.is_custom() { ProfilePick::Custom } else { ProfilePick::Profile(dialog.choice.profile) };
                 let before = pick;
@@ -363,12 +443,28 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                 if pick != before
                     && let ProfilePick::Profile(p) = pick {
                         dialog.choice.select(p);
-                        dialog.seqs = dialog.choice.value("serve.max_num_seqs").as_u64().map_or(dialog.seqs, |n| n as usize);
+                        dialog.pin_seqs = false;
+                        dialog.pin_kv = false;
+                        dialog.solve_key.clear();
                     }
                 match dialog.choice.profile {
                     Profile::MaxPerformance if !dialog.choice.is_custom() => hint(ui, "MTP, CUDA graphs, fused kernels, the fast loader and the prefix cache are on."),
                     Profile::LowMemory if !dialog.choice.is_custom() => hint(ui, "fp8 KV cache, 2 parallel requests, smaller batches and prefill chunks, no MTP draft head, no prefix cache, small loader and image budgets."),
                     _ => hint(ui, &format!("{} advanced option(s) changed from the profile.", dialog.choice.overrides.len())),
+                }
+                match &dialog.solved {
+                    Some(Ok(s)) => {
+                        let r = Line::new().legend("placement").column(ui, 120.0).value(s.strategy.clone()).size(11.0).show(ui);
+                        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("placement {}", s.strategy)));
+                        for why in &s.reasons {
+                            hint(ui, why);
+                        }
+                        if let Some(short) = &s.shortfall {
+                            status(ui, false, short);
+                        }
+                    }
+                    Some(Err(why)) => status(ui, false, &format!("no placement fits: {why}")),
+                    None => {}
                 }
             });
             ui.add_space(8.0);
@@ -380,6 +476,7 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                         row_help(ui, "gpu memory", "How much GPU memory this model may use, weights included. What is left after the weights becomes the KV cache every request shares.", |ui| {
                             if ui.add(egui::Slider::new(&mut mem, (base + 0.25)..=hi).step_by(0.25).fixed_decimals(1).suffix(" GB")).changed() {
                                 dialog.kv_gb = ((mem - base) * 4.0).round() / 4.0;
+                                dialog.pin_kv = true;
                             }
                         });
                     } else {
@@ -395,8 +492,9 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                     }
                 });
                 if dialog.view.is_ok() {
-                    let note = if dialog.extension_factor() > 1 { format!("{} tokens, {} trained x {} YaRN", dialog.max, dialog.native_max, dialog.extension_factor()) } else { format!("{} tokens", dialog.max) };
+                    let note = if dialog.max > dialog.native_max { format!("{} tokens trained, up to {} with YaRN", dialog.native_max, dialog.max) } else { format!("{} tokens", dialog.max) };
                     Line::new().legend("model maximum").value(note).size(11.0).show(ui);
+                    Line::new().note("Going past the trained length turns on YaRN, which changes short-context numerics slightly. Keep the context at or under the trained length unless you need more.").size(10.5).show(ui);
                 }
             });
             ui.add_space(8.0);
@@ -455,9 +553,6 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                                 Some(Err(why)) => status(ui, false, &format!("the planner says it does not fit across {} gpus: {why}. You can still try to load it.", gpus.len())),
                                 None => {}
                             }
-                            if let Some(Ok(p)) = &spread {
-                                load_plan(ui, &plan_rows(&p.placement));
-                            }
                         }
                         Some(f) => {
                             Line::new().legend("free on the gpu").column(ui, 120.0).measured(human_size(f)).show(ui);
@@ -465,9 +560,11 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
                                 Some(false) => status(ui, false, &format!("the planner says it is {} over free memory. You can still try to load it.", human_size(e.total() - f))),
                                 _ => status(ui, true, "fits in free memory"),
                             }
-                            load_plan(ui, &[PlanRow { device: "gpu 0".into(), layers: None, weights: e.weights, kv: e.kv, state: e.state }]);
                         }
                         None => note(ui, "No GPU reading yet, so the estimate cannot be checked against free memory.", LEGEND),
+                    }
+                    if let Some(Ok(s)) = &dialog.solved {
+                        placement_bars(ui, &inv, s);
                     }
                 }
                 None => note(ui, "No estimate: the model's layout could not be read.", LEGEND),
@@ -517,27 +614,50 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
         let names = parse_names(&dialog.served_names);
         if dialog.remember {
             app.settings.model_ctx.insert(model.name.clone(), dialog.ctx);
-            app.settings.model_seqs.insert(model.name.clone(), dialog.seqs);
-            if dialog.seqs > 1 && dialog.view.is_ok() {
+            if dialog.pin_seqs {
+                app.settings.model_seqs.insert(model.name.clone(), dialog.seqs);
+            } else {
+                app.settings.model_seqs.remove(&model.name);
+            }
+            if dialog.pin_kv && dialog.seqs > 1 && dialog.view.is_ok() {
                 app.settings.model_kv_gb.insert(model.name.clone(), dialog.kv_gb);
+            } else {
+                app.settings.model_kv_gb.remove(&model.name);
             }
             app.settings.model_served_names.insert(model.name.clone(), names.clone());
             app.settings.model_engine.insert(model.name.clone(), dialog.choice.clone());
             let _ = app.settings.save(&app.dir);
         }
         app.chat.load_error = None;
-        let kv = dialog.view.is_ok().then(|| dialog.kv_bytes()).flatten().filter(|_| dialog.seqs > 1);
-        let largest = gpus.iter().copied().max().unwrap_or(0);
-        let too_big_for_one = est.as_ref().is_some_and(|e| e.total() > largest);
-        let outcome = if let Some(Err(why)) = spread.as_ref().filter(|_| too_big_for_one) {
-            Err(format!("not loaded: the plan across {} gpus does not fit: {why}", gpus.len()))
-        } else if alongside && spread.as_ref().is_some_and(|r| r.as_ref().is_ok_and(Planned::spans)) {
-            Err("not loaded alongside: this model spans several gpus and needs them all".to_string())
-        } else if let Some(Ok(planned)) = spread.filter(|r| r.as_ref().is_ok_and(Planned::spans)) {
-            crate::hardware::load_spanning(app, &model, planned, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone())
-        } else {
-            app.load_model_placed(&model, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone(), alongside);
-            Ok(())
+        let own = crate::hardware::planning_machine(app).map_or_else(specrt::hardware::host_name, |m| m.host);
+        let outcome = match dialog.solved.clone() {
+            Some(Ok(solved)) if solved.placement.stages.iter().any(|s| specrt::hardware::host_of(s.device_name.split('+').next().unwrap_or_default()) != own) => {
+                if alongside {
+                    Err("not loaded alongside: this model spans several hosts and needs them all".to_string())
+                } else {
+                    let planned = dialog.planned(&load_devices).and_then(Result::ok);
+                    match planned {
+                        Some(planned) => crate::hardware::load_spanning(app, &model, planned, solved.context, solved.slots, Some(solved.kv_pool_bytes), names, dialog.choice.clone()),
+                        None => Err("no plan to load".to_string()),
+                    }
+                }
+            }
+            Some(Ok(solved)) if alongside && solved.spans() => Err("not loaded alongside: this model spans several gpus and needs them all".to_string()),
+            Some(Ok(solved)) => {
+                let mut engine = dialog.choice.clone();
+                let (ctx, slots, pool) = (solved.context, solved.slots, solved.kv_pool_bytes);
+                engine.solved = Some(Box::new(solved));
+                app.load_model_placed(&model, ctx, slots, Some(pool), names, engine, alongside);
+                Ok(())
+            }
+            Some(Err(why)) => Err(format!("not loaded: {why}")),
+            None if load_devices.is_empty() && !inv.cards.is_empty() => Err("not loaded: no gpu selected. Tick a gpu under hardware in this dialog".to_string()),
+            None if inv.local().any(|c| c.ordinal == Some(0) && !c.selected) => Err("not loaded: there is no placement plan for this model, and without one it would load on GPU 0, which is switched off".to_string()),
+            None => {
+                let kv = dialog.view.is_ok().then(|| dialog.kv_bytes()).flatten().filter(|_| dialog.seqs > 1);
+                app.load_model_placed(&model, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone(), alongside);
+                Ok(())
+            }
         };
         if let Err(e) = outcome {
             app.notice = Some((false, e));

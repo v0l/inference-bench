@@ -128,6 +128,11 @@ impl App {
         self.scan.start(job::spawn(&self.wake, move || inference_bench_core::library::scan(&sources)));
     }
 
+    pub fn landing(&self, l: &inference_bench_core::engine::Loaded) -> Option<inference_bench_core::inventory::Landing> {
+        let planned = l.engine.solved.as_deref().map(inference_bench_core::inventory::planned_names).unwrap_or_default();
+        self.inventory().where_landed(&l.landed, &planned)
+    }
+
     pub fn loaded(&self) -> Option<inference_bench_core::engine::Loaded> {
         let all = self.engine.loaded_all();
         let chosen = self.chat_model.as_ref().and_then(|m| all.iter().find(|l| &l.display == m).cloned());
@@ -147,14 +152,13 @@ impl App {
         (n >= self.max_loaded()).then(|| format!("{n} of {} allowed models are loaded: unload one, or raise the limit on the Server tab", self.max_loaded()))
     }
 
-    pub fn gpu_enabled(&self, ordinal: usize) -> bool {
-        let host = self.hardware.machine.as_ref().map_or_else(specrt::hardware::host_name, |m| m.host.clone());
-        let name = specrt::hardware::device_name(&host, ordinal);
-        !self.settings.cluster.disabled_gpus.contains(&name)
+    pub fn inventory(&self) -> inference_bench_core::inventory::Inventory {
+        let peers: Vec<specrt::cluster::Peer> = self.hardware.peers.values().cloned().collect();
+        inference_bench_core::inventory::inventory(self.hardware.machine.as_ref(), &self.gpu, &peers, &self.settings.cluster)
     }
 
     pub fn free_gpu_list(&self) -> Vec<u64> {
-        self.gpu.iter().enumerate().filter(|(i, _)| self.gpu_enabled(*i)).map(|(_, g)| g.available_bytes()).collect()
+        self.inventory().free_local()
     }
 
     pub fn free_gpu_bytes(&self) -> Option<u64> {
@@ -237,7 +241,12 @@ impl App {
                     self.loading = None;
                     self.load_progress = None;
                     self.chat.load_error = None;
-                    self.notice = Some((true, format!("{} loaded in {:.1} s", l.display, l.load_secs)));
+                    let landing = self.landing(&l);
+                    self.notice = Some(match landing {
+                        Some(w) if !w.matches_plan => (false, format!("{} loaded in {:.1} s but is {}, not where the load dialog planned it", l.display, l.load_secs, w.text)),
+                        Some(w) => (true, format!("{} loaded in {:.1} s, {}", l.display, l.load_secs, w.text)),
+                        None => (true, format!("{} loaded in {:.1} s", l.display, l.load_secs)),
+                    });
                 }
                 EngineEvent::LoadFailed(e) => {
                     self.loading = None;

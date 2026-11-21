@@ -89,7 +89,7 @@ fn peer_row(ui: &mut egui::Ui, p: &Peer, use_state: Option<bool>) -> bool {
     toggled
 }
 
-fn gpu_card(ui: &mut egui::Ui, g: &GpuInfo, on: bool) -> bool {
+fn gpu_card(ui: &mut egui::Ui, g: &GpuInfo, on: bool, display: bool) -> bool {
     let mut toggled = false;
     let used = g.total_bytes.saturating_sub(g.free_bytes);
     card(
@@ -101,6 +101,9 @@ fn gpu_card(ui: &mut egui::Ui, g: &GpuInfo, on: bool) -> bool {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 toggled = ui.add(Key::new(if on { "in use" } else { "switched off" }).outline(if on { OK } else { LEGEND }).id_salt(("gpu-switch", g.ordinal))).clicked();
                 tag(ui, &g.arch(), LEGEND, false);
+                if display {
+                    tag(ui, "drives a display", WARN, false);
+                }
             });
         },
         |ui| {
@@ -230,28 +233,7 @@ pub fn planning_machine(app: &App) -> Option<specrt::hardware::Machine> {
 }
 
 pub fn load_devices(app: &App) -> Vec<specrt::placement::DeviceConfig> {
-    use inference_bench_core::fit::{GB, GPU_UTILIZATION};
-    let machine = app.hardware.machine.as_ref();
-    let cards: Vec<(usize, u64)> = app.gpu.iter().enumerate().filter(|(i, _)| app.gpu_enabled(*i)).map(|(i, g)| (i, g.available_bytes())).collect();
-    let mut devices = match machine {
-        Some(m) => {
-            let skip: Vec<usize> = m.gpus.iter().map(|g| g.ordinal).filter(|o| !app.gpu_enabled(*o)).collect();
-            let mut local = m.devices(&skip);
-            for d in &mut local {
-                if let Some(&(_, free)) = cards.iter().find(|(o, _)| Some(*o) == d.ordinal) {
-                    d.memory_gib = free as f64 * GPU_UTILIZATION / GB;
-                    d.reserve_gib = Some(0.0);
-                }
-            }
-            local
-        }
-        None => inference_bench_core::discover::pool_devices_on(&specrt::hardware::host_name(), &cards),
-    };
-    let own = machine.map_or_else(specrt::hardware::host_name, |m| m.host.clone());
-    let peers: Vec<Peer> = app.hardware.peer_list(&own).into_iter().filter(|p| app.settings.cluster.paired.contains(&p.host)).collect();
-    let selection = app.hardware.selection(&app.settings.cluster);
-    devices.extend(inference_bench_core::cluster::peer_devices(&peers, &selection, app.settings.cluster.network_link()));
-    devices
+    app.inventory().devices(app.hardware.machine.as_ref(), app.settings.cluster.network_link())
 }
 
 pub fn load_spanning(app: &mut App, model: &inference_bench_core::library::LocalModel, planned: Planned, ctx: usize, seqs: usize, kv_cache_bytes: Option<u64>, served_names: Vec<String>, engine: specrt::options::EngineChoice) -> Result<(), String> {
@@ -286,7 +268,8 @@ fn this_machine(app: &mut App, ui: &mut egui::Ui) {
         for g in &m.gpus {
             let name = specrt::hardware::device_name(&m.host, g.ordinal);
             let on = !app.settings.cluster.disabled_gpus.contains(&name);
-            if gpu_card(ui, g, on) {
+            let display = app.inventory().card(&name).is_some_and(|c| c.display);
+            if gpu_card(ui, g, on, display) {
                 if !app.settings.cluster.disabled_gpus.remove(&name) {
                     app.settings.cluster.disabled_gpus.insert(name);
                 }

@@ -298,6 +298,19 @@ fn a_downloaded_kernel_description_installs_and_is_listed() {
 }
 
 #[test]
+fn fetched_family_base_parses() {
+    let base = EMBEDDED.iter().find(|(n, _)| *n == "family-base.toml").unwrap().1;
+    let r = rig();
+    let data = temp("familybase");
+    let store = SpecStore::new(&data);
+    r.publish(&[file("family-base.toml", base)], "v1", "c1");
+    assert!(matches!(store.update(&r.cfg).unwrap(), Outcome::Updated(_)));
+    let texts = family_texts(&layers(&store, &[], &[]));
+    assert!(!texts.is_empty());
+    specrt::family::Registry::from_texts(texts.iter().map(|(t, _)| t.as_str())).unwrap();
+}
+
+#[test]
 fn a_folder_beats_the_cache_beats_embedded_beats_the_checkout() {
     let r = rig();
     let data = temp("priority");

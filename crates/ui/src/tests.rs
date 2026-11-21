@@ -66,8 +66,12 @@ fn harness(name: &str, tab: Tab) -> Harness<'static, App> {
 }
 
 fn harness_sized(name: &str, tab: Tab, height: f32) -> Harness<'static, App> {
+    harness_at(name, tab, egui::vec2(1280.0, height))
+}
+
+fn harness_at(name: &str, tab: Tab, size: egui::Vec2) -> Harness<'static, App> {
     let d = dir(name);
-    Harness::builder().with_size(egui::vec2(1280.0, height)).with_max_steps(100).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
+    Harness::builder().with_size(size).with_max_steps(100).with_accessibility_check(false).allow_missing_glyphs().build_eframe(move |cc| {
         egui_bench::install(&cc.egui_ctx);
         let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
         app.tab = tab;
@@ -225,9 +229,22 @@ fn click_load(h: &mut Harness<'static, App>) {
     h.get_all_by_label("load").last().unwrap().click();
 }
 
+fn click_settled(h: &mut Harness<'static, App>, label: &str) {
+    let mut last = None;
+    for _ in 0..30 {
+        h.step();
+        let at = h.get_by_label_contains(label).accesskit_node().bounding_box();
+        if at == last {
+            break;
+        }
+        last = at;
+    }
+    h.get_by_label_contains(label).click();
+}
+
 fn with_gpu(h: &mut Harness<'static, App>, used: u64, total: u64) {
     let app = h.state_mut();
-    app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None, uuid: String::new(), own_bytes: 0 }];
+    app.gpu = vec![inference_bench_core::gpu::GpuStats { name: "test".into(), used_bytes: used, total_bytes: total, util_percent: None, uuid: String::new(), own_bytes: 0, display: false }];
     app.gpu_at = Some(Instant::now() + Duration::from_secs(600));
     app.gpu_poll = Default::default();
 }
@@ -243,7 +260,7 @@ fn the_context_slider_stops_at_the_models_own_maximum() {
     let dialog = h.state().load.as_ref().unwrap();
     let spec_max = dialog.view.as_ref().unwrap().anatomy.max_context;
     assert_eq!(spec_max, 40960);
-    assert_eq!(dialog.max, spec_max);
+    assert_eq!(dialog.max, spec_max * 16);
     h.get_by_label("LOAD QWEN3-0.6B");
 }
 
@@ -261,14 +278,14 @@ fn the_27b_config_gives_the_load_dialog_a_262144_maximum() {
     h.state_mut().open_load_dialog(&m);
     h.run();
     let dialog = h.state().load.as_ref().unwrap();
-    assert_eq!(dialog.max, 262144);
+    assert_eq!(dialog.max, 262144 * 16);
     assert_eq!(crate::load::max_context(&dialog.view.as_ref().unwrap().anatomy), 262144);
 }
 
 #[test]
 fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
     let mut h = harness("load-three-gpus", Tab::Models);
-    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false };
     {
         let app = h.state_mut();
         app.gpu = vec![gpu(24), gpu(24), gpu(24)];
@@ -290,11 +307,11 @@ fn the_load_dialog_judges_fit_across_every_gpu_like_discover_does() {
     assert!(weights > list[0], "the model must be too big for GPU 0 alone");
     assert_eq!(h.state().free_gpu_bytes(), Some(list.iter().sum()));
     let devices = inference_bench_core::discover::pool_devices(&list);
-    let r = dialog.plan(&devices, Default::default());
+    let r = dialog.planned(&devices);
     assert!(matches!(r, Some(Ok(_))), "{:?} {:?} {:?}", r.map(|r| r.map(|p| p.placement.render())), devices.iter().map(|d| d.memory_gib).collect::<Vec<_>>(), dialog.seqs);
     h.get_by_label_contains("free on 3 gpus");
     h.get_by_label_contains("load plan");
-    h.get_by_label_contains("layers 0-");
+    assert!(!h.query_all_by_label_contains("layers 0-").collect::<Vec<_>>().is_empty());
 }
 
 #[test]
@@ -307,7 +324,7 @@ fn load_stays_available_when_the_planner_says_the_model_will_not_fit() {
     h.state_mut().load.as_mut().unwrap().ctx = 40960;
     h.run();
     assert!(h.query_all_by_label_contains("still try to load").count() >= 1);
-    h.get_by_label_contains("load plan");
+    assert!(h.query_by_label_contains("gpu 0").is_none());
     let load = click_load_node(&mut h);
     assert!(!load, "the load key must not be disabled");
 }
@@ -727,7 +744,7 @@ fn the_load_dialog_has_a_parallel_requests_slider_and_the_estimate_grows_with_it
     dialog.kv_gb = 1.0;
     let four = dialog.estimate(free).unwrap();
     assert_eq!(four.kv, 1 << 30);
-    assert_eq!(dialog.max, crate::load::max_context(&dialog.view.as_ref().unwrap().anatomy));
+    assert_eq!(dialog.max, crate::load::max_context(&dialog.view.as_ref().unwrap().anatomy) * 16);
     assert_eq!(four.weights, one.weights);
     let a = detail_view("seqs-27b", Some("qwen3.8-27b-exact.toml")).anatomy;
     let (a1, a4) = (crate::load::estimate(&a, 1 << 30, 1, None), crate::load::estimate(&a, 1 << 30, 4, None));
@@ -762,8 +779,8 @@ fn the_load_dialog_slider_runs_to_the_model_max_with_four_parallel_requests() {
     let d = h.state_mut().load.as_mut().unwrap();
     d.seqs = 4;
     let a = &d.view.as_ref().unwrap().anatomy;
-    assert_eq!(d.max, crate::load::max_context(a));
-    d.ctx = d.max;
+    assert_eq!(d.max, crate::load::max_context(a) * 16);
+    d.ctx = crate::load::max_context(a);
     assert!(d.estimate(Some(96 << 30)).unwrap().kv <= (96u64 << 30));
 }
 
@@ -775,8 +792,8 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
     let m = real_model("Qwen3-0.6B");
     h.state_mut().library[0] = m.clone();
     h.state_mut().open_load_dialog(&m);
-    assert_eq!(h.state().load.as_ref().unwrap().seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
     h.state_mut().load.as_mut().unwrap().seqs = 6;
+    h.state_mut().load.as_mut().unwrap().pin_seqs = true;
     h.run();
     click_load(&mut h);
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
@@ -795,7 +812,9 @@ fn the_server_tab_kv_total_is_the_shared_pool_chosen_in_the_dialog() {
     h.state_mut().open_load_dialog(&m);
     let d = h.state_mut().load.as_mut().unwrap();
     d.seqs = 4;
+    d.pin_seqs = true;
     d.kv_gb = 3.0;
+    d.pin_kv = true;
     let pool = d.kv_bytes().unwrap();
     h.run();
     click_load(&mut h);
@@ -1872,7 +1891,8 @@ fn the_advanced_section_renders_every_option_the_engine_declares() {
 fn the_dialog_defaults_are_the_engine_defaults_and_max_performance() {
     let h = open_dialog("adv-defaults");
     let d = h.state().load.as_ref().unwrap();
-    assert_eq!(d.seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
+    assert!(d.seqs >= specrt::options::DEFAULT_MAX_NUM_SEQS, "{}", d.seqs);
+    assert!(d.solved.as_ref().is_some_and(|s| s.is_ok()));
     assert!(!d.choice.is_custom());
     for f in specrt::options::schema() {
         if f.key == "runtime.prefix_cache.enabled" {
@@ -1930,15 +1950,13 @@ fn changing_a_field_shows_custom_and_its_reset_key_restores_the_default() {
     assert!(h.query_by_label_contains("changed from the profile").is_none());
     assert!(h.query_by_label("reset").is_none());
     let d = h.state_mut().load.as_mut().unwrap();
-    d.seqs = 2;
-    d.choice.set("serve.max_num_seqs", serde_json::json!(2));
+    d.choice.set("serve.max_batched_tokens", serde_json::json!(1024));
     h.run();
     h.get_by_label_contains("1 advanced option(s) changed from the profile");
     h.get_by_label("reset");
-    h.state_mut().load.as_mut().unwrap().reset("serve.max_num_seqs");
+    h.state_mut().load.as_mut().unwrap().reset("serve.max_batched_tokens");
     h.run();
     let d = h.state().load.as_ref().unwrap();
-    assert_eq!(d.seqs, specrt::options::DEFAULT_MAX_NUM_SEQS);
     assert!(!d.choice.is_custom());
     assert!(h.query_by_label_contains("changed from the profile").is_none());
 }
@@ -2011,6 +2029,51 @@ fn screenshots_of_the_load_dialog_with_advanced_folded_and_open() {
 }
 
 #[test]
+fn the_load_dialog_with_a_million_token_context_fits_desktop_and_phone_widths() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (w, h_px, tag) in [(1280.0, 800.0, "desktop"), (390.0, 844.0, "phone")] {
+        let d = dir(&format!("yarn-shot-{tag}"));
+        let mut h = Harness::builder().with_size(egui::vec2(w, h_px)).with_max_steps(100).with_accessibility_check(false).allow_missing_glyphs().build_eframe({
+            let d = d.clone();
+            move |cc| {
+                egui_bench::install(&cc.egui_ctx);
+                let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
+                app.tab = Tab::Models;
+                app.logs = shared_logs();
+                app.library = vec![model("small-dense", true, "dense decoder")];
+                app
+            }
+        });
+        with_gpu(&mut h, 20 << 30, 96 << 30);
+        let md = dir(&format!("yarn-shot-model-{tag}"));
+        std::fs::create_dir_all(&md).unwrap();
+        std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), md.join("config.json")).unwrap();
+        let mut m = model("big-dense", true, "dense decoder");
+        (m.path, m.root) = (md.clone(), md);
+        m.context_length = None;
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().open_load_dialog(&m);
+        h.run();
+        let dialog = h.state_mut().load.as_mut().unwrap();
+        dialog.ctx = dialog.max;
+        h.run();
+        let dialog = h.state().load.as_ref().unwrap();
+        assert_eq!(dialog.ctx, 262144 * 16);
+        assert_eq!(dialog.extension_factor(), 16);
+        assert_eq!(dialog.choice.value("runtime.rope_extension.type").as_str(), Some("yarn"));
+        h.render().unwrap().save(out.join(format!("load-dialog-yarn-{tag}.png"))).unwrap();
+        let dialog = h.state_mut().load.as_mut().unwrap();
+        dialog.ctx = 262144;
+        h.run();
+        let dialog = h.state().load.as_ref().unwrap();
+        assert_eq!(dialog.extension_factor(), 1);
+        assert_eq!(dialog.choice.value("runtime.rope_extension.type").as_str(), None);
+        h.render().unwrap().save(out.join(format!("load-dialog-native-{tag}.png"))).unwrap();
+    }
+}
+
+#[test]
 fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_cache() {
     let mut h = harness("extension", Tab::Models);
     with_gpu(&mut h, 0, 96 << 30);
@@ -2024,11 +2087,28 @@ fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_ca
     h.state_mut().open_load_dialog(&m);
     h.run();
     let dialog = h.state_mut().load.as_mut().unwrap();
-    assert_eq!(dialog.max, 262144);
+    assert_eq!(dialog.max, 262144 * 16);
+    assert_eq!(dialog.max, 262144 * 16);
+    dialog.ctx = 1_048_576;
+    dialog.sync();
+    assert_eq!(dialog.choice.value("runtime.rope_extension.type").as_str(), Some("yarn"));
+    assert_eq!(dialog.extension_factor(), 4);
+    dialog.ctx = 262144 * 2 + 1;
+    dialog.sync();
+    assert_eq!(dialog.extension_factor(), 3);
+    dialog.ctx = 262144;
+    dialog.sync();
+    assert_eq!(dialog.choice.value("runtime.rope_extension.type").as_str(), None);
+    assert_eq!(dialog.extension_factor(), 1);
+    dialog.choice.set("runtime.rope_extension.type", serde_json::json!("yarn"));
+    dialog.sync();
+    assert_eq!(dialog.extension_factor(), 4);
+    dialog.choice.reset("runtime.rope_extension.type");
+    dialog.choice.reset("runtime.rope_extension.factor");
     dialog.choice.set("runtime.rope_extension.factor", serde_json::json!(4));
     dialog.sync();
-    assert_eq!(dialog.max, 1_048_576);
-    dialog.ctx = dialog.max;
+    assert_eq!(dialog.max, 262144 * 16);
+    dialog.ctx = 1_048_576;
     dialog.seqs = 1;
     let kv = dialog.estimate(Some(96 << 30)).unwrap().kv;
     let gib = kv as f64 / (1u64 << 30) as f64;
@@ -2043,8 +2123,8 @@ fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_ca
     assert_eq!(dialog.serve_options().unwrap().runtime.unwrap().rope_extension.unwrap().factor, 4);
     dialog.choice.reset("runtime.rope_extension.factor");
     dialog.sync();
-    assert_eq!(dialog.max, 262144);
-    assert_eq!(dialog.ctx, 262144);
+    assert_eq!(dialog.max, 262144 * 16);
+    assert_eq!(dialog.ctx, 262144 * 4);
 }
 
 fn fixture_spec_model() -> LocalModel {
@@ -2133,7 +2213,7 @@ fn peers_from_fake_announcements_show_name_gpus_memory_and_busy_state() {
 #[test]
 fn switching_a_gpu_off_in_the_hardware_tab_removes_it_from_every_budget() {
     let mut h = hardware_harness("hwswitch", 2);
-    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false };
     {
         let app = h.state_mut();
         app.gpu = vec![gpu(24), gpu(24)];
@@ -2416,7 +2496,7 @@ fn screenshot_of_discover() {
 #[test]
 fn the_budget_excludes_this_apps_own_memory_and_a_model_that_fits_then_shows_as_fitting() {
     use inference_bench_core::gpu::{GpuStats, attribute, parse_compute_apps};
-    let mut gpu = vec![GpuStats { name: "RTX".into(), used_bytes: 87 << 30, total_bytes: 96 << 30, util_percent: None, uuid: "GPU-a".into(), own_bytes: 0 }];
+    let mut gpu = vec![GpuStats { name: "RTX".into(), used_bytes: 87 << 30, total_bytes: 96 << 30, util_percent: None, uuid: "GPU-a".into(), own_bytes: 0, display: false }];
     attribute(&mut gpu, &parse_compute_apps("GPU-a, 4242, 61440\nGPU-a, 7, 12288\n"), &[4242]);
     let mut h = harness("budget", Tab::Models);
     h.state_mut().gpu = gpu;
@@ -2645,8 +2725,12 @@ fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
 }
 
 fn two_gpu_27b_dialog(name: &str) -> Harness<'static, App> {
-    let mut h = harness(name, Tab::Models);
-    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0 };
+    two_gpu_27b_dialog_at(name, egui::vec2(1280.0, 800.0))
+}
+
+fn two_gpu_27b_dialog_at(name: &str, size: egui::Vec2) -> Harness<'static, App> {
+    let mut h = harness_at(name, Tab::Models, size);
+    let gpu = |total: u64| inference_bench_core::gpu::GpuStats { name: "card".into(), used_bytes: 0, total_bytes: total << 30, util_percent: None, uuid: String::new(), own_bytes: 0, display: false };
     {
         let app = h.state_mut();
         app.gpu = vec![gpu(96), gpu(96)];
@@ -2678,40 +2762,35 @@ fn the_user_settings_on_two_96gb_gpus_plan_across_both() {
         d.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
         d.choice.set("runtime.kv_f16_layers", serde_json::json!(0));
         d.seqs = 21;
+        d.pin_seqs = true;
         d.ctx = 262144;
         d.sync();
-        let base = d.anatomy().unwrap().total_bytes + d.anatomy().unwrap().state_bytes_per_seq * 21;
-        d.kv_gb = ((120.0 - base as f64 / (1u64 << 30) as f64) * 4.0).round() / 4.0;
     }
+    h.run();
     let app = h.state();
     let devices = crate::hardware::load_devices(app);
     let d = app.load.as_ref().unwrap();
-    let planned = d.plan(&devices, app.settings.cluster.objective).unwrap().unwrap();
-    assert_eq!(planned.placement.stages.len(), 2);
-    assert!(planned.placement.stages.iter().all(|s| s.kv_bytes > 20 << 30), "the whole 120 GB request is planned, not one GPU's share");
-    let kv_total: u64 = planned.placement.stages.iter().map(|s| s.kv_bytes).sum();
-    let pool = d.kv_bytes().unwrap();
-    assert!(kv_total <= pool + (1 << 20) && kv_total + (1 << 30) > pool, "{kv_total} against pool {pool}");
+    let planned = d.planned(&devices).unwrap().unwrap();
+    assert_eq!(planned.placement.stages.len(), 1);
+    assert_eq!(planned.placement.stages[0].tp, 2);
     assert_eq!(planned.placement.slots, 21);
-    h.run();
-    h.get_by_label_contains("will span 2 gpus");
-    h.get_by_label_contains("desk/gpu0");
-    h.get_by_label_contains("desk/gpu1");
+    assert_eq!(planned.placement.context.min(262144), planned.placement.context);
+    h.get_by_label_contains("TP 2 across desk / GPU 0 + desk / GPU 1");
+    h.get_by_label_contains("GPU 0 layers 0-");
+    h.get_by_label_contains("GPU 1 layers 0-");
 }
 
-type Seen = std::sync::Arc<std::sync::Mutex<Vec<(usize, Option<u64>, Option<specrt::placement::PlacementConfig>)>>>;
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<specrt::serve::ServeOptions>>>;
+
+const SCRIPTED_REPO: &str = "acme/dense-27b-nvfp4";
 
 fn recording_engine(app: &mut App) -> Seen {
     let seen: Seen = Default::default();
     let log = seen.clone();
-    let slot = app.hardware.slot.clone();
-    let script = Script { models: vec!["acme/Qwen3.8-27B-NVFP4".into()], ..script() };
+    let script = Script { models: vec![SCRIPTED_REPO.into()], ..script() };
     let fake = inference_bench_core::fake::ScriptedServing::factory(script.clone());
-    let serving: inference_bench_core::engine::ServingFactory = std::sync::Arc::new(move |mut opts| {
-        if let Some(p) = slot.lock().unwrap().clone() {
-            opts.placement = Some(p);
-        }
-        log.lock().unwrap().push((opts.max_num_seqs, opts.kv_cache_bytes, opts.placement.clone()));
+    let serving: inference_bench_core::engine::ServingFactory = std::sync::Arc::new(move |opts| {
+        log.lock().unwrap().push(opts.clone());
         fake(opts)
     });
     app.engine = inference_bench_core::engine::Engine::with_factories(app.wake.clone(), ScriptedModel::factory(script), serving);
@@ -2719,53 +2798,169 @@ fn recording_engine(app: &mut App) -> Seen {
 }
 
 #[test]
-fn loading_the_user_settings_hands_the_engine_the_plan_the_dialog_showed() {
+fn the_engine_receives_exactly_the_solved_plan_the_dialog_showed() {
     let mut h = two_gpu_27b_dialog("two96load");
     let seen = recording_engine(h.state_mut());
     {
         let app = h.state_mut();
-        app.library[0].repo = "acme/Qwen3.8-27B-NVFP4".into();
+        app.library[0].repo = SCRIPTED_REPO.into();
         let d = app.load.as_mut().unwrap();
-        d.model.repo = "acme/Qwen3.8-27B-NVFP4".into();
-        d.choice.set("runtime.kv_dtype", serde_json::json!("fp8"));
-        d.choice.set("runtime.kv_f16_layers", serde_json::json!(0));
+        d.model.repo = SCRIPTED_REPO.into();
         d.seqs = 21;
+        d.pin_seqs = true;
         d.ctx = 262144;
         d.sync();
-        let base = d.anatomy().unwrap().total_bytes + d.anatomy().unwrap().state_bytes_per_seq * 21;
-        d.kv_gb = ((120.0 - base as f64 / (1u64 << 30) as f64) * 4.0).round() / 4.0;
     }
-    let (shown, pool, mut spec) = {
-        let app = h.state();
-        let devices = crate::hardware::load_devices(app);
-        let d = app.load.as_ref().unwrap();
-        (d.plan(&devices, app.settings.cluster.objective).unwrap().unwrap(), d.kv_bytes().unwrap(), d.view.as_ref().unwrap().spec.clone())
-    };
-    spec.runtime.kv_dtype = specrt::spec::KvDtype::Fp8;
-    spec.runtime.kv_f16_layers = Some(0);
     h.run();
+    let shown = h.state().load.as_ref().unwrap().solved.clone().unwrap().unwrap();
+    assert_eq!(shown.tp, 2);
     click_load(&mut h);
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     let loaded = h.state().loaded().unwrap();
     assert_eq!(loaded.max_num_seqs, 21);
-    assert!(loaded.parallel_note.is_none(), "{:?}", loaded.parallel_note);
     let calls = seen.lock().unwrap().clone();
-    assert_eq!(calls.len(), 1, "{calls:?}");
-    let (seqs, kv, placement) = calls[0].clone();
-    assert_eq!((seqs, kv), (21, Some(pool)));
-    let placement = placement.expect("the engine is given the placement");
-    assert_eq!(placement, shown.config());
-    assert_eq!(placement.stages.len(), 2);
-    assert_eq!(placement.slots, 21);
-    assert_eq!(placement.weight_bytes, shown.sizing.weight_bytes);
-    assert_eq!(placement.kv_pool_bytes, Some(pool));
-    let engine_plan = placement.place(&spec).unwrap();
-    assert_eq!(engine_plan.ranges(), shown.placement.ranges());
-    for (a, b) in engine_plan.stages.iter().zip(&shown.placement.stages) {
-        assert_eq!((a.kv_bytes, a.weight_bytes, a.state_bytes), (b.kv_bytes, b.weight_bytes, b.state_bytes));
+    assert_eq!(calls.len(), 1, "{} calls", calls.len());
+    let got = calls[0].solved.as_deref().expect("the engine is given the solved plan");
+    assert_eq!(got, &shown);
+    assert!(calls[0].placement.is_none());
+    assert_eq!((calls[0].tp, calls[0].max_num_seqs, calls[0].kv_cache_bytes), (shown.tp, shown.slots, Some(shown.kv_pool_bytes)));
+}
+
+#[test]
+fn unticking_gpu_0_in_the_dialog_plans_and_loads_on_gpu_1_only() {
+    let mut h = two_gpu_27b_dialog("untick-gpu0");
+    let seen = recording_engine(h.state_mut());
+    {
+        let app = h.state_mut();
+        app.library[0].repo = SCRIPTED_REPO.into();
+        app.load.as_mut().unwrap().model.repo = SCRIPTED_REPO.into();
     }
-    let per_device: Vec<u64> = engine_plan.stages.iter().map(|s| s.used_bytes()).collect();
-    assert!(per_device.iter().all(|b| *b <= 96 << 30), "{per_device:?}");
+    h.get_by_label_contains("GPU 0 layers 0-");
+    click_settled(&mut h, "GPU 0  ");
+    h.run();
+    assert!(h.state().settings.cluster.disabled_gpus.contains("desk/gpu0"));
+    let shown = h.state().load.as_ref().unwrap().solved.clone().unwrap().unwrap();
+    assert_eq!(shown.ordinals(), vec![1], "{}", shown.strategy);
+    h.get_by_label_contains("fits on desk / GPU 1");
+    h.get_by_label_contains("GPU 1 layers 0-");
+    assert!(h.query_by_label_contains("GPU 0 layers").is_none());
+    click_load(&mut h);
+    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
+    let calls = seen.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    let got = calls[0].solved.as_deref().expect("the engine is given the solved plan");
+    assert_eq!(got.ordinals(), vec![1]);
+    assert_eq!(calls[0].tp, 1);
+}
+
+#[test]
+fn with_every_gpu_unticked_the_dialog_refuses_to_load_on_a_default_gpu() {
+    let mut h = two_gpu_27b_dialog("untick-all");
+    let seen = recording_engine(h.state_mut());
+    click_settled(&mut h, "GPU 0  ");
+    h.run();
+    click_settled(&mut h, "GPU 1  ");
+    h.run();
+    assert_eq!(h.state().settings.cluster.disabled_gpus.len(), 2);
+    click_load(&mut h);
+    for _ in 0..5 {
+        h.run();
+    }
+    assert!(seen.lock().unwrap().is_empty(), "nothing may load with no gpu selected");
+    let notice = h.state().notice.clone().unwrap();
+    assert!(!notice.0 && notice.1.contains("no gpu selected"), "{notice:?}");
+}
+
+#[test]
+fn with_gpu_0_unticked_a_model_with_no_plan_is_not_loaded_on_gpu_0() {
+    let mut h = two_gpu_27b_dialog("unplanned-gpu0-off");
+    let seen = recording_engine(h.state_mut());
+    click_settled(&mut h, "GPU 0  ");
+    h.run();
+    {
+        let d = h.state_mut().load.as_mut().unwrap();
+        d.view = Err("no spec for this architecture".into());
+        d.solved = d.solve(&[]);
+    }
+    h.run();
+    assert!(h.state().load.as_ref().unwrap().solved.is_none());
+    click_load(&mut h);
+    for _ in 0..5 {
+        h.run();
+    }
+    assert!(seen.lock().unwrap().is_empty(), "an unplanned load would open GPU 0");
+    let notice = h.state().notice.clone().unwrap();
+    assert!(!notice.0 && notice.1.contains("GPU 0, which is switched off"), "{notice:?}");
+}
+
+#[test]
+fn a_model_that_lands_on_the_wrong_gpu_is_reported_against_the_plan() {
+    let mut h = two_gpu_27b_dialog("landing");
+    recording_engine(h.state_mut());
+    {
+        let app = h.state_mut();
+        app.library[0].repo = SCRIPTED_REPO.into();
+        app.load.as_mut().unwrap().model.repo = SCRIPTED_REPO.into();
+    }
+    click_settled(&mut h, "GPU 0  ");
+    h.run();
+    click_load(&mut h);
+    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
+    let mut l = h.state().loaded().unwrap();
+    assert!(h.state().landing(&l).is_none());
+    l.landed = vec![("GPU-fake-1".into(), 40 << 30)];
+    let ok = h.state().landing(&l).unwrap();
+    assert!(ok.matches_plan && ok.text.starts_with("running on GPU 1"), "{ok:?}");
+    l.landed = vec![("GPU-fake-0".into(), 40 << 30)];
+    let wrong = h.state().landing(&l).unwrap();
+    assert!(!wrong.matches_plan && wrong.text.starts_with("running on GPU 0"), "{wrong:?}");
+}
+
+#[test]
+fn the_dialog_lists_every_gpu_and_marks_the_one_driving_a_display() {
+    let mut h = two_gpu_27b_dialog("display-gpu");
+    h.state_mut().gpu[0].display = true;
+    h.run();
+    let line = h.get_by_label_contains("GPU 0  ").accesskit_node().label().unwrap_or_default().to_string();
+    assert!(line.contains("drives a display"), "{line}");
+    let other = h.get_by_label_contains("GPU 1  ").accesskit_node().label().unwrap_or_default().to_string();
+    assert!(!other.contains("drives a display"), "{other}");
+    assert!(other.contains("free of"), "{other}");
+}
+
+#[test]
+fn low_memory_on_two_gpus_plans_one_gpu_and_shows_one_plan_row() {
+    let mut h = two_gpu_27b_dialog("low-memory-one-gpu");
+    h.state_mut().load.as_mut().unwrap().choice.select(specrt::options::Profile::LowMemory);
+    h.run();
+    let rows = ["GPU 0 layers 0-", "GPU 1 layers 0-"].iter().map(|l| h.query_all_by_label_contains(l).count()).sum::<usize>();
+    assert_eq!(rows, 1);
+}
+
+#[test]
+fn the_load_dialog_fits_every_window_size() {
+    for (w, hgt) in [(1024.0, 700.0), (1280.0, 800.0), (1920.0, 1080.0), (390.0, 844.0)] {
+        let mut h = two_gpu_27b_dialog_at(&format!("dialog-fit-{w}"), egui::vec2(w, hgt));
+        for key in ["load", "cancel"] {
+            let b = h.get_all_by_label(key).last().unwrap().accesskit_node().bounding_box().unwrap();
+            assert!(b.x0 >= 0.0 && b.x1 <= w as f64 && b.y0 >= 0.0 && b.y1 <= hgt as f64, "{key} at {b:?} outside {w}x{hgt}");
+        }
+        let hw = h.get_by_label_contains("GPU 1  ").accesskit_node().bounding_box().unwrap();
+        assert!(hw.x1 <= w as f64, "hardware row {hw:?} outside {w}");
+        h.state_mut().load.as_mut().unwrap().advanced = false;
+    }
+}
+
+#[test]
+fn the_dialog_shows_the_placement_strategy_for_each_profile() {
+    let mut h = two_gpu_27b_dialog("strategy-lines");
+    h.get_by_label_contains("placement TP 2 across desk / GPU 0 + desk / GPU 1");
+    h.state_mut().load.as_mut().unwrap().choice.select(specrt::options::Profile::LowMemory);
+    h.run();
+    h.get_by_label_contains("smallest that fits");
+    let d = h.state().load.as_ref().unwrap();
+    let s = d.solved.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!((s.tp, s.placement.stages.len(), s.slots), (1, 1, 2));
 }
 
 fn two_model_script() -> Script {

@@ -8,6 +8,7 @@ pub struct GpuStats {
     pub util_percent: Option<u32>,
     pub uuid: String,
     pub own_bytes: u64,
+    pub display: bool,
 }
 
 impl GpuStats {
@@ -46,6 +47,20 @@ pub fn attribute(stats: &mut [GpuStats], apps: &[(String, u32, u64)], own_pids: 
     for g in stats.iter_mut() {
         g.own_bytes = apps.iter().filter(|(u, p, _)| *u == g.uuid && own_pids.contains(p)).map(|a| a.2).sum();
     }
+}
+
+pub const LANDED_MIN_BYTES: u64 = 256 << 20;
+
+pub fn landed(before: &[GpuStats], after: &[GpuStats]) -> Vec<(String, u64)> {
+    after
+        .iter()
+        .filter(|a| !a.uuid.is_empty())
+        .filter_map(|a| {
+            let was = before.iter().find(|b| b.uuid == a.uuid).map_or(0, |b| b.own_bytes);
+            let grew = a.own_bytes.saturating_sub(was);
+            (grew >= LANDED_MIN_BYTES).then(|| (a.uuid.clone(), grew))
+        })
+        .collect()
 }
 
 pub fn own_pids() -> Vec<u32> {
@@ -90,6 +105,7 @@ pub fn parse_nvidia_smi(output: &str) -> Vec<GpuStats> {
                 util_percent: f[3].parse().ok(),
                 uuid: f.get(4).map(|u| u.to_string()).unwrap_or_default(),
                 own_bytes: 0,
+                display: f.get(5).is_some_and(|d| d.eq_ignore_ascii_case("enabled")),
             })
         })
         .collect()
@@ -98,7 +114,7 @@ pub fn parse_nvidia_smi(output: &str) -> Vec<GpuStats> {
 pub fn sample() -> Vec<GpuStats> {
     let mut stats = Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,memory.used,memory.total,utilization.gpu,uuid",
+            "--query-gpu=name,memory.used,memory.total,utilization.gpu,uuid,display_active",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -122,12 +138,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn landed_names_only_the_gpus_whose_own_memory_grew() {
+        let g = |uuid: &str, own: u64| GpuStats { name: "card".into(), used_bytes: own, total_bytes: 96 << 30, util_percent: None, uuid: uuid.into(), own_bytes: own, display: false };
+        let before = [g("GPU-a", 0), g("GPU-b", 1 << 30)];
+        let after = [g("GPU-a", 10 << 20), g("GPU-b", 40 << 30)];
+        assert_eq!(landed(&before, &after), vec![("GPU-b".to_string(), 39 << 30)]);
+        assert!(landed(&after, &after).is_empty());
+    }
+
+    #[test]
     fn nvidia_smi_csv_is_parsed_into_bytes() {
         let out = "NVIDIA RTX PRO 6000 Blackwell, 85926, 97887, 96\nbroken line\nGPU 2, 10, 20, [N/A]\n";
         let g = parse_nvidia_smi(out);
         assert_eq!(g.len(), 2);
         assert_eq!((g[0].used_bytes, g[0].total_bytes, g[0].util_percent), (85926 << 20, 97887 << 20, Some(96)));
         assert_eq!(g[1].util_percent, None);
+        assert!(!g[0].display);
+    }
+
+    #[test]
+    fn the_gpu_driving_a_display_is_marked() {
+        let g = parse_nvidia_smi("RTX, 1, 96000, 0, GPU-a, Enabled\nRTX, 1, 96000, 0, GPU-b, Disabled\n");
+        assert_eq!((g[0].display, g[1].display), (true, false));
     }
 
     #[test]

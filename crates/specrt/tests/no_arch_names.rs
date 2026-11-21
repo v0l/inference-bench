@@ -34,7 +34,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "core/src/specs/tests.rs", lines: 16, kind: Kind::Permanent, note: "spec catalogue tests" },
     Entry { path: "core/src/store.rs", lines: 2, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "server/src/app.rs", lines: 2, kind: Kind::Permanent, note: "route docs name the llama.cpp dialect" },
-    Entry { path: "server/src/config.rs", lines: 11, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
+    Entry { path: "server/src/config.rs", lines: 12, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "server/src/connect.rs", lines: 4, kind: Kind::Permanent, note: "tests use model ids" },
     Entry { path: "server/src/metrics.rs", lines: 10, kind: Kind::Permanent, note: "tests use model ids" },
     Entry { path: "server/src/serve.rs", lines: 2, kind: Kind::Permanent, note: "tests use model ids" },
@@ -46,6 +46,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "specrt/src/placement.rs", lines: 29, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/plan.rs", lines: 13, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/serve.rs", lines: 1, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
+    Entry { path: "specrt/src/solve.rs", lines: 1, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/structure.rs", lines: 7, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/tp.rs", lines: 12, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/weights.rs", lines: 11, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
@@ -55,7 +56,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "ui/src/load.rs", lines: 1, kind: Kind::Permanent, note: "example served name shown as a hint" },
     Entry { path: "ui/src/models.rs", lines: 1, kind: Kind::Permanent, note: "example model name shown as a hint" },
     Entry { path: "ui/src/table.rs", lines: 3, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
-    Entry { path: "ui/src/tests.rs", lines: 152, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
+    Entry { path: "ui/src/tests.rs", lines: 150, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
 ];
 
 fn allowed(rel: &str) -> usize {
