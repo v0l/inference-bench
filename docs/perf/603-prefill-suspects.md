@@ -167,3 +167,19 @@ cargo test --release -p inference-bench-specrt --test flash_speed --test gemm_sp
 SPECRT_FLASH_TOKENS=512 SPECRT_FLASH_FP8=1 ~/.agents/bin/gpu-run 0 -- cargo test --release -p inference-bench-specrt --test flash_speed -- --ignored --nocapture
 SPECRT_GEMM_TOKENS=512,2048,4096 ~/.agents/bin/gpu-run 0 -- cargo test --release -p inference-bench-specrt --test gemm_speed prefill_gemm_speed_fp8_channel_and_fp4 -- --ignored --nocapture
 ```
+
+## #973 FP8 huge tile at 16,384 rows
+
+Isolated `_huge` GEMM on GPU1 (RTX PRO 6000), m = 16384, median of 10. The tile is set with `[runtime] fp8_tile = [bm, bn, wm, wn]` (`SPECRT_F8_TILE=128x128x2x4` in `tests/gemm_speed.rs`). TFLOP/s for gate_up / down / lin_in, block-128 FP8 spec:
+
+| tile | gate_up | down | lin_in |
+|---|---|---|---|
+| 128x128 2x4 (default) | 355 | 373 | 395 |
+| 128x128 4x2 | 366 | 390 | 397 |
+| 256x128 2x4 | 355 | 385 | 363 |
+| 128x256 4x2 | 254 | 315 | 339 |
+| 128x256 2x4 | 224 | 312 | 311 |
+| 256x128 4x2 | 279 | 294 | 294 |
+| 64x256 2x4 | 194 | 370 | 381 |
+
+Per-channel spec (the NVFP4 model's FP8 layers): 128x128 2x4 gives 484 / 493 / 497, 128x128 4x2 gives 468 / 487 / 491. The best alternative is +3% on gate_up and +4.5% on down for one spec only, so no tile reaches the 5% bar. The default stays and no loadtest was run.
