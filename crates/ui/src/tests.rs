@@ -2011,6 +2011,51 @@ fn screenshots_of_the_load_dialog_with_advanced_folded_and_open() {
 }
 
 #[test]
+fn the_load_dialog_with_a_million_token_context_fits_desktop_and_phone_widths() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (w, h_px, tag) in [(1280.0, 800.0, "desktop"), (390.0, 844.0, "phone")] {
+        let d = dir(&format!("yarn-shot-{tag}"));
+        let mut h = Harness::builder().with_size(egui::vec2(w, h_px)).with_max_steps(100).with_accessibility_check(false).allow_missing_glyphs().build_eframe({
+            let d = d.clone();
+            move |cc| {
+                egui_bench::install(&cc.egui_ctx);
+                let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
+                app.tab = Tab::Models;
+                app.logs = shared_logs();
+                app.library = vec![model("Qwen3-0.6B", true, "dense decoder")];
+                app
+            }
+        });
+        with_gpu(&mut h, 20 << 30, 96 << 30);
+        let md = dir(&format!("yarn-shot-model-{tag}"));
+        std::fs::create_dir_all(&md).unwrap();
+        std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), md.join("config.json")).unwrap();
+        let mut m = model("Qwen3.8-27B", true, "dense decoder");
+        (m.path, m.root) = (md.clone(), md);
+        m.context_length = None;
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().open_load_dialog(&m);
+        h.run();
+        let dialog = h.state_mut().load.as_mut().unwrap();
+        dialog.ctx = dialog.max;
+        h.run();
+        let dialog = h.state().load.as_ref().unwrap();
+        assert_eq!(dialog.ctx, 262144 * 16);
+        assert_eq!(dialog.extension_factor(), 16);
+        assert_eq!(dialog.choice.value("runtime.rope_extension.type").as_str(), Some("yarn"));
+        h.render().unwrap().save(out.join(format!("load-dialog-yarn-{tag}.png"))).unwrap();
+        let dialog = h.state_mut().load.as_mut().unwrap();
+        dialog.ctx = 262144;
+        h.run();
+        let dialog = h.state().load.as_ref().unwrap();
+        assert_eq!(dialog.extension_factor(), 1);
+        assert_eq!(dialog.choice.value("runtime.rope_extension.type").as_str(), None);
+        h.render().unwrap().save(out.join(format!("load-dialog-native-{tag}.png"))).unwrap();
+    }
+}
+
+#[test]
 fn a_context_extension_lifts_the_slider_to_a_million_tokens_and_prices_the_kv_cache() {
     let mut h = harness("extension", Tab::Models);
     with_gpu(&mut h, 0, 96 << 30);

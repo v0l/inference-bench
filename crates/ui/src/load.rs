@@ -368,7 +368,7 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
     let r = egui::Modal::new(egui::Id::new("load-model"))
         .backdrop_color(egui::Color32::from_black_alpha(150))
         .show(ctx, |ui| {
-            ui.set_width(520.0);
+            ui.set_width(520.0f32.min(ui.ctx().content_rect().width() - 32.0).max(280.0));
             modal_title(ui, &format!("Load {}", dialog.model.name));
             if let Err(e) = &dialog.view {
                 status(ui, false, e);
