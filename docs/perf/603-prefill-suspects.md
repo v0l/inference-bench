@@ -92,7 +92,57 @@ Measure: the nsys timeline of the 8-client run with `crates/specrt/scripts/prefi
 
 ## Order to work in
 
-1 and 2 are scheduler policy. They can be built and proven on CPU with the `Fake` sim, and are likely most of the 2x TTFT target on their own. Then 5 (a config default). Then 4 and 6, which matter only at the chunk sizes the scheduler ends up using. Then 3 and 7, the larger kernel and executor work.
+1 and 2 are scheduler policy, now built as options (below). Then 5 (a config default). Then 4 and 6, which matter only at the chunk sizes the scheduler ends up using. Then 3 and 7, the larger kernel and executor work.
+
+## Suspects 1 and 2: new options and the CPU sim
+
+Two serving options, both off by default so behaviour is unchanged until a GPU run decides:
+
+| option | default | effect |
+|---|---|---|
+| `serve.prefill_burst_tokens` (`prefill_burst_tokens` in server.toml, `--prefill-burst-tokens`) | 0 | While a prompt over 2,048 tokens is waiting or being read, a step carries at least this many prompt tokens (capped by `max_batched_tokens`), even when decoders fill `itl_target`. With no long prompt pending, the budget is exactly as before, so chat and short prompts keep the `itl_target` behaviour. |
+| `serve.max_long_in_flight` (`max_long_in_flight`, `--max-long-in-flight`) | 1 | Prompts over 2,048 tokens admitted for prefill at the same time. 1 is the old hard gate. |
+
+Tests in `crates/specrt/src/sched.rs` (both failed on the old code, then passed with the options set):
+- `a_long_prompt_beside_decoders_is_read_in_burst_sized_steps`: 8 MTP decoders and one 16k prompt. Default: at least 30 steps to the first token (512 per step). `prefill_burst_tokens = 16384`: at most 6.
+- `several_long_prompts_may_prefill_at_once`: 4 waiting 16k prompts. Default: one at a time. `max_long_in_flight = 4`: all four.
+
+Sim (`print_long_prompt_table`, ignored, run with `--ignored --nocapture`): the user's shape. 24 requests arrive 1 per second, 8 clients, 15-18k prompts, 256-511 output tokens, MTP k = 2 on every decode step, `max_batched_tokens` 16,384, `prefill_chunk` 4,096. Costs are modelled on the 27B: 12.5 ms per decode row, so 100 ms for 8 rows, and 0.2 ms per prompt token, about 5,000 tok/s, the single-stream rate. The Fake engine runs at 1/10 of that and the clock is scaled back up. `itl_target` is 100 ms (scaled). The stream decode column is plain tokens over time: the Fake accepts 0-2 drafts at random, so compare only within the table.
+
+| policy | TTFT p50 | TTFT p95 | prefill tok/s | mean running | stream decode p50 | token gap p50 / p99 / max |
+|---|---|---|---|---|---|---|
+| default (floor 512, 1 long) | 10.5 s | 20.4 s | 3,043 | 6.0 | 9.6 tok/s | 177 / 242 / 278 ms |
+| `min_prefill_tokens` 4096 | 3.8 s | 15.5 s | 4,554 | 6.9 | 8.3 | 100 / 907 / 907 ms |
+| `min_prefill_tokens` 16384 | 3.6 s | 16.6 s | 4,849 | 6.8 | 8.4 | 100 / 3,363 / 3,363 ms |
+| `prefill_burst_tokens` 16384 | 3.6 s | 16.6 s | 4,838 | 6.8 | 8.4 | 100 / 3,363 / 3,363 ms |
+| `max_long_in_flight` 4 | 7.6 s | 23.9 s | 3,029 | 7.2 | 9.0 | 177 / 230 / 278 ms |
+| burst 16384 + long 4 | 3.6 s | 10.0 s | 4,847 | 6.9 | 8.6 | 100 / 3,351 / 3,363 ms |
+| burst 8192 + long 4 | 3.7 s | 13.4 s | 4,730 | 6.9 | 8.7 | 100 / 1,726 / 1,726 ms |
+
+What the sim says:
+- The default reproduces the field numbers: 3,043 tok/s of prefill against the measured 3,509, and 512-token steps.
+- The burst cuts TTFT p50 about 3x (10.5 to 3.6 s) and takes prefill to the single-stream rate. That meets the issue's 2x TTFT target on policy alone, if the GPU agrees.
+- The cost is the tail of the token gap. A burst step that reads 16k tokens stalls every running stream for about 3.4 s once per long prompt. The median gap gets shorter, because steps without prefill are pure 100 ms decode steps. 8,192 halves the stall.
+- `max_long_in_flight` alone does not help: the 512 floor is the limit. With the burst it brings TTFT p95 from 16.6 to 10.0 s, because later arrivals stop queueing behind one prompt at a time.
+- Here `prefill_burst_tokens` and a higher `min_prefill_tokens` give the same numbers, because every prompt is long. They differ for chat: `min_prefill_tokens` also stretches every step that carries a short prompt, while the burst applies only when a prompt over 2,048 tokens is pending, so interactive traffic keeps the `itl_target` budget.
+
+## The GPU runs that decide the defaults
+
+Run all in one window on a quiet GPU0, with the same binary, spec and loadtest, one server at a time. Each arm is one `serve` start and one loadtest.
+
+1. default: no extra flags;
+2. `--min-prefill-tokens 4096`;
+3. `--min-prefill-tokens 16384`;
+4. `--prefill-burst-tokens 8192 --max-long-in-flight 4`;
+5. `--prefill-burst-tokens 16384 --max-long-in-flight 4`;
+6. a chat-shape control for arms 1 and 5: `--mix 1:500-1500 --output 256-512 --rate 4 --clients 16`, to show the burst leaves short-prompt ITL unchanged.
+
+For each arm, record TTFT p50 and p95, prompt tok/s, ITL p50, p95 and max (the loadtest report), and `inference_prefill_tokens_per_step` from `/metrics`.
+
+What decides it:
+- Make burst 16384 + long 4 the default if it reaches TTFT p50 at most 16.4 s (2x better than 32.8) on the long shape, and the chat control's ITL p95 is within 5% of the default.
+- If the 3 s ITL max is judged too long, take burst 8192 as long as it still halves TTFT.
+- Arms 2 and 3 show what the flat floor costs chat traffic, for comparison.
 
 ## GPU commands for the profiling window
 
@@ -106,7 +156,7 @@ $B/inference-bench loadtest --url http://127.0.0.1:18603 --model nvfp4-fp8kv --r
   --mix 1:12000-14000 --output 256-512 --json > /tmp/603/load-default.json
 ```
 
-Repeat the server with `--min-prefill-tokens 4096`, then `16384`, for suspect 1. For the kernel capture, put the server under `nsys profile --cuda-graph-trace=node --trace=cuda -o /tmp/603/serve8` and send 8 co-arriving 16k prompts with `--requests 8 --rate 0`. Then 1 prompt. Then the same at 4k and 32k.
+Repeat the server for each arm above (for example `--prefill-burst-tokens 16384 --max-long-in-flight 4`). For the kernel capture, put the server under `nsys profile --cuda-graph-trace=node --trace=cuda -o /tmp/603/serve8` and send 8 co-arriving 16k prompts with `--requests 8 --rate 0`. Then 1 prompt. Then the same at 4k and 32k.
 
 For vLLM, run `docs/qwen27-run/launch.sh mtp` alone on GPU0 (port 8011, under `systemd-run --user -p MemoryMax=24G`, `MAX_JOBS=3 NVCC_THREADS=2`) with the same loadtest. Stop it before starting specrt.
 

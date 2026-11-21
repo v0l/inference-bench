@@ -41,6 +41,10 @@ pub struct ServeArgs {
     pub swap_space_gb: Option<f64>,
     #[arg(long, help = "Tokens of generation to reserve KV room for at admission (default 0, off)")]
     pub admit_lookahead: Option<usize>,
+    #[arg(long, help = "Prompt tokens per step while a prompt over 2048 tokens waits or is read, even beside decoders (default 0, off)")]
+    pub prefill_burst_tokens: Option<usize>,
+    #[arg(long, help = "Prompts over 2048 tokens read at the same time (default 1)")]
+    pub max_long_in_flight: Option<usize>,
     #[arg(long, help = "Seconds before an idle model is unloaded")]
     pub idle_unload_secs: Option<u64>,
     #[arg(long, help = "Write an access log (JSON lines) here")]
@@ -90,6 +94,8 @@ impl ServeArgs {
         config.min_prefill_tokens = self.min_prefill_tokens.or(config.min_prefill_tokens);
         config.swap_space_gb = self.swap_space_gb.or(config.swap_space_gb);
         config.admit_lookahead = self.admit_lookahead.or(config.admit_lookahead);
+        config.prefill_burst_tokens = self.prefill_burst_tokens.or(config.prefill_burst_tokens);
+        config.max_long_in_flight = self.max_long_in_flight.or(config.max_long_in_flight);
         if let Some(n) = self.idle_unload_secs {
             config.idle_unload_secs = Some(n);
         }
