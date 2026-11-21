@@ -10,7 +10,6 @@ use std::collections::BTreeMap;
 pub const TYPICAL_REQUEST: usize = 4096;
 const SLOT_CHOICES: [usize; 6] = [32, 16, 8, 4, 2, 1];
 const MATCH_TOLERANCE: f64 = 0.05;
-const MEMORY_MATCH_TOLERANCE: f64 = 0.15;
 const GIB: f64 = (1u64 << 30) as f64;
 const MAX_PERFORMANCE_CONTEXT: usize = 32768;
 const LOW_MEMORY_CONTEXT: usize = 8192;
@@ -102,8 +101,8 @@ struct Search<'a> {
 }
 
 fn matched(a: &Device, b: &Device) -> bool {
-    let close = |x: f64, y: f64, tolerance: f64| (x - y).abs() <= tolerance * x.max(y);
-    close(a.memory_bytes as f64, b.memory_bytes as f64, MEMORY_MATCH_TOLERANCE) && close(a.bandwidth, b.bandwidth, MATCH_TOLERANCE)
+    let close = |x: f64, y: f64| (x - y).abs() <= MATCH_TOLERANCE * x.max(y);
+    close(a.bandwidth, b.bandwidth) && close(a.flops, b.flops)
 }
 
 fn tp_kinds(spec: &Spec, devices: &[Device]) -> Vec<Kind> {
@@ -679,14 +678,12 @@ mod tests {
     }
 
     #[test]
-    fn two_equal_cards_with_unequal_free_memory_are_not_a_tp_pair() {
+    fn two_equal_cards_with_unequal_free_memory_still_pair_for_tp() {
         let busy = [gpu(0, 42.8, 1792.0), gpu(1, 76.3, 1792.0)];
         let pinned = PlacementRequest { mode: Profile::MaxPerformance, target: Target::default(), pins: [(PIN_TP.to_string(), json!(2))].into(), devices: &busy, spec: &spec() };
-        let e = solve(&pinned).expect_err("tp 2 is refused");
-        assert!(format!("{e:#}").contains("tp 2 is not possible"), "{e:#}");
-        let idle = [gpu(0, 90.0, 1792.0), gpu(1, 90.0, 1792.0)];
-        let pinned = PlacementRequest { devices: &idle, ..pinned };
-        assert_eq!(solve(&pinned).unwrap().tp, 2);
+        let s = solve(&pinned).unwrap();
+        assert_eq!((s.tp, s.ordinals()), (2, vec![0, 1]), "{}", s.strategy);
+        assert!(s.strategy.starts_with("TP 2 across"), "{}", s.strategy);
     }
 
     #[test]
