@@ -11,6 +11,7 @@ pub mod engine;
 pub mod fit;
 pub mod gpu;
 pub mod hf;
+pub mod inventory;
 pub mod settings;
 pub mod library;
 pub mod live;
