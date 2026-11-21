@@ -49,6 +49,20 @@ pub fn attribute(stats: &mut [GpuStats], apps: &[(String, u32, u64)], own_pids: 
     }
 }
 
+pub const LANDED_MIN_BYTES: u64 = 256 << 20;
+
+pub fn landed(before: &[GpuStats], after: &[GpuStats]) -> Vec<(String, u64)> {
+    after
+        .iter()
+        .filter(|a| !a.uuid.is_empty())
+        .filter_map(|a| {
+            let was = before.iter().find(|b| b.uuid == a.uuid).map_or(0, |b| b.own_bytes);
+            let grew = a.own_bytes.saturating_sub(was);
+            (grew >= LANDED_MIN_BYTES).then(|| (a.uuid.clone(), grew))
+        })
+        .collect()
+}
+
 pub fn own_pids() -> Vec<u32> {
     let me = std::process::id();
     let mut pids = vec![me];
@@ -122,6 +136,15 @@ pub fn sample() -> Vec<GpuStats> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn landed_names_only_the_gpus_whose_own_memory_grew() {
+        let g = |uuid: &str, own: u64| GpuStats { name: "card".into(), used_bytes: own, total_bytes: 96 << 30, util_percent: None, uuid: uuid.into(), own_bytes: own, display: false };
+        let before = [g("GPU-a", 0), g("GPU-b", 1 << 30)];
+        let after = [g("GPU-a", 10 << 20), g("GPU-b", 40 << 30)];
+        assert_eq!(landed(&before, &after), vec![("GPU-b".to_string(), 39 << 30)]);
+        assert!(landed(&after, &after).is_empty());
+    }
 
     #[test]
     fn nvidia_smi_csv_is_parsed_into_bytes() {

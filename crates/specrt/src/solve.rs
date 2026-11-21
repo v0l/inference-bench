@@ -67,7 +67,6 @@ impl Solved {
         self.placement.stages.iter().flat_map(|s| s.ordinals.clone()).collect()
     }
 
-
     pub fn log_line(&self) -> String {
         format!(
             "{}; kv {:?} pool {:.2} GiB, {} slots, context {}, mtp {}",

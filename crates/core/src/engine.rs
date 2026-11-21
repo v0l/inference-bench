@@ -54,6 +54,7 @@ pub struct Loaded {
     pub thinking: specrt::chat::Thinking,
     pub tools: specrt::chat::ToolFormat,
     pub vram_bytes: Option<u64>,
+    pub landed: Vec<(String, u64)>,
 }
 
 impl Loaded {
@@ -642,7 +643,8 @@ fn run(
                 publish(&shared, &slots, &parked);
                 emit(EngineEvent::Loading(display.clone()));
                 let started = Instant::now();
-                let vram_before = crate::gpu::used_total(&crate::gpu::sample()).map(|(used, _)| used);
+                let before = crate::gpu::sample();
+                let vram_before = crate::gpu::used_total(&before).map(|(used, _)| used);
                 let seqs = max_num_seqs.unwrap_or(1).max(1);
                 let sink = {
                     let (events, wake) = (events.clone(), wake.clone());
@@ -654,7 +656,9 @@ fn run(
                 match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &sink) {
                     Ok(o) => {
                         let ctx = engine.solved.as_ref().map(|s| s.context).or(max_ctx).unwrap_or(specrt::engine::DEFAULT_CTX);
-                        let vram_bytes = vram_before.zip(crate::gpu::used_total(&crate::gpu::sample()).map(|(used, _)| used)).map(|(b, a)| a.saturating_sub(b)).filter(|v| *v > 0);
+                        let after = crate::gpu::sample();
+                        let vram_bytes = vram_before.zip(crate::gpu::used_total(&after).map(|(used, _)| used)).map(|(b, a)| a.saturating_sub(b)).filter(|v| *v > 0);
+                        let landed = crate::gpu::landed(&before, &after);
                         let info = Loaded {
                             model_id: model_id.clone(),
                             display,
@@ -669,6 +673,7 @@ fn run(
                             thinking: o.thinking,
                             tools: o.tools,
                             vram_bytes,
+                            landed,
                         };
                         if let Some(share) = o.share {
                             shared.stats.lock().unwrap().push((model_id.clone(), share));

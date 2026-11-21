@@ -2790,6 +2790,29 @@ fn unticking_gpu_0_in_the_dialog_plans_and_loads_on_gpu_1_only() {
 }
 
 #[test]
+fn a_model_that_lands_on_the_wrong_gpu_is_reported_against_the_plan() {
+    let mut h = two_gpu_27b_dialog("landing");
+    recording_engine(h.state_mut());
+    {
+        let app = h.state_mut();
+        app.library[0].repo = "acme/Qwen3.8-27B-NVFP4".into();
+        app.load.as_mut().unwrap().model.repo = "acme/Qwen3.8-27B-NVFP4".into();
+    }
+    click_settled(&mut h, "GPU 0  ");
+    h.run();
+    click_load(&mut h);
+    pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
+    let mut l = h.state().loaded().unwrap();
+    assert!(h.state().landing(&l).is_none());
+    l.landed = vec![("GPU-fake-1".into(), 40 << 30)];
+    let ok = h.state().landing(&l).unwrap();
+    assert!(ok.matches_plan && ok.text.starts_with("running on GPU 1"), "{ok:?}");
+    l.landed = vec![("GPU-fake-0".into(), 40 << 30)];
+    let wrong = h.state().landing(&l).unwrap();
+    assert!(!wrong.matches_plan && wrong.text.starts_with("running on GPU 0"), "{wrong:?}");
+}
+
+#[test]
 fn the_dialog_lists_every_gpu_and_marks_the_one_driving_a_display() {
     let mut h = two_gpu_27b_dialog("display-gpu");
     h.state_mut().gpu[0].display = true;

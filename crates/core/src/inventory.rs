@@ -8,6 +8,7 @@ use specrt::placement::{DeviceConfig, LinkConfig};
 #[derive(Clone, Debug, PartialEq)]
 pub struct Card {
     pub name: String,
+    pub uuid: String,
     pub host: String,
     pub label: String,
     pub ordinal: Option<usize>,
@@ -60,6 +61,7 @@ pub fn inventory(machine: Option<&Machine>, stats: &[GpuStats], peers: &[Peer], 
                 cards.push(Card {
                     selected: !settings.disabled_gpus.contains(&d.name),
                     name: d.name.clone(),
+                    uuid: if g.uuid.is_empty() { s.map_or_else(String::new, |s| s.uuid.clone()) } else { g.uuid.clone() },
                     host: host.clone(),
                     label: g.label(),
                     ordinal: Some(g.ordinal),
@@ -78,6 +80,7 @@ pub fn inventory(machine: Option<&Machine>, stats: &[GpuStats], peers: &[Peer], 
                 cards.push(Card {
                     selected: !settings.disabled_gpus.contains(&d.name),
                     name: d.name.clone(),
+                    uuid: s.uuid.clone(),
                     host: host.clone(),
                     label: specrt::hardware::short_gpu(&s.name).to_string(),
                     ordinal: Some(i),
@@ -96,6 +99,7 @@ pub fn inventory(machine: Option<&Machine>, stats: &[GpuStats], peers: &[Peer], 
             cards.push(Card {
                 selected: settings.peers_in_use.contains(&peer.host) && !settings.disabled_gpus.contains(&g.device.name),
                 name: g.device.name.clone(),
+                uuid: String::new(),
                 host: peer.host.clone(),
                 label: gpu_label(&g.gpu_name, g.backend),
                 ordinal: g.device.ordinal,
@@ -146,6 +150,31 @@ impl Inventory {
         }
         out
     }
+
+    pub fn where_landed(&self, landed: &[(String, u64)], planned: &[String]) -> Option<Landing> {
+        if landed.is_empty() {
+            return None;
+        }
+        let on: Vec<&Card> = self.local().filter(|c| landed.iter().any(|(u, _)| *u == c.uuid)).collect();
+        let planned_here: Vec<&str> = planned.iter().map(String::as_str).filter(|p| self.local().any(|c| c.name == *p)).collect();
+        let mut names: Vec<&str> = on.iter().map(|c| c.name.as_str()).collect();
+        let mut want = planned_here.clone();
+        names.sort_unstable();
+        want.sort_unstable();
+        let bytes: u64 = landed.iter().map(|l| l.1).sum();
+        let where_ = on.iter().map(|c| c.short()).collect::<Vec<_>>().join(" + ");
+        Some(Landing { text: format!("running on {where_} ({})", crate::library::human_size(bytes)), matches_plan: names == want })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Landing {
+    pub text: String,
+    pub matches_plan: bool,
+}
+
+pub fn planned_names(solved: &specrt::solve::Solved) -> Vec<String> {
+    solved.placement.stages.iter().flat_map(|s| s.device_name.split('+').map(str::to_string).collect::<Vec<_>>()).collect()
 }
 
 pub fn toggle(settings: &mut ClusterSettings, inv: &Inventory, name: &str) {
@@ -238,6 +267,22 @@ mod tests {
         assert!(settings.disabled_gpus.contains("desk/gpu0"));
         toggle(&mut settings, &inv, "desk/gpu0");
         assert!(settings.disabled_gpus.is_empty());
+    }
+
+    #[test]
+    fn landing_is_named_by_uuid_and_checked_against_the_plan() {
+        let m = fake_gpus("desk", 2, true);
+        let inv = inventory(Some(&m), &[], &[], &ClusterSettings::default());
+        let landed = vec![("GPU-fake-1".to_string(), 40 << 30)];
+        let l = inv.where_landed(&landed, &["desk/gpu1".into()]).unwrap();
+        assert!(l.text.starts_with("running on GPU 1 ("), "{}", l.text);
+        assert!(l.matches_plan);
+        assert!(!inv.where_landed(&landed, &["desk/gpu0".into()]).unwrap().matches_plan);
+        let both = vec![("GPU-fake-0".to_string(), 1 << 30), ("GPU-fake-1".to_string(), 1 << 30)];
+        let l = inv.where_landed(&both, &["desk/gpu0".into(), "desk/gpu1".into()]).unwrap();
+        assert!(l.text.starts_with("running on GPU 0 + GPU 1"), "{}", l.text);
+        assert!(l.matches_plan);
+        assert!(inv.where_landed(&[], &[]).is_none());
     }
 
     #[test]
