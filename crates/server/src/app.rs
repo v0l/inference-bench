@@ -721,20 +721,35 @@ fn chat_setup(state: &AppState, body: &Value, model: &str) -> Result<(Value, Out
     }
     let choice = match &body["tool_choice"] {
         Value::Null => "auto",
-        Value::String(s) if s == "auto" || s == "none" => s.as_str(),
-        _ => return Err(ApiError::bad_request("tool_choice must be auto or none: required and named tool choice are not supported")),
+        Value::String(s) if s == "none" => "none",
+        _ => "auto",
     };
     if !tools.is_empty() {
         vars["tools"] = Value::Array(tools.clone());
     }
     let tool_parser = state.config.tool_parser_for(state.manager.tool_format(model));
     let output = OutputMode {
-        tool_parsing: tool_parser.is_some() && !tools.is_empty() && choice == "auto",
+        tool_parsing: tool_parser.is_some() && !tools.is_empty() && choice != "none",
         reasoning: state.config.reasoning_parser.is_some() && vars["enable_thinking"] != json!(false),
         hermes: tool_parser.as_deref() == Some("hermes"),
         tools,
     };
     Ok((vars, output))
+}
+
+fn forced_tool_schema(state: &AppState, body: &Value, model: &str, output: &OutputMode) -> Result<Option<inference_bench_core::specrt_grammar::Schema>, ApiError> {
+    let choice = &body["tool_choice"];
+    if !(choice == "required" || choice.is_object()) {
+        inference_bench_core::specrt_grammar::parse_tool_choice(choice, &output.tools, true).map_err(ApiError::bad_request)?;
+        return Ok(None);
+    }
+    let id = state.manager.resolve(model)?.id;
+    let xml = match state.config.tool_parser_for(state.manager.tool_format(&id)).as_deref() {
+        Some("xml_function") => true,
+        Some("hermes") => false,
+        _ => return Err(ApiError::bad_request("tool_choice required or named needs a model whose chat template has a known tool call format")),
+    };
+    inference_bench_core::specrt_grammar::parse_tool_choice(choice, &output.tools, xml).map_err(|e| ApiError::bad_request(format!("tool_choice: {e}")))
 }
 
 fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, ApiError> {
@@ -764,6 +779,13 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         false => (Value::Null, OutputMode::default()),
     };
     let think = think_cap(state, body, output.reasoning, max_tokens);
+    let forced = match chat {
+        true => forced_tool_schema(state, body, &model, &output)?,
+        false => None,
+    };
+    if forced.is_some() && !body["response_format"].is_null() && body["response_format"]["type"] != "text" {
+        return Err(ApiError::bad_request("tool_choice required or named cannot be combined with response_format"));
+    }
     Ok(Params {
         shown_model: model.clone(),
         model,
@@ -779,7 +801,10 @@ fn parse_params(state: &AppState, body: &Value, chat: bool) -> Result<Params, Ap
         ignore_eos: body["ignore_eos"].as_bool().unwrap_or(false),
         n: choice_count(body)?,
         logprobs: logprob_request(body, chat)?,
-        response_format: inference_bench_core::specrt_grammar::parse_response_format(&body["response_format"]).map_err(|e| ApiError::bad_request(format!("response_format: {e}")))?,
+        response_format: match forced {
+            Some(f) => Some(f),
+            None => inference_bench_core::specrt_grammar::parse_response_format(&body["response_format"]).map_err(|e| ApiError::bad_request(format!("response_format: {e}")))?,
+        },
         think,
     })
 }

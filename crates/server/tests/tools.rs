@@ -254,3 +254,24 @@ fn app_mode_leaves_a_model_without_thinking_alone() {
     assert_eq!(rig.stats.requests.lock().unwrap()[0].template_vars["enable_thinking"], false);
     rig.stop();
 }
+
+#[test]
+fn required_and_named_tool_choice_are_checked_and_reach_the_engine() {
+    let rig = start(config(AGENT), Shape { batched: true, ..pieces(&["<tool_call>\n<function=get_weather>\n</function>\n</tool_call>"]) });
+    let mut body = agent_body(false);
+    for choice in [json!("required"), json!({"type": "function", "function": {"name": "get_weather"}})] {
+        body["tool_choice"] = choice;
+        let (status, text, _) = rig.post("/v1/chat/completions", None, body.clone());
+        assert_eq!(status, 200, "{text}");
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+    body["tool_choice"] = json!({"type": "function", "function": {"name": "missing"}});
+    let (status, text, _) = rig.post("/v1/chat/completions", None, body.clone());
+    assert_eq!(status, 400, "{text}");
+    assert!(text.contains("missing"), "{text}");
+    body["tool_choice"] = json!("sometimes");
+    let (status, _, _) = rig.post("/v1/chat/completions", None, body);
+    assert_eq!(status, 400);
+    rig.stop();
+}
