@@ -2790,6 +2790,24 @@ fn unticking_gpu_0_in_the_dialog_plans_and_loads_on_gpu_1_only() {
 }
 
 #[test]
+fn with_every_gpu_unticked_the_dialog_refuses_to_load_on_a_default_gpu() {
+    let mut h = two_gpu_27b_dialog("untick-all");
+    let seen = recording_engine(h.state_mut());
+    click_settled(&mut h, "GPU 0  ");
+    h.run();
+    click_settled(&mut h, "GPU 1  ");
+    h.run();
+    assert_eq!(h.state().settings.cluster.disabled_gpus.len(), 2);
+    click_load(&mut h);
+    for _ in 0..5 {
+        h.run();
+    }
+    assert!(seen.lock().unwrap().is_empty(), "nothing may load with no gpu selected");
+    let notice = h.state().notice.clone().unwrap();
+    assert!(!notice.0 && notice.1.contains("no gpu selected"), "{notice:?}");
+}
+
+#[test]
 fn a_model_that_lands_on_the_wrong_gpu_is_reported_against_the_plan() {
     let mut h = two_gpu_27b_dialog("landing");
     recording_engine(h.state_mut());
