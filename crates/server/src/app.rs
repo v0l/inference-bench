@@ -565,7 +565,7 @@ pub(crate) struct OutputMode {
     tools: Vec<Value>,
     tool_parsing: bool,
     reasoning: bool,
-    hermes: bool,
+    parser: Option<String>,
 }
 
 impl OutputMode {
@@ -574,8 +574,7 @@ impl OutputMode {
     }
 
     pub(crate) fn parser(&self) -> OutputParser {
-        let p = OutputParser::new(&self.tools, self.tool_parsing, self.reasoning);
-        if self.hermes { p.hermes() } else { p }
+        OutputParser::new(&self.tools, self.tool_parsing, self.reasoning).for_parser(self.parser.as_deref())
     }
 }
 
@@ -731,7 +730,7 @@ fn chat_setup(state: &AppState, body: &Value, model: &str) -> Result<(Value, Out
     let output = OutputMode {
         tool_parsing: tool_parser.is_some() && !tools.is_empty() && choice != "none",
         reasoning: state.config.reasoning_parser.is_some() && vars["enable_thinking"] != json!(false),
-        hermes: tool_parser.as_deref() == Some("hermes"),
+        parser: tool_parser,
         tools,
     };
     Ok((vars, output))

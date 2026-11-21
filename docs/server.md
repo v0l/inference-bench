@@ -91,9 +91,14 @@ Parser and rope ids are named by format. Old ids still load and log a deprecatio
 |---|---|
 | `tool_parser = "qwen3_coder"` or `"qwen3_xml"` | `"xml_function"` |
 | `reasoning_parser = "qwen3"` | `"think_tags"` |
+| `tool_parser = "granite"` | `"tool_call_list"` (a marker tag, then a JSON list of calls) |
+| `tool_parser = "llama3_json"` | `"bare_json"` (the reply is a JSON call, or `;` separated calls) |
+| `tool_parser = "phi4_mini_json"` | `"functools_list"` (`functools[...]` JSON list) |
 | spec `[rope.scaling] kind = "llama3"` | `"banded"` |
 
 `/props` reports the new ids. There is no `API_VERSION` in this repo to bump.
+
+`tool_call_list`, `bare_json` and `functools_list` are inferred from the chat template (`ToolFormat`). A template that only lists tools with `<|tool|>` and never shows a call (the Phi-4-mini one) is inferred as `functools_list`, but nothing in its prompt tells the model to write `functools[...]`. That parser is unverified on a real checkpoint; set `tool_parser` explicitly if a model needs another format.
 
 ## Metrics
 
