@@ -16,9 +16,9 @@ pub enum ToolFormat {
     None,
     XmlFunction,
     Hermes,
-    Granite,
-    Llama3Json,
-    Phi4Json,
+    ToolCallList,
+    BareJson,
+    FunctionsList,
     Unparsed,
 }
 
@@ -27,9 +27,9 @@ impl ToolFormat {
         match self {
             ToolFormat::XmlFunction => Some("xml_function"),
             ToolFormat::Hermes => Some("hermes"),
-            ToolFormat::Granite => Some("granite"),
-            ToolFormat::Llama3Json => Some("llama3_json"),
-            ToolFormat::Phi4Json => Some("phi4_mini_json"),
+            ToolFormat::ToolCallList => Some("tool_call_list"),
+            ToolFormat::BareJson => Some("bare_json"),
+            ToolFormat::FunctionsList => Some("functools_list"),
             ToolFormat::None | ToolFormat::Unparsed => None,
         }
     }
@@ -140,11 +140,11 @@ impl ChatTemplate {
         } else if s.contains("<tool_call>") {
             ToolFormat::Hermes
         } else if s.contains("<|tool_call|>") {
-            ToolFormat::Granite
+            ToolFormat::ToolCallList
         } else if s.contains("\"parameters\": dictionary of argument name") {
-            ToolFormat::Llama3Json
+            ToolFormat::BareJson
         } else if s.contains("<|tool|>") {
-            ToolFormat::Phi4Json
+            ToolFormat::FunctionsList
         } else if s.contains("tools") || s.contains("tool_calls") {
             ToolFormat::Unparsed
         } else {

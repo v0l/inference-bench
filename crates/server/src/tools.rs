@@ -95,9 +95,9 @@ pub struct OutputParser {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RawFormat {
-    Granite,
-    Llama3,
-    Phi4,
+    TagList,
+    BareJson,
+    NamedList,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,18 +110,18 @@ enum RawPhase {
 impl RawFormat {
     pub fn from_parser(name: &str) -> Option<Self> {
         match name {
-            "granite" => Some(Self::Granite),
-            "llama3_json" => Some(Self::Llama3),
-            "phi4_mini_json" => Some(Self::Phi4),
+            "tool_call_list" => Some(Self::TagList),
+            "bare_json" => Some(Self::BareJson),
+            "functools_list" => Some(Self::NamedList),
             _ => None,
         }
     }
 
     fn markers(self) -> &'static [&'static str] {
         match self {
-            Self::Granite => &["<|tool_call|>"],
-            Self::Llama3 => &["{", "<|python_tag|>"],
-            Self::Phi4 => &["functools"],
+            Self::TagList => &["<|tool_call|>"],
+            Self::BareJson => &["{", "<|python_tag|>"],
+            Self::NamedList => &["functools"],
         }
     }
 }
@@ -476,7 +476,7 @@ impl OutputParser {
         self.slots[index].ended = true;
         let text = self.slots[index].args.trim().to_string();
         let mut calls = self.json_calls_in(&text);
-        if calls.is_empty() && self.raw.is_some_and(|(f, _)| f == RawFormat::Llama3) && text.contains(';') {
+        if calls.is_empty() && self.raw.is_some_and(|(f, _)| f == RawFormat::BareJson) && text.contains(';') {
             let parts: Vec<Vec<(String, String)>> = text.split(';').map(|p| self.json_calls_in(p.trim())).collect();
             if parts.iter().all(|p| !p.is_empty()) {
                 calls = parts.into_iter().flatten().collect();

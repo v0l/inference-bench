@@ -461,9 +461,9 @@ fn raw_outputs(format: RawFormat, text: &str) -> (Parsed, Streamed) {
 }
 
 #[test]
-fn granite_tool_call_lists_parse() {
+fn tag_then_json_list_parse() {
     let text = "<|tool_call|>[{\"name\": \"get_current_weather\", \"arguments\": {\"city\": \"Dallas\", \"state\": \"TX\"}}, {\"name\": \"calculate_area\", \"arguments\": {\"shape\": \"circle\"}}]";
-    let (p, s) = raw_outputs(RawFormat::Granite, text);
+    let (p, s) = raw_outputs(RawFormat::TagList, text);
     assert_eq!(calls(&p), [("get_current_weather", r#"{"city": "Dallas", "state": "TX"}"#), ("calculate_area", r#"{"shape": "circle"}"#)]);
     assert_eq!(p.content, None);
     assert_eq!(s.calls.len(), 2);
@@ -471,48 +471,48 @@ fn granite_tool_call_lists_parse() {
 }
 
 #[test]
-fn llama3_bare_json_parses_parameters() {
+fn bare_json_bare_json_parses_parameters() {
     let text = "{\"name\": \"get_current_weather\", \"parameters\": {\"city\": \"Dallas\", \"state\": \"TX\"}}";
-    let (p, s) = raw_outputs(RawFormat::Llama3, text);
+    let (p, s) = raw_outputs(RawFormat::BareJson, text);
     assert_eq!(calls(&p), [("get_current_weather", r#"{"city": "Dallas", "state": "TX"}"#)]);
     assert_eq!(s.calls.len(), 1);
     assert_eq!(s.content, "");
 }
 
 #[test]
-fn llama3_semicolon_separated_calls_parse() {
+fn bare_json_semicolon_separated_calls_parse() {
     let text = "{\"name\": \"get_current_weather\", \"parameters\": {\"city\": \"A\"}}; {\"name\": \"calculate_area\", \"parameters\": {}}";
-    let (p, _) = raw_outputs(RawFormat::Llama3, text);
+    let (p, _) = raw_outputs(RawFormat::BareJson, text);
     assert_eq!(calls(&p), [("get_current_weather", r#"{"city": "A"}"#), ("calculate_area", "{}")]);
 }
 
 #[test]
-fn llama3_plain_text_streams_as_content() {
-    let (p, s) = raw_outputs(RawFormat::Llama3, "It is sunny in Dallas.");
+fn bare_json_plain_text_streams_as_content() {
+    let (p, s) = raw_outputs(RawFormat::BareJson, "It is sunny in Dallas.");
     assert!(p.tool_calls.is_empty());
     assert_eq!(p.content.as_deref(), Some("It is sunny in Dallas."));
     assert_eq!(s.content, "It is sunny in Dallas.");
 }
 
 #[test]
-fn llama3_invalid_or_unknown_json_stays_text() {
+fn bare_json_invalid_or_unknown_json_stays_text() {
     for text in ["{\"name\": \"nope\", \"parameters\": {}}", "{not json", "<|python_tag|>brave_search.call(query=\"x\")"] {
-        let (p, s) = raw_outputs(RawFormat::Llama3, text);
+        let (p, s) = raw_outputs(RawFormat::BareJson, text);
         assert!(p.tool_calls.is_empty(), "{text}");
         assert_eq!(s.content, text);
     }
 }
 
 #[test]
-fn phi4_functools_lists_parse() {
+fn functools_list_parse() {
     let text = "functools[{\"name\": \"get_current_weather\", \"arguments\": {\"city\": \"Dallas\", \"state\": \"TX\"}}]";
-    let (p, _) = raw_outputs(RawFormat::Phi4, text);
+    let (p, _) = raw_outputs(RawFormat::NamedList, text);
     assert_eq!(calls(&p), [("get_current_weather", r#"{"city": "Dallas", "state": "TX"}"#)]);
 }
 
 #[test]
 fn raw_parsers_are_chosen_by_name() {
-    let mut p = OutputParser::new(&weather_tools(), true, false).for_parser(Some("llama3_json"));
+    let mut p = OutputParser::new(&weather_tools(), true, false).for_parser(Some("bare_json"));
     p.feed("{\"name\": \"calculate_area\", \"parameters\": {}}");
     p.finish();
     assert_eq!(calls(&p.result()), [("calculate_area", "{}")]);
