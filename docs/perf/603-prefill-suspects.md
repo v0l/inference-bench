@@ -256,3 +256,22 @@ Step 4 (one change tried): `prefill_chunk` 4096 (spec default) against 8192 and 
 | 16384 | 4,307 | 3.58 s | 20.0 s | 97.3 |
 
 No gain, dropped. The NVFP4 GEMM is already at vLLM's isolated TFLOP/s (`docs/specrt-nvfp4.md`, #441: warp specialisation and TMA tried and dropped, remaining cost is load issue inside the mma warps), so a further kir change there is a design task, filed as #973 (GEMMs) and #972 (delta-net).
+
+### #973 flash_mma at fp8 KV, GPU1, 27B shape, 2,048 query tokens, `flash_speed`
+
+| keys before the chunk | bf16 KV, min ms | fp8 KV, min ms | bf16 TFLOP/s | fp8 TFLOP/s | fp8 vs bf16 |
+|---|---|---|---|---|---|
+| 0 | 0.477 | 0.482 | 108 | 107 | -1% |
+| 14,336 (16k context) | 4.225 | 4.293 | 183 | 180 | -1.6% |
+| 30,720 (32k context) | 8.626 | 8.895 | 185 | 180 | -3.1% |
+
+Suspect 6 is small: the fp8 convert costs 1.6% at 16k and 3.1% at 32k, under the 5% bar, so it is not worth a change. The kernel runs at 180-185 TFLOP/s whatever the KV type. There is no FA number for sm_120 in this repo, so the distance to the bound is not measured.
+
+### #973 quant_rows_fp4 and gate_up/down overlap
+
+| idea | share it can touch | outcome |
+|---|---|---|
+| fuse `quant_rows_fp4` into the preceding op (`rms_split` for gate_up, `swiglu` for down) | `quant_rows_fp4` is 13.4 of about 720 ms, 1.9% of prefill kernel time (`docs/qwen3.8-27b-vllm-baseline.md`) | Even a free fusion is under the 5% bar, so not built |
+| overlap gate_up with down across co-scheduled sequences | both GEMMs already run 16384 rows over 188 SMs, many tile waves each, so there is no idle SM to fill | No gain expected, not built |
+
+Measured dead end for #973: no FP8 tile, no fp8 KV change and no quant fusion reaches 5%.
