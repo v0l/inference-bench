@@ -167,3 +167,37 @@ cargo test --release -p inference-bench-specrt --test flash_speed --test gemm_sp
 SPECRT_FLASH_TOKENS=512 SPECRT_FLASH_FP8=1 ~/.agents/bin/gpu-run 0 -- cargo test --release -p inference-bench-specrt --test flash_speed -- --ignored --nocapture
 SPECRT_GEMM_TOKENS=512,2048,4096 ~/.agents/bin/gpu-run 0 -- cargo test --release -p inference-bench-specrt --test gemm_speed prefill_gemm_speed_fp8_channel_and_fp4 -- --ignored --nocapture
 ```
+
+## #972: gdn_chunk_prep and gdn_chunk_scan, a measured dead end
+
+Tried one change: `LA_COLS` 16 to 32 (columns of the state per `gdn_chunk_scan` block). Reverted, because it misses the 5% serving bar and rewrote 12 golden files and the decode, verify and MTP kernel headers.
+
+`gdn_speed`, 27B-shaped layer, min of 10 runs:
+
+| GPU | tokens | scan, 8 cols | scan, 16 cols (kept) | scan, 32 cols | scan, 64 cols | prep |
+|---|---|---|---|---|---|---|
+| Spark GB10 | 4,096 | 13.00 ms | 6.46 ms | 4.11 ms | 4.48 ms | 3.7 ms |
+| Spark GB10 | 16,384 | 61.7 ms | 29.2 ms | 16.8 ms | 18.0 ms | 14.7 ms |
+| desktop RTX PRO 6000 | 4,096 | | 0.665 ms | 0.564 ms | | 0.96 ms |
+| desktop RTX PRO 6000 | 16,384 | | 3.102 ms | 2.458 ms | | 3.76 ms |
+
+The Spark is far more scan-bound than the desktop. On the desktop the scan saving is 0.65 ms per layer at 16k, about 30 ms over 48 layers of a 3.7 s prefill.
+
+Serving loadtest on GPU1 (27B NVFP4, fp8 KV, MTP, `--prefill-burst-tokens 16384 --max-long-in-flight 4`, 16 requests, 8 clients, 1/s, 15-18k prompts):
+
+| | 16 cols | 32 cols |
+|---|---|---|
+| prefill tok/s | 4,369 | 4,374 (+0.1%) |
+| TTFT p50 / p95 | 5.73 / 19.18 s | 5.71 / 19.17 s |
+| decode tok/s, batch 1 | 105.4 | 105.1 |
+| decode tok/s, batch 8 | 533.8 | 534.1 |
+
+Numerics held (`linear` 34 tests, `tiny27b` 8 including speculative greedy equals plain greedy, `real27b` per-layer trace and fp8 greedy), so the value is safe, just worth nothing end to end.
+
+`gdn_chunk_prep` ablation: removing the whole in-block triangular solve (`tri_leaf` and `tri_merge`) takes prep at 16k from 3.76 to 3.37 ms, 10%. The rest is the MMAs and the fp32 loads and stores of KK, QK, WY, `qe` and `kt`.
+
+Why no f16 planes for `w`, `qe`, `kt`, `aqk`: they are already stored as hi/lo 16-bit plane pairs, the same bytes as fp32. One plane would halve about 1.4 GB of traffic at 16k (estimated from the array sizes, not measured), roughly 1 ms of the 6.2 ms prep plus scan on the desktop, 16%. The brief's bar for building it was 35% of prep plus scan, because prep is 7.8% and scan 5.8% of serving kernel time: even 35% of those 13.6% is 4.8% of kernel time, and 16% is 2.2%. It also changes numerics. Not built.
+
+nsys under `serve` hung at model load twice, so there is no per-kernel share beyond the #603 capture (prep 7.8%, scan 5.8%, conv 1.7%).
+
+What would move this: the serving gap is not these kernels. See suspects 1 to 3 above (scheduler budget, one long prompt at a time, one sequence per prefill call).
