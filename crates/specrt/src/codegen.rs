@@ -553,6 +553,7 @@ impl Module {
         kernels.extend(gemms.names());
         smem.extend(gemms.smem());
         let arch_features = moe_arch || kir::cuda::needs_arch_features(&gemms.kernels);
+        let (source, kir_hash) = if spec.runtime.pdl && target.pdl { (kir::cuda::with_pdl_wait(&source, target.sm_count), kir::fold_hashes([kir_hash, "pdl".to_string()])) } else { (source, kir_hash) };
         Ok(Module { source, kernels, smem, arch_features, kir_hash })
     }
 }

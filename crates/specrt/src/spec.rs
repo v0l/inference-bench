@@ -148,6 +148,8 @@ pub enum BackendChoice {
 pub struct RuntimeOptions {
     pub backend: BackendChoice,
     pub graphs: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub pdl: bool,
     pub fuse: bool,
     pub tile: TileChoice,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,7 +245,7 @@ pub struct PrefixCacheOptions {
 
 impl Default for PrefixCacheOptions {
     fn default() -> Self {
-        PrefixCacheOptions { enabled: false, snapshot_interval: 2048, max_snapshots: 4, max_blocks: 0, async_snapshots: true }
+        PrefixCacheOptions { enabled: false, snapshot_interval: 2048, max_snapshots: 32, max_blocks: 0, async_snapshots: true }
     }
 }
 
@@ -265,7 +267,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 
@@ -429,6 +431,7 @@ pub enum Activation {
 #[serde(rename_all = "lowercase")]
 pub enum RopeScalingKind {
     Linear,
+    #[serde(alias = "llama3")]
     Banded,
     Yarn,
     Longrope,

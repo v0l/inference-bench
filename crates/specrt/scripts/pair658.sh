@@ -71,7 +71,7 @@ step_tp27b() {
 step_vllm() {
   local port=8658
   log "starting vLLM tp=2 on :$port (read-only ~/.venv-vllm)"
-  systemd-run --user --collect -q --unit=vllm658 -p MemoryMax=24G -p MemorySwapMax=0 -E HOME -E PATH -E MAX_JOBS=3 -E NVCC_THREADS=2 \
+  systemd-run --user --collect -q --unit=vllm658 -p MemoryMax=40G -p MemorySwapMax=0 -E HOME -E PATH -E HF_HUB_OFFLINE=1 -E MAX_JOBS=3 -E NVCC_THREADS=2 \
     "$HOME/.venv-vllm/bin/vllm" serve orcarouter/Qwen3.8-27B-Uncensored-NVFP4 --tensor-parallel-size 2 --port "$port" --max-model-len 8192 --gpu-memory-utilization 0.85
   trap 'systemctl --user stop vllm658 2>/dev/null || true' EXIT
   for _ in $(seq 1 180); do curl -sf -m 2 "localhost:$port/v1/models" >/dev/null && break; sleep 5; done

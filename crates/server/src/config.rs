@@ -580,9 +580,9 @@ python = "python3"
     #[test]
     fn the_runtime_table_reaches_the_serving_options_with_defaults_for_missing_keys() {
         use inference_bench_core::specrt_serve::{RuntimeOptions, TileChoice};
-        let c = ServerConfig::parse("max_num_seqs = 4\n[runtime]\ngraphs = false\ntile = \"narrow\"\ncache_dir = \"/tmp/ptx\"\n[[models]]\nid='m'").unwrap();
+        let c = ServerConfig::parse("max_num_seqs = 4\n[runtime]\ngraphs = false\npdl = true\ntile = \"narrow\"\ncache_dir = \"/tmp/ptx\"\n[[models]]\nid='m'").unwrap();
         let r = c.serve_options(&c.models[0]).unwrap().runtime.unwrap();
-        assert_eq!(r, RuntimeOptions { graphs: false, tile: TileChoice::Narrow, cache_dir: Some("/tmp/ptx".into()), ..RuntimeOptions::default() });
+        assert_eq!(r, RuntimeOptions { graphs: false, pdl: true, tile: TileChoice::Narrow, cache_dir: Some("/tmp/ptx".into()), ..RuntimeOptions::default() });
         assert!(r.fuse && !r.gemm_fp32);
         let plain = ServerConfig::parse("max_num_seqs = 4\n[[models]]\nid='m'").unwrap();
         assert_eq!(plain.serve_options(&plain.models[0]).unwrap().runtime, None);

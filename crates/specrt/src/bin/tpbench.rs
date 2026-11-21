@@ -13,14 +13,26 @@ struct Args {
     prompt: usize,
     compare: Option<Vec<usize>>,
     max_ctx: usize,
+    exact: bool,
+    split_acts: bool,
+    split: Option<specrt::spec::TpSplit>,
 }
 
 fn parse() -> Result<Args> {
     let mut it = std::env::args().skip(1);
-    let mut a = Args { spec: it.next().context("usage: tpbench SPEC.toml [--tp N] [--batch B] [--decode N] [--prompt N] [--compare 1,2]")?, tp: 1, batch: 1, decode: 128, prompt: 512, compare: None, max_ctx: 8192 };
+    let mut a = Args { spec: it.next().context("usage: tpbench SPEC.toml [--tp N] [--batch B] [--decode N] [--prompt N] [--compare 1,2]")?, tp: 1, batch: 1, decode: 128, prompt: 512, compare: None, max_ctx: 8192, exact: false, split_acts: false, split: None };
     while let Some(k) = it.next() {
+        if k == "--split-acts" {
+            a.split_acts = true;
+            continue;
+        }
+        if k == "--exact" {
+            a.exact = true;
+            continue;
+        }
         let v = it.next().with_context(|| format!("{k} needs a value"))?;
         match k.as_str() {
+            "--split" => a.split = Some(match v.as_str() { "experts" => specrt::spec::TpSplit::Experts, "columns" => specrt::spec::TpSplit::Columns, _ => specrt::spec::TpSplit::Auto }),
             "--tp" => a.tp = v.parse()?,
             "--batch" => a.batch = v.parse()?,
             "--decode" => a.decode = v.parse()?,
@@ -128,9 +140,27 @@ fn compare(spec: &Spec, a: &Args, tps: &[usize]) -> Result<()> {
     Ok(())
 }
 
+fn load_spec(path: &str, exact: bool) -> Result<Spec> {
+    let p = std::path::Path::new(path);
+    if !p.is_dir() {
+        return Spec::load(p);
+    }
+    let json = std::fs::read_to_string(p.join("config.json"))?;
+    let mut spec = if exact { Spec::from_hf_config(&json)? } else { Spec::from_hf_config_serving(&json)? };
+    spec.repo = path.to_string();
+    spec.name = p.file_name().map_or("model".into(), |n| n.to_string_lossy().into_owned());
+    Ok(spec)
+}
+
 fn main() -> Result<()> {
     let a = parse()?;
-    let spec = Spec::load(std::path::Path::new(&a.spec))?;
+    let mut spec = load_spec(&a.spec, a.exact)?;
+    if a.split_acts {
+        spec.runtime.split_activations = Some(true);
+    }
+    if let (Some(split), Some(m)) = (a.split, spec.moe.as_mut()) {
+        m.tp_split = split;
+    }
     if let Some(tps) = a.compare.clone() {
         return compare(&spec, &a, &tps);
     }

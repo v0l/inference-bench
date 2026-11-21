@@ -16,7 +16,7 @@ Our own tensor-parallel mode, with no NCCL. `serve.tp = N` splits one model acro
 | `serve.tp` in the options schema and the server config | done, default 1 |
 | Load dialog choice | left to #776, which owns `load.rs` |
 | MoE | two splits (#798), chosen by `tp::plan_moe` with the reason; `[moe] tp_split = "auto" / "experts" / "columns"` overrides. `columns`: every expert cut like the dense MLP. `experts`: rank r owns experts r*E/tp.. (the shared expert lives on rank 0), every rank routes all tokens, `moe_route` writes idx -1 and coef 0 for experts it does not own, so the rank's `moe_combine` writes a zero contribution into `Buf::Partial`. Both end in `Op::AllReduce`. Auto picks columns when each rank keeps at least 256 columns per expert, else experts; it falls back to whichever divides. Virtual-rank tests pass on the Spark for both |
-| 27B TP=2 against TP=1 numbers | script ready (`pair658.sh`), not run |
+| 27B TP=2 against TP=1 numbers | measured 20 Nov, see Measurements: batch 1 decode 1.45x, short of the 1.6x target |
 
 ## Sharding in the spec
 
@@ -140,13 +140,49 @@ Desktop, 2x RTX PRO 6000 Max-Q, PCIe 5 through the host bridge (`nvidia-smi topo
 | allreduce bf16, 5120 wide, host pinned: 1 / 8 / 64 rows | 31.7 / 34.8 / 74.0 us |
 | allreduce correctness on the pair (host pinned, 1 to 16k rows, f32 and bf16) | bit-exact |
 
-After the reboot with `iommu=pt`, NCCL reaches about 35 GB/s busbw over P2P (supervisor's measurement). Our peer transport, allreduce latency against vLLM's custom allreduce, and the 27B numbers are not measured yet:
+After the reboot with `iommu=pt`, NCCL reaches about 35 GB/s busbw over P2P (supervisor's measurement). Measured 20 Nov 2026 with `pair658.sh` (iommu group type `identity`), results in `/tmp/pair658`:
 
 | measurement | value |
 | --- | --- |
-| peer write probe on the pair after `iommu=pt` | not measured |
-| allreduce 1 / 8 / 64 rows bf16, ours over peer | not measured |
-| 27B NVFP4 tp2 vs tp1: top-1 and KL | not measured |
-| 27B decode batch 1 and 8, tp1 and tp2 (target tp2 batch 1 at least 1.6x tp1) | not measured |
-| 27B 4k prefill, tp1 and tp2 | not measured |
-| vLLM tp2 decode batch 1 and 8, 4k prefill | not measured |
+| peer write probe | lands both ways, auto transport is Peer |
+| peer copy GB/s (256 MiB) 0 to 1 / 1 to 0, p2p off | 43.5 / 43.6 |
+| peer copy GB/s, p2p on | 53.9 / 54.4 |
+| bidirectional peer copy | 105.3 GB/s |
+| 4 KiB peer copy | 1.2 GB/s |
+| flag ping-pong round trip | 150.9 us |
+| allreduce bf16 5120 wide, peer: 1 / 8 / 64 rows | 7.7 / 11.3 / 37.7 us |
+| allreduce bf16 5120 wide, host pinned: 1 / 8 / 64 rows | 33.7 / 36.2 / 75 us |
+| `two_gpu_peer_group_sums_exactly` | bit-exact |
+| 27B NVFP4 tp2 vs tp1, 256 positions | top-1 256/256, mean KL 1.0e-8, max KL 4.5e-7 |
+
+27B NVFP4 (`qwen3.8-27b-nvfp4-exact.toml`, `tpbench`, 512 token prompt, 128 decode, CUDA graphs on), after the fused norm fix below:
+
+| config | prefill tok/s | decode tok/s | per stream | ms per step |
+| --- | --- | --- | --- | --- |
+| tp1 batch 1 | 1668 | 117.3 | 117.3 | 8.52 |
+| tp2 batch 1 | 2476 | 169.9 | 169.9 | 5.89 |
+| tp1 batch 8 | 1662 | 465.3 | 58.2 | 17.19 |
+| tp2 batch 8 | 2567 | 686.9 | 85.9 | 11.65 |
+| tp1, 4096 prompt | 1852 | 53.0 | 53.0 | 18.85 |
+| tp2, 4096 prompt | 3050 | 81.7 | 81.7 | 12.24 |
+
+tp2 against tp1: 1.45x at batch 1 (target 1.6x, not met), 1.48x at batch 8, 1.65x on 4k prefill. Before the fix tp2 was slower than tp1 (88.0 against 119.9 tok/s at batch 1).
+
+The cause, from nsys: `ar_add_rmsnorm_f32` took 68% of GPU time at about 270 us a call. Its residual loop read each rank's partial in a dependent chain per quad, so every load paid the full peer round trip (about 1.5 us over PCIe) one after another. The kernel now issues all `AR_RANKS` loads for a row before any arithmetic. Same bit-exact sums. The remaining gap to 1.6x, from nsys of one decode step (MTP verify rows, 64 prompt, 256 decode, `/tmp/pair658/prof.sh`): tp1 25.8 ms of GPU time, tp2 17.8 ms per rank. The costs that do not shrink with tp: `lm_head_mma_tiny` 1.61 ms and `mtp_head_f4b8` 1.44 ms, both replicated on every rank (3.0 ms, 17% of the tp2 step), and the allreduces, `ar_add_rmsnorm_f32` 1.73 ms (66 calls, 26 us each) plus `ar_one_shot_f32` 1.43 ms (66 calls, 22 us each) = 3.2 ms (18%). The sharded GEMMs halve as expected (gate_up_f4b8 5.6 to 2.5 ms, lin_in 3.6 to 1.7, down 3.1 to 1.2). Launch gaps are negligible (the busy time is 98% of the span). Sharding both heads over the vocabulary (`Shard::Vocab` exists in `tp.rs`, nothing uses it) would save about 1.5 ms and put tp2 at about 1.58x; it needs a cross-rank argmax and logits gather in the sampler, which is the remaining work in #921. The allreduce kernels run 22-26 us in a step against 8-11 us alone, the difference being rank skew from the unequal tails of the previous kernels.
+
+vLLM with the flags of `~/qwen3.8-27B-NVFP4-tp2.sh` (MTP 2 speculative tokens, fp8 KV, prefix caching, tool and reasoning parsers, max-model-len 8192, `MemoryMax=40G`, `/tmp/pair658/vllm_user.sh`): batch 1 decode 169.9 tok/s, batch 8 1193.8 tok/s total (149.2 per stream), 4k prefill 11105 tok/s (369 ms). The prompt is `hello` repeated and the output is repetitive, so MTP acceptance is far above real text and these two decode numbers are an upper bound. Flagless vLLM 0.x tp2 on the same pair (`vllm serve --tensor-parallel-size 2`, fp8 KV, prefix caching, max-model-len 8192, no MTP and none of the other flags of `~/qwen3.8-27B-NVFP4-tp2.sh`; run under `MemoryMax=40G` because `pair658.sh`'s 24G cap OOM-killed the engine): batch 1 decode 104.5 tok/s, batch 8 669.7 tok/s total (83.7 per stream), 4k prefill 11994 tok/s (342 ms). Our tp2 is ahead of it at batch 1 and 8 on decode and about 4x behind on prefill.
+
+Vision on real TP=2 (#910): the server with `tp = 2` loaded the 27B on both cards, an image request (`vision/shapes.png`, 192 vision tokens, greedy, 60 tokens) returned text identical to the tp = 1 server.
+
+MoE (#798) on the real Qwen3.5-122B-A10B NVFP4 (76 GB, fits in 2x96 GB, tp1 fits one card), `tpbench --compare 1,2`:
+
+| mode | split | top-1 | mean KL | max KL |
+| --- | --- | --- | --- | --- |
+| serving (fp4 activations, split acts) | auto (columns) | 443/512 | 1.75e-2 | 0.139 |
+| bf16 activations | columns | 501/512 | 1.33e-3 | 3.5e-2 |
+| bf16 activations | experts | 496/512 | 1.65e-3 | 5.3e-2 |
+| bf16 activations, split activations | columns | 512/512 | 5.0e-5 | 8.8e-3 |
+
+The 27B NVFP4 serving spec behaves the same (top-1 418/512, mean KL 1.18e-2), so this is not MoE specific: the fp4 activation quantisation rounds each 16 value block to fp4 with an e4m3 scale, so the fp32 sum order of a row-parallel partial reduction flips a few block scales and the error is amplified, while the split-activation (hi + lo) path removes it. No wrong logic: bf16 activations with split planes agree to 5e-5 KL. The tiny MoE fixtures at tp2 agree to 2.7e-4 absolute on logits of 3.95 (`moe_tp_stays_within_a_tight_logit_bound`, bound 1e-4 of scale). Decode batch 1: 159.2 tok/s tp1, 229.6 tok/s tp2 (1.44x). Batch 8: 475.2 against 789.5 tok/s (1.66x). Prefill 512: 4011 against 5203 tok/s.
+
+#811 A/B on the 122B, batch 8, 128 prompt, 128 new, three runs, two rounds, master before the merge against after it: decode 297.1 / 299.9 / 291.9 / 294.4 / 296.6 / 302.5 tok/s before, 298.6 / 292.7 / 294.0 / 295.3 / 292.5 / 288.0 after. Both about 295 tok/s, the PTX change from the port costs nothing measurable (under 1%).

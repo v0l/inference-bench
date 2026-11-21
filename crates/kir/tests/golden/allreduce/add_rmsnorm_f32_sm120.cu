@@ -93,18 +93,35 @@ extern "C" __global__ void __launch_bounds__(256) ar_add_rmsnorm_f32(float* in, 
     for (int r = blockIdx.x; r < rows; r += gridDim.x) {
         size_t base = (size_t)r * WIDTH;
         float ss = 0.0f;
-        for (int i = threadIdx.x; i < WIDTH / 4; i += blockDim.x) {
-            float4 v = ((const float4*)(x + base))[i];
-            float s[4] = {v.x, v.y, v.z, v.w};
+        constexpr int QUADS = (WIDTH / 4 + 256 - 1) / 256;
+        float4 pv[QUADS][AR_RANKS];
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                float acc = 0.0f;
+        for (int q = 0; q < QUADS; q++) {
+            int i = threadIdx.x + q * 256;
+            if (i < WIDTH / 4) {
 #pragma unroll
-                for (int p = 0; p < AR_RANKS; p++) acc += ar_ld(&((float*)table[p])[base + 4 * i + j]);
-                s[j] = s[j] + acc;
+                for (int p = 0; p < AR_RANKS; p++) pv[q][p] = __ldcg((const float4*)((const float*)table[p] + base) + i);
             }
-            ss += s[0] * s[0] + s[1] * s[1] + s[2] * s[2] + s[3] * s[3];
-            ((float4*)(x + base))[i] = make_float4(s[0], s[1], s[2], s[3]);
+        }
+#pragma unroll
+        for (int q = 0; q < QUADS; q++) {
+            int i = threadIdx.x + q * 256;
+            if (i < WIDTH / 4) {
+                float4 v = ((const float4*)(x + base))[i];
+                float s[4] = {v.x, v.y, v.z, v.w};
+                float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+                for (int p = 0; p < AR_RANKS; p++) {
+                    acc[0] += pv[q][p].x;
+                    acc[1] += pv[q][p].y;
+                    acc[2] += pv[q][p].z;
+                    acc[3] += pv[q][p].w;
+                }
+#pragma unroll
+                for (int j = 0; j < 4; j++) s[j] = s[j] + acc[j];
+                ss += s[0] * s[0] + s[1] * s[1] + s[2] * s[2] + s[3] * s[3];
+                ((float4*)(x + base))[i] = make_float4(s[0], s[1], s[2], s[3]);
+            }
         }
         float inv = rsqrtf(ar_block_sum(ss, scratch) / WIDTH + 1e-6f);
         for (int i = threadIdx.x; i < WIDTH / 4; i += blockDim.x) {

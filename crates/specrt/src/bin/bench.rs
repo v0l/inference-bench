@@ -11,6 +11,7 @@ struct Flags {
     kv_gb: Option<f64>,
     mlp_act_fp4: bool,
     mlp_planes: u8,
+    pdl: bool,
 }
 
 static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
@@ -24,13 +25,14 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1 };
+    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--serve" => f.serve = true,
             "--profile" => f.profile = true,
             "--fp8-act" => f.fp8_act = true,
+            "--pdl" => f.pdl = true,
             "--mlp-act-fp4" => f.mlp_act_fp4 = true,
             "--mlp-act-planes" => f.mlp_planes = 2,
             "--runs" | "--kv-gb" => {
@@ -53,6 +55,14 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
 }
 
 fn load_spec(path: &Path) -> Result<Spec> {
+    let mut spec = load_spec_file(path)?;
+    if flags().pdl {
+        spec.runtime.pdl = true;
+    }
+    Ok(spec)
+}
+
+fn load_spec_file(path: &Path) -> Result<Spec> {
     if path.extension().is_some_and(|e| e == "gguf") {
         return Spec::from_gguf_file(path);
     }
