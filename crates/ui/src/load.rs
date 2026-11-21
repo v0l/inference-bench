@@ -624,6 +624,7 @@ pub fn modal(app: &mut App, ctx: &egui::Context) {
             }
             Some(Err(why)) => Err(format!("not loaded: {why}")),
             None if load_devices.is_empty() && !inv.cards.is_empty() => Err("not loaded: no gpu selected. Tick a gpu under hardware in this dialog".to_string()),
+            None if inv.local().any(|c| c.ordinal == Some(0) && !c.selected) => Err("not loaded: there is no placement plan for this model, and without one it would load on GPU 0, which is switched off".to_string()),
             None => {
                 let kv = dialog.view.is_ok().then(|| dialog.kv_bytes()).flatten().filter(|_| dialog.seqs > 1);
                 app.load_model_placed(&model, dialog.ctx, dialog.seqs, kv, names, dialog.choice.clone(), alongside);

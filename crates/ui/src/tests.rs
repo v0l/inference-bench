@@ -2808,6 +2808,28 @@ fn with_every_gpu_unticked_the_dialog_refuses_to_load_on_a_default_gpu() {
 }
 
 #[test]
+fn with_gpu_0_unticked_a_model_with_no_plan_is_not_loaded_on_gpu_0() {
+    let mut h = two_gpu_27b_dialog("unplanned-gpu0-off");
+    let seen = recording_engine(h.state_mut());
+    click_settled(&mut h, "GPU 0  ");
+    h.run();
+    {
+        let d = h.state_mut().load.as_mut().unwrap();
+        d.view = Err("no spec for this architecture".into());
+        d.solved = d.solve(&[]);
+    }
+    h.run();
+    assert!(h.state().load.as_ref().unwrap().solved.is_none());
+    click_load(&mut h);
+    for _ in 0..5 {
+        h.run();
+    }
+    assert!(seen.lock().unwrap().is_empty(), "an unplanned load would open GPU 0");
+    let notice = h.state().notice.clone().unwrap();
+    assert!(!notice.0 && notice.1.contains("GPU 0, which is switched off"), "{notice:?}");
+}
+
+#[test]
 fn a_model_that_lands_on_the_wrong_gpu_is_reported_against_the_plan() {
     let mut h = two_gpu_27b_dialog("landing");
     recording_engine(h.state_mut());
