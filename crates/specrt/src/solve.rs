@@ -679,6 +679,17 @@ mod tests {
     }
 
     #[test]
+    fn two_equal_cards_with_unequal_free_memory_are_not_a_tp_pair() {
+        let busy = [gpu(0, 42.8, 1792.0), gpu(1, 76.3, 1792.0)];
+        let pinned = PlacementRequest { mode: Profile::MaxPerformance, target: Target::default(), pins: [(PIN_TP.to_string(), json!(2))].into(), devices: &busy, spec: &spec() };
+        let e = solve(&pinned).expect_err("tp 2 is refused");
+        assert!(format!("{e:#}").contains("tp 2 is not possible"), "{e:#}");
+        let idle = [gpu(0, 90.0, 1792.0), gpu(1, 90.0, 1792.0)];
+        let pinned = PlacementRequest { devices: &idle, ..pinned };
+        assert_eq!(solve(&pinned).unwrap().tp, 2);
+    }
+
+    #[test]
     fn mismatched_gpus_never_form_a_tp_group_and_low_memory_takes_the_smaller_card() {
         let devices = [gpu(0, 86.0, 1792.0), gpu(1, 28.0, 900.0)];
         let max = run(Profile::MaxPerformance, Target::default(), &[], &devices, &spec());
