@@ -2782,10 +2782,12 @@ fn the_user_settings_on_two_96gb_gpus_plan_across_both() {
 
 type Seen = std::sync::Arc<std::sync::Mutex<Vec<specrt::serve::ServeOptions>>>;
 
+const SCRIPTED_REPO: &str = "acme/dense-27b-nvfp4";
+
 fn recording_engine(app: &mut App) -> Seen {
     let seen: Seen = Default::default();
     let log = seen.clone();
-    let script = Script { models: vec!["acme/Qwen3.8-27B-NVFP4".into()], ..script() };
+    let script = Script { models: vec![SCRIPTED_REPO.into()], ..script() };
     let fake = inference_bench_core::fake::ScriptedServing::factory(script.clone());
     let serving: inference_bench_core::engine::ServingFactory = std::sync::Arc::new(move |opts| {
         log.lock().unwrap().push(opts.clone());
@@ -2801,9 +2803,9 @@ fn the_engine_receives_exactly_the_solved_plan_the_dialog_showed() {
     let seen = recording_engine(h.state_mut());
     {
         let app = h.state_mut();
-        app.library[0].repo = "acme/Qwen3.8-27B-NVFP4".into();
+        app.library[0].repo = SCRIPTED_REPO.into();
         let d = app.load.as_mut().unwrap();
-        d.model.repo = "acme/Qwen3.8-27B-NVFP4".into();
+        d.model.repo = SCRIPTED_REPO.into();
         d.seqs = 21;
         d.pin_seqs = true;
         d.ctx = 262144;
@@ -2830,8 +2832,8 @@ fn unticking_gpu_0_in_the_dialog_plans_and_loads_on_gpu_1_only() {
     let seen = recording_engine(h.state_mut());
     {
         let app = h.state_mut();
-        app.library[0].repo = "acme/Qwen3.8-27B-NVFP4".into();
-        app.load.as_mut().unwrap().model.repo = "acme/Qwen3.8-27B-NVFP4".into();
+        app.library[0].repo = SCRIPTED_REPO.into();
+        app.load.as_mut().unwrap().model.repo = SCRIPTED_REPO.into();
     }
     h.get_by_label_contains("GPU 0 layers 0-");
     click_settled(&mut h, "GPU 0  ");
@@ -2897,8 +2899,8 @@ fn a_model_that_lands_on_the_wrong_gpu_is_reported_against_the_plan() {
     recording_engine(h.state_mut());
     {
         let app = h.state_mut();
-        app.library[0].repo = "acme/Qwen3.8-27B-NVFP4".into();
-        app.load.as_mut().unwrap().model.repo = "acme/Qwen3.8-27B-NVFP4".into();
+        app.library[0].repo = SCRIPTED_REPO.into();
+        app.load.as_mut().unwrap().model.repo = SCRIPTED_REPO.into();
     }
     click_settled(&mut h, "GPU 0  ");
     h.run();
