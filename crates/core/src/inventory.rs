@@ -205,7 +205,7 @@ mod tests {
     use specrt::hardware::{device_name, fake_gpus};
 
     fn stats(uuid: &str, used: u64, display: bool) -> GpuStats {
-        GpuStats { name: "NVIDIA RTX PRO 6000".into(), used_bytes: used << 30, total_bytes: 96 << 30, util_percent: None, uuid: uuid.into(), own_bytes: 0, display }
+        GpuStats { name: "NVIDIA RTX PRO 6000".into(), used_bytes: used << 30, total_bytes: 96 << 30, util_percent: None, uuid: uuid.into(), own_bytes: 0, display, index: None }
     }
 
     fn peer(host: &str) -> Peer {
