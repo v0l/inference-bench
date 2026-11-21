@@ -218,4 +218,25 @@ nsys of the 1 + 8 co-arriving 16k run (`--cuda-graph-trace=node`), top kernels b
 
 Prefill is compute bound, so GB/s against the 1,640 GB/s ceiling is not the measure here. The NVFP4 MLP GEMMs and the FP8 projections are about 55% of kernel time and gdn_chunk_prep plus scan another 13.6%. These are the #555 kernel gaps (NVFP4 GEMM 1.4-1.6x CUTLASS, delta-net 4.4x vLLM), which are kernel design work and need a decision on scope before a change. Not started.
 
-Suites on GPU1 with the new default: kv_dtype 11 passed, serving 27 passed, mtp 14 passed 4 failed, real27b 8 passed 2 failed. The same 4 + 2 fail with the default change reverted (`tiny_mtp_draft_logits_match_the_torch_reference`, `moe_speculative_greedy_is_identical_to_plain_greedy` and two others in mtp; `real_27b_fp8_first_layers_match_transformers`, `real_27b_nvfp4_first_layers_match_the_dequantised_checkpoint`), so they are not caused by this change; their references in `~/.cache/specrt-ref-375` look stale.
+Suites on GPU1 with the new default, after merging master (which carries #932's `split_activations` pin):
+
+```
+kv_dtype: test result: ok. 11 passed; 0 failed
+serving:  test result: ok. 27 passed; 0 failed
+mtp:      test result: ok. 18 passed; 0 failed
+real27b --skip needle: 8 passed, 2 failed (first-layer tests), then after the fix below:
+real27b first_layers: test result: ok. 2 passed; 0 failed
+no_arch_names: test result: ok. 3 passed; 0 failed
+```
+
+The two first-layer tests were not stale references: the per-layer errors were 1.7e-6 to 7.9e-6 but the logits error was 2.5e-3 against a 2e-3 bound. They compare against an fp32 transformers reference, so they need `runtime.split_activations = Some(true)` like #932's tiny tests. `first_layers_match` in `tests/real27b.rs` now pins it, and both pass.
+
+Step 4 (one change tried): `prefill_chunk` 4096 (spec default) against 8192 and 16384 under the new default, same long shape, 24 requests:
+
+| chunk | prefill tok/s | TTFT p50 | TTFT p95 | decode tok/s |
+|---|---|---|---|---|
+| 4096 | 4,398 | 3.55 s | 19.3 s | 99.4 |
+| 8192 | 4,326 | 3.57 s | 19.8 s | 97.7 |
+| 16384 | 4,307 | 3.58 s | 20.0 s | 97.3 |
+
+No gain, dropped. The NVFP4 GEMM is already at vLLM's isolated TFLOP/s (`docs/specrt-nvfp4.md`, #441: warp specialisation and TMA tried and dropped, remaining cost is load issue inside the mma warps), so a further kir change there is a design task, filed as #973 (GEMMs) and #972 (delta-net).
