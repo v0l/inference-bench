@@ -167,3 +167,20 @@ cargo test --release -p inference-bench-specrt --test flash_speed --test gemm_sp
 SPECRT_FLASH_TOKENS=512 SPECRT_FLASH_FP8=1 ~/.agents/bin/gpu-run 0 -- cargo test --release -p inference-bench-specrt --test flash_speed -- --ignored --nocapture
 SPECRT_GEMM_TOKENS=512,2048,4096 ~/.agents/bin/gpu-run 0 -- cargo test --release -p inference-bench-specrt --test gemm_speed prefill_gemm_speed_fp8_channel_and_fp4 -- --ignored --nocapture
 ```
+
+## GPU results (21 Nov, GPU1 quiet, 27B NVFP4, kv fp8, MTP on, 26 seqs, 22.5 GB KV, max_batched_tokens 16384)
+
+Long shape: `--requests 40 --rate 1 --clients 8 --mix 1:15000-18000 --output 256-512`. Chat control: `--mix 1:500-1500 --output 256-512 --rate 4 --clients 16 --requests 80`.
+
+| arm | prefill tok/s | decode tok/s | TTFT p50 | TTFT p95 | ITL p95 | ITL max |
+|---|---|---|---|---|---|---|
+| 1 default (floor 512, 1 long) | 2,566 | 57 | 24.9 s | 33.8 s | 0.160 s | 6.9 s |
+| 2 `min_prefill_tokens` 4096 | 3,570 | 80 | 3.8 s | 21.6 s | 0.725 s | 5.9 s |
+| 3 `min_prefill_tokens` 16384 | 3,807 | 85 | 3.5 s | 21.3 s | 0.044 s | 7.8 s |
+| 4 burst 8192 + long 4 | 4,391 | 98 | 4.5 s | 16.5 s | 0.045 s | 1.8 s |
+| 5 burst 16384 + long 4 | 4,459 | 99 | 3.4 s | 17.3 s | 0.044 s | 2.9 s |
+| 6 chat, default | 1,773 | 652 | 0.38 s | 1.40 s | 0.143 s | 0.23 s |
+| 6 chat, burst 16384 + long 4 | 1,772 | 652 | 0.38 s | 1.42 s | 0.143 s | 0.24 s |
+
+Burst 16384 + long 4 is the default now: TTFT p50 7.4x better than the default arm, prefill 1.74x, chat control unchanged. Burst 8192 has the lower max stall (1.8 s) and p95. Both are overridable.
+Still open: nsys profile and the vLLM run on the same card. Prefill at 4,459 tok/s is about 56% of vLLM's 8,000 at 16k, short of the 80% target.
