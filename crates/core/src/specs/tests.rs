@@ -300,16 +300,14 @@ fn a_downloaded_kernel_description_installs_and_is_listed() {
 #[test]
 fn fetched_family_base_parses() {
     let base = EMBEDDED.iter().find(|(n, _)| *n == "family-base.toml").unwrap().1;
-    for text in [base.to_string()] {
-        let r = rig();
-        let data = temp("familybase");
-        let store = SpecStore::new(&data);
-        r.publish(&[file("family-base.toml", &text)], "v1", "c1");
-        assert!(matches!(store.update(&r.cfg).unwrap(), Outcome::Updated(_)));
-        let texts = family_texts(&layers(&store, &[], &[]));
-        assert!(!texts.is_empty());
-        specrt::family::Registry::from_texts(texts.iter().map(|(t, _)| t.as_str())).unwrap();
-    }
+    let r = rig();
+    let data = temp("familybase");
+    let store = SpecStore::new(&data);
+    r.publish(&[file("family-base.toml", base)], "v1", "c1");
+    assert!(matches!(store.update(&r.cfg).unwrap(), Outcome::Updated(_)));
+    let texts = family_texts(&layers(&store, &[], &[]));
+    assert!(!texts.is_empty());
+    specrt::family::Registry::from_texts(texts.iter().map(|(t, _)| t.as_str())).unwrap();
 }
 
 #[test]
