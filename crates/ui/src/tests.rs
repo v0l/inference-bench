@@ -2041,7 +2041,7 @@ fn the_load_dialog_with_a_million_token_context_fits_desktop_and_phone_widths() 
                 let mut app = App::bare(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
                 app.tab = Tab::Models;
                 app.logs = shared_logs();
-                app.library = vec![model("Qwen3-0.6B", true, "dense decoder")];
+                app.library = vec![model("small-dense", true, "dense decoder")];
                 app
             }
         });
@@ -2049,7 +2049,7 @@ fn the_load_dialog_with_a_million_token_context_fits_desktop_and_phone_widths() 
         let md = dir(&format!("yarn-shot-model-{tag}"));
         std::fs::create_dir_all(&md).unwrap();
         std::fs::copy(fixtures().join("qwen3.8-27b.config.json"), md.join("config.json")).unwrap();
-        let mut m = model("Qwen3.8-27B", true, "dense decoder");
+        let mut m = model("big-dense", true, "dense decoder");
         (m.path, m.root) = (md.clone(), md);
         m.context_length = None;
         h.state_mut().library[0] = m.clone();
