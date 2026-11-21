@@ -67,6 +67,7 @@ impl Solved {
         self.placement.stages.iter().flat_map(|s| s.ordinals.clone()).collect()
     }
 
+
     pub fn log_line(&self) -> String {
         format!(
             "{}; kv {:?} pool {:.2} GiB, {} slots, context {}, mtp {}",
@@ -407,19 +408,19 @@ impl<'a> Search<'a> {
             Kind::Single(i) => {
                 let d = &self.devices[i];
                 let why = if self.req.mode == Profile::LowMemory { "smallest that fits" } else { "fastest placement for this load" };
-                format!("fits on {} ({:.0} GB, {why})", d.name, d.memory_bytes as f64 / 1e9)
+                format!("fits on {} ({:.0} GB, {why})", crate::hardware::display_name(&d.name), d.memory_bytes as f64 / 1e9)
             }
             Kind::Tp(first, tp) => {
-                let d = &self.devices[first];
+                let names: Vec<String> = self.devices[first..first + tp].iter().map(|d| crate::hardware::display_name(&d.name)).collect();
                 let one = self.same_kind(Kind::Single(first), o, tokens, context, None).map(|s| s.single_stream_tokens_per_second());
                 let tail = match one {
                     Some(t) if t > 0.0 => format!("{:.1}x the throughput of one GPU", p.single_stream_tokens_per_second() / t),
                     _ => "the model does not fit on one GPU".to_string(),
                 };
-                format!("TP {tp} across {tp} × {}: {tail}", d.name)
+                format!("TP {tp} across {}: {tail}", names.join(" + "))
             }
             Kind::Pipeline => {
-                let names: Vec<String> = p.stages.iter().map(|s| format!("{} layers {}..{}", s.device_name, s.start, s.end)).collect();
+                let names: Vec<String> = p.stages.iter().map(|s| format!("{} layers {}..{}", crate::hardware::display_name(&s.device_name), s.start, s.end)).collect();
                 format!("pipeline over {} GPUs split by memory and speed ({})", p.stages.len(), names.join(", "))
             }
         }
@@ -598,7 +599,9 @@ mod tests {
         assert_eq!(s.kv_dtype, KvDtype::F16);
         assert!(s.slots >= 8, "{} slots", s.slots);
         assert!(s.mtp);
-        assert!(s.strategy.starts_with("TP 2 across 2 ×"), "{}", s.strategy);
+        let names: Vec<String> = pair().iter().map(|d| crate::hardware::display_name(&d.name)).collect();
+        assert!(s.strategy.starts_with(&format!("TP 2 across {} + {}:", names[0], names[1])), "{}", s.strategy);
+        assert!(!s.strategy.contains('×'), "{}", s.strategy);
         assert!(s.shortfall.is_none());
     }
 
