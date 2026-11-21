@@ -65,6 +65,7 @@ pub struct ServeOptions {
     pub watchdog: Option<Duration>,
     pub sessions: Option<crate::sessions::SessionOptions>,
     pub tp: usize,
+    pub grammar_cache: usize,
     pub solved: Option<Box<crate::solve::Solved>>,
 }
 
@@ -90,6 +91,7 @@ impl Default for ServeOptions {
             watchdog: Some(Duration::from_secs(60)),
             sessions: None,
             tp: 1,
+            grammar_cache: 32,
             solved: None,
         }
     }
@@ -1022,11 +1024,48 @@ pub struct Serving {
     core: Arc<Core>,
     assets: Arc<Assets>,
     tokens: Arc<std::sync::OnceLock<Arc<crate::grammar::TokenTable>>>,
+    grammars: Arc<Mutex<GrammarCache>>,
+}
+
+pub struct GrammarCache {
+    cap: usize,
+    order: Vec<(String, Arc<crate::grammar::Grammar>)>,
+}
+
+impl GrammarCache {
+    pub fn new(cap: usize) -> Self {
+        GrammarCache { cap, order: Vec::new() }
+    }
+
+    pub fn get_or_build(&mut self, key: String, build: impl FnOnce() -> Arc<crate::grammar::Grammar>) -> Arc<crate::grammar::Grammar> {
+        if let Some(i) = self.order.iter().position(|(k, _)| *k == key) {
+            let hit = self.order.remove(i);
+            let g = hit.1.clone();
+            self.order.push(hit);
+            return g;
+        }
+        let g = build();
+        if self.cap > 0 {
+            if self.order.len() >= self.cap {
+                self.order.remove(0);
+            }
+            self.order.push((key, g.clone()));
+        }
+        g
+    }
+
+    pub fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
 }
 
 impl Clone for Serving {
     fn clone(&self) -> Self {
-        Serving { core: self.core.clone(), assets: self.assets.clone(), tokens: self.tokens.clone() }
+        Serving { core: self.core.clone(), assets: self.assets.clone(), tokens: self.tokens.clone(), grammars: self.grammars.clone() }
     }
 }
 
@@ -1062,8 +1101,9 @@ impl Serving {
 
     pub fn load(model: &str, opts: ServeOptions) -> Result<Self> {
         let assets = Assets::load(model)?;
+        let grammars = Arc::new(Mutex::new(GrammarCache::new(opts.grammar_cache)));
         let core = Core::start(&assets.spec, opts)?;
-        Ok(Serving { core, assets: Arc::new(assets), tokens: Default::default() })
+        Ok(Serving { core, assets: Arc::new(assets), tokens: Default::default(), grammars })
     }
 
     pub fn spec(&self) -> &Spec {
@@ -1150,7 +1190,8 @@ impl Serving {
 
     pub fn grammar(&self, schema: &crate::grammar::Schema) -> Arc<crate::grammar::Grammar> {
         let table = self.tokens.get_or_init(|| Arc::new(crate::grammar::TokenTable::from_tokenizer(&self.assets.tokenizer))).clone();
-        schema.build(table, self.assets.spec.dims.vocab, self.assets.stop.clone())
+        let build = || schema.build(table, self.assets.spec.dims.vocab, self.assets.stop.clone());
+        self.grammars.lock().unwrap().get_or_build(schema.key(), build)
     }
 
     pub fn token_text(&self, id: u32) -> (String, Vec<u8>) {
@@ -1584,5 +1625,23 @@ mod placement_tests {
         let whole = kv_block_bytes(&s, 1);
         let parts: usize = [(0, 36), (36, 64)].iter().map(|&(a, b)| kv_block_bytes(&s.stage(a, b), 1)).sum();
         assert_eq!(whole, parts);
+    }
+
+    #[test]
+    fn the_grammar_cache_keeps_the_most_recent_schemas() {
+        let table = Arc::new(crate::grammar::TokenTable::new(vec![Vec::new(), b"{".to_vec()]));
+        let build = || crate::grammar::Grammar::json_object(table.clone(), 2, vec![0]);
+        let mut cache = GrammarCache::new(2);
+        let a = cache.get_or_build("a".into(), build);
+        cache.get_or_build("b".into(), build);
+        assert!(Arc::ptr_eq(&a, &cache.get_or_build("a".into(), build)));
+        cache.get_or_build("c".into(), build);
+        assert_eq!(cache.len(), 2);
+        let again = cache.get_or_build("b".into(), build);
+        assert!(!Arc::ptr_eq(&a, &again));
+        assert!(Arc::ptr_eq(&a, &cache.get_or_build("a".into(), build)) || cache.len() == 2);
+        let mut off = GrammarCache::new(0);
+        off.get_or_build("a".into(), build);
+        assert!(off.is_empty());
     }
 }
