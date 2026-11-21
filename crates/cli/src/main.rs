@@ -284,6 +284,13 @@ enum Cmd {
     #[cfg(unix)]
     #[command(about = "Share this machine's GPUs with other inference-bench apps, headless; `host pair` prints a pairing code")]
     Host(hostcmd::HostArgs),
+    #[command(about = "Check this machine and a model before loading: GPU, driver, NVRTC, JIT cache, weights and memory. Exit 0 ok, 1 warnings, 2 problems")]
+    Doctor {
+        #[arg(help = "Spec name or path, HF repo or checkpoint directory")]
+        model: Option<String>,
+        #[arg(long, help = "Print the report as JSON")]
+        json: bool,
+    },
     #[command(about = "Spec files: where each comes from, and updates from GitHub")]
     Specs {
         #[command(subcommand)]
@@ -652,6 +659,15 @@ fn main() -> Result<()> {
         #[cfg(unix)]
         Cmd::Host(args) => hostcmd::run(args, &data)?,
         Cmd::Specs { cmd } => specs_command(&data, cmd)?,
+        Cmd::Doctor { model, json } => {
+            let model = model.as_deref().map(|m| resolve_spec_names(&data, m));
+            let report = inference_bench_core::doctor::report(&inference_bench_core::doctor::Environment::detect(), model.as_deref());
+            match json {
+                true => println!("{}", serde_json::to_string_pretty(&report)?),
+                false => print!("{}", inference_bench_core::doctor::describe(&report)),
+            }
+            std::process::exit(report["exit"].as_i64().unwrap_or(2) as i32);
+        }
         Cmd::Spec { model, out, expect_act_quant } => spec_command(model, out.as_deref(), expect_act_quant.as_deref())?,
         Cmd::Kernels { spec, target } => kernels_command(&data, spec, target.as_deref())?,
         Cmd::Plan { spec, config, context, slots, objective, probe } => plan_command(&data, spec, config, *context, *slots, objective.as_deref(), *probe)?,

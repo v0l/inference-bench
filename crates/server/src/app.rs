@@ -1,3 +1,4 @@
+use crate::capabilities::Usage;
 use crate::config::ServerConfig;
 use crate::error::ApiError;
 use crate::landing::{self, ApiRoute, routes_json};
@@ -155,6 +156,7 @@ fn api_routes() -> Vec<(ApiRoute, MethodRouter<Arc<AppState>>)> {
         (r("GET", "/health", "Liveness, uptime and loaded models"), get(health)),
         (r("GET", "/metrics", "Prometheus metrics"), get(metrics)),
         (r("GET", "/v1/models", "List models (OpenAI)"), get(list_models)),
+        (r("GET", "/v1/capabilities", "Routes, the request fields each accepts, and loaded and loadable models with spec features"), get(capabilities)),
         (r("POST", "/v1/chat/completions", "Chat completions, streaming, tools"), post(chat_completions)),
         (r("POST", "/v1/completions", "Text completions"), post(completions)),
         (r("POST", "/v1/messages", "Anthropic Messages, streaming, tools, thinking"), post(crate::dialects::messages)),
@@ -356,6 +358,48 @@ async fn landing(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         true => Json(info).into_response(),
         false => Html(landing::render(&info)).into_response(),
     }
+}
+
+async fn capabilities(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let routes: Vec<ApiRoute> = api_routes().into_iter().map(|(r, _)| r).collect();
+    let status = state.manager.status();
+    let loaded_ids: Vec<String> = status.iter().filter(|m| m.loaded).map(|m| m.id.clone()).collect();
+    let models = tokio::task::spawn_blocking({
+        let state = state.clone();
+        move || {
+            status
+                .into_iter()
+                .map(|m| {
+                    let cfg = state.config.models.iter().find(|c| c.id == m.id);
+                    let described = cfg.map(|c| crate::capabilities::model_features(&state.config.specs.resolve(c.upstream_name())));
+                    let (features, error) = match described {
+                        Some(Ok(f)) => (serde_json::to_value(f).unwrap_or(Value::Null), Value::Null),
+                        Some(Err(e)) => (Value::Null, json!(e)),
+                        None => (Value::Null, Value::Null),
+                    };
+                    json!({
+                        "id": m.id,
+                        "state": if m.loaded { "loaded" } else if m.loading.is_some() { "loading" } else { "loadable" },
+                        "loaded": m.loaded,
+                        "max_ctx": cfg.and_then(|c| c.max_ctx),
+                        "vram_bytes": m.vram_bytes,
+                        "features": features,
+                        "error": error,
+                    })
+                })
+                .collect::<Vec<_>>()
+        }
+    })
+    .await
+    .unwrap_or_default();
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "auth_required": state.auth_required(),
+        "parallel_requests": state.config.concurrency(),
+        "routes": crate::capabilities::routes_with_fields(&routes),
+        "loaded": loaded_ids,
+        "models": models,
+    }))
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
@@ -591,25 +635,16 @@ fn stop_strings(body: &Value) -> Result<Vec<String>, ApiError> {
     }
 }
 
-const HANDLED_FIELDS: &[&str] = &[
-    "model", "messages", "prompt", "prompts", "repeat", "max_tokens", "max_completion_tokens", "temperature", "top_p", "top_k", "min_p", "seed", "stop", "stream",
-    "stream_options", "ignore_eos", "tools", "tool_choice", "chat_template_kwargs", "reasoning_effort", "cache_salt", "n", "logprobs",
-    "top_logprobs", "reasoning", "reasoning_budget_tokens", "thinking_budget_tokens",
-];
-
-const NEUTRAL_FIELDS: &[&str] = &["user", "parallel_tool_calls", "store", "metadata"];
-
 fn reject_unsupported_fields(body: &Value) -> Result<(), ApiError> {
     let Some(obj) = body.as_object() else { return Ok(()) };
     for (key, value) in obj {
         let key = key.as_str();
-        let known = HANDLED_FIELDS.contains(&key) || NEUTRAL_FIELDS.contains(&key);
-        let ok = known
-            || match key {
-                "response_format" => inference_bench_core::specrt_grammar::parse_response_format(value).is_ok(),
-                "frequency_penalty" | "presence_penalty" => value.is_null() || value.as_f64() == Some(0.0),
-                _ => false,
-            };
+        let ok = match crate::capabilities::lookup(key).map(|f| f.usage) {
+            Some(Usage::Read | Usage::Ignored) => true,
+            Some(Usage::Validated) => inference_bench_core::specrt_grammar::parse_response_format(value).is_ok(),
+            Some(Usage::ZeroOnly) => value.is_null() || value.as_f64() == Some(0.0),
+            None => false,
+        };
         if !ok {
             let why = match key {
                 "response_format" => {

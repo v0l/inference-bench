@@ -270,6 +270,24 @@ pub fn nvrtc_present() -> bool {
     unsafe { cudarc::nvrtc::sys::is_culib_present() }
 }
 
+pub fn driver_version() -> Option<(u32, u32)> {
+    if !cuda_present() {
+        return None;
+    }
+    let mut v = 0;
+    let ok = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut v) } == cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+    (ok && v > 0).then_some(((v / 1000) as u32, (v % 1000 / 10) as u32))
+}
+
+pub fn nvrtc_version() -> Option<(u32, u32)> {
+    if !nvrtc_present() {
+        return None;
+    }
+    let (mut major, mut minor) = (0, 0);
+    let ok = unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor) } == cudarc::nvrtc::sys::nvrtcResult::NVRTC_SUCCESS;
+    ok.then_some((major as u32, minor as u32))
+}
+
 pub fn ensure_nvrtc(cache_dir: &std::path::Path) -> Result<()> {
     if nvrtc_present() {
         return Ok(());
