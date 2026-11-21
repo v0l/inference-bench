@@ -317,8 +317,18 @@ mod tests {
     use super::*;
     use specrt::hardware::fake_gpus;
 
-    fn fixture(name: &str) -> String {
-        format!("{}/../specrt/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    fn fixture(mtp: bool) -> String {
+        let root = format!("{}/../specrt/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let mut dirs: Vec<_> = std::fs::read_dir(root).unwrap().flatten().map(|e| e.path()).filter(|p| p.join("config.json").exists()).collect();
+        dirs.sort();
+        dirs.into_iter()
+            .find(|d| {
+                let config = std::fs::read_to_string(d.join("config.json")).unwrap();
+                config.contains("mtp_num_hidden_layers") == mtp && config.contains("\"num_hidden_layers\"") && features(d.to_str().unwrap()).is_ok_and(|(_, f)| f.mtp.is_some() == mtp) && weights_on_disk(d.to_str().unwrap(), Path::new("")).is_ok()
+            })
+            .unwrap()
+            .display()
+            .to_string()
     }
 
     fn env(machine: Result<Machine, String>, tag: &str) -> Environment {
@@ -355,7 +365,7 @@ mod tests {
     fn a_checkpoint_without_weights_fails_and_says_how_to_download() {
         let dir = std::env::temp_dir().join(format!("ib-doctor-noweights-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::copy(fixture("tiny-qwen3.5/config.json"), dir.join("config.json")).unwrap();
+        std::fs::copy(format!("{}/config.json", fixture(false)), dir.join("config.json")).unwrap();
         let e = env(Ok(with_free(90 << 30)), "noweights");
         let r = report(&e, Some(dir.to_str().unwrap()));
         assert_eq!(r["exit"], 2);
@@ -369,7 +379,7 @@ mod tests {
 
     #[test]
     fn too_little_memory_fails_and_enough_passes() {
-        let tiny = fixture("tiny-qwen3.5");
+        let tiny = fixture(false);
         let low = report(&env(Ok(with_free(1 << 10)), "low"), Some(&tiny));
         assert_eq!(low["exit"], 2);
         let mem = low["checks"].as_array().unwrap().iter().find(|c| c["name"] == "memory").unwrap();
@@ -405,9 +415,9 @@ mod tests {
 
     #[test]
     fn mtp_fixture_reports_its_draft_head() {
-        let (_, f) = features(&fixture("tiny-qwen3.5-mtp")).unwrap();
+        let (_, f) = features(&fixture(true)).unwrap();
         assert!(f.mtp.is_some());
-        let (_, plain) = features(&fixture("tiny-qwen3.5")).unwrap();
+        let (_, plain) = features(&fixture(false)).unwrap();
         assert!(plain.mtp.is_none());
     }
 }
