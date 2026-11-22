@@ -161,7 +161,7 @@ impl Drop for Runtime {
     }
 }
 
-fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec, layers: &mut [DeviceLayer], weight_bytes: u64) -> Result<(Option<stream::Streamer>, Option<crate::offload::OffloadPlan>)> {
+fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec, layers: &mut [DeviceLayer], weight_bytes: u64, swap_staging: u64) -> Result<(Option<stream::Streamer>, Option<crate::offload::OffloadPlan>)> {
     use crate::offload::{Tier, plan_layers};
     let off = &spec.runtime.offload;
     if !off.enabled() {
@@ -173,7 +173,7 @@ fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec,
     if settings.host_budget == 0 {
         settings.host_budget = u64::MAX;
     }
-    let plan = plan_layers(&sizes, always, &settings)?;
+    let plan = plan_layers(&sizes, always, &settings, swap_staging)?;
     let dir = match (&off.nvme_path, plan.nvme_bytes) {
         (_, 0) => None,
         (Some(p), _) => Some(std::path::PathBuf::from(p)),
@@ -1100,7 +1100,8 @@ impl Runtime {
             + (embed.num_bytes() + norm.num_bytes()) as u64
             + lm_head.bytes()
             + mtp_weights.as_ref().map_or(0, mtp::DeviceMtp::bytes);
-        let (streamer, offload_plan) = offload_layers(&ctx, &stream, spec, &mut layers, weight_bytes)?;
+        let swap_staging = crate::offload::swap_staging_for((layout.pages() * kv_block_bytes(spec, layout.kv_planes)) as u64);
+        let (streamer, offload_plan) = offload_layers(&ctx, &stream, spec, &mut layers, weight_bytes, swap_staging)?;
         let d = &spec.dims;
         let pages = layout.pages();
         let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
