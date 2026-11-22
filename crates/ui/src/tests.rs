@@ -221,13 +221,13 @@ fn click_load(h: &mut Harness<'static, App>) {
     let mut last = None;
     for _ in 0..30 {
         h.step();
-        let at = h.get_all_by_label("load").last().unwrap().accesskit_node().bounding_box();
+        let at = h.get_all_by_label("load model").last().unwrap().accesskit_node().bounding_box();
         if at == last {
             break;
         }
         last = at;
     }
-    h.get_all_by_label("load").last().unwrap().click();
+    h.get_all_by_label("load model").last().unwrap().click();
 }
 
 fn click_settled(h: &mut Harness<'static, App>, label: &str) {
@@ -331,7 +331,7 @@ fn load_stays_available_when_the_planner_says_the_model_will_not_fit() {
 }
 
 fn click_load_node(h: &mut Harness<'static, App>) -> bool {
-    h.query_all_by_label("load").last().expect("a load key").accesskit_node().is_disabled()
+    h.query_all_by_label("load model").last().expect("a load key").accesskit_node().is_disabled()
 }
 
 #[test]
@@ -806,7 +806,7 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
 fn offloaded_script() -> Script {
     use specrt::offload::{LayerResidency, OffloadPlan, OffloadStats, Tier};
     let layers = (0..4).map(|i| LayerResidency { layer: i, bytes: 2 << 30, tier: if i < 2 { Tier::Vram } else if i == 2 { Tier::Host } else { Tier::Nvme }, pinned: i < 2 }).collect();
-    let plan = OffloadPlan { layers, staging_bytes: 1 << 30, vram_bytes: 5 << 30, host_bytes: 2 << 30, nvme_bytes: 2 << 30, host_staging_bytes: 0 };
+    let plan = OffloadPlan { layers, staging_bytes: 1 << 30, vram_bytes: 5 << 30, host_bytes: 2 << 30, nvme_bytes: 2 << 30, host_staging_bytes: 0, swap_staging_bytes: 0 };
     let stats = OffloadStats { vram_hits: 3, host_hits: 1, nvme_reads: 0, host_to_vram_bytes: 10, ..Default::default() };
     Script { offload: Some((plan, stats)), ..script() }
 }
@@ -1939,6 +1939,90 @@ fn open_dialog(name: &str) -> Harness<'static, App> {
     h
 }
 
+fn the_load_page_opens_in_place_of_the_models_page_and_back_returns() {
+    let mut h = open_dialog("page-back");
+    h.run();
+    h.get_by_label_contains("LOAD QWEN3-0.6B");
+    h.get_by_label_contains("WHAT YOU WILL GET");
+    assert!(h.query_by_label("search your models").is_none());
+    h.get_by_label("back").click();
+    h.run();
+    assert!(h.state().load.is_none());
+    assert_eq!(h.state().tab, Tab::Models);
+}
+
+#[test]
+fn escape_goes_back_and_enter_loads() {
+    let mut h = open_dialog("page-keys");
+    h.run();
+    h.key_press(egui::Key::Escape);
+    h.run();
+    assert!(h.state().load.is_none());
+    let mut h = open_dialog("page-enter");
+    h.run();
+    h.key_press(egui::Key::Enter);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    assert!(h.state().load.is_none());
+}
+
+#[test]
+fn the_common_options_are_visible_without_any_toggle() {
+    let mut h = open_dialog("page-common");
+    h.run();
+    for label in ["CONTEXT LENGTH", "KV CACHE TYPE", "KV CACHE SIZE", "PARALLEL REQUESTS", "GPU OFFLOAD", "GPU SELECTION"] {
+        assert!(h.query_all_by_label_contains(label).count() >= 1, "{label}");
+    }
+    assert!(h.query_by_label_contains("FAST LOADER").is_none());
+    for heading in specrt::options::SECTION_ORDER {
+        assert!(h.query_all_by_label_contains(&heading.to_uppercase()).count() >= 1, "{heading}");
+    }
+}
+
+#[test]
+fn choosing_fp8_kv_changes_the_result_card() {
+    let mut h = open_dialog("page-kv");
+    h.run();
+    let before = h.state().load.as_ref().unwrap().kv_bytes().unwrap();
+    crate::load::set_kv_kind(&mut h.state_mut().load.as_mut().unwrap().choice, crate::load::KvKind::Fp8);
+    h.run();
+    let d = h.state().load.as_ref().unwrap();
+    assert_eq!(crate::load::kv_kind_of(&d.choice), crate::load::KvKind::Fp8);
+    assert!(d.kv_bytes().unwrap() < before || d.kv_gb < 1e9);
+    assert!(d.choice.is_custom());
+    h.get_by_label_contains("changed from the profile");
+}
+
+#[test]
+fn searching_filters_every_option_by_name() {
+    let mut h = open_dialog("page-search");
+    h.run();
+    h.state_mut().load.as_mut().unwrap().search = "readers".into();
+    h.run();
+    assert!(h.state().load.as_ref().unwrap().search == "readers");
+    assert!(h.query_all_by_label_contains("READERS").count() >= 1);
+    assert!(h.query_by_label_contains("CONTEXT LENGTH").is_none());
+}
+
+#[test]
+fn the_load_page_fits_phone_width_with_every_section_open() {
+    for (w, hgt) in [(390.0, 844.0), (412.0, 900.0)] {
+        let mut h = harness_at("page-phone", Tab::Models, egui::vec2(w, hgt));
+        with_gpu(&mut h, 0, 96 << 30);
+        let m = real_model("Qwen3-0.6B");
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().open_load_dialog(&m);
+        h.state_mut().load.as_mut().unwrap().advanced = true;
+        h.run();
+        let screen = h.ctx.content_rect();
+        for n in h.query_all_by(|_| true).filter(|n| n.accesskit_node().bounding_box().is_some()) {
+            let r = n.rect();
+            assert!(r.right() <= screen.right() + 0.5 && r.left() >= screen.left() - 0.5, "{:?} at {r:?} past {screen:?}", n.accesskit_node().label());
+        }
+        let b = h.get_all_by_label("load model").last().unwrap().accesskit_node().bounding_box().unwrap();
+        assert!(b.y1 <= hgt as f64 && b.x1 <= w as f64, "{b:?}");
+    }
+}
+
 #[test]
 fn the_advanced_section_renders_every_option_the_engine_declares() {
     let mut h = open_dialog("adv-all");
@@ -3007,7 +3091,7 @@ fn low_memory_on_two_gpus_plans_one_gpu_and_shows_one_plan_row() {
 fn the_load_dialog_fits_every_window_size() {
     for (w, hgt) in [(1024.0, 700.0), (1280.0, 800.0), (1920.0, 1080.0), (390.0, 844.0)] {
         let mut h = two_gpu_27b_dialog_at(&format!("dialog-fit-{w}"), egui::vec2(w, hgt));
-        for key in ["load", "cancel"] {
+        for key in ["load model", "cancel"] {
             let b = h.get_all_by_label(key).last().unwrap().accesskit_node().bounding_box().unwrap();
             assert!(b.x0 >= 0.0 && b.x1 <= w as f64 && b.y0 >= 0.0 && b.y1 <= hgt as f64, "{key} at {b:?} outside {w}x{hgt}");
         }
