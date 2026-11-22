@@ -39,8 +39,13 @@ fn compiles_and_caches_both_models() {
     let jit = Jit::new(ctx, dir.clone()).unwrap();
     for file in ["qwen3-0.6b.toml", "qwen2.5-0.5b.toml"] {
         let module = Module::generate(&spec(file), 256).unwrap();
+        let started = std::time::Instant::now();
         let first = jit.load(&module).unwrap();
+        let wall = started.elapsed().as_secs_f64();
         assert!(!first.cache_hit);
+        assert!(first.compile_secs > 0.0 && first.module_secs > 0.0);
+        let sum = first.compile_secs + first.module_secs;
+        assert!((sum - wall).abs() <= 0.1 * wall, "split {sum} vs wall {wall}");
         let second = jit.load(&module).unwrap();
         assert!(second.cache_hit);
         for name in &module.kernels {
