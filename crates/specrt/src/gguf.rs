@@ -149,10 +149,7 @@ impl Iq {
     }
 
     pub fn block(self) -> (usize, usize) {
-        match self {
-            Iq::Nl4 => (32, 18),
-            k => (QK_K, k.superblock_bytes()),
-        }
+        (QK_K, self.superblock_bytes())
     }
 
     pub fn dequantize(self, block: &[u8], out: &mut [f32]) {
