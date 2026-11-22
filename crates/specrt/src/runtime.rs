@@ -21,7 +21,6 @@ mod mtp;
 pub(crate) mod snapshot;
 mod stage;
 mod step;
-mod tune;
 pub use fused::PrefillPart;
 use exec::Plans;
 pub use mtp::{SpecRow, SpecStats};
@@ -728,7 +727,6 @@ pub struct Runtime {
     fp4_act: Option<Fp4Act>,
     f4b_part: CudaSlice<f32>,
     f8b_part: CudaSlice<f32>,
-    tuned_splits: std::sync::RwLock<HashMap<crate::tune::ShapeKey, usize>>,
     ggb_scratch: CudaSlice<u16>,
     chunk: usize,
     prefill_limit: usize,
@@ -1087,7 +1085,6 @@ impl Runtime {
             fp4_act,
             f4b_part,
             f8b_part,
-            tuned_splits: Default::default(),
             ggb_scratch: stream.alloc_zeros(if spec.quant == crate::spec::Quant::Gguf { crate::codegen::ggb_scratch_len(spec) } else { 8 })?,
             chunk,
             prefill_limit,
@@ -1197,8 +1194,6 @@ impl Runtime {
         crate::progress::report(crate::progress::Stage::KvCache, 1, 1);
         let free_after = ctx.mem_get_info().map(|(free, _)| free).unwrap_or(0);
         rt.device_bytes = free_before.saturating_sub(free_after) as u64;
-        let tune_dir = spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
-        rt.tune_batched(spec.runtime.tune, &tune_dir, &rt.jit_key.clone())?;
         rt.load_secs = load_started.elapsed().as_secs_f64();
         rt.peak_host_rss_bytes = peak_rss_bytes().unwrap_or(0);
         tracing::info!(
@@ -1730,7 +1725,7 @@ impl Runtime {
         let DeviceMatrix::Fp8 { values, .. } = w else { unreachable!("tc_f8b takes FP8 weights") };
         let width = values.len() / rows;
         let shape = BatchShape::for_tokens(tokens);
-        let splits = self.splits_for(&choice.name, &shape, rows, width);
+        let splits = shape.splits(&self.target, rows, width);
         let (n, s) = (tokens as i32, splits as i32);
         let mut b = self.launcher(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
@@ -1778,7 +1773,7 @@ impl Runtime {
         let DeviceMatrix::Fp4 { packed, .. } = w else { unreachable!("tc_f4b takes NVFP4 weights") };
         let width = packed.len() * 2 / rows;
         let shape = BatchShape::for_tokens(tokens);
-        let splits = self.splits_for(&choice.name, &shape, rows, width);
+        let splits = shape.splits(&self.target, rows, width);
         let (n, s) = (tokens as i32, splits as i32);
         let mut b = self.launcher(self.kernel(&choice.name));
         w.args(&mut b, &self.buf.dummy);
