@@ -21,6 +21,14 @@ pub const ROWS_MAX_TOKENS: usize = 32;
 pub const FP8_HUGE_MIN_TOKENS: usize = 256;
 pub const GGB_MIN_TOKENS: usize = 32;
 pub const GGML_VARIANTS: [usize; 3] = [8, 16, 32];
+pub const GGML_GEMV_THREADS: u32 = 256;
+pub const GGML_GEMV_ROWS: usize = 2;
+
+pub fn ggml_gemv_rows(_n: usize) -> usize {
+    GGML_GEMV_ROWS
+}
+pub const GGML_GEMV_MAX_K: usize = 8192;
+const GGML_SUPER_BLOCK: usize = 256;
 const GGML_WARPS: usize = 4;
 const GGML_MIN_CHUNKS: usize = 2;
 const GGML_BLOCKS_PER_SM: usize = 2;
@@ -351,6 +359,7 @@ pub enum Kind {
     Fp4Act { shape: GemmShape, tile: Tile, stages: usize },
     Batch { shape: GemmShape, wf: WeightFormat, batch: BatchShape, blocks_per_sm: usize },
     GgmlBatch { shape: GemmShape, batch: BatchShape, blocks_per_sm: usize, split: bool },
+    GgmlGemv { shape: GemmShape, split: bool },
     BatchReduce { shape: GemmShape, wf: WeightFormat },
     QuantFp8 { scale: Fp8Scale },
     QuantFp4,
@@ -367,6 +376,7 @@ impl Kind {
             Kind::Fp4Act { .. } => "BlockScaledFp4Mma",
             Kind::Batch { .. } => "BatchRowsMma",
             Kind::GgmlBatch { .. } => "GgmlBatchRowsMma",
+            Kind::GgmlGemv { .. } => "GgmlGemv",
             Kind::BatchReduce { .. } => "BatchReduce",
             Kind::QuantFp8 { .. } => "QuantRowsFp8",
             Kind::QuantFp4 => "QuantRowsFp4",
@@ -384,7 +394,7 @@ impl Kind {
             Kind::QuantFp8 { .. } => &[Feature::Fp8Mma],
             Kind::QuantFp4 => &[Feature::BlockScaledFp4],
             Kind::BatchReduce { .. } => &[],
-            Kind::Gemv { .. } | Kind::HeadNormFp4 { .. } => &[Feature::WarpShuffle, Feature::CpAsync],
+            Kind::Gemv { .. } | Kind::HeadNormFp4 { .. } | Kind::GgmlGemv { .. } => &[Feature::WarpShuffle, Feature::CpAsync],
         }
     }
 
@@ -500,6 +510,10 @@ impl KernelInstance {
         KernelInstance::build(t, "quant_rows_fp4".to_string(), Kind::QuantFp4, 128, 0)
     }
 
+    pub fn ggml_gemv(t: &Target, name: &str, shape: GemmShape, split: bool) -> Result<KernelInstance, GemmError> {
+        KernelInstance::build(t, name.to_string(), Kind::GgmlGemv { shape, split }, GGML_GEMV_THREADS, 0)
+    }
+
     pub fn fp4_gemv(t: &Target, name: &str, op: Fp4Gemv, n: usize, k: usize) -> Result<KernelInstance, GemmError> {
         KernelInstance::build(t, name.to_string(), Kind::Gemv { op, n, k }, FP4_GEMV_THREADS, 0)
     }
@@ -603,6 +617,12 @@ impl KernelInstance {
                 }
             }
             Kind::GgmlBatch { shape, .. } => check_shape(shape, BATCH_KC)?,
+            Kind::GgmlGemv { shape, .. } => {
+                check_shape(shape, GGML_SUPER_BLOCK)?;
+                if shape.k > GGML_GEMV_MAX_K || !shape.n.is_multiple_of(ggml_gemv_rows(shape.n)) {
+                    return bad(format!("shape {}x{} does not fit the ggml gemv", shape.n, shape.k));
+                }
+            }
             Kind::BatchReduce { wf, .. } => {
                 if !matches!(wf, WeightFormat::Fp4 | WeightFormat::Fp8 | WeightFormat::Ggml) {
                     return bad(format!("batch rows have no {} decoder", wf.label()));
@@ -650,6 +670,7 @@ pub enum GemmPath {
     F8b,
     F4b,
     Ggr,
+    Ggv,
     Rows,
 }
 
@@ -688,6 +709,7 @@ fn decoder_for(path: GemmPath, weight: WeightFormat) -> &'static str {
         GemmPath::F8b => "fp8 batch rows",
         GemmPath::F4b => "nvfp4 batch rows",
         GemmPath::Ggr => "ggml batch rows",
+        GemmPath::Ggv => "ggml gemv",
         GemmPath::Rows => "bf16 one block per row",
         GemmPath::Ggb => "ggml to bf16 scratch",
         GemmPath::Mma | GemmPath::F4w => weight.decoder(),
@@ -738,6 +760,7 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
     let mma = t.has(Feature::Mma16816);
     let f8b = auto && mma && r.tokens <= BATCH_MAX_TOKENS && BATCH_LINEARS.contains(&r.linear);
     let ggr = auto && mma && r.tokens <= GGB_MIN_TOKENS && (GGB_LINEARS.contains(&r.linear) || r.linear == "lm_head");
+    let ggv = ggr && r.tokens == 1 && r.shape.k.is_multiple_of(GGML_SUPER_BLOCK) && r.shape.k <= GGML_GEMV_MAX_K && r.shape.n.is_multiple_of(ggml_gemv_rows(r.shape.n));
     let f4b = auto && mma && r.tokens <= BATCH_MAX_TOKENS && (!head || r.linear == "mtp_head");
     let plain = |name: String, path: GemmPath, tile: Tile, kernel: Option<KernelInstance>| Choice {
         name,
@@ -783,6 +806,11 @@ pub fn select(t: &Target, policy: &Policy, r: &Request) -> Result<Choice, GemmEr
             let name = format!("{}_f4w{suffix}", r.linear);
             let k = KernelInstance::gemm(t, &name, r.shape, WeightFormat::Fp4, tile, true, false)?;
             plain(name, GemmPath::F4w, tile, Some(k))
+        }
+        WeightFormat::Ggml if ggv => {
+            let name = format!("{}_ggv", r.linear);
+            let k = KernelInstance::ggml_gemv(t, &name, r.shape, r.split)?;
+            plain(name, GemmPath::Ggv, tile, Some(k))
         }
         WeightFormat::Ggml if ggr => {
             let name = format!("{}_ggr{}", r.linear, ggr_suffix(r.tokens));

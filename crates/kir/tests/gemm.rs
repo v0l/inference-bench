@@ -67,6 +67,8 @@ fn families(t: &Target) -> Vec<KernelInstance> {
         KernelInstance::batch_reduce(t, "gate_up_f4b_reduce", gate_up(), WeightFormat::Fp4).unwrap(),
         KernelInstance::ggml_batch(t, "down_ggr8", down(), 8, false).unwrap(),
         KernelInstance::batch_reduce(t, "down_ggr_reduce", down(), WeightFormat::Ggml).unwrap(),
+        KernelInstance::ggml_gemv(t, "down_ggv", GemmShape::new(1024, 3072, Epilogue::Residual, false), false).unwrap(),
+        KernelInstance::ggml_gemv(t, "gate_up_ggv", GemmShape::new(6144, 1024, Epilogue::Act, false), true).unwrap(),
         KernelInstance::batch(t, "qkv_f8b64", qkv(), WeightFormat::Fp8, 64).unwrap(),
         KernelInstance::batch_reduce(t, "qkv_f8b_reduce", qkv(), WeightFormat::Fp8).unwrap(),
         KernelInstance::fp4_gemv(t, "gate_up_act_f4", Fp4Gemv::GateUpAct, 34816, 5120).unwrap(),
@@ -185,6 +187,12 @@ fn small_ggml_batches_pick_the_ggml_batch_rows_and_large_ones_the_bf16_scratch()
     assert_eq!(select(&t, &p, &req("down", down(), 33, WeightFormat::Ggml)).unwrap().path, GemmPath::Ggb);
     let head = select(&t, &p, &req("lm_head", GemmShape::new(151936, 1024, Epilogue::Store, false), 4, WeightFormat::Ggml)).unwrap();
     assert_eq!(head.name, "lm_head_ggr8");
+    let one = select(&t, &p, &req("down", GemmShape::new(1024, 3072, Epilogue::Residual, false), 1, WeightFormat::Ggml)).unwrap();
+    assert_eq!((one.path, one.name.as_str(), one.reduce), (GemmPath::Ggv, "down_ggv", None));
+    let head_one = select(&t, &p, &req("lm_head", GemmShape::new(151936, 1024, Epilogue::Store, false), 1, WeightFormat::Ggml)).unwrap();
+    assert_eq!(head_one.name, "lm_head_ggv");
+    assert_eq!(select(&t, &p, &req("down", down(), 1, WeightFormat::Ggml)).unwrap().path, GemmPath::Ggr, "a row too long for the smem vector keeps the batch path");
+    assert_eq!(select(&t, &p, &req("down", GemmShape::new(1024, 3072, Epilogue::Residual, false), 2, WeightFormat::Ggml)).unwrap().path, GemmPath::Ggr);
 }
 
 #[test]

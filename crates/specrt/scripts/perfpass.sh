@@ -48,7 +48,7 @@ case $host in
         args="$family --rounds $rounds --lens $lens"
         [ -n "$only" ] && args="$args --only $only"
         [ -n "$model" ] && args="$args --model $model"
-        ssh spark "cd ~/ib-gates/$issue/src && ISSUE=$issue COMMIT=$(git -C "$repo" rev-parse --short HEAD) HOST_LABEL=spark ./crates/specrt/scripts/perfpass.sh $args"
+        ssh spark "cd ~/ib-gates/$issue/src && ISSUE=$issue MIN_AVAIL_GB=${MIN_AVAIL_GB:-40} COMMIT=$(git -C "$repo" rev-parse --short HEAD) HOST_LABEL=spark ./crates/specrt/scripts/perfpass.sh $args"
         rc=$?
         mkdir -p "$repo/docs/perf"
         rsync -az --exclude scoreboard.md spark:ib-gates/$issue/src/docs/perf/ "$repo/docs/perf/"
@@ -121,7 +121,7 @@ fi
 
 avail=$(awk '/MemAvailable/ {print int($2/1048576)}' /proc/meminfo)
 echo "MemAvailable ${avail} GB"
-[ "$avail" -ge 40 ] || { echo "need 40 GB available"; exit 1; }
+[ "$avail" -ge "${MIN_AVAIL_GB:-40}" ] || { echo "need ${MIN_AVAIL_GB:-40} GB available"; exit 1; }
 
 run() {
     systemd-run --user --wait --collect -P -q -p MemoryMax=60G -p MemorySwapMax=0 \
