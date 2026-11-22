@@ -309,7 +309,8 @@ impl Scan {
         };
         let tile = if self.tile_eligible() && self.tile_names_free(&k.params) && k.target.has(crate::Feature::Mma16816) && k.target.has(crate::Feature::CpAsync) {
             let (tile_lines, tile_value) = self.lines(&k.params, true, true)?;
-            crate::cuda::scan_tile_prefill(&crate::cuda::TileScan { name: k.name, sig: &sig.join(", "), lines: &tile_lines, value: &tile_value, sink })
+            let t = crate::cuda::TileScan { name: k.name, sig: &sig.join(", "), lines: &tile_lines, value: &tile_value, sink };
+            format!("{}{}", crate::cuda::scan_tile_prefill(&t), crate::cuda::scan_tile_decode(&t))
         } else {
             String::new()
         };
