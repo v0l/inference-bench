@@ -1,0 +1,110 @@
+{
+  "name": "llama4_text",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 128,
+    "intermediate": 256,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "sliding",
+      "sliding",
+      "sliding",
+      "full"
+    ],
+    "window": 16
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 4,
+    "kv_heads": 2,
+    "head_dim": 64,
+    "qkv_bias": false,
+    "qk_norm": true,
+    "qk_norm_unit": true,
+    "node": [
+      {
+        "op": "qk_rope",
+        "phase": "prefill"
+      },
+      {
+        "op": "kernel",
+        "kernel": "attn_chunked",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "attn_scale": "attn_scale",
+          "chunk": "window",
+          "floor_scale": "floor_scale",
+          "nope": "nope",
+          "tuning": "tuning"
+        },
+        "phase": "prefill"
+      },
+      {
+        "op": "decode_rope",
+        "phase": "rows"
+      },
+      {
+        "op": "kernel",
+        "kernel": "attn_chunked",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "attn_scale": "attn_scale",
+          "chunk": "window",
+          "floor_scale": "floor_scale",
+          "nope": "nope",
+          "tuning": "tuning"
+        },
+        "phase": "rows"
+      }
+    ],
+    "params": {
+      "attn_scale": 0.5,
+      "floor_scale": 16.0,
+      "tuning": 1.0
+    }
+  },
+  "rope": {
+    "style": "pairs",
+    "theta": 10000.0,
+    "nope_layers": [
+      3
+    ]
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 8,
+    "active": 1,
+    "expert_intermediate": 128,
+    "shared_intermediate": 128,
+    "dense_layers": [
+      0,
+      2
+    ],
+    "sparse_step": 2,
+    "router": "sigmoid",
+    "norm_topk": false,
+    "router_module": "router",
+    "input_scaled": true,
+    "experts_transposed": true
+  },
+  "tensors": {
+    ".feed_forward.": ".mlp."
+  }
+}

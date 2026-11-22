@@ -51,22 +51,25 @@ extern "C" __global__ void __launch_bounds__(32 * FM_WARPS) flash_mma(const floa
                 dst[d] = v;
                 ss += v * v;
             }
-            float inv = QK_NORM ? rsqrtf(warp_sum(ss) / HEAD_DIM + EPS) : 1.0f;
+            bool normed = QK_NORM && !(QK_NORM_UNIT && NOPE[layer]);
+            float inv = normed ? rsqrtf(warp_sum(ss) / HEAD_DIM + EPS) : 1.0f;
             __syncwarp();
-            if (QK_NORM)
-                for (int d = lane; d < HEAD_DIM; d += 32) dst[d] = q_norm[d] * (dst[d] * inv);
+            if (normed)
+                for (int d = lane; d < HEAD_DIM; d += 32) dst[d] = QK_NORM_UNIT ? dst[d] * inv : q_norm[d] * (dst[d] * inv);
             __syncwarp();
 #pragma unroll
             for (int i = 0; i < PAIRS; i++) {
                 int d = lane + 32 * i;
                 if (!NOPE[layer] && d < ROT_HALF) {
-                    float x = dst[d], y = dst[d + ROT_HALF];
+                    int dx = ROPE_PAIRS ? 2 * d : d;
+                    int dy = ROPE_PAIRS ? 2 * d + 1 : d + ROT_HALF;
+                    float x = dst[dx], y = dst[dy];
                     float sn, c;
                     sincosf(rope_position(mm_meta, mm_table, mm_stride, mm_slot, base + row, d) * freq[i], &sn, &c);
                     c *= ROPE_MSCALE;
                     sn *= ROPE_MSCALE;
-                    dst[d] = x * c - y * sn;
-                    dst[d + ROT_HALF] = y * c + x * sn;
+                    dst[dx] = x * c - y * sn;
+                    dst[dy] = y * c + x * sn;
                 }
             }
             __syncwarp();

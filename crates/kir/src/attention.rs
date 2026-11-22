@@ -23,6 +23,7 @@ pub struct RopeShape {
     pub mscale: f64,
     pub freq_factors: Vec<f64>,
     pub mrope: Option<MropeShape>,
+    pub interleaved: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,6 +40,7 @@ pub struct AttentionShape {
     pub qkv_row: usize,
     pub output_gate: bool,
     pub qk_norm: bool,
+    pub qk_norm_unit: bool,
     pub eps: f64,
     pub rope: RopeShape,
     pub kv_layers: usize,
@@ -251,6 +253,8 @@ pub(crate) fn constants(s: &AttentionShape, families: &[Family]) -> String {
     let _ = writeln!(o, "constexpr int ROT = {};", r.rotary_dim);
     let _ = writeln!(o, "constexpr int ROT_HALF = ROT / 2;");
     let _ = writeln!(o, "constexpr bool QK_NORM = {};", s.qk_norm);
+    let _ = writeln!(o, "constexpr bool QK_NORM_UNIT = {};", s.qk_norm_unit);
+    let _ = writeln!(o, "constexpr bool ROPE_PAIRS = {};", r.interleaved);
     let local: Vec<String> = s.local_rope.iter().map(|b| b.to_string()).collect();
     let _ = writeln!(o, "constexpr bool LOCAL_ROPE[] = {{ {} }};", if local.is_empty() { "false".into() } else { local.join(", ") });
     let nope: Vec<String> = s.nope.iter().map(|b| b.to_string()).collect();

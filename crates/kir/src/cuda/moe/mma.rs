@@ -183,7 +183,7 @@ fn tile_setup_head() -> &'static str {
         int pos = begin + i;
         bool live = pos < end;
         int p = live ? sorted[pos] : -1;
-        src[i] = live ? (DOWN ? pos : p / MOE_PAIRS) : -1;
+        src[i] = live ? (DOWN ? pos : (MOE_INPUT_SCALED ? p : p / MOE_PAIRS)) : -1;
         dst[i] = live ? (DOWN ? p : pos) : -1;
     }
     __syncthreads();

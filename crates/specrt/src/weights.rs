@@ -925,7 +925,7 @@ impl Checkpoint {
             None
         };
         let (q_len, k_len) = if a.qk_norm_full { (q, kv) } else { (a.head_dim, a.head_dim) };
-        let (q_norm, k_norm) = if a.qk_norm {
+        let (q_norm, k_norm) = if a.qk_norm && !a.qk_norm_unit {
             (
                 Some(self.norm(spec, &format!("{attn}.q_norm.weight"), q_len)?),
                 Some(self.norm(spec, &format!("{attn}.k_norm.weight"), k_len)?),
@@ -1180,6 +1180,29 @@ impl Checkpoint {
                 ensure!(shared_slots == 0 && local == e, "block quantised experts support neither shared experts nor an expert split yet");
                 let (gate, up) = self.block_gate_up(format, &format!("{p}.mlp.experts.gate_up_proj"), e, inter, h, m.gate_up_interleaved)?;
                 (gate, up, self.block_stack(format, &format!("{p}.mlp.experts.down_proj"), e, h, inter)?)
+            }
+            None if m.experts_transposed => {
+                ensure!(quant == Quant::Bf16, "transposed fused experts are bf16 only");
+                ensure!(shared_slots <= 1, "transposed fused experts take at most one shared expert");
+                let fused = self.bf16(&format!("{p}.mlp.experts.gate_up_proj"), &[e, h, 2 * inter])?;
+                let stored_down = self.bf16(&format!("{p}.mlp.experts.down_proj"), &[e, inter, h])?;
+                let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
+                for x in 0..e {
+                    let (g, d) = (&fused[x * h * 2 * inter..(x + 1) * h * 2 * inter], &stored_down[x * inter * h..(x + 1) * inter * h]);
+                    for r in 0..inter {
+                        gate.extend((0..h).map(|c| g[c * 2 * inter + r]));
+                        up.extend((0..h).map(|c| g[c * 2 * inter + inter + r]));
+                    }
+                    for r in 0..h {
+                        down.extend((0..inter).map(|c| d[c * h + r]));
+                    }
+                }
+                if shared_slots == 1 {
+                    gate.extend_from_slice(&self.bf16(&format!("{shared_module}.gate_proj.weight"), &[inter, h])?);
+                    up.extend_from_slice(&self.bf16(&format!("{shared_module}.up_proj.weight"), &[inter, h])?);
+                    down.extend_from_slice(&self.bf16(&format!("{shared_module}.down_proj.weight"), &[h, inter])?);
+                }
+                (Stacked::Bf16(gate), Stacked::Bf16(up), Stacked::Bf16(down))
             }
             None if m.fused_experts => {
                 ensure!(quant == Quant::Bf16, "fused experts are bf16 only");
