@@ -2061,7 +2061,7 @@ impl Runtime {
             .arg(&self.seq)
             .arg(&l.window)
             .arg(&self.mm_bidi);
-        let rows = crate::codegen::flash_rows(a.head_dim);
+        let rows = crate::codegen::flash_rows(a.head_dim, self.kv_planes);
         let config = LaunchConfig {
             grid_dim: (grid(n, rows), a.heads as u32, 1),
             block_dim: (rows as u32 * 2, 1, 1),
