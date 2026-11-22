@@ -79,12 +79,18 @@ pub struct DraftChooser {
     trial: Option<Trial>,
     last: usize,
     warm: bool,
+    chosen: [u64; MAX_DRAFT_TOKENS + 1],
+    first_seen: std::collections::HashSet<(usize, usize)>,
 }
 
 impl DraftChooser {
     pub fn new(kmax: usize) -> Self {
         let kmax = kmax.min(MAX_DRAFT_TOKENS);
-        DraftChooser { kmax, costs: HashMap::new(), global: Positions::default(), retests: HashMap::new(), trial: None, last: 0, warm: false }
+        DraftChooser { kmax, costs: HashMap::new(), global: Positions::default(), retests: HashMap::new(), trial: None, last: 0, warm: false, chosen: [0; MAX_DRAFT_TOKENS + 1], first_seen: Default::default() }
+    }
+
+    pub fn chosen(&self) -> [u64; MAX_DRAFT_TOKENS + 1] {
+        self.chosen
     }
 
     pub fn global(&self) -> &Positions {
@@ -149,6 +155,7 @@ impl DraftChooser {
         let k = self.pick(rows);
         self.warm = k == 0 || k <= self.last;
         self.last = k;
+        self.chosen[k] += 1;
         k
     }
 
@@ -200,9 +207,13 @@ impl DraftChooser {
     }
 
     pub fn observe(&mut self, rows: usize, k: usize, secs: f64) {
-        if self.warm && secs > 0.0 {
-            self.costs.entry((rows, k)).or_default().push(secs);
+        if !self.warm || secs <= 0.0 {
+            return;
         }
+        if self.first_seen.insert((rows, k)) {
+            return;
+        }
+        self.costs.entry((rows, k)).or_default().push(secs);
     }
 
     pub fn observe_accepts(&mut self, k: usize, accepted: &[usize]) {

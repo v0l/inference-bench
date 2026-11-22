@@ -255,6 +255,9 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
             }
         }
         let after = sched.exec.rt.spec_stats();
+        if let Some(c) = sched.draft_chooser() {
+            println!("  adaptive steps per k (0..=3) {:?}", c.chosen());
+        }
         let rows = (after.rows - before.rows).max(1) as f64;
         println!(
             "{} speculate={speculate} k={} batch={batch} prompts={} new={new_tokens} decode={:.1} tok/s aggregate ({:.1} per sequence) mean_acceptance_length={:.3} draft_acceptance={:.3} drafted={drafted} accepted={accepted}",
