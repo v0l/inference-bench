@@ -8,6 +8,7 @@ pub mod expr;
 pub mod gemm;
 pub mod gemv;
 pub mod ggml;
+pub mod iq_tables;
 pub mod layout;
 pub mod linear;
 pub mod moe;
