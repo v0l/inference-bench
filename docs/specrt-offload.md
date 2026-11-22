@@ -88,6 +88,33 @@ The first 64 greedy tokens are identical to resident in all three rounds. Missin
 
 Hotlist: a calibration run saved by `--save-hotlist` and loaded by `--hotlist` (or found as `<spec>.hotlist`) changed misses over a 16 token run from 4160 to 4104 on the real model (the hottest 256 of 2048 experts only cover so much), and on the tiny fixture the first decode token has zero misses with the hotlist against 6 or more cold (`tests/offload.rs`).
 
+## CPU compute tier for cold experts (evaluation)
+
+Question: for a missing expert, is a GEMV on the CPU from host RAM faster than copying it over PCIe (57.8 GB/s pinned H2D)? Measured with `crates/specrt/src/bin/cpubench.rs` (`cargo build --release --bin cpubench`, `cpubench --threads N --pool-mb 3072`), on this desktop: AMD Threadripper 9960X (24 cores, 48 threads, Zen 5), 24 MiB L2, 128 MiB L3, 62 GB RAM.
+
+CPU features: AVX-512 F/BW/VL/DQ/VNNI/BF16/VBMI/IFMA are present, AMX is not (AMD). The bench kernel is an AVX-512 VNNI int8 GEMV on NVFP4-packed rows (nibble LUT via `vpshufb`, then `vpdpbusd`), checked equal to a scalar reference. The expert is 3 matrices of 1024 x 3072 FP4 (4.72 MB, same size class as the 5.3 MB Qwen3.5-122B expert).
+
+| Measurement | Result |
+| --- | --- |
+| Host RAM streaming read, 48 threads | 159 GB/s (24 threads 158, 8 threads 137) |
+| Pinned host to device (from above) | 57.8 GB/s |
+| CPU GEMV on cold experts (4.7 MB each, pool 3 GB, beyond L3), 48 threads | 156 GB/s of weights, 33.0k experts/s, 30 us per expert |
+| Same, 24 threads / 8 threads | 151 / 131 GB/s |
+| Copy over PCIe, one expert | 12.2k experts/s, 82 us per expert |
+| CPU GEMV on an expert held in cache (compute ceiling, 48 threads) | 1.9 TB/s of weights |
+
+Split of the work: the CPU GEMV is memory bound, not compute bound. It runs at the host read bandwidth (2.7x the PCIe copy rate) and the compute ceiling is 12x above that, so extra tokens that hit the same expert are nearly free on the CPU once its weights are in cache (about 2.5 us per extra token against 30 us for the first). The data that must cross PCIe for a CPU expert is only the activation row (3072 values) down and the 3072 outputs back, a few KB.
+
+Break-even:
+
+- Batch 1 decode: a cold expert costs 30 us on the whole CPU against 82 us to copy, so CPU wins on bandwidth by 2.7x, provided all 48 threads are free and the host link and the CPU share the memory controller. The pinned copy engine also reads host RAM, so running both at once splits the 159 GB/s: copy plus CPU together can serve about 159 / 4.72 MB = 33k experts/s, against 12k for the copy alone.
+- Prefill and large batches: the copy is paid once per expert and the compute is shared by every token routed to it, while the CPU cost grows with tokens per expert (about 2.5 us per token past the first, against the GPU doing it for free). Prefill touches nearly every expert with hundreds of tokens each, so CPU loses there. The cutoff is roughly 30 tokens on one expert (82 us copy against 30 + 2.5 x n us).
+- The CPU tier does not touch the measured gap in the cache bench above (154 tok/s against a 480 tok/s link ceiling): that gap is the compute stream waiting on loads issued after the router, which a CPU path would still pay (GPU to CPU sync of the router output, CPU GEMV, CPU to GPU result, per layer, per token).
+
+Decision: not built. The bandwidth win is real (2.7x, up to about 2.8x combined with the copy engine) but only for decode with few tokens per expert, and today's decode loss is dominated by load issue latency rather than link rate, so the first fix is issuing loads before the router completes or speculating from the previous layer. Revisit once decode reaches the link ceiling. Cost to build if revisited: an AVX-512 VNNI NVFP4 expert GEMV (the bench kernel is the start), activation quantisation to int8 on the CPU path (numerics differ from the GPU NVFP4 activation path and would need its own parity test), a worker thread pool pinned off the engine threads, and a per layer GPU to CPU to GPU hop, which costs at least two stream syncs per MoE layer. The 62 GB host also has to hold the pinned expert pool the CPU reads, which the machine only fits for models up to about 40 GB of experts (9 GB was available during this run).
+
+The link is also memory-bandwidth shared with the CPU on this desktop; on the Spark (unified memory, no PCIe) the question does not apply.
+
 ## Tests
 
 - `cargo test -p inference-bench-specrt --lib offload` (CPU, 17 tests: residency, eviction under budget, prefetch order, no re-read of a resident page, throttled fake NVMe).
