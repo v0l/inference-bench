@@ -1,1 +1,123 @@
-refused: model_type llama4 is not supported
+{
+  "name": "llama4",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 5120,
+    "intermediate": 16384,
+    "vocab": 202048,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 48,
+    "pattern": [
+      "sliding",
+      "sliding",
+      "sliding",
+      "full"
+    ],
+    "window": 8192
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 40,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "qkv_bias": false,
+    "qk_norm": true,
+    "qk_norm_unit": true,
+    "node": [
+      {
+        "op": "qk_rope",
+        "phase": "prefill"
+      },
+      {
+        "op": "kernel",
+        "kernel": "attn_chunked",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "attn_scale": "attn_scale",
+          "chunk": "window",
+          "floor_scale": "floor_scale",
+          "nope": "nope",
+          "tuning": "tuning"
+        },
+        "phase": "prefill"
+      },
+      {
+        "op": "decode_rope",
+        "phase": "rows"
+      },
+      {
+        "op": "kernel",
+        "kernel": "attn_chunked",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "attn_scale": "attn_scale",
+          "chunk": "window",
+          "floor_scale": "floor_scale",
+          "nope": "nope",
+          "tuning": "tuning"
+        },
+        "phase": "rows"
+      }
+    ],
+    "params": {
+      "attn_scale": 0.1,
+      "floor_scale": 8192.0,
+      "tuning": 1.0
+    }
+  },
+  "rope": {
+    "style": "pairs",
+    "theta": 500000.0,
+    "scaling": {
+      "kind": "banded",
+      "factor": 16.0,
+      "low_freq_factor": 1.0,
+      "high_freq_factor": 1.0,
+      "original_max_positions": 8192.0
+    },
+    "nope_layers": [
+      3,
+      7,
+      11,
+      15,
+      19,
+      23,
+      27,
+      31,
+      35,
+      39,
+      43,
+      47
+    ]
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 16,
+    "active": 1,
+    "expert_intermediate": 8192,
+    "shared_intermediate": 8192,
+    "router": "sigmoid",
+    "norm_topk": false,
+    "router_module": "router",
+    "input_scaled": true,
+    "experts_transposed": true
+  },
+  "tensors": {
+    ".feed_forward.": ".mlp."
+  }
+}

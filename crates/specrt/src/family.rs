@@ -98,6 +98,7 @@ pub struct FamilyAttention {
     pub qk_norm: Flag,
     pub output_gate: Flag,
     pub qk_norm_full: bool,
+    pub qk_norm_unit: bool,
     pub fused_qkv: bool,
     pub o_tensor: Option<String>,
 }
@@ -116,6 +117,7 @@ impl Default for FamilyAttention {
             qk_norm: Flag::Fixed(false),
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },
             qk_norm_full: false,
+            qk_norm_unit: false,
             fused_qkv: false,
             o_tensor: None,
         }
@@ -151,6 +153,7 @@ pub struct FamilyMlp {
     pub fused_gate_up: bool,
     pub gated: Option<FamilyGated>,
     pub mapped: Option<FamilyGated>,
+    pub dense_intermediate_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -177,6 +180,8 @@ pub struct FamilyMoe {
     pub expert_bias: bool,
     pub router_module: Option<String>,
     pub fused_experts: bool,
+    pub input_scaled: bool,
+    pub experts_transposed: bool,
     pub hash_table: Option<String>,
 }
 
@@ -218,6 +223,7 @@ impl Default for VisionTokenKeys {
 #[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub struct FamilyVision {
+    pub ignore: bool,
     pub pooled: bool,
     pub bidirectional: bool,
     pub soft_tokens_key: String,
@@ -238,6 +244,7 @@ pub struct FamilyBlocks {
     pub attention_indices_key: Option<String>,
     pub types_key: Option<String>,
     pub sparse_types: Vec<String>,
+    pub sparse_layers_key: Option<String>,
     pub split: bool,
 }
 
@@ -306,6 +313,7 @@ pub struct FamilyRope {
     pub nope_key: Option<String>,
     pub nope_value: Option<String>,
     pub nope_all: bool,
+    pub interleaved: bool,
 }
 
 impl FamilyRope {
@@ -545,6 +553,12 @@ impl Family {
             push(k, &mut out);
         }
         if let Some(k) = self.blocks.sliding_period_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.blocks.sparse_layers_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.mlp.dense_intermediate_key.as_deref() {
             push(k, &mut out);
         }
         if let Some(k) = self.rope.local_theta_key.as_deref() {

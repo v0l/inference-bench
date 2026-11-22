@@ -419,6 +419,7 @@ pub enum AttentionKind {
 #[serde(rename_all = "lowercase")]
 pub enum RopeStyle {
     Neox,
+    Pairs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,6 +572,10 @@ pub struct Moe {
     pub out_scale: f64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fused_experts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub input_scaled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub experts_transposed: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub hash_layers: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -725,6 +730,8 @@ pub struct Attention {
     #[serde(default, skip_serializing_if = "is_false")]
     pub o_bias: bool,
     pub qk_norm: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub qk_norm_unit: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub output_gate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1663,6 +1670,10 @@ impl Spec {
                 let mut dense = hf.mlp_only_layers.clone();
                 dense.extend(dense_types.iter().copied());
                 dense.extend(0..hf.first_k_dense_replace.unwrap_or(0));
+                if let Some(sparse) = family.blocks.sparse_layers_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()) {
+                    let sparse: Vec<usize> = sparse.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect();
+                    dense.extend((0..hf.num_hidden_layers).filter(|l| !sparse.contains(l)));
+                }
                 dense.sort_unstable();
                 dense.dedup();
                 Some(Moe {
@@ -1687,6 +1698,8 @@ impl Spec {
                     router_module: family.moe.router_module.clone().unwrap_or_else(default_router_module),
                     out_scale: multiplier(&family.multipliers.residual).unwrap_or(1.0),
                     fused_experts: family.moe.fused_experts,
+                    input_scaled: family.moe.input_scaled,
+                    experts_transposed: family.moe.experts_transposed,
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,
@@ -1704,7 +1717,7 @@ impl Spec {
             act_quant: act,
             dims: Dims {
                 hidden: hf.hidden_size,
-                intermediate: hf.intermediate_size.or_else(|| {
+                intermediate: family.mlp.dense_intermediate_key.as_deref().and_then(|k| value.get(k)?.as_u64()).map(|n| n as usize).or(hf.intermediate_size).or_else(|| {
                     let m = moe.as_ref().filter(|_| strict)?;
                     Some(if m.shared_intermediate > 0 { m.shared_intermediate } else { m.expert_intermediate })
                 }).unwrap_or(0),
@@ -1736,6 +1749,7 @@ impl Spec {
                 qkv_bias,
                 o_bias,
                 qk_norm,
+                qk_norm_unit: qk_norm && family.attention.qk_norm_unit,
                 output_gate,
                 rotary_dim,
                 softcap: hf.attn_logit_softcapping,
@@ -1750,7 +1764,7 @@ impl Spec {
                 int_scratch: family.attention.int_scratch.clone(),
                 o_tensor: family.attention.o_tensor.clone(),
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value, hf.num_hidden_layers) },
+            rope: Rope { style: if family.rope.interleaved { RopeStyle::Pairs } else { RopeStyle::Neox }, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value, hf.num_hidden_layers) },
             mlp: Mlp {
                 activation,
                 quant: mlp_quant.map(|m| m.0),

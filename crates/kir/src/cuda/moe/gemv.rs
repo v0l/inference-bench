@@ -126,7 +126,7 @@ fn up_impl() -> String {
             &format!(
                 r##"    __shared__ __align__(16) float xs[HIDDEN];
     int pair = blockIdx.x;
-    int t = pair / MOE_PAIRS;
+    int t = MOE_INPUT_SCALED ? pair : pair / MOE_PAIRS;
     int expert = idx[pair];
     if (expert < 0) return;
     for (int i = threadIdx.x; i < HIDDEN; i += 256) xs[i] = xn[(size_t)t * HIDDEN + i];
@@ -190,7 +190,7 @@ fn group_up_impl() -> String {
         int live = min(MOE_TJ, end - base);
         __syncthreads();
         for (int j = 0; j < live; j++) {{
-            int t = sorted[base + j] / MOE_PAIRS;
+            int t = MOE_INPUT_SCALED ? sorted[base + j] : sorted[base + j] / MOE_PAIRS;
             for (int i = threadIdx.x; i < HIDDEN; i += 256) xs[j * HIDDEN + i] = xn[(size_t)t * HIDDEN + i];
         }}
         __syncthreads();

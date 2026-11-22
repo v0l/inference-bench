@@ -22,6 +22,7 @@ OSS = "tiny-gpt-oss"
 DSA = "tiny-glm-dsa"
 HASH = "tiny-hash-glm4-moe"
 V4 = "tiny-deepseek-v4-attention"
+LLAMA4 = "tiny-llama4"
 WINDOW = 16
 SOFTCAP = 8.0
 CHUNK = 16
@@ -136,6 +137,39 @@ def build_mla_config(dense_layers=4):
         n_routed_experts=8,
         num_experts_per_tok=2,
         n_shared_experts=2,
+        max_position_embeddings=512,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        eos_token_id=None,
+        bos_token_id=None,
+        pad_token_id=None,
+        attn_implementation="eager",
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    )
+
+
+def build_llama4_config():
+    from transformers import Llama4TextConfig
+
+    return Llama4TextConfig(
+        vocab_size=512,
+        hidden_size=128,
+        intermediate_size=128,
+        intermediate_size_mlp=256,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_local_experts=8,
+        num_experts_per_tok=1,
+        interleave_moe_layer_step=2,
+        no_rope_layers=[1, 1, 1, 0],
+        attention_chunk_size=CHUNK,
+        use_qk_norm=True,
+        attn_temperature_tuning=True,
+        attn_scale=ATTN_SCALE,
+        floor_scale=FLOOR_SCALE,
         max_position_embeddings=512,
         rms_norm_eps=1e-6,
         hidden_act="silu",
@@ -282,7 +316,9 @@ def weights(model):
     for name, p in sorted(model.state_dict().items()):
         if ".mlp.experts." in name and "bias" not in name:
             continue
-        if name.endswith("router.bias"):
+        if name.endswith(".feed_forward.router.weight"):
+            v = 6.0 * torch.randn(p.shape, generator=g) / p.shape[-1] ** 0.5
+        elif name.endswith("router.bias"):
             v = 0.3 * torch.randn(p.shape, generator=g)
         elif name.endswith("e_score_correction_bias"):
             v = 0.2 * torch.randn(p.shape, generator=g)
@@ -352,6 +388,11 @@ def make(name):
 
         cfg = build_glm_config()
         extra = {}
+    elif name == LLAMA4:
+        from transformers import Llama4ForCausalLM as Model
+
+        cfg = build_llama4_config()
+        extra = {"architectures": ["Llama4ForCausalLM"]}
     elif name == OSS:
         from transformers import GptOssForCausalLM as Model
 
@@ -619,7 +660,7 @@ def make_v4():
 def main(out_dir):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    for name in (SINKS, CHUNKED, MLA, MLA_MOE, GLM, OSS, DSA, V4):
+    for name in (SINKS, CHUNKED, MLA, MLA_MOE, GLM, OSS, DSA, V4, LLAMA4):
         model = make_v4() if name == V4 else make(name)
         g = torch.Generator().manual_seed(SEED + 3)
         prompt = DSA_PROMPT if name == DSA else PROMPT

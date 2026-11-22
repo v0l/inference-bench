@@ -74,6 +74,9 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
     if !spec.attention.node.is_empty() {
         return Some("described attention kernels are not yet on wgpu".into());
     }
+    if spec.attention.qk_norm_unit || spec.rope.style != crate::spec::RopeStyle::Neox {
+        return Some("interleaved rope and weightless qk norm are not yet on wgpu".into());
+    }
     if spec.attention.output_gate {
         return Some("output-gated attention is not yet on wgpu".into());
     }

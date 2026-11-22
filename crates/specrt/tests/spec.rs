@@ -730,13 +730,12 @@ fn a_plain_attention_mtp_block_validates_only_with_a_layout() {
 }
 
 #[test]
-fn llama4_scout_describes_but_is_refused_for_serving_until_the_engine_has_its_blocks() {
+fn llama4_scout_is_served_through_its_family_spec() {
     let json = std::fs::read_to_string(root().join("tests/fixtures/llama4-scout.config.json")).unwrap();
-    let spec = Spec::describe_hf_config(&json).unwrap();
+    let spec = Spec::from_hf_config_serving(&json).unwrap();
     assert_eq!(spec.layers.count, 48);
-    assert!(spec.moe.is_none(), "num_local_experts is not read yet");
-    let refusal = Spec::from_hf_config_serving(&json).unwrap_err().to_string();
-    assert!(refusal.contains("model_type llama4 is not supported"), "{refusal}");
+    assert_eq!(spec.moe.as_ref().unwrap().experts, 16);
+    spec.runnable().unwrap();
 }
 
 #[test]

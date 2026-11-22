@@ -14,6 +14,7 @@ fn experts(k: &MoeKernel) -> String {
     out.push_str(&route::route());
     out.push_str(&gemv::pair_entries());
     out.push_str(&route::combine());
+    out.push_str(&route::scale_inputs());
     out.push_str(&route::permute());
     out.push_str(&gemv::grouped());
     out.push_str(&gemv::group_entries());

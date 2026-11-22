@@ -63,6 +63,7 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         hash: m.hash_table.is_some(),
         block_group: m.expert_block.map_or(0, |b| b.group),
         mapped: spec.mlp.mapped.is_some(),
+        input_scaled: m.input_scaled,
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if moe_mma_enabled(spec, target) {
@@ -127,6 +128,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::at
         qkv_row: spec.qkv_rows(),
         output_gate: a.output_gate,
         qk_norm: a.qk_norm && !a.qk_norm_full,
+        qk_norm_unit: a.qk_norm_unit,
         eps: spec.norm.eps,
         rope: kir::attention::RopeShape {
             rotary_dim: spec.rotary_dim(),
@@ -139,6 +141,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::at
             mscale: rope.mscale,
             freq_factors: spec.rope_freq_factors(max_ctx),
             mrope: spec.rope.mrope.as_ref().map(|m| kir::attention::MropeShape { section: m.section, interleaved: m.interleaved }),
+            interleaved: spec.rope.style == crate::spec::RopeStyle::Pairs,
         },
         kv_layers: spec.kv_layers(),
         kv_planes,
@@ -168,6 +171,8 @@ pub fn attention_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::
         .num("qkv_row", spec.qkv_rows() as f64)
         .flag("output_gate", a.output_gate)
         .flag("qk_norm", a.qk_norm && !a.qk_norm_full)
+        .flag("qk_norm_unit", a.qk_norm_unit)
+        .flag("rope_interleaved", spec.rope.style == crate::spec::RopeStyle::Pairs)
         .num("norm_eps", spec.norm.eps)
         .num("rotary_dim", spec.rotary_dim() as f64)
         .num("rope_theta", spec.theta())
