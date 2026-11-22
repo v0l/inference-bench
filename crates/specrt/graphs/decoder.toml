@@ -960,17 +960,21 @@ out = "qkv"
 [[mtp]]
 op = "kv_rope"
 phase = "prefill"
-when = "speculative+tensor_core"
+when = "speculative+tensor_core+stock"
 
 [[mtp]]
 op = "flash"
 phase = "prefill"
-when = "speculative+tensor_core"
+when = "speculative+tensor_core+stock"
 
 [[mtp]]
 op = "decode_attention"
 phase = "rows"
-when = "speculative+tensor_core"
+when = "speculative+tensor_core+stock"
+
+[[mtp]]
+op = "attention_nodes"
+when = "speculative+tensor_core+described"
 
 [[mtp]]
 op = "linear"

@@ -2206,7 +2206,6 @@ impl Spec {
             }
         }
         ensure!(launches > 0, "[[attention.node]] declares no kernel node");
-        ensure!(self.speculative().is_none(), "[[attention.node]] cannot be combined with [mtp] yet");
         Ok(())
     }
 
