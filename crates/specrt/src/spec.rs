@@ -419,6 +419,7 @@ pub enum AttentionKind {
 #[serde(rename_all = "lowercase")]
 pub enum RopeStyle {
     Neox,
+    Pairs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,6 +572,10 @@ pub struct Moe {
     pub out_scale: f64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fused_experts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub input_scaled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub experts_transposed: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub hash_layers: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -725,6 +730,8 @@ pub struct Attention {
     #[serde(default, skip_serializing_if = "is_false")]
     pub o_bias: bool,
     pub qk_norm: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub qk_norm_unit: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub output_gate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -899,6 +906,48 @@ pub struct Mtp {
     pub graph: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_quant: Option<Quant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<MtpLayout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MtpLayout {
+    pub layer: String,
+    pub fc: String,
+    pub norm_embed: String,
+    pub norm_hidden: String,
+    pub norm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+}
+
+impl MtpLayout {
+    pub fn stock() -> MtpLayout {
+        MtpLayout {
+            layer: "mtp.layers.0".into(),
+            fc: "mtp.fc.weight".into(),
+            norm_embed: "mtp.pre_fc_norm_embedding.weight".into(),
+            norm_hidden: "mtp.pre_fc_norm_hidden.weight".into(),
+            norm: "mtp.norm.weight".into(),
+            head: None,
+        }
+    }
+
+    fn at(&self, layers: usize) -> MtpLayout {
+        let sub = |t: &str| t.replace("{n}", &layers.to_string());
+        MtpLayout { layer: sub(&self.layer), fc: sub(&self.fc), norm_embed: sub(&self.norm_embed), norm_hidden: sub(&self.norm_hidden), norm: sub(&self.norm), head: self.head.as_deref().map(sub) }
+    }
+
+    fn validate(&self) -> Result<()> {
+        for (name, v) in [("layer", &self.layer), ("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden), ("norm", &self.norm)] {
+            ensure!(!v.is_empty(), "[mtp.layout] {name} is empty");
+        }
+        for (name, v) in [("fc", &self.fc), ("norm_embed", &self.norm_embed), ("norm_hidden", &self.norm_hidden), ("norm", &self.norm)] {
+            ensure!(v.ends_with(".weight"), "[mtp.layout] {name} must name a .weight tensor, not {v:?}");
+        }
+        Ok(())
+    }
 }
 
 fn default_draft_tokens() -> usize {
@@ -911,7 +960,7 @@ fn default_true() -> bool {
 
 impl Mtp {
     pub fn new(layers: usize) -> Mtp {
-        Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None, graph: false, head_quant: None }
+        Mtp { layers, draft_tokens: default_draft_tokens(), speculate: true, max_batch: None, graph: false, head_quant: None, layout: None }
     }
 }
 
@@ -1621,6 +1670,10 @@ impl Spec {
                 let mut dense = hf.mlp_only_layers.clone();
                 dense.extend(dense_types.iter().copied());
                 dense.extend(0..hf.first_k_dense_replace.unwrap_or(0));
+                if let Some(sparse) = family.blocks.sparse_layers_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()) {
+                    let sparse: Vec<usize> = sparse.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect();
+                    dense.extend((0..hf.num_hidden_layers).filter(|l| !sparse.contains(l)));
+                }
                 dense.sort_unstable();
                 dense.dedup();
                 Some(Moe {
@@ -1645,6 +1698,8 @@ impl Spec {
                     router_module: family.moe.router_module.clone().unwrap_or_else(default_router_module),
                     out_scale: multiplier(&family.multipliers.residual).unwrap_or(1.0),
                     fused_experts: family.moe.fused_experts,
+                    input_scaled: family.moe.input_scaled,
+                    experts_transposed: family.moe.experts_transposed,
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,
@@ -1662,7 +1717,7 @@ impl Spec {
             act_quant: act,
             dims: Dims {
                 hidden: hf.hidden_size,
-                intermediate: hf.intermediate_size.or_else(|| {
+                intermediate: family.mlp.dense_intermediate_key.as_deref().and_then(|k| value.get(k)?.as_u64()).map(|n| n as usize).or(hf.intermediate_size).or_else(|| {
                     let m = moe.as_ref().filter(|_| strict)?;
                     Some(if m.shared_intermediate > 0 { m.shared_intermediate } else { m.expert_intermediate })
                 }).unwrap_or(0),
@@ -1694,6 +1749,7 @@ impl Spec {
                 qkv_bias,
                 o_bias,
                 qk_norm,
+                qk_norm_unit: qk_norm && family.attention.qk_norm_unit,
                 output_gate,
                 rotary_dim,
                 softcap: hf.attn_logit_softcapping,
@@ -1708,7 +1764,7 @@ impl Spec {
                 int_scratch: family.attention.int_scratch.clone(),
                 o_tensor: family.attention.o_tensor.clone(),
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value, hf.num_hidden_layers) },
+            rope: Rope { style: if family.rope.interleaved { RopeStyle::Pairs } else { RopeStyle::Neox }, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value, hf.num_hidden_layers) },
             mlp: Mlp {
                 activation,
                 quant: mlp_quant.map(|m| m.0),
@@ -1727,7 +1783,8 @@ impl Spec {
                 },
             },
             moe,
-            mtp: (family.mtp && hybrid && hf.mtp_num_hidden_layers > 0).then(|| Mtp::new(hf.mtp_num_hidden_layers)),
+            mtp: (family.mtp && (hybrid || family.mtp_layout.is_some()) && hf.mtp_num_hidden_layers > 0)
+                .then(|| Mtp { layout: family.mtp_layout.clone(), ..Mtp::new(hf.mtp_num_hidden_layers) }),
             linear_attention,
             mixer,
             tensors: family.tensors.clone(),
@@ -1781,8 +1838,13 @@ impl Spec {
                 }
                 Some(h) => bail!("[mtp] head_quant {h:?} is not supported (bf16, fp8_channel and nvfp4_g16 are)"),
             }
-            ensure!(self.linear_attention.is_some(), "[mtp] needs a hybrid spec with [linear_attention]");
-            ensure!(self.attention.output_gate && self.attention.qk_norm, "[mtp] needs output-gated, qk-normed attention (output_gate and qk_norm)");
+            if let Some(l) = &m.layout {
+                l.validate()?;
+            }
+            ensure!(
+                self.linear_attention.is_some() || m.layout.is_some(),
+                "[mtp] on a spec without [linear_attention] needs a [mtp.layout] naming its tensors"
+            );
         }
         match self.act_quant {
             ActQuant::None => {}
@@ -1907,7 +1969,8 @@ impl Spec {
     pub fn draft_head_quant(&self) -> Option<Quant> {
         let fallback = if self.runtime.gemm_fp32 { Quant::Bf16 } else { Quant::Nvfp4G16 };
         let q = self.speculative()?.head_quant.unwrap_or(fallback);
-        (q != self.lm_head_quant()).then_some(q)
+        let own_head = self.mtp.as_ref().is_some_and(|m| m.layout.as_ref().is_some_and(|l| l.head.is_some()));
+        (own_head || q != self.lm_head_quant()).then_some(q)
     }
 
     pub fn mlp_quant(&self, layer: usize) -> Quant {
@@ -2084,6 +2147,10 @@ impl Spec {
 
     pub fn has_mixer(&self, layer: usize) -> bool {
         !self.layers.split || self.block(layer) != Block::Mlp
+    }
+
+    pub fn mtp_layout(&self) -> MtpLayout {
+        self.mtp.as_ref().and_then(|m| m.layout.as_ref()).map_or_else(MtpLayout::stock, |l| l.at(self.layers.count))
     }
 
     pub fn speculative(&self) -> Option<&Mtp> {

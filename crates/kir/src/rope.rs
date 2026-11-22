@@ -36,11 +36,12 @@ pub fn position_fn() -> String {
 }
 
 pub fn rotate_head() -> String {
-    "        int fi = d < ROT_HALF ? d : d - ROT_HALF;
+    "        int fi = ROPE_PAIRS ? d >> 1 : (d < ROT_HALF ? d : d - ROT_HALF);
         float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi, layer);
         float c = cosf(angle) * ROPE_MSCALE;
         float s = sinf(angle) * ROPE_MSCALE;
-        v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
+        if (ROPE_PAIRS) v = (d & 1) == 0 ? vec[d] * c - vec[d + 1] * s : vec[d] * c + vec[d - 1] * s;
+        else v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
 "
     .to_string()
 }

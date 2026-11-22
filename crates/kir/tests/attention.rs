@@ -24,6 +24,7 @@ fn rope(mrope: bool) -> RopeShape {
         mscale: 1.0,
         freq_factors: vec![],
         mrope: mrope.then_some(MropeShape { section: [11, 11, 10], interleaved: true }),
+        interleaved: false,
     }
 }
 
@@ -35,6 +36,7 @@ fn shape(planes: usize, fp8: bool, mrope: bool) -> AttentionShape {
         qkv_row: 14336,
         output_gate: true,
         qk_norm: true,
+        qk_norm_unit: false,
         eps: 1e-6,
         rope: rope(mrope),
         kv_layers: 16,
@@ -65,6 +67,20 @@ fn attention_goldens_per_family_and_variant() {
         }
     }
     golden("all_sm80.cu", &emit(&Target::sm_80(), shape(1, false, false), &Family::ALL));
+}
+
+#[test]
+fn interleaved_rope_and_unit_qk_norm_are_shape_data() {
+    let t = Target::sm_120();
+    let mut s = shape(1, false, false);
+    let plain = emit(&t, s.clone(), &[Family::RopeKv, Family::FlashMma]);
+    assert!(plain.contains("constexpr bool ROPE_PAIRS = false;") && plain.contains("constexpr bool QK_NORM_UNIT = false;"));
+    s.rope.interleaved = true;
+    s.qk_norm_unit = true;
+    let paired = emit(&t, s.clone(), &[Family::RopeKv, Family::FlashMma]);
+    assert!(paired.contains("constexpr bool ROPE_PAIRS = true;") && paired.contains("constexpr bool QK_NORM_UNIT = true;"));
+    let hash = |s: AttentionShape| AttentionKernel::new(&t, Family::FlashMma, s).unwrap().hash();
+    assert_ne!(hash(shape(1, false, false)), hash(s));
 }
 
 #[test]

@@ -312,7 +312,7 @@ impl Op {
             Op::Embed => vec!["embed_tokens.weight".into()],
             Op::Norm { which, .. } | Op::NormAdd { which, .. } => vec![which.tensor().into()],
             Op::Linear { weight, .. } => weight.tensors(spec),
-            Op::KvRope | Op::QkRope | Op::DecodeRope | Op::Flash | Op::DecodeAttention | Op::QkNorm if spec.attention.qk_norm => {
+            Op::KvRope | Op::QkRope | Op::DecodeRope | Op::Flash | Op::DecodeAttention | Op::QkNorm if spec.attention.qk_norm && !spec.attention.qk_norm_unit => {
                 vec!["self_attn.q_norm.weight".into(), "self_attn.k_norm.weight".into()]
             }
             Op::Kernel { node } => spec

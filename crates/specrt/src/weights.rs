@@ -925,7 +925,7 @@ impl Checkpoint {
             None
         };
         let (q_len, k_len) = if a.qk_norm_full { (q, kv) } else { (a.head_dim, a.head_dim) };
-        let (q_norm, k_norm) = if a.qk_norm {
+        let (q_norm, k_norm) = if a.qk_norm && !a.qk_norm_unit {
             (
                 Some(self.norm(spec, &format!("{attn}.q_norm.weight"), q_len)?),
                 Some(self.norm(spec, &format!("{attn}.k_norm.weight"), k_len)?),
@@ -1181,6 +1181,29 @@ impl Checkpoint {
                 let (gate, up) = self.block_gate_up(format, &format!("{p}.mlp.experts.gate_up_proj"), e, inter, h, m.gate_up_interleaved)?;
                 (gate, up, self.block_stack(format, &format!("{p}.mlp.experts.down_proj"), e, h, inter)?)
             }
+            None if m.experts_transposed => {
+                ensure!(quant == Quant::Bf16, "transposed fused experts are bf16 only");
+                ensure!(shared_slots <= 1, "transposed fused experts take at most one shared expert");
+                let fused = self.bf16(&format!("{p}.mlp.experts.gate_up_proj"), &[e, h, 2 * inter])?;
+                let stored_down = self.bf16(&format!("{p}.mlp.experts.down_proj"), &[e, inter, h])?;
+                let (mut gate, mut up, mut down) = (Vec::new(), Vec::new(), Vec::new());
+                for x in 0..e {
+                    let (g, d) = (&fused[x * h * 2 * inter..(x + 1) * h * 2 * inter], &stored_down[x * inter * h..(x + 1) * inter * h]);
+                    for r in 0..inter {
+                        gate.extend((0..h).map(|c| g[c * 2 * inter + r]));
+                        up.extend((0..h).map(|c| g[c * 2 * inter + inter + r]));
+                    }
+                    for r in 0..h {
+                        down.extend((0..inter).map(|c| d[c * h + r]));
+                    }
+                }
+                if shared_slots == 1 {
+                    gate.extend_from_slice(&self.bf16(&format!("{shared_module}.gate_proj.weight"), &[inter, h])?);
+                    up.extend_from_slice(&self.bf16(&format!("{shared_module}.up_proj.weight"), &[inter, h])?);
+                    down.extend_from_slice(&self.bf16(&format!("{shared_module}.down_proj.weight"), &[h, inter])?);
+                }
+                (Stacked::Bf16(gate), Stacked::Bf16(up), Stacked::Bf16(down))
+            }
             None if m.fused_experts => {
                 ensure!(quant == Quant::Bf16, "fused experts are bf16 only");
                 let shared = m.shared_intermediate;
@@ -1328,9 +1351,10 @@ impl Checkpoint {
 
     pub fn mtp<'a>(&'a self, spec: &Spec) -> Result<MtpWeights<'a>> {
         let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
-        ensure!(self.has("mtp.fc.weight"), "the checkpoint has no mtp.* tensors");
+        let lay = spec.mtp_layout();
+        ensure!(self.has(&lay.fc), "the checkpoint has no {}", lay.fc);
         let bf16 = |r: Raw<'a>, what: &str| -> Result<Matrix<'a>> { r.dequantized().into_matrix(Quant::Bf16, what) };
-        let p = "mtp.layers.0";
+        let p = lay.layer.as_str();
         let attn = self.attention_as(spec, &format!("{p}.self_attn"), true, Block::Full)?;
         let sparse = spec.moe.is_some();
         let (gate_up, down, moe) = if sparse {
@@ -1343,9 +1367,9 @@ impl Checkpoint {
             (Raw::interleave(gate, up)?.into_matrix(Quant::Bf16, "mtp gate_up")?, bf16(down, "mtp down_proj")?, None)
         };
         Ok(MtpWeights {
-            fc: bf16(self.raw("mtp.fc.weight", h, 2 * h)?, "mtp.fc")?,
-            norm_embed: self.norm(spec, "mtp.pre_fc_norm_embedding.weight", h)?,
-            norm_hidden: self.norm(spec, "mtp.pre_fc_norm_hidden.weight", h)?,
+            fc: bf16(self.raw(&lay.fc, h, 2 * h)?, "mtp.fc")?,
+            norm_embed: self.norm(spec, &lay.norm_embed, h)?,
+            norm_hidden: self.norm(spec, &lay.norm_hidden, h)?,
             layer: Layer {
                 ln1: self.norm(spec, &format!("{p}.input_layernorm.weight"), h)?,
                 ln2: self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
@@ -1356,7 +1380,7 @@ impl Checkpoint {
                 down,
                 moe,
             },
-            norm: self.norm(spec, "mtp.norm.weight", h)?,
+            norm: self.norm(spec, &lay.norm, h)?,
         })
     }
 
@@ -1404,7 +1428,18 @@ impl Checkpoint {
         }
     }
 
+    pub fn draft_head_bf16(&self, spec: &Spec) -> Result<Option<(Cow<'_, [u16]>, usize)>> {
+        let embed = self.bf16(&format!("{}.embed_tokens.weight", self.root()), &[spec.dims.vocab, spec.dims.hidden])?;
+        Ok(match self.head_raw(spec, &embed)? {
+            Raw::Bf16 { w, cols } => Some((w, cols)),
+            _ => None,
+        })
+    }
+
     pub fn draft_head(&self, spec: &Spec, quant: Quant) -> Result<Matrix<'_>> {
+        if let Some(name) = spec.mtp_layout().head {
+            return self.raw(&name, spec.dims.vocab, spec.dims.hidden)?.into_matrix(quant, "mtp lm_head");
+        }
         let embed = self.bf16(&format!("{}.embed_tokens.weight", self.root()), &[spec.dims.vocab, spec.dims.hidden])?;
         self.head_raw(spec, &embed)?.into_matrix(quant, "mtp lm_head")
     }

@@ -93,6 +93,7 @@ fn attention_shape() -> (Shape, AttentionShape) {
         qkv_row: 14336,
         output_gate: true,
         qk_norm: true,
+        qk_norm_unit: false,
         eps: 1e-6,
         rope: RopeShape {
             rotary_dim: 64,
@@ -105,6 +106,7 @@ fn attention_shape() -> (Shape, AttentionShape) {
             mscale: 0.7,
             freq_factors: vec![2.0, 3.0],
             mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }),
+            interleaved: false,
         },
         kv_layers: 16,
         kv_planes: 1,
@@ -141,6 +143,8 @@ fn attention_shape() -> (Shape, AttentionShape) {
         .num("local_theta", 10000.0)
         .flag("output_gate", true)
         .flag("qk_norm", true)
+        .flag("qk_norm_unit", false)
+        .flag("rope_interleaved", false)
         .flag("kv_fp8", true)
         .flag("bidirectional", false)
         .flags("nope", &[false, false, true, false])

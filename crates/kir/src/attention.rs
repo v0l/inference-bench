@@ -9,6 +9,7 @@ pub const DECODE_KEYS: usize = 16;
 pub const DECODE_STAGES: usize = 2;
 pub const DECODE_MAX_QLEN: usize = 4;
 pub const FLASH_ROWS: usize = 128;
+pub const FLASH_ROWS_SMALL: usize = 64;
 pub const SPLIT_BLOCK: u32 = 128;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -23,6 +24,7 @@ pub struct RopeShape {
     pub mscale: f64,
     pub freq_factors: Vec<f64>,
     pub mrope: Option<MropeShape>,
+    pub interleaved: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -39,6 +41,7 @@ pub struct AttentionShape {
     pub qkv_row: usize,
     pub output_gate: bool,
     pub qk_norm: bool,
+    pub qk_norm_unit: bool,
     pub eps: f64,
     pub rope: RopeShape,
     pub kv_layers: usize,
@@ -67,13 +70,13 @@ impl AttentionShape {
     }
 
     pub fn flash_warps(&self) -> usize {
-        FLASH_ROWS / 16
+        flash_rows(self.head_dim, self.kv_planes) / 16
     }
 
     pub fn flash_smem(&self) -> usize {
         let kv = self.flash_stages() * 2 * self.kv_planes * self.flash_keys() * self.head_dim * 2;
         let scales = if self.kv_fp8 { self.flash_stages() * 2 * self.flash_keys() * 4 } else { 0 };
-        kv.max(FLASH_ROWS * self.head_dim * 2) + scales
+        kv.max(flash_rows(self.head_dim, self.kv_planes) * self.head_dim * 2) + scales
     }
 
     pub fn legacy_flash_smem(&self) -> usize {
@@ -96,6 +99,10 @@ impl AttentionShape {
     pub fn decode_max_warps(&self) -> usize {
         self.decode_warps(DECODE_MAX_QLEN)
     }
+}
+
+pub fn flash_rows(head_dim: usize, kv_planes: usize) -> usize {
+    if head_dim <= 128 && kv_planes == 1 { FLASH_ROWS_SMALL } else { FLASH_ROWS }
 }
 
 pub fn flash_keys(head_dim: usize, kv_planes: usize) -> usize {
@@ -251,6 +258,8 @@ pub(crate) fn constants(s: &AttentionShape, families: &[Family]) -> String {
     let _ = writeln!(o, "constexpr int ROT = {};", r.rotary_dim);
     let _ = writeln!(o, "constexpr int ROT_HALF = ROT / 2;");
     let _ = writeln!(o, "constexpr bool QK_NORM = {};", s.qk_norm);
+    let _ = writeln!(o, "constexpr bool QK_NORM_UNIT = {};", s.qk_norm_unit);
+    let _ = writeln!(o, "constexpr bool ROPE_PAIRS = {};", r.interleaved);
     let local: Vec<String> = s.local_rope.iter().map(|b| b.to_string()).collect();
     let _ = writeln!(o, "constexpr bool LOCAL_ROPE[] = {{ {} }};", if local.is_empty() { "false".into() } else { local.join(", ") });
     let nope: Vec<String> = s.nope.iter().map(|b| b.to_string()).collect();

@@ -45,6 +45,7 @@ pub struct Stepper {
     masks: Vec<Option<Mask>>,
     first_mask: Option<Mask>,
     graphs: HashMap<usize, CudaGraph>,
+    capture_secs: Vec<(usize, f64)>,
     use_graphs: bool,
 }
 
@@ -64,6 +65,10 @@ impl Stepper {
 
     pub fn rows_for(&self, live: usize) -> usize {
         if self.use_graphs { pad_rows(live) } else { live }
+    }
+
+    pub fn capture_secs(&self) -> &[(usize, f64)] {
+        &self.capture_secs
     }
 
     pub fn captured_sizes(&self) -> Vec<usize> {
@@ -106,6 +111,7 @@ impl Runtime {
             masks: Vec::new(),
             first_mask: None,
             graphs: HashMap::new(),
+            capture_secs: Vec::new(),
             use_graphs: self.spec.runtime.graphs,
         })
     }
@@ -218,8 +224,13 @@ impl Runtime {
             unsafe { b.launch(cfg(n as u32, 1024)) }?;
         } else if st.use_graphs {
             if !st.graphs.contains_key(&n) {
+                let started = std::time::Instant::now();
                 let graph = self.capture_decode(st, n)?;
                 graph.upload()?;
+                self.stream.synchronize()?;
+                let secs = started.elapsed().as_secs_f64();
+                tracing::info!(rows = n, capture_secs = secs, "decode graph captured");
+                st.capture_secs.push((n, secs));
                 st.graphs.insert(n, graph);
             }
             st.graphs[&n].launch()?;

@@ -107,6 +107,7 @@ pub(super) struct MtpState {
     clog: CudaSlice<f32>,
     drafted: Vec<usize>,
     graphs: HashMap<(usize, usize), CudaGraph>,
+    capture_secs: Vec<(usize, f64)>,
     use_graphs: bool,
     syncs: Cell<u64>,
     stats: SpecStats,
@@ -157,14 +158,13 @@ impl MtpState {
         let acap = if padded * k1 <= rt.chunk { padded } else { cap };
         let rows = acap * k1;
         ensure!(rows <= rt.chunk, "{rows} verify rows do not fit a step of {}", rt.chunk);
-        let la = s.linear_attention.as_ref().context("MTP needs linear attention")?;
         let stream = &rt.stream;
         let h = s.dims.hidden;
         let vb_rows = rows.max(rt.slots) + 1;
         let wide = rt.chunk.max(vb_rows);
         let parts = vb_rows * s.attention.heads * crate::codegen::decode_splits(rt.max_ctx);
         let layers = s.linear_layers();
-        let vd = la.value_heads * la.key_head_dim;
+        let (vd, value_heads, conv_dim) = s.linear_attention.as_ref().map_or((0, 0, 0), |la| (la.value_heads * la.key_head_dim, la.value_heads, la.conv_dim()));
         let z = |n: usize| stream.alloc_zeros::<f32>(n.max(1));
         let zi = |n: usize| stream.alloc_zeros::<i32>(n.max(1));
         Ok(MtpState {
@@ -198,10 +198,11 @@ impl MtpState {
             res: zi(rows + acap)?,
             klog: z(layers * rows * vd)?,
             dlog: z(layers * rows * vd)?,
-            glog: z(layers * rows * la.value_heads)?,
-            clog: z(layers * rows * la.conv_dim())?,
+            glog: z(layers * rows * value_heads)?,
+            clog: z(layers * rows * conv_dim)?,
             drafted: vec![0; rt.slots + 1],
             graphs: HashMap::new(),
+            capture_secs: Vec::new(),
             use_graphs: s.runtime.graphs && m.graph,
             syncs: Cell::new(0),
             stats: SpecStats::default(),
@@ -245,6 +246,10 @@ impl Runtime {
         if let Some(m) = self.mtp.as_mut() {
             m.use_graphs = on;
         }
+    }
+
+    pub fn speculation_capture_secs(&self) -> Vec<(usize, f64)> {
+        self.mtp.as_ref().map(|m| m.capture_secs.clone()).unwrap_or_default()
     }
 
     pub fn captured_speculation_sizes(&self) -> Vec<usize> {
@@ -563,9 +568,9 @@ impl Runtime {
     }
 
     fn commit(&self, nseq: usize, k: usize) -> Result<()> {
+        let Some(gb) = self.gdn.as_ref() else { return Ok(()) };
         let m = self.mtp();
         let accepted = m.res.slice(..nseq);
-        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
         let la = &gb.la;
         let layers = self.spec.linear_layers() as u32;
         let (seq_slots, k1, log_rows) = (layers as i32, (k + 1) as i32, m.rows as i32);
@@ -666,9 +671,15 @@ impl Runtime {
         self.up_i32(&rin, &m.rin)?;
         if graphs {
             if !m.graphs.contains_key(&(n, k)) {
+                let started = std::time::Instant::now();
                 let graph = self.capture_round(n, k)?;
                 graph.upload()?;
-                self.mtp.as_mut().expect("an MTP spec").graphs.insert((n, k), graph);
+                self.stream.synchronize()?;
+                let secs = started.elapsed().as_secs_f64();
+                tracing::info!(rows = n, k, capture_secs = secs, "speculation graph captured");
+                let m = self.mtp.as_mut().expect("an MTP spec");
+                m.capture_secs.push((n, secs));
+                m.graphs.insert((n, k), graph);
             }
             self.mtp().graphs[&(n, k)].launch()?;
         } else {

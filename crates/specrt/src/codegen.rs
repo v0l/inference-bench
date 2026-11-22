@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 pub use crate::gemm::{
     BATCH_MAX_TOKENS, BATCH_REDUCE_BLOCK, BATCH_VARIANTS, BatchShape, FP4_GEMV_THREADS, FP8_ACT_LINEARS, GDN_LINEARS, GGB_LINEARS,
-    GGB_MIN_TOKENS, GemmPath, KernelChoice, MMA_LINEARS, MmaShape, ROWS_MAX_TOKENS, Tile, WeightFormat, WeightKind,
+    GGB_MIN_TOKENS, GGML_GEMV_THREADS, GemmPath, KernelChoice, MMA_LINEARS, MmaShape, ROWS_MAX_TOKENS, Tile, WeightFormat, WeightKind,
     fp4_act_enabled, fp8_act_enabled, select, linear_dims, linear_shape,
 };
 
@@ -63,6 +63,7 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         hash: m.hash_table.is_some(),
         block_group: m.expert_block.map_or(0, |b| b.group),
         mapped: spec.mlp.mapped.is_some(),
+        input_scaled: m.input_scaled,
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if moe_mma_enabled(spec, target) {
@@ -81,14 +82,10 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
 pub use kir::attention::PAGE;
 pub const Q8_GROUP: usize = 32;
 pub const FP8_BLOCK: usize = 128;
-pub use kir::attention::{DECODE_CHUNK, DECODE_KEYS, DECODE_MAX_QLEN, DECODE_MAX_SPLITS, DECODE_STAGES, decode_chunk, decode_splits, flash_keys, flash_stages};
+pub use kir::attention::{flash_rows, DECODE_CHUNK, DECODE_KEYS, DECODE_MAX_QLEN, DECODE_MAX_SPLITS, DECODE_STAGES, decode_chunk, decode_splits, flash_keys, flash_stages};
 
 pub fn decode_warps(group: usize, qlen: usize) -> usize {
     (group * qlen).div_ceil(16)
-}
-
-pub fn flash_rows(_head_dim: usize) -> usize {
-    kir::attention::FLASH_ROWS
 }
 
 pub fn kir_shape(spec: &Spec) -> kir::desc::Shape {
@@ -127,6 +124,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::at
         qkv_row: spec.qkv_rows(),
         output_gate: a.output_gate,
         qk_norm: a.qk_norm && !a.qk_norm_full,
+        qk_norm_unit: a.qk_norm_unit,
         eps: spec.norm.eps,
         rope: kir::attention::RopeShape {
             rotary_dim: spec.rotary_dim(),
@@ -139,6 +137,7 @@ pub fn attention_shape(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::at
             mscale: rope.mscale,
             freq_factors: spec.rope_freq_factors(max_ctx),
             mrope: spec.rope.mrope.as_ref().map(|m| kir::attention::MropeShape { section: m.section, interleaved: m.interleaved }),
+            interleaved: spec.rope.style == crate::spec::RopeStyle::Pairs,
         },
         kv_layers: spec.kv_layers(),
         kv_planes,
@@ -168,6 +167,8 @@ pub fn attention_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::
         .num("qkv_row", spec.qkv_rows() as f64)
         .flag("output_gate", a.output_gate)
         .flag("qk_norm", a.qk_norm && !a.qk_norm_full)
+        .flag("qk_norm_unit", a.qk_norm_unit)
+        .flag("rope_interleaved", spec.rope.style == crate::spec::RopeStyle::Pairs)
         .num("norm_eps", spec.norm.eps)
         .num("rotary_dim", spec.rotary_dim() as f64)
         .num("rope_theta", spec.theta())
@@ -307,7 +308,13 @@ pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::Li
 }
 
 pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::linear::LinearKernel>> {
-    let Some(la) = spec.linear_attention.as_ref() else { return Ok(Vec::new()) };
+    let Some(la) = spec.linear_attention.as_ref() else {
+        if spec.speculative().is_none() {
+            return Ok(Vec::new());
+        }
+        let unused = kir::linear::LinearShape { key_heads: 1, value_heads: 1, head_dim: 16, conv_kernel: 2, tiled_value_heads: false };
+        return Ok(vec![kir::linear::LinearKernel::new(target, kir::linear::Family::Draft, unused).map_err(anyhow::Error::msg)?]);
+    };
     let shape = linear_kernel_shape(la);
     let mut out = Vec::new();
     for f in kir::linear::Family::ALL {
@@ -536,12 +543,14 @@ impl Module {
                 smem.insert(f.out, f.out_smem);
             }
         }
-        if la.is_some() {
+        if la.is_some() || !linear.is_empty() {
             source.push('\n');
             source.push_str(&linear_source);
             for k in &linear {
                 kernels.extend_from_slice(k.family.kernels());
             }
+        }
+        if la.is_some() {
             kernels.extend_from_slice(GDN_KERNELS);
             smem.insert("lin_ba_rows", 0);
         }
