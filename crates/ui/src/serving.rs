@@ -94,6 +94,14 @@ pub fn readings(r: &Reading, per_minute: f64) -> Vec<(&'static str, String, egui
     out
 }
 
+pub fn offload_readings(r: &Reading, stream_bytes_s: f64) -> Vec<(&'static str, String, egui::Color32)> {
+    let Some(o) = r.serving.as_ref().and_then(|s| s.offload) else { return Vec::new() };
+    vec![
+        ("weight hits", crate::fmt::percent(o.hit_ratio()), TRACE),
+        ("weight stream", format!("{:.2} GB/s", stream_bytes_s / 1e9), TRACE),
+    ]
+}
+
 fn top(series: &[&[f32]], floor: f32) -> f32 {
     let peak = series.iter().flat_map(|s| s.iter().copied()).fold(0.0f32, f32::max);
     (peak * 1.15).max(floor)
@@ -202,7 +210,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 let line = Line::new().legend("showing").column(ui, 120.0).value(loaded.display.clone()).show(ui);
                 line.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
             }
-            readouts(ui, &readings(r, snap.per_minute));
+            let mut shown = readings(r, snap.per_minute);
+            shown.extend(offload_readings(r, snap.last.as_ref().map_or(0.0, |p| p.stream_bytes_s)));
+            readouts(ui, &shown);
             segments(ui, &mut span, &[(Span::Five, "last 5 minutes", None), (Span::Fifteen, "last 15 minutes", None)]);
             charts(ui, &snap, r.max_seqs, r.serving.is_some());
         }

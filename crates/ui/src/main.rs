@@ -13,6 +13,7 @@ mod strip;
 mod job;
 mod load;
 mod loadedlist;
+mod tiers;
 mod running;
 mod modelbar;
 mod models;
