@@ -21,6 +21,7 @@ mod mtp;
 pub(crate) mod snapshot;
 mod stage;
 mod step;
+mod stream;
 pub use fused::PrefillPart;
 use exec::Plans;
 pub use mtp::{SpecRow, SpecStats};
@@ -143,7 +144,36 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _ = self.stream.synchronize();
+        if let Some(s) = self.streamer.take() {
+            s.detach(&mut self.layers, &self.stream);
+        }
     }
+}
+
+fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec, layers: &mut [DeviceLayer], weight_bytes: u64) -> Result<(Option<stream::Streamer>, Option<crate::offload::OffloadPlan>)> {
+    use crate::offload::{Tier, plan_layers};
+    let off = &spec.runtime.offload;
+    if !off.enabled() {
+        return Ok((None, None));
+    }
+    let sizes: Vec<u64> = layers.iter().map(DeviceLayer::bytes).collect();
+    let always = weight_bytes - sizes.iter().sum::<u64>();
+    let mut settings = off.clone();
+    if settings.host_budget == 0 {
+        settings.host_budget = u64::MAX;
+    }
+    let plan = plan_layers(&sizes, always, &settings)?;
+    ensure!(plan.nvme_bytes == 0, "[runtime.offload] {} bytes of layers fit neither vram_budget nor host_budget, and the disk tier is not wired to the GPU path yet", plan.nvme_bytes);
+    let pool = crate::hostpool::HostPool::new(ctx.clone());
+    let mut spilled = Vec::new();
+    for l in plan.layers.iter().filter(|l| l.tier == Tier::Host) {
+        spilled.push(stream::spill(stream, &pool, l.layer, &mut layers[l.layer])?);
+    }
+    if spilled.is_empty() {
+        return Ok((None, Some(plan)));
+    }
+    let streamer = stream::Streamer::new(stream, layers, spilled, off.prefetch_depth)?;
+    Ok((Some(streamer), Some(plan)))
 }
 
 fn copied(stream: &Arc<CudaStream>) -> Result<()> {
@@ -775,6 +805,8 @@ pub struct Runtime {
     mtp: Option<mtp::MtpState>,
     snap: snapshot::SnapshotPool,
     host: crate::hostpool::HostPool,
+    streamer: Option<stream::Streamer>,
+    offload_plan: Option<crate::offload::OffloadPlan>,
     mm_meta: CudaSlice<i32>,
     mm_table: CudaSlice<i32>,
     mm_bidi: CudaSlice<i32>,
@@ -946,6 +978,10 @@ impl Runtime {
             }
             None => full.clone(),
         };
+        let mut staged = staged;
+        if staged.runtime.offload.enabled() {
+            staged.runtime.graphs = false;
+        }
         let spec = &staged;
         ensure!(layout.slots >= 1, "need at least one slot");
         let layout = if spec.runtime.kv_dtype.is_fp8() { Layout { kv_planes: 1, ..layout } } else { layout };
@@ -995,13 +1031,14 @@ impl Runtime {
             None => Checkpoint::for_repo(&spec.repo)?.renamed(&spec.tensors),
         };
         let weights_started = Instant::now();
-        let Weights { layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct } =
+        let Weights { mut layers, embed, norm, lm_head, mtp: mtp_weights, direct: weights_direct } =
             load_weights(&ctx, &stream, &checkpoint, spec, range, role)?;
         let weight_secs = weights_started.elapsed().as_secs_f64();
         let weight_bytes = layers.iter().map(DeviceLayer::bytes).sum::<u64>()
             + (embed.num_bytes() + norm.num_bytes()) as u64
             + lm_head.bytes()
             + mtp_weights.as_ref().map_or(0, mtp::DeviceMtp::bytes);
+        let (streamer, offload_plan) = offload_layers(&ctx, &stream, spec, &mut layers, weight_bytes)?;
         let d = &spec.dims;
         let pages = layout.pages();
         let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
@@ -1186,6 +1223,8 @@ impl Runtime {
             mtp: None,
             snap: Default::default(),
             host: crate::hostpool::HostPool::new(ctx.clone()),
+            streamer,
+            offload_plan,
             mm_meta,
             mm_table,
             mm_bidi,
@@ -1289,6 +1328,36 @@ impl Runtime {
 
     pub fn spec(&self) -> &Spec {
         &self.spec
+    }
+
+    pub fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
+        self.streamer.as_ref().map(|s| s.stats())
+    }
+
+    pub fn offload_plan(&self) -> Option<&crate::offload::OffloadPlan> {
+        self.offload_plan.as_ref()
+    }
+
+    pub fn streamed_layers(&self) -> usize {
+        self.streamer.as_ref().map_or(0, |s| s.streamed_layers())
+    }
+
+    pub fn staging_bytes(&self) -> u64 {
+        self.streamer.as_ref().map_or(0, |s| s.slot_bytes())
+    }
+
+    fn enter_layer(&self, layer: usize) -> Result<()> {
+        match &self.streamer {
+            Some(s) => s.enter(layer, &self.stream),
+            None => Ok(()),
+        }
+    }
+
+    fn leave_layer(&self, layer: usize) -> Result<()> {
+        match &self.streamer {
+            Some(s) => s.leave(layer, &self.stream),
+            None => Ok(()),
+        }
     }
 
     pub fn kv_blocks(&self) -> usize {
@@ -1501,11 +1570,13 @@ impl Runtime {
         unsafe { b.launch(cfg(grid(s.dims.hidden, 256), 256)) }?;
         let qkv_rows = s.qkv_rows();
         for (i, layer) in self.layers.iter().enumerate() {
+            self.enter_layer(i)?;
             let l = match &layer.mixer {
                 DeviceMixer::Linear(g) => {
                     self.gdn_decode(g, &layer.ln1, &buf.x)?;
                     self.mlp_decode(layer)?;
                     self.trace_layer(trace, i, 1)?;
+                    self.leave_layer(i)?;
                     continue;
                 }
                 DeviceMixer::Attention(l) => l,
@@ -1560,6 +1631,7 @@ impl Runtime {
             self.attention_out_decode(l, layer)?;
             self.mlp_decode(layer)?;
             self.trace_layer(trace, i, 1)?;
+            self.leave_layer(i)?;
         }
         let head_kernel = if matches!(self.lm_head, DeviceMatrix::Fp4 { .. }) { "lm_head_norm_f4" } else { "lm_head_norm" };
         self.linear_norm(

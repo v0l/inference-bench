@@ -75,7 +75,8 @@ impl Runtime {
         };
         unsafe { b.launch(config) }?;
         self.splice_media(self.seq as usize, start, np, nd)?;
-        for layer in &self.layers {
+        for (i, layer) in self.layers.iter().enumerate() {
+            self.enter_layer(i)?;
             self.rms_split(&pre.x.as_view(), &layer.ln1, &pre.xn_planes, n)?;
             match &layer.mixer {
                 DeviceMixer::Described(_) | DeviceMixer::None => unreachable!("a described mixer is refused above"),
@@ -104,6 +105,7 @@ impl Runtime {
                 }
             }
             self.mlp_rows(layer, n)?;
+            self.leave_layer(i)?;
         }
         let (hi, lo) = (pre.xn_planes.hi.as_view(), pre.xn_planes.lo.as_view());
         self.rms_split_into(&pre.x.as_view(), &self.norm, &hi, &lo, nd)?;

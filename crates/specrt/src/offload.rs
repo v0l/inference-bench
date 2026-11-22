@@ -262,7 +262,7 @@ pub struct OffloadPlan {
 
 pub fn plan_layers(layer_bytes: &[u64], always_resident: u64, settings: &OffloadSettings) -> Result<OffloadPlan> {
     let n = layer_bytes.len();
-    let staging = layer_bytes.iter().copied().max().unwrap_or(0) * settings.prefetch_depth.max(1) as u64;
+    let staging = layer_bytes.iter().copied().max().unwrap_or(0) * (settings.prefetch_depth.max(1) as u64 + 1);
     let fixed = always_resident + staging;
     ensure!(settings.vram_budget >= fixed, "vram_budget {} cannot hold resident tensors and {} staging bytes", settings.vram_budget, fixed);
     let mut vram_left = settings.vram_budget - fixed;
@@ -478,13 +478,13 @@ mod tests {
         let layers = vec![10u64; 10];
         let s = OffloadSettings { vram_budget: 50, host_budget: 30, prefetch_depth: 1, ..Default::default() };
         let p = plan_layers(&layers, 10, &s).unwrap();
-        assert_eq!(p.staging_bytes, 10);
+        assert_eq!(p.staging_bytes, 20);
         assert_eq!(p.layers[0].tier, Tier::Vram);
         assert_eq!(p.layers[9].tier, Tier::Vram);
         let count = |t| p.layers.iter().filter(|l| l.tier == t).count();
-        assert_eq!((count(Tier::Vram), count(Tier::Host), count(Tier::Nvme)), (3, 3, 4));
+        assert_eq!((count(Tier::Vram), count(Tier::Host), count(Tier::Nvme)), (2, 3, 5));
         assert_eq!(p.vram_bytes, 50);
-        assert_eq!(p.streamed_bytes_per_token(), 70);
+        assert_eq!(p.streamed_bytes_per_token(), 80);
     }
 
     #[test]
@@ -500,9 +500,9 @@ mod tests {
             let s = OffloadSettings { vram_budget: vram, host_budget: 100_000_000_000, ..Default::default() };
             plan_layers(&layers, 0, &s).unwrap().tokens_per_second_ceiling(50.0, 10.0, 1500.0)
         };
-        assert!(tps(28_000_000_000) > tps(14_000_000_000));
+        assert!(tps(30_000_000_000) > tps(14_000_000_000));
         assert!(tps(14_000_000_000) > tps(4_000_000_000));
-        let full = tps(28_000_000_000);
+        let full = tps(30_000_000_000);
         assert!((full - 1500.0 / 27.0).abs() < 1.0);
     }
 

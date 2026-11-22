@@ -68,6 +68,20 @@ impl PlanBackend<Run<'_>> for Runtime {
     fn run_op(&self, op: &Op, layer: Option<usize>, run: &Run<'_>) -> Result<()> {
         self.run_one(op, layer.map(|i| &self.layers[i]), run)
     }
+
+    fn enter_layer(&self, layer: usize) -> Result<()> {
+        match &self.streamer {
+            Some(s) => s.enter(layer, &self.stream),
+            None => Ok(()),
+        }
+    }
+
+    fn leave_layer(&self, layer: usize) -> Result<()> {
+        match &self.streamer {
+            Some(s) => s.leave(layer, &self.stream),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Runtime {
