@@ -350,9 +350,9 @@ fn variants(out: &mut String, mx: bool) {
     let planes: &[(usize, &str)] = if mx { &[(1, ""), (2, "2")] } else { &[(1, "")] };
     for &(p, tag) in planes {
         out.push_str(&variant(&format!("{stem}_up{tag}"), "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false", mx, p));
-        out.push_str(&variant(&format!("{stem}_up{tag}_s"), "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 3, false", mx, p));
+        out.push_str(&variant(&format!("{stem}_up{tag}_s"), "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 6, false", mx, p));
         out.push_str(&variant(&format!("{stem}_down{tag}"), "HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true", mx, p));
-        out.push_str(&variant(&format!("{stem}_down{tag}_s"), "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 3, true", mx, p));
+        out.push_str(&variant(&format!("{stem}_down{tag}_s"), "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 6, true", mx, p));
     }
 }
 
