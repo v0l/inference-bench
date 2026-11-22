@@ -105,8 +105,8 @@ pub(super) struct MtpState {
     dlog: CudaSlice<f32>,
     glog: CudaSlice<f32>,
     clog: CudaSlice<f32>,
-    has_drafts: Vec<bool>,
-    graphs: HashMap<usize, CudaGraph>,
+    drafted: Vec<usize>,
+    graphs: HashMap<(usize, usize), CudaGraph>,
     capture_secs: Vec<(usize, f64)>,
     use_graphs: bool,
     syncs: Cell<u64>,
@@ -200,7 +200,7 @@ impl MtpState {
             dlog: z(layers * rows * vd)?,
             glog: z(layers * rows * value_heads)?,
             clog: z(layers * rows * conv_dim)?,
-            has_drafts: vec![false; rt.slots + 1],
+            drafted: vec![0; rt.slots + 1],
             graphs: HashMap::new(),
             capture_secs: Vec::new(),
             use_graphs: s.runtime.graphs && m.graph,
@@ -228,8 +228,8 @@ impl Runtime {
     }
 
     pub fn drafts(&self, slot: usize) -> Vec<u32> {
-        let Some(m) = self.mtp.as_ref().filter(|m| m.has_drafts[slot]) else { return Vec::new() };
-        let d = self.stream.clone_dtoh(&m.drafts.slice(slot * m.k..(slot + 1) * m.k)).expect("read drafts");
+        let Some(m) = self.mtp.as_ref().filter(|m| m.drafted[slot] > 0) else { return Vec::new() };
+        let d = self.stream.clone_dtoh(&m.drafts.slice(slot * m.k..slot * m.k + m.drafted[slot])).expect("read drafts");
         d.into_iter().map(|t| t as u32).collect()
     }
 
@@ -238,7 +238,7 @@ impl Runtime {
         ensure!(drafts.len() == m.k, "{} drafts for k = {}", drafts.len(), m.k);
         let host: Vec<i32> = drafts.iter().map(|&t| t as i32).collect();
         self.up_i32(&host, &m.drafts.slice(slot * m.k..(slot + 1) * m.k))?;
-        self.mtp.as_mut().expect("an MTP spec").has_drafts[slot] = true;
+        self.mtp.as_mut().expect("an MTP spec").drafted[slot] = drafts.len();
         Ok(())
     }
 
@@ -253,7 +253,8 @@ impl Runtime {
     }
 
     pub fn captured_speculation_sizes(&self) -> Vec<usize> {
-        let mut sizes: Vec<usize> = self.mtp.as_ref().map(|m| m.graphs.keys().copied().collect()).unwrap_or_default();
+        let mut sizes: Vec<usize> = self.mtp.as_ref().map(|m| m.graphs.keys().map(|k| k.0).collect()).unwrap_or_default();
+        sizes.dedup();
         sizes.sort();
         sizes
     }
@@ -264,7 +265,7 @@ impl Runtime {
 
     pub(super) fn mtp_forget(&mut self, slot: usize) {
         if let Some(m) = self.mtp.as_mut() {
-            m.has_drafts[slot] = false;
+            m.drafted[slot] = 0;
         }
     }
 
@@ -285,7 +286,7 @@ impl Runtime {
         let stream = self.stream.clone();
         let m = self.mtp.as_mut().context("no MTP layer")?;
         stream.memcpy_htod(host, &mut m.pending.slice_mut(slot * h..(slot + 1) * h))?;
-        m.has_drafts[slot] = false;
+        m.drafted[slot] = 0;
         Ok(())
     }
 
@@ -537,7 +538,7 @@ impl Runtime {
     }
 
     fn prime(&mut self, rows: &[SpecRow]) -> Result<()> {
-        let need: Vec<&SpecRow> = rows.iter().filter(|r| !self.mtp().has_drafts[r.slot]).collect();
+        let need: Vec<&SpecRow> = rows.iter().filter(|r| self.mtp().drafted[r.slot] == 0).collect();
         if need.is_empty() {
             return Ok(());
         }
@@ -554,25 +555,25 @@ impl Runtime {
         self.mtp_chain(n, &m.iota.slice(..n), &m.rin.slice(..), &m.zeros.slice(..n))?;
         let m = self.mtp.as_mut().expect("an MTP spec");
         for r in need {
-            m.has_drafts[r.slot] = true;
+            m.drafted[r.slot] = m.k;
         }
         Ok(())
     }
 
-    fn verify_rows(&self, nseq: usize) -> Result<()> {
+    fn verify_rows(&self, nseq: usize, k: usize) -> Result<()> {
         let m = self.mtp();
-        let n = nseq * (m.k + 1);
-        let run = super::exec::Run { n, tokens: &m.vb.tokens, logits: &m.vb.logits, rows: 0..n, bb: Some(&m.vb), start: None, qlen: m.k + 1, mtp: None };
+        let n = nseq * (k + 1);
+        let run = super::exec::Run { n, tokens: &m.vb.tokens, logits: &m.vb.logits, rows: 0..n, bb: Some(&m.vb), start: None, qlen: k + 1, mtp: None };
         crate::executor::run_plan(self, &self.plans.verify, &run, &mut |_| Ok(()))
     }
 
-    fn commit(&self, nseq: usize) -> Result<()> {
+    fn commit(&self, nseq: usize, k: usize) -> Result<()> {
         let Some(gb) = self.gdn.as_ref() else { return Ok(()) };
         let m = self.mtp();
         let accepted = m.res.slice(..nseq);
         let la = &gb.la;
         let layers = self.spec.linear_layers() as u32;
-        let (seq_slots, k1, log_rows) = (layers as i32, (m.k + 1) as i32, m.rows as i32);
+        let (seq_slots, k1, log_rows) = (layers as i32, (k + 1) as i32, m.rows as i32);
         let mut b = self.launcher(self.kernel("gdn_conv_commit"));
         b.arg(&*gb.conv_state).arg(&m.clog).arg(&seq_slots).arg(&m.vb.slots).arg(&k1).arg(&accepted).arg(&log_rows);
         let config = LaunchConfig {
@@ -600,25 +601,25 @@ impl Runtime {
         Ok(())
     }
 
-    fn round_body(&self, n: usize) -> Result<()> {
+    fn round_body(&self, n: usize, k: usize) -> Result<()> {
         let m = self.mtp();
-        let (k, k1) = (m.k, m.k + 1);
+        let k1 = k + 1;
         let h = self.spec.dims.hidden;
-        let (n_i, k_i) = (n as i32, k as i32);
+        let (n_i, k_i, stride_i) = (n as i32, k as i32, m.k as i32);
         let rin = m.rin.slice(..);
         let accepted = m.res.slice(..n);
         let vout = m.res.slice(m.pcap..m.pcap + n * k1);
         let mut b = self.launcher(self.kernel("mtp_round_in"));
-        b.arg(&rin).arg(&m.drafts).arg(&n_i).arg(&k_i).arg(&m.vb.tokens).arg(&m.vb.pos).arg(&m.vb.slots);
+        b.arg(&rin).arg(&m.drafts).arg(&n_i).arg(&k_i).arg(&stride_i).arg(&m.vb.tokens).arg(&m.vb.pos).arg(&m.vb.slots);
         unsafe { b.launch(cfg(n as u32, k1 as u32)) }?;
-        self.verify_rows(n)?;
+        self.verify_rows(n, k)?;
         self.copy_rows(&self.pre.x.slice(..n * k1 * h), &m.vx.slice(..n * k1 * h), n * k1 * h)?;
         let maxa = rin.slice(3 * n..4 * n);
         let params = rin.slice(4 * n..10 * n);
         let mut b = self.launcher(self.kernel("spec_accept"));
         b.arg(&m.vb.logits).arg(&m.vb.tokens).arg(&params).arg(&maxa).arg(&k_i).arg(&vout).arg(&accepted);
         unsafe { b.launch(cfg(n as u32, 1024)) }?;
-        self.commit(n)?;
+        self.commit(n, k)?;
         let mut b = self.launcher(self.kernel("mtp_pick_rows"));
         b.arg(&accepted).arg(&k_i).arg(&m.sidx);
         unsafe { b.launch(cfg(1, n as u32)) }?;
@@ -628,18 +629,24 @@ impl Runtime {
         self.copy_rows_by_index(&m.vx, &heads, &m.pending, &rin.slice(2 * n..3 * n), n)
     }
 
-    fn capture_round(&self, n: usize) -> Result<CudaGraph> {
+    fn capture_round(&self, n: usize, k: usize) -> Result<CudaGraph> {
         self.stream.begin_capture(CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)?;
-        let recorded = self.round_body(n);
+        let recorded = self.round_body(n, k);
         let graph = self.stream.end_capture(CUgraphInstantiate_flags(0))?;
         recorded?;
         graph.context("empty speculative graph")
     }
 
     pub fn speculate(&mut self, rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
+        let k = self.mtp.as_ref().map_or(0, |m| m.k);
+        self.speculate_k(rows, k)
+    }
+
+    pub fn speculate_k(&mut self, rows: &[SpecRow], k: usize) -> Result<Vec<Vec<u32>>> {
         ensure!(self.mtp.is_some(), "speculation needs an [mtp] spec with speculate = true");
         ensure!(self.use_mma, "speculation needs the tensor core path");
-        let (k, cap, pcap) = (self.mtp().k, self.mtp().cap, self.mtp().pcap);
+        let (kmax, cap, pcap) = (self.mtp().k, self.mtp().cap, self.mtp().pcap);
+        ensure!((1..=kmax).contains(&k), "{k} draft tokens for a maximum of {kmax}");
         let live = rows.len();
         ensure!(live >= 1 && live <= cap, "{live} speculative rows for a cap of {cap}");
         ensure!(
@@ -663,20 +670,20 @@ impl Runtime {
         let m = self.mtp();
         self.up_i32(&rin, &m.rin)?;
         if graphs {
-            if !m.graphs.contains_key(&n) {
+            if !m.graphs.contains_key(&(n, k)) {
                 let started = std::time::Instant::now();
-                let graph = self.capture_round(n)?;
+                let graph = self.capture_round(n, k)?;
                 graph.upload()?;
                 self.stream.synchronize()?;
                 let secs = started.elapsed().as_secs_f64();
-                tracing::info!(rows = n, capture_secs = secs, "speculation graph captured");
+                tracing::info!(rows = n, k, capture_secs = secs, "speculation graph captured");
                 let m = self.mtp.as_mut().expect("an MTP spec");
                 m.capture_secs.push((n, secs));
-                m.graphs.insert(n, graph);
+                m.graphs.insert((n, k), graph);
             }
-            self.mtp().graphs[&n].launch()?;
+            self.mtp().graphs[&(n, k)].launch()?;
         } else {
-            self.round_body(n)?;
+            self.round_body(n, k)?;
         }
         let m = self.mtp();
         m.syncs.set(m.syncs.get() + 1);
@@ -688,7 +695,7 @@ impl Runtime {
             .collect();
         let m = self.mtp.as_mut().expect("an MTP spec");
         for r in rows {
-            m.has_drafts[r.slot] = true;
+            m.drafted[r.slot] = m.k;
         }
         m.stats.steps += 1;
         m.stats.rows += live as u64;

@@ -22,6 +22,6 @@ guard() {
 }
 for batch in ${BATCHES:-1 4 8}; do
     guard batch "$batch"
-    nice -n 15 "$B" --speculative "$spec" 8192 "${NEW:-128}" "$batch" 2>&1 | grep -v "^ *$" | tee -a "$log"
+    nice -n 15 "$B" ${DRAFTS:+--drafts $DRAFTS} --speculative "$spec" 8192 "${NEW:-128}" "$batch" 2>&1 | grep -v "^ *$" | tee -a "$log"
 done
 echo "done free $(nvidia-smi --query-gpu=memory.free --format=csv,noheader) $(date +%T)" | tee -a "$log"

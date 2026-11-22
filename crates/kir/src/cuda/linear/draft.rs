@@ -142,11 +142,11 @@ fn small_kernels() -> String {
     );
     o.push('\n');
     o += &kernel(
-        "extern \"C\" __global__ void mtp_round_in(const int* rin, const int* drafts, int n, int k, int* vtok, int* vpos,\n                                        int* vslots)",
+        "extern \"C\" __global__ void mtp_round_in(const int* rin, const int* drafts, int n, int k, int stride, int* vtok, int* vpos,\n                                        int* vslots)",
         "int s = blockIdx.x;
 int j = threadIdx.x;
 int slot = rin[2 * n + s];
-vtok[s * (k + 1) + j] = j == 0 ? rin[s] : drafts[slot * k + j - 1];
+vtok[s * (k + 1) + j] = j == 0 ? rin[s] : drafts[slot * stride + j - 1];
 vpos[s * (k + 1) + j] = rin[n + s] + j;
 vslots[s * (k + 1) + j] = slot;
 ",

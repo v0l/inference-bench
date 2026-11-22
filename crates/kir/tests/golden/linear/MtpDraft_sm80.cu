@@ -155,12 +155,12 @@ extern "C" __global__ void mtp_fill(const int* drafts, int* vtok, int k) {
     if (j < k) vtok[s * (k + 1) + 1 + j] = drafts[s * k + j];
 }
 
-extern "C" __global__ void mtp_round_in(const int* rin, const int* drafts, int n, int k, int* vtok, int* vpos,
+extern "C" __global__ void mtp_round_in(const int* rin, const int* drafts, int n, int k, int stride, int* vtok, int* vpos,
                                         int* vslots) {
     int s = blockIdx.x;
     int j = threadIdx.x;
     int slot = rin[2 * n + s];
-    vtok[s * (k + 1) + j] = j == 0 ? rin[s] : drafts[slot * k + j - 1];
+    vtok[s * (k + 1) + j] = j == 0 ? rin[s] : drafts[slot * stride + j - 1];
     vpos[s * (k + 1) + j] = rin[n + s] + j;
     vslots[s * (k + 1) + j] = slot;
 }

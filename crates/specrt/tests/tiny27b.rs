@@ -285,6 +285,29 @@ fn speculative_greedy_equals_plain_greedy_and_oracle_drafts_accept() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn switching_the_draft_count_every_step_equals_plain_greedy() {
+    let s = with_drafts(weight_spec(), 3);
+    let ps = speculation_prompts();
+    let want = plain_greedy(&s, &ps);
+    let mut rt = Runtime::load_layout(&s, layout(1)).unwrap();
+    tables(&mut rt, 1);
+    let mut st = rt.stepper().unwrap();
+    for (i, p) in ps.iter().enumerate() {
+        let mut out = vec![rt.prefill_slot(&mut st, 0, p, 0, Some((Sampling::GREEDY, 0))).unwrap().unwrap()];
+        let mut step = 0;
+        while out.len() < NEW {
+            let k = [3, 1, 2, 3, 2, 1][step % 6];
+            step += 1;
+            let row = SpecRow { slot: 0, token: *out.last().unwrap(), pos: p.len() + out.len() - 1, sampling: Sampling::GREEDY, step: out.len() as u32, max_accept: NEW - out.len() - 1 };
+            out.extend(rt.speculate_k(&[row], k).unwrap().remove(0));
+        }
+        out.truncate(NEW);
+        assert_eq!(out, want[i], "prompt {i}");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn speculative_greedy_with_act_quant_equals_its_plain_greedy() {
     let s = with_drafts(act_spec(), 2);
     let ps = speculation_prompts();

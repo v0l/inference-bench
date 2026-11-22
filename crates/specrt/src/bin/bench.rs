@@ -16,6 +16,7 @@ struct Flags {
     ab: bool,
     rounds: usize,
     b_graphs: Option<bool>,
+    drafts: Option<specrt::serve::DraftTokens>,
 }
 
 static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
@@ -29,7 +30,7 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None };
+    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None, drafts: None };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -41,13 +42,18 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
             "--ab" => f.ab = true,
             "--mlp-act-fp4" => f.mlp_act_fp4 = true,
             "--mlp-act-planes" => f.mlp_planes = 2,
-            "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" => {
+            "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" | "--drafts" => {
                 let name = args.remove(i);
                 anyhow::ensure!(i < args.len(), "{name} needs a value");
                 if name == "--runs" {
                     f.runs = args[i].parse().context("--runs")?;
                 } else if name == "--rounds" {
                     f.rounds = args[i].parse().context("--rounds")?;
+                } else if name == "--drafts" {
+                    f.drafts = Some(match args[i].as_str() {
+                        "auto" => specrt::serve::DraftTokens::Auto,
+                        n => specrt::serve::DraftTokens::Fixed(n.parse().context("--drafts takes auto or a number")?),
+                    });
                 } else if name == "--b-graphs" {
                     f.b_graphs = Some(match args[i].as_str() {
                         "on" => true,
@@ -209,12 +215,18 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
     let prompts = spec_prompts(spec)?;
     for speculate in [true, false] {
         let mut s = spec.clone();
+        let mut adaptive = false;
+        if let Some(d) = flags().drafts {
+            let o = specrt::serve::SpeculativeOptions { draft_tokens: Some(d), ..Default::default() };
+            o.apply(&mut s)?;
+            adaptive = d == specrt::serve::DraftTokens::Auto;
+        }
         if let Some(m) = s.mtp.as_mut() {
             m.speculate = speculate;
         }
         let layout = specrt::runtime::Layout::serving(&s, max_ctx, batch, Some(1 << 30));
         let rt = Runtime::load_layout(&s, layout)?;
-        let mut sched = Scheduler::new(GpuExecutor::new(rt)?, Config { max_num_seqs: batch, ..Config::default() });
+        let mut sched = Scheduler::new(GpuExecutor::new(rt)?, Config { max_num_seqs: batch, adaptive_drafts: adaptive, ..Config::default() });
         let mut warm = Vec::new();
         sched.submit(Request { prompt: prompts[0].clone(), max_tokens: 16, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None })?;
         while !sched.idle() {
@@ -243,18 +255,21 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
             }
         }
         let after = sched.exec.rt.spec_stats();
+        if let Some(c) = sched.draft_chooser() {
+            println!("  adaptive steps per k (0..=3) {:?}", c.chosen());
+        }
         let rows = (after.rows - before.rows).max(1) as f64;
         println!(
             "{} speculate={speculate} k={} batch={batch} prompts={} new={new_tokens} decode={:.1} tok/s aggregate ({:.1} per sequence) mean_acceptance_length={:.3} draft_acceptance={:.3} drafted={drafted} accepted={accepted}",
             spec.name,
-            spec.mtp.as_ref().map_or(0, |m| m.draft_tokens),
+            s.mtp.as_ref().map_or(0, |m| m.draft_tokens),
             prompts.len(),
             tokens as f64 / decode_secs,
             tokens as f64 / decode_secs / batch as f64,
             1.0 + (after.accepted - before.accepted) as f64 / rows,
             accepted as f64 / drafted.max(1) as f64,
         );
-        let k = spec.mtp.as_ref().map_or(0, |m| m.draft_tokens);
+        let k = s.mtp.as_ref().map_or(0, |m| m.draft_tokens);
         let per_position: Vec<f64> = (0..k.min(4)).map(|j| (after.position_accepted[j] - before.position_accepted[j]) as f64 / rows).collect();
         println!(
             "  per_position_accepted={:?} per_position_proposed={rows} per_position_rate={per_position:.3?}",

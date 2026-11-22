@@ -5,11 +5,42 @@ use crate::spec::{PrefixCacheOptions, Spec};
 pub use crate::spec::{RuntimeOptions, TileChoice};
 pub use crate::sessions::SessionOptions;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DraftTokens {
+    Auto,
+    Fixed(usize),
+}
+
+impl serde::Serialize for DraftTokens {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            DraftTokens::Auto => s.serialize_str("auto"),
+            DraftTokens::Fixed(n) => s.serialize_u64(*n as u64),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DraftTokens {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Count(usize),
+            Word(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Count(n) => Ok(DraftTokens::Fixed(n)),
+            Raw::Word(w) if w == "auto" => Ok(DraftTokens::Auto),
+            Raw::Word(w) => Err(serde::de::Error::custom(format!("draft_tokens is \"auto\" or a number, not {w:?}"))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SpeculativeOptions {
     pub enabled: Option<bool>,
-    pub draft_tokens: Option<usize>,
+    pub draft_tokens: Option<DraftTokens>,
     pub max_batch: Option<usize>,
     pub head_quant: Option<crate::spec::Quant>,
 }
@@ -23,8 +54,10 @@ impl SpeculativeOptions {
         if let Some(on) = self.enabled {
             m.speculate = on;
         }
-        if let Some(k) = self.draft_tokens {
-            m.draft_tokens = k;
+        match self.draft_tokens {
+            Some(DraftTokens::Fixed(k)) => m.draft_tokens = k,
+            Some(DraftTokens::Auto) => m.draft_tokens = crate::spec::MAX_DRAFT_TOKENS,
+            None => {}
         }
         if self.max_batch.is_some() {
             m.max_batch = self.max_batch;
@@ -606,6 +639,7 @@ fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
         admit_lookahead: opts.admit_lookahead,
         prefill_burst_tokens: opts.prefill_burst_tokens,
         max_long_in_flight: opts.max_long_in_flight,
+        adaptive_drafts: opts.speculative.draft_tokens == Some(DraftTokens::Auto),
         prefix_cache,
         ..Config::default()
     }
