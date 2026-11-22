@@ -169,9 +169,14 @@ fn request_cell(r: &RequestRecord, name: &str) -> String {
 pub const WIDE_TABLE: f32 = 1000.0;
 pub const MEDIUM_TABLE: f32 = 780.0;
 
+pub const NARROW_TABLE: f32 = 370.0;
+
 pub fn request_columns(with_cache: bool, width: f32) -> Vec<(&'static str, f32)> {
+    if width < NARROW_TABLE {
+        return vec![("time", 66.0), ("ttft", 56.0), ("new", 52.0), ("prefill", 92.0)];
+    }
     if width < MEDIUM_TABLE {
-        return vec![("time", 56.0), ("ttft", 54.0), ("new", 50.0), ("prefill", 94.0), ("decode", 80.0)];
+        return vec![("time", 66.0), ("ttft", 56.0), ("new", 52.0), ("prefill", 92.0), ("decode", 92.0)];
     }
     let mut cols = vec![("time", 80.0), ("ttft", 90.0), ("queue", 90.0), ("prompt", 80.0)];
     if with_cache {
