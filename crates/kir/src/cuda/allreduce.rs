@@ -119,6 +119,23 @@ fn add_rmsnorm(k: &AllReduceKernel, width: u32, eps: f32) -> String {
 pub const PROBE_WAIT: &str = "ar_probe_wait";
 pub const PROBE_STORE: &str = "ar_probe_store";
 
+fn gather(k: &AllReduceKernel, width: u32, each: u32) -> String {
+    let vec = if width % 4 == 0 && each % 4 == 0 { 4 } else { 1 };
+    let (t, load) = if vec == 4 { ("float4", "__ldcg((const float4*)table[p] + i)") } else { ("float", "__ldcg((const float*)table[p] + i)") };
+    let mut s = header(k.threads, &k.name(), "const float* in, float* out, const unsigned long long* table, int rank, int rows");
+    s += &format!("    constexpr int WIDTH = {width} / {vec};\n    constexpr int EACH = {each} / {vec};\n    __shared__ unsigned epoch;\n    ar_begin(table, rank, &epoch);\n    {t}* mine = ({t}*)table[rank];\n    const {t}* src = (const {t}*)in;\n    {t}* dst = ({t}*)out;\n");
+    s += STRIDE;
+    s += "    size_t total = (size_t)rows * EACH;\n    int own = min(WIDTH - rank * EACH, EACH);\n";
+    s += &prim::grid_stride(4, "first", "total", "        int r = (int)(i / EACH), c = (int)(i % EACH);\n        if (c < own) mine[i] = src[(size_t)r * own + c];\n");
+    s += &prim::sync_point(1);
+    s += &format!(
+        "#pragma unroll\n    for (int p = 0; p < AR_RANKS; p++) {{\n        int lo = p * EACH, cnt = min(WIDTH - lo, EACH);\n{}    }}\n",
+        prim::grid_stride(8, "first", "total", &format!("            int r = (int)(i / EACH), c = (int)(i % EACH);\n            if (c < cnt) dst[(size_t)r * WIDTH + lo + c] = {load};\n"))
+    );
+    s += &prim::finish(2);
+    s
+}
+
 pub fn emit_peer_probe() -> String {
     let mut s = String::from("typedef unsigned short bf16_t;\n\n");
     s += &prim::flag_ops();
@@ -145,6 +162,7 @@ pub fn emit_allreduce(kernels: &[AllReduceKernel]) -> Result<String, AllReduceEr
             Mode::OneShot => one_shot(k),
             Mode::TwoShot => two_shot(k),
             Mode::AddRmsNorm { width, eps } => add_rmsnorm(k, width, eps),
+            Mode::Gather { width, each } => gather(k, width, each),
         });
     }
     Ok(out)

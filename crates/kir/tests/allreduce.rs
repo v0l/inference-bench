@@ -34,7 +34,30 @@ fn allreduce_goldens_per_mode_dtype_and_target() {
             }
         }
         golden(&format!("add_rmsnorm_f32_{tag}.cu"), &emit(&t, 2, Dtype::F32, Mode::AddRmsNorm { width: 5120, eps: 1e-6 }));
+        golden(&format!("gather_f32_{tag}.cu"), &emit(&t, 2, Dtype::F32, Mode::Gather { width: 248320, each: 124160 }));
+        golden(&format!("gather_odd_f32_{tag}.cu"), &emit(&t, 3, Dtype::F32, Mode::Gather { width: 1001, each: 334 }));
     }
+}
+
+#[test]
+fn a_gather_slice_must_cover_the_width_and_leave_every_rank_a_column() {
+    let t = Target::sm_120();
+    let g = |r, width, each| AllReduceKernel::new(&t, r, Dtype::F32, Mode::Gather { width, each }, 8);
+    assert!(g(2, 1000, 500).is_ok());
+    assert!(g(3, 976, 336).is_ok());
+    assert!(g(2, 1000, 499).is_err());
+    assert!(g(4, 64, 32).is_err());
+    assert!(AllReduceKernel::new(&t, 2, Dtype::Bf16, Mode::Gather { width: 64, each: 32 }, 8).is_err());
+    let spans: Vec<_> = (0..3).map(|r| kir::allreduce::gather_span(976, 336, r)).collect();
+    assert_eq!(spans, vec![0..336, 336..672, 672..976]);
+}
+
+#[test]
+fn the_gather_reads_float4_when_both_widths_allow_it() {
+    let even = emit(&Target::sm_120(), 2, Dtype::F32, Mode::Gather { width: 1024, each: 512 });
+    assert!(even.contains("float4* mine") && even.contains("constexpr int EACH = 512 / 4;"));
+    let odd = emit(&Target::sm_120(), 2, Dtype::F32, Mode::Gather { width: 1002, each: 501 });
+    assert!(odd.contains("float* mine") && odd.contains("constexpr int EACH = 501 / 1;"));
 }
 
 #[test]
@@ -65,4 +88,5 @@ fn hash_changes_with_ranks_mode_and_dtype() {
     assert_ne!(base, h(2, Dtype::Bf16, Mode::OneShot));
     assert_ne!(base, h(2, Dtype::F32, Mode::TwoShot));
     assert_eq!(base, h(2, Dtype::F32, Mode::OneShot));
+    assert_ne!(h(2, Dtype::F32, Mode::Gather { width: 1024, each: 512 }), h(2, Dtype::F32, Mode::Gather { width: 1024, each: 528 }));
 }
