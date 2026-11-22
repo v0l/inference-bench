@@ -433,7 +433,7 @@ fn kernels_command(data: &Path, spec: &str, target: Option<&str>) -> Result<()> 
 
 fn warmup_command(data: &Path, spec: &str, max_ctx: usize, slots: usize) -> Result<()> {
     let path = resolve_spec_names(data, spec);
-    let spec = specrt::spec::Spec::load(Path::new(&path))?;
+    let spec = specrt::engine::resolve_spec(&path)?;
     let w = specrt::runtime::warmup(&spec, max_ctx, slots)?;
     println!("{} {} ({}) nvrtc {:.2} s, driver load {:.2} s, cache {}", if w.cache_hit { "cached" } else { "compiled" }, w.key, if w.binary { "cubin" } else { "ptx" }, w.compile_secs, w.module_secs, w.cache_dir.display());
     Ok(())

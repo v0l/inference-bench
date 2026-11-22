@@ -917,9 +917,15 @@ pub struct Warmup {
     pub cache_dir: std::path::PathBuf,
 }
 
+pub fn warmup_spec(spec: &Spec) -> Result<Spec> {
+    let mut resolved = spec.clone();
+    crate::engine::complete_spec(&mut resolved)?;
+    crate::engine::apply_rope_extension(&resolved)
+}
+
 pub fn warmup(spec: &Spec, max_ctx: usize, slots: usize) -> Result<Warmup> {
     ensure!(slots >= 1, "need at least one slot");
-    let resolved = crate::engine::apply_rope_extension(spec)?;
+    let resolved = warmup_spec(spec)?;
     let layout = Layout::serving(&resolved, max_ctx, slots, None);
     let layout = if resolved.runtime.kv_dtype.is_fp8() { Layout { kv_planes: 1, ..layout } } else { layout };
     let cache_dir = resolved.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
