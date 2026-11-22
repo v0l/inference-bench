@@ -36,6 +36,7 @@ pub struct LoadDialog {
     pub advanced: bool,
     pub open_sections: std::collections::BTreeSet<&'static str>,
     pub search: String,
+    pub details: bool,
     pub texts: BTreeMap<String, String>,
     pub anatomy: Option<ModelAnatomy>,
     pub pin_seqs: bool,
@@ -165,7 +166,7 @@ impl LoadDialog {
             _ => (ctx, kv_gb),
         };
         let pin_kv = app.settings.kv_gb_for(&model.name).is_some() || fitted.is_some();
-        let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, open_sections: Default::default(), search: String::new(), texts: BTreeMap::new(), anatomy: None, pin_seqs: remembered_seqs.is_some(), pin_kv, solved: None, solve_key: String::new(), native_max: max, auto_extension: false };
+        let mut dialog = Self { model: model.clone(), view, ctx, max, seqs, kv_gb, served_names, remember: true, choice, advanced: false, open_sections: Default::default(), search: String::new(), details: false, texts: BTreeMap::new(), anatomy: None, pin_seqs: remembered_seqs.is_some(), pin_kv, solved: None, solve_key: String::new(), native_max: max, auto_extension: false };
         dialog.sync();
         dialog.resolve(&crate::hardware::load_devices(app));
         dialog
@@ -367,7 +368,9 @@ fn placement_bars(ui: &mut egui::Ui, inv: &inference_bench_core::inventory::Inve
 }
 
 const WIDE: f32 = 860.0;
-const SIDE_W: f32 = 400.0;
+const SIDE_W: f32 = 460.0;
+const LABEL_COL: f32 = 180.0;
+const GRID_MIN: f32 = 520.0;
 
 struct Env {
     inv: inference_bench_core::inventory::Inventory,
@@ -377,16 +380,36 @@ struct Env {
     has_mtp: bool,
 }
 
-fn tokens(n: usize) -> String {
+pub fn tokens(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push(' ');
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
         }
         out.push(c);
     }
     out
+}
+
+pub fn shorten_middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max || max < 3 {
+        return s.to_string();
+    }
+    let keep = max - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep / 2;
+    let a: String = chars[..head].iter().collect();
+    let b: String = chars[chars.len() - tail..].iter().collect();
+    format!("{a}…{b}")
+}
+
+fn split_unit(text: String) -> (String, String) {
+    match text.split_once(' ') {
+        Some((n, u)) => (n.to_string(), u.to_string()),
+        None => (text, String::new()),
+    }
 }
 
 fn changed_marker(ui: &mut egui::Ui) {
@@ -399,87 +422,130 @@ fn is_default(d: &LoadDialog, f: &Field) -> bool {
     match f.key.as_str() {
         "serve.max_num_seqs" => !d.pin_seqs,
         "serve.kv_cache_bytes" => !d.pin_kv,
-        "serve.max_model_len" => false,
+        "serve.max_model_len" => true,
+        "runtime.kv_dtype" => kv_kind_of(&d.choice) == KvKind::Auto,
         _ => d.choice.is_default(&f.key),
     }
 }
 
-fn reset_tail(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
-    if !is_default(d, f) {
-        changed_marker(ui);
-        if ui.add(Key::new("reset").outline(READOUT).id_salt(("reset", &f.key))).clicked() {
-            if f.key == "serve.kv_cache_bytes" {
-                d.pin_kv = false;
-            } else if f.key == "runtime.kv_dtype" {
-                set_kv_kind(&mut d.choice, KvKind::Auto);
-            } else {
-                d.reset(&f.key);
+fn label_block(ui: &mut egui::Ui, label: &str, changed: bool) -> bool {
+    let mut reset = false;
+    ui.add(egui::Label::new(legend(label)).wrap());
+    if changed {
+        ui.horizontal(|ui| {
+            changed_marker(ui);
+            if ui.add(Key::new("reset").outline(READOUT).id_salt(("reset", label))).clicked() {
+                reset = true;
             }
+        });
+    }
+    reset
+}
+
+fn help_line(ui: &mut egui::Ui, help: &str) {
+    let edge = ui.ctx().content_rect().right() - 10.0;
+    let w = ui.available_width().min((edge - ui.cursor().left()).max(80.0));
+    ui.allocate_ui_with_layout(egui::vec2(w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.set_max_width(w);
+        ui.add(egui::Label::new(egui::RichText::new(help).size(10.5).color(LEGEND)).wrap());
+    });
+}
+
+fn grid_row(ui: &mut egui::Ui, label: &str, help: &str, changed: bool, control: impl FnOnce(&mut egui::Ui)) -> bool {
+    let mut reset = false;
+    if ui.available_width() >= GRID_MIN {
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(egui::vec2(LABEL_COL, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(LABEL_COL);
+                reset = label_block(ui, label, changed);
+            });
+            ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                control(ui);
+                if !help.is_empty() {
+                    help_line(ui, help);
+                }
+            });
+        });
+    } else {
+        reset = label_block(ui, label, changed);
+        control(ui);
+        if !help.is_empty() {
+            help_line(ui, help);
         }
     }
-    if f.key != "serve.max_model_len" && f.key != "serve.kv_cache_bytes" {
-        Line::new().note(format!("default {}", display_value(&d.choice.base(&f.key)))).size(10.5).show(ui);
-    }
+    ui.add_space(6.0);
+    reset
 }
 
 fn slider_width(ui: &mut egui::Ui) {
-    let room = ui.available_width() - 190.0;
-    ui.spacing_mut().slider_width = room.clamp(60.0, 320.0);
+    let room = ui.available_width() - 130.0;
+    ui.spacing_mut().slider_width = room.clamp(60.0, 420.0);
 }
 
-fn context_row(ui: &mut egui::Ui, d: &mut LoadDialog, env: &Env) {
-    row_help(ui, "context length", "Tokens one conversation can hold. Bigger contexts keep more of it and cost more memory.", |ui| {
-        if d.view.is_ok() {
+fn with_default(d: &LoadDialog, f: &Field) -> String {
+    format!("{} Default {}.", f.help, display_value(&d.choice.base(&f.key)))
+}
+
+fn context_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
+    let fits = if d.view.is_ok() { d.anatomy().and_then(|a| fitting_context(a, env.free, d.seqs)).map(|n| n.min(d.max)) } else { None };
+    let (lo, max, native, ok, ctx) = (MIN_CTX.min(d.max), d.max, d.native_max, d.view.is_ok(), d.ctx);
+    let mut value = ctx;
+    grid_row(ui, "context length", f.help, false, |ui| {
+        if ok {
             slider_width(ui);
-            let lo = MIN_CTX.min(d.max);
-            ui.add(egui::Slider::new(&mut d.ctx, lo..=d.max).step_by(STEP as f64).suffix(" tokens"));
+            let slider = egui::Slider::new(&mut value, lo..=max)
+                .step_by(STEP as f64)
+                .suffix(" tokens")
+                .custom_formatter(|v, _| tokens(v as usize))
+                .custom_parser(|s| s.replace([',', ' '], "").parse::<f64>().ok());
+            ui.add(slider);
+            ui.horizontal_wrapped(|ui| {
+                if let Some(n) = fits {
+                    Line::new().legend("max that fits").value(format!("{} tokens", tokens(n))).size(11.0).show(ui);
+                    if n != ctx && ui.add(Key::new("use max that fits").outline(READOUT).id_salt("ctx-fit")).clicked() {
+                        value = n.max(lo);
+                    }
+                }
+                let note = if max > native { format!("trained {}, up to {} with YaRN", tokens(native), tokens(max)) } else { format!("model maximum {}", tokens(max)) };
+                Line::new().note(note).size(10.5).show(ui);
+            });
+            if ctx > native {
+                hint(ui, "Going past the trained length turns on YaRN, which changes short-context numerics slightly.");
+            }
         } else {
-            Line::new().set(format!("{} tokens", d.ctx)).show(ui);
+            Line::new().set(format!("{} tokens", ctx)).show(ui);
         }
     });
-    if d.view.is_ok() {
-        let fits = d.anatomy().and_then(|a| fitting_context(a, env.free, d.seqs)).map(|n| n.min(d.max));
-        ui.horizontal_wrapped(|ui| {
-            if let Some(n) = fits {
-                Line::new().legend("max that fits").value(tokens(n)).size(11.0).show(ui);
-                if n != d.ctx && ui.add(Key::new("use max that fits").outline(READOUT).id_salt("ctx-fit")).clicked() {
-                    d.ctx = n.max(MIN_CTX.min(d.max));
-                }
-            }
-            let note = if d.max > d.native_max { format!("trained {}, up to {} with YaRN", tokens(d.native_max), tokens(d.max)) } else { format!("model maximum {}", tokens(d.max)) };
-            Line::new().note(note).size(10.5).show(ui);
-        });
-        if d.ctx > d.native_max {
-            hint(ui, "Going past the trained length turns on YaRN, which changes short-context numerics slightly.");
-        }
-    }
+    d.ctx = value;
 }
 
 fn kv_type_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
     let current = kv_kind_of(&d.choice);
     let mut pick = current;
-    row_help(ui, "kv cache type", f.help, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            reset_tail(ui, d, f);
-        });
+    let effective = kv_kind_effective(&d.choice);
+    let sizes: Vec<(KvKind, u64)> = KvKind::ALL
+        .iter()
+        .map(|k| {
+            let shown = if *k == KvKind::Auto { effective } else { *k };
+            let bytes = d.view.as_ref().map_or(0, |v| kv_bytes_per_token(&v.spec, shown, d.ctx) * d.ctx as u64);
+            (*k, bytes)
+        })
+        .collect();
+    let labels: Vec<String> = sizes.iter().map(|(k, b)| if *b == 0 { k.label().to_string() } else { format!("{} {}", k.label(), human_size(*b)) }).collect();
+    let options: Vec<(KvKind, &str, Option<usize>)> = sizes.iter().zip(&labels).map(|((k, _), l)| (*k, l.as_str(), None)).collect();
+    let f16_bytes = sizes.iter().find(|(k, _)| *k == KvKind::F16).map_or(0, |s| s.1);
+    let picked_bytes = sizes.iter().find(|(k, _)| *k == pick).map_or(0, |s| s.1);
+    let saving = if f16_bytes > 0 && picked_bytes > 0 { format!("{:.2}x the size of fp16 at {} tokens. ", picked_bytes as f64 / f16_bytes as f64, tokens(d.ctx)) } else { String::new() };
+    let help = format!("{saving}{}", pick.help());
+    let changed = !is_default(d, f);
+    let reset = grid_row(ui, "kv cache type", &help, changed, |ui| {
+        segments(ui, &mut pick, &options);
     });
-    let options: Vec<(KvKind, &str, Option<usize>)> = KvKind::ALL.iter().map(|k| (*k, k.label(), None)).collect();
-    segments(ui, &mut pick, &options);
-    if pick != current {
+    if reset {
+        set_kv_kind(&mut d.choice, KvKind::Auto);
+    } else if pick != current {
         set_kv_kind(&mut d.choice, pick);
     }
-    if let Ok(v) = &d.view {
-        let effective = kv_kind_effective(&d.choice);
-        for kind in KvKind::ALL {
-            let shown = if kind == KvKind::Auto { effective } else { kind };
-            let per = kv_bytes_per_token(&v.spec, shown, d.ctx);
-            let size = human_size(per * d.ctx as u64);
-            let line = Line::new().legend(kind.label()).column(ui, 96.0);
-            let line = if kind == pick { line.set(format!("{size} at {} tokens", tokens(d.ctx))) } else { line.value(format!("{size} at {} tokens", tokens(d.ctx))) };
-            line.size(11.0).show(ui);
-        }
-    }
-    hint(ui, pick.help());
 }
 
 fn kv_size_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
@@ -489,15 +555,19 @@ fn kv_size_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
     let mut gb = if pooled { d.kv_gb } else { kv_gb_for_tokens(per, d.ctx) };
     let mut toks = if pooled { tokens_for_kv_gb(per, d.kv_gb) } else { d.ctx };
     let top = max_kv_gb(&a, env.free, d.seqs, d.max).max(gb);
+    let token_cap = d.max.max(1) * d.seqs.max(1);
     let (mut gb_changed, mut tok_changed) = (false, false);
-    row_help(ui, "kv cache size", f.help, |ui| {
+    let help = if pooled { format!("Shared by {} parallel requests. Change either number and the other follows.", d.seqs) } else { "With one request the cache follows the context length, so the two move together.".to_string() };
+    let changed = !is_default(d, f);
+    let reset = grid_row(ui, "kv cache size", &help, changed, |ui| {
         ui.horizontal_wrapped(|ui| {
             gb_changed = ui.add(egui::DragValue::new(&mut gb).speed(0.1).range(0.1..=top.max(0.2)).suffix(" GB").fixed_decimals(2)).changed();
-            tok_changed = ui.add(egui::DragValue::new(&mut toks).speed(256.0).range(1..=d.max.max(1) * d.seqs.max(1)).suffix(" tokens")).changed();
-            reset_tail(ui, d, f);
+            tok_changed = ui.add(egui::DragValue::new(&mut toks).speed(256.0).range(1..=token_cap).suffix(" tokens")).changed();
         });
     });
-    if gb_changed {
+    if reset {
+        d.pin_kv = false;
+    } else if gb_changed {
         if pooled {
             d.kv_gb = gb;
             d.pin_kv = true;
@@ -512,75 +582,74 @@ fn kv_size_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
             d.ctx = toks.clamp(MIN_CTX.min(d.max), d.max);
         }
     }
-    if pooled {
-        hint(ui, &format!("Shared by {} parallel requests. Change either number and the other follows.", d.seqs));
-    } else {
-        hint(ui, "With one request the cache is sized by the context length, so the two move together.");
-    }
 }
 
 fn slots_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
-    row_help(ui, f.label, f.help, |ui| {
+    let mut n = d.seqs;
+    let help = with_default(d, f);
+    let changed = !is_default(d, f);
+    let reset = grid_row(ui, "parallel requests", &help, changed, |ui| {
         slider_width(ui);
-        let mut n = d.seqs;
-        if ui.add(egui::Slider::new(&mut n, 1..=MAX_SEQS)).changed() {
-            d.seqs = n;
-            d.pin_seqs = true;
-        }
-        reset_tail(ui, d, f);
+        ui.add(egui::Slider::new(&mut n, 1..=MAX_SEQS));
     });
+    if reset {
+        d.reset(&f.key);
+    } else if n != d.seqs {
+        d.seqs = n;
+        d.pin_seqs = true;
+    }
 }
 
 fn offload_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
     let Some(total) = d.anatomy().map(|a| a.total_bytes as f64 / GB) else { return };
     let budget = d.choice.value(&f.key).as_u64().unwrap_or(0);
     let mut on_gpu = if budget == 0 { total } else { (budget as f64 / GB).min(total) };
+    let before = on_gpu;
     let lo = 0.5f64.min(total);
-    row_help(ui, "gpu offload", f.help, |ui| {
+    let help = if budget > 0 { format!("The other {:.1} GB of weights stay in host memory and stream in while earlier layers compute.", (total - budget as f64 / GB).max(0.0)) } else { "Every layer lives on the GPU, the fastest setting. Lower it to stream the rest from host memory.".to_string() };
+    let changed = !is_default(d, f);
+    let reset = grid_row(ui, "gpu offload", &help, changed, |ui| {
         slider_width(ui);
-        let slider = egui::Slider::new(&mut on_gpu, lo..=total.max(lo + 0.01)).custom_formatter(move |v, _| if v >= total - 0.01 { "all on GPU".to_string() } else { format!("{v:.1} GB of weights on GPU") }).custom_parser(|s| s.trim().trim_end_matches("GB").trim().parse().ok());
-        if ui.add(slider).changed() {
-            if on_gpu >= total - 0.01 {
-                d.choice.set(&f.key, json!(0));
-            } else {
-                d.choice.set(&f.key, json!((on_gpu * GB) as u64));
-            }
-        }
-        reset_tail(ui, d, f);
+        let slider = egui::Slider::new(&mut on_gpu, lo..=total.max(lo + 0.01))
+            .custom_formatter(move |v, _| if v >= total - 0.01 { "all on GPU".to_string() } else { format!("{v:.1} GB on GPU") })
+            .custom_parser(|s| s.trim().trim_end_matches("GB").trim().parse().ok());
+        ui.add(slider);
     });
-    if budget > 0 {
-        hint(ui, &format!("The other {:.1} GB of weights stay in host memory and stream in while earlier layers compute.", (total - budget as f64 / GB).max(0.0)));
-    } else {
-        hint(ui, "Every layer lives on the GPU, the fastest setting.");
+    if reset {
+        d.reset(&f.key);
+    } else if (on_gpu - before).abs() > f64::EPSILON {
+        if on_gpu >= total - 0.01 {
+            d.choice.set(&f.key, json!(0));
+        } else {
+            d.choice.set(&f.key, json!((on_gpu * GB) as u64));
+        }
     }
 }
 
 fn generic_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
-    row_help(ui, f.label, f.help, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            edit_field(ui, f, &mut d.choice, &mut d.texts);
-            reset_tail(ui, d, f);
-        });
+    let help = with_default(d, f);
+    let changed = !is_default(d, f);
+    let reset = grid_row(ui, f.label, &help, changed, |ui| {
+        ui.horizontal_wrapped(|ui| edit_field(ui, f, &mut d.choice, &mut d.texts));
     });
+    if reset {
+        d.reset(&f.key);
+    }
 }
 
-fn option_row(ui: &mut egui::Ui, app: &mut App, d: &mut LoadDialog, f: &Field, env: &Env) {
+fn option_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field, env: &Env) {
     match f.key.as_str() {
-        "serve.max_model_len" => context_row(ui, d, env),
+        "serve.max_model_len" => context_row(ui, d, f, env),
         "runtime.kv_dtype" => kv_type_row(ui, d, f),
         "serve.kv_cache_bytes" => kv_size_row(ui, d, f, env),
         "serve.max_num_seqs" => slots_row(ui, d, f),
         "runtime.offload.vram_budget" => offload_row(ui, d, f),
         _ => generic_row(ui, d, f),
     }
-    let _ = app;
 }
 
 fn gpu_block(app: &mut App, ui: &mut egui::Ui, env: &Env) {
-    ui.add_space(2.0);
-    ui.label(legend("gpu selection"));
-    hint(ui, "The cards this model may use. The same switches as the Hardware tab.");
-    gpu_rows(app, ui, &env.inv);
+    grid_row(ui, "gpu selection", "The cards this model may use. The same switches as the Hardware tab.", false, |ui| gpu_rows(app, ui, &env.inv));
 }
 
 fn profile_block(ui: &mut egui::Ui, d: &mut LoadDialog) {
@@ -605,7 +674,7 @@ fn profile_block(ui: &mut egui::Ui, d: &mut LoadDialog) {
     }
 }
 
-fn section_block(ui: &mut egui::Ui, app: &mut App, d: &mut LoadDialog, heading: &'static str, fields: &[Field], env: &Env) {
+fn section_block(ui: &mut egui::Ui, d: &mut LoadDialog, heading: &'static str, fields: &[Field], env: &Env) {
     let open = d.advanced || d.open_sections.contains(heading);
     let changed = fields.iter().filter(|f| !is_default(d, f)).count();
     ui.add_space(4.0);
@@ -624,7 +693,7 @@ fn section_block(ui: &mut egui::Ui, app: &mut App, d: &mut LoadDialog, heading: 
     if open {
         ui.add_space(2.0);
         for f in fields {
-            option_row(ui, app, d, f, env);
+            option_row(ui, d, f, env);
         }
     }
 }
@@ -643,7 +712,7 @@ fn settings(ui: &mut egui::Ui, app: &mut App, d: &mut LoadDialog, env: &Env) {
         }
         section(ui, "matching options", &format!("{} found", found.len()), |ui| {
             for f in &found {
-                option_row(ui, app, d, f, env);
+                option_row(ui, d, f, env);
             }
         });
         return;
@@ -651,7 +720,7 @@ fn settings(ui: &mut egui::Ui, app: &mut App, d: &mut LoadDialog, env: &Env) {
     let layout = specrt::options::layout(env.has_mtp);
     section(ui, "common", "the settings most people change", |ui| {
         for f in &layout.common {
-            option_row(ui, app, d, f, env);
+            option_row(ui, d, f, env);
             if f.key == "serve.max_num_seqs" {
                 gpu_block(app, ui, env);
             }
@@ -665,13 +734,66 @@ fn settings(ui: &mut egui::Ui, app: &mut App, d: &mut LoadDialog, env: &Env) {
     });
     ui.label(legend("more options"));
     for (heading, fields) in &layout.sections {
-        section_block(ui, app, d, heading, fields, env);
+        section_block(ui, d, heading, fields, env);
     }
 }
 
-fn result_card(ui: &mut egui::Ui, d: &LoadDialog, env: &Env, spread: &Option<Result<Planned, String>>) {
+pub fn concurrency_text(full: f64, ctx: usize) -> String {
+    if full < 1.0 {
+        format!("cannot hold one request of {} tokens", tokens(ctx))
+    } else {
+        let n = full.floor() as usize;
+        format!("serves {} request{} at {} tokens each", n, if n == 1 { "" } else { "s" }, tokens(ctx))
+    }
+}
+
+fn fit_line(d: &LoadDialog, env: &Env, e: &Estimate, spread: &Option<Result<Planned, String>>) -> Option<(bool, String)> {
+    match e.free {
+        Some(_) if env.gpus.len() > 1 => match spread {
+            Some(Ok(p)) => {
+                let largest = env.gpus.iter().copied().max().unwrap_or(0);
+                Some((true, if p.spans() && e.total() > largest {
+                    format!("{} is more than the largest gpu ({}): it will span {} gpus, split as below", human_size(e.total()), human_size(largest), p.placement.stages.len())
+                } else {
+                    format!("fits across {} gpus in {} stage(s)", env.gpus.len(), p.placement.stages.len())
+                }))
+            }
+            Some(Err(why)) if e.total() > env.gpus.iter().copied().max().unwrap_or(0) => Some((false, format!("the planner says it does not fit across {} gpus: {why}. Loading is blocked: lower the memory, the context or the parallel requests.", env.gpus.len()))),
+            Some(Err(why)) => Some((false, format!("the planner says it does not fit across {} gpus: {why}. You can still try to load it.", env.gpus.len()))),
+            None => None,
+        },
+        Some(f) => Some(match e.fits() {
+            Some(false) => (false, format!("the planner says it is {} over free memory. You can still try to load it.", human_size(e.total() - f))),
+            _ => (true, "fits in free memory".to_string()),
+        }),
+        None => {
+            let _ = d;
+            None
+        }
+    }
+}
+
+fn tile(ui: &mut egui::Ui, width: f32, label: &str, value: String, tint: egui::Color32) {
+    let (number, unit) = split_unit(value);
+    ui.allocate_ui_with_layout(egui::vec2(width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.set_width(width);
+        ui.spacing_mut().item_spacing.y = 1.0;
+        ui.add(egui::Label::new(legend(label)).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(number).font(figure(19.0)).color(tint)).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(unit).size(10.5).color(LEGEND)).truncate());
+    });
+}
+
+fn result_card(ui: &mut egui::Ui, d: &LoadDialog, env: &Env, spread: &Option<Result<Planned, String>>, compact: bool, details: &mut bool) {
     let est = d.estimate(env.free);
-    section(ui, "what you will get", "updates as you change settings", |ui| {
+    card(ui, Some(READOUT), |ui| {
+        ui.add(egui::Label::new(egui::RichText::new("WHAT YOU WILL GET").font(legend_font(13.0)).extra_letter_spacing(1.5).color(VALUE)).truncate());
+        if !compact {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                Line::new().note("updates as you change settings").size(10.5).elided(ui);
+            });
+        }
+    }, |ui| {
         let Some(e) = &est else {
             note(ui, "No estimate: the model's layout could not be read.", LEGEND);
             return;
@@ -679,58 +801,68 @@ fn result_card(ui: &mut egui::Ui, d: &LoadDialog, env: &Env, spread: &Option<Res
         let a = d.anatomy().unwrap();
         let fits = fitting_context(a, env.free, d.seqs).map(|n| n.min(d.max));
         let offload = d.choice.value("runtime.offload.vram_budget").as_u64().unwrap_or(0);
-        let kv_text = if d.seqs > 1 { format!("{} tokens shared by {} requests", tokens(pool_tokens(a, e.kv)), d.seqs) } else { format!("{} tokens", tokens(d.ctx)) };
         let total_tint = if e.fits() == Some(false) { FAULT } else { VALUE };
-        readouts(ui, &[
+        let kv_tint = if d.holds_one_request() { VALUE } else { FAULT };
+        let tiles = [
             ("gpu memory", human_size(e.total()), total_tint),
-            ("context", tokens(d.ctx), VALUE),
-            ("max that fits", fits.map_or("-".to_string(), tokens), VALUE),
-            ("kv cache", human_size(e.kv), if d.holds_one_request() { VALUE } else { FAULT }),
-            ("offload", if offload > 0 { human_size(a.total_bytes.saturating_sub(offload)) } else { "none".to_string() }, VALUE),
-        ]);
-        Line::new().legend("weights").column(ui, 120.0).value(human_size(e.weights)).show(ui);
+            ("context", format!("{} tokens", tokens(d.ctx)), VALUE),
+            ("max that fits", fits.map_or("-".to_string(), |n| format!("up to {} tokens", tokens(n))), VALUE),
+            ("kv cache", human_size(e.kv), kv_tint),
+        ];
+        let gap = 8.0;
+        let across = if ui.available_width() >= 400.0 { 4 } else { 2 };
+        let w = (ui.available_width() - gap * (across as f32 - 1.0)) / across as f32;
+        for row in tiles.chunks(across) {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (label, value, tint) in row {
+                    tile(ui, w, label, value.clone(), *tint);
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if let Some((ok, text)) = fit_line(d, env, e, spread) {
+            status(ui, ok, &text);
+        } else {
+            note(ui, "No GPU reading yet, so the estimate cannot be checked against free memory.", LEGEND);
+        }
+        if !d.holds_one_request() {
+            status(ui, false, &format!("the KV cache cannot hold one request of {} tokens: raise it or lower the context length. You can still try to load it.", tokens(d.ctx)));
+        }
+        if let Some((ok, text)) = d.kv_note() {
+            status(ui, ok, &text);
+        }
+        if compact {
+            let label = if *details { "hide details" } else { "details" };
+            if ui.add(Key::new(label).outline(VALUE).id_salt("result-details")).clicked() {
+                *details = !*details;
+            }
+            if !*details {
+                return;
+            }
+        }
+        ui.add_space(4.0);
+        let kv_text = if d.seqs > 1 { format!("{} tokens shared by {} requests", tokens(pool_tokens(a, e.kv)), d.seqs) } else { format!("{} tokens", tokens(d.ctx)) };
+        let r = Line::new().legend("weights").column(ui, 120.0).value(human_size(e.weights)).show(ui);
+        r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, format!("weights {}", human_size(e.weights))));
         Line::new().legend("kv cache").column(ui, 120.0).note(kv_text).show(ui);
+        Line::new().legend("offload").column(ui, 120.0).value(if offload > 0 { human_size(a.total_bytes.saturating_sub(offload)) } else { "none".to_string() }).show(ui);
         let full = concurrency(a, e.kv, d.ctx);
         let typical = concurrency(a, e.kv, TYPICAL_REQUEST.min(d.ctx));
-        Line::new().legend("concurrency").column(ui, 120.0).value(format!("{full:.2}x at {} tokens, {typical:.1}x at {} tokens", d.ctx, TYPICAL_REQUEST.min(d.ctx))).size(11.0).show(ui);
+        let words = if d.ctx > TYPICAL_REQUEST && typical >= 1.0 { format!("{}, or {} at {} tokens each", concurrency_text(full, d.ctx), typical.floor() as usize, tokens(TYPICAL_REQUEST)) } else { concurrency_text(full, d.ctx) };
+        Line::new().legend("concurrency").column(ui, 120.0).note(words).wrapped(ui);
         if e.state > 0 {
             let each = if d.seqs > 1 { format!("{} each", human_size(e.state / d.seqs as u64)) } else { String::new() };
             Line::new().legend("recurrent state").column(ui, 120.0).value(human_size(e.state)).gap(8.0).note(each).show(ui);
         }
-        if let Some((ok, note)) = d.kv_note() {
-            status(ui, ok, &note);
-        }
-        if !d.holds_one_request() {
-            status(ui, false, &format!("the KV cache cannot hold one request of {} tokens: raise it or lower the context length. You can still try to load it.", d.ctx));
-        }
-        match e.free {
-            Some(f) if env.gpus.len() > 1 => {
+        if let Some(f) = e.free {
+            if env.gpus.len() > 1 {
                 let label = format!("free on {} gpus", env.gpus.len());
                 let r = Line::new().legend(&label).column(ui, 120.0).measured(human_size(f)).show(ui);
                 r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
-                match spread {
-                    Some(Ok(p)) => {
-                        let largest = env.gpus.iter().copied().max().unwrap_or(0);
-                        let line = if p.spans() && e.total() > largest {
-                            format!("{} is more than the largest gpu ({}): it will span {} gpus, split as below", human_size(e.total()), human_size(largest), p.placement.stages.len())
-                        } else {
-                            format!("fits across {} gpus in {} stage(s)", env.gpus.len(), p.placement.stages.len())
-                        };
-                        status(ui, true, &line);
-                    }
-                    Some(Err(why)) if e.total() > env.gpus.iter().copied().max().unwrap_or(0) => status(ui, false, &format!("the planner says it does not fit across {} gpus: {why}. Loading is blocked: lower the memory, the context or the parallel requests.", env.gpus.len())),
-                    Some(Err(why)) => status(ui, false, &format!("the planner says it does not fit across {} gpus: {why}. You can still try to load it.", env.gpus.len())),
-                    None => {}
-                }
-            }
-            Some(f) => {
+            } else {
                 Line::new().legend("free on the gpu").column(ui, 120.0).measured(human_size(f)).show(ui);
-                match e.fits() {
-                    Some(false) => status(ui, false, &format!("the planner says it is {} over free memory. You can still try to load it.", human_size(e.total() - f))),
-                    _ => status(ui, true, "fits in free memory"),
-                }
             }
-            None => note(ui, "No GPU reading yet, so the estimate cannot be checked against free memory.", LEGEND),
         }
         match &d.solved {
             Some(Ok(s)) => {
@@ -758,10 +890,13 @@ fn header(ui: &mut egui::Ui, d: &LoadDialog, back: &mut bool) {
         ui.add_space(6.0);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 2.0;
-            ui.add(egui::Label::new(egui::RichText::new(format!("Load {}", d.model.name).to_uppercase()).font(legend_font(16.0)).extra_letter_spacing(2.0).color(VALUE)).wrap());
+            let room = (ui.available_width() / 12.0).floor().max(12.0) as usize;
+            let shown = shorten_middle(&format!("Load {}", d.model.name), room);
+            let title = ui.add(egui::Label::new(egui::RichText::new(shown.to_uppercase()).font(legend_font(16.0)).extra_letter_spacing(2.0).color(VALUE)).truncate());
+            title.on_hover_text(d.model.name.clone());
             let m = &d.model;
             let facts = [human_size(m.size_bytes), m.architecture.clone(), m.quant.clone()].into_iter().filter(|s| !s.is_empty() && s != "-").collect::<Vec<_>>().join("  ");
-            Line::new().note(facts).size(11.0).wrapped(ui);
+            ui.add(egui::Label::new(Line::new().note(facts).size(11.0).job()).truncate());
         });
     });
     if let Err(e) = &d.view {
@@ -795,6 +930,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         }
     }
     let wide = ui.available_width() >= WIDE;
+    let mut details = d.details;
     egui::Panel::top("load-head").frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin { left: 12, right: 12, top: 10, bottom: 8 })).show(ui, |ui| header(ui, &d, &mut back));
     egui::Panel::bottom("load-foot").frame(egui::Frame::NONE.fill(WELL).inner_margin(egui::Margin::symmetric(12, 8))).show(ui, |ui| {
         if let Some(why) = &alongside_block {
@@ -822,7 +958,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     });
     if wide {
         egui::Panel::left("load-result").exact_size(SIDE_W).resizable(false).frame(egui::Frame::NONE.fill(CHASSIS).inner_margin(egui::Margin { left: 12, right: 8, top: 4, bottom: 4 })).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| result_card(ui, &d, &env, &spread));
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| result_card(ui, &d, &env, &spread, false, &mut details));
         });
         egui::CentralPanel::no_frame().show(ui, |ui| {
             egui::Frame::NONE.inner_margin(egui::Margin { left: 8, right: 12, top: 4, bottom: 4 }).show(ui, |ui| {
@@ -840,12 +976,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     ui.set_max_width(w);
                     ui.spacing_mut().item_spacing.y = 8.0;
-                    result_card(ui, &d, &env, &spread);
+                    result_card(ui, &d, &env, &spread, true, &mut details);
                     settings(ui, app, &mut d, &env);
                 });
             });
         });
     }
+    d.details = details;
     if go {
         launch(app, &d, alongside, &env);
     } else if !back {

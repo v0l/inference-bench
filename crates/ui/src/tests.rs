@@ -1939,10 +1939,107 @@ fn open_dialog(name: &str) -> Harness<'static, App> {
     h
 }
 
+fn token_counts_have_thousands_separators_and_long_names_shorten_in_the_middle() {
+    assert_eq!(crate::load::tokens(0), "0");
+    assert_eq!(crate::load::tokens(999), "999");
+    assert_eq!(crate::load::tokens(8192), "8,192");
+    assert_eq!(crate::load::tokens(524288), "524,288");
+    assert_eq!(crate::load::tokens(1048576), "1,048,576");
+    assert_eq!(crate::load::shorten_middle("short", 20), "short");
+    let s = crate::load::shorten_middle("Load HuggingFaceTB/SmolLM2-135M", 16);
+    assert_eq!(s.chars().count(), 16);
+    assert!(s.contains('…') && s.starts_with("Load") && s.ends_with("135M"));
+}
+
+#[test]
+fn concurrency_is_said_in_plain_words() {
+    assert_eq!(crate::load::concurrency_text(32.4, 8192), "serves 32 requests at 8,192 tokens each");
+    assert_eq!(crate::load::concurrency_text(1.0, 8192), "serves 1 request at 8,192 tokens each");
+    assert_eq!(crate::load::concurrency_text(0.4, 8192), "cannot hold one request of 8,192 tokens");
+}
+
+#[test]
+fn the_kv_type_costs_sit_inside_the_segments_with_no_repeated_list() {
+    let mut h = open_dialog("page-kv-segments");
+    h.run();
+    assert!(h.query_all_by_label_contains("MB").count() >= 1);
+    assert_eq!(h.query_all_by_label_contains("at 8192 tokens").count(), 0);
+    h.get_by_label_contains("the size of fp16");
+}
+
+#[test]
+fn the_result_card_leads_with_four_tiles_and_the_fit_line() {
+    let mut h = open_dialog("page-tiles");
+    h.run();
+    h.get_by_label_contains("WHAT YOU WILL GET");
+    let tile = h.get_all_by_label_contains("weights").next().unwrap().accesskit_node().bounding_box().unwrap();
+    let fit = h.get_by_label_contains("fits in free memory").accesskit_node().bounding_box().unwrap();
+    let weights = h.get_by_label_contains("weights").accesskit_node().bounding_box().unwrap();
+    assert!(fit.y0 < weights.y0, "{tile:?} {fit:?} {weights:?}");
+}
+
+#[test]
+fn the_common_rows_share_one_control_column_at_desktop_width() {
+    let mut h = open_dialog("page-grid");
+    h.run();
+    let mut xs = Vec::new();
+    for label in ["KV CACHE SIZE", "PARALLEL REQUESTS", "GPU OFFLOAD"] {
+        let n = h.get_all_by_label_contains(label).last().unwrap().accesskit_node().bounding_box().unwrap();
+        xs.push((label, n.x0));
+    }
+    assert!(xs.windows(2).all(|w| (w[0].1 - w[1].1).abs() < 1.0), "{xs:?}");
+}
+
+#[test]
+fn the_phone_page_collapses_the_result_card_to_tiles_and_the_fit_line() {
+    let mut h = harness_at("page-phone-compact", Tab::Models, egui::vec2(390.0, 844.0));
+    with_gpu(&mut h, 0, 96 << 30);
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    assert!(h.query_by_label_contains("weights").is_none());
+    h.get_by_label("details").click();
+    h.run();
+    h.get_by_label_contains("weights");
+    assert!(h.state().load.as_ref().unwrap().details);
+}
+
+#[test]
+fn loading_through_the_page_then_chatting_answers() {
+    use agent_ui::chat::Turn;
+    let mut h = open_dialog("page-chat");
+    h.run();
+    click_load(&mut h);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    let (desk, _asks) = agent_core::Desk::new(|| {});
+    h.state_mut().chat.agent.chat.ask("say hello", desk);
+    pump_until(&mut h, 20, "agent turn", |a| !a.chat.agent.chat.busy());
+    let turns = &h.state().chat.agent.chat.turns;
+    assert!(turns.iter().any(|t| matches!(t, Turn::Said(s) if s.contains("Hello"))), "{} turns", turns.len());
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshots_of_the_load_page_at_desktop_and_exactly_390_wide() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (w, hgt, tag) in [(1280.0, 800.0, "1280x800"), (390.0, 844.0, "390x844")] {
+        let mut h = harness_at(&format!("page-shot-{tag}"), Tab::Models, egui::vec2(w, hgt));
+        with_gpu(&mut h, 20 << 30, 96 << 30);
+        let m = real_model("Qwen3-0.6B");
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().open_load_dialog(&m);
+        h.run();
+        h.render().unwrap().save(out.join(format!("load-page-harness-{tag}.png"))).unwrap();
+    }
+}
+
+#[test]
 fn the_load_page_opens_in_place_of_the_models_page_and_back_returns() {
     let mut h = open_dialog("page-back");
     h.run();
-    h.get_by_label_contains("LOAD QWEN3-0.6B");
     h.get_by_label_contains("WHAT YOU WILL GET");
     assert!(h.query_by_label("search your models").is_none());
     h.get_by_label("back").click();
@@ -2016,7 +2113,7 @@ fn the_load_page_fits_phone_width_with_every_section_open() {
         let screen = h.ctx.content_rect();
         for n in h.query_all_by(|_| true).filter(|n| n.accesskit_node().bounding_box().is_some()) {
             let r = n.rect();
-            assert!(r.right() <= screen.right() + 0.5 && r.left() >= screen.left() - 0.5, "{:?} {:?} at {r:?} past {screen:?}", n.accesskit_node().role(), n.accesskit_node().label());
+            assert!(r.right() <= screen.right() + 0.5 && r.left() >= screen.left() - 0.5, "{:?} {:?} at {r:?} past {screen:?} {:?}", n.accesskit_node().role(), n.accesskit_node().label(), n.accesskit_node().value());
         }
         let b = h.get_all_by_label("load model").last().unwrap().accesskit_node().bounding_box().unwrap();
         assert!(b.y1 <= hgt as f64 && b.x1 <= w as f64, "{b:?}");
