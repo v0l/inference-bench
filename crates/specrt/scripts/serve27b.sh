@@ -9,7 +9,7 @@ kv_gb=${KV_GB:-3}
 max_len=${MAX_LEN:-32768}
 out=${OUT:-$here/../out/serve27b}
 mkdir -p "$out"
-free=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
+free=$(nvidia-smi -i "${CUDA_VISIBLE_DEVICES:-0}" --query-gpu=memory.free --format=csv,noheader,nounits | head -1)
 if [ "$free" -lt 36000 ]; then
     echo "only $free MiB free, need 36000" >&2
     exit 1

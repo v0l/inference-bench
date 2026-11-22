@@ -47,6 +47,10 @@ pub struct ServeArgs {
     pub prefill_burst_tokens: Option<usize>,
     #[arg(long, help = "Prompts over 2048 tokens read at the same time (default 1)")]
     pub max_long_in_flight: Option<usize>,
+    #[arg(long, help = "Cap prefill per step once a decoder has waited this many ms since its last token (default 0, off)")]
+    pub stall_budget_ms: Option<u64>,
+    #[arg(long, help = "Smallest prompt chunk per step while the stall cap is active (default 0, no floor)")]
+    pub min_stall_chunk_tokens: Option<usize>,
     #[arg(long, help = "Seconds before an idle model is unloaded")]
     pub idle_unload_secs: Option<u64>,
     #[arg(long, help = "Write an access log (JSON lines) here")]
@@ -99,6 +103,8 @@ impl ServeArgs {
         config.admit_lookahead = self.admit_lookahead.or(config.admit_lookahead);
         config.prefill_burst_tokens = self.prefill_burst_tokens.or(config.prefill_burst_tokens);
         config.max_long_in_flight = self.max_long_in_flight.or(config.max_long_in_flight);
+        config.stall_budget_ms = self.stall_budget_ms.or(config.stall_budget_ms);
+        config.min_stall_chunk_tokens = self.min_stall_chunk_tokens.or(config.min_stall_chunk_tokens);
         if let Some(n) = self.idle_unload_secs {
             config.idle_unload_secs = Some(n);
         }
