@@ -88,3 +88,73 @@ fn a_budget_that_holds_everything_streams_nothing() {
     assert_eq!(rt.streamed_layers(), 0);
     assert!(rt.offload_stats().is_none());
 }
+
+fn moe_spec(dir: &str, slots: usize, hotlist: Option<String>) -> Spec {
+    let mut spec = spec_for(dir, u64::MAX / 4);
+    spec.runtime.offload.expert_slots = slots;
+    spec.runtime.offload.hotlist = hotlist;
+    spec
+}
+
+fn assert_experts_identical(dir: &str, slots: usize) {
+    let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
+    let p = prompt(40);
+    let want_prefill = full.trace_prefill(&p).unwrap();
+    let want_decode = full.trace_decode(&prompt(6)).unwrap();
+    let want_tokens = full.generate(&p, 16, Sampling::GREEDY).unwrap().tokens;
+    drop(full);
+    let mut off = Runtime::load(&moe_spec(dir, slots, None), 256).unwrap();
+    assert_eq!(off.expert_slots(), slots);
+    assert_eq!(off.trace_prefill(&p).unwrap().logits, want_prefill.logits, "prefill logits");
+    let got = off.trace_decode(&prompt(6)).unwrap();
+    assert_eq!(got.logits, want_decode.logits, "decode logits");
+    assert_eq!(got.layers, want_decode.layers, "decode layer outputs");
+    assert_eq!(off.generate(&p, 16, Sampling::GREEDY).unwrap().tokens, want_tokens);
+    let stats = off.offload_stats().unwrap();
+    assert!(stats.host_to_vram_bytes > 0, "{stats:?}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn expert_cache_with_every_expert_slot_is_bit_identical() {
+    assert_experts_identical("tiny-qwen3.5-moe", 8);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn expert_cache_with_few_slots_is_bit_identical() {
+    assert_experts_identical("tiny-qwen3.5-moe", 2);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn expert_cache_with_fp8_experts_is_bit_identical() {
+    assert_experts_identical("tiny-qwen3.5-moe-fp8", 3);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn expert_cache_with_nvfp4_experts_is_bit_identical() {
+    assert_experts_identical("tiny-qwen3.5-moe-nvfp4", 2);
+    assert_experts_identical("tiny-qwen3.5-moe-nvfp4", 8);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn calibration_hotlist_round_trips_and_warms_the_cache() {
+    let first = prompt(1);
+    let mut cold = Runtime::load(&moe_spec("tiny-qwen3.5-moe", 6, None), 256).unwrap();
+    assert_eq!(cold.offload_stats().unwrap().host_hits, 0);
+    let want = cold.trace_decode(&first).unwrap().logits;
+    let cold_misses = cold.offload_stats().unwrap().host_hits;
+    let path = std::env::temp_dir().join(format!("hotlist-{}.json", std::process::id()));
+    cold.save_expert_hotlist(&path).unwrap();
+    drop(cold);
+    let mut warm = Runtime::load(&moe_spec("tiny-qwen3.5-moe", 6, Some(path.display().to_string())), 256).unwrap();
+    assert!(warm.offload_stats().unwrap().host_to_vram_bytes > 0, "hotlist warm up copies experts before the first token");
+    assert_eq!(warm.trace_decode(&first).unwrap().logits, want);
+    let warm_misses = warm.offload_stats().unwrap().host_hits;
+    assert!(cold_misses >= 6, "{cold_misses}");
+    assert_eq!(warm_misses, 0, "first token misses: cold {cold_misses}, warm {warm_misses}");
+    std::fs::remove_file(path).unwrap();
+}
