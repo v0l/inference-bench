@@ -117,7 +117,7 @@ References come from transformers (`scripts/reference.py`) or vLLM and are check
 | Dir | Holds | Used by |
 |---|---|---|
 | `~/.cache/specrt-ref-375` | everything: tiny and tiny-fp8/nvfp4/mtp outputs, all 0.5B, 0.6B, llama, tinymistral references, `qwen3.8-27b-slice`, `qwen3.8-27b-nvfp4-slice`, `real27b-mtp-*`, `vllm-*.json`, `vllm-mtp-*.pt`, `nvfp4-dequant.*` | the whole suite incl. real27b |
-| `/mnt/data/tmp/inference-bench-498/vis498` | vLLM vision references (`vllm-image.json`, `hf-pos-video.json`, `plp-*.json`) | `vision_lm` via `SPECRT_VISION_REF_DIR` |
+| `~/.local/share/inference-bench/refs/vision` (never `/tmp`; on the Spark the gate scripts read the same path under `~`) | vLLM vision references (`vllm-*.json`, `hf-pos-*.json`, `plp-*.json`), made by `vllm_vision.py` (vLLM on GPU1 via `docs/qwen27-run/launch.sh kvauto` under `gpu-run 1`, then `VLLM_URL=http://127.0.0.1:8011 VLLM_MODEL=orcarouter/Qwen3.8-27B-Uncensored-NVFP4`) and `CUDA_VISIBLE_DEVICES= vision_positions.py`. vLLM 0.34 with transformers 5.23 needs `PYTHONPATH=crates/specrt/scripts/vllm_compat` on the server (its `sitecustomize.py`) drops `do_sample_frames` from `VideoMetadata` and ignores the text-only video-pad check | `vision_lm` via `SPECRT_VISION_REF_DIR` |
 | `~/.cache/specrt-gguf` (or `SPECRT_GGUF_DIR`) | Qwen3-0.6B and Llama-3.2-1B GGUF files and llama.cpp logits | `gguf`, `gguf_logits`, `wgsl` |
 
 Regenerate with the vLLM venv python. Run it from the repo root, under the 16G cap. These load full models, so for the 27B ones the one-job-at-a-time rule applies.

@@ -8,7 +8,7 @@ from pathlib import Path
 
 BASE = os.environ.get("VLLM_URL", "http://127.0.0.1:8001")
 URL = BASE + "/v1/chat/completions"
-MODEL = "qwen3.8-27b"
+MODEL = os.environ.get("VLLM_MODEL", "qwen3.8-27b")
 NEW = 32
 TOP = 20
 FIXTURES = Path(__file__).parent.parent / "tests" / "fixtures" / "vision"
@@ -28,8 +28,12 @@ CASES = {
 
 def post(body, url=URL):
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=300) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        print(e.read().decode()[:2000], file=sys.stderr)
+        raise
 
 
 def token_id(key):
