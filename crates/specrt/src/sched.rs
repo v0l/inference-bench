@@ -527,6 +527,7 @@ pub struct Config {
     pub prefill_burst_tokens: usize,
     pub max_long_in_flight: usize,
     pub adaptive_drafts: bool,
+    pub stall_budget: Duration,
 }
 
 impl Default for Config {
@@ -547,6 +548,7 @@ impl Default for Config {
             prefill_burst_tokens: 0,
             max_long_in_flight: 1,
             adaptive_drafts: false,
+            stall_budget: Duration::ZERO,
         }
     }
 }
@@ -604,6 +606,7 @@ struct Seq {
     slot: Option<usize>,
     blocks: Vec<u32>,
     arrived: Instant,
+    last_token: Instant,
     admitted: u64,
     started: bool,
     root: Hash,
@@ -1038,6 +1041,7 @@ impl<E: Executor> Scheduler<E> {
             slot: None,
             blocks: Vec::new(),
             arrived: Instant::now(),
+            last_token: Instant::now(),
             admitted: 0,
             started: false,
             root,
@@ -1397,7 +1401,21 @@ impl<E: Executor> Scheduler<E> {
         let fit = fit.max(floor);
         let fit = fit.max(self.whole_prompt_remaining().unwrap_or(0));
         let fit = if self.long_prompt_pending() { fit.max(self.cfg.prefill_burst_tokens) } else { fit };
-        fit.min(full.max(align))
+        fit.min(full.max(align)).min(self.stall_cap(align).unwrap_or(usize::MAX))
+    }
+
+    fn stall_cap(&self, align: usize) -> Option<usize> {
+        if self.cfg.stall_budget.is_zero() || self.prefill_rate <= 0.0 {
+            return None;
+        }
+        let now = Instant::now();
+        let stalled = self.running.iter().any(|s| s.decoding() && now.duration_since(s.last_token) > self.cfg.stall_budget);
+        if !stalled {
+            return None;
+        }
+        let room = (self.cfg.stall_budget.as_secs_f64() - self.decode_secs).max(0.0);
+        let fit = (room * self.prefill_rate) as usize;
+        Some(if fit > align { fit / align * align } else { align })
     }
 
     fn long_prompt_pending(&self) -> bool {
@@ -1625,6 +1643,7 @@ fn finished(s: &Seq, finish: Finish) -> Event {
 fn accept(s: &mut Seq, t: u32, max_ctx: usize, events: &mut Vec<Event>) -> bool {
     s.tokens.push(t);
     s.keys.push(t);
+    s.last_token = Instant::now();
     let stop = s.req.stop.contains(&t);
     if !stop {
         events.push(Event::Token { id: s.id, token: t });
@@ -2780,6 +2799,58 @@ mod tests {
             prefilled += r.prefill_tokens;
         }
         assert!(prefilled > 12 * 64, "{prefilled}");
+    }
+
+    fn stall_scheduler(stall_ms: u64) -> Scheduler<Fake> {
+        let cfg = Config { max_batched_tokens: 8192, step_cost: 0.0, stall_budget: Duration::from_millis(stall_ms), ..Config::default() };
+        let mut s = Scheduler::new(Fake::new(65536, 8, 8000, 2048), cfg);
+        s.submit(request(50, 400, 1)).unwrap();
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        s.step(&mut events).unwrap();
+        s.decode_secs = 0.05;
+        s.prefill_rate = 10_000.0;
+        s
+    }
+
+    #[test]
+    fn a_decoder_waiting_past_the_stall_budget_caps_the_prefill_step() {
+        let mut s = stall_scheduler(400);
+        s.running[0].last_token = Instant::now() - Duration::from_millis(900);
+        let budget = s.prefill_budget(1);
+        assert!((3000..=3500).contains(&budget), "{budget}");
+    }
+
+    #[test]
+    fn no_decoder_waiting_past_the_stall_budget_allows_the_full_step() {
+        let s = stall_scheduler(400);
+        assert_eq!(s.prefill_budget(1), 8128);
+    }
+
+    #[test]
+    fn a_zero_stall_budget_never_caps() {
+        let mut s = stall_scheduler(0);
+        s.running[0].last_token = Instant::now() - Duration::from_millis(900);
+        assert_eq!(s.prefill_budget(1), 8128);
+    }
+
+    #[test]
+    fn stall_capped_output_matches_plain_greedy() {
+        let run = |stall_ms: u64| {
+            let cfg = Config { max_batched_tokens: 8192, step_cost: 0.0, stall_budget: Duration::from_millis(stall_ms), ..Config::default() };
+            let mut s = Scheduler::new(Fake::new(65536, 8, 8000, 2048), cfg);
+            s.submit(request(50, 40, 1)).unwrap();
+            let mut events = Vec::new();
+            s.step(&mut events).unwrap();
+            s.submit(request(6000, 8, 2)).unwrap();
+            s.prefill_rate = 10_000.0;
+            s.decode_secs = 0.01;
+            let (out, _, _) = drain(&mut s);
+            let mut out: Vec<_> = out.into_iter().collect();
+            out.sort();
+            out
+        };
+        assert_eq!(run(1), run(0));
     }
 
     #[test]

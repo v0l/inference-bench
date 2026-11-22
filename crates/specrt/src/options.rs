@@ -172,6 +172,9 @@ fn apply_values(values: &BTreeMap<String, Value>, sparse: &BTreeMap<String, Valu
         if let Some(v) = values.get("serve.max_long_in_flight").and_then(Value::as_u64) {
             opts.max_long_in_flight = v as usize;
         }
+        if let Some(v) = values.get("serve.stall_budget_ms").and_then(Value::as_u64) {
+            opts.stall_budget = Duration::from_millis(v);
+        }
         if let Some(v) = values.get("serve.tp").and_then(Value::as_u64) {
             opts.tp = v as usize;
         }
@@ -289,6 +292,7 @@ const META: &[Meta] = &[
     Meta { key: "serve.admit_lookahead", label: "admission lookahead", group: Group::Serving, help: "Tokens of generation a new request and each running one reserve KV room for before another request is admitted. Fewer preemptions, later admission. 0 reserves the prompt only.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "serve.prefill_burst_tokens", label: "long prompt burst", group: Group::Serving, help: "Prompt tokens read per step while a prompt over 2048 tokens is waiting or being read, even when decoders fill the inter-token target. Long prompts start sooner, running streams wait longer between tokens. 0 leaves long prompts to the guaranteed prefill.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "serve.max_long_in_flight", label: "long prompts at once", group: Group::Serving, help: "Prompts over 2048 tokens read at the same time. More starts long prompts together instead of one after another.", choices: &[], range: (1, 64) },
+    Meta { key: "serve.stall_budget_ms", label: "decoder stall budget", group: Group::Serving, help: "Once a running stream has waited this many milliseconds since its last token, each step reads only the prompt tokens that fit in the budget. Below it prefill uses the full burst. 0 turns it off.", choices: &[], range: (0, 60_000) },
     Meta { key: "speculative.enabled", label: "mtp", group: Group::Mtp, help: "Draft tokens with the model's own MTP head and verify them in one step. Output is unchanged.", choices: &[], range: (0, 0) },
     Meta { key: "speculative.draft_tokens", label: "draft tokens", group: Group::Mtp, help: "Tokens drafted per step. Auto uses the model spec, 2 on the 27B.", choices: &[], range: (1, crate::spec::MAX_DRAFT_TOKENS as u64) },
     Meta { key: "speculative.max_batch", label: "mtp batch limit", group: Group::Mtp, help: "Largest batch that still drafts. Auto uses the model spec.", choices: &[], range: (1, 64) },
@@ -349,16 +353,17 @@ struct ServeKnobs {
     admit_lookahead: usize,
     prefill_burst_tokens: usize,
     max_long_in_flight: usize,
+    stall_budget_ms: u64,
     tp: usize,
 }
 
 fn knobs(o: &ServeOptions) -> ServeKnobs {
-    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, step_cost, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, prefill_burst_tokens, max_long_in_flight, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp, grammar_cache: _, solved: _ } = o;
-    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, step_cost: *step_cost, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead, prefill_burst_tokens: *prefill_burst_tokens, max_long_in_flight: *max_long_in_flight, tp: *tp }
+    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, step_cost, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, prefill_burst_tokens, max_long_in_flight, stall_budget, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp, grammar_cache: _, solved: _ } = o;
+    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, step_cost: *step_cost, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead, prefill_burst_tokens: *prefill_burst_tokens, max_long_in_flight: *max_long_in_flight, stall_budget_ms: stall_budget.as_millis() as u64, tp: *tp }
 }
 
 fn populated_knobs() -> ServeKnobs {
-    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, step_cost: 1.0, whole_prompt_tokens: 1, min_prefill_tokens: 1, swap_space_gb: 1.0, admit_lookahead: 1, prefill_burst_tokens: 1, max_long_in_flight: 1, tp: 1 }
+    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, step_cost: 1.0, whole_prompt_tokens: 1, min_prefill_tokens: 1, swap_space_gb: 1.0, admit_lookahead: 1, prefill_burst_tokens: 1, max_long_in_flight: 1, stall_budget_ms: 1, tp: 1 }
 }
 
 fn populated_runtime() -> RuntimeOptions {

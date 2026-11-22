@@ -92,6 +92,7 @@ pub struct ServeOptions {
     pub admit_lookahead: usize,
     pub prefill_burst_tokens: usize,
     pub max_long_in_flight: usize,
+    pub stall_budget: Duration,
     pub runtime: Option<RuntimeOptions>,
     pub speculative: SpeculativeOptions,
     pub placement: Option<crate::placement::PlacementConfig>,
@@ -119,6 +120,7 @@ impl Default for ServeOptions {
             admit_lookahead: 0,
             prefill_burst_tokens: 16384,
             max_long_in_flight: 4,
+            stall_budget: Duration::from_millis(400),
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,
@@ -639,6 +641,7 @@ fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
         admit_lookahead: opts.admit_lookahead,
         prefill_burst_tokens: opts.prefill_burst_tokens,
         max_long_in_flight: opts.max_long_in_flight,
+        stall_budget: opts.stall_budget,
         adaptive_drafts: opts.speculative.draft_tokens == Some(DraftTokens::Auto),
         prefix_cache,
         ..Config::default()
