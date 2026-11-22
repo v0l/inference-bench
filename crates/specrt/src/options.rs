@@ -276,13 +276,14 @@ pub struct Layout {
     pub sections: Vec<(&'static str, Vec<Field>)>,
 }
 
-pub fn layout() -> Layout {
+pub fn layout(has_mtp: bool) -> Layout {
     let all = schema();
-    let mut common: Vec<Field> = all.iter().filter(|f| f.common).cloned().collect();
+    let shown = |f: &Field| f.common && (has_mtp || f.group != Group::Mtp);
+    let mut common: Vec<Field> = all.iter().filter(|f| shown(f)).cloned().collect();
     common.sort_by_key(|f| f.order);
     let mut sections: Vec<(&'static str, Vec<Field>)> = Vec::new();
     for heading in SECTION_ORDER {
-        let members: Vec<Field> = all.iter().filter(|f| !f.common && f.group.heading() == heading).cloned().collect();
+        let members: Vec<Field> = all.iter().filter(|f| !shown(f) && f.group.heading() == heading).cloned().collect();
         if !members.is_empty() {
             sections.push((heading, members));
         }
@@ -343,7 +344,7 @@ const QUANTS: &[&str] = &["bf16", "fp8_channel", "nvfp4_g16"];
 
 const META: &[Meta] = &[
     Meta { key: "serve.max_model_len", label: "context length", group: Group::Basic, help: "Tokens one conversation can hold. Bigger contexts keep more and cost more memory.", choices: &[], range: (1, u64::MAX) },
-    Meta { key: "serve.kv_cache_bytes", label: "memory", group: Group::Basic, help: "GPU memory to use. What is left after the weights becomes the KV cache that all requests share.", choices: &[], range: (0, u64::MAX) },
+    Meta { key: "serve.kv_cache_bytes", label: "kv cache size", group: Group::Basic, help: "GPU memory to use. What is left after the weights becomes the KV cache that all requests share.", choices: &[], range: (0, u64::MAX) },
     Meta { key: "serve.max_num_seqs", label: "parallel requests", group: Group::Parallel, help: "Requests decoded together. They share one KV cache, and a single request still runs at full speed.", choices: &[], range: (1, 64) },
     Meta { key: "serve.tp", label: "tensor parallel", group: Group::Parallel, help: "GPUs one model is split across, by attention head and MLP column, with an allreduce after each half layer. One stream decodes faster when the GPUs have peer access. 1 keeps the model on one GPU.", choices: &[], range: (1, 8) },
     Meta { key: "serve.max_batched_tokens", label: "batched tokens", group: Group::Serving, help: "Token budget of one scheduler step. Larger prefills faster, smaller keeps decode steps short.", choices: &[], range: (64, 1 << 20) },
@@ -406,11 +407,11 @@ const META: &[Meta] = &[
     Meta { key: "runtime.loader.lanes", label: "lanes", group: Group::Loader, help: "Parallel upload streams.", choices: &[], range: (1, 16) },
     Meta { key: "runtime.loader.skip_cached", label: "skip cached files", group: Group::Loader, help: "Read files already in the page cache the plain way.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.loader.pinned", label: "pinned buffers", group: Group::Loader, help: "Use pinned host memory for staging.", choices: &[], range: (0, 0) },
-    Meta { key: "runtime.offload.vram_budget", label: "weight memory cap", group: Group::Offload, help: "Bytes of GPU memory the weights may use. Layers that do not fit stay in pinned host memory and stream in while earlier layers compute. 0 keeps every weight on the card.", choices: &[], range: (0, u64::MAX) },
+    Meta { key: "runtime.offload.vram_budget", label: "gpu offload", group: Group::Offload, help: "How much of the weights stay on the GPU, in bytes. Layers beyond it stay in pinned host memory and stream in while earlier layers compute. 0 keeps every weight on the GPU.", choices: &[], range: (0, u64::MAX) },
     Meta { key: "runtime.offload.host_budget", label: "host memory cap", group: Group::Offload, help: "Bytes of pinned host memory for streamed layers. 0 means no cap.", choices: &[], range: (0, u64::MAX) },
     Meta { key: "runtime.offload.nvme_path", label: "disk spill folder", group: Group::Offload, help: "Folder on a fast drive for layers that fit neither tier.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.offload.prefetch_depth", label: "prefetch depth", group: Group::Offload, help: "Layers copied ahead of the one computing.", choices: &[], range: (1, 8) },
-    Meta { key: "runtime.offload.expert_slots", label: "expert slots", group: Group::Offload, help: "Experts kept on the card for a mixture of experts model, shared by every layer. Missing experts copy in after the router picks them. 0 sizes the cache from the weight memory cap.", choices: &[], range: (0, 1 << 20) },
+    Meta { key: "runtime.offload.expert_slots", label: "expert slots", group: Group::Offload, help: "Experts kept on the card for a mixture of experts model, shared by every layer. Missing experts copy in after the router picks them. 0 sizes the cache from the gpu offload setting.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "runtime.offload.hotlist", label: "expert hotlist", group: Group::Offload, help: "File of expert use counts from a calibration run. The most used experts are loaded first and guide prefetch before the router has history.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.offload.policy", label: "eviction policy", group: Group::Offload, help: "Which resident page leaves first when a tier is full.", choices: &["lru", "frequency"], range: (0, 0) },
     Meta { key: "runtime.loader.host_budget_mb", label: "host budget", group: Group::Loader, help: "Megabytes of host memory the loader may use for staging.", choices: &[], range: (64, 1 << 20) },
@@ -709,7 +710,7 @@ mod tests {
 
     #[test]
     fn the_common_options_come_first_in_the_stated_order_and_every_other_option_is_in_a_section() {
-        let l = layout();
+        let l = layout(true);
         let keys: Vec<&str> = l.common.iter().map(|f| f.key.as_str()).collect();
         assert_eq!(keys, COMMON);
         let total = l.common.len() + l.sections.iter().map(|(_, f)| f.len()).sum::<usize>();
@@ -721,6 +722,16 @@ mod tests {
         assert_eq!(seen.len(), schema().len());
         let names: Vec<&str> = l.sections.iter().map(|(n, _)| *n).collect();
         assert_eq!(names, SECTION_ORDER);
+    }
+
+    #[test]
+    fn without_mtp_the_speculative_options_move_into_their_own_section_and_nothing_is_lost() {
+        let l = layout(false);
+        assert!(l.common.iter().all(|f| f.group != Group::Mtp));
+        let total = l.common.len() + l.sections.iter().map(|(_, f)| f.len()).sum::<usize>();
+        assert_eq!(total, schema().len());
+        let spec = l.sections.iter().find(|(n, _)| *n == "Speculative decoding").unwrap();
+        assert!(spec.1.iter().any(|f| f.key == "speculative.enabled"));
     }
 
     #[test]

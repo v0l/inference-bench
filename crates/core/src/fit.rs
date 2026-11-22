@@ -149,15 +149,19 @@ pub fn fitting_context(a: &ModelAnatomy, free: Option<u64>, seqs: usize) -> Opti
     Some(tokens.max(1))
 }
 
-pub fn kv_kind_of(choice: &specrt::options::EngineChoice) -> KvKind {
-    if !choice.overrides.contains_key("runtime.kv_dtype") && !choice.overrides.contains_key("runtime.kv_f16_layers") {
-        return KvKind::Auto;
-    }
+pub fn kv_kind_effective(choice: &specrt::options::EngineChoice) -> KvKind {
     match choice.value("runtime.kv_dtype").as_str() {
         Some("fp8") if choice.value("runtime.kv_f16_layers").as_u64() == Some(0) => KvKind::Fp8,
         Some("fp8") => KvKind::MixedFp8,
         _ => KvKind::F16,
     }
+}
+
+pub fn kv_kind_of(choice: &specrt::options::EngineChoice) -> KvKind {
+    if !choice.overrides.contains_key("runtime.kv_dtype") && !choice.overrides.contains_key("runtime.kv_f16_layers") {
+        return KvKind::Auto;
+    }
+    kv_kind_effective(choice)
 }
 
 pub fn set_kv_kind(choice: &mut specrt::options::EngineChoice, kind: KvKind) {
