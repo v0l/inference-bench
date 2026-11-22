@@ -2,42 +2,79 @@
 
 ## Status
 
-Step 1 is in `crates/specrt/src/offload.rs`: the policy and bookkeeping layer, tested on CPU with fake slow tiers. The CUDA data path (copy stream, pinned buffers, real NVMe reads) and the MoE expert cache are not wired yet.
-
 | Piece | State |
 | --- | --- |
-| `OffloadSettings` (`vram_budget`, `host_budget`, `nvme_path`, `prefetch_depth`, `policy`), TOML parse with defaults | done |
-| `TieredStore`: pages with tiers VRAM, host, NVMe; LRU or frequency eviction under per-tier budgets; pinned pages; prefetch with recorded order; no read of a resident page | done, tested |
-| `plan_layers`: reserves resident tensors and staging buffers (`prefetch_depth` x largest layer), pins first and last layer, fills VRAM then host, rest NVMe | done, tested |
-| `tokens_per_second_ceiling` and `OffloadStats::prometheus` (`inference_offload_hit_ratio`, `inference_offload_read_bytes_total`) | done, tested |
-| Throttled fake NVMe test (read time follows bandwidth, second pass is free) | done |
-| Layer streaming on a second CUDA stream, bit-identical logits with 1 layer resident | not done: needs GPU, see below |
-| MoE expert cache, hotlist | blocked on routed-expert kernels being page-addressable; the `[moe]` block and kernels exist (`docs/specrt-moe.md`), the cache keyed by (layer, expert) is the same `TieredStore` with expert pages |
-| CPU compute tier | not evaluated |
-| UI readout | not done |
+| `[runtime.offload]` in the model spec and the server config (`vram_budget`, `host_budget`, `nvme_path`, `prefetch_depth`, `policy`), also in the options schema (group "offload") | done |
+| `crates/specrt/src/offload.rs`: pages, tiers, LRU or frequency eviction, prefetch order, planner, ceiling, stats | done, 17 CPU tests |
+| Dense layer streaming on a second CUDA stream: layers over `vram_budget` live in pinned host memory and copy into a ring of `prefetch_depth + 1` shared VRAM slots, one layer ahead of compute (`runtime/stream.rs`) | done, bit identical on GPU |
+| `inference_offload_hit_ratio`, `inference_offload_read_bytes_total` on `/metrics` | done, rendered when a model streams |
+| NVMe tier on the GPU path | planner knows it; the loader refuses a budget that needs it |
+| MoE expert cache, CPU compute tier, Models page readout | separate issues |
 
-## Design
+Settings (all in the spec or server config, no env vars):
 
-- Page = one layer's weights (dense) or one expert (MoE). Always-needed tensors (norms, embeddings, lm_head, attention for MoE) are resident and counted in `always_resident`.
-- Tier 1 pinned memory comes from `hostpool::HostPool`; KV offload and session snapshots must share it and the same I/O thread pool.
-- Decode of a dense model reads every streamed byte every token, so speed is bounded by link bandwidth. MoE reads only routed experts, so the hit ratio of the expert cache sets the speed.
-- Prefetch: for dense, layer N+1 while N computes (`prefetch_depth` buffers). For MoE, the previous token's routing is the hotlist for the next layer.
+```toml
+[runtime.offload]
+vram_budget = 24000000000
+host_budget = 0
+prefetch_depth = 1
+policy = "lru"
+```
 
-## Ceilings (tokens/s upper bound, one stream, decode)
+`vram_budget` is the bytes of card memory the weights may use. The planner keeps embeddings, norms and the head resident, pins the first and last layer, fills VRAM with layers, and puts the rest in pinned host memory. Streaming needs `prefetch_depth + 1` staging slots of the largest layer, which count against the budget. CUDA graphs are switched off for a streaming model.
 
-`ceiling = 1 / max(streamed bytes / link, all bytes / HBM read rate)`, computed by `OffloadPlan::tokens_per_second_ceiling`. Assumptions: PCIe 5 x16 about 50 GB/s host to GPU, NVMe 10 GB/s, HBM effective 1500 GB/s. Weight sizes: 27B at FP8 about 27 GB, NVFP4 about 15 GB, bf16 54 GB.
+## Measured links (this desktop, GPU 1, RTX PRO 6000)
 
-| Format | VRAM budget | Streamed per token | Ceiling from host RAM | Ceiling from NVMe |
-| --- | --- | --- | --- | --- |
-| FP8 27 GB | 48 GB | 0 | 55 | 55 |
-| FP8 27 GB | 24 GB | about 5 GB | about 10 | about 2 |
-| FP8 27 GB | 12 GB | about 17 GB | about 3 | about 0.6 |
-| NVFP4 15 GB | 12 GB | about 5 GB | about 10 | about 2 |
+| Link | Result |
+| --- | --- |
+| Pinned host to device, 1 GiB x 5 (`linkbench`) | 57.8 GB/s every run |
+| Pinned device to host | 57.4 GB/s |
+| Model drive, `dd iflag=direct bs=4M` on the Samsung 9100 PRO 4 TB (root, where the HF cache lives) | 10.0 to 10.3 GB/s |
 
-Figures are arithmetic from the assumptions above, not measurements. This session found the desktop GPU 0 busy (57 GB used by the live app) and read link state at idle (gen1 x16, which downshifts at idle), so measured bandwidth is still to be taken.
+The ceiling function takes these as inputs: `tokens_per_second_ceiling(host_gbs, nvme_gbs, resident_read_gbs)`.
 
-## GPU handoff (not run here: the user's app holds GPU 0, and GPU work stays off while it serves)
+## 27B FP8 (Qwen3.8-27B-FP8, 31.06 GB of weights), batch 1 decode and 2k prefill
 
-1. Wire a copy stream and a spare VRAM staging buffer into the loader; with a tiny fixture and `vram_budget` forcing 1 resident layer, assert logits bit-identical to the fully resident run.
-2. On GPU 1 under `~/.agents/bin/gpu-run 1 --`, run the 27B with `vram_budget` 12, 24, 48 GB and record tokens/s against the ceilings above.
-3. Measure `cudaMemcpyAsync` from pinned memory and `dd iflag=direct` on the model drive for the real link figures.
+`bench --runs 2 --vram-gb N` on GPU 1, 2048 token prompt, 128 new tokens, 3 alternating rounds, medians of 2 runs per round. Ceiling is `1 / max(streamed bytes / 57.8 GB/s, resident-speed time)`, resident speed taken from the 48.5 tok/s baseline.
+
+| vram_budget | Layers streamed | Streamed per token | Ceiling tok/s | Decode tok/s (3 rounds) | Reached | Prefill tok/s (3 rounds) |
+| --- | --- | --- | --- | --- | --- | --- |
+| fully resident | 0 | 0 | 48.5 | 48.7, 48.3, 48.4 | 100% | 1804, 1774, 1768 |
+| 24 GB | 21 of 64 | 8.01 GB | 7.2 | 7.1, 7.1, 7.1 | 98% | 1815, 1786, 1786 |
+| 12 GB | 52 of 64 | 19.83 GB | 2.9 | 2.9, 2.9, 2.9 | 100% | 1795, 1786, 1789 |
+
+Device memory with the 12 GB cap: 12.78 GB at load (weights, staging, KV, scratch), checked after the sweep with a 256 token prompt (2.9 tok/s again). The sweep rows were run before the allocator pool was trimmed after the spill, so their `peak_device` read 31.4 GB; throughput is unaffected.
+
+Streaming decode runs at the link ceiling: the copy of layer N+1 hides behind compute of layer N, and the link is the limit. Prefill is unaffected (about 1.78k tok/s in every row) because 2048 rows of compute per layer take longer than the copy.
+
+The 48 GB row of the plan is the resident row: the 27B FP8 fits 33 GB, so a 48 GB cap streams nothing.
+
+### Ceiling per format at batch 1
+
+Bytes per token over the measured 57.8 GB/s, for a 27B model with nothing resident (worst case) and with half resident:
+
+| Format | Weights | All streamed | Half resident |
+| --- | --- | --- | --- |
+| bf16 | 54 GB | 1.1 tok/s | 2.1 tok/s |
+| FP8 | 27 GB | 2.1 tok/s | 4.3 tok/s |
+| NVFP4 | 15 GB | 3.9 tok/s | 7.7 tok/s |
+
+From NVMe at 10 GB/s the same table divides by 5.8. Lower bits stream faster in proportion; speculative decoding (MTP) does not change bytes per step, so it multiplies tokens per streamed byte by the accepted draft length.
+
+## Design notes
+
+- Dense decode reads every layer once per token, so tok/s is bounded by link bandwidth over streamed bytes. Overlap is all the design can add, and the sweep shows it is complete.
+- Staging slots are reused round robin. A layer waits on an event recorded when its copy finishes; a slot is refilled only after an event recorded when the layer that last used it finished.
+- Pinned buffers come from `hostpool::HostPool`, the pool KV swap and session snapshots use.
+- The tiered store in `offload.rs` is the bookkeeping that the MoE expert cache will drive (pages keyed by layer and expert).
+
+## Tests
+
+- `cargo test -p inference-bench-specrt --lib offload` (CPU, 17 tests: residency, eviction under budget, prefetch order, no re-read of a resident page, throttled fake NVMe).
+- `tests/offload.rs` (GPU, `--include-ignored`): logits and per layer outputs bit identical to fully resident with 1 and 2 resident layers (3 layer, 4 layer and FP8 fixtures, slot reuse), identical greedy tokens, no streaming when the budget holds everything.
+- `core` render test and `server` config test for the metrics and the config table.
+
+## Not done here
+
+- NVMe tier on the GPU path (needs the I/O thread pool shared with KV offload and snapshots).
+- MoE expert cache and hotlist, CPU compute tier, Models page readout (filed as issues).

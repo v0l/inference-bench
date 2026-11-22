@@ -173,6 +173,11 @@ fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec,
         return Ok((None, Some(plan)));
     }
     let streamer = stream::Streamer::new(stream, layers, spilled, off.prefetch_depth)?;
+    ctx.synchronize()?;
+    unsafe {
+        let pool = cudarc::driver::result::device::get_default_mem_pool(ctx.cu_device())?;
+        cudarc::driver::result::mem_pool::trim_to(pool, 0)?;
+    }
     Ok((Some(streamer), Some(plan)))
 }
 
