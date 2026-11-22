@@ -805,6 +805,8 @@ pub struct Runtime {
     lm_head: DeviceMatrix,
     layers: Vec<DeviceLayer>,
     described: Vec<Option<DescribedLaunch>>,
+    scan_tile_off: std::sync::atomic::AtomicBool,
+    scan_launches: [std::sync::atomic::AtomicUsize; 3],
     scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
     int_scratch: std::collections::BTreeMap<String, CudaSlice<i32>>,
     buf: Buffers,
@@ -1261,6 +1263,8 @@ impl Runtime {
             lm_head,
             layers,
             described,
+            scan_launches: Default::default(),
+            scan_tile_off: Default::default(),
             scratch: spec
                 .attention
                 .scratch
@@ -1374,6 +1378,14 @@ impl Runtime {
 
     fn launcher<'a>(&'a self, f: &'a CudaFunction) -> crate::launch::Launch<'a> {
         crate::launch::Launch::new(&self.stream, f, self.pdl, self.sms * 8)
+    }
+
+    pub fn set_scan_tile(&self, on: bool) {
+        self.scan_tile_off.store(!on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn scan_launches(&self) -> [usize; 3] {
+        self.scan_launches.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn kernel(&self, name: &str) -> &CudaFunction {

@@ -155,8 +155,14 @@ impl Runtime {
             floats[i] = v as f32;
         }
         let a = &self.spec.attention;
-        let tiled = launch.tile && !self.spec.runtime.kv_dtype.is_fp8() && spec_node.grid.len() == 2 && spec_node.grid[0] == "heads" && spec_node.grid[1] == "rows" && a.heads / a.kv_heads <= 16;
+        let tiled = launch.tile && !self.scan_tile_off.load(std::sync::atomic::Ordering::Relaxed) && !self.spec.runtime.kv_dtype.is_fp8() && spec_node.grid.len() == 2 && spec_node.grid[0] == "heads" && spec_node.grid[1] == "rows" && a.heads / a.kv_heads <= 16;
         let tile_name = tiled.then(|| format!("{}{}", launch.name, if run.bb.is_none() { "_mma" } else { "_mma_dec" }));
+        let which = match (tiled, run.bb.is_none()) {
+            (true, true) => 0,
+            (true, false) => 1,
+            _ => 2,
+        };
+        self.scan_launches[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut b = match &tile_name {
             Some(n) => self.launcher(self.kernel(n)),
             None => self.launcher(self.kernel(launch.name)),
