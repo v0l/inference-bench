@@ -174,16 +174,40 @@ fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec,
         settings.host_budget = u64::MAX;
     }
     let plan = plan_layers(&sizes, always, &settings)?;
-    ensure!(plan.nvme_bytes == 0, "[runtime.offload] {} bytes of layers fit neither vram_budget nor host_budget, and the disk tier is not wired to the GPU path yet", plan.nvme_bytes);
+    let dir = match (&off.nvme_path, plan.nvme_bytes) {
+        (_, 0) => None,
+        (Some(p), _) => Some(std::path::PathBuf::from(p)),
+        (None, n) => anyhow::bail!("[runtime.offload] {n} bytes of layers fit neither vram_budget nor host_budget and nvme_path is not set"),
+    };
     let pool = crate::hostpool::HostPool::new(ctx.clone());
     let mut spilled = Vec::new();
-    for l in plan.layers.iter().filter(|l| l.tier == Tier::Host) {
-        spilled.push(stream::spill(stream, &pool, l.layer, &mut layers[l.layer])?);
+    let mut writer = None;
+    let mut disk_path = None;
+    if let Some(dir) = &dir {
+        std::fs::create_dir_all(dir)?;
+        crate::diskio::remove_stale(dir, "layers");
+        let path = crate::diskio::unique_path(dir, "layers");
+        disk_path = Some(path.clone());
+        writer = Some(crate::diskio::Appender::create(path)?);
+    }
+    for l in plan.layers.iter().filter(|l| l.tier != Tier::Vram) {
+        match (&mut writer, l.tier) {
+            (Some(w), Tier::Nvme) => spilled.push(stream::spill_to_disk(stream, &pool, w, l.layer, &mut layers[l.layer])?),
+            _ => spilled.push(stream::spill(stream, &pool, l.layer, &mut layers[l.layer])?),
+        }
     }
     if spilled.is_empty() {
         return Ok((None, Some(plan)));
     }
-    let streamer = stream::Streamer::new(stream, layers, spilled, off.prefetch_depth)?;
+    let disk = match (writer, disk_path) {
+        (Some(w), Some(path)) => {
+            w.finish()?;
+            let file: Arc<dyn crate::diskio::ReadAt> = Arc::new(crate::diskio::DirectFile::open(&path)?);
+            Some(stream::DiskTier::new(file, path))
+        }
+        _ => None,
+    };
+    let streamer = stream::Streamer::new(stream, layers, spilled, off.prefetch_depth, disk, &pool)?;
     ctx.synchronize()?;
     unsafe {
         let pool = cudarc::driver::result::device::get_default_mem_pool(ctx.cu_device())?;
@@ -215,7 +239,7 @@ fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: Sta
                     Some((w, cols)) => {
                         let cache = spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
                         let d = crate::nvfp4::quantize_rows_on_device(stream, &cache, &w, cols, spec.head_rows())?;
-                        Some(DeviceMatrix::Fp4 { packed: d.packed, scales: d.scales })
+                        Some(DeviceMatrix::Fp4 { packed: d.packed, scales: d.scales, act: false })
                     }
                     None => Some(DeviceMatrix::upload(stream, &ck.draft_head(spec, q)?)?),
                 }
@@ -354,7 +378,7 @@ enum DeviceMatrix {
     Bf16(CudaSlice<u16>),
     Q8 { values: CudaSlice<i8>, scales: CudaSlice<f32> },
     Fp8 { values: CudaSlice<u8>, scales: CudaSlice<f32> },
-    Fp4 { packed: CudaSlice<u8>, scales: CudaSlice<u8> },
+    Fp4 { packed: CudaSlice<u8>, scales: CudaSlice<u8>, act: bool },
     Ggml { data: CudaSlice<u8>, table: CudaSlice<u32> },
 }
 
@@ -372,6 +396,7 @@ impl DeviceMatrix {
             Matrix::Fp4(m) => DeviceMatrix::Fp4 {
                 packed: stream.clone_htod(m.packed.as_ref())?,
                 scales: stream.clone_htod(&m.device_scales())?,
+                act: m.input_global > 0.0,
             },
         })
     }
@@ -381,7 +406,7 @@ impl DeviceMatrix {
             DeviceMatrix::Bf16(w) => w.num_bytes(),
             DeviceMatrix::Q8 { values, scales } => values.num_bytes() + scales.num_bytes(),
             DeviceMatrix::Fp8 { values, scales } => values.num_bytes() + scales.num_bytes(),
-            DeviceMatrix::Fp4 { packed, scales } => packed.num_bytes() + scales.num_bytes(),
+            DeviceMatrix::Fp4 { packed, scales, .. } => packed.num_bytes() + scales.num_bytes(),
             DeviceMatrix::Ggml { data, table } => data.num_bytes() + table.num_bytes(),
         }) as u64
     }
@@ -402,7 +427,7 @@ impl DeviceMatrix {
             DeviceMatrix::Bf16(w) => b.arg(w).arg(dummy),
             DeviceMatrix::Q8 { values, scales } => b.arg(values).arg(scales),
             DeviceMatrix::Fp8 { values, scales } => b.arg(values).arg(scales),
-            DeviceMatrix::Fp4 { packed, scales } => b.arg(packed).arg(scales),
+            DeviceMatrix::Fp4 { packed, scales, .. } => b.arg(packed).arg(scales),
             DeviceMatrix::Ggml { data, table } => b.arg(data).arg(table),
         };
     }
@@ -1172,7 +1197,7 @@ impl Runtime {
         };
         let target = crate::codegen::cuda_target(&ctx)?;
         let sms = target.sm_count;
-        let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) || spec.draft_head_quant() == Some(crate::spec::Quant::Nvfp4G16) {
+        let f4b_part = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) || spec.serves_fp4_mlp() || !spec.requanted_linears().is_empty() || spec.draft_head_quant() == Some(crate::spec::Quant::Nvfp4G16) {
             stream.alloc_zeros(crate::gemm::batch_part_len(spec, &target, true))?
         } else {
             stream.alloc_zeros(1)?
@@ -1656,6 +1681,7 @@ impl Runtime {
 
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
         ensure!(self.head_part.is_none(), "a vocabulary sharded rank decodes through the plan, not the single stream step");
+        ensure!(self.spec.requanted_linears().is_empty(), "requantised attention and delta-net projections run on the plan decode path (the scheduler), not the single stream step");
         ensure!(self.spec.attention.node.is_empty() && self.spec.mixer.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "described attention, mixers, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
         let s = &self.spec;
         let a = &s.attention;
@@ -1775,7 +1801,7 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let choice = crate::codegen::select(&self.spec, &self.target, name, tokens, w.kind())?;
+        let choice = crate::codegen::select_act(&self.spec, &self.target, name, tokens, w.kind(), !matches!(w, DeviceMatrix::Fp4 { act: false, .. }))?;
         use crate::codegen::GemmPath;
         match (choice.path, &self.fp8_act, &self.fp4_act) {
             (GemmPath::F8a, Some(fa), _) => return self.tc_fp8(fa, &choice, w, bias, x, out, rows, tokens),
@@ -2058,7 +2084,7 @@ impl Runtime {
         rows: usize,
         tokens: usize,
     ) -> Result<()> {
-        let DeviceMatrix::Fp4 { packed, scales } = w else { unreachable!("tc_fp4 takes NVFP4 weights") };
+        let DeviceMatrix::Fp4 { packed, scales, .. } = w else { unreachable!("tc_fp4 takes NVFP4 weights") };
         let width = packed.len() * 2 / rows;
         let width_i = width as i32;
         let groups = width / crate::nvfp4::GROUP;

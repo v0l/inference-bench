@@ -22,7 +22,7 @@ struct Part {
 
 enum Backing {
     Pinned(PinnedBuf),
-    File { file: std::fs::File, path: std::path::PathBuf, len: u64 },
+    File { file: Arc<dyn crate::diskio::ReadAt>, path: std::path::PathBuf, len: u64 },
 }
 
 impl Drop for Backing {
@@ -48,8 +48,6 @@ impl ExpertStore {
         ExpertStore { pool, dir: dir.map(std::path::PathBuf::from) }
     }
 }
-
-static NEXT_FILE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(in crate::runtime) struct HostExperts {
     buf: Backing,
@@ -100,13 +98,15 @@ impl HostExperts {
                     return Err(e.context("expert pages exceed [runtime.offload] host_budget and nvme_path is not set"));
                 };
                 std::fs::create_dir_all(dir)?;
-                let path = dir.join(format!("experts-{}-{}.pages", std::process::id(), NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+                crate::diskio::remove_stale(dir, "experts");
+                let path = crate::diskio::unique_path(dir, "experts");
                 let mut f = std::fs::File::create(&path)?;
                 for c in flat() {
                     std::io::Write::write_all(&mut f, c)?;
                 }
+                f.sync_all()?;
                 drop(f);
-                Backing::File { file: std::fs::File::open(&path)?, path, len: total as u64 }
+                Backing::File { file: Arc::new(crate::diskio::DirectFile::open(&path)?), path, len: total as u64 }
             }
         };
         let ig = |s: &Stacked| if let Stacked::Fp4 { input_global, .. } = s { *input_global } else { 1.0 };
@@ -186,7 +186,6 @@ const BULK_MIN_EXPERTS: usize = 32;
 
 struct Staging {
     buf: Option<PinnedBuf>,
-    used: usize,
 }
 
 pub(in crate::runtime) struct Staged {
@@ -207,7 +206,7 @@ impl ExpertCache {
             slots,
             local,
             shared,
-            staging: Mutex::new(Staging { buf: None, used: 0 }),
+            staging: Mutex::new(Staging { buf: None }),
             staging_pool: HostPool::new(ctx.clone()),
             state: Mutex::new(State { book: SlotBook::new(slots, policy), last: vec![Vec::new(); layers], seen: ExpertHotlist::new(layers, local), prior }),
         })
@@ -231,6 +230,7 @@ impl ExpertCache {
 
     fn enqueue_all(&self, host: &HostExperts, copies: &mut Vec<(usize, usize)>, stats: &mut OffloadStats) -> Result<()> {
         copies.sort_unstable();
+        let mut runs = Vec::new();
         let mut i = 0;
         while i < copies.len() {
             let (entry, slot) = copies[i];
@@ -238,10 +238,69 @@ impl ExpertCache {
             while i + n < copies.len() && copies[i + n] == (entry + n, slot + n) {
                 n += 1;
             }
-            self.enqueue_run(host, entry, slot, n, stats)?;
+            runs.push((entry, slot, n));
             i += n;
         }
         copies.clear();
+        if let Backing::File { file, .. } = &host.buf {
+            return self.read_runs(file, host, &runs, stats);
+        }
+        for (entry, slot, n) in runs {
+            self.enqueue_run(host, entry, slot, n, stats)?;
+        }
+        Ok(())
+    }
+
+    fn read_runs(&self, file: &Arc<dyn crate::diskio::ReadAt>, host: &HostExperts, runs: &[(usize, usize, usize)], stats: &mut OffloadStats) -> Result<()> {
+        let mut st = self.staging.lock().unwrap();
+        let cap = (host.entry_bytes() * 64).max(64 << 20);
+        if st.buf.is_none() {
+            st.buf = Some(self.staging_pool.alloc(cap)?);
+        }
+        let mut jobs: Vec<(usize, usize, usize, usize)> = Vec::new();
+        for &(entry, slot, count) in runs {
+            for (pi, p) in host.parts.iter().enumerate() {
+                let step = (cap / p.per).max(1);
+                let mut done = 0;
+                while done < count {
+                    let take = step.min(count - done);
+                    jobs.push((pi, entry + done, slot + done, take));
+                    done += take;
+                }
+            }
+        }
+        let pool = crate::diskio::shared_pool();
+        let mut j = 0;
+        while j < jobs.len() {
+            self.copy.synchronize()?;
+            let base_ptr = st.buf.as_mut().unwrap().as_mut_slice()?.as_mut_ptr();
+            let mut at = 0;
+            let mut batch = Vec::new();
+            let mut tickets = Vec::new();
+            while j < jobs.len() {
+                let (pi, entry, slot, take) = jobs[j];
+                let p = &host.parts[pi];
+                let bytes = take * p.per;
+                if at + bytes > cap {
+                    break;
+                }
+                let t = unsafe { pool.read(file, (p.offset + entry * p.per) as u64, base_ptr.add(at), bytes) };
+                tickets.push(t);
+                batch.push((pi, slot, at, bytes));
+                at += bytes.next_multiple_of(4096);
+                j += 1;
+            }
+            for t in tickets {
+                t.wait()?;
+            }
+            let buf = st.buf.as_ref().unwrap().as_slice()?;
+            for (pi, slot, off, bytes) in batch {
+                let p = &host.parts[pi];
+                unsafe { cudarc::driver::result::memcpy_htod_async(self.addrs[pi] + (slot * p.per) as u64, &buf[off..off + bytes], self.copy.cu_stream()) }?;
+                stats.host_to_vram_bytes += bytes as u64;
+                stats.nvme_read_bytes += bytes as u64;
+            }
+        }
         Ok(())
     }
 
@@ -255,34 +314,7 @@ impl ExpertCache {
                     stats.host_to_vram_bytes += (p.per * count) as u64;
                 }
             }
-            Backing::File { file, .. } => {
-                use std::os::unix::fs::FileExt;
-                let mut st = self.staging.lock().unwrap();
-                let cap = (host.entry_bytes() * 32).max(1 << 20);
-                if st.buf.is_none() {
-                    st.buf = Some(self.staging_pool.alloc(cap)?);
-                }
-                for (p, base) in host.parts.iter().zip(&self.addrs) {
-                    let step = (cap / p.per).max(1);
-                    let mut done = 0;
-                    while done < count {
-                        let take = step.min(count - done);
-                        let bytes = take * p.per;
-                        if st.used + bytes > cap {
-                            self.copy.synchronize()?;
-                            st.used = 0;
-                        }
-                        let at = st.used;
-                        let dst = &mut st.buf.as_mut().unwrap().as_mut_slice()?[at..at + bytes];
-                        file.read_exact_at(dst, (p.offset + (entry + done) * p.per) as u64)?;
-                        unsafe { cudarc::driver::result::memcpy_htod_async(base + ((slot + done) * p.per) as u64, &*dst, self.copy.cu_stream()) }?;
-                        st.used += bytes;
-                        stats.host_to_vram_bytes += bytes as u64;
-                        stats.nvme_read_bytes += bytes as u64;
-                        done += take;
-                    }
-                }
-            }
+            Backing::File { file, .. } => self.read_runs(file, host, &[(entry, slot, count)], stats)?,
         }
         Ok(())
     }

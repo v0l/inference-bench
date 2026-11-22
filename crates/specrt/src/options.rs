@@ -34,6 +34,7 @@ impl Profile {
                 v.insert("runtime.prefix_cache.enabled".into(), json!(true));
             }
             Profile::LowMemory => {
+                v.insert("runtime.requant.mlp_tail".into(), json!("nvfp4_g16"));
                 v.insert("speculative.enabled".into(), json!(false));
                 v.insert("runtime.kv_dtype".into(), json!("fp8"));
                 v.insert("serve.max_num_seqs".into(), json!(2));
@@ -330,6 +331,12 @@ const META: &[Meta] = &[
     Meta { key: "runtime.kv_dtype", label: "kv cache type", group: Group::Runtime, help: "Precision of the KV cache. fp8 stores one byte per value with a scale per head and token, halving KV memory and attention reads against f16.", choices: &["f16", "fp8"], range: (0, 0) },
     Meta { key: "runtime.rope_extension.type", label: "context extension", group: Group::Runtime, help: "How the context is stretched past what the model was trained on. YaRN changes short context numerics slightly, so leave it off unless you need the length.", choices: &["yarn"], range: (0, 0) },
     Meta { key: "runtime.rope_extension.factor", label: "extension factor", group: Group::Runtime, help: "Multiplies the model's own maximum context, so 4 takes 262144 tokens to 1048576. 1 or auto keeps the trained length.", choices: &[], range: (1, 16) },
+    Meta { key: "runtime.requant.lin_in", label: "requant delta-net in", group: Group::Runtime, help: "Reformat the delta-net input projections at load. Auto keeps the checkpoint format.", choices: &["fp8_channel", "nvfp4_g16"], range: (0, 0) },
+    Meta { key: "runtime.requant.lin_out", label: "requant delta-net out", group: Group::Runtime, help: "Reformat the delta-net output projections at load. Auto keeps the checkpoint format.", choices: &["fp8_channel", "nvfp4_g16"], range: (0, 0) },
+    Meta { key: "runtime.requant.qkv", label: "requant qkv", group: Group::Runtime, help: "Reformat the attention q, k and v projections at load. Auto keeps the checkpoint format.", choices: &["fp8_channel", "nvfp4_g16"], range: (0, 0) },
+    Meta { key: "runtime.requant.o", label: "requant attention out", group: Group::Runtime, help: "Reformat the attention output projections at load. Auto keeps the checkpoint format.", choices: &["fp8_channel", "nvfp4_g16"], range: (0, 0) },
+    Meta { key: "runtime.requant.mlp_tail", label: "requant tail mlps", group: Group::Runtime, help: "Reformat the MLPs the checkpoint stores as FP8 (the last 8 layers of the 27B) at load. Auto keeps the checkpoint format.", choices: &["fp8_channel", "nvfp4_g16"], range: (0, 0) },
+    Meta { key: "runtime.requant.lm_head", label: "requant lm head", group: Group::Runtime, help: "Reformat the output head at load. Auto keeps the checkpoint format.", choices: QUANTS, range: (0, 0) },
     Meta { key: "runtime.cache_dir", label: "kernel cache", group: Group::Runtime, help: "Where compiled kernels are kept. Auto uses the user cache folder.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.cache_max_bytes", label: "kernel cache size", group: Group::Runtime, help: "Most bytes of compiled kernels to keep. The oldest are deleted after a new one is written. Auto keeps 4 GB.", choices: &[], range: (1, u64::MAX) },
     Meta { key: "runtime.compile_jobs", label: "compile jobs", group: Group::Runtime, help: "Threads NVRTC may use to compile one kernel module. Auto uses the CPU count, at most 8.", choices: &[], range: (1, 64) },
@@ -406,6 +413,7 @@ fn populated_runtime() -> RuntimeOptions {
         loader: LoaderOptions { enabled: true, direct: true, chunk_mb: 1, readers: 1, ahead: 1, workers: 1, lanes: 1, skip_cached: true, pinned: true, host_budget_mb: 64 },
         offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency, expert_slots: 3, hotlist: Some("x".into()) },
         vision: crate::spec::VisionOptions { precision: crate::vision_encoder::VisionPrecision::Exact, cache_mb: 1, max_batch: 1, pan_and_scan: false },
+        requant: crate::spec::Requant { lin_in: Some(Quant::Bf16), lin_out: Some(Quant::Bf16), qkv: Some(Quant::Bf16), o: Some(Quant::Bf16), mlp_tail: Some(Quant::Bf16), lm_head: Some(Quant::Bf16) },
     }
 }
 
@@ -566,6 +574,33 @@ mod tests {
         let changed = schema().iter().filter(|f| max.value(&f.key) != c.value(&f.key)).count();
         assert!(changed >= 9, "low memory changes only {changed} options");
         assert!(rt.graphs && rt.fuse);
+    }
+
+    #[test]
+    fn low_memory_requantises_the_tail_mlps_and_checkpoint_exact_is_one_override_away() {
+        let mut c = EngineChoice::default();
+        c.select(Profile::LowMemory);
+        let rt = c.apply(ServeOptions::default()).unwrap().runtime.unwrap();
+        assert_eq!(rt.requant.mlp_tail, Some(Quant::Nvfp4G16));
+        assert_eq!(rt.requant.lin_in, None);
+        assert!(c.is_default("runtime.requant.mlp_tail"));
+        c.set("runtime.requant.mlp_tail", Value::Null);
+        assert!(c.is_custom());
+        let exact = c.apply(ServeOptions::default()).unwrap().runtime.unwrap();
+        assert_eq!(exact.requant, crate::spec::Requant::default());
+        let max = EngineChoice::default().apply(ServeOptions::default()).unwrap().runtime.unwrap();
+        assert_eq!(max.requant, crate::spec::Requant::default());
+    }
+
+    #[test]
+    fn requant_options_are_listed_in_the_runtime_group_with_the_active_value() {
+        let fields: Vec<Field> = schema().into_iter().filter(|f| f.key.starts_with("runtime.requant.")).collect();
+        assert_eq!(fields.len(), 6);
+        assert!(fields.iter().all(|f| f.group == Group::Runtime && !f.label.is_empty() && !f.help.is_empty()));
+        let mut c = EngineChoice::default();
+        assert_eq!(c.value("runtime.requant.mlp_tail"), Value::Null);
+        c.select(Profile::LowMemory);
+        assert_eq!(c.value("runtime.requant.mlp_tail"), json!("nvfp4_g16"));
     }
 
     #[test]

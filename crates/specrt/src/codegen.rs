@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 pub use crate::gemm::{
     BATCH_MAX_TOKENS, BATCH_REDUCE_BLOCK, BATCH_VARIANTS, BatchShape, FP4_GEMV_THREADS, FP8_ACT_LINEARS, GDN_LINEARS, GGB_LINEARS,
     GGB_MIN_TOKENS, GGML_GEMV_THREADS, GemmPath, KernelChoice, MMA_LINEARS, MmaShape, ROWS_MAX_TOKENS, Tile, WeightFormat, WeightKind,
-    fp4_act_enabled, fp8_act_enabled, select, linear_dims, linear_shape,
+    fp4_act_enabled, fp8_act_enabled, select, select_act, linear_dims, linear_shape,
 };
 
 pub const MOE_KERNELS: &[&str] = kir::moe::Family::Experts.kernels();

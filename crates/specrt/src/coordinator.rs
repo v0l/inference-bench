@@ -12,6 +12,7 @@ pub struct Coordinator {
     base: PlacementConfig,
     key: Vec<u8>,
     timeout: Duration,
+    link: crate::rdma::LinkOptions,
     members: Membership,
     browser: Option<Browser>,
     epoch: Instant,
@@ -23,6 +24,10 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
+    pub fn set_link(&mut self, link: crate::rdma::LinkOptions) {
+        self.link = link;
+    }
+
     pub fn new(spec: &Spec, base: PlacementConfig, key: Vec<u8>, timeout: Duration, member_ttl: Duration) -> Result<Coordinator> {
         let browser = match base.discovery {
             crate::placement::Discovery::Mdns => Some(Browser::start_on(base.mdns_port, base.mdns_interface.as_deref())?),
@@ -34,6 +39,7 @@ impl Coordinator {
             base,
             key,
             timeout,
+            link: crate::rdma::LinkOptions::default(),
             members,
             browser,
             epoch: Instant::now(),
@@ -178,7 +184,7 @@ impl Coordinator {
             addrs.push(addr);
             ranges.push((s.start, s.end));
         }
-        self.chain = Some(Chain::connect_assigned(&addrs, &ranges, &self.key, self.timeout)?);
+        self.chain = Some(Chain::connect_assigned_with(&addrs, &ranges, &self.key, self.timeout, &self.link)?);
         Ok(())
     }
 

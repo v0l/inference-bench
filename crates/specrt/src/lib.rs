@@ -38,6 +38,7 @@ pub mod nvrtc;
 pub mod options;
 pub mod pairing;
 pub mod pipeline;
+pub mod diskio;
 pub mod hostpool;
 pub mod offload;
 pub mod plan;
@@ -59,6 +60,7 @@ pub mod state;
 pub mod vision;
 pub mod vision_encoder;
 pub mod weights;
+pub mod rdma;
 pub mod wire;
 
 pub use engine::Engine;

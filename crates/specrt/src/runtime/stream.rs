@@ -1,5 +1,6 @@
 use super::{DeviceAttn, DeviceDescribed, DeviceGdn, DeviceLayer, DeviceMatrix, DeviceMixer};
 use crate::hostpool::{HostPool, PinnedBuf};
+use crate::diskio::{Appender, IoPool, ReadAt, Ticket, round_up};
 use crate::offload::OffloadStats;
 use anyhow::Result;
 use cudarc::driver::sys::{CUdeviceptr, CUevent_flags};
@@ -36,7 +37,7 @@ impl DeviceMatrix {
             DeviceMatrix::Bf16(a) => w.slice(a),
             DeviceMatrix::Q8 { values, scales } => w.slice(values).and_then(|_| w.slice(scales)),
             DeviceMatrix::Fp8 { values, scales } => w.slice(values).and_then(|_| w.slice(scales)),
-            DeviceMatrix::Fp4 { packed, scales } => w.slice(packed).and_then(|_| w.slice(scales)),
+            DeviceMatrix::Fp4 { packed, scales, .. } => w.slice(packed).and_then(|_| w.slice(scales)),
             DeviceMatrix::Ggml { data, table } => w.slice(data).and_then(|_| w.slice(table)),
         }
     }
@@ -152,10 +153,42 @@ impl Walk for Detach<'_> {
     }
 }
 
+pub(super) enum Blob {
+    Host(PinnedBuf),
+    Disk { offset: u64, len: usize },
+}
+
+impl Blob {
+    fn len(&self) -> usize {
+        match self {
+            Blob::Host(b) => b.len(),
+            Blob::Disk { len, .. } => *len,
+        }
+    }
+}
+
 pub(super) struct Spilled {
     pub layer: usize,
-    pub blob: PinnedBuf,
+    pub blob: Blob,
     pub lens: Vec<usize>,
+}
+
+pub(super) struct DiskTier {
+    file: Arc<dyn ReadAt>,
+    pool: Arc<IoPool>,
+    path: std::path::PathBuf,
+}
+
+impl DiskTier {
+    pub(super) fn new(file: Arc<dyn ReadAt>, path: std::path::PathBuf) -> Self {
+        DiskTier { file, pool: crate::diskio::shared_pool(), path }
+    }
+}
+
+impl Drop for DiskTier {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 pub(super) fn spill(stream: &Arc<CudaStream>, pool: &HostPool, layer: usize, l: &mut DeviceLayer) -> Result<Spilled> {
@@ -165,7 +198,15 @@ pub(super) fn spill(stream: &Arc<CudaStream>, pool: &HostPool, layer: usize, l: 
     let mut sp = Spill { stream, blob: blob.as_mut_slice()?, at: 0, lens: Vec::new() };
     l.walk(&mut sp)?;
     let lens = sp.lens;
-    Ok(Spilled { layer, blob, lens })
+    Ok(Spilled { layer, blob: Blob::Host(blob), lens })
+}
+
+pub(super) fn spill_to_disk(stream: &Arc<CudaStream>, pool: &HostPool, writer: &mut Appender, layer: usize, l: &mut DeviceLayer) -> Result<Spilled> {
+    let s = spill(stream, pool, layer, l)?;
+    let Blob::Host(buf) = &s.blob else { unreachable!() };
+    let len = buf.len();
+    let offset = writer.append(buf.as_slice()?)?;
+    Ok(Spilled { layer, blob: Blob::Disk { offset, len }, lens: s.lens })
 }
 
 struct Slot {
@@ -173,6 +214,8 @@ struct Slot {
     copied: CudaEvent,
     released: CudaEvent,
     holds: Option<usize>,
+    staging: Option<PinnedBuf>,
+    pending: Option<(Ticket, usize)>,
 }
 
 struct State {
@@ -184,13 +227,14 @@ pub(super) struct Streamer {
     copy: Arc<CudaStream>,
     order: Vec<usize>,
     position: Vec<Option<usize>>,
-    blobs: Vec<Option<(PinnedBuf, Vec<usize>)>>,
+    blobs: Vec<Option<(Blob, Vec<usize>)>>,
+    disk: Option<DiskTier>,
     depth: usize,
     state: Mutex<State>,
 }
 
 impl Streamer {
-    pub(super) fn new(compute: &Arc<CudaStream>, layers: &mut [DeviceLayer], spilled: Vec<Spilled>, depth: usize) -> Result<Self> {
+    pub(super) fn new(compute: &Arc<CudaStream>, layers: &mut [DeviceLayer], spilled: Vec<Spilled>, depth: usize, disk: Option<DiskTier>, pool: &HostPool) -> Result<Self> {
         let ctx = compute.context().clone();
         let copy = ctx.new_stream()?;
         let mut order: Vec<usize> = spilled.iter().map(|s| s.layer).collect();
@@ -199,7 +243,7 @@ impl Streamer {
         for (k, &l) in order.iter().enumerate() {
             position[l] = Some(k);
         }
-        let mut blobs: Vec<Option<(PinnedBuf, Vec<usize>)>> = (0..layers.len()).map(|_| None).collect();
+        let mut blobs: Vec<Option<(Blob, Vec<usize>)>> = (0..layers.len()).map(|_| None).collect();
         let mut slot_bytes = 0;
         for s in spilled {
             slot_bytes = slot_bytes.max(s.blob.len());
@@ -207,8 +251,11 @@ impl Streamer {
         }
         let count = (depth + 1).min(order.len()).max(1);
         let mut slots = Vec::new();
+        let any_disk = blobs.iter().flatten().any(|(b, _)| matches!(b, Blob::Disk { .. }));
         for _ in 0..count {
             slots.push(Slot {
+                staging: if any_disk { Some(pool.alloc(round_up(slot_bytes))?) } else { None },
+                pending: None,
                 memory: compute.alloc_zeros::<u8>(slot_bytes.max(1))?,
                 copied: ctx.new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
                 released: ctx.new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
@@ -222,7 +269,7 @@ impl Streamer {
             let mut alias = Alias { stream: compute, base: ptr, at: 0, lens: lens.iter() };
             layers[l].walk(&mut alias)?;
         }
-        Ok(Streamer { copy, order, position, blobs, depth, state: Mutex::new(State { slots, stats: OffloadStats::default() }) })
+        Ok(Streamer { copy, order, position, blobs, disk, depth, state: Mutex::new(State { slots, stats: OffloadStats::default() }) })
     }
 
     pub(super) fn slot_bytes(&self) -> u64 {
@@ -241,14 +288,51 @@ impl Streamer {
     fn issue(&self, g: &mut State, layer: usize, slot: usize) -> Result<()> {
         let (blob, _) = self.blobs[layer].as_ref().expect("streamed layer has a blob");
         let s = &mut g.slots[slot];
+        match blob {
+            Blob::Host(buf) => {
+                if let Some((stale, _)) = s.pending.take() {
+                    stale.wait()?;
+                }
+                self.copy.wait(&s.released)?;
+                let (ptr, _sync) = s.memory.device_ptr(&self.copy);
+                let src = buf.as_slice()?;
+                unsafe { cudarc::driver::result::memcpy_htod_async(ptr, src, self.copy.cu_stream()) }?;
+                drop(_sync);
+                s.copied.record(&self.copy)?;
+                g.stats.host_to_vram_bytes += src.len() as u64;
+            }
+            Blob::Disk { offset, len } => {
+                let disk = self.disk.as_ref().expect("disk layers have a disk tier");
+                if let Some((stale, _)) = s.pending.take() {
+                    stale.wait()?;
+                }
+                s.copied.synchronize()?;
+                let staging = s.staging.as_mut().expect("disk layers have staging");
+                let dst = staging.as_mut_slice()?.as_mut_ptr();
+                s.pending = Some((unsafe { disk.pool.read(&disk.file, *offset, dst, round_up(*len)) }, *len));
+                g.stats.nvme_reads += 1;
+                g.stats.nvme_read_bytes += *len as u64;
+            }
+        }
+        s.holds = Some(layer);
+        Ok(())
+    }
+
+    fn finish(&self, g: &mut State, slot: usize, block: bool) -> Result<()> {
+        let s = &mut g.slots[slot];
+        let Some((ticket, len)) = s.pending.take() else { return Ok(()) };
+        if !block && !ticket.is_done() {
+            s.pending = Some((ticket, len));
+            return Ok(());
+        }
+        ticket.wait()?;
         self.copy.wait(&s.released)?;
         let (ptr, _sync) = s.memory.device_ptr(&self.copy);
-        let src = blob.as_slice()?;
+        let src = &s.staging.as_ref().expect("staging").as_slice()?[..len];
         unsafe { cudarc::driver::result::memcpy_htod_async(ptr, src, self.copy.cu_stream()) }?;
         drop(_sync);
         s.copied.record(&self.copy)?;
-        s.holds = Some(layer);
-        g.stats.host_to_vram_bytes += src.len() as u64;
+        g.stats.host_to_vram_bytes += len as u64;
         Ok(())
     }
 
@@ -266,6 +350,7 @@ impl Streamer {
             g.stats.host_hits += 1;
             self.issue(&mut g, layer, slot)?;
         }
+        self.finish(&mut g, slot, true)?;
         compute.wait(&g.slots[slot].copied)?;
         let len = self.order.len();
         for d in 1..=self.depth.min(len.saturating_sub(1)) {
@@ -277,6 +362,9 @@ impl Streamer {
                 continue;
             }
             self.issue(&mut g, next, next_slot)?;
+        }
+        for k in 0..g.slots.len() {
+            self.finish(&mut g, k, false)?;
         }
         Ok(())
     }

@@ -188,6 +188,65 @@ pub struct RuntimeOptions {
     pub vision: VisionOptions,
     #[serde(skip_serializing_if = "crate::offload::OffloadSettings::is_default")]
     pub offload: crate::offload::OffloadSettings,
+    #[serde(skip_serializing_if = "Requant::is_default")]
+    pub requant: Requant,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Requant {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lin_in: Option<Quant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lin_out: Option<Quant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qkv: Option<Quant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub o: Option<Quant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mlp_tail: Option<Quant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lm_head: Option<Quant>,
+}
+
+impl Requant {
+    pub const CLASSES: [&'static str; 6] = ["lin_in", "lin_out", "qkv", "o", "mlp_tail", "lm_head"];
+
+    pub fn is_default(&self) -> bool {
+        *self == Requant::default()
+    }
+
+    pub fn class(&self, linear: &str) -> Option<Quant> {
+        match linear {
+            "lin_in" => self.lin_in,
+            "lin_out" => self.lin_out,
+            "qkv" => self.qkv,
+            "o" => self.o,
+            "gate_up" | "down" | "mlp_tail" => self.mlp_tail,
+            "lm_head" => self.lm_head,
+            _ => None,
+        }
+    }
+
+    pub fn set(&mut self, class: &str, q: Option<Quant>) {
+        match class {
+            "lin_in" => self.lin_in = q,
+            "lin_out" => self.lin_out = q,
+            "qkv" => self.qkv = q,
+            "o" => self.o = q,
+            "mlp_tail" => self.mlp_tail = q,
+            _ => self.lm_head = q,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        for class in Self::CLASSES {
+            let Some(q) = self.class(class) else { continue };
+            let allowed: &[Quant] = if class == "lm_head" { &[Quant::Bf16, Quant::Fp8Channel, Quant::Nvfp4G16] } else { &[Quant::Fp8Channel, Quant::Nvfp4G16] };
+            ensure!(allowed.contains(&q), "[runtime.requant] {class} = {q:?} is not supported (use nvfp4_g16{})", if class == "lm_head" { ", fp8_channel or bf16" } else { " or fp8_channel" });
+        }
+        Ok(())
+    }
 }
 
 fn yes() -> bool {
@@ -275,7 +334,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, cache_max_bytes: None, compile_jobs: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default(), offload: crate::offload::OffloadSettings::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, cache_max_bytes: None, compile_jobs: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default(), offload: crate::offload::OffloadSettings::default(), requant: Requant::default() }
     }
 }
 
@@ -287,6 +346,7 @@ impl RuntimeOptions {
     fn validate(&self) -> Result<()> {
         self.prefix_cache.validate()?;
         self.loader.validate()?;
+        self.requant.validate()?;
         ensure!(self.vision.max_batch >= 1, "[runtime.vision] max_batch needs at least 1");
         ensure!(self.fp4_stages.is_none_or(|n| n >= 2), "[runtime] fp4_stages needs at least 2");
         ensure!(self.prefill_chunk.is_none_or(|n| n >= 64), "[runtime] prefill_chunk needs at least 64 tokens");
@@ -1979,7 +2039,7 @@ impl Spec {
     }
 
     pub fn lm_head_quant(&self) -> Quant {
-        match self.head_quant {
+        match self.runtime.requant.lm_head.or(self.head_quant) {
             Some(q) => q,
             None if self.quant == Quant::Gguf => Quant::Gguf,
             None if self.quant.quantised_checkpoint() => Quant::Bf16,
@@ -1999,6 +2059,29 @@ impl Spec {
             Some(q) if self.mlp.quant_until.is_none_or(|u| layer < u) => q,
             _ => self.quant,
         }
+    }
+
+    pub fn requanted(&self, linear: &str, stored: Quant) -> Quant {
+        match self.runtime.requant.class(linear) {
+            Some(Quant::Nvfp4G16) if stored.is_fp8() => Quant::Nvfp4G16,
+            _ => stored,
+        }
+    }
+
+    pub fn served_mlp_quant(&self, layer: usize) -> Quant {
+        self.requanted("mlp_tail", self.mlp_quant(layer))
+    }
+
+    pub fn requanted_linears(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = ["qkv", "o"].into_iter().filter(|l| self.requanted(l, self.quant) != self.quant).collect();
+        if self.linear_attention.is_some() {
+            out.extend(["lin_in", "lin_out"].into_iter().filter(|l| self.requanted(l, self.quant) != self.quant));
+        }
+        out
+    }
+
+    pub fn serves_fp4_mlp(&self) -> bool {
+        (0..self.layers.count).any(|i| self.served_mlp_quant(i) == Quant::Nvfp4G16)
     }
 
     pub fn stage(&self, start: usize, end: usize) -> Spec {
