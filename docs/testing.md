@@ -268,4 +268,4 @@ flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -q \
 
 ## Perf passes
 
-Speed per architecture, with nsys tables and llama.cpp and vLLM side by side, is `docs/perf-pass.md` and `crates/specrt/scripts/perfpass.sh`. The scoreboard is `docs/perf/scoreboard.md`.
+Speed per architecture, with nsys tables and llama.cpp and vLLM side by side, is `docs/perf-pass.md` and `crates/specrt/scripts/perfpass.sh`. The scoreboard is `docs/perf/scoreboard.md`. Keep/drop decisions use paired `bench --ab` and the claims table in `docs/specrt-scoreboard.md`.

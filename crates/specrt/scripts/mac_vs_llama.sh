@@ -11,7 +11,7 @@ fi
 source "$HOME/.cargo/env"
 export PATH=/opt/homebrew/bin:$PATH
 ROUNDS=${ROUNDS:-3}
-RUNS=${SPECRT_BENCH_RUNS:-3}
+RUNS=${RUNS:-3}
 MODELS=${MODELS-"Qwen3-0.6B-BF16 Qwen3-0.6B-Q4_K_M Llama-3.2-1B-Instruct-Q4_K_M"}
 LENS=${LENS:-128,1024,4096}
 BIG=${BIG:-Qwen2.5-7B-Instruct-Q4_K_M}
@@ -53,7 +53,7 @@ cold() {
 run_specrt() {
   cold
   local m=$1 tag=$2 runs=$3 lens=$4
-  SPECRT_BENCH_RUNS=$runs /usr/bin/time -l "$SRC/target/release/bench" --wgpu "$HOME/models/$m.gguf" "$lens" 128 > "$OUT/$tag.specrt.txt" 2>&1
+  /usr/bin/time -l "$SRC/target/release/bench" --wgpu --runs "$runs" "$HOME/models/$m.gguf" "$lens" 128 > "$OUT/$tag.specrt.txt" 2>&1
 }
 
 run_llama() {

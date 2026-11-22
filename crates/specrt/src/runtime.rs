@@ -2201,8 +2201,13 @@ impl Runtime {
         self.advance(sampling)?;
         self.stream.synchronize()?;
         let prefill_secs = started.elapsed().as_secs_f64();
-        let graph = self.capture(sampling)?;
-        graph.upload()?;
+        let graph = if self.spec.runtime.graphs {
+            let graph = self.capture(sampling)?;
+            graph.upload()?;
+            Some(graph)
+        } else {
+            None
+        };
         self.stream.synchronize()?;
         let started = Instant::now();
         let mut made = 1;
@@ -2223,7 +2228,13 @@ impl Runtime {
             }
             let step = if chunked { DECODE_CHUNK.min(new_tokens - made) } else { new_tokens - made };
             for _ in 0..step {
-                graph.launch()?;
+                match &graph {
+                    Some(graph) => graph.launch()?,
+                    None => {
+                        self.step()?;
+                        self.advance(sampling)?;
+                    }
+                }
             }
             made += step;
         }
