@@ -1328,9 +1328,10 @@ impl Checkpoint {
 
     pub fn mtp<'a>(&'a self, spec: &Spec) -> Result<MtpWeights<'a>> {
         let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
-        ensure!(self.has("mtp.fc.weight"), "the checkpoint has no mtp.* tensors");
+        let lay = spec.mtp_layout();
+        ensure!(self.has(&lay.fc), "the checkpoint has no {}", lay.fc);
         let bf16 = |r: Raw<'a>, what: &str| -> Result<Matrix<'a>> { r.dequantized().into_matrix(Quant::Bf16, what) };
-        let p = "mtp.layers.0";
+        let p = lay.layer.as_str();
         let attn = self.attention_as(spec, &format!("{p}.self_attn"), true, Block::Full)?;
         let sparse = spec.moe.is_some();
         let (gate_up, down, moe) = if sparse {
@@ -1343,9 +1344,9 @@ impl Checkpoint {
             (Raw::interleave(gate, up)?.into_matrix(Quant::Bf16, "mtp gate_up")?, bf16(down, "mtp down_proj")?, None)
         };
         Ok(MtpWeights {
-            fc: bf16(self.raw("mtp.fc.weight", h, 2 * h)?, "mtp.fc")?,
-            norm_embed: self.norm(spec, "mtp.pre_fc_norm_embedding.weight", h)?,
-            norm_hidden: self.norm(spec, "mtp.pre_fc_norm_hidden.weight", h)?,
+            fc: bf16(self.raw(&lay.fc, h, 2 * h)?, "mtp.fc")?,
+            norm_embed: self.norm(spec, &lay.norm_embed, h)?,
+            norm_hidden: self.norm(spec, &lay.norm_hidden, h)?,
             layer: Layer {
                 ln1: self.norm(spec, &format!("{p}.input_layernorm.weight"), h)?,
                 ln2: self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
@@ -1356,7 +1357,7 @@ impl Checkpoint {
                 down,
                 moe,
             },
-            norm: self.norm(spec, "mtp.norm.weight", h)?,
+            norm: self.norm(spec, &lay.norm, h)?,
         })
     }
 
@@ -1405,6 +1406,9 @@ impl Checkpoint {
     }
 
     pub fn draft_head(&self, spec: &Spec, quant: Quant) -> Result<Matrix<'_>> {
+        if let Some(name) = spec.mtp_layout().head {
+            return self.raw(&name, spec.dims.vocab, spec.dims.hidden)?.into_matrix(quant, "mtp lm_head");
+        }
         let embed = self.bf16(&format!("{}.embed_tokens.weight", self.root()), &[spec.dims.vocab, spec.dims.hidden])?;
         self.head_raw(spec, &embed)?.into_matrix(quant, "mtp lm_head")
     }

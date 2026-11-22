@@ -280,7 +280,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
             }
         }
     }
-    if la && spec.speculative().is_some() {
+    if spec.speculative().is_some() {
         for linear in crate::mtp::MTP_LINEARS {
             set.tiles(t, &format!("{linear}_mma"), linear_shape(spec, linear), WeightFormat::Bf16, split(spec, linear, WeightFormat::Bf16), false, &tuning)?;
         }
@@ -332,7 +332,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
         set.push(KernelInstance::fp4_head_norm(t, "lm_head_norm_f4", shape.n, shape.k))?;
         set.tiles(t, "lm_head_f4w", shape, WeightFormat::Fp4, true, false, &tuning)?;
     }
-    if la && let Some(q) = spec.draft_head_quant() {
+    if let Some(q) = spec.draft_head_quant() {
         let shape = linear_shape(spec, "lm_head");
         let (name, wf) = if q == Quant::Nvfp4G16 { ("mtp_head_f4w", WeightFormat::Fp4) } else { ("mtp_head_mma", weight_format(q)) };
         set.tiles(t, name, shape, wf, true, false, &tuning)?;

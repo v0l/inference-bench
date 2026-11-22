@@ -482,6 +482,8 @@ pub struct Family {
     #[serde(default)]
     pub mtp: bool,
     #[serde(default)]
+    pub mtp_layout: Option<crate::spec::MtpLayout>,
+    #[serde(default)]
     pub activation: FamilyActivation,
     #[serde(default)]
     pub dtypes: FamilyDtypes,

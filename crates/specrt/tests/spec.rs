@@ -710,6 +710,26 @@ fn glm4_5_air_reads_partial_rotary_sigmoid_routing_shared_expert_and_mtp_layer()
 }
 
 #[test]
+fn a_plain_attention_mtp_block_validates_only_with_a_layout() {
+    let mut s = derived("glm4.5-air.config.json");
+    assert!(s.linear_attention.is_none() && !s.attention.output_gate);
+    let m = s.mtp.clone().expect("the family names the nextn tensors");
+    assert!(m.layout.is_some());
+    s.validate().unwrap();
+    s.mtp.as_mut().unwrap().layout = None;
+    let err = s.validate().unwrap_err().to_string();
+    assert!(err.contains("[mtp.layout]"), "{err}");
+    let mut bad = derived("glm4.5-air.config.json");
+    bad.mtp.as_mut().unwrap().layout.as_mut().unwrap().fc = "fc".into();
+    assert!(bad.validate().unwrap_err().to_string().contains(".weight"));
+    let mut again = derived("glm4.5-air.config.json");
+    again.mtp.as_mut().unwrap().layout.as_mut().unwrap().norm = String::new();
+    assert!(again.validate().is_err());
+    let round = Spec::parse(&derived("glm4.5-air.config.json").to_toml().unwrap()).unwrap();
+    assert_eq!(round.mtp_layout().layer, "model.layers.46");
+}
+
+#[test]
 fn llama4_scout_describes_but_is_refused_for_serving_until_the_engine_has_its_blocks() {
     let json = std::fs::read_to_string(root().join("tests/fixtures/llama4-scout.config.json")).unwrap();
     let spec = Spec::describe_hf_config(&json).unwrap();
