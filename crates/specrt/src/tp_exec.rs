@@ -51,7 +51,7 @@ pub struct TpExecutor {
 }
 
 pub fn fabric_bytes(spec: &Spec, layout: &Layout) -> usize {
-    Runtime::chunk_rows(layout) * spec.dims.hidden * 4
+    (Runtime::chunk_rows(layout) * spec.dims.hidden).max(8 * spec.dims.vocab) * 4
 }
 
 impl TpExecutor {
@@ -165,6 +165,19 @@ impl TpExecutor {
 
     pub fn ranks(&self) -> usize {
         self.workers.len()
+    }
+
+    pub fn head_rows(&self) -> Result<Vec<std::ops::Range<usize>>> {
+        self.all(|r| {
+            let rows = r.rt.head_rows();
+            Ok(Reply::Tokens(vec![rows.start as u32, rows.end as u32]))
+        })?
+        .into_iter()
+        .map(|r| match r {
+            Reply::Tokens(v) => Ok(v[0] as usize..v[1] as usize),
+            _ => bail!("a rank sent no head rows"),
+        })
+        .collect()
     }
 
     pub fn all(&self, job: impl Fn(&mut Rank) -> Result<Reply> + Send + Sync + Clone + 'static) -> Result<Vec<Reply>> {

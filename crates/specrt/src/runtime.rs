@@ -168,7 +168,7 @@ fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: Sta
                 match on_device {
                     Some((w, cols)) => {
                         let cache = spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
-                        let d = crate::nvfp4::quantize_on_device(stream, &cache, &w, cols)?;
+                        let d = crate::nvfp4::quantize_rows_on_device(stream, &cache, &w, cols, spec.head_rows())?;
                         Some(DeviceMatrix::Fp4 { packed: d.packed, scales: d.scales })
                     }
                     None => Some(DeviceMatrix::upload(stream, &ck.draft_head(spec, q)?)?),
@@ -781,8 +781,11 @@ pub struct Runtime {
     media: Vec<Option<MediaDevice>>,
     vision: Option<Arc<crate::media_encode::MediaEncoder>>,
     partial: CudaSlice<f32>,
+    head_part: Option<CudaSlice<f32>>,
     comm: Option<crate::allreduce::Comm>,
 }
+
+const HEAD_PART_ROWS: usize = 64;
 
 struct MediaDevice {
     embeds: CudaSlice<f32>,
@@ -910,6 +913,10 @@ impl Runtime {
         self.comm.as_ref().map(|c| (c.ranks(), c.rank()))
     }
 
+    pub fn head_rows(&self) -> std::ops::Range<usize> {
+        self.spec.head_rows()
+    }
+
     fn load_inner(spec: &Spec, layout: Layout, range: StageRange, tp: Option<(usize, usize, &crate::allreduce::Fabric)>) -> Result<Self> {
         let resolved = crate::engine::apply_rope_extension(spec)?;
         range.check(&resolved)?;
@@ -936,7 +943,13 @@ impl Runtime {
         let cache_dir = spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
         let jit = Jit::new(ctx.clone(), cache_dir.clone())?;
         let comm = match tp {
-            Some((_, rank, fabric)) => Some(fabric.comm(rank, &stream, cache_dir, Some((spec.dims.hidden as u32, spec.norm.eps as f32)))?),
+            Some((n, rank, fabric)) => {
+                let gather = match &spec.dims.head_rows {
+                    Some(_) => Some((spec.dims.vocab as u32, crate::tp::vocab_each(spec.dims.vocab, n)? as u32)),
+                    None => None,
+                };
+                Some(fabric.comm(rank, &stream, cache_dir, Some((spec.dims.hidden as u32, spec.norm.eps as f32)), gather)?)
+            }
             None => None,
         };
         let target = crate::codegen::cuda_target(&ctx)?;
@@ -1123,6 +1136,10 @@ impl Runtime {
                 None => Plans::build(spec, use_mma).for_stage(role),
             },
             partial: stream.alloc_zeros(if tp.is_some() { chunk * d.hidden } else { 1 })?,
+            head_part: match (&spec.dims.head_rows, tp) {
+                (Some(_), Some((n, _, _))) => Some(stream.alloc_zeros(HEAD_PART_ROWS.max(crate::runtime::step::row_capacity(layout.slots) + 1).min(chunk) * crate::tp::vocab_each(d.vocab, n)?)?),
+                _ => None,
+            },
             comm,
             role,
             spec: spec.clone(),
@@ -1468,6 +1485,7 @@ impl Runtime {
     }
 
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
+        ensure!(self.head_part.is_none(), "a vocabulary sharded rank decodes through the plan, not the single stream step");
         ensure!(self.spec.attention.node.is_empty() && self.spec.mixer.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "described attention, mixers, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
         let s = &self.spec;
         let a = &s.attention;

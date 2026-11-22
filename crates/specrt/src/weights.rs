@@ -828,8 +828,26 @@ pub fn nvfp4_global_scale(w: &[u16]) -> f32 {
 }
 
 pub fn quantize_nvfp4(w: &[u16], cols: usize) -> crate::nvfp4::Fp4<'static> {
+    quantize_nvfp4_with(w, cols, nvfp4_global_scale(w))
+}
+
+fn head_rows_matrix<'a>(raw: Raw<'a>, quant: Quant, rows: std::ops::Range<usize>, what: &str) -> Result<Matrix<'a>> {
+    if rows.start == 0 && rows.end == raw.rows() {
+        return raw.into_matrix(quant, what);
+    }
+    ensure!(rows.end <= raw.rows(), "{what}: rows {rows:?} past its {} rows", raw.rows());
+    match raw {
+        Raw::Bf16 { w, cols } if quant == Quant::Nvfp4G16 => {
+            let global = nvfp4_global_scale(&w);
+            Ok(Matrix::Fp4(quantize_nvfp4_with(&w[rows.start * cols..rows.end * cols], cols, global)))
+        }
+        Raw::Bf16 { w: Cow::Borrowed(w), cols } => Raw::Bf16 { w: Cow::Borrowed(&w[rows.start * cols..rows.end * cols]), cols }.into_matrix(quant, what),
+        other => other.slice_rows(rows.start, rows.end).into_matrix(quant, what),
+    }
+}
+
+pub fn quantize_nvfp4_with(w: &[u16], cols: usize, global: f32) -> crate::nvfp4::Fp4<'static> {
     use crate::nvfp4::{Fp4, GROUP, f32_to_e2m1};
-    let global = nvfp4_global_scale(w);
     let mut packed = vec![0u8; w.len() / 2];
     let mut scales = vec![0u8; w.len() / GROUP];
     par_rows(w, cols, (&mut packed, cols / 2), (&mut scales, cols / GROUP), |row, out, row_scales| {
@@ -1413,7 +1431,7 @@ impl Checkpoint {
     fn head_from<'s>(&'s self, spec: &Spec, embed: &Cow<'s, [u16]>) -> Result<(Vec<f32>, Matrix<'s>)> {
         let d = &spec.dims;
         let norm = self.norm(spec, &format!("{}.norm.weight", self.root()), d.hidden)?;
-        let lm_head = self.head_raw(spec, embed)?.into_matrix(spec.lm_head_quant(), "lm_head")?;
+        let lm_head = head_rows_matrix(self.head_raw(spec, embed)?, spec.lm_head_quant(), spec.head_rows(), "lm_head")?;
         Ok((norm, lm_head))
     }
 
@@ -1438,10 +1456,10 @@ impl Checkpoint {
 
     pub fn draft_head(&self, spec: &Spec, quant: Quant) -> Result<Matrix<'_>> {
         if let Some(name) = spec.mtp_layout().head {
-            return self.raw(&name, spec.dims.vocab, spec.dims.hidden)?.into_matrix(quant, "mtp lm_head");
+            return head_rows_matrix(self.raw(&name, spec.dims.vocab, spec.dims.hidden)?, quant, spec.head_rows(), "mtp lm_head");
         }
         let embed = self.bf16(&format!("{}.embed_tokens.weight", self.root()), &[spec.dims.vocab, spec.dims.hidden])?;
-        self.head_raw(spec, &embed)?.into_matrix(quant, "mtp lm_head")
+        head_rows_matrix(self.head_raw(spec, &embed)?, quant, spec.head_rows(), "mtp lm_head")
     }
 }
 

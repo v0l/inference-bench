@@ -44,11 +44,56 @@ struct Group {
 }
 
 fn group(devices: &[usize], bytes: usize, force: Option<Transport>, norm: Option<(u32, f32)>) -> Group {
+    group_with(devices, bytes, force, norm, None)
+}
+
+fn group_with(devices: &[usize], bytes: usize, force: Option<Transport>, norm: Option<(u32, f32)>, gather: Option<(u32, u32)>) -> Group {
     let ctxs = contexts(devices).unwrap();
     let fabric = Fabric::new(&ctxs, bytes, force).unwrap();
     let streams: Vec<_> = ctxs.iter().map(|c| c.new_stream().unwrap()).collect();
-    let comms = streams.iter().enumerate().map(|(r, s)| fabric.comm(r, s, cache(), norm).unwrap()).collect();
+    let comms = streams.iter().enumerate().map(|(r, s)| fabric.comm(r, s, cache(), norm, gather).unwrap()).collect();
     Group { fabric, streams, comms }
+}
+
+fn run_gather(ranks: usize, vocab: usize, rows: usize, force: Option<Transport>) {
+    let d = gpu_ordinal();
+    let each = specrt::tp::vocab_each(vocab, ranks).unwrap();
+    let g = group_with(&vec![d; ranks], rows * each * 4, force, None, Some((vocab as u32, each as u32)));
+    let mut rng = Rng(vocab as u64 * 31 + rows as u64);
+    let full: Vec<f32> = (0..rows * vocab).map(|_| rng.float()).collect();
+    let mut bufs = Vec::new();
+    for r in 0..ranks {
+        let span = specrt::tp::vocab_span(vocab, ranks, r).unwrap();
+        let part: Vec<f32> = (0..rows).flat_map(|row| full[row * vocab + span.start..row * vocab + span.end].to_vec()).collect();
+        let s = &g.streams[r];
+        bufs.push((s.clone_htod(&part).unwrap(), s.alloc_zeros::<f32>(rows * vocab).unwrap()));
+    }
+    std::thread::scope(|s| {
+        for (r, b) in bufs.iter().enumerate() {
+            let (comm, stream) = (&g.comms[r], &g.streams[r]);
+            s.spawn(move || {
+                stream.context().bind_to_thread().unwrap();
+                comm.gather_rows(stream, &b.0.as_view(), &b.1.as_view(), rows).unwrap();
+                stream.synchronize().unwrap();
+            });
+        }
+    });
+    for r in 0..ranks {
+        let got = g.streams[r].clone_dtoh(&bufs[r].1).unwrap();
+        assert!(got.iter().zip(&full).all(|(a, b)| a.to_bits() == b.to_bits()), "rank {r} of {ranks}: gathered logits of {rows} rows x {vocab} differ");
+    }
+    std::fs::remove_dir_all(cache()).ok();
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_vocab_gather_rebuilds_every_row_on_every_rank() {
+    for (ranks, vocab) in [(2usize, 1024usize), (3, 1024), (3, 1001), (2, 248320)] {
+        for rows in [1usize, 3, 9] {
+            run_gather(ranks, vocab, rows, None);
+        }
+    }
+    run_gather(2, 1001, 4, Some(Transport::HostPinned));
 }
 
 fn raw_of(dtype: Dtype, v: &[f32]) -> Vec<u8> {

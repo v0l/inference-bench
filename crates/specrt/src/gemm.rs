@@ -134,7 +134,7 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
         "mtp_o" => (d.hidden, spec.q_dim(), Epilogue::Residual, false),
         "mtp_gate_up" => (2 * d.intermediate, d.hidden, Epilogue::Act, false),
         "mtp_down" => (d.hidden, d.intermediate, Epilogue::Residual, false),
-        _ => (d.vocab, d.hidden, Epilogue::Store, false),
+        _ => (spec.head_rows().len(), d.hidden, Epilogue::Store, false),
     };
     GemmShape::new(n, k, epi, bias).with_act(act(spec))
 }

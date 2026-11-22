@@ -114,9 +114,20 @@ pub fn quantize_on_device(
     w: &[u16],
     cols: usize,
 ) -> Result<DeviceFp4> {
+    quantize_rows_on_device(stream, cache_dir, w, cols, 0..w.len() / cols.max(1))
+}
+
+pub fn quantize_rows_on_device(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    cache_dir: &std::path::Path,
+    w: &[u16],
+    cols: usize,
+    rows: std::ops::Range<usize>,
+) -> Result<DeviceFp4> {
     use anyhow::Context;
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     ensure!(cols.is_multiple_of(GROUP) && w.len().is_multiple_of(cols), "nvfp4 rows must be a multiple of {GROUP} wide");
+    ensure!(rows.start <= rows.end && rows.end * cols <= w.len(), "rows {rows:?} past the {} row matrix", w.len() / cols);
     let ctx = stream.context();
     let (major, minor) = ctx.compute_capability()?;
     let arch: &'static str = Box::leak(format!("compute_{major}{minor}").into_boxed_str());
@@ -140,16 +151,18 @@ pub fn quantize_on_device(
     let quant_kernel = module.load_function("nvfp4_quantize").context("nvfp4_quantize")?;
     let dev_w = stream.clone_htod(w)?;
     let mut amax = stream.alloc_zeros::<u32>(1)?;
-    let groups = w.len() / GROUP;
-    let mut packed = stream.alloc_zeros::<u8>(w.len() / 2)?;
+    let len = rows.len() * cols;
+    let groups = len / GROUP;
+    let mut packed = stream.alloc_zeros::<u8>(len / 2)?;
     let mut scales = stream.alloc_zeros::<u8>(SCALE_HEADER + groups)?;
     let n = w.len() as u64;
     let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
     let amax_cfg = LaunchConfig { grid_dim: (sms * 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
     unsafe { stream.launch_builder(&amax_kernel).arg(&dev_w).arg(&n).arg(&mut amax).launch(amax_cfg) }?;
     let g = groups as u64;
-    let cfg = LaunchConfig { grid_dim: (groups.div_ceil(128) as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
-    unsafe { stream.launch_builder(&quant_kernel).arg(&dev_w).arg(&g).arg(&amax).arg(&mut packed).arg(&mut scales).launch(cfg) }?;
+    let cfg = LaunchConfig { grid_dim: (groups.div_ceil(128).max(1) as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let part = dev_w.slice(rows.start * cols..rows.end * cols);
+    unsafe { stream.launch_builder(&quant_kernel).arg(&part).arg(&g).arg(&amax).arg(&mut packed).arg(&mut scales).launch(cfg) }?;
     Ok(DeviceFp4 { packed, scales })
 }
 

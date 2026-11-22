@@ -468,6 +468,9 @@ impl Runtime {
 
     fn linear_op(&self, weight: Weight, input: Buf, output: Buf, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
         let (w, bias) = self.weight_of(weight, layer);
+        if matches!(weight, Weight::LmHead | Weight::MtpHead) && let Some(part) = &self.head_part {
+            return self.sharded_head(weight, w, input, output, part, run);
+        }
         let rows = weight.rows(&self.spec);
         let hidden = self.spec.dims.hidden;
         let head = weight == Weight::LmHead;
@@ -490,6 +493,26 @@ impl Runtime {
             return self.gemm(&name, w, bias, &view, out, rows, tokens);
         }
         self.gemm(&name, w, bias, &x.as_view(), out, rows, tokens)
+    }
+
+    fn sharded_head(&self, weight: Weight, w: &DeviceMatrix, input: Buf, output: Buf, part: &CudaSlice<f32>, run: &Run) -> Result<()> {
+        anyhow::ensure!(Self::is_planes(input), "a vocabulary sharded head reads the tensor core planes");
+        let comm = self.comm();
+        let (hidden, vocab, own) = (self.spec.dims.hidden, self.spec.dims.vocab, self.spec.head_rows().len());
+        let each = comm.gather_each().context("a vocabulary sharded head needs the gather kernel")?;
+        let tokens = if weight == Weight::LmHead { run.rows.len() } else { run.n };
+        let batch = (part.len() / each).min(comm.capacity_bytes() / (each * 4)).max(1);
+        let planes = self.planes(input);
+        let out = self.f32_buf(output, run);
+        let name = if weight == Weight::MtpHead { self.mtp_head_kernel() } else { weight.name() };
+        let mut at = 0;
+        while at < tokens {
+            let n = (tokens - at).min(batch);
+            self.tc(name, w, None, planes.rows(at, at + n, hidden), GemmOut::F32(part), own, n)?;
+            comm.gather_rows(&self.stream, &part.slice(..n * own), &out.slice(at * vocab..(at + n) * vocab), n)?;
+            at += n;
+        }
+        Ok(())
     }
 
     fn qk_rope_legacy(&self, l: &DeviceAttn, n: usize) -> Result<()> {
