@@ -496,7 +496,7 @@ impl Gguf {
             quant,
             head_quant: None,
             act_quant: ActQuant::None,
-            dims: Dims { hidden, intermediate, vocab, tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None },
+            dims: Dims { hidden, intermediate, vocab, tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None, head_rows: None },
             layers: Layers { count: layers, pattern, window: None, split: false },
             norm: Norm { kind: NormKind::Rmsnorm, eps, unit_offset: false, sandwich: false, pre: true, residual_scale: None },
             attention: Attention {

@@ -35,6 +35,7 @@ pub enum Mode {
     OneShot,
     TwoShot,
     AddRmsNorm { width: u32, eps: f32 },
+    Gather { width: u32, each: u32 },
 }
 
 impl Mode {
@@ -43,8 +44,14 @@ impl Mode {
             Mode::OneShot => "one_shot",
             Mode::TwoShot => "two_shot",
             Mode::AddRmsNorm { .. } => "add_rmsnorm",
+            Mode::Gather { .. } => "gather",
         }
     }
+}
+
+pub fn gather_span(width: u32, each: u32, rank: u32) -> std::ops::Range<u32> {
+    let lo = (rank * each).min(width);
+    lo..(lo + each).min(width)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +117,14 @@ impl AllReduceKernel {
                 return bad("the fused norm reduces f32 partials".into());
             }
         }
+        if let Mode::Gather { width, each } = self.mode {
+            if width == 0 || each == 0 || each * self.ranks < width || each * (self.ranks - 1) >= width {
+                return bad(format!("a gather of {width} columns in slices of {each} leaves a rank with nothing or misses a column"));
+            }
+            if self.dtype != Dtype::F32 {
+                return bad("the gather moves f32 logits".into());
+            }
+        }
         Ok(())
     }
 
@@ -125,6 +140,9 @@ impl AllReduceKernel {
         );
         if let Mode::AddRmsNorm { width, eps } = self.mode {
             s.push_str(&format!(" width={width} eps={}", lit(eps)));
+        }
+        if let Mode::Gather { width, each } = self.mode {
+            s.push_str(&format!(" width={width} each={each}"));
         }
         s
     }

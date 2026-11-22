@@ -286,7 +286,7 @@ impl Fabric {
         self.capacity_bytes
     }
 
-    pub fn comm(&self, rank: usize, stream: &Arc<CudaStream>, cache_dir: std::path::PathBuf, norm: Option<(u32, f32)>) -> Result<Comm> {
+    pub fn comm(&self, rank: usize, stream: &Arc<CudaStream>, cache_dir: std::path::PathBuf, norm: Option<(u32, f32)>, gather: Option<(u32, u32)>) -> Result<Comm> {
         ensure!(rank < self.ranks(), "rank {rank} outside {}", self.ranks());
         ensure!(stream.context().ordinal() == self.ctxs[rank].ordinal(), "rank {rank} stream is on the wrong device");
         let target = cuda_target(&self.ctxs[rank])?;
@@ -301,6 +301,9 @@ impl Fabric {
         if let Some((width, eps)) = norm {
             kernels.push(AllReduceKernel::new(&target, n, Dtype::F32, Mode::AddRmsNorm { width, eps }, blocks).map_err(anyhow::Error::msg)?);
         }
+        if let Some((width, each)) = gather {
+            kernels.push(AllReduceKernel::new(&target, n, Dtype::F32, Mode::Gather { width, each }, blocks).map_err(anyhow::Error::msg)?);
+        }
         let source = kir::cuda::emit_allreduce(&kernels).map_err(anyhow::Error::msg)?;
         let names: Vec<&'static str> = kernels.iter().map(|k| &*Box::leak(k.name().into_boxed_str())).collect();
         let module = Module { source, kernels: names.clone(), smem: BTreeMap::new(), arch_features: false, kir_hash: allreduce_hash(&kernels) };
@@ -311,7 +314,7 @@ impl Fabric {
         }
         let table = stream.clone_htod(&self.table)?;
         stream.synchronize()?;
-        Ok(Comm { rank, ranks: self.ranks(), table, functions, blocks, capacity_bytes: self.capacity_bytes, _owned: self.owned.clone(), norm })
+        Ok(Comm { rank, ranks: self.ranks(), table, functions, blocks, capacity_bytes: self.capacity_bytes, _owned: self.owned.clone(), norm, gather })
     }
 }
 
@@ -324,11 +327,13 @@ pub struct Comm {
     capacity_bytes: usize,
     _owned: Vec<Arc<Owned>>,
     norm: Option<(u32, f32)>,
+    gather: Option<(u32, u32)>,
 }
 
 fn kernel_name(mode: Mode, dtype: Dtype) -> String {
     match mode {
         Mode::AddRmsNorm { .. } => "ar_add_rmsnorm_f32".into(),
+        Mode::Gather { .. } => "ar_gather_f32".into(),
         m => format!("ar_{}_{}", m.tag(), dtype.tag()),
     }
 }
@@ -344,6 +349,27 @@ impl Comm {
 
     pub fn has_norm(&self) -> bool {
         self.norm.is_some()
+    }
+
+    pub fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+
+    pub fn gather_each(&self) -> Option<usize> {
+        self.gather.map(|(_, each)| each as usize)
+    }
+
+    pub fn gather_rows(&self, stream: &Arc<CudaStream>, part: &CudaView<f32>, out: &CudaView<f32>, rows: usize) -> Result<()> {
+        let (width, each) = self.gather.ok_or_else(|| anyhow::anyhow!("this rank has no gather kernel"))?;
+        self.check(rows * each as usize * 4)?;
+        let own = kir::allreduce::gather_span(width, each, self.rank as u32).len();
+        ensure!(part.len() >= rows * own && out.len() >= rows * width as usize, "gather of {rows} rows does not fit its buffers");
+        let (f, threads) = self.function("ar_gather_f32")?;
+        let mut b = stream.launch_builder(f);
+        let (rank, count) = (self.rank as i32, rows as i32);
+        b.arg(part).arg(out).arg(&self.table).arg(&rank).arg(&count);
+        unsafe { b.launch(self.launch_config(*threads)) }?;
+        Ok(())
     }
 
     fn function(&self, name: &str) -> Result<&(CudaFunction, u32)> {

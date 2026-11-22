@@ -533,6 +533,8 @@ pub struct Dims {
     pub logit_softcap: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logit_scale: Option<f64>,
+    #[serde(skip)]
+    pub head_rows: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1737,6 +1739,7 @@ impl Spec {
                     .or(multiplier(&family.multipliers.embedding)),
                 logit_softcap: hf.final_logit_softcapping,
                 logit_scale: multiplier(&family.multipliers.logits_divisor).filter(|d| *d > 0.0).map(|d| 1.0 / d),
+                head_rows: None,
             },
             layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern, split: family.blocks.split },
             norm: Norm {
@@ -1961,6 +1964,10 @@ impl Spec {
             }
         }
         Ok(())
+    }
+
+    pub fn head_rows(&self) -> std::ops::Range<usize> {
+        self.dims.head_rows.clone().unwrap_or(0..self.dims.vocab)
     }
 
     pub fn lm_head_quant(&self) -> Quant {

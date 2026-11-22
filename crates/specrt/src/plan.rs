@@ -110,7 +110,7 @@ impl Weight {
             Weight::LinBa => la.map_or(0, |l| l.ba_rows()),
             Weight::MixIn => spec.mix_in_rows(),
             Weight::MixOut => spec.dims.hidden,
-            Weight::LmHead | Weight::MtpHead => spec.dims.vocab,
+            Weight::LmHead | Weight::MtpHead => spec.head_rows().len(),
         }
     }
 

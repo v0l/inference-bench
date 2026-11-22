@@ -69,9 +69,39 @@ fn split_even(len: usize, tp: usize, rank: usize) -> Result<Range<usize>> {
     Ok(rank * each..(rank + 1) * each)
 }
 
-fn split_ceil(len: usize, tp: usize, rank: usize) -> Range<usize> {
-    let each = len.div_ceil(tp);
-    (rank * each).min(len)..((rank + 1) * each).min(len)
+pub const VOCAB_ROW_ALIGN: usize = 16;
+
+pub fn vocab_each(vocab: usize, tp: usize) -> Result<usize> {
+    ensure!(tp >= 1, "tp must be at least 1");
+    let each = vocab.div_ceil(tp).next_multiple_of(VOCAB_ROW_ALIGN);
+    ensure!(tp == 1 || each * (tp - 1) < vocab, "a vocabulary of {vocab} leaves the last of {tp} ranks no rows in slices of {each}");
+    Ok(each)
+}
+
+pub fn vocab_span(vocab: usize, tp: usize, rank: usize) -> Result<Range<usize>> {
+    ensure!(rank < tp, "rank {rank} outside tp {tp}");
+    let each = vocab_each(vocab, tp)?;
+    let lo = (rank * each).min(vocab);
+    Ok(lo..(lo + each).min(vocab))
+}
+
+pub fn head_shard() -> Result<Shard> {
+    let shards = crate::graph::Graph::decoder().shards()?;
+    let head = shards.get("lm_head").copied().unwrap_or(Shard::Replicate);
+    let draft = shards.get("mtp_head").copied().unwrap_or(head);
+    ensure!(head == draft, "lm_head shards as {head:?} and mtp_head as {draft:?}; the draft head reads the same rows, so they must match");
+    Ok(head)
+}
+
+pub fn head_split(spec: &Spec, tp: usize) -> Result<Option<usize>> {
+    if tp <= 1 || head_shard()? != Shard::Vocab {
+        return Ok(None);
+    }
+    let Ok(each) = vocab_each(spec.dims.vocab, tp) else { return Ok(None) };
+    let last = spec.dims.vocab - each * (tp - 1);
+    let fp4 = spec.lm_head_quant() == crate::spec::Quant::Nvfp4G16 || spec.draft_head_quant() == Some(crate::spec::Quant::Nvfp4G16);
+    let per_row = if fp4 { FP4_GROUP } else { 2 };
+    Ok(last.is_multiple_of(per_row).then_some(each))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,7 +145,7 @@ pub fn slice_of(spec: &Spec, weight: &str, shard: Shard, tp: usize, rank: usize)
             let cols = split_even(l.cols, tp, rank).map_err(|e| anyhow::anyhow!("{weight}: {e}"))?;
             Ok(Slice { rows: one(0..total), cols })
         }
-        Shard::Vocab => Ok(Slice { rows: vec![split_ceil(total, tp, rank)], cols: 0..l.cols }),
+        Shard::Vocab => Ok(Slice { rows: vec![vocab_span(total, tp, rank)?], cols: 0..l.cols }),
         Shard::Replicate => unreachable!(),
     }
 }
@@ -254,6 +284,9 @@ pub fn rank_spec_of(spec: &Spec, tp: usize, rank: usize) -> Result<Spec> {
     s.attention.heads = h.attention;
     s.attention.kv_heads = h.kv;
     s.dims.intermediate = spec.dims.intermediate / tp;
+    if head_split(spec, tp)?.is_some() {
+        s.dims.head_rows = Some(vocab_span(spec.dims.vocab, tp, rank)?);
+    }
     if let Some(m) = s.moe.as_mut() {
         match plan_moe(spec, m, tp)?.split {
             MoeSplit::Columns => {
@@ -570,6 +603,35 @@ mod tests {
     }
 
     #[test]
+    fn each_rank_loads_the_matching_rows_of_the_head_and_the_draft_head() {
+        use crate::spec::Quant;
+        use crate::weights::Matrix;
+        const MTP_FIXTURE: &str = "tiny-qwen3.5-mtp";
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(MTP_FIXTURE);
+        let mut s = spec(&format!("{MTP_FIXTURE}/config.json"));
+        s.repo = dir.display().to_string();
+        let ck = crate::weights::Checkpoint::for_repo(&s.repo).unwrap().renamed(&s.tensors);
+        let (_, whole) = ck.head(&s).unwrap();
+        let Matrix::Bf16(whole) = whole else { panic!("the fixture head is bf16") };
+        let fp4_whole = ck.draft_head(&s, Quant::Nvfp4G16).unwrap();
+        let Matrix::Fp4(fp4_whole) = fp4_whole else { panic!("nvfp4 draft head") };
+        let h = s.dims.hidden;
+        for tp in [2usize] {
+            for rank in 0..tp {
+                let r = rank_spec_of(&s, tp, rank).unwrap();
+                let rows = r.head_rows();
+                let (_, part) = ck.head(&r).unwrap();
+                let Matrix::Bf16(part) = part else { panic!("bf16") };
+                assert_eq!(part.as_ref(), &whole[rows.start * h..rows.end * h], "tp {tp} rank {rank}: lm_head rows {rows:?}");
+                let Matrix::Fp4(f) = ck.draft_head(&r, Quant::Nvfp4G16).unwrap() else { panic!("nvfp4") };
+                assert_eq!(f.global, fp4_whole.global, "tp {tp} rank {rank}: the global scale comes from the whole head");
+                assert_eq!(f.packed.as_ref(), &fp4_whole.packed[rows.start * h / 2..rows.end * h / 2], "tp {tp} rank {rank}: packed rows");
+                assert_eq!(f.scales.as_ref(), &fp4_whole.scales[rows.start * h / 16..rows.end * h / 16], "tp {tp} rank {rank}: group scales");
+            }
+        }
+    }
+
+    #[test]
     fn moe_fixtures_cut_every_expert_and_leave_the_router_whole() {
         for f in ["tiny-qwen3.5-moe", "tiny-qwen3.5-moe-fp8"] {
             let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(f);
@@ -656,7 +718,7 @@ mod tests {
     #[test]
     fn every_linear_node_declares_how_it_shards() {
         let shards = crate::graph::Graph::decoder().shards().unwrap();
-        for (w, s) in [("qkv", Shard::Column), ("o", Shard::Row), ("gate_up", Shard::Column), ("down", Shard::Row), ("lin_in", Shard::Column), ("lin_ba", Shard::Column), ("lin_out", Shard::Row), ("lm_head", Shard::Replicate), ("mtp_qkv", Shard::Column), ("mtp_down", Shard::Row), ("mtp_fc", Shard::Replicate), ("mtp_head", Shard::Replicate)] {
+        for (w, s) in [("qkv", Shard::Column), ("o", Shard::Row), ("gate_up", Shard::Column), ("down", Shard::Row), ("lin_in", Shard::Column), ("lin_ba", Shard::Column), ("lin_out", Shard::Row), ("lm_head", Shard::Vocab), ("mtp_qkv", Shard::Column), ("mtp_down", Shard::Row), ("mtp_fc", Shard::Replicate), ("mtp_head", Shard::Vocab)] {
             assert_eq!(shards[w], s, "{w}");
         }
     }
@@ -720,6 +782,48 @@ mod tests {
         let parts: Vec<_> = (0..3).map(|r| slice_of(&s, "lm_head", Shard::Vocab, 3, r).unwrap().row_count()).collect();
         assert_eq!(parts.iter().sum::<usize>(), s.dims.vocab);
         assert!(parts[2] <= parts[0]);
+    }
+
+    #[test]
+    fn vocab_slices_are_aligned_tile_the_vocabulary_and_refuse_an_empty_rank() {
+        assert_eq!(vocab_each(248320, 2).unwrap(), 124160);
+        let spans: Vec<_> = (0..3).map(|r| vocab_span(1024, 3, r).unwrap()).collect();
+        assert_eq!(spans, vec![0..352, 352..704, 704..1024]);
+        let spans: Vec<_> = (0..3).map(|r| vocab_span(1000, 3, r).unwrap()).collect();
+        assert_eq!(spans, vec![0..336, 336..672, 672..1000]);
+        assert!(vocab_each(32, 3).is_err());
+        assert_eq!(vocab_span(512, 1, 0).unwrap(), 0..512);
+    }
+
+    #[test]
+    fn rank_specs_own_their_vocabulary_rows_and_keep_the_full_vocabulary() {
+        let s = spec("tiny-qwen3.5-27b/config.json");
+        assert_eq!(s.head_rows(), 0..s.dims.vocab);
+        let r: Vec<_> = (0..2).map(|k| rank_spec_of(&s, 2, k).unwrap()).collect();
+        assert_eq!(r[0].head_rows(), 0..512);
+        assert_eq!(r[1].head_rows(), 512..1024);
+        for k in &r {
+            assert_eq!(k.dims.vocab, s.dims.vocab);
+            assert_eq!(crate::gemm::linear_shape(k, "lm_head").n, 512);
+            assert_eq!(crate::gemm::linear_shape(k, "mtp_head").n, 512);
+            assert_eq!(crate::plan::Weight::LmHead.rows(k), 512);
+        }
+        assert_eq!(rank_spec_of(&s, 1, 0).unwrap().dims.head_rows, None);
+        let mut odd = s.clone();
+        odd.mtp = None;
+        odd.dims.vocab = 1000;
+        assert_eq!(head_split(&odd, 3).unwrap(), Some(336));
+        odd.dims.vocab = 1001;
+        assert_eq!(head_split(&odd, 3).unwrap(), None, "an odd last slice of 329 rows keeps the head whole");
+        odd.dims.vocab = 1000;
+        odd.head_quant = Some(crate::spec::Quant::Nvfp4G16);
+        assert_eq!(head_split(&odd, 3).unwrap(), None, "a last nvfp4 slice of 328 rows keeps the head whole");
+        let mut wide = spec("tiny-phi3/config.json");
+        wide.attention.heads = 6;
+        wide.attention.kv_heads = 3;
+        wide.dims.intermediate = 288;
+        wide.dims.vocab = 1024;
+        assert_eq!(rank_spec_of(&wide, 3, 2).unwrap().dims.head_rows, Some(704..1024));
     }
 
     #[test]
