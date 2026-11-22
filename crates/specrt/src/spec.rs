@@ -1621,6 +1621,10 @@ impl Spec {
                 let mut dense = hf.mlp_only_layers.clone();
                 dense.extend(dense_types.iter().copied());
                 dense.extend(0..hf.first_k_dense_replace.unwrap_or(0));
+                if let Some(sparse) = family.blocks.sparse_layers_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()) {
+                    let sparse: Vec<usize> = sparse.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect();
+                    dense.extend((0..hf.num_hidden_layers).filter(|l| !sparse.contains(l)));
+                }
                 dense.sort_unstable();
                 dense.dedup();
                 Some(Moe {
@@ -1662,7 +1666,7 @@ impl Spec {
             act_quant: act,
             dims: Dims {
                 hidden: hf.hidden_size,
-                intermediate: hf.intermediate_size.or_else(|| {
+                intermediate: family.mlp.dense_intermediate_key.as_deref().and_then(|k| value.get(k)?.as_u64()).map(|n| n as usize).or(hf.intermediate_size).or_else(|| {
                     let m = moe.as_ref().filter(|_| strict)?;
                     Some(if m.shared_intermediate > 0 { m.shared_intermediate } else { m.expert_intermediate })
                 }).unwrap_or(0),

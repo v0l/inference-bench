@@ -1,0 +1,25 @@
+name = "llama4"
+kind = "family"
+extends = "base"
+
+[match]
+model_types = ["llama4", "llama4_text"]
+architectures = ["Llama4ForConditionalGeneration", "Llama4ForCausalLM"]
+
+[fields]
+num_experts = ["num_local_experts"]
+moe_intermediate_size = ["intermediate_size"]
+shared_expert_intermediate_size = ["intermediate_size"]
+decoder_sparse_step = ["interleave_moe_layer_step"]
+
+[blocks]
+sparse_layers_key = "moe_layers"
+
+[mlp]
+dense_intermediate_key = "intermediate_size_mlp"
+
+[rope]
+nope_flags = "no_rope_layers"
+
+[moe]
+shared_gate = false

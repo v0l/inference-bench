@@ -151,6 +151,7 @@ pub struct FamilyMlp {
     pub fused_gate_up: bool,
     pub gated: Option<FamilyGated>,
     pub mapped: Option<FamilyGated>,
+    pub dense_intermediate_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -238,6 +239,7 @@ pub struct FamilyBlocks {
     pub attention_indices_key: Option<String>,
     pub types_key: Option<String>,
     pub sparse_types: Vec<String>,
+    pub sparse_layers_key: Option<String>,
     pub split: bool,
 }
 
@@ -543,6 +545,12 @@ impl Family {
             push(k, &mut out);
         }
         if let Some(k) = self.blocks.sliding_period_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.blocks.sparse_layers_key.as_deref() {
+            push(k, &mut out);
+        }
+        if let Some(k) = self.mlp.dense_intermediate_key.as_deref() {
             push(k, &mut out);
         }
         if let Some(k) = self.rope.local_theta_key.as_deref() {
