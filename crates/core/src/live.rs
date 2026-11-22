@@ -51,10 +51,32 @@ impl<T> Ring<T> {
     }
 }
 
+pub const MIN_RATE_TOKENS: u64 = 256;
+
+pub fn prefill_rate(new_tokens: u64, prefill_secs: f64) -> f64 {
+    match new_tokens >= MIN_RATE_TOKENS && prefill_secs > 0.0 {
+        true => new_tokens as f64 / prefill_secs,
+        false => 0.0,
+    }
+}
+
+pub fn host_busy(load: f64, cores: usize) -> bool {
+    load > 0.9 * cores as f64
+}
+
+pub fn host_load() -> Option<(f64, usize)> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let load = text.split_whitespace().next()?.parse().ok()?;
+    let cores = std::thread::available_parallelism().ok()?.get();
+    Some((load, cores))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestRecord {
     pub at: DateTime<Utc>,
     pub ttft_secs: f64,
+    pub queue_secs: f64,
+    pub prefill_secs: f64,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub completion_tokens: u64,
@@ -168,15 +190,8 @@ impl Tracked {
         };
         let ttft_secs = self.first.map_or(g.ttft_secs, |f| f.duration_since(self.started).as_secs_f64());
         let cached_tokens = g.cached_tokens.min(g.prompt_tokens);
-        let prefill_secs = match g.queue_secs > 0.0 {
-            true => ttft_secs - g.queue_secs,
-            false => g.prefill_secs,
-        };
-        let prefill_tok_s = match prefill_secs > 0.0 {
-            true => (g.prompt_tokens - cached_tokens) as f64 / prefill_secs,
-            false => 0.0,
-        };
-        m.recent.push(RequestRecord { at: Utc::now(), ttft_secs, prompt_tokens: g.prompt_tokens, cached_tokens, completion_tokens: g.completion_tokens, prefill_tok_s, decode_tok_s });
+        let prefill_tok_s = prefill_rate(g.prompt_tokens - cached_tokens, g.prefill_secs);
+        m.recent.push(RequestRecord { at: Utc::now(), ttft_secs, queue_secs: g.queue_secs, prefill_secs: g.prefill_secs, prompt_tokens: g.prompt_tokens, cached_tokens, completion_tokens: g.completion_tokens, prefill_tok_s, decode_tok_s });
     }
 }
 
@@ -455,6 +470,42 @@ mod tests {
         assert_eq!((rec[0].cached_tokens, rec[0].prefill_tok_s), (200, 2000.0));
         assert!((rec[1].prefill_tok_s - 1000.0 / 0.9).abs() < 1e-6);
         assert_eq!((rec[2].cached_tokens, rec[2].prefill_tok_s), (64, 0.0));
+    }
+
+    #[test]
+    fn a_nearly_cached_prompt_shows_no_rate_from_step_latency() {
+        let meter = Arc::new(Meter::default());
+        let t = meter.begin(meter.submitted());
+        t.finish(&Generation { prompt_tokens: 1000, cached_tokens: 995, completion_tokens: 2, ttft_secs: 0.19, prefill_secs: 0.19, ..Generation::default() });
+        let rec = meter.recent();
+        assert_eq!((rec[0].prefill_tok_s, rec[0].prompt_tokens - rec[0].cached_tokens), (0.0, 5));
+    }
+
+    #[test]
+    fn a_cold_5k_prompt_uses_the_measured_prefill_time() {
+        let meter = Arc::new(Meter::default());
+        let t = meter.begin(meter.submitted());
+        t.finish(&Generation { prompt_tokens: 5000, completion_tokens: 2, ttft_secs: 1.0, prefill_secs: 0.93, queue_secs: 0.05, ..Generation::default() });
+        let rec = meter.recent();
+        assert_eq!(rec[0].prefill_tok_s.round(), 5376.0);
+        assert_eq!(rec[0].queue_secs, 0.05);
+    }
+
+    #[test]
+    fn a_request_that_waited_keeps_the_queue_apart_from_prefill() {
+        let meter = Arc::new(Meter::default());
+        let t = meter.begin(meter.submitted());
+        t.finish(&Generation { prompt_tokens: 1000, completion_tokens: 2, ttft_secs: 3.71, prefill_secs: 0.2, queue_secs: 3.5, ..Generation::default() });
+        let rec = meter.recent();
+        assert_eq!((rec[0].queue_secs, rec[0].prefill_tok_s), (3.5, 5000.0));
+    }
+
+    #[test]
+    fn the_host_is_busy_above_90_percent_of_the_cores() {
+        assert!(!host_busy(14.4, 16));
+        assert!(host_busy(14.5, 16));
+        assert!(host_busy(49.0, 16));
+        assert!(!host_busy(0.0, 16));
     }
 
     #[test]

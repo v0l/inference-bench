@@ -336,6 +336,7 @@ impl Default for Stats {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SeqEvent {
     Started { queued: Duration },
+    Prefilled { prefill: Duration },
     Token(u32),
     Preempted,
     Finished { finish: Finish, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize },
@@ -1004,6 +1005,7 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
                     s.queue_secs.observe(queued.as_secs_f64());
                     (id, SeqEvent::Started { queued })
                 }
+                Event::Prefilled { id, prefill } => (id, SeqEvent::Prefilled { prefill }),
                 Event::Token { id, token } => {
                     s.generated_tokens += 1;
                     if let Some(l) = live.get_mut(&id) {
@@ -1056,6 +1058,7 @@ pub struct Completion {
     pub completion_tokens: usize,
     pub finish: Option<Finish>,
     pub queue_secs: f64,
+    pub prefill_secs: f64,
     pub ttft_secs: f64,
     pub decode_secs: f64,
     pub preemptions: usize,
@@ -1290,6 +1293,7 @@ impl Serving {
             let ev = rx.recv().map_err(|_| anyhow::anyhow!("the serving engine has stopped"))?;
             match ev {
                 SeqEvent::Started { queued } => out.queue_secs = queued.as_secs_f64(),
+                SeqEvent::Prefilled { prefill } => out.prefill_secs = prefill.as_secs_f64(),
                 SeqEvent::Preempted => out.preemptions += 1,
                 SeqEvent::Token(t) => {
                     if out.preemptions > 0 && ids.len() > out.completion_tokens {

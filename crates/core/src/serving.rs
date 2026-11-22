@@ -55,7 +55,7 @@ impl ServingTarget {
             cached_tokens: c.cached_tokens as u64,
             completion_tokens: c.completion_tokens as u64,
             ttft_secs: c.ttft_secs,
-            prefill_secs: c.ttft_secs,
+            prefill_secs: c.prefill_secs,
             queue_secs: c.queue_secs,
             decode_secs: c.decode_secs,
             peak_memory_bytes: None,

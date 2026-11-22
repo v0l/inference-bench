@@ -2519,6 +2519,8 @@ fn request(ttft: f64, prompt: u64, cached: u64, completion: u64, prefill: f64, d
     inference_bench_core::live::RequestRecord {
         at: chrono::Utc::now(),
         ttft_secs: ttft,
+        queue_secs: 0.0,
+        prefill_secs: 0.0,
         prompt_tokens: prompt,
         cached_tokens: cached,
         completion_tokens: completion,
@@ -2530,14 +2532,24 @@ fn request(ttft: f64, prompt: u64, cached: u64, completion: u64, prefill: f64, d
 #[test]
 fn the_per_request_table_shows_clean_units_and_cache_columns() {
     let plain = request(0.842, 625, 0, 1574, 742.3, 35.44);
-    assert_eq!(crate::serving::request_cells(&plain, false), ["842 ms", "625", "1.57k", "742 tok/s", "35.4 tok/s"]);
+    assert_eq!(crate::serving::request_cells(&plain, false, false), ["842 ms", "625", "625", "1.57k", "742 tok/s", "35.4 tok/s"]);
     let warm = request(1.308, 1450, 1000, 40, 2310.4, 35.44);
-    assert_eq!(crate::serving::request_cells(&warm, true), ["1.31 s", "1.45k", "69%", "1.00k", "450", "40", "2,310 tok/s", "35.4 tok/s"]);
-    let full = request(0.05, 512, 512, 8, 0.0, 20.0);
-    assert_eq!(crate::serving::request_cells(&full, true)[6], "cached");
-    let cols = |c: bool| crate::serving::request_columns(c).iter().map(|c| c.0).collect::<Vec<_>>();
-    assert_eq!(cols(false), ["time", "ttft", "prompt", "completion", "prefill", "decode"]);
-    assert_eq!(cols(true), ["time", "ttft", "prompt", "cache hit", "cache read", "cache write", "completion", "prefill", "decode"]);
+    assert_eq!(crate::serving::request_cells(&warm, true, false), ["1.31 s", "1.45k", "69%", "1.00k", "450", "40", "2,310 tok/s", "35.4 tok/s"]);
+    let full = request(0.19, 512, 507, 8, 0.0, 20.0);
+    assert_eq!(crate::serving::request_cells(&full, true, false)[4..], ["5", "8", "-", "20.0 tok/s"]);
+    let mut waited = request(3.71, 5000, 0, 8, 5376.0, 20.0);
+    waited.queue_secs = 3.5;
+    assert_eq!(crate::serving::request_cells(&waited, false, true)[..2], ["3.71 s", "3,500 ms"]);
+    let cols = |c: bool, q: bool| crate::serving::request_columns(c, q).iter().map(|c| c.0).collect::<Vec<_>>();
+    assert_eq!(cols(false, false), ["time", "ttft", "prompt", "new", "completion", "prefill", "decode"]);
+    assert_eq!(cols(true, true), ["time", "ttft", "queue", "prompt", "cache hit", "cache read", "new", "completion", "prefill", "decode"]);
+}
+
+#[test]
+fn the_host_busy_reading_shows_only_above_the_threshold() {
+    assert!(crate::serving::host_reading(4.0, 16).is_none());
+    let (label, text, _) = crate::serving::host_reading(49.0, 16).unwrap();
+    assert_eq!((label, text.as_str()), ("host busy", "load 49.0 on 16 cores"));
 }
 
 #[test]
