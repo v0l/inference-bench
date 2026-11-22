@@ -1409,11 +1409,8 @@ impl<E: Executor> Scheduler<E> {
             return None;
         }
         let now = Instant::now();
-        let stalled = self.running.iter().any(|s| s.decoding() && now.duration_since(s.last_token) > self.cfg.stall_budget);
-        if !stalled {
-            return None;
-        }
-        let room = (self.cfg.stall_budget.as_secs_f64() - self.decode_secs).max(0.0);
+        let waited = self.running.iter().filter(|s| s.decoding()).map(|s| now.duration_since(s.last_token)).max()?;
+        let room = (self.cfg.stall_budget.as_secs_f64() - waited.as_secs_f64() - self.decode_secs).max(0.0);
         let fit = (room * self.prefill_rate) as usize;
         Some(if fit > align { fit / align * align } else { align })
     }
@@ -2814,17 +2811,24 @@ mod tests {
     }
 
     #[test]
-    fn a_decoder_waiting_past_the_stall_budget_caps_the_prefill_step() {
+    fn a_step_with_a_decoder_that_has_waited_is_capped_to_the_remaining_budget() {
         let mut s = stall_scheduler(400);
-        s.running[0].last_token = Instant::now() - Duration::from_millis(900);
+        s.running[0].last_token = Instant::now() - Duration::from_millis(100);
         let budget = s.prefill_budget(1);
-        assert!((3000..=3500).contains(&budget), "{budget}");
+        assert!((2000..=2500).contains(&budget), "{budget}");
     }
 
     #[test]
-    fn no_decoder_waiting_past_the_stall_budget_allows_the_full_step() {
-        let s = stall_scheduler(400);
+    fn a_step_that_fits_the_stall_budget_carries_the_full_burst() {
+        let mut s = stall_scheduler(400);
+        s.prefill_rate = 1_000_000.0;
         assert_eq!(s.prefill_budget(1), 8128);
+    }
+
+    #[test]
+    fn no_decoder_means_the_full_burst() {
+        let s = stall_scheduler(400);
+        assert_eq!(s.prefill_budget(0), 8192);
     }
 
     #[test]
