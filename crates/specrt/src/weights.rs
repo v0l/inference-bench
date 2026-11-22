@@ -718,6 +718,7 @@ impl<'a> Raw<'a> {
                 let (values, scales) = quantize_q8(&w, cols);
                 Matrix::Q8 { values, scales }
             }
+            (raw @ Raw::Fp8 { .. }, Quant::Nvfp4G16) => return raw.dequantized().into_matrix(quant, what),
             (Raw::Bf16 { w, cols }, Quant::Fp8Channel) => {
                 let (values, scales) = quantize_fp8_channel(&w, cols);
                 Matrix::Fp8 { values: Cow::Owned(values), scales }
@@ -904,6 +905,7 @@ impl Checkpoint {
     fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool, block: Block) -> Result<Attn<'_>> {
         let a = &spec.attention;
         let quant = if bf16 { Quant::Bf16 } else { spec.quant };
+        let (qkv_quant, o_quant) = if bf16 { (Quant::Bf16, Quant::Bf16) } else { (spec.requanted("qkv", quant), spec.requanted("o", quant)) };
         let (h, q, kv) = (spec.dims.hidden, spec.q_dim(), spec.kv_dim());
         let w = |p: &str, rows: usize, cols: usize| {
             self.raw(&format!("{attn}.{p}.weight"), rows, cols).map(|r| if bf16 { r.dequantized() } else { r })
@@ -961,12 +963,12 @@ impl Checkpoint {
         }
         Ok(Attn {
             extra,
-            qkv: Raw::concat(parts)?.into_matrix(quant, &format!("{attn}.qkv"))?,
+            qkv: Raw::concat(parts)?.into_matrix(qkv_quant, &format!("{attn}.qkv"))?,
             qkv_bias,
             o_bias: if a.o_bias { Some(self.f32(&format!("{attn}.o_proj.bias"), h)?) } else { None },
             q_norm,
             k_norm,
-            o: w(a.o_tensor.as_deref().unwrap_or("o_proj"), h, spec.o_dim())?.into_matrix(quant, &format!("{attn}.{}", a.o_tensor.as_deref().unwrap_or("o_proj")))?,
+            o: w(a.o_tensor.as_deref().unwrap_or("o_proj"), h, spec.o_dim())?.into_matrix(o_quant, &format!("{attn}.{}", a.o_tensor.as_deref().unwrap_or("o_proj")))?,
         })
     }
 
@@ -998,13 +1000,13 @@ impl Checkpoint {
             (in_proj, ba)
         };
         Ok(Gdn {
-            in_proj: in_proj.into_matrix(spec.quant, &format!("{p}.in_proj"))?,
+            in_proj: in_proj.into_matrix(spec.requanted("lin_in", spec.quant), &format!("{p}.in_proj"))?,
             ba: Matrix::Bf16(Cow::Owned(ba)),
             conv: self.floats(&format!("{p}.conv1d.weight"), &[conv_dim, 1, la.conv_kernel])?,
             neg_a: self.neg_a(&format!("{p}.A_log"), heads)?,
             dt_bias: self.f32(&format!("{p}.dt_bias"), heads)?,
             norm: self.f32(&format!("{p}.norm.weight"), la.value_head_dim)?,
-            out: w("out_proj", h, value_dim)?.into_matrix(spec.quant, &format!("{p}.out_proj"))?,
+            out: w("out_proj", h, value_dim)?.into_matrix(spec.requanted("lin_out", spec.quant), &format!("{p}.out_proj"))?,
         })
     }
 
@@ -1049,6 +1051,7 @@ impl Checkpoint {
             Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), spec.block(i))?)
         };
         let mlp = spec.mlp_quant(i);
+        let served = spec.served_mlp_quant(i);
         let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(global)) && spec.has_mlp(i);
         let moe = if sparse { Some(self.moe_layer(spec, &p, mlp)?) } else { None };
         let none = || (Matrix::Bf16(Cow::Owned(vec![0; 8])), Matrix::Bf16(Cow::Owned(vec![0; 8])));
@@ -1071,8 +1074,8 @@ impl Checkpoint {
             };
             let down = self.raw(&format!("{p}.mlp.down_proj.weight"), h, inter)?;
             (
-                Raw::interleave(gate, up)?.into_matrix(mlp, &format!("{p}.mlp.gate_up"))?,
-                down.into_matrix(mlp, &format!("{p}.mlp.down_proj"))?,
+                Raw::interleave(gate, up)?.into_matrix(served, &format!("{p}.mlp.gate_up"))?,
+                down.into_matrix(served, &format!("{p}.mlp.down_proj"))?,
             )
         };
         let ln1 = if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] };
