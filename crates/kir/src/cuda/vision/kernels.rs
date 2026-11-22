@@ -301,3 +301,80 @@ pub fn pool_kernel() -> String {
     )
 }
 
+pub fn tiled_kernels() -> String {
+    format!(
+        r#"
+extern "C" __global__ void vis_assemble(const float* patch, const float* cls, const float* pos, float* x, int n, int hidden) {{
+    int tok = blockIdx.x;
+    int tile = tok / (n + 1), local = tok % (n + 1);
+    for (int d = threadIdx.x; d < hidden; d += blockDim.x) {{
+        float v = local < n ? patch[((size_t)tile * n + local) * hidden + d] : cls[d];
+        x[(size_t)tok * hidden + d] = v + pos[(size_t)local * hidden + d];
+    }}
+}}
+
+extern "C" __global__ void vis_rope_pairs(const float* qkv, bf16_t* planes, int tokens, int heads, int head_dim, float theta, int side, int per_tile) {{
+    int tok = blockIdx.x;
+    int h = blockIdx.y;
+    int quarter = head_dim / 4;
+    size_t width = (size_t)3 * heads * head_dim;
+    size_t plane = (size_t)heads * tokens * AT_HDP;
+    size_t dst = ((size_t)h * tokens + tok) * AT_HDP;
+    int local = tok % per_tile;
+    bool rotate = local < per_tile - 1;
+    int px = local % side, py = local / side;
+    for (int part = 0; part < 3; part++) {{
+        const float* src = qkv + tok * width + (size_t)part * heads * head_dim + (size_t)h * head_dim;
+        bf16_t* hi = planes + (2 * part) * plane + dst;
+        bf16_t* lo = planes + (2 * part + 1) * plane + dst;
+        for (int d = threadIdx.x; d < AT_HDP; d += blockDim.x) {{
+            float v = 0.0f;
+            if (d < head_dim) {{
+                v = src[d];
+                if (part < 2 && rotate) {{
+                    int p = d >> 1;
+                    int j = p % quarter;
+                    float coord = (float)((p < quarter ? px : py) + 1);
+                    float angle = coord * exp2f(-((float)j / (float)quarter) * log2f(theta));
+                    float s, c;
+                    sincosf(angle, &s, &c);
+                    float other = src[d ^ 1];
+                    v = (d & 1) ? other * s + v * c : v * c - other * s;
+                }}
+            }}
+            unsigned b = f16_bits(v);
+            hi[d] = (bf16_t)b;
+            if (ATT_SPLIT) lo[d] = (bf16_t)f16_bits(v - f16_float(b));
+        }}
+    }}
+}}
+
+extern "C" __global__ void vis_layernorm_f32(const float* x, const bf16_t* w, const bf16_t* b, float* out, int hidden, float eps) {{
+    __shared__ float red[32];
+    const float* row = x + (size_t)blockIdx.x * hidden;
+{stats}    for (int i = threadIdx.x; i < hidden; i += blockDim.x) out[(size_t)blockIdx.x * hidden + i] = (row[i] - mean) * inv * bf(w[i]) + bf(b[i]);
+}}
+
+extern "C" __global__ void vis_shuffle_norm(const float* x, const bf16_t* w, const bf16_t* b, bf16_t* hi, bf16_t* lo,
+                                            int hidden, int side, int per_tile, float eps) {{
+    __shared__ float red[32];
+    int o = blockIdx.x;
+    int half = side / 2;
+    int q = half * half;
+    int tile = o / q, local = o % q;
+    int oy = local / half, ox = local % half;
+    for (int slot = 0; slot < 4; slot++) {{
+        int tok = tile * per_tile + (oy * 2 + slot / 2) * side + ox * 2 + (slot & 1);
+        const float* row = x + (size_t)tok * hidden;
+{stats}        size_t at = ((size_t)o * 4 + slot) * hidden;
+        for (int i = threadIdx.x * 2; i < hidden; i += blockDim.x * 2) {{
+            store_act2(hi, lo, at + i, (row[i] - mean) * inv * bf(w[i]) + bf(b[i]), (row[i + 1] - mean) * inv * bf(w[i + 1]) + bf(b[i + 1]));
+        }}
+        __syncthreads();
+    }}
+}}
+"#,
+        stats = prim::pool_stats("s", "row", "hidden", "blockDim.x", "red", "mean", "inv"),
+    )
+}
+

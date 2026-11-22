@@ -27,5 +27,8 @@ pub fn emit_vision(k: &VisionKernel) -> Result<String, VisionError> {
     out += &kernels::attention_kernels(k);
     out += &prim::block_sum();
     out += &kernels::pool_kernel();
+    if k.tiled {
+        out += &kernels::tiled_kernels();
+    }
     Ok(out)
 }
