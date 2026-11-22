@@ -283,7 +283,7 @@ impl Runtime {
         let has_shared = routed.iter().any(|&e| e >= shared_at);
         let groups: Vec<&[usize]> = if used.is_empty() { vec![&[][..]] } else { used.chunks(cache.slots).collect() };
         for (g, group) in groups.iter().enumerate() {
-            let staged = cache.stage(&self.stream, w.index, host, group, g == 0 && has_shared)?;
+            let staged = cache.stage(&self.stream, w.index, host, group, g == 0 && has_shared, n >= GROUP_MIN_TOKENS)?;
             let slot_of: std::collections::HashMap<usize, usize> = staged.mapping.iter().copied().collect();
             let remapped: Vec<i32> = routed
                 .iter()
