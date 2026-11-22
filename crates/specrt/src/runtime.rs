@@ -1570,6 +1570,7 @@ impl Runtime {
             (GemmPath::F4b, _, _) => return self.tc_f4b(&choice, w, x, out, rows, tokens),
             (GemmPath::Rows, _, _) => return self.tc_rows(&choice, w, x, out, rows, tokens),
             (GemmPath::Ggr, _, _) => return self.tc_ggr(&choice, w, bias, x, out, rows, tokens),
+            (GemmPath::Ggv, _, _) => return self.tc_ggv(&choice, w, bias, x, out, rows),
             (GemmPath::Ggb, _, _) => return self.tc_ggb(&choice, w, bias, x, out, rows, tokens),
             _ => {}
         }
@@ -1655,6 +1656,30 @@ impl Runtime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn tc_ggv(
+        &self,
+        choice: &crate::codegen::KernelChoice,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+    ) -> Result<()> {
+        let DeviceMatrix::Ggml { data, table } = w else { unreachable!("tc_ggv takes GGUF weights") };
+        let mut b = self.launcher(self.kernel(&choice.name));
+        b.arg(data).arg(table);
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        b.arg(&self.f8b_part).arg(&0i32).arg(&0i32);
+        let per_block = crate::codegen::GGML_GEMV_THREADS as usize / 32 * crate::gemm::ggml_gemv_rows(rows);
+        let blocks = grid(rows, per_block).min(self.sms * GEMV_BLOCKS_PER_SM);
+        unsafe { b.launch(cfg(blocks, crate::codegen::GGML_GEMV_THREADS)) }?;
+        Ok(())
+    }
+
     fn tc_ggr(
         &self,
         choice: &crate::codegen::KernelChoice,

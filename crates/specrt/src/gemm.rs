@@ -4,7 +4,8 @@ use kir::gemm::{self as kg, Epilogue, Fp4Gemv, Fp8Scale, GemmShape, KernelInstan
 use std::collections::BTreeMap;
 
 pub use kg::{BatchShape, GemmPath, MmaShape, Tile, WeightFormat};
-pub use kg::{BATCH_MAX_TOKENS, BATCH_REDUCE_BLOCK, BATCH_VARIANTS, FP4_GEMV_THREADS, GGB_LINEARS, GGB_MIN_TOKENS, ROWS_MAX_TOKENS};
+pub use kg::{BATCH_MAX_TOKENS, BATCH_REDUCE_BLOCK, BATCH_VARIANTS, FP4_GEMV_THREADS, GGB_LINEARS, GGB_MIN_TOKENS, GGML_GEMV_THREADS, ROWS_MAX_TOKENS};
+pub use kg::ggml_gemv_rows;
 
 pub const MMA_LINEARS: [&str; 5] = ["qkv", "o", "gate_up", "down", "lm_head"];
 pub const GDN_LINEARS: [&str; 3] = ["lin_in", "lin_out", "lin_ba"];
@@ -224,7 +225,7 @@ impl GemmSet {
     pub fn smem(&self) -> BTreeMap<&'static str, u32> {
         self.kernels
             .iter()
-            .filter(|k| k.tile().is_some() || k.batch_shape().is_some())
+            .filter(|k| k.tile().is_some() || k.batch_shape().is_some() || matches!(k.kind, kg::Kind::GgmlGemv { .. }))
             .map(|k| (intern(&k.name), k.smem_bytes))
             .collect()
     }
@@ -277,6 +278,9 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
                     set.push(KernelInstance::ggml_batch(t, &format!("{linear}_ggr{tokens}"), shape, tokens, split(spec, linear, WeightFormat::Ggml)))?;
                 }
                 set.push(KernelInstance::batch_reduce(t, &format!("{linear}_ggr_reduce"), shape, WeightFormat::Ggml))?;
+                if shape.k <= kg::GGML_GEMV_MAX_K {
+                    set.push(KernelInstance::ggml_gemv(t, &format!("{linear}_ggv"), shape, split(spec, linear, WeightFormat::Ggml)))?;
+                }
             }
         }
     }

@@ -143,6 +143,65 @@ fn check(linear: &str, kinds: &[GgmlType], token_counts: &[usize]) -> Option<()>
 
 const TOKENS: [usize; 7] = [1, 3, 8, 9, 16, 24, 32];
 
+fn check_gemv(linear: &str, kinds: &[GgmlType]) -> Option<()> {
+    let ctx = CudaContext::new(0).ok()?;
+    let spec = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3-0.6b-gguf.toml")).unwrap();
+    let (rows, cols, _, _) = linear_dims(&spec, linear);
+    let module = Module::generate(&spec, 256).unwrap();
+    let dir = std::env::temp_dir().join(format!("specrt-ggv-{}-{linear}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let loaded = Jit::new(ctx.clone(), dir.clone()).unwrap().load(&module).unwrap();
+    let stream = ctx.default_stream();
+    let mut rng = Lcg(888);
+    let m = matrix(kinds, rows, cols, &mut rng);
+    let hi: Vec<u16> = (0..cols).map(|_| f32_to_bf16(rng.float() * 3.0)).collect();
+    let lo: Vec<u16> = hi.iter().map(|&h| if linear == "lm_head" { f32_to_bf16((rng.float() - 0.5) * 0.01 * bf16_to_f32(h)) } else { 0 }).collect();
+    let x: Vec<f64> = hi.iter().zip(&lo).map(|(&h, &l)| bf16_to_f32(h) as f64 + bf16_to_f32(l) as f64).collect();
+    let wf: Vec<Vec<f32>> = (0..rows).map(|r| m.row_f32(r)).collect();
+    let data = stream.clone_htod(m.data().as_ref()).unwrap();
+    let table = stream.clone_htod(&m.rows).unwrap();
+    let dhi = stream.clone_htod(&hi).unwrap();
+    let dlo = stream.clone_htod(&lo).unwrap();
+    let dummy = stream.alloc_zeros::<f32>(1).unwrap();
+    let dummy16 = stream.alloc_zeros::<u16>(1).unwrap();
+    let out = stream.alloc_zeros::<f32>(rows).unwrap();
+    let f = loaded.function(&format!("{linear}_ggv")).unwrap();
+    let zero = 0i32;
+    let mut b = stream.launch_builder(&f);
+    b.arg(&data).arg(&table).arg(&dummy).arg(&dhi).arg(&dlo).arg(&out).arg(&dummy16).arg(&dummy16).arg(&dummy).arg(&zero).arg(&zero);
+    let per_block = specrt::codegen::GGML_GEMV_THREADS as usize / 32 * specrt::gemm::ggml_gemv_rows(rows);
+    unsafe {
+        b.launch(LaunchConfig {
+            grid_dim: (rows.div_ceil(per_block).min(96) as u32, 1, 1),
+            block_dim: (specrt::codegen::GGML_GEMV_THREADS, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+    .unwrap();
+    let got = stream.clone_dtoh(&out).unwrap();
+    let mut worst = 0f64;
+    let mut scale = 0f64;
+    for r in 0..rows {
+        let want: f64 = wf[r].iter().zip(&x).map(|(&a, &b)| a as f64 * b).sum();
+        scale = scale.max(want.abs());
+        worst = worst.max((got[r] as f64 - want).abs());
+    }
+    eprintln!("{linear} {kinds:?} gemv: max err {worst:.3e} of {scale:.3}");
+    assert!(worst <= 0.002 * scale, "{linear} gemv: error {worst} of {scale}");
+    std::fs::remove_dir_all(&dir).ok();
+    Some(())
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU with NVRTC"]
+fn ggml_gemv_matches_the_dequantised_reference_on_q4k_q6k_and_mixed_rows() {
+    for linear in ["qkv", "o", "down", "lm_head"] {
+        check_gemv(linear, &[GgmlType::Q4K]).expect("a CUDA device");
+        check_gemv(linear, &[GgmlType::Q6K]).expect("a CUDA device");
+        check_gemv(linear, &[GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0]).expect("a CUDA device");
+    }
+}
+
 #[test]
 #[ignore = "needs a CUDA GPU with NVRTC"]
 fn ggml_batch_rows_match_the_dequantised_reference_on_q4k_rows() {
