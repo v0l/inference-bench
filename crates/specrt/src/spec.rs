@@ -896,6 +896,8 @@ pub struct Spec {
     pub runtime: RuntimeOptions,
     #[serde(default, skip_serializing_if = "is_false")]
     pub plain_activations: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub iq_quants: bool,
 }
 
 pub const MAX_DRAFT_TOKENS: usize = 3;
@@ -1806,6 +1808,7 @@ impl Spec {
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
             runtime: RuntimeOptions::default(),
             plain_activations: !family.runtime.split_activations,
+            iq_quants: false,
         };
         Ok(spec)
     }

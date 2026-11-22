@@ -7,7 +7,7 @@ specrt loads a llama.cpp GGUF file directly. `model` is the path of the `.gguf` 
 | Item | Supported |
 | --- | --- |
 | Architectures | the `gguf = [...]` list of every family TOML: `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35` (Qwen3.5/3.6/3.8 delta-net hybrids, with their MTP block) and `qwen35moe`. Others fail with "GGUF architecture X is not supported (list, each once)". |
-| Tensor types | F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K. Any other type fails at load and in the library with the tensor name and type. |
+| Tensor types | F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K and the IQ types (CUDA only, see i-quants). Any other type fails at load and in the library with the tensor name and type. |
 | Tokenizer | `tokenizer.ggml.model = gpt2` with a `pre` named in the family TOML `[gguf.pretokenizers]` (`qwen2`, `qwen35`, `llama-bpe`, ...); `tokenizer.ggml.normalizer.nfc` adds an NFC normaliser |
 | Files | one file. Split GGUF (`-0000N-of-0000M`) is listed but marked unsupported for specrt. |
 
@@ -96,6 +96,26 @@ On BF16 the two engines agree to 5e-5, the same as llama.cpp against transformer
 - Q8_0 and Q4_K_M: mean KL at most 5e-2, max 0.5; top-1 at least 16/18 (Q8_0) and 14/18 (Q4_K_M).
 - Q8_0 greedy: all 64 tokens equal to llama.cpp.
 - Native K-quant kernels against the same file dequantised to bf16: mean KL at most 1e-4.
+
+### i-quants
+
+F32, F16, BF16 and the nine IQ types (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS) load on the CUDA engine. The wgpu engine refuses them ("IQ quant types need the CUDA engine"), and Discover marks IQ quants unsupported when every GPU is a wgpu one. Dequant is bit-exact against libggml (`tests/gguf_iq.rs`, blocks from `scripts/gen_iq_reference.c`); tables come from `crates/kir/scripts/gen_iq_tables.py`.
+
+Qwen3-0.6B, 18 prompt positions, KL(llama.cpp || specrt). Each file is `llama-quantize --pure --imatrix <imatrix of ~300 KB of text> --token-embedding-type q8_0 --output-tensor-type q8_0` from the BF16 GGUF; IQ2_S needs `--tensor-type 'blk\..*\.weight=iq2_s'` because `--pure` maps it to IQ2_XS tensors. Every layer weight is the named type; norms stay F32.
+
+| File | mean KL | max KL | top-1 agree | greedy 64 |
+| --- | --- | --- | --- | --- |
+| IQ4_NL | 9.9e-3 | 0.14 | 17/18 | 64/64 |
+| IQ4_XS | 2.1e-2 | 0.21 | 16/18 | 19/64 |
+| IQ3_S | 6.3e-3 | 1.8e-2 | 18/18 | 4/64 |
+| IQ3_XXS | 1.2e-2 | 6.9e-2 | 14/18 | 64/64 |
+| IQ2_S | 1.7e-2 | 4.6e-2 | 15/18 | 3/64 |
+| IQ2_XS | 4.6e-2 | 0.18 | 17/18 | 1/64 |
+| IQ2_XXS | 0.40 | 2.4 | 14/18 | 2/64 |
+| IQ1_S | 2.4 | 6.2 | 3/18 | 1/64 |
+| IQ1_M | 2.1 | 7.0 | 11/18 | 1/64 |
+
+IQ1 and IQ2_XXS on a 0.6B model are close to unusable in llama.cpp too, so large KL there is the quantisation, not the reader. `qwen3_iq_gguf_logits_stay_within_the_kl_bound_of_llama_cpp` bounds mean and max KL at 1.5 times these numbers, and `qwen3_iq_native_kernels_match_the_same_weights_dequantised_to_bf16` checks the native kernels against the same file dequantised to bf16. The GPU-side checks need `~/.cache/specrt-gguf/Qwen3-0.6B-IQ*.gguf` and `q3-IQ*.logits.bin` (`scripts/gguf_reference.c`).
 
 ## Bench
 

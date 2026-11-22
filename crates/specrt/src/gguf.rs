@@ -621,6 +621,7 @@ impl Gguf {
             mtp: (family.mtp && nextn > 0).then(|| crate::spec::Mtp { head_quant: Some(Quant::Bf16), ..crate::spec::Mtp::new(nextn) }),
             vision: None,
             plain_activations: false,
+            iq_quants: self.tensors.values().any(|t| matches!(t.kind, GgmlType::Iq(_))),
             state: crate::state::stock(),
             runtime: RuntimeOptions {
                 unsplit: Vec::new(),
@@ -824,8 +825,15 @@ impl Gguf {
 
 
 pub fn quant_label_supported(label: &str) -> bool {
+    quant_label_supported_on(label, false)
+}
+
+pub fn quant_label_supported_on(label: &str, wgpu: bool) -> bool {
     let upper = label.to_uppercase();
     let upper = upper.strip_prefix("UD-").unwrap_or(&upper);
+    if wgpu && upper.starts_with("IQ") {
+        return false;
+    }
     ["Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BF16", "F16", "F32"].iter().any(|q| upper.starts_with(q))
 }
 

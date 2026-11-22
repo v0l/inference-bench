@@ -59,6 +59,9 @@ pub fn plan(spec: &Spec, phase: Phase) -> Plan {
 }
 
 pub fn unsupported(spec: &Spec) -> Option<String> {
+    if spec.iq_quants {
+        return Some("IQ quant types need the CUDA engine".into());
+    }
     if spec.linear_attention.is_some() {
         return Some("delta-net layers are not yet on wgpu".into());
     }
