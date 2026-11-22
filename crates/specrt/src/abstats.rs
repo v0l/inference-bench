@@ -61,6 +61,10 @@ impl Verdict {
 }
 
 pub fn verdict(control: &[Summary], passes: &[Summary]) -> Verdict {
+    verdict_with_min_rounds(control, passes, MIN_ROUNDS)
+}
+
+pub fn verdict_with_min_rounds(control: &[Summary], passes: &[Summary], min_rounds: usize) -> Verdict {
     for (i, c) in control.iter().enumerate() {
         if c.refused() {
             return Verdict::Refused(format!("A/A control {} spread {:.3} above {REFUSE_SPREAD}", i + 1, c.spread()));
@@ -70,8 +74,8 @@ pub fn verdict(control: &[Summary], passes: &[Summary]) -> Verdict {
         }
     }
     for (i, p) in passes.iter().enumerate() {
-        if p.n < MIN_ROUNDS {
-            return Verdict::Refused(format!("pass {} has {} rounds, need {MIN_ROUNDS}", i + 1, p.n));
+        if p.n < min_rounds {
+            return Verdict::Refused(format!("pass {} has {} rounds, need {min_rounds}", i + 1, p.n));
         }
         if p.refused() {
             return Verdict::Refused(format!("pass {} spread {:.3} above {REFUSE_SPREAD}", i + 1, p.spread()));
@@ -139,6 +143,14 @@ mod tests {
     #[test]
     fn disagreeing_passes_are_refused() {
         assert!(matches!(verdict(&[s(1.0, 0.01)], &[s(1.1, 0.02), s(1.2, 0.02)]), Verdict::Refused(_)));
+    }
+
+    #[test]
+    fn a_lower_round_floor_accepts_fewer_rounds() {
+        let mut few = s(1.0, 0.02);
+        few.n = 6;
+        assert_eq!(verdict_with_min_rounds(&[s(1.0, 0.01)], &[few, few], 6), Verdict::NoDifference);
+        assert!(matches!(verdict_with_min_rounds(&[s(1.0, 0.01)], &[few, few], 7), Verdict::Refused(_)));
     }
 
     #[test]

@@ -528,6 +528,7 @@ pub struct Config {
     pub max_long_in_flight: usize,
     pub adaptive_drafts: bool,
     pub stall_budget: Duration,
+    pub min_stall_chunk: usize,
 }
 
 impl Default for Config {
@@ -549,6 +550,7 @@ impl Default for Config {
             max_long_in_flight: 1,
             adaptive_drafts: false,
             stall_budget: Duration::ZERO,
+            min_stall_chunk: 0,
         }
     }
 }
@@ -1412,6 +1414,7 @@ impl<E: Executor> Scheduler<E> {
         let waited = self.running.iter().filter(|s| s.decoding()).map(|s| now.duration_since(s.last_token)).max()?;
         let room = (self.cfg.stall_budget.as_secs_f64() - waited.as_secs_f64() - self.decode_secs).max(0.0);
         let fit = (room * self.prefill_rate) as usize;
+        let fit = fit.max(self.cfg.min_stall_chunk);
         Some(if fit > align { fit / align * align } else { align })
     }
 
@@ -2836,6 +2839,20 @@ mod tests {
         let mut s = stall_scheduler(0);
         s.running[0].last_token = Instant::now() - Duration::from_millis(900);
         assert_eq!(s.prefill_budget(1), 8128);
+    }
+
+    #[test]
+    fn the_stall_cap_never_shrinks_a_step_below_its_floor() {
+        let cfg = Config { max_batched_tokens: 8192, step_cost: 0.0, stall_budget: Duration::from_millis(400), min_stall_chunk: 1024, ..Config::default() };
+        let mut s = Scheduler::new(Fake::new(65536, 8, 8000, 2048), cfg);
+        s.submit(request(50, 400, 1)).unwrap();
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        s.step(&mut events).unwrap();
+        s.decode_secs = 0.05;
+        s.prefill_rate = 10_000.0;
+        s.running[0].last_token = Instant::now() - Duration::from_millis(390);
+        assert_eq!(s.prefill_budget(1), 1024);
     }
 
     #[test]
