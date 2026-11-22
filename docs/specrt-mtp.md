@@ -27,10 +27,18 @@ graph = false         # optional: capture the whole speculative round in a CUDA 
 ```toml
 # server config
 [speculative]
-draft_tokens = 3
+draft_tokens = 3      # a number, or "auto"
 enabled = true
 max_batch = 4
 ```
+
+`draft_tokens = "auto"` (#403) compiles every draft count from 1 to 3 on demand (the drafts
+buffer keeps the largest stride, `mtp_round_in` takes it as an argument) and lets the scheduler
+pick k per step (`crates/specrt/src/drafts.rs`). It keeps the median step time per (rows, k),
+interpolated between measured row counts, acceptance per draft position with Laplace's rule
+(per sequence, falling back to the global rate), and picks the k in 0..=3 that maximises expected
+tokens per second. A choice of 0 is re-tested on a doubling schedule and retired after 3 failed
+re-tests. Output is unchanged: greedy output is independent of k.
 
 `Spec::from_hf_config` adds `[mtp]` when `mtp_num_hidden_layers` is 1 and the checkpoint has the
 `mtp.*` tensors' format in its quantisation config: compressed-tensors checkpoints ignore `mtp.`
