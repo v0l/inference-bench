@@ -112,19 +112,30 @@ pub fn tiles(name: &str) -> String {
         None,
         name,
         "const int* offsets, int* tile_map, int bm, int max_tiles",
-        r##"    if (threadIdx.x != 0) return;
-    int t = 0;
-    for (int e = 0; e < MOE_SLOTS; e++) {
+        r##"    __shared__ int first[MOE_SLOTS + 1];
+    for (int e = threadIdx.x; e < MOE_SLOTS; e += blockDim.x) first[e] = (offsets[e + 1] - offsets[e] + bm - 1) / bm;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int run = 0;
+        for (int e = 0; e < MOE_SLOTS; e++) {
+            int c = first[e];
+            first[e] = run;
+            run += c;
+        }
+        first[MOE_SLOTS] = run;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < MOE_SLOTS; e += blockDim.x) {
         int count = offsets[e + 1] - offsets[e];
         for (int m = 0; m * bm < count; m++) {
+            int t = first[e] + m;
             if (t < max_tiles) {
                 tile_map[2 * t] = e;
                 tile_map[2 * t + 1] = m;
             }
-            t++;
         }
     }
-    for (; t < max_tiles; t++) tile_map[2 * t] = -1;
+    for (int t = first[MOE_SLOTS] + threadIdx.x; t < max_tiles; t += blockDim.x) tile_map[2 * t] = -1;
 "##,
     )
 }

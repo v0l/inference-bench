@@ -60,4 +60,26 @@ The first version of this comparison gave 43 of 48 and mean KL 0.29. The cause w
 
 ## Not done
 
-Nothing from the issue list. The 122B decode b8 gap to vLLM (365 vs 435) and the 4k prefill gap (0.79 vs 0.21 s) remain.
+The 122B decode b8 gap to vLLM (365 vs 435) and the 4k prefill gap remain (#652 below).
+
+### #652 profile (nsys, GPU1, 122B, same card)
+
+4k prefill, 0.58 to 0.62 s of kernels (one 4096 token pass, 48 layers, 36 of them linear attention and 12 full attention, every layer MoE):
+
+| Kernel | ms | Share |
+| --- | --- | --- |
+| `lin_in_mma_big` (GDN input projections) | 98 | 16% |
+| `moe_mma_up` (+ `_s`) | 83 + 18 | 17% |
+| `flash_mma` | 73 | 12% |
+| `moe_route_logits` (before) | 77 | 13% |
+| `gdn_chunk_prep` + `gdn_chunk_scan` | 52 + 30 | 14% |
+| `moe_mma_down` (+ `_s`) | 49 + 6 | 9% |
+| `lin_out_mma_big`, `qkv_mma_big`, `o_mma_big` | 48 + 26 + 14 | 14% |
+
+The expert GEMMs are 26% of prefill. Up does 4096 x 9 pairs x 2 x 1024 x 3072 x 2 FLOP x 48 layers = 11.1 TFLOP in 0.101 s of kernel time, about 110 TFLOP/s on the fp4 mma; down 5.6 TFLOP in 0.055 s, about 100 TFLOP/s. A 128-row tile (`BM=128`, 4 warps) was tried and was slower for up (99 ms against 88 ms), so it was dropped. The rest of the 0.8 s to 0.21 s gap is not the expert GEMM: the dense GDN and attention projections (`lin_in_mma_big`, `lin_out_mma_big`, `qkv_mma_big`, `o_mma_big`, 186 ms) and the GDN chunk kernels (82 ms) are the larger share and are separate kernels from `templates/moe_mma.cu` (that file is now `kir::cuda::moe::mma`).
+
+Changes kept: `moe_route_logits` computes 4 experts per warp and loads the activation tile once per 4 experts (router reads were 13% of prefill, now 5%, 4k prefill 0.607 to 0.575 s), and `moe_tiles` builds the tile map with a block scan instead of one thread walking 257 experts (21 us to a few us, 96 launches a pass).
+
+b8 decode (369 tok/s before and after): `moe_mma_up_s` 133 ms of 387 ms of kernel time (34%, 173 us a call, 48 layers x 16 steps), `moe_mma_down_s` 43 ms, `lin_in_mma_tiny` 47 ms, lm head 15 ms. Bytes: 14.8 GB of active experts per step over about 22 ms of up/down time per step is about 680 GB/s, 38% of the card's peak. Our 16-row tile has one CTA row per expert, so the grid is `inter/64 x active_experts` CTAs of 128 threads. Whether that is too few loads in flight is untested.
+
+Still open for #652: the 4k target of 0.3 s needs the GDN and attention projection GEMMs (not MoE) and probably a persistent expert kernel. vLLM's fused_moe and FlashInfer CUTLASS sources were not read, and the expert GEMM was not ported to a new kir family.
