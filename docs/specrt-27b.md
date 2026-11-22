@@ -296,3 +296,36 @@ What limits each case, from per-group timers:
 - The page-cache check uses 80%: right after `cat` of all 24.7 GB the cache held 93.8% of it (the rest was evicted under the 62 GB RAM with vLLM running), which missed the earlier 95% cut-off and sent the warm load through O_DIRECT at 4.8 s.
 
 Progress: `specrt::progress` reports stages (compiling kernels, reading weights with bytes done and total, allocating KV cache) through a thread-local sink. `Engine::load_with_progress` and `ServeOptions::progress` set the sink, and the load workers inherit it. Core turns it into `EngineEvent::LoadProgress`. The UI model bar, chat page and status bar show it (screenshot `docs/gui/load-progress.png`), and the server reports `loading` in `/health` and `/admin/models`.
+
+## Cold start (#396)
+
+`runtime loaded` and `bench` now print `jit_compile_secs` (NVRTC, 0 on a PTX cache hit) and `jit_module_secs` (`load_module`, driver PTX to SASS). `bench --cold` loads the serving layout, sends the same 128-token prompt 11 times and prints the first TTFT against the median of the other ten, then the decode graph capture seconds for rows 1, 2, 4, 8, 16, 32 (also logged as `decode graph captured`).
+
+Measured on GPU 1 of the desktop (RTX PRO 6000, vLLM on the other card). `crates/specrt/scripts/coldstart.sh` runs the five states (a priming run, then both warm, PTX cold with a fresh `[runtime] cache_dir`, driver cold with `CUDA_CACHE_PATH` on an empty temp dir, both cold). Commands:
+
+```bash
+~/.agents/bin/gpu-run 1 -- crates/specrt/scripts/coldstart.sh $CARGO_TARGET_DIR/release/bench crates/specrt/tests/fixtures/qwen3.8-27b.toml 128 64
+~/.agents/bin/gpu-run 1 -- crates/specrt/scripts/coldstart.sh $CARGO_TARGET_DIR/release/bench crates/specrt/tests/fixtures/qwen3.8-27b-nvfp4.toml 128 64
+~/.agents/bin/gpu-run 1 -- crates/specrt/scripts/coldstart.sh $CARGO_TARGET_DIR/release/bench crates/specrt/specs/qwen3-0.6b.toml 128 64
+```
+
+| model | state | load | NVRTC | load_module | weights |
+|---|---|---|---|---|---|
+| 27B FP8 | both warm | 5.10 s | 0.00 s | 0.01 s | 4.97 s |
+| 27B FP8 | PTX cold | 4.21 s | 0.24 s | 0.01 s | 3.84 s |
+| 27B FP8 | driver cold | 10.90 s | 0.00 s | 5.46 s | 5.29 s |
+| 27B FP8 | both cold | 16.60 s | 7.07 s | 5.39 s | 4.02 s |
+| 27B NVFP4 | both warm | 2.95 s | 0.00 s | 0.02 s | 2.81 s |
+| 27B NVFP4 | PTX cold | 3.34 s | 0.30 s | 0.01 s | 2.90 s |
+| 27B NVFP4 | driver cold | 10.59 s | 0.00 s | 6.76 s | 3.72 s |
+| 27B NVFP4 | both cold | 19.73 s | 9.04 s | 6.81 s | 3.73 s |
+| qwen3-0.6b | both warm | 0.33 s | 0.00 s | 0.00 s | 0.21 s |
+| qwen3-0.6b | PTX cold | 0.47 s | 0.12 s | 0.00 s | 0.23 s |
+| qwen3-0.6b | driver cold | 1.60 s | 0.00 s | 1.30 s | 0.19 s |
+| qwen3-0.6b | both cold | 3.48 s | 1.89 s | 1.30 s | 0.19 s |
+
+- A truly cold start splits about 57% NVRTC and 43% driver: 7 to 9 s of NVRTC and 5.4 to 6.8 s of `load_module` on the 27B.
+- The driver share alone is 5.4 to 6.8 s on the 27B and 1.3 s on 0.6B, and a warm driver cache removes it. The NVRTC share is only large when the driver cache is also cold: a fresh PTX dir with a warm driver cache compiles in 0.1 to 0.3 s, so NVRTC output appears to be cached under the driver cache path as well. A new `max_ctx` changes the source, so it misses both.
+- Decode graph capture is 2 to 5 ms per size (1 to 32) in every state. It is not a cold-start cost.
+- First request TTFT (prompt 128): 27B FP8 43 ms against 47 to 49 ms for the next ten; NVFP4 38 ms against 42 ms; 0.6B 5 ms against 5 ms. There is no first-request penalty once the load has finished.
+- The weight seconds vary with the page cache (3.8 to 5.3 s on FP8) and are not part of the JIT split.

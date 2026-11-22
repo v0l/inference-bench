@@ -17,6 +17,8 @@ pub struct Loaded {
     pub module: Arc<CudaModule>,
     pub cache_hit: bool,
     pub key: String,
+    pub compile_secs: f64,
+    pub module_secs: f64,
 }
 
 impl Loaded {
@@ -63,6 +65,7 @@ impl Jit {
         options.push(format!("kir={}", module.kir_hash));
         let key = cache_key(&module.source, arch, &options);
         let path = self.dir.join(format!("{key}.ptx"));
+        let compile_started = std::time::Instant::now();
         let (ptx, cache_hit) = match std::fs::read_to_string(&path) {
             Ok(text) => (text, true),
             Err(_) => {
@@ -80,7 +83,10 @@ impl Jit {
                 (ptx, false)
             }
         };
+        let compile_secs = compile_started.elapsed().as_secs_f64();
+        let module_started = std::time::Instant::now();
         let module = self.ctx.load_module(Ptx::from_src(ptx))?;
-        Ok(Loaded { module, cache_hit, key })
+        let module_secs = module_started.elapsed().as_secs_f64();
+        Ok(Loaded { module, cache_hit, key, compile_secs, module_secs })
     }
 }

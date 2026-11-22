@@ -107,6 +107,7 @@ pub(super) struct MtpState {
     clog: CudaSlice<f32>,
     has_drafts: Vec<bool>,
     graphs: HashMap<usize, CudaGraph>,
+    capture_secs: Vec<(usize, f64)>,
     use_graphs: bool,
     syncs: Cell<u64>,
     stats: SpecStats,
@@ -202,6 +203,7 @@ impl MtpState {
             clog: z(layers * rows * la.conv_dim())?,
             has_drafts: vec![false; rt.slots + 1],
             graphs: HashMap::new(),
+            capture_secs: Vec::new(),
             use_graphs: s.runtime.graphs && m.graph,
             syncs: Cell::new(0),
             stats: SpecStats::default(),
@@ -245,6 +247,10 @@ impl Runtime {
         if let Some(m) = self.mtp.as_mut() {
             m.use_graphs = on;
         }
+    }
+
+    pub fn speculation_capture_secs(&self) -> Vec<(usize, f64)> {
+        self.mtp.as_ref().map(|m| m.capture_secs.clone()).unwrap_or_default()
     }
 
     pub fn captured_speculation_sizes(&self) -> Vec<usize> {
@@ -659,9 +665,15 @@ impl Runtime {
         self.up_i32(&rin, &m.rin)?;
         if graphs {
             if !m.graphs.contains_key(&n) {
+                let started = std::time::Instant::now();
                 let graph = self.capture_round(n)?;
                 graph.upload()?;
-                self.mtp.as_mut().expect("an MTP spec").graphs.insert(n, graph);
+                self.stream.synchronize()?;
+                let secs = started.elapsed().as_secs_f64();
+                tracing::info!(rows = n, capture_secs = secs, "speculation graph captured");
+                let m = self.mtp.as_mut().expect("an MTP spec");
+                m.capture_secs.push((n, secs));
+                m.graphs.insert(n, graph);
             }
             self.mtp().graphs[&n].launch()?;
         } else {
