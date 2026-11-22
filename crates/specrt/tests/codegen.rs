@@ -354,6 +354,20 @@ fn dispatch_specs() -> Vec<(String, Spec)> {
     out
 }
 
+#[test]
+fn source_does_not_depend_on_max_ctx() {
+    let mut differ = Vec::new();
+    for (file, spec) in dispatch_specs() {
+        let (small, large) = if spec.rope.scaling.as_ref().is_some_and(|s| s.longrope.is_some()) { (8192, 16384) } else { (256, 8192) };
+        let a = Module::generate(&spec, small).unwrap();
+        let b = Module::generate(&spec, large).unwrap();
+        if a.source != b.source {
+            differ.push(file);
+        }
+    }
+    assert!(differ.is_empty(), "source changes with max_ctx: {differ:?}");
+}
+
 fn dispatch_variants(base: &Spec) -> Vec<Spec> {
     use specrt::spec::ActQuant;
     let heads = [None, Some(Quant::Bf16), Some(Quant::Fp8Channel), Some(Quant::Nvfp4G16)];
