@@ -120,7 +120,7 @@ impl Default for ServeOptions {
             admit_lookahead: 0,
             prefill_burst_tokens: 16384,
             max_long_in_flight: 4,
-            stall_budget: Duration::from_millis(400),
+            stall_budget: Duration::ZERO,
             runtime: None,
             speculative: SpeculativeOptions::default(),
             placement: None,

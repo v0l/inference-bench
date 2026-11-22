@@ -47,7 +47,7 @@ pub struct ServeArgs {
     pub prefill_burst_tokens: Option<usize>,
     #[arg(long, help = "Prompts over 2048 tokens read at the same time (default 1)")]
     pub max_long_in_flight: Option<usize>,
-    #[arg(long, help = "Cap prefill per step once a decoder has waited this many ms since its last token (default 400, 0 is off)")]
+    #[arg(long, help = "Cap prefill per step once a decoder has waited this many ms since its last token (default 0, off)")]
     pub stall_budget_ms: Option<u64>,
     #[arg(long, help = "Seconds before an idle model is unloaded")]
     pub idle_unload_secs: Option<u64>,
