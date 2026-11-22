@@ -123,6 +123,24 @@ fn qwen3_bf16_gguf_logits_match_llama_cpp_closely() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU, Qwen3-0.6B-IQ*.gguf (llama-quantize with an imatrix) and llama.cpp reference logits q3-IQ*.logits.bin in ~/.cache/specrt-gguf"]
+fn qwen3_iq_gguf_logits_stay_within_the_kl_bound_of_llama_cpp() {
+    let bounds = [("IQ4_NL", 0.05), ("IQ4_XS", 0.1), ("IQ3_S", 0.1), ("IQ3_XXS", 0.1), ("IQ2_S", 0.3), ("IQ2_XS", 0.3), ("IQ2_XXS", 0.5), ("IQ1_S", 1.0), ("IQ1_M", 1.0)];
+    let mut failed = Vec::new();
+    for (q, bound) in bounds {
+        if Spec::from_gguf_file(&dir().join(format!("Qwen3-0.6B-{q}.gguf"))).is_err() {
+            eprintln!("Qwen3-0.6B-{q}.gguf skipped: it mixes in K-quant types (Q2_K, Q3_K) the engine does not read");
+            continue;
+        }
+        let o = run(&format!("Qwen3-0.6B-{q}.gguf"));
+        if o.mean_kl > bound {
+            failed.push(format!("{q}: mean KL {} over {bound}", o.mean_kl));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
+#[test]
 #[ignore = "needs a CUDA GPU, the unsloth Qwen3-0.6B GGUF files and llama.cpp reference logits in ~/.cache/specrt-gguf (scripts/gguf_reference.c)"]
 fn qwen3_q8_0_gguf_logits_stay_within_the_kl_bound_of_llama_cpp() {
     let o = run("Qwen3-0.6B-Q8_0.gguf");
