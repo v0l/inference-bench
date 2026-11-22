@@ -894,7 +894,7 @@ fn server_tab_text_stays_inside_the_screen_from_360_to_600_wide() {
         for (name, gpus) in [("tiny-model", 1), ("tiny-org/a-long-model-name-for-a-phone-instruct-build", 2)] {
             let found = server_tab_painted_text(width, name, gpus);
             assert!(found.len() > 20, "only {} text shapes at {width}", found.len());
-            for (text, r) in found.iter().filter(|(_, r)| r.min.y < 2400.0 - 100.0) {
+            for (text, r) in found.iter() {
                 if r.max.x > width + 0.5 {
                     offenders.push(format!("width {width}, {gpus} gpu, {name}: {text:?} ends at {} past the screen", r.max.x));
                 }
