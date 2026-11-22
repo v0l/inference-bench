@@ -843,6 +843,28 @@ fn where_the_weights_live_and_the_hit_rate_show_for_an_offloaded_model_at_deskto
 }
 
 #[test]
+fn running_options_stay_inside_the_screen_at_phone_width() {
+    let mut h = harness_at("running-phone", Tab::Server, egui::vec2(390.0, 2400.0));
+    with_gpu(&mut h, 0, 96 << 30);
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+    let m = real_model(&h.state().library[0].name.clone());
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().load_model_with(&m, 2048, 2);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    let screen = h.ctx.content_rect();
+    let mut checked = 0;
+    for text in ["what ", "not reported", "tokens", "reasoning parser", "tool parser", "2 of 4 layers"] {
+        for n in h.query_all_by_label_contains(text) {
+            let r = n.rect();
+            checked += 1;
+            assert!(r.right() <= screen.right() + 0.5, "{text} ends at {} past {}", r.right(), screen.right());
+        }
+    }
+    assert!(checked > 0);
+}
+
+#[test]
 #[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshots_of_the_weight_tiers_and_hit_rate_at_desktop_and_phone_width() {
     let out = shots_dir();
