@@ -696,6 +696,30 @@ fn glm5_3_flash_describes_with_its_glm_keys_and_refuses_to_serve() {
 }
 
 #[test]
+fn glm4_5_air_reads_partial_rotary_sigmoid_routing_shared_expert_and_mtp_layer() {
+    let spec = derived("glm4.5-air.config.json");
+    assert_eq!((spec.attention.head_dim, spec.rotary_dim()), (128, 64));
+    assert!(spec.attention.qkv_bias && !spec.attention.qk_norm);
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.top_k(), moe.expert_intermediate, moe.shared_slots()), (128, 8, 1408, 1));
+    assert_eq!((moe.router, moe.score_bias, moe.norm_topk, moe.shared_gate, moe.groups), (specrt::spec::RouterAct::Sigmoid, true, true, false, 0));
+    assert_eq!(moe.dense_layers, vec![0]);
+    assert_eq!(spec.dims.intermediate, 10944);
+    assert_eq!(spec.layers.count, 46);
+    spec.runnable().unwrap();
+}
+
+#[test]
+fn llama4_scout_describes_but_is_refused_for_serving_until_the_engine_has_its_blocks() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/llama4-scout.config.json")).unwrap();
+    let spec = Spec::describe_hf_config(&json).unwrap();
+    assert_eq!(spec.layers.count, 48);
+    assert!(spec.moe.is_none(), "num_local_experts is not read yet");
+    let refusal = Spec::from_hf_config_serving(&json).unwrap_err().to_string();
+    assert!(refusal.contains("model_type llama4 is not supported"), "{refusal}");
+}
+
+#[test]
 fn qwen3_next_nvfp4_config_reads_fp4_experts_and_fused_linear_projections() {
     let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3-next-80b-nvfp4.config.json")).unwrap();
     let spec = Spec::from_hf_config_serving(&json).unwrap();

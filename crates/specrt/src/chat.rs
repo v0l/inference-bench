@@ -20,12 +20,14 @@ pub enum ToolFormat {
     BareJson,
     FunctionsList,
     Unparsed,
+    GlmXml,
 }
 
 impl ToolFormat {
     pub fn parser(self) -> Option<&'static str> {
         match self {
             ToolFormat::XmlFunction => Some("xml_function"),
+            ToolFormat::GlmXml => Some("glm_xml"),
             ToolFormat::Hermes => Some("hermes"),
             ToolFormat::ToolCallList => Some("tool_call_list"),
             ToolFormat::BareJson => Some("bare_json"),
@@ -137,6 +139,8 @@ impl ChatTemplate {
         let s = &self.source;
         if s.contains("<function=") && s.contains("<parameter=") {
             ToolFormat::XmlFunction
+        } else if s.contains("<arg_key>") && s.contains("<tool_call>") {
+            ToolFormat::GlmXml
         } else if s.contains("<tool_call>") {
             ToolFormat::Hermes
         } else if s.contains("<|tool_call|>") {
