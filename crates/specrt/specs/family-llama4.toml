@@ -83,4 +83,7 @@ experts_transposed = true
 shared_gate = false
 
 [runtime]
-split_activations = false
+split_activations = true
+
+[vision]
+ignore = true

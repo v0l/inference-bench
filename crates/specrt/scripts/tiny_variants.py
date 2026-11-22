@@ -316,7 +316,9 @@ def weights(model):
     for name, p in sorted(model.state_dict().items()):
         if ".mlp.experts." in name and "bias" not in name:
             continue
-        if name.endswith("router.bias"):
+        if name.endswith(".feed_forward.router.weight"):
+            v = 6.0 * torch.randn(p.shape, generator=g) / p.shape[-1] ** 0.5
+        elif name.endswith("router.bias"):
             v = 0.3 * torch.randn(p.shape, generator=g)
         elif name.endswith("e_score_correction_bias"):
             v = 0.2 * torch.randn(p.shape, generator=g)

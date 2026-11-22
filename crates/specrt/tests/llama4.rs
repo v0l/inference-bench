@@ -1,5 +1,5 @@
 use specrt::family::Registry;
-use specrt::spec::{EMBEDDED, Spec};
+use specrt::spec::Spec;
 use std::path::Path;
 
 fn fixtures() -> &'static Path {
@@ -7,8 +7,7 @@ fn fixtures() -> &'static Path {
 }
 
 fn registry() -> Registry {
-    let family = std::fs::read_to_string(fixtures().join("family-llama4.toml")).unwrap();
-    Registry::from_texts(EMBEDDED.iter().map(|(_, t)| *t).chain([family.as_str()])).unwrap()
+    Registry::embedded().clone()
 }
 
 fn scout() -> serde_json::Value {

@@ -223,6 +223,7 @@ impl Default for VisionTokenKeys {
 #[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub struct FamilyVision {
+    pub ignore: bool,
     pub pooled: bool,
     pub bidirectional: bool,
     pub soft_tokens_key: String,

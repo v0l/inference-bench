@@ -708,6 +708,9 @@ impl Vision {
         }
         let family = top.get("model_type").and_then(|t| t.as_str()).and_then(|t| registry.for_model_type(t));
         let spec = family.map(|f| f.vision.clone()).unwrap_or_default();
+        if spec.ignore {
+            return Ok(None);
+        }
         let mut config: VisionConfig = serde_json::from_value(vc.clone()).context("vision_config")?;
         if spec.pooled {
             let text = top.get("text_config").unwrap_or(&top);
