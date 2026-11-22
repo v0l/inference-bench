@@ -281,6 +281,15 @@ enum Cmd {
         #[arg(long, help = "sm_120, sm_80, wgpu or wgpu-nosubgroups; the live CUDA device when omitted")]
         target: Option<String>,
     },
+    #[command(about = "Compile and cache the kernels of a spec without loading weights")]
+    Warmup {
+        #[arg(long, help = "Spec name or path")]
+        spec: String,
+        #[arg(long, default_value_t = 4096, help = "Context length the server will run with")]
+        max_ctx: usize,
+        #[arg(long, default_value_t = 8, help = "Sequence slots the server will run with")]
+        slots: usize,
+    },
     #[cfg(unix)]
     #[command(about = "Share this machine's GPUs with other inference-bench apps, headless; `host pair` prints a pairing code")]
     Host(hostcmd::HostArgs),
@@ -419,6 +428,14 @@ fn kernels_command(data: &Path, spec: &str, target: Option<&str>) -> Result<()> 
         None => specrt::codegen::live_target()?,
     };
     print!("{}", specrt::codegen::kernels_report(&spec, &target)?);
+    Ok(())
+}
+
+fn warmup_command(data: &Path, spec: &str, max_ctx: usize, slots: usize) -> Result<()> {
+    let path = resolve_spec_names(data, spec);
+    let spec = specrt::spec::Spec::load(Path::new(&path))?;
+    let w = specrt::runtime::warmup(&spec, max_ctx, slots)?;
+    println!("{} {} ({}) nvrtc {:.2} s, driver load {:.2} s, cache {}", if w.cache_hit { "cached" } else { "compiled" }, w.key, if w.binary { "cubin" } else { "ptx" }, w.compile_secs, w.module_secs, w.cache_dir.display());
     Ok(())
 }
 
@@ -669,6 +686,7 @@ fn main() -> Result<()> {
             std::process::exit(report["exit"].as_i64().unwrap_or(2) as i32);
         }
         Cmd::Spec { model, out, expect_act_quant } => spec_command(model, out.as_deref(), expect_act_quant.as_deref())?,
+        Cmd::Warmup { spec, max_ctx, slots } => warmup_command(&data, spec, *max_ctx, *slots)?,
         Cmd::Kernels { spec, target } => kernels_command(&data, spec, target.as_deref())?,
         Cmd::Plan { spec, config, context, slots, objective, probe } => plan_command(&data, spec, config, *context, *slots, objective.as_deref(), *probe)?,
     }

@@ -125,6 +125,36 @@ Conclusion: the loop was not reproduced on either build or either path. But fp8 
 
 Default since #763: with fp8 KV and `kv_f16_layers` unset, the engine keeps half the attention layers in f16 up to 32768 tokens of configured context, and three quarters (12 of 16 on the 27B) above it (`Spec::for_kv_context`, applied by `Engine::load_with`, `Core::start` and the load dialog). An explicit `kv_f16_layers` still wins; below three quarters past 32k the dialog and the engine log warn. Cost: KV per token goes from 0.74x to 0.86x of f16, so fp8 holds about 1.16x the tokens of f16 instead of 1.35x. Verified bound with the default: 163840 tokens. int8 with a per-row scale (llama.cpp q8_0 style, about 0.51x of f16) is the planned long-context replacement.
 
+### int8 KV gate (#796, 22 Nov)
+
+Result: FAILED, code not merged. It lives on the unmerged branch `issue-796-int8-kv-code` (kir `kv_int8` shape flag, `KvDtype::Int8`, `kvgate --dtype int8`, goldens, the sink simulation). To revive it: `git merge issue-796-int8-kv-code`, rebuild `kvgate` and rerun the commands in this section on GPU1 through `gpu-run 1`.
+
+`kv_dtype = "int8"` is implemented (one signed byte per value, f32 scale `amax / 127` per head and token row, quantised in `norm_rope_head`, dequantised in registers in all four attention families through the kir attention spec flag `kv_int8`). KV per token is 0.51x of f16 on the 27B. Tiny fixtures on GPU: KL against f16 is 2e-6 at 300 and 4096 tokens (`int8_kv_logits_stay_within_the_kl_bound_of_f16`).
+
+27B NVFP4, GPU1, agentic transcript, 48 teacher-forced decode steps per prompt, every layer int8:
+
+| context | f16 layers | prompts | mean KL | max KL | positions above 0.1 |
+| --- | --- | --- | --- | --- | --- |
+| 65536 | 0 | 3 | 0.044 | 2.26 | 7 of 147 |
+| 163840 | 0 | 2 | 0.275 | 21.8 | 12 of 98 |
+| 163840 | 2 | 2 | 0.356 | 22.9 | 15 of 98 |
+| 163840 | 4 | 2 | 0.092 | 3.05 | 12 of 98 |
+
+The gate (max KL under 0.05, no position above 0.1) fails: int8 with a per-row scale drifts like fp8 on the early attention layers. The spikes persist with 4 f16 layers (max 3.05). Batch-8 decode, 27B, 8k context: f16 305.6, fp8 305.7, int8 299.8 tok/s aggregate (int8 is 2 percent behind). The 32k batch-8 row is missing: it ran out of GPU memory on GPU1. Skipped: `kvgate loop` at 150k and the 128k KL row, since the 64k and 160k rows already fail the bound (an earlier 128k run with the default 8 steps was clean, max KL 0.0001, but that is 18 positions).
+
+Because the gate fails, discover and the load dialog still offer f16, mixed fp8 and fp8 only; int8 is opt-in through `runtime.kv_dtype`.
+
+What the numbers imply: int8 with a per-row scale has 127 levels against fp8's 3-bit mantissa and is still as bad as fp8 on the early layers, so the loss does not come from the number of bits. The likely cause is a few tokens or channels with extreme values (attention sinks, outlier channels in K) that any per-row scale handles badly: one large channel sets the scale and crushes the rest of the row.
+
+Experiment, sink exemption (64k, 3 prompts, 48 steps, all layers). A simulation in `norm_rope_head` (env `KIR_FAKE_INT8_SKIP=<n>`, f16 cache, K and V rows at positions `>= n` pass through the int8 per-row quantise and dequantise, rows below `n` stay exact):
+
+| exempt first tokens | mean KL | max KL | positions above 0.1 |
+| --- | --- | --- | --- |
+| 0 (all int8, simulated) | 0.047 | 2.58 | 7 of 147 |
+| 64 | 0.023 | 1.75 | 6 of 147 |
+
+The simulated 0 row matches the real int8 run (0.044, 2.26). Keeping the first 64 tokens exact halves the mean but leaves the spikes: max KL stays 1.75 and 6 of the 7 bad positions remain. Answer: no, the spikes are not mainly the attention sink. They are spread over later tokens, or come from outlier channels in K. Not run (did not fit the window): a per-channel K scale, and logging the position of the worst row per prompt. Next experiment: a per-channel K scale (a fixed per-layer, per-head channel scale from a calibration pass) through the same simulation hook, plus per-position error logging for the spike rows. Until then the #763 stopgap (12 of 16 layers f16 past 32k) stays the long-context choice.
+
 ### Rerun the gate
 
 ```sh

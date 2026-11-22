@@ -462,3 +462,15 @@ read ceiling), `mtp_head_f4w_tiny` 2.7 ms (two draft heads), `batch_decode_atten
 `lin_in_f8_narrow` 2.0 ms, `gdn_verify` 1.3 ms, `gdn_commit` 1.2 ms. The two heads and the fused
 head plus accept were not done; the weight GEMVs at 17 to 32 rows need an mma small-M kernel, since the
 existing 32-row GEMV is slower than the act-quant tile GEMM there (see above).
+
+## Prompt-lookup drafter: replay result (#405)
+
+`crates/specrt/scripts/lookup_sim.py <tokenizer.json>` replays 50 recorded agent turns (assistant text and tool call arguments from `~/.pi/agent/sessions`, with the preceding 40 messages, tool outputs included, as context) through a host-only n-gram lookup. The turn's own tokens stand in for the target's greedy tokens. A step uses lookup drafts only when they are longer than MTP's expected accepted length (1.43 of 2.43), otherwise it advances at MTP's measured 2.43 tokens per step.
+
+| ngram | seeds | gain over MTP 2.43 (tokens/step) |
+|---|---|---|
+| 2..4 (the issue default) | 1, 2, 3 | +0.04, -0.07, +0.03 |
+| 3..4 | 1, 2 | +0.13, +0.06 |
+| 4..4 or 4..8 | 1, 2 | +0.16, +0.09 |
+
+The bar for building was +0.3. No setting reaches it, and the simulation ignores the extra verify cost of a 5-token draft, so the real gain would be lower. Not built: no `[speculative] lookup` option, no index in the scheduler.
