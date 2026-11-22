@@ -206,13 +206,21 @@ impl Runtime {
         if tiled {
             let rows = crate::codegen::flash_rows(a.head_dim, self.kv_planes);
             let tokens = run.n as i32;
+            let splits = crate::codegen::decode_splits(self.max_ctx) as i32;
             let config = if run.bb.is_none() {
                 b.arg(&tokens);
                 LaunchConfig { grid_dim: (grid(run.n, rows), a.heads as u32, 1), block_dim: (rows as u32 * 2, 1, 1), shared_mem_bytes: self.smem["flash_mma"] }
             } else {
-                LaunchConfig { grid_dim: (a.kv_heads as u32, run.n as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: self.smem["flash_mma"] }
+                let bb = run.bb.expect("tile decode runs on batch buffers");
+                b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&splits);
+                LaunchConfig { grid_dim: (a.kv_heads as u32, run.n as u32, splits as u32), block_dim: (128, 1, 1), shared_mem_bytes: self.smem["flash_mma"] }
             };
             unsafe { b.launch(config) }?;
+            if let Some(bb) = run.bb {
+                let mut c = self.launcher(self.kernel("batch_decode_combine"));
+                c.arg(&bb.part_acc).arg(&bb.part_ml).arg(&self.pre.qkv).arg(&bb.pos).arg(&1i32).arg(&splits).arg(&self.pre.attn_planes.hi).arg(&self.pre.attn_planes.lo);
+                unsafe { c.launch(LaunchConfig { grid_dim: (a.heads as u32, run.n as u32, 1), block_dim: (a.head_dim as u32 / 2, 1, 1), shared_mem_bytes: 0 }) }?;
+            }
             return Ok(());
         }
         let dim = |symbol: &String| -> Result<u32> {
