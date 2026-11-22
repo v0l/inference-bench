@@ -146,7 +146,7 @@ impl Jit {
         let (major, minor) = ctx.compute_capability()?;
         let arch: &'static str = Box::leak(format!("compute_{major}{minor}").into_boxed_str());
         std::fs::create_dir_all(&dir)?;
-        Ok(Jit { ctx, dir, arch, options: vec!["--std=c++17".to_string()], max_bytes: DEFAULT_CACHE_MAX_BYTES, jobs: 1 })
+        Ok(Jit { ctx, dir, arch, options: vec!["--std=c++17".to_string()], max_bytes: DEFAULT_CACHE_MAX_BYTES, jobs: default_compile_jobs() })
     }
 
     pub fn with_limits(mut self, max_bytes: u64, jobs: usize) -> Self {

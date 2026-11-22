@@ -887,7 +887,7 @@ pub fn warmup(spec: &Spec, max_ctx: usize, slots: usize) -> Result<Warmup> {
     let ctx = CudaContext::new(0).context("cuda init")?;
     let target = crate::codegen::cuda_target(&ctx)?;
     let module = Module::generate_kv(&resolved, layout.max_ctx, layout.kv_planes, &target)?;
-    let jit = Jit::new(ctx, cache_dir.clone())?.with_limits(resolved.runtime.cache_max_bytes.unwrap_or(crate::jit::DEFAULT_CACHE_MAX_BYTES), resolved.runtime.compile_jobs.unwrap_or(1));
+    let jit = Jit::new(ctx, cache_dir.clone())?.with_limits(resolved.runtime.cache_max_bytes.unwrap_or(crate::jit::DEFAULT_CACHE_MAX_BYTES), resolved.runtime.compile_jobs.unwrap_or(crate::jit::default_compile_jobs()));
     let loaded = jit.load(&module)?;
     Ok(Warmup { key: loaded.key, cache_hit: loaded.cache_hit, binary: loaded.binary, compile_secs: loaded.compile_secs, module_secs: loaded.module_secs, cache_dir })
 }
@@ -958,7 +958,7 @@ impl Runtime {
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let cache_dir = spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
-        let jit = Jit::new(ctx.clone(), cache_dir.clone())?.with_limits(spec.runtime.cache_max_bytes.unwrap_or(crate::jit::DEFAULT_CACHE_MAX_BYTES), spec.runtime.compile_jobs.unwrap_or(1));
+        let jit = Jit::new(ctx.clone(), cache_dir.clone())?.with_limits(spec.runtime.cache_max_bytes.unwrap_or(crate::jit::DEFAULT_CACHE_MAX_BYTES), spec.runtime.compile_jobs.unwrap_or(crate::jit::default_compile_jobs()));
         let comm = match tp {
             Some((_, rank, fabric)) => Some(fabric.comm(rank, &stream, cache_dir, Some((spec.dims.hidden as u32, spec.norm.eps as f32)))?),
             None => None,
