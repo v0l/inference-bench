@@ -178,6 +178,7 @@ impl ChatTemplate {
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_function("strftime_now", |format: String| -> String { strftime_now(&format) });
         env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
             Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
         });
@@ -196,6 +197,28 @@ impl ChatTemplate {
         let ctx = context! { ..minijinja::Value::from_serialize(vars), ..base };
         env.get_template("chat").and_then(|t| t.render(ctx)).map_err(|e| anyhow!("chat template: {e}"))
     }
+}
+
+fn strftime_now(format: &str) -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format
+        .replace("%Y", &format!("{year:04}"))
+        .replace("%m", &format!("{month:02}"))
+        .replace("%d", &format!("{day:02}"))
+        .replace("%H", &format!("{:02}", rem / 3600))
+        .replace("%M", &format!("{:02}", rem % 3600 / 60))
+        .replace("%S", &format!("{:02}", rem % 60))
 }
 
 fn text_parts(content: &Value) -> Option<Vec<String>> {
