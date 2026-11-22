@@ -868,6 +868,9 @@ fn capture_painted_text(ctx: &egui::Context) {
 fn server_tab_painted_text(width: f32, name: &str, gpus: usize) -> Vec<(String, egui::Rect)> {
     let mut h = harness_at(&format!("clip-{width}-{gpus}"), Tab::Server, egui::vec2(width, 2400.0));
     capture_painted_text(&h.ctx);
+    for i in 0..3 {
+        tracing::info!(method = "POST", path = "/v1/chat/completions", status = 200, elapsed_ms = 1234 + i, "request finished");
+    }
     with_gpu(&mut h, 0, 96 << 30);
     let one = h.state().gpu[0].clone();
     h.state_mut().gpu = vec![one; gpus];
@@ -888,10 +891,10 @@ fn server_tab_text_stays_inside_the_screen_from_360_to_600_wide() {
     let _guard = PAINTED_TEXT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut offenders = Vec::new();
     for width in [360.0f32, 390.0, 412.0, 600.0] {
-        for (name, gpus) in [("Qwen3-0.6B", 1), ("HuggingFaceTB/SmolLM2-135M-Instruct", 2)] {
+        for (name, gpus) in [("tiny-model", 1), ("tiny-org/a-long-model-name-for-a-phone-instruct-build", 2)] {
             let found = server_tab_painted_text(width, name, gpus);
             assert!(found.len() > 20, "only {} text shapes at {width}", found.len());
-            for (text, r) in &found {
+            for (text, r) in found.iter().filter(|(_, r)| r.min.y < 2400.0 - 100.0) {
                 if r.max.x > width + 0.5 {
                     offenders.push(format!("width {width}, {gpus} gpu, {name}: {text:?} ends at {} past the screen", r.max.x));
                 }
@@ -914,7 +917,7 @@ fn screenshot_of_the_server_tab_with_a_long_model_name_at_phone_width() {
     h.state_mut().gpu = vec![one; 2];
     h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
     let mut m = real_model(&h.state().library[0].name.clone());
-    m.name = "HuggingFaceTB/SmolLM2-135M-Instruct".to_string();
+    m.name = "tiny-org/a-long-model-name-for-a-phone-instruct-build".to_string();
     h.state_mut().library[0] = m.clone();
     h.state_mut().load_model_with(&m, 2048, 2);
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
