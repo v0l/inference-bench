@@ -842,6 +842,110 @@ fn where_the_weights_live_and_the_hit_rate_show_for_an_offloaded_model_at_deskto
     }
 }
 
+static PAINTED_TEXT: std::sync::Mutex<Vec<(String, egui::Rect)>> = std::sync::Mutex::new(Vec::new());
+
+fn capture_painted_text(ctx: &egui::Context) {
+    ctx.on_end_pass(
+        "painted-text",
+        std::sync::Arc::new(|ui: &mut egui::Ui| {
+            let ctx = ui.ctx().clone();
+            let found: Vec<(String, egui::Rect)> = ctx.graphics(|g| {
+                [egui::LayerId::background()]
+                    .into_iter()
+                    .filter_map(|id| g.get(id))
+                    .flat_map(|list| list.all_entries())
+                    .filter_map(|c| match &c.shape {
+                        egui::Shape::Text(t) if !t.galley.text().trim().is_empty() => Some((t.galley.text().to_string(), c.shape.visual_bounding_rect())),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            *PAINTED_TEXT.lock().unwrap() = found;
+        }),
+    );
+}
+
+fn server_tab_painted_text(width: f32, name: &str, gpus: usize) -> Vec<(String, egui::Rect)> {
+    let mut h = harness_at(&format!("clip-{width}-{gpus}"), Tab::Server, egui::vec2(width, 2400.0));
+    capture_painted_text(&h.ctx);
+    for i in 0..3 {
+        tracing::info!(method = "POST", path = "/v1/chat/completions", status = 200, elapsed_ms = 1234 + i, "request finished");
+    }
+    with_gpu(&mut h, 0, 96 << 30);
+    let one = h.state().gpu[0].clone();
+    h.state_mut().gpu = vec![one; gpus];
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+    let mut m = real_model(&h.state().library[0].name.clone());
+    m.name = name.to_string();
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().load_model_with(&m, 2048, 2);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    h.step();
+    let found = PAINTED_TEXT.lock().unwrap().clone();
+    found
+}
+
+#[test]
+fn server_tab_text_stays_inside_the_screen_from_360_to_600_wide() {
+    let _guard = PAINTED_TEXT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut offenders = Vec::new();
+    for width in [360.0f32, 390.0, 412.0, 600.0] {
+        for (name, gpus) in [("tiny-model", 1), ("tiny-org/a-long-model-name-for-a-phone-instruct-build", 2)] {
+            let found = server_tab_painted_text(width, name, gpus);
+            assert!(found.len() > 20, "only {} text shapes at {width}", found.len());
+            for (text, r) in found.iter() {
+                if r.max.x > width + 0.5 {
+                    offenders.push(format!("width {width}, {gpus} gpu, {name}: {text:?} ends at {} past the screen", r.max.x));
+                }
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+}
+
+static PAINTED_TEXT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshot_of_the_server_tab_with_a_long_model_name_at_phone_width() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness_at("server-phone-shot", Tab::Server, egui::vec2(390.0, 844.0));
+    with_gpu(&mut h, 0, 96 << 30);
+    let one = h.state().gpu[0].clone();
+    h.state_mut().gpu = vec![one; 2];
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+    let mut m = real_model(&h.state().library[0].name.clone());
+    m.name = "tiny-org/a-long-model-name-for-a-phone-instruct-build".to_string();
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().load_model_with(&m, 2048, 2);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    h.render().unwrap().save(out.join("server-phone-390x844.png")).unwrap();
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshots_of_the_status_bar_with_a_long_model_name_at_phone_and_desktop_width() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (name, size) in [("status-phone-390x844", egui::vec2(390.0, 844.0)), ("status-desktop-1280x800", egui::vec2(1280.0, 800.0))] {
+        let mut h = harness_at(name, Tab::Server, size);
+        with_gpu(&mut h, 0, 96 << 30);
+        let one = h.state().gpu[0].clone();
+        h.state_mut().gpu = vec![one; 2];
+        h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+        let mut m = real_model(&h.state().library[0].name.clone());
+        m.name = "tiny-org/a-long-model-name-for-a-phone-instruct-build".to_string();
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().load_model_with(&m, 2048, 2);
+        pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    }
+}
+
 #[test]
 #[ignore = "renders with wgpu; run with SHOTS=dir"]
 fn screenshots_of_the_weight_tiers_and_hit_rate_at_desktop_and_phone_width() {

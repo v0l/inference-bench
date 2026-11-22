@@ -293,6 +293,13 @@ impl Kernel {
         Ok(k)
     }
 
+    pub fn tile_scan(&self) -> bool {
+        match &self.body {
+            Body::Scan(s) => s.tile_eligible() && s.tile_names_free(&self.params) && self.target.has(Feature::Mma16816) && self.target.has(Feature::CpAsync) && self.target.language == Language::Cuda,
+            _ => false,
+        }
+    }
+
     pub fn chunk_form(&self) -> Option<recur::ChunkForm> {
         match &self.body {
             Body::Recurrence(r) => r.chunk_form(self),

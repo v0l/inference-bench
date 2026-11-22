@@ -154,7 +154,19 @@ impl Runtime {
             ints[i] = v as i32;
             floats[i] = v as f32;
         }
-        let mut b = self.launcher(self.kernel(launch.name));
+        let a = &self.spec.attention;
+        let tiled = launch.tile && !self.scan_tile_off.load(std::sync::atomic::Ordering::Relaxed) && !self.spec.runtime.kv_dtype.is_fp8() && spec_node.grid.len() == 2 && spec_node.grid[0] == "heads" && spec_node.grid[1] == "rows" && a.heads / a.kv_heads <= 16;
+        let tile_name = tiled.then(|| format!("{}{}", launch.name, if run.bb.is_none() { "_mma" } else { "_mma_dec" }));
+        let which = match (tiled, run.bb.is_none()) {
+            (true, true) => 0,
+            (true, false) => 1,
+            _ => 2,
+        };
+        self.scan_launches[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut b = match &tile_name {
+            Some(n) => self.launcher(self.kernel(n)),
+            None => self.launcher(self.kernel(launch.name)),
+        };
         for (i, p) in launch.params.iter().enumerate() {
             match (p.role, p.name) {
                 (kir::Role::Value, _) => match p.ty {
@@ -190,6 +202,26 @@ impl Runtime {
                 (_, "out_lo") => b.arg(&self.pre.attn_planes.lo),
                 (_, name) => bail!("kernel {} has an unknown buffer param {name:?}", launch.name),
             };
+        }
+        if tiled {
+            let rows = crate::codegen::flash_rows(a.head_dim, self.kv_planes);
+            let tokens = run.n as i32;
+            let splits = crate::codegen::decode_splits(self.max_ctx) as i32;
+            let config = if run.bb.is_none() {
+                b.arg(&tokens);
+                LaunchConfig { grid_dim: (grid(run.n, rows), a.heads as u32, 1), block_dim: (rows as u32 * 2, 1, 1), shared_mem_bytes: self.smem["flash_mma"] }
+            } else {
+                let bb = run.bb.expect("tile decode runs on batch buffers");
+                b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&splits);
+                LaunchConfig { grid_dim: (a.kv_heads as u32, run.n as u32, splits as u32), block_dim: (128, 1, 1), shared_mem_bytes: self.smem["flash_mma"] }
+            };
+            unsafe { b.launch(config) }?;
+            if let Some(bb) = run.bb {
+                let mut c = self.launcher(self.kernel("batch_decode_combine"));
+                c.arg(&bb.part_acc).arg(&bb.part_ml).arg(&self.pre.qkv).arg(&bb.pos).arg(&1i32).arg(&splits).arg(&self.pre.attn_planes.hi).arg(&self.pre.attn_planes.lo);
+                unsafe { c.launch(LaunchConfig { grid_dim: (a.heads as u32, run.n as u32, 1), block_dim: (a.head_dim as u32 / 2, 1, 1), shared_mem_bytes: 0 }) }?;
+            }
+            return Ok(());
         }
         let dim = |symbol: &String| -> Result<u32> {
             let a = &self.spec.attention;

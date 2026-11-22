@@ -84,7 +84,55 @@ fn glyph(p: &egui::Painter, tab: Tab, c: Pos2, tint: egui::Color32) {
 }
 
 fn status_bar(app: &mut App, ui: &mut egui::Ui) {
+    if ui.available_width() < 560.0 {
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| status_left(app, ui, 0.0));
+            if let Some((ok, text)) = app.notice.clone() {
+                crate::working::status_line(ui, ok, &text, 0.0);
+            }
+            ui.horizontal(|ui| {
+                if let Some(s) = crate::chat::last_request(app) {
+                    last_request_line(ui, &s);
+                    ui.add_space(14.0);
+                }
+                vram_line(app, ui);
+            });
+        });
+        return;
+    }
     ui.horizontal(|ui| {
+        status_left(app, ui, 460.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            vram_line(app, ui);
+            if let Some(s) = crate::chat::last_request(app) {
+                ui.add_space(14.0);
+                last_request_line(ui, &s);
+            }
+        });
+    });
+}
+
+fn last_request_line(ui: &mut egui::Ui, s: &inference_bench_core::live::RequestRecord) {
+    let mut line = Line::new().legend("ttft").measured(format!("{:.0} ms", s.ttft_secs * 1000.0));
+    if s.decode_tok_s > 0.0 {
+        line = line.gap(10.0).legend("decode").measured(format!("{:.1} t/s", s.decode_tok_s));
+    }
+    line.size(11.0).show(ui);
+}
+
+fn vram_line(app: &App, ui: &mut egui::Ui) {
+    if let Some((used, total)) = inference_bench_core::gpu::used_total(&app.gpu) {
+        let legend = if app.gpu.len() > 1 { format!("vram x{}", app.gpu.len()) } else { "vram".into() };
+        let mut line = Line::new().legend(&legend).measured(format!("{} / {}", human_size(used), human_size(total)));
+        if let Some(u) = inference_bench_core::gpu::mean_util(&app.gpu) {
+            line = line.gap(12.0).legend("gpu").measured(format!("{u}%"));
+        }
+        line.size(11.0).show(ui);
+    }
+}
+
+fn status_left(app: &mut App, ui: &mut egui::Ui, reserve: f32) {
+    {
         match (&app.loading, app.loaded()) {
             (Some(name), _) => {
                 lamp(ui, &format!("loading {name}"), true, false);
@@ -99,29 +147,11 @@ fn status_bar(app: &mut App, ui: &mut egui::Ui) {
                 lamp(ui, "no model loaded", false, false);
             }
         }
-        if let Some((ok, text)) = &app.notice {
+        if let (true, Some((ok, text))) = (reserve > 0.0, &app.notice) {
             ui.add_space(10.0);
-            crate::working::status_line(ui, *ok, text, 460.0);
+            crate::working::status_line(ui, *ok, text, reserve);
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some((used, total)) = inference_bench_core::gpu::used_total(&app.gpu) {
-                let legend = if app.gpu.len() > 1 { format!("vram x{}", app.gpu.len()) } else { "vram".into() };
-                let mut line = Line::new().legend(&legend).measured(format!("{} / {}", human_size(used), human_size(total)));
-                if let Some(u) = inference_bench_core::gpu::mean_util(&app.gpu) {
-                    line = line.gap(12.0).legend("gpu").measured(format!("{u}%"));
-                }
-                line.size(11.0).show(ui);
-            }
-            if let Some(s) = crate::chat::last_request(app) {
-                ui.add_space(14.0);
-                let mut line = Line::new().legend("ttft").measured(format!("{:.0} ms", s.ttft_secs * 1000.0));
-                if s.decode_tok_s > 0.0 {
-                    line = line.gap(10.0).legend("decode").measured(format!("{:.1} t/s", s.decode_tok_s));
-                }
-                line.size(11.0).show(ui);
-            }
-        });
-    });
+    }
 }
 
 pub fn draw(app: &mut App, root: &mut egui::Ui) {

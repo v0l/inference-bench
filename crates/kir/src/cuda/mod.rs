@@ -11,6 +11,7 @@ pub(crate) mod topk;
 
 pub use allreduce::{PROBE_STORE, PROBE_WAIT, emit_allreduce, emit_peer_probe};
 pub use attention::emit_attention;
+pub(crate) use attention::scan_tile::{TileScan, decode as scan_tile_decode, prefill as scan_tile_prefill};
 pub use linear::emit_linear;
 pub use ggml::emit_ggml;
 pub use vision::emit_vision;

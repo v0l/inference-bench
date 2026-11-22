@@ -537,6 +537,14 @@ impl Module {
             if !kernels.contains(&k.name) {
                 kernels.push(k.name);
             }
+            if k.tile_scan() && kernels.contains(&"flash_mma") {
+                let tile_smem = smem.get("flash_mma").copied().unwrap_or(0);
+                for n in [format!("{}_mma", k.name), format!("{}_mma_dec", k.name)] {
+                    let n: &'static str = Box::leak(n.into_boxed_str());
+                    kernels.push(n);
+                    smem.insert(n, tile_smem);
+                }
+            }
             if let Some(f) = k.chunk_form() {
                 kernels.extend([f.state, f.carry, f.out]);
                 smem.insert(f.state, f.state_smem);

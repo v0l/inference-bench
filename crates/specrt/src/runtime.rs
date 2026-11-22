@@ -438,6 +438,7 @@ struct DescribedLaunch {
     threads: u32,
     params: Vec<kir::Param>,
     chunk: Option<kir::recur::ChunkForm>,
+    tile: bool,
 }
 
 struct DeviceAttn {
@@ -804,6 +805,8 @@ pub struct Runtime {
     lm_head: DeviceMatrix,
     layers: Vec<DeviceLayer>,
     described: Vec<Option<DescribedLaunch>>,
+    scan_tile_off: std::sync::atomic::AtomicBool,
+    scan_launches: [std::sync::atomic::AtomicUsize; 3],
     scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
     int_scratch: std::collections::BTreeMap<String, CudaSlice<i32>>,
     buf: Buffers,
@@ -1084,7 +1087,7 @@ impl Runtime {
         let smem = module.smem.clone();
         let described: Vec<Option<DescribedLaunch>> = crate::codegen::described_kernels(spec, layout.kv_planes, max_ctx, &target)?
             .into_iter()
-            .map(|k| k.map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, params: k.params }))
+            .map(|k| k.map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, tile: k.tile_scan(), params: k.params }))
             .collect();
         let linear_tuning = LinearTuning::for_target(&target);
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
@@ -1154,7 +1157,7 @@ impl Runtime {
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
         let mixer_launch: Vec<DescribedLaunch> = crate::codegen::mixer_kernels(spec, layout.kv_planes, max_ctx, &target)?
             .into_iter()
-            .map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: k.chunk_form().filter(|_| spec.runtime.chunked_scan), params: k.params })
+            .map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: k.chunk_form().filter(|_| spec.runtime.chunked_scan), tile: false, params: k.params })
             .collect();
         let chunk_tiles = match &spec.mixer {
             Some(m) => mixer_launch
@@ -1260,6 +1263,8 @@ impl Runtime {
             lm_head,
             layers,
             described,
+            scan_launches: Default::default(),
+            scan_tile_off: Default::default(),
             scratch: spec
                 .attention
                 .scratch
@@ -1373,6 +1378,14 @@ impl Runtime {
 
     fn launcher<'a>(&'a self, f: &'a CudaFunction) -> crate::launch::Launch<'a> {
         crate::launch::Launch::new(&self.stream, f, self.pdl, self.sms * 8)
+    }
+
+    pub fn set_scan_tile(&self, on: bool) {
+        self.scan_tile_off.store(!on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn scan_launches(&self) -> [usize; 3] {
+        self.scan_launches.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     fn kernel(&self, name: &str) -> &CudaFunction {
@@ -1683,7 +1696,16 @@ impl Runtime {
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
         ensure!(self.head_part.is_none(), "a vocabulary sharded rank decodes through the plan, not the single stream step");
         ensure!(self.spec.requanted_linears().is_empty(), "requantised attention and delta-net projections run on the plan decode path (the scheduler), not the single stream step");
-        ensure!(self.spec.attention.node.is_empty() && self.spec.mixer.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "described attention, mixers, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        ensure!(self.spec.mixer.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "mixers, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        if !self.spec.attention.node.is_empty() {
+            ensure!(self.use_mma, "described attention needs the tensor core path");
+            let run = exec::Run { n: 1, tokens: &self.buf.token, logits: &self.buf.logits, rows: 0..1, bb: None, start: None, qlen: 1, mtp: None };
+            return crate::executor::run_plan(self, &self.plans.prefill, &run, &mut |i| {
+                let Some(trace) = trace else { return Ok(()) };
+                let n = self.spec.dims.hidden;
+                self.copy_rows(&self.pre.x.slice(..n), &trace.slice(i * n..(i + 1) * n), n)
+            });
+        }
         let s = &self.spec;
         let a = &s.attention;
         let buf = &self.buf;

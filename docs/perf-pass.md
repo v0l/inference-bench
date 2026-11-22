@@ -16,6 +16,8 @@ The smallest real checkpoint of the family, plus one mid size if it fits beside 
 - Decode roofline: weight bytes times decode tok/s against the device bandwidth (`ROOF_GBS`, 273 GB/s on the GB10). For a kernel, bytes it must read over its median time.
 - Gap: batch step wall time minus the nsys kernel sum per step. A gap above about 10% of the step is the first thing to fix, before any kernel.
 
+For dense bf16 families, read the prefill table for the flash attention kernel (`flash_mma`, 6-14% of prefill on llama and smollm3 after #821) and write its share, median time and TFLOP/s next to the GEMM main loop's (85% of cuBLAS) in the family report. These two are the remaining prefill gap to vLLM (scoreboard ratio 0.64-0.80 at 1,024 tokens).
+
 ## 3. Iterate
 
 One change at a time, in kir prims (never a per-architecture kernel). Judge with a paired A/B:

@@ -18,6 +18,8 @@ mod mma;
 pub(crate) mod prim;
 #[path = "attention/rope.rs"]
 mod rope;
+#[path = "attention/scan_tile.rs"]
+pub(crate) mod scan_tile;
 #[path = "attention/split.rs"]
 mod split;
 
