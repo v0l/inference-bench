@@ -55,6 +55,7 @@ fn script() -> Script {
         first_delay_ms: 20,
         usage: Some((9, 3)),
         fail_status: None,
+        offload: None,
         vision: false,
         files: Default::default(),
         sessions: Default::default(),
@@ -800,6 +801,70 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
     assert_eq!(h.state().loaded().unwrap().max_num_seqs, 6);
     assert_eq!(h.state().settings.seqs_for("Qwen3-0.6B"), 6);
     assert_eq!(Settings::load(&h.state().dir).seqs_for("Qwen3-0.6B"), 6);
+}
+
+fn offloaded_script() -> Script {
+    use specrt::offload::{LayerResidency, OffloadPlan, OffloadStats, Tier};
+    let layers = (0..4).map(|i| LayerResidency { layer: i, bytes: 2 << 30, tier: if i < 2 { Tier::Vram } else if i == 2 { Tier::Host } else { Tier::Nvme }, pinned: i < 2 }).collect();
+    let plan = OffloadPlan { layers, staging_bytes: 1 << 30, vram_bytes: 5 << 30, host_bytes: 2 << 30, nvme_bytes: 2 << 30, host_staging_bytes: 0 };
+    let stats = OffloadStats { vram_hits: 3, host_hits: 1, nvme_reads: 0, host_to_vram_bytes: 10, ..Default::default() };
+    Script { offload: Some((plan, stats)), ..script() }
+}
+
+#[test]
+fn where_the_weights_live_and_the_hit_rate_show_for_an_offloaded_model_at_desktop_and_phone_width() {
+    for (name, size) in [("tiers-desktop", egui::vec2(1280.0, 1400.0)), ("tiers-phone", egui::vec2(390.0, 2400.0))] {
+        let mut h = harness_at(name, Tab::Server, size);
+        with_gpu(&mut h, 0, 96 << 30);
+        h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+        let m = real_model(&h.state().library[0].name.clone());
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().load_model_with(&m, 2048, 2);
+        pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+        pump_until(&mut h, 10, "serving reading", |a| a.engine.reading().serving.is_some());
+        h.run();
+        assert!(h.state().engine.handle().serving_stats_of(&m.name).and_then(|s| s.offload_plan).is_some());
+        h.get_by_label_contains("2 of 4 layers stream in");
+        let screen = h.ctx.content_rect();
+        for text in ["2 of 4 layers stream in", m.name.as_str()] {
+            for n in h.get_all_by_label_contains(text) {
+                let r = n.rect();
+                assert!(r.right() <= screen.right() + 0.5, "{text} at {size:?} ends at {} past {}", r.right(), screen.right());
+            }
+        }
+        let r = h.state().engine.reading();
+        let shown = crate::serving::offload_readings(&r, 2.5e9);
+        assert_eq!(shown[0].1, "75%");
+        assert_eq!(shown[1].1, "2.50 GB/s");
+        let plan = h.state().engine.handle().serving_stats_of(&m.name).unwrap().offload_plan.unwrap();
+        let cells = crate::tiers::tier_cells(&plan);
+        assert_eq!(cells.iter().map(|c| c.0).collect::<Vec<_>>(), ["vram", "host ram", "nvme"]);
+    }
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshots_of_the_weight_tiers_and_hit_rate_at_desktop_and_phone_width() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (name, size) in [("tiers-desktop", egui::vec2(1280.0, 1500.0)), ("tiers-phone", egui::vec2(390.0, 2600.0))] {
+        let mut h = harness_at(name, Tab::Server, size);
+        with_gpu(&mut h, 0, 96 << 30);
+        h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+        let m = real_model(&h.state().library[0].name.clone());
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().load_model_with(&m, 2048, 2);
+        pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+        pump_until(&mut h, 10, "serving reading", |a| a.engine.reading().serving.is_some());
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    }
+}
+
+#[test]
+fn without_offload_no_weight_readings_show() {
+    let r = inference_bench_core::live::Reading { generated: 0, prefilled: 0, requests: 0, running: 0, waiting: 0, max_seqs: 1, ttft: specrt::serve::Histogram::new(&[1.0]), itl: specrt::serve::Histogram::new(&[1.0]), serving: Some(specrt::serve::Stats::default()) };
+    assert!(crate::serving::offload_readings(&r, 0.0).is_empty());
 }
 
 #[test]
