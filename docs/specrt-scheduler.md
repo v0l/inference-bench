@@ -49,8 +49,7 @@ to allocate and free, and a table entry is the same for all layers. The kernels 
 - **Chunked prefill and the inter-token target.** Each step decodes every running decoder, then
   spends a prefill budget on the waiting prefills in FCFS order, in chunks of at most
   `max_batched_tokens - decoders` and the runtime chunk (2048). With decoders running, the budget
-  is `itl_target` (default 100 ms) times the measured prefill rate, in multiples of 64 tokens, so
-  a step costs about one decode plus one `itl_target` of prefill. Until a rate has been measured
+  is `(step_cost - 1)` times the measured plain decode step, times the measured prefill rate, in multiples of 64 tokens, so a step costs about `step_cost` decode steps (server config `step_cost`, default 3, 1 or less is off; `itl_target_ms`, default off, is an optional absolute cap). Until a rate has been measured
   the first chunk next to decoders is 64 tokens. The prefill time is measured after a stream
   synchronise: without it the asynchronous launches made prefill look free, the rate estimate ran
   away, and one step took 3.3 s on the 27B. Unit tests:
@@ -295,3 +294,21 @@ stall max), and the vLLM comparison of the same `loadtest` mix (#307).
 `response_format` accepts `json_object` and `json_schema` (`json_schema.schema`). A schema compiles into the grammar in `specrt::grammar` (type, properties, required, enum, const, items, anyOf/oneOf, single-entry allOf, local `$ref`, additionalProperties). Objects are strict by default, like xgrammar: keys not listed in `properties` are rejected. `additionalProperties: true` (or a schema) allows extra keys, and an object with no `properties` accepts any keys. Properties are emitted in declaration order. Schemas that cannot be compiled are a 400.
 
 `tool_choice: "required"` or `{"type":"function","function":{"name":...}}` compiles a grammar of the model's own tool call wrapper (Qwen XML `<tool_call><function=..><parameter=..>` or Hermes JSON, chosen by the tool parser) around each tool's parameter schema, so the reply is always a valid call to a listed tool (the named one for a named choice). It cannot be combined with `response_format`. Compiled grammars are cached per loaded model, LRU, size `grammar_cache` in the server config (default 32, 0 turns the cache off). Constrained rows decode without speculation. Mask time on a 248k vocabulary (release, `mask_time_on_a_248k_vocabulary`): about 40 us for the first mask of a state, 59 ms for a state inside a free string (not yet cached; later steps in the same state hit the cache). Mask overhead against the 27B step at batch 8 is unmeasured (GPU was in use by the user's app).
+
+### step_cost measurement (#404, 22 Nov 2026)
+
+`serve27b.sh ONLY=stall` on the 27B (GPU1 shared, 7 decoders of 700 tokens plus one 29k prompt; prefill is the long request TTFT).
+
+| setting | 29k prefill | decoder itl p99 | itl max |
+|---|---|---|---|
+| server defaults, old absolute 100 ms | 19.4 s | 1.34 s | 1.43 s |
+| server defaults, step_cost 3 | 19.5 s | 1.35 s | 1.43 s |
+| server defaults, step_cost 4 | 19.8 s | 1.36 s | 1.46 s |
+| rule alone, old absolute | 27.5 / 28.1 s | 0.17 s | 0.18 s |
+| rule alone, step_cost 2 | 26.8 / 26.0 s | 0.11 s | 0.17 s |
+| rule alone, step_cost 3 | 28.7 / 29.6 s | 0.18 s | 0.18 s |
+| rule alone, step_cost 4 | 30.3 / 30.1 s | 0.22 s | 0.22 s |
+
+No setting cuts prefill 2x, so none qualifies and the default stays 3. With the defaults (`prefill_burst_tokens` 16384, `min_prefill_tokens` 512, `whole_prompt_tokens` 1024) the long prompt already reads at the alone rate (1,490 tok/s) whatever the rule says, so the 220 tok/s in the issue is gone; the 1.3 s decoder stall is unchanged by `step_cost`. With those three off the rule alone decides, and step_cost 2 gives the lowest inter-token p99 at the same prefill time. This is not a `bench --ab` result: that tool times single-process decode, not a served stall.
+
+First-step fix: before any decode step is measured, `decoders_run_every_step_while_a_long_prompt_prefills_in_chunks` saw `decode_rows: 0` with a 1024-token prefill under the new default; the prefill rate is now measured net of decode time and that test sets `step_cost: 0.0` to pin the max-batched-tokens path, while the new tests pin the relative rule.

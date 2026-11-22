@@ -31,8 +31,10 @@ pub struct ServeArgs {
     pub kv_cache_gb: Option<f64>,
     #[arg(long, help = "Token budget per scheduler step (default 8192)")]
     pub max_batched_tokens: Option<usize>,
-    #[arg(long, help = "Inter-token latency target in ms that bounds prefill beside decoders (default 100)")]
+    #[arg(long, help = "Optional inter-token cap in ms on prefill beside decoders (default off)")]
     pub itl_target_ms: Option<u64>,
+    #[arg(long, help = "A step with prefill beside decoders may cost this many plain decode steps (default 3)")]
+    pub step_cost: Option<f64>,
     #[arg(long, help = "Prefill a whole prompt in one step when it is at most this many tokens (default 1024, 0 is off)")]
     pub whole_prompt_tokens: Option<usize>,
     #[arg(long, help = "Prompt tokens prefilled every step beside decoders (default 0, off)")]
@@ -90,6 +92,7 @@ impl ServeArgs {
         config.kv_cache_gb = self.kv_cache_gb.or(config.kv_cache_gb);
         config.max_batched_tokens = self.max_batched_tokens.or(config.max_batched_tokens);
         config.itl_target_ms = self.itl_target_ms.or(config.itl_target_ms);
+        config.step_cost = self.step_cost.or(config.step_cost);
         config.whole_prompt_tokens = self.whole_prompt_tokens.or(config.whole_prompt_tokens);
         config.min_prefill_tokens = self.min_prefill_tokens.or(config.min_prefill_tokens);
         config.swap_space_gb = self.swap_space_gb.or(config.swap_space_gb);
