@@ -1,0 +1,62 @@
+{
+  "name": "glm4_moe",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 4096,
+    "intermediate": 10944,
+    "vocab": 151552,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 46,
+    "pattern": [
+      "dense"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 96,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "qkv_bias": true,
+    "qk_norm": false,
+    "rotary_dim": 64
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 1000000.0
+  },
+  "mlp": {
+    "activation": "swiglu"
+  },
+  "moe": {
+    "experts": 128,
+    "active": 8,
+    "expert_intermediate": 1408,
+    "shared_intermediate": 1408,
+    "dense_layers": [
+      0
+    ],
+    "router": "sigmoid",
+    "shared_module": "shared_experts",
+    "score_bias": true
+  },
+  "mtp": {
+    "layers": 1,
+    "draft_tokens": 2,
+    "speculate": true,
+    "layout": {
+      "layer": "model.layers.{n}",
+      "fc": "model.layers.{n}.eh_proj.weight",
+      "norm_embed": "model.layers.{n}.enorm.weight",
+      "norm_hidden": "model.layers.{n}.hnorm.weight",
+      "norm": "model.layers.{n}.shared_head.norm.weight",
+      "head": "model.layers.{n}.shared_head.head.weight"
+    }
+  }
+}
