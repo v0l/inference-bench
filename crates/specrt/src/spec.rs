@@ -136,21 +136,6 @@ pub enum TileChoice {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum TuneMode {
-    #[default]
-    Off,
-    Cached,
-    Force,
-}
-
-impl TuneMode {
-    pub fn is_off(&self) -> bool {
-        *self == TuneMode::Off
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
 pub enum BackendChoice {
     #[default]
     Auto,
@@ -175,8 +160,6 @@ pub struct RuntimeOptions {
     pub fp8_tile: Option<[usize; 4]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fp4_stages: Option<usize>,
-    #[serde(skip_serializing_if = "TuneMode::is_off")]
-    pub tune: TuneMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_chunk: Option<usize>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -286,7 +269,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, tune: TuneMode::Off, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 

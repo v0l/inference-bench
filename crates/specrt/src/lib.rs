@@ -49,7 +49,6 @@ pub mod tp;
 pub mod tp_exec;
 pub mod spec;
 pub mod stage;
-pub mod tune;
 pub mod statepool;
 pub mod state;
 pub mod vision;
