@@ -36,6 +36,7 @@ fn rail(app: &mut App, ui: &mut egui::Ui) {
             if on { READOUT } else { LEGEND },
         );
         if resp.clicked() {
+            app.load = None;
             app.tab = tab;
         }
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label));
@@ -135,6 +136,10 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
     egui::CentralPanel::no_frame().show(root, |ui| {
         let r = ui.max_rect();
         ui.painter().rect_filled(r, 0.0, CHASSIS);
+        if app.load.is_some() {
+            crate::load::draw(app, ui);
+            return;
+        }
         match app.tab {
             Tab::Chat => crate::chat::draw(app, ui),
             Tab::Models => crate::models::draw(app, ui),
@@ -144,7 +149,6 @@ pub fn draw(app: &mut App, root: &mut egui::Ui) {
         }
     });
     crate::models::modals(app, root.ctx());
-    crate::load::modal(app, root.ctx());
 }
 
 pub fn page(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
