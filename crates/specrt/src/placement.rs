@@ -96,6 +96,10 @@ pub struct RemoteConfig {
     pub member_ttl_ms: u64,
     #[serde(default = "default_connect_wait_ms")]
     pub connect_wait_ms: u64,
+    #[serde(default)]
+    pub transport: crate::rdma::Transport,
+    #[serde(default)]
+    pub rdma_library: Option<String>,
 }
 
 fn default_connect_wait_ms() -> u64 {
@@ -111,6 +115,10 @@ fn default_member_ttl_ms() -> u64 {
 }
 
 impl RemoteConfig {
+    pub fn link(&self) -> crate::rdma::LinkOptions {
+        crate::rdma::LinkOptions { transport: self.transport, library: self.rdma_library.clone() }
+    }
+
     pub fn key(&self) -> Result<Vec<u8>> {
         crate::stage::read_key(&self.key, &self.key_file)
     }

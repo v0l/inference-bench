@@ -320,7 +320,7 @@ pub fn prepare(run: &Run) -> Result<Prepared> {
         stages,
         devices,
         mdns_port: run.settings.mdns_port,
-        remote: Some(RemoteConfig { key: None, key_file: Some(run.key_file.to_path_buf()), timeout_ms: 600_000, member_ttl_ms: 30_000, connect_wait_ms: 15_000 }),
+        remote: Some(RemoteConfig { key: None, key_file: Some(run.key_file.to_path_buf()), timeout_ms: 600_000, member_ttl_ms: 30_000, connect_wait_ms: 15_000, transport: Default::default(), rdma_library: None }),
         ..runnable_config(&[], run.ctx, run.slots, run.sizing, run.placement.objective)
     };
     Ok(prepared)
