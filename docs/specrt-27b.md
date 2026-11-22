@@ -329,3 +329,17 @@ Measured on GPU 1 of the desktop (RTX PRO 6000, vLLM on the other card). `crates
 - Decode graph capture is 2 to 5 ms per size (1 to 32) in every state. It is not a cold-start cost.
 - First request TTFT (prompt 128): 27B FP8 43 ms against 47 to 49 ms for the next ten; NVFP4 38 ms against 42 ms; 0.6B 5 ms against 5 ms. There is no first-request penalty once the load has finished.
 - The weight seconds vary with the page cache (3.8 to 5.3 s on FP8) and are not part of the JIT split.
+
+### CUBIN cache (#398)
+
+`Jit::load` now compiles to a CUBIN for the exact `sm_XX` through `nvrtcGetCUBIN`, stores `<key>.cubin` and loads it with `Ptx::from_binary`, so the driver never JITs PTX to SASS (the 5.4 to 6.8 s driver share). PTX stays as the fallback when NVRTC cannot emit a CUBIN or the driver rejects it. The key now includes the NVRTC and driver versions. `[runtime] cache_max_bytes` (default 4 GB) deletes the oldest `.ptx`, `.cubin` and `.wgsl` files by mtime after each write; a hit refreshes the mtime. `[runtime] compile_jobs` sets `--split-compile` (default CPU count, at most 8).
+
+27B FP8 on GPU 1, `coldstart.sh`, both caches cold: NVRTC with `compile_jobs = 1` 11.6 to 12.3 s (load 16.3 to 17.1 s) against 5.0 s with `compile_jobs = 8` (load 8.0 to 9.4 s). The CUBIN compile includes the SASS generation that `load_module` did before, so `jit_load_module` is 0.00 s in every state and the PTX-cold and driver-cold states cost 0.25 s and nothing. Split compile cuts the cold compile by 58%, so it stays on.
+
+Pre-build kernels without loading weights, for a Docker build or a first start:
+
+```bash
+inference-bench warmup --spec qwen3.8-27b-nvfp4 --max-ctx 32768 --slots 8
+```
+
+The image has no GPU at build time, so mount the cache dir (`[runtime] cache_dir`) as a volume and run `warmup` once on the target host.
