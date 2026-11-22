@@ -19,6 +19,55 @@ fn signed(signs: u8, j: usize) -> f32 {
     if signs & (1 << j) != 0 { -1.0 } else { 1.0 }
 }
 
+pub fn dequantize_iq2_xxs(block: &[u8], out: &mut [f32]) {
+    let d = f16(block);
+    for ib in 0..8 {
+        let at = 2 + 8 * ib;
+        let (idx, aux) = (u32_at(block, at), u32_at(block, at + 4));
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+        for l in 0..4 {
+            let grid = IQ2XXS_GRID[((idx >> (8 * l)) & 255) as usize].to_le_bytes();
+            let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+            for j in 0..8 {
+                out[32 * ib + 8 * l + j] = db * grid[j] as f32 * signed(signs, j);
+            }
+        }
+    }
+}
+
+pub fn dequantize_iq2_xs(block: &[u8], out: &mut [f32]) {
+    let d = f16(block);
+    for ib in 0..8 {
+        let sc = block[66 + ib];
+        let db = [d * (0.5 + (sc & 0xf) as f32) * 0.25, d * (0.5 + (sc >> 4) as f32) * 0.25];
+        for l in 0..4 {
+            let q = u16_at(block, 2 + 2 * (4 * ib + l)) as usize;
+            let grid = IQ2XS_GRID[q & 511].to_le_bytes();
+            let signs = KSIGNS_IQ2XS[q >> 9];
+            for j in 0..8 {
+                out[32 * ib + 8 * l + j] = db[l / 2] * grid[j] as f32 * signed(signs, j);
+            }
+        }
+    }
+}
+
+pub fn dequantize_iq2_s(block: &[u8], out: &mut [f32]) {
+    let d = f16(block);
+    for ib in 0..8 {
+        let sc = block[74 + ib];
+        let db = [d * (0.5 + (sc & 0xf) as f32) * 0.25, d * (0.5 + (sc >> 4) as f32) * 0.25];
+        let qh = block[66 + ib] as usize;
+        for l in 0..4 {
+            let idx = block[2 + 4 * ib + l] as usize | ((qh << (8 - 2 * l)) & 0x300);
+            let grid = IQ2S_GRID[idx].to_le_bytes();
+            let signs = block[34 + 4 * ib + l];
+            for j in 0..8 {
+                out[32 * ib + 8 * l + j] = db[l / 2] * grid[j] as f32 * signed(signs, j);
+            }
+        }
+    }
+}
+
 pub fn dequantize_iq3_xxs(block: &[u8], out: &mut [f32]) {
     let d = f16(block);
     for ib in 0..8 {
