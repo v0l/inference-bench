@@ -332,94 +332,17 @@ fn gemm() -> String {
     )
 }
 
-fn tile_setup_r8() -> String {
-    let head = tile_setup_head();
-    let cut = head.find("    float acc").unwrap();
-    format!(
-        "{}    float acc[NW][4];\n#pragma unroll\n    for (int w = 0; w < NW; w++)\n#pragma unroll\n        for (int q = 0; q < 4; q++) acc[w][q] = 0.0f;\n",
-        &head[..cut]
-    )
-}
-
-fn mainloop_r8() -> &'static str {
-    r##"    for (int kt = 0; kt < KT * PL; kt++) {
-        cp_async_wait<STAGES - 2>();
-        __syncthreads();
-        int next = kt + STAGES - 1;
-        if (next < KT * PL) load_stage(next % STAGES, next);
-        cp_async_commit();
-        const unsigned char* st = gemm_smem + (kt % STAGES) * STAGE_BYTES;
-#pragma unroll
-        for (int ks = 0; ks < KS; ks++) {
-            unsigned b[4];
-            ldsm_x4(b, st + mma_chunk(lane & 7, ks * 2 + ((lane >> 3) & 1)));
-            unsigned sfb = *(const unsigned*)(st + SCALE_OFF + g * SB + (MX ? 0 : ks * 4));
-#pragma unroll
-            for (int w = 0; w < NW; w++) {
-                const unsigned char* ws = st + (BM + w * BN) * MMA_DATA;
-                unsigned a[4];
-                ldsm_x4(a, ws + mma_chunk(wn * TN + (lane & 15), ks * 2 + (lane >> 4)));
-                unsigned sfa = *(const unsigned*)(st + SCALE_OFF + (BM + w * BN + wn * TN + g + 8 * (lane & 1)) * SB + (MX ? 0 : ks * 4));
-                moe_mma_block<MX>(acc[w], a, b[0], b[1], sfa, sfb, ks);
-            }
-        }
-    }
-    cp_async_wait<0>();
-"##
-}
-
-fn epilogue_r8() -> &'static str {
-    r##"    float alpha0 = MX ? 1.0f : g0[e] * inv_in;
-    float alpha1 = (NW > 1 && !MX) ? g1[e] * inv_in : 1.0f;
-#pragma unroll
-    for (int q = 0; q < 4; q++) {
-        int d = dst[2 * t + (q & 1)];
-        if (d < 0) continue;
-        int col = n0 + wn * TN + g + 8 * (q >> 1);
-        float b0 = 0.0f;
-        float b1 = 0.0f;
-        if (MOE_EBIAS && e < MOE_E) {
-            if (NW == 2) {
-                b0 = bias[(size_t)e * 2 * N + col];
-                b1 = bias[((size_t)e * 2 + 1) * N + col];
-            } else {
-                b0 = bias[(size_t)e * N + col];
-            }
-        }
-        float v;
-        if (NW == 2) v = gated_act(acc[0][q] * alpha0 + b0, acc[NW - 1][q] * alpha1 + b1);
-        else v = acc[0][q] * alpha0 + b0;
-        out[(size_t)d * N + col] = v;
-    }
-"##
-}
-
-fn gemm_r8() -> String {
-    format!(
-        "template <int N, int K, int NW, int BM, int BN, int WM, int WN, int STAGES, bool DOWN, bool MX, int PL>\n{}",
-        prim::device(
-            "void",
-            "moe_gemm_f4_r8",
-            GEMM_ARGS,
-            &format!("{}{}{}{}{}{}", geometry(), tile_setup_r8(), load_stage(), prologue(), mainloop_r8(), epilogue_r8())
-        )
-    )
-}
-
-const GEMM_ARGS: &str = "const unsigned char* w0, const unsigned char* s0, const float* g0, const unsigned char* w1, const unsigned char* s1,\n                                            const float* g1, const float* bias, float inv_in, const unsigned char* aq, const unsigned char* as, const unsigned char* aq2, const unsigned char* as2, const int* offsets, const int* sorted,\n                                            const int* tile_map, float* out";
-
 const ARGS: &str = "const unsigned char* gw, const unsigned char* gs, const float* gg, const unsigned char* uw, const unsigned char* us, const float* ug, const float* bias, float inv_in,\n    const unsigned char* aq, const unsigned char* as, const int* offsets, const int* sorted, const int* tile_map, float* out";
 
 const ARGS_MX: &str = "const unsigned char* gw, const unsigned char* gs, const float* gg, const unsigned char* uw, const unsigned char* us, const float* ug, const float* bias, float inv_in,\n    const unsigned char* aq, const unsigned char* as, const unsigned char* aq2, const unsigned char* as2, const int* offsets, const int* sorted, const int* tile_map, float* out";
 
 fn variant(name: &str, tile: &str, mx: bool, planes: usize) -> String {
-    let func = if name.ends_with("_t") { "moe_gemm_f4_r8" } else { "moe_gemm_f4" };
     let (args, call) = if mx {
         (ARGS_MX, "gw, gs, gg, uw, us, ug, bias, inv_in, aq, as, aq2, as2, offsets, sorted, tile_map, out")
     } else {
         (ARGS, "gw, gs, gg, uw, us, ug, bias, inv_in, aq, as, aq, as, offsets, sorted, tile_map, out")
     };
-    prim::delegate(128, name, args, &format!("{func}<{tile}, {mx}, {planes}>"), call)
+    prim::delegate(128, name, args, &format!("moe_gemm_f4<{tile}, {mx}, {planes}>"), call)
 }
 
 fn variants(out: &mut String, mx: bool) {
@@ -428,8 +351,6 @@ fn variants(out: &mut String, mx: bool) {
     for &(p, tag) in planes {
         out.push_str(&variant(&format!("{stem}_up{tag}"), "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false", mx, p));
         out.push_str(&variant(&format!("{stem}_up{tag}_s"), "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 6, false", mx, p));
-        out.push_str(&variant(&format!("{stem}_up{tag}_t"), "MOE_INTER, HIDDEN, 2, 8, 64, 1, 4, 6, false", mx, p));
-        out.push_str(&variant(&format!("{stem}_down{tag}_t"), "HIDDEN, MOE_INTER, 1, 8, 64, 1, 4, 6, true", mx, p));
         out.push_str(&variant(&format!("{stem}_down{tag}"), "HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true", mx, p));
         out.push_str(&variant(&format!("{stem}_down{tag}_s"), "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 6, true", mx, p));
     }
@@ -465,7 +386,6 @@ pub fn grouped(mx: bool) -> String {
     out.push_str(&tiles("moe_tiles"));
     out.push_str(&prim::swizzle("mma_chunk", "MMA_DATA"));
     out.push_str(&gemm());
-    out.push_str(&gemm_r8());
     variants(&mut out, mx);
     out
 }

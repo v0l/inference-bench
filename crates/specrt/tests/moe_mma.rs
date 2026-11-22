@@ -1,5 +1,5 @@
 use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PushKernelArg};
-use specrt::codegen::{MOE_MMA_BM, MOE_MMA_BM_SMALL, MOE_MMA_BM_TINY, MOE_MMA_BN, Module, cuda_target, moe_mma_smem};
+use specrt::codegen::{MOE_MMA_BM, MOE_MMA_BM_SMALL, MOE_MMA_BN, Module, cuda_target, moe_mma_smem};
 use specrt::jit::Jit;
 use specrt::nvfp4::{e2m1_to_f32, quantize};
 use specrt::spec::{ActQuant, Quant, Spec};
@@ -265,8 +265,8 @@ fn run_planes(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter:
     }
     unsafe { b.launch(cfg(tokens as u32, 256)) }.unwrap();
     let inv_up = 1.0 / igs_up;
-    let suffix = if expected_bm == MOE_MMA_BM_TINY { "_t" } else if expected_bm == MOE_MMA_BM_SMALL { "_s" } else { "" };
-    let kernel = f(&format!("{stem}_up{}{}", if mx { tag(up_planes) } else { "" }, suffix));
+    let small = expected_bm == MOE_MMA_BM_SMALL;
+    let kernel = f(&format!("{stem}_up{}{}", if mx { tag(up_planes) } else { "" }, if small { "_s" } else { "" }));
     let mut b = stream.launch_builder(&kernel);
     b.arg(&gw).arg(&gs).arg(&gg).arg(&uw).arg(&us).arg(&ug).arg(&bias_u).arg(&inv_up).arg(&xq).arg(&xs);
     if mx {
@@ -290,7 +290,7 @@ fn run_planes(tokens: usize, expected_bm: usize, mx: bool, hidden: usize, inter:
     }
     unsafe { b.launch(cfg(pairs as u32, 256)) }.unwrap();
     let inv_down = 1.0 / igs_down;
-    let kernel = f(&format!("{stem}_down{}{}", if mx { tag(down_planes) } else { "" }, suffix));
+    let kernel = f(&format!("{stem}_down{}{}", if mx { tag(down_planes) } else { "" }, if small { "_s" } else { "" }));
     let mut b = stream.launch_builder(&kernel);
     b.arg(&dw).arg(&ds).arg(&dg).arg(&dw).arg(&ds).arg(&dg).arg(&bias_d).arg(&inv_down).arg(&aq).arg(&asc);
     if mx {
@@ -323,37 +323,7 @@ fn grouped_mma_matches_cpu_with_small_tiles() {
 #[test]
 #[ignore = "needs an sm_120 GPU"]
 fn grouped_mma_matches_cpu_with_one_token() {
-    run(1, MOE_MMA_BM_TINY);
-}
-
-#[test]
-#[ignore = "needs an sm_120 GPU"]
-fn grouped_mma_matches_cpu_with_tiny_tiles() {
-    run(3, MOE_MMA_BM_TINY);
-}
-
-#[test]
-#[ignore = "needs an sm_120 GPU"]
-fn mx_grouped_mma_matches_cpu_with_tiny_tiles() {
-    run_with(3, MOE_MMA_BM_TINY, true, HIDDEN, INTER);
-}
-
-#[test]
-#[ignore = "needs an sm_120 GPU"]
-fn mx_grouped_mma_handles_a_k_tail_with_tiny_tiles() {
-    run_with(3, MOE_MMA_BM_TINY, true, 2880, 448);
-}
-
-#[test]
-#[ignore = "needs an sm_120 GPU"]
-fn mx_grouped_mma_two_plane_both_with_tiny_tiles() {
-    run_planes(3, MOE_MMA_BM_TINY, true, 2880, 448, 2, 2);
-}
-
-#[test]
-#[ignore = "needs an sm_120 GPU"]
-fn grouped_mma_with_tiny_tiles_and_one_token_matches_cpu() {
-    run(1, MOE_MMA_BM_TINY);
+    run(1, MOE_MMA_BM_SMALL);
 }
 
 #[test]

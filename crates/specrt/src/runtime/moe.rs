@@ -155,7 +155,7 @@ impl MoeBuffers {
             mma: if mma {
                 let pad = crate::dequant::DEVICE_TILE;
                 let (h, i) = (spec.dims.hidden.next_multiple_of(pad), m.expert_intermediate.next_multiple_of(pad));
-                let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_TINY;
+                let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_SMALL;
                 Some(MmaBuffers {
                     xq: stream.alloc_zeros(inputs * h / 2)?,
                     xs: stream.alloc_zeros(inputs * h / 16)?,
@@ -296,7 +296,7 @@ impl Runtime {
     }
 
     fn moe_grouped_mma(&self, w: &DeviceMoe, mb: &MoeBuffers, n: usize) -> Result<()> {
-        use crate::codegen::{MOE_MMA_BM_SMALL, MOE_MMA_BM_TINY, MOE_MMA_BN, moe_fp4_tile_rows, moe_mma_smem};
+        use crate::codegen::{MOE_MMA_BM, MOE_MMA_BM_SMALL, MOE_MMA_BN, moe_mma_smem};
         let m = self.spec.moe.as_ref().expect("moe spec");
         let mma = mb.mma.as_ref().expect("mma buffers");
         let block = matches!(w.gate, StackWeights::Block { .. });
@@ -316,12 +316,8 @@ impl Runtime {
         let (h, inter) = (self.spec.dims.hidden, m.expert_intermediate);
         let slots = m.local_experts() + m.shared_slots();
         let pairs = n * m.pairs();
-        let bm = moe_fp4_tile_rows(pairs, slots);
-        let suffix = match bm {
-            MOE_MMA_BM_TINY => "_t",
-            MOE_MMA_BM_SMALL => "_s",
-            _ => "",
-        };
+        let small = pairs / slots < MOE_MMA_BM / 2;
+        let bm = if small { MOE_MMA_BM_SMALL } else { MOE_MMA_BM };
         let max_tiles = slots + pairs / bm;
         self.moe_permute(mb, n)?;
         let (bm_i, max_i) = (bm as i32, max_tiles as i32);
@@ -353,7 +349,7 @@ impl Runtime {
         quant(xin, &mma.xq, &mma.xs, &mma.xq2, &mma.xs2, up_planes, xrows, h, igs_up)?;
         let inv_up = 1.0 / igs_up;
         let tag = |planes: u8| if planes == 2 { "2" } else { "" };
-        let name = format!("{stem}_up{}{}", tag(up_planes), suffix);
+        let name = format!("{stem}_up{}{}", tag(up_planes), if small { "_s" } else { "" });
         let mut b = self.launcher(self.kernel(&name));
         b.arg(gw).arg(gs).arg(gg).arg(uw).arg(us).arg(ug).arg(&w.gate_up_bias).arg(&inv_up).arg(&mma.xq).arg(&mma.xs);
         if block {
@@ -364,7 +360,7 @@ impl Runtime {
         unsafe { b.launch(config) }?;
         quant(&mb.act, &mma.aq, &mma.as_, &mma.aq2, &mma.as2, down_planes, pairs, inter, di)?;
         let inv_down = 1.0 / di;
-        let name = format!("{stem}_down{}{}", tag(down_planes), suffix);
+        let name = format!("{stem}_down{}{}", tag(down_planes), if small { "_s" } else { "" });
         let mut b = self.launcher(self.kernel(&name));
         b.arg(dw).arg(ds).arg(dg).arg(dw).arg(ds).arg(dg).arg(&w.down_bias).arg(&inv_down).arg(&mma.aq).arg(&mma.as_);
         if block {

@@ -2,7 +2,6 @@ use crate::{Feature, Language, Target, fnv};
 
 pub const MMA_BM: usize = 64;
 pub const MMA_BM_SMALL: usize = 16;
-pub const MMA_BM_TINY: usize = 8;
 pub const MMA_BN: usize = 64;
 pub const MMA_STAGES: usize = 3;
 pub const MMA_ROW: usize = 72;
@@ -45,7 +44,7 @@ impl Family {
                 "moe_group_up_mx",
                 "moe_group_down_mx",
             ],
-            Family::GroupedMma => &["moe_quant_f32", "moe_tiles", "moe_mma_up", "moe_mma_up_s", "moe_mma_up_t", "moe_mma_down", "moe_mma_down_s", "moe_mma_down_t"],
+            Family::GroupedMma => &["moe_quant_f32", "moe_tiles", "moe_mma_up", "moe_mma_up_s", "moe_mma_down", "moe_mma_down_s"],
             Family::GroupedMmaBf16 => &["moe_split_bf16", "moe_tiles_b16", "moe_mma_up_b16", "moe_mma_up_b16_s", "moe_mma_down_b16", "moe_mma_down_b16_s"],
             Family::GroupedMmaFp8 => &["moe_quant_f8", "moe_tiles_f8", "moe_mma_up_f8", "moe_mma_up_f8_s", "moe_mma_down_f8", "moe_mma_down_f8_s"],
             Family::GroupedMx => &[
@@ -53,16 +52,12 @@ impl Family {
                 "moe_tiles",
                 "moe_mma_mx_up",
                 "moe_mma_mx_up_s",
-                "moe_mma_mx_up_t",
                 "moe_mma_mx_down",
                 "moe_mma_mx_down_s",
-                "moe_mma_mx_down_t",
                 "moe_mma_mx_up2",
                 "moe_mma_mx_up2_s",
-                "moe_mma_mx_up2_t",
                 "moe_mma_mx_down2",
                 "moe_mma_mx_down2_s",
-                "moe_mma_mx_down2_t",
             ],
         }
     }
@@ -79,18 +74,8 @@ impl Family {
 
 pub const MMA_STAGES_SMALL: usize = 6;
 
-pub fn fp4_tile_rows(pairs: usize, slots: usize) -> usize {
-    if pairs < slots {
-        MMA_BM_TINY
-    } else if pairs / slots < MMA_BM / 2 {
-        MMA_BM_SMALL
-    } else {
-        MMA_BM
-    }
-}
-
 pub fn mma_smem(rows_per_tile: usize, weights: usize) -> u32 {
-    let stages = if rows_per_tile <= MMA_BM_SMALL { MMA_STAGES_SMALL } else { MMA_STAGES };
+    let stages = if rows_per_tile == MMA_BM_SMALL { MMA_STAGES_SMALL } else { MMA_STAGES };
     (stages * (rows_per_tile + weights * MMA_BN) * MMA_ROW) as u32
 }
 
@@ -169,8 +154,6 @@ impl MoeKernel {
                 ("moe_mma_up_s", mma_smem(MMA_BM_SMALL, 2)),
                 ("moe_mma_down", mma_smem(MMA_BM, 1)),
                 ("moe_mma_down_s", mma_smem(MMA_BM_SMALL, 1)),
-                ("moe_mma_up_t", mma_smem(MMA_BM_TINY, 2)),
-                ("moe_mma_down_t", mma_smem(MMA_BM_TINY, 1)),
             ],
             Family::GroupedMmaBf16 => vec![
                 ("moe_mma_up_b16", mma_bf16_smem(MMA_BM, up)),
@@ -193,10 +176,6 @@ impl MoeKernel {
                 ("moe_mma_mx_up2_s", mma_smem(MMA_BM_SMALL, 2)),
                 ("moe_mma_mx_down2", mma_smem(MMA_BM, 1)),
                 ("moe_mma_mx_down2_s", mma_smem(MMA_BM_SMALL, 1)),
-                ("moe_mma_mx_up_t", mma_smem(MMA_BM_TINY, 2)),
-                ("moe_mma_mx_down_t", mma_smem(MMA_BM_TINY, 1)),
-                ("moe_mma_mx_up2_t", mma_smem(MMA_BM_TINY, 2)),
-                ("moe_mma_mx_down2_t", mma_smem(MMA_BM_TINY, 1)),
             ],
         }
     }
