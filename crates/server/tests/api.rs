@@ -399,7 +399,8 @@ fn streaming_sends_several_chunks_spread_over_time_before_done() {
     let total = started.elapsed();
     let chunks = seen.matches("\"content\":\"w").count();
     assert!(chunks >= 6, "{chunks} content chunks in {seen}");
-    assert!(first_content.unwrap() < total / 2, "first {:?} total {total:?}", first_content);
+    let spread = total - first_content.unwrap();
+    assert!(spread >= Duration::from_millis(300), "first {:?} total {total:?}", first_content);
     rig.stop();
 }
 
