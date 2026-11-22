@@ -1,3 +1,4 @@
+use crate::rdma::{ConnInfo, Endpoint, LinkOptions, PeerClosed, RdmaChannel, Transport, Verbs};
 use anyhow::{bail, ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
@@ -30,6 +31,7 @@ pub enum Message {
     Assign { layer_start: u32, layer_end: u32 },
     DecodeBatch { slots: Vec<u32>, positions: Vec<u32>, input: Input },
     Tokens { tokens: Vec<u32>, compute_us: u32 },
+    Rdma { qpn: u32, psn: u32, gid: [u8; 16], addr: u64, rkey: u32 },
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -172,6 +174,14 @@ impl Message {
                     put_u32(&mut out, *t);
                 }
             }
+            Message::Rdma { qpn, psn, gid, addr, rkey } => {
+                out.push(13);
+                put_u32(&mut out, *qpn);
+                put_u32(&mut out, *psn);
+                out.extend_from_slice(gid);
+                out.extend_from_slice(&addr.to_le_bytes());
+                put_u32(&mut out, *rkey);
+            }
         }
         out
     }
@@ -239,6 +249,17 @@ impl Message {
             12 => {
                 let compute_us = c.u32()?;
                 Message::Tokens { tokens: c.u32_list()?, compute_us }
+            }
+            13 => {
+                let qpn = c.u32()?;
+                let psn = c.u32()?;
+                ensure!(c.buf.len() >= 28, "truncated frame");
+                let (g, rest) = c.buf.split_at(16);
+                let gid: [u8; 16] = g.try_into().unwrap();
+                let (a, rest) = rest.split_at(8);
+                let addr = u64::from_le_bytes(a.try_into().unwrap());
+                c.buf = rest;
+                Message::Rdma { qpn, psn, gid, addr, rkey: c.u32()? }
             }
             other => bail!("unknown message tag {other}"),
         };
@@ -329,6 +350,10 @@ pub struct StageServer {
 
 impl StageServer {
     pub fn start(bind: &str, key: &[u8], handler: Arc<dyn StageHandler>) -> Result<StageServer> {
+        StageServer::start_with(bind, key, handler, LinkOptions::default())
+    }
+
+    pub fn start_with(bind: &str, key: &[u8], handler: Arc<dyn StageHandler>, link: LinkOptions) -> Result<StageServer> {
         ensure!(!key.is_empty(), "a stage server needs a non-empty pre-shared key");
         let listener = TcpListener::bind(bind).with_context(|| format!("bind {bind}"))?;
         listener.set_nonblocking(true)?;
@@ -343,8 +368,9 @@ impl StageServer {
                         let key = key.clone();
                         let handler = handler.clone();
                         let flag = flag.clone();
+                        let link = link.clone();
                         std::thread::spawn(move || {
-                            if let Err(e) = serve_connection(stream, &key, handler, &flag) {
+                            if let Err(e) = serve_connection(stream, &key, handler, &flag, &link) {
                                 tracing::warn!(%peer, error = %format!("{e:#}"), "stage connection closed");
                             }
                         });
@@ -382,7 +408,34 @@ impl Drop for StageServer {
     }
 }
 
-fn serve_connection(mut stream: TcpStream, key: &[u8], handler: Arc<dyn StageHandler>, stop: &AtomicBool) -> Result<()> {
+fn offer_rdma(stream: &TcpStream, link: &LinkOptions, remote: ConnInfo) -> Result<(RdmaChannel, Message)> {
+    ensure!(link.transport != Transport::Tcp, "rdma is not enabled on this stage");
+    let verbs = Verbs::load(link.library())?;
+    let mut ep = Endpoint::open(verbs, stream.local_addr()?.ip())?;
+    let info = ep.info();
+    ep.connect(&remote)?;
+    let reply = Message::Rdma { qpn: info.qpn, psn: info.psn, gid: info.gid, addr: info.addr, rkey: info.rkey };
+    Ok((RdmaChannel::new(ep, remote, stream.try_clone()?, MAX_FRAME_BYTES), reply))
+}
+
+fn serve_rdma(mut channel: RdmaChannel, handler: &Arc<dyn StageHandler>, stop: &AtomicBool) -> Result<()> {
+    while !stop.load(Ordering::Relaxed) {
+        let body = match channel.recv(Duration::from_millis(200)) {
+            Ok(Some(body)) => body,
+            Ok(None) => continue,
+            Err(e) if e.downcast_ref::<PeerClosed>().is_some() => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let reply = match Message::decode(&body) {
+            Ok(message) => handler.handle(message),
+            Err(e) => Message::Error { message: format!("{e:#}") },
+        };
+        channel.send(&reply.encode(), Duration::from_secs(30))?;
+    }
+    Ok(())
+}
+
+fn serve_connection(mut stream: TcpStream, key: &[u8], handler: Arc<dyn StageHandler>, stop: &AtomicBool, link: &LinkOptions) -> Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_nodelay(true)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
@@ -403,7 +456,21 @@ fn serve_connection(mut stream: TcpStream, key: &[u8], handler: Arc<dyn StageHan
         let mut body = vec![0u8; len];
         stream.read_exact(&mut body)?;
         stream.set_read_timeout(Some(Duration::from_millis(200)))?;
-        let reply = match Message::decode(&body) {
+        let decoded = Message::decode(&body);
+        if let Ok(Message::Rdma { qpn, psn, gid, addr, rkey }) = decoded {
+            match offer_rdma(&stream, link, ConnInfo { qpn, psn, gid, addr, rkey }) {
+                Ok((channel, reply)) => {
+                    write_frame(&mut stream, &reply)?;
+                    stream.set_nonblocking(true)?;
+                    return serve_rdma(channel, &handler, stop);
+                }
+                Err(e) => {
+                    write_frame(&mut stream, &Message::Error { message: format!("rdma unavailable: {e:#}") })?;
+                    continue;
+                }
+            }
+        }
+        let reply = match decoded {
             Ok(message) => handler.handle(message),
             Err(e) => Message::Error { message: format!("{e:#}") },
         };
@@ -414,12 +481,18 @@ fn serve_connection(mut stream: TcpStream, key: &[u8], handler: Arc<dyn StageHan
 
 pub struct StageClient {
     stream: TcpStream,
+    rdma: Option<RdmaChannel>,
+    timeout: Duration,
     pub ready: Message,
     pub addr: String,
 }
 
 impl StageClient {
     pub fn connect(addr: &str, key: &[u8], timeout: Duration) -> Result<StageClient> {
+        StageClient::connect_with(addr, key, timeout, &LinkOptions::default())
+    }
+
+    pub fn connect_with(addr: &str, key: &[u8], timeout: Duration, link: &LinkOptions) -> Result<StageClient> {
         let target = std::net::ToSocketAddrs::to_socket_addrs(addr)
             .with_context(|| format!("resolve {addr}"))?
             .next()
@@ -437,7 +510,37 @@ impl StageClient {
             ready @ Message::Ready { .. } => ready,
             other => bail!("stage {addr} sent {other:?} instead of ready"),
         };
-        Ok(StageClient { stream, ready, addr: addr.to_string() })
+        let mut client = StageClient { stream, rdma: None, timeout, ready, addr: addr.to_string() };
+        if link.transport != Transport::Tcp {
+            match client.upgrade_rdma(link) {
+                Ok(()) => tracing::info!(%addr, device = client.rdma.as_ref().map(|c| c.device()).unwrap_or(""), "stage link is rdma"),
+                Err(e) if link.transport == Transport::Rdma => return Err(e.context(format!("rdma to stage {addr}"))),
+                Err(e) => tracing::info!(%addr, error = %format!("{e:#}"), "rdma unavailable, using tcp"),
+            }
+        }
+        Ok(client)
+    }
+
+    pub fn is_rdma(&self) -> bool {
+        self.rdma.is_some()
+    }
+
+    fn upgrade_rdma(&mut self, link: &LinkOptions) -> Result<()> {
+        let verbs = Verbs::load(link.library())?;
+        let mut ep = Endpoint::open(verbs, self.stream.local_addr()?.ip())?;
+        let info = ep.info();
+        write_frame(&mut self.stream, &Message::Rdma { qpn: info.qpn, psn: info.psn, gid: info.gid, addr: info.addr, rkey: info.rkey })?;
+        match read_frame(&mut self.stream)? {
+            Message::Rdma { qpn, psn, gid, addr, rkey } => {
+                let remote = ConnInfo { qpn, psn, gid, addr, rkey };
+                ep.connect(&remote)?;
+                self.rdma = Some(RdmaChannel::new(ep, remote, self.stream.try_clone()?, MAX_FRAME_BYTES));
+                self.stream.set_nonblocking(true)?;
+                Ok(())
+            }
+            Message::Error { message } => bail!("{message}"),
+            other => bail!("stage answered the rdma offer with {other:?}"),
+        }
     }
 
     pub fn hidden(&self) -> u32 {
@@ -448,6 +551,16 @@ impl StageClient {
     }
 
     pub fn call(&mut self, message: &Message) -> Result<Message> {
+        if let Some(channel) = self.rdma.as_mut() {
+            let reply = channel
+                .send(&message.encode(), self.timeout)
+                .and_then(|()| channel.recv(self.timeout)?.context("timed out waiting for the stage reply"))
+                .with_context(|| format!("stage {}", self.addr))?;
+            return match Message::decode(&reply)? {
+                Message::Error { message } => bail!("stage {} error: {message}", self.addr),
+                reply => Ok(reply),
+            };
+        }
         write_frame(&mut self.stream, message).with_context(|| format!("stage {}", self.addr))?;
         match read_frame(&mut self.stream).with_context(|| format!("stage {}", self.addr))? {
             Message::Error { message } => bail!("stage {} error: {message}", self.addr),
@@ -489,10 +602,14 @@ impl Chain {
     }
 
     pub fn connect_assigned(addrs: &[String], ranges: &[(usize, usize)], key: &[u8], timeout: Duration) -> Result<Chain> {
+        Chain::connect_assigned_with(addrs, ranges, key, timeout, &LinkOptions::default())
+    }
+
+    pub fn connect_assigned_with(addrs: &[String], ranges: &[(usize, usize)], key: &[u8], timeout: Duration, link: &LinkOptions) -> Result<Chain> {
         ensure!(!addrs.is_empty() && addrs.len() == ranges.len(), "a chain needs one layer range per stage");
         let mut stages: Vec<StageClient> = Vec::new();
         for (addr, &(start, end)) in addrs.iter().zip(ranges).rev() {
-            let mut client = StageClient::connect(addr, key, timeout).with_context(|| format!("stage {addr} is not ready, downstream first"))?;
+            let mut client = StageClient::connect_with(addr, key, timeout, link).with_context(|| format!("stage {addr} is not ready, downstream first"))?;
             if client.ready != (Message::Ready { layer_start: start as u32, layer_end: end as u32, hidden: client.hidden() }) {
                 client.assign(start as u32, end as u32).with_context(|| format!("stage {addr} could not load layers {start}..{end}"))?;
             }
@@ -514,6 +631,10 @@ impl Chain {
             expected = layer_end;
         }
         Ok(Chain { stages })
+    }
+
+    pub fn is_rdma(&self) -> Vec<bool> {
+        self.stages.iter().map(|s| s.is_rdma()).collect()
     }
 
     pub fn layers(&self) -> u32 {

@@ -44,5 +44,5 @@ minijinja = { version = "2", features = ["json", "serde_json", "preserve_order"]
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 fancy-regex = "0.17"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(any(windows, unix))'.dependencies]
 libloading = "0.8"

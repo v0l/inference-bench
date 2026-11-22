@@ -402,7 +402,8 @@ pub fn serve(config: &StageConfig, placement: Option<&PlacementConfig>) -> Resul
         Some(layers) => RuntimeStage::load(&spec, layers, config.max_ctx, config.slots, device)?,
         None => RuntimeStage::unloaded_on(&spec, config.max_ctx, config.slots, device),
     });
-    let server = StageServer::start(&config.bind, &config.key()?, stage.clone())?;
+    let link = placement.and_then(|p| p.remote.as_ref()).map(|r| r.link()).unwrap_or_default();
+    let server = StageServer::start_with(&config.bind, &config.key()?, stage.clone(), link)?;
     let announcer = match (placement.map(|p| p.discovery), &config.device) {
         (Some(Discovery::Mdns), Some(device)) => {
             let port = placement.map_or(5353, |p| p.mdns_port);

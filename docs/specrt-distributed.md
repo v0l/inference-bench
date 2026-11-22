@@ -183,3 +183,32 @@ Real check on the desktop pair (2 x RTX PRO 6000, 27B NVFP4, context 32768), `cr
 |---|---|---|---|
 | max | TP 2 across 2, f16 KV 68 GiB pool, 32 slots, MTP on | `tensor parallel serving layout`, `max_num_seqs=32`, `kv_blocks=65536` | 53 GB and 51 GB |
 | low | one GPU, fp8 KV 1.77 GiB pool, 2 slots, MTP off | `serving layout`, `max_num_seqs=2`, `kv_blocks=2400` | 28 GB and 0 |
+
+## RDMA transport (issue #660)
+
+Config: `[placement.remote] transport = "tcp" | "rdma" | "auto"` (default `tcp`), optional `rdma_library` (default `libibverbs.so.1`). Both the stage (`serve`) and the coordinator read it.
+
+How it works (`crates/specrt/src/rdma.rs`, `wire.rs`):
+- libibverbs is loaded with dlopen, so the binary runs where rdma-core is absent. `auto` then uses TCP, `rdma` fails with the load error.
+- The TCP connection stays the control channel. It does the HMAC handshake and hello as before, then the client sends a `Message::Rdma` (tag 13: qpn, psn, gid, buffer address, rkey). The server answers with its own, or with an error (the client falls back to TCP under `auto`). RC queue pairs are brought up from this exchange over the already authenticated TCP link, not through rdma_cm.
+- After the upgrade every frame is the same encoded `Message` bytes, sent with RDMA write with immediate into a 256 KiB registered receive buffer on the peer. The immediate carries the chunk length and a last-chunk flag. A zero-length write with a credit flag returns the buffer, so one chunk is in flight. Larger frames are chunked (one chunk in flight, so large prefill frames are not faster than loopback TCP; a deeper ring is the next step). TCP stays open and is peeked to detect a dead peer, so it fails in about 20 ms instead of hanging.
+- The GID is picked from an active Ethernet RoCE port, preferring the one equal to the connection's local IPv4 (RoCE v2 mapped GID).
+- Frames pass through pinned host buffers. `Endpoint::register_dmabuf` wraps `ibv_reg_dmabuf_mr`, but nothing exports a CUDA dma-buf yet, so GPU-direct hops are not wired in.
+
+Measured on the desktop (ConnectX-4 to its own address 10.100.50.1, echo stage, one chunk in flight):
+
+| payload | TCP | RDMA |
+|---|---|---|
+| 20 KB round trip | 10 us | 19 us |
+| 4 MB round trip | 3.3 ms | 3.4 ms |
+| 64 MB round trip | 119 ms | 149 ms |
+
+These are same-host numbers. TCP here is kernel loopback and does not touch the NIC, so they say nothing about the cable. The desktop to Spark numbers need the supervisor window: run `SPECRT_RDMA_TEST_IP=<ip> cargo test -p inference-bench-specrt --test rdma hop_latency_rdma_vs_tcp -- --ignored --nocapture` with a stage on the far end.
+
+Host requirements:
+- `ulimit -l`: the two 256 KiB buffers per connection fit in the default 8 MB, but each connection pins 512 KiB, so many parallel connections in one process can hit the limit (the tests serialise for this reason). Raise it in `/etc/security/limits.d` only if larger rings are added.
+- PFC/ECN: RoCE is only lossless with priority flow control. On the direct cable set PFC on the RoCE priority (`mlnx_qos --pfc 0,0,0,1,0,0,0,0` or `dcb pfc`) and DSCP trust on both ends. Without it, drops show up as RC retries and then a failed completion, which is reported as a lost stage. Not configured here; the user must approve it.
+
+Cross-host allreduce: not built. The desktop has 1.8 TB/s of memory bandwidth and the Spark 273 GB/s, so TP across them runs at the Spark's pace and every layer adds two network round trips. Pipeline pays one hop per token, so pipeline is the decision. Revisit only if the planner finds a model that fits neither card alone and is compute bound.
+
+Tests: `crates/specrt/tests/rdma.rs` skips with a message when there is no RoCE device or libibverbs. It covers round trip identical to TCP from 0 B to 5 MB, auto, wrong key, dead peer, library-absent fallback and a TCP-only server.

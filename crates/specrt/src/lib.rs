@@ -58,6 +58,7 @@ pub mod state;
 pub mod vision;
 pub mod vision_encoder;
 pub mod weights;
+pub mod rdma;
 pub mod wire;
 
 pub use engine::Engine;

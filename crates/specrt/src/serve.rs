@@ -692,13 +692,14 @@ fn build_remote(spec: &Spec, opts: &ServeOptions) -> Result<Scheduler<crate::rem
     spec.mtp = None;
     let placement = opts.placement.as_ref().context("remote serving needs [placement]")?;
     let remote = placement.remote.as_ref().context("remote serving needs [placement.remote]")?;
-    let coordinator = crate::coordinator::Coordinator::new(
+    let mut coordinator = crate::coordinator::Coordinator::new(
         &spec,
         placement.clone(),
         remote.key()?,
         Duration::from_millis(remote.timeout_ms),
         Duration::from_millis(remote.member_ttl_ms),
     )?;
+    coordinator.set_link(remote.link());
     let layout = opts.layout(&spec);
     let mut exec = crate::remote::ChainExecutor::new(coordinator, layout.max_ctx, layout.slots, layout.prefill_chunk);
     exec.set_micro_batch(placement.micro_batch_for_remote());
