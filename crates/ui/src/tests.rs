@@ -842,26 +842,84 @@ fn where_the_weights_live_and_the_hit_rate_show_for_an_offloaded_model_at_deskto
     }
 }
 
-#[test]
-fn running_options_stay_inside_the_screen_at_phone_width() {
-    let mut h = harness_at("running-phone", Tab::Server, egui::vec2(390.0, 2400.0));
+static PAINTED_TEXT: std::sync::Mutex<Vec<(String, egui::Rect)>> = std::sync::Mutex::new(Vec::new());
+
+fn capture_painted_text(ctx: &egui::Context) {
+    ctx.on_end_pass(
+        "painted-text",
+        std::sync::Arc::new(|ui: &mut egui::Ui| {
+            let ctx = ui.ctx().clone();
+            let found: Vec<(String, egui::Rect)> = ctx.graphics(|g| {
+                [egui::LayerId::background()]
+                    .into_iter()
+                    .filter_map(|id| g.get(id))
+                    .flat_map(|list| list.all_entries())
+                    .filter_map(|c| match &c.shape {
+                        egui::Shape::Text(t) if !t.galley.text().trim().is_empty() => Some((t.galley.text().to_string(), c.shape.visual_bounding_rect())),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            *PAINTED_TEXT.lock().unwrap() = found;
+        }),
+    );
+}
+
+fn server_tab_painted_text(width: f32, name: &str, gpus: usize) -> Vec<(String, egui::Rect)> {
+    let mut h = harness_at(&format!("clip-{width}-{gpus}"), Tab::Server, egui::vec2(width, 2400.0));
+    capture_painted_text(&h.ctx);
     with_gpu(&mut h, 0, 96 << 30);
+    let one = h.state().gpu[0].clone();
+    h.state_mut().gpu = vec![one; gpus];
     h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
-    let m = real_model(&h.state().library[0].name.clone());
+    let mut m = real_model(&h.state().library[0].name.clone());
+    m.name = name.to_string();
     h.state_mut().library[0] = m.clone();
     h.state_mut().load_model_with(&m, 2048, 2);
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
     h.run();
-    let screen = h.ctx.content_rect();
-    let mut checked = 0;
-    for text in ["what ", "not reported", "tokens", "reasoning parser", "tool parser", "2 of 4 layers"] {
-        for n in h.query_all_by_label_contains(text) {
-            let r = n.rect();
-            checked += 1;
-            assert!(r.right() <= screen.right() + 0.5, "{text} ends at {} past {}", r.right(), screen.right());
+    h.step();
+    let found = PAINTED_TEXT.lock().unwrap().clone();
+    found
+}
+
+#[test]
+fn server_tab_text_stays_inside_the_screen_from_360_to_600_wide() {
+    let _guard = PAINTED_TEXT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut offenders = Vec::new();
+    for width in [360.0f32, 390.0, 412.0, 600.0] {
+        for (name, gpus) in [("Qwen3-0.6B", 1), ("HuggingFaceTB/SmolLM2-135M-Instruct", 2)] {
+            let found = server_tab_painted_text(width, name, gpus);
+            assert!(found.len() > 20, "only {} text shapes at {width}", found.len());
+            for (text, r) in &found {
+                if r.max.x > width + 0.5 {
+                    offenders.push(format!("width {width}, {gpus} gpu, {name}: {text:?} ends at {} past the screen", r.max.x));
+                }
+            }
         }
     }
-    assert!(checked > 0);
+    assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+}
+
+static PAINTED_TEXT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshot_of_the_server_tab_with_a_long_model_name_at_phone_width() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness_at("server-phone-shot", Tab::Server, egui::vec2(390.0, 844.0));
+    with_gpu(&mut h, 0, 96 << 30);
+    let one = h.state().gpu[0].clone();
+    h.state_mut().gpu = vec![one; 2];
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+    let mut m = real_model(&h.state().library[0].name.clone());
+    m.name = "HuggingFaceTB/SmolLM2-135M-Instruct".to_string();
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().load_model_with(&m, 2048, 2);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    h.render().unwrap().save(out.join("server-phone-390x844.png")).unwrap();
 }
 
 #[test]
