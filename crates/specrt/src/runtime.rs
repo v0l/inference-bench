@@ -174,16 +174,39 @@ fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec,
         settings.host_budget = u64::MAX;
     }
     let plan = plan_layers(&sizes, always, &settings)?;
-    ensure!(plan.nvme_bytes == 0, "[runtime.offload] {} bytes of layers fit neither vram_budget nor host_budget, and the disk tier is not wired to the GPU path yet", plan.nvme_bytes);
+    let dir = match (&off.nvme_path, plan.nvme_bytes) {
+        (_, 0) => None,
+        (Some(p), _) => Some(std::path::PathBuf::from(p)),
+        (None, n) => anyhow::bail!("[runtime.offload] {n} bytes of layers fit neither vram_budget nor host_budget and nvme_path is not set"),
+    };
     let pool = crate::hostpool::HostPool::new(ctx.clone());
     let mut spilled = Vec::new();
-    for l in plan.layers.iter().filter(|l| l.tier == Tier::Host) {
-        spilled.push(stream::spill(stream, &pool, l.layer, &mut layers[l.layer])?);
+    let mut writer = None;
+    let mut disk_path = None;
+    if let Some(dir) = &dir {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join(format!("layers-{}.pages", std::process::id()));
+        disk_path = Some(path.clone());
+        writer = Some(crate::diskio::Appender::create(path)?);
+    }
+    for l in plan.layers.iter().filter(|l| l.tier != Tier::Vram) {
+        match (&mut writer, l.tier) {
+            (Some(w), Tier::Nvme) => spilled.push(stream::spill_to_disk(stream, &pool, w, l.layer, &mut layers[l.layer])?),
+            _ => spilled.push(stream::spill(stream, &pool, l.layer, &mut layers[l.layer])?),
+        }
     }
     if spilled.is_empty() {
         return Ok((None, Some(plan)));
     }
-    let streamer = stream::Streamer::new(stream, layers, spilled, off.prefetch_depth)?;
+    let disk = match (writer, disk_path) {
+        (Some(w), Some(path)) => {
+            w.finish()?;
+            let file: Arc<dyn crate::diskio::ReadAt> = Arc::new(crate::diskio::DirectFile::open(&path)?);
+            Some(stream::DiskTier::new(file, path))
+        }
+        _ => None,
+    };
+    let streamer = stream::Streamer::new(stream, layers, spilled, off.prefetch_depth, disk, &pool)?;
     ctx.synchronize()?;
     unsafe {
         let pool = cudarc::driver::result::device::get_default_mem_pool(ctx.cu_device())?;

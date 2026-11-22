@@ -37,6 +37,7 @@ pub mod nvrtc;
 pub mod options;
 pub mod pairing;
 pub mod pipeline;
+pub mod diskio;
 pub mod hostpool;
 pub mod offload;
 pub mod plan;
