@@ -121,7 +121,7 @@ impl EngineChoice {
 
 fn validate(opts: &ServeOptions) -> Result<()> {
     let s = &opts.speculative;
-    if let Some(k) = s.draft_tokens {
+    if let Some(crate::serve::DraftTokens::Fixed(k)) = s.draft_tokens {
         anyhow::ensure!((1..=crate::spec::MAX_DRAFT_TOKENS).contains(&k), "speculative.draft_tokens (draft tokens) must be 1 to {}, not {k}", crate::spec::MAX_DRAFT_TOKENS);
     }
     if let Some(b) = s.max_batch {
@@ -386,7 +386,7 @@ fn populated_runtime() -> RuntimeOptions {
 }
 
 fn populated_speculative() -> SpeculativeOptions {
-    SpeculativeOptions { enabled: Some(true), draft_tokens: Some(1), max_batch: Some(1), head_quant: Some(Quant::Bf16) }
+    SpeculativeOptions { enabled: Some(true), draft_tokens: Some(crate::serve::DraftTokens::Fixed(1)), max_batch: Some(1), head_quant: Some(Quant::Bf16) }
 }
 
 fn flatten(prefix: &str, v: &Value, out: &mut BTreeMap<String, Value>) {
@@ -552,7 +552,7 @@ mod tests {
         assert!(!c.is_custom() && c.is_default("runtime.graphs"));
         c.set("speculative.draft_tokens", json!(3));
         let o = c.apply(ServeOptions::default()).unwrap();
-        assert_eq!(o.speculative.draft_tokens, Some(3));
+        assert_eq!(o.speculative.draft_tokens, Some(crate::serve::DraftTokens::Fixed(3)));
     }
 
     #[test]

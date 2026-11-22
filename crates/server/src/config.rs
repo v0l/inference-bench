@@ -554,7 +554,9 @@ python = "python3"
         use inference_bench_core::specrt_serve::SpeculativeOptions;
         let c = ServerConfig::parse("max_num_seqs = 4\n[speculative]\ndraft_tokens = 3\nmax_batch = 2\n[[models]]\nid='m'").unwrap();
         let o = c.serve_options(&c.models[0]).unwrap();
-        assert_eq!(o.speculative, SpeculativeOptions { enabled: None, draft_tokens: Some(3), max_batch: Some(2), head_quant: None });
+        assert_eq!(o.speculative, SpeculativeOptions { enabled: None, draft_tokens: Some(inference_bench_core::specrt_serve::DraftTokens::Fixed(3)), max_batch: Some(2), head_quant: None });
+        let auto = ServerConfig::parse("max_num_seqs = 4\n[speculative]\ndraft_tokens = \"auto\"\n[[models]]\nid='m'").unwrap();
+        assert_eq!(auto.serve_options(&auto.models[0]).unwrap().speculative.draft_tokens, Some(inference_bench_core::specrt_serve::DraftTokens::Auto));
         let off = ServerConfig::parse("max_num_seqs = 4\n[speculative]\nenabled = false\n[[models]]\nid='m'").unwrap();
         assert_eq!(off.serve_options(&off.models[0]).unwrap().speculative.enabled, Some(false));
         let plain = ServerConfig::parse("max_num_seqs = 4\n[[models]]\nid='m'").unwrap();

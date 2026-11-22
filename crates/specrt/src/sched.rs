@@ -178,6 +178,9 @@ pub trait Executor {
     fn speculate(&mut self, _rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
         bail!("this executor does not speculate")
     }
+    fn speculate_with(&mut self, rows: &[SpecRow], _k: usize) -> Result<Vec<Vec<u32>>> {
+        self.speculate(rows)
+    }
     fn supports_prefix_cache(&self) -> bool {
         false
     }
@@ -335,6 +338,10 @@ impl Executor for GpuExecutor {
 
     fn speculate(&mut self, rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
         self.rt.speculate(rows)
+    }
+
+    fn speculate_with(&mut self, rows: &[SpecRow], k: usize) -> Result<Vec<Vec<u32>>> {
+        self.rt.speculate_k(rows, k)
     }
 
     fn supports_prefix_cache(&self) -> bool {
@@ -515,6 +522,7 @@ pub struct Config {
     pub admit_lookahead: usize,
     pub prefill_burst_tokens: usize,
     pub max_long_in_flight: usize,
+    pub adaptive_drafts: bool,
 }
 
 impl Default for Config {
@@ -534,6 +542,7 @@ impl Default for Config {
             admit_lookahead: 0,
             prefill_burst_tokens: 0,
             max_long_in_flight: 1,
+            adaptive_drafts: false,
         }
     }
 }
@@ -599,6 +608,7 @@ struct Seq {
     media: Option<Arc<crate::vision::MediaPlan>>,
     cursor: Option<crate::grammar::Cursor>,
     parked: Option<HostSeq>,
+    drafts: crate::drafts::Positions,
 }
 
 impl Seq {
@@ -638,6 +648,7 @@ pub struct Scheduler<E: Executor> {
     prefix_queries: u64,
     prefix_hits: u64,
     sessions: Option<Sessions>,
+    chooser: Option<crate::drafts::DraftChooser>,
 }
 
 struct Held {
@@ -695,6 +706,7 @@ impl<E: Executor> Scheduler<E> {
         let free_slots = (0..exec.slots()).rev().collect();
         let cache = (cfg.prefix_cache.enabled && exec.supports_prefix_cache()).then(|| PrefixCache::new(&cfg.prefix_cache, exec.hybrid()));
         let mut exec = exec;
+        let chooser = (cfg.adaptive_drafts && exec.draft_tokens() > 0).then(|| crate::drafts::DraftChooser::new(exec.draft_tokens()));
         if cfg.swap_space_bytes > 0 {
             exec.set_host_limit(cfg.swap_space_bytes as usize);
         }
@@ -721,7 +733,12 @@ impl<E: Executor> Scheduler<E> {
             prefix_queries: 0,
             prefix_hits: 0,
             sessions: None,
+            chooser,
         }
+    }
+
+    pub fn draft_chooser(&self) -> Option<&crate::drafts::DraftChooser> {
+        self.chooser.as_ref()
     }
 
     pub fn enable_sessions(&mut self, shared: Arc<crate::sessions::Shared>) {
@@ -1025,6 +1042,7 @@ impl<E: Executor> Scheduler<E> {
             media,
             cursor,
             parked: None,
+            drafts: Default::default(),
         });
         Ok(id)
     }
@@ -1426,7 +1444,14 @@ impl<E: Executor> Scheduler<E> {
         let cap = self.exec.speculation_cap();
         let wants_logprobs = rows.iter().any(|(i, _)| self.running[*i].req.sampling.logprobs.is_some());
         let constrained = rows.iter().any(|(i, _)| self.running[*i].cursor.is_some());
-        if pending && rows.len() <= cap && !wants_logprobs && !constrained {
+        let mut draft_k = self.exec.draft_tokens();
+        if pending && rows.len() <= cap && !wants_logprobs && !constrained
+            && let Some(c) = self.chooser.as_mut()
+        {
+            let seqs: Vec<crate::drafts::Positions> = rows.iter().map(|(i, _)| self.running[*i].drafts).collect();
+            draft_k = c.choose(&seqs);
+        }
+        if pending && rows.len() <= cap && !wants_logprobs && !constrained && draft_k > 0 {
             pending = false;
             let started = Instant::now();
             let spec: Vec<SpecRow> = rows
@@ -1438,11 +1463,19 @@ impl<E: Executor> Scheduler<E> {
                     SpecRow { slot: r.slot, token: r.token, pos: r.pos, sampling: r.sampling, step: r.step, max_accept: left.saturating_sub(1) }
                 })
                 .collect();
-            let out = self.exec.speculate(&spec)?;
+            let out = self.exec.speculate_with(&spec, draft_k)?;
             report.decode_secs = started.elapsed().as_secs_f64();
             report.speculated = true;
             report.decode_rows = rows.len();
-            report.drafted = rows.len() * self.exec.draft_tokens();
+            report.drafted = rows.len() * draft_k;
+            if let Some(c) = self.chooser.as_mut() {
+                c.observe(rows.len(), draft_k, report.decode_secs);
+                let accepted: Vec<usize> = out.iter().map(|e| e.len() - 1).collect();
+                c.observe_accepts(draft_k, &accepted);
+                for ((i, _), a) in rows.iter().zip(&accepted) {
+                    self.running[*i].drafts.record(draft_k, *a);
+                }
+            }
             for ((i, _), emitted) in rows.iter().zip(out) {
                 report.accepted += emitted.len() - 1;
                 for t in emitted {
@@ -1535,6 +1568,12 @@ impl<E: Executor> Scheduler<E> {
             let next = self.exec.decode(&plain)?;
             report.decode_secs = started.elapsed().as_secs_f64();
             report.decode_rows = rows.len();
+            if let Some(c) = self.chooser.as_mut()
+                && rows.len() <= cap
+                && draft_k == 0
+            {
+                c.observe(rows.len(), 0, report.decode_secs);
+            }
             self.apply_decode(&rows, next, &mut done, events)?;
         }
         if report.prefill_tokens > 0 {
@@ -1641,6 +1680,9 @@ mod tests {
         pub spec_cap: usize,
         pub spec_calls: Vec<usize>,
         pub accept_counts: Vec<usize>,
+        pub k_used: Vec<usize>,
+        pub verify_cost: Option<fn(usize, usize) -> Duration>,
+        pub accept_all: bool,
         last_decode: Vec<u32>,
         last_prefill: Option<u32>,
         masks: Vec<Option<Mask>>,
@@ -1684,6 +1726,9 @@ mod tests {
                 spec_cap: 0,
                 spec_calls: Vec::new(),
                 accept_counts: Vec::new(),
+                k_used: Vec::new(),
+                verify_cost: None,
+                accept_all: false,
                 last_decode: Vec::new(),
                 last_prefill: None,
                 masks: Vec::new(),
@@ -1890,16 +1935,27 @@ mod tests {
             self.spec_cap
         }
         fn speculate(&mut self, rows: &[SpecRow]) -> Result<Vec<Vec<u32>>> {
+            self.speculate_with(rows, self.spec_k)
+        }
+        fn speculate_with(&mut self, rows: &[SpecRow], k: usize) -> Result<Vec<Vec<u32>>> {
+            assert!(k >= 1 && k <= self.spec_k);
+            self.k_used.push(k);
             let mut seen = std::collections::HashSet::new();
             assert!(rows.iter().all(|r| seen.insert(r.slot)), "a slot twice in one batch");
             assert!(rows.len() <= self.spec_cap);
             self.spec_calls.push(rows.len());
-            std::thread::sleep(self.row_cost * rows.len() as u32);
+            std::thread::sleep(match self.verify_cost {
+                Some(f) => f(rows.len(), k),
+                None => self.row_cost * rows.len() as u32,
+            });
             let mut out = Vec::new();
             for r in rows {
                 let pages = self.tables[r.slot].len() * PAGE;
-                assert!(r.pos + self.spec_k < pages, "verify rows past the block table: pos {} k {} pages {pages}", r.pos, self.spec_k);
-                let wanted = ((r.pos as u64 * 2654435761 + r.slot as u64) % (self.spec_k as u64 + 1)) as usize;
+                assert!(r.pos + k < pages, "verify rows past the block table: pos {} k {} pages {pages}", r.pos, k);
+                let wanted = match self.accept_all {
+                    true => k,
+                    false => ((r.pos as u64 * 2654435761 + r.slot as u64) % (k as u64 + 1)) as usize,
+                };
                 let a = wanted.min(r.max_accept);
                 self.accept_counts.push(a);
                 let mut emitted = Vec::new();
@@ -2156,6 +2212,59 @@ mod tests {
             assert_eq!(drafted, s.exec.spec_calls.iter().sum::<usize>() * k);
             assert!(accepted <= drafted && accepted >= counts.iter().sum::<usize>() / 2);
         }
+    }
+
+    fn adaptive_run(plain: Duration, cost: fn(usize, usize) -> Duration, accept_all: bool, seqs: u32, tokens: usize) -> (Vec<usize>, usize) {
+        let mut fake = Fake::new(4096, 8, 400, 256);
+        fake.row_cost = plain;
+        fake.spec_k = 3;
+        fake.spec_cap = 8;
+        fake.verify_cost = Some(cost);
+        fake.accept_all = accept_all;
+        let cfg = Config { max_num_seqs: 8, adaptive_drafts: true, ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        let mut want = HashMap::new();
+        for q in 0..seqs {
+            let r = request(20, tokens, q);
+            want.insert(s.submit(r.clone()).unwrap(), expected(&r.prompt, r.max_tokens, &[]));
+        }
+        let (got, _, _) = drain(&mut s);
+        assert_eq!(got, want);
+        (s.exec.k_used.clone(), s.exec.decode_calls.len())
+    }
+
+    #[test]
+    fn the_chooser_stops_drafting_when_verify_is_expensive_and_output_stays_greedy() {
+        let (ks, plain) = adaptive_run(Duration::from_micros(300), |rows, k| Duration::from_micros(300 * rows as u64 * (1 + 3 * k as u64)), false, 8, 400);
+        assert!(plain > 0, "plain decode steps ran");
+        assert!(ks.len() < plain / 3, "drafting stayed rare: {} drafted against {plain} plain", ks.len());
+    }
+
+    #[test]
+    fn the_chooser_drafts_three_when_acceptance_is_high_and_verify_is_cheap() {
+        let (ks, plain) = adaptive_run(Duration::from_micros(2000), |rows, k| Duration::from_micros(2000 + 20 * rows as u64 * k as u64), true, 1, 300);
+        let threes = ks.iter().filter(|&&k| k == 3).count();
+        assert!(threes * 10 > ks.len() * 8, "k = 3 in {threes} of {} steps", ks.len());
+        assert!(plain <= 3, "{plain}");
+    }
+
+    #[test]
+    fn the_chooser_switches_draft_counts_across_steps_with_identical_output() {
+        let mut fake = Fake::new(2048, 16, 120, 256);
+        fake.spec_k = 3;
+        fake.spec_cap = 16;
+        fake.verify_cost = Some(|rows, k| Duration::from_micros(100 * rows as u64 + 150 * k as u64));
+        let cfg = Config { max_num_seqs: 16, max_batched_tokens: 512, reserve_blocks: Some(1), admit_lookahead: 0, adaptive_drafts: true, ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        let mut want = HashMap::new();
+        for q in 0..32u32 {
+            let r = request([3, 17, 90, 400][q as usize % 4], 20 + (q as usize * 13) % 120, q);
+            want.insert(s.submit(r.clone()).unwrap(), expected(&r.prompt, r.max_tokens, &[]));
+        }
+        let (got, _, _) = drain(&mut s);
+        assert_eq!(got, want);
+        let distinct: std::collections::HashSet<usize> = s.exec.k_used.iter().copied().collect();
+        assert!(distinct.len() >= 2, "{distinct:?}");
     }
 
     #[test]
