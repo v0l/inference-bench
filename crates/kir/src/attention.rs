@@ -9,6 +9,7 @@ pub const DECODE_KEYS: usize = 16;
 pub const DECODE_STAGES: usize = 2;
 pub const DECODE_MAX_QLEN: usize = 4;
 pub const FLASH_ROWS: usize = 128;
+pub const FLASH_ROWS_SMALL: usize = 64;
 pub const SPLIT_BLOCK: u32 = 128;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -69,13 +70,13 @@ impl AttentionShape {
     }
 
     pub fn flash_warps(&self) -> usize {
-        FLASH_ROWS / 16
+        flash_rows(self.head_dim, self.kv_planes) / 16
     }
 
     pub fn flash_smem(&self) -> usize {
         let kv = self.flash_stages() * 2 * self.kv_planes * self.flash_keys() * self.head_dim * 2;
         let scales = if self.kv_fp8 { self.flash_stages() * 2 * self.flash_keys() * 4 } else { 0 };
-        kv.max(FLASH_ROWS * self.head_dim * 2) + scales
+        kv.max(flash_rows(self.head_dim, self.kv_planes) * self.head_dim * 2) + scales
     }
 
     pub fn legacy_flash_smem(&self) -> usize {
@@ -98,6 +99,10 @@ impl AttentionShape {
     pub fn decode_max_warps(&self) -> usize {
         self.decode_warps(DECODE_MAX_QLEN)
     }
+}
+
+pub fn flash_rows(head_dim: usize, kv_planes: usize) -> usize {
+    if head_dim <= 128 && kv_planes == 1 { FLASH_ROWS_SMALL } else { FLASH_ROWS }
 }
 
 pub fn flash_keys(head_dim: usize, kv_planes: usize) -> usize {

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 struct Flags {
     runs: usize,
     serve: bool,
+    cold: bool,
     profile: bool,
     fp8_act: bool,
     kv_gb: Option<f64>,
@@ -28,11 +29,12 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None };
+    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--serve" => f.serve = true,
+            "--cold" => f.cold = true,
             "--profile" => f.profile = true,
             "--fp8-act" => f.fp8_act = true,
             "--pdl" => f.pdl = true,
@@ -149,6 +151,9 @@ fn main() -> Result<()> {
     if speculative {
         return bench_spec(&spec, new_tokens, batch.max(1), longest);
     }
+    if flags().cold {
+        return bench_cold(&spec, longest, new_tokens);
+    }
     if flags().serve {
         return bench_serve(&spec, longest, new_tokens, batch.max(1), sampled);
     }
@@ -157,11 +162,13 @@ fn main() -> Result<()> {
     }
     let mut rt = Runtime::load(&spec, longest + new_tokens)?;
     println!(
-        "{} quant={:?} arch={} jit_cache_hit={} load={:.2}s weights={:.2} GB in {:.2}s device={:.2} GB peak_host_rss={:.2} GB",
+        "{} quant={:?} arch={} jit_cache_hit={} jit_compile={:.2}s jit_load_module={:.2}s load={:.2}s weights={:.2} GB in {:.2}s device={:.2} GB peak_host_rss={:.2} GB",
         spec.name,
         spec.quant,
         rt.arch,
         rt.cache_hit,
+        rt.jit_compile_secs,
+        rt.jit_module_secs,
         rt.load_secs,
         rt.weight_bytes as f64 / 1e9,
         rt.weight_secs,
@@ -267,6 +274,57 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
         let first: Vec<u32> = outs[&ids[0]].iter().take(24).copied().collect();
         println!("  first prompt tokens {first:?}");
     }
+    Ok(())
+}
+
+fn bench_cold(spec: &Spec, prompt_len: usize, new_tokens: usize) -> Result<()> {
+    use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
+    let mut spec = spec.clone();
+    if let Some(m) = spec.mtp.as_mut() {
+        m.speculate = false;
+    }
+    let spec = &spec;
+    let max_ctx = prompt_len + new_tokens + 16;
+    let kv_bytes = flags().kv_gb.map(|gb| (gb * (1u64 << 30) as f64) as usize);
+    let layout = specrt::runtime::Layout::serving(spec, max_ctx, 32, kv_bytes);
+    let rt = Runtime::load_layout(spec, layout)?;
+    println!(
+        "{} cold_start load={:.2}s jit_cache_hit={} jit_compile={:.2}s jit_load_module={:.2}s weights={:.2}s",
+        spec.name, rt.load_secs, rt.cache_hit, rt.jit_compile_secs, rt.jit_module_secs, rt.weight_secs
+    );
+    let mut sched = Scheduler::new(GpuExecutor::new(rt)?, Config { max_num_seqs: 32, ..Config::default() });
+    let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 1000 + i * 7 % 5000).collect();
+    let mut ttfts = Vec::new();
+    for _ in 0..11 {
+        let id = sched.submit(Request { prompt: prompt.clone(), max_tokens: new_tokens, sampling: Sampling::GREEDY, stop: vec![], salt: "cold".into(), media: Vec::new(), grammar: None })?;
+        let started = std::time::Instant::now();
+        let mut ttft = None;
+        while !sched.idle() {
+            let mut events = Vec::new();
+            sched.step(&mut events)?;
+            if ttft.is_none() && events.iter().any(|e| matches!(e, Event::Token { id: i, .. } if *i == id)) {
+                ttft = Some(started.elapsed().as_secs_f64());
+            }
+        }
+        ttfts.push(ttft.context("no token")?);
+    }
+    let rest = median(ttfts[1..].to_vec());
+    println!("ttft_first={:.3}s ttft_next10_median={:.3}s ratio={:.1}x prompt={prompt_len}", ttfts[0], rest, ttfts[0] / rest);
+    let mut n = 1;
+    while n <= 32 {
+        for i in 0..n {
+            sched.submit(Request { prompt: prompt.clone(), max_tokens: 24, sampling: Sampling::GREEDY, stop: vec![], salt: format!("g{n}-{i}"), media: Vec::new(), grammar: None })?;
+        }
+        let mut events = Vec::new();
+        while !sched.idle() {
+            sched.step(&mut events)?;
+        }
+        n *= 2;
+    }
+    let secs: Vec<String> = sched.exec.capture_secs().iter().map(|(n, s)| format!("{n}:{s:.3}")).collect();
+    println!("graph_capture_secs rows:secs [{}]", secs.join(" "));
+    let spec_secs: Vec<String> = sched.exec.rt.speculation_capture_secs().iter().map(|(n, s)| format!("{n}:{s:.3}")).collect();
+    println!("speculation_graph_capture_secs rows:secs [{}]", spec_secs.join(" "));
     Ok(())
 }
 

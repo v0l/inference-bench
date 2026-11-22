@@ -745,6 +745,8 @@ pub struct Runtime {
     tables: Vec<i32>,
     pub cache_hit: bool,
     pub jit_key: String,
+    pub jit_compile_secs: f64,
+    pub jit_module_secs: f64,
     pub arch: String,
     pub device_bytes: u64,
     pub weight_bytes: u64,
@@ -1130,6 +1132,8 @@ impl Runtime {
             stream,
             cache_hit: loaded.cache_hit,
             jit_key: loaded.key,
+            jit_compile_secs: loaded.compile_secs,
+            jit_module_secs: loaded.module_secs,
             arch: jit.arch().to_string(),
             device_bytes: 0,
             weight_bytes,
@@ -1201,6 +1205,8 @@ impl Runtime {
             jit_key = %rt.jit_key,
             jit_cache_hit = rt.cache_hit,
             jit_secs = jit_secs,
+            jit_compile_secs = rt.jit_compile_secs,
+            jit_module_secs = rt.jit_module_secs,
             arch = %rt.arch,
             shards = checkpoint.files.len(),
             weights_direct,
@@ -2086,7 +2092,7 @@ impl Runtime {
             .arg(&self.seq)
             .arg(&l.window)
             .arg(&self.mm_bidi);
-        let rows = crate::codegen::flash_rows(a.head_dim);
+        let rows = crate::codegen::flash_rows(a.head_dim, self.kv_planes);
         let config = LaunchConfig {
             grid_dim: (grid(n, rows), a.heads as u32, 1),
             block_dim: (rows as u32 * 2, 1, 1),
