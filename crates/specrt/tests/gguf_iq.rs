@@ -26,6 +26,16 @@ fn iq4_nl_matches_ggml() {
 }
 
 #[test]
+fn iq1_s_matches_ggml() {
+    check("iq1_s", 50, dequantize_iq1_s);
+}
+
+#[test]
+fn iq1_m_matches_ggml() {
+    check("iq1_m", 56, dequantize_iq1_m);
+}
+
+#[test]
 fn iq2_xxs_matches_ggml() {
     check("iq2_xxs", 66, dequantize_iq2_xxs);
 }

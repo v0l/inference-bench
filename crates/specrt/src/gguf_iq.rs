@@ -19,6 +19,44 @@ fn signed(signs: u8, j: usize) -> f32 {
     if signs & (1 << j) != 0 { -1.0 } else { 1.0 }
 }
 
+const IQ1_DELTA: f32 = 0.125;
+
+pub fn dequantize_iq1_s(block: &[u8], out: &mut [f32]) {
+    let d = f16(block);
+    for ib in 0..8 {
+        let qh = u16_at(block, 34 + 2 * ib);
+        let dl = d * (2 * ((qh >> 12) & 7) as i32 + 1) as f32;
+        let delta = if qh & 0x8000 != 0 { -IQ1_DELTA } else { IQ1_DELTA };
+        for l in 0..4 {
+            let idx = block[2 + 4 * ib + l] as usize | ((((qh >> (3 * l)) & 7) as usize) << 8);
+            let grid = IQ1S_GRID[idx].to_le_bytes();
+            for j in 0..8 {
+                out[32 * ib + 8 * l + j] = dl * (grid[j] as i8 as f32 + delta);
+            }
+        }
+    }
+}
+
+pub fn dequantize_iq1_m(block: &[u8], out: &mut [f32]) {
+    let sc = [u16_at(block, 48), u16_at(block, 50), u16_at(block, 52), u16_at(block, 54)];
+    let scale = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    let d = crate::weights::f16_to_f32(scale);
+    for ib in 0..8 {
+        let shift = 6 * (ib % 2);
+        let dl = [d * (2 * ((sc[ib / 2] >> shift) & 7) as i32 + 1) as f32, d * (2 * ((sc[ib / 2] >> (shift + 3)) & 7) as i32 + 1) as f32];
+        for l in 0..4 {
+            let qh = block[32 + 2 * ib + l / 2] as usize;
+            let odd = l % 2 == 1;
+            let idx = block[4 * ib + l] as usize | ((qh << if odd { 4 } else { 8 }) & 0x700);
+            let delta = if qh & if odd { 0x80 } else { 0x08 } != 0 { -IQ1_DELTA } else { IQ1_DELTA };
+            let grid = IQ1S_GRID[idx].to_le_bytes();
+            for j in 0..8 {
+                out[32 * ib + 8 * l + j] = dl[l / 2] * (grid[j] as i8 as f32 + delta);
+            }
+        }
+    }
+}
+
 pub fn dequantize_iq2_xxs(block: &[u8], out: &mut [f32]) {
     let d = f16(block);
     for ib in 0..8 {
