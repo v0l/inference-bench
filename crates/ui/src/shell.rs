@@ -147,11 +147,9 @@ fn status_left(app: &mut App, ui: &mut egui::Ui, reserve: f32) {
                 lamp(ui, "no model loaded", false, false);
             }
         }
-        if reserve > 0.0 {
-            if let Some((ok, text)) = &app.notice {
-                ui.add_space(10.0);
-                crate::working::status_line(ui, *ok, text, reserve);
-            }
+        if let (true, Some((ok, text))) = (reserve > 0.0, &app.notice) {
+            ui.add_space(10.0);
+            crate::working::status_line(ui, *ok, text, reserve);
         }
     }
 }
