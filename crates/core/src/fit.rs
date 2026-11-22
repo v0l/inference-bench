@@ -86,6 +86,106 @@ pub fn kv_cost_at(spec: &specrt::spec::Spec, dtype: specrt::spec::KvDtype, ctx: 
     (specrt::runtime::kv_block_bytes(&s.for_kv_context(ctx), 1) / specrt::codegen::PAGE) as u64 * ctx as u64
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvKind {
+    Auto,
+    F16,
+    Fp8,
+    MixedFp8,
+}
+
+impl KvKind {
+    pub const ALL: [KvKind; 4] = [KvKind::Auto, KvKind::F16, KvKind::Fp8, KvKind::MixedFp8];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            KvKind::Auto => "auto",
+            KvKind::F16 => "fp16 / bf16",
+            KvKind::Fp8 => "fp8",
+            KvKind::MixedFp8 => "mixed fp8",
+        }
+    }
+
+    pub fn help(self) -> &'static str {
+        match self {
+            KvKind::Auto => "The profile and the planner choose.",
+            KvKind::F16 => "Full precision, the most memory.",
+            KvKind::Fp8 => "One byte per value, about half the memory.",
+            KvKind::MixedFp8 => "fp8 with the early layers kept at f16, the safest fp8.",
+        }
+    }
+}
+
+pub fn kv_bytes_per_token(spec: &specrt::spec::Spec, kind: KvKind, ctx: usize) -> u64 {
+    use specrt::spec::KvDtype;
+    let mut s = spec.clone();
+    match kind {
+        KvKind::Auto => {}
+        KvKind::F16 => s.runtime.kv_dtype = KvDtype::F16,
+        KvKind::Fp8 => {
+            s.runtime.kv_dtype = KvDtype::Fp8;
+            s.runtime.kv_f16_layers = Some(0);
+        }
+        KvKind::MixedFp8 => {
+            s.runtime.kv_dtype = KvDtype::Fp8;
+            s.runtime.kv_f16_layers = None;
+        }
+    }
+    (specrt::runtime::kv_block_bytes(&s.for_kv_context(ctx), 1) / specrt::codegen::PAGE) as u64
+}
+
+pub fn kv_gb_for_tokens(bytes_per_token: u64, tokens: usize) -> f64 {
+    bytes_per_token as f64 * tokens as f64 / GB
+}
+
+pub fn tokens_for_kv_gb(bytes_per_token: u64, gb: f64) -> usize {
+    if bytes_per_token == 0 { usize::MAX } else { (gb.max(0.0) * GB / bytes_per_token as f64).floor() as usize }
+}
+
+pub fn fitting_context(a: &ModelAnatomy, free: Option<u64>, seqs: usize) -> Option<usize> {
+    let usable = (free? as f64 * GPU_UTILIZATION) as u64;
+    let room = usable.checked_sub(a.total_bytes + a.state_bytes_per_seq * seqs.max(1) as u64)?;
+    let tokens = pool_tokens(a, room).min(a.max_context.max(1));
+    Some(tokens.max(1))
+}
+
+pub fn kv_kind_effective(choice: &specrt::options::EngineChoice) -> KvKind {
+    match choice.value("runtime.kv_dtype").as_str() {
+        Some("fp8") if choice.value("runtime.kv_f16_layers").as_u64() == Some(0) => KvKind::Fp8,
+        Some("fp8") => KvKind::MixedFp8,
+        _ => KvKind::F16,
+    }
+}
+
+pub fn kv_kind_of(choice: &specrt::options::EngineChoice) -> KvKind {
+    if !choice.overrides.contains_key("runtime.kv_dtype") && !choice.overrides.contains_key("runtime.kv_f16_layers") {
+        return KvKind::Auto;
+    }
+    kv_kind_effective(choice)
+}
+
+pub fn set_kv_kind(choice: &mut specrt::options::EngineChoice, kind: KvKind) {
+    use serde_json::json;
+    match kind {
+        KvKind::Auto => {
+            choice.reset("runtime.kv_dtype");
+            choice.reset("runtime.kv_f16_layers");
+        }
+        KvKind::F16 => {
+            choice.overrides.insert("runtime.kv_dtype".into(), json!("f16"));
+            choice.reset("runtime.kv_f16_layers");
+        }
+        KvKind::Fp8 => {
+            choice.set("runtime.kv_dtype", json!("fp8"));
+            choice.set("runtime.kv_f16_layers", json!(0));
+        }
+        KvKind::MixedFp8 => {
+            choice.set("runtime.kv_dtype", json!("fp8"));
+            choice.reset("runtime.kv_f16_layers");
+        }
+    }
+}
+
 pub fn max_context(a: &ModelAnatomy) -> usize {
     a.max_context.max(1)
 }
@@ -242,4 +342,65 @@ pub fn plan_for(a: &ModelAnatomy, input: &PlanInput, free: Option<u64>) -> LoadP
     let kv_gb = input.kv_gb.filter(|g| *g > 0.0).unwrap_or_else(|| default_kv_gb(a, free, seqs, ctx));
     let kv_bytes = pool_bytes(a, ctx, seqs, kv_gb);
     LoadPlan { ctx, max_ctx, seqs, kv_gb, kv_bytes, estimate: estimate(a, kv_bytes, seqs, free), holds_one_request: pool_holds_one(a, kv_bytes, ctx) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn spec() -> specrt::spec::Spec {
+        let text = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../specrt/tests/fixtures/qwen3.5-4b-base.config.json")).unwrap();
+        specrt::spec::Spec::from_hf_config(&text).unwrap()
+    }
+
+    #[test]
+    fn fp8_kv_costs_less_per_token_than_f16_and_mixed_sits_between() {
+        let s = spec();
+        let f16 = kv_bytes_per_token(&s, KvKind::F16, 8192);
+        let fp8 = kv_bytes_per_token(&s, KvKind::Fp8, 8192);
+        let mixed = kv_bytes_per_token(&s, KvKind::MixedFp8, 8192);
+        assert!(fp8 < mixed && mixed < f16, "{fp8} {mixed} {f16}");
+        assert_eq!(kv_bytes_per_token(&s, KvKind::Auto, 8192), f16);
+    }
+
+    #[test]
+    fn context_to_gb_and_back_per_kv_type() {
+        let s = spec();
+        for kind in KvKind::ALL {
+            let per = kv_bytes_per_token(&s, kind, 32768);
+            let gb = kv_gb_for_tokens(per, 32768);
+            let back = tokens_for_kv_gb(per, gb);
+            assert!(back.abs_diff(32768) <= 1, "{kind:?} {back}");
+            assert!(kv_gb_for_tokens(per, 65536) > gb);
+        }
+        assert_eq!(tokens_for_kv_gb(0, 1.0), usize::MAX);
+        assert_eq!(tokens_for_kv_gb(1024, -1.0), 0);
+    }
+
+    #[test]
+    fn kv_kind_round_trips_through_the_engine_choice() {
+        let mut c = specrt::options::EngineChoice::default();
+        assert_eq!(kv_kind_of(&c), KvKind::Auto);
+        for kind in KvKind::ALL {
+            set_kv_kind(&mut c, kind);
+            assert_eq!(kv_kind_of(&c), kind);
+        }
+        set_kv_kind(&mut c, KvKind::Fp8);
+        assert_eq!(c.value("runtime.kv_f16_layers"), json!(0));
+        set_kv_kind(&mut c, KvKind::Auto);
+        assert!(!c.is_custom());
+    }
+
+    #[test]
+    fn the_fitting_context_shrinks_with_less_free_memory_and_is_capped_by_the_model() {
+        let s = spec();
+        let a = specrt::anatomy::ModelAnatomy::new(&s, 0, None);
+        let big = fitting_context(&a, Some(96 << 30), 1).unwrap();
+        let small = fitting_context(&a, Some(a.total_bytes + (2 << 30)), 1).unwrap();
+        assert!(small < big);
+        assert!(big <= a.max_context.max(1));
+        assert_eq!(fitting_context(&a, Some(1 << 20), 1), None);
+        assert_eq!(fitting_context(&a, None, 1), None);
+    }
 }

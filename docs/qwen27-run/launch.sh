@@ -1,5 +1,8 @@
 #!/bin/bash
 MODE=${1:?mtp|nomtp|kvauto}
+export CUDA_VISIBLE_DEVICES=1
+used=$(nvidia-smi --query-gpu=memory.used --id=1 --format=csv,noheader,nounits | tr -d ' ')
+[ "${used:-99999}" -le 2000 ] || { echo "GPU1 busy: ${used} MiB used"; exit 1; }
 source ~/.venv-vllm/bin/activate
 export HF_HOME=$HOME/.cache/huggingface
 export MAX_JOBS=3

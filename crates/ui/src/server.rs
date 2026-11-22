@@ -269,6 +269,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 note(ui, "no requests yet", LEGEND);
                 return;
             }
+            if ui.available_width() < 540.0 {
+                for e in &log {
+                    let tint = if e.status < 400 { OK } else { FAULT };
+                    Line::new().legend(&e.time).gap(8.0).set(e.status.to_string()).tint(tint).gap(8.0).measured(format!("{} ms", e.ms)).wrapped(ui);
+                    Line::new().value(e.request.clone()).wrapped(ui);
+                }
+                return;
+            }
             let cols: [(&str, f32); 4] = [("time", 90.0), ("request", 280.0), ("status", 70.0), ("ms", 80.0)];
             Table::new(&cols, log.len()).show(ui, |i, p, rect, at| {
                 let e = &log[i];

@@ -3,7 +3,7 @@ set -uo pipefail
 root=$HOME/ib-gates/623
 master=$HOME/ib-gates/623-master
 ref=$HOME/ib-gates/ref375
-vis=$HOME/ib-gates/vis498
+vis=${SPECRT_VISION_REF_DIR:-$HOME/.local/share/inference-bench/refs/vision}
 out=$HOME/ib-gates/out623
 ours=$HOME/ib-gates-target/623
 base=$HOME/ib-gates-target/623-master
