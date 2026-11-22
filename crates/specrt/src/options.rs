@@ -32,7 +32,6 @@ impl Profile {
         match self {
             Profile::MaxPerformance => {
                 v.insert("runtime.prefix_cache.enabled".into(), json!(true));
-                v.insert("runtime.requant.mlp_tail".into(), json!("nvfp4_g16"));
             }
             Profile::LowMemory => {
                 v.insert("runtime.requant.mlp_tail".into(), json!("nvfp4_g16"));
