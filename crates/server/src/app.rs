@@ -614,7 +614,7 @@ pub(crate) struct OutputMode {
 
 impl OutputMode {
     pub(crate) fn parses(&self) -> bool {
-        self.tool_parsing || self.reasoning
+        self.tool_parsing || self.reasoning || self.parser.as_deref() == Some("harmony")
     }
 
     pub(crate) fn parser(&self) -> OutputParser {

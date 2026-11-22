@@ -19,6 +19,7 @@ pub enum ToolFormat {
     ToolCallList,
     BareJson,
     FunctionsList,
+    Harmony,
     Unparsed,
 }
 
@@ -30,6 +31,7 @@ impl ToolFormat {
             ToolFormat::ToolCallList => Some("tool_call_list"),
             ToolFormat::BareJson => Some("bare_json"),
             ToolFormat::FunctionsList => Some("functools_list"),
+            ToolFormat::Harmony => Some("harmony"),
             ToolFormat::None | ToolFormat::Unparsed => None,
         }
     }
@@ -77,6 +79,10 @@ impl ChatTemplate {
             bos_token: token_text(&config["bos_token"]),
             eos_token: token_text(&config["eos_token"]),
         }))
+    }
+
+    pub fn skips_special_tokens(&self) -> bool {
+        self.tool_format() != ToolFormat::Harmony
     }
 
     pub fn source(&self) -> &str {
@@ -135,7 +141,9 @@ impl ChatTemplate {
 
     pub fn tool_format(&self) -> ToolFormat {
         let s = &self.source;
-        if s.contains("<function=") && s.contains("<parameter=") {
+        if s.contains("<|channel|>") && s.contains("<|start|>") {
+            ToolFormat::Harmony
+        } else if s.contains("<function=") && s.contains("<parameter=") {
             ToolFormat::XmlFunction
         } else if s.contains("<tool_call>") {
             ToolFormat::Hermes
@@ -208,6 +216,7 @@ fn prepare(messages: &[Value], vars: &Value, iterates_content: bool) -> (Vec<Val
             }
             if role == "assistant" && m.get("reasoning").is_some_and(|r| !r.is_null()) {
                 m["reasoning_content"] = m["reasoning"].clone();
+                m["thinking"] = m["reasoning"].clone();
             } else if let Some(o) = m.as_object_mut() {
                 o.remove("reasoning_content");
             }

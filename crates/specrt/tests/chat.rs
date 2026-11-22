@@ -106,6 +106,7 @@ fn every_family_template_gets_its_tool_parser_or_an_explicit_none() {
         ("qwen3.5", ToolFormat::XmlFunction),
         ("qwen3.5-moe", ToolFormat::XmlFunction),
         ("qwen3.8", ToolFormat::XmlFunction),
+        ("gpt-oss", ToolFormat::Harmony),
     ];
     for (family, want) in table {
         let got = family_template(family).tool_format();

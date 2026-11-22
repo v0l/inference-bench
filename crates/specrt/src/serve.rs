@@ -1231,6 +1231,7 @@ impl Serving {
         let request = sched::Request { prompt, max_tokens, sampling, stop, salt, media, grammar };
         self.core.submit(Job { request, events: tx, cancel: cancel.clone() })?;
         let tokenizer = &self.assets.tokenizer;
+        let skip = self.assets.chat.as_ref().is_none_or(|c| c.skips_special_tokens());
         let mut out = Completion::default();
         let mut ids: Vec<u32> = Vec::new();
         let mut sent = String::new();
@@ -1246,7 +1247,7 @@ impl Serving {
                     }
                     first.get_or_insert_with(Instant::now);
                     ids.push(t);
-                    if let Ok(text) = tokenizer.decode(&ids, true)
+                    if let Ok(text) = tokenizer.decode(&ids, skip)
                         && text.len() > sent.len()
                         && text.starts_with(&sent)
                         && !text.ends_with('\u{fffd}')
@@ -1274,7 +1275,7 @@ impl Serving {
         }
         out.logprobs.truncate(out.completion_tokens);
         ids.truncate(out.completion_tokens);
-        let text = tokenizer.decode(&ids, true).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+        let text = tokenizer.decode(&ids, skip).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
         if text.len() > sent.len() && text.starts_with(&sent) {
             on_text(&text[sent.len()..]);
         }
