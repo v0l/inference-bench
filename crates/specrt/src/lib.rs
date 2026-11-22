@@ -18,6 +18,7 @@ pub mod engine;
 pub mod executor;
 pub mod family;
 pub mod gguf;
+pub mod gguf_iq;
 pub mod hardware;
 pub mod host;
 pub mod graph;
