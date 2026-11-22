@@ -5,11 +5,12 @@ use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::net::{IpAddr, TcpStream};
 use std::os::fd::AsRawFd;
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const CHUNK: usize = 256 << 10;
+pub const CHUNK: usize = 128 << 10;
+pub const SLOTS: usize = 8;
 pub const DEFAULT_LIBRARY: &str = "libibverbs.so.1";
 
 const LAST: u32 = 1 << 31;
@@ -320,11 +321,10 @@ fn select_device(verbs: &Verbs, local: IpAddr) -> Result<Selected> {
                         Some((_, was_exact)) => exact || !was_exact,
                     };
                     if better && (exact || best.as_ref().is_none_or(|(_, e)| !e)) {
-                        if let Some((old, _)) = best.take() {
-                            if old.ctx != ctx {
+                        if let Some((old, _)) = best.take()
+                            && old.ctx != ctx {
                                 (verbs.close_device)(old.ctx);
                             }
-                        }
                         best = Some((Selected { ctx, name: name.clone(), port, gid_index: index, gid, mtu }, exact));
                         keep = true;
                     }
@@ -373,8 +373,8 @@ impl Endpoint {
                 qp: null_mut(),
                 send_mr: null_mut(),
                 recv_mr: null_mut(),
-                send_buf: vec![0u8; CHUNK].into_boxed_slice(),
-                recv_buf: vec![0u8; CHUNK].into_boxed_slice(),
+                send_buf: vec![0u8; CHUNK * SLOTS].into_boxed_slice(),
+                recv_buf: vec![0u8; CHUNK * SLOTS].into_boxed_slice(),
                 port: sel.port,
                 gid_index: sel.gid_index,
                 mtu: sel.mtu,
@@ -383,9 +383,9 @@ impl Endpoint {
             };
             ep.pd = (verbs.alloc_pd)(ep.ctx);
             ensure!(!ep.pd.is_null(), "ibv_alloc_pd failed");
-            ep.send_mr = (verbs.reg_mr)(ep.pd, ep.send_buf.as_mut_ptr() as *mut c_void, CHUNK, 1);
+            ep.send_mr = (verbs.reg_mr)(ep.pd, ep.send_buf.as_mut_ptr() as *mut c_void, CHUNK * SLOTS, 1);
             ensure!(!ep.send_mr.is_null(), "ibv_reg_mr failed for the send buffer (is the memlock limit high enough?)");
-            ep.recv_mr = (verbs.reg_mr)(ep.pd, ep.recv_buf.as_mut_ptr() as *mut c_void, CHUNK, 1 | 2);
+            ep.recv_mr = (verbs.reg_mr)(ep.pd, ep.recv_buf.as_mut_ptr() as *mut c_void, CHUNK * SLOTS, 1 | 2);
             ensure!(!ep.recv_mr.is_null(), "ibv_reg_mr failed for the receive buffer (is the memlock limit high enough?)");
             ep.cq = (verbs.create_cq)(ep.ctx, CQ_DEPTH, null_mut(), null_mut(), 0);
             ensure!(!ep.cq.is_null(), "ibv_create_cq failed");
@@ -452,9 +452,9 @@ impl Endpoint {
         Ok(())
     }
 
-    fn post_write(&mut self, wr_id: u64, len: usize, imm: u32, remote: &ConnInfo) -> Result<()> {
+    fn post_write(&mut self, wr_id: u64, local_offset: usize, len: usize, imm: u32, remote_offset: usize, remote: &ConnInfo) -> Result<()> {
         unsafe {
-            let mut sge = Sge { addr: self.send_buf.as_ptr() as u64, length: len as u32, lkey: field_u32(self.send_mr, OFF_MR_LKEY) };
+            let mut sge = Sge { addr: self.send_buf.as_ptr() as u64 + local_offset as u64, length: len as u32, lkey: field_u32(self.send_mr, OFF_MR_LKEY) };
             let mut wr = SendWr {
                 wr_id,
                 next: null_mut(),
@@ -463,7 +463,7 @@ impl Endpoint {
                 opcode: 1,
                 send_flags: 2,
                 imm: imm.to_be(),
-                remote_addr: remote.addr,
+                remote_addr: remote.addr + remote_offset as u64,
                 rkey: remote.rkey,
                 tail: [0; 76],
             };
@@ -489,6 +489,43 @@ impl Endpoint {
         let mr = unsafe { f(self.pd, offset, len, iova, fd, 1 | 2) };
         ensure!(!mr.is_null(), "ibv_reg_dmabuf_mr failed");
         Ok(mr)
+    }
+
+    pub fn register_host(&self, addr: *mut u8, len: usize) -> Result<(u32, u32)> {
+        let mr = unsafe { (self.verbs.reg_mr)(self.pd, addr as *mut c_void, len, 1 | 2) };
+        ensure!(!mr.is_null(), "ibv_reg_mr failed");
+        Ok(unsafe { (field_u32(mr, OFF_MR_LKEY), field_u32(mr, OFF_MR_RKEY)) })
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn keys(&self, mr: *mut c_void) -> (u32, u32) {
+        unsafe { (field_u32(mr, OFF_MR_LKEY), field_u32(mr, OFF_MR_RKEY)) }
+    }
+
+    pub fn write_imm(&mut self, local: u64, len: usize, lkey: u32, remote: u64, rkey: u32) -> Result<()> {
+        unsafe {
+            let mut sge = Sge { addr: local, length: len as u32, lkey };
+            let mut wr = SendWr { wr_id: 9, next: null_mut(), sg_list: &mut sge, num_sge: 1, opcode: 1, send_flags: 2, imm: 1u32.to_be(), remote_addr: remote, rkey, tail: [0; 76] };
+            let mut bad: *mut SendWr = null_mut();
+            let post: PostSend = ctx_fn(self.qp, OFF_CTX_POST_SEND);
+            let rc = post(self.qp, &mut wr, &mut bad);
+            ensure!(rc == 0, "ibv_post_send failed ({rc})");
+        }
+        Ok(())
+    }
+
+    pub fn completions(&mut self) -> Result<(usize, usize)> {
+        let mut wcs = [Wc::default(); 16];
+        let n = self.poll(&mut wcs)?;
+        let mut recvs = 0;
+        for wc in &wcs[..n] {
+            ensure!(wc.status == 0, "completion failed with status {}", wc.status);
+            if wc.opcode == 129 {
+                recvs += 1;
+                self.post_recv()?;
+            }
+        }
+        Ok((n, recvs))
     }
 }
 
@@ -522,7 +559,10 @@ pub struct RdmaChannel {
     remote: ConnInfo,
     tcp: TcpStream,
     credits: u32,
-    inflight: usize,
+    data_inflight: usize,
+    ctl_inflight: usize,
+    sent: usize,
+    received: usize,
     partial: Vec<u8>,
     frames: VecDeque<Vec<u8>>,
     max_frame: usize,
@@ -530,7 +570,7 @@ pub struct RdmaChannel {
 
 impl RdmaChannel {
     pub fn new(ep: Endpoint, remote: ConnInfo, tcp: TcpStream, max_frame: usize) -> RdmaChannel {
-        RdmaChannel { ep, remote, tcp, credits: 1, inflight: 0, partial: Vec::new(), frames: VecDeque::new(), max_frame }
+        RdmaChannel { ep, remote, tcp, credits: SLOTS as u32, data_inflight: 0, ctl_inflight: 0, sent: 0, received: 0, partial: Vec::new(), frames: VecDeque::new(), max_frame }
     }
 
     pub fn device(&self) -> &str {
@@ -556,7 +596,8 @@ impl RdmaChannel {
         for wc in &wcs[..n] {
             ensure!(wc.status == 0, "rdma completion failed with status {} (vendor {}): the peer is unreachable", wc.status, wc.vendor_err);
             match wc.opcode {
-                1 | 0 => self.inflight = self.inflight.saturating_sub(1),
+                1 | 0 if wc.wr_id == WR_DATA => self.data_inflight = self.data_inflight.saturating_sub(1),
+                1 | 0 => self.ctl_inflight = self.ctl_inflight.saturating_sub(1),
                 129 => {
                     self.ep.post_recv()?;
                     let imm = u32::from_be(wc.imm);
@@ -567,7 +608,9 @@ impl RdmaChannel {
                     let len = (imm & LEN_MASK) as usize;
                     ensure!(len <= CHUNK, "rdma chunk of {len} bytes exceeds the buffer");
                     ensure!(self.partial.len() + len <= self.max_frame, "frame exceeds the {} byte cap", self.max_frame);
-                    self.partial.extend_from_slice(&self.ep.recv_buf[..len]);
+                    let slot = self.received % SLOTS * CHUNK;
+                    self.received += 1;
+                    self.partial.extend_from_slice(&self.ep.recv_buf[slot..slot + len]);
                     self.post_credit()?;
                     if imm & LAST != 0 {
                         self.frames.push_back(std::mem::take(&mut self.partial));
@@ -580,12 +623,12 @@ impl RdmaChannel {
     }
 
     fn post_credit(&mut self) -> Result<()> {
-        while self.inflight >= SEND_DEPTH - 8 {
+        while self.ctl_inflight >= SEND_DEPTH - SLOTS - 8 {
             self.drain()?;
         }
         let remote = self.remote.clone();
-        self.ep.post_write(WR_CREDIT, 0, CREDIT, &remote)?;
-        self.inflight += 1;
+        self.ep.post_write(WR_CREDIT, 0, 0, CREDIT, 0, &remote)?;
+        self.ctl_inflight += 1;
         Ok(())
     }
 
@@ -620,14 +663,16 @@ impl RdmaChannel {
         let chunks: Vec<&[u8]> = if body.is_empty() { vec![&[][..]] } else { body.chunks(CHUNK).collect() };
         let last = chunks.len() - 1;
         for (i, chunk) in chunks.into_iter().enumerate() {
-            let ready = self.wait(timeout, |c| c.credits > 0 && c.inflight == 0)?;
+            let ready = self.wait(timeout, |c| c.credits > 0 && c.data_inflight < SLOTS)?;
             ensure!(ready, "timed out waiting for the peer to take the previous chunk");
             self.credits -= 1;
-            self.ep.send_buf[..chunk.len()].copy_from_slice(chunk);
+            let slot = self.sent % SLOTS * CHUNK;
+            self.sent += 1;
+            self.ep.send_buf[slot..slot + chunk.len()].copy_from_slice(chunk);
             let imm = chunk.len() as u32 | if i == last { LAST } else { 0 };
             let remote = self.remote.clone();
-            self.ep.post_write(WR_DATA, chunk.len(), imm, &remote)?;
-            self.inflight += 1;
+            self.ep.post_write(WR_DATA, slot, chunk.len(), imm, slot, &remote)?;
+            self.data_inflight += 1;
         }
         Ok(())
     }
@@ -673,9 +718,4 @@ mod tests {
         assert_eq!(&gid[12..], &[10, 100, 50, 1]);
         assert!(!is_ipv4_mapped(&mapped_gid("127.0.0.1".parse().unwrap())));
     }
-}
-
-#[allow(dead_code)]
-fn _unused(_: *const c_void) {
-    let _ = null::<u8>();
 }
