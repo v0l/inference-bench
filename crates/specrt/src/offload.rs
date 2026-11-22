@@ -316,6 +316,21 @@ impl SlotBook {
         self.slot_of.get(&page).copied()
     }
 
+    pub fn misses(&self, pages: impl Iterator<Item = usize>) -> usize {
+        pages.filter(|p| !self.slot_of.contains_key(p)).count()
+    }
+
+    pub fn clear_unpinned(&mut self) {
+        for s in 0..self.page_of.len() {
+            if !self.pinned[s]
+                && let Some(old) = self.page_of[s].take()
+            {
+                self.slot_of.remove(&old);
+                self.stats.evictions += 1;
+            }
+        }
+    }
+
     pub fn unpin_all(&mut self) {
         self.pinned.iter_mut().for_each(|p| *p = false);
     }
@@ -628,6 +643,21 @@ mod tests {
         assert_eq!(b.acquire(12, false, false), Some(Acquired { slot: 1, copy: true }));
         assert_eq!(b.resident(11), None);
         assert_eq!((b.stats.vram_hits, b.stats.host_hits, b.stats.evictions), (1, 3, 1));
+    }
+
+    #[test]
+    fn a_cleared_book_hands_out_slots_in_order_and_keeps_pinned_pages() {
+        let mut b = SlotBook::new(4, Policy::Lru);
+        b.acquire(10, true, false).unwrap();
+        b.unpin_all();
+        b.acquire(11, false, false).unwrap();
+        b.acquire(12, true, false).unwrap();
+        assert_eq!(b.misses([10, 11, 99].into_iter()), 1);
+        b.clear_unpinned();
+        assert_eq!(b.resident(12), Some(2));
+        assert_eq!(b.resident(10), None);
+        let slots: Vec<usize> = [1, 2, 3].iter().map(|&p| b.acquire(p, true, false).unwrap().slot).collect();
+        assert_eq!(slots, vec![0, 1, 3]);
     }
 
     #[test]

@@ -182,6 +182,8 @@ pub(in crate::runtime) struct ExpertCache {
     staging_pool: HostPool,
 }
 
+const BULK_MIN_EXPERTS: usize = 32;
+
 struct Staging {
     buf: Option<PinnedBuf>,
     used: usize,
@@ -224,13 +226,33 @@ impl ExpertCache {
     }
 
     fn enqueue(&self, host: &HostExperts, entry: usize, slot: usize, stats: &mut OffloadStats) -> Result<()> {
+        self.enqueue_run(host, entry, slot, 1, stats)
+    }
+
+    fn enqueue_all(&self, host: &HostExperts, copies: &mut Vec<(usize, usize)>, stats: &mut OffloadStats) -> Result<()> {
+        copies.sort_unstable();
+        let mut i = 0;
+        while i < copies.len() {
+            let (entry, slot) = copies[i];
+            let mut n = 1;
+            while i + n < copies.len() && copies[i + n] == (entry + n, slot + n) {
+                n += 1;
+            }
+            self.enqueue_run(host, entry, slot, n, stats)?;
+            i += n;
+        }
+        copies.clear();
+        Ok(())
+    }
+
+    fn enqueue_run(&self, host: &HostExperts, entry: usize, slot: usize, count: usize, stats: &mut OffloadStats) -> Result<()> {
         match &host.buf {
             Backing::Pinned(b) => {
                 let src = b.as_slice()?;
                 for (p, base) in host.parts.iter().zip(&self.addrs) {
-                    let from = &src[p.offset + entry * p.per..p.offset + (entry + 1) * p.per];
+                    let from = &src[p.offset + entry * p.per..p.offset + (entry + count) * p.per];
                     unsafe { cudarc::driver::result::memcpy_htod_async(base + (slot * p.per) as u64, from, self.copy.cu_stream()) }?;
-                    stats.host_to_vram_bytes += p.per as u64;
+                    stats.host_to_vram_bytes += (p.per * count) as u64;
                 }
             }
             Backing::File { file, .. } => {
@@ -241,17 +263,24 @@ impl ExpertCache {
                     st.buf = Some(self.staging_pool.alloc(cap)?);
                 }
                 for (p, base) in host.parts.iter().zip(&self.addrs) {
-                    if st.used + p.per > cap {
-                        self.copy.synchronize()?;
-                        st.used = 0;
+                    let step = (cap / p.per).max(1);
+                    let mut done = 0;
+                    while done < count {
+                        let take = step.min(count - done);
+                        let bytes = take * p.per;
+                        if st.used + bytes > cap {
+                            self.copy.synchronize()?;
+                            st.used = 0;
+                        }
+                        let at = st.used;
+                        let dst = &mut st.buf.as_mut().unwrap().as_mut_slice()?[at..at + bytes];
+                        file.read_exact_at(dst, (p.offset + (entry + done) * p.per) as u64)?;
+                        unsafe { cudarc::driver::result::memcpy_htod_async(base + ((slot + done) * p.per) as u64, &*dst, self.copy.cu_stream()) }?;
+                        st.used += bytes;
+                        stats.host_to_vram_bytes += bytes as u64;
+                        stats.nvme_read_bytes += bytes as u64;
+                        done += take;
                     }
-                    let at = st.used;
-                    let dst = &mut st.buf.as_mut().unwrap().as_mut_slice()?[at..at + p.per];
-                    file.read_exact_at(dst, (p.offset + entry * p.per) as u64)?;
-                    unsafe { cudarc::driver::result::memcpy_htod_async(base + (slot * p.per) as u64, &*dst, self.copy.cu_stream()) }?;
-                    st.used += p.per;
-                    stats.host_to_vram_bytes += p.per as u64;
-                    stats.nvme_read_bytes += p.per as u64;
                 }
             }
         }
@@ -264,22 +293,27 @@ impl ExpertCache {
         Ok(())
     }
 
-    pub(in crate::runtime) fn stage(&self, compute: &Arc<CudaStream>, layer: usize, host: &HostExperts, wanted: &[usize], with_shared: bool) -> Result<Staged> {
+    pub(in crate::runtime) fn stage(&self, compute: &Arc<CudaStream>, layer: usize, host: &HostExperts, wanted: &[usize], with_shared: bool, bulk: bool) -> Result<Staged> {
         let mut g = self.state.lock().unwrap();
         let g = &mut *g;
+        if bulk && wanted.len() >= BULK_MIN_EXPERTS && g.book.misses(wanted.iter().map(|&e| self.page(layer, e))) * 2 > wanted.len() {
+            g.book.clear_unpinned();
+        }
         self.mark.record(compute)?;
         self.copy.wait(&self.mark)?;
         let mut stats = OffloadStats::default();
         let mut mapping = Vec::with_capacity(wanted.len());
+        let mut copies = Vec::new();
         for &e in wanted {
             let Some(Acquired { slot, copy }) = g.book.acquire(self.page(layer, e), true, false) else {
                 anyhow::bail!("expert cache of {} slots cannot hold {} experts at once", self.slots, wanted.len());
             };
             if copy {
-                self.enqueue(host, e, slot, &mut stats)?;
+                copies.push((e, slot));
             }
             mapping.push((e, slot));
         }
+        self.enqueue_all(host, &mut copies, &mut stats)?;
         if with_shared {
             for s in 0..self.shared {
                 self.enqueue(host, self.local + s, self.slots + s, &mut stats)?;
