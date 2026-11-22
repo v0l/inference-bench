@@ -2061,7 +2061,8 @@ impl Spec {
     }
 
     pub fn served_mlp_quant(&self, layer: usize) -> Quant {
-        self.requanted("mlp_tail", self.mlp_quant(layer))
+        let stored = self.mlp_quant(layer);
+        if self.mlp.quant.is_some() && stored == self.quant { self.requanted("mlp_tail", stored) } else { stored }
     }
 
     pub fn requanted_linears(&self) -> Vec<&'static str> {

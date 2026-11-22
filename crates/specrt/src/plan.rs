@@ -164,7 +164,8 @@ impl QuantSource {
     pub fn resolve_for(self, spec: &Spec, layer: usize, weight: Weight) -> Quant {
         let stored = self.resolve(spec, layer);
         match self {
-            QuantSource::Attn | QuantSource::Mlp => spec.requanted(weight.name(), stored),
+            QuantSource::Attn => spec.requanted(weight.name(), stored),
+            QuantSource::Mlp => spec.served_mlp_quant(layer),
             _ => stored,
         }
     }
