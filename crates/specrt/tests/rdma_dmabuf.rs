@@ -5,13 +5,25 @@ fn check(r: sys::CUresult, what: &str) -> Result<(), String> {
     if r == sys::CUresult::CUDA_SUCCESS { Ok(()) } else { Err(format!("{what}: {r:?}")) }
 }
 
+fn gpu_allowed() -> bool {
+    let visible = std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_default();
+    let first = visible.split(',').next().unwrap_or("").trim().to_string();
+    let on_gpu0 = first.is_empty() || first == "0";
+    if on_gpu0 && std::env::var("SPECRT_DMABUF_ALLOW_GPU0").as_deref() != Ok("1") {
+        eprintln!("SKIPPED: CUDA_VISIBLE_DEVICES={visible:?} would use GPU0 (the user's app). Run under `~/.agents/bin/gpu-run 1 --`.");
+        return false;
+    }
+    eprintln!("using physical GPU {first} (CUDA_VISIBLE_DEVICES={visible:?})");
+    true
+}
+
 fn export_and_register() -> Result<String, String> {
     let verbs = Verbs::load(DEFAULT_LIBRARY).map_err(|e| format!("{e:#}"))?;
     if !verbs.supports_dmabuf() {
         return Err("libibverbs has no ibv_reg_dmabuf_mr".into());
     }
     let ep = Endpoint::open(verbs, "10.100.50.1".parse().unwrap()).map_err(|e| format!("{e:#}"))?;
-    let ordinal: i32 = std::env::var("SPECRT_DMABUF_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ordinal: i32 = 0;
     unsafe {
         check(sys::cuInit(0), "cuInit")?;
         let mut dev = 0;
@@ -34,7 +46,7 @@ fn export_and_register() -> Result<String, String> {
         )?;
         let mr = ep.register_dmabuf(fd, 0, len, ptr).map_err(|e| format!("{e:#} (errno {})", std::io::Error::last_os_error()))?;
         let _ = mr;
-        Ok(format!("registered {len} bytes of GPU {ordinal} memory (fd {fd}) with ibv_reg_dmabuf_mr"))
+        Ok(format!("registered {len} bytes of device ordinal {ordinal} memory (fd {fd}) with ibv_reg_dmabuf_mr"))
     }
 }
 
@@ -107,16 +119,22 @@ fn bench() -> Result<(), String> {
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a CUDA GPU, run under gpu-run 1"]
 fn gpu_to_gpu_hop_vs_host_staging() {
+    if !gpu_allowed() {
+        return;
+    }
     if let Err(e) = bench() {
         eprintln!("DMABUF BENCH FAILED: {e}");
     }
 }
 
 #[test]
-#[ignore]
+#[ignore = "needs a CUDA GPU, run under gpu-run 1"]
 fn gpu_memory_registers_through_dmabuf() {
+    if !gpu_allowed() {
+        return;
+    }
     match export_and_register() {
         Ok(m) => eprintln!("DMABUF OK: {m}"),
         Err(e) => eprintln!("DMABUF REFUSED: {e}"),

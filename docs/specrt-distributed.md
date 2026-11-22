@@ -206,7 +206,7 @@ Measured on the desktop (ConnectX-4 to its own address 10.100.50.1, echo stage, 
 
 The ring took 64 MB from 149 ms (one chunk in flight) to 124-153 ms across 13 runs; against TCP loopback in the same runs it is level to slightly ahead, with run-to-run noise as large as the gap. The cable run is the real comparison. The 20 KB decode hop stays slower than loopback, as expected: it pays the completion polling and a copy through the ring.
 
-GPU memory over dma-buf (`crates/specrt/tests/rdma_dmabuf.rs`, ignored, run under `gpu-run 1`): `cuMemGetHandleForAddressRange(..., DMA_BUF_FD)` on a `cuMemAlloc` buffer plus `ibv_reg_dmabuf_mr` works on the RTX PRO 6000 with the open driver and the ConnectX-4, no nvidia_peermem needed. Single RDMA write between two GPU buffers on the same card through the NIC loopback, against staging through a 1 MiB pinned host buffer (copy out, write, copy in):
+GPU memory over dma-buf (`crates/specrt/tests/rdma_dmabuf.rs`, ignored, run under `gpu-run 1`): `cuMemGetHandleForAddressRange(..., DMA_BUF_FD)` on a `cuMemAlloc` buffer plus `ibv_reg_dmabuf_mr` works on GPU1 (RTX PRO 6000, `CUDA_VISIBLE_DEVICES=1` under `gpu-run 1`; the tests skip on GPU0 unless `SPECRT_DMABUF_ALLOW_GPU0=1`) with the open driver and the ConnectX-4, no nvidia_peermem needed. Single RDMA write between two GPU buffers on the same card through the NIC loopback, against staging through a 1 MiB pinned host buffer (copy out, write, copy in):
 
 | size | GPU direct | pinned host staging |
 |---|---|---|
