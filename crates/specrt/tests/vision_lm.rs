@@ -472,3 +472,30 @@ fn real_27b_random_token_control_against_vllm() {
     }
     eprintln!("RAND overall mean KL {:.4} top1 {top1}/{n}", sum / records.len() as f64);
 }
+
+#[test]
+#[ignore = "writes per layer hidden states for scripts/vision_layers.py, needs the 27B FP8 checkpoint"]
+fn real_27b_dump_layer_states() {
+    let Some(dir) = std::env::var_os("SPECRT_LAYER_DUMP").map(PathBuf::from) else {
+        eprintln!("skipped: set SPECRT_LAYER_DUMP to an output directory");
+        return;
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    let spec = spec();
+    let repo = spec.repo.clone();
+    let mut rt = Runtime::load(&spec, 2048).unwrap();
+    for (case, tag, question) in [(&CASES[1], "video", "Describe this video in detail."), (&CASES[0], "image", "Describe this image in detail.")] {
+        let p = prompt_for(&repo, case, &json!({ "question": question }));
+        let plan = rt.plan_media(&p.ids, &p.media).unwrap();
+        rt.set_media(0, Some(&plan)).unwrap();
+        let trace = rt.trace_prefill(&p.ids).unwrap();
+        let bytes: Vec<u8> = trace.layers.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join(format!("{tag}.layers.f32")), bytes).unwrap();
+        let embeds: Vec<u8> = plan.embeds.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join(format!("{tag}.embeds.f32")), embeds).unwrap();
+        let rows: Vec<i32> = plan.positions.iter().map(|p| p[3]).collect();
+        std::fs::write(dir.join(format!("{tag}.meta.json")), json!({"ids": p.ids, "grid": p.media[0].processed.patches().grid, "layers": spec.layers.count, "hidden": spec.dims.hidden, "rows": rows}).to_string()).unwrap();
+        eprintln!("dumped {tag}: {} tokens", p.ids.len());
+        rt.set_media(0, None).unwrap();
+    }
+}
