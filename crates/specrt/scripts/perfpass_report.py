@@ -167,6 +167,7 @@ def family_report(family, model, raw, out, commit, roof, batch, lens, command):
 
 
 SG_MARK = "## SGLang"
+CLAIMS_MARK = "## Paired A/B claims"
 SG_HEADER = [
     "| family | sglang prefill | sglang decode b1 | sglang decode b8 | prefill ratio | decode ratio | b8 ratio | backend | date |",
     "|---|---|---|---|---|---|---|---|---|",
@@ -180,6 +181,7 @@ PREFIX = ["# Perf scoreboard", "", "Ratios are specrt / best competitor, above 1
 
 def split_board(board):
     text = Path(board).read_text() if Path(board).exists() else ""
+    text = text.partition(CLAIMS_MARK)[0]
     main, _, sg = text.partition(SG_MARK)
     rows = [l for l in main.splitlines() if l.startswith("| ") and not l.startswith("| family")]
     sg_rows = [l for l in sg.splitlines() if l.startswith("| ") and not l.startswith("| family")]
@@ -190,10 +192,14 @@ def split_board(board):
 
 
 def write_board(board, prefix, rows, sg_rows):
+    existing = Path(board).read_text() if Path(board).exists() else ""
+    claims = existing.partition(CLAIMS_MARK)[2]
     key = lambda l: l.split("|")[1].strip()
     out = prefix + [""] + HEADER.rstrip("\n").splitlines() + sorted(rows, key=key)
     if sg_rows:
         out += ["", SG_MARK, "", SG_NOTE, ""] + SG_HEADER + sorted(sg_rows, key=key)
+    if claims:
+        out += ["", CLAIMS_MARK + claims.rstrip("\n")]
     Path(board).write_text("\n".join(out) + "\n")
 
 
