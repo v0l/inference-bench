@@ -1080,3 +1080,11 @@ when = "merged"
 [[vision_tail]]
 op = "vpool"
 when = "pooled"
+
+[[vision_tail]]
+op = "vshuffle"
+when = "tiled"
+
+[[vision_tail]]
+op = "vadapter"
+when = "tiled"

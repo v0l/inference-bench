@@ -86,11 +86,11 @@ fn frame_sampling_matches_transformers_indices() {
 #[test]
 fn placeholders_expand_to_the_merged_token_count() {
     let tokens = MediaTokens::default();
-    let image = Patches { grid: [1, 4, 6], data: vec![] };
+    let image = Patches { grid: [1, 4, 6], data: vec![], layout: [0, 0] };
     let prompt = "a<|vision_start|><|image_pad|><|vision_end|>b";
     let out = expand_placeholders(prompt, &tokens, 2, &[Media::Image(&image)]).unwrap();
     assert_eq!(out, format!("a<|vision_start|>{}<|vision_end|>b", "<|image_pad|>".repeat(6)));
-    let video = VideoPatches { patches: Patches { grid: [2, 4, 4], data: vec![] }, timestamps: vec![0.25, 1.5] };
+    let video = VideoPatches { patches: Patches { grid: [2, 4, 4], data: vec![], layout: [0, 0] }, timestamps: vec![0.25, 1.5] };
     let prompt = "<|vision_start|><|video_pad|><|vision_end|>";
     let out = expand_placeholders(prompt, &tokens, 2, &[Media::Video(&video)]).unwrap();
     let pad = "<|video_pad|>".repeat(4);
@@ -123,7 +123,7 @@ fn tokens() -> VisionTokens {
 }
 
 fn image(h: usize, w: usize) -> Processed {
-    Processed::Image(Patches { grid: [1, h, w], data: vec![] })
+    Processed::Image(Patches { grid: [1, h, w], data: vec![], layout: [0, 0] })
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn a_run_that_does_not_match_the_grid_or_the_media_count_is_an_error() {
 #[test]
 fn video_frames_each_advance_the_text_position_by_their_grid_side() {
     let vis = tokens();
-    let video = Processed::Video(VideoPatches { patches: Patches { grid: [2, 4, 4], data: vec![] }, timestamps: vec![0.0, 1.0] });
+    let video = Processed::Video(VideoPatches { patches: Patches { grid: [2, 4, 4], data: vec![], layout: [0, 0] }, timestamps: vec![0.0, 1.0] });
     let mut ids = vec![7, 5, 7];
     ids.extend([8; 4]);
     ids.extend([6, 5, 7]);

@@ -1439,7 +1439,7 @@ mod watchdog_tests {
         let (mut j, rx) = job();
         j.cancel = Arc::new(AtomicBool::new(cancelled));
         j.request.media = vec![sched::MediaInput {
-            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 80, 60], data: Vec::new() }),
+            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 80, 60], data: Vec::new(), layout: [0, 0] }),
             hash: [7; 32],
         }];
         (j, rx)
@@ -1533,7 +1533,7 @@ mod watchdog_tests {
         image.request.prompt = vec![1, 11, 9, 9, 9, 9, 12, 2];
         image.request.max_tokens = 4;
         image.request.media = vec![sched::MediaInput {
-            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 4, 4], data: vec![0.0; 16] }),
+            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 4, 4], data: vec![0.0; 16], layout: [0, 0] }),
             hash: [3; 32],
         }];
         tx.send(image).unwrap();

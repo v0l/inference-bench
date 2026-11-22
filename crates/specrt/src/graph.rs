@@ -285,6 +285,8 @@ fn vision_op(node: &Node, block: usize, deepstack: Option<usize>) -> Result<Visi
         "deepstack_merger" => VisionOp::DeepstackMerger { index: deepstack.context("deepstack merger outside a deepstack block")?, after_block: block },
         "vmerger" => VisionOp::Merger,
         "vpool" => VisionOp::Pool,
+        "vshuffle" => VisionOp::Shuffle,
+        "vadapter" => VisionOp::Adapter,
         other => bail!("unknown vision op {other}"),
     })
 }
@@ -294,7 +296,8 @@ fn vision_holds(when: Option<&str>, deepstack: Option<usize>, cfg: &VisionConfig
         w.split('+').all(|c| match c {
             "deepstack" => deepstack.is_some(),
             "pooled" => cfg.pooled(),
-            "merged" => !cfg.pooled(),
+            "tiled" => cfg.tiled(),
+            "merged" => cfg.tower == crate::vision::Tower::Merged,
             _ => false,
         })
     })

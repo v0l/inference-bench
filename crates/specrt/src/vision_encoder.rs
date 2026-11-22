@@ -55,6 +55,8 @@ pub enum VisionOp {
     MlpDown { block: usize },
     Merger,
     Pool,
+    Shuffle,
+    Adapter,
     DeepstackMerger { index: usize, after_block: usize },
 }
 
@@ -71,6 +73,8 @@ impl VisionOp {
             VisionOp::MlpDown { block } => format!("block {block} mlp down"),
             VisionOp::Merger => "patch merger".into(),
             VisionOp::Pool => "post norm, average pool, soft embedding norm, projector".into(),
+            VisionOp::Shuffle => "post norm, pixel shuffle".into(),
+            VisionOp::Adapter => "adapter mlp, projector".into(),
             VisionOp::DeepstackMerger { index, after_block } => format!("deepstack merger {index} after block {after_block}"),
         }
     }
@@ -133,6 +137,7 @@ pub struct VisionEncoder {
     merger: Option<Merger>,
     pool: Option<Pool>,
     pool_fn: CudaFunction,
+    tiled: Option<Tiled>,
     deepstack: Vec<Merger>,
     workspace: std::sync::Mutex<Workspace>,
     ops: Vec<VisionOp>,
@@ -169,10 +174,84 @@ enum Out<'a> {
     Split(&'a mut Planes),
 }
 
-fn module(head_dim: usize, precise: bool, target: &kir::Target) -> Result<Module> {
-    let k = kir::vision::VisionKernel::new(target, head_dim, precise).map_err(anyhow::Error::msg)?;
+fn module(head_dim: usize, precise: bool, tiled: bool, target: &kir::Target) -> Result<Module> {
+    let mut k = kir::vision::VisionKernel::new(target, head_dim, precise).map_err(anyhow::Error::msg)?;
+    let mut kernels = KERNELS.to_vec();
+    if tiled {
+        k = k.tiled();
+        kernels.extend_from_slice(kir::vision::TILED_KERNELS);
+    }
     let source = kir::cuda::emit_vision(&k).map_err(anyhow::Error::msg)?;
-    Ok(Module { source, kernels: KERNELS.to_vec(), smem: BTreeMap::new(), arch_features: false, kir_hash: k.hash() })
+    Ok(Module { source, kernels, smem: BTreeMap::new(), arch_features: false, kir_hash: k.hash() })
+}
+
+struct Tiled {
+    assemble: CudaFunction,
+    rope_pairs: CudaFunction,
+    layernorm_f32: CudaFunction,
+    shuffle_norm: CudaFunction,
+    cls: CudaSlice<f32>,
+    pre: Norm,
+    post: Norm,
+    adapter_up: Linear,
+    adapter_down: Linear,
+    proj: Linear,
+    theta: f32,
+}
+
+fn tiled_prefix(ck: &Checkpoint) -> Option<&'static str> {
+    ["vision_model", "model.vision_model"].into_iter().find(|p| ck.has(&format!("{p}.patch_embedding.linear.weight")))
+}
+
+fn tiled_projector_prefix(ck: &Checkpoint) -> &'static str {
+    if ck.has("model.multi_modal_projector.linear_1.weight") { "model.multi_modal_projector" } else { "multi_modal_projector" }
+}
+
+fn bias_free(stream: &Arc<CudaStream>, ck: &Checkpoint, name: &str, rows: usize, cols: usize) -> Result<Linear> {
+    ensure!(cols.is_multiple_of(8) && rows.is_multiple_of(2), "{name}: {rows}x{cols} is not a multiple of the mma tile steps");
+    Ok(Linear { w: upload(stream, ck, name, &[rows, cols])?, b: stream.clone_htod(&vec![0u16; rows])?, rows, cols })
+}
+
+fn tiled_parts(stream: &Arc<CudaStream>, ck: &Checkpoint, cfg: &VisionConfig, loaded: &crate::jit::Loaded) -> Result<(Linear, CudaSlice<f32>, Vec<Block>, Tiled)> {
+    let p = tiled_prefix(ck).context("the checkpoint has no vision tower tensors")?;
+    let hidden = cfg.hidden_size;
+    let raw = cfg.in_channels.unwrap_or(3) * cfg.patch_size * cfg.patch_size;
+    let cols = raw.div_ceil(8) * 8;
+    let linear_w = ck.bf16(&format!("{p}.patch_embedding.linear.weight"), &[hidden, raw])?;
+    let patch = Linear { w: stream.clone_htod(&padded_columns(&linear_w, hidden, raw, cols))?, b: stream.clone_htod(&vec![0u16; hidden])?, rows: hidden, cols };
+    let side = cfg.side();
+    let positions = ck.bf16(&format!("{p}.positional_embedding_vlm"), &[side * side + 1, hidden])?;
+    let pos_embed = stream.clone_htod(&positions.iter().map(|&v| bf16_to_f32(v)).collect::<Vec<f32>>())?;
+    let cls = stream.clone_htod(&ck.bf16(&format!("{p}.class_embedding"), &[hidden])?.iter().map(|&v| bf16_to_f32(v)).collect::<Vec<f32>>())?;
+    let mut blocks = Vec::with_capacity(cfg.depth);
+    for i in 0..cfg.depth {
+        let b = format!("{p}.model.layers.{i}");
+        let qkv: Vec<String> = ["q_proj", "k_proj", "v_proj"].iter().map(|n| format!("{b}.self_attn.{n}")).collect();
+        blocks.push(Block {
+            norm1: norm(stream, ck, &format!("{b}.input_layernorm"), hidden)?,
+            norm2: norm(stream, ck, &format!("{b}.post_attention_layernorm"), hidden)?,
+            qkv: stacked(stream, ck, &qkv, hidden, hidden)?,
+            proj: linear(stream, ck, &format!("{b}.self_attn.o_proj"), hidden, hidden)?,
+            up: linear(stream, ck, &format!("{b}.mlp.fc1"), cfg.intermediate_size, hidden)?,
+            down: linear(stream, ck, &format!("{b}.mlp.fc2"), hidden, cfg.intermediate_size)?,
+        });
+    }
+    let (proj_in, proj_out) = (cfg.projector_input_dim.context("projector_input_dim")?, cfg.projector_output_dim.context("projector_output_dim")?);
+    let mp = tiled_projector_prefix(ck);
+    let tiled = Tiled {
+        assemble: loaded.function("vis_assemble")?,
+        rope_pairs: loaded.function("vis_rope_pairs")?,
+        layernorm_f32: loaded.function("vis_layernorm_f32")?,
+        shuffle_norm: loaded.function("vis_shuffle_norm")?,
+        cls,
+        pre: norm(stream, ck, &format!("{p}.layernorm_pre"), hidden)?,
+        post: norm(stream, ck, &format!("{p}.layernorm_post"), hidden)?,
+        adapter_up: bias_free(stream, ck, &format!("{p}.vision_adapter.mlp.fc1.weight"), proj_in, 4 * hidden)?,
+        adapter_down: bias_free(stream, ck, &format!("{p}.vision_adapter.mlp.fc2.weight"), proj_out, proj_out)?,
+        proj: bias_free(stream, ck, &format!("{mp}.linear_1.weight"), cfg.out_hidden_size, proj_out)?,
+        theta: cfg.rope_theta.unwrap_or(10000.0) as f32,
+    };
+    Ok((patch, pos_embed, blocks, tiled))
 }
 
 fn prefix(ck: &Checkpoint) -> Result<&'static str> {
@@ -185,7 +264,7 @@ fn prefix(ck: &Checkpoint) -> Result<&'static str> {
 }
 
 pub fn has_tower(ck: &Checkpoint, cfg: &VisionConfig) -> bool {
-    if cfg.pooled() { pooled_prefix(ck).is_some() } else { prefix(ck).is_ok() }
+    if cfg.tiled() { tiled_prefix(ck).is_some() } else if cfg.pooled() { pooled_prefix(ck).is_some() } else { prefix(ck).is_ok() }
 }
 
 fn pooled_prefix(ck: &Checkpoint) -> Option<&'static str> {
@@ -420,8 +499,13 @@ impl VisionEncoder {
         let head_dim = cfg.hidden_size / cfg.num_heads;
         ensure!(head_dim.is_multiple_of(8) && head_dim <= 128, "vision head_dim {head_dim} is not supported");
         let act = Act::from_config(cfg.hidden_act.as_deref())?;
-        let loaded = jit.load(&module(head_dim, precise, &crate::codegen::cuda_target(ctx)?)?)?;
-        let (mut patch, pos_embed, mut blocks, mut main, mut deepstack, mut pool) = if cfg.pooled() {
+        let loaded = jit.load(&module(head_dim, precise, cfg.tiled(), &crate::codegen::cuda_target(ctx)?)?)?;
+        let mut tiled = None;
+        let (mut patch, pos_embed, mut blocks, mut main, mut deepstack, mut pool) = if cfg.tiled() {
+            let (patch, pos_embed, blocks, t) = tiled_parts(stream, ck, cfg, &loaded)?;
+            tiled = Some(t);
+            (patch, pos_embed, blocks, None, Vec::new(), None)
+        } else if cfg.pooled() {
             let (patch, pos_embed, blocks, pool) = pooled_parts(stream, ck, cfg)?;
             (patch, pos_embed, blocks, None, Vec::new(), Some(pool))
         } else {
@@ -487,6 +571,11 @@ impl VisionEncoder {
             if let Some(p) = pool.as_mut() {
                 convert(&mut p.proj.w)?;
             }
+            if let Some(t) = tiled.as_mut() {
+                for l in [&mut t.adapter_up, &mut t.adapter_down, &mut t.proj] {
+                    convert(&mut l.w)?;
+                }
+            }
         }
         let workspace = std::sync::Mutex::new(Workspace::new(stream, cfg, patch_cols, WORKSPACE_PATCHES)?);
         stream.synchronize()?;
@@ -508,6 +597,7 @@ impl VisionEncoder {
             merger: main,
             pool,
             pool_fn: loaded.function("vis_pool")?,
+            tiled,
             deepstack,
         })
     }
@@ -558,8 +648,9 @@ impl VisionEncoder {
     fn layernorm(&self, x: &CudaSlice<f32>, nm: &Norm, out: &mut Planes, rows: usize, width: usize) -> Result<()> {
         ensure!(width.is_multiple_of(2), "layernorm width {width} is odd");
         let w = width as i32;
+        let eps = self.cfg.eps();
         let mut b = self.stream.launch_builder(&self.layernorm);
-        b.arg(x).arg(&nm.w).arg(&nm.b).arg(&mut out.hi).arg(&mut out.lo).arg(&w).arg(&LAYERNORM_EPS);
+        b.arg(x).arg(&nm.w).arg(&nm.b).arg(&mut out.hi).arg(&mut out.lo).arg(&w).arg(&eps);
         unsafe { b.launch(LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
         Ok(())
     }
@@ -585,6 +676,32 @@ impl VisionEncoder {
         let merge = cfg.spatial_merge_size;
         let side = cfg.side();
         let mut l = BatchLayout { tokens: 0, taps: Vec::new(), tap_weights: Vec::new(), hw: Vec::new(), seg_lo: Vec::new(), seg_hi: Vec::new(), merged_rows: Vec::new() };
+        if cfg.tiled() {
+            let per_tile = side * side + 1;
+            for p in items {
+                let [t, h, w] = p.grid;
+                ensure!(h == side && w == side && t > 0, "grid {t}x{h}x{w} is not tiles of {side}x{side}");
+                ensure!(p.data.len() == t * side * side * self.raw_cols(), "patch tensor has {} values", p.data.len());
+                for _ in 0..t * per_tile {
+                    l.seg_lo.push(0);
+                    l.seg_hi.push(0);
+                }
+                let n = l.seg_lo.len();
+                for tile in 0..t {
+                    for i in 0..per_tile {
+                        let lo = n - t * per_tile + tile * per_tile;
+                        l.seg_lo[lo + i] = lo as i32;
+                        l.seg_hi[lo + i] = (lo + per_tile) as i32;
+                    }
+                }
+                l.tokens += t * per_tile;
+                l.merged_rows.push(t * side * side / 4);
+            }
+            l.taps = vec![0; 4];
+            l.tap_weights = vec![0.0; 4];
+            l.hw = vec![0; 2];
+            return Ok(l);
+        }
         for p in items {
             let [t, h, w] = p.grid;
             ensure!(t > 0 && h > 0 && w > 0, "grid {t}x{h}x{w} is empty");
@@ -667,6 +784,53 @@ impl VisionEncoder {
         let mut merged = Vec::new();
         for op in &self.ops {
             match *op {
+                VisionOp::PatchEmbed if self.tiled.is_some() => {
+                    let t = self.tiled.as_ref().expect("checked");
+                    let per_tile = cfg.side() * cfg.side() + 1;
+                    let tiles = tokens / per_tile;
+                    let rows = tiles * (per_tile - 1);
+                    let n = (rows * self.patch.cols) as i32;
+                    let mut b = s.launch_builder(&self.split);
+                    b.arg(&*input).arg(&mut mid.hi).arg(&mut mid.lo).arg(&n);
+                    unsafe { b.launch(LaunchConfig { grid_dim: ((n as u32 / 2).div_ceil(256), 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+                    self.gemm(&self.patch, mid, Out::Store(qkv), rows, Act::None)?;
+                    let (n32, h32) = ((per_tile - 1) as i32, hidden as i32);
+                    let mut b = s.launch_builder(&t.assemble);
+                    b.arg(&*qkv).arg(&t.cls).arg(&self.pos_embed).arg(&mut *x).arg(&n32).arg(&h32);
+                    unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+                    let eps = cfg.eps();
+                    let mut b = s.launch_builder(&t.layernorm_f32);
+                    b.arg(&*x).arg(&t.pre.w).arg(&t.pre.b).arg(&mut *qkv).arg(&h32).arg(&eps);
+                    unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+                    s.memcpy_dtod(&qkv.slice(..tokens * hidden), &mut x.slice_mut(..tokens * hidden))?;
+                }
+                VisionOp::Rope if self.tiled.is_some() => {
+                    let t = self.tiled.as_ref().expect("checked");
+                    let (side, per_tile) = (cfg.side() as i32, (cfg.side() * cfg.side() + 1) as i32);
+                    let mut b = s.launch_builder(&t.rope_pairs);
+                    b.arg(&*qkv).arg(&mut *packed).arg(&t32).arg(&h32).arg(&hd32).arg(&t.theta).arg(&side).arg(&per_tile);
+                    unsafe { b.launch(LaunchConfig { grid_dim: (tokens as u32, heads as u32, 1), block_dim: (hdp as u32, 1, 1), shared_mem_bytes: 0 }) }?;
+                }
+                VisionOp::Shuffle => {
+                    let t = self.tiled.as_ref().context("this tower has no pixel shuffle")?;
+                    let (side, per_tile) = (cfg.side(), cfg.side() * cfg.side() + 1);
+                    let rows = tokens / per_tile * side * side / 4;
+                    let (h32, s32, p32, eps) = (hidden as i32, side as i32, per_tile as i32, cfg.eps());
+                    let mut b = s.launch_builder(&t.shuffle_norm);
+                    b.arg(&*x).arg(&t.post.w).arg(&t.post.b).arg(&mut scratch.hi).arg(&mut scratch.lo).arg(&h32).arg(&s32).arg(&p32).arg(&eps);
+                    unsafe { b.launch(LaunchConfig { grid_dim: (rows as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
+                }
+                VisionOp::Adapter => {
+                    let t = self.tiled.as_ref().context("this tower has no adapter")?;
+                    let per_tile = cfg.side() * cfg.side() + 1;
+                    let rows = tokens / per_tile * cfg.side() * cfg.side() / 4;
+                    self.gemm(&t.adapter_up, scratch, Out::Split(up), rows, Act::GeluErf)?;
+                    self.gemm(&t.adapter_down, up, Out::Split(mid), rows, Act::GeluErf)?;
+                    self.gemm(&t.proj, mid, Out::Store(out), rows, Act::None)?;
+                    let mut host = vec![0f32; rows * cfg.out_hidden_size];
+                    s.memcpy_dtoh(&out.slice(..host.len()), &mut host)?;
+                    merged = self.split_rows(host, &l.merged_rows);
+                }
                 VisionOp::PatchEmbed => {
                     let n = (tokens * self.patch.cols) as i32;
                     let mut b = s.launch_builder(&self.split);
@@ -754,6 +918,18 @@ pub struct TowerPart {
 pub fn tower_parts(cfg: &VisionConfig) -> Vec<TowerPart> {
     let h = cfg.hidden_size as u64;
     let i = cfg.intermediate_size as u64;
+    if cfg.tiled() {
+        let (pin, pout) = (cfg.projector_input_dim.unwrap_or(0) as u64, cfg.projector_output_dim.unwrap_or(0) as u64);
+        let patch = (cfg.in_channels.unwrap_or(3) * cfg.patch_size * cfg.patch_size) as u64;
+        return vec![
+            TowerPart { name: "patch embed".into(), count: 1, params: h * patch + h },
+            TowerPart { name: "position embeddings".into(), count: 1, params: cfg.num_position_embeddings as u64 * h },
+            TowerPart { name: "attention (qkv, proj)".into(), count: cfg.depth, params: 4 * h * h + 4 * h },
+            TowerPart { name: "mlp (up, down)".into(), count: cfg.depth, params: 2 * h * i + i + h },
+            TowerPart { name: "layernorms".into(), count: cfg.depth, params: 4 * h },
+            TowerPart { name: "adapter and projector".into(), count: 1, params: i * pin + pout * pout + pout * cfg.out_hidden_size as u64 },
+        ];
+    }
     let merged = h * (cfg.spatial_merge_size * cfg.spatial_merge_size) as u64;
     let channels = cfg.in_channels.unwrap_or(3) as u64;
     let patch = channels * (cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size) as u64;

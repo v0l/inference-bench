@@ -69,6 +69,7 @@ impl Preprocessor {
 pub struct Patches {
     pub grid: [usize; 3],
     pub data: Vec<f32>,
+    pub layout: [usize; 2],
 }
 
 impl Patches {
@@ -280,7 +281,7 @@ pub fn patchify(cfg: &Preprocessor, frames: &[Vec<u8>], height: usize, width: us
             }
         }
     }
-    Patches { grid: [gt, gh, gw], data }
+    Patches { grid: [gt, gh, gw], data, layout: [0, 0] }
 }
 
 pub fn preprocess_image(cfg: &Preprocessor, bytes: &[u8]) -> Result<Patches> {
@@ -408,6 +409,14 @@ pub struct MediaTokens {
     pub placeholder: Option<String>,
     pub wrap: String,
     pub tile_tokens: usize,
+    pub grid: Option<GridTokens>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GridTokens {
+    pub tile_x: String,
+    pub tile_y: String,
+    pub global: String,
 }
 
 impl Default for MediaTokens {
@@ -420,6 +429,7 @@ impl Default for MediaTokens {
             placeholder: None,
             wrap: String::new(),
             tile_tokens: 0,
+            grid: None,
         }
     }
 }
@@ -454,6 +464,10 @@ pub struct TileConfig {
     pub pan_and_scan_max_num_crops: Option<usize>,
     #[serde(default)]
     pub pan_and_scan_min_ratio_to_activate: Option<f64>,
+    #[serde(default)]
+    pub max_patches: Option<usize>,
+    #[serde(default)]
+    pub resize_to_max_canvas: bool,
 }
 
 impl TileConfig {
@@ -522,7 +536,7 @@ pub fn tile_patches(cfg: &TileConfig, patch: usize, tiles: &[Vec<u8>]) -> Patche
             }
         }
     }
-    Patches { grid: [tiles.len(), gh, gw], data }
+    Patches { grid: [tiles.len(), gh, gw], data, layout: [0, 0] }
 }
 
 pub fn preprocess_tiles(cfg: &TileConfig, patch: usize, bytes: &[u8], pan: Option<PanAndScan>) -> Result<Patches> {
@@ -540,6 +554,83 @@ pub fn preprocess_tiles(cfg: &TileConfig, patch: usize, bytes: &[u8], pan: Optio
         .map(|f| if (f.height, f.width) == (th, tw) { f.rgb.clone() } else { resize_bilinear(&f.rgb, f.height, f.width, th, tw) })
         .collect();
     Ok(tile_patches(cfg, patch, &tiles))
+}
+
+pub fn canvas_resolutions(max_chunks: usize, tile: usize) -> Vec<(usize, usize)> {
+    let mut groups: Vec<(u64, Vec<(usize, usize)>)> = Vec::new();
+    for chunk in (1..=max_chunks).rev() {
+        let mut factors: Vec<usize> = (1..=chunk).filter(|f| chunk % f == 0).collect();
+        factors.sort();
+        for f in factors {
+            let ratio = (f as f64 / (chunk / f) as f64).to_bits();
+            let entry = (f * tile, (chunk / f) * tile);
+            match groups.iter_mut().find(|g| g.0 == ratio) {
+                Some(g) => g.1.push(entry),
+                None => groups.push((ratio, vec![entry])),
+            }
+        }
+    }
+    groups.into_iter().flat_map(|g| g.1).collect()
+}
+
+pub fn best_canvas(height: usize, width: usize, options: &[(usize, usize)], max_canvas: bool) -> (usize, usize) {
+    let scale = |&(th, tw): &(usize, usize)| {
+        let (sh, sw) = (th as f32 / height as f32, tw as f32 / width as f32);
+        if sh > sw { sw } else { sh }
+    };
+    let scales: Vec<f32> = options.iter().map(scale).collect();
+    let up = scales.iter().copied().filter(|s| *s >= 1.0);
+    let chosen = if scales.iter().any(|s| *s >= 1.0) {
+        if max_canvas { up.fold(f32::MIN, f32::max) } else { up.fold(f32::MAX, f32::min) }
+    } else {
+        scales.iter().copied().filter(|s| *s < 1.0).fold(f32::MIN, f32::max)
+    };
+    options.iter().zip(&scales).filter(|(_, s)| **s == chosen).map(|(o, _)| *o).min_by_key(|(h, w)| h * w).expect("a canvas matches")
+}
+
+fn fit_without_distortion(height: usize, width: usize, target: (usize, usize)) -> (usize, usize) {
+    let (sw, sh) = (target.1 as f64 / width as f64, target.0 as f64 / height as f64);
+    if sw < sh {
+        (((height as f64 * sw).floor() as usize).min(target.0).max(1), target.1.max(1))
+    } else {
+        (target.0.max(1), ((width as f64 * sh).floor() as usize).min(target.1).max(1))
+    }
+}
+
+pub fn preprocess_canvas(cfg: &TileConfig, patch: usize, bytes: &[u8]) -> Result<Patches> {
+    let format = image::guess_format(bytes).map_err(|_| anyhow::anyhow!("the bytes are not a PNG, JPEG, GIF, BMP, TIFF or WebP image"))?;
+    let img = image::load_from_memory_with_format(bytes, format).context("decode image")?.to_rgb8();
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    let tile = cfg.size.height;
+    ensure!(tile == cfg.size.width, "the tile size must be square");
+    let options = canvas_resolutions(cfg.max_patches.unwrap_or(16), tile);
+    let canvas = best_canvas(h, w, &options, cfg.resize_to_max_canvas);
+    let limit = if cfg.resize_to_max_canvas { canvas } else { (h.max(tile).min(canvas.0), w.max(tile).min(canvas.1)) };
+    let (nh, nw) = fit_without_distortion(h, w, limit);
+    let raw = img.into_raw();
+    let resized = if (nh, nw) == (h, w) { raw.clone() } else { resize_bilinear(&raw, h, w, nh, nw) };
+    let mut padded = vec![0u8; canvas.0 * canvas.1 * 3];
+    for y in 0..nh {
+        padded[y * canvas.1 * 3..y * canvas.1 * 3 + nw * 3].copy_from_slice(&resized[y * nw * 3..(y + 1) * nw * 3]);
+    }
+    let (rh, rw) = (canvas.0 / tile, canvas.1 / tile);
+    let mut tiles = Vec::new();
+    for ty in 0..rh {
+        for tx in 0..rw {
+            let mut t = Vec::with_capacity(tile * tile * 3);
+            for y in 0..tile {
+                let at = ((ty * tile + y) * canvas.1 + tx * tile) * 3;
+                t.extend_from_slice(&padded[at..at + tile * 3]);
+            }
+            tiles.push(t);
+        }
+    }
+    if rh * rw > 1 {
+        tiles.push(if (h, w) == (tile, tile) { raw } else { resize_bilinear(&raw, h, w, tile, tile) });
+    }
+    let mut out = tile_patches(cfg, patch, &tiles);
+    out.layout = [rh, rw];
+    Ok(out)
 }
 
 pub enum Media<'a> {
@@ -573,7 +664,46 @@ pub fn expand_tiles(prompt: &str, tokens: &MediaTokens, media: &[Media]) -> Resu
     Ok(out)
 }
 
+fn grid_sequence(tokens: &MediaTokens, grid: &GridTokens, layout: [usize; 2]) -> String {
+    let patches = tokens.image.repeat(tokens.tile_tokens);
+    let mut s = tokens.start.clone();
+    if layout[0] * layout[1] > 1 {
+        for _ in 0..layout[0] {
+            for x in 0..layout[1] {
+                s.push_str(&patches);
+                if x + 1 < layout[1] {
+                    s.push_str(&grid.tile_x);
+                }
+            }
+            s.push_str(&grid.tile_y);
+        }
+    }
+    s.push_str(&grid.global);
+    s.push_str(&patches);
+    s.push_str(&tokens.end);
+    s
+}
+
+pub fn expand_grid(prompt: &str, tokens: &MediaTokens, media: &[Media]) -> Result<String> {
+    let slot = tokens.placeholder.as_deref().context("the model has no image placeholder")?;
+    let grid = tokens.grid.as_ref().context("the model has no tile grid tokens")?;
+    let mut out = String::with_capacity(prompt.len());
+    let mut rest = prompt;
+    for item in media {
+        let Media::Image(p) = item else { bail!("the model takes images only") };
+        let at = rest.find(slot).context("prompt has fewer media placeholders than media items")?;
+        out.push_str(&rest[..at]);
+        out.push_str(&grid_sequence(tokens, grid, p.layout));
+        rest = &rest[at + slot.len()..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
 pub fn expand_placeholders(prompt: &str, tokens: &MediaTokens, merge_size: usize, media: &[Media]) -> Result<String> {
+    if tokens.grid.is_some() {
+        return expand_grid(prompt, tokens, media);
+    }
     if tokens.placeholder.is_some() {
         return expand_tiles(prompt, tokens, media);
     }
@@ -609,6 +739,7 @@ pub enum Tower {
     #[default]
     Merged,
     Pooled,
+    Tiled,
 }
 
 fn one() -> usize {
@@ -644,14 +775,24 @@ pub struct VisionConfig {
     pub image_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_tokens: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "norm_eps")]
     pub layer_norm_eps: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rope_theta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector_input_dim: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector_output_dim: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_shuffle_ratio: Option<f64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub bidirectional: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub wrap: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grid_tokens: Vec<String>,
 }
 
 fn is_default_tower(t: &Tower) -> bool {
@@ -663,9 +804,21 @@ impl VisionConfig {
         self.tower == Tower::Pooled
     }
 
+    pub fn tiled(&self) -> bool {
+        self.tower == Tower::Tiled
+    }
+
+    pub fn tile_grid(&self) -> bool {
+        self.tower != Tower::Merged
+    }
+
+    pub fn eps(&self) -> f32 {
+        self.layer_norm_eps.unwrap_or(1e-6) as f32
+    }
+
     pub fn side(&self) -> usize {
         match self.image_size {
-            Some(size) if self.pooled() => size / self.patch_size,
+            Some(size) if self.tower != Tower::Merged => size / self.patch_size,
             _ => (self.num_position_embeddings as f64).sqrt() as usize,
         }
     }
@@ -712,6 +865,26 @@ impl Vision {
             return Ok(None);
         }
         let mut config: VisionConfig = serde_json::from_value(vc.clone()).context("vision_config")?;
+        if spec.tiled {
+            let text = top.get("text_config").unwrap_or(&top);
+            config.tower = Tower::Tiled;
+            config.placeholder = spec.placeholder.clone();
+            if let Some(g) = &spec.grid_tokens {
+                config.grid_tokens = vec![g.tile_x.clone(), g.tile_y.clone(), g.global.clone()];
+            }
+            config.out_hidden_size = text.get("hidden_size").and_then(|v| v.as_u64()).context("text_config has no hidden_size")? as usize;
+            if config.rope_theta.is_none() {
+                config.rope_theta = vc.get("rope_parameters").and_then(|r| r.get("rope_theta")).and_then(|v| v.as_f64());
+            }
+            let image = config.image_size.context("vision_config has no image_size")?;
+            let side = image / config.patch_size;
+            ensure!(config.pixel_shuffle_ratio == Some(0.5), "only a pixel shuffle ratio of 0.5 is supported");
+            ensure!(side.is_multiple_of(2), "the patch grid of {side} does not shuffle by 2");
+            config.num_position_embeddings = side * side + 1;
+            config.mm_tokens = Some(side * side / 4);
+            config.hidden_act.get_or_insert_with(|| "gelu".into());
+            ensure!(config.projector_input_dim.is_some() && config.projector_output_dim.is_some(), "vision_config has no projector dims");
+        }
         if spec.pooled {
             let text = top.get("text_config").unwrap_or(&top);
             config.tower = Tower::Pooled;
@@ -788,6 +961,7 @@ pub struct TileAssets {
     pub config: TileConfig,
     pub patch: usize,
     pub pan_and_scan: Option<PanAndScan>,
+    pub canvas: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -818,7 +992,7 @@ impl MediaAssets {
                 .iter()
                 .map(|item| match item.kind {
                     MediaKind::Image => {
-                        let p = preprocess_tiles(&t.config, t.patch, &item.bytes, t.pan_and_scan)?;
+                        let p = if t.canvas { preprocess_canvas(&t.config, t.patch, &item.bytes)? } else { preprocess_tiles(&t.config, t.patch, &item.bytes, t.pan_and_scan)? };
                         check_patches(&p, &budget)?;
                         Ok(Processed::Image(p))
                     }

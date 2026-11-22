@@ -331,7 +331,7 @@ fn vision_case(rt: &mut Runtime, case: &str) {
             let n = grid.iter().product::<usize>() * patch_dim;
             let data = all[at..at + n].to_vec();
             at += n;
-            MediaInput { processed: Processed::Image(Patches { grid, data }), hash: [(case.len() * 8 + i) as u8 + 1; 32] }
+            MediaInput { processed: Processed::Image(Patches { grid, data, layout: [0, 0] }), hash: [(case.len() * 8 + i) as u8 + 1; 32] }
         })
         .collect();
     let prompt = ids(&m["ids"]);

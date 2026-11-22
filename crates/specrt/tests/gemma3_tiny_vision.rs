@@ -76,7 +76,7 @@ fn tiny_gemma3_vision_matches_transformers_on_every_row() {
         let grid: Vec<usize> = m["grid"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
         let ids: Vec<u32> = m["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
         let data = floats(&format!("{case}.patches.bin"));
-        let media = vec![MediaInput { processed: Processed::Image(Patches { grid: [grid[0], grid[1], grid[2]], data }), hash: [seed; 32] }];
+        let media = vec![MediaInput { processed: Processed::Image(Patches { grid: [grid[0], grid[1], grid[2]], data, layout: [0, 0] }), hash: [seed; 32] }];
         let plan = rt.plan_media(&ids, &media).unwrap();
         let want = floats(&format!("{case}.embeds.bin"));
         assert_eq!(plan.embeds.len(), want.len(), "{case}");
@@ -111,7 +111,7 @@ fn image_tokens_attend_to_each_other_in_both_directions() {
     let ids: Vec<u32> = m["ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
     let grid: Vec<usize> = m["grid"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as usize).collect();
     let data = floats("square.patches.bin");
-    let media = vec![MediaInput { processed: Processed::Image(Patches { grid: [grid[0], grid[1], grid[2]], data }), hash: [9; 32] }];
+    let media = vec![MediaInput { processed: Processed::Image(Patches { grid: [grid[0], grid[1], grid[2]], data, layout: [0, 0] }), hash: [9; 32] }];
     let plan = rt.plan_media(&ids, &media).unwrap();
     let first = plan.spans.iter().enumerate().find(|(i, s)| **s as usize > *i).map(|(i, _)| i).unwrap();
     assert_eq!(plan.spans[first] as usize, first + 3);

@@ -1309,7 +1309,7 @@ impl Runtime {
                 let opts = spec.runtime.vision;
                 let stream = rt.ctx.new_stream()?;
                 let enc = crate::vision_encoder::VisionEncoder::load_with(&rt.ctx, &stream, &jit, &checkpoint, &v.config, opts.precision)?;
-                rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::with_tiles(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, if v.config.pooled() { v.config.tokens_per_tile() } else { 0 }, opts)));
+                rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::with_tiles(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, if v.config.tile_grid() { v.config.tokens_per_tile() } else { 0 }, opts)));
                 checkpoint.release();
             }
         rt.stream.synchronize()?;
@@ -2701,7 +2701,7 @@ impl Runtime {
             self.stream.memcpy_htod(&[0i32, 0], &mut self.mm_meta.slice_mut(2 * slot..2 * slot + 2))?;
             return Ok(());
         };
-        ensure!(self.spec.rope.mrope.is_some() || self.spec.vision.as_ref().is_some_and(|v| v.config.pooled()), "the model has no mrope section in its spec");
+        ensure!(self.spec.rope.mrope.is_some() || self.spec.vision.as_ref().is_some_and(|v| v.config.tile_grid()), "the model has no mrope section in its spec");
         let n = plan.positions.len();
         ensure!(n <= self.max_ctx, "media prompt longer than max_ctx");
         let hidden = self.spec.dims.hidden;

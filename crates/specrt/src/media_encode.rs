@@ -244,7 +244,7 @@ mod tests {
     }
 
     fn image(seed: f32, hash: u8) -> MediaInput {
-        MediaInput { processed: Processed::Image(Patches { grid: [1, 4, 4], data: vec![seed; 16] }), hash: [hash; 32] }
+        MediaInput { processed: Processed::Image(Patches { grid: [1, 4, 4], data: vec![seed; 16], layout: [0, 0] }), hash: [hash; 32] }
     }
 
     fn encoder(count: Arc<AtomicUsize>, cache_mb: usize) -> MediaEncoder {

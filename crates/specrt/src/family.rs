@@ -222,7 +222,6 @@ impl Default for VisionTokenKeys {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyGridTokens {
-    pub patch: String,
     pub tile_x: String,
     pub tile_y: String,
     pub global: String,
@@ -234,9 +233,7 @@ pub struct FamilyGridTokens {
 pub struct FamilyVision {
     pub ignore: bool,
     pub pooled: bool,
-    pub shuffled: bool,
-    pub cls: bool,
-    pub rope_pairs: bool,
+    pub tiled: bool,
     pub grid_tokens: Option<FamilyGridTokens>,
     pub bidirectional: bool,
     pub soft_tokens_key: String,
