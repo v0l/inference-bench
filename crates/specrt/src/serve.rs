@@ -55,9 +55,8 @@ impl SpeculativeOptions {
             m.speculate = on;
         }
         match self.draft_tokens {
+            Some(DraftTokens::Auto) | None => m.draft_tokens = crate::spec::MAX_DRAFT_TOKENS,
             Some(DraftTokens::Fixed(k)) => m.draft_tokens = k,
-            Some(DraftTokens::Auto) => m.draft_tokens = crate::spec::MAX_DRAFT_TOKENS,
-            None => {}
         }
         if self.max_batch.is_some() {
             m.max_batch = self.max_batch;
@@ -641,7 +640,7 @@ fn serving_config(spec: &Spec, opts: &ServeOptions) -> Config {
         admit_lookahead: opts.admit_lookahead,
         prefill_burst_tokens: opts.prefill_burst_tokens,
         max_long_in_flight: opts.max_long_in_flight,
-        adaptive_drafts: opts.speculative.draft_tokens == Some(DraftTokens::Auto),
+        adaptive_drafts: !matches!(opts.speculative.draft_tokens, Some(DraftTokens::Fixed(_))),
         prefix_cache,
         ..Config::default()
     }
@@ -724,6 +723,10 @@ fn build_tp(spec: &Spec, opts: &ServeOptions, solved: &crate::solve::Solved) -> 
     tracing::info!(spec = %spec.name, tp = opts.tp, devices = ?devices, max_model_len = layout.max_ctx, max_num_seqs = layout.slots, kv_blocks = exec.kv_blocks(), "tensor parallel serving layout");
     let cfg = serving_config(spec, opts);
     Ok(Scheduler::new(exec, cfg))
+}
+
+pub fn scheduler(spec: &Spec, opts: ServeOptions, device: usize) -> Result<Scheduler<GpuExecutor>> {
+    build(spec, opts, device)
 }
 
 fn build(spec: &Spec, opts: ServeOptions, device: usize) -> Result<Scheduler<GpuExecutor>> {

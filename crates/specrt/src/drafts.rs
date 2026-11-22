@@ -288,6 +288,34 @@ mod tests {
     }
 
     #[test]
+    fn a_settled_count_is_left_when_acceptance_collapses() {
+        let mut c = DraftChooser::new(3);
+        let cost = [0.010, 0.011, 0.012, 0.013];
+        let mut seqs = vec![Positions::default(); 4];
+        let mut run = |c: &mut DraftChooser, seqs: &mut Vec<Positions>, steps: usize, accept: usize| {
+            let mut ks = Vec::new();
+            for _ in 0..steps {
+                let k = c.choose(seqs);
+                c.observe(4, k, cost[k]);
+                if k > 0 {
+                    let a = accept.min(k);
+                    c.observe_accepts(k, &[a; 4]);
+                    for p in seqs.iter_mut() {
+                        p.record(k, a);
+                    }
+                }
+                ks.push(k);
+            }
+            ks
+        };
+        run(&mut c, &mut seqs, 60, 3);
+        assert!(c.choose(&seqs) == 3);
+        seqs = vec![Positions::default(); 4];
+        let ks = run(&mut c, &mut seqs, 200, 0);
+        assert!(ks[100..].iter().all(|&k| k != 3), "{:?}", &ks[100..]);
+    }
+
+    #[test]
     fn explores_every_draft_count_before_deciding() {
         let mut c = DraftChooser::new(3);
         let r = rows(2, 0, 1, 0);

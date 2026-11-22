@@ -18,6 +18,8 @@ struct Flags {
     b_graphs: Option<bool>,
     drafts: Option<specrt::serve::DraftTokens>,
     vram_gb: Option<f64>,
+    a_set: Vec<String>,
+    b_set: Vec<String>,
 }
 
 static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
@@ -31,7 +33,7 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None, drafts: None, vram_gb: None };
+    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None, drafts: None, vram_gb: None, a_set: Vec::new(), b_set: Vec::new() };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -43,7 +45,7 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
             "--ab" => f.ab = true,
             "--mlp-act-fp4" => f.mlp_act_fp4 = true,
             "--mlp-act-planes" => f.mlp_planes = 2,
-            "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" | "--drafts" | "--vram-gb" => {
+            "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" | "--drafts" | "--vram-gb" | "--a-set" | "--b-set" => {
                 let name = args.remove(i);
                 anyhow::ensure!(i < args.len(), "{name} needs a value");
                 if name == "--runs" {
@@ -52,6 +54,10 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
                     f.rounds = args[i].parse().context("--rounds")?;
                 } else if name == "--vram-gb" {
                     f.vram_gb = Some(args[i].parse().context("--vram-gb")?);
+                } else if name == "--a-set" {
+                    f.a_set.push(args[i].clone());
+                } else if name == "--b-set" {
+                    f.b_set.push(args[i].clone());
                 } else if name == "--drafts" {
                     f.drafts = Some(match args[i].as_str() {
                         "auto" => specrt::serve::DraftTokens::Auto,
@@ -140,6 +146,9 @@ fn main() -> Result<()> {
         let reply = engine.generate(prompt, n, Sampling::GREEDY)?;
         println!("TEXT_BEGIN{}TEXT_END", reply.text);
         return Ok(());
+    }
+    if flags().ab && (!flags().a_set.is_empty() || !flags().b_set.is_empty()) {
+        return bench_ab_option(args);
     }
     if flags().ab {
         return bench_ab(args);
@@ -455,6 +464,122 @@ fn bench_wgpu(spec: &Spec, prompts: &[usize], new_tokens: usize) -> Result<()> {
 #[cfg(not(feature = "wgpu"))]
 fn bench_wgpu(_: &Spec, _: &[usize], _: usize) -> Result<()> {
     anyhow::bail!("build with --features wgpu")
+}
+
+fn with_options(spec: &Spec, sets: &[String]) -> Result<(Spec, specrt::serve::ServeOptions)> {
+    let mut spec = spec.clone();
+    let mut opts = specrt::serve::ServeOptions::default();
+    let mut speculative = serde_json::Map::new();
+    let mut runtime = serde_json::to_value(&spec.runtime)?;
+    let known: Vec<String> = specrt::options::schema().into_iter().map(|f| f.key).collect();
+    for set in sets {
+        let (key, raw) = set.split_once('=').with_context(|| format!("--a-set/--b-set takes key=value, not {set}"))?;
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+        let full = if known.iter().any(|k| k == key) {
+            key.to_string()
+        } else {
+            let hits: Vec<&String> = known.iter().filter(|k| k.rsplit('.').next() == Some(key)).collect();
+            anyhow::ensure!(hits.len() == 1, "{key} is not one option key ({hits:?})");
+            hits[0].clone()
+        };
+        if let Some(rest) = full.strip_prefix("speculative.") {
+            speculative.insert(rest.to_string(), value);
+        } else if let Some(path) = full.strip_prefix("runtime.") {
+            let mut node = &mut runtime;
+            let parts: Vec<&str> = path.split('.').collect();
+            for (i, part) in parts.iter().enumerate() {
+                let map = node.as_object_mut().context("runtime path")?;
+                if i + 1 == parts.len() {
+                    map.insert(part.to_string(), value.clone());
+                    break;
+                }
+                node = map.entry(part.to_string()).or_insert_with(|| serde_json::json!({}));
+            }
+        } else {
+            anyhow::bail!("bench --ab takes speculative.* and runtime.* options, not {full}");
+        }
+    }
+    spec.runtime = serde_json::from_value(runtime).context("runtime options")?;
+    opts.speculative = serde_json::from_value(serde_json::Value::Object(speculative)).context("speculative options")?;
+    Ok((spec, opts))
+}
+
+struct Arm {
+    sched: specrt::sched::Scheduler<specrt::sched::GpuExecutor>,
+    drafts: specrt::serve::DraftTokens,
+}
+
+fn load_arm(base: &Spec, sets: &[String], batch: usize, max_ctx: usize) -> Result<Arm> {
+    let (spec, mut opts) = with_options(base, sets)?;
+    opts.max_num_seqs = batch;
+    opts.max_model_len = Some(max_ctx);
+    opts.kv_cache_bytes = Some(1 << 30);
+    let drafts = opts.speculative.draft_tokens.unwrap_or(specrt::serve::DraftTokens::Fixed(spec.mtp.as_ref().map_or(0, |m| m.draft_tokens)));
+    Ok(Arm { sched: specrt::serve::scheduler(&spec, opts, 0)?, drafts })
+}
+
+fn option_round(arm: &mut Arm, prompts: &[Vec<u32>], new_tokens: usize) -> Result<f64> {
+    use specrt::sched::Request;
+    for p in prompts {
+        arm.sched.submit(Request { prompt: p.clone(), max_tokens: new_tokens, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None })?;
+    }
+    let (mut secs, mut tokens) = (0.0, 0usize);
+    while !arm.sched.idle() {
+        let mut events = Vec::new();
+        let r = arm.sched.step(&mut events)?;
+        if r.prefill_tokens == 0 {
+            secs += r.decode_secs;
+            tokens += r.decode_rows + r.accepted;
+        }
+    }
+    Ok(tokens as f64 / secs)
+}
+
+fn bench_ab_option(args: Vec<String>) -> Result<()> {
+    use specrt::abstats::{ratios, summarize, verdict_with_min_rounds};
+    let usage = "usage: bench --ab [--rounds N] [--a-set key=value].. [--b-set key=value].. <spec> [batch] [new_tokens]";
+    let mut args = args.into_iter();
+    let spec_path = PathBuf::from(args.next().context(usage)?);
+    let batch: usize = args.next().map(|s| s.parse()).transpose().context(usage)?.unwrap_or(4);
+    let new_tokens: usize = args.next().map(|s| s.parse()).transpose().context(usage)?.unwrap_or(128);
+    let rounds = flags().rounds;
+    let spec = load_spec(&spec_path)?;
+    let prompts = spec_prompts(&spec)?;
+    let max_ctx = prompts.iter().map(Vec::len).max().unwrap_or(0) + new_tokens + 16;
+    let mut a = load_arm(&spec, &flags().a_set, batch, max_ctx)?;
+    let mut b = load_arm(&spec, &flags().b_set, batch, max_ctx)?;
+    println!("A {:?} drafts={:?} | B {:?} drafts={:?} | batch={batch} prompts={} new={new_tokens} rounds={rounds}", flags().a_set, a.drafts, flags().b_set, b.drafts, prompts.len());
+    for arm in [&mut a, &mut b] {
+        option_round(arm, &prompts, new_tokens)?;
+    }
+    let (mut control, mut passes, mut a_all, mut b_all) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for pass in 1..=2 {
+        let (mut c1, mut c2, mut ra, mut rb) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..rounds {
+            c1.push(option_round(&mut a, &prompts, new_tokens)?);
+            c2.push(option_round(&mut a, &prompts, new_tokens)?);
+        }
+        for _ in 0..rounds {
+            ra.push(option_round(&mut a, &prompts, new_tokens)?);
+            rb.push(option_round(&mut b, &prompts, new_tokens)?);
+        }
+        control.push(summarize(&ratios(&c1, &c2)));
+        passes.push(summarize(&ratios(&ra, &rb)));
+        println!("pass {pass}: A/A {}", describe("ratio", &control[pass - 1]));
+        println!("pass {pass}: A/B {}", describe("ratio", &passes[pass - 1]));
+        a_all.extend(ra);
+        b_all.extend(rb);
+    }
+    println!("A: {:.1} tok/s, B: {:.1} tok/s (median aggregate decode)", summarize(&a_all).median, summarize(&b_all).median);
+    for (name, arm) in [("A", &a), ("B", &b)] {
+        if let Some(c) = arm.sched.draft_chooser() {
+            println!("{name}: adaptive steps per k (0..=3) {:?}", c.chosen());
+        }
+    }
+    let v = verdict_with_min_rounds(&control, &passes, rounds);
+    println!("verdict (decode, B over A): {}", v.label());
+    anyhow::ensure!(!matches!(v, specrt::abstats::Verdict::Refused(_)), "refused: rerun on a quiet card");
+    Ok(())
 }
 
 fn looks_like_spec(arg: &str) -> bool {
