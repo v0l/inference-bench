@@ -155,7 +155,7 @@ fn main() -> Result<()> {
         return bench_wgpu(&spec, &prompts, new_tokens);
     }
     if speculative {
-        return bench_spec(&spec, new_tokens, batch.max(1), longest);
+        return bench_spec(&spec, new_tokens, batch.max(1), longest, sampled);
     }
     if flags().cold {
         return bench_cold(&spec, longest, new_tokens);
@@ -210,7 +210,7 @@ fn spec_prompts(spec: &Spec) -> Result<Vec<Vec<u32>>> {
         .collect()
 }
 
-fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> Result<()> {
+fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize, sampled: bool) -> Result<()> {
     use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
     let prompts = spec_prompts(spec)?;
     for speculate in [true, false] {
@@ -236,8 +236,9 @@ fn bench_spec(spec: &Spec, new_tokens: usize, batch: usize, max_ctx: usize) -> R
         let (mut decode_secs, mut tokens, mut drafted, mut accepted) = (0.0, 0usize, 0usize, 0usize);
         let mut outs: std::collections::HashMap<u64, Vec<u32>> = Default::default();
         let mut ids = Vec::new();
-        for p in &prompts {
-            ids.push(sched.submit(Request { prompt: p.clone(), max_tokens: new_tokens, sampling: Sampling::GREEDY, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None })?);
+        for (n, p) in prompts.iter().enumerate() {
+            let sampling = if sampled { Sampling::new(1.0, 100 + n as u32).truncated(20, 0.95, 0.0) } else { Sampling::GREEDY };
+            ids.push(sched.submit(Request { prompt: p.clone(), max_tokens: new_tokens, sampling, stop: vec![], salt: String::new(), media: Vec::new(), grammar: None })?);
         }
         while !sched.idle() {
             let mut events = Vec::new();
