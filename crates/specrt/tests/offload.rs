@@ -141,6 +141,33 @@ fn expert_cache_with_nvfp4_experts_is_bit_identical() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn expert_cache_with_glm4_moe_experts_is_bit_identical() {
+    assert_experts_identical("tiny-glm4-moe", 3);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn expert_pages_on_nvme_are_bit_identical() {
+    let dir = "tiny-qwen3.5-moe-nvfp4";
+    let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
+    let p = prompt(40);
+    let want = full.generate(&p, 16, Sampling::GREEDY).unwrap().tokens;
+    drop(full);
+    let tmp = std::env::temp_dir().join(format!("specrt-nvme-{}", std::process::id()));
+    let mut spec = moe_spec(dir, 2, None);
+    spec.runtime.offload.host_budget = 1;
+    spec.runtime.offload.nvme_path = Some(tmp.to_string_lossy().into_owned());
+    let mut off = Runtime::load(&spec, 256).unwrap();
+    assert_eq!(off.generate(&p, 16, Sampling::GREEDY).unwrap().tokens, want);
+    let stats = off.offload_stats().unwrap();
+    assert!(stats.nvme_read_bytes > 0, "{stats:?}");
+    drop(off);
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn calibration_hotlist_round_trips_and_warms_the_cache() {
     let first = prompt(1);
     let mut cold = Runtime::load(&moe_spec("tiny-qwen3.5-moe", 6, None), 256).unwrap();

@@ -99,10 +99,10 @@ fn expert_cache_mode(spec: &Spec) -> bool {
     spec.runtime.offload.enabled() && spec.moe.is_some()
 }
 
-fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize, global: usize) -> Result<DeviceLayer> {
+fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &moe::experts::ExpertStore, i: usize, global: usize) -> Result<DeviceLayer> {
     let l = ck.layer_at(spec, i, global).with_context(|| format!("layer {global}"))?;
     let cached = match &spec.moe {
-        Some(m) if expert_cache_mode(spec) && l.moe.is_some() => Some((crate::hostpool::HostPool::new(stream.context().clone()), m.local_experts() + m.shared_slots())),
+        Some(m) if expert_cache_mode(spec) && l.moe.is_some() => Some((store, m.local_experts() + m.shared_slots())),
         _ => None,
     };
     let up_m = |m: &Matrix| DeviceMatrix::upload(stream, m);
@@ -144,7 +144,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (p, *n)))).transpose()? };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()? };
     copied(stream)?;
     Ok(layer)
 }
@@ -227,7 +227,7 @@ fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: Sta
     Ok(up)
 }
 
-fn upload_group(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole, work: Work) -> Result<Uploaded> {
+fn upload_group(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &moe::experts::ExpertStore, range: StageRange, role: StageRole, work: Work) -> Result<Uploaded> {
     match work {
         Work::Head => upload_head(stream, ck, spec, role),
         Work::Embed => {
@@ -240,7 +240,7 @@ fn upload_group(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, range: S
             copied(stream)?;
             Ok(Uploaded::Mtp(m))
         }
-        Work::Layer(i) => Ok(Uploaded::Layer(i, upload_layer(stream, ck, spec, i, range.start + i)?)),
+        Work::Layer(i) => Ok(Uploaded::Layer(i, upload_layer(stream, ck, spec, store, i, range.start + i)?)),
     }
 }
 
@@ -252,6 +252,7 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
     let count = groups.len();
     let names = groups.clone();
     let budget = crate::loader::Budget::new(opts.host_budget_bytes());
+    let store = &moe::experts::ExpertStore::new(ctx.clone(), spec.runtime.offload.host_budget, spec.runtime.offload.nvme_path.as_deref());
     let feed = Mutex::new(Feed::new(ck, groups, opts, ctx, budget.clone())?);
     let direct = feed.lock().unwrap().direct();
     let reader = feed.lock().unwrap().reader();
@@ -285,7 +286,7 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
                         };
                         let outcome = claimed.and_then(|(g, batch)| {
                             let view = ck.with_staged(batch);
-                            let up = upload_group(ws, &view, spec, range, role, work[g])?;
+                            let up = upload_group(ws, &view, spec, store, range, role, work[g])?;
                             if !view.has_staged() {
                                 view.release_names(&names[g]);
                             }

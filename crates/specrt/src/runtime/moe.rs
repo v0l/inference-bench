@@ -72,7 +72,7 @@ impl StackWeights {
 }
 
 impl DeviceMoe {
-    pub(super) fn upload(stream: &Arc<cudarc::driver::CudaStream>, m: &MoeWeights, index: usize, cached: Option<(&crate::hostpool::HostPool, usize)>) -> Result<Self> {
+    pub(super) fn upload(stream: &Arc<cudarc::driver::CudaStream>, m: &MoeWeights, index: usize, cached: Option<(&experts::ExpertStore, usize)>) -> Result<Self> {
         let (stacks, host) = match cached {
             Some((pool, entries)) => (None, Some(experts::HostExperts::pack(pool, m, entries)?)),
             None => (Some(Stacks { gate: StackWeights::upload(stream, &m.gate)?, up: StackWeights::upload(stream, &m.up)?, down: StackWeights::upload(stream, &m.down)? }), None),

@@ -20,8 +20,39 @@ struct Part {
     per: usize,
 }
 
+enum Backing {
+    Pinned(PinnedBuf),
+    File { file: std::fs::File, path: std::path::PathBuf, len: u64 },
+}
+
+impl Drop for Backing {
+    fn drop(&mut self) {
+        if let Backing::File { path, .. } = self {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(in crate::runtime) struct ExpertStore {
+    pool: HostPool,
+    dir: Option<std::path::PathBuf>,
+}
+
+impl ExpertStore {
+    pub(in crate::runtime) fn new(ctx: Arc<cudarc::driver::CudaContext>, host_budget: u64, dir: Option<&str>) -> Self {
+        let pool = HostPool::new(ctx);
+        if host_budget > 0 {
+            pool.set_limit(host_budget as usize);
+        }
+        ExpertStore { pool, dir: dir.map(std::path::PathBuf::from) }
+    }
+}
+
+static NEXT_FILE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(in crate::runtime) struct HostExperts {
-    buf: PinnedBuf,
+    buf: Backing,
     kinds: [Kind; 3],
     pub(in crate::runtime) input_globals: [f32; 3],
     parts: Vec<Part>,
@@ -41,21 +72,43 @@ fn comps(s: &Stacked) -> (Kind, Vec<&[u8]>) {
 }
 
 impl HostExperts {
-    pub(in crate::runtime) fn pack(pool: &HostPool, m: &MoeWeights, entries: usize) -> Result<Self> {
+    pub(in crate::runtime) fn pack(store: &ExpertStore, m: &MoeWeights, entries: usize) -> Result<Self> {
         let all: Vec<(Kind, Vec<&[u8]>)> = [&m.gate, &m.up, &m.down].into_iter().map(comps).collect();
         let total: usize = all.iter().flat_map(|(_, c)| c.iter()).map(|c| c.len()).sum();
-        let mut buf = pool.alloc(total)?;
-        let dst = buf.as_mut_slice()?;
         let mut parts = Vec::new();
         let mut at = 0;
         for (_, cs) in &all {
             for c in cs {
                 ensure!(entries > 0 && c.len() % entries == 0, "expert tensor of {} bytes does not split into {entries} experts", c.len());
-                dst[at..at + c.len()].copy_from_slice(c);
                 parts.push(Part { offset: at, per: c.len() / entries });
                 at += c.len();
             }
         }
+        let flat = || all.iter().flat_map(|(_, cs)| cs.iter().copied());
+        let buf = match store.pool.alloc(total) {
+            Ok(mut b) => {
+                let dst = b.as_mut_slice()?;
+                let mut at = 0;
+                for c in flat() {
+                    dst[at..at + c.len()].copy_from_slice(c);
+                    at += c.len();
+                }
+                Backing::Pinned(b)
+            }
+            Err(e) => {
+                let Some(dir) = &store.dir else {
+                    return Err(e.context("expert pages exceed [runtime.offload] host_budget and nvme_path is not set"));
+                };
+                std::fs::create_dir_all(dir)?;
+                let path = dir.join(format!("experts-{}-{}.pages", std::process::id(), NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+                let mut f = std::fs::File::create(&path)?;
+                for c in flat() {
+                    std::io::Write::write_all(&mut f, c)?;
+                }
+                drop(f);
+                Backing::File { file: std::fs::File::open(&path)?, path, len: total as u64 }
+            }
+        };
         let ig = |s: &Stacked| if let Stacked::Fp4 { input_global, .. } = s { *input_global } else { 1.0 };
         Ok(HostExperts { buf, kinds: [all[0].0, all[1].0, all[2].0], input_globals: [ig(&m.gate), ig(&m.up), ig(&m.down)], parts })
     }
@@ -65,7 +118,10 @@ impl HostExperts {
     }
 
     pub(in crate::runtime) fn host_bytes(&self) -> u64 {
-        self.buf.len() as u64
+        match &self.buf {
+            Backing::Pinned(b) => b.len() as u64,
+            Backing::File { len, .. } => *len,
+        }
     }
 
     fn allocate(&self, stream: &Arc<CudaStream>, cap: usize) -> Result<Stacks> {
@@ -122,6 +178,13 @@ pub(in crate::runtime) struct ExpertCache {
     local: usize,
     shared: usize,
     state: Mutex<State>,
+    staging: Mutex<Staging>,
+    staging_pool: HostPool,
+}
+
+struct Staging {
+    buf: Option<PinnedBuf>,
+    used: usize,
 }
 
 pub(in crate::runtime) struct Staged {
@@ -142,6 +205,8 @@ impl ExpertCache {
             slots,
             local,
             shared,
+            staging: Mutex::new(Staging { buf: None, used: 0 }),
+            staging_pool: HostPool::new(ctx.clone()),
             state: Mutex::new(State { book: SlotBook::new(slots, policy), last: vec![Vec::new(); layers], seen: ExpertHotlist::new(layers, local), prior }),
         })
     }
@@ -159,11 +224,36 @@ impl ExpertCache {
     }
 
     fn enqueue(&self, host: &HostExperts, entry: usize, slot: usize, stats: &mut OffloadStats) -> Result<()> {
-        let src = host.buf.as_slice()?;
-        for (p, base) in host.parts.iter().zip(&self.addrs) {
-            let from = &src[p.offset + entry * p.per..p.offset + (entry + 1) * p.per];
-            unsafe { cudarc::driver::result::memcpy_htod_async(base + (slot * p.per) as u64, from, self.copy.cu_stream()) }?;
-            stats.host_to_vram_bytes += p.per as u64;
+        match &host.buf {
+            Backing::Pinned(b) => {
+                let src = b.as_slice()?;
+                for (p, base) in host.parts.iter().zip(&self.addrs) {
+                    let from = &src[p.offset + entry * p.per..p.offset + (entry + 1) * p.per];
+                    unsafe { cudarc::driver::result::memcpy_htod_async(base + (slot * p.per) as u64, from, self.copy.cu_stream()) }?;
+                    stats.host_to_vram_bytes += p.per as u64;
+                }
+            }
+            Backing::File { file, .. } => {
+                use std::os::unix::fs::FileExt;
+                let mut st = self.staging.lock().unwrap();
+                let cap = (host.entry_bytes() * 32).max(1 << 20);
+                if st.buf.is_none() {
+                    st.buf = Some(self.staging_pool.alloc(cap)?);
+                }
+                for (p, base) in host.parts.iter().zip(&self.addrs) {
+                    if st.used + p.per > cap {
+                        self.copy.synchronize()?;
+                        st.used = 0;
+                    }
+                    let at = st.used;
+                    let dst = &mut st.buf.as_mut().unwrap().as_mut_slice()?[at..at + p.per];
+                    file.read_exact_at(dst, (p.offset + entry * p.per) as u64)?;
+                    unsafe { cudarc::driver::result::memcpy_htod_async(base + (slot * p.per) as u64, &*dst, self.copy.cu_stream()) }?;
+                    st.used += p.per;
+                    stats.host_to_vram_bytes += p.per as u64;
+                    stats.nvme_read_bytes += p.per as u64;
+                }
+            }
         }
         Ok(())
     }
@@ -196,6 +286,7 @@ impl ExpertCache {
             }
         }
         g.book.stats.host_to_vram_bytes += stats.host_to_vram_bytes;
+        g.book.stats.nvme_read_bytes += stats.nvme_read_bytes;
         self.fence(compute)?;
         Ok(Staged { mapping })
     }
@@ -236,6 +327,7 @@ impl ExpertCache {
             }
         }
         g.book.stats.host_to_vram_bytes += stats.host_to_vram_bytes;
+        g.book.stats.nvme_read_bytes += stats.nvme_read_bytes;
         Ok(())
     }
 
@@ -259,6 +351,7 @@ impl ExpertCache {
             }
         }
         g.book.stats.host_to_vram_bytes += stats.host_to_vram_bytes;
+        g.book.stats.nvme_read_bytes += stats.nvme_read_bytes;
         self.fence(compute)?;
         Ok(())
     }

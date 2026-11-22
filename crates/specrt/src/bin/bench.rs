@@ -19,6 +19,8 @@ struct Flags {
     drafts: Option<specrt::serve::DraftTokens>,
     vram_gb: Option<f64>,
     expert_slots: Option<usize>,
+    host_gb: Option<f64>,
+    nvme_path: Option<String>,
     layers: Option<usize>,
     hotlist: Option<String>,
     save_hotlist: Option<String>,
@@ -37,7 +39,7 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None, drafts: None, vram_gb: None, expert_slots: None, layers: None, hotlist: None, save_hotlist: None, a_set: Vec::new(), b_set: Vec::new() };
+    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None, drafts: None, vram_gb: None, expert_slots: None, host_gb: None, nvme_path: None, layers: None, hotlist: None, save_hotlist: None, a_set: Vec::new(), b_set: Vec::new() };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -49,7 +51,7 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
             "--ab" => f.ab = true,
             "--mlp-act-fp4" => f.mlp_act_fp4 = true,
             "--mlp-act-planes" => f.mlp_planes = 2,
-            "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" | "--drafts" | "--vram-gb" | "--expert-slots" | "--layers" | "--hotlist" | "--save-hotlist" | "--a-set" | "--b-set" => {
+            "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" | "--drafts" | "--vram-gb" | "--expert-slots" | "--host-gb" | "--nvme-path" | "--layers" | "--hotlist" | "--save-hotlist" | "--a-set" | "--b-set" => {
                 let name = args.remove(i);
                 anyhow::ensure!(i < args.len(), "{name} needs a value");
                 if name == "--runs" {
@@ -58,6 +60,10 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
                     f.rounds = args[i].parse().context("--rounds")?;
                 } else if name == "--vram-gb" {
                     f.vram_gb = Some(args[i].parse().context("--vram-gb")?);
+                } else if name == "--host-gb" {
+                    f.host_gb = Some(args[i].parse().context("--host-gb")?);
+                } else if name == "--nvme-path" {
+                    f.nvme_path = Some(args[i].clone());
                 } else if name == "--layers" {
                     f.layers = Some(args[i].parse().context("--layers")?);
                 } else if name == "--expert-slots" {
@@ -102,6 +108,12 @@ fn load_spec(path: &Path) -> Result<Spec> {
     }
     if let Some(gb) = flags().vram_gb {
         spec.runtime.offload.vram_budget = (gb * 1e9) as u64;
+    }
+    if let Some(gb) = flags().host_gb {
+        spec.runtime.offload.host_budget = (gb * 1e9) as u64;
+    }
+    if let Some(p) = &flags().nvme_path {
+        spec.runtime.offload.nvme_path = Some(p.clone());
     }
     if let Some(n) = flags().layers {
         spec.layers.count = n;
