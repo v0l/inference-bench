@@ -21,12 +21,14 @@ pub enum ToolFormat {
     FunctionsList,
     Harmony,
     Unparsed,
+    KeyValueXml,
 }
 
 impl ToolFormat {
     pub fn parser(self) -> Option<&'static str> {
         match self {
             ToolFormat::XmlFunction => Some("xml_function"),
+            ToolFormat::KeyValueXml => Some("xml_kv"),
             ToolFormat::Hermes => Some("hermes"),
             ToolFormat::ToolCallList => Some("tool_call_list"),
             ToolFormat::BareJson => Some("bare_json"),
@@ -145,6 +147,8 @@ impl ChatTemplate {
             ToolFormat::Harmony
         } else if s.contains("<function=") && s.contains("<parameter=") {
             ToolFormat::XmlFunction
+        } else if s.contains("<arg_key>") && s.contains("<tool_call>") {
+            ToolFormat::KeyValueXml
         } else if s.contains("<tool_call>") {
             ToolFormat::Hermes
         } else if s.contains("<|tool_call|>") {

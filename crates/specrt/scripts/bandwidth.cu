@@ -1,7 +1,9 @@
+#ifndef SPECRT_NVRTC
 #include <cstdio>
 #include <cuda_runtime.h>
+#endif
 
-__global__ void read_sum(const uint4* __restrict__ src, size_t n, unsigned* out) {
+extern "C" __global__ void read_sum(const uint4* __restrict__ src, size_t n, unsigned* out) {
     unsigned acc = 0;
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) {
         uint4 v;
@@ -11,10 +13,11 @@ __global__ void read_sum(const uint4* __restrict__ src, size_t n, unsigned* out)
     if (acc == 0x12345678u) out[0] = acc;
 }
 
-__global__ void copy(const uint4* __restrict__ src, uint4* dst, size_t n) {
+extern "C" __global__ void copy(const uint4* __restrict__ src, uint4* dst, size_t n) {
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n; i += (size_t)gridDim.x * blockDim.x) dst[i] = src[i];
 }
 
+#ifndef SPECRT_NVRTC
 int main() {
     size_t bytes = 2ull << 30;
     size_t n = bytes / 16;
@@ -51,3 +54,4 @@ int main() {
     }
     return 0;
 }
+#endif
