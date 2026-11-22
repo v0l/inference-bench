@@ -342,4 +342,29 @@ Pre-build kernels without loading weights, for a Docker build or a first start:
 inference-bench warmup --spec qwen3.8-27b-nvfp4 --max-ctx 32768 --slots 8
 ```
 
-The image has no GPU at build time, so mount the cache dir (`[runtime] cache_dir`) as a volume and run `warmup` once on the target host.
+The image has no GPU at build time, so mount the cache dir (`[runtime] cache_dir`) as a volume and run `warmup` once on the target host (recipe in docs/server.md, Packaging).
+
+#### Warmup proves a real start loads from cache (#1013)
+
+27B NVFP4 (`tests/fixtures/qwen3.8-27b-nvfp4.toml`), GPU 1, empty `[runtime] cache_dir`, empty `CUDA_CACHE_PATH`, `--max-ctx 8192 --slots 8`. `warmup` then `inference-bench serve --max-model-len 8192 --max-num-seqs 8 --kv-cache-gb 2` and `POST /load`:
+
+| Step | jit_cache_hit | jit_compile_secs | jit_module_secs | load_secs |
+| --- | --- | --- | --- | --- |
+| `warmup` | false (compiled) | 6.95 | 0.00 | n/a |
+| server load after `warmup` | true | 0.001 | 0.003 | 5.84 |
+| server load, no `warmup` (same empty caches) | false | 6.39 | 0.001 | 10.50 |
+
+The first run of this test missed: `warmup` read the spec TOML as is, the server completes it from the checkpoint config (`engine::complete_spec`), so the module differed. `warmup` now uses `runtime::warmup_spec` (complete, then rope extension). Tests: `jit.rs` `warmup_resolves_the_spec_the_server_loads` and `draft_tokens_do_not_change_the_module`. `max_ctx`, `slots` and `kv_planes` (one plane unless the model needs two, same as `Layout::serving`) already matched, and `--chunk` is not part of the key.
+
+#### NVFP4 27B cold start rows (#1013)
+
+`coldstart.sh` on `tests/fixtures/qwen3.8-27b-nvfp4.toml`, GPU 1, same card state, `bench --cold --kv-gb 2`, prompt 128. Before is master before the #398 merge (`8ac5740^1`), after is this branch.
+
+| State | before load | before jit_compile | before jit_load_module | after load | after jit_compile | after jit_load_module |
+| --- | --- | --- | --- | --- | --- | --- |
+| both caches warm | 3.97 s | 0.00 s | 0.02 s | 3.58 s | 0.00 s | 0.00 s |
+| specrt cache cold | 4.18 s | 0.31 s | 0.01 s | 4.44 s | 0.35 s | 0.00 s |
+| driver cache cold | 9.62 s | 0.00 s | 6.54 s | 3.87 s | 0.00 s | 0.00 s |
+| both cold | 18.98 s | 8.74 s | 6.63 s | 8.41 s | 5.29 s | 0.00 s |
+
+A first run of the cold start (prime, both cold, 19.12 s before and 9.58 s after) agrees. NVRTC fell from 8.5 to 8.7 s to 5.3 to 6.2 s with split compile, and the 6.6 s driver SASS step is gone, so a full cold start is 2.3x faster and a driver cache wipe costs nothing.
