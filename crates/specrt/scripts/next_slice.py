@@ -41,6 +41,9 @@ def main(snap, out_dir, layers):
     with torch.device("meta"):
         model = Qwen3NextForCausalLM(cfg)
     model = model.to_empty(device="cuda")
+    from transformers.models.qwen3_next.modeling_qwen3_next import Qwen3NextRotaryEmbedding
+
+    model.model.rotary_emb = Qwen3NextRotaryEmbedding(cfg).to("cuda")
     params = dict(model.named_parameters())
     inter = cfg.moe_intermediate_size
     for file in sorted({index[n] for n in index if wanted(n)}):
