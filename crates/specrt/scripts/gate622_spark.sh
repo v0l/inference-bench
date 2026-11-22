@@ -2,7 +2,7 @@
 set -uo pipefail
 root=$HOME/ib-gates/622
 master=$HOME/ib-gates/622-master
-vis=$HOME/ib-gates/vis498
+vis=${SPECRT_VISION_REF_DIR:-$HOME/.local/share/inference-bench/refs/vision}
 hf=$HOME/.cache/huggingface/hub
 q35=$HOME/ib-gates/q35-q8.gguf
 q8b=$(ls $hf/models--unsloth--Qwen3-8B-GGUF/snapshots/*/Qwen3-8B-Q4_K_M.gguf)
