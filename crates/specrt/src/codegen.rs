@@ -10,7 +10,7 @@ pub use crate::gemm::{
 
 pub const MOE_KERNELS: &[&str] = kir::moe::Family::Experts.kernels();
 pub const MOE_MMA_KERNELS: &[&str] = kir::moe::Family::GroupedMma.kernels();
-pub use kir::moe::{mma8_smem as moe_mma8_smem, mma_bf16_smem as moe_mma_bf16_smem, MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
+pub use kir::moe::{mma8_smem as moe_mma8_smem, mma_bf16_smem as moe_mma_bf16_smem, MMA_BM as MOE_MMA_BM, MMA_BM_SMALL as MOE_MMA_BM_SMALL, MMA_BM_TINY as MOE_MMA_BM_TINY, fp4_tile_rows as moe_fp4_tile_rows, MMA_BN as MOE_MMA_BN, MMA_STAGES as MOE_MMA_STAGES, mma_smem as moe_mma_smem};
 
 pub fn moe_mma_enabled(spec: &Spec, target: &kir::Target) -> bool {
     let Some(m) = &spec.moe else { return false };
