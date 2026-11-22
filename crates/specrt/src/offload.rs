@@ -386,15 +386,27 @@ pub struct OffloadPlan {
     pub vram_bytes: u64,
     pub host_bytes: u64,
     pub nvme_bytes: u64,
+    #[serde(default)]
+    pub host_staging_bytes: u64,
 }
 
 pub fn plan_layers(layer_bytes: &[u64], always_resident: u64, settings: &OffloadSettings) -> Result<OffloadPlan> {
+    let plan = assign_layers(layer_bytes, always_resident, settings, 0)?;
+    if plan.nvme_bytes == 0 {
+        return Ok(plan);
+    }
+    let slot = layer_bytes.iter().copied().max().unwrap_or(0).div_ceil(4096) * 4096;
+    let staging = slot * (settings.prefetch_depth.max(1) as u64 + 1);
+    assign_layers(layer_bytes, always_resident, settings, staging)
+}
+
+fn assign_layers(layer_bytes: &[u64], always_resident: u64, settings: &OffloadSettings, host_staging: u64) -> Result<OffloadPlan> {
     let n = layer_bytes.len();
     let staging = layer_bytes.iter().copied().max().unwrap_or(0) * (settings.prefetch_depth.max(1) as u64 + 1);
     let fixed = always_resident + staging;
     ensure!(settings.vram_budget >= fixed, "vram_budget {} cannot hold resident tensors and {} staging bytes", settings.vram_budget, fixed);
     let mut vram_left = settings.vram_budget - fixed;
-    let mut host_left = settings.host_budget;
+    let mut host_left = settings.host_budget.saturating_sub(host_staging);
     let mut order: Vec<usize> = (0..n).collect();
     if n > 1 {
         order = vec![0, n - 1].into_iter().chain(1..n - 1).collect();
@@ -412,7 +424,7 @@ pub fn plan_layers(layer_bytes: &[u64], always_resident: u64, settings: &Offload
     }
     let layers: Vec<LayerResidency> = (0..n).map(|l| LayerResidency { layer: l, bytes: layer_bytes[l], tier: tiers[l], pinned: tiers[l] == Tier::Vram }).collect();
     let sum = |t: Tier| layers.iter().filter(|l| l.tier == t).map(|l| l.bytes).sum::<u64>();
-    Ok(OffloadPlan { vram_bytes: sum(Tier::Vram) + fixed, host_bytes: sum(Tier::Host), nvme_bytes: sum(Tier::Nvme), staging_bytes: staging, layers })
+    Ok(OffloadPlan { vram_bytes: sum(Tier::Vram) + fixed, host_bytes: sum(Tier::Host), nvme_bytes: sum(Tier::Nvme), staging_bytes: staging, host_staging_bytes: host_staging, layers })
 }
 
 impl OffloadPlan {
@@ -602,6 +614,25 @@ mod tests {
     }
 
     #[test]
+    fn pinned_total_with_disk_staging_stays_inside_host_budget() {
+        let sizes = vec![10000u64; 10];
+        let staging = 12288u64 * 3;
+        for host in [0u64, 30000, 90000, 200000] {
+            let s = OffloadSettings { vram_budget: 60000, host_budget: host, prefetch_depth: 2, ..Default::default() };
+            let p = plan_layers(&sizes, 0, &s).unwrap();
+            if p.nvme_bytes > 0 {
+                assert_eq!(p.host_staging_bytes, staging);
+                assert!(p.host_bytes + p.host_staging_bytes <= host.max(staging), "{p:?}");
+            } else {
+                assert_eq!(p.host_staging_bytes, 0);
+            }
+        }
+        let tight = OffloadSettings { vram_budget: 60000, host_budget: staging + 20000, prefetch_depth: 2, ..Default::default() };
+        let p = plan_layers(&sizes, 0, &tight).unwrap();
+        assert!(p.nvme_bytes > 0 && p.host_bytes == 20000 && p.host_bytes + p.host_staging_bytes <= tight.host_budget, "{p:?}");
+    }
+
+    #[test]
     fn planner_pins_first_and_last_then_fills_vram_then_host() {
         let layers = vec![10u64; 10];
         let s = OffloadSettings { vram_budget: 50, host_budget: 30, prefetch_depth: 1, ..Default::default() };
@@ -610,7 +641,7 @@ mod tests {
         assert_eq!(p.layers[0].tier, Tier::Vram);
         assert_eq!(p.layers[9].tier, Tier::Vram);
         let count = |t| p.layers.iter().filter(|l| l.tier == t).count();
-        assert_eq!((count(Tier::Vram), count(Tier::Host), count(Tier::Nvme)), (2, 3, 5));
+        assert_eq!((count(Tier::Vram), count(Tier::Host), count(Tier::Nvme)), (2, 0, 8));
         assert_eq!(p.vram_bytes, 50);
         assert_eq!(p.streamed_bytes_per_token(), 80);
     }
