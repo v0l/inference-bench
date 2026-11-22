@@ -1,5 +1,4 @@
 use super::prim::{block_argmax_tree, for_stride, kernel};
-use crate::cuda::attention::prim::{Reduce, block_reduce};
 
 pub fn body() -> String {
     let mut o = String::new();
@@ -54,17 +53,10 @@ extern "C" __global__ void mtp_draft(const float* logits, int* drafts, int col, 
     }
 }
 
-__device__ __forceinline__ float spec_uniform(unsigned seed, unsigned step) {
-    unsigned x = seed * 747796405u + step * 2891336453u + 0x68e31da4u;
-    x ^= x >> 16; x *= 2246822507u; x ^= x >> 13; x *= 3266489909u; x ^= x >> 16;
-    return ((float)(x >> 8) + 0.5f) / 16777216.0f;
-}
-
 extern "C" __global__ void spec_accept(const float* logits, const int* vtok, const int* params, const int* max_accept,
                                        int k, int* out, int* accepted) {
     __shared__ float best_v[1024];
     __shared__ int best_i[1024];
-    __shared__ float scratch[32];
     int s = blockIdx.x;
     const int* p = params + 6 * s;
     float inv_temp = __int_as_float(p[0]);
@@ -76,31 +68,17 @@ extern "C" __global__ void spec_accept(const float* logits, const int* vtok, con
         int d = j < k ? vtok[s * (k + 1) + 1 + j] : -1;
         bool may = j < k && j < max_accept[s];
         bool sampled = inv_temp > 0.0f;
-        bool take = false;
+        bool take;
         float thr = NEG_INF;
         if (sampled) {
             float m;
             thr = sample_threshold(row, inv_temp, p[3], __int_as_float(p[4]), __int_as_float(p[5]), &m);
-            if (may) {
-                float sum = 0.0f;
-                for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
-                    float v = row[i] * inv_temp;
-                    if (v >= thr) sum += expf(v - m);
-                }
-                "##);
-    o.push_str(&format!("sum = {};", block_reduce(Reduce::Sum, "sum", "scratch")));
-    o.push_str(r##"
-                float vd = row[d] * inv_temp;
-                take = vd >= thr && spec_uniform(seed, step + j) < expf(vd - m) / sum;
-            }
         }
         int tok = d;
-        if (!take) {
-            int excl = sampled && may ? d : -1;
+        {
             float bv = NEG_INF;
             int bi = 0;
             for (int i = threadIdx.x; i < VOCAB; i += blockDim.x) {
-                if (i == excl) continue;
                 float v = row[i];
                 if (sampled) {
                     v *= inv_temp;
@@ -116,7 +94,7 @@ extern "C" __global__ void spec_accept(const float* logits, const int* vtok, con
 "##);
     o.push_str(&block_argmax_tree(12));
     o.push_str(r##"            tok = best_i[0];
-            take = !sampled && may && tok == d;
+            take = may && tok == d;
         }
         if (threadIdx.x == 0) out[s * (k + 1) + j] = tok;
         __syncthreads();

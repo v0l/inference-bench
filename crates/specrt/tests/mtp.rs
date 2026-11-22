@@ -294,6 +294,72 @@ fn plain_greedy(s: &Spec, prompts: &[Vec<u32>]) -> Vec<Vec<u32>> {
         .collect()
 }
 
+fn plain_sampled(s: &Spec, prompts: &[Vec<u32>], t: f32) -> Vec<Vec<u32>> {
+    let mut plain = s.clone();
+    plain.mtp.as_mut().unwrap().speculate = false;
+    let mut rt = Runtime::load_layout(&plain, layout(1)).unwrap();
+    tables(&mut rt, 1);
+    let mut st = rt.stepper().unwrap();
+    prompts
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let sampling = Sampling::new(t, 1000 + i as u32);
+            let mut out = vec![rt.prefill_slot(&mut st, 0, p, 0, Some((sampling, 0))).unwrap().unwrap()];
+            while out.len() < NEW {
+                let row = DecodeRow { slot: 0, token: *out.last().unwrap(), pos: p.len() + out.len() - 1, sampling, step: out.len() as u32 };
+                out.push(rt.decode(&mut st, &[row]).unwrap()[0]);
+            }
+            out
+        })
+        .collect()
+}
+
+fn speculative_sampled(s: &Spec, prompts: &[Vec<u32>], want: &[Vec<u32>], t: f32, wrong: bool) -> (Vec<Vec<u32>>, u64) {
+    let k = s.mtp.as_ref().unwrap().draft_tokens;
+    let mut rt = Runtime::load_layout(s, layout(1)).unwrap();
+    tables(&mut rt, 1);
+    let mut st = rt.stepper().unwrap();
+    let mut outs = Vec::new();
+    for (i, (p, w)) in prompts.iter().zip(want).enumerate() {
+        let sampling = Sampling::new(t, 1000 + i as u32);
+        let mut out = vec![rt.prefill_slot(&mut st, 0, p, 0, Some((sampling, 0))).unwrap().unwrap()];
+        while out.len() < NEW {
+            let have = out.len();
+            if wrong {
+                let mut d: Vec<u32> = (0..k).map(|j| w.get(have + j).copied().unwrap_or(0)).collect();
+                let at = (have + i) % (k + 1);
+                if at < k {
+                    d[at] = (d[at] + 1) % 1024;
+                }
+                rt.set_drafts(0, &d).unwrap();
+            }
+            let row = SpecRow { slot: 0, token: *out.last().unwrap(), pos: p.len() + have - 1, sampling, step: have as u32, max_accept: NEW - have - 1 };
+            out.extend(rt.speculate(&[row]).unwrap().remove(0));
+        }
+        out.truncate(NEW);
+        outs.push(out);
+    }
+    (outs, rt.spec_stats().accepted)
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn speculative_sampling_is_identical_to_plain_sampling() {
+    let ps = prompts();
+    for t in [0.3f32, 1.0] {
+        for k in 1..=3 {
+            let s = spec(k);
+            let want = plain_sampled(&s, &ps, t);
+            let (got, accepted) = speculative_sampled(&s, &ps, &want, t, false);
+            eprintln!("T {t}, k = {k}, MTP drafts: accepted {accepted}");
+            check(&format!("MTP drafts, T {t}, k = {k}"), &got, &want);
+            let (got, _) = speculative_sampled(&s, &ps, &want, t, true);
+            check(&format!("wrong drafts, T {t}, k = {k}"), &got, &want);
+        }
+    }
+}
+
 fn cached_turns(s: &Spec, cache: bool) -> (Vec<Vec<u32>>, Vec<usize>, usize) {
     use specrt::sched::{Config, Event, GpuExecutor, Request, Scheduler};
     use specrt::spec::PrefixCacheOptions;
