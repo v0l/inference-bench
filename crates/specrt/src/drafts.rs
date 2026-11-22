@@ -81,12 +81,13 @@ pub struct DraftChooser {
     warm: bool,
     chosen: [u64; MAX_DRAFT_TOKENS + 1],
     first_seen: std::collections::HashSet<(usize, usize)>,
+    settled: HashMap<usize, usize>,
 }
 
 impl DraftChooser {
     pub fn new(kmax: usize) -> Self {
         let kmax = kmax.min(MAX_DRAFT_TOKENS);
-        DraftChooser { kmax, costs: HashMap::new(), global: Positions::default(), retests: HashMap::new(), trial: None, last: 0, warm: false, chosen: [0; MAX_DRAFT_TOKENS + 1], first_seen: Default::default() }
+        DraftChooser { kmax, costs: HashMap::new(), global: Positions::default(), retests: HashMap::new(), trial: None, last: 0, warm: false, chosen: [0; MAX_DRAFT_TOKENS + 1], first_seen: Default::default(), settled: HashMap::new() }
     }
 
     pub fn chosen(&self) -> [u64; MAX_DRAFT_TOKENS + 1] {
@@ -176,6 +177,11 @@ impl DraftChooser {
                 *r = Retest::default();
             }
         }
+        if let Some(&k) = self.settled.get(&rows.len())
+            && self.costs.keys().all(|(n, _)| *n != rows.len())
+        {
+            return k;
+        }
         if let Some(k) = (0..=self.kmax).rev().find(|&k| !self.measured(k)) {
             return k;
         }
@@ -199,7 +205,12 @@ impl DraftChooser {
                 }
             }
         }
+        self.settled.insert(rows.len(), best);
         best
+    }
+
+    pub fn settled(&self, rows: usize) -> Option<usize> {
+        self.settled.get(&rows).copied()
     }
 
     pub fn note_plain(&mut self) {
@@ -285,6 +296,17 @@ mod tests {
             feed(&mut c, 1, k, 0.021 + 0.001 * k as f64, 3, 4);
         }
         assert_eq!(c.choose(&rows(1, 3, 3, 30)), 3);
+    }
+
+    #[test]
+    fn a_row_count_that_settled_before_is_not_explored_again() {
+        let mut c = DraftChooser::new(2);
+        simulate(&mut c, 4, 40, [0.010, 0.012, 0.014], 2);
+        let k = c.settled(4).expect("settled");
+        assert!(k > 0);
+        c.costs.clear();
+        c.first_seen.clear();
+        assert_eq!(c.choose(&rows(4, 2, 2, 30)), k);
     }
 
     #[test]
