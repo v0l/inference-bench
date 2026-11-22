@@ -1428,6 +1428,14 @@ impl Checkpoint {
         }
     }
 
+    pub fn draft_head_bf16(&self, spec: &Spec) -> Result<Option<(Cow<'_, [u16]>, usize)>> {
+        let embed = self.bf16(&format!("{}.embed_tokens.weight", self.root()), &[spec.dims.vocab, spec.dims.hidden])?;
+        Ok(match self.head_raw(spec, &embed)? {
+            Raw::Bf16 { w, cols } => Some((w, cols)),
+            _ => None,
+        })
+    }
+
     pub fn draft_head(&self, spec: &Spec, quant: Quant) -> Result<Matrix<'_>> {
         if let Some(name) = spec.mtp_layout().head {
             return self.raw(&name, spec.dims.vocab, spec.dims.hidden)?.into_matrix(quant, "mtp lm_head");

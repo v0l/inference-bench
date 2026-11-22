@@ -101,6 +101,58 @@ pub fn quantize(w: &[f32], cols: usize, global: f32) -> (Vec<u8>, Vec<u8>) {
     (packed, scales)
 }
 
+pub struct DeviceFp4 {
+    pub packed: cudarc::driver::CudaSlice<u8>,
+    pub scales: cudarc::driver::CudaSlice<u8>,
+}
+
+const QUANT_SOURCE: &str = include_str!("../scripts/nvfp4_quant.cu");
+
+pub fn quantize_on_device(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    cache_dir: &std::path::Path,
+    w: &[u16],
+    cols: usize,
+) -> Result<DeviceFp4> {
+    use anyhow::Context;
+    use cudarc::driver::{LaunchConfig, PushKernelArg};
+    ensure!(cols.is_multiple_of(GROUP) && w.len().is_multiple_of(cols), "nvfp4 rows must be a multiple of {GROUP} wide");
+    let ctx = stream.context();
+    let (major, minor) = ctx.compute_capability()?;
+    let arch: &'static str = Box::leak(format!("compute_{major}{minor}").into_boxed_str());
+    let key = crate::jit::cache_key(QUANT_SOURCE, arch, &[]);
+    let path = cache_dir.join(format!("nvfp4_quant-{key}.ptx"));
+    let ptx = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => {
+            let opts = cudarc::nvrtc::CompileOptions { arch: Some(arch), ..Default::default() };
+            let ptx = cudarc::nvrtc::compile_ptx_with_opts(QUANT_SOURCE, opts).map_err(|e| anyhow::anyhow!("nvrtc nvfp4 quantize: {e:?}"))?.to_src();
+            let _ = std::fs::create_dir_all(cache_dir);
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, &ptx).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+            ptx
+        }
+    };
+    let module = ctx.load_module(cudarc::nvrtc::Ptx::from_src(ptx))?;
+    let amax_kernel = module.load_function("nvfp4_amax").context("nvfp4_amax")?;
+    let quant_kernel = module.load_function("nvfp4_quantize").context("nvfp4_quantize")?;
+    let dev_w = stream.clone_htod(w)?;
+    let mut amax = stream.alloc_zeros::<u32>(1)?;
+    let groups = w.len() / GROUP;
+    let mut packed = stream.alloc_zeros::<u8>(w.len() / 2)?;
+    let mut scales = stream.alloc_zeros::<u8>(SCALE_HEADER + groups)?;
+    let n = w.len() as u64;
+    let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
+    let amax_cfg = LaunchConfig { grid_dim: (sms * 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    unsafe { stream.launch_builder(&amax_kernel).arg(&dev_w).arg(&n).arg(&mut amax).launch(amax_cfg) }?;
+    let g = groups as u64;
+    let cfg = LaunchConfig { grid_dim: (groups.div_ceil(128) as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    unsafe { stream.launch_builder(&quant_kernel).arg(&dev_w).arg(&g).arg(&amax).arg(&mut packed).arg(&mut scales).launch(cfg) }?;
+    Ok(DeviceFp4 { packed, scales })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
