@@ -106,6 +106,7 @@ fn every_family_template_gets_its_tool_parser_or_an_explicit_none() {
         ("qwen3.5", ToolFormat::XmlFunction),
         ("qwen3.5-moe", ToolFormat::XmlFunction),
         ("qwen3.8", ToolFormat::XmlFunction),
+        ("gpt-oss", ToolFormat::Harmony),
     ];
     for (family, want) in table {
         let got = family_template(family).tool_format();
@@ -126,4 +127,14 @@ fn the_tool_format_comes_from_the_template_text() {
     assert_eq!(ToolFormat::KeyValueXml.parser(), Some("xml_kv"));
     assert_eq!(ToolFormat::Hermes.parser(), Some("hermes"));
     assert_eq!(ToolFormat::Unparsed.parser(), None);
+}
+
+#[test]
+fn the_gpt_oss_template_renders_with_tools_and_a_date() {
+    let t = family_template("gpt-oss");
+    let tool = serde_json::json!({"type": "function", "function": {"name": "get_weather", "description": "d", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}});
+    let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+    let text = t.render_with(&messages, &serde_json::json!({"tools": [tool]})).unwrap();
+    assert!(text.contains("Current date: 20") && text.contains("functions.get_weather") || text.contains("get_weather"), "{text}");
+    assert!(text.ends_with("<|start|>assistant"), "{text}");
 }
