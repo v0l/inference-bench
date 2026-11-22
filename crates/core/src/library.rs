@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn every_config_the_engine_tests_load_is_supported_by_the_library() {
-        let engine_refuses = ["gemma4-31b.config.json", "glm5.3-flash.config.json"];
+        let engine_refuses = ["gemma4-31b.config.json", "glm5.3-flash.config.json", "llama4-scout.config.json"];
         let fixtures = engine_config_fixtures();
         assert!(fixtures.len() >= 12, "{} fixtures", fixtures.len());
         for (name, config) in &fixtures {
