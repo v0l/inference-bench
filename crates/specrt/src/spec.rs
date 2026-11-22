@@ -574,6 +574,8 @@ pub struct Moe {
     pub fused_experts: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub input_scaled: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub experts_transposed: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub hash_layers: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1655,6 +1657,7 @@ impl Spec {
                     out_scale: multiplier(&family.multipliers.residual).unwrap_or(1.0),
                     fused_experts: family.moe.fused_experts,
                     input_scaled: family.moe.input_scaled,
+                    experts_transposed: family.moe.experts_transposed,
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,

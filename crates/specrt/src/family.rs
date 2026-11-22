@@ -181,6 +181,7 @@ pub struct FamilyMoe {
     pub router_module: Option<String>,
     pub fused_experts: bool,
     pub input_scaled: bool,
+    pub experts_transposed: bool,
     pub hash_table: Option<String>,
 }
 

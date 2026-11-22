@@ -11,9 +11,15 @@ num_experts = ["num_local_experts"]
 moe_intermediate_size = ["intermediate_size"]
 shared_expert_intermediate_size = ["intermediate_size"]
 decoder_sparse_step = ["interleave_moe_layer_step"]
+sliding_window = ["attention_chunk_size"]
 
 [blocks]
+types_key = "no_rope_layers"
 sparse_layers_key = "moe_layers"
+
+[blocks.layer_types]
+"1" = "sliding"
+"0" = "full"
 
 [mlp]
 dense_intermediate_key = "intermediate_size_mlp"
@@ -26,8 +32,55 @@ interleaved = true
 qk_norm = { config = "use_qk_norm", default = false }
 qk_norm_unit = true
 
+[attention.params]
+attn_scale = { config = "attn_scale" }
+floor_scale = { config = "floor_scale" }
+tuning = { config = "attn_temperature_tuning" }
+
+[[attention.node]]
+op = "qk_rope"
+phase = "prefill"
+
+[[attention.node]]
+op = "kernel"
+kernel = "attn_chunked"
+phase = "prefill"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+chunk = "window"
+nope = "nope"
+attn_scale = "attn_scale"
+floor_scale = "floor_scale"
+tuning = "tuning"
+
+[[attention.node]]
+op = "decode_rope"
+phase = "rows"
+
+[[attention.node]]
+op = "kernel"
+kernel = "attn_chunked"
+phase = "rows"
+grid = ["heads", "rows"]
+
+[attention.node.bind]
+chunk = "window"
+nope = "nope"
+attn_scale = "attn_scale"
+floor_scale = "floor_scale"
+tuning = "tuning"
+
+[tensors]
+".feed_forward." = ".mlp."
+
 [moe]
 router = "sigmoid"
+router_module = "router"
 norm_topk = false
 input_scaled = true
+experts_transposed = true
 shared_gate = false
+
+[runtime]
+split_activations = false

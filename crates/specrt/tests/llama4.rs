@@ -62,6 +62,17 @@ fn top1_sigmoid_routing_scales_the_expert_input_and_the_shared_expert_has_no_gat
 }
 
 #[test]
+fn chunked_attention_nope_and_temperature_tuning_come_from_the_config() {
+    let spec = spec_of(&scout());
+    use specrt::spec::Block;
+    assert_eq!(spec.layers.pattern, vec![Block::Sliding, Block::Sliding, Block::Sliding, Block::Full]);
+    assert_eq!(spec.layers.window, Some(8192));
+    assert_eq!((spec.attention.params["attn_scale"], spec.attention.params["floor_scale"], spec.attention.params["tuning"]), (0.1, 8192.0, 1.0));
+    assert!(spec.attention.node.iter().any(|n| n.kernel.as_deref() == Some("attn_chunked")));
+    assert_eq!(spec.tensors.get(".feed_forward.").map(String::as_str), Some(".mlp."));
+}
+
+#[test]
 fn an_explicit_moe_layer_list_overrides_the_step() {
     let mut config = scout();
     config["text_config"]["moe_layers"] = serde_json::json!([1, 2, 5]);
