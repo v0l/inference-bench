@@ -156,18 +156,16 @@ pub(super) struct Spilled {
     pub layer: usize,
     pub blob: PinnedBuf,
     pub lens: Vec<usize>,
-    pub device_bytes: u64,
 }
 
 pub(super) fn spill(stream: &Arc<CudaStream>, pool: &HostPool, layer: usize, l: &mut DeviceLayer) -> Result<Spilled> {
     let mut m = Measure(0);
     l.walk(&mut m)?;
-    let device_bytes = l.bytes();
     let mut blob = pool.alloc(m.0)?;
     let mut sp = Spill { stream, blob: blob.as_mut_slice()?, at: 0, lens: Vec::new() };
     l.walk(&mut sp)?;
     let lens = sp.lens;
-    Ok(Spilled { layer, blob, lens, device_bytes })
+    Ok(Spilled { layer, blob, lens })
 }
 
 struct Slot {
@@ -234,10 +232,6 @@ impl Streamer {
 
     pub(super) fn streamed_layers(&self) -> usize {
         self.order.len()
-    }
-
-    pub(super) fn pinned_bytes(&self) -> u64 {
-        self.blobs.iter().flatten().map(|(b, _)| b.len() as u64).sum()
     }
 
     pub(super) fn stats(&self) -> OffloadStats {

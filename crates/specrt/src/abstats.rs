@@ -21,7 +21,8 @@ impl Summary {
     }
 
     pub fn refused(&self) -> bool {
-        !(self.spread() <= REFUSE_SPREAD)
+        let spread = self.spread();
+        spread.is_nan() || spread > REFUSE_SPREAD
     }
 }
 

@@ -17,6 +17,7 @@ struct Flags {
     rounds: usize,
     b_graphs: Option<bool>,
     drafts: Option<specrt::serve::DraftTokens>,
+    vram_gb: Option<f64>,
 }
 
 static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
@@ -30,7 +31,7 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None, drafts: None };
+    let mut f = Flags { runs: 6, serve: false, cold: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None, drafts: None, vram_gb: None };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -42,13 +43,15 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
             "--ab" => f.ab = true,
             "--mlp-act-fp4" => f.mlp_act_fp4 = true,
             "--mlp-act-planes" => f.mlp_planes = 2,
-            "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" | "--drafts" => {
+            "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" | "--drafts" | "--vram-gb" => {
                 let name = args.remove(i);
                 anyhow::ensure!(i < args.len(), "{name} needs a value");
                 if name == "--runs" {
                     f.runs = args[i].parse().context("--runs")?;
                 } else if name == "--rounds" {
                     f.rounds = args[i].parse().context("--rounds")?;
+                } else if name == "--vram-gb" {
+                    f.vram_gb = Some(args[i].parse().context("--vram-gb")?);
                 } else if name == "--drafts" {
                     f.drafts = Some(match args[i].as_str() {
                         "auto" => specrt::serve::DraftTokens::Auto,
@@ -78,6 +81,9 @@ fn load_spec(path: &Path) -> Result<Spec> {
     let mut spec = load_spec_file(path)?;
     if flags().pdl {
         spec.runtime.pdl = true;
+    }
+    if let Some(gb) = flags().vram_gb {
+        spec.runtime.offload.vram_budget = (gb * 1e9) as u64;
     }
     Ok(spec)
 }
@@ -167,6 +173,9 @@ fn main() -> Result<()> {
         return bench_batch(&spec, longest, new_tokens, batch);
     }
     let mut rt = Runtime::load(&spec, longest + new_tokens)?;
+    if let Some(plan) = rt.offload_plan() {
+        println!("offload: {} of {} layers streamed, staging {:.2} GB, per token {:.2} GB over the link", rt.streamed_layers(), plan.layers.len(), rt.staging_bytes() as f64 / 1e9, plan.streamed_bytes_per_token() as f64 / 1e9);
+    }
     println!(
         "{} quant={:?} arch={} jit_cache_hit={} jit_compile={:.2}s jit_load_module={:.2}s load={:.2}s weights={:.2} GB in {:.2}s device={:.2} GB peak_host_rss={:.2} GB",
         spec.name,
@@ -197,6 +206,9 @@ fn main() -> Result<()> {
             all(&|g| prompt_len as f64 / g.prefill_secs),
             all(&|g| (new_tokens - 1) as f64 / g.decode_secs),
         );
+    }
+    if let Some(s) = rt.offload_stats() {
+        println!("  offload stats: {s:?}");
     }
     Ok(())
 }
