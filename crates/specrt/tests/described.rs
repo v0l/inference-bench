@@ -141,3 +141,29 @@ fn nodes_round_trip_through_the_spec_text() {
     let text = toml::to_string(&spec).unwrap();
     assert_eq!(Spec::parse(&text).unwrap(), spec);
 }
+
+fn mtp_spec(nodes: &str) -> Spec {
+    let layout = "[mtp]\nlayers = 1\n\n[mtp.layout]\nlayer = \"mtp.layers.{n}\"\nfc = \"mtp.fc.weight\"\nnorm_embed = \"mtp.pre_fc_norm_embedding.weight\"\nnorm_hidden = \"mtp.pre_fc_norm_hidden.weight\"\nnorm = \"mtp.norm.weight\"\n";
+    spec_with(&format!("{layout}\n{nodes}"))
+}
+
+#[test]
+fn described_attention_combines_with_mtp_and_runs_in_the_draft_layer() {
+    let spec = mtp_spec(NODES);
+    assert!(spec.speculative().is_some());
+    let prefill = Plan::build(&spec, Phase::Prefill, true);
+    assert!(prefill.mtp.contains(&Op::Kernel { node: 1 }) && prefill.mtp.contains(&Op::QkRope), "{:?}", prefill.mtp);
+    assert!(!prefill.mtp.contains(&Op::Flash) && !prefill.mtp.contains(&Op::KvRope), "{:?}", prefill.mtp);
+    let decode = Plan::build(&spec, Phase::Decode, true);
+    assert!(decode.mtp.contains(&Op::DecodeRope) && decode.mtp.contains(&Op::Kernel { node: 3 }), "{:?}", decode.mtp);
+    assert!(!decode.mtp.contains(&Op::DecodeAttention), "{:?}", decode.mtp);
+}
+
+#[test]
+fn stock_mtp_keeps_the_stock_draft_attention() {
+    let spec = mtp_spec("");
+    let prefill = Plan::build(&spec, Phase::Prefill, true);
+    assert!(prefill.mtp.contains(&Op::Flash) && prefill.mtp.contains(&Op::KvRope));
+    let decode = Plan::build(&spec, Phase::Decode, true);
+    assert!(decode.mtp.contains(&Op::DecodeAttention));
+}
