@@ -88,7 +88,7 @@ impl DeviceLayer {
         }
         self.gate_up.walk(w)?;
         self.down.walk(w)?;
-        if self.moe.is_some() {
+        if self.moe.as_ref().is_some_and(|m| !m.is_cached()) {
             anyhow::bail!("offload streams dense layers; a routed layer needs the expert cache");
         }
         Ok(())

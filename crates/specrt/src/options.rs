@@ -173,6 +173,12 @@ fn apply_values(values: &BTreeMap<String, Value>, sparse: &BTreeMap<String, Valu
         if let Some(v) = values.get("serve.max_long_in_flight").and_then(Value::as_u64) {
             opts.max_long_in_flight = v as usize;
         }
+        if let Some(v) = values.get("serve.stall_budget_ms").and_then(Value::as_u64) {
+            opts.stall_budget = Duration::from_millis(v);
+        }
+        if let Some(v) = values.get("serve.min_stall_chunk_tokens").and_then(Value::as_u64) {
+            opts.min_stall_chunk_tokens = v as usize;
+        }
         if let Some(v) = values.get("serve.tp").and_then(Value::as_u64) {
             opts.tp = v as usize;
         }
@@ -292,6 +298,8 @@ const META: &[Meta] = &[
     Meta { key: "serve.admit_lookahead", label: "admission lookahead", group: Group::Serving, help: "Tokens of generation a new request and each running one reserve KV room for before another request is admitted. Fewer preemptions, later admission. 0 reserves the prompt only.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "serve.prefill_burst_tokens", label: "long prompt burst", group: Group::Serving, help: "Prompt tokens read per step while a prompt over 2048 tokens is waiting or being read, even when decoders fill the inter-token target. Long prompts start sooner, running streams wait longer between tokens. 0 leaves long prompts to the guaranteed prefill.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "serve.max_long_in_flight", label: "long prompts at once", group: Group::Serving, help: "Prompts over 2048 tokens read at the same time. More starts long prompts together instead of one after another.", choices: &[], range: (1, 64) },
+    Meta { key: "serve.stall_budget_ms", label: "decoder stall budget", group: Group::Serving, help: "Once a running stream has waited this many milliseconds since its last token, each step reads only the prompt tokens that fit in the budget. Below it prefill uses the full burst. 0 turns it off.", choices: &[], range: (0, 60_000) },
+    Meta { key: "serve.min_stall_chunk_tokens", label: "stall cap floor", group: Group::Serving, help: "Smallest prompt chunk a step reads while the decoder stall cap is active, so the cap never shrinks chunks to where prefill slows down. 0 has no floor.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "speculative.enabled", label: "mtp", group: Group::Mtp, help: "Draft tokens with the model's own MTP head and verify them in one step. Output is unchanged.", choices: &[], range: (0, 0) },
     Meta { key: "speculative.draft_tokens", label: "draft tokens", group: Group::Mtp, help: "Tokens drafted per step. Auto (the default) picks the count per step from measured step time and acceptance.", choices: &[], range: (1, crate::spec::MAX_DRAFT_TOKENS as u64) },
     Meta { key: "speculative.max_batch", label: "mtp batch limit", group: Group::Mtp, help: "Largest batch that still drafts. Auto uses the model spec.", choices: &[], range: (1, 64) },
@@ -345,6 +353,8 @@ const META: &[Meta] = &[
     Meta { key: "runtime.offload.host_budget", label: "host memory cap", group: Group::Offload, help: "Bytes of pinned host memory for streamed layers. 0 means no cap.", choices: &[], range: (0, u64::MAX) },
     Meta { key: "runtime.offload.nvme_path", label: "disk spill folder", group: Group::Offload, help: "Folder on a fast drive for layers that fit neither tier.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.offload.prefetch_depth", label: "prefetch depth", group: Group::Offload, help: "Layers copied ahead of the one computing.", choices: &[], range: (1, 8) },
+    Meta { key: "runtime.offload.expert_slots", label: "expert slots", group: Group::Offload, help: "Experts kept on the card for a mixture of experts model, shared by every layer. Missing experts copy in after the router picks them. 0 sizes the cache from the weight memory cap.", choices: &[], range: (0, 1 << 20) },
+    Meta { key: "runtime.offload.hotlist", label: "expert hotlist", group: Group::Offload, help: "File of expert use counts from a calibration run. The most used experts are loaded first and guide prefetch before the router has history.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.offload.policy", label: "eviction policy", group: Group::Offload, help: "Which resident page leaves first when a tier is full.", choices: &["lru", "frequency"], range: (0, 0) },
     Meta { key: "runtime.loader.host_budget_mb", label: "host budget", group: Group::Loader, help: "Megabytes of host memory the loader may use for staging.", choices: &[], range: (64, 1 << 20) },
 ];
@@ -363,16 +373,18 @@ struct ServeKnobs {
     admit_lookahead: usize,
     prefill_burst_tokens: usize,
     max_long_in_flight: usize,
+    stall_budget_ms: u64,
+    min_stall_chunk_tokens: usize,
     tp: usize,
 }
 
 fn knobs(o: &ServeOptions) -> ServeKnobs {
-    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, step_cost, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, prefill_burst_tokens, max_long_in_flight, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp, grammar_cache: _, solved: _ } = o;
-    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, step_cost: *step_cost, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead, prefill_burst_tokens: *prefill_burst_tokens, max_long_in_flight: *max_long_in_flight, tp: *tp }
+    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, step_cost, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, prefill_burst_tokens, max_long_in_flight, stall_budget, min_stall_chunk_tokens, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp, grammar_cache: _, solved: _ } = o;
+    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, step_cost: *step_cost, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead, prefill_burst_tokens: *prefill_burst_tokens, max_long_in_flight: *max_long_in_flight, stall_budget_ms: stall_budget.as_millis() as u64, min_stall_chunk_tokens: *min_stall_chunk_tokens, tp: *tp }
 }
 
 fn populated_knobs() -> ServeKnobs {
-    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, step_cost: 1.0, whole_prompt_tokens: 1, min_prefill_tokens: 1, swap_space_gb: 1.0, admit_lookahead: 1, prefill_burst_tokens: 1, max_long_in_flight: 1, tp: 1 }
+    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, step_cost: 1.0, whole_prompt_tokens: 1, min_prefill_tokens: 1, swap_space_gb: 1.0, admit_lookahead: 1, prefill_burst_tokens: 1, max_long_in_flight: 1, stall_budget_ms: 1, min_stall_chunk_tokens: 1, tp: 1 }
 }
 
 fn populated_runtime() -> RuntimeOptions {
@@ -399,7 +411,7 @@ fn populated_runtime() -> RuntimeOptions {
         compile_jobs: Some(1),
         prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: 16, max_snapshots: 1, max_blocks: 1, async_snapshots: true },
         loader: LoaderOptions { enabled: true, direct: true, chunk_mb: 1, readers: 1, ahead: 1, workers: 1, lanes: 1, skip_cached: true, pinned: true, host_budget_mb: 64 },
-        offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency },
+        offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency, expert_slots: 3, hotlist: Some("x".into()) },
         vision: crate::spec::VisionOptions { precision: crate::vision_encoder::VisionPrecision::Exact, cache_mb: 1, max_batch: 1, pan_and_scan: false },
         requant: crate::spec::Requant { lin_in: Some(Quant::Bf16), lin_out: Some(Quant::Bf16), qkv: Some(Quant::Bf16), o: Some(Quant::Bf16), mlp_tail: Some(Quant::Bf16), lm_head: Some(Quant::Bf16) },
     }

@@ -1,8 +1,10 @@
 use super::{DeviceLayer, Runtime, cfg};
 use crate::weights::{MoeWeights, Stacked};
 use anyhow::Result;
-use cudarc::driver::{CudaSlice, LaunchConfig};
+use cudarc::driver::{CudaSlice, DevicePtr, LaunchConfig};
 use std::sync::Arc;
+
+pub(super) mod experts;
 
 pub(super) enum StackWeights {
     Bf16(CudaSlice<u16>),
@@ -20,9 +22,15 @@ pub(super) struct DeviceMoe {
     down_bias: CudaSlice<f32>,
     hash_table: CudaSlice<i32>,
     hashed: i32,
-    gate: StackWeights,
-    up: StackWeights,
-    down: StackWeights,
+    stacks: Option<Stacks>,
+    pub(super) host: Option<experts::HostExperts>,
+    index: usize,
+}
+
+pub(super) struct Stacks {
+    pub(super) gate: StackWeights,
+    pub(super) up: StackWeights,
+    pub(super) down: StackWeights,
 }
 
 impl StackWeights {
@@ -64,8 +72,15 @@ impl StackWeights {
 }
 
 impl DeviceMoe {
-    pub(super) fn upload(stream: &Arc<cudarc::driver::CudaStream>, m: &MoeWeights) -> Result<Self> {
+    pub(super) fn upload(stream: &Arc<cudarc::driver::CudaStream>, m: &MoeWeights, index: usize, cached: Option<(&experts::ExpertStore, usize)>) -> Result<Self> {
+        let (stacks, host) = match cached {
+            Some((pool, entries)) => (None, Some(experts::HostExperts::pack(pool, m, entries)?)),
+            None => (Some(Stacks { gate: StackWeights::upload(stream, &m.gate)?, up: StackWeights::upload(stream, &m.up)?, down: StackWeights::upload(stream, &m.down)? }), None),
+        };
         Ok(DeviceMoe {
+            index,
+            stacks,
+            host,
             router: stream.clone_htod(&m.router)?,
             shared_gate: stream.clone_htod(m.shared_gate.as_deref().unwrap_or(&[0.0]))?,
             score_bias: stream.clone_htod(m.score_bias.as_deref().unwrap_or(&[0.0]))?,
@@ -74,18 +89,19 @@ impl DeviceMoe {
             down_bias: stream.clone_htod(m.down_bias.as_deref().unwrap_or(&[0.0]))?,
             hash_table: stream.clone_htod(m.hash_table.as_deref().unwrap_or(&[0]))?,
             hashed: i32::from(m.hash_table.is_some()),
-            gate: StackWeights::upload(stream, &m.gate)?,
-            up: StackWeights::upload(stream, &m.up)?,
-            down: StackWeights::upload(stream, &m.down)?,
         })
     }
 
     pub(super) fn upload_with<'a>(stream: &'a Arc<cudarc::driver::CudaStream>) -> impl Fn(&MoeWeights) -> Result<Self> + 'a {
-        move |m| Self::upload(stream, m)
+        move |m| Self::upload(stream, m, usize::MAX, None)
+    }
+
+    pub(super) fn is_cached(&self) -> bool {
+        self.host.is_some()
     }
 
     pub(super) fn bytes(&self) -> u64 {
-        (self.router.num_bytes() + self.shared_gate.num_bytes() + self.score_bias.num_bytes() + self.router_bias.num_bytes() + self.gate_up_bias.num_bytes() + self.down_bias.num_bytes() + self.hash_table.num_bytes()) as u64 + self.gate.bytes() + self.up.bytes() + self.down.bytes()
+        (self.router.num_bytes() + self.shared_gate.num_bytes() + self.score_bias.num_bytes() + self.router_bias.num_bytes() + self.gate_up_bias.num_bytes() + self.down_bias.num_bytes() + self.hash_table.num_bytes()) as u64 + self.stacks.as_ref().map_or(0, |s| s.gate.bytes() + s.up.bytes() + s.down.bytes())
     }
 }
 
@@ -246,27 +262,83 @@ impl Runtime {
 
     pub(super) fn moe_experts(&self, layer: &DeviceLayer, n: usize) -> Result<()> {
         let w = self.moe_of(layer);
+        match &w.stacks {
+            Some(st) => self.moe_experts_with(w, st, None, n),
+            None => self.moe_experts_cached(w, n),
+        }
+    }
+
+    fn moe_experts_cached(&self, w: &DeviceMoe, n: usize) -> Result<()> {
+        let m = self.spec.moe.as_ref().expect("moe spec");
+        let mb = self.moe.as_ref().expect("moe buffers");
+        let cache = self.expert_cache.as_ref().expect("expert cache");
+        let host = w.host.as_ref().expect("cached layer has host experts");
+        let total = n * m.pairs();
+        let routed = self.stream.clone_dtoh(&mb.idx.slice(..total))?;
+        let mut used: Vec<usize> = routed.iter().filter(|&&e| e >= 0 && (e as usize) < m.local_experts()).map(|&e| e as usize).collect();
+        used.sort_unstable();
+        used.dedup();
+        cache.observe(w.index, &used);
+        let shared_at = m.local_experts() as i32;
+        let has_shared = routed.iter().any(|&e| e >= shared_at);
+        let groups: Vec<&[usize]> = if used.is_empty() { vec![&[][..]] } else { used.chunks(cache.slots).collect() };
+        for (g, group) in groups.iter().enumerate() {
+            let staged = cache.stage(&self.stream, w.index, host, group, g == 0 && has_shared)?;
+            let slot_of: std::collections::HashMap<usize, usize> = staged.mapping.iter().copied().collect();
+            let remapped: Vec<i32> = routed
+                .iter()
+                .map(|&e| {
+                    if e < 0 {
+                        -1
+                    } else if e >= shared_at {
+                        if g == 0 { (cache.slots as i32) + (e - shared_at) } else { -1 }
+                    } else {
+                        slot_of.get(&(e as usize)).map_or(-1, |&s| s as i32)
+                    }
+                })
+                .collect();
+            {
+                let (ptr, _sync) = mb.idx.device_ptr(&self.stream);
+                unsafe { cudarc::driver::result::memcpy_htod_async(ptr, &remapped, self.stream.cu_stream()) }?;
+            }
+            if g == 0
+                && let Some(next) = self.next_cached_layer(w.index)
+            {
+                let predicted = cache.predicted(next.0, m.top_k());
+                cache.prefetch(&self.stream, next.0, next.1, &predicted)?;
+            }
+            self.moe_experts_with(w, &cache.stacks, Some(host.input_globals), n)?;
+            cache.release();
+        }
+        Ok(())
+    }
+
+    fn next_cached_layer(&self, after: usize) -> Option<(usize, &experts::HostExperts)> {
+        self.layers.iter().enumerate().skip(after + 1).find_map(|(i, l)| l.moe.as_ref().and_then(|m| m.host.as_ref()).map(|h| (i, h)))
+    }
+
+    fn moe_experts_with(&self, w: &DeviceMoe, st: &Stacks, igs: Option<[f32; 3]>, n: usize) -> Result<()> {
         let m = self.spec.moe.as_ref().expect("moe spec");
         let mb = self.moe.as_ref().expect("moe buffers");
         let pairs = (n * m.pairs()) as u32;
-        if mb.mma.is_some() && w.gate.mma_ready() && n >= MMA_MIN_TOKENS {
-            return self.moe_grouped_mma(w, mb, n);
+        if mb.mma.is_some() && st.gate.mma_ready() && n >= MMA_MIN_TOKENS {
+            return self.moe_grouped_mma(w, st, igs, mb, n);
         }
-        if mb.mma8.is_some() && matches!(w.gate, StackWeights::Fp8 { .. }) && n >= MMA_MIN_TOKENS {
-            return self.moe_grouped_mma8(w, mb, n);
+        if mb.mma8.is_some() && matches!(st.gate, StackWeights::Fp8 { .. }) && n >= MMA_MIN_TOKENS {
+            return self.moe_grouped_mma8(w, st, mb, n);
         }
-        if mb.mmb.is_some() && matches!(w.gate, StackWeights::Bf16(_)) && n >= MMA_MIN_TOKENS {
-            return self.moe_grouped_mmb(w, mb, n);
+        if mb.mmb.is_some() && matches!(st.gate, StackWeights::Bf16(_)) && n >= MMA_MIN_TOKENS {
+            return self.moe_grouped_mmb(w, st, mb, n);
         }
         if n >= GROUP_MIN_TOKENS {
-            return self.moe_grouped(w, mb, n);
+            return self.moe_grouped(w, st, mb, n);
         }
-        let kind = w.gate.suffix();
+        let kind = st.gate.suffix();
         let up = format!("moe_up_{kind}");
         let down = format!("moe_down_{kind}");
         let mut b = self.launcher(self.kernel(&up));
-        self.stack_args(&mut b, &w.gate);
-        self.stack_args(&mut b, &w.up);
+        self.stack_args(&mut b, &st.gate);
+        self.stack_args(&mut b, &st.up);
         b.arg(&w.gate_up_bias).arg(self.expert_inputs(mb, n).0).arg(&mb.idx).arg(&mb.act);
         let config = LaunchConfig {
             grid_dim: (pairs, m.expert_intermediate.div_ceil(ROWS_PER_BLOCK) as u32, 1),
@@ -275,7 +347,7 @@ impl Runtime {
         };
         unsafe { b.launch(config) }?;
         let mut b = self.launcher(self.kernel(&down));
-        self.stack_args(&mut b, &w.down);
+        self.stack_args(&mut b, &st.down);
         b.arg(&w.down_bias).arg(&mb.act).arg(&mb.idx).arg(&mb.out);
         let config = LaunchConfig {
             grid_dim: (pairs, self.spec.dims.hidden.div_ceil(ROWS_PER_BLOCK) as u32, 1),
@@ -295,17 +367,20 @@ impl Runtime {
         Ok(())
     }
 
-    fn moe_grouped_mma(&self, w: &DeviceMoe, mb: &MoeBuffers, n: usize) -> Result<()> {
+    fn moe_grouped_mma(&self, w: &DeviceMoe, st: &Stacks, igs: Option<[f32; 3]>, mb: &MoeBuffers, n: usize) -> Result<()> {
         use crate::codegen::{MOE_MMA_BM, MOE_MMA_BM_SMALL, MOE_MMA_BN, moe_mma_smem};
         let m = self.spec.moe.as_ref().expect("moe spec");
         let mma = mb.mma.as_ref().expect("mma buffers");
-        let block = matches!(w.gate, StackWeights::Block { .. });
-        let (gw, gs, gg, gi, uw, us, ug, ui, dw, ds, dg, di) = match (&w.gate, &w.up, &w.down) {
+        let block = matches!(st.gate, StackWeights::Block { .. });
+        let (gw, gs, gg, gi, uw, us, ug, ui, dw, ds, dg, di) = match (&st.gate, &st.up, &st.down) {
             (
                 StackWeights::Fp4 { packed: gw, scales: gs, inv_global: gg, input_global: gi },
                 StackWeights::Fp4 { packed: uw, scales: us, inv_global: ug, input_global: ui },
                 StackWeights::Fp4 { packed: dw, scales: ds, inv_global: dg, input_global: di },
-            ) => (gw, gs, gg, *gi, uw, us, ug, *ui, dw, ds, dg, *di),
+            ) => {
+                let [ig, iu, id] = igs.unwrap_or([*gi, *ui, *di]);
+                (gw, gs, gg, ig, uw, us, ug, iu, dw, ds, dg, id)
+            }
             (StackWeights::Block { packed: gw, scales: gs }, StackWeights::Block { packed: uw, scales: us }, StackWeights::Block { packed: dw, scales: ds }) => {
                 (gw, gs, &self.buf.dummy, 1.0, uw, us, &self.buf.dummy, 1.0, dw, ds, &self.buf.dummy, 1.0)
             }
@@ -372,11 +447,11 @@ impl Runtime {
         Ok(())
     }
 
-    fn moe_grouped_mmb(&self, w: &DeviceMoe, mb: &MoeBuffers, n: usize) -> Result<()> {
+    fn moe_grouped_mmb(&self, w: &DeviceMoe, st: &Stacks, mb: &MoeBuffers, n: usize) -> Result<()> {
         use crate::codegen::{MOE_MMA_BM, MOE_MMA_BM_SMALL, MOE_MMA_BN, moe_mma_bf16_smem};
         let m = self.spec.moe.as_ref().expect("moe spec");
         let mma = mb.mmb.as_ref().expect("bf16 mma buffers");
-        let (StackWeights::Bf16(gw), StackWeights::Bf16(uw), StackWeights::Bf16(dw)) = (&w.gate, &w.up, &w.down) else {
+        let (StackWeights::Bf16(gw), StackWeights::Bf16(uw), StackWeights::Bf16(dw)) = (&st.gate, &st.up, &st.down) else {
             unreachable!("the bf16 mma path needs bf16 experts")
         };
         let (h, inter) = (self.spec.dims.hidden, m.expert_intermediate);
@@ -415,11 +490,11 @@ impl Runtime {
         Ok(())
     }
 
-    fn moe_grouped_mma8(&self, w: &DeviceMoe, mb: &MoeBuffers, n: usize) -> Result<()> {
+    fn moe_grouped_mma8(&self, _w: &DeviceMoe, st: &Stacks, mb: &MoeBuffers, n: usize) -> Result<()> {
         use crate::codegen::{FP8_BLOCK, MOE_MMA_BM, MOE_MMA_BM_SMALL, MOE_MMA_BN, moe_mma8_smem};
         let m = self.spec.moe.as_ref().expect("moe spec");
         let mma = mb.mma8.as_ref().expect("fp8 mma buffers");
-        let (StackWeights::Fp8 { values: gw, grid: gg }, StackWeights::Fp8 { values: uw, grid: ug }, StackWeights::Fp8 { values: dw, grid: dg }) = (&w.gate, &w.up, &w.down) else {
+        let (StackWeights::Fp8 { values: gw, grid: gg }, StackWeights::Fp8 { values: uw, grid: ug }, StackWeights::Fp8 { values: dw, grid: dg }) = (&st.gate, &st.up, &st.down) else {
             unreachable!("the fp8 mma path needs FP8 experts")
         };
         let (h, inter) = (self.spec.dims.hidden, m.expert_intermediate);
@@ -457,18 +532,18 @@ impl Runtime {
         Ok(())
     }
 
-    fn moe_grouped(&self, w: &DeviceMoe, mb: &MoeBuffers, n: usize) -> Result<()> {
+    fn moe_grouped(&self, w: &DeviceMoe, st: &Stacks, mb: &MoeBuffers, n: usize) -> Result<()> {
         let m = self.spec.moe.as_ref().expect("moe spec");
         let slots = (m.local_experts() + m.shared_slots()) as u32;
         let count = (n * m.pairs()) as i32;
         let mut b = self.launcher(self.kernel("moe_permute"));
         b.arg(&mb.idx).arg(&mb.offsets).arg(&mb.sorted).arg(&count);
         unsafe { b.launch(cfg(1, 1024)) }?;
-        let kind = w.gate.suffix();
+        let kind = st.gate.suffix();
         let (up, down) = (format!("moe_group_up_{kind}"), format!("moe_group_down_{kind}"));
         let mut b = self.launcher(self.kernel(&up));
-        self.stack_args(&mut b, &w.gate);
-        self.stack_args(&mut b, &w.up);
+        self.stack_args(&mut b, &st.gate);
+        self.stack_args(&mut b, &st.up);
         b.arg(&w.gate_up_bias).arg(self.expert_inputs(mb, n).0).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.act);
         let config = LaunchConfig {
             grid_dim: (slots, m.expert_intermediate.div_ceil(ROWS_PER_BLOCK) as u32, 1),
@@ -477,7 +552,7 @@ impl Runtime {
         };
         unsafe { b.launch(config) }?;
         let mut b = self.launcher(self.kernel(&down));
-        self.stack_args(&mut b, &w.down);
+        self.stack_args(&mut b, &st.down);
         b.arg(&w.down_bias).arg(&mb.act).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.out);
         let config = LaunchConfig {
             grid_dim: (slots, self.spec.dims.hidden.div_ceil(ROWS_PER_BLOCK) as u32, 1),

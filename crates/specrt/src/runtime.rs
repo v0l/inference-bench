@@ -95,8 +95,16 @@ struct Weights {
     direct: bool,
 }
 
-fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize, global: usize) -> Result<DeviceLayer> {
+fn expert_cache_mode(spec: &Spec) -> bool {
+    spec.runtime.offload.enabled() && spec.moe.is_some()
+}
+
+fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &moe::experts::ExpertStore, i: usize, global: usize) -> Result<DeviceLayer> {
     let l = ck.layer_at(spec, i, global).with_context(|| format!("layer {global}"))?;
+    let cached = match &spec.moe {
+        Some(m) if expert_cache_mode(spec) && l.moe.is_some() => Some((store, m.local_experts() + m.shared_slots())),
+        _ => None,
+    };
     let up_m = |m: &Matrix| DeviceMatrix::upload(stream, m);
     let up_opt = |v: &Option<Vec<f32>>| -> Result<Option<CudaSlice<f32>>> {
         Ok(match v {
@@ -136,7 +144,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m)).transpose()? };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()? };
     copied(stream)?;
     Ok(layer)
 }
@@ -144,6 +152,9 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, i: usize
 impl Drop for Runtime {
     fn drop(&mut self) {
         let _ = self.stream.synchronize();
+        if let Some(c) = self.expert_cache.take() {
+            c.detach(&self.stream);
+        }
         if let Some(s) = self.streamer.take() {
             s.detach(&mut self.layers, &self.stream);
         }
@@ -216,7 +227,7 @@ fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: Sta
     Ok(up)
 }
 
-fn upload_group(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole, work: Work) -> Result<Uploaded> {
+fn upload_group(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &moe::experts::ExpertStore, range: StageRange, role: StageRole, work: Work) -> Result<Uploaded> {
     match work {
         Work::Head => upload_head(stream, ck, spec, role),
         Work::Embed => {
@@ -229,7 +240,7 @@ fn upload_group(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, range: S
             copied(stream)?;
             Ok(Uploaded::Mtp(m))
         }
-        Work::Layer(i) => Ok(Uploaded::Layer(i, upload_layer(stream, ck, spec, i, range.start + i)?)),
+        Work::Layer(i) => Ok(Uploaded::Layer(i, upload_layer(stream, ck, spec, store, i, range.start + i)?)),
     }
 }
 
@@ -241,6 +252,7 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
     let count = groups.len();
     let names = groups.clone();
     let budget = crate::loader::Budget::new(opts.host_budget_bytes());
+    let store = &moe::experts::ExpertStore::new(ctx.clone(), spec.runtime.offload.host_budget, spec.runtime.offload.nvme_path.as_deref());
     let feed = Mutex::new(Feed::new(ck, groups, opts, ctx, budget.clone())?);
     let direct = feed.lock().unwrap().direct();
     let reader = feed.lock().unwrap().reader();
@@ -274,7 +286,7 @@ fn load_weights(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, ck: &Checkpoin
                         };
                         let outcome = claimed.and_then(|(g, batch)| {
                             let view = ck.with_staged(batch);
-                            let up = upload_group(ws, &view, spec, range, role, work[g])?;
+                            let up = upload_group(ws, &view, spec, store, range, role, work[g])?;
                             if !view.has_staged() {
                                 view.release_names(&names[g]);
                             }
@@ -812,6 +824,7 @@ pub struct Runtime {
     snap: snapshot::SnapshotPool,
     host: crate::hostpool::HostPool,
     streamer: Option<stream::Streamer>,
+    expert_cache: Option<moe::experts::ExpertCache>,
     offload_plan: Option<crate::offload::OffloadPlan>,
     mm_meta: CudaSlice<i32>,
     mm_table: CudaSlice<i32>,
@@ -918,9 +931,15 @@ pub struct Warmup {
     pub cache_dir: std::path::PathBuf,
 }
 
+pub fn warmup_spec(spec: &Spec) -> Result<Spec> {
+    let mut resolved = spec.clone();
+    crate::engine::complete_spec(&mut resolved)?;
+    crate::engine::apply_rope_extension(&resolved)
+}
+
 pub fn warmup(spec: &Spec, max_ctx: usize, slots: usize) -> Result<Warmup> {
     ensure!(slots >= 1, "need at least one slot");
-    let resolved = crate::engine::apply_rope_extension(spec)?;
+    let resolved = warmup_spec(spec)?;
     let layout = Layout::serving(&resolved, max_ctx, slots, None);
     let layout = if resolved.runtime.kv_dtype.is_fp8() { Layout { kv_planes: 1, ..layout } } else { layout };
     let cache_dir = resolved.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
@@ -1247,6 +1266,7 @@ impl Runtime {
             snap: Default::default(),
             host: crate::hostpool::HostPool::new(ctx.clone()),
             streamer,
+            expert_cache: None,
             offload_plan,
             mm_meta,
             mm_table,
@@ -1257,6 +1277,7 @@ impl Runtime {
         if let Some(w) = mtp_weights {
             rt.mtp = Some(mtp::MtpState::new(&rt, w)?);
         }
+        rt.build_expert_cache(weight_bytes)?;
         let hosts_vision = role.first && tp.is_none_or(|(_, rank, _)| rank == 0);
         if let Some(v) = spec.vision.as_ref().filter(|_| hosts_vision)
             && crate::vision_encoder::has_tower(&checkpoint, &v.config) {
@@ -1354,7 +1375,58 @@ impl Runtime {
     }
 
     pub fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
-        self.streamer.as_ref().map(|s| s.stats())
+        let s = self.streamer.as_ref().map(|s| s.stats());
+        let e = self.expert_cache.as_ref().map(|c| c.stats());
+        match (s, e) {
+            (Some(a), Some(b)) => Some(crate::offload::OffloadStats {
+                vram_hits: a.vram_hits + b.vram_hits,
+                host_hits: a.host_hits + b.host_hits,
+                nvme_reads: a.nvme_reads + b.nvme_reads,
+                nvme_read_bytes: a.nvme_read_bytes + b.nvme_read_bytes,
+                host_to_vram_bytes: a.host_to_vram_bytes + b.host_to_vram_bytes,
+                evictions: a.evictions + b.evictions,
+            }),
+            (a, b) => a.or(b),
+        }
+    }
+
+    pub fn expert_slots(&self) -> usize {
+        self.expert_cache.as_ref().map_or(0, |c| c.slots)
+    }
+
+    pub fn expert_hotlist(&self) -> Option<crate::offload::ExpertHotlist> {
+        self.expert_cache.as_ref().map(|c| c.hotlist())
+    }
+
+    pub fn save_expert_hotlist(&self, path: &std::path::Path) -> Result<()> {
+        let h = self.expert_hotlist().context("no expert cache is active")?;
+        h.save(path)
+    }
+
+    fn build_expert_cache(&mut self, weight_bytes: u64) -> Result<()> {
+        let Some(m) = self.spec.moe.as_ref().filter(|_| expert_cache_mode(&self.spec)) else { return Ok(()) };
+        let Some(like) = self.layers.iter().find_map(|l| l.moe.as_ref().and_then(|x| x.host.as_ref())) else { return Ok(()) };
+        let off = &self.spec.runtime.offload;
+        let (local, shared, top_k) = (m.local_experts(), m.shared_slots(), m.top_k());
+        let entry = (like.entry_bytes() / (local + shared).max(1)).max(1) as u64;
+        let slots = if off.expert_slots > 0 {
+            off.expert_slots
+        } else {
+            let resident = weight_bytes.saturating_sub(self.layers.iter().filter_map(|l| l.moe.as_ref()).filter_map(|x| x.host.as_ref()).map(|h| h.host_bytes()).sum::<u64>());
+            let room = off.vram_budget.saturating_sub(resident + self.staging_bytes());
+            (room / entry).min(usize::MAX as u64 / 2) as usize
+        };
+        let slots = slots.clamp(top_k.min(local), local);
+        let prior = match &off.hotlist {
+            Some(p) if std::path::Path::new(p).exists() => Some(crate::offload::ExpertHotlist::load(std::path::Path::new(p))?),
+            _ => None,
+        };
+        let cache = moe::experts::ExpertCache::new(&self.stream, like, self.layers.len(), slots, local, shared, off.policy, prior)?;
+        let hosts: Vec<(usize, &moe::experts::HostExperts)> = self.layers.iter().enumerate().filter_map(|(i, l)| l.moe.as_ref().and_then(|x| x.host.as_ref()).map(|h| (i, h))).collect();
+        cache.warm(&self.stream, &hosts)?;
+        self.expert_cache = Some(cache);
+        self.stream.synchronize()?;
+        Ok(())
     }
 
     pub fn offload_plan(&self) -> Option<&crate::offload::OffloadPlan> {

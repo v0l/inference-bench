@@ -346,3 +346,33 @@ The other side, #603's long-prompt mix (`--requests 40 --rate 1 --clients 8 --mi
 Rule: smallest burst with long TTFT p50 within 25% of the burst-16384 value (4.25 s) and stall decoder p99 under 0.5 s. Bursts 4096 and 2048 keep TTFT (3.8 s, +12%) but the stall stays at 1.33 s, since one 2048-token step already costs that long at the 29k prompt's attention depth. Bursts 1024 and 0 cut the stall to 0.74 s and 0.42 s but lose the #603 win (TTFT p50 +90% and +165%, p99 116 s at 0). Only burst 0 is under 0.5 s on the stall, and it fails the TTFT bound; no burst satisfies both, so the default is unchanged. Giving up the stall is the cheaper side: burst 0 returns the 24.9 s class TTFT that #603 removed.
 
 For interactive chat beside long prompts use the latency profile, `--prefill-burst-tokens 384 --min-prefill-tokens 256 --whole-prompt-tokens 256` (same names as server.toml keys and in the load dialog serving options): decoder itl p99 0.35 s, 29k prefill 26 s. `--prefill-burst-tokens 0` alone is the middle point (0.42 s, 23 s with min 512 and whole 1024) but loses the #603 long-mix TTFT.
+
+### Decode-aware stall cap (#1007, 22 Nov 2026)
+
+`serve.stall_budget_ms` (`--stall-budget-ms`, server.toml `stall_budget_ms`, default 0 = off). Each step the longest-waiting decoder's time since its last token is measured; the prefill in that step is capped at `(budget - waited - decode step) * measured prefill rate`, rounded to 64 tokens, at least 64. A step that fits the budget carries the full burst; with no decoder running nothing is capped.
+
+GPU1, 27B, 3 rounds per arm, arms alternated. Stall: `serve27b.sh ONLY=stall` (FP8 exact spec, 7 decoders of 700 tokens, one 29k prompt). Long mix and chat control: #603's shapes (NVFP4, fp8 KV, MTP, 26 seqs, 22.5 GB KV, burst 16384, long 4), with batch-8 decode (48 x 512 in, 256 out). Scripts: `crates/specrt/scripts/stall1007.sh`, `mixrounds1007.sh`.
+
+| stall_budget_ms | stall itl p99 | itl max | 29k prefill | long TTFT p50 | long TTFT p99 | chat itl p95 | batch-8 tok/s |
+|---|---|---|---|---|---|---|---|
+| 0 (A/A control) | 1.30 / 1.31 / 1.31 s | 1.38 s | 18.8 / 19.0 / 19.0 s | 3.56 / 3.56 / 3.56 s | 22.7 / 22.4 / 22.9 s | 0.148 / 0.146 / 0.147 s | 471 / 467 / 469 |
+| 400 | 0.33 / 0.25 / 0.25 s | 0.34-0.38 s | 27.8 / 29.0 / 29.0 s | 7.57 / 7.44 / 7.88 s | 31.1 / 31.3 / 31.1 s | 0.147 / 0.147 / 0.147 s | 468 / 469 / 471 |
+| 800 | 0.51 / 0.51 / 0.49 s | 0.57-0.59 s | 22.6 / 22.6 / 22.8 s | 5.36 / 4.51 / 4.44 s | 25.4 / 25.3 / 25.6 s | 0.148 / 0.148 / 0.147 s | 466 / 464 / 470 |
+
+Bars: stall p99 under 0.5 s, long TTFT p50 at most 4.25 s, long TTFT p99 at most 25 s, chat unchanged. Budget 400 meets the stall bar and the chat control but costs the long mix (TTFT p50 +110%, p99 +38%, 29k prefill +50%). Budget 800 misses all but chat. Batch-8 decode and chat are unchanged within noise at every budget. No tested budget meets both the stall and the long-mix bars, the same conflict #989 found with fixed bursts: capping a step to the budget shrinks chunks, and the prefill rate falls with small chunks. The default stays 0. Setting 400 gives the stall bound (0.25 to 0.33 s) for interactive use at the price above.
+
+#### Floor on the capped chunk (`serve.min_stall_chunk_tokens`)
+
+The cap never goes below the floor. Same rig, 3 rounds, budget 0 as the control (run in the same sessions; its mix row is 3.74-3.76 s p50, 22.7-22.9 s p99 on this master).
+
+| budget / floor | stall itl p99 | itl max | 29k prefill | long TTFT p50 | long TTFT p99 | chat itl p95 | batch-8 tok/s |
+|---|---|---|---|---|---|---|---|
+| 0 / 0 (control) | 1.30-1.31 s | 1.39 s | 18.8-18.9 s | 3.74-3.76 s | 22.7-22.9 s | 0.150 s | 514 |
+| 400 / 256 | 0.25 s | 0.38 s | 23.5-23.9 s | not run | not run | | |
+| 400 / 512 | 0.41 s | 0.52 s | 22.4-22.5 s | 7.64-8.25 s | 31.7-33.5 s | 0.150 s | 510 |
+| 400 / 1024 | 0.73-0.74 s | 0.76 s | 20.3-20.5 s | 7.89-8.00 s | 29.7-29.8 s | 0.150 s | 512 |
+| 400 / 2048 | 1.31 s | 1.39 s | 18.9-19.0 s | not run | not run | | |
+| 600 / 1024 | 0.74 s | 0.76 s | 20.5 s | not run | not run | | |
+| 600 / 2048 | 1.31 s | 1.39 s | 19.0 s | not run | not run | | |
+
+The stall p99 tracks the floor, not the budget: a step of N tokens stalls decoders for about N / 1,490 s, so a floor of 2048 or more is the same as no cap (1.31 s) and a floor of 1024 gives 0.74 s. Only floors of 512 or less get under 0.5 s, and at 512 the long-mix TTFT p50 is 7.6 to 8.3 s and p99 31.7 to 33.5 s, the same as floor 1024 (7.9 s, 29.7 s): the long-mix loss is not the chunk size falling, it is any cap at all while decoders are running, because eight long prompts all run beside decoders that keep hitting the budget. Floors 256, 2048 and the 600 budget were not run through the long mix because their stall rows already fail the stall bar (2048, 600/1024) or follow the 400/512 result (256 is a smaller chunk than 512, so TTFT can only be worse). No (budget, floor) passes both bars, so the default stays 0 (off). Budget 200 was not run: with any floor the stall p99 is set by the floor.

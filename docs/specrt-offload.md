@@ -9,7 +9,8 @@
 | Dense layer streaming on a second CUDA stream: layers over `vram_budget` live in pinned host memory and copy into a ring of `prefetch_depth + 1` shared VRAM slots, one layer ahead of compute (`runtime/stream.rs`) | done, bit identical on GPU |
 | `inference_offload_hit_ratio`, `inference_offload_read_bytes_total` on `/metrics` | done, rendered when a model streams |
 | NVMe tier on the GPU path | planner knows it; the loader refuses a budget that needs it |
-| MoE expert cache, CPU compute tier, Models page readout | separate issues |
+| MoE expert cache: expert pages (layer, expert) in pinned host memory, a shared pool of VRAM slots, missing experts copied after the router picks them, router output of the previous token as prefetch for the next MoE layer, `ExpertHotlist` counts saved to a file and loaded through `[runtime.offload] hotlist` | done, bit identical on the tiny MoE fixtures (bf16 and FP8) |
+| CPU compute tier, Models page readout | separate issues |
 
 Settings (all in the spec or server config, no env vars):
 
@@ -69,6 +70,23 @@ From NVMe at 10 GB/s the same table divides by 5.8. Lower bits stream faster in 
 - Staging slots are reused round robin. A layer waits on an event recorded when its copy finishes; a slot is refilled only after an event recorded when the layer that last used it finished.
 - Pinned buffers come from `hostpool::HostPool`, the pool KV swap and session snapshots use.
 - The tiered store in `offload.rs` is the bookkeeping that the MoE expert cache will drive (pages keyed by layer and expert).
+
+## Expert cache (MoE)
+
+With `vram_budget > 0` on a MoE model the routed experts of every layer live in pinned host memory and the kernels read them from a slot pool through the router's index buffer (the index is remapped to slots after routing, so the kernels are unchanged). `expert_slots` sets the pool size (0 derives it from `vram_budget`); `hotlist` names a JSON file of use counts (`Runtime::save_expert_hotlist` writes it after a calibration run) whose hottest experts fill the pool at load and guide prefetch until the router has history. Prefill with more distinct experts than slots runs in groups. Not run yet: GLM-4.5-Air real weights (not downloaded here; the tiny GLM-4 MoE fixture with shared experts is bit identical with the cache).
+
+NVMe tier: `host_budget` caps the pinned host memory for expert pages. A layer whose pages do not fit is written to a page file under `nvme_path` (removed on drop) and each missing expert is read from it with `pread` into a pinned staging buffer and copied to its slot. Full Qwen3.5-122B NVFP4 on GPU 1 (`bench --vram-gb 90 --expert-slots 4500 --host-gb 4 --nvme-path ~/ib-nvme1025 512 128`): loads and runs with 13 GB host RSS, 20.5 GB device, 2.4 tok/s decode, 39.8 tok/s prefill, hit ratio 0.47 (reads are synchronous and one expert at a time, so far under the 10 GB/s NVMe rate; grouped file-order reads are still open). The 8 layer cut through the NVMe path gives the same first 64 tokens as resident. `tests/offload.rs` has `expert_pages_on_nvme_are_bit_identical` and `expert_cache_with_glm4_moe_experts_is_bit_identical`.
+
+Qwen3.5-122B NVFP4 (Sehyo, 76 GB) on GPU 1, first 8 of 48 layers (`bench --layers 8`, every MoE layer kept, the full model was not run), 512 token prompt, 128 new tokens, batch 1, 3 alternating rounds of 2 runs each, greedy. Cache is 256 slots shared by all 8 layers (2048 experts, 12.5%), `bench --vram-gb 90 --expert-slots 256`.
+
+| Mode | Decode tok/s (3 rounds) | Prefill tok/s | Device memory | Cache hit ratio | Host to VRAM |
+| --- | --- | --- | --- | --- | --- |
+| resident | 368.6, 368.5, 368.6 | 27.6k | 22.75 GB | n/a | 0 |
+| 256 expert slots | 154.1, 154.8, 154.5 | 2.1k | 13.20 GB | 0.659 | 77.3 GB over the whole bench (prefill, warm up, 2 runs) |
+
+The first 64 greedy tokens are identical to resident in all three rounds. Missing experts cost about 5.3 MB each (gate, up, down plus scales), so 64 routed experts per token with a 34% miss rate is about 0.12 GB per token and a link ceiling of about 480 tok/s at 57.8 GB/s; the measured 154 tok/s is far below it because loads are issued after the router and the compute stream waits for them (only the next layer's predicted experts overlap). Closing that gap is the follow-up (issue filed). Prefill is slow for the same reason: 512 distinct tokens touch nearly every expert in every layer.
+
+Hotlist: a calibration run saved by `--save-hotlist` and loaded by `--hotlist` (or found as `<spec>.hotlist`) changed misses over a 16 token run from 4160 to 4104 on the real model (the hottest 256 of 2048 experts only cover so much), and on the tiny fixture the first decode token has zero misses with the hotlist against 6 or more cold (`tests/offload.rs`).
 
 ## Tests
 
