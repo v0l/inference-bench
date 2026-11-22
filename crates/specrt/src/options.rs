@@ -394,6 +394,7 @@ fn populated_runtime() -> RuntimeOptions {
         loader: LoaderOptions { enabled: true, direct: true, chunk_mb: 1, readers: 1, ahead: 1, workers: 1, lanes: 1, skip_cached: true, pinned: true, host_budget_mb: 64 },
         offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency },
         vision: crate::spec::VisionOptions { precision: crate::vision_encoder::VisionPrecision::Exact, cache_mb: 1, max_batch: 1, pan_and_scan: false },
+        requant: crate::spec::Requant { lin_in: Some(Quant::Bf16), lin_out: Some(Quant::Bf16), qkv: Some(Quant::Bf16), o: Some(Quant::Bf16), mlp_tail: Some(Quant::Bf16), lm_head: Some(Quant::Bf16) },
     }
 }
 
