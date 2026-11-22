@@ -282,6 +282,38 @@ population is inside it. The video gate therefore stays at KL 0.09 and top-1 85%
 open for the remaining 0.01 to 0.06 on video. The text-only controls, the prompt logprob files and the position references are written by
 `vllm_vision.py` and `vision_positions.py` (see below).
 
+## Per layer comparison against transformers (#496)
+
+Same ids, same embeddings, same M-RoPE positions (transformers' `get_rope_index`), 27B FP8 spec. Ours:
+`real_27b_dump_layer_states` (`SPECRT_LAYER_DUMP=/tmp/x`, writes the residual stream after each layer).
+Transformers: `scripts/vision_layers.py <snapshot> /tmp/x video image` (bf16 text model loaded straight to
+the GPU, FP8 weights dequantised, one process after the other). Relative rms of the difference per layer,
+for all tokens (media-only and text-only columns in the script output):
+
+| layer | video (284 tok) | image (160 tok) | video, bf16 noise 0.5% on the embeddings, transformers vs itself |
+|---|---|---|---|
+| 0 | 0.0053 | 0.0047 | 0.0086 |
+| 10 | 0.0072 | 0.0069 | |
+| 20 | 0.0103 | 0.0104 | 0.0087 |
+| 35 | 0.0184 | 0.0131 | 0.0200 |
+| 41 | 0.0372 | 0.0223 | 0.0772 |
+| 42 | 0.0619 | 0.0604 | 0.1036 |
+| 54 | 0.166 | 0.056 | 0.215 |
+| 63 | 0.253 | 0.063 | 0.198 |
+
+An M-RoPE or layout error would show as a jump in the first layers. There is none: layer 0 is 0.005 for
+both, the same as the bf16 rounding of the embeddings. The error grows smoothly with depth for both
+media, then both jump at layer 42 (0.02 to 0.06), where a few channels reach activations of 50 to
+500 (max abs in the dump column). That is the massive-activation layer, where a bf16 rounding difference
+in the residual is amplified for every input. Image and video are the same up to layer 41; video then
+grows from 0.06 to 0.25 while image stays flat at 0.06. Perturbing the embeddings of the same video
+by 0.5% noise and running transformers against itself reproduces the video curve (0.10 at layer 42, 0.2
+at 54 to 63), and the same noise on the image reaches 0.27 at layer 54 and 0.16 at 63, more than our own
+image difference. So both prompts amplify small input differences strongly in layers 42 to 63; the
+video drift is bf16 rounding sensitivity, not a position or layout bug, and the image's flat 0.06 is a
+softer draw of the same effect. Nothing here points
+at a fixable cause, so the video gate (KL 0.09, top-1 85%) stays.
+
 ## Running the tests
 
 Non-27B suite (the 27B tests are all named `real_27b_*`, including every test in `tests/vision_lm.rs`):
