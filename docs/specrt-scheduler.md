@@ -312,3 +312,37 @@ stall max), and the vLLM comparison of the same `loadtest` mix (#307).
 No setting cuts prefill 2x, so none qualifies and the default stays 3. With the defaults (`prefill_burst_tokens` 16384, `min_prefill_tokens` 512, `whole_prompt_tokens` 1024) the long prompt already reads at the alone rate (1,490 tok/s) whatever the rule says, so the 220 tok/s in the issue is gone; the 1.3 s decoder stall is unchanged by `step_cost`. With those three off the rule alone decides, and step_cost 2 gives the lowest inter-token p99 at the same prefill time. This is not a `bench --ab` result: that tool times single-process decode, not a served stall.
 
 First-step fix: before any decode step is measured, `decoders_run_every_step_while_a_long_prompt_prefills_in_chunks` saw `decode_rows: 0` with a 1024-token prefill under the new default; the prefill rate is now measured net of decode time and that test sets `step_cost: 0.0` to pin the max-batched-tokens path, while the new tests pin the relative rule.
+
+### Long-prompt stall defaults (#989, 22 Nov 2026)
+
+Same `serve27b.sh ONLY=stall` run on GPU1 (7 decoders of 700 tokens, one 29k prompt, 8 slots, 3 GB KV, `--max-batched-tokens 2048`). Burst, min and whole are `prefill_burst_tokens`, `min_prefill_tokens`, `whole_prompt_tokens`. The 29k prefill column is the long request's time to first token.
+
+| burst / min / whole | 29k prefill | decoder itl p99 | itl max |
+|---|---|---|---|
+| 16384 / 512 / 1024 (default) | 19.3 s | 1.33 s | 1.41 s |
+| 0 / 512 / 1024 | 22.9 s | 0.42 s | 0.77 s |
+| 0 / 1024 / 1024 | 20.9 s | 0.76 s | 0.95 s |
+| 768 / 512 / 1024 | 21.8 s | 0.59 s | 0.77 s |
+| 640 / 256 / 1024 | 22.7 s | 0.51 s | 0.66 s |
+| 512 / 256 / 1024 | 23.3 s | 0.42 s | 0.77 s |
+| 512 / 256 / 256 | 23.8 s | 0.42 s | 0.43 s |
+| 512 / 0 / 0 | 26.3 s | 0.43 s | 0.44 s |
+| 448 / 256 / 256 | 25.8 s | 0.40 s | 0.41 s |
+| 384 / 256 / 256 | 26.2 s | 0.35 s | 0.36 s |
+| 0 / 256 / 1024 | 27.4 s | 0.27 s | 0.28 s |
+
+The burst causes the step: with the default a step carries up to 16384 prompt tokens, about 1.3 s at 1,490 tok/s, and every decoder waits for it. A step of N prompt tokens stalls decoders for about N / 1,490 s plus the decode, so p99 under 400 ms needs bursts of about 450 tokens or fewer, and those cost 25 s to 26 s of prefill (30% to 35% over the alone rate). No tested setting has p99 under 400 ms with prefill within 15% of 19.3 s (22.2 s): the two targets conflict on this model, because the prefill rate falls once chunks are small. The default therefore stays at burst 16384 (fastest long prefill, right for batch and agent workloads).
+
+The other side, #603's long-prompt mix (`--requests 40 --rate 1 --clients 8 --mix 1:15000-18000 --output 256-512`, 26 seqs, 22.5 GB KV, fp8 KV, MTP, `--max-batched-tokens 16384`, `--max-long-in-flight 4`, GPU1), against the stall workload above with only the burst changed (min 512, whole 1024). The stall workload runs with `--max-batched-tokens 2048`, so bursts of 2048 and more are the same there.
+
+| burst | long TTFT p50 | long TTFT p99 | long ITL p95 | long ITL max | stall decoder itl p99 | stall 29k prefill | chat control ITL p95 |
+|---|---|---|---|---|---|---|---|
+| 16384 (default) | 3.40 s | 21.1 s | 0.044 s | 2.97 s | 1.33 s | 19.3 s | 0.146 s |
+| 4096 | 3.80 s | 21.9 s | 0.72 s | 0.82 s | 1.33 s (not run; `--max-batched-tokens 2048` caps the step, same as 2048) | 19.3 s | 0.144 s |
+| 2048 | 3.86 s | 23.4 s | 0.41 s | 0.48 s | 1.33 s | 19.2 s | 0.143 s |
+| 1024 | 6.45 s | 28.6 s | 0.27 s | 0.80 s | 0.74 s | 20.7 s | 0.143 s |
+| 0 | 9.02 s | 116.6 s | 0.16 s | 0.28 s | 0.42 s | 22.9 s | 0.143 s |
+
+Rule: smallest burst with long TTFT p50 within 25% of the burst-16384 value (4.25 s) and stall decoder p99 under 0.5 s. Bursts 4096 and 2048 keep TTFT (3.8 s, +12%) but the stall stays at 1.33 s, since one 2048-token step already costs that long at the 29k prompt's attention depth. Bursts 1024 and 0 cut the stall to 0.74 s and 0.42 s but lose the #603 win (TTFT p50 +90% and +165%, p99 116 s at 0). Only burst 0 is under 0.5 s on the stall, and it fails the TTFT bound; no burst satisfies both, so the default is unchanged. Giving up the stall is the cheaper side: burst 0 returns the 24.9 s class TTFT that #603 removed.
+
+For interactive chat beside long prompts use the latency profile, `--prefill-burst-tokens 384 --min-prefill-tokens 256 --whole-prompt-tokens 256` (same names as server.toml keys and in the load dialog serving options): decoder itl p99 0.35 s, 29k prefill 26 s. `--prefill-burst-tokens 0` alone is the middle point (0.42 s, 23 s with min 512 and whole 1024) but loses the #603 long-mix TTFT.
