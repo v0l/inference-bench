@@ -245,6 +245,61 @@ impl Group {
     pub fn advanced(self) -> bool {
         self != Group::Basic
     }
+
+    pub fn heading(self) -> &'static str {
+        match self {
+            Group::Basic => "Common",
+            Group::Parallel | Group::Serving => "Batching and prefill",
+            Group::Mtp => "Speculative decoding",
+            Group::PrefixCache => "Prefix cache",
+            Group::Runtime => "Kernels and runtime",
+            Group::Loader => "Loader",
+            Group::Offload => "Offload and memory tiers",
+        }
+    }
+}
+
+pub const COMMON: &[&str] = &[
+    "serve.max_model_len",
+    "runtime.kv_dtype",
+    "serve.kv_cache_bytes",
+    "serve.max_num_seqs",
+    "runtime.offload.vram_budget",
+    "speculative.enabled",
+    "speculative.draft_tokens",
+];
+
+pub const SECTION_ORDER: [&str; 6] = ["Batching and prefill", "Speculative decoding", "Prefix cache", "Offload and memory tiers", "Kernels and runtime", "Loader"];
+
+pub struct Layout {
+    pub common: Vec<Field>,
+    pub sections: Vec<(&'static str, Vec<Field>)>,
+}
+
+pub fn layout() -> Layout {
+    let all = schema();
+    let mut common: Vec<Field> = all.iter().filter(|f| f.common).cloned().collect();
+    common.sort_by_key(|f| f.order);
+    let mut sections: Vec<(&'static str, Vec<Field>)> = Vec::new();
+    for heading in SECTION_ORDER {
+        let members: Vec<Field> = all.iter().filter(|f| !f.common && f.group.heading() == heading).cloned().collect();
+        if !members.is_empty() {
+            sections.push((heading, members));
+        }
+    }
+    Layout { common, sections }
+}
+
+pub fn matching(fields: &[Field], query: &str) -> Vec<Field> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    fields
+        .iter()
+        .filter(|f| {
+            let hay = format!("{} {} {}", f.label, f.key, f.group.heading()).to_lowercase();
+            words.iter().all(|w| hay.contains(w))
+        })
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -265,6 +320,8 @@ pub struct Field {
     pub kind: Kind,
     pub optional: bool,
     pub default: Value,
+    pub common: bool,
+    pub order: usize,
 }
 
 impl Field {
@@ -491,6 +548,8 @@ pub fn schema() -> Vec<Field> {
             kind,
             optional: default.is_null(),
             default,
+            common: COMMON.contains(&key.as_str()),
+            order: COMMON.iter().position(|c| *c == key).unwrap_or(usize::MAX),
         });
     }
     fields.sort_by_key(|f| (Group::ALL.iter().position(|g| *g == f.group), META.iter().position(|m| m.key == f.key)));
@@ -645,6 +704,38 @@ mod tests {
             c.set(key, value);
             let e = c.apply(ServeOptions { max_num_seqs: 8, ..ServeOptions::default() }).unwrap_err();
             assert!(format!("{e:#}").contains(named), "{key}: {e:#}");
+        }
+    }
+
+    #[test]
+    fn the_common_options_come_first_in_the_stated_order_and_every_other_option_is_in_a_section() {
+        let l = layout();
+        let keys: Vec<&str> = l.common.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, COMMON);
+        let total = l.common.len() + l.sections.iter().map(|(_, f)| f.len()).sum::<usize>();
+        assert_eq!(total, schema().len());
+        let mut seen: Vec<String> = l.common.iter().map(|f| f.key.clone()).collect();
+        seen.extend(l.sections.iter().flat_map(|(_, f)| f.iter().map(|f| f.key.clone())));
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), schema().len());
+        let names: Vec<&str> = l.sections.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, SECTION_ORDER);
+    }
+
+    #[test]
+    fn search_matches_label_key_and_section_and_loses_nothing() {
+        let all = schema();
+        let by_label = matching(&all, "KV cache");
+        assert!(by_label.iter().any(|f| f.key == "runtime.kv_dtype"));
+        let by_key = matching(&all, "loader.readers");
+        assert_eq!(by_key.len(), 1);
+        let by_section = matching(&all, "prefix cache");
+        assert!(by_section.iter().filter(|f| f.group == Group::PrefixCache).count() >= 5);
+        assert_eq!(matching(&all, "  ").len(), all.len());
+        assert!(matching(&all, "zzzz nothing").is_empty());
+        for f in &all {
+            assert!(matching(&all, f.label).iter().any(|m| m.key == f.key), "{}", f.key);
         }
     }
 
