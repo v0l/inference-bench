@@ -167,6 +167,15 @@ The GUI Server tab runs this same library in-process over the loaded model, and 
 * `packaging/systemd/inference-bench-server.service`: put the config in `/etc/inference-bench/server.toml` and keys in `/etc/inference-bench/server.env`.
 * `packaging/docker/Dockerfile`: CUDA image, run with `--gpus all`; mount a config and the Hugging Face cache.
 
+The image has no GPU at build time, so it ships no kernels. `XDG_CACHE_HOME=/cache` makes the `[runtime] cache_dir` default `/cache/specrt`, so one named volume on `/cache` carries the kernel cache. Once per host, then serve with the same volume:
+
+```bash
+docker run --rm --gpus all -v specrt-cache:/cache --entrypoint inference-bench <image> warmup --spec <spec> --max-ctx 8192 --slots 8
+docker run --gpus all -v specrt-cache:/cache -p 8080:8080 <image> --model <spec>
+```
+
+Pass the same `--max-ctx` and `--slots` the server runs with (`--max-model-len`, `--max-num-seqs`). A different layout is a different cache key and compiles again. Verified on the desktop with `XDG_CACHE_HOME` set to a temp dir: `warmup` wrote `$XDG_CACHE_HOME/specrt/<key>.cubin` and the next load hit it (see docs/specrt-27b.md, CUBIN cache).
+
 ## Spark run (Qwen3-0.6B, specrt, GB10)
 
 16 concurrent `openai` python clients, 64 new tokens each, `max_concurrent = 1`: 16/16 ok, 143.2 tokens/s aggregate, p50 3.5 s, p95 6.5 s (requests queue behind the one engine; latency is queue wait). A streamed reply arrives as 9 chunks, first at 0.03 s and last at 0.73 s. Loaded model VRAM reads 3.9 GB, device used 99 GB.

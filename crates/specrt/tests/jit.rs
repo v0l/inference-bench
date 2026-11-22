@@ -72,6 +72,34 @@ fn second_load_reads_the_cubin_without_nvrtc() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+fn nvfp4_27b() -> Spec {
+    Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml")).unwrap()
+}
+
+#[test]
+fn draft_tokens_do_not_change_the_module() {
+    let target = specrt::codegen::default_target();
+    let a = nvfp4_27b();
+    let mut b = a.clone();
+    b.mtp.as_mut().unwrap().draft_tokens = 3;
+    let ma = Module::generate_kv(&a, 8192, 1, &target).unwrap();
+    let mb = Module::generate_kv(&b, 8192, 1, &target).unwrap();
+    assert_eq!(ma.kir_hash, mb.kir_hash);
+    assert_eq!(ma.source, mb.source);
+}
+
+#[test]
+fn warmup_resolves_the_spec_the_server_loads() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4.toml");
+    let raw = Spec::load(&path).unwrap();
+    let resolved = specrt::engine::resolve_spec(path.to_str().unwrap()).unwrap();
+    let target = specrt::codegen::default_target();
+    let served = Module::generate_kv(&resolved, 8192, 1, &target).unwrap();
+    let warmed = Module::generate_kv(&specrt::runtime::warmup_spec(&raw).unwrap(), 8192, 1, &target).unwrap();
+    assert_eq!(served.kir_hash, warmed.kir_hash);
+    assert_eq!(served.source, warmed.source);
+}
+
 #[test]
 fn the_gguf_module_renders_the_ggml_kernels() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3-0.6b-gguf.toml");
