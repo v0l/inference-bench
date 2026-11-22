@@ -150,6 +150,7 @@ pub struct ServerConfig {
     pub grammar_cache: Option<usize>,
     pub max_batched_tokens: Option<usize>,
     pub itl_target_ms: Option<u64>,
+    pub step_cost: Option<f64>,
     pub whole_prompt_tokens: Option<usize>,
     pub min_prefill_tokens: Option<usize>,
     pub swap_space_gb: Option<f64>,
@@ -212,6 +213,7 @@ impl Default for ServerConfig {
             grammar_cache: None,
             max_batched_tokens: None,
             itl_target_ms: None,
+            step_cost: None,
             whole_prompt_tokens: None,
             min_prefill_tokens: None,
             swap_space_gb: None,
@@ -379,6 +381,7 @@ impl ServerConfig {
             kv_cache_tokens: None,
             max_batched_tokens: self.max_batched_tokens.unwrap_or(d.max_batched_tokens),
             itl_target: self.itl_target_ms.map(std::time::Duration::from_millis).unwrap_or(d.itl_target),
+            step_cost: self.step_cost.unwrap_or(d.step_cost),
             whole_prompt_tokens: self.whole_prompt_tokens.unwrap_or(d.whole_prompt_tokens),
             min_prefill_tokens: self.min_prefill_tokens.unwrap_or(d.min_prefill_tokens),
             swap_space_gb: self.swap_space_gb.unwrap_or(d.swap_space_gb),
@@ -528,13 +531,14 @@ python = "python3"
     #[test]
     fn serving_options_come_from_the_config_and_raise_concurrency() {
         let c = ServerConfig::parse(
-            "max_num_seqs = 32\nmax_model_len = 262144\nkv_cache_gb = 7\nmax_batched_tokens = 16384\nitl_target_ms = 80\n[[models]]\nid='m'",
+            "max_num_seqs = 32\nmax_model_len = 262144\nkv_cache_gb = 7\nmax_batched_tokens = 16384\nitl_target_ms = 80\nstep_cost = 2.5\n[[models]]\nid='m'",
         )
         .unwrap();
         let o = c.serve_options(&c.models[0]).unwrap();
         assert_eq!((o.max_num_seqs, o.max_model_len, o.max_batched_tokens), (32, Some(262144), 16384));
         assert_eq!(o.kv_cache_bytes, Some(7 << 30));
         assert_eq!(o.itl_target, std::time::Duration::from_millis(80));
+        assert_eq!(o.step_cost, 2.5);
         assert_eq!(c.concurrency(), 32);
         let plain = ServerConfig::parse("max_ctx = 4096\n[[models]]\nid='m'").unwrap();
         assert!(plain.serve_options(&plain.models[0]).is_none());

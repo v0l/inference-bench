@@ -504,6 +504,7 @@ pub struct Config {
     pub max_num_seqs: usize,
     pub max_batched_tokens: usize,
     pub itl_target: Duration,
+    pub step_cost: f64,
     pub reserve_blocks: Option<usize>,
     pub min_prefill_chunk: usize,
     pub min_prefill_tokens: usize,
@@ -521,7 +522,8 @@ impl Default for Config {
         Config {
             max_num_seqs: 32,
             max_batched_tokens: 8192,
-            itl_target: Duration::from_millis(100),
+            itl_target: Duration::ZERO,
+            step_cost: 3.0,
             reserve_blocks: None,
             min_prefill_chunk: 64,
             min_prefill_tokens: 0,
@@ -1365,8 +1367,10 @@ impl<E: Executor> Scheduler<E> {
         if self.prefill_rate <= 0.0 {
             return align.max(floor).min(full.max(1));
         }
-        let room = (self.cfg.itl_target.as_secs_f64() - self.decode_secs).max(0.0);
-        let fit = (room * self.prefill_rate) as usize;
+        let by_cost = if self.cfg.step_cost > 1.0 { (self.cfg.step_cost - 1.0) * self.decode_secs } else { f64::INFINITY };
+        let by_cap = if self.cfg.itl_target.is_zero() { f64::INFINITY } else { (self.cfg.itl_target.as_secs_f64() - self.decode_secs).max(0.0) };
+        let room = by_cost.min(by_cap);
+        let fit = if room.is_finite() { (room * self.prefill_rate) as usize } else { full };
         let fit = if fit > align { fit / align * align } else { align };
         let fit = fit.max(floor);
         let fit = fit.max(self.whole_prompt_remaining().unwrap_or(0));
@@ -1537,7 +1541,8 @@ impl<E: Executor> Scheduler<E> {
             self.exec.flush()?;
             report.prefill_secs = started.elapsed().as_secs_f64();
             if report.prefill_tokens >= self.cfg.min_prefill_chunk.max(self.cfg.min_prefill_tokens / 2) {
-                self.prefill_rate = ewma(self.prefill_rate, report.prefill_tokens as f64 / report.prefill_secs.max(1e-6));
+                let marginal = (report.prefill_secs - if report.decode_rows > 0 { self.decode_secs } else { 0.0 }).max(report.prefill_secs * 0.1);
+                self.prefill_rate = ewma(self.prefill_rate, report.prefill_tokens as f64 / marginal.max(1e-6));
             }
         }
         if report.decode_secs > 0.0 && report.prefill_tokens == 0 {
@@ -2170,7 +2175,7 @@ mod tests {
     #[test]
     fn decoders_run_every_step_while_a_long_prompt_prefills_in_chunks() {
         let fake = Fake::new(65536, 8, 8000, 2048);
-        let cfg = Config { max_batched_tokens: 1024, ..Config::default() };
+        let cfg = Config { max_batched_tokens: 1024, step_cost: 0.0, ..Config::default() };
         let mut s = Scheduler::new(fake, cfg);
         for q in 0..4 {
             s.submit(request(50, 400, q)).unwrap();
@@ -2183,7 +2188,7 @@ mod tests {
         let mut prefill_steps = 0;
         while s.running() < 5 || events.iter().all(|e| !matches!(e, Event::Token { id, .. } if *id == long)) {
             let r = s.step(&mut events).unwrap();
-            assert_eq!(r.decode_rows, 4, "a decoder was skipped while the long prompt prefilled");
+            assert_eq!(r.decode_rows, 4, "a decoder was skipped while the long prompt prefilled {r:?} {prefill_steps}");
             assert!(r.prefill_tokens + r.decode_rows <= 1024, "{r:?}");
             prefill_steps += 1;
         }
@@ -2640,10 +2645,57 @@ mod tests {
     }
 
     #[test]
+    fn prefill_beside_decoders_costs_a_multiple_of_the_decode_step_from_the_first_step() {
+        let mut fake = Fake::new(65536, 8, 8000, 2048);
+        fake.token_cost = Duration::from_micros(100);
+        fake.row_cost = Duration::from_millis(10);
+        let cfg = Config { max_batched_tokens: 8192, step_cost: 3.0, ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        s.submit(request(50, 400, 1)).unwrap();
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            s.step(&mut events).unwrap();
+        }
+        s.submit(request(20_000, 4, 2)).unwrap();
+        let mut prefilled = 0;
+        for _ in 0..12 {
+            let started = Instant::now();
+            let r = s.step(&mut events).unwrap();
+            assert_eq!(r.decode_rows, 1);
+            let took = started.elapsed();
+            assert!(took < Duration::from_millis(48), "a step of {took:?} with {} prefill tokens", r.prefill_tokens);
+            prefilled += r.prefill_tokens;
+        }
+        assert!(prefilled > 12 * 64, "{prefilled}");
+    }
+
+    #[test]
+    fn a_slow_decode_step_still_gets_a_real_prefill_budget() {
+        let mut fake = Fake::new(65536, 8, 8000, 2048);
+        fake.token_cost = Duration::from_micros(100);
+        let cfg = Config { max_batched_tokens: 8192, step_cost: 3.0, ..Config::default() };
+        let mut s = Scheduler::new(fake, cfg);
+        s.submit(request(50, 400, 1)).unwrap();
+        let mut events = Vec::new();
+        s.step(&mut events).unwrap();
+        s.submit(request(20_000, 4, 2)).unwrap();
+        s.step(&mut events).unwrap();
+        s.decode_secs = 0.095;
+        s.prefill_rate = 10_000.0;
+        let budget = s.prefill_budget(1);
+        assert!(budget >= 1536, "{budget}");
+        let capped = Scheduler::new(Fake::new(65536, 8, 8000, 2048), Config { step_cost: 3.0, itl_target: Duration::from_millis(100), ..Config::default() });
+        let mut capped = capped;
+        capped.decode_secs = 0.095;
+        capped.prefill_rate = 10_000.0;
+        assert!(capped.prefill_budget(1) <= 128, "{}", capped.prefill_budget(1));
+    }
+
+    #[test]
     fn prefill_beside_decoders_stays_inside_the_inter_token_target_from_the_first_step() {
         let mut fake = Fake::new(65536, 8, 8000, 2048);
         fake.token_cost = Duration::from_micros(100);
-        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(50), ..Config::default() };
+        let cfg = Config { max_batched_tokens: 8192, step_cost: 0.0, itl_target: Duration::from_millis(50), ..Config::default() };
         let mut s = Scheduler::new(fake, cfg);
         s.submit(request(50, 400, 1)).unwrap();
         let mut events = Vec::new();
@@ -2663,7 +2715,7 @@ mod tests {
     fn whole_prompt_steps(whole: usize) -> (usize, Vec<usize>, HashMap<SeqId, Vec<u32>>, HashMap<SeqId, Vec<u32>>) {
         let mut fake = Fake::new(65536, 8, 8000, 2048);
         fake.token_cost = Duration::from_micros(100);
-        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(50), whole_prompt_tokens: whole, ..Config::default() };
+        let cfg = Config { max_batched_tokens: 8192, step_cost: 0.0, itl_target: Duration::from_millis(50), whole_prompt_tokens: whole, ..Config::default() };
         let mut s = Scheduler::new(fake, cfg);
         let mut want = HashMap::new();
         for q in 0..4u32 {
@@ -2716,7 +2768,7 @@ mod tests {
     fn a_slow_decode_step_shrinks_the_prefill_beside_it() {
         let mut fake = Fake::new(65536, 8, 8000, 2048);
         fake.token_cost = Duration::from_micros(100);
-        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(60), ..Config::default() };
+        let cfg = Config { max_batched_tokens: 8192, step_cost: 0.0, itl_target: Duration::from_millis(60), ..Config::default() };
         let mut s = Scheduler::new(fake, cfg);
         s.submit(request(50, 400, 1)).unwrap();
         let mut events = Vec::new();
@@ -2733,7 +2785,7 @@ mod tests {
     fn a_first_token_mid_step_caps_the_rest_of_that_steps_prefill() {
         let mut fake = Fake::new(65536, 8, 8000, 2048);
         fake.token_cost = Duration::from_micros(100);
-        let cfg = Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(50), ..Config::default() };
+        let cfg = Config { max_batched_tokens: 8192, step_cost: 0.0, itl_target: Duration::from_millis(50), ..Config::default() };
         let mut s = Scheduler::new(fake, cfg);
         s.submit(request(500, 400, 1)).unwrap();
         let mut events = Vec::new();
@@ -2839,7 +2891,7 @@ mod tests {
     }
 
     fn sweep_cfg(min_prefill_tokens: usize, shortest_first: bool, whole_prompt_tokens: usize) -> Config {
-        Config { max_batched_tokens: 8192, itl_target: Duration::from_millis(10), whole_prompt_tokens, min_prefill_tokens, shortest_first, ..Config::default() }
+        Config { max_batched_tokens: 8192, step_cost: 0.0, itl_target: Duration::from_millis(10), whole_prompt_tokens, min_prefill_tokens, shortest_first, ..Config::default() }
     }
 
     #[test]
@@ -2895,7 +2947,7 @@ mod tests {
     }
 
     fn long_cfg(min_prefill_tokens: usize) -> Config {
-        Config { max_num_seqs: 26, max_batched_tokens: 16384, itl_target: Duration::from_millis(10), whole_prompt_tokens: 1024, min_prefill_tokens, ..Config::default() }
+        Config { max_num_seqs: 26, max_batched_tokens: 16384, step_cost: 0.0, itl_target: Duration::from_millis(10), whole_prompt_tokens: 1024, min_prefill_tokens, ..Config::default() }
     }
 
     fn step_cost(r: &StepReport) -> f64 {

@@ -278,7 +278,7 @@ fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize, 
     let rt = Runtime::load_layout(spec, layout)?;
     let mut sched = Scheduler::new(
         GpuExecutor::new(rt)?,
-        Config { max_num_seqs: batch, max_batched_tokens: 16384, itl_target: std::time::Duration::from_secs(10), ..Config::default() },
+        Config { max_num_seqs: batch, max_batched_tokens: 16384, step_cost: 0.0, itl_target: std::time::Duration::from_secs(10), ..Config::default() },
     );
     for round in 0..runs() {
         for s in 0..batch as u32 {

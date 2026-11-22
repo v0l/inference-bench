@@ -151,6 +151,9 @@ fn apply_values(values: &BTreeMap<String, Value>, sparse: &BTreeMap<String, Valu
         if let Some(v) = values.get("serve.itl_target_ms").and_then(Value::as_u64) {
             opts.itl_target = Duration::from_millis(v);
         }
+        if let Some(v) = values.get("serve.step_cost").and_then(Value::as_f64) {
+            opts.step_cost = v;
+        }
         if let Some(v) = values.get("serve.whole_prompt_tokens").and_then(Value::as_u64) {
             opts.whole_prompt_tokens = v as usize;
         }
@@ -278,7 +281,8 @@ const META: &[Meta] = &[
     Meta { key: "serve.max_num_seqs", label: "parallel requests", group: Group::Parallel, help: "Requests decoded together. They share one KV cache, and a single request still runs at full speed.", choices: &[], range: (1, 64) },
     Meta { key: "serve.tp", label: "tensor parallel", group: Group::Parallel, help: "GPUs one model is split across, by attention head and MLP column, with an allreduce after each half layer. One stream decodes faster when the GPUs have peer access. 1 keeps the model on one GPU.", choices: &[], range: (1, 8) },
     Meta { key: "serve.max_batched_tokens", label: "batched tokens", group: Group::Serving, help: "Token budget of one scheduler step. Larger prefills faster, smaller keeps decode steps short.", choices: &[], range: (64, 1 << 20) },
-    Meta { key: "serve.itl_target_ms", label: "inter-token target", group: Group::Serving, help: "Milliseconds a decode stream may wait between tokens while prompts are being read.", choices: &[], range: (1, 10_000) },
+    Meta { key: "serve.itl_target_ms", label: "inter-token cap", group: Group::Serving, help: "Optional cap in milliseconds on how long a decode stream may wait between tokens while prompts are being read. 0 leaves it to the step cost.", choices: &[], range: (0, 10_000) },
+    Meta { key: "serve.step_cost", label: "step cost", group: Group::Serving, help: "A step that reads prompts beside decoders may take this many times a plain decode step. Higher reads prompts faster, running streams wait longer between tokens. 1 or less turns it off.", choices: &[], range: (0, 64) },
     Meta { key: "serve.whole_prompt_tokens", label: "whole prompt limit", group: Group::Serving, help: "A new prompt up to this many tokens is read in a single step even while others decode. 0 keeps the inter-token target in charge.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "serve.min_prefill_tokens", label: "guaranteed prefill per step", group: Group::Serving, help: "Prompt tokens read every step even when decoders already fill the inter-token target. Keeps time to first token bounded under load. 0 leaves prefill to the target alone.", choices: &[], range: (0, 1 << 20) },
     Meta { key: "serve.swap_space_gb", label: "swap space", group: Group::Serving, help: "Gigabytes of pinned host memory where a preempted request parks its KV cache and state, instead of recomputing its prompt. 0 always recomputes.", choices: &[], range: (0, 1 << 20) },
@@ -336,6 +340,7 @@ struct ServeKnobs {
     kv_cache_bytes: Option<u64>,
     max_batched_tokens: usize,
     itl_target_ms: u64,
+    step_cost: f64,
     whole_prompt_tokens: usize,
     min_prefill_tokens: usize,
     swap_space_gb: f64,
@@ -346,12 +351,12 @@ struct ServeKnobs {
 }
 
 fn knobs(o: &ServeOptions) -> ServeKnobs {
-    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, prefill_burst_tokens, max_long_in_flight, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp, grammar_cache: _, solved: _ } = o;
-    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead, prefill_burst_tokens: *prefill_burst_tokens, max_long_in_flight: *max_long_in_flight, tp: *tp }
+    let ServeOptions { max_model_len, max_num_seqs, kv_cache_bytes, kv_cache_tokens: _, max_batched_tokens, itl_target, step_cost, whole_prompt_tokens, min_prefill_tokens, swap_space_gb, admit_lookahead, prefill_burst_tokens, max_long_in_flight, runtime: _, speculative: _, placement: _, progress: _, watchdog: _, sessions: _, tp, grammar_cache: _, solved: _ } = o;
+    ServeKnobs { max_model_len: *max_model_len, max_num_seqs: *max_num_seqs, kv_cache_bytes: *kv_cache_bytes, max_batched_tokens: *max_batched_tokens, itl_target_ms: itl_target.as_millis() as u64, step_cost: *step_cost, whole_prompt_tokens: *whole_prompt_tokens, min_prefill_tokens: *min_prefill_tokens, swap_space_gb: *swap_space_gb, admit_lookahead: *admit_lookahead, prefill_burst_tokens: *prefill_burst_tokens, max_long_in_flight: *max_long_in_flight, tp: *tp }
 }
 
 fn populated_knobs() -> ServeKnobs {
-    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, whole_prompt_tokens: 1, min_prefill_tokens: 1, swap_space_gb: 1.0, admit_lookahead: 1, prefill_burst_tokens: 1, max_long_in_flight: 1, tp: 1 }
+    ServeKnobs { max_model_len: Some(1), max_num_seqs: 1, kv_cache_bytes: Some(1), max_batched_tokens: 1, itl_target_ms: 1, step_cost: 1.0, whole_prompt_tokens: 1, min_prefill_tokens: 1, swap_space_gb: 1.0, admit_lookahead: 1, prefill_burst_tokens: 1, max_long_in_flight: 1, tp: 1 }
 }
 
 fn populated_runtime() -> RuntimeOptions {
