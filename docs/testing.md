@@ -37,6 +37,8 @@ export CARGO_BUILD_JOBS=4
 export SPECRT_REF_DIR=$HOME/.cache/specrt-ref-375
 ```
 
+Without `SPECRT_REF_DIR` the tiny-fixture tests in `linear` (the ten `moe_*` ones among them: six fail, with the missing reference files as the error) look in `crates/specrt/out` and fail on master too.
+
 - The default target dir is shared by every worktree. Parallel sessions overwrite each other's binaries there, so always use a per-issue one. Delete it when the issue is done.
 - Cargo goes under `systemd-run --user --wait --collect -P -q -p MemoryMax=10G --working-directory=$PWD -E CARGO_TARGET_DIR -E CARGO_BUILD_JOBS`. Anything that loads weights goes under `-p MemoryMax=16G -p MemorySwapMax=0`. Python that loads the 27B goes under the same 16G cap, never more than one such job at a time.
 - Any GPU run goes under `flock /tmp/gpu27.lock` (or `crates/specrt/scripts/gpulock.sh`, which skips the lock when `quiet_window.sh` already holds it). Two GPU jobs must never overlap.
@@ -268,4 +270,4 @@ flock /tmp/gpu27.lock systemd-run --user --wait --collect -P -q \
 
 ## Perf passes
 
-Speed per architecture, with nsys tables and llama.cpp and vLLM side by side, is `docs/perf-pass.md` and `crates/specrt/scripts/perfpass.sh`. The scoreboard is `docs/perf/scoreboard.md`.
+Speed per architecture, with nsys tables and llama.cpp and vLLM side by side, is `docs/perf-pass.md` and `crates/specrt/scripts/perfpass.sh`. The scoreboard is `docs/perf/scoreboard.md`. Keep/drop decisions use paired `bench --ab`; its method and claims are in the same file.

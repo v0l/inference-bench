@@ -60,4 +60,44 @@ The first version of this comparison gave 43 of 48 and mean KL 0.29. The cause w
 
 ## Not done
 
-Nothing from the issue list. The 122B decode b8 gap to vLLM (365 vs 435) and the 4k prefill gap (0.79 vs 0.21 s) remain.
+The 122B decode b8 gap to vLLM (365 vs 435) and the 4k prefill gap remain (#652 below).
+
+### #652 profile (nsys, GPU1, 122B, same card)
+
+4k prefill, 0.58 to 0.62 s of kernels (one 4096 token pass, 48 layers, 36 of them linear attention and 12 full attention, every layer MoE):
+
+| Kernel | ms | Share |
+| --- | --- | --- |
+| `lin_in_mma_big` (GDN input projections) | 98 | 16% |
+| `moe_mma_up` (+ `_s`) | 83 + 18 | 17% |
+| `flash_mma` | 73 | 12% |
+| `moe_route_logits` (before) | 77 | 13% |
+| `gdn_chunk_prep` + `gdn_chunk_scan` | 52 + 30 | 14% |
+| `moe_mma_down` (+ `_s`) | 49 + 6 | 9% |
+| `lin_out_mma_big`, `qkv_mma_big`, `o_mma_big` | 48 + 26 + 14 | 14% |
+
+The expert GEMMs are 26% of prefill. Up does 4096 x 9 pairs x 2 x 1024 x 3072 x 2 FLOP x 48 layers = 11.1 TFLOP in 0.101 s of kernel time, about 110 TFLOP/s on the fp4 mma; down 5.6 TFLOP in 0.055 s, about 100 TFLOP/s. A 128-row tile (`BM=128`, 4 warps) was tried and was slower for up (99 ms against 88 ms), so it was dropped. The rest of the 0.8 s to 0.21 s gap is not the expert GEMM: the dense GDN and attention projections (`lin_in_mma_big`, `lin_out_mma_big`, `qkv_mma_big`, `o_mma_big`, 186 ms) and the GDN chunk kernels (82 ms) are the larger share and are separate kernels from `templates/moe_mma.cu` (that file is now `kir::cuda::moe::mma`).
+
+Changes kept: `moe_route_logits` computes 4 experts per warp and loads the activation tile once per 4 experts (router reads were 13% of prefill, now 5%, 4k prefill 0.607 to 0.575 s), and `moe_tiles` builds the tile map with a block scan instead of one thread walking 257 experts (21 us to a few us, 96 launches a pass).
+
+b8 decode (369 tok/s before and after): `moe_mma_up_s` 133 ms of 387 ms of kernel time (34%, 173 us a call, 48 layers x 16 steps), `moe_mma_down_s` 43 ms, `lin_in_mma_tiny` 47 ms, lm head 15 ms. Bytes: 14.8 GB of active experts per step over about 22 ms of up/down time per step is about 680 GB/s, 38% of the card's peak. Our 16-row tile has one CTA row per expert, so the grid is `inter/64 x active_experts` CTAs of 128 threads. Whether that is too few loads in flight is untested.
+
+b8 decode fix kept: the 16-row tile kernels (`moe_mma_up_s`, `moe_mma_down_s`) use a 6 stage cp.async pipeline instead of 3 (`MMA_STAGES_SMALL`, 6 x 16.5 KB shared memory per CTA). More bytes in flight per CTA is what a 16-row tile lacks. Alternating runs of the same `real_122b_batch_8_decode_speed` binary pairs on GPU1 (3 pairs, base then new): base 362.0, 370.4, 371.6 tok/s, new 383.5, 383.2, 383.0 tok/s, about +3.5% (+5.9% on the first pair). Stage counts 8 and 10 gave 382.0 and no further gain, so 6 stays. vLLM is 435, so b8 is still 12% short of it; the 5% bar was not cleared on the median and `bench --ab` could not be used: it loads both arms into one process and two 122B copies (about 70 GB each) do not fit one 96 GB card, and it varies the spec, not the kernel source. The two-GPU command would be `bench --ab <122b spec A> <122b spec B>` with each arm pinned to its own card, which the bench does not do yet.
+
+The top-1 flip at position 34 (ours 1691, vLLM 303, KL 0.357) is not from this issue: master gives 63/64, mean KL 0.01344, max 0.35707, and so do builds with only the route-logits change, only the tile-map change, both, and both plus the 6 stage kernels, all identical to five digits. The "64 of 64" in the table above predates the #644 merge fixes and is stale; the test thresholds (90%, 0.05) hold on master.
+
+vLLM and FlashInfer, read-only from `~/.venv-vllm/lib/python3.*/site-packages/vllm/model_executor/layers/fused_moe/`:
+
+| Item | vLLM | specrt |
+| --- | --- | --- |
+| Token tile `BLOCK_SIZE_M` | Marlin path: picks the first of 8, 16, 32, 48, 64 where `M * topk / E / block_m < 0.9` (`experts/marlin_moe.py:309`); Triton default 64 with config files per (E, N, device) in `configs/` (`fused_moe.py:1388`) | 16 when under 32 pairs per expert, else 64; the 8 to 48 steps are missing |
+| N tile and pipeline | at M <= 8 the block-scaled default uses N=64 and 4 stages at M <= 4, 3 stages up to 8 (`fused_moe.py:1415`) | BN 64 always; 3 stages, now 6 for the 16-row tile |
+| Token packing | `moe_align_block_size` sorts (token, expert) pairs by expert and pads each expert to a multiple of `BLOCK_SIZE_M`, returns `sorted_token_ids` and `expert_ids` per tile (`moe_align_block_size.py:55`); with expert parallelism `expert_map` drops invalid experts | `moe_permute` (one block) plus `moe_tiles` (block scan, no padding, tile map of (expert, m)) |
+| Router top-k | separate `topk_softmax` op (`router/fused_topk_router.py:20`, `fused_topk_bias_router.py:30`), not fused with the align step | `moe_route_logits` (norm plus logits, multi-block) then `moe_route` (one warp per token) then `moe_permute`; also not fused |
+| CUTLASS / FlashInfer | `experts/flashinfer_cutlass_moe.py:372` calls `flashinfer_cutlass_fused_moe` with `tp_size`/`ep_size`; the grouped GEMM and its persistent scheduler live in the FlashInfer JIT sources (not read here: the 24 GB build cap) | not applicable on sm_120 mma kernels |
+
+No vLLM path fuses the router with the permutation, and none uses a persistent kernel in the Marlin or Triton route we compare against (the 0.21 s prefill uses Marlin). The difference that matters for b8 is the smaller M tiles (8) and deeper pipelining at tiny M, which the stage change partly matches.
+
+Grouped GEMM as a kir family: it already is one (`kir::moe::Family::GroupedMma`, emitted by `kir::cuda::moe::mma`), so the port the issue asks for exists; #609's `select` would only choose among the tile variants, and the measured choice (16-row vs 64-row, stage count) is a constant here. Not done as a separate step because the profile shows no GEMM-shape gap that a different family would close.
+
+Still open for #652: 4k prefill 0.575 s against 0.3 s needs the GDN and attention projection GEMMs (186 ms) and GDN chunk kernels (82 ms), which are outside the expert kernel; b8 is 383 against 435 tok/s.

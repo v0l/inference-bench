@@ -57,12 +57,12 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     bool is_k = !is_q && head < HEADS + KV_HEADS;
     float* src = qkv + (size_t)row * QKV_ROW + head * HEAD_DIM;
     float v = d < HEAD_DIM ? src[d] : 0.0f;
-    if (QK_NORM && (is_q || is_k)) {
+    if (QK_NORM && (is_q || is_k) && !(QK_NORM_UNIT && NOPE[layer])) {
         float inv = rsqrtf("##.to_string(),
         prim::block_reduce(Reduce::Sum, "v * v", "scratch"),
         r##" / HEAD_DIM + EPS);
         const float* w = is_q ? q_norm : k_norm;
-        if (d < HEAD_DIM) v = w[d] * (v * inv);
+        if (d < HEAD_DIM) v = QK_NORM_UNIT ? v * inv : w[d] * (v * inv);
     }
     if (d < HEAD_DIM) vec[d] = v;
     __syncthreads();

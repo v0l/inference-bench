@@ -29,6 +29,7 @@ impl Family {
                 "moe_down_bf16",
                 "moe_down_fp4",
                 "moe_combine",
+                "moe_scale_inputs",
                 "moe_permute",
                 "moe_group_up_bf16",
                 "moe_group_up_fp4",
@@ -71,8 +72,11 @@ impl Family {
     }
 }
 
+pub const MMA_STAGES_SMALL: usize = 6;
+
 pub fn mma_smem(rows_per_tile: usize, weights: usize) -> u32 {
-    (MMA_STAGES * (rows_per_tile + weights * MMA_BN) * MMA_ROW) as u32
+    let stages = if rows_per_tile == MMA_BM_SMALL { MMA_STAGES_SMALL } else { MMA_STAGES };
+    (stages * (rows_per_tile + weights * MMA_BN) * MMA_ROW) as u32
 }
 
 pub const MMA_BF16_ROW: usize = 64;

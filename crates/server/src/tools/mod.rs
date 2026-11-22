@@ -85,6 +85,7 @@ pub struct OutputParser {
     tools: Vec<Value>,
     tool_parsing: bool,
     json_calls: bool,
+    kv_calls: bool,
     raw: Option<(RawFormat, RawPhase)>,
     harmony: Option<harmony::Harmony>,
     state: State,
@@ -140,6 +141,7 @@ impl OutputParser {
             tools: tools.to_vec(),
             tool_parsing,
             json_calls: false,
+            kv_calls: false,
             raw: None,
             harmony: None,
             state: if reasoning { State::Reasoning } else { State::Content },
@@ -157,6 +159,12 @@ impl OutputParser {
         self
     }
 
+    pub fn key_value(mut self) -> Self {
+        self.json_calls = true;
+        self.kv_calls = true;
+        self
+    }
+
     pub fn raw_json(mut self, format: RawFormat) -> Self {
         self.json_calls = true;
         self.raw = Some((format, RawPhase::Undecided));
@@ -166,6 +174,7 @@ impl OutputParser {
     pub fn for_parser(self, name: Option<&str>) -> Self {
         match name {
             Some("hermes") => self.hermes(),
+            Some("xml_kv") => self.key_value(),
             Some("harmony") => self.harmony(),
             Some(n) => match RawFormat::from_parser(n) {
                 Some(f) if self.tool_parsing => self.raw_json(f),
@@ -488,6 +497,9 @@ impl OutputParser {
     fn end_json_call(&mut self, index: usize, closer: &str, out: &mut Vec<Delta>) {
         self.slots[index].ended = true;
         let text = self.slots[index].args.trim().to_string();
+        if self.kv_calls {
+            return self.end_kv_call(index, &text, closer, out);
+        }
         let mut calls = self.json_calls_in(&text);
         if calls.is_empty() && self.raw.is_some_and(|(f, _)| f == RawFormat::BareJson) && text.contains(';') {
             let parts: Vec<Vec<(String, String)>> = text.split(';').map(|p| self.json_calls_in(p.trim())).collect();
@@ -514,6 +526,17 @@ impl OutputParser {
             self.slots[at].arguments = Some(args.clone());
             out.push(Delta::Args { index: at, arguments: args });
         }
+    }
+
+    fn end_kv_call(&mut self, index: usize, text: &str, closer: &str, out: &mut Vec<Delta>) {
+        let cut = [text.find('\n'), text.find("<arg_key>")].into_iter().flatten().min().unwrap_or(text.len());
+        let (name, rest) = text.split_at(cut);
+        let Some(name) = self.resolve(name) else { return self.drop_slot_as_text(index, closer, out) };
+        let arguments = convert_kv_args(rest, properties(&self.tools, &name));
+        self.slots[index].name = name;
+        self.send_name(index, out);
+        self.slots[index].arguments = Some(arguments.clone());
+        out.push(Delta::Args { index, arguments });
     }
 
     fn json_calls_in(&self, text: &str) -> Vec<(String, String)> {
@@ -624,6 +647,37 @@ fn params(raw: &str) -> Vec<(String, String)> {
         pos = next;
     }
     out
+}
+
+fn convert_kv_args(raw: &str, props: Option<&Map<String, Value>>) -> String {
+    const KEY: &str = "<arg_key>";
+    const KEY_END: &str = "</arg_key>";
+    const VALUE: &str = "<arg_value>";
+    const VALUE_END: &str = "</arg_value>";
+    let props = props.filter(|p| !p.is_empty());
+    let mut fields: Vec<String> = Vec::new();
+    let mut rest = raw;
+    while let Some(k) = rest.find(KEY) {
+        let after = &rest[k + KEY.len()..];
+        let Some(ke) = after.find(KEY_END) else { break };
+        let key = after[..ke].trim().to_string();
+        let after = &after[ke + KEY_END.len()..];
+        let Some(v) = after.find(VALUE) else { break };
+        let after = &after[v + VALUE.len()..];
+        let (value, next) = match after.find(VALUE_END) {
+            Some(ve) => (&after[..ve], &after[ve + VALUE_END.len()..]),
+            None => (after, ""),
+        };
+        let value = value.trim();
+        let rendered = match props.and_then(|p| p.get(&key)).filter(|s| s.is_object()) {
+            Some(schema) => coerce(value, &schema_types(schema)),
+            None => json_str(value),
+        };
+        fields.retain(|f| !f.starts_with(&format!("{}:", json_str(&key))));
+        fields.push(format!("{}: {rendered}", json_str(&key)));
+        rest = next;
+    }
+    format!("{{{}}}", fields.join(", "))
 }
 
 fn convert_args(raw: &str, props: Option<&Map<String, Value>>) -> String {

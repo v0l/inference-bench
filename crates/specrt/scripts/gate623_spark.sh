@@ -38,7 +38,7 @@ run() {
 bench() {
     local side=$1 d=$2 tg=$3; shift 3
     if [ "$side" = master ]; then
-        run "$d/crates/specrt" "$tg" --setenv=SPECRT_BENCH_RUNS=3 "$tg/release/bench" "$@"
+        run "$d/crates/specrt" "$tg" "$tg/release/bench" --runs 3 "$@"
     else
         run "$d/crates/specrt" "$tg" "$tg/release/bench" --runs 3 "$@"
     fi

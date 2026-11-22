@@ -12,6 +12,9 @@ struct Flags {
     mlp_act_fp4: bool,
     mlp_planes: u8,
     pdl: bool,
+    ab: bool,
+    rounds: usize,
+    b_graphs: Option<bool>,
 }
 
 static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
@@ -25,7 +28,7 @@ fn runs() -> usize {
 }
 
 fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
-    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false };
+    let mut f = Flags { runs: 6, serve: false, profile: false, fp8_act: false, kv_gb: None, mlp_act_fp4: false, mlp_planes: 1, pdl: false, ab: false, rounds: specrt::abstats::MIN_ROUNDS, b_graphs: None };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -33,13 +36,22 @@ fn take_flags(args: &mut Vec<String>) -> Result<Flags> {
             "--profile" => f.profile = true,
             "--fp8-act" => f.fp8_act = true,
             "--pdl" => f.pdl = true,
+            "--ab" => f.ab = true,
             "--mlp-act-fp4" => f.mlp_act_fp4 = true,
             "--mlp-act-planes" => f.mlp_planes = 2,
-            "--runs" | "--kv-gb" => {
+            "--runs" | "--kv-gb" | "--rounds" | "--b-graphs" => {
                 let name = args.remove(i);
                 anyhow::ensure!(i < args.len(), "{name} needs a value");
                 if name == "--runs" {
                     f.runs = args[i].parse().context("--runs")?;
+                } else if name == "--rounds" {
+                    f.rounds = args[i].parse().context("--rounds")?;
+                } else if name == "--b-graphs" {
+                    f.b_graphs = Some(match args[i].as_str() {
+                        "on" => true,
+                        "off" => false,
+                        other => anyhow::bail!("--b-graphs takes on or off, not {other}"),
+                    });
                 } else {
                     f.kv_gb = Some(args[i].parse().context("--kv-gb")?);
                 }
@@ -114,6 +126,9 @@ fn main() -> Result<()> {
         let reply = engine.generate(prompt, n, Sampling::GREEDY)?;
         println!("TEXT_BEGIN{}TEXT_END", reply.text);
         return Ok(());
+    }
+    if flags().ab {
+        return bench_ab(args);
     }
     let mut args = args.into_iter();
     let usage = "usage: bench [--wgpu] [--runs N] [--serve] [--kv-gb GB] [--profile] [--speculative] [--sampled] <spec.toml | checkpoint dir | model.gguf> [prompt_len[,prompt_len..]] [new_tokens] [batch]";
@@ -263,7 +278,7 @@ fn bench_serve(spec: &Spec, prompt_len: usize, new_tokens: usize, batch: usize, 
     let rt = Runtime::load_layout(spec, layout)?;
     let mut sched = Scheduler::new(
         GpuExecutor::new(rt)?,
-        Config { max_num_seqs: batch, max_batched_tokens: 16384, itl_target: std::time::Duration::from_secs(10), ..Config::default() },
+        Config { max_num_seqs: batch, max_batched_tokens: 16384, step_cost: 0.0, itl_target: std::time::Duration::from_secs(10), ..Config::default() },
     );
     for round in 0..runs() {
         for s in 0..batch as u32 {
@@ -354,4 +369,111 @@ fn bench_wgpu(spec: &Spec, prompts: &[usize], new_tokens: usize) -> Result<()> {
 #[cfg(not(feature = "wgpu"))]
 fn bench_wgpu(_: &Spec, _: &[usize], _: usize) -> Result<()> {
     anyhow::bail!("build with --features wgpu")
+}
+
+fn looks_like_spec(arg: &str) -> bool {
+    let p = Path::new(arg);
+    p.is_dir() || p.extension().is_some_and(|e| e == "toml" || e == "gguf")
+}
+
+struct Round {
+    prefill: f64,
+    decode: f64,
+}
+
+fn timed(rt: &mut Runtime, prompt: &[u32], new_tokens: usize) -> Result<Round> {
+    let g = rt.generate(prompt, new_tokens, Sampling::GREEDY)?;
+    Ok(Round { prefill: prompt.len() as f64 / g.prefill_secs, decode: (new_tokens - 1) as f64 / g.decode_secs })
+}
+
+fn control_pass(a: &mut Runtime, prompt: &[u32], new_tokens: usize, rounds: usize) -> Result<(Vec<Round>, Vec<Round>)> {
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    for _ in 0..rounds {
+        first.push(timed(a, prompt, new_tokens)?);
+        second.push(timed(a, prompt, new_tokens)?);
+    }
+    Ok((first, second))
+}
+
+fn ab_pass(a: &mut Runtime, b: &mut Runtime, prompt: &[u32], new_tokens: usize, rounds: usize) -> Result<(Vec<Round>, Vec<Round>)> {
+    let (mut ra, mut rb) = (Vec::new(), Vec::new());
+    for _ in 0..rounds {
+        ra.push(timed(a, prompt, new_tokens)?);
+        rb.push(timed(b, prompt, new_tokens)?);
+    }
+    Ok((ra, rb))
+}
+
+fn describe(name: &str, s: &specrt::abstats::Summary) -> String {
+    format!("{name} median {:.4} IQR {:.4} ({:.1}% of median) n={}", s.median, s.iqr(), s.spread() * 100.0, s.n)
+}
+
+fn bench_ab(args: Vec<String>) -> Result<()> {
+    use specrt::abstats::{ratios, summarize, verdict};
+    let usage = "usage: bench --ab [--rounds N] [--b-graphs on|off] <A spec> [B spec] [prompt_len] [new_tokens]";
+    let mut args = args.into_iter().peekable();
+    let a_path = PathBuf::from(args.next().context(usage)?);
+    let b_path = match args.peek() {
+        Some(next) if looks_like_spec(next) => PathBuf::from(args.next().unwrap()),
+        _ => a_path.clone(),
+    };
+    let prompt_len: usize = args.next().map(|s| s.parse()).transpose().context(usage)?.unwrap_or(128);
+    let new_tokens: usize = args.next().map(|s| s.parse()).transpose().context(usage)?.unwrap_or(128);
+    anyhow::ensure!(new_tokens >= 2, "new_tokens must be at least 2");
+    let rounds = flags().rounds;
+    let spec_a = load_spec(&a_path)?;
+    let mut spec_b = load_spec(&b_path)?;
+    if let Some(graphs) = flags().b_graphs {
+        spec_b.runtime.graphs = graphs;
+    }
+    let max_ctx = prompt_len + new_tokens;
+    let mut a = Runtime::load(&spec_a, max_ctx)?;
+    let mut b = Runtime::load(&spec_b, max_ctx)?;
+    let prompt: Vec<u32> = (0..prompt_len as u32).map(|i| 1000 + i * 7 % 5000).collect();
+    for rt in [&mut a, &mut b] {
+        for _ in 0..3 {
+            rt.generate(&prompt, 8.min(new_tokens), Sampling::GREEDY)?;
+        }
+    }
+    let wall = specrt::bandwidth::probe(a.stream().context())?;
+    println!(
+        "A {} graphs={} | B {} graphs={} | prompt={prompt_len} new={new_tokens} rounds={rounds}",
+        a_path.display(),
+        spec_a.runtime.graphs,
+        b_path.display(),
+        spec_b.runtime.graphs
+    );
+    println!("bandwidth wall (same process): read {:.0} GB/s, copy {:.0} GB/s", wall.read_gbs, wall.copy_gbs);
+
+    let d = |r: &[Round]| r.iter().map(|x| x.decode).collect::<Vec<_>>();
+    let p = |r: &[Round]| r.iter().map(|x| x.prefill).collect::<Vec<_>>();
+    let (mut control, mut control_prefill, mut passes, mut passes_prefill) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut a_decode, mut b_decode) = (Vec::new(), Vec::new());
+    for pass in 1..=2 {
+        let (c1, c2) = control_pass(&mut a, &prompt, new_tokens, rounds)?;
+        control.push(summarize(&ratios(&d(&c1), &d(&c2))));
+        control_prefill.push(summarize(&ratios(&p(&c1), &p(&c2))));
+        let (ra, rb) = ab_pass(&mut a, &mut b, &prompt, new_tokens, rounds)?;
+        passes.push(summarize(&ratios(&d(&ra), &d(&rb))));
+        passes_prefill.push(summarize(&ratios(&p(&ra), &p(&rb))));
+        a_decode.extend(d(&ra));
+        b_decode.extend(d(&rb));
+        println!("pass {pass}: A/A decode  {}", describe("ratio", &control[pass - 1]));
+        println!("pass {pass}: A/B decode  {}", describe("ratio", &passes[pass - 1]));
+        println!("pass {pass}: A/A prefill {}", describe("ratio", &control_prefill[pass - 1]));
+        println!("pass {pass}: A/B prefill {}", describe("ratio", &passes_prefill[pass - 1]));
+    }
+    for (name, weight_bytes, values) in [("A", a.weight_bytes as f64, &a_decode), ("B", b.weight_bytes as f64, &b_decode)] {
+        let tps = summarize(values).median;
+        println!(
+            "{name}: decode {tps:.1} tok/s, {:.2} GB weights per token, {:.1} GB/s = {:.0}% of the read wall",
+            weight_bytes / 1e9,
+            tps * weight_bytes / 1e9,
+            tps * weight_bytes / 1e9 / wall.read_gbs * 100.0
+        );
+    }
+    let v = verdict(&control, &passes);
+    println!("verdict (decode, B over A): {}", v.label());
+    anyhow::ensure!(!matches!(v, specrt::abstats::Verdict::Refused(_)), "refused: rerun on a quiet card");
+    Ok(())
 }

@@ -112,19 +112,30 @@ pub fn tiles(name: &str) -> String {
         None,
         name,
         "const int* offsets, int* tile_map, int bm, int max_tiles",
-        r##"    if (threadIdx.x != 0) return;
-    int t = 0;
-    for (int e = 0; e < MOE_SLOTS; e++) {
+        r##"    __shared__ int first[MOE_SLOTS + 1];
+    for (int e = threadIdx.x; e < MOE_SLOTS; e += blockDim.x) first[e] = (offsets[e + 1] - offsets[e] + bm - 1) / bm;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int run = 0;
+        for (int e = 0; e < MOE_SLOTS; e++) {
+            int c = first[e];
+            first[e] = run;
+            run += c;
+        }
+        first[MOE_SLOTS] = run;
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < MOE_SLOTS; e += blockDim.x) {
         int count = offsets[e + 1] - offsets[e];
         for (int m = 0; m * bm < count; m++) {
+            int t = first[e] + m;
             if (t < max_tiles) {
                 tile_map[2 * t] = e;
                 tile_map[2 * t + 1] = m;
             }
-            t++;
         }
     }
-    for (; t < max_tiles; t++) tile_map[2 * t] = -1;
+    for (int t = first[MOE_SLOTS] + threadIdx.x; t < max_tiles; t += blockDim.x) tile_map[2 * t] = -1;
 "##,
     )
 }
@@ -172,7 +183,7 @@ fn tile_setup_head() -> &'static str {
         int pos = begin + i;
         bool live = pos < end;
         int p = live ? sorted[pos] : -1;
-        src[i] = live ? (DOWN ? pos : p / MOE_PAIRS) : -1;
+        src[i] = live ? (DOWN ? pos : (MOE_INPUT_SCALED ? p : p / MOE_PAIRS)) : -1;
         dst[i] = live ? (DOWN ? p : pos) : -1;
     }
     __syncthreads();
@@ -339,9 +350,9 @@ fn variants(out: &mut String, mx: bool) {
     let planes: &[(usize, &str)] = if mx { &[(1, ""), (2, "2")] } else { &[(1, "")] };
     for &(p, tag) in planes {
         out.push_str(&variant(&format!("{stem}_up{tag}"), "MOE_INTER, HIDDEN, 2, 64, 64, 2, 2, 3, false", mx, p));
-        out.push_str(&variant(&format!("{stem}_up{tag}_s"), "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 3, false", mx, p));
+        out.push_str(&variant(&format!("{stem}_up{tag}_s"), "MOE_INTER, HIDDEN, 2, 16, 64, 1, 4, 6, false", mx, p));
         out.push_str(&variant(&format!("{stem}_down{tag}"), "HIDDEN, MOE_INTER, 1, 64, 64, 2, 2, 3, true", mx, p));
-        out.push_str(&variant(&format!("{stem}_down{tag}_s"), "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 3, true", mx, p));
+        out.push_str(&variant(&format!("{stem}_down{tag}_s"), "HIDDEN, MOE_INTER, 1, 16, 64, 1, 4, 6, true", mx, p));
     }
 }
 

@@ -68,8 +68,9 @@ fn route(hash: bool) -> Routed {
     let mut coef: CudaSlice<f32> = stream.alloc_zeros(pairs).unwrap();
     let logits_kernel = loaded.function("moe_route_logits").unwrap();
     let mut b = stream.launch_builder(&logits_kernel);
-    b.arg(&xd).arg(&lnd).arg(&rd).arg(&gate).arg(&gate).arg(&mut xn).arg(&mut logits);
-    unsafe { b.launch(LaunchConfig { grid_dim: ((e + 1).div_ceil(8) as u32, tokens as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
+    let n_arg = tokens as i32;
+    b.arg(&xd).arg(&lnd).arg(&rd).arg(&gate).arg(&gate).arg(&mut xn).arg(&mut logits).arg(&n_arg);
+    unsafe { b.launch(LaunchConfig { grid_dim: ((e + 1).div_ceil(32) as u32, tokens.div_ceil(4) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
     let (first, hashed) = (0i32, i32::from(hash));
     let route_kernel = loaded.function("moe_route").unwrap();
     let mut b = stream.launch_builder(&route_kernel);

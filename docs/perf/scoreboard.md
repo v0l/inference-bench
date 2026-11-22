@@ -36,3 +36,30 @@ Indicative only: SGLang ran with the radix cache off at batch 8, median of 3, wh
 | qwen3_5 | 4287.8 | 11.1 | 71.1 | 0.51 | 1.13 | 2.54 | flashinfer | 2026-11-19 |
 | qwen3_moe | 5114.2 | 53.0 | 221.8 | 0.06 | 0.99 | 0.72 | flashinfer | 2026-11-19 |
 | smollm3 | 6927.9 | 21.1 | 195.4 | 0.84 | 1.59 | 1.35 | flashinfer | 2026-11-19 |
+
+## Paired A/B claims
+
+The single list of current keep/drop claims. Each row has its command, date, card state and verdict. Retract a claim in place (verdict `retracted`, with the reason). Speeds in older docs (`docs/specrt-mtp.md` and the other `docs/specrt-*.md`) are single runs or medians of 6 on a shared card and are indicative until a row here replaces them. `perfpass_report.py` leaves this section untouched.
+
+Use `bench --ab` for every keep/drop decision:
+
+```bash
+bench --ab [--rounds N] [--b-graphs on|off] <A spec> [B spec] [prompt_len] [new_tokens]
+```
+
+- Both arms load in one process and alternate A/B/A/B. 20 rounds per pass by default (`--rounds`), two passes. Run counts are flags (`--runs`, `--rounds`); `SPECRT_BENCH_RUNS` is gone.
+- Each pass is preceded by an A/A control (A against itself). The statistic is the median of per-round ratios B/A with its IQR.
+- The bench refuses instead of printing a verdict, and exits non-zero, when a control median is outside 1 +/- 0.02, any control or A/B spread (IQR/median) is above 0.10, the two A/B passes differ by more than 3%, or a pass has fewer than 20 rounds. A noisy card gives `REFUSE (reason)`; rerun on a quieter card.
+- Otherwise the verdict is `PASS: B faster`, `PASS: B slower` or `PASS: no difference outside the A/A band`.
+- The bandwidth probe (`crates/specrt/scripts/bandwidth.cu`) runs in the same process. The run prints weight bytes per token and decode GB/s as a fraction of the read wall. Small models can exceed 100% because L2 serves part of the reads.
+- A second spec path makes B a different spec; `--b-graphs off` makes B the same spec with `[runtime] graphs = false`.
+- Prefill ratios are printed too but are noisy at this size; judge on decode unless the change targets prefill.
+
+| claim | value | command | date | card state | verdict |
+|---|---|---|---|---|---|
+| A/A control, Qwen3-0.6B bf16 decode | ratio 0.9996 and 1.0007 (spread 1.1% and 4.7%) | `gpu-run any -- bench --ab crates/specrt/specs/qwen3-0.6b.toml` (one spec path: B is the same spec) | 2026-11-21 | Spark GB10, other jobs resident, 1% util | pass, within 0.98 to 1.02 |
+| CUDA graph decode vs no graphs, Qwen3-0.6B bf16 | B (graphs off) 0.93x of A, spread 0.6% to 2.2% | `gpu-run any -- bench --ab --b-graphs off crates/specrt/specs/qwen3-0.6b.toml` | 2026-11-21 | Spark GB10, shared with resident vLLM | PASS: B slower (detected) |
+| A/A control, Qwen3-0.6B bf16 decode, desktop GPU1 | A/A 0.9999 and 1.0000 (spread 0.0% and 0.1%); A vs a second copy of the same spec 0.9978 (spread 0.0% to 0.1%, a fixed 0.2% bias between the two loaded runtimes) | `~/.agents/bin/gpu-run 1 -- bench --ab crates/specrt/specs/qwen3-0.6b.toml` | 2026-11-22 | RTX PRO 6000 (GPU1) held alone through gpu-run after the #951 trainer finished; the user's app on GPU0 at 100% | PASS: no difference outside the A/A band, none refused |
+| CUDA graph decode vs no graphs, Qwen3-0.6B bf16, desktop GPU1 | B (graphs off) 0.9711 and 0.9710 of A (spread 0.0%), A 858 tok/s, B 834 tok/s, 77% and 75% of the 1680 GB/s probe read wall | `~/.agents/bin/gpu-run 1 -- bench --ab --b-graphs off crates/specrt/specs/qwen3-0.6b.toml` | 2026-11-22 | same as above | PASS: B slower (detected, 2.9% below A, outside the 2% control band) |
+| Qwen3-0.6B bf16 decode b1 | 175.2 tok/s, 1.50 GB per token, 263 GB/s, 112% of probe read wall 236 GB/s | same command, arm A | 2026-11-21 | Spark GB10, shared with resident vLLM | indicative, wall includes L2 hits |
+| 29k prefill beside 7 decoders vs `step_cost` (#404), 27B exact, 8 slots | server defaults: 29k prefill 19.4 s (old absolute 100 ms), 19.5 s (step_cost 3), 19.8 s (4), decoder itl p99 1.34 / 1.35 / 1.36 s. Rule alone (burst, min prefill, whole prompt all 0), two runs each: prefill 27.5/28.1 s (old), 26.8/26.0 (2), 28.7/29.6 (3), 30.3/30.1 (4); itl p99 0.17 (old), 0.11 (2), 0.18 (3), 0.22 s (4) | `ONLY=stall SERVE_ARGS="--step-cost N" ~/.agents/bin/gpu-run 1 --shared --min-free 40000 -- crates/specrt/scripts/serve27b.sh` | 2026-11-22 | GPU1 shared with other jobs, user app on GPU0 | no setting gives 2x, none qualifies. Not a `bench --ab` claim (it times single-process decode, not a served stall) |

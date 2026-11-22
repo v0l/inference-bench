@@ -29,41 +29,55 @@ fn logits_norm() -> &'static str {
 }
 
 fn logits_dot() -> &'static str {
-    r##"    int e = blockIdx.x * MOE_LOGIT_ROWS + warp;
-    if (e >= MOE_E + 1) return;
-    float a[MOE_LOGIT_TOKENS];
+    r##"    float a[MOE_LOGIT_PER_WARP][MOE_LOGIT_TOKENS];
 #pragma unroll
-    for (int j = 0; j < MOE_LOGIT_TOKENS; j++) a[j] = 0.0f;
-    if (e < MOE_E) {
-        const uint4* r = (const uint4*)(router + (size_t)e * HIDDEN);
-        for (int c = lane; c < HIDDEN / 8; c += 32) {
-            uint4 q = __ldg(r + c);
-            float w[8] = {bf16_to_f32(q.x & 0xffffu), bf16_to_f32(q.x >> 16), bf16_to_f32(q.y & 0xffffu), bf16_to_f32(q.y >> 16),
-                          bf16_to_f32(q.z & 0xffffu), bf16_to_f32(q.z >> 16), bf16_to_f32(q.w & 0xffffu), bf16_to_f32(q.w >> 16)};
+    for (int q = 0; q < MOE_LOGIT_PER_WARP; q++)
+#pragma unroll
+        for (int j = 0; j < MOE_LOGIT_TOKENS; j++) a[q][j] = 0.0f;
+    int e0 = (blockIdx.x * (MOE_LOGIT_ROWS / MOE_LOGIT_PER_WARP) + warp) * MOE_LOGIT_PER_WARP;
+    if (e0 >= MOE_E + 1) return;
+    for (int c = lane; c < HIDDEN / 8; c += 32) {
+        float4 xl[MOE_LOGIT_TOKENS], xh[MOE_LOGIT_TOKENS];
+#pragma unroll
+        for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {
+            xl[j] = *(const float4*)(xs + j * HIDDEN + c * 8);
+            xh[j] = *(const float4*)(xs + j * HIDDEN + c * 8 + 4);
+        }
+#pragma unroll
+        for (int q = 0; q < MOE_LOGIT_PER_WARP; q++) {
+            int e = e0 + q;
+            if (e >= MOE_E) continue;
+            uint4 r = __ldg((const uint4*)(router + (size_t)e * HIDDEN) + c);
+            float w[8] = {bf16_to_f32(r.x & 0xffffu), bf16_to_f32(r.x >> 16), bf16_to_f32(r.y & 0xffffu), bf16_to_f32(r.y >> 16),
+                          bf16_to_f32(r.z & 0xffffu), bf16_to_f32(r.z >> 16), bf16_to_f32(r.w & 0xffffu), bf16_to_f32(r.w >> 16)};
 #pragma unroll
             for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {
-                const float* xv = xs + j * HIDDEN + c * 8;
-                a[j] += w[0] * xv[0] + w[1] * xv[1] + w[2] * xv[2] + w[3] * xv[3] + w[4] * xv[4] + w[5] * xv[5] + w[6] * xv[6] + w[7] * xv[7];
+                a[q][j] += w[0] * xl[j].x + w[1] * xl[j].y + w[2] * xl[j].z + w[3] * xl[j].w + w[4] * xh[j].x + w[5] * xh[j].y + w[6] * xh[j].z + w[7] * xh[j].w;
             }
         }
-    } else if (MOE_SHARED_GATE) {
+    }
+    if (MOE_SHARED_GATE && e0 + MOE_LOGIT_PER_WARP > MOE_E && MOE_E >= e0) {
         for (int i = lane; i < HIDDEN; i += 32) {
 #pragma unroll
-            for (int j = 0; j < MOE_LOGIT_TOKENS; j++) a[j] += shared_gate[i] * xs[j * HIDDEN + i];
+            for (int j = 0; j < MOE_LOGIT_TOKENS; j++) a[MOE_E - e0][j] += shared_gate[i] * xs[j * HIDDEN + i];
         }
     }
 #pragma unroll
-    for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {
-        float v = warp_sum(a[j]);
-        if (MOE_ROUTER_BIAS && e < MOE_E) v += router_bias[e];
-        if (lane == 0 && j < live) logits[(size_t)(t0 + j) * (MOE_E + 1) + e] = v;
+    for (int q = 0; q < MOE_LOGIT_PER_WARP; q++) {
+        int e = e0 + q;
+#pragma unroll
+        for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {
+            float v = warp_sum(a[q][j]);
+            if (MOE_ROUTER_BIAS && e < MOE_E) v += router_bias[e];
+            if (lane == 0 && j < live && e < MOE_E + 1) logits[(size_t)(t0 + j) * (MOE_E + 1) + e] = v;
+        }
     }
 "##
 }
 
 pub fn route_logits() -> String {
     format!(
-        "constexpr int MOE_LOGIT_ROWS = 8;\nconstexpr int MOE_LOGIT_TOKENS = 4;\n\n{}",
+        "constexpr int MOE_LOGIT_PER_WARP = 4;\nconstexpr int MOE_LOGIT_ROWS = 8 * MOE_LOGIT_PER_WARP;\nconstexpr int MOE_LOGIT_TOKENS = 4;\n\n{}",
         prim::global(
             Some(256),
             "moe_route_logits",
@@ -174,6 +188,21 @@ pub fn route() -> String {
     )
 }
 
+pub fn scale_inputs() -> String {
+    prim::global(
+        None,
+        "moe_scale_inputs",
+        "const float* xn, const int* idx, const float* coef, float* xp",
+        r##"    int pair = blockIdx.y;
+    int t = pair / MOE_PAIRS;
+    int s = pair % MOE_PAIRS;
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= HIDDEN || idx[pair] < 0) return;
+    xp[(size_t)pair * HIDDEN + i] = xn[(size_t)t * HIDDEN + i] * (s < MOE_K ? coef[pair] : 1.0f);
+"##,
+    )
+}
+
 pub fn combine() -> String {
     prim::global(
         None,
@@ -185,7 +214,7 @@ pub fn combine() -> String {
     float acc = 0.0f;
     for (int s = 0; s < MOE_PAIRS; s++) {
         float c = coef[t * MOE_PAIRS + s];
-        if (c != 0.0f) acc += c * out[((size_t)t * MOE_PAIRS + s) * HIDDEN + i];
+        if (c != 0.0f) acc += (MOE_INPUT_SCALED && s < MOE_K ? 1.0f : c) * out[((size_t)t * MOE_PAIRS + s) * HIDDEN + i];
     }
     x[(size_t)t * HIDDEN + i] += MOE_OUT_SCALE * acc;
 "##,
