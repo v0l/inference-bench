@@ -955,7 +955,7 @@ mod tests {
         let p = plan(&info, &[500 * GB], 1);
         let best = p.best().unwrap();
         assert!(best.variant.label == "IQ4_NL" || best.runnable.is_err() || !best.variant.complete());
-        assert!(p.ranked.iter().all(|s| s.runnable.is_err()), "IQ quants are not supported by specrt");
+        assert!(p.ranked.iter().filter(|s| s.variant.label.starts_with("IQ")).all(|s| s.runnable.is_ok()), "IQ quants are supported by specrt");
         let unsupported = RepoInfo { shape: Err("model_type deepseek_v4 is not supported".into()), ..info };
         let p = plan(&unsupported, &[500 * GB], 1);
         assert_eq!(p.unsupported.as_deref(), Some("model_type deepseek_v4 is not supported"));

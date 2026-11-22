@@ -77,7 +77,98 @@ pub enum GgmlType {
     Q4K,
     Q5K,
     Q6K,
+    Iq(Iq),
     Other(u32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Iq {
+    Xxs2,
+    Xs2,
+    S2,
+    Xxs3,
+    S3,
+    S1,
+    M1,
+    Nl4,
+    Xs4,
+}
+
+impl Iq {
+    pub const ALL: [Iq; 9] = [Iq::Xxs2, Iq::Xs2, Iq::S2, Iq::Xxs3, Iq::S3, Iq::S1, Iq::M1, Iq::Nl4, Iq::Xs4];
+
+    pub fn from_id(id: u32) -> Option<Iq> {
+        Some(match id {
+            16 => Iq::Xxs2,
+            17 => Iq::Xs2,
+            22 => Iq::S2,
+            18 => Iq::Xxs3,
+            21 => Iq::S3,
+            19 => Iq::S1,
+            29 => Iq::M1,
+            20 => Iq::Nl4,
+            23 => Iq::Xs4,
+            _ => return None,
+        })
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Iq::Xxs2 => "IQ2_XXS",
+            Iq::Xs2 => "IQ2_XS",
+            Iq::S2 => "IQ2_S",
+            Iq::Xxs3 => "IQ3_XXS",
+            Iq::S3 => "IQ3_S",
+            Iq::S1 => "IQ1_S",
+            Iq::M1 => "IQ1_M",
+            Iq::Nl4 => "IQ4_NL",
+            Iq::Xs4 => "IQ4_XS",
+        }
+    }
+
+    pub fn device_id(self) -> u32 {
+        8 + Iq::ALL.iter().position(|k| *k == self).expect("listed") as u32
+    }
+
+    pub fn from_device_id(id: u32) -> Option<Iq> {
+        Iq::ALL.iter().copied().find(|k| k.device_id() == id)
+    }
+
+    pub fn superblock_bytes(self) -> usize {
+        match self {
+            Iq::Xxs2 => 66,
+            Iq::Xs2 => 74,
+            Iq::S2 => 82,
+            Iq::Xxs3 => 98,
+            Iq::S3 => 110,
+            Iq::S1 => 50,
+            Iq::M1 => 56,
+            Iq::Nl4 => 144,
+            Iq::Xs4 => 136,
+        }
+    }
+
+    pub fn block(self) -> (usize, usize) {
+        match self {
+            Iq::Nl4 => (32, 18),
+            k => (QK_K, k.superblock_bytes()),
+        }
+    }
+
+    pub fn dequantize(self, block: &[u8], out: &mut [f32]) {
+        use crate::gguf_iq::*;
+        match self {
+            Iq::Xxs2 => dequantize_iq2_xxs(block, out),
+            Iq::Xs2 => dequantize_iq2_xs(block, out),
+            Iq::S2 => dequantize_iq2_s(block, out),
+            Iq::Xxs3 => dequantize_iq3_xxs(block, out),
+            Iq::S3 => dequantize_iq3_s(block, out),
+            Iq::S1 => dequantize_iq1_s(block, out),
+            Iq::M1 => dequantize_iq1_m(block, out),
+            Iq::Nl4 => dequantize_iq4_nl(block, out),
+            Iq::Xs4 => dequantize_iq4_xs(block, out),
+        }
+    }
 }
 
 impl GgmlType {
@@ -92,7 +183,7 @@ impl GgmlType {
             13 => GgmlType::Q5K,
             14 => GgmlType::Q6K,
             30 => GgmlType::Bf16,
-            other => GgmlType::Other(other),
+            other => Iq::from_id(other).map_or(GgmlType::Other(other), GgmlType::Iq),
         }
     }
 
@@ -107,6 +198,7 @@ impl GgmlType {
             GgmlType::Q4K => "Q4_K".into(),
             GgmlType::Q5K => "Q5_K".into(),
             GgmlType::Q6K => "Q6_K".into(),
+            GgmlType::Iq(k) => k.name().into(),
             GgmlType::Other(id) => match id {
                 3 => "Q4_1".into(),
                 7 => "Q5_1".into(),
@@ -129,6 +221,7 @@ impl GgmlType {
             GgmlType::Q4K => (QK_K, 144),
             GgmlType::Q5K => (QK_K, 176),
             GgmlType::Q6K => (QK_K, 210),
+            GgmlType::Iq(k) => k.block(),
             GgmlType::Other(_) => return None,
         })
     }
@@ -447,7 +540,7 @@ impl Gguf {
         let mut unsupported: Vec<String> = self.tensors.values().filter(|t| t.kind.block().is_none()).map(|t| format!("{} ({})", t.name, t.kind.name())).collect();
         unsupported.sort();
         if let Some(first) = unsupported.first().filter(|_| !self.header_only) {
-            bail!("GGUF tensor type is not supported: {first} and {} more (F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K and Q6_K are)", unsupported.len() - 1);
+            bail!("GGUF tensor type is not supported: {first} and {} more (F32, F16, BF16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K and the IQ types are)", unsupported.len() - 1);
         }
         let quant = match self.weight_quant() {
             Quant::Q8 if linear_attention.is_some() => Quant::Gguf,
@@ -736,7 +829,7 @@ impl Gguf {
 pub fn quant_label_supported(label: &str) -> bool {
     let upper = label.to_uppercase();
     let upper = upper.strip_prefix("UD-").unwrap_or(&upper);
-    ["Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "BF16", "F16", "F32"].iter().any(|q| upper.starts_with(q))
+    ["Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ4_NL", "IQ4_XS", "BF16", "F16", "F32"].iter().any(|q| upper.starts_with(q))
 }
 
 pub fn banded_factors(theta: f64, head_dim: usize, s: &RopeScaling) -> Vec<f64> {
@@ -902,13 +995,14 @@ pub fn dequantize(kind: GgmlType, data: &[u8], out: &mut [f32]) -> Result<()> {
         GgmlType::F16 => out.iter_mut().zip(data.chunks_exact(2)).for_each(|(o, b)| *o = f16(b)),
         GgmlType::Bf16 => out.iter_mut().zip(data.chunks_exact(2)).for_each(|(o, b)| *o = crate::weights::bf16_to_f32(u16::from_le_bytes([b[0], b[1]]))),
         _ => {
-            let f: fn(&[u8], &mut [f32]) = match kind {
-                GgmlType::Q4_0 => dequantize_q4_0,
-                GgmlType::Q5_0 => dequantize_q5_0,
-                GgmlType::Q8_0 => dequantize_q8_0,
-                GgmlType::Q4K => dequantize_q4_k,
-                GgmlType::Q5K => dequantize_q5_k,
-                _ => dequantize_q6_k,
+            let f: Box<dyn Fn(&[u8], &mut [f32])> = match kind {
+                GgmlType::Q4_0 => Box::new(dequantize_q4_0),
+                GgmlType::Q5_0 => Box::new(dequantize_q5_0),
+                GgmlType::Q8_0 => Box::new(dequantize_q8_0),
+                GgmlType::Q4K => Box::new(dequantize_q4_k),
+                GgmlType::Q5K => Box::new(dequantize_q5_k),
+                GgmlType::Iq(k) => Box::new(move |b, y| k.dequantize(b, y)),
+                _ => Box::new(dequantize_q6_k),
             };
             for (block, y) in data.chunks_exact(bytes).zip(out.chunks_exact_mut(elems)) {
                 f(block, y);
@@ -919,6 +1013,7 @@ pub fn dequantize(kind: GgmlType, data: &[u8], out: &mut [f32]) -> Result<()> {
 }
 
 pub const DEVICE_SUPERBLOCK: usize = 256;
+pub const IQ_HEADER_BYTES: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceRow {
@@ -928,6 +1023,7 @@ pub enum DeviceRow {
     Q8 = 3,
     Bf16 = 4,
     F16 = 5,
+    Ext = 7,
 }
 
 impl DeviceRow {
@@ -939,6 +1035,7 @@ impl DeviceRow {
             GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::Q5_0 => DeviceRow::Q8,
             GgmlType::Bf16 | GgmlType::F32 => DeviceRow::Bf16,
             GgmlType::F16 => DeviceRow::F16,
+            GgmlType::Iq(_) => DeviceRow::Ext,
             GgmlType::Other(_) => bail!("GGUF tensor type {} is not supported", kind.name()),
         })
     }
@@ -950,6 +1047,7 @@ impl DeviceRow {
             2 => DeviceRow::Q6K,
             3 => DeviceRow::Q8,
             4 => DeviceRow::Bf16,
+            7 => DeviceRow::Ext,
             _ => DeviceRow::F16,
         }
     }
@@ -961,6 +1059,7 @@ impl DeviceRow {
             DeviceRow::Q6K => 224,
             DeviceRow::Q8 => 272,
             DeviceRow::Bf16 | DeviceRow::F16 => 512,
+            DeviceRow::Ext => 0,
         }
     }
 }
@@ -977,6 +1076,20 @@ impl<'a> DeviceRows<'a> {
         ensure!(cols.is_multiple_of(DEVICE_SUPERBLOCK), "a {} row of {cols} is not a whole number of 256-element blocks", kind.name());
         let src_row = kind.row_bytes(cols)?;
         ensure!(data.len() == src_row * rows, "{} data of {} bytes is not {rows} rows of {cols}", kind.name(), data.len());
+        if let GgmlType::Iq(k) = kind {
+            let stored = (IQ_HEADER_BYTES + src_row).next_multiple_of(16);
+            let mut out = Vec::with_capacity(stored * rows);
+            for r in data.chunks_exact(src_row) {
+                let at = out.len();
+                out.extend_from_slice(&k.device_id().to_le_bytes());
+                out.resize(at + IQ_HEADER_BYTES, 0);
+                out.extend_from_slice(r);
+                out.resize(at + stored, 0);
+            }
+            ensure!(out.len() / 16 < 1 << 29, "a GGUF matrix of {} bytes is too large for the row table", out.len());
+            let table = (0..rows).map(|r| ((r * stored / 16) as u32) << 3 | DeviceRow::Ext as u32).collect();
+            return Ok(DeviceRows { parts: vec![std::borrow::Cow::Owned(out)], rows: table, cols });
+        }
         if let Some(q8) = as_q8_0(kind, data) {
             let packed = DeviceRows::pack(GgmlType::Q8_0, &q8, rows, cols)?;
             return Ok(DeviceRows { parts: packed.parts.into_iter().map(|p| std::borrow::Cow::Owned(p.into_owned())).collect(), rows: packed.rows, cols });
@@ -1041,6 +1154,17 @@ impl<'a> DeviceRows<'a> {
         let row = DeviceRow::from_code(entry & 7);
         let start = (entry >> 3) as usize * 16;
         let blocks = self.cols / DEVICE_SUPERBLOCK;
+        if row == DeviceRow::Ext {
+            let id = u32::from_le_bytes(self.slice(start, 4).try_into().expect("4 bytes"));
+            let k = Iq::from_device_id(id).expect("known i-quant id");
+            let (elems, bytes) = k.block();
+            let body = self.slice(start + IQ_HEADER_BYTES, self.cols / elems * bytes);
+            let mut out = vec![0f32; self.cols];
+            for (b, y) in body.chunks_exact(bytes).zip(out.chunks_exact_mut(elems)) {
+                k.dequantize(b, y);
+            }
+            return out;
+        }
         let mut out = vec![0f32; self.cols];
         for (b, y) in out.chunks_exact_mut(DEVICE_SUPERBLOCK).enumerate().take(blocks) {
             let sb = self.slice(start + b * row.bytes(), row.bytes());
@@ -1051,6 +1175,7 @@ impl<'a> DeviceRows<'a> {
                 DeviceRow::Q8 => sb.chunks_exact(34).zip(y.chunks_exact_mut(32)).for_each(|(q, o)| dequantize_q8_0(q, o)),
                 DeviceRow::Bf16 => y.iter_mut().zip(sb.chunks_exact(2)).for_each(|(o, h)| *o = crate::weights::bf16_to_f32(u16::from_le_bytes([h[0], h[1]]))),
                 DeviceRow::F16 => y.iter_mut().zip(sb.chunks_exact(2)).for_each(|(o, h)| *o = f16(h)),
+                DeviceRow::Ext => unreachable!(),
             }
         }
         out
