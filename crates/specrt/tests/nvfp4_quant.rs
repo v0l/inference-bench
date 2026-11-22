@@ -37,6 +37,17 @@ fn device_quantiser_is_byte_identical_to_the_cpu_path() {
 }
 
 #[test]
+fn device_quantiser_matches_the_cpu_path_on_the_tiny_fixture_draft_head() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-qwen3.5-mtp");
+    let mut spec = specrt::spec::Spec::from_hf_config(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+    spec.repo = dir.display().to_string();
+    let ck = specrt::weights::Checkpoint::for_repo(&spec.repo).unwrap().renamed(&spec.tensors);
+    let (w, cols) = ck.draft_head_bf16(&spec).unwrap().expect("fixture head is bf16");
+    assert_eq!(cols, spec.dims.hidden);
+    check(spec.dims.vocab, cols, w.to_vec());
+}
+
+#[test]
 #[ignore]
 fn head_sized_timing() {
     let (rows, cols) = (248320, 5120);
