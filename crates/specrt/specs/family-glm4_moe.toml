@@ -2,6 +2,7 @@ name = "glm4_moe"
 kind = "family"
 min_engine = 10
 extends = "base"
+mtp = true
 
 [match]
 model_types = ["glm4_moe"]
@@ -12,6 +13,15 @@ unit_offset = false
 
 [fields]
 num_experts = ["n_routed_experts"]
+mtp_num_hidden_layers = ["num_nextn_predict_layers"]
+
+[mtp_layout]
+layer = "model.layers.{n}"
+fc = "model.layers.{n}.eh_proj.weight"
+norm_embed = "model.layers.{n}.enorm.weight"
+norm_hidden = "model.layers.{n}.hnorm.weight"
+norm = "model.layers.{n}.shared_head.norm.weight"
+head = "model.layers.{n}.shared_head.head.weight"
 
 [attention]
 qk_norm = { config = "use_qk_norm", default = false }

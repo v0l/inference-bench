@@ -375,3 +375,79 @@ fn gpt_oss_block_scaled_mma_experts_match_the_packed_gemv_experts() {
     eprintln!("gpt-oss mma vs gemv cosine {cosine} over {} rows of {vocab}", tokens.len());
     assert!(a.iter().all(|v| v.is_finite()) && cosine > 0.8, "cosine {cosine}");
 }
+
+fn glm_with_nextn() -> Spec {
+    let mut spec = spec(GLM);
+    spec.mlp.act_quant = specrt::spec::ActQuant::None;
+    spec.mlp.up_act_planes = 1;
+    spec.mlp.down_act_planes = 1;
+    let m = spec.mtp.as_mut().expect("the nextn layer is an [mtp] block");
+    m.head_quant = Some(specrt::spec::Quant::Bf16);
+    spec
+}
+
+#[test]
+fn the_glm_nextn_layer_is_a_plain_attention_mtp_block_named_by_the_family_layout() {
+    let spec = glm_with_nextn();
+    spec.validate().unwrap();
+    spec.runnable().unwrap();
+    assert!(spec.linear_attention.is_none() && !spec.attention.output_gate);
+    let layout = spec.mtp_layout();
+    assert_eq!((layout.layer.as_str(), layout.fc.as_str()), ("model.layers.4", "model.layers.4.eh_proj.weight"));
+    assert_eq!(layout.head.as_deref(), Some("model.layers.4.shared_head.head.weight"));
+    assert_eq!(spec.kv_layers(), spec.attention_layers() + 1);
+    let ck = specrt::weights::Checkpoint::open(&fixture(GLM)).unwrap();
+    let w = ck.mtp(&spec).unwrap();
+    assert!(w.layer.moe.is_some());
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn glm_nextn_draft_logits_match_transformers() {
+    let dir = std::env::var_os("SPECRT_REF_DIR").map(PathBuf::from).unwrap_or_else(|| root().join("out"));
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{GLM}.mtp.json"))).unwrap()).unwrap();
+    let prompt: Vec<u32> = meta["tokens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let floats = |name: &str| -> Vec<f32> { std::fs::read(dir.join(name)).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect() };
+    let mut rt = Runtime::load(&glm_with_nextn(), 512).unwrap();
+    let (logits, drafts) = rt.mtp_prompt_logits(&prompt).unwrap();
+    let want = floats(&format!("{GLM}.mtp.chain.bin"));
+    let err = logits.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let scale = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+    eprintln!("glm nextn chained draft logits max abs {err:e} (scale {scale})");
+    assert!(err <= 1e-2 * scale.max(1.0), "{err}");
+    assert_eq!(drafts[0] as u64, meta["draft"].as_u64().unwrap());
+    assert_eq!(drafts[1] as u64, meta["chain_draft"].as_u64().unwrap());
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn glm_speculative_greedy_equals_plain_greedy_and_reports_acceptance() {
+    use specrt::runtime::{DecodeRow, Layout, SpecRow};
+    let pages = 512usize.div_ceil(specrt::codegen::PAGE);
+    let layout = Layout { max_ctx: 512, slots: 1, kv_blocks: pages, prefill_chunk: 128, kv_planes: 1, kv_headroom: 0, state_on_demand: false };
+    let blocks: Vec<u32> = (0..pages as u32).collect();
+    let prompt: Vec<u32> = (0..40u32).map(|i| (i * 37 + 11) % 512).collect();
+    let new = 48;
+    let mut plain = glm_with_nextn();
+    plain.mtp.as_mut().unwrap().speculate = false;
+    let mut rt = Runtime::load_layout(&plain, layout.clone()).unwrap();
+    rt.set_block_table(0, &blocks).unwrap();
+    let mut st = rt.stepper().unwrap();
+    let mut want = vec![rt.prefill_slot(&mut st, 0, &prompt, 0, Some((Sampling::GREEDY, 0))).unwrap().unwrap()];
+    while want.len() < new {
+        let row = DecodeRow { slot: 0, token: *want.last().unwrap(), pos: prompt.len() + want.len() - 1, sampling: Sampling::GREEDY, step: want.len() as u32 };
+        want.push(rt.decode(&mut st, &[row]).unwrap()[0]);
+    }
+    let mut rt = Runtime::load_layout(&glm_with_nextn(), layout).unwrap();
+    rt.set_block_table(0, &blocks).unwrap();
+    let mut st = rt.stepper().unwrap();
+    let mut got = vec![rt.prefill_slot(&mut st, 0, &prompt, 0, Some((Sampling::GREEDY, 0))).unwrap().unwrap()];
+    while got.len() < new {
+        let row = SpecRow { slot: 0, token: *got.last().unwrap(), pos: prompt.len() + got.len() - 1, sampling: Sampling::GREEDY, step: got.len() as u32, max_accept: 2 };
+        got.extend(rt.speculate(&[row]).unwrap().remove(0));
+    }
+    got.truncate(new);
+    assert_eq!(got, want);
+    let stats = rt.spec_stats();
+    eprintln!("glm speculation: {} steps, {} of {} drafts accepted", stats.steps, stats.accepted, stats.drafted);
+}

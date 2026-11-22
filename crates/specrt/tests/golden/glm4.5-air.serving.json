@@ -45,5 +45,18 @@
     "router": "sigmoid",
     "shared_module": "shared_experts",
     "score_bias": true
+  },
+  "mtp": {
+    "layers": 1,
+    "draft_tokens": 2,
+    "speculate": true,
+    "layout": {
+      "layer": "model.layers.{n}",
+      "fc": "model.layers.{n}.eh_proj.weight",
+      "norm_embed": "model.layers.{n}.enorm.weight",
+      "norm_hidden": "model.layers.{n}.hnorm.weight",
+      "norm": "model.layers.{n}.shared_head.norm.weight",
+      "head": "model.layers.{n}.shared_head.head.weight"
+    }
   }
 }

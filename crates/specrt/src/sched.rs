@@ -245,6 +245,10 @@ impl GpuExecutor {
         let fuse = rt.spec().runtime.fuse && rt.draft_tokens().is_none() && !rt.spec().uses_branch() && rt.spec().mixer.is_none() && !rt.spec().layers.split;
         Ok(GpuExecutor { rt, st, fuse, fused_prefill: None })
     }
+
+    pub fn capture_secs(&self) -> &[(usize, f64)] {
+        self.st.capture_secs()
+    }
 }
 
 impl Executor for GpuExecutor {

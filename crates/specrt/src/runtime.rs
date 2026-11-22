@@ -58,7 +58,11 @@ fn weight_plan(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole)
         push(ck.tensor_names(&[embed]), Work::Embed);
     }
     if spec.speculative().is_some() {
-        push(ck.names_under("mtp."), Work::Mtp);
+        let lay = spec.mtp_layout();
+        let mut names = ck.names_under(&format!("{}.", lay.layer));
+        names.extend(ck.tensor_names(&[lay.fc, lay.norm_embed, lay.norm_hidden, lay.norm]));
+        names.extend(lay.head.iter().filter(|h| ck.has(h)).cloned());
+        push(names, Work::Mtp);
     }
     for &i in &layers[half..] {
         push(ck.names_under(&format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));
@@ -156,7 +160,20 @@ fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: Sta
         lm_head: DeviceMatrix::upload(stream, &head)?,
         embed,
         draft: match spec.draft_head_quant() {
-            Some(q) => Some(DeviceMatrix::upload(stream, &ck.draft_head(spec, q)?)?),
+            Some(q) => {
+                let on_device = match q {
+                    crate::spec::Quant::Nvfp4G16 => ck.draft_head_bf16(spec)?,
+                    _ => None,
+                };
+                match on_device {
+                    Some((w, cols)) => {
+                        let cache = spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
+                        let d = crate::nvfp4::quantize_on_device(stream, &cache, &w, cols)?;
+                        Some(DeviceMatrix::Fp4 { packed: d.packed, scales: d.scales })
+                    }
+                    None => Some(DeviceMatrix::upload(stream, &ck.draft_head(spec, q)?)?),
+                }
+            }
             None => None,
         },
     };
@@ -745,6 +762,8 @@ pub struct Runtime {
     tables: Vec<i32>,
     pub cache_hit: bool,
     pub jit_key: String,
+    pub jit_compile_secs: f64,
+    pub jit_module_secs: f64,
     pub arch: String,
     pub device_bytes: u64,
     pub weight_bytes: u64,
@@ -1130,6 +1149,8 @@ impl Runtime {
             stream,
             cache_hit: loaded.cache_hit,
             jit_key: loaded.key,
+            jit_compile_secs: loaded.compile_secs,
+            jit_module_secs: loaded.module_secs,
             arch: jit.arch().to_string(),
             device_bytes: 0,
             weight_bytes,
@@ -1201,6 +1222,8 @@ impl Runtime {
             jit_key = %rt.jit_key,
             jit_cache_hit = rt.cache_hit,
             jit_secs = jit_secs,
+            jit_compile_secs = rt.jit_compile_secs,
+            jit_module_secs = rt.jit_module_secs,
             arch = %rt.arch,
             shards = checkpoint.files.len(),
             weights_direct,
@@ -1570,6 +1593,7 @@ impl Runtime {
             (GemmPath::F4b, _, _) => return self.tc_f4b(&choice, w, x, out, rows, tokens),
             (GemmPath::Rows, _, _) => return self.tc_rows(&choice, w, x, out, rows, tokens),
             (GemmPath::Ggr, _, _) => return self.tc_ggr(&choice, w, bias, x, out, rows, tokens),
+            (GemmPath::Ggv, _, _) => return self.tc_ggv(&choice, w, bias, x, out, rows),
             (GemmPath::Ggb, _, _) => return self.tc_ggb(&choice, w, bias, x, out, rows, tokens),
             _ => {}
         }
@@ -1655,6 +1679,30 @@ impl Runtime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn tc_ggv(
+        &self,
+        choice: &crate::codegen::KernelChoice,
+        w: &DeviceMatrix,
+        bias: Option<&CudaSlice<f32>>,
+        x: (CudaView<u16>, CudaView<u16>),
+        out: GemmOut,
+        rows: usize,
+    ) -> Result<()> {
+        let DeviceMatrix::Ggml { data, table } = w else { unreachable!("tc_ggv takes GGUF weights") };
+        let mut b = self.launcher(self.kernel(&choice.name));
+        b.arg(data).arg(table);
+        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(&x.0).arg(&x.1);
+        match out {
+            GemmOut::F32(o) => b.arg(o).arg(&self.pre.dummy_u16).arg(&self.pre.dummy_u16),
+            GemmOut::Planes(p) => b.arg(&self.buf.dummy).arg(&p.hi).arg(&p.lo),
+        };
+        b.arg(&self.f8b_part).arg(&0i32).arg(&0i32);
+        let per_block = crate::codegen::GGML_GEMV_THREADS as usize / 32 * crate::gemm::ggml_gemv_rows(rows);
+        let blocks = grid(rows, per_block).min(self.sms * GEMV_BLOCKS_PER_SM);
+        unsafe { b.launch(cfg(blocks, crate::codegen::GGML_GEMV_THREADS)) }?;
+        Ok(())
+    }
+
     fn tc_ggr(
         &self,
         choice: &crate::codegen::KernelChoice,
