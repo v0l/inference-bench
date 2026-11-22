@@ -58,7 +58,11 @@ fn weight_plan(ck: &Checkpoint, spec: &Spec, range: StageRange, role: StageRole)
         push(ck.tensor_names(&[embed]), Work::Embed);
     }
     if spec.speculative().is_some() {
-        push(ck.names_under("mtp."), Work::Mtp);
+        let lay = spec.mtp_layout();
+        let mut names = ck.names_under(&format!("{}.", lay.layer));
+        names.extend(ck.tensor_names(&[lay.fc, lay.norm_embed, lay.norm_hidden, lay.norm]));
+        names.extend(lay.head.iter().filter(|h| ck.has(h)).cloned());
+        push(names, Work::Mtp);
     }
     for &i in &layers[half..] {
         push(ck.names_under(&format!("{root}.layers.{}.", range.start + i)), Work::Layer(i));

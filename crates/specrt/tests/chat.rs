@@ -106,6 +106,7 @@ fn every_family_template_gets_its_tool_parser_or_an_explicit_none() {
         ("qwen3.5", ToolFormat::XmlFunction),
         ("qwen3.5-moe", ToolFormat::XmlFunction),
         ("qwen3.8", ToolFormat::XmlFunction),
+        ("glm4.5", ToolFormat::KeyValueXml),
         ("gpt-oss", ToolFormat::Harmony),
     ];
     for (family, want) in table {
@@ -127,6 +128,26 @@ fn the_tool_format_comes_from_the_template_text() {
     assert_eq!(ToolFormat::KeyValueXml.parser(), Some("xml_kv"));
     assert_eq!(ToolFormat::Hermes.parser(), Some("hermes"));
     assert_eq!(ToolFormat::Unparsed.parser(), None);
+}
+
+#[test]
+fn the_glm_template_renders_tools_and_a_tool_call_in_the_key_value_xml_the_parser_reads() {
+    let t = family_template("glm4.5");
+    assert_eq!(t.tool_format().parser(), Some("xml_kv"));
+    let tool = serde_json::json!({"type": "function", "function": {"name": "get_weather", "description": "d", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}});
+    let call = serde_json::json!({"type": "function", "function": {"name": "get_weather", "arguments": {"city": "Dublin", "days": 3}}});
+    let messages = [
+        serde_json::json!({"role": "user", "content": "weather?"}),
+        serde_json::json!({"role": "assistant", "content": "", "tool_calls": [call]}),
+        serde_json::json!({"role": "tool", "content": "rain"}),
+    ];
+    let text = t.render_with(&messages, &serde_json::json!({"tools": [tool]})).unwrap();
+    assert!(text.starts_with("[gMASK]<sop>"), "{text}");
+    assert!(text.contains("<tools>") && text.contains("\"name\": \"get_weather\""), "{text}");
+    assert!(text.contains("<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Dublin</arg_value>"), "{text}");
+    assert!(text.contains("<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n</tool_call>"), "{text}");
+    assert!(text.contains("<tool_response>\nrain\n</tool_response>"), "{text}");
+    assert!(text.ends_with("<|assistant|>\n<think>") || text.ends_with("<|assistant|>"), "{text}");
 }
 
 #[test]

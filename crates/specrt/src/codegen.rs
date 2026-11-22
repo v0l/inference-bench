@@ -308,7 +308,13 @@ pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::Li
 }
 
 pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::linear::LinearKernel>> {
-    let Some(la) = spec.linear_attention.as_ref() else { return Ok(Vec::new()) };
+    let Some(la) = spec.linear_attention.as_ref() else {
+        if spec.speculative().is_none() {
+            return Ok(Vec::new());
+        }
+        let unused = kir::linear::LinearShape { key_heads: 1, value_heads: 1, head_dim: 16, conv_kernel: 2, tiled_value_heads: false };
+        return Ok(vec![kir::linear::LinearKernel::new(target, kir::linear::Family::Draft, unused).map_err(anyhow::Error::msg)?]);
+    };
     let shape = linear_kernel_shape(la);
     let mut out = Vec::new();
     for f in kir::linear::Family::ALL {
@@ -537,12 +543,14 @@ impl Module {
                 smem.insert(f.out, f.out_smem);
             }
         }
-        if la.is_some() {
+        if la.is_some() || !linear.is_empty() {
             source.push('\n');
             source.push_str(&linear_source);
             for k in &linear {
                 kernels.extend_from_slice(k.family.kernels());
             }
+        }
+        if la.is_some() {
             kernels.extend_from_slice(GDN_KERNELS);
             smem.insert("lin_ba_rows", 0);
         }

@@ -186,7 +186,7 @@ impl ChatTemplate {
         env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
             Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
         });
-        env.add_filter("tojson", |v: minijinja::Value| -> Result<minijinja::Value, minijinja::Error> {
+        env.add_filter("tojson", |v: minijinja::Value, _options: minijinja::value::Kwargs| -> Result<minijinja::Value, minijinja::Error> {
             let json = serde_json::to_value(&v)
                 .map_err(|e| minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, e.to_string()))?;
             Ok(minijinja::Value::from_safe_string(py_json(&json)))
