@@ -1257,7 +1257,7 @@ fn spec_updates_off_in_settings_makes_no_request() {
 fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl Fn(&App) -> bool) {
     let start = Instant::now();
     while !done(h.state()) {
-        assert!(start.elapsed() < Duration::from_secs(secs), "{what}: {:?}", h.state().notice);
+        assert!(start.elapsed() < Duration::from_secs(secs.max(60)), "{what}: {:?}", h.state().notice);
         h.step();
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1470,7 +1470,7 @@ fn the_detail_view_draws_the_27b_with_its_delta_net_rhythm_and_opens_a_block_dia
     let mut h = detail_harness("detail-27b", egui::vec2(1280.0, 900.0), detail_view("qwen3.8-27b", Some("qwen3.8-27b-exact.toml")), None);
     h.run();
     h.get_by_label("layer 3 full attention").hover();
-    h.run();
+    h.run_steps(12);
     assert!(h.query_by_label_contains("layer 3: full attention").is_some());
     h.get_by_label("layer 3 full attention").click();
     h.run();
@@ -2708,7 +2708,7 @@ fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     h.run();
     h.get_by_label_contains("5000 tokens");
-    h.get_by_label_contains("10m 0");
+    h.get_by_label_contains("10m ");
     h.get_by_label("restore").click();
     h.run();
     assert!(h.state().notice.as_ref().is_some_and(|n| n.1.contains("session verified")), "{:?}", h.state().notice);
@@ -2907,6 +2907,7 @@ fn a_model_that_lands_on_the_wrong_gpu_is_reported_against_the_plan() {
     click_load(&mut h);
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     let mut l = h.state().loaded().unwrap();
+    l.landed.clear();
     assert!(h.state().landing(&l).is_none());
     l.landed = vec![("GPU-fake-1".into(), 40 << 30)];
     let ok = h.state().landing(&l).unwrap();

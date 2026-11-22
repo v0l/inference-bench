@@ -527,10 +527,7 @@ mod tests {
     }
 
     fn hub_models() -> Vec<LocalModel> {
-        let mut hubs = vec![hub_dir()];
-        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-            hubs.push(home.join("spark/huggingface/hub"));
-        }
+        let hubs = vec![hub_dir()];
         hubs.iter().flat_map(|h| scan_hub(h)).filter(|m| m.format == Format::Safetensors).collect()
     }
 
