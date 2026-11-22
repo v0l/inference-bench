@@ -606,8 +606,9 @@ mod tests {
     fn each_rank_loads_the_matching_rows_of_the_head_and_the_draft_head() {
         use crate::spec::Quant;
         use crate::weights::Matrix;
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-qwen3.5-mtp");
-        let mut s = spec("tiny-qwen3.5-mtp/config.json");
+        const MTP_FIXTURE: &str = "tiny-qwen3.5-mtp";
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(MTP_FIXTURE);
+        let mut s = spec(&format!("{MTP_FIXTURE}/config.json"));
         s.repo = dir.display().to_string();
         let ck = crate::weights::Checkpoint::for_repo(&s.repo).unwrap().renamed(&s.tensors);
         let (_, whole) = ck.head(&s).unwrap();
@@ -817,12 +818,12 @@ mod tests {
         odd.dims.vocab = 1000;
         odd.head_quant = Some(crate::spec::Quant::Nvfp4G16);
         assert_eq!(head_split(&odd, 3).unwrap(), None, "a last nvfp4 slice of 328 rows keeps the head whole");
-        let mut phi = spec("tiny-phi3/config.json");
-        phi.attention.heads = 6;
-        phi.attention.kv_heads = 3;
-        phi.dims.intermediate = 288;
-        phi.dims.vocab = 1024;
-        assert_eq!(rank_spec_of(&phi, 3, 2).unwrap().dims.head_rows, Some(704..1024));
+        let mut wide = spec("tiny-phi3/config.json");
+        wide.attention.heads = 6;
+        wide.attention.kv_heads = 3;
+        wide.dims.intermediate = 288;
+        wide.dims.vocab = 1024;
+        assert_eq!(rank_spec_of(&wide, 3, 2).unwrap().dims.head_rows, Some(704..1024));
     }
 
     #[test]

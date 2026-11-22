@@ -16,7 +16,7 @@ Our own tensor-parallel mode, with no NCCL. `serve.tp = N` splits one model acro
 | `serve.tp` in the options schema and the server config | done, default 1 |
 | Load dialog choice | left to #776, which owns `load.rs` |
 | MoE | two splits (#798), chosen by `tp::plan_moe` with the reason; `[moe] tp_split = "auto" / "experts" / "columns"` overrides. `columns`: every expert cut like the dense MLP. `experts`: rank r owns experts r*E/tp.. (the shared expert lives on rank 0), every rank routes all tokens, `moe_route` writes idx -1 and coef 0 for experts it does not own, so the rank's `moe_combine` writes a zero contribution into `Buf::Partial`. Both end in `Op::AllReduce`. Auto picks columns when each rank keeps at least 256 columns per expert, else experts; it falls back to whichever divides. Virtual-rank tests pass on the Spark for both |
-| 27B TP=2 against TP=1 numbers | measured 20 Nov, see Measurements: batch 1 decode 1.45x, short of the 1.6x target |
+| 27B TP=2 against TP=1 numbers | measured 20 Nov, see Measurements: batch 1 decode 1.45x, short of the 1.6x target. Vocabulary-sharded heads (#921) built and proven on virtual ranks; the two-card speed run is pending |
 
 ## Sharding in the spec
 
@@ -26,9 +26,14 @@ Each `linear` node in `graphs/decoder.toml` has a `shard`:
 | --- | --- | --- |
 | `column` | split the output rows by head | `qkv`, `gate_up`, `lin_in`, `lin_ba`, `mtp_qkv`, `mtp_gate_up` |
 | `row` | split the input columns; the result is a partial that needs an allreduce | `o`, `down`, `lin_out`, `mtp_o`, `mtp_down` |
-| `replicate` | every rank holds the whole matrix | `lm_head`, `mtp_fc`, `mtp_head` |
+| `replicate` | every rank holds the whole matrix | `mtp_fc` |
+| `vocab` | each rank holds a slice of the vocabulary rows and computes its logits; `ar_gather_f32` rebuilds the full row on every rank | `lm_head`, `mtp_head` |
 
-`Graph::shards()` returns the map and refuses a linear node without a shard, or a weight declared two ways. The embedding, norms and the head stay whole on every rank, so every rank computes the same logits and samples the same token. `TpExecutor` checks that the ranks agree on every token and stops with an error if they ever differ.
+`Graph::shards()` returns the map and refuses a linear node without a shard, or a weight declared two ways. The embedding and norms stay whole on every rank.
+
+Vocabulary heads (#921): rank r owns rows `r * each .. min((r + 1) * each, vocab)` with `each = ceil(vocab / tp)` rounded up to 16 rows (`tp::vocab_span`; 248320 at tp 2 gives two halves of 124160, 1000 at tp 3 gives 336, 336, 328). `tp::rank_spec_of` puts the span in `Dims::head_rows`, so the head GEMM is generated `head_rows.len()` wide and the loader reads only those rows (`Checkpoint::head`, `draft_head`). The nvfp4 draft head takes its global scale from the whole head, so each rank's bytes equal the matching rows of the tp1 head. After the slice GEMM, the plan op gathers the slices through the fabric (`Comm::gather_rows`, kir `Mode::Gather`, one barrier, float4 copies when both widths allow it), so every rank holds the identical full logits row. Sampling, top-k, top-p, min-p, grammar masks, logprobs, MTP drafting and the speculative accept rule are unchanged and see the same numbers as before, so greedy and sampled tokens equal tp1 by construction. A head whose last slice would not fit the kernels (fewer than one row, an odd count, or not a multiple of 16 rows for nvfp4) stays replicated (`tp::head_split`). What is saved: the head GEMM is 1/tp of the weight read per rank; what is added: one gather per head call (rows x vocab x 4 bytes). The single stream `step` path refuses a sharded rank; serving runs the plan.
+
+`TpExecutor` checks that the ranks agree on every token and stops with an error if they ever differ.
 
 `tp::RankCut::new(spec, graph, tp, rank)` turns the shards into cuts of checkpoint tensors:
 
@@ -70,7 +75,7 @@ Whenever the transport would be `Peer` or `SameDevice`, `Fabric::new` then runs 
 
 `Plan::for_tp` rewrites each plan: a `row` linear that wrote `x` writes `Partial` instead and is followed by `AllReduce`. When `[runtime] fuse` is on and the next op is the norm into the GEMM planes, the pair becomes one `AllReduceNorm`. Decode, prefill, verify and the MTP plans are all rewritten.
 
-MTP: the draft layer is sharded like any layer (it is attention plus MLP), and the draft head is replicated. Each rank drafts, verifies and accepts the same tokens, and the executor checks they agree. A separate broadcast from rank 0 is not needed.
+MTP: the draft layer is sharded like any layer (it is attention plus MLP), and the draft head is sharded over the vocabulary like `lm_head`. Each rank drafts, verifies and accepts the same tokens from the gathered logits, and the executor checks they agree. A separate broadcast from rank 0 is not needed.
 
 CUDA graphs: each rank captures its own graph per row count. Virtual ranks on one GPU run without graphs. Two ranks' graphs on one device can each fill the work queue, leaving one rank's barrier waiting on the other's kernel that never starts (seen on the GB10 as a hang in the graphed phi3 run). Separate GPUs do not share queues.
 
@@ -115,6 +120,18 @@ tiny-qwen3.5-27b tp2 (host pinned): logits max |d| 2.580e-4 (of 4.74), top-1 48/
 tiny-qwen3.5-27b tp2: logits max |d| 2.580e-4 (of 4.74), top-1 48/48, greedy streams identical 6/6
 test result: ok. 6 passed; 0 failed
 ```
+
+Desktop GPU1 (RTX PRO 6000 Max-Q, virtual ranks), 22 Nov, after the vocabulary-sharded heads (#921). The whole `tp` suite (13 passed) and `the_vocab_gather_rebuilds_every_row_on_every_rank` (tp 2 and 3, vocab 1024, 1001 and 248320, 1 to 9 rows, also host pinned, bit-exact):
+
+```
+tiny-mistral tp2 vocab-sharded heads [0..256, 256..512]: greedy streams identical 6/6, sampled streams identical 6/6
+tiny-qwen3.5-27b tp2 vocab-sharded heads [0..512, 512..1024]: greedy streams identical 6/6, sampled streams identical 6/6
+tiny-tp3-vocab1000 tp3 vocab-sharded heads [0..336, 336..672, 672..1000]: greedy streams identical 6/6, sampled streams identical 6/6
+tiny-qwen3.5-27b tp2 nvfp4 draft head sharded, sampled with mtp: identical to tp1 with mtp 6/6, to tp1 without mtp 6/6
+tiny-qwen3.5-27b tp2: logits max |d| 2.580e-4 (of 4.74), top-1 48/48, greedy streams identical 6/6
+```
+
+Sampled streams use temperature 0.8 with plain, top-k 40, and top-p 0.9 plus min-p 0.02 requests. `tiny-qwen3.5-27b tp2 with mtp` (greedy, against tp1 without mtp) is 5/6 both before and after this change on this card; the test allows one stream.
 
 Each stream is 64 greedy tokens. The logits are not bit-identical to TP=1: a row-parallel GEMM sums half the K dimension per rank and the allreduce adds the halves, which rounds differently from one K loop. The drift is below 1.2e-4 of the logit range, and top-1 and every greedy token match. The tiny qwen3.5 fixture has 2 key heads, so it runs at tp 2 only; phi3 runs at tp 4.
 

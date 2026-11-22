@@ -120,7 +120,7 @@ pub const PROBE_WAIT: &str = "ar_probe_wait";
 pub const PROBE_STORE: &str = "ar_probe_store";
 
 fn gather(k: &AllReduceKernel, width: u32, each: u32) -> String {
-    let vec = if width % 4 == 0 && each % 4 == 0 { 4 } else { 1 };
+    let vec = if width.is_multiple_of(4) && each.is_multiple_of(4) { 4 } else { 1 };
     let (t, load) = if vec == 4 { ("float4", "__ldcg((const float4*)table[p] + i)") } else { ("float", "__ldcg((const float*)table[p] + i)") };
     let mut s = header(k.threads, &k.name(), "const float* in, float* out, const unsigned long long* table, int rank, int rows");
     s += &format!("    constexpr int WIDTH = {width} / {vec};\n    constexpr int EACH = {each} / {vec};\n    __shared__ unsigned epoch;\n    ar_begin(table, rank, &epoch);\n    {t}* mine = ({t}*)table[rank];\n    const {t}* src = (const {t}*)in;\n    {t}* dst = ({t}*)out;\n");
