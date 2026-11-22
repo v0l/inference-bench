@@ -49,8 +49,7 @@ to allocate and free, and a table entry is the same for all layers. The kernels 
 - **Chunked prefill and the inter-token target.** Each step decodes every running decoder, then
   spends a prefill budget on the waiting prefills in FCFS order, in chunks of at most
   `max_batched_tokens - decoders` and the runtime chunk (2048). With decoders running, the budget
-  is `itl_target` (default 100 ms) times the measured prefill rate, in multiples of 64 tokens, so
-  a step costs about one decode plus one `itl_target` of prefill. Until a rate has been measured
+  is `(step_cost - 1)` times the measured plain decode step, times the measured prefill rate, in multiples of 64 tokens, so a step costs about `step_cost` decode steps (server config `step_cost`, default 3, 1 or less is off; `itl_target_ms`, default off, is an optional absolute cap). Until a rate has been measured
   the first chunk next to decoders is 64 tokens. The prefill time is measured after a stream
   synchronise: without it the asynchronous launches made prefill look free, the rate estimate ran
   away, and one step took 3.3 s on the 27B. Unit tests:
