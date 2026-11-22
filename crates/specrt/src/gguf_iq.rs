@@ -1,4 +1,4 @@
-// CPU dequantisers for the ggml i-quants. Reference: llama.cpp ggml/src/ggml-quants.c,
+// CPU dequantisers for the ggml i-quants. Reference: ggml/src/ggml-quants.c,
 // dequantize_row_iq* (MIT). Grid and codebook tables are in kir::iq_tables, generated
 // from ggml-common.h by crates/kir/scripts/gen_iq_tables.py.
 use kir::iq_tables::*;
