@@ -1404,7 +1404,12 @@ fn parse_rope_scaling(rope: &crate::family::FamilyRope, value: Option<&serde_jso
 impl Spec {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path).with_context(|| path.display().to_string())?;
-        Self::parse(&text).with_context(|| path.display().to_string())
+        let mut spec = Self::parse(&text).with_context(|| path.display().to_string())?;
+        let beside = path.with_extension("hotlist");
+        if spec.runtime.offload.hotlist.is_none() && beside.exists() {
+            spec.runtime.offload.hotlist = Some(beside.display().to_string());
+        }
+        Ok(spec)
     }
 
     pub fn parse(text: &str) -> Result<Self> {

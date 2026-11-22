@@ -346,6 +346,8 @@ const META: &[Meta] = &[
     Meta { key: "runtime.offload.host_budget", label: "host memory cap", group: Group::Offload, help: "Bytes of pinned host memory for streamed layers. 0 means no cap.", choices: &[], range: (0, u64::MAX) },
     Meta { key: "runtime.offload.nvme_path", label: "disk spill folder", group: Group::Offload, help: "Folder on a fast drive for layers that fit neither tier.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.offload.prefetch_depth", label: "prefetch depth", group: Group::Offload, help: "Layers copied ahead of the one computing.", choices: &[], range: (1, 8) },
+    Meta { key: "runtime.offload.expert_slots", label: "expert slots", group: Group::Offload, help: "Experts kept on the card for a mixture of experts model, shared by every layer. Missing experts copy in after the router picks them. 0 sizes the cache from the weight memory cap.", choices: &[], range: (0, 1 << 20) },
+    Meta { key: "runtime.offload.hotlist", label: "expert hotlist", group: Group::Offload, help: "File of expert use counts from a calibration run. The most used experts are loaded first and guide prefetch before the router has history.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.offload.policy", label: "eviction policy", group: Group::Offload, help: "Which resident page leaves first when a tier is full.", choices: &["lru", "frequency"], range: (0, 0) },
     Meta { key: "runtime.loader.host_budget_mb", label: "host budget", group: Group::Loader, help: "Megabytes of host memory the loader may use for staging.", choices: &[], range: (64, 1 << 20) },
 ];
@@ -402,7 +404,7 @@ fn populated_runtime() -> RuntimeOptions {
         compile_jobs: Some(1),
         prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: 16, max_snapshots: 1, max_blocks: 1, async_snapshots: true },
         loader: LoaderOptions { enabled: true, direct: true, chunk_mb: 1, readers: 1, ahead: 1, workers: 1, lanes: 1, skip_cached: true, pinned: true, host_budget_mb: 64 },
-        offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency },
+        offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency, expert_slots: 3, hotlist: Some("x".into()) },
         vision: crate::spec::VisionOptions { precision: crate::vision_encoder::VisionPrecision::Exact, cache_mb: 1, max_batch: 1, pan_and_scan: false },
     }
 }
