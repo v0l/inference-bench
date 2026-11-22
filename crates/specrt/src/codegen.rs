@@ -81,14 +81,10 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
 pub use kir::attention::PAGE;
 pub const Q8_GROUP: usize = 32;
 pub const FP8_BLOCK: usize = 128;
-pub use kir::attention::{DECODE_CHUNK, DECODE_KEYS, DECODE_MAX_QLEN, DECODE_MAX_SPLITS, DECODE_STAGES, decode_chunk, decode_splits, flash_keys, flash_stages};
+pub use kir::attention::{flash_rows, DECODE_CHUNK, DECODE_KEYS, DECODE_MAX_QLEN, DECODE_MAX_SPLITS, DECODE_STAGES, decode_chunk, decode_splits, flash_keys, flash_stages};
 
 pub fn decode_warps(group: usize, qlen: usize) -> usize {
     (group * qlen).div_ceil(16)
-}
-
-pub fn flash_rows(_head_dim: usize) -> usize {
-    kir::attention::FLASH_ROWS
 }
 
 pub fn kir_shape(spec: &Spec) -> kir::desc::Shape {
