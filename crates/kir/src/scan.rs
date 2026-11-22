@@ -6,7 +6,14 @@ pub const WARP: u32 = 32;
 
 pub const BUILTINS: [&str; 6] = ["s", "scale", "q_pos", "k_pos", "head", "kv_head"];
 
-const GENERATED: [&str; 34] = [
+const GENERATED: &[&str] = &[
+    "dot", "m", "l", "m_new", "corr", "p", "t", "q", "acc", "lane", "warp", "row", "table", "top", "denom", "total", "kr", "vr", "ksc", "vsc", "part", "d", "j", "at", "hi", "lo", "v", "w", "q_pos_i", "sink_logit", "visible", "e", "r", "slot",
+];
+
+const TILE_NAMES: &[&str] = &[
+    "key", "live", "tokens", "base", "pos0", "pos1", "row0", "row1", "tid", "g", "kt", "k0", "nb", "np", "kb", "m0", "m1", "l0", "l1", "n0", "n1", "a0", "a1", "i0", "i1", "ph", "pl", "qh", "ql", "bh", "bl", "mx0", "mx1", "sum0", "sum1", "nm", "tiles", "key_end", "warp_last", "sink_l2", "mf0", "mf1", "LOG2E",
+    "o", "dst", "src",
+    "which",
     "dot", "m", "l", "m_new", "corr", "p", "t", "q", "acc", "lane", "warp", "row", "table", "top", "denom", "total", "kr", "vr", "ksc", "vsc", "part", "d", "j", "at", "hi", "lo", "v", "w", "q_pos_i", "sink_logit", "visible", "e", "r", "slot",
 ];
 
@@ -205,17 +212,29 @@ impl Scan {
                 return Err("a block source needs positive layers and keys equal to values".into());
             }
         }
-        self.lines(params, true)?;
-        self.lines(params, false)?;
+        self.lines(params, true, false)?;
+        self.lines(params, false, false)?;
+        if self.tile_eligible() && self.tile_names_free(params) {
+            self.lines(params, true, true)?;
+        }
         Ok(())
     }
 
-    fn lines(&self, params: &[Param], masks: bool) -> Result<(Vec<String>, String), String> {
+    pub fn tile_eligible(&self) -> bool {
+        self.geometry.is_none() && !self.stages.iter().any(|s| matches!(s, Stage::Select { .. }))
+    }
+
+    pub fn tile_names_free(&self, params: &[Param]) -> bool {
+        let used = |n: &str| params.iter().any(|p| p.name == n) || self.consts.iter().any(|c| c.name == n) || self.stages.iter().any(|s| matches!(s, Stage::Epilogue { dst, .. } if dst == n));
+        !TILE_NAMES.iter().any(|n| used(n))
+    }
+
+    fn lines(&self, params: &[Param], masks: bool, tile: bool) -> Result<(Vec<String>, String), String> {
         let mut env: Vec<(String, Expr)> = vec![
-            ("s".into(), Expr::Raw("dot".into())),
+            ("s".into(), Expr::Raw(if tile { "s[nb][e]" } else { "dot" }.into())),
             ("scale".into(), Expr::Raw("QUERY_SCALE".into())),
             ("q_pos".into(), Expr::Raw("(float)q_pos_i".into())),
-            ("k_pos".into(), Expr::Raw("(float)t".into())),
+            ("k_pos".into(), Expr::Raw(if tile { "(float)key" } else { "(float)t" }.into())),
             ("head".into(), Expr::Raw("(float)head".into())),
             ("kv_head".into(), Expr::Raw("(float)kv_head".into())),
         ];
@@ -238,10 +257,13 @@ impl Scan {
                 }
                 Stage::Mask { expr } => {
                     let text = lower(expr, &env)?;
-                    if masks {
+                    if tile {
+                        lines.push(format!("live = live && ({text});"));
+                    } else if masks {
                         lines.push(format!("if (!({text})) continue;"));
                     }
                 }
+                Stage::Select { .. } if tile => return Err("select_from has no tile lowering".into()),
                 Stage::Select { index, row } => lines.push(format!(
                     "{{ bool sel_hit = false; for (int sel_j = lane; sel_j < {row}; sel_j += 32) sel_hit |= {index}[(size_t)row * {row} + sel_j] == t; if (!__any_sync(0xffffffff, sel_hit)) continue; }}"
                 )),
@@ -260,7 +282,7 @@ impl Scan {
         if let Some(g) = &self.geometry {
             return self.emit_state_cuda(k, g);
         }
-        let (lines, value) = self.lines(&k.params, true)?;
+        let (lines, value) = self.lines(&k.params, true, false)?;
         let sink = self.sink();
         let sig: Vec<String> = k
             .params
@@ -284,6 +306,12 @@ impl Scan {
         let (sink_decl, top_init, sink_denom) = match sink {
             Some(n) => (format!("    float sink_logit = {n}[head];\n"), "sink_logit", "expf(sink_logit - top)"),
             None => (String::new(), "NEG_INF", "0.0f"),
+        };
+        let tile = if self.tile_eligible() && self.tile_names_free(&k.params) && k.target.has(crate::Feature::Mma16816) && k.target.has(crate::Feature::CpAsync) {
+            let (tile_lines, tile_value) = self.lines(&k.params, true, true)?;
+            crate::cuda::scan_tile_prefill(&crate::cuda::TileScan { name: k.name, sig: &sig.join(", "), lines: &tile_lines, value: &tile_value, sink })
+        } else {
+            String::new()
         };
         Ok(format!(
             "extern \"C\" __global__ void __launch_bounds__({threads}) {name}({sig}) {{
@@ -359,7 +387,7 @@ impl Scan {
     }}
 }}
 
-",
+{tile}",
             threads = k.threads,
             name = k.name,
             sig = sig.join(", "),
@@ -367,8 +395,8 @@ impl Scan {
     }
 
     fn emit_state_cuda(&self, k: &Kernel, g: &Geometry) -> Result<String, String> {
-        let (lines, value) = self.lines(&k.params, true)?;
-        let (block_lines, _) = self.lines(&k.params, false)?;
+        let (lines, value) = self.lines(&k.params, true, false)?;
+        let (block_lines, _) = self.lines(&k.params, false, false)?;
         let sig: Vec<String> = k
             .params
             .iter()
