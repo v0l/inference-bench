@@ -20,6 +20,9 @@ pub struct OffloadSettings {
     pub nvme_path: Option<String>,
     pub prefetch_depth: usize,
     pub policy: Policy,
+    pub expert_slots: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotlist: Option<String>,
 }
 
 impl OffloadSettings {
@@ -38,7 +41,7 @@ fn default_prefetch_depth() -> usize {
 
 impl Default for OffloadSettings {
     fn default() -> Self {
-        OffloadSettings { vram_budget: 0, host_budget: 0, nvme_path: None, prefetch_depth: default_prefetch_depth(), policy: Policy::Lru }
+        OffloadSettings { vram_budget: 0, host_budget: 0, nvme_path: None, prefetch_depth: default_prefetch_depth(), policy: Policy::Lru, expert_slots: 0, hotlist: None }
     }
 }
 
@@ -240,6 +243,116 @@ impl<S: PageSource> TieredStore<S> {
             inner.stats.evictions += evicted.len() as u64;
         }
         Ok(data)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExpertHotlist {
+    pub counts: Vec<Vec<u64>>,
+}
+
+impl ExpertHotlist {
+    pub fn new(layers: usize, experts: usize) -> Self {
+        ExpertHotlist { counts: vec![vec![0; experts]; layers] }
+    }
+
+    pub fn record(&mut self, layer: usize, expert: usize) {
+        if let Some(c) = self.counts.get_mut(layer).and_then(|l| l.get_mut(expert)) {
+            *c += 1;
+        }
+    }
+
+    pub fn top(&self, layer: usize, k: usize) -> Vec<usize> {
+        let Some(l) = self.counts.get(layer) else { return vec![] };
+        let mut ids: Vec<usize> = (0..l.len()).filter(|&e| l[e] > 0).collect();
+        ids.sort_by_key(|&e| (std::cmp::Reverse(l[e]), e));
+        ids.truncate(k);
+        ids
+    }
+
+    pub fn hottest(&self, k: usize) -> Vec<(usize, usize)> {
+        let mut all: Vec<(u64, usize, usize)> = self.counts.iter().enumerate().flat_map(|(l, c)| c.iter().enumerate().filter(|(_, n)| **n > 0).map(move |(e, n)| (*n, l, e))).collect();
+        all.sort_by_key(|&(n, l, e)| (std::cmp::Reverse(n), l, e));
+        all.into_iter().take(k).map(|(_, l, e)| (l, e)).collect()
+    }
+
+    pub fn load(path: &std::path::Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        Ok(serde_json::from_str(&text)?)
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> Result<()> {
+        std::fs::write(path, serde_json::to_string(self)?).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))
+    }
+}
+
+pub struct SlotBook {
+    page_of: Vec<Option<usize>>,
+    slot_of: HashMap<usize, usize>,
+    last_use: Vec<u64>,
+    uses: Vec<u64>,
+    pinned: Vec<bool>,
+    clock: u64,
+    policy: Policy,
+    pub stats: OffloadStats,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Acquired {
+    pub slot: usize,
+    pub copy: bool,
+}
+
+impl SlotBook {
+    pub fn new(slots: usize, policy: Policy) -> Self {
+        SlotBook { page_of: vec![None; slots], slot_of: HashMap::new(), last_use: vec![0; slots], uses: vec![0; slots], pinned: vec![false; slots], clock: 0, policy, stats: OffloadStats::default() }
+    }
+
+    pub fn slots(&self) -> usize {
+        self.page_of.len()
+    }
+
+    pub fn resident(&self, page: usize) -> Option<usize> {
+        self.slot_of.get(&page).copied()
+    }
+
+    pub fn unpin_all(&mut self) {
+        self.pinned.iter_mut().for_each(|p| *p = false);
+    }
+
+    pub fn acquire(&mut self, page: usize, pin: bool, speculative: bool) -> Option<Acquired> {
+        self.clock += 1;
+        if let Some(&slot) = self.slot_of.get(&page) {
+            self.last_use[slot] = self.clock;
+            if !speculative {
+                self.uses[slot] += 1;
+                self.stats.vram_hits += 1;
+            }
+            self.pinned[slot] |= pin;
+            return Some(Acquired { slot, copy: false });
+        }
+        let slot = match self.page_of.iter().position(Option::is_none) {
+            Some(free) => free,
+            None => (0..self.page_of.len())
+                .filter(|&s| !self.pinned[s])
+                .min_by_key(|&s| match self.policy {
+                    Policy::Lru => (self.last_use[s], 0, s),
+                    Policy::Frequency => (self.uses[s], self.last_use[s], s),
+                })?,
+        };
+        if let Some(old) = self.page_of[slot].take() {
+            self.slot_of.remove(&old);
+            self.stats.evictions += 1;
+        }
+        self.page_of[slot] = Some(page);
+        self.slot_of.insert(page, slot);
+        self.last_use[slot] = self.clock;
+        self.uses[slot] = u64::from(!speculative);
+        self.pinned[slot] = pin;
+        if !speculative {
+            self.stats.host_hits += 1;
+        }
+        Some(Acquired { slot, copy: true })
     }
 }
 
@@ -504,6 +617,66 @@ mod tests {
         assert!(tps(14_000_000_000) > tps(4_000_000_000));
         let full = tps(30_000_000_000);
         assert!((full - 1500.0 / 27.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn slot_book_hits_and_evicts_least_recent() {
+        let mut b = SlotBook::new(2, Policy::Lru);
+        assert_eq!(b.acquire(10, false, false), Some(Acquired { slot: 0, copy: true }));
+        assert_eq!(b.acquire(11, false, false), Some(Acquired { slot: 1, copy: true }));
+        assert_eq!(b.acquire(10, false, false), Some(Acquired { slot: 0, copy: false }));
+        assert_eq!(b.acquire(12, false, false), Some(Acquired { slot: 1, copy: true }));
+        assert_eq!(b.resident(11), None);
+        assert_eq!((b.stats.vram_hits, b.stats.host_hits, b.stats.evictions), (1, 3, 1));
+    }
+
+    #[test]
+    fn slot_book_never_evicts_pinned_pages() {
+        let mut b = SlotBook::new(2, Policy::Lru);
+        b.acquire(1, true, false).unwrap();
+        b.acquire(2, true, false).unwrap();
+        assert_eq!(b.acquire(3, true, false), None);
+        b.unpin_all();
+        assert!(b.acquire(3, true, false).is_some());
+    }
+
+    #[test]
+    fn slot_book_frequency_keeps_the_busy_page() {
+        let mut b = SlotBook::new(2, Policy::Frequency);
+        b.acquire(1, false, false).unwrap();
+        for _ in 0..3 {
+            b.acquire(1, false, false).unwrap();
+        }
+        b.acquire(2, false, false).unwrap();
+        b.acquire(3, false, false).unwrap();
+        assert!(b.resident(1).is_some());
+        assert!(b.resident(2).is_none());
+    }
+
+    #[test]
+    fn speculative_acquire_is_not_counted_as_a_use() {
+        let mut b = SlotBook::new(2, Policy::Lru);
+        b.acquire(1, false, true).unwrap();
+        assert_eq!(b.stats.host_hits, 0);
+        assert_eq!(b.acquire(1, false, false), Some(Acquired { slot: 0, copy: false }));
+        assert_eq!(b.stats.vram_hits, 1);
+    }
+
+    #[test]
+    fn hotlist_ranks_by_count_and_round_trips() {
+        let mut h = ExpertHotlist::new(2, 4);
+        for _ in 0..3 {
+            h.record(0, 2);
+        }
+        h.record(0, 1);
+        h.record(1, 3);
+        h.record(1, 3);
+        assert_eq!(h.top(0, 2), vec![2, 1]);
+        assert_eq!(h.hottest(2), vec![(0, 2), (1, 3)]);
+        let path = std::env::temp_dir().join(format!("hotlist-{}.json", std::process::id()));
+        h.save(&path).unwrap();
+        assert_eq!(ExpertHotlist::load(&path).unwrap(), h);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
