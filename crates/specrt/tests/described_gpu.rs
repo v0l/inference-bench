@@ -156,3 +156,68 @@ fn the_single_stream_step_runs_described_attention_and_matches_transformers() {
     let [prefill, decode, scalar] = rt.scan_launches();
     assert!(prefill + decode + scalar > 0, "the step path ran no described kernel");
 }
+
+const SLIDING: &str = "tiny-qwen3-sliding";
+
+fn plain_variants() -> (Spec, Spec) {
+    install();
+    let json = std::fs::read_to_string(fixture(SLIDING).join("config.json")).unwrap();
+    let mut stock = Spec::from_hf_config_serving_in(Families::embedded(), &json).unwrap();
+    stock.name = SLIDING.into();
+    stock.repo = fixture(SLIDING).display().to_string();
+    stock.layers.window = None;
+    stock.layers.pattern = vec![specrt::spec::Block::Full, specrt::spec::Block::Full];
+    stock.mlp.act_quant = specrt::spec::ActQuant::None;
+    stock.mlp.up_act_planes = 1;
+    stock.mlp.down_act_planes = 1;
+    let described = Spec::parse(&format!("{}\n{NODES}", stock.to_toml().unwrap())).unwrap_or_else(|e| panic!("{e:#}"));
+    (stock, described)
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_described_plain_scan_decodes_the_same_tokens_as_stock_flash_and_batch_decode() {
+    let (stock, described) = plain_variants();
+    let vocab = stock.dims.vocab as u32;
+    let prompt: Vec<u32> = (0..200u32).map(|i| i.wrapping_mul(2654435761) % vocab).collect();
+    let want = Runtime::load_batched(&stock, 512, 1).unwrap().generate_batch(std::slice::from_ref(&prompt), 48).unwrap().tokens;
+    let mut rt = Runtime::load_batched(&described, 512, 1).unwrap();
+    for tile in [false, true] {
+        rt.set_scan_tile(tile);
+        let got = rt.generate_batch(std::slice::from_ref(&prompt), 48).unwrap().tokens;
+        assert_eq!(got, want, "tile {tile}");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU quiet enough to time"]
+fn a_described_plain_scan_versus_stock_flash_and_batch_decode_speed() {
+    let (stock, described) = plain_variants();
+    let vocab = stock.dims.vocab as u32;
+    let mut a = Runtime::load_batched(&stock, 2304, 1).unwrap();
+    let mut b = Runtime::load_batched(&described, 2304, 1).unwrap();
+    b.set_scan_tile(true);
+    for len in [512usize, 2048] {
+        let prompt: Vec<u32> = (0..len as u32).map(|i| i.wrapping_mul(2654435761) % vocab).collect();
+        let time = |rt: &mut Runtime| {
+            let g = rt.generate_batch(std::slice::from_ref(&prompt), 64).unwrap();
+            (g.prefill_secs * 1e3, g.decode_secs * 1e3)
+        };
+        time(&mut a);
+        time(&mut b);
+        let n = 7.0;
+        let (mut s, mut t, mut s2) = ((0.0, 0.0), (0.0, 0.0), (0.0, 0.0));
+        for _ in 0..7 {
+            let x = time(&mut a);
+            let y = time(&mut b);
+            let z = time(&mut a);
+            s = (s.0 + x.0, s.1 + x.1);
+            t = (t.0 + y.0, t.1 + y.1);
+            s2 = (s2.0 + z.0, s2.1 + z.1);
+        }
+        eprintln!(
+            "len {len}: stock prefill {:.2} ms decode {:.2} ms | described tile prefill {:.2} ms decode {:.2} ms | A/A prefill {:.3} decode {:.3} | described/stock prefill {:.3} decode {:.3}",
+            s.0 / n, s.1 / n, t.0 / n, t.1 / n, s2.0 / s.0, s2.1 / s.1, t.0 / s.0, t.1 / s.1
+        );
+    }
+}
