@@ -1025,6 +1025,61 @@ fn parallel_requests_with_a_real_model_run_together_and_aggregate_faster() {
 }
 
 #[test]
+#[ignore = "needs a GPU and Qwen3-0.6B in the hub cache; run with SHOTS=dir under gpu-run 1"]
+fn cold_cached_and_short_prompts_show_queue_prefill_and_new_columns_with_a_real_model() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let d = dir("per-request-real");
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 900.0)).with_accessibility_check(false).allow_missing_glyphs().wgpu().build_eframe(move |cc| {
+        egui_bench::install(&cc.egui_ctx);
+        let mut app = App::new(d, wake_for(&cc.egui_ctx), &cc.egui_ctx);
+        app.tab = Tab::Server;
+        app.logs = shared_logs();
+        app
+    });
+    pump_until(&mut h, 60, "scan", |a| !a.scan.busy() && !a.library.is_empty());
+    let qwen = h.state().library.iter().find(|m| m.name == "Qwen/Qwen3-0.6B").cloned().expect("Qwen3-0.6B in the hub cache");
+    h.state_mut().load_model_with(&qwen, 16384, 4);
+    pump_until(&mut h, 180, "load", |a| a.loaded().is_some());
+    let handle = h.state().engine.handle();
+    h.state_mut().server.start(handle, 0, "", false, false);
+    let url = h.state().server.running.as_ref().unwrap().url();
+    let long: String = (0..1400).map(|i| format!("w{} ", i * 7919 % 10007)).collect();
+    let ask = |text: String| {
+        let mut resp = ureq::post(format!("{url}/v1/chat/completions"))
+            .send_json(serde_json::json!({"messages":[{"role":"user","content":text}],"max_tokens":8,"temperature":0.0}))
+            .unwrap();
+        let _: serde_json::Value = resp.body_mut().read_json().unwrap();
+    };
+    for text in [long.clone(), long, "Say hi.".to_string()] {
+        ask(text);
+        for _ in 0..3 {
+            h.step();
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    h.run();
+    h.render().unwrap().save(out.join("per-request-real-1280.png")).unwrap();
+    let recent = crate::serving::snapshot(h.state(), crate::serving::Span::Five).recent;
+    for r in recent.iter().rev() {
+        eprintln!("{:?}", crate::serving::request_cells(r, true, true));
+    }
+    h.state_mut().server.stop();
+    let mut wide = Harness::builder().with_size(egui::vec2(1280.0, 200.0)).with_accessibility_check(false).allow_missing_glyphs().build_ui(|ui| {
+        egui_bench::install(ui.ctx());
+        crate::serving::per_request(ui, &recent);
+    });
+    wide.run();
+    wide.render().unwrap().save(out.join("per-request-table-1280.png")).unwrap();
+    let mut phone = Harness::builder().with_size(egui::vec2(390.0, 300.0)).with_accessibility_check(false).allow_missing_glyphs().build_ui(|ui| {
+        egui_bench::install(ui.ctx());
+        crate::serving::per_request(ui, &recent);
+    });
+    phone.run();
+    phone.render().unwrap().save(out.join("per-request-real-390.png")).unwrap();
+}
+
+#[test]
 fn after_a_request_prompt_rate_kv_and_the_request_log_all_show_numbers() {
     let mut h = serving_harness("after-request", 4);
     let url = h.state().server.running.as_ref().unwrap().url();
