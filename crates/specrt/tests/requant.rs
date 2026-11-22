@@ -101,7 +101,7 @@ fn compare(a: &[f32], b: &[f32], vocab: usize) -> (f64, f64) {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
-fn requantised_logits_stay_near_the_checkpoint_format_and_batch_decode_agrees() {
+fn requantised_logits_on_random_tiny_weights_stay_within_kl_and_a_loose_top1_floor_and_batch_decode_agrees() {
     let prompts: Vec<Vec<u32>> = (0..4u32).map(|q| (0..96u32).map(|i| (i * 7 + q * 131) % 1024).collect()).collect();
     let mut plain = Runtime::load(&spec_for(FP8, Requant::default()), 256).unwrap();
     let mut fp4 = Runtime::load(&spec_for(FP8, all_fp4()), 256).unwrap();

@@ -577,6 +577,33 @@ mod tests {
     }
 
     #[test]
+    fn low_memory_requantises_the_tail_mlps_and_checkpoint_exact_is_one_override_away() {
+        let mut c = EngineChoice::default();
+        c.select(Profile::LowMemory);
+        let rt = c.apply(ServeOptions::default()).unwrap().runtime.unwrap();
+        assert_eq!(rt.requant.mlp_tail, Some(Quant::Nvfp4G16));
+        assert_eq!(rt.requant.lin_in, None);
+        assert!(c.is_default("runtime.requant.mlp_tail"));
+        c.set("runtime.requant.mlp_tail", Value::Null);
+        assert!(c.is_custom());
+        let exact = c.apply(ServeOptions::default()).unwrap().runtime.unwrap();
+        assert_eq!(exact.requant, crate::spec::Requant::default());
+        let max = EngineChoice::default().apply(ServeOptions::default()).unwrap().runtime.unwrap();
+        assert_eq!(max.requant, crate::spec::Requant::default());
+    }
+
+    #[test]
+    fn requant_options_are_listed_in_the_runtime_group_with_the_active_value() {
+        let fields: Vec<Field> = schema().into_iter().filter(|f| f.key.starts_with("runtime.requant.")).collect();
+        assert_eq!(fields.len(), 6);
+        assert!(fields.iter().all(|f| f.group == Group::Runtime && !f.label.is_empty() && !f.help.is_empty()));
+        let mut c = EngineChoice::default();
+        assert_eq!(c.value("runtime.requant.mlp_tail"), Value::Null);
+        c.select(Profile::LowMemory);
+        assert_eq!(c.value("runtime.requant.mlp_tail"), json!("nvfp4_g16"));
+    }
+
+    #[test]
     fn a_changed_field_makes_the_choice_custom_and_reset_restores_the_default() {
         let mut c = EngineChoice::default();
         c.set("runtime.graphs", json!(false));

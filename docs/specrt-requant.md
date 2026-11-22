@@ -49,4 +49,21 @@ Kept: `mlp_tail = nvfp4_g16`, `lm_head = fp8_channel`. The low memory profile se
 
 The 20% single-stream target is not met: the kept classes cut 2.2 GB of 24.8 GB per token (9%), and the classes that would cut more (`lin_in`, `lin_out`, `qkv`, `o`) fail the quality gate. At batch 8 the weight-only NVFP4 batch kernels are slower than the FP8 batch kernels.
 
+## MTP acceptance (27B, k=2, 20 prompts x 128 tokens, batch 1, GPU1)
+
+| set | mean accepted per step | draft acceptance | position 1 / 2 | decode tok/s |
+|---|---|---|---|---|
+| checkpoint format | 2.408 | 0.704 | 0.815 / 0.592 | 97.9 |
+| mlp_tail nvfp4 + lm_head fp8 | 2.414 | 0.707 | 0.816 / 0.599 | 99.1 |
+
+Acceptance does not move (+0.3%), so the kept set costs nothing in drafts.
+
+## Tiny fixture bound
+
+`requantised_logits_on_random_tiny_weights...` (GPU, ignored by default) requires KL under 0.05 and top-1 above 0.5. The fixture has random weights and a flat output distribution, so a 4-bit requantisation of every class flips many near-ties: measured KL 0.025, top-1 0.667. The 0.5 floor only catches a broken kernel; the real guards are `requantised_weights_match_the_cpu_quantiser_bit_for_bit` (exact bytes) and the 27B gate above.
+
+## GPU quantiser (#593)
+
+`nvfp4::quantize_rows_on_device` takes a bf16 host slice and returns raw device buffers for the draft head. Requant starts from FP8 rows, which would first need a device dequant, and every requantised class goes through `Matrix::Fp4` upload and the CPU-reference test. Not a one-line change, so the CPU quantiser stays. Load time on the 27B with all classes set was 11 to 23 s against 10.6 s unchanged.
+
 Commands: `scripts/requant27b.sh <class=quant>...` (quality, needs `REQUANT_WORK` and `B=<requant27b test binary>`), `scripts/requant_ab27b.sh` (speed).
