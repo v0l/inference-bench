@@ -175,13 +175,13 @@ pub(super) struct Spilled {
 
 pub(super) struct DiskTier {
     file: Arc<dyn ReadAt>,
-    pool: IoPool,
+    pool: Arc<IoPool>,
     path: std::path::PathBuf,
 }
 
 impl DiskTier {
     pub(super) fn new(file: Arc<dyn ReadAt>, path: std::path::PathBuf) -> Self {
-        DiskTier { file, pool: IoPool::new(4), path }
+        DiskTier { file, pool: crate::diskio::shared_pool(), path }
     }
 }
 

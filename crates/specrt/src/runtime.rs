@@ -185,7 +185,8 @@ fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec,
     let mut disk_path = None;
     if let Some(dir) = &dir {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join(format!("layers-{}.pages", std::process::id()));
+        crate::diskio::remove_stale(dir, "layers");
+        let path = crate::diskio::unique_path(dir, "layers");
         disk_path = Some(path.clone());
         writer = Some(crate::diskio::Appender::create(path)?);
     }
