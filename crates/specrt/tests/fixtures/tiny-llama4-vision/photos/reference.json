@@ -1,0 +1,62 @@
+{
+ "landscape.t56x4": {
+  "image": "landscape.png",
+  "tile": 56,
+  "max_patches": 4,
+  "tiles": 5,
+  "layout": [
+   2,
+   2
+  ]
+ },
+ "portrait.t56x4": {
+  "image": "portrait.png",
+  "tile": 56,
+  "max_patches": 4,
+  "tiles": 5,
+  "layout": [
+   2,
+   2
+  ]
+ },
+ "small.t56x4": {
+  "image": "small.png",
+  "tile": 56,
+  "max_patches": 4,
+  "tiles": 5,
+  "layout": [
+   2,
+   2
+  ]
+ },
+ "landscape.t112x6": {
+  "image": "landscape.png",
+  "tile": 112,
+  "max_patches": 6,
+  "tiles": 7,
+  "layout": [
+   2,
+   3
+  ]
+ },
+ "portrait.t112x6": {
+  "image": "portrait.png",
+  "tile": 112,
+  "max_patches": 6,
+  "tiles": 7,
+  "layout": [
+   3,
+   2
+  ]
+ },
+ "small.t112x6": {
+  "image": "small.png",
+  "tile": 112,
+  "max_patches": 6,
+  "tiles": 5,
+  "layout": [
+   2,
+   2
+  ]
+ }
+}
