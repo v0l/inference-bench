@@ -11,6 +11,50 @@ fn u16_at(b: &[u8], i: usize) -> u16 {
     u16::from_le_bytes([b[i], b[i + 1]])
 }
 
+fn u32_at(b: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+
+fn signed(signs: u8, j: usize) -> f32 {
+    if signs & (1 << j) != 0 { -1.0 } else { 1.0 }
+}
+
+pub fn dequantize_iq3_xxs(block: &[u8], out: &mut [f32]) {
+    let d = f16(block);
+    for ib in 0..8 {
+        let aux = u32_at(block, 66 + 4 * ib);
+        let db = d * (0.5 + (aux >> 28) as f32) * 0.5;
+        for l in 0..4 {
+            let signs = KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize];
+            let g1 = IQ3XXS_GRID[block[2 + 8 * ib + 2 * l] as usize].to_le_bytes();
+            let g2 = IQ3XXS_GRID[block[2 + 8 * ib + 2 * l + 1] as usize].to_le_bytes();
+            for j in 0..4 {
+                out[32 * ib + 8 * l + j] = db * g1[j] as f32 * signed(signs, j);
+                out[32 * ib + 8 * l + j + 4] = db * g2[j] as f32 * signed(signs, j + 4);
+            }
+        }
+    }
+}
+
+pub fn dequantize_iq3_s(block: &[u8], out: &mut [f32]) {
+    let d = f16(block);
+    for ib in 0..8 {
+        let sc = block[106 + ib / 2];
+        let db = d * (1 + 2 * ((sc >> (4 * (ib % 2))) & 0xf) as i32) as f32;
+        let qh = block[66 + ib] as usize;
+        for l in 0..4 {
+            let i1 = block[2 + 8 * ib + 2 * l] as usize | ((qh << (8 - 2 * l)) & 256);
+            let i2 = block[2 + 8 * ib + 2 * l + 1] as usize | ((qh << (7 - 2 * l)) & 256);
+            let (g1, g2) = (IQ3S_GRID[i1].to_le_bytes(), IQ3S_GRID[i2].to_le_bytes());
+            let signs = block[74 + 4 * ib + l];
+            for j in 0..4 {
+                out[32 * ib + 8 * l + j] = db * g1[j] as f32 * signed(signs, j);
+                out[32 * ib + 8 * l + j + 4] = db * g2[j] as f32 * signed(signs, j + 4);
+            }
+        }
+    }
+}
+
 pub fn dequantize_iq4_nl(block: &[u8], out: &mut [f32]) {
     for b in 0..8 {
         let blk = &block[18 * b..];
