@@ -37,13 +37,15 @@ The ceiling function takes these as inputs: `tokens_per_second_ceiling(host_gbs,
 
 `bench --runs 2 --vram-gb N` on GPU 1, 2048 token prompt, 128 new tokens, 3 alternating rounds, medians of 2 runs per round. Ceiling is `1 / max(streamed bytes / 57.8 GB/s, resident-speed time)`, resident speed taken from the 48.5 tok/s baseline.
 
-| vram_budget | Layers streamed | Streamed per token | Ceiling tok/s | Decode tok/s (3 rounds) | Reached | Prefill tok/s (3 rounds) |
-| --- | --- | --- | --- | --- | --- | --- |
-| fully resident | 0 | 0 | 48.5 | 48.7, 48.3, 48.4 | 100% | 1804, 1774, 1768 |
-| 24 GB | 21 of 64 | 8.01 GB | 7.2 | 7.1, 7.1, 7.1 | 98% | 1815, 1786, 1786 |
-| 12 GB | 52 of 64 | 19.83 GB | 2.9 | 2.9, 2.9, 2.9 | 100% | 1795, 1786, 1789 |
+| vram_budget | Layers streamed | Streamed per token | Ceiling tok/s | Decode tok/s (3 rounds) | Reached | Prefill tok/s (3 rounds) | Device memory |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| fully resident | 0 | 0 | 48.5 | 48.7, 48.3, 48.4 | 100% | 1804, 1774, 1768 | 32.9 GB |
+| 24 GB | 21 of 64 | 8.01 GB | 7.2 | 7.1, 7.1, 7.1 | 98% | 1815, 1786, 1786 | not remeasured after the trim |
+| 12 GB | 52 of 64 | 19.83 GB | 2.9 | 2.9, 2.9, 2.9 | 100% | 1795, 1786, 1789 | 14.0 GB (rerun with the trim: 2.9 tok/s, 1782 prefill) |
 
-Device memory with the 12 GB cap: 12.78 GB at load (weights, staging, KV, scratch), checked after the sweep with a 256 token prompt (2.9 tok/s again). The sweep rows were run before the allocator pool was trimmed after the spill, so their `peak_device` read 31.4 GB; throughput is unaffected.
+Device memory with the 12 GB cap is 13.99 GB with a 2048 token prompt (weights, staging, KV, scratch), measured on the merged head after the allocator trim. The sweep rows above ran before the trim, so their `peak_device` read 31.4 GB; throughput is unaffected.
+
+Offload off is unchanged on the 27B FP8: master binary against the merged head, batch 1, 128 prompt and 128 new tokens, 3 alternating rounds with a second master copy as the A/A control. Decode B/A 0.994, 0.998, 0.998 (median 0.998), A/A median 0.994; prefill B/A median 0.997, A/A median 0.991. B/A sits inside the A/A band.
 
 Streaming decode runs at the link ceiling: the copy of layer N+1 hides behind compute of layer N, and the link is the limit. Prefill is unaffected (about 1.78k tok/s in every row) because 2048 rows of compute per layer take longer than the copy.
 
