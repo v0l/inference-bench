@@ -103,3 +103,25 @@ No vLLM path fuses the router with the permutation, and none uses a persistent k
 Grouped GEMM as a kir family: it already is one (`kir::moe::Family::GroupedMma`, emitted by `kir::cuda::moe::mma`), so the port the issue asks for exists; #609's `select` would only choose among the tile variants, and the measured choice (16-row vs 64-row, stage count) is a constant here. Not done as a separate step because the profile shows no GEMM-shape gap that a different family would close.
 
 Still open for #652: 4k prefill 0.575 s against 0.3 s needs the GDN and attention projection GEMMs (186 ms) and GDN chunk kernels (82 ms), which are outside the expert kernel; b8 is 383 against 435 tok/s.
+
+### #991: dense projections and GDN chunk kernels at 122B shapes
+
+The dense projections are bf16 in this checkpoint (the `ignore` list keeps `in_proj_qkv`, `in_proj_z`, `out_proj`, `q/k/v/o_proj` unquantised), so there is no NVFP4 GEMM to compare with CUTLASS fp4 here. Against cuBLAS bf16 on the same shapes (4096 rows, rotating weights, GPU1, `torch` bf16 matmul median of 30), specrt's own kernels are already ahead:
+
+| Kernel | shape n x k | specrt (nsys avg) | cuBLAS bf16 |
+| --- | --- | --- | --- |
+| `lin_in_mma_big` | 20480 x 3072 | 1.58 ms, 326 TFLOP/s | 1.73 ms, 298 |
+| `qkv_mma_big` | 17408 x 3072 | 1.21 ms, 362 | 1.63 ms, 270 |
+| `lin_out_mma_big` | 3072 x 8192 | 0.74 ms, 280 | 0.75 ms, 273 |
+| `o_mma_big` | 3072 x 8192 | 0.63 ms, 330 | 0.83 ms, 248 |
+
+So the 186 ms is bf16 tensor work at or above cuBLAS speed; the only way to shrink it is a lower precision weight, which changes the model's numerics and is not a kernel fix. No change kept.
+
+GDN chunk kernels (`gdn_chunk_prep` 58 ms with 72 of 108 launches at 64 x 32 CTAs, `gdn_chunk_scan` 38 ms at 64 x 8 CTAs of 128 threads): `LA_COLS` was varied on the real 122B (value head dim 128, 64 value heads, so 64 x 8 scan CTAs on 188 SMs at 16 columns). Alternating binaries on GPU1, 4k prefill:
+
+| cols | runs (s) | base runs (s) |
+| --- | --- | --- |
+| 8 | 0.648, 0.645 | 0.586, 0.612 |
+| 32 | 0.590, 0.585 | 0.592, 0.610 |
+
+8 is 8% slower, 32 is within noise (-0.5%), so the #972 result carries over to 122B. Both dropped at the 5% bar.
