@@ -143,6 +143,9 @@ pub trait Executor {
     fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
         None
     }
+    fn offload_plan(&self) -> Option<crate::offload::OffloadPlan> {
+        None
+    }
     fn max_ctx(&self) -> usize;
     fn slots(&self) -> usize;
     fn kv_blocks(&self) -> usize;
@@ -258,6 +261,14 @@ impl GpuExecutor {
 }
 
 impl Executor for GpuExecutor {
+    fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
+        self.rt.offload_stats()
+    }
+
+    fn offload_plan(&self) -> Option<crate::offload::OffloadPlan> {
+        self.rt.offload_plan().cloned()
+    }
+
     fn max_ctx(&self) -> usize {
         self.rt.max_ctx()
     }
@@ -955,6 +966,10 @@ impl<E: Executor> Scheduler<E> {
 
     pub fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
         self.exec.offload_stats()
+    }
+
+    pub fn offload_plan(&self) -> Option<crate::offload::OffloadPlan> {
+        self.exec.offload_plan()
     }
 
     pub fn state_refusals(&self) -> u64 {

@@ -252,6 +252,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         if let Some(l) = &loaded {
             crate::running::draw(ui, l, app.loaded_all().len() > 1);
         }
+        crate::tiers::draw(app, ui);
         crate::hardware::pipeline_section(app, ui);
         crate::serving::draw(app, ui);
         crate::sessions::draw(app, ui);

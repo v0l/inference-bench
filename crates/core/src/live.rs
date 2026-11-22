@@ -243,6 +243,7 @@ pub struct Point {
     pub kv_used_bytes: f64,
     pub kv_total_bytes: f64,
     pub requests: u64,
+    pub stream_bytes_s: f64,
 }
 
 pub struct History {
@@ -264,6 +265,8 @@ impl History {
             let dt = now.duration_since(*at).as_secs_f64().max(1e-3);
             p.gen_tok_s = r.generated.saturating_sub(prev.generated) as f64 / dt;
             p.prefill_tok_s = r.prefilled.saturating_sub(prev.prefilled) as f64 / dt;
+            let streamed = |r: &Reading| r.serving.as_ref().and_then(|s| s.offload).map_or(0, |o| o.host_to_vram_bytes + o.nvme_read_bytes);
+            p.stream_bytes_s = streamed(&r).saturating_sub(streamed(prev)) as f64 / dt;
         }
         if self.marks.is_empty() {
             self.marks.push_back((now, Histogram::new(&r.ttft.bounds), Histogram::new(&r.itl.bounds)));

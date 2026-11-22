@@ -55,6 +55,7 @@ fn script() -> Script {
         first_delay_ms: 20,
         usage: Some((9, 3)),
         fail_status: None,
+        offload: None,
         vision: false,
         files: Default::default(),
         sessions: Default::default(),
@@ -802,6 +803,70 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
     assert_eq!(Settings::load(&h.state().dir).seqs_for("Qwen3-0.6B"), 6);
 }
 
+fn offloaded_script() -> Script {
+    use specrt::offload::{LayerResidency, OffloadPlan, OffloadStats, Tier};
+    let layers = (0..4).map(|i| LayerResidency { layer: i, bytes: 2 << 30, tier: if i < 2 { Tier::Vram } else if i == 2 { Tier::Host } else { Tier::Nvme }, pinned: i < 2 }).collect();
+    let plan = OffloadPlan { layers, staging_bytes: 1 << 30, vram_bytes: 5 << 30, host_bytes: 2 << 30, nvme_bytes: 2 << 30, host_staging_bytes: 0, swap_staging_bytes: 0 };
+    let stats = OffloadStats { vram_hits: 3, host_hits: 1, nvme_reads: 0, host_to_vram_bytes: 10, ..Default::default() };
+    Script { offload: Some((plan, stats)), ..script() }
+}
+
+#[test]
+fn where_the_weights_live_and_the_hit_rate_show_for_an_offloaded_model_at_desktop_and_phone_width() {
+    for (name, size) in [("tiers-desktop", egui::vec2(1280.0, 1400.0)), ("tiers-phone", egui::vec2(390.0, 2400.0))] {
+        let mut h = harness_at(name, Tab::Server, size);
+        with_gpu(&mut h, 0, 96 << 30);
+        h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+        let m = real_model(&h.state().library[0].name.clone());
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().load_model_with(&m, 2048, 2);
+        pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+        pump_until(&mut h, 10, "serving reading", |a| a.engine.reading().serving.is_some());
+        h.run();
+        assert!(h.state().engine.handle().serving_stats_of(&m.name).and_then(|s| s.offload_plan).is_some());
+        h.get_by_label_contains("2 of 4 layers stream in");
+        let screen = h.ctx.content_rect();
+        for text in ["2 of 4 layers stream in", m.name.as_str()] {
+            for n in h.get_all_by_label_contains(text) {
+                let r = n.rect();
+                assert!(r.right() <= screen.right() + 0.5, "{text} at {size:?} ends at {} past {}", r.right(), screen.right());
+            }
+        }
+        let r = h.state().engine.reading();
+        let shown = crate::serving::offload_readings(&r, 2.5e9);
+        assert_eq!(shown[0].1, "75%");
+        assert_eq!(shown[1].1, "2.50 GB/s");
+        let plan = h.state().engine.handle().serving_stats_of(&m.name).unwrap().offload_plan.unwrap();
+        let cells = crate::tiers::tier_cells(&plan);
+        assert_eq!(cells.iter().map(|c| c.0).collect::<Vec<_>>(), ["vram", "host ram", "nvme"]);
+    }
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshots_of_the_weight_tiers_and_hit_rate_at_desktop_and_phone_width() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (name, size) in [("tiers-desktop", egui::vec2(1280.0, 1500.0)), ("tiers-phone", egui::vec2(390.0, 2600.0))] {
+        let mut h = harness_at(name, Tab::Server, size);
+        with_gpu(&mut h, 0, 96 << 30);
+        h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+        let m = real_model(&h.state().library[0].name.clone());
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().load_model_with(&m, 2048, 2);
+        pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+        pump_until(&mut h, 10, "serving reading", |a| a.engine.reading().serving.is_some());
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    }
+}
+
+#[test]
+fn without_offload_no_weight_readings_show() {
+    let r = inference_bench_core::live::Reading { generated: 0, prefilled: 0, requests: 0, running: 0, waiting: 0, max_seqs: 1, ttft: specrt::serve::Histogram::new(&[1.0]), itl: specrt::serve::Histogram::new(&[1.0]), serving: Some(specrt::serve::Stats::default()) };
+    assert!(crate::serving::offload_readings(&r, 0.0).is_empty());
+}
+
 #[test]
 fn the_server_tab_kv_total_is_the_shared_pool_chosen_in_the_dialog() {
     let mut h = harness("kv-total", Tab::Models);
@@ -1062,7 +1127,7 @@ fn cold_cached_and_short_prompts_show_queue_prefill_and_new_columns_with_a_real_
     h.render().unwrap().save(out.join("per-request-real-1280.png")).unwrap();
     let recent = crate::serving::snapshot(h.state(), crate::serving::Span::Five).recent;
     for r in recent.iter().rev() {
-        eprintln!("{:?}", crate::serving::request_cells(r, true, true));
+        eprintln!("{:?}", crate::serving::request_cells(r, &crate::serving::request_columns(true, 1280.0)));
     }
     h.state_mut().server.stop();
     let mut wide = Harness::builder().with_size(egui::vec2(1280.0, 200.0)).with_accessibility_check(false).allow_missing_glyphs().build_ui(|ui| {
@@ -2586,18 +2651,36 @@ fn request(ttft: f64, prompt: u64, cached: u64, completion: u64, prefill: f64, d
 
 #[test]
 fn the_per_request_table_shows_clean_units_and_cache_columns() {
+    let wide = crate::serving::request_columns(false, 1280.0);
     let plain = request(0.842, 625, 0, 1574, 742.3, 35.44);
-    assert_eq!(crate::serving::request_cells(&plain, false, false), ["842 ms", "625", "625", "1.57k", "742 tok/s", "35.4 tok/s"]);
+    assert_eq!(crate::serving::request_cells(&plain, &wide), ["842 ms", "0 ms", "625", "625", "1.57k", "742 tok/s", "35.4 tok/s"]);
+    let wide = crate::serving::request_columns(true, 1280.0);
     let warm = request(1.308, 1450, 1000, 40, 2310.4, 35.44);
-    assert_eq!(crate::serving::request_cells(&warm, true, false), ["1.31 s", "1.45k", "69%", "1.00k", "450", "40", "2,310 tok/s", "35.4 tok/s"]);
+    assert_eq!(crate::serving::request_cells(&warm, &wide), ["1.31 s", "0 ms", "1.45k", "69%", "1.00k", "450", "40", "2,310 tok/s", "35.4 tok/s"]);
     let full = request(0.19, 512, 507, 8, 0.0, 20.0);
-    assert_eq!(crate::serving::request_cells(&full, true, false)[4..], ["5", "8", "-", "20.0 tok/s"]);
+    assert_eq!(crate::serving::request_cells(&full, &wide)[5..], ["5", "8", "-", "20.0 tok/s"]);
     let mut waited = request(3.71, 5000, 0, 8, 5376.0, 20.0);
     waited.queue_secs = 3.5;
-    assert_eq!(crate::serving::request_cells(&waited, false, true)[..2], ["3.71 s", "3,500 ms"]);
-    let cols = |c: bool, q: bool| crate::serving::request_columns(c, q).iter().map(|c| c.0).collect::<Vec<_>>();
-    assert_eq!(cols(false, false), ["time", "ttft", "prompt", "new", "completion", "prefill", "decode"]);
-    assert_eq!(cols(true, true), ["time", "ttft", "queue", "prompt", "cache hit", "cache read", "new", "completion", "prefill", "decode"]);
+    assert_eq!(crate::serving::request_cells(&waited, &wide)[..2], ["3.71 s", "3,500 ms"]);
+    let cols = |c: bool, w: f32| crate::serving::request_columns(c, w).iter().map(|c| c.0).collect::<Vec<_>>();
+    assert_eq!(cols(false, 800.0), ["time", "ttft", "queue", "prompt", "new", "prefill", "decode"]);
+    assert_eq!(cols(true, 1280.0), ["time", "ttft", "queue", "prompt", "cache hit", "cache read", "new", "completion", "prefill", "decode"]);
+}
+
+#[test]
+fn the_per_request_columns_fit_every_width_down_to_a_phone() {
+    for width in [1280.0f32, 1000.0, 900.0, 780.0, 700.0, 500.0, 392.0, 340.0] {
+        for with_cache in [false, true] {
+            let cols = crate::serving::request_columns(with_cache, width);
+            let total: f32 = cols.iter().map(|c| c.1).sum();
+            assert!(total + 6.0 <= width, "{width} {with_cache} {total} {:?}", cols.iter().map(|c| c.0).collect::<Vec<_>>());
+            let names: Vec<_> = cols.iter().map(|c| c.0).collect();
+            assert!(names.contains(&"new") && names.contains(&"prefill") && names.contains(&"ttft"), "{names:?}");
+        }
+    }
+    let names = |w: f32| crate::serving::request_columns(true, w).iter().map(|c| c.0).collect::<Vec<_>>();
+    assert!(names(1280.0).contains(&"queue"));
+    assert!(!names(340.0).contains(&"queue"));
 }
 
 #[test]

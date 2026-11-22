@@ -695,6 +695,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     page(ui, "models", |ui| {
         if app.models.detail.is_none() {
             crate::loadedlist::draw(app, ui);
+            crate::tiers::draw(app, ui);
         }
         if app.models.detail.is_some() {
             crate::detail::draw(app, ui);

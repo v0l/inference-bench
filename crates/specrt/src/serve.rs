@@ -295,6 +295,7 @@ pub struct Stats {
     pub chain: Option<ChainMetrics>,
     pub sessions: Option<crate::sessions::Stats>,
     pub offload: Option<crate::offload::OffloadStats>,
+    pub offload_plan: Option<crate::offload::OffloadPlan>,
 }
 
 impl Default for Stats {
@@ -329,6 +330,7 @@ impl Default for Stats {
             chain: None,
             sessions: None,
             offload: None,
+            offload_plan: None,
         }
     }
 }
@@ -1041,6 +1043,7 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         s.reprefilled_tokens = sched.recomputed_tokens();
         s.chain = sched.chain_metrics();
         s.offload = sched.offload_stats();
+        s.offload_plan = sched.offload_plan();
         let p = sched.prefix_stats();
         s.prefix_queries = p.queries;
         s.prefix_hits = p.hits;

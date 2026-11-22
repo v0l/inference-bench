@@ -94,6 +94,14 @@ pub fn readings(r: &Reading, per_minute: f64) -> Vec<(&'static str, String, egui
     out
 }
 
+pub fn offload_readings(r: &Reading, stream_bytes_s: f64) -> Vec<(&'static str, String, egui::Color32)> {
+    let Some(o) = r.serving.as_ref().and_then(|s| s.offload) else { return Vec::new() };
+    vec![
+        ("weight hits", crate::fmt::percent(o.hit_ratio()), TRACE),
+        ("weight stream", format!("{:.2} GB/s", stream_bytes_s / 1e9), TRACE),
+    ]
+}
+
 fn top(series: &[&[f32]], floor: f32) -> f32 {
     let peak = series.iter().flat_map(|s| s.iter().copied()).fold(0.0f32, f32::max);
     (peak * 1.15).max(floor)
@@ -138,36 +146,45 @@ fn right(p: &egui::Painter, row: egui::Rect, x: f32, w: f32, text: &str, col: eg
     p.with_clip_rect(r.intersect(p.clip_rect())).text(egui::pos2(r.right(), r.center().y), egui::Align2::RIGHT_CENTER, text, figure(11.0), col);
 }
 
-pub fn request_cells(r: &RequestRecord, with_cache: bool, with_queue: bool) -> Vec<String> {
-    let mut out = vec![crate::fmt::duration(r.ttft_secs)];
-    if with_queue {
-        out.push(crate::fmt::millis(r.queue_secs));
-    }
-    out.push(crate::fmt::count(r.prompt_tokens));
-    if with_cache {
-        let hit = if r.prompt_tokens > 0 { crate::fmt::percent(r.cached_tokens as f64 / r.prompt_tokens as f64) } else { "-".into() };
-        out.push(hit);
-        out.push(crate::fmt::count(r.cached_tokens));
-    }
-    out.push(crate::fmt::count(r.prompt_tokens - r.cached_tokens));
-    out.push(crate::fmt::count(r.completion_tokens));
-    out.push(if r.prefill_tok_s > 0.0 { crate::fmt::rate(r.prefill_tok_s) } else { "-".into() });
-    out.push(if r.decode_tok_s > 0.0 { crate::fmt::rate(r.decode_tok_s) } else { "-".into() });
-    out
+pub fn request_cells(r: &RequestRecord, columns: &[(&'static str, f32)]) -> Vec<String> {
+    columns[1..].iter().map(|(name, _)| request_cell(r, name)).collect()
 }
 
-pub const PHONE_WIDTH: f32 = 700.0;
+fn request_cell(r: &RequestRecord, name: &str) -> String {
+    let dash = |v: f64| if v > 0.0 { crate::fmt::rate(v) } else { "-".into() };
+    match name {
+        "ttft" => crate::fmt::duration(r.ttft_secs),
+        "queue" => crate::fmt::millis(r.queue_secs),
+        "prompt" => crate::fmt::count(r.prompt_tokens),
+        "cache hit" if r.prompt_tokens > 0 => crate::fmt::percent(r.cached_tokens as f64 / r.prompt_tokens as f64),
+        "cache read" => crate::fmt::count(r.cached_tokens),
+        "new" => crate::fmt::count(r.prompt_tokens - r.cached_tokens),
+        "completion" => crate::fmt::count(r.completion_tokens),
+        "prefill" => dash(r.prefill_tok_s),
+        "decode" => dash(r.decode_tok_s),
+        _ => "-".into(),
+    }
+}
 
-pub fn request_columns(with_cache: bool, with_queue: bool) -> Vec<(&'static str, f32)> {
-    let mut cols = vec![("time", 80.0), ("ttft", 90.0)];
-    if with_queue {
-        cols.push(("queue", 90.0));
+pub const WIDE_TABLE: f32 = 1000.0;
+pub const MEDIUM_TABLE: f32 = 780.0;
+
+pub fn request_columns(with_cache: bool, width: f32) -> Vec<(&'static str, f32)> {
+    if width < MEDIUM_TABLE {
+        return vec![("time", 56.0), ("ttft", 54.0), ("new", 50.0), ("prefill", 94.0), ("decode", 80.0)];
     }
-    cols.push(("prompt", 80.0));
+    let mut cols = vec![("time", 80.0), ("ttft", 90.0), ("queue", 90.0), ("prompt", 80.0)];
     if with_cache {
-        cols.extend([("cache hit", 90.0), ("cache read", 100.0)]);
+        cols.push(("cache hit", 90.0));
+        if width >= WIDE_TABLE {
+            cols.push(("cache read", 100.0));
+        }
     }
-    cols.extend([("new", 80.0), ("completion", 100.0), ("prefill", 130.0), ("decode", 130.0)]);
+    cols.push(("new", 80.0));
+    if width >= WIDE_TABLE {
+        cols.push(("completion", 100.0));
+    }
+    cols.extend([("prefill", 130.0), ("decode", 130.0)]);
     cols
 }
 
@@ -178,12 +195,11 @@ pub fn per_request(ui: &mut egui::Ui, recent: &[RequestRecord]) {
             return;
         }
         let with_cache = recent.iter().any(|r| r.cached_tokens > 0);
-        let with_queue = ui.available_width() >= PHONE_WIDTH;
-        let cols = request_columns(with_cache, with_queue);
+        let cols = request_columns(with_cache, ui.available_width());
         Table::new(&cols, recent.len().min(12)).show(ui, |i, p, rect, at| {
             let r = &recent[recent.len() - 1 - i];
             cell(p, rect, at(0), cols[0].1, &r.at.with_timezone(&chrono::Local).format("%H:%M:%S").to_string(), LEGEND);
-            for (k, text) in request_cells(r, with_cache, with_queue).iter().enumerate() {
+            for (k, text) in request_cells(r, &cols).iter().enumerate() {
                 let tint = if matches!(cols[k + 1].0, "ttft" | "queue" | "prefill" | "decode") { TRACE } else { VALUE };
                 right(p, rect, at(k + 1), cols[k + 1].1, text, tint);
             }
@@ -214,6 +230,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 line.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, label.clone()));
             }
             let mut shown = readings(r, snap.per_minute);
+            shown.extend(offload_readings(r, snap.last.as_ref().map_or(0.0, |p| p.stream_bytes_s)));
             if let Some((load, cores)) = inference_bench_core::live::host_load() {
                 shown.extend(host_reading(load, cores));
             }

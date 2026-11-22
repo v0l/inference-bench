@@ -12,6 +12,7 @@ pub struct Script {
     pub first_delay_ms: u64,
     pub usage: Option<(u64, u64)>,
     pub fail_status: Option<(u16, String)>,
+    pub offload: Option<(specrt::offload::OffloadPlan, specrt::offload::OffloadStats)>,
     pub vision: bool,
     pub files: Arc<Mutex<Vec<FakeFile>>>,
     pub sessions: Arc<Mutex<Option<Arc<specrt::sessions::Shared>>>>,
@@ -405,6 +406,10 @@ impl crate::target::Target for ScriptedServing {
         }
         for v in c.itl.lock().unwrap().iter() {
             s.inter_token_secs.observe(*v);
+        }
+        if let Some((plan, stats)) = &self.script.offload {
+            s.offload_plan = Some(plan.clone());
+            s.offload = Some(*stats);
         }
         Some(s)
     }
