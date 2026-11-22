@@ -11,7 +11,7 @@ const GENERATED: &[&str] = &[
 ];
 
 const TILE_NAMES: &[&str] = &[
-    "key", "live", "tokens", "base", "pos0", "pos1", "row0", "row1", "tid", "g", "kt", "k0", "nb", "np", "kb", "m0", "m1", "l0", "l1", "n0", "n1", "a0", "a1", "i0", "i1", "ph", "pl", "qh", "ql", "bh", "bl", "mx0", "mx1", "sum0", "sum1", "nm", "tiles", "key_end", "warp_last", "sink_l2", "mf0", "mf1", "LOG2E",
+    "key", "live", "tokens", "base", "pos0", "pos1", "row0", "row1", "tid", "g", "kt", "k0", "nb", "np", "kb", "m0", "m1", "l0", "l1", "n0", "n1", "a0", "a1", "i0", "i1", "ph", "pl", "qh", "ql", "bh", "bl", "mx0", "mx1", "sum0", "sum1", "nm", "tiles", "key_end", "warp_last", "sink_l2", "mf0", "mf1", "LOG2E", "part_acc", "part_ml", "splits", "split_span", "key_begin", "z", "len", "base0", "base1",
     "o", "dst", "src",
     "which",
     "dot", "m", "l", "m_new", "corr", "p", "t", "q", "acc", "lane", "warp", "row", "table", "top", "denom", "total", "kr", "vr", "ksc", "vsc", "part", "d", "j", "at", "hi", "lo", "v", "w", "q_pos_i", "sink_logit", "visible", "e", "r", "slot",

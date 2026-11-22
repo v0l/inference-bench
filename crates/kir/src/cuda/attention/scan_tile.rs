@@ -32,7 +32,7 @@ pub fn decode(s: &TileScan) -> String {
     let _ = init_l;
     [
         format!(
-            r##"extern "C" __global__ void __launch_bounds__(128) {name}_mma_dec({sig}) {{
+            r##"extern "C" __global__ void __launch_bounds__(128) {name}_mma_dec({sig}, float* part_acc, float* part_ml, int splits) {{
     constexpr int CPR = HEAD_DIM / 8;
     constexpr int PLANE = FM_BK * HEAD_DIM;
     constexpr float LOG2E = 1.4426950408889634f;
@@ -41,8 +41,13 @@ pub fn decode(s: &TileScan) -> String {
     bf16_t* kvs = (bf16_t*)fm_smem;
     const int kv_head = blockIdx.x;
     const int row = blockIdx.y;
+    const int z = blockIdx.z;
     const int pos_row = pos[row * pos_step] + row * row_step;
-    const int key_end = pos_row + 1;
+    const int len = pos_row + 1;
+    const int split_span = decode_chunk(len, splits);
+    const int key_begin = z * split_span;
+    if (key_begin >= len) return;
+    const int key_end = min(len, key_begin + split_span);
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
@@ -78,8 +83,8 @@ pub fn decode(s: &TileScan) -> String {
     for (int i = 0; i < FM_NB; i++)
 #pragma unroll
         for (int e = 0; e < 4; e++) o[i][e] = 0.0f;
-    float m0 = {init_m}, m1 = {m1_init}, l0 = {init_l}, l1 = {l1_init};
-    const int tiles = (key_end + FM_BK - 1) / FM_BK;
+    float m0 = z == 0 ? {init_m} : NEG_INF, m1 = z == 0 ? {m1_init} : NEG_INF, l0 = z == 0 ? {init_l} : 0.0f, l1 = z == 0 ? {l1_init} : 0.0f;
+    const int tiles = (key_end - key_begin + FM_BK - 1) / FM_BK;
     auto load_kv = [&](int buf, int k0) {{
         bf16_t* st = kvs + buf * 2 * KV_PLANES * PLANE;
 "##,
@@ -90,10 +95,10 @@ pub fn decode(s: &TileScan) -> String {
         prim::load_kv_planes(&prim::TileLoad { table: "table", bound: "key_end", stride: "128", unroll: false }).replace("DM_BK", "FM_BK"),
         r##"    };
     __syncthreads();
-    load_kv(0, 0);
+    load_kv(0, key_begin);
     cp_async_commit();
     for (int kt = 0; kt < tiles; kt++) {
-        int k0 = kt * FM_BK;
+        int k0 = key_begin + kt * FM_BK;
         if (kt + 1 < tiles) load_kv((kt + 1) % FM_STAGES, k0 + FM_BK);
         cp_async_commit();
         cp_async_wait<1>();
@@ -123,19 +128,17 @@ pub fn decode(s: &TileScan) -> String {
         __syncthreads();
     }
     if (warp != 0) return;
-    float i0 = 1.0f / l0;
-    float i1 = 1.0f / l1;
+    const size_t base0 = ((size_t)row * HEADS + head0) * splits + z;
+    const size_t base1 = ((size_t)row * HEADS + head1) * splits + z;
 #pragma unroll
     for (int nb = 0; nb < FM_NB; nb++) {
         int d = nb * 8 + 2 * t;
-        if (r0 < GROUP) {
-            int at = head0 * HEAD_DIM + d;
-            split_store2(out_hi, out_lo, (size_t)row * Q_DIM + at, o[nb][0] * i0 * out_gate(qkv, row, at), o[nb][1] * i0 * out_gate(qkv, row, at + 1));
-        }
-        if (r1 < GROUP) {
-            int at = head1 * HEAD_DIM + d;
-            split_store2(out_hi, out_lo, (size_t)row * Q_DIM + at, o[nb][2] * i1 * out_gate(qkv, row, at), o[nb][3] * i1 * out_gate(qkv, row, at + 1));
-        }
+        if (r0 < GROUP) *(float2*)&part_acc[base0 * HEAD_DIM + d] = make_float2(o[nb][0], o[nb][1]);
+        if (r1 < GROUP) *(float2*)&part_acc[base1 * HEAD_DIM + d] = make_float2(o[nb][2], o[nb][3]);
+    }
+    if (t == 0) {
+        if (r0 < GROUP) *(float2*)&part_ml[base0 * 2] = make_float2(m0, l0);
+        if (r1 < GROUP) *(float2*)&part_ml[base1 * 2] = make_float2(m1, l1);
     }
 }
 

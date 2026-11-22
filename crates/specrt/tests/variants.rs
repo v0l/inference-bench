@@ -485,6 +485,25 @@ fn sinks_scan_scalar_versus_tile_speed() {
     }
 }
 
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn split_tile_decode_over_a_long_context_matches_the_scalar_scan() {
+    for name in [SINKS, CHUNKED] {
+        let mut spec = spec(name);
+        spec.mlp.act_quant = specrt::spec::ActQuant::None;
+        spec.mlp.up_act_planes = 1;
+        spec.mlp.down_act_planes = 1;
+        let vocab = spec.dims.vocab as u32;
+        let mut rt = Runtime::load_batched(&spec, 1024, 2).unwrap();
+        let prompts: Vec<Vec<u32>> = (0..2u32).map(|s| (0..700u32).map(|i| (i + s).wrapping_mul(2654435761) % vocab).collect()).collect();
+        rt.set_scan_tile(false);
+        let scalar = rt.generate_batch(&prompts, 24).unwrap();
+        rt.set_scan_tile(true);
+        let tile = rt.generate_batch(&prompts, 24).unwrap();
+        assert_eq!(tile.tokens, scalar.tokens, "{name}");
+    }
+}
+
 fn decode_through_tile_scan(name: &str, batch: usize) {
     let (tokens, greedy, _, _) = reference(name);
     let mut spec = spec(name);
