@@ -13,7 +13,7 @@ cargo test -p inference-bench-specrt
 
 - Use a per-issue target dir. The default one is shared and parallel sessions overwrite each other's binaries.
 - Run cargo under `systemd-run --user --wait --collect -P -q -p MemoryMax=10G`. Anything that loads weights uses `MemoryMax=16G -p MemorySwapMax=0`.
-- Put every GPU run under `flock /tmp/gpu27.lock`.
+- Put every GPU run under the per-GPU lock: `~/.agents/bin/gpu-run 1 -- <cmd>` (see the GPUs section). The old `flock /tmp/gpu27.lock` is not used any more.
 - Everything configurable lives in the model spec TOML or the server config. Env vars are deprecated dev overrides.
 - No code comments. Commit subjects are short, no trailers.
 
