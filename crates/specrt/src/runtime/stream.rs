@@ -37,7 +37,7 @@ impl DeviceMatrix {
             DeviceMatrix::Bf16(a) => w.slice(a),
             DeviceMatrix::Q8 { values, scales } => w.slice(values).and_then(|_| w.slice(scales)),
             DeviceMatrix::Fp8 { values, scales } => w.slice(values).and_then(|_| w.slice(scales)),
-            DeviceMatrix::Fp4 { packed, scales } => w.slice(packed).and_then(|_| w.slice(scales)),
+            DeviceMatrix::Fp4 { packed, scales, .. } => w.slice(packed).and_then(|_| w.slice(scales)),
             DeviceMatrix::Ggml { data, table } => w.slice(data).and_then(|_| w.slice(table)),
         }
     }

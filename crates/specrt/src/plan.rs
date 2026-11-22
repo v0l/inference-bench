@@ -161,6 +161,15 @@ pub enum QuantSource {
 }
 
 impl QuantSource {
+    pub fn resolve_for(self, spec: &Spec, layer: usize, weight: Weight) -> Quant {
+        let stored = self.resolve(spec, layer);
+        match self {
+            QuantSource::Attn => spec.requanted(weight.name(), stored),
+            QuantSource::Mlp => spec.served_mlp_quant(layer),
+            _ => stored,
+        }
+    }
+
     pub fn resolve(self, spec: &Spec, layer: usize) -> Quant {
         match self {
             QuantSource::Attn => spec.quant,
@@ -358,7 +367,7 @@ impl Op {
 
     pub fn quant(&self, spec: &Spec, layer: usize) -> Option<Quant> {
         match self {
-            Op::Linear { quant, .. } => Some(quant.resolve(spec, layer)),
+            Op::Linear { quant, weight, .. } => Some(quant.resolve_for(spec, layer, *weight)),
             _ => None,
         }
     }
@@ -366,7 +375,7 @@ impl Op {
     pub fn decoder(&self, spec: &Spec, layer: usize, tokens: usize, target: &kir::Target) -> Option<&'static str> {
         match self {
             Op::Linear { weight, quant, .. } => {
-                let kind = weight_kind(quant.resolve(spec, layer));
+                let kind = weight_kind(quant.resolve_for(spec, layer, *weight));
                 select(spec, target, weight.name(), tokens, kind).ok().map(|c| c.decoder)
             }
             _ => None,
@@ -389,7 +398,7 @@ impl Op {
             Op::ScaledAdd { .. } => names(&["residual_add"]),
             Op::Linear { weight, quant, .. } => {
                 let w = *weight;
-                let kind = weight_kind(quant.resolve(spec, layer));
+                let kind = weight_kind(quant.resolve_for(spec, layer, w));
                 let choice = match select(spec, target, w.name(), tokens, kind) {
                     Ok(c) => c,
                     Err(e) => return vec![format!("unsupported: {e}")],
