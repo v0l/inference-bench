@@ -68,6 +68,34 @@ impl DirectFile {
     pub fn is_direct(&self) -> bool {
         self.direct
     }
+
+    pub fn len(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    pub fn is_empty(&self) -> io::Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    pub fn read_range(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let mut b = vec![0u8; len];
+        self.read_at(&mut b, offset)?;
+        Ok(b)
+    }
+}
+
+pub fn read_whole(source: &Arc<DirectFile>) -> Result<Vec<u8>> {
+    let len = source.len()? as usize;
+    let mut raw = vec![0u8; round_up(len) + BLOCK];
+    let skew = raw.as_ptr() as usize % BLOCK;
+    let start = if skew == 0 { 0 } else { BLOCK - skew };
+    if len > 0 {
+        let dyn_src: Arc<dyn ReadAt> = source.clone();
+        unsafe { shared_pool().read(&dyn_src, 0, raw.as_mut_ptr().add(start), round_up(len)) }.wait()?;
+    }
+    raw.drain(..start);
+    raw.truncate(len);
+    Ok(raw)
 }
 
 impl ReadAt for DirectFile {
@@ -211,8 +239,16 @@ pub struct Appender {
 
 impl Appender {
     pub fn create(path: PathBuf) -> Result<Self> {
-        Ok(Appender { file: File::create(&path)?, path, at: 0 })
+        let file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
+        Ok(Appender { file, path, at: 0 })
     }
+
+    pub fn finish_exact(self, len: u64) -> Result<PathBuf> {
+        self.file.set_len(len)?;
+        self.file.sync_all()?;
+        Ok(self.path)
+    }
+
 
     pub fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         use std::io::Write;
@@ -227,6 +263,71 @@ impl Appender {
     pub fn finish(self) -> Result<(PathBuf, u64)> {
         self.file.sync_all()?;
         Ok((self.path, self.at))
+    }
+}
+
+pub struct SwapFile {
+    path: PathBuf,
+    source: Arc<dyn ReadAt>,
+    len: usize,
+}
+
+impl SwapFile {
+    pub fn write(dir: &Path, bytes: &[u8]) -> Result<Self> {
+        static SWEPT: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        std::fs::create_dir_all(dir)?;
+        {
+            let mut swept = SWEPT.lock().unwrap();
+            if !swept.iter().any(|d| d == dir) {
+                remove_stale(dir, "swap");
+                swept.push(dir.to_path_buf());
+            }
+        }
+        let mut w = Appender::create(unique_path(dir, "swap"))?;
+        if let Err(e) = w.append(bytes) {
+            let _ = std::fs::remove_file(&w.path);
+            return Err(e);
+        }
+        let (path, _) = w.finish()?;
+        let source: Arc<dyn ReadAt> = Arc::new(DirectFile::open(&path)?);
+        Ok(SwapFile { path, source, len: bytes.len() })
+    }
+
+    pub fn with_source(mut self, wrap: impl FnOnce(Arc<dyn ReadAt>) -> Arc<dyn ReadAt>) -> Self {
+        self.source = wrap(self.source.clone());
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn padded_len(&self) -> usize {
+        round_up(self.len)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn read_into(&self, dst: &mut [u8]) -> Result<()> {
+        anyhow::ensure!(dst.len() >= self.len, "swap read buffer of {} bytes for {}", dst.len(), self.len);
+        let padded = self.padded_len();
+        let n = if dst.len() >= padded && (dst.as_ptr() as usize).is_multiple_of(BLOCK) { padded } else { self.len };
+        if n == 0 {
+            return Ok(());
+        }
+        unsafe { shared_pool().read(&self.source, 0, dst.as_mut_ptr(), n) }.wait()
+    }
+}
+
+impl Drop for SwapFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -344,6 +445,59 @@ mod tests {
         assert_eq!(remove_stale(&dir, "layers"), 1);
         assert!(!dead.exists() && live.exists() && other.exists());
         assert_ne!(unique_path(&dir, "layers"), unique_path(&dir, "layers"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn swap_file_round_trips_through_a_throttled_drive_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("diskio-swap-{}", std::process::id()));
+        let stale = dir.join("swap-4294967290-deadbeef0001.pages");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&stale, b"x").unwrap();
+        let data = pattern(9 << 20 | 123);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let file = SwapFile::write(&dir, &data).unwrap();
+        assert!(!stale.exists());
+        let throttle = calls.clone();
+        let file = file.with_source(move |inner| {
+            struct Slow(Arc<dyn ReadAt>, Arc<AtomicUsize>);
+            impl ReadAt for Slow {
+                fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
+                    self.1.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_secs_f64(buf.len() as f64 / 20e6));
+                    self.0.read_at(buf, offset)
+                }
+            }
+            Arc::new(Slow(inner, throttle))
+        });
+        let mut raw = vec![0u8; file.padded_len() + BLOCK];
+        let start = (BLOCK - raw.as_ptr() as usize % BLOCK) % BLOCK;
+        let t = Instant::now();
+        file.read_into(&mut raw[start..]).unwrap();
+        let serial = file.padded_len() as f64 / 20e6;
+        assert_eq!(raw[start..start + data.len()], data[..]);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(t.elapsed().as_secs_f64() < serial * 0.8, "{:?}", t.elapsed());
+        let mut small = vec![0u8; data.len()];
+        file.read_into(&mut small).unwrap();
+        assert_eq!(small, data);
+        let path = file.path().to_path_buf();
+        assert!(path.exists());
+        drop(file);
+        assert!(!path.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_whole_returns_exactly_the_appended_bytes() {
+        let dir = std::env::temp_dir().join(format!("diskio-whole-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        let data = pattern(10000);
+        let mut w = Appender::create(path.clone()).unwrap();
+        w.append(&data).unwrap();
+        w.finish_exact(data.len() as u64).unwrap();
+        assert_eq!(read_whole(&Arc::new(DirectFile::open(&path).unwrap())).unwrap(), data);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

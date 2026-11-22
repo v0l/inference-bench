@@ -7,8 +7,13 @@ use cudarc::driver::{CudaEvent, CudaSlice, CudaStream, DevicePtr, PinnedHostSlic
 use std::sync::{Arc, Mutex};
 
 struct Parked {
-    kv: PinnedBuf,
+    kv: Kv,
     state: Option<StateSnapshot>,
+}
+
+enum Kv {
+    Pinned(PinnedBuf),
+    Disk(crate::diskio::SwapFile),
 }
 
 type HostPool = Arc<Mutex<Vec<PinnedHostSlice<f32>>>>;
@@ -277,8 +282,12 @@ impl Runtime {
         let total = blocks.len() * self.kv_bytes_per_block();
         let mut host = self.host.alloc(total)?;
         self.blocks_to_host(blocks, host.as_mut_slice()?)?;
+        let kv = match self.spec.runtime.offload.nvme_path.as_deref() {
+            Some(dir) => Kv::Disk(crate::diskio::SwapFile::write(std::path::Path::new(dir), host.as_slice()?)?),
+            None => Kv::Pinned(host),
+        };
         let bytes = total + state.as_ref().map_or(0, |s| (s.conv().len() + s.ssm().len() + s.pending().len()) * 4);
-        Ok(HostSeq { bytes, blocks: blocks.len(), payload: Box::new(Parked { kv: host, state }) })
+        Ok(HostSeq { bytes, blocks: blocks.len(), payload: Box::new(Parked { kv, state }) })
     }
 
     pub fn resume(&mut self, slot: usize, blocks: &[u32], seq: &HostSeq) -> Result<()> {
@@ -286,7 +295,17 @@ impl Runtime {
         ensure!(blocks.len() == seq.blocks, "{} blocks for a parked sequence of {}", blocks.len(), seq.blocks);
         ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
         self.stream.synchronize()?;
-        self.blocks_from_host(blocks, parked.kv.as_slice()?)?;
+        match &parked.kv {
+            Kv::Pinned(host) => self.blocks_from_host(blocks, host.as_slice()?)?,
+            Kv::Disk(file) => {
+                let mut staging = self.host.alloc(crate::diskio::round_up(file.len()) + crate::diskio::BLOCK)?;
+                let raw = staging.as_mut_slice()?;
+                let skew = raw.as_ptr() as usize % crate::diskio::BLOCK;
+                let start = if skew == 0 { 0 } else { crate::diskio::BLOCK - skew };
+                file.read_into(&mut raw[start..])?;
+                self.blocks_from_host(blocks, &staging.as_slice()?[start..start + file.len()])?;
+            }
+        }
         if let Some(state) = &parked.state {
             self.restore_state(slot, state)?;
         }

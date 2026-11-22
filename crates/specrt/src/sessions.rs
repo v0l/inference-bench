@@ -206,13 +206,13 @@ fn encode(compat: &Compat, session: &Session, created: u64, last_used: u64, stri
     out
 }
 
-fn read_exact_at(f: &mut File, len: usize) -> Result<Vec<u8>> {
+fn read_exact_at(f: &mut impl Read, len: usize) -> Result<Vec<u8>> {
     let mut b = vec![0u8; len];
     f.read_exact(&mut b)?;
     Ok(b)
 }
 
-fn read_tokens(f: &mut File, count: u64, file_len: u64) -> Result<Vec<u32>> {
+fn read_tokens(f: &mut impl Read, count: u64, file_len: u64) -> Result<Vec<u32>> {
     ensure!(count.saturating_mul(4) < file_len, "token count exceeds file size");
     let raw = read_exact_at(f, count as usize * 4)?;
     let crc = read_exact_at(f, 4)?;
@@ -221,13 +221,15 @@ fn read_tokens(f: &mut File, count: u64, file_len: u64) -> Result<Vec<u32>> {
 }
 
 fn read_full(path: &Path) -> Result<(Header, Session)> {
-    let mut f = File::open(path)?;
-    let file_len = f.metadata()?.len();
+    let file = std::sync::Arc::new(crate::diskio::DirectFile::open(path)?);
+    let raw = crate::diskio::read_whole(&file)?;
+    let file_len = raw.len() as u64;
     ensure!(file_len >= (HEADER_LEN + 4 + 16) as u64, "file too short");
+    let mut f = std::io::Cursor::new(raw);
     let header = decode_header(&read_exact_at(&mut f, HEADER_LEN)?)?;
     let tokens = read_tokens(&mut f, header.tokens, file_len)?;
     let mut sections = Vec::new();
-    let mut pos = f.stream_position()?;
+    let mut pos = f.position();
     for i in 0..header.sections {
         let len = u64::from_le_bytes(read_exact_at(&mut f, 8)?.try_into().expect("8 bytes"));
         ensure!(pos + 8 + len + 4 <= file_len, "section {i} runs past the end of the file");
@@ -239,7 +241,7 @@ fn read_full(path: &Path) -> Result<(Header, Session)> {
     }
     let footer = read_exact_at(&mut f, 16)?;
     ensure!(&footer[..8] == FOOTER && u64_at(&footer, 8) == file_len, "bad footer");
-    ensure!(f.stream_position()? == file_len, "trailing bytes");
+    ensure!(f.position() == file_len, "trailing bytes");
     let scope = header.scope;
     Ok((header, Session { scope, tokens, sections }))
 }
@@ -355,12 +357,11 @@ impl SessionStore {
         let id = session_id(&self.compat, &session.scope, &session.tokens);
         let created = self.index.lock().expect("index").get(&id).map(|i| i.entry.created).unwrap_or(now);
         let bytes = encode(&self.compat, session, created, now, stripped);
-        let tmp = self.dir.join(format!(".tmp-{}-{}", std::process::id(), self.writes.fetch_add(1, Ordering::Relaxed)));
+        let tmp = crate::diskio::unique_path(&self.dir, ".tmp");
         let written = (|| -> Result<()> {
-            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-            restrict_file(&f);
-            f.write_all(&bytes)?;
-            f.sync_all()?;
+            let mut w = crate::diskio::Appender::create(tmp.clone())?;
+            w.append(&bytes)?;
+            w.finish_exact(bytes.len() as u64)?;
             fs::rename(&tmp, self.path(&id))?;
             File::open(&self.dir).and_then(|d| d.sync_all())?;
             Ok(())
