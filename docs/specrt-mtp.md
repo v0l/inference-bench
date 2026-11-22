@@ -213,6 +213,7 @@ real-prompts plus 15 short ones: code, SQL, maths, prose, translation) in
 only steps with no prefill in them. One run each, on a shared card, so read the speeds as
 indicative.
 
+Current claims and the paired A/B method are in `docs/perf/scoreboard.md`.
 | k | batch | mean acceptance length | draft acceptance | decode tok/s, speculative | plain | speedup |
 |---|---|---|---|---|---|---|
 | 1 | 1 | 1.830 | 83.0% | 27.2 | 23.1 | 1.18x |
