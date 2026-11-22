@@ -140,6 +140,7 @@ Two GPUs, both free (about 25 minutes: 2 min build, 1 min P2P and allreduce, 4 x
 ```bash
 crates/specrt/scripts/pair658.sh                       # p2p allreduce tp27b vllm
 PAIR_STEPS="p2p allreduce" crates/specrt/scripts/pair658.sh
+PAIR_STEPS="tp27b" crates/specrt/scripts/pair658.sh             # #921 speed run: tp1 and tp2 at batch 1 and 8, 4k prefill, --compare 1,2
 ```
 
 It refuses to start while any compute app is on either GPU or anything answers on :8001. It writes results to `/tmp/pair658`. The vLLM step starts `vllm serve ... --tensor-parallel-size 2` read-only from `~/.venv-vllm` under `MemoryMax=24G` and stops it on exit.
