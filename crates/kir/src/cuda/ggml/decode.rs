@@ -10,10 +10,12 @@ pub fn body() -> String {
         prim::ldg_reader("gg_u16", "unsigned short"),
         prim::ldg_reader("gg_u32", "unsigned"),
         rows::bytes_fn(),
+        super::iq::tables(),
+        super::iq::dequant8_iq(),
         prim::byte_of_words("gg_byte"),
         dequant::scale_min(),
         dequant::dequant8(),
-        prim::table_row("gg_row"),
+        super::iq::table_row(),
         r##"__device__ __forceinline__ void gg_load8(const void* w, const unsigned* table, int row, int k, float* out) {
     int type;
     const unsigned char* base = gg_row(w, table, row, type);

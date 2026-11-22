@@ -26,7 +26,9 @@ pub fn format_ids() -> String {
     for (i, f) in FORMATS.iter().enumerate() {
         out.push_str(&format!("constexpr int GG_{} = {i};\n", f.tag));
     }
-    out.push_str(&format!("constexpr int GG_BF16 = {};\nconstexpr int GG_SB = 256;\n\n", FORMATS.len()));
+    out.push_str(&format!("constexpr int GG_BF16 = {};\nconstexpr int GG_SB = 256;\n", FORMATS.len()));
+    out.push_str(&super::iq::ids());
+    out.push('\n');
     out
 }
 
@@ -35,6 +37,7 @@ pub fn bytes_fn() -> String {
     for f in FORMATS.iter() {
         body.push_str(&format!("        case GG_{}: return {};\n", f.tag, f.bytes));
     }
+    body.push_str(&super::iq::bytes_cases());
     body.push_str(&format!("        default: return {DEFAULT_BYTES};\n    }}\n"));
     prim::device("int", "gg_bytes", "int type", &body)
 }
