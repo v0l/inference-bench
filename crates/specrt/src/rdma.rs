@@ -9,7 +9,7 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const CHUNK: usize = 128 << 10;
+pub const CHUNK: usize = 64 << 10;
 pub const SLOTS: usize = 8;
 pub const DEFAULT_LIBRARY: &str = "libibverbs.so.1";
 
