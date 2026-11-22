@@ -388,16 +388,39 @@ pub struct OffloadPlan {
     pub nvme_bytes: u64,
     #[serde(default)]
     pub host_staging_bytes: u64,
+    #[serde(default)]
+    pub swap_staging_bytes: u64,
 }
 
-pub fn plan_layers(layer_bytes: &[u64], always_resident: u64, settings: &OffloadSettings) -> Result<OffloadPlan> {
-    let plan = assign_layers(layer_bytes, always_resident, settings, 0)?;
+impl OffloadPlan {
+    pub fn check_swap_fits(&self, host_budget: u64, in_use: u64, bytes: u64) -> Result<()> {
+        if host_budget == 0 || host_budget == u64::MAX {
+            return Ok(());
+        }
+        let pinned = self.host_bytes + self.host_staging_bytes.saturating_sub(self.swap_staging_bytes) + in_use + bytes;
+        ensure!(pinned <= host_budget, "parking {bytes} bytes would pin {pinned} bytes, over [runtime.offload] host_budget {host_budget}");
+        Ok(())
+    }
+}
+
+pub fn swap_staging_for(sequence_kv_bytes: u64) -> u64 {
+    sequence_kv_bytes.div_ceil(4096) * 4096 + 4096
+}
+
+pub fn plan_layers(layer_bytes: &[u64], always_resident: u64, settings: &OffloadSettings, swap_staging: u64) -> Result<OffloadPlan> {
+    let mut plan = plan_layers_inner(layer_bytes, always_resident, settings, swap_staging)?;
+    plan.swap_staging_bytes = swap_staging;
+    Ok(plan)
+}
+
+fn plan_layers_inner(layer_bytes: &[u64], always_resident: u64, settings: &OffloadSettings, swap_staging: u64) -> Result<OffloadPlan> {
+    let plan = assign_layers(layer_bytes, always_resident, settings, swap_staging)?;
     if plan.nvme_bytes == 0 {
         return Ok(plan);
     }
     let slot = layer_bytes.iter().copied().max().unwrap_or(0).div_ceil(4096) * 4096;
     let staging = slot * (settings.prefetch_depth.max(1) as u64 + 1);
-    assign_layers(layer_bytes, always_resident, settings, staging)
+    assign_layers(layer_bytes, always_resident, settings, staging + swap_staging)
 }
 
 fn assign_layers(layer_bytes: &[u64], always_resident: u64, settings: &OffloadSettings, host_staging: u64) -> Result<OffloadPlan> {
@@ -424,7 +447,7 @@ fn assign_layers(layer_bytes: &[u64], always_resident: u64, settings: &OffloadSe
     }
     let layers: Vec<LayerResidency> = (0..n).map(|l| LayerResidency { layer: l, bytes: layer_bytes[l], tier: tiers[l], pinned: tiers[l] == Tier::Vram }).collect();
     let sum = |t: Tier| layers.iter().filter(|l| l.tier == t).map(|l| l.bytes).sum::<u64>();
-    Ok(OffloadPlan { vram_bytes: sum(Tier::Vram) + fixed, host_bytes: sum(Tier::Host), nvme_bytes: sum(Tier::Nvme), staging_bytes: staging, host_staging_bytes: host_staging, layers })
+    Ok(OffloadPlan { vram_bytes: sum(Tier::Vram) + fixed, host_bytes: sum(Tier::Host), nvme_bytes: sum(Tier::Nvme), staging_bytes: staging, host_staging_bytes: host_staging, swap_staging_bytes: 0, layers })
 }
 
 impl OffloadPlan {
@@ -614,12 +637,31 @@ mod tests {
     }
 
     #[test]
+    fn swap_staging_is_charged_against_host_budget_and_a_park_over_it_is_refused() {
+        let sizes = vec![10000u64; 10];
+        let swap = swap_staging_for(5000);
+        assert_eq!(swap, 12288);
+        let s = OffloadSettings { vram_budget: 60000, host_budget: 12288 * 3 + 12288 + 20000, prefetch_depth: 2, ..Default::default() };
+        let p = plan_layers(&sizes, 0, &s, swap).unwrap();
+        assert_eq!(p.swap_staging_bytes, swap);
+        assert_eq!(p.host_staging_bytes, 12288 * 3 + swap);
+        assert_eq!(p.host_bytes, 20000);
+        assert!(p.host_bytes + p.host_staging_bytes <= s.host_budget, "{p:?}");
+        let without = plan_layers(&sizes, 0, &s, 0).unwrap();
+        assert!(without.host_bytes > p.host_bytes, "swap staging takes room from host layers");
+        assert!(p.check_swap_fits(s.host_budget, 0, 5000).is_ok());
+        let err = p.check_swap_fits(s.host_budget, 12000, 5000).unwrap_err().to_string();
+        assert!(err.contains("over [runtime.offload] host_budget"), "{err}");
+        assert!(p.check_swap_fits(0, 1 << 40, 1 << 40).is_ok());
+    }
+
+    #[test]
     fn pinned_total_with_disk_staging_stays_inside_host_budget() {
         let sizes = vec![10000u64; 10];
         let staging = 12288u64 * 3;
         for host in [0u64, 30000, 90000, 200000] {
             let s = OffloadSettings { vram_budget: 60000, host_budget: host, prefetch_depth: 2, ..Default::default() };
-            let p = plan_layers(&sizes, 0, &s).unwrap();
+            let p = plan_layers(&sizes, 0, &s, 0).unwrap();
             if p.nvme_bytes > 0 {
                 assert_eq!(p.host_staging_bytes, staging);
                 assert!(p.host_bytes + p.host_staging_bytes <= host.max(staging), "{p:?}");
@@ -628,7 +670,7 @@ mod tests {
             }
         }
         let tight = OffloadSettings { vram_budget: 60000, host_budget: staging + 20000, prefetch_depth: 2, ..Default::default() };
-        let p = plan_layers(&sizes, 0, &tight).unwrap();
+        let p = plan_layers(&sizes, 0, &tight, 0).unwrap();
         assert!(p.nvme_bytes > 0 && p.host_bytes == 20000 && p.host_bytes + p.host_staging_bytes <= tight.host_budget, "{p:?}");
     }
 
@@ -636,7 +678,7 @@ mod tests {
     fn planner_pins_first_and_last_then_fills_vram_then_host() {
         let layers = vec![10u64; 10];
         let s = OffloadSettings { vram_budget: 50, host_budget: 30, prefetch_depth: 1, ..Default::default() };
-        let p = plan_layers(&layers, 10, &s).unwrap();
+        let p = plan_layers(&layers, 10, &s, 0).unwrap();
         assert_eq!(p.staging_bytes, 20);
         assert_eq!(p.layers[0].tier, Tier::Vram);
         assert_eq!(p.layers[9].tier, Tier::Vram);
@@ -649,7 +691,7 @@ mod tests {
     #[test]
     fn planner_rejects_a_budget_below_the_resident_set() {
         let s = OffloadSettings { vram_budget: 15, ..Default::default() };
-        assert!(plan_layers(&[10, 10], 10, &s).is_err());
+        assert!(plan_layers(&[10, 10], 10, &s, 0).is_err());
     }
 
     #[test]
@@ -657,7 +699,7 @@ mod tests {
         let layers = vec![1_000_000_000u64; 27];
         let tps = |vram: u64| {
             let s = OffloadSettings { vram_budget: vram, host_budget: 100_000_000_000, ..Default::default() };
-            plan_layers(&layers, 0, &s).unwrap().tokens_per_second_ceiling(50.0, 10.0, 1500.0)
+            plan_layers(&layers, 0, &s, 0).unwrap().tokens_per_second_ceiling(50.0, 10.0, 1500.0)
         };
         assert!(tps(30_000_000_000) > tps(14_000_000_000));
         assert!(tps(14_000_000_000) > tps(4_000_000_000));

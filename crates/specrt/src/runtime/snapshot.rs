@@ -280,6 +280,9 @@ impl Runtime {
         ensure!(blocks.iter().all(|&b| (b as usize) < self.kv_blocks), "KV block out of range");
         let state = if self.has_seq_state() { Some(self.snapshot_state_blocking(slot)?) } else { None };
         let total = blocks.len() * self.kv_bytes_per_block();
+        if let Some(plan) = &self.offload_plan {
+            plan.check_swap_fits(self.spec.runtime.offload.host_budget, self.host.used() as u64, total as u64)?;
+        }
         let mut host = self.host.alloc(total)?;
         self.blocks_to_host(blocks, host.as_mut_slice()?)?;
         let kv = match self.spec.runtime.offload.nvme_path.as_deref() {

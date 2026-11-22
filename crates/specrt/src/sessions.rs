@@ -268,7 +268,6 @@ pub struct SessionStore {
     dir: PathBuf,
     compat: Compat,
     index: Mutex<HashMap<String, Indexed>>,
-    writes: AtomicU64,
     pub metrics: Metrics,
 }
 
@@ -278,7 +277,7 @@ impl SessionStore {
         let dir = root.join("sessions").join(model);
         fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         restrict(&dir, 0o700);
-        let store = SessionStore { dir, compat, index: Mutex::new(HashMap::new()), writes: AtomicU64::new(0), metrics: Metrics::default() };
+        let store = SessionStore { dir, compat, index: Mutex::new(HashMap::new()), metrics: Metrics::default() };
         store.rescan()?;
         Ok(store)
     }
@@ -534,15 +533,6 @@ fn restrict(path: &Path, mode: u32) {
 
 #[cfg(not(unix))]
 fn restrict(_: &Path, _: u32) {}
-
-#[cfg(unix)]
-fn restrict_file(f: &File) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn restrict_file(_: &File) {}
 
 pub const SECTION_META: usize = 0;
 pub const SECTION_K: usize = 1;
@@ -889,7 +879,7 @@ mod tests {
             Compat { block_size: 32, ..compat() },
         ] {
             let dir = store.dir().to_path_buf();
-            let foreign = SessionStore { dir, compat: other, index: Mutex::new(HashMap::new()), writes: AtomicU64::new(0), metrics: Metrics::default() };
+            let foreign = SessionStore { dir, compat: other, index: Mutex::new(HashMap::new()), metrics: Metrics::default() };
             foreign.rescan().unwrap();
             assert!(foreign.list().is_empty());
             let copy = store.write(&session(64, 3), 0).unwrap();
