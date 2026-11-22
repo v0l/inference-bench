@@ -894,7 +894,7 @@ fn server_tab_text_stays_inside_the_screen_from_360_to_600_wide() {
         for (name, gpus) in [("tiny-model", 1), ("tiny-org/a-long-model-name-for-a-phone-instruct-build", 2)] {
             let found = server_tab_painted_text(width, name, gpus);
             assert!(found.len() > 20, "only {} text shapes at {width}", found.len());
-            for (text, r) in found.iter().filter(|(_, r)| r.min.y < 2400.0 - 100.0) {
+            for (text, r) in found.iter() {
                 if r.max.x > width + 0.5 {
                     offenders.push(format!("width {width}, {gpus} gpu, {name}: {text:?} ends at {} past the screen", r.max.x));
                 }
@@ -923,6 +923,27 @@ fn screenshot_of_the_server_tab_with_a_long_model_name_at_phone_width() {
     pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
     h.run();
     h.render().unwrap().save(out.join("server-phone-390x844.png")).unwrap();
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshots_of_the_status_bar_with_a_long_model_name_at_phone_and_desktop_width() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (name, size) in [("status-phone-390x844", egui::vec2(390.0, 844.0)), ("status-desktop-1280x800", egui::vec2(1280.0, 800.0))] {
+        let mut h = harness_at(name, Tab::Server, size);
+        with_gpu(&mut h, 0, 96 << 30);
+        let one = h.state().gpu[0].clone();
+        h.state_mut().gpu = vec![one; 2];
+        h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+        let mut m = real_model(&h.state().library[0].name.clone());
+        m.name = "tiny-org/a-long-model-name-for-a-phone-instruct-build".to_string();
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().load_model_with(&m, 2048, 2);
+        pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    }
 }
 
 #[test]
