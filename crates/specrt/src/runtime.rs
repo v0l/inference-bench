@@ -934,7 +934,7 @@ impl Runtime {
         unsafe { ctx.disable_event_tracking() };
         let stream = ctx.new_stream()?;
         let cache_dir = spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
-        let jit = Jit::new(ctx.clone(), cache_dir.clone())?;
+        let jit = Jit::new(ctx.clone(), cache_dir.clone())?.with_limits(spec.runtime.cache_max_bytes.unwrap_or(crate::jit::DEFAULT_CACHE_MAX_BYTES), spec.runtime.compile_jobs.unwrap_or(1));
         let comm = match tp {
             Some((_, rank, fabric)) => Some(fabric.comm(rank, &stream, cache_dir, Some((spec.dims.hidden as u32, spec.norm.eps as f32)))?),
             None => None,

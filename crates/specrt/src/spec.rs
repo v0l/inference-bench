@@ -176,6 +176,10 @@ pub struct RuntimeOptions {
     pub rope_extension: Option<RopeExtension>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compile_jobs: Option<usize>,
     #[serde(skip_serializing_if = "PrefixCacheOptions::is_default")]
     pub prefix_cache: PrefixCacheOptions,
     #[serde(skip_serializing_if = "crate::loader::LoaderOptions::is_default")]
@@ -269,7 +273,7 @@ impl PrefixCacheOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
+        RuntimeOptions { backend: BackendChoice::Auto, graphs: true, pdl: false, fuse: true, tile: TileChoice::Auto, big_tile: None, fp4_tile: None, fp8_tile: None, fp4_stages: None, prefill_chunk: None, unsplit: Vec::new(), split_activations: None, gemm_fp32: false, chunked_scan: true, kv_dtype: KvDtype::F16, kv_f16_layers: None, rope_extension: None, cache_dir: None, cache_max_bytes: None, compile_jobs: None, prefix_cache: PrefixCacheOptions::default(), loader: crate::loader::LoaderOptions::default(), vision: VisionOptions::default() }
     }
 }
 
