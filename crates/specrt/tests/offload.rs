@@ -83,6 +83,31 @@ fn slots_are_reused_when_more_layers_stream_than_buffers_exist() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn layers_on_nvme_stream_bit_identically() {
+    let dir = "tiny-qwen3.5";
+    let (budget, _) = budget_keeping(dir, 1);
+    let tmp = std::env::temp_dir().join(format!("specrt-layers-nvme-{}", std::process::id()));
+    let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
+    let p = prompt(40);
+    let want_prefill = full.trace_prefill(&p).unwrap();
+    let want_tokens = full.generate(&p, 16, Sampling::GREEDY).unwrap().tokens;
+    drop(full);
+    let mut spec = spec_for(dir, budget);
+    spec.runtime.offload.host_budget = 1;
+    spec.runtime.offload.nvme_path = Some(tmp.to_string_lossy().into_owned());
+    let mut off = Runtime::load(&spec, 256).unwrap();
+    assert!(off.offload_plan().unwrap().nvme_bytes > 0);
+    assert_eq!(off.trace_prefill(&p).unwrap().logits, want_prefill.logits);
+    assert_eq!(off.generate(&p, 16, Sampling::GREEDY).unwrap().tokens, want_tokens);
+    let stats = off.offload_stats().unwrap();
+    assert!(stats.nvme_read_bytes > 0 && stats.host_to_vram_bytes > 0, "{stats:?}");
+    drop(off);
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn a_budget_that_holds_everything_streams_nothing() {
     let rt = Runtime::load(&spec_for("tiny-qwen3.5", u64::MAX / 4), 256).unwrap();
     assert_eq!(rt.streamed_layers(), 0);
