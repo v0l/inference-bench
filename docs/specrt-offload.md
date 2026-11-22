@@ -75,6 +75,17 @@ From NVMe at 10 GB/s the same table divides by 5.8. Lower bits stream faster in 
 
 With `vram_budget > 0` on a MoE model the routed experts of every layer live in pinned host memory and the kernels read them from a slot pool through the router's index buffer (the index is remapped to slots after routing, so the kernels are unchanged). `expert_slots` sets the pool size (0 derives it from `vram_budget`); `hotlist` names a JSON file of use counts (`Runtime::save_expert_hotlist` writes it after a calibration run) whose hottest experts fill the pool at load and guide prefetch until the router has history. Prefill with more distinct experts than slots runs in groups. Not run yet: Qwen3.5-122B NVFP4 and GLM-4.5-Air (need the 27B-class window), NVMe tier for experts.
 
+Qwen3.5-122B NVFP4 (Sehyo, 76 GB) on GPU 1, first 8 of 48 layers (`bench --layers 8`, every MoE layer kept, the full model was not run), 512 token prompt, 128 new tokens, batch 1, 3 alternating rounds of 2 runs each, greedy. Cache is 256 slots shared by all 8 layers (2048 experts, 12.5%), `bench --vram-gb 90 --expert-slots 256`.
+
+| Mode | Decode tok/s (3 rounds) | Prefill tok/s | Device memory | Cache hit ratio | Host to VRAM |
+| --- | --- | --- | --- | --- | --- |
+| resident | 368.6, 368.5, 368.6 | 27.6k | 22.75 GB | n/a | 0 |
+| 256 expert slots | 154.1, 154.8, 154.5 | 2.1k | 13.20 GB | 0.659 | 77.3 GB over the whole bench (prefill, warm up, 2 runs) |
+
+The first 64 greedy tokens are identical to resident in all three rounds. Missing experts cost about 5.3 MB each (gate, up, down plus scales), so 64 routed experts per token with a 34% miss rate is about 0.12 GB per token and a link ceiling of about 480 tok/s at 57.8 GB/s; the measured 154 tok/s is far below it because loads are issued after the router and the compute stream waits for them (only the next layer's predicted experts overlap). Closing that gap is the follow-up (issue filed). Prefill is slow for the same reason: 512 distinct tokens touch nearly every expert in every layer.
+
+Hotlist: a calibration run saved by `--save-hotlist` and loaded by `--hotlist` (or found as `<spec>.hotlist`) changed misses over a 16 token run from 4160 to 4104 on the real model (the hottest 256 of 2048 experts only cover so much), and on the tiny fixture the first decode token has zero misses with the hotlist against 6 or more cold (`tests/offload.rs`).
+
 ## Tests
 
 - `cargo test -p inference-bench-specrt --lib offload` (CPU, 17 tests: residency, eviction under budget, prefetch order, no re-read of a resident page, throttled fake NVMe).
