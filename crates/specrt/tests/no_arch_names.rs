@@ -57,7 +57,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "ui/src/models.rs", lines: 1, kind: Kind::Permanent, note: "example model name shown as a hint" },
     Entry { path: "core/src/fit.rs", lines: 1, kind: Kind::Permanent, note: "fit tests over a real model fixture" },
     Entry { path: "ui/src/table.rs", lines: 3, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
-    Entry { path: "ui/src/tests.rs", lines: 152, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
+    Entry { path: "ui/src/tests.rs", lines: 153, kind: Kind::Permanent, note: "UI tests over real model fixtures" },
 ];
 
 fn allowed(rel: &str) -> usize {

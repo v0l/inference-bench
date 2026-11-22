@@ -806,7 +806,7 @@ fn result_card(ui: &mut egui::Ui, d: &LoadDialog, env: &Env, spread: &Option<Res
         let tiles = [
             ("gpu memory", human_size(e.total()), total_tint),
             ("context", format!("{} tokens", tokens(d.ctx)), VALUE),
-            ("max that fits", fits.map_or("-".to_string(), |n| format!("up to {} tokens", tokens(n))), VALUE),
+            ("max that fits", fits.map_or("-".to_string(), |n| format!("{} tokens", tokens(n))), VALUE),
             ("kv cache", human_size(e.kv), kv_tint),
         ];
         let gap = 8.0;
