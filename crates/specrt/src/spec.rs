@@ -572,6 +572,8 @@ pub struct Moe {
     pub out_scale: f64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub fused_experts: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub input_scaled: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub hash_layers: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1652,6 +1654,7 @@ impl Spec {
                     router_module: family.moe.router_module.clone().unwrap_or_else(default_router_module),
                     out_scale: multiplier(&family.multipliers.residual).unwrap_or(1.0),
                     fused_experts: family.moe.fused_experts,
+                    input_scaled: family.moe.input_scaled,
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,

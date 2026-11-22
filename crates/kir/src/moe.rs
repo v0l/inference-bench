@@ -29,6 +29,7 @@ impl Family {
                 "moe_down_bf16",
                 "moe_down_fp4",
                 "moe_combine",
+                "moe_scale_inputs",
                 "moe_permute",
                 "moe_group_up_bf16",
                 "moe_group_up_fp4",

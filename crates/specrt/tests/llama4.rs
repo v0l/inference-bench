@@ -48,6 +48,20 @@ fn rope_pairs_and_weightless_qk_norm_come_from_the_family() {
 }
 
 #[test]
+fn top1_sigmoid_routing_scales_the_expert_input_and_the_shared_expert_has_no_gate() {
+    let spec = spec_of(&scout());
+    let moe = spec.moe.as_ref().unwrap();
+    assert!(moe.input_scaled && !moe.norm_topk && !moe.shared_gate);
+    assert_eq!(moe.router, specrt::spec::RouterAct::Sigmoid);
+    assert_eq!((moe.top_k(), moe.shared_slots(), moe.pairs()), (1, 1, 2));
+    let target = kir::Target::sm_120();
+    let source = specrt::codegen::Module::generate_kv(&spec, 256, 1, &target).unwrap().source;
+    assert!(source.contains("constexpr bool MOE_INPUT_SCALED = true;") && source.contains("moe_scale_inputs("));
+    let plain = specrt::codegen::moe_kernels(&Spec::from_hf_config_serving_in(Registry::embedded(), &std::fs::read_to_string(fixtures().join("glm4.5-air.config.json")).unwrap()).unwrap(), &target).unwrap();
+    assert!(!plain.is_empty() && plain.iter().all(|k| !k.shape.input_scaled));
+}
+
+#[test]
 fn an_explicit_moe_layer_list_overrides_the_step() {
     let mut config = scout();
     config["text_config"]["moe_layers"] = serde_json::json!([1, 2, 5]);

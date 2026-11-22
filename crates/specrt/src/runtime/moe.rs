@@ -91,6 +91,7 @@ impl DeviceMoe {
 
 pub(super) struct MoeBuffers {
     xn: CudaSlice<f32>,
+    xp: CudaSlice<f32>,
     idx: CudaSlice<i32>,
     coef: CudaSlice<f32>,
     logits: CudaSlice<f32>,
@@ -139,8 +140,11 @@ impl MoeBuffers {
     pub(super) fn new(stream: &Arc<cudarc::driver::CudaStream>, rows: usize, spec: &crate::spec::Spec, mma: bool, mma8: bool, mmb: bool) -> Result<Self> {
         let m = spec.moe.as_ref().expect("moe buffers need [moe]");
         let pairs = rows * m.pairs();
+        let scaled = m.input_scaled;
+        let inputs = if scaled { pairs } else { rows };
         Ok(MoeBuffers {
             xn: stream.alloc_zeros(rows * spec.dims.hidden)?,
+            xp: stream.alloc_zeros(if scaled { pairs * spec.dims.hidden } else { 1 })?,
             idx: stream.alloc_zeros(pairs)?,
             coef: stream.alloc_zeros(pairs)?,
             logits: stream.alloc_zeros(rows * (m.experts + 1))?,
@@ -153,10 +157,10 @@ impl MoeBuffers {
                 let (h, i) = (spec.dims.hidden.next_multiple_of(pad), m.expert_intermediate.next_multiple_of(pad));
                 let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_SMALL;
                 Some(MmaBuffers {
-                    xq: stream.alloc_zeros(rows * h / 2)?,
-                    xs: stream.alloc_zeros(rows * h / 16)?,
-                    xq2: stream.alloc_zeros(rows * h / 2)?,
-                    xs2: stream.alloc_zeros(rows * h / 16)?,
+                    xq: stream.alloc_zeros(inputs * h / 2)?,
+                    xs: stream.alloc_zeros(inputs * h / 16)?,
+                    xq2: stream.alloc_zeros(inputs * h / 2)?,
+                    xs2: stream.alloc_zeros(inputs * h / 16)?,
                     aq: stream.alloc_zeros(pairs * i / 2)?,
                     as_: stream.alloc_zeros(pairs * i / 16)?,
                     aq2: stream.alloc_zeros(pairs * i / 2)?,
@@ -170,8 +174,8 @@ impl MoeBuffers {
                 let (h, i) = (spec.dims.hidden, m.expert_intermediate);
                 let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_SMALL;
                 Some(MmbBuffers {
-                    xh: stream.alloc_zeros(rows * h)?,
-                    xl: stream.alloc_zeros(rows * h)?,
+                    xh: stream.alloc_zeros(inputs * h)?,
+                    xl: stream.alloc_zeros(inputs * h)?,
                     ah: stream.alloc_zeros(pairs * i)?,
                     al: stream.alloc_zeros(pairs * i)?,
                     tiles: stream.alloc_zeros(2 * tiles)?,
@@ -183,8 +187,8 @@ impl MoeBuffers {
                 let (h, i) = (spec.dims.hidden, m.expert_intermediate);
                 let tiles = m.experts + 1 + pairs / crate::codegen::MOE_MMA_BM_SMALL;
                 Some(Mma8Buffers {
-                    xq: stream.alloc_zeros(rows * h)?,
-                    xs: stream.alloc_zeros(rows * h / 32)?,
+                    xq: stream.alloc_zeros(inputs * h)?,
+                    xs: stream.alloc_zeros(inputs * h / 32)?,
                     aq: stream.alloc_zeros(pairs * i)?,
                     as_: stream.alloc_zeros(pairs * i / 32)?,
                     tiles: stream.alloc_zeros(2 * tiles)?,
@@ -216,7 +220,19 @@ impl Runtime {
         let first = self.spec.moe.as_ref().expect("moe spec").first_expert() as i32;
         b.arg(&mb.logits).arg(&w.score_bias).arg(&w.hash_table).arg(tokens).arg(&w.hashed).arg(&mb.idx).arg(&mb.coef).arg(&first);
         unsafe { b.launch(cfg(n as u32, 32)) }?;
+        if self.spec.moe.as_ref().expect("moe spec").input_scaled {
+            let m = self.spec.moe.as_ref().expect("moe spec");
+            let mut b = self.launcher(self.kernel("moe_scale_inputs"));
+            b.arg(&mb.xn).arg(&mb.idx).arg(&mb.coef).arg(&mb.xp);
+            let config = LaunchConfig { grid_dim: (self.spec.dims.hidden.div_ceil(256) as u32, (n * m.pairs()) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(config) }?;
+        }
         Ok(())
+    }
+
+    fn expert_inputs<'a>(&self, mb: &'a MoeBuffers, n: usize) -> (&'a CudaSlice<f32>, usize) {
+        let m = self.spec.moe.as_ref().expect("moe spec");
+        if m.input_scaled { (&mb.xp, n * m.pairs()) } else { (&mb.xn, n) }
     }
 
     fn stack_args<'a>(&'a self, b: &mut crate::launch::Launch<'a>, s: &'a StackWeights) {
@@ -251,7 +267,7 @@ impl Runtime {
         let mut b = self.launcher(self.kernel(&up));
         self.stack_args(&mut b, &w.gate);
         self.stack_args(&mut b, &w.up);
-        b.arg(&w.gate_up_bias).arg(&mb.xn).arg(&mb.idx).arg(&mb.act);
+        b.arg(&w.gate_up_bias).arg(self.expert_inputs(mb, n).0).arg(&mb.idx).arg(&mb.act);
         let config = LaunchConfig {
             grid_dim: (pairs, m.expert_intermediate.div_ceil(ROWS_PER_BLOCK) as u32, 1),
             block_dim: (256, 1, 1),
@@ -329,7 +345,8 @@ impl Runtime {
             unsafe { b.launch(cfg(rows as u32, 256)) }?;
             Ok(())
         };
-        quant(&mb.xn, &mma.xq, &mma.xs, &mma.xq2, &mma.xs2, up_planes, n, h, igs_up)?;
+        let (xin, xrows) = self.expert_inputs(mb, n);
+        quant(xin, &mma.xq, &mma.xs, &mma.xq2, &mma.xs2, up_planes, xrows, h, igs_up)?;
         let inv_up = 1.0 / igs_up;
         let tag = |planes: u8| if planes == 2 { "2" } else { "" };
         let name = format!("{stem}_up{}{}", tag(up_planes), if small { "_s" } else { "" });
@@ -383,7 +400,8 @@ impl Runtime {
             unsafe { b.launch(cfg(rows as u32, 256)) }?;
             Ok(())
         };
-        split(&mb.xn, &mma.xh, &mma.xl, n, h)?;
+        let (xin, xrows) = self.expert_inputs(mb, n);
+        split(xin, &mma.xh, &mma.xl, xrows, h)?;
         let tag = if small { "_s" } else { "" };
         let mut b = self.launcher(self.kernel(&format!("moe_mma_up_b16{tag}")));
         b.arg(gw).arg(uw).arg(&w.gate_up_bias).arg(&mma.xh).arg(&mma.xl).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.act);
@@ -423,7 +441,8 @@ impl Runtime {
             unsafe { b.launch(config) }?;
             Ok(())
         };
-        quant(&mb.xn, &mma.xq, &mma.xs, n, h)?;
+        let (xin, xrows) = self.expert_inputs(mb, n);
+        quant(xin, &mma.xq, &mma.xs, xrows, h)?;
         let name = if small { "moe_mma_up_f8_s" } else { "moe_mma_up_f8" };
         let mut b = self.launcher(self.kernel(name));
         b.arg(gw).arg(gg).arg(uw).arg(ug).arg(&mma.xq).arg(&mma.xs).arg(&mb.offsets).arg(&mb.sorted).arg(&mma.tiles).arg(&mb.act);
@@ -450,7 +469,7 @@ impl Runtime {
         let mut b = self.launcher(self.kernel(&up));
         self.stack_args(&mut b, &w.gate);
         self.stack_args(&mut b, &w.up);
-        b.arg(&w.gate_up_bias).arg(&mb.xn).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.act);
+        b.arg(&w.gate_up_bias).arg(self.expert_inputs(mb, n).0).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.act);
         let config = LaunchConfig {
             grid_dim: (slots, m.expert_intermediate.div_ceil(ROWS_PER_BLOCK) as u32, 1),
             block_dim: (256, 1, 1),

@@ -27,4 +27,7 @@ qk_norm = { config = "use_qk_norm", default = false }
 qk_norm_unit = true
 
 [moe]
+router = "sigmoid"
+norm_topk = false
+input_scaled = true
 shared_gate = false

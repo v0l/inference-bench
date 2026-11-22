@@ -63,6 +63,7 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         hash: m.hash_table.is_some(),
         block_group: m.expert_block.map_or(0, |b| b.group),
         mapped: spec.mlp.mapped.is_some(),
+        input_scaled: m.input_scaled,
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if moe_mma_enabled(spec, target) {

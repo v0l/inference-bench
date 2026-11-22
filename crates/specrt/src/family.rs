@@ -180,6 +180,7 @@ pub struct FamilyMoe {
     pub expert_bias: bool,
     pub router_module: Option<String>,
     pub fused_experts: bool,
+    pub input_scaled: bool,
     pub hash_table: Option<String>,
 }
 

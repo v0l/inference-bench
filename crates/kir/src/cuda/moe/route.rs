@@ -174,6 +174,21 @@ pub fn route() -> String {
     )
 }
 
+pub fn scale_inputs() -> String {
+    prim::global(
+        None,
+        "moe_scale_inputs",
+        "const float* xn, const int* idx, const float* coef, float* xp",
+        r##"    int pair = blockIdx.y;
+    int t = pair / MOE_PAIRS;
+    int s = pair % MOE_PAIRS;
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= HIDDEN || idx[pair] < 0) return;
+    xp[(size_t)pair * HIDDEN + i] = xn[(size_t)t * HIDDEN + i] * (s < MOE_K ? coef[pair] : 1.0f);
+"##,
+    )
+}
+
 pub fn combine() -> String {
     prim::global(
         None,
@@ -185,7 +200,7 @@ pub fn combine() -> String {
     float acc = 0.0f;
     for (int s = 0; s < MOE_PAIRS; s++) {
         float c = coef[t * MOE_PAIRS + s];
-        if (c != 0.0f) acc += c * out[((size_t)t * MOE_PAIRS + s) * HIDDEN + i];
+        if (c != 0.0f) acc += (MOE_INPUT_SCALED && s < MOE_K ? 1.0f : c) * out[((size_t)t * MOE_PAIRS + s) * HIDDEN + i];
     }
     x[(size_t)t * HIDDEN + i] += MOE_OUT_SCALE * acc;
 "##,
