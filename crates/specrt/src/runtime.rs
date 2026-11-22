@@ -438,6 +438,7 @@ struct DescribedLaunch {
     threads: u32,
     params: Vec<kir::Param>,
     chunk: Option<kir::recur::ChunkForm>,
+    tile: bool,
 }
 
 struct DeviceAttn {
@@ -1084,7 +1085,7 @@ impl Runtime {
         let smem = module.smem.clone();
         let described: Vec<Option<DescribedLaunch>> = crate::codegen::described_kernels(spec, layout.kv_planes, max_ctx, &target)?
             .into_iter()
-            .map(|k| k.map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, params: k.params }))
+            .map(|k| k.map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, tile: k.tile_scan(), params: k.params }))
             .collect();
         let linear_tuning = LinearTuning::for_target(&target);
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
@@ -1154,7 +1155,7 @@ impl Runtime {
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
         let mixer_launch: Vec<DescribedLaunch> = crate::codegen::mixer_kernels(spec, layout.kv_planes, max_ctx, &target)?
             .into_iter()
-            .map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: k.chunk_form().filter(|_| spec.runtime.chunked_scan), params: k.params })
+            .map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: k.chunk_form().filter(|_| spec.runtime.chunked_scan), tile: false, params: k.params })
             .collect();
         let chunk_tiles = match &spec.mixer {
             Some(m) => mixer_launch

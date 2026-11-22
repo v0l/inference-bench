@@ -154,7 +154,13 @@ impl Runtime {
             ints[i] = v as i32;
             floats[i] = v as f32;
         }
-        let mut b = self.launcher(self.kernel(launch.name));
+        let a = &self.spec.attention;
+        let tiled = launch.tile && !self.spec.runtime.kv_dtype.is_fp8() && spec_node.grid.len() == 2 && spec_node.grid[0] == "heads" && spec_node.grid[1] == "rows" && a.heads / a.kv_heads <= 16;
+        let tile_name = tiled.then(|| format!("{}{}", launch.name, if run.bb.is_none() { "_mma" } else { "_mma_dec" }));
+        let mut b = match &tile_name {
+            Some(n) => self.launcher(self.kernel(n)),
+            None => self.launcher(self.kernel(launch.name)),
+        };
         for (i, p) in launch.params.iter().enumerate() {
             match (p.role, p.name) {
                 (kir::Role::Value, _) => match p.ty {
@@ -190,6 +196,18 @@ impl Runtime {
                 (_, "out_lo") => b.arg(&self.pre.attn_planes.lo),
                 (_, name) => bail!("kernel {} has an unknown buffer param {name:?}", launch.name),
             };
+        }
+        if tiled {
+            let rows = crate::codegen::flash_rows(a.head_dim, self.kv_planes);
+            let tokens = run.n as i32;
+            let config = if run.bb.is_none() {
+                b.arg(&tokens);
+                LaunchConfig { grid_dim: (grid(run.n, rows), a.heads as u32, 1), block_dim: (rows as u32 * 2, 1, 1), shared_mem_bytes: self.smem["flash_mma"] }
+            } else {
+                LaunchConfig { grid_dim: (a.kv_heads as u32, run.n as u32, 1), block_dim: (128, 1, 1), shared_mem_bytes: self.smem["flash_mma"] }
+            };
+            unsafe { b.launch(config) }?;
+            return Ok(());
         }
         let dim = |symbol: &String| -> Result<u32> {
             let a = &self.spec.attention;
