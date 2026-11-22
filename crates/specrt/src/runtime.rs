@@ -156,7 +156,20 @@ fn upload_head(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, role: Sta
         lm_head: DeviceMatrix::upload(stream, &head)?,
         embed,
         draft: match spec.draft_head_quant() {
-            Some(q) => Some(DeviceMatrix::upload(stream, &ck.draft_head(spec, q)?)?),
+            Some(q) => {
+                let on_device = match q {
+                    crate::spec::Quant::Nvfp4G16 => ck.draft_head_bf16(spec)?,
+                    _ => None,
+                };
+                match on_device {
+                    Some((w, cols)) => {
+                        let cache = spec.runtime.cache_dir.clone().unwrap_or_else(default_cache_dir);
+                        let d = crate::nvfp4::quantize_on_device(stream, &cache, &w, cols)?;
+                        Some(DeviceMatrix::Fp4 { packed: d.packed, scales: d.scales })
+                    }
+                    None => Some(DeviceMatrix::upload(stream, &ck.draft_head(spec, q)?)?),
+                }
+            }
             None => None,
         },
     };
