@@ -11,19 +11,25 @@ pub enum Policy {
     Frequency,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct OffloadSettings {
-    #[serde(default)]
     pub vram_budget: u64,
-    #[serde(default)]
     pub host_budget: u64,
-    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub nvme_path: Option<String>,
-    #[serde(default = "default_prefetch_depth")]
     pub prefetch_depth: usize,
-    #[serde(default)]
     pub policy: Policy,
+}
+
+impl OffloadSettings {
+    pub fn is_default(&self) -> bool {
+        *self == OffloadSettings::default()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.vram_budget > 0
+    }
 }
 
 fn default_prefetch_depth() -> usize {

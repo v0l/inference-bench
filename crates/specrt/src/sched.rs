@@ -140,6 +140,9 @@ pub trait Executor {
     fn chain_metrics(&self) -> Option<ChainMetrics> {
         None
     }
+    fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
+        None
+    }
     fn max_ctx(&self) -> usize;
     fn slots(&self) -> usize;
     fn kv_blocks(&self) -> usize;
@@ -941,6 +944,10 @@ impl<E: Executor> Scheduler<E> {
 
     pub fn chain_metrics(&self) -> Option<ChainMetrics> {
         self.exec.chain_metrics()
+    }
+
+    pub fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
+        self.exec.offload_stats()
     }
 
     pub fn state_refusals(&self) -> u64 {

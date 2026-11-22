@@ -260,6 +260,10 @@ pub fn render(s: &Stats) -> String {
     gauge(&mut o, "inference_prefix_cache_blocks", "KV blocks held by the prefix cache.", s.prefix_blocks as f64);
     gauge(&mut o, "inference_prefix_cache_snapshots", "Recurrent state snapshots held by the prefix cache.", s.prefix_snapshots as f64);
     sessions(&mut o, s);
+    if let Some(off) = &s.offload {
+        gauge(&mut o, "inference_offload_hit_ratio", "Share of weight page requests served from GPU memory.", off.hit_ratio());
+        let _ = writeln!(o, "# HELP inference_offload_read_bytes_total Weight bytes streamed to the card or read from disk.\n# TYPE inference_offload_read_bytes_total counter\ninference_offload_read_bytes_total {}", off.host_to_vram_bytes + off.nvme_read_bytes);
+    }
     gauge(&mut o, "inference_prefix_cache_snapshot_bytes", "Host bytes of the recurrent state snapshots.", s.prefix_snapshot_bytes as f64);
     let _ = writeln!(
         o,
@@ -286,6 +290,15 @@ pub fn render(s: &Stats) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offload_stats_render_the_two_issue_series() {
+        let s = Stats { offload: Some(specrt::offload::OffloadStats { vram_hits: 3, nvme_reads: 1, nvme_read_bytes: 7, host_to_vram_bytes: 5, ..Default::default() }), ..Stats::default() };
+        let t = render(&s);
+        assert!(t.contains("inference_offload_hit_ratio 0.75"), "{t}");
+        assert!(t.contains("inference_offload_read_bytes_total 12"), "{t}");
+        assert!(!render(&Stats::default()).contains("inference_offload"));
+    }
 
     #[test]
     fn session_counters_render_with_the_documented_names() {

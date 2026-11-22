@@ -414,6 +414,16 @@ fn act_quant_rejects_unknown_values_and_formats_the_weights_cannot_take() {
 }
 
 #[test]
+fn offload_table_parses_round_trips_and_defaults_off() {
+    let base = std::fs::read_to_string(root().join("specs/qwen3-0.6b.toml")).unwrap();
+    assert!(!Spec::parse(&base).unwrap().runtime.offload.enabled());
+    let s = Spec::parse(&format!("{base}\n[runtime.offload]\nvram_budget = 100\nprefetch_depth = 2\npolicy = \"frequency\"\n")).unwrap();
+    assert_eq!((s.runtime.offload.vram_budget, s.runtime.offload.prefetch_depth), (100, 2));
+    assert_eq!(Spec::parse(&s.to_toml().unwrap()).unwrap(), s);
+    assert!(Spec::parse(&format!("{base}\n[runtime.offload]\nbogus = 1\n")).is_err());
+}
+
+#[test]
 fn runtime_table_defaults_round_trips_and_rejects_bad_values() {
     use specrt::spec::{RuntimeOptions, TileChoice};
     let base = std::fs::read_to_string(root().join("specs/qwen3-0.6b.toml")).unwrap();

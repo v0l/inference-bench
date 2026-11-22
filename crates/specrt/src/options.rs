@@ -216,10 +216,11 @@ pub enum Group {
     Serving,
     Runtime,
     Loader,
+    Offload,
 }
 
 impl Group {
-    pub const ALL: [Group; 7] = [Group::Basic, Group::Parallel, Group::Mtp, Group::PrefixCache, Group::Serving, Group::Runtime, Group::Loader];
+    pub const ALL: [Group; 8] = [Group::Basic, Group::Parallel, Group::Mtp, Group::PrefixCache, Group::Serving, Group::Runtime, Group::Loader, Group::Offload];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -230,6 +231,7 @@ impl Group {
             Group::Serving => "serving",
             Group::Runtime => "runtime",
             Group::Loader => "loader",
+            Group::Offload => "offload",
         }
     }
 
@@ -332,6 +334,11 @@ const META: &[Meta] = &[
     Meta { key: "runtime.loader.lanes", label: "lanes", group: Group::Loader, help: "Parallel upload streams.", choices: &[], range: (1, 16) },
     Meta { key: "runtime.loader.skip_cached", label: "skip cached files", group: Group::Loader, help: "Read files already in the page cache the plain way.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.loader.pinned", label: "pinned buffers", group: Group::Loader, help: "Use pinned host memory for staging.", choices: &[], range: (0, 0) },
+    Meta { key: "runtime.offload.vram_budget", label: "weight memory cap", group: Group::Offload, help: "Bytes of GPU memory the weights may use. Layers that do not fit stay in pinned host memory and stream in while earlier layers compute. 0 keeps every weight on the card.", choices: &[], range: (0, u64::MAX) },
+    Meta { key: "runtime.offload.host_budget", label: "host memory cap", group: Group::Offload, help: "Bytes of pinned host memory for streamed layers. 0 means no cap.", choices: &[], range: (0, u64::MAX) },
+    Meta { key: "runtime.offload.nvme_path", label: "disk spill folder", group: Group::Offload, help: "Folder on a fast drive for layers that fit neither tier.", choices: &[], range: (0, 0) },
+    Meta { key: "runtime.offload.prefetch_depth", label: "prefetch depth", group: Group::Offload, help: "Layers copied ahead of the one computing.", choices: &[], range: (1, 8) },
+    Meta { key: "runtime.offload.policy", label: "eviction policy", group: Group::Offload, help: "Which resident page leaves first when a tier is full.", choices: &["lru", "frequency"], range: (0, 0) },
     Meta { key: "runtime.loader.host_budget_mb", label: "host budget", group: Group::Loader, help: "Megabytes of host memory the loader may use for staging.", choices: &[], range: (64, 1 << 20) },
 ];
 
@@ -385,6 +392,7 @@ fn populated_runtime() -> RuntimeOptions {
         compile_jobs: Some(1),
         prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: 16, max_snapshots: 1, max_blocks: 1, async_snapshots: true },
         loader: LoaderOptions { enabled: true, direct: true, chunk_mb: 1, readers: 1, ahead: 1, workers: 1, lanes: 1, skip_cached: true, pinned: true, host_budget_mb: 64 },
+        offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency },
         vision: crate::spec::VisionOptions { precision: crate::vision_encoder::VisionPrecision::Exact, cache_mb: 1, max_batch: 1, pan_and_scan: false },
     }
 }
@@ -418,6 +426,7 @@ fn defaults() -> BTreeMap<String, Value> {
     d.extend(flat("runtime", RuntimeOptions::default()));
     d.extend(flat("runtime.prefix_cache", PrefixCacheOptions::default()));
     d.extend(flat("runtime.loader", LoaderOptions::default()));
+    d.extend(flat("runtime.offload", crate::offload::OffloadSettings::default()));
     d.insert("speculative.enabled".into(), json!(true));
     d.insert("runtime.pdl".into(), json!(false));
     d

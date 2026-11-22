@@ -291,6 +291,7 @@ pub struct Stats {
     pub step_secs: Histogram,
     pub chain: Option<ChainMetrics>,
     pub sessions: Option<crate::sessions::Stats>,
+    pub offload: Option<crate::offload::OffloadStats>,
 }
 
 impl Default for Stats {
@@ -324,6 +325,7 @@ impl Default for Stats {
             step_secs: Histogram::new(&LATENCY_BUCKETS),
             chain: None,
             sessions: None,
+            offload: None,
         }
     }
 }
@@ -1026,6 +1028,7 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         s.swap_secs = sched.swap_secs();
         s.reprefilled_tokens = sched.recomputed_tokens();
         s.chain = sched.chain_metrics();
+        s.offload = sched.offload_stats();
         let p = sched.prefix_stats();
         s.prefix_queries = p.queries;
         s.prefix_hits = p.hits;

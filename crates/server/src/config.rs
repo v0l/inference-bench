@@ -593,6 +593,16 @@ python = "python3"
     }
 
     #[test]
+    fn the_offload_table_reaches_the_serving_options() {
+        use inference_bench_core::specrt_serve::RuntimeOptions;
+        let c = ServerConfig::parse("max_num_seqs = 4\n[runtime.offload]\nvram_budget = 12000000000\nhost_budget = 64000000000\nnvme_path = \"/tmp/w\"\nprefetch_depth = 2\npolicy = \"frequency\"\n[[models]]\nid='m'").unwrap();
+        let r: RuntimeOptions = c.serve_options(&c.models[0]).unwrap().runtime.unwrap();
+        assert_eq!((r.offload.vram_budget, r.offload.host_budget, r.offload.prefetch_depth), (12_000_000_000, 64_000_000_000, 2));
+        assert_eq!(r.offload.nvme_path.as_deref(), Some("/tmp/w"));
+        assert!(r.offload.enabled());
+    }
+
+    #[test]
     fn the_runtime_table_reaches_the_serving_options_with_defaults_for_missing_keys() {
         use inference_bench_core::specrt_serve::{RuntimeOptions, TileChoice};
         let c = ServerConfig::parse("max_num_seqs = 4\n[runtime]\ngraphs = false\npdl = true\ntile = \"narrow\"\ncache_dir = \"/tmp/ptx\"\n[[models]]\nid='m'").unwrap();
