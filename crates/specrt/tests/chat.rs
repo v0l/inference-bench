@@ -122,8 +122,8 @@ fn the_tool_format_comes_from_the_template_text() {
     assert_eq!(format("{% if tools %}<tool_call>{\"name\": \"x\"}</tool_call>{% endif %}"), ToolFormat::Hermes);
     assert_eq!(format("{% if tools %}<tool_call>\n<function=x>\n<parameter=a>{% endif %}"), ToolFormat::XmlFunction);
     assert_eq!(format("{% if tools %}[AVAILABLE_TOOLS]{% endif %}"), ToolFormat::Unparsed);
-    assert_eq!(format("{% if tools %}<tool_call>f\n<arg_key>a</arg_key>\n<arg_value>1</arg_value>{% endif %}"), ToolFormat::GlmXml);
-    assert_eq!(ToolFormat::GlmXml.parser(), Some("glm_xml"));
+    assert_eq!(format("{% if tools %}<tool_call>f\n<arg_key>a</arg_key>\n<arg_value>1</arg_value>{% endif %}"), ToolFormat::KeyValueXml);
+    assert_eq!(ToolFormat::KeyValueXml.parser(), Some("xml_kv"));
     assert_eq!(ToolFormat::Hermes.parser(), Some("hermes"));
     assert_eq!(ToolFormat::Unparsed.parser(), None);
 }

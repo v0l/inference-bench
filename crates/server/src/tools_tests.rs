@@ -511,9 +511,9 @@ fn functools_list_parse() {
 }
 
 #[test]
-fn glm_calls_parse_key_value_pairs_with_schema_types() {
+fn key_value_calls_parse_key_value_pairs_with_schema_types() {
     let text = "Checking.<tool_call>get_current_weather\n<arg_key>city</arg_key>\n<arg_value>Dallas</arg_value>\n<arg_key>state</arg_key>\n<arg_value>TX</arg_value>\n</tool_call>";
-    let mut p = OutputParser::new(&weather_tools(), true, false).for_parser(Some("glm_xml"));
+    let mut p = OutputParser::new(&weather_tools(), true, false).for_parser(Some("xml_kv"));
     let mut deltas = p.feed(&text[..20]);
     deltas.extend(p.feed(&text[20..]));
     deltas.extend(p.finish());
