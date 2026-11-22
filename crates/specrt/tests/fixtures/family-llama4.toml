@@ -20,6 +20,11 @@ dense_intermediate_key = "intermediate_size_mlp"
 
 [rope]
 nope_flags = "no_rope_layers"
+interleaved = true
+
+[attention]
+qk_norm = { config = "use_qk_norm", default = false }
+qk_norm_unit = true
 
 [moe]
 shared_gate = false

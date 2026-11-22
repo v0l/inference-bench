@@ -1,9 +1,11 @@
 // target Cuda cc=12.0 sms=188 warp=32 threads=1024 smem=101376 graphs=true pdl=true features=[WarpShuffle,CpAsync,Mma16816,Tma,ShaderF16,Fp8Mma,BlockScaledFp4]
 // attention RopeKvWrite threads=256 smem=0
-//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, freq_factors: [], mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }) }, kv_layers: 16, kv_planes: 1, kv_fp8: false, kv_f16_layers: 0, query_scale: 0.0625, softcap: 30.0, local_theta: 10000.0, local_rope: [false, true, false, false], bidirectional: false, nope: [false, false, true, false] }
+//   AttentionShape { heads: 24, kv_heads: 4, head_dim: 256, qkv_row: 14336, output_gate: true, qk_norm: true, qk_norm_unit: false, eps: 1e-6, rope: RopeShape { rotary_dim: 64, theta: 10000000.0, kind: 0, factor: 1.0, low: 1.0, high: 1.0, original: 1.0, mscale: 1.0, freq_factors: [], mrope: Some(MropeShape { section: [11, 11, 10], interleaved: true }), interleaved: false }, kv_layers: 16, kv_planes: 1, kv_fp8: false, kv_f16_layers: 0, query_scale: 0.0625, softcap: 30.0, local_theta: 10000.0, local_rope: [false, true, false, false], bidirectional: false, nope: [false, false, true, false] }
 constexpr int ROT = 64;
 constexpr int ROT_HALF = ROT / 2;
 constexpr bool QK_NORM = true;
+constexpr bool QK_NORM_UNIT = false;
+constexpr bool ROPE_PAIRS = false;
 constexpr bool LOCAL_ROPE[] = { false, true, false, false };
 constexpr bool NOPE[] = { false, false, true, false };
 constexpr float LOCAL_THETA = 1e4f;
@@ -190,19 +192,20 @@ __device__ __forceinline__ void norm_rope_head(float* qkv, const float* q_norm, 
     bool is_k = !is_q && head < HEADS + KV_HEADS;
     float* src = qkv + (size_t)row * QKV_ROW + head * HEAD_DIM;
     float v = d < HEAD_DIM ? src[d] : 0.0f;
-    if (QK_NORM && (is_q || is_k)) {
+    if (QK_NORM && (is_q || is_k) && !(QK_NORM_UNIT && NOPE[layer])) {
         float inv = rsqrtf(block_reduce<false>(v * v, scratch) / HEAD_DIM + EPS);
         const float* w = is_q ? q_norm : k_norm;
-        if (d < HEAD_DIM) v = w[d] * (v * inv);
+        if (d < HEAD_DIM) v = QK_NORM_UNIT ? v * inv : w[d] * (v * inv);
     }
     if (d < HEAD_DIM) vec[d] = v;
     __syncthreads();
     if (!NOPE[layer] && (is_q || is_k) && d < ROT) {
-        int fi = d < ROT_HALF ? d : d - ROT_HALF;
+        int fi = ROPE_PAIRS ? d >> 1 : (d < ROT_HALF ? d : d - ROT_HALF);
         float angle = rope_position(mm_meta, mm_table, mm_stride, slot, pos, fi) * rope_inv_freq(fi, layer);
         float c = cosf(angle) * ROPE_MSCALE;
         float s = sinf(angle) * ROPE_MSCALE;
-        v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
+        if (ROPE_PAIRS) v = (d & 1) == 0 ? vec[d] * c - vec[d + 1] * s : vec[d] * c + vec[d - 1] * s;
+        else v = d < ROT_HALF ? vec[d] * c - vec[d + ROT_HALF] * s : vec[d] * c + vec[d - ROT_HALF] * s;
     }
     float row_scale = 1.0f;
     if (kv_q(layer) && !is_q) {

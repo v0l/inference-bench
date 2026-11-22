@@ -98,6 +98,7 @@ pub struct FamilyAttention {
     pub qk_norm: Flag,
     pub output_gate: Flag,
     pub qk_norm_full: bool,
+    pub qk_norm_unit: bool,
     pub fused_qkv: bool,
     pub o_tensor: Option<String>,
 }
@@ -116,6 +117,7 @@ impl Default for FamilyAttention {
             qk_norm: Flag::Fixed(false),
             output_gate: Flag::Config { config: "attn_output_gate".into(), default: false },
             qk_norm_full: false,
+            qk_norm_unit: false,
             fused_qkv: false,
             o_tensor: None,
         }
@@ -308,6 +310,7 @@ pub struct FamilyRope {
     pub nope_key: Option<String>,
     pub nope_value: Option<String>,
     pub nope_all: bool,
+    pub interleaved: bool,
 }
 
 impl FamilyRope {

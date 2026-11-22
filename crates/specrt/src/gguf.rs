@@ -510,6 +510,7 @@ impl Gguf {
                 softcap: None,
                 query_scalar: None,
                 qk_norm_full: false,
+                qk_norm_unit: false,
                 fused_qkv: false,
                 node: Vec::new(),
                 params: Default::default(),

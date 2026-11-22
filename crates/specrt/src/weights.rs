@@ -925,7 +925,7 @@ impl Checkpoint {
             None
         };
         let (q_len, k_len) = if a.qk_norm_full { (q, kv) } else { (a.head_dim, a.head_dim) };
-        let (q_norm, k_norm) = if a.qk_norm {
+        let (q_norm, k_norm) = if a.qk_norm && !a.qk_norm_unit {
             (
                 Some(self.norm(spec, &format!("{attn}.q_norm.weight"), q_len)?),
                 Some(self.norm(spec, &format!("{attn}.k_norm.weight"), k_len)?),

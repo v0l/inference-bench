@@ -419,6 +419,7 @@ pub enum AttentionKind {
 #[serde(rename_all = "lowercase")]
 pub enum RopeStyle {
     Neox,
+    Pairs,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -725,6 +726,8 @@ pub struct Attention {
     #[serde(default, skip_serializing_if = "is_false")]
     pub o_bias: bool,
     pub qk_norm: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub qk_norm_unit: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub output_gate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1698,6 +1701,7 @@ impl Spec {
                 qkv_bias,
                 o_bias,
                 qk_norm,
+                qk_norm_unit: qk_norm && family.attention.qk_norm_unit,
                 output_gate,
                 rotary_dim,
                 softcap: hf.attn_logit_softcapping,
@@ -1712,7 +1716,7 @@ impl Spec {
                 int_scratch: family.attention.int_scratch.clone(),
                 o_tensor: family.attention.o_tensor.clone(),
             },
-            rope: Rope { style: RopeStyle::Neox, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value, hf.num_hidden_layers) },
+            rope: Rope { style: if family.rope.interleaved { RopeStyle::Pairs } else { RopeStyle::Neox }, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value, hf.num_hidden_layers) },
             mlp: Mlp {
                 activation,
                 quant: mlp_quant.map(|m| m.0),
