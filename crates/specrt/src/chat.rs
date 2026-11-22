@@ -19,6 +19,7 @@ pub enum ToolFormat {
     ToolCallList,
     BareJson,
     FunctionsList,
+    Harmony,
     Unparsed,
 }
 
@@ -30,6 +31,7 @@ impl ToolFormat {
             ToolFormat::ToolCallList => Some("tool_call_list"),
             ToolFormat::BareJson => Some("bare_json"),
             ToolFormat::FunctionsList => Some("functools_list"),
+            ToolFormat::Harmony => Some("harmony"),
             ToolFormat::None | ToolFormat::Unparsed => None,
         }
     }
@@ -77,6 +79,10 @@ impl ChatTemplate {
             bos_token: token_text(&config["bos_token"]),
             eos_token: token_text(&config["eos_token"]),
         }))
+    }
+
+    pub fn skips_special_tokens(&self) -> bool {
+        self.tool_format() != ToolFormat::Harmony
     }
 
     pub fn source(&self) -> &str {
@@ -135,7 +141,9 @@ impl ChatTemplate {
 
     pub fn tool_format(&self) -> ToolFormat {
         let s = &self.source;
-        if s.contains("<function=") && s.contains("<parameter=") {
+        if s.contains("<|channel|>") && s.contains("<|start|>") {
+            ToolFormat::Harmony
+        } else if s.contains("<function=") && s.contains("<parameter=") {
             ToolFormat::XmlFunction
         } else if s.contains("<tool_call>") {
             ToolFormat::Hermes
@@ -170,6 +178,7 @@ impl ChatTemplate {
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.add_function("strftime_now", |format: String| -> String { strftime_now(&format) });
         env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
             Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
         });
@@ -190,6 +199,28 @@ impl ChatTemplate {
     }
 }
 
+fn strftime_now(format: &str) -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    let days = secs.div_euclid(86400);
+    let rem = secs.rem_euclid(86400);
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format
+        .replace("%Y", &format!("{year:04}"))
+        .replace("%m", &format!("{month:02}"))
+        .replace("%d", &format!("{day:02}"))
+        .replace("%H", &format!("{:02}", rem / 3600))
+        .replace("%M", &format!("{:02}", rem % 3600 / 60))
+        .replace("%S", &format!("{:02}", rem % 60))
+}
+
 fn text_parts(content: &Value) -> Option<Vec<String>> {
     let parts = content.as_array()?;
     parts.iter().all(|p| p["type"] == "text").then(|| parts.iter().map(|p| p["text"].as_str().unwrap_or("").to_string()).collect())
@@ -208,6 +239,7 @@ fn prepare(messages: &[Value], vars: &Value, iterates_content: bool) -> (Vec<Val
             }
             if role == "assistant" && m.get("reasoning").is_some_and(|r| !r.is_null()) {
                 m["reasoning_content"] = m["reasoning"].clone();
+                m["thinking"] = m["reasoning"].clone();
             } else if let Some(o) = m.as_object_mut() {
                 o.remove("reasoning_content");
             }

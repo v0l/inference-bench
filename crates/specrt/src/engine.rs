@@ -536,10 +536,11 @@ impl Engine {
         let mut so_far: Vec<u32> = Vec::new();
         let mut sent = String::new();
         let tokenizer = &self.tokenizer;
+        let skip = self.chat.as_ref().is_none_or(|c| c.skips_special_tokens());
         let stop: &[u32] = if streaming { &self.stop } else { &[] };
         let g = self.runtime.generate_with(&ids, max_tokens, sampling, stop, streaming, &mut |fresh| {
             so_far.extend_from_slice(fresh);
-            match tokenizer.decode(&so_far, true) {
+            match tokenizer.decode(&so_far, skip) {
                 Ok(text)
                     if text.len() > sent.len()
                         && text.starts_with(&sent)
@@ -553,7 +554,7 @@ impl Engine {
             }
         })?;
         let text =
-            self.tokenizer.decode(&g.tokens, true).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
+            self.tokenizer.decode(&g.tokens, skip).map_err(|e| anyhow::anyhow!("decode: {e}"))?;
         if text.len() > sent.len() && text.starts_with(&sent) {
             on_text(&text[sent.len()..]);
         }

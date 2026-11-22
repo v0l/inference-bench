@@ -517,3 +517,52 @@ fn raw_parsers_are_chosen_by_name() {
     p.finish();
     assert_eq!(calls(&p.result()), [("calculate_area", "{}")]);
 }
+
+fn harmony_parse(tools: &[Value], text: &str, chunk: usize) -> (Vec<Delta>, Parsed) {
+    let mut p = OutputParser::new(tools, true, false).harmony();
+    let mut deltas = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    for c in chars.chunks(chunk) {
+        deltas.extend(p.feed(&c.iter().collect::<String>()));
+    }
+    deltas.extend(p.finish());
+    (deltas, p.result())
+}
+
+const HARMONY_FINAL: &str = "<|channel|>analysis<|message|>User wants hi.<|end|><|start|>assistant<|channel|>final<|message|>Hello there<|return|>";
+const HARMONY_CALL: &str = "<|channel|>analysis<|message|>Need weather.<|end|><|start|>assistant<|channel|>commentary to=functions.get_current_weather <|constrain|>json<|message|>{\"city\":\"Dallas\",\"state\":\"TX\"}<|call|>";
+
+#[test]
+fn harmony_channels_split_into_reasoning_and_content() {
+    for chunk in [1, 3, 1000] {
+        let (_, p) = harmony_parse(&[], HARMONY_FINAL, chunk);
+        assert_eq!(p.reasoning.as_deref(), Some("User wants hi."), "chunk {chunk}");
+        assert_eq!(p.content.as_deref(), Some("Hello there"), "chunk {chunk}");
+        assert!(p.tool_calls.is_empty());
+    }
+}
+
+#[test]
+fn harmony_commentary_recipient_is_a_tool_call() {
+    for chunk in [1, 5, 1000] {
+        let (deltas, p) = harmony_parse(&weather_tools(), HARMONY_CALL, chunk);
+        assert_eq!(calls(&p), [("get_current_weather", r#"{"city":"Dallas","state":"TX"}"#)], "chunk {chunk}");
+        assert_eq!(p.reasoning.as_deref(), Some("Need weather."));
+        assert_eq!(p.content, None);
+        assert!(deltas.iter().any(|d| matches!(d, Delta::Call { name, .. } if name == "get_current_weather")));
+    }
+}
+
+#[test]
+fn harmony_commentary_preamble_stays_content() {
+    let text = "<|channel|>commentary<|message|>Checking.<|end|><|start|>assistant<|channel|>commentary to=functions.calculate_area<|message|>{}<|call|>";
+    let (_, p) = harmony_parse(&weather_tools(), text, 4);
+    assert_eq!(p.content.as_deref(), Some("Checking."));
+    assert_eq!(calls(&p), [("calculate_area", "{}")]);
+}
+
+#[test]
+fn harmony_unterminated_final_message_is_kept() {
+    let (_, p) = harmony_parse(&[], "<|channel|>final<|message|>partial", 2);
+    assert_eq!(p.content.as_deref(), Some("partial"));
+}

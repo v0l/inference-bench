@@ -2,6 +2,8 @@ use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+mod harmony;
+
 static REPAIRS: Mutex<BTreeMap<&'static str, u64>> = Mutex::new(BTreeMap::new());
 
 pub fn note_repair(kind: &'static str) {
@@ -84,6 +86,7 @@ pub struct OutputParser {
     tool_parsing: bool,
     json_calls: bool,
     raw: Option<(RawFormat, RawPhase)>,
+    harmony: Option<harmony::Harmony>,
     state: State,
     buffer: String,
     slots: Vec<Slot>,
@@ -138,6 +141,7 @@ impl OutputParser {
             tool_parsing,
             json_calls: false,
             raw: None,
+            harmony: None,
             state: if reasoning { State::Reasoning } else { State::Content },
             buffer: String::new(),
             slots: Vec::new(),
@@ -162,6 +166,7 @@ impl OutputParser {
     pub fn for_parser(self, name: Option<&str>) -> Self {
         match name {
             Some("hermes") => self.hermes(),
+            Some("harmony") => self.harmony(),
             Some(n) => match RawFormat::from_parser(n) {
                 Some(f) if self.tool_parsing => self.raw_json(f),
                 _ => self,
@@ -173,6 +178,10 @@ impl OutputParser {
     pub fn feed(&mut self, text: &str) -> Vec<Delta> {
         self.buffer.push_str(text);
         let mut out = Vec::new();
+        if self.harmony.is_some() {
+            self.harmony_feed(false, &mut out);
+            return out;
+        }
         if self.raw.is_some() {
             self.raw_feed(&mut out);
             return out;
@@ -229,6 +238,10 @@ impl OutputParser {
 
     pub fn finish(&mut self) -> Vec<Delta> {
         let mut out = Vec::new();
+        if self.harmony.is_some() {
+            self.harmony_finish(&mut out);
+            return out;
+        }
         if self.raw.is_some() {
             self.raw_finish(&mut out);
         }
@@ -877,5 +890,5 @@ fn py_json(text: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-#[path = "tools_tests.rs"]
+#[path = "../tools_tests.rs"]
 mod tests;
