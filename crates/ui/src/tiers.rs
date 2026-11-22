@@ -32,13 +32,17 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     if plans.is_empty() {
         return;
     }
-    section(ui, "where the weights live", "per loaded model, from the offload plan", |ui| {
-        for (name, plan) in &plans {
-            Line::new().legend("model").column(ui, 120.0).value(name.clone()).show(ui);
-            for (label, value) in tier_cells(plan) {
-                Line::new().legend(label).column(ui, 120.0).value(value).show(ui);
+    let visible = ui.ctx().content_rect().right() - ui.max_rect().left() - 12.0;
+    ui.scope(|ui| {
+        ui.set_max_width(ui.available_width().min(visible).max(120.0));
+        section(ui, "where the weights live", "per loaded model, from the offload plan", |ui| {
+            for (name, plan) in &plans {
+                Line::new().legend("model").column(ui, 120.0).value(name.clone()).wrapped(ui);
+                for (label, value) in tier_cells(plan) {
+                    Line::new().legend(label).column(ui, 120.0).value(value).wrapped(ui);
+                }
+                Line::new().legend("layers").column(ui, 120.0).value(layer_text(plan)).wrapped(ui);
             }
-            Line::new().legend("layers").column(ui, 120.0).value(layer_text(plan)).wrapped(ui);
-        }
+        });
     });
 }

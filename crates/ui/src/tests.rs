@@ -806,7 +806,7 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
 fn offloaded_script() -> Script {
     use specrt::offload::{LayerResidency, OffloadPlan, OffloadStats, Tier};
     let layers = (0..4).map(|i| LayerResidency { layer: i, bytes: 2 << 30, tier: if i < 2 { Tier::Vram } else if i == 2 { Tier::Host } else { Tier::Nvme }, pinned: i < 2 }).collect();
-    let plan = OffloadPlan { layers, staging_bytes: 1 << 30, vram_bytes: 5 << 30, host_bytes: 2 << 30, nvme_bytes: 2 << 30 };
+    let plan = OffloadPlan { layers, staging_bytes: 1 << 30, vram_bytes: 5 << 30, host_bytes: 2 << 30, nvme_bytes: 2 << 30, host_staging_bytes: 0 };
     let stats = OffloadStats { vram_hits: 3, host_hits: 1, nvme_reads: 0, host_to_vram_bytes: 10, ..Default::default() };
     Script { offload: Some((plan, stats)), ..script() }
 }
@@ -817,19 +817,26 @@ fn where_the_weights_live_and_the_hit_rate_show_for_an_offloaded_model_at_deskto
         let mut h = harness_at(name, Tab::Server, size);
         with_gpu(&mut h, 0, 96 << 30);
         h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
-        let m = real_model("Qwen3-0.6B");
+        let m = real_model(&h.state().library[0].name.clone());
         h.state_mut().library[0] = m.clone();
         h.state_mut().load_model_with(&m, 2048, 2);
         pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
         pump_until(&mut h, 10, "serving reading", |a| a.engine.reading().serving.is_some());
         h.run();
-        assert!(h.state().engine.handle().serving_stats_of("Qwen3-0.6B").and_then(|s| s.offload_plan).is_some());
+        assert!(h.state().engine.handle().serving_stats_of(&m.name).and_then(|s| s.offload_plan).is_some());
         h.get_by_label_contains("2 of 4 layers stream in");
+        let screen = h.ctx.content_rect();
+        for text in ["2 of 4 layers stream in", m.name.as_str()] {
+            for n in h.get_all_by_label_contains(text) {
+                let r = n.rect();
+                assert!(r.right() <= screen.right() + 0.5, "{text} at {size:?} ends at {} past {}", r.right(), screen.right());
+            }
+        }
         let r = h.state().engine.reading();
         let shown = crate::serving::offload_readings(&r, 2.5e9);
         assert_eq!(shown[0].1, "75%");
         assert_eq!(shown[1].1, "2.50 GB/s");
-        let plan = h.state().engine.handle().serving_stats_of("Qwen3-0.6B").unwrap().offload_plan.unwrap();
+        let plan = h.state().engine.handle().serving_stats_of(&m.name).unwrap().offload_plan.unwrap();
         let cells = crate::tiers::tier_cells(&plan);
         assert_eq!(cells.iter().map(|c| c.0).collect::<Vec<_>>(), ["vram", "host ram", "nvme"]);
     }
@@ -844,7 +851,7 @@ fn screenshots_of_the_weight_tiers_and_hit_rate_at_desktop_and_phone_width() {
         let mut h = harness_at(name, Tab::Server, size);
         with_gpu(&mut h, 0, 96 << 30);
         h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
-        let m = real_model("Qwen3-0.6B");
+        let m = real_model(&h.state().library[0].name.clone());
         h.state_mut().library[0] = m.clone();
         h.state_mut().load_model_with(&m, 2048, 2);
         pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
