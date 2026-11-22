@@ -423,8 +423,8 @@ fn reset_tail(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
 }
 
 fn slider_width(ui: &mut egui::Ui) {
-    let room = ui.available_width() - 150.0;
-    ui.spacing_mut().slider_width = room.clamp(90.0, 320.0);
+    let room = ui.available_width() - 190.0;
+    ui.spacing_mut().slider_width = room.clamp(60.0, 320.0);
 }
 
 fn context_row(ui: &mut egui::Ui, d: &mut LoadDialog, env: &Env) {
@@ -557,8 +557,10 @@ fn offload_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
 
 fn generic_row(ui: &mut egui::Ui, d: &mut LoadDialog, f: &Field) {
     row_help(ui, f.label, f.help, |ui| {
-        edit_field(ui, f, &mut d.choice, &mut d.texts);
-        reset_tail(ui, d, f);
+        ui.horizontal_wrapped(|ui| {
+            edit_field(ui, f, &mut d.choice, &mut d.texts);
+            reset_tail(ui, d, f);
+        });
     });
 }
 

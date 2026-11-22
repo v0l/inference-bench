@@ -2016,7 +2016,7 @@ fn the_load_page_fits_phone_width_with_every_section_open() {
         let screen = h.ctx.content_rect();
         for n in h.query_all_by(|_| true).filter(|n| n.accesskit_node().bounding_box().is_some()) {
             let r = n.rect();
-            assert!(r.right() <= screen.right() + 0.5 && r.left() >= screen.left() - 0.5, "{:?} at {r:?} past {screen:?}", n.accesskit_node().label());
+            assert!(r.right() <= screen.right() + 0.5 && r.left() >= screen.left() - 0.5, "{:?} {:?} at {r:?} past {screen:?}", n.accesskit_node().role(), n.accesskit_node().label());
         }
         let b = h.get_all_by_label("load model").last().unwrap().accesskit_node().bounding_box().unwrap();
         assert!(b.y1 <= hgt as f64 && b.x1 <= w as f64, "{b:?}");
