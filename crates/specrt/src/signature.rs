@@ -85,7 +85,7 @@ impl Count {
         }
     }
 
-    fn rows(&self, r: Rows) -> usize {
+    pub(crate) fn rows(&self, r: Rows) -> usize {
         match r {
             Rows::Tokens => self.tokens,
             Rows::Out => self.out,
@@ -121,7 +121,7 @@ impl Form {
 }
 
 impl Tensor {
-    fn new(place: Place, rows: Rows, cols: usize, form: Form) -> Tensor {
+    pub(crate) fn new(place: Place, rows: Rows, cols: usize, form: Form) -> Tensor {
         Tensor { place, rows, cols, form, layout: form.layout() }
     }
 
@@ -203,7 +203,7 @@ impl<'a> Signer<'a> {
         Tensor::weight(which.tensor(), 1, self.hidden(), Form::F32)
     }
 
-    fn caches(&self, layer: usize, rows: Rows) -> Vec<Tensor> {
+    pub(crate) fn caches(&self, layer: usize, rows: Rows) -> Vec<Tensor> {
         let at = self.spec.attention_before(layer);
         crate::state::positional(self.spec)
             .filter(|s| s.layers == crate::state::Layers::Attention)
@@ -211,7 +211,7 @@ impl<'a> Signer<'a> {
             .collect()
     }
 
-    fn qk_weights(&self) -> Vec<Tensor> {
+    pub(crate) fn qk_weights(&self) -> Vec<Tensor> {
         let a = &self.spec.attention;
         if a.qk_norm && !a.qk_norm_unit && !a.qk_norm_full {
             vec![Tensor::weight("self_attn.q_norm.weight", 1, a.head_dim, Form::F32), Tensor::weight("self_attn.k_norm.weight", 1, a.head_dim, Form::F32)]
@@ -220,7 +220,7 @@ impl<'a> Signer<'a> {
         }
     }
 
-    fn qkv(&self) -> Tensor {
+    pub(crate) fn qkv(&self) -> Tensor {
         Tensor::buf(Buf::Qkv, Rows::Tokens, self.spec.qkv_rows())
     }
 
@@ -483,7 +483,7 @@ pub fn sections<'p>(spec: &Spec, plan: &'p Plan) -> Vec<Section<'p>> {
     out
 }
 
-fn ranked(plan: &Plan) -> bool {
+pub(crate) fn ranked(plan: &Plan) -> bool {
     let all = plan.head.iter().chain(plan.blocks.iter().flat_map(|b| &b.ops)).chain(&plan.tail).chain(&plan.mtp).chain(&plan.mtp_head);
     all.into_iter().any(|o| matches!(o, Op::AllReduce | Op::AllReduceNorm { .. }))
 }
@@ -492,7 +492,7 @@ fn rows_fit(read: Rows, written: Rows) -> bool {
     read == written || (read == Rows::Out && written == Rows::Tokens)
 }
 
-fn key(place: &Place) -> Place {
+pub(crate) fn key(place: &Place) -> Place {
     match place {
         Place::Buf(Buf::XnPlanes) => Place::Buf(Buf::Xn),
         Place::Buf(Buf::AttnPlanes) => Place::Buf(Buf::Attn),
@@ -595,7 +595,7 @@ fn linear_launches(spec: &Spec, weight: Weight, quant: crate::plan::QuantSource,
 }
 
 impl Signer<'_> {
-    fn launches(&self, op: &Op, phase: Phase, layer: usize, count: &Count, target: &kir::Target) -> usize {
+    pub(crate) fn launches(&self, op: &Op, phase: Phase, layer: usize, count: &Count, target: &kir::Target) -> usize {
         let spec = self.spec;
         let tokens = if matches!(op, Op::Linear { weight: Weight::LmHead, .. }) { count.out } else { count.tokens };
         let listed = op.kernels(spec, layer, tokens, target).len();
