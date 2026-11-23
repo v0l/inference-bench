@@ -1,6 +1,7 @@
 use crate::compose::{Mat, Stage, Tile as StageTile};
 use crate::expr::Expr;
-use crate::gemm::{Epilogue, Fp8Scale, GemmError, GemmShape, Kind, KernelInstance, Mainloop, Tile, Tuning, WeightFormat, ggml_gemv_rows};
+use crate::gemm::{Epilogue, Fp4Gemv, Fp8Scale, GemmError, GemmShape, Kind, KernelInstance, Mainloop, Tile, Tuning, WeightFormat, ggml_gemv_rows};
+use crate::gemv::{Gemv, GemvKernel};
 use crate::layout::Layout;
 use crate::{Activation, Target};
 use std::fmt;
@@ -9,6 +10,9 @@ pub const ACC: &str = "acc";
 pub const OUT: &str = "out";
 pub const PLANES: &str = "planes";
 pub const BIAS: &str = "bias";
+pub const X: &str = "x";
+pub const NORM: &str = "nw";
+pub const STAGED: &str = "xs";
 pub const BASE_REGS: u32 = 16;
 
 pub fn acc_regs(elems: usize, threads: u32) -> u32 {
@@ -24,6 +28,8 @@ pub enum Family {
     GgmlBatch { tokens: usize, split: bool },
     GgmlGemv { split: bool },
     BatchReduce { wf: WeightFormat },
+    Gemv { wf: WeightFormat },
+    Fp4Gemv,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -121,15 +127,53 @@ pub fn epilogue(epi: Epilogue, bias: bool, n: usize) -> Result<Vec<Stage>, Strin
     Ok(out)
 }
 
-pub fn spelled(stages: &[Stage], n: usize) -> Result<(Epilogue, bool), String> {
+pub fn epilogue_into(epi: Epilogue, bias: bool, n: usize, dst: &str) -> Result<Vec<Stage>, String> {
+    let mut out = epilogue(epi, bias, n)?;
+    if let Some(Stage::TileStore { dst: d, .. }) = out.last_mut() {
+        *d = dst.to_string();
+    }
+    Ok(out)
+}
+
+fn spelled_into(stages: &[Stage], n: usize, dst: Option<&str>) -> Result<(Epilogue, bool), String> {
     for epi in EPILOGUES {
         for bias in [false, true] {
-            if epilogue(epi, bias, n).is_ok_and(|s| s == stages) {
+            let spelt = match dst {
+                Some(d) => epilogue_into(epi, bias, n, d),
+                None => epilogue(epi, bias, n),
+            };
+            if spelt.is_ok_and(|s| s == stages) {
                 return Ok((epi, bias));
             }
         }
     }
     Err(format!("no emitter spells the epilogue {stages:?}"))
+}
+
+pub fn spelled(stages: &[Stage], n: usize) -> Result<(Epilogue, bool), String> {
+    spelled_into(stages, n, None)
+}
+
+pub fn norm_prologue() -> Vec<Stage> {
+    vec![
+        load("v", X, None),
+        Stage::BlockSum { dst: "total".into(), expr: expr("v * v") },
+        compute("inv", "rsqrt(total / width + eps)"),
+        load("xv", X, None),
+        load("w", NORM, None),
+        compute("y", "w * (xv * inv)"),
+        store(STAGED, "y"),
+    ]
+}
+
+pub fn spelled_prologue(stages: &[Stage]) -> Result<bool, String> {
+    if stages.is_empty() {
+        return Ok(false);
+    }
+    if stages == norm_prologue() {
+        return Ok(true);
+    }
+    Err(format!("no emitter spells the prologue {stages:?}"))
 }
 
 fn defined(s: &Stage) -> Option<&str> {
@@ -165,7 +209,80 @@ impl Heavy {
         Heavy { name: name.to_string(), family, problem, tile, prologue: Vec::new(), epilogue: Vec::new() }
     }
 
+    fn slotted(mut self, normed: bool, epilogue: Result<Vec<Stage>, String>) -> Result<Heavy, String> {
+        if normed {
+            self.prologue = norm_prologue();
+        }
+        self.epilogue = epilogue.map_err(|e| format!("{}: {e}", self.name))?;
+        Ok(self)
+    }
+
+    fn lift_fp4(k: &KernelInstance) -> Result<Option<Heavy>, GemmError> {
+        let gemv = |n: usize, kk: usize| Heavy::new(&k.name, Family::Fp4Gemv, Problem { n, k: kk, act: crate::Activation::Silu }, None);
+        let h = match k.kind {
+            Kind::Gemv { op: Fp4Gemv::GateUpAct, n, k: kk } => gemv(n, kk).slotted(true, epilogue_into(Epilogue::Act, false, n, OUT)),
+            Kind::Gemv { op: Fp4Gemv::Down, n, k: kk } => gemv(n, kk).slotted(false, epilogue(Epilogue::Residual, false, n)),
+            Kind::HeadNormFp4 { n, k: kk, .. } => gemv(n, kk).slotted(true, epilogue(Epilogue::Store, false, n)),
+            _ => return Ok(None),
+        };
+        h.map(Some).map_err(GemmError::Invalid)
+    }
+
+    pub fn lift_gemv(k: &GemvKernel, hidden: usize, inter: usize) -> Result<Option<Heavy>, String> {
+        let family = |decoder: &str| WeightFormat::from_decoder(decoder).map(|wf| Family::Gemv { wf }).ok_or_else(|| format!("{}: unknown decoder {decoder}", k.name));
+        let gemv = |decoder: &str, n: usize, kk: usize| -> Result<Heavy, String> { Ok(Heavy::new(&k.name, family(decoder)?, Problem { n, k: kk, act: crate::Activation::Silu }, None)) };
+        let h = match &k.op {
+            Gemv::Linear { decoder, n, k: kk, bias, residual } => {
+                let epi = if *residual { Epilogue::Residual } else { Epilogue::Store };
+                gemv(decoder, *n, *kk)?.slotted(false, epilogue(epi, *bias, *n))?
+            }
+            Gemv::Norm { decoder, n, bias } => gemv(decoder, *n, hidden)?.slotted(true, epilogue(Epilogue::Store, *bias, *n))?,
+            Gemv::GateUpAct { decoder } => gemv(decoder, 2 * inter, hidden)?.slotted(true, epilogue_into(Epilogue::Act, false, 2 * inter, OUT))?,
+            Gemv::Tiled { .. } | Gemv::Bf16Rows { .. } => return Ok(None),
+        };
+        Ok(Some(h))
+    }
+
+    fn unspelled(&self, what: &str) -> String {
+        format!("{}: no {what} emitter spells the prologue {:?} with the epilogue {:?}", self.name, self.prologue, self.epilogue)
+    }
+
+    pub fn lower_gemv(&self, t: &Target) -> Result<GemvKernel, String> {
+        let Family::Gemv { wf } = self.family else { return Err(format!("{}: family {:?} does not lower to a gemv", self.name, self.family)) };
+        let normed = spelled_prologue(&self.prologue).map_err(|e| format!("{}: {e}", self.name))?;
+        let (epi, bias) = spelled_into(&self.epilogue, self.problem.n, Some(OUT)).map_err(|_| self.unspelled("gemv"))?;
+        let decoder = wf.decoder().to_string();
+        let (n, k) = (self.problem.n, self.problem.k);
+        let op = match (normed, epi) {
+            (false, Epilogue::Store | Epilogue::Residual) => Gemv::Linear { decoder, n, k, bias, residual: epi == Epilogue::Residual },
+            (true, Epilogue::Store) => Gemv::Norm { decoder, n, bias },
+            (true, Epilogue::Act) => Gemv::GateUpAct { decoder },
+            _ => return Err(self.unspelled("gemv")),
+        };
+        GemvKernel::new(t, &self.name, op)
+    }
+
+    pub fn compile_gemv(&self, t: &Target, pass: &str) -> Result<GemvKernel, HeavyError> {
+        self.budget(t, pass)?;
+        self.lower_gemv(t).map_err(|reason| HeavyError::Lower { pass: pass.into(), kernel: self.name.clone(), reason })
+    }
+
+    fn lower_fp4(&self, t: &Target) -> Result<KernelInstance, GemmError> {
+        let normed = spelled_prologue(&self.prologue).map_err(|e| GemmError::Invalid(format!("{}: {e}", self.name)))?;
+        let spelt = spelled_into(&self.epilogue, self.problem.n, Some(OUT)).map_err(|_| GemmError::Invalid(self.unspelled("fp4 gemv")))?;
+        let (n, k) = (self.problem.n, self.problem.k);
+        match (normed, spelt) {
+            (true, (Epilogue::Act, false)) => KernelInstance::fp4_gemv(t, &self.name, Fp4Gemv::GateUpAct, n, k),
+            (false, (Epilogue::Residual, false)) => KernelInstance::fp4_gemv(t, &self.name, Fp4Gemv::Down, n, k),
+            (true, (Epilogue::Store, false)) => KernelInstance::fp4_head_norm(t, &self.name, n, k),
+            _ => Err(GemmError::Invalid(self.unspelled("fp4 gemv"))),
+        }
+    }
+
     pub fn lift(k: &KernelInstance) -> Result<Option<Heavy>, GemmError> {
+        if matches!(k.kind, Kind::Gemv { .. } | Kind::HeadNormFp4 { .. }) {
+            return Heavy::lift_fp4(k);
+        }
         let Some(shape) = shape_of(k) else { return Ok(None) };
         let (family, tile) = match k.kind {
             Kind::Tile { wf, main: Mainloop::Mma(m), token_major, .. } => (Family::Tile { wf, split: m.split, token_major }, Some(m.tile)),
@@ -194,10 +311,17 @@ impl Heavy {
             Family::GgmlBatch { tokens, split } => KernelInstance::ggml_batch(t, name, shape, tokens, split),
             Family::GgmlGemv { split } => KernelInstance::ggml_gemv(t, name, shape, split),
             Family::BatchReduce { wf } => KernelInstance::batch_reduce(t, name, shape, wf),
+            Family::Fp4Gemv => KernelInstance::fp4_gemv(t, name, Fp4Gemv::Down, shape.n, shape.k),
+            Family::Gemv { .. } => Err(GemmError::Invalid(format!("{name}: family {:?} lowers to a gemv kernel, not a gemm", self.family))),
         }
     }
 
     pub fn lower(&self, t: &Target) -> Result<KernelInstance, GemmError> {
+        match self.family {
+            Family::Fp4Gemv => return self.lower_fp4(t),
+            Family::Gemv { .. } => return Err(GemmError::Invalid(format!("{}: family {:?} lowers to a gemv kernel, not a gemm", self.name, self.family))),
+            _ => {}
+        }
         if !self.prologue.is_empty() {
             return Err(GemmError::Invalid(format!("{}: family {:?} has no prologue emitter", self.name, self.family)));
         }
@@ -214,14 +338,23 @@ impl Heavy {
         }
     }
 
+    fn mainloop(&self, t: &Target) -> Result<(u32, u32, usize, usize), String> {
+        if let Family::Gemv { wf } = self.family {
+            let g = GemvKernel::new(t, &self.name, Gemv::Linear { decoder: wf.decoder().into(), n: self.problem.n, k: self.problem.k, bias: false, residual: false })?;
+            return Ok((g.threads(), 0, 1, g.threads() as usize));
+        }
+        let bare = GemmShape::new(self.problem.n, self.problem.k, Epilogue::Store, false).with_act(self.problem.act);
+        let main = self.build(t, bare).map_err(|e| e.to_string())?;
+        let (rows, acc) = self.rows_and_acc(&main);
+        Ok((main.threads, main.smem_bytes, rows, acc))
+    }
+
     pub fn budget(&self, t: &Target, pass: &str) -> Result<Budget, HeavyError> {
         let lower = |reason: String| HeavyError::Lower { pass: pass.into(), kernel: self.name.clone(), reason };
-        let bare = GemmShape::new(self.problem.n, self.problem.k, Epilogue::Store, false).with_act(self.problem.act);
-        let main = self.build(t, bare).map_err(|e| lower(e.to_string()))?;
-        let (rows, acc) = self.rows_and_acc(&main);
+        let (threads, smem, rows, acc) = self.mainloop(t).map_err(lower)?;
         let held = self.prologue.iter().chain(&self.epilogue).filter_map(defined).count() as u32;
         let staged = if self.prologue.is_empty() { 0 } else { rows * self.problem.k * 4 };
-        let b = Budget { threads: main.threads, regs: acc_regs(acc, main.threads) + held, smem: main.smem_bytes + staged as u32 };
+        let b = Budget { threads, regs: acc_regs(acc, threads) + held, smem: smem + staged as u32 };
         let over = |what: &'static str, need: u64, limit: u64| HeavyError::Budget { pass: pass.into(), kernel: self.name.clone(), what, need, limit };
         if b.threads > t.max_threads {
             return Err(over("threads", b.threads as u64, t.max_threads as u64));
@@ -238,6 +371,13 @@ impl Heavy {
     pub fn compile(&self, t: &Target, pass: &str) -> Result<KernelInstance, HeavyError> {
         self.budget(t, pass)?;
         self.lower(t).map_err(|e| HeavyError::Lower { pass: pass.into(), kernel: self.name.clone(), reason: e.to_string() })
+    }
+
+    fn check(&self, t: &Target, pass: &str) -> Result<(), HeavyError> {
+        match self.family {
+            Family::Gemv { .. } => self.compile_gemv(t, pass).map(|_| ()),
+            _ => self.compile(t, pass).map(|_| ()),
+        }
     }
 
     pub fn attach(mut self, t: &Target, pass: &str, slot: Slot, stages: Vec<Stage>) -> Result<Heavy, HeavyError> {
@@ -263,7 +403,7 @@ impl Heavy {
                 self.epilogue.extend(renamed);
             }
         }
-        self.compile(t, pass)?;
+        self.check(t, pass)?;
         Ok(self)
     }
 }
