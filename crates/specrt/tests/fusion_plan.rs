@@ -157,11 +157,31 @@ fn shared_memory_and_registers_bound_a_prologue() {
     let small = with_costs(&spec, &plan, 1, &sm120(), &Costs { smem_limit: 2048, ..base });
     let layer = section(&small, "layer");
     assert!(!grouped(layer, &["input norm", "qkv"]), "{}", small.render());
-    assert!(matches!(kept_apart(layer, "input norm", "qkv"), Reason::Smem { need: 4096, limit: 2048 }), "{}", small.render());
+    let split = |r: &Reason| matches!(r, Reason::SlotFit(inner) if matches!(**inner, Reason::Smem { need: 4096, limit: 2048 }));
+    assert!(split(kept_apart(layer, "input norm", "qkv")), "{}", small.render());
+    assert!(small.render().contains("slot fit split"));
+    assert!(layer.fused.iter().all(|d| d.rule != specrt::fusion::Rule::Split));
+    assert_eq!(layer.groups.iter().filter(|g| g.units.iter().any(|u| u == "input norm")).count(), 1);
+    assert!(layer.groups.iter().all(|g| !(g.units.iter().any(|u| u == "input norm") && g.units.iter().any(|u| u == "qkv"))));
     let few = with_costs(&spec, &plan, 1, &sm120(), &Costs { max_regs: 19, ..base });
     let layer = section(&few, "layer");
-    assert!(matches!(kept_apart(layer, "input norm", "qkv"), Reason::Regs { limit: 19, .. }), "{}", few.render());
-    assert!(matches!(kept_apart(layer, "gate_up", "gate_up act"), Reason::Regs { limit: 19, .. }), "{}", few.render());
+    assert!(matches!(kept_apart(layer, "input norm", "qkv"), Reason::SlotFit(r) if matches!(**r, Reason::Regs { limit: 19, .. })), "{}", few.render());
+    assert!(matches!(kept_apart(layer, "gate_up", "gate_up act"), Reason::SlotFit(r) if matches!(**r, Reason::Regs { limit: 19, .. })), "{}", few.render());
+}
+
+#[test]
+fn an_over_budget_group_is_split_in_two_that_each_fit_and_a_fitting_one_is_untouched() {
+    let spec = dense();
+    let plan = Plan::build(&spec, Phase::Decode, true);
+    let base = Costs::for_target(&sm120());
+    let whole = with_costs(&spec, &plan, 1, &sm120(), &base);
+    let small = with_costs(&spec, &plan, 1, &sm120(), &Costs { smem_limit: 2048, ..base });
+    let (w, s) = (section(&whole, "layer"), section(&small, "layer"));
+    assert!(grouped(w, &["input norm", "qkv"]) && !grouped(s, &["input norm", "qkv"]));
+    assert!(grouped(s, &["input norm"]) && grouped(s, &["qkv"]));
+    assert_eq!(s.launches_after, w.launches_after + s.rejected.iter().filter(|d| d.rule == specrt::fusion::Rule::Split).count());
+    assert!(grouped(s, &["qk norm", "rope", "kv write"]) && grouped(s, &["o", "o residual"]));
+    assert!(whole.render().find("slot fit").is_none());
 }
 
 #[test]

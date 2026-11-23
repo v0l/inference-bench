@@ -150,10 +150,12 @@ pub enum Rule {
     Light,
     Pair,
     Fill,
+    Split,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reason {
+    SlotFit(Box<Reason>),
     Opaque,
     TwoHeavy,
     Barrier,
@@ -174,6 +176,7 @@ pub enum Reason {
 impl Reason {
     pub fn describe(&self) -> String {
         match self {
+            Reason::SlotFit(inner) => format!("slot fit split, the fused group {}", inner.describe()),
             Reason::Opaque => "a unit is several launches or has no kernel geometry".into(),
             Reason::TwoHeavy => "a group holds at most one op with its own block geometry".into(),
             Reason::Barrier => "the consumer waits on a device-wide barrier".into(),
@@ -658,12 +661,12 @@ impl Engine<'_> {
                 (rereads - hidden).max(0.0) as u64
             })
             .sum();
-        let verdict = self.prologue_legal(edges, a, &consumers, &produced);
+        let verdict = self.prologue_legal(edges, a, &consumers);
         let verdict = verdict.and_then(|()| if saving > penalty { Ok(()) } else { Err(Reason::Cost) });
         Some(Candidate { decision: self.decision(Rule::Prologue, g1, &cs, saving, penalty, verdict), apply: Apply::Prologue { producer: a, consumers } })
     }
 
-    fn prologue_legal(&self, edges: &BTreeSet<(usize, usize)>, a: usize, consumers: &[usize], produced: &[&Value]) -> Result<(), Reason> {
+    fn prologue_legal(&self, edges: &BTreeSet<(usize, usize)>, a: usize, consumers: &[usize]) -> Result<(), Reason> {
         let g1 = &self.groups[a];
         if g1.iter().any(|&u| self.units[u].opaque()) {
             return Err(Reason::Opaque);
@@ -685,10 +688,11 @@ impl Engine<'_> {
             self.realisable(&merged)?;
             heavies.push((c, h));
         }
+        let produced: Vec<&Value> = self.values.iter().filter(|v| g1.contains(&v.writer) && v.readers.iter().any(|(r, _)| !g1.contains(r))).collect();
         if produced.iter().any(|v| v.live) {
             return Err(Reason::Readers);
         }
-        for &(c, h) in &heavies {
+        for &(c, _) in &heavies {
             let g2 = &self.groups[c];
             if !self.rows_match(g1, g2) {
                 return Err(Reason::Rows);
@@ -696,18 +700,67 @@ impl Engine<'_> {
             if Self::path_between(edges, a, c) {
                 return Err(Reason::Path);
             }
-            let Some(geo) = self.units[h].geometry else { return Err(Reason::Opaque) };
-            let staged: usize = self.flow(g1, g2).map(|(v, _)| v.tensor.cols).sum();
-            let need = geo.smem + (geo.rows_block * staged * 4) as u64;
-            if need > self.costs.smem_limit {
-                return Err(Reason::Smem { need, limit: self.costs.smem_limit });
-            }
-            let regs = geo.regs + g1.iter().chain(g2.iter()).filter(|&&u| u != h).map(|&u| self.units[u].regs()).sum::<u32>();
-            if regs > self.costs.max_regs {
-                return Err(Reason::Regs { need: regs, limit: self.costs.max_regs });
-            }
         }
         Ok(())
+    }
+
+    fn budget(&self, g: &BTreeSet<usize>) -> Result<(), Reason> {
+        let Some(h) = self.anchor(g) else { return Ok(()) };
+        let Some(geo) = self.units[h].geometry else { return Ok(()) };
+        let staged: usize = self.values.iter().filter(|v| g.contains(&v.writer) && !self.units[v.writer].anchored() && v.readers.iter().any(|(r, _)| *r == h)).map(|v| v.tensor.cols).sum();
+        let need = geo.smem + (geo.rows_block * staged * 4) as u64;
+        if need > self.costs.smem_limit {
+            return Err(Reason::Smem { need, limit: self.costs.smem_limit });
+        }
+        let regs = geo.regs + g.iter().filter(|&&u| u != h).map(|&u| self.units[u].regs()).sum::<u32>();
+        if regs > self.costs.max_regs {
+            return Err(Reason::Regs { need: regs, limit: self.costs.max_regs });
+        }
+        Ok(())
+    }
+
+    fn whole_ops(&self, g: &BTreeSet<usize>) -> bool {
+        let ops: BTreeSet<usize> = g.iter().map(|&u| self.units[u].op).collect();
+        ops.len() <= 1 || self.units.iter().enumerate().filter(|(_, u)| ops.contains(&u.op)).all(|(i, _)| g.contains(&i))
+    }
+
+    fn cut_cost(&self, left: &BTreeSet<usize>, right: &BTreeSet<usize>) -> u64 {
+        self.costs.launch_bytes + self.flow(left, right).map(|(v, reads)| self.bytes(&v.tensor) + reads.iter().map(|t| self.bytes(t)).sum::<u64>()).sum::<u64>()
+    }
+
+    fn slot_fit(&self, g: &BTreeSet<usize>, splits: &mut Vec<Decision>) -> Vec<BTreeSet<usize>> {
+        let Err(reason) = self.budget(g) else { return vec![g.clone()] };
+        let members: Vec<usize> = g.iter().copied().collect();
+        let mut best: Option<(bool, u64, BTreeSet<usize>, BTreeSet<usize>)> = None;
+        for k in 1..members.len() {
+            let left: BTreeSet<usize> = members[..k].iter().copied().collect();
+            let right: BTreeSet<usize> = members[k..].iter().copied().collect();
+            if !self.whole_ops(&left) || !self.whole_ops(&right) || self.fit(&left) == Fit::None || self.fit(&right) == Fit::None {
+                continue;
+            }
+            let fits = self.budget(&left).is_ok() && self.budget(&right).is_ok();
+            let cost = self.cut_cost(&left, &right);
+            if best.as_ref().is_none_or(|(f, c, _, _)| (!fits, cost) < (!*f, *c)) {
+                best = Some((fits, cost, left, right));
+            }
+        }
+        let Some((_, cost, left, right)) = best else {
+            return members.iter().map(|&u| BTreeSet::from([u])).collect();
+        };
+        splits.push(self.decision(Rule::Split, &left, &[&right], 0, cost, Err(Reason::SlotFit(Box::new(reason)))));
+        let mut out = self.slot_fit(&left, splits);
+        out.extend(self.slot_fit(&right, splits));
+        out
+    }
+
+    fn split_over_budget(&mut self) -> Vec<Decision> {
+        let mut splits = Vec::new();
+        let groups = std::mem::take(&mut self.groups);
+        for g in &groups {
+            let pieces = self.slot_fit(g, &mut splits);
+            self.groups.extend(pieces);
+        }
+        splits
     }
 
     fn pair(&self, edges: &BTreeSet<(usize, usize)>, a: usize, b: usize) -> Candidate {
@@ -799,10 +852,6 @@ impl Engine<'_> {
         }
         if held {
             return Err(Reason::Readers);
-        }
-        let regs = geo.regs + merged.iter().filter(|&&u| u != h).map(|&u| self.units[u].regs()).sum::<u32>();
-        if regs > self.costs.max_regs {
-            return Err(Reason::Regs { need: regs, limit: self.costs.max_regs });
         }
         Ok(())
     }
@@ -919,6 +968,10 @@ impl Engine<'_> {
                 }
             }
             if !changed {
+                let splits = self.split_over_budget();
+                let kept = |d: &Decision| self.groups.iter().any(|g| d.producer.iter().chain(d.consumers.iter().flatten()).all(|u| g.iter().any(|&m| self.units[m].label == *u)));
+                let fused = fused.into_iter().filter(|d| kept(d)).collect();
+                seen.extend(splits);
                 return (fused, seen);
             }
         }
