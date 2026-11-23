@@ -94,6 +94,59 @@ fn the_engine_chats_with_a_gguf_file_using_its_own_tokenizer_and_template() {
     assert!(reply.completion_tokens < 32, "stops at the template end of turn");
 }
 
+struct RealIq {
+    mean_kl: f64,
+    max_kl: f64,
+    top1: usize,
+    positions: usize,
+    greedy_prefix: usize,
+    greedy_total: usize,
+}
+
+fn real_iq(file: &str, reference: &str) -> Option<RealIq> {
+    let model = dir().join(file);
+    let refs = dir().join(reference);
+    if !model.exists() || !refs.exists() {
+        eprintln!("skipping {file}: needs {} and llama.cpp references in {} (scripts/iq_real_reference.sh)", model.display(), refs.display());
+        return None;
+    }
+    let spec = Spec::from_gguf_file(&model).unwrap();
+    let mut rt = Runtime::load(&spec, 256).unwrap();
+    let (mut kls, mut top1, mut positions, mut prefix, mut total) = (Vec::new(), 0, 0, 0, 0);
+    for p in 0..20 {
+        let prompt: Vec<u32> = std::fs::read_to_string(refs.join(format!("p{p}.prompt.txt"))).unwrap().split_whitespace().map(|t| t.parse().unwrap()).collect();
+        let logits: Vec<f32> = std::fs::read(refs.join(format!("p{p}.logits.bin"))).unwrap().as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+        let greedy: Vec<u32> = std::fs::read_to_string(refs.join(format!("p{p}.greedy.txt"))).unwrap().lines().map(|l| l.parse().unwrap()).collect();
+        let ours = rt.prompt_logits(&prompt).unwrap();
+        for r in 0..prompt.len() {
+            let (a, b) = (&logits[r * VOCAB..(r + 1) * VOCAB], &ours[r * VOCAB..(r + 1) * VOCAB]);
+            kls.push(kl(a, b));
+            top1 += (argmax(a) == argmax(b)) as usize;
+            positions += 1;
+        }
+        let out = rt.generate(&prompt, greedy.len(), Sampling::GREEDY).unwrap();
+        prefix += out.tokens.iter().zip(&greedy).take_while(|(a, b)| a == b).count();
+        total += greedy.len();
+    }
+    let o = RealIq { mean_kl: kls.iter().sum::<f64>() / kls.len() as f64, max_kl: kls.iter().copied().fold(0.0, f64::max), top1, positions, greedy_prefix: prefix, greedy_total: total };
+    eprintln!("{file}: mean KL {:.3e} max KL {:.3e} top1 {}/{} greedy prefix {}/{}", o.mean_kl, o.max_kl, o.top1, o.positions, o.greedy_prefix, o.greedy_total);
+    Some(o)
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, the unsloth Qwen3-0.6B IQ GGUF files as real-*.gguf and llama.cpp references real-* in ~/.cache/specrt-gguf (scripts/iq_real_reference.sh)"]
+fn real_qwen3_iq_files_agree_with_llama_cpp_on_20_prompts() {
+    let bounds = [("IQ4_XS", 1.4e-2, 0.11, 135, 440), ("IQ4_NL", 1.4e-2, 0.2, 135, 395), ("UD-IQ3_XXS", 1.1e-2, 0.17, 144, 455), ("UD-IQ2_XXS", 0.14, 1.9, 132, 310)];
+    let mut failed = Vec::new();
+    for (q, mean_bound, max_bound, top1_min, prefix_min) in bounds {
+        let Some(o) = real_iq(&format!("real-Qwen3-0.6B-{q}.gguf"), &format!("real-{q}")) else { continue };
+        if o.mean_kl > mean_bound || o.max_kl > max_bound || o.top1 < top1_min || o.greedy_prefix < prefix_min {
+            failed.push(format!("{q}: mean KL {} max KL {} top1 {} prefix {}", o.mean_kl, o.max_kl, o.top1, o.greedy_prefix));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
 const ENGINE_KL_MEAN: f64 = 5e-2;
 const ENGINE_KL_MAX: f64 = 0.5;
 const ENGINE_TOP1: usize = 16;

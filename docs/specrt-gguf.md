@@ -117,6 +117,19 @@ Qwen3-0.6B, 18 prompt positions, KL(llama.cpp || specrt). Each file is `llama-qu
 
 IQ1 and IQ2_XXS on a 0.6B model are close to unusable in llama.cpp too, so large KL there is the quantisation, not the reader. `qwen3_iq_gguf_logits_stay_within_the_kl_bound_of_llama_cpp` bounds mean and max KL at 1.5 times these numbers, and `qwen3_iq_native_kernels_match_the_same_weights_dequantised_to_bf16` checks the native kernels against the same file dequantised to bf16. The GPU-side checks need `~/.cache/specrt-gguf/Qwen3-0.6B-IQ*.gguf` and `q3-IQ*.logits.bin` (`scripts/gguf_reference.c`).
 
+#### Real IQ files, 20 prompts
+
+Files from `unsloth/Qwen3-0.6B-GGUF` (saved as `real-<name>` in `~/.cache/specrt-gguf`), llama.cpp `cb26014d9` CUDA. `scripts/iq_real_reference.sh <file> <dir>` tokenizes the 20 prompts in `tests/fixtures/iq_prompts.txt` and dumps llama.cpp logits and 32 greedy tokens each; test `real_qwen3_iq_files_agree_with_llama_cpp_on_20_prompts` (ignored, skips with a message when files are missing). 169 prompt positions, greedy prefix is the sum over prompts of tokens equal before the first difference, out of 640.
+
+| File | sha256 | mean KL | max KL | top-1 | greedy prefix | bound (mean, max, top-1, prefix) |
+| --- | --- | --- | --- | --- | --- | --- |
+| IQ4_XS | dacc1fe1dc6f4799f366ac3385299f71c7e02c58b8702448a174f14d91b1c64d | 9.3e-3 | 7.1e-2 | 149/169 | 494/640 | 1.4e-2, 0.11, 135, 440 |
+| IQ4_NL | f1b14e28a6de64f21672ddf2c8f24736c389da4c64ebf024b1204f4f43a4fd71 | 9.4e-3 | 0.13 | 151/169 | 439/640 | 1.4e-2, 0.2, 135, 395 |
+| UD-IQ3_XXS | 0ed6dab036349ba8198324c70002a15397e8bdeb06748eee5c631f872e1eaf2f | 7.0e-3 | 0.11 | 160/169 | 508/640 | 1.1e-2, 0.17, 144, 455 |
+| UD-IQ2_XXS | 55e0d0b88ae021edf15d2f0cec5ab2c47552b6a5f388dfab869f1e67240263c3 | 9.1e-2 | 1.25 | 147/169 | 348/640 | 0.14, 1.9, 132, 310 |
+
+The numbers match the self-quantised files above, and the reader shows no format-specific error. Bounds are 1.5x the KL and 0.9x the agreement counts.
+
 ## Bench
 
 RTX PRO 6000 Blackwell Max-Q, beside the resident vLLM (about 38 GB free), master after #462 (`48e2e54`). llama.cpp `7bd8282c3` (build 10267), CUDA, `-ngl 99 -fa 1`, 3 runs per point; llama.cpp decode uses `-d 1024` and `-d 4096` so both engines decode 128 tokens at the same depth. specrt `bench <file.gguf> 1024,4096 128`, median of 3. Both engines ran in the same window, alternating, each step started only below 10% GPU utilisation: `flock /tmp/gpu27.lock crates/specrt/scripts/vsllama.sh <file.gguf> <bench> 2`. The table is the mean of the two rounds.

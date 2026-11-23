@@ -1,0 +1,20 @@
+The capital of France is
+Write a short poem about the moon and the sea.
+def fibonacci(n):
+Explain why the sky is blue in one sentence.
+The three primary colors are
+Once upon a time in a small village by the river,
+What is the derivative of x squared?
+The quick brown fox jumps over the lazy dog because
+Translate to French: Good morning, how are you?
+In 1969, humans first landed on
+List three benefits of regular exercise:
+SELECT name, age FROM users WHERE
+The largest planet in our solar system is
+To make a good cup of tea, you should first
+Photosynthesis is the process by which plants
+A binary search works by repeatedly
+The meaning of the word serendipity is
+Water boils at a temperature of
+Dear Sir or Madam, I am writing to
+The theory of relativity was developed by
