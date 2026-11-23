@@ -85,6 +85,8 @@ const MACROS: [(&str, &str); 4] = [
 
 const BINARY: [(&str, &str, &str); 2] = [("min", "fminf", "min"), ("max", "fmaxf", "max")];
 
+const MODULE: [(&str, usize, &str); 2] = [("gated", 2, "gated_act"), ("mapped", 1, "mapped_act")];
+
 #[derive(Clone, Debug, PartialEq)]
 enum Tok {
     Num(String),
@@ -278,8 +280,8 @@ impl Parser<'_> {
             want(1)?;
             return Ok(Expr::Call(n, args));
         }
-        if let Some((n, _, _)) = BINARY.iter().find(|(n, _, _)| *n == id) {
-            want(2)?;
+        if let Some((n, arity, _)) = BINARY.iter().map(|(n, _, _)| (n, 2, "")).chain(MODULE.iter().map(|(n, a, c)| (n, *a, *c))).find(|(n, _, _)| **n == id) {
+            want(arity)?;
             return Ok(Expr::Call(n, args));
         }
         Err(self.err(&format!("unknown function {id:?}")))
@@ -428,6 +430,14 @@ impl Expr {
                     Dialect::Cuda => format!("({c} ? {a} : {b})"),
                     Dialect::Wgsl => format!("select({b}, {a}, {c})"),
                 }
+            }
+            Expr::Call(f, args) if MODULE.iter().any(|(n, _, _)| n == f) => {
+                let (_, _, cu) = MODULE.iter().find(|(n, _, _)| n == f).expect("checked above");
+                if d != Dialect::Cuda {
+                    return Err(format!("{f} is a CUDA module function with no WGSL lowering"));
+                }
+                let parts: Result<Vec<String>, String> = args.iter().map(|a| child(a, false)).collect();
+                format!("{cu}({})", parts?.join(", "))
             }
             Expr::Call(f, args) => {
                 let (_, cu, wg) = UNARY.iter().chain(BINARY.iter()).find(|(n, _, _)| n == f).ok_or_else(|| format!("unknown function {f}"))?;

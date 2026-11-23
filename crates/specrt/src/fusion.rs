@@ -10,7 +10,6 @@ const CUDA_GBS: f64 = 1600.0;
 const CUDA_LAUNCH_US: f64 = 2.0;
 const CUDA_ROUND_TRIP_US: f64 = 0.8;
 const CUDA_REREAD_RATE: f64 = 0.25;
-const CUDA_MAX_REGS: u32 = 255;
 const WGSL_GBS: f64 = 200.0;
 const WGSL_LAUNCH_US: f64 = 5.0;
 const WGSL_ROUND_TRIP_US: f64 = 2.0;
@@ -40,7 +39,7 @@ impl Costs {
                 reread_rate: CUDA_REREAD_RATE,
                 reread_overlap: 1.0,
                 smem_limit: t.smem_limit as u64,
-                max_regs: CUDA_MAX_REGS,
+                max_regs: t.max_regs,
             },
             kir::Language::Wgsl => Costs {
                 launch_bytes: us_bytes(WGSL_LAUNCH_US, WGSL_GBS),
@@ -48,7 +47,7 @@ impl Costs {
                 reread_rate: 1.0,
                 reread_overlap: 0.0,
                 smem_limit: t.smem_limit as u64,
-                max_regs: u32::MAX,
+                max_regs: t.max_regs,
             },
         }
     }

@@ -30,6 +30,7 @@ const FEATURES: [Feature; 9] = [
 ];
 
 const SMEM_RESERVED_PER_BLOCK: u32 = 1024;
+const CUDA_MAX_REGS: u32 = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
@@ -43,6 +44,7 @@ pub struct Target {
     pub features: u32,
     pub graphs: bool,
     pub pdl: bool,
+    pub max_regs: u32,
 }
 
 fn bit(f: Feature) -> u32 {
@@ -76,6 +78,7 @@ impl Target {
             features,
             graphs: true,
             pdl: cc >= 90,
+            max_regs: CUDA_MAX_REGS,
         }
     }
 
@@ -99,6 +102,7 @@ impl Target {
             features: 0,
             graphs: false,
             pdl: false,
+            max_regs: u32::MAX,
         }
     }
 
