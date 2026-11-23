@@ -24,10 +24,10 @@ fn dump_module_sources() {
     for dir in [root.join("tests/fixtures"), root.join("specs")] {
         for e in std::fs::read_dir(dir).unwrap().flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
-            if name.ends_with(".toml") {
-                if let Ok(s) = Spec::load(&e.path()) {
-                    specs.push((format!("toml-{name}"), s));
-                }
+            if name.ends_with(".toml")
+                && let Ok(s) = Spec::load(&e.path())
+            {
+                specs.push((format!("toml-{name}"), s));
             }
         }
     }
