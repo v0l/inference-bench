@@ -92,6 +92,11 @@ pub enum EngineEvent {
 }
 
 pub type Wake = Arc<dyn Fn() + Send + Sync>;
+pub type GpuSampler = Arc<dyn Fn() -> Vec<crate::gpu::GpuStats> + Send + Sync>;
+
+pub fn no_gpu_sampler() -> GpuSampler {
+    Arc::new(Vec::new)
+}
 
 pub struct Engine {
     commands: Sender<Command>,
@@ -279,10 +284,14 @@ impl Engine {
     }
 
     pub fn with_factory(wake: Wake, factory: Factory) -> Self {
-        Self::with_factories(wake, factory, Arc::new(|_| None))
+        Self::with_factories_sampled(wake, factory, Arc::new(|_| None), no_gpu_sampler())
     }
 
     pub fn with_factories(wake: Wake, factory: Factory, serving: ServingFactory) -> Self {
+        Self::with_factories_sampled(wake, factory, serving, Arc::new(crate::gpu::sample))
+    }
+
+    pub fn with_factories_sampled(wake: Wake, factory: Factory, serving: ServingFactory, gpu: GpuSampler) -> Self {
         let (commands, inbox) = channel();
         let (events_tx, events) = channel();
         let loaded: LoadedList = Arc::default();
@@ -297,7 +306,7 @@ impl Engine {
         let this = Self { commands, events, loaded, suspended, lives, idle, stats, watching, stop_sampler, max_loaded };
         let handle = this.handle();
         let (stop, wake_sampler) = (this.stop_sampler.clone(), wake.clone());
-        std::thread::spawn(move || run(inbox, events_tx, shared, wake, factory, serving));
+        std::thread::spawn(move || run(inbox, events_tx, shared, wake, factory, serving, gpu));
         std::thread::spawn(move || sample(handle, stop, wake_sampler));
         this
     }
@@ -529,6 +538,7 @@ fn run(
     wake: Wake,
     factory: Factory,
     serving: ServingFactory,
+    gpu: GpuSampler,
 ) {
     let mut slots: Vec<Slot> = Vec::new();
     let mut parked: Vec<Parked> = Vec::new();
@@ -643,7 +653,7 @@ fn run(
                 publish(&shared, &slots, &parked);
                 emit(EngineEvent::Loading(display.clone()));
                 let started = Instant::now();
-                let before = crate::gpu::sample();
+                let before = gpu();
                 let vram_before = crate::gpu::used_total(&before).map(|(used, _)| used);
                 let seqs = max_num_seqs.unwrap_or(1).max(1);
                 let sink = {
@@ -656,7 +666,7 @@ fn run(
                 match open(&model_id, max_ctx, seqs, kv_cache_bytes, &engine, &factory, &serving, &sink) {
                     Ok(o) => {
                         let ctx = engine.solved.as_ref().map(|s| s.context).or(max_ctx).unwrap_or(specrt::engine::DEFAULT_CTX);
-                        let after = crate::gpu::sample();
+                        let after = gpu();
                         let vram_bytes = vram_before.zip(crate::gpu::used_total(&after).map(|(used, _)| used)).map(|(b, a)| a.saturating_sub(b)).filter(|v| *v > 0);
                         let landed = crate::gpu::landed(&before, &after);
                         let info = Loaded {
@@ -849,6 +859,21 @@ mod tests {
         e.send(Command::Unload { model: None });
         assert_eq!(wait_event(&e), EngineEvent::Unloaded);
         assert!(e.loaded().is_none());
+    }
+
+    #[test]
+    fn a_scripted_load_samples_the_injected_gpu_twice() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let sampler: GpuSampler = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        });
+        let e = Engine::with_factories_sampled(Arc::new(|| {}), ScriptedModel::factory(script()), Arc::new(|_| None), sampler);
+        e.send(load("m", "M"));
+        wait_event(&e);
+        assert!(matches!(wait_event(&e), EngineEvent::Loaded(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

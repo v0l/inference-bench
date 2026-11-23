@@ -424,5 +424,5 @@ impl crate::target::Target for ScriptedServing {
 }
 
 pub fn engine(wake: crate::engine::Wake, script: Script) -> crate::engine::Engine {
-    crate::engine::Engine::with_factories(wake, ScriptedModel::factory(script.clone()), ScriptedServing::factory(script))
+    crate::engine::Engine::with_factories_sampled(wake, ScriptedModel::factory(script.clone()), ScriptedServing::factory(script), crate::engine::no_gpu_sampler())
 }
