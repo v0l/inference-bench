@@ -126,7 +126,7 @@ fn dead_peer_fails_cleanly() {
 fn auto_falls_back_to_tcp_without_the_library() {
     let server = StageServer::start("127.0.0.1:0", KEY, Arc::new(Echo)).unwrap();
     let addr = server.addr().to_string();
-    let missing = LinkOptions { transport: Transport::Auto, library: Some("libno-such-ibverbs.so.9".into()) };
+    let missing = LinkOptions { transport: Transport::Auto, library: Some("libno-such-ibverbs.so.9".into()), gpu_direct: false };
     let mut client = StageClient::connect_with(&addr, KEY, Duration::from_secs(5), &missing).unwrap();
     assert!(!client.is_rdma());
     assert!(client.ping().is_ok());
@@ -136,7 +136,7 @@ fn auto_falls_back_to_tcp_without_the_library() {
 fn forced_rdma_without_the_library_is_an_error() {
     let server = StageServer::start("127.0.0.1:0", KEY, Arc::new(Echo)).unwrap();
     let addr = server.addr().to_string();
-    let missing = LinkOptions { transport: Transport::Rdma, library: Some("libno-such-ibverbs.so.9".into()) };
+    let missing = LinkOptions { transport: Transport::Rdma, library: Some("libno-such-ibverbs.so.9".into()), gpu_direct: false };
     assert!(StageClient::connect_with(&addr, KEY, Duration::from_secs(5), &missing).is_err());
 }
 

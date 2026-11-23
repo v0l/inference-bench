@@ -7,7 +7,7 @@ Config: `[placement.remote] gpu_direct = true` (default false), next to `transpo
 - `direct::DirectRegion`: a `cuMemAlloc` buffer (rounded up to 2 MiB) exported once with `cuMemGetHandleForAddressRange(DMA_BUF_FD)`. A stage owns two: an outbox (its output hidden state is copied device to device into it) and a landing buffer (the previous stage writes into it, and the stage copies from it into its input rows). Both are registered once, at link set-up, never per hop.
 - `direct::DirectLink`: one RC queue pair with the outbox registered as the local source and the landing buffer registered for remote write. `push(bytes)` posts an RDMA write with immediate (imm = byte count) straight from GPU memory. `wait(bytes)` completes when the immediate arrives, which means the payload is in the peer's GPU memory.
 - `Runtime::export_hidden_device` and `import_hidden_device` move hidden rows between the stage's activation buffer and a device pointer with no host copy.
-- `HiddenView` is the device-side counterpart of `Input::Hidden { data }`: host bytes, or a registered device range plus length.
+- `HiddenView` (planned, not built yet): the device-side counterpart of `Input::Hidden { data }`: host bytes, or a registered device range plus length.
 
 ## Authentication of the payload
 
@@ -26,3 +26,12 @@ Chain hops currently pass through the coordinator (`Chain::forward` takes the re
 ## Tests
 
 `crates/specrt/tests/direct.rs` (ignored, run under `~/.agents/bin/gpu-run 1 --`): two runtimes of the tiny fixture on one GPU as two threads, hidden state passed host-bytes versus GPU-direct, tokens equal to one runtime; decode (20 KB scale) and 4 MB hops timed both ways.
+
+## Results (GPU1, loopback on the card's own address, 2026-11, tiny-qwen3.5)
+
+Both tests pass: the 2-stage pipeline gives the same 32 tokens as one runtime with host hops and with GPU-direct hops. Raw hop through the NIC (one write with immediate, GPU to GPU): 20 KB 8.5 us, 4 MB 653 us (6.4 GB/s), matching the #660 measurement. Against the pinned-ring path measured in #660 (17.7 us and 1.21 ms) that is about 2x. The "host copy" lines in the test log are a local cuMemcpy out and back with no NIC, so they are not a like-for-like baseline and are only there as a sanity floor. In the pipeline test the 1 KB tiny-fixture decode hop and the 100 KB prefill hop are dominated by the fixed per-call cost (14.7 us direct against 10 us host copy): the benefit shows at the real hidden sizes (20 KB and up), not on a 256-wide fixture.
+
+## Not done (needs the Spark or a design call)
+
+- Coordinator and stage handlers still carry `Input::Hidden` bytes. Making stage i push to stage i+1 (a `Message::Direct` offer in the wire protocol, a `HiddenView` in `Input`, handlers using `import_hidden_device`) is the wiring step; the `DirectLink` and device copies it needs exist and are tested.
+- Spark run: desktop to Spark #544 split, 8 of 8 identical texts, with `gpu_direct = true`, needs the Spark.
