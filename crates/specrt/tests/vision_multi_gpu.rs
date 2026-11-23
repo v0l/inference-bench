@@ -87,7 +87,7 @@ fn case(name: &str) -> Case {
             let n = grid.iter().product::<usize>() * patch_dim;
             let data = all[at..at + n].to_vec();
             at += n;
-            MediaInput { processed: Processed::Image(Patches { grid, data }), hash: [(name.len() * 8 + i) as u8 + 1; 32] }
+            MediaInput { processed: Processed::Image(Patches { grid, data, layout: [0, 0] }), hash: [(name.len() * 8 + i) as u8 + 1; 32] }
         })
         .collect();
     Case { prompt: ids(&m["ids"]), media }

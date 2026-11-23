@@ -12,7 +12,11 @@ struct Args {
 }
 
 fn parse() -> Args {
-    let mut a = Args { threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1), pool_mb: 2048, seconds: 1.0 };
+    let mut a = Args {
+        threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+        pool_mb: 2048,
+        seconds: 1.0,
+    };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         let v = it.next().unwrap_or_default();
@@ -57,29 +61,31 @@ fn gemv_ref(w: &[u8], act: &[i8], out: &mut [i32]) {
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
 unsafe fn gemv_avx512(w: &[u8], act: &[i8], out: &mut [i32]) {
     use std::arch::x86_64::*;
-    let lut_bytes: [u8; 16] = [12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0];
-    let lut = _mm512_broadcast_i32x4(_mm_loadu_si128(lut_bytes.as_ptr() as *const __m128i));
-    let mask = _mm512_set1_epi8(0x0f);
-    let ones = _mm512_set1_epi8(1);
-    let chunks = BYTES_PER_ROW / 64;
-    let mut asum = 0i32;
-    for c in 0..chunks * 2 {
-        let v = _mm512_loadu_si512(act.as_ptr().add(c * 64) as *const _);
-        asum += _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, v));
-    }
-    for (r, o) in out.iter_mut().enumerate() {
-        let row = w.as_ptr().add(r * BYTES_PER_ROW);
-        let mut acc = _mm512_setzero_si512();
-        for c in 0..chunks {
-            let b = _mm512_loadu_si512(row.add(c * 64) as *const _);
-            let lo = _mm512_shuffle_epi8(lut, _mm512_and_si512(b, mask));
-            let hi = _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16(b, 4), mask));
-            let a0 = _mm512_loadu_si512(act.as_ptr().add(c * 128) as *const _);
-            let a1 = _mm512_loadu_si512(act.as_ptr().add(c * 128 + 64) as *const _);
-            acc = _mm512_dpbusd_epi32(acc, lo, a0);
-            acc = _mm512_dpbusd_epi32(acc, hi, a1);
+    unsafe {
+        let lut_bytes: [u8; 16] = [12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0];
+        let lut = _mm512_broadcast_i32x4(_mm_loadu_si128(lut_bytes.as_ptr() as *const __m128i));
+        let mask = _mm512_set1_epi8(0x0f);
+        let ones = _mm512_set1_epi8(1);
+        let chunks = BYTES_PER_ROW / 64;
+        let mut asum = 0i32;
+        for c in 0..chunks * 2 {
+            let v = _mm512_loadu_si512(act.as_ptr().add(c * 64) as *const _);
+            asum += _mm512_reduce_add_epi32(_mm512_dpbusd_epi32(_mm512_setzero_si512(), ones, v));
         }
-        *o = _mm512_reduce_add_epi32(acc) - 12 * asum;
+        for (r, o) in out.iter_mut().enumerate() {
+            let row = w.as_ptr().add(r * BYTES_PER_ROW);
+            let mut acc = _mm512_setzero_si512();
+            for c in 0..chunks {
+                let b = _mm512_loadu_si512(row.add(c * 64) as *const _);
+                let lo = _mm512_shuffle_epi8(lut, _mm512_and_si512(b, mask));
+                let hi = _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16(b, 4), mask));
+                let a0 = _mm512_loadu_si512(act.as_ptr().add(c * 128) as *const _);
+                let a1 = _mm512_loadu_si512(act.as_ptr().add(c * 128 + 64) as *const _);
+                acc = _mm512_dpbusd_epi32(acc, lo, a0);
+                acc = _mm512_dpbusd_epi32(acc, hi, a1);
+            }
+            *o = _mm512_reduce_add_epi32(acc) - 12 * asum;
+        }
     }
 }
 
@@ -96,18 +102,23 @@ fn run_gemv(w: &[u8], act: &[i8], out: &mut [i32]) {
 #[target_feature(enable = "avx512f")]
 unsafe fn read_sum(buf: &[u8]) -> u64 {
     use std::arch::x86_64::*;
-    let mut acc = _mm512_setzero_si512();
-    let mut p = buf.as_ptr();
-    let end = p.add(buf.len() & !255);
-    while p < end {
-        let a = _mm512_loadu_si512(p as *const _);
-        let b = _mm512_loadu_si512(p.add(64) as *const _);
-        let c = _mm512_loadu_si512(p.add(128) as *const _);
-        let d = _mm512_loadu_si512(p.add(192) as *const _);
-        acc = _mm512_xor_si512(acc, _mm512_xor_si512(_mm512_xor_si512(a, b), _mm512_xor_si512(c, d)));
-        p = p.add(256);
+    unsafe {
+        let mut acc = _mm512_setzero_si512();
+        let mut p = buf.as_ptr();
+        let end = p.add(buf.len() & !255);
+        while p < end {
+            let a = _mm512_loadu_si512(p as *const _);
+            let b = _mm512_loadu_si512(p.add(64) as *const _);
+            let c = _mm512_loadu_si512(p.add(128) as *const _);
+            let d = _mm512_loadu_si512(p.add(192) as *const _);
+            acc = _mm512_xor_si512(
+                acc,
+                _mm512_xor_si512(_mm512_xor_si512(a, b), _mm512_xor_si512(c, d)),
+            );
+            p = p.add(256);
+        }
+        _mm512_reduce_add_epi64(acc) as u64
     }
-    _mm512_reduce_add_epi64(acc) as u64
 }
 
 fn timed<F: Fn(usize) + Sync>(threads: usize, seconds: f64, f: F) -> (f64, usize) {
@@ -137,7 +148,13 @@ fn main() {
     let mut pool = vec![0u8; n_experts * EXPERT_BYTES];
     fill(&mut pool);
     let act: Vec<i8> = pool[..COLS].iter().map(|&b| b as i8 / 4).collect();
-    println!("threads {} pool {} MB experts {} expert {:.2} MB", a.threads, a.pool_mb, n_experts, EXPERT_BYTES as f64 / 1e6);
+    println!(
+        "threads {} pool {} MB experts {} expert {:.2} MB",
+        a.threads,
+        a.pool_mb,
+        n_experts,
+        EXPERT_BYTES as f64 / 1e6
+    );
 
     let mut o1 = vec![0i32; 64];
     let mut o2 = vec![0i32; 64];
@@ -158,9 +175,16 @@ fn main() {
     let dshare = src.len() / a.threads;
     let dptr = dst.as_mut_ptr() as usize;
     let (secs, iters) = timed(a.threads, a.seconds, |t| unsafe {
-        std::ptr::copy_nonoverlapping(src.as_ptr().add(t * dshare), (dptr as *mut u8).add(t * dshare), dshare);
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr().add(t * dshare),
+            (dptr as *mut u8).add(t * dshare),
+            dshare,
+        );
     });
-    println!("memcpy bandwidth {:.1} GB/s (read+write counted once)", (iters * dshare) as f64 / secs / 1e9);
+    println!(
+        "memcpy bandwidth {:.1} GB/s (read+write counted once)",
+        (iters * dshare) as f64 / secs / 1e9
+    );
     drop(dst);
 
     let per_thread_experts = n_experts.max(a.threads) / a.threads;
@@ -176,7 +200,12 @@ fn main() {
     });
     let experts = iters * per_thread_experts;
     let bytes = experts as f64 * EXPERT_BYTES as f64;
-    println!("cpu gemv, one expert per thread task, cold: {:.1} GB/s weights, {:.0} experts/s, {:.1} us per expert (whole machine)", bytes / secs / 1e9, experts as f64 / secs, secs / experts as f64 * 1e6);
+    println!(
+        "cpu gemv, one expert per thread task, cold: {:.1} GB/s weights, {:.0} experts/s, {:.1} us per expert (whole machine)",
+        bytes / secs / 1e9,
+        experts as f64 / secs,
+        secs / experts as f64 * 1e6
+    );
     println!("pcie reference: 57.8 GB/s = {:.0} experts/s", 57.8e9 / EXPERT_BYTES as f64);
 
     let hot = &pool[..EXPERT_BYTES];
@@ -185,5 +214,8 @@ fn main() {
         run_gemv(hot, &act, &mut out);
         std::hint::black_box(&out);
     });
-    println!("cpu gemv same expert (L2/L3 resident, compute ceiling): {:.1} GB/s weights", iters as f64 * EXPERT_BYTES as f64 / secs / 1e9);
+    println!(
+        "cpu gemv same expert (L2/L3 resident, compute ceiling): {:.1} GB/s weights",
+        iters as f64 * EXPERT_BYTES as f64 / secs / 1e9
+    );
 }

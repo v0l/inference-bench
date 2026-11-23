@@ -232,6 +232,7 @@ mod tests {
             first_delay_ms: 150,
             usage: Some((40, 6)),
             fail_status: None,
+            offload: None,
             vision: false,
             files: Default::default(),
             sessions: Default::default(),

@@ -8,6 +8,7 @@ pub mod expr;
 pub mod gemm;
 pub mod gemv;
 pub mod ggml;
+pub mod heavy;
 pub mod iq_tables;
 pub mod layout;
 pub mod linear;
@@ -292,6 +293,13 @@ impl Kernel {
         let k = Kernel { name, target: *t, params, threads: pick_threads(t, threads), smem_bytes: 0, body: Body::Seq(body) };
         k.validate()?;
         Ok(k)
+    }
+
+    pub fn tile_scan(&self) -> bool {
+        match &self.body {
+            Body::Scan(s) => s.tile_eligible() && s.tile_names_free(&self.params) && self.target.has(Feature::Mma16816) && self.target.has(Feature::CpAsync) && self.target.language == Language::Cuda,
+            _ => false,
+        }
     }
 
     pub fn chunk_form(&self) -> Option<recur::ChunkForm> {

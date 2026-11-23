@@ -161,7 +161,7 @@ impl Drop for Runtime {
     }
 }
 
-fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec, layers: &mut [DeviceLayer], weight_bytes: u64) -> Result<(Option<stream::Streamer>, Option<crate::offload::OffloadPlan>)> {
+fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec, layers: &mut [DeviceLayer], weight_bytes: u64, swap_staging: u64) -> Result<(Option<stream::Streamer>, Option<crate::offload::OffloadPlan>)> {
     use crate::offload::{Tier, plan_layers};
     let off = &spec.runtime.offload;
     if !off.enabled() {
@@ -173,7 +173,7 @@ fn offload_layers(ctx: &Arc<CudaContext>, stream: &Arc<CudaStream>, spec: &Spec,
     if settings.host_budget == 0 {
         settings.host_budget = u64::MAX;
     }
-    let plan = plan_layers(&sizes, always, &settings)?;
+    let plan = plan_layers(&sizes, always, &settings, swap_staging)?;
     let dir = match (&off.nvme_path, plan.nvme_bytes) {
         (_, 0) => None,
         (Some(p), _) => Some(std::path::PathBuf::from(p)),
@@ -438,6 +438,7 @@ struct DescribedLaunch {
     threads: u32,
     params: Vec<kir::Param>,
     chunk: Option<kir::recur::ChunkForm>,
+    tile: bool,
 }
 
 struct DeviceAttn {
@@ -804,6 +805,8 @@ pub struct Runtime {
     lm_head: DeviceMatrix,
     layers: Vec<DeviceLayer>,
     described: Vec<Option<DescribedLaunch>>,
+    scan_tile_off: std::sync::atomic::AtomicBool,
+    scan_launches: [std::sync::atomic::AtomicUsize; 3],
     scratch: std::collections::BTreeMap<String, CudaSlice<f32>>,
     int_scratch: std::collections::BTreeMap<String, CudaSlice<i32>>,
     buf: Buffers,
@@ -1084,7 +1087,7 @@ impl Runtime {
         let smem = module.smem.clone();
         let described: Vec<Option<DescribedLaunch>> = crate::codegen::described_kernels(spec, layout.kv_planes, max_ctx, &target)?
             .into_iter()
-            .map(|k| k.map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, params: k.params }))
+            .map(|k| k.map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: None, tile: k.tile_scan(), params: k.params }))
             .collect();
         let linear_tuning = LinearTuning::for_target(&target);
         crate::progress::report(crate::progress::Stage::Kernels, 1, 1);
@@ -1100,7 +1103,8 @@ impl Runtime {
             + (embed.num_bytes() + norm.num_bytes()) as u64
             + lm_head.bytes()
             + mtp_weights.as_ref().map_or(0, mtp::DeviceMtp::bytes);
-        let (streamer, offload_plan) = offload_layers(&ctx, &stream, spec, &mut layers, weight_bytes)?;
+        let swap_staging = crate::offload::swap_staging_for((layout.pages() * kv_block_bytes(spec, layout.kv_planes)) as u64);
+        let (streamer, offload_plan) = offload_layers(&ctx, &stream, spec, &mut layers, weight_bytes, swap_staging)?;
         let d = &spec.dims;
         let pages = layout.pages();
         let block_elems = kv_block_bytes(spec, layout.kv_planes) / 4;
@@ -1153,7 +1157,7 @@ impl Runtime {
         ensure!(use_mma || gdn.is_none(), "linear attention needs the tensor core path (sm_80 or newer)");
         let mixer_launch: Vec<DescribedLaunch> = crate::codegen::mixer_kernels(spec, layout.kv_planes, max_ctx, &target)?
             .into_iter()
-            .map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: k.chunk_form().filter(|_| spec.runtime.chunked_scan), params: k.params })
+            .map(|k| DescribedLaunch { name: k.name, threads: k.threads, chunk: k.chunk_form().filter(|_| spec.runtime.chunked_scan), tile: false, params: k.params })
             .collect();
         let chunk_tiles = match &spec.mixer {
             Some(m) => mixer_launch
@@ -1259,6 +1263,8 @@ impl Runtime {
             lm_head,
             layers,
             described,
+            scan_launches: Default::default(),
+            scan_tile_off: Default::default(),
             scratch: spec
                 .attention
                 .scratch
@@ -1308,7 +1314,7 @@ impl Runtime {
                 let opts = spec.runtime.vision;
                 let stream = rt.ctx.new_stream()?;
                 let enc = crate::vision_encoder::VisionEncoder::load_with(&rt.ctx, &stream, &jit, &checkpoint, &v.config, opts.precision)?;
-                rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::with_tiles(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, if v.config.pooled() { v.config.tokens_per_tile() } else { 0 }, opts)));
+                rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::with_tiles(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, if v.config.tile_grid() { v.config.tokens_per_tile() } else { 0 }, opts)));
                 checkpoint.release();
             }
         rt.stream.synchronize()?;
@@ -1374,6 +1380,14 @@ impl Runtime {
         crate::launch::Launch::new(&self.stream, f, self.pdl, self.sms * 8)
     }
 
+    pub fn set_scan_tile(&self, on: bool) {
+        self.scan_tile_off.store(!on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn scan_launches(&self) -> [usize; 3] {
+        self.scan_launches.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn kernel(&self, name: &str) -> &CudaFunction {
         &self.kernels[name]
     }
@@ -1407,6 +1421,8 @@ impl Runtime {
                 host_hits: a.host_hits + b.host_hits,
                 nvme_reads: a.nvme_reads + b.nvme_reads,
                 nvme_read_bytes: a.nvme_read_bytes + b.nvme_read_bytes,
+                nvme_read_failures: a.nvme_read_failures + b.nvme_read_failures,
+                nvme_wait_nanos: a.nvme_wait_nanos + b.nvme_wait_nanos,
                 host_to_vram_bytes: a.host_to_vram_bytes + b.host_to_vram_bytes,
                 evictions: a.evictions + b.evictions,
             }),
@@ -1682,7 +1698,16 @@ impl Runtime {
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
         ensure!(self.head_part.is_none(), "a vocabulary sharded rank decodes through the plan, not the single stream step");
         ensure!(self.spec.requanted_linears().is_empty(), "requantised attention and delta-net projections run on the plan decode path (the scheduler), not the single stream step");
-        ensure!(self.spec.attention.node.is_empty() && self.spec.mixer.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "described attention, mixers, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        ensure!(self.spec.mixer.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "mixers, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        if !self.spec.attention.node.is_empty() {
+            ensure!(self.use_mma, "described attention needs the tensor core path");
+            let run = exec::Run { n: 1, tokens: &self.buf.token, logits: &self.buf.logits, rows: 0..1, bb: None, start: None, qlen: 1, mtp: None };
+            return crate::executor::run_plan(self, &self.plans.prefill, &run, &mut |i| {
+                let Some(trace) = trace else { return Ok(()) };
+                let n = self.spec.dims.hidden;
+                self.copy_rows(&self.pre.x.slice(..n), &trace.slice(i * n..(i + 1) * n), n)
+            });
+        }
         let s = &self.spec;
         let a = &s.attention;
         let buf = &self.buf;
@@ -2700,7 +2725,7 @@ impl Runtime {
             self.stream.memcpy_htod(&[0i32, 0], &mut self.mm_meta.slice_mut(2 * slot..2 * slot + 2))?;
             return Ok(());
         };
-        ensure!(self.spec.rope.mrope.is_some() || self.spec.vision.as_ref().is_some_and(|v| v.config.pooled()), "the model has no mrope section in its spec");
+        ensure!(self.spec.rope.mrope.is_some() || self.spec.vision.as_ref().is_some_and(|v| v.config.tile_grid()), "the model has no mrope section in its spec");
         let n = plan.positions.len();
         ensure!(n <= self.max_ctx, "media prompt longer than max_ctx");
         let hidden = self.spec.dims.hidden;

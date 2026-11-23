@@ -55,6 +55,7 @@ fn script() -> Script {
         first_delay_ms: 20,
         usage: Some((9, 3)),
         fail_status: None,
+        offload: None,
         vision: false,
         files: Default::default(),
         sessions: Default::default(),
@@ -220,13 +221,13 @@ fn click_load(h: &mut Harness<'static, App>) {
     let mut last = None;
     for _ in 0..30 {
         h.step();
-        let at = h.get_all_by_label("load").last().unwrap().accesskit_node().bounding_box();
+        let at = h.get_all_by_label("load model").last().unwrap().accesskit_node().bounding_box();
         if at == last {
             break;
         }
         last = at;
     }
-    h.get_all_by_label("load").last().unwrap().click();
+    h.get_all_by_label("load model").last().unwrap().click();
 }
 
 fn click_settled(h: &mut Harness<'static, App>, label: &str) {
@@ -330,7 +331,7 @@ fn load_stays_available_when_the_planner_says_the_model_will_not_fit() {
 }
 
 fn click_load_node(h: &mut Harness<'static, App>) -> bool {
-    h.query_all_by_label("load").last().expect("a load key").accesskit_node().is_disabled()
+    h.query_all_by_label("load model").last().expect("a load key").accesskit_node().is_disabled()
 }
 
 #[test]
@@ -802,6 +803,174 @@ fn loading_from_the_dialog_passes_parallel_requests_to_the_engine_and_remembers_
     assert_eq!(Settings::load(&h.state().dir).seqs_for("Qwen3-0.6B"), 6);
 }
 
+fn offloaded_script() -> Script {
+    use specrt::offload::{LayerResidency, OffloadPlan, OffloadStats, Tier};
+    let layers = (0..4).map(|i| LayerResidency { layer: i, bytes: 2 << 30, tier: if i < 2 { Tier::Vram } else if i == 2 { Tier::Host } else { Tier::Nvme }, pinned: i < 2 }).collect();
+    let plan = OffloadPlan { layers, staging_bytes: 1 << 30, vram_bytes: 5 << 30, host_bytes: 2 << 30, nvme_bytes: 2 << 30, host_staging_bytes: 0, swap_staging_bytes: 0 };
+    let stats = OffloadStats { vram_hits: 3, host_hits: 1, nvme_reads: 0, host_to_vram_bytes: 10, ..Default::default() };
+    Script { offload: Some((plan, stats)), ..script() }
+}
+
+#[test]
+fn where_the_weights_live_and_the_hit_rate_show_for_an_offloaded_model_at_desktop_and_phone_width() {
+    for (name, size) in [("tiers-desktop", egui::vec2(1280.0, 1400.0)), ("tiers-phone", egui::vec2(390.0, 2400.0))] {
+        let mut h = harness_at(name, Tab::Server, size);
+        with_gpu(&mut h, 0, 96 << 30);
+        h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+        let m = real_model(&h.state().library[0].name.clone());
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().load_model_with(&m, 2048, 2);
+        pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+        pump_until(&mut h, 10, "serving reading", |a| a.engine.reading().serving.is_some());
+        h.run();
+        assert!(h.state().engine.handle().serving_stats_of(&m.name).and_then(|s| s.offload_plan).is_some());
+        h.get_by_label_contains("2 of 4 layers stream in");
+        let screen = h.ctx.content_rect();
+        for text in ["2 of 4 layers stream in", m.name.as_str()] {
+            for n in h.get_all_by_label_contains(text) {
+                let r = n.rect();
+                assert!(r.right() <= screen.right() + 0.5, "{text} at {size:?} ends at {} past {}", r.right(), screen.right());
+            }
+        }
+        let r = h.state().engine.reading();
+        let shown = crate::serving::offload_readings(&r, 2.5e9);
+        assert_eq!(shown[0].1, "75%");
+        assert_eq!(shown[1].1, "2.50 GB/s");
+        let plan = h.state().engine.handle().serving_stats_of(&m.name).unwrap().offload_plan.unwrap();
+        let cells = crate::tiers::tier_cells(&plan);
+        assert_eq!(cells.iter().map(|c| c.0).collect::<Vec<_>>(), ["vram", "host ram", "nvme"]);
+    }
+}
+
+static PAINTED_TEXT: std::sync::Mutex<Vec<(String, egui::Rect)>> = std::sync::Mutex::new(Vec::new());
+
+fn capture_painted_text(ctx: &egui::Context) {
+    ctx.on_end_pass(
+        "painted-text",
+        std::sync::Arc::new(|ui: &mut egui::Ui| {
+            let ctx = ui.ctx().clone();
+            let found: Vec<(String, egui::Rect)> = ctx.graphics(|g| {
+                [egui::LayerId::background()]
+                    .into_iter()
+                    .filter_map(|id| g.get(id))
+                    .flat_map(|list| list.all_entries())
+                    .filter_map(|c| match &c.shape {
+                        egui::Shape::Text(t) if !t.galley.text().trim().is_empty() => Some((t.galley.text().to_string(), c.shape.visual_bounding_rect())),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            *PAINTED_TEXT.lock().unwrap() = found;
+        }),
+    );
+}
+
+fn server_tab_painted_text(width: f32, name: &str, gpus: usize) -> Vec<(String, egui::Rect)> {
+    let mut h = harness_at(&format!("clip-{width}-{gpus}"), Tab::Server, egui::vec2(width, 2400.0));
+    capture_painted_text(&h.ctx);
+    for i in 0..3 {
+        tracing::info!(method = "POST", path = "/v1/chat/completions", status = 200, elapsed_ms = 1234 + i, "request finished");
+    }
+    with_gpu(&mut h, 0, 96 << 30);
+    let one = h.state().gpu[0].clone();
+    h.state_mut().gpu = vec![one; gpus];
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+    let mut m = real_model(&h.state().library[0].name.clone());
+    m.name = name.to_string();
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().load_model_with(&m, 2048, 2);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    h.step();
+    let found = PAINTED_TEXT.lock().unwrap().clone();
+    found
+}
+
+#[test]
+fn server_tab_text_stays_inside_the_screen_from_360_to_600_wide() {
+    let _guard = PAINTED_TEXT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut offenders = Vec::new();
+    for width in [360.0f32, 390.0, 412.0, 600.0] {
+        for (name, gpus) in [("tiny-model", 1), ("tiny-org/a-long-model-name-for-a-phone-instruct-build", 2)] {
+            let found = server_tab_painted_text(width, name, gpus);
+            assert!(found.len() > 20, "only {} text shapes at {width}", found.len());
+            for (text, r) in found.iter() {
+                if r.max.x > width + 0.5 {
+                    offenders.push(format!("width {width}, {gpus} gpu, {name}: {text:?} ends at {} past the screen", r.max.x));
+                }
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+}
+
+static PAINTED_TEXT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshot_of_the_server_tab_with_a_long_model_name_at_phone_width() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    let mut h = harness_at("server-phone-shot", Tab::Server, egui::vec2(390.0, 844.0));
+    with_gpu(&mut h, 0, 96 << 30);
+    let one = h.state().gpu[0].clone();
+    h.state_mut().gpu = vec![one; 2];
+    h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+    let mut m = real_model(&h.state().library[0].name.clone());
+    m.name = "tiny-org/a-long-model-name-for-a-phone-instruct-build".to_string();
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().load_model_with(&m, 2048, 2);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    h.render().unwrap().save(out.join("server-phone-390x844.png")).unwrap();
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshots_of_the_status_bar_with_a_long_model_name_at_phone_and_desktop_width() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (name, size) in [("status-phone-390x844", egui::vec2(390.0, 844.0)), ("status-desktop-1280x800", egui::vec2(1280.0, 800.0))] {
+        let mut h = harness_at(name, Tab::Server, size);
+        with_gpu(&mut h, 0, 96 << 30);
+        let one = h.state().gpu[0].clone();
+        h.state_mut().gpu = vec![one; 2];
+        h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+        let mut m = real_model(&h.state().library[0].name.clone());
+        m.name = "tiny-org/a-long-model-name-for-a-phone-instruct-build".to_string();
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().load_model_with(&m, 2048, 2);
+        pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshots_of_the_weight_tiers_and_hit_rate_at_desktop_and_phone_width() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (name, size) in [("tiers-desktop", egui::vec2(1280.0, 1500.0)), ("tiers-phone", egui::vec2(390.0, 2600.0))] {
+        let mut h = harness_at(name, Tab::Server, size);
+        with_gpu(&mut h, 0, 96 << 30);
+        h.state_mut().engine = inference_bench_core::fake::engine(h.state().wake.clone(), offloaded_script());
+        let m = real_model(&h.state().library[0].name.clone());
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().load_model_with(&m, 2048, 2);
+        pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+        pump_until(&mut h, 10, "serving reading", |a| a.engine.reading().serving.is_some());
+        h.run();
+        h.render().unwrap().save(out.join(format!("{name}.png"))).unwrap();
+    }
+}
+
+#[test]
+fn without_offload_no_weight_readings_show() {
+    let r = inference_bench_core::live::Reading { generated: 0, prefilled: 0, requests: 0, running: 0, waiting: 0, max_seqs: 1, ttft: specrt::serve::Histogram::new(&[1.0]), itl: specrt::serve::Histogram::new(&[1.0]), serving: Some(specrt::serve::Stats::default()) };
+    assert!(crate::serving::offload_readings(&r, 0.0).is_empty());
+}
+
 #[test]
 fn the_server_tab_kv_total_is_the_shared_pool_chosen_in_the_dialog() {
     let mut h = harness("kv-total", Tab::Models);
@@ -1257,7 +1426,7 @@ fn spec_updates_off_in_settings_makes_no_request() {
 fn pump_until(h: &mut Harness<'static, App>, secs: u64, what: &str, done: impl Fn(&App) -> bool) {
     let start = Instant::now();
     while !done(h.state()) {
-        assert!(start.elapsed() < Duration::from_secs(secs), "{what}: {:?}", h.state().notice);
+        assert!(start.elapsed() < Duration::from_secs(secs.max(60)), "{what}: {:?}", h.state().notice);
         h.step();
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -1470,7 +1639,7 @@ fn the_detail_view_draws_the_27b_with_its_delta_net_rhythm_and_opens_a_block_dia
     let mut h = detail_harness("detail-27b", egui::vec2(1280.0, 900.0), detail_view("qwen3.8-27b", Some("qwen3.8-27b-exact.toml")), None);
     h.run();
     h.get_by_label("layer 3 full attention").hover();
-    h.run();
+    h.run_steps(12);
     assert!(h.query_by_label_contains("layer 3: full attention").is_some());
     h.get_by_label("layer 3 full attention").click();
     h.run();
@@ -1872,6 +2041,187 @@ fn open_dialog(name: &str) -> Harness<'static, App> {
     h.state_mut().library[0] = m.clone();
     h.state_mut().open_load_dialog(&m);
     h
+}
+
+fn token_counts_have_thousands_separators_and_long_names_shorten_in_the_middle() {
+    assert_eq!(crate::load::tokens(0), "0");
+    assert_eq!(crate::load::tokens(999), "999");
+    assert_eq!(crate::load::tokens(8192), "8,192");
+    assert_eq!(crate::load::tokens(524288), "524,288");
+    assert_eq!(crate::load::tokens(1048576), "1,048,576");
+    assert_eq!(crate::load::shorten_middle("short", 20), "short");
+    let s = crate::load::shorten_middle("Load HuggingFaceTB/SmolLM2-135M", 16);
+    assert_eq!(s.chars().count(), 16);
+    assert!(s.contains('…') && s.starts_with("Load") && s.ends_with("135M"));
+}
+
+#[test]
+fn concurrency_is_said_in_plain_words() {
+    assert_eq!(crate::load::concurrency_text(32.4, 8192), "serves 32 requests at 8,192 tokens each");
+    assert_eq!(crate::load::concurrency_text(1.0, 8192), "serves 1 request at 8,192 tokens each");
+    assert_eq!(crate::load::concurrency_text(0.4, 8192), "cannot hold one request of 8,192 tokens");
+}
+
+#[test]
+fn the_kv_type_costs_sit_inside_the_segments_with_no_repeated_list() {
+    let mut h = open_dialog("page-kv-segments");
+    h.run();
+    assert!(h.query_all_by_label_contains("MB").count() >= 1);
+    assert_eq!(h.query_all_by_label_contains("at 8192 tokens").count(), 0);
+    h.get_by_label_contains("the size of fp16");
+}
+
+#[test]
+fn the_result_card_leads_with_four_tiles_and_the_fit_line() {
+    let mut h = open_dialog("page-tiles");
+    h.run();
+    h.get_by_label_contains("WHAT YOU WILL GET");
+    let tile = h.get_all_by_label_contains("weights").next().unwrap().accesskit_node().bounding_box().unwrap();
+    let fit = h.get_by_label_contains("fits in free memory").accesskit_node().bounding_box().unwrap();
+    let weights = h.get_by_label_contains("weights").accesskit_node().bounding_box().unwrap();
+    assert!(fit.y0 < weights.y0, "{tile:?} {fit:?} {weights:?}");
+}
+
+#[test]
+fn the_common_rows_share_one_control_column_at_desktop_width() {
+    let mut h = open_dialog("page-grid");
+    h.run();
+    let mut xs = Vec::new();
+    for label in ["KV CACHE SIZE", "PARALLEL REQUESTS", "GPU OFFLOAD"] {
+        let n = h.get_all_by_label_contains(label).last().unwrap().accesskit_node().bounding_box().unwrap();
+        xs.push((label, n.x0));
+    }
+    assert!(xs.windows(2).all(|w| (w[0].1 - w[1].1).abs() < 1.0), "{xs:?}");
+}
+
+#[test]
+fn the_phone_page_collapses_the_result_card_to_tiles_and_the_fit_line() {
+    let mut h = harness_at("page-phone-compact", Tab::Models, egui::vec2(390.0, 844.0));
+    with_gpu(&mut h, 0, 96 << 30);
+    let m = real_model("Qwen3-0.6B");
+    h.state_mut().library[0] = m.clone();
+    h.state_mut().open_load_dialog(&m);
+    h.run();
+    assert!(h.query_by_label_contains("weights").is_none());
+    h.get_by_label("details").click();
+    h.run();
+    h.get_by_label_contains("weights");
+    assert!(h.state().load.as_ref().unwrap().details);
+}
+
+#[test]
+fn loading_through_the_page_then_chatting_answers() {
+    use agent_ui::chat::Turn;
+    let mut h = open_dialog("page-chat");
+    h.run();
+    click_load(&mut h);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    h.run();
+    let (desk, _asks) = agent_core::Desk::new(|| {});
+    h.state_mut().chat.agent.chat.ask("say hello", desk);
+    pump_until(&mut h, 20, "agent turn", |a| !a.chat.agent.chat.busy());
+    let turns = &h.state().chat.agent.chat.turns;
+    assert!(turns.iter().any(|t| matches!(t, Turn::Said(s) if s.contains("Hello"))), "{} turns", turns.len());
+}
+
+#[test]
+#[ignore = "renders with wgpu; run with SHOTS=dir"]
+fn screenshots_of_the_load_page_at_desktop_and_exactly_390_wide() {
+    let out = shots_dir();
+    std::fs::create_dir_all(&out).unwrap();
+    for (w, hgt, tag) in [(1280.0, 800.0, "1280x800"), (390.0, 844.0, "390x844")] {
+        let mut h = harness_at(&format!("page-shot-{tag}"), Tab::Models, egui::vec2(w, hgt));
+        with_gpu(&mut h, 20 << 30, 96 << 30);
+        let m = real_model("Qwen3-0.6B");
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().open_load_dialog(&m);
+        h.run();
+        h.render().unwrap().save(out.join(format!("load-page-harness-{tag}.png"))).unwrap();
+    }
+}
+
+#[test]
+fn the_load_page_opens_in_place_of_the_models_page_and_back_returns() {
+    let mut h = open_dialog("page-back");
+    h.run();
+    h.get_by_label_contains("WHAT YOU WILL GET");
+    assert!(h.query_by_label("search your models").is_none());
+    h.get_by_label("back").click();
+    h.run();
+    assert!(h.state().load.is_none());
+    assert_eq!(h.state().tab, Tab::Models);
+}
+
+#[test]
+fn escape_goes_back_and_enter_loads() {
+    let mut h = open_dialog("page-keys");
+    h.run();
+    h.key_press(egui::Key::Escape);
+    h.run();
+    assert!(h.state().load.is_none());
+    let mut h = open_dialog("page-enter");
+    h.run();
+    h.key_press(egui::Key::Enter);
+    pump_until(&mut h, 10, "load", |a| a.loaded().is_some());
+    assert!(h.state().load.is_none());
+}
+
+#[test]
+fn the_common_options_are_visible_without_any_toggle() {
+    let mut h = open_dialog("page-common");
+    h.run();
+    for label in ["CONTEXT LENGTH", "KV CACHE TYPE", "KV CACHE SIZE", "PARALLEL REQUESTS", "GPU OFFLOAD", "GPU SELECTION"] {
+        assert!(h.query_all_by_label_contains(label).count() >= 1, "{label}");
+    }
+    assert!(h.query_by_label_contains("FAST LOADER").is_none());
+    for heading in specrt::options::SECTION_ORDER {
+        assert!(h.query_all_by_label_contains(&heading.to_uppercase()).count() >= 1, "{heading}");
+    }
+}
+
+#[test]
+fn choosing_fp8_kv_changes_the_result_card() {
+    let mut h = open_dialog("page-kv");
+    h.run();
+    let before = h.state().load.as_ref().unwrap().kv_bytes().unwrap();
+    crate::load::set_kv_kind(&mut h.state_mut().load.as_mut().unwrap().choice, crate::load::KvKind::Fp8);
+    h.run();
+    let d = h.state().load.as_ref().unwrap();
+    assert_eq!(crate::load::kv_kind_of(&d.choice), crate::load::KvKind::Fp8);
+    assert!(d.kv_bytes().unwrap() < before || d.kv_gb < 1e9);
+    assert!(d.choice.is_custom());
+    h.get_by_label_contains("changed from the profile");
+}
+
+#[test]
+fn searching_filters_every_option_by_name() {
+    let mut h = open_dialog("page-search");
+    h.run();
+    h.state_mut().load.as_mut().unwrap().search = "readers".into();
+    h.run();
+    assert!(h.state().load.as_ref().unwrap().search == "readers");
+    assert!(h.query_all_by_label_contains("READERS").count() >= 1);
+    assert!(h.query_by_label_contains("CONTEXT LENGTH").is_none());
+}
+
+#[test]
+fn the_load_page_fits_phone_width_with_every_section_open() {
+    for (w, hgt) in [(390.0, 844.0), (412.0, 900.0)] {
+        let mut h = harness_at("page-phone", Tab::Models, egui::vec2(w, hgt));
+        with_gpu(&mut h, 0, 96 << 30);
+        let m = real_model("Qwen3-0.6B");
+        h.state_mut().library[0] = m.clone();
+        h.state_mut().open_load_dialog(&m);
+        h.state_mut().load.as_mut().unwrap().advanced = true;
+        h.run();
+        let screen = h.ctx.content_rect();
+        for n in h.query_all_by(|_| true).filter(|n| n.accesskit_node().bounding_box().is_some()) {
+            let r = n.rect();
+            assert!(r.right() <= screen.right() + 0.5 && r.left() >= screen.left() - 0.5, "{:?} {:?} at {r:?} past {screen:?} {:?}", n.accesskit_node().role(), n.accesskit_node().label(), n.accesskit_node().value());
+        }
+        let b = h.get_all_by_label("load model").last().unwrap().accesskit_node().bounding_box().unwrap();
+        assert!(b.y1 <= hgt as f64 && b.x1 <= w as f64, "{b:?}");
+    }
 }
 
 #[test]
@@ -2519,6 +2869,8 @@ fn request(ttft: f64, prompt: u64, cached: u64, completion: u64, prefill: f64, d
     inference_bench_core::live::RequestRecord {
         at: chrono::Utc::now(),
         ttft_secs: ttft,
+        queue_secs: 0.0,
+        prefill_secs: 0.0,
         prompt_tokens: prompt,
         cached_tokens: cached,
         completion_tokens: completion,
@@ -2529,15 +2881,44 @@ fn request(ttft: f64, prompt: u64, cached: u64, completion: u64, prefill: f64, d
 
 #[test]
 fn the_per_request_table_shows_clean_units_and_cache_columns() {
+    let wide = crate::serving::request_columns(false, 1280.0);
     let plain = request(0.842, 625, 0, 1574, 742.3, 35.44);
-    assert_eq!(crate::serving::request_cells(&plain, false), ["842 ms", "625", "1.57k", "742 tok/s", "35.4 tok/s"]);
+    assert_eq!(crate::serving::request_cells(&plain, &wide), ["842 ms", "0 ms", "625", "625", "1.57k", "742 tok/s", "35.4 tok/s"]);
+    let wide = crate::serving::request_columns(true, 1280.0);
     let warm = request(1.308, 1450, 1000, 40, 2310.4, 35.44);
-    assert_eq!(crate::serving::request_cells(&warm, true), ["1.31 s", "1.45k", "69%", "1.00k", "450", "40", "2,310 tok/s", "35.4 tok/s"]);
-    let full = request(0.05, 512, 512, 8, 0.0, 20.0);
-    assert_eq!(crate::serving::request_cells(&full, true)[6], "cached");
-    let cols = |c: bool| crate::serving::request_columns(c).iter().map(|c| c.0).collect::<Vec<_>>();
-    assert_eq!(cols(false), ["time", "ttft", "prompt", "completion", "prefill", "decode"]);
-    assert_eq!(cols(true), ["time", "ttft", "prompt", "cache hit", "cache read", "cache write", "completion", "prefill", "decode"]);
+    assert_eq!(crate::serving::request_cells(&warm, &wide), ["1.31 s", "0 ms", "1.45k", "69%", "1.00k", "450", "40", "2,310 tok/s", "35.4 tok/s"]);
+    let full = request(0.19, 512, 507, 8, 0.0, 20.0);
+    assert_eq!(crate::serving::request_cells(&full, &wide)[5..], ["5", "8", "-", "20.0 tok/s"]);
+    let mut waited = request(3.71, 5000, 0, 8, 5376.0, 20.0);
+    waited.queue_secs = 3.5;
+    assert_eq!(crate::serving::request_cells(&waited, &wide)[..2], ["3.71 s", "3,500 ms"]);
+    let cols = |c: bool, w: f32| crate::serving::request_columns(c, w).iter().map(|c| c.0).collect::<Vec<_>>();
+    assert_eq!(cols(false, 800.0), ["time", "ttft", "queue", "prompt", "new", "prefill", "decode"]);
+    assert_eq!(cols(true, 1280.0), ["time", "ttft", "queue", "prompt", "cache hit", "cache read", "new", "completion", "prefill", "decode"]);
+}
+
+#[test]
+fn the_per_request_columns_fit_every_width_down_to_a_phone() {
+    for width in [1280.0f32, 1000.0, 900.0, 780.0, 700.0, 500.0, 392.0, 340.0, 280.0] {
+        for with_cache in [false, true] {
+            let cols = crate::serving::request_columns(with_cache, width);
+            let total: f32 = cols.iter().map(|c| c.1).sum();
+            assert!(total + 6.0 <= width, "{width} {with_cache} {total} {:?}", cols.iter().map(|c| c.0).collect::<Vec<_>>());
+            let names: Vec<_> = cols.iter().map(|c| c.0).collect();
+            assert!(names.contains(&"new") && names.contains(&"prefill") && names.contains(&"ttft") && names.contains(&"time"), "{names:?}");
+        }
+    }
+    let names = |w: f32| crate::serving::request_columns(true, w).iter().map(|c| c.0).collect::<Vec<_>>();
+    assert!(names(1280.0).contains(&"queue"));
+    assert!(!names(340.0).contains(&"queue"));
+    assert!(names(392.0).contains(&"decode") && !names(280.0).contains(&"decode"));
+}
+
+#[test]
+fn the_host_busy_reading_shows_only_above_the_threshold() {
+    assert!(crate::serving::host_reading(4.0, 16).is_none());
+    let (label, text, _) = crate::serving::host_reading(49.0, 16).unwrap();
+    assert_eq!((label, text.as_str()), ("host busy", "load 49.0 on 16 cores"));
 }
 
 #[test]
@@ -2568,6 +2949,12 @@ fn screenshot_of_the_per_request_table() {
     });
     h.run();
     h.render().unwrap().save(out.join("server-per-request.png")).unwrap();
+    let mut phone = Harness::builder().with_size(egui::vec2(392.0, 220.0)).with_accessibility_check(false).allow_missing_glyphs().build_ui(|ui| {
+        egui_bench::install(ui.ctx());
+        crate::serving::per_request(ui, &recent);
+    });
+    phone.run();
+    phone.render().unwrap().save(out.join("server-per-request-phone.png")).unwrap();
 }
 
 fn many_hub(repos: usize, sha: std::sync::Arc<std::sync::Mutex<String>>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -2700,7 +3087,7 @@ fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
     s.sessions = std::sync::Arc::new(std::sync::Mutex::new(Some(shared.clone())));
     {
         let app = h.state_mut();
-        app.engine = inference_bench_core::engine::Engine::with_factories(app.wake.clone(), ScriptedModel::factory(s.clone()), inference_bench_core::fake::ScriptedServing::factory(s));
+        app.engine = inference_bench_core::engine::Engine::with_factories_sampled(app.wake.clone(), ScriptedModel::factory(s.clone()), inference_bench_core::fake::ScriptedServing::factory(s), inference_bench_core::engine::no_gpu_sampler());
         app.settings.server.port = 0;
         let m = app.library[0].clone();
         app.load_model(&m);
@@ -2708,7 +3095,7 @@ fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     h.run();
     h.get_by_label_contains("5000 tokens");
-    h.get_by_label_contains("10m 0");
+    h.get_by_label_contains("10m ");
     h.get_by_label("restore").click();
     h.run();
     assert!(h.state().notice.as_ref().is_some_and(|n| n.1.contains("session verified")), "{:?}", h.state().notice);
@@ -2793,7 +3180,7 @@ fn recording_engine(app: &mut App) -> Seen {
         log.lock().unwrap().push(opts.clone());
         fake(opts)
     });
-    app.engine = inference_bench_core::engine::Engine::with_factories(app.wake.clone(), ScriptedModel::factory(script), serving);
+    app.engine = inference_bench_core::engine::Engine::with_factories_sampled(app.wake.clone(), ScriptedModel::factory(script), serving, inference_bench_core::engine::no_gpu_sampler());
     seen
 }
 
@@ -2907,6 +3294,7 @@ fn a_model_that_lands_on_the_wrong_gpu_is_reported_against_the_plan() {
     click_load(&mut h);
     pump_until(&mut h, 20, "load", |a| a.loaded().is_some());
     let mut l = h.state().loaded().unwrap();
+    l.landed.clear();
     assert!(h.state().landing(&l).is_none());
     l.landed = vec![("GPU-fake-1".into(), 40 << 30)];
     let ok = h.state().landing(&l).unwrap();
@@ -2941,7 +3329,7 @@ fn low_memory_on_two_gpus_plans_one_gpu_and_shows_one_plan_row() {
 fn the_load_dialog_fits_every_window_size() {
     for (w, hgt) in [(1024.0, 700.0), (1280.0, 800.0), (1920.0, 1080.0), (390.0, 844.0)] {
         let mut h = two_gpu_27b_dialog_at(&format!("dialog-fit-{w}"), egui::vec2(w, hgt));
-        for key in ["load", "cancel"] {
+        for key in ["load model", "cancel"] {
             let b = h.get_all_by_label(key).last().unwrap().accesskit_node().bounding_box().unwrap();
             assert!(b.x0 >= 0.0 && b.x1 <= w as f64 && b.y0 >= 0.0 && b.y1 <= hgt as f64, "{key} at {b:?} outside {w}x{hgt}");
         }

@@ -280,6 +280,16 @@ enum Cmd {
         spec: String,
         #[arg(long, help = "sm_120, sm_80, wgpu or wgpu-nosubgroups; the live CUDA device when omitted")]
         target: Option<String>,
+        #[arg(long, help = "Print bytes read and written and launches per op for each layer kind instead of the kernels")]
+        plan: bool,
+        #[arg(long, help = "With --plan: print the fusion groups the cost model and legality checks pick, and why each other pair stays apart (dry run)")]
+        fusion: bool,
+        #[arg(long, default_value_t = 1, help = "Tokens in the step the plan report counts")]
+        tokens: usize,
+        #[arg(long, help = "Context per sequence the attention reads; the token count when omitted")]
+        context: Option<usize>,
+        #[arg(long, default_value = "decode", help = "prefill, decode or verify")]
+        phase: String,
     },
     #[command(about = "Compile and cache the kernels of a spec without loading weights")]
     Warmup {
@@ -420,13 +430,31 @@ fn probe_links(placement: &mut inference_bench_core::specrt_placement::Placement
     placement.apply_network_rtts(&rtts);
 }
 
-fn kernels_command(data: &Path, spec: &str, target: Option<&str>) -> Result<()> {
+fn kernels_command(data: &Path, spec: &str, target: Option<&str>, plan: Option<(&str, usize, Option<usize>)>, fusion: bool) -> Result<()> {
     let path = resolve_spec_names(data, spec);
     let spec = specrt::spec::Spec::load(Path::new(&path))?;
     let target = match target {
         Some(name) => kir::Target::named(name).with_context(|| format!("target {name:?} is not sm_120, sm_80, wgpu or wgpu-nosubgroups"))?,
+        None if plan.is_some() => specrt::codegen::default_target(),
         None => specrt::codegen::live_target()?,
     };
+    if let Some((phase, tokens, context)) = plan {
+        let phase = match phase {
+            "prefill" => specrt::plan::Phase::Prefill,
+            "decode" => specrt::plan::Phase::Decode,
+            "verify" => specrt::plan::Phase::Verify,
+            other => bail!("phase {other:?} is not prefill, decode or verify"),
+        };
+        let count = specrt::signature::Count::new(phase, tokens, context.unwrap_or(tokens));
+        if fusion {
+            let built = specrt::plan::Plan::build(&spec, phase, target.language == kir::Language::Cuda);
+            let costs = specrt::fusion::Costs::for_target(&target);
+            print!("{}", specrt::fusion::fusion_report(&spec, &built, count, &target, &costs)?.render());
+            return Ok(());
+        }
+        print!("{}", specrt::signature::plan_report(&spec, phase, count, &target)?.render());
+        return Ok(());
+    }
     print!("{}", specrt::codegen::kernels_report(&spec, &target)?);
     Ok(())
 }
@@ -687,7 +715,12 @@ fn main() -> Result<()> {
         }
         Cmd::Spec { model, out, expect_act_quant } => spec_command(model, out.as_deref(), expect_act_quant.as_deref())?,
         Cmd::Warmup { spec, max_ctx, slots } => warmup_command(&data, spec, *max_ctx, *slots)?,
-        Cmd::Kernels { spec, target } => kernels_command(&data, spec, target.as_deref())?,
+        Cmd::Kernels { spec, target, plan, fusion, tokens, context, phase } => {
+            if *fusion && !*plan {
+                bail!("--fusion needs --plan");
+            }
+            kernels_command(&data, spec, target.as_deref(), plan.then_some((phase.as_str(), *tokens, *context)), *fusion)?
+        }
         Cmd::Plan { spec, config, context, slots, objective, probe } => plan_command(&data, spec, config, *context, *slots, objective.as_deref(), *probe)?,
     }
     Ok(())

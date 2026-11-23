@@ -147,6 +147,10 @@ Checked on the Spark with `cargo test --release -p inference-bench-server --test
 
 The server tab samples the engine once a second off the UI thread (`inference_bench_core::live`, 15 minutes kept) and shows requests per minute, running and waiting sequences, KV use, prefix hit rate, draft acceptance, preemptions, charts of generation and prompt tok/s, TTFT and inter-token p50 and p95, running sequences and KV, and a per-request table. Measured on Qwen3-0.6B (RTX PRO 6000, 4 concurrent requests of 400 tokens): 843 tok/s aggregate at 1 sequence, 2124 tok/s at 4 (`docs/gui/server-live.png`).
 
+The per-request table splits a request's time into `queue` (arrival to its first prefill step, hidden below 700 px width), `prefill` (first prefill step to the end of the last prompt chunk, measured by the scheduler) and `ttft` (arrival to first token). `new` is the uncached prompt tokens. The prefill rate is new tokens over measured prefill time and is shown only when `new` is at least 256; below that it is a dash, because a few tokens over one scheduler step is step latency, not speed. The rate is never computed from TTFT.
+
+On a saturated host (load average above the core count) the scheduler thread is starved, so decode and TTFT degrade and the table cannot tell. The serving strip adds a warning `host busy` reading with the 1 minute load from `/proc/loadavg` when it is above 0.9 x cores.
+
 ## Logging
 
 All crates use `tracing`. Flags (global on `inference-bench` and `inference-bench-server`):

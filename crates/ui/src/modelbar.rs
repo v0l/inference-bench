@@ -77,7 +77,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mu
     let loaded = app.loaded();
     let loading = app.loading.clone();
     let failed = app.chat.load_error.is_some().then(|| app.chat.attempted.clone()).filter(|m| !m.is_empty());
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         match (&loading, &loaded, &failed) {
             (Some(name), _, _) => {
@@ -117,12 +117,22 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui, busy: bool, right: impl FnOnce(&mu
                 _ => app.unload_model(&loaded.as_ref().map(|l| l.display.clone()).unwrap_or_default()),
             }
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            right(ui);
-            if let Some((used, total)) = inference_bench_core::gpu::used_total(&app.gpu) {
-                let legend = if app.gpu.len() > 1 { format!("vram x{}", app.gpu.len()) } else { "vram".into() };
-                Line::new().legend(&legend).measured(format!("{} / {}", human_size(used), human_size(total))).size(11.0).show(ui);
-            }
+        let vram = inference_bench_core::gpu::used_total(&app.gpu).map(|(used, total)| {
+            let legend = if app.gpu.len() > 1 { format!("vram x{}", app.gpu.len()) } else { "vram".into() };
+            (legend, format!("{} / {}", human_size(used), human_size(total)))
         });
+        if ui.available_width() > 400.0 {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                right(ui);
+                if let Some((legend, text)) = &vram {
+                    Line::new().legend(legend).measured(text).size(11.0).show(ui);
+                }
+            });
+        } else {
+            right(ui);
+            if let Some((legend, text)) = &vram {
+                Line::new().legend(legend).measured(text).size(11.0).show(ui);
+            }
+        }
     });
 }

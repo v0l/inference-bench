@@ -21,7 +21,7 @@ fn fixture(name: &str) -> Patches {
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir().join(format!("{name}.json"))).unwrap()).unwrap();
     let g = meta["grid"].as_array().unwrap();
     let grid = [g[0].as_u64().unwrap() as usize, g[1].as_u64().unwrap() as usize, g[2].as_u64().unwrap() as usize];
-    Patches { grid, data: floats(dir().join(format!("{name}.f32"))) }
+    Patches { grid, data: floats(dir().join(format!("{name}.f32"))), layout: [0, 0] }
 }
 
 fn compare(name: &str, got: &[f32], want: &[f32]) -> (f32, f32) {

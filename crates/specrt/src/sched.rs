@@ -143,6 +143,9 @@ pub trait Executor {
     fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
         None
     }
+    fn offload_plan(&self) -> Option<crate::offload::OffloadPlan> {
+        None
+    }
     fn max_ctx(&self) -> usize;
     fn slots(&self) -> usize;
     fn kv_blocks(&self) -> usize;
@@ -258,6 +261,14 @@ impl GpuExecutor {
 }
 
 impl Executor for GpuExecutor {
+    fn offload_stats(&self) -> Option<crate::offload::OffloadStats> {
+        self.rt.offload_stats()
+    }
+
+    fn offload_plan(&self) -> Option<crate::offload::OffloadPlan> {
+        self.rt.offload_plan().cloned()
+    }
+
     fn max_ctx(&self) -> usize {
         self.rt.max_ctx()
     }
@@ -585,6 +596,7 @@ pub enum Finish {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Started { id: SeqId, queued: Duration },
+    Prefilled { id: SeqId, prefill: Duration },
     Token { id: SeqId, token: u32 },
     Preempted { id: SeqId },
     Finished { id: SeqId, finish: Finish, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize },
@@ -614,6 +626,7 @@ struct Seq {
     last_token: Instant,
     admitted: u64,
     started: bool,
+    began: Option<Instant>,
     root: Hash,
     cached: usize,
     keys: Vec<u32>,
@@ -955,6 +968,10 @@ impl<E: Executor> Scheduler<E> {
         self.exec.offload_stats()
     }
 
+    pub fn offload_plan(&self) -> Option<crate::offload::OffloadPlan> {
+        self.exec.offload_plan()
+    }
+
     pub fn state_refusals(&self) -> u64 {
         self.state_refusals
     }
@@ -1053,6 +1070,7 @@ impl<E: Executor> Scheduler<E> {
             last_token: Instant::now(),
             admitted: 0,
             started: false,
+            began: None,
             root,
             cached: 0,
             keys,
@@ -1539,6 +1557,7 @@ impl<E: Executor> Scheduler<E> {
                 let queued = s.arrived.elapsed();
                 let id = s.id;
                 self.running[i].started = true;
+                self.running[i].began = Some(Instant::now());
                 events.push(Event::Started { id, queued });
             }
             while left > 0 {
@@ -1582,6 +1601,9 @@ impl<E: Executor> Scheduler<E> {
                 s.computed += n;
                 left -= n;
                 report.prefill_tokens += n;
+                if last && sample.is_some() && let Some(began) = s.began {
+                    events.push(Event::Prefilled { id: s.id, prefill: began.elapsed() });
+                }
                 if let Some(t) = t
                     && accept(s, t, self.exec.max_ctx(), events)
                 {
@@ -2061,6 +2083,27 @@ mod tests {
     fn is_json_object(tokens: &[u32]) -> bool {
         let bytes: Vec<u8> = tokens.iter().filter(|&&t| (1..=256).contains(&t)).map(|&t| (t - 1) as u8).collect();
         serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|v| v.is_object())
+    }
+
+    #[test]
+    fn each_request_reports_one_prefill_time_after_it_started() {
+        let mut s = Scheduler::new(Fake::new(4096, 4, 256, 64), Config { max_num_seqs: 4, ..Config::default() });
+        let ids: Vec<SeqId> = (0..2).map(|i| s.submit(request(20 + i, 300, i as u32)).unwrap()).collect();
+        let (_, events, _) = drain(&mut s);
+        for id in ids {
+            let at = |f: fn(&Event) -> bool| events.iter().position(|e| f(e) && event_id(e) == id);
+            let started = at(|e| matches!(e, Event::Started { .. })).unwrap();
+            let prefilled = at(|e| matches!(e, Event::Prefilled { .. })).unwrap();
+            let first = at(|e| matches!(e, Event::Token { .. })).unwrap();
+            assert!(started < prefilled && prefilled < first);
+            assert_eq!(events.iter().filter(|e| matches!(e, Event::Prefilled { .. }) && event_id(e) == id).count(), 1);
+        }
+    }
+
+    fn event_id(e: &Event) -> SeqId {
+        match e {
+            Event::Started { id, .. } | Event::Prefilled { id, .. } | Event::Token { id, .. } | Event::Preempted { id } | Event::Finished { id, .. } | Event::Logprob { id, .. } => *id,
+        }
     }
 
     #[test]

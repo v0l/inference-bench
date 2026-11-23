@@ -764,6 +764,14 @@ fn park_resume_is_bit_identical(dir: &str) {
     for at in [0, 3, 7] {
         assert_eq!(parked_run(&s, Some(at)), straight, "park after {at} decode steps");
     }
+    let swap_dir = std::env::temp_dir().join(format!("specrt-swap-{dir}-{}", std::process::id()));
+    let mut on_disk = s.clone();
+    on_disk.runtime.offload.nvme_path = Some(swap_dir.to_string_lossy().into_owned());
+    for at in [0, 3, 7] {
+        assert_eq!(parked_run(&on_disk, Some(at)), straight, "disk swap after {at} decode steps");
+    }
+    assert_eq!(std::fs::read_dir(&swap_dir).unwrap().count(), 0, "swap files are removed once resumed");
+    let _ = std::fs::remove_dir_all(&swap_dir);
 }
 
 #[test]

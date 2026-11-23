@@ -1,0 +1,1 @@
+{"do_normalize": true, "do_resize": true, "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5], "size": {"height": 56, "width": 56}, "max_patches": 4, "resize_to_max_canvas": false}

@@ -1076,10 +1076,23 @@ pub fn unread_hf_keys(json: &str) -> Vec<(String, String)> {
     out
 }
 
+fn uniform_size<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(match v {
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|n| n as usize),
+        Some(serde_json::Value::Array(a)) => {
+            let first = a.first().and_then(|x| x.as_u64());
+            first.filter(|f| a.iter().all(|x| x.as_u64() == Some(*f))).map(|n| n as usize)
+        }
+        _ => None,
+    })
+}
+
 #[derive(Deserialize)]
 struct HfConfig {
     model_type: String,
     hidden_size: usize,
+    #[serde(default, deserialize_with = "uniform_size")]
     intermediate_size: Option<usize>,
     moe_intermediate_size: Option<usize>,
     shared_expert_intermediate_size: Option<usize>,
@@ -2209,7 +2222,6 @@ impl Spec {
             }
         }
         ensure!(launches > 0, "[[attention.node]] declares no kernel node");
-        ensure!(self.speculative().is_none(), "[[attention.node]] cannot be combined with [mtp] yet");
         Ok(())
     }
 

@@ -307,7 +307,7 @@ fn media_assets(spec: &Spec, tokenizer: &Tokenizer) -> Result<Option<crate::visi
     use crate::vision::{MediaAssets, MediaTokens, Preprocessor};
     let Some(vision) = &spec.vision else { return Ok(None) };
     let read = |f: &str| find_in_snapshot(&spec.repo, f).ok().and_then(|p| std::fs::read_to_string(p).ok());
-    if vision.config.pooled() {
+    if vision.config.tile_grid() {
         let Some(image) = read("preprocessor_config.json") else { return Ok(None) };
         let text = |id: u32| tokenizer.id_to_token(id).with_context(|| format!("no token {id}"));
         let config = crate::vision::TileConfig::from_json(&image)?;
@@ -320,8 +320,12 @@ fn media_assets(spec: &Spec, tokenizer: &Tokenizer) -> Result<Option<crate::visi
             placeholder: vision.config.placeholder.clone(),
             wrap: vision.config.wrap.clone(),
             tile_tokens: vision.config.tokens_per_tile(),
+            grid: match vision.config.grid_tokens.as_slice() {
+                [x, y, g] => Some(crate::vision::GridTokens { tile_x: x.clone(), tile_y: y.clone(), global: g.clone() }),
+                _ => None,
+            },
         };
-        let tiles = crate::vision::TileAssets { config, patch: vision.config.patch_size, pan_and_scan };
+        let tiles = crate::vision::TileAssets { config, patch: vision.config.patch_size, pan_and_scan, canvas: vision.config.tiled() };
         return Ok(Some(MediaAssets { image: Preprocessor::unused(), video: Preprocessor::unused(), tokens, ids: vision.tokens.clone(), tiles: Some(tiles) }));
     }
     let (Some(image), Some(video)) = (read("preprocessor_config.json"), read("video_preprocessor_config.json")) else { return Ok(None) };

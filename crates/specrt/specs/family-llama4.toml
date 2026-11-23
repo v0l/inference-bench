@@ -86,4 +86,16 @@ shared_gate = false
 split_activations = true
 
 [vision]
-ignore = true
+tiled = true
+placeholder = "<|image|>"
+
+[vision.grid_tokens]
+tile_x = "<|tile_x_separator|>"
+tile_y = "<|tile_y_separator|>"
+global = "<|image|>"
+
+[vision.token_keys]
+image = "image_token_index"
+video = ""
+start = "boi_token_index"
+end = "eoi_token_index"

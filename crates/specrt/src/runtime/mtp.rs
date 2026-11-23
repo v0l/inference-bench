@@ -51,7 +51,7 @@ impl DeviceMtp {
                 kv: spec.attention_layers() as i32,
                 window: 0,
                 nope: false,
-                extra: Default::default(),
+                extra: a.extra.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,
             }),
             gate_up: DeviceMatrix::upload(stream, &w.layer.gate_up)?,
             down: DeviceMatrix::upload(stream, &w.layer.down)?,
@@ -318,9 +318,10 @@ impl Runtime {
         Ok(())
     }
 
-    fn mtp_run<'a>(&'a self, n: usize, qlen: usize, args: MtpArgs<'a>, ops: &[crate::plan::Op]) -> Result<()> {
+    fn mtp_run<'a>(&'a self, n: usize, qlen: usize, args: MtpArgs<'a>, ops: &[crate::plan::Op], contiguous: bool) -> Result<()> {
         let m = self.mtp();
-        let run = super::exec::Run { n, tokens: &m.vb.tokens, logits: &m.logits, rows: 0..n, bb: Some(&m.vb), start: None, qlen, mtp: Some(args) };
+        let bb = if contiguous { None } else { Some(&m.vb) };
+        let run = super::exec::Run { n, tokens: &m.vb.tokens, logits: &m.logits, rows: 0..n, bb, start: None, qlen, mtp: Some(args) };
         for op in ops {
             self.run_mtp_node(op, &run)?;
         }
@@ -331,8 +332,8 @@ impl Runtime {
         let iota = self.mtp().iota.as_view();
         let args = MtpArgs { tokens, hidx, xsrc, pre, src: &iota, col: 0, slots: &iota };
         match attn {
-            Attn::Contiguous => self.mtp_run(n, 1, args, &self.plans.prefill.mtp),
-            Attn::Rows(qlen) => self.mtp_run(n, qlen, args, &self.plans.decode.mtp),
+            Attn::Contiguous => self.mtp_run(n, 1, args, &self.plans.prefill.mtp, true),
+            Attn::Rows(qlen) => self.mtp_run(n, qlen, args, &self.plans.decode.mtp, false),
         }
     }
 
@@ -340,7 +341,7 @@ impl Runtime {
         let m = self.mtp();
         let iota = m.iota.as_view();
         let args = MtpArgs { tokens: &iota, hidx: &iota, xsrc: &m.vx, pre: &self.norm, src, col, slots };
-        self.mtp_run(n, 1, args, &self.plans.decode.mtp_head)
+        self.mtp_run(n, 1, args, &self.plans.decode.mtp_head, false)
     }
 
     pub(super) fn mtp_logits(&self) -> &CudaSlice<f32> {

@@ -451,3 +451,89 @@ fn glm_speculative_greedy_equals_plain_greedy_and_reports_acceptance() {
     let stats = rt.spec_stats();
     eprintln!("glm speculation: {} steps, {} of {} drafts accepted", stats.steps, stats.accepted, stats.drafted);
 }
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn sinks_scan_scalar_versus_tile_speed() {
+    let mut spec = spec(SINKS);
+    spec.mlp.act_quant = specrt::spec::ActQuant::None;
+    spec.mlp.up_act_planes = 1;
+    spec.mlp.down_act_planes = 1;
+    let vocab = spec.dims.vocab as u32;
+    let mut rt = Runtime::load_batched(&spec, 2304, 1).unwrap();
+    for len in [512usize, 2048] {
+        let prompt: Vec<u32> = (0..len as u32).map(|i| i.wrapping_mul(2654435761) % vocab).collect();
+        let mut time = |tile: bool| {
+            rt.set_scan_tile(tile);
+            let g = rt.generate_batch(std::slice::from_ref(&prompt), 64).unwrap();
+            (g.prefill_secs * 1e3, g.decode_secs * 1e3)
+        };
+        let (mut sa, mut sb, mut sc) = ((0.0, 0.0), (0.0, 0.0), (0.0, 0.0));
+        time(false);
+        time(true);
+        for _ in 0..5 {
+            let (a, b, c) = (time(false), time(true), time(false));
+            sa = (sa.0 + a.0, sa.1 + a.1);
+            sb = (sb.0 + b.0, sb.1 + b.1);
+            sc = (sc.0 + c.0, sc.1 + c.1);
+        }
+        let n = 5.0;
+        eprintln!(
+            "len {len}: scalar prefill {:.2} ms decode {:.2} ms | tile prefill {:.2} ms decode {:.2} ms | scalar again prefill {:.2} ms decode {:.2} ms | A/A prefill {:.3} decode {:.3} | tile/scalar prefill {:.3} decode {:.3}",
+            sa.0 / n, sa.1 / n, sb.0 / n, sb.1 / n, sc.0 / n, sc.1 / n, sc.0 / sa.0, sc.1 / sa.1, sb.0 / sa.0, sb.1 / sa.1
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn split_tile_decode_over_a_long_context_matches_the_scalar_scan() {
+    for name in [SINKS, CHUNKED] {
+        let mut spec = spec(name);
+        spec.mlp.act_quant = specrt::spec::ActQuant::None;
+        spec.mlp.up_act_planes = 1;
+        spec.mlp.down_act_planes = 1;
+        let vocab = spec.dims.vocab as u32;
+        let mut rt = Runtime::load_batched(&spec, 1024, 2).unwrap();
+        let prompts: Vec<Vec<u32>> = (0..2u32).map(|s| (0..700u32).map(|i| (i + s).wrapping_mul(2654435761) % vocab).collect()).collect();
+        rt.set_scan_tile(false);
+        let scalar = rt.generate_batch(&prompts, 24).unwrap();
+        rt.set_scan_tile(true);
+        let tile = rt.generate_batch(&prompts, 24).unwrap();
+        assert_eq!(tile.tokens, scalar.tokens, "{name}");
+    }
+}
+
+fn decode_through_tile_scan(name: &str, batch: usize) {
+    let (tokens, greedy, _, _) = reference(name);
+    let mut spec = spec(name);
+    spec.mlp.act_quant = specrt::spec::ActQuant::None;
+    spec.mlp.up_act_planes = 1;
+    spec.mlp.down_act_planes = 1;
+    assert!(tokens.len() > 16, "the prompt crosses the first KV page");
+    let a = &spec.attention;
+    assert!(a.heads / a.kv_heads <= 16 && !spec.runtime.kv_dtype.is_fp8());
+    let mut rt = Runtime::load_batched(&spec, 256, batch).unwrap();
+    let prompts = vec![tokens.clone(); batch];
+    let got = rt.generate_batch(&prompts, greedy.len()).unwrap();
+    for (i, g) in got.tokens.iter().enumerate() {
+        assert_eq!(*g, greedy, "{name} batch {batch} seq {i}");
+    }
+    let [prefill, decode, scalar] = rt.scan_launches();
+    eprintln!("{name} batch {batch} tile prefill {prefill} tile decode {decode} scalar {scalar}");
+    assert!(prefill > 0 && decode > 0 && scalar == 0, "{name}: prefill {prefill} decode {decode} scalar {scalar}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn sinks_tile_decode_matches_transformers_at_batch_1_and_3() {
+    decode_through_tile_scan(SINKS, 1);
+    decode_through_tile_scan(SINKS, 3);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_variants.py output in SPECRT_REF_DIR"]
+fn chunked_tile_decode_matches_transformers_at_batch_1_and_3() {
+    decode_through_tile_scan(CHUNKED, 1);
+    decode_through_tile_scan(CHUNKED, 3);
+}

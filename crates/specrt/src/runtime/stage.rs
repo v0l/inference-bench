@@ -62,6 +62,38 @@ impl Runtime {
         Ok(())
     }
 
+    pub fn hidden_capacity_bytes(&self) -> usize {
+        4 * self.pre.x.len()
+    }
+
+    pub fn export_hidden_device(&self, rows: usize, dst: u64) -> Result<()> {
+        use cudarc::driver::DevicePtr;
+        let bytes = rows * self.hidden_row_bytes();
+        ensure!(rows > 0 && bytes <= self.hidden_capacity_bytes(), "hidden state of {rows} rows does not fit the stage");
+        self.ctx.bind_to_thread()?;
+        self.stream.synchronize()?;
+        {
+            let (src, _guard) = self.pre.x.device_ptr(&self.stream);
+            unsafe { cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.stream.cu_stream())? };
+        }
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    pub fn import_hidden_device(&mut self, rows: usize, src: u64) -> Result<()> {
+        use cudarc::driver::DevicePtrMut;
+        let bytes = rows * self.hidden_row_bytes();
+        ensure!(rows > 0 && bytes <= self.hidden_capacity_bytes(), "hidden state of {rows} rows does not fit the stage");
+        self.ctx.bind_to_thread()?;
+        self.stream.synchronize()?;
+        {
+            let (dst, _guard) = self.pre.x.device_ptr_mut(&self.stream);
+            unsafe { cudarc::driver::result::memcpy_dtod_async(dst, src, bytes, self.stream.cu_stream())? };
+        }
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
     pub fn device_ordinal(&self) -> usize {
         self.ctx.ordinal()
     }

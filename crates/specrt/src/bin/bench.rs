@@ -251,6 +251,7 @@ fn main() -> Result<()> {
     }
     if let Some(s) = rt.offload_stats() {
         println!("  offload stats: {s:?} hit_ratio={:.4}", s.hit_ratio());
+        println!("  nvme: reads={} bytes={} failures={} wait={:.3}s", s.nvme_reads, s.nvme_read_bytes, s.nvme_read_failures, s.nvme_wait_nanos as f64 / 1e9);
     }
     if let Some(p) = &flags().save_hotlist {
         rt.save_expert_hotlist(std::path::Path::new(p))?;

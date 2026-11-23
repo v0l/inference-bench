@@ -264,6 +264,11 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
     Ok(out)
 }
 
+pub fn described_tiles(spec: &Spec, node: &crate::graph::Node) -> bool {
+    let a = &spec.attention;
+    !spec.runtime.kv_dtype.is_fp8() && node.grid.len() == 2 && node.grid[0] == "heads" && node.grid[1] == "rows" && a.heads / a.kv_heads <= 16
+}
+
 pub fn mixer_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::desc::Shape {
     let mut symbols = attention_symbols(spec, kv_planes, max_ctx).num("mix_in", spec.mix_in_rows() as f64).num("mix_out", spec.mix_out_cols() as f64).num("linear_layers", spec.linear_layers() as f64);
     for (n, v) in spec.mixer.iter().flat_map(|m| m.params.iter()) {
@@ -412,6 +417,32 @@ pub fn default_target() -> kir::Target {
     kir::Target::sm_120()
 }
 
+pub fn ops_shape(spec: &Spec) -> kir::ops::OpsShape {
+    let (a, d) = (&spec.attention, &spec.dims);
+    kir::ops::OpsShape {
+        hidden: d.hidden,
+        inter: d.intermediate,
+        vocab: d.vocab,
+        heads: a.heads,
+        kv_heads: a.kv_heads,
+        head_dim: a.head_dim,
+        qkv_row: spec.qkv_rows(),
+        q_dim: spec.q_dim(),
+        output_gate: a.output_gate,
+        qkv_bias: a.qkv_bias,
+        o_bias: a.o_bias,
+        eps: spec.norm.eps,
+        embed_scale: spec.dims.embed_scale.unwrap_or(1.0),
+        gated_gelu: spec.mlp.activation == Activation::Geglu,
+        q8_group: Q8_GROUP,
+        fp8_block: FP8_BLOCK,
+        gated: spec.mlp.gated.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
+        mapped: spec.mlp.mapped.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
+        weight_decoder: crate::gemm::weight_format(spec.quant).decoder().to_string(),
+        head_decoder: crate::gemm::head_format(spec).decoder().to_string(),
+    }
+}
+
 pub fn gemv_kernels(spec: &Spec, target: &kir::Target, ops: &kir::ops::OpsShape) -> Result<Vec<kir::gemv::GemvKernel>> {
     use kir::gemv::Gemv;
     let (wf, hwf) = (ops.weight_decoder.clone(), ops.head_decoder.clone());
@@ -420,6 +451,11 @@ pub fn gemv_kernels(spec: &Spec, target: &kir::Target, ops: &kir::ops::OpsShape)
     let gu = if ops.mapped.is_some() { ops.inter } else { 2 * ops.inter };
     let lin = |d: &str, n, k, bias, residual| Gemv::Linear { decoder: d.to_string(), n, k, bias, residual };
     let tiled = |d: &str, n, k, bias, residual| Gemv::Tiled { decoder: d.to_string(), n, k, bias, residual };
+    let fused = |name: &'static str, decoder: &str, n: usize, bias: bool, gated: bool| -> Result<(&'static str, Gemv)> {
+        let wf = kir::gemm::WeightFormat::from_decoder(decoder).ok_or_else(|| anyhow::anyhow!("{name}: unknown decoder {decoder}"))?;
+        let k = crate::gemm::normed(target, name, kir::heavy::Family::Gemv { wf }, n, h, bias, gated)?.compile_gemv(target, crate::gemm::KERNEL_SELECT)?;
+        Ok((name, k.op))
+    };
     let mut ops_list = vec![
         ("qkv_proj", lin(&wf, n, h, bias, false)),
         ("o_proj", lin(&wf, h, q, ops.o_bias, true)),
@@ -431,13 +467,13 @@ pub fn gemv_kernels(spec: &Spec, target: &kir::Target, ops: &kir::ops::OpsShape)
         ("gate_up_gemm", tiled(&wf, gu, h, false, false)),
         ("down_gemm", tiled(&wf, h, i, false, true)),
         ("lm_head_gemm", tiled(&hwf, v, h, false, false)),
-        ("qkv_proj_norm", Gemv::Norm { decoder: wf.clone(), n, bias }),
-        ("gate_up_act", Gemv::GateUpAct { decoder: wf.clone() }),
-        ("lm_head_norm", Gemv::Norm { decoder: hwf.clone(), n: v, bias: false }),
+        fused("qkv_proj_norm", &wf, n, bias, false)?,
+        fused("gate_up_act", &wf, 2 * i, false, true)?,
+        fused("lm_head_norm", &hwf, v, false, false)?,
     ];
     if let Some(la) = spec.linear_attention.as_ref() {
-        ops_list.push(("lin_in_norm", Gemv::Norm { decoder: wf.clone(), n: la.in_proj_rows(), bias: false }));
-        ops_list.push(("lin_ba_norm", Gemv::Norm { decoder: "DecBf16".into(), n: la.ba_rows(), bias: false }));
+        ops_list.push(fused("lin_in_norm", &wf, la.in_proj_rows(), false, false)?);
+        ops_list.push(fused("lin_ba_norm", "DecBf16", la.ba_rows(), false, false)?);
         ops_list.push(("lin_ba_rows", Gemv::Bf16Rows { n: la.ba_rows(), k: h }));
         ops_list.push(("lin_out_proj", lin(&wf, h, la.value_dim(), false, true)));
     }
@@ -456,10 +492,7 @@ impl Module {
     pub fn generate_kv(spec: &Spec, max_ctx: usize, kv_planes: usize, target: &kir::Target) -> Result<Self> {
         anyhow::ensure!(kv_planes == 1 || kv_planes == 2, "kv planes must be 1 or 2");
         anyhow::ensure!(kv_planes == 1 || !spec.runtime.kv_dtype.is_fp8(), "fp8 KV needs a single plane");
-        let a = &spec.attention;
         let d = &spec.dims;
-        let wf = crate::gemm::weight_format(spec.quant);
-        let head_wf = crate::gemm::head_format(spec);
         let mut smem = BTreeMap::new();
         let attn = attention_kernels(spec, kv_planes, max_ctx, target)?;
         for k in &attn {
@@ -477,28 +510,7 @@ impl Module {
                 smem.insert("gdn_chunk_prep", k.smem_bytes);
             }
         }
-        let ops = kir::ops::OpsShape {
-            hidden: d.hidden,
-            inter: d.intermediate,
-            vocab: d.vocab,
-            heads: a.heads,
-            kv_heads: a.kv_heads,
-            head_dim: a.head_dim,
-            qkv_row: spec.qkv_rows(),
-            q_dim: spec.q_dim(),
-            output_gate: a.output_gate,
-            qkv_bias: a.qkv_bias,
-            o_bias: a.o_bias,
-            eps: spec.norm.eps,
-            embed_scale: spec.dims.embed_scale.unwrap_or(1.0),
-            gated_gelu: spec.mlp.activation == Activation::Geglu,
-            q8_group: Q8_GROUP,
-            fp8_block: FP8_BLOCK,
-            gated: spec.mlp.gated.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
-            mapped: spec.mlp.mapped.as_ref().map(|g| kir::ops::GatedExpr { expr: g.expr.clone(), params: g.params.iter().map(|(k, v)| (k.clone(), *v)).collect() }),
-            weight_decoder: wf.decoder().to_string(),
-            head_decoder: head_wf.decoder().to_string(),
-        };
+        let ops = ops_shape(spec);
         let kir_kernels = kir_kernels(spec, target)?;
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let described = described_kernels(spec, kv_planes, max_ctx, target)?;
@@ -536,6 +548,14 @@ impl Module {
         for k in kir_kernels.iter().chain(&distinct) {
             if !kernels.contains(&k.name) {
                 kernels.push(k.name);
+            }
+            if k.tile_scan() && kernels.contains(&"flash_mma") {
+                let tile_smem = smem.get("flash_mma").copied().unwrap_or(0);
+                for n in [format!("{}_mma", k.name), format!("{}_mma_dec", k.name)] {
+                    let n: &'static str = Box::leak(n.into_boxed_str());
+                    kernels.push(n);
+                    smem.insert(n, tile_smem);
+                }
             }
             if let Some(f) = k.chunk_form() {
                 kernels.extend([f.state, f.carry, f.out]);

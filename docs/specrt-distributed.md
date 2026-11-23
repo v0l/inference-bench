@@ -214,7 +214,7 @@ GPU memory over dma-buf (`crates/specrt/tests/rdma_dmabuf.rs`, ignored, run unde
 | 4 MB | 653 us (6.4 GB/s) | 1.21 ms (3.5 GB/s) |
 | 64 MB | 10.3 ms (6.5 GB/s) | 19.4 ms (3.5 GB/s) |
 
-GPU-direct is about twice as fast, so wiring the stage handlers to hand over device buffers is the next step once the hidden state lives in a registered device buffer.
+GPU-direct is about twice as fast. The stage handlers now use it behind `[placement.remote] gpu_direct = true`; see `docs/specrt-gpu-direct.md`.
 
 These are same-host numbers. TCP here is kernel loopback and does not touch the NIC, so they say nothing about the cable. The desktop to Spark numbers need the supervisor window: run `SPECRT_RDMA_TEST_IP=<ip> cargo test -p inference-bench-specrt --test rdma hop_latency_rdma_vs_tcp -- --ignored --nocapture` with a stage on the far end.
 

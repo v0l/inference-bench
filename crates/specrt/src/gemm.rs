@@ -203,10 +203,47 @@ pub fn intern(name: &str) -> &'static str {
     n
 }
 
+pub const KERNEL_SELECT: &str = "kernel_select";
+
+fn through_heavy(k: KernelInstance) -> Result<KernelInstance> {
+    match kir::heavy::Heavy::lift(&k).map_err(anyhow::Error::msg)? {
+        Some(h) => h.compile(&k.target, KERNEL_SELECT).map_err(anyhow::Error::msg),
+        None => Ok(k),
+    }
+}
+
+pub const PROLOGUE_ATTACH: &str = "prologue_attach";
+pub const EPILOGUE_ATTACH: &str = "epilogue_attach";
+
+pub fn normed(t: &kir::Target, name: &str, family: kir::heavy::Family, n: usize, k: usize, bias: bool, gated: bool) -> std::result::Result<kir::heavy::Heavy, kir::heavy::HeavyError> {
+    use kir::heavy::{self, Heavy, HeavyError, Problem, Slot};
+    let lower = |pass: &str, reason: String| HeavyError::Lower { pass: pass.into(), kernel: name.into(), reason };
+    let mut h = Heavy::new(name, family, Problem { n, k, act: kir::Activation::Silu }, None);
+    h.epilogue = heavy::epilogue(Epilogue::Store, bias, n).map_err(|e| lower(PROLOGUE_ATTACH, e))?;
+    let h = h.attach(t, PROLOGUE_ATTACH, Slot::Prologue, heavy::norm_prologue())?;
+    if !gated {
+        return Ok(h);
+    }
+    let act = heavy::epilogue_into(Epilogue::Act, false, n, heavy::OUT).map_err(|e| lower(EPILOGUE_ATTACH, e))?;
+    h.attach(t, EPILOGUE_ATTACH, Slot::Epilogue, act)
+}
+
+fn normed_fp4(t: &kir::Target, name: &str, shape: GemmShape, gated: bool) -> std::result::Result<KernelInstance, kir::heavy::HeavyError> {
+    normed(t, name, kir::heavy::Family::Fp4Gemv, shape.n, shape.k, false, gated)?.compile(t, KERNEL_SELECT)
+}
+
 impl GemmSet {
-    fn push(&mut self, k: std::result::Result<KernelInstance, kg::GemmError>) -> Result<()> {
+    fn push_fused(&mut self, k: std::result::Result<KernelInstance, kir::heavy::HeavyError>) -> Result<()> {
         match k {
             Ok(k) => self.kernels.push(k),
+            Err(kir::heavy::HeavyError::Gemm { error, .. }) if self.lenient && error.is_unsupported() => self.refused.push(error.to_string()),
+            Err(e) => return Err(anyhow::Error::msg(e)),
+        }
+        Ok(())
+    }
+    fn push(&mut self, k: std::result::Result<KernelInstance, kg::GemmError>) -> Result<()> {
+        match k {
+            Ok(k) => self.kernels.push(through_heavy(k)?),
             Err(e) if self.lenient && e.is_unsupported() => self.refused.push(e.to_string()),
             Err(e) => return Err(anyhow::Error::msg(e)),
         }
@@ -263,7 +300,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
                 set.push(KernelInstance::fp4_act(t, &format!("{linear}_f4a"), shape, Tile::SMALL, &tuning))?;
             }
             let gu = linear_shape(spec, "gate_up");
-            set.push(KernelInstance::fp4_gemv(t, "gate_up_act_f4", Fp4Gemv::GateUpAct, gu.n, gu.k))?;
+            set.push_fused(normed_fp4(t, "gate_up_act_f4", gu, true))?;
         }
         if let Some(scale) = fp8_scale(spec) {
             let shape = linear_shape(spec, "qkv");
@@ -316,7 +353,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
     let fp4_mlp = spec.mlp.quant == Some(Quant::Nvfp4G16) || spec.serves_fp4_mlp();
     if fp4_mlp {
         let (gu, dn) = (linear_shape(spec, "gate_up"), linear_shape(spec, "down"));
-        set.push(KernelInstance::fp4_gemv(t, "gate_up_act_f4", Fp4Gemv::GateUpAct, gu.n, gu.k))?;
+        set.push_fused(normed_fp4(t, "gate_up_act_f4", gu, true))?;
         set.push(KernelInstance::fp4_gemv(t, "down_proj_f4", Fp4Gemv::Down, dn.n, dn.k))?;
         for linear in FP4_LINEARS {
             let shape = linear_shape(spec, linear);
@@ -346,7 +383,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
     }
     if spec.lm_head_quant() == Quant::Nvfp4G16 {
         let shape = linear_shape(spec, "lm_head");
-        set.push(KernelInstance::fp4_head_norm(t, "lm_head_norm_f4", shape.n, shape.k))?;
+        set.push_fused(normed_fp4(t, "lm_head_norm_f4", shape, false))?;
         set.tiles(t, "lm_head_f4w", shape, WeightFormat::Fp4, true, false, &tuning)?;
     }
     if let Some(q) = spec.draft_head_quant() {

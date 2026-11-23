@@ -154,7 +154,19 @@ impl Runtime {
             ints[i] = v as i32;
             floats[i] = v as f32;
         }
-        let mut b = self.launcher(self.kernel(launch.name));
+        let a = &self.spec.attention;
+        let tiled = launch.tile && !self.scan_tile_off.load(std::sync::atomic::Ordering::Relaxed) && crate::codegen::described_tiles(&self.spec, spec_node);
+        let tile_name = tiled.then(|| format!("{}{}", launch.name, if run.bb.is_none() { "_mma" } else { "_mma_dec" }));
+        let which = match (tiled, run.bb.is_none()) {
+            (true, true) => 0,
+            (true, false) => 1,
+            _ => 2,
+        };
+        self.scan_launches[which].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut b = match &tile_name {
+            Some(n) => self.launcher(self.kernel(n)),
+            None => self.launcher(self.kernel(launch.name)),
+        };
         for (i, p) in launch.params.iter().enumerate() {
             match (p.role, p.name) {
                 (kir::Role::Value, _) => match p.ty {
@@ -190,6 +202,26 @@ impl Runtime {
                 (_, "out_lo") => b.arg(&self.pre.attn_planes.lo),
                 (_, name) => bail!("kernel {} has an unknown buffer param {name:?}", launch.name),
             };
+        }
+        if tiled {
+            let rows = crate::codegen::flash_rows(a.head_dim, self.kv_planes);
+            let tokens = run.n as i32;
+            let splits = crate::codegen::decode_splits(self.max_ctx) as i32;
+            let config = if run.bb.is_none() {
+                b.arg(&tokens);
+                LaunchConfig { grid_dim: (grid(run.n, rows), a.heads as u32, 1), block_dim: (rows as u32 * 2, 1, 1), shared_mem_bytes: self.smem["flash_mma"] }
+            } else {
+                let bb = run.bb.expect("tile decode runs on batch buffers");
+                b.arg(&bb.part_acc).arg(&bb.part_ml).arg(&splits);
+                LaunchConfig { grid_dim: (a.kv_heads as u32, run.n as u32, splits as u32), block_dim: (128, 1, 1), shared_mem_bytes: self.smem["flash_mma"] }
+            };
+            unsafe { b.launch(config) }?;
+            if let Some(bb) = run.bb {
+                let mut c = self.launcher(self.kernel("batch_decode_combine"));
+                c.arg(&bb.part_acc).arg(&bb.part_ml).arg(&self.pre.qkv).arg(&bb.pos).arg(&1i32).arg(&splits).arg(&self.pre.attn_planes.hi).arg(&self.pre.attn_planes.lo);
+                unsafe { c.launch(LaunchConfig { grid_dim: (a.heads as u32, run.n as u32, 1), block_dim: (a.head_dim as u32 / 2, 1, 1), shared_mem_bytes: 0 }) }?;
+            }
+            return Ok(());
         }
         let dim = |symbol: &String| -> Result<u32> {
             let a = &self.spec.attention;
@@ -453,10 +485,6 @@ impl Runtime {
         }
     }
 
-    fn is_planes(b: Buf) -> bool {
-        matches!(b, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes)
-    }
-
     fn weight_of<'a>(&'a self, weight: Weight, layer: Option<&'a DeviceLayer>) -> (&'a DeviceMatrix, Option<&'a CudaSlice<f32>>) {
         let attn = || self.attn_of(layer);
         let gdn = || self.gdn_of(layer);
@@ -489,7 +517,7 @@ impl Runtime {
         let hidden = self.spec.dims.hidden;
         let head = weight == Weight::LmHead;
         let tokens = if head { run.rows.len() } else { run.n };
-        if Self::is_planes(input) {
+        if input.is_planes() {
             let planes = self.planes(input);
             let x = if head { planes.rows(0, tokens, hidden) } else { planes.all() };
             let out = match output {
@@ -510,7 +538,7 @@ impl Runtime {
     }
 
     fn sharded_head(&self, weight: Weight, w: &DeviceMatrix, input: Buf, output: Buf, part: &CudaSlice<f32>, run: &Run) -> Result<()> {
-        anyhow::ensure!(Self::is_planes(input), "a vocabulary sharded head reads the tensor core planes");
+        anyhow::ensure!(input.is_planes(), "a vocabulary sharded head reads the tensor core planes");
         let comm = self.comm();
         let (hidden, vocab, own) = (self.spec.dims.hidden, self.spec.dims.vocab, self.spec.head_rows().len());
         let each = comm.gather_each().context("a vocabulary sharded head needs the gather kernel")?;

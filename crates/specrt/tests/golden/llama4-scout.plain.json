@@ -117,6 +117,41 @@
     "input_scaled": true,
     "experts_transposed": true
   },
+  "vision": {
+    "config": {
+      "depth": 34,
+      "hidden_size": 1408,
+      "intermediate_size": 5632,
+      "num_heads": 16,
+      "patch_size": 14,
+      "spatial_merge_size": 1,
+      "temporal_patch_size": 1,
+      "out_hidden_size": 5120,
+      "num_position_embeddings": 577,
+      "in_channels": 3,
+      "hidden_act": "gelu",
+      "tower": "tiled",
+      "image_size": 336,
+      "mm_tokens": 144,
+      "layer_norm_eps": 0.00001,
+      "rope_theta": 10000.0,
+      "projector_input_dim": 4096,
+      "projector_output_dim": 4096,
+      "pixel_shuffle_ratio": 0.5,
+      "placeholder": "<|image|>",
+      "grid_tokens": [
+        "<|tile_x_separator|>",
+        "<|tile_y_separator|>",
+        "<|image|>"
+      ]
+    },
+    "tokens": {
+      "image": 200092,
+      "video": 4294967295,
+      "start": 200080,
+      "end": 200081
+    }
+  },
   "tensors": {
     ".feed_forward.": ".mlp."
   }

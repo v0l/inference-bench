@@ -1,0 +1,157 @@
+# kir as a compiler
+
+Analysis for #1052. No code changes. Everything below was read from the tree at this commit; numbers are quoted from the docs that measured them.
+
+## 1. Fusions written by hand today
+
+Graph level: `graphs/decoder.toml` lowers to a flat `Vec<Op>` (`plan.rs`). Kernel level: one kir builder per op. The only rewrite on the op list is the `tp_ops` peephole in `plan.rs` (`Linear` into `Partial` plus `AllReduce`, merged with a following `Norm` into `AllReduceNorm`). Every other fusion is a kernel somebody wrote and a runtime branch that picks it.
+
+| # | Graph pattern | Kernel (files) | Phase | Measured | Numerics |
+|---|---|---|---|---|---|
+| 1 | `Norm` then `Linear` | `qkv_proj_norm`, `lin_in_norm`, `lin_ba_norm`, `Gemv::Norm` (`kir/src/gemv.rs`, `specrt/src/codegen.rs`, `runtime.rs:1545`) | decode | in the 27B decode survey ("Decode is already fused", `docs/perf/417-pdl.md`); no standalone norm kernel remains | bit identical to `rmsnorm` then the plain GEMV at the GEMV's block width; also equal to the runtime's 1024 thread norm on the tested inputs (slice 4, `prologue_bits.rs`) |
+| 2 | `Norm`, gate_up `Linear`, SwiGLU | `gate_up_act`, `gate_up_act_f4` (`Gemv::GateUpAct`, `fp4.rs`) | decode | same survey; `gate_up_act_f4` 91 to 78.5 us after the #362 pairing (`specrt-nvfp4.md`) | bit identical to `rmsnorm`, the gate_up GEMV and `swiglu` (slice 4) |
+| 3 | `Linear` then residual add into `x` | `Epilogue::Residual` / `EPI_RESIDUAL` (`kir/src/gemm.rs:95`, `cuda/gemm/core.rs`, `prim.rs`), `Gemv { residual }`, `down_proj_f4` | decode and prefill | no separate add kernel in decode (417 survey) | bit identical in f32 (`out + v`) |
+| 4 | gate_up `Linear` then SwiGLU into bf16 hi/lo planes | `Epilogue::Act` / `EPI_ACT`, `*_f4b_reduce` applies SwiGLU (`specrt-nvfp4.md:474`) | prefill, batch decode | part of the tile and batch GEMM design | plane rounding differs from an f32 epilogue (`specrt-nvfp4.md:482`) |
+| 5 | `Norm` plus bf16 hi/lo plane split | `rms_split` (`kir::prims`, `plan.rs:390`) | prefill, MTP | 2.5% of 27B kernel time at b1, 1.8% at b8 (`specrt-graph-spec.md`) | changes the activation representation by design |
+| 6 | qk-norm, rope, KV write (bf16 or fp8) | `qk_norm_rope`, `kv_norm_rope` (`kir/src/cuda/attention/rope.rs`, `norm_rope_head`) | decode, prefill | 0.2% of kernel time | fp8 KV changes numerics (#324, #763) |
+| 7 | TP: allreduce, residual add, next norm | `ar_add_rmsnorm_f32` via `tp_ops` | TP decode | #800 fix took tp2 b1 to 169.9 against 117.3 tok/s (#921) | f32 sum order differs per rank count |
+| 8 | Activation quant scale | per-token scale applied once in the `gemm_fp8` epilogue (#416), `quant_rows_*` stay separate kernels | prefill | #416 per-call table in `specrt-nvfp4.md:768`; `quant_rows_fp4` 1.9% of prefill, fusion "not built" (`perf/603-prefill-suspects.md:308`) | changes numerics (act_quant) |
+| 9 | Dense head: norm, `lm_head` | `lm_head_norm`, `HeadNormFp4` | decode | 29% of the GGUF b1 step before #888 | bit identical for `lm_head_norm` (bf16, GGUF) and `lm_head_norm_f4` (slice 4) |
+| 10 | Sandwich norms | `clear_branch`, `Linear` into `branch`, `norm_add`, `residual_add` (`plan.rs`, `exec.rs`) | all | `add_rmsnorm` emitted and tested, not launched | f32 |
+| 11 | Mac WGSL | SwiGLU into gate_up GEMV (`linear_sg*`) kept; rmsnorm and rope folded into GEMV tried and dropped (`specrt-wgpu.md:401`) | decode | glue kernels gain, GEMV folding lost 3 to 9% | |
+
+Fusions tried and dropped, with the measurement: `add_rmsnorm` (`specrt-graph-spec.md:86`, the GEMM residual epilogue already adds, only the norm's read of `x` is saved), attention reduce into `attention_split` (195 against 216 tok/s, `specrt-gguf.md:153`), rmsnorm into a GEMV on wgpu (above), `quant_rows_fp4` into the preceding op (under the 5% bar). PDL (#417) overlaps kernels instead of fusing them.
+
+I could not read #412, #416, #417's comments, #509 or #770 through the tracker (other project); the rows cite the repo docs that carry their numbers. Rows with "not documented" needed a bit-identity check when the compiler reproduced them; slice 4 did it for rows 1, 2 and 9.
+
+Pattern of the list: all of 1 to 7 are the same three shapes. Producer epilogue (3, 4, 8), consumer prologue (1, 2, 5, 9) and a short chain of memory-bound row ops (6, 7, 10). A compiler needs exactly those three rules.
+
+## 2. Is kir transformable or emit-only?
+
+Answer: mostly emit-only. A pass cannot take a kernel and rewrite it.
+
+- `kir::Kernel` is `{ name, target, params, threads, smem_bytes, body: Body }` (`kir/src/lib.rs:90`). `Body` is a closed enum of fixed shapes (`RmsNorm`, `AddRmsNorm`, `NormAdd`, `GatedActivation`, `Pointwise`, `Add`) plus four description bodies. Each builder takes parameters and returns a fully formed kernel; `validate` checks it against the `Target` (smem, threads, features, language).
+- GEMM is `KernelInstance { kind: Kind, ... }` (`kir/src/gemm.rs:432`). `Kind` is a closed enum of families (`Tile`, `Fp8Act`, `Fp4Act`, `Batch`, `GgmlBatch`, `Gemv`, `HeadNormFp4`, ...). The epilogue is `enum Epilogue { Store, Residual, Act, Map }` mapped to C++ template constants (`EPI_RESIDUAL`). The decode fusions are `Gemv::Norm` and `Gemv::GateUpAct`, wrappers that name a hand-written device template (`linear_norm<...>`, `gate_up_act_norm<...>`). Adding a new combination means a new enum variant and new template text.
+
+Data (rewritable) today:
+
+| Block | Form | Rewritable how |
+|---|---|---|
+| `Compose` (`compose.rs`): `TileLoad`, `Epilogue{expr}`, `BlockSum`, `TileStore`, `Gather`, `Lookup`, `Scatter` stages over `Expr` | list of stages with an expression AST (`expr.rs`) | yes: stages can be appended, merged, constant folded; used by `rmsnorm`, `norm_add`, `residual_add`, `swiglu`, logit scale and softcap (`kir/kernels/compose_*.toml`) |
+| `Scan` (`scan.rs`), `Rows` (`rows.rs`), `Recurrence` (`recur.rs`) | stage lists, serialisable (`desc.rs`) | yes inside the family; attention and Mamba/KDA variants come from spec TOML |
+| `Layout` (`layout.rs`) | CuTe style shape/stride algebra with `compose`, `coalesce` | yes |
+| `Tile`, `MmaShape`, `BatchShape`, `Tuning` | parameter structs | yes (this is what tile selection already rewrites) |
+
+Opaque (parameters in, text out):
+
+- GEMM mainloops and epilogues, `Fp8Act`, `Fp4Act`, `Batch*`, `Ggml*`, `Gemv*`: built from `prim::` string functions (`cuda/gemm/prim.rs`, `core.rs`). The `VERBATIM_QUANT` allowlist is the prim library itself; `VERBATIM_MOE` still lists `moe/route.rs`, `moe/gemv.rs`, `moe/prim.rs` with reasons (route and expert row dots keep text because ports change PTX). `VERBATIM_LINEAR` and `VERBATIM_ATTENTION` are empty, but "contains `prim::`" is the bar, not "is data": attention and delta-net bodies are text assembled from prims.
+- Fixed `Body` variants (`RmsNorm` etc.): data in name only, a pass can read the width but cannot splice a stage.
+
+So the data model has no common op node: there is no place that says what a kernel reads, writes, in what layout, or how many registers it holds. `Kernel::needs` and `smem_bytes` are the only summary, and they are per kernel, not per stage.
+
+Consequence: the first slice is making kir a real two-level IR, with the Rust builders kept as the reference.
+
+## 3. Two levels, and what sits between them
+
+Exists today: graph IR (decoder.toml nodes, `Op` list, `Buf` names; shapes implicit in the `Spec`), kernel descriptions (`Compose`, `Scan`, ...), emitters (CUDA, WGSL).
+
+Missing:
+
+1. **Typed graph IR.** `Op` carries no signature. Needed per node: tensors read and written (`Buf` plus rows, cols), dtype or plane form (f32, bf16 hi/lo, fp8, fp4 with scales), layout (row major, planes, paged), and a class: `Elementwise`, `RowReduce` (norm), `Gemm`, `Attention`, `Scan`, `Gather`. This is a table over the existing `Op` enum, not a rewrite of the runtime.
+2. **Kernel IR with fusable slots.** A heavy kernel (GEMM, attention, scan) becomes `Heavy { family, tile, prologue: Vec<Stage>, epilogue: Vec<Stage> }` where the slots reuse the `compose::Stage` and `expr::Expr` types that already exist. A light kernel is a `Compose`. Fusion is then "append stages to a slot", and the existing builders are the reference implementation: they must emit byte-identical text for an IR that spells today's choice.
+3. **Fusion legality data** (the minimum model): per op, `reads`, `writes` (tensor, rows, cols, dtype), `class`, `bytes_moved`, `regs_per_thread`, `smem_bytes`, and for heavy ops the accumulator layout (which thread owns which output element, since an epilogue can only consume what the owner sees). Per Target: registers per SM, smem limit, `Feature` set (already in `Target`).
+
+Copy from other systems, read only:
+
+- **TVM Relax/TIR**: two levels with an explicit lowering (graph `FuseOps` pattern fusion, then `FuseTIR`, then scheduling). Copy the split and the rule "fuse by pattern kind (elementwise, injective, reduce, out-ewise-fusable), not by op name". Avoid: building a general tensor expression language; we only need the three shapes above.
+- **XLA**: producer-consumer fusion decided by cost ("does fusing duplicate work or add traffic"), multi-output fusion for siblings. Copy the "never duplicate a producer that is heavy" rule. Avoid the HLO instruction set.
+- **MLIR linalg**: tile-and-fuse a consumer into the producer's tile loop. Copy the idea that an epilogue fuses into the GEMM's output tile when the tile owns whole rows or the reduction is tile-local. Avoid the dialect machinery.
+- **Inductor**: scheduler that groups nodes into kernels with a "can fuse" check plus a score from saved bytes, and a separate codegen. Copy the scheduler shape: candidate pairs, legality check, score, merge, repeat. Avoid generating the heavy kernels (it autotunes templates too).
+- **TensorRT-LLM graph rewriting**: pattern matchers that rewrite to fused plugins (`norm+quant`, `gemm+swiglu`). That is what we have by hand. Copy only the per-pattern test; avoid one plugin per pattern.
+
+## 4. Stages and what is checked between them
+
+```
+decoder.toml + Spec ──► Plan (Vec<Op>) ──► [G] graph passes ──► Fused plan
+   Fused plan ──► [K] kernel selection (family, tile, splits from Target) ──► Heavy/Compose IR
+   Heavy/Compose IR ──► [L] kernel passes (epilogue attach, hoist, tile fit) ──► IR
+   IR ──► [E] emit (CUDA, WGSL) ──► source ──► NVRTC
+```
+
+| Boundary | Verified by | Fails as |
+|---|---|---|
+| Plan to G | `validate_plan`: every `Buf` read was written, shapes agree op to op, dtype/plane form matches (`xn_planes` only feeds planes consumers) | compile error naming the node |
+| G to K | `validate_fused`: each group is a legal shape (one heavy op, light ops only in its slots, nothing else reads the intermediate), no tensor written and then unused | compile error naming the pass and the group |
+| K to L | `Kernel::validate` against `Target` (exists), extended: registers and smem of the whole fused kernel, accumulator ownership of the epilogue | compile error naming pass, kernel, budget |
+| L to E | structural hash and golden compare for any IR that spells a hand kernel (today's goldens) | golden diff |
+| E | `emit` already refuses a block the Target lacks, with the block named | emit error |
+
+A fusion that would change numerics (`act_quant`, plane rounding) is not a legality question. It is a spec option (config-first) that selects which equivalence class a pass may use: `exact` (bit identical in f32) or `numerics = "act"`. The pass reports which it used.
+
+## 5. Pass list
+
+| # | Pass | Input, output | Rule | Test |
+|---|---|---|---|---|
+| G1 | canonicalise | Plan: symbolic shapes, dead `Split`, `Clear` before a store | fold constants (`unit_offset`, scales), drop an op whose output no one reads | table test per fixture plan |
+| G2 | legalise | Plan, Target: which `Op` has a kernel here | refuse early with the op named (replaces late `unsupported:` strings in `Op::kernels`) | all fixtures on sm_120, sm_80, wgpu |
+| G3 | layout assign | planes vs f32 vs fp8 per `Buf` | producers write the form the consumer's family wants (`xn_planes` for tile GEMM, f32 for GEMV) | plan equality against today's `Buf` choice |
+| G4 | epilogue attach | `Heavy` + following light ops | fuse consumer C into producer P when: C reads only P's output (plus a vector or scalar), C is `Elementwise`, no other reader of P's output, accumulator owner has the data (per-element, or whole row in tile for reductions), regs/smem fit. Covers residual add, SwiGLU, scale, bias, `clear`+residual to store | pattern fixtures; rediscovery test against rows 3, 4 |
+| G5 | prologue attach | light `RowReduce` + following `Heavy` | fuse norm into the GEMV/GEMM input load when the heavy op is memory-bound (decode) and the row fits one pass; refuse when each block would re-read the whole row more than once (the wgpu loss) | rediscovery test against rows 1, 2, 9 |
+| G6 | light group | adjacent `RowReduce`/`Elementwise` nodes | merge into one `Compose` (rows 6, 7, 10) if traffic after is lower | rediscovery of `norm_add`, `ar_add_rmsnorm` |
+| K1 | split and tile selection | Heavy IR, Target | current `f4b_splits`, `Tile`, `variant_for` formulas, unchanged (#408 found no 5% win from measuring) | goldens |
+| L1 | slot fit | fused kernel | recompute regs/smem; if over the Target, split the group again (undo the last attach) | budget test with a small fake Target |
+| L2 | hoist | load of weights or scales above the dependent wait | enables PDL style overlap; only when the load does not depend on the previous kernel's output | PTX diff and `pdl` test |
+| S1 | stream and capture grouping | fused plan | group launches into the CUDA graph sizes the runtime captures; independent branches (`lin_in` and `lin_ba`) onto one launch or two streams | graph test |
+
+G4, G5, G6 are one engine: candidate pairs from the dataflow graph, the legality check from section 3, the score from section 6, merge, repeat to fixed point.
+
+## 6. Cost model
+
+Decode is memory-bound, so first version is bytes moved plus launches:
+
+```
+cost(group) = bytes_read + bytes_written + launch_cost * launches
+saving(fuse P,C) = bytes(P.out written) + bytes(C.in read) + launch_cost
+penalty = redundant_reads (blocks * row_bytes for a prologue norm) + spill_bytes
+fuse iff saving - penalty > 0 and legality holds
+```
+
+`launch_cost` is a Target constant expressed in bytes (launch gap times memory bandwidth), measured once per device by the existing probe, not per shape. Validation against section 1: it must (a) select 1, 2, 3, 4, 6, 7, 9 on the 27B and the 4B; (b) reject the dropped ones: the `add_rmsnorm` case saves one read of `x` (hidden x 4 B per row, 2.5% of kernel time) and costs the extra pass, and attention reduce into split (serialises 4 reductions, which the model sees as a penalty if the group has one block per KV head). The wgpu GEMV norm loss is the `redundant_reads` term (blocks x row bytes) and is predicted by the model without measurement.
+
+Needs measured feedback: launch gap on a new Target (one probe, cached in `[runtime]`), and any case where the penalty is occupancy (register pressure changing blocks per SM). Does not: bytes, launches, legality, smem. The tuner result of #408 is why tiles stay formula-based.
+
+## 7. Proof plan
+
+1. Decision equality. For the qwen3 dense fixture and the 27B hybrid (`tiny27b`), the pass pipeline's groups equal the hand fusions of section 1, and the kernel IR emits the same text: kir goldens byte identical, `linear_unchanged` green. No GPU.
+2. Logits. `logits`, `linear`, `mtp`, `tiny27b` within today's bounds, then `real27b` on GPU1 under `gpu-run 1`.
+3. A fusion nobody wrote. Candidate: `clear` plus residual `Linear` into `branch` plus `norm_add` (sandwich and scaled variants, row 10) becomes `Linear` with store epilogue then `norm_add`; the `clear_branch` launch disappears, saving one launch per branch per layer. Verify with logits (f32, bit identical expected) and the launch count.
+4. A new architecture by spec only. A spec that combines existing parameters in a way no hand fusion exists for (sandwich norms plus scaled residual plus MoE-free MLP, or `mixer` with `scaled`) gets its fusions from the passes, with a test that counts launches against the unfused plan.
+5. Guard. A test greps pass and cost-model files for architecture names (`no_arch_names` pattern list), and asserts that pass inputs are only the typed signatures and the `Target`.
+
+## 8. Slices (landing order)
+
+1. Typed op signatures plus `validate_plan`, bytes and launch report (`inference-bench kernels --plan`). No behaviour change. Landed (#1053): `crates/specrt/src/signature.rs` (`Signer::signature`, one exhaustive match over `Op`; shapes from `gemm::linear_shape`, cache rows from `state`, described nodes from their kir params and binds), `validate_plan`, `plan_report`; tests in `tests/plan_check.rs`. `inference-bench kernels --spec S --plan [--phase prefill|decode|verify] [--tokens N] [--context C] [--target T]` prints per layer kind the ops, class, bytes read and written, launches and a step total. Bytes are what each op touches once (weights, activations, the cache rows read), not cache-line traffic.
+2. Cost model and the legality predicate, with the rediscovery test as a decision-only dry run (prints groups, changes nothing). Landed (#1054): `crates/specrt/src/fusion.rs`, `inference-bench kernels --spec S --plan --fusion [--phase P] [--tokens N] [--target T]`, tests in `tests/fusion_plan.rs`.
+   - Units. Each plan op lowers to units over the slice 1 signatures. A `Linear` becomes its mainloop (block geometry from `gemm::select`: GEMV rows per block, tile `bn`, batch rows and splits), a split reduce when splits > 1, an act quant row op for the f8a/f4a paths, and its epilogue (residual add, gated act) as an elementwise unit. Rope ops become qk norm, rope, KV write; decode attention becomes rope, split (one block per KV head per split) and combine. Everything else is one unit with the launch count from `plan_report`.
+   - Engine. Candidates are dataflow edges between groups. Epilogue and light merges run to a fixed point first, then prologues; the best net saving wins each round. A prologue duplicates the producer into every heavy consumer (one norm into `lin_in` and `lin_ba`).
+   - Cost. Saving is the launch cost plus the intermediate's write and reads. Penalties: prologue rereads, `(col_blocks - 1) x row bytes x reread_rate`, less what the consumer's own reads hide (`reread_overlap`); an epilogue on a split mainloop pays `(splits + 1) x round_trip_bytes` for the last-block ticket. `Costs::for_target` holds the constants: CUDA 2 us launch, 0.8 us round trip, 1,600 GB/s, reread rate 0.25 with full overlap (L2 serves the rereads); wgpu 5 us launch, 200 GB/s, rate 1 with no overlap (the #827 measurement).
+   - Legality. Single launch units only; one unit with block geometry per group; no device barrier (allreduce) in a consumer; attention and scan units fuse only inside their own op; rows must match; no other group on a path between the two; the intermediate has no reader outside the group and is not live after it; an epilogue row op needs the block to own the whole row (`Owner::Tile { cols }` against the row width), and a split owner refuses row ops; staged prologue rows plus the mainloop smem fit `smem_limit`; registers fit `max_regs`.
+   - What it finds on qwen3-0.6b and tiny27b at sm_120: rows 1, 2, 3, 4, 6, 7 and 9 (decode norm into qkv, gate_up, lin_in plus lin_ba, lm_head and the MTP head; residual and act epilogues on GEMV, tile and split reduce; qk norm, rope and KV write; allreduce plus the next norm). It keeps apart `add_rmsnorm` (the residual already fused into its producer scores higher, and the norm needs a whole row a GEMV block does not own), attention reduce into the split (ticket penalty 3.84 MB against a 3.2 MB launch saving) and the wgpu norm fold (8.4 MB of rereads against a 1 MB saving). Prefill also groups each norm with the act quant that follows it (`rms_split` plus `quant_rows_*`). That is the `quant_rows_fp4` into the preceding op fusion section 1 lists as not built because it was under the 5% bar, not because it lost; the quant does not fold into the GEMM because the reread penalty exceeds the saving at 512 tokens. Constants are estimates; slice 3 onwards checks them against nsys.
+3. Kernel IR slots: `Heavy { prologue, epilogue }` over `compose::Stage`, with `Epilogue::{Residual, Act, Map}` re-expressed as stages; goldens byte identical. Landed (#1055): `crates/kir/src/heavy.rs`, tests in `crates/kir/tests/gemm.rs` and `crates/specrt/tests/fusion_plan.rs`.
+   - IR. `Heavy { name, family, problem: { n, k, act }, tile, prologue, epilogue }`. `Family` is the mainloop with its own parameters (tile MMA, fp8 act, fp4 act, batch rows, ggml batch and gemv, split reduce); the quant rows and the fp4 GEMV and head kernels are not lifted, they are slice 4.
+   - Epilogue stages. The accumulator is the name `acc`; `out` is the f32 output, `planes` the bf16 hi/lo output, `bias` the bias vector. Store is `store out acc`; bias adds `load b bias`, `v = acc + b`; Residual is `load r out`, `y = acc + r` (`v + r` with bias), `store out y`; Act loads the gate and up columns with the `(n/2,2):(2,1)` layout and stores `gated(g, u)` to `planes`; Map stores `mapped(acc)` to `planes`. `gated` and `mapped` are expression functions that lower to the module's `gated_act` and `mapped_act` on CUDA and are refused on WGSL.
+   - Lowering. `Heavy::lower` matches the epilogue against the stage lists the emitters spell (`heavy::spelled`) and calls the existing builder, so the source is the reference text. A list no emitter spells, or any prologue (no emitter yet), is refused. `Heavy::attach` appends stages to a slot: an epilogue attach drops the store and renames `acc` to the stored value, so `store out acc` plus the residual stages becomes the Residual list.
+   - Budget. `Heavy::budget` builds the bare mainloop and checks threads, shared memory (mainloop plus the staged prologue rows) and registers (`acc_regs` of the accumulator tile plus one per stage value) against `Target::max_regs` and `smem_limit`. Every failure is `pass P: kernel K needs N what, the target has L`. `gemm::gemm_kernels` lifts every GEMM it builds and emits it through `Heavy::compile` under the pass name `kernel_select`; the fusion cost model takes `max_regs` from the `Target`.
+   - Proof. Every GEMM in the kir golden set lifts and lowers to an equal `KernelInstance` and the byte identical golden; every GEMM of qwen3-0.6b, tiny27b and the 27B fixture does the same; `linear_unchanged` and the specrt goldens are unchanged.
+4. `Gemv::Norm` and `GateUpAct` rebuilt from the same IR (prologue slot), goldens byte identical; bit identity check for rows marked "not documented". Landed (#1056): `crates/kir/src/heavy.rs`, `crates/specrt/src/gemm.rs` (`normed`, passes `prologue_attach` and `epilogue_attach`), `codegen::gemv_kernels`; tests in `crates/kir/tests/gemm.rs`, `tests/fusion_plan.rs`, `tests/prologue_bits.rs`.
+   - IR. Two more families: `Gemv { wf }` (the `linear_w` row GEMV for every decoder) and `Fp4Gemv` (the NVFP4 GEMV and head). `Heavy::lift_gemv` lifts a `GemvKernel`, and `Heavy::lift` now lifts `Kind::Gemv` and `Kind::HeadNormFp4`; `lower_gemv` and `compile_gemv` lower to a `GemvKernel`. `Bf16Rows` and `Tiled` have no slots and stay unlifted.
+   - Prologue stages. `heavy::norm_prologue` is the rmsnorm list from `compose_rmsnorm.toml` over the names `x` (the residual row), `nw` (norm weight) and `xs` (the staged row in shared memory): `load v x`, `total = sum(v * v)`, `inv = rsqrt(total / width + eps)`, `load xv x`, `load w nw`, `y = w * (xv * inv)`, `store xs y`. `spelled_prologue` accepts it or none; the emitters spell it as `load_normed` inside `linear_norm`, `gate_up_act_norm` and `head_norm_f4`.
+   - Epilogue on a GEMV. The gated act on a GEMV stores to `out`, not `planes` (`epilogue_into(Act, .., OUT)`). `lower_gemv` maps no prologue with Store or Residual to `Linear`, the norm with Store to `Norm`, the norm with Act to `GateUpAct`; `Fp4Gemv` maps the norm with Act to `gate_up_act_f4`, the norm with Store to `lm_head_norm_f4` and Residual to `down_proj_f4`. Any other pairing is refused with both lists named.
+   - Passes. `gemm::normed` builds the bare GEMV, attaches `norm_prologue` under `prologue_attach`, then for the gated MLP the act stages under `epilogue_attach`; every attach rechecks the budget. `codegen::gemv_kernels` builds `qkv_proj_norm`, `gate_up_act`, `lm_head_norm`, `lin_in_norm` and `lin_ba_norm` this way, `gemm_kernels` builds `gate_up_act_f4` and `lm_head_norm_f4`. A GEMV budget is 256 threads, the staged row `k x 4` bytes of shared memory and one register per stage value; a target with less shared memory fails as `pass prologue_attach: kernel qkv_proj_norm needs ...`. `HeavyError::Gemm` keeps a `GemmError` so the WGSL path still lists unsupported blocks instead of failing.
+   - Proof. Module source and `kir_hash` byte identical for all 270 fixture and spec modules on sm_120 and sm_80 (`tests/source_dump.rs`), NVRTC PTX identical for the 21 27B, 4B and 0.6B modules with one `libnvrtc` (13.2 and 13.5 give different PTX for the same source, so pin `LD_LIBRARY_PATH`); kir goldens, `linear_unchanged` and the specrt goldens unchanged. On GPU1 each fused kernel equals `rmsnorm`, then `linear_w` on the same weights, then `swiglu` for the act, bit for bit: 40 cases on tiny-qwen3.5 (bf16, fp8, nvfp4, nvfp4 head), tiny27b, the tiny Q8_0 GGUF and Qwen3.5-4B NVFP4 with both heads, against both a norm at the GEMV's width (256 or 512 threads) and the runtime's 1024 thread `rmsnorm`. A one ulp change to the reference's norm weight makes it differ, so the check sees single bits. Equality at the same width is structural: `load_normed` and the compose `rmsnorm` use the same strided partial sums and the same warp then block reduction. Against the 1024 thread norm it held on these inputs, but when `HIDDEN` exceeds the block the partial sums group differently, so a last bit difference in `inv` is possible on other inputs.
+5. Run the plan from the pass output: replace `tp_ops` and the runtime `fp4` kernel-name branches with the fused plan; identical kernels, `no_arch_names` and grep test.
+6. First new fusion: eliminate `clear_branch` (store epilogue) and measure launches and decode tok/s on the 4B via `perfpass.sh`.
+7. Spec-only proof and the grep test.
+8. L1 slot fit and L2 hoist (PDL), then S1 graph capture grouping.
+
+Out of scope: tuning parameters (formulas stay), a general tensor language, fusing attention or scans into neighbours (the measured losses above).

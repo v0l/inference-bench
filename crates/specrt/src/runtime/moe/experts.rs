@@ -284,21 +284,18 @@ impl ExpertCache {
                 if at + bytes > cap {
                     break;
                 }
-                let t = unsafe { pool.read(file, (p.offset + entry * p.per) as u64, base_ptr.add(at), bytes) };
+                let t = unsafe { submit_counted(&pool, file, (p.offset + entry * p.per) as u64, base_ptr.add(at), bytes, stats) };
                 tickets.push(t);
                 batch.push((pi, slot, at, bytes));
                 at += bytes.next_multiple_of(4096);
                 j += 1;
             }
-            for t in tickets {
-                t.wait()?;
-            }
+            wait_counted(tickets, stats)?;
             let buf = st.buf.as_ref().unwrap().as_slice()?;
             for (pi, slot, off, bytes) in batch {
                 let p = &host.parts[pi];
                 unsafe { cudarc::driver::result::memcpy_htod_async(self.addrs[pi] + (slot * p.per) as u64, &buf[off..off + bytes], self.copy.cu_stream()) }?;
                 stats.host_to_vram_bytes += bytes as u64;
-                stats.nvme_read_bytes += bytes as u64;
             }
         }
         Ok(())
@@ -345,14 +342,16 @@ impl ExpertCache {
             }
             mapping.push((e, slot));
         }
-        self.enqueue_all(host, &mut copies, &mut stats)?;
-        if with_shared {
-            for s in 0..self.shared {
-                self.enqueue(host, self.local + s, self.slots + s, &mut stats)?;
+        let queued = self.enqueue_all(host, &mut copies, &mut stats).and_then(|_| {
+            if with_shared {
+                for s in 0..self.shared {
+                    self.enqueue(host, self.local + s, self.slots + s, &mut stats)?;
+                }
             }
-        }
-        g.book.stats.host_to_vram_bytes += stats.host_to_vram_bytes;
-        g.book.stats.nvme_read_bytes += stats.nvme_read_bytes;
+            Ok(())
+        });
+        g.book.stats.absorb_io(&stats);
+        queued?;
         self.fence(compute)?;
         Ok(Staged { mapping })
     }
@@ -387,14 +386,17 @@ impl ExpertCache {
         let mut g = self.state.lock().unwrap();
         let g = &mut *g;
         let mut stats = OffloadStats::default();
+        let mut queued = Ok(());
         for &e in experts {
-            if let Some(Acquired { slot, copy: true }) = g.book.acquire(self.page(layer, e), false, true) {
-                self.enqueue(host, e, slot, &mut stats)?;
+            if let Some(Acquired { slot, copy: true }) = g.book.acquire(self.page(layer, e), false, true)
+                && let Err(err) = self.enqueue(host, e, slot, &mut stats)
+            {
+                queued = Err(err);
+                break;
             }
         }
-        g.book.stats.host_to_vram_bytes += stats.host_to_vram_bytes;
-        g.book.stats.nvme_read_bytes += stats.nvme_read_bytes;
-        Ok(())
+        g.book.stats.absorb_io(&stats);
+        queued
     }
 
     pub(in crate::runtime) fn warm(&self, compute: &Arc<CudaStream>, hosts: &[(usize, &HostExperts)]) -> Result<()> {
@@ -410,14 +412,18 @@ impl ExpertCache {
         let mut g = self.state.lock().unwrap();
         let g = &mut *g;
         let mut stats = OffloadStats::default();
+        let mut queued = Ok(());
         for (layer, e) in hot {
             let Some((_, host)) = hosts.iter().find(|(l, _)| *l == layer) else { continue };
-            if let Some(Acquired { slot, copy: true }) = g.book.acquire(self.page(layer, e), false, true) {
-                self.enqueue(host, e, slot, &mut stats)?;
+            if let Some(Acquired { slot, copy: true }) = g.book.acquire(self.page(layer, e), false, true)
+                && let Err(err) = self.enqueue(host, e, slot, &mut stats)
+            {
+                queued = Err(err);
+                break;
             }
         }
-        g.book.stats.host_to_vram_bytes += stats.host_to_vram_bytes;
-        g.book.stats.nvme_read_bytes += stats.nvme_read_bytes;
+        g.book.stats.absorb_io(&stats);
+        queued?;
         self.fence(compute)?;
         Ok(())
     }
@@ -425,5 +431,79 @@ impl ExpertCache {
     pub(in crate::runtime) fn detach(&self, compute: &Arc<CudaStream>) {
         let _ = compute.synchronize();
         let _ = self.copy.synchronize();
+    }
+}
+
+unsafe fn submit_counted(pool: &crate::diskio::IoPool, file: &Arc<dyn crate::diskio::ReadAt>, offset: u64, dst: *mut u8, len: usize, stats: &mut OffloadStats) -> crate::diskio::Ticket {
+    stats.nvme_reads += 1;
+    stats.nvme_read_bytes += len as u64;
+    unsafe { pool.read(file, offset, dst, len) }
+}
+
+fn wait_counted(tickets: Vec<crate::diskio::Ticket>, stats: &mut OffloadStats) -> Result<()> {
+    let started = std::time::Instant::now();
+    let mut first = Ok(());
+    for t in tickets {
+        if let Err(e) = t.wait() {
+            stats.nvme_read_failures += 1;
+            if first.is_ok() {
+                first = Err(e);
+            }
+        }
+    }
+    stats.nvme_wait_nanos += started.elapsed().as_nanos() as u64;
+    first
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diskio::{IoPool, ReadAt};
+    use std::time::Duration;
+
+    struct Throttled {
+        bytes_per_sec: f64,
+        fail: bool,
+    }
+
+    impl ReadAt for Throttled {
+        fn read_at(&self, buf: &mut [u8], _: u64) -> std::io::Result<()> {
+            std::thread::sleep(Duration::from_secs_f64(buf.len() as f64 / self.bytes_per_sec));
+            if self.fail {
+                return Err(std::io::Error::other("drive gone"));
+            }
+            buf.fill(7);
+            Ok(())
+        }
+    }
+
+    fn run(fail: bool, reads: usize, bytes: usize) -> (Result<()>, OffloadStats, Vec<u8>) {
+        let pool = IoPool::new(2);
+        let file: Arc<dyn ReadAt> = Arc::new(Throttled { bytes_per_sec: 200e6, fail });
+        let mut dst = vec![0u8; reads * bytes];
+        let mut stats = OffloadStats::default();
+        let base = dst.as_mut_ptr();
+        let tickets: Vec<_> = (0..reads).map(|i| unsafe { submit_counted(&pool, &file, (i * bytes) as u64, base.add(i * bytes), bytes, &mut stats) }).collect();
+        let r = wait_counted(tickets, &mut stats);
+        (r, stats, dst)
+    }
+
+    #[test]
+    fn expert_reads_count_reads_bytes_and_wait_time() {
+        let (r, stats, dst) = run(false, 6, 1 << 20);
+        r.unwrap();
+        assert!(dst.iter().all(|&b| b == 7));
+        assert_eq!(stats.nvme_reads, 6);
+        assert_eq!(stats.nvme_read_bytes, 6 << 20);
+        assert_eq!(stats.nvme_read_failures, 0);
+        assert!(stats.nvme_wait_nanos > 0);
+    }
+
+    #[test]
+    fn failed_expert_reads_are_counted() {
+        let (r, stats, _) = run(true, 3, 4096);
+        assert!(r.is_err());
+        assert_eq!(stats.nvme_reads, 3);
+        assert_eq!(stats.nvme_read_failures, 3);
     }
 }

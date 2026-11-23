@@ -295,6 +295,7 @@ pub struct Stats {
     pub chain: Option<ChainMetrics>,
     pub sessions: Option<crate::sessions::Stats>,
     pub offload: Option<crate::offload::OffloadStats>,
+    pub offload_plan: Option<crate::offload::OffloadPlan>,
 }
 
 impl Default for Stats {
@@ -329,6 +330,7 @@ impl Default for Stats {
             chain: None,
             sessions: None,
             offload: None,
+            offload_plan: None,
         }
     }
 }
@@ -336,6 +338,7 @@ impl Default for Stats {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SeqEvent {
     Started { queued: Duration },
+    Prefilled { prefill: Duration },
     Token(u32),
     Preempted,
     Finished { finish: Finish, prompt_tokens: usize, completion_tokens: usize, cached_tokens: usize },
@@ -1004,6 +1007,7 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
                     s.queue_secs.observe(queued.as_secs_f64());
                     (id, SeqEvent::Started { queued })
                 }
+                Event::Prefilled { id, prefill } => (id, SeqEvent::Prefilled { prefill }),
                 Event::Token { id, token } => {
                     s.generated_tokens += 1;
                     if let Some(l) = live.get_mut(&id) {
@@ -1039,6 +1043,7 @@ fn run<E: Executor>(sched: &mut Scheduler<E>, inbox: Receiver<Job>, stats: Arc<M
         s.reprefilled_tokens = sched.recomputed_tokens();
         s.chain = sched.chain_metrics();
         s.offload = sched.offload_stats();
+        s.offload_plan = sched.offload_plan();
         let p = sched.prefix_stats();
         s.prefix_queries = p.queries;
         s.prefix_hits = p.hits;
@@ -1056,6 +1061,7 @@ pub struct Completion {
     pub completion_tokens: usize,
     pub finish: Option<Finish>,
     pub queue_secs: f64,
+    pub prefill_secs: f64,
     pub ttft_secs: f64,
     pub decode_secs: f64,
     pub preemptions: usize,
@@ -1290,6 +1296,7 @@ impl Serving {
             let ev = rx.recv().map_err(|_| anyhow::anyhow!("the serving engine has stopped"))?;
             match ev {
                 SeqEvent::Started { queued } => out.queue_secs = queued.as_secs_f64(),
+                SeqEvent::Prefilled { prefill } => out.prefill_secs = prefill.as_secs_f64(),
                 SeqEvent::Preempted => out.preemptions += 1,
                 SeqEvent::Token(t) => {
                     if out.preemptions > 0 && ids.len() > out.completion_tokens {
@@ -1432,7 +1439,7 @@ mod watchdog_tests {
         let (mut j, rx) = job();
         j.cancel = Arc::new(AtomicBool::new(cancelled));
         j.request.media = vec![sched::MediaInput {
-            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 80, 60], data: Vec::new() }),
+            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 80, 60], data: Vec::new(), layout: [0, 0] }),
             hash: [7; 32],
         }];
         (j, rx)
@@ -1526,7 +1533,7 @@ mod watchdog_tests {
         image.request.prompt = vec![1, 11, 9, 9, 9, 9, 12, 2];
         image.request.max_tokens = 4;
         image.request.media = vec![sched::MediaInput {
-            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 4, 4], data: vec![0.0; 16] }),
+            processed: crate::vision::Processed::Image(crate::vision::Patches { grid: [1, 4, 4], data: vec![0.0; 16], layout: [0, 0] }),
             hash: [3; 32],
         }];
         tx.send(image).unwrap();

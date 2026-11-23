@@ -43,6 +43,10 @@ pub fn thousands(n: u64) -> String {
     out
 }
 
+pub fn millis(secs: f64) -> String {
+    format!("{} ms", thousands((secs * 1000.0).round() as u64))
+}
+
 pub fn rate(per_sec: f64) -> String {
     if per_sec < 99.95 {
         format!("{:.1} tok/s", per_sec.max(0.0))

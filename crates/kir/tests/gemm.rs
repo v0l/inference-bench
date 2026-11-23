@@ -1,8 +1,12 @@
+use kir::compose::Stage;
+use kir::expr::Expr;
 use kir::gemm::{
     BatchShape, Epilogue, Fp4Gemv, Fp8Scale, GemmPath, GemmShape, KernelInstance, MmaShape, Policy, Request, Tile, TileChoice,
     Tuning, Variant, WeightFormat, select,
 };
-use kir::{Feature, Target};
+use kir::gemv::{Gemv, GemvKernel};
+use kir::heavy::{self, Family, Heavy, HeavyError, Slot};
+use kir::{Dialect, Feature, Target};
 use std::path::PathBuf;
 
 fn golden(name: &str, actual: &str) {
@@ -262,4 +266,223 @@ fn nvfp4_act_rows_between_17_and_32_take_the_skinny_tiles() {
     assert_eq!((dn.name.as_str(), dn.tile), ("down_f4a_skinny", Tile::SKINNY));
     let wide = select(&t, &p, &req("down", down(), 33, WeightFormat::Fp4)).unwrap();
     assert!(!wide.name.contains("skinny"), "{}", wide.name);
+}
+
+fn heavy_targets() -> Vec<Target> {
+    vec![Target::sm_120(), Target::sm_80()]
+}
+
+#[test]
+fn every_slotted_family_lifts_to_heavy_and_lowers_to_the_same_kernel_and_golden() {
+    let mut lifted = 0;
+    for (tag, t) in [("sm120", Target::sm_120()), ("sm80", Target::sm_80())] {
+        for k in families(&t) {
+            let Some(h) = Heavy::lift(&k).unwrap() else { continue };
+            let back = h.compile(&t, "test").unwrap();
+            assert_eq!(back, k, "{}", k.name);
+            golden(&format!("{}_{tag}.cu", k.name), &cuda(&back));
+            lifted += 1;
+        }
+    }
+    let w = wgsl();
+    for (name, shape, wf) in [("qkv_mma", qkv(), WeightFormat::Bf16), ("down_mma", down(), WeightFormat::Fp8)] {
+        let k = KernelInstance::gemm(&w, name, shape, wf, Tile::SMALL, true, false).unwrap();
+        let back = Heavy::lift(&k).unwrap().unwrap().lower(&w).unwrap();
+        golden(&format!("{name}.wgsl"), &kir::wgsl::emit_gemm(&back).unwrap());
+    }
+    assert!(lifted >= 26, "only {lifted} kernels lifted");
+}
+
+#[test]
+fn the_four_epilogues_are_stage_lists_the_emitters_spell() {
+    for (epi, bias) in [(Epilogue::Store, false), (Epilogue::Store, true), (Epilogue::Residual, false), (Epilogue::Residual, true), (Epilogue::Act, false), (Epilogue::Map, false)] {
+        let stages = heavy::epilogue(epi, bias, 64).unwrap();
+        assert!(matches!(stages.last(), Some(Stage::TileStore { .. })), "{epi:?}");
+        assert_eq!(heavy::spelled(&stages, 64).unwrap(), (epi, bias));
+    }
+    assert!(heavy::epilogue(Epilogue::Act, true, 64).is_err());
+    let mut odd = heavy::epilogue(Epilogue::Residual, false, 64).unwrap();
+    odd.insert(1, Stage::Epilogue { dst: "s".into(), expr: Expr::parse("acc * 2.0").unwrap(), mat: Default::default() });
+    assert!(heavy::spelled(&odd, 64).unwrap_err().contains("no emitter spells"));
+}
+
+#[test]
+fn heavy_records_slot_and_mainloop_and_wgsl_refuses_the_module_functions() {
+    let t = Target::sm_120();
+    let k = KernelInstance::gemm(&t, "gate_up_mma", gate_up(), WeightFormat::Fp8, Tile::SMALL, true, false).unwrap();
+    let h = Heavy::lift(&k).unwrap().unwrap();
+    assert_eq!(h.family, Family::Tile { wf: WeightFormat::Fp8, split: true, token_major: false });
+    assert_eq!((h.problem.n, h.problem.k, h.tile), (34816, 5120, Some(Tile::SMALL)));
+    assert!(h.prologue.is_empty());
+    assert!(Heavy::lift(&KernelInstance::quant_fp4(&t).unwrap()).unwrap().is_none(), "quant rows are light, not heavy");
+    let gated = Expr::parse("gated(1.0, 2.0)").unwrap();
+    assert_eq!(gated.lower(Dialect::Cuda, &[]).unwrap(), "gated_act(1.0f, 2.0f)");
+    assert!(gated.lower(Dialect::Wgsl, &[]).is_err());
+    assert!(Expr::parse("mapped(a, b)").is_err());
+}
+
+fn store_only(t: &Target, name: &str, shape: GemmShape, wf: WeightFormat, tile: Tile) -> Heavy {
+    let bare = GemmShape { epi: Epilogue::Store, ..shape };
+    Heavy::lift(&KernelInstance::gemm(t, name, bare, wf, tile, true, false).unwrap()).unwrap().unwrap()
+}
+
+#[test]
+fn attaching_the_residual_and_act_stages_rebuilds_the_hand_epilogues() {
+    for t in heavy_targets() {
+        let residual = vec![
+            Stage::TileLoad { dst: "r".into(), src: heavy::OUT.into(), tile: None, mat: Default::default() },
+            Stage::Epilogue { dst: "y".into(), expr: Expr::parse("acc + r").unwrap(), mat: Default::default() },
+            Stage::TileStore { dst: heavy::OUT.into(), value: "y".into(), tile: None },
+        ];
+        let o = store_only(&t, "o_mma", down(), WeightFormat::Bf16, Tile::SMALL).attach(&t, "epilogue_attach", Slot::Epilogue, residual.clone()).unwrap();
+        let hand = KernelInstance::gemm(&t, "o_mma", down(), WeightFormat::Bf16, Tile::SMALL, true, false).unwrap();
+        assert_eq!(o.lower(&t).unwrap(), hand);
+        assert_eq!(kir::cuda::emit_gemm(&o.lower(&t).unwrap()).unwrap(), kir::cuda::emit_gemm(&hand).unwrap());
+        let biased = GemmShape { bias: true, ..down() };
+        let ob = store_only(&t, "o_mma", biased, WeightFormat::Bf16, Tile::SMALL).attach(&t, "epilogue_attach", Slot::Epilogue, residual).unwrap();
+        assert_eq!(ob.lower(&t).unwrap(), KernelInstance::gemm(&t, "o_mma", biased, WeightFormat::Bf16, Tile::SMALL, true, false).unwrap());
+        let act = heavy::epilogue(Epilogue::Act, false, gate_up().n).unwrap();
+        let gu = store_only(&t, "gate_up_mma", gate_up(), WeightFormat::Fp8, Tile::SMALL).attach(&t, "epilogue_attach", Slot::Epilogue, act).unwrap();
+        assert_eq!(gu.lower(&t).unwrap(), KernelInstance::gemm(&t, "gate_up_mma", gate_up(), WeightFormat::Fp8, Tile::SMALL, true, false).unwrap());
+        let map = vec![
+            Stage::Epilogue { dst: "y".into(), expr: Expr::parse("mapped(acc)").unwrap(), mat: Default::default() },
+            Stage::TileStore { dst: heavy::PLANES.into(), value: "y".into(), tile: None },
+        ];
+        let up = store_only(&t, "up_map_mma", up_map(), WeightFormat::Bf16, Tile::SMALL).attach(&t, "epilogue_attach", Slot::Epilogue, map).unwrap();
+        assert_eq!(up.lower(&t).unwrap(), KernelInstance::gemm(&t, "up_map_mma", up_map(), WeightFormat::Bf16, Tile::SMALL, true, false).unwrap());
+    }
+}
+
+#[test]
+fn an_epilogue_no_emitter_spells_is_refused_naming_the_pass() {
+    let t = Target::sm_120();
+    let scale = vec![
+        Stage::Epilogue { dst: "y".into(), expr: Expr::parse("acc * 0.5").unwrap(), mat: Default::default() },
+        Stage::TileStore { dst: heavy::OUT.into(), value: "y".into(), tile: None },
+    ];
+    let err = store_only(&t, "qkv_mma", qkv(), WeightFormat::Bf16, Tile::SMALL).attach(&t, "epilogue_attach", Slot::Epilogue, scale).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("pass epilogue_attach") && msg.contains("qkv_mma") && msg.contains("no emitter spells"), "{msg}");
+    let clash = vec![Stage::TileLoad { dst: "b".into(), src: heavy::OUT.into(), tile: None, mat: Default::default() }];
+    let biased = GemmShape { bias: true, ..qkv() };
+    let err = store_only(&t, "qkv_mma", biased, WeightFormat::Bf16, Tile::SMALL).attach(&t, "epilogue_attach", Slot::Epilogue, clash).unwrap_err();
+    assert!(err.to_string().contains("already defined"), "{err}");
+}
+
+#[test]
+fn the_fused_kernel_budget_is_checked_against_the_target_and_names_the_pass() {
+    let t = Target::sm_120();
+    let h = Heavy::lift(&KernelInstance::gemm(&t, "qkv_mma_big", qkv(), WeightFormat::Bf16, Tuning::default().tile(Variant::Big), true, false).unwrap()).unwrap().unwrap();
+    let b = h.budget(&t, "slot_fit").unwrap();
+    assert_eq!(b.regs, heavy::acc_regs(128 * 128, 256) + 2);
+    assert!(b.smem > 0 && b.smem <= t.smem_limit);
+    let tight = Target { max_regs: b.regs - 1, ..t };
+    let err = h.budget(&tight, "slot_fit").unwrap_err();
+    assert_eq!(err, HeavyError::Budget { pass: "slot_fit".into(), kernel: "qkv_mma_big".into(), what: "registers per thread", need: b.regs as u64, limit: b.regs as u64 - 1 });
+    let norm = vec![
+        Stage::TileLoad { dst: "x".into(), src: "x".into(), tile: None, mat: Default::default() },
+        Stage::BlockSum { dst: "total".into(), expr: Expr::parse("x * x").unwrap() },
+    ];
+    let err = h.clone().attach(&t, "prologue_attach", Slot::Prologue, norm.clone()).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.starts_with("pass prologue_attach: kernel qkv_mma_big needs") && msg.contains("bytes of shared memory"), "{msg}");
+    let gemv = Heavy::lift(&KernelInstance::ggml_gemv(&t, "down_ggv", GemmShape::new(1024, 3072, Epilogue::Residual, false), false).unwrap()).unwrap().unwrap();
+    let err = gemv.attach(&t, "prologue_attach", Slot::Prologue, norm).unwrap_err();
+    assert!(err.to_string().contains("pass prologue_attach") && err.to_string().contains("no prologue emitter"), "{err}");
+}
+
+const HIDDEN: usize = 5120;
+const INTER: usize = 17408;
+
+fn hand_gemvs(t: &Target) -> Vec<GemvKernel> {
+    let g = |name: &str, op: Gemv| GemvKernel::new(t, name, op).unwrap();
+    vec![
+        g("qkv_proj", Gemv::Linear { decoder: "DecFp8".into(), n: 14336, k: HIDDEN, bias: true, residual: false }),
+        g("down_proj", Gemv::Linear { decoder: "DecQ8".into(), n: HIDDEN, k: INTER, bias: false, residual: true }),
+        g("qkv_proj_norm", Gemv::Norm { decoder: "DecFp8".into(), n: 14336, bias: true }),
+        g("lin_ba_norm", Gemv::Norm { decoder: "DecBf16".into(), n: 96, bias: false }),
+        g("lm_head_norm", Gemv::Norm { decoder: "DecGgml".into(), n: 248320, bias: false }),
+        g("gate_up_act", Gemv::GateUpAct { decoder: "DecBf16".into() }),
+    ]
+}
+
+fn bare_gemv(name: &str, wf: WeightFormat, n: usize, bias: bool) -> Heavy {
+    let mut h = Heavy::new(name, Family::Gemv { wf }, kir::heavy::Problem { n, k: HIDDEN, act: kir::Activation::Silu }, None);
+    h.epilogue = heavy::epilogue(Epilogue::Store, bias, n).unwrap();
+    h
+}
+
+#[test]
+fn the_norm_prologue_is_the_rmsnorm_stage_list() {
+    let p = heavy::norm_prologue();
+    assert!(matches!(p.first(), Some(Stage::TileLoad { src, .. }) if src == heavy::X));
+    assert!(p.iter().any(|s| matches!(s, Stage::BlockSum { .. })));
+    assert!(matches!(p.last(), Some(Stage::TileStore { dst, .. }) if dst == heavy::STAGED));
+    assert!(heavy::spelled_prologue(&p).unwrap());
+    assert!(!heavy::spelled_prologue(&[]).unwrap());
+    let mut odd = p.clone();
+    odd.remove(1);
+    assert!(heavy::spelled_prologue(&odd).unwrap_err().contains("no emitter spells the prologue"));
+}
+
+#[test]
+fn every_gemv_lifts_to_heavy_and_lowers_to_the_same_kernel_and_text() {
+    let t = Target::sm_120();
+    let hand = hand_gemvs(&t);
+    for k in &hand {
+        let h = Heavy::lift_gemv(k, HIDDEN, INTER).unwrap().unwrap();
+        assert_eq!(&h.compile_gemv(&t, "test").unwrap(), k, "{}", k.name);
+        let normed = matches!(k.op, Gemv::Norm { .. } | Gemv::GateUpAct { .. });
+        assert_eq!(h.prologue == heavy::norm_prologue(), normed, "{}", k.name);
+        assert_eq!(h.prologue.is_empty(), !normed, "{}", k.name);
+    }
+    let lowered: Vec<GemvKernel> = hand.iter().map(|k| Heavy::lift_gemv(k, HIDDEN, INTER).unwrap().unwrap().lower_gemv(&t).unwrap()).collect();
+    assert_eq!(kir::gemv::emit_gemvs(&lowered).unwrap(), kir::gemv::emit_gemvs(&hand).unwrap());
+    let rows = GemvKernel::new(&t, "lin_ba_rows", Gemv::Bf16Rows { n: 96, k: HIDDEN }).unwrap();
+    assert!(Heavy::lift_gemv(&rows, HIDDEN, INTER).unwrap().is_none(), "the token rows kernel has no slots");
+    assert!(Heavy::lift(&KernelInstance::fp4_gemv(&t, "down_proj_f4", Fp4Gemv::Down, HIDDEN, INTER).unwrap()).unwrap().unwrap().prologue.is_empty());
+}
+
+#[test]
+fn attaching_the_norm_prologue_rebuilds_linear_norm_and_gate_up_act_norm() {
+    let t = Target::sm_120();
+    let hand = hand_gemvs(&t);
+    let norm = |h: Heavy| h.attach(&t, "prologue_attach", Slot::Prologue, heavy::norm_prologue()).unwrap();
+    let qkv = norm(bare_gemv("qkv_proj_norm", WeightFormat::Fp8, 14336, true));
+    assert_eq!(qkv.lower_gemv(&t).unwrap(), hand[2]);
+    let ba = norm(bare_gemv("lin_ba_norm", WeightFormat::Bf16, 96, false));
+    assert_eq!(ba.lower_gemv(&t).unwrap(), hand[3]);
+    let act = heavy::epilogue_into(Epilogue::Act, false, 2 * INTER, heavy::OUT).unwrap();
+    let gu = norm(bare_gemv("gate_up_act", WeightFormat::Bf16, 2 * INTER, false)).attach(&t, "epilogue_attach", Slot::Epilogue, act.clone()).unwrap();
+    assert_eq!(gu.lower_gemv(&t).unwrap(), hand[5]);
+    let fp4 = |name: &str, n: usize| {
+        let mut h = Heavy::new(name, Family::Fp4Gemv, kir::heavy::Problem { n, k: HIDDEN, act: kir::Activation::Silu }, None);
+        h.epilogue = heavy::epilogue(Epilogue::Store, false, n).unwrap();
+        norm(h)
+    };
+    let head = fp4("lm_head_norm_f4", 248320);
+    assert_eq!(head.lower(&t).unwrap(), KernelInstance::fp4_head_norm(&t, "lm_head_norm_f4", 248320, HIDDEN).unwrap());
+    let gu4 = fp4("gate_up_act_f4", 2 * INTER).attach(&t, "epilogue_attach", Slot::Epilogue, act).unwrap();
+    let hand4 = KernelInstance::fp4_gemv(&t, "gate_up_act_f4", Fp4Gemv::GateUpAct, 2 * INTER, HIDDEN).unwrap();
+    assert_eq!(gu4.lower(&t).unwrap(), hand4);
+    assert_eq!(kir::cuda::emit_gemm(&gu4.lower(&t).unwrap()).unwrap(), kir::cuda::emit_gemm(&hand4).unwrap());
+}
+
+#[test]
+fn a_gemv_slot_list_no_emitter_spells_is_refused_naming_the_pass() {
+    let t = Target::sm_120();
+    let act = heavy::epilogue_into(Epilogue::Act, false, 2 * INTER, heavy::OUT).unwrap();
+    let err = bare_gemv("gate_up_act", WeightFormat::Bf16, 2 * INTER, false).attach(&t, "epilogue_attach", Slot::Epilogue, act).unwrap_err().to_string();
+    assert!(err.contains("pass epilogue_attach") && err.contains("gate_up_act") && err.contains("no gemv emitter"), "{err}");
+    let mut odd = heavy::norm_prologue();
+    odd.pop();
+    let err = bare_gemv("qkv_proj_norm", WeightFormat::Fp8, 14336, false).attach(&t, "prologue_attach", Slot::Prologue, odd).unwrap_err().to_string();
+    assert!(err.contains("pass prologue_attach") && err.contains("no emitter spells the prologue"), "{err}");
+    let normed = bare_gemv("lm_head_norm", WeightFormat::Bf16, 248320, false).attach(&t, "prologue_attach", Slot::Prologue, heavy::norm_prologue()).unwrap();
+    let b = normed.budget(&t, "slot_fit").unwrap();
+    assert_eq!(b.smem, (HIDDEN * 4) as u32, "the normed row is staged in shared memory");
+    let small = Target { smem_limit: b.smem - 1, ..t };
+    let err = normed.budget(&small, "slot_fit").unwrap_err();
+    assert_eq!(err, HeavyError::Budget { pass: "slot_fit".into(), kernel: "lm_head_norm".into(), what: "bytes of shared memory", need: b.smem as u64, limit: b.smem as u64 - 1 });
+    assert!(normed.lower(&t).unwrap_err().to_string().contains("lowers to a gemv"));
 }

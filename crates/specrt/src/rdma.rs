@@ -35,6 +35,7 @@ pub enum Transport {
 pub struct LinkOptions {
     pub transport: Transport,
     pub library: Option<String>,
+    pub gpu_direct: bool,
 }
 
 impl LinkOptions {
@@ -357,6 +358,7 @@ pub struct Endpoint {
     mtu: u32,
     pub device: String,
     local: ConnInfo,
+    extra_mrs: std::sync::Mutex<Vec<usize>>,
 }
 
 unsafe impl Send for Endpoint {}
@@ -380,6 +382,7 @@ impl Endpoint {
                 mtu: sel.mtu,
                 device: sel.name,
                 local: ConnInfo { qpn: 0, psn: 0, gid: sel.gid, addr: 0, rkey: 0 },
+                extra_mrs: std::sync::Mutex::new(Vec::new()),
             };
             ep.pd = (verbs.alloc_pd)(ep.ctx);
             ensure!(!ep.pd.is_null(), "ibv_alloc_pd failed");
@@ -488,13 +491,29 @@ impl Endpoint {
         let f = self.verbs.reg_dmabuf_mr.context("this libibverbs has no ibv_reg_dmabuf_mr")?;
         let mr = unsafe { f(self.pd, offset, len, iova, fd, 1 | 2) };
         ensure!(!mr.is_null(), "ibv_reg_dmabuf_mr failed");
+        self.extra_mrs.lock().unwrap().push(mr as usize);
+        Ok(mr)
+    }
+
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn deregister(&self, mr: *mut c_void) {
+        let mut held = self.extra_mrs.lock().unwrap();
+        if let Some(i) = held.iter().position(|m| *m == mr as usize) {
+            held.swap_remove(i);
+            unsafe { (self.verbs.dereg_mr)(mr) };
+        }
+    }
+
+    pub fn register_host_mr(&self, addr: *mut u8, len: usize) -> Result<*mut c_void> {
+        let mr = unsafe { (self.verbs.reg_mr)(self.pd, addr as *mut c_void, len, 1 | 2) };
+        ensure!(!mr.is_null(), "ibv_reg_mr failed");
+        self.extra_mrs.lock().unwrap().push(mr as usize);
         Ok(mr)
     }
 
     pub fn register_host(&self, addr: *mut u8, len: usize) -> Result<(u32, u32)> {
-        let mr = unsafe { (self.verbs.reg_mr)(self.pd, addr as *mut c_void, len, 1 | 2) };
-        ensure!(!mr.is_null(), "ibv_reg_mr failed");
-        Ok(unsafe { (field_u32(mr, OFF_MR_LKEY), field_u32(mr, OFF_MR_RKEY)) })
+        let mr = self.register_host_mr(addr, len)?;
+        Ok(self.keys(mr))
     }
 
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -503,15 +522,36 @@ impl Endpoint {
     }
 
     pub fn write_imm(&mut self, local: u64, len: usize, lkey: u32, remote: u64, rkey: u32) -> Result<()> {
+        self.write_with_imm(9, local, len, lkey, remote, rkey, 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_with_imm(&mut self, wr_id: u64, local: u64, len: usize, lkey: u32, remote: u64, rkey: u32, imm: u32) -> Result<()> {
         unsafe {
             let mut sge = Sge { addr: local, length: len as u32, lkey };
-            let mut wr = SendWr { wr_id: 9, next: null_mut(), sg_list: &mut sge, num_sge: 1, opcode: 1, send_flags: 2, imm: 1u32.to_be(), remote_addr: remote, rkey, tail: [0; 76] };
+            let mut wr = SendWr { wr_id, next: null_mut(), sg_list: &mut sge, num_sge: 1, opcode: 1, send_flags: 2, imm: imm.to_be(), remote_addr: remote, rkey, tail: [0; 76] };
             let mut bad: *mut SendWr = null_mut();
             let post: PostSend = ctx_fn(self.qp, OFF_CTX_POST_SEND);
             let rc = post(self.qp, &mut wr, &mut bad);
             ensure!(rc == 0, "ibv_post_send failed ({rc})");
         }
         Ok(())
+    }
+
+    pub fn events(&mut self) -> Result<Vec<Event>> {
+        let mut wcs = [Wc::default(); 16];
+        let n = self.poll(&mut wcs)?;
+        let mut out = Vec::new();
+        for wc in &wcs[..n] {
+            ensure!(wc.status == 0, "rdma completion failed with status {} (vendor {}): the peer is unreachable", wc.status, wc.vendor_err);
+            if wc.opcode == 129 {
+                self.post_recv()?;
+                out.push(Event::Imm(u32::from_be(wc.imm)));
+            } else {
+                out.push(Event::Sent);
+            }
+        }
+        Ok(out)
     }
 
     pub fn completions(&mut self) -> Result<(usize, usize)> {
@@ -529,6 +569,12 @@ impl Endpoint {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Event {
+    Sent,
+    Imm(u32),
+}
+
 impl Drop for Endpoint {
     fn drop(&mut self) {
         unsafe {
@@ -537,6 +583,9 @@ impl Drop for Endpoint {
             }
             if !self.cq.is_null() {
                 (self.verbs.destroy_cq)(self.cq);
+            }
+            for mr in self.extra_mrs.get_mut().unwrap().drain(..) {
+                (self.verbs.dereg_mr)(mr as *mut c_void);
             }
             if !self.send_mr.is_null() {
                 (self.verbs.dereg_mr)(self.send_mr);

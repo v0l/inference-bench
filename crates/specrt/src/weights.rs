@@ -1438,6 +1438,14 @@ impl Checkpoint {
         Ok((norm, lm_head))
     }
 
+    fn head_name(&self) -> String {
+        let nested = self.root().strip_suffix(".model").map(|p| format!("{p}.lm_head.weight"));
+        match nested {
+            Some(n) if self.has(&n) => n,
+            _ => "lm_head.weight".to_string(),
+        }
+    }
+
     fn head_raw<'s>(&'s self, spec: &Spec, embed: &Cow<'s, [u16]>) -> Result<Raw<'s>> {
         let d = &spec.dims;
         if d.tie_embeddings && self.gguf.is_some() {
@@ -1445,7 +1453,7 @@ impl Checkpoint {
         } else if d.tie_embeddings {
             Ok(Raw::Bf16 { w: embed.clone(), cols: d.hidden })
         } else {
-            self.raw("lm_head.weight", d.vocab, d.hidden)
+            self.raw(&self.head_name(), d.vocab, d.hidden)
         }
     }
 

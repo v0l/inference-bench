@@ -61,6 +61,10 @@ impl WeightFormat {
         }
     }
 
+    pub fn from_decoder(decoder: &str) -> Option<WeightFormat> {
+        [WeightFormat::Bf16, WeightFormat::Q8, WeightFormat::Fp8, WeightFormat::Ggml, WeightFormat::Fp4].into_iter().find(|w| w.decoder() == decoder)
+    }
+
     pub fn gemv_rows(self) -> usize {
         match self {
             WeightFormat::Ggml => 2,
