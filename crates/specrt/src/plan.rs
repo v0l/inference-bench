@@ -8,7 +8,7 @@ pub enum Phase {
     Verify,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Buf {
     X,
     Xn,
@@ -54,6 +54,10 @@ impl Buf {
             Buf::MtpLogits => "draft logits",
             Buf::Partial => "rank partial",
         }
+    }
+
+    pub fn is_planes(self) -> bool {
+        matches!(self, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes)
     }
 }
 
@@ -434,7 +438,7 @@ impl Op {
             Op::MoeRoute => names(&["moe_route_logits", "moe_route"]),
             Op::MoeExperts => names(&["moe_up_bf16", "moe_down_bf16"]),
             Op::MoeCombine => names(&["moe_combine"]),
-            Op::AllReduce => names(&["ar_one_shot_f32", "ar_two_shot_f32"]),
+            Op::AllReduce => vec![crate::allreduce::kernel_name(crate::allreduce::pick_mode(tokens * spec.dims.hidden * 4), kir::allreduce::Dtype::F32)],
             Op::AllReduceNorm { .. } => names(&["ar_add_rmsnorm_f32"]),
         }
     }
