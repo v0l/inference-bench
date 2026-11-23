@@ -1,4 +1,6 @@
 use crate::placement::{DeviceConfig, Discovery, PlacementConfig};
+use crate::direct::{DirectLink, DirectRegion, PendingLink};
+use crate::rdma::{ConnInfo, LinkOptions, Transport};
 use crate::runtime::{DecodeRow, Layout, Runtime, Sampling, StageRange, Stepper};
 use crate::spec::Spec;
 use crate::wire::{Chain, ChainTimes, Input, Message, StageHandler, StageServer};
@@ -146,8 +148,22 @@ impl MemoryGuard {
     }
 }
 
+#[derive(Default)]
+struct DirectState {
+    regions: Option<(Arc<DirectRegion>, Arc<DirectRegion>)>,
+    pending_next: Option<PendingLink>,
+    pending_prev: Option<PendingLink>,
+    next: Option<DirectLink>,
+    prev: Option<DirectLink>,
+    push: bool,
+}
+
+const DIRECT_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct RuntimeStage {
     guard: Mutex<Option<MemoryGuard>>,
+    direct: Mutex<DirectState>,
+    link: Mutex<LinkOptions>,
     spec: Spec,
     max_ctx: usize,
     slots: usize,
@@ -189,7 +205,7 @@ impl RuntimeStage {
     pub fn load(spec: &Spec, layers: [usize; 2], max_ctx: usize, slots: usize, device: usize) -> Result<RuntimeStage> {
         let api = if spec.runtime.backend == crate::spec::BackendChoice::Wgpu { Api::Wgpu } else { Api::Cuda };
         let loaded = load_range(spec, layers, max_ctx, slots, device, api)?;
-        Ok(RuntimeStage { spec: spec.clone(), max_ctx, slots, device, api, inner: Mutex::new(Some(loaded)), guard: Mutex::new(None) })
+        Ok(RuntimeStage { spec: spec.clone(), max_ctx, slots, device, api, inner: Mutex::new(Some(loaded)), guard: Mutex::new(None), direct: Mutex::default(), link: Mutex::default() })
     }
 
     pub fn unloaded_on(spec: &Spec, max_ctx: usize, slots: usize, device: usize) -> RuntimeStage {
@@ -198,7 +214,93 @@ impl RuntimeStage {
     }
 
     pub fn unloaded_with(spec: &Spec, max_ctx: usize, slots: usize, device: usize, api: Api) -> RuntimeStage {
-        RuntimeStage { spec: spec.clone(), max_ctx, slots, device, api, inner: Mutex::new(None), guard: Mutex::new(None) }
+        RuntimeStage { spec: spec.clone(), max_ctx, slots, device, api, inner: Mutex::new(None), guard: Mutex::new(None), direct: Mutex::default(), link: Mutex::default() }
+    }
+
+    pub fn set_link(&self, link: LinkOptions) {
+        *self.link.lock().unwrap() = link;
+    }
+
+    pub fn direct_active(&self) -> bool {
+        let d = self.direct.lock().unwrap();
+        d.push || d.prev.is_some()
+    }
+
+    fn direct_open(&self, next: bool, ip: &str) -> Result<Message> {
+        let link = self.link.lock().unwrap().clone();
+        ensure!(link.gpu_direct && link.transport != Transport::Tcp, "gpu-direct is not enabled on this stage");
+        let ip = ip.parse().with_context(|| format!("address {ip}"))?;
+        let verbs = crate::rdma::Verbs::load(link.library())?;
+        ensure!(verbs.supports_dmabuf(), "this libibverbs has no ibv_reg_dmabuf_mr");
+        let mut guard = self.inner.lock().unwrap();
+        let Loaded { engine, .. } = guard.as_mut().context("this stage has no layers loaded")?;
+        let rt = match engine {
+            Engine::Cuda { rt, .. } => rt,
+            #[cfg(feature = "wgpu")]
+            Engine::Wgpu(_) => anyhow::bail!("gpu-direct needs a CUDA stage"),
+        };
+        let mut d = self.direct.lock().unwrap();
+        if d.regions.is_none() {
+            let bytes = rt.hidden_capacity_bytes();
+            let ctx = rt.context().clone();
+            d.regions = Some((Arc::new(DirectRegion::new(&ctx, bytes)?), Arc::new(DirectRegion::new(&ctx, bytes)?)));
+        }
+        let (outbox, landing) = d.regions.clone().expect("regions");
+        let (pending, info) = DirectLink::offer(&outbox, &landing, &link, ip)?;
+        if next {
+            d.pending_next = Some(pending);
+        } else {
+            d.pending_prev = Some(pending);
+        }
+        Ok(Message::DirectInfo { qpn: info.qpn, psn: info.psn, gid: info.gid, addr: info.addr, rkey: info.rkey, capacity: landing.len() as u64 })
+    }
+
+    fn direct_connect(&self, next: bool, remote: ConnInfo, capacity: u64) -> Result<Message> {
+        let mut d = self.direct.lock().unwrap();
+        let pending = if next { d.pending_next.take() } else { d.pending_prev.take() };
+        let link = pending.context("no direct offer is pending")?.connect(remote, capacity as usize)?;
+        if next {
+            d.next = Some(link);
+        } else {
+            d.prev = Some(link);
+        }
+        Ok(Message::Ack)
+    }
+
+    fn direct_mode(&self, enabled: bool) -> Message {
+        let mut d = self.direct.lock().unwrap();
+        d.push = enabled && d.next.is_some();
+        Message::Ack
+    }
+
+    fn reset_direct(&self) {
+        *self.direct.lock().unwrap() = DirectState::default();
+    }
+
+    fn take_direct(&self, rt: &mut Runtime, rows: usize) -> Result<()> {
+        let mut d = self.direct.lock().unwrap();
+        let landing = d.regions.as_ref().context("no direct link is open on this stage")?.1.clone();
+        let bytes = rows * rt.hidden_row_bytes();
+        let link = d.prev.as_mut().context("no direct link from the previous stage")?;
+        link.wait(bytes, DIRECT_TIMEOUT)?;
+        rt.import_hidden_device(rows, landing.ptr())
+    }
+
+    fn emit(&self, rt: &Runtime, rows: usize, compute_us: u32) -> Result<Message> {
+        let bytes = rows * rt.hidden_row_bytes();
+        let mut d = self.direct.lock().unwrap();
+        let outbox = d.regions.as_ref().map(|r| r.0.clone());
+        if d.push
+            && let (Some(outbox), Some(link)) = (outbox, d.next.as_mut())
+            && bytes <= link.capacity().min(outbox.len())
+        {
+            rt.export_hidden_device(rows, outbox.ptr())?;
+            link.push(bytes, DIRECT_TIMEOUT)?;
+            return Ok(Message::Pushed { rows: rows as u32, compute_us });
+        }
+        drop(d);
+        let h = rt.export_hidden(rows)?;
+        Ok(Message::Output { rows: rows as u32, data: f32_bytes(&h), compute_us })
     }
 
     pub fn guard_memory(&self, guard: Option<MemoryGuard>) {
@@ -211,6 +313,7 @@ impl RuntimeStage {
             return Ok(());
         }
         *guard = None;
+        self.reset_direct();
         if let Some(g) = self.guard.lock().unwrap().clone() {
             g.check(&self.spec, layers, self.max_ctx, self.slots, self.device)?;
         }
@@ -244,6 +347,11 @@ impl RuntimeStage {
                 rt.import_hidden(&bytes_f32(&data)?)?;
                 (vec![0; rows as usize], rows as usize)
             }
+            Input::Direct { rows } => {
+                ensure!(!role.first, "this stage owns the embedding, send token ids");
+                self.take_direct(rt, rows as usize)?;
+                (vec![0; rows as usize], rows as usize)
+            }
         };
         let token = if decode {
             ensure!(rows == 1, "a decode step carries one row");
@@ -257,9 +365,8 @@ impl RuntimeStage {
             let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
             return Ok(Message::Token { token, compute_us });
         }
-        let h = rt.export_hidden(rows)?;
         let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
-        Ok(Message::Output { rows: rows as u32, data: f32_bytes(&h), compute_us })
+        self.emit(rt, rows, compute_us)
     }
 
     fn decode_batch(&self, slots: Vec<u32>, positions: Vec<u32>, input: Input) -> Result<Message> {
@@ -287,6 +394,12 @@ impl RuntimeStage {
                 rt.import_hidden(&bytes_f32(&data)?)?;
                 vec![0; rows]
             }
+            Input::Direct { rows: n } => {
+                ensure!(!role.first, "this stage owns the embedding, send token ids");
+                ensure!(n as usize == rows, "{n} hidden rows for {rows} slots");
+                self.take_direct(rt, rows)?;
+                vec![0; rows]
+            }
         };
         let batch: Vec<DecodeRow> = (0..rows)
             .map(|i| DecodeRow { slot: slots[i] as usize, token: tokens[i], pos: positions[i] as usize, sampling: Sampling::GREEDY, step: 0 })
@@ -296,9 +409,8 @@ impl RuntimeStage {
             let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
             return Ok(Message::Tokens { tokens: out, compute_us });
         }
-        let h = rt.export_hidden(rows)?;
         let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
-        Ok(Message::Output { rows: rows as u32, data: f32_bytes(&h), compute_us })
+        self.emit(rt, rows, compute_us)
     }
 }
 
@@ -323,6 +435,15 @@ impl StageHandler for RuntimeStage {
                 Err(e) => Message::Error { message: format!("{e:#}") },
             },
             Message::Free { .. } | Message::Cancel { .. } => Message::Ack,
+            Message::DirectOpen { next, ip } => match self.direct_open(next, &ip) {
+                Ok(reply) => reply,
+                Err(e) => Message::Error { message: format!("{e:#}") },
+            },
+            Message::DirectConnect { next, qpn, psn, gid, addr, rkey, capacity } => match self.direct_connect(next, ConnInfo { qpn, psn, gid, addr, rkey }, capacity) {
+                Ok(reply) => reply,
+                Err(e) => Message::Error { message: format!("{e:#}") },
+            },
+            Message::DirectMode { enabled } => self.direct_mode(enabled),
             other => Message::Error { message: format!("unexpected {other:?}") },
         }
     }
@@ -342,6 +463,7 @@ fn wgpu_input<'a>(input: &'a Input, hidden: &'a mut Vec<f32>) -> Result<crate::b
             *hidden = bytes_f32(data)?;
             StageInput::Hidden(hidden)
         }
+        Input::Direct { .. } => anyhow::bail!("gpu-direct input reached a wgpu stage"),
     })
 }
 
@@ -352,6 +474,7 @@ fn forward_wgpu(d: &mut crate::backends::dense::Dense<crate::backends::wgpu::Wgp
     let rows = match &input {
         Input::Tokens(t) => t.len(),
         Input::Hidden { rows, .. } => *rows as usize,
+        Input::Direct { .. } => anyhow::bail!("gpu-direct input reached a wgpu stage"),
     };
     ensure!(!decode || rows == 1, "a decode step carries one row");
     let out = d.stage_forward(slot as usize, position as usize, wgpu_input(&input, &mut hidden)?, decode, true)?;
@@ -374,6 +497,7 @@ fn decode_batch_wgpu(d: &mut crate::backends::dense::Dense<crate::backends::wgpu
             ensure!(*rows as usize == slots.len(), "{rows} hidden rows for {} slots", slots.len());
             (Vec::new(), bytes_f32(data)?)
         }
+        Input::Direct { .. } => anyhow::bail!("gpu-direct input reached a wgpu stage"),
     };
     let (mut ids, mut carried) = (Vec::new(), Vec::new());
     for (i, (&slot, &pos)) in slots.iter().zip(positions).enumerate() {
@@ -403,6 +527,7 @@ pub fn serve(config: &StageConfig, placement: Option<&PlacementConfig>) -> Resul
         None => RuntimeStage::unloaded_on(&spec, config.max_ctx, config.slots, device),
     });
     let link = placement.and_then(|p| p.remote.as_ref()).map(|r| r.link()).unwrap_or_default();
+    stage.set_link(link.clone());
     let server = StageServer::start_with(&config.bind, &config.key()?, stage.clone(), link)?;
     let announcer = match (placement.map(|p| p.discovery), &config.device) {
         (Some(Discovery::Mdns), Some(device)) => {

@@ -29,6 +29,7 @@ impl StageHandler for Fake {
                 let sum: u32 = match &input {
                     Input::Tokens(t) => t.iter().sum(),
                     Input::Hidden { data, .. } => data.iter().map(|b| *b as u32).sum(),
+                    Input::Direct { .. } => 0,
                 };
                 if self.last {
                     Message::Token { token: sum + 1, compute_us: 7 }
@@ -69,6 +70,13 @@ fn every_message_round_trips_through_the_codec() {
         Message::DecodeBatch { slots: vec![0, 3, 5], positions: vec![10, 20, 30], input: Input::Tokens(vec![7, 8, 9]) },
         Message::DecodeBatch { slots: vec![1, 2], positions: vec![4, 5], input: Input::Hidden { rows: 2, data: vec![3; 32] } },
         Message::Tokens { tokens: vec![5, 6, 7], compute_us: 12 },
+        Message::Forward { slot: 1, position: 4, input: Input::Direct { rows: 3 }, decode: false },
+        Message::DecodeBatch { slots: vec![1], positions: vec![4], input: Input::Direct { rows: 1 } },
+        Message::DirectOpen { next: true, ip: "10.100.50.1".into() },
+        Message::DirectInfo { qpn: 1, psn: 2, gid: [7; 16], addr: 99, rkey: 5, capacity: 4 << 20 },
+        Message::DirectConnect { next: false, qpn: 1, psn: 2, gid: [7; 16], addr: 99, rkey: 5, capacity: 4 << 20 },
+        Message::DirectMode { enabled: true },
+        Message::Pushed { rows: 2, compute_us: 8 },
     ];
     for m in messages {
         let mut buf = Vec::new();

@@ -34,6 +34,7 @@ impl StageHandler for Fake {
                 let sum: u32 = match &input {
                     Input::Tokens(t) => t.iter().sum(),
                     Input::Hidden { data, .. } => data.len() as u32,
+                    Input::Direct { .. } => 0,
                 };
                 if self.last {
                     Message::Token { token: sum, compute_us: 1 }
@@ -45,6 +46,7 @@ impl StageHandler for Fake {
                 let sum: u32 = match &input {
                     Input::Tokens(t) => t.iter().sum(),
                     Input::Hidden { data, .. } => data.len() as u32,
+                    Input::Direct { .. } => 0,
                 };
                 if self.last {
                     Message::Tokens { tokens: slots.iter().map(|s| sum + s).collect(), compute_us: 1 }

@@ -11,6 +11,7 @@ pub mod structure;
 pub mod chat;
 pub mod cluster;
 pub mod coordinator;
+pub mod direct;
 pub mod discovery;
 pub mod codegen;
 pub mod gemm;
