@@ -1080,11 +1080,15 @@ impl Checkpoint {
         };
         let ln1 = if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] };
         let ln2 = if spec.layers.split { ln1.clone() } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? };
+        let branch = |w: Vec<f32>| match spec.norm.residual_scale.filter(|_| spec.norm.sandwich) {
+            Some(s) => w.into_iter().map(|v| (v as f64 * s) as f32).collect(),
+            None => w,
+        };
         Ok(Layer {
             ln1,
-            ln2,
+            ln2: if spec.norm.sandwich { branch(ln2) } else { ln2 },
             ln_pre_mlp: if spec.norm.sandwich && spec.norm.pre { Some(self.norm(spec, &format!("{p}.pre_feedforward_layernorm.weight"), h)?) } else { None },
-            ln_post_mlp: if spec.norm.sandwich { Some(self.norm(spec, &format!("{p}.post_feedforward_layernorm.weight"), h)?) } else { None },
+            ln_post_mlp: if spec.norm.sandwich { Some(branch(self.norm(spec, &format!("{p}.post_feedforward_layernorm.weight"), h)?)) } else { None },
             mixer,
             gate_up,
             down,

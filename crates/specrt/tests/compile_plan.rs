@@ -272,6 +272,7 @@ fn launch_row(name: &str, spec: &Spec) -> (String, bool) {
 fn assert_launches(specs: &[(String, Spec)]) {
     let rows: Vec<(String, bool)> = specs.iter().map(|(n, s)| launch_row(n, s)).collect();
     let table: Vec<&str> = rows.iter().map(|(r, _)| r.as_str()).collect();
+    eprintln!("{}", table.join("\n"));
     assert!(rows.iter().all(|(_, ok)| *ok), "compiled single step launches against the unfused plan and the cost model:\n{}", table.join("\n"));
 }
 
@@ -280,6 +281,37 @@ fn the_compiled_step_launches_what_the_cost_model_predicts() {
     let specs: Vec<(String, Spec)> = all_specs().into_iter().filter(|(_, s)| runs_single_step(s)).collect();
     assert!(specs.len() >= 20, "{}", specs.len());
     assert_launches(&specs);
+}
+
+const MIXES: [&str; 3] = ["tiny-sandwich-scaled.toml", "tiny-sandwich-pre-qknorm.toml", "tiny-scaled-qknorm.toml"];
+
+fn mix(name: &str, store: bool) -> Spec {
+    let mut s = Spec::load(&root().join("tests/fixtures").join(name)).unwrap();
+    s.runtime.store_epilogue = store;
+    s
+}
+
+#[test]
+fn spec_only_mixes_get_their_fusions_from_the_passes() {
+    let mut specs = Vec::new();
+    for name in MIXES {
+        for store in [false, true] {
+            let s = mix(name, store);
+            assert!(runs_single_step(&s), "{name}");
+            specs.push((format!("{name} store_epilogue={store}"), s));
+        }
+    }
+    assert_launches(&specs);
+    for (name, s) in &specs {
+        let (_, trace) = specrt::compile::single_traced(s, &sm120(), 4096).unwrap();
+        let layer = trace.section("layer dense").unwrap_or_else(|| panic!("{name}\n{}", trace.render()));
+        let rules: Vec<specrt::fusion::Rule> = layer.fused.iter().map(|d| d.rule).collect();
+        let count = |r| rules.iter().filter(|x| **x == r).count();
+        use specrt::fusion::Rule;
+        assert_eq!(count(Rule::Fill), if s.runtime.store_epilogue { 2 } else { 0 }, "{name}\n{}", trace.render());
+        assert_eq!(count(Rule::Prologue), if s.norm.pre { 2 } else { 0 }, "{name}\n{}", trace.render());
+        assert!(count(Rule::Epilogue) >= 3, "{name}\n{}", trace.render());
+    }
 }
 
 #[test]

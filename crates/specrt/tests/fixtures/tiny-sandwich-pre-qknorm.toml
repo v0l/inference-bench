@@ -1,0 +1,34 @@
+name = "tiny-sandwich-pre-qknorm"
+repo = "tests/fixtures/tiny-sandwich-pre-qknorm"
+quant = "bf16"
+
+[dims]
+hidden = 128
+intermediate = 256
+vocab = 512
+tie_embeddings = true
+
+[layers]
+count = 4
+pattern = ["dense"]
+
+[norm]
+kind = "rmsnorm"
+eps = 0.000001
+sandwich = true
+
+[attention]
+kind = "gqa"
+heads = 4
+kv_heads = 2
+head_dim = 32
+qkv_bias = false
+qk_norm = true
+qk_norm_full = true
+
+[rope]
+style = "neox"
+theta = 1000000.0
+
+[mlp]
+activation = "swiglu"
