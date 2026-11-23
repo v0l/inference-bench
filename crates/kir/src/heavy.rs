@@ -65,13 +65,21 @@ pub struct Budget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeavyError {
     Lower { pass: String, kernel: String, reason: String },
+    Gemm { pass: String, kernel: String, error: GemmError },
     Budget { pass: String, kernel: String, what: &'static str, need: u64, limit: u64 },
+}
+
+impl HeavyError {
+    pub fn is_unsupported(&self) -> bool {
+        matches!(self, HeavyError::Gemm { error, .. } if error.is_unsupported())
+    }
 }
 
 impl fmt::Display for HeavyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             HeavyError::Lower { pass, kernel, reason } => write!(f, "pass {pass}: kernel {kernel}: {reason}"),
+            HeavyError::Gemm { pass, kernel, error } => write!(f, "pass {pass}: kernel {kernel}: {error}"),
             HeavyError::Budget { pass, kernel, what, need, limit } => write!(f, "pass {pass}: kernel {kernel} needs {need} {what}, the target has {limit}"),
         }
     }
@@ -338,20 +346,20 @@ impl Heavy {
         }
     }
 
-    fn mainloop(&self, t: &Target) -> Result<(u32, u32, usize, usize), String> {
+    fn mainloop(&self, t: &Target, pass: &str) -> Result<(u32, u32, usize, usize), HeavyError> {
         if let Family::Gemv { wf } = self.family {
-            let g = GemvKernel::new(t, &self.name, Gemv::Linear { decoder: wf.decoder().into(), n: self.problem.n, k: self.problem.k, bias: false, residual: false })?;
+            let g = GemvKernel::new(t, &self.name, Gemv::Linear { decoder: wf.decoder().into(), n: self.problem.n, k: self.problem.k, bias: false, residual: false })
+                .map_err(|reason| HeavyError::Lower { pass: pass.into(), kernel: self.name.clone(), reason })?;
             return Ok((g.threads(), 0, 1, g.threads() as usize));
         }
         let bare = GemmShape::new(self.problem.n, self.problem.k, Epilogue::Store, false).with_act(self.problem.act);
-        let main = self.build(t, bare).map_err(|e| e.to_string())?;
+        let main = self.build(t, bare).map_err(|error| HeavyError::Gemm { pass: pass.into(), kernel: self.name.clone(), error })?;
         let (rows, acc) = self.rows_and_acc(&main);
         Ok((main.threads, main.smem_bytes, rows, acc))
     }
 
     pub fn budget(&self, t: &Target, pass: &str) -> Result<Budget, HeavyError> {
-        let lower = |reason: String| HeavyError::Lower { pass: pass.into(), kernel: self.name.clone(), reason };
-        let (threads, smem, rows, acc) = self.mainloop(t).map_err(lower)?;
+        let (threads, smem, rows, acc) = self.mainloop(t, pass)?;
         let held = self.prologue.iter().chain(&self.epilogue).filter_map(defined).count() as u32;
         let staged = if self.prologue.is_empty() { 0 } else { rows * self.problem.k * 4 };
         let b = Budget { threads, regs: acc_regs(acc, threads) + held, smem: smem + staged as u32 };
@@ -370,7 +378,7 @@ impl Heavy {
 
     pub fn compile(&self, t: &Target, pass: &str) -> Result<KernelInstance, HeavyError> {
         self.budget(t, pass)?;
-        self.lower(t).map_err(|e| HeavyError::Lower { pass: pass.into(), kernel: self.name.clone(), reason: e.to_string() })
+        self.lower(t).map_err(|error| HeavyError::Gemm { pass: pass.into(), kernel: self.name.clone(), error })
     }
 
     fn check(&self, t: &Target, pass: &str) -> Result<(), HeavyError> {

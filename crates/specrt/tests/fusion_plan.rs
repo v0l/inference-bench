@@ -203,3 +203,35 @@ fn every_gemm_kernel_is_emitted_from_the_heavy_ir_and_checked_against_the_target
     let err = specrt::gemm::gemm_kernels(&hybrid(), &tight).err().expect("a 40 register target cannot hold the big tile accumulators").to_string();
     assert!(err.starts_with(&format!("pass {}: kernel ", specrt::gemm::KERNEL_SELECT)) && err.contains("registers per thread, the target has 40"), "{err}");
 }
+
+fn nvfp4() -> Spec {
+    Spec::load(&root().join("tests/fixtures/qwen3.8-27b-nvfp4-head-nvfp4.toml")).unwrap()
+}
+
+#[test]
+fn the_decode_norm_gemvs_are_built_by_the_prologue_attach_pass() {
+    use kir::gemv::Gemv;
+    for spec in [dense(), hybrid(), nvfp4(), Spec::load(&root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap()] {
+        let ops = specrt::codegen::ops_shape(&spec);
+        let built = specrt::codegen::gemv_kernels(&spec, &sm120(), &ops).unwrap();
+        let op = |name: &str| built.iter().find(|k| k.name == name).unwrap_or_else(|| panic!("{}: no {name}", spec.name)).op.clone();
+        assert_eq!(op("qkv_proj_norm"), Gemv::Norm { decoder: ops.weight_decoder.clone(), n: ops.qkv_row, bias: ops.qkv_bias });
+        assert_eq!(op("gate_up_act"), Gemv::GateUpAct { decoder: ops.weight_decoder.clone() });
+        assert_eq!(op("lm_head_norm"), Gemv::Norm { decoder: ops.head_decoder.clone(), n: ops.vocab, bias: false });
+        if let Some(la) = spec.linear_attention.as_ref() {
+            assert_eq!(op("lin_in_norm"), Gemv::Norm { decoder: ops.weight_decoder.clone(), n: la.in_proj_rows(), bias: false });
+            assert_eq!(op("lin_ba_norm"), Gemv::Norm { decoder: "DecBf16".into(), n: la.ba_rows(), bias: false });
+        }
+        for k in &built {
+            let h = kir::heavy::Heavy::lift_gemv(k, ops.hidden, ops.inter).unwrap();
+            let normed = matches!(k.op, Gemv::Norm { .. } | Gemv::GateUpAct { .. });
+            assert_eq!(h.is_some_and(|h| h.prologue == kir::heavy::norm_prologue()), normed, "{}", k.name);
+        }
+    }
+    let set = specrt::gemm::gemm_kernels(&nvfp4(), &sm120()).unwrap();
+    let fp4: Vec<&str> = set.kernels.iter().filter(|k| kir::heavy::Heavy::lift(k).unwrap().is_some_and(|h| !h.prologue.is_empty())).map(|k| k.name.as_str()).collect();
+    assert_eq!(fp4, ["gate_up_act_f4", "lm_head_norm_f4"]);
+    let small = kir::Target { smem_limit: 4 * dense().dims.hidden as u32 - 1, ..sm120() };
+    let err = specrt::codegen::gemv_kernels(&dense(), &small, &specrt::codegen::ops_shape(&dense())).unwrap_err().to_string();
+    assert!(err.starts_with(&format!("pass {}: kernel qkv_proj_norm needs", specrt::gemm::PROLOGUE_ATTACH)) && err.contains("bytes of shared memory"), "{err}");
+}
