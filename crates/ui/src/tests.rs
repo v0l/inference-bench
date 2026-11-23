@@ -3087,7 +3087,7 @@ fn the_server_tab_lists_saved_sessions_with_restore_strip_and_delete() {
     s.sessions = std::sync::Arc::new(std::sync::Mutex::new(Some(shared.clone())));
     {
         let app = h.state_mut();
-        app.engine = inference_bench_core::engine::Engine::with_factories(app.wake.clone(), ScriptedModel::factory(s.clone()), inference_bench_core::fake::ScriptedServing::factory(s));
+        app.engine = inference_bench_core::engine::Engine::with_factories_sampled(app.wake.clone(), ScriptedModel::factory(s.clone()), inference_bench_core::fake::ScriptedServing::factory(s), inference_bench_core::engine::no_gpu_sampler());
         app.settings.server.port = 0;
         let m = app.library[0].clone();
         app.load_model(&m);
@@ -3180,7 +3180,7 @@ fn recording_engine(app: &mut App) -> Seen {
         log.lock().unwrap().push(opts.clone());
         fake(opts)
     });
-    app.engine = inference_bench_core::engine::Engine::with_factories(app.wake.clone(), ScriptedModel::factory(script), serving);
+    app.engine = inference_bench_core::engine::Engine::with_factories_sampled(app.wake.clone(), ScriptedModel::factory(script), serving, inference_bench_core::engine::no_gpu_sampler());
     seen
 }
 
