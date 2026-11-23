@@ -284,7 +284,7 @@ enum Cmd {
         plan: bool,
         #[arg(long, help = "With --plan: print the fusion groups the cost model and legality checks pick, and why each other pair stays apart (dry run)")]
         fusion: bool,
-        #[arg(long, help = "With --plan: count the single stream decode plan the compiler passes produce, the one the runtime launches")]
+        #[arg(long, help = "With --plan: count the single stream decode plan the compiler passes produce, the one the runtime launches; with --fusion too, print the groups and refusals of the passes that built it")]
         compiled: bool,
         #[arg(long, default_value_t = 1, help = "Tokens in the step the plan report counts")]
         tokens: usize,
@@ -449,7 +449,11 @@ fn kernels_command(data: &Path, spec: &str, target: Option<&str>, plan: Option<(
         };
         let count = specrt::signature::Count::new(phase, tokens, context.unwrap_or(tokens));
         if compiled {
-            let single = specrt::compile::single(&spec, &target, count.context.max(1))?;
+            let (single, fused) = specrt::compile::single_traced(&spec, &target, count.context.max(1))?;
+            if fusion {
+                print!("{}", fused.render());
+                return Ok(());
+            }
             print!("{}", specrt::signature::compiled_report(&spec, &single, count, &target)?.render());
             return Ok(());
         }

@@ -494,7 +494,14 @@ fn values(units: &[Unit], internal: &BTreeSet<Place>) -> Vec<Value> {
     out
 }
 
-pub type Library<'a> = &'a dyn Fn(&[&Unit]) -> bool;
+pub type Library<'a> = &'a dyn Fn(&[&Unit]) -> Fit;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fit {
+    Kernel,
+    Part,
+    None,
+}
 
 struct Engine<'a> {
     units: &'a [Unit],
@@ -529,7 +536,18 @@ impl Engine<'_> {
     }
 
     fn launches(&self, g: &BTreeSet<usize>) -> usize {
-        if g.len() == 1 { self.units[*g.first().unwrap()].launches } else { 1 }
+        if g.len() == 1 {
+            return self.units[*g.first().unwrap()].launches;
+        }
+        match self.fit(g) {
+            Fit::Part => g.iter().map(|&u| self.units[u].launches).sum(),
+            Fit::Kernel | Fit::None => 1,
+        }
+    }
+
+    fn fit(&self, g: &BTreeSet<usize>) -> Fit {
+        let units: Vec<&Unit> = g.iter().map(|&u| &self.units[u]).collect();
+        self.library.map_or(Fit::Kernel, |library| library(&units))
     }
 
     fn ops(&self, g: &BTreeSet<usize>) -> Vec<usize> {
@@ -538,10 +556,9 @@ impl Engine<'_> {
     }
 
     fn realisable(&self, merged: &BTreeSet<usize>) -> Result<(), Reason> {
-        let units: Vec<&Unit> = merged.iter().map(|&u| &self.units[u]).collect();
-        match self.library {
-            Some(library) if !library(&units) => Err(Reason::NoKernel),
-            _ => Ok(()),
+        match self.fit(merged) {
+            Fit::None => Err(Reason::NoKernel),
+            Fit::Kernel | Fit::Part => Ok(()),
         }
     }
 

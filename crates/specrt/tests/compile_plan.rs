@@ -254,6 +254,34 @@ fn the_store_epilogue_leaves_plans_without_a_branch_alone() {
     }
 }
 
+fn launch_row(name: &str, spec: &Spec) -> (String, bool) {
+    use specrt::signature::{Count, compiled_report};
+    let count = Count::new(Phase::Decode, 1, 4096);
+    let mut built = Plan::build(spec, Phase::Decode, true);
+    built.mtp.clear();
+    built.mtp_head.clear();
+    let unfused = compiled_report(spec, &built, count, &sm120()).unwrap().total().2;
+    let (plan, trace) = specrt::compile::single_traced(spec, &sm120(), 4096).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+    let compiled = compiled_report(spec, &plan, count, &sm120()).unwrap().total().2;
+    let before: usize = trace.sections.iter().map(|s| s.launches_before * s.repeats).sum();
+    let predicted: usize = trace.sections.iter().map(|s| s.launches_after * s.repeats).sum();
+    let ok = compiled < unfused && compiled == predicted;
+    (format!("{name:<44} unfused {unfused:>5} units {before:>5} predicted {predicted:>5} compiled {compiled:>5}{}", if ok { "" } else { "  <-" }), ok)
+}
+
+fn assert_launches(specs: &[(String, Spec)]) {
+    let rows: Vec<(String, bool)> = specs.iter().map(|(n, s)| launch_row(n, s)).collect();
+    let table: Vec<&str> = rows.iter().map(|(r, _)| r.as_str()).collect();
+    assert!(rows.iter().all(|(_, ok)| *ok), "compiled single step launches against the unfused plan and the cost model:\n{}", table.join("\n"));
+}
+
+#[test]
+fn the_compiled_step_launches_what_the_cost_model_predicts() {
+    let specs: Vec<(String, Spec)> = all_specs().into_iter().filter(|(_, s)| runs_single_step(s)).collect();
+    assert!(specs.len() >= 20, "{}", specs.len());
+    assert_launches(&specs);
+}
+
 #[test]
 fn every_single_step_kernel_is_in_the_module() {
     for (name, spec) in all_specs().into_iter().filter(|(_, s)| runs_single_step(s)) {

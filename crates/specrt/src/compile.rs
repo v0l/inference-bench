@@ -1,4 +1,4 @@
-use crate::fusion::{self, Costs, Part, Section, Unit};
+use crate::fusion::{self, Costs, Fit, FusionReport, Part, Section, SectionFusion, Unit};
 use crate::gemm::{self, GemvLaunch};
 use crate::plan::{Buf, Op, Phase, Plan, QuantSource, Weight, weight_kind};
 use crate::signature::{Count, Place, Signer, layers_using, ranked};
@@ -131,6 +131,17 @@ impl Ctx<'_> {
         self.layers.iter().all(|&l| launch(self.spec, weight, quant, l, normed).is_some_and(|g| want(&g)))
     }
 
+    fn fit(&self, units: &[&Unit]) -> Fit {
+        match self.realise(units) {
+            None => Fit::None,
+            Some((_, Op::Linear { weight, quant, .. })) if self.opts.family == Family::Gemv => {
+                let act = units.iter().any(|u| u.part == Part::Act);
+                if self.every_layer(weight, quant, false, |g| g.act == act) { Fit::Kernel } else { Fit::Part }
+            }
+            Some(_) => Fit::Kernel,
+        }
+    }
+
     fn realise(&self, units: &[&Unit]) -> Option<(usize, Op)> {
         let ops: BTreeSet<usize> = units.iter().map(|u| u.op).collect();
         let ops: Vec<usize> = ops.into_iter().collect();
@@ -179,16 +190,16 @@ impl Ctx<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fuse(spec: &Spec, signer: &Signer, target: &kir::Target, costs: &Costs, opts: &Options, phase: Phase, layers: &[usize], ops: &[Op]) -> Result<Vec<Op>> {
+fn fuse(spec: &Spec, signer: &Signer, target: &kir::Target, costs: &Costs, opts: &Options, phase: Phase, name: String, layers: &[usize], ops: &[Op]) -> Result<(Vec<Op>, Option<SectionFusion>)> {
     let layer = layers.first().copied().unwrap_or(0);
     if ops.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), None));
     }
     let writes_x = ops.iter().map(|o| writes_x(signer, o, layer)).collect::<Result<Vec<bool>>>()?;
     let ctx = Ctx { spec, opts, ops, layers, writes_x };
-    let library = |units: &[&Unit]| ctx.realise(units).is_some();
+    let library = |units: &[&Unit]| ctx.fit(units);
     let count = Count::new(phase, 1, opts.context);
-    let section = Section { name: String::new(), repeats: layers.len(), phase, layer, ops };
+    let section = Section { name, repeats: layers.len(), phase, layer, ops };
     let fused = fusion::fuse_ops(spec, signer, target, count, costs, section, Some(&library))?;
     let mut at: BTreeMap<usize, Op> = BTreeMap::new();
     let mut dropped: BTreeSet<usize> = BTreeSet::new();
@@ -209,51 +220,70 @@ fn fuse(spec: &Spec, signer: &Signer, target: &kir::Target, costs: &Costs, opts:
             None => ctx.unfused(*op, &mut out)?,
         }
     }
-    Ok(out)
+    Ok((out, Some(fused)))
 }
 
-fn sections_mut<'p>(spec: &Spec, plan: &'p mut Plan) -> Vec<(Vec<usize>, &'p mut Vec<Op>)> {
+fn sections_mut<'p>(spec: &Spec, plan: &'p mut Plan) -> Vec<(String, Vec<usize>, &'p mut Vec<Op>)> {
     let count = spec.layers.count;
     let Plan { head, blocks, tail, mtp, mtp_head, .. } = plan;
-    let mut out = vec![(vec![0], head)];
+    let mut out = vec![("head".to_string(), vec![0], head)];
     for b in blocks.iter_mut() {
-        out.push((layers_using(spec, &b.layers, b.sparse), &mut b.ops));
+        let used = layers_using(spec, &b.layers, b.sparse);
+        let mut kinds: Vec<&str> = used.iter().map(|&i| spec.block(i).name()).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        out.push((format!("layer {}{}", kinds.join("|"), if b.sparse { " moe" } else { "" }), used, &mut b.ops));
     }
-    out.push((vec![count.saturating_sub(1)], tail));
-    out.push((vec![count], mtp));
-    out.push((vec![count], mtp_head));
+    out.push(("tail".to_string(), vec![count.saturating_sub(1)], tail));
+    out.push(("mtp".to_string(), vec![count], mtp));
+    out.push(("mtp head".to_string(), vec![count], mtp_head));
     out
 }
 
 pub fn partition_plan(spec: &Spec, mut plan: Plan, shards: &BTreeMap<String, Shard>) -> Plan {
-    for (_, ops) in sections_mut(spec, &mut plan) {
+    for (_, _, ops) in sections_mut(spec, &mut plan) {
         *ops = partition(ops, shards);
     }
     plan
 }
 
 pub fn compile(spec: &Spec, plan: Plan, target: &kir::Target, opts: &Options) -> Result<Plan> {
+    compile_traced(spec, plan, target, opts).map(|(plan, _)| plan)
+}
+
+pub fn compile_traced(spec: &Spec, plan: Plan, target: &kir::Target, opts: &Options) -> Result<(Plan, FusionReport)> {
     let mut plan = partition_plan(spec, plan, &opts.shards);
     let signer = Signer::new(spec)?.ranked(ranked(&plan));
     if opts.family == Family::Gemv {
-        for (layers, ops) in sections_mut(spec, &mut plan) {
+        for (_, layers, ops) in sections_mut(spec, &mut plan) {
             *ops = gemv_layout(&signer, ops, layers.first().copied().unwrap_or(0))?;
         }
     }
     let costs = Costs::for_target(target);
     let phase = plan.phase;
+    let mut report = FusionReport { phase, count: Count::new(phase, 1, opts.context), costs, sections: Vec::new() };
     if opts.family == Family::Planes && !(opts.fuse && ranked(&plan)) {
-        return Ok(plan);
+        return Ok((plan, report));
     }
-    for (layers, ops) in sections_mut(spec, &mut plan) {
-        *ops = fuse(spec, &signer, target, &costs, opts, phase, &layers, ops)?;
+    for (name, layers, ops) in sections_mut(spec, &mut plan) {
+        let (fused, section) = fuse(spec, &signer, target, &costs, opts, phase, name, &layers, ops)?;
+        *ops = fused;
+        report.sections.extend(section.filter(|_| !layers.is_empty()));
     }
-    Ok(plan)
+    Ok((plan, report))
 }
 
-pub fn single(spec: &Spec, target: &kir::Target, context: usize) -> Result<Plan> {
+fn single_plan(spec: &Spec) -> Plan {
     let mut plan = Plan::build(spec, Phase::Decode, true);
     plan.mtp.clear();
     plan.mtp_head.clear();
-    compile(spec, plan, target, &Options::gemv(context))
+    plan
+}
+
+pub fn single(spec: &Spec, target: &kir::Target, context: usize) -> Result<Plan> {
+    compile(spec, single_plan(spec), target, &Options::gemv(context))
+}
+
+pub fn single_traced(spec: &Spec, target: &kir::Target, context: usize) -> Result<(Plan, FusionReport)> {
+    compile_traced(spec, single_plan(spec), target, &Options::gemv(context))
 }
