@@ -217,7 +217,7 @@ impl MoeBuffers {
 }
 
 fn launch(l: kir::moe::Launch) -> LaunchConfig {
-    LaunchConfig { grid_dim: (l.grid.0, l.grid.1, 1), block_dim: (l.threads, 1, 1), shared_mem_bytes: 0 }
+    LaunchConfig { grid_dim: (l.grid.0, l.grid.1, 1), block_dim: (l.threads, 1, 1), shared_mem_bytes: l.smem }
 }
 
 impl Runtime {
@@ -232,7 +232,7 @@ impl Runtime {
         let n_arg = n as i32;
         let mut b = self.launcher(self.kernel("moe_route_logits"));
         b.arg(x).arg(&layer.ln2).arg(&w.router).arg(&w.shared_gate).arg(&w.router_bias).arg(&mb.xn).arg(&mb.logits).arg(&n_arg);
-        let config = launch(kir::moe::route_logits_launch(experts, n));
+        let config = launch(kir::moe::route_logits_launch(experts, n, self.spec.dims.hidden));
         unsafe { b.launch(config) }?;
         let mut b = self.launcher(self.kernel("moe_route"));
         let first = self.spec.moe.as_ref().expect("moe spec").first_expert() as i32;

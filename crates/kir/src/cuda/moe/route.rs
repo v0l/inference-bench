@@ -3,7 +3,7 @@ use crate::cuda::attention::prim::{Reduce, block_reduce, warp_reduce};
 
 fn logits_norm() -> String {
     format!(
-        r##"    __shared__ __align__(16) float xs[MOE_LOGIT_TOKENS * HIDDEN];
+        r##"    extern __shared__ __align__(16) float xs[];
     __shared__ float red[32];
     int tid = threadIdx.x;
     int lane = tid & 31;

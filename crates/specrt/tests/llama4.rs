@@ -61,6 +61,36 @@ fn top1_sigmoid_routing_scales_the_expert_input_and_the_shared_expert_has_no_gat
 }
 
 #[test]
+fn glm_air_route_logits_stage_through_dynamic_shared_memory() {
+    let spec = Spec::from_hf_config_serving_in(Registry::embedded(), &std::fs::read_to_string(fixtures().join("glm4.5-air.config.json")).unwrap()).unwrap();
+    let target = kir::Target::sm_120();
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &target).unwrap();
+    assert!(module.source.contains("extern __shared__ __align__(16) float xs[];"));
+    assert_eq!(module.smem["moe_route_logits"], 4 * 4096 * 4);
+    assert!(module.smem["moe_route_logits"] <= target.smem_limit);
+    let mut small = target;
+    small.smem_limit = 48 * 1024;
+    let err = specrt::codegen::moe_kernels(&spec, &small).unwrap_err().to_string();
+    assert!(err.contains("moe_route_logits needs"), "{err}");
+}
+
+#[test]
+fn route_logits_launch_smem_equals_what_the_kernel_indexes() {
+    for hidden in [2880usize, 3072, 4096, 7168] {
+        assert_eq!(kir::moe::route_logits_launch(128, 9, hidden).smem as usize, kir::moe::LOGIT_TOKENS * hidden * 4);
+        assert_eq!(kir::moe::route_logits_smem(hidden) as usize, kir::moe::LOGIT_TOKENS * hidden * 4);
+    }
+    let mut spec = Spec::from_hf_config_serving_in(Registry::embedded(), &std::fs::read_to_string(fixtures().join("glm4.5-air.config.json")).unwrap()).unwrap();
+    spec.dims.hidden = 7168;
+    let mut limit = kir::Target::sm_120();
+    limit.smem_limit = 100 * 1024;
+    let err = specrt::codegen::moe_kernels(&spec, &limit).unwrap_err().to_string();
+    assert!(err.contains("moe_route_logits needs 114688"), "{err}");
+    spec.dims.hidden = 4096;
+    assert!(specrt::codegen::moe_kernels(&spec, &limit).is_ok());
+}
+
+#[test]
 fn chunked_attention_nope_and_temperature_tuning_come_from_the_config() {
     let spec = spec_of(&scout());
     use specrt::spec::Block;

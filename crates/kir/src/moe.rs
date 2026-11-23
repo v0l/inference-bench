@@ -87,18 +87,23 @@ pub const PERMUTE_THREADS: u32 = 1024;
 pub struct Launch {
     pub grid: (u32, u32),
     pub threads: u32,
+    pub smem: u32,
 }
 
-pub fn route_logits_launch(experts: usize, tokens: usize) -> Launch {
-    Launch { grid: ((experts + 1).div_ceil(EXPERT_WARPS) as u32, tokens.div_ceil(LOGIT_TOKENS) as u32), threads: EXPERT_THREADS }
+pub fn route_logits_smem(hidden: usize) -> u32 {
+    (LOGIT_TOKENS * hidden * 4) as u32
+}
+
+pub fn route_logits_launch(experts: usize, tokens: usize, hidden: usize) -> Launch {
+    Launch { grid: ((experts + 1).div_ceil(EXPERT_WARPS) as u32, tokens.div_ceil(LOGIT_TOKENS) as u32), threads: EXPERT_THREADS, smem: route_logits_smem(hidden) }
 }
 
 pub fn expert_rows_launch(slots: u32, rows: usize) -> Launch {
-    Launch { grid: (slots, rows.div_ceil(EXPERT_WARPS) as u32), threads: EXPERT_THREADS }
+    Launch { grid: (slots, rows.div_ceil(EXPERT_WARPS) as u32), threads: EXPERT_THREADS, smem: 0 }
 }
 
 pub fn rows_launch(width: usize, rows: usize) -> Launch {
-    Launch { grid: (width.div_ceil(EXPERT_THREADS as usize) as u32, rows as u32), threads: EXPERT_THREADS }
+    Launch { grid: (width.div_ceil(EXPERT_THREADS as usize) as u32, rows as u32), threads: EXPERT_THREADS, smem: 0 }
 }
 
 pub fn mma_smem(rows_per_tile: usize, weights: usize) -> u32 {
@@ -156,6 +161,9 @@ impl MoeKernel {
         if self.family == Family::GroupedMx && s.block_group != 32 {
             return bad(format!("the block scaled mma reads groups of 32, not {}", s.block_group));
         }
+        if self.family == Family::Experts && route_logits_smem(s.hidden) > t.smem_limit {
+            return bad(format!("moe_route_logits needs {} bytes of shared memory, the target allows {}", route_logits_smem(s.hidden), t.smem_limit));
+        }
         if matches!(self.family, Family::GroupedMma | Family::GroupedMx | Family::GroupedMmaFp8 | Family::GroupedMmaBf16) {
             if !s.inter.is_multiple_of(MMA_BN) {
                 return bad(format!("expert intermediate {} must be a multiple of {MMA_BN}", s.inter));
@@ -175,7 +183,8 @@ impl MoeKernel {
     pub fn smem(&self) -> Vec<(&'static str, u32)> {
         let up = if self.shape.mapped { 1 } else { 2 };
         match self.family {
-            Family::Experts | Family::ExpertTable => vec![],
+            Family::ExpertTable => vec![],
+            Family::Experts => vec![("moe_route_logits", route_logits_smem(self.shape.hidden))],
             Family::GroupedMma => vec![
                 ("moe_mma_up", mma_smem(MMA_BM, 2)),
                 ("moe_mma_up_s", mma_smem(MMA_BM_SMALL, 2)),
