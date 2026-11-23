@@ -238,8 +238,21 @@ fn pdl_macro(single_wave_blocks: u32) -> String {
 }
 
 pub fn with_pdl_wait(source: &str, single_wave_blocks: u32) -> String {
+    with_pdl(source, single_wave_blocks, false)
+}
+
+const WEIGHT_PREFETCH: &str = "\n    PDL_PREFETCH(w);";
+
+fn pdl_prefetch_macro() -> &'static str {
+    "#define PDL_PREFETCH(p) asm volatile(\"prefetch.global.L2 [%0];\" :: \"l\"((const char*)(p) + (size_t)blockIdx.x * 4096 + (size_t)threadIdx.x * 16))\n"
+}
+
+pub fn with_pdl(source: &str, single_wave_blocks: u32, hoist: bool) -> String {
     let mut out = String::with_capacity(source.len() + 1024);
     out.push_str(&pdl_macro(single_wave_blocks));
+    if hoist {
+        out.push_str(pdl_prefetch_macro());
+    }
     let mut rest = source;
     while let Some(at) = rest.find("__global__") {
         let (head, tail) = rest.split_at(at);
@@ -247,6 +260,9 @@ pub fn with_pdl_wait(source: &str, single_wave_blocks: u32) -> String {
         let open = tail.find('{').map(|i| i + 1).unwrap_or(tail.len());
         out.push_str(&tail[..open]);
         if open < tail.len() {
+            if hoist && tail[..open].contains("* w,") {
+                out.push_str(WEIGHT_PREFETCH);
+            }
             out.push_str("\n    PDL_WAIT();");
         }
         rest = &tail[open..];
@@ -257,7 +273,17 @@ pub fn with_pdl_wait(source: &str, single_wave_blocks: u32) -> String {
 
 #[cfg(test)]
 mod pdl_tests {
-    use super::with_pdl_wait;
+    use super::{with_pdl, with_pdl_wait};
+
+    #[test]
+    fn hoist_prefetches_weights_above_the_wait_and_is_off_by_default() {
+        let src = "extern \"C\" __global__ void a(const void* w, const float* x) {\n x[0];\n}\nextern \"C\" __global__ void b(float* y) { y[0] = 0; }\n";
+        assert_eq!(with_pdl(src, 188, false), with_pdl_wait(src, 188));
+        let out = with_pdl(src, 188, true);
+        assert!(out.contains("{\n    PDL_PREFETCH(w);\n    PDL_WAIT();\n x[0]"), "{out}");
+        assert_eq!(out.matches("PDL_PREFETCH(w)").count(), 1);
+        assert!(out.contains("b(float* y) {\n    PDL_WAIT(); y[0]"));
+    }
 
     #[test]
     fn wait_is_first_statement_of_every_kernel() {
