@@ -418,8 +418,8 @@ fn the_norm_prologue_is_the_rmsnorm_stage_list() {
     assert!(matches!(p.first(), Some(Stage::TileLoad { src, .. }) if src == heavy::X));
     assert!(p.iter().any(|s| matches!(s, Stage::BlockSum { .. })));
     assert!(matches!(p.last(), Some(Stage::TileStore { dst, .. }) if dst == heavy::STAGED));
-    assert_eq!(heavy::spelled_prologue(&p).unwrap(), true);
-    assert_eq!(heavy::spelled_prologue(&[]).unwrap(), false);
+    assert!(heavy::spelled_prologue(&p).unwrap());
+    assert!(!heavy::spelled_prologue(&[]).unwrap());
     let mut odd = p.clone();
     odd.remove(1);
     assert!(heavy::spelled_prologue(&odd).unwrap_err().contains("no emitter spells the prologue"));
