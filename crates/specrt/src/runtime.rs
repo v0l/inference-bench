@@ -1401,16 +1401,7 @@ impl Runtime {
         let s = self.streamer.as_ref().map(|s| s.stats());
         let e = self.expert_cache.as_ref().map(|c| c.stats());
         match (s, e) {
-            (Some(a), Some(b)) => Some(crate::offload::OffloadStats {
-                vram_hits: a.vram_hits + b.vram_hits,
-                host_hits: a.host_hits + b.host_hits,
-                nvme_reads: a.nvme_reads + b.nvme_reads,
-                nvme_read_bytes: a.nvme_read_bytes + b.nvme_read_bytes,
-                nvme_read_failures: a.nvme_read_failures + b.nvme_read_failures,
-                nvme_wait_nanos: a.nvme_wait_nanos + b.nvme_wait_nanos,
-                host_to_vram_bytes: a.host_to_vram_bytes + b.host_to_vram_bytes,
-                evictions: a.evictions + b.evictions,
-            }),
+            (Some(a), Some(b)) => Some(a.plus(&b)),
             (a, b) => a.or(b),
         }
     }
@@ -1446,9 +1437,9 @@ impl Runtime {
             Some(p) if std::path::Path::new(p).exists() => Some(crate::offload::ExpertHotlist::load(std::path::Path::new(p))?),
             _ => None,
         };
-        let cache = moe::experts::ExpertCache::new(&self.stream, like, self.layers.len(), slots, local, shared, off.policy, prior)?;
-        let hosts: Vec<(usize, &moe::experts::HostExperts)> = self.layers.iter().enumerate().filter_map(|(i, l)| l.moe.as_ref().and_then(|x| x.host.as_ref()).map(|h| (i, h))).collect();
-        cache.warm(&self.stream, &hosts)?;
+        let cache = moe::experts::ExpertCache::new(&self.stream, like, self.layers.len(), slots, local, shared, off, top_k, prior)?;
+        let hosts = self.cached_hosts();
+        cache.warm(&self.stream, &hosts, top_k)?;
         self.expert_cache = Some(cache);
         self.stream.synchronize()?;
         Ok(())

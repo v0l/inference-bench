@@ -1,6 +1,6 @@
 use super::{StackWeights, Stacks};
 use crate::hostpool::{HostPool, PinnedBuf};
-use crate::offload::{Acquired, ExpertHotlist, OffloadStats, Policy, SlotBook};
+use crate::offload::{Acquired, CopyEngine, ExpertBook, ExpertHotlist, OffloadSettings, OffloadStats, Policy, SlotBook};
 use crate::weights::{MoeWeights, Stacked};
 use anyhow::{Result, ensure};
 use cudarc::driver::sys::{CUdeviceptr, CUevent_flags};
@@ -163,13 +163,40 @@ fn pointers(stream: &Arc<CudaStream>, s: &Stacks) -> Vec<CUdeviceptr> {
 
 struct State {
     book: SlotBook,
+    scored: Option<ExpertBook<CudaEvent>>,
     last: Vec<Vec<usize>>,
     seen: ExpertHotlist,
     prior: Option<ExpertHotlist>,
 }
 
+struct Promotions<'a> {
+    cache: &'a ExpertCache,
+    hosts: &'a [(usize, &'a HostExperts)],
+    stats: OffloadStats,
+}
+
+impl CopyEngine for Promotions<'_> {
+    type Ticket = CudaEvent;
+
+    fn copy(&mut self, page: usize, slot: usize) -> Result<Option<CudaEvent>> {
+        let (layer, e) = (page / self.cache.local, page % self.cache.local);
+        let Some((_, host)) = self.hosts.iter().find(|(l, _)| *l == layer) else { return Ok(None) };
+        let Backing::Pinned(b) = &host.buf else { return Ok(None) };
+        let src = b.as_slice()?;
+        for (p, base) in host.parts.iter().zip(&self.cache.addrs) {
+            let from = &src[p.offset + e * p.per..p.offset + (e + 1) * p.per];
+            unsafe { cudarc::driver::result::memcpy_htod_async(base + (slot * p.per) as u64, from, self.cache.promo.cu_stream()) }?;
+            self.stats.host_to_vram_bytes += p.per as u64;
+        }
+        let ev = self.cache.promo.context().new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+        ev.record(&self.cache.promo)?;
+        Ok(Some(ev))
+    }
+}
+
 pub(in crate::runtime) struct ExpertCache {
     copy: Arc<CudaStream>,
+    promo: Arc<CudaStream>,
     mark: CudaEvent,
     copied: CudaEvent,
     pub(in crate::runtime) stacks: Stacks,
@@ -193,12 +220,15 @@ pub(in crate::runtime) struct Staged {
 }
 
 impl ExpertCache {
-    pub(in crate::runtime) fn new(compute: &Arc<CudaStream>, like: &HostExperts, layers: usize, slots: usize, local: usize, shared: usize, policy: Policy, prior: Option<ExpertHotlist>) -> Result<Self> {
+    pub(in crate::runtime) fn new(compute: &Arc<CudaStream>, like: &HostExperts, layers: usize, slots: usize, local: usize, shared: usize, settings: &OffloadSettings, top_k: usize, prior: Option<ExpertHotlist>) -> Result<Self> {
         let ctx = compute.context().clone();
         let stacks = like.allocate(compute, slots + shared)?;
         let addrs = pointers(compute, &stacks);
+        let (lowest, _) = cudarc::driver::result::stream::get_priority_range()?;
+        let scored = (settings.policy == Policy::Score).then(|| ExpertBook::new(layers * local, slots, crate::offload::scratch_slots(slots, top_k), settings));
         Ok(ExpertCache {
             copy: ctx.new_stream()?,
+            promo: ctx.new_stream_with_priority(lowest)?,
             mark: ctx.new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
             copied: ctx.new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
             stacks,
@@ -208,12 +238,17 @@ impl ExpertCache {
             shared,
             staging: Mutex::new(Staging { buf: None }),
             staging_pool: HostPool::new(ctx.clone()),
-            state: Mutex::new(State { book: SlotBook::new(slots, policy), last: vec![Vec::new(); layers], seen: ExpertHotlist::new(layers, local), prior }),
+            state: Mutex::new(State { book: SlotBook::new(slots, settings.policy), scored, last: vec![Vec::new(); layers], seen: ExpertHotlist::new(layers, local), prior }),
         })
     }
 
     pub(in crate::runtime) fn stats(&self) -> OffloadStats {
-        self.state.lock().unwrap().book.stats
+        let g = self.state.lock().unwrap();
+        g.scored.as_ref().map_or(g.book.stats, |b| b.stats)
+    }
+
+    pub(in crate::runtime) fn scored(&self) -> bool {
+        self.state.lock().unwrap().scored.is_some()
     }
 
     pub(in crate::runtime) fn hotlist(&self) -> ExpertHotlist {
@@ -360,6 +395,52 @@ impl ExpertCache {
         self.state.lock().unwrap().book.unpin_all();
     }
 
+    pub(in crate::runtime) fn plan_scored(&self, layer: usize, routed: &[(usize, usize)], rows: usize, borrow: bool) -> Vec<Vec<(usize, usize, bool)>> {
+        let mut g = self.state.lock().unwrap();
+        let book = g.scored.as_mut().expect("score policy");
+        book.poll(|ev| ev.is_complete());
+        let pages: Vec<usize> = routed.iter().map(|&(e, _)| self.page(layer, e)).collect();
+        let groups = book.plan(&pages, borrow);
+        for &(e, uses) in routed {
+            book.record(self.page(layer, e), uses as f64 / rows.max(1) as f64);
+        }
+        groups.into_iter().map(|grp| grp.into_iter().map(|p| (p.page - layer * self.local, p.slot, p.copy)).collect()).collect()
+    }
+
+    pub(in crate::runtime) fn load_group(&self, compute: &Arc<CudaStream>, host: &HostExperts, group: &[(usize, usize, bool)], with_shared: bool) -> Result<()> {
+        let mut copies: Vec<(usize, usize)> = group.iter().filter(|g| g.2).map(|g| (g.0, g.1)).collect();
+        if copies.is_empty() && !with_shared {
+            return Ok(());
+        }
+        self.mark.record(compute)?;
+        self.copy.wait(&self.mark)?;
+        let mut stats = OffloadStats::default();
+        let queued = self.enqueue_all(host, &mut copies, &mut stats).and_then(|_| {
+            if with_shared {
+                for s in 0..self.shared {
+                    self.enqueue(host, self.local + s, self.slots + s, &mut stats)?;
+                }
+            }
+            Ok(())
+        });
+        if let Some(b) = self.state.lock().unwrap().scored.as_mut() {
+            b.stats.absorb_io(&stats);
+        }
+        queued?;
+        self.fence(compute)
+    }
+
+    pub(in crate::runtime) fn end_step(&self, compute: &Arc<CudaStream>, hosts: &[(usize, &HostExperts)]) -> Result<()> {
+        let mut g = self.state.lock().unwrap();
+        let Some(book) = g.scored.as_mut() else { return Ok(()) };
+        self.mark.record(compute)?;
+        self.promo.wait(&self.mark)?;
+        let mut engine = Promotions { cache: self, hosts, stats: OffloadStats::default() };
+        let promoted = book.end_step(&mut engine);
+        book.stats.absorb_io(&engine.stats);
+        promoted.map(|_| ())
+    }
+
     pub(in crate::runtime) fn observe(&self, layer: usize, used: &[usize]) {
         let mut g = self.state.lock().unwrap();
         for &e in used {
@@ -399,7 +480,10 @@ impl ExpertCache {
         queued
     }
 
-    pub(in crate::runtime) fn warm(&self, compute: &Arc<CudaStream>, hosts: &[(usize, &HostExperts)]) -> Result<()> {
+    pub(in crate::runtime) fn warm(&self, compute: &Arc<CudaStream>, hosts: &[(usize, &HostExperts)], top_k: usize) -> Result<()> {
+        if self.scored() {
+            return self.warm_scored(compute, hosts, top_k);
+        }
         let hot = {
             let g = self.state.lock().unwrap();
             let Some(prior) = &g.prior else { return Ok(()) };
@@ -428,9 +512,31 @@ impl ExpertCache {
         Ok(())
     }
 
+    fn warm_scored(&self, compute: &Arc<CudaStream>, hosts: &[(usize, &HostExperts)], top_k: usize) -> Result<()> {
+        let mut g = self.state.lock().unwrap();
+        let g = &mut *g;
+        let (Some(prior), Some(book)) = (&g.prior, g.scored.as_mut()) else { return Ok(()) };
+        let placed = book.seed(prior, self.local, top_k);
+        self.mark.record(compute)?;
+        self.copy.wait(&self.mark)?;
+        let mut stats = OffloadStats::default();
+        let mut queued = Ok(());
+        for (page, slot) in placed {
+            let Some((_, host)) = hosts.iter().find(|(l, _)| *l == page / self.local) else { continue };
+            if let Err(err) = self.enqueue(host, page % self.local, slot, &mut stats) {
+                queued = Err(err);
+                break;
+            }
+        }
+        book.stats.absorb_io(&stats);
+        queued?;
+        self.fence(compute)
+    }
+
     pub(in crate::runtime) fn detach(&self, compute: &Arc<CudaStream>) {
         let _ = compute.synchronize();
         let _ = self.copy.synchronize();
+        let _ = self.promo.synchronize();
     }
 }
 

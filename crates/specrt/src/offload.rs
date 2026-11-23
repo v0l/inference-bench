@@ -9,9 +9,10 @@ pub enum Policy {
     #[default]
     Lru,
     Frequency,
+    Score,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OffloadSettings {
     pub vram_budget: u64,
@@ -23,7 +24,12 @@ pub struct OffloadSettings {
     pub expert_slots: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hotlist: Option<String>,
+    pub promote_margin: f64,
+    pub score_half_life: u32,
+    pub promote_per_step: usize,
 }
+
+impl Eq for OffloadSettings {}
 
 impl OffloadSettings {
     pub fn is_default(&self) -> bool {
@@ -41,7 +47,18 @@ fn default_prefetch_depth() -> usize {
 
 impl Default for OffloadSettings {
     fn default() -> Self {
-        OffloadSettings { vram_budget: 0, host_budget: 0, nvme_path: None, prefetch_depth: default_prefetch_depth(), policy: Policy::Lru, expert_slots: 0, hotlist: None }
+        OffloadSettings {
+            vram_budget: 0,
+            host_budget: 0,
+            nvme_path: None,
+            prefetch_depth: default_prefetch_depth(),
+            policy: Policy::Lru,
+            expert_slots: 0,
+            hotlist: None,
+            promote_margin: 1.15,
+            score_half_life: 64,
+            promote_per_step: 16,
+        }
     }
 }
 
@@ -68,9 +85,25 @@ pub struct OffloadStats {
     pub nvme_wait_nanos: u64,
     pub host_to_vram_bytes: u64,
     pub evictions: u64,
+    #[serde(default)]
+    pub promotions: u64,
 }
 
 impl OffloadStats {
+    pub fn plus(&self, o: &OffloadStats) -> OffloadStats {
+        OffloadStats {
+            vram_hits: self.vram_hits + o.vram_hits,
+            host_hits: self.host_hits + o.host_hits,
+            nvme_reads: self.nvme_reads + o.nvme_reads,
+            nvme_read_bytes: self.nvme_read_bytes + o.nvme_read_bytes,
+            nvme_read_failures: self.nvme_read_failures + o.nvme_read_failures,
+            nvme_wait_nanos: self.nvme_wait_nanos + o.nvme_wait_nanos,
+            host_to_vram_bytes: self.host_to_vram_bytes + o.host_to_vram_bytes,
+            evictions: self.evictions + o.evictions,
+            promotions: self.promotions + o.promotions,
+        }
+    }
+
     pub fn absorb_io(&mut self, other: &OffloadStats) {
         self.host_to_vram_bytes += other.host_to_vram_bytes;
         self.nvme_reads += other.nvme_reads;
@@ -118,7 +151,7 @@ impl Level {
             .filter(|(id, _)| !pinned[**id])
             .min_by_key(|(id, e)| match policy {
                 Policy::Lru => (e.last_use, 0, **id),
-                Policy::Frequency => (e.uses, e.last_use, **id),
+                Policy::Frequency | Policy::Score => (e.uses, e.last_use, **id),
             })
             .map(|(id, _)| *id)
     }
@@ -363,7 +396,7 @@ impl SlotBook {
             None => (0..self.page_of.len())
                 .filter(|&s| !self.pinned[s])
                 .min_by_key(|&s| match self.policy {
-                    Policy::Lru => (self.last_use[s], 0, s),
+                    Policy::Lru | Policy::Score => (self.last_use[s], 0, s),
                     Policy::Frequency => (self.uses[s], self.last_use[s], s),
                 })?,
         };
@@ -380,6 +413,213 @@ impl SlotBook {
             self.stats.host_hits += 1;
         }
         Some(Acquired { slot, copy: true })
+    }
+}
+
+pub trait CopyEngine {
+    type Ticket;
+    fn copy(&mut self, page: usize, slot: usize) -> Result<Option<Self::Ticket>>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotState {
+    Free,
+    Resident(usize),
+    Landing(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placed {
+    pub page: usize,
+    pub slot: usize,
+    pub copy: bool,
+}
+
+pub struct ExpertBook<T> {
+    state: Vec<SlotState>,
+    slot_of: Vec<Option<usize>>,
+    landing: Vec<(usize, usize, T)>,
+    score: Vec<f64>,
+    scratch: usize,
+    decay: f64,
+    margin: f64,
+    per_step: usize,
+    pub stats: OffloadStats,
+}
+
+pub fn scratch_slots(slots: usize, top_k: usize) -> usize {
+    top_k.max(slots / 8).clamp(1, slots.max(1))
+}
+
+impl<T> ExpertBook<T> {
+    pub fn new(pages: usize, slots: usize, scratch: usize, settings: &OffloadSettings) -> Self {
+        let scratch = scratch.min(slots);
+        ExpertBook {
+            state: vec![SlotState::Free; slots - scratch],
+            slot_of: vec![None; pages],
+            landing: Vec::new(),
+            score: vec![0.0; pages],
+            scratch,
+            decay: 0.5f64.powf(1.0 / f64::from(settings.score_half_life.max(1))),
+            margin: settings.promote_margin.max(1.0),
+            per_step: settings.promote_per_step,
+            stats: OffloadStats::default(),
+        }
+    }
+
+    pub fn cache_slots(&self) -> usize {
+        self.state.len()
+    }
+
+    pub fn resident(&self, page: usize) -> Option<usize> {
+        self.slot_of[page]
+    }
+
+    pub fn in_flight(&self) -> usize {
+        self.landing.len()
+    }
+
+    pub fn score(&self, page: usize) -> f64 {
+        self.score[page]
+    }
+
+    pub fn record(&mut self, page: usize, uses: f64) {
+        self.score[page] += uses;
+    }
+
+    pub fn seed(&mut self, hot: &ExpertHotlist, local: usize, top_k: usize) -> Vec<(usize, usize)> {
+        let steady = 1.0 / (1.0 - self.decay);
+        for (layer, counts) in hot.counts.iter().enumerate() {
+            let sum: u64 = counts.iter().sum();
+            for (e, &c) in counts.iter().enumerate().take(local) {
+                let page = layer * local + e;
+                if c > 0 && page < self.score.len() {
+                    let rate = (c as f64 * top_k as f64 / sum as f64).min(1.0);
+                    self.score[page] = self.score[page].max(rate * steady);
+                }
+            }
+        }
+        let mut order: Vec<usize> = (0..self.score.len()).filter(|&p| self.score[p] > 0.0 && self.slot_of[p].is_none()).collect();
+        order.sort_by(|&a, &b| self.score[b].total_cmp(&self.score[a]).then(a.cmp(&b)));
+        let mut placed = Vec::new();
+        for page in order {
+            let Some(slot) = self.state.iter().position(|s| *s == SlotState::Free) else { break };
+            self.state[slot] = SlotState::Resident(page);
+            self.slot_of[page] = Some(slot);
+            placed.push((page, slot));
+        }
+        placed.sort_unstable();
+        placed
+    }
+
+    pub fn plan(&mut self, pages: &[usize], borrow: bool) -> Vec<Vec<Placed>> {
+        let mut hits = Vec::new();
+        let mut misses = Vec::new();
+        for &page in pages {
+            match self.slot_of[page] {
+                Some(slot) => hits.push(Placed { page, slot, copy: false }),
+                None => misses.push(page),
+            }
+        }
+        self.stats.vram_hits += hits.len() as u64;
+        self.stats.host_hits += misses.len() as u64;
+        let base = self.state.len();
+        let mut pool: Vec<usize> = (base..base + self.scratch).collect();
+        if borrow && misses.len() > pool.len() {
+            let mut lenders: Vec<usize> = (0..base)
+                .filter(|&s| match self.state[s] {
+                    SlotState::Free => true,
+                    SlotState::Resident(p) => !pages.contains(&p),
+                    SlotState::Landing(_) => false,
+                })
+                .collect();
+            lenders.sort_by(|&a, &b| self.slot_score(a).total_cmp(&self.slot_score(b)).then(a.cmp(&b)));
+            for s in lenders.into_iter().take(misses.len() - pool.len()) {
+                if let SlotState::Resident(p) = self.state[s] {
+                    self.slot_of[p] = None;
+                    self.stats.evictions += 1;
+                }
+                self.state[s] = SlotState::Free;
+                pool.push(s);
+            }
+        }
+        let mut groups = vec![hits];
+        if pool.is_empty() {
+            return groups;
+        }
+        for (i, chunk) in misses.chunks(pool.len()).enumerate() {
+            let placed: Vec<Placed> = chunk.iter().zip(&pool).map(|(&page, &slot)| Placed { page, slot, copy: true }).collect();
+            if i == 0 {
+                for p in placed.iter().filter(|p| p.slot < base) {
+                    self.state[p.slot] = SlotState::Resident(p.page);
+                    self.slot_of[p.page] = Some(p.slot);
+                }
+                groups[0].extend(placed);
+            } else {
+                groups.push(placed);
+            }
+        }
+        groups
+    }
+
+    fn slot_score(&self, slot: usize) -> f64 {
+        match self.state[slot] {
+            SlotState::Resident(p) => self.score[p],
+            _ => f64::NEG_INFINITY,
+        }
+    }
+
+    pub fn poll(&mut self, done: impl Fn(&T) -> bool) -> usize {
+        let mut landed = 0;
+        let mut i = 0;
+        while i < self.landing.len() {
+            if done(&self.landing[i].2) {
+                let (page, slot, _) = self.landing.swap_remove(i);
+                if let Some(other) = self.slot_of[page] {
+                    self.state[other] = SlotState::Free;
+                }
+                self.state[slot] = SlotState::Resident(page);
+                self.slot_of[page] = Some(slot);
+                landed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        landed
+    }
+
+    pub fn end_step<E: CopyEngine<Ticket = T>>(&mut self, engine: &mut E) -> Result<usize> {
+        let landing_page = |book: &Self, p: usize| book.landing.iter().any(|(q, _, _)| *q == p);
+        let mut wanted: Vec<usize> = (0..self.score.len()).filter(|&p| self.score[p] > 0.0 && self.slot_of[p].is_none() && !landing_page(self, p)).collect();
+        wanted.sort_by(|&a, &b| self.score[b].total_cmp(&self.score[a]).then(a.cmp(&b)));
+        wanted.truncate(self.per_step);
+        let mut victims: Vec<usize> = (0..self.state.len()).filter(|&s| !matches!(self.state[s], SlotState::Landing(_))).collect();
+        victims.sort_by(|&a, &b| self.slot_score(a).total_cmp(&self.slot_score(b)).then(a.cmp(&b)));
+        let mut promoted = 0;
+        for (page, slot) in wanted.into_iter().zip(victims) {
+            let old = match self.state[slot] {
+                SlotState::Resident(p) => Some(p),
+                _ => None,
+            };
+            if let Some(p) = old
+                && self.score[page] <= self.margin * self.score[p]
+            {
+                break;
+            }
+            let Some(ticket) = engine.copy(page, slot)? else { continue };
+            if let Some(p) = old {
+                self.slot_of[p] = None;
+                self.stats.evictions += 1;
+            }
+            self.state[slot] = SlotState::Landing(page);
+            self.landing.push((page, slot, ticket));
+            self.stats.promotions += 1;
+            promoted += 1;
+        }
+        for s in &mut self.score {
+            *s *= self.decay;
+        }
+        Ok(promoted)
     }
 }
 
@@ -800,6 +1040,167 @@ mod tests {
         assert_eq!(s.vram_budget, 12);
         assert_eq!(s.policy, Policy::Frequency);
         assert_eq!(s.prefetch_depth, 1);
+    }
+
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct FakeCopies {
+        now: Rc<Cell<u64>>,
+        latency: u64,
+        copies: Vec<(usize, usize)>,
+    }
+
+    impl CopyEngine for FakeCopies {
+        type Ticket = u64;
+        fn copy(&mut self, page: usize, slot: usize) -> Result<Option<u64>> {
+            self.copies.push((page, slot));
+            Ok(Some(self.now.get() + self.latency))
+        }
+    }
+
+    impl FakeCopies {
+        fn done(&self, ticket: &u64) -> bool {
+            self.now.get() >= *ticket
+        }
+    }
+
+    fn engine(latency: u64) -> (FakeCopies, Rc<Cell<u64>>) {
+        let now = Rc::new(Cell::new(0));
+        (FakeCopies { now: now.clone(), latency, copies: vec![] }, now)
+    }
+
+    fn score_settings(margin: f64, half_life: u32) -> OffloadSettings {
+        OffloadSettings { policy: Policy::Score, promote_margin: margin, score_half_life: half_life, promote_per_step: 16, ..Default::default() }
+    }
+
+    fn step(book: &mut ExpertBook<u64>, eng: &mut FakeCopies, now: &Rc<Cell<u64>>, used: &[usize]) -> Vec<Vec<Placed>> {
+        book.poll(|t| eng.done(t));
+        let groups = book.plan(used, false);
+        for &p in used {
+            book.record(p, 1.0);
+        }
+        book.end_step(eng).unwrap();
+        now.set(now.get() + 1);
+        groups
+    }
+
+    #[test]
+    fn promotion_evicts_a_resident_only_past_the_margin() {
+        let (mut eng, _) = engine(0);
+        let mut b: ExpertBook<u64> = ExpertBook::new(4, 2, 1, &score_settings(1.15, 1_000_000));
+        b.record(0, 10.0);
+        b.end_step(&mut eng).unwrap();
+        b.poll(|t| eng.done(t));
+        assert_eq!(b.resident(0), Some(0));
+        b.record(1, 11.0);
+        b.end_step(&mut eng).unwrap();
+        b.poll(|t| eng.done(t));
+        assert_eq!((b.resident(0), b.resident(1)), (Some(0), None), "11 is under 1.15 times 10");
+        assert_eq!(b.stats.evictions, 0);
+        b.record(1, 1.0);
+        b.end_step(&mut eng).unwrap();
+        b.poll(|t| eng.done(t));
+        assert_eq!((b.resident(0), b.resident(1)), (None, Some(0)), "12 is over 1.15 times 10");
+        assert_eq!((b.stats.evictions, b.stats.promotions), (1, 2));
+    }
+
+    #[test]
+    fn an_expert_still_copying_is_served_from_scratch() {
+        let (mut eng, now) = engine(3);
+        let mut b: ExpertBook<u64> = ExpertBook::new(8, 4, 1, &score_settings(1.15, 64));
+        let g = step(&mut b, &mut eng, &now, &[5]);
+        assert_eq!(g, vec![vec![Placed { page: 5, slot: 3, copy: true }]]);
+        assert_eq!((b.in_flight(), b.resident(5)), (1, None));
+        for _ in 0..2 {
+            let g = step(&mut b, &mut eng, &now, &[5]);
+            assert_eq!(g, vec![vec![Placed { page: 5, slot: 3, copy: true }]], "in flight is never read as resident");
+        }
+        let g = step(&mut b, &mut eng, &now, &[5]);
+        assert_eq!(g, vec![vec![Placed { page: 5, slot: 0, copy: false }]]);
+        assert_eq!(eng.copies, vec![(5, 0)], "one promotion copy, never repeated while in flight");
+    }
+
+    #[test]
+    fn scores_decay_by_half_each_half_life() {
+        let (mut eng, _) = engine(0);
+        let mut b: ExpertBook<u64> = ExpertBook::new(2, 2, 1, &score_settings(1.15, 4));
+        b.record(1, 8.0);
+        for _ in 0..4 {
+            b.end_step(&mut eng).unwrap();
+        }
+        assert!((b.score(1) - 4.0).abs() < 1e-9, "{}", b.score(1));
+        for _ in 0..4 {
+            b.end_step(&mut eng).unwrap();
+        }
+        assert!((b.score(1) - 2.0).abs() < 1e-9, "{}", b.score(1));
+    }
+
+    fn alternating_evictions(margin: f64) -> u64 {
+        let (mut eng, now) = engine(1);
+        let mut b: ExpertBook<u64> = ExpertBook::new(4, 2, 1, &score_settings(margin, 64));
+        for t in 0..1000 {
+            step(&mut b, &mut eng, &now, &[t % 2]);
+        }
+        b.stats.evictions
+    }
+
+    #[test]
+    fn alternating_experts_do_not_thrash_the_cache() {
+        assert!(alternating_evictions(1.15) <= 2, "{}", alternating_evictions(1.15));
+        assert!(alternating_evictions(1.0) > 400, "without a margin the same pattern thrashes: {}", alternating_evictions(1.0));
+    }
+
+    #[test]
+    fn hotlist_seed_fills_the_cache_before_the_first_token() {
+        let mut hot = ExpertHotlist::new(2, 4);
+        for (l, e, n) in [(0, 1, 9), (0, 2, 3), (1, 0, 7), (1, 3, 1), (0, 0, 1)] {
+            for _ in 0..n {
+                hot.record(l, e);
+            }
+        }
+        let mut b: ExpertBook<u64> = ExpertBook::new(8, 4, 1, &score_settings(1.15, 64));
+        let placed = b.seed(&hot, 4, 2);
+        assert_eq!(placed.len(), 3);
+        assert!(b.resident(1).is_some() && b.resident(4).is_some() && b.resident(2).is_some(), "{placed:?}");
+        let g = b.plan(&[1, 4], false);
+        assert!(g[0].iter().all(|p| !p.copy), "{g:?}");
+        assert_eq!(b.stats.host_hits, 0);
+    }
+
+    #[test]
+    fn misses_past_the_scratch_slots_split_into_groups_or_borrow_cold_slots() {
+        let (mut eng, _) = engine(0);
+        let mut b: ExpertBook<u64> = ExpertBook::new(16, 6, 2, &score_settings(1.15, 64));
+        for p in 0..4 {
+            b.record(p, 1.0 + p as f64);
+        }
+        b.end_step(&mut eng).unwrap();
+        b.poll(|t| eng.done(t));
+        let g = b.plan(&[0, 8, 9, 10, 11, 12], false);
+        assert_eq!(g.len(), 3);
+        assert_eq!(g[0][0], Placed { page: 0, slot: b.resident(0).unwrap(), copy: false });
+        assert!(g.iter().flatten().filter(|p| p.copy).all(|p| p.slot >= 4));
+        let g = b.plan(&[3, 8, 9, 10, 11, 12], true);
+        assert_eq!(g.len(), 1);
+        let slots: Vec<usize> = g[0].iter().map(|p| p.slot).collect();
+        let mut uniq = slots.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 6);
+        assert_eq!(b.resident(3), Some(g[0][0].slot), "the hottest routed resident stays");
+        assert_eq!((b.resident(0), b.resident(1), b.resident(2)), (None, None, None));
+        let borrowed: Vec<usize> = g[0].iter().filter(|p| p.copy && p.slot < 4).map(|p| p.page).collect();
+        assert_eq!(borrowed.len(), 3);
+        assert!(borrowed.iter().all(|&p| b.resident(p).is_some()), "a borrowed slot keeps the expert it was given");
+    }
+
+    #[test]
+    fn score_settings_parse_with_defaults() {
+        let s: OffloadSettings = toml::from_str("policy = \"score\"\npromote_margin = 1.3\n").unwrap();
+        assert_eq!((s.policy, s.promote_margin, s.score_half_life, s.promote_per_step), (Policy::Score, 1.3, 64, 16));
+        assert_eq!(OffloadSettings::default().policy, Policy::Lru);
+        assert_eq!(OffloadSettings::default().promote_margin, 1.15);
     }
 
     #[test]

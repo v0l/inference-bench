@@ -283,6 +283,9 @@ impl Runtime {
         cache.observe(w.index, &used);
         let shared_at = m.local_experts() as i32;
         let has_shared = routed.iter().any(|&e| e >= shared_at);
+        if cache.scored() {
+            return self.moe_experts_scored(w, cache, host, &routed, &used, has_shared, n);
+        }
         let groups: Vec<&[usize]> = if used.is_empty() { vec![&[][..]] } else { used.chunks(cache.slots).collect() };
         for (g, group) in groups.iter().enumerate() {
             let staged = cache.stage(&self.stream, w.index, host, group, g == 0 && has_shared, n >= GROUP_MIN_TOKENS)?;
@@ -313,6 +316,47 @@ impl Runtime {
             cache.release();
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_scored(&self, w: &DeviceMoe, cache: &experts::ExpertCache, host: &experts::HostExperts, routed: &[i32], used: &[usize], has_shared: bool, n: usize) -> Result<()> {
+        let m = self.spec.moe.as_ref().expect("moe spec");
+        let mb = self.moe.as_ref().expect("moe buffers");
+        let shared_at = m.local_experts() as i32;
+        let counted: Vec<(usize, usize)> = used.iter().map(|&e| (e, routed.iter().filter(|&&r| r == e as i32).count())).collect();
+        let mut groups = cache.plan_scored(w.index, &counted, n, n >= GROUP_MIN_TOKENS);
+        if groups.iter().all(Vec::is_empty) {
+            groups.truncate(1);
+        }
+        for (g, group) in groups.iter().enumerate() {
+            cache.load_group(&self.stream, host, group, g == 0 && has_shared)?;
+            let slot_of: std::collections::HashMap<usize, usize> = group.iter().map(|&(e, s, _)| (e, s)).collect();
+            let remapped: Vec<i32> = routed
+                .iter()
+                .map(|&e| {
+                    if e < 0 {
+                        -1
+                    } else if e >= shared_at {
+                        if g == 0 { (cache.slots as i32) + (e - shared_at) } else { -1 }
+                    } else {
+                        slot_of.get(&(e as usize)).map_or(-1, |&s| s as i32)
+                    }
+                })
+                .collect();
+            {
+                let (ptr, _sync) = mb.idx.device_ptr(&self.stream);
+                unsafe { cudarc::driver::result::memcpy_htod_async(ptr, &remapped, self.stream.cu_stream()) }?;
+            }
+            self.moe_experts_with(w, &cache.stacks, Some(host.input_globals), n)?;
+        }
+        if self.next_cached_layer(w.index).is_none() {
+            cache.end_step(&self.stream, &self.cached_hosts())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn cached_hosts(&self) -> Vec<(usize, &experts::HostExperts)> {
+        self.layers.iter().enumerate().filter_map(|(i, l)| l.moe.as_ref().and_then(|m| m.host.as_ref()).map(|h| (i, h))).collect()
     }
 
     fn next_cached_layer(&self, after: usize) -> Option<(usize, &experts::HostExperts)> {
