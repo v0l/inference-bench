@@ -247,6 +247,7 @@ pub enum Op {
     AllReduce,
     AllReduceNorm { which: NormKind },
     Gemv { norm: Option<NormKind>, weight: Weight, quant: QuantSource, input: Buf, output: Buf },
+    GemvStore { weight: Weight, quant: QuantSource, input: Buf, output: Buf },
     StepAttention,
     GdnStep,
 }
@@ -299,6 +300,7 @@ impl Op {
             Op::AllReduceNorm { .. } => "allreduce, add and norm".into(),
             Op::Gemv { norm: Some(_), weight, .. } => format!("norm and {}", weight.name()),
             Op::Gemv { weight, .. } => weight.name().into(),
+            Op::GemvStore { weight, .. } => format!("{} store", weight.name()),
             Op::StepAttention => "step attention".into(),
             Op::GdnStep => "delta rule step".into(),
         }
@@ -332,6 +334,7 @@ impl Op {
             Op::AllReduceNorm { .. } => "rank partials summed into x, x to xn planes".into(),
             Op::Gemv { norm: Some(_), output, .. } => format!("x normed to {}", output.label()),
             Op::Gemv { input, output, .. } => format!("{} to {}", input.label(), output.label()),
+            Op::GemvStore { input, output, .. } => format!("{} stored to {}", input.label(), output.label()),
             Op::StepAttention => "qkv and kv cache to attn".into(),
             Op::GdnStep => "lin, ba and state to gdn".into(),
         }
@@ -343,6 +346,7 @@ impl Op {
             Op::Norm { which, .. } | Op::NormAdd { which, .. } => vec![which.tensor().into()],
             Op::Linear { weight, .. } => weight.tensors(spec),
             Op::Gemv { norm, weight, .. } => norm.iter().map(|n| n.tensor().to_string()).chain(weight.tensors(spec)).collect(),
+            Op::GemvStore { weight, .. } => weight.tensors(spec),
             Op::KvRope | Op::QkRope | Op::DecodeRope | Op::Flash | Op::DecodeAttention | Op::StepAttention | Op::QkNorm if spec.attention.qk_norm && !spec.attention.qk_norm_unit => {
                 vec!["self_attn.q_norm.weight".into(), "self_attn.k_norm.weight".into()]
             }
@@ -389,7 +393,7 @@ impl Op {
 
     pub fn quant(&self, spec: &Spec, layer: usize) -> Option<Quant> {
         match self {
-            Op::Linear { quant, weight, .. } | Op::Gemv { quant, weight, .. } => Some(quant.resolve_for(spec, layer, *weight)),
+            Op::Linear { quant, weight, .. } | Op::Gemv { quant, weight, .. } | Op::GemvStore { quant, weight, .. } => Some(quant.resolve_for(spec, layer, *weight)),
             _ => None,
         }
     }
@@ -458,6 +462,10 @@ impl Op {
             Op::MoeCombine => names(&["moe_combine"]),
             Op::AllReduce => vec![crate::allreduce::kernel_name(crate::allreduce::pick_mode(tokens * spec.dims.hidden * 4), kir::allreduce::Dtype::F32)],
             Op::AllReduceNorm { .. } => names(&["ar_add_rmsnorm_f32"]),
+            Op::GemvStore { weight, quant, .. } => match crate::gemm::gemv_into(spec, weight.name(), weight_kind(quant.resolve_for(spec, layer, *weight)), false, true) {
+                Some(g) => vec![g.name.to_string()],
+                None => vec![format!("unsupported: no store gemv for {}", weight.name())],
+            },
             Op::Gemv { norm, weight, quant, .. } => match crate::gemm::gemv(spec, weight.name(), weight_kind(quant.resolve_for(spec, layer, *weight)), norm.is_some()) {
                 Some(g) => vec![g.name.to_string()],
                 None => vec![format!("unsupported: no gemv for {}", weight.name())],

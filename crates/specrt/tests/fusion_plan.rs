@@ -165,6 +165,21 @@ fn shared_memory_and_registers_bound_a_prologue() {
 }
 
 #[test]
+fn the_branch_clear_is_filled_into_the_residual_linear() {
+    for name in ["tiny-olmo2", "tiny-granite"] {
+        let spec = Spec::from_hf_config_serving(&std::fs::read_to_string(root().join("tests/fixtures").join(name).join("config.json")).unwrap()).unwrap();
+        let r = report(&spec, Phase::Decode, 1, &sm120());
+        let layer = section(&r, "layer");
+        for (clear, linear) in [("clear", "o"), ("clear 2", "down")] {
+            let g = layer.group_of(linear);
+            assert!(g.iter().any(|g| g.units.iter().any(|u| u == clear) && g.units.contains(&format!("{linear} residual"))), "{name}\n{}", r.render());
+        }
+        assert!(layer.fused.iter().filter(|d| d.rule == specrt::fusion::Rule::Fill).count() == 2, "{name}\n{}", r.render());
+        assert!(layer.groups.iter().all(|g| !(g.units.len() == 1 && g.units[0].starts_with("clear"))), "{name}\n{}", r.render());
+    }
+}
+
+#[test]
 fn the_dry_run_leaves_the_plan_alone() {
     let spec = hybrid();
     for phase in [Phase::Prefill, Phase::Decode, Phase::Verify] {

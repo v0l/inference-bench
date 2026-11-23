@@ -125,7 +125,7 @@ echo "MemAvailable ${avail} GB"
 
 run() {
     systemd-run --user --wait --collect -P -q -p MemoryMax=60G -p MemorySwapMax=0 \
-        --setenv=PATH="$PATH" --setenv=HOME="$HOME" "$@"
+        --setenv=PATH="$PATH" --setenv=HOME="$HOME" ${CUDA_VISIBLE_DEVICES:+--setenv=CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES} "$@"
 }
 
 if [ "$only" = sglang ]; then
@@ -150,13 +150,13 @@ fi
 bench=$target/release/bench
 
 exec 9>/tmp/gpu27.lock
-echo "waiting for gpu27.lock"; flock 9; echo "lock held"
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then echo "waiting for gpu27.lock"; flock 9; echo "lock held"; fi
 
 if [ "$mode" = ab ]; then
     for r in $(seq "$rounds"); do
         for side in A B; do
-            b=$bin_a; [ $side = B ] && b=$bin_b
-            run "$b" --runs 3 "$model" "$lens" "$new" 2>&1 | grep -E "^\s+prompt=" | sed "s/^/round=$r side=$side /" | cut -c1-200
+            b=$bin_a; mb=$model; [ $side = B ] && { b=$bin_b; mb=${MODEL_B:-$model}; }
+            run "$b" --runs 3 "$mb" "$lens" "$new" 2>&1 | grep -E "^\s+prompt=" | sed "s/^/round=$r side=$side /" | cut -c1-200
         done
     done | tee "$raw/ab.log"
     python3 "$here/perfpass_report.py" ab "$raw/ab.log"

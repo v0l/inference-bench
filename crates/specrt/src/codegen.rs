@@ -480,6 +480,26 @@ pub fn gemv_kernels(spec: &Spec, target: &kir::Target, ops: &kir::ops::OpsShape)
     ops_list.into_iter().map(|(name, op)| kir::gemv::GemvKernel::new(target, name, op).map_err(anyhow::Error::msg)).collect()
 }
 
+pub const EPILOGUE_FILL: &str = "epilogue_fill";
+
+pub const STORE_GEMVS: [&str; 2] = ["o_proj_store", "down_proj_store"];
+
+pub fn store_gemvs(spec: &Spec, target: &kir::Target, ops: &kir::ops::OpsShape) -> Result<Vec<kir::gemv::GemvKernel>> {
+    if !(spec.runtime.store_epilogue && spec.uses_branch()) {
+        return Ok(Vec::new());
+    }
+    let wf = kir::gemm::WeightFormat::from_decoder(&ops.weight_decoder).ok_or_else(|| anyhow::anyhow!("unknown decoder {}", ops.weight_decoder))?;
+    let (h, q, i) = (ops.hidden, ops.q_dim, ops.inter);
+    [(STORE_GEMVS[0], q, ops.o_bias), (STORE_GEMVS[1], i, false)]
+        .into_iter()
+        .map(|(name, k, bias)| {
+            let mut heavy = kir::heavy::Heavy::new(name, kir::heavy::Family::Gemv { wf }, kir::heavy::Problem { n: h, k, act: kir::Activation::Silu }, None);
+            heavy.epilogue = kir::heavy::epilogue(kir::gemm::Epilogue::Residual, bias, h).map_err(anyhow::Error::msg)?;
+            Ok(heavy.fill(target, EPILOGUE_FILL, kir::heavy::OUT, 0.0)?.compile_gemv(target, EPILOGUE_FILL)?)
+        })
+        .collect()
+}
+
 pub fn ggb_scratch_len(spec: &Spec) -> usize {
     GGB_LINEARS.iter().map(|l| { let (n, k, _, _) = linear_dims(spec, l); n * k }).max().unwrap_or(0)
 }
@@ -532,7 +552,10 @@ impl Module {
         ]);
         let ggml = kir::ggml::GgmlKernel::new(target);
         let prims = kir::prims::cuda_prims(target, d.hidden, d.vocab, spec.norm.eps, spec.dims.embed_scale.unwrap_or(1.0)).map_err(anyhow::Error::msg)?;
-        let gemvs = gemv_kernels(spec, target, &ops)?;
+        let mut gemvs = gemv_kernels(spec, target, &ops)?;
+        let stores = store_gemvs(spec, target, &ops)?;
+        let store_names: Vec<&'static str> = stores.iter().map(|k| crate::gemm::intern(&k.name)).collect();
+        gemvs.extend(stores);
         let kir_hash = kir::fold_hashes([kir_hash, ggml.hash(), kir::prims::prims_hash(&prims), kir::gemv::gemv_hash(&gemvs)]);
         let mut source = format!(
             "{}\n{}\n{}\n{}\n{}\n{}\n{}",
@@ -545,6 +568,7 @@ impl Module {
             kir_source
         );
         let mut kernels: Vec<&'static str> = KERNELS.iter().copied().filter(|k| attention_available(k, target)).collect();
+        kernels.extend(store_names);
         for k in kir_kernels.iter().chain(&distinct) {
             if !kernels.contains(&k.name) {
                 kernels.push(k.name);

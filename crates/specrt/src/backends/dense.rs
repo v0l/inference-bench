@@ -228,7 +228,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => bail!("MTP is not yet on wgpu"),
             Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => bail!("mixture of experts is not yet on wgpu"),
             Op::AllReduce | Op::AllReduceNorm { .. } => bail!("tensor parallel is not on wgpu"),
-            Op::Gemv { .. } | Op::StepAttention | Op::GdnStep => bail!("the single row cuda plan is not on wgpu"),
+            Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => bail!("the single row cuda plan is not on wgpu"),
         }
     }
 }

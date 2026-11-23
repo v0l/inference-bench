@@ -26,7 +26,7 @@ One change at a time, in kir prims (never a per-architecture kernel). Judge with
 crates/specrt/scripts/perfpass.sh --ab <bench-base> <bench-branch> <model> --rounds 5 --lens 1024,8192
 ```
 
-It alternates A, B, A, B for the given number of rounds and prints the median B/A ratio per length with the IQR. It refuses a result whose IQR is above 10% of the median (re-run on a quieter card). Keep a change only on a 5% gain or better with the correctness gates holding (logits KL and greedy against the reference, the tests in `docs/testing.md` for that family). Stop when the top kernels are about 80% of their roofline, or each remaining one has a written reason in the family report. Build each side in its own target dir (`CARGO_TARGET_DIR=~/ib-gates-target/803-<side>`), and check the JIT source in the PTX before trusting numbers.
+It alternates A, B, A, B for the given number of rounds and prints the median B/A ratio per length with the IQR. Set `MODEL_B` to give side B its own spec (an option the base binary does not know). Under `~/.agents/bin/gpu-run 1 --` it passes `CUDA_VISIBLE_DEVICES` to each run and skips the old `gpu27.lock`. It refuses a result whose IQR is above 10% of the median (re-run on a quieter card). Keep a change only on a 5% gain or better with the correctness gates holding (logits KL and greedy against the reference, the tests in `docs/testing.md` for that family). Stop when the top kernels are about 80% of their roofline, or each remaining one has a written reason in the family report. Build each side in its own target dir (`CARGO_TARGET_DIR=~/ib-gates-target/803-<side>`), and check the JIT source in the PTX before trusting numbers.
 
 ## 4. Compare
 

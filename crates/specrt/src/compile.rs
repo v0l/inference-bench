@@ -144,6 +144,11 @@ impl Ctx<'_> {
                     let whole = parts.contains(&Part::Main) && parts.iter().all(|p| matches!(p, Part::Main | Part::Act));
                     (whole && self.every_layer(weight, quant, true, |g| g.act == act)).then_some((b, Op::Gemv { norm: Some(which), weight, quant, input: Buf::X, output }))
                 }
+                (Op::Clear { buf }, Op::Linear { weight, quant, input, output }) if self.opts.family == Family::Gemv && output == buf => {
+                    let parts: Vec<Part> = units.iter().map(|u| u.part).collect();
+                    let whole = parts.contains(&Part::Main) && parts.contains(&Part::Residual) && parts.iter().all(|p| matches!(p, Part::Whole | Part::Main | Part::Residual));
+                    (whole && self.layers.iter().all(|&l| gemm::gemv_into(self.spec, weight.name(), weight_kind(quant.resolve_for(self.spec, l, weight)), false, true).is_some())).then_some((b, Op::GemvStore { weight, quant, input, output }))
+                }
                 _ => None,
             },
             _ => None,

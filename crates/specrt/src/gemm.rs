@@ -207,9 +207,26 @@ fn gemv_name(linear: &str, normed: bool, fp4: bool, gdn: bool) -> Option<(&'stat
 }
 
 pub fn gemv(spec: &Spec, linear: &str, weight: WeightKind, normed: bool) -> Option<GemvLaunch> {
+    gemv_into(spec, linear, weight, normed, false)
+}
+
+fn store_name(linear: &str) -> Option<&'static str> {
+    match linear {
+        "o" => Some("o_proj_store"),
+        "down" => Some("down_proj_store"),
+        _ => None,
+    }
+}
+
+pub fn gemv_into(spec: &Spec, linear: &str, weight: WeightKind, normed: bool, store: bool) -> Option<GemvLaunch> {
     let s = linear_shape(spec, linear);
     if normed && s.epi == Epilogue::Map {
         return None;
+    }
+    if store {
+        let plain = gemv_into(spec, linear, weight, normed, false)?;
+        let name = store_name(linear).filter(|_| !normed && s.epi == Epilogue::Residual && weight != WeightKind::Fp4 && spec.runtime.store_epilogue && spec.uses_branch())?;
+        return Some(GemvLaunch { name, ..plain });
     }
     let (name, fp4) = gemv_name(linear, normed, weight == WeightKind::Fp4, spec.linear_attention.is_some())?;
     let act = normed && s.epi == Epilogue::Act;
