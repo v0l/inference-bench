@@ -1421,6 +1421,8 @@ impl Runtime {
                 host_hits: a.host_hits + b.host_hits,
                 nvme_reads: a.nvme_reads + b.nvme_reads,
                 nvme_read_bytes: a.nvme_read_bytes + b.nvme_read_bytes,
+                nvme_read_failures: a.nvme_read_failures + b.nvme_read_failures,
+                nvme_wait_nanos: a.nvme_wait_nanos + b.nvme_wait_nanos,
                 host_to_vram_bytes: a.host_to_vram_bytes + b.host_to_vram_bytes,
                 evictions: a.evictions + b.evictions,
             }),

@@ -99,6 +99,10 @@ pub fn offload_readings(r: &Reading, stream_bytes_s: f64) -> Vec<(&'static str, 
     vec![
         ("weight hits", crate::fmt::percent(o.hit_ratio()), TRACE),
         ("weight stream", format!("{:.2} GB/s", stream_bytes_s / 1e9), TRACE),
+        ("nvme reads", o.nvme_reads.to_string(), TRACE),
+        ("nvme read", format!("{:.2} GB", o.nvme_read_bytes as f64 / 1e9), TRACE),
+        ("nvme wait", format!("{:.2} s", o.nvme_wait_nanos as f64 / 1e9), TRACE),
+        ("nvme failures", o.nvme_read_failures.to_string(), TRACE),
     ]
 }
 
