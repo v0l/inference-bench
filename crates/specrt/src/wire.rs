@@ -15,6 +15,22 @@ const NONCE_BYTES: usize = 32;
 pub enum Input {
     Tokens(Vec<u32>),
     Hidden { rows: u32, data: Vec<u8> },
+    Direct { rows: u32 },
+}
+
+pub enum HiddenView<'a> {
+    Host { rows: u32, data: &'a [u8] },
+    Device { rows: u32 },
+}
+
+impl Input {
+    pub fn hidden_view(&self) -> Option<HiddenView<'_>> {
+        match self {
+            Input::Tokens(_) => None,
+            Input::Hidden { rows, data } => Some(HiddenView::Host { rows: *rows, data }),
+            Input::Direct { rows } => Some(HiddenView::Device { rows: *rows }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,10 +48,24 @@ pub enum Message {
     DecodeBatch { slots: Vec<u32>, positions: Vec<u32>, input: Input },
     Tokens { tokens: Vec<u32>, compute_us: u32 },
     Rdma { qpn: u32, psn: u32, gid: [u8; 16], addr: u64, rkey: u32 },
+    DirectOpen { next: bool, ip: String },
+    DirectInfo { qpn: u32, psn: u32, gid: [u8; 16], addr: u64, rkey: u32, capacity: u64 },
+    DirectConnect { next: bool, qpn: u32, psn: u32, gid: [u8; 16], addr: u64, rkey: u32, capacity: u64 },
+    DirectMode { enabled: bool },
+    Pushed { rows: u32, compute_us: u32 },
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn put_conn(out: &mut Vec<u8>, qpn: u32, psn: u32, gid: &[u8; 16], addr: u64, rkey: u32, capacity: u64) {
+    put_u32(out, qpn);
+    put_u32(out, psn);
+    out.extend_from_slice(gid);
+    out.extend_from_slice(&addr.to_le_bytes());
+    put_u32(out, rkey);
+    out.extend_from_slice(&capacity.to_le_bytes());
 }
 
 fn put_bytes(out: &mut Vec<u8>, b: &[u8]) {
@@ -60,6 +90,22 @@ impl<'a> Cursor<'a> {
         let v = self.buf[0];
         self.buf = &self.buf[1..];
         Ok(v)
+    }
+
+    fn conn(&mut self) -> Result<(u32, u32, [u8; 16], u64, u32, u64)> {
+        let qpn = self.u32()?;
+        let psn = self.u32()?;
+        ensure!(self.buf.len() >= 36, "truncated frame");
+        let (g, rest) = self.buf.split_at(16);
+        let gid: [u8; 16] = g.try_into().unwrap();
+        let (a, rest) = rest.split_at(8);
+        let addr = u64::from_le_bytes(a.try_into().unwrap());
+        self.buf = rest;
+        let rkey = self.u32()?;
+        let (c, rest) = self.buf.split_at(8);
+        let capacity = u64::from_le_bytes(c.try_into().unwrap());
+        self.buf = rest;
+        Ok((qpn, psn, gid, addr, rkey, capacity))
     }
 
     fn u32_list(&mut self) -> Result<Vec<u32>> {
@@ -114,6 +160,10 @@ impl Message {
                         put_u32(&mut out, *rows);
                         put_bytes(&mut out, data);
                     }
+                    Input::Direct { rows } => {
+                        out.push(2);
+                        put_u32(&mut out, *rows);
+                    }
                 }
             }
             Message::Output { rows, data, compute_us } => {
@@ -164,6 +214,10 @@ impl Message {
                         put_u32(&mut out, *rows);
                         put_bytes(&mut out, data);
                     }
+                    Input::Direct { rows } => {
+                        out.push(2);
+                        put_u32(&mut out, *rows);
+                    }
                 }
             }
             Message::Tokens { tokens, compute_us } => {
@@ -181,6 +235,29 @@ impl Message {
                 out.extend_from_slice(gid);
                 out.extend_from_slice(&addr.to_le_bytes());
                 put_u32(&mut out, *rkey);
+            }
+            Message::DirectOpen { next, ip } => {
+                out.push(14);
+                out.push(*next as u8);
+                put_bytes(&mut out, ip.as_bytes());
+            }
+            Message::DirectInfo { qpn, psn, gid, addr, rkey, capacity } => {
+                out.push(15);
+                put_conn(&mut out, *qpn, *psn, gid, *addr, *rkey, *capacity);
+            }
+            Message::DirectConnect { next, qpn, psn, gid, addr, rkey, capacity } => {
+                out.push(16);
+                out.push(*next as u8);
+                put_conn(&mut out, *qpn, *psn, gid, *addr, *rkey, *capacity);
+            }
+            Message::DirectMode { enabled } => {
+                out.push(17);
+                out.push(*enabled as u8);
+            }
+            Message::Pushed { rows, compute_us } => {
+                out.push(18);
+                put_u32(&mut out, *rows);
+                put_u32(&mut out, *compute_us);
             }
         }
         out
@@ -210,6 +287,7 @@ impl Message {
                         let rows = c.u32()?;
                         Input::Hidden { rows, data: c.bytes()? }
                     }
+                    2 => Input::Direct { rows: c.u32()? },
                     other => bail!("unknown input kind {other}"),
                 };
                 Message::Forward { slot, position, input, decode }
@@ -242,6 +320,7 @@ impl Message {
                         let rows = c.u32()?;
                         Input::Hidden { rows, data: c.bytes()? }
                     }
+                    2 => Input::Direct { rows: c.u32()? },
                     other => bail!("unknown input kind {other}"),
                 };
                 Message::DecodeBatch { slots, positions, input }
@@ -261,6 +340,18 @@ impl Message {
                 c.buf = rest;
                 Message::Rdma { qpn, psn, gid, addr, rkey: c.u32()? }
             }
+            14 => Message::DirectOpen { next: c.u8()? != 0, ip: String::from_utf8(c.bytes()?).context("ip text")? },
+            15 => {
+                let (qpn, psn, gid, addr, rkey, capacity) = c.conn()?;
+                Message::DirectInfo { qpn, psn, gid, addr, rkey, capacity }
+            }
+            16 => {
+                let next = c.u8()? != 0;
+                let (qpn, psn, gid, addr, rkey, capacity) = c.conn()?;
+                Message::DirectConnect { next, qpn, psn, gid, addr, rkey, capacity }
+            }
+            17 => Message::DirectMode { enabled: c.u8()? != 0 },
+            18 => Message::Pushed { rows: c.u32()?, compute_us: c.u32()? },
             other => bail!("unknown message tag {other}"),
         };
         c.done()?;
@@ -525,6 +616,10 @@ impl StageClient {
         self.rdma.is_some()
     }
 
+    pub fn peer_ip(&self) -> Result<String> {
+        Ok(self.stream.peer_addr()?.ip().to_string())
+    }
+
     fn upgrade_rdma(&mut self, link: &LinkOptions) -> Result<()> {
         let verbs = Verbs::load(link.library())?;
         let mut ep = Endpoint::open(verbs, self.stream.local_addr()?.ip())?;
@@ -588,6 +683,7 @@ impl StageClient {
 
 pub struct Chain {
     stages: Vec<StageClient>,
+    direct: bool,
 }
 
 impl Chain {
@@ -616,7 +712,9 @@ impl Chain {
             stages.push(client);
         }
         stages.reverse();
-        Chain::assemble(stages)
+        let mut chain = Chain::assemble(stages)?;
+        chain.try_direct(link);
+        Ok(chain)
     }
 
     fn assemble(stages: Vec<StageClient>) -> Result<Chain> {
@@ -630,7 +728,46 @@ impl Chain {
             hidden = Some(h);
             expected = layer_end;
         }
-        Ok(Chain { stages })
+        Ok(Chain { stages, direct: false })
+    }
+
+    pub fn is_direct(&self) -> bool {
+        self.direct
+    }
+
+    pub fn set_direct(&mut self, on: bool) -> Result<()> {
+        for stage in self.stages.iter_mut() {
+            ensure!(stage.call(&Message::DirectMode { enabled: on })? == Message::Ack, "direct mode was not acknowledged");
+        }
+        self.direct = on;
+        Ok(())
+    }
+
+    fn open_direct(&mut self) -> Result<()> {
+        ensure!(self.stages.len() >= 2, "a single stage has no hop to open");
+        for i in 0..self.stages.len() - 1 {
+            let (left, right) = self.stages.split_at_mut(i + 1);
+            let (a, b) = (&mut left[i], &mut right[0]);
+            let (ip_a, ip_b) = (a.peer_ip()?, b.peer_ip()?);
+            let Message::DirectInfo { qpn: aq, psn: ap, gid: ag, addr: aa, rkey: ar, capacity: ac } = a.call(&Message::DirectOpen { next: true, ip: ip_a })? else { bail!("stage {} answered a direct offer wrongly", a.addr) };
+            let Message::DirectInfo { qpn: bq, psn: bp, gid: bg, addr: ba, rkey: br, capacity: bc } = b.call(&Message::DirectOpen { next: false, ip: ip_b })? else { bail!("stage {} answered a direct offer wrongly", b.addr) };
+            ensure!(a.call(&Message::DirectConnect { next: true, qpn: bq, psn: bp, gid: bg, addr: ba, rkey: br, capacity: bc })? == Message::Ack, "direct connect refused");
+            ensure!(b.call(&Message::DirectConnect { next: false, qpn: aq, psn: ap, gid: ag, addr: aa, rkey: ar, capacity: ac })? == Message::Ack, "direct connect refused");
+        }
+        self.set_direct(true)
+    }
+
+    pub fn try_direct(&mut self, link: &LinkOptions) {
+        if !link.gpu_direct || link.transport == Transport::Tcp || self.stages.len() < 2 {
+            return;
+        }
+        match self.open_direct() {
+            Ok(()) => tracing::info!(stages = self.stages.len(), "stage hops are gpu-direct"),
+            Err(e) => {
+                tracing::info!(error = %format!("{e:#}"), "gpu-direct unavailable, hidden states use byte frames");
+                let _ = self.set_direct(false);
+            }
+        }
     }
 
     pub fn is_rdma(&self) -> Vec<bool> {
@@ -679,6 +816,10 @@ impl Chain {
                     times.compute.push(Duration::from_micros(compute_us as u64));
                     input = Input::Hidden { rows, data };
                 }
+                Message::Pushed { rows, compute_us } if i < last => {
+                    times.compute.push(Duration::from_micros(compute_us as u64));
+                    input = Input::Direct { rows };
+                }
                 Message::Token { token, compute_us } if i == last => {
                     times.compute.push(Duration::from_micros(compute_us as u64));
                     times.total = times.stage.iter().sum();
@@ -704,6 +845,10 @@ impl Chain {
                     times.compute.push(Duration::from_micros(compute_us as u64));
                     input = Input::Hidden { rows, data };
                 }
+                Message::Pushed { rows, compute_us } if i < last => {
+                    times.compute.push(Duration::from_micros(compute_us as u64));
+                    input = Input::Direct { rows };
+                }
                 Message::Tokens { tokens, compute_us } if i == last => {
                     ensure!(tokens.len() == slots.len(), "stage {i} returned {} tokens for {} rows", tokens.len(), slots.len());
                     times.compute.push(Duration::from_micros(compute_us as u64));
@@ -718,6 +863,18 @@ impl Chain {
 
     pub fn forward_pipelined(&mut self, slot: u32, position: u32, tokens: &[u32], micro: usize) -> Result<(u32, Vec<ChainTimes>)> {
         ensure!(micro >= 1 && !tokens.is_empty(), "pipelined prefill needs tokens and a micro-batch size");
+        let was_direct = self.direct;
+        if was_direct {
+            self.set_direct(false)?;
+        }
+        let result = self.pipelined_inner(slot, position, tokens, micro);
+        if was_direct {
+            self.set_direct(true)?;
+        }
+        result
+    }
+
+    fn pipelined_inner(&mut self, slot: u32, position: u32, tokens: &[u32], micro: usize) -> Result<(u32, Vec<ChainTimes>)> {
         let last = self.stages.len() - 1;
         let pieces: Vec<(u32, Vec<u32>)> = tokens
             .chunks(micro)
