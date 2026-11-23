@@ -376,6 +376,29 @@ fn linear_builders_use_prims_unless_listed() {
 }
 
 #[test]
+fn launch_geometry_comes_from_kir_builders() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let moe = std::fs::read_to_string(src.join("runtime/moe.rs")).unwrap();
+    for hand in ["ROWS_PER_BLOCK", "div_ceil(256)", "block_dim: (256, 1, 1)", "div_ceil(8) as u32"] {
+        assert!(!moe.contains(hand), "runtime/moe.rs spells launch geometry by hand ({hand}): take it from kir::moe");
+    }
+    for f in ["kir::moe::route_logits_launch", "kir::moe::expert_rows_launch", "kir::moe::rows_launch"] {
+        assert!(moe.contains(f), "runtime/moe.rs must launch through {f}");
+    }
+    let gemm = std::fs::read_to_string(src.join("gemm.rs")).unwrap();
+    assert!(gemm.contains("kir::gemv::gemv_geometry(") && !gemm.contains("threads as usize / 32"), "gemv geometry lives in kir::gemv");
+    let codegen = std::fs::read_to_string(src.join("codegen.rs")).unwrap();
+    assert!(!codegen.contains("div_ceil(16)"), "decode warps live in kir::attention");
+    let launch = kir::moe::expert_rows_launch(3, 17);
+    assert_eq!((launch.grid, launch.threads), ((3, 3), 256));
+    assert_eq!(kir::moe::route_logits_launch(256, 9).grid, (33, 3));
+    let g = kir::gemv::gemv_geometry(kir::gemm::WeightFormat::Ggml, 64, false, false, false);
+    assert_eq!((g.threads, g.rows_per_block, g.blocks_per_sm), (256, 16, Some(8)));
+    let f = kir::gemv::gemv_geometry(kir::gemm::WeightFormat::Fp4, 64, false, true, true);
+    assert_eq!((f.threads, f.rows_per_block), (512, 32));
+}
+
+#[test]
 fn module_bakes_spec_constants() {
     let m = Module::generate(&spec("qwen3-0.6b.toml"), 256).unwrap();
     assert!(!m.source.contains("{{"));

@@ -82,10 +82,11 @@ fn logits_dot() -> String {
 }
 
 pub fn route_logits() -> String {
+    use crate::moe::{EXPERT_WARPS, LOGIT_PER_WARP, LOGIT_TOKENS};
     format!(
-        "constexpr int MOE_LOGIT_PER_WARP = 4;\nconstexpr int MOE_LOGIT_ROWS = 8 * MOE_LOGIT_PER_WARP;\nconstexpr int MOE_LOGIT_TOKENS = 4;\n\n{}",
+        "constexpr int MOE_LOGIT_PER_WARP = {LOGIT_PER_WARP};\nconstexpr int MOE_LOGIT_ROWS = {EXPERT_WARPS} * MOE_LOGIT_PER_WARP;\nconstexpr int MOE_LOGIT_TOKENS = {LOGIT_TOKENS};\n\n{}",
         prim::global(
-            Some(256),
+            Some(crate::moe::EXPERT_THREADS),
             "moe_route_logits",
             "const float* x, const float* ln, const bf16_t* router, const float* shared_gate, const float* router_bias, float* xn, float* logits, int n",
             &format!("{}{}", logits_norm(), logits_dot())
@@ -191,7 +192,7 @@ fn emit_pairs() -> &'static str {
 pub fn route() -> String {
     format!(
         "constexpr bool MOE_PARALLEL = MOE_LOCAL != MOE_E;\n\n{}",
-        prim::global(Some(32), "moe_route", "const float* logits, const float* bias, const int* table, const int* tokens, int hashed, int* idx, float* coef, int first", &format!("{}{}{}", probabilities(), top_k(), emit_pairs()))
+        prim::global(Some(crate::moe::ROUTE_THREADS), "moe_route", "const float* logits, const float* bias, const int* table, const int* tokens, int hashed, int* idx, float* coef, int first", &format!("{}{}{}", probabilities(), top_k(), emit_pairs()))
     )
 }
 
@@ -232,7 +233,7 @@ pub fn permute() -> String {
     format!(
         "constexpr int MOE_TJ = 2;\nconstexpr int MOE_SLOTS = MOE_LOCAL + MOE_SHARED;\n\n{}",
         prim::global(
-            Some(1024),
+            Some(crate::moe::PERMUTE_THREADS),
             "moe_permute",
             "const int* idx, int* offsets, int* sorted, int pairs",
             r##"    __shared__ int count[MOE_SLOTS + 1];

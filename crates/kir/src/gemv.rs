@@ -3,6 +3,25 @@ use crate::{Language, Target, fnv};
 pub const BA_ROWS_MAX_TOKENS: usize = 32;
 pub const BA_ROWS_THREADS: u32 = 256;
 pub const GEMV_THREADS: u32 = 256;
+pub const GEMV_BLOCKS_PER_SM: u32 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GemvGeometry {
+    pub threads: u32,
+    pub rows_per_block: usize,
+    pub blocks_per_sm: Option<u32>,
+}
+
+pub fn gemv_geometry(weight: crate::gemm::WeightFormat, rows: usize, act: bool, store: bool, fp4: bool) -> GemvGeometry {
+    if fp4 {
+        let pair = if store && rows.is_multiple_of(2) { 2 } else { 1 };
+        let threads = crate::gemm::FP4_GEMV_THREADS;
+        return GemvGeometry { threads, rows_per_block: threads as usize / 32 * pair, blocks_per_sm: None };
+    }
+    let pair = weight.gemv_rows();
+    let per_warp = if act || !rows.is_multiple_of(pair) { 1 } else { pair };
+    GemvGeometry { threads: GEMV_THREADS, rows_per_block: GEMV_THREADS as usize / 32 * per_warp, blocks_per_sm: (weight == crate::gemm::WeightFormat::Ggml).then_some(GEMV_BLOCKS_PER_SM) }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Gemv {

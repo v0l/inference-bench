@@ -159,7 +159,7 @@ pub fn select(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, we
     select_act(spec, target, linear, tokens, weight, true)
 }
 
-pub const GEMV_BLOCKS_PER_SM: u32 = 8;
+pub const GEMV_BLOCKS_PER_SM: u32 = kir::gemv::GEMV_BLOCKS_PER_SM;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GemvLaunch {
@@ -231,17 +231,8 @@ pub fn gemv_into(spec: &Spec, linear: &str, weight: WeightKind, normed: bool, st
     let (name, fp4) = gemv_name(linear, normed, weight == WeightKind::Fp4, spec.linear_attention.is_some())?;
     let act = normed && s.epi == Epilogue::Act;
     let rows = if act { spec.gate_up_out(s.n) } else { s.n };
-    let (threads, rows_per_block, blocks_per_sm) = if fp4 {
-        let pair = if s.epi == Epilogue::Store && rows.is_multiple_of(2) { 2 } else { 1 };
-        (FP4_GEMV_THREADS, FP4_GEMV_THREADS as usize / 32 * pair, None)
-    } else {
-        let format = weight.format();
-        let pair = format.gemv_rows();
-        let per_warp = if act || !rows.is_multiple_of(pair) { 1 } else { pair };
-        let threads = kir::gemv::GEMV_THREADS;
-        (threads, threads as usize / 32 * per_warp, (format == WeightFormat::Ggml).then_some(GEMV_BLOCKS_PER_SM))
-    };
-    Some(GemvLaunch { name, rows, threads, rows_per_block, blocks_per_sm, bias: !act, act })
+    let g = kir::gemv::gemv_geometry(weight.format(), rows, act, s.epi == Epilogue::Store, fp4);
+    Some(GemvLaunch { name, rows, threads: g.threads, rows_per_block: g.rows_per_block, blocks_per_sm: g.blocks_per_sm, bias: !act, act })
 }
 
 pub fn select_act(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, weight: WeightKind, act: bool) -> Result<KernelChoice> {

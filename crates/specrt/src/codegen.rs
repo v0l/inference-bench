@@ -85,7 +85,7 @@ pub const FP8_BLOCK: usize = 128;
 pub use kir::attention::{flash_rows, DECODE_CHUNK, DECODE_KEYS, DECODE_MAX_QLEN, DECODE_MAX_SPLITS, DECODE_STAGES, decode_chunk, decode_splits, flash_keys, flash_stages};
 
 pub fn decode_warps(group: usize, qlen: usize) -> usize {
-    (group * qlen).div_ceil(16)
+    kir::attention::decode_warps(group, qlen)
 }
 
 pub fn kir_shape(spec: &Spec) -> kir::desc::Shape {

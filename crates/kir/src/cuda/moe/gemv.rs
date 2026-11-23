@@ -212,13 +212,13 @@ fn group_down_impl() -> String {
 
 fn entries(out: &mut String, stem: &str, args: &str, impl_name: &str, call: &str) {
     for (q, name) in prim::QUANTS {
-        out.push_str(&prim::delegate(256, &format!("{stem}_{name}"), args, &format!("{impl_name}<{q}>"), call));
+        out.push_str(&prim::delegate(crate::moe::EXPERT_THREADS, &format!("{stem}_{name}"), args, &format!("{impl_name}<{q}>"), call));
     }
 }
 
 pub fn gemv() -> String {
     let mut out = String::new();
-    out.push_str(prim::fp8_grid());
+    out.push_str(&prim::fp8_grid());
     out.push_str(&prim::e2m1_to_f32("moe_e2m1"));
     out.push_str(&prim::multi_row_dot("moe_rows_fp4", prim::RowFormat::Fp4Rows { decode: "moe_e2m1" }, prim::RowLoad { unroll: 0, stream: false }));
     out.push_str(&prim::multi_row_dot("moe_rows_mx", prim::RowFormat::Mx { decode: "moe_e2m1", block: "MOE_BLOCK" }, prim::RowLoad { unroll: 0, stream: false }));

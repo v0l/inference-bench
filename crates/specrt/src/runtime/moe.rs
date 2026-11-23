@@ -216,7 +216,9 @@ impl MoeBuffers {
     }
 }
 
-const ROWS_PER_BLOCK: usize = 8;
+fn launch(l: kir::moe::Launch) -> LaunchConfig {
+    LaunchConfig { grid_dim: (l.grid.0, l.grid.1, 1), block_dim: (l.threads, 1, 1), shared_mem_bytes: 0 }
+}
 
 impl Runtime {
     pub(super) fn moe_of<'a>(&self, layer: &'a DeviceLayer) -> &'a DeviceMoe {
@@ -230,17 +232,17 @@ impl Runtime {
         let n_arg = n as i32;
         let mut b = self.launcher(self.kernel("moe_route_logits"));
         b.arg(x).arg(&layer.ln2).arg(&w.router).arg(&w.shared_gate).arg(&w.router_bias).arg(&mb.xn).arg(&mb.logits).arg(&n_arg);
-        let config = LaunchConfig { grid_dim: ((experts + 1).div_ceil(8) as u32, n.div_ceil(4) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        let config = launch(kir::moe::route_logits_launch(experts, n));
         unsafe { b.launch(config) }?;
         let mut b = self.launcher(self.kernel("moe_route"));
         let first = self.spec.moe.as_ref().expect("moe spec").first_expert() as i32;
         b.arg(&mb.logits).arg(&w.score_bias).arg(&w.hash_table).arg(tokens).arg(&w.hashed).arg(&mb.idx).arg(&mb.coef).arg(&first);
-        unsafe { b.launch(cfg(n as u32, 32)) }?;
+        unsafe { b.launch(cfg(n as u32, kir::moe::ROUTE_THREADS)) }?;
         if self.spec.moe.as_ref().expect("moe spec").input_scaled {
             let m = self.spec.moe.as_ref().expect("moe spec");
             let mut b = self.launcher(self.kernel("moe_scale_inputs"));
             b.arg(&mb.xn).arg(&mb.idx).arg(&mb.coef).arg(&mb.xp);
-            let config = LaunchConfig { grid_dim: (self.spec.dims.hidden.div_ceil(256) as u32, (n * m.pairs()) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            let config = launch(kir::moe::rows_launch(self.spec.dims.hidden, n * m.pairs()));
             unsafe { b.launch(config) }?;
         }
         Ok(())
@@ -340,20 +342,12 @@ impl Runtime {
         self.stack_args(&mut b, &st.gate);
         self.stack_args(&mut b, &st.up);
         b.arg(&w.gate_up_bias).arg(self.expert_inputs(mb, n).0).arg(&mb.idx).arg(&mb.act);
-        let config = LaunchConfig {
-            grid_dim: (pairs, m.expert_intermediate.div_ceil(ROWS_PER_BLOCK) as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let config = launch(kir::moe::expert_rows_launch(pairs, m.expert_intermediate));
         unsafe { b.launch(config) }?;
         let mut b = self.launcher(self.kernel(&down));
         self.stack_args(&mut b, &st.down);
         b.arg(&w.down_bias).arg(&mb.act).arg(&mb.idx).arg(&mb.out);
-        let config = LaunchConfig {
-            grid_dim: (pairs, self.spec.dims.hidden.div_ceil(ROWS_PER_BLOCK) as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let config = launch(kir::moe::expert_rows_launch(pairs, self.spec.dims.hidden));
         unsafe { b.launch(config) }?;
         Ok(())
     }
@@ -545,20 +539,12 @@ impl Runtime {
         self.stack_args(&mut b, &st.gate);
         self.stack_args(&mut b, &st.up);
         b.arg(&w.gate_up_bias).arg(self.expert_inputs(mb, n).0).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.act);
-        let config = LaunchConfig {
-            grid_dim: (slots, m.expert_intermediate.div_ceil(ROWS_PER_BLOCK) as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let config = launch(kir::moe::expert_rows_launch(slots, m.expert_intermediate));
         unsafe { b.launch(config) }?;
         let mut b = self.launcher(self.kernel(&down));
         self.stack_args(&mut b, &st.down);
         b.arg(&w.down_bias).arg(&mb.act).arg(&mb.offsets).arg(&mb.sorted).arg(&mb.out);
-        let config = LaunchConfig {
-            grid_dim: (slots, self.spec.dims.hidden.div_ceil(ROWS_PER_BLOCK) as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let config = launch(kir::moe::expert_rows_launch(slots, self.spec.dims.hidden));
         unsafe { b.launch(config) }?;
         Ok(())
     }
@@ -567,11 +553,7 @@ impl Runtime {
         let mb = self.moe.as_ref().expect("moe buffers");
         let mut b = self.launcher(self.kernel("moe_combine"));
         b.arg(x).arg(&mb.out).arg(&mb.coef);
-        let config = LaunchConfig {
-            grid_dim: (self.spec.dims.hidden.div_ceil(256) as u32, n as u32, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
+        let config = launch(kir::moe::rows_launch(self.spec.dims.hidden, n));
         unsafe { b.launch(config) }?;
         Ok(())
     }

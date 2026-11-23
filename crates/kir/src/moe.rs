@@ -74,6 +74,31 @@ impl Family {
 
 pub const MMA_STAGES_SMALL: usize = 6;
 
+pub const EXPERT_THREADS: u32 = 256;
+pub const EXPERT_WARPS: usize = EXPERT_THREADS as usize / 32;
+pub const LOGIT_PER_WARP: usize = 4;
+pub const LOGIT_TOKENS: usize = 4;
+pub const ROUTE_THREADS: u32 = 32;
+pub const PERMUTE_THREADS: u32 = 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Launch {
+    pub grid: (u32, u32),
+    pub threads: u32,
+}
+
+pub fn route_logits_launch(experts: usize, tokens: usize) -> Launch {
+    Launch { grid: ((experts + 1).div_ceil(EXPERT_WARPS) as u32, tokens.div_ceil(LOGIT_TOKENS) as u32), threads: EXPERT_THREADS }
+}
+
+pub fn expert_rows_launch(slots: u32, rows: usize) -> Launch {
+    Launch { grid: (slots, rows.div_ceil(EXPERT_WARPS) as u32), threads: EXPERT_THREADS }
+}
+
+pub fn rows_launch(width: usize, rows: usize) -> Launch {
+    Launch { grid: (width.div_ceil(EXPERT_THREADS as usize) as u32, rows as u32), threads: EXPERT_THREADS }
+}
+
 pub fn mma_smem(rows_per_tile: usize, weights: usize) -> u32 {
     let stages = if rows_per_tile == MMA_BM_SMALL { MMA_STAGES_SMALL } else { MMA_STAGES };
     (stages * (rows_per_tile + weights * MMA_BN) * MMA_ROW) as u32

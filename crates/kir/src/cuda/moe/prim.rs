@@ -18,6 +18,6 @@ pub fn constants(m: &crate::ops::MoeShape) -> String {
     )
 }
 
-pub fn fp8_grid() -> &'static str {
-    "constexpr int MOE_WARPS = 8;\ntemplate <int K> constexpr int MOE_FP8_KB = (K + FP8_BLOCK - 1) / FP8_BLOCK;\ntemplate <int ROWS, int K> constexpr int MOE_FP8_GRID = ((ROWS + FP8_BLOCK - 1) / FP8_BLOCK) * MOE_FP8_KB<K>;\n\n"
+pub fn fp8_grid() -> String {
+    format!("constexpr int MOE_WARPS = {};\ntemplate <int K> constexpr int MOE_FP8_KB = (K + FP8_BLOCK - 1) / FP8_BLOCK;\ntemplate <int ROWS, int K> constexpr int MOE_FP8_GRID = ((ROWS + FP8_BLOCK - 1) / FP8_BLOCK) * MOE_FP8_KB<K>;\n\n", crate::moe::EXPERT_WARPS)
 }

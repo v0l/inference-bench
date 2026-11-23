@@ -93,12 +93,16 @@ impl AttentionShape {
     }
 
     pub fn decode_warps(&self, qlen: usize) -> usize {
-        (self.group() * qlen).div_ceil(16)
+        decode_warps(self.group(), qlen)
     }
 
     pub fn decode_max_warps(&self) -> usize {
         self.decode_warps(DECODE_MAX_QLEN)
     }
+}
+
+pub fn decode_warps(group: usize, qlen: usize) -> usize {
+    (group * qlen).div_ceil(16)
 }
 
 pub fn flash_rows(head_dim: usize, kv_planes: usize) -> usize {
