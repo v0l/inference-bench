@@ -456,24 +456,30 @@ impl<'a> Signer<'a> {
 pub struct Section<'p> {
     pub name: String,
     pub layer: usize,
+    pub repeats: usize,
     pub ops: &'p [Op],
 }
 
-fn layer_of(spec: &Spec, layers: &[String], sparse: bool) -> usize {
+fn layers_using(spec: &Spec, layers: &[String], sparse: bool) -> Vec<usize> {
     (0..spec.layers.count)
-        .find(|&i| layers.iter().any(|l| l == spec.block(i).name()) && spec.moe.as_ref().is_some_and(|m| m.is_sparse(i) && spec.has_mlp(i)) == sparse)
-        .unwrap_or(0)
+        .filter(|&i| layers.iter().any(|l| l == spec.block(i).name()) && spec.moe.as_ref().is_some_and(|m| m.is_sparse(i) && spec.has_mlp(i)) == sparse)
+        .collect()
 }
 
 pub fn sections<'p>(spec: &Spec, plan: &'p Plan) -> Vec<Section<'p>> {
-    let mut out = vec![Section { name: "head".into(), layer: 0, ops: &plan.head }];
+    let mut out = vec![Section { name: "head".into(), layer: 0, repeats: 1, ops: &plan.head }];
     for b in &plan.blocks {
-        let name = format!("layer {}{}", b.layers.join("|"), if b.sparse { " (moe)" } else { "" });
-        out.push(Section { name, layer: layer_of(spec, &b.layers, b.sparse), ops: &b.ops });
+        let used = layers_using(spec, &b.layers, b.sparse);
+        let Some(&first) = used.first() else { continue };
+        let mut kinds: Vec<&str> = used.iter().map(|&i| spec.block(i).name()).collect();
+        kinds.sort_unstable();
+        kinds.dedup();
+        let name = format!("layer {}{}", kinds.join("|"), if b.sparse { " moe" } else { "" });
+        out.push(Section { name, layer: first, repeats: used.len(), ops: &b.ops });
     }
-    out.push(Section { name: "tail".into(), layer: spec.layers.count.saturating_sub(1), ops: &plan.tail });
-    out.push(Section { name: "mtp".into(), layer: spec.layers.count, ops: &plan.mtp });
-    out.push(Section { name: "mtp head".into(), layer: spec.layers.count, ops: &plan.mtp_head });
+    out.push(Section { name: "tail".into(), layer: spec.layers.count.saturating_sub(1), repeats: 1, ops: &plan.tail });
+    out.push(Section { name: "mtp".into(), layer: spec.layers.count, repeats: 1, ops: &plan.mtp });
+    out.push(Section { name: "mtp head".into(), layer: spec.layers.count, repeats: 1, ops: &plan.mtp_head });
     out
 }
 
@@ -561,6 +567,7 @@ pub struct OpCost {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SectionCost {
     pub name: String,
+    pub repeats: usize,
     pub ops: Vec<OpCost>,
     pub read: u64,
     pub written: u64,
@@ -622,7 +629,7 @@ pub fn plan_report(spec: &Spec, phase: Phase, count: Count, target: &kir::Target
             ops.push(OpCost { label: op.label(), class: sig.class, read, written, launches: signer.launches(op, phase, s.layer, &count, target) });
         }
         let (read, written, launches) = ops.iter().fold((0, 0, 0), |a, o| (a.0 + o.read, a.1 + o.written, a.2 + o.launches));
-        sections.push(SectionCost { name: s.name, ops, read, written, launches });
+        sections.push(SectionCost { name: s.name, repeats: s.repeats, ops, read, written, launches });
     }
     Ok(PlanReport { phase, count, sections })
 }
@@ -636,16 +643,22 @@ impl PlanReport {
         self.sections.iter().find(|s| s.name == name)
     }
 
+    pub fn total(&self) -> (u64, u64, usize) {
+        self.sections.iter().fold((0, 0, 0), |a, s| (a.0 + s.read * s.repeats as u64, a.1 + s.written * s.repeats as u64, a.2 + s.launches * s.repeats))
+    }
+
     pub fn render(&self) -> String {
         let c = &self.count;
-        let mut out = format!("plan {:?} tokens {} context {} (bytes are unique reads and writes per launch group)\n", self.phase, c.tokens, c.context);
+        let mut out = format!("plan {:?} tokens {} context {}\n", self.phase, c.tokens, c.context);
         for s in &self.sections {
-            out.push_str(&format!("\n== {}\n", s.name));
+            out.push_str(&format!("\n== {} (x{})\n", s.name, s.repeats));
             for (i, o) in s.ops.iter().enumerate() {
                 out.push_str(&format!("{i:>3} {:<28} {:<11} read {:>12} write {:>12} launches {}\n", o.label, format!("{:?}", o.class), o.read, o.written, o.launches));
             }
             out.push_str(&format!("    {:<28} {:<11} read {:>12} write {:>12} launches {}\n", "total", "", s.read, s.written, s.launches));
         }
+        let (read, written, launches) = self.total();
+        out.push_str(&format!("\nstep total read {read} write {written} launches {launches}\n"));
         out
     }
 }

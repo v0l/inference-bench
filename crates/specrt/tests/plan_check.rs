@@ -158,6 +158,41 @@ fn a_plane_mismatch_names_the_node() {
 }
 
 #[test]
+fn the_plan_report_matches_hand_counted_bytes_on_the_tiny_dense_fixture() {
+    use specrt::signature::{Class, Count, plan_report};
+    let spec = dense();
+    assert_eq!((spec.dims.hidden, spec.dims.intermediate, spec.dims.vocab, spec.qkv_rows(), spec.quant), (128, 256, 512, 512, specrt::spec::Quant::Bf16));
+    let report = plan_report(&spec, Phase::Decode, Count::new(Phase::Decode, 1, 1), &kir::Target::sm_120()).unwrap();
+    let layer = report.sections.iter().find(|s| s.name.starts_with("layer")).unwrap();
+    assert_eq!((layer.name.as_str(), layer.repeats, report.sections.len()), ("layer dense", 4, 3), "only the layer kinds the spec runs");
+    let (h, q, inter, qkv) = (128u64, 256u64, 256u64, 512u64);
+    let x = 4 * h;
+    let norm_w = 4 * h;
+    let kv_row = 2 * 64 * 2;
+    let want: Vec<(&str, Class, u64, u64, usize)> = vec![
+        ("input norm", Class::RowReduce, x + norm_w, 4 * h, 1),
+        ("qkv", Class::Gemm, 4 * h + 2 * qkv * h, 4 * qkv, 1),
+        ("decode attention", Class::Attention, 4 * qkv + 2 * kv_row, 4 * qkv + 2 * kv_row + 4 * q, 3),
+        ("o", Class::Gemm, 4 * q + 2 * h * q + x, x, 1),
+        ("post attention norm", Class::RowReduce, x + norm_w, 4 * h, 1),
+        ("gate_up", Class::Gemm, 4 * h + 2 * 2 * inter * h, 4 * inter, 1),
+        ("down", Class::Gemm, 4 * inter + 2 * h * inter + x, x, 1),
+    ];
+    let got: Vec<(&str, Class, u64, u64, usize)> = layer.ops.iter().map(|o| (o.label.as_str(), o.class, o.read, o.written, o.launches)).collect();
+    assert_eq!(got, want);
+    assert_eq!((layer.read, layer.written, layer.launches), (401_920, 8_704, 9));
+    let tail = report.section("tail").unwrap();
+    assert_eq!((tail.read, tail.written, tail.launches), (x + norm_w + 4 * h + 2 * 512 * h, 4 * h + 4 * 512, 2));
+    let head = report.section("head").unwrap();
+    assert_eq!((head.read, head.written, head.launches), (4 + 2 * h, x, 1));
+    assert_eq!(report.total(), (head.read + 4 * 401_920 + tail.read, head.written + 4 * 8_704 + tail.written, 1 + 4 * 9 + 2));
+    let eight = plan_report(&spec, Phase::Decode, Count::new(Phase::Decode, 8, 100), &kir::Target::sm_120()).unwrap();
+    let attention = &eight.sections.iter().find(|s| s.name.starts_with("layer")).unwrap().ops[2];
+    assert_eq!(attention.read, 8 * 4 * qkv + 2 * 8 * 100 * kv_row, "eight sequences each read 100 cached rows");
+    assert!(report.render().contains("decode attention"));
+}
+
+#[test]
 fn signatures_carry_the_class_and_forms() {
     use specrt::signature::{Class, Form, Signer};
     let spec = dense();
