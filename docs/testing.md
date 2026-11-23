@@ -149,6 +149,7 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `codegen.rs` | generated CUDA source text | CPU | 0 | none | none, 1 s |
 | `discovery.rs` | LAN discovery (mdns) | CPU, 1 ign | 1 | none; the ignored one needs a GPU | 2 GB, 4 s |
 | `spec.rs` | spec TOML parsing, `Spec::from_hf_config` for every fixture config | CPU | 0 | none | none |
+| `plan_check.rs` | kir compiler slice 1 (#1053): `signature::validate_plan` on every fixture and spec plan (tensor core, legacy, TP, MTP, every phase); broken plans fail naming the node (read before write, shape, plane form); `kernels --plan` bytes and launches on tiny-mistral against hand counts | CPU | 0 | none | none, 5 s |
 | `wire.rs` | stage wire formats | CPU | 0 | none | none |
 | `remote.rs` | remote stage over loopback | CPU | 0 | none | none |
 | `vision.rs` | image and video preprocessing, mrope positions | CPU | 0 | none | none, 6 s |
