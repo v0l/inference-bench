@@ -75,6 +75,22 @@ fn glm_air_route_logits_stage_through_dynamic_shared_memory() {
 }
 
 #[test]
+fn route_logits_launch_smem_equals_what_the_kernel_indexes() {
+    for hidden in [2880usize, 3072, 4096, 7168] {
+        assert_eq!(kir::moe::route_logits_launch(128, 9, hidden).smem as usize, kir::moe::LOGIT_TOKENS * hidden * 4);
+        assert_eq!(kir::moe::route_logits_smem(hidden) as usize, kir::moe::LOGIT_TOKENS * hidden * 4);
+    }
+    let mut spec = Spec::from_hf_config_serving_in(Registry::embedded(), &std::fs::read_to_string(fixtures().join("glm4.5-air.config.json")).unwrap()).unwrap();
+    spec.dims.hidden = 7168;
+    let mut limit = kir::Target::sm_120();
+    limit.smem_limit = 100 * 1024;
+    let err = specrt::codegen::moe_kernels(&spec, &limit).unwrap_err().to_string();
+    assert!(err.contains("moe_route_logits needs 114688"), "{err}");
+    spec.dims.hidden = 4096;
+    assert!(specrt::codegen::moe_kernels(&spec, &limit).is_ok());
+}
+
+#[test]
 fn chunked_attention_nope_and_temperature_tuning_come_from_the_config() {
     let spec = spec_of(&scout());
     use specrt::spec::Block;
