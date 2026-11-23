@@ -167,6 +167,7 @@ struct State {
     last: Vec<Vec<usize>>,
     seen: ExpertHotlist,
     prior: Option<ExpertHotlist>,
+    mirror: Vec<Vec<i32>>,
 }
 
 struct Promotions<'a> {
@@ -202,7 +203,10 @@ pub(in crate::runtime) struct ExpertCache {
     pub(in crate::runtime) stacks: Stacks,
     addrs: Vec<CUdeviceptr>,
     pub(in crate::runtime) slots: usize,
+    tables: Option<Vec<CudaSlice<i32>>>,
+    table_launches: std::sync::atomic::AtomicU64,
     local: usize,
+    top_k: usize,
     shared: usize,
     state: Mutex<State>,
     staging: Mutex<Staging>,
@@ -210,6 +214,8 @@ pub(in crate::runtime) struct ExpertCache {
 }
 
 const BULK_MIN_EXPERTS: usize = 32;
+
+pub(in crate::runtime) const TABLE_MAX_TOKENS: usize = super::MMA_MIN_TOKENS;
 
 struct Staging {
     buf: Option<PinnedBuf>,
@@ -220,12 +226,16 @@ pub(in crate::runtime) struct Staged {
 }
 
 impl ExpertCache {
-    pub(in crate::runtime) fn new(compute: &Arc<CudaStream>, like: &HostExperts, layers: usize, slots: usize, local: usize, shared: usize, settings: &OffloadSettings, top_k: usize, prior: Option<ExpertHotlist>) -> Result<Self> {
+    pub(in crate::runtime) fn new(compute: &Arc<CudaStream>, like: &HostExperts, layers: usize, cached_layers: usize, slots: usize, local: usize, shared: usize, settings: &OffloadSettings, top_k: usize, prior: Option<ExpertHotlist>) -> Result<Self> {
         let ctx = compute.context().clone();
         let stacks = like.allocate(compute, slots + shared)?;
         let addrs = pointers(compute, &stacks);
         let (lowest, _) = cudarc::driver::result::stream::get_priority_range()?;
-        let scored = (settings.policy == Policy::Score).then(|| ExpertBook::new(layers * local, slots, crate::offload::scratch_slots(slots, top_k), settings));
+        let scored = (settings.policy == Policy::Score).then(|| {
+            let (scratch, per_step) = crate::offload::score_pool(slots, top_k, local * cached_layers, settings);
+            ExpertBook::new(layers * local, slots, scratch, &OffloadSettings { promote_per_step: per_step, ..settings.clone() })
+        });
+        let tables = if settings.pointer_table { Some((0..layers).map(|_| compute.alloc_zeros::<i32>(local + shared)).collect::<Result<Vec<_>, _>>()?) } else { None };
         Ok(ExpertCache {
             copy: ctx.new_stream()?,
             promo: ctx.new_stream_with_priority(lowest)?,
@@ -234,11 +244,13 @@ impl ExpertCache {
             stacks,
             addrs,
             slots,
+            tables,
+            table_launches: std::sync::atomic::AtomicU64::new(0),
             local,
-            shared,
+            top_k,            shared,
             staging: Mutex::new(Staging { buf: None }),
             staging_pool: HostPool::new(ctx.clone()),
-            state: Mutex::new(State { book: SlotBook::new(slots, settings.policy), scored, last: vec![Vec::new(); layers], seen: ExpertHotlist::new(layers, local), prior }),
+            state: Mutex::new(State { book: SlotBook::new(slots, settings.policy), scored, last: vec![Vec::new(); layers], seen: ExpertHotlist::new(layers, local), prior, mirror: vec![Vec::new(); layers] }),
         })
     }
 
@@ -391,20 +403,92 @@ impl ExpertCache {
         Ok(Staged { mapping })
     }
 
+    pub(in crate::runtime) fn table_for(&self, compute: &Arc<CudaStream>, layer: usize, host: &HostExperts, tokens: usize) -> Result<Option<&CudaSlice<i32>>> {
+        let Some(tables) = &self.tables else { return Ok(None) };
+        let mut g = self.state.lock().unwrap();
+        let g = &mut *g;
+        let (table, full) = match g.scored.as_mut() {
+            Some(book) => {
+                book.poll(|ev| ev.is_complete());
+                crate::offload::pointer_table_of(|p| book.resident(p), |e| self.page(layer, e), self.local, self.shared, self.slots)
+            }
+            None => crate::offload::pointer_table(&g.book, |e| self.page(layer, e), self.local, self.shared, self.slots),
+        };
+        if crate::offload::expert_route(true, full, tokens, TABLE_MAX_TOKENS) == crate::offload::ExpertRoute::Staged {
+            return Ok(None);
+        }
+        self.table_launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(book) = g.scored.as_mut() {
+            book.stats.vram_hits += 1;
+            let share = self.top_k as f64 / self.local.max(1) as f64;
+            for e in 0..self.local {
+                book.record(self.page(layer, e), share);
+            }
+        } else {
+            for e in 0..self.local {
+                g.book.touch(self.page(layer, e));
+            }
+        }
+        if g.mirror[layer] != table {
+            let (ptr, _sync) = tables[layer].device_ptr(compute);
+            unsafe { cudarc::driver::result::memcpy_htod_async(ptr, &table, compute.cu_stream()) }?;
+            g.mirror[layer] = table;
+        }
+        if self.shared > 0 {
+            self.mark.record(compute)?;
+            self.copy.wait(&self.mark)?;
+            let mut stats = OffloadStats::default();
+            let queued = (0..self.shared).try_for_each(|s| self.enqueue(host, self.local + s, self.slots + s, &mut stats));
+            match g.scored.as_mut() {
+                Some(b) => b.stats.absorb_io(&stats),
+                None => g.book.stats.absorb_io(&stats),
+            }
+            queued?;
+        }
+        self.fence(compute)?;
+        Ok(Some(&tables[layer]))
+    }
+
+    pub(in crate::runtime) fn table_launches(&self) -> u64 {
+        self.table_launches.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(in crate::runtime) fn evict(&self, layer: usize, expert: usize) -> bool {
+        let mut g = self.state.lock().unwrap();
+        let page = self.page(layer, expert);
+        match g.scored.as_mut() {
+            Some(b) => b.evict(page),
+            None => g.book.evict(page),
+        }
+    }
+
+    pub(in crate::runtime) fn promote(&self, compute: &Arc<CudaStream>, layer: usize, host: &HostExperts, expert: usize) -> Result<()> {
+        if self.scored() {
+            let mut g = self.state.lock().unwrap();
+            let book = g.scored.as_mut().expect("score policy");
+            let Some(slot) = book.fill(&[self.page(layer, expert)]).first().map(|p| p.1) else { return Ok(()) };
+            drop(g);
+            self.load_group(compute, host, &[(expert, slot, true)], false)?;
+            return Ok(());
+        }
+        self.prefetch(compute, layer, host, &[expert])?;
+        self.fence(compute)
+    }
+
     pub(in crate::runtime) fn release(&self) {
         self.state.lock().unwrap().book.unpin_all();
     }
 
-    pub(in crate::runtime) fn plan_scored(&self, layer: usize, routed: &[(usize, usize)], rows: usize, borrow: bool) -> Vec<Vec<(usize, usize, bool)>> {
+    pub(in crate::runtime) fn plan_scored(&self, layer: usize, routed: &[(usize, usize)], rows: usize, borrow: bool) -> Result<Vec<Vec<(usize, usize, bool)>>> {
         let mut g = self.state.lock().unwrap();
         let book = g.scored.as_mut().expect("score policy");
         book.poll(|ev| ev.is_complete());
         let pages: Vec<usize> = routed.iter().map(|&(e, _)| self.page(layer, e)).collect();
-        let groups = book.plan(&pages, borrow);
+        let groups = book.plan(&pages, borrow)?;
         for &(e, uses) in routed {
             book.record(self.page(layer, e), uses as f64 / rows.max(1) as f64);
         }
-        groups.into_iter().map(|grp| grp.into_iter().map(|p| (p.page - layer * self.local, p.slot, p.copy)).collect()).collect()
+        Ok(groups.into_iter().map(|grp| grp.into_iter().map(|p| (p.page - layer * self.local, p.slot, p.copy)).collect()).collect())
     }
 
     pub(in crate::runtime) fn load_group(&self, compute: &Arc<CudaStream>, host: &HostExperts, group: &[(usize, usize, bool)], with_shared: bool) -> Result<()> {
@@ -484,12 +568,16 @@ impl ExpertCache {
         if self.scored() {
             return self.warm_scored(compute, hosts, top_k);
         }
-        let hot = {
+        let hot: Vec<(usize, usize)> = {
             let g = self.state.lock().unwrap();
-            let Some(prior) = &g.prior else { return Ok(()) };
-            let mut pairs = prior.hottest(self.slots);
-            pairs.sort_unstable();
-            pairs
+            if self.tables.is_some() && self.slots >= self.local * hosts.len() {
+                hosts.iter().flat_map(|(l, _)| (0..self.local).map(move |e| (*l, e))).collect()
+            } else {
+                let Some(prior) = &g.prior else { return Ok(()) };
+                let mut pairs = prior.hottest(self.slots);
+                pairs.sort_unstable();
+                pairs
+            }
         };
         self.mark.record(compute)?;
         self.copy.wait(&self.mark)?;
@@ -515,8 +603,14 @@ impl ExpertCache {
     fn warm_scored(&self, compute: &Arc<CudaStream>, hosts: &[(usize, &HostExperts)], top_k: usize) -> Result<()> {
         let mut g = self.state.lock().unwrap();
         let g = &mut *g;
-        let (Some(prior), Some(book)) = (&g.prior, g.scored.as_mut()) else { return Ok(()) };
-        let placed = book.seed(prior, self.local, top_k);
+        let book = g.scored.as_mut().expect("score policy");
+        let placed = if self.tables.is_some() && self.slots >= self.local * hosts.len() {
+            let pages: Vec<usize> = hosts.iter().flat_map(|(l, _)| (0..self.local).map(move |e| l * self.local + e)).collect();
+            book.fill(&pages)
+        } else {
+            let Some(prior) = &g.prior else { return Ok(()) };
+            book.seed(prior, self.local, top_k)
+        };
         self.mark.record(compute)?;
         self.copy.wait(&self.mark)?;
         let mut stats = OffloadStats::default();

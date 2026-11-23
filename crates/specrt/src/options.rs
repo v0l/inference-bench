@@ -414,6 +414,7 @@ const META: &[Meta] = &[
     Meta { key: "runtime.offload.nvme_path", label: "disk spill folder", group: Group::Offload, help: "Folder on a fast drive for layers that fit neither tier.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.offload.prefetch_depth", label: "prefetch depth", group: Group::Offload, help: "Layers copied ahead of the one computing.", choices: &[], range: (1, 8) },
     Meta { key: "runtime.offload.expert_slots", label: "expert slots", group: Group::Offload, help: "Experts kept on the card for a mixture of experts model, shared by every layer. Missing experts copy in after the router picks them. 0 sizes the cache from the gpu offload setting.", choices: &[], range: (0, 1 << 20) },
+    Meta { key: "runtime.offload.pointer_table", label: "expert pointer table", group: Group::Offload, help: "Decode a layer whose experts are all on the card from a device table of expert addresses, with no wait on the host. Layers with a missing expert use the staged copy path.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.offload.hotlist", label: "expert hotlist", group: Group::Offload, help: "File of expert use counts from a calibration run. The most used experts are loaded first and guide prefetch before the router has history.", choices: &[], range: (0, 0) },
     Meta { key: "runtime.offload.policy", label: "eviction policy", group: Group::Offload, help: "Which resident page leaves first when a tier is full. Score keeps a decaying use score per expert and refills the expert cache between decode steps, off the token's path.", choices: &["lru", "frequency", "score"], range: (0, 0) },
     Meta { key: "runtime.offload.promote_margin", label: "promotion margin", group: Group::Offload, help: "With the score policy, a resident expert is replaced only when the newcomer's score is this many times higher, so the cache does not thrash.", choices: &[], range: (1, 16) },
@@ -476,7 +477,7 @@ fn populated_runtime() -> RuntimeOptions {
         compile_jobs: Some(1),
         prefix_cache: PrefixCacheOptions { enabled: true, snapshot_interval: 16, max_snapshots: 1, max_blocks: 1, async_snapshots: true },
         loader: LoaderOptions { enabled: true, direct: true, chunk_mb: 1, readers: 1, ahead: 1, workers: 1, lanes: 1, skip_cached: true, pinned: true, host_budget_mb: 64 },
-        offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency, expert_slots: 3, hotlist: Some("x".into()), promote_margin: 1.5, score_half_life: 8, promote_per_step: 4 },
+        offload: crate::offload::OffloadSettings { vram_budget: 1, host_budget: 1, nvme_path: Some("x".into()), prefetch_depth: 2, policy: crate::offload::Policy::Frequency, expert_slots: 3, pointer_table: true, hotlist: Some("x".into()), promote_margin: 1.5, score_half_life: 8, promote_per_step: 4 },
         vision: crate::spec::VisionOptions { precision: crate::vision_encoder::VisionPrecision::Exact, cache_mb: 1, max_batch: 1, pan_and_scan: false },
         requant: crate::spec::Requant { lin_in: Some(Quant::Bf16), lin_out: Some(Quant::Bf16), qkv: Some(Quant::Bf16), o: Some(Quant::Bf16), mlp_tail: Some(Quant::Bf16), lm_head: Some(Quant::Bf16) },
     }

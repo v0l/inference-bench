@@ -22,6 +22,8 @@ pub struct OffloadSettings {
     pub prefetch_depth: usize,
     pub policy: Policy,
     pub expert_slots: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pointer_table: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hotlist: Option<String>,
     pub promote_margin: f64,
@@ -54,6 +56,7 @@ impl Default for OffloadSettings {
             prefetch_depth: default_prefetch_depth(),
             policy: Policy::Lru,
             expert_slots: 0,
+            pointer_table: false,
             hotlist: None,
             promote_margin: 1.15,
             score_half_life: 64,
@@ -343,6 +346,27 @@ pub struct SlotBook {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertRoute {
+    Table,
+    Staged,
+}
+
+pub fn expert_route(table_enabled: bool, every_routed_resident: bool, tokens: usize, table_max_tokens: usize) -> ExpertRoute {
+    if table_enabled && every_routed_resident && tokens < table_max_tokens { ExpertRoute::Table } else { ExpertRoute::Staged }
+}
+
+pub fn pointer_table(book: &SlotBook, page_of: impl Fn(usize) -> usize, local: usize, shared: usize, shared_base: usize) -> (Vec<i32>, bool) {
+    pointer_table_of(|p| book.resident(p), page_of, local, shared, shared_base)
+}
+
+pub fn pointer_table_of(resident: impl Fn(usize) -> Option<usize>, page_of: impl Fn(usize) -> usize, local: usize, shared: usize, shared_base: usize) -> (Vec<i32>, bool) {
+    let mut table: Vec<i32> = (0..local).map(|e| resident(page_of(e)).map_or(0, |s| s as i32 + 1)).collect();
+    let full = table.iter().all(|&s| s != 0);
+    table.extend((0..shared).map(|s| (shared_base + s) as i32 + 1));
+    (table, full)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Acquired {
     pub slot: usize,
     pub copy: bool,
@@ -359,6 +383,20 @@ impl SlotBook {
 
     pub fn resident(&self, page: usize) -> Option<usize> {
         self.slot_of.get(&page).copied()
+    }
+
+    pub fn evict(&mut self, page: usize) -> bool {
+        let Some(slot) = self.slot_of.remove(&page) else { return false };
+        self.page_of[slot] = None;
+        self.stats.evictions += 1;
+        true
+    }
+
+    pub fn touch(&mut self, page: usize) -> Option<usize> {
+        let slot = *self.slot_of.get(&page)?;
+        self.clock += 1;
+        self.last_use[slot] = self.clock;
+        Some(slot)
     }
 
     pub fn misses(&self, pages: impl Iterator<Item = usize>) -> usize {
@@ -451,6 +489,10 @@ pub fn scratch_slots(slots: usize, top_k: usize) -> usize {
     top_k.max(slots / 16).clamp(1, slots.max(1))
 }
 
+pub fn score_pool(slots: usize, top_k: usize, cached_pages: usize, settings: &OffloadSettings) -> (usize, usize) {
+    if settings.pointer_table && slots >= cached_pages { (0, 0) } else { (scratch_slots(slots, top_k), settings.promote_per_step) }
+}
+
 impl<T> ExpertBook<T> {
     pub fn new(pages: usize, slots: usize, scratch: usize, settings: &OffloadSettings) -> Self {
         let scratch = scratch.min(slots);
@@ -487,6 +529,27 @@ impl<T> ExpertBook<T> {
         self.score[page] += uses;
     }
 
+    pub fn fill(&mut self, pages: &[usize]) -> Vec<(usize, usize)> {
+        let mut placed = Vec::new();
+        for &page in pages {
+            if self.slot_of[page].is_some() {
+                continue;
+            }
+            let Some(slot) = self.state.iter().position(|s| *s == SlotState::Free) else { break };
+            self.state[slot] = SlotState::Resident(page);
+            self.slot_of[page] = Some(slot);
+            placed.push((page, slot));
+        }
+        placed
+    }
+
+    pub fn evict(&mut self, page: usize) -> bool {
+        let Some(slot) = self.slot_of[page].take() else { return false };
+        self.state[slot] = SlotState::Free;
+        self.stats.evictions += 1;
+        true
+    }
+
     pub fn seed(&mut self, hot: &ExpertHotlist, local: usize, top_k: usize) -> Vec<(usize, usize)> {
         let steady = 1.0 / (1.0 - self.decay);
         for (layer, counts) in hot.counts.iter().enumerate() {
@@ -512,7 +575,7 @@ impl<T> ExpertBook<T> {
         placed
     }
 
-    pub fn plan(&mut self, pages: &[usize], borrow: bool) -> Vec<Vec<Placed>> {
+    pub fn plan(&mut self, pages: &[usize], borrow: bool) -> Result<Vec<Vec<Placed>>> {
         let mut hits = Vec::new();
         let mut misses = Vec::new();
         for &page in pages {
@@ -525,7 +588,7 @@ impl<T> ExpertBook<T> {
         self.stats.host_hits += misses.len() as u64;
         let base = self.state.len();
         let mut pool: Vec<usize> = (base..base + self.scratch).collect();
-        if borrow && misses.len() > pool.len() {
+        if (borrow || pool.is_empty()) && misses.len() > pool.len() {
             let mut lenders: Vec<usize> = (0..base)
                 .filter(|&s| match self.state[s] {
                     SlotState::Free => true,
@@ -544,9 +607,10 @@ impl<T> ExpertBook<T> {
             }
         }
         let mut groups = vec![hits];
-        if pool.is_empty() {
-            return groups;
+        if misses.is_empty() {
+            return Ok(groups);
         }
+        ensure!(!pool.is_empty(), "expert cache has no slot free for {} missing experts", misses.len());
         for (i, chunk) in misses.chunks(pool.len()).enumerate() {
             let placed: Vec<Placed> = chunk.iter().zip(&pool).map(|(&page, &slot)| Placed { page, slot, copy: true }).collect();
             for p in placed.iter().filter(|p| p.slot < base) {
@@ -562,7 +626,7 @@ impl<T> ExpertBook<T> {
                 groups.push(placed);
             }
         }
-        groups
+        Ok(groups)
     }
 
     fn slot_score(&self, slot: usize) -> f64 {
@@ -967,6 +1031,54 @@ mod tests {
     }
 
     #[test]
+    fn pointer_table_is_full_only_when_every_expert_has_an_address() {
+        let mut b = SlotBook::new(4, Policy::Lru);
+        for e in 0..3 {
+            b.acquire(10 + e, false, false).unwrap();
+        }
+        let (t, full) = pointer_table(&b, |e| 10 + e, 3, 1, 4);
+        assert!(full);
+        assert_eq!(t, vec![1, 2, 3, 5]);
+        b.acquire(99, false, false).unwrap();
+        b.acquire(100, false, false).unwrap();
+        let (t, full) = pointer_table(&b, |e| 10 + e, 3, 1, 4);
+        assert!(!full);
+        assert_eq!(t.iter().filter(|&&s| s == 0).count(), 1);
+        assert_eq!(t.len(), 4);
+        let (t, full) = pointer_table(&SlotBook::new(2, Policy::Lru), |e| e, 2, 0, 2);
+        assert!(!full);
+        assert_eq!(t, vec![0, 0]);
+    }
+
+    #[test]
+    fn a_missing_routed_expert_always_takes_the_staged_path() {
+        let mut b = SlotBook::new(4, Policy::Lru);
+        for e in 0..3 {
+            b.acquire(e, false, false).unwrap();
+        }
+        let (_, full) = pointer_table(&b, |e| e, 4, 0, 4);
+        assert!(!full);
+        for tokens in [1, 2, 7, 8, 9, 64] {
+            assert_eq!(expert_route(true, full, tokens, 8), ExpertRoute::Staged, "{tokens} tokens");
+        }
+        b.acquire(3, false, false).unwrap();
+        let (_, full) = pointer_table(&b, |e| e, 4, 0, 4);
+        assert!(full);
+        for tokens in [1, 2, 7] {
+            assert_eq!(expert_route(true, full, tokens, 8), ExpertRoute::Table);
+        }
+        for tokens in [8, 9, 64] {
+            assert_eq!(expert_route(true, full, tokens, 8), ExpertRoute::Staged);
+        }
+        assert_eq!(expert_route(false, full, 1, 8), ExpertRoute::Staged);
+        assert!(b.evict(2));
+        let (t, full) = pointer_table(&b, |e| e, 4, 0, 4);
+        assert!(!full);
+        assert_eq!(t[2], 0);
+        assert_eq!(expert_route(true, full, 1, 8), ExpertRoute::Staged);
+    }
+
+    #[test]
     fn slot_book_hits_and_evicts_least_recent() {
         let mut b = SlotBook::new(2, Policy::Lru);
         assert_eq!(b.acquire(10, false, false), Some(Acquired { slot: 0, copy: true }));
@@ -1083,7 +1195,7 @@ mod tests {
 
     fn step(book: &mut ExpertBook<u64>, eng: &mut FakeCopies, now: &Rc<Cell<u64>>, used: &[usize]) -> Vec<Vec<Placed>> {
         book.poll(|t| eng.done(t));
-        let groups = book.plan(used, false);
+        let groups = book.plan(used, false).unwrap();
         for &p in used {
             book.record(p, 1.0);
         }
@@ -1170,7 +1282,7 @@ mod tests {
         let placed = b.seed(&hot, 4, 2);
         assert_eq!(placed.len(), 3);
         assert!(b.resident(1).is_some() && b.resident(4).is_some() && b.resident(2).is_some(), "{placed:?}");
-        let g = b.plan(&[1, 4], false);
+        let g = b.plan(&[1, 4], false).unwrap();
         assert!(g[0].iter().all(|p| !p.copy), "{g:?}");
         assert_eq!(b.stats.host_hits, 0);
     }
@@ -1184,11 +1296,11 @@ mod tests {
         }
         b.end_step(&mut eng).unwrap();
         b.poll(|t| eng.done(t));
-        let g = b.plan(&[0, 8, 9, 10, 11, 12], false);
+        let g = b.plan(&[0, 8, 9, 10, 11, 12], false).unwrap();
         assert_eq!(g.len(), 3);
         assert_eq!(g[0][0], Placed { page: 0, slot: b.resident(0).unwrap(), copy: false });
         assert!(g.iter().flatten().filter(|p| p.copy).all(|p| p.slot >= 4));
-        let g = b.plan(&[3, 8, 9, 10, 11, 12], true);
+        let g = b.plan(&[3, 8, 9, 10, 11, 12], true).unwrap();
         assert_eq!(g.len(), 1);
         let slots: Vec<usize> = g[0].iter().map(|p| p.slot).collect();
         let mut uniq = slots.clone();
@@ -1211,7 +1323,7 @@ mod tests {
         }
         b.end_step(&mut eng).unwrap();
         b.poll(|t| eng.done(t));
-        let g = b.plan(&[10, 11, 12, 13, 14, 15, 16, 17, 18, 19], true);
+        let g = b.plan(&[10, 11, 12, 13, 14, 15, 16, 17, 18, 19], true).unwrap();
         assert!(g.len() > 1, "{g:?}");
         let mut owner = std::collections::HashMap::new();
         for p in g.iter().flatten() {
@@ -1224,9 +1336,74 @@ mod tests {
         }
         for page in 10..20 {
             if let Some(slot) = b.resident(page) {
-                assert_eq!(g.iter().flatten().filter(|p| p.slot == slot).last().unwrap().page, page, "slot {slot} holds the last copy");
+                assert_eq!(g.iter().flatten().rfind(|p| p.slot == slot).unwrap().page, page, "slot {slot} holds the last copy");
             }
         }
+    }
+
+    #[test]
+    fn the_table_changes_only_when_a_promotion_lands_or_an_expert_leaves() {
+        let (mut eng, now) = engine(2);
+        let mut b: ExpertBook<u64> = ExpertBook::new(4, 3, 1, &score_settings(1.15, 1_000_000));
+        let table = |b: &ExpertBook<u64>| pointer_table_of(|p| b.resident(p), |e| e, 4, 0, 3);
+        b.record(0, 5.0);
+        b.record(1, 5.0);
+        b.end_step(&mut eng).unwrap();
+        assert_eq!(table(&b), (vec![0, 0, 0, 0], false), "copies in flight are not in the table");
+        now.set(1);
+        b.poll(|t| eng.done(t));
+        assert_eq!(table(&b).0, vec![0, 0, 0, 0]);
+        now.set(2);
+        b.poll(|t| eng.done(t));
+        let landed = table(&b).0;
+        assert!(landed[0] > 0 && landed[1] > 0 && landed[2] == 0, "{landed:?}");
+        b.record(2, 100.0);
+        b.end_step(&mut eng).unwrap();
+        let during = table(&b).0;
+        assert!(during.iter().filter(|&&s| s > 0).count() == 1 && during[2] == 0, "an eviction leaves the table at once, the newcomer only on landing: {during:?}");
+        now.set(10);
+        b.poll(|t| eng.done(t));
+        assert!(table(&b).0[2] > 0);
+        assert!(b.evict(2));
+        assert_eq!(table(&b).0[2], 0);
+    }
+
+    #[test]
+    fn a_pool_that_holds_every_cached_expert_has_no_scratch_and_promotes_nothing() {
+        let on = OffloadSettings { pointer_table: true, ..score_settings(1.15, 64) };
+        assert_eq!(score_pool(24, 2, 24, &on), (0, 0));
+        assert_eq!(score_pool(30, 2, 24, &on), (0, 0));
+        assert_eq!(score_pool(12, 2, 24, &on), (2, 16));
+        assert_eq!(score_pool(24, 2, 24, &score_settings(1.15, 64)), (2, 16), "without the table the margin still applies");
+        let (scratch, per_step) = score_pool(8, 2, 8, &on);
+        let (mut eng, _) = engine(0);
+        let mut b: ExpertBook<u64> = ExpertBook::new(8, 8, scratch, &OffloadSettings { promote_per_step: per_step, ..on });
+        assert_eq!(b.fill(&(0..8).collect::<Vec<_>>()).len(), 8);
+        for p in 0..8 {
+            b.record(p, p as f64 * 10.0);
+        }
+        assert_eq!(b.end_step(&mut eng).unwrap(), 0);
+        assert!(eng.copies.is_empty());
+        assert_eq!(pointer_table_of(|p| b.resident(p), |e| e, 8, 0, 8).1, true);
+        assert!(b.evict(3));
+        let g = b.plan(&[3], false).unwrap();
+        assert_eq!(g, vec![vec![Placed { page: 3, slot: 3, copy: true }]], "with no scratch a miss reuses a free cache slot");
+    }
+
+    #[test]
+    fn scratch_slots_never_appear_in_the_pointer_table() {
+        let (mut eng, _) = engine(0);
+        let mut b: ExpertBook<u64> = ExpertBook::new(8, 4, 2, &score_settings(1.15, 64));
+        b.record(0, 3.0);
+        b.end_step(&mut eng).unwrap();
+        b.poll(|t| eng.done(t));
+        let g = b.plan(&[0, 5, 6], false).unwrap();
+        let scratch: Vec<usize> = g.iter().flatten().filter(|p| p.copy).map(|p| p.slot).collect();
+        assert_eq!(scratch, vec![2, 3]);
+        let (t, full) = pointer_table_of(|p| b.resident(p), |e| e, 8, 0, 4);
+        assert!(!full);
+        assert!(t.iter().all(|&s| s == 0 || (s as usize - 1) < b.cache_slots()), "{t:?}");
+        assert_eq!((b.resident(5), b.resident(6)), (None, None));
     }
 
     #[test]
