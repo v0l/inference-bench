@@ -24,8 +24,15 @@ impl GgmlKernel {
 
     pub fn emit(&self) -> Result<String, String> {
         match self.target.language {
-            Language::Cuda => Ok(crate::cuda::emit_ggml()),
+            Language::Cuda => Ok(crate::cuda::emit_ggml().into_string()),
             Language::Wgsl => Ok(wgsl_decoder()),
+        }
+    }
+
+    pub fn emit_cuda(&self) -> Result<crate::KirSource, String> {
+        match self.target.language {
+            Language::Cuda => Ok(crate::cuda::emit_ggml()),
+            Language::Wgsl => Err("ggml: the CUDA emitter cannot target wgsl".to_string()),
         }
     }
 }

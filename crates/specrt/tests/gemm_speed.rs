@@ -24,7 +24,7 @@ fn variants(module: &Module) -> Vec<(String, Module)> {
         .into_iter()
         .map(|g| {
             let mut m = module.clone();
-            m.source = m.source.replace(base, &format!("constexpr int RASTER_GROUP = {g};"));
+            m.source = kir::KirSource::test_text(m.source.replace(base, &format!("constexpr int RASTER_GROUP = {g};")));
             (format!("group {g}"), m)
         })
         .collect()
@@ -63,7 +63,7 @@ fn time_fp4(spec_name: &str) {
             if let Some(t) = template {
                 let act = kir::cuda::fp4_act_source();
                 assert!(module.source.contains(&act));
-                module.source = module.source.replace(&act, &t);
+                module.source = kir::KirSource::test_text(module.source.replace(&act, &t));
             }
             let loaded = jit.load(&module).unwrap();
             (name, s, module, loaded)

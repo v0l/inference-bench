@@ -209,7 +209,7 @@ fn build(text: &str) -> Kernel {
 }
 
 fn emit(k: &Kernel) -> String {
-    kir::cuda::emit_module(std::slice::from_ref(k)).unwrap()
+    kir::cuda::emit_module(std::slice::from_ref(k)).unwrap().into_string()
 }
 
 #[test]

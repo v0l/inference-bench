@@ -110,7 +110,7 @@ impl Harness {
             if let Ok(v) = std::env::var(var) {
                 let at = module.source.find(&format!("constexpr int {name} = ")).unwrap();
                 let end = at + module.source[at..].find(';').unwrap();
-                module.source.replace_range(at..end, &format!("constexpr int {name} = {v}"));
+                module.source.edit_text(|s| s.replace_range(at..end, &format!("constexpr int {name} = {v}")));
             }
         }
         if let (Ok(bk), Ok(st)) = (std::env::var("SPECRT_DECODE_BK"), std::env::var("SPECRT_DECODE_STAGES")) {

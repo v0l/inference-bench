@@ -57,7 +57,7 @@ extern \"C\" __global__ void swiglu(const float* gate_up, float* out) {
 }
 ";
 
-fn module(source: String) -> Module {
+fn module(source: kir::KirSource) -> Module {
     Module { source, kernels: vec![], smem: BTreeMap::new(), arch_features: false, kir_hash: String::new() }
 }
 
@@ -78,7 +78,7 @@ fn kir_rmsnorm_and_swiglu_are_not_slower_than_the_templates() {
         Kernel::gated_activation(&target, "swiglu", INTER as u32, Activation::Silu, 256).unwrap(),
     ])
     .unwrap();
-    let old = jit.load(&module(OLD.to_string())).unwrap();
+    let old = jit.load(&module(kir::KirSource::test_text(OLD))).unwrap();
     let new = jit.load(&module(new_src)).unwrap();
     let max_rows = 4096;
     let x: CudaSlice<f32> = stream.clone_htod(&(0..max_rows * HIDDEN).map(|i| ((i % 97) as f32 - 48.0) * 0.03).collect::<Vec<_>>()).unwrap();

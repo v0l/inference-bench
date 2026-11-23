@@ -90,7 +90,7 @@ fn compare(label: &str, spec: &Spec, case: &Case) -> bool {
     let dir = std::env::temp_dir().join(format!("specrt-fp4gemv-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut module = Module::generate(spec, 256).unwrap();
-    module.source.push_str(include_str!("fixtures/fp4_gemv_reference.cu"));
+    module.source.edit_text(|s| s.push_str(include_str!("fixtures/fp4_gemv_reference.cu")));
     let loaded = Jit::new(ctx.clone(), dir.clone()).unwrap().load(&module).unwrap();
     let stream = ctx.default_stream();
     let (hidden, inter) = (spec.dims.hidden, spec.dims.intermediate);

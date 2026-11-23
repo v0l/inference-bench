@@ -50,15 +50,15 @@ fn flash_mma_prefill_attention_speed() {
             for stages in list("SPECRT_FLASH_STAGES", &specrt::codegen::flash_stages(a.head_dim, 1).to_string()) {
                 for warps in list("SPECRT_FLASH_WARPS", &(specrt::codegen::flash_rows(a.head_dim, 1) / 16).to_string()) {
                     let mut m = module.clone();
-                    m.source = m
+                    m.source = kir::KirSource::test_text(m
                         .source
                         .replace(&base_text, &format!("constexpr int FM_BK = {bk};"))
                         .replace(&format!("constexpr int FM_STAGES = {};", specrt::codegen::flash_stages(a.head_dim, 1)), &format!("constexpr int FM_STAGES = {stages};"))
-                        .replace(&format!("constexpr int FM_WARPS = {};", specrt::codegen::flash_rows(a.head_dim, 1) / 16), &format!("constexpr int FM_WARPS = {warps};"));
+                        .replace(&format!("constexpr int FM_WARPS = {};", specrt::codegen::flash_rows(a.head_dim, 1) / 16), &format!("constexpr int FM_WARPS = {warps};")));
                     if std::env::var("SPECRT_FLASH_NOLOAD").is_ok() {
                         let patched = m.source.replace("cp_async16_zfill(dst, src + c * 8, tk < key_end);", "(void)dst; (void)src;");
-                        assert_ne!(patched, m.source);
-                        m.source = patched;
+                        assert_ne!(patched, m.source.as_str());
+                        m.source = kir::KirSource::test_text(patched);
                     }
                     let smem = if fp8 { module.smem["flash_mma"] } else { (stages * 2 * bk * a.head_dim * 2).max(warps * 16 * a.head_dim * 2) as u32 };
                     let loaded = jit.load(&m).unwrap();

@@ -24,8 +24,8 @@ pub(crate) mod scan_tile;
 mod split;
 
 
-pub fn emit_attention(kernels: &[AttentionKernel]) -> Result<String, AttentionError> {
-    let Some(first) = kernels.first() else { return Ok(String::new()) };
+pub fn emit_attention(kernels: &[AttentionKernel]) -> Result<crate::KirSource, AttentionError> {
+    let Some(first) = kernels.first() else { return Ok(crate::KirSource::default()) };
     for k in kernels {
         k.validate()?;
         if k.shape != first.shape {
@@ -63,5 +63,5 @@ pub fn emit_attention(kernels: &[AttentionKernel]) -> Result<String, AttentionEr
     if has(Family::GroupedDecode) {
         push(&decode::body());
     }
-    Ok(out)
+    Ok(crate::KirSource::emitted(out))
 }

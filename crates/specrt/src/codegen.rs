@@ -377,7 +377,7 @@ pub const GDN_KERNELS: &[&str] = &["lin_in_norm", "lin_ba_norm", "lin_out_proj",
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Module {
-    pub source: String,
+    pub source: kir::KirSource,
     pub kernels: Vec<&'static str>,
     pub smem: BTreeMap<&'static str, u32>,
     pub arch_features: bool,
@@ -557,15 +557,17 @@ impl Module {
         let store_names: Vec<&'static str> = stores.iter().map(|k| crate::gemm::intern(&k.name)).collect();
         gemvs.extend(stores);
         let kir_hash = kir::fold_hashes([kir_hash, ggml.hash(), kir::prims::prims_hash(&prims), kir::gemv::gemv_hash(&gemvs)]);
-        let mut source = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
-            kir::cuda::emit_ops(&ops).map_err(anyhow::Error::msg)?,
-            kir::prims::emit_cuda(&prims).map_err(anyhow::Error::msg)?,
-            ggml.emit().map_err(anyhow::Error::msg)?,
-            attn_source,
-            gemm_source,
-            kir::gemv::emit_gemvs(&gemvs).map_err(anyhow::Error::msg)?,
-            kir_source
+        let mut source = kir::KirSource::join(
+            [
+                &kir::cuda::emit_ops(&ops).map_err(anyhow::Error::msg)?,
+                &kir::prims::emit_cuda(&prims).map_err(anyhow::Error::msg)?,
+                &ggml.emit_cuda().map_err(anyhow::Error::msg)?,
+                &attn_source,
+                &gemm_source,
+                &kir::gemv::emit_gemvs(&gemvs).map_err(anyhow::Error::msg)?,
+                &kir_source,
+            ],
+            "\n",
         );
         let mut kernels: Vec<&'static str> = KERNELS.iter().copied().filter(|k| attention_available(k, target)).collect();
         kernels.extend(store_names);
@@ -588,8 +590,7 @@ impl Module {
             }
         }
         if la.is_some() || !linear.is_empty() {
-            source.push('\n');
-            source.push_str(&linear_source);
+            source.append("\n", &linear_source);
             for k in &linear {
                 kernels.extend_from_slice(k.family.kernels());
             }
@@ -601,8 +602,7 @@ impl Module {
         let mut moe_arch = false;
         let moe = moe_kernels(spec, target)?;
         if !moe.is_empty() {
-            source.push('\n');
-            source.push_str(&kir::cuda::emit_moe(&moe).map_err(anyhow::Error::msg)?);
+            source.append("\n", &kir::cuda::emit_moe(&moe).map_err(anyhow::Error::msg)?);
             for k in &moe {
                 kernels.extend_from_slice(k.family.kernels());
                 smem.extend(k.smem());
@@ -635,7 +635,7 @@ pub fn kernels_report(spec: &Spec, target: &kir::Target) -> Result<String> {
     for k in &kernels {
         out.push_str(&format!("\n== {} ({})\n{}\n\n", k.name, k.hash(), k.describe()));
         let source = match target.language {
-            kir::Language::Cuda => kir::cuda::emit_module(std::slice::from_ref(k)),
+            kir::Language::Cuda => kir::cuda::emit_module(std::slice::from_ref(k)).map(kir::KirSource::into_string),
             kir::Language::Wgsl => kir::wgsl::emit_kernel(k),
         };
         out.push_str(&source.map_err(anyhow::Error::msg)?);

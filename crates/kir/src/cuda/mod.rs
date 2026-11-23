@@ -219,7 +219,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
     })
 }
 
-pub fn emit_module(kernels: &[Kernel]) -> Result<String, String> {
+pub fn emit_module(kernels: &[Kernel]) -> Result<crate::KirSource, String> {
     let mut out = String::new();
     if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum()) || matches!(&k.body, Body::Rows(crate::rows::RowBody::LayerNorm { .. }))) {
         out.push_str(WARP_SUM);
@@ -228,7 +228,7 @@ pub fn emit_module(kernels: &[Kernel]) -> Result<String, String> {
         out.push_str(&emit_kernel(k)?);
     }
     out.push_str(&linear::chunked_scans(kernels)?);
-    Ok(out)
+    Ok(crate::KirSource::emitted(out))
 }
 
 fn pdl_macro(single_wave_blocks: u32) -> String {
@@ -238,7 +238,7 @@ fn pdl_macro(single_wave_blocks: u32) -> String {
 }
 
 pub fn with_pdl_wait(source: &str, single_wave_blocks: u32) -> String {
-    with_pdl(source, single_wave_blocks, false)
+    pdl_text(source, single_wave_blocks, false)
 }
 
 const WEIGHT_PREFETCH: &str = "\n    PDL_PREFETCH(w);";
@@ -247,7 +247,11 @@ fn pdl_prefetch_macro() -> &'static str {
     "#define PDL_PREFETCH(p) asm volatile(\"prefetch.global.L2 [%0];\" :: \"l\"((const char*)(p) + (size_t)blockIdx.x * 4096 + (size_t)threadIdx.x * 16))\n"
 }
 
-pub fn with_pdl(source: &str, single_wave_blocks: u32, hoist: bool) -> String {
+pub fn with_pdl(source: &crate::KirSource, single_wave_blocks: u32, hoist: bool) -> crate::KirSource {
+    crate::KirSource::emitted(pdl_text(source, single_wave_blocks, hoist))
+}
+
+fn pdl_text(source: &str, single_wave_blocks: u32, hoist: bool) -> String {
     let mut out = String::with_capacity(source.len() + 1024);
     out.push_str(&pdl_macro(single_wave_blocks));
     if hoist {
@@ -273,7 +277,7 @@ pub fn with_pdl(source: &str, single_wave_blocks: u32, hoist: bool) -> String {
 
 #[cfg(test)]
 mod pdl_tests {
-    use super::{with_pdl, with_pdl_wait};
+    use super::{pdl_text as with_pdl, with_pdl_wait};
 
     #[test]
     fn hoist_prefetches_weights_above_the_wait_and_is_off_by_default() {

@@ -21,7 +21,7 @@ fn experts(k: &MoeKernel) -> String {
     out
 }
 
-pub fn emit_moe(kernels: &[MoeKernel]) -> Result<String, String> {
+pub fn emit_moe(kernels: &[MoeKernel]) -> Result<crate::KirSource, String> {
     let mut out = String::new();
     for k in kernels {
         k.validate()?;
@@ -45,5 +45,5 @@ pub fn emit_moe(kernels: &[MoeKernel]) -> Result<String, String> {
             }
         }
     }
-    Ok(out)
+    Ok(crate::KirSource::emitted(out))
 }

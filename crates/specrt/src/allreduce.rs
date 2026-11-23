@@ -150,11 +150,7 @@ struct ProbeKernels {
 }
 
 fn probe_kernels(ctx: &Arc<CudaContext>) -> Result<ProbeKernels> {
-    let (major, minor) = ctx.compute_capability()?;
-    let arch: &'static str = Box::leak(format!("compute_{major}{minor}").into_boxed_str());
-    let opts = cudarc::nvrtc::CompileOptions { arch: Some(arch), options: vec!["--std=c++17".into()], ..Default::default() };
-    let ptx = cudarc::nvrtc::compile_ptx_with_opts(kir::cuda::emit_peer_probe(), opts).map_err(|e| anyhow::anyhow!("nvrtc peer probe: {e:?}"))?;
-    let module = ctx.load_module(ptx)?;
+    let module = crate::jit::load_uncached(ctx, &kir::cuda::emit_peer_probe()).map_err(|e| anyhow::anyhow!("peer probe: {e:#}"))?;
     Ok(ProbeKernels { wait: module.load_function(kir::cuda::PROBE_WAIT)?, store: module.load_function(kir::cuda::PROBE_STORE)?, _module: module })
 }
 

@@ -46,3 +46,6 @@ fancy-regex = "0.17"
 
 [target.'cfg(any(windows, unix))'.dependencies]
 libloading = "0.8"
+
+[dev-dependencies]
+inference-bench-kir = { path = "../kir", features = ["test-text"] }

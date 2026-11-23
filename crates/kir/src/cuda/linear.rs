@@ -26,8 +26,8 @@ pub(crate) fn chunked_scans(kernels: &[crate::Kernel]) -> Result<String, String>
 }
 
 
-pub fn emit_linear(kernels: &[LinearKernel]) -> Result<String, LinearError> {
-    let Some(first) = kernels.iter().find(|k| k.family.uses_shape()).or(kernels.first()) else { return Ok(String::new()) };
+pub fn emit_linear(kernels: &[LinearKernel]) -> Result<crate::KirSource, LinearError> {
+    let Some(first) = kernels.iter().find(|k| k.family.uses_shape()).or(kernels.first()) else { return Ok(crate::KirSource::default()) };
     for k in kernels {
         k.validate()?;
         if k.family.uses_shape() && (k.shape != first.shape || k.tuning != first.tuning) {
@@ -61,5 +61,5 @@ pub fn emit_linear(kernels: &[LinearKernel]) -> Result<String, LinearError> {
     if has(Family::Draft) {
         push(&draft::body());
     }
-    Ok(out)
+    Ok(crate::KirSource::emitted(out))
 }

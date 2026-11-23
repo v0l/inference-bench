@@ -17,6 +17,7 @@ toml.workspace = true
 default = ["cuda", "wgsl"]
 cuda = []
 wgsl = []
+test-text = []
 
 [dev-dependencies]
 naga = { version = "30.0.1", features = ["wgsl-in"] }

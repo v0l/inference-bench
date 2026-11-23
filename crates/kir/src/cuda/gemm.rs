@@ -189,11 +189,11 @@ pub fn emit_gemm(k: &KernelInstance) -> Result<String, GemmError> {
     })
 }
 
-pub fn emit_gemms(kernels: &[KernelInstance]) -> Result<String, GemmError> {
+pub fn emit_gemms(kernels: &[KernelInstance]) -> Result<crate::KirSource, GemmError> {
     let mut out = gemm_library(kernels);
     out.push('\n');
     for k in kernels {
         out.push_str(&emit_gemm(k)?);
     }
-    Ok(out)
+    Ok(crate::KirSource::emitted(out))
 }

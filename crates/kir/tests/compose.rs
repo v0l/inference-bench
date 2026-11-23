@@ -22,7 +22,7 @@ fn composed(name: &str, t: &Target, s: &Shape) -> Kernel {
 
 fn emit(k: &Kernel) -> String {
     match k.target.language {
-        kir::Language::Cuda => kir::cuda::emit_module(std::slice::from_ref(k)).unwrap(),
+        kir::Language::Cuda => kir::cuda::emit_module(std::slice::from_ref(k)).unwrap().into_string(),
         kir::Language::Wgsl => kir::wgsl::emit_kernel(k).unwrap(),
     }
 }

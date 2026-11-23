@@ -123,7 +123,7 @@ const KERNEL_TEXT_OUTSIDE_KIR: &[(&str, &str)] = &[
 
 const KERNEL_INCLUDES_OUTSIDE_KIR: &[&str] = &["specrt/src/bandwidth.rs", "specrt/src/nvfp4.rs", "specrt/tests/fp4_gemv.rs"];
 
-const NVRTC_OUTSIDE_JIT: &[&str] = &["specrt/src/allreduce.rs", "specrt/src/bandwidth.rs", "specrt/src/nvfp4.rs"];
+const NVRTC_OUTSIDE_JIT: &[&str] = &["specrt/src/bandwidth.rs", "specrt/src/nvfp4.rs"];
 
 fn crate_files(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -177,6 +177,32 @@ fn nvrtc_offenders(files: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
+fn untyped_source_offenders(files: &[(String, String)], manifests: &[(String, String)]) -> Vec<String> {
+    let mut out: Vec<String> = files
+        .iter()
+        .filter(|(f, text)| f.contains("/src/") && f.ends_with(".rs") && (text.contains("KirSource::test_text") || text.contains(".edit_text(")))
+        .map(|(f, _)| f.clone())
+        .collect();
+    for (f, text) in manifests {
+        let normal = text.split("[dev-dependencies]").next().unwrap_or("");
+        if normal.contains("test-text") && !f.starts_with("kir/") {
+            out.push(f.clone());
+        }
+    }
+    out
+}
+
+fn manifests(crates: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(crates).unwrap() {
+        let dir = e.unwrap().path();
+        if let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+            out.push((format!("{}/Cargo.toml", dir.file_name().unwrap().to_string_lossy()), text));
+        }
+    }
+    out
+}
+
 fn assert_kernel_text_lives_only_in_kir() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let files = crate_files(&crates);
@@ -187,8 +213,28 @@ fn assert_kernel_text_lives_only_in_kir() {
     assert!(includes.is_empty(), "include_str! of kernel text outside crates/kir: {includes:?}");
     let nvrtc = nvrtc_offenders(&files);
     assert!(nvrtc.is_empty(), "NVRTC called outside src/jit.rs: {nvrtc:?}");
+    let untyped = untyped_source_offenders(&files, &manifests(&crates));
+    assert!(untyped.is_empty(), "kernel source built from raw text in library code: {untyped:?}");
+    let jit = std::fs::read_to_string(crates.join("specrt/src/jit.rs")).unwrap();
+    for sig in ["fn compile_cubin(source: &kir::KirSource", "fn ptx_of(source: &kir::KirSource", "fn compile_ptx(&self, source: &kir::KirSource", "pub fn load_uncached(ctx: &Arc<CudaContext>, source: &kir::KirSource)", "pub fn load(&self, module: &Module)"] {
+        assert!(jit.contains(sig), "jit.rs must compile only kir output: {sig}");
+    }
+    let module = std::fs::read_to_string(crates.join("specrt/src/codegen.rs")).unwrap();
+    assert!(module.contains("pub source: kir::KirSource,"), "Module::source must be a KirSource");
+    let source = std::fs::read_to_string(crates.join("kir/src/source.rs")).unwrap();
+    assert!(source.contains("pub(crate) fn emitted(") && source.contains("pub struct KirSource(String);"), "only kir emitters may build a KirSource");
     for f in KIR_EMITTERS_OUTSIDE_CUDA.iter().chain(KERNEL_INCLUDES_OUTSIDE_KIR).chain(NVRTC_OUTSIDE_JIT).chain(KERNEL_TEXT_OUTSIDE_KIR.iter().map(|(f, _)| f)) {
         assert!(crates.join(f).exists(), "stale allowlist entry {f}");
+    }
+    let text_of = |f: &str| files.iter().find(|(n, _)| n == f).map(|(_, t)| t.as_str()).unwrap_or("");
+    for f in NVRTC_OUTSIDE_JIT {
+        assert!(["compile_ptx", "create_program", "compile_program"].iter().any(|p| text_of(f).contains(p)), "stale NVRTC_OUTSIDE_JIT entry {f}: shrink the list");
+    }
+    for f in KERNEL_INCLUDES_OUTSIDE_KIR {
+        assert!(text_of(f).contains(".cu\")") || text_of(f).contains(".wgsl\")"), "stale KERNEL_INCLUDES_OUTSIDE_KIR entry {f}: shrink the list");
+    }
+    for (f, _) in KERNEL_TEXT_OUTSIDE_KIR {
+        assert!(text_of(f).contains("__global__"), "stale KERNEL_TEXT_OUTSIDE_KIR entry {f}: shrink the list");
     }
     let pinned = [
         ("KIR_SNIPPETS", KIR_SNIPPETS.len(), 4),
@@ -201,7 +247,7 @@ fn assert_kernel_text_lives_only_in_kir() {
         ("KIR_EMITTERS_OUTSIDE_CUDA", KIR_EMITTERS_OUTSIDE_CUDA.len(), 6),
         ("KERNEL_TEXT_OUTSIDE_KIR", KERNEL_TEXT_OUTSIDE_KIR.len(), 10),
         ("KERNEL_INCLUDES_OUTSIDE_KIR", KERNEL_INCLUDES_OUTSIDE_KIR.len(), 3),
-        ("NVRTC_OUTSIDE_JIT", NVRTC_OUTSIDE_JIT.len(), 3),
+        ("NVRTC_OUTSIDE_JIT", NVRTC_OUTSIDE_JIT.len(), 2),
     ];
     for (name, len, pin) in pinned {
         assert_eq!(len, pin, "{name} changed size: shrink the pin when an entry is ported, never grow the list");
@@ -223,6 +269,12 @@ fn the_kernel_text_guards_catch_a_new_offender() {
     assert_eq!(kernel_text_offenders(&files), ["specrt/src/new.rs"]);
     assert_eq!(kernel_include_offenders(&files), ["core/src/x.rs", "ui/src/y.rs"]);
     assert_eq!(nvrtc_offenders(&files), ["specrt/src/z.rs"]);
+    let raw = vec![file("specrt/src/r.rs", "Module { source: kir::KirSource::test_text(s) }"), file("specrt/tests/t.rs", "kir::KirSource::test_text(s)"), file("core/src/e.rs", "m.source.edit_text(|s| s.clear())")];
+    let toml = vec![
+        ("specrt/Cargo.toml".to_string(), "[dependencies]\nkir = { features = [\"test-text\"] }\n".to_string()),
+        ("core/Cargo.toml".to_string(), "[dependencies]\nkir = {}\n[dev-dependencies]\nkir = { features = [\"test-text\"] }\n".to_string()),
+    ];
+    assert_eq!(untyped_source_offenders(&raw, &toml), ["specrt/src/r.rs", "core/src/e.rs", "specrt/Cargo.toml"]);
 }
 
 #[test]

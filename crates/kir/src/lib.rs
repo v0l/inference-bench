@@ -25,7 +25,10 @@ pub mod vision;
 pub mod wgsl;
 
 pub use layout::{Dialect, Layout};
+pub use source::KirSource;
 pub use target::{BlockSum, Feature, Language, Target};
+
+mod source;
 
 use std::fmt::{self, Write as _};
 

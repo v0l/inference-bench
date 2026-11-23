@@ -103,9 +103,9 @@ pub fn evict_oldest(dir: &Path, max_bytes: u64, keep: Option<&Path>) -> u64 {
     removed
 }
 
-fn compile_cubin(source: &str, sm: &str, options: &[String], jobs: usize) -> Result<Vec<u8>> {
+fn compile_cubin(source: &kir::KirSource, sm: &str, options: &[String], jobs: usize) -> Result<Vec<u8>> {
     use cudarc::nvrtc::{result, sys};
-    let src = CString::new(source).map_err(|_| anyhow!("kernel source has a NUL"))?;
+    let src = CString::new(source.as_str()).map_err(|_| anyhow!("kernel source has a NUL"))?;
     let prog = result::create_program(&src, None).map_err(|e| anyhow!("nvrtc create: {e:?}"))?;
     let mut opts = vec![format!("--gpu-architecture={sm}")];
     opts.extend(options.iter().cloned());
@@ -139,6 +139,17 @@ fn compile_cubin(source: &str, sm: &str, options: &[String], jobs: usize) -> Res
 
 pub fn default_cache_dir() -> PathBuf {
     dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("specrt")
+}
+
+fn ptx_of(source: &kir::KirSource, arch: &'static str, options: Vec<String>) -> Result<String> {
+    let opts = CompileOptions { arch: Some(arch), options, ..Default::default() };
+    Ok(compile_ptx_with_opts(source.as_str(), opts).map_err(|e| anyhow!("nvrtc: {e:?}"))?.to_src())
+}
+
+pub fn load_uncached(ctx: &Arc<CudaContext>, source: &kir::KirSource) -> Result<Arc<CudaModule>> {
+    let (major, minor) = ctx.compute_capability()?;
+    let arch: &'static str = Box::leak(format!("compute_{major}{minor}").into_boxed_str());
+    Ok(ctx.load_module(Ptx::from_src(ptx_of(source, arch, vec!["--std=c++17".to_string()])?))?)
 }
 
 impl Jit {
@@ -177,9 +188,8 @@ impl Jit {
         Ok(())
     }
 
-    fn compile_ptx(&self, source: &str, arch: &'static str, path: &Path) -> Result<String> {
-        let opts = CompileOptions { arch: Some(arch), options: self.options.clone(), ..Default::default() };
-        let ptx = compile_ptx_with_opts(source, opts).map_err(|e| anyhow!("nvrtc: {e:?}"))?.to_src();
+    fn compile_ptx(&self, source: &kir::KirSource, arch: &'static str, path: &Path) -> Result<String> {
+        let ptx = ptx_of(source, arch, self.options.clone())?;
         self.store(path, ptx.as_bytes())?;
         Ok(ptx)
     }

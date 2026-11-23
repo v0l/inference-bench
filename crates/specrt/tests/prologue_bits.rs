@@ -241,7 +241,7 @@ fn prepare(spec: &Spec) -> (Module, String) {
     let cs = cases(spec, &layers, &head);
     let refs = reference_source(&cs);
     let mut module = Module::generate(spec, 256).unwrap();
-    module.source.push_str(&refs);
+    module.source.edit_text(|s| s.push_str(&refs));
     (module, refs)
 }
 

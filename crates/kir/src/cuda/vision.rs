@@ -5,7 +5,7 @@ mod kernels;
 #[path = "vision/prim.rs"]
 mod prim;
 
-pub fn emit_vision(k: &VisionKernel) -> Result<String, VisionError> {
+pub fn emit_vision(k: &VisionKernel) -> Result<crate::KirSource, VisionError> {
     k.validate()?;
     let split = k.precise.to_string();
     let mut out = prim::scalar_prelude();
@@ -30,5 +30,5 @@ pub fn emit_vision(k: &VisionKernel) -> Result<String, VisionError> {
     if k.tiled {
         out += &kernels::tiled_kernels();
     }
-    Ok(out)
+    Ok(crate::KirSource::emitted(out))
 }

@@ -83,10 +83,10 @@ fn run_with(spec: Spec, linear: &str, suffix: &str, tokens: usize, raster: Optio
     if let Some(group) = raster {
         let (g, c) = ("constexpr int RASTER_GROUP = 32;", "constexpr int RASTER_MIN_COLS = 256;");
         assert!(module.source.contains(g) && module.source.contains(c));
-        module.source = module
+        module.source = kir::KirSource::test_text(module
             .source
             .replace(g, &format!("constexpr int RASTER_GROUP = {group};"))
-            .replace(c, "constexpr int RASTER_MIN_COLS = 1;");
+            .replace(c, "constexpr int RASTER_MIN_COLS = 1;"));
     }
     let loaded = jit.load(&module).unwrap();
     let kernel = format!("{linear}_f8{suffix}");

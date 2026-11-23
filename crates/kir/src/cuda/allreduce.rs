@@ -1,5 +1,5 @@
 use crate::allreduce::{AllReduceError, AllReduceKernel, Dtype, Mode};
-use crate::lit;
+use crate::{KirSource, lit};
 
 #[path = "allreduce/prim.rs"]
 mod prim;
@@ -136,7 +136,7 @@ fn gather(k: &AllReduceKernel, width: u32, each: u32) -> String {
     s
 }
 
-pub fn emit_peer_probe() -> String {
+pub fn emit_peer_probe() -> KirSource {
     let mut s = String::from("typedef unsigned short bf16_t;\n\n");
     s += &prim::flag_ops();
     s += &prim::global_timer();
@@ -144,11 +144,11 @@ pub fn emit_peer_probe() -> String {
     s += "    unsigned long long start = ar_now_ns();\n    while (ar_load_acquire(flag) != magic) {\n        if (ar_now_ns() - start > timeout_ns) {\n            *result = 2;\n            return;\n        }\n    }\n    *result = 1;\n}\n\n";
     s += &header(1, PROBE_STORE, "unsigned* flag, unsigned magic");
     s += "    __threadfence_system();\n    ar_store_release(flag, magic);\n}\n\n";
-    s
+    KirSource::emitted(s)
 }
 
-pub fn emit_allreduce(kernels: &[AllReduceKernel]) -> Result<String, AllReduceError> {
-    let Some(first) = kernels.first() else { return Ok(String::new()) };
+pub fn emit_allreduce(kernels: &[AllReduceKernel]) -> Result<KirSource, AllReduceError> {
+    let Some(first) = kernels.first() else { return Ok(KirSource::default()) };
     for k in kernels {
         k.validate()?;
         if k.ranks != first.ranks {
@@ -165,5 +165,5 @@ pub fn emit_allreduce(kernels: &[AllReduceKernel]) -> Result<String, AllReduceEr
             Mode::Gather { width, each } => gather(k, width, each),
         });
     }
-    Ok(out)
+    Ok(KirSource::emitted(out))
 }

@@ -171,7 +171,7 @@ pub fn cuda_prims(t: &Target, hidden: usize, vocab: usize, eps: f64, embed_scale
     .collect()
 }
 
-pub fn emit_cuda(kernels: &[PrimKernel]) -> Result<String, String> {
+pub fn emit_cuda(kernels: &[PrimKernel]) -> Result<crate::KirSource, String> {
     let mut out = String::new();
     let vocab = kernels.iter().find_map(|k| match k.prim {
         Prim::SampleRows { vocab } | Prim::ArgmaxAdvance { vocab } => Some(vocab),
@@ -192,7 +192,7 @@ pub fn emit_cuda(kernels: &[PrimKernel]) -> Result<String, String> {
         }
         out.push_str(&k.emit()?);
     }
-    Ok(out)
+    Ok(crate::KirSource::emitted(out))
 }
 
 fn grid_stride(n: &str, step: usize) -> String {

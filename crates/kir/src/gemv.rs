@@ -86,12 +86,12 @@ pub fn gemv_hash(kernels: &[GemvKernel]) -> String {
     fnv(kernels.iter().flat_map(|k| k.hash().into_bytes().into_iter().chain(std::iter::once(0))))
 }
 
-pub fn emit_gemvs(kernels: &[GemvKernel]) -> Result<String, String> {
+pub fn emit_gemvs(kernels: &[GemvKernel]) -> Result<crate::KirSource, String> {
     let mut out = String::new();
     for k in kernels {
         out.push_str(&k.emit()?);
     }
-    Ok(out)
+    Ok(crate::KirSource::emitted(out))
 }
 
 fn bf16_rows(name: &str, n: usize, k: usize) -> String {
