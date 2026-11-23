@@ -69,10 +69,27 @@ pub struct Geometry {
     pub regs: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    Whole,
+    Quant,
+    Dequant,
+    Main,
+    Reduce,
+    Residual,
+    Act,
+    QkNorm,
+    Rope,
+    KvWrite,
+    Split,
+    Combine,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Unit {
     pub label: String,
     pub op: usize,
+    pub part: Part,
     pub class: Class,
     pub reads: Vec<Tensor>,
     pub writes: Vec<Tensor>,
@@ -86,7 +103,11 @@ pub struct Unit {
 impl Unit {
     fn new(label: impl Into<String>, op: usize, class: Class, reads: Vec<Tensor>, writes: Vec<Tensor>) -> Unit {
         let row = writes.first().map_or(1, |t| t.cols);
-        Unit { label: label.into(), op, class, reads, writes, launches: 1, geometry: None, barrier: false, bound: matches!(class, Class::Attention | Class::Scan), row }
+        Unit { label: label.into(), op, part: Part::Whole, class, reads, writes, launches: 1, geometry: None, barrier: false, bound: matches!(class, Class::Attention | Class::Scan), row }
+    }
+
+    fn with_part(self, part: Part) -> Unit {
+        Unit { part, ..self }
     }
 
     fn with_row(self, row: usize) -> Unit {
@@ -146,6 +167,7 @@ pub enum Reason {
     Regs { need: u32, limit: u32 },
     Cost,
     Outscored { by: Vec<String>, saving: u64 },
+    NoKernel,
 }
 
 impl Reason {
@@ -165,6 +187,7 @@ impl Reason {
             Reason::Regs { need, limit } => format!("needs {need} registers per thread, the target has {limit}"),
             Reason::Cost => "the penalty is at least the saving".into(),
             Reason::Outscored { by, saving } => format!("{} saves more ({saving}) with the same units", by.join(" + ")),
+            Reason::NoKernel => "no kernel in the library runs these ops as one".into(),
         }
     }
 }
@@ -197,6 +220,8 @@ impl Decision {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Group {
     pub units: Vec<String>,
+    pub members: Vec<usize>,
+    pub ops: Vec<usize>,
     pub launches: usize,
 }
 
@@ -316,9 +341,9 @@ impl Lower<'_> {
         let tokens = self.count.rows(out.rows).max(1);
         let label = op.label();
         let residual = s.epi == Epilogue::Residual;
-        let act = matches!(s.epi, Epilogue::Act | Epilogue::Map) && output.is_planes();
+        let act = matches!(s.epi, Epilogue::Act | Epilogue::Map) && output.holds_activation();
         let Some((geo, path)) = self.geometry(weight, quant, tokens, s.n, s.k) else {
-            let mut u = Unit::new(label, i, sig.class, sig.reads, sig.writes);
+            let mut u = Unit::new(label, i, sig.class, sig.reads, sig.writes).with_part(Part::Main);
             u.launches = 0;
             self.units.push(u);
             return Ok(());
@@ -335,29 +360,29 @@ impl Lower<'_> {
         if let Some((form, row)) = quantised {
             let input = reads[0].clone();
             let t = self.local(format!("{label} act quant"), input.rows, s.k, form);
-            self.units.push(Unit::new(format!("{label} quant"), i, Class::RowReduce, vec![input], vec![t.clone()]).with_row(row));
+            self.units.push(Unit::new(format!("{label} quant"), i, Class::RowReduce, vec![input], vec![t.clone()]).with_row(row).with_part(Part::Quant));
             reads[0] = t;
         } else if path == GemmPath::Ggb {
             let w = reads[1].clone();
             let staged = self.local(format!("{label} dequant"), Rows::Fixed(s.n), s.k, Form::Bf16);
-            self.units.push(Unit::new(format!("{label} dequant"), i, Class::Gather, vec![w], vec![staged.clone()]));
+            self.units.push(Unit::new(format!("{label} dequant"), i, Class::Gather, vec![w], vec![staged.clone()]).with_part(Part::Dequant));
             reads[1] = staged;
         }
         let result = if residual || act { self.local(format!("{label} acc"), out.rows, s.n, Form::F32) } else { out.clone() };
         match geo.owner {
             Owner::Split { serial } => {
                 let parts = self.local(format!("{label} parts"), out.rows, s.n * serial, Form::F32);
-                self.units.push(Unit::new(label.clone(), i, Class::Gemm, reads, vec![parts.clone()]).with_geometry(Some(geo)));
+                self.units.push(Unit::new(label.clone(), i, Class::Gemm, reads, vec![parts.clone()]).with_geometry(Some(geo)).with_part(Part::Main));
                 let block = gemm::BATCH_REDUCE_BLOCK;
                 let reduce = Geometry { col_blocks: (tokens * s.n).div_ceil(block), rows_block: 1, owner: Owner::Flat { cols: block }, smem: 0, regs: BASE_REGS };
-                self.units.push(Unit::new(format!("{label} reduce"), i, Class::Elementwise, vec![parts], vec![result.clone()]).with_geometry(Some(reduce)));
+                self.units.push(Unit::new(format!("{label} reduce"), i, Class::Elementwise, vec![parts], vec![result.clone()]).with_geometry(Some(reduce)).with_part(Part::Reduce));
             }
-            Owner::Tile { .. } | Owner::Flat { .. } => self.units.push(Unit::new(label.clone(), i, Class::Gemm, reads, vec![result.clone()]).with_geometry(Some(geo))),
+            Owner::Tile { .. } | Owner::Flat { .. } => self.units.push(Unit::new(label.clone(), i, Class::Gemm, reads, vec![result.clone()]).with_geometry(Some(geo)).with_part(Part::Main)),
         }
         if residual {
-            self.units.push(Unit::new(format!("{label} residual"), i, Class::Elementwise, vec![result, out.clone()], vec![out]));
+            self.units.push(Unit::new(format!("{label} residual"), i, Class::Elementwise, vec![result, out.clone()], vec![out]).with_part(Part::Residual));
         } else if act {
-            self.units.push(Unit::new(format!("{label} act"), i, Class::Elementwise, vec![result], vec![out]));
+            self.units.push(Unit::new(format!("{label} act"), i, Class::Elementwise, vec![result], vec![out]).with_part(Part::Act));
         }
         Ok(())
     }
@@ -370,13 +395,13 @@ impl Lower<'_> {
             let normed = self.local("qk normed".into(), Rows::Tokens, qkv.cols, Form::F32);
             let mut reads = vec![qkv.clone()];
             reads.extend(self.signer.qk_weights());
-            self.units.push(Unit::new("qk norm", i, Class::RowReduce, reads, vec![normed.clone()]).with_row(a.head_dim));
+            self.units.push(Unit::new("qk norm", i, Class::RowReduce, reads, vec![normed.clone()]).with_row(a.head_dim).with_part(Part::QkNorm));
             src = normed;
         }
-        self.units.push(Unit::new("rope", i, Class::Elementwise, vec![src], vec![qkv.clone()]));
+        self.units.push(Unit::new("rope", i, Class::Elementwise, vec![src], vec![qkv.clone()]).with_part(Part::Rope));
         let caches = self.signer.caches(self.layer, Rows::Tokens);
         if !caches.is_empty() {
-            self.units.push(Unit::new("kv write", i, Class::Elementwise, vec![qkv], caches));
+            self.units.push(Unit::new("kv write", i, Class::Elementwise, vec![qkv], caches).with_part(Part::KvWrite));
         }
     }
 
@@ -389,9 +414,9 @@ impl Lower<'_> {
         let mut reads = vec![self.signer.qkv()];
         reads.extend(self.signer.caches(self.layer, Rows::Context));
         let geo = Geometry { col_blocks: a.kv_heads * splits, rows_block: 1, owner: Owner::Split { serial: group }, smem: 0, regs: BASE_REGS };
-        self.units.push(Unit::new("attention split", i, Class::Attention, reads, vec![parts.clone()]).with_geometry(Some(geo)));
+        self.units.push(Unit::new("attention split", i, Class::Attention, reads, vec![parts.clone()]).with_geometry(Some(geo)).with_part(Part::Split));
         let out = self.signer.signature(op, self.layer)?.writes.last().cloned().expect("decode attention writes its output");
-        let mut combine = Unit::new("attention combine", i, Class::Elementwise, vec![parts], vec![out]).with_row(a.head_dim);
+        let mut combine = Unit::new("attention combine", i, Class::Elementwise, vec![parts], vec![out]).with_row(a.head_dim).with_part(Part::Combine);
         combine.bound = true;
         self.units.push(combine);
         Ok(())
@@ -468,12 +493,15 @@ fn values(units: &[Unit], internal: &BTreeSet<Place>) -> Vec<Value> {
     out
 }
 
+pub type Library<'a> = &'a dyn Fn(&[&Unit]) -> bool;
+
 struct Engine<'a> {
     units: &'a [Unit],
     values: Vec<Value>,
     groups: Vec<BTreeSet<usize>>,
     costs: &'a Costs,
     count: Count,
+    library: Option<Library<'a>>,
 }
 
 struct Candidate {
@@ -497,6 +525,19 @@ impl Engine<'_> {
 
     fn launches(&self, g: &BTreeSet<usize>) -> usize {
         if g.len() == 1 { self.units[*g.first().unwrap()].launches } else { 1 }
+    }
+
+    fn ops(&self, g: &BTreeSet<usize>) -> Vec<usize> {
+        let ops: BTreeSet<usize> = g.iter().map(|&u| self.units[u].op).collect();
+        ops.into_iter().collect()
+    }
+
+    fn realisable(&self, merged: &BTreeSet<usize>) -> Result<(), Reason> {
+        let units: Vec<&Unit> = merged.iter().map(|&u| &self.units[u]).collect();
+        match self.library {
+            Some(library) if !library(&units) => Err(Reason::NoKernel),
+            _ => Ok(()),
+        }
     }
 
     fn heavy(&self, g: &BTreeSet<usize>) -> Option<usize> {
@@ -619,6 +660,7 @@ impl Engine<'_> {
             if self.boundary(&merged) {
                 return Err(Reason::Boundary);
             }
+            self.realisable(&merged)?;
             heavies.push((c, h));
         }
         if produced.iter().any(|v| v.live) {
@@ -687,6 +729,7 @@ impl Engine<'_> {
         if merged.iter().any(|&u| self.units[u].opaque()) {
             return Err(Reason::Opaque);
         }
+        self.realisable(merged)?;
         if rule == Rule::Pair {
             return Err(Reason::TwoHeavy);
         }
@@ -836,14 +879,14 @@ impl Engine<'_> {
 
 const PHASES: [&[Rule]; 2] = [&[Rule::Epilogue, Rule::Light], &[Rule::Prologue]];
 
-fn fuse_section(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, repeats: usize) -> SectionFusion {
+fn fuse_section(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, repeats: usize, library: Option<Library>) -> SectionFusion {
     let vals = values(&units, internal);
-    let mut engine = Engine { units: &units, values: vals, groups: (0..units.len()).map(|u| BTreeSet::from([u])).collect(), costs, count };
+    let mut engine = Engine { units: &units, values: vals, groups: (0..units.len()).map(|u| BTreeSet::from([u])).collect(), costs, count, library };
     let launches_before = units.iter().map(|u| u.launches).sum();
     let (fused, seen) = engine.run();
     let mut ordered = engine.groups.clone();
     ordered.sort_by_key(|g| (g.iter().copied().find(|&u| units[u].heavy()).unwrap_or(*g.first().unwrap()), g.len()));
-    let groups: Vec<Group> = ordered.iter().map(|g| Group { units: engine.labels(g), launches: engine.launches(g) }).collect();
+    let groups: Vec<Group> = ordered.iter().map(|g| Group { units: engine.labels(g), members: g.iter().copied().collect(), ops: engine.ops(g), launches: engine.launches(g) }).collect();
     let together = |d: &Decision| groups.iter().any(|g| d.producer.iter().chain(d.consumers.iter().flatten()).all(|u| g.units.contains(u)));
     let mut rejected: Vec<Decision> = Vec::new();
     for d in seen.into_iter().filter(|d| d.verdict.is_err() && !together(d)) {
@@ -856,17 +899,31 @@ fn fuse_section(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, cou
     SectionFusion { name, repeats, units, groups, fused, rejected, launches_before, launches_after }
 }
 
+pub struct Section<'a> {
+    pub name: String,
+    pub repeats: usize,
+    pub phase: Phase,
+    pub layer: usize,
+    pub ops: &'a [Op],
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fuse_ops(spec: &Spec, signer: &Signer, target: &kir::Target, count: Count, costs: &Costs, section: Section, library: Option<Library>) -> Result<SectionFusion> {
+    let mut lower = Lower { spec, signer, target, count, phase: section.phase, layer: section.layer, units: Vec::new(), internal: BTreeSet::new() };
+    for (i, op) in section.ops.iter().enumerate() {
+        lower.op(i, op)?;
+    }
+    let Lower { mut units, internal, .. } = lower;
+    unique_labels(&mut units);
+    Ok(fuse_section(units, &internal, costs, count, section.name, section.repeats, library))
+}
+
 pub fn fusion_report(spec: &Spec, plan: &Plan, count: Count, target: &kir::Target, costs: &Costs) -> Result<FusionReport> {
     let signer = Signer::new(spec)?.ranked(ranked(plan));
     let mut out = Vec::new();
     for s in sections(spec, plan).into_iter().filter(|s| !s.ops.is_empty()) {
-        let mut lower = Lower { spec, signer: &signer, target, count, phase: plan.phase, layer: s.layer, units: Vec::new(), internal: BTreeSet::new() };
-        for (i, op) in s.ops.iter().enumerate() {
-            lower.op(i, op)?;
-        }
-        let Lower { mut units, internal, .. } = lower;
-        unique_labels(&mut units);
-        out.push(fuse_section(units, &internal, costs, count, s.name, s.repeats));
+        let section = Section { name: s.name, repeats: s.repeats, phase: plan.phase, layer: s.layer, ops: s.ops };
+        out.push(fuse_ops(spec, &signer, target, count, costs, section, None)?);
     }
     Ok(FusionReport { phase: plan.phase, count, costs: *costs, sections: out })
 }

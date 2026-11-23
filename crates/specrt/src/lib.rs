@@ -14,6 +14,7 @@ pub mod coordinator;
 pub mod direct;
 pub mod discovery;
 pub mod codegen;
+pub mod compile;
 pub mod gemm;
 pub mod engine;
 pub mod executor;

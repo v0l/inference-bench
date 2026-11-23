@@ -246,7 +246,7 @@ impl<'a> Signer<'a> {
         let rows = if weight == Weight::LmHead { Rows::Out } else { Rows::Tokens };
         let out_cols = match s.epi {
             _ if head => self.spec.dims.vocab,
-            Epilogue::Act if output.is_planes() => self.spec.gate_up_out(s.n),
+            Epilogue::Act if output.holds_activation() => self.spec.gate_up_out(s.n),
             _ => s.n,
         };
         let mut reads = vec![Tensor::buf(input, rows, s.k), Tensor::weight(weight.name(), weight.rows(self.spec), s.k, Form::Weight(q))];
@@ -417,6 +417,23 @@ impl<'a> Signer<'a> {
                 sig(Class::Elementwise, vec![logits.clone()], vec![logits])
             }
             Op::Linear { weight, quant, input, output } => self.linear(weight, quant, input, output, layer),
+            Op::Gemv { norm, weight, quant, input, output } => {
+                let mut s = self.linear(weight, quant, input, output, layer);
+                if let Some(which) = norm {
+                    let rows = s.reads[0].rows;
+                    s.reads[0] = Tensor::buf(Buf::X, rows, h);
+                    s.reads.push(self.norm_weight(which));
+                }
+                s
+            }
+            Op::StepAttention => self.attention(layer, true, Tensor::buf(Buf::Attn, Rows::Tokens, spec.q_dim())),
+            Op::GdnStep => {
+                let mut s = self.gdn();
+                if let Some(planes) = s.writes.iter_mut().find(|t| t.place == Place::Buf(Buf::GdnPlanes)) {
+                    *planes = Tensor::buf(Buf::Gdn, Rows::Tokens, planes.cols);
+                }
+                s
+            }
             Op::KvRope | Op::QkRope | Op::DecodeRope => {
                 let (reads, writes) = self.rope(layer);
                 sig(Class::Elementwise, reads, writes)
@@ -460,7 +477,7 @@ pub struct Section<'p> {
     pub ops: &'p [Op],
 }
 
-fn layers_using(spec: &Spec, layers: &[String], sparse: bool) -> Vec<usize> {
+pub(crate) fn layers_using(spec: &Spec, layers: &[String], sparse: bool) -> Vec<usize> {
     (0..spec.layers.count)
         .filter(|&i| layers.iter().any(|l| l == spec.block(i).name()) && spec.moe.as_ref().is_some_and(|m| m.is_sparse(i) && spec.has_mlp(i)) == sparse)
         .collect()

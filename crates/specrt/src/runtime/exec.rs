@@ -11,33 +11,24 @@ pub(super) struct Plans {
     pub prefill: Plan,
     pub decode: Plan,
     pub verify: Plan,
+    pub single: std::result::Result<Plan, String>,
 }
 
 impl Plans {
-    pub fn build(spec: &Spec, tensor_core: bool) -> Self {
-        Plans {
-            prefill: Plan::build(spec, Phase::Prefill, tensor_core),
-            decode: Plan::build(spec, Phase::Decode, tensor_core),
-            verify: Plan::build(spec, Phase::Verify, tensor_core),
-        }
-    }
-}
-
-impl Plans {
-    pub fn for_tp(self, shards: &std::collections::BTreeMap<String, crate::tp::Shard>, fuse: bool) -> Self {
-        Plans { prefill: self.prefill.for_tp(shards, fuse), decode: self.decode.for_tp(shards, fuse), verify: self.verify.for_tp(shards, fuse) }
+    pub fn compile(spec: &Spec, tensor_core: bool, target: &kir::Target, opts: &crate::compile::Options, role: super::StageRole) -> Result<Self> {
+        let build = |phase| -> Result<Plan> { Ok(Self::staged(crate::compile::compile(spec, Plan::build(spec, phase, tensor_core), target, opts)?, role)) };
+        let single = crate::compile::single(spec, target, opts.context).map(|p| Self::staged(p, role)).map_err(|e| format!("{e:#}"));
+        Ok(Plans { prefill: build(Phase::Prefill)?, decode: build(Phase::Decode)?, verify: build(Phase::Verify)?, single })
     }
 
-    pub fn for_stage(mut self, role: super::StageRole) -> Self {
-        for plan in [&mut self.prefill, &mut self.decode, &mut self.verify] {
-            if !role.first {
-                plan.head.clear();
-            }
-            if !role.last {
-                plan.tail.clear();
-            }
+    fn staged(mut plan: Plan, role: super::StageRole) -> Plan {
+        if !role.first {
+            plan.head.clear();
         }
-        self
+        if !role.last {
+            plan.tail.clear();
+        }
+        plan
     }
 }
 
@@ -120,6 +111,7 @@ impl Runtime {
             Op::MoeCombine => self.moe_combine(if self.comm.is_some() { &self.partial } else { &self.pre.x }, n),
             Op::AllReduce => self.allreduce_op(n),
             Op::AllReduceNorm { which } => self.allreduce_norm_op(which, layer, n),
+            Op::Gemv { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
         }
     }
 
@@ -335,14 +327,14 @@ impl Runtime {
         self.comm().allreduce_add_norm(&self.stream, &self.partial.slice(..n), &self.pre.x.slice(..n), weight, &planes.hi.slice(..n), &planes.lo.slice(..n), rows)
     }
 
-    fn attn_of<'a>(&self, layer: Option<&'a DeviceLayer>) -> &'a DeviceAttn {
+    pub(super) fn attn_of<'a>(&self, layer: Option<&'a DeviceLayer>) -> &'a DeviceAttn {
         match &layer.expect("attention ops run inside a layer").mixer {
             DeviceMixer::Attention(a) => a,
             _ => unreachable!("attention op on a linear layer"),
         }
     }
 
-    fn gdn_of<'a>(&self, layer: Option<&'a DeviceLayer>) -> &'a super::DeviceGdn {
+    pub(super) fn gdn_of<'a>(&self, layer: Option<&'a DeviceLayer>) -> &'a super::DeviceGdn {
         match &layer.expect("linear ops run inside a layer").mixer {
             DeviceMixer::Linear(g) => g,
             _ => unreachable!("linear op on an attention layer"),
@@ -369,7 +361,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn norm_weight<'a>(&'a self, which: NormKind, layer: Option<&'a DeviceLayer>) -> &'a CudaSlice<f32> {
+    pub(super) fn norm_weight<'a>(&'a self, which: NormKind, layer: Option<&'a DeviceLayer>) -> &'a CudaSlice<f32> {
         let l = || layer.expect("layer norm runs inside a layer");
         match which {
             NormKind::Input => &l().ln1,
@@ -485,7 +477,7 @@ impl Runtime {
         }
     }
 
-    fn weight_of<'a>(&'a self, weight: Weight, layer: Option<&'a DeviceLayer>) -> (&'a DeviceMatrix, Option<&'a CudaSlice<f32>>) {
+    pub(super) fn weight_of<'a>(&'a self, weight: Weight, layer: Option<&'a DeviceLayer>) -> (&'a DeviceMatrix, Option<&'a CudaSlice<f32>>) {
         let attn = || self.attn_of(layer);
         let gdn = || self.gdn_of(layer);
         let layer_of = || layer.expect("layer weights need a layer");

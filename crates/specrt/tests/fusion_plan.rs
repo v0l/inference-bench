@@ -95,7 +95,7 @@ fn prefill_selects_the_tile_epilogues_and_the_rope_chain() {
 fn tensor_parallel_decode_finds_the_allreduce_norm() {
     let spec = dense();
     let shards = specrt::graph::Graph::decoder().shards().unwrap();
-    let plan = Plan::build(&spec, Phase::Decode, true).for_tp(&shards, false);
+    let plan = specrt::compile::partition_plan(&spec, Plan::build(&spec, Phase::Decode, true), &shards);
     let r = with_costs(&spec, &plan, 1, &sm120(), &Costs::for_target(&sm120()));
     assert_groups(&r, "layer", &[&["allreduce", "post attention norm"], &["o", "o residual"]]);
     let layer = section(&r, "layer");

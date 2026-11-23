@@ -18,6 +18,7 @@ mod exec;
 mod fused;
 mod moe;
 mod mtp;
+mod single;
 pub(crate) mod snapshot;
 mod stage;
 mod step;
@@ -878,26 +879,7 @@ fn cfg(grid: u32, block: u32) -> LaunchConfig {
     LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: 0 }
 }
 
-const LINEAR_ROWS_PER_BLOCK: usize = 8;
-const FP4_GEMV_THREADS: u32 = crate::codegen::FP4_GEMV_THREADS;
-
-fn gemv_cfg(name: &str, rows: usize, w: &DeviceMatrix, sms: u32) -> LaunchConfig {
-    if name == "lm_head_norm_f4" {
-        let per_block = FP4_GEMV_THREADS as usize / 32 * if rows.is_multiple_of(2) { 2 } else { 1 };
-        cfg(grid(rows, per_block), FP4_GEMV_THREADS)
-    } else if name.ends_with("_f4") {
-        cfg(grid(rows, FP4_GEMV_THREADS as usize / 32), FP4_GEMV_THREADS)
-    } else {
-        let format = w.kind().format();
-        let pair = format.gemv_rows();
-        let per_warp = if name.starts_with("gate_up_act") || !rows.is_multiple_of(pair) { 1 } else { pair };
-        let blocks = grid(rows, LINEAR_ROWS_PER_BLOCK * per_warp);
-        let cap = if format == crate::codegen::WeightFormat::Ggml { sms * GEMV_BLOCKS_PER_SM } else { u32::MAX };
-        cfg(blocks.min(cap), 256)
-    }
-}
-
-const GEMV_BLOCKS_PER_SM: u32 = 8;
+const GEMV_BLOCKS_PER_SM: u32 = crate::gemm::GEMV_BLOCKS_PER_SM;
 const PREFILL_CHUNK: usize = 2048;
 const STATE_FREE_MARGIN: usize = 256 << 20;
 const ATTN_SPLITS: usize = 64;
@@ -1245,9 +1227,12 @@ impl Runtime {
             sms,
             target,
             use_mma,
-            plans: match tp {
-                Some(_) => Plans::build(spec, use_mma).for_stage(role).for_tp(&crate::graph::Graph::decoder().shards()?, spec.runtime.fuse),
-                None => Plans::build(spec, use_mma).for_stage(role),
+            plans: {
+                let opts = match tp {
+                    Some(_) => crate::compile::Options::ranked(crate::graph::Graph::decoder().shards()?, spec.runtime.fuse, max_ctx),
+                    None => crate::compile::Options::planes(max_ctx),
+                };
+                Plans::compile(spec, use_mma, &target, &opts, role)?
             },
             partial: stream.alloc_zeros(if tp.is_some() { chunk * d.hidden } else { 1 })?,
             head_part: match (&spec.dims.head_rows, tp) {
@@ -1528,130 +1513,8 @@ impl Runtime {
         Ok(())
     }
 
-    fn linear(
-        &self,
-        name: &str,
-        w: &DeviceMatrix,
-        bias: Option<&CudaSlice<f32>>,
-        x: &CudaSlice<f32>,
-        out: &CudaSlice<f32>,
-        rows: usize,
-    ) -> Result<()> {
-        let mut b = self.launcher(self.kernel(name));
-        w.args(&mut b, &self.buf.dummy);
-        b.arg(bias.unwrap_or(&self.buf.dummy)).arg(x).arg(out);
-        unsafe { b.launch(gemv_cfg(name, rows, w, self.sms)) }?;
-        Ok(())
-    }
-
-    fn linear_norm(
-        &self,
-        name: &str,
-        w: &DeviceMatrix,
-        bias: Option<&CudaSlice<f32>>,
-        x: &CudaSlice<f32>,
-        norm: &CudaSlice<f32>,
-        out: &CudaSlice<f32>,
-        rows: usize,
-    ) -> Result<()> {
-        let mut b = self.launcher(self.kernel(name));
-        w.args(&mut b, &self.buf.dummy);
-        if !name.starts_with("gate_up_act") {
-            b.arg(bias.unwrap_or(&self.buf.dummy));
-        }
-        b.arg(x).arg(norm).arg(out);
-        unsafe { b.launch(gemv_cfg(name, rows, w, self.sms)) }?;
-        Ok(())
-    }
-
     fn step(&self) -> Result<()> {
         self.step_traced(None)
-    }
-
-    fn mlp_decode(&self, l: &DeviceLayer) -> Result<()> {
-        if l.moe.is_some() {
-            return self.moe_block(l, &self.buf.x, &self.buf.token, 1);
-        }
-        let s = &self.spec;
-        let buf = &self.buf;
-        let fp4 = matches!(l.gate_up, DeviceMatrix::Fp4 { .. });
-        let (act, down) = if fp4 { ("gate_up_act_f4", "down_proj_f4") } else { ("gate_up_act", "down_proj") };
-        if s.norm.pre {
-            let pre = l.ln_pre_mlp.as_ref().unwrap_or(&l.ln2);
-            self.linear_norm(act, &l.gate_up, None, &buf.x, pre, &buf.act, s.dims.intermediate)?;
-        } else {
-            self.linear("gate_up_proj", &l.gate_up, None, &buf.x, &buf.gate_up, 2 * s.dims.intermediate)?;
-            let mut b = self.launcher(self.kernel("swiglu"));
-            b.arg(&buf.gate_up).arg(&buf.act);
-            unsafe { b.launch(cfg(grid(s.dims.intermediate, 256), 256)) }?;
-        }
-        if s.uses_branch() {
-            self.clear_branch()?;
-            self.linear(down, &l.down, None, &buf.act, &self.pre.branch, s.dims.hidden)?;
-            return self.merge_branch(l.ln_post_mlp.as_ref());
-        }
-        self.linear(down, &l.down, None, &buf.act, &buf.x, s.dims.hidden)
-    }
-
-    fn merge_branch(&self, post: Option<&CudaSlice<f32>>) -> Result<()> {
-        match post {
-            Some(weight) => self.add_normed_branch(weight),
-            None => {
-                let mut b = self.launcher(self.kernel("residual_add"));
-                b.arg(&self.buf.x).arg(&self.pre.branch).arg(&self.buf.x);
-                unsafe { b.launch(cfg(grid(self.spec.dims.hidden, 256), 256)) }?;
-                Ok(())
-            }
-        }
-    }
-
-    fn clear_branch(&self) -> Result<()> {
-        let hidden = self.spec.dims.hidden;
-        let mut b = self.launcher(self.kernel("clear_branch"));
-        b.arg(&self.pre.branch).arg(&self.pre.branch);
-        unsafe { b.launch(cfg(grid(hidden, 256), 256)) }?;
-        Ok(())
-    }
-
-    fn add_normed_branch(&self, weight: &CudaSlice<f32>) -> Result<()> {
-        let mut b = self.launcher(self.kernel("norm_add"));
-        b.arg(&self.pre.branch).arg(weight).arg(&self.buf.x).arg(&self.buf.x);
-        unsafe { b.launch(cfg(1, 1024)) }?;
-        Ok(())
-    }
-
-    fn attention_out_decode(&self, l: &DeviceAttn, layer: &DeviceLayer) -> Result<()> {
-        let hidden = self.spec.dims.hidden;
-        if self.spec.uses_branch() {
-            self.clear_branch()?;
-            self.linear("o_proj", &l.o, l.o_bias.as_ref(), &self.buf.attn, &self.pre.branch, hidden)?;
-            return self.merge_branch(self.spec.norm.sandwich.then_some(&layer.ln2));
-        }
-        self.linear("o_proj", &l.o, l.o_bias.as_ref(), &self.buf.attn, &self.buf.x, hidden)
-    }
-
-    fn qk_norm_decode(&self, l: &DeviceAttn) -> Result<()> {
-        if !self.spec.attention.qk_norm_full {
-            return Ok(());
-        }
-        for (name, w) in [("q_norm_rows", &l.q_norm), ("k_norm_rows", &l.k_norm)] {
-            let mut b = self.launcher(self.kernel(name));
-            b.arg(&self.buf.qkv).arg(w.as_ref().expect("full-width qk norm has weights")).arg(&self.buf.qkv);
-            unsafe { b.launch(cfg(1, 1024)) }?;
-        }
-        Ok(())
-    }
-
-    fn softcap_decode(&self) -> Result<()> {
-        let vocab = self.spec.dims.vocab;
-        for (present, name) in [(self.spec.dims.logit_scale.is_some(), "logit_scale"), (self.spec.dims.logit_softcap.is_some(), "logit_softcap")] {
-            if present {
-                let mut b = self.launcher(self.kernel(name));
-                b.arg(&self.buf.logits).arg(&self.buf.logits);
-                unsafe { b.launch(cfg(grid(vocab, 256), 256)) }?;
-            }
-        }
-        Ok(())
     }
 
     fn trace_layer(&self, trace: Option<&CudaSlice<f32>>, layer: usize, tokens: usize) -> Result<()> {
@@ -1670,31 +1533,6 @@ impl Runtime {
         Ok(())
     }
 
-    fn gdn_decode(&self, g: &DeviceGdn, ln1: &CudaSlice<f32>, x: &CudaSlice<f32>) -> Result<()> {
-        let gb = self.gdn.as_ref().expect("linear layers have gdn buffers");
-        let la = &gb.la;
-        self.linear_norm("lin_in_norm", &g.in_proj, None, x, ln1, &gb.lin, la.in_proj_rows())?;
-        self.linear_norm("lin_ba_norm", &g.ba, None, x, ln1, &gb.ba, la.ba_rows())?;
-        let zero = 0i32;
-        let mut b = self.launcher(self.kernel("gdn_conv_step"));
-        b.arg(&gb.lin).arg(&g.conv).arg(&*gb.conv_state).arg(&gb.mix).arg(&g.slot).arg(&zero).arg(&self.buf.zero_slots);
-        unsafe { b.launch(cfg(grid(la.conv_dim(), 256), 256)) }?;
-        let mut b = self.launcher(self.kernel("gdn_step"));
-        b.arg(&gb.mix)
-            .arg(&gb.lin)
-            .arg(&gb.ba)
-            .arg(&g.neg_a)
-            .arg(&g.dt_bias)
-            .arg(&g.norm)
-            .arg(&*gb.ssm_state)
-            .arg(&gb.out)
-            .arg(&g.slot)
-            .arg(&zero)
-            .arg(&self.buf.zero_slots);
-        unsafe { b.launch(cfg(la.value_heads as u32, (la.value_head_dim * self.linear_tuning.ksplit) as u32)) }?;
-        self.linear("lin_out_proj", &g.out, None, &gb.out, x, self.spec.dims.hidden)
-    }
-
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
         ensure!(self.head_part.is_none(), "a vocabulary sharded rank decodes through the plan, not the single stream step");
         ensure!(self.spec.requanted_linears().is_empty(), "requantised attention and delta-net projections run on the plan decode path (the scheduler), not the single stream step");
@@ -1708,88 +1546,8 @@ impl Runtime {
                 self.copy_rows(&self.pre.x.slice(..n), &trace.slice(i * n..(i + 1) * n), n)
             });
         }
-        let s = &self.spec;
-        let a = &s.attention;
-        let buf = &self.buf;
-        let mut b = self.launcher(self.kernel("embed"));
-        b.arg(&self.embed).arg(&buf.token).arg(&buf.x);
-        unsafe { b.launch(cfg(grid(s.dims.hidden, 256), 256)) }?;
-        let qkv_rows = s.qkv_rows();
-        for (i, layer) in self.layers.iter().enumerate() {
-            self.enter_layer(i)?;
-            let l = match &layer.mixer {
-                DeviceMixer::Linear(g) => {
-                    self.gdn_decode(g, &layer.ln1, &buf.x)?;
-                    self.mlp_decode(layer)?;
-                    self.trace_layer(trace, i, 1)?;
-                    self.leave_layer(i)?;
-                    continue;
-                }
-                DeviceMixer::Attention(l) => l,
-                DeviceMixer::Described(_) | DeviceMixer::None => unreachable!("a described mixer is refused above"),
-            };
-            let kv_layer = l.kv;
-            let window = l.window;
-            let table = self.slot_table(self.seq as usize);
-            let (pages, mm_stride) = (self.pages as i32, self.max_ctx as i32);
-            if s.norm.pre {
-                self.linear_norm("qkv_proj_norm", &l.qkv, l.qkv_bias.as_ref(), &buf.x, &layer.ln1, &buf.qkv, qkv_rows)?;
-            } else {
-                self.linear("qkv_proj", &l.qkv, l.qkv_bias.as_ref(), &buf.x, &buf.qkv, qkv_rows)?;
-            }
-            self.qk_norm_decode(l)?;
-            let mut b = self.launcher(self.kernel("qk_norm_rope"));
-            b.arg(&buf.qkv)
-                .arg(l.q_norm.as_ref().unwrap_or(&buf.dummy))
-                .arg(l.k_norm.as_ref().unwrap_or(&buf.dummy))
-                .arg(buf.k_cache())
-                .arg(buf.v_cache())
-                .arg(&table)
-                .arg(&buf.pos)
-                .arg(&buf.zero_slots)
-                .arg(&kv_layer)
-                .arg(&0i32)
-                .arg(&pages)
-                .arg(&mm_stride)
-                .arg(&self.mm_meta)
-                .arg(&self.mm_table)
-                .arg(&self.seq);
-            unsafe { b.launch(cfg((a.heads + 2 * a.kv_heads) as u32, a.head_dim.max(32) as u32)) }?;
-            let mut b = self.launcher(self.kernel("attention_split"));
-            b.arg(&buf.qkv)
-                .arg(buf.k_cache())
-                .arg(buf.v_cache())
-                .arg(&table)
-                .arg(&buf.pos)
-                .arg(&kv_layer)
-                .arg(&buf.attn_part)
-                .arg(&window);
-            unsafe {
-                b.launch(LaunchConfig {
-                    grid_dim: (a.kv_heads as u32, ATTN_SPLITS as u32, 1),
-                    block_dim: (ATTN_BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                })
-            }?;
-            let mut b = self.launcher(self.kernel("attention_reduce"));
-            b.arg(&buf.attn_part).arg(&buf.pos).arg(&buf.qkv).arg(&buf.attn).arg(&window);
-            unsafe { b.launch(cfg(a.heads as u32, a.head_dim.max(32) as u32)) }?;
-            self.attention_out_decode(l, layer)?;
-            self.mlp_decode(layer)?;
-            self.trace_layer(trace, i, 1)?;
-            self.leave_layer(i)?;
-        }
-        let head_kernel = if matches!(self.lm_head, DeviceMatrix::Fp4 { .. }) { "lm_head_norm_f4" } else { "lm_head_norm" };
-        self.linear_norm(
-            head_kernel,
-            &self.lm_head,
-            None,
-            &buf.x,
-            &self.norm,
-            &buf.logits,
-            s.dims.vocab,
-        )?;
-        self.softcap_decode()
+        let plan = self.plans.single.as_ref().map_err(|e| anyhow::anyhow!("the single stream step has no plan: {e}"))?;
+        crate::executor::run_plan(self, plan, &single::Single, &mut |i| self.trace_layer(trace, i, 1))
     }
 
     fn gemm(

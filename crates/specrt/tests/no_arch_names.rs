@@ -107,6 +107,38 @@ fn architecture_names_stay_inside_the_allowlist() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+const PASS_FILES: &[&str] = &["specrt/src/compile.rs", "specrt/src/fusion.rs", "specrt/src/signature.rs", "kir/src/heavy.rs"];
+
+const PASS_FORBIDDEN: &[&str] = &["Block::", "spec.attention.qk_norm_full", "spec.norm.sandwich", "spec.moe", "spec.linear_attention", "DeviceMatrix"];
+
+#[test]
+fn pass_and_cost_files_name_no_architecture() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut failures = Vec::new();
+    for rel in PASS_FILES {
+        let text = std::fs::read_to_string(crates.join(rel)).unwrap();
+        for (n, line) in text.lines().enumerate() {
+            let lower = line.to_lowercase();
+            if let Some(name) = NAMES.iter().find(|name| lower.contains(*name)) {
+                failures.push(format!("{rel}:{}: names {name}", n + 1));
+            }
+        }
+        if *rel != "specrt/src/signature.rs" {
+            for f in PASS_FORBIDDEN.iter().filter(|f| text.contains(*f)) {
+                failures.push(format!("{rel}: reads {f}, a pass reads signatures and the target only"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn the_pass_guard_sees_a_planted_name() {
+    let lower = "if spec.name.contains(\"qwen\") {".to_lowercase();
+    assert!(NAMES.iter().any(|n| lower.contains(n)));
+    assert!(PASS_FORBIDDEN.iter().any(|f| "match spec.block(i) { Block::Linear => }".contains(f)));
+}
+
 #[test]
 fn allowlist_has_no_stale_entries() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();

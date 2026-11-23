@@ -105,7 +105,7 @@ fn tensor_parallel_plans_validate() {
     for (name, spec) in specs().into_iter().filter(|(_, s)| !s.uses_branch()) {
         for fuse in [false, true] {
             for phase in [Phase::Prefill, Phase::Decode] {
-                let plan = Plan::build(&spec, phase, true).for_tp(&shards, fuse);
+                let plan = specrt::compile::compile(&spec, Plan::build(&spec, phase, true), &kir::Target::sm_120(), &specrt::compile::Options::ranked(shards.clone(), fuse, 4096)).unwrap();
                 validate_plan(&plan, &spec).unwrap_or_else(|e| panic!("{name} tp fuse={fuse} {phase:?}: {e:#}"));
                 checked += 1;
             }

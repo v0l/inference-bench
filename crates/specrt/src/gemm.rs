@@ -159,6 +159,74 @@ pub fn select(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, we
     select_act(spec, target, linear, tokens, weight, true)
 }
 
+pub const GEMV_BLOCKS_PER_SM: u32 = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GemvLaunch {
+    pub name: &'static str,
+    pub rows: usize,
+    pub threads: u32,
+    pub rows_per_block: usize,
+    pub blocks_per_sm: Option<u32>,
+    pub bias: bool,
+    pub act: bool,
+}
+
+impl GemvLaunch {
+    pub fn grid(&self, sms: u32) -> u32 {
+        let blocks = self.rows.div_ceil(self.rows_per_block) as u32;
+        self.blocks_per_sm.map_or(blocks, |b| blocks.min(sms * b))
+    }
+}
+
+fn gemv_name(linear: &str, normed: bool, fp4: bool, gdn: bool) -> Option<(&'static str, bool)> {
+    let fp4_name = match (linear, normed) {
+        ("gate_up", true) => Some("gate_up_act_f4"),
+        ("lm_head", true) => Some("lm_head_norm_f4"),
+        ("down", false) => Some("down_proj_f4"),
+        _ => None,
+    };
+    if fp4 {
+        return fp4_name.map(|n| (n, true));
+    }
+    let name = match (linear, normed) {
+        ("qkv", true) => "qkv_proj_norm",
+        ("gate_up", true) => "gate_up_act",
+        ("lm_head", true) => "lm_head_norm",
+        ("lin_in", true) if gdn => "lin_in_norm",
+        ("lin_ba", true) if gdn => "lin_ba_norm",
+        ("qkv", false) => "qkv_proj",
+        ("o", false) => "o_proj",
+        ("gate_up", false) => "gate_up_proj",
+        ("down", false) => "down_proj",
+        ("lin_out", false) if gdn => "lin_out_proj",
+        ("lm_head", false) => "lm_head",
+        _ => return None,
+    };
+    Some((name, false))
+}
+
+pub fn gemv(spec: &Spec, linear: &str, weight: WeightKind, normed: bool) -> Option<GemvLaunch> {
+    let s = linear_shape(spec, linear);
+    if normed && s.epi == Epilogue::Map {
+        return None;
+    }
+    let (name, fp4) = gemv_name(linear, normed, weight == WeightKind::Fp4, spec.linear_attention.is_some())?;
+    let act = normed && s.epi == Epilogue::Act;
+    let rows = if act { spec.gate_up_out(s.n) } else { s.n };
+    let (threads, rows_per_block, blocks_per_sm) = if fp4 {
+        let pair = if s.epi == Epilogue::Store && rows.is_multiple_of(2) { 2 } else { 1 };
+        (FP4_GEMV_THREADS, FP4_GEMV_THREADS as usize / 32 * pair, None)
+    } else {
+        let format = weight.format();
+        let pair = format.gemv_rows();
+        let per_warp = if act || !rows.is_multiple_of(pair) { 1 } else { pair };
+        let threads = kir::gemv::GEMV_THREADS;
+        (threads, threads as usize / 32 * per_warp, (format == WeightFormat::Ggml).then_some(GEMV_BLOCKS_PER_SM))
+    };
+    Some(GemvLaunch { name, rows, threads, rows_per_block, blocks_per_sm, bias: !act, act })
+}
+
 pub fn select_act(spec: &Spec, target: &kir::Target, linear: &str, tokens: usize, weight: WeightKind, act: bool) -> Result<KernelChoice> {
     let policy = Policy { fp4_act: policy(spec).fp4_act && act, ..policy(spec) };
     kg::select(target, &policy, &request(spec, linear, tokens, weight)).map_err(anyhow::Error::msg)

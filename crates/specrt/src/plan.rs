@@ -29,6 +29,7 @@ pub enum Buf {
     FcPlanes,
     MtpLogits,
     Partial,
+    Gdn,
 }
 
 impl Buf {
@@ -53,11 +54,16 @@ impl Buf {
             Buf::FcPlanes => "fc planes",
             Buf::MtpLogits => "draft logits",
             Buf::Partial => "rank partial",
+            Buf::Gdn => "gdn",
         }
     }
 
     pub fn is_planes(self) -> bool {
         matches!(self, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes)
+    }
+
+    pub fn holds_activation(self) -> bool {
+        self.is_planes() || self == Buf::Act
     }
 }
 
@@ -240,6 +246,9 @@ pub enum Op {
     MoeCombine,
     AllReduce,
     AllReduceNorm { which: NormKind },
+    Gemv { norm: Option<NormKind>, weight: Weight, quant: QuantSource, input: Buf, output: Buf },
+    StepAttention,
+    GdnStep,
 }
 
 pub fn weight_kind(q: Quant) -> WeightKind {
@@ -288,6 +297,10 @@ impl Op {
             Op::MoeCombine => "combine".into(),
             Op::AllReduce => "allreduce".into(),
             Op::AllReduceNorm { .. } => "allreduce, add and norm".into(),
+            Op::Gemv { norm: Some(_), weight, .. } => format!("norm and {}", weight.name()),
+            Op::Gemv { weight, .. } => weight.name().into(),
+            Op::StepAttention => "step attention".into(),
+            Op::GdnStep => "delta rule step".into(),
         }
     }
 
@@ -317,6 +330,10 @@ impl Op {
             Op::MoeCombine => "expert outputs to x".into(),
             Op::AllReduce => "rank partials summed into x".into(),
             Op::AllReduceNorm { .. } => "rank partials summed into x, x to xn planes".into(),
+            Op::Gemv { norm: Some(_), output, .. } => format!("x normed to {}", output.label()),
+            Op::Gemv { input, output, .. } => format!("{} to {}", input.label(), output.label()),
+            Op::StepAttention => "qkv and kv cache to attn".into(),
+            Op::GdnStep => "lin, ba and state to gdn".into(),
         }
     }
 
@@ -325,7 +342,8 @@ impl Op {
             Op::Embed => vec!["embed_tokens.weight".into()],
             Op::Norm { which, .. } | Op::NormAdd { which, .. } => vec![which.tensor().into()],
             Op::Linear { weight, .. } => weight.tensors(spec),
-            Op::KvRope | Op::QkRope | Op::DecodeRope | Op::Flash | Op::DecodeAttention | Op::QkNorm if spec.attention.qk_norm && !spec.attention.qk_norm_unit => {
+            Op::Gemv { norm, weight, .. } => norm.iter().map(|n| n.tensor().to_string()).chain(weight.tensors(spec)).collect(),
+            Op::KvRope | Op::QkRope | Op::DecodeRope | Op::Flash | Op::DecodeAttention | Op::StepAttention | Op::QkNorm if spec.attention.qk_norm && !spec.attention.qk_norm_unit => {
                 vec!["self_attn.q_norm.weight".into(), "self_attn.k_norm.weight".into()]
             }
             Op::Kernel { node } => spec
@@ -350,7 +368,7 @@ impl Op {
                     })
                 })
                 .collect(),
-            Op::GdnPrefill | Op::GdnDecode => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
+            Op::GdnPrefill | Op::GdnDecode | Op::GdnStep => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
             Op::MoeRoute => vec!["mlp.gate.weight".into(), "mlp.shared_expert_gate.weight".into()],
             Op::MoeExperts => spec.expert_tensors(),
             _ => Vec::new(),
@@ -371,7 +389,7 @@ impl Op {
 
     pub fn quant(&self, spec: &Spec, layer: usize) -> Option<Quant> {
         match self {
-            Op::Linear { quant, weight, .. } => Some(quant.resolve_for(spec, layer, *weight)),
+            Op::Linear { quant, weight, .. } | Op::Gemv { quant, weight, .. } => Some(quant.resolve_for(spec, layer, *weight)),
             _ => None,
         }
     }
@@ -440,6 +458,12 @@ impl Op {
             Op::MoeCombine => names(&["moe_combine"]),
             Op::AllReduce => vec![crate::allreduce::kernel_name(crate::allreduce::pick_mode(tokens * spec.dims.hidden * 4), kir::allreduce::Dtype::F32)],
             Op::AllReduceNorm { .. } => names(&["ar_add_rmsnorm_f32"]),
+            Op::Gemv { norm, weight, quant, .. } => match crate::gemm::gemv(spec, weight.name(), weight_kind(quant.resolve_for(spec, layer, *weight)), norm.is_some()) {
+                Some(g) => vec![g.name.to_string()],
+                None => vec![format!("unsupported: no gemv for {}", weight.name())],
+            },
+            Op::StepAttention => names(&["qk_norm_rope", "attention_split", "attention_reduce"]),
+            Op::GdnStep => names(&["gdn_conv_step", "gdn_step"]),
         }
     }
 }
@@ -467,18 +491,6 @@ impl Plan {
         crate::graph::Graph::decoder().plan(spec, phase, tensor_core).expect("the embedded decoder graph lowers")
     }
 
-    pub fn for_tp(mut self, shards: &std::collections::BTreeMap<String, crate::tp::Shard>, fuse: bool) -> Plan {
-        let rewrite = |ops: &[Op]| tp_ops(ops, shards, fuse);
-        for b in &mut self.blocks {
-            b.ops = rewrite(&b.ops);
-        }
-        self.head = rewrite(&self.head);
-        self.tail = rewrite(&self.tail);
-        self.mtp = rewrite(&self.mtp);
-        self.mtp_head = rewrite(&self.mtp_head);
-        self
-    }
-
     pub fn layer(&self, block: Block) -> &[Op] {
         self.layer_of(block, false)
     }
@@ -490,32 +502,6 @@ impl Plan {
             .find(|b| b.sparse == sparse && b.layers.iter().any(|l| l == name))
             .map_or(&[], |b| &b.ops)
     }
-}
-
-fn tp_ops(ops: &[Op], shards: &std::collections::BTreeMap<String, crate::tp::Shard>, fuse: bool) -> Vec<Op> {
-    let mut out = Vec::with_capacity(ops.len() + 4);
-    let mut i = 0;
-    while i < ops.len() {
-        match ops[i] {
-            Op::Linear { weight, quant, input, output: Buf::X } if shards.get(weight.name()).is_some_and(|s| s.needs_allreduce()) => {
-                out.push(Op::Linear { weight, quant, input, output: Buf::Partial });
-                match ops.get(i + 1) {
-                    Some(Op::Norm { which, into: Buf::XnPlanes }) if fuse => {
-                        out.push(Op::AllReduceNorm { which: *which });
-                        i += 1;
-                    }
-                    _ => out.push(Op::AllReduce),
-                }
-            }
-            Op::MoeCombine if !shards.is_empty() => {
-                out.push(Op::MoeCombine);
-                out.push(Op::AllReduce);
-            }
-            op => out.push(op),
-        }
-        i += 1;
-    }
-    out
 }
 
 #[cfg(test)]
@@ -532,7 +518,7 @@ mod tests {
         let json = std::fs::read_to_string(fixtures().join("qwen3.8-27b.config.json")).unwrap();
         let spec = Spec::from_hf_config_serving(&json).unwrap();
         let shards = crate::graph::Graph::decoder().shards().unwrap();
-        Plan::build(&spec, Phase::Decode, true).for_tp(&shards, fuse)
+        crate::compile::compile(&spec, Plan::build(&spec, Phase::Decode, true), &kir::Target::sm_120(), &crate::compile::Options::ranked(shards, fuse, 4096)).unwrap()
     }
 
     #[test]
@@ -568,7 +554,7 @@ mod tests {
         let json = std::fs::read_to_string(fixtures().join("qwen3.8-27b.config.json")).unwrap();
         let spec = Spec::from_hf_config_serving(&json).unwrap();
         let plain = Plan::build(&spec, Phase::Decode, true);
-        assert_eq!(plain.clone().for_tp(&Default::default(), true), plain);
+        assert_eq!(crate::compile::compile(&spec, plain.clone(), &kir::Target::sm_120(), &crate::compile::Options::ranked(Default::default(), true, 4096)).unwrap(), plain);
     }
 
     fn described(config: &str, header: &str) -> (Spec, Structure) {
