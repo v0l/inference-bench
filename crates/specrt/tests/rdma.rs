@@ -38,7 +38,7 @@ fn rdma_ip() -> Option<String> {
 }
 
 fn link(transport: Transport) -> LinkOptions {
-    LinkOptions { transport, library: None }
+    LinkOptions { transport, library: None, gpu_direct: false }
 }
 
 fn skip(reason: &str) -> bool {

@@ -100,6 +100,8 @@ pub struct RemoteConfig {
     pub transport: crate::rdma::Transport,
     #[serde(default)]
     pub rdma_library: Option<String>,
+    #[serde(default)]
+    pub gpu_direct: bool,
 }
 
 fn default_connect_wait_ms() -> u64 {
@@ -116,7 +118,7 @@ fn default_member_ttl_ms() -> u64 {
 
 impl RemoteConfig {
     pub fn link(&self) -> crate::rdma::LinkOptions {
-        crate::rdma::LinkOptions { transport: self.transport, library: self.rdma_library.clone() }
+        crate::rdma::LinkOptions { transport: self.transport, library: self.rdma_library.clone(), gpu_direct: self.gpu_direct }
     }
 
     pub fn key(&self) -> Result<Vec<u8>> {
