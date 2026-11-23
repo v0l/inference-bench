@@ -150,9 +150,17 @@ fn kl(p: &[f32], q: &[f32]) -> f64 {
 fn quantised_experts_match_the_bf16_expanded_experts_within_the_rounding_of_bf16() {
     for file in FILES {
         let run = |s: &Spec| {
-            let mut rt = Runtime::load(s, 256).unwrap();
+            let mut rt = Runtime::load(s, 512).unwrap();
             let logits = rt.prompt_logits(&PROMPT).unwrap();
             let greedy = rt.generate(&PROMPT, 32, Sampling::GREEDY).unwrap().tokens;
+            let long: Vec<u32> = (0..256u32).map(|i| (i * 37 + 11) % 1000).collect();
+            let (mut pre, mut dec) = (f64::MAX, f64::MAX);
+            for _ in 0..5 {
+                let g = rt.generate(&long, 128, Sampling::GREEDY).unwrap();
+                pre = pre.min(g.prefill_secs);
+                dec = dec.min(g.decode_secs);
+            }
+            eprintln!("{file} quantized_experts={}: prefill {:.0} tok/s decode {:.0} tok/s", s.moe.as_ref().unwrap().quantized_experts, long.len() as f64 / pre, 127.0 / dec);
             (logits, greedy, rt.weight_bytes)
         };
         let ((a, ga, wa), (b, gb, wb)) = (run(&spec(file, false)), run(&spec(file, true)));

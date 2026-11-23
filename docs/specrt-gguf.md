@@ -40,6 +40,9 @@ specrt loads a llama.cpp GGUF file directly. `model` is the path of the `.gguf` 
 | Q4_0, Q5_0 | `gguf` | repacked to Q8_0 blocks at load (the int values and scale are exact) |
 | any K-quant (Q4_K_M, Q5_K_M, Q6_K) | `gguf` | blocks are kept as they are on the GPU |
 | Q8_0 mixed with F16 or BF16 tensors (for example a Q8_K_P recipe), or any hybrid qwen35 file | `gguf` | row table per matrix, so each row keeps its own type |
+| MoE experts (`ffn_*_exps`, `ffn_*_shexp`) | `gguf` or `q8` | expanded to bf16 at load by default. With `[moe] quantized_experts = true` they stay ggml blocks: one fixed size slot per expert (its `DeviceRows` padded to the largest expert) and a row table of `rows + 1` words per expert whose last word is the slot size in 16 byte units. `moe_up_gg`, `moe_down_gg` and the grouped pair (`kir::moe::Family::ExpertsGgml`) dot those rows with `DecGgml::dot`, the decoder the dense GEMV uses, against f32 activations. The expert cache copies a slot and its table as two parts, so host and NVMe pages shrink with the blocks |
+
+Keeping experts quantised on the tiny qwen3moe fixture (`scripts/tiny_qwen3moe_gguf.py`, 4 experts, hidden 256): Q4_K_M experts take 0.99 MB against 3.15 MB expanded (3.2x, one `ffn_down` is Q6_K), Q8_0 1.70 MB against 3.15 MB (1.85x). Every kept row decodes to the same bf16 as the expanded path (`tests/gguf_moe.rs`). The default stays off until the GPU KL and the decode and prefill speed are measured.
 
 For `gguf`, every matrix carries a row table: each row has its own byte offset and type (Q4_K, Q5_K, Q6_K, Q8_0, BF16), so a fused matrix (qkv, gate and up interleaved) can mix types the way Q4_K_M does (`attn_v` and some `ffn_down` are Q6_K). Q6_K blocks are padded from 210 to 224 bytes so every row starts 16-byte aligned.
 
@@ -75,6 +78,7 @@ No environment variables. A spec derived from a GGUF takes the same `[runtime]` 
 | `tests/gguf_logits.rs` | logits and greedy generation against llama.cpp; native kernels against bf16; engine chat on a GGUF |
 | `tests/gguf_qwen35.rs` | tiny qwen35 GGUFs made by llama.cpp `convert_hf_to_gguf.py` and `llama-quantize` from `tiny-qwen3.5-hd256` (`scripts/qwen35_gguf_fixture.py`, `qwen35_mtp_fixture.py`): the spec equals the safetensors spec, every value-head tensor lands in the same tiled order, the MTP block equals the safetensors MTP, Q8_0, Q5_K_M, Q5_0, Q4_K_M and Q4_0 load inside their error bound, the module compiles with NVRTC, the tokenizer uses the family pre-tokenizer |
 | `tests/gguf_qwen35_gpu.rs` | ignored GPU tests: tiny Q8_0 against the safetensors logits, a real file against llama.cpp logits, KL and greedy, and native kernels against bf16. `scripts/gate676.sh <file.gguf>` builds the llama.cpp reference and runs them |
+| `tests/gguf_moe.rs` | tiny qwen3moe Q4_K_M and Q8_0: kept expert rows decode to the expanded bf16, the size ratio, fixed expert slots, the anatomy bytes, the option only appends the ggml expert family to the module, NVRTC compile. Ignored GPU test: KL, greedy prefix, weight bytes and prefill and decode tok/s, kept against expanded |
 | `core::library` | specrt support for a dense qwen3 GGUF, a qwen35 GGUF, and the reason for an unsupported type |
 | `ui` | the detail view reads GGUF metadata |
 
