@@ -63,7 +63,10 @@ impl DirectRegion {
     pub fn write_host(&self, data: &[u8]) -> Result<()> {
         ensure!(data.len() <= self.len, "{} bytes exceed the region", data.len());
         self.ctx.bind_to_thread()?;
-        unsafe { check(sys::cuMemcpyHtoD_v2(self.ptr, data.as_ptr() as *const _, data.len()), "htod") }
+        unsafe {
+            check(sys::cuMemcpyHtoD_v2(self.ptr, data.as_ptr() as *const _, data.len()), "htod")?;
+            check(sys::cuCtxSynchronize(), "sync")
+        }
     }
 
     pub fn read_host(&self, bytes: usize) -> Result<Vec<u8>> {
@@ -154,6 +157,10 @@ impl DirectLink {
         loop {
             if let Some(len) = self.pending.pop_front() {
                 ensure!(len as usize == bytes, "the peer wrote {len} bytes into the landing buffer, expected {bytes}");
+                self.landing.context().bind_to_thread()?;
+                unsafe {
+                    let _ = sys::cuFlushGPUDirectRDMAWrites(sys::CUflushGPUDirectRDMAWritesTarget::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TARGET_CURRENT_CTX, sys::CUflushGPUDirectRDMAWritesScope::CU_FLUSH_GPU_DIRECT_RDMA_WRITES_TO_OWNER);
+                }
                 return Ok(());
             }
             self.pump()?;
