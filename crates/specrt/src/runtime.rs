@@ -1462,7 +1462,7 @@ impl Runtime {
             Some(p) if std::path::Path::new(p).exists() => Some(crate::offload::ExpertHotlist::load(std::path::Path::new(p))?),
             _ => None,
         };
-        let cache = moe::experts::ExpertCache::new(&self.stream, like, self.layers.len(), slots, local, shared, off.policy, prior, off.pointer_table)?;
+        let cache = moe::experts::ExpertCache::new(&self.stream, like, self.layers.len(), slots, local, shared, off.policy, prior, off.pointer_table, m.expert_bias.then_some((m.expert_intermediate, self.spec.dims.hidden)))?;
         let hosts: Vec<(usize, &moe::experts::HostExperts)> = self.layers.iter().enumerate().filter_map(|(i, l)| l.moe.as_ref().and_then(|x| x.host.as_ref()).map(|h| (i, h))).collect();
         cache.warm(&self.stream, &hosts)?;
         self.expert_cache = Some(cache);

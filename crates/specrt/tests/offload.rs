@@ -250,6 +250,12 @@ fn expert_cache_with_nvfp4_experts_is_bit_identical() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn expert_cache_with_gpt_oss_experts_is_bit_identical() {
+    assert_experts_identical("tiny-gpt-oss", 4);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn expert_cache_with_glm4_moe_experts_is_bit_identical() {
     assert_experts_identical("tiny-glm4-moe", 3);
 }

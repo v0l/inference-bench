@@ -176,6 +176,7 @@ pub(in crate::runtime) struct ExpertCache {
     pub(in crate::runtime) stacks: Stacks,
     addrs: Vec<CUdeviceptr>,
     pub(in crate::runtime) slots: usize,
+    pub(in crate::runtime) bias: Option<(CudaSlice<f32>, CudaSlice<f32>)>,
     tables: Option<Vec<CudaSlice<i32>>>,
     table_launches: std::sync::atomic::AtomicU64,
     local: usize,
@@ -198,7 +199,11 @@ pub(in crate::runtime) struct Staged {
 }
 
 impl ExpertCache {
-    pub(in crate::runtime) fn new(compute: &Arc<CudaStream>, like: &HostExperts, layers: usize, slots: usize, local: usize, shared: usize, policy: Policy, prior: Option<ExpertHotlist>, pointer_table: bool) -> Result<Self> {
+    pub(in crate::runtime) fn new(compute: &Arc<CudaStream>, like: &HostExperts, layers: usize, slots: usize, local: usize, shared: usize, policy: Policy, prior: Option<ExpertHotlist>, pointer_table: bool, bias_dims: Option<(usize, usize)>) -> Result<Self> {
+        let bias = match bias_dims {
+            Some((inter, hidden)) => Some((compute.alloc_zeros::<f32>((slots + shared) * 2 * inter)?, compute.alloc_zeros::<f32>((slots + shared) * hidden)?)),
+            None => None,
+        };
         let ctx = compute.context().clone();
         let stacks = like.allocate(compute, slots + shared)?;
         let addrs = pointers(compute, &stacks);
@@ -210,6 +215,7 @@ impl ExpertCache {
             stacks,
             addrs,
             slots,
+            bias,
             tables,
             table_launches: std::sync::atomic::AtomicU64::new(0),
             local,
