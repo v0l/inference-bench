@@ -38,6 +38,12 @@ fn blocks(kind: GgmlType, cols: usize, rng: &mut Lcg) -> Vec<u8> {
                 b[2..4].copy_from_slice(&half(0.01 + rng.float().abs() * 0.01));
             }
             GgmlType::Q8_0 => b[..2].copy_from_slice(&half(0.001 + rng.float().abs() * 0.001)),
+            GgmlType::Iq(specrt::gguf::Iq::M1) => {
+                b[53] = (b[53] & 0x0f) | 0xc0;
+                b[55] = (b[55] & 0x0f) | 0x20;
+            }
+            GgmlType::Iq(specrt::gguf::Iq::Nl4) => b[..2].copy_from_slice(&half(0.001 + rng.float().abs() * 0.001)),
+            GgmlType::Iq(_) => b[..2].copy_from_slice(&half(0.001 + rng.float().abs() * 0.001)),
             _ => b[208..210].copy_from_slice(&half(0.001 + rng.float().abs() * 0.001)),
         }
         out.extend(b);
@@ -200,6 +206,20 @@ fn ggml_gemv_matches_the_dequantised_reference_on_q4k_q6k_and_mixed_rows() {
         check_gemv(linear, &[GgmlType::Q6K]).expect("a CUDA device");
         check_gemv(linear, &[GgmlType::Q4K, GgmlType::Q6K, GgmlType::Q8_0]).expect("a CUDA device");
     }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU with NVRTC"]
+fn ggml_gemv_and_batch_match_the_dequantised_reference_on_every_iq_type() {
+    for k in specrt::gguf::Iq::ALL {
+        let kind = GgmlType::Iq(k);
+        check_gemv("qkv", &[kind]).expect("a CUDA device");
+        check_gemv("down", &[kind]).expect("a CUDA device");
+        check("qkv", &[kind], &[1, 8, 24]).expect("a CUDA device");
+        check("down", &[kind], &[3, 16]).expect("a CUDA device");
+    }
+    check_gemv("o", &[GgmlType::Iq(specrt::gguf::Iq::Xs4), GgmlType::Q4K, GgmlType::Iq(specrt::gguf::Iq::S2)]).expect("a CUDA device");
+    check("o", &[GgmlType::Iq(specrt::gguf::Iq::Xs4), GgmlType::Q6K, GgmlType::Iq(specrt::gguf::Iq::Xxs3)], &[1, 9]).expect("a CUDA device");
 }
 
 #[test]

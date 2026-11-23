@@ -141,6 +141,7 @@ pub fn dequant8() -> String {
             Layout::KQuant { .. } => {}
         }
     }
+    body.push_str("    else if (type >= 8) {\n        gg_dequant8_iq(sb, type, c, w);\n    }\n");
     body.push_str(HALF_BRANCH);
     prim::device("void", "gg_dequant8", "const unsigned char* sb, int type, int c, float* w", &body)
 }

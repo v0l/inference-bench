@@ -440,6 +440,13 @@ fn argmax_picks_the_greedy_token_and_gumbel_sampling_is_seeded() {
 }
 
 #[test]
+fn iq_quant_ggufs_are_refused_on_wgpu_with_a_named_reason() {
+    let mut s = spec();
+    s.iq_quants = true;
+    assert_eq!(wgsl::unsupported(&s).as_deref(), Some("IQ quant types need the CUDA engine"));
+}
+
+#[test]
 fn unsupported_features_are_named() {
     let s = Spec::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3.8-27b-nvfp4-exact.toml")).unwrap();
     let why = wgsl::unsupported(&s).unwrap();

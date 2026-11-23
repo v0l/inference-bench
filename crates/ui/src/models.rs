@@ -45,6 +45,7 @@ struct PlanKey {
     infos: usize,
     seqs: usize,
     gpus: Vec<u64>,
+    wgpu_only: bool,
 }
 
 const BUDGET_BUCKET: u64 = 256 << 20;
@@ -71,6 +72,7 @@ pub struct ModelsState {
     pub info_dir: std::path::PathBuf,
     generation: u64,
     plan_key: Option<PlanKey>,
+    pub wgpu_only: bool,
     rows: Vec<PlanRow>,
     pub plan_runs: usize,
 }
@@ -99,6 +101,7 @@ impl Default for ModelsState {
             info_dir: std::path::PathBuf::new(),
             generation: 0,
             plan_key: None,
+            wgpu_only: false,
             rows: Vec::new(),
             plan_runs: 0,
         }
@@ -207,7 +210,7 @@ impl ModelsState {
     }
 
     pub fn plans(&self, gpus: &[u64], seqs: usize) -> Vec<RepoPlan> {
-        let planned: Vec<RepoPlan> = self.infos.values().filter_map(|i| i.as_ref().ok()).map(|i| discover::plan(i, gpus, seqs)).collect();
+        let planned: Vec<RepoPlan> = self.infos.values().filter_map(|i| i.as_ref().ok()).map(|i| discover::plan_on(i, gpus, seqs, self.wgpu_only)).collect();
         let ranked = discover::rank_repos(planned);
         let mut out: Vec<RepoPlan> = Vec::new();
         for r in &self.results {
@@ -226,6 +229,7 @@ impl ModelsState {
             infos: self.infos.len(),
             seqs,
             gpus: gpus.iter().map(|g| g / BUDGET_BUCKET).collect(),
+            wgpu_only: self.wgpu_only,
         };
         if self.plan_key.as_ref() == Some(&key) {
             return;
@@ -635,6 +639,7 @@ fn discover_pane(app: &mut App, ui: &mut egui::Ui) {
         crate::working::working(ui, &format!("checking which quants fit and run, {done} of {}", app.models.inspect_total));
     }
     let gpus = app.free_gpu_list();
+    app.models.wgpu_only = app.hardware.machine.as_ref().is_some_and(|m| !m.gpus.is_empty() && m.gpus.iter().all(|g| g.backend.is_wgpu()));
     if !gpus.is_empty() {
         note(ui, budget_line(&app.gpu, app.settings.default_seqs), LEGEND);
     }

@@ -110,15 +110,6 @@ pub fn byte_of_words(name: &str) -> String {
     device("unsigned", name, "const unsigned* s, int i", "    return (s[i >> 2] >> (8 * (i & 3))) & 0xffu;\n")
 }
 
-pub fn table_row(name: &str) -> String {
-    device(
-        "const unsigned char*",
-        name,
-        "const void* w, const unsigned* table, int row, int& type",
-        "    unsigned e = __ldg(table + row);\n    type = (int)(e & 7u);\n    return (const unsigned char*)w + (size_t)(e >> 3) * 16;\n",
-    )
-}
-
 pub fn load_f4(dst: &str, base: &str, offset: &str) -> String {
     format!("{dst} = *(const float4*)({base} + {offset});\n")
 }

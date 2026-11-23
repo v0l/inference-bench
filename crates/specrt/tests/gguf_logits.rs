@@ -123,6 +123,46 @@ fn qwen3_bf16_gguf_logits_match_llama_cpp_closely() {
 }
 
 #[test]
+#[ignore = "needs a CUDA GPU and Qwen3-0.6B-IQ*.gguf in ~/.cache/specrt-gguf"]
+fn qwen3_iq_native_kernels_match_the_same_weights_dequantised_to_bf16() {
+    // Bounds are 1.5x the mean and max KL measured on the engine against the same weights dequantised to bf16.
+    let bounds = [("IQ4_NL", 7e-5, 3.1e-4), ("IQ4_XS", 7e-5, 1.7e-4), ("IQ3_S", 9e-5, 2.6e-4), ("IQ3_XXS", 7e-5, 3e-4), ("IQ2_S", 2.3e-4, 5.9e-4), ("IQ2_XS", 3.9e-4, 1.1e-3), ("IQ2_XXS", 7.5e-3, 3.5e-2), ("IQ1_S", 2.2e-1, 2.1), ("IQ1_M", 9.4e-2, 7.4e-1)];
+    let mut failed = Vec::new();
+    for (q, mean_bound, max_bound) in bounds {
+        let (mean, max, _) = native_against_bf16(&format!("Qwen3-0.6B-{q}.gguf"));
+        if mean > mean_bound || max > max_bound {
+            failed.push(format!("{q}: mean {mean} max {max}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU, Qwen3-0.6B-IQ*.gguf (llama-quantize with an imatrix) and llama.cpp reference logits q3-IQ*.logits.bin in ~/.cache/specrt-gguf"]
+fn qwen3_iq_gguf_logits_stay_within_the_kl_bound_of_llama_cpp() {
+    // Bounds are 1.5x the mean and max KL measured against llama.cpp (Qwen3-0.6B, llama-quantize --pure with an imatrix, token embedding and output at q8_0), see docs/specrt-gguf.md.
+    let bounds = [
+        ("IQ4_NL", 1.5e-2, 2.2e-1),
+        ("IQ4_XS", 3.1e-2, 3.2e-1),
+        ("IQ3_S", 9.5e-3, 2.7e-2),
+        ("IQ3_XXS", 1.8e-2, 1.04e-1),
+        ("IQ2_S", 2.6e-2, 7e-2),
+        ("IQ2_XS", 6.9e-2, 2.7e-1),
+        ("IQ2_XXS", 0.6, 3.7),
+        ("IQ1_S", 3.6, 9.3),
+        ("IQ1_M", 3.2, 10.5),
+    ];
+    let mut failed = Vec::new();
+    for (q, mean_bound, max_bound) in bounds {
+        let o = run(&format!("Qwen3-0.6B-{q}.gguf"));
+        if o.mean_kl > mean_bound || o.max_kl > max_bound {
+            failed.push(format!("{q}: mean KL {} max KL {} top1 {}", o.mean_kl, o.max_kl, o.top1));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
+#[test]
 #[ignore = "needs a CUDA GPU, the unsloth Qwen3-0.6B GGUF files and llama.cpp reference logits in ~/.cache/specrt-gguf (scripts/gguf_reference.c)"]
 fn qwen3_q8_0_gguf_logits_stay_within_the_kl_bound_of_llama_cpp() {
     let o = run("Qwen3-0.6B-Q8_0.gguf");

@@ -603,14 +603,19 @@ impl RepoPlan {
 }
 
 pub fn plan(info: &RepoInfo, gpus: &[u64], seqs: usize) -> RepoPlan {
+    plan_on(info, gpus, seqs, false)
+}
+
+pub fn plan_on(info: &RepoInfo, gpus: &[u64], seqs: usize, wgpu: bool) -> RepoPlan {
     let mut ranked: Vec<Scored> = info
         .grouped
         .variants
         .iter()
         .map(|v| {
-            let quant_ok = v.format != Format::Gguf || specrt::gguf::quant_label_supported(&v.label);
+            let quant_ok = v.format != Format::Gguf || specrt::gguf::quant_label_supported_on(&v.label, wgpu);
             let runnable = match (&info.shape, quant_ok) {
                 (Err(e), _) => Err(e.clone()),
+                (Ok(_), false) if wgpu && v.label.to_uppercase().contains("IQ") => Err("IQ quant types need the CUDA engine".to_string()),
                 (Ok(_), false) => Err(format!("{} weights are not supported by specrt", v.label)),
                 (Ok(_), true) => Ok(()),
             };
@@ -949,13 +954,26 @@ mod tests {
     }
 
     #[test]
+    fn iq_quants_are_supported_on_cuda_and_refused_on_wgpu() {
+        let files = files_1017();
+        let info = RepoInfo { repo: "x/y".into(), grouped: group(&files, None), shape: Ok(shape()), draft: None };
+        let cuda = plan_on(&info, &[500 * GB], 1, false);
+        let wgpu = plan_on(&info, &[500 * GB], 1, true);
+        let iq = |p: &RepoPlan| p.ranked.iter().filter(|s| s.variant.label.starts_with("IQ")).map(|s| s.runnable.clone()).collect::<Vec<_>>();
+        assert!(!iq(&cuda).is_empty() && iq(&cuda).iter().all(|r| r.is_ok()));
+        assert!(iq(&wgpu).iter().all(|r| r.as_ref().err().is_some_and(|e| e == "IQ quant types need the CUDA engine")));
+        assert!(!specrt::gguf::quant_label_supported_on("IQ4_NL", true));
+        assert!(specrt::gguf::quant_label_supported_on("Q4_K_M", true));
+    }
+
+    #[test]
     fn unsupported_quant_types_and_incomplete_splits_are_never_the_best() {
         let files = files_1017();
         let info = RepoInfo { repo: "x/y".into(), grouped: group(&files, None), shape: Ok(shape()), draft: None };
         let p = plan(&info, &[500 * GB], 1);
         let best = p.best().unwrap();
         assert!(best.variant.label == "IQ4_NL" || best.runnable.is_err() || !best.variant.complete());
-        assert!(p.ranked.iter().all(|s| s.runnable.is_err()), "IQ quants are not supported by specrt");
+        assert!(p.ranked.iter().filter(|s| s.variant.label.starts_with("IQ")).all(|s| s.runnable.is_ok()), "IQ quants are supported by specrt");
         let unsupported = RepoInfo { shape: Err("model_type deepseek_v4 is not supported".into()), ..info };
         let p = plan(&unsupported, &[500 * GB], 1);
         assert_eq!(p.unsupported.as_deref(), Some("model_type deepseek_v4 is not supported"));

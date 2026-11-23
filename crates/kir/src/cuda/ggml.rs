@@ -1,6 +1,7 @@
 mod dec;
 mod decode;
 mod dequant;
+mod iq;
 mod rowmath;
 mod rows;
 
