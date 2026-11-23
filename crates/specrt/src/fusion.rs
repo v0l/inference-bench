@@ -4,6 +4,7 @@ use crate::signature::{Class, Count, Form, Place, Rows, Signer, Tensor, key, ran
 use crate::spec::{Quant, Spec};
 use anyhow::Result;
 use kir::gemm::Epilogue;
+use kir::heavy::{BASE_REGS, acc_regs};
 use std::collections::{BTreeMap, BTreeSet};
 
 const CUDA_GBS: f64 = 1600.0;
@@ -13,7 +14,6 @@ const CUDA_REREAD_RATE: f64 = 0.25;
 const WGSL_GBS: f64 = 200.0;
 const WGSL_LAUNCH_US: f64 = 5.0;
 const WGSL_ROUND_TRIP_US: f64 = 2.0;
-const BASE_REGS: u32 = 16;
 const FP4_ACT_GROUP: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -263,10 +263,6 @@ struct Lower<'a> {
     layer: usize,
     units: Vec<Unit>,
     internal: BTreeSet<Place>,
-}
-
-fn acc_regs(elems: usize, threads: u32) -> u32 {
-    BASE_REGS + (elems / threads.max(1) as usize) as u32
 }
 
 impl Lower<'_> {

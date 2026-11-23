@@ -184,3 +184,22 @@ fn the_dry_run_leaves_the_plan_alone() {
         }
     }
 }
+
+#[test]
+fn every_gemm_kernel_is_emitted_from_the_heavy_ir_and_checked_against_the_target() {
+    for spec in [dense(), hybrid(), Spec::load(&root().join("tests/fixtures/qwen3.8-27b.toml")).unwrap()] {
+        let set = specrt::gemm::gemm_kernels(&spec, &sm120()).unwrap();
+        let mut lifted = 0;
+        for k in &set.kernels {
+            if let Some(h) = kir::heavy::Heavy::lift(k).unwrap() {
+                assert_eq!(&h.lower(&sm120()).unwrap(), k);
+                assert!(h.budget(&sm120(), "test").unwrap().regs <= sm120().max_regs);
+                lifted += 1;
+            }
+        }
+        assert!(lifted > 0);
+    }
+    let tight = kir::Target { max_regs: 40, ..sm120() };
+    let err = specrt::gemm::gemm_kernels(&hybrid(), &tight).err().expect("a 40 register target cannot hold the big tile accumulators").to_string();
+    assert!(err.starts_with(&format!("pass {}: kernel ", specrt::gemm::KERNEL_SELECT)) && err.contains("registers per thread, the target has 40"), "{err}");
+}

@@ -203,10 +203,19 @@ pub fn intern(name: &str) -> &'static str {
     n
 }
 
+pub const KERNEL_SELECT: &str = "kernel_select";
+
+fn through_heavy(k: KernelInstance) -> Result<KernelInstance> {
+    match kir::heavy::Heavy::lift(&k).map_err(anyhow::Error::msg)? {
+        Some(h) => h.compile(&k.target, KERNEL_SELECT).map_err(anyhow::Error::msg),
+        None => Ok(k),
+    }
+}
+
 impl GemmSet {
     fn push(&mut self, k: std::result::Result<KernelInstance, kg::GemmError>) -> Result<()> {
         match k {
-            Ok(k) => self.kernels.push(k),
+            Ok(k) => self.kernels.push(through_heavy(k)?),
             Err(e) if self.lenient && e.is_unsupported() => self.refused.push(e.to_string()),
             Err(e) => return Err(anyhow::Error::msg(e)),
         }
