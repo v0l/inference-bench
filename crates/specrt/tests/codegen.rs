@@ -31,8 +31,6 @@ const VERBATIM_QUANT: &[(&str, &str)] = &[
 ];
 
 const VERBATIM_MOE: &[(&str, &str)] = &[
-    ("cuda/moe/route.rs", "top-k routing, permute, combine are MoE-specific; the logits block sum keeps its warp-sum plus smem loop because block_reduce adds a __syncthreads and changes the PTX"),
-    ("cuda/moe/gemv.rs", "expert row dots read per-expert fp4/fp8/bf16 rows; porting onto the shared row dots changes the PTX (#793)"),
     ("cuda/moe/prim.rs", "re-exports the shared gemm prims plus MoE constants and launch wrappers"),
 ];
 
@@ -48,6 +46,19 @@ fn moe_builders_use_shared_prims_unless_listed() {
     assert!(!mma8.contains("asm volatile"));
     let gemv = std::fs::read_to_string(kir.join("cuda/moe/gemv.rs")).unwrap();
     assert!(gemv.contains("prim::e2m1_to_f32") && gemv.contains("prim::warp_ids"));
+    for f in ["RowFormat::Fp4Rows", "RowFormat::Mx", "RowFormat::Fp8", "RowFormat::Bf16"] {
+        assert!(gemv.contains(f), "cuda/moe/gemv.rs must build its {f} row dots from prim::multi_row_dot");
+    }
+    for hand in ["uint4 q =", "uint2 q =", "__shfl_xor_sync", "e4m3_to_f32("] {
+        assert!(!gemv.contains(hand), "cuda/moe/gemv.rs spells a row dot by hand ({hand})");
+    }
+    let route = std::fs::read_to_string(kir.join("cuda/moe/route.rs")).unwrap();
+    for p in ["block_reduce(Reduce::Sum", "warp_reduce(Reduce::Sum", "warp_reduce(Reduce::Max", "prim::unpack_bf16x8", "topk::warp_top_k"] {
+        assert!(route.contains(p), "cuda/moe/route.rs must build from {p}");
+    }
+    for hand in ["block_reduce<", "warp_sum(", "warp_max(", "bf16_to_f32(r."] {
+        assert!(!route.contains(hand), "cuda/moe/route.rs spells {hand} by hand");
+    }
     assert!(!kir.join("cuda/moe.cu").exists() && !kir.join("cuda/moe_mma.cu").exists());
     for (f, why) in VERBATIM_MOE {
         assert!(kir.join(f).exists() && !why.is_empty(), "stale allowlist entry {f}");
@@ -250,7 +261,7 @@ fn assert_kernel_text_lives_only_in_kir() {
         ("VERBATIM_ATTENTION", VERBATIM_ATTENTION.len(), 0),
         ("PRIM_LIBRARY_ATTENTION", PRIM_LIBRARY_ATTENTION.len(), 2),
         ("VERBATIM_QUANT", VERBATIM_QUANT.len(), 1),
-        ("VERBATIM_MOE", VERBATIM_MOE.len(), 3),
+        ("VERBATIM_MOE", VERBATIM_MOE.len(), 1),
         ("KIR_EMITTERS_OUTSIDE_CUDA", KIR_EMITTERS_OUTSIDE_CUDA.len(), 6),
         ("KERNEL_TEXT_OUTSIDE_KIR", KERNEL_TEXT_OUTSIDE_KIR.len(), 5),
         ("KERNEL_INCLUDES_OUTSIDE_KIR", KERNEL_INCLUDES_OUTSIDE_KIR.len(), 1),

@@ -1,78 +1,84 @@
 use super::prim;
+use crate::cuda::attention::prim::{Reduce, block_reduce, warp_reduce};
 
-fn logits_norm() -> &'static str {
-    r##"    __shared__ __align__(16) float xs[MOE_LOGIT_TOKENS * HIDDEN];
+fn logits_norm() -> String {
+    format!(
+        r##"    __shared__ __align__(16) float xs[MOE_LOGIT_TOKENS * HIDDEN];
     __shared__ float red[32];
     int tid = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
     int t0 = blockIdx.y * MOE_LOGIT_TOKENS;
     int live = min(MOE_LOGIT_TOKENS, n - t0);
-    for (int j = 0; j < live; j++) {
+    for (int j = 0; j < live; j++) {{
         int t = t0 + j;
         const float* xr = x + (size_t)t * HIDDEN;
         float ss = 0.0f;
-        for (int i = tid * 4; i < HIDDEN; i += 1024) {
+        for (int i = tid * 4; i < HIDDEN; i += 1024) {{
             float4 v = *(const float4*)(xr + i);
             ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
-        }
-        float total = block_reduce<false>(ss, red);
+        }}
+        float total = {total};
         float inv = rsqrtf(total / HIDDEN + EPS);
-        for (int i = tid; i < HIDDEN; i += 256) {
+        for (int i = tid; i < HIDDEN; i += 256) {{
             float v = xr[i] * inv * ln[i];
             xs[j * HIDDEN + i] = v;
             if (blockIdx.x == 0) xn[(size_t)t * HIDDEN + i] = v;
-        }
-    }
+        }}
+    }}
     __syncthreads();
-"##
+"##,
+        total = block_reduce(Reduce::Sum, "ss", "red")
+    )
 }
 
-fn logits_dot() -> &'static str {
-    r##"    float a[MOE_LOGIT_PER_WARP][MOE_LOGIT_TOKENS];
+fn logits_dot() -> String {
+    format!(
+        r##"    float a[MOE_LOGIT_PER_WARP][MOE_LOGIT_TOKENS];
 #pragma unroll
     for (int q = 0; q < MOE_LOGIT_PER_WARP; q++)
 #pragma unroll
         for (int j = 0; j < MOE_LOGIT_TOKENS; j++) a[q][j] = 0.0f;
     int e0 = (blockIdx.x * (MOE_LOGIT_ROWS / MOE_LOGIT_PER_WARP) + warp) * MOE_LOGIT_PER_WARP;
     if (e0 >= MOE_E + 1) return;
-    for (int c = lane; c < HIDDEN / 8; c += 32) {
+    for (int c = lane; c < HIDDEN / 8; c += 32) {{
         float4 xl[MOE_LOGIT_TOKENS], xh[MOE_LOGIT_TOKENS];
 #pragma unroll
-        for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {
+        for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {{
             xl[j] = *(const float4*)(xs + j * HIDDEN + c * 8);
             xh[j] = *(const float4*)(xs + j * HIDDEN + c * 8 + 4);
-        }
+        }}
 #pragma unroll
-        for (int q = 0; q < MOE_LOGIT_PER_WARP; q++) {
+        for (int q = 0; q < MOE_LOGIT_PER_WARP; q++) {{
             int e = e0 + q;
             if (e >= MOE_E) continue;
             uint4 r = __ldg((const uint4*)(router + (size_t)e * HIDDEN) + c);
-            float w[8] = {bf16_to_f32(r.x & 0xffffu), bf16_to_f32(r.x >> 16), bf16_to_f32(r.y & 0xffffu), bf16_to_f32(r.y >> 16),
-                          bf16_to_f32(r.z & 0xffffu), bf16_to_f32(r.z >> 16), bf16_to_f32(r.w & 0xffffu), bf16_to_f32(r.w >> 16)};
-#pragma unroll
-            for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {
+            {unpack}#pragma unroll
+            for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {{
                 a[q][j] += w[0] * xl[j].x + w[1] * xl[j].y + w[2] * xl[j].z + w[3] * xl[j].w + w[4] * xh[j].x + w[5] * xh[j].y + w[6] * xh[j].z + w[7] * xh[j].w;
-            }
-        }
-    }
-    if (MOE_SHARED_GATE && e0 + MOE_LOGIT_PER_WARP > MOE_E && MOE_E >= e0) {
-        for (int i = lane; i < HIDDEN; i += 32) {
+            }}
+        }}
+    }}
+    if (MOE_SHARED_GATE && e0 + MOE_LOGIT_PER_WARP > MOE_E && MOE_E >= e0) {{
+        for (int i = lane; i < HIDDEN; i += 32) {{
 #pragma unroll
             for (int j = 0; j < MOE_LOGIT_TOKENS; j++) a[MOE_E - e0][j] += shared_gate[i] * xs[j * HIDDEN + i];
-        }
-    }
+        }}
+    }}
 #pragma unroll
-    for (int q = 0; q < MOE_LOGIT_PER_WARP; q++) {
+    for (int q = 0; q < MOE_LOGIT_PER_WARP; q++) {{
         int e = e0 + q;
 #pragma unroll
-        for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {
-            float v = warp_sum(a[q][j]);
+        for (int j = 0; j < MOE_LOGIT_TOKENS; j++) {{
+            float v = {sum};
             if (MOE_ROUTER_BIAS && e < MOE_E) v += router_bias[e];
             if (lane == 0 && j < live && e < MOE_E + 1) logits[(size_t)(t0 + j) * (MOE_E + 1) + e] = v;
-        }
-    }
-"##
+        }}
+    }}
+"##,
+        unpack = prim::unpack_bf16x8("w", "r", 26),
+        sum = warp_reduce(Reduce::Sum, "a[q][j]")
+    )
 }
 
 pub fn route_logits() -> String {
@@ -87,8 +93,8 @@ pub fn route_logits() -> String {
     )
 }
 
-fn probabilities() -> &'static str {
-    r##"    __shared__ float probs[MOE_E];
+fn probabilities() -> String {
+    let body = r##"    __shared__ float probs[MOE_E];
     __shared__ float sel[MOE_E];
     __shared__ float group_score[MOE_GROUPS];
     __shared__ bool group_kept[MOE_GROUPS];
@@ -103,14 +109,14 @@ fn probabilities() -> &'static str {
     } else {
         float m = NEG_INF;
         for (int e = lane; e < MOE_E; e += 32) m = fmaxf(m, lg[e]);
-        m = warp_max(m);
+        m = WARP_MAX_M;
         float s = 0.0f;
         for (int e = lane; e < MOE_E; e += 32) {
             float p = expf(lg[e] - m);
             probs[e] = p;
             s += p;
         }
-        s = warp_sum(s);
+        s = WARP_SUM_S;
         for (int e = lane; e < MOE_E; e += 32) probs[e] /= s;
     }
     __syncwarp();
@@ -152,7 +158,8 @@ fn probabilities() -> &'static str {
         __syncwarp();
     }
     }
-"##
+"##;
+    body.replace("WARP_MAX_M", &warp_reduce(Reduce::Max, "m")).replace("WARP_SUM_S", &warp_reduce(Reduce::Sum, "s"))
 }
 
 fn top_k() -> String {

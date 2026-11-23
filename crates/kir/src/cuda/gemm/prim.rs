@@ -78,6 +78,13 @@ pub fn pack_bf16x8(indent: usize) -> String {
     )
 }
 
+pub fn unpack_bf16x8(dst: &str, src: &str, indent: usize) -> String {
+    let s = " ".repeat(indent);
+    format!(
+        "float {dst}[8] = {{bf16_to_f32({src}.x & 0xffffu), bf16_to_f32({src}.x >> 16), bf16_to_f32({src}.y & 0xffffu), bf16_to_f32({src}.y >> 16),\n{s}bf16_to_f32({src}.z & 0xffffu), bf16_to_f32({src}.z >> 16), bf16_to_f32({src}.w & 0xffffu), bf16_to_f32({src}.w >> 16)}};\n"
+    )
+}
+
 pub fn device(ret: &str, name: &str, args: &str, body: &str) -> String {
     format!("__device__ __forceinline__ {ret} {name}({args}) {{\n{body}}}\n\n")
 }
@@ -430,6 +437,7 @@ pub enum RowFormat<'a> {
     Bf16,
     Fp8,
     Fp4Rows { decode: &'a str },
+    Mx { decode: &'a str, block: &'a str },
 }
 
 pub struct RowLoad {
@@ -471,6 +479,19 @@ pub fn multi_row_dot(name: &str, format: RowFormat, load: RowLoad) -> String {
                 columns(
                     "            float part = 0.0f;\n#pragma unroll\n            for (int i = 0; i < 16; i++) part += v[i] * xs[j * K + grp * 16 + i];\n            acc[j] += part * sc;\n"
                 )
+            ),
+        ),
+        RowFormat::Mx { decode, block } => (
+            "const unsigned char* wr, const unsigned char* sb, const float* xs, int lane, int live, float* acc",
+            format!(
+                "{unroll}    for (int grp = lane; grp < K / {block}; grp += 32) {{\n        float sc = __uint_as_float((unsigned)sb[grp] << 23);\n#pragma unroll\n        for (int c = 0; c < {block} / 32; c++) {{\n            uint4 q = {};\n            float v[32];\n#pragma unroll\n            for (int i = 0; i < 16; i++) {{\n                unsigned word = i < 4 ? q.x : i < 8 ? q.y : i < 12 ? q.z : q.w;\n                unsigned byte = (word >> (8 * (i & 3))) & 0xffu;\n                v[2 * i] = {decode}(byte & 0xfu);\n                v[2 * i + 1] = {decode}(byte >> 4);\n            }}\n{}        }}\n    }}\n",
+                load16(&format!("wr + (size_t)grp * ({block} / 2) + c * 16")),
+                columns(&format!(
+                    "            float part = 0.0f;\n#pragma unroll\n            for (int i = 0; i < 32; i++) part += v[i] * xs[j * K + grp * {block} + c * 32 + i];\n            acc[j] += part * sc;\n"
+                ))
+                .lines()
+                .map(|l| if l.is_empty() { "\n".to_string() } else { format!("    {l}\n") })
+                .collect::<String>()
             ),
         ),
     };

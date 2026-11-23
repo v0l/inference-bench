@@ -5,25 +5,7 @@ fn dot_fp4() -> &'static str {
 }
 
 fn dot_mx() -> &'static str {
-    r##"        constexpr int KP = (K + 127) / 128 * 128;
-        const unsigned char* wb = (const unsigned char*)w + at * (KP / 2);
-        const unsigned char* sb = s + at * (KP / MOE_BLOCK);
-        for (int grp = lane; grp < K / MOE_BLOCK; grp += 32) {
-            float part = 0.0f;
-#pragma unroll
-            for (int c = 0; c < MOE_BLOCK / 32; c++) {
-                uint4 q = *(const uint4*)(wb + (size_t)grp * (MOE_BLOCK / 2) + c * 16);
-                const float* x = xs + grp * MOE_BLOCK + c * 32;
-#pragma unroll
-                for (int j = 0; j < 16; j++) {
-                    unsigned word = j < 4 ? q.x : j < 8 ? q.y : j < 12 ? q.z : q.w;
-                    unsigned byte = (word >> (8 * (j & 3))) & 0xffu;
-                    part += moe_e2m1(byte & 0xfu) * x[2 * j] + moe_e2m1(byte >> 4) * x[2 * j + 1];
-                }
-            }
-            acc += part * __uint_as_float((unsigned)sb[grp] << 23);
-        }
-"##
+    "        constexpr int KP = (K + 127) / 128 * 128;\n        float col[1] = {0.0f};\n        moe_rows_mx<K, 1>((const unsigned char*)w + at * (KP / 2), s + at * (KP / MOE_BLOCK), xs, lane, 1, col);\n        acc = col[0];\n"
 }
 
 fn dot_fp8() -> &'static str {
@@ -57,34 +39,7 @@ fn dot2_fp4() -> &'static str {
 }
 
 fn dot2_mx() -> &'static str {
-    r##"        constexpr int KP = (K + 127) / 128 * 128;
-        const unsigned char* wb = (const unsigned char*)w + at * (KP / 2);
-        const unsigned char* sb = s + at * (KP / MOE_BLOCK);
-        for (int grp = lane; grp < K / MOE_BLOCK; grp += 32) {
-            float sc = __uint_as_float((unsigned)sb[grp] << 23);
-#pragma unroll
-            for (int c = 0; c < MOE_BLOCK / 32; c++) {
-                uint4 q = *(const uint4*)(wb + (size_t)grp * (MOE_BLOCK / 2) + c * 16);
-                float v[32];
-#pragma unroll
-                for (int j = 0; j < 16; j++) {
-                    unsigned word = j < 4 ? q.x : j < 8 ? q.y : j < 12 ? q.z : q.w;
-                    unsigned byte = (word >> (8 * (j & 3))) & 0xffu;
-                    v[2 * j] = moe_e2m1(byte & 0xfu);
-                    v[2 * j + 1] = moe_e2m1(byte >> 4);
-                }
-#pragma unroll
-                for (int j = 0; j < MOE_TJ; j++) {
-                    if (j < live) {
-                        float part = 0.0f;
-#pragma unroll
-                        for (int i = 0; i < 32; i++) part += v[i] * xs[j * K + grp * MOE_BLOCK + c * 32 + i];
-                        result[j] += part * sc;
-                    }
-                }
-            }
-        }
-"##
+    "        constexpr int KP = (K + 127) / 128 * 128;\n        moe_rows_mx<K, MOE_TJ>((const unsigned char*)w + at * (KP / 2), s + at * (KP / MOE_BLOCK), xs, lane, live, result);\n"
 }
 
 fn dot2_fp8() -> &'static str {
@@ -266,6 +221,7 @@ pub fn gemv() -> String {
     out.push_str(prim::fp8_grid());
     out.push_str(&prim::e2m1_to_f32("moe_e2m1"));
     out.push_str(&prim::multi_row_dot("moe_rows_fp4", prim::RowFormat::Fp4Rows { decode: "moe_e2m1" }, prim::RowLoad { unroll: 0, stream: false }));
+    out.push_str(&prim::multi_row_dot("moe_rows_mx", prim::RowFormat::Mx { decode: "moe_e2m1", block: "MOE_BLOCK" }, prim::RowLoad { unroll: 0, stream: false }));
     out.push_str(&dot());
     out.push_str(&up_impl());
     out.push_str(&down_impl());
