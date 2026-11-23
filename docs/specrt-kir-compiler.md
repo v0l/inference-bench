@@ -130,7 +130,7 @@ Needs measured feedback: launch gap on a new Target (one probe, cached in `[runt
 
 ## 8. Slices (landing order)
 
-1. Typed op signatures plus `validate_plan`, bytes and launch report (`inference-bench kernels --plan`). No behaviour change.
+1. Typed op signatures plus `validate_plan`, bytes and launch report (`inference-bench kernels --plan`). No behaviour change. Landed (#1053): `crates/specrt/src/signature.rs` (`Signer::signature`, one exhaustive match over `Op`; shapes from `gemm::linear_shape`, cache rows from `state`, described nodes from their kir params and binds), `validate_plan`, `plan_report`; tests in `tests/plan_check.rs`. `inference-bench kernels --spec S --plan [--phase prefill|decode|verify] [--tokens N] [--context C] [--target T]` prints per layer kind the ops, class, bytes read and written, launches and a step total. Bytes are what each op touches once (weights, activations, the cache rows read), not cache-line traffic.
 2. Cost model and the legality predicate, with the rediscovery test as a decision-only dry run (prints groups, changes nothing).
 3. Kernel IR slots: `Heavy { prologue, epilogue }` over `compose::Stage`, with `Epilogue::{Residual, Act, Map}` re-expressed as stages; goldens byte identical.
 4. `Gemv::Norm` and `GateUpAct` rebuilt from the same IR (prologue slot), goldens byte identical; bit identity check for rows marked "not documented".

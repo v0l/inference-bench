@@ -155,7 +155,7 @@ impl Runtime {
             floats[i] = v as f32;
         }
         let a = &self.spec.attention;
-        let tiled = launch.tile && !self.scan_tile_off.load(std::sync::atomic::Ordering::Relaxed) && !self.spec.runtime.kv_dtype.is_fp8() && spec_node.grid.len() == 2 && spec_node.grid[0] == "heads" && spec_node.grid[1] == "rows" && a.heads / a.kv_heads <= 16;
+        let tiled = launch.tile && !self.scan_tile_off.load(std::sync::atomic::Ordering::Relaxed) && crate::codegen::described_tiles(&self.spec, spec_node);
         let tile_name = tiled.then(|| format!("{}{}", launch.name, if run.bb.is_none() { "_mma" } else { "_mma_dec" }));
         let which = match (tiled, run.bb.is_none()) {
             (true, true) => 0,
@@ -485,10 +485,6 @@ impl Runtime {
         }
     }
 
-    fn is_planes(b: Buf) -> bool {
-        matches!(b, Buf::XnPlanes | Buf::AttnPlanes | Buf::ActPlanes | Buf::GdnPlanes | Buf::MixPlanes | Buf::FcPlanes)
-    }
-
     fn weight_of<'a>(&'a self, weight: Weight, layer: Option<&'a DeviceLayer>) -> (&'a DeviceMatrix, Option<&'a CudaSlice<f32>>) {
         let attn = || self.attn_of(layer);
         let gdn = || self.gdn_of(layer);
@@ -521,7 +517,7 @@ impl Runtime {
         let hidden = self.spec.dims.hidden;
         let head = weight == Weight::LmHead;
         let tokens = if head { run.rows.len() } else { run.n };
-        if Self::is_planes(input) {
+        if input.is_planes() {
             let planes = self.planes(input);
             let x = if head { planes.rows(0, tokens, hidden) } else { planes.all() };
             let out = match output {
@@ -542,7 +538,7 @@ impl Runtime {
     }
 
     fn sharded_head(&self, weight: Weight, w: &DeviceMatrix, input: Buf, output: Buf, part: &CudaSlice<f32>, run: &Run) -> Result<()> {
-        anyhow::ensure!(Self::is_planes(input), "a vocabulary sharded head reads the tensor core planes");
+        anyhow::ensure!(input.is_planes(), "a vocabulary sharded head reads the tensor core planes");
         let comm = self.comm();
         let (hidden, vocab, own) = (self.spec.dims.hidden, self.spec.dims.vocab, self.spec.head_rows().len());
         let each = comm.gather_each().context("a vocabulary sharded head needs the gather kernel")?;

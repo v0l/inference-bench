@@ -264,6 +264,11 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
     Ok(out)
 }
 
+pub fn described_tiles(spec: &Spec, node: &crate::graph::Node) -> bool {
+    let a = &spec.attention;
+    !spec.runtime.kv_dtype.is_fp8() && node.grid.len() == 2 && node.grid[0] == "heads" && node.grid[1] == "rows" && a.heads / a.kv_heads <= 16
+}
+
 pub fn mixer_symbols(spec: &Spec, kv_planes: usize, max_ctx: usize) -> kir::desc::Shape {
     let mut symbols = attention_symbols(spec, kv_planes, max_ctx).num("mix_in", spec.mix_in_rows() as f64).num("mix_out", spec.mix_out_cols() as f64).num("linear_layers", spec.linear_layers() as f64);
     for (n, v) in spec.mixer.iter().flat_map(|m| m.params.iter()) {

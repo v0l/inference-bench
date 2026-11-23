@@ -330,7 +330,7 @@ pub struct Comm {
     gather: Option<(u32, u32)>,
 }
 
-fn kernel_name(mode: Mode, dtype: Dtype) -> String {
+pub fn kernel_name(mode: Mode, dtype: Dtype) -> String {
     match mode {
         Mode::AddRmsNorm { .. } => "ar_add_rmsnorm_f32".into(),
         Mode::Gather { .. } => "ar_gather_f32".into(),
