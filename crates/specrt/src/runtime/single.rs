@@ -60,7 +60,8 @@ impl Runtime {
                 b.arg(&self.embed).arg(&self.buf.token).arg(&self.buf.x);
                 unsafe { b.launch(cfg(grid(hidden, 256), 256)) }?;
             }
-            Op::Gemv { norm, weight, quant, input, output } => self.gemv_op(norm, weight, quant, input, output, index.unwrap_or(s.layers.count.saturating_sub(1)), layer)?,
+            Op::Gemv { norm, weight, quant, input, output } => self.gemv_op(norm, weight, quant, input, output, index.unwrap_or(s.layers.count.saturating_sub(1)), layer, false)?,
+            Op::GemvStore { weight, quant, input, output } => self.gemv_op(None, weight, quant, input, output, index.unwrap_or(s.layers.count.saturating_sub(1)), layer, true)?,
             Op::Swiglu => {
                 let mut b = self.launcher(self.kernel("swiglu"));
                 b.arg(&self.buf.gate_up).arg(&self.buf.act);
@@ -107,11 +108,11 @@ impl Runtime {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn gemv_op(&self, norm: Option<NormKind>, weight: Weight, quant: QuantSource, input: Buf, output: Buf, index: usize, layer: Option<&DeviceLayer>) -> Result<()> {
+    fn gemv_op(&self, norm: Option<NormKind>, weight: Weight, quant: QuantSource, input: Buf, output: Buf, index: usize, layer: Option<&DeviceLayer>, store: bool) -> Result<()> {
         let (w, bias): (&DeviceMatrix, _) = self.weight_of(weight, layer);
         let kind = weight_kind(quant.resolve_for(&self.spec, index, weight));
         ensure!(w.kind() == kind, "{} is planned as {kind:?} but loaded as {:?}", weight.name(), w.kind());
-        let g = crate::gemm::gemv(&self.spec, weight.name(), kind, norm.is_some()).with_context(|| format!("no gemv for {}", weight.name()))?;
+        let g = crate::gemm::gemv_into(&self.spec, weight.name(), kind, norm.is_some(), store).with_context(|| format!("no gemv for {}", weight.name()))?;
         let mut b = self.launcher(self.kernel(g.name));
         w.args(&mut b, &self.buf.dummy);
         if g.bias {

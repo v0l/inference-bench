@@ -426,6 +426,11 @@ impl<'a> Signer<'a> {
                 }
                 s
             }
+            Op::GemvStore { weight, quant, input, output } => {
+                let mut s = self.linear(weight, quant, input, output, layer);
+                s.reads.retain(|t| t.place != Place::Buf(output));
+                s
+            }
             Op::StepAttention => self.attention(layer, true, Tensor::buf(Buf::Attn, Rows::Tokens, spec.q_dim())),
             Op::GdnStep => {
                 let mut s = self.gdn();
@@ -634,10 +639,18 @@ impl Signer<'_> {
 }
 
 pub fn plan_report(spec: &Spec, phase: Phase, count: Count, target: &kir::Target) -> Result<PlanReport> {
-    let plan = Plan::build(spec, phase, true);
-    let signer = Signer::new(spec)?.ranked(ranked(&plan));
+    report_of(spec, &Plan::build(spec, phase, true), count, target)
+}
+
+pub fn compiled_report(spec: &Spec, plan: &Plan, count: Count, target: &kir::Target) -> Result<PlanReport> {
+    report_of(spec, plan, count, target)
+}
+
+fn report_of(spec: &Spec, plan: &Plan, count: Count, target: &kir::Target) -> Result<PlanReport> {
+    let phase = plan.phase;
+    let signer = Signer::new(spec)?.ranked(ranked(plan));
     let mut sections = Vec::new();
-    for s in sections_of(spec, &plan) {
+    for s in sections_of(spec, plan) {
         let mut ops = Vec::new();
         for op in s.ops {
             let sig = signer.signature(op, s.layer)?;

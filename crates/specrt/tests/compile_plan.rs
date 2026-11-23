@@ -119,6 +119,7 @@ fn step_kernels(spec: &Spec) -> Vec<Vec<String>> {
     let fp4 = |i: usize| spec.mlp_quant(i) == Quant::Nvfp4G16;
     let mut out: Vec<Vec<String>> = Vec::new();
     for i in 0..spec.layers.count {
+        let store = |name: &'static str, plain: &'static str| -> Vec<&'static str> { if spec.runtime.store_epilogue { vec![name] } else { vec!["clear_branch", plain] } };
         let mut k: Vec<&str> = Vec::new();
         if i == 0 {
             k.push("embed");
@@ -135,7 +136,12 @@ fn step_kernels(spec: &Spec) -> Vec<Vec<String>> {
                 k.extend(["gate_up_proj", "swiglu"]);
             }
             if spec.uses_branch() {
-                k.extend(["clear_branch", down, if spec.norm.sandwich { "norm_add" } else { "residual_add" }]);
+                if fp4(i) {
+                    k.extend(["clear_branch", down]);
+                } else {
+                    k.extend(store("down_proj_store", down));
+                }
+                k.push(if spec.norm.sandwich { "norm_add" } else { "residual_add" });
             } else {
                 k.push(down);
             }
@@ -150,7 +156,8 @@ fn step_kernels(spec: &Spec) -> Vec<Vec<String>> {
             }
             k.extend(["qk_norm_rope", "attention_split", "attention_reduce"]);
             if spec.uses_branch() {
-                k.extend(["clear_branch", "o_proj", if spec.norm.sandwich { "norm_add" } else { "residual_add" }]);
+                k.extend(store("o_proj_store", "o_proj"));
+                k.push(if spec.norm.sandwich { "norm_add" } else { "residual_add" });
             } else {
                 k.push("o_proj");
             }
@@ -216,6 +223,35 @@ fn the_single_step_plan_is_the_hand_arrangement_for_every_spec_it_runs() {
         checked += 1;
     }
     assert!(checked >= 20, "{checked}");
+}
+
+#[test]
+fn the_store_epilogue_drops_the_branch_clear_from_every_branch_spec() {
+    let mut checked = 0;
+    for (name, mut spec) in all_specs().into_iter().filter(|(_, s)| runs_single_step(s) && s.uses_branch()) {
+        let before: usize = plan_kernels(&spec, &single(&spec, &sm120(), 4096).unwrap()).iter().flatten().filter(|k| *k == "clear_branch").count();
+        spec.runtime.store_epilogue = true;
+        assert_single_matches(&name, &spec);
+        let plan = single(&spec, &sm120(), 4096).unwrap();
+        let kernels: Vec<String> = plan_kernels(&spec, &plan).into_iter().flatten().collect();
+        assert_eq!(kernels.iter().filter(|k| *k == "clear_branch").count(), 0, "{name}");
+        assert_eq!(before, 2 * spec.layers.count, "{name}");
+        let module = specrt::codegen::Module::generate(&spec, 4096).unwrap();
+        for k in kernels.iter().filter(|k| k.ends_with("_store")) {
+            assert!(module.kernels.contains(&k.as_str()), "{name}: {k} is planned but not emitted");
+        }
+        checked += 1;
+    }
+    assert!(checked >= 4, "{checked}");
+}
+
+#[test]
+fn the_store_epilogue_leaves_plans_without_a_branch_alone() {
+    for (name, mut spec) in all_specs().into_iter().filter(|(_, s)| runs_single_step(s) && !s.uses_branch()) {
+        let off = single(&spec, &sm120(), 4096).unwrap();
+        spec.runtime.store_epilogue = true;
+        assert_eq!(single(&spec, &sm120(), 4096).unwrap(), off, "{name}");
+    }
 }
 
 #[test]

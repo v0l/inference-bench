@@ -469,6 +469,25 @@ fn attaching_the_norm_prologue_rebuilds_linear_norm_and_gate_up_act_norm() {
 }
 
 #[test]
+fn filling_the_residual_with_zero_leaves_the_store_epilogue() {
+    let t = Target::sm_120();
+    for bias in [false, true] {
+        let mut h = bare_gemv("o_proj_store", WeightFormat::Bf16, HIDDEN, bias);
+        h.epilogue = heavy::epilogue(Epilogue::Residual, bias, HIDDEN).unwrap();
+        let filled = h.fill(&t, "epilogue_fill", heavy::OUT, 0.0).unwrap();
+        assert_eq!(filled.epilogue, heavy::epilogue(Epilogue::Store, bias, HIDDEN).unwrap(), "bias {bias}");
+        let hand = GemvKernel::new(&t, "o_proj_store", Gemv::Linear { decoder: "DecBf16".into(), n: HIDDEN, k: HIDDEN, bias, residual: false }).unwrap();
+        assert_eq!(filled.compile_gemv(&t, "epilogue_fill").unwrap(), hand);
+    }
+    let mut h = bare_gemv("o_proj_store", WeightFormat::Bf16, HIDDEN, false);
+    h.epilogue = heavy::epilogue(Epilogue::Residual, false, HIDDEN).unwrap();
+    let err = h.clone().fill(&t, "epilogue_fill", heavy::OUT, 1.0).unwrap_err().to_string();
+    assert!(err.contains("pass epilogue_fill") && err.contains("o_proj_store") && err.contains("no gemv emitter"), "{err}");
+    let err = bare_gemv("qkv_proj", WeightFormat::Bf16, 14336, false).fill(&t, "epilogue_fill", heavy::OUT, 0.0).unwrap_err().to_string();
+    assert!(err.contains("pass epilogue_fill") && err.contains("reads no"), "{err}");
+}
+
+#[test]
 fn a_gemv_slot_list_no_emitter_spells_is_refused_naming_the_pass() {
     let t = Target::sm_120();
     let act = heavy::epilogue_into(Epilogue::Act, false, 2 * INTER, heavy::OUT).unwrap();

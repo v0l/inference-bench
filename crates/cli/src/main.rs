@@ -284,6 +284,8 @@ enum Cmd {
         plan: bool,
         #[arg(long, help = "With --plan: print the fusion groups the cost model and legality checks pick, and why each other pair stays apart (dry run)")]
         fusion: bool,
+        #[arg(long, help = "With --plan: count the single stream decode plan the compiler passes produce, the one the runtime launches")]
+        compiled: bool,
         #[arg(long, default_value_t = 1, help = "Tokens in the step the plan report counts")]
         tokens: usize,
         #[arg(long, help = "Context per sequence the attention reads; the token count when omitted")]
@@ -430,7 +432,7 @@ fn probe_links(placement: &mut inference_bench_core::specrt_placement::Placement
     placement.apply_network_rtts(&rtts);
 }
 
-fn kernels_command(data: &Path, spec: &str, target: Option<&str>, plan: Option<(&str, usize, Option<usize>)>, fusion: bool) -> Result<()> {
+fn kernels_command(data: &Path, spec: &str, target: Option<&str>, plan: Option<(&str, usize, Option<usize>)>, fusion: bool, compiled: bool) -> Result<()> {
     let path = resolve_spec_names(data, spec);
     let spec = specrt::spec::Spec::load(Path::new(&path))?;
     let target = match target {
@@ -446,6 +448,11 @@ fn kernels_command(data: &Path, spec: &str, target: Option<&str>, plan: Option<(
             other => bail!("phase {other:?} is not prefill, decode or verify"),
         };
         let count = specrt::signature::Count::new(phase, tokens, context.unwrap_or(tokens));
+        if compiled {
+            let single = specrt::compile::single(&spec, &target, count.context.max(1))?;
+            print!("{}", specrt::signature::compiled_report(&spec, &single, count, &target)?.render());
+            return Ok(());
+        }
         if fusion {
             let built = specrt::plan::Plan::build(&spec, phase, target.language == kir::Language::Cuda);
             let costs = specrt::fusion::Costs::for_target(&target);
@@ -715,11 +722,11 @@ fn main() -> Result<()> {
         }
         Cmd::Spec { model, out, expect_act_quant } => spec_command(model, out.as_deref(), expect_act_quant.as_deref())?,
         Cmd::Warmup { spec, max_ctx, slots } => warmup_command(&data, spec, *max_ctx, *slots)?,
-        Cmd::Kernels { spec, target, plan, fusion, tokens, context, phase } => {
-            if *fusion && !*plan {
-                bail!("--fusion needs --plan");
+        Cmd::Kernels { spec, target, plan, fusion, compiled, tokens, context, phase } => {
+            if (*fusion || *compiled) && !*plan {
+                bail!("--fusion and --compiled need --plan");
             }
-            kernels_command(&data, spec, target.as_deref(), plan.then_some((phase.as_str(), *tokens, *context)), *fusion)?
+            kernels_command(&data, spec, target.as_deref(), plan.then_some((phase.as_str(), *tokens, *context)), *fusion, *compiled)?
         }
         Cmd::Plan { spec, config, context, slots, objective, probe } => plan_command(&data, spec, config, *context, *slots, objective.as_deref(), *probe)?,
     }

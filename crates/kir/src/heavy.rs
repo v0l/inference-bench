@@ -414,4 +414,54 @@ impl Heavy {
         self.check(t, pass)?;
         Ok(self)
     }
+
+    pub fn fill(mut self, t: &Target, pass: &str, src: &str, value: f32) -> Result<Heavy, HeavyError> {
+        let lower = |reason: String| HeavyError::Lower { pass: pass.into(), kernel: self.name.clone(), reason };
+        let filled: Vec<String> = self.epilogue.iter().filter_map(|s| match s {
+            Stage::TileLoad { dst, src: from, .. } if from == src => Some(dst.clone()),
+            _ => None,
+        }).collect();
+        if filled.is_empty() {
+            return Err(lower(format!("the epilogue reads no {src}")));
+        }
+        let constant = Expr::Lit(format!("{value:?}"));
+        let mut alias: Vec<(String, String)> = Vec::new();
+        let mut out = Vec::new();
+        for s in std::mem::take(&mut self.epilogue) {
+            let s = alias.iter().try_fold(s, |s, (from, to)| rename(s, from, to)).map_err(lower)?;
+            match s {
+                Stage::TileLoad { ref dst, .. } if filled.contains(dst) => {}
+                Stage::Epilogue { dst, expr, mat } => {
+                    let expr = fold_zero(expr.subst(&|n| Some(if filled.iter().any(|f| f == n) { constant.clone() } else { Expr::Name(n.to_string()) })).map_err(lower)?);
+                    match expr {
+                        Expr::Name(n) => alias.push((dst, n)),
+                        expr => out.push(Stage::Epilogue { dst, expr, mat }),
+                    }
+                }
+                s => out.push(s),
+            }
+        }
+        self.epilogue = out;
+        self.check(t, pass)?;
+        Ok(self)
+    }
+}
+
+fn is_zero(e: &Expr) -> bool {
+    matches!(e, Expr::Lit(t) if t.parse::<f64>().is_ok_and(|v| v == 0.0))
+}
+
+fn fold_zero(e: Expr) -> Expr {
+    match e {
+        Expr::Bin(op, a, b) => {
+            let (a, b) = (fold_zero(*a), fold_zero(*b));
+            match op {
+                crate::expr::Op::Add if is_zero(&b) => a,
+                crate::expr::Op::Add if is_zero(&a) => b,
+                crate::expr::Op::Sub if is_zero(&b) => a,
+                op => Expr::Bin(op, Box::new(a), Box::new(b)),
+            }
+        }
+        e => e,
+    }
 }

@@ -111,7 +111,7 @@ impl Runtime {
             Op::MoeCombine => self.moe_combine(if self.comm.is_some() { &self.partial } else { &self.pre.x }, n),
             Op::AllReduce => self.allreduce_op(n),
             Op::AllReduceNorm { which } => self.allreduce_norm_op(which, layer, n),
-            Op::Gemv { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
+            Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
         }
     }
 

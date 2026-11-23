@@ -149,6 +149,7 @@ pub enum Rule {
     Epilogue,
     Light,
     Pair,
+    Fill,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -514,6 +515,10 @@ enum Apply {
     Pair { producer: usize, consumer: usize },
 }
 
+fn constant(units: &[Unit], g: &BTreeSet<usize>) -> bool {
+    g.iter().all(|&u| units[u].reads.is_empty() && units[u].class == Class::Elementwise && units[u].launches == 1)
+}
+
 impl Engine<'_> {
     fn bytes(&self, t: &Tensor) -> u64 {
         t.bytes(&self.count)
@@ -785,11 +790,57 @@ impl Engine<'_> {
         Ok(())
     }
 
+    fn fill(&self, edges: &BTreeSet<(usize, usize)>, a: usize, b: usize) -> Candidate {
+        let (g1, g2) = (&self.groups[a], &self.groups[b]);
+        let merged: BTreeSet<usize> = g1.union(g2).copied().collect();
+        let after: Vec<BTreeSet<usize>> = self.groups.iter().enumerate().filter(|(i, _)| *i != a && *i != b).map(|(_, g)| g.clone()).chain([merged.clone()]).collect();
+        let mut saving = self.launches(g1) as u64 * self.costs.launch_bytes;
+        let mut held = false;
+        for (v, reads) in self.flow(g1, g2) {
+            held |= Self::needs_memory(&after, v);
+            saving += self.bytes(&v.tensor) + reads.iter().map(|t| self.bytes(t)).sum::<u64>();
+        }
+        let verdict = self.fill_legal(edges, a, b, &merged, held);
+        Candidate { decision: self.decision(Rule::Fill, g1, &[g2], saving, 0, verdict), apply: Apply::Pair { producer: b, consumer: a } }
+    }
+
+    fn fill_legal(&self, edges: &BTreeSet<(usize, usize)>, a: usize, b: usize, merged: &BTreeSet<usize>, held: bool) -> Result<(), Reason> {
+        let (g1, g2) = (&self.groups[a], &self.groups[b]);
+        if merged.iter().any(|&u| self.units[u].opaque()) {
+            return Err(Reason::Opaque);
+        }
+        self.realisable(merged)?;
+        if g2.iter().any(|&u| self.units[u].barrier) {
+            return Err(Reason::Barrier);
+        }
+        let anchor = self.anchor(g2);
+        let readers: Vec<usize> = self.values.iter().filter(|v| g1.contains(&v.writer)).flat_map(|v| v.readers.iter().map(|(r, _)| *r)).filter(|r| g2.contains(r)).collect();
+        if readers.iter().any(|&r| Some(r) == anchor || !self.units[r].light()) {
+            return Err(Reason::NotElementwise);
+        }
+        if !self.rows_match(g1, g2) {
+            return Err(Reason::Rows);
+        }
+        if Self::path_between(edges, a, b) {
+            return Err(Reason::Path);
+        }
+        if held {
+            return Err(Reason::Readers);
+        }
+        Ok(())
+    }
+
     fn candidates(&self) -> Vec<Candidate> {
         let edges = self.edges();
         let mut out = Vec::new();
         let mut prologued = BTreeSet::new();
         for &(a, b) in &edges {
+            if constant(self.units, &self.groups[a]) {
+                if self.anchor(&self.groups[b]).is_some() {
+                    out.push(self.fill(&edges, a, b));
+                }
+                continue;
+            }
             let light = self.anchor(&self.groups[a]).is_none();
             if light && self.heavy(&self.groups[b]).is_some() {
                 if prologued.insert(a)
@@ -877,7 +928,7 @@ impl Engine<'_> {
     }
 }
 
-const PHASES: [&[Rule]; 2] = [&[Rule::Epilogue, Rule::Light], &[Rule::Prologue]];
+const PHASES: [&[Rule]; 2] = [&[Rule::Epilogue, Rule::Light, Rule::Fill], &[Rule::Prologue]];
 
 fn fuse_section(units: Vec<Unit>, internal: &BTreeSet<Place>, costs: &Costs, count: Count, name: String, repeats: usize, library: Option<Library>) -> SectionFusion {
     let vals = values(&units, internal);
