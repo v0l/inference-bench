@@ -24,7 +24,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn hf(name: &str, label: &str) -> Spec {
-    let mut s = Spec::from_hf_config(&std::fs::read_to_string(fixture(name)).unwrap()).unwrap();
+    let mut s = Spec::from_hf_config_serving(&std::fs::read_to_string(fixture(name)).unwrap()).unwrap();
     s.name = label.into();
     s
 }
@@ -51,6 +51,8 @@ fn specs() -> Vec<Spec> {
         hf("qwen3.5-4b-base.config.json", "4b-bf16"),
         hf("qwen3.5-122b-a10b-nvfp4.config.json", "122b-nvfp4"),
         moe128,
+        hf("gpt-oss-20b.config.json", "gpt-oss-20b"),
+        hf("glm4.5-air.config.json", "glm4.5-air"),
         with_attention(q27.clone(), "hd128-gqa8", 32, 4, 128),
         with_attention(q27, "hd128-gqa4", 32, 8, 128),
     ]
@@ -105,12 +107,19 @@ fn rows_for(spec: &Spec, module: &Module, t: &Target) -> Vec<Value> {
     if has("batch_decode_attention") {
         let splits = specrt::codegen::decode_splits(DECODE_CTX);
         let warps = specrt::codegen::decode_warps(a.heads / a.kv_heads, 1);
-        for seqs in [1usize, 8] {
+        for seqs in [8usize] {
             for ctx in [1024usize, 8192, 32768] {
                 let p = with(json!({ "seqs": seqs, "ctx": ctx, "splits": splits }));
                 out.push(row("decode_attention", spec, "batch_decode_attention", [a.kv_heads, seqs, splits], 32 * warps, module.smem["batch_decode_attention"], p.clone()));
                 out.push(row("decode_attention", spec, "batch_decode_combine", [a.heads, seqs, 1], a.head_dim / 2, 0, p));
             }
+        }
+    }
+    if has("attention_split") {
+        for ctx in [1024usize, 8192, 32768] {
+            let p = with(json!({ "seqs": 1, "ctx": ctx, "splits": 64, "path": "single step" }));
+            out.push(row("decode_attention", spec, "attention_split", [a.kv_heads, 64, 1], kir::attention::SPLIT_BLOCK as usize, 0, p.clone()));
+            out.push(row("decode_attention", spec, "attention_reduce", [a.heads, 1, 1], a.head_dim.max(32), 0, p));
         }
     }
     if has("flash_mma") {
@@ -184,7 +193,7 @@ fn sm_name(t: &Target, arch_features: bool) -> String {
 
 fn compile(dir: &Path, stem: &str, source: &kir::KirSource, sm: &str, entry: &mut serde_json::Map<String, Value>) {
     std::fs::write(dir.join(format!("{stem}.cu")), source.as_str()).unwrap();
-    match specrt::jit::cubin_for(source, sm, 8) {
+    match specrt::jit::cubin_for(source, sm, 1) {
         Ok(bytes) => {
             std::fs::write(dir.join(format!("{stem}.cubin")), bytes).unwrap();
             entry.insert("cubin".into(), json!(format!("{stem}.cubin")));
@@ -278,7 +287,7 @@ fn dump_static_kernels() {
         std::fs::create_dir_all(&dir).unwrap();
         let mut m = manifest_for(&gpu, Some(&dir));
         m["nvrtc"] = json!(format!("{major}.{minor}"));
-        m["options"] = json!(["--std=c++17", "--split-compile=8"]);
+        m["options"] = json!(["--std=c++17", "no --split-compile (it makes register allocation nondeterministic)"]);
         std::fs::write(dir.join("manifest.json"), serde_json::to_string_pretty(&m).unwrap()).unwrap();
         eprintln!("{}: {} modules", gpu.name, m["modules"].as_array().unwrap().len());
     }
