@@ -11,6 +11,7 @@ pub(super) enum StackWeights {
     Fp4 { packed: CudaSlice<u8>, scales: CudaSlice<u8>, inv_global: CudaSlice<f32>, input_global: f32 },
     Fp8 { values: CudaSlice<u8>, grid: CudaSlice<f32> },
     Block { packed: CudaSlice<u8>, scales: CudaSlice<u8> },
+    Ggml { data: CudaSlice<u8>, tables: CudaSlice<u32> },
 }
 
 pub(super) struct DeviceMoe {
@@ -39,6 +40,7 @@ impl StackWeights {
             Stacked::Bf16(w) => StackWeights::Bf16(stream.clone_htod(w)?),
             Stacked::Fp8 { values, grid } => StackWeights::Fp8 { values: stream.clone_htod(values)?, grid: stream.clone_htod(grid)? },
             Stacked::Block { packed, scales } => StackWeights::Block { packed: stream.clone_htod(packed)?, scales: stream.clone_htod(scales)? },
+            Stacked::Ggml { data, tables } => StackWeights::Ggml { data: stream.clone_htod(data)?, tables: stream.clone_htod(tables)? },
             Stacked::Fp4 { packed, scales, inv_global, input_global } => StackWeights::Fp4 {
                 input_global: *input_global,
                 packed: stream.clone_htod(packed)?,
@@ -53,6 +55,7 @@ impl StackWeights {
             StackWeights::Bf16(w) => w.num_bytes(),
             StackWeights::Fp8 { values, grid } => values.num_bytes() + grid.num_bytes(),
             StackWeights::Block { packed, scales } => packed.num_bytes() + scales.num_bytes(),
+            StackWeights::Ggml { data, tables } => data.num_bytes() + tables.num_bytes(),
             StackWeights::Fp4 { packed, scales, inv_global, .. } => packed.num_bytes() + scales.num_bytes() + inv_global.num_bytes(),
         }) as u64
     }
@@ -67,6 +70,7 @@ impl StackWeights {
             StackWeights::Fp4 { .. } => "fp4",
             StackWeights::Fp8 { .. } => "fp8",
             StackWeights::Block { .. } => "mx",
+            StackWeights::Ggml { .. } => "gg",
         }
     }
 }
@@ -259,6 +263,7 @@ impl Runtime {
             StackWeights::Fp8 { values, grid } => b.arg(values).arg(&self.pre.dummy_u8).arg(grid),
             StackWeights::Fp4 { packed, scales, inv_global, .. } => b.arg(packed).arg(scales).arg(inv_global),
             StackWeights::Block { packed, scales } => b.arg(packed).arg(scales).arg(&self.buf.dummy),
+            StackWeights::Ggml { data, tables } => b.arg(data).arg(tables).arg(&self.buf.dummy),
         };
     }
 

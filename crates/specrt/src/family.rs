@@ -182,6 +182,7 @@ pub struct FamilyMoe {
     pub fused_experts: bool,
     pub input_scaled: bool,
     pub experts_transposed: bool,
+    pub quantized_experts: bool,
     pub hash_table: Option<String>,
 }
 

@@ -13,6 +13,7 @@ enum Kind {
     Fp4,
     Fp8,
     Block,
+    Ggml,
 }
 
 struct Part {
@@ -66,6 +67,7 @@ fn comps(s: &Stacked) -> (Kind, Vec<&[u8]>) {
         Stacked::Fp4 { packed, scales, inv_global, .. } => (Kind::Fp4, vec![packed, scales, as_bytes(inv_global)]),
         Stacked::Fp8 { values, grid } => (Kind::Fp8, vec![values, as_bytes(grid)]),
         Stacked::Block { packed, scales } => (Kind::Block, vec![packed, scales]),
+        Stacked::Ggml { data, tables } => (Kind::Ggml, vec![data, as_bytes(tables)]),
     }
 }
 
@@ -131,6 +133,7 @@ impl HostExperts {
                 Kind::Bf16 => StackWeights::Bf16(stream.alloc_zeros(cap * per.next().unwrap() / 2)?),
                 Kind::Fp8 => StackWeights::Fp8 { values: stream.alloc_zeros(cap * per.next().unwrap())?, grid: stream.alloc_zeros(cap * per.next().unwrap() / 4)? },
                 Kind::Block => StackWeights::Block { packed: stream.alloc_zeros(cap * per.next().unwrap())?, scales: stream.alloc_zeros(cap * per.next().unwrap())? },
+                Kind::Ggml => StackWeights::Ggml { data: stream.alloc_zeros(cap * per.next().unwrap())?, tables: stream.alloc_zeros(cap * per.next().unwrap() / 4)? },
                 Kind::Fp4 => StackWeights::Fp4 {
                     input_global: 1.0,
                     packed: stream.alloc_zeros(cap * per.next().unwrap())?,
@@ -155,6 +158,7 @@ fn pointers(stream: &Arc<CudaStream>, s: &Stacks) -> Vec<CUdeviceptr> {
             StackWeights::Bf16(a) => out.push(address(stream, a)),
             StackWeights::Fp8 { values, grid } => out.extend([address(stream, values), address(stream, grid)]),
             StackWeights::Block { packed, scales } => out.extend([address(stream, packed), address(stream, scales)]),
+            StackWeights::Ggml { data, tables } => out.extend([address(stream, data), address(stream, tables)]),
             StackWeights::Fp4 { packed, scales, inv_global, .. } => out.extend([address(stream, packed), address(stream, scales), address(stream, inv_global)]),
         }
     }

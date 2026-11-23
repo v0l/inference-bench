@@ -1,4 +1,5 @@
 use super::prim;
+use crate::cuda::attention::prim::{Reduce, warp_reduce};
 
 fn dot_fp4() -> &'static str {
     "        const unsigned char* wb = (const unsigned char*)w + at * (K / 2);\n        const unsigned char* sb = s + at * (K / 16);\n        float col[1] = {0.0f};\n        moe_rows_fp4<K, 1>(wb, sb, xs, lane, 1, col);\n        acc = col[0] * g[expert];\n"
@@ -71,12 +72,12 @@ fn dot2() -> String {
 const UP_ARGS: &str = "const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug, const float* eb";
 const UP_CALL: &str = "gw, gs, gg, uw, us, ug, eb";
 
-fn up_impl() -> String {
+fn up_impl(name: &str, dot: &str) -> String {
     format!(
         "template <int Q>\n{}",
         prim::device(
             "void",
-            "moe_up_impl",
+            name,
             &format!("{UP_ARGS}, const float* xn, const int* idx, float* act"),
             &format!(
                 r##"    __shared__ __align__(16) float xs[HIDDEN];
@@ -88,8 +89,8 @@ fn up_impl() -> String {
     __syncthreads();
 {}    int row = blockIdx.y * MOE_WARPS + warp;
     if (row >= MOE_INTER) return;
-    float g = MOE_MAPPED ? 0.0f : moe_dot<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
-    float u = moe_dot<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane);
+    float g = MOE_MAPPED ? 0.0f : {dot}<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane);
+    float u = {dot}<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane);
     if (MOE_EBIAS) {{
         g += eb[(size_t)expert * 2 * MOE_INTER + row];
         u += eb[((size_t)expert * 2 + 1) * MOE_INTER + row];
@@ -102,12 +103,12 @@ fn up_impl() -> String {
     )
 }
 
-fn down_impl() -> String {
+fn down_impl(name: &str, dot: &str) -> String {
     format!(
         "template <int Q>\n{}",
         prim::device(
             "void",
-            "moe_down_impl",
+            name,
             "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* idx, float* out",
             &format!(
                 r##"    __shared__ __align__(16) float xs[MOE_INTER];
@@ -118,7 +119,7 @@ fn down_impl() -> String {
     __syncthreads();
 {}    int row = blockIdx.y * MOE_WARPS + warp;
     if (row >= HIDDEN) return;
-    float v = moe_dot<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane);
+    float v = {dot}<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane);
     if (MOE_EBIAS) v += db[(size_t)expert * HIDDEN + row];
     if (lane == 0) out[(size_t)pair * HIDDEN + row] = v;
 "##,
@@ -128,12 +129,12 @@ fn down_impl() -> String {
     )
 }
 
-fn group_up_impl() -> String {
+fn group_up_impl(name: &str, dot2: &str) -> String {
     format!(
         "template <int Q>\n{}",
         prim::device(
             "void",
-            "moe_group_up_impl",
+            name,
             &format!("{UP_ARGS}, const float* xn, const int* offsets, const int* sorted, float* act"),
             &format!(
                 r##"    __shared__ __align__(16) float xs[MOE_TJ * HIDDEN];
@@ -151,8 +152,8 @@ fn group_up_impl() -> String {
         __syncthreads();
         if (row < MOE_INTER) {{
             float gv[MOE_TJ], uv[MOE_TJ];
-            if (!MOE_MAPPED) moe_dot2<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
-            moe_dot2<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane, live, uv);
+            if (!MOE_MAPPED) {dot2}<Q, HIDDEN, MOE_INTER>(gw, gs, gg, expert, row, xs, lane, live, gv);
+            {dot2}<Q, HIDDEN, MOE_INTER>(uw, us, ug, expert, row, xs, lane, live, uv);
             if (MOE_EBIAS) {{
                 for (int j = 0; j < live; j++) {{
                     gv[j] += eb[(size_t)expert * 2 * MOE_INTER + row];
@@ -171,12 +172,12 @@ fn group_up_impl() -> String {
     )
 }
 
-fn group_down_impl() -> String {
+fn group_down_impl(name: &str, dot2: &str) -> String {
     format!(
         "template <int Q>\n{}",
         prim::device(
             "void",
-            "moe_group_down_impl",
+            name,
             "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* offsets, const int* sorted, float* out",
             &format!(
                 r##"    __shared__ __align__(16) float xs[MOE_TJ * MOE_INTER];
@@ -194,7 +195,7 @@ fn group_down_impl() -> String {
         __syncthreads();
         if (row < HIDDEN) {{
             float v[MOE_TJ];
-            moe_dot2<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane, live, v);
+            {dot2}<Q, MOE_INTER, HIDDEN>(w, s, g, expert, row, xs, lane, live, v);
             if (MOE_EBIAS) {{
                 for (int j = 0; j < live; j++) v[j] += db[(size_t)expert * HIDDEN + row];
             }}
@@ -223,8 +224,8 @@ pub fn gemv() -> String {
     out.push_str(&prim::multi_row_dot("moe_rows_fp4", prim::RowFormat::Fp4Rows { decode: "moe_e2m1" }, prim::RowLoad { unroll: 0, stream: false }));
     out.push_str(&prim::multi_row_dot("moe_rows_mx", prim::RowFormat::Mx { decode: "moe_e2m1", block: "MOE_BLOCK" }, prim::RowLoad { unroll: 0, stream: false }));
     out.push_str(&dot());
-    out.push_str(&up_impl());
-    out.push_str(&down_impl());
+    out.push_str(&up_impl("moe_up_impl", "moe_dot"));
+    out.push_str(&down_impl("moe_down_impl", "moe_dot"));
     out
 }
 
@@ -239,8 +240,59 @@ pub fn grouped() -> String {
     let mut out = prim::multi_row_dot("moe_rows_fp8", prim::RowFormat::Fp8, prim::RowLoad { unroll: 0, stream: false });
     out.push_str(&prim::multi_row_dot("moe_rows_bf16", prim::RowFormat::Bf16, prim::RowLoad { unroll: 8, stream: true }));
     out.push_str(&dot2());
-    out.push_str(&group_up_impl());
-    out.push_str(&group_down_impl());
+    out.push_str(&group_up_impl("moe_group_up_impl", "moe_dot2"));
+    out.push_str(&group_down_impl("moe_group_down_impl", "moe_dot2"));
+    out
+}
+
+fn ggml_rows() -> &'static str {
+    "    const unsigned* tb = s + (size_t)expert * (ROWS + 1);\n    const unsigned char* wb = (const unsigned char*)w + (size_t)expert * tb[ROWS] * 16;\n"
+}
+
+fn dot_ggml() -> String {
+    format!(
+        "template <int Q, int K, int ROWS>\n{}",
+        prim::device(
+            "float",
+            "moe_dot_gg",
+            "const void* w, const unsigned* s, const float* g, int expert, int row, const float* xs, int lane",
+            &format!("{}    return {};\n", ggml_rows(), warp_reduce(Reduce::Sum, "DecGgml::dot<K>(wb, tb, row, xs, lane)"))
+        )
+    )
+}
+
+fn dot2_ggml() -> String {
+    format!(
+        "template <int Q, int K, int ROWS>\n{}",
+        prim::device(
+            "void",
+            "moe_dot2_gg",
+            "const void* w, const unsigned* s, const float* g, int expert, int row, const float* xs, int lane, int live, float* result",
+            &format!(
+                "{}#pragma unroll\n    for (int j = 0; j < MOE_TJ; j++) result[j] = j < live ? {} : 0.0f;\n",
+                ggml_rows(),
+                warp_reduce(Reduce::Sum, "DecGgml::dot<K>(wb, tb, row, xs + j * K, lane)")
+            )
+        )
+    )
+}
+
+const GG_UP_ARGS: &str = "const void* gw, const unsigned* gs, const float* gg, const void* uw, const unsigned* us, const float* ug, const float* eb";
+
+pub fn ggml_experts() -> String {
+    let mut out = String::new();
+    out.push_str(&dot_ggml());
+    out.push_str(&dot2_ggml());
+    out.push_str(&up_impl("moe_up_gg_impl", "moe_dot_gg").replace(UP_ARGS, GG_UP_ARGS));
+    out.push_str(&down_impl("moe_down_gg_impl", "moe_dot_gg").replace("const unsigned char* s", "const unsigned* s"));
+    out.push_str(&group_up_impl("moe_group_up_gg_impl", "moe_dot2_gg").replace(UP_ARGS, GG_UP_ARGS));
+    out.push_str(&group_down_impl("moe_group_down_gg_impl", "moe_dot2_gg").replace("const unsigned char* s", "const unsigned* s"));
+    let down = |rest: &str| format!("const void* w, const unsigned* s, const float* g, const float* db, const float* act, {rest}, float* out");
+    let t = crate::moe::EXPERT_THREADS;
+    out.push_str(&prim::delegate(t, "moe_up_gg", &format!("{GG_UP_ARGS}, const float* xn, const int* idx, float* act"), "moe_up_gg_impl<4>", &format!("{UP_CALL}, xn, idx, act")));
+    out.push_str(&prim::delegate(t, "moe_down_gg", &down("const int* idx"), "moe_down_gg_impl<4>", "w, s, g, db, act, idx, out"));
+    out.push_str(&prim::delegate(t, "moe_group_up_gg", &format!("{GG_UP_ARGS}, const float* xn, const int* offsets, const int* sorted, float* act"), "moe_group_up_gg_impl<4>", &format!("{UP_CALL}, xn, offsets, sorted, act")));
+    out.push_str(&prim::delegate(t, "moe_group_down_gg", &down("const int* offsets, const int* sorted"), "moe_group_down_gg_impl<4>", "w, s, g, db, act, offsets, sorted, out"));
     out
 }
 

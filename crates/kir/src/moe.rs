@@ -12,6 +12,7 @@ pub use crate::ops::MoeShape;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     Experts,
+    ExpertsGgml,
     GroupedMma,
     GroupedMx,
     GroupedMmaFp8,
@@ -44,6 +45,7 @@ impl Family {
                 "moe_group_up_mx",
                 "moe_group_down_mx",
             ],
+            Family::ExpertsGgml => &["moe_up_gg", "moe_down_gg", "moe_group_up_gg", "moe_group_down_gg"],
             Family::GroupedMma => &["moe_quant_f32", "moe_tiles", "moe_mma_up", "moe_mma_up_s", "moe_mma_down", "moe_mma_down_s"],
             Family::GroupedMmaBf16 => &["moe_split_bf16", "moe_tiles_b16", "moe_mma_up_b16", "moe_mma_up_b16_s", "moe_mma_down_b16", "moe_mma_down_b16_s"],
             Family::GroupedMmaFp8 => &["moe_quant_f8", "moe_tiles_f8", "moe_mma_up_f8", "moe_mma_up_f8_s", "moe_mma_down_f8", "moe_mma_down_f8_s"],
@@ -64,7 +66,7 @@ impl Family {
 
     pub fn needs(self) -> &'static [Feature] {
         match self {
-            Family::Experts => &[Feature::WarpShuffle],
+            Family::Experts | Family::ExpertsGgml => &[Feature::WarpShuffle],
             Family::GroupedMma | Family::GroupedMx => &[Feature::BlockScaledFp4, Feature::CpAsync],
             Family::GroupedMmaFp8 => &[Feature::Fp8Mma, Feature::CpAsync],
             Family::GroupedMmaBf16 => &[Feature::Mma16816, Feature::CpAsync],
@@ -162,6 +164,9 @@ impl MoeKernel {
         if self.family == Family::Experts && route_logits_smem(s.hidden) > t.smem_limit {
             return bad(format!("moe_route_logits needs {} bytes of shared memory, the target allows {}", route_logits_smem(s.hidden), t.smem_limit));
         }
+        if self.family == Family::ExpertsGgml && !(s.hidden.is_multiple_of(crate::ggml::SUPER_BLOCK) && s.inter.is_multiple_of(crate::ggml::SUPER_BLOCK)) {
+            return bad(format!("ggml expert rows need hidden {} and intermediate {} to be multiples of {}", s.hidden, s.inter, crate::ggml::SUPER_BLOCK));
+        }
         if matches!(self.family, Family::GroupedMma | Family::GroupedMx | Family::GroupedMmaFp8 | Family::GroupedMmaBf16) {
             if !s.inter.is_multiple_of(MMA_BN) {
                 return bad(format!("expert intermediate {} must be a multiple of {MMA_BN}", s.inter));
@@ -182,6 +187,7 @@ impl MoeKernel {
         let up = if self.shape.mapped { 1 } else { 2 };
         match self.family {
             Family::Experts => vec![("moe_route_logits", route_logits_smem(self.shape.hidden))],
+            Family::ExpertsGgml => Vec::new(),
             Family::GroupedMma => vec![
                 ("moe_mma_up", mma_smem(MMA_BM, 2)),
                 ("moe_mma_up_s", mma_smem(MMA_BM_SMALL, 2)),

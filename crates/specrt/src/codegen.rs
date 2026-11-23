@@ -41,6 +41,10 @@ pub fn moe_mma_fp8_enabled(spec: &Spec, target: &kir::Target) -> bool {
         && spec.dims.hidden.is_multiple_of(FP8_BLOCK)
 }
 
+pub fn moe_ggml_experts(spec: &Spec) -> bool {
+    spec.moe.as_ref().is_some_and(|m| m.quantized_experts) && matches!(spec.mlp.quant.unwrap_or(spec.quant), Quant::Gguf | Quant::Q8)
+}
+
 pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::MoeKernel>> {
     let Some(m) = &spec.moe else { return Ok(Vec::new()) };
     let shape = kir::moe::MoeShape {
@@ -67,6 +71,9 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         input_scaled: m.input_scaled,
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
+    if moe_ggml_experts(spec) {
+        out.push(kir::moe::MoeKernel::new(target, kir::moe::Family::ExpertsGgml, shape.clone()).map_err(anyhow::Error::msg)?);
+    }
     if moe_mma_enabled(spec, target) {
         let family = if m.expert_block.is_some() { kir::moe::Family::GroupedMx } else { kir::moe::Family::GroupedMma };
         out.push(kir::moe::MoeKernel::new(target, family, shape.clone()).map_err(anyhow::Error::msg)?);

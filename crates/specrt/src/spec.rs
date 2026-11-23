@@ -648,6 +648,8 @@ pub struct Moe {
     pub input_scaled: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub experts_transposed: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quantized_experts: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub hash_layers: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1553,6 +1555,7 @@ impl Spec {
             "mixture-of-experts with {experts_quant:?} expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are)"
         );
         ensure!(m.active.is_some_and(|k| k >= 1 && k <= m.experts), "mixture-of-experts needs num_experts_per_tok between 1 and the expert count");
+        ensure!(!m.quantized_experts || matches!(experts_quant, Quant::Gguf | Quant::Q8), "[moe] quantized_experts keeps GGUF expert blocks and needs GGUF weights, not {experts_quant:?}");
         ensure!(m.expert_intermediate.is_multiple_of(256) || experts_quant == Quant::Bf16, "nvfp4 experts need an intermediate size that is a multiple of 256");
         ensure!(m.expert_intermediate.is_multiple_of(16) && m.shared_intermediate.is_multiple_of(16), "expert intermediate sizes must be multiples of 16");
         ensure!(
@@ -1792,6 +1795,7 @@ impl Spec {
                     fused_experts: family.moe.fused_experts,
                     input_scaled: family.moe.input_scaled,
                     experts_transposed: family.moe.experts_transposed,
+                    quantized_experts: false,
                     hash_layers: if family.moe.hash_table.is_some() { hf.num_hash_layers.unwrap_or(0) } else { 0 },
                     hash_table: family.moe.hash_table.clone(),
                     tp_split: TpSplit::Auto,

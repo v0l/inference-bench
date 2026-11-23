@@ -200,16 +200,23 @@ impl MlpParts {
         self.dense + self.routed + self.shared + self.router
     }
 
-    fn bytes(&self, q: Quant) -> u64 {
-        quant_bytes(self.dense, q) + quant_bytes(self.routed, q) + quant_bytes(self.shared, q) + 2 * self.router
+    fn bytes(&self, q: Quant, experts: Quant) -> u64 {
+        quant_bytes(self.dense, q) + quant_bytes(self.routed, experts) + quant_bytes(self.shared, experts) + 2 * self.router
     }
 
     fn active(&self) -> u64 {
         self.dense + self.active_routed + self.shared + self.router
     }
 
-    fn active_bytes(&self, q: Quant) -> u64 {
-        quant_bytes(self.dense, q) + quant_bytes(self.active_routed, q) + quant_bytes(self.shared, q) + 2 * self.router
+    fn active_bytes(&self, q: Quant, experts: Quant) -> u64 {
+        quant_bytes(self.dense, q) + quant_bytes(self.active_routed, experts) + quant_bytes(self.shared, experts) + 2 * self.router
+    }
+}
+
+pub fn expert_quant(spec: &Spec, q: Quant) -> Quant {
+    match &spec.moe {
+        Some(m) if matches!(q, Quant::Gguf | Quant::Q8) && !m.quantized_experts => Quant::Bf16,
+        _ => q,
     }
 }
 
@@ -264,10 +271,10 @@ fn layer(spec: &Spec, index: usize) -> LayerInfo {
         routed_params: parts.routed,
         shared_params: parts.shared,
         active_params: mixer_params + parts.active() + norm_params,
-        active_bytes: fixed + parts.active_bytes(mlp_quant),
+        active_bytes: fixed + parts.active_bytes(mlp_quant, expert_quant(spec, mlp_quant)),
         norm_params,
         params: mixer_params + mlp + norm_params,
-        bytes: fixed + parts.bytes(mlp_quant),
+        bytes: fixed + parts.bytes(mlp_quant, expert_quant(spec, mlp_quant)),
     }
 }
 
@@ -282,7 +289,7 @@ fn mtp_counts(spec: &Spec, count: usize) -> (u64, u64) {
     let norms = 5 * h;
     let fc = 2 * h * h;
     let params = attn.quantised + attn.plain + mlp + norms + fc;
-    let bytes = quant_bytes(attn.quantised, spec.quant) + 2 * attn.plain + parts.bytes(spec.quant) + 2 * norms + 2 * fc;
+    let bytes = quant_bytes(attn.quantised, spec.quant) + 2 * attn.plain + parts.bytes(spec.quant, expert_quant(spec, spec.quant)) + 2 * norms + 2 * fc;
     (params * count as u64, bytes * count as u64)
 }
 

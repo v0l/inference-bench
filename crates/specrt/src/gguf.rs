@@ -571,6 +571,7 @@ impl Gguf {
                     fused_experts: false,
                     input_scaled: false,
                     experts_transposed: false,
+                    quantized_experts: family.moe.quantized_experts,
                     hash_layers: 0,
                     hash_table: None,
                     tp_split: crate::spec::TpSplit::Auto,
