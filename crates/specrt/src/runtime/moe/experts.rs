@@ -177,6 +177,7 @@ pub(in crate::runtime) struct ExpertCache {
     addrs: Vec<CUdeviceptr>,
     pub(in crate::runtime) slots: usize,
     tables: Option<Vec<CudaSlice<i32>>>,
+    table_launches: std::sync::atomic::AtomicU64,
     local: usize,
     shared: usize,
     state: Mutex<State>,
@@ -185,6 +186,8 @@ pub(in crate::runtime) struct ExpertCache {
 }
 
 const BULK_MIN_EXPERTS: usize = 32;
+
+pub(in crate::runtime) const TABLE_MAX_TOKENS: usize = super::MMA_MIN_TOKENS;
 
 struct Staging {
     buf: Option<PinnedBuf>,
@@ -208,6 +211,7 @@ impl ExpertCache {
             addrs,
             slots,
             tables,
+            table_launches: std::sync::atomic::AtomicU64::new(0),
             local,
             shared,
             staging: Mutex::new(Staging { buf: None }),
@@ -360,14 +364,15 @@ impl ExpertCache {
         Ok(Staged { mapping })
     }
 
-    pub(in crate::runtime) fn table_for(&self, compute: &Arc<CudaStream>, layer: usize, host: &HostExperts) -> Result<Option<&CudaSlice<i32>>> {
+    pub(in crate::runtime) fn table_for(&self, compute: &Arc<CudaStream>, layer: usize, host: &HostExperts, tokens: usize) -> Result<Option<&CudaSlice<i32>>> {
         let Some(tables) = &self.tables else { return Ok(None) };
         let mut g = self.state.lock().unwrap();
         let g = &mut *g;
         let (table, full) = crate::offload::pointer_table(&g.book, |e| self.page(layer, e), self.local, self.shared, self.slots);
-        if !full {
+        if crate::offload::expert_route(true, full, tokens, TABLE_MAX_TOKENS) == crate::offload::ExpertRoute::Staged {
             return Ok(None);
         }
+        self.table_launches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         for e in 0..self.local {
             g.book.touch(self.page(layer, e));
         }
@@ -386,6 +391,19 @@ impl ExpertCache {
         }
         self.fence(compute)?;
         Ok(Some(&tables[layer]))
+    }
+
+    pub(in crate::runtime) fn table_launches(&self) -> u64 {
+        self.table_launches.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(in crate::runtime) fn evict(&self, layer: usize, expert: usize) -> bool {
+        self.state.lock().unwrap().book.evict(self.page(layer, expert))
+    }
+
+    pub(in crate::runtime) fn promote(&self, compute: &Arc<CudaStream>, layer: usize, host: &HostExperts, expert: usize) -> Result<()> {
+        self.prefetch(compute, layer, host, &[expert])?;
+        self.fence(compute)
     }
 
     pub(in crate::runtime) fn release(&self) {

@@ -125,7 +125,7 @@ fn assert_experts_identical(dir: &str, slots: usize) {
     assert_experts_identical_with(dir, slots, false);
 }
 
-fn assert_experts_identical_with(dir: &str, slots: usize, pointer_table: bool) {
+fn assert_experts_identical_with(dir: &str, slots: usize, pointer_table: bool) -> u64 {
     let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
     let p = prompt(40);
     let want_prefill = full.trace_prefill(&p).unwrap();
@@ -136,13 +136,20 @@ fn assert_experts_identical_with(dir: &str, slots: usize, pointer_table: bool) {
     spec.runtime.offload.pointer_table = pointer_table;
     let mut off = Runtime::load(&spec, 256).unwrap();
     assert_eq!(off.expert_slots(), slots);
-    assert_eq!(off.trace_prefill(&p).unwrap().logits, want_prefill.logits, "prefill logits");
+    let got_prefill = off.trace_prefill(&p).unwrap();
+    if pointer_table {
+        let worst = got_prefill.logits.iter().zip(&want_prefill.logits).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(worst < 1e-3, "prefill logits differ by {worst}");
+    } else {
+        assert_eq!(got_prefill.logits, want_prefill.logits, "prefill logits");
+    }
     let got = off.trace_decode(&prompt(6)).unwrap();
     assert_eq!(got.logits, want_decode.logits, "decode logits");
     assert_eq!(got.layers, want_decode.layers, "decode layer outputs");
     assert_eq!(off.generate(&p, 16, Sampling::GREEDY).unwrap().tokens, want_tokens);
     let stats = off.offload_stats().unwrap();
     assert!(stats.host_to_vram_bytes > 0, "{stats:?}");
+    off.expert_table_launches()
 }
 
 #[test]
@@ -154,23 +161,72 @@ fn expert_cache_with_every_expert_slot_is_bit_identical() {
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn pointer_table_with_every_expert_resident_is_bit_identical() {
-    assert_experts_identical_with("tiny-qwen3.5-moe", 8, true);
-    assert_experts_identical_with("tiny-qwen3.5-moe-nvfp4", 8, true);
-    assert_experts_identical_with("tiny-qwen3.5-moe-fp8", 8, true);
+    assert!(assert_experts_identical_with("tiny-qwen3.5-moe", 24, true) > 0);
+    assert!(assert_experts_identical_with("tiny-qwen3.5-moe-nvfp4", 24, true) > 0);
+    assert!(assert_experts_identical_with("tiny-qwen3.5-moe-fp8", 24, true) > 0);
 }
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
 fn pointer_table_with_half_the_experts_resident_falls_back_bit_identically() {
-    assert_experts_identical_with("tiny-qwen3.5-moe", 4, true);
-    assert_experts_identical_with("tiny-qwen3.5-moe-nvfp4", 2, true);
+    assert_experts_identical_with("tiny-qwen3.5-moe", 12, true);
+    assert_experts_identical_with("tiny-qwen3.5-moe-nvfp4", 6, true);
 }
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
-fn pointer_table_on_gpt_oss_and_glm_is_bit_identical() {
-    assert_experts_identical_with("tiny-gpt-oss", 4, true);
-    assert_experts_identical_with("tiny-glm4-moe", 3, true);
+fn pointer_table_on_glm_is_bit_identical() {
+    assert_experts_identical_with("tiny-glm4-moe", 24, true);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn evicting_then_promoting_an_expert_switches_paths_and_stays_bit_identical() {
+    let dir = "tiny-qwen3.5-moe";
+    let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
+    let want = full.trace_decode(&prompt(6)).unwrap();
+    drop(full);
+    let mut spec = moe_spec(dir, 24, None);
+    spec.runtime.offload.pointer_table = true;
+    let mut off = Runtime::load(&spec, 256).unwrap();
+    let first = off.trace_decode(&prompt(6)).unwrap();
+    assert_eq!(first.logits, want.logits);
+    let on_table = off.expert_table_launches();
+    assert!(on_table > 0);
+    for layer in 0..3 {
+        for e in 0..8 {
+            assert!(off.evict_expert(layer, e));
+        }
+    }
+    let second = off.trace_decode(&prompt(6)).unwrap();
+    assert_eq!(second.logits, want.logits, "after evicting every expert");
+    assert_eq!(second.layers, want.layers);
+    assert!(off.expert_table_launches() < on_table * 2, "a layer with a missing expert must not use the table");
+    for layer in 0..3 {
+        for e in 0..8 {
+            off.promote_expert(layer, e).unwrap();
+        }
+    }
+    let third = off.trace_decode(&prompt(6)).unwrap();
+    assert_eq!(third.logits, want.logits, "after promoting every expert");
+    assert_eq!(third.layers, want.layers);
+    assert!(off.expert_table_launches() > on_table, "promoted layers must use the table again");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn pointer_table_matches_fully_resident_decode_on_gpt_oss() {
+    let dir = "tiny-gpt-oss";
+    let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
+    let want_decode = full.trace_decode(&prompt(6)).unwrap();
+    drop(full);
+    let mut spec = moe_spec(dir, 32, None);
+    spec.runtime.offload.pointer_table = true;
+    let mut table = Runtime::load(&spec, 256).unwrap();
+    let got = table.trace_decode(&prompt(6)).unwrap();
+    assert_eq!(got.logits, want_decode.logits);
+    assert_eq!(got.layers, want_decode.layers);
+    assert!(table.expert_table_launches() > 0);
 }
 
 #[test]

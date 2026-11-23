@@ -275,8 +275,7 @@ impl Runtime {
         let mb = self.moe.as_ref().expect("moe buffers");
         let cache = self.expert_cache.as_ref().expect("expert cache");
         let host = w.host.as_ref().expect("cached layer has host experts");
-        if n < MMA_MIN_TOKENS
-            && let Some(table) = cache.table_for(&self.stream, w.index, host)?
+        if let Some(table) = cache.table_for(&self.stream, w.index, host, n)?
         {
             return self.moe_experts_with(w, &cache.stacks, Some(host.input_globals), Some(table), n);
         }
@@ -328,16 +327,17 @@ impl Runtime {
         let m = self.spec.moe.as_ref().expect("moe spec");
         let mb = self.moe.as_ref().expect("moe buffers");
         let pairs = (n * m.pairs()) as u32;
-        if mb.mma.is_some() && st.gate.mma_ready() && n >= MMA_MIN_TOKENS {
+        let flat = igs.is_some() && self.expert_cache.as_ref().is_some_and(|c| c.slots > m.local_experts());
+        if !flat && mb.mma.is_some() && st.gate.mma_ready() && n >= MMA_MIN_TOKENS {
             return self.moe_grouped_mma(w, st, igs, mb, n);
         }
-        if mb.mma8.is_some() && matches!(st.gate, StackWeights::Fp8 { .. }) && n >= MMA_MIN_TOKENS {
+        if !flat && mb.mma8.is_some() && matches!(st.gate, StackWeights::Fp8 { .. }) && n >= MMA_MIN_TOKENS {
             return self.moe_grouped_mma8(w, st, mb, n);
         }
-        if mb.mmb.is_some() && matches!(st.gate, StackWeights::Bf16(_)) && n >= MMA_MIN_TOKENS {
+        if !flat && mb.mmb.is_some() && matches!(st.gate, StackWeights::Bf16(_)) && n >= MMA_MIN_TOKENS {
             return self.moe_grouped_mmb(w, st, mb, n);
         }
-        if n >= GROUP_MIN_TOKENS {
+        if !flat && n >= GROUP_MIN_TOKENS {
             return self.moe_grouped(w, st, mb, n);
         }
         let kind = st.gate.suffix();

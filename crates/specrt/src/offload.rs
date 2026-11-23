@@ -311,6 +311,16 @@ pub struct SlotBook {
     pub stats: OffloadStats,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertRoute {
+    Table,
+    Staged,
+}
+
+pub fn expert_route(table_enabled: bool, every_routed_resident: bool, tokens: usize, table_max_tokens: usize) -> ExpertRoute {
+    if table_enabled && every_routed_resident && tokens < table_max_tokens { ExpertRoute::Table } else { ExpertRoute::Staged }
+}
+
 pub fn pointer_table(book: &SlotBook, page_of: impl Fn(usize) -> usize, local: usize, shared: usize, shared_base: usize) -> (Vec<i32>, bool) {
     let mut table: Vec<i32> = (0..local).map(|e| book.resident(page_of(e)).map_or(0, |s| s as i32 + 1)).collect();
     let full = table.iter().all(|&s| s != 0);
@@ -335,6 +345,13 @@ impl SlotBook {
 
     pub fn resident(&self, page: usize) -> Option<usize> {
         self.slot_of.get(&page).copied()
+    }
+
+    pub fn evict(&mut self, page: usize) -> bool {
+        let Some(slot) = self.slot_of.remove(&page) else { return false };
+        self.page_of[slot] = None;
+        self.stats.evictions += 1;
+        true
     }
 
     pub fn touch(&mut self, page: usize) -> Option<usize> {
@@ -753,6 +770,34 @@ mod tests {
         let (t, full) = pointer_table(&SlotBook::new(2, Policy::Lru), |e| e, 2, 0, 2);
         assert!(!full);
         assert_eq!(t, vec![0, 0]);
+    }
+
+    #[test]
+    fn a_missing_routed_expert_always_takes_the_staged_path() {
+        let mut b = SlotBook::new(4, Policy::Lru);
+        for e in 0..3 {
+            b.acquire(e, false, false).unwrap();
+        }
+        let (_, full) = pointer_table(&b, |e| e, 4, 0, 4);
+        assert!(!full);
+        for tokens in [1, 2, 7, 8, 9, 64] {
+            assert_eq!(expert_route(true, full, tokens, 8), ExpertRoute::Staged, "{tokens} tokens");
+        }
+        b.acquire(3, false, false).unwrap();
+        let (_, full) = pointer_table(&b, |e| e, 4, 0, 4);
+        assert!(full);
+        for tokens in [1, 2, 7] {
+            assert_eq!(expert_route(true, full, tokens, 8), ExpertRoute::Table);
+        }
+        for tokens in [8, 9, 64] {
+            assert_eq!(expert_route(true, full, tokens, 8), ExpertRoute::Staged);
+        }
+        assert_eq!(expert_route(false, full, 1, 8), ExpertRoute::Staged);
+        assert!(b.evict(2));
+        let (t, full) = pointer_table(&b, |e| e, 4, 0, 4);
+        assert!(!full);
+        assert_eq!(t[2], 0);
+        assert_eq!(expert_route(true, full, 1, 8), ExpertRoute::Staged);
     }
 
     #[test]

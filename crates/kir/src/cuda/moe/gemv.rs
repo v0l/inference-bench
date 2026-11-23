@@ -71,7 +71,11 @@ fn dot2() -> String {
 const UP_ARGS: &str = "const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug, const float* eb";
 const UP_CALL: &str = "gw, gs, gg, uw, us, ug, eb";
 
-const TABLE_RESOLVE: &str = "    expert = tbl[expert];\n    if (expert == 0) return;\n    expert -= 1;\n";
+const TABLE_RESOLVE: &str = "    int eid = expert;\n    expert = tbl[expert];\n    if (expert == 0) return;\n    expert -= 1;\n";
+
+fn by_id(body: String, table: bool) -> String {
+    if table { body.replace("eb[(size_t)expert", "eb[(size_t)eid").replace("eb[((size_t)expert", "eb[((size_t)eid").replace("db[(size_t)expert", "db[(size_t)eid") } else { body }
+}
 
 fn up_impl(table: bool) -> String {
     let (name, extra, resolve) = if table { ("moe_up_tbl_impl", ", const int* tbl", TABLE_RESOLVE) } else { ("moe_up_impl", "", "") };
@@ -81,7 +85,7 @@ fn up_impl(table: bool) -> String {
             "void",
             name,
             &format!("{UP_ARGS}, const float* xn, const int* idx, float* act{extra}"),
-            &format!(
+            &by_id(format!(
                 r##"    __shared__ __align__(16) float xs[HIDDEN];
     int pair = blockIdx.x;
     int t = MOE_INPUT_SCALED ? pair : pair / MOE_PAIRS;
@@ -101,7 +105,7 @@ fn up_impl(table: bool) -> String {
 "##,
                 resolve,
                 prim::warp_ids()
-            )
+            ), table)
         )
     )
 }
@@ -116,7 +120,7 @@ fn down_impl(table: bool) -> String {
             "void",
             name,
             &args,
-            &format!(
+            &by_id(format!(
                 r##"    __shared__ __align__(16) float xs[MOE_INTER];
     int pair = blockIdx.x;
     int expert = idx[pair];
@@ -131,7 +135,7 @@ fn down_impl(table: bool) -> String {
 "##,
                 resolve,
                 prim::warp_ids()
-            )
+            ), table)
         )
     )
 }

@@ -1419,6 +1419,20 @@ impl Runtime {
         self.expert_cache.as_ref().map_or(0, |c| c.slots)
     }
 
+    pub fn expert_table_launches(&self) -> u64 {
+        self.expert_cache.as_ref().map_or(0, |c| c.table_launches())
+    }
+
+    pub fn evict_expert(&self, layer: usize, expert: usize) -> bool {
+        self.expert_cache.as_ref().is_some_and(|c| c.evict(layer, expert))
+    }
+
+    pub fn promote_expert(&self, layer: usize, expert: usize) -> Result<()> {
+        let cache = self.expert_cache.as_ref().context("no expert cache is active")?;
+        let host = self.layers[layer].moe.as_ref().and_then(|m| m.host.as_ref()).context("layer has no cached experts")?;
+        cache.promote(&self.stream, layer, host, expert)
+    }
+
     pub fn expert_hotlist(&self) -> Option<crate::offload::ExpertHotlist> {
         self.expert_cache.as_ref().map(|c| c.hotlist())
     }
