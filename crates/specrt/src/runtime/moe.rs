@@ -265,7 +265,7 @@ impl Runtime {
     pub(super) fn moe_experts(&self, layer: &DeviceLayer, n: usize) -> Result<()> {
         let w = self.moe_of(layer);
         match &w.stacks {
-            Some(st) => self.moe_experts_with(w, st, None, n),
+            Some(st) => self.moe_experts_with(w, st, None, None, n),
             None => self.moe_experts_cached(w, n),
         }
     }
@@ -275,6 +275,11 @@ impl Runtime {
         let mb = self.moe.as_ref().expect("moe buffers");
         let cache = self.expert_cache.as_ref().expect("expert cache");
         let host = w.host.as_ref().expect("cached layer has host experts");
+        if n < MMA_MIN_TOKENS
+            && let Some(table) = cache.table_for(&self.stream, w.index, host)?
+        {
+            return self.moe_experts_with(w, &cache.stacks, Some(host.input_globals), Some(table), n);
+        }
         let total = n * m.pairs();
         let routed = self.stream.clone_dtoh(&mb.idx.slice(..total))?;
         let mut used: Vec<usize> = routed.iter().filter(|&&e| e >= 0 && (e as usize) < m.local_experts()).map(|&e| e as usize).collect();
@@ -309,7 +314,7 @@ impl Runtime {
                 let predicted = cache.predicted(next.0, m.top_k());
                 cache.prefetch(&self.stream, next.0, next.1, &predicted)?;
             }
-            self.moe_experts_with(w, &cache.stacks, Some(host.input_globals), n)?;
+            self.moe_experts_with(w, &cache.stacks, Some(host.input_globals), None, n)?;
             cache.release();
         }
         Ok(())
@@ -319,7 +324,7 @@ impl Runtime {
         self.layers.iter().enumerate().skip(after + 1).find_map(|(i, l)| l.moe.as_ref().and_then(|m| m.host.as_ref()).map(|h| (i, h)))
     }
 
-    fn moe_experts_with(&self, w: &DeviceMoe, st: &Stacks, igs: Option<[f32; 3]>, n: usize) -> Result<()> {
+    fn moe_experts_with(&self, w: &DeviceMoe, st: &Stacks, igs: Option<[f32; 3]>, table: Option<&CudaSlice<i32>>, n: usize) -> Result<()> {
         let m = self.spec.moe.as_ref().expect("moe spec");
         let mb = self.moe.as_ref().expect("moe buffers");
         let pairs = (n * m.pairs()) as u32;
@@ -336,17 +341,22 @@ impl Runtime {
             return self.moe_grouped(w, st, mb, n);
         }
         let kind = st.gate.suffix();
-        let up = format!("moe_up_{kind}");
-        let down = format!("moe_down_{kind}");
+        let (up, down) = if table.is_some() { (format!("moe_up_t_{kind}"), format!("moe_down_t_{kind}")) } else { (format!("moe_up_{kind}"), format!("moe_down_{kind}")) };
         let mut b = self.launcher(self.kernel(&up));
         self.stack_args(&mut b, &st.gate);
         self.stack_args(&mut b, &st.up);
         b.arg(&w.gate_up_bias).arg(self.expert_inputs(mb, n).0).arg(&mb.idx).arg(&mb.act);
+        if let Some(t) = table {
+            b.arg(t);
+        }
         let config = launch(kir::moe::expert_rows_launch(pairs, m.expert_intermediate));
         unsafe { b.launch(config) }?;
         let mut b = self.launcher(self.kernel(&down));
         self.stack_args(&mut b, &st.down);
         b.arg(&w.down_bias).arg(&mb.act).arg(&mb.idx).arg(&mb.out);
+        if let Some(t) = table {
+            b.arg(t);
+        }
         let config = launch(kir::moe::expert_rows_launch(pairs, self.spec.dims.hidden));
         unsafe { b.launch(config) }?;
         Ok(())

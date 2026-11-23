@@ -166,6 +166,7 @@ struct State {
     last: Vec<Vec<usize>>,
     seen: ExpertHotlist,
     prior: Option<ExpertHotlist>,
+    mirror: Vec<Vec<i32>>,
 }
 
 pub(in crate::runtime) struct ExpertCache {
@@ -175,6 +176,7 @@ pub(in crate::runtime) struct ExpertCache {
     pub(in crate::runtime) stacks: Stacks,
     addrs: Vec<CUdeviceptr>,
     pub(in crate::runtime) slots: usize,
+    tables: Option<Vec<CudaSlice<i32>>>,
     local: usize,
     shared: usize,
     state: Mutex<State>,
@@ -193,10 +195,11 @@ pub(in crate::runtime) struct Staged {
 }
 
 impl ExpertCache {
-    pub(in crate::runtime) fn new(compute: &Arc<CudaStream>, like: &HostExperts, layers: usize, slots: usize, local: usize, shared: usize, policy: Policy, prior: Option<ExpertHotlist>) -> Result<Self> {
+    pub(in crate::runtime) fn new(compute: &Arc<CudaStream>, like: &HostExperts, layers: usize, slots: usize, local: usize, shared: usize, policy: Policy, prior: Option<ExpertHotlist>, pointer_table: bool) -> Result<Self> {
         let ctx = compute.context().clone();
         let stacks = like.allocate(compute, slots + shared)?;
         let addrs = pointers(compute, &stacks);
+        let tables = if pointer_table { Some((0..layers).map(|_| compute.alloc_zeros::<i32>(local + shared)).collect::<Result<Vec<_>, _>>()?) } else { None };
         Ok(ExpertCache {
             copy: ctx.new_stream()?,
             mark: ctx.new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))?,
@@ -204,11 +207,12 @@ impl ExpertCache {
             stacks,
             addrs,
             slots,
+            tables,
             local,
             shared,
             staging: Mutex::new(Staging { buf: None }),
             staging_pool: HostPool::new(ctx.clone()),
-            state: Mutex::new(State { book: SlotBook::new(slots, policy), last: vec![Vec::new(); layers], seen: ExpertHotlist::new(layers, local), prior }),
+            state: Mutex::new(State { book: SlotBook::new(slots, policy), last: vec![Vec::new(); layers], seen: ExpertHotlist::new(layers, local), prior, mirror: vec![Vec::new(); layers] }),
         })
     }
 
@@ -356,6 +360,34 @@ impl ExpertCache {
         Ok(Staged { mapping })
     }
 
+    pub(in crate::runtime) fn table_for(&self, compute: &Arc<CudaStream>, layer: usize, host: &HostExperts) -> Result<Option<&CudaSlice<i32>>> {
+        let Some(tables) = &self.tables else { return Ok(None) };
+        let mut g = self.state.lock().unwrap();
+        let g = &mut *g;
+        let (table, full) = crate::offload::pointer_table(&g.book, |e| self.page(layer, e), self.local, self.shared, self.slots);
+        if !full {
+            return Ok(None);
+        }
+        for e in 0..self.local {
+            g.book.touch(self.page(layer, e));
+        }
+        if g.mirror[layer] != table {
+            let (ptr, _sync) = tables[layer].device_ptr(compute);
+            unsafe { cudarc::driver::result::memcpy_htod_async(ptr, &table, compute.cu_stream()) }?;
+            g.mirror[layer] = table;
+        }
+        if self.shared > 0 {
+            self.mark.record(compute)?;
+            self.copy.wait(&self.mark)?;
+            let mut stats = OffloadStats::default();
+            let queued = (0..self.shared).try_for_each(|s| self.enqueue(host, self.local + s, self.slots + s, &mut stats));
+            g.book.stats.absorb_io(&stats);
+            queued?;
+        }
+        self.fence(compute)?;
+        Ok(Some(&tables[layer]))
+    }
+
     pub(in crate::runtime) fn release(&self) {
         self.state.lock().unwrap().book.unpin_all();
     }
@@ -400,12 +432,16 @@ impl ExpertCache {
     }
 
     pub(in crate::runtime) fn warm(&self, compute: &Arc<CudaStream>, hosts: &[(usize, &HostExperts)]) -> Result<()> {
-        let hot = {
+        let hot: Vec<(usize, usize)> = {
             let g = self.state.lock().unwrap();
-            let Some(prior) = &g.prior else { return Ok(()) };
-            let mut pairs = prior.hottest(self.slots);
-            pairs.sort_unstable();
-            pairs
+            if self.tables.is_some() && self.slots >= self.local * hosts.len() {
+                hosts.iter().flat_map(|(l, _)| (0..self.local).map(move |e| (*l, e))).collect()
+            } else {
+                let Some(prior) = &g.prior else { return Ok(()) };
+                let mut pairs = prior.hottest(self.slots);
+                pairs.sort_unstable();
+                pairs
+            }
         };
         self.mark.record(compute)?;
         self.copy.wait(&self.mark)?;

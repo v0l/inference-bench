@@ -71,20 +71,23 @@ fn dot2() -> String {
 const UP_ARGS: &str = "const void* gw, const unsigned char* gs, const float* gg, const void* uw, const unsigned char* us, const float* ug, const float* eb";
 const UP_CALL: &str = "gw, gs, gg, uw, us, ug, eb";
 
-fn up_impl() -> String {
+const TABLE_RESOLVE: &str = "    expert = tbl[expert];\n    if (expert == 0) return;\n    expert -= 1;\n";
+
+fn up_impl(table: bool) -> String {
+    let (name, extra, resolve) = if table { ("moe_up_tbl_impl", ", const int* tbl", TABLE_RESOLVE) } else { ("moe_up_impl", "", "") };
     format!(
         "template <int Q>\n{}",
         prim::device(
             "void",
-            "moe_up_impl",
-            &format!("{UP_ARGS}, const float* xn, const int* idx, float* act"),
+            name,
+            &format!("{UP_ARGS}, const float* xn, const int* idx, float* act{extra}"),
             &format!(
                 r##"    __shared__ __align__(16) float xs[HIDDEN];
     int pair = blockIdx.x;
     int t = MOE_INPUT_SCALED ? pair : pair / MOE_PAIRS;
     int expert = idx[pair];
     if (expert < 0) return;
-    for (int i = threadIdx.x; i < HIDDEN; i += 256) xs[i] = xn[(size_t)t * HIDDEN + i];
+{}    for (int i = threadIdx.x; i < HIDDEN; i += 256) xs[i] = xn[(size_t)t * HIDDEN + i];
     __syncthreads();
 {}    int row = blockIdx.y * MOE_WARPS + warp;
     if (row >= MOE_INTER) return;
@@ -96,25 +99,29 @@ fn up_impl() -> String {
     }}
     if (lane == 0) act[(size_t)pair * MOE_INTER + row] = MOE_MAPPED ? mapped_act(u) : gated_act(g, u);
 "##,
+                resolve,
                 prim::warp_ids()
             )
         )
     )
 }
 
-fn down_impl() -> String {
+const DOWN_ARGS: &str = "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* idx, float* out";
+
+fn down_impl(table: bool) -> String {
+    let (name, args, resolve) = if table { ("moe_down_tbl_impl", format!("{DOWN_ARGS}, const int* tbl"), TABLE_RESOLVE) } else { ("moe_down_impl", DOWN_ARGS.to_string(), "") };
     format!(
         "template <int Q>\n{}",
         prim::device(
             "void",
-            "moe_down_impl",
-            "const void* w, const unsigned char* s, const float* g, const float* db, const float* act, const int* idx, float* out",
+            name,
+            &args,
             &format!(
                 r##"    __shared__ __align__(16) float xs[MOE_INTER];
     int pair = blockIdx.x;
     int expert = idx[pair];
     if (expert < 0) return;
-    for (int i = threadIdx.x; i < MOE_INTER; i += 256) xs[i] = act[(size_t)pair * MOE_INTER + i];
+{}    for (int i = threadIdx.x; i < MOE_INTER; i += 256) xs[i] = act[(size_t)pair * MOE_INTER + i];
     __syncthreads();
 {}    int row = blockIdx.y * MOE_WARPS + warp;
     if (row >= HIDDEN) return;
@@ -122,6 +129,7 @@ fn down_impl() -> String {
     if (MOE_EBIAS) v += db[(size_t)expert * HIDDEN + row];
     if (lane == 0) out[(size_t)pair * HIDDEN + row] = v;
 "##,
+                resolve,
                 prim::warp_ids()
             )
         )
@@ -223,8 +231,21 @@ pub fn gemv() -> String {
     out.push_str(&prim::multi_row_dot("moe_rows_fp4", prim::RowFormat::Fp4Rows { decode: "moe_e2m1" }, prim::RowLoad { unroll: 0, stream: false }));
     out.push_str(&prim::multi_row_dot("moe_rows_mx", prim::RowFormat::Mx { decode: "moe_e2m1", block: "MOE_BLOCK" }, prim::RowLoad { unroll: 0, stream: false }));
     out.push_str(&dot());
-    out.push_str(&up_impl());
-    out.push_str(&down_impl());
+    out.push_str(&up_impl(false));
+    out.push_str(&down_impl(false));
+    out
+}
+
+pub fn table_gemv() -> String {
+    let mut out = up_impl(true);
+    out.push_str(&down_impl(true));
+    out
+}
+
+pub fn table_entries() -> String {
+    let mut out = String::new();
+    entries(&mut out, "moe_up_t", &format!("{UP_ARGS}, const float* xn, const int* idx, float* act, const int* tbl"), "moe_up_tbl_impl", &format!("{UP_CALL}, xn, idx, act, tbl"));
+    entries(&mut out, "moe_down_t", &format!("{DOWN_ARGS}, const int* tbl"), "moe_down_tbl_impl", "w, s, g, db, act, idx, out, tbl");
     out
 }
 

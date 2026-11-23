@@ -12,6 +12,7 @@ pub use crate::ops::MoeShape;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Family {
     Experts,
+    ExpertTable,
     GroupedMma,
     GroupedMx,
     GroupedMmaFp8,
@@ -44,6 +45,7 @@ impl Family {
                 "moe_group_up_mx",
                 "moe_group_down_mx",
             ],
+            Family::ExpertTable => &["moe_up_t_bf16", "moe_up_t_fp4", "moe_up_t_fp8", "moe_up_t_mx", "moe_down_t_bf16", "moe_down_t_fp4", "moe_down_t_fp8", "moe_down_t_mx"],
             Family::GroupedMma => &["moe_quant_f32", "moe_tiles", "moe_mma_up", "moe_mma_up_s", "moe_mma_down", "moe_mma_down_s"],
             Family::GroupedMmaBf16 => &["moe_split_bf16", "moe_tiles_b16", "moe_mma_up_b16", "moe_mma_up_b16_s", "moe_mma_down_b16", "moe_mma_down_b16_s"],
             Family::GroupedMmaFp8 => &["moe_quant_f8", "moe_tiles_f8", "moe_mma_up_f8", "moe_mma_up_f8_s", "moe_mma_down_f8", "moe_mma_down_f8_s"],
@@ -64,7 +66,7 @@ impl Family {
 
     pub fn needs(self) -> &'static [Feature] {
         match self {
-            Family::Experts => &[Feature::WarpShuffle],
+            Family::Experts | Family::ExpertTable => &[Feature::WarpShuffle],
             Family::GroupedMma | Family::GroupedMx => &[Feature::BlockScaledFp4, Feature::CpAsync],
             Family::GroupedMmaFp8 => &[Feature::Fp8Mma, Feature::CpAsync],
             Family::GroupedMmaBf16 => &[Feature::Mma16816, Feature::CpAsync],
@@ -173,7 +175,7 @@ impl MoeKernel {
     pub fn smem(&self) -> Vec<(&'static str, u32)> {
         let up = if self.shape.mapped { 1 } else { 2 };
         match self.family {
-            Family::Experts => vec![],
+            Family::Experts | Family::ExpertTable => vec![],
             Family::GroupedMma => vec![
                 ("moe_mma_up", mma_smem(MMA_BM, 2)),
                 ("moe_mma_up_s", mma_smem(MMA_BM_SMALL, 2)),

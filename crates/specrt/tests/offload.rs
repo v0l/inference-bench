@@ -122,13 +122,19 @@ fn moe_spec(dir: &str, slots: usize, hotlist: Option<String>) -> Spec {
 }
 
 fn assert_experts_identical(dir: &str, slots: usize) {
+    assert_experts_identical_with(dir, slots, false);
+}
+
+fn assert_experts_identical_with(dir: &str, slots: usize, pointer_table: bool) {
     let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
     let p = prompt(40);
     let want_prefill = full.trace_prefill(&p).unwrap();
     let want_decode = full.trace_decode(&prompt(6)).unwrap();
     let want_tokens = full.generate(&p, 16, Sampling::GREEDY).unwrap().tokens;
     drop(full);
-    let mut off = Runtime::load(&moe_spec(dir, slots, None), 256).unwrap();
+    let mut spec = moe_spec(dir, slots, None);
+    spec.runtime.offload.pointer_table = pointer_table;
+    let mut off = Runtime::load(&spec, 256).unwrap();
     assert_eq!(off.expert_slots(), slots);
     assert_eq!(off.trace_prefill(&p).unwrap().logits, want_prefill.logits, "prefill logits");
     let got = off.trace_decode(&prompt(6)).unwrap();
@@ -143,6 +149,28 @@ fn assert_experts_identical(dir: &str, slots: usize) {
 #[ignore = "needs a CUDA GPU"]
 fn expert_cache_with_every_expert_slot_is_bit_identical() {
     assert_experts_identical("tiny-qwen3.5-moe", 8);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn pointer_table_with_every_expert_resident_is_bit_identical() {
+    assert_experts_identical_with("tiny-qwen3.5-moe", 8, true);
+    assert_experts_identical_with("tiny-qwen3.5-moe-nvfp4", 8, true);
+    assert_experts_identical_with("tiny-qwen3.5-moe-fp8", 8, true);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn pointer_table_with_half_the_experts_resident_falls_back_bit_identically() {
+    assert_experts_identical_with("tiny-qwen3.5-moe", 4, true);
+    assert_experts_identical_with("tiny-qwen3.5-moe-nvfp4", 2, true);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn pointer_table_on_gpt_oss_and_glm_is_bit_identical() {
+    assert_experts_identical_with("tiny-gpt-oss", 4, true);
+    assert_experts_identical_with("tiny-glm4-moe", 3, true);
 }
 
 #[test]

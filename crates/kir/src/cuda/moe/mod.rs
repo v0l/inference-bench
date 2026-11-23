@@ -27,6 +27,10 @@ pub fn emit_moe(kernels: &[MoeKernel]) -> Result<crate::KirSource, String> {
         k.validate()?;
         match k.family {
             Family::Experts => out.push_str(&experts(k)),
+            Family::ExpertTable => {
+                out.push_str(&gemv::table_gemv());
+                out.push_str(&gemv::table_entries());
+            }
             Family::GroupedMma => {
                 out.push('\n');
                 out.push_str(&mma::grouped(false));
