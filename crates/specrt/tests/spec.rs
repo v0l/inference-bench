@@ -569,6 +569,17 @@ fn the_35b_fp8_moe_config_is_runnable_with_mtp_and_block_fp8_experts() {
 }
 
 #[test]
+fn a_per_layer_intermediate_size_list_does_not_fail_to_parse() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3-0.6b.config.json")).unwrap();
+    let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let n = v["num_hidden_layers"].as_u64().unwrap() as usize;
+    let size = v["intermediate_size"].clone();
+    v["intermediate_size"] = serde_json::Value::Array(vec![size.clone(); n]);
+    let spec = Spec::from_hf_config(&v.to_string()).unwrap();
+    assert_eq!(spec.dims.intermediate as u64, size.as_u64().unwrap());
+}
+
+#[test]
 fn a_dense_config_without_an_intermediate_size_names_the_missing_field() {
     let json = std::fs::read_to_string(root().join("tests/fixtures/qwen3-0.6b.config.json")).unwrap();
     let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
