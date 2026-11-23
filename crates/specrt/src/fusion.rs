@@ -257,6 +257,13 @@ pub struct FusionReport {
     pub count: Count,
     pub costs: Costs,
     pub sections: Vec<SectionFusion>,
+    pub capture: Vec<CaptureSection>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CaptureSection {
+    pub name: String,
+    pub groups: Vec<Vec<(usize, String)>>,
 }
 
 impl FusionReport {
@@ -277,6 +284,13 @@ impl FusionReport {
             }
             for d in &s.rejected {
                 out.push_str(&format!("  kept apart {}\n", d.describe()));
+            }
+        }
+        for c in &self.capture {
+            out.push_str(&format!("\n== {} capture groups\n", c.name));
+            for g in &c.groups {
+                let members: Vec<String> = g.iter().map(|(i, l)| format!("{i} {l}")).collect();
+                out.push_str(&format!("  one launch group [{}]\n", members.join(" | ")));
             }
         }
         out
@@ -1046,5 +1060,5 @@ pub fn fusion_report(spec: &Spec, plan: &Plan, count: Count, target: &kir::Targe
         let section = Section { name: s.name, repeats: s.repeats, phase: plan.phase, layer: s.layer, ops: s.ops };
         out.push(fuse_ops(spec, &signer, target, count, costs, section, None)?);
     }
-    Ok(FusionReport { phase: plan.phase, count, costs: *costs, sections: out })
+    Ok(FusionReport { phase: plan.phase, count, costs: *costs, sections: out, capture: Vec::new() })
 }

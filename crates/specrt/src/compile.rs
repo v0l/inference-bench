@@ -1,7 +1,7 @@
-use crate::fusion::{self, Costs, Fit, FusionReport, Part, Section, SectionFusion, Unit};
+use crate::fusion::{self, CaptureSection, Costs, Fit, FusionReport, Part, Section, SectionFusion, Unit};
 use crate::gemm::{self, GemvLaunch};
 use crate::plan::{Buf, Op, Phase, Plan, QuantSource, Weight, weight_kind};
-use crate::signature::{Count, Place, Signer, layers_using, ranked};
+use crate::signature::{Count, Signature, Tensor, key, Place, Signer, layers_using, ranked};
 use crate::spec::Spec;
 use crate::tp::Shard;
 use anyhow::{Result, bail};
@@ -24,19 +24,20 @@ pub struct Options {
     pub fuse: bool,
     pub family: Family,
     pub context: usize,
+    pub capture_groups: bool,
 }
 
 impl Options {
     pub fn planes(context: usize) -> Options {
-        Options { shards: BTreeMap::new(), fuse: true, family: Family::Planes, context }
+        Options { shards: BTreeMap::new(), fuse: true, family: Family::Planes, context, capture_groups: false }
     }
 
     pub fn ranked(shards: BTreeMap<String, Shard>, fuse: bool, context: usize) -> Options {
-        Options { shards, fuse, family: Family::Planes, context }
+        Options { shards, fuse, family: Family::Planes, context, capture_groups: false }
     }
 
     pub fn gemv(context: usize) -> Options {
-        Options { shards: BTreeMap::new(), fuse: true, family: Family::Gemv, context }
+        Options { shards: BTreeMap::new(), fuse: true, family: Family::Gemv, context, capture_groups: false }
     }
 }
 
@@ -261,7 +262,7 @@ pub fn compile_traced(spec: &Spec, plan: Plan, target: &kir::Target, opts: &Opti
     }
     let costs = Costs::for_target(target);
     let phase = plan.phase;
-    let mut report = FusionReport { phase, count: Count::new(phase, 1, opts.context), costs, sections: Vec::new() };
+    let mut report = FusionReport { phase, count: Count::new(phase, 1, opts.context), costs, sections: Vec::new(), capture: Vec::new() };
     if opts.family == Family::Planes && !(opts.fuse && ranked(&plan)) {
         return Ok((plan, report));
     }
@@ -270,7 +271,47 @@ pub fn compile_traced(spec: &Spec, plan: Plan, target: &kir::Target, opts: &Opti
         *ops = fused;
         report.sections.extend(section.filter(|_| !layers.is_empty()));
     }
+    if opts.capture_groups {
+        for (name, layers, ops) in sections_mut(spec, &mut plan) {
+            let groups = capture_groups(&signer, ops, layers.first().copied().unwrap_or(0))?;
+            if !groups.is_empty() {
+                report.capture.push(CaptureSection { name, groups: groups.into_iter().map(|g| g.into_iter().map(|i| (i, ops[i].label())).collect()).collect() });
+            }
+        }
+    }
     Ok((plan, report))
+}
+
+pub fn capture_groups(signer: &Signer, ops: &[Op], layer: usize) -> Result<Vec<Vec<usize>>> {
+    let mut sigs = Vec::with_capacity(ops.len());
+    for op in ops {
+        sigs.push(signer.signature(op, layer)?);
+    }
+    let places = |w: &[Tensor]| w.iter().map(|t| key(&t.place)).collect::<Vec<Place>>();
+    let touches = |a: &Signature, b: &Signature| {
+        let (aw, bw, ar, br) = (places(&a.writes), places(&b.writes), places(&a.reads), places(&b.reads));
+        aw.iter().any(|p| bw.contains(p) || br.contains(p)) || bw.iter().any(|p| ar.contains(p))
+    };
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut run: Vec<usize> = Vec::new();
+    for (i, sig) in sigs.iter().enumerate() {
+        let launches = matches!(ops[i], Op::Gemv { .. } | Op::GemvStore { .. });
+        if launches && run.iter().all(|&j| !touches(&sigs[j], sig)) {
+            run.push(i);
+            continue;
+        }
+        if run.len() > 1 {
+            out.push(std::mem::take(&mut run));
+        }
+        run.clear();
+        if launches {
+            run.push(i);
+        }
+    }
+    if run.len() > 1 {
+        out.push(run);
+    }
+    Ok(out)
 }
 
 fn single_plan(spec: &Spec) -> Plan {
@@ -285,5 +326,5 @@ pub fn single(spec: &Spec, target: &kir::Target, context: usize) -> Result<Plan>
 }
 
 pub fn single_traced(spec: &Spec, target: &kir::Target, context: usize) -> Result<(Plan, FusionReport)> {
-    compile_traced(spec, single_plan(spec), target, &Options::gemv(context))
+    compile_traced(spec, single_plan(spec), target, &Options { capture_groups: true, ..Options::gemv(context) })
 }
