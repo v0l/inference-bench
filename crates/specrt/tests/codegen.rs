@@ -114,16 +114,13 @@ const KERNEL_TEXT_OUTSIDE_KIR: &[(&str, &str)] = &[
     ("specrt/tests/kir_speed.rs", "the old template text the kir rmsnorm is timed against"),
     ("specrt/tests/prologue_bits.rs", "reference kernels the fused prologue is compared to bit for bit"),
     ("specrt/tests/fixtures/fp4_gemv_reference.cu", "reference GEMV for tests/fp4_gemv.rs"),
-    ("specrt/scripts/bandwidth.cu", "bandwidth probe, compiled at runtime by src/bandwidth.rs"),
-    ("specrt/scripts/nvfp4_quant.cu", "load time NVFP4 quantiser, compiled by src/nvfp4.rs"),
-    ("specrt/scripts/bw_q6k_head.cu", "dev bench"),
-    ("specrt/scripts/fp4_gemv_bench.cu", "dev bench"),
-    ("specrt/scripts/p2p658.cu", "dev bench"),
 ];
 
-const KERNEL_INCLUDES_OUTSIDE_KIR: &[&str] = &["specrt/src/bandwidth.rs", "specrt/src/nvfp4.rs", "specrt/tests/fp4_gemv.rs"];
+const DEV_TOOLS: &str = "specrt/tools/";
 
-const NVRTC_OUTSIDE_JIT: &[&str] = &["specrt/src/bandwidth.rs", "specrt/src/nvfp4.rs"];
+const KERNEL_INCLUDES_OUTSIDE_KIR: &[&str] = &["specrt/tests/fp4_gemv.rs"];
+
+const NVRTC_OUTSIDE_JIT: &[&str] = &[];
 
 fn crate_files(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -152,7 +149,7 @@ fn crate_files(root: &Path) -> Vec<(String, String)> {
 fn kernel_text_offenders(files: &[(String, String)]) -> Vec<String> {
     files
         .iter()
-        .filter(|(f, text)| !f.starts_with("kir/src/cuda/") && text.contains("__global__"))
+        .filter(|(f, text)| !f.starts_with("kir/src/cuda/") && !f.starts_with(DEV_TOOLS) && text.contains("__global__"))
         .map(|(f, _)| f.clone())
         .filter(|f| !KIR_EMITTERS_OUTSIDE_CUDA.contains(&f.as_str()) && !KERNEL_TEXT_OUTSIDE_KIR.iter().any(|(a, _)| a == f))
         .collect()
@@ -174,6 +171,14 @@ fn nvrtc_offenders(files: &[(String, String)]) -> Vec<String> {
         .filter(|(f, text)| f.contains("/src/") && f.ends_with(".rs") && f != "specrt/src/jit.rs" && ["compile_ptx", "create_program", "compile_program"].iter().any(|p| text.contains(p)))
         .map(|(f, _)| f.clone())
         .filter(|f| !NVRTC_OUTSIDE_JIT.contains(&f.as_str()))
+        .collect()
+}
+
+fn dev_tool_readers(files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|(f, text)| f.contains("/src/") && f.ends_with(".rs") && (text.contains("tools/cuda") || text.contains("specrt/tools") || text.contains("\"../tools/")))
+        .map(|(f, _)| f.clone())
         .collect()
 }
 
@@ -215,6 +220,8 @@ fn assert_kernel_text_lives_only_in_kir() {
     assert!(nvrtc.is_empty(), "NVRTC called outside src/jit.rs: {nvrtc:?}");
     let untyped = untyped_source_offenders(&files, &manifests(&crates));
     assert!(untyped.is_empty(), "kernel source built from raw text in library code: {untyped:?}");
+    let readers = dev_tool_readers(&files);
+    assert!(readers.is_empty(), "library code must not read the dev tools in {DEV_TOOLS}: {readers:?}");
     let jit = std::fs::read_to_string(crates.join("specrt/src/jit.rs")).unwrap();
     for sig in ["fn compile_cubin(source: &kir::KirSource", "fn ptx_of(source: &kir::KirSource", "fn compile_ptx(&self, source: &kir::KirSource", "pub fn load_uncached(ctx: &Arc<CudaContext>, source: &kir::KirSource)", "pub fn load(&self, module: &Module)"] {
         assert!(jit.contains(sig), "jit.rs must compile only kir output: {sig}");
@@ -245,9 +252,9 @@ fn assert_kernel_text_lives_only_in_kir() {
         ("VERBATIM_QUANT", VERBATIM_QUANT.len(), 1),
         ("VERBATIM_MOE", VERBATIM_MOE.len(), 3),
         ("KIR_EMITTERS_OUTSIDE_CUDA", KIR_EMITTERS_OUTSIDE_CUDA.len(), 6),
-        ("KERNEL_TEXT_OUTSIDE_KIR", KERNEL_TEXT_OUTSIDE_KIR.len(), 10),
-        ("KERNEL_INCLUDES_OUTSIDE_KIR", KERNEL_INCLUDES_OUTSIDE_KIR.len(), 3),
-        ("NVRTC_OUTSIDE_JIT", NVRTC_OUTSIDE_JIT.len(), 2),
+        ("KERNEL_TEXT_OUTSIDE_KIR", KERNEL_TEXT_OUTSIDE_KIR.len(), 5),
+        ("KERNEL_INCLUDES_OUTSIDE_KIR", KERNEL_INCLUDES_OUTSIDE_KIR.len(), 1),
+        ("NVRTC_OUTSIDE_JIT", NVRTC_OUTSIDE_JIT.len(), 0),
     ];
     for (name, len, pin) in pinned {
         assert_eq!(len, pin, "{name} changed size: shrink the pin when an entry is ported, never grow the list");
@@ -275,6 +282,9 @@ fn the_kernel_text_guards_catch_a_new_offender() {
         ("core/Cargo.toml".to_string(), "[dependencies]\nkir = {}\n[dev-dependencies]\nkir = { features = [\"test-text\"] }\n".to_string()),
     ];
     assert_eq!(untyped_source_offenders(&raw, &toml), ["specrt/src/r.rs", "core/src/e.rs", "specrt/Cargo.toml"]);
+    let tools = vec![file("specrt/src/a.rs", "include_bytes!(\"../tools/cuda/x.cu\")"), file("specrt/tools/cuda/x.cu", "__global__ void k() {}"), file("specrt/scripts/b.sh", "nvcc tools/cuda/x.cu")];
+    assert_eq!(dev_tool_readers(&tools), ["specrt/src/a.rs"]);
+    assert!(kernel_text_offenders(&tools).is_empty());
 }
 
 #[test]

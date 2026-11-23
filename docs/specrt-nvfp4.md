@@ -251,7 +251,7 @@ All on the shared GPU: vLLM serving at 92 to 100% utilisation and the card at it
 the whole time, max context 8,192, 128 new tokens, medians of 3, two rounds
 (`scripts/bench27b-nvfp4.sh`). Indicative, as the FP8 numbers in `specrt-27b.md` were.
 
-Memory bandwidth on this card (`scripts/bandwidth.cu`, 2 GiB, best of 10): a streaming read
+Memory bandwidth on this card (`kir::cuda::emit_bandwidth`, 2 GiB, best of 10): a streaming read
 reaches 1,640 to 1,660 GB/s even beside vLLM, a copy 800 to 1,360 GB/s (read plus write).
 
 ### Single stream
@@ -307,8 +307,8 @@ attention layers) and the sharing: each kernel here ran beside vLLM's own.
 The GPU was never free (vLLM at 94% utilisation, 300 W cap), so every number is beside vLLM;
 medians swing with its load (the bf16 `lm_head` median moved from 2.7 ms to 4.3 ms between two
 runs of the same kernel) while minimums stay put. Standalone microbenchmarks
-(`scripts/fp4_gemv_bench.cu`, 16 layers of buffers so nothing is L2 resident, streaming read
-ceiling 1,652 GB/s from `scripts/bandwidth.cu`):
+(`crates/specrt/tools/cuda/fp4_gemv_bench.cu`, 16 layers of buffers so nothing is L2 resident, streaming read
+ceiling 1,652 GB/s from `kir::cuda::emit_bandwidth`):
 
 | variant | gate/up GB/s | down GB/s |
 |---|---|---|

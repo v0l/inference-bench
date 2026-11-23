@@ -7,7 +7,12 @@ mod ggml;
 mod vision;
 mod ops;
 mod moe;
+mod bandwidth;
+mod weight_quant;
 pub(crate) mod topk;
+
+pub use bandwidth::emit_bandwidth;
+pub use weight_quant::emit_weight_quant;
 
 pub use allreduce::{PROBE_STORE, PROBE_WAIT, emit_allreduce, emit_peer_probe};
 pub use attention::emit_attention;

@@ -51,7 +51,7 @@ bench --ab [--rounds N] [--b-graphs on|off] <A spec> [B spec] [prompt_len] [new_
 - Each pass is preceded by an A/A control (A against itself). The statistic is the median of per-round ratios B/A with its IQR.
 - The bench refuses instead of printing a verdict, and exits non-zero, when a control median is outside 1 +/- 0.02, any control or A/B spread (IQR/median) is above 0.10, the two A/B passes differ by more than 3%, or a pass has fewer than 20 rounds. A noisy card gives `REFUSE (reason)`; rerun on a quieter card.
 - Otherwise the verdict is `PASS: B faster`, `PASS: B slower` or `PASS: no difference outside the A/A band`.
-- The bandwidth probe (`crates/specrt/scripts/bandwidth.cu`) runs in the same process. The run prints weight bytes per token and decode GB/s as a fraction of the read wall. Small models can exceed 100% because L2 serves part of the reads.
+- The bandwidth probe (`kir::cuda::emit_bandwidth`) runs in the same process. The run prints weight bytes per token and decode GB/s as a fraction of the read wall. Small models can exceed 100% because L2 serves part of the reads.
 - A second spec path makes B a different spec; `--b-graphs off` makes B the same spec with `[runtime] graphs = false`.
 - `--a-set key=value` and `--b-set key=value` (repeatable, `speculative.*` and `runtime.*` option keys, short names allowed when unique) A/B one option on one spec through the serving scheduler: `bench --ab --rounds 6 --a-set draft_tokens=3 --b-set draft_tokens=auto <spec> [batch] [new_tokens]`. Same control and refusal rules; the round floor is `--rounds`.
 - Prefill ratios are printed too but are noisy at this size; judge on decode unless the change targets prefill.

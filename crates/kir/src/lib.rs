@@ -2,6 +2,7 @@
 pub mod cuda;
 pub mod allreduce;
 pub mod attention;
+pub mod bandwidth;
 pub mod compose;
 pub mod desc;
 pub mod expr;
@@ -21,6 +22,7 @@ pub mod rows;
 pub mod scan;
 pub mod target;
 pub mod vision;
+pub mod weight_quant;
 #[cfg(feature = "wgsl")]
 pub mod wgsl;
 

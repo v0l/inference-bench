@@ -38,7 +38,7 @@ check_free() {
 
 build() {
   log "building"
-  /usr/local/cuda/bin/nvcc -O2 -o "$out/p2p658" "$root/crates/specrt/scripts/p2p658.cu"
+  /usr/local/cuda/bin/nvcc -O2 -o "$out/p2p658" "$root/crates/specrt/tools/cuda/p2p658.cu"
   cargo_run test --release -p inference-bench-specrt --test allreduce --no-run 2>&1 | tail -2
   cargo_run test --release -p inference-bench-specrt --test tp --no-run 2>&1 | tail -2
   cargo_run build --release -p inference-bench-specrt --bin tpbench 2>&1 | tail -2

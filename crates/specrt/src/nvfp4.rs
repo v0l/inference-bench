@@ -106,8 +106,6 @@ pub struct DeviceFp4 {
     pub scales: cudarc::driver::CudaSlice<u8>,
 }
 
-const QUANT_SOURCE: &str = include_str!("../scripts/nvfp4_quant.cu");
-
 pub fn quantize_on_device(
     stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     cache_dir: &std::path::Path,
@@ -124,31 +122,22 @@ pub fn quantize_rows_on_device(
     cols: usize,
     rows: std::ops::Range<usize>,
 ) -> Result<DeviceFp4> {
-    use anyhow::Context;
     use cudarc::driver::{LaunchConfig, PushKernelArg};
     ensure!(cols.is_multiple_of(GROUP) && w.len().is_multiple_of(cols), "nvfp4 rows must be a multiple of {GROUP} wide");
     ensure!(rows.start <= rows.end && rows.end * cols <= w.len(), "rows {rows:?} past the {} row matrix", w.len() / cols);
     let ctx = stream.context();
-    let (major, minor) = ctx.compute_capability()?;
-    let arch: &'static str = Box::leak(format!("compute_{major}{minor}").into_boxed_str());
-    let key = crate::jit::cache_key(QUANT_SOURCE, arch, &[]);
-    let path = cache_dir.join(format!("nvfp4_quant-{key}.ptx"));
-    let ptx = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => {
-            let opts = cudarc::nvrtc::CompileOptions { arch: Some(arch), ..Default::default() };
-            let ptx = cudarc::nvrtc::compile_ptx_with_opts(QUANT_SOURCE, opts).map_err(|e| anyhow::anyhow!("nvrtc nvfp4 quantize: {e:?}"))?.to_src();
-            let _ = std::fs::create_dir_all(cache_dir);
-            let tmp = path.with_extension("tmp");
-            if std::fs::write(&tmp, &ptx).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
-            ptx
-        }
+    let target = crate::codegen::cuda_target(ctx)?;
+    let quant = kir::weight_quant::WeightQuant::nvfp4(&target).map_err(anyhow::Error::msg)?;
+    let module = crate::codegen::Module {
+        source: kir::cuda::emit_weight_quant(&quant).map_err(anyhow::Error::msg)?,
+        kernels: kir::weight_quant::KERNELS.to_vec(),
+        smem: std::collections::BTreeMap::new(),
+        arch_features: false,
+        kir_hash: quant.hash(),
     };
-    let module = ctx.load_module(cudarc::nvrtc::Ptx::from_src(ptx))?;
-    let amax_kernel = module.load_function("nvfp4_amax").context("nvfp4_amax")?;
-    let quant_kernel = module.load_function("nvfp4_quantize").context("nvfp4_quantize")?;
+    let loaded = crate::jit::Jit::new(ctx.clone(), cache_dir.to_path_buf())?.load(&module)?;
+    let amax_kernel = loaded.function(kir::weight_quant::AMAX)?;
+    let quant_kernel = loaded.function(kir::weight_quant::QUANTIZE)?;
     let dev_w = stream.clone_htod(w)?;
     let mut amax = stream.alloc_zeros::<u32>(1)?;
     let len = rows.len() * cols;
@@ -156,11 +145,11 @@ pub fn quantize_rows_on_device(
     let mut packed = stream.alloc_zeros::<u8>(len / 2)?;
     let mut scales = stream.alloc_zeros::<u8>(SCALE_HEADER + groups)?;
     let n = w.len() as u64;
-    let sms = ctx.attribute(cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
-    let amax_cfg = LaunchConfig { grid_dim: (sms * 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+    let launch = |l: kir::weight_quant::Launch| LaunchConfig { grid_dim: (l.grid, 1, 1), block_dim: (l.threads, 1, 1), shared_mem_bytes: 0 };
+    let amax_cfg = launch(quant.amax_launch());
     unsafe { stream.launch_builder(&amax_kernel).arg(&dev_w).arg(&n).arg(&mut amax).launch(amax_cfg) }?;
     let g = groups as u64;
-    let cfg = LaunchConfig { grid_dim: (groups.div_ceil(128).max(1) as u32, 1, 1), block_dim: (128, 1, 1), shared_mem_bytes: 0 };
+    let cfg = launch(quant.quant_launch(groups));
     let part = dev_w.slice(rows.start * cols..rows.end * cols);
     unsafe { stream.launch_builder(&quant_kernel).arg(&part).arg(&g).arg(&amax).arg(&mut packed).arg(&mut scales).launch(cfg) }?;
     Ok(DeviceFp4 { packed, scales })
