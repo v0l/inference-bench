@@ -92,6 +92,16 @@ The first 64 greedy tokens are identical to resident in all three rounds. Missin
 
 Hotlist: a calibration run saved by `--save-hotlist` and loaded by `--hotlist` (or found as `<spec>.hotlist`) changed misses over a 16 token run from 4160 to 4104 on the real model (the hottest 256 of 2048 experts only cover so much), and on the tiny fixture the first decode token has zero misses with the hotlist against 6 or more cold (`tests/offload.rs`).
 
+### Score policy: lagged refill off the token's path (#1169)
+
+`policy = "score"` replaces the slot book with `offload::ExpertBook`. Each expert (layer, expert) keeps a use score: every forward pass adds its share of the routed rows and the score decays by half every `score_half_life` passes (default 64). The pool is split into cache slots and a few scratch slots (`scratch_slots`: the larger of top_k and a sixteenth of the pool). A routed expert that is resident is read from its cache slot; a miss is copied into a scratch slot on the copy stream for this pass only (the same staged path as before), so a miss still costs its copy but never displaces a hot expert. Prefill with more misses than scratch slots borrows the coldest unrouted cache slots, or runs in groups.
+
+After the last cached MoE layer of a pass, `end_step` picks up to `promote_per_step` (default 16) of the best scored non-resident experts and copies each into the cache slot of the coldest resident on a lowest-priority stream, recording one event per copy. A resident is evicted only when the newcomer's score is over `promote_margin` (default 1.15) times its own. A slot is published as resident only when its event has completed (`CudaEvent::is_complete`, polled at the start of every cached MoE layer, the stream is never synchronised); until then the expert is served through scratch. With a hotlist the scores are seeded from it and the cache filled before the first token.
+
+CPU tests in `offload.rs` with a fake copy engine and clock: `promotion_evicts_a_resident_only_past_the_margin`, `an_expert_still_copying_is_served_from_scratch`, `scores_decay_by_half_each_half_life`, `alternating_experts_do_not_thrash_the_cache` (at most 2 evictions in 1000 alternating steps with the margin, over 400 without), `hotlist_seed_fills_the_cache_before_the_first_token`, `misses_past_the_scratch_slots_split_into_groups_or_borrow_cold_slots`, `a_borrowed_slot_reused_by_a_later_group_belongs_to_the_last_expert_copied`. GPU tests in `tests/offload.rs`: `score_policy_expert_cache_is_bit_identical_and_promotes_between_steps` and `score_policy_hotlist_seed_warms_the_cache_and_stays_identical`. The default stays `lru` until the 122B A/B below is run.
+
+Not measured yet (GPU 1 was held by the user's app): `bench --vram-gb 90 --expert-slots 256 --layers 8 --ab --a-set runtime.offload.policy=lru --b-set runtime.offload.policy=score <122B spec> 1 2000`, plus the hit ratio of each arm over the 2000 tokens.
+
 ## CPU compute tier for cold experts (evaluation)
 
 Question: for a missing expert, is a GEMV on the CPU from host RAM faster than copying it over PCIe (57.8 GB/s pinned H2D)? Measured with `crates/specrt/src/bin/cpubench.rs` (`cargo build --release --bin cpubench`, `cpubench --threads N --pool-mb 3072`), on this desktop: AMD Threadripper 9960X (24 cores, 48 threads, Zen 5), 24 MiB L2, 128 MiB L3, 62 GB RAM.
