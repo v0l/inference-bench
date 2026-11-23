@@ -128,6 +128,17 @@ Needs measured feedback: launch gap on a new Target (one probe, cached in `[runt
 4. A new architecture by spec only. A spec that combines existing parameters in a way no hand fusion exists for (sandwich norms plus scaled residual plus MoE-free MLP, or `mixer` with `scaled`) gets its fusions from the passes, with a test that counts launches against the unfused plan.
 5. Guard. A test greps pass and cost-model files for architecture names (`no_arch_names` pattern list), and asserts that pass inputs are only the typed signatures and the `Target`.
 
+Target list from the static comparison against FlashInfer, Triton and vLLM (#1148, `docs/perf/kernel-static.md`, no GPU). Where kir output is structurally behind, ranked by time at stake, each with the pass that would close it:
+
+1. Grouped decode attention at head_dim 256: 255 registers, 184 to 792 B spill, 64 threads per SM against FlashInfer's 768 to 1152. Register pressure aware decode tiling with spill as a refusal (#1160).
+2. NVFP4 prefill GEMM: same `OMMA` as CUTLASS, but cp.async from every warp and 2 stages against TMA, mbarriers, 3 stages and warp specialization. TMA mainloop lowering for `Feature::Tma` targets, stages from the smem budget (#1162).
+3. `moe_route_logits` stages tokens in static shared memory over the 48 KB limit at hidden 3072 and up: GLM-4.5-Air does not build. Static smem check in the budget pass for the route kernels (#1159).
+4. Norm, add norm, swiglu and rope load 32 bits per instruction; every competitor loads 128. Vectorise pass over `Compose` and row loops (#1161).
+5. No sm_75 plan for any Qwen3.5 or 27B spec (scalar flash tile 84 KB, chunk GDN needs mma) (#1163).
+6. `--split-compile` makes the spill of kernels at 255 registers depend on unrelated kernels in the module (#1164).
+
+The prefill flash attention and the bf16 GEMM main loop match the competitors structurally. Timed runs: #1158.
+
 ## 8. Slices (landing order)
 
 1. Typed op signatures plus `validate_plan`, bytes and launch report (`inference-bench kernels --plan`). No behaviour change. Landed (#1053): `crates/specrt/src/signature.rs` (`Signer::signature`, one exhaustive match over `Op`; shapes from `gemm::linear_shape`, cache rows from `state`, described nodes from their kir params and binds), `validate_plan`, `plan_report`; tests in `tests/plan_check.rs`. `inference-bench kernels --spec S --plan [--phase prefill|decode|verify] [--tokens N] [--context C] [--target T]` prints per layer kind the ops, class, bytes read and written, launches and a step total. Bytes are what each op touches once (weights, activations, the cache rows read), not cache-line traffic.
