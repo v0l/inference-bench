@@ -391,7 +391,8 @@ fn launch_geometry_comes_from_kir_builders() {
     assert!(!codegen.contains("div_ceil(16)"), "decode warps live in kir::attention");
     let launch = kir::moe::expert_rows_launch(3, 17);
     assert_eq!((launch.grid, launch.threads), ((3, 3), 256));
-    assert_eq!(kir::moe::route_logits_launch(256, 9).grid, (33, 3));
+    assert_eq!(kir::moe::route_logits_launch(256, 9, 4096).grid, (33, 3));
+    assert_eq!(kir::moe::route_logits_launch(256, 9, 4096).smem, 65536);
     let g = kir::gemv::gemv_geometry(kir::gemm::WeightFormat::Ggml, 64, false, false, false);
     assert_eq!((g.threads, g.rows_per_block, g.blocks_per_sm), (256, 16, Some(8)));
     let f = kir::gemv::gemv_geometry(kir::gemm::WeightFormat::Fp4, 64, false, true, true);

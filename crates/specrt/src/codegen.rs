@@ -44,6 +44,7 @@ pub fn moe_mma_fp8_enabled(spec: &Spec, target: &kir::Target) -> bool {
 pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::MoeKernel>> {
     let Some(m) = &spec.moe else { return Ok(Vec::new()) };
     let shape = kir::moe::MoeShape {
+        hidden: spec.dims.hidden,
         experts: m.experts,
         local: m.local_experts(),
         top_k: m.top_k(),

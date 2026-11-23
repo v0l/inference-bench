@@ -156,9 +156,9 @@ fn rows_for(spec: &Spec, module: &Module, t: &Target) -> Vec<Value> {
         && has("moe_route")
     {
         for tokens in [1usize, 4096] {
-            let l = kir::moe::route_logits_launch(m.experts, tokens);
+            let l = kir::moe::route_logits_launch(m.experts, tokens, spec.dims.hidden);
             let p = with(json!({ "tokens": tokens }));
-            out.push(row("topk_routing", spec, "moe_route_logits", [l.grid.0 as usize, l.grid.1 as usize, 1], l.threads as usize, 0, p.clone()));
+            out.push(row("topk_routing", spec, "moe_route_logits", [l.grid.0 as usize, l.grid.1 as usize, 1], l.threads as usize, l.smem, p.clone()));
             out.push(row("topk_routing", spec, "moe_route", [tokens, 1, 1], kir::moe::ROUTE_THREADS as usize, 0, p));
         }
     }
@@ -268,6 +268,26 @@ fn every_static_row_names_a_kernel_its_module_builds() {
             for f in ["bf16_gemm", "decode_attention", "fused_add_rmsnorm", "nvfp4_gemm", "nvfp4_gemv", "prefill_attention", "rmsnorm", "rotary", "silu_and_mul", "topk_routing"] {
                 assert!(families.iter().any(|x| x == f), "{}: no {f} row in {families:?}", gpu.name);
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "NVRTC compile for plain sm_120 and sm_75, no GPU"]
+fn route_logits_compiles_without_arch_features() {
+    let t = Target::cuda(12, 0, 188, 99 * 1024);
+    for (name, config) in [("glm4.5-air", "glm4.5-air.config.json"), ("122b", "qwen3.5-122b-a10b-nvfp4.config.json")] {
+        let spec = hf(config, name);
+        let m = Module::generate_kv(&spec, DECODE_CTX, 1, &t).unwrap();
+        assert_eq!(m.smem["moe_route_logits"], kir::moe::route_logits_smem(spec.dims.hidden));
+        let sm = if m.arch_features { "sm_120a" } else { "sm_120" };
+        specrt::jit::cubin_for(&m.source, sm, 1).unwrap_or_else(|e| panic!("{name} {sm}: {e:#}"));
+        let plain = specrt::jit::cubin_for(&m.source, "sm_120", 1);
+        if let Err(e) = plain {
+            assert!(!format!("{e:#}").contains("moe_route_logits"), "{name} sm_120: {e:#}");
+            eprintln!("{name} plain sm_120 fails for other reasons: {}", format!("{e:#}").lines().filter(|l| l.contains("error")).next().unwrap_or(""));
+        } else {
+            eprintln!("{name} plain sm_120 builds");
         }
     }
 }
