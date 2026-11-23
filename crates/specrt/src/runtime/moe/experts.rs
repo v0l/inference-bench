@@ -181,15 +181,23 @@ impl CopyEngine for Promotions<'_> {
     fn copy(&mut self, page: usize, slot: usize) -> Result<Option<CudaEvent>> {
         let (layer, e) = (page / self.cache.local, page % self.cache.local);
         let Some((_, host)) = self.hosts.iter().find(|(l, _)| *l == layer) else { return Ok(None) };
-        let Backing::Pinned(b) = &host.buf else { return Ok(None) };
-        let src = b.as_slice()?;
-        for (p, base) in host.parts.iter().zip(&self.cache.addrs) {
-            let from = &src[p.offset + e * p.per..p.offset + (e + 1) * p.per];
-            unsafe { cudarc::driver::result::memcpy_htod_async(base + (slot * p.per) as u64, from, self.cache.promo.cu_stream()) }?;
-            self.stats.host_to_vram_bytes += p.per as u64;
-        }
-        let ev = self.cache.promo.context().new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
-        ev.record(&self.cache.promo)?;
+        let stream = match &host.buf {
+            Backing::Pinned(b) => {
+                let src = b.as_slice()?;
+                for (p, base) in host.parts.iter().zip(&self.cache.addrs) {
+                    let from = &src[p.offset + e * p.per..p.offset + (e + 1) * p.per];
+                    unsafe { cudarc::driver::result::memcpy_htod_async(base + (slot * p.per) as u64, from, self.cache.promo.cu_stream()) }?;
+                    self.stats.host_to_vram_bytes += p.per as u64;
+                }
+                &self.cache.promo
+            }
+            Backing::File { file, .. } => {
+                self.cache.read_runs(file, host, &[(e, slot, 1)], &mut self.stats)?;
+                &self.cache.copy
+            }
+        };
+        let ev = stream.context().new_event(Some(CUevent_flags::CU_EVENT_DISABLE_TIMING))?;
+        ev.record(stream)?;
         Ok(Some(ev))
     }
 }
@@ -435,6 +443,7 @@ impl ExpertCache {
         let Some(book) = g.scored.as_mut() else { return Ok(()) };
         self.mark.record(compute)?;
         self.promo.wait(&self.mark)?;
+        self.copy.wait(&self.mark)?;
         let mut engine = Promotions { cache: self, hosts, stats: OffloadStats::default() };
         let promoted = book.end_step(&mut engine);
         book.stats.absorb_io(&engine.stats);

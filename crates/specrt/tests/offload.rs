@@ -122,13 +122,19 @@ fn moe_spec(dir: &str, slots: usize, hotlist: Option<String>) -> Spec {
 }
 
 fn assert_experts_identical(dir: &str, slots: usize) {
+    assert_experts_identical_with(dir, slots, |_| ());
+}
+
+fn assert_experts_identical_with(dir: &str, slots: usize, tweak: impl Fn(&mut Spec)) -> specrt::offload::OffloadStats {
     let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
     let p = prompt(40);
     let want_prefill = full.trace_prefill(&p).unwrap();
     let want_decode = full.trace_decode(&prompt(6)).unwrap();
     let want_tokens = full.generate(&p, 16, Sampling::GREEDY).unwrap().tokens;
     drop(full);
-    let mut off = Runtime::load(&moe_spec(dir, slots, None), 256).unwrap();
+    let mut spec = moe_spec(dir, slots, None);
+    tweak(&mut spec);
+    let mut off = Runtime::load(&spec, 256).unwrap();
     assert_eq!(off.expert_slots(), slots);
     assert_eq!(off.trace_prefill(&p).unwrap().logits, want_prefill.logits, "prefill logits");
     let got = off.trace_decode(&prompt(6)).unwrap();
@@ -137,6 +143,43 @@ fn assert_experts_identical(dir: &str, slots: usize) {
     assert_eq!(off.generate(&p, 16, Sampling::GREEDY).unwrap().tokens, want_tokens);
     let stats = off.offload_stats().unwrap();
     assert!(stats.host_to_vram_bytes > 0, "{stats:?}");
+    stats
+}
+
+fn scored(spec: &mut Spec) {
+    spec.runtime.offload.policy = specrt::offload::Policy::Score;
+    spec.runtime.offload.score_half_life = 4;
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn score_policy_expert_cache_is_bit_identical_and_promotes_between_steps() {
+    for slots in [3, 5, 8] {
+        let stats = assert_experts_identical_with("tiny-qwen3.5-moe", slots, scored);
+        assert!(stats.promotions > 0, "{slots} slots: {stats:?}");
+    }
+    assert_experts_identical_with("tiny-qwen3.5-moe-nvfp4", 3, scored);
+    assert_experts_identical_with("tiny-qwen3.5-moe-fp8", 3, scored);
+    assert_experts_identical_with("tiny-glm4-moe", 4, scored);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn score_policy_hotlist_seed_warms_the_cache_and_stays_identical() {
+    let first = prompt(1);
+    let mut cold = Runtime::load(&moe_spec("tiny-qwen3.5-moe", 8, None), 256).unwrap();
+    let want = cold.trace_decode(&first).unwrap().logits;
+    let path = std::env::temp_dir().join(format!("hotlist-score-{}.json", std::process::id()));
+    cold.save_expert_hotlist(&path).unwrap();
+    drop(cold);
+    let mut spec = moe_spec("tiny-qwen3.5-moe", 8, Some(path.display().to_string()));
+    scored(&mut spec);
+    let mut warm = Runtime::load(&spec, 256).unwrap();
+    assert!(warm.offload_stats().unwrap().host_to_vram_bytes > 0, "seed copies experts before the first token");
+    assert_eq!(warm.trace_decode(&first).unwrap().logits, want);
+    let st = warm.offload_stats().unwrap();
+    assert!(st.vram_hits > 0, "{st:?}");
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]

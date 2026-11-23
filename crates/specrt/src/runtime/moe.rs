@@ -324,7 +324,7 @@ impl Runtime {
         let mb = self.moe.as_ref().expect("moe buffers");
         let shared_at = m.local_experts() as i32;
         let counted: Vec<(usize, usize)> = used.iter().map(|&e| (e, routed.iter().filter(|&&r| r == e as i32).count())).collect();
-        let mut groups = cache.plan_scored(w.index, &counted, n, n >= GROUP_MIN_TOKENS);
+        let mut groups = cache.plan_scored(w.index, &counted, n, true);
         if groups.iter().all(Vec::is_empty) {
             groups.truncate(1);
         }

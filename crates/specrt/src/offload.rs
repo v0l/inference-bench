@@ -448,7 +448,7 @@ pub struct ExpertBook<T> {
 }
 
 pub fn scratch_slots(slots: usize, top_k: usize) -> usize {
-    top_k.max(slots / 8).clamp(1, slots.max(1))
+    top_k.max(slots / 16).clamp(1, slots.max(1))
 }
 
 impl<T> ExpertBook<T> {
@@ -549,11 +549,14 @@ impl<T> ExpertBook<T> {
         }
         for (i, chunk) in misses.chunks(pool.len()).enumerate() {
             let placed: Vec<Placed> = chunk.iter().zip(&pool).map(|(&page, &slot)| Placed { page, slot, copy: true }).collect();
-            if i == 0 {
-                for p in placed.iter().filter(|p| p.slot < base) {
-                    self.state[p.slot] = SlotState::Resident(p.page);
-                    self.slot_of[p.page] = Some(p.slot);
+            for p in placed.iter().filter(|p| p.slot < base) {
+                if let SlotState::Resident(prev) = self.state[p.slot] {
+                    self.slot_of[prev] = None;
                 }
+                self.state[p.slot] = SlotState::Resident(p.page);
+                self.slot_of[p.page] = Some(p.slot);
+            }
+            if i == 0 {
                 groups[0].extend(placed);
             } else {
                 groups.push(placed);
@@ -591,8 +594,12 @@ impl<T> ExpertBook<T> {
     pub fn end_step<E: CopyEngine<Ticket = T>>(&mut self, engine: &mut E) -> Result<usize> {
         let landing_page = |book: &Self, p: usize| book.landing.iter().any(|(q, _, _)| *q == p);
         let mut wanted: Vec<usize> = (0..self.score.len()).filter(|&p| self.score[p] > 0.0 && self.slot_of[p].is_none() && !landing_page(self, p)).collect();
-        wanted.sort_by(|&a, &b| self.score[b].total_cmp(&self.score[a]).then(a.cmp(&b)));
-        wanted.truncate(self.per_step);
+        let by_score = |book: &Self, a: &usize, b: &usize| book.score[*b].total_cmp(&book.score[*a]).then(a.cmp(b));
+        if wanted.len() > self.per_step {
+            wanted.select_nth_unstable_by(self.per_step, |a, b| by_score(self, a, b));
+            wanted.truncate(self.per_step);
+        }
+        wanted.sort_by(|a, b| by_score(self, a, b));
         let mut victims: Vec<usize> = (0..self.state.len()).filter(|&s| !matches!(self.state[s], SlotState::Landing(_))).collect();
         victims.sort_by(|&a, &b| self.slot_score(a).total_cmp(&self.slot_score(b)).then(a.cmp(&b)));
         let mut promoted = 0;
@@ -1193,6 +1200,33 @@ mod tests {
         let borrowed: Vec<usize> = g[0].iter().filter(|p| p.copy && p.slot < 4).map(|p| p.page).collect();
         assert_eq!(borrowed.len(), 3);
         assert!(borrowed.iter().all(|&p| b.resident(p).is_some()), "a borrowed slot keeps the expert it was given");
+    }
+
+    #[test]
+    fn a_borrowed_slot_reused_by_a_later_group_belongs_to_the_last_expert_copied() {
+        let (mut eng, _) = engine(0);
+        let mut b: ExpertBook<u64> = ExpertBook::new(32, 4, 1, &score_settings(1.15, 64));
+        for p in 0..3 {
+            b.record(p, 1.0);
+        }
+        b.end_step(&mut eng).unwrap();
+        b.poll(|t| eng.done(t));
+        let g = b.plan(&[10, 11, 12, 13, 14, 15, 16, 17, 18, 19], true);
+        assert!(g.len() > 1, "{g:?}");
+        let mut owner = std::collections::HashMap::new();
+        for p in g.iter().flatten() {
+            owner.insert(p.slot, p.page);
+        }
+        for (slot, page) in owner {
+            if slot < b.cache_slots() {
+                assert_eq!(b.resident(page), Some(slot));
+            }
+        }
+        for page in 10..20 {
+            if let Some(slot) = b.resident(page) {
+                assert_eq!(g.iter().flatten().filter(|p| p.slot == slot).last().unwrap().page, page, "slot {slot} holds the last copy");
+            }
+        }
     }
 
     #[test]
