@@ -106,8 +106,128 @@ fn kernel_files(dir: &Path) -> Vec<String> {
     out
 }
 
+const KIR_EMITTERS_OUTSIDE_CUDA: &[&str] = &["kir/src/compose.rs", "kir/src/gemv.rs", "kir/src/prims.rs", "kir/src/recur.rs", "kir/src/rows.rs", "kir/src/scan.rs"];
+
+const KERNEL_TEXT_OUTSIDE_KIR: &[(&str, &str)] = &[
+    ("kir/tests/compose.rs", "asserts on emitted text"),
+    ("specrt/tests/codegen.rs", "this guard"),
+    ("specrt/tests/kir_speed.rs", "the old template text the kir rmsnorm is timed against"),
+    ("specrt/tests/prologue_bits.rs", "reference kernels the fused prologue is compared to bit for bit"),
+    ("specrt/tests/fixtures/fp4_gemv_reference.cu", "reference GEMV for tests/fp4_gemv.rs"),
+    ("specrt/scripts/bandwidth.cu", "bandwidth probe, compiled at runtime by src/bandwidth.rs"),
+    ("specrt/scripts/nvfp4_quant.cu", "load time NVFP4 quantiser, compiled by src/nvfp4.rs"),
+    ("specrt/scripts/bw_q6k_head.cu", "dev bench"),
+    ("specrt/scripts/fp4_gemv_bench.cu", "dev bench"),
+    ("specrt/scripts/p2p658.cu", "dev bench"),
+];
+
+const KERNEL_INCLUDES_OUTSIDE_KIR: &[&str] = &["specrt/src/bandwidth.rs", "specrt/src/nvfp4.rs", "specrt/tests/fp4_gemv.rs"];
+
+const NVRTC_OUTSIDE_JIT: &[&str] = &["specrt/src/allreduce.rs", "specrt/src/bandwidth.rs", "specrt/src/nvfp4.rs"];
+
+fn crate_files(root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries {
+            let path = e.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if path.is_dir() {
+                if name != "target" && name != "golden" && !name.starts_with('.') {
+                    stack.push(path);
+                }
+            } else if ["rs", "cu", "cuh", "c", "h", "wgsl", "metal"].iter().any(|x| name.ends_with(&format!(".{x}"))) {
+                let rel = path.strip_prefix(root).unwrap().display().to_string();
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    out.push((rel, text));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn kernel_text_offenders(files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|(f, text)| !f.starts_with("kir/src/cuda/") && text.contains("__global__"))
+        .map(|(f, _)| f.clone())
+        .filter(|f| !KIR_EMITTERS_OUTSIDE_CUDA.contains(&f.as_str()) && !KERNEL_TEXT_OUTSIDE_KIR.iter().any(|(a, _)| a == f))
+        .collect()
+}
+
+fn kernel_include_offenders(files: &[(String, String)]) -> Vec<String> {
+    let includes = |text: &str| text.split("include_str!(").skip(1).any(|rest| rest.split(')').next().is_some_and(|arg| arg.contains(".cu\"") || arg.contains(".wgsl\"") || arg.contains(".cuh\"")));
+    files
+        .iter()
+        .filter(|(f, text)| f.ends_with(".rs") && !f.starts_with("kir/") && f != "specrt/tests/codegen.rs" && includes(text))
+        .map(|(f, _)| f.clone())
+        .filter(|f| !KERNEL_INCLUDES_OUTSIDE_KIR.contains(&f.as_str()))
+        .collect()
+}
+
+fn nvrtc_offenders(files: &[(String, String)]) -> Vec<String> {
+    files
+        .iter()
+        .filter(|(f, text)| f.contains("/src/") && f.ends_with(".rs") && f != "specrt/src/jit.rs" && ["compile_ptx", "create_program", "compile_program"].iter().any(|p| text.contains(p)))
+        .map(|(f, _)| f.clone())
+        .filter(|f| !NVRTC_OUTSIDE_JIT.contains(&f.as_str()))
+        .collect()
+}
+
+fn assert_kernel_text_lives_only_in_kir() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let files = crate_files(&crates);
+    assert!(files.len() > 200, "{}", files.len());
+    let text = kernel_text_offenders(&files);
+    assert!(text.is_empty(), "__global__ kernel text outside crates/kir/src/cuda: {text:?}");
+    let includes = kernel_include_offenders(&files);
+    assert!(includes.is_empty(), "include_str! of kernel text outside crates/kir: {includes:?}");
+    let nvrtc = nvrtc_offenders(&files);
+    assert!(nvrtc.is_empty(), "NVRTC called outside src/jit.rs: {nvrtc:?}");
+    for f in KIR_EMITTERS_OUTSIDE_CUDA.iter().chain(KERNEL_INCLUDES_OUTSIDE_KIR).chain(NVRTC_OUTSIDE_JIT).chain(KERNEL_TEXT_OUTSIDE_KIR.iter().map(|(f, _)| f)) {
+        assert!(crates.join(f).exists(), "stale allowlist entry {f}");
+    }
+    let pinned = [
+        ("KIR_SNIPPETS", KIR_SNIPPETS.len(), 4),
+        ("LIBRARY_ONLY", LIBRARY_ONLY.len(), 1),
+        ("VERBATIM_LINEAR", VERBATIM_LINEAR.len(), 0),
+        ("VERBATIM_ATTENTION", VERBATIM_ATTENTION.len(), 0),
+        ("PRIM_LIBRARY_ATTENTION", PRIM_LIBRARY_ATTENTION.len(), 2),
+        ("VERBATIM_QUANT", VERBATIM_QUANT.len(), 1),
+        ("VERBATIM_MOE", VERBATIM_MOE.len(), 3),
+        ("KIR_EMITTERS_OUTSIDE_CUDA", KIR_EMITTERS_OUTSIDE_CUDA.len(), 6),
+        ("KERNEL_TEXT_OUTSIDE_KIR", KERNEL_TEXT_OUTSIDE_KIR.len(), 10),
+        ("KERNEL_INCLUDES_OUTSIDE_KIR", KERNEL_INCLUDES_OUTSIDE_KIR.len(), 3),
+        ("NVRTC_OUTSIDE_JIT", NVRTC_OUTSIDE_JIT.len(), 3),
+    ];
+    for (name, len, pin) in pinned {
+        assert_eq!(len, pin, "{name} changed size: shrink the pin when an entry is ported, never grow the list");
+    }
+}
+
+#[test]
+fn the_kernel_text_guards_catch_a_new_offender() {
+    let file = |f: &str, t: &str| (f.to_string(), t.to_string());
+    let files = vec![
+        file("specrt/src/new.rs", "const K: &str = \"extern \\\"C\\\" __global__ void k() {}\";"),
+        file("core/src/x.rs", "const S: &str = include_str!(\"k.cu\");"),
+        file("ui/src/y.rs", "const S: &str = include_str!(\"shader.wgsl\");"),
+        file("specrt/src/z.rs", "let p = cudarc::nvrtc::compile_ptx(src);"),
+        file("kir/src/cuda/fine.rs", "__global__ include_str!(\"a.cu\")"),
+        file("specrt/src/jit.rs", "compile_ptx"),
+        file("specrt/src/ok.rs", "include_str!(\"spec.toml\")"),
+    ];
+    assert_eq!(kernel_text_offenders(&files), ["specrt/src/new.rs"]);
+    assert_eq!(kernel_include_offenders(&files), ["core/src/x.rs", "ui/src/y.rs"]);
+    assert_eq!(nvrtc_offenders(&files), ["specrt/src/z.rs"]);
+}
+
 #[test]
 fn every_kernel_comes_from_kir() {
+    assert_kernel_text_lives_only_in_kir();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let stray = kernel_files(&root.join("templates"));
     assert!(stray.is_empty(), "kernel text belongs in kir: {stray:?}");
