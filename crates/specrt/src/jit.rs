@@ -137,6 +137,16 @@ fn compile_cubin(source: &kir::KirSource, sm: &str, options: &[String], jobs: us
     }
 }
 
+pub fn cubin_for(source: &kir::KirSource, sm: &str, jobs: usize) -> Result<Vec<u8>> {
+    compile_cubin(source, sm, &["--std=c++17".to_string()], jobs)
+}
+
+pub fn nvrtc_version() -> Result<(i32, i32)> {
+    let (mut major, mut minor) = (0, 0);
+    unsafe { cudarc::nvrtc::sys::nvrtcVersion(&mut major, &mut minor).result().map_err(|e| anyhow!("nvrtcVersion: {e:?}"))? };
+    Ok((major, minor))
+}
+
 pub fn default_cache_dir() -> PathBuf {
     dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("specrt")
 }
