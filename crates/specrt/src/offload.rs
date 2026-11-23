@@ -62,11 +62,23 @@ pub struct OffloadStats {
     pub host_hits: u64,
     pub nvme_reads: u64,
     pub nvme_read_bytes: u64,
+    #[serde(default)]
+    pub nvme_read_failures: u64,
+    #[serde(default)]
+    pub nvme_wait_nanos: u64,
     pub host_to_vram_bytes: u64,
     pub evictions: u64,
 }
 
 impl OffloadStats {
+    pub fn absorb_io(&mut self, other: &OffloadStats) {
+        self.host_to_vram_bytes += other.host_to_vram_bytes;
+        self.nvme_reads += other.nvme_reads;
+        self.nvme_read_bytes += other.nvme_read_bytes;
+        self.nvme_read_failures += other.nvme_read_failures;
+        self.nvme_wait_nanos += other.nvme_wait_nanos;
+    }
+
     pub fn hit_ratio(&self) -> f64 {
         let total = self.vram_hits + self.host_hits + self.nvme_reads;
         if total == 0 { 1.0 } else { self.vram_hits as f64 / total as f64 }
