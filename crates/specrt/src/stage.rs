@@ -230,6 +230,8 @@ impl RuntimeStage {
         let link = self.link.lock().unwrap().clone();
         ensure!(link.gpu_direct && link.transport != Transport::Tcp, "gpu-direct is not enabled on this stage");
         let ip = ip.parse().with_context(|| format!("address {ip}"))?;
+        let verbs = crate::rdma::Verbs::load(link.library())?;
+        ensure!(verbs.supports_dmabuf(), "this libibverbs has no ibv_reg_dmabuf_mr");
         let mut guard = self.inner.lock().unwrap();
         let Loaded { engine, .. } = guard.as_mut().context("this stage has no layers loaded")?;
         let rt = match engine {
