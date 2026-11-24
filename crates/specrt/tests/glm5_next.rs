@@ -125,9 +125,97 @@ fn the_reference_loads_with_finite_prefill_decode_hidden_and_mtp_outputs() {
 
 const TOLERANCE: f32 = 3.8e-4;
 
+fn engine_spec() -> Spec {
+    let family = std::fs::read_to_string(fixture().join("family.toml")).unwrap();
+    let registry = specrt::family::Registry::from_texts(specrt::spec::EMBEDDED.iter().map(|(_, t)| *t).chain([family.as_str()])).unwrap();
+    let mut spec = Spec::from_hf_config_serving_in(&registry, &config()).unwrap_or_else(|e| panic!("{e:#}"));
+    spec.name = NAME.into();
+    spec.repo = fixture().display().to_string();
+    spec
+}
+
+#[test]
+fn the_engine_family_plans_hyper_connections_and_no_rope_nodes() {
+    use specrt::plan::{Op, Phase, Plan};
+    let spec = engine_spec();
+    spec.runnable().unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(spec.hyper.as_ref().map(|h| h.sites.len()), Some(2));
+    for phase in [Phase::Prefill, Phase::Decode] {
+        let plan = Plan::build(&spec, phase, true);
+        assert_eq!(plan.head.last(), Some(&Op::HyperExpand), "{phase:?}");
+        assert_eq!(plan.tail.first(), Some(&Op::HyperMean), "{phase:?}");
+        for (block, sparse) in [(Block::Linear, false), (Block::Linear, true), (Block::Full, true)] {
+            let ops = plan.layer_of(block, sparse);
+            assert_eq!(ops.iter().filter(|o| matches!(o, Op::HyperPre { .. })).count(), 2, "{block:?} {sparse}");
+            assert_eq!(ops.iter().filter(|o| matches!(o, Op::HyperPost)).count(), 2, "{block:?} {sparse}");
+            assert!(!ops.iter().any(|o| matches!(o, Op::KvRope | Op::QkRope | Op::DecodeRope)), "{block:?}");
+        }
+        specrt::signature::validate_plan(&plan, &spec).unwrap_or_else(|e| panic!("{phase:?}: {e:#}"));
+    }
+    let kernels: Vec<&str> = spec.attention.node.iter().filter_map(|n| n.kernel.as_deref()).collect();
+    assert!(kernels.iter().all(|k| !k.contains("rope")), "{kernels:?}");
+    let module = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap_or_else(|e| panic!("{e:#}"));
+    for k in ["hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_index_topk", "dsa_latent_attention", "kda_recurrence", "kda_conv_q", "kda_gated_norm"] {
+        assert!(module.kernels.contains(&k) && module.source.contains(&format!("{k}(")), "{k}");
+    }
+    assert!(Spec::from_hf_config(&config()).is_err(), "the library itself still refuses glm5_next");
+    let mixer = specrt::codegen::mixer_kernels(&spec, 1, 256, &kir::Target::sm_120()).unwrap();
+    let kda = mixer.iter().find(|k| k.name == "kda_recurrence").unwrap();
+    assert!(kda.chunk_form().is_none(), "KDA prefill runs the recurrent form: the chunked lowering takes one read stage and KDA reads the state twice");
+}
+
+#[test]
+#[ignore = "needs the NVRTC library (no GPU)"]
+fn the_engine_module_compiles_through_nvrtc() {
+    let module = specrt::codegen::Module::generate_kv(&engine_spec(), 256, 1, &kir::Target::sm_120()).unwrap();
+    let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".into()], ..Default::default() };
+    let ptx = cudarc::nvrtc::compile_ptx_with_opts(&module.source, opts).unwrap_or_else(|e| panic!("{e:?}")).to_src();
+    for k in ["hyper_pre", "hyper_post", "pool_index_topk", "dsa_latent_attention", "kda_recurrence", "kda_gated_norm"] {
+        assert!(ptx.contains(&format!(".entry {k}(")), "{k}");
+    }
+}
+
 struct Run {
     logits: Vec<Vec<f32>>,
     trace: Vec<Vec<Vec<Vec<f32>>>>,
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn the_engine_matches_the_reference_streams_prefill_and_four_decode_steps() {
+    use specrt::runtime::{DecodeRow, Runtime, Sampling};
+    let spec = engine_spec();
+    let m = meta(&format!("{NAME}.ref.json"));
+    let ids = |k: &str| -> Vec<u32> { m[k].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect() };
+    let (tokens, greedy) = (ids("tokens"), ids("greedy"));
+    let vocab = 512;
+    let mut rt = Runtime::load_batched(&spec, 256, 1).unwrap_or_else(|e| panic!("{e:#}"));
+    let trace = rt.trace_prefill(&tokens).unwrap();
+    let gap = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+    let per = tokens.len() * 4 * 128;
+    let saved = floats(&format!("{NAME}.hidden.streams.bin"));
+    for (slot, layer) in [(0, 0), (1, 1), (2, 3)] {
+        let g = gap(&trace.layers[layer * per..(layer + 1) * per], &saved[slot * per..(slot + 1) * per]);
+        eprintln!("layer {layer} streams max abs {g}");
+        assert!(g < TOLERANCE, "layer {layer} streams max abs {g}");
+    }
+    let prefill = floats(&format!("{NAME}.ref.bin"));
+    let p = gap(&trace.logits, &prefill);
+    eprintln!("engine prefill max abs {p}");
+    assert!(p < TOLERANCE, "prefill max abs {p}");
+    let decode = floats(&format!("{NAME}.decode.logits.bin"));
+    let mut st = rt.stepper().unwrap();
+    let mut st_prefill = rt.stepper().unwrap();
+    rt.prefill_slot(&mut st_prefill, 0, &tokens, 0, None).unwrap();
+    for s in 0..4 {
+        let row = DecodeRow { slot: 0, token: greedy[s], pos: tokens.len() + s, sampling: Sampling::GREEDY, step: s as u32 };
+        let next = rt.decode(&mut st, &[row]).unwrap();
+        let got = rt.step_logits(&st, 0, 1).unwrap();
+        let d = gap(&got, &decode[s * vocab..(s + 1) * vocab]);
+        eprintln!("decode step {s} max abs {d}");
+        assert!(d < TOLERANCE, "decode step {s} max abs {d}");
+        assert_eq!(next[0], greedy[s + 1], "decode step {s}");
+    }
 }
 
 fn host_run(knobs: impl Fn(&mut Knobs), extra: &[u32]) -> Run {
