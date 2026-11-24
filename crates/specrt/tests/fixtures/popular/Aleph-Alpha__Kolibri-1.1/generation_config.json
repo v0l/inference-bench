@@ -1,0 +1,12 @@
+{
+  "temperature": 1.0,
+  "top_p": 0.99,
+  "top_k": 128,
+  "min_p": 0.0,
+  "do_sample": true,
+  "eos_token_id": [
+    127906,
+    127901
+  ],
+  "pad_token_id": 127901
+}

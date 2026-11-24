@@ -1,0 +1,40 @@
+{
+  "add_bos_token": false,
+  "add_eos_token": false,
+  "backend": "tokenizers",
+  "bos_token": {
+    "__type": "AddedToken",
+    "content": "<_start>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false,
+    "special": true
+  },
+  "clean_up_tokenization_spaces": false,
+  "do_lower_case": false,
+  "eos_token": {
+    "__type": "AddedToken",
+    "content": "<_end>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false,
+    "special": true
+  },
+  "is_local": true,
+  "model_max_length": 1048576,
+  "model_specific_special_tokens": {},
+  "pad_token":{
+    "__type": "AddedToken",
+    "content": "<_pad>",
+    "lstrip": false,
+    "normalized": false,
+    "rstrip": false,
+    "single_word": false,
+    "special": true
+  },
+  "padding_side": "left",
+  "remove_space": false,
+  "tokenizer_class": "TokenizersBackend"
+}

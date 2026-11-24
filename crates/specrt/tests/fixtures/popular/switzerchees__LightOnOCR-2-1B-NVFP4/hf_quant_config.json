@@ -1,0 +1,16 @@
+{
+    "producer": {
+        "name": "modelopt",
+        "version": "0.41.0"
+    },
+    "quantization": {
+        "quant_algo": "NVFP4",
+        "kv_cache_quant_algo": null,
+        "group_size": 16,
+        "exclude_modules": [
+            "lm_head",
+            "model.vision_encoder*",
+            "model.vision_projection.patch_merger*"
+        ]
+    }
+}
