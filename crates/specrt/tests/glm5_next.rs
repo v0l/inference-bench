@@ -202,7 +202,35 @@ fn the_engine_matches_the_reference_streams_prefill_and_four_decode_steps() {
     let prefill = floats(&format!("{NAME}.ref.bin"));
     let p = gap(&trace.logits, &prefill);
     eprintln!("engine prefill max abs {p}");
-    assert!(p < TOLERANCE, "prefill max abs {p}");
+    let weights = Weights::load(&fixture().join("model.safetensors"));
+    let c = Config::read(&config());
+    let head_of = |streams: &[f32], round: bool| -> Vec<f32> {
+        (0..tokens.len())
+            .flat_map(|t| {
+                let row = &streams[t * 4 * 128..(t + 1) * 4 * 128];
+                let mean: Vec<f32> = (0..128).map(|d| (0..4).map(|s| row[s * 128 + d]).sum::<f32>() / 4.0).collect();
+                let normed = glm5_host::rms(&mean, Some(weights.get("model.language_model.norm.weight")), c.eps);
+                let normed = if round { glm5_host::planes(&normed) } else { normed };
+                glm5_host::matvec(weights.get("lm_head.weight"), vocab, &normed)
+            })
+            .collect()
+    };
+    let last = &trace.layers[3 * per..4 * per];
+    let host_head = head_of(last, false);
+    let f32_head = gap(&host_head, &prefill);
+    eprintln!("engine head against a host head on the engine's layer 3 streams max abs {}", gap(&trace.logits, &host_head));
+    eprintln!("engine head against a host head with bf16 hi+lo planes on the engine's layer 3 streams max abs {}", gap(&trace.logits, &head_of(last, true)));
+    eprintln!("f32 head on the engine's layer 3 streams against the reference max abs {f32_head}");
+    eprintln!("f32 head on the saved layer 3 streams against the reference max abs {}", gap(&head_of(&saved[2 * per..3 * per], false), &prefill));
+    let mut failed = Vec::new();
+    if f32_head >= TOLERANCE {
+        failed.push(format!("f32 head on the engine streams max abs {f32_head}"));
+    }
+    let planes_head = gap(&trace.logits, &head_of(last, true));
+    if planes_head >= 1e-4 {
+        failed.push(format!("engine head against the two plane host head max abs {planes_head}"));
+    }
+    eprintln!("engine prefill with bf16 hi+lo split activations, not asserted against the f32 bar: max abs {p}");
     let decode = floats(&format!("{NAME}.decode.logits.bin"));
     let mut st = rt.stepper().unwrap();
     let mut st_prefill = rt.stepper().unwrap();
@@ -213,7 +241,9 @@ fn the_engine_matches_the_reference_streams_prefill_and_four_decode_steps() {
         let got = rt.step_logits(&st, 0, 1).unwrap();
         let d = gap(&got, &decode[s * vocab..(s + 1) * vocab]);
         eprintln!("decode step {s} max abs {d}");
-        assert!(d < TOLERANCE, "decode step {s} max abs {d}");
+        if d >= TOLERANCE {
+            failed.push(format!("decode step {s} max abs {d}"));
+        }
         assert_eq!(next[0], greedy[s + 1], "decode step {s}");
     }
     drop(rt);
@@ -225,11 +255,30 @@ fn the_engine_matches_the_reference_streams_prefill_and_four_decode_steps() {
     let mut short = engine_spec();
     short.hyper.as_mut().unwrap().sinkhorn_iters = 1;
     let g = layer_gap(&short, 0, 0);
+    eprintln!("one Sinkhorn iteration: layer 0 streams max abs {g}");
     assert!(g > TOLERANCE, "one Sinkhorn iteration still matches layer 0 ({g})");
     let mut tailless = engine_spec();
     tailless.attention.params.insert("index_tail".into(), 0.0);
     let g = layer_gap(&tailless, 3, 2);
+    eprintln!("tail pool dropped: layer 3 streams max abs {g}");
     assert!(g > TOLERANCE, "dropping the tail pool still matches layer 3 ({g})");
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
+#[test]
+fn the_host_model_with_two_plane_bf16_inputs_shows_the_split_activation_rounding() {
+    let m = meta(&format!("{NAME}.ref.json"));
+    let greedy: Vec<u32> = m["greedy"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    glm5_host::PLANES.set(true);
+    let run = host_run(|_| {}, &greedy[..4]);
+    glm5_host::PLANES.set(false);
+    let vocab = 512;
+    let prefill = floats(&format!("{NAME}.ref.bin"));
+    let tokens = prefill.len() / vocab;
+    let gap = |got: &[f32], want: &[f32]| got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let p = (0..tokens).map(|t| gap(&run.logits[t], &prefill[t * vocab..(t + 1) * vocab])).fold(0f32, f32::max);
+    eprintln!("host with two plane bf16 matvec inputs: prefill max abs {p}");
+    assert!(p > TOLERANCE, "the two plane rounding alone stays inside the f32 bar ({p})");
 }
 
 fn host_run(knobs: impl Fn(&mut Knobs), extra: &[u32]) -> Run {

@@ -33,6 +33,17 @@ pub struct Knobs {
     pub tail: bool,
 }
 
+pub fn planes(x: &[f32]) -> Vec<f32> {
+    let bf16 = |v: f32| {
+        let u = v.to_bits();
+        f32::from_bits(((u + 0x7fff + ((u >> 16) & 1)) >> 16) << 16)
+    };
+    x.iter().map(|&v| {
+        let hi = bf16(v);
+        hi + bf16(v - hi)
+    }).collect()
+}
+
 pub struct Config {
     pub hidden: usize,
     pub vocab: usize,
@@ -105,7 +116,18 @@ impl Config {
     }
 }
 
+thread_local! {
+    pub static PLANES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub fn matvec(w: &[f32], rows: usize, x: &[f32]) -> Vec<f32> {
+    let rounded;
+    let x = if PLANES.get() {
+        rounded = planes(x);
+        &rounded[..]
+    } else {
+        x
+    };
     let cols = x.len();
     assert_eq!(w.len(), rows * cols);
     (0..rows).map(|r| w[r * cols..(r + 1) * cols].iter().zip(x).map(|(a, b)| f64::from(*a) * f64::from(*b)).sum::<f64>() as f32).collect()
