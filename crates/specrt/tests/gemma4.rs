@@ -135,6 +135,45 @@ fn the_tiny_moe_fixture_routes_every_layer_beside_its_dense_mlp() {
     }
 }
 
+#[test]
+#[ignore = "needs nvrtc, no GPU"]
+fn the_moe_modules_compile_to_ptx() {
+    let big = Spec::from_hf_config_serving(&popular("google__gemma-4-26B-A4B-it")).unwrap();
+    for spec in [tiny_named("tiny-gemma4-moe"), big] {
+        let m = specrt::codegen::Module::generate_kv(&spec, 256, 1, &kir::Target::sm_120()).unwrap();
+        assert!(m.source.contains("constexpr bool MOE_EXPERT_SCALE = true;"));
+        let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120a"), options: vec!["--std=c++17".to_string()], ..Default::default() };
+        cudarc::nvrtc::compile_ptx_with_opts(m.source.as_str(), opts).unwrap_or_else(|e| panic!("{}: {e:?}", spec.name));
+    }
+}
+
+#[test]
+fn the_tiny_moe_layer_loads_router_scales_and_fused_experts_from_the_checkpoint() {
+    let spec = tiny_named("tiny-gemma4-moe");
+    let ck = specrt::weights::Checkpoint::for_repo(&spec.repo).unwrap().renamed(&spec.tensors);
+    let layer = ck.layer(&spec, 1).unwrap();
+    let moe = layer.moe.as_ref().unwrap();
+    let n = moe.norms.as_ref().unwrap();
+    let raw = |name: &str| -> Vec<f32> {
+        let st = safetensors::SafeTensors::deserialize(Box::leak(std::fs::read(fixture("tiny-gemma4-moe").join("model.safetensors")).unwrap().into_boxed_slice())).unwrap();
+        st.tensor(name).unwrap().data().as_chunks::<2>().0.iter().map(|b| f32::from_bits((u16::from_le_bytes(*b) as u32) << 16)).collect()
+    };
+    let scale = raw("model.layers.1.router.scale");
+    for (a, b) in n.router.iter().zip(&scale) {
+        assert!((a - b / 128f32.sqrt()).abs() < 1e-6);
+    }
+    assert_eq!(n.expert_scale, raw("model.layers.1.router.per_expert_scale"));
+    assert_eq!(n.input, raw("model.layers.1.pre_feedforward_layernorm_2.weight"));
+    assert_eq!(n.post_experts, raw("model.layers.1.post_feedforward_layernorm_2.weight"));
+    let fused = raw("model.layers.1.experts.gate_up_proj");
+    let specrt::weights::Stacked::Bf16(up) = &moe.up else { panic!("bf16 experts") };
+    let (h, i) = (128, 64);
+    let up_e2_r3 = &fused[(2 * 2 * i + i + 3) * h..(2 * 2 * i + i + 4) * h];
+    let got: Vec<f32> = up[(2 * i + 3) * h..(2 * i + 4) * h].iter().map(|b| f32::from_bits((*b as u32) << 16)).collect();
+    assert_eq!(got, up_e2_r3);
+    assert!(matches!(layer.gate_up, specrt::weights::Matrix::Bf16(ref w) if w.len() == 2 * 256 * h));
+}
+
 fn reference(name: &str) -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
     let dir = std::env::var_os("SPECRT_REF_DIR").map(PathBuf::from).expect("SPECRT_REF_DIR holds scripts/tiny_gemma4.py output");
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join(format!("{name}.ref.json"))).unwrap()).unwrap();
