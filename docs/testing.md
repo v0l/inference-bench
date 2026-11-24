@@ -162,6 +162,7 @@ $PY crates/specrt/scripts/reference.py tiny-mtp crates/specrt/tests/fixtures/tin
 | `prefix.rs` | prefix cache, snapshots, block tables | CPU, 2 ign | 2 | none | none, 0.4 s |
 | `yarn.rs` | YaRN rope against `yarn_reference.json` | CPU, 1 ign | 1 | none | 2 GB |
 | `gguf.rs` | GGUF parse, spec from GGUF | CPU, 3 ign | 3 | GGUF files in `~/.cache/specrt-gguf` | 2 GB |
+| `glm5_next.rs` | GLM-5 stage 2 (#1189): the `tiny-glm5-next` fixture (KDA, KDA, KDA, DSA; 8 experts top 2 plus a shared expert; dense layer 0; mHC 4 streams; key pool 4; one MTP layer) describes with hyper-connections, no rope, the pooled indexer, `kda` and `dsa` kinds, and is refused by serving; its checkpoint keeps the real tensor names and F32 tensors; its references (prefill logits, 4 decode steps, mHC streams after layers 0, 1, 3, MTP draft and chained draft) load and are finite. Regenerate with `~/.venv-vllm/bin/python crates/specrt/scripts/tiny_glm5_next.py all` (CPU torch, transformers 5.23.0) | CPU | 0 | checked in (`fixtures/tiny-glm5-next/reference`) | none, 1 s |
 | `gguf_qwen35.rs` | qwen35 GGUF fixtures (llama.cpp converted) against the safetensors weights, spec, MTP, quant bounds, NVRTC compile | CPU, 1 ign | 1 | checked in (`fixtures/qwen35-gguf`) | none, 1 s |
 | `gguf_qwen35_gpu.rs` | qwen35 GGUF logits against safetensors and llama.cpp | 3 | 3 | `SPECRT_GGUF_FILE`, `SPECRT_GGUF_REF` (`scripts/gate676.sh`) | 3 to 40 GB |
 | `jit.rs` | NVRTC compile and launch, cache | 2 | 2 | none | 1 GB, 13 s |

@@ -20,7 +20,7 @@ Line numbers below are in HF `modeling_glm5_next.py` unless named.
 
 ## What specrt says today
 
-`Spec::describe_hf_config` on the real config (golden `crates/specrt/tests/golden/glm5.3-flash.describe.json`) and `from_hf_config_serving` (`model_type glm5_next is not supported`). The describe output is wrong in five places, so the family spec cannot be a rename of an existing one:
+`Spec::describe_hf_config` on the real config (golden `crates/specrt/tests/golden/glm5.3-flash.describe.json`) and `from_hf_config_serving` (`model_type glm5_next is not supported`). Before #1189 the describe output was wrong in five places, so the family spec cannot be a rename of an existing one. #1189 fixed the first four through `family-generic.toml` keys (`[[attention.kinds]]`, `[attention.indexer]`, `[[linear.kinds]]`, `[norm] no_offset_keys`, `[moe] shared_gate_key`, `[rope] nope_zero_key`) and added `hyper` for the fifth (`[hyper]` reads `hc_mult`); the describe now says `dsa` with the pooled indexer, `kda`, no unit offset, no shared gate, every layer without rope and 4 streams:
 
 | field | describe says | real model | source |
 | --- | --- | --- | --- |
@@ -136,7 +136,7 @@ B is the only one that runs without the user, and only at the speeds above.
 
 ## Order of work (stages 2 to 5)
 
-1. Tiny fixture `tiny-glm5-next` from HF 5.23.0 (4 layers: KDA, KDA, KDA, DSA; 8 experts top 2; layer 0 dense; mHC on; swiglu limit; pool 4, small index top-k). MTP reference from vLLM's `common/mtp.py` formula, recomputed in torch on the CPU, since HF has no MTP.
+1. Tiny fixture `tiny-glm5-next` from HF 5.23.0 (4 layers: KDA, KDA, KDA, DSA; 8 experts top 2; layer 0 dense; mHC on; swiglu limit; pool 4, small index top-k). MTP reference from vLLM's `common/mtp.py` formula, recomputed in torch on the CPU, since HF has no MTP. Done in #1189: `scripts/tiny_glm5_next.py`, `tests/glm5_next.rs`. The swiglu limit is 1.5 at this size so about 20% of gate and up values clamp; the MTP reference zeroes the embedding at position 0 as `fused_eh_norm` does and runs the chained draft with a fresh indexer top-k.
 2. Engine pieces in this order, each with a test: mHC (#1 above), the KDA mixer (#2, reusing `kda_recurrence`), NoPE MLA through the existing DSA nodes (#3, #4), pooled indexer state and top-k at k = 512 (#5), clamped SwiGLU on the MoE (#9). Then MTP over DSA plus MoE (#12).
 3. Quant loader: per module map (Q1), FP8_PB_WO scale (Q3), MXFP8 block format (Q2), CSF decoder (Q4). These can be proven on CPU against the real shards without a GPU (dequantise one matrix and compare with vLLM's dequant or the README's re-encode rule).
 4. `family-glm5_next.toml` last, flipping `glm5_3_flash_describes_with_its_glm_keys_and_refuses_to_serve`.

@@ -42,7 +42,6 @@
     "dense_layers": [
       0
     ],
-    "shared_gate": true,
     "routed_scale": 1.5,
     "groups": 2,
     "topk_group": 1

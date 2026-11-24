@@ -706,7 +706,7 @@ fn glm5_3_flash_describes_with_its_glm_keys_and_refuses_to_serve() {
     assert_eq!((moe.experts, moe.active, moe.expert_intermediate), (288, Some(8), 2048));
     assert_eq!(moe.shared_intermediate, 2048, "n_shared_experts x moe_intermediate_size");
     assert_eq!(moe.dense_layers, vec![0, 1, 2], "first_k_dense_replace");
-    assert!(moe.shared_gate);
+    assert!(!moe.shared_gate, "the shared expert output is added with no gate");
     assert_eq!(spec.speculative().map(|m| m.layers), Some(1), "num_nextn_predict_layers");
     assert!(spec.runnable().is_err(), "glm5.3 cannot run yet (no family spec, no rope theta)");
     let mut no_theta = derived("qwen3-0.6b.config.json");

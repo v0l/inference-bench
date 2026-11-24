@@ -60,19 +60,71 @@
   },
   "norm": {
     "kind": "rmsnorm",
-    "eps": 0.00001,
-    "unit_offset": true
+    "eps": 0.00001
   },
   "attention": {
-    "kind": "gqa",
+    "kind": "dsa",
     "heads": 64,
     "kv_heads": 64,
     "head_dim": 64,
     "qkv_bias": false,
-    "qk_norm": false
+    "qk_norm": false,
+    "indexer": {
+      "heads": 32,
+      "head_dim": 128,
+      "topk": 2048,
+      "kpool": 4
+    }
   },
   "rope": {
-    "style": "neox"
+    "style": "neox",
+    "nope_layers": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44
+    ]
   },
   "mlp": {
     "activation": "swiglu"
@@ -87,16 +139,20 @@
       1,
       2
     ],
-    "shared_gate": true,
     "routed_scale": 2.5
   },
   "linear_attention": {
-    "kind": "gated_delta_net",
+    "kind": "kda",
     "key_heads": 64,
     "value_heads": 64,
     "key_head_dim": 128,
     "value_head_dim": 128,
     "conv_kernel": 4
+  },
+  "hyper": {
+    "streams": 4,
+    "sinkhorn_iters": 20,
+    "eps": 1e-6
   },
   "mtp": {
     "layers": 1,

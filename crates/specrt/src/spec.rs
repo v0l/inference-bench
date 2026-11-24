@@ -424,6 +424,7 @@ impl Block {
 #[serde(rename_all = "snake_case")]
 pub enum LinearKind {
     GatedDeltaNet,
+    Kda,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +484,28 @@ pub enum NormKind {
 #[serde(rename_all = "lowercase")]
 pub enum AttentionKind {
     Gqa,
+    Mla,
+    Dsa,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Indexer {
+    pub heads: usize,
+    pub head_dim: usize,
+    pub topk: usize,
+    #[serde(default = "default_sparse_step", skip_serializing_if = "is_one")]
+    pub kpool: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hyper {
+    pub streams: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub sinkhorn_iters: usize,
+    #[serde(default)]
+    pub eps: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -832,6 +855,8 @@ pub struct Attention {
     pub int_scratch: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub o_tensor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexer: Option<Indexer>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -950,6 +975,8 @@ pub struct Spec {
     pub linear_attention: Option<LinearAttention>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixer: Option<Mixer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hyper: Option<Hyper>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1144,6 +1171,9 @@ struct HfConfig {
 
 fn nope_layers(rope: &crate::family::FamilyRope, config: &serde_json::Value, layers: usize) -> Vec<usize> {
     if rope.nope_all {
+        return (0..layers).collect();
+    }
+    if rope.nope_zero_key.as_deref().and_then(|k| config.get(k)).and_then(|v| v.as_u64()) == Some(0) {
         return (0..layers).collect();
     }
     if let (Some(key), Some(value)) = (rope.nope_key.as_deref(), rope.nope_value.as_deref())
@@ -1742,7 +1772,7 @@ impl Spec {
             let need = |v: Option<usize>, key: &str| v.with_context(|| format!("no {key}"));
             let dims: Result<LinearAttention> = (|| {
                 Ok(LinearAttention {
-                    kind: LinearKind::GatedDeltaNet,
+                    kind: crate::family::first_kind(&family.linear.kinds, &value).unwrap_or(LinearKind::GatedDeltaNet),
                     key_heads: need(hf.linear_num_key_heads, "linear_num_key_heads")?,
                     value_heads: need(hf.linear_num_value_heads, "linear_num_value_heads")?,
                     key_head_dim: need(hf.linear_key_head_dim, "linear_key_head_dim")?,
@@ -1780,7 +1810,10 @@ impl Spec {
                     sparse_step: hf.decoder_sparse_step.unwrap_or(1),
                     router: family.moe.router.unwrap_or_default(),
                     norm_topk: hf.norm_topk_prob.or(family.moe.norm_topk).unwrap_or(hybrid),
-                    shared_gate: family.moe.shared_gate.unwrap_or(hf.n_shared_experts.is_some_and(|n| n > 0) || shared > 0),
+                    shared_gate: family.moe.shared_gate.unwrap_or_else(|| match family.moe.shared_gate_key.as_deref() {
+                        Some(k) => value.get(k).is_some_and(|v| !v.is_null()),
+                        None => hf.n_shared_experts.is_some_and(|n| n > 0) || shared > 0,
+                    }),
                     shared_module: family.moe.shared_module.clone().unwrap_or_else(default_shared_module),
                     routed_scale: hf.routed_scaling_factor.unwrap_or(1.0),
                     groups: hf.n_group.filter(|g| *g > 1).unwrap_or(0),
@@ -1833,13 +1866,13 @@ impl Spec {
             norm: Norm {
                 kind: NormKind::Rmsnorm,
                 eps: hf.rms_norm_eps,
-                unit_offset: family.norm.unit_offset.unwrap_or(hybrid),
+                unit_offset: family.norm.unit_offset.unwrap_or(hybrid && !family.norm.no_offset_keys.iter().any(|k| k.split('.').try_fold(&value, |v, p| v.get(p)).is_some())),
                 sandwich: family.norm.sandwich,
                 pre: family.norm.pre,
                 residual_scale: multiplier(&family.multipliers.residual),
             },
             attention: Attention {
-                kind: AttentionKind::Gqa,
+                kind: crate::family::first_kind(&family.attention.kinds, &value).unwrap_or(AttentionKind::Gqa),
                 heads: hf.num_attention_heads,
                 kv_heads: hf.num_key_value_heads.unwrap_or(hf.num_attention_heads),
                 head_dim,
@@ -1860,6 +1893,7 @@ impl Spec {
                 scratch: family.attention.scratch.clone(),
                 int_scratch: family.attention.int_scratch.clone(),
                 o_tensor: family.attention.o_tensor.clone(),
+                indexer: family.attention.indexer.as_ref().and_then(|i| i.read(&value)),
             },
             rope: Rope { style: if family.rope.interleaved { RopeStyle::Pairs } else { RopeStyle::Neox }, theta, scaling, mrope: parse_mrope(params), local_theta, nope_layers: nope_layers(&family.rope, &value, hf.num_hidden_layers) },
             mlp: Mlp {
@@ -1884,6 +1918,7 @@ impl Spec {
                 .then(|| Mtp { layout: family.mtp_layout.clone(), ..Mtp::new(hf.mtp_num_hidden_layers) }),
             linear_attention,
             mixer,
+            hyper: family.hyper.read(&value),
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
