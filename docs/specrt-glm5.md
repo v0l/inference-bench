@@ -92,6 +92,23 @@ Gaps (all **load**, none needs a per-architecture name):
 | Q5 | the same kir block with e2m1 elements, e4m3 scales, group 16 and the `weight_scale_2` multiplier decodes W4A16 NVFP4 to bf16 for the bf16 tile GEMM | as Q2 | `tests/w4a16_nvfp4.rs` |
 
 GPU checks: `crates/specrt/scripts/gate1190_gpu.sh` under `~/.agents/bin/gpu-run 1 --`. No family claims `glm5_next` yet.
+
+### Status after #1191 (stage 3b)
+
+Everything below is kir row families, kernel descriptions in `specs/` and spec entries. No Rust names the architecture; the only per-model file is the test family `tests/fixtures/tiny-glm5-next/family.toml` (extends `generic`), so the library still refuses `glm5_next` until stage 4.
+
+| # | piece | how | where |
+| --- | --- | --- | --- |
+| 1 | mHC | four typed plan ops: `HyperExpand` (embedding to `hc_mult` streams), `HyperPre { site }` (unweighted RMS norm of the flat streams, the `fn` GEMV, sigmoid pre and post, softmax comb, Sinkhorn column then `iters - 1` row and column passes, collapse into `x`, the 24 weights into a per row buffer), `HyperPost` (recovers the block output as `x - collapse`, then `post * y + comb^T streams`), `HyperMean` (before the final norm). kir row families `hyper_pre`, `hyper_post`, `hyper_expand`, `hyper_mean`; decoder graph blocks `hyper_attention`, `hyper_attention_moe`, `hyper_mixer`, `hyper_mixer_moe` (`when = hyper`). `[hyper] sites` names the per block tensor prefixes (`hc_attn`, `hc_ffn`) | `kir/src/rows.rs`, `specs/hyper_*.toml`, `graphs/decoder.toml`, `plan.rs`, `runtime/exec.rs` |
+| 3, 4 | no-rope MLA | `[rope] nope_all = true`; the family lists no rope nodes, and the scan `dsa_latent_attention` keys on the latent only. The latent and q norms use `norm_eps` (`mla_q_lora_norm`, `mla_kv_lora_norm`), the DSA ones hard-code 1e-6 | `specs/dsa_latent_attention.toml`, `specs/mla_*_lora_norm.toml` |
+| 5 | pooled indexer | the `index_key` state holds key and compress gate per token (`pool_index_write`); `pool_topk` pools 4 keys with the softmax of gate plus `compress_ape`, scores pools, picks `topk / kpool`, expands them to tokens and appends the open tail (`index_tail`) | `kir/src/rows.rs`, `specs/pool_index_*.toml` |
+| 2 | KDA mixer | `[mixer]` with q, k, v, f_a, g_a, b projections fused into one input linear; three `seq_conv` nodes (`kda_conv_q/k/v`), `head_matvec` for f_b and g_b, `kda_recurrence` (q, k, v from the conv buffer, forget gate and beta from their own params), `group_norm` with `w * n * sigmoid(g)` | `specs/kda_*.toml` |
+
+Prefill runs the recurrent form of `kda_recurrence`. The chunked lowering (`kir/src/recur/chunk.rs`) takes one decay, update, read and store with key inputs read directly; KDA's delta rule reads the state twice (`mem` then the output), so `chunk_form` returns none and `the_engine_family_plans_hyper_connections_and_no_rope_nodes` pins that. A per channel decay chunked form is a speed item, not a correctness one.
+
+CPU reference: `tests/glm5_host/mod.rs` is a per token f32 model of the fixture from the checkpoint alone. Against the HF reference it gives prefill max abs 4.2e-5 and decode 3.2e-5, matches the saved streams after layers 0, 1 and 3 within 3.8e-4, and is red with 1 or 5 Sinkhorn iterations and with the tail pool dropped (20 iterations converge: 19 differ by 2e-6).
+
+GPU gate: `the_engine_matches_the_reference_streams_prefill_and_four_decode_steps` (ignored, `tests/glm5_next.rs`) checks the streams after layers 0, 1, 3, prefill logits and 4 decode steps within 3.8e-4 and the two red cases.
 | Q6 | bf16 tensors from a second file | `tensors/native-QB.safetensors` is in the index `weight_map`, and `shard_files` reads every file the map names: **have** |
 
 ## Memory: resident set and KV per token
