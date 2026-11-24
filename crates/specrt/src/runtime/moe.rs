@@ -28,7 +28,7 @@ pub(super) struct DeviceMoe {
     index: usize,
 }
 
-type Bias<'a> = (&'a CudaSlice<f32>, &'a CudaSlice<f32>);
+pub(super) type Bias<'a> = (&'a CudaSlice<f32>, &'a CudaSlice<f32>);
 
 pub(super) struct Stacks {
     pub(super) gate: StackWeights,
@@ -284,7 +284,8 @@ impl Runtime {
         let host = w.host.as_ref().expect("cached layer has host experts");
         if let Some(table) = cache.table_for(&self.stream, w.index, host, n)?
         {
-            return self.moe_experts_with(w, &cache.stacks, Some(host.input_globals), Some(table), None, n);
+            self.moe_experts_with(w, &cache.stacks, Some(host.input_globals), Some(table), None, n)?;
+            return self.end_step_after(w.index, cache);
         }
         let total = n * m.pairs();
         let routed = self.stream.clone_dtoh(&mb.idx.slice(..total))?;
@@ -294,6 +295,9 @@ impl Runtime {
         cache.observe(w.index, &used);
         let shared_at = m.local_experts() as i32;
         let has_shared = routed.iter().any(|&e| e >= shared_at);
+        if cache.scored() {
+            return self.moe_experts_scored(w, cache, host, &routed, &used, has_shared, n);
+        }
         let groups: Vec<&[usize]> = if used.is_empty() { vec![&[][..]] } else { used.chunks(cache.slots).collect() };
         for (g, group) in groups.iter().enumerate() {
             let staged = cache.stage(&self.stream, w.index, host, group, g == 0 && has_shared, n >= GROUP_MIN_TOKENS)?;
@@ -338,6 +342,56 @@ impl Runtime {
             cache.release();
         }
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_scored(&self, w: &DeviceMoe, cache: &experts::ExpertCache, host: &experts::HostExperts, routed: &[i32], used: &[usize], has_shared: bool, n: usize) -> Result<()> {
+        let m = self.spec.moe.as_ref().expect("moe spec");
+        let mb = self.moe.as_ref().expect("moe buffers");
+        let shared_at = m.local_experts() as i32;
+        let counted: Vec<(usize, usize)> = used.iter().map(|&e| (e, routed.iter().filter(|&&r| r == e as i32).count())).collect();
+        let mut groups = cache.plan_scored(w.index, &counted, n, true)?;
+        if groups.iter().all(Vec::is_empty) {
+            groups.truncate(1);
+        }
+        for (g, group) in groups.iter().enumerate() {
+            cache.load_group(&self.stream, host, group, g == 0 && has_shared, (&w.gate_up_bias, &w.down_bias))?;
+            let slot_of: std::collections::HashMap<usize, usize> = group.iter().map(|&(e, s, _)| (e, s)).collect();
+            let remapped: Vec<i32> = routed
+                .iter()
+                .map(|&e| {
+                    if e < 0 {
+                        -1
+                    } else if e >= shared_at {
+                        if g == 0 { (cache.slots as i32) + (e - shared_at) } else { -1 }
+                    } else {
+                        slot_of.get(&(e as usize)).map_or(-1, |&s| s as i32)
+                    }
+                })
+                .collect();
+            {
+                let (ptr, _sync) = mb.idx.device_ptr(&self.stream);
+                unsafe { cudarc::driver::result::memcpy_htod_async(ptr, &remapped, self.stream.cu_stream()) }?;
+            }
+            let slot_bias = cache.bias.as_ref().map(|(a, b)| (a, b));
+            self.moe_experts_with(w, &cache.stacks, Some(host.input_globals), None, slot_bias, n)?;
+        }
+        self.end_step_after(w.index, cache)
+    }
+
+    fn end_step_after(&self, layer: usize, cache: &experts::ExpertCache) -> Result<()> {
+        if cache.scored() && self.next_cached_layer(layer).is_none() {
+            cache.end_step(&self.stream, &self.cached_hosts())?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn layer_bias(&self, layer: usize) -> Option<Bias<'_>> {
+        self.layers.get(layer).and_then(|l| l.moe.as_ref()).map(|m| (&m.gate_up_bias, &m.down_bias))
+    }
+
+    pub(super) fn cached_hosts(&self) -> Vec<experts::Cached<'_>> {
+        self.layers.iter().enumerate().filter_map(|(i, l)| l.moe.as_ref().and_then(|m| m.host.as_ref().map(|h| (i, h, (&m.gate_up_bias, &m.down_bias))))).collect()
     }
 
     fn next_cached_layer(&self, after: usize) -> Option<(usize, &experts::HostExperts)> {

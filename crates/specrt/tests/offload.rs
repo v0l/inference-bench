@@ -1,4 +1,4 @@
-use specrt::offload::Tier;
+use specrt::offload::{Policy, Tier};
 use specrt::runtime::{Runtime, Sampling};
 use specrt::spec::Spec;
 use std::path::{Path, PathBuf};
@@ -126,6 +126,15 @@ fn assert_experts_identical(dir: &str, slots: usize) {
 }
 
 fn assert_experts_identical_with(dir: &str, slots: usize, pointer_table: bool) -> u64 {
+    checked(dir, slots, pointer_table, Policy::Lru).table_launches
+}
+
+struct Checked {
+    stats: specrt::offload::OffloadStats,
+    table_launches: u64,
+}
+
+fn checked(dir: &str, slots: usize, pointer_table: bool, policy: Policy) -> Checked {
     let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
     let p = prompt(40);
     let want_prefill = full.trace_prefill(&p).unwrap();
@@ -134,6 +143,8 @@ fn assert_experts_identical_with(dir: &str, slots: usize, pointer_table: bool) -
     drop(full);
     let mut spec = moe_spec(dir, slots, None);
     spec.runtime.offload.pointer_table = pointer_table;
+    spec.runtime.offload.policy = policy;
+    spec.runtime.offload.score_half_life = 4;
     let mut off = Runtime::load(&spec, 256).unwrap();
     assert_eq!(off.expert_slots(), slots);
     let got_prefill = off.trace_prefill(&p).unwrap();
@@ -149,7 +160,86 @@ fn assert_experts_identical_with(dir: &str, slots: usize, pointer_table: bool) -
     assert_eq!(off.generate(&p, 16, Sampling::GREEDY).unwrap().tokens, want_tokens);
     let stats = off.offload_stats().unwrap();
     assert!(stats.host_to_vram_bytes > 0, "{stats:?}");
-    off.expert_table_launches()
+    Checked { stats, table_launches: off.expert_table_launches() }
+}
+
+fn scored(dir: &str, slots: usize) -> specrt::offload::OffloadStats {
+    checked(dir, slots, false, Policy::Score).stats
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn score_policy_expert_cache_is_bit_identical_and_promotes_between_steps() {
+    for slots in [3, 5, 8] {
+        let stats = scored("tiny-qwen3.5-moe", slots);
+        assert!(stats.promotions > 0, "{slots} slots: {stats:?}");
+    }
+    scored("tiny-qwen3.5-moe-nvfp4", 3);
+    scored("tiny-qwen3.5-moe-fp8", 3);
+    scored("tiny-glm4-moe", 4);
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn score_policy_gpt_oss_experts_with_promotions_is_bit_identical() {
+    for slots in [4, 6] {
+        let stats = scored("tiny-gpt-oss", slots);
+        assert!(stats.promotions > 0 && stats.evictions > 0, "{slots} slots: {stats:?}");
+    }
+    let both = checked("tiny-gpt-oss", 16, true, Policy::Score).stats;
+    assert!(both.promotions > 0, "{both:?}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_promotion_still_copying_is_served_by_the_staged_path() {
+    for (dir, table) in [("tiny-qwen3.5-moe", false), ("tiny-qwen3.5-moe", true), ("tiny-gpt-oss", false), ("tiny-gpt-oss", true)] {
+        let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
+        let want = full.trace_decode(&prompt(12)).unwrap();
+        drop(full);
+        let mut spec = moe_spec(dir, if table { 16 } else { 5 }, None);
+        spec.runtime.offload.policy = Policy::Score;
+        spec.runtime.offload.score_half_life = 2;
+        spec.runtime.offload.pointer_table = table;
+        let mut off = Runtime::load(&spec, 256).unwrap();
+        off.stall_expert_promotions(300);
+        let got = off.trace_decode(&prompt(12)).unwrap();
+        let stats = off.offload_stats().unwrap();
+        assert!(stats.promotions > 0, "{dir} table={table}: {stats:?}");
+        assert_eq!(got.logits, want.logits, "{dir} table={table}: decode logits with promotions in flight");
+        assert_eq!(got.layers, want.layers, "{dir} table={table}");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn score_policy_with_pointer_table_is_bit_identical() {
+    for dir in ["tiny-qwen3.5-moe", "tiny-qwen3.5-moe-nvfp4", "tiny-qwen3.5-moe-fp8", "tiny-glm4-moe"] {
+        let all = checked(dir, 24, true, Policy::Score);
+        assert!(all.table_launches > 0, "{dir}: a pool of every expert decodes from the table");
+        assert_eq!((all.stats.promotions, all.stats.evictions), (0, 0), "{dir}: nothing to promote when every expert fits");
+        let part = checked(dir, 12, true, Policy::Score);
+        assert!(part.stats.promotions > 0, "{dir}: {:?}", part.stats);
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn score_policy_hotlist_seed_warms_the_cache_and_stays_identical() {
+    let first = prompt(1);
+    let mut cold = Runtime::load(&moe_spec("tiny-qwen3.5-moe", 8, None), 256).unwrap();
+    let want = cold.trace_decode(&first).unwrap().logits;
+    let path = std::env::temp_dir().join(format!("hotlist-score-{}.json", std::process::id()));
+    cold.save_expert_hotlist(&path).unwrap();
+    drop(cold);
+    let mut spec = moe_spec("tiny-qwen3.5-moe", 8, Some(path.display().to_string()));
+    spec.runtime.offload.policy = Policy::Score;
+    let mut warm = Runtime::load(&spec, 256).unwrap();
+    assert!(warm.offload_stats().unwrap().host_to_vram_bytes > 0, "seed copies experts before the first token");
+    assert_eq!(warm.trace_decode(&first).unwrap().logits, want);
+    let st = warm.offload_stats().unwrap();
+    assert!(st.vram_hits > 0, "{st:?}");
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
