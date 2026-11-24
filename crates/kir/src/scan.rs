@@ -88,6 +88,20 @@ const STATE_REQUIRED: [(&str, Scalar, Role, Access); 10] = [
     ("row_step", Scalar::I32, Role::Value, Access::Read),
 ];
 
+const STATE_REQUIRED_PLANES: [(&str, Scalar, Role, Access); 11] = [
+    ("k_cache", Scalar::Bf16, Role::Activation, Access::Read),
+    ("v_cache", Scalar::Bf16, Role::Activation, Access::Read),
+    ("block_table", Scalar::I32, Role::Activation, Access::Read),
+    ("pos", Scalar::I32, Role::Activation, Access::Read),
+    ("slots", Scalar::I32, Role::Activation, Access::Read),
+    ("out_hi", Scalar::Bf16, Role::Activation, Access::Write),
+    ("out_lo", Scalar::Bf16, Role::Activation, Access::Write),
+    ("layer", Scalar::I32, Role::Value, Access::Read),
+    ("pages", Scalar::I32, Role::Value, Access::Read),
+    ("pos_step", Scalar::I32, Role::Value, Access::Read),
+    ("row_step", Scalar::I32, Role::Value, Access::Read),
+];
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scan {
     pub consts: Vec<Const>,
@@ -128,7 +142,8 @@ impl Scan {
         if !threads.is_multiple_of(WARP) || threads == 0 {
             return Err(format!("scan threads {threads} must be a multiple of {WARP}"));
         }
-        let required: &[(&str, Scalar, Role, Access)] = if self.geometry.is_some() { &STATE_REQUIRED } else { &REQUIRED };
+        let planes = params.iter().any(|p| p.name == "out_hi");
+        let required: &[(&str, Scalar, Role, Access)] = if self.geometry.is_some() { if planes { &STATE_REQUIRED_PLANES } else { &STATE_REQUIRED } } else { &REQUIRED };
         for &(name, ty, role, access) in required {
             match params.iter().find(|p| p.name == name) {
                 Some(p) if p.ty == ty && p.role == role && p.access == access => {}
@@ -549,8 +564,9 @@ impl Scan {
     for (int d = threadIdx.x; d < VD; d += blockDim.x) {{
         float total = 0.0f;
         for (int w = 0; w < SCAN_WARPS; w++) total += m_s[w] == NEG_INF ? 0.0f : acc_s[w][d] * expf(m_s[w] - top);
-        out[(size_t)row * {out_row} + (size_t)head * {out_head} + {out_offset} + d] = total / denom;
-    }}
+        float res = total / denom;
+        size_t at = (size_t)row * {out_row} + (size_t)head * {out_head} + {out_offset} + d;
+{store}    }}
 }}
 
 ",
@@ -566,6 +582,11 @@ impl Scan {
             out_row = g.out_row,
             out_head = g.out_head,
             out_offset = g.out_offset,
+            store = if k.params.iter().any(|p| p.name == "out_hi") {
+                "        unsigned hi, lo;\n        split_hi_lo(res, hi, lo);\n        out_hi[at] = (bf16_t)hi;\n        out_lo[at] = (bf16_t)lo;\n"
+            } else {
+                "        out[at] = res;\n"
+            },
         ))
     }
 }

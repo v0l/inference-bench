@@ -432,3 +432,12 @@ fn bad_block_sources_are_refused_with_the_kernel_name() {
     assert!(err(&block_scan("", "0").replace("ratio = \"ratio\"", "ratio = \"nope\"")).contains("block ratio"));
     assert!(err(&block_scan("", "0").replace("cache = \"comp\"", "cache = \"nope\"")).contains("block cache"));
 }
+
+#[test]
+fn a_geometry_scan_can_write_the_split_attention_planes() {
+    let planes = "[[param]]\nname = \"out_hi\"\ntype = \"bf16\"\nrole = \"activation\"\naccess = \"write\"\n\n[[param]]\nname = \"out_lo\"\ntype = \"bf16\"\nrole = \"activation\"\naccess = \"write\"\n";
+    let text = block_scan("", "0").replace("[[param]]\nname = \"out\"\ntype = \"f32\"\nrole = \"activation\"\naccess = \"write\"\n", planes);
+    let src = emit(&build(&text));
+    assert!(src.contains("split_hi_lo(res, hi, lo);") && src.contains("out_hi[at] = (bf16_t)hi;") && !src.contains("out[at]"), "{src}");
+    assert!(emit(&build(&block_scan("", "0"))).contains("out[at] = res;"));
+}
