@@ -191,14 +191,15 @@ impl FamilyGatedResidual {
 #[serde(default, deny_unknown_fields)]
 pub struct FamilyPerLayer {
     pub dim: Option<String>,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
     pub scratch: std::collections::BTreeMap<String, String>,
     pub node: Vec<crate::graph::Node>,
 }
 
 impl FamilyPerLayer {
-    pub fn read(&self, config: &serde_json::Value) -> Option<crate::spec::PerLayer> {
-        let dim = dotted(config, self.dim.as_deref()?).and_then(|v| v.as_u64()).filter(|d| *d > 0)? as usize;
-        Some(crate::spec::PerLayer { dim, scratch: self.scratch.clone(), node: self.node.clone() })
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::PerLayer>> {
+        let Some(dim) = self.dim.as_deref().and_then(|k| dotted(config, k)).and_then(|v| v.as_u64()).filter(|d| *d > 0) else { return Ok(None) };
+        Ok(Some(crate::spec::PerLayer { dim: dim as usize, params: read_params(&self.params, config)?, scratch: self.scratch.clone(), node: self.node.clone() }))
     }
 }
 
@@ -674,7 +675,7 @@ impl Family {
                 push(a, &mut out);
             }
         }
-        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.gated_residual.params.iter()) {
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.gated_residual.params.iter()).chain(self.per_layer.params.iter()) {
             match key {
                 ParamSource::Config { config, alt, .. } => {
                     push(config, &mut out);

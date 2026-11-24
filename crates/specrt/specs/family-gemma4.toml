@@ -13,6 +13,16 @@ message = "Gemma 4 mixture-of-experts layers (enable_moe_block) are not supporte
 [per_layer]
 dim = "hidden_size_per_layer_input"
 
+[per_layer.params]
+ple_dim = { expr = "hidden_size_per_layer_input" }
+ple_width = { expr = "ple_dim * num_hidden_layers" }
+ple_embed_scale = { expr = "sqrt(hidden_size_per_layer_input)" }
+ple_proj_scale = { expr = "rsqrt(hidden_size)" }
+ple_mix_scale = { expr = "sqrt(0.5)" }
+ple_vocab = { config = "vocab_size_per_layer_input", alt = "vocab_size" }
+ple_layers = { expr = "num_hidden_layers" }
+ple_one = { expr = "1" }
+
 [per_layer.scratch]
 ple_proj = "ple_width"
 ple = "ple_width"
@@ -104,14 +114,6 @@ qk_norm = false
 o_cols = "q_w"
 
 [attention.params]
-ple_dim = { expr = "hidden_size_per_layer_input" }
-ple_width = { expr = "ple_dim * num_hidden_layers" }
-ple_embed_scale = { expr = "sqrt(hidden_size_per_layer_input)" }
-ple_proj_scale = { expr = "rsqrt(hidden_size)" }
-ple_mix_scale = { expr = "sqrt(0.5)" }
-ple_vocab = { config = "vocab_size_per_layer_input", alt = "vocab_size" }
-ple_layers = { expr = "num_hidden_layers" }
-ple_one = { expr = "1" }
 hd_s = { config = "head_dim" }
 hd_g = { config = "global_head_dim", alt = "head_dim" }
 heads_n = { config = "num_attention_heads" }

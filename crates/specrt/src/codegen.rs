@@ -382,7 +382,7 @@ pub fn per_layer_symbols(spec: &Spec) -> kir::desc::Shape {
     let mut symbols = kir_shape(spec);
     if let Some(p) = spec.per_layer() {
         symbols = symbols.num("ple_dim", p.dim as f64).num("ple_width", (p.dim * spec.layers.count) as f64);
-        for (n, v) in &spec.attention.params {
+        for (n, v) in &p.params {
             symbols = symbols.num(n, *v);
         }
     }

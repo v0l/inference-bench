@@ -572,6 +572,8 @@ impl GatedResidual {
 pub struct PerLayer {
     pub dim: usize,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub scratch: std::collections::BTreeMap<String, String>,
     pub node: Vec<crate::graph::Node>,
 }
@@ -2061,7 +2063,7 @@ impl Spec {
             mixer,
             hyper: family.hyper.read(&value),
             gated_residual: family.gated_residual.read(&value)?,
-            per_layer: family.per_layer.read(&value),
+            per_layer: family.per_layer.read(&value)?,
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },

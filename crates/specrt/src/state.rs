@@ -92,7 +92,13 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
         other => match other.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {
-                if let Some(v) = spec.mixer.as_ref().and_then(|m| m.params.get(other)).or_else(|| spec.gated_residual().and_then(|h| h.params.get(other))) {
+                if let Some(v) = spec
+                    .mixer
+                    .as_ref()
+                    .and_then(|m| m.params.get(other))
+                    .or_else(|| spec.gated_residual().and_then(|h| h.params.get(other)))
+                    .or_else(|| spec.per_layer().and_then(|p| p.params.get(other)))
+                {
                     return (*v >= 0.0 && v.fract() == 0.0).then_some(*v as usize);
                 }
                 let v = *a.params.get(other)?;
