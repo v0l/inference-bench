@@ -349,6 +349,7 @@ pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::line
 pub const KERNELS: &[&str] = &[
     "embed",
     "splice_rows",
+    "add_rows",
     "rmsnorm",
     "qkv_proj",
     "qk_norm_rope",

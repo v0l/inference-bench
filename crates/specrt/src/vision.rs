@@ -1067,6 +1067,7 @@ pub struct MediaPlan {
     pub delta: i32,
     pub tags: Vec<u32>,
     pub embeds: Arc<Vec<f32>>,
+    pub deepstack: Vec<Arc<Vec<f32>>>,
     pub spans: Vec<i32>,
 }
 
@@ -1148,7 +1149,7 @@ pub fn plan_media(ids: &[u32], vis: &VisionTokens, merge: usize, processed: &[Pr
         i = j;
     }
     ensure!(next_item == processed.len(), "fewer media placeholders than media items");
-    Ok(MediaPlan { positions, delta: cur - ids.len() as i32, tags, embeds: Arc::new(Vec::new()), spans: Vec::new() })
+    Ok(MediaPlan { positions, delta: cur - ids.len() as i32, tags, embeds: Arc::new(Vec::new()), deepstack: Vec::new(), spans: Vec::new() })
 }
 
 pub fn plan_tiles(ids: &[u32], vis: &VisionTokens, tile_tokens: usize, processed: &[Processed], hashes: &[[u8; 32]]) -> Result<MediaPlan> {
@@ -1190,5 +1191,5 @@ pub fn plan_tiles(ids: &[u32], vis: &VisionTokens, tile_tokens: usize, processed
         i = j;
     }
     ensure!(tiles_left == 0 && next_item == processed.len(), "fewer image placeholders than images");
-    Ok(MediaPlan { positions, delta: 0, tags, embeds: Arc::new(Vec::new()), spans })
+    Ok(MediaPlan { positions, delta: 0, tags, embeds: Arc::new(Vec::new()), deepstack: Vec::new(), spans })
 }

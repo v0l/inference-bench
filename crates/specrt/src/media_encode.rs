@@ -12,8 +12,13 @@ pub trait EncodeImages: Send + Sync {
 
 impl EncodeImages for crate::vision_encoder::VisionEncoder {
     fn encode_images(&self, items: &[&Patches]) -> Result<Vec<Vec<f32>>> {
-        self.encode_batch(items)
+        self.encode_packed(items)
     }
+}
+
+fn unpack(packed: &[f32], levels: usize) -> impl Iterator<Item = &[f32]> {
+    let part = packed.len() / (1 + levels);
+    (0..=levels).map(move |k| &packed[k * part..(k + 1) * part])
 }
 
 pub struct EmbedCache {
@@ -80,6 +85,7 @@ pub struct MediaEncoder {
     tile_tokens: usize,
     max_batch: usize,
     max_patches: usize,
+    levels: usize,
     cache: Mutex<EmbedCache>,
     stats: Mutex<EncodeStats>,
     gpu: Mutex<()>,
@@ -103,10 +109,16 @@ impl MediaEncoder {
             tile_tokens,
             max_batch: opts.max_batch.max(1),
             max_patches: BATCH_PATCHES,
+            levels: 0,
             cache: Mutex::new(EmbedCache::new(opts.cache_mb)),
             stats: Mutex::new(EncodeStats::default()),
             gpu: Mutex::new(()),
         }
+    }
+
+    pub fn with_deepstack_levels(mut self, levels: usize) -> Self {
+        self.levels = levels;
+        self
     }
 
     pub fn stats(&self) -> EncodeStats {
@@ -193,13 +205,20 @@ impl MediaEncoder {
             .map(|(layout, r)| {
                 let mut plan = layout?;
                 let mut embeds = Vec::new();
+                let mut deepstack: Vec<Vec<f32>> = vec![Vec::new(); self.levels];
                 for m in r.media {
                     if let Some(e) = failed.get(&m.hash) {
                         anyhow::bail!("{e}");
                     }
-                    embeds.extend_from_slice(found.get(&m.hash).context("media item was not encoded")?);
+                    let packed = found.get(&m.hash).context("media item was not encoded")?;
+                    let mut parts = unpack(packed, self.levels);
+                    embeds.extend_from_slice(parts.next().expect("a packed item has its main rows"));
+                    for (level, part) in deepstack.iter_mut().zip(parts) {
+                        level.extend_from_slice(part);
+                    }
                 }
                 plan.embeds = Arc::new(embeds);
+                plan.deepstack = deepstack.into_iter().map(Arc::new).collect();
                 Ok(plan)
             })
             .collect()
