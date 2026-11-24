@@ -108,7 +108,21 @@ Prefill runs the recurrent form of `kda_recurrence`. The chunked lowering (`kir/
 
 CPU reference: `tests/glm5_host/mod.rs` is a per token f32 model of the fixture from the checkpoint alone. Against the HF reference it gives prefill max abs 4.2e-5 and decode 3.2e-5, matches the saved streams after layers 0, 1 and 3 within 3.8e-4, and is red with 1 or 5 Sinkhorn iterations and with the tail pool dropped (20 iterations converge: 19 differ by 2e-6).
 
-GPU gate: `the_engine_matches_the_reference_streams_prefill_and_four_decode_steps` (ignored, `tests/glm5_next.rs`) checks the streams after layers 0, 1, 3, prefill logits and 4 decode steps within 3.8e-4 and the two red cases.
+GPU gate: `the_engine_matches_the_reference_streams_prefill_and_four_decode_steps` (ignored, `tests/glm5_next.rs`) checks the streams after layers 0, 1, 3, the f32 head on the engine's streams, the engine head against the same head computed with two plane bf16 inputs, 4 decode steps within 3.8e-4 and the two red cases.
+
+GPU1, 2026-11-24 (deterministic across runs):
+
+| check | max abs |
+| --- | --- |
+| streams after layers 0, 1, 3 | 1.66e-5, 4.34e-5, 7.11e-5 |
+| f32 host head on the engine's layer 3 streams | 3.39e-4 |
+| engine head against the host head with two plane bf16 inputs | 4.6e-5 |
+| engine prefill logits (split activations) | 4.15e-4 |
+| decode steps 0 to 3 | 1.84e-4, 2.40e-4, 3.02e-4, 1.58e-4 |
+| one Sinkhorn iteration, layer 0 streams | 0.0799 (red) |
+| tail pool dropped, layer 3 streams | 6.17 (red) |
+
+The prefill logits pass 3.8e-4 only in f32. The streams are right, the f32 head on them is right, and the engine head equals its own arithmetic (activations split into bf16 hi and lo planes before every tensor core GEMM, `split_activations`). The host model with the same two plane rounding on every matvec input gives 4.6e-4 on its own (`the_host_model_with_two_plane_bf16_inputs_shows_the_split_activation_rounding`), so 4.15e-4 is the bf16 number. The logits here reach 50, so 4e-4 is 1e-5 relative.
 | Q6 | bf16 tensors from a second file | `tensors/native-QB.safetensors` is in the index `weight_map`, and `shard_files` reads every file the map names: **have** |
 
 ## Memory: resident set and KV per token
