@@ -750,15 +750,16 @@ fn compare_logits(a: &[Vec<f32>], b: &[Vec<f32>]) -> LogitsCompare {
 }
 
 fn bench_logits(args: Vec<String>) -> Result<()> {
-    let usage = "usage: bench --logits [--a-set key=value].. [--b-set key=value].. <spec> [prompts] [decode_tokens]";
+    let usage = "usage: bench --logits [--a-set key=value].. [--b-set key=value].. <spec> [prompts] [decode_tokens] [prompt_cap]";
     let mut args = args.into_iter();
     let spec_path = PathBuf::from(args.next().context(usage)?);
     let n: usize = args.next().map(|s| s.parse()).transpose().context(usage)?.unwrap_or(8);
     let steps: usize = args.next().map(|s| s.parse()).transpose().context(usage)?.unwrap_or(32);
+    let cap: usize = args.next().map(|s| s.parse()).transpose().context(usage)?.unwrap_or(usize::MAX);
     let spec = load_spec(&spec_path)?;
     let prompts = spec_prompts(&spec)?;
     let corpus: Vec<u32> = prompts.iter().flatten().copied().collect();
-    let cases: Vec<(Vec<u32>, Vec<u32>)> = (0..n).map(|i| (prompts[i % prompts.len()].clone(), (0..steps).map(|j| corpus[(i * 131 + j) % corpus.len()]).collect())).collect();
+    let cases: Vec<(Vec<u32>, Vec<u32>)> = (0..n).map(|i| (prompts[i % prompts.len()].iter().take(cap).copied().collect(), (0..steps).map(|j| corpus[(i * 131 + j) % corpus.len()]).collect())).collect();
     let max_ctx = cases.iter().map(|(p, t)| p.len() + t.len()).max().unwrap_or(0) + 16;
     let vocab = spec.dims.vocab;
     let mut arms = Vec::new();
