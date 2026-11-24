@@ -28,7 +28,7 @@ impl TensorQuant {
         }
     }
 
-    fn fp4(self) -> bool {
+    pub fn is_fp4(self) -> bool {
         matches!(self, TensorQuant::Nvfp4 | TensorQuant::Nvfp4Csf | TensorQuant::W4a16Nvfp4)
     }
 }
@@ -104,6 +104,38 @@ impl QuantMap {
         out
     }
 
+    pub fn mlp_fp4(&self, layer: usize) -> Option<bool> {
+        let key = format!("layers.{layer}.mlp.");
+        let mut hits = self.0.iter().filter(|(k, _)| k.contains(&key)).peekable();
+        hits.peek()?;
+        Some(hits.any(|(_, f)| f.is_fp4()))
+    }
+
+    pub fn fp4_experts(&self, layers: usize) -> bool {
+        let main = |k: &str| (0..layers).any(|l| k.contains(&format!("layers.{l}.mlp.experts")));
+        let mut experts = self.0.iter().filter(|(k, _)| main(k)).peekable();
+        experts.peek().is_some() && experts.all(|(_, f)| f.is_fp4())
+    }
+
+    pub fn stage(&self, start: usize, end: usize) -> QuantMap {
+        let mut out = BTreeMap::new();
+        for (k, f) in &self.0 {
+            let Some(at) = k.find("layers.").map(|i| i + "layers.".len()) else {
+                out.insert(k.clone(), *f);
+                continue;
+            };
+            let digits = k[at..].bytes().take_while(u8::is_ascii_digit).count();
+            let Ok(layer) = k[at..at + digits].parse::<usize>() else {
+                out.insert(k.clone(), *f);
+                continue;
+            };
+            if (start..end).contains(&layer) {
+                out.insert(format!("{}{}{}", &k[..at], layer - start, &k[at + digits..]), *f);
+            }
+        }
+        QuantMap(out)
+    }
+
     pub fn check_layout(&self, tensors: &BTreeMap<String, Tensor>) -> Result<()> {
         if self.is_empty() {
             return Ok(());
@@ -145,7 +177,7 @@ fn check_weight(module: &str, w: &Tensor, format: TensorQuant, tensors: &BTreeMa
     {
         bail!("{stray} is a compressed scale but {module} is {format:?}");
     }
-    if format.fp4() {
+    if format.is_fp4() {
         shape_is(&weight, w, Dtype::U8, &[&[rows, stored]])?;
         let cols = stored * 2;
         ensure!(cols.is_multiple_of(16), "{weight} has {cols} columns, not a multiple of 16");

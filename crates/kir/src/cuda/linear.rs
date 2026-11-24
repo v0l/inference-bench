@@ -46,17 +46,21 @@ pub fn emit_linear(kernels: &[LinearKernel]) -> Result<crate::KirSource, LinearE
         push(&constants(&first.shape, &first.tuning));
         push(&common());
     }
+    let gate = if first.shape.gate_sigmoid { "la_sigmoid" } else { "silu" };
+    if first.shape.gate_sigmoid {
+        push("__device__ __forceinline__ float la_sigmoid(float x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n");
+    }
     if has(Family::Conv) {
         push(&conv::body());
     }
     if has(Family::Step) {
-        push(&step::body());
+        push(&step::body(gate));
     }
     if has(Family::Chunk) {
-        push(&chunk::body());
+        push(&chunk::body(gate));
     }
     if has(Family::Verify) {
-        push(&verify::body());
+        push(&verify::body(gate));
     }
     if has(Family::Draft) {
         push(&draft::body());

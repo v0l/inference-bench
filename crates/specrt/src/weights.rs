@@ -146,6 +146,7 @@ pub struct Layer<'a> {
     pub down: Matrix<'a>,
     pub moe: Option<MoeWeights>,
     pub hyper: Vec<Vec<f32>>,
+    pub gated: Vec<Vec<(String, Vec<f32>)>>,
 }
 
 pub struct Outside<'a> {
@@ -483,6 +484,10 @@ impl Checkpoint {
             Dtype::F32 => Cow::Owned(
                 v.data.as_chunks::<4>().0.iter().map(|b| f32_to_bf16(f32::from_le_bytes(*b))).collect(),
             ),
+            Dtype::F8_E4M3 if shape.len() == 2 && (self.has(&format!("{name}_scale")) || self.has(&format!("{name}_scale_inv"))) => match self.raw(name, shape[0], shape[1])?.dequantized() {
+                Raw::Bf16 { w, .. } => w,
+                _ => bail!("{name} did not decode to bf16"),
+            },
             Dtype::F8_E4M3 => bail!("{name} is FP8; use quant = \"fp8_block128\""),
             other => bail!("{name} is {other:?}, expected bf16, f16 or f32"),
         })
@@ -495,6 +500,7 @@ impl Checkpoint {
         let v = self.shaped(name, shape)?;
         match v.dtype {
             Dtype::F32 => Ok(v.data.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()),
+            Dtype::F8_E4M3 if v.shape.len() == 2 => Ok(self.bf16(name, &v.shape.clone())?.iter().map(|&b| bf16_to_f32(b)).collect()),
             _ => Ok(self.bf16(name, shape)?.iter().map(|&b| bf16_to_f32(b)).collect()),
         }
     }
@@ -782,6 +788,9 @@ impl<'a> Raw<'a> {
         if parts.iter().any(|p| matches!(p, Raw::Q8 { .. })) && !parts.iter().all(|p| matches!(p, Raw::Q8 { .. })) {
             parts = parts.into_iter().map(Raw::dequantized).collect();
         }
+        if parts.iter().any(|p| matches!(p, Raw::Fp8 { .. })) && !parts.iter().all(|p| matches!(p, Raw::Fp8 { .. })) {
+            parts = parts.into_iter().map(Raw::dequantized).collect();
+        }
         let mut parts = parts.into_iter();
         let mut out = parts.next().context("nothing to concatenate")?;
         for p in parts {
@@ -854,7 +863,7 @@ impl<'a> Raw<'a> {
                 let (values, scales) = quantize_q8(&w, cols);
                 Matrix::Q8 { values, scales }
             }
-            (raw @ Raw::Fp8 { .. }, Quant::Nvfp4G16) => return raw.dequantized().into_matrix(quant, what),
+            (raw @ Raw::Fp8 { .. }, Quant::Nvfp4G16 | Quant::Bf16) => return raw.dequantized().into_matrix(quant, what),
             (Raw::Bf16 { w, cols }, Quant::Fp8Channel) => {
                 let (values, scales) = quantize_fp8_channel(&w, cols);
                 Matrix::Fp8 { values: Cow::Owned(values), scales }
@@ -1268,7 +1277,7 @@ impl Checkpoint {
             )
         };
         let ln1 = if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] };
-        let ln2 = if spec.layers.split { ln1.clone() } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? };
+        let ln2 = if spec.layers.split { ln1.clone() } else if spec.gated_residual().is_some() { vec![0.0; 1] } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? };
         let layer_scale = match &spec.norm.layer_scale {
             Some(t) => {
                 let root = self.root();
@@ -1295,6 +1304,7 @@ impl Checkpoint {
             down,
             moe,
             hyper: self.hyper(spec, &p)?,
+            gated: self.gated_sites(spec, &p)?,
         })
     }
 
@@ -1309,6 +1319,21 @@ impl Checkpoint {
             out.push(self.floats(&format!("{p}.{site}_scale"), &[3])?);
         }
         Ok(out)
+    }
+
+    pub fn gated_weights(&self, spec: &Spec, module: &str, stage: crate::spec::GatedStage) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
+        h.weights(stage).into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&format!("{module}.{w}"), spec.weight_len(&len)?)?))).collect()
+    }
+
+    fn gated_sites(&self, spec: &Spec, p: &str) -> Result<Vec<Vec<(String, Vec<f32>)>>> {
+        let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
+        h.sites.iter().map(|s| self.gated_weights(spec, &format!("{p}.{s}"), crate::spec::GatedStage::Pre)).collect()
+    }
+
+    pub fn gated_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
+        self.gated_weights(spec, &format!("{}.{}", self.root(), h.module), crate::spec::GatedStage::Collapse)
     }
 
     fn gguf_stack(&self, g: &Gguf, name: &str, shape: &[usize], out: &mut Vec<u16>) -> Result<()> {
@@ -1386,7 +1411,7 @@ impl Checkpoint {
                 let mut inv_global = Vec::with_capacity(total);
                 let mut input_global = f32::MAX;
                 for i in 0..total {
-                    let f = self.fp4(&module(i, which), rows, cols)?;
+                    let f = self.fp4_or_requant(&module(i, which), rows, cols)?;
                     packed.extend_from_slice(&f.packed);
                     scales.extend_from_slice(&f.scales);
                     inv_global.push(1.0 / f.global);
@@ -1581,6 +1606,16 @@ impl Checkpoint {
         Ok(None)
     }
 
+    fn fp4_or_requant(&self, module: &str, rows: usize, cols: usize) -> Result<crate::nvfp4::Fp4<'_>> {
+        if self.is_fp4(module) {
+            return self.fp4(module, rows, cols);
+        }
+        match self.raw(&format!("{module}.weight"), rows, cols)?.dequantized() {
+            Raw::Bf16 { w, cols } => Ok(quantize_nvfp4(&w, cols)),
+            _ => bail!("{module} did not decode to bf16"),
+        }
+    }
+
     pub fn fp4(&self, module: &str, rows: usize, cols: usize) -> Result<crate::nvfp4::Fp4<'_>> {
         use crate::nvfp4::GROUP;
         let weight = if self.has(&format!("{module}.weight_packed")) { format!("{module}.weight_packed") } else { format!("{module}.weight") };
@@ -1648,6 +1683,7 @@ impl Checkpoint {
                 down,
                 moe,
                 hyper: Vec::new(),
+                gated: Vec::new(),
             },
             norm: self.norm(spec, &lay.norm, h)?,
         })
@@ -1681,7 +1717,7 @@ impl Checkpoint {
 
     fn head_from<'s>(&'s self, spec: &Spec, embed: &Cow<'s, [u16]>) -> Result<(Vec<f32>, Matrix<'s>)> {
         let d = &spec.dims;
-        let norm = self.norm(spec, &format!("{}.norm.weight", self.root()), d.hidden)?;
+        let norm = if spec.gated_residual().is_some() { vec![0.0; 1] } else { self.norm(spec, &format!("{}.norm.weight", self.root()), d.hidden)? };
         let lm_head = head_rows_matrix(self.head_raw(spec, embed)?, spec.lm_head_quant(), spec.head_rows(), "lm_head")?;
         Ok((norm, lm_head))
     }

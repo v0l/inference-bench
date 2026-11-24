@@ -1,6 +1,6 @@
 use super::prim::{self, at, delta_update, gate, gated_output, load_state, memory_read, qk_norm, store_state, unroll, window_load, window_shift, window_store};
 
-pub fn body() -> String {
+pub fn body(out_gate: &str) -> String {
     let mut o = String::new();
     o.push_str(
         "extern \"C\" __global__ void gdn_conv_verify(const float* lin, const float* w, const float* state, float* mix, float* log,
@@ -102,7 +102,7 @@ if (tid == 0) glog[row * LA_VH + h] = decay;
 __syncthreads();
 ",
     ));
-    o.push_str(&gated_output(8, "out[row * LA_VALUE_DIM + h * LA_D + v]", "l[LA_Z_OFF + h * LA_D + v]"));
+    o.push_str(&gated_output(8, "out[row * LA_VALUE_DIM + h * LA_D + v]", "l[LA_Z_OFF + h * LA_D + v]", out_gate));
     o.push_str("    }\n}\n\n");
 
     o.push_str(

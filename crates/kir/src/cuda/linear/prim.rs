@@ -130,7 +130,7 @@ pub fn delta_update(n: usize, store: bool) -> String {
     o
 }
 
-pub fn gated_output(n: usize, dst: &str, z: &str) -> String {
+pub fn gated_output(n: usize, dst: &str, z: &str, gate: &str) -> String {
     let mut o = at(n, "part[ks][v] = acc;\n__syncthreads();\nfloat o = 0.0f;\nif (ks == 0) {\n");
     o += &unroll(n + 4, "int j = 0; j < LA_KSPLIT; j++", "o += part[j][v];");
     o += &at(
@@ -138,7 +138,7 @@ pub fn gated_output(n: usize, dst: &str, z: &str) -> String {
         &format!(
             "}}
 float inv = rsqrtf(block_reduce<false>(o * o, scratch) / LA_D + EPS);
-if (ks == 0) {dst} = norm_w[v] * (o * inv) * silu({z});
+if (ks == 0) {dst} = norm_w[v] * (o * inv) * {gate}({z});
 "
         ),
     );

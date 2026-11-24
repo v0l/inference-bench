@@ -45,7 +45,7 @@ const ALLOWED: &[Entry] = &[
     Entry { path: "specrt/src/gguf.rs", lines: 15, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/placement.rs", lines: 29, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/plan.rs", lines: 13, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
-    Entry { path: "specrt/src/serve.rs", lines: 1, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
+    Entry { path: "specrt/src/serve.rs", lines: 2, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/solve.rs", lines: 1, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/structure.rs", lines: 7, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },
     Entry { path: "specrt/src/tp.rs", lines: 15, kind: Kind::Permanent, note: "tests only: fixtures and real model names" },

@@ -19,9 +19,9 @@ fn logits_norm() -> String {
             ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
         }}
         float total = {total};
-        float inv = rsqrtf(total / HIDDEN + EPS);
+        float inv = MOE_INPUT_NORM ? rsqrtf(total / HIDDEN + EPS) : 1.0f;
         for (int i = tid; i < HIDDEN; i += 256) {{
-            float v = xr[i] * inv * ln[i];
+            float v = MOE_INPUT_NORM ? xr[i] * inv * ln[i] : xr[i];
             xs[j * HIDDEN + i] = v;
             if (blockIdx.x == 0) xn[(size_t)t * HIDDEN + i] = v;
         }}

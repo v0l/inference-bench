@@ -19,13 +19,25 @@ impl LinearTuning {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct LinearShape {
     pub key_heads: usize,
     pub value_heads: usize,
     pub head_dim: usize,
     pub conv_kernel: usize,
     pub tiled_value_heads: bool,
+    pub gate_sigmoid: bool,
+}
+
+impl fmt::Debug for LinearShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut d = f.debug_struct("LinearShape");
+        d.field("key_heads", &self.key_heads).field("value_heads", &self.value_heads).field("head_dim", &self.head_dim).field("conv_kernel", &self.conv_kernel).field("tiled_value_heads", &self.tiled_value_heads);
+        if self.gate_sigmoid {
+            d.field("gate_sigmoid", &true);
+        }
+        d.finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

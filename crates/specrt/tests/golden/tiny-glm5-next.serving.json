@@ -1,1 +1,654 @@
-refused: model_type glm5_next is not supported
+{
+  "name": "glm5_next",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 128,
+    "intermediate": 256,
+    "vocab": 512,
+    "tie_embeddings": false
+  },
+  "layers": {
+    "count": 4,
+    "pattern": [
+      "linear",
+      "linear",
+      "linear",
+      "full"
+    ]
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 0.00001
+  },
+  "attention": {
+    "kind": "dsa",
+    "heads": 4,
+    "kv_heads": 4,
+    "head_dim": 32,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "mla_q_lora_norm",
+        "grid": [
+          "rows"
+        ],
+        "bind": {
+          "out": {
+            "buffer": "qkv"
+          },
+          "weight": {
+            "weight": "q_a_layernorm.weight",
+            "len": "q_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_kv_lora_norm",
+        "grid": [
+          "rows"
+        ],
+        "bind": {
+          "out": {
+            "buffer": "qkv"
+          },
+          "weight": {
+            "weight": "kv_a_layernorm.weight",
+            "len": "kv_lora_rank"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "dsa_q_b",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "q_b_proj.weight",
+            "len": "q_lora_rank * heads * (qk_nope_head_dim + qk_rope_head_dim)"
+          },
+          "x": {
+            "buffer": "qkv"
+          },
+          "y": {
+            "buffer": "qr"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "dsa_latent_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "latent"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "dsa_absorb_q",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "kv_b_proj.weight",
+            "len": "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank"
+          },
+          "x": {
+            "buffer": "qr"
+          },
+          "y": {
+            "buffer": "q_latent"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "dsa_index_q",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "indexer.wq_b.weight",
+            "len": "q_lora_rank * index_q_row"
+          },
+          "x": {
+            "buffer": "qkv"
+          },
+          "y": {
+            "buffer": "index_q"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "dsa_index_k_norm",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "b": {
+            "weight": "indexer.k_norm.bias",
+            "len": "index_head_dim"
+          },
+          "w": {
+            "weight": "indexer.k_norm.weight",
+            "len": "index_head_dim"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "pool_index_write",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "index_key"
+          },
+          "src": {
+            "buffer": "qkv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "pool_index_topk",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "ape": {
+            "weight": "indexer.index_kpool_compress_ape",
+            "len": "index_kpool * index_head_dim"
+          },
+          "idx": {
+            "buffer": "index_buf"
+          },
+          "keys": {
+            "state": "index_key"
+          },
+          "q": {
+            "buffer": "index_q"
+          },
+          "scale": "index_scale",
+          "w": {
+            "buffer": "qkv"
+          },
+          "w_scale": "index_w_scale"
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "dsa_latent_attention",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "idx": {
+            "buffer": "index_buf"
+          },
+          "k_cache": {
+            "state": "latent"
+          },
+          "out": {
+            "buffer": "o_latent"
+          },
+          "q_latent": {
+            "buffer": "q_latent"
+          },
+          "softmax_scale": "softmax_scale",
+          "v_cache": {
+            "state": "latent"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "mla_expand_v",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "kv_b_proj.weight",
+            "len": "heads * (qk_nope_head_dim + v_head_dim) * kv_lora_rank"
+          },
+          "x": {
+            "buffer": "o_latent"
+          }
+        }
+      }
+    ],
+    "params": {
+      "index_head_dim": 32.0,
+      "index_heads": 4.0,
+      "index_kpool": 4.0,
+      "index_out_row": 11.0,
+      "index_pick": 2.0,
+      "index_q_row": 128.0,
+      "index_scale": 0.17677669529663687,
+      "index_tail": 1.0,
+      "index_topk": 8.0,
+      "index_w_offset": 192.0,
+      "index_w_scale": 0.5,
+      "kv_lora_rank": 64.0,
+      "q_lora_rank": 64.0,
+      "qk_nope_head_dim": 32.0,
+      "qk_rope_head_dim": 0.0,
+      "softmax_scale": 0.17677669529663687,
+      "v_head_dim": 32.0
+    },
+    "projection": [
+      {
+        "tensor": "q_a_proj",
+        "rows": "q_lora_rank"
+      },
+      {
+        "tensor": "kv_a_proj_with_mqa",
+        "rows": "kv_lora_rank + qk_rope_head_dim"
+      },
+      {
+        "tensor": "indexer.wk",
+        "rows": "index_head_dim"
+      },
+      {
+        "tensor": "indexer.kpool_gate",
+        "rows": "index_head_dim"
+      },
+      {
+        "tensor": "indexer.weights_proj",
+        "rows": "index_heads"
+      }
+    ],
+    "o_cols": "heads * v_head_dim",
+    "scratch": {
+      "index_q": "index_q_row",
+      "o_latent": "heads * kv_lora_rank",
+      "q_latent": "heads * kv_lora_rank",
+      "qr": "heads * (qk_nope_head_dim + qk_rope_head_dim)"
+    },
+    "int_scratch": {
+      "index_buf": "index_out_row"
+    },
+    "indexer": {
+      "heads": 4,
+      "head_dim": 32,
+      "topk": 8,
+      "kpool": 4
+    }
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 10000.0,
+    "nope_layers": [
+      0,
+      1,
+      2,
+      3
+    ]
+  },
+  "mlp": {
+    "activation": "swiglu",
+    "gated": {
+      "expr": "silu(min(g, limit)) * max(min(u, limit), -limit)",
+      "params": {
+        "limit": 1.5
+      }
+    }
+  },
+  "moe": {
+    "experts": 8,
+    "active": 2,
+    "expert_intermediate": 32,
+    "shared_intermediate": 32,
+    "dense_layers": [
+      0
+    ],
+    "router": "sigmoid",
+    "shared_module": "shared_experts",
+    "routed_scale": 2.5,
+    "score_bias": true
+  },
+  "mixer": {
+    "module": "self_attn",
+    "projection": [
+      {
+        "tensor": "q_proj",
+        "rows": "kda_qkv"
+      },
+      {
+        "tensor": "k_proj",
+        "rows": "kda_qkv"
+      },
+      {
+        "tensor": "v_proj",
+        "rows": "kda_qkv"
+      },
+      {
+        "tensor": "f_a_proj",
+        "rows": "kda_head_dim"
+      },
+      {
+        "tensor": "g_a_proj",
+        "rows": "kda_head_dim"
+      },
+      {
+        "tensor": "b_proj",
+        "rows": "kda_heads"
+      }
+    ],
+    "out_tensor": "o_proj",
+    "out_cols": "kda_qkv",
+    "params": {
+      "kda_beta_offset": 512.0,
+      "kda_beta_row": 514.0,
+      "kda_conv_blocks": 1.0,
+      "kda_f_offset": 384.0,
+      "kda_g_offset": 448.0,
+      "kda_gate_offset": 0.0,
+      "kda_gate_row": 128.0,
+      "kda_head_dim": 64.0,
+      "kda_heads": 2.0,
+      "kda_lower_bound": -5.0,
+      "kda_qkv": 128.0,
+      "kda_row": 384.0,
+      "kda_taps": 4.0
+    },
+    "scratch": {
+      "conv": "3 * kda_qkv",
+      "core": "kda_qkv",
+      "gate": "kda_qkv",
+      "ogate": "kda_qkv"
+    },
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "kda_conv_q",
+        "grid": [
+          "kda_conv_blocks",
+          "seqs"
+        ],
+        "bind": {
+          "state": {
+            "state": "conv_q"
+          },
+          "w": {
+            "weight": "q_conv1d.weight",
+            "len": "kda_qkv * kda_taps"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "conv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_conv_k",
+        "grid": [
+          "kda_conv_blocks",
+          "seqs"
+        ],
+        "bind": {
+          "state": {
+            "state": "conv_k"
+          },
+          "w": {
+            "weight": "k_conv1d.weight",
+            "len": "kda_qkv * kda_taps"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "conv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_conv_v",
+        "grid": [
+          "kda_conv_blocks",
+          "seqs"
+        ],
+        "bind": {
+          "state": {
+            "state": "conv_v"
+          },
+          "w": {
+            "weight": "v_conv1d.weight",
+            "len": "kda_qkv * kda_taps"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "conv"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_forget_up",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "f_b_proj.weight",
+            "len": "kda_qkv * kda_head_dim"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "gate"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_out_gate_up",
+        "grid": [
+          "1",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "g_b_proj.weight",
+            "len": "kda_qkv * kda_head_dim"
+          },
+          "x": {
+            "buffer": "mix"
+          },
+          "y": {
+            "buffer": "ogate"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_recurrence",
+        "grid": [
+          "kda_heads",
+          "seqs"
+        ],
+        "bind": {
+          "a_log": {
+            "weight": "A_log",
+            "len": "kda_heads"
+          },
+          "betas": {
+            "buffer": "mix"
+          },
+          "dt_bias": {
+            "weight": "dt_bias",
+            "len": "kda_qkv"
+          },
+          "gates": {
+            "buffer": "gate"
+          },
+          "kda": {
+            "state": "kda"
+          },
+          "mix": {
+            "buffer": "conv"
+          },
+          "y": {
+            "buffer": "core"
+          }
+        }
+      },
+      {
+        "op": "kernel",
+        "kernel": "kda_gated_norm",
+        "grid": [
+          "kda_heads",
+          "rows"
+        ],
+        "bind": {
+          "g": {
+            "buffer": "ogate"
+          },
+          "w": {
+            "weight": "o_norm.weight",
+            "len": "kda_head_dim"
+          },
+          "x": {
+            "buffer": "core"
+          }
+        }
+      }
+    ]
+  },
+  "hyper": {
+    "streams": 4,
+    "sinkhorn_iters": 20,
+    "eps": 1e-6,
+    "sites": [
+      "hc_attn",
+      "hc_ffn"
+    ]
+  },
+  "state": [
+    {
+      "name": "latent",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "kv_lora_rank + qk_rope_head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "index_key",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "1",
+        "2 * index_head_dim"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional"
+    },
+    {
+      "name": "conv_q",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "kda_qkv",
+        "kda_taps - 1"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "conv_k",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "kda_qkv",
+        "kda_taps - 1"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "conv_v",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "kda_qkv",
+        "kda_taps - 1"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    },
+    {
+      "name": "kda",
+      "per": "sequence",
+      "layers": "linear",
+      "shape": [
+        "kda_heads",
+        "kda_head_dim",
+        "kda_head_dim"
+      ],
+      "dtype": "f32",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "checkpoint"
+    }
+  ],
+  "tensors": {
+    "index_kpool_compress_gate": "kpool_gate.weight"
+  }
+}

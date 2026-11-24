@@ -69,6 +69,7 @@ pub fn moe_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::moe::Mo
         block_group: m.expert_block.map_or(0, |b| b.group),
         mapped: spec.mlp.mapped.is_some(),
         input_scaled: m.input_scaled,
+        input_norm: spec.gated_residual().is_none(),
     };
     let mut out = vec![kir::moe::MoeKernel::new(target, kir::moe::Family::Experts, shape.clone()).map_err(anyhow::Error::msg)?];
     if spec.runtime.offload.pointer_table && spec.runtime.offload.enabled() {
@@ -115,6 +116,8 @@ pub fn kir_shape(spec: &Spec) -> kir::desc::Shape {
         .word("mlp_act", act);
     if let Some(v) = spec.norm.residual_scale {
         shape = shape.num("residual_scale", v);
+    } else if spec.gated_residual().is_some() {
+        shape = shape.num("residual_scale", 1.0);
     }
     if let Some(v) = spec.dims.logit_scale {
         shape = shape.num("logit_scale", v);
@@ -334,8 +337,49 @@ pub fn hyper_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kerne
         .collect()
 }
 
+pub fn gated_symbols(spec: &Spec) -> kir::desc::Shape {
+    let mut symbols = kir_shape(spec);
+    if let Some(h) = spec.gated_residual() {
+        symbols = symbols.num("hc_streams", h.streams as f64).num("hc_width", h.width(spec.dims.hidden) as f64);
+        for (n, v) in &h.params {
+            symbols = symbols.num(n, *v);
+        }
+    }
+    symbols
+}
+
+pub fn gated_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
+    let symbols = gated_symbols(spec);
+    let registry = crate::kir_kernel::Registry::active();
+    let mut built: BTreeMap<String, kir::Kernel> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (i, node) in h.node.iter().enumerate() {
+        let name = node.kernel.as_deref().ok_or_else(|| anyhow::anyhow!("[[gated_residual.node]] {i} names no kernel"))?;
+        if !built.contains_key(name) {
+            let d = registry.get(name).ok_or_else(|| anyhow::anyhow!("[[gated_residual.node]] {i} names kernel {name:?}, which no kernel description provides"))?;
+            built.insert(name.to_string(), d.build(target, &symbols).map_err(|e| anyhow::anyhow!("[[gated_residual.node]] {i}: {e}"))?);
+        }
+        let kernel = &built[name];
+        for p in &kernel.params {
+            anyhow::ensure!(node.bind.contains_key(p.name), "[[gated_residual.node]] {i} does not bind {name} param {:?}", p.name);
+        }
+        for (b, v) in &node.bind {
+            let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[gated_residual.node]] {i} binds {b:?}, which {name} has no param for"))?;
+            let fits = match v {
+                crate::graph::Bind::Weight { .. } => param.role == kir::Role::Weight,
+                crate::graph::Bind::Buffer { .. } => param.role == kir::Role::Activation && param.ty == kir::Scalar::F32,
+                _ => false,
+            };
+            anyhow::ensure!(fits, "[[gated_residual.node]] {i} binds {b:?} to the wrong kind of value");
+        }
+        out.push(kernel.clone());
+    }
+    Ok(out)
+}
+
 pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::LinearShape {
-    kir::linear::LinearShape { key_heads: la.key_heads, value_heads: la.value_heads, head_dim: la.key_head_dim, conv_kernel: la.conv_kernel, tiled_value_heads: la.v_heads == crate::spec::VHeadOrder::Tiled }
+    kir::linear::LinearShape { key_heads: la.key_heads, value_heads: la.value_heads, head_dim: la.key_head_dim, conv_kernel: la.conv_kernel, tiled_value_heads: la.v_heads == crate::spec::VHeadOrder::Tiled, gate_sigmoid: la.gate_sigmoid }
 }
 
 pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::linear::LinearKernel>> {
@@ -343,7 +387,7 @@ pub fn linear_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::line
         if spec.speculative().is_none() {
             return Ok(Vec::new());
         }
-        let unused = kir::linear::LinearShape { key_heads: 1, value_heads: 1, head_dim: 16, conv_kernel: 2, tiled_value_heads: false };
+        let unused = kir::linear::LinearShape { key_heads: 1, value_heads: 1, head_dim: 16, conv_kernel: 2, tiled_value_heads: false, gate_sigmoid: false };
         return Ok(vec![kir::linear::LinearKernel::new(target, kir::linear::Family::Draft, unused).map_err(anyhow::Error::msg)?]);
     };
     let shape = linear_kernel_shape(la);
@@ -416,8 +460,10 @@ pub fn kir_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>
     let mut names = vec!["rmsnorm", "swiglu"];
     if spec.uses_branch() {
         names.extend(["norm_add", "clear_branch"]);
+    } else if spec.gated_residual().is_some() {
+        names.push("clear_branch");
     }
-    if spec.norm.residual_scale.is_some() {
+    if spec.norm.residual_scale.is_some() || spec.gated_residual().is_some() {
         names.push("residual_add");
     }
     if spec.attention.qk_norm_full {
@@ -562,7 +608,7 @@ impl Module {
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let described = described_kernels(spec, kv_planes, max_ctx, target)?;
         let mut distinct: Vec<kir::Kernel> = Vec::new();
-        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?).chain(hyper_kernels(spec, target)?) {
+        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?).chain(hyper_kernels(spec, target)?).chain(gated_kernels(spec, target)?) {
             if !distinct.iter().any(|d| d.name == k.name) {
                 distinct.push(k);
             }

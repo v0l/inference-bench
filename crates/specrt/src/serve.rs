@@ -1356,6 +1356,16 @@ mod media_refusal_tests {
         assert!(!super::no_vision_reason(true).contains("no vision_config"));
         assert!(super::no_vision_reason(false).contains("no vision_config"));
     }
+
+    #[test]
+    fn a_family_that_ignores_its_vision_tower_refuses_images_as_text_only() {
+        let json = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/glm5.3-flash.config.json")).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(config["vision_config"].is_object(), "the checkpoint ships a vision tower");
+        assert!(crate::spec::Spec::from_hf_config_serving(&json).unwrap().vision.is_none());
+        assert!(crate::vision::Vision::from_hf_config(&json).unwrap().is_none(), "so the engine reads no tower and accepts no media");
+        assert!(super::no_vision_reason(config["vision_config"].is_object()).contains("text only"));
+    }
 }
 
 #[cfg(test)]

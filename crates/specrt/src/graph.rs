@@ -1,7 +1,7 @@
-use crate::spec::{Block, Spec};
+use crate::spec::{Block, GatedStage, Spec};
 use crate::vision::VisionConfig;
 use crate::vision_encoder::VisionOp;
-use crate::plan::{Buf, QuantSource, NormKind, Op, Phase, Plan, PlanBlock, Weight};
+use crate::plan::{Buf, GATED_MODULE, QuantSource, NormKind, Op, Phase, Plan, PlanBlock, Weight};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -230,8 +230,10 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
             "nopre" => !spec.norm.pre,
             "qk_norm_full" => spec.attention.qk_norm_full,
             "branch" => spec.uses_branch() && !spec.layers.split && spec.hyper.is_none(),
-            "plain" => !spec.uses_branch() && !spec.layers.split && spec.hyper.is_none(),
+            "plain" => !spec.uses_branch() && !spec.layers.split && spec.hyper.is_none() && spec.gated_residual().is_none(),
             "hyper" => spec.hyper.is_some(),
+            "gated" => spec.gated_residual().is_some(),
+            "flat" => spec.gated_residual().is_none(),
             "split" => spec.layers.split,
             "logit_softcap" => spec.dims.logit_softcap.is_some(),
             "logit_scale" => spec.dims.logit_scale.is_some(),
@@ -248,6 +250,16 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
     })
 }
 
+fn gated_stage(op: &str) -> Option<GatedStage> {
+    Some(match op {
+        "gated_expand" => GatedStage::Expand,
+        "gated_pre" => GatedStage::Pre,
+        "gated_post" => GatedStage::Post,
+        "gated_collapse" => GatedStage::Collapse,
+        _ => return None,
+    })
+}
+
 fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Option<Block>) -> Result<Vec<Op>> {
     let mut ops = Vec::new();
     for n in nodes.iter().filter(|n| n.runs_in(phase, tensor_core, spec, None)) {
@@ -258,6 +270,16 @@ fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Opt
                 if d.runs_in(phase, tensor_core, spec, kind) {
                     ops.push(Op::MixKernel { node: i as u8 });
                 }
+            }
+        } else if let Some(stage) = gated_stage(&n.op) {
+            let h = spec.gated_residual().with_context(|| format!("{} needs a [gated_residual]", n.op))?;
+            let site = match stage {
+                GatedStage::Pre | GatedStage::Post => n.weight.as_deref().context("a gated pre or post node names its site in weight")?.parse::<u8>().context("gated site")?,
+                GatedStage::Expand | GatedStage::Collapse => GATED_MODULE,
+            };
+            ensure!(site == GATED_MODULE || (site as usize) < h.sites.len(), "gated site {site} is not one of the {} [gated_residual] sites", h.sites.len());
+            for (i, _) in h.nodes(stage) {
+                ops.push(Op::Gated { node: i as u8, site });
             }
         } else if n.op == "attention_nodes" {
             for (i, d) in spec.attention.node.iter().enumerate().filter(|(_, d)| d.runs_in(phase, tensor_core, spec, kind)) {

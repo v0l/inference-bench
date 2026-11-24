@@ -1,0 +1,42 @@
+kind = "kir-kernel"
+family = "compose"
+name = "hc_act"
+threads = 32
+
+[args]
+width = "hc_lowrank"
+
+[rows]
+iter = "grid"
+address = "advance"
+per_row = ["x", "out"]
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out"
+role = "activation"
+access = "write"
+
+[[const]]
+name = "streams"
+value = "hc_streams"
+
+[[stage]]
+op = "tile_load"
+name = "v"
+src = "x"
+materialize = "cuda"
+
+[[stage]]
+op = "epilogue"
+name = "y"
+expr = "silu(v / streams)"
+
+[[stage]]
+op = "tile_store"
+dst = "out"
+value = "y"

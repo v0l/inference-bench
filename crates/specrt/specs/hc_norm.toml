@@ -1,0 +1,36 @@
+kind = "kir-kernel"
+family = "group_norm"
+name = "hc_norm"
+threads = 128
+
+[args]
+x_row = "hc_width"
+x_offset = 0
+g_row = "hc_width"
+g_offset = 0
+width = "hidden"
+w_group = "hidden"
+out_row = "hc_width"
+eps = "norm_eps"
+input = "x"
+output = "(1.0 + w) * n"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "g"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"

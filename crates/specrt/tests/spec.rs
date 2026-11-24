@@ -692,28 +692,38 @@ fn modelopt_mixed_config_maps_quant_algos_to_the_same_kernels() {
 }
 
 #[test]
-fn glm5_3_flash_describes_with_its_glm_keys_and_refuses_to_serve() {
+fn glm5_3_flash_serves_text_with_its_glm_keys() {
     let json = std::fs::read_to_string(root().join("tests/fixtures/glm5.3-flash.config.json")).unwrap();
     let spec = Spec::describe_hf_config(&json).unwrap();
     assert_eq!(spec.rope.theta, None, "glm5.3 has no rope_theta");
-    assert_eq!(spec.theta(), 10_000.0);
-    assert_eq!(spec.attention.head_dim, 4096 / 64, "head_dim 0 falls back to hidden / heads");
     assert_eq!(spec.layers.pattern.len(), 45, "the 3-then-1 rhythm has no period that divides 45");
     assert!(spec.layers.pattern.iter().enumerate().all(|(i, b)| if i % 4 == 3 { *b == Block::Full } else { b.is_linear() }), "deepseek_sparse_attention is full, linear_attention is linear");
-    let la = spec.linear_attention.as_ref().unwrap();
-    assert_eq!((la.key_heads, la.value_heads, la.key_head_dim, la.conv_kernel), (64, 64, 128, 4), "read from linear_attn_config");
-    let moe = spec.moe.as_ref().unwrap();
-    assert_eq!((moe.experts, moe.active, moe.expert_intermediate), (288, Some(8), 2048));
-    assert_eq!(moe.shared_intermediate, 2048, "n_shared_experts x moe_intermediate_size");
-    assert_eq!(moe.dense_layers, vec![0, 1, 2], "first_k_dense_replace");
-    assert!(!moe.shared_gate, "the shared expert output is added with no gate");
     assert_eq!(spec.speculative().map(|m| m.layers), Some(1), "num_nextn_predict_layers");
-    assert!(spec.runnable().is_err(), "glm5.3 cannot run yet (no family spec, no rope theta)");
     let mut no_theta = derived("qwen3-0.6b.config.json");
     no_theta.rope.theta = None;
     assert!(no_theta.runnable().unwrap_err().to_string().contains("rope theta is required to run"));
-    let refusal = Spec::from_hf_config_serving(&json).unwrap_err().to_string();
-    assert!(refusal.contains("model_type glm5_next is not supported"), "{refusal}");
+    let served = Spec::from_hf_config_serving(&json).unwrap_or_else(|e| panic!("{e:#}"));
+    served.runnable().unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(served.name, "glm5_next");
+    assert_eq!(served.hyper.as_ref().map(|h| (h.streams, h.sinkhorn_iters, h.sites.len())), Some((4, 20, 2)), "hc_mult streams around attention and MLP");
+    assert!(served.rope.nope_layers.len() == 45 && served.theta() == 10_000.0, "qk_rope_head_dim 0: no layer rotates, the theta is the nope_all placeholder");
+    assert!(served.attention.node.iter().filter_map(|n| n.kernel.as_deref()).all(|k| !k.contains("rope")), "no rope nodes");
+    assert_eq!(served.attention.kind, specrt::spec::AttentionKind::Dsa);
+    assert_eq!(served.attention.indexer.as_ref().map(|i| (i.heads, i.head_dim, i.topk, i.kpool)), Some((32, 128, 2048, 4)));
+    assert_eq!(spec.linear_attention.as_ref().map(|l| (l.kind, l.key_heads, l.key_head_dim, l.conv_kernel)), Some((LinearKind::Kda, 64, 128, 4)));
+    let mixer = served.mixer.as_ref().expect("KDA layers run as a described [mixer]");
+    assert!(mixer.node.iter().any(|n| n.kernel.as_deref() == Some("kda_recurrence")));
+    assert_eq!((mixer.params["kda_heads"], mixer.params["kda_head_dim"], mixer.params["kda_taps"]), (64.0, 128.0, 4.0));
+    assert_eq!(served.layers.pattern.iter().filter(|b| **b == Block::Full).count(), 11);
+    let moe = served.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.active, moe.expert_intermediate, moe.shared_intermediate), (288, Some(8), 2048, 2048));
+    assert_eq!((moe.dense_layers.clone(), moe.shared_gate, moe.routed_scale), (vec![0, 1, 2], false, 2.5));
+    assert!(!served.norm.unit_offset);
+    assert!(served.mtp.is_none(), "the MTP layer is described but not served: [mixer] with [mtp] is not supported yet");
+    assert!(served.vision.is_none(), "text only: the vision tower is not read");
+    assert_eq!(served.quant_map.0.len(), 494);
+    let text_only = specrt::vision::Vision::from_hf_config(&json).unwrap();
+    assert!(text_only.is_none(), "the family ignores vision_config, so images are refused at request time");
 }
 
 #[test]

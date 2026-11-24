@@ -128,6 +128,26 @@ The prefill logits pass 3.8e-4 only in f32. The streams are right, the f32 head 
 Decision (supervisor, 2026-11-24): the 3.8e-4 bar came from the f32 host model and does not apply to the bf16 hi plus lo split activation engine, whose rounding is the whole gap. The engine prefill logits on this fixture are held to `BF16_SPLIT_TOLERANCE` 5.0e-4 (about 20 percent over the measured 4.15e-4), with every prefill and decode greedy token equal to the reference. The f32 head on the engine streams, the streams and the decode logits stay at 3.8e-4. The bar still catches a real regression: one plane bf16 on the head input alone gives 0.0777, and the wrong Sinkhorn count and the dropped tail pool give 21.9 and 23.9 on the prefill logits.
 | Q6 | bf16 tensors from a second file | `tensors/native-QB.safetensors` is in the index `weight_map`, and `shard_files` reads every file the map names: **have** |
 
+### Status after #1192 (stage 4)
+
+`specs/family-glm5_next.toml` (the stage 3b test family, moved, `min_engine` 15) claims `glm5_next` and `glm5_next_text`. `Spec::from_hf_config_serving` accepts the real config: 45 layers (34 KDA as a described `[mixer]`, 11 DSA with the pooled indexer, every one 3 then 1), mHC with 4 streams and 20 Sinkhorn iterations around attention and MLP, no rope (`nope_all`, the 10 000 theta is a placeholder no kernel reads), 288 experts top 8 plus one 2048 wide shared expert, dense MLP in layers 0 to 2, clamped SwiGLU with limit 10, the 494 module quant map. The plan validates and the kernel module generates for that shape.
+
+Serving MIXED_PRECISION (the family sets `[quantization] per_tensor = true`, other families keep refusing mixed attention formats):
+
+| tensors | stored | served |
+| --- | --- | --- |
+| routed experts, layers 3 to 44 | NVFP4 with CSF scales | NVFP4 expert stack as stored (`[mlp] quant = nvfp4_g16`, weight only) |
+| shared experts | FP8_PB_WO | decoded at load, requantised to NVFP4 into the expert stack's shared slot |
+| KDA q/k/v/o, dense MLP, lm_head | MXFP8 | decoded to bf16 at load |
+| DSA q_a, q_b, kv_a, o | FP8_PB_WO | decoded to bf16 at load |
+| everything else | bf16 | bf16 |
+
+So the resident set grows from the stored 10.2 GB to about 18 GB (the 8.3 GB of fp8 projections and the lm_head become bf16). The native MXFP8 and fp8 block GEMMs for those are speed work, not correctness. `mlp_quant` reads the map per layer, so the MXFP8 dense layers are never treated as fp4.
+
+Not served: the MTP layer (`[mixer]` with `[mtp]` is refused, so the family sets `mtp = false`; the describe output still lists it) and the vision tower (`[vision] ignore = true`: the model loads text only and an image request gets `the engine serves this model as text only: its vision tower is not supported yet`, as Llama 4 style families do).
+
+Tests: `tests/spec.rs` `glm5_3_flash_serves_text_with_its_glm_keys`; `tests/glm5_mixed.rs` builds a MIXED_PRECISION copy of the tiny fixture in the real layout (MXFP8, FP8_PB_WO with the 4-D scale, NVFP4 experts) and a bf16 twin of the exact decoded values: the loader gives identical matrices (red without the loader change: `q_b_proj.weight is FP8`), and on GPU1 the engine logits of the two are identical (max abs 0). The stage 3b GPU gate gives the same numbers through the library family. The real checkpoint run is #1335 (parked, needs both cards).
+
 ## Memory: resident set and KV per token
 
 Bytes as stored (the formats above, kept native on the GPU):
@@ -185,8 +205,8 @@ B is the only one that runs without the user, and only at the speeds above.
 1. Tiny fixture `tiny-glm5-next` from HF 5.23.0 (4 layers: KDA, KDA, KDA, DSA; 8 experts top 2; layer 0 dense; mHC on; swiglu limit; pool 4, small index top-k). MTP reference from vLLM's `common/mtp.py` formula, recomputed in torch on the CPU, since HF has no MTP. Done in #1189: `scripts/tiny_glm5_next.py`, `tests/glm5_next.rs`. The swiglu limit is 1.5 at this size so about 20% of gate and up values clamp; the MTP reference zeroes the embedding at position 0 as `fused_eh_norm` does and runs the chained draft with a fresh indexer top-k.
 2. Engine pieces in this order, each with a test: mHC (#1 above), the KDA mixer (#2, reusing `kda_recurrence`), NoPE MLA through the existing DSA nodes (#3, #4), pooled indexer state and top-k at k = 512 (#5), clamped SwiGLU on the MoE (#9). Then MTP over DSA plus MoE (#12).
 3. Quant loader: per module map (Q1), FP8_PB_WO scale (Q3), MXFP8 block format (Q2), CSF decoder (Q4). These can be proven on CPU against the real shards without a GPU (dequantise one matrix and compare with vLLM's dequant or the README's re-encode rule).
-4. `family-glm5_next.toml` last, flipping `glm5_3_flash_describes_with_its_glm_keys_and_refuses_to_serve`.
-5. Real checkpoint run, parked: option A or C needs both GPUs, option B needs the expert cache and NVMe tier on GPU1. Reference: the user's running vLLM (same checkpoint, same machine), logits and top-1 against its logprobs.
+4. `family-glm5_next.toml` last, flipping `glm5_3_flash_describes_with_its_glm_keys_and_refuses_to_serve` into `glm5_3_flash_serves_text_with_its_glm_keys` (done in #1192).
+5. Real checkpoint run, parked as #1335: option A or C needs both GPUs, option B needs the expert cache and NVMe tier on GPU1. Reference: the user's running vLLM (same checkpoint, same machine), logits and top-1 against its logprobs.
 
 ## Other MoE configs in the fixtures
 
@@ -196,7 +216,7 @@ B is the only one that runs without the user, and only at the speeds above.
 | --- | --- | --- | --- |
 | deepseek-v2-lite | deepseek_v2 | 64 | accepted |
 | glm4.5-air | glm4_moe | 128 | accepted |
-| glm5.3-flash | glm5_next | 288 | refused: `model_type glm5_next is not supported` |
+| glm5.3-flash | glm5_next | 288 | accepted since #1192 (text only, MIXED_PRECISION from the quant map) |
 | gpt-oss-20b | gpt_oss | 32 | accepted |
 | granite-4.0-h-tiny | granitemoehybrid | 64 | accepted |
 | llama4-scout | llama4 | 16 | accepted |
