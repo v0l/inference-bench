@@ -1,0 +1,102 @@
+kind = "kir-kernel"
+family = "pool_topk"
+name = "pool_index_topk"
+threads = 256
+
+[args]
+heads = "index_heads"
+dim = "index_head_dim"
+pool = "index_kpool"
+pick = "index_pick"
+max_pools = "floor(max_context / index_kpool)"
+q_row = "index_q_row"
+q_offset = 0
+w_row = "qkv_row"
+w_offset = "index_w_offset"
+out_row = "index_out_row"
+layers = "index_key_layers"
+tail = "index_tail"
+
+[[param]]
+name = "q"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "keys"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "ape"
+type = "f32"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "idx"
+type = "i32"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "scale"
+type = "f32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "w_scale"
+type = "f32"
+role = "value"
+access = "read"
