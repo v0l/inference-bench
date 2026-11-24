@@ -74,7 +74,9 @@ pub enum Weight {
     Qkv,
     O,
     GateUp,
+    GateUpWide,
     Down,
+    DownWide,
     LinIn,
     LinBa,
     LinOut,
@@ -95,7 +97,9 @@ impl Weight {
             Weight::Qkv => "qkv",
             Weight::O => "o",
             Weight::GateUp => "gate_up",
+            Weight::GateUpWide => "gate_up_wide",
             Weight::Down => "down",
+            Weight::DownWide => "down_wide",
             Weight::LinIn => "lin_in",
             Weight::LinBa => "lin_ba",
             Weight::LinOut => "lin_out",
@@ -116,8 +120,9 @@ impl Weight {
         match self {
             Weight::Qkv | Weight::MtpQkv => spec.qkv_rows(),
             Weight::GateUp => spec.gate_up_rows(),
+            Weight::GateUpWide => spec.gate_up_rows_wide(),
             Weight::MtpGateUp => 2 * spec.dims.intermediate,
-            Weight::O | Weight::Down | Weight::LinOut | Weight::MtpFc | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
+            Weight::O | Weight::Down | Weight::DownWide | Weight::LinOut | Weight::MtpFc | Weight::MtpO | Weight::MtpDown => spec.dims.hidden,
             Weight::LinIn => la.map_or(0, |l| l.in_proj_rows()),
             Weight::LinBa => la.map_or(0, |l| l.ba_rows()),
             Weight::MixIn => spec.mix_in_rows(),
@@ -146,10 +151,10 @@ impl Weight {
                 }
                 t
             }
-            Weight::GateUp if spec.mlp.mapped.is_some() => vec![w("mlp.up_proj")],
-            Weight::GateUp if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
-            Weight::GateUp => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
-            Weight::Down => vec![w("mlp.down_proj")],
+            Weight::GateUp | Weight::GateUpWide if spec.mlp.mapped.is_some() => vec![w("mlp.up_proj")],
+            Weight::GateUp | Weight::GateUpWide if spec.mlp.fused_gate_up => vec![w("mlp.gate_up_proj")],
+            Weight::GateUp | Weight::GateUpWide => vec![w("mlp.gate_proj"), w("mlp.up_proj")],
+            Weight::Down | Weight::DownWide => vec![w("mlp.down_proj")],
             Weight::LinIn if spec.linear_attention.as_ref().is_some_and(|l| l.fused_interleaved) => vec![w("linear_attn.in_proj_qkvz")],
             Weight::LinBa if spec.linear_attention.as_ref().is_some_and(|l| l.fused_interleaved) => vec![w("linear_attn.in_proj_ba")],
             Weight::LinIn => vec![w("linear_attn.in_proj_qkv"), w("linear_attn.in_proj_z")],
@@ -519,6 +524,7 @@ impl Op {
 pub struct PlanBlock {
     pub layers: Vec<String>,
     pub sparse: bool,
+    pub tail: bool,
     pub ops: Vec<Op>,
 }
 
@@ -543,10 +549,14 @@ impl Plan {
     }
 
     pub fn layer_of(&self, block: Block, sparse: bool) -> &[Op] {
+        self.layer_for(block, sparse, false)
+    }
+
+    pub fn layer_for(&self, block: Block, sparse: bool, tail: bool) -> &[Op] {
         let name = block.name();
         self.blocks
             .iter()
-            .find(|b| b.sparse == sparse && b.layers.iter().any(|l| l == name))
+            .find(|b| b.sparse == sparse && b.tail == tail && b.layers.iter().any(|l| l == name))
             .map_or(&[], |b| &b.ops)
     }
 }

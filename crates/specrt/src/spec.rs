@@ -943,6 +943,8 @@ pub struct Mixer {
 pub struct Projection {
     pub tensor: String,
     pub rows: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub kv_owner: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2465,11 +2467,35 @@ impl Spec {
     }
 
     pub fn attention_layers(&self) -> usize {
-        (0..self.layers.count).filter(|&i| self.block(i).is_attention()).count()
+        (0..self.layers.count).filter(|&i| self.owns_kv(i)).count()
     }
 
     pub fn attention_before(&self, layer: usize) -> usize {
-        (0..layer).filter(|&i| self.block(i).is_attention()).count()
+        (0..layer).filter(|&i| self.owns_kv(i)).count()
+    }
+
+    pub fn owns_kv(&self, layer: usize) -> bool {
+        self.block(layer).is_attention() && !self.shares_kv(layer)
+    }
+
+    pub fn kv_index(&self, layer: usize) -> usize {
+        self.attention_before(self.kv_source(layer))
+    }
+
+    pub fn kind_index(&self, layer: usize) -> usize {
+        self.kind_before(self.kv_source(layer))
+    }
+
+    pub fn max_intermediate(&self) -> usize {
+        if self.mlp.wide_shared_tail && self.layers.shared_tail > 0 { 2 * self.dims.intermediate } else { self.dims.intermediate }
+    }
+
+    pub fn gate_up_rows_wide(&self) -> usize {
+        if self.mlp.mapped.is_some() { 2 * self.dims.intermediate } else { 4 * self.dims.intermediate }
+    }
+
+    pub fn wide_layer(&self, layer: usize) -> bool {
+        self.mlp.wide_shared_tail && self.shares_kv(layer)
     }
 
     pub fn shares_kv(&self, layer: usize) -> bool {
@@ -2631,8 +2657,9 @@ impl Spec {
         out
     }
 
-    pub fn projection_live(&self, p: &Projection, block: Block) -> bool {
+    pub fn projection_live(&self, p: &Projection, block: Block, shared: bool) -> bool {
         p.present_in(block)
+            && !(p.kv_owner && shared)
             && p.when.as_deref().is_none_or(|w| {
                 let (name, want) = match w.strip_prefix('!') {
                     Some(n) => (n, false),

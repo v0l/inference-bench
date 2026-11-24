@@ -1141,8 +1141,8 @@ impl Runtime {
             qkv: stream.alloc_zeros(spec.qkv_rows())?,
             attn: stream.alloc_zeros(spec.q_dim())?,
             attn_part: stream.alloc_zeros(spec.attention.heads * ATTN_SPLITS * (spec.attention.head_dim + 2))?,
-            gate_up: stream.alloc_zeros(2 * d.intermediate)?,
-            act: stream.alloc_zeros(d.intermediate)?,
+            gate_up: stream.alloc_zeros(2 * spec.max_intermediate())?,
+            act: stream.alloc_zeros(spec.max_intermediate())?,
             logits: stream.alloc_zeros(d.vocab)?,
             caches: vec![stream.alloc_zeros(1)?],
             block_table: stream.alloc_zeros((layout.slots + 1) * pages)?,
@@ -1162,11 +1162,11 @@ impl Runtime {
             hyper_mix: stream.alloc_zeros(spec.hyper.as_ref().map_or(1, |h| chunk * (2 + h.streams) * h.streams))?,
             qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
             attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim().max(spec.o_dim())))?,
-            gate_up: stream.alloc_zeros(mma_only(chunk * 2 * d.intermediate))?,
-            act: stream.alloc_zeros(mma_only(chunk * d.intermediate))?,
+            gate_up: stream.alloc_zeros(mma_only(chunk * 2 * spec.max_intermediate()))?,
+            act: stream.alloc_zeros(mma_only(chunk * spec.max_intermediate()))?,
             xn_planes: Planes::new(&stream, chunk * d.hidden)?,
             attn_planes: Planes::new(&stream, chunk * spec.q_dim().max(spec.o_dim()))?,
-            act_planes: Planes::new(&stream, chunk * d.intermediate)?,
+            act_planes: Planes::new(&stream, chunk * spec.max_intermediate())?,
             dummy_u16: stream.alloc_zeros(8)?,
             dummy_u8: stream.alloc_zeros(8)?,
         };
@@ -1196,7 +1196,7 @@ impl Runtime {
         };
         ensure!(use_mma || mixer.is_none(), "a described mixer needs the tensor core path (sm_80 or newer)");
         ensure!(use_mma || (!spec.layers.split && spec.mlp.mapped.is_none()), "mlp-only layers and non-gated mlps need the tensor core path (sm_80 or newer)");
-        let widest = [d.hidden, d.intermediate, spec.q_dim()]
+        let widest = [d.hidden, spec.max_intermediate(), spec.q_dim()]
             .into_iter()
             .chain(spec.linear_attention.as_ref().map(|l| l.value_dim()))
             .max()
@@ -1211,7 +1211,7 @@ impl Runtime {
             None
         };
         let fp4_act = if spec.mlp.quant == Some(crate::spec::Quant::Nvfp4G16) && crate::codegen::fp4_act_enabled(spec) {
-            let widest = d.hidden.max(d.intermediate);
+            let widest = d.hidden.max(spec.max_intermediate());
             Some(Fp4Act {
                 q: stream.alloc_zeros(chunk * widest / 2)?,
                 scales: stream.alloc_zeros(chunk * widest / crate::nvfp4::GROUP)?,

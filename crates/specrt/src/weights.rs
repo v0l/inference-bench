@@ -1043,11 +1043,11 @@ impl Checkpoint {
         Ok(self.f32(name, len)?.into_iter().map(|w| w + offset).collect())
     }
 
-    fn attention(&self, spec: &Spec, attn: &str, block: Block) -> Result<Attn<'_>> {
-        self.attention_as(spec, attn, false, block)
+    fn attention(&self, spec: &Spec, attn: &str, block: Block, shared: bool) -> Result<Attn<'_>> {
+        self.attention_as(spec, attn, false, block, shared)
     }
 
-    fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool, block: Block) -> Result<Attn<'_>> {
+    fn attention_as(&self, spec: &Spec, attn: &str, bf16: bool, block: Block, shared: bool) -> Result<Attn<'_>> {
         let a = &spec.attention;
         let quant = if bf16 { Quant::Bf16 } else { spec.quant };
         let (qkv_quant, o_quant) = if bf16 { (Quant::Bf16, Quant::Bf16) } else { (spec.requanted("qkv", quant), spec.requanted("o", quant)) };
@@ -1062,7 +1062,7 @@ impl Checkpoint {
             let mut layout: Vec<(Option<usize>, usize, usize)> = Vec::new();
             let mut loaded = Vec::new();
             for (group, width) in spec.projection_groups() {
-                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block)).collect();
+                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block, shared)).collect();
                 ensure!(live.len() <= 1, "{attn}: {} projections share one slot in {} layers", live.len(), block.name());
                 match live.first() {
                     Some(p) => {
@@ -1107,7 +1107,7 @@ impl Checkpoint {
         parts.extend(gates);
         if a.projection.iter().any(|p| p.append) {
             for (group, width) in spec.projection_groups() {
-                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block)).collect();
+                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block, shared)).collect();
                 ensure!(live.len() <= 1, "{attn}: {} appended projections share one slot in {} layers", live.len(), block.name());
                 let rows = match live.first() {
                     Some(p) => {
@@ -1232,11 +1232,11 @@ impl Checkpoint {
 
     pub fn layer_attention(&self, spec: &Spec, i: usize) -> Result<Attn<'_>> {
         ensure!(spec.block(i).is_attention(), "layer {i} is not an attention layer");
-        self.attention(spec, &format!("{}.layers.{i}.self_attn", self.root()), spec.block(i))
+        self.attention(spec, &format!("{}.layers.{i}.self_attn", self.root()), spec.block(i), spec.shares_kv(i))
     }
 
     pub fn layer_at(&self, spec: &Spec, i: usize, global: usize) -> Result<Layer<'_>> {
-        let (h, inter) = (spec.dims.hidden, spec.dims.intermediate);
+        let (h, inter) = (spec.dims.hidden, spec.layer_intermediate(i));
         let p = format!("{}.layers.{global}", self.root());
         self.require_activation_scales(spec, i, global, &p)?;
         let mixer = if !spec.has_mixer(i) {
@@ -1246,7 +1246,7 @@ impl Checkpoint {
         } else if spec.block(i).is_linear() {
             Mixer::Linear(self.gated_delta_net(spec, &format!("{p}.linear_attn"))?)
         } else {
-            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), spec.block(i))?)
+            Mixer::Attention(self.attention(spec, &format!("{p}.self_attn"), spec.block(i), spec.shares_kv(i))?)
         };
         let mlp = spec.mlp_quant(i);
         let served = spec.served_mlp_quant(i);
@@ -1658,7 +1658,7 @@ impl Checkpoint {
         ensure!(self.has(&lay.fc), "the checkpoint has no {}", lay.fc);
         let bf16 = |r: Raw<'a>, what: &str| -> Result<Matrix<'a>> { r.dequantized().into_matrix(Quant::Bf16, what) };
         let p = lay.layer.as_str();
-        let attn = self.attention_as(spec, &format!("{p}.self_attn"), true, Block::Full)?;
+        let attn = self.attention_as(spec, &format!("{p}.self_attn"), true, Block::Full, false)?;
         let sparse = spec.moe.is_some();
         let (gate_up, down, moe) = if sparse {
             let dummy = || Matrix::Bf16(Cow::Owned(vec![0; 8]));

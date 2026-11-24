@@ -532,21 +532,21 @@ pub struct Section<'p> {
     pub ops: &'p [Op],
 }
 
-pub(crate) fn layers_using(spec: &Spec, layers: &[String], sparse: bool) -> Vec<usize> {
+pub(crate) fn layers_using(spec: &Spec, layers: &[String], sparse: bool, tail: bool) -> Vec<usize> {
     (0..spec.layers.count)
-        .filter(|&i| layers.iter().any(|l| l == spec.block(i).name()) && spec.moe.as_ref().is_some_and(|m| m.is_sparse(i) && spec.has_mlp(i)) == sparse)
+        .filter(|&i| spec.shares_kv(i) == tail && layers.iter().any(|l| l == spec.block(i).name()) && spec.moe.as_ref().is_some_and(|m| m.is_sparse(i) && spec.has_mlp(i)) == sparse)
         .collect()
 }
 
 pub fn sections<'p>(spec: &Spec, plan: &'p Plan) -> Vec<Section<'p>> {
     let mut out = vec![Section { name: "head".into(), layer: 0, repeats: 1, ops: &plan.head }];
     for b in &plan.blocks {
-        let used = layers_using(spec, &b.layers, b.sparse);
+        let used = layers_using(spec, &b.layers, b.sparse, b.tail);
         let Some(&first) = used.first() else { continue };
         let mut kinds: Vec<&str> = used.iter().map(|&i| spec.block(i).name()).collect();
         kinds.sort_unstable();
         kinds.dedup();
-        let name = format!("layer {}{}", kinds.join("|"), if b.sparse { " moe" } else { "" });
+        let name = format!("layer {}{}{}", kinds.join("|"), if b.sparse { " moe" } else { "" }, if b.tail { " shared" } else { "" });
         out.push(Section { name, layer: first, repeats: used.len(), ops: &b.ops });
     }
     out.push(Section { name: "tail".into(), layer: spec.layers.count.saturating_sub(1), repeats: 1, ops: &plan.tail });
@@ -616,7 +616,7 @@ pub fn validate_with(signer: &Signer, plan: &Plan, spec: &Spec) -> Result<()> {
         let block = spec.block(i);
         let mut defined = entry.clone();
         defined.extend(carried.clone());
-        walk(&mut defined, &format!("layer {i} ({}{})", block.name(), if sparse { ", moe" } else { "" }), i, plan.layer_of(block, sparse))?;
+        walk(&mut defined, &format!("layer {i} ({}{})", block.name(), if sparse { ", moe" } else { "" }), i, plan.layer_for(block, sparse, spec.shares_kv(i)))?;
         carried.extend(defined.iter().filter(|(p, _)| matches!(p, Place::Local(_))).map(|(p, t)| (p.clone(), t.clone())));
         last = defined;
     }

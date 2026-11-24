@@ -34,7 +34,7 @@ pub fn rows_for(spec: &Spec, structure: &Structure, layer: usize, phase: Phase) 
     let root = structure.root().ok_or("not runnable on specrt: the checkpoint has no layer stack")?;
     let plan = Plan::build(spec, phase, true);
     let mut rows = column(&plan.head, spec, layer, phase, root, None);
-    rows.extend(column(plan.layer_of(spec.block(layer), spec.moe.as_ref().is_some_and(|m| m.is_sparse(layer))), spec, layer, phase, root, Some(layer)));
+    rows.extend(column(plan.layer_for(spec.block(layer), spec.moe.as_ref().is_some_and(|m| m.is_sparse(layer)), spec.shares_kv(layer)), spec, layer, phase, root, Some(layer)));
     rows.extend(column(&plan.tail, spec, layer, phase, root, None));
     Ok(rows)
 }

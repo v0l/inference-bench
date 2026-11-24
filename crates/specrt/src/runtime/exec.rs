@@ -56,6 +56,10 @@ impl PlanBackend<Run<'_>> for Runtime {
         self.layers[layer].moe.is_some()
     }
 
+    fn tail(&self, layer: usize) -> bool {
+        self.spec.shares_kv(layer)
+    }
+
     fn run_op(&self, op: &Op, layer: Option<usize>, run: &Run<'_>) -> Result<()> {
         self.run_one(op, layer.map(|i| &self.layers[i]), run)
     }
@@ -566,8 +570,8 @@ impl Runtime {
         match weight {
             Weight::Qkv => (&attn().qkv, attn().qkv_bias.as_ref()),
             Weight::O => (&attn().o, attn().o_bias.as_ref()),
-            Weight::GateUp => (&layer_of().gate_up, None),
-            Weight::Down => (&layer_of().down, None),
+            Weight::GateUp | Weight::GateUpWide => (&layer_of().gate_up, None),
+            Weight::Down | Weight::DownWide => (&layer_of().down, None),
             Weight::LinIn => (&gdn().in_proj, None),
             Weight::LinBa => (&gdn().ba, None),
             Weight::LinOut => (&gdn().out, None),

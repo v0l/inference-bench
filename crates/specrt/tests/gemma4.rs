@@ -84,6 +84,22 @@ fn the_e2b_config_maps_its_shared_tail_and_wide_mlp() {
 }
 
 #[test]
+fn the_wide_tail_plan_runs_the_wide_mlp_and_the_rest_is_unchanged() {
+    use specrt::plan::{Op, Phase, Plan, Weight};
+    let spec = Spec::from_hf_config_serving_in(&unrefused(), &popular("google__gemma-4-E2B-it")).unwrap();
+    let plan = Plan::build(&spec, Phase::Prefill, true);
+    let wide = |ops: &[Op]| ops.iter().any(|o| matches!(o, Op::Linear { weight: Weight::GateUpWide | Weight::DownWide, .. }));
+    let narrow = |ops: &[Op]| ops.iter().any(|o| matches!(o, Op::Linear { weight: Weight::GateUp | Weight::Down, .. }));
+    for layer in 0..spec.layers.count {
+        let ops = plan.layer_for(spec.block(layer), false, spec.shares_kv(layer));
+        assert_eq!((wide(ops), narrow(ops)), (spec.shares_kv(layer), !spec.shares_kv(layer)), "layer {layer}");
+    }
+    assert_eq!(specrt::plan::Weight::GateUpWide.rows(&spec), 4 * spec.dims.intermediate);
+    let dense = Spec::from_hf_config_serving(&popular("google__gemma-4-31B-it")).unwrap();
+    assert!(Plan::build(&dense, Phase::Prefill, true).blocks.iter().all(|b| !b.tail));
+}
+
+#[test]
 fn the_kv_cache_holds_each_layer_kind_at_its_own_width() {
     let spec = Spec::from_hf_config_serving(&popular("google__gemma-4-31B-it")).unwrap();
     let sliding = specrt::state::kv_bytes_per_token_at(&spec, 0);

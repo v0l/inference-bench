@@ -110,7 +110,9 @@ fn weight(name: &str) -> Result<Weight> {
         "qkv" => Weight::Qkv,
         "o" => Weight::O,
         "gate_up" => Weight::GateUp,
+        "gate_up_wide" => Weight::GateUpWide,
         "down" => Weight::Down,
+        "down_wide" => Weight::DownWide,
         "lin_in" => Weight::LinIn,
         "lin_ba" => Weight::LinBa,
         "lin_out" => Weight::LinOut,
@@ -154,8 +156,8 @@ impl Node {
         self.layers.is_empty() || self.layers.iter().any(|l| l == block.name())
     }
 
-    fn runs_in(&self, phase: Phase, tensor_core: bool, spec: &Spec, kind: Option<Block>) -> bool {
-        kind.is_none_or(|b| self.present_in(b)) && holds(self.when.as_deref(), tensor_core, spec) && match self.phase.as_deref() {
+    fn runs_in(&self, phase: Phase, tensor_core: bool, spec: &Spec, kind: Option<Block>, tail: bool) -> bool {
+        kind.is_none_or(|b| self.present_in(b)) && holds(self.when.as_deref(), tensor_core, spec, tail) && match self.phase.as_deref() {
             None => true,
             Some("prefill") => phase == Phase::Prefill,
             Some("decode") => phase == Phase::Decode,
@@ -219,9 +221,11 @@ impl Node {
     }
 }
 
-fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec) -> bool {
+fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec, tail: bool) -> bool {
     when.is_none_or(|w| {
         w.split('+').all(|c| match c {
+            "kv_owner" => !tail,
+            "kv_reader" => tail,
             "tensor_core" => tensor_core,
             "legacy" => !tensor_core,
             "sandwich" => spec.norm.sandwich,
@@ -260,14 +264,22 @@ fn gated_stage(op: &str) -> Option<GatedStage> {
     })
 }
 
-fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Option<Block>) -> Result<Vec<Op>> {
+fn widen(op: Op) -> Op {
+    match op {
+        Op::Linear { weight: Weight::GateUp, quant, input, output } => Op::Linear { weight: Weight::GateUpWide, quant, input, output },
+        Op::Linear { weight: Weight::Down, quant, input, output } => Op::Linear { weight: Weight::DownWide, quant, input, output },
+        other => other,
+    }
+}
+
+fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Option<Block>, tail: bool) -> Result<Vec<Op>> {
     let mut ops = Vec::new();
-    for n in nodes.iter().filter(|n| n.runs_in(phase, tensor_core, spec, None)) {
+    for n in nodes.iter().filter(|n| n.runs_in(phase, tensor_core, spec, None, tail)) {
         if n.op == "mixer_nodes" {
             let count = spec.mixer.as_ref().map_or(0, |m| m.node.len());
             ensure!(count <= 256, "a mixer has at most 256 nodes");
             for (i, d) in spec.mixer.iter().flat_map(|m| m.node.iter()).enumerate() {
-                if d.runs_in(phase, tensor_core, spec, kind) {
+                if d.runs_in(phase, tensor_core, spec, kind, tail) {
                     ops.push(Op::MixKernel { node: i as u8 });
                 }
             }
@@ -282,11 +294,12 @@ fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Opt
                 ops.push(Op::Gated { node: i as u8, site });
             }
         } else if n.op == "attention_nodes" {
-            for (i, d) in spec.attention.node.iter().enumerate().filter(|(_, d)| d.runs_in(phase, tensor_core, spec, kind)) {
+            for (i, d) in spec.attention.node.iter().enumerate().filter(|(_, d)| d.runs_in(phase, tensor_core, spec, kind, tail)) {
                 ops.push(d.lower_described(i)?);
             }
         } else {
-            ops.push(n.lower()?);
+            let op = n.lower()?;
+            ops.push(if tail && spec.mlp.wide_shared_tail { widen(op) } else { op });
         }
     }
     Ok(ops)
@@ -376,22 +389,25 @@ impl Graph {
 
     pub fn plan(&self, spec: &Spec, phase: Phase, tensor_core: bool) -> Result<Plan> {
         let mut blocks = Vec::new();
-        for b in self.block.iter().filter(|b| holds(b.when.as_deref(), tensor_core, spec)) {
+        for b in self.block.iter().filter(|b| holds(b.when.as_deref(), tensor_core, spec, false)) {
             let sparse = match b.mlp.as_deref() {
                 None | Some("dense") => false,
                 Some("sparse") => true,
                 Some(other) => bail!("block {} has unknown mlp {other}", b.name),
             };
-            if spec.attention.node.iter().any(|n| !n.layers.is_empty()) {
-                for name in &b.layers {
-                    let kind = Block::parse(name)?;
-                    blocks.push(PlanBlock { layers: vec![name.clone()], sparse, ops: lower(&b.node, phase, tensor_core, spec, Some(kind))? });
+            let tails: &[bool] = if spec.layers.shared_tail > 0 { &[false, true] } else { &[false] };
+            for &tail in tails {
+                if spec.attention.node.iter().any(|n| !n.layers.is_empty()) {
+                    for name in &b.layers {
+                        let kind = Block::parse(name)?;
+                        blocks.push(PlanBlock { layers: vec![name.clone()], sparse, tail, ops: lower(&b.node, phase, tensor_core, spec, Some(kind), tail)? });
+                    }
+                } else {
+                    blocks.push(PlanBlock { layers: b.layers.clone(), sparse, tail, ops: lower(&b.node, phase, tensor_core, spec, None, tail)? });
                 }
-            } else {
-                blocks.push(PlanBlock { layers: b.layers.clone(), sparse, ops: lower(&b.node, phase, tensor_core, spec, None)? });
             }
         }
-        Ok(Plan { phase, tensor_core, head: lower(&self.head, phase, tensor_core, spec, None)?, blocks, tail: lower(&self.tail, phase, tensor_core, spec, None)?, mtp: lower(&self.mtp, phase, tensor_core, spec, None)?, mtp_head: lower(&self.mtp_head, phase, tensor_core, spec, None)? })
+        Ok(Plan { phase, tensor_core, head: lower(&self.head, phase, tensor_core, spec, None, false)?, blocks, tail: lower(&self.tail, phase, tensor_core, spec, None, false)?, mtp: lower(&self.mtp, phase, tensor_core, spec, None, false)?, mtp_head: lower(&self.mtp_head, phase, tensor_core, spec, None, false)? })
     }
 }
 

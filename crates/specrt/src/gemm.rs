@@ -123,7 +123,9 @@ pub fn linear_shape(spec: &Spec, linear: &str) -> GemmShape {
         "qkv" => (spec.qkv_rows(), d.hidden, Epilogue::Store, spec.attention.qkv_bias),
         "o" => (d.hidden, spec.o_dim(), Epilogue::Residual, spec.attention.o_bias),
         "gate_up" => (spec.gate_up_rows(), d.hidden, gate_up_epilogue(spec), false),
+        "gate_up_wide" => (spec.gate_up_rows_wide(), d.hidden, gate_up_epilogue(spec), false),
         "down" => (d.hidden, d.intermediate, Epilogue::Residual, false),
+        "down_wide" => (d.hidden, 2 * d.intermediate, Epilogue::Residual, false),
         "lin_in" => (la.map_or(0, |l| l.in_proj_rows()), d.hidden, Epilogue::Store, false),
         "lin_ba" => (la.map_or(0, |l| l.ba_rows()), d.hidden, Epilogue::Store, false),
         "lin_out" => (d.hidden, la.map_or(0, |l| l.value_dim()), Epilogue::Residual, false),
@@ -349,6 +351,21 @@ impl GemmSet {
     }
 }
 
+fn wide_of(spec: &Spec, base: &[&'static str]) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for &l in base {
+        out.push(l);
+        if spec.mlp.wide_shared_tail && spec.layers.shared_tail > 0 {
+            match l {
+                "gate_up" => out.push("gate_up_wide"),
+                "down" => out.push("down_wide"),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
     let tuning = tuning(&spec.runtime);
     let la = spec.linear_attention.is_some();
@@ -359,7 +376,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
     if !mma && !dequant {
         return Ok(set);
     }
-    for &linear in MMA_LINEARS.iter().chain(gdn) {
+    for linear in wide_of(spec, &MMA_LINEARS).into_iter().chain(gdn.iter().copied()) {
         let wf = match linear {
             "lm_head" => head_format(spec),
             "lin_ba" => WeightFormat::Bf16,
@@ -369,7 +386,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
     }
     if dequant {
         if spec.mlp.quant == Some(Quant::Nvfp4G16) {
-            for linear in FP4_LINEARS {
+            for linear in wide_of(spec, &FP4_LINEARS) {
                 let shape = linear_shape(spec, linear);
                 set.tiles(t, &format!("{linear}_f4w"), shape, WeightFormat::Fp4, true, false, &tuning)?;
                 set.push(KernelInstance::batch(t, &format!("{linear}_f4b8"), shape, WeightFormat::Fp4, 8))?;
@@ -411,14 +428,14 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
         if t.has(kir::Feature::Fp8Mma) {
             set.push(KernelInstance::quant_fp8(t, Fp8Scale::Block))?;
             set.push(KernelInstance::quant_fp8(t, Fp8Scale::Channel))?;
-            for &linear in FP8_ACT_LINEARS.iter().filter(|l| la || !l.starts_with("lin_")) {
+            for linear in wide_of(spec, &FP8_ACT_LINEARS).into_iter().filter(|l| la || !l.starts_with("lin_")) {
                 let shape = linear_shape(spec, linear);
                 for v in Variant::FP8_ACT {
                     set.push(KernelInstance::fp8_act(t, &format!("{linear}_f8{}", v.suffix()), shape, tuning.tile(v), scale))?;
                 }
             }
         }
-        for &linear in kg::BATCH_LINEARS.iter().filter(|l| la || !l.starts_with("lin_")) {
+        for linear in wide_of(spec, &kg::BATCH_LINEARS).into_iter().filter(|l| la || !l.starts_with("lin_")) {
             let shape = linear_shape(spec, linear);
             for tokens in BATCH_VARIANTS {
                 set.push(KernelInstance::batch(t, &format!("{linear}_f8b{tokens}"), shape, WeightFormat::Fp8, tokens))?;
@@ -431,7 +448,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
         let (gu, dn) = (linear_shape(spec, "gate_up"), linear_shape(spec, "down"));
         set.push_fused(normed_fp4(t, "gate_up_act_f4", gu, true))?;
         set.push(KernelInstance::fp4_gemv(t, "down_proj_f4", Fp4Gemv::Down, dn.n, dn.k))?;
-        for linear in FP4_LINEARS {
+        for linear in wide_of(spec, &FP4_LINEARS) {
             let shape = linear_shape(spec, linear);
             set.tiles(t, &format!("{linear}_f4w"), shape, WeightFormat::Fp4, true, false, &tuning)?;
             for tokens in BATCH_VARIANTS {
@@ -441,7 +458,7 @@ pub fn gemm_kernels(spec: &Spec, t: &kir::Target) -> Result<GemmSet> {
         }
         if fp4_act_enabled(spec) && t.has(kir::Feature::BlockScaledFp4) {
             set.push(KernelInstance::quant_fp4(t))?;
-            for linear in FP4_LINEARS {
+            for linear in wide_of(spec, &FP4_LINEARS) {
                 let shape = linear_shape(spec, linear);
                 for v in Variant::FP4_ACT {
                     set.push(KernelInstance::fp4_act(t, &format!("{linear}_f4a{}", v.suffix()), shape, tuning.fp4_tile(v), &tuning))?;
