@@ -35,109 +35,107 @@ Each gap is one missing piece, ranked by the summed downloads of the rows it blo
 
 | # | kind | gap | blocked downloads | rows | models | issue |
 |---|---|---|---|---|---|---|
-| 1 | tokenizer or chat template | chat template: syntax error: unknown statement generation | 86.69 M | 8 | HuggingFaceTB/SmolLM3-3B, RedHatAI/SmolLM3-3B-FP8-dynamic, Qwen/Qwen3.6-27B, Qwen/Qwen3.6-27B-FP8 and 4 more | #1193 |
-| 2 | new family spec | model_type gemma4 | 57.92 M | 25 | unsloth/gemma-4-12b-it-GGUF, google/gemma-4-26B-A4B-it, nvidia/Gemma-4-26B-A4B-NVFP4, RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic and 21 more | #1194 |
-| 3 | new family spec | model_type gpt2 | 35.99 M | 9 | distilbert/distilgpt2, mradermacher/distilgpt2-i1-GGUF, openai-community/gpt2, liodon-ai/gpt2-FP8 and 5 more | #1195 |
-| 4 | new family spec | model_type qwen4_exp | 32.17 M | 5 | Qwen/Qwen3.8-Flash-Next, RadixArk/Qwen3.8-Flash-Next-NVFP4, Qwen/Qwen3.8-Flash-Next-FP8, tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ and 1 more | #1196 |
-| 5 | new family spec | model_type florence2 | 22.83 M | 1 | microsoft/Florence-2-base | #1198 |
-| 6 | new family spec | model_type qwen3_vl | 14.82 M | 18 | Qwen/Qwen3-VL-2B-Instruct, kaitchup/Qwen3-VL-2B-Instruct-NVFP4, Qwen/Qwen3-VL-2B-Instruct-FP8, cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit and 14 more | #1197 |
-| 7 | new family spec | model_type qwen2_5_vl | 11.10 M | 13 | Qwen/Qwen2.5-VL-32B-Instruct, BCCard/Qwen2.5-VL-32B-Instruct-FP8-Dynamic, Qwen/Qwen2.5-VL-32B-Instruct-AWQ, Qwen/Qwen2.5-VL-3B-Instruct and 9 more | #1197 |
-| 8 | new family spec | model_type deepseek_v32 | 11.00 M | 4 | XingChen-AGI/Xing4.1-Preview, deepseek-ai/DeepSeek-V3.2, RedHatAI/DeepSeek-V3.2-NVFP4-FP8-BLOCK, QuantTrio/DeepSeek-V3.2-AWQ | #1199 |
-| 9 | quant format | awq 4bit weights | 7.79 M | 27 | fbaldassarri/HuggingFaceTB_SmolLM2-135M-auto_awq-int4-gs64-sym, fbaldassarri/HuggingFaceTB_SmolLM2-360M-auto_awq-int4-gs64-sym, Qwen/Qwen2.5-0.5B-Instruct-AWQ, Qwen/Qwen2.5-1.5B-Instruct-AWQ and 23 more | #1200 |
-| 10 | new family spec | model_type glm5_next | 7.46 M | 4 | zai-org/GLM-5.3-Flash, tattrongvu/GLM-5.3-Flash-NVFP4, wtdcode/GLM-5.3-Flash-AWQ-W4A16, Piecrust/GLM-5.3-Flash-FP4-Abliterated | #1179 |
-| 11 | new family spec | model_type gemma4_unified | 7.44 M | 5 | google/gemma-4-12B-it, AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-NVFP4-FP8, AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-FP8, cyankiwi/gemma-4-12B-it-AWQ-INT4 and 1 more | #1194 |
-| 12 | new family spec | model_type deepseek_v41 | 6.47 M | 5 | deepseek-ai/DeepSeek-V4.1-Flash, nvidia/DeepSeek-V4.1-Flash-NVFP4, antirez/deepseek-v4.1-flash-gguf, deepseek-ai/DeepSeek-V4.1-Flash-1017 and 1 more | #1201 |
-| 13 | new family spec | model_type unlimited_ocr | 5.50 M | 1 | baidu/Unlimited-OCR | #1202 |
-| 14 | new family spec | model_type opt | 4.68 M | 1 | facebook/opt-125m | #1203 |
-| 15 | new family spec | model_type deepseek_v4 | 3.95 M | 9 | deepseek-ai/DeepSeek-V4-Flash, nvidia/DeepSeek-V4-Flash-NVFP4, huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF, deepseek-ai/DeepSeek-V4-Flash-0731 and 5 more | #1201 |
-| 16 | attention, block or MoE variant | GGUF tensor and metadata names for families that already load from safetensors | 3.42 M | 24 | webAI-Official/TwIL-LM3, llmfan46/Qwen3-Coder-Next-Uncensored-Heretic-GGUF, allenai/OLMo-2-0425-1B-GGUF, unsloth/DeepSeek-R1-GGUF and 20 more | #1204 |
-| 17 | new family spec | model_type spark2_5 | 3.30 M | 9 | XHToken/Spark-X2.5-4B-Base, XHToken/Spark-X2.5-4B-FP8, peculiar-ragdoll/Sharp-Spark-X2.5-4B-GGUF, XHToken/Spark-X2.6-4B and 5 more | #1209 |
-| 18 | new family spec | model_type lfm2_moe | 3.29 M | 6 | LiquidAI/LFM2.5-24B-A2B, primitive-ai/LFM2.5-24B-A2B-NVFP4A16, LiquidAI/LFM2.5-24B-A2B-FP8, cyankiwi/LFM2.5-24B-A2B-AWQ-INT4 and 2 more | #1205 |
-| 19 | quant format | compressed-tensors pack-quantized w4i-group weights | 2.84 M | 34 | TheUnderscore/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-W4A16-AWQ, drawais/SmolLM3-3B-AWQ-INT4, upshift/infomaniak-translategemma-4b-it-W4A16-awq, cyankiwi/Sage-A1.5-AWQ-INT4 and 30 more | #1200 |
-| 20 | new family spec | GGUF architecture dflash | 2.82 M | 2 | nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2, peasantsmith/GLM-5.3-Flash-Maya-GGUF | #1212 |
-| 21 | new family spec | model_type deepseek_v3 | 2.71 M | 7 | deepseek-ai/DeepSeek-R1, RedHatAI/DeepSeek-R1-NVFP4-FP8-BLOCK, QuixiAI/DeepSeek-R1-AWQ, OPEA/DeepSeek-R1-int4-gptq-sym-inc and 3 more | #1199 |
-| 22 | new family spec | model_type gpt_neox | 2.47 M | 4 | EleutherAI/pythia-160m, fbaldassarri/EleutherAI_pythia-160m-autoawq-int4-gs128-asym, fbaldassarri/EleutherAI_pythia-160m-autogptq-int4-gs128-sym, mradermacher/pythia-160m-i1-GGUF | #1203 |
-| 23 | new family spec | model_type moondream1 | 2.39 M | 1 | vikhyatk/moondream2 | #1208 |
-| 24 | new family spec | model_type inkling2_loop | 2.39 M | 3 | thinkingmachines/Inkling-2-Mini, OpenUncensored/Inkling-2-Mini-Uncensored, unsloth/Inkling-2-Mini-GGUF | #1210 |
-| 25 | new family spec | model_type smolvlm | 2.38 M | 1 | HuggingFaceTB/SmolVLM2-500M-Video-Instruct | #1208 |
-| 26 | new family spec | model_type internvl_chat | 2.28 M | 1 | OpenGVLab/InternVL2-1B | #1208 |
-| 27 | quant format | layer N mlp.gate_proj is in two groups | 1.98 M | 2 | unsloth/Qwen3.6-27B-NVFP4, unsloth/Qwen3.8-27B-NVFP4 | #1207 |
-| 28 | quant format | GGUF types | 1.84 M | 1 | prism-ml/Ternary-Bonsai-2-2B-gguf | #1213 |
-| 29 | new family spec | model_type deepseek_vl_v2 | 1.75 M | 1 | deepseek-ai/DeepSeek-OCR | #1202 |
-| 30 | new family spec | model_type inkling_mm_model | 1.74 M | 7 | thinkingmachines/Inkling, thinkingmachines/Inkling-NVFP4, RedHatAI/Inkling-FP8-dynamic, thinkingmachines/Inkling-Small and 3 more | #1210 |
-| 31 | attention, block or MoE variant | [mixer] is set but the pattern has no linear layer | 1.69 M | 3 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16, SergiioB/Nemotron-3.5-Lightning-30B-A3B-GPTQ-INT4-G64-sym, nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 | #1206 |
-| 32 | new family spec | model_type qwen2_vl | 1.63 M | 7 | Qwen/Qwen2-VL-2B-Instruct, Qwen/Qwen2-VL-2B-Instruct-AWQ, Qwen/Qwen2-VL-2B-Instruct-GPTQ-Int4, ggml-org/Qwen2-VL-2B-Instruct-GGUF and 3 more | #1197 |
-| 33 | new family spec | model_type lfm3 | 1.58 M | 5 | LiquidAI/LFM3-1.7B, LiquidAI/LFM3-1.7B-NVFP4, LiquidAI/LFM3-1.7B-FP8, LiquidAI/LFM3-1.7B-GGUF and 1 more | #1205 |
-| 34 | new family spec | model_type minicpmv4_7 (wraps qwen3_5_moe_text, which specrt runs) | 1.55 M | 5 | openbmb/MiniCPM-V-4.7-35B-A3B, axteam/MiniCPM-V-4.7-35B-A3B-NVFP4A16, openbmb/MiniCPM-V-4.7-35B-A3B-FP8, openbmb/MiniCPM-V-4.7-35B-A3B-AWQ and 1 more | #1208 |
-| 35 | new family spec | model_type glm4_moe_lite | 1.51 M | 5 | zai-org/GLM-4.7-Flash, GadflyII/GLM-4.7-Flash-NVFP4, unsloth/GLM-4.7-Flash-FP8-Dynamic, cyankiwi/GLM-4.7-Flash-AWQ-4bit and 1 more | #1199 |
-| 36 | quant format | fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of N | 1.44 M | 7 | liodon-ai/SmolLM2-360M-FP8, RedHatAI/Qwen2.5-0.5B-FP8-dynamic, RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic, ArliAI/GLM-4.5-Air-Derestricted-FP8 and 3 more | #1207 |
-| 37 | attention, block or MoE variant | config.json has no num_hidden_layers | 1.31 M | 5 | cyankiwi/NVIDIA-Nemotron-3-Super-120B-A12B-AWQ-4bit, nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16, OpenYourMind/OpenYourMind-NVIDIA-Nemotron-3-Ultra-550B-A55B-abliterated-uncensored-NVFP4, RedHatAI/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8-dynamic and 1 more | #1206 |
-| 38 | new family spec | model_type k2_horizon | 1.30 M | 5 | IFM/K2-Horizon-7B, ProCreations/K2-Horizon-7B-Uno-NVFP4, IFM/K2-Horizon-7B-FP8, cyankiwi/K2-Horizon-7B-AWQ-INT4 and 1 more | #1211 |
-| 39 | tokenizer or chat template | chat template: syntax error: unknown statement break | 1.30 M | 2 | zai-org/GLM-5.3-BF16, RadixArk/GLM-5.3-NVFP4 | #1193 |
-| 40 | quant format | gptq 4bit weights | 1.22 M | 33 | fbaldassarri/HuggingFaceTB_SmolLM2-360M-auto_gptq-int4-gs128-sym, Tech2wild/Nanbeige4.3-33B-W4A16-AutoRound, Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4, Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4 and 29 more | #1200 |
-| 41 | new family spec | model_type qwen3_vl_moe | 1.18 M | 6 | Qwen/Qwen3-VL-30B-A3B-Instruct, ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4, Qwen/Qwen3-VL-30B-A3B-Instruct-FP8, QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ and 2 more | #1197 |
-| 42 | attention, block or MoE variant | config.json has no vocab_size | 1.07 M | 2 | gaunernst/gemma-3-12b-it-int4-awq, gaunernst/gemma-3-27b-it-int4-awq | #1213 |
-| 43 | new family spec | model_type gemma2 | 1.06 M | 5 | google/gemma-2-9b-it, RedHatAI/gemma-2-9b-it-FP8, hugging-quants/gemma-2-9b-it-AWQ-INT4, wath5/kgl_lmsys_pref_classif and 1 more | #1203 |
-| 44 | new family spec | model_type bloom | 0.92 M | 3 | bigscience/bloomz-560m, liodon-ai/bloomz-560m-FP8, mradermacher/bloomz-560m-GGUF | #1203 |
-| 45 | new family spec | model_type kimi_k3 | 0.90 M | 5 | moonshotai/Kimi-K3, nvidia/Kimi-K3-NVFP4, RedHatAI/Kimi-K3-FP8-BLOCK, open-inference/Kimi-K3-W4A8-K512-DenseChannel-GPTQ-Cal128-v2 and 1 more | #1214 |
-| 46 | quant format | quantisation declared only in hf_quant_config.json | 0.85 M | 2 | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4, nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 | #1206 |
-| 47 | new family spec | model_type muse_glimmer | 0.79 M | 6 | meta-models/Muse-Glimmer-30B, RadixArk/Muse-Glimmer-NVFP4, RedHatAI/Muse-Glimmer-30B-FP8-block, cyankiwi/Muse-Glimmer-30B-AWQ-INT4 and 2 more |  |
-| 48 | new family spec | model_type nemotron_parse | 0.77 M | 1 | nvidia/NVIDIA-Nemotron-Parse-2.0 |  |
-| 49 | new family spec | model_type unlimited-ocr | 0.65 M | 6 | sahilchachra/Unlimited-OCR-NVFP4, shadowrock-io/Unlimited-OCR-Community-FP8-Dynamic, sahilchachra/Unlimited-OCR-AWQ, baidu/Unlimited-OCR-2 and 2 more | #1202 |
-| 50 | new family spec | model_type llava | 0.64 M | 1 | llava-hf/llava-1.5-7b-hf | #1208 |
-| 51 | new family spec | model_type mistral3 (wraps qwen3, which specrt runs) | 0.62 M | 2 | lightonai/LightOnOCR-2-1B, switzerchees/LightOnOCR-2-1B-NVFP4 | #1208 |
-| 52 | quant format | nvfp4_g16 is supported for [mlp] quant only | 0.62 M | 22 | Firworks/SmolLM3-3B-nvfp4, axteam/Nanbeige4.3-33B-NVFP4, ilessio-aiflowlab/Qwen2.5-Coder-14B-Instruct-NVFP4-anima, JongYeop/Qwen2.5-3B-Instruct-FP4-W4A4 and 18 more | #1207 |
-| 53 | new family spec | model_type kimi_k25 | 0.61 M | 3 | moonshotai/Kimi-K2.5, nvidia/Kimi-K2.5-NVFP4, amd/Kimi-K2.5-MXFP4-AttnFP8 | #1199 |
-| 54 | new family spec | model_type bailing_hybrid | 0.47 M | 3 | inclusionAI/Ling-3.0-tiny, inclusionAI/LingSante-3.1-flash, inclusionAI/LingSante-3.1-flash-MXFP4 |  |
-| 55 | new family spec | GGUF architecture glm-dsa | 0.36 M | 4 | unsloth/GLM-5-GGUF, unsloth/GLM-5.2-GGUF, unsloth/GLM-5.3-GGUF, AesSedai/GLM-5.3-GGUF |  |
-| 56 | quant format | the quantisation config covers no attention projection | 0.26 M | 1 | nvidia/GLM-5.3-NVFP4 |  |
-| 57 | new family spec | GGUF architecture bailingmoe3 | 0.24 M | 1 | bloomer010/Ling-3.0-tiny-GGUF |  |
-| 58 | new family spec | model_type gemma3n | 0.24 M | 4 | google/gemma-3n-E2B-it, RedHatAI/gemma-3n-E2B-it-FP8-dynamic, unsloth/gemma-3n-E2B-it-GGUF, google/gemma-3n-E4B-it | #1214 |
-| 59 | quant format | compressed-tensors naive-quantized w8f-tensor a8 weights | 0.21 M | 2 | RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8, RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8 |  |
-| 60 | new family spec | model_type llada | 0.11 M | 5 | GSAI-ML/LLaDA-1.5, mradermacher/LLaDA-1.5-GGUF, GSAI-ML/LLaDA-8B-Instruct, FunAGI/LLaDA-8B-Instruct-gptqmodel-4bit and 1 more | #1214 |
-| 61 | new family spec | model_type nemotron_h_puzzle | 0.11 M | 2 | nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-FP8 |  |
-| 62 | new family spec | model_type lfm3_omni | 0.10 M | 2 | LiquidAI/LFM3-Omni-2B, MichaelAnthony/LFM3-Omni-2B-98K-V2-FP8 |  |
-| 63 | new family spec | model_type kimi_k31 | 0.09 M | 4 | moonshotai/Kimi-K3.1-Pro, nvidia/Kimi-K3.1-Pro-NVFP4, manifoldlabs/Kimi-K3.1-Pro-Quark-MXFP4-AttnFP8, KarLexAI/Kimi-K3.1-Pro-GGUF | #1214 |
-| 64 | new family spec | model_type olala | 0.08 M | 3 | OVHaiLLM/Olala-v1.0-mini-7A1B, solfird/Olala-v1.0-mini-7A1B-NVFP4-experts, OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF |  |
-| 65 | quant format | modelopt_mixed weights | 0.07 M | 1 | nvidia/Qwen3.5-397B-A17B-NVFP4-V2 |  |
-| 66 | quant format | gptq 8bit weights | 0.05 M | 5 | Qwen/Qwen3-0.6B-GPTQ-Int8, Qwen/Qwen3-1.7B-GPTQ-Int8, JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int8, QuantTrio/Qwen3-Coder-30B-A3B-Instruct-GPTQ-Int8 and 1 more |  |
-| 67 | quant format | mixture-of-experts with Fp8Channel expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are) | 0.05 M | 4 | InternScience/Sage-A1.5-FP8, debackerl/KAT-Coder-V2.5-Dev-FP8, RedHatAI/Qwen3-Coder-Next-FP8-dynamic, lflare/Ornith-1.0-35B-FP8 | #1207 |
-| 68 | new family spec | GGUF architecture inkling | 0.05 M | 2 | unsloth/inkling-GGUF, unsloth/Inkling-Small-GGUF |  |
-| 69 | quant format | the quantisation config has no groups | 0.03 M | 1 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark |  |
-| 70 | new family spec | model_type raon1_nano | 0.02 M | 3 | KRAFTON/Raon-1-nano, Pilcothink/Raon-1-nano-NVFP4, KRAFTON/Raon-1-nano-gguf |  |
-| 71 | quant format | compressed-tensors float-quantized w8f-tensor a8 weights | 0.02 M | 2 | RedHatAI/Llama-3.2-1B-FP8, JongYeop/Mistral-7B-Instruct-v0.2-FP8-W8A8 |  |
-| 72 | new family spec | model_type maxwell_moe | 0.02 M | 3 | maxwell-model/Maxwell-V1-Flash, maxwell-model/Maxwell-V1-Flash-FP8, AtomicChat/Maxwell-V1-Flash-GGUF |  |
-| 73 | quant format | nvfp4_g16 needs hidden and intermediate to be multiples of N | 0.02 M | 2 | NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4, Firworks/GLM-4.5-Air-nvfp4 |  |
-| 74 | new family spec | GGUF architecture unlimited-ocr2 | 0.02 M | 1 | AtomicChat/Unlimited-OCR-2-GGUF |  |
-| 75 | new family spec | GGUF architecture deepseek2-ocr | 0.01 M | 2 | sahilchachra/Unlimited-OCR-GGUF, sabafallah/DeepSeek-OCR-GGUF |  |
-| 76 | quant format | gptq 2bit weights | 0.01 M | 1 | lilmeaty/SmolLM2-135M-Instruct-GPTQ |  |
-| 77 | new family spec | GGUF architecture phi2 | 0.01 M | 1 | ggml-org/moondream2-20250414-GGUF |  |
-| 78 | new family spec | model_type ernie5_5_moe | 0.01 M | 2 | baidu/ERNIE-5.5-Flash-Preview-BF16, baidu/ERNIE-5.5-Flash-Base |  |
-| 79 | new family spec | model_type aion_instruct | 0.00 M | 2 | microsoft/Aion-1.0-Instruct-2.3B, PureTensorAI/Aion-1.0-Instruct-2.3B-NVFP4 |  |
-| 80 | quant format | quark weights | 0.00 M | 3 | amd/gpt-oss-120b-w-mxfp4-a-fp8, amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8, amd/GLM-5-NVFP4 |  |
-| 81 | new family spec | model_type sarvam_mla | 0.00 M | 4 | sarvamai/sarvam-105b, sarvamai/sarvam-105b-1711, RedHatAI/sarvam-105b-FP8-dynamic, QuantTrio/sarvam-105b-AWQ |  |
-| 82 | new family spec | GGUF architecture aion | 0.00 M | 1 | Xylolabs/Aion-1.0-Instruct-2.3B-GGUF |  |
-| 83 | quant format | modelopt FP8_PB_WO+FP8_PER_CHANNEL_PER_TOKEN+MIXED_PRECISION+W4A16_NVFP4 weights | 0.00 M | 1 | dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 |  |
-| 84 | new family spec | model_type grug_moe | 0.00 M | 1 | open-athena/Marin-Mochi-535B-A23B |  |
-| 85 | quant format | fp8 e4m3 block None weights | 0.00 M | 2 | EliovpAI/Deepseek-R1-0528-Qwen3-8B-FP8-KV, RedHatAI/Meta-Llama-3-8B-Instruct-FP8-KV |  |
-| 86 | new family spec | model_type aurora2 | 0.00 M | 1 | AuroraAI-Research/Aurora2-400M-A20M |  |
-| 87 | quant format | compressed-tensors float-quantized w8f-block a8 weights | 0.00 M | 1 | Nanbeige/Nanbeige4.3-33B-FP8 |  |
-| 88 | attention, block or MoE variant | config.json has no num_attention_heads | 0.00 M | 1 | gaunernst/gemma-3-4b-it-int4-awq | #1213 |
-| 89 | quant format | w4afp8 weights | 0.00 M | 2 | PhalaCloud/GLM-5.3-W4AFP8, BitdeerAI/GLM-5.3-W4AFP8-AWQ |  |
-| 90 | new family spec | model_type philolm | 0.00 M | 1 | gustavecortal/PhiloLM |  |
-| 91 | quant format | layer N mlp.experts is in two groups | 0.00 M | 1 | kvallespin/Sage-A1.5-NVFP4 |  |
-| 92 | quant format | compressed-tensors pack-quantized w4i-channel, pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 2 | nchapman/Ornith-1.5-35B-A3B-W4A16-HGPTQ, nchapman/Ornith-1.5-9B-W4A16-HGPTQ | #1200 |
-| 93 | quant format | compressed-tensors float-quantized w8f-tensor a8, nvfp4-pack-quantized w4f-tensor_group a4 weights | 0.00 M | 1 | primitive-ai/Ornith-1.5-35B-A3B-agentic-NVFP4-FP8 |  |
-| 94 | quant format | compressed-tensors pack-quantized w8i-group weights | 0.00 M | 1 | axteam/MiniCPM5-2B-AWQ-8bit |  |
-| 95 | quant format | dgpp_mixed346 weights | 0.00 M | 1 | HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128 |  |
-| 96 | new family spec | GGUF architecture kolibri1 | 0.00 M | 1 | Harsha001/Kolibri-1.1-ROCmFPX |  |
-| 97 | quant format | pretensor_nvfp4_weight_only weights | 0.00 M | 1 | PreDoctor/DeepSeek-R1-0528-Qwen3-8B-NVFP4-W4A16-PreTensor |  |
-| 98 | quant format | torchao weights | 0.00 M | 1 | pytorch/Phi-4-mini-instruct-AWQ-INT4 |  |
-| 99 | quant format | gptq_marlin weights | 0.00 M | 1 | QuantTrio/GLM-4.5-Air-GPTQ-Int4-Int8Mix |  |
-| 100 | quant format | compressed-tensors pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 1 | bot-lab-21/GLM-5.3-Int4-Int8Mix-Pollard-GPTQ | #1200 |
-| 101 | attention, block or MoE variant | model_type  is not supported | 0.00 M | 1 | amd/Phi-3-mini-4k-instruct-awq-g128-int4-asym-fp16-onnx-hybrid |  |
-| 102 | quant format | bitsandbytes 4bit weights | 0.00 M | 1 | rautaditya/llama-3.2-1b-4bit-gptq |  |
-| 103 | new family spec | model_type kolibri1_1 | 0.00 M | 1 | Aleph-Alpha/Kolibri-1.1 |  |
+| 1 | new family spec | model_type gemma4 | 57.92 M | 25 | unsloth/gemma-4-12b-it-GGUF, google/gemma-4-26B-A4B-it, nvidia/Gemma-4-26B-A4B-NVFP4, RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic and 21 more | #1194 |
+| 2 | new family spec | model_type gpt2 | 35.99 M | 9 | distilbert/distilgpt2, mradermacher/distilgpt2-i1-GGUF, openai-community/gpt2, liodon-ai/gpt2-FP8 and 5 more | #1195 |
+| 3 | new family spec | model_type qwen4_exp | 32.17 M | 5 | Qwen/Qwen3.8-Flash-Next, RadixArk/Qwen3.8-Flash-Next-NVFP4, Qwen/Qwen3.8-Flash-Next-FP8, tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ and 1 more | #1196 |
+| 4 | new family spec | model_type florence2 | 22.83 M | 1 | microsoft/Florence-2-base | #1198 |
+| 5 | new family spec | model_type qwen3_vl | 14.82 M | 18 | Qwen/Qwen3-VL-2B-Instruct, kaitchup/Qwen3-VL-2B-Instruct-NVFP4, Qwen/Qwen3-VL-2B-Instruct-FP8, cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit and 14 more | #1197 |
+| 6 | new family spec | model_type qwen2_5_vl | 11.10 M | 13 | Qwen/Qwen2.5-VL-32B-Instruct, BCCard/Qwen2.5-VL-32B-Instruct-FP8-Dynamic, Qwen/Qwen2.5-VL-32B-Instruct-AWQ, Qwen/Qwen2.5-VL-3B-Instruct and 9 more | #1197 |
+| 7 | new family spec | model_type deepseek_v32 | 11.00 M | 4 | XingChen-AGI/Xing4.1-Preview, deepseek-ai/DeepSeek-V3.2, RedHatAI/DeepSeek-V3.2-NVFP4-FP8-BLOCK, QuantTrio/DeepSeek-V3.2-AWQ | #1199 |
+| 8 | quant format | awq 4bit weights | 7.79 M | 27 | fbaldassarri/HuggingFaceTB_SmolLM2-135M-auto_awq-int4-gs64-sym, fbaldassarri/HuggingFaceTB_SmolLM2-360M-auto_awq-int4-gs64-sym, Qwen/Qwen2.5-0.5B-Instruct-AWQ, Qwen/Qwen2.5-1.5B-Instruct-AWQ and 23 more | #1200 |
+| 9 | new family spec | model_type glm5_next | 7.46 M | 4 | zai-org/GLM-5.3-Flash, tattrongvu/GLM-5.3-Flash-NVFP4, wtdcode/GLM-5.3-Flash-AWQ-W4A16, Piecrust/GLM-5.3-Flash-FP4-Abliterated | #1179 |
+| 10 | new family spec | model_type gemma4_unified | 7.44 M | 5 | google/gemma-4-12B-it, AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-NVFP4-FP8, AEON-7/Gemma-4-12B-it-AEON-Abliterated-K4-FP8, cyankiwi/gemma-4-12B-it-AWQ-INT4 and 1 more | #1194 |
+| 11 | new family spec | model_type deepseek_v41 | 6.47 M | 5 | deepseek-ai/DeepSeek-V4.1-Flash, nvidia/DeepSeek-V4.1-Flash-NVFP4, antirez/deepseek-v4.1-flash-gguf, deepseek-ai/DeepSeek-V4.1-Flash-1017 and 1 more | #1201 |
+| 12 | new family spec | model_type unlimited_ocr | 5.50 M | 1 | baidu/Unlimited-OCR | #1202 |
+| 13 | new family spec | model_type opt | 4.68 M | 1 | facebook/opt-125m | #1203 |
+| 14 | new family spec | model_type deepseek_v4 | 3.95 M | 9 | deepseek-ai/DeepSeek-V4-Flash, nvidia/DeepSeek-V4-Flash-NVFP4, huihui-ai/Huihui-DeepSeek-V4-Flash-abliterated-ds4-GGUF, deepseek-ai/DeepSeek-V4-Flash-0731 and 5 more | #1201 |
+| 15 | attention, block or MoE variant | GGUF tensor and metadata names for families that already load from safetensors | 3.42 M | 24 | webAI-Official/TwIL-LM3, llmfan46/Qwen3-Coder-Next-Uncensored-Heretic-GGUF, allenai/OLMo-2-0425-1B-GGUF, unsloth/DeepSeek-R1-GGUF and 20 more | #1204 |
+| 16 | new family spec | model_type spark2_5 | 3.30 M | 9 | XHToken/Spark-X2.5-4B-Base, XHToken/Spark-X2.5-4B-FP8, peculiar-ragdoll/Sharp-Spark-X2.5-4B-GGUF, XHToken/Spark-X2.6-4B and 5 more | #1209 |
+| 17 | new family spec | model_type lfm2_moe | 3.29 M | 6 | LiquidAI/LFM2.5-24B-A2B, primitive-ai/LFM2.5-24B-A2B-NVFP4A16, LiquidAI/LFM2.5-24B-A2B-FP8, cyankiwi/LFM2.5-24B-A2B-AWQ-INT4 and 2 more | #1205 |
+| 18 | quant format | compressed-tensors pack-quantized w4i-group weights | 2.84 M | 34 | TheUnderscore/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-W4A16-AWQ, drawais/SmolLM3-3B-AWQ-INT4, upshift/infomaniak-translategemma-4b-it-W4A16-awq, cyankiwi/Sage-A1.5-AWQ-INT4 and 30 more | #1200 |
+| 19 | new family spec | GGUF architecture dflash | 2.82 M | 2 | nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2, peasantsmith/GLM-5.3-Flash-Maya-GGUF | #1212 |
+| 20 | new family spec | model_type deepseek_v3 | 2.71 M | 7 | deepseek-ai/DeepSeek-R1, RedHatAI/DeepSeek-R1-NVFP4-FP8-BLOCK, QuixiAI/DeepSeek-R1-AWQ, OPEA/DeepSeek-R1-int4-gptq-sym-inc and 3 more | #1199 |
+| 21 | new family spec | model_type gpt_neox | 2.47 M | 4 | EleutherAI/pythia-160m, fbaldassarri/EleutherAI_pythia-160m-autoawq-int4-gs128-asym, fbaldassarri/EleutherAI_pythia-160m-autogptq-int4-gs128-sym, mradermacher/pythia-160m-i1-GGUF | #1203 |
+| 22 | new family spec | model_type moondream1 | 2.39 M | 1 | vikhyatk/moondream2 | #1208 |
+| 23 | new family spec | model_type inkling2_loop | 2.39 M | 3 | thinkingmachines/Inkling-2-Mini, OpenUncensored/Inkling-2-Mini-Uncensored, unsloth/Inkling-2-Mini-GGUF | #1210 |
+| 24 | new family spec | model_type smolvlm | 2.38 M | 1 | HuggingFaceTB/SmolVLM2-500M-Video-Instruct | #1208 |
+| 25 | new family spec | model_type internvl_chat | 2.28 M | 1 | OpenGVLab/InternVL2-1B | #1208 |
+| 26 | quant format | layer N mlp.gate_proj is in two groups | 1.98 M | 2 | unsloth/Qwen3.6-27B-NVFP4, unsloth/Qwen3.8-27B-NVFP4 | #1207 |
+| 27 | quant format | GGUF types | 1.84 M | 1 | prism-ml/Ternary-Bonsai-2-2B-gguf | #1213 |
+| 28 | new family spec | model_type deepseek_vl_v2 | 1.75 M | 1 | deepseek-ai/DeepSeek-OCR | #1202 |
+| 29 | new family spec | model_type inkling_mm_model | 1.74 M | 7 | thinkingmachines/Inkling, thinkingmachines/Inkling-NVFP4, RedHatAI/Inkling-FP8-dynamic, thinkingmachines/Inkling-Small and 3 more | #1210 |
+| 30 | attention, block or MoE variant | [mixer] is set but the pattern has no linear layer | 1.69 M | 3 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16, SergiioB/Nemotron-3.5-Lightning-30B-A3B-GPTQ-INT4-G64-sym, nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4 | #1206 |
+| 31 | new family spec | model_type qwen2_vl | 1.63 M | 7 | Qwen/Qwen2-VL-2B-Instruct, Qwen/Qwen2-VL-2B-Instruct-AWQ, Qwen/Qwen2-VL-2B-Instruct-GPTQ-Int4, ggml-org/Qwen2-VL-2B-Instruct-GGUF and 3 more | #1197 |
+| 32 | new family spec | model_type lfm3 | 1.58 M | 5 | LiquidAI/LFM3-1.7B, LiquidAI/LFM3-1.7B-NVFP4, LiquidAI/LFM3-1.7B-FP8, LiquidAI/LFM3-1.7B-GGUF and 1 more | #1205 |
+| 33 | new family spec | model_type minicpmv4_7 (wraps qwen3_5_moe_text, which specrt runs) | 1.55 M | 5 | openbmb/MiniCPM-V-4.7-35B-A3B, axteam/MiniCPM-V-4.7-35B-A3B-NVFP4A16, openbmb/MiniCPM-V-4.7-35B-A3B-FP8, openbmb/MiniCPM-V-4.7-35B-A3B-AWQ and 1 more | #1208 |
+| 34 | new family spec | model_type glm4_moe_lite | 1.51 M | 5 | zai-org/GLM-4.7-Flash, GadflyII/GLM-4.7-Flash-NVFP4, unsloth/GLM-4.7-Flash-FP8-Dynamic, cyankiwi/GLM-4.7-Flash-AWQ-4bit and 1 more | #1199 |
+| 35 | quant format | fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of N | 1.44 M | 7 | liodon-ai/SmolLM2-360M-FP8, RedHatAI/Qwen2.5-0.5B-FP8-dynamic, RedHatAI/Llama-3.2-1B-Instruct-FP8-dynamic, ArliAI/GLM-4.5-Air-Derestricted-FP8 and 3 more | #1207 |
+| 36 | attention, block or MoE variant | config.json has no num_hidden_layers | 1.31 M | 5 | cyankiwi/NVIDIA-Nemotron-3-Super-120B-A12B-AWQ-4bit, nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16, OpenYourMind/OpenYourMind-NVIDIA-Nemotron-3-Ultra-550B-A55B-abliterated-uncensored-NVFP4, RedHatAI/NVIDIA-Nemotron-3-Ultra-550B-A55B-FP8-dynamic and 1 more | #1206 |
+| 37 | new family spec | model_type k2_horizon | 1.30 M | 5 | IFM/K2-Horizon-7B, ProCreations/K2-Horizon-7B-Uno-NVFP4, IFM/K2-Horizon-7B-FP8, cyankiwi/K2-Horizon-7B-AWQ-INT4 and 1 more | #1211 |
+| 38 | quant format | gptq 4bit weights | 1.22 M | 33 | fbaldassarri/HuggingFaceTB_SmolLM2-360M-auto_gptq-int4-gs128-sym, Tech2wild/Nanbeige4.3-33B-W4A16-AutoRound, Qwen/Qwen2.5-0.5B-Instruct-GPTQ-Int4, Qwen/Qwen2.5-1.5B-Instruct-GPTQ-Int4 and 29 more | #1200 |
+| 39 | new family spec | model_type qwen3_vl_moe | 1.18 M | 6 | Qwen/Qwen3-VL-30B-A3B-Instruct, ig1/Qwen3-VL-30B-A3B-Instruct-NVFP4, Qwen/Qwen3-VL-30B-A3B-Instruct-FP8, QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ and 2 more | #1197 |
+| 40 | attention, block or MoE variant | config.json has no vocab_size | 1.07 M | 2 | gaunernst/gemma-3-12b-it-int4-awq, gaunernst/gemma-3-27b-it-int4-awq | #1213 |
+| 41 | new family spec | model_type gemma2 | 1.06 M | 5 | google/gemma-2-9b-it, RedHatAI/gemma-2-9b-it-FP8, hugging-quants/gemma-2-9b-it-AWQ-INT4, wath5/kgl_lmsys_pref_classif and 1 more | #1203 |
+| 42 | new family spec | model_type bloom | 0.92 M | 3 | bigscience/bloomz-560m, liodon-ai/bloomz-560m-FP8, mradermacher/bloomz-560m-GGUF | #1203 |
+| 43 | new family spec | model_type kimi_k3 | 0.90 M | 5 | moonshotai/Kimi-K3, nvidia/Kimi-K3-NVFP4, RedHatAI/Kimi-K3-FP8-BLOCK, open-inference/Kimi-K3-W4A8-K512-DenseChannel-GPTQ-Cal128-v2 and 1 more | #1214 |
+| 44 | quant format | quantisation declared only in hf_quant_config.json | 0.85 M | 2 | nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4, nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 | #1206 |
+| 45 | new family spec | model_type muse_glimmer | 0.79 M | 6 | meta-models/Muse-Glimmer-30B, RadixArk/Muse-Glimmer-NVFP4, RedHatAI/Muse-Glimmer-30B-FP8-block, cyankiwi/Muse-Glimmer-30B-AWQ-INT4 and 2 more |  |
+| 46 | new family spec | model_type nemotron_parse | 0.77 M | 1 | nvidia/NVIDIA-Nemotron-Parse-2.0 |  |
+| 47 | new family spec | model_type unlimited-ocr | 0.65 M | 6 | sahilchachra/Unlimited-OCR-NVFP4, shadowrock-io/Unlimited-OCR-Community-FP8-Dynamic, sahilchachra/Unlimited-OCR-AWQ, baidu/Unlimited-OCR-2 and 2 more | #1202 |
+| 48 | new family spec | model_type llava | 0.64 M | 1 | llava-hf/llava-1.5-7b-hf | #1208 |
+| 49 | new family spec | model_type mistral3 (wraps qwen3, which specrt runs) | 0.62 M | 2 | lightonai/LightOnOCR-2-1B, switzerchees/LightOnOCR-2-1B-NVFP4 | #1208 |
+| 50 | quant format | nvfp4_g16 is supported for [mlp] quant only | 0.62 M | 22 | Firworks/SmolLM3-3B-nvfp4, axteam/Nanbeige4.3-33B-NVFP4, ilessio-aiflowlab/Qwen2.5-Coder-14B-Instruct-NVFP4-anima, JongYeop/Qwen2.5-3B-Instruct-FP4-W4A4 and 18 more | #1207 |
+| 51 | new family spec | model_type kimi_k25 | 0.61 M | 3 | moonshotai/Kimi-K2.5, nvidia/Kimi-K2.5-NVFP4, amd/Kimi-K2.5-MXFP4-AttnFP8 | #1199 |
+| 52 | new family spec | model_type bailing_hybrid | 0.47 M | 3 | inclusionAI/Ling-3.0-tiny, inclusionAI/LingSante-3.1-flash, inclusionAI/LingSante-3.1-flash-MXFP4 |  |
+| 53 | new family spec | GGUF architecture glm-dsa | 0.36 M | 4 | unsloth/GLM-5-GGUF, unsloth/GLM-5.2-GGUF, unsloth/GLM-5.3-GGUF, AesSedai/GLM-5.3-GGUF |  |
+| 54 | quant format | the quantisation config covers no attention projection | 0.26 M | 1 | nvidia/GLM-5.3-NVFP4 |  |
+| 55 | new family spec | GGUF architecture bailingmoe3 | 0.24 M | 1 | bloomer010/Ling-3.0-tiny-GGUF |  |
+| 56 | new family spec | model_type gemma3n | 0.24 M | 4 | google/gemma-3n-E2B-it, RedHatAI/gemma-3n-E2B-it-FP8-dynamic, unsloth/gemma-3n-E2B-it-GGUF, google/gemma-3n-E4B-it | #1214 |
+| 57 | quant format | compressed-tensors naive-quantized w8f-tensor a8 weights | 0.21 M | 2 | RedHatAI/Meta-Llama-3.1-70B-Instruct-FP8, RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8 |  |
+| 58 | new family spec | model_type llada | 0.11 M | 5 | GSAI-ML/LLaDA-1.5, mradermacher/LLaDA-1.5-GGUF, GSAI-ML/LLaDA-8B-Instruct, FunAGI/LLaDA-8B-Instruct-gptqmodel-4bit and 1 more | #1214 |
+| 59 | new family spec | model_type nemotron_h_puzzle | 0.11 M | 2 | nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-NVFP4, nvidia/NVIDIA-Nemotron-Labs-3-Puzzle-75B-A9B-FP8 |  |
+| 60 | new family spec | model_type lfm3_omni | 0.10 M | 2 | LiquidAI/LFM3-Omni-2B, MichaelAnthony/LFM3-Omni-2B-98K-V2-FP8 |  |
+| 61 | new family spec | model_type kimi_k31 | 0.09 M | 4 | moonshotai/Kimi-K3.1-Pro, nvidia/Kimi-K3.1-Pro-NVFP4, manifoldlabs/Kimi-K3.1-Pro-Quark-MXFP4-AttnFP8, KarLexAI/Kimi-K3.1-Pro-GGUF | #1214 |
+| 62 | new family spec | model_type olala | 0.08 M | 3 | OVHaiLLM/Olala-v1.0-mini-7A1B, solfird/Olala-v1.0-mini-7A1B-NVFP4-experts, OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF |  |
+| 63 | quant format | modelopt_mixed weights | 0.07 M | 1 | nvidia/Qwen3.5-397B-A17B-NVFP4-V2 |  |
+| 64 | quant format | gptq 8bit weights | 0.05 M | 5 | Qwen/Qwen3-0.6B-GPTQ-Int8, Qwen/Qwen3-1.7B-GPTQ-Int8, JunHowie/Qwen3-4B-Instruct-2507-GPTQ-Int8, QuantTrio/Qwen3-Coder-30B-A3B-Instruct-GPTQ-Int8 and 1 more |  |
+| 65 | quant format | mixture-of-experts with Fp8Channel expert weights is not supported yet (bf16, nvfp4_g16 and fp8_block128 are) | 0.05 M | 4 | InternScience/Sage-A1.5-FP8, debackerl/KAT-Coder-V2.5-Dev-FP8, RedHatAI/Qwen3-Coder-Next-FP8-dynamic, lflare/Ornith-1.0-35B-FP8 | #1207 |
+| 66 | new family spec | GGUF architecture inkling | 0.05 M | 2 | unsloth/inkling-GGUF, unsloth/Inkling-Small-GGUF |  |
+| 67 | quant format | the quantisation config has no groups | 0.03 M | 1 | nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark |  |
+| 68 | new family spec | model_type raon1_nano | 0.02 M | 3 | KRAFTON/Raon-1-nano, Pilcothink/Raon-1-nano-NVFP4, KRAFTON/Raon-1-nano-gguf |  |
+| 69 | quant format | compressed-tensors float-quantized w8f-tensor a8 weights | 0.02 M | 2 | RedHatAI/Llama-3.2-1B-FP8, JongYeop/Mistral-7B-Instruct-v0.2-FP8-W8A8 |  |
+| 70 | new family spec | model_type maxwell_moe | 0.02 M | 3 | maxwell-model/Maxwell-V1-Flash, maxwell-model/Maxwell-V1-Flash-FP8, AtomicChat/Maxwell-V1-Flash-GGUF |  |
+| 71 | quant format | nvfp4_g16 needs hidden and intermediate to be multiples of N | 0.02 M | 2 | NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4, Firworks/GLM-4.5-Air-nvfp4 |  |
+| 72 | new family spec | GGUF architecture unlimited-ocr2 | 0.02 M | 1 | AtomicChat/Unlimited-OCR-2-GGUF |  |
+| 73 | new family spec | GGUF architecture deepseek2-ocr | 0.01 M | 2 | sahilchachra/Unlimited-OCR-GGUF, sabafallah/DeepSeek-OCR-GGUF |  |
+| 74 | quant format | gptq 2bit weights | 0.01 M | 1 | lilmeaty/SmolLM2-135M-Instruct-GPTQ |  |
+| 75 | new family spec | GGUF architecture phi2 | 0.01 M | 1 | ggml-org/moondream2-20250414-GGUF |  |
+| 76 | new family spec | model_type ernie5_5_moe | 0.01 M | 2 | baidu/ERNIE-5.5-Flash-Preview-BF16, baidu/ERNIE-5.5-Flash-Base |  |
+| 77 | new family spec | model_type aion_instruct | 0.00 M | 2 | microsoft/Aion-1.0-Instruct-2.3B, PureTensorAI/Aion-1.0-Instruct-2.3B-NVFP4 |  |
+| 78 | quant format | quark weights | 0.00 M | 3 | amd/gpt-oss-120b-w-mxfp4-a-fp8, amd/gpt-oss-20b-MoE-Quant-W-MXFP4-A-FP8-KV-FP8, amd/GLM-5-NVFP4 |  |
+| 79 | new family spec | model_type sarvam_mla | 0.00 M | 4 | sarvamai/sarvam-105b, sarvamai/sarvam-105b-1711, RedHatAI/sarvam-105b-FP8-dynamic, QuantTrio/sarvam-105b-AWQ |  |
+| 80 | new family spec | GGUF architecture aion | 0.00 M | 1 | Xylolabs/Aion-1.0-Instruct-2.3B-GGUF |  |
+| 81 | quant format | modelopt FP8_PB_WO+FP8_PER_CHANNEL_PER_TOKEN+MIXED_PRECISION+W4A16_NVFP4 weights | 0.00 M | 1 | dealignai/Ornith-1.5-122B-UNCENSORED-NVFP4 |  |
+| 82 | new family spec | model_type grug_moe | 0.00 M | 1 | open-athena/Marin-Mochi-535B-A23B |  |
+| 83 | quant format | fp8 e4m3 block None weights | 0.00 M | 2 | EliovpAI/Deepseek-R1-0528-Qwen3-8B-FP8-KV, RedHatAI/Meta-Llama-3-8B-Instruct-FP8-KV |  |
+| 84 | new family spec | model_type aurora2 | 0.00 M | 1 | AuroraAI-Research/Aurora2-400M-A20M |  |
+| 85 | quant format | compressed-tensors float-quantized w8f-block a8 weights | 0.00 M | 1 | Nanbeige/Nanbeige4.3-33B-FP8 |  |
+| 86 | attention, block or MoE variant | config.json has no num_attention_heads | 0.00 M | 1 | gaunernst/gemma-3-4b-it-int4-awq | #1213 |
+| 87 | quant format | w4afp8 weights | 0.00 M | 2 | PhalaCloud/GLM-5.3-W4AFP8, BitdeerAI/GLM-5.3-W4AFP8-AWQ |  |
+| 88 | new family spec | model_type philolm | 0.00 M | 1 | gustavecortal/PhiloLM |  |
+| 89 | quant format | layer N mlp.experts is in two groups | 0.00 M | 1 | kvallespin/Sage-A1.5-NVFP4 |  |
+| 90 | quant format | compressed-tensors pack-quantized w4i-channel, pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 2 | nchapman/Ornith-1.5-35B-A3B-W4A16-HGPTQ, nchapman/Ornith-1.5-9B-W4A16-HGPTQ | #1200 |
+| 91 | quant format | compressed-tensors float-quantized w8f-tensor a8, nvfp4-pack-quantized w4f-tensor_group a4 weights | 0.00 M | 1 | primitive-ai/Ornith-1.5-35B-A3B-agentic-NVFP4-FP8 |  |
+| 92 | quant format | compressed-tensors pack-quantized w8i-group weights | 0.00 M | 1 | axteam/MiniCPM5-2B-AWQ-8bit |  |
+| 93 | quant format | dgpp_mixed346 weights | 0.00 M | 1 | HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128 |  |
+| 94 | new family spec | GGUF architecture kolibri1 | 0.00 M | 1 | Harsha001/Kolibri-1.1-ROCmFPX |  |
+| 95 | quant format | pretensor_nvfp4_weight_only weights | 0.00 M | 1 | PreDoctor/DeepSeek-R1-0528-Qwen3-8B-NVFP4-W4A16-PreTensor |  |
+| 96 | quant format | torchao weights | 0.00 M | 1 | pytorch/Phi-4-mini-instruct-AWQ-INT4 |  |
+| 97 | quant format | gptq_marlin weights | 0.00 M | 1 | QuantTrio/GLM-4.5-Air-GPTQ-Int4-Int8Mix |  |
+| 98 | quant format | compressed-tensors pack-quantized w4i-group, pack-quantized w8i-group weights | 0.00 M | 1 | bot-lab-21/GLM-5.3-Int4-Int8Mix-Pollard-GPTQ | #1200 |
+| 99 | attention, block or MoE variant | model_type  is not supported | 0.00 M | 1 | amd/Phi-3-mini-4k-instruct-awq-g128-int4-asym-fp16-onnx-hybrid |  |
+| 100 | quant format | bitsandbytes 4bit weights | 0.00 M | 1 | rautaditya/llama-3.2-1b-4bit-gptq |  |
+| 101 | new family spec | model_type kolibri1_1 | 0.00 M | 1 | Aleph-Alpha/Kolibri-1.1 |  |
 
 ## Quantisation formats in the safetensors indexes
 
@@ -217,8 +215,8 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 
 | model | role | downloads | size GB | arch | quant | class | why | family | tiny fixture | chat template | issue |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| Qwen/Qwen3.8-27B | base | 6185088 | 55.6 | qwen3_5 | none | LOADS | 64 layers (full+linear), hidden 5120, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | fails: chat template: syntax error: unknown statement generation (in chat:117) | #1193 |
-| Qwen/Qwen3.8-27B-FP8 | fp8 | 6781903 | 30.9 | qwen3_5 | fp8 e4m3 block [128, 128] | LOADS | 64 layers (full+linear), hidden 5120, mtp, vision, fp8_block128 | `family-qwen3_5.toml` | yes | fails: chat template: syntax error: unknown statement generation (in chat:117) | #1193 |
+| Qwen/Qwen3.8-27B | base | 6185088 | 55.6 | qwen3_5 | none | LOADS | 64 layers (full+linear), hidden 5120, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
+| Qwen/Qwen3.8-27B-FP8 | fp8 | 6781903 | 30.9 | qwen3_5 | fp8 e4m3 block [128, 128] | LOADS | 64 layers (full+linear), hidden 5120, mtp, vision, fp8_block128 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16 | gptq | 141974 | 19.6 | qwen3_5 | gptq 4bit g128 | UNKNOWN-QUANT | quantization {"bits":4,"checkpoint_format":"gptq","desc_act":false,"dynamic":{"-:.*mtp.*":{}},"format":"gptq","group_size":128,"lm_head":false,"meta":{"act_group_aware":true,"auto_forward_data_parallel":true,"damp_auto_i... | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
 | Solstice-AI/Qwen3.8-27B-TTURBO-Cold-Fusion-709-L-Uncensored-UltraOptimised-VariableThinking-1M | disk | 856 | 0.9 | clip | gguf | UNCHECKED | the hub reports the vision projector's architecture (clip), not the model's |  |  | in the GGUF |  |
 | cyankiwi/Qwen3.8-27B-AWQ-INT4 | awq | 861620 | 21 | qwen3_5 | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (64 layers (full+linear), hidden 5120, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
@@ -235,9 +233,9 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | Qwen/Qwen3.8-Flash-Next-FP8 (config from unsloth/Qwen3.8-Flash-Next-FP8) | fp8 | 355138 | 185.5 | qwen4_exp | fp8 e4m3 block [128, 128] | REFUSED | model_type qwen4_exp is not supported |  |  | ok, tools XmlFunction | #1196 |
 | RadixArk/Qwen3.8-Flash-Next-NVFP4 | nvfp4 | 215858 | 135.2 | qwen4_exp | modelopt NVFP4 | REFUSED | model_type qwen4_exp is not supported |  |  | ok, tools XmlFunction | #1196 |
 | tcclaviger/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ | gptq | 6542 | 118.8 | qwen4_exp | compressed-tensors mxfp4-pack-quantized w4f-group-g32, mxfp4-pack-quantized w8f-block a8 | REFUSED | model_type qwen4_exp is not supported |  |  | ok, tools XmlFunction | #1196 |
-| Qwen/Qwen3.6-35B-A3B | base | 3448033 | 71.9 | qwen3_5_moe | none | LOADS | 40 layers (full+linear), hidden 2048, 256 experts top 8, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | fails: chat template: syntax error: unknown statement generation (in chat:101) | #1193 |
+| Qwen/Qwen3.6-35B-A3B | base | 3448033 | 71.9 | qwen3_5_moe | none | LOADS | 40 layers (full+linear), hidden 2048, 256 experts top 8, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | QuantTrio/Qwen3.6-35B-A3B-AWQ | awq | 177214 | 25.4 | qwen3_5_moe | awq 4bit g128 | UNKNOWN-QUANT | quantization {"quant_method":"awq","bits":4,"group_size":128,"version":"gemm","zero_point":true,"modules_to_not_convert":["visual","linear_attn","self_attn","shared_expert","mlp.gate","model.layers.0.","mtp"]} is not sup... | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
-| Qwen/Qwen3.6-35B-A3B-FP8 | fp8 | 3031059 | 37.5 | qwen3_5_moe | fp8 e4m3 block [128, 128] | LOADS | 40 layers (full+linear), hidden 2048, 256 experts top 8, mtp, vision, fp8_block128 | `family-qwen3_5.toml` | yes | fails: chat template: syntax error: unknown statement generation (in chat:101) | #1193 |
+| Qwen/Qwen3.6-35B-A3B-FP8 | fp8 | 3031059 | 37.5 | qwen3_5_moe | fp8 e4m3 block [128, 128] | LOADS | 40 layers (full+linear), hidden 2048, 256 experts top 8, mtp, vision, fp8_block128 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | huihui-ai/Huihui-Qwen3.6-35B-A3B-abliterated-MTP-GGUF | gguf | 4701153 | 71.1 | qwen35moe | gguf | LOADS | GGUF qwen35moe; reads F16 Q4_K Q5_K Q6_K Q8_0; not Q2_K Q3_K | `family-qwen3_5.toml` | yes | in the GGUF |  |
 | nvidia/Qwen3.6-35B-A3B-NVFP4 | nvfp4 | 3770795 | 23.4 | qwen3_5_moe | modelopt FP8+MIXED_PRECISION+W4A16_NVFP4 | LOADS | 40 layers (full+linear), hidden 2048, 256 experts top 8, mtp, vision, nvfp4_g16 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | palmfuture/Qwen3.6-35B-A3B-GPTQ-Int4 | gptq | 86385 | 24.4 | qwen3_5_moe | gptq 4bit g128 | UNKNOWN-QUANT | quantization {"bits":4,"checkpoint_format":"gptq","desc_act":false,"dynamic":{"-:.*attn.*":{},"-:.*mlp\\.gate$":{},"-:.*mtp.*":{},"-:.*shared_expert.*":{},"-:.*visual.*":{},"lm_head":{},"model.language_model.embed_tokens... | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
@@ -291,9 +289,9 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | QuantTrio/DeepSeek-V3.2-AWQ | awq | 252 | 361.9 | deepseek_v32 | awq 4bit g128 | REFUSED | model_type deepseek_v32 is not supported |  |  | ok, tools Unparsed | #1199 |
 | RedHatAI/DeepSeek-V3.2-NVFP4-FP8-BLOCK | nvfp4 | 219 | 386.1 | deepseek_v32 | compressed-tensors float-quantized w8f-block a8, nvfp4-pack-quantized w4f-tensor_group-g16 a4 | REFUSED | model_type deepseek_v32 is not supported |  |  | ok, tools None | #1199 |
 | unsloth/DeepSeek-V3.2-GGUF | gguf | 22505 | 161.3 | deepseek2 | gguf | REFUSED | GGUF architecture deepseek2 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1204 |
-| Qwen/Qwen3.6-27B | base | 2324489 | 55.6 | qwen3_5 | none | LOADS | 64 layers (full+linear), hidden 5120, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | fails: chat template: syntax error: unknown statement generation (in chat:101) | #1193 |
+| Qwen/Qwen3.6-27B | base | 2324489 | 55.6 | qwen3_5 | none | LOADS | 64 layers (full+linear), hidden 5120, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | DavidAU/Qwen3.6-27B-Fable-Fusion-711-Uncensored-Heretic-NM-DAU-NEO-MAX-MTP-GGUF | gguf | 265356 | 11.7 | qwen35 | gguf | LOADS | GGUF qwen35; reads IQ2_M IQ3_M IQ4_NL IQ4_XS Q4_K_M Q4_K_S Q5_K_M Q5_K_S Q6_K Q8_0 | `family-qwen3_5.toml` | yes | in the GGUF |  |
-| Qwen/Qwen3.6-27B-FP8 | fp8 | 1109783 | 30.9 | qwen3_5 | fp8 e4m3 block [128, 128] | LOADS | 64 layers (full+linear), hidden 5120, mtp, vision, fp8_block128 | `family-qwen3_5.toml` | yes | fails: chat template: syntax error: unknown statement generation (in chat:101) | #1193 |
+| Qwen/Qwen3.6-27B-FP8 | fp8 | 1109783 | 30.9 | qwen3_5 | fp8 e4m3 block [128, 128] | LOADS | 64 layers (full+linear), hidden 5120, mtp, vision, fp8_block128 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | btbtyler09/Qwen3.6-27B-GPTQ-4bit | gptq | 47657 | 21.9 | qwen3_5 | gptq 4bit g32 | UNKNOWN-QUANT | quantization {"bits":4,"checkpoint_format":"gptq","desc_act":false,"format":"gptq","group_size":32,"lm_head":false,"meta":{"act_group_aware":true,"auto_forward_data_parallel":false,"damp_auto_increment":0.01,"damp_percen... | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
 | cyankiwi/Qwen3.6-27B-AWQ-INT4 | awq | 299167 | 0.3 | qwen3_5 | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (64 layers (full+linear), hidden 5120, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
 | unsloth/Qwen3.6-27B-NVFP4 | nvfp4 | 224711 | 23.4 | qwen3_5 | compressed-tensors float-quantized w8f-channel a8, nvfp4-pack-quantized w4f-tensor_group-g16 a4 | UNKNOWN-QUANT | layer 56 mlp.gate_proj is in two groups (64 layers (full+linear), hidden 5120, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1207 |
@@ -309,11 +307,11 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | cosmicproc/Qwen3.5-4B-NVFP4 | nvfp4 | 84218 | 3.3 | qwen3_5 | modelopt NVFP4 | UNKNOWN-QUANT | nvfp4_g16 is supported for [mlp] quant only (32 layers (full+linear), hidden 2560, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1207 |
 | cyankiwi/Qwen3.5-4B-AWQ-4bit | awq | 144699 | 16.7 | qwen3_5 | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (32 layers (full+linear), hidden 2560, mtp, bf16) | `family-qwen3_5.toml` |  | ok, tools XmlFunction | #1200 |
 | unsloth/Qwen3.5-4B-GGUF | gguf | 1682471 | 8.4 | qwen35 | gguf | LOADS | GGUF qwen35; reads BF16 IQ2_M IQ2_XXS IQ3_XXS IQ4_NL IQ4_XS Q4_0 Q4_K_M Q4_K_S Q4_K_XL Q5_K_M Q5_K_S Q5_K_XL Q6_K Q6_K_XL Q8_0; not Q2_K_XL Q3_K_M Q3_K_S Q3_K_XL Q4_1 Q8_K_XL | `family-qwen3_5.toml` | yes | in the GGUF |  |
-| zai-org/GLM-5.3-Flash | base | 6383668 | 328.3 | glm5_next | fp8 e4m3 block [128, 128] | REFUSED | model_type glm5_next is not supported |  |  | fails: chat template: syntax error: unknown statement break (in chat:118) | #1179 |
-| Piecrust/GLM-5.3-Flash-FP4-Abliterated | disk | 451 | 177.4 | glm5_next | modelopt FP8_PB_WO+MIXED_PRECISION+MXFP8+NVFP4+W4A16_NVFP4 | REFUSED | model_type glm5_next is not supported |  |  | fails: chat template: syntax error: unknown statement break (in chat:118) | #1179 |
+| zai-org/GLM-5.3-Flash | base | 6383668 | 328.3 | glm5_next | fp8 e4m3 block [128, 128] | REFUSED | model_type glm5_next is not supported |  |  | ok, tools KeyValueXml | #1179 |
+| Piecrust/GLM-5.3-Flash-FP4-Abliterated | disk | 451 | 177.4 | glm5_next | modelopt FP8_PB_WO+MIXED_PRECISION+MXFP8+NVFP4+W4A16_NVFP4 | REFUSED | model_type glm5_next is not supported |  |  | ok, tools KeyValueXml | #1179 |
 | peasantsmith/GLM-5.3-Flash-Maya-GGUF | gguf | 1933129 | 0.7 | dflash | gguf | REFUSED | GGUF architecture dflash is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1212 |
-| tattrongvu/GLM-5.3-Flash-NVFP4 | nvfp4 | 110586 | 194.6 | glm5_next | modelopt NVFP4 | REFUSED | model_type glm5_next is not supported |  |  | fails: chat template: syntax error: unknown statement break (in chat:118) | #1179 |
-| wtdcode/GLM-5.3-Flash-AWQ-W4A16 | awq | 2490 | 190.8 | glm5_next | compressed-tensors pack-quantized w4i-group-g128 | REFUSED | model_type glm5_next is not supported |  |  | fails: chat template: syntax error: unknown statement break (in chat:118) | #1179 |
+| tattrongvu/GLM-5.3-Flash-NVFP4 | nvfp4 | 110586 | 194.6 | glm5_next | modelopt NVFP4 | REFUSED | model_type glm5_next is not supported |  |  | ok, tools KeyValueXml | #1179 |
+| wtdcode/GLM-5.3-Flash-AWQ-W4A16 | awq | 2490 | 190.8 | glm5_next | compressed-tensors pack-quantized w4i-group-g128 | REFUSED | model_type glm5_next is not supported |  |  | ok, tools KeyValueXml | #1179 |
 | Qwen/Qwen3-VL-8B-Instruct | base | 5432237 | 17.5 | qwen3_vl | none | REFUSED | model_type qwen3_vl is not supported |  |  | ok, tools Hermes | #1197 |
 | Qwen/Qwen3-VL-8B-Instruct-FP8 | fp8 | 1156671 | 10.6 | qwen3_vl | fp8 e4m3 block [128, 128] | REFUSED | model_type qwen3_vl is not supported |  |  | ok, tools Hermes | #1197 |
 | Qwen/Qwen3-VL-8B-Instruct-GGUF | gguf | 2452776 | 16.4 | qwen3vl | gguf | REFUSED | GGUF architecture qwen3vl is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1197 |
@@ -433,12 +431,12 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | Qwen/Qwen3-VL-4B-Instruct-FP8 | fp8 | 165325 | 6 | qwen3_vl | fp8 e4m3 block [128, 128] | REFUSED | model_type qwen3_vl is not supported |  |  | ok, tools Hermes | #1197 |
 | Qwen/Qwen3-VL-4B-Instruct-GGUF | gguf | 620070 | 8.1 | qwen3vl | gguf | REFUSED | GGUF architecture qwen3vl is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1197 |
 | cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit | awq | 40257 | 16.9 | qwen3_vl | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type qwen3_vl is not supported |  |  | ok, tools Hermes | #1197 |
-| LiquidAI/LFM2.5-24B-A2B | base | 26894 | 47.9 | lfm2_moe | none | REFUSED | model_type lfm2_moe is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:86) | #1205 |
+| LiquidAI/LFM2.5-24B-A2B | base | 26894 | 47.9 | lfm2_moe | none | REFUSED | model_type lfm2_moe is not supported |  |  | ok, tools Unparsed | #1205 |
 | DavidAU/LFM2.5-24B-A2B-Turbo-Brilliance-50X-NEO-MAX-Imatrix-GGUF | gguf | 1379630 | 20 | lfm2moe | gguf | REFUSED | GGUF architecture lfm2moe is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1205 |
-| LiquidAI/LFM2.5-24B-A2B-FP8 | fp8 | 2531 | 24.7 | lfm2_moe | compressed-tensors float-quantized w8f-block a8 | REFUSED | model_type lfm2_moe is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:86) | #1205 |
-| aiprimebuilds/LFM2.5-24B-A2B-GPTQ | gptq | 339 | 14.4 | lfm2_moe | gptq 4bit g32 | REFUSED | model_type lfm2_moe is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:86) | #1205 |
-| cyankiwi/LFM2.5-24B-A2B-AWQ-INT4 | awq | 731 | 15.2 | lfm2_moe | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type lfm2_moe is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:86) | #1205 |
-| primitive-ai/LFM2.5-24B-A2B-NVFP4A16 | nvfp4 | 169 | 15 | lfm2_moe | compressed-tensors nvfp4-pack-quantized w4f-tensor_group-g16 | REFUSED | model_type lfm2_moe is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:86) | #1205 |
+| LiquidAI/LFM2.5-24B-A2B-FP8 | fp8 | 2531 | 24.7 | lfm2_moe | compressed-tensors float-quantized w8f-block a8 | REFUSED | model_type lfm2_moe is not supported |  |  | ok, tools Unparsed | #1205 |
+| aiprimebuilds/LFM2.5-24B-A2B-GPTQ | gptq | 339 | 14.4 | lfm2_moe | gptq 4bit g32 | REFUSED | model_type lfm2_moe is not supported |  |  | ok, tools Unparsed | #1205 |
+| cyankiwi/LFM2.5-24B-A2B-AWQ-INT4 | awq | 731 | 15.2 | lfm2_moe | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type lfm2_moe is not supported |  |  | ok, tools Unparsed | #1205 |
+| primitive-ai/LFM2.5-24B-A2B-NVFP4A16 | nvfp4 | 169 | 15 | lfm2_moe | compressed-tensors nvfp4-pack-quantized w4f-tensor_group-g16 | REFUSED | model_type lfm2_moe is not supported |  |  | ok, tools Unparsed | #1205 |
 | Qwen/Qwen3-Coder-30B-A3B-Instruct | base | 1951394 | 61.1 | qwen3_moe | none | LOADS | 48 layers (dense), hidden 2048, 128 experts top 8, bf16 | `family-qwen3.toml` | yes | ok, tools XmlFunction |  |
 | NVFP4/Qwen3-Coder-30B-A3B-Instruct-FP4 | nvfp4 | 17318 | 18.1 | qwen3_moe | modelopt NVFP4 | UNKNOWN-QUANT | nvfp4_g16 needs hidden and intermediate to be multiples of 256 (48 layers (dense), hidden 2048, 128 experts top 8, bf16) | `family-qwen3.toml` |  | ok, tools XmlFunction |  |
 | QuantTrio/Qwen3-Coder-30B-A3B-Instruct-GPTQ-Int8 | gptq | 46438 | 32 | qwen3_moe | gptq 8bit g128 | UNKNOWN-QUANT | quantization {"quant_method":"gptq","bits":8,"group_size":128,"sym":true,"desc_act":false,"dynamic":{"-:model[.]layers[.]\\d+[.]mlp.gate*":{}}} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nv... | `family-qwen3.toml` |  | ok, tools XmlFunction |  |
@@ -479,8 +477,8 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | liodon-ai/SmolLM2-360M-FP8 | fp8 | 15 | 0.4 | llama | compressed-tensors float-quantized w8f-channel a8 | UNKNOWN-QUANT | fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of 128 (32 layers (dense), hidden 960, bf16) | `family-llama.toml` |  | no template | #1207 |
 | vikhyatk/moondream2 | base | 2391895 | 3.9 | moondream1 | none | REFUSED | model_type moondream1 is not supported |  |  | no template | #1208 |
 | ggml-org/moondream2-20250414-GGUF | gguf | 8304 | 2.8 | phi2 | gguf | REFUSED | GGUF architecture phi2 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF |  |
-| thinkingmachines/Inkling-2-Mini | base | 41888 | 19.5 | inkling2_loop | modelopt NVFP4 | REFUSED | model_type inkling2_loop is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:129) | #1210 |
-| OpenUncensored/Inkling-2-Mini-Uncensored | nvfp4 | 3066 | 19.5 | inkling2_loop | modelopt NVFP4 | REFUSED | model_type inkling2_loop is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:129) | #1210 |
+| thinkingmachines/Inkling-2-Mini | base | 41888 | 19.5 | inkling2_loop | modelopt NVFP4 | REFUSED | model_type inkling2_loop is not supported |  |  | ok, tools Unparsed | #1210 |
+| OpenUncensored/Inkling-2-Mini-Uncensored | nvfp4 | 3066 | 19.5 | inkling2_loop | modelopt NVFP4 | REFUSED | model_type inkling2_loop is not supported |  |  | ok, tools Unparsed | #1210 |
 | unsloth/Inkling-2-Mini-GGUF | gguf | 1292888 | 8 | inkling2_loop | gguf | REFUSED | GGUF architecture inkling2_loop is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1210 |
 | DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP | base | 3697 | 19.2 | qwen3_5 | none | LOADS | 32 layers (full+linear), hidden 4096, mtp, vision, bf16 | `family-qwen3_5.toml` | yes | ok, tools XmlFunction |  |
 | DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF | gguf | 2285682 | 4.9 | qwen35 | gguf | LOADS | GGUF qwen35; reads IQ2_M IQ3_M IQ4_NL IQ4_XS Q4_K_M Q4_K_S Q5_K_M Q5_K_S Q6_K Q8_0 | `family-qwen3_5.toml` | yes | in the GGUF |  |
@@ -508,10 +506,10 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | XHToken/Spark-X2.5-4B-Base | base | 396 | 8.2 | spark2_5 | none | REFUSED | model_type spark2_5 is not supported |  |  | ok, tools KeyValueXml | #1209 |
 | XHToken/Spark-X2.5-4B-FP8 | fp8 | 146 | 8.2 | spark2_5 | fp8 e4m3 block [128, 128] | REFUSED | model_type spark2_5 is not supported |  |  | ok, tools KeyValueXml | #1209 |
 | peculiar-ragdoll/Sharp-Spark-X2.5-4B-GGUF | gguf | 891852 | 2.7 | spark2_5 | gguf | REFUSED | GGUF architecture spark2_5 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1209 |
-| zai-org/GLM-5.3 | base | 1262104 | 755.6 | glm_moe_dsa | fp8 e4m3 block [128, 128] | UNKNOWN-QUANT | fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of 128 (78 layers (full+shared), hidden 6144, 256 experts top 8, bf16) | `family-glm_moe_dsa.toml` |  | fails: chat template: syntax error: unknown statement break (in chat:112) | #1207 |
-| bot-lab-21/GLM-5.3-Int4-Int8Mix-Pollard-GPTQ | gptq | 73 | 396.9 | glm_moe_dsa | compressed-tensors pack-quantized w4i-group-g128, pack-quantized w8i-group-g128 | UNKNOWN-QUANT | compressed-tensors group w4a16_experts is not supported (fp8 per-channel and nvfp4 group 16 are) (78 layers (full+shared), hidden 6144, 256 experts top 8, bf16) | `family-glm_moe_dsa.toml` |  | fails: chat template: syntax error: unknown statement break (in chat:112) | #1200 |
-| cyankiwi/GLM-5.3-AWQ-INT4 | awq | 401 | 488.1 | glm_moe_dsa | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (78 layers (full+shared), hidden 6144, 256 experts top 8, bf16) | `family-glm_moe_dsa.toml` |  | fails: chat template: syntax error: unknown statement break (in chat:112) | #1200 |
-| nvidia/GLM-5.3-NVFP4 | nvfp4 | 257086 | 464.1 | glm_moe_dsa | modelopt FP8+MIXED_PRECISION+NVFP4 | UNKNOWN-QUANT | the quantisation config covers no attention projection (78 layers (full+shared), hidden 6144, 256 experts top 8, bf16) | `family-glm_moe_dsa.toml` |  | fails: chat template: syntax error: unknown statement break (in chat:112) |  |
+| zai-org/GLM-5.3 | base | 1262104 | 755.6 | glm_moe_dsa | fp8 e4m3 block [128, 128] | UNKNOWN-QUANT | fp8 weights need hidden, intermediate, head_dim and the linear value dim to be multiples of 128 (78 layers (full+shared), hidden 6144, 256 experts top 8, bf16) | `family-glm_moe_dsa.toml` |  | ok, tools KeyValueXml | #1207 |
+| bot-lab-21/GLM-5.3-Int4-Int8Mix-Pollard-GPTQ | gptq | 73 | 396.9 | glm_moe_dsa | compressed-tensors pack-quantized w4i-group-g128, pack-quantized w8i-group-g128 | UNKNOWN-QUANT | compressed-tensors group w4a16_experts is not supported (fp8 per-channel and nvfp4 group 16 are) (78 layers (full+shared), hidden 6144, 256 experts top 8, bf16) | `family-glm_moe_dsa.toml` |  | ok, tools KeyValueXml | #1200 |
+| cyankiwi/GLM-5.3-AWQ-INT4 | awq | 401 | 488.1 | glm_moe_dsa | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (78 layers (full+shared), hidden 6144, 256 experts top 8, bf16) | `family-glm_moe_dsa.toml` |  | ok, tools KeyValueXml | #1200 |
+| nvidia/GLM-5.3-NVFP4 | nvfp4 | 257086 | 464.1 | glm_moe_dsa | modelopt FP8+MIXED_PRECISION+NVFP4 | UNKNOWN-QUANT | the quantisation config covers no attention projection (78 layers (full+shared), hidden 6144, 256 experts top 8, bf16) | `family-glm_moe_dsa.toml` |  | ok, tools KeyValueXml |  |
 | unsloth/GLM-5.3-GGUF | gguf | 332949 | 1508 | glm-dsa | gguf | REFUSED | GGUF architecture glm-dsa is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF |  |
 | ornith-ai/Ornith-1.0-9B-GGUF | base | 1961809 | 17.9 | qwen35 | gguf | LOADS | GGUF qwen35; reads BF16 Q4_K_M Q5_K_M Q6_K Q8_0 | `family-qwen3_5.toml` | yes | in the GGUF |  |
 | deepseek-ai/DeepSeek-V4.1-Flash | base | 1217500 | 510.3 | deepseek_v41 | fp8 e4m3 block [32, 32] | REFUSED | model_type deepseek_v41 is not supported |  |  | ok, tools Unparsed | #1201 |
@@ -603,17 +601,17 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | RedHatAI/gemma-3-27b-it-FP8-dynamic | fp8 | 63101 | 29.3 | gemma3 | compressed-tensors float-quantized w8f-channel a8 | LOADS | 62 layers (full+sliding), hidden 5376, vision, fp8_channel | `family-gemma3.toml` | yes | ok, tools None |  |
 | gaunernst/gemma-3-27b-it-int4-awq | awq | 958482 | 18.7 | gemma3 | awq 4bit g32 | REFUSED | config.json has no vocab_size | `family-gemma3.toml` |  | ok, tools None | #1213 |
 | unsloth/gemma-3-27b-it-GGUF | gguf | 55908 | 15.6 | gemma3 | gguf | REFUSED | GGUF architecture gemma3 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) | `family-gemma3.toml` |  | in the GGUF | #1204 |
-| zai-org/GLM-5.3-BF16 | base | 40699 | 1506.7 | glm_moe_dsa | none | TOO-BIG | 1506.7 GB of weights needs 18 cards of 96 GB; 78 layers (full+shared), hidden 6144, 256 experts top 8, bf16 | `family-glm_moe_dsa.toml` | yes | fails: chat template: syntax error: unknown statement break (in chat:112) | #1193 |
+| zai-org/GLM-5.3-BF16 | base | 40699 | 1506.7 | glm_moe_dsa | none | TOO-BIG | 1506.7 GB of weights needs 18 cards of 96 GB; 78 layers (full+shared), hidden 6144, 256 experts top 8, bf16 | `family-glm_moe_dsa.toml` | yes | ok, tools KeyValueXml |  |
 | AesSedai/GLM-5.3-GGUF | gguf | 295 | 259.1 | glm-dsa | gguf | REFUSED | GGUF architecture glm-dsa is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF |  |
-| BitdeerAI/GLM-5.3-W4AFP8-AWQ | awq | 93 | 399.7 | glm_moe_dsa | w4afp8 | UNKNOWN-QUANT | quantization {"quant_method":"w4afp8","group_size":128,"ignored_layers":["model.layers.0.self_attn.indexer.weights_proj","model.layers.1.self_attn.indexer.weights_proj","model.layers.2.self_attn.indexer.weights_proj","mo... | `family-glm_moe_dsa.toml` |  | fails: chat template: syntax error: unknown statement break (in chat:112) |  |
-| HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128 | gptq | 217 | 409.3 | glm_moe_dsa | dgpp_mixed346 | UNKNOWN-QUANT | quantization {"activation_bits":8,"baseline_config_file":"baseline-quantization-config.json","format":"dgpp_mixed346_h32_a8_g128_v1","group_size":128,"quant_method":"dgpp_mixed346","recipe_file":"quantization-recipe.json... | `family-glm_moe_dsa.toml` |  | fails: chat template: syntax error: unknown statement break (in chat:112) |  |
-| PhalaCloud/GLM-5.3-W4AFP8 | fp8 | 344 | 399.7 | glm_moe_dsa | w4afp8 | UNKNOWN-QUANT | quantization {"quant_method":"w4afp8","group_size":128,"modules_to_not_convert":["gate","indexer","norm","embed_tokens","lm_head"]} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are) (78... | `family-glm_moe_dsa.toml` |  | fails: chat template: syntax error: unknown statement break (in chat:112) |  |
-| RadixArk/GLM-5.3-NVFP4 | nvfp4 | 13548 | 464.8 | glm_moe_dsa | modelopt NVFP4 | TOO-BIG | 464.8 GB of weights needs 6 cards of 96 GB; 78 layers (full+shared), hidden 6144, 256 experts top 8, nvfp4_g16 | `family-glm_moe_dsa.toml` | yes | fails: chat template: syntax error: unknown statement break (in chat:112) | #1193 |
-| IFM/K2-Horizon-7B | base | 19598 | 18 | k2_horizon | none | REFUSED | model_type k2_horizon is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:984) | #1211 |
-| IFM/K2-Horizon-7B-FP8 | fp8 | 414 | 11.1 | k2_horizon | compressed-tensors float-quantized w8f-block a8 | REFUSED | model_type k2_horizon is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:984) | #1211 |
+| BitdeerAI/GLM-5.3-W4AFP8-AWQ | awq | 93 | 399.7 | glm_moe_dsa | w4afp8 | UNKNOWN-QUANT | quantization {"quant_method":"w4afp8","group_size":128,"ignored_layers":["model.layers.0.self_attn.indexer.weights_proj","model.layers.1.self_attn.indexer.weights_proj","model.layers.2.self_attn.indexer.weights_proj","mo... | `family-glm_moe_dsa.toml` |  | ok, tools KeyValueXml |  |
+| HawkBearPig/GLM-5.3-Mixed346-GPTQ-H32-A8-g128 | gptq | 217 | 409.3 | glm_moe_dsa | dgpp_mixed346 | UNKNOWN-QUANT | quantization {"activation_bits":8,"baseline_config_file":"baseline-quantization-config.json","format":"dgpp_mixed346_h32_a8_g128_v1","group_size":128,"quant_method":"dgpp_mixed346","recipe_file":"quantization-recipe.json... | `family-glm_moe_dsa.toml` |  | ok, tools KeyValueXml |  |
+| PhalaCloud/GLM-5.3-W4AFP8 | fp8 | 344 | 399.7 | glm_moe_dsa | w4afp8 | UNKNOWN-QUANT | quantization {"quant_method":"w4afp8","group_size":128,"modules_to_not_convert":["gate","indexer","norm","embed_tokens","lm_head"]} is not supported (fp8 e4m3 with 128x128 blocks and compressed-tensors fp8/nvfp4 are) (78... | `family-glm_moe_dsa.toml` |  | ok, tools KeyValueXml |  |
+| RadixArk/GLM-5.3-NVFP4 | nvfp4 | 13548 | 464.8 | glm_moe_dsa | modelopt NVFP4 | TOO-BIG | 464.8 GB of weights needs 6 cards of 96 GB; 78 layers (full+shared), hidden 6144, 256 experts top 8, nvfp4_g16 | `family-glm_moe_dsa.toml` | yes | ok, tools KeyValueXml |  |
+| IFM/K2-Horizon-7B | base | 19598 | 18 | k2_horizon | none | REFUSED | model_type k2_horizon is not supported |  |  | ok, tools Unparsed | #1211 |
+| IFM/K2-Horizon-7B-FP8 | fp8 | 414 | 11.1 | k2_horizon | compressed-tensors float-quantized w8f-block a8 | REFUSED | model_type k2_horizon is not supported |  |  | ok, tools Unparsed | #1211 |
 | OsaurusAI/Diplodocus-preview-GGUF | gguf | 1257451 | 6.3 | k2-horizon | gguf | REFUSED | GGUF architecture k2-horizon is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1211 |
-| ProCreations/K2-Horizon-7B-Uno-NVFP4 | nvfp4 | 90 | 8 | k2_horizon | modelopt NVFP4 | REFUSED | model_type k2_horizon is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:964) | #1211 |
-| cyankiwi/K2-Horizon-7B-AWQ-INT4 | awq | 172 | 8.1 | k2_horizon | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type k2_horizon is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:964) | #1211 |
+| ProCreations/K2-Horizon-7B-Uno-NVFP4 | nvfp4 | 90 | 8 | k2_horizon | modelopt NVFP4 | REFUSED | model_type k2_horizon is not supported |  |  | ok, tools Unparsed | #1211 |
+| cyankiwi/K2-Horizon-7B-AWQ-INT4 | awq | 172 | 8.1 | k2_horizon | compressed-tensors pack-quantized w4i-group-g32 | REFUSED | model_type k2_horizon is not supported |  |  | ok, tools Unparsed | #1211 |
 | deepseek-ai/DeepSeek-R1-0528-Qwen3-8B | base | 591189 | 16.4 | qwen3 | none | LOADS | 36 layers (dense), hidden 4096, bf16 | `family-qwen3.toml` | yes | ok, tools Unparsed |  |
 | EliovpAI/Deepseek-R1-0528-Qwen3-8B-FP8-KV | fp8 | 22 | 9.4 | qwen3 | fp8 e4m3 block None | UNKNOWN-QUANT | quantization {"activation_scheme":"static","export":{"kv_cache_group":["*c_attn"],"min_kv_scale":0.0,"pack_method":"reorder","weight_format":"real_quantized","weight_merge_groups":null},"ignored_layers":["lm_head"],"kv_c... | `family-qwen3.toml` |  | ok, tools Unparsed |  |
 | PreDoctor/DeepSeek-R1-0528-Qwen3-8B-NVFP4-W4A16-PreTensor | nvfp4 | 147 | 6.4 | qwen3 | pretensor_nvfp4_weight_only | UNKNOWN-QUANT | quantization {"quant_method":"pretensor_nvfp4_weight_only","format_version":1,"weights":{"dtype":"fp4_e2m1","group_size":16,"block_scale_dtype":"fp8_e4m3","tensor_scale_dtype":"float32","layout":"output-major-low-nibble-... | `family-qwen3.toml` |  | ok, tools Unparsed |  |
@@ -695,10 +693,10 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | QuantTrio/GLM-4.5-Air-GPTQ-Int4-Int8Mix | gptq | 111 | 70.9 | glm4_moe | gptq_marlin | UNKNOWN-QUANT | quantization {"quant_method":"gptq_marlin","bits":4,"group_size":128,"sym":true,"desc_act":false,"dynamic":{"-:model.embed_tokens.weight":{},"-:.*shared_experts":{},"-:.*shared_head":{},"-:lm_head.weight":{},"+:model[.]l... | `family-glm4_moe.toml` |  | ok, tools KeyValueXml |  |
 | cyankiwi/GLM-4.5-Air-AWQ-4bit | awq | 13500 | 63.4 | glm4_moe | compressed-tensors pack-quantized w4i-group-g32 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (46 layers (dense), hidden 4096, 128 experts top 8, mtp, bf16) | `family-glm4_moe.toml` |  | ok, tools KeyValueXml | #1200 |
 | unsloth/GLM-4.5-Air-GGUF | gguf | 130679 | 45.5 | glm4moe | gguf | REFUSED | GGUF architecture glm4moe is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1204 |
-| LiquidAI/LFM3-1.7B | base | 146872 | 3.5 | lfm3 | none | REFUSED | model_type lfm3 is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:198) | #1205 |
-| LiquidAI/LFM3-1.7B-FP8 | fp8 | 3520 | 2.2 | lfm3 | compressed-tensors float-quantized w8f-block a8 | REFUSED | model_type lfm3 is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:198) | #1205 |
+| LiquidAI/LFM3-1.7B | base | 146872 | 3.5 | lfm3 | none | REFUSED | model_type lfm3 is not supported |  |  | ok, tools XmlFunction | #1205 |
+| LiquidAI/LFM3-1.7B-FP8 | fp8 | 3520 | 2.2 | lfm3 | compressed-tensors float-quantized w8f-block a8 | REFUSED | model_type lfm3 is not supported |  |  | ok, tools XmlFunction | #1205 |
 | LiquidAI/LFM3-1.7B-GGUF | gguf | 457767 | 3.5 | lfm3 | gguf | REFUSED | GGUF architecture lfm3 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1205 |
-| LiquidAI/LFM3-1.7B-NVFP4 | nvfp4 | 6234 | 2.3 | lfm3 | modelopt NVFP4 | REFUSED | model_type lfm3 is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:198) | #1205 |
+| LiquidAI/LFM3-1.7B-NVFP4 | nvfp4 | 6234 | 2.3 | lfm3 | modelopt NVFP4 | REFUSED | model_type lfm3 is not supported |  |  | ok, tools XmlFunction | #1205 |
 | Qwen/Qwen2-VL-2B-Instruct | base | 890810 | 4.4 | qwen2_vl | none | REFUSED | model_type qwen2_vl is not supported |  |  | ok, tools None | #1197 |
 | Qwen/Qwen2-VL-2B-Instruct-AWQ | awq | 101076 | 7.5 | qwen2_vl | awq 4bit g128 | REFUSED | model_type qwen2_vl is not supported |  |  | ok, tools None | #1197 |
 | Qwen/Qwen2-VL-2B-Instruct-GPTQ-Int4 | gptq | 840 | 7 | qwen2_vl | gptq 4bit g128 | REFUSED | model_type qwen2_vl is not supported |  |  | ok, tools None | #1197 |
@@ -790,14 +788,14 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | amd/Kimi-K2.5-MXFP4-AttnFP8 | fp8 | 77 | 552.8 | kimi_k25 | quark | REFUSED | model_type kimi_k25 is not supported |  |  | no tokenizer.json | #1199 |
 | nvidia/Kimi-K2.5-NVFP4 | nvfp4 | 180637 | 590.8 | kimi_k25 | modelopt NVFP4 | REFUSED | model_type kimi_k25 is not supported |  |  | no tokenizer.json | #1199 |
 | unsloth/Kimi-K2.5-GGUF | gguf | 52204 | 2053.2 | deepseek2 | gguf | REFUSED | GGUF architecture deepseek2 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1204 |
-| LiquidAI/LFM3-Omni-2B | base | 29875 | 4.3 | lfm3_omni | none | REFUSED | model_type lfm3_omni is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:209) |  |
+| LiquidAI/LFM3-Omni-2B | base | 29875 | 4.3 | lfm3_omni | none | REFUSED | model_type lfm3_omni is not supported |  |  | ok, tools XmlFunction |  |
 | LiquidAI/LFM3-Omni-2B-GGUF | gguf | 558694 | 3.5 | lfm3 | gguf | REFUSED | GGUF architecture lfm3 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1205 |
-| MichaelAnthony/LFM3-Omni-2B-98K-V2-FP8 | fp8 | 40 | 3.1 | lfm3_omni | compressed-tensors float-quantized w8f-channel a8 | REFUSED | model_type lfm3_omni is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:209) |  |
+| MichaelAnthony/LFM3-Omni-2B-98K-V2-FP8 | fp8 | 40 | 3.1 | lfm3_omni | compressed-tensors float-quantized w8f-channel a8 | REFUSED | model_type lfm3_omni is not supported |  |  | ok, tools XmlFunction |  |
 | baidu/Unlimited-OCR-2 | base | 641835 | 6.7 | unlimited-ocr | none | REFUSED | model_type unlimited-ocr is not supported |  |  | no template | #1202 |
 | AtomicChat/Unlimited-OCR-2-GGUF | gguf | 17455 | 2 | unlimited-ocr2 | gguf | REFUSED | GGUF architecture unlimited-ocr2 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF |  |
 | AutomatosX/AX-Unlimited-OCR-2-AXQ-MXFP8 | fp8 | 69 | 4.2 | unlimited-ocr | None | REFUSED | model_type unlimited-ocr is not supported |  |  | no template | #1202 |
 | AutomatosX/AX-Unlimited-OCR-2-CUDA-AXQ-NVFP4-W4A16 | nvfp4 | 81 | 2.9 | unlimited-ocr | compressed-tensors nvfp4-pack-quantized w4f-tensor_group-g16 | REFUSED | model_type unlimited-ocr is not supported |  |  | no template | #1202 |
-| llava-hf/llava-1.5-7b-hf | base | 637130 | 14.1 | llava | none | REFUSED | model_type llava is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:2) | #1208 |
+| llava-hf/llava-1.5-7b-hf | base | 637130 | 14.1 | llava | none | REFUSED | model_type llava is not supported |  |  | ok, tools None | #1208 |
 | Marwan02/llava-1.5-7b-hf-Q4_K_M-GGUF | gguf | 32 | 4.1 | llama | gguf | LOADS | GGUF llama; reads Q4_K_M | `family-llama.toml` | yes | in the GGUF |  |
 | lightonai/LightOnOCR-2-1B | base | 622290 | 2 | mistral3 | none | REFUSED | model_type mistral3 is not supported; its text model (qwen3) passes on its own (28 layers (dense), hidden 1024, bf16) |  |  | ok, tools None | #1208 |
 | noctrex/LightOnOCR-2-1B-GGUF | gguf | 2367 | 1.2 | qwen3 | gguf | LOADS | GGUF qwen3; reads BF16 F16 IQ4_NL IQ4_XS Q4_K_M Q5_K_M Q6_K Q8_0 | `family-qwen3.toml` | yes | in the GGUF |  |
@@ -807,10 +805,10 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | iqbalamo93/Phi-4-mini-instruct-GPTQ-8bit | gptq | 330 | 14.1 | phi3 | gptq 8bit g128 | UNKNOWN-QUANT | quantization {"backend":"auto","batch_size":1,"bits":8,"block_name_to_quantize":null,"cache_block_outputs":true,"checkpoint_format":"gptq_v2","damp_percent":0.1,"dataset":"c4","desc_act":false,"exllama_config":{"version"... | `family-phi3.toml` |  | ok, tools FunctionsList |  |
 | pytorch/Phi-4-mini-instruct-AWQ-INT4 | awq | 122 |  | phi3 | torchao | UNKNOWN-QUANT | quantization {"include_input_output_embeddings":false,"modules_to_not_convert":null,"quant_method":"torchao","quant_type":{"default":{"_data":{"base_config":{"_data":{"group_size":128,"int4_choose_qparams_algorithm":{"_d... | `family-phi3.toml` |  | ok, tools FunctionsList |  |
 | unsloth/Phi-4-mini-instruct-GGUF | gguf | 115278 | 1.7 | phi3 | gguf | REFUSED | GGUF architecture phi3 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) | `family-phi3.toml` |  | in the GGUF | #1204 |
-| HuggingFaceTB/SmolLM3-3B | base | 122536 | 6.2 | smollm3 | none | LOADS | 36 layers (dense), hidden 2048, bf16 | `family-smollm3.toml` | yes | fails: chat template: syntax error: unknown statement generation (in chat:76) | #1193 |
-| Firworks/SmolLM3-3B-nvfp4 | nvfp4 | 24 | 2.6 | smollm3 | compressed-tensors nvfp4-pack-quantized w4f-tensor_group-g16 a4 | UNKNOWN-QUANT | nvfp4_g16 is supported for [mlp] quant only (36 layers (dense), hidden 2048, bf16) | `family-smollm3.toml` |  | fails: chat template: syntax error: unknown statement generation (in chat:76) | #1207 |
-| RedHatAI/SmolLM3-3B-FP8-dynamic | fp8 | 825 | 3.3 | smollm3 | compressed-tensors float-quantized w8f-channel a8 | LOADS | 36 layers (dense), hidden 2048, fp8_channel | `family-smollm3.toml` | yes | fails: chat template: syntax error: unknown statement generation (in chat:76) | #1193 |
-| drawais/SmolLM3-3B-AWQ-INT4 | awq | 26 | 11.8 | smollm3 | compressed-tensors pack-quantized w4i-group-g128 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (36 layers (dense), hidden 2048, bf16) | `family-smollm3.toml` |  | fails: chat template: syntax error: unknown statement generation (in chat:76) | #1200 |
+| HuggingFaceTB/SmolLM3-3B | base | 122536 | 6.2 | smollm3 | none | LOADS | 36 layers (dense), hidden 2048, bf16 | `family-smollm3.toml` | yes | ok, tools Hermes |  |
+| Firworks/SmolLM3-3B-nvfp4 | nvfp4 | 24 | 2.6 | smollm3 | compressed-tensors nvfp4-pack-quantized w4f-tensor_group-g16 a4 | UNKNOWN-QUANT | nvfp4_g16 is supported for [mlp] quant only (36 layers (dense), hidden 2048, bf16) | `family-smollm3.toml` |  | ok, tools Hermes | #1207 |
+| RedHatAI/SmolLM3-3B-FP8-dynamic | fp8 | 825 | 3.3 | smollm3 | compressed-tensors float-quantized w8f-channel a8 | LOADS | 36 layers (dense), hidden 2048, fp8_channel | `family-smollm3.toml` | yes | ok, tools Hermes |  |
+| drawais/SmolLM3-3B-AWQ-INT4 | awq | 26 | 11.8 | smollm3 | compressed-tensors pack-quantized w4i-group-g128 | UNKNOWN-QUANT | compressed-tensors group group_0 is not supported (fp8 per-channel and nvfp4 group 16 are) (36 layers (dense), hidden 2048, bf16) | `family-smollm3.toml` |  | ok, tools Hermes | #1200 |
 | webAI-Official/TwIL-LM3 | gguf | 257840 | 6.2 | smollm3 | gguf | REFUSED | GGUF architecture smollm3 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) | `family-smollm3.toml` |  | in the GGUF | #1204 |
 | meta-llama/Meta-Llama-3-8B-Instruct (config from local snapshot (gated on the hub)) | base | 433087 | 16.1 | llama | none | LOADS | 32 layers (dense), hidden 4096, bf16 | `family-llama.toml` | yes | ok, tools None |  |
 | MaziyarPanahi/Meta-Llama-3-8B-Instruct-GGUF | gguf | 73697 | 16.1 | mistral | gguf | LOADS | GGUF llama; reads IQ1_M IQ1_S IQ2_XS IQ4_XS Q4_K_M Q4_K_S Q5_K_M Q5_K_S Q6_K Q8_0; not IQ3_XS Q2_K Q3_K_L Q3_K_M Q3_K_S | `family-llama.toml` | yes | in the GGUF |  |
@@ -853,19 +851,19 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | KarLexAI/Kimi-K3.1-Pro-GGUF | gguf | 18558 | 647.9 | kimi-k31 | gguf | REFUSED | GGUF architecture kimi-k31 is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1214 |
 | manifoldlabs/Kimi-K3.1-Pro-Quark-MXFP4-AttnFP8 | fp8 | 64 | 1524.1 | kimi_k31 | quark | REFUSED | model_type kimi_k31 is not supported |  |  | no tokenizer.json | #1214 |
 | nvidia/Kimi-K3.1-Pro-NVFP4 | nvfp4 | 2586 | 1605 | kimi_k31 | modelopt_mixed | REFUSED | model_type kimi_k31 is not supported |  |  | no tokenizer.json | #1214 |
-| OVHaiLLM/Olala-v1.0-mini-7A1B | base | 63289 | 13.6 | olala | none | REFUSED | model_type olala is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:182) |  |
+| OVHaiLLM/Olala-v1.0-mini-7A1B | base | 63289 | 13.6 | olala | none | REFUSED | model_type olala is not supported |  |  | ok, tools Unparsed |  |
 | OVHaiLLM/Olala-v1.0-mini-7A1B-GGUF | gguf | 14056 | 13.6 | olala | gguf | REFUSED | GGUF architecture olala is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF |  |
-| solfird/Olala-v1.0-mini-7A1B-NVFP4-experts | nvfp4 | 62 | 5.8 | olala | compressed-tensors nvfp4-pack-quantized w4f-tensor_group-g16 | REFUSED | model_type olala is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:182) |  |
-| KRAFTON/Raon-1-nano | base | 3542 | 7.1 | raon1_nano | none | REFUSED | model_type raon1_nano is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:110) |  |
+| solfird/Olala-v1.0-mini-7A1B-NVFP4-experts | nvfp4 | 62 | 5.8 | olala | compressed-tensors nvfp4-pack-quantized w4f-tensor_group-g16 | REFUSED | model_type olala is not supported |  |  | ok, tools Unparsed |  |
+| KRAFTON/Raon-1-nano | base | 3542 | 7.1 | raon1_nano | none | REFUSED | model_type raon1_nano is not supported |  |  | ok, tools XmlFunction |  |
 | KRAFTON/Raon-1-nano-gguf | gguf | 20272 | 6.3 | raon1nano | gguf | REFUSED | GGUF architecture raon1nano is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF |  |
-| Pilcothink/Raon-1-nano-NVFP4 | nvfp4 | 88 | 3.8 | raon1_nano | modelopt NVFP4 | REFUSED | model_type raon1_nano is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:110) |  |
+| Pilcothink/Raon-1-nano-NVFP4 | nvfp4 | 88 | 3.8 | raon1_nano | modelopt NVFP4 | REFUSED | model_type raon1_nano is not supported |  |  | ok, tools XmlFunction |  |
 | maxwell-model/Maxwell-V1-Flash | base | 3639 | 73.6 | maxwell_moe | none | REFUSED | model_type maxwell_moe is not supported |  |  | ok, tools XmlFunction |  |
 | AtomicChat/Maxwell-V1-Flash-GGUF | gguf | 15399 | 20.8 | maxwell-moe | gguf | REFUSED | GGUF architecture maxwell-moe is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF |  |
 | maxwell-model/Maxwell-V1-Flash-FP8 | fp8 | 46 | 38.6 | maxwell_moe | fp8 e4m3 block [128, 128] | REFUSED | model_type maxwell_moe is not supported |  |  | ok, tools XmlFunction |  |
 | GSAI-ML/LLaDA-1.5 | base | 8607 | 16 | llada | none | REFUSED | model_type llada is not supported |  |  | ok, tools None | #1214 |
 | mradermacher/LLaDA-1.5-GGUF | gguf | 2504 | 16 | llada | gguf | REFUSED | GGUF architecture llada is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF | #1214 |
-| microsoft/Aion-1.0-Instruct-2.3B | base | 4747 | 4.6 | aion_instruct | none | REFUSED | model_type aion_instruct is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:57) |  |
-| PureTensorAI/Aion-1.0-Instruct-2.3B-NVFP4 | nvfp4 | 52 | 2.7 | aion_instruct | compressed-tensors nvfp4-pack-quantized w4f-tensor_group-g16 a4 | REFUSED | model_type aion_instruct is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:57) |  |
+| microsoft/Aion-1.0-Instruct-2.3B | base | 4747 | 4.6 | aion_instruct | none | REFUSED | model_type aion_instruct is not supported |  |  | ok, tools ToolCallList |  |
+| PureTensorAI/Aion-1.0-Instruct-2.3B-NVFP4 | nvfp4 | 52 | 2.7 | aion_instruct | compressed-tensors nvfp4-pack-quantized w4f-tensor_group-g16 a4 | REFUSED | model_type aion_instruct is not supported |  |  | ok, tools ToolCallList |  |
 | Xylolabs/Aion-1.0-Instruct-2.3B-GGUF | gguf | 2014 | 4.6 | aion | gguf | REFUSED | GGUF architecture aion is not supported (llama, qwen2, qwen3, qwen3moe, qwen35, qwen35moe are) |  |  | in the GGUF |  |
 | baidu/ERNIE-5.5-Flash-Preview-BF16 | base | 0 | 599.6 | ernie5_5_moe | none | REFUSED | model_type ernie5_5_moe is not supported |  |  | no template |  |
 | baidu/ERNIE-5.5-Flash-Base | fp8 | 5532 | 288.4 | ernie5_5_moe | fp8 e4m3 block [128, 128] | REFUSED | model_type ernie5_5_moe is not supported |  |  | no template |  |
@@ -879,7 +877,7 @@ A config check cannot prove these; they stay unproven until a real load (phase 2
 | RedHatAI/sarvam-105b-FP8-dynamic | fp8 | 82 | 112.7 | sarvam_mla | compressed-tensors float-quantized w8f-channel a8 | REFUSED | model_type sarvam_mla is not supported |  |  | ok, tools KeyValueXml |  |
 | sarvamai/sarvam-105b-1711 | nvfp4 | 384 | 64.6 | sarvam_mla | compressed-tensors mxfp8-quantized w8f-group-g32 a8, nvfp4-pack-quantized w4f-tensor_group-g16 a4 | REFUSED | model_type sarvam_mla is not supported |  |  | ok, tools KeyValueXml |  |
 | SupraLabs/Supra2.5-Pro-Instruct | base | 2868 | 0.3 | qwen3 | gguf | LOADS | GGUF qwen3; reads F16 Q4_K_M Q8_0 | `family-qwen3.toml` | yes | in the GGUF |  |
-| open-athena/Marin-Mochi-535B-A23B | base | 1563 | 1071 | grug_moe | none | REFUSED | model_type grug_moe is not supported |  |  | fails: chat template: syntax error: unknown statement generation (in chat:70) |  |
+| open-athena/Marin-Mochi-535B-A23B | base | 1563 | 1071 | grug_moe | none | REFUSED | model_type grug_moe is not supported |  |  | ok, tools Hermes |  |
 | Locutusque/TinyMistral-248M | base | 942 | 1 | mistral | none | LOADS | 12 layers (dense), hidden 1024, bf16 | `family-llama.toml` | yes | no template |  |
 | afrideva/TinyMistral-248M-GGUF | gguf | 539 | 0.5 | llama | gguf | LOADS | GGUF llama; reads Q4_K_M Q5_K_M Q6_K Q8_0; not Q2_K Q3_K_M | `family-llama.toml` | yes | in the GGUF |  |
 | AuroraAI-Research/Aurora2-400M-A20M | base | 1158 | 1.6 | aurora2 | none | REFUSED | model_type aurora2 is not supported |  |  | no template |  |
