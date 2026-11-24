@@ -1831,13 +1831,21 @@ impl Spec {
         };
         let (qkv_bias, o_bias, qk_norm, output_gate) = attn_flags;
         let multiplier = |key: &Option<String>| key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_f64());
-        let head_dim = hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads);
+        let head_dim = match family.attention.head_dim.as_deref() {
+            Some(expr) => {
+                let e = kir::expr::Expr::parse(expr).map_err(anyhow::Error::msg).with_context(|| format!("[attention] head_dim {expr:?}"))?;
+                let env = |k: &str| k.split('.').try_fold(&value, |v, p| v.get(p)).and_then(|v| v.as_f64());
+                e.eval(&env).with_context(|| format!("[attention] head_dim {expr:?} reads a missing config key"))? as usize
+            }
+            None => hf.head_dim.filter(|d| *d > 0).unwrap_or(hf.hidden_size / hf.num_attention_heads),
+        };
         let keyed_rotary = family.rope.rotary_dim_key.as_deref().and_then(|k| value.get(k)?.as_u64()).map(|d| d as usize);
         let rotary_dim = keyed_rotary.or_else(|| {
             hf.partial_rotary_factor.or(param("partial_rotary_factor")).filter(|f| *f != 1.0).map(|f| (head_dim as f64 * f).round() as usize)
         });
-        let indexed = family.blocks.attention_indices_key.as_deref().and_then(|k| value.get(k)).and_then(|v| v.as_array()).map(|a| {
-            let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()).collect();
+        let indexed = family.blocks.attention_indices_key.as_deref().and_then(|k| k.split('.').try_fold(&value, |v, p| v.get(p))).and_then(|v| v.as_array()).map(|a| {
+            let base = family.blocks.attention_indices_base as u64;
+            let full: Vec<u64> = a.iter().filter_map(|v| v.as_u64()?.checked_sub(base)).collect();
             (0..hf.num_hidden_layers).map(|i| if full.contains(&(i as u64)) { "full_attention" } else { "linear_attention" }.to_string()).collect::<Vec<_>>()
         });
         let keyed: Option<Vec<String>> = family.blocks.types_key.as_deref().and_then(|k| value.get(k)).and_then(|v| match v {

@@ -866,6 +866,46 @@ when = "tensor_core"
 in = "act_planes"
 
 [[block]]
+name = "mixer_moe"
+when = "plain+mixer+moe+tensor_core"
+layers = ["linear"]
+mlp = "sparse"
+
+[[block.node]]
+op = "rmsnorm"
+weight = "input_layernorm.weight"
+out = "xn_planes"
+in = "x"
+
+[[block.node]]
+op = "linear"
+weight = "mix_in"
+shard = "column"
+quant = "attn"
+out = "mix"
+in = "xn_planes"
+
+[[block.node]]
+op = "mixer_nodes"
+
+[[block.node]]
+op = "linear"
+weight = "mix_out"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "mix_planes"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "moe_combine"
+
+[[block]]
 name = "mixer_branch"
 when = "scaled+mixer+tensor_core+dense"
 layers = ["linear"]

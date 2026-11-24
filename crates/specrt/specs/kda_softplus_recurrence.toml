@@ -1,0 +1,197 @@
+kind = "kir-kernel"
+family = "recurrence"
+name = "kda_softplus_recurrence"
+
+[recurrence]
+state = "kda"
+keys = "kda_head_dim"
+values = "kda_head_dim"
+ksplit = 4
+layers = "linear_layers"
+
+[[const]]
+name = "dk"
+value = "kda_head_dim"
+
+[[input]]
+name = "q"
+src = "mix"
+space = "key"
+row = "kda_row"
+head = "kda_head_dim"
+offset = 0
+
+[[input]]
+name = "k"
+src = "mix"
+space = "key"
+row = "kda_row"
+head = "kda_head_dim"
+offset = "kda_heads * kda_head_dim"
+
+[[input]]
+name = "v"
+src = "mix"
+space = "value"
+row = "kda_row"
+head = "kda_head_dim"
+offset = "2 * kda_heads * kda_head_dim"
+
+[[input]]
+name = "f"
+src = "gates"
+space = "key"
+row = "kda_gate_row"
+head = "kda_head_dim"
+offset = "kda_gate_offset"
+
+[[input]]
+name = "b"
+src = "betas"
+space = "scalar"
+row = "kda_beta_row"
+head = 1
+offset = "kda_beta_offset"
+
+[[input]]
+name = "dtb"
+src = "dt_bias"
+space = "key"
+row = 0
+head = "kda_head_dim"
+offset = 0
+
+[[input]]
+name = "a"
+src = "a_log"
+space = "scalar"
+row = 0
+head = 1
+offset = 0
+
+[[stage]]
+op = "key_sum"
+name = "qq"
+expr = "q * q"
+
+[[stage]]
+op = "key_sum"
+name = "kk"
+expr = "k * k"
+
+[[stage]]
+op = "key"
+name = "qn"
+expr = "q / sqrt(qq + 0.000001) * rsqrt(dk)"
+
+[[stage]]
+op = "key"
+name = "kn"
+expr = "k / sqrt(kk + 0.000001)"
+
+[[stage]]
+op = "key"
+name = "decay"
+expr = "exp(-exp(a) * softplus(f + dtb))"
+
+[[stage]]
+op = "scalar"
+name = "beta"
+expr = "sigmoid(b)"
+
+[[stage]]
+op = "decay"
+expr = "decay"
+
+[[stage]]
+op = "read"
+name = "mem"
+key = "kn"
+
+[[stage]]
+op = "value"
+name = "delta"
+expr = "(v - mem) * beta"
+
+[[stage]]
+op = "update"
+key = "kn"
+value = "delta"
+
+[[stage]]
+op = "read"
+name = "o"
+key = "qn"
+
+[[stage]]
+op = "store"
+dst = "y"
+value = "o"
+row = "kda_heads * kda_head_dim"
+head = "kda_head_dim"
+offset = 0
+
+[[param]]
+name = "mix"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "betas"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "gates"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "dt_bias"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "a_log"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "kda"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "slot_base"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "slot_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "rows_per_seq"
+type = "i32"
+role = "value"
+access = "read"
