@@ -142,6 +142,19 @@ fn host_head(hidden: &[f32]) -> Vec<f32> {
 }
 
 #[test]
+fn the_real_kimi_linear_48b_config_serves() {
+    let json = std::fs::read_to_string(root().join("tests/fixtures/kimi-linear-48b.config.json")).unwrap();
+    let spec = Spec::from_hf_config_serving(&json).unwrap_or_else(|e| panic!("{e:#}"));
+    spec.runnable().unwrap_or_else(|e| panic!("{e:#}"));
+    assert_eq!(spec.layers.count, 27);
+    assert_eq!(spec.layers.pattern.len(), 27, "layer 27 breaks the 3:1 rhythm, so the pattern is the full list");
+    assert_eq!((0..27).filter(|&l| spec.block(l) == Block::Full).collect::<Vec<_>>(), vec![3, 7, 11, 15, 19, 23, 26]);
+    assert_eq!(spec.attention.head_dim, 192, "nope 128 plus rope 64, not the config's head_dim 72");
+    let moe = spec.moe.as_ref().unwrap();
+    assert_eq!((moe.experts, moe.active, moe.expert_intermediate, moe.shared_intermediate), (256, Some(8), 1024, 1024));
+}
+
+#[test]
 #[ignore = "needs a CUDA GPU"]
 fn the_engine_matches_transformers_on_hidden_states_prefill_and_four_decode_steps() {
     use specrt::runtime::{DecodeRow, Runtime, Sampling};
