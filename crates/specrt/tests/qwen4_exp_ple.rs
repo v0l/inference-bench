@@ -411,6 +411,22 @@ fn rows(fx: &Fixture, slot: usize, r: std::ops::Range<usize>) -> (usize, Vec<i64
 }
 
 #[test]
+#[ignore = "needs NVRTC, no GPU"]
+fn the_ple_module_compiles_through_nvrtc() {
+    let registry = Registry::embedded();
+    let real: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/popular/Qwen__Qwen3.8-Flash-Next/config.json")).unwrap()).unwrap();
+    for p in [params(&text_config(), 1), params(&real["text_config"], 1)] {
+        let kernels: Vec<kir::Kernel> = KERNELS.iter().map(|n| registry.get(n).unwrap().build(&kir::Target::sm_120(), &shape(&p)).unwrap()).collect();
+        let opts = cudarc::nvrtc::CompileOptions { arch: Some("compute_120"), options: vec!["--std=c++17".into()], ..Default::default() };
+        let source = kir::cuda::emit_module(&kernels).unwrap().to_string();
+        let ptx = cudarc::nvrtc::compile_ptx_with_opts(&source, opts).unwrap_or_else(|e| panic!("{e:?}")).to_src();
+        for name in KERNELS {
+            assert!(ptx.contains(&format!(".entry {name}(")), "{name}");
+        }
+    }
+}
+
+#[test]
 #[ignore = "needs a CUDA GPU"]
 fn the_ple_layer_matches_transformers_for_prefill_and_decode_steps_one_to_four() {
     let fx = load();
