@@ -122,6 +122,7 @@ fn the_harness_reads_the_low_rank_gate_from_the_config_and_the_spec() {
     assert_eq!(h.sites, vec!["attn_hyper_connection", "mlp_hyper_connection"]);
     assert_eq!(h.module, "hyper_connection_mixer");
     assert!(!s.norm.pre && !s.uses_branch());
+    assert!(s.linear_attention.as_ref().unwrap().gate_sigmoid, "output_gate_type sigmoid gates the delta-net output");
     assert_eq!(s.layers.pattern, vec![Block::Linear, Block::Linear, Block::Linear, Block::Full]);
 }
 
@@ -171,6 +172,7 @@ fn the_hyper_kernels_come_from_kir_descriptions_and_compile_into_the_module() {
         assert!(src.contains(&format!(" {n}(")), "{n} missing");
     }
     assert!(src.contains("constexpr bool MOE_INPUT_NORM = false;"));
+    assert!(src.contains("* la_sigmoid("), "the delta-net output gate is a sigmoid");
     assert!(src.contains("o + av * 2.0f * ") || src.contains("(o + ((av * 2.0f) *"), "inject add text");
 }
 

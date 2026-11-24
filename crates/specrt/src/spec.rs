@@ -454,6 +454,8 @@ pub struct LinearAttention {
     pub v_heads: VHeadOrder,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub fused_interleaved: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gate_sigmoid: bool,
 }
 
 impl LinearAttention {
@@ -1869,6 +1871,7 @@ impl Spec {
                     conv_kernel: need(hf.linear_conv_kernel_dim, "linear_conv_kernel_dim")?,
                     v_heads: VHeadOrder::Grouped,
                     fused_interleaved: family.linear.fused_interleaved,
+                    gate_sigmoid: family.linear.gate_key.as_deref().and_then(|k| value.get(k).filter(|v| !v.is_null()).or(value.get("hidden_act"))).and_then(|v| v.as_str()) == Some("sigmoid"),
                 })
             })();
             if strict { Some(dims?) } else { dims.ok() }

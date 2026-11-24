@@ -1,6 +1,6 @@
 use super::prim::{self, at, delta_update, gate, gated_output, memory_read, qk_norm};
 
-pub fn body() -> String {
+pub fn body(out_gate: &str) -> String {
     let mut o = String::new();
     o.push_str(
         "extern \"C\" __global__ void __launch_bounds__(LA_D * LA_KSPLIT) gdn_step(const float* mix, const float* lin,
@@ -32,7 +32,7 @@ int ks = tid / LA_D;
     o.push_str(&memory_read(4, "S[k * LA_D + v]", "mix[LA_V_OFF + h * LA_D + v]"));
     o.push_str(&delta_update(4, true));
     o.push_str(&at(4, "__syncthreads();\n"));
-    o.push_str(&gated_output(4, "out[h * LA_D + v]", "lin[LA_Z_OFF + h * LA_D + v]"));
+    o.push_str(&gated_output(4, "out[h * LA_D + v]", "lin[LA_Z_OFF + h * LA_D + v]", out_gate));
     o.push_str("}\n\n");
     o.push_str(
         "extern \"C\" __global__ void gdn_qk_prep(const float* mix, float* qn, float* kn) {

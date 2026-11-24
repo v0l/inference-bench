@@ -1,6 +1,6 @@
 use super::{chunk_lib, chunk_prep, chunk_scan};
 
-pub fn body() -> String {
+pub fn body(gate: &str) -> String {
     let mut o = chunk_lib::library();
     o.push('\n');
     o.push_str(&chunk_prep::body());
@@ -9,12 +9,13 @@ pub fn body() -> String {
     o.push('\n');
     o.push_str(&chunk_scan::body());
     o.push_str("\n\n");
-    o.push_str(&gated_norm());
+    o.push_str(&gated_norm(gate));
     o
 }
 
-fn gated_norm() -> String {
-    r##"extern "C" __global__ void gdn_gated_norm(const float* o, const float* lin, const float* norm_w, bf16_t* hi, bf16_t* lo) {
+fn gated_norm(gate: &str) -> String {
+    format!(
+        r##"extern "C" __global__ void gdn_gated_norm(const float* o, const float* lin, const float* norm_w, bf16_t* hi, bf16_t* lo) {{
     __shared__ float scratch[32];
     int h = blockIdx.x;
     int t = blockIdx.y;
@@ -24,9 +25,9 @@ fn gated_norm() -> String {
     float b = src[d + 1];
     float inv = rsqrtf(block_reduce<false>(a * a + b * b, scratch) / LA_D + EPS);
     const float* z = lin + (size_t)t * LA_IN_ROWS + LA_Z_OFF + h * LA_D;
-    split_store2(hi, lo, (size_t)t * LA_VALUE_DIM + h * LA_D + d, norm_w[d] * (a * inv) * silu(z[d]),
-                 norm_w[d + 1] * (b * inv) * silu(z[d + 1]));
-}
+    split_store2(hi, lo, (size_t)t * LA_VALUE_DIM + h * LA_D + d, norm_w[d] * (a * inv) * {gate}(z[d]),
+                 norm_w[d + 1] * (b * inv) * {gate}(z[d + 1]));
+}}
 "##
-    .to_string()
+    )
 }

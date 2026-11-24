@@ -369,6 +369,7 @@ pub struct FamilyBlocks {
 pub struct FamilyLinear {
     pub fused_interleaved: bool,
     pub kinds: Vec<KindRule<crate::spec::LinearKind>>,
+    pub gate_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -673,6 +674,9 @@ impl Family {
         }
         for s in self.attention.scratch.values().chain(self.mixer.scratch.values()) {
             expr_keys(s, &mut out);
+        }
+        if let Some(k) = self.linear.gate_key.as_deref() {
+            push(k, &mut out);
         }
         if let Some(k) = self.blocks.attention_indices_key.as_deref() {
             push(k, &mut out);

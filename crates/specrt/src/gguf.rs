@@ -689,6 +689,7 @@ impl Gguf {
             conv_kernel,
             v_heads: names.v_heads,
             fused_interleaved: false,
+            gate_sigmoid: false,
         };
         Ok((Some(la), pattern))
     }

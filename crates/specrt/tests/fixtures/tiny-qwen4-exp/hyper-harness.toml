@@ -10,6 +10,9 @@ architectures = []
 [norm]
 pre = false
 
+[linear]
+gate_key = "output_gate_type"
+
 [gated_residual]
 streams = "hc_count"
 module = "hyper_connection_mixer"
