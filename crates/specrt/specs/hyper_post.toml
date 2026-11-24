@@ -1,0 +1,23 @@
+kind = "kir-kernel"
+family = "hyper_post"
+name = "hyper_post"
+threads = 128
+
+[args]
+streams = "hc_streams"
+hidden = "hidden"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "mix"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "streams"
+role = "activation"
+access = "write"

@@ -196,7 +196,7 @@ fn plan_kernels(spec: &Spec, plan: &Plan) -> Vec<Vec<String>> {
 }
 
 fn runs_single_step(spec: &Spec) -> bool {
-    spec.attention.node.is_empty() && spec.requanted_linears().is_empty() && spec.mixer.is_none() && !spec.layers.split && spec.mlp.mapped.is_none() && spec.dims.head_rows.is_none()
+    spec.attention.node.is_empty() && spec.requanted_linears().is_empty() && spec.mixer.is_none() && spec.hyper.is_none() && !spec.layers.split && spec.mlp.mapped.is_none() && spec.dims.head_rows.is_none()
 }
 
 fn assert_single_matches(name: &str, spec: &Spec) {

@@ -144,6 +144,7 @@ pub struct FamilyHyper {
     pub streams: Option<String>,
     pub sinkhorn_iters: Option<String>,
     pub eps: Option<String>,
+    pub sites: Vec<String>,
 }
 
 impl FamilyHyper {
@@ -154,6 +155,7 @@ impl FamilyHyper {
             streams,
             sinkhorn_iters: at(&self.sinkhorn_iters).and_then(|v| v.as_u64()).unwrap_or(0) as usize,
             eps: at(&self.eps).and_then(|v| v.as_f64()).unwrap_or(0.0),
+            sites: self.sites.clone(),
         })
     }
 

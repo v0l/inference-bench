@@ -145,7 +145,7 @@ fn upload_layer(stream: &Arc<CudaStream>, ck: &Checkpoint, spec: &Spec, store: &
             slot: before(true),
         }),
     };
-    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()? };
+    let layer = DeviceLayer { ln1: stream.clone_htod(&l.ln1)?, ln2: stream.clone_htod(&l.ln2)?, ln_pre_mlp: up_opt(&l.ln_pre_mlp)?, ln_post_mlp: up_opt(&l.ln_post_mlp)?, mixer, gate_up: up_m(&l.gate_up)?, down: up_m(&l.down)?, moe: l.moe.as_ref().map(|m| moe::DeviceMoe::upload(stream, m, i, cached.as_ref().map(|(p, n)| (*p, *n)))).transpose()?, hyper: l.hyper.iter().map(|v| Ok(stream.clone_htod(v)?)).collect::<Result<_>>()? };
     copied(stream)?;
     Ok(layer)
 }
@@ -534,6 +534,7 @@ struct DeviceLayer {
     gate_up: DeviceMatrix,
     down: DeviceMatrix,
     moe: Option<moe::DeviceMoe>,
+    hyper: Vec<CudaSlice<f32>>,
 }
 
 fn opt_bytes(v: &Option<CudaSlice<f32>>) -> u64 {
@@ -565,6 +566,7 @@ impl DeviceLayer {
             + self.down.bytes()
             + self.moe.as_ref().map_or(0, moe::DeviceMoe::bytes)
             + (self.ln1.num_bytes() + self.ln2.num_bytes()) as u64
+            + self.hyper.iter().map(|v| v.num_bytes() as u64).sum::<u64>()
     }
 }
 
@@ -760,6 +762,8 @@ struct PrefillBuffers {
     x: CudaSlice<f32>,
     xn: CudaSlice<f32>,
     branch: CudaSlice<f32>,
+    streams: CudaSlice<f32>,
+    hyper_mix: CudaSlice<f32>,
     qkv: CudaSlice<f32>,
     attn: CudaSlice<f32>,
     gate_up: CudaSlice<f32>,
@@ -1123,6 +1127,8 @@ impl Runtime {
             x: stream.alloc_zeros(chunk * d.hidden)?,
             xn: stream.alloc_zeros(mma_only(chunk * d.hidden))?,
             branch: stream.alloc_zeros(if spec.uses_branch() { chunk * d.hidden } else { 1 })?,
+            streams: stream.alloc_zeros(spec.hyper.as_ref().map_or(1, |h| chunk * h.streams * d.hidden))?,
+            hyper_mix: stream.alloc_zeros(spec.hyper.as_ref().map_or(1, |h| chunk * (2 + h.streams) * h.streams))?,
             qkv: stream.alloc_zeros(chunk * spec.qkv_rows())?,
             attn: stream.alloc_zeros(mma_only(chunk * spec.q_dim().max(spec.o_dim())))?,
             gate_up: stream.alloc_zeros(mma_only(chunk * 2 * d.intermediate))?,
@@ -1537,6 +1543,10 @@ impl Runtime {
 
     fn trace_layer(&self, trace: Option<&CudaSlice<f32>>, layer: usize, tokens: usize) -> Result<()> {
         let Some(trace) = trace else { return Ok(()) };
+        if let Some(h) = &self.spec.hyper {
+            let n = tokens * h.streams * self.spec.dims.hidden;
+            return self.copy_rows(&self.pre.streams.slice(..n), &trace.slice(layer * n..(layer + 1) * n), n);
+        }
         let n = tokens * self.spec.dims.hidden;
         let src = if tokens == 1 { self.buf.x.slice(..n) } else { self.pre.x.slice(..n) };
         let dst = trace.slice(layer * n..(layer + 1) * n);
@@ -1554,7 +1564,7 @@ impl Runtime {
     fn step_traced(&self, trace: Option<&CudaSlice<f32>>) -> Result<()> {
         ensure!(self.head_part.is_none(), "a vocabulary sharded rank decodes through the plan, not the single stream step");
         ensure!(self.spec.requanted_linears().is_empty(), "requantised attention and delta-net projections run on the plan decode path (the scheduler), not the single stream step");
-        ensure!(self.spec.mixer.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "mixers, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
+        ensure!(self.spec.mixer.is_none() && self.spec.hyper.is_none() && !self.spec.layers.split && self.spec.mlp.mapped.is_none(), "mixers, hyper-connections, mlp-only layers and non-gated mlps run on the batched decode path (generate_batch and the scheduler), not the single stream step");
         if !self.spec.attention.node.is_empty() {
             ensure!(self.use_mma, "described attention needs the tensor core path");
             let run = exec::Run { n: 1, tokens: &self.buf.token, logits: &self.buf.logits, rows: 0..1, bb: None, start: None, qlen: 1, mtp: None };
@@ -2558,7 +2568,7 @@ impl Runtime {
         ensure!(tokens.len() <= self.prefill_limit, "trace prefill fits one chunk");
         let s = &self.spec;
         let n = tokens.len();
-        let layers = self.stream.alloc_zeros::<f32>(s.layers.count * n * s.dims.hidden)?;
+        let layers = self.stream.alloc_zeros::<f32>(s.layers.count * n * s.dims.hidden * s.hyper.as_ref().map_or(1, |h| h.streams))?;
         let logits = self.stream.alloc_zeros::<f32>(n * s.dims.vocab)?;
         self.reset_linear_state()?;
         self.prefill_chunk_traced(tokens, 0, Some(&logits), Some(&layers))?;

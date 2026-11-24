@@ -319,6 +319,19 @@ pub fn mixer_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: &kir
     Ok(out)
 }
 
+pub fn hyper_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::Kernel>> {
+    let Some(h) = &spec.hyper else { return Ok(Vec::new()) };
+    let symbols = kir_shape(spec).num("hc_streams", h.streams as f64).num("hc_sinkhorn_iters", h.sinkhorn_iters as f64).num("hc_eps", h.eps);
+    let registry = crate::kir_kernel::Registry::active();
+    ["hyper_expand", "hyper_pre", "hyper_post", "hyper_mean"]
+        .iter()
+        .map(|n| {
+            let d = registry.get(n).ok_or_else(|| anyhow::anyhow!("no kernel description provides {n}"))?;
+            d.build(target, &symbols).map_err(anyhow::Error::msg)
+        })
+        .collect()
+}
+
 pub fn linear_kernel_shape(la: &crate::spec::LinearAttention) -> kir::linear::LinearShape {
     kir::linear::LinearShape { key_heads: la.key_heads, value_heads: la.value_heads, head_dim: la.key_head_dim, conv_kernel: la.conv_kernel, tiled_value_heads: la.v_heads == crate::spec::VHeadOrder::Tiled }
 }
@@ -546,7 +559,7 @@ impl Module {
         let gemms = crate::gemm::gemm_kernels(spec, target)?;
         let described = described_kernels(spec, kv_planes, max_ctx, target)?;
         let mut distinct: Vec<kir::Kernel> = Vec::new();
-        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?) {
+        for k in described.into_iter().flatten().chain(mixer_kernels(spec, kv_planes, max_ctx, target)?).chain(hyper_kernels(spec, target)?) {
             if !distinct.iter().any(|d| d.name == k.name) {
                 distinct.push(k);
             }

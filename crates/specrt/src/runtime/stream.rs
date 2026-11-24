@@ -81,6 +81,9 @@ impl DeviceLayer {
         w.slice(&mut self.ln2)?;
         opt(w, &mut self.ln_pre_mlp)?;
         opt(w, &mut self.ln_post_mlp)?;
+        for v in &mut self.hyper {
+            w.slice(v)?;
+        }
         match &mut self.mixer {
             DeviceMixer::Attention(a) => a.walk(w)?,
             DeviceMixer::Linear(g) => g.walk(w)?,

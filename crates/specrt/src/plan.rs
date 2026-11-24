@@ -30,6 +30,7 @@ pub enum Buf {
     MtpLogits,
     Partial,
     Gdn,
+    Streams,
 }
 
 impl Buf {
@@ -55,6 +56,7 @@ impl Buf {
             Buf::MtpLogits => "draft logits",
             Buf::Partial => "rank partial",
             Buf::Gdn => "gdn",
+            Buf::Streams => "streams",
         }
     }
 
@@ -250,6 +252,10 @@ pub enum Op {
     GemvStore { weight: Weight, quant: QuantSource, input: Buf, output: Buf },
     StepAttention,
     GdnStep,
+    HyperExpand,
+    HyperPre { site: u8 },
+    HyperPost,
+    HyperMean,
 }
 
 pub fn weight_kind(q: Quant) -> WeightKind {
@@ -303,6 +309,10 @@ impl Op {
             Op::GemvStore { weight, .. } => format!("{} store", weight.name()),
             Op::StepAttention => "step attention".into(),
             Op::GdnStep => "delta rule step".into(),
+            Op::HyperExpand => "hyper expand".into(),
+            Op::HyperPre { site } => format!("hyper pre {site}"),
+            Op::HyperPost => "hyper post".into(),
+            Op::HyperMean => "hyper mean".into(),
         }
     }
 
@@ -337,6 +347,10 @@ impl Op {
             Op::GemvStore { input, output, .. } => format!("{} stored to {}", input.label(), output.label()),
             Op::StepAttention => "qkv and kv cache to attn".into(),
             Op::GdnStep => "lin, ba and state to gdn".into(),
+            Op::HyperExpand => "x to streams".into(),
+            Op::HyperPre { .. } => "streams to x and hyper weights".into(),
+            Op::HyperPost => "x and hyper weights into streams".into(),
+            Op::HyperMean => "streams to x".into(),
         }
     }
 
@@ -375,6 +389,7 @@ impl Op {
             Op::GdnPrefill | Op::GdnDecode | Op::GdnStep => ["conv1d.weight", "A_log", "dt_bias", "norm.weight"].iter().map(|t| format!("linear_attn.{t}")).collect(),
             Op::MoeRoute => vec!["mlp.gate.weight".into(), "mlp.shared_expert_gate.weight".into()],
             Op::MoeExperts => spec.expert_tensors(),
+            Op::HyperPre { site } => spec.hyper.as_ref().and_then(|h| h.sites.get(*site as usize)).map(|s| ["fn", "base", "scale"].iter().map(|t| format!("{s}_{t}")).collect()).unwrap_or_default(),
             _ => Vec::new(),
         }
     }
@@ -472,6 +487,10 @@ impl Op {
             },
             Op::StepAttention => names(&["qk_norm_rope", "attention_split", "attention_reduce"]),
             Op::GdnStep => names(&["gdn_conv_step", "gdn_step"]),
+            Op::HyperExpand => names(&["hyper_expand"]),
+            Op::HyperPre { .. } => names(&["hyper_pre"]),
+            Op::HyperPost => names(&["hyper_post"]),
+            Op::HyperMean => names(&["hyper_mean"]),
         }
     }
 }

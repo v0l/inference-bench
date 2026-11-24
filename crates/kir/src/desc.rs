@@ -10,7 +10,7 @@ use toml::Value;
 
 pub const KIND: &str = "kir-kernel";
 
-pub const ROW_FAMILIES: [&str; 7] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool"];
+pub const ROW_FAMILIES: [&str; 12] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool", "hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_topk"];
 
 pub const SEQ_FAMILIES: [&str; 3] = ["recurrence", "seq_conv", "group_norm"];
 
@@ -597,7 +597,7 @@ impl Description {
     }
 
     fn sizes(&self, shape: &Shape, table: &BTreeMap<String, Value>, keys: &[&str], what: &str) -> Result<BTreeMap<String, u32>, String> {
-        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !matches!(k.as_str(), "src" | "style" | "name" | "space" | "act" | "input" | "output" | "eps" | "invert" | "stride")) {
+        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !matches!(k.as_str(), "src" | "style" | "name" | "space" | "act" | "input" | "output" | "eps" | "mix_eps" | "invert" | "stride")) {
             return Err(format!("{}: {what} has no key {k:?}", self.name));
         }
         let mut out = BTreeMap::new();
@@ -816,6 +816,37 @@ impl Description {
             "layernorm_segment" => {
                 let n = self.sizes(shape, &self.args, &["width", "row", "head", "offset"], "[args]")?;
                 RowBody::LayerNorm { width: n["width"], row: n["row"], head: n["head"], offset: n["offset"], eps: self.number(shape, "eps")? as f32 }
+            }
+            "hyper_pre" => {
+                let n = self.sizes(shape, &self.args, &["streams", "hidden", "iters"], "[args]")?;
+                RowBody::HyperPre { streams: n["streams"], hidden: n["hidden"], iters: n["iters"], norm_eps: self.number(shape, "eps")? as f32, eps: self.number(shape, "mix_eps")? as f32 }
+            }
+            "hyper_post" | "hyper_expand" | "hyper_mean" => {
+                let n = self.sizes(shape, &self.args, &["streams", "hidden"], "[args]")?;
+                let (streams, hidden) = (n["streams"], n["hidden"]);
+                match self.family.as_str() {
+                    "hyper_post" => RowBody::HyperPost { streams, hidden },
+                    "hyper_expand" => RowBody::HyperExpand { streams, hidden },
+                    _ => RowBody::HyperMean { streams, hidden },
+                }
+            }
+            "pool_topk" => {
+                let n = self.sizes(shape, &self.args, &["heads", "dim", "pool", "pick", "max_pools", "q_row", "q_offset", "w_row", "w_offset", "out_row", "layers", "tail"], "[args]")?;
+                let tail = n["tail"] != 0;
+                RowBody::PoolTopk {
+                    heads: n["heads"],
+                    dim: n["dim"],
+                    pool: n["pool"],
+                    pick: n["pick"],
+                    max_pools: n["max_pools"],
+                    q_row: n["q_row"],
+                    q_offset: n["q_offset"],
+                    w_row: n["w_row"],
+                    w_offset: n["w_offset"],
+                    out_row: n["out_row"],
+                    layers: n["layers"],
+                    tail,
+                }
             }
             "head_matvec" => {
                 let n = self.sizes(shape, &self.args, &["x_row", "x_head", "x_offset", "inner", "w_head", "w_inner", "w_out", "w_offset", "out", "y_row", "y_head", "y_offset"], "[args]")?;

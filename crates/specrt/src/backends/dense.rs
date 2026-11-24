@@ -221,7 +221,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             }
             Op::Swiglu if rows == 1 && be.limits().subgroup_size == 32 => Ok(()),
             Op::Swiglu => be.dispatch(kernels[0], &[&m.scratch.gate_up, &m.scratch.act], [r, 0, 0, 0, 0, 0, 0, 0], grid_1d(rows * spec.dims.intermediate)),
-            Op::Kernel { .. } | Op::DecodeRope => bail!("described kernels are not yet on wgpu"),
+            Op::Kernel { .. } | Op::MixKernel { .. } | Op::DecodeRope => bail!("described kernels are not yet on wgpu"),
             Op::NormAdd { .. } | Op::Clear { .. } | Op::Split { .. } | Op::QkNorm | Op::ScaledAdd { .. } | Op::LogitScale | Op::LogitSoftcap => bail!("{} is not yet on wgpu", op.label()),
             Op::Splice => bail!("vision is not yet on wgpu"),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => bail!("delta-net is not yet on wgpu"),
@@ -229,6 +229,7 @@ impl<B: Backend> PlanBackend<Step> for Exec<'_, B> {
             Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => bail!("mixture of experts is not yet on wgpu"),
             Op::AllReduce | Op::AllReduceNorm { .. } => bail!("tensor parallel is not on wgpu"),
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => bail!("the single row cuda plan is not on wgpu"),
+            Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => bail!("hyper-connections are not yet on wgpu"),
         }
     }
 }

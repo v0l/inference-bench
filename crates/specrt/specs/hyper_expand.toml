@@ -1,0 +1,18 @@
+kind = "kir-kernel"
+family = "hyper_expand"
+name = "hyper_expand"
+threads = 128
+
+[args]
+streams = "hc_streams"
+hidden = "hidden"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "streams"
+role = "activation"
+access = "write"

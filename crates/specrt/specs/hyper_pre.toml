@@ -1,0 +1,41 @@
+kind = "kir-kernel"
+family = "hyper_pre"
+name = "hyper_pre"
+threads = 256
+
+[args]
+streams = "hc_streams"
+hidden = "hidden"
+iters = "hc_sinkhorn_iters"
+eps = "norm_eps"
+mix_eps = "hc_eps"
+
+[[param]]
+name = "streams"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "proj"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "base"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "scale"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "mix"
+role = "activation"
+access = "write"

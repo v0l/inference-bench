@@ -3,7 +3,7 @@ use crate::executor::PlanBackend;
 use crate::plan::{Buf, NormKind, Op, Phase, Plan, Weight};
 use crate::graph::Bind;
 use crate::spec::{Block, Spec};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::{CudaSlice, LaunchConfig};
 use std::ops::Range;
 
@@ -112,7 +112,31 @@ impl Runtime {
             Op::AllReduce => self.allreduce_op(n),
             Op::AllReduceNorm { which } => self.allreduce_norm_op(which, layer, n),
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
+            Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => self.hyper_op(op, layer, n),
         }
+    }
+
+    fn hyper_op(&self, op: &Op, layer: Option<&DeviceLayer>, n: usize) -> Result<()> {
+        let (name, threads) = match *op {
+            Op::HyperExpand => ("hyper_expand", 128),
+            Op::HyperPre { .. } => ("hyper_pre", 256),
+            Op::HyperPost => ("hyper_post", 128),
+            _ => ("hyper_mean", 128),
+        };
+        let mut b = self.launcher(self.kernel(name));
+        match *op {
+            Op::HyperExpand => b.arg(&self.pre.x).arg(&self.pre.streams),
+            Op::HyperPre { site } => {
+                let w = &layer.context("hyper pre runs inside a layer")?.hyper;
+                let at = 3 * site as usize;
+                ensure!(w.len() >= at + 3, "the layer has no hyper weights for site {site}");
+                b.arg(&self.pre.streams).arg(&w[at]).arg(&w[at + 1]).arg(&w[at + 2]).arg(&self.pre.x).arg(&self.pre.hyper_mix)
+            }
+            Op::HyperPost => b.arg(&self.pre.x).arg(&self.pre.hyper_mix).arg(&self.pre.streams),
+            _ => b.arg(&self.pre.streams).arg(&self.pre.x),
+        };
+        unsafe { b.launch(LaunchConfig { grid_dim: (1, n as u32, 1), block_dim: (threads, 1, 1), shared_mem_bytes: 0 }) }?;
+        Ok(())
     }
 
     fn kernel_op(&self, node: u8, l: &DeviceAttn, run: &Run) -> Result<()> {

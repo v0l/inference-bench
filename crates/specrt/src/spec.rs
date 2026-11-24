@@ -498,7 +498,7 @@ pub struct Indexer {
     pub kpool: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Hyper {
     pub streams: usize,
@@ -506,6 +506,8 @@ pub struct Hyper {
     pub sinkhorn_iters: usize,
     #[serde(default)]
     pub eps: f64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sites: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -104,6 +104,15 @@ fn the_graph_lowers_to_the_reference_plan_for_every_config() {
             checked += 1;
             continue;
         }
+        if spec.hyper.is_some() {
+            for phase in [Phase::Prefill, Phase::Decode] {
+                let plan = Plan::build(&spec, phase, true);
+                assert_eq!(plan.head.last(), Some(&Op::HyperExpand), "{}", path.display());
+                assert_eq!(plan.tail.first(), Some(&Op::HyperMean), "{}", path.display());
+            }
+            checked += 1;
+            continue;
+        }
         if spec.norm.sandwich && spec.norm.pre {
             sandwich_plan_is_well_formed(&spec);
             checked += 1;

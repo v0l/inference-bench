@@ -19,7 +19,7 @@ impl Runtime {
     ) -> Result<(Vec<u32>, Option<u32>)> {
         ensure!(self.use_mma, "serving needs the tensor core path");
         ensure!(self.comm.is_none(), "a tensor parallel rank runs decode and prefill as separate steps");
-        ensure!(self.spec.mixer.is_none() && !self.spec.layers.split, "a described mixer or mlp-only layer runs prefill and decode as separate steps");
+        ensure!(self.spec.mixer.is_none() && self.spec.hyper.is_none() && !self.spec.layers.split, "a described mixer, hyper-connections or mlp-only layer runs prefill and decode as separate steps");
         let nd = rows.len();
         let np = part.tokens.len();
         let n = nd + np;

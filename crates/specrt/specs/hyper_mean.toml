@@ -1,0 +1,18 @@
+kind = "kir-kernel"
+family = "hyper_mean"
+name = "hyper_mean"
+threads = 128
+
+[args]
+streams = "hc_streams"
+hidden = "hidden"
+
+[[param]]
+name = "streams"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"

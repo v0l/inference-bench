@@ -52,6 +52,7 @@ pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static s
         Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => anyhow::bail!("mixture of experts is not yet on wgpu"),
         Op::AllReduce | Op::AllReduceNorm { .. } => anyhow::bail!("tensor parallel is not on wgpu"),
         Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => anyhow::bail!("the single row cuda plan is not on wgpu"),
+        Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => anyhow::bail!("hyper-connections are not yet on wgpu"),
     })
 }
 
@@ -68,6 +69,9 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
     }
     if spec.mixer.is_some() {
         return Some("described mixers are not yet on wgpu".into());
+    }
+    if spec.hyper.is_some() {
+        return Some("hyper-connections are not yet on wgpu".into());
     }
     if spec.layers.split || spec.mlp.mapped.is_some() {
         return Some("mlp-only layers and non-gated mlps are not yet on wgpu".into());

@@ -164,8 +164,10 @@ fn class_of(body: &kir::Body) -> Class {
         kir::Body::Rows(r) => match r {
             RowBody::HeadRms { .. } | RowBody::LayerNorm { .. } => Class::RowReduce,
             RowBody::SpanRope { .. } => Class::Elementwise,
-            RowBody::StateWrite { .. } | RowBody::BlockPool { .. } | RowBody::IndexTopk { .. } => Class::Gather,
+            RowBody::StateWrite { .. } | RowBody::BlockPool { .. } | RowBody::IndexTopk { .. } | RowBody::PoolTopk { .. } => Class::Gather,
             RowBody::HeadMatvec { .. } => Class::Gemm,
+            RowBody::HyperPre { .. } => Class::RowReduce,
+            RowBody::HyperPost { .. } | RowBody::HyperExpand { .. } | RowBody::HyperMean { .. } => Class::Elementwise,
         },
         kir::Body::Recurrence(_) => Class::Scan,
         kir::Body::Seq(kir::recur::SeqBody::Conv { .. }) => Class::Scan,
@@ -470,6 +472,17 @@ impl<'a> Signer<'a> {
             Op::AllReduceNorm { which } => {
                 let partial = Tensor::buf(Buf::Partial, Rows::Tokens, h);
                 sig(Class::RowReduce, vec![partial.clone(), self.x(), self.norm_weight(which)], vec![self.x(), Tensor::buf(Buf::XnPlanes, Rows::Tokens, h), partial])
+            }
+            Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => {
+                let n = spec.hyper.as_ref().map_or(1, |hc| hc.streams);
+                let streams = Tensor::buf(Buf::Streams, Rows::Tokens, n * h);
+                let mix = Tensor::new(Place::Local("hyper weights".into()), Rows::Tokens, (2 + n) * n, Form::F32);
+                match *op {
+                    Op::HyperExpand => sig(Class::Elementwise, vec![self.x()], vec![streams]),
+                    Op::HyperPre { .. } => sig(Class::RowReduce, vec![streams, Tensor::weight("hyper fn", (2 + n) * n, n * h, Form::Bf16)], vec![self.x(), mix]),
+                    Op::HyperPost => sig(Class::Elementwise, vec![self.x(), mix, streams.clone()], vec![streams]),
+                    _ => sig(Class::Elementwise, vec![streams], vec![self.x()]),
+                }
             }
         })
     }

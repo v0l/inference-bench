@@ -15,7 +15,14 @@ pub enum RowBody {
     IndexTopk { heads: u32, dim: u32, topk: u32, max_keys: u32, q_row: u32, q_offset: u32, w_row: u32, w_offset: u32, out_row: u32, layers: u32 },
     LayerNorm { width: u32, row: u32, head: u32, offset: u32, eps: f32 },
     HeadMatvec { x_row: u32, x_head: u32, x_offset: u32, inner: u32, w_head: u32, w_inner: u32, w_out: u32, w_offset: u32, out: u32, y_row: u32, y_head: u32, y_offset: u32 },
+    HyperPre { streams: u32, hidden: u32, iters: u32, norm_eps: f32, eps: f32 },
+    HyperPost { streams: u32, hidden: u32 },
+    HyperExpand { streams: u32, hidden: u32 },
+    HyperMean { streams: u32, hidden: u32 },
+    PoolTopk { heads: u32, dim: u32, pool: u32, pick: u32, max_pools: u32, q_row: u32, q_offset: u32, w_row: u32, w_offset: u32, out_row: u32, layers: u32, tail: bool },
 }
+
+const MAX_STREAMS: u32 = 8;
 
 const POSITION: [(&str, Scalar, Role, Access); 4] = [
     ("pos", Scalar::I32, Role::Activation, Access::Read),
@@ -40,6 +47,11 @@ impl RowBody {
             RowBody::LayerNorm { .. } => "layernorm_segment",
             RowBody::HeadRms { .. } => "head_rms",
             RowBody::BlockPool { .. } => "block_pool",
+            RowBody::HyperPre { .. } => "hyper_pre",
+            RowBody::HyperPost { .. } => "hyper_post",
+            RowBody::HyperExpand { .. } => "hyper_expand",
+            RowBody::HyperMean { .. } => "hyper_mean",
+            RowBody::PoolTopk { .. } => "pool_topk",
         }
     }
 
@@ -95,6 +107,38 @@ impl RowBody {
                 out.push(("w", Scalar::F32, Role::Weight, Access::Read));
                 out.push(("b", Scalar::F32, Role::Weight, Access::Read));
             }
+            RowBody::HyperPre { .. } => {
+                out.push(("streams", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("proj", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("base", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("scale", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("x", Scalar::F32, Role::Activation, Access::Write));
+                out.push(("mix", Scalar::F32, Role::Activation, Access::Write));
+            }
+            RowBody::HyperPost { .. } => {
+                out.push(("x", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("mix", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("streams", Scalar::F32, Role::Activation, Access::Write));
+            }
+            RowBody::HyperExpand { .. } => {
+                out.push(("x", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("streams", Scalar::F32, Role::Activation, Access::Write));
+            }
+            RowBody::HyperMean { .. } => {
+                out.push(("streams", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("x", Scalar::F32, Role::Activation, Access::Write));
+            }
+            RowBody::PoolTopk { .. } => {
+                out.push(("q", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("w", Scalar::F32, Role::Activation, Access::Read));
+                out.push(("keys", Scalar::Bf16, Role::Activation, Access::Read));
+                out.push(("ape", Scalar::F32, Role::Weight, Access::Read));
+                out.push(("idx", Scalar::I32, Role::Activation, Access::Write));
+                out.extend(POSITION);
+                out.extend(PAGED);
+                out.push(("scale", Scalar::F32, Role::Value, Access::Read));
+                out.push(("w_scale", Scalar::F32, Role::Value, Access::Read));
+            }
             RowBody::HeadMatvec { .. } => {
                 out.push(("x", Scalar::F32, Role::Activation, Access::Read));
                 out.push(("w", Scalar::F32, Role::Weight, Access::Read));
@@ -139,6 +183,19 @@ impl RowBody {
             RowBody::IndexTopk { max_keys, .. } if *max_keys > 12288 => Err("index_topk scores live in shared memory, at most 12288 keys".into()),
             RowBody::LayerNorm { width, eps, .. } if *width == 0 || !eps.is_finite() || *eps < 0.0 => Err("layernorm_segment needs a positive width and a finite eps".into()),
             RowBody::HeadMatvec { inner, out, .. } if *inner == 0 || *out == 0 => Err("head_matvec needs positive inner and out sizes".into()),
+            RowBody::HyperPre { streams, hidden, .. } | RowBody::HyperPost { streams, hidden } | RowBody::HyperExpand { streams, hidden } | RowBody::HyperMean { streams, hidden }
+                if !(2..=MAX_STREAMS).contains(streams) || *hidden == 0 =>
+            {
+                Err(format!("{} needs 2 to {MAX_STREAMS} streams and a positive hidden size", self.family()))
+            }
+            RowBody::HyperPre { iters, norm_eps, eps, .. } if *iters == 0 || !norm_eps.is_finite() || *norm_eps < 0.0 || !eps.is_finite() || *eps < 0.0 => {
+                Err("hyper_pre needs at least one Sinkhorn iteration and finite eps values".into())
+            }
+            RowBody::PoolTopk { heads, dim, pool, pick, max_pools, .. } if *heads == 0 || *heads > 64 || *dim == 0 || *pool == 0 || *pick == 0 || *max_pools == 0 => {
+                Err("pool_topk needs 1 to 64 heads and positive dim, pool, pick and max_pools".into())
+            }
+            RowBody::PoolTopk { max_pools, .. } if *max_pools > 12288 => Err("pool_topk scores live in shared memory, at most 12288 pools".into()),
+            RowBody::PoolTopk { pick, pool, out_row, .. } if *out_row < pick * pool + pool - 1 => Err("pool_topk out_row must hold the picked pools and the open tail".into()),
             _ => Ok(()),
         }
     }
@@ -373,6 +430,208 @@ impl RowBody {
     }}
 ",
                 eps = crate::lit(*eps),
+            ),
+            RowBody::HyperPre { streams, hidden, iters, norm_eps, eps } => format!(
+                "    constexpr int N = {streams};
+    constexpr int H = {hidden};
+    constexpr int W = N * H;
+    constexpr int M = (2 + N) * N;
+    __shared__ float red[32];
+    __shared__ float raw[M];
+    __shared__ float coef[M];
+    const int row = blockIdx.y;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (blockDim.x + 31) >> 5;
+    const float* s = streams + (size_t)row * W;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < W; i += blockDim.x) ss += s[i] * s[i];
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if (lane == 0) red[warp] = ss;
+    __syncthreads();
+    float total = 0.0f;
+    for (int i = 0; i < warps; i++) total += red[i];
+    const float inv = rsqrtf(total / W + {norm_eps}f);
+    for (int m = warp; m < M; m += warps) {{
+        const float* f = proj + (size_t)m * W;
+        float acc = 0.0f;
+        for (int i = lane; i < W; i += 32) acc += f[i] * s[i];
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) raw[m] = acc * inv;
+    }}
+    __syncthreads();
+    if (threadIdx.x == 0) {{
+        for (int k = 0; k < N; k++) {{
+            coef[k] = 1.0f / (1.0f + expf(-(raw[k] * scale[0] + base[k]))) + {eps}f;
+            coef[N + k] = 2.0f / (1.0f + expf(-(raw[N + k] * scale[1] + base[N + k])));
+        }}
+        float* c = coef + 2 * N;
+        for (int i = 0; i < N; i++) {{
+            float top = -3.0e30f;
+            for (int j = 0; j < N; j++) {{
+                c[i * N + j] = raw[2 * N + i * N + j] * scale[2] + base[2 * N + i * N + j];
+                top = fmaxf(top, c[i * N + j]);
+            }}
+            float sum = 0.0f;
+            for (int j = 0; j < N; j++) {{
+                c[i * N + j] = expf(c[i * N + j] - top);
+                sum += c[i * N + j];
+            }}
+            for (int j = 0; j < N; j++) c[i * N + j] = c[i * N + j] / sum + {eps}f;
+        }}
+        for (int it = 0; it < {iters}; it++) {{
+            if (it > 0) {{
+                for (int i = 0; i < N; i++) {{
+                    float sum = {eps}f;
+                    for (int j = 0; j < N; j++) sum += c[i * N + j];
+                    for (int j = 0; j < N; j++) c[i * N + j] /= sum;
+                }}
+            }}
+            for (int j = 0; j < N; j++) {{
+                float sum = {eps}f;
+                for (int i = 0; i < N; i++) sum += c[i * N + j];
+                for (int i = 0; i < N; i++) c[i * N + j] /= sum;
+            }}
+        }}
+    }}
+    __syncthreads();
+    for (int k = threadIdx.x; k < M; k += blockDim.x) mix[(size_t)row * M + k] = coef[k];
+    for (int d = threadIdx.x; d < H; d += blockDim.x) {{
+        float acc = 0.0f;
+        for (int k = 0; k < N; k++) acc += coef[k] * s[k * H + d];
+        x[(size_t)row * H + d] = acc;
+    }}
+",
+                norm_eps = crate::lit(*norm_eps),
+                eps = crate::lit(*eps),
+            ),
+            RowBody::HyperPost { streams, hidden } => format!(
+                "    constexpr int N = {streams};
+    constexpr int H = {hidden};
+    constexpr int M = (2 + N) * N;
+    const int row = blockIdx.y;
+    const float* c = mix + (size_t)row * M;
+    const float* xv = x + (size_t)row * H;
+    float* s = streams + (size_t)row * N * H;
+    for (int d = threadIdx.x; d < H; d += blockDim.x) {{
+        float in[N];
+        float collapsed = 0.0f;
+        for (int k = 0; k < N; k++) {{
+            in[k] = s[k * H + d];
+            collapsed += c[k] * in[k];
+        }}
+        const float y = xv[d] - collapsed;
+        for (int o = 0; o < N; o++) {{
+            float acc = c[N + o] * y;
+            for (int i = 0; i < N; i++) acc += c[2 * N + i * N + o] * in[i];
+            s[o * H + d] = acc;
+        }}
+    }}
+"
+            ),
+            RowBody::HyperExpand { streams, hidden } => format!(
+                "    constexpr int N = {streams};
+    constexpr int H = {hidden};
+    const int row = blockIdx.y;
+    for (int d = threadIdx.x; d < H; d += blockDim.x) {{
+        const float v = x[(size_t)row * H + d];
+        for (int k = 0; k < N; k++) streams[((size_t)row * N + k) * H + d] = v;
+    }}
+"
+            ),
+            RowBody::HyperMean { streams, hidden } => format!(
+                "    constexpr int N = {streams};
+    constexpr int H = {hidden};
+    const int row = blockIdx.y;
+    for (int d = threadIdx.x; d < H; d += blockDim.x) {{
+        float acc = 0.0f;
+        for (int k = 0; k < N; k++) acc += streams[((size_t)row * N + k) * H + d];
+        x[(size_t)row * H + d] = acc / N;
+    }}
+"
+            ),
+            RowBody::PoolTopk { heads, dim, pool, pick, max_pools, q_row, q_offset, w_row, w_offset, out_row, layers, tail } => format!(
+                "    constexpr int HEADS = {heads};
+    constexpr int DIM = {dim};
+    constexpr int POOL = {pool};
+    constexpr int PICK = {pick};
+    constexpr int MAX_POOLS = {max_pools};
+    constexpr bool TAIL = {tail};
+    __shared__ float score[MAX_POOLS];
+    __shared__ float best_v[32];
+    __shared__ int best_i[32];
+    const int row = blockIdx.y;
+    const int seen = pos[row * pos_step] + row * row_step + 1;
+    const int pools = min(seen / POOL, MAX_POOLS);
+    const float* qr = q + (size_t)row * {q_row} + {q_offset};
+    const float* wr = w + (size_t)row * {w_row} + {w_offset};
+    const int* table = seq_table(block_table, slots, row, pages);
+    for (int t = threadIdx.x; t < MAX_POOLS; t += blockDim.x) {{
+        float s = -3.0e30f;
+        if (t < pools) {{
+            float acc[HEADS];
+            for (int h = 0; h < HEADS; h++) acc[h] = 0.0f;
+            for (int j = 0; j < DIM; j++) {{
+                float g[POOL];
+                float v[POOL];
+                float top = -3.0e30f;
+                for (int k = 0; k < POOL; k++) {{
+                    const int tp = t * POOL + k;
+                    const bf16_t* kr = keys + (((size_t)table[tp / PAGE] * {layers} + layer) * PAGE + tp % PAGE) * 2 * DIM * KV_PLANES;
+                    v[k] = attn_float(kr[j]) + (KV_PLANES == 2 ? attn_float(kr[2 * DIM + j]) : 0.0f);
+                    g[k] = attn_float(kr[DIM + j]) + (KV_PLANES == 2 ? attn_float(kr[3 * DIM + j]) : 0.0f) + ape[k * DIM + j];
+                    top = fmaxf(top, g[k]);
+                }}
+                float den = 0.0f;
+                float pk = 0.0f;
+                for (int k = 0; k < POOL; k++) {{
+                    const float e = expf(g[k] - top);
+                    den += e;
+                    pk += e * v[k];
+                }}
+                pk /= den;
+                for (int h = 0; h < HEADS; h++) acc[h] += qr[h * DIM + j] * pk;
+            }}
+            s = 0.0f;
+            for (int h = 0; h < HEADS; h++) s += wr[h] * w_scale * fmaxf(acc[h] * scale, 0.0f);
+        }}
+        score[t] = s;
+    }}
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = (blockDim.x + 31) >> 5;
+    int* out = idx + (size_t)row * {out_row};
+    for (int r = 0; r < PICK; r++) {{
+        float bv = -3.0e30f;
+        int bi = MAX_POOLS;
+        for (int t = threadIdx.x; t < MAX_POOLS; t += blockDim.x) {{
+            if (score[t] > bv) {{ bv = score[t]; bi = t; }}
+        }}
+        for (int o = 16; o > 0; o >>= 1) {{
+            float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) {{ bv = ov; bi = oi; }}
+        }}
+        if (lane == 0) {{ best_v[warp] = bv; best_i[warp] = bi; }}
+        __syncthreads();
+        if (threadIdx.x == 0) {{
+            float v = best_v[0];
+            int at = best_i[0];
+            for (int i = 1; i < warps; i++) {{
+                if (best_v[i] > v || (best_v[i] == v && best_i[i] < at)) {{ v = best_v[i]; at = best_i[i]; }}
+            }}
+            const bool live = r < pools && at < MAX_POOLS;
+            for (int k = 0; k < POOL; k++) out[r * POOL + k] = live ? at * POOL + k : -1;
+            if (live) score[at] = -3.0e30f;
+        }}
+        __syncthreads();
+    }}
+    for (int k = threadIdx.x; k < {out_row} - PICK * POOL; k += blockDim.x) {{
+        const int tok = pools * POOL + k;
+        out[PICK * POOL + k] = TAIL && k < POOL - 1 && tok < seen ? tok : -1;
+    }}
+"
             ),
             RowBody::HeadMatvec { x_row, x_head, x_offset, inner, w_head, w_inner, w_out, w_offset, out, y_row, y_head, y_offset } => {
                 let store = if Self::planes(&k.params) {

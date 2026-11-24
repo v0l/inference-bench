@@ -145,6 +145,7 @@ pub struct Layer<'a> {
     pub gate_up: Matrix<'a>,
     pub down: Matrix<'a>,
     pub moe: Option<MoeWeights>,
+    pub hyper: Vec<Vec<f32>>,
 }
 
 pub struct Outside<'a> {
@@ -1190,7 +1191,21 @@ impl Checkpoint {
             gate_up,
             down,
             moe,
+            hyper: self.hyper(spec, &p)?,
         })
+    }
+
+    fn hyper(&self, spec: &Spec, p: &str) -> Result<Vec<Vec<f32>>> {
+        let Some(hc) = &spec.hyper else { return Ok(Vec::new()) };
+        let (n, h) = (hc.streams, spec.dims.hidden);
+        let m = (2 + n) * n;
+        let mut out = Vec::new();
+        for site in &hc.sites {
+            out.push(self.floats(&format!("{p}.{site}_fn"), &[m, n * h])?);
+            out.push(self.floats(&format!("{p}.{site}_base"), &[m])?);
+            out.push(self.floats(&format!("{p}.{site}_scale"), &[3])?);
+        }
+        Ok(out)
     }
 
     fn gguf_stack(&self, g: &Gguf, name: &str, shape: &[usize], out: &mut Vec<u16>) -> Result<()> {
@@ -1529,6 +1544,7 @@ impl Checkpoint {
                 gate_up,
                 down,
                 moe,
+                hyper: Vec::new(),
             },
             norm: self.norm(spec, &lay.norm, h)?,
         })
