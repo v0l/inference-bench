@@ -165,6 +165,28 @@ impl FamilyHyper {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyGatedResidual {
+    pub streams: Option<String>,
+    pub module: String,
+    pub sites: Vec<String>,
+    pub params: std::collections::BTreeMap<String, ParamSource>,
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl FamilyGatedResidual {
+    pub fn read(&self, config: &serde_json::Value) -> Result<Option<crate::spec::GatedResidual>> {
+        if self.node.is_empty() {
+            return Ok(None);
+        }
+        let key = self.streams.as_deref().context("[gated_residual] needs streams, the config key of the stream count")?;
+        let streams = dotted(config, key).and_then(|v| v.as_u64()).with_context(|| format!("[gated_residual] streams reads {key}, which the config does not hold"))? as usize;
+        Ok(Some(crate::spec::GatedResidual { streams, module: self.module.clone(), sites: self.sites.clone(), params: read_params(&self.params, config)?, scratch: self.scratch.clone(), node: self.node.clone() }))
+    }
+}
+
 impl Default for FamilyAttention {
     fn default() -> Self {
         FamilyAttention {
@@ -347,6 +369,7 @@ pub struct FamilyBlocks {
 pub struct FamilyLinear {
     pub fused_interleaved: bool,
     pub kinds: Vec<KindRule<crate::spec::LinearKind>>,
+    pub gate_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -610,6 +633,8 @@ pub struct Family {
     #[serde(default)]
     pub hyper: FamilyHyper,
     #[serde(default)]
+    pub gated_residual: FamilyGatedResidual,
+    #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub refuse: Vec<FamilyRefuse>,
@@ -630,7 +655,7 @@ impl Family {
                 push(a, &mut out);
             }
         }
-        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()) {
+        for (_, key) in self.attention.params.iter().chain(self.mixer.params.iter()).chain(self.gated_residual.params.iter()) {
             match key {
                 ParamSource::Config { config, alt, .. } => {
                     push(config, &mut out);
@@ -650,6 +675,9 @@ impl Family {
         }
         for s in self.attention.scratch.values().chain(self.mixer.scratch.values()) {
             expr_keys(s, &mut out);
+        }
+        if let Some(k) = self.linear.gate_key.as_deref() {
+            push(k, &mut out);
         }
         if let Some(k) = self.blocks.attention_indices_key.as_deref() {
             push(k, &mut out);
@@ -678,7 +706,7 @@ impl Family {
         if let Some(k) = self.rope.nope_zero_key.as_deref() {
             push(k, &mut out);
         }
-        for k in self.hyper.keys() {
+        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()) {
             push(k, &mut out);
         }
         if let Some(i) = &self.attention.indexer {

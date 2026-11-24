@@ -43,6 +43,19 @@ Tests (`tests/qsa_indexer.rs`): a CPU reference of the selection reproduces the 
 - `family-generic.toml` aliases `hc_count` and `indexer_*` so `describe_hf_config` reports the 4 streams and the pooled indexer (4 heads, 64 dim, top 16, pool 4).
 - `tests/qwen4_exp.rs` pins the description, the tensor names and shapes, the reference, and that the engine still refuses the model.
 
+## Four stream residual (#1277)
+
+The gated residual is a `[gated_residual]` table: no Rust names it, and the kernels are kir descriptions in `crates/specrt/specs/hc_*.toml`. It is separate from glm5's `[hyper]` (#1191: Sinkhorn, comb matrix, `hyper_*` rows); a spec takes one of the two.
+
+- Spec. `[gated_residual]` has `streams` (config key), `module` (the final mixer), `sites` (one or two per block modules), `params`, `scratch` and `[[gated_residual.node]]`. Each node is `expand` (embedding to every stream), `pre` (before a block; a node with `when = "site"` runs only inside blocks, so the final mixer skips the inject weights) or `post` (after a block). Nodes bind `x`, `streams`, a scratch buffer or a weight under the site module. `Spec::validate_hyper` refuses `[hyper]` beside it, pre or sandwich norms, MTP and mixers, and checks every grid symbol, buffer and weight length.
+- Kernels. `hc_norm` (`group_norm`, `(1 + w) * n` per hidden wide group), `hc_down`, `hc_up`, `hc_inject` (`head_matvec`), `hc_act` (`compose`, `silu(v / streams)`), `hc_mix` (`group_sum`: `sum over streams of sigmoid(gate) * normed / streams`), `hc_inject_add` and `hc_expand` (`group_update`: `stream + y * 2 sigmoid(c / streams)` and the copy). `group_sum` and `group_update` are generic stream families in `kir::recur`, tested in `kir/tests/recur.rs`.
+- Plan. `decoder.toml` has `gated_linear_moe` and `gated_attention_moe` blocks: `gated_pre 0`, the qwen3_5 block body reading `x` (no input norm, `split` straight to planes), `clear x`, the output linear into `x`, `gated_post 0`, then the same around the MoE (the route skips its own norm, `MoeShape::input_norm`). The head adds `gated_expand`; the tail runs `gated_collapse` then `split` instead of the final norm. Each graph node lowers to one `Op::Gated { node, site }` per described node.
+- Stream buffer. `GatedBuffers` in `runtime.rs` owns the 4 x hidden per row stream buffer and the scratch.
+- Test. `the_four_stream_residual_matches_the_reference_streams_of_layers_0_1_and_3` (ignored, GPU) loads the fixture with `tests/fixtures/tiny-qwen4-exp/hyper-harness.toml`, a test only family that extends `qwen3_5` and adds the `[gated_residual]` table, through `Spec::from_hf_config_serving_in`. `Runtime::trace_streams` runs one prefill chunk, copies the streams after each layer and adds stubbed deltas before chosen layers: the PLE output of layer 1 is the first 30 rows of `tiny-qwen4-exp.ple.out.bin` (#1279's capture). Layers 0 and 1 compare every row; layer 3 compares the rows before the indexer selects (positions whose complete groups fit the 16 token budget). The bar is the qwen3.5 tiny fixtures' 1e-3, and the test also checks that leaving out the PLE delta fails at layer 1.
+- Delta-net output gate. Qwen4Exp gates the gated RMSNorm of the delta-net output with `output_gate_type` (fallback `hidden_act`); the tiny fixture uses `sigmoid`, qwen3_5 uses `silu`. `[linear] gate_key = "output_gate_type"` in a family sets `LinearAttention::gate_sigmoid`, and `kir::linear` emits `la_sigmoid` instead of `silu` in `gdn_step`, `gdn_verify` and `gdn_gated_norm` (`kir/tests/linear.rs`); without the key the text is unchanged (`linear_unchanged`). The GPU check found this: before it, layers 0, 1 and 3 were off by about 4.
+- Reference size. The hidden streams are stored as int16 with a per layer scale (`tiny-qwen4-exp.hidden.streams.i16`, scales in `hidden.json`, rounding at most 2.4e-4, a quarter of the bar); the PLE stub reuses #1279's `ple.out.bin`. The fixture folder is 5087428 bytes.
+- GPU1 (shared with the user's app, `gpu-run 1 --min-free 2000`): layer 0 max abs 9.5e-5, layer 1 2.6e-4, layer 3 2.4e-4 (19 rows), including the int16 rounding.
+
 ## n-gram hash and PLE (#1279)
 
 Order, read from `Qwen4ExpTextPLELayer.forward`: `out = gated + silu(conv(norm_conv(gated)))` where `gated[s] = sigmoid(sqrt(abs(g_s)) sign(g_s)) * value` and `g_s = norm_key(key)[s] . norm_query(x)[s] / sqrt(hidden)`; the residual is `x + out` per stream. Norms are grouped per stream with a `1 + w` weight. The conv state holds the last `(taps - 1) * ngram_size` = 9 normed inputs per channel; the n-gram history holds the last `ngram_size - 1` tokens, starts as EOS, and is stored xor EOS so a zeroed slot means "all EOS" (prefill chunks and slot reuse need only the usual zeroing).
@@ -62,7 +75,7 @@ Tests: `crates/kir/tests/ple.rs` (CPU: integer semantics, the hash description a
 
 A family file makes `from_hf_config_serving` accept the model, so the coverage script would call the real config TOO-BIG while the engine cannot run it. The family file goes in last, after these engine pieces each have a kir description and a test against `tiny-qwen4-exp`:
 
-1. 4 stream residual with the low rank gate, collapse and inject kernels (with #1191's stream buffer when it lands).
+1. 4 stream residual with the low rank gate, collapse and inject kernels: done in #1277 (above).
 2. QSA block pool, score and block top-k stage over a GQA layer, producing a mask or a selected index list for `flash_attention`.
 3. n-gram hash and gather stage plus token history state.
 4. PLE gate and dilated conv stage.

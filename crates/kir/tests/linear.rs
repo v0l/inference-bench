@@ -13,7 +13,7 @@ fn golden(name: &str, actual: &str) {
 }
 
 fn shape() -> LinearShape {
-    LinearShape { key_heads: 16, value_heads: 48, head_dim: 128, conv_kernel: 4, tiled_value_heads: false }
+    LinearShape { key_heads: 16, value_heads: 48, head_dim: 128, conv_kernel: 4, tiled_value_heads: false, gate_sigmoid: false }
 }
 
 fn emit(t: &Target, s: LinearShape, fam: &[Family]) -> String {
@@ -65,4 +65,17 @@ fn hash_changes_with_shape_and_target() {
     let c = LinearKernel::new(&Target::sm_80(), Family::Step, shape()).unwrap();
     assert_ne!(a.hash(), b.hash());
     assert_ne!(a.hash(), c.hash());
+}
+
+#[test]
+fn a_sigmoid_output_gate_replaces_silu_in_every_gated_norm() {
+    let mut s = shape();
+    s.gate_sigmoid = true;
+    let kernels: Vec<LinearKernel> = [Family::Step, Family::Chunk, Family::Verify].into_iter().map(|f| LinearKernel::new(&Target::sm_120(), f, s.clone()).unwrap()).collect();
+    let src = kir::cuda::emit_linear(&kernels).unwrap().into_string();
+    assert_eq!(src.matches("* la_sigmoid(").count(), 4, "{src}");
+    assert!(!src.contains("* silu(z[") && !src.contains("* silu(lin[") && !src.contains("* silu(l["));
+    let plain: Vec<LinearKernel> = [Family::Step, Family::Chunk, Family::Verify].into_iter().map(|f| LinearKernel::new(&Target::sm_120(), f, shape()).unwrap()).collect();
+    assert!(!kir::cuda::emit_linear(&plain).unwrap().into_string().contains("la_sigmoid"));
+    assert_ne!(kernels[0].hash(), plain[0].hash());
 }

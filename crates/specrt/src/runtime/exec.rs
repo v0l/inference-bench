@@ -61,6 +61,16 @@ impl PlanBackend<Run<'_>> for Runtime {
     }
 
     fn enter_layer(&self, layer: usize) -> Result<()> {
+        if let Some(hb) = &self.gated
+            && let Some(t) = hb.trace.lock().unwrap().as_ref()
+            && let Some(delta) = t.inject.get(&layer)
+        {
+            let mut b = self.launcher(self.kernel("residual_add"));
+            let hidden = self.spec.dims.hidden;
+            b.arg(&hb.streams).arg(delta).arg(&hb.streams);
+            let config = LaunchConfig { grid_dim: (grid(hidden, 256), (delta.len() / hidden) as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+            unsafe { b.launch(config) }?;
+        }
         match &self.streamer {
             Some(s) => s.enter(layer, &self.stream),
             None => Ok(()),
@@ -89,6 +99,7 @@ impl Runtime {
             Op::Clear { buf } => self.clear_op(buf, run),
             Op::LogitSoftcap => self.softcap_op(run, "logit_softcap"),
             Op::LogitScale => self.softcap_op(run, "logit_scale"),
+            Op::Split { from, into } if layer.is_none() && self.gated.is_some() => self.split_rows_op(from, into, run),
             Op::Split { from, into } => self.split_op(from, into, run),
             Op::QkNorm => self.qk_norm_op(self.attn_of(layer), run.n),
             Op::ScaledAdd { from } => self.scaled_add_op(from, run),
@@ -101,6 +112,7 @@ impl Runtime {
             Op::DecodeRope => self.decode_rope_rows(self.attn_of(layer), run.bb.expect("decode runs carry batch buffers"), n),
             Op::Kernel { node } => self.kernel_op(node, self.attn_of(layer), run),
             Op::MixKernel { node } => self.mix_kernel_op(node, layer.expect("mixer ops run inside a layer"), run),
+            Op::Gated { node, site } => self.gated_op(node, site, layer, run),
             Op::Swiglu => self.swiglu_legacy(n),
             Op::GdnPrefill => self.gdn_prefill_rows(self.gdn_of(layer), n, 0),
             Op::GdnDecode => self.gdn_decode_rows(self.gdn_of(layer), &run.bb.expect("decode runs carry batch buffers").slots, n),
@@ -430,6 +442,48 @@ impl Runtime {
         let mut b = self.launcher(self.kernel("clear_branch"));
         b.arg(target).arg(target);
         let config = LaunchConfig { grid_dim: (grid(hidden, 256), run.n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
+    }
+
+    fn split_rows_op(&self, from: Buf, into: Buf, run: &Run) -> Result<()> {
+        let hidden = self.spec.dims.hidden;
+        let planes = self.planes(into);
+        let source = self.f32_buf(from, run).slice(run.rows.start * hidden..run.rows.end * hidden);
+        let count = (run.rows.len() * hidden) as i32;
+        let mut b = self.launcher(self.kernel("split_rows"));
+        b.arg(&source).arg(&planes.hi).arg(&planes.lo).arg(&count);
+        unsafe { b.launch(super::cfg(super::grid(count as usize, 512), 256)) }?;
+        Ok(())
+    }
+
+    fn gated_op(&self, node: u8, site: u8, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+        let hb = self.gated.as_ref().expect("a gated residual has buffers");
+        let h = self.spec.gated_residual().expect("a gated residual");
+        let launch = &hb.launch[node as usize];
+        let spec_node = &h.node[node as usize];
+        let weights = match layer {
+            Some(l) if site != crate::plan::GATED_MODULE => &l.gated[site as usize],
+            _ => &hb.head,
+        };
+        let mut b = self.launcher(self.kernel(launch.name));
+        for p in &launch.params {
+            match spec_node.bind.get(p.name) {
+                Some(Bind::Weight { weight, .. }) => b.arg(weights.get(weight).with_context(|| format!("no hyper weight {weight}"))?),
+                Some(Bind::Buffer { buffer }) if buffer == "x" => b.arg(&self.pre.x),
+                Some(Bind::Buffer { buffer }) if buffer == "streams" => b.arg(&hb.streams),
+                Some(Bind::Buffer { buffer }) => b.arg(hb.scratch.get(buffer).with_context(|| format!("no hyper scratch {buffer:?}"))?),
+                _ => bail!("param {:?} of {} is not bound to a buffer or weight", p.name, launch.name),
+            };
+        }
+        let dim = |symbol: &String| -> Result<u32> {
+            Ok(match symbol.as_str() {
+                "rows" => run.n as u32,
+                other => crate::state::dim(&self.spec, other)? as u32,
+            })
+        };
+        let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
+        let config = LaunchConfig { grid_dim: (dims[0], dims.get(1).copied().unwrap_or(1), dims.get(2).copied().unwrap_or(1)), block_dim: (launch.threads, 1, 1), shared_mem_bytes: 0 };
         unsafe { b.launch(config) }?;
         Ok(())
     }

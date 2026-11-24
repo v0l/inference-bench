@@ -13,6 +13,10 @@ when = "vision+tensor_core"
 op = "hyper_expand"
 when = "hyper+tensor_core"
 
+[[head]]
+op = "gated_expand"
+when = "gated+tensor_core"
+
 [[tail]]
 op = "hyper_mean"
 when = "hyper+tensor_core"
@@ -403,8 +407,18 @@ in = "xn"
 op = "rmsnorm"
 weight = "norm.weight"
 out = "xn_planes"
-when = "tensor_core"
+when = "tensor_core+flat"
 in = "x"
+
+[[tail]]
+op = "gated_collapse"
+when = "tensor_core+gated"
+
+[[tail]]
+op = "split"
+in = "x"
+out = "xn_planes"
+when = "tensor_core+gated"
 
 [[tail]]
 op = "linear"
@@ -414,6 +428,165 @@ quant = "head"
 out = "logits"
 when = "tensor_core"
 in = "xn_planes"
+
+[[block]]
+name = "gated_linear_moe"
+when = "gated+tensor_core+gdn+moe"
+layers = ["linear"]
+mlp = "sparse"
+
+[[block.node]]
+op = "gated_pre"
+weight = "0"
+
+[[block.node]]
+op = "split"
+in = "x"
+out = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "lin_in"
+shard = "column"
+quant = "attn"
+out = "lin"
+in = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "lin_ba"
+shard = "column"
+quant = "bf16"
+out = "ba"
+in = "xn_planes"
+
+[[block.node]]
+op = "gdn_prefill"
+phase = "prefill"
+
+[[block.node]]
+op = "gdn_decode"
+phase = "decode"
+
+[[block.node]]
+op = "gdn_verify"
+phase = "verify"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "lin_out"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "gdn_planes"
+
+[[block.node]]
+op = "gated_post"
+weight = "0"
+
+[[block.node]]
+op = "gated_pre"
+weight = "1"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "moe_combine"
+
+[[block.node]]
+op = "gated_post"
+weight = "1"
+
+[[block]]
+name = "gated_attention_moe"
+when = "gated+tensor_core+moe"
+layers = ["dense", "full", "sliding", "shared", "compressed", "indexed"]
+mlp = "sparse"
+
+[[block.node]]
+op = "gated_pre"
+weight = "0"
+
+[[block.node]]
+op = "split"
+in = "x"
+out = "xn_planes"
+
+[[block.node]]
+op = "linear"
+weight = "qkv"
+shard = "column"
+quant = "attn"
+out = "qkv"
+in = "xn_planes"
+
+[[block.node]]
+op = "kv_rope"
+when = "stock"
+phase = "prefill"
+
+[[block.node]]
+op = "flash"
+when = "stock"
+phase = "prefill"
+
+[[block.node]]
+op = "decode_attention"
+when = "stock"
+phase = "rows"
+
+[[block.node]]
+op = "attention_nodes"
+when = "described"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "linear"
+weight = "o"
+shard = "row"
+quant = "attn"
+out = "x"
+in = "attn_planes"
+
+[[block.node]]
+op = "gated_post"
+weight = "0"
+
+[[block.node]]
+op = "gated_pre"
+weight = "1"
+
+[[block.node]]
+op = "moe_route"
+
+[[block.node]]
+op = "moe_experts"
+
+[[block.node]]
+op = "clear"
+out = "x"
+
+[[block.node]]
+op = "moe_combine"
+
+[[block.node]]
+op = "gated_post"
+weight = "1"
 
 [[block]]
 name = "attention"

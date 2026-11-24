@@ -236,7 +236,10 @@ def references(model, head):
     }
     (out / f"{NAME}.ref.json").write_text(json.dumps(meta) + "\n")
     save(out, f"{NAME}.decode", {"logits": decode}, {"rows": DECODE, "vocab": cfg.vocab_size, "greedy": greedy})
-    save(out, f"{NAME}.hidden", {"streams": hidden}, {"layers": HIDDEN_LAYERS, "shape": list(hidden.shape)})
+    scales = [float(h.abs().max()) / 32767 for h in hidden]
+    np.concatenate([np.round(h.numpy() / s).astype(np.int16).reshape(-1) for h, s in zip(hidden, scales)]).tofile(out / f"{NAME}.hidden.streams.i16")
+    (out / f"{NAME}.hidden.json").write_text(json.dumps({"layers": HIDDEN_LAYERS, "shape": list(hidden.shape), "scales": scales}) + "\n")
+    (out / f"{NAME}.hidden.streams.bin").unlink(missing_ok=True)
     print(NAME, "prefill", tuple(prefill.shape), "greedy", greedy, "decode vs recompute", recompute)
 
 

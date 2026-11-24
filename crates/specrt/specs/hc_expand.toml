@@ -1,0 +1,21 @@
+kind = "kir-kernel"
+family = "group_update"
+name = "hc_expand"
+threads = 128
+
+[args]
+groups = "hc_streams"
+width = "hidden"
+x_row = "hc_width"
+a_row = "hidden"
+expr = "a"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "a"
+role = "activation"
+access = "read"
