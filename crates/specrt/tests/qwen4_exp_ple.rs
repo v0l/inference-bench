@@ -9,6 +9,44 @@ const NAME: &str = "tiny-qwen4-exp";
 const KERNELS: [&str; 7] = ["ple_ngram_hash", "ple_embed_gather", "ple_key_proj", "ple_value_proj", "ple_gate", "ple_conv", "ple_add"];
 const TOLERANCE: f32 = 1e-3;
 
+const PARAMS: &str = r#"
+streams = { config = "hc_count" }
+hidden = { config = "hidden_size" }
+vocab = { config = "vocab_size" }
+norm_eps = { config = "rms_norm_eps" }
+ngram_size = { config = "ngram_size", default = 3.0 }
+heads_per_ngram = { config = "heads_per_ngram", default = 8.0 }
+ngram_heads = { expr = "(ngram_size - 1) * heads_per_ngram" }
+ngram_base = { config = "ngram_vocab_size_base", default = 20000000.0 }
+ngram_seed = { config = "seed", default = 1234.0 }
+ngram_eos = { config = "eos_token_id" }
+ple_embed_dim = { config = "ple_embed_dim", alt = "hidden_size" }
+ple_head_dim = { expr = "ple_embed_dim / ngram_heads" }
+ple_conv_taps = { config = "ple_conv_kernel_size", default = 4.0 }
+ple_conv_state = { expr = "(ple_conv_taps - 1) * ngram_size" }
+ple_gate_scale = { expr = "1 / sqrt(hidden)" }
+"#;
+
+const STATES: &str = r#"
+[[state]]
+name = "ngram_history"
+per = "sequence"
+layers = "linear"
+shape = ["ngram_size - 1"]
+dtype = "f32"
+rollback = "checkpoint"
+owner = "layer:1"
+
+[[state]]
+name = "ple_conv"
+per = "sequence"
+layers = "linear"
+shape = ["streams * hidden", "ple_conv_state"]
+dtype = "f32"
+rollback = "checkpoint"
+owner = "layer:1"
+"#;
+
 fn fixture() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(NAME)
 }
@@ -19,8 +57,7 @@ fn text_config() -> serde_json::Value {
 }
 
 fn params(config: &serde_json::Value, ple_layer: usize) -> BTreeMap<String, f64> {
-    let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ple-params.toml")).unwrap();
-    let sources: BTreeMap<String, ParamSource> = toml::from_str(&text).unwrap();
+    let sources: BTreeMap<String, ParamSource> = toml::from_str(PARAMS).unwrap();
     let mut p = specrt::family::read_params(&sources, config).unwrap();
     let ids: Vec<u64> = config["ple_layer_ids"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap()).collect();
     p.insert("ple_index".into(), ids.iter().position(|&l| l as usize == ple_layer + 1).unwrap() as f64);
@@ -320,14 +357,14 @@ fn every_ple_kernel_is_an_embedded_description_that_builds_for_the_real_and_the_
     }
 }
 
+#[derive(serde::Deserialize)]
+struct States {
+    state: Vec<specrt::state::State>,
+}
+
 #[test]
 fn the_ple_state_table_sizes_the_history_and_the_dilated_conv_window() {
-    let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ple-state.toml")).unwrap();
-    #[derive(serde::Deserialize)]
-    struct States {
-        state: Vec<specrt::state::State>,
-    }
-    let states: States = toml::from_str(&text).unwrap();
+    let states: States = toml::from_str(STATES).unwrap();
     let mut spec = specrt::spec::Spec::describe_hf_config(&std::fs::read_to_string(fixture().join("config.json")).unwrap()).unwrap();
     spec.attention.params.extend(params(&text_config(), 1));
     spec.state.extend(states.state);
