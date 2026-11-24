@@ -1,0 +1,37 @@
+{
+    "producer": {
+        "name": "modelopt",
+        "version": "0.30.1.dev44+gd6269109"
+    },
+    "quantization": {
+        "quant_algo": "FP8",
+        "kv_cache_quant_algo": "FP8",
+        "exclude_modules": [
+            "model.layers.backbone.layers.0.mixer.conv1d",
+            "model.layers.backbone.layers.11.mixer.conv1d",
+            "model.layers.backbone.layers.13.mixer.conv1d",
+            "model.layers.backbone.layers.15.mixer.conv1d",
+            "model.layers.backbone.layers.17.mixer.conv1d",
+            "model.layers.backbone.layers.2.mixer.conv1d",
+            "model.layers.backbone.layers.20.mixer.conv1d",
+            "model.layers.backbone.layers.22.mixer.conv1d",
+            "model.layers.backbone.layers.24.mixer.conv1d",
+            "model.layers.backbone.layers.26.mixer.conv1d",
+            "model.layers.backbone.layers.28.mixer.conv1d",
+            "model.layers.backbone.layers.31.mixer.conv1d",
+            "model.layers.backbone.layers.33.mixer.conv1d",
+            "model.layers.backbone.layers.35.mixer.conv1d",
+            "model.layers.backbone.layers.37.mixer.conv1d",
+            "model.layers.backbone.layers.39.mixer.conv1d",
+            "model.layers.backbone.layers.4.mixer.conv1d",
+            "model.layers.backbone.layers.42.mixer.conv1d",
+            "model.layers.backbone.layers.44.mixer.conv1d",
+            "model.layers.backbone.layers.46.mixer.conv1d",
+            "model.layers.backbone.layers.48.mixer.conv1d",
+            "model.layers.backbone.layers.50.mixer.conv1d",
+            "model.layers.backbone.layers.6.mixer.conv1d",
+            "model.layers.backbone.layers.9.mixer.conv1d",
+            "model.layers.lm_head"
+        ]
+    }
+}

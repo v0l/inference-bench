@@ -1,0 +1,10 @@
+{
+    "quantization": {
+        "exclude_modules": [
+            "lm_head",
+            "model.embed_tokens"
+        ],
+        "kv_cache_quant_algo": null,
+        "quant_algo": "FP8"
+    }
+}

@@ -1,0 +1,20 @@
+{
+    "bos_token": "<｜hy_begin_of_sentence:opensource｜>",
+    "clean_up_tokenization_spaces": false,
+    "eos_token": "<｜hy_eod:opensource｜>",
+    "model_max_length": 1000000000000000019884624838656,
+    "pad_token": "<｜hy_pad:opensource｜>",
+    "user_token": "<｜hy_User:opensource｜>",
+    "assistant_token": "<｜hy_Assistant:opensource｜>",
+    "tokenizer_class": "PreTrainedTokenizerFast",
+    "extra_special_tokens": {
+        "image_token": "<｜hy_image▁pad:opensource｜>",
+        "image_start_token": "<｜hy_image▁start:opensource｜>",
+        "image_end_token": "<｜hy_image▁end:opensource｜>",
+        "image_newline_token": "<｜hy_image▁newline:opensource｜>",
+        "video_token": "<｜hy_video▁pad:opensource｜>",
+        "video_start_token": "<｜hy_video▁start:opensource｜>",
+        "video_end_token": "<｜hy_video▁end:opensource｜>"
+    }
+  }
+  

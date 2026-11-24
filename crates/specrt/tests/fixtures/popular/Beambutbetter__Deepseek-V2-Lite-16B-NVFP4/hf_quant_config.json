@@ -1,0 +1,14 @@
+{
+    "producer": {
+        "name": "modelopt",
+        "version": "0.39.0.dev12+g9e64f81a6"
+    },
+    "quantization": {
+        "quant_algo": "NVFP4",
+        "kv_cache_quant_algo": "NVFP4",
+        "group_size": 16,
+        "exclude_modules": [
+            "lm_head"
+        ]
+    }
+}

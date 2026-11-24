@@ -1,0 +1,13 @@
+{
+  "_from_model_config": true,
+  "bos_token_id": 200000,
+  "cache_implementation": "hybrid",
+  "eos_token_id": [
+    200001,
+    200007,
+    200008
+  ],
+  "pad_token_id": 200018,
+  "transformers_version": "4.51.3",
+  "use_cache": false
+}
