@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Policy {
-    #[default]
     Lru,
     Frequency,
+    #[default]
     Score,
 }
 
@@ -54,7 +54,7 @@ impl Default for OffloadSettings {
             host_budget: 0,
             nvme_path: None,
             prefetch_depth: default_prefetch_depth(),
-            policy: Policy::Lru,
+            policy: Policy::Score,
             expert_slots: 0,
             pointer_table: false,
             hotlist: None,
@@ -1410,7 +1410,7 @@ mod tests {
     fn score_settings_parse_with_defaults() {
         let s: OffloadSettings = toml::from_str("policy = \"score\"\npromote_margin = 1.3\n").unwrap();
         assert_eq!((s.policy, s.promote_margin, s.score_half_life, s.promote_per_step), (Policy::Score, 1.3, 64, 16));
-        assert_eq!(OffloadSettings::default().policy, Policy::Lru);
+        assert_eq!(OffloadSettings::default().policy, Policy::Score);
         assert_eq!(OffloadSettings::default().promote_margin, 1.15);
     }
 

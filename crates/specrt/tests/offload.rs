@@ -121,6 +121,12 @@ fn moe_spec(dir: &str, slots: usize, hotlist: Option<String>) -> Spec {
     spec
 }
 
+fn lru_spec(dir: &str, slots: usize, hotlist: Option<String>) -> Spec {
+    let mut spec = moe_spec(dir, slots, hotlist);
+    spec.runtime.offload.policy = Policy::Lru;
+    spec
+}
+
 fn assert_experts_identical(dir: &str, slots: usize) {
     assert_experts_identical_with(dir, slots, false);
 }
@@ -375,14 +381,14 @@ fn expert_pages_on_nvme_are_bit_identical() {
 #[ignore = "needs a CUDA GPU"]
 fn calibration_hotlist_round_trips_and_warms_the_cache() {
     let first = prompt(1);
-    let mut cold = Runtime::load(&moe_spec("tiny-qwen3.5-moe", 6, None), 256).unwrap();
+    let mut cold = Runtime::load(&lru_spec("tiny-qwen3.5-moe", 6, None), 256).unwrap();
     assert_eq!(cold.offload_stats().unwrap().host_hits, 0);
     let want = cold.trace_decode(&first).unwrap().logits;
     let cold_misses = cold.offload_stats().unwrap().host_hits;
     let path = std::env::temp_dir().join(format!("hotlist-{}.json", std::process::id()));
     cold.save_expert_hotlist(&path).unwrap();
     drop(cold);
-    let mut warm = Runtime::load(&moe_spec("tiny-qwen3.5-moe", 6, Some(path.display().to_string())), 256).unwrap();
+    let mut warm = Runtime::load(&lru_spec("tiny-qwen3.5-moe", 6, Some(path.display().to_string())), 256).unwrap();
     assert!(warm.offload_stats().unwrap().host_to_vram_bytes > 0, "hotlist warm up copies experts before the first token");
     assert_eq!(warm.trace_decode(&first).unwrap().logits, want);
     let warm_misses = warm.offload_stats().unwrap().host_hits;
