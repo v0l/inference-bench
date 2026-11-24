@@ -88,14 +88,15 @@ pub fn ggml_stack(g: &Gguf, name: &str, shared: Option<&str>, experts: usize, ro
         ensure!(si.shape == [rows, cols], "{s} has shape {:?}, expected {:?}", si.shape, [rows, cols]);
         packed.push(expert_rows(si.kind, g.data(si), rows, cols)?);
     }
-    let stride = packed.iter().map(|p| p.len_bytes().next_multiple_of(16)).max().unwrap_or(16).max(min_stride);
+    let routed = &packed[..experts];
+    let stride = routed.iter().map(|p| p.len_bytes().next_multiple_of(16)).max().unwrap_or(16).max(min_stride);
     ensure!(stride / 16 < 1 << 29, "an expert of {stride} bytes is too large for the row table");
-    let mut data = Vec::with_capacity(stride * packed.len());
+    let mut data = Vec::with_capacity(packed.iter().map(|p| p.len_bytes().next_multiple_of(16).max(stride)).sum());
     let mut tables = Vec::with_capacity((rows + 1) * packed.len());
     for p in &packed {
         let at = data.len();
         data.extend_from_slice(&p.data());
-        data.resize(at + stride, 0);
+        data.resize(at + p.len_bytes().next_multiple_of(16).max(stride), 0);
         tables.extend_from_slice(&p.rows);
         tables.push((stride / 16) as u32);
     }
@@ -117,7 +118,8 @@ pub fn ggml_stride(g: &Gguf, which: &str, rows: usize, cols: usize) -> Result<us
 pub fn ggml_expert_row(data: &[u8], tables: &[u32], rows: usize, cols: usize, expert: usize, row: usize) -> Vec<f32> {
     let t = &tables[expert * (rows + 1)..(expert + 1) * (rows + 1)];
     let stride = t[rows] as usize * 16;
-    let one = crate::gguf::DeviceRows { parts: vec![Cow::Borrowed(&data[expert * stride..(expert + 1) * stride])], rows: t[..rows].to_vec(), cols };
+    let end = if expert + 1 == tables.len() / (rows + 1) { data.len() } else { (expert + 1) * stride };
+    let one = crate::gguf::DeviceRows { parts: vec![Cow::Borrowed(&data[expert * stride..end])], rows: t[..rows].to_vec(), cols };
     one.row_f32(row)
 }
 
@@ -1708,6 +1710,49 @@ mod tests {
         assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
         assert_eq!(f32_to_bf16(1.0), 0x3f80);
         assert_eq!(bf16_to_f32(f32_to_bf16(f16_to_f32(0x3555))), 0.333_984_38);
+    }
+
+    #[test]
+    fn a_q8_0_shared_expert_does_not_pad_every_q4_k_routed_expert_to_its_size() {
+        use crate::gguf::writer::{Kv, build};
+        let (h, inter, e) = (256usize, 16usize, 8usize);
+        let q4k = |n: usize| -> Vec<u8> { (0..n / 256).flat_map(|b| { let mut blk = vec![0u8; 144]; blk[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); blk[16..].iter_mut().enumerate().for_each(|(i, v)| *v = (i * 7 + b) as u8); blk }).collect() };
+        let q8 = |n: usize| -> Vec<u8> { (0..n / 32).flat_map(|b| { let mut blk = vec![0u8; 34]; blk[0..2].copy_from_slice(&0x2c00u16.to_le_bytes()); blk[2..].iter_mut().enumerate().for_each(|(i, v)| *v = (i as i8 - 16 + b as i8 % 3) as u8); blk }).collect() };
+        let f32s = |n: usize| -> Vec<u8> { (0..n).flat_map(|i| (i as f32 * 0.01).to_le_bytes()).collect() };
+        let (routed, shared) = (q4k(e * inter * h), q8(inter * h));
+        let bytes = build(
+            3,
+            &[
+                ("general.architecture", Kv::Str("qwen3moe")),
+                ("qwen3moe.block_count", Kv::U32(1)),
+                ("qwen3moe.embedding_length", Kv::U32(h as u32)),
+                ("qwen3moe.attention.head_count", Kv::U32(2)),
+                ("qwen3moe.attention.head_count_kv", Kv::U32(1)),
+                ("qwen3moe.attention.key_length", Kv::U32(4)),
+                ("qwen3moe.attention.layer_norm_rms_epsilon", Kv::F32(1e-6)),
+                ("qwen3moe.expert_count", Kv::U32(e as u32)),
+                ("qwen3moe.expert_used_count", Kv::U32(2)),
+                ("qwen3moe.expert_feed_forward_length", Kv::U32(inter as u32)),
+                ("qwen3moe.expert_shared_feed_forward_length", Kv::U32(inter as u32)),
+            ],
+            &[
+                ("token_embd.weight", &[h as u64, 8], 0, &f32s(8 * h)),
+                ("blk.0.ffn_gate_exps.weight", &[h as u64, inter as u64, e as u64], 12, &routed),
+                ("blk.0.ffn_gate_shexp.weight", &[h as u64, inter as u64], 8, &shared),
+            ],
+        );
+        let g = Gguf::from_bytes(bytes).unwrap();
+        let Stacked::Ggml { data, tables } = ggml_stack(&g, "blk.0.ffn_gate_exps.weight", Some("blk.0.ffn_gate_shexp.weight"), e, inter, h, 0).unwrap() else { panic!("ggml") };
+        let (q4k_expert, q8_expert) = (inter * 144, inter * 272);
+        assert_eq!(data.len(), e * q4k_expert + q8_expert, "routed experts keep their Q4_K size, the shared one its Q8_0 size");
+        let mut want = vec![0f32; inter * h];
+        for x in 0..=e {
+            let (kind, src) = if x < e { (crate::gguf::GgmlType::Q4K, &routed[x * inter * 144..(x + 1) * inter * 144]) } else { (crate::gguf::GgmlType::Q8_0, &shared[..]) };
+            crate::gguf::dequantize(kind, src, &mut want).unwrap();
+            for row in [0, inter - 1] {
+                assert_eq!(ggml_expert_row(&data, &tables, inter, h, x, row), want[row * h..(row + 1) * h], "expert {x} row {row}");
+            }
+        }
     }
 
     #[test]
