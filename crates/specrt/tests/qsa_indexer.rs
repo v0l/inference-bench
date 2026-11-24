@@ -215,6 +215,45 @@ fn the_indexer_spec_appends_index_qk_proj_to_the_qkv_rows_and_builds_its_kernels
 }
 
 #[test]
+fn attention_over_the_selected_tokens_reproduces_the_fixture_output_on_cpu() {
+    let spec = qsa_spec();
+    let a = &spec.attention;
+    let ix = Index::of(&spec);
+    let attn = attention(&spec);
+    let qkv = attn.project(&spec, &floats(&format!("{NAME}.indexer.input.bin")));
+    let (row, hd, qd, kvd) = (spec.qkv_rows(), a.head_dim, spec.q_dim(), spec.kv_dim());
+    let rope = Index { rot: spec.rotary_dim(), ..ix };
+    let head = |r: &[f32], at: usize, w: &[f32], p: usize| {
+        let inv = 1.0 / (r[at..at + hd].iter().map(|v| v * v).sum::<f32>() / hd as f32 + rope.eps).sqrt();
+        let mut v: Vec<f32> = r[at..at + hd].iter().zip(w).map(|(x, w)| x * inv * w).collect();
+        rope.rope(&mut v, p);
+        v
+    };
+    let rows: Vec<&[f32]> = qkv.chunks(row).collect();
+    let keys: Vec<Vec<Vec<f32>>> = rows.iter().enumerate().map(|(p, r)| (0..a.kv_heads).map(|k| head(r, qd + k * hd, &attn.k_norm, p)).collect()).collect();
+    let want = floats(&format!("{NAME}.indexer.attn.bin"));
+    let selected = reference_rows();
+    let mut worst = 0f32;
+    for (p, r) in rows.iter().enumerate() {
+        let chosen: Vec<usize> = selected[p].iter().filter(|t| **t >= 0).map(|t| *t as usize).collect();
+        for h in 0..a.heads {
+            let kv = h / (a.heads / a.kv_heads);
+            let q = head(r, h * hd, &attn.q_norm, p);
+            let scores: Vec<f32> = chosen.iter().map(|&t| q.iter().zip(&keys[t][kv]).map(|(x, y)| x * y).sum::<f32>() / (hd as f32).sqrt()).collect();
+            let top = scores.iter().copied().fold(f32::MIN, f32::max);
+            let e: Vec<f32> = scores.iter().map(|s| (s - top).exp()).collect();
+            let total: f32 = e.iter().sum();
+            for d in 0..hd {
+                let v: f32 = chosen.iter().zip(&e).map(|(&t, w)| w * rows[t][qd + kvd + kv * hd + d]).sum::<f32>() / total;
+                let gate = 1.0 / (1.0 + (-r[qd + 2 * kvd + h * hd + d]).exp());
+                worst = worst.max((v * gate - want[p * qd + h * hd + d]).abs());
+            }
+        }
+    }
+    assert!(worst <= TOLERANCE, "gated attention over the selected tokens differs by {worst}");
+}
+
+#[test]
 #[ignore = "NVRTC compile of the indexer module for sm_120, no GPU"]
 fn the_indexer_module_compiles_with_nvrtc() {
     let module = Module::generate_kv(&qsa_spec(), MAX_CTX, 2, &kir::Target::sm_120()).unwrap();
