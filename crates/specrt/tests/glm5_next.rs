@@ -216,6 +216,20 @@ fn the_engine_matches_the_reference_streams_prefill_and_four_decode_steps() {
         assert!(d < TOLERANCE, "decode step {s} max abs {d}");
         assert_eq!(next[0], greedy[s + 1], "decode step {s}");
     }
+    drop(rt);
+    let layer_gap = |spec: &Spec, layer: usize, slot: usize| {
+        let mut rt = Runtime::load_batched(spec, 256, 1).unwrap();
+        let t = rt.trace_prefill(&tokens).unwrap();
+        gap(&t.layers[layer * per..(layer + 1) * per], &saved[slot * per..(slot + 1) * per])
+    };
+    let mut short = engine_spec();
+    short.hyper.as_mut().unwrap().sinkhorn_iters = 1;
+    let g = layer_gap(&short, 0, 0);
+    assert!(g > TOLERANCE, "one Sinkhorn iteration still matches layer 0 ({g})");
+    let mut tailless = engine_spec();
+    tailless.attention.params.insert("index_tail".into(), 0.0);
+    let g = layer_gap(&tailless, 3, 2);
+    assert!(g > TOLERANCE, "dropping the tail pool still matches layer 3 ({g})");
 }
 
 fn host_run(knobs: impl Fn(&mut Knobs), extra: &[u32]) -> Run {
