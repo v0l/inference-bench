@@ -49,6 +49,28 @@ fn the_parts_not_built_yet_are_refused_by_name() {
 }
 
 #[test]
+fn the_e2b_config_maps_its_shared_tail_and_wide_mlp() {
+    let mut e2b: serde_json::Value = serde_json::from_str(&popular("google__gemma-4-E2B-it")).unwrap();
+    e2b["text_config"]["hidden_size_per_layer_input"] = 0.into();
+    let spec = Spec::from_hf_config(&e2b.to_string()).unwrap();
+    assert_eq!(spec.layers.count, 35);
+    assert_eq!(spec.layers.shared_tail, 20);
+    assert!(spec.mlp.wide_shared_tail);
+    assert!(!spec.shares_kv(14) && spec.shares_kv(15));
+    assert_eq!(spec.layer_intermediate(14), spec.dims.intermediate);
+    assert_eq!(spec.layer_intermediate(15), 2 * spec.dims.intermediate);
+    for layer in 15..35 {
+        let source = spec.kv_source(layer);
+        assert!(source < 15 && spec.block(source) == spec.block(layer));
+        assert_eq!(source, (0..15).rev().find(|&j| spec.block(j) == spec.block(layer)).unwrap());
+    }
+    let dense = Spec::from_hf_config_serving(&popular("google__gemma-4-31B-it")).unwrap();
+    assert_eq!(dense.layers.shared_tail, 0);
+    assert!(!dense.mlp.wide_shared_tail);
+    assert!((0..dense.layers.count).all(|l| dense.kv_source(l) == l));
+}
+
+#[test]
 fn the_kv_cache_holds_each_layer_kind_at_its_own_width() {
     let spec = Spec::from_hf_config_serving(&popular("google__gemma-4-31B-it")).unwrap();
     let sliding = specrt::state::kv_bytes_per_token_at(&spec, 0);

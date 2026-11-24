@@ -258,6 +258,7 @@ pub struct FamilyMlp {
     pub gated: Option<FamilyGated>,
     pub mapped: Option<FamilyGated>,
     pub dense_intermediate_key: Option<String>,
+    pub shared_tail_wide_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -357,6 +358,7 @@ pub struct FamilyBlocks {
     pub other_layer_type: Option<crate::spec::Block>,
     pub from_layer_types: bool,
     pub sliding_period_key: Option<String>,
+    pub shared_tail_key: Option<String>,
     pub attention_indices_key: Option<String>,
     pub types_key: Option<String>,
     pub sparse_types: Vec<String>,
@@ -686,6 +688,9 @@ impl Family {
             push(k, &mut out);
         }
         if let Some(k) = self.blocks.sliding_period_key.as_deref() {
+            push(k, &mut out);
+        }
+        for k in [self.blocks.shared_tail_key.as_deref(), self.mlp.shared_tail_wide_key.as_deref()].into_iter().flatten() {
             push(k, &mut out);
         }
         if let Some(k) = self.blocks.sparse_layers_key.as_deref() {

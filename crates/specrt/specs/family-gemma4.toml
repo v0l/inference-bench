@@ -14,13 +14,11 @@ message = "Gemma 4 mixture-of-experts layers (enable_moe_block) are not supporte
 when = "hidden_size_per_layer_input > 0"
 message = "Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet"
 
-[[refuse]]
-when = "num_kv_shared_layers > 0"
-message = "Gemma 4 KV sharing across layers (num_kv_shared_layers) is not supported yet"
+[blocks]
+shared_tail_key = "num_kv_shared_layers"
 
-[[refuse]]
-when = "use_double_wide_mlp"
-message = "Gemma 4 double wide MLP layers (use_double_wide_mlp) are not supported yet"
+[mlp]
+shared_tail_wide_key = "use_double_wide_mlp"
 
 [norm]
 unit_offset = false

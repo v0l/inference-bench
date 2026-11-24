@@ -858,6 +858,8 @@ pub struct Layers {
     pub window: Option<usize>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub split: bool,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub shared_tail: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1017,6 +1019,8 @@ pub struct Mlp {
     pub gated: Option<GatedAct>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mapped: Option<GatedAct>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wide_shared_tail: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1963,7 +1967,7 @@ impl Spec {
                 logit_scale: multiplier(&family.multipliers.logits_divisor).filter(|d| *d > 0.0).map(|d| 1.0 / d),
                 head_rows: None,
             },
-            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern, split: family.blocks.split },
+            layers: Layers { count: hf.num_hidden_layers, window: hf.sliding_window.filter(|_| pattern.iter().any(|b| b.windowed())), pattern, split: family.blocks.split, shared_tail: family.blocks.shared_tail_key.as_deref().and_then(|k| value.get(k)?.as_u64()).unwrap_or(0) as usize },
             norm: Norm {
                 kind: NormKind::Rmsnorm,
                 eps: hf.rms_norm_eps,
@@ -2015,6 +2019,7 @@ impl Spec {
                     Some(g) if activation == Activation::Mapped => Some(GatedAct { expr: g.expr.clone(), params: crate::family::read_params(&g.params, &value)? }),
                     _ => None,
                 },
+                wide_shared_tail: family.mlp.shared_tail_wide_key.as_deref().and_then(|k| value.get(k)?.as_bool()).unwrap_or(false),
             },
             moe,
             mtp: (family.mtp && (hybrid || family.mtp_layout.is_some()) && hf.mtp_num_hidden_layers > 0)
@@ -2465,6 +2470,22 @@ impl Spec {
 
     pub fn attention_before(&self, layer: usize) -> usize {
         (0..layer).filter(|&i| self.block(i).is_attention()).count()
+    }
+
+    pub fn shares_kv(&self, layer: usize) -> bool {
+        layer >= self.layers.count.saturating_sub(self.layers.shared_tail)
+    }
+
+    pub fn kv_source(&self, layer: usize) -> usize {
+        if !self.shares_kv(layer) {
+            return layer;
+        }
+        let first = self.layers.count - self.layers.shared_tail;
+        (0..first).rev().find(|&j| self.block(j) == self.block(layer)).unwrap_or(layer)
+    }
+
+    pub fn layer_intermediate(&self, layer: usize) -> usize {
+        if self.mlp.wide_shared_tail && self.shares_kv(layer) { 2 * self.dims.intermediate } else { self.dims.intermediate }
     }
 
     pub fn kind_before(&self, layer: usize) -> usize {
