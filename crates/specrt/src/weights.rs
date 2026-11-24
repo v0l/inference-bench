@@ -1718,25 +1718,11 @@ mod tests {
         let (h, inter, e) = (256usize, 16usize, 8usize);
         let q4k = |n: usize| -> Vec<u8> { (0..n / 256).flat_map(|b| { let mut blk = vec![0u8; 144]; blk[0..2].copy_from_slice(&0x3c00u16.to_le_bytes()); blk[16..].iter_mut().enumerate().for_each(|(i, v)| *v = (i * 7 + b) as u8); blk }).collect() };
         let q8 = |n: usize| -> Vec<u8> { (0..n / 32).flat_map(|b| { let mut blk = vec![0u8; 34]; blk[0..2].copy_from_slice(&0x2c00u16.to_le_bytes()); blk[2..].iter_mut().enumerate().for_each(|(i, v)| *v = (i as i8 - 16 + b as i8 % 3) as u8); blk }).collect() };
-        let f32s = |n: usize| -> Vec<u8> { (0..n).flat_map(|i| (i as f32 * 0.01).to_le_bytes()).collect() };
         let (routed, shared) = (q4k(e * inter * h), q8(inter * h));
         let bytes = build(
             3,
+            &[("general.architecture", Kv::Str("tinymoe"))],
             &[
-                ("general.architecture", Kv::Str("qwen3moe")),
-                ("qwen3moe.block_count", Kv::U32(1)),
-                ("qwen3moe.embedding_length", Kv::U32(h as u32)),
-                ("qwen3moe.attention.head_count", Kv::U32(2)),
-                ("qwen3moe.attention.head_count_kv", Kv::U32(1)),
-                ("qwen3moe.attention.key_length", Kv::U32(4)),
-                ("qwen3moe.attention.layer_norm_rms_epsilon", Kv::F32(1e-6)),
-                ("qwen3moe.expert_count", Kv::U32(e as u32)),
-                ("qwen3moe.expert_used_count", Kv::U32(2)),
-                ("qwen3moe.expert_feed_forward_length", Kv::U32(inter as u32)),
-                ("qwen3moe.expert_shared_feed_forward_length", Kv::U32(inter as u32)),
-            ],
-            &[
-                ("token_embd.weight", &[h as u64, 8], 0, &f32s(8 * h)),
                 ("blk.0.ffn_gate_exps.weight", &[h as u64, inter as u64, e as u64], 12, &routed),
                 ("blk.0.ffn_gate_shexp.weight", &[h as u64, inter as u64], 8, &shared),
             ],
