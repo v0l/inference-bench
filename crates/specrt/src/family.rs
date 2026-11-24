@@ -187,6 +187,21 @@ impl FamilyGatedResidual {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FamilyPerLayer {
+    pub dim: Option<String>,
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl FamilyPerLayer {
+    pub fn read(&self, config: &serde_json::Value) -> Option<crate::spec::PerLayer> {
+        let dim = dotted(config, self.dim.as_deref()?).and_then(|v| v.as_u64()).filter(|d| *d > 0)? as usize;
+        Some(crate::spec::PerLayer { dim, scratch: self.scratch.clone(), node: self.node.clone() })
+    }
+}
+
 impl Default for FamilyAttention {
     fn default() -> Self {
         FamilyAttention {
@@ -637,6 +652,8 @@ pub struct Family {
     #[serde(default)]
     pub gated_residual: FamilyGatedResidual,
     #[serde(default)]
+    pub per_layer: FamilyPerLayer,
+    #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     pub refuse: Vec<FamilyRefuse>,
@@ -711,7 +728,7 @@ impl Family {
         if let Some(k) = self.rope.nope_zero_key.as_deref() {
             push(k, &mut out);
         }
-        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()) {
+        for k in self.hyper.keys().chain(self.gated_residual.streams.as_deref()).chain(self.per_layer.dim.as_deref()) {
             push(k, &mut out);
         }
         if let Some(i) = &self.attention.indexer {

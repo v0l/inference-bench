@@ -129,7 +129,60 @@ impl Runtime {
             Op::AllReduceNorm { which } => self.allreduce_norm_op(which, layer, n),
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
             Op::HyperExpand | Op::HyperPre { .. } | Op::HyperPost | Op::HyperMean => self.hyper_op(op, layer, n),
+            Op::PerLayer { node, stage } => self.per_layer_op(node, stage, layer, run),
         }
+    }
+
+    fn per_layer_op(&self, node: u8, stage: u8, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+        let pb = self.ple.as_ref().context("the spec has no [per_layer]")?;
+        let p = self.spec.per_layer().expect("per layer buffers need a [per_layer]");
+        let launch = &pb.launch[node as usize];
+        let spec_node = &p.node[node as usize];
+        let head = stage == crate::plan::PLE_HEAD;
+        let weights = if head { &pb.head } else { &layer.expect("a per layer node runs inside a layer").ple };
+        let at: i32 = if head { 0 } else { layer.expect("a per layer node runs inside a layer").ple_at };
+        let numbers: Vec<i32> = launch
+            .params
+            .iter()
+            .map(|p| match spec_node.bind.get(p.name) {
+                Some(Bind::Number(v)) => *v as i32,
+                _ => 0,
+            })
+            .collect();
+        let mut b = self.launcher(self.kernel(launch.name));
+        for (i, param) in launch.params.iter().enumerate() {
+            match spec_node.bind.get(param.name) {
+                Some(Bind::Weight { weight, .. }) => {
+                    b.arg(weights.get(weight).with_context(|| format!("no per layer weight {weight}"))?);
+                }
+                Some(Bind::Buffer { buffer }) if buffer == "x" => {
+                    b.arg(&self.pre.x);
+                }
+                Some(Bind::Buffer { buffer }) if buffer == "tokens" => {
+                    b.arg(run.tokens);
+                }
+                Some(Bind::Buffer { buffer }) => {
+                    b.arg(pb.scratch.get(buffer).with_context(|| format!("no per layer scratch {buffer:?}"))?);
+                }
+                Some(Bind::Name(n)) if n == "layer" => {
+                    b.arg(&at);
+                }
+                Some(Bind::Number(_)) => {
+                    b.arg(&numbers[i]);
+                }
+                _ => bail!("param {:?} of {} is not bound to a buffer, weight or number", param.name, launch.name),
+            }
+        }
+        let dim = |symbol: &String| -> Result<u32> {
+            Ok(match symbol.as_str() {
+                "rows" => run.n as u32,
+                other => crate::state::dim(&self.spec, other)? as u32,
+            })
+        };
+        let dims = spec_node.grid.iter().map(dim).collect::<Result<Vec<_>>>()?;
+        let config = LaunchConfig { grid_dim: (dims[0], dims.get(1).copied().unwrap_or(1), dims.get(2).copied().unwrap_or(1)), block_dim: (launch.threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe { b.launch(config) }?;
+        Ok(())
     }
 
     fn hyper_op(&self, op: &Op, layer: Option<&DeviceLayer>, n: usize) -> Result<()> {

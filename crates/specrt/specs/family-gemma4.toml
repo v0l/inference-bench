@@ -22,6 +22,79 @@ message = "Gemma 4 KV sharing across layers (num_kv_shared_layers) is not suppor
 when = "use_double_wide_mlp"
 message = "Gemma 4 double wide MLP layers (use_double_wide_mlp) are not supported yet"
 
+[per_layer]
+dim = "hidden_size_per_layer_input"
+
+[per_layer.scratch]
+ple_proj = "ple_width"
+ple = "ple_width"
+ple_gate = "ple_dim"
+ple_out = "ple_dim"
+
+[[per_layer.node]]
+op = "head"
+kernel = "g4_ple_proj"
+grid = ["hidden", "rows"]
+
+[per_layer.node.bind]
+x = { buffer = "x" }
+w = { weight = "per_layer_model_projection.weight", len = "ple_width * hidden" }
+y = { buffer = "ple_proj" }
+
+[[per_layer.node]]
+op = "head"
+kernel = "g4_ple_mix"
+grid = ["ple_width", "rows"]
+
+[per_layer.node.bind]
+idx = { buffer = "tokens" }
+table = { weight = "embed_tokens_per_layer.weight", len = "ple_vocab * ple_width" }
+proj = { buffer = "ple_proj" }
+w = { weight = "per_layer_projection_norm.weight", len = "ple_width" }
+ple = { buffer = "ple" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_gate"
+grid = ["ple_dim", "rows"]
+
+[per_layer.node.bind]
+x = { buffer = "x" }
+w = { weight = "per_layer_input_gate.weight", len = "ple_dim * hidden" }
+y = { buffer = "ple_gate" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_act"
+grid = ["ple_dim", "rows"]
+
+[per_layer.node.bind]
+gate = { buffer = "ple_gate" }
+ple = { buffer = "ple" }
+layer = "layer"
+gp = { buffer = "ple_gate" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_out"
+grid = ["hidden", "rows"]
+
+[per_layer.node.bind]
+x = { buffer = "ple_gate" }
+w = { weight = "per_layer_projection.weight", len = "ple_dim * hidden" }
+y = { buffer = "ple_out" }
+
+[[per_layer.node]]
+op = "layer"
+kernel = "g4_ple_add"
+grid = ["hidden", "rows"]
+
+[per_layer.node.bind]
+pout = { buffer = "ple_out" }
+w = { weight = "post_per_layer_input_norm.weight", len = "hidden" }
+xin = { buffer = "x" }
+x = { buffer = "x" }
+
 [blocks]
 shared_tail_key = "num_kv_shared_layers"
 
@@ -43,6 +116,12 @@ qk_norm = false
 o_cols = "q_w"
 
 [attention.params]
+ple_dim = { expr = "hidden_size_per_layer_input" }
+ple_width = { expr = "ple_dim * num_hidden_layers" }
+ple_embed_scale = { expr = "sqrt(hidden_size_per_layer_input)" }
+ple_proj_scale = { expr = "rsqrt(hidden_size)" }
+ple_mix_scale = { expr = "sqrt(0.5)" }
+ple_vocab = { config = "vocab_size_per_layer_input", alt = "vocab_size" }
 hd_s = { config = "head_dim" }
 hd_g = { config = "global_head_dim", alt = "head_dim" }
 heads_n = { config = "num_attention_heads" }

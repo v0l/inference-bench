@@ -32,6 +32,7 @@ pub fn run_plan<R, B: PlanBackend<R>>(be: &B, plan: &Plan, run: &R, after_layer:
     for i in 0..be.layers() {
         be.enter_layer(i)?;
         run_ops(be, plan.layer_for(be.block(i), be.sparse(i), be.tail(i)), Some(i), run)?;
+        run_ops(be, &plan.per_layer, Some(i), run)?;
         be.leave_layer(i)?;
         after_layer(i)?;
     }

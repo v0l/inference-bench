@@ -567,6 +567,35 @@ impl GatedResidual {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerLayer {
+    pub dim: usize,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+impl PerLayer {
+    pub fn nodes<'a>(&'a self, stage: &'a str) -> impl Iterator<Item = (usize, &'a crate::graph::Node)> {
+        self.node.iter().enumerate().filter(move |(_, n)| n.op == stage)
+    }
+
+    pub fn weights(&self, stage: &str) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (_, n) in self.nodes(stage) {
+            for b in n.bind.values() {
+                if let crate::graph::Bind::Weight { weight, len } = b
+                    && !out.iter().any(|(w, _)| w == weight)
+                {
+                    out.push((weight.clone(), len.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RopeStyle {
@@ -1061,6 +1090,8 @@ pub struct Spec {
     pub hyper: Option<Hyper>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gated_residual: Option<GatedResidual>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_layer: Option<PerLayer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2030,6 +2061,7 @@ impl Spec {
             mixer,
             hyper: family.hyper.read(&value),
             gated_residual: family.gated_residual.read(&value)?,
+            per_layer: family.per_layer.read(&value),
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
@@ -2056,6 +2088,7 @@ impl Spec {
         self.validate_attention_nodes()?;
         self.validate_mixer()?;
         self.validate_hyper()?;
+        self.validate_per_layer()?;
         crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
@@ -2283,6 +2316,50 @@ impl Spec {
 
     pub fn gated_residual(&self) -> Option<&GatedResidual> {
         self.gated_residual.as_ref()
+    }
+
+    pub fn per_layer(&self) -> Option<&PerLayer> {
+        self.per_layer.as_ref()
+    }
+
+    fn validate_per_layer(&self) -> Result<()> {
+        let Some(p) = self.per_layer() else { return Ok(()) };
+        ensure!(p.dim > 0, "[per_layer] needs a positive dim");
+        ensure!(self.gated_residual().is_none() && self.hyper.is_none() && self.mixer.is_none(), "[per_layer] cannot be combined with other residual or mixer descriptions yet");
+        ensure!(self.speculative().is_none(), "[per_layer] cannot be combined with [mtp] yet");
+        ensure!(p.node.len() <= 64, "[[per_layer.node]] has more than 64 nodes");
+        for stage in ["head", "layer"] {
+            ensure!(p.nodes(stage).next().is_some(), "[[per_layer.node]] has no {stage} node");
+        }
+        for (n, w) in &p.scratch {
+            ensure!(!matches!(n.as_str(), "x" | "tokens"), "[per_layer.scratch] {n} shadows a built in buffer");
+            crate::state::dim(self, w).with_context(|| format!("[per_layer.scratch] {n}"))?;
+        }
+        for (i, n) in p.node.iter().enumerate() {
+            ensure!(matches!(n.op.as_str(), "head" | "layer") && n.kernel.is_some(), "[[per_layer.node]] {i} must be a head or layer node with `kernel`");
+            ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[per_layer.node]] {i} needs a grid of one to three symbols");
+            for g in n.grid.iter().filter(|g| *g != "rows") {
+                crate::state::dim(self, g).with_context(|| format!("[[per_layer.node]] {i} grid symbol {g:?}"))?;
+            }
+            for b in n.bind.values() {
+                match b {
+                    crate::graph::Bind::Weight { len, .. } => {
+                        self.weight_len(len)?;
+                    }
+                    crate::graph::Bind::Buffer { buffer } => ensure!(
+                        matches!(buffer.as_str(), "x" | "tokens") || p.scratch.contains_key(buffer),
+                        "[[per_layer.node]] {i} binds buffer {buffer:?}, which is not x, tokens or a [per_layer.scratch] entry"
+                    ),
+                    crate::graph::Bind::Name(n) => ensure!(n == "layer", "[[per_layer.node]] {i} binds the name {n:?}, which is not layer"),
+                    crate::graph::Bind::Number(_) => {}
+                    crate::graph::Bind::State { .. } => bail!("[[per_layer.node]] {i} binds a state, which per layer nodes do not take"),
+                }
+            }
+        }
+        for (w, _how) in &p.scratch {
+            let _ = w;
+        }
+        Ok(())
     }
 
     fn validate_hyper(&self) -> Result<()> {

@@ -147,6 +147,7 @@ pub struct Layer<'a> {
     pub moe: Option<MoeWeights>,
     pub hyper: Vec<Vec<f32>>,
     pub gated: Vec<Vec<(String, Vec<f32>)>>,
+    pub ple: Vec<(String, Vec<f32>)>,
 }
 
 pub struct Outside<'a> {
@@ -1294,6 +1295,7 @@ impl Checkpoint {
             let s = spec.norm.residual_scale.filter(|_| spec.norm.sandwich).unwrap_or(1.0) * layer_scale;
             if s == 1.0 { w } else { w.into_iter().map(|v| (v as f64 * s) as f32).collect() }
         };
+        let ple_factor = spec.norm.residual_scale.filter(|_| spec.norm.sandwich).unwrap_or(1.0) * layer_scale;
         Ok(Layer {
             ln1,
             ln2: if spec.norm.sandwich { branch(ln2) } else { ln2 },
@@ -1305,6 +1307,7 @@ impl Checkpoint {
             moe,
             hyper: self.hyper(spec, &p)?,
             gated: self.gated_sites(spec, &p)?,
+            ple: self.ple_layer(spec, &p, ple_factor)?,
         })
     }
 
@@ -1334,6 +1337,22 @@ impl Checkpoint {
     pub fn gated_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
         let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
         self.gated_weights(spec, &format!("{}.{}", self.root(), h.module), crate::spec::GatedStage::Collapse)
+    }
+
+    pub fn ple_layer(&self, spec: &Spec, p: &str, factor: f64) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(pl) = spec.per_layer() else { return Ok(Vec::new()) };
+        pl.weights("layer")
+            .into_iter()
+            .map(|(w, len)| {
+                let values = self.flat(&format!("{p}.{w}"), spec.weight_len(&len)?)?;
+                Ok((w.clone(), if factor == 1.0 { values } else { values.into_iter().map(|v| (v as f64 * factor) as f32).collect() }))
+            })
+            .collect()
+    }
+
+    pub fn ple_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(pl) = spec.per_layer() else { return Ok(Vec::new()) };
+        pl.weights("head").into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&format!("{}.{w}", self.root()), spec.weight_len(&len)?)?))).collect()
     }
 
     fn gguf_stack(&self, g: &Gguf, name: &str, shape: &[usize], out: &mut Vec<u16>) -> Result<()> {
@@ -1684,6 +1703,7 @@ impl Checkpoint {
                 moe,
                 hyper: Vec::new(),
                 gated: Vec::new(),
+                ple: Vec::new(),
             },
             norm: self.norm(spec, &lay.norm, h)?,
         })

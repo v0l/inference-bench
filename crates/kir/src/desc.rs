@@ -349,6 +349,8 @@ pub struct StageDesc {
     pub offset: Option<Value>,
     #[serde(default)]
     pub index: Option<String>,
+    #[serde(default)]
+    pub shift: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -774,11 +776,15 @@ impl Description {
             stages.push(match s.op.as_str() {
                 "load" => {
                     let (row, group, offset) = at()?;
-                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: None }
+                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: None, shift: s.shift.clone(), by_row: false }
                 }
                 "gather" => {
                     let (row, group, offset) = at()?;
-                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: Some(need(&s.index, "index", &s.op)?) }
+                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: Some(need(&s.index, "index", &s.op)?), shift: None, by_row: false }
+                }
+                "gather_row" => {
+                    let (row, group, offset) = at()?;
+                    GroupStage::Load { dst: dst()?, src: need(&s.src, "src", &s.op)?, row, group, offset, index: Some(need(&s.index, "index", &s.op)?), shift: None, by_row: true }
                 }
                 "value" => GroupStage::Value { dst: dst()?, expr: e()? },
                 "sum" => GroupStage::Sum { dst: dst()?, expr: e()? },
@@ -787,7 +793,7 @@ impl Description {
                     let (row, group, offset) = at()?;
                     GroupStage::Store { dst: need(&s.dst, "dst", &s.op)?, value: parse(need(&s.value, "value", &s.op)?)?, row, group, offset }
                 }
-                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, value, sum, scalar or store", self.name)),
+                o => return Err(format!("{}: group_map stage op {o:?} is not load, gather, gather_row, value, sum, scalar or store", self.name)),
             });
         }
         Ok(crate::group::GroupMap { width: n["width"], consts, stages })

@@ -1,0 +1,91 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "g4_ple_mix"
+threads = 128
+
+[args]
+width = "ple_dim"
+
+[[const]]
+name = "eps"
+value = "norm_eps"
+
+[[const]]
+name = "proj_scale"
+value = "ple_proj_scale"
+
+[[const]]
+name = "embed_scale"
+value = "ple_embed_scale"
+
+[[const]]
+name = "mix_scale"
+value = "ple_mix_scale"
+
+[[param]]
+name = "idx"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "table"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "proj"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "ple"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "p"
+src = "proj"
+row = "ple_width"
+head = "ple_dim"
+
+[[stage]]
+op = "value"
+name = "pv"
+expr = "p * proj_scale"
+
+[[stage]]
+op = "sum"
+name = "ss"
+expr = "pv * pv"
+
+[[stage]]
+op = "scalar"
+name = "inv"
+expr = "rsqrt(ss / width + eps)"
+
+[[stage]]
+op = "load"
+name = "wv"
+src = "w"
+
+[[stage]]
+op = "gather_row"
+name = "t"
+src = "table"
+index = "idx"
+row = "ple_width"
+head = "ple_dim"
+
+[[stage]]
+op = "store"
+dst = "ple"
+value = "(pv * inv * wv + t * embed_scale) * mix_scale"
+row = "ple_width"
+head = "ple_dim"

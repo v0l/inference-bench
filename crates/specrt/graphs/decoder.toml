@@ -6,6 +6,10 @@ op = "embed"
 out = "x"
 
 [[head]]
+op = "per_layer_head"
+when = "ple"
+
+[[head]]
 op = "splice"
 when = "vision+tensor_core"
 

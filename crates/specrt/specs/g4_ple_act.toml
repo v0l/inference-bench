@@ -1,0 +1,47 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "g4_ple_act"
+threads = 64
+
+[args]
+width = "ple_dim"
+
+[[param]]
+name = "gate"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "ple"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "gp"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "g"
+src = "gate"
+row = "ple_dim"
+
+[[stage]]
+op = "load"
+name = "t"
+src = "ple"
+row = "ple_width"
+shift = "layer"
+
+[[stage]]
+op = "store"
+dst = "gp"
+value = "gelu_tanh(g) * t"
+row = "ple_dim"

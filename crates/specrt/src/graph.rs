@@ -242,6 +242,7 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec, tail: bool) -> bool
             "hyper" => spec.hyper.is_some(),
             "gated" => spec.gated_residual().is_some(),
             "flat" => spec.gated_residual().is_none(),
+            "ple" => spec.per_layer().is_some(),
             "split" => spec.layers.split,
             "logit_softcap" => spec.dims.logit_softcap.is_some(),
             "logit_scale" => spec.dims.logit_scale.is_some(),
@@ -255,6 +256,14 @@ fn holds(when: Option<&str>, tensor_core: bool, spec: &Spec, tail: bool) -> bool
             "dense" => spec.moe.is_none(),
             _ => false,
         })
+    })
+}
+
+fn per_layer_stage(op: &str) -> Option<u8> {
+    Some(match op {
+        "per_layer_head" => crate::plan::PLE_HEAD,
+        "per_layer_layer" => crate::plan::PLE_LAYER,
+        _ => return None,
     })
 }
 
@@ -286,6 +295,11 @@ fn lower(nodes: &[Node], phase: Phase, tensor_core: bool, spec: &Spec, kind: Opt
                 if d.runs_in(phase, tensor_core, spec, kind, tail) {
                     ops.push(Op::MixKernel { node: i as u8 });
                 }
+            }
+        } else if let Some(stage) = per_layer_stage(&n.op) {
+            let p = spec.per_layer().with_context(|| format!("{} needs a [per_layer]", n.op))?;
+            for (i, _) in p.nodes(if stage == crate::plan::PLE_HEAD { "head" } else { "layer" }) {
+                ops.push(Op::PerLayer { node: i as u8, stage });
             }
         } else if let Some(stage) = gated_stage(&n.op) {
             let h = spec.gated_residual().with_context(|| format!("{} needs a [gated_residual]", n.op))?;
@@ -411,7 +425,11 @@ impl Graph {
                 }
             }
         }
-        Ok(Plan { phase, tensor_core, head: lower(&self.head, phase, tensor_core, spec, None, false)?, blocks, tail: lower(&self.tail, phase, tensor_core, spec, None, false)?, mtp: lower(&self.mtp, phase, tensor_core, spec, None, false)?, mtp_head: lower(&self.mtp_head, phase, tensor_core, spec, None, false)? })
+        let per_layer: Vec<Op> = match spec.per_layer() {
+            Some(p) => p.nodes("layer").map(|(i, _)| Op::PerLayer { node: i as u8, stage: crate::plan::PLE_LAYER }).collect(),
+            None => Vec::new(),
+        };
+        Ok(Plan { phase, tensor_core, head: lower(&self.head, phase, tensor_core, spec, None, false)?, blocks, per_layer, tail: lower(&self.tail, phase, tensor_core, spec, None, false)?, mtp: lower(&self.mtp, phase, tensor_core, spec, None, false)?, mtp_head: lower(&self.mtp_head, phase, tensor_core, spec, None, false)? })
     }
 }
 

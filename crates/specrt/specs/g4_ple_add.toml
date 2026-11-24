@@ -1,0 +1,64 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "g4_ple_add"
+threads = 128
+
+[args]
+width = "hidden"
+
+[[const]]
+name = "eps"
+value = "norm_eps"
+
+[[param]]
+name = "pout"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "xin"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "load"
+name = "p"
+src = "pout"
+row = "hidden"
+
+[[stage]]
+op = "sum"
+name = "ss"
+expr = "p * p"
+
+[[stage]]
+op = "scalar"
+name = "inv"
+expr = "rsqrt(ss / width + eps)"
+
+[[stage]]
+op = "load"
+name = "wv"
+src = "w"
+
+[[stage]]
+op = "load"
+name = "xv"
+src = "xin"
+row = "hidden"
+
+[[stage]]
+op = "store"
+dst = "x"
+value = "xv + p * inv * wv"
+row = "hidden"

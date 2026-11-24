@@ -263,7 +263,11 @@ pub enum Op {
     HyperPre { site: u8 },
     HyperPost,
     HyperMean,
+    PerLayer { node: u8, stage: u8 },
 }
+
+pub const PLE_HEAD: u8 = 0;
+pub const PLE_LAYER: u8 = 1;
 
 pub const GATED_MODULE: u8 = u8::MAX;
 
@@ -324,6 +328,8 @@ impl Op {
             Op::HyperPre { site } => format!("hyper pre {site}"),
             Op::HyperPost => "hyper post".into(),
             Op::HyperMean => "hyper mean".into(),
+            Op::PerLayer { stage: PLE_HEAD, .. } => "per layer inputs".into(),
+            Op::PerLayer { .. } => "per layer residual".into(),
         }
     }
 
@@ -363,6 +369,8 @@ impl Op {
             Op::HyperPre { .. } => "streams to x and hyper weights".into(),
             Op::HyperPost => "x and hyper weights into streams".into(),
             Op::HyperMean => "streams to x".into(),
+            Op::PerLayer { stage: PLE_HEAD, .. } => "tokens and hidden to per layer inputs".into(),
+            Op::PerLayer { .. } => "x and per layer inputs into x".into(),
         }
     }
 
@@ -414,6 +422,10 @@ impl Op {
             Op::MoeRoute => vec!["mlp.gate.weight".into(), "mlp.shared_expert_gate.weight".into()],
             Op::MoeExperts => spec.expert_tensors(),
             Op::HyperPre { site } => spec.hyper.as_ref().and_then(|h| h.sites.get(*site as usize)).map(|s| ["fn", "base", "scale"].iter().map(|t| format!("{s}_{t}")).collect()).unwrap_or_default(),
+            Op::PerLayer { node, .. } => spec.per_layer.as_ref().and_then(|p| p.node.get(*node as usize)).into_iter().flat_map(|n| n.bind.values()).filter_map(|b| match b {
+                crate::graph::Bind::Weight { weight, .. } => Some(weight.clone()),
+                _ => None,
+            }).collect(),
             _ => Vec::new(),
         }
     }
@@ -516,6 +528,7 @@ impl Op {
             Op::HyperPre { .. } => names(&["hyper_pre"]),
             Op::HyperPost => names(&["hyper_post"]),
             Op::HyperMean => names(&["hyper_mean"]),
+            Op::PerLayer { node, .. } => spec.per_layer.as_ref().and_then(|p| p.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
         }
     }
 }
@@ -534,6 +547,7 @@ pub struct Plan {
     pub tensor_core: bool,
     pub head: Vec<Op>,
     pub blocks: Vec<PlanBlock>,
+    pub per_layer: Vec<Op>,
     pub tail: Vec<Op>,
     pub mtp: Vec<Op>,
     pub mtp_head: Vec<Op>,
@@ -542,6 +556,10 @@ pub struct Plan {
 impl Plan {
     pub fn build(spec: &Spec, phase: Phase, tensor_core: bool) -> Plan {
         crate::graph::Graph::decoder().plan(spec, phase, tensor_core).expect("the embedded decoder graph lowers")
+    }
+
+    pub fn layer_tail(&self) -> &[Op] {
+        &self.per_layer
     }
 
     pub fn layer(&self, block: Block) -> &[Op] {

@@ -64,6 +64,24 @@ fn unrefused() -> specrt::family::Registry {
 }
 
 #[test]
+fn the_e2b_spec_carries_per_layer_inputs() {
+    use specrt::plan::{Op, Phase, Plan};
+    let spec = Spec::from_hf_config_serving_in(&unrefused(), &popular("google__gemma-4-E2B-it")).unwrap();
+    let p = spec.per_layer().expect("the E2B config has per layer inputs");
+    assert_eq!(p.dim, 256);
+    assert_eq!(spec.weight_len("ple_width * hidden").unwrap(), 256 * 35 * 1536);
+    assert_eq!(spec.weight_len("ple_dim * hidden").unwrap(), 256 * 1536);
+    assert!(spec.hyper.is_none());
+    let plan = Plan::build(&spec, Phase::Prefill, true);
+    let head = plan.head.iter().filter(|o| matches!(o, Op::PerLayer { stage: specrt::plan::PLE_HEAD, .. })).count();
+    let tail = plan.layer_tail().iter().filter(|o| matches!(o, Op::PerLayer { stage: specrt::plan::PLE_LAYER, .. })).count();
+    assert_eq!((head, tail), (2, 4));
+    specrt::signature::validate_plan(&plan, &spec).unwrap();
+    let dense = Spec::from_hf_config_serving(&popular("google__gemma-4-31B-it")).unwrap();
+    assert!(dense.per_layer().is_none() && Plan::build(&dense, Phase::Prefill, true).layer_tail().is_empty());
+}
+
+#[test]
 fn the_e2b_config_maps_its_shared_tail_and_wide_mlp() {
     let spec = Spec::from_hf_config_serving_in(&unrefused(), &popular("google__gemma-4-E2B-it")).unwrap();
     assert_eq!(spec.layers.count, 35);

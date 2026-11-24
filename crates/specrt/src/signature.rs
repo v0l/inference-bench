@@ -1,7 +1,7 @@
 use crate::graph::Bind;
 use crate::plan::{Buf, NormKind, Op, Phase, Plan, Weight, weight_kind};
 use crate::spec::{KvDtype, Quant, Spec};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use kir::gemm::Epilogue;
 use std::collections::BTreeMap;
 
@@ -194,6 +194,53 @@ impl<'a> Signer<'a> {
 
     pub fn ranked(self, ranked: bool) -> Signer<'a> {
         Signer { ranked, ..self }
+    }
+
+    fn per_layer_node(&self, node: u8, stage: u8, layer: usize) -> Result<Signature> {
+        let p = self.spec.per_layer().context("[per_layer]")?;
+        let spec_node: &crate::graph::Node = &p.node[node as usize];
+        let head = stage == crate::plan::PLE_HEAD;
+        let defaults = |name: &str| -> Option<Tensor> {
+            match name {
+                "x" => Some(self.x()),
+                "tokens" => Some(Tensor::new(Place::Input("tokens"), Rows::Tokens, 1, Form::I32)),
+                _ => None,
+            }
+        };
+        let mut sig = self.bound_stage(spec_node, &p.scratch, &defaults)?;
+        let _ = layer;
+        if !head {
+            sig.reads.retain(|t| t.place != Place::Buf(Buf::X));
+            sig.writes.retain(|t| t.place != Place::Buf(Buf::X));
+            sig.writes.push(self.x());
+            sig.reads.push(self.x());
+        }
+        Ok(sig)
+    }
+
+    fn bound_stage(&self, node: &crate::graph::Node, scratch: &BTreeMap<String, String>, defaults: &dyn Fn(&str) -> Option<Tensor>) -> Result<Signature> {
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        let mut seen: Vec<Tensor> = Vec::new();
+        for b in node.bind.values() {
+            let t = match b {
+                crate::graph::Bind::Weight { weight, len } => Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, Form::F32),
+                crate::graph::Bind::Buffer { buffer } => match scratch.get(buffer) {
+                    Some(w) => Tensor::new(Place::Local(buffer.clone()), Rows::Tokens, crate::state::dim(self.spec, w)?, Form::F32),
+                    None => defaults(buffer).with_context(|| format!("no buffer {buffer:?}"))?,
+                },
+                crate::graph::Bind::Name(_) | crate::graph::Bind::Number(_) => continue,
+                crate::graph::Bind::State { state } => bail!("per layer node binds state {state:?}, which per layer nodes do not take"),
+            };
+            if seen.contains(&t) {
+                writes.push(t);
+            } else {
+                reads.push(t.clone());
+                writes.push(t.clone());
+                seen.push(t);
+            }
+        }
+        Ok(Signature { class: Class::Elementwise, reads, writes })
     }
 
     fn hidden(&self) -> usize {
@@ -435,6 +482,7 @@ impl<'a> Signer<'a> {
         let tokens_in = Tensor::new(Place::Input("tokens"), Rows::Tokens, 1, Form::I32);
         let sig = |class, reads, writes| Signature { class, reads, writes };
         Ok(match *op {
+            Op::PerLayer { node, stage } => self.per_layer_node(node, stage, layer)?,
             Op::Embed => sig(Class::Gather, vec![tokens_in, Tensor::new(Place::Weight("embed_tokens.weight".into()), Rows::Tokens, h, Form::Bf16)], vec![self.x()]),
             Op::Splice => sig(Class::Gather, vec![Tensor::new(Place::Input("media"), Rows::Tokens, h, Form::F32)], vec![self.x()]),
             Op::Norm { which, into } => {
