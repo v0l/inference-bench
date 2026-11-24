@@ -335,6 +335,41 @@ impl Checkpoint {
         Ok(items)
     }
 
+    pub fn quant_config(&self) -> Result<Option<serde_json::Value>> {
+        let Some(dir) = self.files.first().and_then(|f| f.parent()).filter(|_| self.gguf.is_none()) else { return Ok(None) };
+        let read = |name: &str| -> Result<Option<serde_json::Value>> {
+            let path = dir.join(name);
+            if !path.is_file() {
+                return Ok(None);
+            }
+            let text = std::fs::read_to_string(&path).with_context(|| path.display().to_string())?;
+            Ok(Some(serde_json::from_str(&text).with_context(|| path.display().to_string())?))
+        };
+        if let Some(q) = read("hf_quant_config.json")? {
+            return Ok(Some(q.get("quantization").filter(|v| v.is_object()).cloned().unwrap_or(q)));
+        }
+        Ok(read("config.json")?.and_then(|c| c.get("quantization_config").or_else(|| c.get("text_config")?.get("quantization_config")).cloned()))
+    }
+
+    pub fn quant_map(&self) -> Result<crate::quant_map::QuantMap> {
+        match self.quant_config()? {
+            Some(q) => crate::quant_map::QuantMap::from_quant_config(&q),
+            None => Ok(Default::default()),
+        }
+    }
+
+    pub fn check_quant_layout(&self, map: &crate::quant_map::QuantMap) -> Result<()> {
+        if map.is_empty() {
+            return Ok(());
+        }
+        let mut tensors = std::collections::BTreeMap::new();
+        for (name, (i, stored)) in self.names.iter() {
+            let info = self.shards[*i].meta.info(stored).context("tensor info")?;
+            tensors.insert(name.clone(), crate::quant_map::Tensor { dtype: info.dtype, shape: info.shape.clone() });
+        }
+        map.check_layout(&tensors)
+    }
+
     pub fn names_under(&self, prefix: &str) -> Vec<String> {
         self.names.keys().filter(|n| n.starts_with(prefix)).cloned().collect()
     }
@@ -492,6 +527,16 @@ impl Checkpoint {
         ensure!(v.shape == [rows, cols], "{weight} has shape {:?}, expected {:?}", v.shape, [rows, cols]);
         let kb = cols.div_ceil(FP8_BLOCK);
         let channel = format!("{weight}_scale");
+        if self.has(&channel) && self.view(&channel)?.dtype == Dtype::U8 {
+            let s = self.shaped(&channel, &[rows, cols / crate::dequant::MXFP8.group])?;
+            let w = crate::dequant::MXFP8.decode_bf16(v.data, s.data).with_context(|| weight.to_string())?;
+            return Ok(Raw::Bf16 { w: Cow::Owned(w), cols });
+        }
+        if self.has(&channel) && self.view(&channel)?.shape.len() == 4 {
+            let grid = self.floats(&channel, &[rows.div_ceil(FP8_BLOCK), 1, kb, 1])?;
+            let map = (0..rows).map(|r| (r / FP8_BLOCK * kb) as u32).collect();
+            return Ok(Raw::Fp8 { w: Cow::Borrowed(v.data), grid, map, cols });
+        }
         if !self.has(&format!("{weight}_scale_inv")) && self.has(&channel) {
             let per_row = if self.view(&channel)?.shape.iter().product::<usize>() == 1 {
                 vec![self.floats(&channel, &self.view(&channel)?.shape)?[0]; rows]
@@ -1421,12 +1466,35 @@ impl Checkpoint {
         let weight = if self.has(&format!("{module}.weight_packed")) { format!("{module}.weight_packed") } else { format!("{module}.weight") };
         let packed = self.shaped(&weight, &[rows, cols / 2])?;
         ensure!(packed.dtype == Dtype::U8, "{weight} is {:?}, expected U8", packed.dtype);
-        let scales = self.shaped(&format!("{module}.weight_scale"), &[rows, cols / GROUP])?;
-        ensure!(scales.dtype == Dtype::F8_E4M3, "{module}.weight_scale is {:?}, expected F8_E4M3", scales.dtype);
+        let scale_name = format!("{module}.weight_scale");
+        let decoded;
+        let scale_bytes: Cow<'_, [u8]> = if !self.has(&scale_name) && self.has(&format!("{scale_name}.csf32_bases")) {
+            decoded = self.csf_scales(&scale_name, rows, cols / GROUP)?;
+            Cow::Owned(decoded)
+        } else {
+            let scales = self.shaped(&scale_name, &[rows, cols / GROUP])?;
+            ensure!(scales.dtype == Dtype::F8_E4M3, "{module}.weight_scale is {:?}, expected F8_E4M3", scales.dtype);
+            Cow::Borrowed(scales.data)
+        };
         let global = self.global_scale(module, "weight_global_scale", "weight_scale_2")?.with_context(|| format!("{module} has no weight_global_scale or weight_scale_2"))?;
-        let mut m = crate::nvfp4::Fp4::new(Cow::Borrowed(packed.data), Cow::Borrowed(scales.data), global, rows, cols)?;
+        let mut m = crate::nvfp4::Fp4::new(Cow::Borrowed(packed.data), scale_bytes, global, rows, cols)?;
         m.input_global = self.global_scale(module, "input_global_scale", "input_scale")?.unwrap_or(0.0);
         Ok(m)
+    }
+
+    pub fn csf_scales(&self, scale: &str, rows: usize, columns: usize) -> Result<Vec<u8>> {
+        let part = |p: &str, dtype: Dtype| -> Result<&[u8]> {
+            let name = format!("{scale}.csf32_{p}");
+            let v = self.view(&name)?;
+            ensure!(v.dtype == dtype && v.shape.len() == 1, "{name} is {:?} {:?}, expected {dtype:?} [n]", v.dtype, v.shape);
+            Ok(v.data)
+        };
+        let words16 = |b: &[u8]| -> Vec<u16> { b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+        let page_bases: Vec<u32> = part("page_bases", Dtype::U32)?.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let offsets = words16(part("offsets", Dtype::U16)?);
+        let exceptions = words16(part("exceptions", Dtype::U16)?);
+        let plane = crate::csf::CsfPlane { rows, columns, bases: part("bases", Dtype::U8)?, codes: part("codes", Dtype::U8)?, page_bases: &page_bases, offsets: &offsets, exceptions: &exceptions };
+        plane.decode().with_context(|| scale.to_string())
     }
 
     pub fn mtp<'a>(&'a self, spec: &Spec) -> Result<MtpWeights<'a>> {

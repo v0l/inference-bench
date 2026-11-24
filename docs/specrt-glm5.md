@@ -80,6 +80,18 @@ Gaps (all **load**, none needs a per-architecture name):
 | Q3 | FP8_PB_WO | `Quant::Fp8Block128` is the same math, but `Checkpoint::raw` (weights.rs 444-457) looks for `weight_scale_inv` [rows/128, cols/128] or a per channel `weight_scale` [rows, 1]; the 4-D f32 `weight_scale` must be read as the block grid. Weight only: the act-quant rules must not turn on fp8 activations for these |
 | Q4 | NVFP4 with CSF scales | the NVFP4 loader reads `{module}.weight_scale` F8_E4M3 [rows, cols / 16] (weights.rs 1369). Needs a CSF decoder (host side at load is enough; the format is lossless) |
 | Q5 | W4A16_NVFP4 (fp4 weights, bf16 activations) | the `nvfp4_g16` group rule already matches it and the act rule turns fp4 activations on only for plain `NVFP4`, so the existing weight only NVFP4 GEMV is the path. Note: the user's vLLM forces A16 for the NVFP4 experts too (`VLLM_B12X_MOE_FP4_FORCE_A16=1`), so W4A16 everywhere is the like for like default |
+
+### Status after #1190 (stage 3a)
+
+| # | done | where | test |
+| --- | --- | --- | --- |
+| Q1 | `[[quantization.tensor_rules]]` in `family-base.toml` map each `quantized_layers` entry to a `TensorQuant` (`fp8`, `fp8_block128`, `mxfp8`, `nvfp4`, `nvfp4_csf`, `w4a16_nvfp4`). The spec carries it as `quant_map` (module to format, `Spec::tensor_quant` finds the owning module of a tensor name; spec format 14). At load `Checkpoint::quant_map` reads `hf_quant_config.json` (or `config.json`) and `check_quant_layout` refuses an unknown algo or encoding with the module name, and a weight or scale in the wrong dtype or shape, a missing part, a CSF part on a plain module or an fp8/u8 weight no entry covers with the tensor name. The real checkpoint passes it (494 modules) | `src/quant_map.rs`, `Checkpoint::{quant_map, check_quant_layout}`, `Runtime::load` | `tests/quant_map.rs` |
+| Q2 | `dequant::MXFP8` decodes at load (`Checkpoint::raw` reads a U8 `weight_scale` as e8m0 per 32); the device block is `kir::dequant::BlockDequant` emitted by `kir::cuda::emit_block_dequant` (format is data: elem, scale, group), run through `BlockFormat::decode_on_device`. e8m0 0 is 2^-127 and 255 is NaN, as in `ml_dtypes` | `kir/src/dequant.rs`, `kir/src/cuda/dequant.rs`, `specrt/src/dequant.rs` | `tests/mxfp8.rs` against `scripts/mxfp8_reference.py` (numpy, `ml_dtypes`); an exponent off by one changes more than half the values |
+| Q3 | the 4-D f32 `weight_scale` [r/128, 1, c/128, 1] loads as the `Fp8Block128` grid. The existing fp8 path takes it weight only: with `act_quant = none` `select` picks `*_f8b*` (tokens up to 64) or `*_mma*` (`DecFp8` in the bf16 tile mainloop), neither quantises activations. Nothing differs from DeepSeek style `weight_scale_inv` except the scale's name and shape | `Checkpoint::raw` | `tests/fp8_pb_wo.rs` |
+| Q4 | `csf::CsfPlane::decode`, a port of vLLM's `logical_csf_components`; `Checkpoint::fp4` uses it when there is no plain `weight_scale`. Equal byte for byte to vLLM on the real `layers.3.mlp.experts.0.down_proj` scale (sha256 `788ca324...`) and on two clipped slices cut by vLLM's `slice_csf_blocks` (fixtures from `scripts/csf_reference.sh`, which runs the image on the CPU only) | `src/csf.rs` | `tests/csf.rs` |
+| Q5 | the same kir block with e2m1 elements, e4m3 scales, group 16 and the `weight_scale_2` multiplier decodes W4A16 NVFP4 to bf16 for the bf16 tile GEMM | as Q2 | `tests/w4a16_nvfp4.rs` |
+
+GPU checks: `crates/specrt/scripts/gate1190_gpu.sh` under `~/.agents/bin/gpu-run 1 --`. No family claims `glm5_next` yet.
 | Q6 | bf16 tensors from a second file | `tensors/native-QB.safetensors` is in the index `weight_map`, and `shard_files` reads every file the map names: **have** |
 
 ## Memory: resident set and KV per token

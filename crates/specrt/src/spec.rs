@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use kir as kir;
 
-pub const SPEC_FORMAT: u32 = 13;
+pub const SPEC_FORMAT: u32 = 14;
 
 pub fn modelopt_verified() -> bool {
     include_str!("../modelopt-verified.txt").trim() == "pass"
@@ -991,6 +991,8 @@ pub struct Spec {
     pub plain_activations: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub iq_quants: bool,
+    #[serde(default, skip_serializing_if = "crate::quant_map::QuantMap::is_empty")]
+    pub quant_map: crate::quant_map::QuantMap,
 }
 
 pub const MAX_DRAFT_TOKENS: usize = 3;
@@ -1670,6 +1672,12 @@ impl Spec {
             }
         })?;
         let quantization = parse_quantization(&family.quantization, quant_config.as_ref(), hf.num_hidden_layers);
+        let quant_map = match (quant_config.as_ref().map(|q| crate::quant_map::QuantMap::from_config(&family.quantization, q)), strict) {
+            (None, _) => Default::default(),
+            (Some(Ok(m)), _) => m,
+            (Some(Err(e)), true) => return Err(e),
+            (Some(Err(_)), false) => Default::default(),
+        };
         let Quantization { quant, mlp: mlp_quant, act, mlp_act } = match (quantization, strict) {
             (Ok(q), _) => q,
             (Err(e), true) => return Err(e),
@@ -1925,6 +1933,7 @@ impl Spec {
             runtime: RuntimeOptions::default(),
             plain_activations: !family.runtime.split_activations,
             iq_quants: false,
+            quant_map,
         };
         Ok(spec)
     }
@@ -2092,6 +2101,10 @@ impl Spec {
 
     pub fn head_rows(&self) -> std::ops::Range<usize> {
         self.dims.head_rows.clone().unwrap_or(0..self.dims.vocab)
+    }
+
+    pub fn tensor_quant(&self, tensor: &str) -> Option<crate::quant_map::TensorQuant> {
+        self.quant_map.tensor(tensor)
     }
 
     pub fn lm_head_quant(&self) -> Quant {

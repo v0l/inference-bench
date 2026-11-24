@@ -29,6 +29,8 @@ pub const DEVICE_TILE: usize = 128;
 
 pub const MXFP4: BlockFormat = BlockFormat { elem: Elem::E2m1, scale: ScaleKind::E8m0, group: 32 };
 
+pub const MXFP8: BlockFormat = BlockFormat { elem: Elem::E4m3, scale: ScaleKind::E8m0, group: 32 };
+
 impl Elem {
     pub fn bits(self) -> usize {
         match self {
@@ -49,6 +51,8 @@ impl Elem {
 impl ScaleKind {
     fn value(self, code: u8) -> f32 {
         match self {
+            ScaleKind::E8m0 if code == 0 => f32::from_bits(0x0040_0000),
+            ScaleKind::E8m0 if code == 0xff => f32::NAN,
             ScaleKind::E8m0 => f32::from_bits(u32::from(code) << 23),
             ScaleKind::E4m3 => crate::weights::e4m3_to_f32(code),
             ScaleKind::F32 => f32::from(code),
@@ -113,6 +117,53 @@ impl BlockFormat {
         let mut f = Vec::with_capacity(packed.len() * 8 / self.elem.bits());
         self.decode(packed, scales, &mut f)?;
         Ok(f.into_iter().map(crate::weights::f32_to_bf16).collect())
+    }
+
+    pub fn kernel(&self, target: &kir::Target) -> Result<kir::dequant::BlockDequant> {
+        let elem = match self.elem {
+            Elem::E2m1 => kir::dequant::Elem::E2m1,
+            Elem::E4m3 => kir::dequant::Elem::E4m3,
+            Elem::Int8 => bail!("int8 blocks have no device dequant"),
+        };
+        let scale = match self.scale {
+            ScaleKind::E8m0 => kir::dequant::Scale::E8m0,
+            ScaleKind::E4m3 => kir::dequant::Scale::E4m3,
+            ScaleKind::F32 => bail!("a one byte scale cannot be f32"),
+        };
+        kir::dequant::BlockDequant::new(target, elem, scale, self.group as u32).map_err(anyhow::Error::msg)
+    }
+
+    pub fn decode_on_device(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        cache_dir: &std::path::Path,
+        packed: &[u8],
+        scales: &[u8],
+        global: f32,
+    ) -> Result<cudarc::driver::CudaSlice<u16>> {
+        use cudarc::driver::{LaunchConfig, PushKernelArg};
+        self.check()?;
+        ensure!(packed.len() == scales.len() * self.packed_len(self.group), "{} packed bytes do not match {} scales of {} values", packed.len(), scales.len(), self.group);
+        let target = crate::codegen::cuda_target(stream.context())?;
+        let k = self.kernel(&target)?;
+        let module = crate::codegen::Module {
+            source: kir::cuda::emit_block_dequant(&k).map_err(anyhow::Error::msg)?,
+            kernels: vec![k.name()],
+            smem: std::collections::BTreeMap::new(),
+            arch_features: false,
+            kir_hash: k.hash(),
+        };
+        let loaded = crate::jit::Jit::new(stream.context().clone(), cache_dir.to_path_buf())?.load(&module)?;
+        let f = loaded.function(k.name())?;
+        let groups = scales.len();
+        let w = stream.clone_htod(packed)?;
+        let s = stream.clone_htod(scales)?;
+        let mut out = stream.alloc_zeros::<u16>(groups * self.group)?;
+        let n = groups as u64;
+        let l = k.launch(groups);
+        let cfg = LaunchConfig { grid_dim: (l.grid, 1, 1), block_dim: (l.threads, 1, 1), shared_mem_bytes: 0 };
+        unsafe { stream.launch_builder(&f).arg(&w).arg(&s).arg(&global).arg(&n).arg(&mut out).launch(cfg) }?;
+        Ok(out)
     }
 }
 

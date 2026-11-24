@@ -5,6 +5,7 @@ pub mod attention;
 pub mod bandwidth;
 pub mod compose;
 pub mod desc;
+pub mod dequant;
 pub mod expr;
 pub mod gemm;
 pub mod gemv;

@@ -39,6 +39,8 @@ pub mod nvfp4;
 pub mod nvrtc;
 pub mod options;
 pub mod pairing;
+pub mod csf;
+pub mod quant_map;
 pub mod fusion;
 pub mod pipeline;
 pub mod diskio;
