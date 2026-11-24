@@ -181,6 +181,38 @@ fn score_policy_expert_cache_is_bit_identical_and_promotes_between_steps() {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
+fn score_policy_gpt_oss_experts_with_promotions_is_bit_identical() {
+    for slots in [4, 6] {
+        let stats = scored("tiny-gpt-oss", slots);
+        assert!(stats.promotions > 0 && stats.evictions > 0, "{slots} slots: {stats:?}");
+    }
+    let both = checked("tiny-gpt-oss", 16, true, Policy::Score).stats;
+    assert!(both.promotions > 0, "{both:?}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
+fn a_promotion_still_copying_is_served_by_the_staged_path() {
+    for (dir, table) in [("tiny-qwen3.5-moe", false), ("tiny-qwen3.5-moe", true), ("tiny-gpt-oss", false), ("tiny-gpt-oss", true)] {
+        let mut full = Runtime::load(&spec_for(dir, 0), 256).unwrap();
+        let want = full.trace_decode(&prompt(12)).unwrap();
+        drop(full);
+        let mut spec = moe_spec(dir, if table { 16 } else { 5 }, None);
+        spec.runtime.offload.policy = Policy::Score;
+        spec.runtime.offload.score_half_life = 2;
+        spec.runtime.offload.pointer_table = table;
+        let mut off = Runtime::load(&spec, 256).unwrap();
+        off.stall_expert_promotions(300);
+        let got = off.trace_decode(&prompt(12)).unwrap();
+        let stats = off.offload_stats().unwrap();
+        assert!(stats.promotions > 0, "{dir} table={table}: {stats:?}");
+        assert_eq!(got.logits, want.logits, "{dir} table={table}: decode logits with promotions in flight");
+        assert_eq!(got.layers, want.layers, "{dir} table={table}");
+    }
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU"]
 fn score_policy_with_pointer_table_is_bit_identical() {
     for dir in ["tiny-qwen3.5-moe", "tiny-qwen3.5-moe-nvfp4", "tiny-qwen3.5-moe-fp8", "tiny-glm4-moe"] {
         let all = checked(dir, 24, true, Policy::Score);
