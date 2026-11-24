@@ -1,0 +1,111 @@
+{%- set _reserved_control_tokens = ['<|system|>', '<|user|>', '<|assistant|>', '<|end|>', '<|endofprompt|>', '<|tool|>', '<|/tool|>', '<|tool_call|>', '<|/tool_call|>', '<|tool_response|>'] %}
+{%- if model_identity is not defined %}
+{%- set model_identity = "You are Aion Instruct, a large language model trained by Microsoft." %}
+{%- endif %}
+{%- if knowledge_cutoff is not defined or not knowledge_cutoff %}
+{%- set knowledge_cutoff = "2025-12" %}
+{%- endif %}
+{%- if messages and messages[0].role == 'system' %}
+{%- set start_index = 1 %}
+{%- else %}
+{%- set start_index = 0 %}
+{%- endif %}
+{{- '<|system|>' + model_identity }}
+{{- '\nKnowledge cutoff: ' + knowledge_cutoff }}
+{%- if current_date is defined and current_date %}
+{{- '\nCurrent date: ' + current_date }}
+{%- else %}
+{{- '\nCurrent date: ' + strftime_now('%Y-%m-%d') }}
+{%- endif %}
+{%- if messages and messages[0].role == 'system' %}
+{%- if messages[0].content is string %}
+{%- set _sys_content = messages[0].content %}
+{%- else %}
+{%- set _sys_content = '' %}
+{%- endif %}
+{%- for _t in _reserved_control_tokens %}
+{%- if _sys_content and _t in _sys_content %}
+{{- raise_exception("aion chat template: content of the leading 'system' message contains reserved control token " ~ _t ~ "; strip chat control tokens from the data.") }}
+{%- endif %}
+{%- endfor %}
+{{- '\n\n' + _sys_content }}
+{%- endif %}
+{%- if tools %}
+{{- '\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nThe available tools are provided as JSON between <|tool|> and <|/tool|> tokens:\n' }}
+{{- '<|tool|>' }}
+{{- tools | tojson }}
+{{- '<|/tool|>\n\nFor each function call, respond with a single <|tool_call|>{\"name\": \"<function-name>\", \"arguments\": <json-args>}<|/tool_call|> block.\n' }}
+{%- endif %}
+{{- '<|end|>' }}
+{%- set _ns = namespace(pending_tool_call=false) %}
+{%- for message in messages[start_index:] %}
+{%- if message.content is string %}
+{%- set content = message.content %}
+{%- else %}
+{%- set content = '' %}
+{%- endif %}
+{%- for _t in _reserved_control_tokens %}
+{%- if content and _t in content %}
+{{- raise_exception("aion chat template: content of a '" ~ message.role ~ "' message contains reserved control token " ~ _t ~ "; strip chat control tokens from the data.") }}
+{%- endif %}
+{%- endfor %}
+{%- if message.role == 'user' %}
+{{- '<|user|>' + content + '<|end|>' }}
+{%- set _ns.pending_tool_call = false %}
+{%- elif message.role == 'assistant' %}
+{{- '<|assistant|>' }}
+{%- generation %}
+{{- content }}
+{%- if message.tool_calls %}
+{%- for tool_call in message.tool_calls %}
+{%- if tool_call.function %}
+{%- set tc = tool_call.function %}
+{%- else %}
+{%- set tc = tool_call %}
+{%- endif %}
+{{- '<|tool_call|>' }}
+{{- '{\"name\": \"' ~ tc.name ~ '\", \"arguments\": ' }}
+{%- if tc.arguments is string %}
+{{- tc.arguments }}
+{%- else %}
+{{- tc.arguments | tojson }}
+{%- endif %}
+{{- '}' }}
+{{- '<|/tool_call|>' }}
+{%- endfor %}
+{%- endif %}
+{#- EVERY assistant turn -- including the conversation-final one -- closes on
+    <|end|> (200020), which IS the model's emitted eos (Phi-4 / Phi-4-reasoning
+    single-terminator scheme: <|im_end|> ends every turn AND is the eos, with NO
+    separate document terminator). Training on it teaches the model to STOP. The IFT
+    assistant-only loss trains this closing token. Packing isolates
+    conversations via reset position_ids (no distinct terminal token needed). #}
+{{- '<|end|>' }}
+{%- endgeneration %}
+{%- if message.tool_calls %}
+{%- set _ns.pending_tool_call = true %}
+{%- else %}
+{%- set _ns.pending_tool_call = false %}
+{%- endif %}
+{%- elif message.role == 'tool' %}
+{%- if not _ns.pending_tool_call %}
+{{- raise_exception("aion chat template: a 'tool' message has no preceding assistant tool_call.") }}
+{%- endif %}
+{%- if loop.first or (messages[loop.index0 + start_index - 1].role != 'tool') %}
+{{- '<|user|>' }}
+{%- endif %}
+{{- '<|tool_response|>' }}
+{{- content }}
+{%- if loop.last or (messages[loop.index0 + start_index + 1].role != 'tool') %}
+<|end|>
+{%- endif %}
+{%- elif message.role == 'system' and (start_index + loop.index0) != 0 %}
+{%- if content | trim %}
+{{- '<|system|>' + content + '<|end|>' }}
+{%- endif %}
+{%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+{{- '<|assistant|>' }}
+{%- else %}
+{%- endif %}

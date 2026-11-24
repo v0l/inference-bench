@@ -1,0 +1,11 @@
+{
+ "do_sample": true,
+ "temperature": 0.7,
+ "top_k": 20,
+ "top_p": 0.8,
+ "presence_penalty": 2.0,
+ "max_new_tokens": 256,
+ "bos_token_id": 0,
+ "eos_token_id": 0,
+ "pad_token_id": 0
+}

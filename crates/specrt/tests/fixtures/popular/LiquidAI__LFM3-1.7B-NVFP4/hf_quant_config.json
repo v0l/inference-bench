@@ -1,0 +1,39 @@
+{
+  "producer": {
+    "name": "modelopt",
+    "version": "0.0.1.dev1+g4c1f81382"
+  },
+  "quantization": {
+    "quant_algo": "NVFP4",
+    "kv_cache_quant_algo": null,
+    "group_size": 16,
+    "exclude_modules": [
+      "lm_head",
+      "model.embed_tokens",
+      "model.layers.0.conv*",
+      "model.layers.1.conv*",
+      "model.layers.10.self_attn*",
+      "model.layers.11.conv*",
+      "model.layers.12.self_attn*",
+      "model.layers.13.conv*",
+      "model.layers.14.self_attn*",
+      "model.layers.15.conv*",
+      "model.layers.16.self_attn*",
+      "model.layers.17.conv*",
+      "model.layers.18.self_attn*",
+      "model.layers.19.conv*",
+      "model.layers.2.self_attn*",
+      "model.layers.20.self_attn*",
+      "model.layers.21.conv*",
+      "model.layers.22.self_attn*",
+      "model.layers.23.conv*",
+      "model.layers.3.conv*",
+      "model.layers.4.self_attn*",
+      "model.layers.5.conv*",
+      "model.layers.6.self_attn*",
+      "model.layers.7.conv*",
+      "model.layers.8.self_attn*",
+      "model.layers.9.conv*"
+    ]
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "_from_model_config": true,
+  "bos_token_id": 199999,
+  "eos_token_id": [
+    200020,
+    199999
+  ],
+  "output_attentions": false,
+  "output_hidden_states": false,
+  "pad_token_id": 199999,
+  "transformers_version": "5.9.0",
+  "use_cache": true
+}

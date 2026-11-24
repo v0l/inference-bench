@@ -1,0 +1,16 @@
+{
+  "producer": {
+    "name": "modelopt",
+    "version": "0.43.0"
+  },
+  "quantization": {
+    "quant_algo": "FP8_PER_CHANNEL_PER_TOKEN",
+    "kv_cache_quant_algo": null,
+    "exclude_modules": [
+      "lm_head",
+      "model.embed_audio*",
+      "model.embed_vision*",
+      "model.vision_embedder*"
+    ]
+  }
+}
