@@ -236,6 +236,7 @@ pub enum Op {
     DecodeRope,
     Kernel { node: u8 },
     MixKernel { node: u8 },
+    Gated { node: u8, site: u8 },
     Swiglu,
     GdnPrefill,
     GdnDecode,
@@ -258,6 +259,8 @@ pub enum Op {
     HyperPost,
     HyperMean,
 }
+
+pub const GATED_MODULE: u8 = u8::MAX;
 
 pub fn weight_kind(q: Quant) -> WeightKind {
     match q {
@@ -294,6 +297,8 @@ impl Op {
             Op::DecodeAttention => "decode attention".into(),
             Op::Kernel { .. } => "described kernel".into(),
             Op::MixKernel { .. } => "described mixer kernel".into(),
+            Op::Gated { site: GATED_MODULE, .. } => "gated residual mixer".into(),
+            Op::Gated { site, .. } => format!("gated residual site {site}"),
             Op::Swiglu => "swiglu".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "delta rule".into(),
             Op::MtpIn => "draft input".into(),
@@ -332,6 +337,7 @@ impl Op {
             Op::KvRope | Op::QkRope | Op::DecodeRope => "qkv to kv cache".into(),
             Op::Flash | Op::FlashLegacy | Op::DecodeAttention | Op::Kernel { .. } => "qkv and kv cache to attn".into(),
             Op::MixKernel { .. } => "mix and sequence state to mix planes".into(),
+            Op::Gated { .. } => "streams and x".into(),
             Op::Swiglu => "gate_up to act".into(),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => "lin, ba and state to gdn".into(),
             Op::MtpIn => "tokens and hidden to fc planes".into(),
@@ -383,6 +389,18 @@ impl Op {
                 .flat_map(|(m, n)| {
                     n.bind.values().filter_map(move |b| match b {
                         crate::graph::Bind::Weight { weight, .. } => Some(format!("{}.{weight}", m.module)),
+                        _ => None,
+                    })
+                })
+                .collect(),
+            Op::Gated { node, site } => spec
+                .gated_residual
+                .iter()
+                .filter_map(|h| h.node.get(*node as usize).map(|n| (h, n)))
+                .flat_map(|(h, n)| {
+                    let module = h.sites.get(*site as usize).cloned().unwrap_or_else(|| h.module.clone());
+                    n.bind.values().filter_map(move |b| match b {
+                        crate::graph::Bind::Weight { weight, .. } => Some(format!("{module}.{weight}")),
                         _ => None,
                     })
                 })
@@ -457,6 +475,7 @@ impl Op {
             Op::DecodeAttention => names(&["qk_norm_rope", "batch_decode_attention", "batch_decode_combine"]),
             Op::Kernel { node } => spec.attention.node.get(*node as usize).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::MixKernel { node } => spec.mixer.as_ref().and_then(|m| m.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
+            Op::Gated { node, .. } => spec.gated_residual().and_then(|h| h.node.get(*node as usize)).and_then(|n| n.kernel.clone()).into_iter().collect(),
             Op::Swiglu => names(&["swiglu"]),
             Op::GdnPrefill => names(&[
                 "gdn_conv_prefill",

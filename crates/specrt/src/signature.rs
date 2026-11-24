@@ -173,6 +173,7 @@ fn class_of(body: &kir::Body) -> Class {
         kir::Body::Seq(kir::recur::SeqBody::Conv { .. }) => Class::Scan,
         kir::Body::Seq(kir::recur::SeqBody::GroupNorm { .. } | kir::recur::SeqBody::GroupMap(_)) => Class::RowReduce,
         kir::Body::Seq(kir::recur::SeqBody::TokenHash(_)) => Class::Gather,
+        kir::Body::Seq(kir::recur::SeqBody::GroupSum { .. } | kir::recur::SeqBody::GroupUpdate { .. }) => Class::Elementwise,
     }
 }
 
@@ -180,6 +181,7 @@ pub struct Signer<'a> {
     spec: &'a Spec,
     described: Vec<Option<kir::Kernel>>,
     mixer: Vec<kir::Kernel>,
+    gated: Vec<kir::Kernel>,
     ranked: bool,
 }
 
@@ -187,7 +189,7 @@ impl<'a> Signer<'a> {
     pub fn new(spec: &'a Spec) -> Result<Signer<'a>> {
         let target = crate::codegen::default_target();
         let ctx = crate::engine::DEFAULT_CTX;
-        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, ranked: false })
+        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, ranked: false })
     }
 
     pub fn ranked(self, ranked: bool) -> Signer<'a> {
@@ -342,6 +344,39 @@ impl<'a> Signer<'a> {
         self.bound(kernel, &m.node[node as usize].bind, &m.scratch, &BTreeMap::new(), &defaults)
     }
 
+    fn gated_node(&self, node: u8, site: u8) -> Result<Signature> {
+        let Some(h) = self.spec.gated_residual() else { bail!("a gated node needs a [gated_residual]") };
+        let Some(kernel) = self.gated.get(node as usize) else { bail!("gated node {node} has no kernel") };
+        let module = h.sites.get(site as usize).unwrap_or(&h.module).clone();
+        let mut bind = h.node[node as usize].bind.clone();
+        for b in bind.values_mut() {
+            if let Bind::Weight { weight, .. } = b {
+                *weight = format!("{module}.{weight}");
+            }
+        }
+        let streams = Tensor::new(Place::Local("streams".into()), Rows::Tokens, h.width(self.hidden()), Form::F32);
+        let mut sig = Signature { class: class_of(&kernel.body), reads: Vec::new(), writes: Vec::new() };
+        for p in kernel.params.iter().filter(|p| p.role != kir::Role::Value) {
+            let t = match &bind[p.name] {
+                Bind::Weight { weight, len } => Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, Form::F32),
+                Bind::Buffer { buffer } if buffer == "x" => self.x(),
+                Bind::Buffer { buffer } if buffer == "streams" => streams.clone(),
+                Bind::Buffer { buffer } => Tensor::new(Place::Local(buffer.clone()), Rows::Tokens, crate::state::dim(self.spec, &h.scratch[buffer])?, Form::F32),
+                _ => bail!("gated node {node} binds {:?} to a state or a number", p.name),
+            };
+            match p.access {
+                kir::Access::Read => sig.reads.push(t),
+                kir::Access::Write => {
+                    if p.name == "x" && h.node[node as usize].op != "expand" && kernel.params.iter().any(|q| q.name == "a") {
+                        sig.reads.push(t.clone());
+                    }
+                    sig.writes.push(t)
+                }
+            }
+        }
+        Ok(sig)
+    }
+
     fn gdn(&self) -> Signature {
         let Some(la) = &self.spec.linear_attention else {
             return Signature { class: Class::Scan, reads: Vec::new(), writes: Vec::new() };
@@ -451,6 +486,7 @@ impl<'a> Signer<'a> {
             Op::DecodeAttention => self.attention(layer, true, Tensor::buf(Buf::AttnPlanes, Rows::Tokens, spec.q_dim())),
             Op::Kernel { node } => self.described(node, layer)?,
             Op::MixKernel { node } => self.mixed(node)?,
+            Op::Gated { node, site } => self.gated_node(node, site)?,
             Op::Swiglu => sig(Class::Elementwise, vec![Tensor::buf(Buf::GateUp, Rows::Tokens, 2 * spec.dims.intermediate)], vec![Tensor::buf(Buf::Act, Rows::Tokens, spec.dims.intermediate)]),
             Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => self.gdn(),
             Op::MtpIn => sig(

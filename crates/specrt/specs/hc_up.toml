@@ -1,0 +1,36 @@
+kind = "kir-kernel"
+family = "head_matvec"
+name = "hc_up"
+threads = 128
+
+[args]
+x_row = "hc_lowrank"
+x_head = 0
+x_offset = 0
+inner = "hc_lowrank"
+w_head = "hidden * hc_lowrank"
+w_inner = 1
+w_out = "hc_lowrank"
+w_offset = 0
+out = "hidden"
+y_row = "hc_width"
+y_head = "hidden"
+y_offset = 0
+
+[[param]]
+name = "x"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+type = "f32"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+type = "f32"
+role = "activation"
+access = "write"

@@ -45,7 +45,7 @@ pub fn kernels_for(op: &Op, spec: &Spec, tokens: usize) -> Result<Vec<&'static s
         Op::DecodeRope => anyhow::bail!("described kernels are not yet on wgpu"),
         Op::Flash | Op::FlashLegacy | Op::DecodeAttention => vec!["attention"],
         Op::Swiglu => vec!["swiglu"],
-        Op::Kernel { .. } | Op::MixKernel { .. } => anyhow::bail!("described kernels are not yet on wgpu"),
+        Op::Kernel { .. } | Op::MixKernel { .. } | Op::Gated { .. } => anyhow::bail!("described kernels are not yet on wgpu"),
         Op::NormAdd { .. } | Op::LogitSoftcap | Op::LogitScale | Op::Split { .. } | Op::QkNorm | Op::ScaledAdd { .. } | Op::Clear { .. } => anyhow::bail!("this op is not yet on wgpu"),
         Op::GdnPrefill | Op::GdnDecode | Op::GdnVerify => anyhow::bail!("delta-net is not yet on wgpu"),
         Op::MtpIn | Op::MtpGather | Op::MtpNorm | Op::MtpDraft => anyhow::bail!("MTP is not yet on wgpu"),
@@ -66,6 +66,9 @@ pub fn unsupported(spec: &Spec) -> Option<String> {
     }
     if spec.linear_attention.is_some() {
         return Some("delta-net layers are not yet on wgpu".into());
+    }
+    if spec.gated_residual().is_some() {
+        return Some("described hyper-connections are not yet on wgpu".into());
     }
     if spec.mixer.is_some() {
         return Some("described mixers are not yet on wgpu".into());

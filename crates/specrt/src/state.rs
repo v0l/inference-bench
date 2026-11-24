@@ -87,10 +87,12 @@ fn symbol(spec: &Spec, name: &str) -> Option<usize> {
         "key_heads" => la?.key_heads,
         "key_head_dim" => la?.key_head_dim,
         "value_head_dim" => la?.value_head_dim,
+        "hc_streams" => spec.gated_residual().map(|g| g.streams).or(spec.hyper.as_ref().map(|h| h.streams))?,
+        "hc_width" => spec.gated_residual()?.width(spec.dims.hidden),
         other => match other.parse::<usize>() {
             Ok(n) => n,
             Err(_) => {
-                if let Some(v) = spec.mixer.as_ref().and_then(|m| m.params.get(other)) {
+                if let Some(v) = spec.mixer.as_ref().and_then(|m| m.params.get(other)).or_else(|| spec.gated_residual().and_then(|h| h.params.get(other))) {
                     return (*v >= 0.0 && v.fract() == 0.0).then_some(*v as usize);
                 }
                 let v = *a.params.get(other)?;

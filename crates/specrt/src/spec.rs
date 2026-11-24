@@ -510,6 +510,61 @@ pub struct Hyper {
     pub sites: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatedResidual {
+    pub streams: usize,
+    pub module: String,
+    pub sites: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub scratch: std::collections::BTreeMap<String, String>,
+    pub node: Vec<crate::graph::Node>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatedStage {
+    Expand,
+    Pre,
+    Post,
+    Collapse,
+}
+
+impl GatedStage {
+    pub fn op(self) -> &'static str {
+        match self {
+            GatedStage::Expand => "expand",
+            GatedStage::Pre | GatedStage::Collapse => "pre",
+            GatedStage::Post => "post",
+        }
+    }
+}
+
+impl GatedResidual {
+    pub fn width(&self, hidden: usize) -> usize {
+        self.streams * hidden
+    }
+
+    pub fn nodes(&self, stage: GatedStage) -> impl Iterator<Item = (usize, &crate::graph::Node)> {
+        self.node.iter().enumerate().filter(move |(_, n)| n.op == stage.op() && (stage != GatedStage::Collapse || n.when.as_deref() != Some("site")))
+    }
+
+    pub fn weights(&self, stage: GatedStage) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (_, n) in self.nodes(stage) {
+            for b in n.bind.values() {
+                if let crate::graph::Bind::Weight { weight, len } = b
+                    && !out.iter().any(|(w, _)| w == weight)
+                {
+                    out.push((weight.clone(), len.clone()));
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RopeStyle {
@@ -996,6 +1051,8 @@ pub struct Spec {
     pub mixer: Option<Mixer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hyper: Option<Hyper>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gated_residual: Option<GatedResidual>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtp: Option<Mtp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1953,6 +2010,7 @@ impl Spec {
             linear_attention,
             mixer,
             hyper: family.hyper.read(&value),
+            gated_residual: family.gated_residual.read(&value)?,
             tensors: family.tensors.clone(),
             vision: if strict { crate::vision::Vision::from_hf_config(json)? } else { None },
             state: if family.state.is_empty() { crate::state::stock() } else { family.state.clone() },
@@ -1978,6 +2036,7 @@ impl Spec {
         ensure!(self.mlp.mapped.is_none() || self.mlp.quant.is_none(), "a non-gated ([mlp.mapped]) mlp runs on bf16, fp8 and q8 weights only");
         self.validate_attention_nodes()?;
         self.validate_mixer()?;
+        self.validate_hyper()?;
         crate::state::validate(self)?;
         match self.head_quant {
             None | Some(Quant::Bf16) => {}
@@ -2199,6 +2258,49 @@ impl Spec {
 
     pub fn uses_branch(&self) -> bool {
         self.norm.sandwich || self.norm.residual_scale.is_some()
+    }
+
+    pub fn gated_residual(&self) -> Option<&GatedResidual> {
+        self.gated_residual.as_ref()
+    }
+
+    fn validate_hyper(&self) -> Result<()> {
+        let Some(h) = self.gated_residual() else { return Ok(()) };
+        ensure!(h.streams > 1, "[gated_residual] needs more than one stream");
+        ensure!(self.hyper.is_none(), "[gated_residual] and [hyper] are two different residuals, a spec takes one");
+        ensure!(!h.module.is_empty() && !h.sites.is_empty() && h.sites.len() <= 2, "[gated_residual] needs a module and one or two sites");
+        ensure!(!self.uses_branch() && !self.layers.split && !self.norm.pre, "[gated_residual] replaces the block norms and the residual, so it takes no pre, sandwich, scaled or split layers");
+        ensure!(self.speculative().is_none() && self.mixer.is_none(), "[gated_residual] cannot be combined with [mtp] or [mixer] yet");
+        ensure!(h.node.len() <= 64, "[[gated_residual.node]] has more than 64 nodes");
+        for stage in [GatedStage::Expand, GatedStage::Pre, GatedStage::Post, GatedStage::Collapse] {
+            ensure!(h.nodes(stage).next().is_some(), "[[gated_residual.node]] has no {:?} node", stage);
+        }
+        for (n, w) in &h.scratch {
+            ensure!(!matches!(n.as_str(), "x" | "streams"), "[gated_residual.scratch] {n} shadows a built in buffer");
+            crate::state::dim(self, w).with_context(|| format!("[gated_residual.scratch] {n}"))?;
+        }
+        for (i, n) in h.node.iter().enumerate() {
+            ensure!(matches!(n.op.as_str(), "expand" | "pre" | "post") && n.kernel.is_some(), "[[gated_residual.node]] {i} must be an expand, pre or post node with `kernel`");
+            ensure!(n.when.as_deref().is_none_or(|w| w == "site"), "[[gated_residual.node]] {i} when {:?} is not site", n.when);
+            ensure!(!n.grid.is_empty() && n.grid.len() <= 3, "[[gated_residual.node]] {i} needs a grid of one to three symbols");
+            for g in n.grid.iter().filter(|g| *g != "rows") {
+                crate::state::dim(self, g).with_context(|| format!("[[gated_residual.node]] {i} grid symbol {g:?}"))?;
+            }
+            for b in n.bind.values() {
+                match b {
+                    crate::graph::Bind::Weight { len, .. } => {
+                        ensure!(n.op != "expand", "[[gated_residual.node]] {i} is an expand node, which reads no weight");
+                        self.weight_len(len)?;
+                    }
+                    crate::graph::Bind::Buffer { buffer } => ensure!(
+                        matches!(buffer.as_str(), "x" | "streams") || h.scratch.contains_key(buffer),
+                        "[[gated_residual.node]] {i} binds buffer {buffer:?}, which is not x, streams or a [gated_residual.scratch] entry"
+                    ),
+                    _ => bail!("[[gated_residual.node]] {i} binds a state or a number, which gated nodes do not take"),
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn weight_len(&self, symbol: &str) -> Result<usize> {

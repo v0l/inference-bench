@@ -146,6 +146,7 @@ pub struct Layer<'a> {
     pub down: Matrix<'a>,
     pub moe: Option<MoeWeights>,
     pub hyper: Vec<Vec<f32>>,
+    pub gated: Vec<Vec<(String, Vec<f32>)>>,
 }
 
 pub struct Outside<'a> {
@@ -1268,7 +1269,7 @@ impl Checkpoint {
             )
         };
         let ln1 = if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] };
-        let ln2 = if spec.layers.split { ln1.clone() } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? };
+        let ln2 = if spec.layers.split { ln1.clone() } else if spec.gated_residual().is_some() { vec![0.0; 1] } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? };
         let layer_scale = match &spec.norm.layer_scale {
             Some(t) => {
                 let root = self.root();
@@ -1295,6 +1296,7 @@ impl Checkpoint {
             down,
             moe,
             hyper: self.hyper(spec, &p)?,
+            gated: self.gated_sites(spec, &p)?,
         })
     }
 
@@ -1309,6 +1311,21 @@ impl Checkpoint {
             out.push(self.floats(&format!("{p}.{site}_scale"), &[3])?);
         }
         Ok(out)
+    }
+
+    pub fn gated_weights(&self, spec: &Spec, module: &str, stage: crate::spec::GatedStage) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
+        h.weights(stage).into_iter().map(|(w, len)| Ok((w.clone(), self.flat(&format!("{module}.{w}"), spec.weight_len(&len)?)?))).collect()
+    }
+
+    fn gated_sites(&self, spec: &Spec, p: &str) -> Result<Vec<Vec<(String, Vec<f32>)>>> {
+        let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
+        h.sites.iter().map(|s| self.gated_weights(spec, &format!("{p}.{s}"), crate::spec::GatedStage::Pre)).collect()
+    }
+
+    pub fn gated_head(&self, spec: &Spec) -> Result<Vec<(String, Vec<f32>)>> {
+        let Some(h) = spec.gated_residual() else { return Ok(Vec::new()) };
+        self.gated_weights(spec, &format!("{}.{}", self.root(), h.module), crate::spec::GatedStage::Collapse)
     }
 
     fn gguf_stack(&self, g: &Gguf, name: &str, shape: &[usize], out: &mut Vec<u16>) -> Result<()> {
@@ -1648,6 +1665,7 @@ impl Checkpoint {
                 down,
                 moe,
                 hyper: Vec::new(),
+                gated: Vec::new(),
             },
             norm: self.norm(spec, &lay.norm, h)?,
         })
@@ -1681,7 +1699,7 @@ impl Checkpoint {
 
     fn head_from<'s>(&'s self, spec: &Spec, embed: &Cow<'s, [u16]>) -> Result<(Vec<f32>, Matrix<'s>)> {
         let d = &spec.dims;
-        let norm = self.norm(spec, &format!("{}.norm.weight", self.root()), d.hidden)?;
+        let norm = if spec.gated_residual().is_some() { vec![0.0; 1] } else { self.norm(spec, &format!("{}.norm.weight", self.root()), d.hidden)? };
         let lm_head = head_rows_matrix(self.head_raw(spec, embed)?, spec.lm_head_quant(), spec.head_rows(), "lm_head")?;
         Ok((norm, lm_head))
     }

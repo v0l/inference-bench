@@ -1,0 +1,36 @@
+kind = "kir-kernel"
+family = "head_matvec"
+name = "hc_inject"
+threads = 32
+
+[args]
+x_row = "hc_width"
+x_head = 0
+x_offset = 0
+inner = "hc_width"
+w_head = 0
+w_inner = 1
+w_out = "hc_width"
+w_offset = 0
+out = "hc_streams"
+y_row = "hc_streams"
+y_head = 0
+y_offset = 0
+
+[[param]]
+name = "x"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+type = "f32"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+type = "f32"
+role = "activation"
+access = "write"

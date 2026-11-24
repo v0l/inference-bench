@@ -1,0 +1,28 @@
+kind = "kir-kernel"
+family = "group_sum"
+name = "hc_mix"
+threads = 128
+
+[args]
+groups = "hc_streams"
+width = "hidden"
+a_row = "hc_width"
+b_row = "hc_width"
+y_row = "hidden"
+input = "sigmoid(a) * b"
+output = "s / groups"
+
+[[param]]
+name = "a"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "b"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"

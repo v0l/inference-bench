@@ -62,6 +62,7 @@ pub struct MoeShape {
     pub block_group: usize,
     pub mapped: bool,
     pub input_scaled: bool,
+    pub input_norm: bool,
 }
 
 pub(crate) fn f32_literal(v: f64) -> String {

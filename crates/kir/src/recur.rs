@@ -62,6 +62,8 @@ pub enum SeqBody {
     GroupNorm { x_row: u32, x_offset: u32, g_row: u32, g_offset: u32, width: u32, w_group: u32, out_row: u32, eps: f32, input: Expr, output: Expr },
     TokenHash(crate::hash::TokenHash),
     GroupMap(crate::group::GroupMap),
+    GroupSum { groups: u32, width: u32, a_row: u32, b_row: u32, y_row: u32, input: Expr, output: Expr },
+    GroupUpdate { groups: u32, width: u32, x_row: u32, a_row: u32, c_row: u32, expr: Expr },
 }
 
 fn ident(n: &str) -> bool {
@@ -156,6 +158,17 @@ fn lower_with(e: &Expr, names: &[(&str, String)], params: &[Param]) -> Result<St
     e.subst(&env)?.lower(Dialect::Cuda, &[])
 }
 
+fn group_names(params: &[Param], names: &[&'static str]) -> Vec<(&'static str, String)> {
+    names.iter().filter(|n| find(params, n).is_some()).map(|n| (*n, format!("{n}v"))).collect()
+}
+
+fn update_names(params: &[Param], groups: u32) -> Vec<(&'static str, String)> {
+    let mut out = group_names(params, &["a", "c"]);
+    out.push(("o", "o".into()));
+    out.push(("groups", format!("(float){groups}")));
+    out
+}
+
 impl SeqBody {
     pub fn family(&self) -> &'static str {
         match self {
@@ -163,6 +176,8 @@ impl SeqBody {
             SeqBody::GroupNorm { .. } => "group_norm",
             SeqBody::TokenHash(_) => "token_hash",
             SeqBody::GroupMap(_) => "group_map",
+            SeqBody::GroupSum { .. } => "group_sum",
+            SeqBody::GroupUpdate { .. } => "group_update",
         }
     }
 
@@ -185,6 +200,8 @@ impl SeqBody {
             SeqBody::GroupNorm { .. } => vec!["x", "g", "w", "y"],
             SeqBody::TokenHash(_) => crate::hash::TokenHash::allowed(),
             SeqBody::GroupMap(_) => params.iter().map(|p| p.name).collect(),
+            SeqBody::GroupSum { .. } => vec!["a", "b", "y"],
+            SeqBody::GroupUpdate { .. } => vec!["x", "a", "c"],
         }
     }
 
@@ -246,6 +263,29 @@ impl SeqBody {
                 lower_with(output, &[("n", "nv".into()), ("w", "wv[i]".into()), ("g", "gv[i]".into()), ("x", "xv[i]".into())], params)?;
             }
             SeqBody::TokenHash(_) | SeqBody::GroupMap(_) => {}
+            SeqBody::GroupSum { groups, width, input, output, .. } => {
+                f("a", Role::Activation, Access::Read)?;
+                f("y", Role::Activation, Access::Write)?;
+                if find(params, "b").is_some() {
+                    f("b", Role::Activation, Access::Read)?;
+                }
+                if *groups == 0 || *width == 0 {
+                    return Err("group_sum needs positive groups and width".into());
+                }
+                lower_with(input, &group_names(params, &["a", "b"]), params)?;
+                lower_with(output, &[("s", "s".into()), ("groups", format!("(float){groups}"))], params)?;
+            }
+            SeqBody::GroupUpdate { groups, width, expr, .. } => {
+                f("x", Role::Activation, Access::Write)?;
+                f("a", Role::Activation, Access::Read)?;
+                if find(params, "c").is_some() {
+                    f("c", Role::Activation, Access::Read)?;
+                }
+                if *groups == 0 || *width == 0 {
+                    return Err("group_update needs positive groups and width".into());
+                }
+                lower_with(expr, &update_names(params, *groups), params)?;
+            }
         }
         Ok(())
     }
@@ -349,6 +389,39 @@ impl SeqBody {
 {store}    }}
 ",
                     eps = crate::lit(*eps),
+                )
+            }
+            SeqBody::GroupSum { groups, width, a_row, b_row, y_row, input, output } => {
+                let term = lower_with(input, &group_names(&k.params, &["a", "b"]), &k.params)?;
+                let out = lower_with(output, &[("s", "s".into()), ("groups", format!("(float){groups}"))], &k.params)?;
+                let b = if find(&k.params, "b").is_some() { format!("\n        const float bv = b[(size_t)row * {b_row} + (size_t)g * {width} + h];") } else { String::new() };
+                format!(
+                    "    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (h >= {width}) return;
+    float s = 0.0f;
+    for (int g = 0; g < {groups}; g++) {{
+        const float av = a[(size_t)row * {a_row} + (size_t)g * {width} + h];{b}
+        s += {term};
+    }}
+    y[(size_t)row * {y_row} + h] = {out};
+"
+                )
+            }
+            SeqBody::GroupUpdate { groups, width, x_row, a_row, c_row, expr } => {
+                let value = lower_with(expr, &update_names(&k.params, *groups), &k.params)?;
+                let c = if find(&k.params, "c").is_some() { format!("\n        const float cv = c[(size_t)row * {c_row} + g];") } else { String::new() };
+                format!(
+                    "    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    const int row = blockIdx.y;
+    if (h >= {width}) return;
+    const float av = a[(size_t)row * {a_row} + h];
+    for (int g = 0; g < {groups}; g++) {{{c}
+        float* xs = x + (size_t)row * {x_row} + (size_t)g * {width} + h;
+        const float o = *xs;
+        *xs = {value};
+    }}
+"
                 )
             }
         };

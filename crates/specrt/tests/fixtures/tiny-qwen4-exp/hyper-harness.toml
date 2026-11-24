@@ -1,0 +1,106 @@
+name = "gated-residual-harness"
+kind = "family"
+min_engine = 8
+extends = "qwen3_5"
+
+[match]
+model_types = ["qwen4_exp", "qwen4_exp_text"]
+architectures = []
+
+[norm]
+pre = false
+
+[gated_residual]
+streams = "hc_count"
+module = "hyper_connection_mixer"
+sites = ["attn_hyper_connection", "mlp_hyper_connection"]
+
+[gated_residual.params]
+hc_lowrank = { config = "hc_lowrank" }
+hc_blocks = { expr = "floor((hidden_size + 127) / 128)" }
+
+[gated_residual.scratch]
+hc_normed = "hc_width"
+hc_low = "hc_lowrank"
+hc_gate = "hc_width"
+hc_inject = "hc_streams"
+
+[[gated_residual.node]]
+op = "expand"
+kernel = "hc_expand"
+grid = ["hc_blocks", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "streams" }
+a = { buffer = "x" }
+
+[[gated_residual.node]]
+op = "pre"
+kernel = "hc_norm"
+grid = ["hc_streams", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "streams" }
+g = { buffer = "streams" }
+w = { weight = "hc_norm.weight", len = "hc_width" }
+y = { buffer = "hc_normed" }
+
+[[gated_residual.node]]
+op = "pre"
+kernel = "hc_down"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "hc_normed" }
+w = { weight = "input_mix_weight_down.weight", len = "hc_lowrank * hc_width" }
+y = { buffer = "hc_low" }
+
+[[gated_residual.node]]
+op = "pre"
+kernel = "hc_act"
+grid = ["1", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "hc_low" }
+out = { buffer = "hc_low" }
+
+[[gated_residual.node]]
+op = "pre"
+kernel = "hc_up"
+grid = ["hc_streams", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "hc_low" }
+w = { weight = "input_mix_weight_up.weight", len = "hc_width * hc_lowrank" }
+y = { buffer = "hc_gate" }
+
+[[gated_residual.node]]
+op = "pre"
+kernel = "hc_inject"
+grid = ["1", "rows"]
+when = "site"
+
+[gated_residual.node.bind]
+x = { buffer = "hc_normed" }
+w = { weight = "block_inject_weight.weight", len = "hc_streams * hc_width" }
+y = { buffer = "hc_inject" }
+
+[[gated_residual.node]]
+op = "pre"
+kernel = "hc_mix"
+grid = ["hc_blocks", "rows"]
+
+[gated_residual.node.bind]
+a = { buffer = "hc_gate" }
+b = { buffer = "hc_normed" }
+y = { buffer = "x" }
+
+[[gated_residual.node]]
+op = "post"
+kernel = "hc_inject_add"
+grid = ["hc_blocks", "rows"]
+
+[gated_residual.node.bind]
+x = { buffer = "streams" }
+a = { buffer = "x" }
+c = { buffer = "hc_inject" }

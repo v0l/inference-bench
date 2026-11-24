@@ -12,7 +12,7 @@ pub const KIND: &str = "kir-kernel";
 
 pub const ROW_FAMILIES: [&str; 14] = ["span_rope", "state_write", "head_matvec", "index_topk", "layernorm_segment", "head_rms", "block_pool", "hyper_pre", "hyper_post", "hyper_expand", "hyper_mean", "pool_topk", "group_pool", "group_topk"];
 
-pub const SEQ_FAMILIES: [&str; 5] = ["recurrence", "seq_conv", "group_norm", "token_hash", "group_map"];
+pub const SEQ_FAMILIES: [&str; 7] = ["recurrence", "seq_conv", "group_norm", "token_hash", "group_map", "group_sum", "group_update"];
 
 pub const BUILTIN: [(&str, &str); 10] = [
     ("rmsnorm", include_str!("../kernels/rmsnorm.toml")),
@@ -615,7 +615,7 @@ impl Description {
     }
 
     fn sizes(&self, shape: &Shape, table: &BTreeMap<String, Value>, keys: &[&str], what: &str) -> Result<BTreeMap<String, u32>, String> {
-        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !matches!(k.as_str(), "src" | "style" | "name" | "space" | "act" | "input" | "output" | "eps" | "mix_eps" | "invert" | "stride" | "theta" | "angles")) {
+        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !matches!(k.as_str(), "src" | "style" | "name" | "space" | "act" | "input" | "output" | "expr" | "eps" | "mix_eps" | "invert" | "stride" | "theta" | "angles")) {
             return Err(format!("{}: {what} has no key {k:?}", self.name));
         }
         let mut out = BTreeMap::new();
@@ -821,6 +821,21 @@ impl Description {
                 let input = self.expr_arg(&words, &self.args, "input", "x")?;
                 let output = self.expr_arg(&words, &self.args, "output", "w * n")?;
                 let body = SeqBody::GroupNorm { x_row: n["x_row"], x_offset: n["x_offset"], g_row: n["g_row"], g_offset: n["g_offset"], width: n["width"], w_group: n["w_group"], out_row: n["out_row"], eps, input, output };
+                Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
+            }
+            "group_sum" => {
+                let n = self.sizes(shape, &self.args, &["groups", "width", "a_row", "b_row", "y_row"], "[args]")?;
+                let input = self.expr_arg(&words, &self.args, "input", "a")?;
+                let output = self.expr_arg(&words, &self.args, "output", "s")?;
+                let body = SeqBody::GroupSum { groups: n["groups"], width: n["width"], a_row: n["a_row"], b_row: n["b_row"], y_row: n["y_row"], input, output };
+                Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
+            }
+            "group_update" => {
+                let mut args = self.args.clone();
+                args.entry("c_row".into()).or_insert(Value::Integer(0));
+                let n = self.sizes(shape, &args, &["groups", "width", "x_row", "a_row", "c_row"], "[args]")?;
+                let expr = self.expr_arg(&words, &self.args, "expr", "o + a")?;
+                let body = SeqBody::GroupUpdate { groups: n["groups"], width: n["width"], x_row: n["x_row"], a_row: n["a_row"], c_row: n["c_row"], expr };
                 Kernel::seq(t, intern(&self.name), self.threads(shape)?, params, body).map_err(fail)
             }
             _ => {

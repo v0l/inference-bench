@@ -1,0 +1,27 @@
+kind = "kir-kernel"
+family = "group_update"
+name = "hc_inject_add"
+threads = 128
+
+[args]
+groups = "hc_streams"
+width = "hidden"
+x_row = "hc_width"
+a_row = "hidden"
+c_row = "hc_streams"
+expr = "o + a * 2.0 * sigmoid(c / groups)"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "a"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "c"
+role = "activation"
+access = "read"
