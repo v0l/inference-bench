@@ -1,1 +1,506 @@
-refused: model_type gemma4 is not supported
+{
+  "name": "gemma4",
+  "repo": "",
+  "quant": "bf16",
+  "dims": {
+    "hidden": 5376,
+    "intermediate": 21504,
+    "vocab": 262144,
+    "tie_embeddings": true,
+    "embed_scale": 73.32121111929344,
+    "logit_softcap": 30.0
+  },
+  "layers": {
+    "count": 60,
+    "pattern": [
+      "sliding",
+      "sliding",
+      "sliding",
+      "sliding",
+      "sliding",
+      "full"
+    ],
+    "window": 1024
+  },
+  "norm": {
+    "kind": "rmsnorm",
+    "eps": 1e-6,
+    "sandwich": true,
+    "layer_scale": "layer_scalar"
+  },
+  "attention": {
+    "kind": "gqa",
+    "heads": 32,
+    "kv_heads": 16,
+    "head_dim": 256,
+    "qkv_bias": false,
+    "qk_norm": false,
+    "node": [
+      {
+        "op": "kernel",
+        "kernel": "g4_q_norm_s",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "q_norm.weight",
+            "len": "hd_s"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_norm_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "k_norm.weight",
+            "len": "hd_s"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_v_norm_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_q_rope_s",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_rope_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_write_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "k_s"
+          },
+          "layer": "kind_layer",
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_v_write_s",
+        "grid": [
+          "kvh_s",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "v_s"
+          },
+          "layer": "kind_layer",
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_attn_s",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "k_cache": {
+            "state": "k_s"
+          },
+          "layer": "kind_layer",
+          "v_cache": {
+            "state": "v_s"
+          },
+          "window": "window"
+        },
+        "layers": [
+          "sliding"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_q_norm_g",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "q_norm.weight",
+            "len": "hd_g"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_norm_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "w": {
+            "weight": "k_norm.weight",
+            "len": "hd_g"
+          },
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_v_norm_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_q_rope_g",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_rope_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "x": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_k_write_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "k_g"
+          },
+          "layer": "kind_layer",
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_v_write_g",
+        "grid": [
+          "kvh_g",
+          "rows"
+        ],
+        "bind": {
+          "dst": {
+            "state": "v_g"
+          },
+          "layer": "kind_layer",
+          "src": {
+            "buffer": "qkv"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      },
+      {
+        "op": "kernel",
+        "kernel": "g4_attn_g",
+        "grid": [
+          "heads",
+          "rows"
+        ],
+        "bind": {
+          "k_cache": {
+            "state": "k_g"
+          },
+          "layer": "kind_layer",
+          "v_cache": {
+            "state": "v_g"
+          }
+        },
+        "layers": [
+          "full"
+        ]
+      }
+    ],
+    "params": {
+      "angles_g": 64.0,
+      "angles_s": 128.0,
+      "hd_g": 512.0,
+      "hd_s": 256.0,
+      "heads_n": 32.0,
+      "k_eq_v": 1.0,
+      "k_w": 4096.0,
+      "kv_w": 4096.0,
+      "kvh_g": 4.0,
+      "kvh_global": 4.0,
+      "kvh_s": 16.0,
+      "q_w": 16384.0,
+      "rotary_g": 0.25,
+      "theta_g": 1000000.0,
+      "theta_s": 10000.0,
+      "v_w": 4096.0
+    },
+    "projection": [
+      {
+        "tensor": "q_proj",
+        "rows": "heads * hd_s",
+        "layers": [
+          "sliding"
+        ],
+        "slot": "q_w"
+      },
+      {
+        "tensor": "q_proj",
+        "rows": "heads * hd_g",
+        "layers": [
+          "full"
+        ],
+        "slot": "q_w"
+      },
+      {
+        "tensor": "k_proj",
+        "rows": "kvh_s * hd_s",
+        "layers": [
+          "sliding"
+        ],
+        "slot": "k_w"
+      },
+      {
+        "tensor": "k_proj",
+        "rows": "kvh_g * hd_g",
+        "layers": [
+          "full"
+        ],
+        "slot": "k_w"
+      },
+      {
+        "tensor": "v_proj",
+        "rows": "kvh_s * hd_s",
+        "layers": [
+          "sliding"
+        ],
+        "slot": "v_w"
+      },
+      {
+        "tensor": "v_proj",
+        "rows": "kvh_g * hd_g",
+        "layers": [
+          "full"
+        ],
+        "slot": "v_w",
+        "when": "!k_eq_v"
+      },
+      {
+        "tensor": "k_proj",
+        "rows": "kvh_g * hd_g",
+        "layers": [
+          "full"
+        ],
+        "slot": "v_w",
+        "when": "k_eq_v"
+      }
+    ],
+    "o_cols": "q_w",
+    "o_cols_by": [
+      {
+        "layers": [
+          "sliding"
+        ],
+        "cols": "heads * hd_s"
+      },
+      {
+        "layers": [
+          "full"
+        ],
+        "cols": "heads * hd_g"
+      }
+    ]
+  },
+  "rope": {
+    "style": "neox",
+    "theta": 1000000.0,
+    "local_theta": 10000.0
+  },
+  "mlp": {
+    "activation": "geglu"
+  },
+  "state": [
+    {
+      "name": "k_s",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kvh_s",
+        "hd_s"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional",
+      "blocks": [
+        "sliding"
+      ]
+    },
+    {
+      "name": "v_s",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kvh_s",
+        "hd_s"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional",
+      "blocks": [
+        "sliding"
+      ]
+    },
+    {
+      "name": "k_g",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kvh_g",
+        "hd_g"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional",
+      "blocks": [
+        "full"
+      ]
+    },
+    {
+      "name": "v_g",
+      "per": "token",
+      "layers": "attention",
+      "shape": [
+        "kvh_g",
+        "hd_g"
+      ],
+      "dtype": "bf16",
+      "snapshot": true,
+      "prefix_share": true,
+      "rollback": "positional",
+      "blocks": [
+        "full"
+      ]
+    }
+  ],
+  "plain_activations": true
+}

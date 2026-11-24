@@ -3,6 +3,10 @@
 "chat template: syntax error: unknown statement break" = 1193
 "model_type gemma4" = 1194
 "model_type gemma4_unified" = 1194
+"Gemma 4 mixture-of-experts layers (enable_moe_block) are not supported yet" = 1238
+"Gemma 4 per-layer input embeddings (hidden_size_per_layer_input) are not supported yet" = 1239
+"vision_config not read" = 1237
+"vision_config and audio_config not read" = 1237
 "model_type gpt2" = 1195
 "model_type qwen4_exp" = 1196
 "GGUF architecture qwen4exp" = 1196

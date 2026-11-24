@@ -199,6 +199,7 @@ pub(crate) struct Assets {
     pub stop: Vec<u32>,
     pub sampling: SamplingDefaults,
     pub media: Option<crate::vision::MediaAssets>,
+    pub config_has_vision: bool,
 }
 
 pub fn without_truncation(mut tokenizer: Tokenizer) -> Result<Tokenizer> {
@@ -218,7 +219,7 @@ impl Assets {
         };
         let gen_cfg = g.generation_config_json();
         let stop = stop_ids(Some(&gen_cfg), tok_cfg.as_deref(), &|t| tokenizer.token_to_id(t));
-        Ok(Assets { spec, tokenizer, chat, stop, sampling: SamplingDefaults::default(), media: None })
+        Ok(Assets { spec, tokenizer, chat, stop, sampling: SamplingDefaults::default(), media: None, config_has_vision: false })
     }
 
     pub fn load(model: &str) -> Result<Self> {
@@ -249,7 +250,8 @@ impl Assets {
             &|t| tokenizer.token_to_id(t),
         );
         let media = media_assets(&spec, &tokenizer)?;
-        Ok(Assets { spec, tokenizer, chat, stop, sampling, media })
+        let config_has_vision = read("config.json").and_then(|c| serde_json::from_str::<Value>(&c).ok()).is_some_and(|c| c.get("vision_config").is_some_and(|v| v.is_object()));
+        Ok(Assets { spec, tokenizer, chat, stop, sampling, media, config_has_vision })
     }
 
     pub fn tokens(&self, text: &str) -> Result<Vec<u32>> {
@@ -281,7 +283,7 @@ impl Assets {
 }
 
 fn ensure_media(ok: bool) -> Result<()> {
-    if ok { Ok(()) } else { bail!("the model does not accept image or video input: its config has no vision_config") }
+    if ok { Ok(()) } else { bail!("the model does not accept image or video input") }
 }
 
 pub fn strip_media_urls(messages: &[Value]) -> Vec<Value> {
@@ -452,7 +454,7 @@ impl Engine {
     }
 
     pub fn load_with(model: &str, max_ctx: Option<usize>, runtime: Option<&crate::spec::RuntimeOptions>) -> Result<Self> {
-        let Assets { mut spec, tokenizer, chat, stop, sampling, media } = Assets::load(model)?;
+        let Assets { mut spec, tokenizer, chat, stop, sampling, media, .. } = Assets::load(model)?;
         if let Some(r) = runtime {
             spec.runtime = r.clone();
         }

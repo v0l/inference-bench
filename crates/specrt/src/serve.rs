@@ -1195,7 +1195,7 @@ impl Serving {
             return None;
         }
         Some(match (&self.assets.spec.vision, &self.assets.media) {
-            (None, _) => "this model's config has no vision_config".to_string(),
+            (None, _) => no_vision_reason(self.assets.config_has_vision).to_string(),
             (Some(_), None) => "the engine did not load the image preprocessing assets (the preprocessor configs are missing)".to_string(),
             (Some(_), Some(_)) => "the engine did not load a vision encoder (the checkpoint has no vision tensors)".to_string(),
         })
@@ -1341,6 +1341,20 @@ impl Serving {
         out.ttft_secs = first.duration_since(started).as_secs_f64();
         out.decode_secs = first.elapsed().as_secs_f64();
         Ok(out)
+    }
+}
+
+fn no_vision_reason(config_has_vision: bool) -> &'static str {
+    if config_has_vision { "the engine serves this model as text only: its vision tower is not supported yet" } else { "this model's config has no vision_config" }
+}
+
+#[cfg(test)]
+mod media_refusal_tests {
+    #[test]
+    fn a_vision_tower_the_family_does_not_read_is_named_as_text_only_not_missing() {
+        assert!(super::no_vision_reason(true).contains("text only"));
+        assert!(!super::no_vision_reason(true).contains("no vision_config"));
+        assert!(super::no_vision_reason(false).contains("no vision_config"));
     }
 }
 
