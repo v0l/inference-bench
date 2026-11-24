@@ -46,6 +46,8 @@ pub struct State {
     pub rollback: Rollback,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -53,7 +55,7 @@ fn yes() -> bool {
 }
 
 fn declared(name: &str, per: Per, layers: Layers, shape: &[&str], dtype: Dtype, rollback: Rollback) -> State {
-    State { name: name.into(), per, layers, shape: shape.iter().map(|s| s.to_string()).collect(), dtype, snapshot: true, prefix_share: true, rollback, owner: None }
+    State { name: name.into(), per, layers, shape: shape.iter().map(|s| s.to_string()).collect(), dtype, snapshot: true, prefix_share: true, rollback, owner: None, blocks: Vec::new() }
 }
 
 pub fn stock() -> Vec<State> {
@@ -116,6 +118,7 @@ pub fn dim(spec: &Spec, text: &str) -> Result<usize> {
 impl State {
     pub fn layer_count(&self, spec: &Spec) -> usize {
         match self.layers {
+            Layers::Attention if !self.blocks.is_empty() => (0..spec.layers.count).filter(|&i| self.blocks.iter().any(|b| b == spec.block(i).name())).count(),
             Layers::Attention => spec.kv_layers(),
             Layers::Linear => spec.linear_layers(),
         }
@@ -137,6 +140,10 @@ impl State {
 
     pub fn positional(&self) -> bool {
         self.per == Per::Token
+    }
+
+    pub fn keeps(&self, spec: &Spec, layer: Option<usize>) -> bool {
+        self.blocks.is_empty() || layer.is_some_and(|l| self.blocks.iter().any(|b| b == spec.block(l).name()))
     }
 
     pub fn token_layer_bytes(&self, spec: &Spec, attention_index: usize, planes: usize) -> usize {
@@ -177,7 +184,11 @@ pub fn kv_block_bytes(spec: &Spec, planes: usize) -> usize {
 }
 
 pub fn kv_bytes_per_token_at(spec: &Spec, attention_index: usize) -> u64 {
-    positional(spec).filter(|s| s.layers == Layers::Attention).map(|s| s.token_layer_bytes(spec, attention_index, 1) as u64).sum()
+    let layer = (0..spec.layers.count).filter(|&i| spec.block(i).is_attention()).nth(attention_index);
+    positional(spec)
+        .filter(|s| s.layers == Layers::Attention && s.keeps(spec, layer))
+        .map(|s| s.token_layer_bytes(spec, attention_index, 1) as u64)
+        .sum()
 }
 
 pub fn sequence_bytes(spec: &Spec) -> u64 {
@@ -219,6 +230,11 @@ pub fn validate(spec: &Spec) -> Result<()> {
             let layer = owner.strip_prefix("layer:").and_then(|n| n.parse::<usize>().ok());
             ensure!(layer.is_some_and(|l| l < spec.layers.count), "{at} owner {owner:?} is not layer:N inside the model");
         }
+        for b in &s.blocks {
+            let kind = crate::spec::Block::parse(b).with_context(|| at.clone())?;
+            ensure!(s.layers == Layers::Attention && kind.is_attention(), "{at} blocks {b:?} must name attention layer kinds of an attention state");
+        }
+        ensure!(s.blocks.is_empty() || spec.speculative().is_none(), "{at} is kept for some layer kinds only, which [mtp] does not support yet");
         if s.layer_count(spec) > 0 {
             let d = s.dims(spec).with_context(|| at.clone())?;
             ensure!(d.iter().all(|&x| x > 0), "{at} has a zero sized axis");

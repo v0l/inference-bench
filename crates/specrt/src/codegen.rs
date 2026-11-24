@@ -266,7 +266,7 @@ pub fn described_kernels(spec: &Spec, kv_planes: usize, max_ctx: usize, target: 
                 | (kir::Role::Activation | kir::Role::Scratch, crate::graph::Bind::Weight { .. } | crate::graph::Bind::Number(_) | crate::graph::Bind::Name(_)) => {
                     anyhow::bail!("[[attention.node]] {i} binds {b:?} to the wrong kind of value")
                 }
-                (_, crate::graph::Bind::Name(n)) => anyhow::ensure!(matches!(n.as_str(), "window" | "nope") || spec.attention.params.contains_key(n), "[[attention.node]] {i} binds {b:?} to {n:?}, which is not window, nope or an [attention.params] entry"),
+                (_, crate::graph::Bind::Name(n)) => anyhow::ensure!(matches!(n.as_str(), "window" | "nope" | "kind_layer") || spec.attention.params.contains_key(n), "[[attention.node]] {i} binds {b:?} to {n:?}, which is not window, nope, kind_layer or an [attention.params] entry"),
                 _ => {}
             }
         }

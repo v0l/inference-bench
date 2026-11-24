@@ -814,6 +814,8 @@ pub struct Norm {
     pub pre: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub residual_scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_scale: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -849,6 +851,8 @@ pub struct Attention {
     pub projection: Vec<Projection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub o_cols: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub o_cols_by: Vec<OCols>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub scratch: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -880,12 +884,23 @@ pub struct Projection {
     pub rows: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub layers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
 impl Projection {
     pub fn present_in(&self, block: Block) -> bool {
         self.layers.is_empty() || self.layers.iter().any(|l| l == block.name())
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OCols {
+    pub layers: Vec<String>,
+    pub cols: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1658,6 +1673,11 @@ impl Spec {
             family.attention.output_gate.read(&value),
         );
         family.normalise(&mut value);
+        if strict {
+            for r in &family.refuse {
+                ensure!(!r.hits(&value)?, "{}", r.message);
+            }
+        }
         let dtype_values: std::collections::HashMap<&str, String> = family
             .dtypes
             .keys
@@ -1878,6 +1898,7 @@ impl Spec {
                 sandwich: family.norm.sandwich,
                 pre: family.norm.pre,
                 residual_scale: multiplier(&family.multipliers.residual),
+                layer_scale: family.norm.layer_scale.clone(),
             },
             attention: Attention {
                 kind: crate::family::first_kind(&family.attention.kinds, &value).unwrap_or(AttentionKind::Gqa),
@@ -1898,6 +1919,7 @@ impl Spec {
                 params: crate::family::read_params(&family.attention.params, &value)?,
                 projection: family.attention.projection.clone(),
                 o_cols: family.attention.o_cols.clone(),
+                o_cols_by: family.attention.o_cols_by.clone(),
                 scratch: family.attention.scratch.clone(),
                 int_scratch: family.attention.int_scratch.clone(),
                 o_tensor: family.attention.o_tensor.clone(),
@@ -1946,6 +1968,7 @@ impl Spec {
         self.runtime.validate()?;
         ensure!(!self.layers.pattern.iter().any(|b| b.windowed()) || self.layers.window.is_some_and(|w| w > 0), "sliding layers need a sliding_window");
         ensure!(self.layers.split || !self.layers.pattern.contains(&Block::Mlp), "mlp layers need [layers] split = true");
+        ensure!(self.norm.layer_scale.is_none() || (self.uses_branch() && !self.layers.split), "[norm] layer_scale needs sandwich or scaled residual norms");
         ensure!((self.mlp.activation == Activation::Mapped) == self.mlp.mapped.is_some(), "activation = \"mapped\" and [mlp.mapped] go together");
         ensure!(self.mlp.mapped.is_none() || self.mlp.gated.is_none(), "[mlp] cannot be both gated and mapped");
         ensure!(self.mlp.mapped.is_none() || self.mlp.quant.is_none(), "a non-gated ([mlp.mapped]) mlp runs on bf16, fp8 and q8 weights only");
@@ -2223,9 +2246,24 @@ impl Spec {
     fn validate_attention_nodes(&self) -> Result<()> {
         let nodes = &self.attention.node;
         for p in &self.attention.projection {
-            crate::state::dim(self, &p.rows).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
+            let rows = crate::state::dim(self, &p.rows).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
             for k in &p.layers {
                 Block::parse(k).with_context(|| format!("[[attention.projection]] {}", p.tensor))?;
+            }
+            if let Some(s) = &p.slot {
+                let width = self.attention.params.get(s).with_context(|| format!("[[attention.projection]] {} slot {s:?} is not an [attention.params] entry", p.tensor))?;
+                ensure!(rows as f64 <= *width, "[[attention.projection]] {} has {rows} rows, more than its slot {s} ({width})", p.tensor);
+            }
+            if let Some(w) = &p.when {
+                let name = w.strip_prefix('!').unwrap_or(w);
+                ensure!(self.attention.params.contains_key(name), "[[attention.projection]] {} when {w:?} is not an [attention.params] entry", p.tensor);
+            }
+        }
+        for o in &self.attention.o_cols_by {
+            let cols = crate::state::dim(self, &o.cols).context("[[attention.o_cols_by]] cols")?;
+            ensure!(cols <= self.o_dim(), "[[attention.o_cols_by]] {cols} columns are wider than o_cols ({})", self.o_dim());
+            for k in &o.layers {
+                Block::parse(k).context("[[attention.o_cols_by]] layers")?;
             }
         }
         if let Some(c) = &self.attention.o_cols {
@@ -2303,6 +2341,10 @@ impl Spec {
 
     pub fn attention_before(&self, layer: usize) -> usize {
         (0..layer).filter(|&i| self.block(i).is_attention()).count()
+    }
+
+    pub fn kind_before(&self, layer: usize) -> usize {
+        (0..layer).filter(|&i| self.block(i) == self.block(layer)).count()
     }
 
     pub fn gate_up_rows(&self) -> usize {
@@ -2415,10 +2457,42 @@ impl Spec {
 
     pub fn qkv_rows(&self) -> usize {
         if !self.attention.projection.is_empty() {
-            return self.attention.projection.iter().map(|p| crate::state::dim(self, &p.rows).unwrap_or(0)).sum();
+            return self.projection_groups().iter().map(|g| g.1).sum();
         }
         let gate = if self.attention.output_gate { self.q_dim() } else { 0 };
         self.q_dim() + 2 * self.kv_dim() + gate
+    }
+
+    pub fn projection_groups(&self) -> Vec<(Vec<&Projection>, usize)> {
+        let mut out: Vec<(Vec<&Projection>, usize)> = Vec::new();
+        for p in &self.attention.projection {
+            match p.slot.as_deref() {
+                Some(s) => match out.iter_mut().find(|(g, _)| g[0].slot.as_deref() == Some(s)) {
+                    Some((g, _)) => g.push(p),
+                    None => out.push((vec![p], self.attention.params.get(s).map_or(0, |v| *v as usize))),
+                },
+                None => out.push((vec![p], crate::state::dim(self, &p.rows).unwrap_or(0))),
+            }
+        }
+        out
+    }
+
+    pub fn projection_live(&self, p: &Projection, block: Block) -> bool {
+        p.present_in(block)
+            && p.when.as_deref().is_none_or(|w| {
+                let (name, want) = match w.strip_prefix('!') {
+                    Some(n) => (n, false),
+                    None => (w, true),
+                };
+                (self.attention.params.get(name).copied().unwrap_or(0.0) != 0.0) == want
+            })
+    }
+
+    pub fn o_cols_in(&self, block: Block) -> usize {
+        match self.attention.o_cols_by.iter().find(|o| o.layers.iter().any(|l| l == block.name())) {
+            Some(o) => crate::state::dim(self, &o.cols).unwrap_or(0),
+            None => self.o_dim(),
+        }
     }
 
 

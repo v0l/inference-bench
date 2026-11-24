@@ -631,6 +631,44 @@ enum Raw<'a> {
     Fp8 { w: Cow<'a, [u8]>, grid: Vec<f32>, map: Vec<u32>, cols: usize },
 }
 
+fn pad_cols(raw: Raw<'_>, cols: usize) -> Raw<'_> {
+    match raw {
+        Raw::Bf16 { w, cols: have } => {
+            let mut out = Vec::with_capacity(w.len() / have * cols);
+            for row in w.chunks(have) {
+                out.extend_from_slice(row);
+                out.resize(out.len() + cols - have, 0);
+            }
+            Raw::Bf16 { w: Cow::Owned(out), cols }
+        }
+        Raw::Fp8 { w, grid, map, cols: have } if have.is_multiple_of(FP8_BLOCK) && cols.is_multiple_of(FP8_BLOCK) => {
+            let (kb, kb_new) = (have / FP8_BLOCK, cols / FP8_BLOCK);
+            let mut out = Vec::with_capacity(w.len() / have * cols);
+            let mut g = Vec::with_capacity(map.len() * kb_new);
+            for (row, &m) in w.chunks(have).zip(&map) {
+                out.extend_from_slice(row);
+                out.resize(out.len() + cols - have, 0);
+                g.extend_from_slice(&grid[m as usize..m as usize + kb]);
+                g.resize(g.len() + kb_new - kb, 1.0);
+            }
+            let map = (0..map.len() as u32).map(|r| r * kb_new as u32).collect();
+            Raw::Fp8 { w: Cow::Owned(out), grid: g, map, cols }
+        }
+        other => pad_cols(other.dequantized(), cols),
+    }
+}
+
+impl Raw<'_> {
+    fn zero_rows(&self, rows: usize) -> Raw<'static> {
+        let cols = self.cols();
+        match self {
+            Raw::Q8 { .. } => Raw::Q8 { values: vec![0; rows * cols], scales: vec![0.0; rows * cols / Q8_GROUP], cols },
+            Raw::Fp8 { .. } => Raw::Fp8 { w: Cow::Owned(vec![0; rows * cols]), grid: vec![1.0; cols.div_ceil(FP8_BLOCK)], map: vec![0; rows], cols },
+            Raw::Bf16 { .. } | Raw::Ggml(_) => Raw::Bf16 { w: Cow::Owned(vec![0; rows * cols]), cols },
+        }
+    }
+}
+
 pub fn fp8_scales(grid: &[f32], map: &[u32]) -> Vec<f32> {
     let rows = map.len() as u32;
     map.iter().map(|&m| f32::from_bits(rows + m)).chain(grid.iter().copied()).collect()
@@ -1010,9 +1048,34 @@ impl Checkpoint {
         let mut parts = Vec::new();
         let mut gates = Vec::new();
         if !a.projection.is_empty() {
-            for p in &a.projection {
-                let rows = crate::state::dim(spec, &p.rows)?;
-                parts.push(if p.present_in(block) { w(&p.tensor, rows, h)? } else { Raw::Bf16 { w: Cow::Owned(vec![0; rows * h]), cols: h } });
+            let mut first: Option<Raw<'_>> = None;
+            let mut layout: Vec<(Option<usize>, usize, usize)> = Vec::new();
+            let mut loaded = Vec::new();
+            for (group, width) in spec.projection_groups() {
+                let live: Vec<_> = group.iter().filter(|p| spec.projection_live(p, block)).collect();
+                ensure!(live.len() <= 1, "{attn}: {} projections share one slot in {} layers", live.len(), block.name());
+                match live.first() {
+                    Some(p) => {
+                        let rows = crate::state::dim(spec, &p.rows)?;
+                        let raw = w(&p.tensor, rows, h)?;
+                        if first.is_none() {
+                            first = Some(raw.zero_rows(0));
+                        }
+                        layout.push((Some(loaded.len()), rows, width));
+                        loaded.push(raw);
+                    }
+                    None => layout.push((None, 0, width)),
+                }
+            }
+            let zero = first.unwrap_or(Raw::Bf16 { w: Cow::Owned(Vec::new()), cols: h });
+            let mut loaded = loaded.into_iter();
+            for (at, rows, width) in layout {
+                if at.is_some() {
+                    parts.push(loaded.next().context("projection order")?);
+                }
+                if width > rows {
+                    parts.push(zero.zero_rows(width - rows));
+                }
             }
         } else if a.fused_qkv {
             ensure!(!a.output_gate, "fused qkv with an output gate is not supported");
@@ -1065,7 +1128,12 @@ impl Checkpoint {
             o_bias: if a.o_bias { Some(self.f32(&format!("{attn}.o_proj.bias"), h)?) } else { None },
             q_norm,
             k_norm,
-            o: w(a.o_tensor.as_deref().unwrap_or("o_proj"), h, spec.o_dim())?.into_matrix(o_quant, &format!("{attn}.{}", a.o_tensor.as_deref().unwrap_or("o_proj")))?,
+            o: {
+                let (full, cols) = (spec.o_dim(), spec.o_cols_in(block));
+                let raw = w(a.o_tensor.as_deref().unwrap_or("o_proj"), h, cols)?;
+                let raw = if cols < full { pad_cols(raw, full) } else { raw };
+                raw.into_matrix(o_quant, &format!("{attn}.{}", a.o_tensor.as_deref().unwrap_or("o_proj")))?
+            },
         })
     }
 
@@ -1177,9 +1245,21 @@ impl Checkpoint {
         };
         let ln1 = if spec.norm.pre { self.norm(spec, &format!("{p}.input_layernorm.weight"), h)? } else { vec![0.0; 1] };
         let ln2 = if spec.layers.split { ln1.clone() } else { self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)? };
-        let branch = |w: Vec<f32>| match spec.norm.residual_scale.filter(|_| spec.norm.sandwich) {
-            Some(s) => w.into_iter().map(|v| (v as f64 * s) as f32).collect(),
-            None => w,
+        let layer_scale = match &spec.norm.layer_scale {
+            Some(t) => {
+                let root = self.root();
+                let mut c = 1.0f64;
+                for j in 0..global {
+                    c *= self.flat(&format!("{root}.layers.{j}.{t}"), 1)?[0] as f64;
+                }
+                ensure!(c.is_finite() && c != 0.0, "{p}: the product of the earlier {t} values is {c}");
+                1.0 / c
+            }
+            None => 1.0,
+        };
+        let branch = |w: Vec<f32>| {
+            let s = spec.norm.residual_scale.filter(|_| spec.norm.sandwich).unwrap_or(1.0) * layer_scale;
+            if s == 1.0 { w } else { w.into_iter().map(|v| (v as f64 * s) as f32).collect() }
         };
         Ok(Layer {
             ln1,

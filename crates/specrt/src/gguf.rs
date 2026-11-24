@@ -589,7 +589,7 @@ impl Gguf {
             act_quant: ActQuant::None,
             dims: Dims { hidden, intermediate, vocab, tie_embeddings: tied, embed_scale: None, logit_softcap: None, logit_scale: None, head_rows: None },
             layers: Layers { count: layers, pattern, window: None, split: false },
-            norm: Norm { kind: NormKind::Rmsnorm, eps, unit_offset: false, sandwich: false, pre: true, residual_scale: None },
+            norm: Norm { kind: NormKind::Rmsnorm, eps, unit_offset: false, sandwich: false, pre: true, residual_scale: None, layer_scale: None },
             attention: Attention {
                 kind: AttentionKind::Gqa,
                 heads,
@@ -609,6 +609,7 @@ impl Gguf {
                 params: Default::default(),
                 projection: Vec::new(),
                 o_cols: None,
+                o_cols_by: Vec::new(),
                 scratch: Default::default(),
                 int_scratch: Default::default(),
                 o_tensor: None,
