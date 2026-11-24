@@ -1,3 +1,6 @@
+mod glm5_host;
+
+use glm5_host::{Config, Host, Knobs, Weights};
 use serde_json::Value;
 use specrt::spec::{AttentionKind, Block, LinearKind, Spec};
 use std::path::{Path, PathBuf};
@@ -118,4 +121,84 @@ fn the_reference_loads_with_finite_prefill_decode_hidden_and_mtp_outputs() {
     assert!(finite(&logits) && finite(&chain));
     assert_eq!(top(&logits[(tokens - 1) * vocab..]), mtp["draft"].as_u64().unwrap());
     assert_eq!(top(&chain), mtp["chain_draft"].as_u64().unwrap());
+}
+
+const TOLERANCE: f32 = 3.8e-4;
+
+struct Run {
+    logits: Vec<Vec<f32>>,
+    trace: Vec<Vec<Vec<Vec<f32>>>>,
+}
+
+fn host_run(knobs: impl Fn(&mut Knobs), extra: &[u32]) -> Run {
+    let weights = Weights::load(&fixture().join("model.safetensors"));
+    let mut c = Config::read(&config());
+    knobs(&mut c.knobs);
+    let m = meta(&format!("{NAME}.ref.json"));
+    let tokens: Vec<u32> = m["tokens"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let mut host = Host::new(c, &weights);
+    let mut run = Run { logits: vec![], trace: vec![] };
+    for t in tokens.iter().chain(extra) {
+        let mut trace = vec![];
+        run.logits.push(host.step(*t, &mut trace));
+        run.trace.push(trace);
+    }
+    run
+}
+
+fn saved_streams_gap(run: &Run, slot: usize, layer: usize) -> f32 {
+    let saved = floats(&format!("{NAME}.hidden.streams.bin"));
+    let per = 4 * 128;
+    let tokens = saved.len() / 3 / per;
+    (0..tokens)
+        .flat_map(|t| {
+            let want = &saved[(slot * tokens + t) * per..(slot * tokens + t + 1) * per];
+            let got: Vec<f32> = run.trace[t][layer].iter().flatten().copied().collect();
+            got.into_iter().zip(want.iter().copied()).collect::<Vec<_>>()
+        })
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max)
+}
+
+#[test]
+fn the_host_hyper_connections_match_the_saved_layer_0_streams_and_need_all_sinkhorn_iterations() {
+    let gap = saved_streams_gap(&host_run(|_| {}, &[]), 0, 0);
+    assert!(gap < TOLERANCE, "layer 0 streams max abs {gap}");
+    for wrong in [1, 5] {
+        let short = saved_streams_gap(&host_run(|k| k.sinkhorn_iters = wrong, &[]), 0, 0);
+        assert!(short > TOLERANCE, "{wrong} Sinkhorn iterations still match ({short})");
+    }
+}
+
+#[test]
+fn the_host_kda_layers_match_the_saved_streams() {
+    let run = host_run(|_| {}, &[]);
+    for (slot, layer) in [(0, 0), (1, 1)] {
+        let gap = saved_streams_gap(&run, slot, layer);
+        assert!(gap < TOLERANCE, "layer {layer} streams max abs {gap}");
+    }
+}
+
+#[test]
+fn the_host_pooled_indexer_matches_layer_3_and_needs_the_open_tail_pool() {
+    let gap = saved_streams_gap(&host_run(|_| {}, &[]), 2, 3);
+    assert!(gap < TOLERANCE, "layer 3 streams max abs {gap}");
+    let dropped = saved_streams_gap(&host_run(|k| k.tail = false, &[]), 2, 3);
+    assert!(dropped > TOLERANCE, "dropping the tail pool still matches ({dropped})");
+}
+
+#[test]
+fn the_host_model_matches_prefill_logits_and_four_decode_steps() {
+    let m = meta(&format!("{NAME}.ref.json"));
+    let greedy: Vec<u32> = m["greedy"].as_array().unwrap().iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let run = host_run(|_| {}, &greedy[..4]);
+    let vocab = 512;
+    let prefill = floats(&format!("{NAME}.ref.bin"));
+    let decode = floats(&format!("{NAME}.decode.logits.bin"));
+    let tokens = prefill.len() / vocab;
+    let gap = |got: &[f32], want: &[f32]| got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let p = (0..tokens).map(|t| gap(&run.logits[t], &prefill[t * vocab..(t + 1) * vocab])).fold(0f32, f32::max);
+    let d = (0..4).map(|s| gap(&run.logits[tokens + s], &decode[s * vocab..(s + 1) * vocab])).fold(0f32, f32::max);
+    eprintln!("host prefill max abs {p}, decode max abs {d}");
+    assert!(p < TOLERANCE && d < TOLERANCE, "prefill {p} decode {d}");
 }
