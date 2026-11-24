@@ -128,7 +128,10 @@ fn the_tiny_moe_fixture_routes_every_layer_beside_its_dense_mlp() {
     let m = spec.moe.as_ref().unwrap();
     assert_eq!((m.experts, m.top_k(), m.expert_intermediate), (4, 2, 64));
     assert!(spec.parallel_moe() && (0..6).all(|l| m.is_sparse(l)));
-    specrt::codegen::Module::generate(&spec, 256).unwrap();
+    let module = specrt::codegen::Module::generate(&spec, 256).unwrap();
+    for k in ["moe_route_logits(const float* x, const float* ln, const float* xn_ln,", "const float* bias, const float* expert_scale,", "moe_mma_up_b16", "moe_up_bf16"] {
+        assert!(module.source.contains(k), "{k}");
+    }
     let target = kir::Target::sm_120();
     for phase in [Phase::Prefill, Phase::Decode] {
         specrt::compile::compile(&spec, Plan::build(&spec, phase, true), &target, &specrt::compile::Options::planes(256)).unwrap();
@@ -217,6 +220,24 @@ fn gemma4_moe_logits_and_greedy_match_transformers() {
 #[ignore = "needs a CUDA GPU and G4_MOE=1 scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
 fn gemma4_moe_served_two_slots_match_transformers_greedy() {
     served_two_slots_match("tiny-gemma4-moe");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and G4_MOE=1 scripts/tiny_gemma4.py output in SPECRT_REF_DIR"]
+fn gemma4_moe_router_fed_the_normed_input_misses_transformers() {
+    let name = "tiny-gemma4-moe";
+    let (tokens, _, vocab, want) = reference(name);
+    let mut spec = tiny_named(name);
+    let m = spec.moe.as_mut().unwrap();
+    m.router_norm = m.input_norm.clone();
+    m.router_norm_scale = 1.0;
+    let mut rt = specrt::runtime::Runtime::load(&spec, 256).unwrap();
+    let ours = rt.prompt_logits(&tokens).unwrap();
+    let max_abs = ours.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    let row = |v: &[f32], r: usize| v[r * vocab..(r + 1) * vocab].iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let missed = (0..tokens.len()).filter(|&r| row(&ours, r) != row(&want, r)).count();
+    eprintln!("{name} router on the normed input: max_abs {max_abs}, {missed} of {} argmax rows differ", tokens.len());
+    assert!(max_abs >= 5e-2, "the logit bound must catch a router that reads the normed input, max abs {max_abs}");
 }
 
 fn layer_states_match(name: &str) {
