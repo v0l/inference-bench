@@ -212,6 +212,20 @@ fn e_reference() -> (Vec<u32>, Vec<u32>, usize, Vec<f32>) {
 
 #[test]
 #[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py E output in SPECRT_REF_DIR_E"]
+fn gemma4_e_reading_the_wrong_kv_layer_or_layer_slice_fails_the_match() {
+    let (tokens, _, _, _) = e_reference();
+    let mut spec = tiny_e();
+    spec.layers.shared_tail = 0;
+    let red = match specrt::runtime::Runtime::load(&spec, 256).and_then(|mut rt| rt.prompt_logits(&tokens)) {
+        Ok(_) => panic!("with no shared layers every layer owned a cache and the run still matched transformers"),
+        Err(e) => format!("{e:#}"),
+    };
+    eprintln!("red kv: {red}");
+    assert!(red.contains("k_proj") || red.contains("state_write"), "the red run failed for an unrelated reason: {red}");
+}
+
+#[test]
+#[ignore = "needs a CUDA GPU and scripts/tiny_gemma4.py E output in SPECRT_REF_DIR_E"]
 fn gemma4_e_logits_and_greedy_match_transformers() {
     let (tokens, greedy, vocab, want) = e_reference();
     let mut rt = specrt::runtime::Runtime::load(&tiny_e(), 256).unwrap();
