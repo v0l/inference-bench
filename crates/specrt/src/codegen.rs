@@ -382,6 +382,9 @@ pub fn per_layer_symbols(spec: &Spec) -> kir::desc::Shape {
     let mut symbols = kir_shape(spec);
     if let Some(p) = spec.per_layer() {
         symbols = symbols.num("ple_dim", p.dim as f64).num("ple_width", (p.dim * spec.layers.count) as f64);
+        for (n, v) in &spec.attention.params {
+            symbols = symbols.num(n, *v);
+        }
     }
     symbols
 }
@@ -406,7 +409,7 @@ pub fn per_layer_kernels(spec: &Spec, target: &kir::Target) -> Result<Vec<kir::K
             let param = kernel.params.iter().find(|p| p.name == b).ok_or_else(|| anyhow::anyhow!("[[per_layer.node]] {i} binds {b:?}, which {name} has no param for"))?;
             let fits = match v {
                 crate::graph::Bind::Weight { .. } => param.role == kir::Role::Weight,
-                crate::graph::Bind::Buffer { .. } => param.role == kir::Role::Activation && param.ty == kir::Scalar::F32,
+                crate::graph::Bind::Buffer { .. } => param.role == kir::Role::Activation && param.ty != kir::Scalar::Bf16,
                 crate::graph::Bind::Name(n) => n == "layer" && param.role == kir::Role::Value,
                 crate::graph::Bind::Number(_) => param.role == kir::Role::Value,
                 crate::graph::Bind::State { .. } => false,

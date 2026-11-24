@@ -182,6 +182,7 @@ pub struct Signer<'a> {
     described: Vec<Option<kir::Kernel>>,
     mixer: Vec<kir::Kernel>,
     gated: Vec<kir::Kernel>,
+    per_layer: Vec<kir::Kernel>,
     ranked: bool,
 }
 
@@ -189,7 +190,7 @@ impl<'a> Signer<'a> {
     pub fn new(spec: &'a Spec) -> Result<Signer<'a>> {
         let target = crate::codegen::default_target();
         let ctx = crate::engine::DEFAULT_CTX;
-        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, ranked: false })
+        Ok(Signer { spec, described: crate::codegen::described_kernels(spec, 1, ctx, &target)?, mixer: crate::codegen::mixer_kernels(spec, 1, ctx, &target)?, gated: crate::codegen::gated_kernels(spec, &target)?, per_layer: crate::codegen::per_layer_kernels(spec, &target)?, ranked: false })
     }
 
     pub fn ranked(self, ranked: bool) -> Signer<'a> {
@@ -198,7 +199,9 @@ impl<'a> Signer<'a> {
 
     fn per_layer_node(&self, node: u8, stage: u8, layer: usize) -> Result<Signature> {
         let p = self.spec.per_layer().context("[per_layer]")?;
-        let spec_node: &crate::graph::Node = &p.node[node as usize];
+        let _ = p;
+        let Some(kernel) = self.per_layer.get(node as usize) else { bail!("per layer node {node} has no kernel") };
+        let spec_node: &crate::graph::Node = &self.spec.per_layer().context("[per_layer]")?.node[node as usize];
         let head = stage == crate::plan::PLE_HEAD;
         let defaults = |name: &str| -> Option<Tensor> {
             match name {
@@ -207,7 +210,8 @@ impl<'a> Signer<'a> {
                 _ => None,
             }
         };
-        let mut sig = self.bound_stage(spec_node, &p.scratch, &defaults)?;
+        let scratch = &self.spec.per_layer().context("[per_layer]")?.scratch;
+        let mut sig = self.bound_stage(kernel, spec_node, scratch, &defaults)?;
         let _ = layer;
         if !head {
             sig.reads.retain(|t| t.place != Place::Buf(Buf::X));
@@ -218,26 +222,23 @@ impl<'a> Signer<'a> {
         Ok(sig)
     }
 
-    fn bound_stage(&self, node: &crate::graph::Node, scratch: &BTreeMap<String, String>, defaults: &dyn Fn(&str) -> Option<Tensor>) -> Result<Signature> {
+    fn bound_stage(&self, kernel: &kir::Kernel, node: &crate::graph::Node, scratch: &BTreeMap<String, String>, defaults: &dyn Fn(&str) -> Option<Tensor>) -> Result<Signature> {
         let mut reads = Vec::new();
         let mut writes = Vec::new();
-        let mut seen: Vec<Tensor> = Vec::new();
-        for b in node.bind.values() {
-            let t = match b {
-                crate::graph::Bind::Weight { weight, len } => Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, Form::F32),
-                crate::graph::Bind::Buffer { buffer } => match scratch.get(buffer) {
+        for param in kernel.params.iter().filter(|p| p.role != kir::Role::Value) {
+            let t = match node.bind.get(param.name) {
+                Some(crate::graph::Bind::Weight { weight, len }) => Tensor::weight(weight.clone(), 1, self.spec.weight_len(len)?, Form::F32),
+                Some(crate::graph::Bind::Buffer { buffer }) => match scratch.get(buffer) {
                     Some(w) => Tensor::new(Place::Local(buffer.clone()), Rows::Tokens, crate::state::dim(self.spec, w)?, Form::F32),
                     None => defaults(buffer).with_context(|| format!("no buffer {buffer:?}"))?,
                 },
-                crate::graph::Bind::Name(_) | crate::graph::Bind::Number(_) => continue,
-                crate::graph::Bind::State { state } => bail!("per layer node binds state {state:?}, which per layer nodes do not take"),
+                Some(crate::graph::Bind::Name(_) | crate::graph::Bind::Number(_)) => continue,
+                Some(crate::graph::Bind::State { state }) => bail!("per layer node binds state {state:?}, which per layer nodes do not take"),
+                None => defaults(param.name).with_context(|| format!("{} has no binding for {}", kernel.name, param.name))?,
             };
-            if seen.contains(&t) {
-                writes.push(t);
-            } else {
-                reads.push(t.clone());
-                writes.push(t.clone());
-                seen.push(t);
+            match param.access {
+                kir::Access::Read => reads.push(t),
+                kir::Access::Write => writes.push(t),
             }
         }
         Ok(Signature { class: Class::Elementwise, reads, writes })
