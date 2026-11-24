@@ -737,6 +737,16 @@ impl VisionEncoder {
         Ok(self.encode_all(items)?.0)
     }
 
+    pub fn encode_packed(&self, items: &[&Patches]) -> Result<Vec<Vec<f32>>> {
+        let (mut merged, deepstack) = self.encode_all(items)?;
+        for (i, item) in merged.iter_mut().enumerate() {
+            for level in &deepstack {
+                item.extend_from_slice(&level[i]);
+            }
+        }
+        Ok(merged)
+    }
+
     fn encode_all(&self, items: &[&Patches]) -> Result<(Vec<Vec<f32>>, Vec<Vec<Vec<f32>>>)> {
         let l = self.layout(items)?;
         let mut shared = self.workspace.lock().unwrap();

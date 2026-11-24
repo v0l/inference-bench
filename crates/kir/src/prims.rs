@@ -24,6 +24,7 @@ pub enum RowSource {
 pub enum Prim {
     Embed { width: usize, scale: f64, source: RowSource },
     SpliceRows { width: usize },
+    AddRows { width: usize },
     CopyRows,
     SplitRows,
     Bump,
@@ -87,7 +88,7 @@ impl PrimKernel {
         }
         match self.prim {
             Prim::Embed { width, scale, .. } if width == 0 || !scale.is_finite() => Err(format!("{}: bad embed width or scale", self.name)),
-            Prim::SpliceRows { width: 0 } => Err(format!("{}: width must be positive", self.name)),
+            Prim::SpliceRows { width: 0 } | Prim::AddRows { width: 0 } => Err(format!("{}: width must be positive", self.name)),
             Prim::RmsSplit { width, eps } if width == 0 || !width.is_multiple_of(4) || !eps.is_finite() || eps < 0.0 => {
                 Err(format!("{}: rms_split needs a width that is a multiple of 4 and a finite eps", self.name))
             }
@@ -125,6 +126,7 @@ impl PrimKernel {
             (Dialect::Cuda, Prim::RmsSplit { width, eps }) => cuda_rms_split(self.name, width, eps),
             (Dialect::Cuda, Prim::Embed { width, scale, .. }) => cuda_embed(self.name, width, scale),
             (Dialect::Cuda, Prim::SpliceRows { width }) => cuda_splice(self.name, width),
+            (Dialect::Cuda, Prim::AddRows { width }) => cuda_add_rows(self.name, width),
             (Dialect::Cuda, Prim::ArgmaxRows { vocab }) => cuda_argmax_rows(self.name, vocab),
             (Dialect::Cuda, Prim::ApplyMask { vocab }) => cuda_apply_mask(self.name, vocab),
             (Dialect::Cuda, Prim::SampleRows { vocab }) => cuda_sample_rows(self.name, vocab),
@@ -158,6 +160,7 @@ pub fn cuda_prims(t: &Target, hidden: usize, vocab: usize, eps: f64, embed_scale
         ("rms_split", Prim::RmsSplit { width: hidden, eps }),
         ("embed", Prim::Embed { width: hidden, scale: embed_scale, source: RowSource::Bf16 }),
         ("splice_rows", Prim::SpliceRows { width: hidden }),
+        ("add_rows", Prim::AddRows { width: hidden }),
         ("argmax_rows", Prim::ArgmaxRows { vocab }),
         ("apply_mask", Prim::ApplyMask { vocab }),
         ("sample_rows", Prim::SampleRows { vocab }),
@@ -407,6 +410,21 @@ fn cuda_splice(name: &str, width: usize) -> String {
     float* dst = x + (size_t)blockIdx.y * {width};
     const float* src = embeds + (size_t)row * {width};
     {loop} dst[i] = src[i];
+}}
+
+",
+        loop = grid_stride(&width.to_string(), 1),
+    )
+}
+
+fn cuda_add_rows(name: &str, width: usize) -> String {
+    format!(
+        "extern \"C\" __global__ void {name}(float* x, const int* rows, const float* embeds) {{
+    int row = rows[blockIdx.y];
+    if (row < 0) return;
+    float* dst = x + (size_t)blockIdx.y * {width};
+    const float* src = embeds + (size_t)row * {width};
+    {loop} dst[i] += src[i];
 }}
 
 ",

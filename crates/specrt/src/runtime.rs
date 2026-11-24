@@ -870,6 +870,7 @@ const HEAD_PART_ROWS: usize = 64;
 
 struct MediaDevice {
     embeds: CudaSlice<f32>,
+    deepstack: Vec<CudaSlice<f32>>,
     rows: Vec<i32>,
 }
 
@@ -1302,7 +1303,7 @@ impl Runtime {
                 let opts = spec.runtime.vision;
                 let stream = rt.ctx.new_stream()?;
                 let enc = crate::vision_encoder::VisionEncoder::load_with(&rt.ctx, &stream, &jit, &checkpoint, &v.config, opts.precision)?;
-                rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::with_tiles(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, if v.config.tile_grid() { v.config.tokens_per_tile() } else { 0 }, opts)));
+                rt.vision = Some(Arc::new(crate::media_encode::MediaEncoder::with_tiles(Box::new(enc), v.tokens.clone(), v.config.spatial_merge_size, if v.config.tile_grid() { v.config.tokens_per_tile() } else { 0 }, opts).with_deepstack_levels(v.config.deepstack_visual_indexes.len())));
                 checkpoint.release();
             }
         rt.stream.synchronize()?;
@@ -2166,7 +2167,10 @@ impl Runtime {
         let out = all_logits.unwrap_or(&self.buf.logits);
         let rows = if all_logits.is_some() { 0..n } else { n - 1..n };
         let run = exec::Run { n, tokens: &self.pre.tokens, logits: out, rows, bb: None, start: Some(start), qlen: 1, mtp: None };
-        crate::executor::run_plan(self, plan, &run, &mut |i| self.trace_layer(trace, i, n))
+        crate::executor::run_plan(self, plan, &run, &mut |i| {
+            self.add_deepstack(i, self.seq as usize, start, n, 0)?;
+            self.trace_layer(trace, i, n)
+        })
     }
 
     fn prefill(&mut self, tokens: &[u32], all_logits: bool) -> Result<Vec<f32>> {
@@ -2519,15 +2523,31 @@ impl Runtime {
         }
         let rows: Vec<i32> = plan.positions.iter().map(|p| p[3]).collect();
         let embeds = if self.role.first { self.stream.clone_htod(plan.embeds.as_slice())? } else { self.stream.alloc_zeros(1)? };
-        self.media[slot] = Some(MediaDevice { embeds, rows });
+        let deepstack = if self.role.first { plan.deepstack.iter().map(|d| self.stream.clone_htod(d.as_slice())).collect::<std::result::Result<Vec<_>, _>>()? } else { Vec::new() };
+        self.media[slot] = Some(MediaDevice { embeds, deepstack, rows });
         Ok(())
     }
 
     pub(super) fn splice_media(&self, slot: usize, start: usize, n: usize, row_offset: usize) -> Result<()> {
+        self.media_rows(slot, start, n, row_offset, None)
+    }
+
+    pub(super) fn add_deepstack(&self, layer: usize, slot: usize, start: usize, n: usize, row_offset: usize) -> Result<()> {
+        self.media_rows(slot, start, n, row_offset, Some(layer))
+    }
+
+    fn media_rows(&self, slot: usize, start: usize, n: usize, row_offset: usize, level: Option<usize>) -> Result<()> {
         if !self.role.first {
             return Ok(());
         }
         let Some(m) = self.media.get(slot).and_then(|m| m.as_ref()) else { return Ok(()) };
+        let (kernel, src) = match level {
+            None => ("splice_rows", &m.embeds),
+            Some(l) => match m.deepstack.get(l) {
+                Some(d) => ("add_rows", d),
+                None => return Ok(()),
+            },
+        };
         let rows: Vec<i32> = (0..n).map(|i| m.rows.get(start + i).copied().unwrap_or(-1)).collect();
         if rows.iter().all(|&r| r < 0) {
             return Ok(());
@@ -2535,8 +2555,8 @@ impl Runtime {
         let hidden = self.spec.dims.hidden;
         let rows_dev = self.stream.clone_htod(&rows)?;
         let x = self.pre.x.slice(row_offset * hidden..);
-        let mut b = self.launcher(self.kernel("splice_rows"));
-        b.arg(&x).arg(&rows_dev).arg(&m.embeds);
+        let mut b = self.launcher(self.kernel(kernel));
+        b.arg(&x).arg(&rows_dev).arg(src);
         unsafe { b.launch(LaunchConfig { grid_dim: (grid(hidden, 256), n as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }) }?;
         Ok(())
     }
