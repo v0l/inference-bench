@@ -91,6 +91,7 @@ pub struct FamilyAttention {
     pub params: std::collections::BTreeMap<String, ParamSource>,
     pub projection: Vec<crate::spec::Projection>,
     pub o_cols: Option<String>,
+    pub o_cols_by: Vec<crate::spec::OCols>,
     pub scratch: std::collections::BTreeMap<String, String>,
     pub int_scratch: std::collections::BTreeMap<String, String>,
     pub qkv_bias: Flag,
@@ -171,6 +172,7 @@ impl Default for FamilyAttention {
             params: Default::default(),
             projection: Vec::new(),
             o_cols: None,
+            o_cols_by: Vec::new(),
             scratch: Default::default(),
             int_scratch: Default::default(),
             qkv_bias: Flag::Config { config: "attention_bias".into(), default: false },
@@ -194,11 +196,27 @@ pub struct FamilyNorm {
     pub sandwich: bool,
     pub pre: bool,
     pub no_offset_keys: Vec<String>,
+    pub layer_scale: Option<String>,
 }
 
 impl Default for FamilyNorm {
     fn default() -> Self {
-        FamilyNorm { unit_offset: None, sandwich: false, pre: true, no_offset_keys: Vec::new() }
+        FamilyNorm { unit_offset: None, sandwich: false, pre: true, no_offset_keys: Vec::new(), layer_scale: None }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FamilyRefuse {
+    pub when: String,
+    pub message: String,
+}
+
+impl FamilyRefuse {
+    pub fn hits(&self, config: &serde_json::Value) -> Result<bool> {
+        let e = kir::expr::Expr::parse(&self.when).map_err(anyhow::Error::msg).with_context(|| format!("[[refuse]] when {:?}", self.when))?;
+        let env = |k: &str| dotted(config, k).and_then(|v| v.as_f64().or_else(|| v.as_bool().map(f64::from)));
+        Ok(e.eval(&env).is_some_and(|v| v != 0.0))
     }
 }
 
@@ -592,6 +610,8 @@ pub struct Family {
     pub hyper: FamilyHyper,
     #[serde(default)]
     pub tensors: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub refuse: Vec<FamilyRefuse>,
 }
 
 impl Family {
@@ -623,6 +643,9 @@ impl Family {
         }
         if let Some(k) = self.attention.o_cols.as_deref() {
             expr_keys(k, &mut out);
+        }
+        for r in &self.refuse {
+            expr_keys(&r.when, &mut out);
         }
         for s in self.attention.scratch.values().chain(self.mixer.scratch.values()) {
             expr_keys(s, &mut out);

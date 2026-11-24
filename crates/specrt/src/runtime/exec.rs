@@ -152,7 +152,8 @@ impl Runtime {
                 Bind::Name(n) => match n.as_str() {
                     "window" => l.window as f64,
                     "nope" => f64::from(u8::from(l.nope)),
-                    other => *self.spec.attention.params.get(other).with_context(|| format!("{other:?} is not window, nope or an [attention.params] entry"))?,
+                    "kind_layer" => f64::from(l.kind_kv),
+                    other => *self.spec.attention.params.get(other).with_context(|| format!("{other:?} is not window, nope, kind_layer or an [attention.params] entry"))?,
                 },
                 Bind::Weight { .. } | Bind::Buffer { .. } | Bind::State { .. } => bail!("a weight, buffer or state binding is not a number"),
             })
@@ -161,7 +162,10 @@ impl Runtime {
         let mut floats = vec![0f32; launch.params.len()];
         for (i, p) in launch.params.iter().enumerate().filter(|(_, p)| p.role == kir::Role::Value) {
             let v = match p.name {
-                "layer" => f64::from(l.kv),
+                "layer" => match spec_node.bind.get("layer") {
+                    Some(b) => numbers(b)?,
+                    None => f64::from(l.kv),
+                },
                 "pages" => self.pages as f64,
                 "pos_step" => f64::from(pos_step),
                 "row_step" => f64::from(row_step),

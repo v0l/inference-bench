@@ -208,7 +208,7 @@ impl<'a> Signer<'a> {
     pub(crate) fn caches(&self, layer: usize, rows: Rows) -> Vec<Tensor> {
         let at = self.spec.attention_before(layer);
         crate::state::positional(self.spec)
-            .filter(|s| s.layers == crate::state::Layers::Attention)
+            .filter(|s| s.layers == crate::state::Layers::Attention && s.keeps(self.spec, Some(layer)))
             .map(|s| Tensor::new(Place::Cache(s.name.clone()), rows, s.token_layer_bytes(self.spec, at, 1), Form::Paged(self.spec.runtime.kv_dtype)))
             .collect()
     }

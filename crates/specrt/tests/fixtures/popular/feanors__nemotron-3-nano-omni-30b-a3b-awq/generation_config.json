@@ -1,0 +1,14 @@
+{
+  "_from_model_config": true,
+  "bos_token_id": 1,
+  "eos_token_id": [2, 11],
+  "pad_token_id": 0,
+  "do_sample": true,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "max_new_tokens": 16384,
+  "reasoning_budget": 16384,
+  "reasoning_grace": 512,
+  "repetition_penalty": 1.0,
+  "transformers_version": "4.55.4"
+}

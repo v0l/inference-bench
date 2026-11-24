@@ -597,7 +597,7 @@ impl Description {
     }
 
     fn sizes(&self, shape: &Shape, table: &BTreeMap<String, Value>, keys: &[&str], what: &str) -> Result<BTreeMap<String, u32>, String> {
-        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !matches!(k.as_str(), "src" | "style" | "name" | "space" | "act" | "input" | "output" | "eps" | "mix_eps" | "invert" | "stride")) {
+        if let Some(k) = table.keys().find(|k| !keys.contains(&k.as_str()) && !matches!(k.as_str(), "src" | "style" | "name" | "space" | "act" | "input" | "output" | "eps" | "mix_eps" | "invert" | "stride" | "theta" | "angles")) {
             return Err(format!("{}: {what} has no key {k:?}", self.name));
         }
         let mut out = BTreeMap::new();
@@ -791,7 +791,15 @@ impl Description {
                     Some(Value::Boolean(b)) => *b,
                     Some(o) => return Err(format!("{}: invert is {o}, not a boolean", self.name)),
                 };
-                RowBody::SpanRope { row: n["row"], head: n["head"], offset: n["offset"], rot: n["rot"], style, invert }
+                let theta = match self.args.get("theta") {
+                    None => None,
+                    Some(_) => Some(self.number(shape, "theta")? as f32),
+                };
+                let angles = match self.args.get("angles") {
+                    None => None,
+                    Some(v) => Some(self.size(shape, v, "angles")?),
+                };
+                RowBody::SpanRope { row: n["row"], head: n["head"], offset: n["offset"], rot: n["rot"], style, invert, theta, angles }
             }
             "state_write" => {
                 let n = self.sizes(shape, &self.args, &["src_row", "src_offset", "layers", "rows", "width"], "[args]")?;

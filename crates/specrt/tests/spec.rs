@@ -594,7 +594,7 @@ fn a_config_of_a_family_the_engine_has_not_seen_is_still_described() {
     let spec = Spec::describe_hf_config(&json).unwrap();
     assert_eq!((spec.dims.hidden, spec.layers.count, spec.attention.heads, spec.attention.head_dim), (5376, 60, 32, 256));
     assert_eq!(spec.mlp.activation, Activation::Geglu);
-    assert!(Spec::from_hf_config(&json).is_err());
+    assert!(Spec::from_hf_config(&json).is_ok());
 }
 
 #[test]

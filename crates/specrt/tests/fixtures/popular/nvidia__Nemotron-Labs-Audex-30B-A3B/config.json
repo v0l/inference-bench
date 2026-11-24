@@ -1,0 +1,11 @@
+{
+  "model_type": "nemotron_labs_audex",
+  "model_name": "Nemotron-Labs-Audex-30B-A3B",
+  "description": "Repository-level manifest. Load task-specific checkpoints from the folders below.",
+  "default_checkpoint_folder": "checkpoint_folder_full",
+  "checkpoint_folders": {
+    "full": "checkpoint_folder_full",
+    "audiogen": "checkpoint_folder_audiogen",
+    "textonly": "checkpoint_folder_textonly"
+  }
+}

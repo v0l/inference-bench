@@ -49,6 +49,7 @@ impl DeviceMtp {
                 k_norm: up(&a.k_norm)?,
                 o: DeviceMatrix::upload(stream, &a.o)?,
                 kv: spec.attention_layers() as i32,
+                kind_kv: spec.attention_layers() as i32,
                 window: 0,
                 nope: false,
                 extra: a.extra.iter().map(|(n, v)| Ok((n.clone(), stream.clone_htod(v)?))).collect::<Result<_>>()?,

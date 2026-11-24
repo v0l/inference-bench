@@ -1,0 +1,9 @@
+{
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "max_length": 262144,
+  "pad_token_id": 11,
+  "do_sample": true,
+  "temperature": 0.15,
+  "transformers_version": "5.0.0.dev0"
+}

@@ -105,6 +105,7 @@ impl Runtime {
                 }
             }
             self.mlp_rows(layer, n)?;
+            self.add_deepstack(i, self.seq as usize, start, np, nd)?;
             self.leave_layer(i)?;
         }
         let (hi, lo) = (pre.xn_planes.hi.as_view(), pre.xn_planes.lo.as_view());

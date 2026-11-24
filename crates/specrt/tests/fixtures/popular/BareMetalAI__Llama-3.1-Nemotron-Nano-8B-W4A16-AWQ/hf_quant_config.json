@@ -1,0 +1,16 @@
+{
+    "producer": {
+        "name": "modelopt",
+        "version": "0.37.0"
+    },
+    "quantization": {
+        "quant_algo": "W4A16_AWQ",
+        "kv_cache_quant_algo": null,
+        "group_size": 128,
+        "has_zero_point": false,
+        "pre_quant_scale": true,
+        "exclude_modules": [
+            "lm_head"
+        ]
+    }
+}

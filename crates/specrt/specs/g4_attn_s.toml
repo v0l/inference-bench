@@ -1,0 +1,113 @@
+kind = "kir-kernel"
+family = "scan_attention"
+name = "g4_attn_s"
+threads = 128
+
+[geometry]
+layers = "k_s_layers"
+kv_rows = "kvh_s"
+k_width = "hd_s"
+v_stride = "hd_s"
+v_offset = 0
+v_width = "hd_s"
+out_row = "o_dim"
+out_head = "hd_s"
+out_offset = 0
+
+[[query]]
+src = "qkv"
+row = "qkv_row"
+head = "hd_s"
+offset = 0
+width = "hd_s"
+
+[[param]]
+name = "qkv"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "k_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "v_cache"
+type = "bf16"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "window"
+type = "i32"
+role = "value"
+access = "read"
+
+[[stage]]
+op = "epilogue"
+name = "score"
+expr = "s"
+
+[[stage]]
+op = "mask"
+expr = "window <= 0 || k_pos > q_pos - window"
+
+[[stage]]
+op = "online_softmax"
+value = "score"

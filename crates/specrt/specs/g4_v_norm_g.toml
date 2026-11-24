@@ -1,0 +1,17 @@
+kind = "kir-kernel"
+family = "head_rms"
+name = "g4_v_norm_g"
+threads = 128
+
+[args]
+row = "qkv_row"
+head = "hd_g"
+offset = "q_w + kv_w"
+width = "hd_g"
+eps = "norm_eps"
+
+[[param]]
+name = "x"
+type = "f32"
+role = "activation"
+access = "write"

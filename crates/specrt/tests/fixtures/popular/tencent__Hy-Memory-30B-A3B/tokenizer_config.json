@@ -1,0 +1,10 @@
+{
+  "backend": "tokenizers",
+  "bos_token": "<｜hy_begin▁of▁sentence｜>",
+  "clean_up_tokenization_spaces": false,
+  "eos_token": "<eos:6124c78e>",
+  "local_files_only": false,
+  "model_max_length": 262144,
+  "pad_token": "<｜hy_▁pad▁｜>",
+  "tokenizer_class": "TokenizersBackend"
+}

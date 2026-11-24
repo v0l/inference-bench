@@ -1,0 +1,59 @@
+{
+  "_name_or_path": "google/gemma-2-2b",
+  "architectures": [
+    "Gemma2ForCausalLM"
+  ],
+  "attention_bias": false,
+  "attention_dropout": 0.0,
+  "attn_logit_softcapping": 50.0,
+  "bos_token_id": 2,
+  "cache_implementation": "hybrid",
+  "eos_token_id": 1,
+  "final_logit_softcapping": 30.0,
+  "head_dim": 256,
+  "hidden_act": "gelu_pytorch_tanh",
+  "hidden_activation": "gelu_pytorch_tanh",
+  "hidden_size": 2304,
+  "initializer_range": 0.02,
+  "intermediate_size": 9216,
+  "max_position_embeddings": 8192,
+  "model_type": "gemma2",
+  "num_attention_heads": 8,
+  "num_hidden_layers": 26,
+  "num_key_value_heads": 4,
+  "pad_token_id": 0,
+  "quantization_config": {
+    "batch_size": 1,
+    "bits": 4,
+    "block_name_to_quantize": null,
+    "cache_block_outputs": true,
+    "damp_percent": 0.1,
+    "dataset": [
+      "auto-gptq is an easy-to-use model quantization library with user-friendly apis, based on GPTQ algorithm."
+    ],
+    "desc_act": false,
+    "exllama_config": {
+      "version": 1
+    },
+    "group_size": 128,
+    "max_input_length": null,
+    "model_seqlen": null,
+    "module_name_preceding_first_block": null,
+    "modules_in_block_to_quantize": null,
+    "pad_token_id": null,
+    "quant_method": "gptq",
+    "sym": true,
+    "tokenizer": null,
+    "true_sequential": true,
+    "use_cuda_fp16": false,
+    "use_exllama": true
+  },
+  "query_pre_attn_scalar": 256,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 10000.0,
+  "sliding_window": 4096,
+  "torch_dtype": "float16",
+  "transformers_version": "4.48.3",
+  "use_cache": true,
+  "vocab_size": 256000
+}

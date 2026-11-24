@@ -1,0 +1,65 @@
+kind = "kir-kernel"
+family = "state_write"
+name = "g4_k_write_g"
+threads = 128
+
+[args]
+src_row = "qkv_row"
+src_offset = "q_w"
+layers = "k_g_layers"
+rows = "kvh_g"
+width = "hd_g"
+
+[[param]]
+name = "src"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "dst"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "block_table"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "pages"
+type = "i32"
+role = "value"
+access = "read"

@@ -427,7 +427,7 @@ impl Op {
         let names = |k: &[&str]| k.iter().map(|s| s.to_string()).collect();
         match self {
             Op::Embed => names(&["embed"]),
-            Op::Splice => names(&["splice_rows"]),
+            Op::Splice => names(&["splice_rows", "add_rows"]),
             Op::Norm { into: Buf::XnPlanes, .. } => names(&["rms_split"]),
             Op::Norm { .. } => names(&["rmsnorm"]),
             Op::NormAdd { .. } => names(&["norm_add"]),

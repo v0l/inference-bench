@@ -37,20 +37,22 @@ fn fetched(repo: &str, name: &str) -> Option<String> {
 enum Class {
     Loads,
     TextOnly,
-    TooBig,
+    Offload,
+    NoFit,
     UnknownQuant,
     Refused,
     Unchecked,
 }
 
 impl Class {
-    const ALL: [Class; 6] = [Class::Loads, Class::TextOnly, Class::TooBig, Class::UnknownQuant, Class::Refused, Class::Unchecked];
+    const ALL: [Class; 7] = [Class::Loads, Class::TextOnly, Class::Offload, Class::NoFit, Class::UnknownQuant, Class::Refused, Class::Unchecked];
 
     fn label(self) -> &'static str {
         match self {
             Class::Loads => "LOADS",
             Class::TextOnly => "LOADS-TEXT-ONLY",
-            Class::TooBig => "TOO-BIG",
+            Class::Offload => "SUPPORTED-WITH-OFFLOAD",
+            Class::NoFit => "DOES-NOT-FIT",
             Class::UnknownQuant => "UNKNOWN-QUANT",
             Class::Refused => "REFUSED",
             Class::Unchecked => "UNCHECKED",
@@ -58,7 +60,7 @@ impl Class {
     }
 
     fn arch_ok(self) -> bool {
-        matches!(self, Class::Loads | Class::TextOnly | Class::TooBig)
+        matches!(self, Class::Loads | Class::TextOnly | Class::Offload | Class::NoFit)
     }
 }
 
@@ -94,12 +96,81 @@ struct Verdict {
     class: Class,
     why: String,
     gap: Option<Gap>,
+    offload: Option<Offload>,
 }
 
 impl Verdict {
     fn new(class: Class, why: impl Into<String>, gap: Option<Gap>) -> Self {
-        Verdict { class, why: why.into(), gap }
+        Verdict { class, why: why.into(), gap, offload: None }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Offload {
+    cards: u64,
+    host_gb: f64,
+    nvme_gb: f64,
+    short_gb: f64,
+    placement: Option<bool>,
+}
+
+impl Offload {
+    fn tiers(&self) -> String {
+        format!("{} cards plus {:.0} GB host plus {:.0} GB NVMe", self.cards, self.host_gb, self.nvme_gb)
+    }
+
+    fn placement_text(&self) -> &'static str {
+        match self.placement {
+            Some(true) => "planner accepts today",
+            Some(false) if self.nvme_gb > 0.0 => "planner models cards and host only, the NVMe tier is the expert cache and layer spill path",
+            Some(false) => "planner rejects today",
+            None => "planner not run until the family exists",
+        }
+    }
+
+    fn text(&self) -> String {
+        if self.short_gb > 0.0 {
+            format!("{}; does not fit this machine, short by {:.0} GB of NVMe", self.tiers(), self.short_gb)
+        } else {
+            format!("{}; {}", self.tiers(), self.placement_text())
+        }
+    }
+}
+
+struct Lab {
+    key: String,
+    name: String,
+    orgs: Vec<String>,
+    absent: Vec<(String, String)>,
+    note: String,
+}
+
+fn labs() -> Vec<Lab> {
+    let text = std::fs::read_to_string(popular().join("labs.toml")).unwrap();
+    let t: toml::Table = toml::from_str(&text).unwrap();
+    let strings = |v: &toml::Value| v.as_array().map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
+    t["lab"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| Lab {
+            key: l["key"].as_str().unwrap().into(),
+            name: l["name"].as_str().unwrap().into(),
+            orgs: strings(&l["orgs"]),
+            absent: l.get("absent").and_then(|a| a.as_array()).map(|a| a.iter().map(|x| (x["name"].as_str().unwrap().to_string(), x["note"].as_str().unwrap().to_string())).collect()).unwrap_or_default(),
+            note: l.get("note").and_then(|n| n.as_str()).unwrap_or("").to_string(),
+        })
+        .collect()
+}
+
+fn excluded() -> BTreeSet<String> {
+    let Ok(text) = std::fs::read_to_string(popular().join("gaps.toml")) else { return BTreeSet::new() };
+    let t: toml::Table = toml::from_str(&text).unwrap();
+    t.get("excluded").and_then(|a| a.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect()).unwrap_or_default()
+}
+
+fn is_excluded(row: &Row, out: &BTreeSet<String>) -> bool {
+    out.contains(row.s("base")) || out.contains(row.repo())
 }
 
 struct Row<'a> {
@@ -329,28 +400,98 @@ fn classify_gguf(row: &Row) -> Verdict {
     Verdict::new(Class::Loads, why, None)
 }
 
-fn sized(v: Verdict, row: &Row, card_gb: f64) -> Verdict {
-    match row.size() {
-        Some(gb) if v.class.arch_ok() && gb > card_gb * CARD_SHARE => {
-            let cards = (gb / (card_gb * CARD_SHARE)).ceil() as u64;
-            Verdict::new(Class::TooBig, format!("{gb} GB of weights needs {cards} cards of {card_gb} GB; {}", v.why), v.gap)
+struct Machine {
+    card_gb: f64,
+    cards: u64,
+    ram_available_gb: f64,
+    host_share: f64,
+    host_bandwidth_gbs: f64,
+    nvme_free_gb: f64,
+}
+
+fn machine(man: &Value) -> Machine {
+    let m = &man["machine"];
+    Machine {
+        card_gb: man["card_gb"].as_f64().unwrap(),
+        cards: m["cards"].as_u64().unwrap(),
+        ram_available_gb: m["ram_available_gb"].as_f64().unwrap(),
+        host_share: m["host_share"].as_f64().unwrap(),
+        host_bandwidth_gbs: m["host_bandwidth_gbs"].as_f64().unwrap(),
+        nvme_free_gb: m["nvme_free_gb"].as_f64().unwrap(),
+    }
+}
+
+fn offload_need(gb: f64, m: &Machine, spec: Option<&Spec>) -> Offload {
+    let usable = m.card_gb * CARD_SHARE;
+    let cards = ((gb / usable).ceil() as u64).clamp(1, m.cards);
+    let rest = (gb - cards as f64 * usable).max(0.0);
+    let host_budget = m.ram_available_gb * m.host_share;
+    let host_gb = rest.min(host_budget);
+    let nvme_gb = rest - host_gb;
+    let short_gb = (nvme_gb - m.nvme_free_gb).max(0.0);
+    let placement = spec.map(|s| place_on_desktop(s, gb, m, host_budget));
+    Offload { cards, host_gb, nvme_gb, short_gb, placement }
+}
+
+fn place_on_desktop(spec: &Spec, gb: f64, m: &Machine, host_budget_gb: f64) -> bool {
+    use specrt::placement::{DeviceConfig, LinkConfig, OffloadConfig, PlacementConfig};
+    let gib = (1u64 << 30) as f64;
+    let devices = (0..m.cards as usize)
+        .map(|i| DeviceConfig {
+            name: format!("desktop/gpu{i}"),
+            memory_gib: m.card_gb * 1e9 / gib,
+            bandwidth_gbs: 1792.0,
+            tflops: 500.0,
+            ordinal: Some(i),
+            address: None,
+            reserve_gib: None,
+            link: LinkConfig::default(),
+            offload: Some(OffloadConfig { host_gib: host_budget_gb * 1e9 / gib / m.cards as f64, bandwidth_gbs: m.host_bandwidth_gbs }),
+            host: Some("desktop".into()),
+            peer: Some(LinkConfig::default()),
+            wgpu: false,
+        })
+        .collect();
+    let config = PlacementConfig { devices, weight_bytes: Some((gb * 1e9) as u64), ..PlacementConfig::default() };
+    config.place(spec).is_ok()
+}
+
+fn sized(v: Verdict, row: &Row, m: &Machine, config: Option<&str>) -> Verdict {
+    let Some(gb) = row.size().filter(|gb| *gb > m.card_gb * CARD_SHARE) else { return v };
+    match v.class {
+        Class::Loads | Class::TextOnly => {
+            let spec = config.and_then(|c| serde_json::from_str::<Value>(c).ok()).and_then(|j| serving(&j).ok());
+            let need = offload_need(gb, m, spec.as_ref());
+            let class = if need.short_gb > 0.0 { Class::NoFit } else { Class::Offload };
+            let why = format!("{gb} GB of weights, {}; {}", need.text(), v.why);
+            Verdict { class, why, gap: v.gap, offload: Some(need) }
+        }
+        Class::Refused | Class::UnknownQuant => {
+            let need = offload_need(gb, m, None);
+            let why = format!("{}; {gb} GB of weights, then offload: {}", v.why, need.text());
+            Verdict { why, offload: Some(need), ..v }
         }
         _ => v,
     }
 }
 
-fn classify(row: &Row, card_gb: f64, committed_only: bool) -> Option<Verdict> {
+fn classify(row: &Row, m: &Machine, committed_only: bool) -> Option<Verdict> {
+    let mut config_text = None;
     let v = if row.is_gguf() {
         classify_gguf(row)
     } else {
         let config = if committed_only { committed(row.repo(), "config.json") } else { fetched(row.repo(), "config.json") };
         match config {
-            Some(c) => classify_config(&c, row),
+            Some(c) => {
+                let v = classify_config(&c, row);
+                config_text = Some(c);
+                v
+            }
             None if committed_only && row.has_file("config.json") => return None,
             None => Verdict::new(Class::Unchecked, row.m["config_from"].as_str().unwrap_or("no config.json"), None),
         }
     };
-    Some(sized(v, row, card_gb))
+    Some(sized(v, row, m, config_text.as_deref()))
 }
 
 fn chat(row: &Row) -> (String, Option<Gap>) {
@@ -427,6 +568,113 @@ fn unread_of<'a>(mut rows: impl Iterator<Item = &'a Row<'a>>) -> Vec<String> {
     rows.find_map(|r| fetched(r.repo(), "config.json")).map(|c| specrt::spec::unread_hf_keys(&c).into_iter().map(|(k, _)| k).collect()).unwrap_or_default()
 }
 
+fn lab_class_cell(v: &Verdict, issue: &str) -> String {
+    match (&v.offload, v.class) {
+        (Some(o), Class::Refused | Class::UnknownQuant) => {
+            let blocker = if issue.is_empty() { " (no issue yet)".to_string() } else { format!(" {issue}") };
+            let what = if v.class == Class::Refused { "family" } else { "quantisation support" };
+            format!("needs {what}{blocker}, then offload: {}", o.text())
+        }
+        (Some(o), _) => format!("{}: {}", v.class.label(), o.text()),
+        _ => v.class.label().to_string(),
+    }
+}
+
+fn own_row(lab: &Lab, r: &Row, skip: &BTreeSet<String>) -> bool {
+    r.s("lab") == lab.key && !is_excluded(r, skip) && lab.orgs.iter().any(|o| r.repo().split('/').next().is_some_and(|x| x.eq_ignore_ascii_case(o)))
+}
+
+fn main_labs(rows: &[Row], verdicts: &[Verdict], filed: &BTreeMap<String, u64>, fold: &dyn Fn(&Gap) -> Gap, mach: &Machine, man: &Value, skip: &BTreeSet<String>) -> String {
+    let mut out = String::new();
+    let since = man["labs_since"].as_str().unwrap_or("");
+    writeln!(out, "## Main labs\n").unwrap();
+    writeln!(out, "Source: `tests/fixtures/popular/labs.toml`. Per lab: every model its hub orgs released since {since} (9 months) plus every family the lab still ships, one row per repo of the lab itself with its release date. Quantised copies by other orgs sit under the source lab and are counted, not listed. A model over one card is never refused for size: it reads SUPPORTED-WITH-OFFLOAD, or `needs family #N, then offload: ...` when the architecture is also missing. Machine read for the offload numbers: {:.0} GB free host RAM ({:.0}% usable by the host tier), {:.0} GB free NVMe, {} cards of {} GB.\n", mach.ram_available_gb, mach.host_share * 100.0, mach.nvme_free_gb, mach.cards, mach.card_gb).unwrap();
+    for lab in labs() {
+        let own: Vec<usize> = (0..rows.len()).filter(|&i| own_row(&lab, &rows[i], skip)).collect();
+        let copies: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].s("lab") == lab.key && !own.contains(&i)).collect();
+        let loading = |i: usize| matches!(verdicts[i].class, Class::Loads | Class::TextOnly | Class::Offload);
+        let status = if own.is_empty() {
+            "no public text model".to_string()
+        } else if own.iter().all(|&i| loading(i)) {
+            "GREEN: every model loads".to_string()
+        } else {
+            let blocked = own.iter().filter(|&&i| !loading(i)).count();
+            format!("{blocked} of {} models are blocked, the rest load", own.len())
+        };
+        writeln!(out, "### {} ({})\n", lab.name, status).unwrap();
+        writeln!(out, "| model | released | size GB | arch | class | gap | issue |").unwrap();
+        writeln!(out, "|---|---|---|---|---|---|---|").unwrap();
+        if own.is_empty() {
+            writeln!(out, "| none | | | | no public text model | | |").unwrap();
+        }
+        let mut sorted = own.clone();
+        sorted.sort_by(|&a, &b| rows[b].s("created").cmp(rows[a].s("created")).then(rows[a].repo().cmp(rows[b].repo())));
+        for i in sorted {
+            let r = &rows[i];
+            let v = &verdicts[i];
+            let gap = v.gap.as_ref().map(fold);
+            let issue = gap.as_ref().and_then(|g| filed.get(&g.key)).map(|n| format!("#{n}")).unwrap_or_default();
+            let key = gap.as_ref().map(|g| g.key.clone()).unwrap_or_default();
+            let class = lab_class_cell(v, &issue);
+            writeln!(out, "| {} | {} | {} | {} | {} | {} | {} |", r.repo(), r.s("created"), r.size().map(|s| s.to_string()).unwrap_or_default(), r.s("model_type"), cell(&short(&class, 220)), cell(&short(&key, 90)), issue).unwrap();
+        }
+        for (name, note) in &lab.absent {
+            writeln!(out, "| {name} | | | | no public repo | {} | |", cell(note)).unwrap();
+        }
+        let loads = copies.iter().filter(|&&i| loading(i)).count();
+        writeln!(out, "\nQuantised copies under this lab: {}, of which {} load or load text only.\n", copies.len(), loads).unwrap();
+        if !lab.note.is_empty() {
+            writeln!(out, "{}\n", lab.note).unwrap();
+        }
+    }
+    out
+}
+
+fn lab_gaps(rows: &[Row], verdicts: &[Verdict], filed: &BTreeMap<String, u64>, fold: &dyn Fn(&Gap) -> Gap, skip: &BTreeSet<String>) -> String {
+    let mut out = String::new();
+    writeln!(out, "## Gaps by lab priority\n").unwrap();
+    writeln!(out, "Labs in the order of `labs.toml`, then by how many of that lab's own models a gap blocks. Downloads do not enter the order.\n").unwrap();
+    writeln!(out, "| lab | gap | lab models blocked | models | issue |").unwrap();
+    writeln!(out, "|---|---|---|---|---|").unwrap();
+    for lab in labs() {
+        let mut by_gap: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for i in (0..rows.len()).filter(|&i| own_row(&lab, &rows[i], skip)) {
+            if let Some(g) = &verdicts[i].gap {
+                by_gap.entry(fold(g).key).or_default().push(rows[i].repo());
+            }
+        }
+        let mut list: Vec<(String, Vec<&str>)> = by_gap.into_iter().collect();
+        list.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.cmp(&b.0)));
+        for (key, models) in list {
+            let issue = filed.get(&key).map(|n| format!("#{n}")).unwrap_or_default();
+            let shown = models.iter().take(4).copied().collect::<Vec<_>>().join(", ");
+            let more = if models.len() > 4 { format!(" and {} more", models.len() - 4) } else { String::new() };
+            writeln!(out, "| {} | {} | {} | {}{} | {} |", lab.name, cell(&short(&key, 100)), models.len(), cell(&shown), more, issue).unwrap();
+        }
+    }
+    out.push('\n');
+    out
+}
+
+fn traffic_section(rows: &[Row], verdicts: &[Verdict], skip: &BTreeSet<String>) -> String {
+    let mut out = String::new();
+    writeln!(out, "## Test and tutorial traffic\n").unwrap();
+    writeln!(out, "Listed in `gaps.toml` under `excluded`. These repos are downloaded by CI, tutorials and smoke tests, not by people running a model, so they stay out of the ranked tables. Counts are the hub's last-30-day downloads.\n").unwrap();
+    writeln!(out, "| model | rows | downloads | class | gap |").unwrap();
+    writeln!(out, "|---|---|---|---|---|").unwrap();
+    for name in skip {
+        let idx: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].s("base") == name || rows[i].repo() == name).collect();
+        if idx.is_empty() {
+            continue;
+        }
+        let downloads: u64 = idx.iter().map(|&i| rows[i].downloads()).sum();
+        let base = idx.iter().copied().find(|&i| rows[i].repo() == name).unwrap_or(idx[0]);
+        writeln!(out, "| {name} | {} | {} | {} | {} |", idx.len(), downloads, verdicts[base].class.label(), cell(&verdicts[base].gap.as_ref().map(|g| g.key.clone()).unwrap_or_default())).unwrap();
+    }
+    out.push('\n');
+    out
+}
+
 fn cell(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
@@ -451,12 +699,13 @@ struct Report {
 
 fn report() -> Report {
     let man = manifest();
-    let card_gb = man["card_gb"].as_f64().unwrap();
+    let mach = machine(&man);
     let rows: Vec<Row> = man["models"].as_array().unwrap().iter().map(|m| Row { m }).collect();
     let weight = weights(&rows);
     let tiny = fixture_families();
     let filed = issues();
-    let verdicts: Vec<Verdict> = rows.iter().map(|r| classify(r, card_gb, false).unwrap()).collect();
+    let skip = excluded();
+    let verdicts: Vec<Verdict> = rows.iter().map(|r| classify(r, &mach, false).unwrap()).collect();
     let chats: Vec<(String, Option<Gap>)> = rows.iter().map(chat).collect();
 
     let mut tsv = String::from("repo\tclass\tgap\twhy\n");
@@ -483,6 +732,9 @@ fn report() -> Report {
         }
     };
     for (i, v) in verdicts.iter().enumerate() {
+        if is_excluded(&rows[i], &skip) {
+            continue;
+        }
         if let Some(g) = &v.gap {
             let e = gaps.entry(fold(g)).or_default();
             e.0 += weight[i];
@@ -516,15 +768,19 @@ fn report() -> Report {
     let fetched_on = man["fetched"].as_str().unwrap();
     writeln!(doc, "# specrt model coverage\n").unwrap();
     writeln!(doc, "Fetched {fetched_on}. Generated by `crates/specrt/scripts/model_coverage.sh`; do not edit by hand.\n").unwrap();
+    doc.push_str(&main_labs(&rows, &verdicts, &filed, &fold, &mach, &man, &skip));
+    doc.push_str(&lab_gaps(&rows, &verdicts, &filed, &fold, &skip));
+    doc.push_str(&traffic_section(&rows, &verdicts, &skip));
     writeln!(doc, "\"Popular\" means popular on Hugging Face on {fetched_on}: the most downloaded and the trending repos for the text-generation, image-text-to-text and any-to-any pipeline tags, as the hub API ranked them that day. Downloads are the hub's last-30-day counts. Nothing here was measured by loading weights: every class comes from the model's `config.json` (and the hub's file list for GGUF repos) run through specrt's own checks, `Spec::from_hf_config_serving`, `Vision::from_hf_config` and `Gguf::spec`, with the family specs embedded in this build.\n").unwrap();
     writeln!(doc, "Source: {}.\n", man["source"].as_str().unwrap()).unwrap();
     writeln!(doc, "Selection: {}. Each group keeps the original lab's repo (`base`) and the most downloaded NVFP4, FP8, AWQ, GPTQ and GGUF copy (`nvfp4`, `fp8`, `awq`, `gptq`, `gguf`), plus any copy already in the local hub cache (`disk`).\n", man["selection"].as_str().unwrap()).unwrap();
     writeln!(doc, "## Classes\n").unwrap();
     writeln!(doc, "- LOADS: the serving check passes and every input tower the config declares is read.").unwrap();
     writeln!(doc, "- LOADS-TEXT-ONLY: the text model passes; a vision or audio tower in the config is refused or not read, so only text input works.").unwrap();
-    writeln!(doc, "- TOO-BIG: the architecture passes but the weights are more than {:.0}% of one {card_gb} GB card; the why column says how many cards.", CARD_SHARE * 100.0).unwrap();
+    writeln!(doc, "- SUPPORTED-WITH-OFFLOAD: the architecture passes and the weights are more than {:.0}% of one {} GB card. This is not a refusal: placement spreads layers over the cards, then host RAM, then NVMe. The why column gives the cards, host RAM and NVMe the tiers need on this machine (read from the manifest's `machine` block) and whether `PlacementConfig::place` accepts it today with the desktop's device list.", CARD_SHARE * 100.0, mach.card_gb).unwrap();
+    writeln!(doc, "- DOES-NOT-FIT: the architecture passes but the weights exceed every tier together on this machine; the why column says by how much.").unwrap();
     writeln!(doc, "- UNKNOWN-QUANT: the architecture passes without the quantisation, the quantisation format is refused.").unwrap();
-    writeln!(doc, "- REFUSED: the architecture itself is refused; the why column is the exact refusal text.").unwrap();
+    writeln!(doc, "- REFUSED: the architecture itself is missing or refused; the why column is the exact refusal text. A refused model that is also over one card reads `needs family #N, then offload: ...` in the Main labs tables. Size never refuses a model.").unwrap();
     writeln!(doc, "- UNCHECKED: nothing specrt could check was found: gated with no open mirror, or a GGUF repo whose hub metadata names only the vision projector.\n").unwrap();
 
     writeln!(doc, "## Counts\n").unwrap();
@@ -539,7 +795,7 @@ fn report() -> Report {
     writeln!(doc, "| total | {base_total} | {} |\n", rows.len()).unwrap();
 
     writeln!(doc, "## Ranked gaps\n").unwrap();
-    writeln!(doc, "Each gap is one missing piece, ranked by the summed downloads of the rows it blocks (a base row counts its whole group less the quantised copies listed beside it). Chat and tokenizer gaps are counted only on rows whose architecture passes. The issue column maps a gap to its tracker issue through `crates/specrt/tests/fixtures/popular/gaps.toml`; every gap over {} downloads has one.\n", millions(FILE_THRESHOLD)).unwrap();
+    writeln!(doc, "The same gaps as above, ordered by the summed downloads of the rows they block. This is the older view and it is not the queue order: the lab priority at the top of this section is, because downloads reward CI and tutorial traffic. A base row counts its whole group less the quantised copies listed beside it. Chat and tokenizer gaps are counted only on rows whose architecture passes. The issue column maps a gap to its tracker issue through `crates/specrt/tests/fixtures/popular/gaps.toml`; every gap over {} downloads has one.\n", millions(FILE_THRESHOLD)).unwrap();
     let unfiled: Vec<&str> = ranked.iter().filter(|(g, (sum, _))| *sum >= FILE_THRESHOLD && !filed.contains_key(&g.key)).map(|(g, _)| g.key.as_str()).collect();
     if !unfiled.is_empty() {
         writeln!(doc, "Gaps over the threshold with no issue yet: {}.\n", unfiled.join("; ")).unwrap();
@@ -556,7 +812,7 @@ fn report() -> Report {
     }
 
     writeln!(doc, "\n## Quantisation formats in the safetensors indexes\n").unwrap();
-    writeln!(doc, "Modules per weight layout, counted from each repo's `model.safetensors.index.json` (tensor names only). Read today means at least one repo holding that layout classifies as LOADS, LOADS-TEXT-ONLY or TOO-BIG.\n").unwrap();
+    writeln!(doc, "Modules per weight layout, counted from each repo's `model.safetensors.index.json` (tensor names only). Read today means at least one repo holding that layout classifies as LOADS, LOADS-TEXT-ONLY or SUPPORTED-WITH-OFFLOAD.\n").unwrap();
     let mut formats: BTreeMap<String, (u64, usize, bool)> = BTreeMap::new();
     for (r, v) in rows.iter().zip(&verdicts) {
         if let Some(t) = r.m["tensor_formats"].as_object() {
@@ -658,10 +914,109 @@ fn expected() -> BTreeMap<String, (String, String, String)> {
         .collect()
 }
 
+fn section<'a>(doc: &'a str, title: &str) -> &'a str {
+    let start = doc.find(&format!("## {title}")).unwrap_or_else(|| panic!("no section {title}"));
+    let rest = &doc[start + 3..];
+    let end = rest.find("\n## ").map(|e| e + 3).unwrap_or(rest.len());
+    &doc[start..start + end]
+}
+
+#[test]
+fn every_lab_has_a_model_row_or_an_explicit_no_public_model_row() {
+    let man = manifest();
+    let rows: Vec<Row> = man["models"].as_array().unwrap().iter().map(|m| Row { m }).collect();
+    let skip = excluded();
+    let doc = report().doc;
+    let main = section(&doc, "Main labs");
+    for lab in labs() {
+        let heading = format!("### {} (", lab.name);
+        let at = main.find(&heading).unwrap_or_else(|| panic!("lab {} has no table", lab.name));
+        let table = &main[at..main[at..].find("\nQuantised copies").map(|e| at + e).unwrap_or(main.len())];
+        let own = rows.iter().filter(|r| own_row(&lab, r, &skip)).count();
+        if own == 0 {
+            assert!(table.contains("no public text model"), "lab {} has no rows and no explicit row", lab.name);
+        } else {
+            assert!(table.lines().filter(|l| l.starts_with("| ") && !l.starts_with("| model")).count() >= own, "lab {} lost rows", lab.name);
+        }
+    }
+    for key in ["zai", "deepseek", "kimi", "tencent", "xiaomi", "minimax", "alibaba", "mistral", "thinkingmachines", "meta", "nvidia", "google"] {
+        assert!(labs().iter().any(|l| l.key == key), "labs.toml lacks {key}");
+    }
+}
+
+#[test]
+fn an_excluded_model_never_appears_in_the_ranked_tables() {
+    let skip = excluded();
+    assert!(skip.contains("openai-community/gpt2") && skip.contains("facebook/opt-125m"));
+    let doc = report().doc;
+    for title in ["Main labs", "Gaps by lab priority", "Ranked gaps"] {
+        let body = section(&doc, title);
+        for name in &skip {
+            assert!(!body.contains(&format!("| {name} ")) && !body.contains(&format!(", {name},")) && !body.contains(&format!(", {name} ")), "{name} is in {title}");
+        }
+    }
+    let traffic = section(&doc, "Test and tutorial traffic");
+    for name in &skip {
+        assert!(traffic.contains(&format!("| {name} |")), "{name} missing from the traffic section");
+    }
+}
+
+#[test]
+fn a_model_larger_than_one_card_is_refused_only_for_a_missing_architecture() {
+    let man = manifest();
+    let mach = machine(&man);
+    let big = mach.card_gb * CARD_SHARE;
+    let mut oversize = 0;
+    for m in man["models"].as_array().unwrap() {
+        let row = Row { m };
+        if row.size().is_none_or(|gb| gb <= big) || (!row.is_gguf() && !row.file_committed("config.json")) {
+            continue;
+        }
+        let Some(v) = classify(&row, &mach, true) else { continue };
+        oversize += 1;
+        if v.class == Class::Refused {
+            let missing = v.gap.as_ref().is_some_and(|g| g.kind == Kind::Family || g.kind == Kind::Variant);
+            assert!(missing, "{} is REFUSED over one card without a missing architecture: {}", row.repo(), v.why);
+            assert!(v.why.contains("then offload"), "{}: {}", row.repo(), v.why);
+        }
+        assert!(!v.why.contains("refused for size"), "{}", row.repo());
+    }
+    assert!(oversize > 20, "only {oversize} oversize rows checked");
+}
+
+#[test]
+fn the_offload_numbers_follow_the_machine_block() {
+    let man = manifest();
+    let mach = machine(&man);
+    let huge = offload_need(mach.card_gb * CARD_SHARE * 2.0 + 100.0, &mach, None);
+    assert_eq!(huge.cards, 2);
+    assert!((huge.host_gb - 100.0f64.min(mach.ram_available_gb * mach.host_share)).abs() < 1e-6);
+    let beyond = offload_need((mach.cards as f64) * mach.card_gb * CARD_SHARE + mach.ram_available_gb * mach.host_share + mach.nvme_free_gb + 500.0, &mach, None);
+    assert!((beyond.short_gb - 500.0).abs() < 1e-6, "{beyond:?}");
+    let fits = offload_need(mach.card_gb * CARD_SHARE * 1.5, &mach, None);
+    assert_eq!((fits.cards, fits.nvme_gb), (2, 0.0));
+    let probe = serde_json::json!({"repo": "x/y", "size_gb": 5000.0});
+    let refused = sized(Verdict::new(Class::Refused, "model_type zzz is not supported", Some(Gap { kind: Kind::Family, key: "model_type zzz".into() })), &Row { m: &probe }, &mach, None);
+    assert_eq!(refused.class, Class::Refused);
+    assert!(refused.why.contains("then offload"));
+    let loads = sized(Verdict::new(Class::Loads, "ok", None), &Row { m: &probe }, &mach, None);
+    assert_eq!(loads.class, Class::NoFit);
+}
+
+#[test]
+fn kimi_k3_reads_needs_family_then_offload() {
+    let doc = report().doc;
+    let kimi = section(&doc, "Main labs");
+    let line = kimi.lines().find(|l| l.starts_with("| moonshotai/Kimi-K3 |")).expect("Kimi-K3 row");
+    assert!(line.contains("needs family #1214, then offload:"), "{line}");
+    assert!(line.contains(" cards plus ") && line.contains(" GB host plus ") && line.contains(" GB NVMe"), "{line}");
+    assert!(!line.contains("refused for size"));
+}
+
 #[test]
 fn committed_popular_configs_still_classify_as_the_manifest_says() {
     let man = manifest();
-    let card_gb = man["card_gb"].as_f64().unwrap();
+    let mach = machine(&man);
     let want = expected();
     let mut checked = 0;
     let mut failures = Vec::new();
@@ -670,7 +1025,7 @@ fn committed_popular_configs_still_classify_as_the_manifest_says() {
         if !row.is_gguf() && !row.file_committed("config.json") {
             continue;
         }
-        let Some(v) = classify(&row, card_gb, true) else { continue };
+        let Some(v) = classify(&row, &mach, true) else { continue };
         let got = (v.class.label().to_string(), v.gap.map(|g| g.key).unwrap_or_default(), v.why);
         match want.get(row.repo()) {
             Some(w) if *w == got => {}

@@ -1,0 +1,42 @@
+kind = "kir-kernel"
+family = "span_rope"
+name = "g4_q_rope_s"
+threads = 64
+
+[args]
+row = "qkv_row"
+head = "hd_s"
+offset = 0
+rot = "hd_s"
+theta = "theta_s"
+angles = "angles_s"
+
+[[param]]
+name = "x"
+type = "f32"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "pos"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "pos_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "row_step"
+type = "i32"
+role = "value"
+access = "read"

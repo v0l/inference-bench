@@ -8,7 +8,7 @@ pub enum RopeStyle {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowBody {
-    SpanRope { row: u32, head: u32, offset: u32, rot: u32, style: RopeStyle, invert: bool },
+    SpanRope { row: u32, head: u32, offset: u32, rot: u32, style: RopeStyle, invert: bool, theta: Option<f32>, angles: Option<u32> },
     HeadRms { row: u32, head: u32, offset: u32, width: u32, eps: f32 },
     BlockPool { dim: u32, rot: u32, layers: u32, raw_width: u32, gate_offset: u32, eps: f32 },
     StateWrite { src_row: u32, src_offset: u32, layers: u32, rows: u32, width: u32, stride: u32 },
@@ -91,6 +91,9 @@ impl RowBody {
             }
             RowBody::HeadRms { .. } => {
                 out.push(("x", Scalar::F32, Role::Activation, Access::Write));
+                if params.iter().any(|p| p.name == "w") {
+                    out.push(("w", Scalar::F32, Role::Weight, Access::Read));
+                }
             }
             RowBody::BlockPool { .. } => {
                 out.push(("raw", Scalar::Bf16, Role::Activation, Access::Read));
@@ -170,6 +173,9 @@ impl RowBody {
         }
         match self {
             RowBody::SpanRope { rot, head, .. } if *rot == 0 || !rot.is_multiple_of(2) || rot > head => Err("span_rope needs an even rot no wider than the head".into()),
+            RowBody::SpanRope { rot, angles: Some(a), .. } if *a == 0 || *a > rot / 2 => Err("span_rope angles must be between 1 and rot / 2".into()),
+            RowBody::SpanRope { theta: Some(t), .. } if !t.is_finite() || *t <= 0.0 => Err("span_rope theta must be positive".into()),
+            RowBody::SpanRope { theta: None, angles: Some(_), .. } => Err("span_rope angles needs an explicit theta".into()),
             RowBody::StateWrite { width, rows, layers, stride, .. } if *width == 0 || *rows == 0 || *layers == 0 || stride < width => {
                 Err("state_write needs a positive width, rows and layers and a stride of at least the width".into())
             }
@@ -220,20 +226,25 @@ impl RowBody {
             .collect();
         let head = format!("extern \"C\" __global__ void __launch_bounds__({}) {}({}) {{\n", k.threads, k.name, sig.join(", "));
         let body = match self {
-            RowBody::SpanRope { row, head: stride, offset, rot, style, invert } => {
+            RowBody::SpanRope { row, head: stride, offset, rot, style, invert, theta, angles } => {
                 let (a, b) = match style {
                     RopeStyle::Halves => ("i", "i + ROT_SPAN / 2"),
                     RopeStyle::Pairs => ("2 * i", "2 * i + 1"),
                 };
+                let (freq, mscale) = match theta {
+                    Some(t) => (format!("powf({}f, -(float)(2 * i) / (float)ROT_SPAN)", crate::lit(*t)), "1.0f"),
+                    None => ("rope_inv_freq(i, layer)".to_string(), "ROPE_MSCALE"),
+                };
+                let count = angles.unwrap_or(rot / 2);
                 format!(
                     "    constexpr int ROT_SPAN = {rot};
     const int row = blockIdx.y;
     const int p = pos[row * pos_step] + row * row_step;
     float* v = x + (size_t)row * {row} + (size_t)blockIdx.x * {stride} + {offset};
-    for (int i = threadIdx.x; i < ROT_SPAN / 2; i += blockDim.x) {{
-        float angle = (float)p * rope_inv_freq(i, layer);
-        float c = cosf(angle) * ROPE_MSCALE;
-        float s = {sign}sinf(angle) * ROPE_MSCALE;
+    for (int i = threadIdx.x; i < {count}; i += blockDim.x) {{
+        float angle = (float)p * {freq};
+        float c = cosf(angle) * {mscale};
+        float s = {sign}sinf(angle) * {mscale};
         float a = v[{a}];
         float b = v[{b}];
         v[{a}] = a * c - b * s;
@@ -348,9 +359,10 @@ impl RowBody {
     float total = 0.0f;
     for (int w = 0; w < ((int)blockDim.x + 31) / 32; w++) total += part[w];
     const float inv = rsqrtf(total / {width}.0f + {eps}f);
-    for (int i = threadIdx.x; i < {width}; i += blockDim.x) v[i] *= inv;
+    for (int i = threadIdx.x; i < {width}; i += blockDim.x) v[i] *= inv{weight};
 ",
                 eps = crate::lit(*eps),
+                weight = if k.params.iter().any(|p| p.name == "w") { " * w[i]" } else { "" },
             ),
             RowBody::BlockPool { dim, rot, layers, raw_width, gate_offset, eps } => format!(
                 "    constexpr int DIM = {dim};

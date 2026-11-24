@@ -1,0 +1,49 @@
+{
+  "backend": "tokenizers",
+  "bos_token": "<s>",
+  "eos_token": "</s>",
+  "model_max_length": 1048576,
+  "pad_token": "<pad>",
+  "processor_class": "PixtralProcessor",
+  "tokenizer_class": "TokenizersBackend",
+  "unk_token": "<unk>",
+  "response_template": {
+    "defaults": {
+      "role": "assistant"
+    },
+    "start_anchor": [
+      "[/SYSTEM_PROMPT]",
+      "[/INST]",
+      "[/TOOL_RESULTS]"
+    ],
+    "fields": {
+      "reasoning_content": {
+        "open": "[THINK]",
+        "close": "[/THINK]",
+        "content": "text"
+      },
+      "tool_calls": {
+        "open_pattern": "\\[TOOL_CALLS\\](?P<name>.+?)\\[ARGS\\]",
+        "close_pattern": "(?=\\[TOOL_CALLS\\])|</s>",
+        "repeats": true,
+        "content": "json",
+        "transform": {
+          "type": "function",
+          "function": {
+            "name": "{name}",
+            "arguments": "{content}"
+          }
+        }
+      },
+      "content": {
+        "close": [
+          "[TOOL_CALLS]",
+          "</s>"
+        ],
+        "content": "text",
+        "repeats": true,
+        "join": ""
+      }
+    }
+  }
+}

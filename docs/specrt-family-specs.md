@@ -101,3 +101,20 @@ against transformers on `tests/fixtures/tiny-{mistral,phi3,smollm3,olmo2,granite
 families (`uses_branch`) turn off the fused prefill-plus-decode step, which only runs the plain layer.
 
 Real checks: Phi-4-mini (partial rotary 0.75 plus longrope), Phi-3-mini, OLMo-2-1B, Granite-3.3-2B, SmolLM3-3B, and Mistral-Small-24B-Instruct-2501 FP8 (`RedHatAI/...-FP8-dynamic`, all 40 layers) against transformers.
+
+## Two attention shapes per layer kind (#1194, Gemma 4)
+
+Gemma 4 sliding layers use `head_dim` and `num_key_value_heads`, full layers use `global_head_dim` and `num_global_key_value_heads`, and with `attention_k_eq_v` the full layers have no `v_proj` (keys are the values). `family-gemma4.toml` extends `gemma3` and describes this with data only:
+
+| Field | What it does |
+|---|---|
+| `[[attention.projection]] slot` | Projections naming the same `[attention.params]` width share one fused row range; each layer loads the one present in its kind and zero pads to the slot width. The qkv row is the sum of the slot widths. |
+| `[[attention.projection]] when` | `"param"` or `"!param"`: the projection is loaded only when that param is non zero (or zero). k_eq_v loads `k_proj` into the v slot. |
+| `[[attention.o_cols_by]]` | o_proj columns per layer kind; narrower layers are zero padded to `o_cols`. |
+| `[[state]] blocks` | A per token state kept only for these layer kinds, so each kind's KV holds its own width. Kernels bind `layer = "kind_layer"` (index among layers of that kind). |
+| `[norm] layer_scale` | A per layer scalar tensor that multiplies the layer output. Folded at load into the post norms as `1 / prod(earlier scalars)`, so the residual runs unscaled until the final norm, which is scale invariant. |
+| `[[refuse]]` | `when` is an expression over config keys; a hit refuses the strict spec with `message`. Gemma 4 uses it for MoE, per-layer inputs, KV sharing and double wide MLPs (#1238, #1239). |
+
+The kernels are kir descriptions (`specs/g4_*.toml`): `head_rms` with an optional weight (q, k norms; v norm without), `span_rope` with an explicit `theta` and `angles` (proportional rope rotates `partial_rotary_factor * head_dim / 2` angles over the full head), `state_write`, and a geometry `scan_attention` writing the split attention planes. The vision and audio towers are ignored (`[vision] ignore`); image input gets a text-only refusal (#1237).
+
+Tests: `tests/gemma4.rs` (31B and 12B mapping, refusals, per kind KV bytes, every kernel builds, and on GPU1 tiny-gemma4 logits, greedy and per-layer states against transformers from `scripts/tiny_gemma4.py`: max abs 4.6e-4 on logits).

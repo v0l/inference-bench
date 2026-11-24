@@ -1,0 +1,16 @@
+{
+    "producer": {
+        "name": "modelopt",
+        "version": "0.45.0"
+    },
+    "quantization": {
+        "quant_algo": "FP8",
+        "kv_cache_quant_algo": null,
+        "exclude_modules": [
+            "diffusion_head",
+            "encoder.embed_tokens",
+            "encoder.multi_modal_projector*",
+            "encoder.vision_tower*"
+        ]
+    }
+}

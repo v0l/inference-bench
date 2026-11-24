@@ -142,7 +142,8 @@ mod tests {
         let e = entries(&v);
         let raw = |k: &str| e.iter().find(|x| x.group == "config keys the spec does not read" && x.field == k).map(|x| x.value.clone());
         assert!(raw("final_logit_softcapping").is_none());
-        assert_eq!(raw("global_head_dim").as_deref(), Some("512"));
+        assert_eq!(raw("use_bidirectional_attention").as_deref(), Some("\"vision\""));
+        assert!(raw("global_head_dim").is_none());
         assert!(raw("hidden_size").is_none() && raw("layer_types").is_none() && raw("sliding_window").is_none());
     }
 
