@@ -171,7 +171,8 @@ fn class_of(body: &kir::Body) -> Class {
         },
         kir::Body::Recurrence(_) => Class::Scan,
         kir::Body::Seq(kir::recur::SeqBody::Conv { .. }) => Class::Scan,
-        kir::Body::Seq(kir::recur::SeqBody::GroupNorm { .. }) => Class::RowReduce,
+        kir::Body::Seq(kir::recur::SeqBody::GroupNorm { .. } | kir::recur::SeqBody::GroupMap(_)) => Class::RowReduce,
+        kir::Body::Seq(kir::recur::SeqBody::TokenHash(_)) => Class::Gather,
     }
 }
 

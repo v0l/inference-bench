@@ -1,0 +1,17 @@
+[[state]]
+name = "ngram_history"
+per = "sequence"
+layers = "linear"
+shape = ["ngram_size - 1"]
+dtype = "f32"
+rollback = "checkpoint"
+owner = "layer:1"
+
+[[state]]
+name = "ple_conv"
+per = "sequence"
+layers = "linear"
+shape = ["streams * hidden", "ple_conv_state"]
+dtype = "f32"
+rollback = "checkpoint"
+owner = "layer:1"

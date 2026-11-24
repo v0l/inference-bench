@@ -1,0 +1,65 @@
+kind = "kir-kernel"
+family = "seq_conv"
+name = "ple_conv"
+threads = 128
+
+[args]
+x_row = "streams * hidden"
+x_offset = 0
+channels = "streams * hidden"
+taps = "ple_conv_taps"
+dilation = "ngram_size"
+y_row = "streams * hidden"
+y_offset = 0
+layers = "ple_layers"
+act = "silu(v)"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "state"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "slot_base"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "slot_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "rows_per_seq"
+type = "i32"
+role = "value"
+access = "read"

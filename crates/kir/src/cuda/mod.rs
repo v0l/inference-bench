@@ -228,7 +228,7 @@ pub fn emit_kernel(k: &Kernel) -> Result<String, String> {
 
 pub fn emit_module(kernels: &[Kernel]) -> Result<crate::KirSource, String> {
     let mut out = String::new();
-    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum()) || matches!(&k.body, Body::Rows(crate::rows::RowBody::LayerNorm { .. }))) {
+    if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum()) || matches!(&k.body, Body::Rows(crate::rows::RowBody::LayerNorm { .. })) || matches!(&k.body, Body::Seq(s) if s.has_sum())) {
         out.push_str(WARP_SUM);
     }
     for k in kernels {

@@ -1,0 +1,15 @@
+streams = { config = "hc_count" }
+hidden = { config = "hidden_size" }
+vocab = { config = "vocab_size" }
+norm_eps = { config = "rms_norm_eps" }
+ngram_size = { config = "ngram_size", default = 3.0 }
+heads_per_ngram = { config = "heads_per_ngram", default = 8.0 }
+ngram_heads = { expr = "(ngram_size - 1) * heads_per_ngram" }
+ngram_base = { config = "ngram_vocab_size_base", default = 20000000.0 }
+ngram_seed = { config = "seed", default = 1234.0 }
+ngram_eos = { config = "eos_token_id" }
+ple_embed_dim = { config = "ple_embed_dim", alt = "hidden_size" }
+ple_head_dim = { expr = "ple_embed_dim / ngram_heads" }
+ple_conv_taps = { config = "ple_conv_kernel_size", default = 4.0 }
+ple_conv_state = { expr = "(ple_conv_taps - 1) * ngram_size" }
+ple_gate_scale = { expr = "1 / sqrt(hidden)" }

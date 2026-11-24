@@ -10,7 +10,10 @@ pub mod expr;
 pub mod gemm;
 pub mod gemv;
 pub mod ggml;
+pub mod group;
+pub mod hash;
 pub mod heavy;
+pub mod int;
 pub mod iq_tables;
 pub mod layout;
 pub mod linear;
@@ -422,7 +425,7 @@ impl Kernel {
                 &roles
             }
             Body::Seq(c) => {
-                c.check(t, &self.params)?;
+                c.check(t, self.threads, &self.params)?;
                 &roles
             }
             Body::GatedActivation { width, .. } => {

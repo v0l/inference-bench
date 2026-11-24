@@ -1,0 +1,38 @@
+kind = "kir-kernel"
+family = "group_map"
+name = "ple_embed_gather"
+threads = 32
+
+[args]
+width = "ple_head_dim"
+
+[[param]]
+name = "idx"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "table"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "emb"
+role = "activation"
+access = "write"
+
+[[stage]]
+op = "gather"
+name = "e"
+src = "table"
+index = "idx"
+row = "ngram_heads"
+head = "ple_head_dim"
+
+[[stage]]
+op = "store"
+dst = "emb"
+value = "e"
+row = "ple_embed_dim"
+head = "ple_head_dim"
