@@ -48,11 +48,24 @@ fn the_parts_not_built_yet_are_refused_by_name() {
     assert!(small.contains("hidden_size_per_layer_input"), "{small}");
 }
 
+fn unrefused() -> specrt::family::Registry {
+    let texts: Vec<String> = specrt::spec::EMBEDDED
+        .iter()
+        .map(|(_, text)| {
+            let mut table: toml::Table = toml::from_str(text).unwrap();
+            if table.get("name").and_then(|n| n.as_str()) == Some("gemma4") {
+                let rules = table.get_mut("refuse").and_then(|r| r.as_array_mut()).unwrap();
+                rules.retain(|r| r["when"].as_str() == Some("enable_moe_block"));
+            }
+            table.to_string()
+        })
+        .collect();
+    specrt::family::Registry::from_texts(texts.iter().map(String::as_str)).unwrap()
+}
+
 #[test]
 fn the_e2b_config_maps_its_shared_tail_and_wide_mlp() {
-    let mut e2b: serde_json::Value = serde_json::from_str(&popular("google__gemma-4-E2B-it")).unwrap();
-    e2b["text_config"]["hidden_size_per_layer_input"] = 0.into();
-    let spec = Spec::from_hf_config(&e2b.to_string()).unwrap();
+    let spec = Spec::from_hf_config_serving_in(&unrefused(), &popular("google__gemma-4-E2B-it")).unwrap();
     assert_eq!(spec.layers.count, 35);
     assert_eq!(spec.layers.shared_tail, 20);
     assert!(spec.mlp.wide_shared_tail);
