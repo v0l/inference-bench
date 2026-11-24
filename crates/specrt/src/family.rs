@@ -291,6 +291,11 @@ pub struct FamilyMoe {
     pub experts_transposed: bool,
     pub quantized_experts: bool,
     pub hash_table: Option<String>,
+    pub parallel_dense: bool,
+    pub router_norm: Option<String>,
+    pub router_norm_scale: Option<String>,
+    pub input_norm: Option<String>,
+    pub expert_scale: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

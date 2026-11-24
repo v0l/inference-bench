@@ -423,7 +423,11 @@ impl<'a> Signer<'a> {
                 Signature { class: Class::Gemm, reads, writes: vec![outs] }
             }
             _ => {
-                let target = if self.ranked { Tensor::buf(Buf::Partial, Rows::Tokens, h) } else { self.x() };
+                let target = match op {
+                    Op::MoeCombineInto { into } => Tensor::buf(*into, Rows::Tokens, h),
+                    _ if self.ranked => Tensor::buf(Buf::Partial, Rows::Tokens, h),
+                    _ => self.x(),
+                };
                 Signature { class: Class::Gather, reads: vec![outs, routes, target.clone()], writes: vec![target] }
             }
         }
@@ -441,7 +445,7 @@ impl<'a> Signer<'a> {
                 let rows = if which == NormKind::Final && into.is_planes() { Rows::Out } else { Rows::Tokens };
                 sig(Class::RowReduce, vec![Tensor::buf(Buf::X, rows, h), self.norm_weight(which)], vec![Tensor::buf(into, rows, h)])
             }
-            Op::NormAdd { which, from } => sig(Class::RowReduce, vec![Tensor::buf(from, Rows::Tokens, h), self.norm_weight(which), self.x()], vec![self.x()]),
+            Op::NormAdd { which, from, into } => sig(Class::RowReduce, vec![Tensor::buf(from, Rows::Tokens, h), self.norm_weight(which), Tensor::buf(into, Rows::Tokens, h)], vec![Tensor::buf(into, Rows::Tokens, h)]),
             Op::Clear { buf } => sig(Class::Elementwise, Vec::new(), vec![Tensor::buf(buf, Rows::Tokens, h)]),
             Op::Split { from, into } => sig(Class::Elementwise, vec![Tensor::buf(from, Rows::Tokens, h)], vec![Tensor::buf(into, Rows::Tokens, h)]),
             Op::QkNorm => sig(
@@ -501,7 +505,7 @@ impl<'a> Signer<'a> {
                 vec![Tensor::buf(Buf::XnPlanes, Rows::Tokens, h)],
             ),
             Op::MtpDraft => sig(Class::RowReduce, vec![Tensor::buf(Buf::MtpLogits, Rows::Tokens, spec.dims.vocab)], vec![Tensor::new(Place::Local("drafts".into()), Rows::Tokens, 1, Form::I32)]),
-            Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => self.moe(op, layer),
+            Op::MoeRoute | Op::MoeExperts | Op::MoeCombine | Op::MoeCombineInto { .. } => self.moe(op, layer),
             Op::AllReduce => {
                 let partial = Tensor::buf(Buf::Partial, Rows::Tokens, h);
                 sig(Class::Elementwise, vec![partial.clone(), self.x()], vec![self.x(), partial])

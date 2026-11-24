@@ -575,6 +575,11 @@ impl Gguf {
                     hash_layers: 0,
                     hash_table: None,
                     tp_split: crate::spec::TpSplit::Auto,
+                    parallel_dense: false,
+                    router_norm: None,
+                    router_norm_scale: 1.0,
+                    input_norm: None,
+                    expert_scale: None,
                     local: None,
                 })
             }

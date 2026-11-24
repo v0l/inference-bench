@@ -44,6 +44,7 @@ impl Runtime {
             Buf::Act => &self.buf.act,
             Buf::Logits => &self.buf.logits,
             Buf::Branch => &self.pre.branch,
+            Buf::Merged => &self.pre.merged,
             Buf::PreLin => &gdn()?.lin,
             Buf::PreBa => &gdn()?.ba,
             Buf::Gdn => &gdn()?.out,
@@ -82,9 +83,10 @@ impl Runtime {
                 b.arg(target).arg(target);
                 unsafe { b.launch(cfg(grid(hidden, 256), 256)) }?;
             }
-            Op::NormAdd { which, from } => {
+            Op::NormAdd { which, from, into } => {
+                let target = self.row(into)?;
                 let mut b = self.launcher(self.kernel("norm_add"));
-                b.arg(self.row(from)?).arg(self.norm_weight(which, layer)).arg(&self.buf.x).arg(&self.buf.x);
+                b.arg(self.row(from)?).arg(self.norm_weight(which, layer)).arg(target).arg(target);
                 unsafe { b.launch(cfg(1, 1024)) }?;
             }
             Op::ScaledAdd { from } => {
@@ -96,6 +98,7 @@ impl Runtime {
             Op::MoeRoute => self.moe_route(layer.context("moe runs inside a layer")?, &self.buf.x, &self.buf.token, 1)?,
             Op::MoeExperts => self.moe_experts(layer.context("moe runs inside a layer")?, 1)?,
             Op::MoeCombine => self.moe_combine(&self.buf.x, 1)?,
+            Op::MoeCombineInto { into } => self.moe_combine(self.row(into)?, 1)?,
             Op::LogitScale | Op::LogitSoftcap => {
                 let name = if *op == Op::LogitScale { "logit_scale" } else { "logit_softcap" };
                 let mut b = self.launcher(self.kernel(name));

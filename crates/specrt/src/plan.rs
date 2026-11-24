@@ -31,6 +31,7 @@ pub enum Buf {
     Partial,
     Gdn,
     Streams,
+    Merged,
 }
 
 impl Buf {
@@ -57,6 +58,7 @@ impl Buf {
             Buf::Partial => "rank partial",
             Buf::Gdn => "gdn",
             Buf::Streams => "streams",
+            Buf::Merged => "merged",
         }
     }
 
@@ -200,6 +202,8 @@ pub enum NormKind {
     PostAttention,
     PreMlp,
     PostMlp,
+    PostDense,
+    PostExperts,
     Final,
 }
 
@@ -210,6 +214,8 @@ impl NormKind {
             NormKind::PostAttention => "post_attention_layernorm.weight",
             NormKind::PreMlp => "pre_feedforward_layernorm.weight",
             NormKind::PostMlp => "post_feedforward_layernorm.weight",
+            NormKind::PostDense => "post_feedforward_layernorm_1.weight",
+            NormKind::PostExperts => "post_feedforward_layernorm_2.weight",
             NormKind::Final => "norm.weight",
         }
     }
@@ -220,7 +226,7 @@ pub enum Op {
     Embed,
     Splice,
     Norm { which: NormKind, into: Buf },
-    NormAdd { which: NormKind, from: Buf },
+    NormAdd { which: NormKind, from: Buf, into: Buf },
     Clear { buf: Buf },
     Split { from: Buf, into: Buf },
     QkNorm,
@@ -248,6 +254,7 @@ pub enum Op {
     MoeRoute,
     MoeExperts,
     MoeCombine,
+    MoeCombineInto { into: Buf },
     AllReduce,
     AllReduceNorm { which: NormKind },
     Gemv { norm: Option<NormKind>, weight: Weight, quant: QuantSource, input: Buf, output: Buf },
@@ -282,6 +289,8 @@ impl Op {
                 NormKind::PostAttention => "post attention norm".into(),
                 NormKind::PreMlp => "pre mlp norm".into(),
                 NormKind::PostMlp => "post mlp norm".into(),
+                NormKind::PostDense => "post dense mlp norm".into(),
+                NormKind::PostExperts => "post experts norm".into(),
                 NormKind::Final => "final norm".into(),
             },
             Op::NormAdd { which, .. } => format!("{which:?} norm and add"),
@@ -308,6 +317,7 @@ impl Op {
             Op::MoeRoute => "router".into(),
             Op::MoeExperts => "experts".into(),
             Op::MoeCombine => "combine".into(),
+            Op::MoeCombineInto { .. } => "combine".into(),
             Op::AllReduce => "allreduce".into(),
             Op::AllReduceNorm { .. } => "allreduce, add and norm".into(),
             Op::Gemv { norm: Some(_), weight, .. } => format!("norm and {}", weight.name()),
@@ -327,7 +337,7 @@ impl Op {
             Op::Embed => "tokens to x".into(),
             Op::Splice => "media embeddings into x".into(),
             Op::Norm { into, .. } => format!("x to {}", into.label()),
-            Op::NormAdd { from, .. } => format!("{} added to x", from.label()),
+            Op::NormAdd { from, into, .. } => format!("{} added to {}", from.label(), into.label()),
             Op::LogitSoftcap | Op::LogitScale => "logits to logits".into(),
             Op::Clear { buf } => format!("zero {}", buf.label()),
             Op::Split { from, into } => format!("{} to {}", from.label(), into.label()),
@@ -347,6 +357,7 @@ impl Op {
             Op::MoeRoute => "x to top-k experts".into(),
             Op::MoeExperts => "x and top-k to expert outputs".into(),
             Op::MoeCombine => "expert outputs to x".into(),
+            Op::MoeCombineInto { into } => format!("expert outputs to {}", into.label()),
             Op::AllReduce => "rank partials summed into x".into(),
             Op::AllReduceNorm { .. } => "rank partials summed into x, x to xn planes".into(),
             Op::Gemv { norm: Some(_), output, .. } => format!("x normed to {}", output.label()),
@@ -494,7 +505,7 @@ impl Op {
             Op::MtpDraft => names(&["mtp_draft"]),
             Op::MoeRoute => names(&["moe_route_logits", "moe_route"]),
             Op::MoeExperts => names(&["moe_up_bf16", "moe_down_bf16"]),
-            Op::MoeCombine => names(&["moe_combine"]),
+            Op::MoeCombine | Op::MoeCombineInto { .. } => names(&["moe_combine"]),
             Op::AllReduce => vec![crate::allreduce::kernel_name(crate::allreduce::pick_mode(tokens * spec.dims.hidden * 4), kir::allreduce::Dtype::F32)],
             Op::AllReduceNorm { .. } => names(&["ar_add_rmsnorm_f32"]),
             Op::GemvStore { weight, quant, .. } => match crate::gemm::gemv_into(spec, weight.name(), weight_kind(quant.resolve_for(spec, layer, *weight)), false, true) {

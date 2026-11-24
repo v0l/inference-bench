@@ -131,9 +131,18 @@ pub struct MoeWeights {
     pub gate_up_bias: Option<Vec<f32>>,
     pub down_bias: Option<Vec<f32>>,
     pub hash_table: Option<Vec<i32>>,
+    pub norms: Option<ParallelNorms>,
     pub gate: Stacked,
     pub up: Stacked,
     pub down: Stacked,
+}
+
+pub struct ParallelNorms {
+    pub router: Vec<f32>,
+    pub input: Vec<f32>,
+    pub expert_scale: Vec<f32>,
+    pub post_dense: Vec<f32>,
+    pub post_experts: Vec<f32>,
 }
 
 pub struct Layer<'a> {
@@ -1253,7 +1262,8 @@ impl Checkpoint {
         let sparse = spec.moe.as_ref().is_some_and(|m| m.is_sparse(global)) && spec.has_mlp(i);
         let moe = if sparse { Some(self.moe_layer(spec, &p, mlp)?) } else { None };
         let none = || (Matrix::Bf16(Cow::Owned(vec![0; 8])), Matrix::Bf16(Cow::Owned(vec![0; 8])));
-        let (gate_up, down) = if sparse || !spec.has_mlp(i) {
+        let dense_beside = sparse && spec.parallel_moe();
+        let (gate_up, down) = if (sparse && !dense_beside) || !spec.has_mlp(i) {
             none()
         } else if spec.mlp.mapped.is_some() {
             let up = self.raw(&format!("{p}.mlp.up_proj.weight"), inter, h)?;
@@ -1376,7 +1386,7 @@ impl Checkpoint {
         } else {
             None
         };
-        Ok(MoeWeights { router, shared_gate, score_bias: None, router_bias: None, gate_up_bias: None, down_bias: None, hash_table: None, gate: stack("gate", inter, h)?, up: stack("up", inter, h)?, down: stack("down", h, inter)? })
+        Ok(MoeWeights { router, shared_gate, score_bias: None, router_bias: None, gate_up_bias: None, down_bias: None, hash_table: None, norms: None, gate: stack("gate", inter, h)?, up: stack("up", inter, h)?, down: stack("down", h, inter)? })
     }
 
     fn moe_layer(&self, spec: &Spec, p: &str, quant: Quant) -> Result<MoeWeights> {
@@ -1474,7 +1484,7 @@ impl Checkpoint {
                 }
                 (Stacked::Bf16(gate), Stacked::Bf16(up), Stacked::Bf16(down))
             }
-            None if m.fused_experts => {
+            None if m.fused_experts && self.has(&format!("{p}.mlp.experts.gate_up_proj.weight")) => {
                 ensure!(quant == Quant::Bf16, "fused experts are bf16 only");
                 let shared = m.shared_intermediate;
                 let fused = self.bf16(&format!("{p}.mlp.experts.gate_up_proj.weight"), &[e, 2 * inter, h])?;
@@ -1508,9 +1518,31 @@ impl Checkpoint {
                 (Some(t), true) => Some(self.int_table(&format!("{p}.mlp.{}.{t}", m.router_module), m.top_k())?),
                 _ => None,
             },
+            norms: if m.parallel_dense { Some(self.parallel_norms(spec, m, p)?) } else { None },
             gate,
             up,
             down,
+        })
+    }
+
+    fn parallel_norms(&self, spec: &Spec, m: &crate::spec::Moe, p: &str) -> Result<ParallelNorms> {
+        let h = spec.dims.hidden;
+        let router = match &m.router_norm {
+            Some(t) => self.f32(&format!("{p}.{t}"), h)?.into_iter().map(|v| (v as f64 * m.router_norm_scale) as f32).collect(),
+            None => vec![m.router_norm_scale as f32; h],
+        };
+        Ok(ParallelNorms {
+            router,
+            input: match &m.input_norm {
+                Some(t) => self.norm(spec, &format!("{p}.{t}"), h)?,
+                None => self.norm(spec, &format!("{p}.post_attention_layernorm.weight"), h)?,
+            },
+            expert_scale: match &m.expert_scale {
+                Some(t) => self.f32(&format!("{p}.{t}"), m.experts)?,
+                None => vec![1.0; m.experts],
+            },
+            post_dense: self.norm(spec, &format!("{p}.{}", crate::plan::NormKind::PostDense.tensor()), h)?,
+            post_experts: self.norm(spec, &format!("{p}.{}", crate::plan::NormKind::PostExperts.tensor()), h)?,
         })
     }
 

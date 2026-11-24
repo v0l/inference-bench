@@ -95,7 +95,7 @@ impl Runtime {
                 None => Ok(()),
             },
             Op::Norm { which, into } => self.norm_op(which, into, layer, run),
-            Op::NormAdd { which, from } => self.norm_add_op(which, from, layer, run),
+            Op::NormAdd { which, from, into } => self.norm_add_op(which, from, into, layer, run),
             Op::Clear { buf } => self.clear_op(buf, run),
             Op::LogitSoftcap => self.softcap_op(run, "logit_softcap"),
             Op::LogitScale => self.softcap_op(run, "logit_scale"),
@@ -121,6 +121,7 @@ impl Runtime {
             Op::MoeRoute => self.moe_route(layer.expect("moe runs inside a layer"), &self.pre.x, run.tokens, n),
             Op::MoeExperts => self.moe_experts(layer.expect("moe runs inside a layer"), n),
             Op::MoeCombine => self.moe_combine(if self.comm.is_some() { &self.partial } else { &self.pre.x }, n),
+            Op::MoeCombineInto { into } => self.moe_combine(self.f32_buf(into, run), n),
             Op::AllReduce => self.allreduce_op(n),
             Op::AllReduceNorm { which } => self.allreduce_norm_op(which, layer, n),
             Op::Gemv { .. } | Op::GemvStore { .. } | Op::StepAttention | Op::GdnStep => unreachable!("{} runs on the single row plan", op.label()),
@@ -408,6 +409,8 @@ impl Runtime {
             NormKind::PostAttention => &l().ln2,
             NormKind::PreMlp => l().ln_pre_mlp.as_ref().expect("a sandwich layer has a pre mlp norm"),
             NormKind::PostMlp => l().ln_post_mlp.as_ref().expect("a sandwich layer has a post mlp norm"),
+            NormKind::PostDense => l().moe_norms().0,
+            NormKind::PostExperts => l().moe_norms().1,
             NormKind::Final => &self.norm,
         }
     }
@@ -427,11 +430,12 @@ impl Runtime {
         }
     }
 
-    fn norm_add_op(&self, which: NormKind, from: Buf, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
+    fn norm_add_op(&self, which: NormKind, from: Buf, into: Buf, layer: Option<&DeviceLayer>, run: &Run) -> Result<()> {
         let weight = self.norm_weight(which, layer);
         let mut b = self.launcher(self.kernel("norm_add"));
         let delta = self.f32_buf(from, run);
-        b.arg(delta).arg(weight).arg(&self.pre.x).arg(&self.pre.x);
+        let target = self.f32_buf(into, run);
+        b.arg(delta).arg(weight).arg(target).arg(target);
         unsafe { b.launch(super::cfg(run.n as u32, 1024)) }?;
         Ok(())
     }
@@ -545,6 +549,7 @@ impl Runtime {
             Buf::X => &self.pre.x,
             Buf::Xn => &self.pre.xn,
             Buf::Branch => &self.pre.branch,
+            Buf::Merged => &self.pre.merged,
             Buf::Qkv => &self.pre.qkv,
             Buf::Attn => &self.pre.attn,
             Buf::GateUp => &self.pre.gate_up,

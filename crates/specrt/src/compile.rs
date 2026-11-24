@@ -104,7 +104,7 @@ pub fn gemv_layout(signer: &Signer, ops: &[Op], layer: usize) -> Result<Vec<Op>>
             Op::Linear { weight, quant, input, output } => Op::Linear { weight, quant, input: read(input, &alias)?, output: row_form(output) },
             Op::DecodeAttention => Op::StepAttention,
             Op::GdnDecode => Op::GdnStep,
-            Op::Embed | Op::Clear { .. } | Op::NormAdd { .. } | Op::ScaledAdd { .. } | Op::QkNorm | Op::LogitScale | Op::LogitSoftcap | Op::MoeRoute | Op::MoeExperts | Op::MoeCombine => *op,
+            Op::Embed | Op::Clear { .. } | Op::NormAdd { .. } | Op::ScaledAdd { .. } | Op::QkNorm | Op::LogitScale | Op::LogitSoftcap | Op::MoeRoute | Op::MoeExperts | Op::MoeCombine | Op::MoeCombineInto { .. } => *op,
             ref other => bail!("pass {GEMV_LAYOUT}: {} has no single row form", other.label()),
         };
         if alias == Alias::X && writes_x(signer, &lowered, layer)? {

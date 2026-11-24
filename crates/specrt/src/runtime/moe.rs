@@ -16,6 +16,7 @@ pub(super) enum StackWeights {
 
 pub(super) struct DeviceMoe {
     router: CudaSlice<u16>,
+    parallel: Option<DeviceParallel>,
     shared_gate: CudaSlice<f32>,
     score_bias: CudaSlice<f32>,
     router_bias: CudaSlice<f32>,
@@ -29,6 +30,30 @@ pub(super) struct DeviceMoe {
 }
 
 pub(super) type Bias<'a> = (&'a CudaSlice<f32>, &'a CudaSlice<f32>);
+
+pub(super) struct DeviceParallel {
+    router: CudaSlice<f32>,
+    input: CudaSlice<f32>,
+    expert_scale: CudaSlice<f32>,
+    pub(super) post_dense: CudaSlice<f32>,
+    pub(super) post_experts: CudaSlice<f32>,
+}
+
+impl DeviceParallel {
+    fn upload(stream: &Arc<cudarc::driver::CudaStream>, n: &crate::weights::ParallelNorms) -> Result<Self> {
+        Ok(DeviceParallel {
+            router: stream.clone_htod(&n.router)?,
+            input: stream.clone_htod(&n.input)?,
+            expert_scale: stream.clone_htod(&n.expert_scale)?,
+            post_dense: stream.clone_htod(&n.post_dense)?,
+            post_experts: stream.clone_htod(&n.post_experts)?,
+        })
+    }
+
+    fn bytes(&self) -> u64 {
+        (self.router.num_bytes() + self.input.num_bytes() + self.expert_scale.num_bytes() + self.post_dense.num_bytes() + self.post_experts.num_bytes()) as u64
+    }
+}
 
 pub(super) struct Stacks {
     pub(super) gate: StackWeights,
@@ -88,6 +113,7 @@ impl DeviceMoe {
             stacks,
             host,
             router: stream.clone_htod(&m.router)?,
+            parallel: m.norms.as_ref().map(|n| DeviceParallel::upload(stream, n)).transpose()?,
             shared_gate: stream.clone_htod(m.shared_gate.as_deref().unwrap_or(&[0.0]))?,
             score_bias: stream.clone_htod(m.score_bias.as_deref().unwrap_or(&[0.0]))?,
             router_bias: stream.clone_htod(m.router_bias.as_deref().unwrap_or(&[0.0]))?,
@@ -106,8 +132,12 @@ impl DeviceMoe {
         self.host.is_some()
     }
 
+    pub(super) fn parallel(&self) -> Option<&DeviceParallel> {
+        self.parallel.as_ref()
+    }
+
     pub(super) fn bytes(&self) -> u64 {
-        (self.router.num_bytes() + self.shared_gate.num_bytes() + self.score_bias.num_bytes() + self.router_bias.num_bytes() + self.gate_up_bias.num_bytes() + self.down_bias.num_bytes() + self.hash_table.num_bytes()) as u64 + self.stacks.as_ref().map_or(0, |s| s.gate.bytes() + s.up.bytes() + s.down.bytes())
+        self.parallel.as_ref().map_or(0, DeviceParallel::bytes) + (self.router.num_bytes() + self.shared_gate.num_bytes() + self.score_bias.num_bytes() + self.router_bias.num_bytes() + self.gate_up_bias.num_bytes() + self.down_bias.num_bytes() + self.hash_table.num_bytes()) as u64 + self.stacks.as_ref().map_or(0, |s| s.gate.bytes() + s.up.bytes() + s.down.bytes())
     }
 }
 
@@ -237,12 +267,20 @@ impl Runtime {
         let experts = self.spec.moe.as_ref().expect("moe spec").experts;
         let n_arg = n as i32;
         let mut b = self.launcher(self.kernel("moe_route_logits"));
-        b.arg(x).arg(&layer.ln2).arg(&w.router).arg(&w.shared_gate).arg(&w.router_bias).arg(&mb.xn).arg(&mb.logits).arg(&n_arg);
+        match &w.parallel {
+            Some(p) => b.arg(x).arg(&p.router).arg(&p.input),
+            None => b.arg(x).arg(&layer.ln2),
+        };
+        b.arg(&w.router).arg(&w.shared_gate).arg(&w.router_bias).arg(&mb.xn).arg(&mb.logits).arg(&n_arg);
         let config = launch(kir::moe::route_logits_launch(experts, n, self.spec.dims.hidden));
         unsafe { b.launch(config) }?;
         let mut b = self.launcher(self.kernel("moe_route"));
         let first = self.spec.moe.as_ref().expect("moe spec").first_expert() as i32;
-        b.arg(&mb.logits).arg(&w.score_bias).arg(&w.hash_table).arg(tokens).arg(&w.hashed).arg(&mb.idx).arg(&mb.coef).arg(&first);
+        b.arg(&mb.logits).arg(&w.score_bias);
+        if let Some(p) = w.parallel.as_ref().filter(|_| self.spec.moe.as_ref().is_some_and(|m| m.expert_scale.is_some())) {
+            b.arg(&p.expert_scale);
+        }
+        b.arg(&w.hash_table).arg(tokens).arg(&w.hashed).arg(&mb.idx).arg(&mb.coef).arg(&first);
         unsafe { b.launch(cfg(n as u32, kir::moe::ROUTE_THREADS)) }?;
         if self.spec.moe.as_ref().expect("moe spec").input_scaled {
             let m = self.spec.moe.as_ref().expect("moe spec");
