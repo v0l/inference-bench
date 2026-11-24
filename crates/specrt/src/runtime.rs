@@ -1421,7 +1421,14 @@ impl Runtime {
     pub fn promote_expert(&self, layer: usize, expert: usize) -> Result<()> {
         let cache = self.expert_cache.as_ref().context("no expert cache is active")?;
         let host = self.layers[layer].moe.as_ref().and_then(|m| m.host.as_ref()).context("layer has no cached experts")?;
-        cache.promote(&self.stream, layer, host, expert)
+        let bias = self.layer_bias(layer).context("layer has no cached experts")?;
+        cache.promote(&self.stream, layer, host, expert, bias)
+    }
+
+    pub fn stall_expert_promotions(&self, ms: u64) {
+        if let Some(c) = &self.expert_cache {
+            c.stall_promotions(ms);
+        }
     }
 
     pub fn expert_hotlist(&self) -> Option<crate::offload::ExpertHotlist> {
@@ -1453,7 +1460,7 @@ impl Runtime {
             Some(p) if std::path::Path::new(p).exists() => Some(crate::offload::ExpertHotlist::load(std::path::Path::new(p))?),
             _ => None,
         };
-        let cache = moe::experts::ExpertCache::new(&self.stream, like, self.layers.len(), cached_layers, slots, local, shared, off, top_k, prior)?;
+        let cache = moe::experts::ExpertCache::new(&self.stream, like, self.layers.len(), cached_layers, slots, local, shared, off, top_k, prior, m.expert_bias.then_some((m.expert_intermediate, self.spec.dims.hidden)))?;
         let hosts = self.cached_hosts();
         cache.warm(&self.stream, &hosts, top_k)?;
         self.expert_cache = Some(cache);
