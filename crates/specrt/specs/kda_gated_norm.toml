@@ -1,0 +1,43 @@
+kind = "kir-kernel"
+family = "group_norm"
+name = "kda_gated_norm"
+threads = 128
+
+[args]
+x_row = "kda_qkv"
+x_offset = 0
+g_row = "kda_qkv"
+g_offset = 0
+width = "kda_head_dim"
+w_group = 0
+out_row = "kda_qkv"
+eps = "norm_eps"
+input = "x"
+output = "w * n * sigmoid(g)"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "g"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "out_hi"
+type = "bf16"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "out_lo"
+type = "bf16"
+role = "activation"
+access = "write"

@@ -88,6 +88,10 @@ fn the_kda_description_builds_from_the_spec_file() {
         .num("kda_head_dim", 128.0)
         .num("kda_heads", 64.0)
         .num("kda_row", 5.0 * 64.0 * 128.0 + 64.0)
+        .num("kda_gate_row", 5.0 * 64.0 * 128.0 + 64.0)
+        .num("kda_gate_offset", 3.0 * 64.0 * 128.0)
+        .num("kda_beta_row", 5.0 * 64.0 * 128.0 + 64.0)
+        .num("kda_beta_offset", 4.0 * 64.0 * 128.0)
         .num("kda_lower_bound", -5.0)
         .num("linear_layers", 34.0);
     let k = d.build(&kir::Target::sm_120(), &shape).unwrap_or_else(|e| panic!("{e}"));
@@ -185,7 +189,16 @@ fn the_kda_kernel_matches_the_kimi_delta_rule() {
     let (heads, d, rows, lower) = (4usize, 64usize, 12usize, -5.0f32);
     let row = 4 * heads * d + heads;
     let text = std::fs::read_to_string(root().join("specs/kda_recurrence.toml")).unwrap();
-    let shape = kir::desc::Shape::new().num("kda_head_dim", d as f64).num("kda_heads", heads as f64).num("kda_row", row as f64).num("kda_lower_bound", lower as f64).num("linear_layers", 1.0);
+    let shape = kir::desc::Shape::new()
+        .num("kda_head_dim", d as f64)
+        .num("kda_heads", heads as f64)
+        .num("kda_row", row as f64)
+        .num("kda_gate_row", row as f64)
+        .num("kda_gate_offset", (3 * heads * d) as f64)
+        .num("kda_beta_row", row as f64)
+        .num("kda_beta_offset", (4 * heads * d) as f64)
+        .num("kda_lower_bound", lower as f64)
+        .num("linear_layers", 1.0);
     let ctx = CudaContext::new(0).unwrap();
     let target = specrt::codegen::cuda_target(&ctx).unwrap();
     let k = kir::desc::Description::parse(&text).unwrap().build(&target, &shape).unwrap();
@@ -209,7 +222,7 @@ fn the_kda_kernel_matches_the_kimi_delta_rule() {
     let slots = stream.alloc_zeros::<i32>(1).unwrap();
     let (layer, base, step, per) = (0i32, 0i32, 0i32, rows as i32);
     let mut b = stream.launch_builder(&f);
-    b.arg(&dmix).arg(&ddtb).arg(&da).arg(&y).arg(&st).arg(&slots).arg(&layer).arg(&base).arg(&step).arg(&per);
+    b.arg(&dmix).arg(&dmix).arg(&dmix).arg(&ddtb).arg(&da).arg(&y).arg(&st).arg(&slots).arg(&layer).arg(&base).arg(&step).arg(&per);
     unsafe { b.launch(LaunchConfig { grid_dim: (heads as u32, 1, 1), block_dim: (k.threads, 1, 1), shared_mem_bytes: 0 }) }.unwrap();
     let got = stream.clone_dtoh(&y).unwrap();
     let got_state = stream.clone_dtoh(&st).unwrap();

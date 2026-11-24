@@ -1,0 +1,64 @@
+kind = "kir-kernel"
+family = "seq_conv"
+name = "kda_conv_q"
+threads = 128
+
+[args]
+x_row = "mix_in"
+x_offset = 0
+channels = "kda_qkv"
+taps = "kda_taps"
+y_row = "3 * kda_qkv"
+y_offset = 0
+layers = "linear_layers"
+act = "silu(v)"
+
+[[param]]
+name = "x"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "state"
+role = "activation"
+access = "write"
+
+[[param]]
+name = "slots"
+type = "i32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "layer"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "slot_base"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "slot_step"
+type = "i32"
+role = "value"
+access = "read"
+
+[[param]]
+name = "rows_per_seq"
+type = "i32"
+role = "value"
+access = "read"

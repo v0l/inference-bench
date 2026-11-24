@@ -1,0 +1,36 @@
+kind = "kir-kernel"
+family = "head_matvec"
+name = "kda_out_gate_up"
+threads = 128
+
+[args]
+x_row = "mix_in"
+x_head = 0
+x_offset = "kda_g_offset"
+inner = "kda_head_dim"
+w_head = 0
+w_inner = 1
+w_out = "kda_head_dim"
+w_offset = 0
+out = "kda_qkv"
+y_row = "kda_qkv"
+y_head = 0
+y_offset = 0
+
+[[param]]
+name = "x"
+type = "f32"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "w"
+type = "f32"
+role = "weight"
+access = "read"
+
+[[param]]
+name = "y"
+type = "f32"
+role = "activation"
+access = "write"

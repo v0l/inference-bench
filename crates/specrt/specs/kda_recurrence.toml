@@ -43,19 +43,19 @@ offset = "2 * kda_heads * kda_head_dim"
 
 [[input]]
 name = "f"
-src = "mix"
+src = "gates"
 space = "key"
-row = "kda_row"
+row = "kda_gate_row"
 head = "kda_head_dim"
-offset = "3 * kda_heads * kda_head_dim"
+offset = "kda_gate_offset"
 
 [[input]]
 name = "b"
-src = "mix"
+src = "betas"
 space = "scalar"
-row = "kda_row"
+row = "kda_beta_row"
 head = 1
-offset = "4 * kda_heads * kda_head_dim"
+offset = "kda_beta_offset"
 
 [[input]]
 name = "dtb"
@@ -137,6 +137,16 @@ offset = 0
 
 [[param]]
 name = "mix"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "betas"
+role = "activation"
+access = "read"
+
+[[param]]
+name = "gates"
 role = "activation"
 access = "read"
 
