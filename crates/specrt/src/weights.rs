@@ -527,6 +527,11 @@ impl Checkpoint {
         ensure!(v.shape == [rows, cols], "{weight} has shape {:?}, expected {:?}", v.shape, [rows, cols]);
         let kb = cols.div_ceil(FP8_BLOCK);
         let channel = format!("{weight}_scale");
+        if self.has(&channel) && self.view(&channel)?.dtype == Dtype::U8 {
+            let s = self.shaped(&channel, &[rows, cols / crate::dequant::MXFP8.group])?;
+            let w = crate::dequant::MXFP8.decode_bf16(v.data, s.data).with_context(|| weight.to_string())?;
+            return Ok(Raw::Bf16 { w: Cow::Owned(w), cols });
+        }
         if !self.has(&format!("{weight}_scale_inv")) && self.has(&channel) {
             let per_row = if self.view(&channel)?.shape.iter().product::<usize>() == 1 {
                 vec![self.floats(&channel, &self.view(&channel)?.shape)?[0]; rows]

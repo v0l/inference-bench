@@ -32,7 +32,7 @@ fn f32_e4m3(max: u32) -> String {
     )
 }
 
-fn e4m3_f32() -> String {
+pub(super) fn e4m3_f32() -> String {
     device(
         "float",
         "e4m3_f32",
