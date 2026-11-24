@@ -119,6 +119,10 @@ impl HostExperts {
         self.parts.iter().map(|p| p.per).sum()
     }
 
+    pub(in crate::runtime) fn same_slots(&self, other: &HostExperts) -> bool {
+        self.kinds == other.kinds && self.parts.len() == other.parts.len() && self.parts.iter().zip(&other.parts).all(|(a, b)| a.per == b.per)
+    }
+
     pub(in crate::runtime) fn host_bytes(&self) -> u64 {
         match &self.buf {
             Backing::Pinned(b) => b.len() as u64,

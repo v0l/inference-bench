@@ -514,9 +514,24 @@ fn with_options(spec: &Spec, sets: &[String]) -> Result<(Spec, specrt::serve::Se
     let mut speculative = serde_json::Map::new();
     let mut runtime = serde_json::to_value(&spec.runtime)?;
     let known: Vec<String> = specrt::options::schema().into_iter().map(|f| f.key).collect();
+    let runtime_before = runtime.clone();
+    let mut spec_value = serde_json::to_value(&spec)?;
     for set in sets {
         let (key, raw) = set.split_once('=').with_context(|| format!("--a-set/--b-set takes key=value, not {set}"))?;
         let value: serde_json::Value = serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+        if let Some(path) = key.strip_prefix("spec.") {
+            let mut node = &mut spec_value;
+            let parts: Vec<&str> = path.split('.').collect();
+            for (i, part) in parts.iter().enumerate() {
+                let map = node.as_object_mut().with_context(|| format!("spec.{path} is not a spec table path"))?;
+                if i + 1 == parts.len() {
+                    map.insert(part.to_string(), value.clone());
+                    break;
+                }
+                node = map.entry(part.to_string()).or_insert_with(|| serde_json::json!({}));
+            }
+            continue;
+        }
         let full = if known.iter().any(|k| k == key) {
             key.to_string()
         } else {
@@ -538,10 +553,14 @@ fn with_options(spec: &Spec, sets: &[String]) -> Result<(Spec, specrt::serve::Se
                 node = map.entry(part.to_string()).or_insert_with(|| serde_json::json!({}));
             }
         } else {
-            anyhow::bail!("bench --ab takes speculative.* and runtime.* options, not {full}");
+            anyhow::bail!("bench --ab takes spec.*, speculative.* and runtime.* options, not {full}");
         }
     }
-    spec.runtime = serde_json::from_value(runtime).context("runtime options")?;
+    spec = serde_json::from_value(spec_value).context("spec.* overrides")?;
+    if runtime != runtime_before {
+        spec.runtime = serde_json::from_value(runtime).context("runtime options")?;
+    }
+    spec.runnable()?;
     opts.speculative = serde_json::from_value(serde_json::Value::Object(speculative)).context("speculative options")?;
     Ok((spec, opts))
 }
@@ -729,4 +748,34 @@ fn bench_ab(args: Vec<String>) -> Result<()> {
     println!("verdict (decode, B over A): {}", v.label());
     anyhow::ensure!(!matches!(v, specrt::abstats::Verdict::Refused(_)), "refused: rerun on a quiet card");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn moe_gguf() -> Spec {
+        Spec::from_gguf_file(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen3moe-gguf/tiny-qwen3moe-Q4_K_M.gguf")).unwrap()
+    }
+
+    #[test]
+    fn an_arm_sets_a_spec_key_beside_runtime_options() {
+        let base = moe_gguf();
+        let (s, _) = with_options(&base, &["spec.moe.quantized_experts=true".into(), "pointer_table=true".into()]).unwrap();
+        assert!(s.moe.as_ref().unwrap().quantized_experts);
+        assert!(s.runtime.offload.pointer_table);
+        assert!(!base.moe.as_ref().unwrap().quantized_experts);
+        let (s, _) = with_options(&base, &["spec.runtime.offload.expert_slots=3".into()]).unwrap();
+        assert_eq!(s.runtime.offload.expert_slots, 3);
+    }
+
+    #[test]
+    fn a_spec_key_that_does_not_exist_or_breaks_the_spec_is_refused() {
+        let base = moe_gguf();
+        assert!(with_options(&base, &["spec.nope.x=1".into()]).is_err());
+        assert!(with_options(&base, &["spec.moe.no_such_field=1".into()]).is_err());
+        let mut bf16 = base.clone();
+        bf16.quant = specrt::spec::Quant::Bf16;
+        assert!(with_options(&bf16, &["spec.moe.quantized_experts=true".into()]).is_err());
+    }
 }

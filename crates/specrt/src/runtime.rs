@@ -1445,6 +1445,9 @@ impl Runtime {
     fn build_expert_cache(&mut self, weight_bytes: u64) -> Result<()> {
         let Some(m) = self.spec.moe.as_ref().filter(|_| expert_cache_mode(&self.spec)) else { return Ok(()) };
         let Some(like) = self.layers.iter().find_map(|l| l.moe.as_ref().and_then(|x| x.host.as_ref())) else { return Ok(()) };
+        if let Some(i) = self.layers.iter().position(|l| l.moe.as_ref().and_then(|x| x.host.as_ref()).is_some_and(|h| !h.same_slots(like))) {
+            anyhow::bail!("layer {i} stores its experts at a different size than the first cached layer, so they cannot share expert cache slots");
+        }
         let off = &self.spec.runtime.offload;
         let (local, shared, top_k) = (m.local_experts(), m.shared_slots(), m.top_k());
         let entry = (like.entry_bytes() / (local + shared).max(1)).max(1) as u64;

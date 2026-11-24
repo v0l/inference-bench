@@ -77,7 +77,7 @@ fn expert_rows(kind: crate::gguf::GgmlType, data: &[u8], rows: usize, cols: usiz
     Ok(crate::gguf::DeviceRows { parts: vec![Cow::Owned(packed.data().into_owned())], rows: packed.rows, cols })
 }
 
-pub fn ggml_stack(g: &Gguf, name: &str, shared: Option<&str>, experts: usize, rows: usize, cols: usize) -> Result<Stacked> {
+pub fn ggml_stack(g: &Gguf, name: &str, shared: Option<&str>, experts: usize, rows: usize, cols: usize, min_stride: usize) -> Result<Stacked> {
     let info = g.tensor(name).with_context(|| format!("{name} is not in the GGUF file"))?;
     ensure!(info.shape == [experts, rows, cols], "{name} has shape {:?}, expected {:?}", info.shape, [experts, rows, cols]);
     let all = g.data(info);
@@ -88,7 +88,7 @@ pub fn ggml_stack(g: &Gguf, name: &str, shared: Option<&str>, experts: usize, ro
         ensure!(si.shape == [rows, cols], "{s} has shape {:?}, expected {:?}", si.shape, [rows, cols]);
         packed.push(expert_rows(si.kind, g.data(si), rows, cols)?);
     }
-    let stride = packed.iter().map(|p| p.len_bytes().next_multiple_of(16)).max().unwrap_or(16);
+    let stride = packed.iter().map(|p| p.len_bytes().next_multiple_of(16)).max().unwrap_or(16).max(min_stride);
     ensure!(stride / 16 < 1 << 29, "an expert of {stride} bytes is too large for the row table");
     let mut data = Vec::with_capacity(stride * packed.len());
     let mut tables = Vec::with_capacity((rows + 1) * packed.len());
@@ -100,6 +100,18 @@ pub fn ggml_stack(g: &Gguf, name: &str, shared: Option<&str>, experts: usize, ro
         tables.push((stride / 16) as u32);
     }
     Ok(Stacked::Ggml { data, tables })
+}
+
+pub fn ggml_stride(g: &Gguf, which: &str, rows: usize, cols: usize) -> Result<usize> {
+    let mut stride = 16;
+    for t in g.tensors.values() {
+        let Some(rest) = t.name.strip_prefix("blk.") else { continue };
+        let Some((_, tail)) = rest.split_once('.') else { continue };
+        if tail == format!("ffn_{which}_exps.weight") || tail == format!("ffn_{which}_shexp.weight") {
+            stride = stride.max(crate::gguf::DeviceRows::packed_len(t.kind, rows, cols)?.next_multiple_of(16));
+        }
+    }
+    Ok(stride)
 }
 
 pub fn ggml_expert_row(data: &[u8], tables: &[u32], rows: usize, cols: usize, expert: usize, row: usize) -> Vec<f32> {
@@ -1153,7 +1165,8 @@ impl Checkpoint {
         let stack = |which: &str, rows: usize, cols: usize| -> Result<Stacked> {
             if m.quantized_experts {
                 let shexp = format!("{blk}.ffn_{which}_shexp.weight");
-                return ggml_stack(g, &format!("{blk}.ffn_{which}_exps.weight"), shared.then_some(shexp.as_str()), e, rows, cols);
+                let uniform = if spec.runtime.offload.enabled() { ggml_stride(g, which, rows, cols)? } else { 0 };
+                return ggml_stack(g, &format!("{blk}.ffn_{which}_exps.weight"), shared.then_some(shexp.as_str()), e, rows, cols, uniform);
             }
             let mut w = Vec::with_capacity((e + 1) * rows * cols);
             self.gguf_stack(g, &format!("{blk}.ffn_{which}_exps.weight"), &[e, rows, cols], &mut w)?;

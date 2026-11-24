@@ -1131,6 +1131,15 @@ impl<'a> DeviceRows<'a> {
         self.parts.iter().map(|p| p.len()).sum()
     }
 
+    pub fn packed_len(kind: GgmlType, rows: usize, cols: usize) -> Result<usize> {
+        let src_row = kind.row_bytes(cols)?;
+        Ok(match kind {
+            GgmlType::Iq(_) => rows * (IQ_HEADER_BYTES + src_row).next_multiple_of(16),
+            GgmlType::F32 => rows * cols * 2,
+            _ => rows * cols / DEVICE_SUPERBLOCK * DeviceRow::of(kind)?.bytes(),
+        })
+    }
+
     pub fn data(&self) -> std::borrow::Cow<'_, [u8]> {
         match self.parts.as_slice() {
             [one] => std::borrow::Cow::Borrowed(one),

@@ -166,7 +166,7 @@ fn the_pointer_table_gets_ggml_table_kernels_that_resolve_slots_and_read_bias_by
 }
 
 fn cached(file: &str, slots: usize, table: bool) -> Spec {
-    let mut s = spec(file, true);
+    let mut s = spec(file, std::env::var_os("GGUF_MOE_EXPANDED").is_none());
     s.runtime.offload.vram_budget = u64::MAX / 4;
     s.runtime.offload.expert_slots = slots;
     s.runtime.offload.pointer_table = table;
@@ -201,6 +201,23 @@ fn kept_experts_through_the_expert_cache_and_the_pointer_table_decode_like_resid
     }
 }
 
+#[test]
+fn with_offload_every_layer_of_a_mixed_type_file_gets_the_same_expert_slot_size() {
+    let file = FILES[0];
+    let ck = Checkpoint::open(&path(file)).unwrap();
+    let size = |s: &Spec, layer: usize| {
+        let m = ck.layer_at(s, layer, layer).unwrap().moe.unwrap();
+        [&m.gate, &m.up, &m.down].map(|x| match x {
+            Stacked::Ggml { data, tables } => (data.len(), tables.len()),
+            _ => panic!("ggml"),
+        })
+    };
+    let resident = spec(file, true);
+    assert_ne!(size(&resident, 0), size(&resident, 1), "the fixture mixes Q4_K and Q6_K down tensors across layers");
+    let offloaded = cached(file, 2, false);
+    assert_eq!(size(&offloaded, 0), size(&offloaded, 1));
+}
+
 fn log_softmax(row: &[f32]) -> Vec<f64> {
     let max = row.iter().copied().fold(f32::MIN, f32::max) as f64;
     let sum: f64 = row.iter().map(|&v| (v as f64 - max).exp()).sum();
@@ -214,7 +231,7 @@ fn kl(p: &[f32], q: &[f32]) -> f64 {
 
 #[test]
 #[ignore = "needs a CUDA GPU"]
-fn quantised_experts_match_the_bf16_expanded_experts_within_the_rounding_of_bf16() {
+fn quantised_experts_match_the_bf16_expanded_experts_within_max_kl_2e_5_measured_8_8e_6() {
     for file in FILES {
         let run = |s: &Spec| {
             let mut rt = Runtime::load(s, 512).unwrap();
@@ -237,7 +254,7 @@ fn quantised_experts_match_the_bf16_expanded_experts_within_the_rounding_of_bf16
         let same = ga.iter().zip(&gb).take_while(|(x, y)| x == y).count();
         eprintln!("{file}: weights {wa} bytes expanded, {wb} bytes kept; mean KL {mean:.3e} max KL {max:.3e} greedy prefix {same}/32");
         assert!(wb < wa, "{file}");
-        assert!(max < 1e-3, "{file}: max KL {max:.3e}");
+        assert!(max < 2e-5, "{file}: max KL {max:.3e}");
     }
 }
 
