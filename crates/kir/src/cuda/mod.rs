@@ -49,6 +49,17 @@ __device__ float kir_block_sum(float v, float* scratch) {
 
 ";
 
+const SPLIT_BF16: &str = "__device__ __forceinline__ void kir_split_bf16(float v, unsigned short& hi, unsigned short& lo) {
+    unsigned u = __float_as_uint(v);
+    unsigned h = (u + 0x7fffu + ((u >> 16) & 1u)) >> 16;
+    float r = v - __uint_as_float(h << 16);
+    unsigned w = __float_as_uint(r);
+    hi = (unsigned short)h;
+    lo = (unsigned short)((w + 0x7fffu + ((w >> 16) & 1u)) >> 16);
+}
+
+";
+
 fn check(k: &Kernel) -> Result<(), String> {
     k.validate()?;
     if k.target.language != Language::Cuda {
@@ -230,6 +241,9 @@ pub fn emit_module(kernels: &[Kernel]) -> Result<crate::KirSource, String> {
     let mut out = String::new();
     if kernels.iter().any(|k| matches!(k.body, Body::RmsNorm { .. } | Body::RmsNormSegment { .. } | Body::AddRmsNorm { .. } | Body::NormAdd { .. }) || matches!(&k.body, Body::Compose(c) if c.has_sum()) || matches!(&k.body, Body::Rows(crate::rows::RowBody::LayerNorm { .. })) || matches!(&k.body, Body::Seq(s) if s.has_sum())) {
         out.push_str(WARP_SUM);
+    }
+    if kernels.iter().any(|k| matches!(&k.body, Body::Compose(c) if c.splits())) {
+        out.push_str(SPLIT_BF16);
     }
     for k in kernels {
         out.push_str(&emit_kernel(k)?);

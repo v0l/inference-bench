@@ -21,6 +21,7 @@ pub struct Rows {
     pub iter: Iter,
     pub address: Address,
     pub per_row: Vec<(String, u32)>,
+    pub stride: Vec<(String, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,6 +51,8 @@ pub enum Stage {
     Epilogue { dst: String, expr: Expr, mat: Mat },
     BlockSum { dst: String, expr: Expr },
     TileStore { dst: String, value: String, tile: Option<Tile> },
+    SplitStore { hi: String, lo: String, value: String, tile: Option<Tile> },
+    Index { dst: String },
     Gather { dst: String, src: String, index: String },
     Lookup { dst: String, src: String, index: String },
     Scatter { dst: String, value: String, index: String },
@@ -66,11 +69,15 @@ pub struct Compose {
 
 #[derive(Debug, Default)]
 struct Plan {
-    pass1: Vec<String>,
+    passes: Vec<Vec<String>>,
+    between: Vec<Vec<String>>,
     total: Option<String>,
-    total_stmt: Option<String>,
-    scalars: Vec<String>,
-    pass2: Vec<String>,
+}
+
+impl Plan {
+    fn final_pass(&self) -> &[String] {
+        self.passes.last().map_or(&[], |p| p.as_slice())
+    }
 }
 
 fn decl(d: Dialect) -> &'static str {
@@ -82,6 +89,10 @@ fn decl(d: Dialect) -> &'static str {
 
 fn name_ok(n: &str) -> bool {
     !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && !n.starts_with(|c: char| c.is_ascii_digit()) && !RESERVED.contains(&n) && n != "width"
+}
+
+fn sums(stages: &[Stage]) -> usize {
+    stages.iter().filter(|s| matches!(s, Stage::BlockSum { .. })).count()
 }
 
 fn scalar_flags(stages: &[Stage], consts: &[Const]) -> Vec<bool> {
@@ -141,9 +152,16 @@ impl Compose {
         if params.is_empty() {
             return Err("compose needs params".into());
         }
-        let sums = self.stages.iter().filter(|s| matches!(s, Stage::BlockSum { .. })).count();
-        if sums > 1 {
-            return Err("compose has more than one block_sum".into());
+        if sums(&self.stages) > 1 && t.language != crate::Language::Cuda {
+            return Err("compose has more than one block_sum, which only the CUDA lowering runs".into());
+        }
+        if !self.rows.stride.is_empty() && t.language != crate::Language::Cuda {
+            return Err("compose row strides have only a CUDA lowering".into());
+        }
+        for (n, s) in &self.rows.stride {
+            if !params.iter().any(|p| p.name == n) || *s == 0 || self.rows.per_row.iter().any(|(m, _)| m == n) {
+                return Err(format!("rows stride names unknown param {n:?}, a zero stride or a param that also advances per row"));
+            }
         }
         if self.has_sum() != self.sum.is_some() {
             return Err("compose block sum and its reduction strategy disagree".into());
@@ -189,6 +207,9 @@ impl Compose {
             Some(t) => t.layout.expr(&t.at.iter().map(String::as_str).collect::<Vec<_>>(), d)?,
             None => "i".to_string(),
         };
+        if self.rows.stride.iter().any(|(n, _)| n == p) {
+            return Ok(local);
+        }
         let Some((_, m)) = self.rows.per_row.iter().find(|(n, _)| n == p) else {
             return Ok(local);
         };
@@ -234,7 +255,6 @@ impl Compose {
         let sum_text = if d == Dialect::Cuda { "kir_block_sum(ss, scratch)" } else { "" };
         let mut env: Vec<(String, Expr)> = Vec::new();
         let mut plan = Plan::default();
-        let mut after = false;
         let mut defined: Vec<String> = Vec::new();
         let mut scalar_names: Vec<String> = Vec::new();
         let mut define = |n: &str| -> Result<(), String> {
@@ -244,9 +264,14 @@ impl Compose {
             defined.push(n.to_string());
             Ok(())
         };
-        let has_sum = self.has_sum();
+        let total_sums = sums(&self.stages);
+        plan.passes.push(Vec::new());
         for (st, scalar) in self.stages.iter().zip(flags.iter()) {
-            let main_pass = after || !has_sum;
+            macro_rules! emit {
+                ($line:expr) => {
+                    plan.passes.last_mut().expect("a pass").push($line)
+                };
+            }
             match st {
                 Stage::TileLoad { dst, src, tile, mat } => {
                     define(dst)?;
@@ -255,23 +280,37 @@ impl Compose {
                     }
                     let text = format!("{src}[{}]", self.index(d, params, src, tile.as_ref())?);
                     if mat.on(d) {
-                        let line = format!("{} {dst} = {text};", decl(d));
-                        if main_pass { plan.pass2.push(line) } else { plan.pass1.push(line) }
+                        emit!(format!("{} {dst} = {text};", decl(d)));
                         env.push((dst.clone(), Expr::Raw(dst.clone())));
                     } else {
                         env.push((dst.clone(), Expr::Raw(text)));
                     }
                 }
+                Stage::Index { dst } => {
+                    define(dst)?;
+                    if d != Dialect::Cuda {
+                        return Err("an index stage has only a CUDA lowering".into());
+                    }
+                    let row = match self.rows.iter {
+                        Iter::Block => "x",
+                        Iter::Grid => "y",
+                    };
+                    let text = match dst.as_str() {
+                        "col" => "(float)i".to_string(),
+                        "row" => format!("(float)blockIdx.{row}"),
+                        other => return Err(format!("index stage {other:?} is not col or row")),
+                    };
+                    env.push((dst.clone(), Expr::Raw(text)));
+                }
                 Stage::Epilogue { dst, expr, mat } => {
                     define(dst)?;
                     let e = expr.clone().bind(&self.consts).subst(&|n| env.iter().find(|(k, _)| k == n).map(|(_, x)| x.clone()))?;
                     if *scalar {
-                        plan.scalars.push(format!("{} {dst} = {};", decl(d), e.lower(d, &named)?));
+                        plan.between.last_mut().expect("a gap").push(format!("{} {dst} = {};", decl(d), e.lower(d, &named)?));
                         env.push((dst.clone(), Expr::Raw(dst.clone())));
                         scalar_names.push(dst.clone());
                     } else if mat.on(d) {
-                        let line = format!("{} {dst} = {};", decl(d), e.lower(d, &named)?);
-                        if main_pass { plan.pass2.push(line) } else { plan.pass1.push(line) }
+                        emit!(format!("{} {dst} = {};", decl(d), e.lower(d, &named)?));
                         env.push((dst.clone(), Expr::Raw(dst.clone())));
                     } else {
                         env.push((dst.clone(), e));
@@ -279,7 +318,7 @@ impl Compose {
                 }
                 Stage::BlockSum { dst, expr } => {
                     let e = expr.clone().bind(&self.consts).subst(&|n| env.iter().find(|(k, _)| k == n).map(|(_, x)| x.clone()))?;
-                    plan.pass1.push(format!("ss += {};", e.lower(d, &named)?));
+                    emit!(format!("ss += {};", e.lower(d, &named)?));
                     define(dst)?;
                     let mut uses = 0;
                     let mut wide = 0;
@@ -290,24 +329,25 @@ impl Compose {
                         }
                     }
                     plan.total = Some(dst.clone());
-                    env.retain(|(n, x)| !matches!(x, Expr::Raw(r) if r == n));
-                    if d == Dialect::Cuda && uses <= 1 && wide == 0 {
+                    env.retain(|(n, x)| scalar_names.contains(n) || !matches!(x, Expr::Raw(r) if r == n));
+                    plan.between.push(Vec::new());
+                    let gap = plan.between.last_mut().expect("a gap");
+                    if d == Dialect::Cuda && total_sums == 1 && uses <= 1 && wide == 0 {
                         env.push((dst.clone(), Expr::Raw(sum_text.to_string())));
                     } else {
                         if d == Dialect::Cuda {
-                            plan.total_stmt = Some(format!("float {dst} = {sum_text};"));
+                            gap.insert(0, format!("float {dst} = {sum_text};"));
                         }
                         env.push((dst.clone(), Expr::Raw(dst.clone())));
                     }
-                    after = true;
+                    plan.passes.push(Vec::new());
                 }
                 Stage::Gather { dst, src, index } | Stage::Lookup { dst, src, index } => {
                     define(dst)?;
                     let row = self.row_index(d, params, src, index, matches!(st, Stage::Gather { .. }))?;
                     let wide = matches!(st, Stage::Gather { .. });
                     let at = if wide { format!("{row} * WIDTH + i") } else { row };
-                    let line = format!("float {dst} = {src}[{at}];");
-                    if main_pass { plan.pass2.push(line) } else { plan.pass1.push(line) }
+                    emit!(format!("float {dst} = {src}[{at}];"));
                     env.push((dst.clone(), Expr::Raw(dst.clone())));
                 }
                 Stage::Scatter { dst, value, index } => {
@@ -317,8 +357,7 @@ impl Compose {
                     }
                     let row = self.row_index(d, params, dst, index, true)?;
                     let e = env.iter().find(|(k, _)| k == value).map(|(_, x)| x.clone()).ok_or_else(|| format!("scatter of unknown value {value:?}"))?;
-                    let line = format!("{dst}[{row} * WIDTH + i] = {};", e.lower(d, &named)?);
-                    if main_pass { plan.pass2.push(line) } else { plan.pass1.push(line) }
+                    emit!(format!("{dst}[{row} * WIDTH + i] = {};", e.lower(d, &named)?));
                 }
                 Stage::TileStore { dst, value, tile } => {
                     match params.iter().find(|p| p.name == dst) {
@@ -326,15 +365,33 @@ impl Compose {
                         _ => return Err(format!("store to {dst:?}, which is not a written param")),
                     }
                     let e = env.iter().find(|(k, _)| k == value).map(|(_, x)| x.clone()).ok_or_else(|| format!("store of unknown value {value:?}"))?;
-                    let line = format!("{dst}[{}] = {};", self.index(d, params, dst, tile.as_ref())?, e.lower(d, &named)?);
-                    if main_pass { plan.pass2.push(line) } else { plan.pass1.push(line) }
+                    emit!(format!("{dst}[{}] = {};", self.index(d, params, dst, tile.as_ref())?, e.lower(d, &named)?));
+                }
+                Stage::SplitStore { hi, lo, value, tile } => {
+                    if d != Dialect::Cuda {
+                        return Err("a split store has only a CUDA lowering".into());
+                    }
+                    for p in [hi, lo] {
+                        match params.iter().find(|q| q.name == p) {
+                            Some(q) if q.access == Access::Write && q.ty == crate::Scalar::Bf16 => {}
+                            _ => return Err(format!("split store to {p:?}, which is not a written bf16 param")),
+                        }
+                    }
+                    let e = env.iter().find(|(k, _)| k == value).map(|(_, x)| x.clone()).ok_or_else(|| format!("store of unknown value {value:?}"))?;
+                    let at_hi = self.index(d, params, hi, tile.as_ref())?;
+                    let at_lo = self.index(d, params, lo, tile.as_ref())?;
+                    emit!(format!("kir_split_bf16({}, {hi}[{at_hi}], {lo}[{at_lo}]);", e.lower(d, &named)?));
                 }
             }
         }
-        if !self.stages.iter().any(|s| matches!(s, Stage::TileStore { .. } | Stage::Scatter { .. })) {
+        if !self.stages.iter().any(|s| matches!(s, Stage::TileStore { .. } | Stage::Scatter { .. } | Stage::SplitStore { .. })) {
             return Err("compose has no tile_store".into());
         }
         Ok(plan)
+    }
+
+    pub fn splits(&self) -> bool {
+        self.stages.iter().any(|s| matches!(s, Stage::SplitStore { .. }))
     }
 
     pub fn emit_cuda(&self, k: &Kernel) -> Result<String, String> {
@@ -342,7 +399,14 @@ impl Compose {
         let sig: Vec<String> = k
             .params
             .iter()
-            .map(|p| format!("{}{}* {}", if p.access == Access::Write { "" } else { "const " }, if p.ty == crate::Scalar::I32 { "int" } else { "float" }, p.name))
+            .map(|p| {
+                let ty = match p.ty {
+                    crate::Scalar::I32 => "int",
+                    crate::Scalar::Bf16 => "unsigned short",
+                    _ => "float",
+                };
+                format!("{}{ty}* {}", if p.access == Access::Write { "" } else { "const " }, p.name)
+            })
             .collect();
         let (row, loop_head) = match self.rows.iter {
             Iter::Block => ("x", "for (int i = threadIdx.x; i < WIDTH; i += blockDim.x)"),
@@ -361,6 +425,9 @@ impl Compose {
             }
             Address::Base => s.push_str(&format!("    size_t base = (size_t)blockIdx.{row} * WIDTH;\n")),
         }
+        for (n, stride) in &self.rows.stride {
+            s.push_str(&format!("    {n} += (size_t)blockIdx.{row} * {stride};\n"));
+        }
         let looped = |lines: &[String]| -> String {
             match lines {
                 [one] => format!("    {loop_head} {one}\n"),
@@ -368,16 +435,16 @@ impl Compose {
             }
         };
         if self.has_sum() {
-            s.push_str("    float ss = 0.0f;\n");
-            s.push_str(&looped(&plan.pass1));
-            if let Some(t) = &plan.total_stmt {
-                s.push_str(&format!("    {t}\n"));
-            }
-            for l in &plan.scalars {
-                s.push_str(&format!("    {l}\n"));
+            let sums = plan.passes.len() - 1;
+            for (n, pass) in plan.passes[..sums].iter().enumerate() {
+                s.push_str(if n == 0 { "    float ss = 0.0f;\n" } else { "    ss = 0.0f;\n" });
+                s.push_str(&looped(pass));
+                for l in &plan.between[n] {
+                    s.push_str(&format!("    {l}\n"));
+                }
             }
         }
-        s.push_str(&looped(&plan.pass2));
+        s.push_str(&looped(plan.final_pass()));
         s.push_str("}\n\n");
         Ok(s)
     }
@@ -451,12 +518,12 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, {builtins}) {{
                 let looped = |lines: &[String]| -> String {
                     format!("    for (var i = li; i < WIDTH; i += {t}u) {{\n{}    }}\n", lines.iter().map(|l| format!("        {l}\n")).collect::<String>())
                 };
-                s.push_str(&looped(&plan.pass1));
+                s.push_str(&looped(&plan.passes[0]));
                 s.push_str(&reduce);
-                for l in &plan.scalars {
+                for l in plan.between.first().into_iter().flatten() {
                     s.push_str(&format!("    {l}\n"));
                 }
-                s.push_str(&looped(&plan.pass2));
+                s.push_str(&looped(plan.final_pass()));
                 s.push_str("}\n");
             }
             Iter::Grid => {
@@ -475,7 +542,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {{
     let i = idx % WIDTH;
 "
                 ));
-                for l in &plan.pass2 {
+                for l in plan.final_pass() {
                     s.push_str(&format!("    {l}\n"));
                 }
                 s.push_str("}\n");

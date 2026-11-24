@@ -440,7 +440,7 @@ impl Kernel {
         }
         let wide = |p: &Param| match &self.body {
             Body::Scan(_) | Body::Rows(_) | Body::Recurrence(_) | Body::Seq(_) => true,
-            Body::Compose(_) => p.ty == Scalar::I32,
+            Body::Compose(_) => matches!(p.ty, Scalar::I32 | Scalar::Bf16),
             _ => false,
         };
         if self.params.iter().any(|p| p.ty != Scalar::F32 && !wide(p)) {

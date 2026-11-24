@@ -294,6 +294,8 @@ pub struct RowsDesc {
     pub iter: String,
     pub address: String,
     pub per_row: Vec<String>,
+    #[serde(default)]
+    pub stride: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
@@ -351,6 +353,8 @@ pub struct StageDesc {
     pub index: Option<String>,
     #[serde(default)]
     pub shift: Option<String>,
+    #[serde(default)]
+    pub lo: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1088,11 +1092,17 @@ impl Description {
                 "lookup" => Stage::Lookup { dst: need(&s.name, "name", &s.op)?, src: need(&s.src, "src", &s.op)?, index: need(&s.index, "index", &s.op)? },
                 "scatter" => Stage::Scatter { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, index: need(&s.index, "index", &s.op)? },
                 "tile_store" => Stage::TileStore { dst: need(&s.dst, "dst", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(width, &s.layout, &s.at)? },
+                "split_store" => Stage::SplitStore { hi: need(&s.dst, "dst", &s.op)?, lo: need(&s.lo, "lo", &s.op)?, value: need(&s.value, "value", &s.op)?, tile: self.tile(width, &s.layout, &s.at)? },
+                "index" => Stage::Index { dst: need(&s.name, "name", &s.op)? },
                 o => return Err(format!("{}: unknown stage op {o:?}", self.name)),
             });
         }
+        let mut stride = Vec::new();
+        for (n, v) in &rows.stride {
+            stride.push((n.clone(), self.size(shape, v, n)?));
+        }
         let sum = stages.iter().any(|s| matches!(s, Stage::BlockSum { .. })).then(|| BlockSum::for_target(t));
-        Kernel::compose(t, intern(&self.name), self.threads(shape)?, params, Compose { width, rows: Rows { iter, address, per_row }, consts, sum, stages }).map_err(|e| format!("{}: {e}", self.name))
+        Kernel::compose(t, intern(&self.name), self.threads(shape)?, params, Compose { width, rows: Rows { iter, address, per_row, stride }, consts, sum, stages }).map_err(|e| format!("{}: {e}", self.name))
     }
 
     fn threads(&self, shape: &Shape) -> Result<u32, String> {
