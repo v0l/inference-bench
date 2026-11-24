@@ -349,7 +349,11 @@ def fetch_files(entry, m, config_repo, local):
             continue
         if name == INDEX:
             try:
-                entry["tensor_formats"] = tensor_formats(json.loads(body))
+                parsed = json.loads(body)
+                entry["tensor_formats"] = tensor_formats(parsed)
+                total = (parsed.get("metadata") or {}).get("total_size")
+                if isinstance(total, (int, float)) and total > 0:
+                    entry["size_gb"] = round(total / 1e9, 1)
             except json.JSONDecodeError:
                 entry["tensor_formats"] = {"unreadable index": 1}
             files[name] = {"bytes": len(body), "sha256": hashlib.sha256(body).hexdigest(), "committed": False}
