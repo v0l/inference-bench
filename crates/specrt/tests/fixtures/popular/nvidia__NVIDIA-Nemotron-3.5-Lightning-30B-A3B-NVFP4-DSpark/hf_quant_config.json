@@ -1,0 +1,16 @@
+{
+  "producer": {
+    "name": "modelopt",
+    "version": "0.45.0"
+  },
+  "quantization": {
+    "quant_algo": "W4A16_NVFP4",
+    "kv_cache_quant_algo": null,
+    "group_size": 16,
+    "exclude_modules": [
+      "*embed_tokens*",
+      "*markov_w1*",
+      "*self_attn*"
+    ]
+  }
+}

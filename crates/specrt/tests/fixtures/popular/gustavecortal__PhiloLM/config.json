@@ -1,0 +1,46 @@
+{
+ "model": {
+  "blocks": 16,
+  "width": 576,
+  "query_heads": 9,
+  "kv_heads": 9,
+  "global_kv_heads": 3,
+  "head_dim": 64,
+  "ffn_intermediate": 1512,
+  "rmsnorm_epsilon": 1e-06,
+  "rope_base": 10000,
+  "rope_dimensions": 32,
+  "context_tokens": 4096,
+  "tie_embeddings": true,
+  "linear_bias": false,
+  "initialization_std": 0.02,
+  "residual_projection_initialization_scale": "1/sqrt(2*blocks)",
+  "qk_norm": true,
+  "attention_gate": true,
+  "local_window": 256,
+  "global_every": 4,
+  "ngram": true,
+  "ngram_orders": [
+   2
+  ],
+  "ngram_rows": 245760,
+  "ngram_dim": 128,
+  "ngram_heads": null,
+  "ngram_layers": null,
+  "key_offset": true,
+  "document_mask": true
+ },
+ "vocab_size": 32768,
+ "eos_id": 0,
+ "architectures": [
+  "PhiloLMForCausalLM"
+ ],
+ "model_type": "philolm",
+ "auto_map": {
+  "AutoConfig": "configuration_philolm.PhiloLMConfig",
+  "AutoModelForCausalLM": "modeling_philolm.PhiloLMForCausalLM"
+ },
+ "bos_token_id": 0,
+ "eos_token_id": 0,
+ "pad_token_id": 0
+}
