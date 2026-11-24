@@ -539,7 +539,11 @@ fn report() -> Report {
     writeln!(doc, "| total | {base_total} | {} |\n", rows.len()).unwrap();
 
     writeln!(doc, "## Ranked gaps\n").unwrap();
-    writeln!(doc, "Each gap is one missing piece, ranked by the summed downloads of the rows it blocks (a base row counts its whole group less the quantised copies listed beside it). Chat and tokenizer gaps are counted only on rows whose architecture passes. Gaps under {} downloads have no issue filed.\n", millions(FILE_THRESHOLD)).unwrap();
+    writeln!(doc, "Each gap is one missing piece, ranked by the summed downloads of the rows it blocks (a base row counts its whole group less the quantised copies listed beside it). Chat and tokenizer gaps are counted only on rows whose architecture passes. The issue column maps a gap to its tracker issue through `crates/specrt/tests/fixtures/popular/gaps.toml`; every gap over {} downloads has one.\n", millions(FILE_THRESHOLD)).unwrap();
+    let unfiled: Vec<&str> = ranked.iter().filter(|(g, (sum, _))| *sum >= FILE_THRESHOLD && !filed.contains_key(&g.key)).map(|(g, _)| g.key.as_str()).collect();
+    if !unfiled.is_empty() {
+        writeln!(doc, "Gaps over the threshold with no issue yet: {}.\n", unfiled.join("; ")).unwrap();
+    }
     writeln!(doc, "| # | kind | gap | blocked downloads | rows | models | issue |").unwrap();
     writeln!(doc, "|---|---|---|---|---|---|---|").unwrap();
     for (n, (g, (sum, idx))) in ranked.iter().enumerate() {
