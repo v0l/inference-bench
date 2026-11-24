@@ -592,13 +592,14 @@ fn main_labs(rows: &[Row], verdicts: &[Verdict], filed: &BTreeMap<String, u64>, 
     for lab in labs() {
         let own: Vec<usize> = (0..rows.len()).filter(|&i| own_row(&lab, &rows[i], skip)).collect();
         let copies: Vec<usize> = (0..rows.len()).filter(|&i| rows[i].s("lab") == lab.key && !own.contains(&i)).collect();
-        let loading = |i: usize| matches!(verdicts[i].class, Class::Loads | Class::Offload);
+        let loading = |i: usize| matches!(verdicts[i].class, Class::Loads | Class::TextOnly | Class::Offload);
         let status = if own.is_empty() {
             "no public text model".to_string()
         } else if own.iter().all(|&i| loading(i)) {
             "GREEN: every model loads".to_string()
         } else {
-            format!("{} of {} models do not load yet", own.iter().filter(|&&i| !loading(i)).count(), own.len())
+            let blocked = own.iter().filter(|&&i| !loading(i)).count();
+            format!("{blocked} of {} models are blocked, the rest load", own.len())
         };
         writeln!(out, "### {} ({})\n", lab.name, status).unwrap();
         writeln!(out, "| model | released | size GB | arch | class | gap | issue |").unwrap();
@@ -621,7 +622,7 @@ fn main_labs(rows: &[Row], verdicts: &[Verdict], filed: &BTreeMap<String, u64>, 
             writeln!(out, "| {name} | | | | no public repo | {} | |", cell(note)).unwrap();
         }
         let loads = copies.iter().filter(|&&i| loading(i)).count();
-        writeln!(out, "\nQuantised copies under this lab: {}, of which {} load.\n", copies.len(), loads).unwrap();
+        writeln!(out, "\nQuantised copies under this lab: {}, of which {} load or load text only.\n", copies.len(), loads).unwrap();
         if !lab.note.is_empty() {
             writeln!(out, "{}\n", lab.note).unwrap();
         }
